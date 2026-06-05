@@ -1,0 +1,44 @@
+[package]
+name = "ssh-broker"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+# `spike` keeps the feasibility-spike scaffolding (src/spike.rs + src/relay_spike.rs
+# and the diag/ptytest/conpty subcommands) and its `conpty` regression-reference
+# dependency OUT of the default production build. Build/test the spike with:
+#   cargo build --target x86_64-pc-windows-msvc --features spike
+# The production relay is reimplemented in the conpty/agent/shim modules.
+spike = ["dep:conpty"]
+
+# Cross-platform dependencies (compile + unit-test on the macOS host).
+# Versions are pinned and cited per project rule; exact resolved versions live in
+# Cargo.lock. Citations gathered by the verify-foundation-crates workflow.
+[dependencies]
+anyhow = "1.0"               # error context: Result, anyhow!, ensure!, bail!
+thiserror = "2.0"            # derive(Error) for typed protocol errors
+serde = { version = "1.0", features = ["derive"] }     # Handshake (de)serialize (1.0.228)
+postcard = { version = "1.1", features = ["use-std"] } # compact serde wire format; `use-std` gates to_stdvec (1.1.3)
+socket2 = "0.6"                                         # AF_UNIX on Windows (Domain::UNIX, SockAddr::unix, shutdown) — no extra feature needed (0.6.4)
+tracing = "0.1"              # structured logging
+tracing-subscriber = "0.3"  # file/stderr log sink (Phase 6 routes off the PTY)
+
+[dev-dependencies]
+pipe = "0.4"                 # two unidirectional pipes compose the splittable relay test transport, EOF-on-writer-drop (Phase 2; 0.4.0)
+
+# Windows-only dependencies. Not compiled on the macOS host, so the pure-logic
+# protocol/relay phases unit-test natively here.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62.2", features = [
+    "Win32_System_Console",
+    "Win32_Foundation",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+    "Win32_Storage_FileSystem",
+    "Win32_Security",
+    "Win32_System_IO",
+    "Win32_System_RemoteDesktop",
+] }
+# conpty: ONLY pulled in under `--features spike` (the ptytest regression matrix /
+# known-good reference). Never part of the production build.
+conpty = { version = "0.7.0", optional = true }
