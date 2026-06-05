@@ -11,6 +11,7 @@ mod afunix;
 mod agent;
 mod conpty;
 mod pipes;
+mod protocol;
 mod provision;
 mod shim;
 
