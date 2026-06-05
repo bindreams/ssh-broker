@@ -13,6 +13,7 @@ mod conpty;
 mod pipes;
 mod protocol;
 mod provision;
+mod relay;
 mod shim;
 
 #[cfg(all(windows, feature = "spike"))]
