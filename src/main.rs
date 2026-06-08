@@ -16,6 +16,7 @@ mod protocol;
 mod provision;
 mod relay;
 mod shim;
+mod vtinput;
 
 #[cfg(all(windows, feature = "spike"))]
 mod spike;
