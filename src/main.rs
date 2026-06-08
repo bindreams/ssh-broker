@@ -6,6 +6,7 @@
 //! in first position selects a subcommand, anything else (bare, or sshd's
 //! `-c "cmd"`) is the shim.
 
+#[cfg(windows)]
 mod acl;
 mod afunix;
 mod agent;
