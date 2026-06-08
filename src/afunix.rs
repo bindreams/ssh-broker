@@ -154,6 +154,16 @@ impl ConnTx {
         self.0.shutdown(std::net::Shutdown::Write)?;
         Ok(())
     }
+
+    /// Shut down both directions of the connection. Used at teardown to FIN the write side
+    /// (delivering a final EXIT frame) AND unblock a sibling thread blocked reading the
+    /// OTHER split half. That cross-half unblock works because `split` uses `try_clone`
+    /// (WSADuplicateSocketW on Windows / `dup` on Unix): both halves are descriptors over
+    /// one underlying socket, so a shutdown here tears down that shared socket's read side.
+    pub fn shutdown_both(&self) -> anyhow::Result<()> {
+        self.0.shutdown(std::net::Shutdown::Both)?;
+        Ok(())
+    }
 }
 
 impl Read for ConnRx {

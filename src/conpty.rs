@@ -118,8 +118,11 @@ unsafe fn make_attr_list(hpc: HPCON) -> windows::core::Result<OwnedAttrList> {
     let _ = unsafe { InitializeProcThreadAttributeList(None, 1, None, &mut bytes) };
     let mut buf = vec![0u8; bytes];
     let list = LPPROC_THREAD_ATTRIBUTE_LIST(buf.as_mut_ptr() as *mut _);
+    unsafe { InitializeProcThreadAttributeList(Some(list), 1, None, &mut bytes)? };
+    // Wrap in the RAII guard NOW, so a later failure (UpdateProcThreadAttribute) still runs
+    // DeleteProcThreadAttributeList. (`buf`'s heap stays put when moved, so `list` is valid.)
+    let owned = OwnedAttrList { _buf: buf, list };
     unsafe {
-        InitializeProcThreadAttributeList(Some(list), 1, None, &mut bytes)?;
         UpdateProcThreadAttribute(
             list,
             0,
@@ -131,7 +134,7 @@ unsafe fn make_attr_list(hpc: HPCON) -> windows::core::Result<OwnedAttrList> {
             None,
         )?;
     }
-    Ok(OwnedAttrList { _buf: buf, list })
+    Ok(owned)
 }
 
 /// Write the whole buffer to `handle`, looping on the returned byte count. Returns false
@@ -158,6 +161,26 @@ pub fn read_handle(handle: isize, buf: &mut [u8]) -> usize {
         return 0;
     }
     n as usize
+}
+
+/// Resize a pseudoconsole by raw HPCON value (for the agent's input thread). A `0` handle
+/// (already closed/taken) is a no-op, symmetric with [`close_pty_raw`].
+pub fn resize_pty(hpc_raw: isize, cols: u16, rows: u16) -> windows::core::Result<()> {
+    if hpc_raw == 0 {
+        return Ok(());
+    }
+    let size = COORD { X: cols.max(1) as i16, Y: rows.max(1) as i16 };
+    unsafe { ResizePseudoConsole(HPCON(hpc_raw), size) }
+}
+
+/// Close a pseudoconsole by raw HPCON value (the agent's teardown owns this once it has
+/// taken the HPCON via [`PtySession::take_hpc_raw`]). Makes the output pipe hit EOF.
+pub fn close_pty_raw(hpc_raw: isize) {
+    if hpc_raw != 0 {
+        unsafe {
+            ClosePseudoConsole(HPCON(hpc_raw));
+        }
+    }
 }
 
 // ── PtySession ─────────────────────────────────────────────────────────────────────
@@ -242,6 +265,26 @@ impl PtySession {
     /// Raw input-write handle (as `isize`) for forwarding decoded input.
     pub fn in_write_raw(&self) -> isize {
         self.in_write.0.0 as isize
+    }
+
+    /// Raw child-process handle (as `isize`) — e.g. for `TerminateProcess` from a relay
+    /// thread on mid-session teardown.
+    pub fn process_raw(&self) -> isize {
+        self.process.0.0 as isize
+    }
+
+    /// Hand the pseudoconsole's raw handle to the caller, who then owns closing it (via
+    /// [`close_pty_raw`]); `PtySession`'s own Drop no longer closes it. Used by the agent
+    /// so the HPCON can be shared (behind a mutex) between the resize and teardown paths.
+    pub fn take_hpc_raw(&mut self) -> isize {
+        match self.hpc.take() {
+            Some(owned) => {
+                let raw = owned.0.0;
+                std::mem::forget(owned); // ownership transferred; don't ClosePseudoConsole here
+                raw
+            }
+            None => 0,
+        }
     }
 
     /// Resize the pseudoconsole.

@@ -128,8 +128,9 @@ pub enum Mode {
 
 /// The first frame on a connection (a HANDSHAKE-kind frame whose payload is this
 /// struct, `postcard`-serialized). The shim fills `term`/`cwd` and the allow-listed
-/// `env`; the agent applies `%TERM%`, sets the working directory, and merges `env`
-/// into the child. Raw DATA frames are NOT routed through serde — only this header.
+/// `env`. The agent currently applies the working directory; `%TERM%`/`env` propagation
+/// into the child lands alongside the config-driven shell (Phase 7). Raw DATA frames are
+/// NOT routed through serde — only this header.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Handshake {
     pub version: u16,
