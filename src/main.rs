@@ -10,6 +10,7 @@
 mod acl;
 mod afunix;
 mod agent;
+#[cfg(windows)]
 mod conpty;
 mod pipes;
 mod protocol;
