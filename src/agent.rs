@@ -1,15 +1,7 @@
 //! agent: resident in session 1 (started by the auto-login logon task). Per AF_UNIX
-//! connection it hosts the shell in a ConPTY (inheriting the session-1 token → working
+//! connection it hosts the shell — in a ConPTY for interactive (PTY) sessions, or with
+//! redirected pipes for EXEC (`ssh host "cmd"`) — inheriting the session-1 token (working
 //! DPAPI/profile + no RedirectionGuard) and relays it to the SSH-side shim.
-//!
-//! The PTY relay uses three threads with an ordered, race-free teardown (criterion 2):
-//!   - **waiter** (the calling thread): blocks on the child, then records the exit code,
-//!     closes the pseudoconsole (→ output pipe EOF), and joins the two pump threads;
-//!   - **output**: `PtySession` output → `DATA(Pty)` frames; on EOF emits the `EXIT` frame
-//!     and shuts the connection down (which unblocks the input pump);
-//!   - **input**: `pump_decode` → ConPTY input + `ResizePseudoConsole`, and on return kills
-//!     the child so the waiter unblocks even when the SSH side drops first.
-//! The HPCON is shared behind a mutex so a resize can never race the teardown's close.
 
 /// `agent` subcommand entrypoint. Windows-only: the agent must run in the interactive
 /// session-1 console to confer RDP parity.
@@ -24,9 +16,11 @@ pub fn run() -> anyhow::Result<()> {
 }
 
 #[cfg(windows)]
-use crate::afunix::{self, Listener};
+use crate::afunix::{self, ConnRx, ConnTx, Listener};
 #[cfg(windows)]
 use crate::conpty::{self, PtySession};
+#[cfg(windows)]
+use crate::pipes::ExecChild;
 #[cfg(windows)]
 use crate::protocol::{
     ExitCode, FrameKind, FrameReader, Handshake, Mode, Resize, Stream, read_one_frame, write_frame,
@@ -34,12 +28,16 @@ use crate::protocol::{
 #[cfg(windows)]
 use crate::relay::{FrameSink, pump_decode, write_data};
 #[cfg(windows)]
+use crate::winutil::OwnedHandle;
+#[cfg(windows)]
+use std::path::Path;
+#[cfg(windows)]
 use std::sync::{Arc, Mutex};
 
 /// Bind the hardened socket and serve connections, one handler thread each. Single-instance
 /// is enforced by a named mutex acquired before binding.
 #[cfg(windows)]
-fn run_on(path: &std::path::Path) -> anyhow::Result<()> {
+fn run_on(path: &Path) -> anyhow::Result<()> {
     let _instance = SingleInstance::acquire()?;
     let listener = Listener::bind(path)?;
     loop {
@@ -58,22 +56,37 @@ fn default_shell() -> String {
     "pwsh.exe -NoLogo".to_string()
 }
 
-/// Drive one PTY connection: handshake → spawn shell in a ConPTY → relay both directions →
-/// exit code → ordered teardown.
+/// Read the handshake, then dispatch to the PTY or EXEC relay.
 #[cfg(windows)]
 fn handle_connection(conn: socket2::Socket) -> anyhow::Result<()> {
     let (mut rx, tx) = afunix::split(conn)?;
-
-    // Handshake (reuse the FrameReader so any pipelined input survives for the pump).
     let mut fr = FrameReader::new();
     let frame = read_one_frame(&mut rx, &mut fr)?;
     anyhow::ensure!(frame.kind == FrameKind::Handshake, "first frame was not a handshake");
     let hs = Handshake::decode(&frame.payload)?;
-    anyhow::ensure!(hs.mode == Mode::Pty, "the agent PTY handler requires Mode::Pty");
-
     let command = hs.command.clone().unwrap_or_else(default_shell);
-    let cwd = if hs.cwd.is_empty() { None } else { Some(std::path::Path::new(&hs.cwd)) };
-    let mut session = PtySession::spawn(&command, hs.cols, hs.rows, cwd)?;
+    let cwd = if hs.cwd.is_empty() { None } else { Some(Path::new(&hs.cwd)) };
+    match hs.mode {
+        Mode::Pty => handle_pty(rx, fr, tx, &command, hs.cols, hs.rows, cwd),
+        Mode::Exec => handle_exec(rx, fr, tx, &command, cwd),
+    }
+}
+
+// ── PTY relay ────────────────────────────────────────────────────────────────────────
+
+/// Interactive PTY relay: spawn the shell in a ConPTY and bridge it with three threads and
+/// an ordered, race-free teardown (criterion 2).
+#[cfg(windows)]
+fn handle_pty(
+    mut rx: ConnRx,
+    mut fr: FrameReader,
+    tx: ConnTx,
+    command: &str,
+    cols: u16,
+    rows: u16,
+    cwd: Option<&Path>,
+) -> anyhow::Result<()> {
+    let mut session = PtySession::spawn(command, cols, rows, cwd)?;
 
     let out_raw = session.out_read_raw();
     let in_raw = session.in_write_raw();
@@ -111,12 +124,7 @@ fn handle_connection(conn: socket2::Socket) -> anyhow::Result<()> {
         std::thread::spawn(move || {
             let mut sink = PtyInputSink { in_raw, hpc_cell };
             let _ = pump_decode(&mut rx, &mut fr, &mut sink);
-            unsafe {
-                let _ = windows::Win32::System::Threading::TerminateProcess(
-                    windows::Win32::Foundation::HANDLE(proc_raw as *mut core::ffi::c_void),
-                    1,
-                );
-            }
+            kill_process(proc_raw);
         })
     };
 
@@ -128,8 +136,7 @@ fn handle_connection(conn: socket2::Socket) -> anyhow::Result<()> {
     *code_cell.lock().unwrap() = code;
     {
         // Close the pseudoconsole while HOLDING the lock, so a concurrent resize cannot
-        // copy the raw HPCON out and then race this close (use-after-close). Binding the
-        // guard to a variable keeps it alive across `close_pty_raw`.
+        // copy the raw HPCON out and then race this close (use-after-close).
         let mut hpc = hpc_cell.lock().unwrap();
         if let Some(raw) = hpc.take() {
             conpty::close_pty_raw(raw); // → output pipe EOF → out_thread drains, emits EXIT, FINs
@@ -138,7 +145,6 @@ fn handle_connection(conn: socket2::Socket) -> anyhow::Result<()> {
     let _ = out_thread.join();
     let _ = in_thread.join();
     // Threads joined; `session` now drops and closes the process/thread + pipe handles.
-    // Propagate a wait() error only AFTER teardown (converts windows::core::Error -> anyhow).
     wait_result?;
     Ok(())
 }
@@ -170,6 +176,125 @@ impl FrameSink for PtyInputSink {
         Ok(())
     }
 }
+
+// ── EXEC relay ───────────────────────────────────────────────────────────────────────
+
+/// Non-interactive EXEC relay (`ssh host "cmd"`): spawn the child with redirected pipes,
+/// relay stdout/stderr as SEPARATE streams, feed stdin, and propagate the exit code.
+#[cfg(windows)]
+fn handle_exec(
+    mut rx: ConnRx,
+    mut fr: FrameReader,
+    tx: ConnTx,
+    command: &str,
+    cwd: Option<&Path>,
+) -> anyhow::Result<()> {
+    let mut child = ExecChild::spawn(command, cwd)?;
+    let out_raw = child.stdout_read_raw();
+    let err_raw = child.stderr_read_raw();
+    let proc_raw = child.process_raw();
+    let stdin_owned = child.take_stdin_write();
+    // stdout, stderr, and the EXIT frame all share tx → serialize with a mutex.
+    let tx_arc = Arc::new(Mutex::new(tx));
+
+    let t_out = spawn_stream_pump(out_raw, Stream::Stdout, Arc::clone(&tx_arc), proc_raw);
+    let t_err = spawn_stream_pump(err_raw, Stream::Stderr, Arc::clone(&tx_arc), proc_raw);
+
+    // stdin pump owns the child's stdin-write handle. A half-close mid-session (empty
+    // DATA(Stdin) marker) closes only the child's stdin so a reader like sort/findstr
+    // finishes; a FULL socket close means the SSH side is gone, so after the pump returns we
+    // kill the child unconditionally. Without this, a silent, stdin-ignoring command
+    // (e.g. `ssh host "Start-Sleep 99999"`) would never exit and the output pumps — blocked
+    // in read with nothing to write — would never detect the dead socket, hanging the waiter.
+    let t_in = std::thread::spawn(move || {
+        let mut sink = ExecInputSink { stdin: stdin_owned };
+        let _ = pump_decode(&mut rx, &mut fr, &mut sink);
+        drop(sink); // close the child's stdin if the EOF marker never arrived
+        kill_process(proc_raw);
+    });
+
+    let wait_result = child.wait();
+    let code = *wait_result.as_ref().unwrap_or(&1);
+    let _ = t_out.join();
+    let _ = t_err.join();
+    {
+        let mut g = tx_arc.lock().unwrap();
+        let _ = write_frame(&mut *g, FrameKind::Exit, &ExitCode(code).encode());
+        let _ = g.shutdown_both(); // FIN + unblock the stdin pump's read
+    }
+    let _ = t_in.join();
+    wait_result?;
+    Ok(())
+}
+
+/// Pump one child output stream (stdout/stderr) into `DATA(stream)` frames on the shared
+/// connection. On EOF the child is exiting; on a write failure the SSH side is gone, so
+/// kill the child to unblock the waiter.
+#[cfg(windows)]
+fn spawn_stream_pump(
+    raw: isize,
+    stream: Stream,
+    tx: Arc<Mutex<ConnTx>>,
+    proc_raw: isize,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 32 * 1024];
+        loop {
+            let n = conpty::read_handle(raw, &mut buf);
+            if n == 0 {
+                break; // child's stream closed (exiting)
+            }
+            let ok = {
+                let mut g = tx.lock().unwrap();
+                write_data(&mut *g, stream, &buf[..n]).is_ok()
+            };
+            if !ok {
+                kill_process(proc_raw); // SSH side gone → unblock the waiter
+                break;
+            }
+        }
+    })
+}
+
+/// Routes decoded input frames into the EXEC child's stdin. Owns the stdin-write handle so
+/// it can close it on the stdin-EOF marker (below) or when the pump thread ends.
+#[cfg(windows)]
+struct ExecInputSink {
+    stdin: Option<OwnedHandle>,
+}
+
+#[cfg(windows)]
+impl FrameSink for ExecInputSink {
+    fn on_data(&mut self, _stream: Stream, bytes: &[u8]) -> anyhow::Result<()> {
+        if bytes.is_empty() {
+            // An empty DATA(Stdin) frame is the shim's stdin-EOF marker: close the child's
+            // stdin (→ readers like sort/findstr see EOF and finish) WITHOUT tearing down the
+            // connection, so stdout/stderr/EXIT still flow. A full socket close is the
+            // separate disconnect signal, handled by the pump thread (kill).
+            self.stdin = None;
+        } else if let Some(h) = &self.stdin {
+            anyhow::ensure!(
+                conpty::write_all_handle(h.raw(), bytes),
+                "failed to write to the exec child's stdin"
+            );
+        }
+        Ok(())
+    }
+    // on_resize: default no-op (EXEC has no pseudoconsole).
+}
+
+/// `TerminateProcess` by raw handle (no-op-safe to call on an already-exited child).
+#[cfg(windows)]
+fn kill_process(proc_raw: isize) {
+    unsafe {
+        let _ = windows::Win32::System::Threading::TerminateProcess(
+            windows::Win32::Foundation::HANDLE(proc_raw as *mut core::ffi::c_void),
+            1,
+        );
+    }
+}
+
+// ── single-instance ────────────────────────────────────────────────────────────────
 
 /// Single-instance guard: a named mutex so only one agent binds the socket (the real fix
 /// for a concurrent double-launch, which the bind probe-connect alone can't close).

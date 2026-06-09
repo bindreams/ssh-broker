@@ -20,17 +20,17 @@
 
 use std::path::Path;
 
-use windows::Win32::Foundation::{CloseHandle, HANDLE};
+use crate::winutil::{AttrList, OwnedHandle};
+use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Storage::FileSystem::{ReadFile, WriteFile};
 use windows::Win32::System::Console::{
     ClosePseudoConsole, CreatePseudoConsole, ResizePseudoConsole, COORD, HPCON,
 };
 use windows::Win32::System::Pipes::CreatePipe;
 use windows::Win32::System::Threading::{
-    CreateProcessW, DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT,
-    GetExitCodeProcess, INFINITE, InitializeProcThreadAttributeList,
-    LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOEXW,
-    TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
+    CreateProcessW, EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess, INFINITE,
+    PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOEXW, TerminateProcess,
+    WaitForSingleObject,
 };
 use windows::core::{PCWSTR, PWSTR};
 
@@ -46,19 +46,7 @@ const PSEUDOCONSOLE_WIN32_INPUT_MODE: u32 = 0x0004;
 /// `PSEUDOCONSOLE_PASSTHROUGH_MODE` (build ≥ 22621) — relay the child's VT directly.
 const PSEUDOCONSOLE_PASSTHROUGH_MODE: u32 = 0x0008;
 
-// ── RAII guards ────────────────────────────────────────────────────────────────────
-
-/// `CloseHandle` on drop (no-op on an invalid handle).
-struct OwnedHandle(HANDLE);
-impl Drop for OwnedHandle {
-    fn drop(&mut self) {
-        if !self.0.is_invalid() {
-            unsafe {
-                let _ = CloseHandle(self.0);
-            }
-        }
-    }
-}
+// ── RAII guard (pipe/process handles use winutil::OwnedHandle) ───────────────────────
 
 /// `ClosePseudoConsole` on drop (no-op once taken/closed). Closing the pseudoconsole is
 /// what makes the output pipe deliver its buffered tail and then EOF.
@@ -69,20 +57,6 @@ impl Drop for OwnedHpcon {
             unsafe {
                 ClosePseudoConsole(self.0);
             }
-        }
-    }
-}
-
-/// `DeleteProcThreadAttributeList` on drop (frees the list's internal allocations); the
-/// backing `Vec` is freed when this struct drops.
-struct OwnedAttrList {
-    _buf: Vec<u8>,
-    list: LPPROC_THREAD_ATTRIBUTE_LIST,
-}
-impl Drop for OwnedAttrList {
-    fn drop(&mut self) {
-        unsafe {
-            DeleteProcThreadAttributeList(self.list);
         }
     }
 }
@@ -109,32 +83,6 @@ unsafe fn create_pty(size: COORD, in_read: HANDLE, out_write: HANDLE) -> windows
         }
     };
     Ok(OwnedHpcon(hpc))
-}
-
-/// Build a process-thread attribute list carrying the pseudoconsole attribute.
-unsafe fn make_attr_list(hpc: HPCON) -> windows::core::Result<OwnedAttrList> {
-    let mut bytes: usize = 0;
-    // First call computes the required size (returns an error we expect/ignore).
-    let _ = unsafe { InitializeProcThreadAttributeList(None, 1, None, &mut bytes) };
-    let mut buf = vec![0u8; bytes];
-    let list = LPPROC_THREAD_ATTRIBUTE_LIST(buf.as_mut_ptr() as *mut _);
-    unsafe { InitializeProcThreadAttributeList(Some(list), 1, None, &mut bytes)? };
-    // Wrap in the RAII guard NOW, so a later failure (UpdateProcThreadAttribute) still runs
-    // DeleteProcThreadAttributeList. (`buf`'s heap stays put when moved, so `list` is valid.)
-    let owned = OwnedAttrList { _buf: buf, list };
-    unsafe {
-        UpdateProcThreadAttribute(
-            list,
-            0,
-            PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
-            // The HPCON VALUE itself, not a pointer to it (the 0xC0000142 root cause).
-            Some(hpc.0 as *const core::ffi::c_void),
-            std::mem::size_of::<HPCON>(),
-            None,
-            None,
-        )?;
-    }
-    Ok(owned)
 }
 
 /// Write the whole buffer to `handle`, looping on the returned byte count. Returns false
@@ -214,7 +162,13 @@ impl PtySession {
             drop(in_read);
             drop(out_write);
 
-            let attr = make_attr_list(hpc.0)?;
+            // lpValue for PSEUDOCONSOLE is the HPCON VALUE itself, not a pointer to it —
+            // the root cause of the 0xC0000142 DLL-init failure in the spike.
+            let attr = AttrList::single(
+                PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
+                hpc.0.0 as *const core::ffi::c_void,
+                std::mem::size_of::<HPCON>(),
+            )?;
 
             let mut si = STARTUPINFOEXW::default();
             si.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
@@ -222,7 +176,7 @@ impl PtySession {
             si.StartupInfo.hStdOutput = HANDLE::default();
             si.StartupInfo.hStdError = HANDLE::default();
             si.StartupInfo.dwFlags |= STARTF_USESTDHANDLES;
-            si.lpAttributeList = attr.list;
+            si.lpAttributeList = attr.as_ptr();
 
             let mut cmd: Vec<u16> = command.encode_utf16().chain(std::iter::once(0)).collect();
             let cwd_wide: Option<Vec<u16>> = cwd.map(|c| {

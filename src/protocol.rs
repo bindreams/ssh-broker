@@ -58,6 +58,11 @@ impl FrameHeader {
 /// DATA-frame stream tag (the first payload byte). PTY mode uses a single merged
 /// terminal stream; EXEC mode keeps stdin/stdout/stderr separate (SSH preserves
 /// stderr as a distinct channel).
+///
+/// EXEC convention: an empty-payload `DATA(Stdin)` frame is the shim's **stdin-EOF
+/// marker** — it tells the agent to close the child's stdin (so a reader like `sort`
+/// finishes) while keeping the connection open for stdout/stderr/EXIT. A full socket
+/// close is the distinct *disconnect* signal (the agent kills the child).
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stream {

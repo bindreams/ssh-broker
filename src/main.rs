@@ -12,12 +12,15 @@ mod afunix;
 mod agent;
 #[cfg(windows)]
 mod conpty;
+#[cfg(windows)]
 mod pipes;
 mod protocol;
 mod provision;
 mod relay;
 mod shim;
 mod vtinput;
+#[cfg(windows)]
+mod winutil;
 
 #[cfg(all(windows, feature = "spike"))]
 mod spike;

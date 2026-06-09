@@ -1,8 +1,8 @@
 //! Windows-only integration tests for the agent (run on winhost via the cross-compile
 //! -> scp -> run loop). They drive `handle_connection` over a real AF_UNIX socket.
 use crate::afunix::{self, Listener};
-use crate::protocol::{FrameKind, FrameReader, Handshake, Mode, write_frame};
-use crate::relay::{Outcome, TestSink, pump_decode};
+use crate::protocol::{FrameKind, FrameReader, Handshake, Mode, Stream, write_frame};
+use crate::relay::{Outcome, TestSink, pump_decode, write_data};
 use std::thread;
 
 fn hardened_dir(tag: &str) -> std::path::PathBuf {
@@ -80,6 +80,125 @@ fn agent_tears_down_when_ssh_side_disconnects_first() {
     let conn = listener.accept().unwrap();
     // Returns Ok once the child is killed and both threads join; hangs forever if teardown
     // deadlocks (which is the failure we are guarding against).
+    super::handle_connection(conn).unwrap();
+    let _ = client.join();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn agent_exec_handler_separates_streams_and_returns_code() {
+    let dir = hardened_dir("exec");
+    let sock = dir.join("s");
+    let listener = Listener::bind(&sock).unwrap();
+
+    let client_path = sock.clone();
+    let client = thread::spawn(move || {
+        let conn = afunix::connect(&client_path).unwrap();
+        let (mut crx, mut ctx) = afunix::split(conn).unwrap();
+        let hs = Handshake {
+            mode: Mode::Exec,
+            command: Some("cmd.exe /c echo OUT& echo ERR 1>&2& exit /b 4".into()),
+            ..Handshake::pty_default()
+        };
+        write_frame(&mut ctx, FrameKind::Handshake, &hs.encode().unwrap()).unwrap();
+        // No stdin to send: send the empty-Stdin EOF marker (NOT a half-close, which would
+        // read as a disconnect) and keep the socket open to receive stdout/stderr/EXIT.
+        write_data(&mut ctx, Stream::Stdin, b"").unwrap();
+        let mut fr = FrameReader::new();
+        let mut sink = TestSink::default();
+        let outcome = pump_decode(&mut crx, &mut fr, &mut sink).unwrap();
+        (outcome, sink.stdout, sink.stderr)
+    });
+
+    let conn = listener.accept().unwrap();
+    super::handle_connection(conn).unwrap();
+
+    let (outcome, stdout, stderr) = client.join().unwrap();
+    assert_eq!(outcome, Outcome::Exited(4));
+    assert!(
+        String::from_utf8_lossy(&stdout).contains("OUT"),
+        "stdout was: {:?}",
+        String::from_utf8_lossy(&stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&stderr).contains("ERR"),
+        "stderr was: {:?}",
+        String::from_utf8_lossy(&stderr)
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn agent_exec_relays_stdin_and_returns_sorted_output() {
+    // The documented core of the stdin path: feed a stdin-reading child (`sort`) its full
+    // input, signal stdin-EOF with the empty marker, and assert it consumed all input and
+    // sorted it. This is the regression guard for the stdin-EOF-marker timing.
+    let dir = hardened_dir("exec-stdin");
+    let sock = dir.join("s");
+    let listener = Listener::bind(&sock).unwrap();
+
+    let client_path = sock.clone();
+    let client = thread::spawn(move || {
+        let conn = afunix::connect(&client_path).unwrap();
+        let (mut crx, mut ctx) = afunix::split(conn).unwrap();
+        let hs = Handshake {
+            mode: Mode::Exec,
+            command: Some("sort".into()), // reads stdin, sorts lines, writes stdout, needs EOF
+            ..Handshake::pty_default()
+        };
+        write_frame(&mut ctx, FrameKind::Handshake, &hs.encode().unwrap()).unwrap();
+        write_data(&mut ctx, Stream::Stdin, b"banana\r\napple\r\ncherry\r\n").unwrap();
+        write_data(&mut ctx, Stream::Stdin, b"").unwrap(); // stdin-EOF marker → sort finishes
+        let mut fr = FrameReader::new();
+        let mut sink = TestSink::default();
+        let outcome = pump_decode(&mut crx, &mut fr, &mut sink).unwrap();
+        (outcome, sink.stdout)
+    });
+
+    let conn = listener.accept().unwrap();
+    super::handle_connection(conn).unwrap();
+
+    let (outcome, stdout) = client.join().unwrap();
+    assert_eq!(outcome, Outcome::Exited(0));
+    let out = String::from_utf8_lossy(&stdout);
+    let (a, b, c) = (out.find("apple"), out.find("banana"), out.find("cherry"));
+    assert!(
+        a.is_some() && b.is_some() && c.is_some(),
+        "sorted output missing a line: {out:?}"
+    );
+    assert!(a < b && b < c, "output not in sorted order: {out:?}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn agent_exec_tears_down_when_ssh_disconnects_first() {
+    // A silent, stdin-ignoring, long-running command. The SSH side FULLY disconnects
+    // (shutdown_both) without ever sending the stdin-EOF marker. The agent must treat the
+    // socket close as a disconnect and kill the child so the waiter unblocks and
+    // handle_connection RETURNS. With no kill, the output pumps block in read (nothing to
+    // write) and child.wait() blocks forever — this test would hang (surfaced by the runner),
+    // which is exactly the bug it guards against.
+    let dir = hardened_dir("exec-disc");
+    let sock = dir.join("s");
+    let listener = Listener::bind(&sock).unwrap();
+
+    let client_path = sock.clone();
+    let client = thread::spawn(move || {
+        let conn = afunix::connect(&client_path).unwrap();
+        let (_crx, mut ctx) = afunix::split(conn).unwrap();
+        let hs = Handshake {
+            mode: Mode::Exec,
+            command: Some(
+                "pwsh.exe -NoLogo -NoProfile -Command \"Start-Sleep -Seconds 99999\"".into(),
+            ),
+            ..Handshake::pty_default()
+        };
+        write_frame(&mut ctx, FrameKind::Handshake, &hs.encode().unwrap()).unwrap();
+        // Full disconnect with the child still running and producing no output.
+        let _ = ctx.shutdown_both();
+    });
+
+    let conn = listener.accept().unwrap();
     super::handle_connection(conn).unwrap();
     let _ = client.join();
     std::fs::remove_dir_all(&dir).ok();
