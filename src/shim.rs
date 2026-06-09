@@ -253,12 +253,13 @@ pub fn make_handshake(exec: &Option<String>, term: String, cols: u16, rows: u16)
 
 // ── mouse-mode sniffer (pure; gates mouse forwarding) ──────────────────────────────
 
-/// Observes the agent→client output stream for the shell enabling/disabling mouse tracking,
-/// so the input side forwards mouse events ONLY when the shell wants them (an ungated mouse
-/// stream injects `ESC[<…M` bytes into mouse-naive programs). Recognizes the DEC private
-/// modes `CSI ? <params> h|l`: tracking 1000/1002/1003 and SGR encoding 1006. Stateful, so a
-/// sequence split across reads is handled. Observe-only — it never alters the bytes (the
-/// client terminal still receives and honors the same sequences via `XtwinopsFilter`).
+/// Observes the agent→client output stream for the shell enabling/disabling mouse tracking
+/// and focus reporting, so the input side forwards those events ONLY when the shell wants them
+/// (an ungated stream injects `ESC[<…M` / `ESC[I`/`ESC[O` bytes into naive programs).
+/// Recognizes the DEC private modes `CSI ? <params> h|l`: tracking 1000/1002/1003, SGR encoding
+/// 1006, and focus reporting 1004. Stateful, so a sequence split across reads is handled.
+/// Observe-only — it never alters the bytes (the client terminal still receives and honors the
+/// same sequences via `XtwinopsFilter`).
 #[derive(Default)]
 pub struct MouseModeSniffer {
     state: SniffState,
@@ -268,6 +269,7 @@ pub struct MouseModeSniffer {
     cur_has_digits: bool,
     tracking: u8, // bitset: 1000 → bit0, 1002 → bit1, 1003 → bit2
     sgr: bool,    // mode 1006 (SGR extended coordinates)
+    focus: bool,  // mode 1004 (focus in/out reporting)
 }
 
 #[derive(Default, PartialEq)]
@@ -350,6 +352,10 @@ impl MouseModeSniffer {
                 self.sgr = set;
                 return;
             }
+            1004 => {
+                self.focus = set;
+                return;
+            }
             _ => None, // 1005/1015 etc. recognized-but-unsupported → leave SGR off (gate stays closed)
         };
         if let Some(bit) = bit {
@@ -380,6 +386,10 @@ impl MouseModeSniffer {
     /// SGR extended coordinate mode (1006) is enabled.
     pub fn sgr_on(&self) -> bool {
         self.sgr
+    }
+    /// Focus-reporting mode (1004) is enabled — gate focus `CSI I`/`CSI O` events on this.
+    pub fn focus_on(&self) -> bool {
+        self.focus
     }
     /// Forward mouse events only when the shell enabled tracking AND SGR encoding — the only
     /// encoding `MouseEncoder` emits; sending SGR to a shell that asked for legacy X10 would

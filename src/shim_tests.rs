@@ -232,3 +232,49 @@ fn sniffer_ignores_unrelated_sequences() {
     s.observe(b"\x1b[4h");
     assert!(!s.tracking_on());
 }
+
+// ── focus-tracking mode (?1004) ────────────────────────────────────────────────────
+
+#[test]
+fn sniffer_focus_set_and_clear() {
+    let mut s = MouseModeSniffer::new();
+    assert!(!s.focus_on());
+    s.observe(b"\x1b[?1004h"); // focus reporting on
+    assert!(s.focus_on());
+    s.observe(b"\x1b[?1004l"); // focus reporting off
+    assert!(!s.focus_on());
+}
+
+#[test]
+fn sniffer_focus_combined_with_mouse_in_one_csi() {
+    let mut s = MouseModeSniffer::new();
+    s.observe(b"\x1b[?1002;1004;1006h"); // button-drag tracking + focus + SGR in one sequence
+    assert!(s.focus_on());
+    assert!(s.tracking_on());
+    assert!(s.sgr_on());
+    assert!(s.forward_mouse());
+}
+
+#[test]
+fn sniffer_focus_handles_sequence_split_across_reads() {
+    let mut s = MouseModeSniffer::new();
+    s.observe(b"\x1b[?100");
+    s.observe(b"4h");
+    assert!(s.focus_on());
+}
+
+#[test]
+fn sniffer_focus_independent_of_mouse_flags() {
+    // ?1004 must not flip mouse tracking/sgr, and mouse modes must not flip focus.
+    let mut s = MouseModeSniffer::new();
+    s.observe(b"\x1b[?1004h");
+    assert!(s.focus_on());
+    assert!(!s.tracking_on());
+    assert!(!s.sgr_on());
+    assert!(!s.forward_mouse());
+
+    let mut t = MouseModeSniffer::new();
+    t.observe(b"\x1b[?1000h\x1b[?1006h"); // mouse tracking + SGR
+    assert!(t.forward_mouse());
+    assert!(!t.focus_on());
+}

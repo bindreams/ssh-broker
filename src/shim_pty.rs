@@ -209,6 +209,9 @@ impl FrameSink for StdoutSink {
         self.gate
             .forward
             .store(self.sniffer.forward_mouse(), Ordering::Relaxed);
+        self.gate
+            .focus
+            .store(self.sniffer.focus_on(), Ordering::Relaxed);
         let filtered = self.filter.filter(bytes);
         anyhow::ensure!(
             conpty::write_all_handle(self.out, &filtered),
@@ -219,12 +222,14 @@ impl FrameSink for StdoutSink {
     // on_resize: no-op — RESIZE flows shim→agent only.
 }
 
-/// Shared mouse-mode gate: MAIN (the output sink) publishes whether the brokered shell wants
-/// SGR mouse events; the input worker reads it. A single scalar, so an atomic (not a mutex)
-/// suffices and there is no compound invariant to tear.
+/// Shared input gate: MAIN (the output sink) publishes whether the brokered shell wants SGR
+/// mouse events (`forward`) and focus in/out reports (`focus`); the input worker reads them.
+/// Each is an independent scalar, so atomics (not a mutex) suffice with no compound invariant
+/// to tear.
 #[derive(Default)]
 struct MouseGate {
     forward: AtomicBool,
+    focus: AtomicBool,
 }
 
 /// The single input thread: owns `tx`, reads `ReadConsoleInputW`, re-encodes keys/mouse and
@@ -317,7 +322,20 @@ unsafe fn input_loop(
                         enc.reset();
                     }
                 }
-                _ => {} // FOCUS / MENU: ignored in v1 (the wake record lands here)
+                EVT_FOCUS => {
+                    // Forward focus in/out as `CSI I`/`CSI O`, but ONLY when the shell enabled
+                    // ?1004 — else focus-naive programs would see stray `ESC[I`/`ESC[O`. The
+                    // teardown wake record (also a FOCUS) never reaches here: the worker returns
+                    // on the post-read `stopping` re-check above, before this loop.
+                    if gate.focus.load(Ordering::Relaxed) {
+                        let focused = unsafe { rec.Event.FocusEvent }.bSetFocus.as_bool();
+                        let seq: &[u8] = if focused { b"\x1b[I" } else { b"\x1b[O" };
+                        if write_data(tx, Stream::Pty, seq).is_err() {
+                            return;
+                        }
+                    }
+                }
+                _ => {} // MENU: ignored (internal)
             }
         }
     }
