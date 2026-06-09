@@ -44,3 +44,6 @@ windows = { version = "0.62.2", features = [
 # conpty: ONLY pulled in under `--features spike` (the ptytest regression matrix /
 # known-good reference). Never part of the production build.
 conpty = { version = "0.7.0", optional = true }
+# tracing-appender: rolling file sink for the shim's logs under ProgramData (the shim must
+# never log to the PTY stdout/stderr in interactive mode). Only the Windows shim uses it.
+tracing-appender = "0.2"

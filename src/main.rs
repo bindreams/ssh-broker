@@ -18,6 +18,8 @@ mod protocol;
 mod provision;
 mod relay;
 mod shim;
+#[cfg(windows)]
+mod shim_pty;
 mod vtinput;
 #[cfg(windows)]
 mod winutil;
