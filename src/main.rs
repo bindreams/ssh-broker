@@ -35,6 +35,8 @@ pub enum Route {
     Agent,
     Apply,
     Verify,
+    /// Hidden: the parity-probe child the agent spawns in session 1 (used by `verify`).
+    VerifyProbe,
 }
 
 /// Dispatch `argv[1..]` (the args after the program name). A known verb in first
@@ -46,6 +48,7 @@ pub fn route(args: &[String]) -> Route {
         Some("agent") => Route::Agent,
         Some("apply") => Route::Apply,
         Some("verify") => Route::Verify,
+        Some("verify-probe") => Route::VerifyProbe,
         Some("-c") => {
             // Reassemble the command from args[1..] so a command that arrives split
             // across argv is not truncated. `-c` with nothing after it degrades to an
@@ -75,6 +78,7 @@ fn main() -> anyhow::Result<()> {
         Route::Agent => agent::run(),
         Route::Apply => provision::apply(),
         Route::Verify => provision::verify(),
+        Route::VerifyProbe => provision::verify_probe(),
     }
 }
 
@@ -124,6 +128,16 @@ mod route_tests {
     fn apply_and_verify_verbs() {
         assert_eq!(route(&["apply".into()]), Route::Apply);
         assert_eq!(route(&["verify".into()]), Route::Verify);
+        assert_eq!(route(&["verify-probe".into()]), Route::VerifyProbe);
+    }
+
+    #[test]
+    fn ssh_exec_of_verify_probe_word_is_still_shim_exec() {
+        // `ssh host "verify-probe"` arrives as `-c "verify-probe"` → shim-exec, NOT the verb.
+        assert_eq!(
+            route(&["-c".into(), "verify-probe".into()]),
+            Route::Shim { exec: Some("verify-probe".into()) }
+        );
     }
 
     #[test]

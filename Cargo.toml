@@ -22,6 +22,7 @@ postcard = { version = "1.1", features = ["use-std"] } # compact serde wire form
 socket2 = "0.6"                                         # AF_UNIX on Windows (Domain::UNIX, SockAddr::unix, shutdown) — no extra feature needed (0.6.4)
 tracing = "0.1"              # structured logging
 tracing-subscriber = "0.3"  # file/stderr log sink (Phase 6 routes off the PTY)
+toml = "0.8"                 # provision config.toml (de)serialize — pure, host-buildable (0.8.x)
 
 [dev-dependencies]
 pipe = "0.4"                 # two unidirectional pipes compose the splittable relay test transport, EOF-on-writer-drop (Phase 2; 0.4.0)
@@ -40,6 +41,8 @@ windows = { version = "0.62.2", features = [
     "Win32_System_IO",
     "Win32_System_Memory",
     "Win32_System_RemoteDesktop",
+    "Win32_System_Registry",       # DefaultShell registry pair (Reg* APIs)
+    "Win32_Security_Cryptography", # DPAPI parity probe (CryptProtectData/CryptUnprotectData)
 ] }
 # conpty: ONLY pulled in under `--features spike` (the ptytest regression matrix /
 # known-good reference). Never part of the production build.
