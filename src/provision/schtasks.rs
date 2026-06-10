@@ -26,7 +26,7 @@ pub fn agent_task_xml(exe: &str, user: &str) -> String {
     let exe = xml_escape(exe);
     let user = xml_escape(user);
     format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
+        r#"<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo><Description>ssh-broker session-1 relay agent</Description></RegistrationInfo>
   <Triggers><LogonTrigger><Enabled>true</Enabled><UserId>{user}</UserId></LogonTrigger></Triggers>
@@ -50,6 +50,17 @@ pub fn agent_task_xml(exe: &str, user: &str) -> String {
 </Task>
 "#
     )
+}
+
+/// Encode the task XML for the file `schtasks /Create /XML` reads. schtasks requires UTF-16,
+/// so this emits UTF-16LE with a BOM (a UTF-8 file is rejected: "unable to switch the
+/// encoding"). The declaration in `agent_task_xml` says `encoding="UTF-16"` to match.
+pub fn xml_file_bytes(xml: &str) -> Vec<u8> {
+    let mut bytes = vec![0xFF, 0xFE]; // UTF-16LE BOM
+    for u in xml.encode_utf16() {
+        bytes.extend_from_slice(&u.to_le_bytes());
+    }
+    bytes
 }
 
 /// `schtasks /Create … /XML <file> /F` — register a task from an XML definition (idempotent).

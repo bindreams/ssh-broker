@@ -11,6 +11,18 @@ fn agent_xml_sets_interactive_token_and_least_privilege() {
     assert!(xml.contains("<Arguments>agent</Arguments>"));
     assert!(xml.contains("<UserId>Test.User</UserId>"));
     assert!(xml_has_interactive_token(&xml));
+    // schtasks /XML rejects UTF-8; the declaration must match the UTF-16 file we write.
+    assert!(xml.contains(r#"encoding="UTF-16""#));
+}
+
+#[test]
+fn xml_file_bytes_is_utf16le_with_bom() {
+    let xml = agent_task_xml("C:\\x.exe", "u");
+    let bytes = xml_file_bytes(&xml);
+    assert_eq!(&bytes[..2], &[0xFF, 0xFE], "must start with a UTF-16LE BOM");
+    // The body after the BOM decodes back to the original XML.
+    let u16s: Vec<u16> = bytes[2..].chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+    assert_eq!(String::from_utf16(&u16s).unwrap(), xml);
 }
 
 #[test]

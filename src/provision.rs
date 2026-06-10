@@ -188,7 +188,8 @@ mod imp {
     fn register_agent_task(exe: &Path, user: &str) -> anyhow::Result<()> {
         let xml = schtasks::agent_task_xml(&exe.to_string_lossy(), user);
         let xml_path = base_dir().join("agent-task.xml");
-        std::fs::write(&xml_path, xml).context("write agent task xml")?;
+        // schtasks /XML requires a UTF-16 file (a UTF-8 one is rejected).
+        std::fs::write(&xml_path, schtasks::xml_file_bytes(&xml)).context("write agent task xml")?;
         run_schtasks(&schtasks::create_from_xml_argv(
             schtasks::AGENT_TASK,
             &xml_path.to_string_lossy(),
@@ -284,8 +285,15 @@ mod imp {
             registered && interactive,
             format!("registered={registered} interactive_token={interactive}"),
         ));
+        // Informational: verify runs via the LeastPrivilege agent (non-elevated) and cannot
+        // reliably query a SYSTEM-owned task, so this never gates verify (apply errors loudly
+        // if registration fails, and the reboot self-heal is exercised in the Phase-8 test).
         let (_, heal_ok) = query_schtasks(&schtasks::query_task_argv(schtasks::SELFHEAL_TASK));
-        rows.push(report::Check::new("self-heal task", heal_ok, String::new()));
+        rows.push(report::Check::new(
+            "self-heal task (info)",
+            true,
+            if heal_ok { "registered" } else { "not queryable (needs elevation)" },
+        ));
 
         // Local: the socket is reachable.
         let reachable = afunix::connect(&afunix::socket_path()).is_ok();
@@ -294,11 +302,13 @@ mod imp {
         // Through the agent: the real parity proof (run in session 1 by verify-probe).
         match drive_probe(&exe) {
             Ok(p) => {
-                let session_ok = p.session_id != 0 && p.session_id == probe::active_console_session();
+                // Parity = escaped session 0 (the limited network-logon session). The agent
+                // need not be in THE active-console session — a box can have several
+                // interactive sessions — and DPAPI/symlink below confirm it is a genuine one.
                 rows.push(report::Check::new(
-                    "session 1 (via agent)",
-                    session_ok,
-                    format!("session_id={} console={}", p.session_id, probe::active_console_session()),
+                    "interactive session (via agent)",
+                    p.session_id != 0,
+                    format!("session_id={} (active console={})", p.session_id, probe::active_console_session()),
                 ));
                 rows.push(report::Check::new("DPAPI (via agent)", p.dpapi_ok, String::new()));
                 // Only a confirmed Blocked is a parity failure; Skipped (unprivileged,
@@ -347,10 +357,11 @@ mod imp {
         let dpapi = probe::dpapi_roundtrip(b"ssh-broker-parity-probe");
         let symlink = probe::symlink_probe();
         println!("{}", probe::format_probe_line(sid, dpapi, symlink));
-        // session-1 + DPAPI are the hard parity gates; a CONFIRMED symlink block also fails, but
-        // a Skipped (unprivileged, untestable) symlink does not.
-        let pass =
-            sid != 0 && sid == probe::active_console_session() && dpapi && !symlink.is_failure();
+        // Parity gates: escaped session 0 AND a working DPAPI (proves a real user profile, the
+        // thing session 0 lacks). A CONFIRMED symlink block also fails; a Skipped (unprivileged,
+        // untestable) symlink does not. The active-console id is NOT required to match — a host
+        // can have several interactive sessions; any non-0 one with DPAPI is parity.
+        let pass = sid != 0 && dpapi && !symlink.is_failure();
         if !pass {
             std::process::exit(1);
         }
