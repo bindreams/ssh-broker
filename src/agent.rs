@@ -30,7 +30,7 @@ use crate::relay::{FrameSink, pump_decode, write_data};
 #[cfg(windows)]
 use crate::winutil::OwnedHandle;
 #[cfg(windows)]
-use std::path::Path;
+use std::path::{Path, PathBuf};
 #[cfg(windows)]
 use std::sync::{Arc, Mutex};
 
@@ -56,6 +56,26 @@ fn default_shell() -> String {
     "pwsh.exe -NoLogo".to_string()
 }
 
+/// The session-1 user's home directory (`%USERPROFILE%`), if it exists. The agent runs AS that
+/// user, so its own environment carries the correct profile path.
+#[cfg(windows)]
+fn home_dir() -> Option<PathBuf> {
+    let p = PathBuf::from(std::env::var_os("USERPROFILE")?);
+    p.is_dir().then_some(p)
+}
+
+/// The working directory to start the child in: the handshake's explicit `cwd` if any, else the
+/// user's home directory. This mirrors what a normal SSH login does — sshd's `do_child()` runs
+/// `chdir(pw->pw_dir)` to the user's home before exec'ing the shell — so `ssh host` lands you in
+/// your home, not wherever the agent task happened to start (`C:\Windows\System32`).
+fn child_cwd(handshake_cwd: &str, home: Option<std::path::PathBuf>) -> Option<std::path::PathBuf> {
+    if handshake_cwd.is_empty() {
+        home
+    } else {
+        Some(std::path::PathBuf::from(handshake_cwd))
+    }
+}
+
 /// Read the handshake, then dispatch to the PTY or EXEC relay.
 #[cfg(windows)]
 fn handle_connection(conn: socket2::Socket) -> anyhow::Result<()> {
@@ -65,10 +85,37 @@ fn handle_connection(conn: socket2::Socket) -> anyhow::Result<()> {
     anyhow::ensure!(frame.kind == FrameKind::Handshake, "first frame was not a handshake");
     let hs = Handshake::decode(&frame.payload)?;
     let command = hs.command.clone().unwrap_or_else(default_shell);
-    let cwd = if hs.cwd.is_empty() { None } else { Some(Path::new(&hs.cwd)) };
+    let cwd_buf = child_cwd(&hs.cwd, home_dir());
+    let cwd = cwd_buf.as_deref();
     match hs.mode {
         Mode::Pty => handle_pty(rx, fr, tx, &command, hs.cols, hs.rows, cwd),
         Mode::Exec => handle_exec(rx, fr, tx, &command, cwd),
+    }
+}
+
+#[cfg(test)]
+mod cwd_logic_tests {
+    use super::child_cwd;
+    use std::path::PathBuf;
+
+    #[test]
+    fn empty_handshake_cwd_falls_back_to_home() {
+        let home = Some(PathBuf::from(r"C:\Users\me"));
+        assert_eq!(child_cwd("", home.clone()), home);
+    }
+
+    #[test]
+    fn explicit_handshake_cwd_wins_over_home() {
+        assert_eq!(
+            child_cwd(r"C:\work", Some(PathBuf::from(r"C:\Users\me"))),
+            Some(PathBuf::from(r"C:\work"))
+        );
+    }
+
+    #[test]
+    fn empty_cwd_and_no_home_is_none() {
+        // No worse than today's behaviour (inherit the agent's cwd) when home is unresolvable.
+        assert_eq!(child_cwd("", None), None);
     }
 }
 
