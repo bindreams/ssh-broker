@@ -99,12 +99,80 @@ struct ExecOutSink<O: Write, E: Write> {
 
 impl<O: Write, E: Write> FrameSink for ExecOutSink<O, E> {
     fn on_data(&mut self, stream: Stream, bytes: &[u8]) -> anyhow::Result<()> {
+        // Flush after each frame: `std::io::stdout()` is a LineWriter, so newline-less or binary
+        // output (e.g. a streaming command, or a relayed sftp protocol) would otherwise sit in
+        // the buffer until a newline or process exit — hanging the client.
         match stream {
-            Stream::Stderr => self.err.write_all(bytes)?,
-            _ => self.out.write_all(bytes)?, // Stdout (Pty/Stdin not expected in EXEC)
+            Stream::Stderr => {
+                self.err.write_all(bytes)?;
+                self.err.flush()?;
+            }
+            _ => {
+                self.out.write_all(bytes)?; // Stdout (Pty/Stdin not expected in EXEC)
+                self.out.flush()?;
+            }
         }
         Ok(())
     }
+}
+
+/// Whether an EXEC command is an sftp/scp FILE TRANSFER that the shim should run locally rather
+/// than relay to the agent. File transfer needs raw binary stdio and gains nothing from session-1
+/// parity, so relaying its long-lived binary protocol is pure downside (latency + a buffering
+/// failure surface). Detected by the subsystem helper (`sftp-server`/`internal-sftp`) or the
+/// rcp protocol's internal `-t`/`-f` flags — markers a human would never type, so no real
+/// session-1 command is misrouted.
+pub fn is_transfer_command(cmd: &str) -> bool {
+    let tokens = split_command(cmd);
+    let Some(prog) = tokens.first() else {
+        return false;
+    };
+    match program_basename(prog).as_str() {
+        "sftp-server" | "internal-sftp" => true,
+        // The rcp protocol always emits `scp <opts> -t <path>` / `-f <path>` with the flag
+        // immediately before the single trailing path operand (never combined like `-rt`).
+        // Require that position so a legitimate `scp … -t …`-to-a-third-host is not misrouted.
+        "scp" => tokens.len() >= 2 && matches!(tokens[tokens.len() - 2].as_str(), "-t" | "-f"),
+        _ => false,
+    }
+}
+
+/// Split a command line into tokens, respecting double quotes (so a program path containing
+/// spaces stays one token). Quote characters are stripped. Good enough for the transfer-detection
+/// heuristic; not a full Win32 `CommandLineToArgvW` (no backslash-escaping of quotes).
+fn split_command(cmd: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut cur = String::new();
+    let mut in_quotes = false;
+    let mut has_token = false;
+    for ch in cmd.chars() {
+        match ch {
+            '"' => has_token = {
+                in_quotes = !in_quotes;
+                true
+            },
+            c if c.is_whitespace() && !in_quotes => {
+                if has_token {
+                    tokens.push(std::mem::take(&mut cur));
+                    has_token = false;
+                }
+            }
+            c => {
+                cur.push(c);
+                has_token = true;
+            }
+        }
+    }
+    if has_token {
+        tokens.push(cur);
+    }
+    tokens
+}
+
+/// The program's lowercase basename without a `.exe` suffix (path separators stripped).
+fn program_basename(prog: &str) -> String {
+    let base = prog.rsplit(['\\', '/']).next().unwrap_or(prog).to_ascii_lowercase();
+    base.strip_suffix(".exe").unwrap_or(&base).to_string()
 }
 
 // ── PTY relay helpers (pure; the live console path is Windows-only, Phase 8) ───────────

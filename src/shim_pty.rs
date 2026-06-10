@@ -60,6 +60,18 @@ const VT_OUT: CONSOLE_MODE = CONSOLE_MODE(
 /// since `process::exit` runs no destructors and the log is the only PTY-mode diagnostic.
 pub fn run_on(exec: Option<String>) -> anyhow::Result<()> {
     let log = init_file_logging();
+
+    // sftp/scp FILE TRANSFERS run locally, not through the agent: they need raw binary
+    // bidirectional stdio and gain nothing from session-1 parity, so relaying their long-lived
+    // binary protocol only adds latency + a buffering failure surface. (This is what sshd's
+    // sftp subsystem becomes once DefaultShell is the shim: `ssh-broker -c "sftp-server.exe"`.)
+    if let Some(cmd) = &exec {
+        if crate::shim::is_transfer_command(cmd) {
+            drop(log);
+            return run_local_passthrough(cmd);
+        }
+    }
+
     match try_relay(&exec) {
         Ok(Some(code)) => {
             drop(log); // flush the appender before process::exit
@@ -127,6 +139,58 @@ fn try_relay(exec: &Option<String>) -> anyhow::Result<Option<i32>> {
 /// `$TERM` from the SSH environment, defaulting to a sane 256-colour terminal.
 fn term() -> String {
     std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".into())
+}
+
+/// Run an sftp/scp transfer command LOCALLY (in the session sshd launched us in), inheriting
+/// our stdio directly, instead of relaying it to the agent. The child writes raw to sshd's
+/// pipes (no Rust buffering), exactly as the original DefaultShell did. Exits with its code.
+fn run_local_passthrough(command: &str) -> anyhow::Result<()> {
+    use anyhow::Context;
+    use windows::Win32::Foundation::{CloseHandle, HANDLE_FLAG_INHERIT, SetHandleInformation};
+    use windows::Win32::System::Console::STD_ERROR_HANDLE;
+    use windows::Win32::System::Threading::{
+        CreateProcessW, GetExitCodeProcess, INFINITE, PROCESS_CREATION_FLAGS, PROCESS_INFORMATION,
+        STARTF_USESTDHANDLES, STARTUPINFOW, WaitForSingleObject,
+    };
+    use windows::core::PWSTR;
+    unsafe {
+        let stdin = GetStdHandle(STD_INPUT_HANDLE)?;
+        let stdout = GetStdHandle(STD_OUTPUT_HANDLE)?;
+        let stderr = GetStdHandle(STD_ERROR_HANDLE)?;
+        // STARTF_USESTDHANDLES only passes handles the child can inherit; make sure they are.
+        for h in [stdin, stdout, stderr] {
+            let _ = SetHandleInformation(h, HANDLE_FLAG_INHERIT.0, HANDLE_FLAG_INHERIT);
+        }
+        let si = STARTUPINFOW {
+            cb: std::mem::size_of::<STARTUPINFOW>() as u32,
+            dwFlags: STARTF_USESTDHANDLES,
+            hStdInput: stdin,
+            hStdOutput: stdout,
+            hStdError: stderr,
+            ..Default::default()
+        };
+        let mut cmd: Vec<u16> = command.encode_utf16().chain(std::iter::once(0)).collect();
+        let mut pi = PROCESS_INFORMATION::default();
+        CreateProcessW(
+            None,
+            Some(PWSTR(cmd.as_mut_ptr())),
+            None,
+            None,
+            true, // inherit handles → the child gets sshd's stdio directly (binary-clean)
+            PROCESS_CREATION_FLAGS(0),
+            None,
+            None,
+            &si,
+            &mut pi,
+        )
+        .with_context(|| format!("spawn local transfer command: {command}"))?;
+        WaitForSingleObject(pi.hProcess, INFINITE);
+        let mut code = 0u32;
+        let _ = GetExitCodeProcess(pi.hProcess, &mut code);
+        let _ = CloseHandle(pi.hThread);
+        let _ = CloseHandle(pi.hProcess);
+        std::process::exit(code as i32);
+    }
 }
 
 /// Exec a local shell, inheriting the current stdio (behaviour == today's thin shell), and

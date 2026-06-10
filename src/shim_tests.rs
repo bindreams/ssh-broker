@@ -4,10 +4,10 @@
 use crate::protocol::{
     ExitCode, FrameKind, FrameReader, Handshake, Mode, Resize, Stream, read_one_frame, write_frame,
 };
-use crate::relay::{Outcome, duplex, write_data};
+use crate::relay::{FrameSink, Outcome, duplex, write_data};
 use super::{
-    Fallback, MouseModeSniffer, XtwinopsFilter, decide_fallback, make_handshake, map_outcome,
-    size_to_resize,
+    ExecOutSink, Fallback, MouseModeSniffer, XtwinopsFilter, decide_fallback, is_transfer_command,
+    make_handshake, map_outcome, size_to_resize,
 };
 
 #[test]
@@ -96,6 +96,65 @@ fn exec_shim_truncated_stream_is_254() {
 #[test]
 fn size_event_maps_to_resize_frame() {
     assert_eq!(size_to_resize(120, 40), Resize { cols: 120, rows: 40 });
+}
+
+// ── is_transfer_command (route sftp/scp locally, not through the agent) ──────────────
+
+#[test]
+fn detects_sftp_and_scp_transfers() {
+    // The sftp subsystem (the dominant path) — bare name, full path, internal-sftp.
+    assert!(is_transfer_command("sftp-server.exe"));
+    assert!(is_transfer_command(r"C:\Windows\System32\OpenSSH\sftp-server.exe"));
+    assert!(is_transfer_command("sftp-server.exe -l ERROR")); // with args
+    assert!(is_transfer_command("internal-sftp"));
+    // A quoted path with spaces (a "C:\Program Files\OpenSSH\…" install) must still be detected
+    // — split_whitespace would shatter it and re-hang sftp.
+    assert!(is_transfer_command(r#""C:\Program Files\OpenSSH\sftp-server.exe""#));
+    assert!(is_transfer_command(r#""C:\Program Files\OpenSSH\sftp-server.exe" -l ERROR"#));
+    // The rcp protocol's -t/-f immediately before the trailing path.
+    assert!(is_transfer_command("scp -t /tmp/x"));
+    assert!(is_transfer_command("scp -p -f /tmp/x"));
+}
+
+#[test]
+fn does_not_misdetect_normal_commands() {
+    // A user running scp on the remote host to a THIRD host wants session-1 parity, not a
+    // local transfer.
+    assert!(!is_transfer_command("scp file other-host:/path"));
+    // A -t/-f NOT in the rcp protocol's trailing-path position must NOT be misdetected.
+    assert!(!is_transfer_command("scp -i -t file host:/p"));
+    assert!(!is_transfer_command("pwsh -c Get-ChildItem"));
+    assert!(!is_transfer_command("git status"));
+    assert!(!is_transfer_command("sftp-something-else.exe")); // not sftp-server
+    assert!(!is_transfer_command(""));
+}
+
+#[test]
+fn exec_out_sink_flushes_each_frame() {
+    // The bug that hung sftp: streaming/binary output (no newlines) must reach the client
+    // immediately, not sit in a LineWriter buffer until a newline or process exit.
+    #[derive(Default)]
+    struct FlushSpy {
+        bytes: Vec<u8>,
+        flushes: usize,
+    }
+    impl std::io::Write for FlushSpy {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.bytes.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.flushes += 1;
+            Ok(())
+        }
+    }
+    let mut sink = ExecOutSink { out: FlushSpy::default(), err: FlushSpy::default() };
+    sink.on_data(Stream::Stdout, b"binary-no-newline").unwrap();
+    sink.on_data(Stream::Stderr, b"err-no-newline").unwrap();
+    assert_eq!(sink.out.bytes, b"binary-no-newline");
+    assert_eq!(sink.out.flushes, 1, "stdout must flush after each frame");
+    assert_eq!(sink.err.bytes, b"err-no-newline");
+    assert_eq!(sink.err.flushes, 1, "stderr must flush after each frame");
 }
 
 #[test]
