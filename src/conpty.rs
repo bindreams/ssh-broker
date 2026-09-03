@@ -17,6 +17,16 @@
 //! Relay threading + cancellation + the close-then-drain teardown ordering live in the
 //! agent (it owns the pump threads); `PtySession` provides the cancelable primitive
 //! (`close_pty` makes the output pipe hit EOF) and the raw handles for those threads.
+//!
+//! Session placement is NOT a ConPTY constraint. A pseudoconsole created in session 0 can
+//! host a child launched into a *different* (interactive) session: with a SYSTEM process
+//! using `WTSQueryUserToken` + `CreateProcessAsUserW`, the child landed in the console
+//! session (confirmed parent-side via `ProcessIdToSessionId`), exited 0, and its VT came
+//! back through the session-0 pseudoconsole byte-identical to a same-session control.
+//! The agent still runs *inside* the target session, but by choice, not necessity: that
+//! keeps the relay at the user's privilege instead of SYSTEM's, and inherits the real
+//! profile/environment for free (`CreateProcessAsUserW` with a null environment block
+//! hands the child SYSTEM's environment, not the user's).
 
 use std::path::Path;
 

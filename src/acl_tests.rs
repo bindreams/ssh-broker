@@ -1,5 +1,5 @@
 //! Unit tests for the `acl` module. Windows-only (the module is `#[cfg(windows)]`);
-//! they run on winhost via the cross-compile -> scp -> run loop and fail loudly if the
+//! they run on a real Windows host via the cross-compile -> scp -> run loop and fail loudly if the
 //! ACL primitives are broken (no skip-on-missing).
 use super::*;
 

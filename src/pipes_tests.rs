@@ -1,4 +1,4 @@
-//! Windows-only tests for the EXEC child (run on winhost).
+//! Windows-only tests for the EXEC child (run on a real Windows host).
 use super::*;
 use crate::conpty::read_handle;
 use std::thread;

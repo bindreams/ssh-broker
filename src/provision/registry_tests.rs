@@ -11,7 +11,7 @@ fn pair_is_option_first_then_shell() {
 
 /// Round-trips the pair through a throwaway subkey on Windows (plan Task 7.1), exercising the
 /// real Reg* FFI under HKCU so it needs no elevation (the production path is identical but
-/// targets HKLM). Runs on winhost; fails loudly on any Reg* error (never skips).
+/// targets HKLM). Runs on a real Windows host; fails loudly on any Reg* error (never skips).
 #[cfg(windows)]
 #[test]
 fn writes_and_reads_default_shell_pair() {

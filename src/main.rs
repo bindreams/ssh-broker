@@ -24,9 +24,6 @@ mod vtinput;
 #[cfg(windows)]
 mod winutil;
 
-#[cfg(all(windows, feature = "spike"))]
-mod spike;
-
 #[derive(Debug, PartialEq, Eq)]
 pub enum Route {
     /// The SSH DefaultShell. `exec` is `Some(command)` for `-c "cmd"`, `None` for
@@ -66,12 +63,6 @@ pub fn route(args: &[String]) -> Route {
 
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-
-    // Spike subcommands (diag/ptytest/conpty) are only present under `--features spike`.
-    #[cfg(all(windows, feature = "spike"))]
-    if let Some(result) = spike::try_dispatch(&args) {
-        return result;
-    }
 
     match route(&args) {
         Route::Shim { exec } => shim::run(exec),

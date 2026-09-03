@@ -1,6 +1,6 @@
 //! Cross-platform tests for the shim relay logic: the EXEC relay (over the in-memory
 //! duplex transport), the fail-open decision, and the pure helpers. The Windows console
-//! PTY path (raw mode, `ReadConsoleInputW`) is exercised on winhost / in Phase 8.
+//! PTY path (raw mode, `ReadConsoleInputW`) is exercised on a real Windows host end-to-end.
 use crate::protocol::{
     ExitCode, FrameKind, FrameReader, Handshake, Mode, Resize, Stream, read_one_frame, write_frame,
 };

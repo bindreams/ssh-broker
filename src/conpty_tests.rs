@@ -1,5 +1,5 @@
 //! Unit tests for the `conpty` module. Windows-only (the module is `#[cfg(windows)]`);
-//! they run on winhost via the cross-compile -> scp -> run loop.
+//! they run on a real Windows host via the cross-compile -> scp -> run loop.
 use super::*;
 
 /// Drain a raw output handle to EOF on a thread (EOF arrives after `close_pty`).

@@ -60,7 +60,7 @@ fn handshake_roundtrips() {
         cols: 100,
         rows: 30,
         term: "xterm-256color".into(),
-        cwd: "C:\\Users\\Test.User".into(),
+        cwd: "C:\\Users\\example".into(),
         command: None,
         env: vec![("LANG".into(), "C".into())],
     };

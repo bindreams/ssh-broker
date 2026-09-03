@@ -113,7 +113,7 @@ impl Sid {
         }
     }
 
-    /// Resolve a SID from an account name (e.g. "Test.User" or "DOMAIN\\user").
+    /// Resolve a SID from an account name (e.g. "jdoe" or "DOMAIN\\user").
     pub fn lookup(account: &str) -> anyhow::Result<Sid> {
         let name: Vec<u16> = account.encode_utf16().chain(std::iter::once(0)).collect();
         unsafe {

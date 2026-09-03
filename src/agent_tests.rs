@@ -1,4 +1,4 @@
-//! Windows-only integration tests for the agent (run on winhost via the cross-compile
+//! Windows-only integration tests for the agent (run on a real Windows host via the cross-compile
 //! -> scp -> run loop). They drive `handle_connection` over a real AF_UNIX socket.
 use crate::afunix::{self, Listener};
 use crate::protocol::{FrameKind, FrameReader, Handshake, Mode, Stream, write_frame};

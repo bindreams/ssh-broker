@@ -3,14 +3,6 @@ name = "ssh-broker"
 version = "0.1.0"
 edition = "2024"
 
-[features]
-# `spike` keeps the feasibility-spike scaffolding (src/spike.rs + src/relay_spike.rs
-# and the diag/ptytest/conpty subcommands) and its `conpty` regression-reference
-# dependency OUT of the default production build. Build/test the spike with:
-#   cargo build --target x86_64-pc-windows-msvc --features spike
-# The production relay is reimplemented in the conpty/agent/shim modules.
-spike = ["dep:conpty"]
-
 # Cross-platform dependencies (compile + unit-test on the macOS host).
 # Versions are pinned and cited per project rule; exact resolved versions live in
 # Cargo.lock. Citations gathered by the verify-foundation-crates workflow.
@@ -44,9 +36,6 @@ windows = { version = "0.62.2", features = [
     "Win32_System_Registry",       # DefaultShell registry pair (Reg* APIs)
     "Win32_Security_Cryptography", # DPAPI parity probe (CryptProtectData/CryptUnprotectData)
 ] }
-# conpty: ONLY pulled in under `--features spike` (the ptytest regression matrix /
-# known-good reference). Never part of the production build.
-conpty = { version = "0.7.0", optional = true }
 # tracing-appender: rolling file sink for the shim's logs under ProgramData (the shim must
 # never log to the PTY stdout/stderr in interactive mode). Only the Windows shim uses it.
 tracing-appender = "0.2"
