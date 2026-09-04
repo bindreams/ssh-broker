@@ -24,6 +24,9 @@ const PROC_THREAD_ATTRIBUTE_HANDLE_LIST: usize = 0x0002_0002;
 /// A child process with redirected stdin/stdout/stderr (the EXEC path).
 pub struct ExecChild {
     process: OwnedHandle,
+    /// The child's pid. Tearing down the whole process tree needs an identity the OS can
+    /// resolve to descendants; a process HANDLE cannot be walked that way.
+    pid: u32,
     _thread: OwnedHandle,
     stdin_write: Option<OwnedHandle>,
     stdout_read: OwnedHandle,
@@ -100,6 +103,7 @@ impl ExecChild {
             drop(stderr_write);
 
             Ok(ExecChild {
+                pid: pi.dwProcessId,
                 process: OwnedHandle(pi.hProcess),
                 _thread: OwnedHandle(pi.hThread),
                 stdin_write: Some(stdin_write),
@@ -118,7 +122,12 @@ impl ExecChild {
         self.stderr_read.raw()
     }
 
-    /// Raw child-process handle (`isize`) — for `TerminateProcess` from a relay thread.
+    /// The child's pid, for process-tree teardown.
+    pub fn pid(&self) -> u32 {
+        self.pid
+    }
+
+    /// Raw child-process handle (`isize`) — for `wait`/`GetExitCodeProcess`.
     pub fn process_raw(&self) -> isize {
         self.process.raw()
     }

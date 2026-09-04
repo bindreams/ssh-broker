@@ -148,6 +148,9 @@ pub fn close_pty_raw(hpc_raw: isize) {
 pub struct PtySession {
     hpc: Option<OwnedHpcon>,
     process: OwnedHandle,
+    /// The child's pid. Tearing down the whole process tree needs an identity the OS can
+    /// resolve to descendants; a process HANDLE cannot be walked that way.
+    pid: u32,
     _thread: OwnedHandle,
     in_write: OwnedHandle,
     out_read: OwnedHandle,
@@ -211,12 +214,18 @@ impl PtySession {
 
             Ok(PtySession {
                 hpc: Some(hpc),
+                pid: pi.dwProcessId,
                 process: OwnedHandle(pi.hProcess),
                 _thread: OwnedHandle(pi.hThread),
                 in_write,
                 out_read,
             })
         }
+    }
+
+    /// The child's pid, for process-tree teardown.
+    pub fn pid(&self) -> u32 {
+        self.pid
     }
 
     /// Raw output-read handle (as `isize`) for the agent's reader thread.

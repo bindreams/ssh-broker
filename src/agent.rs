@@ -135,7 +135,7 @@ fn handle_pty(
 
     let out_raw = session.out_read_raw();
     let in_raw = session.in_write_raw();
-    let proc_raw = session.process_raw();
+    let child_pid = session.pid();
     // HPCON shared behind a mutex: the input thread resizes under the lock; teardown takes
     // it (→ None) and closes it under the lock, so resize can never touch a closed HPCON.
     let hpc_cell = Arc::new(Mutex::new(Some(session.take_hpc_raw())));
@@ -169,7 +169,7 @@ fn handle_pty(
         std::thread::spawn(move || {
             let mut sink = PtyInputSink { in_raw, hpc_cell };
             let _ = pump_decode(&mut rx, &mut fr, &mut sink);
-            kill_process(proc_raw);
+            kill_tree(child_pid);
         })
     };
 
@@ -237,13 +237,13 @@ fn handle_exec(
     let mut child = ExecChild::spawn(command, cwd)?;
     let out_raw = child.stdout_read_raw();
     let err_raw = child.stderr_read_raw();
-    let proc_raw = child.process_raw();
+    let child_pid = child.pid();
     let stdin_owned = child.take_stdin_write();
     // stdout, stderr, and the EXIT frame all share tx → serialize with a mutex.
     let tx_arc = Arc::new(Mutex::new(tx));
 
-    let t_out = spawn_stream_pump(out_raw, Stream::Stdout, Arc::clone(&tx_arc), proc_raw);
-    let t_err = spawn_stream_pump(err_raw, Stream::Stderr, Arc::clone(&tx_arc), proc_raw);
+    let t_out = spawn_stream_pump(out_raw, Stream::Stdout, Arc::clone(&tx_arc), child_pid);
+    let t_err = spawn_stream_pump(err_raw, Stream::Stderr, Arc::clone(&tx_arc), child_pid);
 
     // stdin pump owns the child's stdin-write handle. A half-close mid-session (empty
     // DATA(Stdin) marker) closes only the child's stdin so a reader like sort/findstr
@@ -255,7 +255,7 @@ fn handle_exec(
         let mut sink = ExecInputSink { stdin: stdin_owned };
         let _ = pump_decode(&mut rx, &mut fr, &mut sink);
         drop(sink); // close the child's stdin if the EOF marker never arrived
-        kill_process(proc_raw);
+        kill_tree(child_pid);
     });
 
     let wait_result = child.wait();
@@ -280,7 +280,7 @@ fn spawn_stream_pump(
     raw: isize,
     stream: Stream,
     tx: Arc<Mutex<ConnTx>>,
-    proc_raw: isize,
+    child_pid: u32,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let mut buf = [0u8; 32 * 1024];
@@ -294,7 +294,7 @@ fn spawn_stream_pump(
                 write_data(&mut *g, stream, &buf[..n]).is_ok()
             };
             if !ok {
-                kill_process(proc_raw); // SSH side gone → unblock the waiter
+                kill_tree(child_pid); // SSH side gone → unblock the waiter
                 break;
             }
         }
@@ -328,15 +328,30 @@ impl FrameSink for ExecInputSink {
     // on_resize: default no-op (EXEC has no pseudoconsole).
 }
 
-/// `TerminateProcess` by raw handle (no-op-safe to call on an already-exited child).
+/// Terminate the child **and everything it spawned**.
+///
+/// Terminating the child alone leaves its descendants running, so a relayed shell that
+/// launched anything in the background leaked it past the end of the SSH session.
+///
+/// Descendants are enumerated before the root is killed: once the root dies its children
+/// are orphaned and the parent links the walk relies on no longer lead anywhere.
+///
+/// Deliberate limitation: without a job object this is a treewalk, so a process created
+/// *during* the walk can still escape. Pid reuse is not a hazard — cosca's `Process`
+/// identity is `(pid, start_token)`, so a recycled pid resolves as a different process.
+/// A job object is the complete fix and is tracked separately.
 #[cfg(windows)]
-fn kill_process(proc_raw: isize) {
-    unsafe {
-        let _ = windows::Win32::System::Threading::TerminateProcess(
-            windows::Win32::Foundation::HANDLE(proc_raw as *mut core::ffi::c_void),
-            1,
-        );
+fn kill_tree(pid: u32) {
+    use cosca::identity::Resolved;
+    use cosca::process::{Process, Recursive};
+
+    let Resolved::Found(root) = Process::from_pid(pid) else {
+        return; // already gone, or the OS refused the query
+    };
+    for descendant in root.children(Recursive::Yes) {
+        let _ = descendant.kill();
     }
+    let _ = root.kill();
 }
 
 // ── single-instance ────────────────────────────────────────────────────────────────

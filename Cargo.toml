@@ -36,6 +36,12 @@ windows = { version = "0.62.2", features = [
     "Win32_System_Registry",       # DefaultShell registry pair (Reg* APIs)
     "Win32_Security_Cryptography", # DPAPI parity probe (CryptProtectData/CryptUnprotectData)
 ] }
+# cosca: process-tree teardown. `TerminateProcess` kills only the process named, so a
+# relayed shell's background children outlive the session without this. Its `Process`
+# identity is (pid, start_token), so a recycled pid cannot be mis-targeted.
+# API is explicitly unstable across 0.x releases.
+cosca = "0.3"
+
 # tracing-appender: rolling file sink for the shim's logs under ProgramData (the shim must
 # never log to the PTY stdout/stderr in interactive mode). Only the Windows shim uses it.
 tracing-appender = "0.2"

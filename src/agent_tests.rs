@@ -238,3 +238,91 @@ fn agent_rejects_non_handshake_first_frame() {
     assert!(result.is_err(), "a non-handshake first frame must be rejected");
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// A relayed command spawns a background process; the SSH side then disconnects. The
+/// grandchild must not survive the session.
+///
+/// This is the regression gate for the teardown defect: the old path terminated the direct
+/// child only, so anything the relayed shell had launched kept running with no session left
+/// to reach it.
+///
+/// The rendezvous is real rather than timed. The command writes the grandchild's pid, *then*
+/// prints a marker, and the client disconnects only after reading that marker — so the
+/// grandchild is guaranteed to exist before teardown starts. The client opens a handle to it
+/// before disconnecting, which also pins the pid: Windows will not recycle it while a handle
+/// is open, so the post-teardown wait cannot be fooled into watching a different process.
+///
+/// The final wait is `INFINITE` on purpose. If the descendant is never killed this test hangs
+/// instead of flaking, matching how `agent_exec_tears_down_when_ssh_disconnects_first` is
+/// built — a hang is a loud, deterministic failure; a timeout would be a guess.
+#[test]
+fn agent_disconnect_kills_the_whole_process_tree() {
+    use crate::protocol::read_one_frame;
+    use windows::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows::Win32::System::Threading::{
+        INFINITE, OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject,
+    };
+
+    let dir = hardened_dir("tree");
+    let sock = dir.join("s");
+    let pidfile = dir.join("grandchild.pid");
+    let listener = Listener::bind(&sock).unwrap();
+
+    // Order matters inside the script: the pid file is complete before the marker is
+    // printed, so a client that has seen the marker can always read a valid pid.
+    let cmd = format!(
+        "pwsh.exe -NoLogo -NoProfile -Command \"$p = Start-Process pwsh.exe -ArgumentList \
+         '-NoLogo','-NoProfile','-Command','Start-Sleep -Seconds 99999' -PassThru; \
+         $p.Id | Set-Content -LiteralPath '{}'; Write-Output 'SPAWNED'; \
+         Start-Sleep -Seconds 99999\"",
+        pidfile.display()
+    );
+
+    let (tx_handle, rx_handle) = std::sync::mpsc::channel::<isize>();
+    let client_path = sock.clone();
+    let client = thread::spawn(move || {
+        let conn = afunix::connect(&client_path).unwrap();
+        let (mut crx, mut ctx) = afunix::split(conn).unwrap();
+        let hs = Handshake {
+            mode: Mode::Exec,
+            command: Some(cmd),
+            ..Handshake::pty_default()
+        };
+        write_frame(&mut ctx, FrameKind::Handshake, &hs.encode().unwrap()).unwrap();
+
+        let mut fr = FrameReader::new();
+        loop {
+            let f = read_one_frame(&mut crx, &mut fr).unwrap();
+            // DATA payloads are [stream tag][bytes].
+            if f.kind == FrameKind::Data
+                && f.payload.len() > 1
+                && String::from_utf8_lossy(&f.payload[1..]).contains("SPAWNED")
+            {
+                break;
+            }
+        }
+
+        let pid: u32 = std::fs::read_to_string(&pidfile)
+            .expect("grandchild pid file written before the marker")
+            .trim()
+            .parse()
+            .expect("pid file holds a pid");
+        let h = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, pid) }
+            .expect("grandchild is alive when the marker arrives");
+        tx_handle.send(h.0 as isize).unwrap();
+
+        let _ = ctx.shutdown_both();
+    });
+
+    let conn = listener.accept().unwrap();
+    super::handle_connection(conn).unwrap();
+    let _ = client.join();
+
+    let raw = rx_handle.recv().expect("client reported the grandchild handle");
+    let h = HANDLE(raw as *mut core::ffi::c_void);
+    unsafe {
+        WaitForSingleObject(h, INFINITE);
+        let _ = CloseHandle(h);
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
