@@ -19,10 +19,10 @@
       "automerge": true
     },
     {
-      "description": "Major updates: one PR per package, and never automerged — a breaking change is what a human is for. groupName: null overrides any inherited monorepo group from config:recommended.",
+      "description": "Major updates: one PR per package. A major usually breaks the API surface, so it is the update most likely to break CI — isolating each one keeps that break cheap to diagnose and fix. Automerge stays on: the gate is CI, which is maintained to a standard where green means shippable without human testing. groupName: null overrides any inherited monorepo group from config:recommended.",
       "matchUpdateTypes": ["major"],
       "groupName": null,
-      "automerge": false
+      "automerge": true
     },
     {
       "description": "Rust compiler: its own reviewable PR, never automerged. A compiler bump lands new default-on clippy lints across the whole crate at once (see rust-toolchain.toml), so it must not ride in a batch. No matchDepNames filter: this manager only reads rust-toolchain.toml, so every dep it produces is the compiler, and a filter that stopped matching would silently demote the bump into another rule. Last rule wins — keep this LAST.",
