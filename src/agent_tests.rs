@@ -186,9 +186,11 @@ fn agent_exec_tears_down_when_ssh_disconnects_first() {
     let client = thread::spawn(move || {
         let conn = afunix::connect(&client_path).unwrap();
         let (_crx, mut ctx) = afunix::split(conn).unwrap();
+        // A sentinel the child holds until teardown kills it — not a wait for anything.
+        let never_exits = r#"pwsh.exe -NoLogo -NoProfile -Command "Start-Sleep -Seconds 99999""#; // sleep-ok: sentinel the test kills
         let hs = Handshake {
             mode: Mode::Exec,
-            command: Some("pwsh.exe -NoLogo -NoProfile -Command \"Start-Sleep -Seconds 99999\"".into()),
+            command: Some(never_exits.into()),
             ..Handshake::pty_default()
         };
         write_frame(&mut ctx, FrameKind::Handshake, &hs.encode().unwrap()).unwrap();
