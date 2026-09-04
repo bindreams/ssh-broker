@@ -6,13 +6,12 @@ on:
   pull_request:
   workflow_dispatch:
 
-# Superseded PR runs are cancelled; pushes to main are not. `cancel-in-progress: false`
-# still cancels a *pending* run when a newer one queues, so two merges in quick
-# succession would leave the first commit on main with no completed CI. Folding the SHA
-# into the group for pushes gives every main commit its own group, so none can cancel
-# another.
+# Only PR runs are superseded. Everything else gets a group of its own, keyed on the run
+# id, so it can never be cancelled by a later run: `cancel-in-progress: false` still
+# cancels a *pending* run when a newer one joins the group, which for a shared group
+# would leave a commit on main with no completed CI after two quick merges.
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}-${{ github.event_name == 'push' && github.sha || 'shared' }}
+  group: ci-${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 # No toolchain action: `rust-toolchain.toml` is a rustup directory override, so the
@@ -20,24 +19,37 @@ concurrency:
 # its `components` and `targets`. The install step below exists to make that explicit
 # and to keep the download out of the middle of a check's log — it is NOT a gate:
 # `rustup toolchain install` exits 0 even when a declared target is unavailable (it
-# only warns). The real gate is the cargo steps that follow, which cannot run at all
-# on a toolchain that failed to install, and fail loudly on a missing component.
+# only warns). What does gate is the cargo steps that follow: they cannot run at all on
+# a toolchain that failed to install, and fail loudly on a missing component. A missing
+# *target* stays invisible here, and that is accepted — CI builds natively and never
+# cross-compiles; `targets` exists in the toolchain file for local `cargo xwin` use.
 #
 # Job names are load-bearing — they are the required status-check contexts on the
 # default branch. Renaming one silently blocks every PR, because a required context
 # that never reports is indistinguishable from one that has not finished.
 
 jobs:
+  # One source of truth for the platform set. Two jobs need the identical matrix, and a
+  # workflow cannot share a `strategy.matrix` between them any other way; duplicating the
+  # list is how a platform silently ends up linted but not tested, or the reverse.
+  platforms:
+    name: Platforms
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set.outputs.matrix }}
+    steps:
+      - id: set
+        run: |
+          echo 'matrix={"include":[{"os":"windows-latest","label":"windows/amd64"},{"os":"macos-latest","label":"macos/arm64"}]}' >> "$GITHUB_OUTPUT"
+
   lint:
     name: Lint (${{ matrix.label }})
+    needs: platforms
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - { os: windows-latest, label: windows/amd64 }
-          - { os: macos-latest, label: macos/arm64 }
+      matrix: ${{ fromJSON(needs.platforms.outputs.matrix) }}
     steps:
       - uses: actions/checkout@v7
 
@@ -55,14 +67,12 @@ jobs:
 
   test:
     name: Test (${{ matrix.label }})
+    needs: platforms
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - { os: windows-latest, label: windows/amd64 }
-          - { os: macos-latest, label: macos/arm64 }
+      matrix: ${{ fromJSON(needs.platforms.outputs.matrix) }}
     steps:
       - uses: actions/checkout@v7
 
