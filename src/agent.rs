@@ -31,6 +31,7 @@ use crate::winutil::OwnedHandle;
 use std::path::{Path, PathBuf};
 #[cfg(windows)]
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(windows)]
 use std::sync::{Arc, Mutex};
 
 /// Bind the hardened socket and serve connections, one handler thread each. Single-instance
