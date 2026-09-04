@@ -259,9 +259,7 @@ fn agent_rejects_non_handshake_first_frame() {
 fn agent_disconnect_kills_the_whole_process_tree() {
     use crate::protocol::read_one_frame;
     use windows::Win32::Foundation::{CloseHandle, HANDLE};
-    use windows::Win32::System::Threading::{
-        INFINITE, OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject,
-    };
+    use windows::Win32::System::Threading::{INFINITE, OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject};
 
     let dir = hardened_dir("tree");
     let sock = dir.join("s");
