@@ -1,0 +1,95 @@
+default_install_hook_types = ["pre-commit"]
+
+# Local hooks ==========================================================================================================
+
+[[repos]]
+repo = "local"
+
+[[repos.hooks]]
+id = "cargo-fmt"
+name = "cargo fmt"
+entry = "cargo fmt"
+language = "system"
+types = ["rust"]
+pass_filenames = false
+
+[[repos.hooks]]
+id = "cargo-clippy"
+name = "cargo clippy"
+# Native only. Clippy sees one `cfg` per invocation and most of this crate is
+# `cfg(windows)`, so this half of the codebase is linted here and the other half in
+# CI's per-platform Lint jobs. Cross-linting locally would mean requiring cargo-xwin
+# of everyone who commits.
+entry = "cargo clippy --all-targets -- -D warnings"
+language = "system"
+types = ["rust"]
+pass_filenames = false
+
+# Project invariants ---------------------------------------------------------------------------------------------------
+#
+# Each pattern below is pinned by `scripts/prek_patterns_test.py`, which asserts it
+# against a table of should-match and should-not-match lines — including every bypass
+# found in review. Change a pattern, run that script. These hooks are a gate on every
+# commit; a gate with no tests of its own is how the previous version shipped three
+# regexes that could not fire.
+
+[[repos.hooks]]
+id = "no-sleep-sync"
+name = "no sleeping as a synchronization primitive"
+# A sleep is a bet that some duration is long enough, and that bet loses on a loaded CI
+# runner. Waiting on a genuinely external event is fine — that is why an unbounded wait
+# does not match, and a wait carrying a numeric bound does.
+#
+# No `types` filter: a timing-based wait is the same hazard in a workflow `run:` step or
+# a PowerShell script as it is in Rust, and restricting this to `.rs` made the CI case —
+# the one the loaded-runner argument is actually about — invisible.
+#
+# Deliberately matches the sleep *stem* and the bounded-wait *shape*, not one spelling:
+# a renamed import, a suffixed variant, or a bounded wait under a different name is the
+# same defect. A genuine long-lived sentinel opts out with a same-line `sleep-ok:` marker
+# followed by a reason — a bare marker does not suppress.
+entry = '^(?!.*sleep-ok:\s*\S).*(\b[Ss]leep(_ms|_until|_for|Ex)?\s*\(|\bthread::sleep\b|\bpark_timeout\s*\(|\b(recv|wait|read|write|join|lock)_timeout\s*\(|\bWaitForSingleObject\s*\([^,]+,(?!\s*INFINITE\b)|\bStart-Sleep\b|^\s*-?\s*run:.*\bsleep\s+[0-9])'
+language = "pygrep"
+
+[[repos.hooks]]
+id = "no-hardcoded-user-paths"
+name = "no hardcoded user home directories"
+# This repo is public. Derive the path or fail loudly; never bake one in.
+#
+# Scans every text file: a home path is at least as likely to reach a README or a
+# workflow as a source file, and the invariant is about what gets published.
+#
+# Case-insensitive, because both platforms are: a path typed in lowercase is a working
+# path and was previously invisible here. The username class allows dots, because real
+# usernames contain them and `\w+` alone missed exactly the paths worth catching. No
+# trailing separator is required, so a bare home path used as a string literal is caught.
+#
+# `me` and `example` are the sanctioned placeholders. `Public`, `Default` and
+# `All Users` are machine-independent Windows system paths, not anyone's home, and this
+# crate provisions Windows-side artefacts that legitimately reference them.
+#
+# No file is excluded: an exclusion is exactly where a real path would end up hiding.
+# The pattern is written so this file does not match itself.
+entry = '(?i)(C:\\+Users\\+(?!me\b|example\b|Public\b|Default\b|All Users\b)[\w.-]+|/Users/(?!me\b|example\b)[\w.-]+)'
+language = "pygrep"
+
+[[repos.hooks]]
+id = "tests-in-separate-files"
+name = "unit tests live in a separate _tests.rs file"
+# The convention is `#[cfg(test)] #[path = "foo_tests.rs"] mod foo_tests;` next to
+# `foo.rs`. Inline test modules hide host-testable logic inside files that are otherwise
+# platform-gated — which is how `child_cwd`'s tests ended up unreachable from the macOS
+# build.
+#
+# Keys on the test *attribute*, not on a module name or a brace. Naming the module
+# `tests` was never the violation; putting a `#[test]` in the implementation file is.
+# That also sidesteps two bypasses the name-based version had: a brace on the next line,
+# and anything preceding `mod` on the same line. `#[cfg(test)]` itself is not matched —
+# the sanctioned `#[path]` declaration needs it.
+#
+# `#[skuld::test]` and any other path-qualified test attribute are matched too, so this
+# keeps working after the migration to a custom harness.
+entry = '^\s*#\[(?:[\w:]+::)?test\b'
+exclude = '_tests\.rs$'
+language = "pygrep"
+types = ["rust"]

@@ -92,30 +92,8 @@ fn handle_connection(conn: socket2::Socket) -> anyhow::Result<()> {
 }
 
 #[cfg(test)]
-mod cwd_logic_tests {
-    use super::child_cwd;
-    use std::path::PathBuf;
-
-    #[test]
-    fn empty_handshake_cwd_falls_back_to_home() {
-        let home = Some(PathBuf::from(r"C:\Users\me"));
-        assert_eq!(child_cwd("", home.clone()), home);
-    }
-
-    #[test]
-    fn explicit_handshake_cwd_wins_over_home() {
-        assert_eq!(
-            child_cwd(r"C:\work", Some(PathBuf::from(r"C:\Users\me"))),
-            Some(PathBuf::from(r"C:\work"))
-        );
-    }
-
-    #[test]
-    fn empty_cwd_and_no_home_is_none() {
-        // No worse than today's behaviour (inherit the agent's cwd) when home is unresolvable.
-        assert_eq!(child_cwd("", None), None);
-    }
-}
+#[path = "agent_cwd_tests.rs"]
+mod agent_cwd_tests;
 
 // ── PTY relay ────────────────────────────────────────────────────────────────────────
 
@@ -248,9 +226,9 @@ fn handle_exec(
     // stdin pump owns the child's stdin-write handle. A half-close mid-session (empty
     // DATA(Stdin) marker) closes only the child's stdin so a reader like sort/findstr
     // finishes; a FULL socket close means the SSH side is gone, so after the pump returns we
-    // kill the child unconditionally. Without this, a silent, stdin-ignoring command
-    // (e.g. `ssh host "Start-Sleep 99999"`) would never exit and the output pumps — blocked
-    // in read with nothing to write — would never detect the dead socket, hanging the waiter.
+    // kill the child unconditionally. Without this, a silent, stdin-ignoring command that
+    // sleeps indefinitely would never exit, and the output pumps — blocked in read with
+    // nothing to write — would never detect the dead socket, hanging the waiter.
     let t_in = std::thread::spawn(move || {
         let mut sink = ExecInputSink { stdin: stdin_owned };
         let _ = pump_decode(&mut rx, &mut fr, &mut sink);

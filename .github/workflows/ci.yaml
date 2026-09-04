@@ -65,6 +65,29 @@ jobs:
       - name: cargo clippy
         run: cargo clippy --locked --all-targets -- -D warnings
 
+      # The hooks are only a gate for people who have them installed and do not pass
+      # `--no-verify`. Running them here makes them a gate for everyone — without this,
+      # a commit that fails a hook still reaches main with CI green.
+      #
+      # Both steps are macOS-only: they are platform-independent, and `python3` is not on
+      # PATH under that name on the Windows runners. They sit inside an already-required
+      # job rather than in a job of their own, because a check nobody requires cannot
+      # block the merge it exists to block.
+      # renovate: datasource=github-releases depName=astral-sh/setup-uv
+      - uses: astral-sh/setup-uv@v10.0.1
+        if: runner.os == 'macOS'
+      - name: prek hooks
+        if: runner.os == 'macOS'
+        run: |
+          uv tool install prek
+          prek run --all-files
+
+      # The hooks' own patterns need a gate too — two successive versions shipped regexes
+      # that silently could not fire.
+      - name: prek pattern regression test
+        if: runner.os == 'macOS'
+        run: python3 scripts/prek_patterns_test.py
+
   test:
     name: Test (${{ matrix.label }})
     needs: platforms
