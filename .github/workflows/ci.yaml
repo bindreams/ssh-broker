@@ -6,14 +6,22 @@ on:
   pull_request:
   workflow_dispatch:
 
+# Superseded PR runs are cancelled; pushes to main are not. `cancel-in-progress: false`
+# still cancels a *pending* run when a newer one queues, so two merges in quick
+# succession would leave the first commit on main with no completed CI. Folding the SHA
+# into the group for pushes gives every main commit its own group, so none can cancel
+# another.
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
+  group: ci-${{ github.workflow }}-${{ github.ref }}-${{ github.event_name == 'push' && github.sha || 'shared' }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 # No toolchain action: `rust-toolchain.toml` is a rustup directory override, so the
 # first `cargo`/`rustup` call in the workspace installs the pinned channel along with
-# its `components` and `targets`. `rustup show` makes that install an explicit, logged
-# step instead of a side effect of whichever cargo command happens to run first.
+# its `components` and `targets`. The install step below exists to make that explicit
+# and to keep the download out of the middle of a check's log — it is NOT a gate:
+# `rustup toolchain install` exits 0 even when a declared target is unavailable (it
+# only warns). The real gate is the cargo steps that follow, which cannot run at all
+# on a toolchain that failed to install, and fail loudly on a missing component.
 #
 # Job names are load-bearing — they are the required status-check contexts on the
 # default branch. Renaming one silently blocks every PR, because a required context
@@ -34,7 +42,7 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Install pinned toolchain
-        run: rustup show
+        run: rustup toolchain install
 
       # Formatting is platform-independent, but clippy is not: it only sees one `cfg`
       # per invocation, so a single-platform lint job would never lint the other half
@@ -43,7 +51,7 @@ jobs:
         run: cargo fmt --check
 
       - name: cargo clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --locked --all-targets -- -D warnings
 
   test:
     name: Test (${{ matrix.label }})
@@ -59,7 +67,7 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Install pinned toolchain
-        run: rustup show
+        run: rustup toolchain install
 
       - name: cargo test
-        run: cargo test
+        run: cargo test --locked

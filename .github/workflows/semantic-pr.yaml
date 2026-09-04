@@ -7,8 +7,7 @@ name: Semantic PR Title
 # `on: pull_request` (vs `pull_request_target`) runs the workflow from the PR's branch
 # using the default read-only GITHUB_TOKEN. Write access is unnecessary — the action only
 # reads the PR title — and `pull_request` lets the workflow be validated by its own PR at
-# introduction time. Nothing here is exploitable: it does not check out PR code, run
-# untrusted scripts, or expose secrets.
+# introduction time.
 on:
   pull_request:
     types: [opened, edited, synchronize, reopened]
