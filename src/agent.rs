@@ -30,6 +30,7 @@ use crate::winutil::OwnedHandle;
 #[cfg(windows)]
 use std::path::{Path, PathBuf};
 #[cfg(windows)]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// Bind the hardened socket and serve connections, one handler thread each. Single-instance
@@ -136,6 +137,14 @@ fn handle_pty(
     let out_raw = session.out_read_raw();
     let in_raw = session.in_write_raw();
     let child_pid = session.pid();
+    let proc_raw = session.process_raw();
+    // Set once the child has exited on its own, BEFORE teardown FINs the socket. Both
+    // teardown paths deliberately shut the socket down to unblock the input pump, and
+    // because `split` hands out duplicates of one socket that EOF reaches the pump exactly
+    // as a peer disconnect would. Without this flag the pump cannot tell the two apart and
+    // would reap a normally-exited session's descendants — killing the daemon in
+    // `ssh host "start-a-daemon"`. sshd leaves them running; so do we.
+    let child_exited = Arc::new(AtomicBool::new(false));
     // HPCON shared behind a mutex: the input thread resizes under the lock; teardown takes
     // it (→ None) and closes it under the lock, so resize can never touch a closed HPCON.
     let hpc_cell = Arc::new(Mutex::new(Some(session.take_hpc_raw())));
@@ -166,10 +175,13 @@ fn handle_pty(
     // unblocks even if the SSH side dropped first.
     let in_thread = {
         let hpc_cell = Arc::clone(&hpc_cell);
+        let exited = Arc::clone(&child_exited);
         std::thread::spawn(move || {
             let mut sink = PtyInputSink { in_raw, hpc_cell };
             let _ = pump_decode(&mut rx, &mut fr, &mut sink);
-            kill_tree(child_pid);
+            if !exited.load(Ordering::SeqCst) {
+                kill_tree(child_pid, proc_raw);
+            }
         })
     };
 
@@ -177,6 +189,8 @@ fn handle_pty(
     // down (close the HPCON, join the threads) before returning, or the threads would
     // outlive `session` and touch closed handles, and the (forgotten) HPCON would leak.
     let wait_result = session.wait();
+    // Ordered before the close below, which is what ultimately FINs the socket.
+    child_exited.store(true, Ordering::SeqCst);
     let code = *wait_result.as_ref().unwrap_or(&1);
     *code_cell.lock().unwrap() = code;
     {
@@ -238,12 +252,20 @@ fn handle_exec(
     let out_raw = child.stdout_read_raw();
     let err_raw = child.stderr_read_raw();
     let child_pid = child.pid();
+    let proc_raw = child.process_raw();
+    // Set once the child has exited on its own, BEFORE teardown FINs the socket. Both
+    // teardown paths deliberately shut the socket down to unblock the input pump, and
+    // because `split` hands out duplicates of one socket that EOF reaches the pump exactly
+    // as a peer disconnect would. Without this flag the pump cannot tell the two apart and
+    // would reap a normally-exited session's descendants — killing the daemon in
+    // `ssh host "start-a-daemon"`. sshd leaves them running; so do we.
+    let child_exited = Arc::new(AtomicBool::new(false));
     let stdin_owned = child.take_stdin_write();
     // stdout, stderr, and the EXIT frame all share tx → serialize with a mutex.
     let tx_arc = Arc::new(Mutex::new(tx));
 
-    let t_out = spawn_stream_pump(out_raw, Stream::Stdout, Arc::clone(&tx_arc), child_pid);
-    let t_err = spawn_stream_pump(err_raw, Stream::Stderr, Arc::clone(&tx_arc), child_pid);
+    let t_out = spawn_stream_pump(out_raw, Stream::Stdout, Arc::clone(&tx_arc), child_pid, proc_raw);
+    let t_err = spawn_stream_pump(err_raw, Stream::Stderr, Arc::clone(&tx_arc), child_pid, proc_raw);
 
     // stdin pump owns the child's stdin-write handle. A half-close mid-session (empty
     // DATA(Stdin) marker) closes only the child's stdin so a reader like sort/findstr
@@ -251,14 +273,21 @@ fn handle_exec(
     // kill the child unconditionally. Without this, a silent, stdin-ignoring command
     // (e.g. `ssh host "Start-Sleep 99999"`) would never exit and the output pumps — blocked
     // in read with nothing to write — would never detect the dead socket, hanging the waiter.
-    let t_in = std::thread::spawn(move || {
-        let mut sink = ExecInputSink { stdin: stdin_owned };
-        let _ = pump_decode(&mut rx, &mut fr, &mut sink);
-        drop(sink); // close the child's stdin if the EOF marker never arrived
-        kill_tree(child_pid);
-    });
+    let t_in = {
+        let exited = Arc::clone(&child_exited);
+        std::thread::spawn(move || {
+            let mut sink = ExecInputSink { stdin: stdin_owned };
+            let _ = pump_decode(&mut rx, &mut fr, &mut sink);
+            drop(sink); // close the child's stdin if the EOF marker never arrived
+            if !exited.load(Ordering::SeqCst) {
+                kill_tree(child_pid, proc_raw);
+            }
+        })
+    };
 
     let wait_result = child.wait();
+    // Ordered before the EXIT frame and shutdown below, which FIN the socket.
+    child_exited.store(true, Ordering::SeqCst);
     let code = *wait_result.as_ref().unwrap_or(&1);
     let _ = t_out.join();
     let _ = t_err.join();
@@ -281,6 +310,7 @@ fn spawn_stream_pump(
     stream: Stream,
     tx: Arc<Mutex<ConnTx>>,
     child_pid: u32,
+    proc_raw: isize,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let mut buf = [0u8; 32 * 1024];
@@ -294,7 +324,7 @@ fn spawn_stream_pump(
                 write_data(&mut *g, stream, &buf[..n]).is_ok()
             };
             if !ok {
-                kill_tree(child_pid); // SSH side gone → unblock the waiter
+                kill_tree(child_pid, proc_raw); // SSH side gone → unblock the waiter
                 break;
             }
         }
@@ -328,30 +358,62 @@ impl FrameSink for ExecInputSink {
     // on_resize: default no-op (EXEC has no pseudoconsole).
 }
 
-/// Terminate the child **and everything it spawned**.
+/// Terminate the child **and everything it spawned**. Call only when the session is being
+/// torn down under the peer's disconnect — never after a normal exit (see `child_exited`).
 ///
 /// Terminating the child alone leaves its descendants running, so a relayed shell that
-/// launched anything in the background leaked it past the end of the SSH session.
+/// launched anything in the background outlived the SSH session.
 ///
-/// Descendants are enumerated before the root is killed: once the root dies its children
-/// are orphaned and the parent links the walk relies on no longer lead anywhere.
+/// `proc_raw` is the caller's still-open handle to the child, and it does two jobs. It pins
+/// the pid — Windows will not recycle a pid while a handle to it is open — which is what
+/// makes resolving `pid` here safe rather than a race. And it is the fallback: if the pid
+/// cannot be resolved to a process, terminating through the handle is still guaranteed, so
+/// an unresolvable pid degrades to the old single-process behaviour instead of killing
+/// nothing and leaving the waiter blocked forever.
+///
+/// The root is killed first so it cannot spawn more children while the descendants are
+/// being walked; the descendant list is captured beforehand, since it is needed either way.
 ///
 /// Deliberate limitation: without a job object this is a treewalk, so a process created
-/// *during* the walk can still escape. Pid reuse is not a hazard — cosca's `Process`
-/// identity is `(pid, start_token)`, so a recycled pid resolves as a different process.
-/// A job object is the complete fix and is tracked separately.
+/// between the snapshot and its parent's death can still escape. A job object is the
+/// complete fix and is tracked separately.
 #[cfg(windows)]
-fn kill_tree(pid: u32) {
+fn kill_tree(pid: u32, proc_raw: isize) {
     use cosca::identity::Resolved;
     use cosca::process::{Process, Recursive};
 
-    let Resolved::Found(root) = Process::from_pid(pid) else {
-        return; // already gone, or the OS refused the query
-    };
-    for descendant in root.children(Recursive::Yes) {
-        let _ = descendant.kill();
+    match Process::from_pid(pid) {
+        Resolved::Found(root) => {
+            let descendants = root.children(Recursive::Yes);
+            if let Err(e) = root.kill() {
+                tracing::debug!("kill_tree: root pid {pid} did not terminate: {e:?}");
+            }
+            for descendant in descendants {
+                if let Err(e) = descendant.kill() {
+                    tracing::debug!("kill_tree: descendant of {pid} survived: {e:?}");
+                }
+            }
+        }
+        Resolved::Gone => {} // nothing to do; the child and its tree are already down
+        Resolved::Unknown => {
+            // The OS refused the query, so the tree cannot be walked. Fall back to the
+            // handle rather than returning: leaving the child alive would hang the waiter.
+            tracing::warn!("kill_tree: could not resolve pid {pid}; terminating by handle only");
+            terminate_by_handle(proc_raw);
+        }
     }
-    let _ = root.kill();
+}
+
+/// `TerminateProcess` on a handle we already hold. Reaches the child only, never its
+/// descendants — the fallback path, not the normal one.
+#[cfg(windows)]
+fn terminate_by_handle(proc_raw: isize) {
+    unsafe {
+        let _ = windows::Win32::System::Threading::TerminateProcess(
+            windows::Win32::Foundation::HANDLE(proc_raw as *mut core::ffi::c_void),
+            1,
+        );
+    }
 }
 
 // ── single-instance ────────────────────────────────────────────────────────────────
