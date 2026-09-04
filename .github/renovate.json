@@ -4,9 +4,10 @@
   "minimumReleaseAge": "7 days",
   "platformAutomerge": true,
   "lockFileMaintenance": {
-    "description": "config:recommended leaves this off, which would freeze every transitive dependency forever: caret requirements in Cargo.toml are already satisfied by the committed Cargo.lock, so nothing else ever refreshes it. CI runs --locked, so the lockfile is what actually ships.",
+    "description": "config:recommended leaves this off, which would freeze every transitive dependency forever: caret requirements in Cargo.toml stay satisfied by the committed Cargo.lock, so nothing else refreshes it. CI runs --locked, so the lockfile is what ships. Two local overrides, both required: minimumReleaseAge must be nulled because these PRs are synthesized with no release timestamp, and renovate's default timestamp-required behaviour would hold them pending forever with no error to notice. Nulling it is also honest — the refresh shells out to `cargo update`, which has no release-age awareness, so the top-level cooldown could never have applied here. automerge is off for the same reason: this is the one path where a freshly-published or later-yanked release reaches main ungated, and that hazard compiles and passes tests, so CI cannot stand in for the cooldown.",
     "enabled": true,
-    "automerge": true
+    "minimumReleaseAge": null,
+    "automerge": false
   },
   "vulnerabilityAlerts": {
     "description": "The 7-day cooldown exists to dodge yanked releases; applying it to a published advisory would delay the fix for exactly as long as the exposure lasts.",
@@ -14,24 +15,30 @@
   },
   "packageRules": [
     {
-      "description": "Group non-major GitHub Actions updates",
       "matchManagers": ["github-actions"],
       "matchUpdateTypes": ["minor", "patch", "pin", "digest"],
       "groupName": "GitHub Actions",
       "automerge": true
     },
     {
-      "description": "Group non-breaking Rust crate updates",
       "matchManagers": ["cargo"],
       "matchUpdateTypes": ["minor", "patch", "pin", "digest"],
       "groupName": "Rust crates",
       "automerge": true
     },
     {
-      "description": "0.x crates: under Cargo's semver rules 0.6 -> 0.7 is a breaking change, but renovate still classifies it as `minor`, so without this rule it would ride in the grouped batch above. Most of this crate's direct dependencies are 0.x. Un-grouped for the same reason as majors: isolate the break. Must stay after the grouping rule to win.",
+      "description": "0.x crates: under Cargo's semver rules 0.6 -> 0.7 is a breaking change, but renovate classifies it as `minor`, so without this rule it would ride in the grouped batch above. Un-grouped for the same reason as majors: isolate the break. Must stay after the grouping rule to win.",
       "matchManagers": ["cargo"],
       "matchCurrentVersion": "/^0\\./",
       "matchUpdateTypes": ["minor"],
+      "groupName": null,
+      "automerge": true
+    },
+    {
+      "description": "0.0.x crates are a separate case: every 0.0.x -> 0.0.y is breaking under Cargo's rules, yet renovate classifies it as `patch`, which the grouping rule above would swallow. Covers both types so the classification cannot route around it.",
+      "matchManagers": ["cargo"],
+      "matchCurrentVersion": "/^0\\.0\\./",
+      "matchUpdateTypes": ["minor", "patch"],
       "groupName": null,
       "automerge": true
     },
@@ -42,7 +49,7 @@
       "automerge": true
     },
     {
-      "description": "Rust compiler: its own PR. A bump lands new default-on clippy lints across the whole crate at once (see rust-toolchain.toml), which under -D warnings breaks CI on code that never changed. No matchDepNames filter: this manager only reads rust-toolchain.toml, so every dep it produces is the compiler, and a filter that stopped matching would silently demote the bump into another rule. Last rule wins — keep this LAST.",
+      "description": "Rust compiler: its own PR. A bump lands new default-on clippy lints across the whole crate at once (see rust-toolchain.toml), which under -D warnings breaks CI on code that never changed. Last rule wins — keep this LAST.",
       "matchManagers": ["rust-toolchain"],
       "groupName": null,
       "automerge": true
