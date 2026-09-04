@@ -33,14 +33,11 @@ use std::path::Path;
 use crate::winutil::{AttrList, OwnedHandle};
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Storage::FileSystem::{ReadFile, WriteFile};
-use windows::Win32::System::Console::{
-    ClosePseudoConsole, CreatePseudoConsole, ResizePseudoConsole, COORD, HPCON,
-};
+use windows::Win32::System::Console::{COORD, ClosePseudoConsole, CreatePseudoConsole, HPCON, ResizePseudoConsole};
 use windows::Win32::System::Pipes::CreatePipe;
 use windows::Win32::System::Threading::{
-    CreateProcessW, EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess, INFINITE,
-    PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOEXW, TerminateProcess,
-    WaitForSingleObject,
+    CreateProcessW, EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess, INFINITE, PROCESS_INFORMATION,
+    STARTF_USESTDHANDLES, STARTUPINFOEXW, TerminateProcess, WaitForSingleObject,
 };
 use windows::core::{PCWSTR, PWSTR};
 
@@ -127,7 +124,10 @@ pub fn resize_pty(hpc_raw: isize, cols: u16, rows: u16) -> windows::core::Result
     if hpc_raw == 0 {
         return Ok(());
     }
-    let size = COORD { X: cols.max(1) as i16, Y: rows.max(1) as i16 };
+    let size = COORD {
+        X: cols.max(1) as i16,
+        Y: rows.max(1) as i16,
+    };
     unsafe { ResizePseudoConsole(HPCON(hpc_raw), size) }
 }
 
@@ -156,13 +156,11 @@ pub struct PtySession {
 impl PtySession {
     /// Spawn `command` in a fresh pseudoconsole of `cols`x`rows`, optionally in `cwd`. The
     /// child inherits the agent's (session-1) token and environment.
-    pub fn spawn(
-        command: &str,
-        cols: u16,
-        rows: u16,
-        cwd: Option<&Path>,
-    ) -> windows::core::Result<PtySession> {
-        let size = COORD { X: cols.max(1) as i16, Y: rows.max(1) as i16 };
+    pub fn spawn(command: &str, cols: u16, rows: u16, cwd: Option<&Path>) -> windows::core::Result<PtySession> {
+        let size = COORD {
+            X: cols.max(1) as i16,
+            Y: rows.max(1) as i16,
+        };
         unsafe {
             let (in_read, in_write) = create_pipe_pair()?;
             let (out_read, out_write) = create_pipe_pair()?;
@@ -253,7 +251,10 @@ impl PtySession {
 
     /// Resize the pseudoconsole.
     pub fn resize(&self, cols: u16, rows: u16) -> windows::core::Result<()> {
-        let size = COORD { X: cols.max(1) as i16, Y: rows.max(1) as i16 };
+        let size = COORD {
+            X: cols.max(1) as i16,
+            Y: rows.max(1) as i16,
+        };
         unsafe { ResizePseudoConsole(self.hpc_handle(), size) }
     }
 

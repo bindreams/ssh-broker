@@ -3,7 +3,10 @@ use super::*;
 
 #[test]
 fn header_roundtrips() {
-    let h = FrameHeader { kind: FrameKind::Data, len: 5 };
+    let h = FrameHeader {
+        kind: FrameKind::Data,
+        len: 5,
+    };
     let bytes = h.encode();
     // u8 kind + u32-LE len
     assert_eq!(bytes, [FrameKind::Data as u8, 5, 0, 0, 0]);
@@ -151,9 +154,7 @@ fn header_decode_rejects_bad_kind() {
 #[test]
 fn header_decode_rejects_oversize_len() {
     let len = (MAX_FRAME + 1).to_le_bytes();
-    assert!(
-        FrameHeader::decode(&[FrameKind::Data as u8, len[0], len[1], len[2], len[3]]).is_err()
-    );
+    assert!(FrameHeader::decode(&[FrameKind::Data as u8, len[0], len[1], len[2], len[3]]).is_err());
 }
 
 #[test]

@@ -1,0 +1,4 @@
+# Project invariants enforced as clippy lints live here.
+#
+# Empty for now: the lints worth adding are the ones that encode a rule this
+# codebase has learned the hard way, and they should arrive with the rule.

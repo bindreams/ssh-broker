@@ -1,0 +1,13 @@
+# The single source of truth for the Rust version, in CI and locally.
+#
+# CI reads `channel` from this file rather than duplicating a version, so bumping
+# it here moves CI too. Do that deliberately: clippy gains lints between releases,
+# and under `-D warnings` they arrive as build failures on code that never changed.
+#
+# `targets` declares the Windows cross-target so `cargo xwin` works on a fresh
+# checkout without a separate `rustup target add`. CI's Windows runner builds
+# natively and does not need it.
+[toolchain]
+channel = "1.98.0"
+components = ["clippy", "rustfmt"]
+targets = ["x86_64-pc-windows-msvc"]

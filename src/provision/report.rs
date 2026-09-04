@@ -8,21 +8,18 @@ pub struct Check {
 
 impl Check {
     pub fn new(name: &'static str, pass: bool, detail: impl Into<String>) -> Check {
-        Check { name, pass, detail: detail.into() }
+        Check {
+            name,
+            pass,
+            detail: detail.into(),
+        }
     }
 }
 
 /// Render an aligned PASS/FAIL table.
 pub fn format_report(rows: &[Check]) -> String {
     rows.iter()
-        .map(|r| {
-            format!(
-                "[{}] {:<28} {}",
-                if r.pass { "PASS" } else { "FAIL" },
-                r.name,
-                r.detail
-            )
-        })
+        .map(|r| format!("[{}] {:<28} {}", if r.pass { "PASS" } else { "FAIL" }, r.name, r.detail))
         .collect::<Vec<_>>()
         .join("\n")
 }

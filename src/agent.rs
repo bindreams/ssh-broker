@@ -22,9 +22,7 @@ use crate::conpty::{self, PtySession};
 #[cfg(windows)]
 use crate::pipes::ExecChild;
 #[cfg(windows)]
-use crate::protocol::{
-    ExitCode, FrameKind, FrameReader, Handshake, Mode, Resize, Stream, read_one_frame, write_frame,
-};
+use crate::protocol::{ExitCode, FrameKind, FrameReader, Handshake, Mode, Resize, Stream, read_one_frame, write_frame};
 #[cfg(windows)]
 use crate::relay::{FrameSink, pump_decode, write_data};
 #[cfg(windows)]

@@ -18,17 +18,16 @@ use std::path::Path;
 
 use windows::Win32::Foundation::{CloseHandle, HANDLE, HLOCAL, LocalFree};
 use windows::Win32::Security::Authorization::{
-    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
-    GetNamedSecurityInfoW, SDDL_REVISION_1, SE_FILE_OBJECT, SetNamedSecurityInfoW,
+    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, GetNamedSecurityInfoW,
+    SDDL_REVISION_1, SE_FILE_OBJECT, SetNamedSecurityInfoW,
 };
 use windows::Win32::Security::{
-    ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, ACL_SIZE_INFORMATION, AclSizeInformation, CopySid,
-    CreateWellKnownSid, DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetAclInformation,
-    GetLengthSid, GetSecurityDescriptorControl, GetSecurityDescriptorDacl,
-    GetSecurityDescriptorOwner, GetTokenInformation, INHERITED_ACE, IsValidSid, LookupAccountNameW,
-    OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
-    SE_DACL_PRESENT, SE_DACL_PROTECTED, SID_NAME_USE, TOKEN_QUERY, TOKEN_USER, TokenUser,
-    WinBuiltinAdministratorsSid, WinLocalSystemSid,
+    ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, ACL_SIZE_INFORMATION, AclSizeInformation, CopySid, CreateWellKnownSid,
+    DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetAclInformation, GetLengthSid, GetSecurityDescriptorControl,
+    GetSecurityDescriptorDacl, GetSecurityDescriptorOwner, GetTokenInformation, INHERITED_ACE, IsValidSid,
+    LookupAccountNameW, OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+    SE_DACL_PRESENT, SE_DACL_PROTECTED, SID_NAME_USE, TOKEN_QUERY, TOKEN_USER, TokenUser, WinBuiltinAdministratorsSid,
+    WinLocalSystemSid,
 };
 use windows::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
 use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
@@ -187,12 +186,7 @@ pub fn harden_dir(dir: &Path, target_user: &Sid) -> anyhow::Result<()> {
     let path_w = wide(dir);
     unsafe {
         let mut psd = PSECURITY_DESCRIPTOR::default();
-        ConvertStringSecurityDescriptorToSecurityDescriptorW(
-            PCWSTR(sddl_w.as_ptr()),
-            SDDL_REVISION_1,
-            &mut psd,
-            None,
-        )?;
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(PCWSTR(sddl_w.as_ptr()), SDDL_REVISION_1, &mut psd, None)?;
         let _sd = LocalSd(psd); // freed on every path below
 
         let mut dacl_present = BOOL(0);

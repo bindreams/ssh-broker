@@ -113,10 +113,10 @@ mod win {
     }
 }
 
-#[cfg(windows)]
-pub use win::{read_default_shell_under, set_default_shell_under};
 #[cfg(all(windows, test))]
 pub use win::{delete_hkcu, read_hkcu, set_hkcu};
+#[cfg(windows)]
+pub use win::{read_default_shell_under, set_default_shell_under};
 
 #[cfg(test)]
 #[path = "registry_tests.rs"]

@@ -1,14 +1,12 @@
 //! Cross-platform tests for the shim relay logic: the EXEC relay (over the in-memory
 //! duplex transport), the fail-open decision, and the pure helpers. The Windows console
 //! PTY path (raw mode, `ReadConsoleInputW`) is exercised on a real Windows host end-to-end.
-use crate::protocol::{
-    ExitCode, FrameKind, FrameReader, Handshake, Mode, Resize, Stream, read_one_frame, write_frame,
-};
-use crate::relay::{FrameSink, Outcome, duplex, write_data};
 use super::{
-    ExecOutSink, Fallback, MouseModeSniffer, XtwinopsFilter, decide_fallback, is_transfer_command,
-    make_handshake, map_outcome, size_to_resize,
+    ExecOutSink, Fallback, MouseModeSniffer, XtwinopsFilter, decide_fallback, is_transfer_command, make_handshake,
+    map_outcome, size_to_resize,
 };
+use crate::protocol::{ExitCode, FrameKind, FrameReader, Handshake, Mode, Resize, Stream, read_one_frame, write_frame};
+use crate::relay::{FrameSink, Outcome, duplex, write_data};
 
 #[test]
 fn exec_shim_relays_streams_and_exit() {
@@ -61,7 +59,11 @@ fn exec_shim_dead_agent_is_255_not_command_failure() {
         // Drop stx WITHOUT an EXIT frame → the shim sees PeerClosed.
     });
 
-    let hs = Handshake { mode: Mode::Exec, command: Some("x".into()), ..Handshake::pty_default() };
+    let hs = Handshake {
+        mode: Mode::Exec,
+        command: Some("x".into()),
+        ..Handshake::pty_default()
+    };
     let mut out = Vec::new();
     let mut err = Vec::new();
     let code = super::run_exec_on(crx, ctx, &hs, &mut out, &mut err, std::io::empty()).unwrap();
@@ -85,7 +87,11 @@ fn exec_shim_truncated_stream_is_254() {
         stx.write_all(&[2u8, 5, 0]).unwrap();
     });
 
-    let hs = Handshake { mode: Mode::Exec, command: Some("x".into()), ..Handshake::pty_default() };
+    let hs = Handshake {
+        mode: Mode::Exec,
+        command: Some("x".into()),
+        ..Handshake::pty_default()
+    };
     let mut out = Vec::new();
     let mut err = Vec::new();
     let code = super::run_exec_on(crx, ctx, &hs, &mut out, &mut err, std::io::empty()).unwrap();
@@ -110,7 +116,9 @@ fn detects_sftp_and_scp_transfers() {
     // A quoted path with spaces (a "C:\Program Files\OpenSSH\…" install) must still be detected
     // — split_whitespace would shatter it and re-hang sftp.
     assert!(is_transfer_command(r#""C:\Program Files\OpenSSH\sftp-server.exe""#));
-    assert!(is_transfer_command(r#""C:\Program Files\OpenSSH\sftp-server.exe" -l ERROR"#));
+    assert!(is_transfer_command(
+        r#""C:\Program Files\OpenSSH\sftp-server.exe" -l ERROR"#
+    ));
     // The rcp protocol's -t/-f immediately before the trailing path.
     assert!(is_transfer_command("scp -t /tmp/x"));
     assert!(is_transfer_command("scp -p -f /tmp/x"));
@@ -148,7 +156,10 @@ fn exec_out_sink_flushes_each_frame() {
             Ok(())
         }
     }
-    let mut sink = ExecOutSink { out: FlushSpy::default(), err: FlushSpy::default() };
+    let mut sink = ExecOutSink {
+        out: FlushSpy::default(),
+        err: FlushSpy::default(),
+    };
     sink.on_data(Stream::Stdout, b"binary-no-newline").unwrap();
     sink.on_data(Stream::Stderr, b"err-no-newline").unwrap();
     assert_eq!(sink.out.bytes, b"binary-no-newline");

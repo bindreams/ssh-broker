@@ -61,7 +61,11 @@ pub fn parse_probe_line(stdout: &str) -> anyhow::Result<ProbeResult> {
         .lines()
         .find(|l| l.trim_start().starts_with("PROBE "))
         .ok_or_else(|| anyhow::anyhow!("no PROBE line in probe output"))?;
-    let mut r = ProbeResult { session_id: 0, dpapi_ok: false, symlink: SymlinkState::Skipped };
+    let mut r = ProbeResult {
+        session_id: 0,
+        dpapi_ok: false,
+        symlink: SymlinkState::Skipped,
+    };
     for tok in line.split_whitespace() {
         if let Some(v) = tok.strip_prefix("session_id=") {
             r.session_id = v.parse().unwrap_or(0);
@@ -81,8 +85,7 @@ pub fn parse_probe_line(stdout: &str) -> anyhow::Result<ProbeResult> {
 #[cfg(windows)]
 pub fn current_session_id() -> u32 {
     let mut sid = 0u32;
-    let _ =
-        unsafe { windows::Win32::System::RemoteDesktop::ProcessIdToSessionId(std::process::id(), &mut sid) };
+    let _ = unsafe { windows::Win32::System::RemoteDesktop::ProcessIdToSessionId(std::process::id(), &mut sid) };
     sid
 }
 
@@ -108,7 +111,10 @@ fn dpapi_protect(data: &[u8]) -> anyhow::Result<Vec<u8>> {
     use windows::Win32::Foundation::{HLOCAL, LocalFree};
     use windows::Win32::Security::Cryptography::{CRYPT_INTEGER_BLOB, CryptProtectData};
     unsafe {
-        let input = CRYPT_INTEGER_BLOB { cbData: data.len() as u32, pbData: data.as_ptr() as *mut u8 };
+        let input = CRYPT_INTEGER_BLOB {
+            cbData: data.len() as u32,
+            pbData: data.as_ptr() as *mut u8,
+        };
         let mut out = CRYPT_INTEGER_BLOB::default();
         CryptProtectData(&input, None, None, None, None, 0, &mut out)?;
         let bytes = std::slice::from_raw_parts(out.pbData, out.cbData as usize).to_vec();
@@ -122,7 +128,10 @@ fn dpapi_unprotect(blob: &[u8]) -> anyhow::Result<Vec<u8>> {
     use windows::Win32::Foundation::{HLOCAL, LocalFree};
     use windows::Win32::Security::Cryptography::{CRYPT_INTEGER_BLOB, CryptUnprotectData};
     unsafe {
-        let input = CRYPT_INTEGER_BLOB { cbData: blob.len() as u32, pbData: blob.as_ptr() as *mut u8 };
+        let input = CRYPT_INTEGER_BLOB {
+            cbData: blob.len() as u32,
+            pbData: blob.as_ptr() as *mut u8,
+        };
         let mut out = CRYPT_INTEGER_BLOB::default();
         CryptUnprotectData(&input, None, None, None, None, 0, &mut out)?;
         let bytes = std::slice::from_raw_parts(out.pbData, out.cbData as usize).to_vec();
@@ -149,7 +158,10 @@ pub fn symlink_probe() -> SymlinkState {
         }
         let target = dir.join("target.txt");
         let link = dir.join("link.txt");
-        if std::fs::File::create(&target).and_then(|mut f| f.write_all(b"parity")).is_err() {
+        if std::fs::File::create(&target)
+            .and_then(|mut f| f.write_all(b"parity"))
+            .is_err()
+        {
             return SymlinkState::Skipped;
         }
         if std::os::windows::fs::symlink_file(&target, &link).is_err() {

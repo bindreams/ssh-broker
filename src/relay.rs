@@ -39,11 +39,7 @@ pub trait FrameSink {
 /// `sink`. Reuses `fr`'s residual buffer, so it can continue immediately after a
 /// handshake read via `protocol::read_one_frame`. A `HANDSHAKE` frame mid-stream is a
 /// protocol violation (error).
-pub fn pump_decode<R: Read>(
-    r: &mut R,
-    fr: &mut FrameReader,
-    sink: &mut impl FrameSink,
-) -> anyhow::Result<Outcome> {
+pub fn pump_decode<R: Read>(r: &mut R, fr: &mut FrameReader, sink: &mut impl FrameSink) -> anyhow::Result<Outcome> {
     let mut buf = [0u8; 32 * 1024];
     loop {
         while let Some(frame) = fr.next_frame()? {
@@ -53,8 +49,7 @@ pub fn pump_decode<R: Read>(
                         .payload
                         .first()
                         .ok_or_else(|| anyhow::anyhow!("DATA frame missing stream tag"))?;
-                    let stream = Stream::from_u8(tag)
-                        .ok_or_else(|| anyhow::anyhow!("bad stream tag {tag}"))?;
+                    let stream = Stream::from_u8(tag).ok_or_else(|| anyhow::anyhow!("bad stream tag {tag}"))?;
                     sink.on_data(stream, &frame.payload[1..])?;
                 }
                 FrameKind::Resize => sink.on_resize(Resize::decode(&frame.payload)?)?,
@@ -124,8 +119,14 @@ impl Write for DuplexEnd {
 pub fn duplex() -> (DuplexEnd, DuplexEnd) {
     let (a_to_b_reader, a_to_b_writer) = pipe::pipe();
     let (b_to_a_reader, b_to_a_writer) = pipe::pipe();
-    let a = DuplexEnd { reader: b_to_a_reader, writer: a_to_b_writer };
-    let b = DuplexEnd { reader: a_to_b_reader, writer: b_to_a_writer };
+    let a = DuplexEnd {
+        reader: b_to_a_reader,
+        writer: a_to_b_writer,
+    };
+    let b = DuplexEnd {
+        reader: a_to_b_reader,
+        writer: b_to_a_writer,
+    };
     (a, b)
 }
 
