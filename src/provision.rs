@@ -8,11 +8,11 @@
 //! proven present), and resolves the ACL grantee BY NAME so a SYSTEM-run self-heal grants the
 //! same account the agent binds as.
 
-mod config;
-mod probe;
-mod registry;
-mod report;
-mod schtasks;
+pub mod config;
+pub mod probe;
+pub mod registry;
+pub mod report;
+pub mod schtasks;
 
 /// `apply` subcommand: idempotently assert all desired state. Windows-only.
 pub fn apply() -> anyhow::Result<()> {
