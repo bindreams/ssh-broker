@@ -1,0 +1,39 @@
+name: Semantic PR Title
+
+# Enforces the Conventional Commits convention on PR titles. This repo squash-merges
+# every PR, so the PR title becomes the commit subject on main — which is why the title
+# is worth a check of its own rather than being left to review.
+
+# `on: pull_request` (vs `pull_request_target`) runs the workflow from the PR's branch
+# using the default read-only GITHUB_TOKEN. Write access is unnecessary — the action only
+# reads the PR title — and `pull_request` lets the workflow be validated by its own PR at
+# introduction time.
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+
+permissions:
+  pull-requests: read
+
+jobs:
+  validate:
+    name: Validate PR title
+    runs-on: ubuntu-latest
+    steps:
+      - uses: amannn/action-semantic-pull-request@v6
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          types: |
+            feat
+            fix
+            docs
+            style
+            refactor
+            perf
+            test
+            build
+            ci
+            chore
+            revert
+          requireScope: false
