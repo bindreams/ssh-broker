@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# No toolchain action: `rust-toolchain.toml` is a rustup directory override, so the
+# first `cargo`/`rustup` call in the workspace installs the pinned channel along with
+# its `components` and `targets`. `rustup show` makes that install an explicit, logged
+# step instead of a side effect of whichever cargo command happens to run first.
+#
+# Job names are load-bearing — they are the required status-check contexts on the
+# default branch. Renaming one silently blocks every PR, because a required context
+# that never reports is indistinguishable from one that has not finished.
+
+jobs:
+  lint:
+    name: Lint (${{ matrix.label }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: windows-latest, label: windows/amd64 }
+          - { os: macos-latest, label: macos/arm64 }
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install pinned toolchain
+        run: rustup show
+
+      # Formatting is platform-independent, but clippy is not: it only sees one `cfg`
+      # per invocation, so a single-platform lint job would never lint the other half
+      # of the codebase. Most of this crate is `cfg(windows)`.
+      - name: cargo fmt
+        run: cargo fmt --check
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+  test:
+    name: Test (${{ matrix.label }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: windows-latest, label: windows/amd64 }
+          - { os: macos-latest, label: macos/arm64 }
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install pinned toolchain
+        run: rustup show
+
+      - name: cargo test
+        run: cargo test
