@@ -47,8 +47,7 @@ impl FrameHeader {
 
     pub fn decode(b: &[u8]) -> anyhow::Result<Self> {
         anyhow::ensure!(b.len() >= HEADER_LEN, "short header: {} < {HEADER_LEN}", b.len());
-        let kind = FrameKind::from_u8(b[0])
-            .ok_or_else(|| anyhow::anyhow!("bad frame kind {}", b[0]))?;
+        let kind = FrameKind::from_u8(b[0]).ok_or_else(|| anyhow::anyhow!("bad frame kind {}", b[0]))?;
         let len = u32::from_le_bytes([b[1], b[2], b[3], b[4]]);
         anyhow::ensure!(len <= MAX_FRAME, "frame too large: {len} > {MAX_FRAME}");
         Ok(Self { kind, len })
@@ -186,17 +185,16 @@ pub struct Frame {
 }
 
 /// Write one length-prefixed frame (`[header][payload]`) to `w`.
-pub fn write_frame<W: std::io::Write>(
-    w: &mut W,
-    kind: FrameKind,
-    payload: &[u8],
-) -> anyhow::Result<()> {
+pub fn write_frame<W: std::io::Write>(w: &mut W, kind: FrameKind, payload: &[u8]) -> anyhow::Result<()> {
     anyhow::ensure!(
         payload.len() as u64 <= MAX_FRAME as u64,
         "payload too large: {} > {MAX_FRAME}",
         payload.len()
     );
-    let header = FrameHeader { kind, len: payload.len() as u32 };
+    let header = FrameHeader {
+        kind,
+        len: payload.len() as u32,
+    };
     w.write_all(&header.encode())?;
     w.write_all(payload)?;
     Ok(())
@@ -235,7 +233,10 @@ impl FrameReader {
         }
         let payload = self.buf[HEADER_LEN..total].to_vec();
         self.buf.drain(..total);
-        Ok(Some(Frame { kind: header.kind, payload }))
+        Ok(Some(Frame {
+            kind: header.kind,
+            payload,
+        }))
     }
 }
 
@@ -244,10 +245,7 @@ impl FrameReader {
 /// `FrameReader` to `pump_decode` afterwards without losing pipelined data (e.g. a
 /// DATA frame sent in the same write as the HANDSHAKE). Errors on EOF before a
 /// complete frame, or on a malformed header.
-pub fn read_one_frame(
-    r: &mut impl std::io::Read,
-    fr: &mut FrameReader,
-) -> anyhow::Result<Frame> {
+pub fn read_one_frame(r: &mut impl std::io::Read, fr: &mut FrameReader) -> anyhow::Result<Frame> {
     loop {
         if let Some(frame) = fr.next_frame()? {
             return Ok(frame);

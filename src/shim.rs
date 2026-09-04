@@ -31,14 +31,7 @@ pub fn run(exec: Option<String>) -> anyhow::Result<()> {
 /// `protocol::Stream`): the agent treats a full socket close as a *disconnect* and kills the
 /// child, whereas stdin-EOF is signalled by an empty `DATA(Stdin)` marker. Closing `tx` at
 /// stdin EOF would therefore kill a child that is still producing output.
-pub fn run_exec_on<R, W, O, E, I>(
-    mut rx: R,
-    tx: W,
-    hs: &Handshake,
-    out: O,
-    err: E,
-    stdin: I,
-) -> anyhow::Result<i32>
+pub fn run_exec_on<R, W, O, E, I>(mut rx: R, tx: W, hs: &Handshake, out: O, err: E, stdin: I) -> anyhow::Result<i32>
 where
     R: Read,
     W: Write + Send + 'static,
@@ -147,10 +140,12 @@ fn split_command(cmd: &str) -> Vec<String> {
     let mut has_token = false;
     for ch in cmd.chars() {
         match ch {
-            '"' => has_token = {
-                in_quotes = !in_quotes;
-                true
-            },
+            '"' => {
+                has_token = {
+                    in_quotes = !in_quotes;
+                    true
+                }
+            }
             c if c.is_whitespace() && !in_quotes => {
                 if has_token {
                     tokens.push(std::mem::take(&mut cur));

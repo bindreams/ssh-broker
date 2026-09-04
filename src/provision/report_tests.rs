@@ -15,7 +15,10 @@ fn exit_code_zero_only_when_all_pass_and_nonempty() {
 
 #[test]
 fn report_marks_pass_and_fail() {
-    let rows = vec![Check::new("DefaultShell", true, "ok"), Check::new("DPAPI", false, "absent")];
+    let rows = vec![
+        Check::new("DefaultShell", true, "ok"),
+        Check::new("DPAPI", false, "absent"),
+    ];
     let out = format_report(&rows);
     assert!(out.contains("[PASS] DefaultShell"));
     assert!(out.contains("[FAIL] DPAPI"));

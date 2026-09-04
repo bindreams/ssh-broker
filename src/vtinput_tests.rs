@@ -62,7 +62,13 @@ const MOUSE_MOVED: u32 = 0x0001;
 const MOUSE_WHEELED: u32 = 0x0004;
 
 fn mev(x: i16, y: i16, buttons: u32, flags: u32, cks: u32) -> MouseEvent {
-    MouseEvent { x, y, button_state: buttons, control_key_state: cks, event_flags: flags }
+    MouseEvent {
+        x,
+        y,
+        button_state: buttons,
+        control_key_state: cks,
+        event_flags: flags,
+    }
 }
 
 #[test]

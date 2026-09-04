@@ -6,8 +6,8 @@
 
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::System::Threading::{
-    DeleteProcThreadAttributeList, InitializeProcThreadAttributeList,
-    LPPROC_THREAD_ATTRIBUTE_LIST, UpdateProcThreadAttribute,
+    DeleteProcThreadAttributeList, InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
+    UpdateProcThreadAttribute,
 };
 
 /// Owns a `HANDLE`, calling `CloseHandle` on drop (no-op on an invalid handle).

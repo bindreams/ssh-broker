@@ -25,9 +25,10 @@ impl Config {
 }
 
 /// Resolve the target account NAME, preferring an explicit source so a SYSTEM-run `apply`
-/// never derives it from its own (SYSTEM) token. Precedence: CLI `--user` > persisted config
-/// > the current interactive user (only meaningful when `apply` is run interactively). Errors
-/// if none is available — `apply` must bail loudly rather than harden for the wrong account.
+/// never derives it from its own (SYSTEM) token. Precedence: CLI `--user` > persisted
+/// config > the current interactive user (only meaningful when `apply` is run
+/// interactively). Errors if none is available — `apply` must bail loudly rather than
+/// harden for the wrong account.
 pub fn resolve_target_user(
     cli: Option<&str>,
     cfg: Option<&str>,

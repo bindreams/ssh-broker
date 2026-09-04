@@ -3,7 +3,9 @@ use super::{Config, resolve_target_user};
 
 #[test]
 fn config_toml_round_trips() {
-    let c = Config { target_user: "Test.User".into() };
+    let c = Config {
+        target_user: "Test.User".into(),
+    };
     let parsed = Config::from_toml(&c.to_toml().unwrap()).unwrap();
     assert_eq!(parsed, c);
 }

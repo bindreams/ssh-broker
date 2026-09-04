@@ -28,7 +28,9 @@ mod winutil;
 pub enum Route {
     /// The SSH DefaultShell. `exec` is `Some(command)` for `-c "cmd"`, `None` for
     /// an interactive (PTY) session.
-    Shim { exec: Option<String> },
+    Shim {
+        exec: Option<String>,
+    },
     Agent,
     Apply,
     Verify,
@@ -86,7 +88,9 @@ mod route_tests {
     fn dash_c_is_exec_shim() {
         assert_eq!(
             route(&["-c".into(), "echo hi".into()]),
-            Route::Shim { exec: Some("echo hi".into()) }
+            Route::Shim {
+                exec: Some("echo hi".into())
+            }
         );
     }
 
@@ -95,13 +99,10 @@ mod route_tests {
         // Resolves the truncation defect: everything after `-c` is reassembled,
         // not just args[1].
         assert_eq!(
-            route(&[
-                "-c".into(),
-                "git".into(),
-                "commit -m".into(),
-                "x y".into()
-            ]),
-            Route::Shim { exec: Some("git commit -m x y".into()) }
+            route(&["-c".into(), "git".into(), "commit -m".into(), "x y".into()]),
+            Route::Shim {
+                exec: Some("git commit -m x y".into())
+            }
         );
     }
 
@@ -127,7 +128,9 @@ mod route_tests {
         // `ssh host "verify-probe"` arrives as `-c "verify-probe"` → shim-exec, NOT the verb.
         assert_eq!(
             route(&["-c".into(), "verify-probe".into()]),
-            Route::Shim { exec: Some("verify-probe".into()) }
+            Route::Shim {
+                exec: Some("verify-probe".into())
+            }
         );
     }
 
@@ -137,7 +140,9 @@ mod route_tests {
         // running the command `agent`. No collision with the `agent` verb.
         assert_eq!(
             route(&["-c".into(), "agent".into()]),
-            Route::Shim { exec: Some("agent".into()) }
+            Route::Shim {
+                exec: Some("agent".into())
+            }
         );
     }
 }

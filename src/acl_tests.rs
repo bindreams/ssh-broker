@@ -20,10 +20,7 @@ fn harden_then_verify_roundtrips() {
     std::fs::create_dir_all(&dir).unwrap();
     let me = Sid::current_user().unwrap();
     harden_dir(&dir, &me).unwrap();
-    assert!(
-        verify_dir_acl(&dir, &me).unwrap(),
-        "a freshly hardened dir must verify"
-    );
+    assert!(verify_dir_acl(&dir, &me).unwrap(), "a freshly hardened dir must verify");
     std::fs::remove_dir_all(&dir).ok();
 }
 

@@ -83,9 +83,8 @@ impl Listener {
                     path.display()
                 );
             }
-            std::fs::remove_file(path).map_err(|e| {
-                anyhow::anyhow!("failed to reclaim stale socket {}: {e}", path.display())
-            })?;
+            std::fs::remove_file(path)
+                .map_err(|e| anyhow::anyhow!("failed to reclaim stale socket {}: {e}", path.display()))?;
         }
         let sock = Socket::new(Domain::UNIX, Type::STREAM, None)?;
         sock.bind(&unix_addr(path)?)?;
@@ -119,7 +118,7 @@ pub fn connect(path: &Path) -> anyhow::Result<Socket> {
 #[cfg(windows)]
 fn set_no_inherit(sock: &Socket) -> anyhow::Result<()> {
     use std::os::windows::io::AsRawSocket;
-    use windows::Win32::Foundation::{HANDLE, HANDLE_FLAGS, HANDLE_FLAG_INHERIT, SetHandleInformation};
+    use windows::Win32::Foundation::{HANDLE, HANDLE_FLAG_INHERIT, HANDLE_FLAGS, SetHandleInformation};
     let handle = HANDLE(sock.as_raw_socket() as usize as *mut core::ffi::c_void);
     unsafe {
         SetHandleInformation(handle, HANDLE_FLAG_INHERIT.0, HANDLE_FLAGS(0))?;

@@ -188,9 +188,7 @@ fn agent_exec_tears_down_when_ssh_disconnects_first() {
         let (_crx, mut ctx) = afunix::split(conn).unwrap();
         let hs = Handshake {
             mode: Mode::Exec,
-            command: Some(
-                "pwsh.exe -NoLogo -NoProfile -Command \"Start-Sleep -Seconds 99999\"".into(),
-            ),
+            command: Some("pwsh.exe -NoLogo -NoProfile -Command \"Start-Sleep -Seconds 99999\"".into()),
             ..Handshake::pty_default()
         };
         write_frame(&mut ctx, FrameKind::Handshake, &hs.encode().unwrap()).unwrap();

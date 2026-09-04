@@ -134,7 +134,11 @@ fn pump_decode_errors_on_truncation_at_eof() {
     let writer = thread::spawn(move || {
         let mut tx = tx;
         // Header claims 10 payload bytes; only 2 are sent, then EOF.
-        let header = FrameHeader { kind: FrameKind::Data, len: 10 }.encode();
+        let header = FrameHeader {
+            kind: FrameKind::Data,
+            len: 10,
+        }
+        .encode();
         tx.write_all(&header).unwrap();
         tx.write_all(&[Stream::Stdout as u8, b'x']).unwrap();
         // tx drops here -> EOF mid-frame
@@ -172,8 +176,12 @@ fn pump_decode_continues_from_handshake_readers_residual() {
     let (tx, mut rx) = duplex();
     let writer = thread::spawn(move || {
         let mut tx = tx;
-        write_frame(&mut tx, FrameKind::Handshake, &Handshake::pty_default().encode().unwrap())
-            .unwrap();
+        write_frame(
+            &mut tx,
+            FrameKind::Handshake,
+            &Handshake::pty_default().encode().unwrap(),
+        )
+        .unwrap();
         write_data(&mut tx, Stream::Stdout, b"after-handshake").unwrap();
         write_frame(&mut tx, FrameKind::Exit, &ExitCode(0).encode()).unwrap();
     });

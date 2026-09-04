@@ -7,7 +7,11 @@ fn probe_line_round_trips() {
     assert_eq!(line, "PROBE session_id=1 dpapi=ok symlink=blocked");
     assert_eq!(
         parse_probe_line(&line).unwrap(),
-        ProbeResult { session_id: 1, dpapi_ok: true, symlink: SymlinkState::Blocked }
+        ProbeResult {
+            session_id: 1,
+            dpapi_ok: true,
+            symlink: SymlinkState::Blocked
+        }
     );
 }
 
@@ -27,7 +31,14 @@ fn symlink_states_round_trip() {
 fn parse_is_default_deny_on_gating_keys() {
     // Missing dpapi → fail; missing session_id → 0; missing symlink → Skipped (informational).
     let r = parse_probe_line("PROBE session_id=2").unwrap();
-    assert_eq!(r, ProbeResult { session_id: 2, dpapi_ok: false, symlink: SymlinkState::Skipped });
+    assert_eq!(
+        r,
+        ProbeResult {
+            session_id: 2,
+            dpapi_ok: false,
+            symlink: SymlinkState::Skipped
+        }
+    );
 }
 
 #[test]
@@ -35,7 +46,11 @@ fn parse_tolerates_surrounding_noise() {
     let out = "starting...\nPROBE session_id=7 dpapi=ok symlink=ok\nbye\n";
     assert_eq!(
         parse_probe_line(out).unwrap(),
-        ProbeResult { session_id: 7, dpapi_ok: true, symlink: SymlinkState::Ok }
+        ProbeResult {
+            session_id: 7,
+            dpapi_ok: true,
+            symlink: SymlinkState::Ok
+        }
     );
 }
 

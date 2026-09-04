@@ -5,8 +5,14 @@ use super::*;
 #[test]
 fn agent_xml_sets_interactive_token_and_least_privilege() {
     let xml = agent_task_xml(r"C:\ProgramData\ssh-broker\ssh-broker.exe", "Test.User");
-    assert!(xml.contains("<LogonType>InteractiveToken</LogonType>"), "must be InteractiveToken");
-    assert!(xml.contains("<RunLevel>LeastPrivilege</RunLevel>"), "must be LeastPrivilege");
+    assert!(
+        xml.contains("<LogonType>InteractiveToken</LogonType>"),
+        "must be InteractiveToken"
+    );
+    assert!(
+        xml.contains("<RunLevel>LeastPrivilege</RunLevel>"),
+        "must be LeastPrivilege"
+    );
     assert!(xml.contains(r"C:\ProgramData\ssh-broker\ssh-broker.exe"));
     assert!(xml.contains("<Arguments>agent</Arguments>"));
     assert!(xml.contains("<UserId>Test.User</UserId>"));
@@ -21,7 +27,9 @@ fn xml_file_bytes_is_utf16le_with_bom() {
     let bytes = xml_file_bytes(&xml);
     assert_eq!(&bytes[..2], &[0xFF, 0xFE], "must start with a UTF-16LE BOM");
     // The body after the BOM decodes back to the original XML.
-    let u16s: Vec<u16> = bytes[2..].chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+    let (pairs, rest) = bytes[2..].as_chunks::<2>();
+    assert!(rest.is_empty(), "UTF-16LE body must be a whole number of code units");
+    let u16s: Vec<u16> = pairs.iter().copied().map(u16::from_le_bytes).collect();
     assert_eq!(String::from_utf16(&u16s).unwrap(), xml);
 }
 
@@ -74,6 +82,8 @@ fn query_parsing_registered_and_token() {
     assert!(!parse_query_registered(&xml, false)); // nonzero exit = not registered
     assert!(!parse_query_registered("ERROR: task not found", true)); // no <Task
     // A task that is NOT InteractiveToken must be detected as such.
-    assert!(!xml_has_interactive_token("<Principal><LogonType>S4U</LogonType></Principal>"));
+    assert!(!xml_has_interactive_token(
+        "<Principal><LogonType>S4U</LogonType></Principal>"
+    ));
     assert!(xml_has_interactive_token(&xml));
 }

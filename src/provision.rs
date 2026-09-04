@@ -101,11 +101,8 @@ mod imp {
             .ok()
             .and_then(|s| config::Config::from_toml(&s).ok())
             .map(|c| c.target_user);
-        let user = config::resolve_target_user(
-            arg_user().as_deref(),
-            saved.as_deref(),
-            current_user_name().as_deref(),
-        )?;
+        let user =
+            config::resolve_target_user(arg_user().as_deref(), saved.as_deref(), current_user_name().as_deref())?;
         let sid = acl::Sid::lookup(&user).with_context(|| format!("resolving SID for {user:?}"))?;
 
         // 2. Create + harden the socket dir (the agent's bind precondition) — fail-closed.
@@ -135,10 +132,10 @@ mod imp {
         );
 
         // 6. Start the agent now so no re-login is needed (the logon trigger covers the rest).
-        if probe::active_console_session() != 0xFFFF_FFFF {
-            if let Err(e) = run_schtasks(&schtasks::run_task_argv(schtasks::AGENT_TASK)) {
-                eprintln!("apply: agent task registered but immediate start failed: {e}");
-            }
+        if probe::active_console_session() != 0xFFFF_FFFF
+            && let Err(e) = run_schtasks(&schtasks::run_task_argv(schtasks::AGENT_TASK))
+        {
+            eprintln!("apply: agent task registered but immediate start failed: {e}");
         }
         println!(
             "apply: ok — DefaultShell -> {}, agent + self-heal tasks installed for {user}",
@@ -177,7 +174,10 @@ mod imp {
     }
 
     fn write_config(user: &str) -> anyhow::Result<()> {
-        let toml = config::Config { target_user: user.to_string() }.to_toml()?;
+        let toml = config::Config {
+            target_user: user.to_string(),
+        }
+        .to_toml()?;
         // Direct overwrite: config.toml is read only by apply/verify, never concurrently with
         // this write, so atomicity buys nothing — and a plain write is reliably idempotent on
         // every re-apply (a temp+rename adds a Windows replace-semantics footgun for no gain).
@@ -199,8 +199,7 @@ mod imp {
     }
 
     fn register_selfheal_task(exe: &Path, user: &str) -> anyhow::Result<()> {
-        run_schtasks(&schtasks::selfheal_task_argv(&exe.to_string_lossy(), user))
-            .context("register self-heal task")?;
+        run_schtasks(&schtasks::selfheal_task_argv(&exe.to_string_lossy(), user)).context("register self-heal task")?;
         Ok(())
     }
 
@@ -213,10 +212,10 @@ mod imp {
         let nul_heavy = bytes.iter().take(64).filter(|&&b| b == 0).count() > 8;
         if bom || nul_heavy {
             let start = if bom { 2 } else { 0 };
-            let u16s: Vec<u16> = bytes[start..]
-                .chunks_exact(2)
-                .map(|c| u16::from_le_bytes([c[0], c[1]]))
-                .collect();
+            // A trailing odd byte is dropped, as `chunks_exact` did: this decodes
+            // schtasks' output defensively, not a length-checked wire format.
+            let (pairs, _odd_tail) = bytes[start..].as_chunks::<2>();
+            let u16s: Vec<u16> = pairs.iter().copied().map(u16::from_le_bytes).collect();
             String::from_utf16_lossy(&u16s)
         } else {
             String::from_utf8_lossy(bytes).into_owned()
@@ -256,7 +255,11 @@ mod imp {
         match registry::read_default_shell_under(registry::OPENSSH_KEY) {
             Ok((shell, opt)) => {
                 let ok = eq_path(&shell, &exe) && opt == "-c" && exe.is_file();
-                rows.push(report::Check::new("DefaultShell pair", ok, format!("shell={shell:?} opt={opt:?}")));
+                rows.push(report::Check::new(
+                    "DefaultShell pair",
+                    ok,
+                    format!("shell={shell:?} opt={opt:?}"),
+                ));
             }
             Err(e) => rows.push(report::Check::new("DefaultShell pair", false, e.to_string())),
         }
@@ -292,7 +295,11 @@ mod imp {
         rows.push(report::Check::new(
             "self-heal task (info)",
             true,
-            if heal_ok { "registered" } else { "not queryable (needs elevation)" },
+            if heal_ok {
+                "registered"
+            } else {
+                "not queryable (needs elevation)"
+            },
         ));
 
         // Local: the socket is reachable.
@@ -308,7 +315,11 @@ mod imp {
                 rows.push(report::Check::new(
                     "interactive session (via agent)",
                     p.session_id != 0,
-                    format!("session_id={} (active console={})", p.session_id, probe::active_console_session()),
+                    format!(
+                        "session_id={} (active console={})",
+                        p.session_id,
+                        probe::active_console_session()
+                    ),
                 ));
                 rows.push(report::Check::new("DPAPI (via agent)", p.dpapi_ok, String::new()));
                 // Only a confirmed Blocked is a parity failure; Skipped (unprivileged,
@@ -320,7 +331,11 @@ mod imp {
                 ));
             }
             Err(e) => {
-                rows.push(report::Check::new("parity probe (via agent)", false, format!("unavailable: {e}")));
+                rows.push(report::Check::new(
+                    "parity probe (via agent)",
+                    false,
+                    format!("unavailable: {e}"),
+                ));
             }
         }
 

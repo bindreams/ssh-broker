@@ -17,19 +17,18 @@
 use crate::protocol::{FrameKind, FrameReader, Handshake, Stream, write_frame};
 use crate::relay::{FrameSink, pump_decode, write_data};
 use crate::shim::{
-    Fallback, MouseModeSniffer, XtwinopsFilter, decide_fallback, make_handshake, map_outcome,
-    run_exec_on, size_to_resize,
+    Fallback, MouseModeSniffer, XtwinopsFilter, decide_fallback, make_handshake, map_outcome, run_exec_on,
+    size_to_resize,
 };
 use crate::{afunix, conpty, vtinput};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::System::Console::{
-    CONSOLE_MODE, CONSOLE_SCREEN_BUFFER_INFO, DISABLE_NEWLINE_AUTO_RETURN, ENABLE_EXTENDED_FLAGS,
-    ENABLE_MOUSE_INPUT, ENABLE_PROCESSED_OUTPUT, ENABLE_VIRTUAL_TERMINAL_PROCESSING,
-    ENABLE_WINDOW_INPUT, GetConsoleMode, GetConsoleScreenBufferInfo, GetStdHandle, INPUT_RECORD,
-    ReadConsoleInputW, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, SetConsoleCtrlHandler, SetConsoleMode,
-    WriteConsoleInputW,
+    CONSOLE_MODE, CONSOLE_SCREEN_BUFFER_INFO, DISABLE_NEWLINE_AUTO_RETURN, ENABLE_EXTENDED_FLAGS, ENABLE_MOUSE_INPUT,
+    ENABLE_PROCESSED_OUTPUT, ENABLE_VIRTUAL_TERMINAL_PROCESSING, ENABLE_WINDOW_INPUT, GetConsoleMode,
+    GetConsoleScreenBufferInfo, GetStdHandle, INPUT_RECORD, ReadConsoleInputW, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+    SetConsoleCtrlHandler, SetConsoleMode, WriteConsoleInputW,
 };
 
 // INPUT_RECORD.EventType values (processthreadsapi/consoleapi). windows-rs 0.62 does not
@@ -43,13 +42,11 @@ const EVT_FOCUS: u16 = 0x0010;
 /// quick-edit). The absolute store implicitly clears PROCESSED/LINE/ECHO input, so Ctrl-C
 /// arrives as a KEY record (uc=0x03) rather than a signal. VT-input is intentionally omitted
 /// — we read raw `INPUT_RECORD`s and re-encode them ourselves.
-const RAW_IN: CONSOLE_MODE =
-    CONSOLE_MODE(ENABLE_WINDOW_INPUT.0 | ENABLE_MOUSE_INPUT.0 | ENABLE_EXTENDED_FLAGS.0);
+const RAW_IN: CONSOLE_MODE = CONSOLE_MODE(ENABLE_WINDOW_INPUT.0 | ENABLE_MOUSE_INPUT.0 | ENABLE_EXTENDED_FLAGS.0);
 /// stdout bits OR-ed onto the inherited mode: render the agent's VT, and stop CR injection
 /// on LF (the agent's stream already carries explicit CR/LF).
-const VT_OUT: CONSOLE_MODE = CONSOLE_MODE(
-    ENABLE_PROCESSED_OUTPUT.0 | ENABLE_VIRTUAL_TERMINAL_PROCESSING.0 | DISABLE_NEWLINE_AUTO_RETURN.0,
-);
+const VT_OUT: CONSOLE_MODE =
+    CONSOLE_MODE(ENABLE_PROCESSED_OUTPUT.0 | ENABLE_VIRTUAL_TERMINAL_PROCESSING.0 | DISABLE_NEWLINE_AUTO_RETURN.0);
 
 // ── run() wiring + fail-open ───────────────────────────────────────────────────────
 
@@ -65,11 +62,11 @@ pub fn run_on(exec: Option<String>) -> anyhow::Result<()> {
     // bidirectional stdio and gain nothing from session-1 parity, so relaying their long-lived
     // binary protocol only adds latency + a buffering failure surface. (This is what sshd's
     // sftp subsystem becomes once DefaultShell is the shim: `ssh-broker -c "sftp-server.exe"`.)
-    if let Some(cmd) = &exec {
-        if crate::shim::is_transfer_command(cmd) {
-            drop(log);
-            return run_local_passthrough(cmd);
-        }
+    if let Some(cmd) = &exec
+        && crate::shim::is_transfer_command(cmd)
+    {
+        drop(log);
+        return run_local_passthrough(cmd);
     }
 
     match try_relay(&exec) {
@@ -270,12 +267,8 @@ impl FrameSink for StdoutSink {
         self.sniffer.observe(bytes);
         // The AND (tracking && SGR) is computed here on the single writer, so the worker
         // reads one self-consistent flag rather than two it would have to combine.
-        self.gate
-            .forward
-            .store(self.sniffer.forward_mouse(), Ordering::Relaxed);
-        self.gate
-            .focus
-            .store(self.sniffer.focus_on(), Ordering::Relaxed);
+        self.gate.forward.store(self.sniffer.forward_mouse(), Ordering::Relaxed);
+        self.gate.focus.store(self.sniffer.focus_on(), Ordering::Relaxed);
         let filtered = self.filter.filter(bytes);
         anyhow::ensure!(
             conpty::write_all_handle(self.out, &filtered),
@@ -386,17 +379,16 @@ unsafe fn input_loop(
                         enc.reset();
                     }
                 }
-                EVT_FOCUS => {
-                    // Forward focus in/out as `CSI I`/`CSI O`, but ONLY when the shell enabled
-                    // ?1004 — else focus-naive programs would see stray `ESC[I`/`ESC[O`. The
-                    // teardown wake record (also a FOCUS) never reaches here: the worker returns
-                    // on the post-read `stopping` re-check above, before this loop.
-                    if gate.focus.load(Ordering::Relaxed) {
-                        let focused = unsafe { rec.Event.FocusEvent }.bSetFocus.as_bool();
-                        let seq: &[u8] = if focused { b"\x1b[I" } else { b"\x1b[O" };
-                        if write_data(tx, Stream::Pty, seq).is_err() {
-                            return;
-                        }
+                // Forward focus in/out as `CSI I`/`CSI O`, but ONLY when the shell enabled
+                // ?1004 — else focus-naive programs would see stray `ESC[I`/`ESC[O`. A focus
+                // record arriving while the gate is closed falls through to the `_` arm. The
+                // teardown wake record (also a FOCUS) never reaches here: the worker returns
+                // on the post-read `stopping` re-check above, before this loop.
+                EVT_FOCUS if gate.focus.load(Ordering::Relaxed) => {
+                    let focused = unsafe { rec.Event.FocusEvent }.bSetFocus.as_bool();
+                    let seq: &[u8] = if focused { b"\x1b[I" } else { b"\x1b[O" };
+                    if write_data(tx, Stream::Pty, seq).is_err() {
+                        return;
                     }
                 }
                 _ => {} // MENU: ignored (internal)
@@ -452,8 +444,8 @@ impl ConsoleModes {
             let stdout = GetStdHandle(STD_OUTPUT_HANDLE)?;
             let mut in_orig = CONSOLE_MODE(0);
             let mut out_orig = CONSOLE_MODE(0);
-            let is_console = GetConsoleMode(stdin, &mut in_orig).is_ok()
-                && GetConsoleMode(stdout, &mut out_orig).is_ok();
+            let is_console =
+                GetConsoleMode(stdin, &mut in_orig).is_ok() && GetConsoleMode(stdout, &mut out_orig).is_ok();
             if is_console {
                 SetConsoleMode(stdin, RAW_IN)?;
                 SetConsoleMode(stdout, CONSOLE_MODE(out_orig.0 | VT_OUT.0))?;
@@ -461,7 +453,13 @@ impl ConsoleModes {
                 // the cleared ENABLE_PROCESSED_INPUT delivering Ctrl-C as a KEY record).
                 let _ = SetConsoleCtrlHandler(None, true);
             }
-            Ok(ConsoleModes { stdin, stdout, in_orig, out_orig, is_console })
+            Ok(ConsoleModes {
+                stdin,
+                stdout,
+                in_orig,
+                out_orig,
+                is_console,
+            })
         }
     }
 }
@@ -487,10 +485,7 @@ fn init_file_logging() -> Option<tracing_appender::non_blocking::WorkerGuard> {
     std::fs::create_dir_all(&dir).ok()?;
     let appender = tracing_appender::rolling::daily(&dir, "shim.log");
     let (nb, guard) = tracing_appender::non_blocking(appender);
-    let _ = tracing_subscriber::fmt()
-        .with_writer(nb)
-        .with_ansi(false)
-        .try_init();
+    let _ = tracing_subscriber::fmt().with_writer(nb).with_ansi(false).try_init();
     Some(guard)
 }
 
