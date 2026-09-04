@@ -66,7 +66,7 @@ fn home_dir() -> Option<PathBuf> {
 /// user's home directory. This mirrors what a normal SSH login does — sshd's `do_child()` runs
 /// `chdir(pw->pw_dir)` to the user's home before exec'ing the shell — so `ssh host` lands you in
 /// your home, not wherever the agent task happened to start (`C:\Windows\System32`).
-fn child_cwd(handshake_cwd: &str, home: Option<std::path::PathBuf>) -> Option<std::path::PathBuf> {
+pub fn child_cwd(handshake_cwd: &str, home: Option<std::path::PathBuf>) -> Option<std::path::PathBuf> {
     if handshake_cwd.is_empty() {
         home
     } else {
