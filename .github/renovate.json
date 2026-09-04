@@ -1,0 +1,45 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended"],
+  "minimumReleaseAge": "7 days",
+  "platformAutomerge": true,
+  "customManagers": [
+    {
+      "customType": "regex",
+      "managerFilePatterns": ["/^\\.github/workflows/.+\\.ya?ml$/"],
+      "matchStrings": [
+        "# renovate: datasource=(?<datasource>\\S+) depName=(?<depName>\\S+)(?: versioning=(?<versioning>\\S+))?\\s+\\w+:\\s*[\"'](?<currentValue>[^\"']+)[\"']"
+      ],
+      "extractVersionTemplate": "^v?(?<version>.+)$"
+    }
+  ],
+  "packageRules": [
+    {
+      "description": "Group non-major GitHub Actions updates",
+      "matchManagers": ["github-actions"],
+      "matchUpdateTypes": ["minor", "patch", "pin", "digest"],
+      "groupName": "GitHub Actions",
+      "automerge": true
+    },
+    {
+      "description": "Group non-major Rust crate updates",
+      "matchManagers": ["cargo"],
+      "matchUpdateTypes": ["minor", "patch", "pin", "digest"],
+      "groupName": "Rust crates",
+      "automerge": true
+    },
+    {
+      "description": "Major updates: one PR per package (API breaks reviewed individually). groupName: null overrides any inherited monorepo group from config:recommended's group:monorepos / group:recommended presets. Applies to the customManagers workflow-annotation manager as well — by design; the customManagers block has no groupName, so this just reasserts the default.",
+      "matchUpdateTypes": ["major"],
+      "groupName": null,
+      "automerge": true
+    },
+    {
+      "description": "Rust compiler: its own reviewable PR, never automerged. A compiler bump lands new default-on clippy lints across the whole crate at once, so it must not ride in a batch (see rust-toolchain.toml). groupName: null un-groups it; automerge: false overrides the major-updates rule above, which matches every manager including this one. Last rule wins — this rule must stay LAST in this array.",
+      "matchManagers": ["rust-toolchain"],
+      "matchDepNames": ["rust"],
+      "groupName": null,
+      "automerge": false
+    }
+  ]
+}
