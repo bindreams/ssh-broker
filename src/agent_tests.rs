@@ -385,29 +385,26 @@ fn pty_disconnect_kills_the_whole_process_tree() {
     assert_exits(raw, "the grandchild after a PTY disconnect");
 }
 
-/// Normal exit: the command finished on its own, so its descendants are left alone.
+/// Normal exit reaps descendants too — Windows OpenSSH does, so we do.
 ///
-/// This is the contract that keeps `ssh host "start-a-daemon"` working, and it is not free —
-/// both teardown paths shut the socket down to unblock the input pump, and because `split`
-/// hands out duplicates of one socket that EOF is indistinguishable from a peer disconnect.
-/// The pump resolves it by asking whether the child already exited.
+/// This is measured behaviour of the shell being replaced, not a guess: stock Windows OpenSSH
+/// ends the session when the direct child exits and terminates the descendant tree, including a
+/// descendant whose stdout was redirected to a file and never touched the session's pipe. There
+/// is no `nohup` equivalent there, so leaving descendants running would be a divergence from the
+/// platform rather than parity with it. (Unix OpenSSH is the opposite — it waits for pipe EOF,
+/// which is why `nohup cmd >/dev/null 2>&1 &` exists.)
 ///
-/// **Deliberately uses a non-inheriting grandchild.** With `-NoNewWindow` the descendant would
-/// hold the command's stdout, the output pump would never see EOF, and the session would not
-/// end at all — which is what sshd does too, and is therefore accepted behaviour rather than a
-/// bug this test should assert around. Covering it here would hang, not fail.
+/// The grandchild here does NOT inherit stdout, so this is purely about the reap decision; the
+/// inherited-pipe case is covered by `exec_disconnect_reaps_a_descendant_holding_stdout`.
 #[test]
-fn exec_normal_exit_leaves_descendants_running() {
-    use windows::Win32::Foundation::{HANDLE, WAIT_TIMEOUT};
-    use windows::Win32::System::Threading::{TerminateProcess, WaitForSingleObject};
-
+fn exec_normal_exit_reaps_descendants_like_windows_sshd() {
     let raw = run_tree_session("tree-exec-exit", Mode::Exec, "exit 0", false, false);
-    let h = HANDLE(raw as *mut core::ffi::c_void);
-    // sleep-ok: zero timeout is a state query — WAIT_TIMEOUT means "still running"
-    let alive = unsafe { WaitForSingleObject(h, 0) } == WAIT_TIMEOUT; // sleep-ok: state query, not a wait
-    unsafe {
-        let _ = TerminateProcess(h, 1); // do not leak it into the rest of the run
-    }
-    close_handle(raw);
-    assert!(alive, "a normally-exited command must not take its descendants with it");
+    assert_exits(raw, "the grandchild after a normal EXEC exit");
+}
+
+/// The PTY path makes the same decision at its own teardown site.
+#[test]
+fn pty_normal_exit_reaps_descendants_like_windows_sshd() {
+    let raw = run_tree_session("tree-pty-exit", Mode::Pty, "exit 0", false, false);
+    assert_exits(raw, "the grandchild after a normal PTY exit");
 }
