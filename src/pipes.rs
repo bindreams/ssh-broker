@@ -25,9 +25,9 @@ const PROC_THREAD_ATTRIBUTE_HANDLE_LIST: usize = 0x0002_0002;
 /// A child process with redirected stdin/stdout/stderr (the EXEC path).
 pub struct ExecChild {
     process: OwnedHandle,
-    /// Kernel-enforced containment for the command and everything it spawns. Teardown is
-    /// `kill_tree` (the session is gone, reap it all) or `disarm` (the command exited on its
-    /// own, so leave whatever it launched running, as sshd does).
+    /// Kernel-enforced containment for the command and everything it spawns. Teardown always
+    /// reaps the whole tree; a normal exit is no different from a disconnect here, for the
+    /// measured reason in `agent::reap_tree`.
     job: std::sync::Arc<cosca::Job>,
     _thread: OwnedHandle,
     stdin_write: Option<OwnedHandle>,
@@ -119,7 +119,11 @@ impl ExecChild {
                 Err(e) => {
                     // Uncontained AND still suspended. Resuming now would let it fork
                     // descendants nothing can reach, so kill it and propagate.
-                    let _ = TerminateProcess(process.0, 1);
+                    if let Err(ke) = TerminateProcess(process.0, 1) {
+                        // Uncontained, still suspended, and now unkillable: say so, or it is
+                        // a leaked process with no trace but an unrelated error message.
+                        tracing::warn!("killing the unassigned command also failed: {ke}");
+                    }
                     return Err(windows::core::Error::new(
                         windows::core::HRESULT::from_win32(ERROR_INVALID_HANDLE.0),
                         format!("assign the command to a job object: {e}"),
@@ -130,7 +134,9 @@ impl ExecChild {
             // Contained: safe to run.
             if ResumeThread(thread.0) == u32::MAX {
                 let err = windows::core::Error::from_thread();
-                let _ = job.kill_tree();
+                if let Err(ke) = job.kill_tree() {
+                    tracing::warn!("killing the unresumed command failed: {ke}");
+                }
                 return Err(err);
             }
 
@@ -154,11 +160,6 @@ impl ExecChild {
         self.stderr_read.raw()
     }
 
-    /// Raw child-process handle (`isize`) — for `TerminateProcess` from a relay thread.
-    pub fn process_raw(&self) -> isize {
-        self.process.raw()
-    }
-
     /// Take ownership of the stdin-write handle. The relay's stdin thread holds it and
     /// drops it (→ the child's stdin sees EOF) when the SSH side stops sending — so a
     /// reader like `sort`/`findstr` finishes instead of hanging.
@@ -166,25 +167,10 @@ impl ExecChild {
         self.stdin_write.take()
     }
 
-    /// Reap the command and everything it spawned — the peer is gone, so nothing it started
-    /// has anyone left to talk to.
     /// A share of the containment handle, for a relay thread that must tear the tree down
     /// without owning the session.
     pub fn job(&self) -> std::sync::Arc<cosca::Job> {
         std::sync::Arc::clone(&self.job)
-    }
-
-    pub fn kill_tree(&self) {
-        if let Err(e) = self.job.kill_tree() {
-            tracing::warn!("exec: killing the command's process tree failed: {e}");
-        }
-    }
-
-    /// Leave the tree running: the command exited on its own, so anything it launched in the
-    /// background outlives the session, exactly as it would under sshd. Clears
-    /// `KILL_ON_JOB_CLOSE`, so dropping this child no longer reaps them.
-    pub fn disarm(&self) {
-        self.job.disarm();
     }
 
     /// Block until the child exits and return its exit code (bit-preserving `u32`→`i32`).

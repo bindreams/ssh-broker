@@ -187,10 +187,10 @@ fn agent_exec_tears_down_when_ssh_disconnects_first() {
         let conn = afunix::connect(&client_path).unwrap();
         let (_crx, mut ctx) = afunix::split(conn).unwrap();
         // A sentinel the child holds until teardown kills it — not a wait for anything.
-        let never_exits = r#"pwsh.exe -NoLogo -NoProfile -Command "Start-Sleep -Seconds 99999""#; // sleep-ok: sentinel the test kills
+        let never_exits = format!("pwsh.exe -NoLogo -NoProfile -Command {SLEEP_FOREVER}");
         let hs = Handshake {
             mode: Mode::Exec,
-            command: Some(never_exits.into()),
+            command: Some(never_exits),
             ..Handshake::pty_default()
         };
         write_frame(&mut ctx, FrameKind::Handshake, &hs.encode().unwrap()).unwrap();
@@ -244,7 +244,64 @@ fn agent_rejects_non_handshake_first_frame() {
 // ── process-tree teardown ────────────────────────────────────────────────────────────────
 
 /// A command that never returns on its own, so teardown is what ends it.
-const SLEEP_FOREVER: &str = "Start-Sleep -Seconds 99999"; // sleep-ok: a sentinel the tests reap
+///
+/// Genuinely unbounded, not a large number: a bounded sleep would let a reap regression pass by
+/// simply outlasting it, turning the assertion below into a slow yes.
+const SLEEP_FOREVER: &str = "[System.Threading.Thread]::Sleep([System.Threading.Timeout]::Infinite)"; // sleep-ok: a sentinel that must never wake; teardown killing it IS the assertion
+
+/// How the session under test ends.
+#[derive(Clone, Copy, PartialEq)]
+enum Ending {
+    /// The client vanishes mid-session, leaving the command running.
+    Disconnect,
+    /// The command finishes on its own — but not before the client has pinned the grandchild.
+    NormalExit,
+}
+
+/// A named Win32 event that holds a relayed command at the starting line.
+///
+/// Without it the normal-exit cases are a race, not a test: the command exits the instant it
+/// prints its marker, so the server can reap the grandchild — and Windows can recycle its pid —
+/// before the client reaches `OpenProcess`. The client would then either fail to open a pid that
+/// just died or, worse, open an unrelated process that inherited the number and wait on it.
+/// Blocking the command on a kernel object until the pin is done removes the window entirely,
+/// without anyone guessing a duration.
+struct GoEvent {
+    raw: isize,
+    name: String,
+}
+
+impl GoEvent {
+    fn create(tag: &str) -> Self {
+        use windows::Win32::System::Threading::CreateEventW;
+        use windows::core::HSTRING;
+        let name = format!("ssh-broker-test-go-{tag}-{}", std::process::id());
+        // Manual-reset: the command may reach its wait either side of the signal, and a
+        // latching event makes both orders behave the same.
+        let h = unsafe { CreateEventW(None, true, false, &HSTRING::from(name.as_str())) }.expect("create the go event");
+        Self {
+            raw: h.0 as isize,
+            name,
+        }
+    }
+}
+
+impl Drop for GoEvent {
+    fn drop(&mut self) {
+        close_handle(self.raw);
+    }
+}
+
+fn set_event(raw: isize) {
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::System::Threading::SetEvent;
+    unsafe { SetEvent(HANDLE(raw as *mut core::ffi::c_void)) }.expect("signal the go event");
+}
+
+/// The tail that waits for the go event, then exits cleanly.
+fn wait_then_exit(event: &str) -> String {
+    format!("[System.Threading.EventWaitHandle]::OpenExisting('{event}').WaitOne() | Out-Null; exit 0")
+}
 
 /// A command that launches a background grandchild, records its pid, then announces itself.
 ///
@@ -305,17 +362,24 @@ fn close_handle(raw: isize) {
     }
 }
 
-/// Drive one relayed command to its marker, hand back the pinned grandchild handle, then run
-/// `finish` (disconnect, or wait for a normal exit).
-fn run_tree_session(tag: &str, mode: Mode, tail: &str, inherit_stdio: bool, disconnect: bool) -> isize {
+/// Drive one relayed command to its marker, pin the grandchild, then end the session the way
+/// `ending` says and hand back the pinned handle.
+fn run_tree_session(tag: &str, mode: Mode, inherit_stdio: bool, ending: Ending) -> isize {
     let dir = hardened_dir(tag);
     let sock = dir.join("s");
     let pidfile = dir.join("grandchild.pid");
     let listener = Listener::bind(&sock).unwrap();
-    let cmd = grandchild_cmd(&pidfile, tail, inherit_stdio);
+    // Created before the handshake, so the command can never reach its wait first.
+    let go = GoEvent::create(tag);
+    let tail = match ending {
+        Ending::Disconnect => SLEEP_FOREVER.to_string(),
+        Ending::NormalExit => wait_then_exit(&go.name),
+    };
+    let cmd = grandchild_cmd(&pidfile, &tail, inherit_stdio);
 
     let (tx_h, rx_h) = std::sync::mpsc::channel::<isize>();
     let client_path = sock.clone();
+    let go_raw = go.raw;
     let client = thread::spawn(move || {
         let conn = afunix::connect(&client_path).unwrap();
         let (mut crx, mut ctx) = afunix::split(conn).unwrap();
@@ -328,18 +392,29 @@ fn run_tree_session(tag: &str, mode: Mode, tail: &str, inherit_stdio: bool, disc
         let mut fr = FrameReader::new();
         read_until_marker(&mut crx, &mut fr);
         tx_h.send(open_grandchild(&pidfile)).unwrap();
-        if disconnect {
-            let _ = ctx.shutdown_both();
-        } else {
-            // Let the session end because the command finished, not because we left.
-            let mut sink = TestSink::default();
-            let _ = pump_decode(&mut crx, &mut fr, &mut sink);
+        match ending {
+            Ending::Disconnect => {
+                let _ = ctx.shutdown_both();
+            }
+            Ending::NormalExit => {
+                set_event(go_raw); // the pin above is now provably ahead of any teardown
+                let mut sink = TestSink::default();
+                let outcome = pump_decode(&mut crx, &mut fr, &mut sink);
+                // If the command failed to reach its wait at all (a mistyped event name would
+                // do it), it exits early and silently restores the race this is here to remove.
+                // Its exit code is what makes that loud instead.
+                assert_eq!(
+                    outcome.unwrap(),
+                    Outcome::Exited(0),
+                    "the relayed command should have blocked on the go event, then exited 0"
+                );
+            }
         }
     });
 
     let conn = listener.accept().unwrap();
     super::handle_connection(conn).unwrap();
-    let _ = client.join();
+    client.join().expect("client thread");
     let raw = rx_h.recv().expect("client reported the grandchild handle");
     std::fs::remove_dir_all(&dir).ok();
     raw
@@ -349,11 +424,17 @@ fn run_tree_session(tag: &str, mode: Mode, tail: &str, inherit_stdio: bool, disc
 /// deterministically rather than flaking, and a timeout would be a guess about how long a
 /// kill "should" take.
 fn assert_exits(raw: isize, who: &str) {
-    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
     use windows::Win32::System::Threading::{INFINITE, WaitForSingleObject};
-    let _ = who;
-    unsafe { WaitForSingleObject(HANDLE(raw as *mut core::ffi::c_void), INFINITE) };
-    close_handle(raw);
+    let rc = unsafe { WaitForSingleObject(HANDLE(raw as *mut core::ffi::c_void), INFINITE) };
+    close_handle(raw); // before the assert, so a failure does not also leak the handle
+    // Checking the result is the difference between a gate and a decoration: an unusable
+    // handle makes the wait return WAIT_FAILED *immediately*, which an ignored return value
+    // reports as a pass — every test here would go green while verifying nothing.
+    assert_eq!(
+        rc, WAIT_OBJECT_0,
+        "waiting on {who} failed instead of observing it exit"
+    );
 }
 
 /// Disconnect: the session is gone, so everything it spawned goes with it.
@@ -362,7 +443,7 @@ fn assert_exits(raw: isize, who: &str) {
 /// descendants running with no session left to reach them.
 #[test]
 fn exec_disconnect_kills_the_whole_process_tree() {
-    let raw = run_tree_session("tree-exec-disc", Mode::Exec, SLEEP_FOREVER, false, true);
+    let raw = run_tree_session("tree-exec-disc", Mode::Exec, false, Ending::Disconnect);
     assert_exits(raw, "the grandchild after an EXEC disconnect");
 }
 
@@ -374,37 +455,41 @@ fn exec_disconnect_kills_the_whole_process_tree() {
 /// and the one where getting teardown wrong hangs the session instead of merely leaking.
 #[test]
 fn exec_disconnect_reaps_a_descendant_holding_stdout() {
-    let raw = run_tree_session("tree-exec-inherit", Mode::Exec, SLEEP_FOREVER, true, true);
+    let raw = run_tree_session("tree-exec-inherit", Mode::Exec, true, Ending::Disconnect);
     assert_exits(raw, "the stdout-holding grandchild after an EXEC disconnect");
 }
 
-/// The PTY path has its own teardown and its own decision point.
+/// The same inherited-handle case on the PTY path, where the grandchild holds the
+/// pseudoconsole's pipe rather than a plain stdout pipe.
+#[test]
+fn pty_disconnect_reaps_a_descendant_holding_the_pseudoconsole() {
+    let raw = run_tree_session("tree-pty-inherit", Mode::Pty, true, Ending::Disconnect);
+    assert_exits(raw, "the pty-holding grandchild after a PTY disconnect");
+}
+
+/// The PTY path reaps at its own teardown site, separately from EXEC.
 #[test]
 fn pty_disconnect_kills_the_whole_process_tree() {
-    let raw = run_tree_session("tree-pty-disc", Mode::Pty, SLEEP_FOREVER, false, true);
+    let raw = run_tree_session("tree-pty-disc", Mode::Pty, false, Ending::Disconnect);
     assert_exits(raw, "the grandchild after a PTY disconnect");
 }
 
 /// Normal exit reaps descendants too — Windows OpenSSH does, so we do.
 ///
-/// This is measured behaviour of the shell being replaced, not a guess: stock Windows OpenSSH
-/// ends the session when the direct child exits and terminates the descendant tree, including a
-/// descendant whose stdout was redirected to a file and never touched the session's pipe. There
-/// is no `nohup` equivalent there, so leaving descendants running would be a divergence from the
-/// platform rather than parity with it. (Unix OpenSSH is the opposite — it waits for pipe EOF,
-/// which is why `nohup cmd >/dev/null 2>&1 &` exists.)
+/// Measured parity, not a guess — `agent::reap_tree` records what stock Windows OpenSSH does
+/// and how it was established. A normal exit is not a special case here.
 ///
 /// The grandchild here does NOT inherit stdout, so this is purely about the reap decision; the
 /// inherited-pipe case is covered by `exec_disconnect_reaps_a_descendant_holding_stdout`.
 #[test]
 fn exec_normal_exit_reaps_descendants_like_windows_sshd() {
-    let raw = run_tree_session("tree-exec-exit", Mode::Exec, "exit 0", false, false);
+    let raw = run_tree_session("tree-exec-exit", Mode::Exec, false, Ending::NormalExit);
     assert_exits(raw, "the grandchild after a normal EXEC exit");
 }
 
-/// The PTY path makes the same decision at its own teardown site.
+/// Same, at the PTY teardown site.
 #[test]
 fn pty_normal_exit_reaps_descendants_like_windows_sshd() {
-    let raw = run_tree_session("tree-pty-exit", Mode::Pty, "exit 0", false, false);
+    let raw = run_tree_session("tree-pty-exit", Mode::Pty, false, Ending::NormalExit);
     assert_exits(raw, "the grandchild after a normal PTY exit");
 }

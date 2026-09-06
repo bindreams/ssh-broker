@@ -149,9 +149,9 @@ pub fn close_pty_raw(hpc_raw: isize) {
 pub struct PtySession {
     hpc: Option<OwnedHpcon>,
     process: OwnedHandle,
-    /// Kernel-enforced containment for the shell and everything it spawns. Teardown is
-    /// `kill_tree` (the session is gone, reap it all) or `disarm` (the shell exited on its
-    /// own, so leave whatever it launched running, as sshd does).
+    /// Kernel-enforced containment for the shell and everything it spawns. Teardown always
+    /// reaps the whole tree; a normal exit is no different from a disconnect here, for the
+    /// measured reason in `agent::reap_tree`.
     job: std::sync::Arc<cosca::Job>,
     _thread: OwnedHandle,
     in_write: OwnedHandle,
@@ -230,7 +230,11 @@ impl PtySession {
                     // Assignment failed, so the child is uncontained AND still suspended.
                     // Resuming it now would let it fork descendants nothing can reach, so it
                     // is killed instead and the error propagates.
-                    let _ = TerminateProcess(process.0, 1);
+                    if let Err(ke) = TerminateProcess(process.0, 1) {
+                        // Uncontained, still suspended, and now unkillable: say so, or it is
+                        // a leaked process with no trace but an unrelated error message.
+                        tracing::warn!("killing the unassigned shell also failed: {ke}");
+                    }
                     return Err(windows::core::Error::new(
                         windows::core::HRESULT::from_win32(ERROR_INVALID_HANDLE.0),
                         format!("assign the shell to a job object: {e}"),
@@ -241,7 +245,9 @@ impl PtySession {
             // Contained: safe to run.
             if ResumeThread(thread.0) == u32::MAX {
                 let err = windows::core::Error::from_thread();
-                let _ = job.kill_tree();
+                if let Err(ke) = job.kill_tree() {
+                    tracing::warn!("killing the unresumed shell failed: {ke}");
+                }
                 return Err(err);
             }
 
@@ -264,12 +270,6 @@ impl PtySession {
     /// Raw input-write handle (as `isize`) for forwarding decoded input.
     pub fn in_write_raw(&self) -> isize {
         self.in_write.0.0 as isize
-    }
-
-    /// Raw child-process handle (as `isize`) — e.g. for `TerminateProcess` from a relay
-    /// thread on mid-session teardown.
-    pub fn process_raw(&self) -> isize {
-        self.process.0.0 as isize
     }
 
     /// Hand the pseudoconsole's raw handle to the caller, who then owns closing it (via
@@ -305,30 +305,10 @@ impl PtySession {
         }
     }
 
-    /// Reap the shell and everything it spawned — the peer is gone, so nothing it started
-    /// has anyone left to talk to.
     /// A share of the containment handle, for a relay thread that must tear the tree down
     /// without owning the session.
     pub fn job(&self) -> std::sync::Arc<cosca::Job> {
         std::sync::Arc::clone(&self.job)
-    }
-
-    pub fn kill_tree(&self) {
-        if let Err(e) = self.job.kill_tree() {
-            tracing::warn!("pty: killing the shell's process tree failed: {e}");
-        }
-    }
-
-    /// Leave the tree running: the shell exited on its own, so anything it launched in the
-    /// background outlives the session, exactly as it would under sshd. Clears
-    /// `KILL_ON_JOB_CLOSE`, so dropping this session no longer reaps them.
-    pub fn disarm(&self) {
-        self.job.disarm();
-    }
-
-    /// Force-terminate the child (mid-session teardown when the SSH side drops).
-    pub fn kill(&self) -> windows::core::Result<()> {
-        unsafe { TerminateProcess(self.process.0, 1) }
     }
 
     /// Close the pseudoconsole. This makes the output pipe deliver its buffered tail and

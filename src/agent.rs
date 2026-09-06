@@ -24,7 +24,7 @@ use crate::pipes::ExecChild;
 #[cfg(windows)]
 use crate::protocol::{ExitCode, FrameKind, FrameReader, Handshake, Mode, Resize, Stream, read_one_frame, write_frame};
 #[cfg(windows)]
-use crate::relay::{FrameSink, pump_decode, write_data};
+use crate::relay::{FrameSink, Outcome, PumpError, pump_decode, write_data};
 #[cfg(windows)]
 use crate::winutil::OwnedHandle;
 #[cfg(windows)]
@@ -147,13 +147,13 @@ fn handle_pty(
         let job = Arc::clone(&job);
         std::thread::spawn(move || {
             let mut sink = PtyInputSink { in_raw, hpc_cell };
-            // Any reason the pump stops ends the session: a closed socket, a broken transport,
-            // or a sink failure all leave nobody reading the peer. Reaping unconditionally is
-            // also what guarantees the waiter unblocks.
-            if let Err(e) = pump_decode(&mut rx, &mut fr, &mut sink) {
+            let result = pump_decode(&mut rx, &mut fr, &mut sink);
+            if let Err(e) = &result {
                 tracing::debug!("pty input pump stopped: {e}");
             }
-            reap_tree(&job);
+            if session_is_over(&result) {
+                reap_tree(&job);
+            }
         })
     };
 
@@ -242,14 +242,14 @@ fn handle_exec(
         let job = Arc::clone(&job);
         std::thread::spawn(move || {
             let mut sink = ExecInputSink { stdin: stdin_owned };
-            // Any reason the pump stops ends the session: a closed socket, a broken transport,
-            // or a sink failure all leave nobody reading the peer. Reaping unconditionally is
-            // also what guarantees the waiter unblocks.
-            if let Err(e) = pump_decode(&mut rx, &mut fr, &mut sink) {
+            let result = pump_decode(&mut rx, &mut fr, &mut sink);
+            if let Err(e) = &result {
                 tracing::debug!("exec input pump stopped: {e}");
             }
             drop(sink); // close the child's stdin if the EOF marker never arrived
-            reap_tree(&job);
+            if session_is_over(&result) {
+                reap_tree(&job);
+            }
         })
     };
 
@@ -324,6 +324,24 @@ impl FrameSink for ExecInputSink {
         Ok(())
     }
     // on_resize: default no-op (EXEC has no pseudoconsole).
+}
+
+/// Whether a pump's ending means nobody is left driving the session.
+///
+/// A [`PumpError::Sink`] is the one ending that does not. It is local and says nothing about
+/// the peer: a relayed command closing its own stdin makes the next write fail while the
+/// session continues normally, and reaping there would kill a live session over a routine
+/// stdin write. The child's stdin handle is dropped either way, so a reader still sees EOF,
+/// and `wait` still ends the session when the command finishes.
+///
+/// Every other ending means the far end is finished with this session — including a peer that
+/// sent `EXIT` and then went silent. Our own shim never does that, but the agent is reachable
+/// by anything the socket ACL admits and must not depend on the peer behaving: without reaping
+/// there, a command that never exits on its own parks this handler thread for the lifetime of
+/// a resident agent.
+#[cfg(windows)]
+fn session_is_over(result: &Result<Outcome, PumpError>) -> bool {
+    !matches!(result, Err(PumpError::Sink(_)))
 }
 
 /// Reap the child and everything it spawned. Idempotent.
