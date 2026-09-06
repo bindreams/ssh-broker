@@ -139,17 +139,27 @@ pub fn is_transfer_command(cmd: &str) -> bool {
 /// splitter — including the mod-3 rule shell32 applies to runs of consecutive bare quotes,
 /// which the simpler MSVCRT `main()` parser (and this module's previous hand-rolled scan) get
 /// wrong. That scan documented itself as "not a full `CommandLineToArgvW` (no backslash-escaping
-/// of quotes)"; a path like `"C:\\dir\\" scp -t x` tokenized differently there than the OS
-/// would, which is the kind of divergence a transfer-detection heuristic must not have.
+/// of quotes)", and the divergence is real: for `scp -t "C:\dir\""` the old scan yielded a final
+/// token of `C:\dir\`, where Windows reads the `\"` as an escaped quote and yields `C:\dir"`.
+///
+/// Note the divergence is in argv[1..], not argv[0]: `CommandLineToArgvW` parses the program
+/// name by a different rule that does no backslash-escaping, so a quoted leading path happens
+/// to tokenize the same either way. A transfer-detection heuristic that disagrees with the OS
+/// about argument boundaries can misroute, so it should not be guessing at either rule.
 ///
 /// Pure UTF-16 logic, so it runs and is tested on any host, not just Windows.
 pub(crate) fn split_command(cmd: &str) -> Vec<String> {
     let wide: Vec<u16> = cmd.encode_utf16().collect();
-    cosca::quote::windows::split_wide(&wide)
-        .unwrap_or_default()
-        .iter()
-        .map(|t| String::from_utf16_lossy(t))
-        .collect()
+    // A split failure must not read as "no tokens": that would make `is_transfer_command`
+    // answer false and relay an sftp transfer through the agent, which is the hang this
+    // detection exists to avoid. Report it and let the caller decide.
+    match cosca::quote::windows::split_wide(&wide) {
+        Ok(tokens) => tokens.iter().map(|t| String::from_utf16_lossy(t)).collect(),
+        Err(e) => {
+            tracing::warn!("could not tokenize the exec command ({e}); treating it as unsplittable");
+            vec![cmd.to_string()]
+        }
+    }
 }
 
 /// The program's lowercase basename without a `.exe` suffix (path separators stripped).
