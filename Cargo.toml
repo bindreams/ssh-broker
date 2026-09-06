@@ -16,6 +16,10 @@ tracing = "0.1"              # structured logging
 tracing-subscriber = "0.3"  # file/stderr log sink (Phase 6 routes off the PTY)
 toml = "0.8"                 # provision config.toml (de)serialize — pure, host-buildable (0.8.x)
 
+# cosca: `CommandLineToArgvW`-compatible argv splitting for the shim's transfer detection.
+# Pure UTF-16 logic, so it is not Windows-gated and the host tests exercise it.
+cosca = "0.4"
+
 [dev-dependencies]
 pipe = "0.4"                 # two unidirectional pipes compose the splittable relay test transport, EOF-on-writer-drop (Phase 2; 0.4.0)
 

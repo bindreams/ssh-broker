@@ -3,7 +3,7 @@
 //! PTY path (raw mode, `ReadConsoleInputW`) is exercised on a real Windows host end-to-end.
 use super::{
     ExecOutSink, Fallback, MouseModeSniffer, XtwinopsFilter, decide_fallback, is_transfer_command, make_handshake,
-    map_outcome, size_to_resize,
+    map_outcome, size_to_resize, split_command,
 };
 use crate::protocol::{ExitCode, FrameKind, FrameReader, Handshake, Mode, Resize, Stream, read_one_frame, write_frame};
 use crate::relay::{FrameSink, Outcome, duplex, write_data};
@@ -352,4 +352,21 @@ fn sniffer_focus_independent_of_mouse_flags() {
     t.observe(b"\x1b[?1000h\x1b[?1006h"); // mouse tracking + SGR
     assert!(t.forward_mouse());
     assert!(!t.focus_on());
+}
+
+/// The UTF-16 round trip around `cosca::quote::windows::split_wide` is this module's own code,
+/// so it gets its own test; the splitter's fidelity to `CommandLineToArgvW` is verified by
+/// cosca's differential suite against the real OS parser and is not re-tested here.
+#[test]
+fn split_command_round_trips_utf16_through_the_splitter() {
+    assert_eq!(split_command(r#"prog "a b" c"#), vec!["prog", "a b", "c"]);
+    // Non-ASCII survives the &str -> UTF-16 -> String round trip intact.
+    assert_eq!(
+        split_command("prog \u{e9}t\u{e9} \u{1f600}"),
+        vec!["prog", "\u{e9}t\u{e9}", "\u{1f600}"]
+    );
+    assert!(
+        split_command("   ").is_empty(),
+        "whitespace-only input yields no tokens"
+    );
 }

@@ -133,38 +133,23 @@ pub fn is_transfer_command(cmd: &str) -> bool {
     }
 }
 
-/// Split a command line into tokens, respecting double quotes (so a program path containing
-/// spaces stays one token). Quote characters are stripped. Good enough for the transfer-detection
-/// heuristic; not a full Win32 `CommandLineToArgvW` (no backslash-escaping of quotes).
-fn split_command(cmd: &str) -> Vec<String> {
-    let mut tokens = Vec::new();
-    let mut cur = String::new();
-    let mut in_quotes = false;
-    let mut has_token = false;
-    for ch in cmd.chars() {
-        match ch {
-            '"' => {
-                has_token = {
-                    in_quotes = !in_quotes;
-                    true
-                }
-            }
-            c if c.is_whitespace() && !in_quotes => {
-                if has_token {
-                    tokens.push(std::mem::take(&mut cur));
-                    has_token = false;
-                }
-            }
-            c => {
-                cur.push(c);
-                has_token = true;
-            }
-        }
-    }
-    if has_token {
-        tokens.push(cur);
-    }
-    tokens
+/// Split a command line into argv the way Windows itself would.
+///
+/// Delegates to `cosca::quote::windows::split_wide`, the `CommandLineToArgvW`-compatible
+/// splitter — including the mod-3 rule shell32 applies to runs of consecutive bare quotes,
+/// which the simpler MSVCRT `main()` parser (and this module's previous hand-rolled scan) get
+/// wrong. That scan documented itself as "not a full `CommandLineToArgvW` (no backslash-escaping
+/// of quotes)"; a path like `"C:\\dir\\" scp -t x` tokenized differently there than the OS
+/// would, which is the kind of divergence a transfer-detection heuristic must not have.
+///
+/// Pure UTF-16 logic, so it runs and is tested on any host, not just Windows.
+pub(crate) fn split_command(cmd: &str) -> Vec<String> {
+    let wide: Vec<u16> = cmd.encode_utf16().collect();
+    cosca::quote::windows::split_wide(&wide)
+        .unwrap_or_default()
+        .iter()
+        .map(|t| String::from_utf16_lossy(t))
+        .collect()
 }
 
 /// The program's lowercase basename without a `.exe` suffix (path separators stripped).
