@@ -87,3 +87,16 @@ impl Drop for AttrList {
         }
     }
 }
+
+/// Whether the process behind `handle_raw` has already exited.
+///
+/// The single place this query lives, so its one justified `sleep-ok:` opt-out does not have
+/// to be repeated (and kept correct through reformatting) at every call site. A zero timeout
+/// is an instantaneous state query: it never blocks and never bets on how long anything takes,
+/// which is the thing the hook exists to forbid.
+pub fn has_exited(handle_raw: isize) -> bool {
+    use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
+    use windows::Win32::System::Threading::WaitForSingleObject;
+    let h = HANDLE(handle_raw as *mut core::ffi::c_void);
+    unsafe { WaitForSingleObject(h, 0) == WAIT_OBJECT_0 } // sleep-ok: zero timeout is a state query
+}

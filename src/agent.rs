@@ -140,14 +140,17 @@ fn handle_pty(
         })
     };
 
-    // Input pump: socket → ConPTY input + resize; on return, kill the child so the waiter
-    // unblocks even if the SSH side dropped first.
+    // Input pump: socket → ConPTY input + resize. On return the socket is gone; if the shell
+    // is still running that means the SSH side dropped, so its tree is reaped to unblock the
+    // waiter. If the shell already exited, this return is just the normal-exit teardown
+    // reaching us, and its descendants are left alone.
     let in_thread = {
         let hpc_cell = Arc::clone(&hpc_cell);
+        let job = session.job();
         std::thread::spawn(move || {
             let mut sink = PtyInputSink { in_raw, hpc_cell };
             let _ = pump_decode(&mut rx, &mut fr, &mut sink);
-            kill_process(proc_raw);
+            reap_if_peer_vanished(&job, crate::winutil::has_exited(proc_raw));
         })
     };
 
@@ -155,6 +158,10 @@ fn handle_pty(
     // down (close the HPCON, join the threads) before returning, or the threads would
     // outlive `session` and touch closed handles, and the (forgotten) HPCON would leak.
     let wait_result = session.wait();
+    // The shell finished on its own, so whatever it launched is not ours to reap. Disarming
+    // before teardown is what makes that true by construction: without it, dropping the
+    // session closes the job handle and KILL_ON_JOB_CLOSE takes the tree with it.
+    session.disarm();
     let code = *wait_result.as_ref().unwrap_or(&1);
     *code_cell.lock().unwrap() = code;
     {
@@ -220,8 +227,8 @@ fn handle_exec(
     // stdout, stderr, and the EXIT frame all share tx → serialize with a mutex.
     let tx_arc = Arc::new(Mutex::new(tx));
 
-    let t_out = spawn_stream_pump(out_raw, Stream::Stdout, Arc::clone(&tx_arc), proc_raw);
-    let t_err = spawn_stream_pump(err_raw, Stream::Stderr, Arc::clone(&tx_arc), proc_raw);
+    let t_out = spawn_stream_pump(out_raw, Stream::Stdout, Arc::clone(&tx_arc), proc_raw, child.job());
+    let t_err = spawn_stream_pump(err_raw, Stream::Stderr, Arc::clone(&tx_arc), proc_raw, child.job());
 
     // stdin pump owns the child's stdin-write handle. A half-close mid-session (empty
     // DATA(Stdin) marker) closes only the child's stdin so a reader like sort/findstr
@@ -229,14 +236,21 @@ fn handle_exec(
     // kill the child unconditionally. Without this, a silent, stdin-ignoring command that
     // sleeps indefinitely would never exit, and the output pumps — blocked in read with
     // nothing to write — would never detect the dead socket, hanging the waiter.
-    let t_in = std::thread::spawn(move || {
-        let mut sink = ExecInputSink { stdin: stdin_owned };
-        let _ = pump_decode(&mut rx, &mut fr, &mut sink);
-        drop(sink); // close the child's stdin if the EOF marker never arrived
-        kill_process(proc_raw);
-    });
+    let t_in = {
+        let job = child.job();
+        std::thread::spawn(move || {
+            let mut sink = ExecInputSink { stdin: stdin_owned };
+            let _ = pump_decode(&mut rx, &mut fr, &mut sink);
+            drop(sink); // close the child's stdin if the EOF marker never arrived
+            reap_if_peer_vanished(&job, crate::winutil::has_exited(proc_raw));
+        })
+    };
 
     let wait_result = child.wait();
+    // The command finished on its own, so whatever it launched is not ours to reap. Disarming
+    // before teardown is what makes that true by construction: without it, dropping the child
+    // closes the job handle and KILL_ON_JOB_CLOSE takes the tree with it.
+    child.disarm();
     let code = *wait_result.as_ref().unwrap_or(&1);
     let _ = t_out.join();
     let _ = t_err.join();
@@ -259,6 +273,7 @@ fn spawn_stream_pump(
     stream: Stream,
     tx: Arc<Mutex<ConnTx>>,
     proc_raw: isize,
+    job: std::sync::Arc<cosca::Job>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let mut buf = [0u8; 32 * 1024];
@@ -272,7 +287,8 @@ fn spawn_stream_pump(
                 write_data(&mut *g, stream, &buf[..n]).is_ok()
             };
             if !ok {
-                kill_process(proc_raw); // SSH side gone → unblock the waiter
+                // A failed write is unambiguous: the socket is gone while the child runs.
+                reap_if_peer_vanished(&job, crate::winutil::has_exited(proc_raw));
                 break;
             }
         }
@@ -306,14 +322,29 @@ impl FrameSink for ExecInputSink {
     // on_resize: default no-op (EXEC has no pseudoconsole).
 }
 
-/// `TerminateProcess` by raw handle (no-op-safe to call on an already-exited child).
+/// Tear down the child's whole process tree, but only if the peer is what went away.
+///
+/// Terminating the child alone used to leave its descendants running, so a relayed shell that
+/// launched anything in the background outlived the SSH session. The job object fixes that —
+/// but it makes the *decision* matter, because reaping on a normal exit would break
+/// `ssh host "start-a-daemon"`, which sshd supports.
+///
+/// Both teardown paths end with the socket being shut down, and because `split` hands out
+/// duplicates of ONE socket that EOF reaches the input pump identically whether the peer
+/// disconnected or the agent closed up after a normal exit. Neither the pump's `Outcome` nor
+/// a flag set beforehand can separate them without racing.
+///
+/// The child can. On a normal exit it is already dead by the time the socket closes; on a
+/// disconnect it is still running. So the pump asks rather than being told. A child that
+/// exits at the very moment the peer drops reads as a normal exit — the safe direction, since
+/// it leaves descendants alive rather than reaping a tree someone meant to keep.
 #[cfg(windows)]
-fn kill_process(proc_raw: isize) {
-    unsafe {
-        let _ = windows::Win32::System::Threading::TerminateProcess(
-            windows::Win32::Foundation::HANDLE(proc_raw as *mut core::ffi::c_void),
-            1,
-        );
+fn reap_if_peer_vanished(job: &cosca::Job, child_already_exited: bool) {
+    if child_already_exited {
+        return; // finished on its own — sshd leaves what it spawned running, so do we
+    }
+    if let Err(e) = job.kill_tree() {
+        tracing::warn!("tearing down the process tree after a disconnect failed: {e}");
     }
 }
 

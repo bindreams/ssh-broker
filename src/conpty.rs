@@ -28,16 +28,17 @@
 //! profile/environment for free (`CreateProcessAsUserW` with a null environment block
 //! hands the child SYSTEM's environment, not the user's).
 
+use std::os::windows::io::BorrowedHandle;
 use std::path::Path;
 
 use crate::winutil::{AttrList, OwnedHandle};
-use windows::Win32::Foundation::HANDLE;
+use windows::Win32::Foundation::{ERROR_INVALID_HANDLE, HANDLE};
 use windows::Win32::Storage::FileSystem::{ReadFile, WriteFile};
 use windows::Win32::System::Console::{COORD, ClosePseudoConsole, CreatePseudoConsole, HPCON, ResizePseudoConsole};
 use windows::Win32::System::Pipes::CreatePipe;
 use windows::Win32::System::Threading::{
-    CreateProcessW, EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess, INFINITE, PROCESS_INFORMATION,
-    STARTF_USESTDHANDLES, STARTUPINFOEXW, TerminateProcess, WaitForSingleObject,
+    CREATE_SUSPENDED, CreateProcessW, EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess, INFINITE, PROCESS_INFORMATION,
+    ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOEXW, TerminateProcess, WaitForSingleObject,
 };
 use windows::core::{PCWSTR, PWSTR};
 
@@ -148,6 +149,10 @@ pub fn close_pty_raw(hpc_raw: isize) {
 pub struct PtySession {
     hpc: Option<OwnedHpcon>,
     process: OwnedHandle,
+    /// Kernel-enforced containment for the shell and everything it spawns. Teardown is
+    /// `kill_tree` (the session is gone, reap it all) or `disarm` (the shell exited on its
+    /// own, so leave whatever it launched running, as sshd does).
+    job: std::sync::Arc<cosca::Job>,
     _thread: OwnedHandle,
     in_write: OwnedHandle,
     out_read: OwnedHandle,
@@ -193,6 +198,10 @@ impl PtySession {
             });
             let cwd_ptr = cwd_wide.as_ref().map(|w| PCWSTR(w.as_ptr())).unwrap_or(PCWSTR::null());
 
+            // CREATE_SUSPENDED is required, not an optimisation: the shell must be inside the
+            // job before it runs a single instruction, or anything it forks first escapes
+            // containment permanently. Sequence fixed by `cosca::Job`: create suspended,
+            // assign, and only then resume.
             let mut pi = PROCESS_INFORMATION::default();
             CreateProcessW(
                 PCWSTR::null(),
@@ -200,7 +209,7 @@ impl PtySession {
                 None,
                 None,
                 false,
-                EXTENDED_STARTUPINFO_PRESENT,
+                EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED,
                 None,
                 cwd_ptr,
                 &si.StartupInfo,
@@ -209,10 +218,38 @@ impl PtySession {
             // `attr` drops here (DeleteProcThreadAttributeList) — the child is created.
             drop(attr);
 
+            let process = OwnedHandle(pi.hProcess);
+            let thread = OwnedHandle(pi.hThread);
+
+            // Borrowed for the call only; `process` owns the handle and outlives it.
+            let job = match cosca::Job::assign(BorrowedHandle::borrow_raw(
+                process.0.0 as std::os::windows::io::RawHandle,
+            )) {
+                Ok(job) => job,
+                Err(e) => {
+                    // Assignment failed, so the child is uncontained AND still suspended.
+                    // Resuming it now would let it fork descendants nothing can reach, so it
+                    // is killed instead and the error propagates.
+                    let _ = TerminateProcess(process.0, 1);
+                    return Err(windows::core::Error::new(
+                        windows::core::HRESULT::from_win32(ERROR_INVALID_HANDLE.0),
+                        format!("assign the shell to a job object: {e}"),
+                    ));
+                }
+            };
+
+            // Contained: safe to run.
+            if ResumeThread(thread.0) == u32::MAX {
+                let err = windows::core::Error::from_thread();
+                let _ = job.kill_tree();
+                return Err(err);
+            }
+
             Ok(PtySession {
                 hpc: Some(hpc),
-                process: OwnedHandle(pi.hProcess),
-                _thread: OwnedHandle(pi.hThread),
+                process,
+                _thread: thread,
+                job: std::sync::Arc::new(job),
                 in_write,
                 out_read,
             })
@@ -266,6 +303,33 @@ impl PtySession {
             GetExitCodeProcess(self.process.0, &mut code)?;
             Ok(code as i32)
         }
+    }
+
+    /// Reap the shell and everything it spawned — the peer is gone, so nothing it started
+    /// has anyone left to talk to.
+    /// A share of the containment handle, for a relay thread that must tear the tree down
+    /// without owning the session.
+    pub fn job(&self) -> std::sync::Arc<cosca::Job> {
+        std::sync::Arc::clone(&self.job)
+    }
+
+    /// Whether the shell has already exited. A zero timeout is an instantaneous state query,
+    /// not a wait for anything.
+    pub fn has_exited(&self) -> bool {
+        crate::winutil::has_exited(self.process.0.0 as isize)
+    }
+
+    pub fn kill_tree(&self) {
+        if let Err(e) = self.job.kill_tree() {
+            tracing::warn!("pty: killing the shell's process tree failed: {e}");
+        }
+    }
+
+    /// Leave the tree running: the shell exited on its own, so anything it launched in the
+    /// background outlives the session, exactly as it would under sshd. Clears
+    /// `KILL_ON_JOB_CLOSE`, so dropping this session no longer reaps them.
+    pub fn disarm(&self) {
+        self.job.disarm();
     }
 
     /// Force-terminate the child (mid-session teardown when the SSH side drops).
