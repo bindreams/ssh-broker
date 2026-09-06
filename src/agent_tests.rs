@@ -398,13 +398,13 @@ fn pty_disconnect_kills_the_whole_process_tree() {
 /// bug this test should assert around. Covering it here would hang, not fail.
 #[test]
 fn exec_normal_exit_leaves_descendants_running() {
-    use windows::Win32::Foundation::HANDLE;
-    use windows::Win32::System::Threading::TerminateProcess;
+    use windows::Win32::Foundation::{HANDLE, WAIT_TIMEOUT};
+    use windows::Win32::System::Threading::{TerminateProcess, WaitForSingleObject};
 
     let raw = run_tree_session("tree-exec-exit", Mode::Exec, "exit 0", false, false);
     let h = HANDLE(raw as *mut core::ffi::c_void);
     // sleep-ok: zero timeout is a state query — WAIT_TIMEOUT means "still running"
-    let alive = !crate::winutil::has_exited(raw);
+    let alive = unsafe { WaitForSingleObject(h, 0) } == WAIT_TIMEOUT; // sleep-ok: state query, not a wait
     unsafe {
         let _ = TerminateProcess(h, 1); // do not leak it into the rest of the run
     }

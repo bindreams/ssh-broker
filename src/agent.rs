@@ -24,7 +24,7 @@ use crate::pipes::ExecChild;
 #[cfg(windows)]
 use crate::protocol::{ExitCode, FrameKind, FrameReader, Handshake, Mode, Resize, Stream, read_one_frame, write_frame};
 #[cfg(windows)]
-use crate::relay::{FrameSink, pump_decode, write_data};
+use crate::relay::{FrameSink, Outcome, pump_decode, write_data};
 #[cfg(windows)]
 use crate::winutil::OwnedHandle;
 #[cfg(windows)]
@@ -113,7 +113,6 @@ fn handle_pty(
 
     let out_raw = session.out_read_raw();
     let in_raw = session.in_write_raw();
-    let proc_raw = session.process_raw();
     // HPCON shared behind a mutex: the input thread resizes under the lock; teardown takes
     // it (→ None) and closes it under the lock, so resize can never touch a closed HPCON.
     let hpc_cell = Arc::new(Mutex::new(Some(session.take_hpc_raw())));
@@ -144,13 +143,18 @@ fn handle_pty(
     // is still running that means the SSH side dropped, so its tree is reaped to unblock the
     // waiter. If the shell already exited, this return is just the normal-exit teardown
     // reaching us, and its descendants are left alone.
+    let job_claim: JobClaim = Arc::new(Mutex::new(Some(session.job())));
     let in_thread = {
         let hpc_cell = Arc::clone(&hpc_cell);
-        let job = session.job();
+        let job = Arc::clone(&job_claim);
         std::thread::spawn(move || {
             let mut sink = PtyInputSink { in_raw, hpc_cell };
-            let _ = pump_decode(&mut rx, &mut fr, &mut sink);
-            reap_if_peer_vanished(&job, crate::winutil::has_exited(proc_raw));
+            // Only a closed socket means the peer is gone. A sink error is a local failure
+            // (a broken pseudoconsole write), not a disconnect, and must not reap a session
+            // whose peer is still there.
+            if matches!(pump_decode(&mut rx, &mut fr, &mut sink), Ok(Outcome::PeerClosed)) {
+                reap_if_peer_vanished(&job);
+            }
         })
     };
 
@@ -158,10 +162,14 @@ fn handle_pty(
     // down (close the HPCON, join the threads) before returning, or the threads would
     // outlive `session` and touch closed handles, and the (forgotten) HPCON would leak.
     let wait_result = session.wait();
-    // The shell finished on its own, so whatever it launched is not ours to reap. Disarming
-    // before teardown is what makes that true by construction: without it, dropping the
-    // session closes the job handle and KILL_ON_JOB_CLOSE takes the tree with it.
-    session.disarm();
+    // Only a clean exit means the shell finished on its own. If `wait` failed the state is
+    // unknown, so the claim is left alone and the `Job`'s drop reaps the tree — the safe
+    // default. Winning the claim is also what proves no pump has already reaped.
+    if wait_result.is_ok()
+        && let Some(job) = claim_job(&job_claim)
+    {
+        job.disarm();
+    }
     let code = *wait_result.as_ref().unwrap_or(&1);
     *code_cell.lock().unwrap() = code;
     {
@@ -222,13 +230,13 @@ fn handle_exec(
     let mut child = ExecChild::spawn(command, cwd)?;
     let out_raw = child.stdout_read_raw();
     let err_raw = child.stderr_read_raw();
-    let proc_raw = child.process_raw();
     let stdin_owned = child.take_stdin_write();
     // stdout, stderr, and the EXIT frame all share tx → serialize with a mutex.
     let tx_arc = Arc::new(Mutex::new(tx));
+    let job_claim: JobClaim = Arc::new(Mutex::new(Some(child.job())));
 
-    let t_out = spawn_stream_pump(out_raw, Stream::Stdout, Arc::clone(&tx_arc), proc_raw, child.job());
-    let t_err = spawn_stream_pump(err_raw, Stream::Stderr, Arc::clone(&tx_arc), proc_raw, child.job());
+    let t_out = spawn_stream_pump(out_raw, Stream::Stdout, Arc::clone(&tx_arc), Arc::clone(&job_claim));
+    let t_err = spawn_stream_pump(err_raw, Stream::Stderr, Arc::clone(&tx_arc), Arc::clone(&job_claim));
 
     // stdin pump owns the child's stdin-write handle. A half-close mid-session (empty
     // DATA(Stdin) marker) closes only the child's stdin so a reader like sort/findstr
@@ -237,20 +245,29 @@ fn handle_exec(
     // sleeps indefinitely would never exit, and the output pumps — blocked in read with
     // nothing to write — would never detect the dead socket, hanging the waiter.
     let t_in = {
-        let job = child.job();
+        let job = Arc::clone(&job_claim);
         std::thread::spawn(move || {
             let mut sink = ExecInputSink { stdin: stdin_owned };
-            let _ = pump_decode(&mut rx, &mut fr, &mut sink);
+            // Only a closed socket means the peer is gone. A sink error is a local failure —
+            // notably a broken stdin pipe when the command closed its own stdin, which
+            // `ssh host "prog" < file` produces routinely — and must not reap a live session.
+            let peer_closed = matches!(pump_decode(&mut rx, &mut fr, &mut sink), Ok(Outcome::PeerClosed));
             drop(sink); // close the child's stdin if the EOF marker never arrived
-            reap_if_peer_vanished(&job, crate::winutil::has_exited(proc_raw));
+            if peer_closed {
+                reap_if_peer_vanished(&job);
+            }
         })
     };
 
     let wait_result = child.wait();
-    // The command finished on its own, so whatever it launched is not ours to reap. Disarming
-    // before teardown is what makes that true by construction: without it, dropping the child
-    // closes the job handle and KILL_ON_JOB_CLOSE takes the tree with it.
-    child.disarm();
+    // Only a clean exit means the command finished on its own. If `wait` failed the state is
+    // unknown, so the claim is left alone and the `Job`'s drop reaps the tree — the safe
+    // default. Winning the claim is also what proves no pump has already reaped.
+    if wait_result.is_ok()
+        && let Some(job) = claim_job(&job_claim)
+    {
+        job.disarm();
+    }
     let code = *wait_result.as_ref().unwrap_or(&1);
     let _ = t_out.join();
     let _ = t_err.join();
@@ -268,13 +285,7 @@ fn handle_exec(
 /// connection. On EOF the child is exiting; on a write failure the SSH side is gone, so
 /// kill the child to unblock the waiter.
 #[cfg(windows)]
-fn spawn_stream_pump(
-    raw: isize,
-    stream: Stream,
-    tx: Arc<Mutex<ConnTx>>,
-    proc_raw: isize,
-    job: std::sync::Arc<cosca::Job>,
-) -> std::thread::JoinHandle<()> {
+fn spawn_stream_pump(raw: isize, stream: Stream, tx: Arc<Mutex<ConnTx>>, job: JobClaim) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let mut buf = [0u8; 32 * 1024];
         loop {
@@ -287,8 +298,8 @@ fn spawn_stream_pump(
                 write_data(&mut *g, stream, &buf[..n]).is_ok()
             };
             if !ok {
-                // A failed write is unambiguous: the socket is gone while the child runs.
-                reap_if_peer_vanished(&job, crate::winutil::has_exited(proc_raw));
+                // A failed write is unambiguous: the socket is gone.
+                reap_if_peer_vanished(&job);
                 break;
             }
         }
@@ -322,27 +333,42 @@ impl FrameSink for ExecInputSink {
     // on_resize: default no-op (EXEC has no pseudoconsole).
 }
 
-/// Tear down the child's whole process tree, but only if the peer is what went away.
+/// The containment handle, claimable exactly once.
 ///
-/// Terminating the child alone used to leave its descendants running, so a relayed shell that
-/// launched anything in the background outlived the SSH session. The job object fixes that —
-/// but it makes the *decision* matter, because reaping on a normal exit would break
-/// `ssh host "start-a-daemon"`, which sshd supports.
+/// Teardown and the relay pumps race to decide the tree's fate, and the decision cannot be
+/// made by *observing* anything: both paths end with the socket shut down, and because
+/// `split` hands out duplicates of one socket that EOF is identical whether the peer vanished
+/// or the agent closed up after a normal exit. Asking whether the child exited is wrong too —
+/// a descendant holding the child's stdout keeps the output pumps blocked long after the child
+/// is gone, so "child exited" and "peer still there" are simultaneously true.
 ///
-/// Both teardown paths end with the socket being shut down, and because `split` hands out
-/// duplicates of ONE socket that EOF reaches the input pump identically whether the peer
-/// disconnected or the agent closed up after a normal exit. Neither the pump's `Outcome` nor
-/// a flag set beforehand can separate them without racing.
+/// So the decision is made by *ownership*. Whoever takes the handle first decides, and the
+/// loser does nothing:
 ///
-/// The child can. On a normal exit it is already dead by the time the socket closes; on a
-/// disconnect it is still running. So the pump asks rather than being told. A child that
-/// exits at the very moment the peer drops reads as a normal exit — the safe direction, since
-/// it leaves descendants alive rather than reaping a tree someone meant to keep.
+/// - Teardown takes it after a clean `wait()` and disarms — the command finished on its own,
+///   so what it launched is not ours to reap (sshd leaves such processes running).
+/// - A pump that still finds it present knows teardown has not begun, so the peer is what went
+///   away, and it reaps unconditionally. That also unblocks the output pumps: reaping the tree
+///   closes the pipe a descendant was holding.
+///
+/// Nobody claiming it is also correct — the `Job` drops with the session and
+/// `KILL_ON_JOB_CLOSE` reaps the tree, which is the right default when `wait()` failed and the
+/// state is unknown.
 #[cfg(windows)]
-fn reap_if_peer_vanished(job: &cosca::Job, child_already_exited: bool) {
-    if child_already_exited {
-        return; // finished on its own — sshd leaves what it spawned running, so do we
-    }
+type JobClaim = Arc<Mutex<Option<Arc<cosca::Job>>>>;
+
+/// Take the containment handle if it is still unclaimed.
+#[cfg(windows)]
+fn claim_job(claim: &JobClaim) -> Option<Arc<cosca::Job>> {
+    claim.lock().unwrap_or_else(|e| e.into_inner()).take()
+}
+
+/// Reap the tree because the peer went away — unless teardown already claimed it.
+#[cfg(windows)]
+fn reap_if_peer_vanished(claim: &JobClaim) {
+    let Some(job) = claim_job(claim) else {
+        return; // teardown got there first: the command exited on its own
+    };
     if let Err(e) = job.kill_tree() {
         tracing::warn!("tearing down the process tree after a disconnect failed: {e}");
     }

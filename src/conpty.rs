@@ -313,12 +313,6 @@ impl PtySession {
         std::sync::Arc::clone(&self.job)
     }
 
-    /// Whether the shell has already exited. A zero timeout is an instantaneous state query,
-    /// not a wait for anything.
-    pub fn has_exited(&self) -> bool {
-        crate::winutil::has_exited(self.process.0.0 as isize)
-    }
-
     pub fn kill_tree(&self) {
         if let Err(e) = self.job.kill_tree() {
             tracing::warn!("pty: killing the shell's process tree failed: {e}");
