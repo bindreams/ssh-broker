@@ -251,7 +251,16 @@ pub fn read_one_frame(r: &mut impl std::io::Read, fr: &mut FrameReader) -> anyho
             return Ok(frame);
         }
         let mut buf = [0u8; 8192];
-        let n = r.read(&mut buf)?;
+        // `Interrupted` is non-fatal and retryable per `Read::read`'s contract: a signal
+        // arriving mid-read, not a truncated handshake. Retrying a specific self-clearing
+        // condition, not a bounded retry loop.
+        let n = loop {
+            match r.read(&mut buf) {
+                Ok(n) => break n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e.into()),
+            }
+        };
         anyhow::ensure!(n > 0, "unexpected EOF before a complete frame");
         fr.push(&buf[..n]);
     }

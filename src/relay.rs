@@ -28,7 +28,10 @@ pub enum Outcome {
 /// [`PumpError::peer_gone`].
 #[derive(Debug, thiserror::Error)]
 pub enum PumpError {
-    /// Reading the transport failed. The peer's side is broken or gone.
+    /// Reading the transport failed for a reason that does not clear by itself.
+    ///
+    /// `ErrorKind::Interrupted` is excluded: it is retried in place, because it signals a
+    /// signal arriving mid-read rather than a peer that has gone.
     #[error("transport read failed: {0}")]
     Transport(#[source] std::io::Error),
 
@@ -109,7 +112,17 @@ pub fn pump_decode<R: Read>(r: &mut R, fr: &mut FrameReader, sink: &mut impl Fra
                 }
             }
         }
-        let n = r.read(&mut buf).map_err(PumpError::Transport)?;
+        // `Interrupted` is documented as non-fatal and retryable — a signal arriving mid-read,
+        // not a lost peer. Reporting it as `Transport` would make `peer_gone()` true while the
+        // far end is fine, discarding whatever it had already sent (an `EXIT` frame included).
+        // This is a retry on a specific, self-clearing condition, not a bounded retry loop.
+        let n = loop {
+            match r.read(&mut buf) {
+                Ok(n) => break n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(PumpError::Transport(e)),
+            }
+        };
         if n == 0 {
             // A correct peer closes on a frame boundary, so leftover bytes here mean the
             // stream was cut mid-frame — a truncation error, distinct from a clean close.

@@ -146,7 +146,12 @@ fn handle_pty(
         let hpc_cell = Arc::clone(&hpc_cell);
         std::thread::spawn(move || {
             let mut sink = PtyInputSink { in_raw, hpc_cell };
-            let _ = pump_decode(&mut rx, &mut fr, &mut sink);
+            // Discarded deliberately for now — every termination tears the session down
+            // either way — but logged, so a sink failure is distinguishable from a lost peer
+            // when diagnosing. #5 turns this into the teardown decision.
+            if let Err(e) = pump_decode(&mut rx, &mut fr, &mut sink) {
+                tracing::debug!("pty input pump stopped: {e} (peer_gone={})", e.peer_gone());
+            }
             kill_process(proc_raw);
         })
     };
@@ -231,7 +236,12 @@ fn handle_exec(
     // nothing to write — would never detect the dead socket, hanging the waiter.
     let t_in = std::thread::spawn(move || {
         let mut sink = ExecInputSink { stdin: stdin_owned };
-        let _ = pump_decode(&mut rx, &mut fr, &mut sink);
+        // Discarded deliberately for now — every termination tears the session down either
+        // way — but logged, so a sink failure is distinguishable from a lost peer when
+        // diagnosing. #5 turns this into the teardown decision.
+        if let Err(e) = pump_decode(&mut rx, &mut fr, &mut sink) {
+            tracing::debug!("exec input pump stopped: {e} (peer_gone={})", e.peer_gone());
+        }
         drop(sink); // close the child's stdin if the EOF marker never arrived
         kill_process(proc_raw);
     });

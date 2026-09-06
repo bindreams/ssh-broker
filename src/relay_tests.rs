@@ -327,3 +327,65 @@ fn a_clean_close_without_exit_is_peer_closed() {
     let outcome = pump_decode(&mut a, &mut fr, &mut TestSink::default()).expect("clean EOF");
     assert_eq!(outcome, Outcome::PeerClosed);
 }
+
+/// A reader that yields `Interrupted` once, then behaves normally.
+///
+/// Models a signal arriving mid-read: the peer is fine and its bytes are already queued.
+struct InterruptsOnce {
+    interrupted: bool,
+    data: std::io::Cursor<Vec<u8>>,
+}
+
+impl Read for InterruptsOnce {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if !self.interrupted {
+            self.interrupted = true;
+            return Err(std::io::Error::from(std::io::ErrorKind::Interrupted));
+        }
+        self.data.read(buf)
+    }
+}
+
+/// `Interrupted` is retried, not reported as a lost peer.
+///
+/// Classifying it as `Transport` would make `peer_gone()` true for a transient signal and
+/// discard whatever the peer had already sent — here a complete `EXIT(7)`, which the shim
+/// would have turned into 254 instead of 7.
+#[test]
+fn an_interrupted_read_is_retried_not_treated_as_a_lost_peer() {
+    let mut framed = Vec::new();
+    write_frame(&mut framed, FrameKind::Exit, &ExitCode(7).encode()).unwrap();
+    let mut r = InterruptsOnce {
+        interrupted: false,
+        data: std::io::Cursor::new(framed),
+    };
+
+    let mut fr = FrameReader::new();
+    let outcome = pump_decode(&mut r, &mut fr, &mut TestSink::default()).expect("interrupted is retried");
+    assert_eq!(
+        outcome,
+        Outcome::Exited(7),
+        "the queued exit code must survive the signal"
+    );
+}
+
+/// A reader that fails with a genuinely fatal error.
+struct AlwaysBroken;
+
+impl Read for AlwaysBroken {
+    fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+        Err(std::io::Error::from(std::io::ErrorKind::ConnectionReset))
+    }
+}
+
+/// A transport failure that does not clear by itself is `Transport`, and the peer is gone.
+#[test]
+fn a_broken_transport_is_reported_as_the_peer_going_away() {
+    let mut fr = FrameReader::new();
+    let err = pump_decode(&mut AlwaysBroken, &mut fr, &mut TestSink::default()).expect_err("broken");
+    assert!(
+        matches!(err, PumpError::Transport(_)),
+        "a fatal read failure must be classified as Transport, got {err:?}"
+    );
+    assert!(err.peer_gone(), "a broken transport means the peer is gone");
+}
