@@ -58,7 +58,7 @@ CASES: dict[str, tuple[list[str], list[str]]] = {
         [
             f'    const P: &str = r"{WIN_HOME}alice\\x";',
             f'    const P: &str = r"{WIN_HOME.lower()}alice\\x";',
-            f'    const P: &str = "{NIX_HOME}anna.zhukova/private";',
+            f'    const P: &str = "{NIX_HOME}firstname.lastname/private";',
             f'    const P: &str = "{NIX_HOME}bob";',
             f"Clone it to {NIX_HOME}someone/src/thing and run.",
             f"      working-directory: {NIX_HOME}runner/work",
