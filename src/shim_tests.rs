@@ -224,7 +224,12 @@ fn map_outcome_exit_code_policy() {
     assert_eq!(map_outcome(Ok(Outcome::Exited(0))), 0);
     // A dead/abrupt peer is never 0; protocol errors get a distinct nonzero.
     assert_eq!(map_outcome(Ok(Outcome::PeerClosed)), 255);
-    assert_eq!(map_outcome(Err(anyhow::anyhow!("truncated frame"))), 254);
+    assert_eq!(
+        map_outcome(Err(crate::relay::PumpError::Protocol(anyhow::anyhow!(
+            "truncated frame"
+        )))),
+        254
+    );
 }
 
 // ── make_handshake (pure field mapping) ────────────────────────────────────────────

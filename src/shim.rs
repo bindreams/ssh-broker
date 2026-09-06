@@ -284,7 +284,7 @@ pub fn decide_fallback(connect_err: bool) -> Fallback {
 /// code verbatim (the later `i32`→`u32` at `process::exit` is bit-preserving, so an NTSTATUS
 /// like `0xC0000142` survives); a peer that closed with no EXIT frame, or a protocol error,
 /// map to distinct nonzero codes — never 0, so a dead agent can't masquerade as success.
-pub fn map_outcome(outcome: anyhow::Result<Outcome>) -> i32 {
+pub fn map_outcome(outcome: Result<Outcome, crate::relay::PumpError>) -> i32 {
     match outcome {
         Ok(Outcome::Exited(code)) => code,
         Ok(Outcome::PeerClosed) => {
