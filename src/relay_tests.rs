@@ -256,3 +256,136 @@ fn pump_decode_errors_on_truncated_exit_payload() {
     writer.join().unwrap();
     assert!(result.is_err());
 }
+
+/// A sink failure must be reported as a sink failure, not as a lost peer.
+///
+/// This is the distinction the type exists for. A relayed command that closes its own stdin
+/// makes the next write fail while the session carries on normally, so a caller that reads
+/// every error as a disconnect would tear down a live session.
+#[test]
+fn a_failing_sink_is_not_reported_as_the_peer_going_away() {
+    struct FailingSink;
+    impl FrameSink for FailingSink {
+        fn on_data(&mut self, _stream: Stream, _bytes: &[u8]) -> anyhow::Result<()> {
+            anyhow::bail!("the child closed its stdin")
+        }
+    }
+
+    let (mut a, mut b) = duplex();
+    // Writer on its own thread: the transport is unbuffered, so writing before the reader
+    // runs would deadlock on the same thread.
+    let t = thread::spawn(move || {
+        let _ = write_data(&mut b, Stream::Stdin, b"hello");
+    });
+
+    let mut fr = FrameReader::new();
+    let err = pump_decode(&mut a, &mut fr, &mut FailingSink).expect_err("the sink fails");
+    let _ = t.join();
+    assert!(
+        matches!(err, PumpError::Sink(_)),
+        "a sink failure must be classified as Sink, got {err:?}"
+    );
+    assert!(!err.peer_gone(), "a sink failure says nothing about the peer");
+}
+
+/// A stream cut mid-frame is the peer going away, not a local problem.
+///
+/// Reachable rather than theoretical: `write_frame` emits a frame as two separate `write_all`
+/// calls, so a peer killed between them leaves exactly this behind.
+#[test]
+fn a_truncated_frame_is_reported_as_the_peer_going_away() {
+    let (mut a, mut b) = duplex();
+    // A header promising four payload bytes, then only two of them — the shape a peer killed
+    // between `write_frame`'s two `write_all` calls leaves behind. Writer on its own thread,
+    // since the transport is unbuffered.
+    let t = thread::spawn(move || {
+        let header = FrameHeader {
+            kind: FrameKind::Data,
+            len: 4,
+        };
+        let _ = b.write_all(&header.encode());
+        let _ = b.write_all(b"xx");
+    });
+
+    let mut fr = FrameReader::new();
+    let err = pump_decode(&mut a, &mut fr, &mut TestSink::default()).expect_err("truncated");
+    let _ = t.join();
+    assert!(
+        matches!(err, PumpError::Protocol(_)),
+        "a truncated stream must be classified as Protocol, got {err:?}"
+    );
+    assert!(err.peer_gone(), "a truncated stream means the peer is gone");
+}
+
+/// A clean close with no EXIT frame is still the peer going away — the existing outcome,
+/// pinned here alongside its error-shaped siblings so the three stay distinguishable.
+#[test]
+fn a_clean_close_without_exit_is_peer_closed() {
+    let (mut a, b) = duplex();
+    drop(b);
+    let mut fr = FrameReader::new();
+    let outcome = pump_decode(&mut a, &mut fr, &mut TestSink::default()).expect("clean EOF");
+    assert_eq!(outcome, Outcome::PeerClosed);
+}
+
+/// A reader that yields `Interrupted` once, then behaves normally.
+///
+/// Models a signal arriving mid-read: the peer is fine and its bytes are already queued.
+struct InterruptsOnce {
+    interrupted: bool,
+    data: std::io::Cursor<Vec<u8>>,
+}
+
+impl Read for InterruptsOnce {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if !self.interrupted {
+            self.interrupted = true;
+            return Err(std::io::Error::from(std::io::ErrorKind::Interrupted));
+        }
+        self.data.read(buf)
+    }
+}
+
+/// `Interrupted` is retried, not reported as a lost peer.
+///
+/// Classifying it as `Transport` would make `peer_gone()` true for a transient signal and
+/// discard whatever the peer had already sent — here a complete `EXIT(7)`, which the shim
+/// would have turned into 254 instead of 7.
+#[test]
+fn an_interrupted_read_is_retried_not_treated_as_a_lost_peer() {
+    let mut framed = Vec::new();
+    write_frame(&mut framed, FrameKind::Exit, &ExitCode(7).encode()).unwrap();
+    let mut r = InterruptsOnce {
+        interrupted: false,
+        data: std::io::Cursor::new(framed),
+    };
+
+    let mut fr = FrameReader::new();
+    let outcome = pump_decode(&mut r, &mut fr, &mut TestSink::default()).expect("interrupted is retried");
+    assert_eq!(
+        outcome,
+        Outcome::Exited(7),
+        "the queued exit code must survive the signal"
+    );
+}
+
+/// A reader that fails with a genuinely fatal error.
+struct AlwaysBroken;
+
+impl Read for AlwaysBroken {
+    fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+        Err(std::io::Error::from(std::io::ErrorKind::ConnectionReset))
+    }
+}
+
+/// A transport failure that does not clear by itself is `Transport`, and the peer is gone.
+#[test]
+fn a_broken_transport_is_reported_as_the_peer_going_away() {
+    let mut fr = FrameReader::new();
+    let err = pump_decode(&mut AlwaysBroken, &mut fr, &mut TestSink::default()).expect_err("broken");
+    assert!(
+        matches!(err, PumpError::Transport(_)),
+        "a fatal read failure must be classified as Transport, got {err:?}"
+    );
+    assert!(err.peer_gone(), "a broken transport means the peer is gone");
+}

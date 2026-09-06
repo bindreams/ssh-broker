@@ -71,6 +71,9 @@ fn forward_stdin<I: Read, W: Write>(mut stdin: I, tx: Arc<Mutex<W>>) {
     let mut buf = [0u8; 32 * 1024];
     loop {
         match stdin.read(&mut buf) {
+            // `Interrupted` is retryable, not end-of-input. Folding it into the break would
+            // send the stdin-EOF marker while the user is still typing.
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Ok(0) | Err(_) => break,
             Ok(n) => {
                 let mut g = tx.lock().unwrap();
@@ -284,7 +287,12 @@ pub fn decide_fallback(connect_err: bool) -> Fallback {
 /// code verbatim (the later `i32`→`u32` at `process::exit` is bit-preserving, so an NTSTATUS
 /// like `0xC0000142` survives); a peer that closed with no EXIT frame, or a protocol error,
 /// map to distinct nonzero codes — never 0, so a dead agent can't masquerade as success.
-pub fn map_outcome(outcome: anyhow::Result<Outcome>) -> i32 {
+///
+/// Every [`PumpError`](crate::relay::PumpError) maps to 254 regardless of side, deliberately:
+/// from the shim's position a sink failure is its own stdout or stderr breaking, which is no
+/// more survivable than a lost agent. The distinction exists for the agent, which can keep a
+/// session alive when only its sink failed.
+pub fn map_outcome(outcome: Result<Outcome, crate::relay::PumpError>) -> i32 {
     match outcome {
         Ok(Outcome::Exited(code)) => code,
         Ok(Outcome::PeerClosed) => {
