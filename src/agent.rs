@@ -224,8 +224,8 @@ fn handle_exec(
     let tx_arc = Arc::new(Mutex::new(tx));
     let job = child.job();
 
-    let t_out = spawn_stream_pump(out_raw, Stream::Stdout, Arc::clone(&tx_arc));
-    let t_err = spawn_stream_pump(err_raw, Stream::Stderr, Arc::clone(&tx_arc));
+    let t_out = spawn_stream_pump(out_raw, Stream::Stdout, Arc::clone(&tx_arc), Arc::clone(&job));
+    let t_err = spawn_stream_pump(err_raw, Stream::Stderr, Arc::clone(&tx_arc), Arc::clone(&job));
 
     // stdin pump owns the child's stdin-write handle. A half-close mid-session (empty
     // DATA(Stdin) marker) closes only the child's stdin so a reader like sort/findstr
@@ -264,7 +264,12 @@ fn handle_exec(
 /// connection. On EOF the child is exiting; on a write failure the SSH side is gone, so
 /// kill the child to unblock the waiter.
 #[cfg(windows)]
-fn spawn_stream_pump(raw: isize, stream: Stream, tx: Arc<Mutex<ConnTx>>) -> std::thread::JoinHandle<()> {
+fn spawn_stream_pump(
+    raw: isize,
+    stream: Stream,
+    tx: Arc<Mutex<ConnTx>>,
+    job: std::sync::Arc<cosca::Job>,
+) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let mut buf = [0u8; 32 * 1024];
         loop {
@@ -277,10 +282,13 @@ fn spawn_stream_pump(raw: isize, stream: Stream, tx: Arc<Mutex<ConnTx>>) -> std:
                 write_data(&mut *g, stream, &buf[..n]).is_ok()
             };
             if !ok {
-                // The socket is gone, but detecting that is the input pump's job — it is
-                // always parked in a read and will see the same disconnect. Reaping here too
-                // would be a second owner for one fact, which is what made this teardown hard
-                // to get right in the first place.
+                // The socket is gone. Reaping here is NOT redundant with the input pump: that
+                // pump dispatches inline, and `ExecInputSink` writes to the child's stdin with
+                // a blocking `WriteFile` on a default-sized pipe. A command that ignores its
+                // stdin fills that pipe in a few KiB and parks the input pump *in the sink*,
+                // where it can no longer see the socket at all. These pumps are then the only
+                // thing left that can notice, so they must act rather than defer.
+                reap_tree(&job);
                 break;
             }
         }

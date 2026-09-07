@@ -93,22 +93,20 @@ impl Drop for AttrList {
 /// Inventing a plausible code instead (this reported `ERROR_INVALID_HANDLE` for every
 /// containment failure, whatever actually went wrong) sends whoever reads the log after an
 /// incident chasing a cause that was never there.
-pub fn win_error_from<E: std::error::Error>(e: &E, context: &str) -> windows::core::Error {
-    // Walk the chain rather than naming a dependency's error variant: the OS code may sit at
-    // any depth, and the search should not break when that crate reshapes its enum.
-    let mut cur = e.source();
-    let mut code = None;
-    while let Some(s) = cur {
-        if let Some(io) = s.downcast_ref::<std::io::Error>() {
-            code = io.raw_os_error();
-            break;
-        }
-        cur = s.source();
-    }
-    let hr = code.map_or(windows::Win32::Foundation::E_FAIL, |c| {
-        windows::core::HRESULT::from_win32(c as u32)
-    });
-    windows::core::Error::new(hr, format!("{context}: {e}"))
+pub fn win_error_from(e: &cosca::error::Error, context: &str) -> windows::core::Error {
+    // Matched, not walked. `Error::Io` is `#[error(transparent)]`, and thiserror forwards
+    // `source()` to the *inner* error's source — which for an `io::Error` is `None`. A chain
+    // walk therefore never reaches the `io::Error` at all and silently reports a placeholder
+    // for every failure, which is the same defect as hardcoding one. The wildcard is required:
+    // `cosca::error::Error` is `#[non_exhaustive]`.
+    let hr = match e {
+        cosca::error::Error::Io(io) => io.raw_os_error().map(|c| windows::core::HRESULT::from_win32(c as u32)),
+        _ => None,
+    };
+    windows::core::Error::new(
+        hr.unwrap_or(windows::Win32::Foundation::E_FAIL),
+        format!("{context}: {e}"),
+    )
 }
 
 /// Contain a suspended process in a job object, then let it run.
@@ -146,3 +144,7 @@ pub unsafe fn contain_and_resume(process: HANDLE, thread: HANDLE, what: &str) ->
     }
     Ok(job)
 }
+
+#[cfg(test)]
+#[path = "winutil_tests.rs"]
+mod winutil_tests;

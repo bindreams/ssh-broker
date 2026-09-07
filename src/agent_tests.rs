@@ -241,6 +241,47 @@ fn agent_rejects_non_handshake_first_frame() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// A disconnect must be noticed even when the input pump is stuck inside its own sink.
+///
+/// The regression this pins is one that reached review: the output pumps' reap was deleted as
+/// "redundant", on the premise that the input pump is always parked in a socket read and would
+/// see the same disconnect. It is not. `pump_decode` dispatches inline, and `ExecInputSink`
+/// writes to the child's stdin with a blocking `WriteFile` on a default-sized pipe — so a
+/// command that ignores its stdin fills that pipe within a few KiB and parks the input pump in
+/// the sink, blind to the socket. The output pumps are then the only detector left.
+///
+/// The payload is far larger than the pipe buffer but well under `MAX_FRAME`, so the agent
+/// reads the whole frame before dispatching it and the client never blocks writing it.
+/// A regression hangs here rather than failing, which the runner surfaces.
+#[test]
+fn exec_disconnect_is_noticed_while_the_input_pump_is_blocked_on_stdin() {
+    let dir = hardened_dir("exec-stdin-blocked");
+    let sock = dir.join("s");
+    let listener = Listener::bind(&sock).unwrap();
+
+    let client_path = sock.clone();
+    let client = thread::spawn(move || {
+        let conn = afunix::connect(&client_path).unwrap();
+        let (_crx, mut ctx) = afunix::split(conn).unwrap();
+        let hs = Handshake {
+            mode: Mode::Exec,
+            // Never reads stdin, and keeps producing output so an output pump attempts a
+            // write after the disconnect and can observe it.
+            command: Some("pwsh.exe -NoLogo -NoProfile -Command \"while ($true) { Write-Output 'tick' }\"".into()),
+            ..Handshake::pty_default()
+        };
+        write_frame(&mut ctx, FrameKind::Handshake, &hs.encode().unwrap()).unwrap();
+        write_data(&mut ctx, Stream::Stdin, &vec![b'x'; 256 * 1024]).unwrap();
+        let _ = ctx.shutdown_both();
+    });
+
+    let conn = listener.accept().unwrap();
+    // Returns only if something noticed the disconnect and reaped; hangs forever otherwise.
+    super::handle_connection(conn).unwrap();
+    let _ = client.join();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 // ── process-tree teardown ────────────────────────────────────────────────────────────────
 
 /// A command that never returns on its own, so teardown is what ends it.
