@@ -128,18 +128,26 @@ fn handle_pty(
         let job = Arc::clone(&job);
         std::thread::spawn(move || {
             let mut buf = [0u8; 32 * 1024];
+            let mut delivering = true;
             loop {
                 let n = conpty::read_handle(out_raw, &mut buf);
                 if n == 0 {
                     break; // pseudoconsole closed (teardown) -> drained to EOF
+                }
+                if !delivering {
+                    continue; // draining, see below
                 }
                 let ok = {
                     let mut g = tx.lock().unwrap();
                     write_data(&mut *g, Stream::Pty, &buf[..n]).is_ok()
                 };
                 if !ok {
-                    reap_tree(&job); // the socket is gone; see `spawn_stream_pump`
-                    break;
+                    // The socket is gone. Reap, but keep READING: this thread is the only
+                    // reader of the pseudoconsole's output pipe, and `ClosePseudoConsole`
+                    // below flushes conhost's pending output through it. Abandoning the pipe
+                    // here lets it fill, and teardown then blocks inside the close.
+                    reap_tree(&job);
+                    delivering = false;
                 }
             }
         })
@@ -154,9 +162,13 @@ fn handle_pty(
                 hpc_cell,
             };
             pump_until_peer_gone(&mut rx, &mut fr, &mut sink);
-            // Reap before dropping the sink: dropping joins the writer thread, which may be
-            // parked in a write that only a dead shell releases.
-            reap_tree(&job);
+            if let Some(w) = teardown_warning(reap_tree(&job)) {
+                tracing::error!("{w}");
+            }
+            // Dropping the sink joins the writer thread, which may be parked writing to the
+            // pseudoconsole's input pipe. The reap does NOT release that: conhost holds the
+            // read end and is not a member of the job. `ClosePseudoConsole` in the waiter
+            // below is what releases it, which is why this drop must not be moved ahead of it.
             drop(sink);
         })
     };
@@ -174,7 +186,7 @@ fn handle_pty(
         // copy the raw HPCON out and then race this close (use-after-close).
         let mut hpc = hpc_cell.lock().unwrap();
         if let Some(raw) = hpc.take() {
-            conpty::close_pty_raw(raw); // → output pipe EOF → out_thread drains, emits EXIT, FINs
+            conpty::close_pty_raw(raw); // → flushes conhost, then output pipe EOF → out_thread ends
         }
     }
     let _ = out_thread.join();
@@ -252,11 +264,13 @@ fn handle_exec(
                 writer: HandleWriter::spawn(stdin_raw, stdin_owned),
             };
             pump_until_peer_gone(&mut rx, &mut fr, &mut sink);
-            // Reap before dropping the sink: dropping joins the writer thread, which may be
-            // parked in a write that only a dead child releases. The drop then closes the
-            // child's stdin if the EOF marker never arrived.
-            reap_tree(&job);
-            drop(sink);
+            // Reap first: dropping the sink joins the writer thread, which may be parked
+            // writing to the child's stdin. Here the reap does release it — `ExecChild::spawn`
+            // drops the parent's copy of the read end, so the dead child was the only holder.
+            if let Some(w) = teardown_warning(reap_tree(&job)) {
+                tracing::error!("{w}");
+            }
+            drop(sink); // also closes the child's stdin if the EOF marker never arrived
         })
     };
 
@@ -291,24 +305,25 @@ fn spawn_stream_pump(
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let mut buf = [0u8; 32 * 1024];
+        let mut delivering = true;
         loop {
             let n = conpty::read_handle(raw, &mut buf);
             if n == 0 {
                 break; // child's stream closed (exiting)
+            }
+            if !delivering {
+                continue; // draining so the pipe cannot fill and stall the writer
             }
             let ok = {
                 let mut g = tx.lock().unwrap();
                 write_data(&mut *g, stream, &buf[..n]).is_ok()
             };
             if !ok {
-                // The socket is gone. Reaping here is NOT redundant with the input pump: that
-                // pump dispatches inline, and `ExecInputSink` writes to the child's stdin with
-                // a blocking `WriteFile` on a default-sized pipe. A command that ignores its
-                // stdin fills that pipe in a few KiB and parks the input pump *in the sink*,
-                // where it can no longer see the socket at all. These pumps are then the only
-                // thing left that can notice, so they must act rather than defer.
+                // The socket is gone. This is an independent detector, not a redundant
+                // one: the input pump's queue is bounded, so a command that ignores its stdin
+                // can still park that pump in a send and blind it to the socket.
                 reap_tree(&job);
-                break;
+                delivering = false;
             }
         }
     })
@@ -347,12 +362,14 @@ impl FrameSink for ExecInputSink {
 /// lifetime of the agent. Moving the write off this thread is what sshd gets from a select
 /// loop over non-blocking descriptors.
 ///
-/// The queue is unbounded. Bounding it would reintroduce exactly the block it removes, and it
-/// would buy nothing: the peer is a user the socket ACL already admits, who can exhaust memory
-/// directly.
+/// The queue is bounded. Unbounded buffering makes an ordinary `cat big-file | ssh host cmd`
+/// into unbounded growth in a resident agent that is shared with the user's other sessions, so
+/// the cap is what keeps one session from taking down the rest. Once it is full the reader
+/// does park in the send — the socket then applies the same backpressure sshd gets from its
+/// channel window — and the output pumps are the detector that still sees a disconnect.
 #[cfg(windows)]
 struct HandleWriter {
-    tx: Option<std::sync::mpsc::Sender<Option<Vec<u8>>>>,
+    tx: Option<std::sync::mpsc::SyncSender<Option<Vec<u8>>>>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -361,7 +378,9 @@ impl HandleWriter {
     /// `owned` is the handle to close on the stdin-EOF marker; the PTY path passes `None`
     /// because the pseudoconsole's input handle belongs to the session.
     fn spawn(raw: isize, owned: Option<OwnedHandle>) -> Self {
-        let (tx, rx) = std::sync::mpsc::channel::<Option<Vec<u8>>>();
+        // Frames are at most `protocol::MAX_FRAME`, but the shim sends 32 KiB chunks, so
+        // this is well under a megabyte in practice.
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Option<Vec<u8>>>(16);
         let thread = std::thread::spawn(move || {
             let _owned = owned; // dropped on the way out, closing the child's stdin
             for msg in rx {

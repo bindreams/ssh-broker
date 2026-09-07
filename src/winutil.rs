@@ -101,9 +101,11 @@ pub fn win_error_from(e: &cosca::error::Error, context: &str) -> windows::core::
     // `cosca::error::Error` is `#[non_exhaustive]`.
     use cosca::error::Error as E;
     let os = match e {
-        E::Io(io) => io.raw_os_error(),
+        E::Io(io) => io.raw_os_error().filter(|c| *c != 0),
         // These carry the OS error only when the OS was actually asked something.
-        E::Unassessable { source: Some(io), .. } | E::IdentityRecord { source: Some(io), .. } => io.raw_os_error(),
+        E::Unassessable { source: Some(io), .. } | E::IdentityRecord { source: Some(io), .. } => {
+            io.raw_os_error().filter(|c| *c != 0)
+        }
         _ => None,
     };
     let hr = os.map(|c| {
