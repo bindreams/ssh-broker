@@ -247,7 +247,7 @@ fn agent_rejects_non_handshake_first_frame() {
 ///
 /// Genuinely unbounded, not a large number: a bounded sleep would let a reap regression pass by
 /// simply outlasting it, turning the assertion below into a slow yes.
-const SLEEP_FOREVER: &str = "[System.Threading.Thread]::Sleep([System.Threading.Timeout]::Infinite)"; // sleep-ok: a sentinel that must never wake; teardown killing it IS the assertion
+const SLEEP_FOREVER: &str = "[System.Threading.Thread]::Sleep([System.Threading.Timeout]::Infinite)"; // sleep-ok: teardown killing it IS the assertion
 
 /// How the session under test ends.
 #[derive(Clone, Copy, PartialEq)]
@@ -300,7 +300,14 @@ fn set_event(raw: isize) {
 
 /// The tail that waits for the go event, then exits cleanly.
 fn wait_then_exit(event: &str) -> String {
-    format!("[System.Threading.EventWaitHandle]::OpenExisting('{event}').WaitOne() | Out-Null; exit 0")
+    // `$ErrorActionPreference='Stop'` is what makes the exit-code check downstream mean
+    // anything: PowerShell's default is `Continue`, so a failed `OpenExisting` would print a
+    // message, fall through to `exit 0`, and report success while never having waited at all —
+    // silently restoring the pid race this event exists to remove.
+    format!(
+        "$ErrorActionPreference='Stop'; \
+         [System.Threading.EventWaitHandle]::OpenExisting('{event}').WaitOne() | Out-Null; exit 0"
+    )
 }
 
 /// A command that launches a background grandchild, records its pid, then announces itself.

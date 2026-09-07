@@ -24,7 +24,7 @@ use crate::pipes::ExecChild;
 #[cfg(windows)]
 use crate::protocol::{ExitCode, FrameKind, FrameReader, Handshake, Mode, Resize, Stream, read_one_frame, write_frame};
 #[cfg(windows)]
-use crate::relay::{FrameSink, Outcome, PumpError, pump_decode, write_data};
+use crate::relay::{FrameSink, pump_until_peer_gone, write_data};
 #[cfg(windows)]
 use crate::winutil::OwnedHandle;
 #[cfg(windows)]
@@ -147,13 +147,8 @@ fn handle_pty(
         let job = Arc::clone(&job);
         std::thread::spawn(move || {
             let mut sink = PtyInputSink { in_raw, hpc_cell };
-            let result = pump_decode(&mut rx, &mut fr, &mut sink);
-            if let Err(e) = &result {
-                tracing::debug!("pty input pump stopped: {e}");
-            }
-            if session_is_over(&result) {
-                reap_tree(&job);
-            }
+            pump_until_peer_gone(&mut rx, &mut fr, &mut sink);
+            reap_tree(&job);
         })
     };
 
@@ -163,7 +158,7 @@ fn handle_pty(
     let wait_result = session.wait();
     // The shell is gone, so the session is over. Reaping now takes its descendants with it and
     // closes the pipes, which is what lets the output pump below be joined at all.
-    reap_tree(&job);
+    warn_if_teardown_may_block(reap_tree(&job));
     let code = *wait_result.as_ref().unwrap_or(&1);
     *code_cell.lock().unwrap() = code;
     {
@@ -229,8 +224,8 @@ fn handle_exec(
     let tx_arc = Arc::new(Mutex::new(tx));
     let job = child.job();
 
-    let t_out = spawn_stream_pump(out_raw, Stream::Stdout, Arc::clone(&tx_arc), Arc::clone(&job));
-    let t_err = spawn_stream_pump(err_raw, Stream::Stderr, Arc::clone(&tx_arc), Arc::clone(&job));
+    let t_out = spawn_stream_pump(out_raw, Stream::Stdout, Arc::clone(&tx_arc));
+    let t_err = spawn_stream_pump(err_raw, Stream::Stderr, Arc::clone(&tx_arc));
 
     // stdin pump owns the child's stdin-write handle. A half-close mid-session (empty
     // DATA(Stdin) marker) closes only the child's stdin so a reader like sort/findstr
@@ -242,21 +237,16 @@ fn handle_exec(
         let job = Arc::clone(&job);
         std::thread::spawn(move || {
             let mut sink = ExecInputSink { stdin: stdin_owned };
-            let result = pump_decode(&mut rx, &mut fr, &mut sink);
-            if let Err(e) = &result {
-                tracing::debug!("exec input pump stopped: {e}");
-            }
+            pump_until_peer_gone(&mut rx, &mut fr, &mut sink);
             drop(sink); // close the child's stdin if the EOF marker never arrived
-            if session_is_over(&result) {
-                reap_tree(&job);
-            }
+            reap_tree(&job);
         })
     };
 
     let wait_result = child.wait();
     // The command is gone, so the session is over. Reaping now takes its descendants with it
     // and closes the pipes, which is what lets the output pumps below be joined at all.
-    reap_tree(&job);
+    warn_if_teardown_may_block(reap_tree(&job));
     let code = *wait_result.as_ref().unwrap_or(&1);
     let _ = t_out.join();
     let _ = t_err.join();
@@ -274,12 +264,7 @@ fn handle_exec(
 /// connection. On EOF the child is exiting; on a write failure the SSH side is gone, so
 /// kill the child to unblock the waiter.
 #[cfg(windows)]
-fn spawn_stream_pump(
-    raw: isize,
-    stream: Stream,
-    tx: Arc<Mutex<ConnTx>>,
-    job: std::sync::Arc<cosca::Job>,
-) -> std::thread::JoinHandle<()> {
+fn spawn_stream_pump(raw: isize, stream: Stream, tx: Arc<Mutex<ConnTx>>) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let mut buf = [0u8; 32 * 1024];
         loop {
@@ -292,7 +277,10 @@ fn spawn_stream_pump(
                 write_data(&mut *g, stream, &buf[..n]).is_ok()
             };
             if !ok {
-                reap_tree(&job); // the socket is gone; end the session
+                // The socket is gone, but detecting that is the input pump's job — it is
+                // always parked in a read and will see the same disconnect. Reaping here too
+                // would be a second owner for one fact, which is what made this teardown hard
+                // to get right in the first place.
                 break;
             }
         }
@@ -326,24 +314,6 @@ impl FrameSink for ExecInputSink {
     // on_resize: default no-op (EXEC has no pseudoconsole).
 }
 
-/// Whether a pump's ending means nobody is left driving the session.
-///
-/// A [`PumpError::Sink`] is the one ending that does not. It is local and says nothing about
-/// the peer: a relayed command closing its own stdin makes the next write fail while the
-/// session continues normally, and reaping there would kill a live session over a routine
-/// stdin write. The child's stdin handle is dropped either way, so a reader still sees EOF,
-/// and `wait` still ends the session when the command finishes.
-///
-/// Every other ending means the far end is finished with this session — including a peer that
-/// sent `EXIT` and then went silent. Our own shim never does that, but the agent is reachable
-/// by anything the socket ACL admits and must not depend on the peer behaving: without reaping
-/// there, a command that never exits on its own parks this handler thread for the lifetime of
-/// a resident agent.
-#[cfg(windows)]
-fn session_is_over(result: &Result<Outcome, PumpError>) -> bool {
-    !matches!(result, Err(PumpError::Sink(_)))
-}
-
 /// Reap the child and everything it spawned. Idempotent.
 ///
 /// This is what Windows OpenSSH does, measured rather than assumed: it ends the session when
@@ -357,9 +327,29 @@ fn session_is_over(result: &Result<Outcome, PumpError>) -> bool {
 /// parked in `ReadFile` on a handle a descendant was holding returns instead of hanging the
 /// handler thread forever in a resident agent.
 #[cfg(windows)]
-fn reap_tree(job: &cosca::Job) {
-    if let Err(e) = job.kill_tree() {
-        tracing::warn!("tearing down the process tree failed: {e}");
+fn reap_tree(job: &cosca::Job) -> bool {
+    match job.kill_tree() {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::warn!("tearing down the process tree failed: {e}");
+            false
+        }
+    }
+}
+
+/// Log before a join that can only block if the reap failed.
+///
+/// Teardown joins the output pumps, which end when the tree's pipes close. If the reap failed
+/// those pipes may still be held, and the join blocks for as long as the survivor lives. Going
+/// ahead is deliberate — detaching the threads would let them read handles `session` is about
+/// to close — but it must not be silent, or the agent looks wedged for no stated reason.
+#[cfg(windows)]
+fn warn_if_teardown_may_block(reaped: bool) {
+    if !reaped {
+        tracing::error!(
+            "the process tree survived teardown; joining the output pumps will block until \
+             whatever still holds the session's pipes exits"
+        );
     }
 }
 

@@ -28,17 +28,16 @@
 //! profile/environment for free (`CreateProcessAsUserW` with a null environment block
 //! hands the child SYSTEM's environment, not the user's).
 
-use std::os::windows::io::BorrowedHandle;
 use std::path::Path;
 
 use crate::winutil::{AttrList, OwnedHandle};
-use windows::Win32::Foundation::{ERROR_INVALID_HANDLE, HANDLE};
+use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Storage::FileSystem::{ReadFile, WriteFile};
 use windows::Win32::System::Console::{COORD, ClosePseudoConsole, CreatePseudoConsole, HPCON, ResizePseudoConsole};
 use windows::Win32::System::Pipes::CreatePipe;
 use windows::Win32::System::Threading::{
     CREATE_SUSPENDED, CreateProcessW, EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess, INFINITE, PROCESS_INFORMATION,
-    ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOEXW, TerminateProcess, WaitForSingleObject,
+    STARTF_USESTDHANDLES, STARTUPINFOEXW, WaitForSingleObject,
 };
 use windows::core::{PCWSTR, PWSTR};
 
@@ -221,35 +220,7 @@ impl PtySession {
             let process = OwnedHandle(pi.hProcess);
             let thread = OwnedHandle(pi.hThread);
 
-            // Borrowed for the call only; `process` owns the handle and outlives it.
-            let job = match cosca::Job::assign(BorrowedHandle::borrow_raw(
-                process.0.0 as std::os::windows::io::RawHandle,
-            )) {
-                Ok(job) => job,
-                Err(e) => {
-                    // Assignment failed, so the child is uncontained AND still suspended.
-                    // Resuming it now would let it fork descendants nothing can reach, so it
-                    // is killed instead and the error propagates.
-                    if let Err(ke) = TerminateProcess(process.0, 1) {
-                        // Uncontained, still suspended, and now unkillable: say so, or it is
-                        // a leaked process with no trace but an unrelated error message.
-                        tracing::warn!("killing the unassigned shell also failed: {ke}");
-                    }
-                    return Err(windows::core::Error::new(
-                        windows::core::HRESULT::from_win32(ERROR_INVALID_HANDLE.0),
-                        format!("assign the shell to a job object: {e}"),
-                    ));
-                }
-            };
-
-            // Contained: safe to run.
-            if ResumeThread(thread.0) == u32::MAX {
-                let err = windows::core::Error::from_thread();
-                if let Err(ke) = job.kill_tree() {
-                    tracing::warn!("killing the unresumed shell failed: {ke}");
-                }
-                return Err(err);
-            }
+            let job = crate::winutil::contain_and_resume(process.0, thread.0, "shell")?;
 
             Ok(PtySession {
                 hpc: Some(hpc),

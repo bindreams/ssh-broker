@@ -61,6 +61,40 @@ impl PumpError {
     }
 }
 
+/// A sink that accepts and drops everything, so a pump can keep watching a peer it is no
+/// longer able to deliver to.
+struct DiscardSink;
+
+impl FrameSink for DiscardSink {
+    fn on_data(&mut self, _stream: Stream, _bytes: &[u8]) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+/// Deliver frames from `r` to `sink` until the **peer** is gone, not merely until the sink is.
+///
+/// [`PumpError::Sink`] is the one ending that must not stop the loop: it is local, and the peer
+/// is usually still connected — a relayed command closing its own stdin makes the next write
+/// fail mid-session. Delivery stops there, but watching does not; the pump re-enters with the
+/// frames discarded.
+///
+/// Returning early instead would leave nobody reading the transport, so the peer's eventual
+/// disconnect is never observed and whoever waits on the child blocks forever on a command that
+/// never exits on its own. Separating "cannot deliver" from "nobody is there" is the whole point
+/// of [`PumpError`]; this function is where that distinction is spent.
+pub fn pump_until_peer_gone<R: Read>(r: &mut R, fr: &mut FrameReader, sink: &mut impl FrameSink) {
+    let Err(e) = pump_decode(r, fr, sink) else {
+        return; // clean end of stream: the peer is finished
+    };
+    tracing::debug!("input pump stopped delivering: {e}");
+    if e.peer_gone() {
+        return;
+    }
+    if let Err(e) = pump_decode(r, fr, &mut DiscardSink) {
+        tracing::debug!("input pump stopped watching: {e}");
+    }
+}
+
 /// Write a `DATA` frame: `[stream tag: u8][bytes...]`.
 pub fn write_data<W: Write>(w: &mut W, stream: Stream, bytes: &[u8]) -> anyhow::Result<()> {
     let mut payload = Vec::with_capacity(1 + bytes.len());

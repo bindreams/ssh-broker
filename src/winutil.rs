@@ -87,3 +87,62 @@ impl Drop for AttrList {
         }
     }
 }
+
+/// Turn a `cosca` failure into a Win32 error, keeping the real OS code when there is one.
+///
+/// Inventing a plausible code instead (this reported `ERROR_INVALID_HANDLE` for every
+/// containment failure, whatever actually went wrong) sends whoever reads the log after an
+/// incident chasing a cause that was never there.
+pub fn win_error_from<E: std::error::Error>(e: &E, context: &str) -> windows::core::Error {
+    // Walk the chain rather than naming a dependency's error variant: the OS code may sit at
+    // any depth, and the search should not break when that crate reshapes its enum.
+    let mut cur = e.source();
+    let mut code = None;
+    while let Some(s) = cur {
+        if let Some(io) = s.downcast_ref::<std::io::Error>() {
+            code = io.raw_os_error();
+            break;
+        }
+        cur = s.source();
+    }
+    let hr = code.map_or(windows::Win32::Foundation::E_FAIL, |c| {
+        windows::core::HRESULT::from_win32(c as u32)
+    });
+    windows::core::Error::new(hr, format!("{context}: {e}"))
+}
+
+/// Contain a suspended process in a job object, then let it run.
+///
+/// `process` must have been created `CREATE_SUSPENDED`. That is load-bearing, not tidiness:
+/// assignment has to win the race against the process spawning anything, or a descendant is
+/// born outside the job and survives teardown. If assignment fails the process is killed
+/// rather than resumed — resuming it would produce exactly those unreachable descendants.
+///
+/// # Safety
+/// `process` and `thread` must be the live handles from a successful `CreateProcess*` call.
+pub unsafe fn contain_and_resume(process: HANDLE, thread: HANDLE, what: &str) -> windows::core::Result<cosca::Job> {
+    use std::os::windows::io::{BorrowedHandle, RawHandle};
+    use windows::Win32::System::Threading::{ResumeThread, TerminateProcess};
+
+    // Borrowed for the call only; the caller owns the handle and outlives it.
+    let job = match cosca::Job::assign(unsafe { BorrowedHandle::borrow_raw(process.0 as RawHandle) }) {
+        Ok(job) => job,
+        Err(e) => {
+            // Uncontained AND still suspended, so it must not be resumed.
+            if let Err(ke) = unsafe { TerminateProcess(process, 1) } {
+                // Now also unkillable: say so, or this is a leaked suspended process whose
+                // only trace is an unrelated error message.
+                tracing::warn!("killing the unassigned {what} also failed: {ke}");
+            }
+            return Err(win_error_from(&e, &format!("assign the {what} to a job object")));
+        }
+    };
+    if unsafe { ResumeThread(thread) } == u32::MAX {
+        let err = windows::core::Error::from_thread();
+        if let Err(ke) = job.kill_tree() {
+            tracing::warn!("killing the unresumed {what} failed: {ke}");
+        }
+        return Err(err);
+    }
+    Ok(job)
+}
