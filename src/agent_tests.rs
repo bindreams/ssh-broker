@@ -357,9 +357,11 @@ fn wait_then_exit(event: &str) -> String {
 /// complete *before* the marker is printed, so a client that has read the marker can always
 /// read a valid pid and the grandchild is guaranteed to exist.
 ///
-/// `window` selects whether the grandchild inherits this process's stdio. `-NoNewWindow`
-/// inherits (the case that actually matters, and the one a naive test misses); the default
-/// opens a new console and inherits nothing.
+/// `window` selects how the grandchild is attached: `-NoNewWindow` keeps it on the parent's
+/// console and standard handles, the default gives it a fresh console. Exactly which handles
+/// each variant inherits was NOT verified here — .NET's `Process.Start` sets
+/// `bInheritHandles` either way — so treat the pair as two attachment shapes that must both be
+/// reaped, not as a claim about handle inheritance.
 fn grandchild_cmd(pidfile: &std::path::Path, tail: &str, inherit_stdio: bool) -> String {
     let window = if inherit_stdio { "-NoNewWindow " } else { "" };
     format!(
@@ -495,20 +497,18 @@ fn exec_disconnect_kills_the_whole_process_tree() {
     assert_exits(raw, "the grandchild after an EXEC disconnect");
 }
 
-/// The same, for a grandchild that **inherits the command's stdout**.
+/// The same, for a grandchild left on the command's own console and standard handles.
 ///
-/// This is the case a `Start-Process` default misses: a new console inherits no handles, so a
-/// test built on it proves only the easy half. Here the descendant holds the pipe the output
-/// pump reads, which is both the realistic shape (`start /b`, a daemon launched from a script)
-/// and the one where getting teardown wrong hangs the session instead of merely leaking.
+/// This is the realistic shape (`start /b`, a daemon launched from a script) and the one where
+/// getting teardown wrong hangs the session instead of merely leaking a process.
 #[test]
 fn exec_disconnect_reaps_a_descendant_holding_stdout() {
     let raw = run_tree_session("tree-exec-inherit", Mode::Exec, true, Ending::Disconnect);
     assert_exits(raw, "the stdout-holding grandchild after an EXEC disconnect");
 }
 
-/// The same inherited-handle case on the PTY path, where the grandchild holds the
-/// pseudoconsole's pipe rather than a plain stdout pipe.
+/// The same case on the PTY path, where the grandchild is attached to the pseudoconsole
+/// rather than to a plain stdout pipe.
 #[test]
 fn pty_disconnect_reaps_a_descendant_holding_the_pseudoconsole() {
     let raw = run_tree_session("tree-pty-inherit", Mode::Pty, true, Ending::Disconnect);
@@ -540,4 +540,20 @@ fn exec_normal_exit_reaps_descendants_like_windows_sshd() {
 fn pty_normal_exit_reaps_descendants_like_windows_sshd() {
     let raw = run_tree_session("tree-pty-exit", Mode::Pty, false, Ending::NormalExit);
     assert_exits(raw, "the grandchild after a normal PTY exit");
+}
+
+/// The teardown warning fires exactly when the reap failed.
+///
+/// Split out as a pure function so the decision is testable at all: as an inline `if` around a
+/// `tracing::error!` it had no observable behaviour, so a regression that silenced it — the
+/// operator's only clue that the agent is about to block rather than wedge — would have failed
+/// nothing.
+#[test]
+fn teardown_warns_only_when_the_reap_failed() {
+    assert!(super::teardown_warning(true).is_none(), "a clean reap needs no warning");
+    let w = super::teardown_warning(false).expect("a failed reap must warn");
+    assert!(
+        w.contains("block"),
+        "the warning must say what is about to happen: {w:?}"
+    );
 }

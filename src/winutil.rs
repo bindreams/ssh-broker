@@ -99,10 +99,22 @@ pub fn win_error_from(e: &cosca::error::Error, context: &str) -> windows::core::
     // walk therefore never reaches the `io::Error` at all and silently reports a placeholder
     // for every failure, which is the same defect as hardcoding one. The wildcard is required:
     // `cosca::error::Error` is `#[non_exhaustive]`.
-    let hr = match e {
-        cosca::error::Error::Io(io) => io.raw_os_error().map(|c| windows::core::HRESULT::from_win32(c as u32)),
+    use cosca::error::Error as E;
+    let os = match e {
+        E::Io(io) => io.raw_os_error(),
+        // These carry the OS error only when the OS was actually asked something.
+        E::Unassessable { source: Some(io), .. } | E::IdentityRecord { source: Some(io), .. } => io.raw_os_error(),
         _ => None,
     };
+    let hr = os.map(|c| {
+        // A negative code is already an encoded HRESULT (an `io::Error` built from one), and
+        // widening it a second time would corrupt it; a positive code is a bare Win32 code.
+        if c < 0 {
+            windows::core::HRESULT(c)
+        } else {
+            windows::core::HRESULT::from_win32(c as u32)
+        }
+    });
     windows::core::Error::new(
         hr.unwrap_or(windows::Win32::Foundation::E_FAIL),
         format!("{context}: {e}"),

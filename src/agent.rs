@@ -116,39 +116,48 @@ fn handle_pty(
     // HPCON shared behind a mutex: the input thread resizes under the lock; teardown takes
     // it (→ None) and closes it under the lock, so resize can never touch a closed HPCON.
     let hpc_cell = Arc::new(Mutex::new(Some(session.take_hpc_raw())));
-    let code_cell = Arc::new(Mutex::new(0i32));
+    let tx_arc = Arc::new(Mutex::new(tx));
+    let job = session.job();
 
-    // Output pump (owns tx): ConPTY output → DATA(Pty); on EOF emit EXIT + shut down.
+    // Output pump: ConPTY output -> DATA(Pty). It deliberately does NOT emit EXIT.
+    // `read_handle` returns 0 for a read *error* as well as for EOF, so this thread cannot
+    // tell "the shell finished" from "the pipe broke" — emitting the code from here raced the
+    // waiter that produces it, and a failed session could report EXIT(0).
     let out_thread = {
-        let code_cell = Arc::clone(&code_cell);
-        let mut tx = tx;
+        let tx = Arc::clone(&tx_arc);
+        let job = Arc::clone(&job);
         std::thread::spawn(move || {
             let mut buf = [0u8; 32 * 1024];
             loop {
                 let n = conpty::read_handle(out_raw, &mut buf);
                 if n == 0 {
-                    break; // pseudoconsole closed (teardown) → drained to EOF
+                    break; // pseudoconsole closed (teardown) -> drained to EOF
                 }
-                if write_data(&mut tx, Stream::Pty, &buf[..n]).is_err() {
-                    break; // SSH side gone
+                let ok = {
+                    let mut g = tx.lock().unwrap();
+                    write_data(&mut *g, Stream::Pty, &buf[..n]).is_ok()
+                };
+                if !ok {
+                    reap_tree(&job); // the socket is gone; see `spawn_stream_pump`
+                    break;
                 }
             }
-            let code = *code_cell.lock().unwrap();
-            let _ = write_frame(&mut tx, FrameKind::Exit, &ExitCode(code).encode());
-            let _ = tx.shutdown_both(); // FIN + unblock the input pump's read
         })
     };
 
-    // Input pump: socket → ConPTY input + resize; on return, kill the child so the waiter
-    // unblocks even if the SSH side dropped first.
-    let job = session.job();
     let in_thread = {
         let hpc_cell = Arc::clone(&hpc_cell);
         let job = Arc::clone(&job);
         std::thread::spawn(move || {
-            let mut sink = PtyInputSink { in_raw, hpc_cell };
+            let mut sink = PtyInputSink {
+                writer: HandleWriter::spawn(in_raw, None),
+                hpc_cell,
+            };
             pump_until_peer_gone(&mut rx, &mut fr, &mut sink);
+            // Reap before dropping the sink: dropping joins the writer thread, which may be
+            // parked in a write that only a dead shell releases.
             reap_tree(&job);
+            drop(sink);
         })
     };
 
@@ -156,11 +165,10 @@ fn handle_pty(
     // down (close the HPCON, join the threads) before returning, or the threads would
     // outlive `session` and touch closed handles, and the (forgotten) HPCON would leak.
     let wait_result = session.wait();
-    // The shell is gone, so the session is over. Reaping now takes its descendants with it and
-    // closes the pipes, which is what lets the output pump below be joined at all.
-    warn_if_teardown_may_block(reap_tree(&job));
+    if let Some(w) = teardown_warning(reap_tree(&job)) {
+        tracing::error!("{w}");
+    }
     let code = *wait_result.as_ref().unwrap_or(&1);
-    *code_cell.lock().unwrap() = code;
     {
         // Close the pseudoconsole while HOLDING the lock, so a concurrent resize cannot
         // copy the raw HPCON out and then race this close (use-after-close).
@@ -170,6 +178,13 @@ fn handle_pty(
         }
     }
     let _ = out_thread.join();
+    {
+        // The shell is gone and the output is drained, so the code is final and nothing else
+        // can still be writing frames.
+        let mut g = tx_arc.lock().unwrap();
+        let _ = write_frame(&mut *g, FrameKind::Exit, &ExitCode(code).encode());
+        let _ = g.shutdown_both(); // FIN + unblock the input pump's read
+    }
     let _ = in_thread.join();
     // Threads joined; `session` now drops and closes the process/thread + pipe handles.
     wait_result?;
@@ -179,19 +194,15 @@ fn handle_pty(
 /// Routes decoded input frames into the pseudoconsole.
 #[cfg(windows)]
 struct PtyInputSink {
-    in_raw: isize,
+    writer: HandleWriter,
     hpc_cell: Arc<Mutex<Option<isize>>>,
 }
 
 #[cfg(windows)]
 impl FrameSink for PtyInputSink {
     fn on_data(&mut self, _stream: Stream, bytes: &[u8]) -> anyhow::Result<()> {
-        // PTY input arrives pre-encoded (win32-input-mode); write it straight to ConPTY#2.
-        anyhow::ensure!(
-            conpty::write_all_handle(self.in_raw, bytes),
-            "failed to write to the pseudoconsole input"
-        );
-        Ok(())
+        // PTY input arrives pre-encoded (win32-input-mode); hand it straight to ConPTY#2.
+        self.writer.write(bytes)
     }
     fn on_resize(&mut self, r: Resize) -> anyhow::Result<()> {
         // Hold the lock across the OS call (bound guard, not a temporary) so teardown
@@ -220,6 +231,7 @@ fn handle_exec(
     let out_raw = child.stdout_read_raw();
     let err_raw = child.stderr_read_raw();
     let stdin_owned = child.take_stdin_write();
+    let stdin_raw = stdin_owned.as_ref().map_or(0, |h| h.raw());
     // stdout, stderr, and the EXIT frame all share tx → serialize with a mutex.
     let tx_arc = Arc::new(Mutex::new(tx));
     let job = child.job();
@@ -236,17 +248,24 @@ fn handle_exec(
     let t_in = {
         let job = Arc::clone(&job);
         std::thread::spawn(move || {
-            let mut sink = ExecInputSink { stdin: stdin_owned };
+            let mut sink = ExecInputSink {
+                writer: HandleWriter::spawn(stdin_raw, stdin_owned),
+            };
             pump_until_peer_gone(&mut rx, &mut fr, &mut sink);
-            drop(sink); // close the child's stdin if the EOF marker never arrived
+            // Reap before dropping the sink: dropping joins the writer thread, which may be
+            // parked in a write that only a dead child releases. The drop then closes the
+            // child's stdin if the EOF marker never arrived.
             reap_tree(&job);
+            drop(sink);
         })
     };
 
     let wait_result = child.wait();
     // The command is gone, so the session is over. Reaping now takes its descendants with it
     // and closes the pipes, which is what lets the output pumps below be joined at all.
-    warn_if_teardown_may_block(reap_tree(&job));
+    if let Some(w) = teardown_warning(reap_tree(&job)) {
+        tracing::error!("{w}");
+    }
     let code = *wait_result.as_ref().unwrap_or(&1);
     let _ = t_out.join();
     let _ = t_err.join();
@@ -299,27 +318,103 @@ fn spawn_stream_pump(
 /// it can close it on the stdin-EOF marker (below) or when the pump thread ends.
 #[cfg(windows)]
 struct ExecInputSink {
-    stdin: Option<OwnedHandle>,
+    writer: HandleWriter,
 }
 
 #[cfg(windows)]
 impl FrameSink for ExecInputSink {
     fn on_data(&mut self, _stream: Stream, bytes: &[u8]) -> anyhow::Result<()> {
         if bytes.is_empty() {
-            // An empty DATA(Stdin) frame is the shim's stdin-EOF marker: close the child's
-            // stdin (→ readers like sort/findstr see EOF and finish) WITHOUT tearing down the
-            // connection, so stdout/stderr/EXIT still flow. A full socket close is the
-            // separate disconnect signal, handled by the pump thread (kill).
-            self.stdin = None;
-        } else if let Some(h) = &self.stdin {
-            anyhow::ensure!(
-                conpty::write_all_handle(h.raw(), bytes),
-                "failed to write to the exec child's stdin"
-            );
+            // The shim's stdin-EOF marker: close the child's stdin so a reader like
+            // sort/findstr finishes, WITHOUT tearing down the connection — stdout, stderr and
+            // EXIT still flow. A full socket close is the separate disconnect signal.
+            self.writer.close();
+            Ok(())
+        } else {
+            self.writer.write(bytes)
         }
-        Ok(())
     }
+
     // on_resize: default no-op (EXEC has no pseudoconsole).
+}
+
+/// Writes to a blocking handle from a thread of its own.
+///
+/// The frame reader must never park in a sink. `pump_decode` dispatches inline, and a pipe
+/// write blocks as soon as the pipe fills and the child stops reading it — so a reader parked
+/// there has stopped watching the socket, and a disconnect becomes invisible. If the command
+/// also produces no output, nothing is left that can notice, and the session hangs for the
+/// lifetime of the agent. Moving the write off this thread is what sshd gets from a select
+/// loop over non-blocking descriptors.
+///
+/// The queue is unbounded. Bounding it would reintroduce exactly the block it removes, and it
+/// would buy nothing: the peer is a user the socket ACL already admits, who can exhaust memory
+/// directly.
+#[cfg(windows)]
+struct HandleWriter {
+    tx: Option<std::sync::mpsc::Sender<Option<Vec<u8>>>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(windows)]
+impl HandleWriter {
+    /// `owned` is the handle to close on the stdin-EOF marker; the PTY path passes `None`
+    /// because the pseudoconsole's input handle belongs to the session.
+    fn spawn(raw: isize, owned: Option<OwnedHandle>) -> Self {
+        let (tx, rx) = std::sync::mpsc::channel::<Option<Vec<u8>>>();
+        let thread = std::thread::spawn(move || {
+            let _owned = owned; // dropped on the way out, closing the child's stdin
+            for msg in rx {
+                match msg {
+                    Some(bytes) if conpty::write_all_handle(raw, &bytes) => {}
+                    _ => break, // the write failed, or the peer signalled stdin-EOF
+                }
+            }
+        });
+        Self {
+            tx: Some(tx),
+            thread: Some(thread),
+        }
+    }
+
+    /// Queue bytes. Fails only once the writer thread has stopped, which is a genuine
+    /// [`crate::relay::PumpError::Sink`]: local, and no evidence about the peer.
+    fn write(&self, bytes: &[u8]) -> anyhow::Result<()> {
+        let Some(tx) = &self.tx else {
+            return Ok(()); // stdin already closed by the marker; further input is discarded
+        };
+        tx.send(Some(bytes.to_vec()))
+            .map_err(|_| anyhow::anyhow!("the handle writer stopped"))
+    }
+
+    /// Close the underlying handle without ending the session.
+    fn close(&mut self) {
+        if let Some(tx) = self.tx.take() {
+            let _ = tx.send(None);
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for HandleWriter {
+    fn drop(&mut self) {
+        self.tx = None; // end the channel so the thread finishes
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+/// The warning teardown owes an operator when a failed reap means the joins can block.
+///
+/// Pure so the decision is testable; the caller does the logging. Proceeding with the join is
+/// deliberate — detaching would let those threads read handles the session is about to close —
+/// but it must not be silent, or the agent looks wedged for no stated reason.
+#[cfg(windows)]
+fn teardown_warning(reaped: bool) -> Option<&'static str> {
+    (!reaped).then_some(
+        "the process tree survived teardown; joining the output pumps will block until whatever still holds the session's pipes exits",
+    )
 }
 
 /// Reap the child and everything it spawned. Idempotent.
@@ -342,22 +437,6 @@ fn reap_tree(job: &cosca::Job) -> bool {
             tracing::warn!("tearing down the process tree failed: {e}");
             false
         }
-    }
-}
-
-/// Log before a join that can only block if the reap failed.
-///
-/// Teardown joins the output pumps, which end when the tree's pipes close. If the reap failed
-/// those pipes may still be held, and the join blocks for as long as the survivor lives. Going
-/// ahead is deliberate — detaching the threads would let them read handles `session` is about
-/// to close — but it must not be silent, or the agent looks wedged for no stated reason.
-#[cfg(windows)]
-fn warn_if_teardown_may_block(reaped: bool) {
-    if !reaped {
-        tracing::error!(
-            "the process tree survived teardown; joining the output pumps will block until \
-             whatever still holds the session's pipes exits"
-        );
     }
 }
 
