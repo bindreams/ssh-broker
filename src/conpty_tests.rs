@@ -40,7 +40,7 @@ fn conpty_resize_on_live_session_succeeds() {
 
     session.resize(120, 40).expect("ResizePseudoConsole on a live session");
 
-    session.kill().unwrap();
+    session.job().kill_tree().unwrap();
     let _ = session.wait();
     session.close_pty();
     let _ = reader.join();

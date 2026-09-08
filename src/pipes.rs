@@ -11,7 +11,7 @@ use std::path::Path;
 use windows::Win32::Foundation::{HANDLE, HANDLE_FLAG_INHERIT, SetHandleInformation};
 use windows::Win32::System::Pipes::CreatePipe;
 use windows::Win32::System::Threading::{
-    CreateProcessW, EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess, INFINITE, PROCESS_INFORMATION,
+    CREATE_SUSPENDED, CreateProcessW, EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess, INFINITE, PROCESS_INFORMATION,
     STARTF_USESTDHANDLES, STARTUPINFOEXW, WaitForSingleObject,
 };
 use windows::core::{PCWSTR, PWSTR};
@@ -24,6 +24,10 @@ const PROC_THREAD_ATTRIBUTE_HANDLE_LIST: usize = 0x0002_0002;
 /// A child process with redirected stdin/stdout/stderr (the EXEC path).
 pub struct ExecChild {
     process: OwnedHandle,
+    /// Kernel-enforced containment for the command and everything it spawns. Teardown always
+    /// reaps the whole tree; a normal exit is no different from a disconnect here, for the
+    /// measured reason in `agent::reap_tree`.
+    job: std::sync::Arc<cosca::Job>,
     _thread: OwnedHandle,
     stdin_write: Option<OwnedHandle>,
     stdout_read: OwnedHandle,
@@ -79,6 +83,10 @@ impl ExecChild {
             });
             let cwd_ptr = cwd_wide.as_ref().map(|w| PCWSTR(w.as_ptr())).unwrap_or(PCWSTR::null());
 
+            // CREATE_SUSPENDED is required, not an optimisation: the command must be inside
+            // the job before it runs a single instruction, or anything it forks first escapes
+            // containment permanently. Sequence fixed by `cosca::Job`: create suspended,
+            // assign, and only then resume.
             let mut pi = PROCESS_INFORMATION::default();
             CreateProcessW(
                 PCWSTR::null(),
@@ -86,7 +94,7 @@ impl ExecChild {
                 None,
                 None,
                 true, // bInheritHandles — restricted to the 3 handles above
-                EXTENDED_STARTUPINFO_PRESENT,
+                EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED,
                 None,
                 cwd_ptr,
                 &si.StartupInfo,
@@ -99,9 +107,15 @@ impl ExecChild {
             drop(stdout_write);
             drop(stderr_write);
 
+            let process = OwnedHandle(pi.hProcess);
+            let thread = OwnedHandle(pi.hThread);
+
+            let job = crate::winutil::contain_and_resume(process.0, thread.0, "command")?;
+
             Ok(ExecChild {
-                process: OwnedHandle(pi.hProcess),
-                _thread: OwnedHandle(pi.hThread),
+                process,
+                _thread: thread,
+                job: std::sync::Arc::new(job),
                 stdin_write: Some(stdin_write),
                 stdout_read,
                 stderr_read,
@@ -118,16 +132,17 @@ impl ExecChild {
         self.stderr_read.raw()
     }
 
-    /// Raw child-process handle (`isize`) — for `TerminateProcess` from a relay thread.
-    pub fn process_raw(&self) -> isize {
-        self.process.raw()
-    }
-
     /// Take ownership of the stdin-write handle. The relay's stdin thread holds it and
     /// drops it (→ the child's stdin sees EOF) when the SSH side stops sending — so a
     /// reader like `sort`/`findstr` finishes instead of hanging.
     pub fn take_stdin_write(&mut self) -> Option<OwnedHandle> {
         self.stdin_write.take()
+    }
+
+    /// A share of the containment handle, for a relay thread that must tear the tree down
+    /// without owning the session.
+    pub fn job(&self) -> std::sync::Arc<cosca::Job> {
+        std::sync::Arc::clone(&self.job)
     }
 
     /// Block until the child exits and return its exit code (bit-preserving `u32`→`i32`).

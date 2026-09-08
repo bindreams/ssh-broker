@@ -389,3 +389,77 @@ fn a_broken_transport_is_reported_as_the_peer_going_away() {
     );
     assert!(err.peer_gone(), "a broken transport means the peer is gone");
 }
+
+// ── watching a peer you can no longer deliver to ─────────────────────────────────────────
+
+/// A reader that records reaching end-of-stream, so a test can prove a pump read *that far*
+/// rather than merely having returned.
+struct EofSpy<R> {
+    inner: R,
+    saw_eof: std::rc::Rc<std::cell::Cell<bool>>,
+}
+
+impl<R: std::io::Read> std::io::Read for EofSpy<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        if n == 0 {
+            self.saw_eof.set(true);
+        }
+        Ok(n)
+    }
+}
+
+/// A sink failure stops delivery, never watching.
+///
+/// The regression this pins: teardown was gated on the sink/peer distinction, but the pump
+/// still *returned* on a sink failure. That left nobody reading the transport, so the peer's
+/// later disconnect was never observed and the agent's waiter blocked forever on a command
+/// that never exits on its own — the failure the distinction exists to prevent, reintroduced
+/// one layer up.
+///
+/// The frames are pre-encoded into a buffer rather than sent over the duplex: the duplex is
+/// unbuffered, so a regression would block the writer and hang instead of failing. Reading a
+/// buffer to `Ok(0)` models the peer's disconnect just as well and reports the defect as a
+/// plain assertion.
+#[test]
+fn pump_until_peer_gone_keeps_watching_after_a_sink_failure() {
+    struct FailingSink {
+        calls: usize,
+    }
+    impl FrameSink for FailingSink {
+        fn on_data(&mut self, _stream: Stream, _bytes: &[u8]) -> anyhow::Result<()> {
+            self.calls += 1;
+            anyhow::bail!("the relayed command closed its own stdin")
+        }
+    }
+
+    let mut framed = Vec::new();
+    write_data(&mut framed, Stream::Stdin, b"breaks the sink").unwrap();
+    write_data(&mut framed, Stream::Stdin, b"arrives anyway").unwrap();
+
+    let saw_eof = std::rc::Rc::new(std::cell::Cell::new(false));
+    let mut spy = EofSpy {
+        inner: std::io::Cursor::new(framed),
+        saw_eof: std::rc::Rc::clone(&saw_eof),
+    };
+    let mut sink = FailingSink { calls: 0 };
+    pump_until_peer_gone(&mut spy, &mut FrameReader::new(), &mut sink);
+
+    assert!(
+        saw_eof.get(),
+        "the pump must keep reading to end-of-stream; stopping at the sink failure hides the disconnect"
+    );
+    assert_eq!(sink.calls, 1, "delivery must stop at the first sink failure");
+}
+
+/// The ordinary path is unchanged: a working sink receives every frame, and the pump returns
+/// at end-of-stream rather than after the first one.
+#[test]
+fn pump_until_peer_gone_delivers_every_frame_to_a_working_sink() {
+    let mut framed = Vec::new();
+    write_data(&mut framed, Stream::Stdout, b"one").unwrap();
+    write_data(&mut framed, Stream::Stdout, b"two").unwrap();
+    let mut sink = TestSink::default();
+    pump_until_peer_gone(&mut std::io::Cursor::new(framed), &mut FrameReader::new(), &mut sink);
+    assert_eq!(sink.stdout, b"onetwo");
+}

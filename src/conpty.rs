@@ -36,8 +36,8 @@ use windows::Win32::Storage::FileSystem::{ReadFile, WriteFile};
 use windows::Win32::System::Console::{COORD, ClosePseudoConsole, CreatePseudoConsole, HPCON, ResizePseudoConsole};
 use windows::Win32::System::Pipes::CreatePipe;
 use windows::Win32::System::Threading::{
-    CreateProcessW, EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess, INFINITE, PROCESS_INFORMATION,
-    STARTF_USESTDHANDLES, STARTUPINFOEXW, TerminateProcess, WaitForSingleObject,
+    CREATE_SUSPENDED, CreateProcessW, EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess, INFINITE, PROCESS_INFORMATION,
+    STARTF_USESTDHANDLES, STARTUPINFOEXW, WaitForSingleObject,
 };
 use windows::core::{PCWSTR, PWSTR};
 
@@ -148,6 +148,10 @@ pub fn close_pty_raw(hpc_raw: isize) {
 pub struct PtySession {
     hpc: Option<OwnedHpcon>,
     process: OwnedHandle,
+    /// Kernel-enforced containment for the shell and everything it spawns. Teardown always
+    /// reaps the whole tree; a normal exit is no different from a disconnect here, for the
+    /// measured reason in `agent::reap_tree`.
+    job: std::sync::Arc<cosca::Job>,
     _thread: OwnedHandle,
     in_write: OwnedHandle,
     out_read: OwnedHandle,
@@ -193,6 +197,10 @@ impl PtySession {
             });
             let cwd_ptr = cwd_wide.as_ref().map(|w| PCWSTR(w.as_ptr())).unwrap_or(PCWSTR::null());
 
+            // CREATE_SUSPENDED is required, not an optimisation: the shell must be inside the
+            // job before it runs a single instruction, or anything it forks first escapes
+            // containment permanently. Sequence fixed by `cosca::Job`: create suspended,
+            // assign, and only then resume.
             let mut pi = PROCESS_INFORMATION::default();
             CreateProcessW(
                 PCWSTR::null(),
@@ -200,7 +208,7 @@ impl PtySession {
                 None,
                 None,
                 false,
-                EXTENDED_STARTUPINFO_PRESENT,
+                EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED,
                 None,
                 cwd_ptr,
                 &si.StartupInfo,
@@ -209,10 +217,16 @@ impl PtySession {
             // `attr` drops here (DeleteProcThreadAttributeList) — the child is created.
             drop(attr);
 
+            let process = OwnedHandle(pi.hProcess);
+            let thread = OwnedHandle(pi.hThread);
+
+            let job = crate::winutil::contain_and_resume(process.0, thread.0, "shell")?;
+
             Ok(PtySession {
                 hpc: Some(hpc),
-                process: OwnedHandle(pi.hProcess),
-                _thread: OwnedHandle(pi.hThread),
+                process,
+                _thread: thread,
+                job: std::sync::Arc::new(job),
                 in_write,
                 out_read,
             })
@@ -227,12 +241,6 @@ impl PtySession {
     /// Raw input-write handle (as `isize`) for forwarding decoded input.
     pub fn in_write_raw(&self) -> isize {
         self.in_write.0.0 as isize
-    }
-
-    /// Raw child-process handle (as `isize`) — e.g. for `TerminateProcess` from a relay
-    /// thread on mid-session teardown.
-    pub fn process_raw(&self) -> isize {
-        self.process.0.0 as isize
     }
 
     /// Hand the pseudoconsole's raw handle to the caller, who then owns closing it (via
@@ -268,9 +276,10 @@ impl PtySession {
         }
     }
 
-    /// Force-terminate the child (mid-session teardown when the SSH side drops).
-    pub fn kill(&self) -> windows::core::Result<()> {
-        unsafe { TerminateProcess(self.process.0, 1) }
+    /// A share of the containment handle, for a relay thread that must tear the tree down
+    /// without owning the session.
+    pub fn job(&self) -> std::sync::Arc<cosca::Job> {
+        std::sync::Arc::clone(&self.job)
     }
 
     /// Close the pseudoconsole. This makes the output pipe deliver its buffered tail and
