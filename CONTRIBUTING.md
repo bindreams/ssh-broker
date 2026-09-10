@@ -6,7 +6,8 @@ negotiable.
 
 ## Architecture
 
-One binary, four entry points, selected by argv ([`src/route.rs`](src/route.rs)). The shim is
+One binary, four entry points plus a hidden `verify-probe` child, selected by argv
+([`src/route.rs`](src/route.rs)). The shim is
 the *default* action because `DefaultShell` is a bare path and cannot carry a subcommand: a
 known verb in first position selects a subcommand, anything else is the shim.
 
@@ -15,10 +16,12 @@ known verb in first position selects a subcommand, anything else is the shim.
 | *(none)* or `-c "cmd"` | `shim`, `shim_pty` | the SSH session, as sshd's `DefaultShell` |
 | `agent` | `agent` | the interactive session, started by a logon task |
 | `apply` / `verify` | `provision` | wherever an admin runs it |
+| `verify-probe` | `provision` | internal: the child `verify` spawns to measure parity |
 
 Supporting modules: `protocol` (frame codec and handshake), `relay` (transport-agnostic
 pumping), `afunix` + `acl` (the socket and its security boundary), `conpty` (the pseudoconsole
-host), `pipes` (the redirected-pipe EXEC child), `vtinput` (Win32 input records → VT).
+host), `pipes` (the redirected-pipe EXEC child), `vtinput` (Win32 input records → VT),
+`winutil` (Windows RAII guards, job containment, cosca→Win32 error conversion).
 
 The functionality lives in the library rather than the binary so it is reachable from tests on
 every host platform; `main.rs` is a thin dispatcher.
@@ -65,16 +68,18 @@ uv tool install prek && prek install
 ```
 
 `prek run --all-files` also runs in CI, so the hooks gate everyone, not just people who
-installed them. Their patterns are themselves tested by
-`scripts/prek_patterns_test.py` — a hook that cannot fire is worse than no hook, and two
-earlier versions of these shipped exactly that.
+installed them. Their regexes — and the `types`/`exclude` filters that decide what those
+regexes ever see — are pinned by `scripts/prek_patterns_test.py`. A hook that cannot fire is
+worse than no hook, and two earlier versions of these shipped exactly that; one of them was
+inert because of its filters rather than its pattern.
 
 Note that `prek run --all-files` only scans **git-tracked** files. An untracked probe passes
 vacuously, which is a convincing way to believe a broken hook works.
 
 ## Invariants
 
-Each is enforced by a hook, a lint, or a test — not by good intentions.
+Most are enforced by a hook, a lint, or a test rather than by good intentions. Two are not,
+and say so below; they rest on review.
 
 **No sleeping as synchronization.** A sleep is a bet that some duration is long enough, and
 that bet loses on a loaded runner. Teardown ordering uses real primitives: waking a parked
@@ -83,11 +88,11 @@ Waiting on a genuinely external event is fine and uses an unbounded wait; a wait
 numeric bound is not. A long-lived sentinel in a fixture opts out with a same-line
 `sleep-ok:` marker **and a reason** — a bare marker does not suppress.
 
-**No arbitrary retry or loop caps.** Retrying a specific, self-clearing condition is fine —
+**No arbitrary retry or loop caps** *(review-enforced)*. Retrying a specific, self-clearing condition is fine —
 `ErrorKind::Interrupted` is retried in place, because `Read::read` documents it as
 non-fatal. Inventing a maximum attempt count is not.
 
-**Tests fail loudly.** Nothing skips on a missing dependency. A test that needs an environment
+**Tests fail loudly** *(review-enforced)*. Nothing skips on a missing dependency. A test that needs an environment
 CI cannot provide is excluded by an explicit label the runner is told about, never by a runtime
 early return.
 

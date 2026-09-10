@@ -91,6 +91,18 @@ CASES: dict[str, tuple[list[str], list[str]]] = {
 }
 
 
+# A pattern only ever sees the files its filters let through, so the filters are as
+# load-bearing as the regex — and both hooks that shipped inert were inert because of a filter.
+# Widening `tests-in-separate-files`'s exclude to `\.rs$` silences it entirely; dropping the
+# exclude blocks every legitimate `_tests.rs` file. The other two deliberately have NO filters,
+# and prek.toml says why in both places.
+FILTERS: dict[str, dict[str, object]] = {
+    "no-sleep-sync": {"types": None, "exclude": None},
+    "no-hardcoded-user-paths": {"types": None, "exclude": None},
+    "tests-in-separate-files": {"types": ["rust"], "exclude": r"_tests\.rs$"},
+}
+
+
 def main() -> int:
     root = Path(__file__).resolve().parent.parent
     config = tomllib.loads((root / "prek.toml").read_text(encoding="utf-8"))
@@ -101,6 +113,12 @@ def main() -> int:
         if hook_id not in hooks:
             failures.append(f"{hook_id}: no such hook in prek.toml")
             continue
+        # An emptied list would otherwise pass in silence, which is the failure this file exists
+        # to prevent: a check that reports success while testing nothing.
+        if not must:
+            failures.append(f"{hook_id}: no positive cases — the pattern is unpinned")
+        if not must_not:
+            failures.append(f"{hook_id}: no negative cases — nothing stops it matching everything")
         pattern = re.compile(hooks[hook_id]["entry"])
         for line in must:
             if not pattern.search(line):
@@ -109,9 +127,24 @@ def main() -> int:
             if pattern.search(line):
                 failures.append(f"{hook_id}: should NOT have matched but did:\n    {line}")
 
+    for hook_id, expected in FILTERS.items():
+        hook = hooks.get(hook_id)
+        if hook is None:
+            continue  # already reported above
+        for key, want in expected.items():
+            got = hook.get(key)
+            if got != want:
+                failures.append(
+                    f"{hook_id}: {key} is {got!r}, expected {want!r} — "
+                    f"a filter change can make the hook inert without touching its pattern"
+                )
+
     untested = set(hooks) - set(CASES) - {"cargo-fmt", "cargo-clippy"}
     for hook_id in sorted(untested):
         failures.append(f"{hook_id}: pygrep hook has no cases in this file")
+    unfiltered = set(hooks) - set(FILTERS) - {"cargo-fmt", "cargo-clippy"}
+    for hook_id in sorted(unfiltered):
+        failures.append(f"{hook_id}: pygrep hook has no filter expectations in this file")
 
     if failures:
         print("prek pattern check FAILED:\n", file=sys.stderr)
@@ -120,7 +153,7 @@ def main() -> int:
         return 1
 
     total = sum(len(m) + len(n) for m, n in CASES.values())
-    print(f"prek pattern check passed: {len(CASES)} patterns, {total} cases")
+    print(f"prek pattern check passed: {len(CASES)} patterns, {total} cases, {len(FILTERS)} filter sets")
     return 0
 
 
