@@ -125,12 +125,42 @@ pub fn is_transfer_command(cmd: &str) -> bool {
     };
     match program_basename(prog).as_str() {
         "sftp-server" | "internal-sftp" => true,
-        // The rcp protocol always emits `scp <opts> -t <path>` / `-f <path>` with the flag
-        // immediately before the single trailing path operand (never combined like `-rt`).
-        // Require that position so a legitimate `scp … -t …`-to-a-third-host is not misrouted.
-        "scp" => tokens.len() >= 2 && matches!(tokens[tokens.len() - 2].as_str(), "-t" | "-f"),
+        // scp's rcp mode is announced by a `-t` (to) or `-f` (from) flag, but its POSITION is
+        // not dependable. Measured against an OpenSSH 10.3 client: a remote path containing a
+        // space is sent unquoted (`scp -t /my dir/`), and one beginning with a dash is sent
+        // after an end-of-options marker (`scp -t -- -dst`). Requiring the flag immediately
+        // before the last token missed both — and a path with a space is the ordinary case on
+        // Windows — so a real transfer was relayed through the agent, corrupting the binary
+        // stdio this detection exists to protect. Neither flag is user-facing in scp's own
+        // CLI, so scanning for one cannot misfire on an ordinary `scp a host2:b`.
+        "scp" => scp_is_rcp_mode(&tokens[1..]),
         _ => false,
     }
+}
+
+/// Whether an `scp` argument list is the rcp-protocol mode sshd is being asked to run.
+///
+/// Scans rather than checking a fixed position, and skips the two things that would make a
+/// scan wrong:
+///
+/// * a value-taking option's argument, so `scp -i -t key host:/p` (an identity file named
+///   `-t`) is still an ordinary client invocation, not a transfer;
+/// * everything after `--`, since operands follow it and a *path* may legitimately be named
+///   `-t`.
+fn scp_is_rcp_mode(args: &[String]) -> bool {
+    // scp's own value-taking short options; anything immediately after one is its argument.
+    const TAKES_VALUE: &[&str] = &["-c", "-F", "-i", "-J", "-l", "-o", "-P", "-S", "-X"];
+    let mut prev_takes_value = false;
+    for a in args {
+        if a == "--" {
+            return false; // only operands from here on
+        }
+        if !prev_takes_value && (a == "-t" || a == "-f") {
+            return true;
+        }
+        prev_takes_value = TAKES_VALUE.contains(&a.as_str());
+    }
+    false
 }
 
 /// Split a command line into argv the way Windows itself would.
@@ -141,6 +171,7 @@ pub fn is_transfer_command(cmd: &str) -> bool {
 /// wrong. That scan documented itself as "not a full `CommandLineToArgvW` (no backslash-escaping
 /// of quotes)", and the divergence is real: for `scp -t "C:\dir\""` the old scan yielded a final
 /// token of `C:\dir\`, where Windows reads the `\"` as an escaped quote and yields `C:\dir"`.
+/// That is measured, not reasoned: see `split_command_round_trips_utf16_through_the_splitter`.
 ///
 /// Note the divergence is in argv[1..], not argv[0]: `CommandLineToArgvW` parses the program
 /// name by a different rule that does no backslash-escaping, so a quoted leading path happens
@@ -150,14 +181,15 @@ pub fn is_transfer_command(cmd: &str) -> bool {
 /// Pure UTF-16 logic, so it runs and is tested on any host, not just Windows.
 pub(crate) fn split_command(cmd: &str) -> Vec<String> {
     let wide: Vec<u16> = cmd.encode_utf16().collect();
-    // A split failure must not read as "no tokens": that would make `is_transfer_command`
-    // answer false and relay an sftp transfer through the agent, which is the hang this
-    // detection exists to avoid. Report it and let the caller decide.
     match cosca::quote::windows::split_wide(&wide) {
         Ok(tokens) => tokens.iter().map(|t| String::from_utf16_lossy(t)).collect(),
+        // `split_wide` has no failure path today — it returns `Result` for API shape, and
+        // every `return` inside it is `Ok`. This arm is handled rather than unwrapped because
+        // a panic here would cost the user their session, which is the one thing the shim must
+        // never do. No tokens means no match, so the command takes the ordinary relay path.
         Err(e) => {
-            tracing::warn!("could not tokenize the exec command ({e}); treating it as unsplittable");
-            vec![cmd.to_string()]
+            tracing::warn!("could not tokenize the exec command ({e}); relaying it unclassified");
+            Vec::new()
         }
     }
 }

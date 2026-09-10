@@ -122,6 +122,13 @@ fn detects_sftp_and_scp_transfers() {
     // The rcp protocol's -t/-f immediately before the trailing path.
     assert!(is_transfer_command("scp -t /tmp/x"));
     assert!(is_transfer_command("scp -p -f /tmp/x"));
+    // Both shapes below are what an OpenSSH 10.3 client actually sends, measured rather than
+    // assumed, and both were missed while the flag had to sit immediately before the last
+    // token. A remote path containing a space is the ordinary case on Windows.
+    assert!(is_transfer_command("scp -t /my dir/"), "an unquoted path with a space");
+    assert!(is_transfer_command("scp -t -- -dst"), "a path starting with a dash");
+    assert!(is_transfer_command("scp -f -- -src"), "the fetch direction");
+    assert!(is_transfer_command("scp -r -p -t /my dir/with spaces/"));
 }
 
 #[test]
@@ -130,7 +137,9 @@ fn does_not_misdetect_normal_commands() {
     // local transfer.
     assert!(!is_transfer_command("scp file other-host:/path"));
     // A -t/-f NOT in the rcp protocol's trailing-path position must NOT be misdetected.
-    assert!(!is_transfer_command("scp -i -t file host:/p"));
+    assert!(!is_transfer_command("scp -i -t file host:/p")); // `-t` is `-i`'s argument
+    assert!(!is_transfer_command("scp -- -t host:/p")); // `-t` is an operand, not a flag
+    assert!(!is_transfer_command("scp -o -f a host:/p")); // `-f` is `-o`'s argument
     assert!(!is_transfer_command("pwsh -c Get-ChildItem"));
     assert!(!is_transfer_command("git status"));
     assert!(!is_transfer_command("sftp-something-else.exe")); // not sftp-server
@@ -360,6 +369,36 @@ fn sniffer_focus_independent_of_mouse_flags() {
 #[test]
 fn split_command_round_trips_utf16_through_the_splitter() {
     assert_eq!(split_command(r#"prog "a b" c"#), vec!["prog", "a b", "c"]);
+    // Not a re-test of cosca's differential suite (see above) — these pin the specific
+    // divergences this module's routing depends on, so a splitter swap that reintroduced the
+    // old scan's behaviour fails here instead of silently misrouting. Every expectation below
+    // was measured against the splitter, not reasoned out.
+    //
+    // A backslash run is only special immediately before a quote; elsewhere it stays literal.
+    assert_eq!(
+        split_command(r#"p "a\\b""#),
+        vec!["p", r"a\\b"],
+        "not before a quote: literal"
+    );
+    assert_eq!(split_command(r##"p "a\"b""##), vec!["p", r#"a"b"#], "an escaped quote");
+    // argv[0] is parsed by a DIFFERENT rule: no backslash-escaping at all.
+    assert_eq!(
+        split_command(r#"a\\b c"#),
+        vec![r"a\\b", "c"],
+        "argv[0] is never unescaped"
+    );
+    // shell32's mod-3 rule for a run of bare quotes inside a quoted region.
+    assert_eq!(
+        split_command(r##"p "a""""##),
+        vec!["p", r#"a""#],
+        "three quotes yield one"
+    );
+    // The exact divergence documented on `split_command`: the old scan produced `C:\dir\`.
+    assert_eq!(
+        split_command(r##"scp -t "C:\dir\"""##),
+        vec!["scp", "-t", r#"C:\dir""#],
+        "an escaped quote inside a path operand"
+    );
     // Non-ASCII survives the &str -> UTF-16 -> String round trip intact.
     assert_eq!(
         split_command("prog \u{e9}t\u{e9} \u{1f600}"),
