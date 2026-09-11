@@ -39,7 +39,8 @@ to bind.
 ### Fail-open is deliberate, and only here
 
 If the shim cannot reach the agent it runs a local shell and reports why. A broken broker must
-not cost you access to the machine. This is the only place the *relay path* prefers degraded
+not cost you access to the machine. The local shell is `pwsh`, so this inherits the project's
+PowerShell Core requirement. This is the only place the *relay path* prefers degraded
 service to failure, and the security boundary never does — the ACL check above and the bind
 both fail closed. Provisioning has best-effort steps of its own, each marked where it occurs.
 
@@ -92,7 +93,10 @@ Waiting on a genuinely external event is fine and uses an unbounded wait; a wait
 numeric bound is not. A long-lived sentinel in a fixture opts out with a same-line
 `sleep-ok:` marker **and a reason** — a bare marker does not suppress.
 
-**No arbitrary retry or loop caps** *(review-enforced)*. Retrying a specific, self-clearing condition is fine —
+**No arbitrary retry or loop caps in this crate's own code** *(review-enforced)*. One declarative
+exception is documented where it occurs: the agent task's `RestartOnFailure` carries a Windows
+Task Scheduler `Count`, which the schema requires and which cannot be expressed as unbounded.
+Retrying a specific, self-clearing condition is fine —
 `ErrorKind::Interrupted` is retried in place, because `Read::read` documents it as
 non-fatal. Inventing a maximum attempt count is not.
 
@@ -101,7 +105,8 @@ CI cannot provide is excluded by an explicit label the runner is told about, nev
 early return.
 
 **Unit tests live beside their module** as `foo_tests.rs`, linked with `#[path]`, never as an
-inline `#[cfg(test)] mod`. Inline modules hide host-testable logic inside files that are
+inline `#[cfg(test)] mod`. The hook catches the inline form; that the sibling is actually wired
+up with `#[path]` is *(review-enforced)*. Inline modules hide host-testable logic inside files that are
 otherwise platform-gated — which is how `child_cwd`'s tests once became unreachable from the
 macOS build.
 

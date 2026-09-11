@@ -23,17 +23,21 @@ ssh client ──▶ sshd ──▶ shim (DefaultShell) ──▶ AF_UNIX ──
                                                         shell in a pseudoconsole
 ```
 
-The **shim** is installed as sshd's `DefaultShell`, so every SSH session runs it instead of a shell. It forwards keystrokes, window resizes and mouse events to the **agent**, which lives in the interactive session and hosts the real shell inside a pseudoconsole. Output comes back the same way.
+The **shim** is installed as sshd's `DefaultShell`, so every SSH session runs it instead of a shell. It forwards keystrokes, window resizes and mouse events to the **agent**, which lives in the interactive session and hosts the real shell — in a pseudoconsole for an interactive session, on redirected pipes for `ssh host "cmd"`. Output comes back the same way.
 
 Because the shell is a child of the agent rather than of `sshd`, it inherits neither the network logon nor the RedirectionGuard mitigation. DPAPI works and the profile is loaded — both checked by `verify` — and symlink traversal follows from the same lineage, without disabling a security mitigation or storing a password anywhere.
 
 The two halves talk over an AF_UNIX socket whose directory grants Full Control to the agent's account, SYSTEM and Administrators and to nobody else — verified fail-closed on every bind.
 
+## Requirements
+
+**PowerShell Core (`pwsh`) must be installed.** It is the shell the agent hosts by default, and the one the shim falls back to when the agent is unreachable — stock Windows ships `powershell.exe` 5.1, which is a different binary. Without `pwsh` on `PATH`, neither path works.
+
 ## Limits worth knowing before you install it
 
 - **A user with no interactive session gets a plain passthrough shell.** No design can conjure an interactive session without that user's credentials; this relays into one that already exists. If nobody is logged in at the console or over RDP, there is nothing to relay into.
 - **Your session's background processes die with it.** When the session ends, everything it spawned is terminated — including a process that redirected its output to a file and never touched the session's pipes. There is no `nohup` equivalent here. This matches what stock Windows OpenSSH does; it is the opposite of Unix, where the session waits for pipe EOF.
-- **The shim fails open, provided PowerShell Core is installed.** If the agent is unreachable it runs a local shell and says why, rather than locking you out of the machine. The fallback currently launches `pwsh` unconditionally — which stock Windows does not ship — so on a host without PowerShell Core the fallback itself fails. The reason goes to stderr for `ssh host cmd`; for an interactive session it goes to the log under `C:\ProgramData\ssh-broker\logs`, because writing to stderr there would corrupt the terminal stream.
+- **The shim fails open.** If the agent is unreachable it runs a local shell and says why, rather than locking you out of the machine. That is deliberate: a broken broker must never cost you SSH access. The reason goes to stderr for `ssh host cmd`; for an interactive session it goes to the log under `C:\ProgramData\ssh-broker\logs`, because writing to stderr there would corrupt the terminal stream. The fallback launches `pwsh`, so it inherits the requirement above.
 - **File transfers bypass the relay.** `sftp` and `scp` need raw binary stdio and gain nothing from session parity, so the shim runs them locally.
 
 ## Status
