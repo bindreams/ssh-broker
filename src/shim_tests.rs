@@ -119,7 +119,7 @@ fn detects_sftp_and_scp_transfers() {
     assert!(is_transfer_command(
         r#""C:\Program Files\OpenSSH\sftp-server.exe" -l ERROR"#
     ));
-    // The rcp protocol's -t/-f immediately before the trailing path.
+    // The rcp protocol's `-t`/`-f`, wherever it falls in the argument list.
     assert!(is_transfer_command("scp -t /tmp/x"));
     assert!(is_transfer_command("scp -p -f /tmp/x"));
     // Both shapes below are what an OpenSSH 10.3 client actually sends, measured rather than
@@ -154,6 +154,17 @@ fn does_not_misdetect_normal_commands() {
     assert!(!is_transfer_command("scp -- -t host:/p")); // `-t` is an operand, not a flag
     assert!(!is_transfer_command("scp -i -t file host:/p")); // `-t` is `-i`'s argument
     assert!(!is_transfer_command("scp -o -f a host:/p")); // `-f` is `-o`'s argument
+    assert!(!is_transfer_command("scp -if /tmp/x")); // `f` clustered behind a value-taking `-i`
+
+    // `ssh host " "` is a genuine exec request; only `ssh host ""` degrades to interactive.
+    // Folding it to `None` handed the caller an interactive REPL on the SSH channel.
+    assert_eq!(super::normalize_exec(Some("  cmd  ".into())), Some("cmd".into()));
+    assert_eq!(
+        super::normalize_exec(Some(" ".into())),
+        Some(String::new()),
+        "stays an exec"
+    );
+    assert_eq!(super::normalize_exec(None), None);
     assert!(!is_transfer_command("pwsh -c Get-ChildItem"));
     assert!(!is_transfer_command("git status"));
     assert!(!is_transfer_command("sftp-something-else.exe")); // not sftp-server

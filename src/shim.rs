@@ -13,9 +13,7 @@ pub fn run(exec: Option<String>) -> anyhow::Result<()> {
     // Trim once, here, so the string that is CLASSIFIED is the string that is EXECUTED.
     // Trimming inside the classifier alone would let a command be judged in one form and run
     // in another.
-    // An all-whitespace command trims to nothing, which is not a command: fold it to `None`
-    // so it takes the interactive path rather than asking a shell to run the empty string.
-    let exec = exec.map(|c| c.trim().to_string()).filter(|c| !c.is_empty());
+    let exec = normalize_exec(exec);
     #[cfg(windows)]
     return crate::shim_pty::run_on(exec);
 
@@ -24,6 +22,18 @@ pub fn run(exec: Option<String>) -> anyhow::Result<()> {
         let _ = exec;
         anyhow::bail!("the shim relays the session-1 console and runs only on Windows")
     }
+}
+
+/// Trim the command sshd handed us, so the string that is CLASSIFIED is the string that is
+/// EXECUTED. Trimming inside the classifier alone would let a command be judged in one form and
+/// run in another.
+///
+/// A whitespace-only command stays `Some` and empty. `ssh host " "` is a genuine exec request —
+/// measured against a stock client, only `ssh host ""` degrades to an interactive session — and
+/// mapping it to `None` would route it to the interactive path, handing the caller a shell REPL
+/// on the SSH channel instead of running its no-op.
+pub(crate) fn normalize_exec(exec: Option<String>) -> Option<String> {
+    exec.map(|c| c.trim().to_string())
 }
 
 // ── EXEC relay ───────────────────────────────────────────────────────────────────────
@@ -163,17 +173,40 @@ pub fn is_transfer_command(cmd: &str) -> bool {
 /// ordinary command to the local passthrough, which spawns outside the session's job object and
 /// resolves `PATH` in session 0.
 fn scp_is_rcp_mode(args: &[String]) -> bool {
-    // Exactly these tokens consume the one after them. An attached or clustered form is not
-    // included: it is unreachable from a real client, and guessing at it is what broke before.
+    // Exactly these tokens consume the one after them. An attached form (`-oFoo=no`, `-l100`)
+    // carries its own value, which is why matching on a token's last character was wrong and
+    // ate the `-t` in `-oStrictHostKeyChecking=no -t /p`.
     const TAKES_NEXT: &[&str] = &["-c", "-D", "-F", "-i", "-J", "-l", "-o", "-P", "-S", "-X"];
     let mut prev_takes_next = false;
     for a in args.iter().take_while(|a| *a != "--") {
-        if !prev_takes_next && (a == "-t" || a == "-f") {
+        if !prev_takes_next && is_rcp_flag(a) {
             return true;
         }
         prev_takes_next = TAKES_NEXT.contains(&a.as_str());
     }
     false
+}
+
+/// Whether a token is the rcp mode flag, possibly clustered behind the protocol's own
+/// no-value flags.
+///
+/// The cluster is not hypothetical: libssh2 builds its remote command from `"scp -%sf "` and
+/// `"scp -%st "`, so it emits `scp -pf <path>` whenever the caller passes the stat out-param —
+/// which is how a caller learns the file size, so every libssh2 download takes that form.
+/// curl's `scp://`, the Rust `ssh2` crate and PHP's ssh2 extension all reach it.
+///
+/// Only `d`/`p`/`r`/`v` may precede the flag: those are the no-value flags the rcp protocol
+/// itself carries. A cluster ending in a value-taking letter (`-ri`, where the next token is
+/// `-i`'s value) is deliberately not distinguished — no measured client emits one.
+fn is_rcp_flag(a: &str) -> bool {
+    let Some(rest) = a.strip_prefix('-') else {
+        return false;
+    };
+    let mut cs: Vec<char> = rest.chars().collect();
+    let Some(last) = cs.pop() else {
+        return false;
+    };
+    matches!(last, 't' | 'f') && cs.iter().all(|c| matches!(c, 'd' | 'p' | 'r' | 'v'))
 }
 
 /// Split a command line into argv the way Windows itself would.
