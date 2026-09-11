@@ -40,9 +40,10 @@ to bind.
 
 If the shim cannot reach the agent it runs a local shell and reports why. A broken broker must
 not cost you access to the machine. The local shell is `pwsh`, so this inherits the project's
-PowerShell Core requirement. This is the only place the *relay path* prefers degraded
-service to failure, and the security boundary never does — the ACL check above and the bind
-both fail closed. Provisioning has best-effort steps of its own, each marked where it occurs.
+PowerShell Core requirement. This is the relay path's deliberate degradation, and the security boundary never degrades — the
+ACL check above and the bind both fail closed. Elsewhere the shim also prefers working over
+failing in smaller ways (logging disables itself rather than aborting, for one), and
+provisioning has best-effort steps of its own.
 
 ## Building and testing
 
@@ -83,8 +84,8 @@ vacuously, which is a convincing way to believe a broken hook works.
 
 ## Invariants
 
-Most are enforced by a hook or a test rather than by good intentions. The ones marked below
-rest on review instead. No lint enforces any of them: `clippy.toml` is deliberately empty.
+Most are enforced by a prek hook rather than by good intentions. The ones marked below rest on
+review instead. No lint enforces any of them: `clippy.toml` is deliberately empty.
 
 **No sleeping as synchronization.** A sleep is a bet that some duration is long enough, and
 that bet loses on a loaded runner. Teardown ordering uses real primitives: waking a parked

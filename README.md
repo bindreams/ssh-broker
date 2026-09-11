@@ -6,7 +6,7 @@ Give a Windows SSH session the environment of a session you'd get by sitting at 
 
 Log in over SSH with a key on Windows and you get a **network logon in session 0**. It authenticates you correctly, and then three things quietly do not work:
 
-- **DPAPI fails.** A key-authenticated logon carries no credential material, so there is no master key behind it. Anything that decrypts stored secrets gets `ERROR_NO_SUCH_LOGON_SESSION`.
+- **DPAPI fails for user-scope secrets.** A key-authenticated logon carries no credential material, so there is no user master key behind it, and `CryptUnprotectData` gets `ERROR_NO_SUCH_LOGON_SESSION`. Machine-scope blobs still work.
 - **Your profile isn't loaded**, so environment and per-user state are not what your desktop session has.
 - **Symlinks stop resolving.** The shell Windows OpenSSH spawns runs under the RedirectionGuard process mitigation, so traversing a reparse point created by a non-admin fails with `STATUS_UNTRUSTED_MOUNT_POINT`. In practice: every WinGet shim in `AppData\Local\Microsoft\WinGet\Links` — `fnm`, `uv`, `bun` — fails to launch.
 
@@ -25,13 +25,13 @@ ssh client ──▶ sshd ──▶ shim (DefaultShell) ──▶ AF_UNIX ──
 
 The **shim** is installed as sshd's `DefaultShell`, so every SSH session runs it instead of a shell. It forwards keystrokes, window resizes and mouse events to the **agent**, which lives in the interactive session and hosts the real shell — in a pseudoconsole for an interactive session, on redirected pipes for `ssh host "cmd"`. Output comes back the same way.
 
-Because the shell is a child of the agent rather than of `sshd`, it inherits neither the network logon nor the RedirectionGuard mitigation. DPAPI works and the profile is loaded — both checked by `verify` — and symlink traversal follows from the same lineage, without disabling a security mitigation or storing a password anywhere.
+Because the shell is a child of the agent rather than of `sshd`, it inherits neither the network logon nor the RedirectionGuard mitigation. DPAPI works, the profile is loaded, and symlinks resolve — without disabling a security mitigation or storing a password anywhere. `verify` checks the session id, DPAPI and symlink traversal; the profile follows from the interactive logon rather than being probed separately.
 
 The two halves talk over an AF_UNIX socket whose directory grants Full Control to the agent's account, SYSTEM and Administrators and to nobody else — verified fail-closed on every bind.
 
 ## Requirements
 
-**PowerShell Core (`pwsh`) must be installed.** It is the shell the agent hosts by default, and the one the shim falls back to when the agent is unreachable — stock Windows ships `powershell.exe` 5.1, which is a different binary. Without `pwsh` on `PATH`, neither path works.
+**PowerShell Core (`pwsh`) must be installed.** Stock Windows ships `powershell.exe` 5.1, which is a different binary. `pwsh` is what the agent hosts for an interactive session when no shell is configured, and what the shim falls back to when the agent is unreachable; `ssh host "cmd"` runs the command you name and is unaffected. The Windows test suite also assumes it.
 
 ## Limits worth knowing before you install it
 
