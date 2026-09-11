@@ -129,6 +129,19 @@ fn detects_sftp_and_scp_transfers() {
     assert!(is_transfer_command("scp -t -- -dst"), "a path starting with a dash");
     assert!(is_transfer_command("scp -f -- -src"), "the fetch direction");
     assert!(is_transfer_command("scp -r -p -t /my dir/with spaces/"));
+    // Windows separates arguments on space and tab only, so a stray CR/LF stays glued to the
+    // program name; the scan this replaced split on any whitespace and caught these.
+    assert!(
+        is_transfer_command("sftp-server.exe\r"),
+        "a trailing CR must not hide a transfer"
+    );
+    assert!(is_transfer_command("\nsftp-server.exe"), "nor a leading LF");
+    // Detection is deliberately greedy: any `-t`/`-f` before `--` counts. A rule that tried to
+    // skip a value-taking option's argument could not tell `-ri` (a cluster) from `-oFoo=no`
+    // (an attached value), and ate the `-t` in the latter.
+    assert!(is_transfer_command("scp -oStrictHostKeyChecking=no -t /p"));
+    assert!(is_transfer_command("scp -ri -t /p"));
+    assert!(is_transfer_command("scp -i key -t /p"));
 }
 
 #[test]
@@ -136,25 +149,9 @@ fn does_not_misdetect_normal_commands() {
     // A user running scp on the remote host to a THIRD host wants session-1 parity, not a
     // local transfer.
     assert!(!is_transfer_command("scp file other-host:/path"));
-    // Windows separates arguments on space and tab only, so a stray CR/LF stays glued to the
-    // program name. The scan this replaced split on any whitespace and caught these; without
-    // the trim in `is_transfer_command` they silently stop being detected and get relayed.
-    assert!(
-        is_transfer_command("sftp-server.exe\r"),
-        "a trailing CR must not hide a transfer"
-    );
-    assert!(is_transfer_command("\nsftp-server.exe"), "nor a leading LF");
-    assert!(
-        is_transfer_command("scp -oFoo=bar -t /p"),
-        "an attached value consumes no token"
-    );
 
     // A `-t`/`-f` that is an option's argument, or an operand, must NOT be misdetected.
-    assert!(!is_transfer_command("scp -i -t file host:/p")); // `-t` is `-i`'s argument
     assert!(!is_transfer_command("scp -- -t host:/p")); // `-t` is an operand, not a flag
-    assert!(!is_transfer_command("scp -o -f a host:/p")); // `-f` is `-o`'s argument
-    assert!(!is_transfer_command("scp -D -t host:/p")); // `-t` is `-D`'s argument
-    assert!(!is_transfer_command("scp -ri -t key host:/p")); // clustered: `-t` is `-i`'s
     assert!(!is_transfer_command("pwsh -c Get-ChildItem"));
     assert!(!is_transfer_command("git status"));
     assert!(!is_transfer_command("sftp-something-else.exe")); // not sftp-server

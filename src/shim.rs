@@ -10,6 +10,10 @@ use std::sync::{Arc, Mutex};
 /// for an interactive PTY session. The Windows path connects to the agent and relays;
 /// elsewhere there is no session-1 console to relay.
 pub fn run(exec: Option<String>) -> anyhow::Result<()> {
+    // Trim once, here, so the string that is CLASSIFIED is the string that is EXECUTED.
+    // Trimming inside the classifier alone would let a command be judged in one form and run
+    // in another.
+    let exec = exec.map(|c| c.trim().to_string());
     #[cfg(windows)]
     return crate::shim_pty::run_on(exec);
 
@@ -119,9 +123,10 @@ impl<O: Write, E: Write> FrameSink for ExecOutSink<O, E> {
 /// rcp protocol's internal `-t`/`-f` flags — markers a human would never type, so no real
 /// session-1 command is misrouted.
 pub fn is_transfer_command(cmd: &str) -> bool {
-    // Trimmed first: Windows separates arguments on space and tab only, so a stray CR or LF
-    // would otherwise stay glued to the program name and defeat the basename match — which
-    // the `char::is_whitespace` scan this replaced did not do.
+    // `run` has already trimmed what it will execute, so classification and execution agree;
+    // this trims again so a direct caller gets the same answer. Windows separates arguments on
+    // space and tab only, so an untrimmed stray CR or LF stays glued to the program name and
+    // defeats the basename match — which the `char::is_whitespace` scan this replaced did not.
     let tokens = split_command(cmd.trim());
     let Some(prog) = tokens.first() else {
         return false;
@@ -151,23 +156,17 @@ pub fn is_transfer_command(cmd: &str) -> bool {
 /// * everything after `--`, since operands follow it and a *path* may legitimately be named
 ///   `-t`.
 fn scp_is_rcp_mode(args: &[String]) -> bool {
-    // scp's own value-taking short options (`scp -c cipher -D path -F config -i key …`).
-    const VALUE_OPTS: &str = "cDFiJloPSX";
-    let mut prev_takes_value = false;
-    for a in args {
-        if a == "--" {
-            return false; // only operands from here on
-        }
-        if !prev_takes_value && (a == "-t" || a == "-f") {
-            return true;
-        }
-        // The LAST character of a short-option token decides whether the next token is its
-        // argument. One rule covers clustering (`-ri` is `-r -i`, so `-i` takes the value) and
-        // attached values (`-oFoo=bar`, `-P22`, `-l100` end in a non-option char and take none).
-        prev_takes_value =
-            a.len() > 1 && a.starts_with('-') && a.chars().next_back().is_some_and(|c| VALUE_OPTS.contains(c));
-    }
-    false
+    // No attempt is made to skip a value-taking option's argument. getopt gives no way to tell
+    // a cluster (`-ri`, where the next token IS `-i`'s value) from an attached value
+    // (`-oFoo=no`, where it is not), so any such rule misclassifies one shape or the other — an
+    // earlier last-character version ate the `-t` in `-oStrictHostKeyChecking=no -t /p`.
+    //
+    // Over-detecting is the safe direction, because the two errors are not symmetric: a missed
+    // transfer relays a binary stream through the agent and corrupts it, whereas a false
+    // positive runs an ordinary `scp` locally instead of relayed — it still works, it just
+    // loses session parity. Measured against an OpenSSH 10.3 client, no value-taking option
+    // ever reaches the remote command: it is always `scp [-v] [-r] [-p] [-d] (-t|-f) [--] <p>`.
+    args.iter().take_while(|a| *a != "--").any(|a| a == "-t" || a == "-f")
 }
 
 /// Split a command line into argv the way Windows itself would.
