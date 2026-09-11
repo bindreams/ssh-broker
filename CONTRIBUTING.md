@@ -16,8 +16,8 @@ known verb in first position selects a subcommand, anything else is the shim.
 | *(none)* or `-c "cmd"` | `shim`, `shim_pty` | the SSH session, as sshd's `DefaultShell` |
 | `agent` | `agent` | the interactive session, started by a logon task |
 | `apply` | `provision` | wherever an admin runs it; needs elevation |
-| `verify` | `provision` | anywhere, unelevated by design |
-| `verify-probe` | `provision` | session 1: the child the **agent** spawns, driven through the relay by `verify` |
+| `verify` | `provision` | on the host itself, unelevated by design |
+| `verify-probe` | `provision` | the child the **agent** spawns in its interactive session, driven through the relay by `verify` |
 
 Supporting modules: `protocol` (frame codec and handshake), `relay` (transport-agnostic
 pumping), `afunix` + `acl` (the socket and its security boundary), `conpty` (the pseudoconsole
@@ -82,8 +82,8 @@ vacuously, which is a convincing way to believe a broken hook works.
 
 ## Invariants
 
-Most are enforced by a hook, a lint, or a test rather than by good intentions. Two are not,
-and say so below; they rest on review.
+Most are enforced by a hook or a test rather than by good intentions. The ones marked below
+rest on review instead. No lint enforces any of them: `clippy.toml` is deliberately empty.
 
 **No sleeping as synchronization.** A sleep is a bet that some duration is long enough, and
 that bet loses on a loaded runner. Teardown ordering uses real primitives: waking a parked

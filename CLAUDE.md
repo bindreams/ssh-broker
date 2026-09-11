@@ -13,7 +13,7 @@ over an ACL-gated AF_UNIX socket. `apply` and
 
 The point is lineage: a shell that is a child of the agent rather than of `sshd` inherits
 neither the session-0 network logon nor the RedirectionGuard mitigation. `verify` establishes
-the session id and DPAPI directly; symlink traversal follows from the same lineage, but the
+the session id and DPAPI directly; the profile and symlink traversal follow from the same lineage, but the
 unprivileged agent usually cannot create a link to self-test it.
 
 ## Where things live
@@ -34,19 +34,21 @@ unprivileged agent usually cannot create a link to self-test it.
 
 ## Invariants you must not break
 
-Most are enforced by a hook, a lint, or a test; the three marked *(review)* are not, and rest on
-reading the diff. Full rationale in
+Most are enforced by a hook or a test; the ones marked *(review)* are not, and rest on reading
+the diff. (No lint enforces any of these — `clippy.toml` is deliberately empty.) Full rationale in
 [CONTRIBUTING.md](CONTRIBUTING.md#invariants).
 
 - **No sleeping as synchronization**, and no arbitrary retry caps *(the retry half: review)*.
   Retrying a documented self-clearing condition is fine; inventing an attempt limit is not.
 - **Tests fail loudly** — never skip on a missing dependency *(review)*.
-- **Unit tests in a sibling `foo_tests.rs`**, never an inline `#[cfg(test)] mod`.
+- **Unit tests in a sibling `foo_tests.rs`**, never an inline `#[cfg(test)] mod`. The hook
+  catches the inline form; that the sibling is wired up with `#[path]` is *(review)*.
 - **No personal home paths** in tracked files; usernames and machine names *(review)*.
 - **`acl::verify_dir_acl` is exact-match and fail-closed.** It is the whole security boundary;
   if it cannot prove the directory is safe, refuse to bind.
 - **The shim fails open, and only the shim** *(the "only" half: review)*. A broken broker must
-  not cost you SSH access. Everywhere else fails closed.
+  not cost you SSH access. The security boundary never degrades — the ACL gate and the bind
+  fail closed. Provisioning has best-effort steps of its own, marked where they occur.
 
 ## Two things that surprise people
 
