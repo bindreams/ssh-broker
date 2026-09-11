@@ -158,8 +158,9 @@ pub fn is_transfer_command(cmd: &str) -> bool {
 /// Whether an `scp` argument list is the rcp-protocol mode sshd is being asked to run.
 ///
 /// Recognises the protocol's own shape rather than modelling scp's CLI. Measured against an
-/// OpenSSH 10.3 client the remote command is always
-/// `scp [-v] [-r] [-p] [-d] (-t|-f) [--] <path>`, so no value-taking option ever reaches it.
+/// OpenSSH 10.3 client *in rcp mode* (`scp -O`; since OpenSSH 9 plain `scp` uses the sftp
+/// subsystem instead) the remote command is always `scp [-v] [-r] [-p] [-d] (-t|-f) [--]
+/// <path>`, so no value-taking option ever reaches it. Other clients differ — see `is_rcp_flag`.
 ///
 /// Two things would make a naive scan wrong, and both are handled:
 ///
@@ -177,6 +178,7 @@ fn scp_is_rcp_mode(args: &[String]) -> bool {
     // carries its own value, which is why matching on a token's last character was wrong and
     // ate the `-t` in `-oStrictHostKeyChecking=no -t /p`.
     const TAKES_NEXT: &[&str] = &["-c", "-D", "-F", "-i", "-J", "-l", "-o", "-P", "-S", "-X"];
+    debug_assert!(TAKES_NEXT.iter().all(|o| VALUE_LETTERS.contains(&o[1..])));
     let mut prev_takes_next = false;
     for a in args.iter().take_while(|a| *a != "--") {
         if !prev_takes_next && is_rcp_flag(a) {
@@ -187,29 +189,39 @@ fn scp_is_rcp_mode(args: &[String]) -> bool {
     false
 }
 
-/// Whether a token is the rcp mode flag, possibly clustered behind the protocol's own
-/// no-value flags.
+/// Whether a token is the rcp mode flag, alone or clustered with other no-value flags.
 ///
-/// The cluster is not hypothetical: libssh2 builds its remote command from `"scp -%sf "` and
-/// `"scp -%st "`, so it emits `scp -pf <path>` whenever the caller passes the stat out-param —
-/// which is how a caller learns the file size, so every libssh2 download takes that form.
-/// curl's `scp://`, the Rust `ssh2` crate and PHP's ssh2 extension all reach it.
+/// Clusters are not hypothetical, and they do not follow the rcp protocol's own flag set —
+/// each client builds the remote command from its own template, so the letters that show up
+/// are whatever that client happened to write. Measured from shipped sources:
 ///
-/// Only `d`/`p`/`r`/`v` may precede the flag: those are the no-value flags the rcp protocol
-/// itself carries. A cluster ending in a value-taking letter (`-ri`, where the next token is
-/// `-i`'s value) is deliberately not distinguished — no measured client emits one.
+/// * libssh2 `src/scp.c` — `"scp -%sf "` / `"scp -%st "`, so every download is `scp -pf <p>`;
+/// * `bramvdbogaerde/go-scp` v1.5.0 — `"%s -qt %q"`, so every upload is `scp -qt <p>`;
+/// * `appleboy/easyssh-proxy` v1.5.0 — `"scp -tr %s"`, behind `drone-scp` and `scp-action`.
+///
+/// So the test is not a whitelist of preceding letters, and not the cluster's last character —
+/// earlier versions were both, and missed `-qt` and `-tr` respectively. It is: the cluster
+/// mentions `t` or `f`, and contains no letter that would consume the following token. That
+/// last part is what keeps `-if` (an `f` behind a value-taking `-i`) from matching.
 fn is_rcp_flag(a: &str) -> bool {
     let Some(rest) = a.strip_prefix('-') else {
         return false;
     };
-    let mut cs: Vec<char> = rest.chars().collect();
-    let Some(last) = cs.pop() else {
+    if rest.chars().any(|c| VALUE_LETTERS.contains(c)) {
         return false;
-    };
-    matches!(last, 't' | 'f') && cs.iter().all(|c| matches!(c, 'd' | 'p' | 'r' | 'v'))
+    }
+    rest.contains('t') || rest.contains('f')
 }
 
-/// Split a command line into argv the way Windows itself would.
+/// scp's value-taking short options, as letters, for testing a cluster.
+const VALUE_LETTERS: &str = "cDFiJloPSX";
+
+/// Split a command line into argv the way `CommandLineToArgvW` would.
+///
+/// Note this is the rule a *program* sees for its own argv, not the rule `CreateProcessW` uses
+/// to pick the executable when `lpApplicationName` is NULL (as at the launch sites): that one
+/// scans spaces, so an unquoted `C:\Program Files\...\sftp-server.exe` launches correctly while
+/// tokenizing here as `C:\Program`. Detection and launch can therefore disagree — see #24.
 ///
 /// Delegates to `cosca::quote::windows::split_wide`, the `CommandLineToArgvW`-compatible
 /// splitter — including the mod-3 rule shell32 applies to runs of consecutive bare quotes,

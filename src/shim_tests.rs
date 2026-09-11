@@ -106,6 +106,20 @@ fn size_event_maps_to_resize_frame() {
 
 // ── is_transfer_command (route sftp/scp locally, not through the agent) ──────────────
 
+/// `ssh host " "` is a genuine exec request; only `ssh host ""` degrades to interactive
+/// (measured against a stock sshd). Mapping a blank command to `None` would hand the caller an
+/// interactive REPL on the SSH channel instead of running its no-op.
+#[test]
+fn normalize_exec_trims_but_keeps_a_blank_command_an_exec() {
+    assert_eq!(super::normalize_exec(Some("  cmd  ".into())), Some("cmd".into()));
+    assert_eq!(
+        super::normalize_exec(Some(" ".into())),
+        Some(String::new()),
+        "stays an exec"
+    );
+    assert_eq!(super::normalize_exec(None), None);
+}
+
 #[test]
 fn detects_sftp_and_scp_transfers() {
     // The sftp subsystem (the dominant path) — bare name, full path, internal-sftp.
@@ -156,15 +170,6 @@ fn does_not_misdetect_normal_commands() {
     assert!(!is_transfer_command("scp -o -f a host:/p")); // `-f` is `-o`'s argument
     assert!(!is_transfer_command("scp -if /tmp/x")); // `f` clustered behind a value-taking `-i`
 
-    // `ssh host " "` is a genuine exec request; only `ssh host ""` degrades to interactive.
-    // Folding it to `None` handed the caller an interactive REPL on the SSH channel.
-    assert_eq!(super::normalize_exec(Some("  cmd  ".into())), Some("cmd".into()));
-    assert_eq!(
-        super::normalize_exec(Some(" ".into())),
-        Some(String::new()),
-        "stays an exec"
-    );
-    assert_eq!(super::normalize_exec(None), None);
     assert!(!is_transfer_command("pwsh -c Get-ChildItem"));
     assert!(!is_transfer_command("git status"));
     assert!(!is_transfer_command("sftp-something-else.exe")); // not sftp-server
