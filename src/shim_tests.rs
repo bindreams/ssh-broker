@@ -156,6 +156,35 @@ fn detects_sftp_and_scp_transfers() {
         is_transfer_command("scp -i key -t /p"),
         "`-i` consumed `key`, so `-t` is a flag"
     );
+    // Every cluster below comes from a shipped client's own command template, not invented.
+    // Without these, a rule that only inspected the cluster's last character passes this file.
+    assert!(is_transfer_command("scp -pf /tmp/x"), "libssh2, download");
+    assert!(
+        is_transfer_command("scp -pt /tmp/x"),
+        "libssh2, upload preserving times"
+    );
+    assert!(
+        is_transfer_command("scp -qt /tmp/x"),
+        "bramvdbogaerde/go-scp, every upload"
+    );
+    assert!(is_transfer_command("scp -qf /tmp/x"), "the same, fetching");
+    assert!(
+        is_transfer_command("scp -tr /tmp/x"),
+        "easyssh-proxy: mode letter not last"
+    );
+    assert!(is_transfer_command("scp -prf /tmp/x"), "a longer cluster");
+    // An option that consumes the next token cannot itself be the mode flag.
+    assert!(
+        !is_transfer_command("scp -if /tmp/x"),
+        "`f` sits behind a value-taking `-i`"
+    );
+    // A pending consume swallows the NEXT token whatever it looks like: `-o` is `-i`'s value,
+    // so it never acts as an option, and the `-t` after it is a genuine flag. Clearing the
+    // pending state unconditionally got this backwards.
+    assert!(
+        is_transfer_command("scp -i -o -t /p"),
+        "`-o` was `-i`'s value, so `-t` is a flag"
+    );
 }
 
 #[test]

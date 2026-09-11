@@ -177,14 +177,17 @@ fn scp_is_rcp_mode(args: &[String]) -> bool {
     // Exactly these tokens consume the one after them. An attached form (`-oFoo=no`, `-l100`)
     // carries its own value, which is why matching on a token's last character was wrong and
     // ate the `-t` in `-oStrictHostKeyChecking=no -t /p`.
-    const TAKES_NEXT: &[&str] = &["-c", "-D", "-F", "-i", "-J", "-l", "-o", "-P", "-S", "-X"];
+    const TAKES_NEXT: &[&str] = &["-c", "-D", "-F", "-i", "-J", "-l", "-M", "-o", "-P", "-S", "-X"];
     debug_assert!(TAKES_NEXT.iter().all(|o| VALUE_LETTERS.contains(&o[1..])));
     let mut prev_takes_next = false;
     for a in args.iter().take_while(|a| *a != "--") {
         if !prev_takes_next && is_rcp_flag(a) {
             return true;
         }
-        prev_takes_next = TAKES_NEXT.contains(&a.as_str());
+        // Only a token that is NOT already being consumed can consume the next one; otherwise
+        // the second option in `scp -i -o -t /p` clears a pending consume and `-t` reads as a
+        // flag rather than as `-o`'s argument.
+        prev_takes_next = !prev_takes_next && TAKES_NEXT.contains(&a.as_str());
     }
     false
 }
@@ -195,7 +198,8 @@ fn scp_is_rcp_mode(args: &[String]) -> bool {
 /// each client builds the remote command from its own template, so the letters that show up
 /// are whatever that client happened to write. Measured from shipped sources:
 ///
-/// * libssh2 `src/scp.c` — `"scp -%sf "` / `"scp -%st "`, so every download is `scp -pf <p>`;
+/// * libssh2 `src/scp.c` — `"scp -%sf "` / `"scp -%st "`, where the `%s` is `p` whenever the
+///   caller asks for times, which is the common path in both directions;
 /// * `bramvdbogaerde/go-scp` v1.5.0 — `"%s -qt %q"`, so every upload is `scp -qt <p>`;
 /// * `appleboy/easyssh-proxy` v1.5.0 — `"scp -tr %s"`, behind `drone-scp` and `scp-action`.
 ///
@@ -214,7 +218,7 @@ fn is_rcp_flag(a: &str) -> bool {
 }
 
 /// scp's value-taking short options, as letters, for testing a cluster.
-const VALUE_LETTERS: &str = "cDFiJloPSX";
+const VALUE_LETTERS: &str = "cDFiJlMoPSX";
 
 /// Split a command line into argv the way `CommandLineToArgvW` would.
 ///
