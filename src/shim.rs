@@ -13,7 +13,9 @@ pub fn run(exec: Option<String>) -> anyhow::Result<()> {
     // Trim once, here, so the string that is CLASSIFIED is the string that is EXECUTED.
     // Trimming inside the classifier alone would let a command be judged in one form and run
     // in another.
-    let exec = exec.map(|c| c.trim().to_string());
+    // An all-whitespace command trims to nothing, which is not a command: fold it to `None`
+    // so it takes the interactive path rather than asking a shell to run the empty string.
+    let exec = exec.map(|c| c.trim().to_string()).filter(|c| !c.is_empty());
     #[cfg(windows)]
     return crate::shim_pty::run_on(exec);
 
@@ -133,14 +135,11 @@ pub fn is_transfer_command(cmd: &str) -> bool {
     };
     match program_basename(prog).as_str() {
         "sftp-server" | "internal-sftp" => true,
-        // scp's rcp mode is announced by a `-t` (to) or `-f` (from) flag, but its POSITION is
-        // not dependable. Measured against an OpenSSH 10.3 client: a remote path containing a
-        // space is sent unquoted (`scp -t /my dir/`), and one beginning with a dash is sent
-        // after an end-of-options marker (`scp -t -- -dst`). Requiring the flag immediately
-        // before the last token missed both — and a path with a space is the ordinary case on
-        // Windows — so a real transfer was relayed through the agent, corrupting the binary
-        // stdio this detection exists to protect. Neither flag is user-facing in scp's own
-        // CLI, so scanning for one cannot misfire on an ordinary `scp a host2:b`.
+        // scp's rcp mode is announced by a `-t` (to) or `-f` (from) flag whose position is not
+        // dependable: measured against an OpenSSH 10.3 client, a remote path beginning with a
+        // dash is sent after an end-of-options marker (`scp -t -- -dst`), so requiring the flag
+        // immediately before the last token missed it and relayed a real transfer through the
+        // agent, corrupting the binary stdio this detection exists to protect.
         "scp" => scp_is_rcp_mode(&tokens[1..]),
         _ => false,
     }
@@ -148,25 +147,33 @@ pub fn is_transfer_command(cmd: &str) -> bool {
 
 /// Whether an `scp` argument list is the rcp-protocol mode sshd is being asked to run.
 ///
-/// Scans rather than checking a fixed position, and skips the two things that would make a
-/// scan wrong:
+/// Recognises the protocol's own shape rather than modelling scp's CLI. Measured against an
+/// OpenSSH 10.3 client the remote command is always
+/// `scp [-v] [-r] [-p] [-d] (-t|-f) [--] <path>`, so no value-taking option ever reaches it.
 ///
-/// * a value-taking option's argument, so `scp -i -t key host:/p` (an identity file named
-///   `-t`) is still an ordinary client invocation, not a transfer;
-/// * everything after `--`, since operands follow it and a *path* may legitimately be named
-///   `-t`.
+/// Two things would make a naive scan wrong, and both are handled:
+///
+/// * a value-taking option's argument — `scp -i -t key host:/p` is an identity file named
+///   `-t`, not a transfer. Only an exact `-i`/`-o`/… token consumes the next one; an attached
+///   value (`-oFoo=no`, `-l100`) carries its own, which is why matching on a token's last
+///   character was wrong and ate the `-t` in `-oStrictHostKeyChecking=no -t /p`.
+/// * everything after `--`, since operands follow and a *path* may legitimately be named `-t`.
+///
+/// Detection is not made deliberately greedy: a false positive is not harmless. It routes an
+/// ordinary command to the local passthrough, which spawns outside the session's job object and
+/// resolves `PATH` in session 0.
 fn scp_is_rcp_mode(args: &[String]) -> bool {
-    // No attempt is made to skip a value-taking option's argument. getopt gives no way to tell
-    // a cluster (`-ri`, where the next token IS `-i`'s value) from an attached value
-    // (`-oFoo=no`, where it is not), so any such rule misclassifies one shape or the other — an
-    // earlier last-character version ate the `-t` in `-oStrictHostKeyChecking=no -t /p`.
-    //
-    // Over-detecting is the safe direction, because the two errors are not symmetric: a missed
-    // transfer relays a binary stream through the agent and corrupts it, whereas a false
-    // positive runs an ordinary `scp` locally instead of relayed — it still works, it just
-    // loses session parity. Measured against an OpenSSH 10.3 client, no value-taking option
-    // ever reaches the remote command: it is always `scp [-v] [-r] [-p] [-d] (-t|-f) [--] <p>`.
-    args.iter().take_while(|a| *a != "--").any(|a| a == "-t" || a == "-f")
+    // Exactly these tokens consume the one after them. An attached or clustered form is not
+    // included: it is unreachable from a real client, and guessing at it is what broke before.
+    const TAKES_NEXT: &[&str] = &["-c", "-D", "-F", "-i", "-J", "-l", "-o", "-P", "-S", "-X"];
+    let mut prev_takes_next = false;
+    for a in args.iter().take_while(|a| *a != "--") {
+        if !prev_takes_next && (a == "-t" || a == "-f") {
+            return true;
+        }
+        prev_takes_next = TAKES_NEXT.contains(&a.as_str());
+    }
+    false
 }
 
 /// Split a command line into argv the way Windows itself would.

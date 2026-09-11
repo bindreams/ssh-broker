@@ -125,7 +125,6 @@ fn detects_sftp_and_scp_transfers() {
     // Both shapes below are what an OpenSSH 10.3 client actually sends, measured rather than
     // assumed, and both were missed while the flag had to sit immediately before the last
     // token. A remote path containing a space is the ordinary case on Windows.
-    assert!(is_transfer_command("scp -t /my dir/"), "an unquoted path with a space");
     assert!(is_transfer_command("scp -t -- -dst"), "a path starting with a dash");
     assert!(is_transfer_command("scp -f -- -src"), "the fetch direction");
     assert!(is_transfer_command("scp -r -p -t /my dir/with spaces/"));
@@ -136,12 +135,13 @@ fn detects_sftp_and_scp_transfers() {
         "a trailing CR must not hide a transfer"
     );
     assert!(is_transfer_command("\nsftp-server.exe"), "nor a leading LF");
-    // Detection is deliberately greedy: any `-t`/`-f` before `--` counts. A rule that tried to
-    // skip a value-taking option's argument could not tell `-ri` (a cluster) from `-oFoo=no`
-    // (an attached value), and ate the `-t` in the latter.
+    // An attached value carries its own argument, so the `-t` after it is a real flag. Matching
+    // on a token's last character got this backwards and ate the `-t`.
     assert!(is_transfer_command("scp -oStrictHostKeyChecking=no -t /p"));
-    assert!(is_transfer_command("scp -ri -t /p"));
-    assert!(is_transfer_command("scp -i key -t /p"));
+    assert!(
+        is_transfer_command("scp -i key -t /p"),
+        "`-i` consumed `key`, so `-t` is a flag"
+    );
 }
 
 #[test]
@@ -152,6 +152,8 @@ fn does_not_misdetect_normal_commands() {
 
     // A `-t`/`-f` that is an option's argument, or an operand, must NOT be misdetected.
     assert!(!is_transfer_command("scp -- -t host:/p")); // `-t` is an operand, not a flag
+    assert!(!is_transfer_command("scp -i -t file host:/p")); // `-t` is `-i`'s argument
+    assert!(!is_transfer_command("scp -o -f a host:/p")); // `-f` is `-o`'s argument
     assert!(!is_transfer_command("pwsh -c Get-ChildItem"));
     assert!(!is_transfer_command("git status"));
     assert!(!is_transfer_command("sftp-something-else.exe")); // not sftp-server
