@@ -10,9 +10,6 @@ use std::sync::{Arc, Mutex};
 /// for an interactive PTY session. The Windows path connects to the agent and relays;
 /// elsewhere there is no session-1 console to relay.
 pub fn run(exec: Option<String>) -> anyhow::Result<()> {
-    // Trim once, here, so the string that is CLASSIFIED is the string that is EXECUTED.
-    // Trimming inside the classifier alone would let a command be judged in one form and run
-    // in another.
     #[cfg(windows)]
     return crate::shim_pty::run_on(exec);
 
@@ -24,13 +21,16 @@ pub fn run(exec: Option<String>) -> anyhow::Result<()> {
 }
 
 /// Trim the command sshd handed us, so the string that is CLASSIFIED is the string that is
-/// EXECUTED. Applied in `route`, at the one place the command is assembled, so no caller can
-/// reach the shim with an untrimmed form.
+/// EXECUTED. Applied in `route`, the one place the binary assembles a command, so no argv the
+/// binary parses reaches the shim untrimmed. A library caller invoking `shim::run` directly
+/// bypasses it and should normalize first.
 ///
 /// A whitespace-only command stays `Some` and empty. `ssh host " "` is a genuine exec request —
 /// measured against a stock client, only `ssh host ""` degrades to an interactive session — and
 /// mapping it to `None` would route it to the interactive path, handing the caller a shell REPL
-/// on the SSH channel instead of running its no-op.
+/// on the SSH channel. The empty command then fails at spawn — EXEC calls `CreateProcessW`
+/// directly, with no shell to treat it as a no-op — which is the right outcome: a failed
+/// command rather than a shell.
 pub(crate) fn normalize_exec(exec: Option<String>) -> Option<String> {
     exec.map(|c| c.trim().to_string())
 }

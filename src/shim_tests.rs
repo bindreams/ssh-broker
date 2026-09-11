@@ -136,7 +136,7 @@ fn detects_sftp_and_scp_transfers() {
     // The rcp protocol's `-t`/`-f`, wherever it falls in the argument list.
     assert!(is_transfer_command("scp -t /tmp/x"));
     assert!(is_transfer_command("scp -p -f /tmp/x"));
-    // Both shapes below are what an OpenSSH 10.3 client actually sends, measured rather than
+    // The shapes below are what an OpenSSH 10.3 client actually sends, measured rather than
     // assumed, and both were missed while the flag had to sit immediately before the last
     // token. A remote path containing a space is the ordinary case on Windows.
     assert!(is_transfer_command("scp -t -- -dst"), "a path starting with a dash");
@@ -198,6 +198,24 @@ fn detects_sftp_and_scp_transfers() {
     );
 }
 
+/// Guards the CONTENTS of `VALUE_LETTERS`, which the loop below cannot: that loop reads the
+/// set, so adding a boolean flag to it silently turns real client commands into missed
+/// transfers while the loop stays green. Every shape here was captured from a live client, and
+/// each names a letter that must stay OUT of the set.
+#[test]
+fn real_client_shapes_survive_a_wrong_value_set() {
+    // `-d` (target is a directory): OpenSSH sends it for a multi-source or directory upload.
+    assert!(is_transfer_command("scp -d -t /dst"), "`-d` must not take a value");
+    assert!(is_transfer_command("scp -r -d -t /dst"));
+    // `-v`: Terraform's ssh provisioner sends `scp -vt <dir>`; pscp prefixes `-v`.
+    assert!(is_transfer_command("scp -vt /dst"), "`-v` must not take a value");
+    assert!(is_transfer_command("scp -v -r -p -d -f /src"), "a verbose fetch");
+    // Other booleans that appear ahead of the mode letter.
+    assert!(is_transfer_command("scp -3 -t /dst"), "`-3` must not take a value");
+    assert!(is_transfer_command("scp -q -t /dst"), "`-q` must not take a value");
+    assert!(is_transfer_command("scp -B -t /dst"), "`-B` must not take a value");
+}
+
 /// scp does not permute: option parsing stops at the first operand, so a dash-leading token
 /// after one is a path. Without this, an ordinary upload whose destination merely begins with
 /// `-f` was routed to the local passthrough, which spawns outside the session's job object.
@@ -208,8 +226,9 @@ fn stops_scanning_options_at_the_first_operand() {
     assert!(!is_transfer_command("scp - -t host:/dst"), "a bare `-` is an operand");
 }
 
-/// Every value-taking option must consume the token after it, or a path named `-t` reads as the
-/// mode flag. Looping the set means a newly added option cannot go untested.
+/// Every value-taking option must consume the token after it, or a path named `-t` reads as
+/// the mode flag. Looping the set means a newly added option cannot go untested — but the loop
+/// reads the set, so it cannot see the set itself being wrong; that is the test above.
 #[test]
 fn every_value_taking_option_consumes_its_argument() {
     for letter in super::VALUE_LETTERS.chars() {
