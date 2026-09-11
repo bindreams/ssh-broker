@@ -25,7 +25,7 @@ ssh client ──▶ sshd ──▶ shim (DefaultShell) ──▶ AF_UNIX ──
 
 The **shim** is installed as sshd's `DefaultShell`, so every SSH session runs it instead of a shell. It forwards keystrokes, window resizes and mouse events to the **agent**, which lives in the interactive session and hosts the real shell inside a pseudoconsole. Output comes back the same way.
 
-Because the shell is a child of the agent rather than of `sshd`, it inherits neither the network logon nor the RedirectionGuard mitigation. DPAPI works, the profile is loaded, symlinks resolve — without disabling a security mitigation or storing a password anywhere.
+Because the shell is a child of the agent rather than of `sshd`, it inherits neither the network logon nor the RedirectionGuard mitigation. DPAPI works and the profile is loaded — both checked by `verify` — and symlink traversal follows from the same lineage, without disabling a security mitigation or storing a password anywhere.
 
 The two halves talk over an AF_UNIX socket whose directory grants Full Control to the agent's account, SYSTEM and Administrators and to nobody else — verified fail-closed on every bind.
 

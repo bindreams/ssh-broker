@@ -7,12 +7,14 @@ invariants: [CONTRIBUTING.md](CONTRIBUTING.md). This file is the short orientati
 
 One binary with four entry points plus a hidden `verify-probe` child, dispatched by argv. The **shim** is sshd's `DefaultShell`
 and is the default action; the **agent** runs in an interactive session and hosts the shell in
-a pseudoconsole; the two speak framed messages over an ACL-gated AF_UNIX socket. `apply` and
+a pseudoconsole (PTY) or on redirected pipes (`ssh host cmd`); the two speak framed messages
+over an ACL-gated AF_UNIX socket. `apply` and
 `verify` install and check that arrangement.
 
 The point is lineage: a shell that is a child of the agent rather than of `sshd` inherits
-neither the session-0 network logon nor the RedirectionGuard mitigation, so DPAPI, the user
-profile, and symlink traversal all work.
+neither the session-0 network logon nor the RedirectionGuard mitigation. `verify` establishes
+the session id and DPAPI directly; symlink traversal follows from the same lineage, but the
+unprivileged agent usually cannot create a link to self-test it.
 
 ## Where things live
 
@@ -32,7 +34,7 @@ profile, and symlink traversal all work.
 
 ## Invariants you must not break
 
-Most are enforced by a hook, a lint, or a test; the two marked *(review)* are not, and rest on
+Most are enforced by a hook, a lint, or a test; the three marked *(review)* are not, and rest on
 reading the diff. Full rationale in
 [CONTRIBUTING.md](CONTRIBUTING.md#invariants).
 
@@ -40,7 +42,7 @@ reading the diff. Full rationale in
   Retrying a documented self-clearing condition is fine; inventing an attempt limit is not.
 - **Tests fail loudly** — never skip on a missing dependency *(review)*.
 - **Unit tests in a sibling `foo_tests.rs`**, never an inline `#[cfg(test)] mod`.
-- **No personal paths, usernames or machine names** in tracked files.
+- **No personal home paths** in tracked files; usernames and machine names *(review)*.
 - **`acl::verify_dir_acl` is exact-match and fail-closed.** It is the whole security boundary;
   if it cannot prove the directory is safe, refuse to bind.
 - **The shim fails open, and only the shim** *(the "only" half: review)*. A broken broker must

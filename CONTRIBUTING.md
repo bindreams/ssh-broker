@@ -15,8 +15,9 @@ known verb in first position selects a subcommand, anything else is the shim.
 |---|---|---|
 | *(none)* or `-c "cmd"` | `shim`, `shim_pty` | the SSH session, as sshd's `DefaultShell` |
 | `agent` | `agent` | the interactive session, started by a logon task |
-| `apply` / `verify` | `provision` | wherever an admin runs it |
-| `verify-probe` | `provision` | internal: the child `verify` spawns to measure parity |
+| `apply` | `provision` | wherever an admin runs it; needs elevation |
+| `verify` | `provision` | anywhere, unelevated by design |
+| `verify-probe` | `provision` | session 1: the child the **agent** spawns, driven through the relay by `verify` |
 
 Supporting modules: `protocol` (frame codec and handshake), `relay` (transport-agnostic
 pumping), `afunix` + `acl` (the socket and its security boundary), `conpty` (the pseudoconsole
@@ -38,8 +39,9 @@ to bind.
 ### Fail-open is deliberate, and only here
 
 If the shim cannot reach the agent it runs a local shell and reports why. A broken broker must
-not cost you access to the machine. This is the *only* place the codebase prefers degraded
-service to failure; everywhere else, including the ACL check above, fails closed.
+not cost you access to the machine. This is the only place the *relay path* prefers degraded
+service to failure, and the security boundary never does — the ACL check above and the bind
+both fail closed. Provisioning has best-effort steps of its own, each marked where it occurs.
 
 ## Building and testing
 
@@ -52,7 +54,8 @@ cargo xwin check --target x86_64-pc-windows-msvc    # cross-compile check
 ```
 
 `rust-toolchain.toml` pins the toolchain and declares the Windows target, so a fresh checkout
-gets both without a separate `rustup target add`.
+gets both without a separate `rustup target add`. The cross-compile line also needs
+`cargo install cargo-xwin`, which the toolchain file cannot supply.
 
 **Clippy only sees one `cfg` at a time**, and most of this crate is `cfg(windows)`. A single
 run lints half the code. CI runs it per-platform for that reason; locally, `cargo xwin clippy`
@@ -68,10 +71,11 @@ uv tool install prek && prek install
 ```
 
 `prek run --all-files` also runs in CI, so the hooks gate everyone, not just people who
-installed them. Their regexes — and the `types`/`exclude` filters that decide what those
-regexes ever see — are pinned by `scripts/prek_patterns_test.py`. A hook that cannot fire is
-worse than no hook, and two earlier versions of these shipped exactly that; one of them was
-inert because of its filters rather than its pattern.
+installed them. The three pattern hooks' regexes — and the `types`/`exclude` filters that
+decide what those regexes ever see — are pinned by `scripts/prek_patterns_test.py`. A hook
+that cannot fire is worse than no hook, and two earlier versions of these shipped regexes that
+could not fire. `cargo-fmt` and `cargo-clippy` run commands rather than patterns, and nothing
+pins their `types` filter.
 
 Note that `prek run --all-files` only scans **git-tracked** files. An untracked probe passes
 vacuously, which is a convincing way to believe a broken hook works.
@@ -101,9 +105,12 @@ inline `#[cfg(test)] mod`. Inline modules hide host-testable logic inside files 
 otherwise platform-gated — which is how `child_cwd`'s tests once became unreachable from the
 macOS build.
 
-**No personal paths, usernames or machine names** in tracked files. This repo is public and its
-history had to be rewritten once to scrub a hardcoded home directory out of every commit.
-`C:\Users\me` and `C:\Users\example` are the sanctioned fixture placeholders.
+**No personal home paths** in tracked files *(hook-enforced)*; no usernames or machine names
+*(review)* — the hook matches home-directory shapes only, so a bare username or a hostname is
+caught by reading the diff. This repo is public and its history had to be rewritten once to
+scrub a hardcoded home directory out of every commit. `me` and `example` are the sanctioned
+placeholders under `C:\Users\` or `/Users/`; `Public`, `Default` and `All Users` are allowed
+as machine-independent Windows paths.
 
 ## Pull requests
 

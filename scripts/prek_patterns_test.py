@@ -92,7 +92,7 @@ CASES: dict[str, tuple[list[str], list[str]]] = {
 
 
 # A pattern only ever sees the files its filters let through, so the filters are as
-# load-bearing as the regex — and both hooks that shipped inert were inert because of a filter.
+# load-bearing as the regex: widening one silences a hook without touching its pattern.
 # Widening `tests-in-separate-files`'s exclude to `\.rs$` silences it entirely; dropping the
 # exclude blocks every legitimate `_tests.rs` file. The other two deliberately have NO filters,
 # and prek.toml says why in both places.
