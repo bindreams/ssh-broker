@@ -119,7 +119,10 @@ impl<O: Write, E: Write> FrameSink for ExecOutSink<O, E> {
 /// rcp protocol's internal `-t`/`-f` flags — markers a human would never type, so no real
 /// session-1 command is misrouted.
 pub fn is_transfer_command(cmd: &str) -> bool {
-    let tokens = split_command(cmd);
+    // Trimmed first: Windows separates arguments on space and tab only, so a stray CR or LF
+    // would otherwise stay glued to the program name and defeat the basename match — which
+    // the `char::is_whitespace` scan this replaced did not do.
+    let tokens = split_command(cmd.trim());
     let Some(prog) = tokens.first() else {
         return false;
     };
@@ -148,8 +151,8 @@ pub fn is_transfer_command(cmd: &str) -> bool {
 /// * everything after `--`, since operands follow it and a *path* may legitimately be named
 ///   `-t`.
 fn scp_is_rcp_mode(args: &[String]) -> bool {
-    // scp's own value-taking short options; anything immediately after one is its argument.
-    const TAKES_VALUE: &[&str] = &["-c", "-F", "-i", "-J", "-l", "-o", "-P", "-S", "-X"];
+    // scp's own value-taking short options (`scp -c cipher -D path -F config -i key …`).
+    const VALUE_OPTS: &str = "cDFiJloPSX";
     let mut prev_takes_value = false;
     for a in args {
         if a == "--" {
@@ -158,7 +161,11 @@ fn scp_is_rcp_mode(args: &[String]) -> bool {
         if !prev_takes_value && (a == "-t" || a == "-f") {
             return true;
         }
-        prev_takes_value = TAKES_VALUE.contains(&a.as_str());
+        // The LAST character of a short-option token decides whether the next token is its
+        // argument. One rule covers clustering (`-ri` is `-r -i`, so `-i` takes the value) and
+        // attached values (`-oFoo=bar`, `-P22`, `-l100` end in a non-option char and take none).
+        prev_takes_value =
+            a.len() > 1 && a.starts_with('-') && a.chars().next_back().is_some_and(|c| VALUE_OPTS.contains(c));
     }
     false
 }
@@ -173,10 +180,10 @@ fn scp_is_rcp_mode(args: &[String]) -> bool {
 /// token of `C:\dir\`, where Windows reads the `\"` as an escaped quote and yields `C:\dir"`.
 /// That is measured, not reasoned: see `split_command_round_trips_utf16_through_the_splitter`.
 ///
-/// Note the divergence is in argv[1..], not argv[0]: `CommandLineToArgvW` parses the program
-/// name by a different rule that does no backslash-escaping, so a quoted leading path happens
-/// to tokenize the same either way. A transfer-detection heuristic that disagrees with the OS
-/// about argument boundaries can misroute, so it should not be guessing at either rule.
+/// argv[0] is parsed by a different rule again — no backslash-escaping at all — and that rule
+/// genuinely diverges: `a\"b c` splits as `a\"b` + `c` in leading position, where the same bytes
+/// in argv[1..] unescape to `a"b` + `c`. A transfer-detection heuristic that disagrees with the
+/// OS about argument boundaries can misroute, so it should not be guessing at either rule.
 ///
 /// Pure UTF-16 logic, so it runs and is tested on any host, not just Windows.
 pub(crate) fn split_command(cmd: &str) -> Vec<String> {

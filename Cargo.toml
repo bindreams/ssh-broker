@@ -40,10 +40,6 @@ windows = { version = "0.62.2", features = [
     "Win32_System_Registry",       # DefaultShell registry pair (Reg* APIs)
     "Win32_Security_Cryptography", # DPAPI parity probe (CryptProtectData/CryptUnprotectData)
 ] }
-# cosca: kernel-enforced process-tree containment (Windows Job Objects). Terminating the
-# child alone leaves its descendants running, so a relayed shell's background processes
-# outlive the session without this.
-cosca = "0.4"
 
 # tracing-appender: rolling file sink for the shim's logs under ProgramData (the shim must
 # never log to the PTY stdout/stderr in interactive mode). Only the Windows shim uses it.

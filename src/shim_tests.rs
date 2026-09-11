@@ -136,10 +136,25 @@ fn does_not_misdetect_normal_commands() {
     // A user running scp on the remote host to a THIRD host wants session-1 parity, not a
     // local transfer.
     assert!(!is_transfer_command("scp file other-host:/path"));
-    // A -t/-f NOT in the rcp protocol's trailing-path position must NOT be misdetected.
+    // Windows separates arguments on space and tab only, so a stray CR/LF stays glued to the
+    // program name. The scan this replaced split on any whitespace and caught these; without
+    // the trim in `is_transfer_command` they silently stop being detected and get relayed.
+    assert!(
+        is_transfer_command("sftp-server.exe\r"),
+        "a trailing CR must not hide a transfer"
+    );
+    assert!(is_transfer_command("\nsftp-server.exe"), "nor a leading LF");
+    assert!(
+        is_transfer_command("scp -oFoo=bar -t /p"),
+        "an attached value consumes no token"
+    );
+
+    // A `-t`/`-f` that is an option's argument, or an operand, must NOT be misdetected.
     assert!(!is_transfer_command("scp -i -t file host:/p")); // `-t` is `-i`'s argument
     assert!(!is_transfer_command("scp -- -t host:/p")); // `-t` is an operand, not a flag
     assert!(!is_transfer_command("scp -o -f a host:/p")); // `-f` is `-o`'s argument
+    assert!(!is_transfer_command("scp -D -t host:/p")); // `-t` is `-D`'s argument
+    assert!(!is_transfer_command("scp -ri -t key host:/p")); // clustered: `-t` is `-i`'s
     assert!(!is_transfer_command("pwsh -c Get-ChildItem"));
     assert!(!is_transfer_command("git status"));
     assert!(!is_transfer_command("sftp-something-else.exe")); // not sftp-server
@@ -381,11 +396,18 @@ fn split_command_round_trips_utf16_through_the_splitter() {
         "not before a quote: literal"
     );
     assert_eq!(split_command(r##"p "a\"b""##), vec!["p", r#"a"b"#], "an escaped quote");
-    // argv[0] is parsed by a DIFFERENT rule: no backslash-escaping at all.
+    // argv[0] is parsed by a DIFFERENT rule: no backslash-escaping at all. The input must
+    // contain a quote to discriminate — a bare backslash run is literal under both rules, so
+    // an assertion built on one passes even if argv[0] were parsed by the argv[1..] rule.
     assert_eq!(
-        split_command(r#"a\\b c"#),
-        vec![r"a\\b", "c"],
-        "argv[0] is never unescaped"
+        split_command(r##"a\"b c"##),
+        vec![r#"a\"b"#, "c"],
+        "argv[0] keeps the escape"
+    );
+    assert_eq!(
+        split_command(r##"p a\"b c"##),
+        vec!["p", r#"a"b"#, "c"],
+        "argv[1..] unescapes"
     );
     // shell32's mod-3 rule for a run of bare quotes inside a quoted region.
     assert_eq!(
