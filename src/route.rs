@@ -34,8 +34,10 @@ pub fn route(args: &[String]) -> Route {
             // Reassemble the command from args[1..] so a command that arrives split
             // across argv is not truncated. `-c` with nothing after it degrades to an
             // interactive shim (no command).
+            // Normalized here, at the one place the command is assembled, so the string the
+            // shim classifies is exactly the string it executes.
             let exec = if args.len() > 1 {
-                Some(args[1..].join(" "))
+                crate::shim::normalize_exec(Some(args[1..].join(" ")))
             } else {
                 None
             };

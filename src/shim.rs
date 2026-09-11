@@ -13,7 +13,6 @@ pub fn run(exec: Option<String>) -> anyhow::Result<()> {
     // Trim once, here, so the string that is CLASSIFIED is the string that is EXECUTED.
     // Trimming inside the classifier alone would let a command be judged in one form and run
     // in another.
-    let exec = normalize_exec(exec);
     #[cfg(windows)]
     return crate::shim_pty::run_on(exec);
 
@@ -25,8 +24,8 @@ pub fn run(exec: Option<String>) -> anyhow::Result<()> {
 }
 
 /// Trim the command sshd handed us, so the string that is CLASSIFIED is the string that is
-/// EXECUTED. Trimming inside the classifier alone would let a command be judged in one form and
-/// run in another.
+/// EXECUTED. Applied in `route`, at the one place the command is assembled, so no caller can
+/// reach the shim with an untrimmed form.
 ///
 /// A whitespace-only command stays `Some` and empty. `ssh host " "` is a genuine exec request —
 /// measured against a stock client, only `ssh host ""` degrades to an interactive session — and
@@ -157,68 +156,54 @@ pub fn is_transfer_command(cmd: &str) -> bool {
 
 /// Whether an `scp` argument list is the rcp-protocol mode sshd is being asked to run.
 ///
-/// Recognises the protocol's own shape rather than modelling scp's CLI. Measured against an
-/// OpenSSH 10.3 client *in rcp mode* (`scp -O`; since OpenSSH 9 plain `scp` uses the sftp
-/// subsystem instead) the remote command is always `scp [-v] [-r] [-p] [-d] (-t|-f) [--]
-/// <path>`, so no value-taking option ever reaches it. Other clients differ — see `is_rcp_flag`.
+/// Implements scp's own option grammar rather than approximating it. scp uses a non-permuting
+/// BSD `getopt`, so three rules decide everything:
 ///
-/// Two things would make a naive scan wrong, and both are handled:
+/// * option parsing STOPS at the first operand. A dash-leading token after it is a path, not a
+///   flag — without this, `scp f.txt -f host:/dst` reads as a transfer.
+/// * a value-taking option consumes the remainder of its own token if there is one
+///   (`-oFoo=no`, `-l100`), otherwise the whole next token, whatever that looks like —
+///   including `--`.
+/// * within a cluster, letters are options left to right until one takes a value.
 ///
-/// * a value-taking option's argument — `scp -i -t key host:/p` is an identity file named
-///   `-t`, not a transfer. Only an exact `-i`/`-o`/… token consumes the next one; an attached
-///   value (`-oFoo=no`, `-l100`) carries its own, which is why matching on a token's last
-///   character was wrong and ate the `-t` in `-oStrictHostKeyChecking=no -t /p`.
-/// * everything after `--`, since operands follow and a *path* may legitimately be named `-t`.
-///
-/// Detection is not made deliberately greedy: a false positive is not harmless. It routes an
-/// ordinary command to the local passthrough, which spawns outside the session's job object and
-/// resolves `PATH` in session 0.
+/// So the mode flag is a `t` or `f` reached before any value-taking letter. Clusters are not
+/// hypothetical and do not follow the rcp protocol's own flag set — each client writes its own
+/// command template. Measured from shipped sources: libssh2 `src/scp.c` builds `"scp -%sf "` /
+/// `"scp -%st "`; `bramvdbogaerde/go-scp` v1.5.0 sends `scp -qt`; `appleboy/easyssh-proxy`
+/// sends `scp -tr`, with the mode letter not even last.
 fn scp_is_rcp_mode(args: &[String]) -> bool {
-    // Exactly these tokens consume the one after them. An attached form (`-oFoo=no`, `-l100`)
-    // carries its own value, which is why matching on a token's last character was wrong and
-    // ate the `-t` in `-oStrictHostKeyChecking=no -t /p`.
-    const TAKES_NEXT: &[&str] = &["-c", "-D", "-F", "-i", "-J", "-l", "-M", "-o", "-P", "-S", "-X"];
-    debug_assert!(TAKES_NEXT.iter().all(|o| VALUE_LETTERS.contains(&o[1..])));
-    let mut prev_takes_next = false;
-    for a in args.iter().take_while(|a| *a != "--") {
-        if !prev_takes_next && is_rcp_flag(a) {
-            return true;
+    let mut expect_value = false;
+    for a in args {
+        if expect_value {
+            expect_value = false; // consumed as an argument, whatever it looks like
+            continue;
         }
-        // Only a token that is NOT already being consumed can consume the next one; otherwise
-        // the second option in `scp -i -o -t /p` clears a pending consume and `-t` reads as a
-        // flag rather than as `-o`'s argument.
-        prev_takes_next = !prev_takes_next && TAKES_NEXT.contains(&a.as_str());
+        if a == "--" {
+            return false; // explicit end of options; operands follow
+        }
+        let Some(rest) = a.strip_prefix('-') else {
+            return false; // first operand: scp does not permute, so no options follow
+        };
+        if rest.is_empty() {
+            return false; // a bare `-` is an operand
+        }
+        for (i, c) in rest.char_indices() {
+            if VALUE_LETTERS.contains(c) {
+                // Its argument is the rest of this token, or the next one if there is no rest.
+                expect_value = rest[i + c.len_utf8()..].is_empty();
+                break;
+            }
+            if c == 't' || c == 'f' {
+                return true;
+            }
+        }
     }
     false
 }
 
-/// Whether a token is the rcp mode flag, alone or clustered with other no-value flags.
-///
-/// Clusters are not hypothetical, and they do not follow the rcp protocol's own flag set —
-/// each client builds the remote command from its own template, so the letters that show up
-/// are whatever that client happened to write. Measured from shipped sources:
-///
-/// * libssh2 `src/scp.c` — `"scp -%sf "` / `"scp -%st "`, where the `%s` is `p` whenever the
-///   caller asks for times, which is the common path in both directions;
-/// * `bramvdbogaerde/go-scp` v1.5.0 — `"%s -qt %q"`, so every upload is `scp -qt <p>`;
-/// * `appleboy/easyssh-proxy` v1.5.0 — `"scp -tr %s"`, behind `drone-scp` and `scp-action`.
-///
-/// So the test is not a whitelist of preceding letters, and not the cluster's last character —
-/// earlier versions were both, and missed `-qt` and `-tr` respectively. It is: the cluster
-/// mentions `t` or `f`, and contains no letter that would consume the following token. That
-/// last part is what keeps `-if` (an `f` behind a value-taking `-i`) from matching.
-fn is_rcp_flag(a: &str) -> bool {
-    let Some(rest) = a.strip_prefix('-') else {
-        return false;
-    };
-    if rest.chars().any(|c| VALUE_LETTERS.contains(c)) {
-        return false;
-    }
-    rest.contains('t') || rest.contains('f')
-}
-
-/// scp's value-taking short options, as letters, for testing a cluster.
-const VALUE_LETTERS: &str = "cDFiJlMoPSX";
+/// scp's value-taking short options, as letters. The single source for the rule above: an
+/// earlier version kept a parallel list of whole tokens, which could drift from this one.
+pub(crate) const VALUE_LETTERS: &str = "cDFiJlMoPSX";
 
 /// Split a command line into argv the way `CommandLineToArgvW` would.
 ///

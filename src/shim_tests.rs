@@ -167,7 +167,7 @@ fn detects_sftp_and_scp_transfers() {
         is_transfer_command("scp -qt /tmp/x"),
         "bramvdbogaerde/go-scp, every upload"
     );
-    assert!(is_transfer_command("scp -qf /tmp/x"), "the same, fetching");
+    assert!(is_transfer_command("scp -f /tmp/x"), "the bare fetch direction");
     assert!(
         is_transfer_command("scp -tr /tmp/x"),
         "easyssh-proxy: mode letter not last"
@@ -185,6 +185,43 @@ fn detects_sftp_and_scp_transfers() {
         is_transfer_command("scp -i -o -t /p"),
         "`-o` was `-i`'s value, so `-t` is a flag"
     );
+    // ...including `--`, an argument here rather than an end-of-options marker.
+    assert!(is_transfer_command("scp -o -- -t /p"), "`--` was `-o`'s value");
+    // Within a cluster, letters are options until one takes a value.
+    assert!(
+        is_transfer_command("scp -ti /key /p"),
+        "`t` precedes the value-taking `i`"
+    );
+    assert!(
+        !is_transfer_command("scp -pi -t file"),
+        "the cluster ends in `i`, which takes `-t`"
+    );
+}
+
+/// scp does not permute: option parsing stops at the first operand, so a dash-leading token
+/// after one is a path. Without this, an ordinary upload whose destination merely begins with
+/// `-f` was routed to the local passthrough, which spawns outside the session's job object.
+#[test]
+fn stops_scanning_options_at_the_first_operand() {
+    assert!(!is_transfer_command("scp f.txt -f host:/dst"));
+    assert!(!is_transfer_command("scp f.txt -t host:/dst"));
+    assert!(!is_transfer_command("scp - -t host:/dst"), "a bare `-` is an operand");
+}
+
+/// Every value-taking option must consume the token after it, or a path named `-t` reads as the
+/// mode flag. Looping the set means a newly added option cannot go untested.
+#[test]
+fn every_value_taking_option_consumes_its_argument() {
+    for letter in super::VALUE_LETTERS.chars() {
+        assert!(
+            !is_transfer_command(&format!("scp -{letter} -t /p")),
+            "-{letter} must consume the `-t` after it"
+        );
+        assert!(
+            is_transfer_command(&format!("scp -{letter}val -t /p")),
+            "-{letter}val carries its own value, so `-t` is a flag"
+        );
+    }
 }
 
 #[test]
