@@ -201,8 +201,9 @@ fn detects_sftp_and_scp_transfers() {
 
 /// `VALUE_LETTERS` must be exactly scp's value-taking options — hardcoded here rather than
 /// derived, because a test that reads the set cannot notice the set shrinking: it just deletes
-/// its own coverage. Measured: with this absent, 9 of the 11 letters could be removed
-/// individually with the whole suite green.
+/// its own coverage. Measured at this commit: with this test absent, six of the eleven letters
+/// (`D F J M S X`) can each be removed with the whole suite still green — precisely the ones no
+/// command below exercises.
 #[test]
 fn value_letters_is_exactly_scps_value_taking_options() {
     // The `:`-suffixed letters of OpenSSH scp.c's optstring
@@ -216,9 +217,13 @@ fn value_letters_is_exactly_scps_value_taking_options() {
     assert_eq!(sorted(super::VALUE_LETTERS), sorted("cDFiJlMoPSX"));
 }
 
-/// A real client command for each letter that is easy to get wrong. `-l` is the one that bit:
-/// jbardin/scp.py appends `-l <n>` whenever a bandwidth limit is set, so dropping `l` from the
-/// set makes `1000` read as the first operand and the transfer is missed entirely.
+/// Commands where a value-taking option must not swallow the mode flag.
+///
+/// Only the `-l` pair is client-sourced, and it is the one that bit: jbardin/scp.py appends
+/// `-l <n>` whenever a bandwidth limit is set, so dropping `l` makes `1000` read as the first
+/// operand and the transfer is missed entirely. The rest are synthetic — scp never forwards
+/// `-c`, `-P` or `-i` to the remote command — but they keep those letters from being removed
+/// unnoticed.
 #[test]
 fn value_taking_options_do_not_swallow_the_mode_flag() {
     assert!(
