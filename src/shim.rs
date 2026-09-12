@@ -20,6 +20,28 @@ pub fn run(exec: Option<String>) -> anyhow::Result<()> {
     }
 }
 
+/// Trim the command sshd handed us, so the string that is CLASSIFIED is the string that is
+/// EXECUTED. Applied in `route`, the one place the binary assembles a command, so no argv the
+/// binary parses reaches the shim untrimmed. A library caller invoking `shim::run` directly
+/// bypasses it and should normalize first.
+///
+/// A whitespace-only command stays `Some` and empty. `ssh host " "` is a genuine exec request —
+/// measured against a stock client, only `ssh host ""` degrades to an interactive session — and
+/// mapping it to `None` would route it to the interactive path, handing the caller a shell REPL
+/// on the SSH channel. The empty command then fails at spawn — EXEC calls `CreateProcessW`
+/// directly, with no shell to treat it as a no-op — which is the right outcome: a failed
+/// command rather than a shell.
+pub(crate) fn normalize_exec(exec: Option<String>) -> Option<String> {
+    exec.map(|c| c.trim_matches(BOUNDARY).to_string())
+}
+
+/// The characters that carry no meaning at a command's edges. Windows separates arguments on
+/// space and tab only; CR and LF are here because sshd can hand over a line-terminated command
+/// and they would otherwise stay glued to the program name. Deliberately NOT Rust's `trim`,
+/// whose Unicode `White_Space` set would strip characters this pipeline treats as part of an
+/// argument — one definition, cited by `normalize_exec` and `is_transfer_command` alike.
+pub(crate) const BOUNDARY: [char; 4] = [' ', '\t', '\r', '\n'];
+
 // ── EXEC relay ───────────────────────────────────────────────────────────────────────
 
 /// Relay an EXEC session over an already-connected, split transport: send the handshake,
@@ -119,52 +141,100 @@ impl<O: Write, E: Write> FrameSink for ExecOutSink<O, E> {
 /// rcp protocol's internal `-t`/`-f` flags — markers a human would never type, so no real
 /// session-1 command is misrouted.
 pub fn is_transfer_command(cmd: &str) -> bool {
-    let tokens = split_command(cmd);
+    // `route` already trimmed what will execute, so classification and execution agree; this
+    // trims again so a direct caller gets the same answer.
+    let tokens = split_command(cmd.trim_matches(BOUNDARY));
     let Some(prog) = tokens.first() else {
         return false;
     };
     match program_basename(prog).as_str() {
         "sftp-server" | "internal-sftp" => true,
-        // The rcp protocol always emits `scp <opts> -t <path>` / `-f <path>` with the flag
-        // immediately before the single trailing path operand (never combined like `-rt`).
-        // Require that position so a legitimate `scp … -t …`-to-a-third-host is not misrouted.
-        "scp" => tokens.len() >= 2 && matches!(tokens[tokens.len() - 2].as_str(), "-t" | "-f"),
+        "scp" => scp_is_rcp_mode(&tokens[1..]),
         _ => false,
     }
 }
 
-/// Split a command line into tokens, respecting double quotes (so a program path containing
-/// spaces stays one token). Quote characters are stripped. Good enough for the transfer-detection
-/// heuristic; not a full Win32 `CommandLineToArgvW` (no backslash-escaping of quotes).
-fn split_command(cmd: &str) -> Vec<String> {
-    let mut tokens = Vec::new();
-    let mut cur = String::new();
-    let mut in_quotes = false;
-    let mut has_token = false;
-    for ch in cmd.chars() {
-        match ch {
-            '"' => {
-                has_token = {
-                    in_quotes = !in_quotes;
-                    true
-                }
+/// Whether an `scp` argument list is the rcp-protocol mode sshd is being asked to run.
+///
+/// Implements scp's own option grammar rather than approximating it. scp uses a non-permuting
+/// BSD `getopt`, so three rules decide everything:
+///
+/// * option parsing STOPS at the first operand; a dash-leading token after it is a path.
+/// * a value-taking option consumes the remainder of its own token if there is one
+///   (`-oFoo=no`, `-l100`), otherwise the whole next token, including `--`.
+/// * within a cluster, letters are options left to right until one takes a value.
+///
+/// So the mode flag is a `t` or `f` reached before any value-taking letter. Clusters do not
+/// follow the rcp protocol's own flag set — each client writes its own command template, so the
+/// letters around the mode flag are whatever that client emitted.
+fn scp_is_rcp_mode(args: &[String]) -> bool {
+    let mut expect_value = false;
+    for a in args {
+        if expect_value {
+            expect_value = false; // consumed as an argument, whatever it looks like
+            continue;
+        }
+        if a == "--" {
+            return false; // explicit end of options; operands follow
+        }
+        let Some(rest) = a.strip_prefix('-') else {
+            return false; // first operand: scp does not permute, so no options follow
+        };
+        if rest.is_empty() {
+            return false; // a bare `-` is an operand
+        }
+        for (i, c) in rest.char_indices() {
+            if VALUE_LETTERS.contains(c) {
+                // Its argument is the rest of this token, or the next one if there is no rest.
+                expect_value = rest[i + c.len_utf8()..].is_empty();
+                break;
             }
-            c if c.is_whitespace() && !in_quotes => {
-                if has_token {
-                    tokens.push(std::mem::take(&mut cur));
-                    has_token = false;
-                }
-            }
-            c => {
-                cur.push(c);
-                has_token = true;
+            if c == 't' || c == 'f' {
+                return true;
             }
         }
     }
-    if has_token {
-        tokens.push(cur);
+    false
+}
+
+/// scp's value-taking short options, as letters — the single source for the rule above.
+pub(crate) const VALUE_LETTERS: &str = "cDFiJlMoPSX";
+
+/// Split a command line into argv the way `CommandLineToArgvW` would.
+///
+/// Note this is the rule a *program* sees for its own argv, not the rule `CreateProcessW` uses
+/// to pick the executable when `lpApplicationName` is NULL (as at the launch sites): that one
+/// scans spaces, so an unquoted `C:\Program Files\...\sftp-server.exe` launches correctly while
+/// tokenizing here as `C:\Program`. Detection and launch can therefore disagree — see #24.
+///
+/// Delegates to `cosca::quote::windows::split_wide`, the `CommandLineToArgvW`-compatible
+/// splitter — including the mod-3 rule shell32 applies to runs of consecutive bare quotes,
+/// which the simpler MSVCRT `main()` parser (and this module's previous hand-rolled scan) get
+/// wrong. That scan documented itself as "not a full `CommandLineToArgvW` (no backslash-escaping
+/// of quotes)", and the divergence is real: for `scp -t "C:\dir\""` the old scan yielded a final
+/// token of `C:\dir\`, where Windows reads the `\"` as an escaped quote and yields `C:\dir"`.
+/// That is measured, not reasoned: see `split_command_round_trips_utf16_through_the_splitter`.
+///
+/// argv[0] is parsed by a different rule again — no backslash-escaping at all — and that rule
+/// genuinely diverges: `a\"b c` splits as `a\"b` + `c` in leading position, where the same bytes
+/// in argv[1..] unescape to `a"b` + `c`. A transfer-detection heuristic that disagrees with the
+/// OS about argument boundaries can misroute, so it should not be guessing at either rule.
+///
+/// Pure UTF-16 logic, so it runs and is tested on any host, not just Windows.
+pub(crate) fn split_command(cmd: &str) -> Vec<String> {
+    let wide: Vec<u16> = cmd.encode_utf16().collect();
+    match cosca::quote::windows::split_wide(&wide) {
+        Ok(tokens) => tokens.iter().map(|t| String::from_utf16_lossy(t)).collect(),
+        // Unreachable today: every `return` in `split_wide` is `Ok`. The assert fails CI if a
+        // future cosca grows a failure path, because the silent alternative — an empty token
+        // list — classifies as not-a-transfer and corrupts a binary stream. Not a panic in
+        // release: that would cost the user their session.
+        Err(e) => {
+            debug_assert!(false, "split_wide gained a failure path: {e}");
+            tracing::error!("could not tokenize the exec command ({e}); relaying it unclassified");
+            Vec::new()
+        }
     }
-    tokens
 }
 
 /// The program's lowercase basename without a `.exe` suffix (path separators stripped).
