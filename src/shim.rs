@@ -32,8 +32,15 @@ pub fn run(exec: Option<String>) -> anyhow::Result<()> {
 /// directly, with no shell to treat it as a no-op — which is the right outcome: a failed
 /// command rather than a shell.
 pub(crate) fn normalize_exec(exec: Option<String>) -> Option<String> {
-    exec.map(|c| c.trim().to_string())
+    exec.map(|c| c.trim_matches(BOUNDARY).to_string())
 }
+
+/// The characters that carry no meaning at a command's edges. Windows separates arguments on
+/// space and tab only; CR and LF are here because sshd can hand over a line-terminated command
+/// and they would otherwise stay glued to the program name. Deliberately NOT Rust's `trim`,
+/// whose Unicode `White_Space` set would strip characters this pipeline treats as part of an
+/// argument — one definition, cited by `normalize_exec` and `is_transfer_command` alike.
+pub(crate) const BOUNDARY: [char; 4] = [' ', '\t', '\r', '\n'];
 
 // ── EXEC relay ───────────────────────────────────────────────────────────────────────
 
@@ -134,24 +141,56 @@ impl<O: Write, E: Write> FrameSink for ExecOutSink<O, E> {
 /// rcp protocol's internal `-t`/`-f` flags — markers a human would never type, so no real
 /// session-1 command is misrouted.
 pub fn is_transfer_command(cmd: &str) -> bool {
-    // `route` has already trimmed what will execute, so classification and execution agree;
-    // this trims again so a direct caller gets the same answer. Windows separates arguments on
-    // space and tab only, so an untrimmed stray CR or LF stays glued to the program name and
-    // defeats the basename match — which the `char::is_whitespace` scan this replaced did not.
-    let tokens = split_command(cmd.trim());
-    let Some(prog) = tokens.first() else {
-        return false;
-    };
-    match program_basename(prog).as_str() {
+    // `route` already trimmed what will execute, so classification and execution agree; this
+    // trims again so a direct caller gets the same answer.
+    let cmd = cmd.trim_matches(BOUNDARY);
+    let tokens = split_command(cmd);
+    if let Some(prog) = tokens.first()
+        && classify(program_basename(prog).as_str(), &tokens[1..])
+    {
+        return true;
+    }
+    // `CommandLineToArgvW`'s rule is not the rule the launch uses. `CreateProcessW` with a NULL
+    // `lpApplicationName` tries progressively longer space-delimited prefixes of an unquoted
+    // command line until one names a real executable, so
+    // `C:\Program Files\OpenSSH\sftp-server.exe -l ERROR` LAUNCHES fine while tokenizing here
+    // as `C:\Program`. Classifying by argv[0] alone therefore misses the transfer a default
+    // GitHub-release install emits — the direction that corrupts a binary stream.
+    launch_candidates(cmd)
+        .into_iter()
+        .any(|(prog, rest)| classify(program_basename(prog).as_str(), &rest))
+}
+
+/// Whether a program name plus its arguments is a transfer.
+fn classify(basename: &str, args: &[String]) -> bool {
+    match basename {
         "sftp-server" | "internal-sftp" => true,
-        // scp's rcp mode is announced by a `-t` (to) or `-f` (from) flag whose position is not
-        // dependable: measured against an OpenSSH 10.3 client, a remote path beginning with a
-        // dash is sent after an end-of-options marker (`scp -t -- -dst`), so requiring the flag
-        // immediately before the last token missed it and relayed a real transfer through the
-        // agent, corrupting the binary stdio this detection exists to protect.
-        "scp" => scp_is_rcp_mode(&tokens[1..]),
+        "scp" => scp_is_rcp_mode(args),
         _ => false,
     }
+}
+
+/// The program names `CreateProcessW` would try for an unquoted command line, each paired with
+/// the arguments that would follow it.
+///
+/// Only widened when the first token already looks like a path — it holds a separator or a
+/// drive colon. Without that guard, `echo C:\dir\sftp-server.exe` would match on a later
+/// prefix and route an ordinary command to the local passthrough.
+fn launch_candidates(cmd: &str) -> Vec<(&str, Vec<String>)> {
+    let trimmed = cmd.trim_matches(BOUNDARY);
+    let Some(first_end) = trimmed.find(BOUNDARY) else {
+        return Vec::new(); // a single token: argv[0]'s rule already saw all of it
+    };
+    if trimmed.starts_with('"') || !trimmed[..first_end].contains(['\\', '/', ':']) {
+        return Vec::new();
+    }
+    let mut out: Vec<(&str, Vec<String>)> = trimmed
+        .char_indices()
+        .filter(|(i, c)| *i > first_end && matches!(c, ' ' | '\t'))
+        .map(|(i, _)| (&trimmed[..i], split_command(&trimmed[i..])))
+        .collect();
+    out.push((trimmed, Vec::new())); // the whole line, for a path with no arguments
+    out
 }
 
 /// Whether an `scp` argument list is the rcp-protocol mode sshd is being asked to run.
@@ -230,12 +269,15 @@ pub(crate) fn split_command(cmd: &str) -> Vec<String> {
     let wide: Vec<u16> = cmd.encode_utf16().collect();
     match cosca::quote::windows::split_wide(&wide) {
         Ok(tokens) => tokens.iter().map(|t| String::from_utf16_lossy(t)).collect(),
-        // `split_wide` has no failure path today — it returns `Result` for API shape, and
-        // every `return` inside it is `Ok`. This arm is handled rather than unwrapped because
-        // a panic here would cost the user their session, which is the one thing the shim must
-        // never do. No tokens means no match, so the command takes the ordinary relay path.
+        // `split_wide` has no failure path today — every `return` inside it is `Ok`. The
+        // `debug_assert` makes a future cosca that grows one fail CI here rather than silently
+        // changing what this returns: an empty token list classifies as not-a-transfer, which
+        // relays a binary stream through the agent and corrupts it. Not a panic in release,
+        // because a panic would cost the user their session; `error` rather than `warn`
+        // because the consequence is corruption, not degraded service.
         Err(e) => {
-            tracing::warn!("could not tokenize the exec command ({e}); relaying it unclassified");
+            debug_assert!(false, "split_wide gained a failure path: {e}");
+            tracing::error!("could not tokenize the exec command ({e}); relaying it unclassified");
             Vec::new()
         }
     }

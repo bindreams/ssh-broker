@@ -261,6 +261,36 @@ fn real_client_shapes_survive_a_wrong_value_set() {
     assert!(is_transfer_command("scp -B -t /dst"), "`-B` must not take a value");
 }
 
+/// An unquoted program path containing spaces must still be detected.
+///
+/// `CreateProcessW` with a NULL `lpApplicationName` widens across spaces until a prefix names a
+/// real executable, so the command below LAUNCHES correctly while `CommandLineToArgvW` reads
+/// argv[0] as `C:\Program`. Classifying by argv[0] alone missed it — and this is the shape a
+/// default GitHub-release OpenSSH install puts in its `Subsystem sftp` line, so the miss
+/// relays an sftp session through the agent and corrupts it.
+#[test]
+fn detects_an_unquoted_program_path_with_spaces() {
+    assert!(is_transfer_command(r"C:\Program Files\OpenSSH\sftp-server.exe"));
+    assert!(is_transfer_command(
+        r"C:\Program Files\OpenSSH\sftp-server.exe -l ERROR"
+    ));
+    assert!(is_transfer_command(r"C:\Program Files (x86)\OpenSSH\sftp-server.exe"));
+    // The same widening has to carry the arguments with it, or scp's mode flag is lost.
+    assert!(is_transfer_command(r"C:\Program Files\OpenSSH\scp.exe -t /dst"));
+    assert!(!is_transfer_command(r"C:\Program Files\OpenSSH\scp.exe file host:/p"));
+}
+
+/// Widening only applies to a first token that already looks like a path. Without that guard,
+/// an ordinary command that merely MENTIONS a transfer binary would be routed to the local
+/// passthrough, which spawns outside the session's job object.
+#[test]
+fn does_not_widen_a_bare_command_name() {
+    assert!(!is_transfer_command(r"echo C:\Program Files\OpenSSH\sftp-server.exe"));
+    assert!(!is_transfer_command(r"pwsh -c Get-Item C:\dir\sftp-server.exe"));
+    // A quoted path is exact under argv[0]'s rule, so there is nothing to widen.
+    assert!(is_transfer_command(r#""C:\Program Files\OpenSSH\sftp-server.exe""#));
+}
+
 /// scp does not permute: option parsing stops at the first operand, so a dash-leading token
 /// after one is a path. Without this, an ordinary copy with a source operand that merely begins
 /// with `-f` was routed to the local passthrough, which spawns outside the session's job object.
