@@ -24,11 +24,14 @@ from pathlib import Path
 PS_SLEEP = "Start-" + "Sleep"
 WIN_HOME = "C:" + "\\Users\\"
 NIX_HOME = "/" + "Users/"
+# Composed so this fixture is not itself a match for the hook it exercises.
+PS_SLEEP = "start-" + "sleep"
 
 CASES: dict[str, tuple[list[str], list[str]]] = {
     # hook id: (must match, must not match)
     "no-sleep-sync": (
         [
+            f"    pwsh -c '{PS_SLEEP} 5'",  # the cmdlet is case-insensitive in PowerShell
             "    std::thread::sleep(Duration::from_millis(50));",  # sleep-ok: pattern fixture, not a call
             "    sleep(Duration::from_millis(50));",  # sleep-ok: pattern fixture, not a call
             "    Sleep(50);",  # sleep-ok: pattern fixture, not a call
@@ -62,6 +65,14 @@ CASES: dict[str, tuple[list[str], list[str]]] = {
             f'    const P: &str = "{NIX_HOME}bob";',
             f"Clone it to {NIX_HOME}someone/src/thing and run.",
             f"      working-directory: {NIX_HOME}runner/work",
+            # prek matches BYTES, where `\\w` is ASCII-only: a Cyrillic home directory slipped
+            # past the pattern while a `str`-compiled harness reported it as caught.
+            f'    const P: &str = "{NIX_HOME}\u0410\u043d\u043d\u0430/private";',
+            f'    const P: &str = r"{WIN_HOME}\u0410\u043d\u043d\u0430\\secrets";',
+            # A sanctioned placeholder is the WHOLE segment; these merely start with one.
+            f'    const P: &str = "{NIX_HOME}me.smith/private";',
+            f'    const P: &str = "{NIX_HOME}meredith/private";',
+            f'    const P: &str = r"{WIN_HOME}example2\\x";',
         ],
         [
             f'    const P: &str = r"{WIN_HOME}me\\x";',
@@ -69,6 +80,8 @@ CASES: dict[str, tuple[list[str], list[str]]] = {
             f'    const P: &str = r"{WIN_HOME}Public\\Desktop";',
             f'    const P: &str = r"{WIN_HOME}Default\\NTUSER.DAT";',
             f'    const P: &str = r"{WIN_HOME}All Users\\App";',
+            f'    const P: &str = "{NIX_HOME}me";',
+            f'    const P: &str = \'"{NIX_HOME}me"\';',
             "    let dir = std::env::temp_dir();",
         ],
     ),
@@ -97,9 +110,9 @@ CASES: dict[str, tuple[list[str], list[str]]] = {
 # exclude blocks every legitimate `_tests.rs` file. The other two deliberately have NO filters,
 # and prek.toml says why in both places.
 FILTERS: dict[str, dict[str, object]] = {
-    "no-sleep-sync": {"types": None, "exclude": None},
-    "no-hardcoded-user-paths": {"types": None, "exclude": None},
-    "tests-in-separate-files": {"types": ["rust"], "exclude": r"_tests\.rs$"},
+    "no-sleep-sync": {"types": None, "exclude": None, "files": None, "types_or": None, "exclude_types": None, "args": None},
+    "no-hardcoded-user-paths": {"types": None, "exclude": None, "files": None, "types_or": None, "exclude_types": None, "args": None},
+    "tests-in-separate-files": {"types": ["rust"], "exclude": r"_tests\.rs$", "files": None, "types_or": None, "exclude_types": None, "args": None},
 }
 
 
@@ -119,19 +132,25 @@ def main() -> int:
             failures.append(f"{hook_id}: no positive cases — the pattern is unpinned")
         if not must_not:
             failures.append(f"{hook_id}: no negative cases — nothing stops it matching everything")
-        pattern = re.compile(hooks[hook_id]["entry"])
+        # Compiled and searched as BYTES, because that is what prek does: as a `str`
+        # pattern `\w` is Unicode and matches `Анна`, so the harness certified a hook
+        # that could not fire on a non-ASCII home path.
+        pattern = re.compile(hooks[hook_id]["entry"].encode())
         for line in must:
-            if not pattern.search(line):
+            if not pattern.search(line.encode() + b"\n"):
                 failures.append(f"{hook_id}: should have matched but did not:\n    {line}")
         for line in must_not:
-            if pattern.search(line):
+            if pattern.search(line.encode() + b"\n"):
                 failures.append(f"{hook_id}: should NOT have matched but did:\n    {line}")
 
     for hook_id, expected in FILTERS.items():
         hook = hooks.get(hook_id)
         if hook is None:
             continue  # already reported above
-        for key, want in expected.items():
+        # Every filter key, not just the ones named: an unpinned `files` or `exclude_types`
+        # narrows what the hook sees exactly as `exclude` does.
+        for key in ("types", "exclude", "files", "types_or", "exclude_types", "args"):
+            want = expected.get(key)
             got = hook.get(key)
             if got != want:
                 failures.append(

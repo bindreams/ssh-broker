@@ -48,7 +48,7 @@ name = "no sleeping as a synchronization primitive"
 # a renamed import, a suffixed variant, or a bounded wait under a different name is the
 # same defect. A genuine long-lived sentinel opts out with a same-line `sleep-ok:` marker
 # followed by a reason — a bare marker does not suppress.
-entry = '^(?!.*sleep-ok:\s*\S).*(\b[Ss]leep(_ms|_until|_for|Ex)?\s*\(|\bthread::sleep\b|\bpark_timeout\s*\(|\b(recv|wait|read|write|join|lock)_timeout\s*\(|\bWaitForSingleObject\s*\([^,]+,(?!\s*INFINITE\b)|\bStart-Sleep\b|^\s*-?\s*run:.*\bsleep\s+[0-9])'
+entry = '^(?!.*sleep-ok:\s*\S).*(\b[Ss]leep(_ms|_until|_for|Ex)?\s*\(|\bthread::sleep\b|\bpark_timeout\s*\(|\b(recv|wait|read|write|join|lock)_timeout\s*\(|\bWaitForSingleObject\s*\((?![^\n]*\bINFINITE\b)|(?i:\bstart-sleep\b)|^\s*-?\s*run:.*\bsleep\s+[0-9])'
 language = "pygrep"
 
 [[repos.hooks]]
@@ -69,8 +69,14 @@ name = "no hardcoded user home directories"
 # crate provisions Windows-side artefacts that legitimately reference them.
 #
 # No file is excluded: an exclusion is exactly where a real path would end up hiding.
+#
+# The username class is `[\w.-]` OR any non-ASCII byte. prek matches on BYTES, where `\w` is
+# ASCII-only, so `\w+` alone let a home directory named in a non-Latin script through entirely —
+# and a `str`-compiled test harness reported it as caught. The placeholder exclusions use a
+# negative lookahead for a following username character rather than `\b`, so `me` is sanctioned
+# while a real name merely starting with it is not. Cases in scripts/prek_patterns_test.py.
 # The pattern is written so this file does not match itself.
-entry = '(?i)(C:\\+Users\\+(?!me\b|example\b|Public\b|Default\b|All Users\b)[\w.-]+|/Users/(?!me\b|example\b)[\w.-]+)'
+entry = '(?i)(C:\\+Users\\+(?!(?:me|example|Public|Default|All Users)(?![\w.-]|[^\x00-\x7F]))(?:[\w.-]|[^\x00-\x7F])+|/Users/(?!(?:me|example)(?![\w.-]|[^\x00-\x7F]))(?:[\w.-]|[^\x00-\x7F])+)'
 language = "pygrep"
 
 [[repos.hooks]]
