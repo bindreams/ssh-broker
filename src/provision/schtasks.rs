@@ -40,8 +40,8 @@ pub fn agent_task_xml(exe: &str, user: &str) -> String {
     <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
     <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
     <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
-    <!-- The project forbids arbitrary retry caps; this is one of the two documented numeric
-         bounds (see CONTRIBUTING.md's invariants). The Task Scheduler schema requires a Count
+    <!-- The project forbids arbitrary retry caps; this is a documented numeric bound that is
+         not one (see CONTRIBUTING.md's invariants). The Task Scheduler schema requires a Count
          with RestartOnFailure and has no unbounded form.
          A failure outlasting these attempts is covered at the next boot or logon, by the
          ONSTART self-heal task and the agent task's own logon trigger — not before. -->

@@ -13,10 +13,10 @@ over an ACL-gated AF_UNIX socket. `apply` and
 
 The point is lineage: a shell that is a child of the agent rather than of `sshd` inherits
 neither the session-0 network logon nor the RedirectionGuard mitigation. `verify` establishes
-the session id and DPAPI directly, and reports symlink traversal — a probe that cannot create a
-link reports `Skipped` rather than failing, which is the usual outcome for the unprivileged
-agent. The profile follows from the interactive logon and is not separately checked. The
-unprivileged agent usually cannot create a link to self-test it.
+the session id and DPAPI through an agent-spawned probe, and reports symlink traversal — a probe
+that cannot create a link reports `Skipped` rather than failing, which is the usual outcome for
+the unprivileged agent. The profile follows from the interactive logon and is not separately
+checked.
 
 ## Where things live
 
@@ -36,8 +36,8 @@ unprivileged agent usually cannot create a link to self-test it.
 
 ## Invariants you must not break
 
-Most are enforced by a hook or a test; the ones marked *(review)* are not, and rest on reading
-the diff. (No lint enforces any of these — `clippy.toml` is deliberately empty.) Full rationale in
+Most are enforced by a prek hook; the ones marked *(review)* are not, and rest on reading the
+diff. (No lint enforces any of these — `clippy.toml` is deliberately empty.) Full rationale in
 [CONTRIBUTING.md](CONTRIBUTING.md#invariants).
 
 - **No sleeping as synchronization**, and no arbitrary retry caps *(the retry half: review)*.
@@ -48,7 +48,7 @@ the diff. (No lint enforces any of these — `clippy.toml` is deliberately empty
 - **No personal home paths** in tracked files; usernames and machine names *(review)*.
 - **`acl::verify_dir_acl` is exact-match and fail-closed.** It is the whole security boundary;
   if it cannot prove the directory is safe, refuse to bind.
-- **The shim fails open, and only the shim** *(the "only" half: review)*, given `pwsh`. A broken broker must
+- **The shim fails open on the relay path** *(review)*, given `pwsh`. A broken broker must
   not cost you SSH access. The security boundary never degrades — the ACL gate and the bind
   fail closed. Provisioning has best-effort steps of its own, marked where they occur.
 
