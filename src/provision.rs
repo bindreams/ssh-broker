@@ -209,6 +209,9 @@ mod imp {
     /// NUL-interleaved false-fail.
     fn decode_output(bytes: &[u8]) -> String {
         let bom = bytes.starts_with(&[0xFF, 0xFE]);
+        // A fixed window over a fixed input, not a cap on work: schtasks' UTF-16 output
+        // interleaves NULs from the first byte, so a short prefix decides it. Counting the
+        // whole buffer would say the same thing more slowly.
         let nul_heavy = bytes.iter().take(64).filter(|&&b| b == 0).count() > 8;
         if bom || nul_heavy {
             let start = if bom { 2 } else { 0 };

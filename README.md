@@ -25,13 +25,13 @@ ssh client ──▶ sshd ──▶ shim (DefaultShell) ──▶ AF_UNIX ──
 
 The **shim** is installed as sshd's `DefaultShell`, so every SSH session runs it instead of a shell. It forwards keystrokes, window resizes and mouse events to the **agent**, which lives in the interactive session and hosts the real shell — in a pseudoconsole for an interactive session, on redirected pipes for `ssh host "cmd"`. Output comes back the same way.
 
-Because the shell is a child of the agent rather than of `sshd`, it inherits neither the network logon nor the RedirectionGuard mitigation. DPAPI works, the profile is loaded, and symlinks resolve — without disabling a security mitigation or storing a password anywhere. `verify` checks the session id, DPAPI and symlink traversal; the profile follows from the interactive logon rather than being probed separately.
+Because the shell is a child of the agent rather than of `sshd`, it inherits neither the network logon nor the RedirectionGuard mitigation. DPAPI works, the profile is loaded, and symlinks resolve — without disabling a security mitigation or storing a password anywhere. `verify` checks the session id and DPAPI, and reports symlink traversal — failing only on a confirmed block, since the unprivileged agent usually cannot create a link to test with. The profile follows from the interactive logon rather than being probed separately.
 
 The two halves talk over an AF_UNIX socket whose directory grants Full Control to the agent's account, SYSTEM and Administrators and to nobody else — verified fail-closed on every bind.
 
 ## Requirements
 
-**PowerShell Core (`pwsh`) must be installed.** Stock Windows ships `powershell.exe` 5.1, which is a different binary. `pwsh` is what the agent hosts for an interactive session when no shell is configured, and what the shim falls back to when the agent is unreachable — for `ssh host "cmd"` as well, since both paths share that fallback. The Windows test suite also assumes it.
+**PowerShell Core (`pwsh`) must be installed.** Stock Windows ships `powershell.exe` 5.1, which is a different binary. `pwsh` is what the agent hosts for every interactive session — a configurable shell is not implemented — and what the shim falls back to when the agent is unreachable — for `ssh host "cmd"` as well, since both paths share that fallback. The Windows test suite also assumes it.
 
 ## Limits worth knowing before you install it
 

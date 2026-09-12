@@ -13,9 +13,9 @@ over an ACL-gated AF_UNIX socket. `apply` and
 
 The point is lineage: a shell that is a child of the agent rather than of `sshd` inherits
 neither the session-0 network logon nor the RedirectionGuard mitigation. `verify` establishes
-the session id, DPAPI and symlink traversal directly — a symlink probe that cannot create a
-link reports `Skipped` rather than failing. The profile follows from the interactive logon and
-is not separately checked. The
+the session id and DPAPI directly, and reports symlink traversal — a probe that cannot create a
+link reports `Skipped` rather than failing, which is the usual outcome for the unprivileged
+agent. The profile follows from the interactive logon and is not separately checked. The
 unprivileged agent usually cannot create a link to self-test it.
 
 ## Where things live

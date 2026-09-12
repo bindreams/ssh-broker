@@ -36,7 +36,7 @@ a non-protected one, inherited ACEs, DENY entries, non-FullControl grants, extra
 an owner outside the allowed set. If it cannot prove the directory is safe, the agent refuses
 to bind.
 
-### Fail-open is deliberate, and only here
+### Fail-open is deliberate, and only on the relay path
 
 If the shim cannot reach the agent it runs a local shell and reports why. A broken broker must
 not cost you access to the machine. The local shell is `pwsh`, so this inherits the project's
