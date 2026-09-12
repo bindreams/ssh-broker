@@ -107,7 +107,8 @@ fn size_event_maps_to_resize_frame() {
 // ── is_transfer_command (route sftp/scp locally, not through the agent) ──────────────
 
 /// `ssh host " "` is a genuine exec request; only `ssh host ""` degrades to interactive
-/// (measured against a stock sshd). Mapping a blank command to `None` would hand the caller an
+/// (measured against a stock client — `ssh.c` sends a shell request only for an empty
+/// command buffer, so sshd never sees an empty exec). Mapping a blank command to `None` would hand the caller an
 /// interactive REPL on the SSH channel instead of running its no-op.
 #[test]
 fn normalize_exec_trims_but_keeps_a_blank_command_an_exec() {
@@ -156,8 +157,8 @@ fn detects_sftp_and_scp_transfers() {
         is_transfer_command("scp -i key -t /p"),
         "`-i` consumed `key`, so `-t` is a flag"
     );
-    // Every cluster below comes from a shipped client's own command template, not invented.
-    // Without these, a rule that only inspected the cluster's last character passes this file.
+    // The clusters below come from shipped clients' command templates, except the two marked
+    // synthetic. Without them, a rule inspecting only the cluster's last character passes.
     assert!(is_transfer_command("scp -pf /tmp/x"), "libssh2, download");
     assert!(
         is_transfer_command("scp -pt /tmp/x"),
@@ -172,11 +173,11 @@ fn detects_sftp_and_scp_transfers() {
         is_transfer_command("scp -tr /tmp/x"),
         "easyssh-proxy: mode letter not last"
     );
-    assert!(is_transfer_command("scp -prf /tmp/x"), "a longer cluster");
+    assert!(is_transfer_command("scp -prf /tmp/x"), "synthetic: a longer cluster");
     // An option that consumes the next token cannot itself be the mode flag.
     assert!(
         !is_transfer_command("scp -if /tmp/x"),
-        "`f` sits behind a value-taking `-i`"
+        "synthetic: `f` sits behind a value-taking `-i`"
     );
     // A pending consume swallows the NEXT token whatever it looks like: `-o` is `-i`'s value,
     // so it never acts as an option, and the `-t` after it is a genuine flag. Clearing the
@@ -198,10 +199,46 @@ fn detects_sftp_and_scp_transfers() {
     );
 }
 
+/// `VALUE_LETTERS` must be exactly scp's value-taking options — hardcoded here rather than
+/// derived, because a test that reads the set cannot notice the set shrinking: it just deletes
+/// its own coverage. Measured: with this absent, 9 of the 11 letters could be removed
+/// individually with the whole suite green.
+#[test]
+fn value_letters_is_exactly_scps_value_taking_options() {
+    // The `:`-suffixed letters of OpenSSH scp.c's optstring
+    // "12346ABCTdfOpqRrstvD:F:J:M:P:S:c:i:l:o:X:". `M` has no `case` and falls through to
+    // usage(), but getopt still consumes its argument, so it belongs here.
+    let sorted = |s: &str| {
+        let mut v: Vec<char> = s.chars().collect();
+        v.sort_unstable();
+        v
+    };
+    assert_eq!(sorted(super::VALUE_LETTERS), sorted("cDFiJlMoPSX"));
+}
+
+/// A real client command for each letter that is easy to get wrong. `-l` is the one that bit:
+/// jbardin/scp.py appends `-l <n>` whenever a bandwidth limit is set, so dropping `l` from the
+/// set makes `1000` read as the first operand and the transfer is missed entirely.
+#[test]
+fn value_taking_options_do_not_swallow_the_mode_flag() {
+    assert!(
+        is_transfer_command("scp -l 1000 -t /path"),
+        "scp.py, bandwidth-limited put"
+    );
+    assert!(
+        is_transfer_command("scp -l 1000 -r -p -f /path"),
+        "scp.py, the same fetching"
+    );
+    assert!(is_transfer_command("scp -c aes128-ctr -t /dst"));
+    assert!(is_transfer_command("scp -P 2222 -t /dst"));
+    assert!(is_transfer_command("scp -i /key/id_ed25519 -t /dst"));
+}
+
 /// Guards the CONTENTS of `VALUE_LETTERS`, which the loop below cannot: that loop reads the
 /// set, so adding a boolean flag to it silently turns real client commands into missed
-/// transfers while the loop stays green. Every shape here was captured from a live client, and
-/// each names a letter that must stay OUT of the set.
+/// transfers while the loop stays green. Each assertion names a letter that must stay OUT of
+/// the set; the ones marked with a client were captured from that client's source, the rest are
+/// synthetic probes chosen because the letter is a plain boolean in scp's optstring.
 #[test]
 fn real_client_shapes_survive_a_wrong_value_set() {
     // `-d` (target is a directory): OpenSSH sends it for a multi-source or directory upload.
@@ -211,14 +248,17 @@ fn real_client_shapes_survive_a_wrong_value_set() {
     assert!(is_transfer_command("scp -vt /dst"), "`-v` must not take a value");
     assert!(is_transfer_command("scp -v -r -p -d -f /src"), "a verbose fetch");
     // Other booleans that appear ahead of the mode letter.
+    // Synthetic: `-3`, `-q` and `-B` are booleans in the optstring, but no surveyed client
+    // sends them ahead of the mode letter — `-3` and `-B` never reach the remote command at
+    // all, and go-scp sends `-q` clustered as `-qt`.
     assert!(is_transfer_command("scp -3 -t /dst"), "`-3` must not take a value");
     assert!(is_transfer_command("scp -q -t /dst"), "`-q` must not take a value");
     assert!(is_transfer_command("scp -B -t /dst"), "`-B` must not take a value");
 }
 
 /// scp does not permute: option parsing stops at the first operand, so a dash-leading token
-/// after one is a path. Without this, an ordinary upload whose destination merely begins with
-/// `-f` was routed to the local passthrough, which spawns outside the session's job object.
+/// after one is a path. Without this, an ordinary copy with a source operand that merely begins
+/// with `-f` was routed to the local passthrough, which spawns outside the session's job object.
 #[test]
 fn stops_scanning_options_at_the_first_operand() {
     assert!(!is_transfer_command("scp f.txt -f host:/dst"));

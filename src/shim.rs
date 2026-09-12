@@ -134,7 +134,7 @@ impl<O: Write, E: Write> FrameSink for ExecOutSink<O, E> {
 /// rcp protocol's internal `-t`/`-f` flags — markers a human would never type, so no real
 /// session-1 command is misrouted.
 pub fn is_transfer_command(cmd: &str) -> bool {
-    // `run` has already trimmed what it will execute, so classification and execution agree;
+    // `route` has already trimmed what will execute, so classification and execution agree;
     // this trims again so a direct caller gets the same answer. Windows separates arguments on
     // space and tab only, so an untrimmed stray CR or LF stays glued to the program name and
     // defeats the basename match — which the `char::is_whitespace` scan this replaced did not.
