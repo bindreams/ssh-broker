@@ -150,12 +150,9 @@ pub fn is_transfer_command(cmd: &str) -> bool {
     {
         return true;
     }
-    // `CommandLineToArgvW`'s rule is not the rule the launch uses. `CreateProcessW` with a NULL
-    // `lpApplicationName` tries progressively longer space-delimited prefixes of an unquoted
-    // command line until one names a real executable, so
-    // `C:\Program Files\OpenSSH\sftp-server.exe -l ERROR` LAUNCHES fine while tokenizing here
-    // as `C:\Program`. Classifying by argv[0] alone therefore misses the transfer a default
-    // GitHub-release install emits — the direction that corrupts a binary stream.
+    // `CreateProcessW` with a NULL `lpApplicationName` widens across spaces until a prefix
+    // names a real executable, so an unquoted `C:\Program Files\...\sftp-server.exe` launches
+    // fine while tokenizing here as `C:\Program`. Classifying by argv[0] alone misses it.
     launch_candidates(cmd)
         .into_iter()
         .any(|(prog, rest)| classify(program_basename(prog).as_str(), &rest))
@@ -198,18 +195,14 @@ fn launch_candidates(cmd: &str) -> Vec<(&str, Vec<String>)> {
 /// Implements scp's own option grammar rather than approximating it. scp uses a non-permuting
 /// BSD `getopt`, so three rules decide everything:
 ///
-/// * option parsing STOPS at the first operand. A dash-leading token after it is a path, not a
-///   flag — without this, `scp f.txt -f host:/dst` reads as a transfer.
+/// * option parsing STOPS at the first operand; a dash-leading token after it is a path.
 /// * a value-taking option consumes the remainder of its own token if there is one
-///   (`-oFoo=no`, `-l100`), otherwise the whole next token, whatever that looks like —
-///   including `--`.
+///   (`-oFoo=no`, `-l100`), otherwise the whole next token, including `--`.
 /// * within a cluster, letters are options left to right until one takes a value.
 ///
-/// So the mode flag is a `t` or `f` reached before any value-taking letter. Clusters are not
-/// hypothetical and do not follow the rcp protocol's own flag set — each client writes its own
-/// command template. Measured from shipped sources: libssh2 `src/scp.c` builds `"scp -%sf "` /
-/// `"scp -%st "`; `bramvdbogaerde/go-scp` v1.5.0 sends `scp -qt`; `appleboy/easyssh-proxy`
-/// sends `scp -tr`, with the mode letter not even last.
+/// So the mode flag is a `t` or `f` reached before any value-taking letter. Clusters do not
+/// follow the rcp protocol's own flag set — each client writes its own command template, so the
+/// letters around the mode flag are whatever that client emitted.
 fn scp_is_rcp_mode(args: &[String]) -> bool {
     let mut expect_value = false;
     for a in args {
@@ -240,8 +233,7 @@ fn scp_is_rcp_mode(args: &[String]) -> bool {
     false
 }
 
-/// scp's value-taking short options, as letters. The single source for the rule above: an
-/// earlier version kept a parallel list of whole tokens, which could drift from this one.
+/// scp's value-taking short options, as letters — the single source for the rule above.
 pub(crate) const VALUE_LETTERS: &str = "cDFiJlMoPSX";
 
 /// Split a command line into argv the way `CommandLineToArgvW` would.
@@ -269,12 +261,10 @@ pub(crate) fn split_command(cmd: &str) -> Vec<String> {
     let wide: Vec<u16> = cmd.encode_utf16().collect();
     match cosca::quote::windows::split_wide(&wide) {
         Ok(tokens) => tokens.iter().map(|t| String::from_utf16_lossy(t)).collect(),
-        // `split_wide` has no failure path today — every `return` inside it is `Ok`. The
-        // `debug_assert` makes a future cosca that grows one fail CI here rather than silently
-        // changing what this returns: an empty token list classifies as not-a-transfer, which
-        // relays a binary stream through the agent and corrupts it. Not a panic in release,
-        // because a panic would cost the user their session; `error` rather than `warn`
-        // because the consequence is corruption, not degraded service.
+        // Unreachable today: every `return` in `split_wide` is `Ok`. The assert fails CI if a
+        // future cosca grows a failure path, because the silent alternative — an empty token
+        // list — classifies as not-a-transfer and corrupts a binary stream. Not a panic in
+        // release: that would cost the user their session.
         Err(e) => {
             debug_assert!(false, "split_wide gained a failure path: {e}");
             tracing::error!("could not tokenize the exec command ({e}); relaying it unclassified");
