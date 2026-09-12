@@ -261,34 +261,61 @@ fn real_client_shapes_survive_a_wrong_value_set() {
     assert!(is_transfer_command("scp -B -t /dst"), "`-B` must not take a value");
 }
 
-/// An unquoted program path containing spaces must still be detected.
+/// An UNQUOTED program path containing spaces is not detected, and that is deliberate.
 ///
 /// `CreateProcessW` with a NULL `lpApplicationName` widens across spaces until a prefix names a
-/// real executable, so the command below LAUNCHES correctly while `CommandLineToArgvW` reads
-/// argv[0] as `C:\Program`. Classifying by argv[0] alone missed it — and this is the shape a
-/// default GitHub-release OpenSSH install puts in its `Subsystem sftp` line, so the miss
-/// relays an sftp session through the agent and corrupts it.
+/// real executable, so such a command launches while `CommandLineToArgvW` reads argv[0] as
+/// `C:\Program`. Classifying by those same candidates was tried and reverted: it produced worse
+/// failures than it fixed. `icacls.exe C:\...\sftp-server.exe /grant Users:R` matched on a later
+/// candidate and was routed to the local passthrough — spawned in session 0, outside the
+/// session's job object — and no stock install emits the shape it was meant to catch, since
+/// Windows OpenSSH's default `Subsystem sftp` line is a bare `sftp-server.exe` with no path.
+/// Reaching the miss needs a hand-edited config with an unquoted spaced path; quoting it, which
+/// the sshd_config format already expects, avoids it. Tracked in #24.
 #[test]
-fn detects_an_unquoted_program_path_with_spaces() {
-    assert!(is_transfer_command(r"C:\Program Files\OpenSSH\sftp-server.exe"));
+fn does_not_detect_an_unquoted_program_path_with_spaces() {
+    assert!(!is_transfer_command(r"C:\Program Files\OpenSSH\sftp-server.exe"));
+    // The quoted form — what a config should use — is detected.
+    assert!(is_transfer_command(r#""C:\Program Files\OpenSSH\sftp-server.exe""#));
     assert!(is_transfer_command(
-        r"C:\Program Files\OpenSSH\sftp-server.exe -l ERROR"
+        r#""C:\Program Files\OpenSSH\sftp-server.exe" -l ERROR"#
     ));
-    assert!(is_transfer_command(r"C:\Program Files (x86)\OpenSSH\sftp-server.exe"));
-    // The same widening has to carry the arguments with it, or scp's mode flag is lost.
-    assert!(is_transfer_command(r"C:\Program Files\OpenSSH\scp.exe -t /dst"));
-    assert!(!is_transfer_command(r"C:\Program Files\OpenSSH\scp.exe file host:/p"));
+    // The failures that reverting avoids: an ordinary command naming the binary as an argument.
+    assert!(!is_transfer_command(
+        r"C:\Windows\System32\icacls.exe C:\Windows\System32\OpenSSH\sftp-server.exe /grant Users:R"
+    ));
+    assert!(!is_transfer_command(
+        r"C:\Windows\System32\cmd.exe /c del C:\x\sftp-server.exe"
+    ));
 }
 
-/// Widening only applies to a first token that already looks like a path. Without that guard,
-/// an ordinary command that merely MENTIONS a transfer binary would be routed to the local
-/// passthrough, which spawns outside the session's job object.
+/// `BOUNDARY` is deliberately narrower than Rust's `trim`: only the separators this pipeline
+/// treats as meaningful. A Unicode space is part of an argument, not padding around one.
 #[test]
-fn does_not_widen_a_bare_command_name() {
-    assert!(!is_transfer_command(r"echo C:\Program Files\OpenSSH\sftp-server.exe"));
-    assert!(!is_transfer_command(r"pwsh -c Get-Item C:\dir\sftp-server.exe"));
-    // A quoted path is exact under argv[0]'s rule, so there is nothing to widen.
-    assert!(is_transfer_command(r#""C:\Program Files\OpenSSH\sftp-server.exe""#));
+fn boundary_is_narrower_than_unicode_whitespace() {
+    assert_eq!(
+        super::normalize_exec(Some("\u{a0}scp -t /p".into())),
+        Some("\u{a0}scp -t /p".into())
+    );
+    assert_eq!(
+        super::normalize_exec(Some("\r\n scp -t /p \t".into())),
+        Some("scp -t /p".into())
+    );
+}
+
+/// Program names are matched case-insensitively, with either separator, and with or without
+/// the `.exe` suffix — all shapes a `Subsystem` line or a client may produce.
+#[test]
+fn program_basename_accepts_every_real_spelling() {
+    for cmd in [
+        "SFTP-SERVER.EXE",
+        r"C:/Windows/System32/OpenSSH/sftp-server.exe",
+        r"C:\Windows\System32\OpenSSH\sftp-server",
+        "Internal-SFTP",
+    ] {
+        assert!(is_transfer_command(cmd), "{cmd}");
+    }
+    assert!(is_transfer_command("SCP.EXE -t /dst"));
 }
 
 /// scp does not permute: option parsing stops at the first operand, so a dash-leading token

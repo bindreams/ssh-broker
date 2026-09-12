@@ -143,51 +143,15 @@ impl<O: Write, E: Write> FrameSink for ExecOutSink<O, E> {
 pub fn is_transfer_command(cmd: &str) -> bool {
     // `route` already trimmed what will execute, so classification and execution agree; this
     // trims again so a direct caller gets the same answer.
-    let cmd = cmd.trim_matches(BOUNDARY);
-    let tokens = split_command(cmd);
-    if let Some(prog) = tokens.first()
-        && classify(program_basename(prog).as_str(), &tokens[1..])
-    {
-        return true;
-    }
-    // `CreateProcessW` with a NULL `lpApplicationName` widens across spaces until a prefix
-    // names a real executable, so an unquoted `C:\Program Files\...\sftp-server.exe` launches
-    // fine while tokenizing here as `C:\Program`. Classifying by argv[0] alone misses it.
-    launch_candidates(cmd)
-        .into_iter()
-        .any(|(prog, rest)| classify(program_basename(prog).as_str(), &rest))
-}
-
-/// Whether a program name plus its arguments is a transfer.
-fn classify(basename: &str, args: &[String]) -> bool {
-    match basename {
+    let tokens = split_command(cmd.trim_matches(BOUNDARY));
+    let Some(prog) = tokens.first() else {
+        return false;
+    };
+    match program_basename(prog).as_str() {
         "sftp-server" | "internal-sftp" => true,
-        "scp" => scp_is_rcp_mode(args),
+        "scp" => scp_is_rcp_mode(&tokens[1..]),
         _ => false,
     }
-}
-
-/// The program names `CreateProcessW` would try for an unquoted command line, each paired with
-/// the arguments that would follow it.
-///
-/// Only widened when the first token already looks like a path — it holds a separator or a
-/// drive colon. Without that guard, `echo C:\dir\sftp-server.exe` would match on a later
-/// prefix and route an ordinary command to the local passthrough.
-fn launch_candidates(cmd: &str) -> Vec<(&str, Vec<String>)> {
-    let trimmed = cmd.trim_matches(BOUNDARY);
-    let Some(first_end) = trimmed.find(BOUNDARY) else {
-        return Vec::new(); // a single token: argv[0]'s rule already saw all of it
-    };
-    if trimmed.starts_with('"') || !trimmed[..first_end].contains(['\\', '/', ':']) {
-        return Vec::new();
-    }
-    let mut out: Vec<(&str, Vec<String>)> = trimmed
-        .char_indices()
-        .filter(|(i, c)| *i > first_end && matches!(c, ' ' | '\t'))
-        .map(|(i, _)| (&trimmed[..i], split_command(&trimmed[i..])))
-        .collect();
-    out.push((trimmed, Vec::new())); // the whole line, for a path with no arguments
-    out
 }
 
 /// Whether an `scp` argument list is the rcp-protocol mode sshd is being asked to run.
