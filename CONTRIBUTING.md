@@ -94,10 +94,11 @@ Waiting on a genuinely external event is fine and uses an unbounded wait; a wait
 numeric bound is not. A long-lived sentinel in a fixture opts out with a same-line
 `sleep-ok:` marker **and a reason** — a bare marker does not suppress.
 
-**No arbitrary retry or loop caps in this crate's own code** *(review-enforced)*. One declarative
-exception is documented where it occurs: the agent task's `RestartOnFailure` carries a Windows
-Task Scheduler `Count`, which the schema requires and which cannot be expressed as unbounded.
-Retrying a specific, self-clearing condition is fine —
+**No arbitrary retry caps** *(review-enforced)*. Two numeric bounds are deliberate and documented
+where they occur: the agent task's `RestartOnFailure` carries a Task Scheduler `Count`, which the
+schema requires and cannot express as unbounded; and `decode_output` sniffs UTF-16 by counting
+NULs in a fixed leading window, which is a heuristic over a fixed input rather than a cap on
+work. Retrying a specific, self-clearing condition is fine —
 `ErrorKind::Interrupted` is retried in place, because `Read::read` documents it as
 non-fatal. Inventing a maximum attempt count is not.
 

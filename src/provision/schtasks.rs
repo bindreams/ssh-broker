@@ -42,7 +42,8 @@ pub fn agent_task_xml(exe: &str, user: &str) -> String {
     <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
     <!-- The project forbids arbitrary retry caps, and this is the one documented exception: the
          Task Scheduler schema requires a Count with RestartOnFailure and has no unbounded form.
-         The ONSTART self-heal task is what covers a failure that outlasts these attempts. -->
+         A failure outlasting these attempts is covered at the next boot or logon, by the
+         ONSTART self-heal task and the agent task's own logon trigger — not before. -->
     <RestartOnFailure><Interval>PT1M</Interval><Count>3</Count></RestartOnFailure>
     <Enabled>true</Enabled>
   </Settings>

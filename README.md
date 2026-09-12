@@ -31,7 +31,7 @@ The two halves talk over an AF_UNIX socket whose directory grants Full Control t
 
 ## Requirements
 
-**PowerShell Core (`pwsh`) must be installed.** Stock Windows ships `powershell.exe` 5.1, which is a different binary. `pwsh` is what the agent hosts for an interactive session when no shell is configured, and what the shim falls back to when the agent is unreachable; `ssh host "cmd"` runs the command you name and is unaffected. The Windows test suite also assumes it.
+**PowerShell Core (`pwsh`) must be installed.** Stock Windows ships `powershell.exe` 5.1, which is a different binary. `pwsh` is what the agent hosts for an interactive session when no shell is configured, and what the shim falls back to when the agent is unreachable — for `ssh host "cmd"` as well, since both paths share that fallback. The Windows test suite also assumes it.
 
 ## Limits worth knowing before you install it
 
