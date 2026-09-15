@@ -157,9 +157,11 @@ pub fn is_transfer_command(cmd: &str) -> bool {
 /// Whether an `scp` argument list is the rcp-protocol mode sshd is being asked to run.
 ///
 /// Implements scp's own option grammar rather than approximating it. scp uses a non-permuting
-/// BSD `getopt`, so three rules decide everything:
+/// BSD `getopt`, so four rules decide everything:
 ///
 /// * option parsing STOPS at the first operand; a dash-leading token after it is a path.
+/// * a letter absent from [`SCP_OPTSTRING`] is getopt's `BADCH`: scp prints usage and exits,
+///   so the command never speaks the rcp protocol at all.
 /// * a value-taking option consumes the remainder of its own token if there is one
 ///   (`-oFoo=no`, `-l100`), otherwise the whole next token, including `--`.
 /// * within a cluster, letters are options left to right until one takes a value.
@@ -184,7 +186,13 @@ fn scp_is_rcp_mode(args: &[String]) -> bool {
             return false; // a bare `-` is an operand
         }
         for (i, c) in rest.char_indices() {
-            if VALUE_LETTERS.contains(c) {
+            if c == ':' || !SCP_OPTSTRING.contains(c) {
+                // getopt's BADCH. A `:` is in the optstring only as a value marker, never an
+                // option, so it is rejected too — otherwise `--` handling aside, `-:t` would
+                // read as a transfer.
+                return false;
+            }
+            if takes_value(c) {
                 // Its argument is the rest of this token, or the next one if there is no rest.
                 expect_value = rest[i + c.len_utf8()..].is_empty();
                 break;
@@ -197,8 +205,21 @@ fn scp_is_rcp_mode(args: &[String]) -> bool {
     false
 }
 
-/// scp's value-taking short options, as letters — the single source for the rule above.
-pub(crate) const VALUE_LETTERS: &str = "cDFiJlMoPSX";
+/// scp's own getopt optstring, verbatim from OpenSSH's `scp.c` — the single source for the rule
+/// above. A `:` suffix marks a value-taking letter; every other letter is a boolean flag, and a
+/// letter absent from the string is one getopt rejects.
+pub(crate) const SCP_OPTSTRING: &str = "12346ABCTdfOpqRrstvD:F:J:M:P:S:c:i:l:o:X:";
+
+/// The value-taking letters of [`SCP_OPTSTRING`], i.e. those written with a `:` suffix.
+pub(crate) fn value_taking_letters() -> impl Iterator<Item = char> {
+    let b = SCP_OPTSTRING.as_bytes(); // the optstring is ASCII, so bytes index chars
+    (0..b.len()).filter_map(move |i| (b[i] != b':' && b.get(i + 1) == Some(&b':')).then_some(b[i] as char))
+}
+
+/// Whether `c` is one of scp's value-taking options.
+fn takes_value(c: char) -> bool {
+    value_taking_letters().any(|l| l == c)
+}
 
 /// Split a command line into argv the way `CommandLineToArgvW` would.
 ///

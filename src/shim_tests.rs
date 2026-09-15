@@ -202,22 +202,32 @@ fn detects_sftp_and_scp_transfers() {
     );
 }
 
-/// `VALUE_LETTERS` must be exactly scp's value-taking options — hardcoded here rather than
-/// derived, because a test that reads the set cannot notice the set shrinking: it just deletes
-/// its own coverage. Measured at this commit: with this test absent, six of the eleven letters
+/// `SCP_OPTSTRING` must be scp's optstring verbatim — hardcoded here rather than derived,
+/// because a test that reads it cannot notice it shrinking: it just deletes its own coverage.
+/// Measured at this commit: with this test absent, six of the eleven value-taking letters
 /// (`D F J M S X`) can each be removed with the whole suite still green — precisely the ones no
-/// command below exercises.
+/// command below exercises. Verified against the shipped `scp` binary, not transcribed from
+/// documentation. `M` has no `case` and falls through to usage(), but getopt still consumes its
+/// argument, so it keeps its `:`.
 #[test]
-fn value_letters_is_exactly_scps_value_taking_options() {
-    // The `:`-suffixed letters of OpenSSH scp.c's optstring
-    // "12346ABCTdfOpqRrstvD:F:J:M:P:S:c:i:l:o:X:". `M` has no `case` and falls through to
-    // usage(), but getopt still consumes its argument, so it belongs here.
-    let sorted = |s: &str| {
-        let mut v: Vec<char> = s.chars().collect();
-        v.sort_unstable();
-        v
-    };
-    assert_eq!(sorted(super::VALUE_LETTERS), sorted("cDFiJlMoPSX"));
+fn optstring_is_exactly_scps_own() {
+    assert_eq!(super::SCP_OPTSTRING, "12346ABCTdfOpqRrstvD:F:J:M:P:S:c:i:l:o:X:");
+}
+
+/// A letter scp's own getopt would reject is `BADCH`: scp prints usage and exits, so the command
+/// never speaks the rcp protocol at all. Treating an unknown letter as a harmless boolean let a
+/// `t` or `f` LATER in the cluster decide the command, routing an ordinary command to the local
+/// passthrough — which spawns outside the session's job object and resolves PATH in session 0.
+#[test]
+fn letters_scp_would_reject_are_not_transfers() {
+    // `--force` strips one dash to `-force`; getopt looks up `-`, which is not in the optstring.
+    assert!(!is_transfer_command("scp --force a b"), "`-` is BADCH, not a boolean");
+    assert!(
+        !is_transfer_command("scp --two a b"),
+        "`-` is BADCH before `t` is reached"
+    );
+    assert!(!is_transfer_command("scp -zt /p"), "`z` is not in scp's optstring");
+    assert!(!is_transfer_command("scp -Zf /p"), "`Z` is not in scp's optstring");
 }
 
 /// Commands where a value-taking option must not swallow the mode flag.
@@ -336,7 +346,7 @@ fn stops_scanning_options_at_the_first_operand() {
 /// reads the set, so it cannot see the set itself being wrong; that is the test above.
 #[test]
 fn every_value_taking_option_consumes_its_argument() {
-    for letter in super::VALUE_LETTERS.chars() {
+    for letter in super::value_taking_letters() {
         assert!(
             !is_transfer_command(&format!("scp -{letter} -t /p")),
             "-{letter} must consume the `-t` after it"
