@@ -228,6 +228,28 @@ fn letters_scp_would_reject_are_not_transfers() {
     );
     assert!(!is_transfer_command("scp -zt /p"), "`z` is not in scp's optstring");
     assert!(!is_transfer_command("scp -Zf /p"), "`Z` is not in scp's optstring");
+    // A GNU-cp habit on the remote host, and the shape that made this reachable in practice.
+    assert!(
+        !is_transfer_command("scp --target-directory=/tmp file host:/x"),
+        "the `t` after the BADCH `-` must not decide the command"
+    );
+}
+
+/// The derivation must itself be right: `value_taking_letters` has to find exactly the
+/// `:`-suffixed letters of the optstring. This is the half `optstring_is_exactly_scps_own`
+/// cannot see — that test pins the source string, this one pins the parse of it. A bug in
+/// either alone silently changes which options consume their argument, and a value-taking
+/// letter that stops consuming lets the `-t` after it read as the mode flag.
+#[test]
+fn value_taking_letters_are_derived_from_the_optstring() {
+    let sorted = |mut v: Vec<char>| {
+        v.sort_unstable();
+        v
+    };
+    assert_eq!(
+        sorted(super::value_taking_letters().collect()),
+        sorted("cDFiJlMoPSX".chars().collect())
+    );
 }
 
 /// Commands where a value-taking option must not swallow the mode flag.
@@ -284,7 +306,7 @@ fn real_client_shapes_survive_a_wrong_value_set() {
 /// session's job object — and no stock install emits the shape it was meant to catch, since
 /// Windows OpenSSH's default `Subsystem sftp` line is a bare `sftp-server.exe` with no path.
 /// Reaching the miss needs a hand-edited config with an unquoted spaced path; quoting it, which
-/// the sshd_config format already expects, avoids it. Tracked in #24.
+/// the sshd_config format already expects, avoids it.
 #[test]
 fn does_not_detect_an_unquoted_program_path_with_spaces() {
     assert!(!is_transfer_command(r"C:\Program Files\OpenSSH\sftp-server.exe"));
@@ -300,6 +322,34 @@ fn does_not_detect_an_unquoted_program_path_with_spaces() {
     assert!(!is_transfer_command(
         r"C:\Windows\System32\cmd.exe /c del C:\x\sftp-server.exe"
     ));
+}
+
+/// The miss above is reachable and corrupts a binary stream, so it must leave a footprint an
+/// operator can find. The `split_wide` Err path already logs even though it is unreachable; this
+/// case is reachable and logged nothing, so a corrupted transfer gave no signal pointing at the
+/// classification layer at all.
+///
+/// The hint must NOT fire on the commands that reverting the widening protected — that is the
+/// whole reason it is a log line and not a routing rule. `icacls.exe` names the binary as an
+/// argument but is a real executable in argv[0], so it stays out.
+#[test]
+fn an_unquoted_spaced_transfer_path_leaves_a_diagnostic() {
+    assert!(super::missed_transfer_hint(r"C:\Program Files\OpenSSH\sftp-server.exe"));
+    assert!(super::missed_transfer_hint(r"C:\Program Files\OpenSSH\scp.exe -t /dst"));
+    // The quoted form is classified correctly, so there is nothing to warn about.
+    assert!(!super::missed_transfer_hint(
+        r#""C:\Program Files\OpenSSH\sftp-server.exe""#
+    ));
+    // The false-positive shapes that made widening-based ROUTING untenable.
+    assert!(!super::missed_transfer_hint(
+        r"C:\Windows\System32\icacls.exe C:\Windows\System32\OpenSSH\sftp-server.exe /grant Users:R"
+    ));
+    assert!(!super::missed_transfer_hint(
+        r"C:\Windows\System32\cmd.exe /c del C:\x\sftp-server.exe"
+    ));
+    // Ordinary commands, and correctly-classified transfers, stay silent.
+    assert!(!super::missed_transfer_hint("scp -t /p"));
+    assert!(!super::missed_transfer_hint("sftp-server.exe"));
 }
 
 /// `BOUNDARY` is deliberately narrower than Rust's `trim`: only the separators this pipeline
@@ -630,7 +680,6 @@ fn split_command_round_trips_utf16_through_the_splitter() {
         vec!["p", r#"a""#],
         "three quotes yield one"
     );
-    // The exact divergence documented on `split_command`: the old scan produced `C:\dir\`.
     assert_eq!(
         split_command(r##"scp -t "C:\dir\"""##),
         vec!["scp", "-t", r#"C:\dir""#],

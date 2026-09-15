@@ -154,6 +154,28 @@ pub fn is_transfer_command(cmd: &str) -> bool {
     }
 }
 
+/// Whether a command that classified as NOT a transfer nonetheless shows the one shape
+/// argv[0]-only classification cannot see: an unquoted program path containing spaces.
+/// `CreateProcessW` with a NULL `lpApplicationName` widens past the space and launches the
+/// transfer helper, while `CommandLineToArgvW` truncated argv[0] at it — so the command is
+/// relayed, and its binary stream corrupts with nothing in the log pointing at classification.
+///
+/// Diagnostic only: it never routes. Routing on widened candidates was implemented and reverted
+/// because it misrouted ordinary commands that merely NAME the binary as an argument. This fires
+/// only when argv[0] is itself path-shaped yet not an executable name, which is exactly what
+/// keeps `icacls.exe …\sftp-server.exe` — the shape that broke the widening — out of it.
+pub fn missed_transfer_hint(cmd: &str) -> bool {
+    let tokens = split_command(cmd.trim_matches(BOUNDARY));
+    let Some(prog) = tokens.first() else {
+        return false;
+    };
+    let truncated_path = prog.contains(['\\', '/', ':']) && !prog.to_ascii_lowercase().ends_with(".exe");
+    truncated_path
+        && tokens[1..]
+            .iter()
+            .any(|t| matches!(program_basename(t).as_str(), "sftp-server" | "internal-sftp" | "scp"))
+}
+
 /// Whether an `scp` argument list is the rcp-protocol mode sshd is being asked to run.
 ///
 /// Implements scp's own option grammar rather than approximating it. scp uses a non-permuting
@@ -226,15 +248,14 @@ fn takes_value(c: char) -> bool {
 /// Note this is the rule a *program* sees for its own argv, not the rule `CreateProcessW` uses
 /// to pick the executable when `lpApplicationName` is NULL (as at the launch sites): that one
 /// scans spaces, so an unquoted `C:\Program Files\...\sftp-server.exe` launches correctly while
-/// tokenizing here as `C:\Program`. Detection and launch can therefore disagree — see #24.
+/// tokenizing here as `C:\Program`. Detection and launch can therefore disagree.
 ///
 /// Delegates to `cosca::quote::windows::split_wide`, the `CommandLineToArgvW`-compatible
 /// splitter — including the mod-3 rule shell32 applies to runs of consecutive bare quotes,
-/// which the simpler MSVCRT `main()` parser (and this module's previous hand-rolled scan) get
-/// wrong. That scan documented itself as "not a full `CommandLineToArgvW` (no backslash-escaping
-/// of quotes)", and the divergence is real: for `scp -t "C:\dir\""` the old scan yielded a final
-/// token of `C:\dir\`, where Windows reads the `\"` as an escaped quote and yields `C:\dir"`.
-/// That is measured, not reasoned: see `split_command_round_trips_utf16_through_the_splitter`.
+/// which the simpler MSVCRT `main()` parser gets wrong. The divergence is measured, not reasoned:
+/// for `scp -t "C:\dir\""` a hand-rolled scan yields a final token of `C:\dir\`, where Windows
+/// reads the `\"` as an escaped quote and yields `C:\dir"` — which is why this delegates rather
+/// than matching on tokens itself. See `split_command_round_trips_utf16_through_the_splitter`.
 ///
 /// argv[0] is parsed by a different rule again — no backslash-escaping at all — and that rule
 /// genuinely diverges: `a\"b c` splits as `a\"b` + `c` in leading position, where the same bytes

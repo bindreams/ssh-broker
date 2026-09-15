@@ -68,6 +68,17 @@ pub fn run_on(exec: Option<String>) -> anyhow::Result<()> {
         drop(log);
         return run_local_passthrough(cmd);
     }
+    // Classified as not-a-transfer, but shaped like the one miss this rule cannot see: an
+    // unquoted spaced program path, which Windows launches and we tokenize short. Relaying it
+    // corrupts the binary stream, so leave the operator a signal rather than failing silently.
+    if let Some(cmd) = &exec
+        && crate::shim::missed_transfer_hint(cmd)
+    {
+        tracing::warn!(
+            "relaying a command whose program path looks like an unquoted transfer helper; \
+             if a transfer hangs or corrupts, quote the path in sshd_config"
+        );
+    }
 
     match try_relay(&exec) {
         Ok(Some(code)) => {
