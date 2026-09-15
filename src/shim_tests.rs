@@ -157,7 +157,7 @@ fn detects_sftp_and_scp_transfers() {
         is_transfer_command("scp -i key -t /p"),
         "`-i` consumed `key`, so `-t` is a flag"
     );
-    // The clusters below come from shipped clients' command templates, except the two marked
+    // The clusters below come from shipped clients' command templates, except the one marked
     // synthetic. Without them, a rule inspecting only the cluster's last character passes.
     assert!(is_transfer_command("scp -pf /tmp/x"), "libssh2, download");
     assert!(
@@ -173,7 +173,10 @@ fn detects_sftp_and_scp_transfers() {
         is_transfer_command("scp -tr /tmp/x"),
         "easyssh-proxy: mode letter not last"
     );
-    assert!(is_transfer_command("scp -prf /tmp/x"), "synthetic: a longer cluster");
+    assert!(
+        is_transfer_command("scp -prf /tmp/x"),
+        "Renci SSH.NET, recursive download preserving times"
+    );
     // An option that consumes the next token cannot itself be the mode flag.
     assert!(
         !is_transfer_command("scp -if /tmp/x"),
