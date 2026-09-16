@@ -13,6 +13,7 @@ pub mod probe;
 pub mod registry;
 pub mod report;
 pub mod schtasks;
+pub mod sshd;
 
 /// `apply` subcommand: idempotently assert all desired state. Windows-only.
 pub fn apply() -> anyhow::Result<()> {
