@@ -42,7 +42,7 @@ pub fn verify_probe() -> anyhow::Result<()> {
 
 #[cfg(windows)]
 mod imp {
-    use super::{config, probe, registry, report, schtasks};
+    use super::{config, probe, registry, report, schtasks, sshd};
     use crate::{acl, afunix, shim};
     use anyhow::Context;
     use std::path::{Path, PathBuf};
@@ -117,7 +117,8 @@ mod imp {
         );
 
         // 3. Persist config (records the account for the SYSTEM self-heal).
-        write_config(&user)?;
+        let declared = read_declared_subsystems()?;
+        write_config(&user, &declared)?;
 
         // 4. Register both tasks (idempotent /F).
         register_agent_task(&exe, &user)?;
@@ -174,9 +175,38 @@ mod imp {
         matches!((std::fs::read(a), std::fs::read(b)), (Ok(x), Ok(y)) if x == y)
     }
 
-    fn write_config(user: &str) -> anyhow::Result<()> {
+    /// Ask sshd for its own effective configuration and extract the `Subsystem` declarations.
+    ///
+    /// `sshd -T` prints the RESOLVED config: `dump_config` emits `subsystem <name> <args>`, where
+    /// `<args>` is `subsystem_args` — the exact string sshd hands the login shell, i.e. the shim.
+    /// Asking sshd avoids re-deriving it from `sshd_config`, which would mean reimplementing
+    /// `argv_split` and `argv_assemble` and keeping both in step with upstream forever.
+    ///
+    /// Fails loudly rather than recording nothing. An empty list means "match nothing", so a
+    /// half-provisioned install would look healthy while the matching this exists for never fired.
+    fn read_declared_subsystems() -> anyhow::Result<Vec<sshd::Subsystem>> {
+        // Normally on PATH via the OpenSSH feature, but PATH is not guaranteed for a SYSTEM-run
+        // apply, so fall back to the canonical install location before giving up.
+        const FALLBACK: &str = r"C:\Windows\System32\OpenSSH\sshd.exe";
+        let mut last: Option<String> = None;
+        for exe in ["sshd", FALLBACK] {
+            match std::process::Command::new(exe).arg("-T").output() {
+                Ok(out) if out.status.success() => return Ok(sshd::parse_subsystems(&decode_output(&out.stdout))),
+                Ok(out) => last = Some(format!("`{exe} -T` failed: {}", decode_output(&out.stderr).trim())),
+                Err(e) => last = Some(format!("could not run `{exe}`: {e}")),
+            }
+        }
+        anyhow::bail!(
+            "could not read sshd's effective configuration ({}); the shim routes transfers by \
+             matching sshd's own Subsystem declarations, so provisioning cannot proceed without it",
+            last.unwrap_or_else(|| "no attempt was made".into())
+        )
+    }
+
+    fn write_config(user: &str, declared: &[sshd::Subsystem]) -> anyhow::Result<()> {
         let toml = config::Config {
             target_user: user.to_string(),
+            declared_subsystems: declared.to_vec(),
         }
         .to_toml()?;
         // Direct overwrite: config.toml is read only by apply/verify, never concurrently with

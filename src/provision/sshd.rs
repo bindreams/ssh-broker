@@ -22,7 +22,10 @@
 //! own answer, byte for byte, for the cost of parsing one line shape.
 
 /// One `Subsystem` declaration, as sshd resolved it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Serialisable because `apply` records these in the persisted config for the shim to read: the
+/// shim runs per SSH session and must not shell out to `sshd -T` on every command.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Subsystem {
     /// The key a client names in a subsystem request, e.g. `sftp`.
     pub name: String,

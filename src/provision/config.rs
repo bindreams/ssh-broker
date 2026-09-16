@@ -13,6 +13,18 @@ use serde::{Deserialize, Serialize};
 pub struct Config {
     /// The account the agent task runs as, == the socket-dir ACL grantee.
     pub target_user: String,
+    /// The subsystem declarations `apply` read from `sshd -T` — what sshd will actually hand the
+    /// shim for each `Subsystem` line. The shim compares an incoming command against these rather
+    /// than inspecting it, so routing follows the administrator's declaration instead of a
+    /// client-chosen string. Recorded here because the shim runs once per SSH command and must
+    /// not shell out to `sshd -T` each time.
+    ///
+    /// `#[serde(default)]` is load-bearing, not tidiness: a `config.toml` written by an earlier
+    /// `apply` has no such key, and a hard parse failure would break the SYSTEM self-heal — the
+    /// one path that must never need a human. Defaulting to empty is safe because an empty list
+    /// matches nothing, and an unmatched command is relayed, which is correct (if slower).
+    #[serde(default)]
+    pub declared_subsystems: Vec<super::sshd::Subsystem>,
 }
 
 impl Config {
