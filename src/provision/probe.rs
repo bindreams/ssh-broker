@@ -44,6 +44,54 @@ pub struct ProbeResult {
     pub symlink: SymlinkState,
 }
 
+// ── binary-transparency probe ────────────────────────────────────────────────────────
+
+/// Brackets around the binary-transparency payload in the probe child's stdout.
+///
+/// These cannot collide with the data they delimit. [`binary_probe_payload`] is the 256 byte
+/// values in ascending order, so every window of it is a consecutive ascending run — and neither
+/// `BINPROBE<` (`42 49 4E 50 52 4F 42 45 3C`) nor `>BINPROBE` is. A naive byte search therefore
+/// cannot land inside the payload, which matters precisely because the payload is arbitrary bytes.
+const BINARY_PROBE_OPEN: &[u8] = b"BINPROBE<";
+const BINARY_PROBE_CLOSE: &[u8] = b">BINPROBE";
+
+/// The payload the probe child writes and `verify` checks: every one of the 256 byte values, so
+/// NUL, `0xFF`, a lone CR, a lone LF and invalid UTF-8 all have to survive the real path.
+pub fn binary_probe_payload() -> Vec<u8> {
+    (0..=255u8).collect()
+}
+
+/// Write the bracketed payload. Deliberately `write_all` on a raw handle rather than `println!`:
+/// the whole point is that no layer between here and `verify` reinterprets a byte.
+pub fn emit_binary_probe<W: std::io::Write>(w: &mut W) -> std::io::Result<()> {
+    w.write_all(BINARY_PROBE_OPEN)?;
+    w.write_all(&binary_probe_payload())?;
+    w.write_all(BINARY_PROBE_CLOSE)?;
+    w.write_all(b"\n")?; // so the PROBE line that follows starts cleanly
+    w.flush()
+}
+
+/// Whether the payload crossed the agent, the child's pipes and the frame relay byte for byte.
+///
+/// This is the end-to-end half of a claim the in-memory relay tests cannot reach: they exercise
+/// the shim's framing over a duplex in one process, never a real `CreatePipe`, a real child or a
+/// real socket. Default-deny — a missing or truncated marker is a FAILURE, not a skip, so an
+/// installed binary too old to emit it is reported rather than silently passed.
+pub fn binary_probe_ok(stdout: &[u8]) -> bool {
+    extract_binary_probe(stdout).is_some_and(|got| got == binary_probe_payload())
+}
+
+fn extract_binary_probe(stdout: &[u8]) -> Option<&[u8]> {
+    let open = find_bytes(stdout, BINARY_PROBE_OPEN)? + BINARY_PROBE_OPEN.len();
+    let rest = &stdout[open..];
+    let close = find_bytes(rest, BINARY_PROBE_CLOSE)?;
+    Some(&rest[..close])
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
 /// The single line `verify-probe` prints to stdout.
 pub fn format_probe_line(session_id: u32, dpapi_ok: bool, symlink: SymlinkState) -> String {
     format!(

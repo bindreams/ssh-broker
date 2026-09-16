@@ -35,7 +35,7 @@ pub fn route(args: &[String]) -> Route {
             // across argv is not truncated. `-c` with nothing after it degrades to an
             // interactive shim (no command).
             let exec = if args.len() > 1 {
-                Some(args[1..].join(" "))
+                crate::shim::normalize_exec(Some(args[1..].join(" ")))
             } else {
                 None
             };
