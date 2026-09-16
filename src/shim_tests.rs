@@ -44,6 +44,109 @@ fn exec_shim_relays_streams_and_exit() {
     assert_eq!(err, b"ERR");
 }
 
+/// The EXEC relay must be byte-transparent. This is the premise the whole transfer-classification
+/// design rests on, and until now it was only ever asserted in prose: if relaying mangles bytes,
+/// a missed classification corrupts an sftp/scp stream and detection is a correctness gate; if it
+/// does not, detection is a throughput choice and nothing more.
+///
+/// The claim entered the tree with `40c30b2`, whose message has no body and which bundled two
+/// changes. The only defect actually measured there was sftp *hanging* — `std::io::stdout()` is a
+/// `LineWriter`, so newline-less output sat in the buffer — and the fix for that is the per-frame
+/// flush, which applies to every relayed command whether or not it is classified as a transfer.
+/// Nothing tested byte-transparency itself, so the premise could diverge silently. This is that
+/// test.
+///
+/// Payload: all 256 byte values, so NUL, `0xFF`, a lone CR, a lone LF and invalid UTF-8 are all
+/// present. The agent writes it in deliberately awkward chunks — 1 byte, then a chunk ending
+/// exactly on a 256 boundary, then the remainder — so no frame aligns with the value cycle and
+/// reassembly across frames is exercised rather than assumed.
+#[test]
+fn exec_relay_is_byte_clean_from_the_agent() {
+    let payload: Vec<u8> = (0..=255u8).cycle().take(1024).collect();
+    let chunks: Vec<Vec<u8>> = vec![payload[..1].to_vec(), payload[1..257].to_vec(), payload[257..].to_vec()];
+
+    let (server, client) = duplex();
+    let (mut srx, mut stx) = server.split();
+    let (crx, ctx) = client.split();
+
+    let expect = payload.clone();
+    let agent = std::thread::spawn(move || {
+        let mut fr = FrameReader::new();
+        let _ = read_one_frame(&mut srx, &mut fr).unwrap(); // consume the handshake
+        for c in &chunks {
+            write_data(&mut stx, Stream::Stdout, c).unwrap();
+        }
+        // The same bytes on stderr: proves the streams stay separate AND that both stay clean.
+        write_data(&mut stx, Stream::Stderr, &expect).unwrap();
+        write_frame(&mut stx, FrameKind::Exit, &ExitCode(0).encode()).unwrap();
+    });
+
+    let hs = Handshake {
+        mode: Mode::Exec,
+        command: Some("x".into()),
+        ..Handshake::pty_default()
+    };
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    let code = super::run_exec_on(crx, ctx, &hs, &mut out, &mut err, std::io::empty()).unwrap();
+    agent.join().unwrap();
+
+    assert_eq!(code, 0);
+    assert_eq!(out, payload, "stdout must round-trip every byte value unchanged");
+    assert_eq!(err, payload, "stderr must round-trip too, and not merge into stdout");
+}
+
+/// The upstream half of the same premise: bytes the client sends — an `sftp put`, an `scp`
+/// upload — must reach the agent unchanged. This direction carries a hazard the downstream one
+/// does not: `forward_stdin` signals end-of-input with an EMPTY `Stdin` frame rather than by
+/// closing the connection (closing would make the agent treat it as a disconnect and kill the
+/// child), so a reader that took a zero-length payload for data would corrupt an upload.
+///
+/// Same adversarial payload as the downstream test: all 256 byte values.
+#[test]
+fn exec_relay_is_byte_clean_to_the_agent() {
+    let payload: Vec<u8> = (0..=255u8).cycle().take(1024).collect();
+
+    let (server, client) = duplex();
+    let (mut srx, mut stx) = server.split();
+    let (crx, ctx) = client.split();
+
+    let agent = std::thread::spawn(move || {
+        let mut fr = FrameReader::new();
+        let _ = read_one_frame(&mut srx, &mut fr).unwrap(); // consume the handshake
+        let mut got = Vec::new();
+        loop {
+            let frame = read_one_frame(&mut srx, &mut fr).unwrap();
+            assert_eq!(frame.kind, FrameKind::Data);
+            assert_eq!(
+                frame.payload[0],
+                Stream::Stdin as u8,
+                "only stdin flows upstream in EXEC"
+            );
+            let bytes = &frame.payload[1..];
+            if bytes.is_empty() {
+                break; // the stdin-EOF marker — NOT a zero-length write
+            }
+            got.extend_from_slice(bytes);
+        }
+        write_frame(&mut stx, FrameKind::Exit, &ExitCode(0).encode()).unwrap();
+        got
+    });
+
+    let hs = Handshake {
+        mode: Mode::Exec,
+        command: Some("x".into()),
+        ..Handshake::pty_default()
+    };
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    let code = super::run_exec_on(crx, ctx, &hs, &mut out, &mut err, std::io::Cursor::new(payload.clone())).unwrap();
+    let got = agent.join().unwrap();
+
+    assert_eq!(code, 0);
+    assert_eq!(got, payload, "stdin must round-trip every byte value unchanged");
+}
+
 #[test]
 fn exec_shim_dead_agent_is_255_not_command_failure() {
     // The agent dies after spawning the child but before writing EXIT (e.g. crash). The shim
