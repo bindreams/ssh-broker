@@ -153,14 +153,9 @@ fn term() -> String {
 /// our stdio directly, instead of relaying it to the agent. The child writes raw to sshd's
 /// pipes (no Rust buffering), exactly as the original DefaultShell did. Exits with its code.
 fn run_local_passthrough(command: &str) -> anyhow::Result<()> {
-    use anyhow::Context;
-    use windows::Win32::Foundation::{CloseHandle, HANDLE_FLAG_INHERIT, SetHandleInformation};
+    use windows::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
     use windows::Win32::System::Console::STD_ERROR_HANDLE;
-    use windows::Win32::System::Threading::{
-        CreateProcessW, GetExitCodeProcess, INFINITE, PROCESS_CREATION_FLAGS, PROCESS_INFORMATION,
-        STARTF_USESTDHANDLES, STARTUPINFOW, WaitForSingleObject,
-    };
-    use windows::core::PWSTR;
+    use windows::Win32::System::Threading::{GetExitCodeProcess, INFINITE, WaitForSingleObject};
     unsafe {
         let stdin = GetStdHandle(STD_INPUT_HANDLE)?;
         let stdout = GetStdHandle(STD_OUTPUT_HANDLE)?;
@@ -169,35 +164,73 @@ fn run_local_passthrough(command: &str) -> anyhow::Result<()> {
         for h in [stdin, stdout, stderr] {
             let _ = SetHandleInformation(h, HANDLE_FLAG_INHERIT.0, HANDLE_FLAG_INHERIT);
         }
-        let si = STARTUPINFOW {
-            cb: std::mem::size_of::<STARTUPINFOW>() as u32,
-            dwFlags: STARTF_USESTDHANDLES,
-            hStdInput: stdin,
-            hStdOutput: stdout,
-            hStdError: stderr,
-            ..Default::default()
-        };
-        let mut cmd: Vec<u16> = command.encode_utf16().chain(std::iter::once(0)).collect();
-        let mut pi = PROCESS_INFORMATION::default();
+        // `_job` must outlive the wait: `cosca::Job` sets KILL_ON_JOB_CLOSE, so dropping it early
+        // would terminate the very child we are waiting on.
+        let (process, _job) = spawn_contained(command, Some([stdin, stdout, stderr]))?;
+        WaitForSingleObject(process.0, INFINITE);
+        let mut code = 0u32;
+        let _ = GetExitCodeProcess(process.0, &mut code);
+        std::process::exit(code as i32);
+    }
+}
+
+/// Spawn `command` suspended and contain it in a job object before it runs a single instruction.
+///
+/// This exists as its own function so the containment is *testable*: `run_local_passthrough`
+/// ends in `process::exit`, so nothing could assert against it.
+///
+/// Containment is the point. Without it, a misclassified command — or any binary a user chooses
+/// to name `scp.exe` — spawns OUTSIDE the job object and survives session teardown, while the
+/// relayed path (`pipes.rs`, `conpty.rs`) contains its child. Routing must not carry a
+/// containment difference: that asymmetry is the only thing that made an attacker-chosen string
+/// decide a security outcome, and sshd itself attaches no such consequence to how a command is
+/// classified. `CREATE_SUSPENDED` is load-bearing — assignment has to win the race against the
+/// child spawning anything — and `contain_and_resume` kills rather than resumes if it fails.
+///
+/// The caller MUST keep the returned `Job` alive for as long as the child should live.
+///
+/// # Safety
+/// Any handles named in `stdio` must be valid and inheritable.
+unsafe fn spawn_contained(
+    command: &str,
+    stdio: Option<[windows::Win32::Foundation::HANDLE; 3]>,
+) -> anyhow::Result<(crate::winutil::OwnedHandle, cosca::Job)> {
+    use anyhow::Context;
+    use windows::Win32::System::Threading::{
+        CREATE_SUSPENDED, CreateProcessW, PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOW,
+    };
+    use windows::core::PWSTR;
+
+    let mut si = STARTUPINFOW {
+        cb: std::mem::size_of::<STARTUPINFOW>() as u32,
+        ..Default::default()
+    };
+    if let Some([i, o, e]) = stdio {
+        si.dwFlags = STARTF_USESTDHANDLES;
+        si.hStdInput = i;
+        si.hStdOutput = o;
+        si.hStdError = e;
+    }
+    let mut cmd: Vec<u16> = command.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut pi = PROCESS_INFORMATION::default();
+    unsafe {
         CreateProcessW(
             None,
             Some(PWSTR(cmd.as_mut_ptr())),
             None,
             None,
-            true, // inherit handles → the child gets sshd's stdio directly (binary-clean)
-            PROCESS_CREATION_FLAGS(0),
+            stdio.is_some(), // inherit → the child gets sshd's stdio directly (binary-clean)
+            CREATE_SUSPENDED,
             None,
             None,
             &si,
             &mut pi,
         )
         .with_context(|| format!("spawn local transfer command: {command}"))?;
-        WaitForSingleObject(pi.hProcess, INFINITE);
-        let mut code = 0u32;
-        let _ = GetExitCodeProcess(pi.hProcess, &mut code);
-        let _ = CloseHandle(pi.hThread);
-        let _ = CloseHandle(pi.hProcess);
-        std::process::exit(code as i32);
+        let process = crate::winutil::OwnedHandle(pi.hProcess);
+        let thread = crate::winutil::OwnedHandle(pi.hThread);
+        let job = crate::winutil::contain_and_resume(process.0, thread.0, "local transfer")?;
+        Ok((process, job))
     }
 }
 
@@ -503,3 +536,7 @@ fn init_file_logging() -> Option<tracing_appender::non_blocking::WorkerGuard> {
 fn log_dir() -> std::path::PathBuf {
     std::path::PathBuf::from(r"C:\ProgramData\ssh-broker\logs")
 }
+
+#[cfg(test)]
+#[path = "shim_pty_tests.rs"]
+mod shim_pty_tests;
