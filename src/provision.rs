@@ -40,19 +40,24 @@ pub fn verify_probe() -> anyhow::Result<()> {
     anyhow::bail!("verify-probe runs only on Windows");
 }
 
+/// The install root. Single authority for the path so the shim, the socket dir and the logger
+/// cannot drift apart — each previously carried its own copy of this literal.
+pub fn base_dir() -> std::path::PathBuf {
+    std::path::PathBuf::from(r"C:\ProgramData\ssh-broker")
+}
+
+/// Where `apply` persists the install config. Public because the SHIM reads it: routing a
+/// transfer means matching sshd's declarations, which `apply` recorded here.
+pub fn config_path() -> std::path::PathBuf {
+    base_dir().join("config.toml")
+}
+
 #[cfg(windows)]
 mod imp {
-    use super::{config, probe, registry, report, schtasks, sshd};
+    use super::{base_dir, config, config_path, probe, registry, report, schtasks, sshd};
     use crate::{acl, afunix, shim};
     use anyhow::Context;
     use std::path::{Path, PathBuf};
-
-    fn base_dir() -> PathBuf {
-        PathBuf::from(r"C:\ProgramData\ssh-broker")
-    }
-    fn config_path() -> PathBuf {
-        base_dir().join("config.toml")
-    }
     fn canonical_exe() -> PathBuf {
         base_dir().join("ssh-broker.exe")
     }

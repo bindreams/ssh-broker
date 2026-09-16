@@ -58,26 +58,20 @@ const VT_OUT: CONSOLE_MODE =
 pub fn run_on(exec: Option<String>) -> anyhow::Result<()> {
     let log = init_file_logging();
 
-    // sftp/scp FILE TRANSFERS run locally, not through the agent: they need raw binary
-    // bidirectional stdio and gain nothing from session-1 parity, so relaying their long-lived
-    // binary protocol only adds latency + a buffering failure surface. (This is what sshd's
-    // sftp subsystem becomes once DefaultShell is the shim: `ssh-broker -c "sftp-server.exe"`.)
+    // Run a command locally only when it is one the ADMINISTRATOR declared — an `sshd_config`
+    // `Subsystem` line, recorded by `apply` from `sshd -T`. sshd's own trust anchor for which
+    // binary runs is the config file, never anything on the wire, and this follows it rather
+    // than inferring from a string the client chose.
+    //
+    // Anything unmatched is relayed, which is CORRECT and not a fallback: the EXEC relay is
+    // byte-transparent in both directions (`exec_relay_is_byte_clean_*`, and end to end via
+    // `verify`'s binary-transparency check), so the only cost of relaying a transfer is
+    // throughput.
     if let Some(cmd) = &exec
-        && crate::shim::is_transfer_command(cmd)
+        && is_declared_subsystem(cmd)
     {
         drop(log);
         return run_local_passthrough(cmd);
-    }
-    // Classified as not-a-transfer, but shaped like the one miss this rule cannot see: an
-    // unquoted spaced program path, which Windows launches and we tokenize short. Relaying it
-    // corrupts the binary stream, so leave the operator a signal rather than failing silently.
-    if let Some(cmd) = &exec
-        && crate::shim::missed_transfer_hint(cmd)
-    {
-        tracing::warn!(
-            "relaying a command whose program path looks like an unquoted transfer helper; \
-             if a transfer hangs or corrupts, quote the path in sshd_config"
-        );
     }
 
     match try_relay(&exec) {
@@ -147,6 +141,24 @@ fn try_relay(exec: &Option<String>) -> anyhow::Result<Option<i32>> {
 /// `$TERM` from the SSH environment, defaulting to a sane 256-colour terminal.
 fn term() -> String {
     std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".into())
+}
+
+/// Whether `cmd` is EXACTLY a subsystem command line the administrator declared.
+///
+/// Best-effort on purpose: a missing, unreadable or older config matches nothing, so every
+/// command relays. That is the safe direction — relaying is correct, merely slower — which means
+/// a box provisioned before declarations existed degrades in throughput, never in behaviour.
+///
+/// Read per invocation rather than cached: the shim is a short-lived process, one per SSH
+/// command, so there is nothing to cache into, and re-reading picks up a re-`apply` immediately.
+fn is_declared_subsystem(cmd: &str) -> bool {
+    let Ok(text) = std::fs::read_to_string(crate::provision::config_path()) else {
+        return false;
+    };
+    let Ok(cfg) = crate::provision::config::Config::from_toml(&text) else {
+        return false;
+    };
+    crate::provision::sshd::matches_declaration(cmd, &cfg.declared_subsystems)
 }
 
 /// Run an sftp/scp transfer command LOCALLY (in the session sshd launched us in), inheriting
