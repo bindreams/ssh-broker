@@ -304,10 +304,10 @@ mod imp {
         }
 
         // Local: the socket dir ACL verifies for the configured account (== the agent's grantee).
-        let saved_user = std::fs::read_to_string(config_path())
+        let saved_cfg = std::fs::read_to_string(config_path())
             .ok()
-            .and_then(|s| config::Config::from_toml(&s).ok())
-            .map(|c| c.target_user);
+            .and_then(|s| config::Config::from_toml(&s).ok());
+        let saved_user = saved_cfg.as_ref().map(|c| c.target_user.clone());
         match &saved_user {
             Some(u) => {
                 let ok = acl::Sid::lookup(u)
@@ -344,6 +344,41 @@ mod imp {
         // Local: the socket is reachable.
         let reachable = afunix::connect(&afunix::socket_path()).is_ok();
         rows.push(report::Check::new("socket reachable", reachable, String::new()));
+
+        // Local: do the recorded Subsystem declarations still match what sshd reports?
+        //
+        // The shim runs a command locally only when it EXACTLY equals a declaration `apply`
+        // recorded. Edit an `sshd_config` Subsystem line without re-running `apply` and the table
+        // goes stale: the transfer stops matching and is relayed instead — still correct, since
+        // the relay is byte-transparent, but slower and with nothing to say why. This row is what
+        // says why.
+        //
+        // Informational when sshd cannot be asked. `verify` runs through the LeastPrivilege agent
+        // and `sshd -T` generally needs elevation, so gating on it would paint every ordinary run
+        // red. Same treatment as the self-heal task row above: reported with its reason, never
+        // silently dropped.
+        let recorded = saved_cfg.map(|c| c.declared_subsystems).unwrap_or_default();
+        match read_declared_subsystems() {
+            Ok(current) if current == recorded => rows.push(report::Check::new(
+                "subsystem declarations",
+                true,
+                format!("{} declared, matching sshd", recorded.len()),
+            )),
+            Ok(current) => rows.push(report::Check::new(
+                "subsystem declarations",
+                false,
+                format!(
+                    "STALE — re-run apply (recorded {}, sshd now reports {})",
+                    recorded.len(),
+                    current.len()
+                ),
+            )),
+            Err(e) => rows.push(report::Check::new(
+                "subsystem declarations (info)",
+                true,
+                format!("recorded {}; could not re-check: {e}", recorded.len()),
+            )),
+        }
 
         // Through the agent: the real parity proof (run in session 1 by verify-probe).
         match drive_probe(&exe) {
