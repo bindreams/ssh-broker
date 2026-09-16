@@ -311,7 +311,7 @@ mod imp {
 
         // Through the agent: the real parity proof (run in session 1 by verify-probe).
         match drive_probe(&exe) {
-            Ok(p) => {
+            Ok((p, binary_ok)) => {
                 // Parity = escaped session 0 (the limited network-logon session). The agent
                 // need not be in THE active-console session — a box can have several
                 // interactive sessions — and DPAPI/symlink below confirm it is a genuine one.
@@ -332,6 +332,18 @@ mod imp {
                     !p.symlink.is_failure(),
                     format!("{:?}", p.symlink),
                 ));
+                // Byte-transparency on the real path. Transfers are routed around the relay on
+                // the premise that relaying would not carry binary intact; this is the check
+                // that holds that premise honest end to end, rather than in prose.
+                rows.push(report::Check::new(
+                    "binary transparency (via agent)",
+                    binary_ok,
+                    if binary_ok {
+                        String::new()
+                    } else {
+                        "payload did not survive the relay byte for byte".into()
+                    },
+                ));
             }
             Err(e) => {
                 rows.push(report::Check::new(
@@ -350,9 +362,14 @@ mod imp {
         Ok(())
     }
 
-    /// Drive `<exe> verify-probe` as an EXEC command THROUGH the agent (so it runs in session 1)
-    /// and parse the PROBE line it prints.
-    fn drive_probe(exe: &Path) -> anyhow::Result<probe::ProbeResult> {
+    /// Drive `<exe> verify-probe` as an EXEC command THROUGH the agent (so it runs in session 1),
+    /// parse the PROBE line it prints, and check whether its binary payload survived intact.
+    ///
+    /// The byte check reads the RAW stdout, before the lossy UTF-8 conversion the line parse
+    /// needs: the payload is deliberately not valid UTF-8, so converting first would destroy the
+    /// very property being measured. This is the end-to-end half of byte-transparency — a real
+    /// child, real pipes, a real socket — which the in-memory relay tests cannot reach.
+    fn drive_probe(exe: &Path) -> anyhow::Result<(probe::ProbeResult, bool)> {
         let sock = afunix::connect(&afunix::socket_path()).context("connect to agent")?;
         let (rx, tx) = afunix::split(sock)?;
         let cmd = format!("\"{}\" verify-probe", exe.display());
@@ -365,7 +382,9 @@ mod imp {
             "probe relay failed (code {code}; stderr={})",
             String::from_utf8_lossy(&err).trim()
         );
-        probe::parse_probe_line(&String::from_utf8_lossy(&out))
+        let binary_ok = probe::binary_probe_ok(&out);
+        let parsed = probe::parse_probe_line(&String::from_utf8_lossy(&out))?;
+        Ok((parsed, binary_ok))
     }
 
     // ── verify-probe (runs in session 1, spawned by the agent) ───────────────────────
@@ -374,7 +393,15 @@ mod imp {
         let sid = probe::current_session_id();
         let dpapi = probe::dpapi_roundtrip(b"ssh-broker-parity-probe");
         let symlink = probe::symlink_probe();
-        println!("{}", probe::format_probe_line(sid, dpapi, symlink));
+        // One locked handle for both writes: `println!` would take its own lock, and the binary
+        // payload must not interleave with the line that follows it.
+        {
+            use std::io::Write;
+            let mut stdout = std::io::stdout().lock();
+            probe::emit_binary_probe(&mut stdout).context("emit the binary-transparency payload")?;
+            writeln!(stdout, "{}", probe::format_probe_line(sid, dpapi, symlink)).context("write the PROBE line")?;
+            stdout.flush().context("flush probe output")?;
+        }
         // Parity gates: escaped session 0 AND a working DPAPI (proves a real user profile, the
         // thing session 0 lacks). A CONFIRMED symlink block also fails; a Skipped (unprivileged,
         // untestable) symlink does not. The active-console id is NOT required to match — a host

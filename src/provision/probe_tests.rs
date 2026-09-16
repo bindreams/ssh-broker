@@ -1,5 +1,8 @@
 //! Host tests for the pure probe-line format/parse.
-use super::{ProbeResult, SymlinkState, format_probe_line, parse_probe_line};
+use super::{
+    ProbeResult, SymlinkState, binary_probe_ok, binary_probe_payload, emit_binary_probe, format_probe_line,
+    parse_probe_line,
+};
 
 #[test]
 fn probe_line_round_trips() {
@@ -25,6 +28,49 @@ fn symlink_states_round_trip() {
     assert!(SymlinkState::Blocked.is_failure());
     assert!(!SymlinkState::Ok.is_failure());
     assert!(!SymlinkState::Skipped.is_failure());
+}
+
+/// The payload must survive an exact round trip, and the check must be sensitive to a SINGLE
+/// flipped byte. A check that only noticed gross damage would pass on a relay that mangles the
+/// occasional byte — which is precisely the failure it exists to catch.
+#[test]
+fn binary_probe_round_trips_and_detects_a_single_flipped_byte() {
+    let mut buf = Vec::new();
+    emit_binary_probe(&mut buf).unwrap();
+    assert!(binary_probe_ok(&buf));
+
+    // Surrounding output is expected — the PROBE line follows, and a shell may add its own.
+    let mut noisy = b"leading junk\n".to_vec();
+    noisy.extend_from_slice(&buf);
+    noisy.extend_from_slice(b"PROBE session_id=1 dpapi=ok symlink=skip\n");
+    assert!(binary_probe_ok(&noisy), "must tolerate surrounding output");
+
+    let payload_start = b"BINPROBE<".len();
+    for i in [payload_start, payload_start + 128, payload_start + 255] {
+        let mut broken = buf.clone();
+        broken[i] ^= 0x01;
+        assert!(!binary_probe_ok(&broken), "a flipped byte at {i} must fail the check");
+    }
+
+    // Default-deny: absent or truncated is a FAILURE, never a silent pass.
+    assert!(!binary_probe_ok(b"no markers here"));
+    assert!(!binary_probe_ok(&buf[..buf.len() - 4]));
+}
+
+/// The brackets must not occur inside the data they delimit, or extraction would truncate and the
+/// comparison would fail for the wrong reason. This holds because the payload is the 256 values in
+/// ascending order, so every window of it is a consecutive ascending run — but it is asserted
+/// rather than trusted, since a future change to the payload could quietly break it.
+#[test]
+fn binary_probe_markers_cannot_collide_with_the_payload() {
+    let payload = binary_probe_payload();
+    for marker in [b"BINPROBE<".as_slice(), b">BINPROBE".as_slice()] {
+        assert!(
+            !payload.windows(marker.len()).any(|w| w == marker),
+            "marker {:?} must not appear inside the payload",
+            String::from_utf8_lossy(marker)
+        );
+    }
 }
 
 #[test]
