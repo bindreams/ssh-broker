@@ -54,4 +54,4 @@ fn the_local_passthrough_child_is_contained_in_a_job() {
 // directly, which bypasses `run_on` — so the mutation that matters
 // (`FailOpen::Passthrough(cmd) => run_local_passthrough(&format!("pwsh -Command {cmd}"))`)
 // would leave it green. That property is gated end to end, through the real binary, by
-// `tests/fail_open_windows.rs`.
+// `tests/fail_open_windows_tests.rs`.
