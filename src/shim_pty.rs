@@ -58,28 +58,14 @@ const VT_OUT: CONSOLE_MODE =
 pub fn run_on(exec: Option<String>) -> anyhow::Result<()> {
     let log = init_file_logging();
 
-    // sftp/scp FILE TRANSFERS run locally, not through the agent: they need raw binary
-    // bidirectional stdio and gain nothing from session-1 parity, so relaying their long-lived
-    // binary protocol only adds latency + a buffering failure surface. (This is what sshd's
-    // sftp subsystem becomes once DefaultShell is the shim: `ssh-broker -c "sftp-server.exe"`.)
-    if let Some(cmd) = &exec
-        && crate::shim::is_transfer_command(cmd)
-    {
-        drop(log);
-        return run_local_passthrough(cmd);
-    }
-    // Classified as not-a-transfer, but shaped like the one miss this rule cannot see: an
-    // unquoted spaced program path, which Windows launches and we tokenize short. Relaying it
-    // corrupts the binary stream, so leave the operator a signal rather than failing silently.
-    if let Some(cmd) = &exec
-        && crate::shim::missed_transfer_hint(cmd)
-    {
-        tracing::warn!(
-            "relaying a command whose program path looks like an unquoted transfer helper; \
-             if a transfer hangs or corrupts, quote the path in sshd_config"
-        );
-    }
-
+    // EVERY command relays. There is deliberately no local route for file transfers.
+    //
+    // Routing them locally required deciding, from a string the CLIENT chose, whether a command
+    // was a transfer — and that decision is not reliably derivable: sshd rewrites commands before
+    // `DefaultShell` sees them, and its config serialisation differs from Windows' own quoting.
+    // The justification for routing was that relaying would corrupt a binary stream; that turned
+    // out to be untrue (`exec_relay_is_byte_clean_*` and `verify`'s end-to-end probe). What
+    // remains is a throughput difference, which does not earn a classifier.
     match try_relay(&exec) {
         Ok(Some(code)) => {
             drop(log); // flush the appender before process::exit
@@ -93,8 +79,15 @@ pub fn run_on(exec: Option<String>) -> anyhow::Result<()> {
             tracing::warn!("shim relay setup failed: {e:?}; falling back to a local shell");
         }
     }
-    drop(log); // flush before exec_local_shell's own process::exit
-    exec_local_shell(exec)
+    drop(log); // flush before the fallback's own process::exit
+    // Fail open. An EXEC command runs through the contained passthrough, NOT a shell: `pwsh
+    // -Command` reinterprets quoting, and an `sftp` session on a box with no interactive session
+    // to relay into lands exactly here — a shell would mangle its binary stream. Interactive has
+    // no command to run, so it still gets a plain `pwsh`.
+    match exec {
+        Some(cmd) => run_local_passthrough(&cmd),
+        None => exec_local_shell(None),
+    }
 }
 
 /// Attempt the relay. `Ok(Some(code))` = a relay completed (PTY or EXEC). `Ok(None)` = the
@@ -149,9 +142,13 @@ fn term() -> String {
     std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".into())
 }
 
-/// Run an sftp/scp transfer command LOCALLY (in the session sshd launched us in), inheriting
-/// our stdio directly, instead of relaying it to the agent. The child writes raw to sshd's
-/// pipes (no Rust buffering), exactly as the original DefaultShell did. Exits with its code.
+/// Run `command` locally (in the session sshd launched us in), inheriting our stdio directly,
+/// and exit with its code.
+///
+/// This is the EXEC **fail-open** path — the agent was unreachable, so the command runs here
+/// rather than not at all. It deliberately does not go through a shell: `pwsh -Command` would
+/// reinterpret quoting and mangle a binary stream, which is what an `sftp` session landing here
+/// would be. The child writes raw to sshd's pipes, exactly as the original DefaultShell did.
 fn run_local_passthrough(command: &str) -> anyhow::Result<()> {
     use windows::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
     use windows::Win32::System::Console::STD_ERROR_HANDLE;
