@@ -283,16 +283,17 @@ fn fail_open_when_agent_unreachable() {
 /// another `pwsh -Command` before calling `run_local_passthrough`) would leave this test green
 /// while reintroducing exactly the re-quoting bug it used to guard against — this assertion alone
 /// cannot catch that. The real gate for "the command reaches the OS verbatim, with no shell
-/// re-parsing its quoting" is
-/// `shim_pty_tests::spawn_contained_passes_the_command_line_to_create_process_w_verbatim`, a
-/// Windows-only test that observes the actual `CreateProcessW` command line through the same
-/// `spawn_contained` call both fail-open arms use; it exists because this one cannot see past the
-/// pure decision made here.
+/// re-parsing its quoting" is `tests/fail_open_windows.rs`, which runs the actual binary down the
+/// actual fail-open path and reads back the command line `cmd.exe` really received. It has to be
+/// an integration test: `run_on` ends in `process::exit`, so nothing in-process — here or in
+/// `shim_pty_tests.rs` — can observe that wiring, and a unit test calling `spawn_contained`
+/// directly would bypass `run_on` and stay green through exactly the mutation described above.
 #[test]
 fn fail_open_runs_a_command_directly_and_only_interactive_gets_a_shell() {
     // The command must survive verbatim through the decision itself: re-quoting is the failure
     // mode ultimately being guarded against, and spaces plus backslashes are what a shell would
-    // mangle first — though proving nothing mangles them downstream needs the Windows test above.
+    // mangle first — though proving nothing mangles them downstream needs the end-to-end test
+    // named above, not this one.
     let cmd = r#"scp -t "C:\path with spaces\out.bin""#;
     assert_eq!(
         decide_fail_open(Some(cmd.to_string())),
