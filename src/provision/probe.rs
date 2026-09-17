@@ -83,8 +83,12 @@ impl UpstreamState {
         match self {
             UpstreamState::Ok => String::new(),
             UpstreamState::Fail => "the payload verify sent upstream did not reach the child intact".into(),
-            UpstreamState::Absent => "the installed probe child predates this check and reported nothing — \
-                 re-run `apply` (stop the agent first: it cannot replace the exe while the agent holds it open)"
+            // State what is KNOWN, then the likely cause — the same discipline the `Fail` arm
+            // follows. All the parser can tell is that no `upstream=` token arrived; an exe older
+            // than this check is the usual reason, but a truncated or garbled PROBE line and a
+            // child killed mid-write produce it too, and those are not fixed by re-running `apply`.
+            UpstreamState::Absent => "no `upstream=` token in the PROBE line (usually an installed exe older \
+                 than this check — re-run `apply`, stopping the agent first so the exe can be replaced)"
                 .into(),
         }
     }

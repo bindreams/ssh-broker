@@ -80,7 +80,6 @@ pub fn run_on(exec: Option<String>) -> anyhow::Result<()> {
             tracing::warn!("shim relay setup failed: {e:?}; falling back to a local shell");
         }
     }
-    drop(log); // flush before the fallback's own process::exit
     // Fail open. An EXEC command runs through the contained passthrough, NOT a shell: `pwsh
     // -Command` reinterprets quoting, and an `sftp` session on a box with no interactive session
     // to relay into lands exactly here — a shell would mangle its binary stream. That also matches
@@ -89,29 +88,45 @@ pub fn run_on(exec: Option<String>) -> anyhow::Result<()> {
     // it gets a plain `pwsh` instead — but through the SAME contained passthrough, not a separate
     // uncontained spawn: see `run_local_passthrough` for why that used to be a real containment
     // gap, not just an inaccurate claim in prose. `decide_fail_open` is where the exec/interactive
-    // choice is made and tested.
-    match decide_fail_open(exec) {
-        // A spawn failure must NOT escape to `main()`: that exits 1, the one code this crate
-        // forbids for a broker-side failure because it is indistinguishable from the command
-        // itself failing (`shim::map_outcome`). The relay reports the identical failure as 255,
-        // so both arms below do too — neither ever lets `run_local_passthrough`'s `Err` propagate
-        // out of this function via `?`.
-        FailOpen::Passthrough(cmd) => {
-            if let Err(e) = run_local_passthrough(&cmd) {
-                tracing::error!("fail-open spawn of {cmd:?} failed: {e:?}");
+    // choice is made and tested, and `fail_open_command` maps it to the single spawn below — ONE
+    // call site, so neither arm can regain shell semantics or lose containment on its own.
+    //
+    // The log guard deliberately stays ALIVE until each exit. Dropping it here (as this once did)
+    // shuts the `tracing-appender` worker down, and its lossy writer then silently discards every
+    // later line — so the `tracing::error!` below, the only PTY-mode diagnostic for a failed
+    // fallback, went nowhere at all.
+    let decision = decide_fail_open(exec);
+    let command = fail_open_command(&decision);
+    match run_local_passthrough(command) {
+        Ok(code) => {
+            drop(log); // flush: `process::exit` runs no destructors
+            // Bypass main()'s Result→0/1 collapse; the i32→u32 cast is bit-preserving.
+            std::process::exit(code)
+        }
+        Err(e) => {
+            // A spawn failure must NOT escape to `main()`: that exits 1, the one code this crate
+            // forbids for a broker-side failure because it is indistinguishable from the command
+            // itself failing (`shim::map_outcome`). The relay reports the identical failure as
+            // 255, so this does too — the `Err` is never propagated out of this function.
+            tracing::error!("fail-open spawn of {command:?} failed: {e:?}");
+            // EXEC has a clean stderr channel; in PTY mode a stderr write would corrupt the
+            // terminal stream, so there the reason goes only to the log (README's "Limits").
+            if matches!(decision, FailOpen::Passthrough(_)) {
                 eprintln!("ssh-broker: could not run the command locally: {e}");
-                std::process::exit(255);
             }
-            Ok(()) // not reached: on success it exits with the child's code
+            drop(log); // flush before exiting
+            std::process::exit(255)
         }
-        FailOpen::LocalShell => {
-            if let Err(e) = run_local_passthrough("pwsh -NoLogo") {
-                tracing::error!("fail-open spawn of pwsh failed: {e:?}");
-                eprintln!("ssh-broker: could not run pwsh locally: {e}");
-                std::process::exit(255);
-            }
-            Ok(()) // not reached: on success it exits with the child's code
-        }
+    }
+}
+
+/// The command each fail-open outcome runs. Pure, so the interactive arm's program is pinned by a
+/// test rather than by reading `run_on`: an interactive session has nothing of its own to run, so
+/// it gets `pwsh`, while an EXEC command is passed through untouched.
+fn fail_open_command(decision: &FailOpen) -> &str {
+    match decision {
+        FailOpen::Passthrough(cmd) => cmd.as_str(),
+        FailOpen::LocalShell => "pwsh -NoLogo",
     }
 }
 
@@ -167,8 +182,13 @@ fn term() -> String {
     std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".into())
 }
 
-/// Run `command` locally (in the session sshd launched us in), inheriting our stdio directly,
-/// and exit with its code.
+/// Run `command` locally (in the session sshd launched us in), inheriting our stdio directly, and
+/// return its exit code.
+///
+/// It deliberately RETURNS the code rather than calling `process::exit` itself. Exiting here forced
+/// the caller to drop the log guard before this ran, which shut the appender down and silently
+/// discarded every diagnostic logged afterwards — including the one explaining a failed fallback.
+/// Returning leaves the caller owning both the exit and the flush that must precede it.
 ///
 /// This is the fail-open path for BOTH shim modes — the agent was unreachable, so the command
 /// runs here rather than not at all. For EXEC (`ssh host "cmd"`) `command` is the command itself;
@@ -190,7 +210,7 @@ fn term() -> String {
 /// it used to run through a plain, uncontained `std::process::Command` (`exec_local_shell`),
 /// so its children did NOT die with the session — contradicting the README. Routing it through
 /// this same contained spawn closes that gap; see `spawn_contained`.
-fn run_local_passthrough(command: &str) -> anyhow::Result<()> {
+fn run_local_passthrough(command: &str) -> anyhow::Result<i32> {
     use windows::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
     use windows::Win32::System::Console::STD_ERROR_HANDLE;
     use windows::Win32::System::Threading::{GetExitCodeProcess, INFINITE, WaitForSingleObject};
@@ -208,21 +228,23 @@ fn run_local_passthrough(command: &str) -> anyhow::Result<()> {
         WaitForSingleObject(process.0, INFINITE);
         let mut code = 0u32;
         if GetExitCodeProcess(process.0, &mut code).is_err() {
-            // A failed query must not read as SUCCESS. `code` is still 0 here, so exiting with it
+            // A failed query must not read as SUCCESS. `code` is still 0 here, so returning it
             // would be indistinguishable from the command having succeeded — the exact confusion
-            // `shim::map_outcome` exists to prevent. 255 is this crate's "the broker failed" code,
-            // and it is what the relay reports for the same class of failure.
-            tracing::error!("GetExitCodeProcess failed for the fail-open child; reporting 255");
-            std::process::exit(255);
+            // `shim::map_outcome` exists to prevent. Reporting it as an error routes it to the
+            // caller's 255, this crate's "the broker failed" code, which is what the relay reports
+            // for the same class of failure. Erroring rather than exiting here is also what lets
+            // the caller LOG it: exiting inside this function is why that diagnostic was lost.
+            anyhow::bail!("GetExitCodeProcess failed for the fail-open child");
         }
-        std::process::exit(code as i32);
+        Ok(code as i32)
     }
 }
 
 /// Spawn `command` suspended and contain it in a job object before it runs a single instruction.
 ///
-/// This exists as its own function so the containment is *testable*: `run_local_passthrough`
-/// ends in `process::exit`, so nothing could assert against it.
+/// This exists as its own function so the containment is *testable* in isolation. `run_on` still
+/// ends in `process::exit` (so nothing in-process can observe its wiring — that is gated end to
+/// end by `tests/fail_open_windows_tests.rs`), but the spawn itself can be asserted against here.
 ///
 /// Containment is the point. A child spawned here must die with the session exactly as a relayed
 /// one does (`pipes.rs`, `conpty.rs` both contain theirs) — otherwise reaching the fail-open path

@@ -26,10 +26,16 @@
 /// parsed argv, reporting the `pwsh.dll` path as argv[0] and discarding the caller's quoting, so it
 /// describes .NET's reconstruction rather than the real command line.
 ///
-/// The probe deliberately carries no agent: with no socket to reach (the case on any machine where
-/// `apply` has not run, including a CI runner) the shim takes the fail-open path, which is the path
-/// under test. If a future change made the shim wrap the command in a shell, `cmd.exe` would report
-/// the wrapper's reconstructed line instead and this assertion would fail.
+/// The test ASSERTS it took the fail-open path rather than assuming it. That matters because the
+/// relay path is also a bare `CreateProcessW` with the verbatim command line (`src/pipes.rs`), so
+/// on a machine where `apply` has run and the agent is up, `%CMDCMDLINE%` would come back
+/// byte-identical having exercised the relay instead — and the mutation this file exists to catch
+/// would go undetected. Only the fail-open path emits the "agent unavailable" warning on stderr
+/// for EXEC (`shim_pty::try_relay`), so checking for it pins which path ran.
+///
+/// If a future change made the shim wrap the command in a shell, `cmd.exe` would report the
+/// wrapper's reconstructed line instead and the command-line assertion would fail — .NET's
+/// `BuildCommandLine` always quotes the resolved program, and `cmd /c` likewise rewrites it.
 #[test]
 fn exec_fail_open_runs_the_command_with_no_shell_in_between() {
     let probe = r"cmd.exe /c echo %CMDCMDLINE%";
@@ -38,6 +44,14 @@ fn exec_fail_open_runs_the_command_with_no_shell_in_between() {
         .args(["-c", probe])
         .output()
         .expect("run the shim binary");
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("agent unavailable"),
+        "this assertion is the test's precondition, not a nicety: without it the RELAY path — \
+         also a bare CreateProcessW with a verbatim command line — satisfies everything below \
+         while never exercising fail-open at all.\nstderr: {stderr}"
+    );
 
     let stdout = String::from_utf8_lossy(&out.stdout);
     let got = stdout.trim_end();

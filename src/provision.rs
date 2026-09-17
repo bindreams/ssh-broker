@@ -338,8 +338,12 @@ mod imp {
                 // These rows are what hold that claim honest end to end rather than in prose.
                 // They are separate because a one-directional failure must name its direction:
                 // client → child is the `scp`/`sftp put` upload, child → client the download.
+                // Named for the transfer each direction carries, not spelled out longhand: the
+                // report pads names to a fixed width, and two rows differing only by transposed
+                // words ("child to client" / "client to child") both overflowed it and read as
+                // near-identical in the one place they appear side by side.
                 rows.push(report::Check::new(
-                    "binary transparency, child to client (via agent)",
+                    "binary download (via agent)",
                     binary_ok,
                     if binary_ok {
                         String::new()
@@ -353,7 +357,7 @@ mod imp {
                 // they have different remedies, and claiming the payload was mangled when nothing
                 // ever looked at it would be a diagnosis the code cannot support.
                 rows.push(report::Check::new(
-                    "binary transparency, client to child (via agent)",
+                    "binary upload (via agent)",
                     p.upstream.proven(),
                     p.upstream.detail(),
                 ));

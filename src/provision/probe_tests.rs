@@ -35,7 +35,19 @@ fn a_missing_upstream_token_is_absent_not_a_reported_failure() {
         .upstream;
     assert_eq!(old, UpstreamState::Absent);
     assert!(!old.proven(), "absent must never pass the gate");
-    assert!(old.detail().contains("predates"), "{}", old.detail());
+    // Gate the PROPERTY, not the phrasing: the detail must name the thing actually observed (no
+    // `upstream=` token) and must NOT report the payload as corrupted, because in this state
+    // nothing ever looked at the payload — it may well have arrived perfectly.
+    assert!(
+        old.detail().contains("upstream="),
+        "absent must name the missing token rather than guess a cause: {}",
+        old.detail()
+    );
+    assert!(
+        !old.detail().contains("did not reach the child intact"),
+        "absent must NOT be reported as a mangled payload — nothing examined it: {}",
+        old.detail()
+    );
 
     let failed = format_probe_line(1, true, SymlinkState::Ok, false);
     assert!(failed.contains("upstream=fail"));
