@@ -94,9 +94,17 @@ review instead. No lint enforces any of them: `clippy.toml` is deliberately empt
 **No sleeping as synchronization.** A sleep is a bet that some duration is long enough, and
 that bet loses on a loaded runner. Teardown ordering uses real primitives: waking a parked
 console read by injecting a record, closing a pseudoconsole to force EOF, joining threads.
-Waiting on a genuinely external event is fine and uses an unbounded wait; a wait carrying a
-numeric bound is not. A long-lived sentinel in a fixture opts out with a same-line
+Waiting on a genuinely external event is fine and normally uses an unbounded wait; a wait
+carrying a numeric bound is not. A long-lived sentinel in a fixture opts out with a same-line
 `sleep-ok:` marker **and a reason** — a bare marker does not suppress.
+
+There is exactly one bounded wait in the product — [`provision::bounded`](src/provision/bounded.rs)
+— and it is the rule's stated exception rather than a breach of it. `verify` awaits bytes crossing
+the SSH transport, which may simply never arrive, and the bound is the failure it reports to the
+operator at the keyboard (`--probe-timeout <seconds>`, `0` to wait indefinitely). It replaced a
+hang that printed no report at all, not even the local checks that had already passed. Nothing the
+shim and agent do *between themselves* may use it: there they have real primitives — frame reads,
+EOF, process handles, job objects — and an unbounded wait is the correct one.
 
 **No arbitrary retry caps** *(review-enforced)*. Numeric bounds that are not retry caps are fine
 and are explained where they occur — the agent task's `RestartOnFailure` `Count`, which the Task

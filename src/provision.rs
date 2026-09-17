@@ -8,6 +8,7 @@
 //! proven present), and resolves the ACL grantee BY NAME so a SYSTEM-run self-heal grants the
 //! same account the agent binds as.
 
+pub mod bounded;
 pub mod config;
 pub mod probe;
 pub mod registry;
@@ -82,6 +83,25 @@ mod imp {
             .and_then(|i| args.get(i + 1))
             .filter(|s| !s.is_empty())
             .cloned()
+    }
+
+    /// How long `verify` waits for the probe, from `--probe-timeout <seconds>`. `0` waits
+    /// indefinitely, for someone debugging a genuinely slow box.
+    ///
+    /// The default is deliberately generous: this bound exists to turn a wedged transport into a
+    /// reported failure, NOT to police how quickly a healthy host answers, and a bound tight
+    /// enough to false-fail on a loaded machine would be worse than no bound at all. An
+    /// unparseable value falls back to the default, matching `--user`'s tolerance.
+    fn arg_probe_timeout() -> Option<std::time::Duration> {
+        const DEFAULT_SECS: u64 = 30;
+        let args: Vec<String> = std::env::args().collect();
+        let secs = args
+            .iter()
+            .position(|a| a == "--probe-timeout")
+            .and_then(|i| args.get(i + 1))
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(DEFAULT_SECS);
+        (secs != 0).then(|| std::time::Duration::from_secs(secs))
     }
 
     /// Case-insensitive compare of a registry path string (quotes trimmed) to a path.
@@ -309,8 +329,12 @@ mod imp {
         let reachable = afunix::connect(&afunix::socket_path()).is_ok();
         rows.push(report::Check::new("socket reachable", reachable, String::new()));
 
-        // Through the agent: the real parity proof (run in session 1 by verify-probe).
-        match drive_probe(&exe) {
+        // Through the agent: the real parity proof (run in session 1 by verify-probe). Bounded,
+        // because the probe child blocks reading the upstream payload before it writes anything:
+        // if the transport stops delivering, an unbounded wait prints NO report at all — not even
+        // the local rows already gathered above. See `provision::bounded` for why a clock here is
+        // the rule's stated exception rather than a breach of it.
+        match drive_probe_bounded(&exe, arg_probe_timeout()) {
             Ok((p, binary_ok)) => {
                 // Parity = escaped session 0 (the limited network-logon session). The agent
                 // need not be in THE active-console session — a box can have several
@@ -377,6 +401,31 @@ mod imp {
             std::process::exit(code);
         }
         Ok(())
+    }
+
+    /// Drive the probe on a worker thread, giving up after `timeout`.
+    ///
+    /// The bound is here rather than around the child's stdin read for two reasons. It covers
+    /// EVERY way the probe can fail to answer — a lost stdin-EOF marker, an agent that accepts the
+    /// connection and then never replies, a child that dies mid-write — where bounding the read
+    /// would cover only the first. And bounding a blocking `ReadFile` on a Windows pipe means
+    /// overlapped I/O inside the child, where this is a thread and a channel.
+    ///
+    /// On expiry the error flows into the same `parity probe (via agent)` row that an unreachable
+    /// agent produces, so `verify` still prints every local check and exits non-zero — instead of
+    /// hanging with nothing on stdout, which is what it did before.
+    fn drive_probe_bounded(
+        exe: &Path,
+        timeout: Option<std::time::Duration>,
+    ) -> anyhow::Result<(probe::ProbeResult, bool)> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let exe = exe.to_path_buf();
+        // The worker owns the whole relay conversation; on expiry it is left blocked on a socket
+        // that is not delivering, and `verify` exits immediately after printing, which collects it.
+        std::thread::spawn(move || {
+            let _ = tx.send(drive_probe(&exe));
+        });
+        super::bounded::await_bounded(&rx, timeout)?
     }
 
     /// Drive `<exe> verify-probe` as an EXEC command THROUGH the agent (so it runs in session 1),
