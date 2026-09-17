@@ -273,24 +273,31 @@ fn fail_open_when_agent_unreachable() {
     assert_eq!(decide_fallback(false), Fallback::Relay);
 }
 
-/// Fail-open dispatch: a command runs DIRECTLY, and only an interactive session gets a shell.
+/// Fail-open DECISION: `Some(cmd)` selects the passthrough with `cmd` carried verbatim, `None`
+/// selects the plain-shell arm.
 ///
-/// Rationale, recorded so this is never "simplified" back: `pwsh -Command` re-parses its
-/// argument, so putting an EXEC command through a shell re-quotes it and mangles a binary
-/// stream — which is exactly what an `sftp`/`scp` session landing on the fail-open path is. An
-/// earlier `exec_local_shell(Some(cmd))` route did precisely that. Now that nothing is routed
-/// around the relay, fail-open is the ONLY local execution left, so if it silently regains shell
-/// semantics there is no second path left to notice. `run_on` ends in `process::exit`, which is
-/// why the choice lives in a pure function rather than being asserted where it is made.
+/// This is deliberately a narrow, cheap gate — it only proves the two-arm `match` in
+/// `decide_fail_open` routes correctly and does not mutate `cmd` in transit. It does NOT prove
+/// that a command reaches `CreateProcessW` unmangled: `decide_fail_open` returns data, not a
+/// spawn, so a mutation downstream of it (e.g. `run_on` wrapping the passthrough command in
+/// another `pwsh -Command` before calling `run_local_passthrough`) would leave this test green
+/// while reintroducing exactly the re-quoting bug it used to guard against — this assertion alone
+/// cannot catch that. The real gate for "the command reaches the OS verbatim, with no shell
+/// re-parsing its quoting" is
+/// `shim_pty_tests::spawn_contained_passes_the_command_line_to_create_process_w_verbatim`, a
+/// Windows-only test that observes the actual `CreateProcessW` command line through the same
+/// `spawn_contained` call both fail-open arms use; it exists because this one cannot see past the
+/// pure decision made here.
 #[test]
 fn fail_open_runs_a_command_directly_and_only_interactive_gets_a_shell() {
-    // The command must survive verbatim: re-quoting is the failure mode being guarded against,
-    // and spaces plus backslashes are what a shell would mangle first.
+    // The command must survive verbatim through the decision itself: re-quoting is the failure
+    // mode ultimately being guarded against, and spaces plus backslashes are what a shell would
+    // mangle first — though proving nothing mangles them downstream needs the Windows test above.
     let cmd = r#"scp -t "C:\path with spaces\out.bin""#;
     assert_eq!(
         decide_fail_open(Some(cmd.to_string())),
         FailOpen::Passthrough(cmd.to_string()),
-        "an EXEC command must run directly, byte for byte, never through a re-quoting shell"
+        "an EXEC command must carry through the decision byte for byte"
     );
     assert_eq!(
         decide_fail_open(None),

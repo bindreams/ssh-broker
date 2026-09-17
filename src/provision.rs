@@ -347,14 +347,15 @@ mod imp {
                         "the payload the child sent did not survive the relay byte for byte".into()
                     },
                 ));
+                // `detail()` distinguishes "the child reported a mismatch" from "the child never
+                // reported at all" (an exe older than this check, which `apply` tolerates when a
+                // running agent holds the canonical path open). Both FAIL — default-deny — but
+                // they have different remedies, and claiming the payload was mangled when nothing
+                // ever looked at it would be a diagnosis the code cannot support.
                 rows.push(report::Check::new(
                     "binary transparency, client to child (via agent)",
-                    p.upstream_ok,
-                    if p.upstream_ok {
-                        String::new()
-                    } else {
-                        "the payload verify sent upstream did not reach the child intact".into()
-                    },
+                    p.upstream.proven(),
+                    p.upstream.detail(),
                 ));
             }
             Err(e) => {
@@ -412,22 +413,21 @@ mod imp {
         // Read the UPSTREAM payload first. This direction — client → child — is the one an
         // `sftp put` / `scp` upload rides, and until now nothing carried binary through a real
         // pipe and checked it arrived unchanged: the in-memory test stops at a fake agent thread,
-        // and this probe fed `io::empty()`. The parent echoes what it read back inside the
-        // downstream payload, so one round trip proves both directions on the real path.
-        let upstream_ok = {
-            use std::io::Read;
-            let mut got = Vec::new();
-            match std::io::stdin().read_to_end(&mut got) {
-                Ok(_) => got == probe::binary_probe_payload(),
-                Err(e) => {
-                    // Default-deny, but SAY WHY. Dropping this error with `.ok()` left a read
-                    // failure and a mangled payload reporting the identical `upstream=fail`,
-                    // which misdiagnoses a transport fault as a transparency fault — the very
-                    // confusion this row was added to resolve. stderr is safe here: the relay
-                    // keeps it separate from the stdout the parent parses.
-                    eprintln!("ssh-broker: reading the upstream probe payload failed: {e}");
-                    false
-                }
+        // and this probe fed `io::empty()`. The two directions are measured INDEPENDENTLY: the
+        // downstream payload emitted below is a fixed write that carries nothing back about what
+        // arrived here, so a corrupted upload surfaces ONLY as `upstream=fail` and never as a
+        // downstream mismatch. The comparison itself lives in `probe::upstream_payload_ok` so it
+        // is host-testable — this function is `cfg(windows)` and has no test module, so a
+        // comparison written inline here could be mutated to `true` with the suite still green.
+        let upstream_ok = match probe::upstream_payload_ok(&mut std::io::stdin()) {
+            Ok(ok) => ok,
+            Err(e) => {
+                // Default-deny, but SAY WHY. Dropping this error with `.ok()` left a read failure
+                // and a mangled payload reporting the identical `upstream=fail`, which
+                // misdiagnoses a transport fault as a transparency fault. stderr is safe here:
+                // the relay keeps it separate from the stdout the parent parses.
+                eprintln!("ssh-broker: reading the upstream probe payload failed: {e}");
+                false
             }
         };
         // One locked handle for both writes: `println!` would take its own lock, and the binary

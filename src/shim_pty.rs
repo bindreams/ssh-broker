@@ -86,12 +86,16 @@ pub fn run_on(exec: Option<String>) -> anyhow::Result<()> {
     // to relay into lands exactly here — a shell would mangle its binary stream. That also matches
     // the relay path, itself a bare `CreateProcessW`, so fail-open and relay no longer disagree
     // about whether a command gets shell semantics. An interactive session carries no command, so
-    // it still gets a plain `pwsh`. `decide_fail_open` is where that choice is made and tested.
+    // it gets a plain `pwsh` instead — but through the SAME contained passthrough, not a separate
+    // uncontained spawn: see `run_local_passthrough` for why that used to be a real containment
+    // gap, not just an inaccurate claim in prose. `decide_fail_open` is where the exec/interactive
+    // choice is made and tested.
     match decide_fail_open(exec) {
         // A spawn failure must NOT escape to `main()`: that exits 1, the one code this crate
         // forbids for a broker-side failure because it is indistinguishable from the command
         // itself failing (`shim::map_outcome`). The relay reports the identical failure as 255,
-        // so this does too.
+        // so both arms below do too — neither ever lets `run_local_passthrough`'s `Err` propagate
+        // out of this function via `?`.
         FailOpen::Passthrough(cmd) => {
             if let Err(e) = run_local_passthrough(&cmd) {
                 tracing::error!("fail-open spawn of {cmd:?} failed: {e:?}");
@@ -100,7 +104,14 @@ pub fn run_on(exec: Option<String>) -> anyhow::Result<()> {
             }
             Ok(()) // not reached: on success it exits with the child's code
         }
-        FailOpen::LocalShell => exec_local_shell(),
+        FailOpen::LocalShell => {
+            if let Err(e) = run_local_passthrough("pwsh -NoLogo") {
+                tracing::error!("fail-open spawn of pwsh failed: {e:?}");
+                eprintln!("ssh-broker: could not run pwsh locally: {e}");
+                std::process::exit(255);
+            }
+            Ok(()) // not reached: on success it exits with the child's code
+        }
     }
 }
 
@@ -159,10 +170,26 @@ fn term() -> String {
 /// Run `command` locally (in the session sshd launched us in), inheriting our stdio directly,
 /// and exit with its code.
 ///
-/// This is the EXEC **fail-open** path — the agent was unreachable, so the command runs here
-/// rather than not at all. It deliberately does not go through a shell: `pwsh -Command` would
-/// reinterpret quoting and mangle a binary stream, which is what an `sftp` session landing here
-/// would be. The child writes raw to sshd's pipes, exactly as the original DefaultShell did.
+/// This is the fail-open path for BOTH shim modes — the agent was unreachable, so the command
+/// runs here rather than not at all. For EXEC (`ssh host "cmd"`) `command` is the command itself;
+/// for an interactive session it is a literal `pwsh -NoLogo`, since that session carries nothing
+/// else to run (see the `FailOpen::LocalShell` arm in `run_on`). Either way it deliberately does
+/// not go through an EXTRA shell: `pwsh -Command <cmd>` would reinterpret quoting and mangle a
+/// binary stream, which is what an `sftp` session landing on the EXEC arm would be. The child
+/// writes raw to sshd's pipes, exactly as the original DefaultShell did.
+///
+/// **Deliberate behaviour change** (do not "simplify" this back): the EXEC arm used to run
+/// `exec_local_shell(Some(cmd))`, i.e. `pwsh -Command <cmd>`, so `ssh host "a | b"` piped and
+/// `ssh host "cd x && y"` chained even during an agent outage. That shell hop is gone on purpose:
+/// EXEC fail-open now matches the relay path's own bare `CreateProcessW` exactly, so during an
+/// outage those shell operators stop working — they become the client's business, same as they
+/// already are on the working (relayed) path, rather than an outage-only convenience the relay
+/// never offered.
+///
+/// The interactive arm changed too, and for a correctness reason rather than a behavioural one:
+/// it used to run through a plain, uncontained `std::process::Command` (`exec_local_shell`),
+/// so its children did NOT die with the session — contradicting the README. Routing it through
+/// this same contained spawn closes that gap; see `spawn_contained`.
 fn run_local_passthrough(command: &str) -> anyhow::Result<()> {
     use windows::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
     use windows::Win32::System::Console::STD_ERROR_HANDLE;
@@ -249,21 +276,6 @@ unsafe fn spawn_contained(
         let job = crate::winutil::contain_and_resume(process.0, thread.0, "shim fail-open")?;
         Ok((process, job))
     }
-}
-
-/// Exec a local `pwsh`, inheriting the current stdio (behaviour == today's thin shell), and exit
-/// with its code. The last resort for an INTERACTIVE session when the agent is unreachable or
-/// there is no console.
-///
-/// It deliberately takes no command. An `ssh host "cmd"` session fails open through
-/// [`run_local_passthrough`] instead, precisely so that no shell reinterprets the command's
-/// quoting. This used to accept an `Option<String>` and forward it to `pwsh -Command`, a leftover
-/// of the deleted local-transfer route; every caller passed `None`.
-fn exec_local_shell() -> anyhow::Result<()> {
-    let mut cmd = std::process::Command::new("pwsh");
-    cmd.arg("-NoLogo");
-    let status = cmd.status()?;
-    std::process::exit(status.code().unwrap_or(1));
 }
 
 // ── PTY relay ──────────────────────────────────────────────────────────────────────
