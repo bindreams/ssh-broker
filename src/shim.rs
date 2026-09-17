@@ -20,7 +20,7 @@ pub fn run(exec: Option<String>) -> anyhow::Result<()> {
     }
 }
 
-/// Trim the command sshd handed us, so the string that is CLASSIFIED is the string that is
+/// Trim the command sshd handed us, so the string that is RELAYED is the string that is
 /// EXECUTED. Applied in `route`, the one place the binary assembles a command, so no argv the
 /// binary parses reaches the shim untrimmed. A library caller invoking `shim::run` directly
 /// bypasses it and should normalize first.
@@ -229,8 +229,12 @@ impl XtwinopsFilter {
 pub enum Fallback {
     /// The agent answered — relay this session to it.
     Relay,
-    /// The agent is unreachable — run a local shell so the box is never locked out, and
-    /// warn (to a log in PTY mode, to stderr in EXEC) that parity is unavailable.
+    /// The agent is unreachable — fail open so the box is never locked out, and warn (to a log
+    /// in PTY mode, to stderr in EXEC) that parity is unavailable.
+    ///
+    /// The name is historical and only half true: a shell is what an INTERACTIVE session gets.
+    /// An `ssh host "cmd"` session runs the command directly, with no shell in between to
+    /// reinterpret its quoting — [`decide_fail_open`] is where the two part company.
     LocalShellWithWarning,
 }
 
@@ -241,6 +245,26 @@ pub fn decide_fallback(connect_err: bool) -> Fallback {
         Fallback::LocalShellWithWarning
     } else {
         Fallback::Relay
+    }
+}
+
+/// What the shim runs once it has decided to fail open.
+#[derive(Debug, PartialEq, Eq)]
+pub enum FailOpen {
+    /// `ssh host "cmd"` — run the command itself, with NO shell between it and sshd's pipes.
+    Passthrough(String),
+    /// An interactive session carries no command to run, so it gets a plain `pwsh`.
+    LocalShell,
+}
+
+/// Decide what the fail-open path runs, from whether this session carried a command.
+///
+/// Pure, and lifted out of `shim_pty::run_on` for the same reason as [`decide_fallback`]: that
+/// function ends in `process::exit`, so nothing could assert against the choice in place.
+pub fn decide_fail_open(exec: Option<String>) -> FailOpen {
+    match exec {
+        Some(cmd) => FailOpen::Passthrough(cmd),
+        None => FailOpen::LocalShell,
     }
 }
 

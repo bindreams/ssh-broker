@@ -4,12 +4,15 @@
 use super::spawn_contained;
 
 /// The local passthrough must contain its child in a job object, exactly as the relayed path
-/// does. This is the property that makes a misclassified command harmless.
+/// does, so that failing open can never become a way to outlive the session.
 ///
-/// Classification reads a string the client chose. While routing carried a containment
-/// difference, that string decided a security outcome: naming any binary `scp.exe` was enough to
-/// be spawned outside the job object and survive session teardown. sshd itself attaches no such
-/// consequence to how a command is classified, and neither should this.
+/// This used to be the property that made a MISCLASSIFIED command harmless: while the shim routed
+/// suspected transfers around the relay, a string the client chose decided a security outcome, and
+/// naming any binary `scp.exe` was enough to be spawned outside the job object and survive session
+/// teardown. That classifier is gone and every command relays now, which makes this test matter
+/// more rather than less — fail-open is the ONLY local spawn left, so this containment is the sole
+/// thing between an unreachable agent and a process that outlives the session the README promises
+/// to reap.
 ///
 /// `cosca::Job` sets `KILL_ON_JOB_CLOSE`, so dropping the job must terminate the child. Before
 /// containment was added the child was created with `PROCESS_CREATION_FLAGS(0)` and no job at

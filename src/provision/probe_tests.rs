@@ -6,22 +6,35 @@ use super::{
 
 #[test]
 fn probe_line_round_trips() {
-    let line = format_probe_line(1, true, SymlinkState::Blocked);
-    assert_eq!(line, "PROBE session_id=1 dpapi=ok symlink=blocked");
+    let line = format_probe_line(1, true, SymlinkState::Blocked, true);
+    assert_eq!(line, "PROBE session_id=1 dpapi=ok symlink=blocked upstream=ok");
     assert_eq!(
         parse_probe_line(&line).unwrap(),
         ProbeResult {
             session_id: 1,
             dpapi_ok: true,
-            symlink: SymlinkState::Blocked
+            symlink: SymlinkState::Blocked,
+            upstream_ok: true,
         }
     );
+}
+
+/// `upstream` is default-deny, like `dpapi`: a probe child too old to report it must read as
+/// "not proven" rather than proven. It gates a claim the README makes about the client → child
+/// direction, so a default of `true` would silently restore the unverified assertion it replaces.
+#[test]
+fn a_missing_upstream_token_reads_as_not_proven() {
+    let old = "PROBE session_id=1 dpapi=ok symlink=skip";
+    assert!(!parse_probe_line(old).unwrap().upstream_ok);
+    let failed = format_probe_line(1, true, SymlinkState::Ok, false);
+    assert!(failed.contains("upstream=fail"));
+    assert!(!parse_probe_line(&failed).unwrap().upstream_ok);
 }
 
 #[test]
 fn symlink_states_round_trip() {
     for st in [SymlinkState::Ok, SymlinkState::Blocked, SymlinkState::Skipped] {
-        let line = format_probe_line(2, false, st);
+        let line = format_probe_line(2, false, st, true);
         assert_eq!(parse_probe_line(&line).unwrap().symlink, st);
     }
     // Only a confirmed block is a parity failure.
@@ -75,27 +88,30 @@ fn binary_probe_markers_cannot_collide_with_the_payload() {
 
 #[test]
 fn parse_is_default_deny_on_gating_keys() {
-    // Missing dpapi → fail; missing session_id → 0; missing symlink → Skipped (informational).
+    // Missing dpapi and upstream → fail; missing session_id → 0; missing symlink → Skipped
+    // (informational). Only symlink may default to a non-failing value.
     let r = parse_probe_line("PROBE session_id=2").unwrap();
     assert_eq!(
         r,
         ProbeResult {
             session_id: 2,
             dpapi_ok: false,
-            symlink: SymlinkState::Skipped
+            symlink: SymlinkState::Skipped,
+            upstream_ok: false,
         }
     );
 }
 
 #[test]
 fn parse_tolerates_surrounding_noise() {
-    let out = "starting...\nPROBE session_id=7 dpapi=ok symlink=ok\nbye\n";
+    let out = "starting...\nPROBE session_id=7 dpapi=ok symlink=ok upstream=ok\nbye\n";
     assert_eq!(
         parse_probe_line(out).unwrap(),
         ProbeResult {
             session_id: 7,
             dpapi_ok: true,
-            symlink: SymlinkState::Ok
+            symlink: SymlinkState::Ok,
+            upstream_ok: true,
         }
     );
 }

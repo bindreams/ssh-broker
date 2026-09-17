@@ -42,6 +42,10 @@ pub struct ProbeResult {
     pub session_id: u32,
     pub dpapi_ok: bool,
     pub symlink: SymlinkState,
+    /// Whether the payload `verify` sent UPSTREAM reached the child unchanged. The downstream
+    /// half is checked by comparing the child's stdout directly; this is the only way to learn
+    /// the client → child direction, because only the child can see what arrived.
+    pub upstream_ok: bool,
 }
 
 // ── binary-transparency probe ────────────────────────────────────────────────────────
@@ -93,11 +97,12 @@ fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 }
 
 /// The single line `verify-probe` prints to stdout.
-pub fn format_probe_line(session_id: u32, dpapi_ok: bool, symlink: SymlinkState) -> String {
+pub fn format_probe_line(session_id: u32, dpapi_ok: bool, symlink: SymlinkState, upstream_ok: bool) -> String {
     format!(
-        "PROBE session_id={session_id} dpapi={} symlink={}",
+        "PROBE session_id={session_id} dpapi={} symlink={} upstream={}",
         if dpapi_ok { "ok" } else { "fail" },
-        symlink.as_str()
+        symlink.as_str(),
+        if upstream_ok { "ok" } else { "fail" }
     )
 }
 
@@ -113,6 +118,10 @@ pub fn parse_probe_line(stdout: &str) -> anyhow::Result<ProbeResult> {
         session_id: 0,
         dpapi_ok: false,
         symlink: SymlinkState::Skipped,
+        // Default-deny, like `dpapi`: a probe child too old to report it must read as "not
+        // proven", never as proven. This one gates a claim the README makes, so a silent
+        // default of `true` would restore exactly the unverified assertion it exists to replace.
+        upstream_ok: false,
     };
     for tok in line.split_whitespace() {
         if let Some(v) = tok.strip_prefix("session_id=") {
@@ -121,6 +130,8 @@ pub fn parse_probe_line(stdout: &str) -> anyhow::Result<ProbeResult> {
             r.dpapi_ok = v == "ok";
         } else if let Some(v) = tok.strip_prefix("symlink=") {
             r.symlink = SymlinkState::parse(v);
+        } else if let Some(v) = tok.strip_prefix("upstream=") {
+            r.upstream_ok = v == "ok";
         }
     }
     Ok(r)

@@ -332,16 +332,28 @@ mod imp {
                     !p.symlink.is_failure(),
                     format!("{:?}", p.symlink),
                 ));
-                // Byte-transparency on the real path. Transfers are routed around the relay on
-                // the premise that relaying would not carry binary intact; this is the check
-                // that holds that premise honest end to end, rather than in prose.
+                // Byte-transparency on the real path, in BOTH directions. Nothing is routed
+                // around the relay any more, so "the relay carries arbitrary bytes unchanged" is
+                // what makes scp/sftp work at all rather than a nicety — and the README says so.
+                // These rows are what hold that claim honest end to end rather than in prose.
+                // They are separate because a one-directional failure must name its direction:
+                // client → child is the `scp`/`sftp put` upload, child → client the download.
                 rows.push(report::Check::new(
-                    "binary transparency (via agent)",
+                    "binary transparency, child to client (via agent)",
                     binary_ok,
                     if binary_ok {
                         String::new()
                     } else {
-                        "payload did not survive the relay byte for byte".into()
+                        "the payload the child sent did not survive the relay byte for byte".into()
+                    },
+                ));
+                rows.push(report::Check::new(
+                    "binary transparency, client to child (via agent)",
+                    p.upstream_ok,
+                    if p.upstream_ok {
+                        String::new()
+                    } else {
+                        "the payload verify sent upstream did not reach the child intact".into()
                     },
                 ));
             }
@@ -376,7 +388,11 @@ mod imp {
         let hs = shim::make_handshake(&Some(cmd), "xterm".into(), 80, 24);
         let mut out = Vec::new();
         let mut err = Vec::new();
-        let code = shim::run_exec_on(rx, tx, &hs, &mut out, &mut err, std::io::empty())?;
+        // Feed the SAME payload upstream that the child echoes downstream. Passing `io::empty()`
+        // here left the client → child direction — the `sftp put` / `scp` upload direction —
+        // completely unchecked, while the docs claimed `verify` covered both.
+        let upstream = std::io::Cursor::new(probe::binary_probe_payload());
+        let code = shim::run_exec_on(rx, tx, &hs, &mut out, &mut err, upstream)?;
         anyhow::ensure!(
             code != 254 && code != 255,
             "probe relay failed (code {code}; stderr={})",
@@ -393,19 +409,46 @@ mod imp {
         let sid = probe::current_session_id();
         let dpapi = probe::dpapi_roundtrip(b"ssh-broker-parity-probe");
         let symlink = probe::symlink_probe();
+        // Read the UPSTREAM payload first. This direction — client → child — is the one an
+        // `sftp put` / `scp` upload rides, and until now nothing carried binary through a real
+        // pipe and checked it arrived unchanged: the in-memory test stops at a fake agent thread,
+        // and this probe fed `io::empty()`. The parent echoes what it read back inside the
+        // downstream payload, so one round trip proves both directions on the real path.
+        let upstream_ok = {
+            use std::io::Read;
+            let mut got = Vec::new();
+            match std::io::stdin().read_to_end(&mut got) {
+                Ok(_) => got == probe::binary_probe_payload(),
+                Err(e) => {
+                    // Default-deny, but SAY WHY. Dropping this error with `.ok()` left a read
+                    // failure and a mangled payload reporting the identical `upstream=fail`,
+                    // which misdiagnoses a transport fault as a transparency fault — the very
+                    // confusion this row was added to resolve. stderr is safe here: the relay
+                    // keeps it separate from the stdout the parent parses.
+                    eprintln!("ssh-broker: reading the upstream probe payload failed: {e}");
+                    false
+                }
+            }
+        };
         // One locked handle for both writes: `println!` would take its own lock, and the binary
         // payload must not interleave with the line that follows it.
         {
             use std::io::Write;
             let mut stdout = std::io::stdout().lock();
             probe::emit_binary_probe(&mut stdout).context("emit the binary-transparency payload")?;
-            writeln!(stdout, "{}", probe::format_probe_line(sid, dpapi, symlink)).context("write the PROBE line")?;
+            writeln!(stdout, "{}", probe::format_probe_line(sid, dpapi, symlink, upstream_ok))
+                .context("write the PROBE line")?;
             stdout.flush().context("flush probe output")?;
         }
         // Parity gates: escaped session 0 AND a working DPAPI (proves a real user profile, the
         // thing session 0 lacks). A CONFIRMED symlink block also fails; a Skipped (unprivileged,
         // untestable) symlink does not. The active-console id is NOT required to match — a host
         // can have several interactive sessions; any non-0 one with DPAPI is parity.
+        //
+        // `upstream_ok` is deliberately NOT a gate here: it measures the RELAY, not the session,
+        // and this child is the wrong place to judge it — exiting non-zero would report a
+        // transport fault as a parity failure, and the parent could not tell the two apart. It
+        // rides up in the PROBE line instead, where `verify` gates it as a row of its own.
         let pass = sid != 0 && dpapi && !symlink.is_failure();
         if !pass {
             std::process::exit(1);

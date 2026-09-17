@@ -17,8 +17,8 @@
 use crate::protocol::{FrameKind, FrameReader, Handshake, Stream, write_frame};
 use crate::relay::{FrameSink, pump_decode, write_data};
 use crate::shim::{
-    Fallback, MouseModeSniffer, XtwinopsFilter, decide_fallback, make_handshake, map_outcome, run_exec_on,
-    size_to_resize,
+    FailOpen, Fallback, MouseModeSniffer, XtwinopsFilter, decide_fail_open, decide_fallback, make_handshake,
+    map_outcome, run_exec_on, size_to_resize,
 };
 use crate::{afunix, conpty, vtinput};
 use std::sync::Arc;
@@ -64,8 +64,9 @@ pub fn run_on(exec: Option<String>) -> anyhow::Result<()> {
     // was a transfer — and that decision is not reliably derivable: sshd rewrites commands before
     // `DefaultShell` sees them, and its config serialisation differs from Windows' own quoting.
     // The justification for routing was that relaying would corrupt a binary stream; that turned
-    // out to be untrue (`exec_relay_is_byte_clean_*` and `verify`'s end-to-end probe). What
-    // remains is a throughput difference, which does not earn a classifier.
+    // out to be untrue — `exec_relay_is_byte_clean_*` covers the framing in both directions, and
+    // `verify`'s probe covers a real child, real pipes and a real socket in both directions too.
+    // What remains is a throughput difference, which does not earn a classifier.
     match try_relay(&exec) {
         Ok(Some(code)) => {
             drop(log); // flush the appender before process::exit
@@ -82,11 +83,24 @@ pub fn run_on(exec: Option<String>) -> anyhow::Result<()> {
     drop(log); // flush before the fallback's own process::exit
     // Fail open. An EXEC command runs through the contained passthrough, NOT a shell: `pwsh
     // -Command` reinterprets quoting, and an `sftp` session on a box with no interactive session
-    // to relay into lands exactly here — a shell would mangle its binary stream. Interactive has
-    // no command to run, so it still gets a plain `pwsh`.
-    match exec {
-        Some(cmd) => run_local_passthrough(&cmd),
-        None => exec_local_shell(None),
+    // to relay into lands exactly here — a shell would mangle its binary stream. That also matches
+    // the relay path, itself a bare `CreateProcessW`, so fail-open and relay no longer disagree
+    // about whether a command gets shell semantics. An interactive session carries no command, so
+    // it still gets a plain `pwsh`. `decide_fail_open` is where that choice is made and tested.
+    match decide_fail_open(exec) {
+        // A spawn failure must NOT escape to `main()`: that exits 1, the one code this crate
+        // forbids for a broker-side failure because it is indistinguishable from the command
+        // itself failing (`shim::map_outcome`). The relay reports the identical failure as 255,
+        // so this does too.
+        FailOpen::Passthrough(cmd) => {
+            if let Err(e) = run_local_passthrough(&cmd) {
+                tracing::error!("fail-open spawn of {cmd:?} failed: {e:?}");
+                eprintln!("ssh-broker: could not run the command locally: {e}");
+                std::process::exit(255);
+            }
+            Ok(()) // not reached: on success it exits with the child's code
+        }
+        FailOpen::LocalShell => exec_local_shell(),
     }
 }
 
@@ -166,7 +180,14 @@ fn run_local_passthrough(command: &str) -> anyhow::Result<()> {
         let (process, _job) = spawn_contained(command, Some([stdin, stdout, stderr]))?;
         WaitForSingleObject(process.0, INFINITE);
         let mut code = 0u32;
-        let _ = GetExitCodeProcess(process.0, &mut code);
+        if GetExitCodeProcess(process.0, &mut code).is_err() {
+            // A failed query must not read as SUCCESS. `code` is still 0 here, so exiting with it
+            // would be indistinguishable from the command having succeeded — the exact confusion
+            // `shim::map_outcome` exists to prevent. 255 is this crate's "the broker failed" code,
+            // and it is what the relay reports for the same class of failure.
+            tracing::error!("GetExitCodeProcess failed for the fail-open child; reporting 255");
+            std::process::exit(255);
+        }
         std::process::exit(code as i32);
     }
 }
@@ -176,13 +197,12 @@ fn run_local_passthrough(command: &str) -> anyhow::Result<()> {
 /// This exists as its own function so the containment is *testable*: `run_local_passthrough`
 /// ends in `process::exit`, so nothing could assert against it.
 ///
-/// Containment is the point. Without it, a misclassified command — or any binary a user chooses
-/// to name `scp.exe` — spawns OUTSIDE the job object and survives session teardown, while the
-/// relayed path (`pipes.rs`, `conpty.rs`) contains its child. Routing must not carry a
-/// containment difference: that asymmetry is the only thing that made an attacker-chosen string
-/// decide a security outcome, and sshd itself attaches no such consequence to how a command is
-/// classified. `CREATE_SUSPENDED` is load-bearing — assignment has to win the race against the
-/// child spawning anything — and `contain_and_resume` kills rather than resumes if it fails.
+/// Containment is the point. A child spawned here must die with the session exactly as a relayed
+/// one does (`pipes.rs`, `conpty.rs` both contain theirs) — otherwise reaching the fail-open path
+/// would be a way to leave a process running after disconnect, and the README promises the
+/// opposite. `CREATE_SUSPENDED` is load-bearing: assignment has to win the race against the child
+/// spawning anything, or a descendant is born outside the job. `contain_and_resume` kills rather
+/// than resumes if assignment fails, so a failure here never yields an uncontained process.
 ///
 /// The caller MUST keep the returned `Job` alive for as long as the child should live.
 ///
@@ -223,22 +243,25 @@ unsafe fn spawn_contained(
             &si,
             &mut pi,
         )
-        .with_context(|| format!("spawn local transfer command: {command}"))?;
+        .with_context(|| format!("spawn the fail-open local command: {command}"))?;
         let process = crate::winutil::OwnedHandle(pi.hProcess);
         let thread = crate::winutil::OwnedHandle(pi.hThread);
-        let job = crate::winutil::contain_and_resume(process.0, thread.0, "local transfer")?;
+        let job = crate::winutil::contain_and_resume(process.0, thread.0, "shim fail-open")?;
         Ok((process, job))
     }
 }
 
-/// Exec a local shell, inheriting the current stdio (behaviour == today's thin shell), and
-/// exit with its code. The last resort when the agent is unreachable or there is no console.
-fn exec_local_shell(exec: Option<String>) -> anyhow::Result<()> {
+/// Exec a local `pwsh`, inheriting the current stdio (behaviour == today's thin shell), and exit
+/// with its code. The last resort for an INTERACTIVE session when the agent is unreachable or
+/// there is no console.
+///
+/// It deliberately takes no command. An `ssh host "cmd"` session fails open through
+/// [`run_local_passthrough`] instead, precisely so that no shell reinterprets the command's
+/// quoting. This used to accept an `Option<String>` and forward it to `pwsh -Command`, a leftover
+/// of the deleted local-transfer route; every caller passed `None`.
+fn exec_local_shell() -> anyhow::Result<()> {
     let mut cmd = std::process::Command::new("pwsh");
     cmd.arg("-NoLogo");
-    if let Some(c) = &exec {
-        cmd.args(["-Command", c]);
-    }
     let status = cmd.status()?;
     std::process::exit(status.code().unwrap_or(1));
 }

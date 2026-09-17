@@ -69,9 +69,9 @@ fn ssh_exec_of_word_agent_is_still_shim_exec() {
     );
 }
 
-/// The command is normalized where it is assembled, so the string the shim classifies is the
-/// string it executes. Mutating the call out of `route` left the whole suite green, because
-/// nothing here had ever passed an untrimmed command.
+/// The command is normalized where it is assembled, so the string the shim relays is the string
+/// it executes. Mutating the call out of `route` left the whole suite green, because nothing here
+/// had ever passed an untrimmed command.
 #[test]
 fn shim_command_is_trimmed_at_the_parse_site() {
     let Route::Shim { exec } = route(&["-c".into(), "  scp -t /x  ".into()]) else {

@@ -2,8 +2,8 @@
 //! duplex transport), the fail-open decision, and the pure helpers. The Windows console
 //! PTY path (raw mode, `ReadConsoleInputW`) is exercised on a real Windows host end-to-end.
 use super::{
-    ExecOutSink, Fallback, MouseModeSniffer, XtwinopsFilter, decide_fallback, make_handshake, map_outcome,
-    size_to_resize,
+    ExecOutSink, FailOpen, Fallback, MouseModeSniffer, XtwinopsFilter, decide_fail_open, decide_fallback,
+    make_handshake, map_outcome, size_to_resize,
 };
 use crate::protocol::{ExitCode, FrameKind, FrameReader, Handshake, Mode, Resize, Stream, read_one_frame, write_frame};
 use crate::relay::{FrameSink, Outcome, duplex, write_data};
@@ -44,17 +44,17 @@ fn exec_shim_relays_streams_and_exit() {
     assert_eq!(err, b"ERR");
 }
 
-/// The EXEC relay must be byte-transparent. This is the premise the whole transfer-classification
-/// design rests on, and until now it was only ever asserted in prose: if relaying mangles bytes,
-/// a missed classification corrupts an sftp/scp stream and detection is a correctness gate; if it
-/// does not, detection is a throughput choice and nothing more.
+/// The EXEC relay must be byte-transparent. Every command now rides the relay — there is no local
+/// route and no classifier — so this property is what makes `scp` and `sftp` work at all, rather
+/// than the throughput detail it would have been if transfers were routed around it. Until this
+/// test the claim was only ever asserted in prose.
 ///
 /// The claim entered the tree with `40c30b2`, whose message has no body and which bundled two
 /// changes. The only defect actually measured there was sftp *hanging* — `std::io::stdout()` is a
 /// `LineWriter`, so newline-less output sat in the buffer — and the fix for that is the per-frame
-/// flush, which applies to every relayed command whether or not it is classified as a transfer.
-/// Nothing tested byte-transparency itself, so the premise could diverge silently. This is that
-/// test.
+/// flush, which applies to every relayed command. Nothing tested byte-transparency itself, so the
+/// premise could diverge silently. This is that test; `verify`'s probe covers the same property
+/// end to end, on a real child, real pipes and a real socket.
 ///
 /// Payload: all 256 byte values, so NUL, `0xFF`, a lone CR, a lone LF and invalid UTF-8 are all
 /// present. The agent writes it in deliberately awkward chunks — 1 byte, then a chunk ending
@@ -271,6 +271,32 @@ fn exec_out_sink_flushes_each_frame() {
 fn fail_open_when_agent_unreachable() {
     assert_eq!(decide_fallback(true), Fallback::LocalShellWithWarning);
     assert_eq!(decide_fallback(false), Fallback::Relay);
+}
+
+/// Fail-open dispatch: a command runs DIRECTLY, and only an interactive session gets a shell.
+///
+/// Rationale, recorded so this is never "simplified" back: `pwsh -Command` re-parses its
+/// argument, so putting an EXEC command through a shell re-quotes it and mangles a binary
+/// stream — which is exactly what an `sftp`/`scp` session landing on the fail-open path is. An
+/// earlier `exec_local_shell(Some(cmd))` route did precisely that. Now that nothing is routed
+/// around the relay, fail-open is the ONLY local execution left, so if it silently regains shell
+/// semantics there is no second path left to notice. `run_on` ends in `process::exit`, which is
+/// why the choice lives in a pure function rather than being asserted where it is made.
+#[test]
+fn fail_open_runs_a_command_directly_and_only_interactive_gets_a_shell() {
+    // The command must survive verbatim: re-quoting is the failure mode being guarded against,
+    // and spaces plus backslashes are what a shell would mangle first.
+    let cmd = r#"scp -t "C:\path with spaces\out.bin""#;
+    assert_eq!(
+        decide_fail_open(Some(cmd.to_string())),
+        FailOpen::Passthrough(cmd.to_string()),
+        "an EXEC command must run directly, byte for byte, never through a re-quoting shell"
+    );
+    assert_eq!(
+        decide_fail_open(None),
+        FailOpen::LocalShell,
+        "an interactive session carries no command to run, so it gets pwsh"
+    );
 }
 
 #[test]
