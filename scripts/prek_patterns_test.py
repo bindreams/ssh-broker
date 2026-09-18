@@ -112,7 +112,43 @@ CASES: dict[str, tuple[list[str], list[str]]] = {
 FILTERS: dict[str, dict[str, object]] = {
     "no-sleep-sync": {"types": None, "exclude": None, "files": None, "types_or": None, "exclude_types": None, "args": None},
     "no-hardcoded-user-paths": {"types": None, "exclude": None, "files": None, "types_or": None, "exclude_types": None, "args": None},
-    "tests-in-separate-files": {"types": ["rust"], "exclude": r"_tests\.rs$", "files": None, "types_or": None, "exclude_types": None, "args": None},
+    "tests-in-separate-files": {
+        "types": ["rust"],
+        "exclude": r"^tests/|_tests\.rs$",
+        "files": None,
+        "types_or": None,
+        "exclude_types": None,
+        "args": None,
+    },
+}
+
+# Proves the `exclude` filter actually does its job against real paths, not just that its
+# string matches what we expect: a filter can be widened (or narrowed) to something that still
+# equality-checks correctly against a typo'd expectation. `excluded` paths must be SKIPPED by
+# the filter (so a `#[test]` there never reaches the pattern); `scanned` paths must NOT be, so a
+# `#[test]` in an implementation file is still caught.
+EXCLUDE_PATH_CASES: dict[str, tuple[list[str], list[str]]] = {
+    "tests-in-separate-files": (
+        [
+            "src/shim_tests.rs",
+            "src/shim_pty_tests.rs",
+            "tests/fail_open_windows.rs",
+            "tests/verify_probe_upstream.rs",
+            "tests/interactive_fail_open_containment.rs",
+        ],
+        [
+            "src/shim.rs",
+            "src/shim_pty.rs",
+            "src/main.rs",
+            "src/provision.rs",
+            # Pins the `^` anchor specifically: unanchored `tests/` (dropping the `^` from
+            # `^tests/|_tests\.rs$`) would also skip a `tests/` directory NESTED under `src/` —
+            # reopening the inline-`#[test]`-inside-`src/` hole this hook exists to close, while
+            # the FILTERS string-equality check alone could not tell an anchored pattern from an
+            # unanchored one if both were edited to match.
+            "src/tests/helper.rs",
+        ],
+    ),
 }
 
 
@@ -158,12 +194,49 @@ def main() -> int:
                     f"a filter change can make the hook inert without touching its pattern"
                 )
 
+    for hook_id, (excluded, scanned) in EXCLUDE_PATH_CASES.items():
+        hook = hooks.get(hook_id)
+        if hook is None:
+            continue  # already reported above
+        # Same emptiness guard as the `CASES` loop above, and for the same reason: an emptied
+        # list here would pass in silence — exactly the "reports success while testing nothing"
+        # failure this file's docstring calls out.
+        if not excluded:
+            failures.append(f"{hook_id}: no excluded-path cases — the exclude filter is unpinned")
+        if not scanned:
+            failures.append(f"{hook_id}: no scanned-path cases — nothing stops exclude matching everything")
+        # `.get`, not a subscript: a hook can appear in EXCLUDE_PATH_CASES while its `exclude` was
+        # removed from prek.toml (one of the two mutations this block exists to catch — see the
+        # comment on that hook's `exclude` key). A subscript there raises `KeyError` and aborts
+        # the whole script before `failures` is ever printed, hiding every other collected result
+        # along with it.
+        exclude_src = hook.get("exclude")
+        if not exclude_src:
+            failures.append(f"{hook_id}: has EXCLUDE_PATH_CASES cases but no `exclude` filter in prek.toml")
+            continue
+        # Bytes, like the `CASES` loop above and for the same reason: prek matches filenames as
+        # bytes too, and a `str`-compiled pattern here would certify an `exclude` that a non-ASCII
+        # path could silently slip past in real prek even while this check reports it as caught.
+        exclude_pattern = re.compile(exclude_src.encode())
+        for path in excluded:
+            if not exclude_pattern.search(path.encode()):
+                failures.append(f"{hook_id}: exclude should skip {path!r} but the pattern does not match it")
+        for path in scanned:
+            if exclude_pattern.search(path.encode()):
+                failures.append(f"{hook_id}: exclude should NOT skip {path!r} but the pattern matches it")
+
     untested = set(hooks) - set(CASES) - {"cargo-fmt", "cargo-clippy"}
     for hook_id in sorted(untested):
         failures.append(f"{hook_id}: pygrep hook has no cases in this file")
     unfiltered = set(hooks) - set(FILTERS) - {"cargo-fmt", "cargo-clippy"}
     for hook_id in sorted(unfiltered):
         failures.append(f"{hook_id}: pygrep hook has no filter expectations in this file")
+    # Mirrors `unfiltered` above: any hook that declares an `exclude` at all should have its own
+    # path-level proof the filter does its job, not just a string equality check that could
+    # itself be typo'd to something inert (see `EXCLUDE_PATH_CASES`'s own docstring).
+    excludes_untested = {hid for hid, h in hooks.items() if h.get("exclude")} - set(EXCLUDE_PATH_CASES)
+    for hook_id in sorted(excludes_untested):
+        failures.append(f"{hook_id}: hook has an `exclude` filter but no EXCLUDE_PATH_CASES entry")
 
     if failures:
         print("prek pattern check FAILED:\n", file=sys.stderr)
@@ -172,7 +245,11 @@ def main() -> int:
         return 1
 
     total = sum(len(m) + len(n) for m, n in CASES.values())
-    print(f"prek pattern check passed: {len(CASES)} patterns, {total} cases, {len(FILTERS)} filter sets")
+    exclude_total = sum(len(e) + len(s) for e, s in EXCLUDE_PATH_CASES.values())
+    print(
+        f"prek pattern check passed: {len(CASES)} patterns, {total} cases, {len(FILTERS)} filter sets, "
+        f"{len(EXCLUDE_PATH_CASES)} exclude filters, {exclude_total} exclude-path cases"
+    )
     return 0
 
 

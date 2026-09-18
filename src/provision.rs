@@ -8,6 +8,7 @@
 //! proven present), and resolves the ACL grantee BY NAME so a SYSTEM-run self-heal grants the
 //! same account the agent binds as.
 
+pub mod bounded;
 pub mod config;
 pub mod probe;
 pub mod registry;
@@ -309,8 +310,19 @@ mod imp {
         let reachable = afunix::connect(&afunix::socket_path()).is_ok();
         rows.push(report::Check::new("socket reachable", reachable, String::new()));
 
-        // Through the agent: the real parity proof (run in session 1 by verify-probe).
-        match drive_probe(&exe) {
+        // Through the agent: the real parity proof (run in session 1 by verify-probe). Bounded,
+        // because the probe child blocks reading the upstream payload before it writes anything,
+        // so an agent or session-1 child that wedges yields NO report at all — not even the local
+        // rows already gathered above. See `provision::bounded` for why a clock here is the rule's
+        // exception rather than a breach of it.
+        //
+        // Not a claim that this is the only wait that can hang: the `schtasks` queries above are
+        // unbounded too, and a wedged Task Scheduler stalls `verify` just as thoroughly. That case
+        // is simply not addressed here.
+        // A malformed `--probe-timeout` errors rather than quietly applying the default, so the
+        // operator who asked to wait indefinitely never silently gets 30s and a wrong diagnosis.
+        let probe_timeout = super::bounded::probe_timeout_from_args(&std::env::args().collect::<Vec<_>>())?;
+        match drive_probe_bounded(&exe, probe_timeout) {
             Ok((p, binary_ok)) => {
                 // Parity = escaped session 0 (the limited network-logon session). The agent
                 // need not be in THE active-console session — a box can have several
@@ -332,17 +344,35 @@ mod imp {
                     !p.symlink.is_failure(),
                     format!("{:?}", p.symlink),
                 ));
-                // Byte-transparency on the real path. Transfers are routed around the relay on
-                // the premise that relaying would not carry binary intact; this is the check
-                // that holds that premise honest end to end, rather than in prose.
+                // Byte-transparency on the real path, in BOTH directions. Nothing is routed
+                // around the relay any more, so "the relay carries arbitrary bytes unchanged" is
+                // what makes scp/sftp work at all rather than a nicety — and the README says so.
+                // These rows are what hold that claim honest end to end rather than in prose.
+                // They are separate because a one-directional failure must name its direction:
+                // client → child is the `scp`/`sftp put` upload, child → client the download.
+                // Named for the transfer each direction carries. The previous names differed only
+                // by two transposed words ("child to client" / "client to child") and read as
+                // near-identical in the one place they appear side by side. (The formatter pads to
+                // a MINIMUM width and truncates nothing — a sibling row already runs longer — so
+                // length was never the problem; legibility was.)
                 rows.push(report::Check::new(
-                    "binary transparency (via agent)",
+                    "binary download (via agent)",
                     binary_ok,
                     if binary_ok {
                         String::new()
                     } else {
-                        "payload did not survive the relay byte for byte".into()
+                        "the payload the child sent did not survive the relay byte for byte".into()
                     },
+                ));
+                // `detail()` distinguishes "the child reported a mismatch" from "the child never
+                // reported at all" (an exe older than this check, which `apply` tolerates when a
+                // running agent holds the canonical path open). Both FAIL — default-deny — but
+                // they have different remedies, and claiming the payload was mangled when nothing
+                // ever looked at it would be a diagnosis the code cannot support.
+                rows.push(report::Check::new(
+                    "binary upload (via agent)",
+                    p.upstream.proven(),
+                    p.upstream.detail(),
                 ));
             }
             Err(e) => {
@@ -362,6 +392,31 @@ mod imp {
         Ok(())
     }
 
+    /// Drive the probe on a worker thread, giving up after `timeout`.
+    ///
+    /// The bound is here rather than around the child's stdin read for two reasons. It covers
+    /// EVERY way the probe can fail to answer — a lost stdin-EOF marker, an agent that accepts the
+    /// connection and then never replies, a child that dies mid-write — where bounding the read
+    /// would cover only the first. And bounding a blocking `ReadFile` on a Windows pipe means
+    /// overlapped I/O inside the child, where this is a thread and a channel.
+    ///
+    /// On expiry the error flows into the same `parity probe (via agent)` row that an unreachable
+    /// agent produces, so `verify` still prints every local check and exits non-zero — instead of
+    /// hanging with nothing on stdout, which is what it did before.
+    fn drive_probe_bounded(
+        exe: &Path,
+        timeout: Option<std::time::Duration>,
+    ) -> anyhow::Result<(probe::ProbeResult, bool)> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let exe = exe.to_path_buf();
+        // The worker owns the whole relay conversation; on expiry it is left blocked on a socket
+        // that is not delivering, and `verify` exits immediately after printing, which collects it.
+        std::thread::spawn(move || {
+            let _ = tx.send(drive_probe(&exe));
+        });
+        super::bounded::await_bounded(&rx, timeout)?
+    }
+
     /// Drive `<exe> verify-probe` as an EXEC command THROUGH the agent (so it runs in session 1),
     /// parse the PROBE line it prints, and check whether its binary payload survived intact.
     ///
@@ -376,7 +431,11 @@ mod imp {
         let hs = shim::make_handshake(&Some(cmd), "xterm".into(), 80, 24);
         let mut out = Vec::new();
         let mut err = Vec::new();
-        let code = shim::run_exec_on(rx, tx, &hs, &mut out, &mut err, std::io::empty())?;
+        // Feed the SAME payload upstream that the child echoes downstream. Passing `io::empty()`
+        // here left the client → child direction — the `sftp put` / `scp` upload direction —
+        // completely unchecked, while the docs claimed `verify` covered both.
+        let upstream = std::io::Cursor::new(probe::binary_probe_payload());
+        let code = shim::run_exec_on(rx, tx, &hs, &mut out, &mut err, upstream)?;
         anyhow::ensure!(
             code != 254 && code != 255,
             "probe relay failed (code {code}; stderr={})",
@@ -393,19 +452,45 @@ mod imp {
         let sid = probe::current_session_id();
         let dpapi = probe::dpapi_roundtrip(b"ssh-broker-parity-probe");
         let symlink = probe::symlink_probe();
+        // Read the UPSTREAM payload first. This direction — client → child — is the one an
+        // `sftp put` / `scp` upload rides, and until now nothing carried binary through a real
+        // pipe and checked it arrived unchanged: the in-memory test stops at a fake agent thread,
+        // and this probe fed `io::empty()`. The two directions are measured INDEPENDENTLY: the
+        // downstream payload emitted below is a fixed write that carries nothing back about what
+        // arrived here, so a corrupted upload surfaces ONLY as `upstream=fail` and never as a
+        // downstream mismatch. The comparison itself lives in `probe::upstream_payload_ok` so it
+        // is host-testable — this function is `cfg(windows)` and has no test module, so a
+        // comparison written inline here could be mutated to `true` with the suite still green.
+        let upstream_ok = match probe::upstream_payload_ok(&mut std::io::stdin()) {
+            Ok(ok) => ok,
+            Err(e) => {
+                // Default-deny, but SAY WHY. Dropping this error with `.ok()` left a read failure
+                // and a mangled payload reporting the identical `upstream=fail`, which
+                // misdiagnoses a transport fault as a transparency fault. stderr is safe here:
+                // the relay keeps it separate from the stdout the parent parses.
+                eprintln!("ssh-broker: reading the upstream probe payload failed: {e}");
+                false
+            }
+        };
         // One locked handle for both writes: `println!` would take its own lock, and the binary
         // payload must not interleave with the line that follows it.
         {
             use std::io::Write;
             let mut stdout = std::io::stdout().lock();
             probe::emit_binary_probe(&mut stdout).context("emit the binary-transparency payload")?;
-            writeln!(stdout, "{}", probe::format_probe_line(sid, dpapi, symlink)).context("write the PROBE line")?;
+            writeln!(stdout, "{}", probe::format_probe_line(sid, dpapi, symlink, upstream_ok))
+                .context("write the PROBE line")?;
             stdout.flush().context("flush probe output")?;
         }
         // Parity gates: escaped session 0 AND a working DPAPI (proves a real user profile, the
         // thing session 0 lacks). A CONFIRMED symlink block also fails; a Skipped (unprivileged,
         // untestable) symlink does not. The active-console id is NOT required to match — a host
         // can have several interactive sessions; any non-0 one with DPAPI is parity.
+        //
+        // `upstream_ok` is deliberately NOT a gate here: it measures the RELAY, not the session,
+        // and this child is the wrong place to judge it — exiting non-zero would report a
+        // transport fault as a parity failure, and the parent could not tell the two apart. It
+        // rides up in the PROBE line instead, where `verify` gates it as a row of its own.
         let pass = sid != 0 && dpapi && !symlink.is_failure();
         if !pass {
             std::process::exit(1);

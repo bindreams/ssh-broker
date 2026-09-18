@@ -95,7 +95,12 @@ name = "unit tests live in a separate _tests.rs file"
 #
 # `#[skuld::test]` and any other path-qualified test attribute are matched too, so this
 # keeps working after the migration to a custom harness.
+#
+# `tests/` is also exempt: Cargo's own integration-test convention is `tests/foo.rs` — a
+# `#[test]` there is exactly what belongs, not the inline-module violation this hook exists
+# to catch. Anchored to the directory prefix rather than widened to `\.rs$`, which would
+# silence the hook everywhere.
 entry = '^\s*#\[(?:[\w:]+::)?test\b'
-exclude = '_tests\.rs$'
+exclude = '^tests/|_tests\.rs$'
 language = "pygrep"
 types = ["rust"]

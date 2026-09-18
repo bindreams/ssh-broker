@@ -17,8 +17,8 @@
 use crate::protocol::{FrameKind, FrameReader, Handshake, Stream, write_frame};
 use crate::relay::{FrameSink, pump_decode, write_data};
 use crate::shim::{
-    Fallback, MouseModeSniffer, XtwinopsFilter, decide_fallback, make_handshake, map_outcome, run_exec_on,
-    size_to_resize,
+    FailOpen, Fallback, MouseModeSniffer, XtwinopsFilter, decide_fail_open, decide_fallback, make_handshake,
+    map_outcome, run_exec_on, size_to_resize,
 };
 use crate::{afunix, conpty, vtinput};
 use std::sync::Arc;
@@ -58,28 +58,15 @@ const VT_OUT: CONSOLE_MODE =
 pub fn run_on(exec: Option<String>) -> anyhow::Result<()> {
     let log = init_file_logging();
 
-    // sftp/scp FILE TRANSFERS run locally, not through the agent: they need raw binary
-    // bidirectional stdio and gain nothing from session-1 parity, so relaying their long-lived
-    // binary protocol only adds latency + a buffering failure surface. (This is what sshd's
-    // sftp subsystem becomes once DefaultShell is the shim: `ssh-broker -c "sftp-server.exe"`.)
-    if let Some(cmd) = &exec
-        && crate::shim::is_transfer_command(cmd)
-    {
-        drop(log);
-        return run_local_passthrough(cmd);
-    }
-    // Classified as not-a-transfer, but shaped like the one miss this rule cannot see: an
-    // unquoted spaced program path, which Windows launches and we tokenize short. Relaying it
-    // corrupts the binary stream, so leave the operator a signal rather than failing silently.
-    if let Some(cmd) = &exec
-        && crate::shim::missed_transfer_hint(cmd)
-    {
-        tracing::warn!(
-            "relaying a command whose program path looks like an unquoted transfer helper; \
-             if a transfer hangs or corrupts, quote the path in sshd_config"
-        );
-    }
-
+    // EVERY command relays. There is deliberately no local route for file transfers.
+    //
+    // Routing them locally required deciding, from a string the CLIENT chose, whether a command
+    // was a transfer — and that decision is not reliably derivable: sshd rewrites commands before
+    // `DefaultShell` sees them, and its config serialisation differs from Windows' own quoting.
+    // The justification for routing was that relaying would corrupt a binary stream; that turned
+    // out to be untrue — `exec_relay_is_byte_clean_*` covers the framing in both directions, and
+    // `verify`'s probe covers a real child, real pipes and a real socket in both directions too.
+    // What remains is a throughput difference, which does not earn a classifier.
     match try_relay(&exec) {
         Ok(Some(code)) => {
             drop(log); // flush the appender before process::exit
@@ -93,8 +80,54 @@ pub fn run_on(exec: Option<String>) -> anyhow::Result<()> {
             tracing::warn!("shim relay setup failed: {e:?}; falling back to a local shell");
         }
     }
-    drop(log); // flush before exec_local_shell's own process::exit
-    exec_local_shell(exec)
+    // Fail open. An EXEC command runs through the contained passthrough, NOT a shell: `pwsh
+    // -Command` reinterprets quoting, and an `sftp` session on a box with no interactive session
+    // to relay into lands exactly here — a shell would mangle its binary stream. That also matches
+    // the relay path, itself a bare `CreateProcessW`, so fail-open and relay no longer disagree
+    // about whether a command gets shell semantics. An interactive session carries no command, so
+    // it gets a plain `pwsh` instead — but through the SAME contained passthrough, not a separate
+    // uncontained spawn: see `run_local_passthrough` for why that used to be a real containment
+    // gap, not just an inaccurate claim in prose. `decide_fail_open` is where the exec/interactive
+    // choice is made and tested, and `fail_open_command` maps it to the single spawn below — ONE
+    // call site, so neither arm can regain shell semantics or lose containment on its own.
+    //
+    // The log guard deliberately stays ALIVE until each exit. Dropping it here (as this once did)
+    // shuts the `tracing-appender` worker down, and its lossy writer then silently discards every
+    // later line — so the `tracing::error!` below, the only PTY-mode diagnostic for a failed
+    // fallback, went nowhere at all.
+    let decision = decide_fail_open(exec);
+    let command = fail_open_command(&decision);
+    match run_local_passthrough(command) {
+        Ok(code) => {
+            drop(log); // flush: `process::exit` runs no destructors
+            // Bypass main()'s Result→0/1 collapse; the i32→u32 cast is bit-preserving.
+            std::process::exit(code)
+        }
+        Err(e) => {
+            // A spawn failure must NOT escape to `main()`: that exits 1, the one code this crate
+            // forbids for a broker-side failure because it is indistinguishable from the command
+            // itself failing (`shim::map_outcome`). The relay reports the identical failure as
+            // 255, so this does too — the `Err` is never propagated out of this function.
+            tracing::error!("fail-open spawn of {command:?} failed: {e:?}");
+            // EXEC has a clean stderr channel; in PTY mode a stderr write would corrupt the
+            // terminal stream, so there the reason goes only to the log (README's "Limits").
+            if matches!(decision, FailOpen::Passthrough(_)) {
+                eprintln!("ssh-broker: could not run the command locally: {e}");
+            }
+            drop(log); // flush before exiting
+            std::process::exit(255)
+        }
+    }
+}
+
+/// The command each fail-open outcome runs. Pure, so the interactive arm's program is pinned by a
+/// test rather than by reading `run_on`: an interactive session has nothing of its own to run, so
+/// it gets `pwsh`, while an EXEC command is passed through untouched.
+fn fail_open_command(decision: &FailOpen) -> &str {
+    match decision {
+        FailOpen::Passthrough(cmd) => cmd.as_str(),
+        FailOpen::LocalShell => "pwsh -NoLogo",
+    }
 }
 
 /// Attempt the relay. `Ok(Some(code))` = a relay completed (PTY or EXEC). `Ok(None)` = the
@@ -149,10 +182,35 @@ fn term() -> String {
     std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".into())
 }
 
-/// Run an sftp/scp transfer command LOCALLY (in the session sshd launched us in), inheriting
-/// our stdio directly, instead of relaying it to the agent. The child writes raw to sshd's
-/// pipes (no Rust buffering), exactly as the original DefaultShell did. Exits with its code.
-fn run_local_passthrough(command: &str) -> anyhow::Result<()> {
+/// Run `command` locally (in the session sshd launched us in), inheriting our stdio directly, and
+/// return its exit code.
+///
+/// It deliberately RETURNS the code rather than calling `process::exit` itself. Exiting here forced
+/// the caller to drop the log guard before this ran, which shut the appender down and silently
+/// discarded every diagnostic logged afterwards — including the one explaining a failed fallback.
+/// Returning leaves the caller owning both the exit and the flush that must precede it.
+///
+/// This is the fail-open path for BOTH shim modes — the agent was unreachable, so the command
+/// runs here rather than not at all. For EXEC (`ssh host "cmd"`) `command` is the command itself;
+/// for an interactive session it is a literal `pwsh -NoLogo`, since that session carries nothing
+/// else to run (see the `FailOpen::LocalShell` arm in `run_on`). Either way it deliberately does
+/// not go through an EXTRA shell: `pwsh -Command <cmd>` would reinterpret quoting and mangle a
+/// binary stream, which is what an `sftp` session landing on the EXEC arm would be. The child
+/// writes raw to sshd's pipes, exactly as the original DefaultShell did.
+///
+/// **Deliberate behaviour change** (do not "simplify" this back): the EXEC arm used to run
+/// `exec_local_shell(Some(cmd))`, i.e. `pwsh -Command <cmd>`, so `ssh host "a | b"` piped and
+/// `ssh host "cd x && y"` chained even during an agent outage. That shell hop is gone on purpose:
+/// EXEC fail-open now matches the relay path's own bare `CreateProcessW` exactly, so during an
+/// outage those shell operators stop working — they become the client's business, same as they
+/// already are on the working (relayed) path, rather than an outage-only convenience the relay
+/// never offered.
+///
+/// The interactive arm changed too, and for a correctness reason rather than a behavioural one:
+/// it used to run through a plain, uncontained `std::process::Command` (`exec_local_shell`),
+/// so its children did NOT die with the session — contradicting the README. Routing it through
+/// this same contained spawn closes that gap; see `spawn_contained`.
+fn run_local_passthrough(command: &str) -> anyhow::Result<i32> {
     use windows::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
     use windows::Win32::System::Console::STD_ERROR_HANDLE;
     use windows::Win32::System::Threading::{GetExitCodeProcess, INFINITE, WaitForSingleObject};
@@ -169,23 +227,31 @@ fn run_local_passthrough(command: &str) -> anyhow::Result<()> {
         let (process, _job) = spawn_contained(command, Some([stdin, stdout, stderr]))?;
         WaitForSingleObject(process.0, INFINITE);
         let mut code = 0u32;
-        let _ = GetExitCodeProcess(process.0, &mut code);
-        std::process::exit(code as i32);
+        if GetExitCodeProcess(process.0, &mut code).is_err() {
+            // A failed query must not read as SUCCESS. `code` is still 0 here, so returning it
+            // would be indistinguishable from the command having succeeded — the exact confusion
+            // `shim::map_outcome` exists to prevent. Reporting it as an error routes it to the
+            // caller's 255, this crate's "the broker failed" code, which is what the relay reports
+            // for the same class of failure. Erroring rather than exiting here is also what lets
+            // the caller LOG it: exiting inside this function is why that diagnostic was lost.
+            anyhow::bail!("GetExitCodeProcess failed for the fail-open child");
+        }
+        Ok(code as i32)
     }
 }
 
 /// Spawn `command` suspended and contain it in a job object before it runs a single instruction.
 ///
-/// This exists as its own function so the containment is *testable*: `run_local_passthrough`
-/// ends in `process::exit`, so nothing could assert against it.
+/// This exists as its own function so the containment is *testable* in isolation. `run_on` still
+/// ends in `process::exit` (so nothing in-process can observe its wiring — that is gated end to
+/// end by `tests/fail_open_windows.rs`), but the spawn itself can be asserted against here.
 ///
-/// Containment is the point. Without it, a misclassified command — or any binary a user chooses
-/// to name `scp.exe` — spawns OUTSIDE the job object and survives session teardown, while the
-/// relayed path (`pipes.rs`, `conpty.rs`) contains its child. Routing must not carry a
-/// containment difference: that asymmetry is the only thing that made an attacker-chosen string
-/// decide a security outcome, and sshd itself attaches no such consequence to how a command is
-/// classified. `CREATE_SUSPENDED` is load-bearing — assignment has to win the race against the
-/// child spawning anything — and `contain_and_resume` kills rather than resumes if it fails.
+/// Containment is the point. A child spawned here must die with the session exactly as a relayed
+/// one does (`pipes.rs`, `conpty.rs` both contain theirs) — otherwise reaching the fail-open path
+/// would be a way to leave a process running after disconnect, and the README promises the
+/// opposite. `CREATE_SUSPENDED` is load-bearing: assignment has to win the race against the child
+/// spawning anything, or a descendant is born outside the job. `contain_and_resume` kills rather
+/// than resumes if assignment fails, so a failure here never yields an uncontained process.
 ///
 /// The caller MUST keep the returned `Job` alive for as long as the child should live.
 ///
@@ -226,24 +292,12 @@ unsafe fn spawn_contained(
             &si,
             &mut pi,
         )
-        .with_context(|| format!("spawn local transfer command: {command}"))?;
+        .with_context(|| format!("spawn the fail-open local command: {command}"))?;
         let process = crate::winutil::OwnedHandle(pi.hProcess);
         let thread = crate::winutil::OwnedHandle(pi.hThread);
-        let job = crate::winutil::contain_and_resume(process.0, thread.0, "local transfer")?;
+        let job = crate::winutil::contain_and_resume(process.0, thread.0, "shim fail-open")?;
         Ok((process, job))
     }
-}
-
-/// Exec a local shell, inheriting the current stdio (behaviour == today's thin shell), and
-/// exit with its code. The last resort when the agent is unreachable or there is no console.
-fn exec_local_shell(exec: Option<String>) -> anyhow::Result<()> {
-    let mut cmd = std::process::Command::new("pwsh");
-    cmd.arg("-NoLogo");
-    if let Some(c) = &exec {
-        cmd.args(["-Command", c]);
-    }
-    let status = cmd.status()?;
-    std::process::exit(status.code().unwrap_or(1));
 }
 
 // ── PTY relay ──────────────────────────────────────────────────────────────────────
@@ -470,18 +524,96 @@ fn console_size(stdout: HANDLE) -> (u16, u16) {
 
 // ── console raw-mode RAII ──────────────────────────────────────────────────────────
 
+/// The Win32 calls `ConsoleModes` drives to apply/restore raw mode, behind a trait so the
+/// guard's rollback-on-partial-failure behavior is host-testable without a real console via a
+/// fake that fails the SECOND `set_mode` call (`src/shim_pty_tests.rs`). `Win32ConsoleOps` is
+/// the real implementation the `ConsoleModes` alias below is backed by at runtime.
+trait ConsoleOps {
+    fn set_mode(&self, handle: HANDLE, mode: CONSOLE_MODE) -> windows::core::Result<()>;
+    fn set_ctrl_suppressed(&self, suppress: bool) -> windows::core::Result<()>;
+}
+
+struct Win32ConsoleOps;
+
+impl ConsoleOps for Win32ConsoleOps {
+    fn set_mode(&self, handle: HANDLE, mode: CONSOLE_MODE) -> windows::core::Result<()> {
+        unsafe { SetConsoleMode(handle, mode) }
+    }
+
+    fn set_ctrl_suppressed(&self, suppress: bool) -> windows::core::Result<()> {
+        unsafe { SetConsoleCtrlHandler(None, suppress) }
+    }
+}
+
 /// Saves and restores the stdin/stdout console modes (and the Ctrl handler). `is_console` is
 /// false when stdin/stdout are not consoles (redirected pipes) — then nothing is changed and
 /// Drop is a no-op, and the caller fails open (a non-console can't drive `ReadConsoleInputW`).
-struct ConsoleModes {
+///
+/// Generic over `ConsoleOps` purely for testability; real callers use the `ConsoleModes` alias
+/// below, which is always `Win32ConsoleOps`-backed.
+struct ConsoleModesState<Ops: ConsoleOps> {
+    ops: Ops,
     stdin: HANDLE,
     stdout: HANDLE,
     in_orig: CONSOLE_MODE,
     out_orig: CONSOLE_MODE,
     is_console: bool,
+    // Whether `set_ctrl_suppressed(true)` actually SUCCEEDED. Unlike the two `SetConsoleMode`
+    // restores below (writing back a captured value is a harmless no-op even on a path where
+    // that particular handle's mode was never actually changed), `SetConsoleCtrlHandler` is an
+    // ABSOLUTE state change inherited by child processes, not a value restore — unconditionally
+    // clearing it on Drop, on a path where the corresponding suppress call never ran (or
+    // failed), would clear an attribute this guard never set (e.g. one the process inherited
+    // from sshd). Gating the restore on this flag keeps Drop symmetric with what actually changed.
+    ctrl_suppressed: bool,
 }
 
-impl ConsoleModes {
+type ConsoleModes = ConsoleModesState<Win32ConsoleOps>;
+
+impl<Ops: ConsoleOps> ConsoleModesState<Ops> {
+    /// Applies raw mode via `ops`, constructing the guard NOW, holding the ORIGINAL modes,
+    /// before either is changed below. `modes` is then a local variable in scope for the rest of
+    /// this function, so if the stdout `set_mode` fails via `?` after the stdin one already
+    /// succeeded, Rust drops every local on that early return — running `modes`'s `Drop` and
+    /// restoring stdin's mode before this function returns the error.
+    fn enter_with(
+        ops: Ops,
+        stdin: HANDLE,
+        stdout: HANDLE,
+        in_orig: CONSOLE_MODE,
+        out_orig: CONSOLE_MODE,
+        is_console: bool,
+    ) -> windows::core::Result<Self> {
+        let mut modes = ConsoleModesState {
+            ops,
+            stdin,
+            stdout,
+            in_orig,
+            out_orig,
+            is_console,
+            ctrl_suppressed: false,
+        };
+        if is_console {
+            modes.ops.set_mode(stdin, RAW_IN)?;
+            modes.ops.set_mode(stdout, CONSOLE_MODE(out_orig.0 | VT_OUT.0))?;
+            // Suppress Ctrl events as signals to the shim (insurance; the primary path is the
+            // cleared ENABLE_PROCESSED_INPUT delivering Ctrl-C as a KEY record). Best-effort:
+            // failure here does not fail `enter_with`, it just leaves `ctrl_suppressed` false so
+            // Drop does not try to undo a change that never happened — but it must not be silent,
+            // for the same reason the Drop-side restores below are logged.
+            modes.ctrl_suppressed = match modes.ops.set_ctrl_suppressed(true) {
+                Ok(()) => true,
+                Err(e) => {
+                    tracing::error!("failed to suppress the console Ctrl handler: {e:?}");
+                    false
+                }
+            };
+        }
+        Ok(modes)
+    }
+}
+
+impl ConsoleModesState<Win32ConsoleOps> {
     fn enter() -> windows::core::Result<ConsoleModes> {
         unsafe {
             let stdin = GetStdHandle(STD_INPUT_HANDLE)?;
@@ -490,31 +622,29 @@ impl ConsoleModes {
             let mut out_orig = CONSOLE_MODE(0);
             let is_console =
                 GetConsoleMode(stdin, &mut in_orig).is_ok() && GetConsoleMode(stdout, &mut out_orig).is_ok();
-            if is_console {
-                SetConsoleMode(stdin, RAW_IN)?;
-                SetConsoleMode(stdout, CONSOLE_MODE(out_orig.0 | VT_OUT.0))?;
-                // Suppress Ctrl events as signals to the shim (insurance; the primary path is
-                // the cleared ENABLE_PROCESSED_INPUT delivering Ctrl-C as a KEY record).
-                let _ = SetConsoleCtrlHandler(None, true);
-            }
-            Ok(ConsoleModes {
-                stdin,
-                stdout,
-                in_orig,
-                out_orig,
-                is_console,
-            })
+            Self::enter_with(Win32ConsoleOps, stdin, stdout, in_orig, out_orig, is_console)
         }
     }
 }
 
-impl Drop for ConsoleModes {
+impl<Ops: ConsoleOps> Drop for ConsoleModesState<Ops> {
     fn drop(&mut self) {
         if self.is_console {
-            unsafe {
-                let _ = SetConsoleMode(self.stdin, self.in_orig);
-                let _ = SetConsoleMode(self.stdout, self.out_orig);
-                let _ = SetConsoleCtrlHandler(None, false);
+            // Restoring a captured value is a harmless no-op even if that particular call never
+            // actually changed anything, so these two stay unconditional. A failure here can
+            // leave the session in a corrupted terminal state (raw mode, no echo/line input)
+            // with nothing left to do about it from this function — but it must not be silent,
+            // or that corruption has zero diagnostic trail in the log.
+            if let Err(e) = self.ops.set_mode(self.stdin, self.in_orig) {
+                tracing::error!("failed to restore stdin console mode: {e:?}");
+            }
+            if let Err(e) = self.ops.set_mode(self.stdout, self.out_orig) {
+                tracing::error!("failed to restore stdout console mode: {e:?}");
+            }
+            if self.ctrl_suppressed
+                && let Err(e) = self.ops.set_ctrl_suppressed(false)
+            {
+                tracing::error!("failed to restore the console Ctrl handler: {e:?}");
             }
         }
     }

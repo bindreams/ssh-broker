@@ -38,12 +38,16 @@ to bind.
 
 ### Fail-open is deliberate, and never in the security boundary
 
-If the shim cannot reach the agent it runs a local shell and reports why. A broken broker must
-not cost you access to the machine. The local shell is `pwsh`, so this inherits the project's
-PowerShell Core requirement. This is the relay path's deliberate degradation, and the security boundary never degrades — the
-ACL check above and the bind both fail closed. Elsewhere the shim also prefers working over
-failing in smaller ways (logging disables itself rather than aborting, for one), and
-provisioning has best-effort steps of its own.
+If the shim cannot reach the agent it runs your command locally and reports why. A broken broker
+must not cost you access to the machine. An *interactive* session falls back to a plain `pwsh`, so
+that path inherits the project's PowerShell Core requirement; `ssh host "cmd"` instead runs the
+command directly, with no shell in between to re-quote it — which is what keeps an `sftp` or `scp`
+session landing here byte-clean. Either way the child is contained in a job object exactly as a
+relayed one is, so failing open is not a way to outlive the session. This is the relay path's
+deliberate degradation, and the security boundary never degrades — the ACL check above and the
+bind both fail closed. Elsewhere the shim also prefers working over failing in smaller ways
+(logging disables itself rather than aborting, for one), and provisioning has best-effort steps of
+its own.
 
 ## Building and testing
 
@@ -90,9 +94,25 @@ review instead. No lint enforces any of them: `clippy.toml` is deliberately empt
 **No sleeping as synchronization.** A sleep is a bet that some duration is long enough, and
 that bet loses on a loaded runner. Teardown ordering uses real primitives: waking a parked
 console read by injecting a record, closing a pseudoconsole to force EOF, joining threads.
-Waiting on a genuinely external event is fine and uses an unbounded wait; a wait carrying a
-numeric bound is not. A long-lived sentinel in a fixture opts out with a same-line
-`sleep-ok:` marker **and a reason** — a bare marker does not suppress.
+Waiting on a genuinely external event is fine and normally uses an unbounded wait; a wait
+carrying a numeric bound is not. A same-line `sleep-ok:` marker **and a reason** opts out — a bare
+marker does not suppress. The hatch is not fixture-only: product code may carry one where the
+reason is written down, and exactly one place does.
+
+That place is [`provision::bounded`](src/provision/bounded.rs), and its justification is narrower
+than "the network might swallow it". `verify` runs on this host and drives the agent over the
+AF_UNIX socket **in-process** — there is no ssh client, no sshd and no separate shim in that path.
+If the agent dies, the socket EOFs and the probe fails with no clock involved. The bound covers the
+case that has no such primitive: the agent alive while its handler, or the session-1 probe child,
+never produces output — a wedged LSASS blocking the child's DPAPI round trip, a hung filesystem
+filter driver, or a deadlock of our own.
+
+That last possibility is the uncomfortable one, and it is why the bound is confined to this one
+command. Most ways `verify` can hang are OUR bugs, and a clock over a bug is precisely what this
+rule exists to forbid. It is justified here because `verify` is a one-shot operator diagnostic
+whose subject is a possibly-sick machine: hanging is the worst way to report one, and it throws
+away the local rows already gathered. `--probe-timeout 0` keeps the true unbounded hang for anyone
+debugging such a deadlock. Nothing else may take a bound on this argument.
 
 **No arbitrary retry caps** *(review-enforced)*. Numeric bounds that are not retry caps are fine
 and are explained where they occur — the agent task's `RestartOnFailure` `Count`, which the Task

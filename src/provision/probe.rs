@@ -42,6 +42,56 @@ pub struct ProbeResult {
     pub session_id: u32,
     pub dpapi_ok: bool,
     pub symlink: SymlinkState,
+    /// Whether the payload `verify` sent UPSTREAM reached the child unchanged. Only the child can
+    /// see what arrived, so the PROBE line is the only way to learn the client → child direction;
+    /// the downstream half is checked by comparing the child's stdout directly.
+    pub upstream: UpstreamState,
+}
+
+/// Outcome of the upstream (client → child) transparency check.
+///
+/// `Absent` is deliberately distinct from `Fail`. `apply` tolerates NOT replacing the canonical
+/// exe when a running agent holds it open (see `install_self`), so a probe child older than this
+/// check is a reachable state on an otherwise healthy box. Reporting that as "the payload did not
+/// reach the child intact" would be a diagnosis the code cannot support: the payload may have
+/// arrived perfectly and the child simply never looked. Both still FAIL the gate — the difference
+/// is only in what `verify` tells the operator to do about it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpstreamState {
+    Ok,
+    Fail,
+    Absent,
+}
+
+impl UpstreamState {
+    fn parse(s: &str) -> UpstreamState {
+        if s == "ok" {
+            UpstreamState::Ok
+        } else {
+            UpstreamState::Fail
+        }
+    }
+
+    /// Proven intact. Default-deny: ONLY `Ok` passes, so an exe too old to report cannot silently
+    /// restore the unverified assertion this check exists to replace.
+    pub fn proven(self) -> bool {
+        matches!(self, UpstreamState::Ok)
+    }
+
+    /// The `verify` row detail — never a claim the code cannot support.
+    pub fn detail(self) -> String {
+        match self {
+            UpstreamState::Ok => String::new(),
+            UpstreamState::Fail => "the payload verify sent upstream did not reach the child intact".into(),
+            // State what is KNOWN, then the likely cause — the same discipline the `Fail` arm
+            // follows. All the parser can tell is that no `upstream=` token arrived; an exe older
+            // than this check is the usual reason, but a truncated or garbled PROBE line and a
+            // child killed mid-write produce it too, and those are not fixed by re-running `apply`.
+            UpstreamState::Absent => "no `upstream=` token in the PROBE line (usually an installed exe older \
+                 than this check — re-run `apply`, stopping the agent first so the exe can be replaced)"
+                .into(),
+        }
+    }
 }
 
 // ── binary-transparency probe ────────────────────────────────────────────────────────
@@ -81,6 +131,21 @@ pub fn binary_probe_ok(stdout: &[u8]) -> bool {
     extract_binary_probe(stdout).is_some_and(|got| got == binary_probe_payload())
 }
 
+/// Whether the payload that arrived on the probe child's stdin is the one `verify` sent upstream.
+///
+/// Pure, and host-tested, on purpose. Its only caller (`provision::imp::verify_probe`) is
+/// `#[cfg(windows)]` and has no test module, so mutating the comparison THERE to a bare `true`
+/// would make `verify` print a PASS for the client → child row unconditionally with the whole
+/// suite still green — restoring exactly the unverified assertion that row exists to replace.
+///
+/// Default-deny by construction: a short or empty read compares unequal, and an I/O error
+/// propagates so the caller reports it rather than mistaking it for "arrived intact".
+pub fn upstream_payload_ok<R: std::io::Read>(r: &mut R) -> std::io::Result<bool> {
+    let mut got = Vec::new();
+    r.read_to_end(&mut got)?;
+    Ok(got == binary_probe_payload())
+}
+
 fn extract_binary_probe(stdout: &[u8]) -> Option<&[u8]> {
     let open = find_bytes(stdout, BINARY_PROBE_OPEN)? + BINARY_PROBE_OPEN.len();
     let rest = &stdout[open..];
@@ -93,11 +158,12 @@ fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 }
 
 /// The single line `verify-probe` prints to stdout.
-pub fn format_probe_line(session_id: u32, dpapi_ok: bool, symlink: SymlinkState) -> String {
+pub fn format_probe_line(session_id: u32, dpapi_ok: bool, symlink: SymlinkState, upstream_ok: bool) -> String {
     format!(
-        "PROBE session_id={session_id} dpapi={} symlink={}",
+        "PROBE session_id={session_id} dpapi={} symlink={} upstream={}",
         if dpapi_ok { "ok" } else { "fail" },
-        symlink.as_str()
+        symlink.as_str(),
+        if upstream_ok { "ok" } else { "fail" }
     )
 }
 
@@ -113,6 +179,11 @@ pub fn parse_probe_line(stdout: &str) -> anyhow::Result<ProbeResult> {
         session_id: 0,
         dpapi_ok: false,
         symlink: SymlinkState::Skipped,
+        // Default-deny, like `dpapi`: a probe child too old to report it must read as "not
+        // proven", never as proven. This one gates a claim the README makes, so a silent
+        // default of "ok" would restore exactly the unverified assertion it exists to replace.
+        // `Absent` rather than `Fail` so the row can say WHICH of the two happened.
+        upstream: UpstreamState::Absent,
     };
     for tok in line.split_whitespace() {
         if let Some(v) = tok.strip_prefix("session_id=") {
@@ -121,6 +192,8 @@ pub fn parse_probe_line(stdout: &str) -> anyhow::Result<ProbeResult> {
             r.dpapi_ok = v == "ok";
         } else if let Some(v) = tok.strip_prefix("symlink=") {
             r.symlink = SymlinkState::parse(v);
+        } else if let Some(v) = tok.strip_prefix("upstream=") {
+            r.upstream = UpstreamState::parse(v);
         }
     }
     Ok(r)
