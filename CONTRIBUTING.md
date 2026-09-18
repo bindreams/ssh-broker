@@ -95,16 +95,24 @@ review instead. No lint enforces any of them: `clippy.toml` is deliberately empt
 that bet loses on a loaded runner. Teardown ordering uses real primitives: waking a parked
 console read by injecting a record, closing a pseudoconsole to force EOF, joining threads.
 Waiting on a genuinely external event is fine and normally uses an unbounded wait; a wait
-carrying a numeric bound is not. A long-lived sentinel in a fixture opts out with a same-line
-`sleep-ok:` marker **and a reason** — a bare marker does not suppress.
+carrying a numeric bound is not. A same-line `sleep-ok:` marker **and a reason** opts out — a bare
+marker does not suppress. The hatch is not fixture-only: product code may carry one where the
+reason is written down, and exactly one place does.
 
-There is exactly one bounded wait in the product — [`provision::bounded`](src/provision/bounded.rs)
-— and it is the rule's stated exception rather than a breach of it. `verify` awaits bytes crossing
-the SSH transport, which may simply never arrive, and the bound is the failure it reports to the
-operator at the keyboard (`--probe-timeout <seconds>`, `0` to wait indefinitely). It replaced a
-hang that printed no report at all, not even the local checks that had already passed. Nothing the
-shim and agent do *between themselves* may use it: there they have real primitives — frame reads,
-EOF, process handles, job objects — and an unbounded wait is the correct one.
+That place is [`provision::bounded`](src/provision/bounded.rs), and its justification is narrower
+than "the network might swallow it". `verify` runs on this host and drives the agent over the
+AF_UNIX socket **in-process** — there is no ssh client, no sshd and no separate shim in that path.
+If the agent dies, the socket EOFs and the probe fails with no clock involved. The bound covers the
+case that has no such primitive: the agent alive while its handler, or the session-1 probe child,
+never produces output — a wedged LSASS blocking the child's DPAPI round trip, a hung filesystem
+filter driver, or a deadlock of our own.
+
+That last possibility is the uncomfortable one, and it is why the bound is confined to this one
+command. Most ways `verify` can hang are OUR bugs, and a clock over a bug is precisely what this
+rule exists to forbid. It is justified here because `verify` is a one-shot operator diagnostic
+whose subject is a possibly-sick machine: hanging is the worst way to report one, and it throws
+away the local rows already gathered. `--probe-timeout 0` keeps the true unbounded hang for anyone
+debugging such a deadlock. Nothing else may take a bound on this argument.
 
 **No arbitrary retry caps** *(review-enforced)*. Numeric bounds that are not retry caps are fine
 and are explained where they occur — the agent task's `RestartOnFailure` `Count`, which the Task

@@ -85,25 +85,6 @@ mod imp {
             .cloned()
     }
 
-    /// How long `verify` waits for the probe, from `--probe-timeout <seconds>`. `0` waits
-    /// indefinitely, for someone debugging a genuinely slow box.
-    ///
-    /// The default is deliberately generous: this bound exists to turn a wedged transport into a
-    /// reported failure, NOT to police how quickly a healthy host answers, and a bound tight
-    /// enough to false-fail on a loaded machine would be worse than no bound at all. An
-    /// unparseable value falls back to the default, matching `--user`'s tolerance.
-    fn arg_probe_timeout() -> Option<std::time::Duration> {
-        const DEFAULT_SECS: u64 = 30;
-        let args: Vec<String> = std::env::args().collect();
-        let secs = args
-            .iter()
-            .position(|a| a == "--probe-timeout")
-            .and_then(|i| args.get(i + 1))
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(DEFAULT_SECS);
-        (secs != 0).then(|| std::time::Duration::from_secs(secs))
-    }
-
     /// Case-insensitive compare of a registry path string (quotes trimmed) to a path.
     fn eq_path(a: &str, b: &Path) -> bool {
         a.trim().trim_matches('"').eq_ignore_ascii_case(&b.to_string_lossy())
@@ -330,11 +311,18 @@ mod imp {
         rows.push(report::Check::new("socket reachable", reachable, String::new()));
 
         // Through the agent: the real parity proof (run in session 1 by verify-probe). Bounded,
-        // because the probe child blocks reading the upstream payload before it writes anything:
-        // if the transport stops delivering, an unbounded wait prints NO report at all — not even
-        // the local rows already gathered above. See `provision::bounded` for why a clock here is
-        // the rule's stated exception rather than a breach of it.
-        match drive_probe_bounded(&exe, arg_probe_timeout()) {
+        // because the probe child blocks reading the upstream payload before it writes anything,
+        // so an agent or session-1 child that wedges yields NO report at all — not even the local
+        // rows already gathered above. See `provision::bounded` for why a clock here is the rule's
+        // exception rather than a breach of it.
+        //
+        // Not a claim that this is the only wait that can hang: the `schtasks` queries above are
+        // unbounded too, and a wedged Task Scheduler stalls `verify` just as thoroughly. That case
+        // is simply not addressed here.
+        // A malformed `--probe-timeout` errors rather than quietly applying the default, so the
+        // operator who asked to wait indefinitely never silently gets 30s and a wrong diagnosis.
+        let probe_timeout = super::bounded::probe_timeout_from_args(&std::env::args().collect::<Vec<_>>())?;
+        match drive_probe_bounded(&exe, probe_timeout) {
             Ok((p, binary_ok)) => {
                 // Parity = escaped session 0 (the limited network-logon session). The agent
                 // need not be in THE active-console session — a box can have several
@@ -362,10 +350,11 @@ mod imp {
                 // These rows are what hold that claim honest end to end rather than in prose.
                 // They are separate because a one-directional failure must name its direction:
                 // client → child is the `scp`/`sftp put` upload, child → client the download.
-                // Named for the transfer each direction carries, not spelled out longhand: the
-                // report pads names to a fixed width, and two rows differing only by transposed
-                // words ("child to client" / "client to child") both overflowed it and read as
-                // near-identical in the one place they appear side by side.
+                // Named for the transfer each direction carries. The previous names differed only
+                // by two transposed words ("child to client" / "client to child") and read as
+                // near-identical in the one place they appear side by side. (The formatter pads to
+                // a MINIMUM width and truncates nothing — a sibling row already runs longer — so
+                // length was never the problem; legibility was.)
                 rows.push(report::Check::new(
                     "binary download (via agent)",
                     binary_ok,

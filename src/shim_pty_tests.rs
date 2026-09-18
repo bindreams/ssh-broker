@@ -59,8 +59,9 @@ fn the_local_passthrough_child_is_contained_in_a_job() {
 ///
 /// This is worth pinning because both arms now reach the OS through the SINGLE
 /// `run_local_passthrough` call in `run_on` — the program string is the only thing that differs
-/// between them, so this is what stops the interactive arm quietly acquiring a shell hop or a
-/// different program.
+/// between them, so this is what stops either arm quietly acquiring a DIFFERENT PROGRAM. It does
+/// not stop a shell hop: a wrapper applied at that single call site leaves `fail_open_command`
+/// untouched and this test green — see the caveat below for what does catch that.
 ///
 /// Being precise about what it does NOT prove, since overclaiming here is a defect this file has
 /// already shipped twice: it does not prove containment (that is
