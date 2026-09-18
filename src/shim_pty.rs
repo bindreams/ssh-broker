@@ -244,7 +244,7 @@ fn run_local_passthrough(command: &str) -> anyhow::Result<i32> {
 ///
 /// This exists as its own function so the containment is *testable* in isolation. `run_on` still
 /// ends in `process::exit` (so nothing in-process can observe its wiring — that is gated end to
-/// end by `tests/fail_open_windows_tests.rs`), but the spawn itself can be asserted against here.
+/// end by `tests/fail_open_windows.rs`), but the spawn itself can be asserted against here.
 ///
 /// Containment is the point. A child spawned here must die with the session exactly as a relayed
 /// one does (`pipes.rs`, `conpty.rs` both contain theirs) — otherwise reaching the fail-open path
@@ -524,18 +524,96 @@ fn console_size(stdout: HANDLE) -> (u16, u16) {
 
 // ── console raw-mode RAII ──────────────────────────────────────────────────────────
 
+/// The Win32 calls `ConsoleModes` drives to apply/restore raw mode, behind a trait so the
+/// guard's rollback-on-partial-failure behavior is host-testable without a real console via a
+/// fake that fails the SECOND `set_mode` call (`src/shim_pty_tests.rs`). `Win32ConsoleOps` is
+/// the real implementation the `ConsoleModes` alias below is backed by at runtime.
+trait ConsoleOps {
+    fn set_mode(&self, handle: HANDLE, mode: CONSOLE_MODE) -> windows::core::Result<()>;
+    fn set_ctrl_suppressed(&self, suppress: bool) -> windows::core::Result<()>;
+}
+
+struct Win32ConsoleOps;
+
+impl ConsoleOps for Win32ConsoleOps {
+    fn set_mode(&self, handle: HANDLE, mode: CONSOLE_MODE) -> windows::core::Result<()> {
+        unsafe { SetConsoleMode(handle, mode) }
+    }
+
+    fn set_ctrl_suppressed(&self, suppress: bool) -> windows::core::Result<()> {
+        unsafe { SetConsoleCtrlHandler(None, suppress) }
+    }
+}
+
 /// Saves and restores the stdin/stdout console modes (and the Ctrl handler). `is_console` is
 /// false when stdin/stdout are not consoles (redirected pipes) — then nothing is changed and
 /// Drop is a no-op, and the caller fails open (a non-console can't drive `ReadConsoleInputW`).
-struct ConsoleModes {
+///
+/// Generic over `ConsoleOps` purely for testability; real callers use the `ConsoleModes` alias
+/// below, which is always `Win32ConsoleOps`-backed.
+struct ConsoleModesState<Ops: ConsoleOps> {
+    ops: Ops,
     stdin: HANDLE,
     stdout: HANDLE,
     in_orig: CONSOLE_MODE,
     out_orig: CONSOLE_MODE,
     is_console: bool,
+    // Whether `set_ctrl_suppressed(true)` actually SUCCEEDED. Unlike the two `SetConsoleMode`
+    // restores below (writing back a captured value is a harmless no-op even on a path where
+    // that particular handle's mode was never actually changed), `SetConsoleCtrlHandler` is an
+    // ABSOLUTE state change inherited by child processes, not a value restore — unconditionally
+    // clearing it on Drop, on a path where the corresponding suppress call never ran (or
+    // failed), would clear an attribute this guard never set (e.g. one the process inherited
+    // from sshd). Gating the restore on this flag keeps Drop symmetric with what actually changed.
+    ctrl_suppressed: bool,
 }
 
-impl ConsoleModes {
+type ConsoleModes = ConsoleModesState<Win32ConsoleOps>;
+
+impl<Ops: ConsoleOps> ConsoleModesState<Ops> {
+    /// Applies raw mode via `ops`, constructing the guard NOW, holding the ORIGINAL modes,
+    /// before either is changed below. `modes` is then a local variable in scope for the rest of
+    /// this function, so if the stdout `set_mode` fails via `?` after the stdin one already
+    /// succeeded, Rust drops every local on that early return — running `modes`'s `Drop` and
+    /// restoring stdin's mode before this function returns the error.
+    fn enter_with(
+        ops: Ops,
+        stdin: HANDLE,
+        stdout: HANDLE,
+        in_orig: CONSOLE_MODE,
+        out_orig: CONSOLE_MODE,
+        is_console: bool,
+    ) -> windows::core::Result<Self> {
+        let mut modes = ConsoleModesState {
+            ops,
+            stdin,
+            stdout,
+            in_orig,
+            out_orig,
+            is_console,
+            ctrl_suppressed: false,
+        };
+        if is_console {
+            modes.ops.set_mode(stdin, RAW_IN)?;
+            modes.ops.set_mode(stdout, CONSOLE_MODE(out_orig.0 | VT_OUT.0))?;
+            // Suppress Ctrl events as signals to the shim (insurance; the primary path is the
+            // cleared ENABLE_PROCESSED_INPUT delivering Ctrl-C as a KEY record). Best-effort:
+            // failure here does not fail `enter_with`, it just leaves `ctrl_suppressed` false so
+            // Drop does not try to undo a change that never happened — but it must not be silent,
+            // for the same reason the Drop-side restores below are logged.
+            modes.ctrl_suppressed = match modes.ops.set_ctrl_suppressed(true) {
+                Ok(()) => true,
+                Err(e) => {
+                    tracing::error!("failed to suppress the console Ctrl handler: {e:?}");
+                    false
+                }
+            };
+        }
+        Ok(modes)
+    }
+}
+
+impl ConsoleModesState<Win32ConsoleOps> {
     fn enter() -> windows::core::Result<ConsoleModes> {
         unsafe {
             let stdin = GetStdHandle(STD_INPUT_HANDLE)?;
@@ -544,31 +622,29 @@ impl ConsoleModes {
             let mut out_orig = CONSOLE_MODE(0);
             let is_console =
                 GetConsoleMode(stdin, &mut in_orig).is_ok() && GetConsoleMode(stdout, &mut out_orig).is_ok();
-            if is_console {
-                SetConsoleMode(stdin, RAW_IN)?;
-                SetConsoleMode(stdout, CONSOLE_MODE(out_orig.0 | VT_OUT.0))?;
-                // Suppress Ctrl events as signals to the shim (insurance; the primary path is
-                // the cleared ENABLE_PROCESSED_INPUT delivering Ctrl-C as a KEY record).
-                let _ = SetConsoleCtrlHandler(None, true);
-            }
-            Ok(ConsoleModes {
-                stdin,
-                stdout,
-                in_orig,
-                out_orig,
-                is_console,
-            })
+            Self::enter_with(Win32ConsoleOps, stdin, stdout, in_orig, out_orig, is_console)
         }
     }
 }
 
-impl Drop for ConsoleModes {
+impl<Ops: ConsoleOps> Drop for ConsoleModesState<Ops> {
     fn drop(&mut self) {
         if self.is_console {
-            unsafe {
-                let _ = SetConsoleMode(self.stdin, self.in_orig);
-                let _ = SetConsoleMode(self.stdout, self.out_orig);
-                let _ = SetConsoleCtrlHandler(None, false);
+            // Restoring a captured value is a harmless no-op even if that particular call never
+            // actually changed anything, so these two stay unconditional. A failure here can
+            // leave the session in a corrupted terminal state (raw mode, no echo/line input)
+            // with nothing left to do about it from this function — but it must not be silent,
+            // or that corruption has zero diagnostic trail in the log.
+            if let Err(e) = self.ops.set_mode(self.stdin, self.in_orig) {
+                tracing::error!("failed to restore stdin console mode: {e:?}");
+            }
+            if let Err(e) = self.ops.set_mode(self.stdout, self.out_orig) {
+                tracing::error!("failed to restore stdout console mode: {e:?}");
+            }
+            if self.ctrl_suppressed
+                && let Err(e) = self.ops.set_ctrl_suppressed(false)
+            {
+                tracing::error!("failed to restore the console Ctrl handler: {e:?}");
             }
         }
     }

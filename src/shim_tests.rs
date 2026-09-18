@@ -283,7 +283,7 @@ fn fail_open_when_agent_unreachable() {
 /// another `pwsh -Command` before calling `run_local_passthrough`) would leave this test green
 /// while reintroducing exactly the re-quoting bug it used to guard against — this assertion alone
 /// cannot catch that. The real gate for "the command reaches the OS verbatim, with no shell
-/// re-parsing its quoting" is `tests/fail_open_windows_tests.rs`, which runs the actual binary down the
+/// re-parsing its quoting" is `tests/fail_open_windows.rs`, which runs the actual binary down the
 /// actual fail-open path and reads back the command line `cmd.exe` really received. It has to be
 /// an integration test: `run_on` ends in `process::exit`, so nothing in-process — here or in
 /// `shim_pty_tests.rs` — can observe that wiring, and a unit test calling `spawn_contained`
