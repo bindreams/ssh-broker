@@ -74,7 +74,7 @@ jobs:
       # job rather than in a job of their own, because a check nobody requires cannot
       # block the merge it exists to block.
       # renovate: datasource=github-releases depName=astral-sh/setup-uv
-      - uses: astral-sh/setup-uv@v10.2.0
+      - uses: astral-sh/setup-uv@v10.3.0
         if: runner.os == 'macOS'
       - name: prek hooks
         if: runner.os == 'macOS'
