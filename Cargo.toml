@@ -25,7 +25,7 @@ pipe = "0.4"                 # two unidirectional pipes compose the splittable r
 # cosca: kernel-enforced process-tree containment (Windows Job Objects) for the agent and for
 # the shim's fail-open passthrough. Windows-gated again now that transfer detection is gone —
 # its `CommandLineToArgvW` splitter was the only cross-platform user.
-cosca = "0.4"
+cosca = "0.5"
 
 windows = { version = "0.62.2", features = [
     "Win32_System_Console",
