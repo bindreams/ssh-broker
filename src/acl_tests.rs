@@ -312,3 +312,31 @@ fn is_trusted_install_owner_accepts_only_system_and_administrators() {
     assert!(!is_trusted_install_owner(&sid("Everyone")).unwrap());
     assert!(!is_trusted_install_owner(&Sid::current_user().unwrap()).unwrap());
 }
+
+// A hostile directory must be refused with a reason, not fail the inspection itself ------
+
+/// A plain directory this user owns (no elevation needed), with the deny ACE a local attacker
+/// would plant. `/deny (W)` includes SYNCHRONIZE, which `CreateFileW` always requests.
+fn plain_dir_denying(tag: &str) -> TempPath {
+    let dir = TempPath::new(tag);
+    std::fs::create_dir(&dir.0).unwrap();
+    icacls_str(&dir.0, &["/deny", "*S-1-1-0:(W)"]);
+    dir
+}
+
+#[test]
+fn install_dir_problem_is_reported_for_a_dir_denying_everyone_write() {
+    let dir = plain_dir_denying("deny-w");
+    let problem = install_dir_problem(&dir.0).unwrap().expect("a deny ACE is a problem");
+    assert!(problem.contains("not the hardened one"), "{problem}");
+    icacls_str(&dir.0, &["/remove:d", "*S-1-1-0"]);
+}
+
+#[test]
+fn nt_path_prefixes_each_win32_path_form() {
+    let nt = |p: &str| String::from_utf16(&nt_path(Path::new(p)).unwrap()).unwrap();
+    assert_eq!(nt(r"C:\a\b"), r"\??\C:\a\b");
+    assert_eq!(nt(r"\\?\C:\a\b"), r"\??\C:\a\b");
+    assert_eq!(nt(r"\\server\share\a"), r"\??\UNC\server\share\a");
+    assert_eq!(nt(r"\\?\UNC\server\share\a"), r"\??\UNC\server\share\a");
+}

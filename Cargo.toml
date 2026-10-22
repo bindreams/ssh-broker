@@ -40,6 +40,8 @@ windows = { version = "0.62.2", features = [
     "Win32_System_RemoteDesktop",
     "Win32_System_Registry",       # DefaultShell registry pair (Reg* APIs)
     "Win32_Security_Cryptography", # DPAPI parity probe (CryptProtectData/CryptUnprotectData)
+    "Wdk_Foundation",
+    "Wdk_Storage_FileSystem",       # NtOpenFile: open a directory for ACL inspection without SYNCHRONIZE
 ] }
 
 # tracing-appender: rolling file sink for the shim's logs under ProgramData (the shim must

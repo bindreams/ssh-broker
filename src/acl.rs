@@ -22,7 +22,12 @@ use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
 
 use anyhow::Context;
-use windows::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, HANDLE, HLOCAL, LocalFree};
+use windows::Wdk::Foundation::OBJECT_ATTRIBUTES;
+use windows::Wdk::Storage::FileSystem::{FILE_OPEN_FOR_BACKUP_INTENT, FILE_OPEN_REPARSE_POINT, NtOpenFile};
+use windows::Win32::Foundation::{
+    CloseHandle, ERROR_ALREADY_EXISTS, HANDLE, HLOCAL, LocalFree, OBJ_CASE_INSENSITIVE, RtlNtStatusToDosError,
+    STATUS_ACCESS_DENIED, UNICODE_STRING,
+};
 use windows::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, GetNamedSecurityInfoW,
     GetSecurityInfo, SDDL_REVISION_1, SE_FILE_OBJECT, SetNamedSecurityInfoW,
@@ -37,11 +42,11 @@ use windows::Win32::Security::{
     WinBuiltinUsersSid, WinLocalSystemSid,
 };
 use windows::Win32::Storage::FileSystem::{
-    BY_HANDLE_FILE_INFORMATION, CreateDirectoryW, CreateFileW, FILE_ALL_ACCESS, FILE_ATTRIBUTE_DIRECTORY,
-    FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_EXECUTE,
-    FILE_GENERIC_READ, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    GetFileInformationByHandle, OPEN_EXISTING, READ_CONTROL,
+    BY_HANDLE_FILE_INFORMATION, CreateDirectoryW, FILE_ALL_ACCESS, FILE_ATTRIBUTE_DIRECTORY,
+    FILE_ATTRIBUTE_REPARSE_POINT, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
+    FILE_SHARE_READ, FILE_SHARE_WRITE, GetFileInformationByHandle, READ_CONTROL,
 };
+use windows::Win32::System::IO::IO_STATUS_BLOCK;
 use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 use windows::core::{BOOL, HRESULT, PCWSTR, PWSTR};
 
@@ -460,24 +465,75 @@ const INSTALL_DIR_SDDL: &str = "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;F
 /// `AceFlags` of every ACE in [`INSTALL_DIR_SDDL`]: `OI|CI`, and not `INHERITED_ACE`.
 const INSTALL_ACE_FLAGS: u8 = (OBJECT_INHERIT_ACE.0 | CONTAINER_INHERIT_ACE.0) as u8;
 
+/// Open `dir` itself (never a reparse target) with only the rights to read its ACL and
+/// attributes, so every later answer is about the object opened and not about whatever the path
+/// names a moment later. `None` if the object refuses even that (access denied).
+///
+/// Not `CreateFileW`: it always adds `SYNCHRONIZE` to the request, so a deny ACE covering
+/// `SYNCHRONIZE` (`icacls /deny (W)` does) would fail the open before the ACL is read.
+fn open_for_inspection(dir: &Path) -> anyhow::Result<Option<OwnedHandle>> {
+    let mut name = nt_path(dir)?;
+    let bytes = u16::try_from(name.len() * 2).context("the path is too long")?;
+    let name = UNICODE_STRING {
+        Length: bytes,
+        MaximumLength: bytes,
+        Buffer: PWSTR(name.as_mut_ptr()),
+    };
+    let attributes = OBJECT_ATTRIBUTES {
+        Length: std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
+        ObjectName: &name,
+        Attributes: OBJ_CASE_INSENSITIVE,
+        ..Default::default()
+    };
+    let mut handle = HANDLE::default();
+    let mut io = IO_STATUS_BLOCK::default();
+    // SAFETY: every pointer is to a local that outlives the call.
+    let status = unsafe {
+        NtOpenFile(
+            &mut handle,
+            READ_CONTROL.0 | FILE_READ_ATTRIBUTES.0,
+            &attributes,
+            &mut io,
+            (FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE).0,
+            FILE_OPEN_FOR_BACKUP_INTENT.0 | FILE_OPEN_REPARSE_POINT.0,
+        )
+    };
+    if status.0 >= 0 {
+        return Ok(Some(OwnedHandle(handle)));
+    }
+    if status == STATUS_ACCESS_DENIED {
+        return Ok(None);
+    }
+    // SAFETY: a plain value conversion.
+    let win32 = unsafe { RtlNtStatusToDosError(status) };
+    Err(windows::core::Error::from(HRESULT::from_win32(win32))).with_context(|| format!("open {}", dir.display()))
+}
+
+/// `dir` as an NT object-manager path (`\??\C:\...`), UTF-16 without a terminator.
+fn nt_path(dir: &Path) -> anyhow::Result<Vec<u16>> {
+    let abs: Vec<u16> = std::path::absolute(dir)
+        .with_context(|| format!("make {} absolute", dir.display()))?
+        .as_os_str()
+        .encode_wide()
+        .collect();
+    let units = |s: &str| s.encode_utf16().collect::<Vec<u16>>();
+    let (prefix, rest) = if abs.starts_with(&units(r"\\?\")) {
+        (r"\??\", &abs[4..])
+    } else if abs.starts_with(&units(r"\\")) {
+        (r"\??\UNC\", &abs[2..])
+    } else {
+        (r"\??\", &abs[..])
+    };
+    Ok([units(prefix).as_slice(), rest].concat())
+}
+
 /// Why `dir` is not an install directory this build made, or `None` if it is one.
 fn install_dir_problem(dir: &Path) -> anyhow::Result<Option<String>> {
-    let path_w = wide(dir);
-    // Open the object itself (never a reparse target) and ask it everything, so the answer
-    // cannot be about a different object than the one inspected.
-    let handle = unsafe {
-        CreateFileW(
-            PCWSTR(path_w.as_ptr()),
-            READ_CONTROL.0 | FILE_READ_ATTRIBUTES.0,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            None,
-            OPEN_EXISTING,
-            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
-            None,
-        )
-    }
-    .with_context(|| format!("open {}", dir.display()))?;
-    let handle = OwnedHandle(handle);
+    let Some(handle) = open_for_inspection(dir)? else {
+        return Ok(Some(
+            "this process is denied access to read its ACL, so it cannot be shown to be the hardened one".to_owned(),
+        ));
+    };
 
     let security = Security::from_handle(handle.0).with_context(|| format!("read the ACL of {}", dir.display()))?;
     let owner = describe_sid(security.owner);
