@@ -147,6 +147,12 @@ pub fn split(sock: Socket) -> anyhow::Result<(ConnRx, ConnTx)> {
 }
 
 impl ConnTx {
+    /// A new handle on the same underlying socket, for a thread that must watch the connection
+    /// without owning one of the split halves.
+    pub fn try_clone_socket(&self) -> std::io::Result<Socket> {
+        self.0.try_clone()
+    }
+
     /// Send FIN on the write half. A `try_clone` dup does NOT FIN on drop, so without an
     /// explicit shutdown the peer would block forever and never observe `PeerClosed`.
     pub fn shutdown_write(&self) -> anyhow::Result<()> {

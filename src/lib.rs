@@ -18,6 +18,8 @@ pub mod agent;
 #[cfg(windows)]
 pub mod conpty;
 #[cfg(windows)]
+pub mod hangup;
+#[cfg(windows)]
 pub mod pipes;
 pub mod protocol;
 pub mod provision;
