@@ -41,9 +41,20 @@ The two halves talk over an AF_UNIX socket whose directory grants Full Control t
 - **Everything goes through the relay, including `sftp` and `scp`.** No command is *classified* and routed around it — the fail-open above is a different thing, running locally because the agent is unreachable rather than because of what the command is. Deciding what to route would mean classifying a command from a string the client chose — and sshd rewrites commands before the shim ever sees them. The relay carries arbitrary bytes unchanged in both directions (tested, and checked end to end by `verify`), so transfers work normally; running them locally would be faster, and that is a trade we take deliberately rather than guess at what a command is.
 - **`apply` owns `DefaultShellEscapeArguments`.** It sets `HKLM\SOFTWARE\OpenSSH\DefaultShellEscapeArguments` to the DWORD 1 (sshd's default), before it registers the shim as `DefaultShell`, overwriting any other value, and `verify` fails if sshd would read it as off. Without a PTY, sshd passes the command to the shim in one of two encodings depending on that value. sshd reads the value once per session, when it starts, so a shim that read it later could disagree with the session it serves. The shim therefore always decodes the escaped form and reads no registry value; keeping the value at 1 is what keeps it right.
 
+## Install
+
+Releases carry `ssh-broker-<version>-x86_64-pc-windows-msvc.zip` (`ssh-broker.exe` and the license) and a `.sha256` file, with a build attestation on the zip. Verify before installing:
+
+```sh
+gh attestation verify ssh-broker-<version>-x86_64-pc-windows-msvc.zip -R bindreams/ssh-broker
+sha256sum -c ssh-broker-<version>-x86_64-pc-windows-msvc.zip.sha256
+```
+
+Then extract it and, from an elevated prompt, run `ssh-broker.exe apply --user <account>`, where `<account>` is the account that is logged on at the console and whose session the shell should run in (`apply` falls back to the saved account, then to the current user). `ssh-broker.exe verify` checks the result. The executable is statically linked, so it needs no Visual C++ redistributable.
+
 ## Status
 
-Working and tested, but pre-1.0 and not yet packaged for general installation. See [CONTRIBUTING.md](CONTRIBUTING.md) for how to build and test it.
+Working and tested, but pre-1.0. See [CONTRIBUTING.md](CONTRIBUTING.md) for how to build and test it, and how releases are made.
 
 ## License
 

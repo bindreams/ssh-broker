@@ -5,6 +5,8 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+  # Called by draft-release.yaml, so the release commit is tested before a draft exists.
+  workflow_call:
 
 # Only PR runs are superseded. Everything else gets a group of its own, keyed on the run
 # id, so it can never be cancelled by a later run: `cancel-in-progress: false` still

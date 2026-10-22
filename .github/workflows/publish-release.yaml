@@ -1,0 +1,154 @@
+name: Publish Release
+
+# Step two of two: check the draft's assets against their hash and attestation, publish it, and
+# check that what is published is what was verified. Nothing is built here.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version (e.g. 0.1.0)"
+        required: true
+        type: string
+
+concurrency:
+  # Keyed on the raw input; see draft-release.yaml.
+  group: publish-release-${{ inputs.version }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Verify and publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # The preflight (version, CI, packaging, attestation) ran in draft-release.yaml before a
+    # draft could exist; this environment is the human gate in front of the irreversible step.
+    environment: Deploy
+    permissions:
+      # `write`, not `read`: the releases API only returns drafts to a caller with push access.
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Normalize and validate version
+        id: version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          V="$(bash .github/scripts/normalize-version.sh "$INPUT_VERSION")"
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "tag=v${V}" >> "$GITHUB_OUTPUT"
+          echo "zip=ssh-broker-${V}-x86_64-pc-windows-msvc.zip" >> "$GITHUB_OUTPUT"
+
+      - name: Verify draft release exists and resolve commit SHA
+        id: release
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if ! RELEASE_JSON=$(gh release view "$TAG" --json isDraft,targetCommitish); then
+            echo "::error::gh release view failed for $TAG. Does the draft release exist?"
+            exit 1
+          fi
+
+          IS_DRAFT=$(echo "$RELEASE_JSON" | jq -r '.isDraft')
+          if [ "$IS_DRAFT" != "true" ]; then
+            echo "::error::Release $TAG is already published"
+            exit 1
+          fi
+
+          TARGET=$(echo "$RELEASE_JSON" | jq -r '.targetCommitish')
+          if ! [[ "$TARGET" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Draft release target '$TARGET' is not a 40-char commit SHA. Recreate the draft via the Draft Release workflow."
+            exit 1
+          fi
+          echo "commit_sha=$TARGET" >> "$GITHUB_OUTPUT"
+
+      - name: Download the draft's assets
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+          ZIP: ${{ steps.version.outputs.zip }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release download "$TAG" --dir draft
+
+          want="$(printf '%s\n' "$ZIP" "$ZIP.sha256" | sort)"
+          got="$(ls draft | sort)"
+          if [[ "$got" != "$want" ]]; then
+            echo "::error::the draft's assets are not exactly the expected pair"
+            echo "want:"; echo "$want"; echo "got:"; echo "$got"
+            exit 1
+          fi
+
+      - name: Check the draft's hash and attestation
+        env:
+          ZIP: ${{ steps.version.outputs.zip }}
+          SHA: ${{ steps.release.outputs.commit_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          (cd draft && sha256sum -c "${ZIP}.sha256")
+          gh attestation verify "draft/${ZIP}" \
+            -R "$GH_REPO" \
+            --signer-workflow "${GH_REPO}/.github/workflows/release-asset.yaml" \
+            --source-digest "$SHA"
+
+      - name: Publish GitHub release
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+          SHA: ${{ steps.release.outputs.commit_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # One last check immediately before the action that creates the tag: the draft creates
+          # no tag, so this is safe on every reachable path, and it turns a race into an early,
+          # explicit refusal instead of a mis-binding caught only by the read-back below.
+          bash .github/scripts/assert-tag-absent.sh "$TAG"
+
+          gh release edit "$TAG" --draft=false
+
+          # Un-drafting is what creates the tag, so this is the first moment the binding is
+          # observable. `targetCommitish` is NOT usable for this: GitHub never recomputes it when
+          # a draft is published, so it would echo $SHA back and the guard would never fire.
+          # Resolve the tag itself.
+          if ! PUBLISHED="$(gh api -X GET "repos/${GH_REPO}/commits/${TAG}" --jq '.sha')"; then
+            echo "::error::Could not resolve tag $TAG after publishing."
+            echo "::error::The release is published. Verify by hand that $TAG points at $SHA."
+            exit 1
+          fi
+          if [ "$PUBLISHED" != "$SHA" ]; then
+            echo "::error::Release $TAG points at $PUBLISHED, not the verified commit $SHA."
+            echo "::error::Fix by hand: delete the release and its tag, then re-run Draft Release."
+            exit 1
+          fi
+
+      # What users download is the published asset, not the draft's. Verify that file again.
+      - name: Verify the published asset
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+          ZIP: ${{ steps.version.outputs.zip }}
+          SHA: ${{ steps.release.outputs.commit_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release download "$TAG" --dir published --pattern "$ZIP" --pattern "${ZIP}.sha256"
+          (cd published && sha256sum -c "${ZIP}.sha256")
+          gh attestation verify "published/${ZIP}" \
+            -R "$GH_REPO" \
+            --signer-workflow "${GH_REPO}/.github/workflows/release-asset.yaml" \
+            --source-digest "$SHA"
+          {
+            echo "Release published: https://github.com/${GH_REPO}/releases/tag/${TAG}"
+            echo
+            echo "Asset: https://github.com/${GH_REPO}/releases/download/${TAG}/${ZIP}"
+            echo
+            echo "SHA-256: $(cut -d ' ' -f 1 "published/${ZIP}.sha256")"
+          } | tee -a "$GITHUB_STEP_SUMMARY"

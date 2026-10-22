@@ -1,0 +1,215 @@
+name: Draft Release
+
+# Step one of two: validate, test the release commit, build and attest the Windows asset, and
+# create a DRAFT release with the asset attached. publish-release.yaml publishes it.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version (e.g. 0.1.0)"
+        required: true
+        type: string
+
+concurrency:
+  # Keyed on the raw input. `normalize-version.sh` strips a leading `v`, so `0.1.0` and `v0.1.0`
+  # form separate groups resolving to one tag; the re-checks in the `release` job cover that.
+  group: draft-release-${{ inputs.version }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  validate:
+    name: Validate version
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      # `write`, not `read`: GitHub returns draft releases only to callers with push access, so a
+      # read-scoped token reports every existing draft as absent.
+      contents: write
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          # Full history so the ancestry check can resolve origin/main.
+          fetch-depth: 0
+
+      - name: Install pinned toolchain
+        run: rustup toolchain install
+
+      - name: Normalize and validate version
+        id: version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          V="$(bash .github/scripts/normalize-version.sh "$INPUT_VERSION")"
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+
+      - name: Verify manifest version matches
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          MANIFEST="$(cargo metadata --no-deps --locked --format-version 1 | jq -r '.packages[0].version')"
+          if [ "$MANIFEST" != "$VERSION" ]; then
+            echo "::error::Cargo.toml declares $MANIFEST but this dispatch asked for $VERSION"
+            exit 1
+          fi
+
+      - name: Fail if the release already exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ steps.version.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="v${VERSION}"
+
+          # `gh release view` exits non-zero for a missing release AND for every transient
+          # failure. Discarding the reason would make an outage read as "no such release", and
+          # since GitHub does not enforce tag_name uniqueness across drafts, the run would then
+          # create a SECOND draft for the same tag.
+          set +e
+          OUTPUT="$(gh release view "$TAG" --json tagName 2>&1)"
+          STATUS=$?
+          set -e
+
+          if [ "$STATUS" -eq 0 ]; then
+            echo "::error::Release $TAG already exists (draft or published). Delete it or pick a new version."
+            exit 1
+          fi
+          if ! grep -qi 'release not found' <<<"$OUTPUT"; then
+            echo "::error::Cannot confirm whether $TAG exists: $OUTPUT"
+            exit 1
+          fi
+          echo "no existing release $TAG"
+
+      # A tag with no release attached is the dangerous case: `gh release create --target` is
+      # SILENTLY IGNORED when the tag exists, binding the release to the old tag's commit.
+      - name: Fail if the tag already exists
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        shell: bash
+        run: bash .github/scripts/assert-tag-absent.sh "v${VERSION}"
+
+      # `workflow_dispatch` accepts --ref, so without this a draft can be pinned to unmerged code
+      # and every downstream check still passes.
+      - name: Verify the release commit is on main
+        env:
+          SHA: ${{ github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --quiet origin main
+
+          set +e
+          git merge-base --is-ancestor "$SHA" origin/main
+          STATUS=$?
+          set -e
+
+          case "$STATUS" in
+            0) echo "$SHA is an ancestor of origin/main" ;;
+            1)
+              echo "::error::$SHA is not an ancestor of origin/main. Release only from merged commits."
+              exit 1
+              ;;
+            *)
+              echo "::error::git merge-base failed (exit $STATUS); cannot confirm $SHA is on main"
+              exit 1
+              ;;
+          esac
+
+  ci:
+    name: CI
+    needs: validate
+    # Main's last green run does not imply THIS commit is green.
+    uses: ./.github/workflows/ci.yaml
+
+  package:
+    name: Package
+    needs: validate
+    uses: ./.github/workflows/release-asset.yaml
+    with:
+      version: ${{ needs.validate.outputs.version }}
+    # A reusable workflow cannot be granted more than its caller holds.
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+
+  release:
+    name: Create draft release
+    needs: [validate, ci, package]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      # The validate job's checks ran before the CI matrix, tens of minutes ago. Re-check
+      # immediately before creating the draft, which narrows the window to seconds.
+      - name: Re-check that the tag is still absent
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+        shell: bash
+        run: bash .github/scripts/assert-tag-absent.sh "v${VERSION}"
+
+      # The concurrency group is keyed on the raw input, so `0.1.0` and `v0.1.0` can run
+      # concurrently; both pass the tag re-check above (a draft creates no tag) unless the
+      # release itself is re-checked here.
+      - name: Fail if the release already exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ needs.validate.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="v${VERSION}"
+
+          set +e
+          OUTPUT="$(gh release view "$TAG" --json tagName 2>&1)"
+          STATUS=$?
+          set -e
+
+          if [ "$STATUS" -eq 0 ]; then
+            echo "::error::Release $TAG already exists (draft or published). Delete it or pick a new version."
+            exit 1
+          fi
+          if ! grep -qi 'release not found' <<<"$OUTPUT"; then
+            echo "::error::Cannot confirm whether $TAG exists: $OUTPUT"
+            exit 1
+          fi
+          echo "no existing release $TAG"
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: release-asset
+          path: dist
+
+      - name: Create draft release pinned to commit SHA
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ needs.validate.outputs.version }}
+          SHA: ${{ github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="v${VERSION}"
+          ZIP="dist/ssh-broker-${VERSION}-x86_64-pc-windows-msvc.zip"
+          URL="$(gh release create "$TAG" \
+            --draft \
+            --generate-notes \
+            --title "$TAG" \
+            --target "$SHA" \
+            "$ZIP" "${ZIP}.sha256")"
+          echo "Draft release created for commit $SHA:"
+          echo "  $URL"

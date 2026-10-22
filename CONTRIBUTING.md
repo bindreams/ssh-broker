@@ -141,6 +141,15 @@ scrub a hardcoded home directory out of every commit. `me` and `example` are the
 placeholders under `C:\Users\` or `/Users/`; `Public`, `Default` and `All Users` are allowed
 as machine-independent Windows paths.
 
+## Releasing
+
+A release is two manual workflows, both taking the version (the `Cargo.toml` version, without `v`):
+
+1. **Draft Release** (`draft-release.yaml`) from a commit on `main`: validates the version, runs CI on the commit, builds the Windows asset (`.github/workflows/release-asset.yaml`), attests the zip, and creates a draft release `v<version>` with the zip and its `.sha256`.
+2. **Publish Release** (`publish-release.yaml`), behind the `Deploy` environment: re-verifies the draft's hash and attestation, publishes it, checks the tag points at the verified commit, and re-verifies the published zip.
+
+`release-asset.yaml` also runs on pull requests that touch what goes into the asset, so packaging, the import check and the attestation are exercised before a release. The exe is built with `+crt-static` and `.github/scripts/check-imports.sh` fails the build if it imports a VC or UCRT runtime DLL: it is sshd's `DefaultShell` and must start on a guest without the redistributable.
+
 ## Pull requests
 
 Branch, PR, green CI, squash merge. The PR title becomes the commit subject on `main`, so it
