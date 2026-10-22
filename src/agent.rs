@@ -20,6 +20,8 @@ use crate::afunix::{self, ConnRx, ConnTx, Listener};
 #[cfg(windows)]
 use crate::conpty::{self, PtySession};
 #[cfg(windows)]
+use crate::hangup::HangupWatcher;
+#[cfg(windows)]
 use crate::pipes::ExecChild;
 #[cfg(windows)]
 use crate::protocol::{ExitCode, FrameKind, FrameReader, Handshake, Mode, Resize, Stream, read_one_frame, write_frame};
@@ -240,6 +242,9 @@ fn handle_exec(
     cwd: Option<&Path>,
 ) -> anyhow::Result<()> {
     let mut child = ExecChild::spawn(command, cwd)?;
+    // Before `tx` moves into the shared mutex. If this fails the child is dropped by `?`, which
+    // reaps its job.
+    let (hangup, waker) = HangupWatcher::new(&tx)?;
     let out_raw = child.stdout_read_raw();
     let err_raw = child.stderr_read_raw();
     let stdin_owned = child.take_stdin_write();
@@ -274,6 +279,20 @@ fn handle_exec(
         })
     };
 
+    // The third detector, for the one case the other two cannot see: a command that is silent
+    // (no output pump ever fails a write) while the stdin pump is parked in the bounded queue
+    // (nothing reads the socket). It watches the socket without reading it.
+    let t_hup = {
+        let job = Arc::clone(&job);
+        std::thread::spawn(move || match hangup.wait() {
+            // Also returns after a normal teardown, when the reap is already done and idempotent.
+            Ok(()) => {
+                reap_tree(&job);
+            }
+            Err(e) => tracing::warn!("the hangup watcher failed; a silent command will outlive its client: {e}"),
+        })
+    };
+
     let wait_result = child.wait();
     // The command is gone, so the session is over. Reaping now takes its descendants with it
     // and closes the pipes, which is what lets the output pumps below be joined at all.
@@ -287,6 +306,15 @@ fn handle_exec(
         let mut g = tx_arc.lock().unwrap();
         let _ = write_frame(&mut *g, FrameKind::Exit, &ExitCode(code).encode());
         let _ = g.shutdown_both(); // FIN + unblock the stdin pump's read
+    }
+    // After the shutdown: a poll on a duplicate of an idle socket does not notice it.
+    match waker.wake() {
+        Ok(()) => {
+            let _ = t_hup.join();
+        }
+        // Joining would block until the peer's FIN; the thread holds only a socket duplicate
+        // and the job, so detaching it is safe.
+        Err(e) => tracing::error!("could not wake the hangup watcher; leaving it to end on its own: {e}"),
     }
     let _ = t_in.join();
     wait_result?;
