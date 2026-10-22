@@ -10,28 +10,42 @@
 //! configured at setup), never the current process token — `apply` may run as SYSTEM
 //! under the ONSTART self-heal task, so the current token is not the grantee.
 //!
+//! The install directory (`C:\ProgramData\ssh-broker`) is the other half of the boundary: the
+//! agent runs the exe in it as the user and the self-heal task runs it as SYSTEM, so a directory
+//! a standard user can write to is a local privilege escalation. [`ensure_install_dir`] creates
+//! it with its final DACL and refuses to adopt one it did not make.
+//!
 //! This module is Windows-only (`#[cfg(windows)] mod acl;`). API signatures were
 //! source-verified against windows-0.62.2 (see verify-windows-acl-apis workflow).
 
 use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
 
-use windows::Win32::Foundation::{CloseHandle, HANDLE, HLOCAL, LocalFree};
+use anyhow::Context;
+use windows::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, HANDLE, HLOCAL, LocalFree};
 use windows::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, GetNamedSecurityInfoW,
-    SDDL_REVISION_1, SE_FILE_OBJECT, SetNamedSecurityInfoW,
+    GetSecurityInfo, SDDL_REVISION_1, SE_FILE_OBJECT, SetNamedSecurityInfoW,
 };
 use windows::Win32::Security::{
-    ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, ACL_SIZE_INFORMATION, AclSizeInformation, CopySid, CreateWellKnownSid,
-    DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetAclInformation, GetLengthSid, GetSecurityDescriptorControl,
-    GetSecurityDescriptorDacl, GetSecurityDescriptorOwner, GetTokenInformation, INHERITED_ACE, IsValidSid,
-    LookupAccountNameW, OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
-    SE_DACL_PRESENT, SE_DACL_PROTECTED, SID_NAME_USE, TOKEN_QUERY, TOKEN_USER, TokenUser, WinBuiltinAdministratorsSid,
-    WinLocalSystemSid,
+    ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, ACL_SIZE_INFORMATION, AclSizeInformation, CONTAINER_INHERIT_ACE, CopySid,
+    CreateWellKnownSid, DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetAclInformation, GetLengthSid,
+    GetSecurityDescriptorControl, GetSecurityDescriptorDacl, GetSecurityDescriptorOwner, GetTokenInformation,
+    INHERITED_ACE, IsValidSid, LookupAccountNameW, LookupAccountSidW, OBJECT_INHERIT_ACE, OWNER_SECURITY_INFORMATION,
+    PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SE_DACL_PRESENT, SE_DACL_PROTECTED,
+    SECURITY_ATTRIBUTES, SID_NAME_USE, TOKEN_QUERY, TOKEN_USER, TokenUser, WinBuiltinAdministratorsSid,
+    WinBuiltinUsersSid, WinLocalSystemSid,
 };
-use windows::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
+use windows::Win32::Storage::FileSystem::{
+    BY_HANDLE_FILE_INFORMATION, CreateDirectoryW, CreateFileW, FILE_ALL_ACCESS, FILE_ATTRIBUTE_DIRECTORY,
+    FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_EXECUTE,
+    FILE_GENERIC_READ, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    GetFileInformationByHandle, OPEN_EXISTING, READ_CONTROL,
+};
 use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
-use windows::core::{BOOL, PCWSTR, PWSTR};
+use windows::core::{BOOL, HRESULT, PCWSTR, PWSTR};
+
+use crate::winutil::OwnedHandle;
 
 /// ACCESS_ALLOWED_ACE_TYPE (winnt.h) — stored raw in `ACE_HEADER.AceType` (a `u8`).
 const ACE_TYPE_ALLOWED: u8 = 0;
@@ -41,6 +55,7 @@ const ACE_TYPE_ALLOWED: u8 = 0;
 pub enum WellKnown {
     System,
     Administrators,
+    Users,
 }
 
 /// An owned Windows security identifier (a copy of the raw SID bytes, so it outlives any
@@ -91,11 +106,12 @@ impl Sid {
         }
     }
 
-    /// A well-known SID (SYSTEM / BUILTIN\\Administrators).
+    /// A well-known SID (SYSTEM / BUILTIN\\Administrators / BUILTIN\\Users).
     pub fn well_known(kind: WellKnown) -> anyhow::Result<Sid> {
         let which = match kind {
             WellKnown::System => WinLocalSystemSid,
             WellKnown::Administrators => WinBuiltinAdministratorsSid,
+            WellKnown::Users => WinBuiltinUsersSid,
         };
         unsafe {
             let mut cb = 0u32;
@@ -149,12 +165,63 @@ impl Sid {
 
     /// The SID in SDDL string form ("S-1-5-…"), for embedding in a security descriptor.
     fn to_sddl(&self) -> anyhow::Result<String> {
-        unsafe {
-            let mut s = PWSTR::null();
-            ConvertSidToStringSidW(self.as_psid(), &mut s)?;
-            let text = s.to_string();
-            let _ = LocalFree(Some(HLOCAL(s.0 as *mut core::ffi::c_void)));
-            Ok(text?)
+        sid_to_string(self.as_psid())
+    }
+}
+
+fn sid_to_string(psid: PSID) -> anyhow::Result<String> {
+    unsafe {
+        let mut s = PWSTR::null();
+        ConvertSidToStringSidW(psid, &mut s)?;
+        let text = s.to_string();
+        let _ = LocalFree(Some(HLOCAL(s.0 as *mut core::ffi::c_void)));
+        Ok(text?)
+    }
+}
+
+/// `DOMAIN\\name (S-1-5-...)` for a valid SID, as far as the account database resolves it, for an
+/// error message. Never fails: whatever cannot be read is left out.
+fn describe_sid(psid: PSID) -> String {
+    unsafe {
+        if psid.is_invalid() || !IsValidSid(psid).as_bool() {
+            return "<none>".into();
+        }
+        let text = sid_to_string(psid).unwrap_or_else(|_| "<unprintable SID>".into());
+        let (mut cch_name, mut cch_domain) = (0u32, 0u32);
+        let mut sid_use = SID_NAME_USE(0);
+        let _ = LookupAccountSidW(
+            PCWSTR::null(),
+            psid,
+            None,
+            &mut cch_name,
+            None,
+            &mut cch_domain,
+            &mut sid_use,
+        ); // size probe -> Err
+        if cch_name == 0 {
+            return text;
+        }
+        let mut name = vec![0u16; cch_name as usize];
+        let mut domain = vec![0u16; (cch_domain as usize).max(1)];
+        if LookupAccountSidW(
+            PCWSTR::null(),
+            psid,
+            Some(PWSTR(name.as_mut_ptr())),
+            &mut cch_name,
+            Some(PWSTR(domain.as_mut_ptr())),
+            &mut cch_domain,
+            &mut sid_use,
+        )
+        .is_err()
+        {
+            return text;
+        }
+        let name = String::from_utf16_lossy(&name[..cch_name as usize]);
+        let domain = String::from_utf16_lossy(&domain[..cch_domain as usize]);
+        if domain.is_empty() {
+            format!("{name} ({text})")
+        } else {
+            format!("{domain}\\{name} ({text})")
         }
     }
 }
@@ -213,6 +280,156 @@ pub fn harden_dir(dir: &Path, target_user: &Sid) -> anyhow::Result<()> {
     }
 }
 
+/// One ALLOW ACE a DACL must contain, once, and nothing else.
+struct Grant<'a> {
+    sid: &'a Sid,
+    /// The exact access mask the ACE must carry.
+    mask: u32,
+    /// The exact `AceFlags` the ACE must carry, or `None` to allow any flags but `INHERITED_ACE`.
+    flags: Option<u8>,
+}
+
+/// A security descriptor read back from an object: the DACL and owner point into `sd`.
+struct Security {
+    sd: LocalSd,
+    dacl: *mut ACL,
+    owner: PSID,
+}
+
+impl Security {
+    fn from_path(path: &Path) -> anyhow::Result<Security> {
+        let path_w = wide(path);
+        unsafe {
+            let mut psd = PSECURITY_DESCRIPTOR::default();
+            let mut dacl: *mut ACL = std::ptr::null_mut();
+            let mut owner = PSID::default();
+            let rc = GetNamedSecurityInfoW(
+                PCWSTR(path_w.as_ptr()),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | OWNER_SECURITY_INFORMATION,
+                Some(&mut owner),
+                None,
+                Some(&mut dacl),
+                None,
+                &mut psd,
+            );
+            let sd = LocalSd(psd);
+            rc.ok()?;
+            Ok(Security { sd, dacl, owner })
+        }
+    }
+
+    /// Read from an open handle, so the answer is about the object that was opened and not about
+    /// whatever the path names a moment later.
+    fn from_handle(handle: HANDLE) -> anyhow::Result<Security> {
+        unsafe {
+            let mut psd = PSECURITY_DESCRIPTOR::default();
+            let mut dacl: *mut ACL = std::ptr::null_mut();
+            let mut owner = PSID::default();
+            let rc = GetSecurityInfo(
+                handle,
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | OWNER_SECURITY_INFORMATION,
+                Some(&mut owner),
+                None,
+                Some(&mut dacl),
+                None,
+                Some(&mut psd),
+            );
+            let sd = LocalSd(psd);
+            rc.ok()?;
+            Ok(Security { sd, dacl, owner })
+        }
+    }
+
+    /// `true` iff the descriptor is EXACTLY the given policy: a PRESENT, PROTECTED DACL whose
+    /// ACEs are precisely `grants` (each once), no inherited, DENY or other ACEs, and an owner in
+    /// `owners`. Anything else, including a NULL or absent DACL, is `false`: fail-closed.
+    fn matches(&self, owners: &[&Sid], grants: &[Grant]) -> anyhow::Result<bool> {
+        unsafe {
+            // A NULL/absent DACL means unrestricted access — never acceptable.
+            if self.dacl.is_null() {
+                return Ok(false);
+            }
+
+            // The DACL must be both PRESENT and PROTECTED. An *absent* DACL (present bit
+            // clear) means "everyone, full access" — reject it explicitly, not just the
+            // null-pointer case. PROTECTED means no inheritance from the parent dir.
+            let mut control = 0u16;
+            let mut revision = 0u32;
+            GetSecurityDescriptorControl(self.sd.0, &mut control, &mut revision)?;
+            if control & SE_DACL_PRESENT.0 == 0 || control & SE_DACL_PROTECTED.0 == 0 {
+                return Ok(false);
+            }
+
+            // Owner must be a valid SID in the allow-set. Guard validity before EqualSid
+            // (which is unsafe and assumes valid SID pointers).
+            if self.owner.is_invalid() || !IsValidSid(self.owner).as_bool() {
+                return Ok(false);
+            }
+            if !owners.iter().any(|s| EqualSid(self.owner, s.as_psid()).is_ok()) {
+                return Ok(false);
+            }
+
+            let mut size_info = ACL_SIZE_INFORMATION::default();
+            GetAclInformation(
+                self.dacl,
+                &mut size_info as *mut _ as *mut core::ffi::c_void,
+                std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
+                AclSizeInformation,
+            )?;
+
+            let mut seen = vec![false; grants.len()];
+            let mut allowed_count = 0usize;
+            for i in 0..size_info.AceCount {
+                let mut ace: *mut core::ffi::c_void = std::ptr::null_mut();
+                GetAce(self.dacl, i, &mut ace)?;
+                let header = &*(ace as *const ACE_HEADER);
+
+                // Any inherited ACE means the dir is not the locked-down explicit set.
+                if header.AceFlags & (INHERITED_ACE.0 as u8) != 0 {
+                    return Ok(false);
+                }
+                // Only ALLOW ACEs are permitted; a DENY (or any other type) fails closed.
+                if header.AceType != ACE_TYPE_ALLOWED {
+                    return Ok(false);
+                }
+
+                // Defensive: confirm the ACE body is large enough to contain Mask + a SID
+                // start before dereferencing it (the on-disk DACL is treated as untrusted).
+                if (header.AceSize as usize) < std::mem::size_of::<ACCESS_ALLOWED_ACE>() {
+                    return Ok(false);
+                }
+                let allowed = &*(ace as *const ACCESS_ALLOWED_ACE);
+                let trustee = PSID(&allowed.SidStart as *const u32 as *mut core::ffi::c_void);
+
+                let mut matched = false;
+                for (idx, grant) in grants.iter().enumerate() {
+                    if IsValidSid(trustee).as_bool() && EqualSid(trustee, grant.sid.as_psid()).is_ok() {
+                        if seen[idx] {
+                            return Ok(false); // duplicate ACE for the same grantee
+                        }
+                        // Each grant must carry exactly the mask (and flags) the policy names.
+                        if allowed.Mask != grant.mask || grant.flags.is_some_and(|f| header.AceFlags != f) {
+                            return Ok(false);
+                        }
+                        seen[idx] = true;
+                        matched = true;
+                        break;
+                    }
+                }
+                if !matched {
+                    return Ok(false); // an unexpected grantee (e.g. Everyone/Users)
+                }
+                allowed_count += 1;
+            }
+
+            // Exactly the expected grantees, each present once, nothing else.
+            Ok(allowed_count == grants.len() && seen.iter().all(|&b| b))
+        }
+    }
+}
+
 /// Read `dir`'s DACL + owner back and return `true` iff it is EXACTLY the locked-down
 /// allow-set: a PRESENT, PROTECTED DACL whose ACEs are precisely Full-Control ALLOWs for
 /// `{target_user, SYSTEM, Administrators}` (each once), owner within the allow-set, and no
@@ -221,122 +438,145 @@ pub fn harden_dir(dir: &Path, target_user: &Sid) -> anyhow::Result<()> {
 pub fn verify_dir_acl(dir: &Path, target_user: &Sid) -> anyhow::Result<bool> {
     let system = Sid::well_known(WellKnown::System)?;
     let admins = Sid::well_known(WellKnown::Administrators)?;
-    let expected = [target_user, &system, &admins];
+    let full = |sid| Grant {
+        sid,
+        mask: FILE_ALL_ACCESS.0,
+        flags: None,
+    };
+    Security::from_path(dir)?.matches(
+        &[target_user, &system, &admins],
+        &[full(target_user), full(&system), full(&admins)],
+    )
+}
+
+// install directory ====================================================================
+
+/// The install directory's security descriptor: owner Administrators; protected DACL; SYSTEM and
+/// Administrators Full Control and `BUILTIN\Users` read and execute, all inherited by children.
+/// Only SYSTEM and Administrators can write. Handed to `CreateDirectoryW`, so the directory
+/// never exists with any other DACL.
+const INSTALL_DIR_SDDL: &str = "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FRFX;;;BU)";
+
+/// `AceFlags` of every ACE in [`INSTALL_DIR_SDDL`]: `OI|CI`, and not `INHERITED_ACE`.
+const INSTALL_ACE_FLAGS: u8 = (OBJECT_INHERIT_ACE.0 | CONTAINER_INHERIT_ACE.0) as u8;
+
+/// Why `dir` is not an install directory this build made, or `None` if it is one.
+fn install_dir_problem(dir: &Path) -> anyhow::Result<Option<String>> {
     let path_w = wide(dir);
-
-    unsafe {
-        let mut psd = PSECURITY_DESCRIPTOR::default();
-        let mut dacl: *mut ACL = std::ptr::null_mut();
-        let mut owner = PSID::default();
-        let rc = GetNamedSecurityInfoW(
+    // Open the object itself (never a reparse target) and ask it everything, so the answer
+    // cannot be about a different object than the one inspected.
+    let handle = unsafe {
+        CreateFileW(
             PCWSTR(path_w.as_ptr()),
-            SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION | OWNER_SECURITY_INFORMATION,
-            Some(&mut owner),
+            READ_CONTROL.0 | FILE_READ_ATTRIBUTES.0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             None,
-            Some(&mut dacl),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
             None,
-            &mut psd,
-        );
-        let _sd = LocalSd(psd);
-        rc.ok()?;
+        )
+    }
+    .with_context(|| format!("open {}", dir.display()))?;
+    let handle = OwnedHandle(handle);
 
-        // A NULL/absent DACL means unrestricted access — never acceptable.
-        if dacl.is_null() {
-            return Ok(false);
-        }
+    let security = Security::from_handle(handle.0).with_context(|| format!("read the ACL of {}", dir.display()))?;
+    let owner = describe_sid(security.owner);
 
-        // The DACL must be both PRESENT and PROTECTED. An *absent* DACL (present bit
-        // clear) means "everyone, full access" — reject it explicitly, not just the
-        // null-pointer case. PROTECTED means no inheritance from the parent dir.
-        let mut control = 0u16;
-        let mut revision = 0u32;
-        GetSecurityDescriptorControl(psd, &mut control, &mut revision)?;
-        if control & SE_DACL_PRESENT.0 == 0 || control & SE_DACL_PROTECTED.0 == 0 {
-            return Ok(false);
-        }
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    unsafe { GetFileInformationByHandle(handle.0, &mut info) }
+        .with_context(|| format!("read the attributes of {}", dir.display()))?;
+    if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
+        return Ok(Some(format!(
+            "it is a reparse point (junction or symlink); owner {owner}"
+        )));
+    }
+    if info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY.0 == 0 {
+        return Ok(Some(format!("it is not a directory; owner {owner}")));
+    }
 
-        // Owner must be a valid SID in the allow-set. Guard validity before EqualSid
-        // (which is unsafe and assumes valid SID pointers).
-        if owner.is_invalid() || !IsValidSid(owner).as_bool() {
-            return Ok(false);
-        }
-        let owner_ok = expected.iter().any(|s| EqualSid(owner, s.as_psid()).is_ok());
-        if !owner_ok {
-            return Ok(false);
-        }
-
-        let mut size_info = ACL_SIZE_INFORMATION::default();
-        GetAclInformation(
-            dacl,
-            &mut size_info as *mut _ as *mut core::ffi::c_void,
-            std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
-            AclSizeInformation,
-        )?;
-
-        let mut seen = [false; 3];
-        let mut allowed_count = 0u32;
-        for i in 0..size_info.AceCount {
-            let mut ace: *mut core::ffi::c_void = std::ptr::null_mut();
-            GetAce(dacl, i, &mut ace)?;
-            let header = &*(ace as *const ACE_HEADER);
-
-            // Any inherited ACE means the dir is not the locked-down explicit set.
-            if header.AceFlags & (INHERITED_ACE.0 as u8) != 0 {
-                return Ok(false);
-            }
-            // Only ALLOW ACEs are permitted; a DENY (or any other type) fails closed.
-            if header.AceType != ACE_TYPE_ALLOWED {
-                return Ok(false);
-            }
-
-            // Defensive: confirm the ACE body is large enough to contain Mask + a SID
-            // start before dereferencing it (the on-disk DACL is treated as untrusted).
-            if (header.AceSize as usize) < std::mem::size_of::<ACCESS_ALLOWED_ACE>() {
-                return Ok(false);
-            }
-            let allowed = &*(ace as *const ACCESS_ALLOWED_ACE);
-            // Each grant must be exactly Full Control (SDDL "FA" == FILE_ALL_ACCESS).
-            if allowed.Mask != FILE_ALL_ACCESS.0 {
-                return Ok(false);
-            }
-            let trustee = PSID(&allowed.SidStart as *const u32 as *mut core::ffi::c_void);
-
-            let mut matched = false;
-            for (idx, exp) in expected.iter().enumerate() {
-                if IsValidSid(trustee).as_bool() && EqualSid(trustee, exp.as_psid()).is_ok() {
-                    if seen[idx] {
-                        return Ok(false); // duplicate ACE for the same grantee
-                    }
-                    seen[idx] = true;
-                    matched = true;
-                    break;
-                }
-            }
-            if !matched {
-                return Ok(false); // an unexpected grantee (e.g. Everyone/Users)
-            }
-            allowed_count += 1;
-        }
-
-        // Exactly the three expected grantees, each present once, nothing else.
-        Ok(allowed_count == 3 && seen.iter().all(|&b| b))
+    let system = Sid::well_known(WellKnown::System)?;
+    let admins = Sid::well_known(WellKnown::Administrators)?;
+    let users = Sid::well_known(WellKnown::Users)?;
+    let grant = |sid, mask| Grant {
+        sid,
+        mask,
+        flags: Some(INSTALL_ACE_FLAGS),
+    };
+    let grants = [
+        grant(&system, FILE_ALL_ACCESS.0),
+        grant(&admins, FILE_ALL_ACCESS.0),
+        grant(&users, FILE_GENERIC_READ.0 | FILE_GENERIC_EXECUTE.0),
+    ];
+    if security.matches(&[&system, &admins], &grants)? {
+        Ok(None)
+    } else {
+        Ok(Some(format!(
+            "its owner is {owner} and its ACL is not the hardened one"
+        )))
     }
 }
 
-/// Create the install directory with its hardened DACL, or accept one that already has it.
-pub fn ensure_install_dir(_dir: &Path) -> anyhow::Result<()> {
-    unimplemented!()
+/// Create `dir` with the install-directory DACL, or accept it if this build made it already.
+///
+/// `dir`'s parent must exist. If `dir` exists (including losing a creation race to another
+/// caller) it must verify under [`verify_install_dir_acl`] and not be a reparse point; an
+/// existing directory that does not is an error naming it, its owner and the fix, and is never
+/// modified: it may have been made by anyone.
+pub fn ensure_install_dir(dir: &Path) -> anyhow::Result<()> {
+    create_install_dir(dir)?;
+    if let Some(problem) = install_dir_problem(dir)? {
+        anyhow::bail!(
+            "the install directory {} exists but cannot be trusted: {problem}. \
+             Inspect it, remove it, and run `apply` again",
+            dir.display()
+        );
+    }
+    Ok(())
 }
 
-/// `true` iff `dir` is exactly the install-directory policy.
-pub fn verify_install_dir_acl(_dir: &Path) -> anyhow::Result<bool> {
-    unimplemented!()
+/// `CreateDirectoryW` with [`INSTALL_DIR_SDDL`]. "Already exists" is not an error here: the
+/// caller decides whether what exists is acceptable.
+fn create_install_dir(dir: &Path) -> anyhow::Result<()> {
+    let sddl_w: Vec<u16> = INSTALL_DIR_SDDL.encode_utf16().chain(std::iter::once(0)).collect();
+    let path_w = wide(dir);
+    unsafe {
+        let mut psd = PSECURITY_DESCRIPTOR::default();
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(PCWSTR(sddl_w.as_ptr()), SDDL_REVISION_1, &mut psd, None)?;
+        let _sd = LocalSd(psd);
+        let attributes = SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: psd.0,
+            bInheritHandle: BOOL(0),
+        };
+        match CreateDirectoryW(PCWSTR(path_w.as_ptr()), Some(&attributes)) {
+            Ok(()) => Ok(()),
+            Err(e) if e.code() == HRESULT::from_win32(ERROR_ALREADY_EXISTS.0) => Ok(()),
+            Err(e) => Err(anyhow::Error::new(e).context(format!(
+                "create the install directory {} (this needs an elevated administrator)",
+                dir.display()
+            ))),
+        }
+    }
 }
 
-/// `true` only for SYSTEM and BUILTIN\Administrators.
-pub fn is_trusted_install_owner(_owner: &Sid) -> anyhow::Result<bool> {
-    unimplemented!()
+/// `true` iff `dir` is exactly the install-directory policy: not a reparse point, owned by
+/// SYSTEM or Administrators, with a protected DACL holding only the three explicit ACEs of
+/// [`INSTALL_DIR_SDDL`], none inherited. Anything unexpected is `false`: fail-closed.
+pub fn verify_install_dir_acl(dir: &Path) -> anyhow::Result<bool> {
+    Ok(install_dir_problem(dir)?.is_none())
+}
+
+/// `true` only for SYSTEM and BUILTIN\Administrators: the owners an install directory may have.
+pub fn is_trusted_install_owner(owner: &Sid) -> anyhow::Result<bool> {
+    let system = Sid::well_known(WellKnown::System)?;
+    let admins = Sid::well_known(WellKnown::Administrators)?;
+    // SAFETY: `owner` holds a copy of SID bytes; validity is checked before EqualSid.
+    Ok(unsafe {
+        IsValidSid(owner.as_psid()).as_bool()
+            && [&system, &admins]
+                .iter()
+                .any(|s| EqualSid(owner.as_psid(), s.as_psid()).is_ok())
+    })
 }
 
 #[cfg(test)]
