@@ -210,7 +210,14 @@ fn ensure_install_dir_rejects_a_default_inherited_directory_and_leaves_it_unchan
 /// Give `dir` the install-directory policy ([`INSTALL_DIR_SDDL`]) with `owner` as its owner.
 /// Setting an owner other than the caller's needs SeRestorePrivilege, so the caller enables it.
 fn set_install_policy(dir: &Path, owner: &Sid) {
-    let sddl = INSTALL_DIR_SDDL.replace("O:BA", &format!("O:{}", owner.to_sddl().unwrap()));
+    set_security(
+        dir,
+        &INSTALL_DIR_SDDL.replace("O:BA", &format!("O:{}", owner.to_sddl().unwrap())),
+    );
+}
+
+/// Replace `dir`'s owner and protected DACL with those of `sddl`.
+fn set_security(dir: &Path, sddl: &str) {
     let sddl_w: Vec<u16> = sddl.encode_utf16().chain(std::iter::once(0)).collect();
     let path_w = wide(dir);
     unsafe {
@@ -263,28 +270,31 @@ fn enable_restore_privilege() {
 }
 
 #[test]
-fn install_dir_problem_names_a_foreign_owner_of_an_otherwise_exact_directory() {
-    // Host-safe: the owner is this user, who is not SYSTEM or Administrators.
+fn install_dir_problem_blames_only_the_owner_of_an_otherwise_exact_directory() {
+    // Host-safe: the owner is this user, who is not Administrators.
     let dir = TempPath::new("owner-me");
     std::fs::create_dir(&dir.0).unwrap();
-    set_install_policy(&dir.0, &Sid::current_user().unwrap());
-
     let me = Sid::current_user().unwrap();
+    set_install_policy(&dir.0, &me);
+
     let problem = install_dir_problem(&dir.0)
         .unwrap()
         .expect("a foreign owner is a problem");
-    assert_eq!(
-        problem,
-        format!(
-            "its owner is {} and its ACL is not the hardened one",
-            describe_sid(me.as_psid())
-        )
+    assert!(
+        problem.contains(&me.to_sddl().unwrap()),
+        "it must name the owner found: {problem}"
+    );
+    assert!(
+        problem.contains("Administrators"),
+        "it must name the owner wanted: {problem}"
+    );
+    assert!(
+        !problem.contains("ACL is not") && !problem.contains("not the hardened"),
+        "the ACL is exact, so the message must not blame it: {problem}"
     );
 }
 
-/// The owner is the only difference between the accepted and the refused directory, so the
-/// refusal is the owner rule's and not an artefact of the rest of the policy. Elevated (CI only):
-/// setting an owner other than the caller's needs SeRestorePrivilege.
+/// Elevated (CI only): setting an owner other than the caller's needs SeRestorePrivilege.
 #[test]
 fn a_trusted_owner_is_accepted_and_a_users_owner_is_refused_with_the_same_acl() {
     let dir = TempPath::new("owner-control");
@@ -318,11 +328,24 @@ fn ensure_install_dir_rejects_a_users_owned_directory_with_the_exact_acl() {
     assert!(ensure_install_dir(&dir.0).is_err());
 }
 
+/// Elevated (CI only). `create_install_dir` is nothing but the creation call, so a directory that
+/// verifies the moment it returns got its final DACL from that call and not from a later step.
+#[test]
+fn create_install_dir_gives_the_directory_its_final_acl_at_creation() {
+    let dir = TempPath::new("at-creation");
+    create_install_dir(&dir.0).unwrap();
+    assert!(
+        verify_install_dir_acl(&dir.0).unwrap(),
+        "the directory must verify straight after the creation call"
+    );
+}
+
+/// Elevated (CI only). Races an observer against creation; the deterministic check above is the
+/// one that pins the property, this one catches a window the creation call itself opens.
 #[test]
 fn ensure_install_dir_is_never_observable_unhardened() {
-    // The directory must carry its final DACL from the instant it exists: an observer that
-    // checks the moment it sees the directory must always find it verified. Elevated (CI only).
     const ROUNDS: usize = 200;
+    let checked = AtomicUsize::new(0);
     for _ in 0..ROUNDS {
         let dir = TempPath::new("atomic");
         let start = std::sync::Barrier::new(2);
@@ -330,10 +353,13 @@ fn ensure_install_dir_is_never_observable_unhardened() {
         std::thread::scope(|s| {
             let observer = s.spawn(|| {
                 start.wait();
-                // Re-checks the real condition; ends when the directory exists or creation is over.
+                // Re-checks the real condition; once creation is over it looks one last time.
                 while !dir.0.exists() {
                     if done.load(Ordering::Acquire) {
-                        return;
+                        if !dir.0.exists() {
+                            return;
+                        }
+                        break;
                     }
                     std::hint::spin_loop();
                 }
@@ -341,6 +367,7 @@ fn ensure_install_dir_is_never_observable_unhardened() {
                     verify_install_dir_acl(&dir.0).unwrap(),
                     "the directory was observable before it was hardened"
                 );
+                checked.fetch_add(1, Ordering::Relaxed);
             });
             start.wait();
             let created = ensure_install_dir(&dir.0);
@@ -349,6 +376,10 @@ fn ensure_install_dir_is_never_observable_unhardened() {
             observer.join().unwrap();
         });
     }
+    assert!(
+        checked.load(Ordering::Relaxed) >= 1,
+        "the observer never saw a directory, so nothing was checked"
+    );
 }
 
 #[test]
@@ -440,14 +471,117 @@ fn ensure_install_dir_is_safe_under_concurrent_callers() {
     assert!(verify_install_dir_acl(&dir.0).unwrap());
 }
 
+/// Elevated (CI only): setting an owner other than the caller's needs SeRestorePrivilege.
 #[test]
-fn is_trusted_install_owner_accepts_only_system_and_administrators() {
-    let sid = |s: &str| Sid::lookup(s).unwrap();
-    assert!(is_trusted_install_owner(&Sid::well_known(WellKnown::System).unwrap()).unwrap());
-    assert!(is_trusted_install_owner(&Sid::well_known(WellKnown::Administrators).unwrap()).unwrap());
-    assert!(!is_trusted_install_owner(&sid("Users")).unwrap());
-    assert!(!is_trusted_install_owner(&sid("Everyone")).unwrap());
-    assert!(!is_trusted_install_owner(&Sid::current_user().unwrap()).unwrap());
+fn a_system_owned_directory_with_the_exact_acl_is_refused() {
+    let dir = TempPath::new("owner-system");
+    std::fs::create_dir(&dir.0).unwrap();
+    enable_restore_privilege();
+    set_install_policy(&dir.0, &Sid::well_known(WellKnown::System).unwrap());
+
+    let problem = install_dir_problem(&dir.0)
+        .unwrap()
+        .expect("only Administrators may own the install directory");
+    assert!(problem.contains("Administrators"), "{problem}");
+    assert!(!problem.contains("not the hardened"), "{problem}");
+    assert!(ensure_install_dir(&dir.0).is_err());
+}
+
+fn ace_count(dir: &Path) -> u32 {
+    let security = Security::from_path(dir).unwrap();
+    let mut info = ACL_SIZE_INFORMATION::default();
+    unsafe {
+        GetAclInformation(
+            security.dacl,
+            &mut info as *mut _ as *mut core::ffi::c_void,
+            std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
+            AclSizeInformation,
+        )
+        .unwrap();
+    }
+    info.AceCount
+}
+
+/// Elevated (CI only). The policy with one ACE changed, owned as `ensure_install_dir` owns it.
+fn assert_refused_with_acl_problem(tag: &str, sddl: String) {
+    assert_ne!(sddl, INSTALL_DIR_SDDL, "the test must change the policy");
+    let dir = TempPath::new(tag);
+    std::fs::create_dir(&dir.0).unwrap();
+    enable_restore_privilege();
+    set_security(&dir.0, &sddl);
+    assert_eq!(
+        ace_count(&dir.0) as usize,
+        sddl.matches("(A;").count(),
+        "the DACL must keep every ACE"
+    );
+
+    assert!(!verify_install_dir_acl(&dir.0).unwrap(), "{sddl} must not verify");
+    let problem = install_dir_problem(&dir.0).unwrap().expect("a problem");
+    assert!(problem.contains("ACL is not the hardened one"), "{problem}");
+    assert!(
+        !problem.contains("not the Administrators"),
+        "the owner is fine: {problem}"
+    );
+}
+
+#[test]
+fn verify_install_dir_acl_rejects_a_reduced_mask_for_system() {
+    assert_refused_with_acl_problem(
+        "mask-sy",
+        INSTALL_DIR_SDDL.replace("(A;OICI;FA;;;SY)", "(A;OICI;FRFX;;;SY)"),
+    );
+}
+
+#[test]
+fn verify_install_dir_acl_rejects_a_reduced_mask_for_administrators() {
+    assert_refused_with_acl_problem(
+        "mask-ba",
+        INSTALL_DIR_SDDL.replace("(A;OICI;FA;;;BA)", "(A;OICI;FRFX;;;BA)"),
+    );
+}
+
+#[test]
+fn verify_install_dir_acl_rejects_a_duplicate_ace() {
+    let sddl = INSTALL_DIR_SDDL.replace("(A;OICI;FA;;;SY)", "(A;OICI;FA;;;SY)(A;OICI;FA;;;SY)");
+    assert_refused_with_acl_problem("dup", sddl);
+}
+
+#[test]
+fn ensure_install_dir_rejects_a_regular_file() {
+    let path = TempPath::new("file");
+    std::fs::write(&path.0, "x").unwrap();
+
+    let err = format!("{:#}", ensure_install_dir(&path.0).unwrap_err());
+
+    assert!(err.contains("not a directory"), "{err}");
+    assert_eq!(std::fs::read_to_string(&path.0).unwrap(), "x");
+    std::fs::remove_file(&path.0).unwrap();
+}
+
+#[test]
+fn ensure_install_dir_reports_a_missing_parent_as_a_creation_error() {
+    let parent = TempPath::new("no-parent");
+    let dir = parent.0.join("child");
+
+    let err = format!("{:#}", ensure_install_dir(&dir).unwrap_err());
+
+    assert!(err.contains("create the install directory"), "{err}");
+    assert!(!parent.0.exists(), "no parent may be created on the way");
+}
+
+/// Needs symlink creation rights (an elevated administrator or Developer Mode).
+#[test]
+fn ensure_install_dir_rejects_a_symlink() {
+    let target = hardened_install_dir("symlink-target");
+    let link = TempPath::new("symlink");
+    std::os::windows::fs::symlink_dir(&target.0, &link.0)
+        .expect("create a directory symlink: needs an elevated administrator or Developer Mode");
+
+    let err = format!("{:#}", ensure_install_dir(&link.0).unwrap_err());
+    assert!(err.contains("reparse point"), "the error must say why: {err}");
+
+    std::fs::remove_dir(&link.0).unwrap();
+    assert!(target.0.is_dir());
 }
 
 // A hostile directory must be refused with a reason, not fail the inspection itself ------
@@ -464,9 +598,30 @@ fn plain_dir_denying(tag: &str) -> TempPath {
 #[test]
 fn install_dir_problem_is_reported_for_a_dir_denying_everyone_write() {
     let dir = plain_dir_denying("deny-w");
+    assert!(
+        open_for_inspection(&dir.0).unwrap().is_some(),
+        "the deny covers SYNCHRONIZE, which the inspection open must not request"
+    );
     let problem = install_dir_problem(&dir.0).unwrap().expect("a deny ACE is a problem");
     assert!(problem.contains("not the hardened one"), "{problem}");
     icacls_str(&dir.0, &["/remove:d", "*S-1-1-0"]);
+}
+
+/// Elevated (CI only): the owner is SYSTEM, so this user has no implicit READ_CONTROL, and the
+/// DACL denies it to everyone. Administrators keep DELETE and listing so the test can clean up.
+#[test]
+fn install_dir_problem_says_so_when_the_acl_cannot_be_read() {
+    let dir = TempPath::new("no-read-control");
+    std::fs::create_dir(&dir.0).unwrap();
+    enable_restore_privilege();
+    set_security(&dir.0, "O:SYD:P(D;;RC;;;WD)(A;;0x10001;;;BA)(A;;FA;;;SY)");
+
+    assert!(open_for_inspection(&dir.0).unwrap().is_none());
+    let problem = install_dir_problem(&dir.0)
+        .unwrap()
+        .expect("an unreadable ACL is a problem");
+    assert!(problem.contains("denied access to read its ACL"), "{problem}");
+    assert!(ensure_install_dir(&dir.0).is_err());
 }
 
 #[test]
@@ -474,6 +629,7 @@ fn nt_path_prefixes_each_win32_path_form() {
     let nt = |p: &str| String::from_utf16(&nt_path(Path::new(p)).unwrap()).unwrap();
     assert_eq!(nt(r"C:\a\b"), r"\??\C:\a\b");
     assert_eq!(nt(r"\\?\C:\a\b"), r"\??\C:\a\b");
+    assert_eq!(nt(r"\\.\C:\a\b"), r"\??\C:\a\b");
     assert_eq!(nt(r"\\server\share\a"), r"\??\UNC\server\share\a");
     assert_eq!(nt(r"\\?\UNC\server\share\a"), r"\??\UNC\server\share\a");
 }

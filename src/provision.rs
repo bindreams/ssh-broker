@@ -11,7 +11,7 @@
 pub mod bounded;
 pub mod config;
 #[cfg(windows)]
-mod layout;
+pub(crate) mod layout;
 pub mod probe;
 pub mod registry;
 pub mod report;
@@ -46,7 +46,7 @@ pub fn verify_probe() -> anyhow::Result<()> {
 mod imp {
     use super::layout::{self, Layout};
     use super::{probe, registry, report, schtasks};
-    use crate::{acl, afunix, shim};
+    use crate::{afunix, shim};
     use anyhow::Context;
     use std::path::Path;
 
@@ -86,20 +86,14 @@ mod imp {
     pub fn apply() -> anyhow::Result<()> {
         let layout = Layout::production();
 
-        // 0. The install directory first: made hardened, or proven to be. Nothing is read from or
-        //    written into it before this passes, so a directory planted by someone else is never
-        //    adopted. Resolve the target account BY NAME (CLI --user > saved config > interactive
-        //    user), failing loudly rather than ever guessing from a SYSTEM token.
-        let user = layout::resolve_user(&layout, arg_user().as_deref(), current_user_name().as_deref())?;
-        let sid = acl::Sid::lookup(&user).with_context(|| format!("resolving SID for {user:?}"))?;
-
-        // 1. Install this exe to a STABLE path (everything registers the canonical path: a temp
-        //    path would brick SSH the instant it is deleted — the shim's fail-open can't help if
-        //    sshd execs a missing binary), create the logs and the hardened socket dir (the agent's
-        //    bind precondition, fail-closed), and persist the config (records the account for the
-        //    SYSTEM self-heal).
+        // 0. Resolve the target account BY NAME (CLI --user > saved config > interactive user),
+        //    failing loudly rather than guessing from a SYSTEM token. The install
+        //    directory is gated first, so a planted one is never adopted.
+        // 1. Install this exe to a STABLE path and fill the base (see layout::populate). Everything
+        //    registers the canonical path: a temp path would brick SSH the instant it is deleted;
+        //    the shim's fail-open can't help if sshd execs a missing binary.
         let current = std::env::current_exe().context("current_exe")?;
-        let exe = layout::populate(&layout, &current, &user, &sid)?;
+        let (user, exe) = layout::prepare(&layout, &current, arg_user().as_deref(), current_user_name().as_deref())?;
 
         // 2. Register both tasks (idempotent /F).
         register_agent_task(&layout, &exe, &user)?;
@@ -212,28 +206,11 @@ mod imp {
 
         // Local: the install directory is exactly the hardened one (only SYSTEM and Administrators
         // can write to it).
-        let (install_ok, install_detail) = match acl::verify_install_dir_acl(&layout.base) {
-            Ok(ok) => (ok, layout.base.display().to_string()),
-            Err(e) => (false, format!("{e:#}")),
-        };
-        rows.push(report::Check::new("install dir ACL", install_ok, install_detail));
+        let base = layout::check_base(&layout);
+        rows.push(layout::install_dir_row(&base));
 
         // Local: the socket dir ACL verifies for the configured account (== the agent's grantee).
-        // The config lives in the install directory, so it is not read from an untrusted one.
-        match &layout::saved_user(&layout, install_ok) {
-            _ if !install_ok => rows.push(report::Check::new(
-                "socket dir ACL",
-                false,
-                "install dir untrusted: its config is not read",
-            )),
-            Some(u) => {
-                let ok = acl::Sid::lookup(u)
-                    .and_then(|sid| acl::verify_dir_acl(&afunix::socket_dir(), &sid))
-                    .unwrap_or(false);
-                rows.push(report::Check::new("socket dir ACL", ok, format!("grantee={u}")));
-            }
-            None => rows.push(report::Check::new("socket dir ACL", false, "no config target_user")),
-        }
+        rows.push(layout::socket_dir_row(&base));
 
         // Local: both tasks registered, and the agent task is InteractiveToken (session 1).
         let (agent_xml, agent_ok) = query_schtasks(&schtasks::query_task_argv(schtasks::AGENT_TASK));
@@ -275,7 +252,9 @@ mod imp {
         // operator who asked to wait indefinitely never silently gets 30s and a wrong diagnosis.
         let probe_timeout = super::bounded::probe_timeout_from_args(&std::env::args().collect::<Vec<_>>())?;
         // The probe runs the exe in the install directory, so an untrusted one never gets that far.
-        match layout::run_if_trusted_base(install_ok, || drive_probe_bounded(&exe, probe_timeout)) {
+        match layout::run_if_trusted_base(&base, |trusted| {
+            drive_probe_bounded(&trusted.layout().canonical_exe(), probe_timeout)
+        }) {
             Ok((p, binary_ok)) => {
                 // Parity = escaped session 0 (the limited network-logon session). The agent
                 // need not be in THE active-console session — a box can have several

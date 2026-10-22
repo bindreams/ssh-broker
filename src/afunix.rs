@@ -24,7 +24,7 @@ pub fn unix_addr(path: &Path) -> anyhow::Result<SockAddr> {
 /// `sockaddr_un` path limit, and under `ProgramData` (a system path, not user-specific).
 #[cfg(windows)]
 pub fn socket_dir() -> std::path::PathBuf {
-    std::path::Path::new(r"C:\ProgramData\ssh-broker\s").to_path_buf()
+    crate::provision::layout::Layout::production().socket_dir()
 }
 
 /// The fixed production socket path, shared by the agent (bind) and the shim (connect)

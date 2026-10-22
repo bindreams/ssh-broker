@@ -12,8 +12,7 @@
 //!
 //! The install directory (`C:\ProgramData\ssh-broker`) is the other half of the boundary: the
 //! agent runs the exe in it as the user and the self-heal task runs it as SYSTEM, so a directory
-//! a standard user can write to is a local privilege escalation. [`ensure_install_dir`] creates
-//! it with its final DACL and refuses to adopt one it did not make.
+//! a standard user can write to is a local privilege escalation.
 //!
 //! This module is Windows-only (`#[cfg(windows)] mod acl;`). API signatures were
 //! source-verified against windows-0.62.2 (see verify-windows-acl-apis workflow).
@@ -324,8 +323,7 @@ impl Security {
         }
     }
 
-    /// Read from an open handle, so the answer is about the object that was opened and not about
-    /// whatever the path names a moment later.
+    /// Read from an open handle.
     fn from_handle(handle: HANDLE) -> anyhow::Result<Security> {
         unsafe {
             let mut psd = PSECURITY_DESCRIPTOR::default();
@@ -347,11 +345,19 @@ impl Security {
         }
     }
 
-    /// `true` iff the descriptor is EXACTLY the given policy: a PRESENT, PROTECTED DACL whose
-    /// ACEs are precisely `grants` (each once), no inherited, DENY or other ACEs, and an owner
-    /// that `owner_ok` accepts. Anything else, including a NULL or absent DACL, is `false`:
-    /// fail-closed.
-    fn matches(&self, owner_ok: &dyn Fn(&Sid) -> anyhow::Result<bool>, grants: &[Grant]) -> anyhow::Result<bool> {
+    /// `true` iff the owner is a valid SID that is one of `set`.
+    fn owner_in(&self, set: &[&Sid]) -> anyhow::Result<bool> {
+        // Guard validity before copying (`from_psid` and `EqualSid` assume valid SID pointers).
+        if self.owner.is_invalid() || !unsafe { IsValidSid(self.owner) }.as_bool() {
+            return Ok(false);
+        }
+        Ok(is_in(&Sid::from_psid(self.owner)?, set))
+    }
+
+    /// `true` iff the DACL is EXACTLY the given policy: PRESENT and PROTECTED, its ACEs
+    /// precisely `grants` (each once), no inherited, DENY or other ACEs. Anything else, including a
+    /// NULL or absent DACL, is `false`: fail-closed.
+    fn dacl_matches(&self, grants: &[Grant]) -> anyhow::Result<bool> {
         unsafe {
             // A NULL/absent DACL means unrestricted access — never acceptable.
             if self.dacl.is_null() {
@@ -365,15 +371,6 @@ impl Security {
             let mut revision = 0u32;
             GetSecurityDescriptorControl(self.sd.0, &mut control, &mut revision)?;
             if control & SE_DACL_PRESENT.0 == 0 || control & SE_DACL_PROTECTED.0 == 0 {
-                return Ok(false);
-            }
-
-            // Owner must be a valid SID the policy accepts. Guard validity before copying it
-            // (`from_psid` and `EqualSid` assume valid SID pointers).
-            if self.owner.is_invalid() || !IsValidSid(self.owner).as_bool() {
-                return Ok(false);
-            }
-            if !owner_ok(&Sid::from_psid(self.owner)?)? {
                 return Ok(false);
             }
 
@@ -449,15 +446,16 @@ pub fn verify_dir_acl(dir: &Path, target_user: &Sid) -> anyhow::Result<bool> {
         mask: FILE_ALL_ACCESS.0,
         flags: None,
     };
-    let owner_ok = |owner: &Sid| Ok(is_in(owner, &[target_user, &system, &admins]));
-    Security::from_path(dir)?.matches(&owner_ok, &[full(target_user), full(&system), full(&admins)])
+    let security = Security::from_path(dir)?;
+    Ok(security.owner_in(&[target_user, &system, &admins])?
+        && security.dacl_matches(&[full(target_user), full(&system), full(&admins)])?)
 }
 
 // install directory ====================================================================
 
 /// The install directory's security descriptor: owner Administrators; protected DACL; SYSTEM and
 /// Administrators Full Control and `BUILTIN\Users` read and execute, all inherited by children.
-/// Only SYSTEM and Administrators can write. Handed to `CreateDirectoryW`, so the directory
+/// Handed to `CreateDirectoryW`, so the directory
 /// never exists with any other DACL.
 const INSTALL_DIR_SDDL: &str = "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FRFX;;;BU)";
 
@@ -503,7 +501,6 @@ fn open_for_inspection(dir: &Path) -> anyhow::Result<Option<OwnedHandle>> {
     if status == STATUS_ACCESS_DENIED {
         return Ok(None);
     }
-    // SAFETY: a plain value conversion.
     let win32 = unsafe { RtlNtStatusToDosError(status) };
     Err(windows::core::Error::from(HRESULT::from_win32(win32))).with_context(|| format!("open {}", dir.display()))
 }
@@ -516,18 +513,23 @@ fn nt_path(dir: &Path) -> anyhow::Result<Vec<u16>> {
         .encode_wide()
         .collect();
     let units = |s: &str| s.encode_utf16().collect::<Vec<u16>>();
-    let (prefix, rest) = if abs.starts_with(&units(r"\\?\")) {
-        (r"\??\", &abs[4..])
-    } else if abs.starts_with(&units(r"\\")) {
-        (r"\??\UNC\", &abs[2..])
-    } else {
-        (r"\??\", &abs[..])
-    };
+    // Longest prefix first: `\\?\UNC\` and `\\server` are both UNC, `\\?\` and `\\.\` are
+    // device paths, and everything else is a drive path.
+    let forms = [
+        (r"\\?\UNC\", r"\??\UNC\"),
+        (r"\\?\", r"\??\"),
+        (r"\\.\", r"\??\"),
+        (r"\\", r"\??\UNC\"),
+    ];
+    let (prefix, rest) = forms
+        .iter()
+        .find_map(|(win32, nt)| abs.strip_prefix(units(win32).as_slice()).map(|rest| (*nt, rest)))
+        .unwrap_or((r"\??\", &abs[..]));
     Ok([units(prefix).as_slice(), rest].concat())
 }
 
 /// Why `dir` is not an install directory this build made, or `None` if it is one.
-fn install_dir_problem(dir: &Path) -> anyhow::Result<Option<String>> {
+pub fn install_dir_problem(dir: &Path) -> anyhow::Result<Option<String>> {
     let Some(handle) = open_for_inspection(dir)? else {
         return Ok(Some(
             "this process is denied access to read its ACL, so it cannot be shown to be the hardened one".to_owned(),
@@ -562,13 +564,17 @@ fn install_dir_problem(dir: &Path) -> anyhow::Result<Option<String>> {
         grant(&admins, FILE_ALL_ACCESS.0),
         grant(&users, FILE_GENERIC_READ.0 | FILE_GENERIC_EXECUTE.0),
     ];
-    if security.matches(&is_trusted_install_owner, &grants)? {
-        Ok(None)
-    } else {
-        Ok(Some(format!(
-            "its owner is {owner} and its ACL is not the hardened one"
-        )))
-    }
+    // `INSTALL_DIR_SDDL` makes Administrators the owner, so nothing else is accepted.
+    let owner_ok = security.owner_in(&[&admins])?;
+    let acl_ok = security.dacl_matches(&grants)?;
+    Ok(match (owner_ok, acl_ok) {
+        (true, true) => None,
+        (false, true) => Some(format!("its owner is {owner}, not the Administrators group")),
+        (true, false) => Some(format!("its ACL is not the hardened one (its owner, {owner}, is fine)")),
+        (false, false) => Some(format!(
+            "its owner is {owner}, not the Administrators group, and its ACL is not the hardened one"
+        )),
+    })
 }
 
 /// Create `dir` with the install-directory DACL, or accept it if this build made it already.
@@ -614,18 +620,10 @@ fn create_install_dir(dir: &Path) -> anyhow::Result<()> {
     }
 }
 
-/// `true` iff `dir` is exactly the install-directory policy: not a reparse point, owned by
-/// SYSTEM or Administrators, with a protected DACL holding only the three explicit ACEs of
-/// [`INSTALL_DIR_SDDL`], none inherited. Anything unexpected is `false`: fail-closed.
+/// `true` iff `dir` is exactly the [`INSTALL_DIR_SDDL`] policy and not a reparse point. Anything
+/// unexpected is `false`: fail-closed.
 pub fn verify_install_dir_acl(dir: &Path) -> anyhow::Result<bool> {
     Ok(install_dir_problem(dir)?.is_none())
-}
-
-/// `true` only for SYSTEM and BUILTIN\Administrators: the owners an install directory may have.
-pub fn is_trusted_install_owner(owner: &Sid) -> anyhow::Result<bool> {
-    let system = Sid::well_known(WellKnown::System)?;
-    let admins = Sid::well_known(WellKnown::Administrators)?;
-    Ok(is_in(owner, &[&system, &admins]))
 }
 
 /// `true` iff `sid` is one of `set`.

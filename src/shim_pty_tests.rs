@@ -222,9 +222,8 @@ impl Drop for WriteDeniedDir {
     }
 }
 
-/// The shim is sshd's `DefaultShell`: a panic here exits 101 before the relay or the fail-open
-/// path runs, and the user loses SSH access. A log directory the user cannot write (any non-admin
-/// account once `logs\` is no longer user-writable) must disable logging, not abort the shim.
+/// A log directory the user cannot write must disable logging, not abort the shim (a panic exits
+/// 101 before the fail-open path runs).
 #[test]
 fn file_logging_is_disabled_not_fatal_when_the_log_directory_is_unwritable() {
     let dir = WriteDeniedDir::new("unwritable");
@@ -232,4 +231,16 @@ fn file_logging_is_disabled_not_fatal_when_the_log_directory_is_unwritable() {
         super::init_file_logging_in(&dir.0).is_none(),
         "an unwritable log directory must yield no logging, not a guard"
     );
+}
+
+#[test]
+fn file_logging_is_enabled_for_a_writable_log_directory() {
+    let dir = std::env::temp_dir().join(format!("sb-logok-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let guard = super::init_file_logging_in(&dir);
+
+    assert!(guard.is_some(), "a writable log directory must yield a guard");
+    drop(guard);
+    let _ = std::fs::remove_dir_all(&dir);
 }

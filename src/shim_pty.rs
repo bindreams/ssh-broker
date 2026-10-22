@@ -663,7 +663,7 @@ fn init_file_logging() -> Option<tracing_appender::non_blocking::WorkerGuard> {
 fn init_file_logging_in(dir: &std::path::Path) -> Option<tracing_appender::non_blocking::WorkerGuard> {
     std::fs::create_dir_all(dir).ok()?;
     // `rolling::daily` panics when the first log file cannot be created; the builder returns the
-    // error instead. A panic here would exit 101 before the relay or the fail-open path ran.
+    // error instead.
     let appender = tracing_appender::rolling::RollingFileAppender::builder()
         .rotation(tracing_appender::rolling::Rotation::DAILY)
         .filename_prefix("shim.log")
@@ -674,8 +674,8 @@ fn init_file_logging_in(dir: &std::path::Path) -> Option<tracing_appender::non_b
     Some(guard)
 }
 
-pub(crate) fn log_dir() -> std::path::PathBuf {
-    std::path::PathBuf::from(r"C:\ProgramData\ssh-broker\logs")
+fn log_dir() -> std::path::PathBuf {
+    crate::provision::layout::Layout::production().logs_dir()
 }
 
 #[cfg(test)]

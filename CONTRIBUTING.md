@@ -36,7 +36,7 @@ a non-protected one, inherited ACEs, DENY entries, non-FullControl grants, extra
 an owner outside the allowed set. If it cannot prove the directory is safe, the agent refuses
 to bind.
 
-The install directory is the other half: the agent and the SYSTEM self-heal task run the exe in it, so a directory a standard user can write to is a privilege escalation. `acl::ensure_install_dir` creates it with its final DACL and verifies an existing one with the same exact-match rule; `apply` reads and writes nothing in it before that passes.
+The install directory is the other half of the boundary: the agent and the SYSTEM self-heal task run the exe in it, so a directory a standard user can write to is a privilege escalation. `apply` verifies it exactly and reads and writes nothing in it until that passes.
 
 ### Fail-open is deliberate, and never in the security boundary
 
