@@ -10,6 +10,9 @@
 
 pub mod bounded;
 pub mod config;
+#[cfg(windows)]
+#[allow(dead_code)] // stubs until the implementation lands
+mod layout;
 pub mod probe;
 pub mod registry;
 pub mod report;

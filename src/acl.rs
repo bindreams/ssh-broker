@@ -324,6 +324,21 @@ pub fn verify_dir_acl(dir: &Path, target_user: &Sid) -> anyhow::Result<bool> {
     }
 }
 
+/// Create the install directory with its hardened DACL, or accept one that already has it.
+pub fn ensure_install_dir(_dir: &Path) -> anyhow::Result<()> {
+    unimplemented!()
+}
+
+/// `true` iff `dir` is exactly the install-directory policy.
+pub fn verify_install_dir_acl(_dir: &Path) -> anyhow::Result<bool> {
+    unimplemented!()
+}
+
+/// `true` only for SYSTEM and BUILTIN\Administrators.
+pub fn is_trusted_install_owner(_owner: &Sid) -> anyhow::Result<bool> {
+    unimplemented!()
+}
+
 #[cfg(test)]
 #[path = "acl_tests.rs"]
 mod acl_tests;

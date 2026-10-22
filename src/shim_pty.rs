@@ -674,7 +674,7 @@ fn init_file_logging_in(dir: &std::path::Path) -> Option<tracing_appender::non_b
     Some(guard)
 }
 
-fn log_dir() -> std::path::PathBuf {
+pub(crate) fn log_dir() -> std::path::PathBuf {
     std::path::PathBuf::from(r"C:\ProgramData\ssh-broker\logs")
 }
 

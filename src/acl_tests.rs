@@ -111,3 +111,204 @@ fn hardened_dir_with_inheritance_enabled_does_not_verify() {
     );
     std::fs::remove_dir_all(&dir).ok();
 }
+
+// install directory ------------------------------------------------------------------
+
+use std::path::PathBuf;
+use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+/// A not-yet-created path under the temp dir that is removed on drop.
+struct TempPath(PathBuf);
+
+impl TempPath {
+    fn new(tag: &str) -> TempPath {
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        TempPath(std::env::temp_dir().join(format!("ssh-broker-install-{tag}-{}-{n}", std::process::id())))
+    }
+}
+
+impl Drop for TempPath {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn icacls(args: &[&std::ffi::OsStr]) -> String {
+    let out = Command::new("icacls").args(args).output().expect("run icacls");
+    assert!(
+        out.status.success(),
+        "icacls {args:?} failed: {}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+fn icacls_str(dir: &Path, rest: &[&str]) -> String {
+    let mut args: Vec<&std::ffi::OsStr> = vec![dir.as_os_str()];
+    args.extend(rest.iter().map(std::ffi::OsStr::new));
+    icacls(&args)
+}
+
+/// A fresh install directory that `ensure_install_dir` made.
+fn hardened_install_dir(tag: &str) -> TempPath {
+    let dir = TempPath::new(tag);
+    ensure_install_dir(&dir.0).unwrap();
+    assert!(
+        verify_install_dir_acl(&dir.0).unwrap(),
+        "sanity: a fresh install dir must verify"
+    );
+    dir
+}
+
+#[test]
+fn ensure_install_dir_creates_a_directory_that_verifies() {
+    let dir = TempPath::new("create");
+    ensure_install_dir(&dir.0).unwrap();
+    assert!(dir.0.is_dir());
+    assert!(verify_install_dir_acl(&dir.0).unwrap());
+}
+
+#[test]
+fn ensure_install_dir_accepts_its_own_previous_result() {
+    let dir = hardened_install_dir("again");
+    let before = icacls_str(&dir.0, &[]);
+    ensure_install_dir(&dir.0).unwrap();
+    assert_eq!(icacls_str(&dir.0, &[]), before, "the DACL must not change");
+    assert!(verify_install_dir_acl(&dir.0).unwrap());
+}
+
+#[test]
+fn ensure_install_dir_rejects_a_default_inherited_directory_and_leaves_it_unchanged() {
+    let dir = TempPath::new("default");
+    std::fs::create_dir_all(&dir.0).unwrap();
+    let before = icacls_str(&dir.0, &[]);
+
+    let err = format!("{:#}", ensure_install_dir(&dir.0).unwrap_err());
+
+    assert!(
+        err.contains(&dir.0.display().to_string()),
+        "the error must name the directory: {err}"
+    );
+    assert!(err.contains("owner"), "the error must name the owner found: {err}");
+    assert!(err.contains("remove"), "the error must say how to fix it: {err}");
+    assert_eq!(icacls_str(&dir.0, &[]), before, "the DACL must be left unchanged");
+    assert_eq!(
+        std::fs::read_dir(&dir.0).unwrap().count(),
+        0,
+        "nothing may be written into it"
+    );
+}
+
+#[test]
+fn ensure_install_dir_rejects_a_foreign_owner() {
+    let dir = hardened_install_dir("owner");
+    // Needs SeRestorePrivilege, which icacls enables when the token holds it.
+    icacls_str(&dir.0, &["/setowner", "*S-1-5-32-545"]);
+    assert!(
+        !verify_install_dir_acl(&dir.0).unwrap(),
+        "a Users-owned dir must not verify"
+    );
+    assert!(ensure_install_dir(&dir.0).is_err());
+}
+
+#[test]
+fn ensure_install_dir_rejects_a_junction() {
+    let target = hardened_install_dir("junction-target");
+    let link = TempPath::new("junction");
+    let out = Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(&link.0)
+        .arg(&target.0)
+        .output()
+        .expect("run mklink");
+    assert!(
+        out.status.success(),
+        "mklink /J failed: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    let err = format!("{:#}", ensure_install_dir(&link.0).unwrap_err());
+    assert!(err.contains("reparse point"), "the error must say why: {err}");
+
+    // Remove the junction itself before `target` goes, never through it.
+    std::fs::remove_dir(&link.0).unwrap();
+    assert!(target.0.is_dir());
+}
+
+#[test]
+fn verify_install_dir_acl_rejects_an_added_users_write_grant() {
+    let dir = hardened_install_dir("users-write");
+    icacls_str(&dir.0, &["/grant", "*S-1-5-32-545:(OI)(CI)M"]);
+    assert!(!verify_install_dir_acl(&dir.0).unwrap());
+}
+
+#[test]
+fn verify_install_dir_acl_rejects_an_extra_grantee() {
+    let dir = hardened_install_dir("everyone");
+    icacls_str(&dir.0, &["/grant", "*S-1-1-0:(OI)(CI)(R)"]);
+    assert!(!verify_install_dir_acl(&dir.0).unwrap());
+}
+
+#[test]
+fn verify_install_dir_acl_rejects_a_deny_ace() {
+    let dir = hardened_install_dir("deny");
+    icacls_str(&dir.0, &["/deny", "*S-1-1-0:(W)"]);
+    assert!(!verify_install_dir_acl(&dir.0).unwrap());
+}
+
+#[test]
+fn verify_install_dir_acl_rejects_a_non_inheritable_ace() {
+    let dir = hardened_install_dir("noninherit");
+    // Same grantee and mask as the policy's Users ACE, but without OI/CI.
+    icacls_str(&dir.0, &["/remove:g", "*S-1-5-32-545"]);
+    icacls_str(&dir.0, &["/grant", "*S-1-5-32-545:(RX)"]);
+    assert!(!verify_install_dir_acl(&dir.0).unwrap());
+}
+
+#[test]
+fn verify_install_dir_acl_rejects_a_missing_users_grant() {
+    let dir = hardened_install_dir("nousers");
+    icacls_str(&dir.0, &["/remove:g", "*S-1-5-32-545"]);
+    assert!(!verify_install_dir_acl(&dir.0).unwrap());
+}
+
+#[test]
+fn verify_install_dir_acl_rejects_enabled_inheritance() {
+    let dir = hardened_install_dir("inherit");
+    icacls_str(&dir.0, &["/inheritance:e"]);
+    assert!(!verify_install_dir_acl(&dir.0).unwrap());
+}
+
+#[test]
+fn ensure_install_dir_is_safe_under_concurrent_callers() {
+    const CALLERS: usize = 8;
+    let dir = TempPath::new("race");
+    let start = std::sync::Barrier::new(CALLERS);
+    std::thread::scope(|s| {
+        let handles: Vec<_> = (0..CALLERS)
+            .map(|_| {
+                s.spawn(|| {
+                    start.wait();
+                    ensure_install_dir(&dir.0)
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap().unwrap();
+        }
+    });
+    assert!(verify_install_dir_acl(&dir.0).unwrap());
+}
+
+#[test]
+fn is_trusted_install_owner_accepts_only_system_and_administrators() {
+    let sid = |s: &str| Sid::lookup(s).unwrap();
+    assert!(is_trusted_install_owner(&Sid::well_known(WellKnown::System).unwrap()).unwrap());
+    assert!(is_trusted_install_owner(&Sid::well_known(WellKnown::Administrators).unwrap()).unwrap());
+    assert!(!is_trusted_install_owner(&sid("Users")).unwrap());
+    assert!(!is_trusted_install_owner(&sid("Everyone")).unwrap());
+    assert!(!is_trusted_install_owner(&Sid::current_user().unwrap()).unwrap());
+}
