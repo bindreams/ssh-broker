@@ -10,6 +10,8 @@
 
 pub mod bounded;
 pub mod config;
+#[cfg(windows)]
+pub(crate) mod layout;
 pub mod probe;
 pub mod registry;
 pub mod report;
@@ -42,20 +44,11 @@ pub fn verify_probe() -> anyhow::Result<()> {
 
 #[cfg(windows)]
 mod imp {
-    use super::{config, probe, registry, report, schtasks};
-    use crate::{acl, afunix, shim};
+    use super::layout::{self, Layout};
+    use super::{probe, registry, report, schtasks};
+    use crate::{afunix, shim};
     use anyhow::Context;
-    use std::path::{Path, PathBuf};
-
-    fn base_dir() -> PathBuf {
-        PathBuf::from(r"C:\ProgramData\ssh-broker")
-    }
-    fn config_path() -> PathBuf {
-        base_dir().join("config.toml")
-    }
-    fn canonical_exe() -> PathBuf {
-        base_dir().join("ssh-broker.exe")
-    }
+    use std::path::Path;
 
     /// The interactive user running `apply` (lowest-precedence fallback). Returns None for a
     /// service identity — `apply` may run as SYSTEM (the ONSTART self-heal), and the agent's
@@ -91,39 +84,22 @@ mod imp {
     }
 
     pub fn apply() -> anyhow::Result<()> {
-        // 0. Install this exe to a STABLE path; everything registers the canonical path (a temp
-        //    path would brick SSH the instant it is deleted — the shim's fail-open can't help if
-        //    sshd execs a missing binary).
-        let exe = install_self()?;
+        let layout = Layout::production();
 
-        // 1. Resolve the target account BY NAME (CLI --user > saved config > interactive user),
-        //    failing loudly rather than ever guessing from a SYSTEM token.
-        let saved = std::fs::read_to_string(config_path())
-            .ok()
-            .and_then(|s| config::Config::from_toml(&s).ok())
-            .map(|c| c.target_user);
-        let user =
-            config::resolve_target_user(arg_user().as_deref(), saved.as_deref(), current_user_name().as_deref())?;
-        let sid = acl::Sid::lookup(&user).with_context(|| format!("resolving SID for {user:?}"))?;
+        // 0. Resolve the target account BY NAME (CLI --user > saved config > interactive user),
+        //    failing loudly rather than guessing from a SYSTEM token. The install
+        //    directory is gated first, so a planted one is never adopted.
+        // 1. Install this exe to a STABLE path and fill the base (see layout::populate). Everything
+        //    registers the canonical path: a temp path would brick SSH the instant it is deleted;
+        //    the shim's fail-open can't help if sshd execs a missing binary.
+        let current = std::env::current_exe().context("current_exe")?;
+        let (user, exe) = layout::prepare(&layout, &current, arg_user().as_deref(), current_user_name().as_deref())?;
 
-        // 2. Create + harden the socket dir (the agent's bind precondition) — fail-closed.
-        let sdir = afunix::socket_dir();
-        std::fs::create_dir_all(&sdir).context("create socket dir")?;
-        std::fs::create_dir_all(base_dir().join("logs")).context("create logs dir")?;
-        acl::harden_dir(&sdir, &sid).context("harden socket dir")?;
-        anyhow::ensure!(
-            acl::verify_dir_acl(&sdir, &sid).unwrap_or(false),
-            "socket dir ACL did not verify after harden"
-        );
-
-        // 3. Persist config (records the account for the SYSTEM self-heal).
-        write_config(&user)?;
-
-        // 4. Register both tasks (idempotent /F).
-        register_agent_task(&exe, &user)?;
+        // 2. Register both tasks (idempotent /F).
+        register_agent_task(&layout, &exe, &user)?;
         register_selfheal_task(&exe, &user)?;
 
-        // 5. Flip the DefaultShell pair LAST and only to the validated canonical path; read back.
+        // 3. Flip the DefaultShell pair LAST and only to the validated canonical path; read back.
         registry::set_default_shell_under(registry::OPENSSH_KEY, &exe.to_string_lossy())
             .context("write DefaultShell pair")?;
         let (shell, opt) = registry::read_default_shell_under(registry::OPENSSH_KEY)?;
@@ -132,7 +108,7 @@ mod imp {
             "DefaultShell read-back mismatch (shell={shell:?}, opt={opt:?})"
         );
 
-        // 6. Start the agent now so no re-login is needed (the logon trigger covers the rest).
+        // 4. Start the agent now so no re-login is needed (the logon trigger covers the rest).
         if probe::active_console_session() != 0xFFFF_FFFF
             && let Err(e) = run_schtasks(&schtasks::run_task_argv(schtasks::AGENT_TASK))
         {
@@ -145,50 +121,9 @@ mod imp {
         Ok(())
     }
 
-    fn install_self() -> anyhow::Result<PathBuf> {
-        let current = std::env::current_exe().context("current_exe")?;
-        let canonical = canonical_exe();
-        if current != canonical && !files_identical(&current, &canonical) {
-            std::fs::create_dir_all(base_dir()).context("create base dir")?;
-            if let Err(e) = std::fs::copy(&current, &canonical) {
-                // A running agent holds the canonical exe open (sharing violation). Don't abort
-                // the whole idempotent re-apply: if a canonical exe already exists, keep it and
-                // repair the rest of the state (installing a NEW build needs the agent stopped).
-                anyhow::ensure!(
-                    canonical.is_file(),
-                    "copy self to {} failed and no canonical exe exists: {e}",
-                    canonical.display()
-                );
-                eprintln!(
-                    "apply: could not update {} ({e}); using the existing exe \
-                     — stop the agent to update the binary",
-                    canonical.display()
-                );
-            }
-        }
-        anyhow::ensure!(canonical.is_file(), "canonical exe missing after install");
-        Ok(canonical)
-    }
-
-    fn files_identical(a: &Path, b: &Path) -> bool {
-        matches!((std::fs::read(a), std::fs::read(b)), (Ok(x), Ok(y)) if x == y)
-    }
-
-    fn write_config(user: &str) -> anyhow::Result<()> {
-        let toml = config::Config {
-            target_user: user.to_string(),
-        }
-        .to_toml()?;
-        // Direct overwrite: config.toml is read only by apply/verify, never concurrently with
-        // this write, so atomicity buys nothing — and a plain write is reliably idempotent on
-        // every re-apply (a temp+rename adds a Windows replace-semantics footgun for no gain).
-        std::fs::write(config_path(), toml).context("write config")?;
-        Ok(())
-    }
-
-    fn register_agent_task(exe: &Path, user: &str) -> anyhow::Result<()> {
+    fn register_agent_task(layout: &Layout, exe: &Path, user: &str) -> anyhow::Result<()> {
         let xml = schtasks::agent_task_xml(&exe.to_string_lossy(), user);
-        let xml_path = base_dir().join("agent-task.xml");
+        let xml_path = layout.base.join("agent-task.xml");
         // schtasks /XML requires a UTF-16 file (a UTF-8 one is rejected).
         std::fs::write(&xml_path, schtasks::xml_file_bytes(&xml)).context("write agent task xml")?;
         run_schtasks(&schtasks::create_from_xml_argv(
@@ -252,7 +187,8 @@ mod imp {
     // ── verify ─────────────────────────────────────────────────────────────────────
 
     pub fn verify() -> anyhow::Result<()> {
-        let exe = canonical_exe();
+        let layout = Layout::production();
+        let exe = layout.canonical_exe();
         let mut rows = Vec::new();
 
         // Local: the DefaultShell pair points at this exe (and the exe still exists).
@@ -268,20 +204,13 @@ mod imp {
             Err(e) => rows.push(report::Check::new("DefaultShell pair", false, e.to_string())),
         }
 
+        // Local: the install directory is exactly the hardened one (only SYSTEM and Administrators
+        // can write to it).
+        let base = layout::check_base(&layout);
+        rows.push(layout::install_dir_row(&base));
+
         // Local: the socket dir ACL verifies for the configured account (== the agent's grantee).
-        let saved_user = std::fs::read_to_string(config_path())
-            .ok()
-            .and_then(|s| config::Config::from_toml(&s).ok())
-            .map(|c| c.target_user);
-        match &saved_user {
-            Some(u) => {
-                let ok = acl::Sid::lookup(u)
-                    .and_then(|sid| acl::verify_dir_acl(&afunix::socket_dir(), &sid))
-                    .unwrap_or(false);
-                rows.push(report::Check::new("socket dir ACL", ok, format!("grantee={u}")));
-            }
-            None => rows.push(report::Check::new("socket dir ACL", false, "no config target_user")),
-        }
+        rows.push(layout::socket_dir_row(&base));
 
         // Local: both tasks registered, and the agent task is InteractiveToken (session 1).
         let (agent_xml, agent_ok) = query_schtasks(&schtasks::query_task_argv(schtasks::AGENT_TASK));
@@ -322,7 +251,10 @@ mod imp {
         // A malformed `--probe-timeout` errors rather than quietly applying the default, so the
         // operator who asked to wait indefinitely never silently gets 30s and a wrong diagnosis.
         let probe_timeout = super::bounded::probe_timeout_from_args(&std::env::args().collect::<Vec<_>>())?;
-        match drive_probe_bounded(&exe, probe_timeout) {
+        // The probe runs the exe in the install directory, so an untrusted one never gets that far.
+        match layout::run_if_trusted_base(&base, |trusted| {
+            drive_probe_bounded(&trusted.layout().canonical_exe(), probe_timeout)
+        }) {
             Ok((p, binary_ok)) => {
                 // Parity = escaped session 0 (the limited network-logon session). The agent
                 // need not be in THE active-console session — a box can have several
