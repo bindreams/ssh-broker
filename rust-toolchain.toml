@@ -8,6 +8,6 @@
 # checkout without a separate `rustup target add`. CI's Windows runner builds
 # natively and does not need it.
 [toolchain]
-channel = "1.99.0"
+channel = "1.99.1"
 components = ["clippy", "rustfmt"]
 targets = ["x86_64-pc-windows-msvc"]
