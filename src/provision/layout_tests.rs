@@ -95,6 +95,40 @@ fn resolve_user_reads_the_saved_config_of_a_hardened_base() {
 }
 
 #[test]
+fn saved_user_is_not_read_from_an_untrusted_base() {
+    let base = TempBase::new("saved-untrusted");
+    std::fs::create_dir_all(&base.0).unwrap();
+    std::fs::write(
+        base.0.join("config.toml"),
+        Config {
+            target_user: "planted-user".into(),
+        }
+        .to_toml()
+        .unwrap(),
+    )
+    .unwrap();
+
+    assert_eq!(saved_user(&base.layout(), false), None);
+    assert_eq!(saved_user(&base.layout(), true).as_deref(), Some("planted-user"));
+}
+
+#[test]
+fn trusted_base_gate_does_not_run_the_action_on_an_untrusted_base() {
+    let ran = std::cell::Cell::new(false);
+    let run = || {
+        ran.set(true);
+        Ok(7)
+    };
+
+    let err = format!("{:#}", run_if_trusted_base(false, run).unwrap_err());
+    assert!(err.contains("install dir untrusted"), "{err}");
+    assert!(!ran.get(), "the action must not run");
+
+    assert_eq!(run_if_trusted_base(true, run).unwrap(), 7);
+    assert!(ran.get());
+}
+
+#[test]
 fn populate_builds_a_verified_layout() {
     let base = TempBase::new("populate");
     let layout = base.layout();

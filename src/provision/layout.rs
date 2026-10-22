@@ -54,11 +54,27 @@ pub fn ensure_base(layout: &Layout) -> anyhow::Result<()> {
 /// interactive user. The saved config is read only from a directory that passed `ensure_base`.
 pub fn resolve_user(layout: &Layout, cli_user: Option<&str>, current_user: Option<&str>) -> anyhow::Result<String> {
     ensure_base(layout)?;
-    let saved = std::fs::read_to_string(layout.config_path())
+    config::resolve_target_user(cli_user, saved_user(layout, true).as_deref(), current_user)
+}
+
+/// The account recorded in the saved config, or `None` if there is none or it is unreadable. The
+/// config lives in the install directory, so it is read only when `base_trusted` says the
+/// directory passed its ACL check.
+pub fn saved_user(layout: &Layout, base_trusted: bool) -> Option<String> {
+    if !base_trusted {
+        return None;
+    }
+    std::fs::read_to_string(layout.config_path())
         .ok()
         .and_then(|s| config::Config::from_toml(&s).ok())
-        .map(|c| c.target_user);
-    config::resolve_target_user(cli_user, saved.as_deref(), current_user)
+        .map(|c| c.target_user)
+}
+
+/// Run `action`, which reads from or runs something in the install directory, only if
+/// `base_trusted` says the directory passed its ACL check. Otherwise fail without running it.
+pub fn run_if_trusted_base<T>(base_trusted: bool, action: impl FnOnce() -> anyhow::Result<T>) -> anyhow::Result<T> {
+    anyhow::ensure!(base_trusted, "install dir untrusted: not running anything from it");
+    action()
 }
 
 /// Fill a base that passed [`ensure_base`]: the logs directory, the exe, the hardened socket
@@ -96,7 +112,8 @@ fn install_self(layout: &Layout, current: &Path) -> anyhow::Result<PathBuf> {
             canonical.display()
         );
         eprintln!(
-            "apply: could not update {} ({e}); using the existing exe              — stop the agent to update the binary",
+            "apply: could not update {} ({e}); using the existing exe \
+             — stop the agent to update the binary",
             canonical.display()
         );
     }

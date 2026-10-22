@@ -117,6 +117,11 @@ fn hardened_dir_with_inheritance_enabled_does_not_verify() {
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use windows::Win32::Foundation::{ERROR_SUCCESS, GetLastError, LUID};
+use windows::Win32::Security::{
+    AdjustTokenPrivileges, LUID_AND_ATTRIBUTES, LookupPrivilegeValueW, SE_PRIVILEGE_ENABLED, SE_RESTORE_NAME,
+    TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES,
+};
 
 /// A not-yet-created path under the temp dir that is removed on drop.
 struct TempPath(PathBuf);
@@ -202,16 +207,117 @@ fn ensure_install_dir_rejects_a_default_inherited_directory_and_leaves_it_unchan
     );
 }
 
+/// Give `dir` the install-directory policy ([`INSTALL_DIR_SDDL`]) with `owner` as its owner.
+/// Setting an owner other than the caller's needs SeRestorePrivilege, so the caller enables it.
+fn set_install_policy(dir: &Path, owner: &Sid) {
+    let sddl = INSTALL_DIR_SDDL.replace("O:BA", &format!("O:{}", owner.to_sddl().unwrap()));
+    let sddl_w: Vec<u16> = sddl.encode_utf16().chain(std::iter::once(0)).collect();
+    let path_w = wide(dir);
+    unsafe {
+        let mut psd = PSECURITY_DESCRIPTOR::default();
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(PCWSTR(sddl_w.as_ptr()), SDDL_REVISION_1, &mut psd, None)
+            .unwrap();
+        let _sd = LocalSd(psd);
+        let (mut present, mut defaulted) = (BOOL(0), BOOL(0));
+        let mut dacl: *mut ACL = std::ptr::null_mut();
+        GetSecurityDescriptorDacl(psd, &mut present, &mut dacl, &mut defaulted).unwrap();
+        let mut sd_owner = PSID::default();
+        GetSecurityDescriptorOwner(psd, &mut sd_owner, &mut defaulted).unwrap();
+        SetNamedSecurityInfoW(
+            PCWSTR(path_w.as_ptr()),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION | OWNER_SECURITY_INFORMATION,
+            Some(sd_owner),
+            None,
+            Some(dacl as *const ACL),
+            None,
+        )
+        .ok()
+        .unwrap();
+    }
+}
+
+/// Enable SeRestorePrivilege on this process token (held, disabled, by an elevated administrator).
+fn enable_restore_privilege() {
+    unsafe {
+        let mut token = HANDLE::default();
+        OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &mut token).unwrap();
+        let _token = OwnedHandle(token);
+        let mut luid = LUID::default();
+        LookupPrivilegeValueW(PCWSTR::null(), SE_RESTORE_NAME, &mut luid).unwrap();
+        let privileges = TOKEN_PRIVILEGES {
+            PrivilegeCount: 1,
+            Privileges: [LUID_AND_ATTRIBUTES {
+                Luid: luid,
+                Attributes: SE_PRIVILEGE_ENABLED,
+            }],
+        };
+        AdjustTokenPrivileges(token, false, Some(&privileges), 0, None, None).unwrap();
+        // AdjustTokenPrivileges succeeds even when it assigned nothing; that case is an error here.
+        assert_eq!(
+            GetLastError(),
+            ERROR_SUCCESS,
+            "SeRestorePrivilege is not held: run elevated"
+        );
+    }
+}
+
 #[test]
-fn ensure_install_dir_rejects_a_foreign_owner() {
-    let dir = hardened_install_dir("owner");
-    // Needs SeRestorePrivilege, which icacls enables when the token holds it.
-    icacls_str(&dir.0, &["/setowner", "*S-1-5-32-545"]);
+fn install_dir_problem_names_a_foreign_owner_of_an_otherwise_exact_directory() {
+    // Host-safe: the owner is this user, who is not SYSTEM or Administrators.
+    let dir = TempPath::new("owner-me");
+    std::fs::create_dir(&dir.0).unwrap();
+    set_install_policy(&dir.0, &Sid::current_user().unwrap());
+
+    let problem = install_dir_problem(&dir.0)
+        .unwrap()
+        .expect("a foreign owner is a problem");
+    assert!(problem.contains("owner"), "{problem}");
+}
+
+#[test]
+fn ensure_install_dir_rejects_a_users_owned_directory_with_the_exact_acl() {
+    let dir = hardened_install_dir("owner-users");
+    enable_restore_privilege();
+    set_install_policy(&dir.0, &Sid::well_known(WellKnown::Users).unwrap());
     assert!(
         !verify_install_dir_acl(&dir.0).unwrap(),
         "a Users-owned dir must not verify"
     );
     assert!(ensure_install_dir(&dir.0).is_err());
+}
+
+#[test]
+fn ensure_install_dir_is_never_observable_unhardened() {
+    // The directory must carry its final DACL from the instant it exists: an observer that
+    // checks the moment it sees the directory must always find it verified. Elevated (CI only).
+    const ROUNDS: usize = 200;
+    for _ in 0..ROUNDS {
+        let dir = TempPath::new("atomic");
+        let start = std::sync::Barrier::new(2);
+        let done = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|s| {
+            let observer = s.spawn(|| {
+                start.wait();
+                // Re-checks the real condition; ends when the directory exists or creation is over.
+                while !dir.0.exists() {
+                    if done.load(Ordering::Acquire) {
+                        return;
+                    }
+                    std::hint::spin_loop();
+                }
+                assert!(
+                    verify_install_dir_acl(&dir.0).unwrap(),
+                    "the directory was observable before it was hardened"
+                );
+            });
+            start.wait();
+            let created = ensure_install_dir(&dir.0);
+            done.store(true, Ordering::Release);
+            created.unwrap();
+            observer.join().unwrap();
+        });
+    }
 }
 
 #[test]

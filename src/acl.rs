@@ -348,9 +348,10 @@ impl Security {
     }
 
     /// `true` iff the descriptor is EXACTLY the given policy: a PRESENT, PROTECTED DACL whose
-    /// ACEs are precisely `grants` (each once), no inherited, DENY or other ACEs, and an owner in
-    /// `owners`. Anything else, including a NULL or absent DACL, is `false`: fail-closed.
-    fn matches(&self, owners: &[&Sid], grants: &[Grant]) -> anyhow::Result<bool> {
+    /// ACEs are precisely `grants` (each once), no inherited, DENY or other ACEs, and an owner
+    /// that `owner_ok` accepts. Anything else, including a NULL or absent DACL, is `false`:
+    /// fail-closed.
+    fn matches(&self, owner_ok: &dyn Fn(&Sid) -> anyhow::Result<bool>, grants: &[Grant]) -> anyhow::Result<bool> {
         unsafe {
             // A NULL/absent DACL means unrestricted access — never acceptable.
             if self.dacl.is_null() {
@@ -367,12 +368,12 @@ impl Security {
                 return Ok(false);
             }
 
-            // Owner must be a valid SID in the allow-set. Guard validity before EqualSid
-            // (which is unsafe and assumes valid SID pointers).
+            // Owner must be a valid SID the policy accepts. Guard validity before copying it
+            // (`from_psid` and `EqualSid` assume valid SID pointers).
             if self.owner.is_invalid() || !IsValidSid(self.owner).as_bool() {
                 return Ok(false);
             }
-            if !owners.iter().any(|s| EqualSid(self.owner, s.as_psid()).is_ok()) {
+            if !owner_ok(&Sid::from_psid(self.owner)?)? {
                 return Ok(false);
             }
 
@@ -448,10 +449,8 @@ pub fn verify_dir_acl(dir: &Path, target_user: &Sid) -> anyhow::Result<bool> {
         mask: FILE_ALL_ACCESS.0,
         flags: None,
     };
-    Security::from_path(dir)?.matches(
-        &[target_user, &system, &admins],
-        &[full(target_user), full(&system), full(&admins)],
-    )
+    let owner_ok = |owner: &Sid| Ok(is_in(owner, &[target_user, &system, &admins]));
+    Security::from_path(dir)?.matches(&owner_ok, &[full(target_user), full(&system), full(&admins)])
 }
 
 // install directory ====================================================================
@@ -563,7 +562,7 @@ fn install_dir_problem(dir: &Path) -> anyhow::Result<Option<String>> {
         grant(&admins, FILE_ALL_ACCESS.0),
         grant(&users, FILE_GENERIC_READ.0 | FILE_GENERIC_EXECUTE.0),
     ];
-    if security.matches(&[&system, &admins], &grants)? {
+    if security.matches(&is_trusted_install_owner, &grants)? {
         Ok(None)
     } else {
         Ok(Some(format!(
@@ -626,13 +625,13 @@ pub fn verify_install_dir_acl(dir: &Path) -> anyhow::Result<bool> {
 pub fn is_trusted_install_owner(owner: &Sid) -> anyhow::Result<bool> {
     let system = Sid::well_known(WellKnown::System)?;
     let admins = Sid::well_known(WellKnown::Administrators)?;
-    // SAFETY: `owner` holds a copy of SID bytes; validity is checked before EqualSid.
-    Ok(unsafe {
-        IsValidSid(owner.as_psid()).as_bool()
-            && [&system, &admins]
-                .iter()
-                .any(|s| EqualSid(owner.as_psid(), s.as_psid()).is_ok())
-    })
+    Ok(is_in(owner, &[&system, &admins]))
+}
+
+/// `true` iff `sid` is one of `set`.
+fn is_in(sid: &Sid, set: &[&Sid]) -> bool {
+    // SAFETY: `Sid` holds a copy of SID bytes; validity is checked before EqualSid.
+    unsafe { IsValidSid(sid.as_psid()).as_bool() && set.iter().any(|s| EqualSid(sid.as_psid(), s.as_psid()).is_ok()) }
 }
 
 #[cfg(test)]

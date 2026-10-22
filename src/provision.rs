@@ -219,11 +219,13 @@ mod imp {
         rows.push(report::Check::new("install dir ACL", install_ok, install_detail));
 
         // Local: the socket dir ACL verifies for the configured account (== the agent's grantee).
-        let saved_user = std::fs::read_to_string(layout.config_path())
-            .ok()
-            .and_then(|s| super::config::Config::from_toml(&s).ok())
-            .map(|c| c.target_user);
-        match &saved_user {
+        // The config lives in the install directory, so it is not read from an untrusted one.
+        match &layout::saved_user(&layout, install_ok) {
+            _ if !install_ok => rows.push(report::Check::new(
+                "socket dir ACL",
+                false,
+                "install dir untrusted: its config is not read",
+            )),
             Some(u) => {
                 let ok = acl::Sid::lookup(u)
                     .and_then(|sid| acl::verify_dir_acl(&afunix::socket_dir(), &sid))
@@ -272,7 +274,8 @@ mod imp {
         // A malformed `--probe-timeout` errors rather than quietly applying the default, so the
         // operator who asked to wait indefinitely never silently gets 30s and a wrong diagnosis.
         let probe_timeout = super::bounded::probe_timeout_from_args(&std::env::args().collect::<Vec<_>>())?;
-        match drive_probe_bounded(&exe, probe_timeout) {
+        // The probe runs the exe in the install directory, so an untrusted one never gets that far.
+        match layout::run_if_trusted_base(install_ok, || drive_probe_bounded(&exe, probe_timeout)) {
             Ok((p, binary_ok)) => {
                 // Parity = escaped session 0 (the limited network-logon session). The agent
                 // need not be in THE active-console session — a box can have several
