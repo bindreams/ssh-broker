@@ -244,7 +244,8 @@ fn run_shim_child(line: &str) -> std::process::Output {
 
 /// A session without a PTY: sshd turns the command into one escaped argument of the shell's line
 /// (`apply` sets `DefaultShellEscapeArguments`), and the shim must undo that and run the command
-/// as the client sent it, whatever the machine's registry holds.
+/// as the client sent it. (The decode reads no registry value, so there is nothing for this test
+/// to vary.)
 ///
 /// The encoder is the port of sshd's in `tests/common/sshd_encoder.rs`.
 #[test]

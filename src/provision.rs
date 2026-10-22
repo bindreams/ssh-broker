@@ -42,6 +42,18 @@ pub fn verify_probe() -> anyhow::Result<()> {
     anyhow::bail!("verify-probe runs only on Windows");
 }
 
+/// The directory `apply` installs into. The one place the path is written; [`layout::Layout`]
+/// derives from it.
+pub const BASE_DIR: &str = r"C:\ProgramData\ssh-broker";
+
+/// The installed exe's file name.
+pub const EXE_NAME: &str = "ssh-broker.exe";
+
+/// The path `apply` installs the shim to and registers as `DefaultShell`.
+pub fn canonical_exe() -> std::path::PathBuf {
+    std::path::Path::new(BASE_DIR).join(EXE_NAME)
+}
+
 #[cfg(windows)]
 mod imp {
     use super::layout::{self, Layout};
@@ -99,19 +111,16 @@ mod imp {
         register_agent_task(&layout, &exe, &user)?;
         register_selfheal_task(&exe, &user)?;
 
-        // 3. Write the escape flag, then flip the DefaultShell pair LAST and only to the validated
-        //    canonical path; read back. sshd reads these once per session, so the shim cannot ask
-        //    later which form sshd used: `apply` owns the flag (see `registry::desired_values`).
+        // 3. Write the escape flag and read it back at once, then flip the DefaultShell pair LAST
+        //    and only to the validated canonical path; read that back too. sshd reads these once
+        //    per session, so the shim cannot ask later which form sshd used: `apply` owns the flag
+        //    (see `registry::desired_values`).
         registry::set_default_shell_under(registry::OPENSSH_KEY, &exe.to_string_lossy())
             .context("write the DefaultShell values")?;
         let (shell, opt) = registry::read_default_shell_under(registry::OPENSSH_KEY)?;
         anyhow::ensure!(
             eq_path(&shell, &exe) && opt == "-c",
             "DefaultShell read-back mismatch (shell={shell:?}, opt={opt:?})"
-        );
-        anyhow::ensure!(
-            registry::escape_arguments_under(registry::OPENSSH_KEY).context("read back DefaultShellEscapeArguments")?,
-            "DefaultShellEscapeArguments read-back mismatch: sshd would not escape the command"
         );
 
         // 4. Start the agent now so no re-login is needed (the logon trigger covers the rest).

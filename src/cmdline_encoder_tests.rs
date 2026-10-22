@@ -243,10 +243,11 @@ fn a_trailing_backslash_in_a_quoted_command_is_recovered() {
 /// The shim decodes the escaped form only because `apply` sets the flag AND installs the shim at a
 /// path for which sshd reads the flag: a path with `cmd`, `powershell`, `ssh-shellhost`, `bash`
 /// or `cygwin` in it would fix the form without it. The path is the one `apply` registers
-/// (`provision::imp::canonical_exe`).
+/// ([`crate::provision::canonical_exe`]).
 #[test]
 fn sshd_reads_the_flag_for_the_path_apply_registers() {
-    assert!(flag_decides_form(r"C:\ProgramData\ssh-broker\ssh-broker.exe"));
+    let registered = crate::provision::canonical_exe();
+    assert!(flag_decides_form(&registered.to_string_lossy()));
     assert!(flag_decides_form(r"c:/programdata/ssh-broker/ssh-broker.exe"));
     assert!(!flag_decides_form(r"C:\Windows\System32\cmd.exe"));
     assert!(!flag_decides_form(

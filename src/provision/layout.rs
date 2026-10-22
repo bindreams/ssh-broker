@@ -22,7 +22,7 @@ pub struct Layout {
 impl Layout {
     pub fn production() -> Layout {
         Layout {
-            base: PathBuf::from(r"C:\ProgramData\ssh-broker"),
+            base: PathBuf::from(super::BASE_DIR),
         }
     }
 
@@ -31,7 +31,7 @@ impl Layout {
     }
 
     pub fn canonical_exe(&self) -> PathBuf {
-        self.base.join("ssh-broker.exe")
+        self.base.join(super::EXE_NAME)
     }
 
     /// The agent's socket directory.

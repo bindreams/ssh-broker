@@ -92,6 +92,38 @@ fn writing_the_values_sets_the_escape_flag_to_dword_one() {
     }
 }
 
+/// The flag is read back right after it is written, before the option and the shell: a flag that
+/// cannot be confirmed (off, or unreadable) must stop the writes while the old shell is still
+/// registered, not after the shim is already `DefaultShell`.
+#[cfg(windows)]
+#[test]
+fn a_flag_that_cannot_be_confirmed_stops_the_writes_before_the_option_and_the_shell() {
+    use windows::Win32::Foundation::ERROR_ACCESS_DENIED;
+    type Confirm = Box<dyn FnOnce() -> windows::core::Result<bool>>;
+    let confirmations: [Confirm; 2] = [
+        Box::new(|| Ok(false)),
+        Box::new(|| Err(ERROR_ACCESS_DENIED.to_hresult().into())),
+    ];
+    for confirm in confirmations {
+        let key = TestKey::new("unconfirmed");
+        let subkey = key.path();
+        super::set_hkcu_confirming(subkey, r"C:\x\ssh-broker.exe", confirm).unwrap_err();
+
+        assert_eq!(
+            super::read_dword_hkcu(subkey, "DefaultShellEscapeArguments").unwrap(),
+            1
+        );
+        assert!(
+            super::read_string_hkcu(subkey, "DefaultShellCommandOption").is_err(),
+            "the option may not be written"
+        );
+        assert!(
+            super::read_string_hkcu(subkey, "DefaultShell").is_err(),
+            "the shell may not be written"
+        );
+    }
+}
+
 /// Round-trips the pair through a throwaway subkey on Windows (plan Task 7.1), exercising the
 /// real Reg* FFI under HKCU so it needs no elevation (the production path is identical but
 /// targets HKLM). Runs on a real Windows host; fails loudly on any Reg* error (never skips).

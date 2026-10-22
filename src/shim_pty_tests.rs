@@ -245,8 +245,8 @@ fn file_logging_is_enabled_for_a_writable_log_directory() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The fail-open spawn trims the command's edges for `CreateProcessW`, which rejects leading
-/// whitespace; the relay's spawn does the same (`pipes_tests`).
+/// The fail-open spawn trims leading whitespace for `CreateProcessW`, which rejects it; the
+/// relay's spawn does the same (`pipes_tests`).
 #[test]
 fn the_local_passthrough_spawn_accepts_whitespace_at_the_edges_of_a_command() {
     use windows::Win32::System::Threading::{GetExitCodeProcess, INFINITE, WaitForSingleObject};

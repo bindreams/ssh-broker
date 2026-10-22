@@ -144,7 +144,7 @@ fn a_verbatim_single_token_keeps_its_quotes() {
 // Resolving a `-c` command =====
 
 /// Run `f` and return what it logged, with its result.
-fn logged<T>(f: impl FnOnce() -> T) -> (String, T) {
+pub(super) fn logged<T>(f: impl FnOnce() -> T) -> (String, T) {
     #[derive(Clone, Default)]
     struct Buf(Arc<Mutex<Vec<u8>>>);
     impl std::io::Write for Buf {

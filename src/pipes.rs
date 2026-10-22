@@ -48,8 +48,8 @@ unsafe fn set_inheritable(h: HANDLE) -> windows::core::Result<()> {
 }
 
 impl ExecChild {
-    /// Spawn `command` with redirected std streams, optionally in `cwd`. The edges of the command
-    /// are trimmed for `CreateProcessW` ([`crate::shim::spawn_line`]).
+    /// Spawn `command` with redirected std streams, optionally in `cwd`. `CreateProcessW` cannot run
+    /// some edge whitespace, which [`crate::shim::spawn_line`] trims.
     pub fn spawn(command: &str, cwd: Option<&Path>) -> windows::core::Result<ExecChild> {
         unsafe {
             let (stdin_read, stdin_write) = create_pipe()?;

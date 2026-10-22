@@ -207,15 +207,39 @@ fn size_event_maps_to_resize_frame() {
     assert_eq!(size_to_resize(120, 40), Resize { cols: 120, rows: 40 });
 }
 
-/// `CreateProcessW` rejects a command line with leading whitespace (`ERROR_INVALID_PARAMETER`)
-/// and glues a trailing CR or LF to a bare program name, so the line handed to it is trimmed of
-/// the `BOUNDARY` characters. Nothing else is: a Unicode space is part of an argument.
+/// `CreateProcessW` rejects a line with leading whitespace (`ERROR_INVALID_PARAMETER` for space
+/// or tab, `ERROR_FILE_NOT_FOUND` for CR or LF), so the leading `BOUNDARY` characters are
+/// trimmed. Nothing else is: a Unicode space is part of an argument.
 #[test]
-fn spawn_line_trims_only_the_boundary_characters() {
-    assert_eq!(spawn_line("  cmd /c x  "), "cmd /c x");
-    assert_eq!(spawn_line("\t\r\n scp -t /p \t\r\n"), "scp -t /p");
+fn spawn_line_trims_the_leading_boundary_characters() {
+    assert_eq!(spawn_line("  cmd /c x"), "cmd /c x");
+    assert_eq!(spawn_line("\t\r\n scp -t /p"), "scp -t /p");
     assert_eq!(spawn_line("\u{a0}scp -t /p\u{a0}"), "\u{a0}scp -t /p\u{a0}");
     assert_eq!(spawn_line("a  b"), "a  b");
+}
+
+/// Trailing space and tab reach the program: `cmd /c echo a   ` prints `a   `.
+#[test]
+fn spawn_line_keeps_trailing_spaces_and_tabs() {
+    assert_eq!(spawn_line("cmd /c echo a   "), "cmd /c echo a   ");
+    assert_eq!(spawn_line("  cmd /c echo a \t"), "cmd /c echo a \t");
+    assert_eq!(spawn_line("whoami "), "whoami ");
+}
+
+/// CR or LF after arguments is part of the line (`CreateProcessW` runs it as is).
+#[test]
+fn spawn_line_keeps_trailing_line_breaks_after_arguments() {
+    assert_eq!(spawn_line("scp -t /p\r\n"), "scp -t /p\r\n");
+    assert_eq!(spawn_line("scp -t /p \t\r\n"), "scp -t /p \t\r\n");
+}
+
+/// A bare program name followed by CR or LF names a file that cannot exist (`CreateProcessW`
+/// fails with `ERROR_FILE_NOT_FOUND`), so the line break is trimmed.
+#[test]
+fn spawn_line_trims_line_breaks_after_a_bare_program_name() {
+    assert_eq!(spawn_line("whoami\n"), "whoami");
+    assert_eq!(spawn_line("\r\n whoami\r\n"), "whoami");
+    assert_eq!(spawn_line("whoami\r\n\r\n"), "whoami");
 }
 
 #[test]

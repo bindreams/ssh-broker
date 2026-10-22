@@ -50,8 +50,8 @@ fn a_shell_on_pipes_is_not_verbatim() {
     let stdout = String::from_utf8_lossy(&out.stdout);
 
     assert!(out.status.success(), "the probe failed on pipes:\n{stdout}");
-    // `apply` sets DefaultShellEscapeArguments, and the shim reads no registry value: whatever
-    // the machine holds, a non-PTY session is the escaped form.
+    // `apply` sets DefaultShellEscapeArguments, and the detection reads no registry value, so a
+    // non-PTY session is the escaped form on any machine. (The test does not vary the registry.)
     assert!(
         stdout.contains("encoding=Escaped"),
         "stdin on a pipe must read as a non-PTY session.\nstdout: {stdout:?}"

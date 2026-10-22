@@ -45,7 +45,7 @@ fn exec_separates_stdout_stderr_and_returns_code() {
 }
 
 /// `CreateProcessW` rejects a command line that starts with whitespace, and the command is
-/// relayed as the client sent it, so the spawn trims it.
+/// relayed as the client sent it, so the spawn trims the leading edge.
 #[test]
 fn exec_runs_a_command_with_whitespace_at_its_edges() {
     for command in [
@@ -56,4 +56,18 @@ fn exec_runs_a_command_with_whitespace_at_its_edges() {
         let child = ExecChild::spawn(command, None).unwrap_or_else(|e| panic!("{command:?}: {e}"));
         assert_eq!(child.wait().unwrap(), 3, "{command:?}");
     }
+}
+
+/// The relayed command reaches the program whole: `cmd` reads its raw command line, so trailing
+/// spaces after the arguments are printed.
+#[test]
+fn exec_keeps_the_trailing_spaces_of_a_command() {
+    let child = ExecChild::spawn("  cmd.exe /c echo a   ", None).unwrap();
+    let out_t = drain(child.stdout_read_raw());
+    let err_t = drain(child.stderr_read_raw());
+    assert_eq!(child.wait().unwrap(), 0);
+    let out = out_t.join().unwrap();
+    err_t.join().unwrap();
+
+    assert_eq!(String::from_utf8_lossy(&out), "a   \r\n");
 }

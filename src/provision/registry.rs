@@ -64,6 +64,7 @@ pub const OPENSSH_KEY: &str = r"SOFTWARE\OpenSSH";
 #[cfg(windows)]
 mod win {
     use super::{ESCAPE_ARGUMENTS, RegValue, desired_values};
+    use anyhow::Context;
     use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_MORE_DATA, ERROR_PATH_NOT_FOUND, WIN32_ERROR};
     use windows::Win32::System::Registry::{
         HKEY, HKEY_LOCAL_MACHINE, KEY_QUERY_VALUE, KEY_WOW64_64KEY, REG_DWORD, REG_SZ, REG_VALUE_TYPE, RRF_RT_REG_SZ,
@@ -76,7 +77,15 @@ mod win {
     }
 
     /// Write [`desired_values`] under `<root>\<subkey>` (creating the key), in its fail-safe order.
-    fn set_under(root: HKEY, subkey: &str, exe: &str) -> anyhow::Result<()> {
+    /// Right after the flag is written, `confirm_flag` must report that sshd now reads it as on;
+    /// otherwise this stops with the option and the shell untouched.
+    fn set_under(
+        root: HKEY,
+        subkey: &str,
+        exe: &str,
+        confirm_flag: impl FnOnce() -> windows::core::Result<bool>,
+    ) -> anyhow::Result<()> {
+        let mut confirm_flag = Some(confirm_flag);
         let sub = wide(subkey);
         for (name, value) in desired_values(exe) {
             let name_w = wide(name);
@@ -95,6 +104,14 @@ mod win {
                     bytes.len() as u32,
                 )
                 .ok()?;
+            }
+            if name == ESCAPE_ARGUMENTS
+                && let Some(confirm_flag) = confirm_flag.take()
+            {
+                anyhow::ensure!(
+                    confirm_flag().context("read back DefaultShellEscapeArguments")?,
+                    "DefaultShellEscapeArguments read-back mismatch: sshd would not escape the command"
+                );
             }
         }
         Ok(())
@@ -130,7 +147,9 @@ mod win {
 
     /// Production: write [`desired_values`] under `HKLM\<subkey>`.
     pub fn set_default_shell_under(subkey: &str, exe: &str) -> anyhow::Result<()> {
-        set_under(HKEY_LOCAL_MACHINE, subkey, exe)
+        set_under(HKEY_LOCAL_MACHINE, subkey, exe, || {
+            escape_arguments_in(HKEY_LOCAL_MACHINE, subkey)
+        })
     }
 
     /// Production: read `(DefaultShell, DefaultShellCommandOption)` from `HKLM\<subkey>`.
@@ -205,7 +224,24 @@ mod win {
     // ── test helpers: same FFI core, under HKCU (writable without elevation) ──────────
     #[cfg(test)]
     pub fn set_hkcu(subkey: &str, exe: &str) -> anyhow::Result<()> {
-        set_under(windows::Win32::System::Registry::HKEY_CURRENT_USER, subkey, exe)
+        set_hkcu_confirming(subkey, exe, || escape_arguments_hkcu(subkey))
+    }
+    #[cfg(test)]
+    pub fn set_hkcu_confirming(
+        subkey: &str,
+        exe: &str,
+        confirm_flag: impl FnOnce() -> windows::core::Result<bool>,
+    ) -> anyhow::Result<()> {
+        set_under(
+            windows::Win32::System::Registry::HKEY_CURRENT_USER,
+            subkey,
+            exe,
+            confirm_flag,
+        )
+    }
+    #[cfg(test)]
+    pub fn read_string_hkcu(subkey: &str, name: &str) -> anyhow::Result<String> {
+        read_value(windows::Win32::System::Registry::HKEY_CURRENT_USER, subkey, name)
     }
     #[cfg(test)]
     pub fn read_hkcu(subkey: &str) -> anyhow::Result<(String, String)> {
@@ -265,8 +301,8 @@ mod win {
 
 #[cfg(all(windows, test))]
 pub use win::{
-    delete_hkcu, escape_arguments_from_status, escape_arguments_hkcu, read_dword_hkcu, read_hkcu, set_hkcu,
-    set_value_hkcu,
+    delete_hkcu, escape_arguments_from_status, escape_arguments_hkcu, read_dword_hkcu, read_hkcu, read_string_hkcu,
+    set_hkcu, set_hkcu_confirming, set_value_hkcu,
 };
 #[cfg(windows)]
 pub use win::{escape_arguments_under, read_default_shell_under, set_default_shell_under};
