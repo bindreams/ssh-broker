@@ -1,6 +1,8 @@
 //! Windows-only integration tests for the agent (run on a real Windows host via the cross-compile
 //! -> scp -> run loop). They drive `handle_connection` over a real AF_UNIX socket.
+use super::{HandleWriter, HangupGuard, Hooks, ParkSignal, end_of_watch};
 use crate::afunix::{self, Listener};
+use crate::hangup::HangupWatcher;
 use crate::protocol::{FrameKind, FrameReader, Handshake, Mode, Stream, write_frame};
 use crate::relay::{Outcome, TestSink, pump_decode, write_data};
 use std::thread;
@@ -44,6 +46,64 @@ fn agent_pty_handler_runs_command_and_returns_exit() {
     let text = String::from_utf8_lossy(&stdout);
     assert!(text.contains("agent-pty-ok"), "relayed output was: {text:?}");
     std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Run `cmd.exe /c echo pty-ok` as a PTY session under `hooks`; returns the outcome and the output.
+fn run_pty_echo_session(tag: &str, hooks: Hooks) -> (Outcome, String) {
+    let dir = hardened_dir(tag);
+    let sock = dir.join("s");
+    let listener = Listener::bind(&sock).unwrap();
+    let client_path = sock.clone();
+    let client = thread::spawn(move || {
+        let conn = afunix::connect(&client_path).unwrap();
+        let (mut crx, mut ctx) = afunix::split(conn).unwrap();
+        let hs = Handshake {
+            mode: Mode::Pty,
+            command: Some("cmd.exe /c echo pty-ok".into()),
+            ..Handshake::pty_default()
+        };
+        write_frame(&mut ctx, FrameKind::Handshake, &hs.encode().unwrap()).unwrap();
+        let mut fr = FrameReader::new();
+        let mut sink = TestSink::default();
+        let outcome = pump_decode(&mut crx, &mut fr, &mut sink).unwrap();
+        (outcome, sink.stdout)
+    });
+    let conn = listener.accept().unwrap();
+    super::handle_connection_with(conn, hooks).unwrap();
+    let (outcome, stdout) = client.join().unwrap();
+    std::fs::remove_dir_all(&dir).ok();
+    (outcome, String::from_utf8_lossy(&stdout).into_owned())
+}
+
+/// The PTY relay creates a hangup watcher for its session, and, like EXEC, runs the command
+/// without that protection when the watcher cannot be created.
+#[test]
+fn agent_pty_session_creates_a_hangup_watcher_and_survives_its_failure() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static CREATED: AtomicUsize = AtomicUsize::new(0);
+    let counting = Hooks {
+        make_watcher: |tx| {
+            CREATED.fetch_add(1, Ordering::SeqCst);
+            HangupWatcher::new(tx)
+        },
+        parked: ParkSignal::default(),
+    };
+    let (outcome, text) = run_pty_echo_session("pty-watcher", counting);
+    assert_eq!(outcome, Outcome::Exited(0));
+    assert!(text.contains("pty-ok"), "relayed output was: {text:?}");
+    assert_eq!(
+        CREATED.load(Ordering::SeqCst),
+        1,
+        "the PTY relay did not ask for a watcher"
+    );
+
+    let failing = Hooks {
+        make_watcher: |_| Err(std::io::Error::other("forced watcher failure")),
+        parked: ParkSignal::default(),
+    };
+    let (outcome, text) = run_pty_echo_session("pty-no-watcher", failing);
+    assert_eq!(outcome, Outcome::Exited(0));
+    assert!(text.contains("pty-ok"), "relayed output was: {text:?}");
 }
 
 #[test]
@@ -124,6 +184,108 @@ fn agent_exec_handler_separates_streams_and_returns_code() {
         String::from_utf8_lossy(&stderr).contains("ERR"),
         "stderr was: {:?}",
         String::from_utf8_lossy(&stderr)
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// After EXIT the agent only FINs its write half; it keeps reading, and so discarding, the
+/// client's input until the client closes. Closing the read side instead resets the connection
+/// whenever input is in flight, and the reset discards an EXIT frame the client has not read yet.
+///
+/// The client therefore gets the EXIT frame and the agent's FIN before it sends anything more,
+/// which leaves no race: everything the agent will send has been sent, so the EXIT frame can no
+/// longer be lost. Every write after that must succeed. Had the agent shut its read side down, the first would reset the connection and a
+/// later one would fail (or block, once the socket buffers fill with data nobody reads).
+fn assert_input_after_exit_is_still_read(tag: &str, mode: Mode) {
+    use std::io::Read;
+
+    /// More than the socket buffers hold, so a reader that is gone cannot hide behind them.
+    const AFTER_EXIT: usize = 8 * 1024 * 1024;
+
+    let dir = hardened_dir(tag);
+    let sock = dir.join("s");
+    let listener = Listener::bind(&sock).unwrap();
+
+    let client_path = sock.clone();
+    let client = thread::spawn(move || {
+        let conn = afunix::connect(&client_path).unwrap();
+        let (mut crx, mut ctx) = afunix::split(conn).unwrap();
+        let hs = Handshake {
+            mode,
+            command: Some("cmd.exe /c exit /b 3".into()),
+            ..Handshake::pty_default()
+        };
+        write_frame(&mut ctx, FrameKind::Handshake, &hs.encode().unwrap()).unwrap();
+        let mut fr = FrameReader::new();
+        let mut sink = TestSink::default();
+        let outcome = pump_decode(&mut crx, &mut fr, &mut sink).expect("the EXIT frame was lost");
+        assert_eq!(outcome, Outcome::Exited(3));
+        // Everything the agent will ever send has been sent once it has FINed.
+        let mut buf = [0u8; 4096];
+        while crx.read(&mut buf).expect("reading up to the agent's FIN") != 0 {}
+
+        let stream = if mode == Mode::Pty { Stream::Pty } else { Stream::Stdin };
+        let chunk = [b'x'; 32 * 1024];
+        for _ in 0..AFTER_EXIT / chunk.len() {
+            write_data(&mut ctx, stream, &chunk).expect("input after EXIT must still be read");
+        }
+        ctx.shutdown_both().unwrap();
+    });
+
+    let conn = listener.accept().unwrap();
+    super::handle_connection(conn).unwrap();
+
+    client.join().unwrap();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn agent_exec_keeps_reading_input_after_exit_until_the_client_closes() {
+    assert_input_after_exit_is_still_read("exec-after-exit", Mode::Exec);
+}
+
+#[test]
+fn agent_pty_keeps_reading_input_after_exit_until_the_client_closes() {
+    assert_input_after_exit_is_still_read("pty-after-exit", Mode::Pty);
+}
+
+/// A broken broker must not cost the user a session: if the hangup watcher cannot be created the
+/// command still runs and reports its exit code, without that protection.
+#[test]
+fn agent_exec_runs_the_command_when_the_hangup_watcher_cannot_be_created() {
+    let dir = hardened_dir("exec-no-watcher");
+    let sock = dir.join("s");
+    let listener = Listener::bind(&sock).unwrap();
+
+    let client_path = sock.clone();
+    let client = thread::spawn(move || {
+        let conn = afunix::connect(&client_path).unwrap();
+        let (mut crx, mut ctx) = afunix::split(conn).unwrap();
+        let hs = Handshake {
+            mode: Mode::Exec,
+            command: Some("cmd.exe /c echo OUT& exit /b 4".into()),
+            ..Handshake::pty_default()
+        };
+        write_frame(&mut ctx, FrameKind::Handshake, &hs.encode().unwrap()).unwrap();
+        write_data(&mut ctx, Stream::Stdin, b"").unwrap();
+        let mut fr = FrameReader::new();
+        let mut sink = TestSink::default();
+        let outcome = pump_decode(&mut crx, &mut fr, &mut sink).unwrap();
+        (outcome, sink.stdout)
+    });
+
+    let conn = listener.accept().unwrap();
+    let hooks = Hooks {
+        make_watcher: |_| Err(std::io::Error::other("forced watcher failure")),
+        parked: ParkSignal::default(),
+    };
+    super::handle_connection_with(conn, hooks).unwrap();
+
+    let (outcome, stdout) = client.join().unwrap();
+    assert_eq!(outcome, Outcome::Exited(4));
+    assert!(
+        String::from_utf8_lossy(&stdout).contains("OUT"),
+        "stdout was: {stdout:?}"
     );
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -252,8 +414,7 @@ fn agent_rejects_non_handshake_first_frame() {
 /// The sizes are chosen to park it without parking the *client*: one chunk larger than the
 /// stdin pipe's buffer stalls the writer thread, then enough one-byte frames to overfill the
 /// queue stall the pump. The total is a few KiB, so the client's own socket writes never
-/// block and it always reaches the disconnect below. A regression hangs here rather than
-/// failing, which the runner surfaces.
+/// block and it always reaches the disconnect below.
 #[test]
 fn exec_disconnect_is_noticed_while_the_input_pump_is_blocked_on_stdin() {
     let dir = hardened_dir("exec-stdin-blocked");
@@ -361,13 +522,21 @@ fn wait_then_exit(event: &str) -> String {
 /// complete *before* the marker is printed, so a client that has read the marker can always
 /// read a valid pid and the grandchild is guaranteed to exist.
 ///
-/// `window` selects how the grandchild is attached: `-NoNewWindow` keeps it on the parent's
-/// console and standard handles, the default gives it a fresh console. Exactly which handles
-/// each variant inherits was NOT verified here — .NET's `Process.Start` sets
-/// `bInheritHandles` either way — so treat the pair as two attachment shapes that must both be
-/// reaped, not as a claim about handle inheritance.
+/// `inherit_stdio` selects how the grandchild is attached: `-NoNewWindow` keeps it on the
+/// parent's console and standard handles. Otherwise it gets its own fresh console and, measured
+/// with pwsh 7.6.6 and a piped stdout, inherits none of the outer command's handles.
+///
+/// The fresh console is created hidden so no test opens a window on the developer's desktop.
+/// Measured with Windows Terminal as the default terminal: the console window is hidden, is the
+/// grandchild's own, and is not handed to Windows Terminal. Do not add `-Environment`: it moves
+/// `Start-Process` onto `CreateProcess` with handle inheritance, so the grandchild would hold the
+/// outer pipes.
 fn grandchild_cmd(pidfile: &std::path::Path, tail: &str, inherit_stdio: bool) -> String {
-    let window = if inherit_stdio { "-NoNewWindow " } else { "" };
+    let window = if inherit_stdio {
+        "-NoNewWindow "
+    } else {
+        "-WindowStyle Hidden "
+    };
     format!(
         "pwsh.exe -NoLogo -NoProfile -Command \"$p = Start-Process pwsh.exe {window}-ArgumentList \
          '-NoLogo','-NoProfile','-Command','{SLEEP_FOREVER}' -PassThru; \
@@ -416,9 +585,22 @@ fn close_handle(raw: isize) {
     }
 }
 
+/// Input the command never drains, so the input pump parks in its bounded queue. A 64 KiB chunk
+/// stalls the writer thread and 64 one-byte frames overfill the queue; the total is about 64 KiB,
+/// which the socket buffers take, so the client's socket writes never block.
+fn flood_input(ctx: &mut impl std::io::Write, stream: Stream) {
+    write_data(ctx, stream, &vec![b'x'; 64 * 1024]).unwrap();
+    for _ in 0..64 {
+        write_data(ctx, stream, b"x").unwrap();
+    }
+}
+
 /// Drive one relayed command to its marker, pin the grandchild, then end the session the way
 /// `ending` says and hand back the pinned handle.
-fn run_tree_session(tag: &str, mode: Mode, inherit_stdio: bool, ending: Ending) -> isize {
+///
+/// `flood` sends [`flood_input`] and waits until the input pump reports it is parked before the
+/// disconnect, so the session ends with the pump provably parked.
+fn run_tree_session(tag: &str, mode: Mode, inherit_stdio: bool, ending: Ending, flood: bool) -> isize {
     let dir = hardened_dir(tag);
     let sock = dir.join("s");
     let pidfile = dir.join("grandchild.pid");
@@ -434,6 +616,8 @@ fn run_tree_session(tag: &str, mode: Mode, inherit_stdio: bool, ending: Ending) 
     let (tx_h, rx_h) = std::sync::mpsc::channel::<isize>();
     let client_path = sock.clone();
     let go_raw = go.raw;
+    let parked = ParkSignal::default();
+    let client_parked = parked.clone();
     let client = thread::spawn(move || {
         let conn = afunix::connect(&client_path).unwrap();
         let (mut crx, mut ctx) = afunix::split(conn).unwrap();
@@ -448,6 +632,10 @@ fn run_tree_session(tag: &str, mode: Mode, inherit_stdio: bool, ending: Ending) 
         tx_h.send(open_grandchild(&pidfile)).unwrap();
         match ending {
             Ending::Disconnect => {
+                if flood {
+                    flood_input(&mut ctx, if mode == Mode::Pty { Stream::Pty } else { Stream::Stdin });
+                    client_parked.wait();
+                }
                 let _ = ctx.shutdown_both();
             }
             Ending::NormalExit => {
@@ -467,7 +655,11 @@ fn run_tree_session(tag: &str, mode: Mode, inherit_stdio: bool, ending: Ending) 
     });
 
     let conn = listener.accept().unwrap();
-    super::handle_connection(conn).unwrap();
+    let hooks = Hooks {
+        parked,
+        ..Hooks::production()
+    };
+    super::handle_connection_with(conn, hooks).unwrap();
     client.join().expect("client thread");
     let raw = rx_h.recv().expect("client reported the grandchild handle");
     std::fs::remove_dir_all(&dir).ok();
@@ -497,7 +689,7 @@ fn assert_exits(raw: isize, who: &str) {
 /// descendants running with no session left to reach them.
 #[test]
 fn exec_disconnect_kills_the_whole_process_tree() {
-    let raw = run_tree_session("tree-exec-disc", Mode::Exec, false, Ending::Disconnect);
+    let raw = run_tree_session("tree-exec-disc", Mode::Exec, false, Ending::Disconnect, false);
     assert_exits(raw, "the grandchild after an EXEC disconnect");
 }
 
@@ -507,7 +699,7 @@ fn exec_disconnect_kills_the_whole_process_tree() {
 /// getting teardown wrong hangs the session instead of merely leaking a process.
 #[test]
 fn exec_disconnect_reaps_a_descendant_holding_stdout() {
-    let raw = run_tree_session("tree-exec-inherit", Mode::Exec, true, Ending::Disconnect);
+    let raw = run_tree_session("tree-exec-inherit", Mode::Exec, true, Ending::Disconnect, false);
     assert_exits(raw, "the stdout-holding grandchild after an EXEC disconnect");
 }
 
@@ -515,14 +707,14 @@ fn exec_disconnect_reaps_a_descendant_holding_stdout() {
 /// rather than to a plain stdout pipe.
 #[test]
 fn pty_disconnect_reaps_a_descendant_holding_the_pseudoconsole() {
-    let raw = run_tree_session("tree-pty-inherit", Mode::Pty, true, Ending::Disconnect);
+    let raw = run_tree_session("tree-pty-inherit", Mode::Pty, true, Ending::Disconnect, false);
     assert_exits(raw, "the pty-holding grandchild after a PTY disconnect");
 }
 
 /// The PTY path reaps at its own teardown site, separately from EXEC.
 #[test]
 fn pty_disconnect_kills_the_whole_process_tree() {
-    let raw = run_tree_session("tree-pty-disc", Mode::Pty, false, Ending::Disconnect);
+    let raw = run_tree_session("tree-pty-disc", Mode::Pty, false, Ending::Disconnect, false);
     assert_exits(raw, "the grandchild after a PTY disconnect");
 }
 
@@ -535,15 +727,131 @@ fn pty_disconnect_kills_the_whole_process_tree() {
 /// inherited-pipe case is covered by `exec_disconnect_reaps_a_descendant_holding_stdout`.
 #[test]
 fn exec_normal_exit_reaps_descendants_like_windows_sshd() {
-    let raw = run_tree_session("tree-exec-exit", Mode::Exec, false, Ending::NormalExit);
+    let raw = run_tree_session("tree-exec-exit", Mode::Exec, false, Ending::NormalExit, false);
     assert_exits(raw, "the grandchild after a normal EXEC exit");
 }
 
 /// Same, at the PTY teardown site.
 #[test]
 fn pty_normal_exit_reaps_descendants_like_windows_sshd() {
-    let raw = run_tree_session("tree-pty-exit", Mode::Pty, false, Ending::NormalExit);
+    let raw = run_tree_session("tree-pty-exit", Mode::Pty, false, Ending::NormalExit, false);
     assert_exits(raw, "the grandchild after a normal PTY exit");
+}
+
+/// A disconnect is noticed when the command is silent and the input pump is parked (nothing reads
+/// the socket, no output write fails). The pinned grandchild must die too, so the whole tree is
+/// reaped.
+#[test]
+fn exec_disconnect_with_a_parked_input_pump_reaps_the_tree_of_a_silent_command() {
+    let raw = run_tree_session("tree-exec-flood", Mode::Exec, false, Ending::Disconnect, true);
+    assert_exits(
+        raw,
+        "the grandchild after an EXEC disconnect with the input pump parked",
+    );
+}
+
+/// The same on the PTY path, which shares `HandleWriter`.
+#[test]
+fn pty_disconnect_with_a_parked_input_pump_reaps_the_tree_of_a_silent_command() {
+    let raw = run_tree_session("tree-pty-flood", Mode::Pty, false, Ending::Disconnect, true);
+    assert_exits(raw, "the grandchild after a PTY disconnect with the input pump parked");
+}
+
+/// An anonymous pipe `(read, write)`.
+fn anonymous_pipe() -> (crate::winutil::OwnedHandle, crate::winutil::OwnedHandle) {
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::System::Pipes::CreatePipe;
+    let (mut read, mut write) = (HANDLE::default(), HANDLE::default());
+    unsafe { CreatePipe(&mut read, &mut write, None, 0) }.expect("create a pipe");
+    (crate::winutil::OwnedHandle(read), crate::winutil::OwnedHandle(write))
+}
+
+/// A writer whose queue is full reports it: the signal is what lets a test know the input pump is
+/// about to park in the send, without guessing how long that takes.
+#[test]
+fn handle_writer_reports_a_full_queue() {
+    let (read, write) = anonymous_pipe();
+    let parked = ParkSignal::default();
+    let writer = HandleWriter::spawn(write.raw(), Some(write), parked.clone());
+    // Nobody reads the pipe: the big chunk stalls the writer thread, then the queue fills and the
+    // feeder parks in a send.
+    let feeder = thread::spawn(move || {
+        if writer.write(&vec![b'x'; 64 * 1024]).is_err() {
+            return;
+        }
+        while writer.write(b"x").is_ok() {}
+    });
+    parked.wait();
+    // Closing the read end fails the stalled write, which ends the writer thread and, with it,
+    // the feeder's send.
+    drop(read);
+    feeder.join().unwrap();
+}
+
+/// The wait on a hangup watcher ends in an `Err` only when the poll itself failed. That says
+/// nothing about the peer, so it must not reap the command; a hangup or a wake does.
+#[test]
+fn a_failed_hangup_wait_does_not_reap_and_a_finished_one_does() {
+    let mut reaped = false;
+    end_of_watch(Err(std::io::Error::other("the poll failed")), || reaped = true);
+    assert!(!reaped, "a failed poll reaped the tree");
+    end_of_watch(Ok(()), || reaped = true);
+    assert!(reaped, "a finished wait did not reap the tree");
+}
+
+/// A connected session's server-side halves and its client socket, for building a watcher over.
+fn session_halves(tag: &str) -> (afunix::ConnTx, afunix::ConnRx, socket2::Socket, std::path::PathBuf) {
+    let dir = hardened_dir(tag);
+    let sock = dir.join("s");
+    let listener = Listener::bind(&sock).unwrap();
+    let client = afunix::connect(&sock).unwrap();
+    let conn = listener.accept().unwrap();
+    let (rx, tx) = afunix::split(conn).unwrap();
+    (tx, rx, client, dir)
+}
+
+/// Ending the hangup watch wakes the watcher and waits for its thread, so no thread outlives the
+/// session while the peer is still connected.
+#[test]
+fn finishing_the_hangup_watch_wakes_and_joins_the_watcher_thread() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let (tx, _rx, client, dir) = session_halves("finish-joins");
+    let (watcher, waker) = HangupWatcher::new(&tx).unwrap();
+    let ended = std::sync::Arc::new(AtomicBool::new(false));
+    let flag = std::sync::Arc::clone(&ended);
+    let thread = thread::spawn(move || {
+        watcher.wait().unwrap();
+        flag.store(true, Ordering::Release);
+    });
+    HangupGuard { waker, thread }.finish();
+    // `client` is still connected: only the wake can have ended the watcher before this point.
+    assert!(
+        ended.load(Ordering::Acquire),
+        "finish returned before the watcher ended"
+    );
+    drop(client);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A wake that fails leaves the watcher possibly unable to end until the peer closes, so ending
+/// the watch must not wait for it.
+#[test]
+fn finishing_the_hangup_watch_does_not_wait_when_the_wake_fails() {
+    let (tx, _rx, client, dir) = session_halves("finish-detaches");
+    let (watcher, waker) = HangupWatcher::new(&tx).unwrap();
+    // With the watcher gone the wake channel's far end is closed, so wakes start failing once the
+    // reset reaches us.
+    drop(watcher);
+    while waker.wake().is_ok() {}
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let thread = thread::spawn(move || {
+        let _ = release_rx.recv();
+    });
+    // Returns although the thread is still blocked; a join here would never return.
+    HangupGuard { waker, thread }.finish();
+    release_tx.send(()).unwrap();
+    drop(client);
+    std::fs::remove_dir_all(&dir).ok();
 }
 
 /// The teardown warning fires exactly when the reap failed.

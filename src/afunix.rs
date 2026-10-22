@@ -147,6 +147,12 @@ pub fn split(sock: Socket) -> anyhow::Result<(ConnRx, ConnTx)> {
 }
 
 impl ConnTx {
+    /// A new handle on the same underlying socket, for a thread that must watch the connection
+    /// without owning one of the split halves.
+    pub fn try_clone_socket(&self) -> std::io::Result<Socket> {
+        self.0.try_clone()
+    }
+
     /// Send FIN on the write half. A `try_clone` dup does NOT FIN on drop, so without an
     /// explicit shutdown the peer would block forever and never observe `PeerClosed`.
     pub fn shutdown_write(&self) -> anyhow::Result<()> {
@@ -154,11 +160,15 @@ impl ConnTx {
         Ok(())
     }
 
-    /// Shut down both directions of the connection. Used at teardown to FIN the write side
-    /// (delivering a final EXIT frame) AND unblock a sibling thread blocked reading the
-    /// OTHER split half. That cross-half unblock works because `split` uses `try_clone`
-    /// (WSADuplicateSocketW on Windows / `dup` on Unix): both halves are descriptors over
-    /// one underlying socket, so a shutdown here tears down that shared socket's read side.
+    /// Shut down both directions of the connection: FIN the write side AND unblock a sibling
+    /// thread blocked reading the OTHER split half. That cross-half unblock works because
+    /// `split` uses `try_clone` (WSADuplicateSocketW on Windows / `dup` on Unix): both halves
+    /// are descriptors over one underlying socket, so a shutdown here tears down that shared
+    /// socket's read side.
+    ///
+    /// Not for a peer that may still be sending: closing with its input unread resets the
+    /// connection and can lose the final frame. Use [`Self::shutdown_write`] and read until the
+    /// peer is gone.
     pub fn shutdown_both(&self) -> anyhow::Result<()> {
         self.0.shutdown(std::net::Shutdown::Both)?;
         Ok(())
