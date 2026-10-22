@@ -242,6 +242,15 @@ fn spawn_line_trims_line_breaks_after_a_bare_program_name() {
     assert_eq!(spawn_line("whoami\r\n\r\n"), "whoami");
 }
 
+/// A quoted program name ends at its closing quote, so a line break after it is an argument
+/// (`CreateProcessW` runs `"whoami"\n`) and is kept.
+#[test]
+fn spawn_line_keeps_line_breaks_after_a_quoted_program_name() {
+    assert_eq!(spawn_line("\"whoami\"\n"), "\"whoami\"\n");
+    assert_eq!(spawn_line("\"C:\\tools\\prog.exe\"\r\n"), "\"C:\\tools\\prog.exe\"\r\n");
+    assert_eq!(spawn_line("\r\n\"whoami\"\n"), "\"whoami\"\n");
+}
+
 #[test]
 fn exec_out_sink_flushes_each_frame() {
     // The bug that hung sftp: streaming/binary output (no newlines) must reach the client
