@@ -11,8 +11,8 @@ use crate::relay::{Outcome, TestSink, pump_decode, write_data};
 use std::path::PathBuf;
 use std::thread;
 
-/// A fresh directory holding a hardened socket directory and `Spaced Dir\sftp-server.exe`, a copy
-/// of `cmd.exe`, so the test needs no fixture binary.
+/// A fresh directory containing a hardened socket subdirectory and `Spaced Dir\sftp-server.exe`,
+/// a copy of `cmd.exe`, so the test needs no fixture binary.
 struct Fixture {
     root: PathBuf,
     sockets: PathBuf,
