@@ -1,28 +1,27 @@
 //! The encoder-inverse property: for every command in a corpus, and for every short string over
 //! the characters that matter, the command `route` recovers from the line the shim receives
-//! equals the command sshd was given, in each of sshd's three forms. In a PTY session conhost
+//! equals the command sshd was given, in each of the two forms it can take. In a PTY session conhost
 //! rewrites the line first, so there the command recovered is the one conhost rebuilt.
 //!
 //! The encoder is a port of Win32-OpenSSH and conhost, kept in `tests/common/sshd_encoder.rs` so
 //! the integration tests use the same one. It is test code, so a change to the decoder cannot
 //! pass by changing the encoder it is checked against.
 
-use crate::cmdline::{Detected, Encoding, resolve_exec, split_args};
+use crate::cmdline::{Encoding, resolve_exec, split_args};
 use crate::route::{Route, route};
 
 #[path = "../tests/common/sshd_encoder.rs"]
 mod sshd_encoder;
-use sshd_encoder::{build_exec_command, conhost_escape, escape_arg, tokenize};
+use sshd_encoder::{build_exec_command, conhost_escape, escape_arg, flag_decides_form, tokenize};
 
 const SHELL: &str = r"C:\Program Files\ssh-broker\ssh-broker.exe";
 
-/// The line the shim receives. `Encoding` selects which of the three lines sshd builds; a PTY
+/// The line the shim receives. `Encoding` selects which of the two lines sshd builds; a PTY
 /// session's line has been through conhost.
 fn encode(encoding: Encoding, command: &str) -> String {
     match encoding {
         Encoding::Verbatim => sshd_encoder::verbatim_line(SHELL, command),
         Encoding::Escaped => sshd_encoder::escaped_line(SHELL, command),
-        Encoding::Wrapped => sshd_encoder::wrapped_line(SHELL, command),
     }
 }
 
@@ -114,7 +113,7 @@ fn conhost_command(command: &str) -> String {
 fn expected(encoding: Encoding, command: &str) -> String {
     match encoding {
         Encoding::Verbatim => conhost_command(command),
-        Encoding::Escaped | Encoding::Wrapped => build_exec_command(command),
+        Encoding::Escaped => build_exec_command(command),
     }
 }
 
@@ -123,10 +122,7 @@ fn routed(encoding: Encoding, command: &str) -> String {
     let line = encode(encoding, command);
     let args = split_args(&line);
     match route(&args[1..], &line) {
-        Route::Shim { exec: Some(exec) } => resolve_exec(exec, || Detected {
-            encoding,
-            warning: None,
-        }),
+        Route::Shim { exec: Some(exec) } => resolve_exec(exec, || encoding),
         other => panic!("{line:?} routed to {other:?}, not a shim exec"),
     }
 }
@@ -142,7 +138,7 @@ fn check(encoding: Encoding, command: &str, failures: &mut Vec<String>) {
     }
 }
 
-const ENCODINGS: [Encoding; 3] = [Encoding::Verbatim, Encoding::Escaped, Encoding::Wrapped];
+const ENCODINGS: [Encoding; 2] = [Encoding::Verbatim, Encoding::Escaped];
 
 #[test]
 fn decoding_inverts_sshds_encoding_for_every_command_in_the_corpus() {
@@ -243,6 +239,23 @@ fn a_trailing_backslash_in_a_quoted_command_is_recovered() {
 }
 
 // The port itself =====
+
+/// The shim decodes the escaped form only because `apply` sets the flag AND installs the shim at a
+/// path for which sshd reads the flag: a path with `cmd`, `powershell`, `ssh-shellhost`, `bash`
+/// or `cygwin` in it would fix the form without it. The path is the one `apply` registers
+/// (`provision::imp::canonical_exe`).
+#[test]
+fn sshd_reads_the_flag_for_the_path_apply_registers() {
+    assert!(flag_decides_form(r"C:\ProgramData\ssh-broker\ssh-broker.exe"));
+    assert!(flag_decides_form(r"c:/programdata/ssh-broker/ssh-broker.exe"));
+    assert!(!flag_decides_form(r"C:\Windows\System32\cmd.exe"));
+    assert!(!flag_decides_form(
+        r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+    ));
+    assert!(!flag_decides_form(r"C:\tools\ssh-shellhost.exe"));
+    assert!(!flag_decides_form(r"C:\Git\usr\bin\bash.exe"));
+    assert!(!flag_decides_form(r"C:\cygwin64\bin\zsh.exe"));
+}
 
 #[test]
 fn the_encoder_matches_sshds_documented_shapes() {

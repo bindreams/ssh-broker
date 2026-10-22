@@ -10,16 +10,14 @@
 //! (`FailOpen::Passthrough(cmd) => run_local_passthrough(&format!("pwsh -Command {cmd}"))`)
 //! leaves such a test green. Only running the actual binary traverses the real path.
 //!
-//! The shim decides how sshd encoded its command line from the machine's OpenSSH registry
-//! settings, so a test whose result depends on the form runs `shim_child` instead: the same
-//! entry point (`route`, then `shim_pty::run_on`) with the form given to it. The tests that run
-//! the binary use commands that decode the same in every form, or a PTY session, which is
-//! recognized by its console.
+//! The shim tells a PTY session from a non-PTY one by its console and reads no registry value, so
+//! these tests do not depend on the machine's OpenSSH settings. `shim_child` runs the same entry
+//! point as the binary (`route`, then `shim_pty::run_on`) on a line the test built.
 #![cfg(windows)]
 
 use std::path::{Path, PathBuf};
 
-use ssh_broker::cmdline::{Detected, Encoding, split_args};
+use ssh_broker::cmdline::split_args;
 use ssh_broker::route::{Route, route};
 
 #[path = "common/pty.rs"]
@@ -220,68 +218,56 @@ fn exec_fail_open_runs_a_pty_command_as_conhost_rebuilt_it() {
 
 // A session without a PTY =====
 
-/// The child of the tests below. It does what `main` does with the command line it is given —
-/// `route`, then `shim_pty::run_on` — but takes the form sshd used from the environment, rather
-/// than detecting it from the machine's registry, and exits as the shim does.
+/// The child of the test below. It does what `main` does with the command line it is given —
+/// `route`, then `shim_pty::run_on` — and exits as the shim does.
 #[test]
 #[ignore = "run as a child of the tests below"]
 fn shim_child() {
     let line = std::env::var("SB_TEST_LINE").expect("SB_TEST_LINE: the command line");
-    let encoding = match std::env::var("SB_TEST_ENCODING").expect("SB_TEST_ENCODING").as_str() {
-        "Escaped" => Encoding::Escaped,
-        "Wrapped" => Encoding::Wrapped,
-        other => panic!("unknown SB_TEST_ENCODING {other:?}"),
-    };
     let args = split_args(&line);
     let Route::Shim { exec } = route(&args[1..], &line) else {
         panic!("{line:?} must select the shim");
     };
-    ssh_broker::shim_pty::run_on(exec, || Detected {
-        encoding,
-        warning: None,
-    })
-    .expect("run the shim");
+    ssh_broker::shim_pty::run_on(exec, ssh_broker::cmdline::detect).expect("run the shim");
 }
 
-/// Run the shim on `line` (a whole command line) as sshd's `encoding` form, without a PTY.
-fn run_shim_child(line: &str, encoding: Encoding) -> std::process::Output {
+/// Run the shim on `line` (a whole command line) with stdin on a pipe, as sshd gives it without a
+/// PTY.
+fn run_shim_child(line: &str) -> std::process::Output {
     std::process::Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "shim_child", "--ignored", "--nocapture"])
         .env("SB_TEST_LINE", line)
-        .env("SB_TEST_ENCODING", format!("{encoding:?}"))
+        .stdin(std::process::Stdio::piped())
         .output()
         .expect("run the shim child")
 }
 
-/// A session without a PTY: sshd turns the command into one argument of the shell's line, escaped
-/// (`DefaultShellEscapeArguments` on, the default) or wrapped in quotes and nothing else (off), and
-/// the shim must undo that and run the command as the client sent it.
+/// A session without a PTY: sshd turns the command into one escaped argument of the shell's line
+/// (`apply` sets `DefaultShellEscapeArguments`), and the shim must undo that and run the command
+/// as the client sent it, whatever the machine's registry holds.
 ///
-/// The encoders are the port of sshd's in `tests/common/sshd_encoder.rs`.
+/// The encoder is the port of sshd's in `tests/common/sshd_encoder.rs`.
 #[test]
 fn exec_fail_open_decodes_the_command_of_a_session_without_a_pty() {
-    let shim = env!("CARGO_BIN_EXE_ssh-broker");
-    for encoding in [Encoding::Escaped, Encoding::Wrapped] {
-        let (root, program) = spaced_program("sb-failopen-quoted-piped");
-        let command = quoted_command(&program);
-        let line = match encoding {
-            Encoding::Escaped => sshd_encoder::escaped_line(shim, &command),
-            _ => sshd_encoder::wrapped_line(shim, &command),
-        };
-        let out = run_shim_child(&line, encoding);
-        let _ = std::fs::remove_dir_all(&root);
+    let (root, program) = spaced_program("sb-failopen-quoted-piped");
+    let command = quoted_command(&program);
+    let line = sshd_encoder::escaped_line(env!("CARGO_BIN_EXE_ssh-broker"), &command);
+    let out = run_shim_child(&line);
+    let _ = std::fs::remove_dir_all(&root);
 
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        assert!(
-            stderr.contains("agent unavailable"),
-            "{encoding:?}: precondition: the fail-open path must be the one that ran, not the relay.\nstderr: {stderr}"
-        );
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        assert!(
-            stdout.contains(r#""quoted  ok""#),
-            "{encoding:?}: the quoted argument lost its quotes or its double space.\nstdout: {stdout}\nstderr: {stderr}"
-        );
-    }
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("agent unavailable"),
+        "precondition: the fail-open path must be the one that ran, not the relay.
+stderr: {stderr}"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains(r#""quoted  ok""#),
+        "the quoted argument lost its quotes or its double space.
+stdout: {stdout}
+stderr: {stderr}"
+    );
 }
 
 /// An exec whose command is empty or whitespace-only runs nothing and exits 0 with no output, as

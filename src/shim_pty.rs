@@ -14,7 +14,7 @@
 //! not), JOINS the worker, then the guard restores modes AFTER the join — so the worker can
 //! never read with a half-restored mode (the use-after-close hazard the agent review found).
 
-use crate::cmdline::{Detected, RawExec, resolve_exec};
+use crate::cmdline::{Encoding, RawExec, resolve_exec};
 use crate::protocol::{FrameKind, FrameReader, Handshake, Stream, write_frame};
 use crate::relay::{FrameSink, pump_decode, write_data};
 use crate::shim::{
@@ -59,7 +59,7 @@ const VT_OUT: CONSOLE_MODE =
 ///
 /// A `-c` session resolves its command first, once the log is open: `detect` says how sshd
 /// encoded it (see [`resolve_exec`]), and a blank command ends the run there, exit 0.
-pub fn run_on(exec: Option<RawExec>, detect: impl FnOnce() -> Detected) -> anyhow::Result<()> {
+pub fn run_on(exec: Option<RawExec>, detect: impl FnOnce() -> Encoding) -> anyhow::Result<()> {
     let log = init_file_logging();
     let exec = exec.map(|exec| resolve_exec(exec, detect));
     if exec.as_deref().is_some_and(is_blank_command) {

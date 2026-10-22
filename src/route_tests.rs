@@ -4,7 +4,7 @@
 //! `route` receives is derived from it the way the C runtime would.
 
 use super::{Route, route};
-use crate::cmdline::{Detected, Encoding, RawExec, resolve_exec, split_args};
+use crate::cmdline::{Encoding, RawExec, resolve_exec, split_args};
 
 fn route_line(line: &str) -> Route {
     let args = split_args(line);
@@ -23,12 +23,7 @@ fn command_as(line: &str, encoding: Encoding) -> Option<String> {
     let Route::Shim { exec } = route_line(line) else {
         panic!("{line:?} must select the shim");
     };
-    exec.map(|exec| {
-        resolve_exec(exec, || Detected {
-            encoding,
-            warning: None,
-        })
-    })
+    exec.map(|exec| resolve_exec(exec, || encoding))
 }
 
 /// A line whose form does not matter: commands with nothing sshd would escape.
@@ -59,11 +54,11 @@ fn dash_c_routes_the_raw_tail() {
 fn dash_c_with_an_empty_command_is_an_empty_exec() {
     assert_eq!(route_line("ssh-broker.exe -c"), tail(""));
     assert_eq!(route_line("ssh-broker.exe -c "), tail(""));
-    for encoding in [Encoding::Verbatim, Encoding::Escaped, Encoding::Wrapped] {
+    for encoding in [Encoding::Verbatim, Encoding::Escaped] {
         assert_eq!(command_as("ssh-broker.exe -c", encoding), some(""), "{encoding:?}");
         assert_eq!(command_as("ssh-broker.exe -c ", encoding), some(""), "{encoding:?}");
     }
-    assert_eq!(command_as(r#"ssh-broker.exe -c """#, Encoding::Wrapped), some(""));
+    assert_eq!(command_as(r#"ssh-broker.exe -c """#, Encoding::Escaped), some(""));
 }
 
 #[test]

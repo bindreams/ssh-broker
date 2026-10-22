@@ -1,5 +1,6 @@
-//! Tests for the DefaultShell pair: the pure builder (host) + the Reg* round-trip (Windows).
-use super::registry_pair;
+//! Tests for the values `apply` owns under `HKLM\SOFTWARE\OpenSSH`: the pure list and the verify
+//! row (host) + the Reg* round-trips (Windows).
+use super::{RegValue, desired_values, escape_arguments_check};
 
 /// A throwaway HKCU subkey, deleted when the guard drops, so a failing assertion leaves nothing
 /// behind.
@@ -24,12 +25,71 @@ impl Drop for TestKey {
     }
 }
 
+/// The flag comes first: sshd reads all four values once per session (`pwd.c`
+/// `set_defaultshell`), so a crash between writes must never leave the shim as `DefaultShell` with
+/// sshd's escaping still off. The option comes before the shell for the reason it always did.
 #[test]
-fn pair_is_option_first_then_shell() {
-    let pair = registry_pair(r"C:\ProgramData\ssh-broker\ssh-broker.exe");
-    assert_eq!(pair[0], ("DefaultShellCommandOption", "-c".to_string()));
-    assert_eq!(pair[1].0, "DefaultShell");
-    assert_eq!(pair[1].1, r"C:\ProgramData\ssh-broker\ssh-broker.exe");
+fn values_are_the_flag_then_the_option_then_the_shell() {
+    let values = desired_values(r"C:\ProgramData\ssh-broker\ssh-broker.exe");
+    assert_eq!(
+        values,
+        [
+            ("DefaultShellEscapeArguments", RegValue::Dword(1)),
+            ("DefaultShellCommandOption", RegValue::Sz("-c".into())),
+            (
+                "DefaultShell",
+                RegValue::Sz(r"C:\ProgramData\ssh-broker\ssh-broker.exe".into())
+            ),
+        ]
+    );
+}
+
+/// The verify row passes when sshd reads the value as on (a missing value included), and fails
+/// otherwise, naming the value and `apply`. A read that cannot be made fails too: the setting is
+/// then unknown.
+#[test]
+fn the_escape_row_passes_only_when_sshd_would_escape() {
+    let on = escape_arguments_check(Ok::<_, String>(true));
+    assert!(on.pass, "{}", on.detail);
+
+    let off = escape_arguments_check(Ok::<_, String>(false));
+    assert!(!off.pass);
+    assert!(off.name.contains("DefaultShellEscapeArguments"), "{}", off.name);
+    assert!(off.detail.contains("apply"), "{}", off.detail);
+
+    let unreadable = escape_arguments_check(Err("Access is denied."));
+    assert!(!unreadable.pass);
+    assert!(unreadable.detail.contains("Access is denied."), "{}", unreadable.detail);
+    assert!(unreadable.detail.contains("apply"), "{}", unreadable.detail);
+}
+
+/// Writing the values leaves `DefaultShellEscapeArguments` as the REG_DWORD 1 sshd reads as on,
+/// whatever the value held before: 0, an empty string (whose two zero bytes sshd reads as 0), or
+/// nothing.
+#[cfg(windows)]
+#[test]
+fn writing_the_values_sets_the_escape_flag_to_dword_one() {
+    use windows::Win32::System::Registry::{REG_DWORD, REG_SZ};
+    const NAME: &str = "DefaultShellEscapeArguments";
+    for before in [
+        Some((REG_DWORD.0, 0u32.to_le_bytes().to_vec())),
+        Some((REG_SZ.0, vec![0, 0])),
+        None,
+    ] {
+        let key = TestKey::new("flag");
+        let subkey = key.path();
+        if let Some((reg_type, bytes)) = &before {
+            super::set_value_hkcu(subkey, NAME, *reg_type, bytes);
+        }
+        super::set_hkcu(subkey, r"C:\x\ssh-broker.exe").unwrap();
+
+        assert_eq!(
+            super::read_dword_hkcu(subkey, NAME).unwrap(),
+            1,
+            "from {before:?}: a REG_DWORD of 1"
+        );
+        assert!(super::escape_arguments_hkcu(subkey).unwrap());
+    }
 }
 
 /// Round-trips the pair through a throwaway subkey on Windows (plan Task 7.1), exercising the
@@ -135,37 +195,4 @@ fn escape_arguments_reports_a_read_that_fails_for_another_reason() {
     assert!(super::escape_arguments_from_status(ERROR_MORE_DATA, [0; 4]).unwrap());
     assert!(!super::escape_arguments_from_status(ERROR_SUCCESS, [0; 4]).unwrap());
     assert!(super::escape_arguments_from_status(ERROR_SUCCESS, [1, 0, 0, 0]).unwrap());
-}
-
-/// `default_shell_path` reads `DefaultShell` as sshd does (`pwd.c:78-80`): whatever its type, as
-/// text up to the first NUL. A missing key, a missing value and an empty value all mean no
-/// `DefaultShell` is set (sshd then uses `cmd.exe`).
-#[cfg(windows)]
-#[test]
-fn default_shell_path_reads_the_value_the_way_sshd_does() {
-    use windows::Win32::System::Registry::{REG_EXPAND_SZ, REG_SZ};
-    let key = TestKey::new("shell-path");
-    let subkey = key.path();
-    let utf16 = |s: &str| -> Vec<u8> { s.encode_utf16().chain([0]).flat_map(u16::to_le_bytes).collect() };
-
-    let absent_key = super::default_shell_path_hkcu(subkey);
-    super::set_value_hkcu(subkey, "Other", REG_SZ.0, &utf16("x"));
-    let absent_value = super::default_shell_path_hkcu(subkey);
-    super::set_value_hkcu(subkey, "DefaultShell", REG_SZ.0, &utf16(""));
-    let empty = super::default_shell_path_hkcu(subkey);
-    let long = format!(r"C:\{}\ssh-broker.exe", "d".repeat(600));
-    super::set_value_hkcu(subkey, "DefaultShell", REG_SZ.0, &utf16(&long));
-    let long_read = super::default_shell_path_hkcu(subkey);
-    super::set_value_hkcu(subkey, "DefaultShell", REG_EXPAND_SZ.0, &utf16(r"%ProgramFiles%\x.exe"));
-    let expand = super::default_shell_path_hkcu(subkey);
-
-    assert_eq!(absent_key.unwrap(), None);
-    assert_eq!(absent_value.unwrap(), None);
-    assert_eq!(empty.unwrap(), None);
-    assert_eq!(long_read.unwrap(), Some(long), "no fixed buffer size");
-    assert_eq!(
-        expand.unwrap().as_deref(),
-        Some(r"%ProgramFiles%\x.exe"),
-        "not expanded"
-    );
 }

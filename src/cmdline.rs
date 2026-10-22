@@ -1,7 +1,7 @@
 //! The raw process command line, and the `-c` command recovered from it.
 //!
 //! `std::env::args` has already split and unquoted the command line, which loses the exact
-//! command sshd sent: see [`decode_command`] for the three forms it arrives in, and
+//! command sshd sent: see [`decode_command`] for the two forms it arrives in, and
 //! [`detect`] for how the shim tells them apart. [`resolve_exec`] is the step from what
 //! `route` finds to the command.
 
@@ -24,31 +24,16 @@ pub enum RawExec {
     Argv(String),
 }
 
-/// The command `exec` carries. A tail is decoded by the form [`detect`] reports, called here
-/// rather than at startup because it reads the registry and the console and only a `-c` session
-/// needs it; its warning is logged, so the caller opens the log first.
-pub fn resolve_exec(exec: RawExec, detect: impl FnOnce() -> Detected) -> String {
+/// The command `exec` carries. A tail is decoded by the form `detect` reports, called here rather
+/// than at startup because only a `-c` session needs it.
+pub fn resolve_exec(exec: RawExec, detect: impl FnOnce() -> Encoding) -> String {
     match exec {
-        RawExec::Tail(tail) => {
-            let Detected { encoding, warning } = detect();
-            if let Some(warning) = warning {
-                tracing::warn!("{warning}");
-            }
-            decode_command(&tail, encoding)
-        }
+        RawExec::Tail(tail) => decode_command(&tail, detect()),
         RawExec::Argv(command) => {
             tracing::warn!("the raw command line has no `-c` although argv does; running the joined argv");
             command
         }
     }
-}
-
-/// What [`detect`] found: how sshd encoded the command line, and, when that rests on an assumption,
-/// what to log once logging is up (detection runs before the log is opened).
-#[derive(Debug)]
-pub struct Detected {
-    pub encoding: Encoding,
-    pub warning: Option<String>,
 }
 
 /// How sshd built the `DefaultShell` command line; see [`decode_command`].
@@ -60,54 +45,14 @@ pub enum Encoding {
     /// the one the client typed (runs of spaces between arguments become one, quotes around
     /// an argument with no space are dropped) and relays it as received.
     Verbatim,
-    /// No PTY, `DefaultShellEscapeArguments` on (the default): the command is one escaped argument.
+    /// No PTY: the command is one escaped argument.
+    ///
+    /// sshd escapes it when `DefaultShellEscapeArguments` is nonzero or absent and the
+    /// `DefaultShell` path is not one it special-cases (`w32-doexec.c:308-318`, `:370-371`). It
+    /// reads both once per session (`pwd.c` `set_defaultshell`), so a re-read here could disagree
+    /// with the session being served. ssh-broker owns the setting instead: `apply` writes the flag
+    /// and installs the shim at a path sshd does not special-case, and `verify` checks it.
     Escaped,
-    /// No PTY, `DefaultShellEscapeArguments=0`: the command is wrapped in quotes, unescaped.
-    Wrapped,
-}
-
-/// The kinds of `DefaultShell` path sshd tells apart (`w32-doexec.c:308-318`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ShellKind {
-    Cmd,
-    PowerShell,
-    ShellHost,
-    Bash,
-    Cygwin,
-    Other,
-}
-
-/// Classify a `DefaultShell` path the way sshd does: it lowercases the path and turns `/` into
-/// `\` (`pwd.c:113-114`, `wmisc.c:919`, `:1288`), then takes the first substring that matches,
-/// in this order (`w32-doexec.c:308-318`).
-pub fn shell_kind(path: &str) -> ShellKind {
-    let path = path.replace('/', "\\").to_ascii_lowercase();
-    if path.contains(r"system32\cmd") {
-        ShellKind::Cmd
-    } else if path.contains("powershell") {
-        ShellKind::PowerShell
-    } else if path.contains("ssh-shellhost") {
-        ShellKind::ShellHost
-    } else if path.contains(r"\bash") {
-        ShellKind::Bash
-    } else if path.contains("cygwin") {
-        ShellKind::Cygwin
-    } else {
-        ShellKind::Other
-    }
-}
-
-impl ShellKind {
-    /// The non-PTY form sshd uses for this kind of shell, or `None` when `DefaultShellEscapeArguments`
-    /// decides: sshd escapes for PowerShell, bash and cygwin, wraps for cmd and ssh-shellhost, and
-    /// reads the flag only for any other path (`w32-doexec.c:370-371`).
-    pub fn encoding(self) -> Option<Encoding> {
-        match self {
-            ShellKind::Cmd | ShellKind::ShellHost => Some(Encoding::Wrapped),
-            ShellKind::PowerShell | ShellKind::Bash | ShellKind::Cygwin => Some(Encoding::Escaped),
-            ShellKind::Other => None,
-        }
-    }
 }
 
 /// Space and tab separate arguments; nothing else does.
@@ -192,7 +137,7 @@ pub fn dash_c_tail(line: &str) -> Option<&str> {
 
 /// The command a `-c` tail carries, as `encoding` says sshd wrote it; `None` when there is none.
 ///
-/// Win32-OpenSSH builds the `DefaultShell` command line in three ways (`w32-doexec.c` and
+/// Win32-OpenSSH builds the `DefaultShell` command line one of two ways here (`w32-doexec.c` and
 /// `misc.c`), and each has its own inverse:
 ///
 /// - [`Encoding::Verbatim`], a PTY session (`ssh -t host cmd`): the command is appended to
@@ -205,13 +150,13 @@ pub fn dash_c_tail(line: &str) -> Option<&str> {
 ///   C-runtime splitter would read as an escaped quote. Inside, `\"` is a quote and a backslash
 ///   run before it halves. A command with a space or tab left unwrapped (`'a b'`, a tab with
 ///   no space) is not split.
-/// - [`Encoding::Wrapped`], no PTY and `DefaultShellEscapeArguments=0`: the command is wrapped
-///   in quotes with nothing escaped, so the quotes inside it are its own.
+///
+/// The third form sshd has (the command wrapped in quotes, unescaped) is for
+/// `DefaultShellEscapeArguments=0`, which `apply` overwrites; it is not decoded.
 ///
 /// An empty tail is an empty command: `-c` was given, so the client asked to run something.
 ///
-/// A tail that cannot come from its form (a wrapped command with no quotes around it, an escaped
-/// one that opens a quote and never closes it) is logged and decoded as far as it goes, and
+/// A tail that cannot come from its form (an escaped one that opens a quote and never closes it) is logged and decoded as far as it goes, and
 /// asserts in a debug build.
 pub fn decode_command(tail: &str, encoding: Encoding) -> String {
     match encoding {
@@ -219,8 +164,6 @@ pub fn decode_command(tail: &str, encoding: Encoding) -> String {
         // An unwrapped escaped argument never starts with a quote: sshd escapes it as `\"`.
         Encoding::Escaped if tail.starts_with('"') => unescape_argument(unwrap_or_log(tail, encoding)),
         Encoding::Escaped => unescape_argument(tail),
-        Encoding::Wrapped if tail.is_empty() => String::new(),
-        Encoding::Wrapped => unwrap_or_log(tail, encoding).to_string(),
     }
 }
 

@@ -1,4 +1,4 @@
-//! provision::registry — the OpenSSH DefaultShell pair (pure pair builder + Windows Reg*).
+//! provision::registry — the `HKLM\SOFTWARE\OpenSSH` values `apply` owns (pure list + Windows Reg*).
 //!
 //! Uses windows-rs `Reg*` directly (not the `winreg` crate) — `windows` is already a
 //! dependency and this matches the hand-rolled-FFI + RAII idiom of `acl.rs`/`winutil.rs`.
@@ -6,15 +6,56 @@
 //! is an admin operation); the FFI core is root-parameterized so the unit test can exercise
 //! the same code path under HKCU without elevation.
 
-/// The two `HKLM\SOFTWARE\OpenSSH` values in FAIL-SAFE write order: the command option FIRST,
-/// the shell path SECOND. There is no atomicity across two REG_SZ writes; a crash between them
-/// then leaves `-c` with the OLD/absent shell (sshd falls back to cmd.exe — harmless) rather
-/// than the NEW shell with no option (which would mis-invoke `ssh host "cmd"`).
-pub fn registry_pair(exe: &str) -> [(&'static str, String); 2] {
+use super::report::Check;
+
+/// A registry value `apply` writes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RegValue {
+    Sz(String),
+    Dword(u32),
+}
+
+/// The three `HKLM\SOFTWARE\OpenSSH` values `apply` owns, in FAIL-SAFE write order.
+///
+/// sshd reads `DefaultShell`, `DefaultShellCommandOption`, `DefaultShellArguments` and
+/// `DefaultShellEscapeArguments` once per session (`pwd.c` `set_defaultshell`), so the shim cannot
+/// ask later which form sshd used; `apply` sets the form instead. There is no atomicity across the
+/// writes, so each crash point must be harmless:
+///
+/// - the escape flag FIRST: sshd escapes the command for every shell the flag does not exempt, so
+///   it is right before the shim becomes the shell and costs nothing before then;
+/// - the command option SECOND, the shell path LAST: a crash between them leaves `-c` with the
+///   OLD/absent shell (sshd falls back to cmd.exe — harmless) rather than the NEW shell with no
+///   option (which would mis-invoke `ssh host "cmd"`).
+pub fn desired_values(exe: &str) -> [(&'static str, RegValue); 3] {
     [
-        ("DefaultShellCommandOption", "-c".to_string()),
-        ("DefaultShell", exe.to_string()),
+        (ESCAPE_ARGUMENTS, RegValue::Dword(1)),
+        ("DefaultShellCommandOption", RegValue::Sz("-c".to_string())),
+        ("DefaultShell", RegValue::Sz(exe.to_string())),
     ]
+}
+
+/// The value sshd reads to decide whether to escape the command it hands the `DefaultShell`.
+pub const ESCAPE_ARGUMENTS: &str = "DefaultShellEscapeArguments";
+
+/// The `verify` row for the escape flag: `read` is [`escape_arguments_under`]'s answer, which
+/// already follows how sshd reads the value. Off, and a value that cannot be read, both fail:
+/// the shim decodes the escaped form only.
+pub fn escape_arguments_check<E: std::fmt::Display>(read: Result<bool, E>) -> Check {
+    let name = ESCAPE_ARGUMENTS;
+    match read {
+        Ok(true) => Check::new(name, true, "sshd escapes the command"),
+        Ok(false) => Check::new(
+            name,
+            false,
+            "sshd would not escape the command, which the shim cannot decode; run `ssh-broker apply`",
+        ),
+        Err(error) => Check::new(
+            name,
+            false,
+            format!("cannot read it ({error}); run `ssh-broker apply` and check the key's permissions"),
+        ),
+    }
 }
 
 /// The production OpenSSH key under `HKEY_LOCAL_MACHINE`.
@@ -22,11 +63,11 @@ pub const OPENSSH_KEY: &str = r"SOFTWARE\OpenSSH";
 
 #[cfg(windows)]
 mod win {
-    use super::registry_pair;
+    use super::{ESCAPE_ARGUMENTS, RegValue, desired_values};
     use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_MORE_DATA, ERROR_PATH_NOT_FOUND, WIN32_ERROR};
     use windows::Win32::System::Registry::{
-        HKEY, HKEY_LOCAL_MACHINE, KEY_QUERY_VALUE, KEY_WOW64_64KEY, REG_SZ, RRF_RT_REG_SZ, RegCloseKey, RegGetValueW,
-        RegOpenKeyExW, RegQueryValueExW, RegSetKeyValueW,
+        HKEY, HKEY_LOCAL_MACHINE, KEY_QUERY_VALUE, KEY_WOW64_64KEY, REG_DWORD, REG_SZ, REG_VALUE_TYPE, RRF_RT_REG_SZ,
+        RegCloseKey, RegGetValueW, RegOpenKeyExW, RegQueryValueExW, RegSetKeyValueW,
     };
     use windows::core::PCWSTR;
 
@@ -34,22 +75,24 @@ mod win {
         s.encode_utf16().chain(std::iter::once(0)).collect()
     }
 
-    /// Write the DefaultShell pair under `<root>\<subkey>` (creating the key), in the fail-safe
-    /// order from `registry_pair`.
+    /// Write [`desired_values`] under `<root>\<subkey>` (creating the key), in its fail-safe order.
     fn set_under(root: HKEY, subkey: &str, exe: &str) -> anyhow::Result<()> {
         let sub = wide(subkey);
-        for (name, val) in registry_pair(exe) {
+        for (name, value) in desired_values(exe) {
             let name_w = wide(name);
-            let val_w = wide(&val);
-            let cb = (val_w.len() * 2) as u32; // bytes including the UTF-16 NUL terminator
+            let (reg_type, bytes): (REG_VALUE_TYPE, Vec<u8>) = match value {
+                RegValue::Sz(text) => (REG_SZ, wide(&text).into_iter().flat_map(u16::to_le_bytes).collect()),
+                RegValue::Dword(number) => (REG_DWORD, number.to_le_bytes().to_vec()),
+            };
+            // SAFETY: `sub` and `name_w` are NUL-terminated and `bytes` is the value's data.
             unsafe {
                 RegSetKeyValueW(
                     root,
                     PCWSTR(sub.as_ptr()),
                     PCWSTR(name_w.as_ptr()),
-                    REG_SZ.0,
-                    Some(val_w.as_ptr() as *const core::ffi::c_void),
-                    cb,
+                    reg_type.0,
+                    Some(bytes.as_ptr() as *const core::ffi::c_void),
+                    bytes.len() as u32,
                 )
                 .ok()?;
             }
@@ -85,7 +128,7 @@ mod win {
         Ok(String::from_utf16_lossy(&buf[..chars.min(buf.len())]))
     }
 
-    /// Production: write the DefaultShell pair under `HKLM\<subkey>`.
+    /// Production: write [`desired_values`] under `HKLM\<subkey>`.
     pub fn set_default_shell_under(subkey: &str, exe: &str) -> anyhow::Result<()> {
         set_under(HKEY_LOCAL_MACHINE, subkey, exe)
     }
@@ -103,7 +146,7 @@ mod win {
     /// for another reason leaves the real setting unknown, so it is an `Err` the caller can report.
     fn escape_arguments_in(root: HKEY, subkey: &str) -> windows::core::Result<bool> {
         let sub = wide(subkey);
-        let name = wide("DefaultShellEscapeArguments");
+        let name = wide(ESCAPE_ARGUMENTS);
         let mut key = HKEY::default();
         // sshd's `escape_option` starts at 1 (`pwd.c:83`); a value shorter than four bytes
         // overwrites only its own bytes.
@@ -154,75 +197,6 @@ mod win {
         status == ERROR_FILE_NOT_FOUND || status == ERROR_PATH_NOT_FOUND
     }
 
-    /// The `DefaultShell` path as sshd reads it (`pwd.c:78-80`): the value's bytes, whatever their
-    /// type and unexpanded, as UTF-16 up to the first NUL. `None` when the key or value is missing
-    /// or empty, which is when sshd uses `cmd.exe` instead. Any other failure is an `Err`.
-    fn default_shell_path_in(root: HKEY, subkey: &str) -> windows::core::Result<Option<String>> {
-        let sub = wide(subkey);
-        let name = wide("DefaultShell");
-        let mut key = HKEY::default();
-        let opened = unsafe {
-            RegOpenKeyExW(
-                root,
-                PCWSTR(sub.as_ptr()),
-                None,
-                KEY_QUERY_VALUE | KEY_WOW64_64KEY,
-                &mut key,
-            )
-        };
-        if is_absent(opened) {
-            return Ok(None);
-        }
-        opened.ok()?;
-        let read = unsafe { query_bytes(key, PCWSTR(name.as_ptr())) };
-        unsafe {
-            let _ = RegCloseKey(key);
-        }
-        let bytes = match read {
-            Ok(bytes) => bytes,
-            Err(status) if is_absent(status) => return Ok(None),
-            Err(status) => return Err(status.to_hresult().into()),
-        };
-        let units: Vec<u16> = bytes
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .map(|&pair| u16::from_le_bytes(pair))
-            .take_while(|&unit| unit != 0)
-            .collect();
-        Ok((!units.is_empty()).then(|| String::from_utf16_lossy(&units)))
-    }
-
-    /// The raw bytes of the value `name` under `key`, however long, retrying while the value grows
-    /// between the size query and the read.
-    ///
-    /// # Safety
-    /// `key` must be an open registry key and `name` a NUL-terminated string.
-    unsafe fn query_bytes(key: HKEY, name: PCWSTR) -> Result<Vec<u8>, WIN32_ERROR> {
-        let mut cb = 0u32;
-        loop {
-            let size = unsafe { RegQueryValueExW(key, name, None, None, None, Some(&mut cb)) };
-            if size != WIN32_ERROR(0) {
-                return Err(size);
-            }
-            let mut buf = vec![0u8; cb as usize];
-            let status = unsafe { RegQueryValueExW(key, name, None, None, Some(buf.as_mut_ptr()), Some(&mut cb)) };
-            if status == ERROR_MORE_DATA {
-                continue;
-            }
-            if status != WIN32_ERROR(0) {
-                return Err(status);
-            }
-            buf.truncate(cb as usize);
-            return Ok(buf);
-        }
-    }
-
-    /// Production: the `DefaultShell` path from `HKLM\<subkey>`; see [`default_shell_path_in`].
-    pub fn default_shell_path_under(subkey: &str) -> windows::core::Result<Option<String>> {
-        default_shell_path_in(HKEY_LOCAL_MACHINE, subkey)
-    }
-
     /// Production: whether sshd escapes the command, from `HKLM\<subkey>`.
     pub fn escape_arguments_under(subkey: &str) -> windows::core::Result<bool> {
         escape_arguments_in(HKEY_LOCAL_MACHINE, subkey)
@@ -242,8 +216,25 @@ mod win {
         escape_arguments_in(windows::Win32::System::Registry::HKEY_CURRENT_USER, subkey)
     }
     #[cfg(test)]
-    pub fn default_shell_path_hkcu(subkey: &str) -> windows::core::Result<Option<String>> {
-        default_shell_path_in(windows::Win32::System::Registry::HKEY_CURRENT_USER, subkey)
+    pub fn read_dword_hkcu(subkey: &str, name: &str) -> windows::core::Result<u32> {
+        use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
+        let (sub, name) = (wide(subkey), wide(name));
+        let mut value = 0u32;
+        let mut cb = 4u32;
+        // SAFETY: `value` is a four-byte buffer and `cb` its size; the strings are NUL-terminated.
+        unsafe {
+            RegGetValueW(
+                HKEY_CURRENT_USER,
+                PCWSTR(sub.as_ptr()),
+                PCWSTR(name.as_ptr()),
+                RRF_RT_REG_DWORD,
+                None,
+                Some(&mut value as *mut u32 as *mut core::ffi::c_void),
+                Some(&mut cb),
+            )
+            .ok()?;
+        }
+        Ok(value)
     }
     #[cfg(test)]
     pub fn set_value_hkcu(subkey: &str, name: &str, reg_type: u32, data: &[u8]) {
@@ -274,11 +265,11 @@ mod win {
 
 #[cfg(all(windows, test))]
 pub use win::{
-    default_shell_path_hkcu, delete_hkcu, escape_arguments_from_status, escape_arguments_hkcu, read_hkcu, set_hkcu,
+    delete_hkcu, escape_arguments_from_status, escape_arguments_hkcu, read_dword_hkcu, read_hkcu, set_hkcu,
     set_value_hkcu,
 };
 #[cfg(windows)]
-pub use win::{default_shell_path_under, escape_arguments_under, read_default_shell_under, set_default_shell_under};
+pub use win::{escape_arguments_under, read_default_shell_under, set_default_shell_under};
 
 #[cfg(test)]
 #[path = "registry_tests.rs"]

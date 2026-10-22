@@ -6,9 +6,7 @@
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Mutex};
 
-use super::{
-    Detected, Encoding, RawExec, ShellKind, dash_c_tail, decode_command, resolve_exec, shell_kind, split_args,
-};
+use super::{Encoding, RawExec, dash_c_tail, decode_command, resolve_exec, split_args};
 
 fn args(line: &str) -> Vec<String> {
     split_args(line)
@@ -107,14 +105,9 @@ fn a_verbatim_command_is_kept_exactly() {
 /// that runs nothing, not an interactive session.
 #[test]
 fn an_empty_tail_is_an_empty_command() {
-    for encoding in [Encoding::Verbatim, Encoding::Escaped, Encoding::Wrapped] {
+    for encoding in [Encoding::Verbatim, Encoding::Escaped] {
         assert_eq!(decode_command("", encoding), "", "{encoding:?}");
     }
-}
-
-#[test]
-fn an_empty_quoted_argument_is_an_empty_command() {
-    assert_eq!(decode_command(r#""""#, Encoding::Wrapped), "");
 }
 
 // Escaped, again: the forms a C-runtime splitter reads wrongly.
@@ -137,19 +130,6 @@ fn an_escaped_command_ending_in_a_backslash_keeps_it() {
     );
 }
 
-// Wrapped: `DefaultShellEscapeArguments=0` wraps the command in quotes and nothing else.
-
-#[test]
-fn a_wrapped_command_keeps_the_quotes_inside_it() {
-    assert_eq!(decode_command(r#""echo "a b"""#, Encoding::Wrapped), r#"echo "a b""#);
-    assert_eq!(decode_command(r#""a"b""#, Encoding::Wrapped), r#"a"b"#);
-    // Nothing is escaped, so a backslash before a quote is the command's own.
-    assert_eq!(
-        decode_command(r#""echo \"a b\"""#, Encoding::Wrapped),
-        r#"echo \"a b\""#
-    );
-}
-
 // Verbatim, again: a single quoted token is the command as written.
 
 #[test]
@@ -159,59 +139,6 @@ fn a_verbatim_single_token_keeps_its_quotes() {
         r#""C:\a b\p.exe""#
     );
     assert_eq!(decode_command(r#"--opt="a b""#, Encoding::Verbatim), r#"--opt="a b""#);
-}
-
-// Which non-PTY form sshd uses also depends on the DefaultShell path (`w32-doexec.c:308-318`,
-// `:370-371`).
-
-#[test]
-fn shell_kind_matches_sshds_substring_checks() {
-    for (path, kind) in [
-        (r"C:\Windows\System32\cmd.exe", ShellKind::Cmd),
-        (
-            r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
-            ShellKind::PowerShell,
-        ),
-        // Only the directory name matches.
-        (r"C:\Program Files\PowerShell\7\pwsh.exe", ShellKind::PowerShell),
-        (r"C:\tools\pwsh.exe", ShellKind::Other),
-        (r"C:\tools\ssh-shellhost.exe", ShellKind::ShellHost),
-        (r"C:\Program Files\Git\usr\bin\bash.exe", ShellKind::Bash),
-        (r"C:\cygwin64\bin\zsh.exe", ShellKind::Cygwin),
-        (r"C:\ProgramData\ssh-broker\ssh-broker.exe", ShellKind::Other),
-        ("", ShellKind::Other),
-    ] {
-        assert_eq!(shell_kind(path), kind, "{path}");
-    }
-}
-
-/// sshd lowercases the path and turns `/` into `\` before it looks (`pwd.c:113-114`).
-#[test]
-fn shell_kind_ignores_case_and_slash_direction() {
-    assert_eq!(shell_kind("C:/Windows/System32/CMD.EXE"), ShellKind::Cmd);
-    assert_eq!(shell_kind("c:/x/PowerShell.exe"), ShellKind::PowerShell);
-    assert_eq!(shell_kind("c:/x/Bash.exe"), ShellKind::Bash);
-}
-
-/// The first check that matches wins, in sshd's order.
-#[test]
-fn shell_kind_checks_in_sshds_order() {
-    assert_eq!(shell_kind(r"c:\cygwin\powershell.exe"), ShellKind::PowerShell);
-    assert_eq!(shell_kind(r"c:\windows\system32\cmd-powershell.exe"), ShellKind::Cmd);
-    assert_eq!(shell_kind(r"c:\bash\ssh-shellhost.exe"), ShellKind::ShellHost);
-    assert_eq!(shell_kind(r"c:\cygwin\bash.exe"), ShellKind::Bash);
-}
-
-/// cmd and ssh-shellhost get the wrapped form; PowerShell, bash and cygwin the escaped form; any
-/// other path follows the registry flag (`None` here).
-#[test]
-fn a_shell_kind_fixes_the_form_except_for_other_paths() {
-    assert_eq!(ShellKind::Cmd.encoding(), Some(Encoding::Wrapped));
-    assert_eq!(ShellKind::ShellHost.encoding(), Some(Encoding::Wrapped));
-    assert_eq!(ShellKind::PowerShell.encoding(), Some(Encoding::Escaped));
-    assert_eq!(ShellKind::Bash.encoding(), Some(Encoding::Escaped));
-    assert_eq!(ShellKind::Cygwin.encoding(), Some(Encoding::Escaped));
-    assert_eq!(ShellKind::Other.encoding(), None);
 }
 
 // Resolving a `-c` command =====
@@ -245,57 +172,32 @@ fn logged<T>(f: impl FnOnce() -> T) -> (String, T) {
     (log, result)
 }
 
-fn detected(encoding: Encoding, warning: Option<&str>) -> Detected {
-    Detected {
-        encoding,
-        warning: warning.map(str::to_string),
-    }
-}
-
 #[test]
-fn a_tail_is_decoded_by_the_detected_encoding() {
+fn a_tail_is_decoded_by_the_encoding() {
     let tail = || RawExec::Tail(r#""echo \"a b\"""#.into());
-    let (log, command) = logged(|| resolve_exec(tail(), || detected(Encoding::Escaped, None)));
+    let (log, command) = logged(|| resolve_exec(tail(), || Encoding::Escaped));
     assert_eq!(command, r#"echo "a b""#);
     assert_eq!(log, "", "nothing to report");
-    let (_, command) = logged(|| resolve_exec(tail(), || detected(Encoding::Verbatim, None)));
+    let (_, command) = logged(|| resolve_exec(tail(), || Encoding::Verbatim));
     assert_eq!(command, r#""echo \"a b\"""#);
-}
-
-/// Detection runs after the log is open, so the warning it returns is logged where it is used.
-#[test]
-fn the_detection_warning_is_logged() {
-    let (log, _) = logged(|| {
-        resolve_exec(RawExec::Tail("x".into()), || {
-            detected(Encoding::Escaped, Some("cannot read the setting"))
-        })
-    });
-    assert!(log.contains("WARN") && log.contains("cannot read the setting"), "{log}");
 }
 
 /// argv carried a `-c` the raw line did not show: the joined argv is the command, nothing is
 /// detected, and the log says the line was unexpected.
 #[test]
 fn an_argv_command_is_used_as_it_is_and_logged() {
-    let detect = || -> Detected { panic!("there is no encoding to detect for argv") };
+    let detect = || -> Encoding { panic!("there is no encoding to detect for argv") };
     let (log, command) = logged(|| resolve_exec(RawExec::Argv("a b c".into()), detect));
     assert_eq!(command, "a b c");
     assert!(log.contains("WARN") && log.contains("no `-c`"), "{log}");
 }
 
-/// A tail that the form's own rules say cannot occur: a wrapped command with no quotes around it,
-/// or an escaped one that opens a quote and never closes it. The tail is decoded as far as it
-/// goes and the log says so; a debug build also asserts.
+/// A tail that the form's own rules say cannot occur: an escaped one that opens a quote and never
+/// closes it. The tail is decoded as far as it goes and the log says so; a debug build also
+/// asserts.
 #[test]
 fn a_tail_that_does_not_fit_its_form_is_logged() {
-    for (tail, encoding) in [
-        ("abc", Encoding::Wrapped),
-        (r#""abc"#, Encoding::Wrapped),
-        (r#"abc""#, Encoding::Wrapped),
-        (r#"""#, Encoding::Wrapped),
-        (r#""abc"#, Encoding::Escaped),
-        (r#"""#, Encoding::Escaped),
-    ] {
+    for (tail, encoding) in [(r#""abc"#, Encoding::Escaped), (r#"""#, Encoding::Escaped)] {
         let (log, result) = logged(|| catch_unwind(AssertUnwindSafe(|| decode_command(tail, encoding))));
         assert!(
             log.contains("WARN") && log.contains("does not fit"),
@@ -312,10 +214,8 @@ fn a_tail_that_does_not_fit_its_form_is_logged() {
 #[test]
 fn a_tail_that_fits_its_form_is_not_logged() {
     for (tail, encoding) in [
-        ("", Encoding::Wrapped),
         ("", Encoding::Escaped),
         ("", Encoding::Verbatim),
-        (r#""""#, Encoding::Wrapped),
         (r#""""#, Encoding::Escaped),
         ("abc", Encoding::Escaped),
         (r#"a\"b"#, Encoding::Escaped),

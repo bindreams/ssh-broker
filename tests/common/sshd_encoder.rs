@@ -81,10 +81,15 @@ pub fn escaped_argument(command: &str) -> String {
     escape_arg(&build_exec_command(command))
 }
 
-/// The line sshd builds without a PTY and with `DefaultShellEscapeArguments=0`:
-/// `sprintf("%s %s \"%s\"", shell, option, exec_command)` (`w32-doexec.c:399-400`).
-pub fn wrapped_line(shell: &str, command: &str) -> String {
-    format!("\"{shell}\" -c \"{}\"", build_exec_command(command))
+/// Whether sshd consults `DefaultShellEscapeArguments` for this `DefaultShell` path
+/// (`w32-doexec.c:308-318`, `:370-371`): only when none of the substrings it looks for is in the
+/// path, which sshd has lowercased and turned `/` into `\` (`pwd.c:113-114`). Otherwise the path
+/// alone fixes the form.
+pub fn flag_decides_form(shell: &str) -> bool {
+    let path = shell.replace('/', "\\").to_ascii_lowercase();
+    ["system32\\cmd", "powershell", "ssh-shellhost", "\\bash", "cygwin"]
+        .iter()
+        .all(|special| !path.contains(special))
 }
 
 // conhost =====

@@ -1,4 +1,4 @@
-//! provision: self-install (`apply`) and self-check (`verify`) — DefaultShell pair, the
+//! provision: self-install (`apply`) and self-check (`verify`) — the DefaultShell values, the
 //! session-1 agent logon task, the ONSTART self-heal task, the socket dir + ACL, and parity
 //! probes (DPAPI/symlink/session) run THROUGH the agent.
 //!
@@ -99,13 +99,19 @@ mod imp {
         register_agent_task(&layout, &exe, &user)?;
         register_selfheal_task(&exe, &user)?;
 
-        // 3. Flip the DefaultShell pair LAST and only to the validated canonical path; read back.
+        // 3. Write the escape flag, then flip the DefaultShell pair LAST and only to the validated
+        //    canonical path; read back. sshd reads these once per session, so the shim cannot ask
+        //    later which form sshd used: `apply` owns the flag (see `registry::desired_values`).
         registry::set_default_shell_under(registry::OPENSSH_KEY, &exe.to_string_lossy())
-            .context("write DefaultShell pair")?;
+            .context("write the DefaultShell values")?;
         let (shell, opt) = registry::read_default_shell_under(registry::OPENSSH_KEY)?;
         anyhow::ensure!(
             eq_path(&shell, &exe) && opt == "-c",
             "DefaultShell read-back mismatch (shell={shell:?}, opt={opt:?})"
+        );
+        anyhow::ensure!(
+            registry::escape_arguments_under(registry::OPENSSH_KEY).context("read back DefaultShellEscapeArguments")?,
+            "DefaultShellEscapeArguments read-back mismatch: sshd would not escape the command"
         );
 
         // 4. Start the agent now so no re-login is needed (the logon trigger covers the rest).
@@ -208,6 +214,12 @@ mod imp {
         // can write to it).
         let base = layout::check_base(&layout);
         rows.push(layout::install_dir_row(&base));
+
+        // Local: sshd escapes the command, the only non-PTY form the shim decodes. sshd reads the
+        // value once per session, so this is the one place it is checked.
+        rows.push(registry::escape_arguments_check(registry::escape_arguments_under(
+            registry::OPENSSH_KEY,
+        )));
 
         // Local: the socket dir ACL verifies for the configured account (== the agent's grantee).
         rows.push(layout::socket_dir_row(&base));
