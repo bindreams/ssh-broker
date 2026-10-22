@@ -11,7 +11,6 @@ on:
         type: string
 
 concurrency:
-  # Keyed on the raw input; see draft-release.yaml.
   group: publish-release-${{ inputs.version }}
   cancel-in-progress: false
 
@@ -30,17 +29,6 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
     steps:
-      # The attested source ref is the ref this workflow runs from, and the attestation checks
-      # below require `refs/heads/main`. `workflow_dispatch` accepts --ref, so it is enforced here.
-      - name: Verify the workflow runs from main
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [ "$GITHUB_REF" != "refs/heads/main" ]; then
-            echo "::error::Publish Release must be dispatched from main, not $GITHUB_REF"
-            exit 1
-          fi
-
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           # Full history so the ancestry check can resolve origin/main.
@@ -56,7 +44,7 @@ jobs:
           V="$(bash .github/scripts/normalize-version.sh "$INPUT_VERSION")"
           echo "version=$V" >> "$GITHUB_OUTPUT"
           echo "tag=v${V}" >> "$GITHUB_OUTPUT"
-          echo "zip=ssh-broker-${V}-x86_64-pc-windows-msvc.zip" >> "$GITHUB_OUTPUT"
+          echo "zip=$(bash .github/scripts/asset-name.sh "$V")" >> "$GITHUB_OUTPUT"
 
       - name: Verify draft release exists and resolve commit SHA
         id: release
@@ -86,30 +74,11 @@ jobs:
 
       # A draft is only trustworthy if it was built from merged code: a valid attestation alone
       # also covers a pull-request build, or an older zip renamed to this version.
-      - name: Verify the draft's commit is on main
+      - name: Verify the workflow runs from main and the draft's commit is on main
         env:
           SHA: ${{ steps.release.outputs.commit_sha }}
         shell: bash
-        run: |
-          set -euo pipefail
-          git fetch --quiet origin main
-
-          set +e
-          git merge-base --is-ancestor "$SHA" origin/main
-          STATUS=$?
-          set -e
-
-          case "$STATUS" in
-            0) echo "$SHA is an ancestor of origin/main" ;;
-            1)
-              echo "::error::$SHA is not an ancestor of origin/main. Release only from merged commits."
-              exit 1
-              ;;
-            *)
-              echo "::error::git merge-base failed (exit $STATUS); cannot confirm $SHA is on main"
-              exit 1
-              ;;
-          esac
+        run: bash .github/scripts/assert-ancestor-of-main.sh "$SHA"
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -127,7 +96,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          MANIFEST="$(cargo metadata --no-deps --locked --format-version 1 | jq -r '.packages[0].version')"
+          MANIFEST="$(bash "$GITHUB_WORKSPACE/.github/scripts/manifest-version.sh")"
           if [ "$MANIFEST" != "$VERSION" ]; then
             echo "::error::The draft's commit declares $MANIFEST but this dispatch asked for $VERSION"
             exit 1
@@ -173,14 +142,12 @@ jobs:
         run: |
           set -euo pipefail
 
-          # One last check immediately before the action that creates the tag: the draft creates
-          # no tag, so this is safe on every reachable path, and it turns a race into an early,
-          # explicit refusal instead of a mis-binding caught only by the read-back below.
+          # Refuse early if a tag appeared since the draft (a draft creates none).
           bash .github/scripts/assert-tag-absent.sh "$TAG"
 
           # Replace the draft's assets with the bytes verified above, in case they changed since.
           # GitHub has no compare-and-swap, so a swap in the window between this upload and the
-          # edit is not prevented; the published asset is re-verified below to detect it.
+          # edit is not prevented.
           gh release upload "$TAG" "draft/${ZIP}" "draft/${ZIP}.sha256" --clobber
 
           # Assets added after the download check above would be published too: delete any other
@@ -198,7 +165,7 @@ jobs:
           # observable. `targetCommitish` is NOT usable for this: GitHub never recomputes it when
           # a draft is published, so it would echo $SHA back and the guard would never fire.
           # Resolve the tag itself.
-          if ! PUBLISHED="$(gh api -X GET "repos/${GH_REPO}/commits/${TAG}" --jq '.sha')"; then
+          if ! PUBLISHED="$(gh api -X GET "repos/${GH_REPO}/commits/tags/${TAG}" --jq '.sha')"; then
             echo "::error::Could not resolve tag $TAG after publishing."
             echo "::error::The release is published. Verify by hand that $TAG points at $SHA."
             exit 1

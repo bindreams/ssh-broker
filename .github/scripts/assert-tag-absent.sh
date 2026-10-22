@@ -10,7 +10,7 @@ set -euo pipefail
 tag="${1:?tag required}"
 
 status=0
-git ls-remote --exit-code --tags origin "refs/tags/${tag}" >/dev/null 2>&1 || status=$?
+errors="$(git ls-remote --exit-code --tags origin "refs/tags/${tag}" 2>&1 >/dev/null)" || status=$?
 
 case "$status" in
     0)
@@ -21,7 +21,7 @@ case "$status" in
         echo "no existing tag ${tag}"
         ;;
     *)
-        echo "::error::git ls-remote failed (exit ${status}); cannot confirm ${tag} is absent"
+        echo "::error::git ls-remote failed (exit ${status}); cannot confirm ${tag} is absent: ${errors}"
         exit 1
         ;;
 esac

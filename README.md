@@ -46,7 +46,9 @@ The two halves talk over an AF_UNIX socket whose directory grants Full Control t
 Releases carry `ssh-broker-<version>-x86_64-pc-windows-msvc.zip` (`ssh-broker.exe` and the license) and a `.sha256` file, with a build attestation on the zip. Verify before installing:
 
 ```sh
-gh attestation verify ssh-broker-<version>-x86_64-pc-windows-msvc.zip -R bindreams/ssh-broker
+gh attestation verify ssh-broker-<version>-x86_64-pc-windows-msvc.zip -R bindreams/ssh-broker \
+    --signer-workflow bindreams/ssh-broker/.github/workflows/release-asset.yaml \
+    --source-ref refs/heads/main
 sha256sum -c ssh-broker-<version>-x86_64-pc-windows-msvc.zip.sha256
 ```
 

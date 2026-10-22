@@ -9,17 +9,22 @@ on:
         description: "Version the caller expects; must equal Cargo.toml's"
         required: false
         type: string
+    outputs:
+      zip:
+        description: Name of the archive in the `release-asset` artifact
+        value: ${{ jobs.package.outputs.zip }}
   pull_request:
     paths:
       - .github/workflows/release-asset.yaml
       - .github/scripts/**
+      - src/**
       - Cargo.toml
       - Cargo.lock
       - rust-toolchain.toml
+      - LICENSE.md
 
 env:
   CARGO_TERM_COLOR: always
-  TRIPLE: x86_64-pc-windows-msvc
 
 jobs:
   package:
@@ -28,14 +33,20 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: read
-      # Both are needed by the attestation step. Declaring any `permissions:` block sets every
-      # unlisted scope to `none`.
+      # Needed by the attestation step.
       id-token: write
       attestations: write
     outputs:
       version: ${{ steps.version.outputs.version }}
+      zip: ${{ steps.version.outputs.zip }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Resolve the target triple
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "TRIPLE=$(bash .github/scripts/asset-name.sh --triple)" >> "$GITHUB_ENV"
 
       - name: Install pinned toolchain
         run: rustup toolchain install
@@ -59,12 +70,13 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          manifest="$(cargo metadata --no-deps --locked --format-version 1 | jq -r '.packages[0].version' | tr -d '\r')"
+          manifest="$(bash .github/scripts/manifest-version.sh)"
           if [[ -n "$INPUT_VERSION" && "$INPUT_VERSION" != "$manifest" ]]; then
               echo "::error::Cargo.toml declares $manifest but the caller asked for $INPUT_VERSION"
               exit 1
           fi
           echo "version=$manifest" >> "$GITHUB_OUTPUT"
+          echo "zip=$(bash .github/scripts/asset-name.sh "$manifest")" >> "$GITHUB_OUTPUT"
 
       # `+crt-static`: the exe is sshd's DefaultShell, and a fresh guest has no VC++
       # redistributable. `--target` keeps the flag off build scripts and proc macros.
@@ -87,22 +99,21 @@ jobs:
 
       - name: Zip
         env:
-          VERSION: ${{ steps.version.outputs.version }}
+          ZIP: ${{ steps.version.outputs.zip }}
         shell: pwsh
-        run: Compress-Archive -Path stage/ssh-broker.exe, stage/LICENSE.md -DestinationPath "dist/ssh-broker-$env:VERSION-$env:TRIPLE.zip"
+        run: Compress-Archive -Path stage/ssh-broker.exe, stage/LICENSE.md -DestinationPath "dist/$env:ZIP"
 
       # `<hex>  <name>`, the form `sha256sum -c` takes. Spelled out because Git for Windows'
       # `sha256sum` marks binary-mode entries with `*`.
       - name: Hash
         env:
-          VERSION: ${{ steps.version.outputs.version }}
+          ZIP: ${{ steps.version.outputs.zip }}
         shell: bash
         run: |
           set -euo pipefail
-          zip="ssh-broker-${VERSION}-${TRIPLE}.zip"
-          hash="$(sha256sum "dist/${zip}" | cut -d ' ' -f 1)"
-          printf '%s  %s\n' "$hash" "$zip" > "dist/${zip}.sha256"
-          cat "dist/${zip}.sha256"
+          hash="$(sha256sum "dist/${ZIP}" | cut -d ' ' -f 1)"
+          printf '%s  %s\n' "$hash" "$ZIP" > "dist/${ZIP}.sha256"
+          cat "dist/${ZIP}.sha256"
 
       # A pull request from a fork gets a read-only token with no OIDC, so it cannot attest. It
       # still builds, runs the import gate and packages; only the attestation is skipped.
@@ -128,7 +139,7 @@ jobs:
       contents: read
     env:
       GH_TOKEN: ${{ github.token }}
-      VERSION: ${{ needs.package.outputs.version }}
+      ZIP: ${{ needs.package.outputs.zip }}
     steps:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
@@ -139,8 +150,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          zip="ssh-broker-${VERSION}-x86_64-pc-windows-msvc.zip"
-          want_files="$(printf '%s\n' "$zip" "$zip.sha256" | sort)"
+          want_files="$(printf '%s\n' "$ZIP" "$ZIP.sha256" | sort)"
           got_files="$(ls dist | sort)"
           if [[ "$got_files" != "$want_files" ]]; then
               echo "::error::artifact files are not exactly the expected pair"
@@ -148,7 +158,7 @@ jobs:
               exit 1
           fi
           want_members="$(printf '%s\n' LICENSE.md ssh-broker.exe)"
-          got_members="$(unzip -Z1 "dist/${zip}" | sort)"
+          got_members="$(unzip -Z1 "dist/${ZIP}" | sort)"
           if [[ "$got_members" != "$want_members" ]]; then
               echo "::error::archive members are not exactly ssh-broker.exe and LICENSE.md"
               echo "got:"; echo "$got_members"
@@ -159,13 +169,12 @@ jobs:
         shell: bash
         run: cd dist && sha256sum -c ./*.sha256
 
-      # Nothing to verify for a fork pull request: see "Attest build provenance".
       - name: Verify the attestation
         if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
         shell: bash
         run: |
           set -euo pipefail
-          gh attestation verify "dist/ssh-broker-${VERSION}-x86_64-pc-windows-msvc.zip" \
+          gh attestation verify "dist/${ZIP}" \
               -R "$GITHUB_REPOSITORY" \
               --signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/release-asset.yaml" \
               --source-digest "$GITHUB_SHA"

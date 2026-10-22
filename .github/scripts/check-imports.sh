@@ -12,16 +12,21 @@
 # reading an executable; it prints the names that are not allowed and exits 1 if there are any.
 set -euo pipefail
 
-# API sets resolve to the OS's own implementation, whatever Windows version is installed.
-# `api-ms-win-crt-*` is the UCRT's API set and is deliberately absent: `+crt-static` removes it.
-allowed_patterns='^(api-ms-win-core-|ext-ms-)'
+# Baseline `api-ms-win-core-*` API sets resolve to the OS's own implementation, and are listed
+# one by one. The `ext-ms-*` extension sets are not guaranteed on every Windows edition, so none
+# is allowed. `ucrtbase`, `api-ms-win-crt-*` and the VC runtime are absent on purpose:
+# `+crt-static` removes them.
+allowed_names='api-ms-win-core-synch-l1-2-0|api-ms-win-core-winrt-error-l1-1-0|kernel32|kernelbase|ntdll|advapi32|ws2_32|crypt32|oleaut32|user32|ole32|shell32|bcrypt|secur32|userenv|wtsapi32|netapi32|shlwapi|rpcrt4|sspicli|ncrypt|iphlpapi|gdi32'
 
-# OS-shipped System32 DLLs. `ucrtbase` and the VC runtime are deliberately absent.
-allowed_names='kernel32|kernelbase|ntdll|advapi32|ws2_32|crypt32|oleaut32|user32|ole32|shell32|bcrypt|secur32|userenv|wtsapi32|netapi32|shlwapi|rpcrt4|sspicli|ncrypt|iphlpapi|gdi32'
-
-# Print the names on stdin that are not allowed.
+# Print the names on stdin that are not allowed. `grep` exits 1 when it selects nothing,
+# which is the good case; any other non-zero exit is a failure.
 disallowed() {
-    grep -ivE "${allowed_patterns}|^(${allowed_names})\.dll\$" || true
+    local status=0
+    grep -ivE "^(${allowed_names})\.dll\$" || status=$?
+    if [[ "$status" -gt 1 ]]; then
+        echo "::error::grep failed (exit ${status}) while classifying imports" >&2
+        return "$status"
+    fi
 }
 
 if [[ "${1:-}" == "--names" ]]; then
@@ -36,26 +41,58 @@ fi
 exe="${1:?path to the executable required}"
 
 vswhere='C:/Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe'
-dumpbin="$("$vswhere" -latest -products '*' \
+if [[ ! -f "$vswhere" ]]; then
+    echo "::error::vswhere.exe not found at ${vswhere}" >&2
+    exit 1
+fi
+
+status=0
+found="$("$vswhere" -latest -products '*' \
     -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 \
-    -find 'VC/Tools/MSVC/**/bin/Hostx64/x64/dumpbin.exe' | head -n 1 | tr -d '\r')"
+    -find 'VC/Tools/MSVC/**/bin/Hostx64/x64/dumpbin.exe')" || status=$?
+if [[ "$status" -ne 0 ]]; then
+    echo "::error::vswhere.exe failed (exit ${status}) while looking for dumpbin.exe" >&2
+    exit 1
+fi
+dumpbin="$(head -n 1 <<<"$found" | tr -d '\r')"
 if [[ -z "$dumpbin" ]]; then
     echo "::error::dumpbin.exe not found through vswhere" >&2
     exit 1
 fi
 
-# Both the load-time and the delay-load dependencies are listed as indented `NAME.dll` lines.
-dlls="$("$dumpbin" -nologo -dependents "$exe" | tr -d '\r' | grep -iE '^[[:space:]]+[^[:space:]]+\.dll[[:space:]]*$' | tr -d ' \t')"
-if [[ -z "$dlls" ]]; then
-    echo "::error::no imports parsed from dumpbin output for $exe" >&2
+status=0
+listing="$("$dumpbin" -nologo -dependents "$exe" 2>&1)" || status=$?
+if [[ "$status" -ne 0 ]]; then
+    echo "::error::dumpbin failed (exit ${status}) on ${exe}: ${listing}" >&2
     exit 1
 fi
 
-echo "imports of $exe:"
+# Both the load-time and the delay-load dependencies are listed as indented `NAME.dll` lines.
+status=0
+dlls="$(tr -d '\r' <<<"$listing" | grep -iE '^[[:space:]]+[^[:space:]]+\.dll[[:space:]]*$' | tr -d ' \t')" || status=$?
+if [[ "$status" -gt 1 ]]; then
+    echo "::error::grep failed (exit ${status}) while parsing the dumpbin output for ${exe}" >&2
+    exit 1
+fi
+if [[ -z "$dlls" ]]; then
+    echo "::error::no imports parsed from dumpbin output for ${exe}" >&2
+    exit 1
+fi
+
+echo "imports of ${exe}:"
 echo "$dlls"
 
-if ! bad="$(bash "$0" --names <<<"$dlls")"; then
-    echo "::error::$exe imports DLLs that are not on the allowlist of OS-shipped DLLs; a fresh Windows guest may not have them:" >&2
-    echo "$bad" >&2
-    exit 1
-fi
+status=0
+bad="$(bash "$0" --names <<<"$dlls")" || status=$?
+case "$status" in
+    0) ;;
+    1)
+        echo "::error::${exe} imports DLLs that are not on the allowlist of OS-shipped DLLs; a fresh Windows guest may not have them:" >&2
+        echo "$bad" >&2
+        exit 1
+        ;;
+    *)
+        echo "::error::classifying the imports of ${exe} failed (exit ${status})" >&2
+        exit 1
+        ;;
+esac

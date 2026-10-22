@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
-# Echo a bare MAJOR.MINOR.PATCH from a dispatch input, stripping one optional
-# leading `v`. Exits non-zero on anything else, including a leading zero in any
-# component: `v01.2.3` and `v1.2.3` are different git tags.
+# Echo `$1` if it is a bare MAJOR.MINOR.PATCH, otherwise exit non-zero. A leading `v` is
+# rejected, not stripped: the workflows key their concurrency group on the raw input, so
+# `0.1.0` and `v0.1.0` must not both name the tag `v0.1.0`. A leading zero in any component is
+# rejected too: `1.02.3` and `1.2.3` are different git tags.
 set -euo pipefail
 
 input="${1-}"
-version="${input#v}"
 
-if [[ ! "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
-    echo "::error::Invalid version: '${input}'" >&2
+if [[ ! "$input" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+    echo "::error::Invalid version: '${input}'. Pass MAJOR.MINOR.PATCH without a leading 'v'." >&2
     exit 1
 fi
 
-printf '%s\n' "$version"
+printf '%s\n' "$input"
