@@ -125,9 +125,10 @@ fn handle_connection_with(conn: socket2::Socket, hooks: Hooks) -> anyhow::Result
 }
 
 /// An empty or whitespace-only EXEC command runs nothing and exits 0 with no output, as the
-/// shell does for `-c ""`; `CreateProcessW` would fail on it. Ends as `handle_exec` does: EXIT,
-/// close, then read the peer's remaining frames until it is gone, so closing with unread input
-/// cannot reset the connection before the client has the EXIT frame.
+/// shell does for `-c ""`; `CreateProcessW` would fail on it. Sends EXIT, then FINs only the
+/// write half and reads the peer's remaining frames until it is gone. Shutting down the read
+/// side too would end the drain at once and close the socket with unread client stdin, which
+/// resets the connection and loses the EXIT frame.
 #[cfg(windows)]
 fn handle_blank_exec(mut rx: ConnRx, mut fr: FrameReader, mut tx: ConnTx) -> anyhow::Result<()> {
     struct Discard;
@@ -137,7 +138,7 @@ fn handle_blank_exec(mut rx: ConnRx, mut fr: FrameReader, mut tx: ConnTx) -> any
         }
     }
     write_frame(&mut tx, FrameKind::Exit, &ExitCode(0).encode())?;
-    let _ = tx.shutdown_both();
+    let _ = tx.shutdown_write();
     pump_until_peer_gone(&mut rx, &mut fr, &mut Discard);
     Ok(())
 }

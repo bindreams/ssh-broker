@@ -873,6 +873,10 @@ fn teardown_warns_only_when_the_reap_failed() {
 /// An empty or whitespace-only exec runs nothing and exits 0 with no output, as the shell does
 /// for `-c ""`; without the check it reaches `CreateProcessW("")`, fails to spawn, and the
 /// handler errors with no EXIT frame, which the shim reports as 255.
+///
+/// The client streams stdin concurrently with reading, as the shim does, so the agent closes
+/// with unread input in flight: closing the read side too early resets the connection and the
+/// client loses the EXIT frame. Looped because the reset is a race.
 #[test]
 fn agent_exec_of_a_blank_command_runs_nothing_and_exits_zero() {
     let dir = hardened_dir("blank-exec");
@@ -880,31 +884,47 @@ fn agent_exec_of_a_blank_command_runs_nothing_and_exits_zero() {
     let listener = Listener::bind(&sock).unwrap();
 
     for blank in ["", "   ", "\t \r\n"] {
-        let client_path = sock.clone();
-        let command = blank.to_string();
-        let client = thread::spawn(move || {
-            let conn = afunix::connect(&client_path).unwrap();
-            let (mut crx, mut ctx) = afunix::split(conn).unwrap();
-            let hs = Handshake {
-                mode: Mode::Exec,
-                command: Some(command),
-                ..Handshake::pty_default()
-            };
-            write_frame(&mut ctx, FrameKind::Handshake, &hs.encode().unwrap()).unwrap();
-            // As the shim does: stdin-EOF marker, socket kept open for EXIT.
-            let _ = write_data(&mut ctx, Stream::Stdin, b"");
-            let mut fr = FrameReader::new();
-            let mut sink = TestSink::default();
-            let outcome = pump_decode(&mut crx, &mut fr, &mut sink).unwrap();
-            (outcome, sink.stdout, sink.stderr)
-        });
+        for stdin_len in [0usize, 1, 100 * 1024] {
+            for round in 0..10 {
+                let client_path = sock.clone();
+                let command = blank.to_string();
+                let client = thread::spawn(move || {
+                    let conn = afunix::connect(&client_path).unwrap();
+                    let (mut crx, mut ctx) = afunix::split(conn).unwrap();
+                    let hs = Handshake {
+                        mode: Mode::Exec,
+                        command: Some(command),
+                        ..Handshake::pty_default()
+                    };
+                    write_frame(&mut ctx, FrameKind::Handshake, &hs.encode().unwrap()).unwrap();
+                    // As the shim does: stdin streams from its own thread, then the EOF marker;
+                    // the socket stays open for EXIT. The agent may close first, so write errors
+                    // are expected and ignored.
+                    let writer = thread::spawn(move || {
+                        let stdin = vec![b'x'; stdin_len];
+                        for chunk in stdin.chunks(8 * 1024) {
+                            if write_data(&mut ctx, Stream::Stdin, chunk).is_err() {
+                                return;
+                            }
+                        }
+                        let _ = write_data(&mut ctx, Stream::Stdin, b"");
+                    });
+                    let mut fr = FrameReader::new();
+                    let mut sink = TestSink::default();
+                    let outcome = pump_decode(&mut crx, &mut fr, &mut sink);
+                    writer.join().unwrap();
+                    (outcome, sink.stdout, sink.stderr)
+                });
 
-        let conn = listener.accept().unwrap();
-        super::handle_connection(conn).unwrap();
+                let conn = listener.accept().unwrap();
+                super::handle_connection(conn).unwrap();
 
-        let (outcome, stdout, stderr) = client.join().unwrap();
-        assert_eq!(outcome, Outcome::Exited(0), "{blank:?}");
-        assert!(stdout.is_empty() && stderr.is_empty(), "{blank:?} produced output");
+                let (outcome, stdout, stderr) = client.join().unwrap();
+                let ctx = format!("{blank:?}, {stdin_len} bytes of stdin, round {round}");
+                assert_eq!(outcome.expect(&ctx), Outcome::Exited(0), "{ctx}");
+                assert!(stdout.is_empty() && stderr.is_empty(), "{ctx} produced output");
+            }
+        }
     }
     std::fs::remove_dir_all(&dir).ok();
 }
