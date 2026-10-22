@@ -416,9 +416,24 @@ fn close_handle(raw: isize) {
     }
 }
 
+/// Queue input the command will never drain, so the agent's input pump parks in its bounded
+/// queue and stops reading the socket. Sizes as in
+/// `exec_disconnect_is_noticed_while_the_input_pump_is_blocked_on_stdin`: one chunk larger than
+/// the pipe buffer stalls the writer thread, then enough one-byte frames overfill the queue. The
+/// total stays a few KiB, so the client's own socket writes never block.
+fn flood_input(ctx: &mut impl std::io::Write, stream: Stream) {
+    write_data(ctx, stream, &vec![b'x'; 64 * 1024]).unwrap();
+    for _ in 0..64 {
+        write_data(ctx, stream, b"x").unwrap();
+    }
+}
+
 /// Drive one relayed command to its marker, pin the grandchild, then end the session the way
 /// `ending` says and hand back the pinned handle.
-fn run_tree_session(tag: &str, mode: Mode, inherit_stdio: bool, ending: Ending) -> isize {
+///
+/// `flood` sends [`flood_input`] just before a disconnect, so the session ends with the input
+/// pump parked.
+fn run_tree_session(tag: &str, mode: Mode, inherit_stdio: bool, ending: Ending, flood: bool) -> isize {
     let dir = hardened_dir(tag);
     let sock = dir.join("s");
     let pidfile = dir.join("grandchild.pid");
@@ -448,6 +463,9 @@ fn run_tree_session(tag: &str, mode: Mode, inherit_stdio: bool, ending: Ending) 
         tx_h.send(open_grandchild(&pidfile)).unwrap();
         match ending {
             Ending::Disconnect => {
+                if flood {
+                    flood_input(&mut ctx, if mode == Mode::Pty { Stream::Pty } else { Stream::Stdin });
+                }
                 let _ = ctx.shutdown_both();
             }
             Ending::NormalExit => {
@@ -497,7 +515,7 @@ fn assert_exits(raw: isize, who: &str) {
 /// descendants running with no session left to reach them.
 #[test]
 fn exec_disconnect_kills_the_whole_process_tree() {
-    let raw = run_tree_session("tree-exec-disc", Mode::Exec, false, Ending::Disconnect);
+    let raw = run_tree_session("tree-exec-disc", Mode::Exec, false, Ending::Disconnect, false);
     assert_exits(raw, "the grandchild after an EXEC disconnect");
 }
 
@@ -507,7 +525,7 @@ fn exec_disconnect_kills_the_whole_process_tree() {
 /// getting teardown wrong hangs the session instead of merely leaking a process.
 #[test]
 fn exec_disconnect_reaps_a_descendant_holding_stdout() {
-    let raw = run_tree_session("tree-exec-inherit", Mode::Exec, true, Ending::Disconnect);
+    let raw = run_tree_session("tree-exec-inherit", Mode::Exec, true, Ending::Disconnect, false);
     assert_exits(raw, "the stdout-holding grandchild after an EXEC disconnect");
 }
 
@@ -515,14 +533,14 @@ fn exec_disconnect_reaps_a_descendant_holding_stdout() {
 /// rather than to a plain stdout pipe.
 #[test]
 fn pty_disconnect_reaps_a_descendant_holding_the_pseudoconsole() {
-    let raw = run_tree_session("tree-pty-inherit", Mode::Pty, true, Ending::Disconnect);
+    let raw = run_tree_session("tree-pty-inherit", Mode::Pty, true, Ending::Disconnect, false);
     assert_exits(raw, "the pty-holding grandchild after a PTY disconnect");
 }
 
 /// The PTY path reaps at its own teardown site, separately from EXEC.
 #[test]
 fn pty_disconnect_kills_the_whole_process_tree() {
-    let raw = run_tree_session("tree-pty-disc", Mode::Pty, false, Ending::Disconnect);
+    let raw = run_tree_session("tree-pty-disc", Mode::Pty, false, Ending::Disconnect, false);
     assert_exits(raw, "the grandchild after a PTY disconnect");
 }
 
@@ -535,15 +553,40 @@ fn pty_disconnect_kills_the_whole_process_tree() {
 /// inherited-pipe case is covered by `exec_disconnect_reaps_a_descendant_holding_stdout`.
 #[test]
 fn exec_normal_exit_reaps_descendants_like_windows_sshd() {
-    let raw = run_tree_session("tree-exec-exit", Mode::Exec, false, Ending::NormalExit);
+    let raw = run_tree_session("tree-exec-exit", Mode::Exec, false, Ending::NormalExit, false);
     assert_exits(raw, "the grandchild after a normal EXEC exit");
 }
 
 /// Same, at the PTY teardown site.
 #[test]
 fn pty_normal_exit_reaps_descendants_like_windows_sshd() {
-    let raw = run_tree_session("tree-pty-exit", Mode::Pty, false, Ending::NormalExit);
+    let raw = run_tree_session("tree-pty-exit", Mode::Pty, false, Ending::NormalExit, false);
     assert_exits(raw, "the grandchild after a normal PTY exit");
+}
+
+/// A disconnect must be noticed when the command is SILENT as well as stuck on its input.
+///
+/// The sibling `exec_disconnect_is_noticed_while_the_input_pump_is_blocked_on_stdin` only passes
+/// because its command keeps printing: the output pumps attempt a socket write, fail, and reap. A
+/// command that reads nothing, writes nothing and never exits gives them nothing to fail on, and
+/// with the input pump parked in the bounded queue no thread is left reading the socket. Nothing
+/// then sees the FIN. The pinned grandchild must die too, so the whole tree is torn down rather
+/// than the handler merely freed. A regression hangs here rather than failing.
+#[test]
+fn exec_disconnect_with_a_parked_input_pump_reaps_the_tree_of_a_silent_command() {
+    let raw = run_tree_session("tree-exec-flood", Mode::Exec, false, Ending::Disconnect, true);
+    assert_exits(
+        raw,
+        "the grandchild after an EXEC disconnect with the input pump parked",
+    );
+}
+
+/// The same on the PTY path, which shares `HandleWriter`. May already pass if ConPTY's input never
+/// blocks; it then stays as the pin for the class.
+#[test]
+fn pty_disconnect_with_a_parked_input_pump_reaps_the_tree_of_a_silent_command() {
+    let raw = run_tree_session("tree-pty-flood", Mode::Pty, false, Ending::Disconnect, true);
+    assert_exits(raw, "the grandchild after a PTY disconnect with the input pump parked");
 }
 
 /// The teardown warning fires exactly when the reap failed.
