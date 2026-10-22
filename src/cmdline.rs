@@ -2,7 +2,8 @@
 //!
 //! `std::env::args` has already split and unquoted the command line, which loses the exact
 //! command sshd sent: see [`decode_command`] for the three forms it arrives in, and
-//! [`detect`] for how the shim tells them apart.
+//! [`detect`] for how the shim tells them apart. [`resolve_exec`] is the step from what
+//! `route` finds to the command.
 
 #[cfg(not(windows))]
 mod other;
@@ -12,7 +13,35 @@ mod windows;
 #[cfg(not(windows))]
 pub use other::{current, detect};
 #[cfg(windows)]
-pub use windows::{current, detect, detect_piped};
+pub use windows::{current, detect};
+
+/// The `-c` command as `route` found it, before sshd's encoding is undone ([`resolve_exec`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RawExec {
+    /// The text after `-c` in the raw command line, as written.
+    Tail(String),
+    /// argv joined with spaces: the raw line did not show the `-c` argv reported.
+    Argv(String),
+}
+
+/// The command `exec` carries. A tail is decoded by the form [`detect`] reports, called here
+/// rather than at startup because it reads the registry and the console and only a `-c` session
+/// needs it; its warning is logged, so the caller opens the log first.
+pub fn resolve_exec(exec: RawExec, detect: impl FnOnce() -> Detected) -> String {
+    match exec {
+        RawExec::Tail(tail) => {
+            let Detected { encoding, warning } = detect();
+            if let Some(warning) = warning {
+                tracing::warn!("{warning}");
+            }
+            decode_command(&tail, encoding)
+        }
+        RawExec::Argv(command) => {
+            tracing::warn!("the raw command line has no `-c` although argv does; running the joined argv");
+            command
+        }
+    }
+}
 
 /// What [`detect`] found: how sshd encoded the command line, and, when that rests on an assumption,
 /// what to log once logging is up (detection runs before the log is opened).
@@ -25,7 +54,11 @@ pub struct Detected {
 /// How sshd built the `DefaultShell` command line; see [`decode_command`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Encoding {
-    /// A PTY session: the command is appended as written.
+    /// A PTY session. sshd appends the command to the shim's line as written, but starts the
+    /// shell as `conhost.exe --headless ... -- <line>`, and conhost splits that line into
+    /// arguments and escapes each one again. The shim receives the command conhost rebuilt, not
+    /// the one the client typed (runs of spaces between arguments become one, quotes around
+    /// an argument with no space are dropped) and relays it as received.
     Verbatim,
     /// No PTY, `DefaultShellEscapeArguments` on (the default): the command is one escaped argument.
     Escaped,
@@ -160,10 +193,11 @@ pub fn dash_c_tail(line: &str) -> Option<&str> {
 /// The command a `-c` tail carries, as `encoding` says sshd wrote it; `None` when there is none.
 ///
 /// Win32-OpenSSH builds the `DefaultShell` command line in three ways (`w32-doexec.c` and
-/// `misc.c` at commit 274893f), and each has its own inverse:
+/// `misc.c`), and each has its own inverse:
 ///
 /// - [`Encoding::Verbatim`], a PTY session (`ssh -t host cmd`): the command is appended to
-///   `"shim" -c ` as written, so the tail is the command.
+///   `"shim" -c ` as written and conhost then rewrites the line, so the tail is the command in
+///   conhost's form, relayed as received.
 /// - [`Encoding::Escaped`], no PTY: the command is one argument. sshd wraps it in quotes when it
 ///   contains a space and does not start with `'`, escapes every `"`, and doubles a backslash
 ///   only when a `"` follows it. A tail starting with `"` is therefore a wrapped argument
@@ -175,12 +209,28 @@ pub fn dash_c_tail(line: &str) -> Option<&str> {
 ///   in quotes with nothing escaped, so the quotes inside it are its own.
 ///
 /// An empty tail is an empty command: `-c` was given, so the client asked to run something.
+///
+/// A tail that cannot come from its form (a wrapped command with no quotes around it, an escaped
+/// one that opens a quote and never closes it) is logged and decoded as far as it goes, and
+/// asserts in a debug build.
 pub fn decode_command(tail: &str, encoding: Encoding) -> String {
     match encoding {
         Encoding::Verbatim => tail.to_string(),
-        Encoding::Escaped => unescape_argument(unwrap_quotes(tail).unwrap_or(tail)),
-        Encoding::Wrapped => unwrap_quotes(tail).unwrap_or(tail).to_string(),
+        // An unwrapped escaped argument never starts with a quote: sshd escapes it as `\"`.
+        Encoding::Escaped if tail.starts_with('"') => unescape_argument(unwrap_or_log(tail, encoding)),
+        Encoding::Escaped => unescape_argument(tail),
+        Encoding::Wrapped if tail.is_empty() => String::new(),
+        Encoding::Wrapped => unwrap_or_log(tail, encoding).to_string(),
     }
+}
+
+/// [`unwrap_quotes`] for a tail that must be wrapped; the tail itself when it is not.
+fn unwrap_or_log(tail: &str, encoding: Encoding) -> &str {
+    unwrap_quotes(tail).unwrap_or_else(|| {
+        tracing::warn!("a {encoding:?} -c tail does not fit its form ({tail:?}); decoding it as written");
+        debug_assert!(false, "a {encoding:?} -c tail does not fit its form: {tail:?}");
+        tail
+    })
 }
 
 /// `s` without the quote that opens and the quote that closes it; `None` if it has no such pair.

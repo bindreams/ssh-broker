@@ -16,7 +16,7 @@ pub fn current() -> String {
 
 /// How sshd encoded this process's command line.
 ///
-/// A PTY session runs the shell on a pseudoconsole, so its stdin is a console; a non-PTY session
+/// A PTY session runs the shell under conhost, so its stdin is a console; a non-PTY session
 /// gives it the pipes sshd created, so it is not (`win32_pty.c` and `w32fd.c` in Win32-OpenSSH;
 /// `tests/session_encoding_windows.rs` measures it). Without a console, see [`detect_piped`].
 pub fn detect() -> Detected {
@@ -27,38 +27,53 @@ pub fn detect() -> Detected {
         }
     } else {
         let own_exe = std::env::current_exe().map(|path| path.to_string_lossy().into_owned());
-        detect_piped(own_exe.as_deref().unwrap_or(""))
+        detect_piped(
+            own_exe,
+            || default_shell_path_under(OPENSSH_KEY),
+            || escape_arguments_under(OPENSSH_KEY),
+        )
     }
 }
 
-/// How sshd encoded the command line of a session without a PTY.
-///
-/// sshd classifies the `DefaultShell` path first and reads `DefaultShellEscapeArguments` only for
-/// a path that is none of cmd, PowerShell, ssh-shellhost, bash or cygwin (see
-/// [`super::ShellKind::encoding`]), and the shim reads both the way sshd does. `own_exe` stands in for
-/// the path when no `DefaultShell` is registered or it cannot be read: the shim runs only because
-/// sshd launched it as that shell.
-pub fn detect_piped(own_exe: &str) -> Detected {
-    let (shell, shell_warning) = match default_shell_path_under(OPENSSH_KEY) {
-        Ok(Some(path)) => (path, None),
-        Ok(None) => (own_exe.to_string(), None),
-        Err(error) => (
-            own_exe.to_string(),
-            Some(format!(
+/// sshd reads `DefaultShellEscapeArguments` only when the path does not decide the form (see
+/// [`super::ShellKind::encoding`]). `own_exe` stands in for the path when none is registered or
+/// readable: sshd launched the shim as that shell.
+fn detect_piped(
+    own_exe: std::io::Result<String>,
+    read_shell: impl FnOnce() -> ::windows::core::Result<Option<String>>,
+    read_flag: impl FnOnce() -> ::windows::core::Result<bool>,
+) -> Detected {
+    let mut warnings = Vec::new();
+    let registered = match read_shell() {
+        Ok(path) => path,
+        Err(error) => {
+            warnings.push(format!(
                 "cannot read HKLM\\{OPENSSH_KEY}\\DefaultShell ({error}); assuming it is this program"
-            )),
-        ),
+            ));
+            None
+        }
     };
-    let mut detected = detect_piped_with(&shell, || escape_arguments_under(OPENSSH_KEY));
-    detected.warning = match (shell_warning, detected.warning) {
-        (Some(shell), Some(escape)) => Some(format!("{shell}; {escape}")),
-        (shell, escape) => shell.or(escape),
+    let shell = match (registered, own_exe) {
+        (Some(path), _) => path,
+        (None, Ok(path)) => path,
+        (None, Err(error)) => {
+            warnings.push(format!(
+                "cannot find this program's own path ({error}); assuming it is not cmd, PowerShell, \
+                 ssh-shellhost, bash or cygwin"
+            ));
+            String::new()
+        }
     };
-    detected
+    let detected = detect_piped_with(&shell, read_flag);
+    warnings.extend(detected.warning);
+    Detected {
+        encoding: detected.encoding,
+        warning: (!warnings.is_empty()).then(|| warnings.join("; ")),
+    }
 }
 
-/// [`detect_piped`] for a known shell path and a way to read the escape flag, which is called only
-/// when the path leaves the form to the flag.
+/// The form for a known shell path and a way to read the escape flag, which is called only when
+/// the path leaves the form to the flag.
 fn detect_piped_with(shell: &str, escape_arguments: impl FnOnce() -> ::windows::core::Result<bool>) -> Detected {
     match shell_kind(shell).encoding() {
         Some(encoding) => Detected {

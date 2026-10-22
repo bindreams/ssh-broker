@@ -1,6 +1,7 @@
 //! shim: the SSH `DefaultShell` (default action). Relays the terminal/streams to
 //! the agent over AF_UNIX; fails open to a local shell if the agent is unreachable.
 
+use crate::cmdline::RawExec;
 use crate::protocol::{FrameKind, FrameReader, Handshake, Mode, Resize, Stream, write_frame};
 use crate::relay::{FrameSink, Outcome, pump_decode, write_data};
 use std::io::{Read, Write};
@@ -8,44 +9,45 @@ use std::sync::{Arc, Mutex};
 
 /// Shim entrypoint. `exec` is `Some(command)` for the `-c "cmd"` EXEC path, `None`
 /// for an interactive PTY session. The Windows path connects to the agent and relays;
-/// elsewhere there is no session-1 console to relay. `warning` is logged once the shim's log is
-/// open (see `cmdline::Detected`).
-pub fn run(exec: Option<String>, warning: Option<String>) -> anyhow::Result<()> {
+/// elsewhere there is no session-1 console to relay.
+pub fn run(exec: Option<RawExec>) -> anyhow::Result<()> {
     #[cfg(windows)]
-    return crate::shim_pty::run_on(exec, warning);
+    return crate::shim_pty::run_on(exec, crate::cmdline::detect);
 
     #[cfg(not(windows))]
     {
-        let _ = (exec, warning);
+        let _ = exec;
         anyhow::bail!("the shim relays the session-1 console and runs only on Windows")
     }
 }
 
-/// Trim the command sshd handed us, so the string that is RELAYED is the string that is
-/// EXECUTED. Applied in `route`, the one place the binary assembles a command, so no argv the
-/// binary parses reaches the shim untrimmed. A library caller invoking `shim::run` directly
-/// bypasses it and should normalize first.
+/// The command line to hand to `CreateProcessW`: `command` without the [`BOUNDARY`] characters
+/// at its edges.
 ///
-/// A whitespace-only command stays `Some` and empty. `ssh host " "` is a genuine exec request —
-/// measured against a stock client, only `ssh host ""` degrades to an interactive session — and
-/// mapping it to `None` would route it to the interactive path, handing the caller a shell REPL
-/// on the SSH channel. The empty command is then run as nothing, exit 0 ([`is_blank_command`]):
-/// EXEC calls `CreateProcessW` directly, which would fail on it, so the agent and the fail-open
-/// path each check for it first.
-pub(crate) fn normalize_exec(exec: Option<String>) -> Option<String> {
-    exec.map(|c| c.trim_matches(BOUNDARY).to_string())
+/// The command itself is relayed as the client sent it. `CreateProcessW` rejects a line that
+/// starts with whitespace (`ERROR_INVALID_PARAMETER`) and reads a trailing CR or LF as part of a
+/// bare program name, so both spawn sites (`pipes::ExecChild::spawn` and
+/// `shim_pty::spawn_contained`) trim here.
+pub fn spawn_line(command: &str) -> &str {
+    command.trim_matches(BOUNDARY)
 }
 
 /// The characters that carry no meaning at a command's edges. Windows separates arguments on
 /// space and tab only; CR and LF are here because sshd can hand over a line-terminated command
 /// and they would otherwise stay glued to the program name. Deliberately NOT Rust's `trim`,
 /// whose Unicode `White_Space` set would strip characters this pipeline treats as part of an
-/// argument — one definition, used wherever a command's edges are trimmed.
-pub(crate) const BOUNDARY: [char; 4] = [' ', '\t', '\r', '\n'];
+/// argument.
+pub const BOUNDARY: [char; 4] = [' ', '\t', '\r', '\n'];
 
 /// Whether an exec command is empty or only [`BOUNDARY`] characters. Such a command runs nothing
-/// and exits 0 on every path, as the shell does for `-c ""`; `CreateProcessW` would fail on it.
-pub(crate) fn is_blank_command(command: &str) -> bool {
+/// and exits 0, as the shell does for `-c ""`; `CreateProcessW` would fail on it. It is checked
+/// once, at the top of `shim_pty::run_on`, before anything connects to the agent.
+///
+/// A blank command stays an exec request rather than becoming an interactive one: `ssh host " "`
+/// is a genuine exec (measured against a stock client, only `ssh host ""` degrades to an
+/// interactive session), and mapping it to `None` would hand the caller a shell REPL on the SSH
+/// channel.
+pub fn is_blank_command(command: &str) -> bool {
     command.trim_matches(BOUNDARY).is_empty()
 }
 
@@ -262,8 +264,6 @@ pub enum FailOpen {
     Passthrough(String),
     /// An interactive session carries no command to run, so it gets a plain `pwsh`.
     LocalShell,
-    /// A blank command: run nothing and exit 0, as the shell does for `-c ""`.
-    Nothing,
 }
 
 /// Decide what the fail-open path runs, from whether this session carried a command.
@@ -272,7 +272,6 @@ pub enum FailOpen {
 /// function ends in `process::exit`, so nothing could assert against the choice in place.
 pub fn decide_fail_open(exec: Option<String>) -> FailOpen {
     match exec {
-        Some(cmd) if is_blank_command(&cmd) => FailOpen::Nothing,
         Some(cmd) => FailOpen::Passthrough(cmd),
         None => FailOpen::LocalShell,
     }

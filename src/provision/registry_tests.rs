@@ -1,6 +1,29 @@
 //! Tests for the DefaultShell pair: the pure builder (host) + the Reg* round-trip (Windows).
 use super::registry_pair;
 
+/// A throwaway HKCU subkey, deleted when the guard drops, so a failing assertion leaves nothing
+/// behind.
+#[cfg(windows)]
+struct TestKey(String);
+
+#[cfg(windows)]
+impl TestKey {
+    fn new(tag: &str) -> Self {
+        Self(format!(r"SOFTWARE\ssh-broker-test-{tag}-{}", std::process::id()))
+    }
+
+    fn path(&self) -> &str {
+        &self.0
+    }
+}
+
+#[cfg(windows)]
+impl Drop for TestKey {
+    fn drop(&mut self) {
+        super::delete_hkcu(&self.0);
+    }
+}
+
 #[test]
 fn pair_is_option_first_then_shell() {
     let pair = registry_pair(r"C:\ProgramData\ssh-broker\ssh-broker.exe");
@@ -15,11 +38,11 @@ fn pair_is_option_first_then_shell() {
 #[cfg(windows)]
 #[test]
 fn writes_and_reads_default_shell_pair() {
-    let subkey = format!(r"SOFTWARE\ssh-broker-test-{}", std::process::id());
+    let key = TestKey::new("pair");
+    let subkey = key.path();
     let exe = r"C:\x\ssh-broker.exe";
-    super::set_hkcu(&subkey, exe).unwrap();
-    let (shell, opt) = super::read_hkcu(&subkey).unwrap();
-    super::delete_hkcu(&subkey);
+    super::set_hkcu(subkey, exe).unwrap();
+    let (shell, opt) = super::read_hkcu(subkey).unwrap();
     assert_eq!(shell, exe);
     assert_eq!(opt, "-c");
 }
@@ -33,23 +56,23 @@ fn writes_and_reads_default_shell_pair() {
 fn escape_arguments_reads_the_value_the_way_sshd_does() {
     use windows::Win32::System::Registry::{REG_DWORD, REG_SZ};
     const NAME: &str = "DefaultShellEscapeArguments";
-    let subkey = format!(r"SOFTWARE\ssh-broker-escape-test-{}", std::process::id());
-    let dword = |v: u32| super::set_value_hkcu(&subkey, NAME, REG_DWORD.0, &v.to_le_bytes());
+    let key = TestKey::new("escape");
+    let subkey = key.path();
+    let dword = |v: u32| super::set_value_hkcu(subkey, NAME, REG_DWORD.0, &v.to_le_bytes());
 
-    let absent_key = super::escape_arguments_hkcu(&subkey);
-    super::set_value_hkcu(&subkey, "Other", REG_DWORD.0, &1u32.to_le_bytes());
-    let absent_value = super::escape_arguments_hkcu(&subkey);
+    let absent_key = super::escape_arguments_hkcu(subkey);
+    super::set_value_hkcu(subkey, "Other", REG_DWORD.0, &1u32.to_le_bytes());
+    let absent_value = super::escape_arguments_hkcu(subkey);
     dword(0);
-    let zero = super::escape_arguments_hkcu(&subkey);
+    let zero = super::escape_arguments_hkcu(subkey);
     dword(1);
-    let one = super::escape_arguments_hkcu(&subkey);
+    let one = super::escape_arguments_hkcu(subkey);
     dword(7);
-    let seven = super::escape_arguments_hkcu(&subkey);
+    let seven = super::escape_arguments_hkcu(subkey);
     // The four bytes of a REG_SZ "0" and its terminator read as 0x30, which is nonzero.
     let sz: Vec<u8> = "0\0".encode_utf16().flat_map(u16::to_le_bytes).collect();
-    super::set_value_hkcu(&subkey, NAME, REG_SZ.0, &sz);
-    let string_zero = super::escape_arguments_hkcu(&subkey);
-    super::delete_hkcu(&subkey);
+    super::set_value_hkcu(subkey, NAME, REG_SZ.0, &sz);
+    let string_zero = super::escape_arguments_hkcu(subkey);
 
     assert!(absent_key.unwrap(), "a missing key leaves escaping on");
     assert!(absent_value.unwrap(), "a missing value leaves escaping on");
@@ -67,12 +90,12 @@ fn escape_arguments_reads_the_value_the_way_sshd_does() {
 fn escape_arguments_keeps_sshds_start_value_under_a_short_value() {
     use windows::Win32::System::Registry::REG_BINARY;
     const NAME: &str = "DefaultShellEscapeArguments";
-    let subkey = format!(r"SOFTWARE\ssh-broker-escape-short-test-{}", std::process::id());
-    super::set_value_hkcu(&subkey, NAME, REG_BINARY.0, &[]);
-    let empty = super::escape_arguments_hkcu(&subkey);
-    super::set_value_hkcu(&subkey, NAME, REG_BINARY.0, &[0]);
-    let one_zero_byte = super::escape_arguments_hkcu(&subkey);
-    super::delete_hkcu(&subkey);
+    let key = TestKey::new("escape-short");
+    let subkey = key.path();
+    super::set_value_hkcu(subkey, NAME, REG_BINARY.0, &[]);
+    let empty = super::escape_arguments_hkcu(subkey);
+    super::set_value_hkcu(subkey, NAME, REG_BINARY.0, &[0]);
+    let one_zero_byte = super::escape_arguments_hkcu(subkey);
 
     assert!(
         empty.unwrap(),
@@ -91,10 +114,10 @@ fn escape_arguments_keeps_sshds_start_value_under_a_short_value() {
 #[test]
 fn escape_arguments_treats_a_value_longer_than_four_bytes_as_on() {
     use windows::Win32::System::Registry::REG_BINARY;
-    let subkey = format!(r"SOFTWARE\ssh-broker-escape-long-test-{}", std::process::id());
-    super::set_value_hkcu(&subkey, "DefaultShellEscapeArguments", REG_BINARY.0, &[0u8; 8]);
-    let read = super::escape_arguments_hkcu(&subkey);
-    super::delete_hkcu(&subkey);
+    let key = TestKey::new("escape-long");
+    let subkey = key.path();
+    super::set_value_hkcu(subkey, "DefaultShellEscapeArguments", REG_BINARY.0, &[0u8; 8]);
+    let read = super::escape_arguments_hkcu(subkey);
 
     assert!(
         read.unwrap(),
@@ -121,25 +144,20 @@ fn escape_arguments_reports_a_read_that_fails_for_another_reason() {
 #[test]
 fn default_shell_path_reads_the_value_the_way_sshd_does() {
     use windows::Win32::System::Registry::{REG_EXPAND_SZ, REG_SZ};
-    let subkey = format!(r"SOFTWARE\ssh-broker-shell-path-test-{}", std::process::id());
+    let key = TestKey::new("shell-path");
+    let subkey = key.path();
     let utf16 = |s: &str| -> Vec<u8> { s.encode_utf16().chain([0]).flat_map(u16::to_le_bytes).collect() };
 
-    let absent_key = super::default_shell_path_hkcu(&subkey);
-    super::set_value_hkcu(&subkey, "Other", REG_SZ.0, &utf16("x"));
-    let absent_value = super::default_shell_path_hkcu(&subkey);
-    super::set_value_hkcu(&subkey, "DefaultShell", REG_SZ.0, &utf16(""));
-    let empty = super::default_shell_path_hkcu(&subkey);
+    let absent_key = super::default_shell_path_hkcu(subkey);
+    super::set_value_hkcu(subkey, "Other", REG_SZ.0, &utf16("x"));
+    let absent_value = super::default_shell_path_hkcu(subkey);
+    super::set_value_hkcu(subkey, "DefaultShell", REG_SZ.0, &utf16(""));
+    let empty = super::default_shell_path_hkcu(subkey);
     let long = format!(r"C:\{}\ssh-broker.exe", "d".repeat(600));
-    super::set_value_hkcu(&subkey, "DefaultShell", REG_SZ.0, &utf16(&long));
-    let long_read = super::default_shell_path_hkcu(&subkey);
-    super::set_value_hkcu(
-        &subkey,
-        "DefaultShell",
-        REG_EXPAND_SZ.0,
-        &utf16(r"%ProgramFiles%\x.exe"),
-    );
-    let expand = super::default_shell_path_hkcu(&subkey);
-    super::delete_hkcu(&subkey);
+    super::set_value_hkcu(subkey, "DefaultShell", REG_SZ.0, &utf16(&long));
+    let long_read = super::default_shell_path_hkcu(subkey);
+    super::set_value_hkcu(subkey, "DefaultShell", REG_EXPAND_SZ.0, &utf16(r"%ProgramFiles%\x.exe"));
+    let expand = super::default_shell_path_hkcu(subkey);
 
     assert_eq!(absent_key.unwrap(), None);
     assert_eq!(absent_value.unwrap(), None);

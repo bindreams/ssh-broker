@@ -71,16 +71,11 @@ fn the_local_passthrough_child_is_contained_in_a_job() {
 #[test]
 fn fail_open_maps_interactive_to_pwsh_and_passes_an_exec_command_through() {
     use crate::shim::FailOpen;
-    assert_eq!(super::fail_open_command(&FailOpen::LocalShell), Some("pwsh -NoLogo"));
-    assert_eq!(
-        super::fail_open_command(&FailOpen::Nothing),
-        None,
-        "a blank exec runs nothing"
-    );
+    assert_eq!(super::fail_open_command(&FailOpen::LocalShell), "pwsh -NoLogo");
     let cmd = r#"scp -t "C:\path with spaces\out.bin""#;
     assert_eq!(
         super::fail_open_command(&FailOpen::Passthrough(cmd.to_string())),
-        Some(cmd),
+        cmd,
         "an EXEC command must reach the spawn byte for byte"
     );
 }
@@ -248,4 +243,26 @@ fn file_logging_is_enabled_for_a_writable_log_directory() {
     assert!(guard.is_some(), "a writable log directory must yield a guard");
     drop(guard);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The fail-open spawn trims the command's edges for `CreateProcessW`, which rejects leading
+/// whitespace; the relay's spawn does the same (`pipes_tests`).
+#[test]
+fn the_local_passthrough_spawn_accepts_whitespace_at_the_edges_of_a_command() {
+    use windows::Win32::System::Threading::{GetExitCodeProcess, INFINITE, WaitForSingleObject};
+
+    for command in [
+        "  cmd.exe /c exit /b 3",
+        "\tcmd.exe /c exit /b 3\r\n",
+        "\r\ncmd.exe /c exit /b 3",
+    ] {
+        let (process, _job) =
+            unsafe { spawn_contained(command, None) }.unwrap_or_else(|e| panic!("{command:?}: {e:?}"));
+        let mut code = 0u32;
+        unsafe {
+            WaitForSingleObject(process.0, INFINITE);
+            GetExitCodeProcess(process.0, &mut code).unwrap();
+        }
+        assert_eq!(code, 3, "{command:?}");
+    }
 }

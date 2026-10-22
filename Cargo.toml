@@ -49,3 +49,8 @@ windows = { version = "0.62.2", features = [
 # tracing-appender: rolling file sink for the shim's logs under ProgramData (the shim must
 # never log to the PTY stdout/stderr in interactive mode). Only the Windows shim uses it.
 tracing-appender = "0.2"
+
+[target.'cfg(windows)'.dev-dependencies]
+windows = { version = "0.62.2", features = [
+    "Win32_UI_Shell", # CommandLineToArgvW: tests/conhost_windows.rs checks the test encoder's tokenizer against it
+] }

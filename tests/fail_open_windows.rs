@@ -9,7 +9,18 @@
 //! entirely, so the mutation that matters
 //! (`FailOpen::Passthrough(cmd) => run_local_passthrough(&format!("pwsh -Command {cmd}"))`)
 //! leaves such a test green. Only running the actual binary traverses the real path.
+//!
+//! The shim decides how sshd encoded its command line from the machine's OpenSSH registry
+//! settings, so a test whose result depends on the form runs `shim_child` instead: the same
+//! entry point (`route`, then `shim_pty::run_on`) with the form given to it. The tests that run
+//! the binary use commands that decode the same in every form, or a PTY session, which is
+//! recognized by its console.
 #![cfg(windows)]
+
+use std::path::{Path, PathBuf};
+
+use ssh_broker::cmdline::{Detected, Encoding, split_args};
+use ssh_broker::route::{Route, route};
 
 #[path = "common/pty.rs"]
 mod pty;
@@ -71,18 +82,14 @@ fn exec_fail_open_runs_the_command_with_no_shell_in_between() {
 
 /// Create `<tmp>\<tag>-<pid>\Spaced Dir\sftp-server.exe`, a copy of `cmd.exe`, and return the
 /// root and the program path. A copy of `cmd.exe` needs no fixture binary.
-fn spaced_program(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+fn spaced_program(tag: &str) -> (PathBuf, PathBuf) {
     let root = std::env::temp_dir().join(format!("{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     let program_dir = root.join("Spaced Dir");
     std::fs::create_dir_all(&program_dir).unwrap();
     let program = program_dir.join("sftp-server.exe");
     let system_root = std::env::var_os("SystemRoot").expect("SystemRoot is set on Windows");
-    std::fs::copy(
-        std::path::PathBuf::from(system_root).join(r"System32\cmd.exe"),
-        &program,
-    )
-    .unwrap();
+    std::fs::copy(PathBuf::from(system_root).join(r"System32\cmd.exe"), &program).unwrap();
     (root, program)
 }
 
@@ -119,116 +126,170 @@ fn exec_fail_open_runs_an_unquoted_program_path_containing_spaces() {
     assert_unquoted_program_ran(&out);
 }
 
-/// As above, but the command is appended to the command line verbatim, which is how sshd passes
-/// it in a PTY session (`ssh -t host cmd`). The C runtime then splits it at the space inside the
-/// path, so only the raw command line still holds the program path whole.
-///
-/// `raw_arg` is what makes this the PTY shape: `.arg` would wrap the text in quotes.
-#[test]
-fn exec_fail_open_runs_an_unquoted_program_path_appended_to_the_command_line() {
-    use std::os::windows::process::CommandExt;
-
-    let (root, program) = spaced_program("sb-failopen-spaced-raw");
-    let command = format!("{} /c echo unquoted-ok", program.display());
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_ssh-broker"))
-        .arg("-c")
-        .raw_arg(&command)
-        .output()
-        .expect("run the shim binary");
-    let _ = std::fs::remove_dir_all(&root);
-
-    assert_unquoted_program_ran(&out);
+/// What a PTY session of the shim produced.
+struct PtyRun {
+    console: String,
+    written: String,
 }
 
-/// `cmd.exe /c` text for the command of the two tests below: a quoted spaced program path, and
-/// an argument with a double space inside quotes. `cmd` echoes the quotes it is given.
-fn quoted_command(program: &std::path::Path) -> String {
+/// Run `command` as a PTY session of the shim does: `ssh -t host <command>` makes sshd start
+/// `conhost.exe --headless ... -- "shim" -c <command>`, and the shim runs on its console. The
+/// command writes to `out` itself, so a result does not depend on how the console renders it.
+fn run_pty_session(command: &str, out: &Path) -> PtyRun {
+    let shim = env!("CARGO_BIN_EXE_ssh-broker");
+    let run = pty::run_under_conhost(&sshd_encoder::pty_line(shim, command), &[]);
+    PtyRun {
+        console: run.console,
+        written: std::fs::read_to_string(out).unwrap_or_default(),
+    }
+}
+
+/// A PTY session whose command is an unquoted spaced program path, appended as the client wrote
+/// it. conhost splits it at the space inside the path and joins the pieces again, so only the
+/// raw command line still holds the path whole.
+#[test]
+fn exec_fail_open_runs_an_unquoted_program_path_in_a_pty_session() {
+    let (root, program) = spaced_program("sb-failopen-spaced-pty");
+    let out = root.join("out.txt");
+    let command = format!("{} /c echo unquoted-ok > \"{}\"", program.display(), out.display());
+    let run = run_pty_session(&command, &out);
+    let _ = std::fs::remove_dir_all(&root);
+
+    assert!(
+        run.console.contains("agent unavailable"),
+        "precondition: the fail-open path must be the one that ran, not the relay.\nconsole: {}",
+        run.console
+    );
+    assert!(
+        run.written.contains("unquoted-ok"),
+        "the unquoted spaced program did not run.\nwritten: {:?}\nconsole: {}",
+        run.written,
+        run.console
+    );
+}
+
+/// `cmd.exe /c` text for the commands of the tests below: a quoted spaced program path and an
+/// argument with a double space inside quotes. `cmd` echoes the quotes it is given.
+fn quoted_command(program: &Path) -> String {
     format!(r#""{}" /c echo "quoted  ok""#, program.display())
 }
 
-/// A PTY session (`ssh -t host cmd`): sshd appends the command to the shell's line as written
-/// and runs the shell on a pseudoconsole, so the shim must keep the quotes. The shim runs under
-/// a real pseudoconsole here, because that is what tells it the command is verbatim
-/// (`tests/session_encoding_windows.rs` measures the signal).
-///
-/// The program writes to a file rather than the console, so the assertion does not depend on how
-/// the pseudoconsole renders a double space.
+/// A PTY session keeps the quotes of an argument with a space, and its double space inside them.
 #[test]
 fn exec_fail_open_keeps_the_quotes_of_a_pty_command() {
     let (root, program) = spaced_program("sb-failopen-quoted-pty");
-    let out_file = root.join("out.txt");
-    let command = format!("{}>\"{}\"", quoted_command(&program), out_file.display());
-    let shim = env!("CARGO_BIN_EXE_ssh-broker");
-    let (code, console) = pty::run_on_pseudoconsole(&sshd_encoder::verbatim_line(shim, &command));
-    let written = std::fs::read_to_string(&out_file).unwrap_or_default();
+    let out = root.join("out.txt");
+    let command = format!("{} > \"{}\"", quoted_command(&program), out.display());
+    let run = run_pty_session(&command, &out);
     let _ = std::fs::remove_dir_all(&root);
 
     assert!(
-        console.contains("agent unavailable"),
-        "precondition: the fail-open path must be the one that ran, not the relay.\nconsole: {console}"
+        run.console.contains("agent unavailable"),
+        "precondition: the fail-open path must be the one that ran, not the relay.\nconsole: {}",
+        run.console
     );
-    assert_eq!(code, 0, "the command failed.\nconsole: {console}");
     assert!(
-        written.contains(r#""quoted  ok""#),
-        "the quoted argument lost its quotes or its double space.\nwritten: {written:?}\nconsole: {console}"
+        run.written.contains(r#""quoted  ok""#),
+        "the quoted argument lost its quotes or its double space.\nwritten: {:?}\nconsole: {}",
+        run.written,
+        run.console
     );
 }
 
-/// The precondition of the test below, checked loudly: the form the shim will decode on pipes is
-/// the one it detects from this machine's `DefaultShell` and `DefaultShellEscapeArguments`
-/// (`DefaultShell` unset or elsewhere than cmd, with the flag on or unset, gives the escaped form).
-fn require_escaped_form(shim: &str) {
-    let detected = ssh_broker::cmdline::detect_piped(shim);
-    assert!(
-        detected.encoding == ssh_broker::cmdline::Encoding::Escaped && detected.warning.is_none(),
-        "this test encodes the command as sshd does for the escaped form, but this machine's \
-         OpenSSH settings make the shim expect {:?} (warning: {:?}). Check \
-         HKLM\\SOFTWARE\\OpenSSH\\DefaultShell and DefaultShellEscapeArguments.",
-        detected.encoding,
-        detected.warning
-    );
-}
-
-/// A session without a PTY: sshd escapes the command into one argument of the shell's line (with
-/// `DefaultShellEscapeArguments` on, which is the default), so the shim must undo that and run
-/// the command as the client sent it. Piped stdio is what tells the shim the command is escaped.
-///
-/// The encoder is the port of sshd's in `tests/common/sshd_encoder.rs`.
+/// A PTY session's command arrives as conhost rebuilt it, and the shim runs that: runs of spaces
+/// between arguments become one, and quotes around an argument with no space go.
 #[test]
-fn exec_fail_open_decodes_the_escaped_command_of_a_session_without_a_pty() {
-    use std::os::windows::process::CommandExt;
-
-    let (root, program) = spaced_program("sb-failopen-quoted-escaped");
-    let shim = env!("CARGO_BIN_EXE_ssh-broker");
-    require_escaped_form(shim);
-    let argument = sshd_encoder::escaped_argument(&quoted_command(&program));
-    let out = std::process::Command::new(shim)
-        .arg("-c")
-        .raw_arg(argument)
-        .output()
-        .expect("run the shim binary");
+fn exec_fail_open_runs_a_pty_command_as_conhost_rebuilt_it() {
+    let (root, program) = spaced_program("sb-failopen-conhost-pty");
+    let out = root.join("out.txt");
+    let command = format!(
+        "{} /c echo   spread    out \"tight\" > \"{}\"",
+        program.display(),
+        out.display()
+    );
+    let run = run_pty_session(&command, &out);
     let _ = std::fs::remove_dir_all(&root);
 
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("agent unavailable"),
-        "precondition: the fail-open path must be the one that ran, not the relay.\nstderr: {stderr}"
+    assert_eq!(
+        run.written.trim_end(),
+        "spread out tight",
+        "the command should have run as conhost rebuilt it.\nconsole: {}",
+        run.console
     );
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        stdout.contains(r#""quoted  ok""#),
-        "the quoted argument lost its quotes or its double space.\nstdout: {stdout}\nstderr: {stderr}"
-    );
+}
+
+// A session without a PTY =====
+
+/// The child of the tests below. It does what `main` does with the command line it is given —
+/// `route`, then `shim_pty::run_on` — but takes the form sshd used from the environment, rather
+/// than detecting it from the machine's registry, and exits as the shim does.
+#[test]
+#[ignore = "run as a child of the tests below"]
+fn shim_child() {
+    let line = std::env::var("SB_TEST_LINE").expect("SB_TEST_LINE: the command line");
+    let encoding = match std::env::var("SB_TEST_ENCODING").expect("SB_TEST_ENCODING").as_str() {
+        "Escaped" => Encoding::Escaped,
+        "Wrapped" => Encoding::Wrapped,
+        other => panic!("unknown SB_TEST_ENCODING {other:?}"),
+    };
+    let args = split_args(&line);
+    let Route::Shim { exec } = route(&args[1..], &line) else {
+        panic!("{line:?} must select the shim");
+    };
+    ssh_broker::shim_pty::run_on(exec, || Detected {
+        encoding,
+        warning: None,
+    })
+    .expect("run the shim");
+}
+
+/// Run the shim on `line` (a whole command line) as sshd's `encoding` form, without a PTY.
+fn run_shim_child(line: &str, encoding: Encoding) -> std::process::Output {
+    std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "shim_child", "--ignored", "--nocapture"])
+        .env("SB_TEST_LINE", line)
+        .env("SB_TEST_ENCODING", format!("{encoding:?}"))
+        .output()
+        .expect("run the shim child")
+}
+
+/// A session without a PTY: sshd turns the command into one argument of the shell's line, escaped
+/// (`DefaultShellEscapeArguments` on, the default) or wrapped in quotes and nothing else (off), and
+/// the shim must undo that and run the command as the client sent it.
+///
+/// The encoders are the port of sshd's in `tests/common/sshd_encoder.rs`.
+#[test]
+fn exec_fail_open_decodes_the_command_of_a_session_without_a_pty() {
+    let shim = env!("CARGO_BIN_EXE_ssh-broker");
+    for encoding in [Encoding::Escaped, Encoding::Wrapped] {
+        let (root, program) = spaced_program("sb-failopen-quoted-piped");
+        let command = quoted_command(&program);
+        let line = match encoding {
+            Encoding::Escaped => sshd_encoder::escaped_line(shim, &command),
+            _ => sshd_encoder::wrapped_line(shim, &command),
+        };
+        let out = run_shim_child(&line, encoding);
+        let _ = std::fs::remove_dir_all(&root);
+
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("agent unavailable"),
+            "{encoding:?}: precondition: the fail-open path must be the one that ran, not the relay.\nstderr: {stderr}"
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains(r#""quoted  ok""#),
+            "{encoding:?}: the quoted argument lost its quotes or its double space.\nstdout: {stdout}\nstderr: {stderr}"
+        );
+    }
 }
 
 /// An exec whose command is empty or whitespace-only runs nothing and exits 0 with no output, as
-/// the shell does for `-c ""`, rather than failing at `CreateProcessW("")` with 255. The shim
-/// stays silent even though the agent is unreachable: there is nothing to warn about, since no
-/// command needed it. Because the run is silent, only the exit code and the empty streams are
-/// asserted; CI has no agent, so this is the fail-open path (`src/agent_tests.rs` covers the
-/// relayed one).
+/// the shell does for `-c ""`, rather than failing at `CreateProcessW("")` with 255. The check
+/// comes before the agent is consulted, so this holds with or without one, and the shim stays
+/// silent: no command needed the agent, so there is nothing to warn about.
 #[test]
-fn exec_fail_open_of_a_blank_command_runs_nothing_and_exits_zero() {
+fn exec_of_a_blank_command_runs_nothing_and_exits_zero() {
     for blank in ["", " ", "   ", "\t "] {
         let out = std::process::Command::new(env!("CARGO_BIN_EXE_ssh-broker"))
             .args(["-c", blank])

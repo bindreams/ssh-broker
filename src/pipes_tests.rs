@@ -43,3 +43,17 @@ fn exec_separates_stdout_stderr_and_returns_code() {
     );
     assert_eq!(code, 5);
 }
+
+/// `CreateProcessW` rejects a command line that starts with whitespace, and the command is
+/// relayed as the client sent it, so the spawn trims it.
+#[test]
+fn exec_runs_a_command_with_whitespace_at_its_edges() {
+    for command in [
+        "  cmd.exe /c exit /b 3",
+        "\tcmd.exe /c exit /b 3\r\n",
+        "\r\ncmd.exe /c exit /b 3",
+    ] {
+        let child = ExecChild::spawn(command, None).unwrap_or_else(|e| panic!("{command:?}: {e}"));
+        assert_eq!(child.wait().unwrap(), 3, "{command:?}");
+    }
+}

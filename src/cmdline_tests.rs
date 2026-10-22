@@ -1,9 +1,14 @@
 //! Host tests for command-line recovery (pure; runs on any platform).
 //!
-//! The three shapes sshd's `-c` tail takes are taken from Win32-OpenSSH `w32-doexec.c` and
-//! `misc.c` (`build_commandline_string`); see `decode_command`.
+//! The forms sshd's `-c` tail takes are taken from Win32-OpenSSH `w32-doexec.c` and `misc.c`
+//! (`build_commandline_string`); see `decode_command`.
 
-use super::{Encoding, ShellKind, dash_c_tail, decode_command, shell_kind, split_args};
+use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::{Arc, Mutex};
+
+use super::{
+    Detected, Encoding, RawExec, ShellKind, dash_c_tail, decode_command, resolve_exec, shell_kind, split_args,
+};
 
 fn args(line: &str) -> Vec<String> {
     split_args(line)
@@ -63,8 +68,8 @@ fn dash_c_tail_does_not_unquote_the_command() {
     );
 }
 
-// Shape (a): non-PTY with sshd's default argument escaping. The command is one argument,
-// quoted if it contains a space and with every `"` escaped.
+// Escaped: non-PTY with sshd's default argument escaping. The command is one argument, quoted if
+// it contains a space and with every `"` escaped.
 
 #[test]
 fn an_escaped_single_argument_decodes_to_the_command() {
@@ -78,7 +83,7 @@ fn an_escaped_single_argument_decodes_to_the_command() {
     assert_eq!(decode_command(r#"a\"b"#, Encoding::Escaped), r#"a"b"#);
 }
 
-// Shape (b): a PTY session (`ssh -t host cmd`). sshd appends the command verbatim.
+// Verbatim: a PTY session (`ssh -t host cmd`). The tail is the command as the shim received it.
 
 #[test]
 fn a_verbatim_command_is_kept_exactly() {
@@ -112,7 +117,7 @@ fn an_empty_quoted_argument_is_an_empty_command() {
     assert_eq!(decode_command(r#""""#, Encoding::Wrapped), "");
 }
 
-// Shape (a) again: the forms a C-runtime splitter reads wrongly.
+// Escaped, again: the forms a C-runtime splitter reads wrongly.
 
 #[test]
 fn an_escaped_command_sshd_left_unwrapped_is_not_split() {
@@ -132,7 +137,7 @@ fn an_escaped_command_ending_in_a_backslash_keeps_it() {
     );
 }
 
-// Shape (c): `DefaultShellEscapeArguments=0` wraps the command in quotes and nothing else.
+// Wrapped: `DefaultShellEscapeArguments=0` wraps the command in quotes and nothing else.
 
 #[test]
 fn a_wrapped_command_keeps_the_quotes_inside_it() {
@@ -145,7 +150,7 @@ fn a_wrapped_command_keeps_the_quotes_inside_it() {
     );
 }
 
-// Shape (b) again: a single quoted token is the command as written.
+// Verbatim, again: a single quoted token is the command as written.
 
 #[test]
 fn a_verbatim_single_token_keeps_its_quotes() {
@@ -207,4 +212,118 @@ fn a_shell_kind_fixes_the_form_except_for_other_paths() {
     assert_eq!(ShellKind::Bash.encoding(), Some(Encoding::Escaped));
     assert_eq!(ShellKind::Cygwin.encoding(), Some(Encoding::Escaped));
     assert_eq!(ShellKind::Other.encoding(), None);
+}
+
+// Resolving a `-c` command =====
+
+/// Run `f` and return what it logged, with its result.
+fn logged<T>(f: impl FnOnce() -> T) -> (String, T) {
+    #[derive(Clone, Default)]
+    struct Buf(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for Buf {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Buf {
+        type Writer = Buf;
+        fn make_writer(&'a self) -> Buf {
+            self.clone()
+        }
+    }
+    let buf = Buf::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(buf.clone())
+        .with_ansi(false)
+        .finish();
+    let result = tracing::subscriber::with_default(subscriber, f);
+    let log = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+    (log, result)
+}
+
+fn detected(encoding: Encoding, warning: Option<&str>) -> Detected {
+    Detected {
+        encoding,
+        warning: warning.map(str::to_string),
+    }
+}
+
+#[test]
+fn a_tail_is_decoded_by_the_detected_encoding() {
+    let tail = || RawExec::Tail(r#""echo \"a b\"""#.into());
+    let (log, command) = logged(|| resolve_exec(tail(), || detected(Encoding::Escaped, None)));
+    assert_eq!(command, r#"echo "a b""#);
+    assert_eq!(log, "", "nothing to report");
+    let (_, command) = logged(|| resolve_exec(tail(), || detected(Encoding::Verbatim, None)));
+    assert_eq!(command, r#""echo \"a b\"""#);
+}
+
+/// Detection runs after the log is open, so the warning it returns is logged where it is used.
+#[test]
+fn the_detection_warning_is_logged() {
+    let (log, _) = logged(|| {
+        resolve_exec(RawExec::Tail("x".into()), || {
+            detected(Encoding::Escaped, Some("cannot read the setting"))
+        })
+    });
+    assert!(log.contains("WARN") && log.contains("cannot read the setting"), "{log}");
+}
+
+/// argv carried a `-c` the raw line did not show: the joined argv is the command, nothing is
+/// detected, and the log says the line was unexpected.
+#[test]
+fn an_argv_command_is_used_as_it_is_and_logged() {
+    let detect = || -> Detected { panic!("there is no encoding to detect for argv") };
+    let (log, command) = logged(|| resolve_exec(RawExec::Argv("a b c".into()), detect));
+    assert_eq!(command, "a b c");
+    assert!(log.contains("WARN") && log.contains("no `-c`"), "{log}");
+}
+
+/// A tail that the form's own rules say cannot occur: a wrapped command with no quotes around it,
+/// or an escaped one that opens a quote and never closes it. The tail is decoded as far as it
+/// goes and the log says so; a debug build also asserts.
+#[test]
+fn a_tail_that_does_not_fit_its_form_is_logged() {
+    for (tail, encoding) in [
+        ("abc", Encoding::Wrapped),
+        (r#""abc"#, Encoding::Wrapped),
+        (r#"abc""#, Encoding::Wrapped),
+        (r#"""#, Encoding::Wrapped),
+        (r#""abc"#, Encoding::Escaped),
+        (r#"""#, Encoding::Escaped),
+    ] {
+        let (log, result) = logged(|| catch_unwind(AssertUnwindSafe(|| decode_command(tail, encoding))));
+        assert!(
+            log.contains("WARN") && log.contains("does not fit"),
+            "{encoding:?} {tail:?}: {log}"
+        );
+        assert_eq!(
+            result.is_err(),
+            cfg!(debug_assertions),
+            "{encoding:?} {tail:?}: a debug build asserts and a release build does not"
+        );
+    }
+}
+
+#[test]
+fn a_tail_that_fits_its_form_is_not_logged() {
+    for (tail, encoding) in [
+        ("", Encoding::Wrapped),
+        ("", Encoding::Escaped),
+        ("", Encoding::Verbatim),
+        (r#""""#, Encoding::Wrapped),
+        (r#""""#, Encoding::Escaped),
+        ("abc", Encoding::Escaped),
+        (r#"a\"b"#, Encoding::Escaped),
+        (r#""a b""#, Encoding::Escaped),
+        (r#""abc"#, Encoding::Verbatim),
+        ("abc", Encoding::Verbatim),
+    ] {
+        let (log, _) = logged(|| decode_command(tail, encoding));
+        assert_eq!(log, "", "{encoding:?} {tail:?}");
+    }
 }

@@ -3,7 +3,7 @@
 //! PTY path (raw mode, `ReadConsoleInputW`) is exercised on a real Windows host end-to-end.
 use super::{
     ExecOutSink, FailOpen, Fallback, MouseModeSniffer, XtwinopsFilter, decide_fail_open, decide_fallback,
-    is_blank_command, make_handshake, map_outcome, size_to_resize,
+    is_blank_command, make_handshake, map_outcome, size_to_resize, spawn_line,
 };
 use crate::protocol::{ExitCode, FrameKind, FrameReader, Handshake, Mode, Resize, Stream, read_one_frame, write_frame};
 use crate::relay::{FrameSink, Outcome, duplex, write_data};
@@ -207,33 +207,15 @@ fn size_event_maps_to_resize_frame() {
     assert_eq!(size_to_resize(120, 40), Resize { cols: 120, rows: 40 });
 }
 
-/// `ssh host " "` is a genuine exec request; only `ssh host ""` degrades to interactive
-/// (measured against a stock client — `ssh.c` sends a shell request only for an empty
-/// command buffer, so sshd never sees an empty exec). Mapping a blank command to `None` would hand the caller an
-/// interactive REPL on the SSH channel instead of running its no-op.
+/// `CreateProcessW` rejects a command line with leading whitespace (`ERROR_INVALID_PARAMETER`)
+/// and glues a trailing CR or LF to a bare program name, so the line handed to it is trimmed of
+/// the `BOUNDARY` characters. Nothing else is: a Unicode space is part of an argument.
 #[test]
-fn normalize_exec_trims_but_keeps_a_blank_command_an_exec() {
-    assert_eq!(super::normalize_exec(Some("  cmd  ".into())), Some("cmd".into()));
-    assert_eq!(
-        super::normalize_exec(Some(" ".into())),
-        Some(String::new()),
-        "stays an exec"
-    );
-    assert_eq!(super::normalize_exec(None), None);
-}
-
-/// `BOUNDARY` is deliberately narrower than Rust's `trim`: only the separators this pipeline
-/// treats as meaningful. A Unicode space is part of an argument, not padding around one.
-#[test]
-fn boundary_is_narrower_than_unicode_whitespace() {
-    assert_eq!(
-        super::normalize_exec(Some("\u{a0}scp -t /p".into())),
-        Some("\u{a0}scp -t /p".into())
-    );
-    assert_eq!(
-        super::normalize_exec(Some("\r\n scp -t /p \t".into())),
-        Some("scp -t /p".into())
-    );
+fn spawn_line_trims_only_the_boundary_characters() {
+    assert_eq!(spawn_line("  cmd /c x  "), "cmd /c x");
+    assert_eq!(spawn_line("\t\r\n scp -t /p \t\r\n"), "scp -t /p");
+    assert_eq!(spawn_line("\u{a0}scp -t /p\u{a0}"), "\u{a0}scp -t /p\u{a0}");
+    assert_eq!(spawn_line("a  b"), "a  b");
 }
 
 #[test]
@@ -487,24 +469,15 @@ fn sniffer_focus_independent_of_mouse_flags() {
     assert!(!t.focus_on());
 }
 
-/// An empty or whitespace-only exec runs nothing, as the shell would for `-c ""`: the fail-open
-/// path must not hand it to `CreateProcessW`, which fails (255) on an empty command line.
-/// "Blank" uses the same separators as `normalize_exec`.
+/// A blank exec (empty, or only space, tab, CR and LF) runs nothing, as the shell does for
+/// `-c ""`. The set is spelled out here so a change to `BOUNDARY` shows up as a failure.
 #[test]
-fn a_blank_exec_fails_open_to_nothing() {
-    for blank in ["", " ", "\t", "\r\n", " \t\r\n "] {
+fn a_blank_command_is_empty_or_only_space_tab_cr_lf() {
+    for blank in ["", " ", "\t", "\r", "\n", "\r\n", " \t\r\n "] {
         assert!(is_blank_command(blank), "{blank:?}");
-        assert_eq!(
-            decide_fail_open(Some(blank.to_string())),
-            FailOpen::Nothing,
-            "{blank:?}"
-        );
     }
     // A Unicode space is part of an argument (see `BOUNDARY`), so it is not blank.
-    assert!(!is_blank_command("\u{a0}"));
-    assert!(!is_blank_command("cmd"));
-    assert_eq!(
-        decide_fail_open(Some(" cmd ".to_string())),
-        FailOpen::Passthrough(" cmd ".to_string())
-    );
+    for not_blank in ["\u{a0}", "cmd", " cmd ", "\0", "\u{b}", "\u{c}"] {
+        assert!(!is_blank_command(not_blank), "{not_blank:?}");
+    }
 }

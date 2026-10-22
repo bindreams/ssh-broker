@@ -14,6 +14,7 @@
 //! not), JOINS the worker, then the guard restores modes AFTER the join — so the worker can
 //! never read with a half-restored mode (the use-after-close hazard the agent review found).
 
+use crate::cmdline::{Detected, RawExec, resolve_exec};
 use crate::protocol::{FrameKind, FrameReader, Handshake, Stream, write_frame};
 use crate::relay::{FrameSink, pump_decode, write_data};
 use crate::shim::{
@@ -55,10 +56,15 @@ const VT_OUT: CONSOLE_MODE =
 /// shell — never let an error reach `main()` (which would exit 1 and print to the terminal,
 /// corrupting an interactive PTY). The log guard is flushed before every `process::exit`,
 /// since `process::exit` runs no destructors and the log is the only PTY-mode diagnostic.
-pub fn run_on(exec: Option<String>, warning: Option<String>) -> anyhow::Result<()> {
+///
+/// A `-c` session resolves its command first, once the log is open: `detect` says how sshd
+/// encoded it (see [`resolve_exec`]), and a blank command ends the run there, exit 0.
+pub fn run_on(exec: Option<RawExec>, detect: impl FnOnce() -> Detected) -> anyhow::Result<()> {
     let log = init_file_logging();
-    if let Some(warning) = warning {
-        tracing::warn!("{warning}");
+    let exec = exec.map(|exec| resolve_exec(exec, detect));
+    if exec.as_deref().is_some_and(is_blank_command) {
+        drop(log); // flush: `process::exit` runs no destructors
+        std::process::exit(0)
     }
 
     // EVERY command relays. There is deliberately no local route for file transfers.
@@ -99,11 +105,7 @@ pub fn run_on(exec: Option<String>, warning: Option<String>) -> anyhow::Result<(
     // later line — so the `tracing::error!` below, the only PTY-mode diagnostic for a failed
     // fallback, went nowhere at all.
     let decision = decide_fail_open(exec);
-    let Some(command) = fail_open_command(&decision) else {
-        // A blank exec: nothing to run, so nothing failed.
-        drop(log); // flush: `process::exit` runs no destructors
-        std::process::exit(0)
-    };
+    let command = fail_open_command(&decision);
     match run_local_passthrough(command) {
         Ok(code) => {
             drop(log); // flush: `process::exit` runs no destructors
@@ -129,13 +131,11 @@ pub fn run_on(exec: Option<String>, warning: Option<String>) -> anyhow::Result<(
 
 /// The command each fail-open outcome runs. Pure, so the interactive arm's program is pinned by a
 /// test rather than by reading `run_on`: an interactive session has nothing of its own to run, so
-/// it gets `pwsh`, while an EXEC command is passed through untouched. `None` is a blank exec,
-/// which runs nothing.
-fn fail_open_command(decision: &FailOpen) -> Option<&str> {
+/// it gets `pwsh`, while an EXEC command is passed through untouched.
+fn fail_open_command(decision: &FailOpen) -> &str {
     match decision {
-        FailOpen::Passthrough(cmd) => Some(cmd.as_str()),
-        FailOpen::LocalShell => Some("pwsh -NoLogo"),
-        FailOpen::Nothing => None,
+        FailOpen::Passthrough(cmd) => cmd.as_str(),
+        FailOpen::LocalShell => "pwsh -NoLogo",
     }
 }
 
@@ -150,9 +150,8 @@ fn try_relay(exec: &Option<String>) -> anyhow::Result<Option<i32>> {
         let msg = "ssh-broker: agent unavailable — falling back to a local shell";
         tracing::warn!("{msg} (path={path:?}, err={:?})", conn.as_ref().err());
         // EXEC has a clean stderr channel; in PTY mode a stderr write would corrupt the
-        // terminal stream, so there the warning goes only to the log file. A blank exec runs
-        // nothing, so it needed no agent and gets no warning.
-        if exec.as_deref().is_some_and(|c| !is_blank_command(c)) {
+        // terminal stream, so there the warning goes only to the log file.
+        if exec.is_some() {
             eprintln!("{msg}");
         }
         return Ok(None);
@@ -287,7 +286,10 @@ unsafe fn spawn_contained(
         si.hStdOutput = o;
         si.hStdError = e;
     }
-    let mut cmd: Vec<u16> = command.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut cmd: Vec<u16> = crate::shim::spawn_line(command)
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
     let mut pi = PROCESS_INFORMATION::default();
     unsafe {
         CreateProcessW(

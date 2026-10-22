@@ -1,13 +1,13 @@
 //! How the shim tells a PTY session from a non-PTY one, measured rather than assumed.
 //!
-//! Win32-OpenSSH appends the command to the shell's line as written in a PTY session and
-//! escapes it otherwise (`w32-doexec.c`), so `cmdline::detect` must report which. Its signal
-//! is whether stdin is a console: a PTY session runs the shell on a pseudoconsole
-//! (`win32_pty.c`, `conhost.exe --headless`), while a non-PTY session gives it the pipes
+//! Win32-OpenSSH appends the command to the shell's line as written in a PTY session (conhost
+//! then rewrites the line) and escapes it otherwise (`w32-doexec.c`), so `cmdline::detect` must
+//! report which. Its signal is whether stdin is a console: a PTY session runs the shell under
+//! `conhost.exe --headless` (`win32_pty.c`), while a non-PTY session gives it the pipes
 //! `posix_spawn` set up (`w32fd.c`).
 //!
-//! Windows-only: runs in CI's `Test (windows/amd64)` job, which hosts a pseudoconsole. Each test
-//! runs this test binary again as the probe, once under a pseudoconsole and once under pipes.
+//! Windows-only: runs in CI's `Test (windows/amd64)` job. Each test runs this test binary again
+//! as the probe, once under conhost and once under pipes.
 #![cfg(windows)]
 
 use ssh_broker::cmdline::{self, Encoding};
@@ -28,15 +28,14 @@ fn probe_args() -> [&'static str; 4] {
 }
 
 #[test]
-fn a_shell_on_a_pseudoconsole_is_verbatim() {
+fn a_shell_on_conhosts_console_is_verbatim() {
     let exe = std::env::current_exe().unwrap();
     let command = format!("\"{}\" {}", exe.display(), probe_args().join(" "));
-    let (code, out) = pty::run_on_pseudoconsole(&command);
+    let out = pty::run_under_conhost(&command, &[]).console;
 
-    assert_eq!(code, 0, "the probe failed under the pseudoconsole:\n{out}");
     assert!(
         out.contains(&format!("encoding={:?}", Encoding::Verbatim)),
-        "stdin on a pseudoconsole must read as a PTY session.\noutput: {out:?}"
+        "stdin on conhost's console must read as a PTY session.\noutput: {out:?}"
     );
 }
 

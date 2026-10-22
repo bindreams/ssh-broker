@@ -48,7 +48,8 @@ unsafe fn set_inheritable(h: HANDLE) -> windows::core::Result<()> {
 }
 
 impl ExecChild {
-    /// Spawn `command` with redirected std streams, optionally in `cwd`.
+    /// Spawn `command` with redirected std streams, optionally in `cwd`. The edges of the command
+    /// are trimmed for `CreateProcessW` ([`crate::shim::spawn_line`]).
     pub fn spawn(command: &str, cwd: Option<&Path>) -> windows::core::Result<ExecChild> {
         unsafe {
             let (stdin_read, stdin_write) = create_pipe()?;
@@ -76,7 +77,10 @@ impl ExecChild {
             si.StartupInfo.hStdError = stderr_write.0;
             si.lpAttributeList = attr.as_ptr();
 
-            let mut cmd: Vec<u16> = command.encode_utf16().chain(std::iter::once(0)).collect();
+            let mut cmd: Vec<u16> = crate::shim::spawn_line(command)
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect();
             let cwd_wide: Option<Vec<u16>> = cwd.map(|c| {
                 use std::os::windows::ffi::OsStrExt;
                 c.as_os_str().encode_wide().chain(std::iter::once(0)).collect()

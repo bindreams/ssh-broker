@@ -6,14 +6,14 @@
 //! in first position selects a subcommand, anything else (bare, or sshd's
 //! `-c "cmd"`) is the shim.
 
-use crate::cmdline;
+use crate::cmdline::{self, RawExec};
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Route {
     /// The SSH DefaultShell. `exec` is `Some(command)` for `-c "cmd"`, `None` for
     /// an interactive (PTY) session.
     Shim {
-        exec: Option<String>,
+        exec: Option<RawExec>,
     },
     Agent,
     Apply,
@@ -25,13 +25,12 @@ pub enum Route {
 /// Dispatch `args` (the arguments after the program name). A known verb in first position
 /// wins; otherwise it is the shim.
 ///
-/// For `-c` the exec command is recovered from `command_line`, the process's raw command
-/// line, not from `args`: sshd does not always quote the command, and `args` has lost the
-/// quotes and spaces it carried. `encoding` says how sshd wrote the line (see
-/// [`cmdline::decode_command`]). Routing never inspects the
-/// command, so every `-c` command takes the same path. If the raw line does not have the
-/// `-c` shape `args` reports, the command is `args[1..]` joined with spaces.
-pub fn route(args: &[String], command_line: &str, encoding: cmdline::Encoding) -> Route {
+/// For `-c` the exec command is the text after `-c` in `command_line`, the process's raw command
+/// line, not `args`: sshd does not always quote the command, and `args` has lost the quotes and
+/// spaces it carried. The tail is kept as written; `cmdline::resolve_exec` decodes it once the
+/// shim knows how sshd wrote it. Both come from the same command line, so it shows the `-c` that
+/// `args` reports; if it does not, the command is `args[1..]` joined with spaces.
+pub fn route(args: &[String], command_line: &str) -> Route {
     match args.first().map(String::as_str) {
         Some("agent") => Route::Agent,
         Some("apply") => Route::Apply,
@@ -40,12 +39,16 @@ pub fn route(args: &[String], command_line: &str, encoding: cmdline::Encoding) -
         Some("-c") => {
             // `-c` was given, so this is an exec request even when the command is empty.
             let exec = match cmdline::dash_c_tail(command_line) {
-                Some(tail) => cmdline::decode_command(tail, encoding),
-                None => args[1..].join(" "),
+                Some(tail) => RawExec::Tail(tail.to_string()),
+                None => {
+                    debug_assert!(
+                        false,
+                        "argv starts with -c but the raw command line has no `-c`: {command_line:?}"
+                    );
+                    RawExec::Argv(args[1..].join(" "))
+                }
             };
-            Route::Shim {
-                exec: crate::shim::normalize_exec(Some(exec)),
-            }
+            Route::Shim { exec: Some(exec) }
         }
         _ => Route::Shim { exec: None },
     }
