@@ -269,10 +269,41 @@ fn install_dir_problem_names_a_foreign_owner_of_an_otherwise_exact_directory() {
     std::fs::create_dir(&dir.0).unwrap();
     set_install_policy(&dir.0, &Sid::current_user().unwrap());
 
+    let me = Sid::current_user().unwrap();
     let problem = install_dir_problem(&dir.0)
         .unwrap()
         .expect("a foreign owner is a problem");
-    assert!(problem.contains("owner"), "{problem}");
+    assert_eq!(
+        problem,
+        format!(
+            "its owner is {} and its ACL is not the hardened one",
+            describe_sid(me.as_psid())
+        )
+    );
+}
+
+/// The owner is the only difference between the accepted and the refused directory, so the
+/// refusal is the owner rule's and not an artefact of the rest of the policy. Elevated (CI only):
+/// setting an owner other than the caller's needs SeRestorePrivilege.
+#[test]
+fn a_trusted_owner_is_accepted_and_a_users_owner_is_refused_with_the_same_acl() {
+    let dir = TempPath::new("owner-control");
+    std::fs::create_dir(&dir.0).unwrap();
+    enable_restore_privilege();
+
+    set_install_policy(&dir.0, &Sid::well_known(WellKnown::Administrators).unwrap());
+    assert!(
+        verify_install_dir_acl(&dir.0).unwrap(),
+        "control: the policy with an Administrators owner must verify"
+    );
+    assert_eq!(install_dir_problem(&dir.0).unwrap(), None);
+
+    set_install_policy(&dir.0, &Sid::well_known(WellKnown::Users).unwrap());
+    assert!(
+        !verify_install_dir_acl(&dir.0).unwrap(),
+        "the same policy with a Users owner must not verify"
+    );
+    assert!(install_dir_problem(&dir.0).unwrap().is_some());
 }
 
 #[test]
