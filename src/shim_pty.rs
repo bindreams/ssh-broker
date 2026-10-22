@@ -17,8 +17,8 @@
 use crate::protocol::{FrameKind, FrameReader, Handshake, Stream, write_frame};
 use crate::relay::{FrameSink, pump_decode, write_data};
 use crate::shim::{
-    FailOpen, Fallback, MouseModeSniffer, XtwinopsFilter, decide_fail_open, decide_fallback, make_handshake,
-    map_outcome, run_exec_on, size_to_resize,
+    FailOpen, Fallback, MouseModeSniffer, XtwinopsFilter, decide_fail_open, decide_fallback, is_blank_command,
+    make_handshake, map_outcome, run_exec_on, size_to_resize,
 };
 use crate::{afunix, conpty, vtinput};
 use std::sync::Arc;
@@ -99,7 +99,11 @@ pub fn run_on(exec: Option<String>, warning: Option<String>) -> anyhow::Result<(
     // later line — so the `tracing::error!` below, the only PTY-mode diagnostic for a failed
     // fallback, went nowhere at all.
     let decision = decide_fail_open(exec);
-    let command = fail_open_command(&decision);
+    let Some(command) = fail_open_command(&decision) else {
+        // A blank exec: nothing to run, so nothing failed.
+        drop(log); // flush: `process::exit` runs no destructors
+        std::process::exit(0)
+    };
     match run_local_passthrough(command) {
         Ok(code) => {
             drop(log); // flush: `process::exit` runs no destructors
@@ -125,11 +129,13 @@ pub fn run_on(exec: Option<String>, warning: Option<String>) -> anyhow::Result<(
 
 /// The command each fail-open outcome runs. Pure, so the interactive arm's program is pinned by a
 /// test rather than by reading `run_on`: an interactive session has nothing of its own to run, so
-/// it gets `pwsh`, while an EXEC command is passed through untouched.
-fn fail_open_command(decision: &FailOpen) -> &str {
+/// it gets `pwsh`, while an EXEC command is passed through untouched. `None` is a blank exec,
+/// which runs nothing.
+fn fail_open_command(decision: &FailOpen) -> Option<&str> {
     match decision {
-        FailOpen::Passthrough(cmd) => cmd.as_str(),
-        FailOpen::LocalShell => "pwsh -NoLogo",
+        FailOpen::Passthrough(cmd) => Some(cmd.as_str()),
+        FailOpen::LocalShell => Some("pwsh -NoLogo"),
+        FailOpen::Nothing => None,
     }
 }
 
@@ -144,8 +150,9 @@ fn try_relay(exec: &Option<String>) -> anyhow::Result<Option<i32>> {
         let msg = "ssh-broker: agent unavailable — falling back to a local shell";
         tracing::warn!("{msg} (path={path:?}, err={:?})", conn.as_ref().err());
         // EXEC has a clean stderr channel; in PTY mode a stderr write would corrupt the
-        // terminal stream, so there the warning goes only to the log file.
-        if exec.is_some() {
+        // terminal stream, so there the warning goes only to the log file. A blank exec runs
+        // nothing, so it needed no agent and gets no warning.
+        if exec.as_deref().is_some_and(|c| !is_blank_command(c)) {
             eprintln!("{msg}");
         }
         return Ok(None);

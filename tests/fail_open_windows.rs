@@ -220,3 +220,26 @@ fn exec_fail_open_decodes_the_escaped_command_of_a_session_without_a_pty() {
         "the quoted argument lost its quotes or its double space.\nstdout: {stdout}\nstderr: {stderr}"
     );
 }
+
+/// An exec whose command is empty or whitespace-only runs nothing and exits 0 with no output, as
+/// the shell does for `-c ""`, rather than failing at `CreateProcessW("")` with 255. The shim
+/// stays silent even though the agent is unreachable: there is nothing to warn about, since no
+/// command needed it. Because the run is silent, only the exit code and the empty streams are
+/// asserted; CI has no agent, so this is the fail-open path (`src/agent_tests.rs` covers the
+/// relayed one).
+#[test]
+fn exec_fail_open_of_a_blank_command_runs_nothing_and_exits_zero() {
+    for blank in ["", " ", "   ", "\t "] {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_ssh-broker"))
+            .args(["-c", blank])
+            .output()
+            .expect("run the shim binary");
+        assert_eq!(out.status.code(), Some(0), "{blank:?}");
+        assert!(
+            out.stdout.is_empty() && out.stderr.is_empty(),
+            "{blank:?} produced output.\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}

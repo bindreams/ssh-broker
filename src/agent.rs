@@ -28,6 +28,8 @@ use crate::protocol::{ExitCode, FrameKind, FrameReader, Handshake, Mode, Resize,
 #[cfg(windows)]
 use crate::relay::{FrameSink, pump_until_peer_gone, write_data};
 #[cfg(windows)]
+use crate::shim::is_blank_command;
+#[cfg(windows)]
 use crate::winutil::OwnedHandle;
 #[cfg(windows)]
 use std::path::{Path, PathBuf};
@@ -117,8 +119,27 @@ fn handle_connection_with(conn: socket2::Socket, hooks: Hooks) -> anyhow::Result
     let cwd = cwd_buf.as_deref();
     match hs.mode {
         Mode::Pty => handle_pty(rx, fr, tx, &command, (hs.cols, hs.rows), cwd, hooks),
+        Mode::Exec if is_blank_command(&command) => handle_blank_exec(rx, fr, tx),
         Mode::Exec => handle_exec(rx, fr, tx, &command, cwd, hooks),
     }
+}
+
+/// An empty or whitespace-only EXEC command runs nothing and exits 0 with no output, as the
+/// shell does for `-c ""`; `CreateProcessW` would fail on it. Ends as `handle_exec` does: EXIT,
+/// close, then read the peer's remaining frames until it is gone, so closing with unread input
+/// cannot reset the connection before the client has the EXIT frame.
+#[cfg(windows)]
+fn handle_blank_exec(mut rx: ConnRx, mut fr: FrameReader, mut tx: ConnTx) -> anyhow::Result<()> {
+    struct Discard;
+    impl FrameSink for Discard {
+        fn on_data(&mut self, _stream: Stream, _bytes: &[u8]) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+    write_frame(&mut tx, FrameKind::Exit, &ExitCode(0).encode())?;
+    let _ = tx.shutdown_both();
+    pump_until_peer_gone(&mut rx, &mut fr, &mut Discard);
+    Ok(())
 }
 
 #[cfg(test)]

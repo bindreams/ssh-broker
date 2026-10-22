@@ -869,3 +869,42 @@ fn teardown_warns_only_when_the_reap_failed() {
         "the warning must say what is about to happen: {w:?}"
     );
 }
+
+/// An empty or whitespace-only exec runs nothing and exits 0 with no output, as the shell does
+/// for `-c ""`; without the check it reaches `CreateProcessW("")`, fails to spawn, and the
+/// handler errors with no EXIT frame, which the shim reports as 255.
+#[test]
+fn agent_exec_of_a_blank_command_runs_nothing_and_exits_zero() {
+    let dir = hardened_dir("blank-exec");
+    let sock = dir.join("s");
+    let listener = Listener::bind(&sock).unwrap();
+
+    for blank in ["", "   ", "\t \r\n"] {
+        let client_path = sock.clone();
+        let command = blank.to_string();
+        let client = thread::spawn(move || {
+            let conn = afunix::connect(&client_path).unwrap();
+            let (mut crx, mut ctx) = afunix::split(conn).unwrap();
+            let hs = Handshake {
+                mode: Mode::Exec,
+                command: Some(command),
+                ..Handshake::pty_default()
+            };
+            write_frame(&mut ctx, FrameKind::Handshake, &hs.encode().unwrap()).unwrap();
+            // As the shim does: stdin-EOF marker, socket kept open for EXIT.
+            let _ = write_data(&mut ctx, Stream::Stdin, b"");
+            let mut fr = FrameReader::new();
+            let mut sink = TestSink::default();
+            let outcome = pump_decode(&mut crx, &mut fr, &mut sink).unwrap();
+            (outcome, sink.stdout, sink.stderr)
+        });
+
+        let conn = listener.accept().unwrap();
+        super::handle_connection(conn).unwrap();
+
+        let (outcome, stdout, stderr) = client.join().unwrap();
+        assert_eq!(outcome, Outcome::Exited(0), "{blank:?}");
+        assert!(stdout.is_empty() && stderr.is_empty(), "{blank:?} produced output");
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}

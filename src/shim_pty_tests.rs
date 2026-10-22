@@ -71,11 +71,16 @@ fn the_local_passthrough_child_is_contained_in_a_job() {
 #[test]
 fn fail_open_maps_interactive_to_pwsh_and_passes_an_exec_command_through() {
     use crate::shim::FailOpen;
-    assert_eq!(super::fail_open_command(&FailOpen::LocalShell), "pwsh -NoLogo");
+    assert_eq!(super::fail_open_command(&FailOpen::LocalShell), Some("pwsh -NoLogo"));
+    assert_eq!(
+        super::fail_open_command(&FailOpen::Nothing),
+        None,
+        "a blank exec runs nothing"
+    );
     let cmd = r#"scp -t "C:\path with spaces\out.bin""#;
     assert_eq!(
         super::fail_open_command(&FailOpen::Passthrough(cmd.to_string())),
-        cmd,
+        Some(cmd),
         "an EXEC command must reach the spawn byte for byte"
     );
 }

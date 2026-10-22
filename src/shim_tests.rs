@@ -3,7 +3,7 @@
 //! PTY path (raw mode, `ReadConsoleInputW`) is exercised on a real Windows host end-to-end.
 use super::{
     ExecOutSink, FailOpen, Fallback, MouseModeSniffer, XtwinopsFilter, decide_fail_open, decide_fallback,
-    make_handshake, map_outcome, size_to_resize,
+    is_blank_command, make_handshake, map_outcome, size_to_resize,
 };
 use crate::protocol::{ExitCode, FrameKind, FrameReader, Handshake, Mode, Resize, Stream, read_one_frame, write_frame};
 use crate::relay::{FrameSink, Outcome, duplex, write_data};
@@ -485,4 +485,26 @@ fn sniffer_focus_independent_of_mouse_flags() {
     t.observe(b"\x1b[?1000h\x1b[?1006h"); // mouse tracking + SGR
     assert!(t.forward_mouse());
     assert!(!t.focus_on());
+}
+
+/// An empty or whitespace-only exec runs nothing, as the shell would for `-c ""`: the fail-open
+/// path must not hand it to `CreateProcessW`, which fails (255) on an empty command line.
+/// "Blank" uses the same separators as `normalize_exec`.
+#[test]
+fn a_blank_exec_fails_open_to_nothing() {
+    for blank in ["", " ", "\t", "\r\n", " \t\r\n "] {
+        assert!(is_blank_command(blank), "{blank:?}");
+        assert_eq!(
+            decide_fail_open(Some(blank.to_string())),
+            FailOpen::Nothing,
+            "{blank:?}"
+        );
+    }
+    // A Unicode space is part of an argument (see `BOUNDARY`), so it is not blank.
+    assert!(!is_blank_command("\u{a0}"));
+    assert!(!is_blank_command("cmd"));
+    assert_eq!(
+        decide_fail_open(Some(" cmd ".to_string())),
+        FailOpen::Passthrough(" cmd ".to_string())
+    );
 }

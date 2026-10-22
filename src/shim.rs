@@ -29,9 +29,9 @@ pub fn run(exec: Option<String>, warning: Option<String>) -> anyhow::Result<()> 
 /// A whitespace-only command stays `Some` and empty. `ssh host " "` is a genuine exec request —
 /// measured against a stock client, only `ssh host ""` degrades to an interactive session — and
 /// mapping it to `None` would route it to the interactive path, handing the caller a shell REPL
-/// on the SSH channel. The empty command then fails at spawn — EXEC calls `CreateProcessW`
-/// directly, with no shell to treat it as a no-op — which is the right outcome: a failed
-/// command rather than a shell.
+/// on the SSH channel. The empty command is then run as nothing, exit 0 ([`is_blank_command`]):
+/// EXEC calls `CreateProcessW` directly, which would fail on it, so the agent and the fail-open
+/// path each check for it first.
 pub(crate) fn normalize_exec(exec: Option<String>) -> Option<String> {
     exec.map(|c| c.trim_matches(BOUNDARY).to_string())
 }
@@ -42,6 +42,12 @@ pub(crate) fn normalize_exec(exec: Option<String>) -> Option<String> {
 /// whose Unicode `White_Space` set would strip characters this pipeline treats as part of an
 /// argument — one definition, used wherever a command's edges are trimmed.
 pub(crate) const BOUNDARY: [char; 4] = [' ', '\t', '\r', '\n'];
+
+/// Whether an exec command is empty or only [`BOUNDARY`] characters. Such a command runs nothing
+/// and exits 0 on every path, as the shell does for `-c ""`; `CreateProcessW` would fail on it.
+pub(crate) fn is_blank_command(command: &str) -> bool {
+    command.trim_matches(BOUNDARY).is_empty()
+}
 
 // ── EXEC relay ───────────────────────────────────────────────────────────────────────
 
@@ -256,6 +262,8 @@ pub enum FailOpen {
     Passthrough(String),
     /// An interactive session carries no command to run, so it gets a plain `pwsh`.
     LocalShell,
+    /// A blank command: run nothing and exit 0, as the shell does for `-c ""`.
+    Nothing,
 }
 
 /// Decide what the fail-open path runs, from whether this session carried a command.
@@ -264,6 +272,7 @@ pub enum FailOpen {
 /// function ends in `process::exit`, so nothing could assert against the choice in place.
 pub fn decide_fail_open(exec: Option<String>) -> FailOpen {
     match exec {
+        Some(cmd) if is_blank_command(&cmd) => FailOpen::Nothing,
         Some(cmd) => FailOpen::Passthrough(cmd),
         None => FailOpen::LocalShell,
     }
