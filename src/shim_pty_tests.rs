@@ -192,3 +192,44 @@ fn enter_rolls_back_only_what_it_actually_changed_on_partial_failure() {
          Drop must not attempt to restore a suppression that was never applied"
     );
 }
+
+/// A directory that refuses new files, removed (deny ACE lifted first) when dropped.
+struct WriteDeniedDir(std::path::PathBuf);
+
+impl WriteDeniedDir {
+    fn new(tag: &str) -> Self {
+        let dir = std::env::temp_dir().join(format!("sb-logdeny-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // DENY beats the runner's admin ALLOW, so this holds for an elevated test process too.
+        let status = std::process::Command::new("icacls")
+            .arg(&dir)
+            .args(["/deny", "*S-1-1-0:(OI)(CI)(WD)"])
+            .status()
+            .expect("run icacls");
+        assert!(status.success(), "icacls /deny should succeed");
+        Self(dir)
+    }
+}
+
+impl Drop for WriteDeniedDir {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new("icacls")
+            .arg(&self.0)
+            .args(["/remove:d", "*S-1-1-0"])
+            .status();
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// The shim is sshd's `DefaultShell`: a panic here exits 101 before the relay or the fail-open
+/// path runs, and the user loses SSH access. A log directory the user cannot write (any non-admin
+/// account once `logs\` is no longer user-writable) must disable logging, not abort the shim.
+#[test]
+fn file_logging_is_disabled_not_fatal_when_the_log_directory_is_unwritable() {
+    let dir = WriteDeniedDir::new("unwritable");
+    assert!(
+        super::init_file_logging_in(&dir.0).is_none(),
+        "an unwritable log directory must yield no logging, not a guard"
+    );
+}

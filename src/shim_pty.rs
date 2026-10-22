@@ -655,9 +655,14 @@ impl<Ops: ConsoleOps> Drop for ConsoleModesState<Ops> {
 /// Initialise a rolling file log under ProgramData. Best-effort: returns `None` (logging
 /// disabled) on any failure so the shim still works. NEVER logs to stdout/stderr in PTY mode.
 fn init_file_logging() -> Option<tracing_appender::non_blocking::WorkerGuard> {
-    let dir = log_dir();
-    std::fs::create_dir_all(&dir).ok()?;
-    let appender = tracing_appender::rolling::daily(&dir, "shim.log");
+    init_file_logging_in(&log_dir())
+}
+
+/// [`init_file_logging`] against an explicit directory, so a test can point it at one that
+/// refuses writes.
+fn init_file_logging_in(dir: &std::path::Path) -> Option<tracing_appender::non_blocking::WorkerGuard> {
+    std::fs::create_dir_all(dir).ok()?;
+    let appender = tracing_appender::rolling::daily(dir, "shim.log");
     let (nb, guard) = tracing_appender::non_blocking(appender);
     let _ = tracing_subscriber::fmt().with_writer(nb).with_ansi(false).try_init();
     Some(guard)
