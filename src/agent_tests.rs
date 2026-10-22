@@ -522,13 +522,24 @@ fn wait_then_exit(event: &str) -> String {
 /// complete *before* the marker is printed, so a client that has read the marker can always
 /// read a valid pid and the grandchild is guaranteed to exist.
 ///
-/// `window` selects how the grandchild is attached: `-NoNewWindow` keeps it on the parent's
-/// console and standard handles, the default gives it a fresh console. Exactly which handles
-/// each variant inherits was NOT verified here — .NET's `Process.Start` sets
+/// `inherit_stdio` selects how the grandchild is attached: `-NoNewWindow` keeps it on the
+/// parent's console and standard handles, otherwise it gets a fresh console. Exactly which
+/// handles each variant inherits was NOT verified here — .NET's `Process.Start` sets
 /// `bInheritHandles` either way — so treat the pair as two attachment shapes that must both be
 /// reaped, not as a claim about handle inheritance.
+///
+/// The fresh console is created hidden so no test opens a window on the developer's desktop:
+/// conhost does not hand a console whose client set `STARTF_USESHOWWINDOW` + `SW_HIDE` to the
+/// default terminal (`_shouldAttemptHandoff`, microsoft/terminal `src/server/IoDispatchers.cpp`).
+/// `-Environment @{}` is a no-op that forces `Start-Process` onto its `CreateProcess` path,
+/// which sets that flag itself (PowerShell `Process.cs`, `SetStartupInfo` and
+/// `StartWithCreateProcess`); the default `ShellExecute` path leaves it to the shell.
 fn grandchild_cmd(pidfile: &std::path::Path, tail: &str, inherit_stdio: bool) -> String {
-    let window = if inherit_stdio { "-NoNewWindow " } else { "" };
+    let window = if inherit_stdio {
+        "-NoNewWindow "
+    } else {
+        "-WindowStyle Hidden -Environment @{} "
+    };
     format!(
         "pwsh.exe -NoLogo -NoProfile -Command \"$p = Start-Process pwsh.exe {window}-ArgumentList \
          '-NoLogo','-NoProfile','-Command','{SLEEP_FOREVER}' -PassThru; \
