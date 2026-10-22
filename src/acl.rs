@@ -24,8 +24,8 @@ use anyhow::Context;
 use windows::Wdk::Foundation::OBJECT_ATTRIBUTES;
 use windows::Wdk::Storage::FileSystem::{FILE_OPEN_FOR_BACKUP_INTENT, FILE_OPEN_REPARSE_POINT, NtOpenFile};
 use windows::Win32::Foundation::{
-    CloseHandle, ERROR_ALREADY_EXISTS, HANDLE, HLOCAL, LocalFree, OBJ_CASE_INSENSITIVE, RtlNtStatusToDosError,
-    STATUS_ACCESS_DENIED, UNICODE_STRING,
+    CloseHandle, ERROR_ALREADY_EXISTS, HANDLE, HLOCAL, LocalFree, NTSTATUS, OBJ_CASE_INSENSITIVE,
+    RtlNtStatusToDosError, STATUS_ACCESS_DENIED, UNICODE_STRING,
 };
 use windows::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, GetNamedSecurityInfoW,
@@ -495,14 +495,34 @@ fn open_for_inspection(dir: &Path) -> anyhow::Result<Option<OwnedHandle>> {
             FILE_OPEN_FOR_BACKUP_INTENT.0 | FILE_OPEN_REPARSE_POINT.0,
         )
     };
+    match classify_open(status) {
+        OpenOutcome::Opened => Ok(Some(OwnedHandle(handle))),
+        OpenOutcome::Denied => Ok(None),
+        OpenOutcome::Failed(status) => {
+            let win32 = unsafe { RtlNtStatusToDosError(status) };
+            Err(windows::core::Error::from(HRESULT::from_win32(win32)))
+                .with_context(|| format!("open {}", dir.display()))
+        }
+    }
+}
+
+/// What [`open_for_inspection`]'s `NtOpenFile` status means.
+#[derive(Debug, PartialEq, Eq)]
+enum OpenOutcome {
+    Opened,
+    /// The object refuses even the inspection rights; not an error of the inspection.
+    Denied,
+    Failed(NTSTATUS),
+}
+
+fn classify_open(status: NTSTATUS) -> OpenOutcome {
     if status.0 >= 0 {
-        return Ok(Some(OwnedHandle(handle)));
+        OpenOutcome::Opened
+    } else if status == STATUS_ACCESS_DENIED {
+        OpenOutcome::Denied
+    } else {
+        OpenOutcome::Failed(status)
     }
-    if status == STATUS_ACCESS_DENIED {
-        return Ok(None);
-    }
-    let win32 = unsafe { RtlNtStatusToDosError(status) };
-    Err(windows::core::Error::from(HRESULT::from_win32(win32))).with_context(|| format!("open {}", dir.display()))
 }
 
 /// `dir` as an NT object-manager path (`\??\C:\...`), UTF-16 without a terminator.
@@ -528,9 +548,29 @@ fn nt_path(dir: &Path) -> anyhow::Result<Vec<u16>> {
     Ok([units(prefix).as_slice(), rest].concat())
 }
 
+/// The ACEs of [`INSTALL_DIR_SDDL`], as [`Security::dacl_matches`] takes them.
+fn install_grants<'a>(system: &'a Sid, admins: &'a Sid, users: &'a Sid) -> [Grant<'a>; 3] {
+    let grant = |sid, mask| Grant {
+        sid,
+        mask,
+        flags: Some(INSTALL_ACE_FLAGS),
+    };
+    [
+        grant(system, FILE_ALL_ACCESS.0),
+        grant(admins, FILE_ALL_ACCESS.0),
+        grant(users, FILE_GENERIC_READ.0 | FILE_GENERIC_EXECUTE.0),
+    ]
+}
+
 /// Why `dir` is not an install directory this build made, or `None` if it is one.
 pub fn install_dir_problem(dir: &Path) -> anyhow::Result<Option<String>> {
-    let Some(handle) = open_for_inspection(dir)? else {
+    problem_from_open(dir, open_for_inspection(dir)?)
+}
+
+/// [`install_dir_problem`] given the outcome of opening `dir` for inspection: `None` means the
+/// open was denied.
+fn problem_from_open(dir: &Path, handle: Option<OwnedHandle>) -> anyhow::Result<Option<String>> {
+    let Some(handle) = handle else {
         return Ok(Some(
             "this process is denied access to read its ACL, so it cannot be shown to be the hardened one".to_owned(),
         ));
@@ -554,16 +594,7 @@ pub fn install_dir_problem(dir: &Path) -> anyhow::Result<Option<String>> {
     let system = Sid::well_known(WellKnown::System)?;
     let admins = Sid::well_known(WellKnown::Administrators)?;
     let users = Sid::well_known(WellKnown::Users)?;
-    let grant = |sid, mask| Grant {
-        sid,
-        mask,
-        flags: Some(INSTALL_ACE_FLAGS),
-    };
-    let grants = [
-        grant(&system, FILE_ALL_ACCESS.0),
-        grant(&admins, FILE_ALL_ACCESS.0),
-        grant(&users, FILE_GENERIC_READ.0 | FILE_GENERIC_EXECUTE.0),
-    ];
+    let grants = install_grants(&system, &admins, &users);
     // `INSTALL_DIR_SDDL` makes Administrators the owner, so nothing else is accepted.
     let owner_ok = security.owner_in(&[&admins])?;
     let acl_ok = security.dacl_matches(&grants)?;

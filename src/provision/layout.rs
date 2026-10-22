@@ -76,13 +76,25 @@ pub fn check_base(layout: &Layout) -> BaseCheck<'_> {
     }
 }
 
-/// The target account by name: CLI `--user` > the saved config > the interactive user.
+/// The target account by name: CLI `--user` > the saved config > the interactive user. The
+/// config is read only when `--user` does not settle it, so a damaged config cannot block the
+/// `apply --user X` that repairs it.
 pub fn resolve_user(
     base: &TrustedBase<'_>,
     cli_user: Option<&str>,
     current_user: Option<&str>,
 ) -> anyhow::Result<String> {
-    config::resolve_target_user(cli_user, saved_user(base)?.as_deref(), current_user)
+    let saved = if cli_user.is_some_and(|user| !user.is_empty()) {
+        None
+    } else {
+        saved_user(base).with_context(|| {
+            format!(
+                "fix or delete {}, or pass --user <account>",
+                base.layout.config_path().display()
+            )
+        })?
+    };
+    config::resolve_target_user(cli_user, saved.as_deref(), current_user)
 }
 
 /// The account recorded in the saved config, or `None` if there is no config. A config that

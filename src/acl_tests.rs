@@ -117,11 +117,16 @@ fn hardened_dir_with_inheritance_enabled_does_not_verify() {
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use windows::Win32::Foundation::{ERROR_SUCCESS, GetLastError, LUID};
-use windows::Win32::Security::{
-    AdjustTokenPrivileges, LUID_AND_ATTRIBUTES, LookupPrivilegeValueW, SE_PRIVILEGE_ENABLED, SE_RESTORE_NAME,
-    TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES,
+use windows::Win32::Foundation::{
+    ERROR_SUCCESS, GetLastError, LUID, STATUS_OBJECT_NAME_NOT_FOUND, STATUS_OBJECT_PATH_NOT_FOUND,
+    STATUS_SHARING_VIOLATION, STATUS_SUCCESS,
 };
+use windows::Win32::Security::{
+    AdjustTokenPrivileges, DuplicateTokenEx, LUID_AND_ATTRIBUTES, LookupPrivilegeValueW, SE_PRIVILEGE_ENABLED,
+    SE_RESTORE_NAME, SecurityImpersonation, TOKEN_ADJUST_PRIVILEGES, TOKEN_ALL_ACCESS, TOKEN_DUPLICATE,
+    TOKEN_PRIVILEGES, TokenImpersonation,
+};
+use windows::Win32::System::Threading::SetThreadToken;
 
 /// A not-yet-created path under the temp dir that is removed on drop.
 struct TempPath(PathBuf);
@@ -540,10 +545,39 @@ fn verify_install_dir_acl_rejects_a_reduced_mask_for_administrators() {
     );
 }
 
+/// The security descriptor of `sddl`, held in memory (never applied to an object).
+fn in_memory(sddl: &str) -> Security {
+    let sddl_w: Vec<u16> = sddl.encode_utf16().chain(std::iter::once(0)).collect();
+    unsafe {
+        let mut psd = PSECURITY_DESCRIPTOR::default();
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(PCWSTR(sddl_w.as_ptr()), SDDL_REVISION_1, &mut psd, None)
+            .unwrap();
+        let sd = LocalSd(psd);
+        let (mut present, mut defaulted) = (BOOL(0), BOOL(0));
+        let mut dacl: *mut ACL = std::ptr::null_mut();
+        GetSecurityDescriptorDacl(psd, &mut present, &mut dacl, &mut defaulted).unwrap();
+        let mut owner = PSID::default();
+        GetSecurityDescriptorOwner(psd, &mut owner, &mut defaulted).unwrap();
+        Security { sd, dacl, owner }
+    }
+}
+
+/// The ACL helper APIs and the file system merge identical ACEs when a DACL is applied to an
+/// object, so a duplicate cannot be put on a directory; the check is exercised in memory.
 #[test]
-fn verify_install_dir_acl_rejects_a_duplicate_ace() {
-    let sddl = INSTALL_DIR_SDDL.replace("(A;OICI;FA;;;SY)", "(A;OICI;FA;;;SY)(A;OICI;FA;;;SY)");
-    assert_refused_with_acl_problem("dup", sddl);
+fn the_install_policy_rejects_a_duplicate_ace_and_accepts_the_exact_acl() {
+    let system = Sid::well_known(WellKnown::System).unwrap();
+    let admins = Sid::well_known(WellKnown::Administrators).unwrap();
+    let users = Sid::well_known(WellKnown::Users).unwrap();
+    let grants = install_grants(&system, &admins, &users);
+    let exact = in_memory(INSTALL_DIR_SDDL);
+    let duplicated = in_memory(&INSTALL_DIR_SDDL.replace("(A;OICI;FA;;;SY)", "(A;OICI;FA;;;SY)(A;OICI;FA;;;SY)"));
+
+    assert!(exact.dacl_matches(&grants).unwrap(), "positive control");
+    assert!(
+        !duplicated.dacl_matches(&grants).unwrap(),
+        "four ACEs, one grantee twice"
+    );
 }
 
 #[test]
@@ -607,21 +641,82 @@ fn install_dir_problem_is_reported_for_a_dir_denying_everyone_write() {
     icacls_str(&dir.0, &["/remove:d", "*S-1-1-0"]);
 }
 
-/// Elevated (CI only): the owner is SYSTEM, so this user has no implicit READ_CONTROL, and the
-/// DACL denies it to everyone. Administrators keep DELETE and listing so the test can clean up.
+#[test]
+fn an_inspection_open_maps_each_status_to_one_outcome() {
+    assert_eq!(classify_open(STATUS_SUCCESS), OpenOutcome::Opened);
+    assert_eq!(classify_open(STATUS_ACCESS_DENIED), OpenOutcome::Denied);
+    for status in [
+        STATUS_OBJECT_NAME_NOT_FOUND,
+        STATUS_SHARING_VIOLATION,
+        STATUS_OBJECT_PATH_NOT_FOUND,
+    ] {
+        assert_eq!(classify_open(status), OpenOutcome::Failed(status));
+    }
+}
+
+#[test]
+fn a_dir_whose_acl_cannot_be_opened_is_a_problem_that_says_so() {
+    let problem = problem_from_open(Path::new("anything"), None)
+        .unwrap()
+        .expect("an unreadable ACL is a problem");
+
+    assert!(problem.contains("denied access to read its ACL"), "{problem}");
+}
+
+/// Runs `f` on this thread with a copy of the process token that holds no privileges, so
+/// SeBackupPrivilege/SeRestorePrivilege (enabled process-wide by other tests) cannot grant access
+/// that the DACL withholds. Other threads keep the process token.
+fn without_privileges<T>(f: impl FnOnce() -> T) -> T {
+    struct Revert;
+    impl Drop for Revert {
+        fn drop(&mut self) {
+            unsafe { SetThreadToken(None, None) }.expect("revert to the process token");
+        }
+    }
+    unsafe {
+        let mut process = HANDLE::default();
+        OpenProcessToken(GetCurrentProcess(), TOKEN_DUPLICATE | TOKEN_QUERY, &mut process).unwrap();
+        let _process = OwnedHandle(process);
+        let mut copy = HANDLE::default();
+        DuplicateTokenEx(
+            process,
+            TOKEN_ALL_ACCESS,
+            None,
+            SecurityImpersonation,
+            TokenImpersonation,
+            &mut copy,
+        )
+        .unwrap();
+        let _copy = OwnedHandle(copy);
+        // Removes every privilege.
+        AdjustTokenPrivileges(copy, true, None, 0, None, None).unwrap();
+        SetThreadToken(None, Some(copy)).unwrap();
+    }
+    let _revert = Revert;
+    f()
+}
+
+/// A directory this user owns whose DACL denies READ_CONTROL to everyone and (OWNER RIGHTS)
+/// withholds the owner's implicit READ_CONTROL, so only a privilege could open it for its ACL.
 #[test]
 fn install_dir_problem_says_so_when_the_acl_cannot_be_read() {
     let dir = TempPath::new("no-read-control");
     std::fs::create_dir(&dir.0).unwrap();
-    enable_restore_privilege();
-    set_security(&dir.0, "O:SYD:P(D;;RC;;;WD)(A;;0x10001;;;BA)(A;;FA;;;SY)");
+    let me = Sid::current_user().unwrap().to_sddl().unwrap();
+    set_security(&dir.0, &format!("O:{me}D:P(D;;RC;;;WD)(A;;;;;OW)(A;;0x10001;;;{me})"));
 
-    assert!(open_for_inspection(&dir.0).unwrap().is_none());
-    let problem = install_dir_problem(&dir.0)
-        .unwrap()
-        .expect("an unreadable ACL is a problem");
+    let (opened, problem, ensured) = without_privileges(|| {
+        (
+            open_for_inspection(&dir.0).map(|handle| handle.is_some()),
+            install_dir_problem(&dir.0),
+            ensure_install_dir(&dir.0),
+        )
+    });
+
+    assert!(!opened.unwrap(), "the open must be denied, not fail");
+    let problem = problem.unwrap().expect("an unreadable ACL is a problem");
     assert!(problem.contains("denied access to read its ACL"), "{problem}");
-    assert!(ensure_install_dir(&dir.0).is_err());
+    assert!(ensured.is_err());
 }
 
 #[test]

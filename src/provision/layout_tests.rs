@@ -177,7 +177,31 @@ fn resolve_user_fails_on_a_malformed_config_instead_of_falling_back() {
     std::fs::write(base.0.join("config.toml"), "target_user = [").unwrap();
     let layout = base.layout();
 
-    assert!(resolve_user(&forged(&layout), None, Some("me")).is_err());
+    let err = format!("{:#}", resolve_user(&forged(&layout), None, Some("me")).unwrap_err());
+
+    assert!(err.contains("config.toml"), "{err}");
+    assert!(err.contains("--user"), "the error says how to recover: {err}");
+}
+
+#[test]
+fn resolve_user_ignores_a_malformed_config_when_the_cli_names_the_user() {
+    let base = TempBase::existing("resolve-bad-cli");
+    std::fs::write(base.0.join("config.toml"), "target_user = [").unwrap();
+    let layout = base.layout();
+
+    assert_eq!(
+        resolve_user(&forged(&layout), Some("cli-user"), Some("me")).unwrap(),
+        "cli-user"
+    );
+}
+
+#[test]
+fn resolve_user_reads_the_config_for_an_empty_cli_user() {
+    let base = TempBase::existing("resolve-bad-empty-cli");
+    std::fs::write(base.0.join("config.toml"), "target_user = [").unwrap();
+    let layout = base.layout();
+
+    assert!(resolve_user(&forged(&layout), Some(""), Some("me")).is_err());
 }
 
 // The apply sequence ----------------------------------------------------------------------
