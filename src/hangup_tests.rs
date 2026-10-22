@@ -184,3 +184,52 @@ fn wake_pairs_are_independent() {
         std::io::ErrorKind::WouldBlock
     );
 }
+
+/// A foreign connection reset before it is accepted consumes its queue entry; it does not abort
+/// the wake pair's creation.
+#[test]
+fn a_foreign_connection_reset_before_accept_does_not_abort_the_pair() {
+    let (rx, tx) = wake_pair_with(|addr| {
+        for _ in 0..50 {
+            let foreign = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
+            foreign.connect(&SockAddr::from(addr)).unwrap();
+            // A zero linger turns the close into a RST.
+            foreign.set_linger(Some(std::time::Duration::ZERO)).unwrap();
+            drop(foreign);
+        }
+    })
+    .unwrap();
+
+    (&tx).write_all(b"w").unwrap();
+    rx.set_nonblocking(false).unwrap();
+    let mut got = [0u8; 1];
+    (&rx).read_exact(&mut got).unwrap();
+    assert_eq!(&got, b"w");
+}
+
+/// `accept` failing with a reset or an abort means the queue entry is gone, so the loop accepts
+/// again; the real OS rarely surfaces this on loopback, so the errors are injected.
+#[test]
+fn accept_own_skips_entries_the_peer_reset_and_returns_the_matching_one() {
+    use std::io::{Error, ErrorKind};
+    let own: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+    let foreign: SocketAddr = "127.0.0.1:6000".parse().unwrap();
+    let mut script = vec![
+        Err(Error::from(ErrorKind::ConnectionReset)),
+        Ok(("foreign", Some(foreign))),
+        Err(Error::from(ErrorKind::ConnectionAborted)),
+        Ok(("ours", Some(own))),
+    ]
+    .into_iter();
+    let got = accept_own(own, || script.next().expect("accepted past the matching entry")).unwrap();
+    assert_eq!(got, "ours");
+}
+
+/// Any other `accept` failure is a real error and ends the pair's creation.
+#[test]
+fn accept_own_propagates_other_accept_errors() {
+    use std::io::{Error, ErrorKind};
+    let own: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+    let err = accept_own::<()>(own, || Err(Error::from(ErrorKind::PermissionDenied))).unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::PermissionDenied);
+}

@@ -189,15 +189,35 @@ fn wake_pair_with(listening: impl FnOnce(SocketAddr)) -> std::io::Result<(TcpStr
 
     let tx = TcpStream::connect(addr)?;
     let tx_local = tx.local_addr()?;
-    let rx = loop {
+    let rx = accept_own(tx_local, || {
         let (conn, peer) = listener.accept()?;
-        if peer.as_socket() == Some(tx_local) {
-            break TcpStream::from(conn);
-        }
-    };
+        Ok((TcpStream::from(conn), peer.as_socket()))
+    })?;
     rx.set_nonblocking(true)?;
     tx.set_nonblocking(true)?;
     Ok((rx, tx))
+}
+
+/// Calls `accept` until it yields the connection whose peer is `own`, dropping the others.
+///
+/// A foreign connection reset or aborted before it is accepted is a consumed queue entry, not a
+/// failure, so it is accepted past like any other foreign one. Every other error is returned.
+fn accept_own<C>(
+    own: SocketAddr,
+    mut accept: impl FnMut() -> std::io::Result<(C, Option<SocketAddr>)>,
+) -> std::io::Result<C> {
+    loop {
+        match accept() {
+            Ok((conn, peer)) if peer == Some(own) => return Ok(conn),
+            Ok(_) => {}
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+                ) => {}
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 fn exclusive_addr_use(socket: &Socket) -> std::io::Result<()> {
