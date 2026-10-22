@@ -23,6 +23,7 @@ checked.
 | Module | Responsibility |
 |---|---|
 | `route` | argv → entry point. A known verb wins; anything else is the shim |
+| `cmdline` | the raw command line and the exact `-c` command sshd sent (argv has lost its quotes) |
 | `shim`, `shim_pty` | the SSH side: console raw mode, input encoding, fail-open |
 | `agent` | the interactive-session side: accept, handshake, relay threads, teardown |
 | `conpty` | pseudoconsole host for the PTY path |

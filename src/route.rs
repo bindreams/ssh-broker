@@ -6,6 +6,8 @@
 //! in first position selects a subcommand, anything else (bare, or sshd's
 //! `-c "cmd"`) is the shim.
 
+use crate::cmdline;
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum Route {
     /// The SSH DefaultShell. `exec` is `Some(command)` for `-c "cmd"`, `None` for
@@ -20,26 +22,30 @@ pub enum Route {
     VerifyProbe,
 }
 
-/// Dispatch `argv[1..]` (the args after the program name). A known verb in first
-/// position wins; otherwise it is the shim. For `-c`, the exec command is
-/// `args[1..]` joined with spaces — so a command that arrives split across argv
-/// (rather than as a single string) is reassembled instead of truncated.
-pub fn route(args: &[String]) -> Route {
+/// Dispatch `args` (the arguments after the program name). A known verb in first position
+/// wins; otherwise it is the shim.
+///
+/// For `-c` the exec command is recovered from `command_line`, the process's raw command
+/// line, not from `args`: sshd does not always quote the command, and `args` has lost the
+/// quotes and spaces it carried (see [`cmdline::decode_command`]). Routing never inspects the
+/// command, so every `-c` command takes the same path. If the raw line does not have the
+/// `-c` shape `args` reports, the command is `args[1..]` joined with spaces.
+pub fn route(args: &[String], command_line: &str) -> Route {
     match args.first().map(String::as_str) {
         Some("agent") => Route::Agent,
         Some("apply") => Route::Apply,
         Some("verify") => Route::Verify,
         Some("verify-probe") => Route::VerifyProbe,
         Some("-c") => {
-            // Reassemble the command from args[1..] so a command that arrives split
-            // across argv is not truncated. `-c` with nothing after it degrades to an
-            // interactive shim (no command).
-            let exec = if args.len() > 1 {
-                crate::shim::normalize_exec(Some(args[1..].join(" ")))
-            } else {
-                None
+            // `-c` with no command after it degrades to an interactive shim.
+            let exec = match cmdline::dash_c_tail(command_line) {
+                Some(tail) => cmdline::decode_command(tail),
+                None if args.len() > 1 => Some(args[1..].join(" ")),
+                None => None,
             };
-            Route::Shim { exec }
+            Route::Shim {
+                exec: crate::shim::normalize_exec(exec),
+            }
         }
         _ => Route::Shim { exec: None },
     }

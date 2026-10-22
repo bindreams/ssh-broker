@@ -64,15 +64,10 @@ fn exec_fail_open_runs_the_command_with_no_shell_in_between() {
     );
 }
 
-/// The same path, with the agent unreachable: an unquoted program path containing spaces, with
-/// arguments after it, must still launch. `CreateProcessW` resolves it by prefix widening, so the
-/// shim must pass the command line through without tokenizing it (see
-/// `src/agent_program_path_tests.rs` for the relayed twin).
-///
-/// The program is a copy of `cmd.exe` in `Spaced Dir`, so the test needs no fixture binary.
-#[test]
-fn exec_fail_open_runs_an_unquoted_program_path_containing_spaces() {
-    let root = std::env::temp_dir().join(format!("sb-failopen-spaced-{}", std::process::id()));
+/// Create `<tmp>\<tag>-<pid>\Spaced Dir\sftp-server.exe`, a copy of `cmd.exe`, and return the
+/// root and the program path. A copy of `cmd.exe` needs no fixture binary.
+fn spaced_program(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+    let root = std::env::temp_dir().join(format!("{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     let program_dir = root.join("Spaced Dir");
     std::fs::create_dir_all(&program_dir).unwrap();
@@ -83,10 +78,74 @@ fn exec_fail_open_runs_an_unquoted_program_path_containing_spaces() {
         &program,
     )
     .unwrap();
+    (root, program)
+}
 
+/// Assert that the shim, launched as `cmd`, took the fail-open path and ran the program.
+fn assert_unquoted_program_ran(out: &std::process::Output) {
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("agent unavailable"),
+        "precondition: the fail-open path must be the one that ran, not the relay.\nstderr: {stderr}"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("unquoted-ok"),
+        "the unquoted spaced program did not run.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+}
+
+/// The same path, with the agent unreachable: an unquoted program path containing spaces, with
+/// arguments after it, must still launch. `CreateProcessW` resolves it by prefix widening, so the
+/// shim must pass the command line through without tokenizing it (see
+/// `src/agent_program_path_tests.rs` for the relayed twin).
+///
+/// The command arrives as one argument, which is how sshd passes it in a session without a PTY.
+#[test]
+fn exec_fail_open_runs_an_unquoted_program_path_containing_spaces() {
+    let (root, program) = spaced_program("sb-failopen-spaced");
     let command = format!("{} /c echo unquoted-ok", program.display());
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_ssh-broker"))
         .args(["-c", &command])
+        .output()
+        .expect("run the shim binary");
+    let _ = std::fs::remove_dir_all(&root);
+
+    assert_unquoted_program_ran(&out);
+}
+
+/// As above, but the command is appended to the command line verbatim, which is how sshd passes
+/// it in a PTY session (`ssh -t host cmd`). The C runtime then splits it at the space inside the
+/// path, so only the raw command line still holds the program path whole.
+///
+/// `raw_arg` is what makes this the PTY shape: `.arg` would wrap the text in quotes.
+#[test]
+fn exec_fail_open_runs_an_unquoted_program_path_appended_to_the_command_line() {
+    use std::os::windows::process::CommandExt;
+
+    let (root, program) = spaced_program("sb-failopen-spaced-raw");
+    let command = format!("{} /c echo unquoted-ok", program.display());
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_ssh-broker"))
+        .arg("-c")
+        .raw_arg(&command)
+        .output()
+        .expect("run the shim binary");
+    let _ = std::fs::remove_dir_all(&root);
+
+    assert_unquoted_program_ran(&out);
+}
+
+/// A PTY-shaped command keeps its quotes: the quoted program path is found, and the quoted
+/// argument reaches the program as written, double space and quotes included.
+#[test]
+fn exec_fail_open_keeps_the_quotes_of_a_command_appended_to_the_command_line() {
+    use std::os::windows::process::CommandExt;
+
+    let (root, program) = spaced_program("sb-failopen-quoted-raw");
+    let command = format!(r#""{}" /c echo "quoted  ok""#, program.display());
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_ssh-broker"))
+        .arg("-c")
+        .raw_arg(&command)
         .output()
         .expect("run the shim binary");
     let _ = std::fs::remove_dir_all(&root);
@@ -98,7 +157,7 @@ fn exec_fail_open_runs_an_unquoted_program_path_containing_spaces() {
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        stdout.contains("unquoted-ok"),
-        "the unquoted spaced program did not run.\nstdout: {stdout}\nstderr: {stderr}"
+        stdout.contains(r#""quoted  ok""#),
+        "the quoted argument lost its quotes or its double space (cmd echoes the quotes it is given).\nstdout: {stdout}\nstderr: {stderr}"
     );
 }

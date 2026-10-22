@@ -29,6 +29,7 @@ cosca = "0.5"
 
 windows = { version = "0.62.2", features = [
     "Win32_System_Console",
+    "Win32_System_Environment",    # GetCommandLineW: the shim recovers sshd's exact `-c` text
     "Win32_Foundation",
     "Win32_System_Pipes",
     "Win32_System_Threading",
