@@ -171,8 +171,9 @@ impl Drop for Waker {
 /// A connected loopback TCP pair `(receiving, sending)` that nothing else can reach.
 ///
 /// The listener's exact address cannot be rebound (measured, with or without
-/// `SO_EXCLUSIVEADDRUSE`). A wildcard bind on its port does succeed, but it does not receive
-/// connects to `127.0.0.1:port`. The listener is closed as soon as the pair exists. A foreign
+/// `SO_EXCLUSIVEADDRUSE` on the listener: 10048, or 10013 with `SO_REUSEADDR`). A wildcard bind
+/// on its port succeeds unless the second socket itself sets `SO_EXCLUSIVEADDRUSE` (10048), and
+/// it does not receive connects to `127.0.0.1:port`. The listener is closed as soon as the pair exists. A foreign
 /// process may still connect to the port before that; [`accept_own`] is what excludes it: the
 /// accepted connection is ours only if its peer address is the connecting socket's own, and any
 /// other is dropped.
