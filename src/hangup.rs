@@ -23,7 +23,7 @@ use windows::Win32::Networking::WinSock::{
     WSAPOLL_EVENT_FLAGS, WSAPOLLFD, WSAPoll, setsockopt,
 };
 
-/// Waits for the peer of a session socket to hang up. See the module docs.
+/// Waits for the peer of a session socket to hang up.
 pub struct HangupWatcher {
     session: Socket,
     wake_rx: TcpStream,
@@ -47,8 +47,7 @@ enum Ready {
     Wake,
 }
 
-/// Bytes read from the wake channel per call. Anything arriving there only means "re-check the
-/// teardown flag", so the size only bounds how often that happens.
+/// Bytes read from the wake channel per call; only bounds how often the flag is re-checked.
 const WAKE_READ_BUF: usize = 64 * 1024;
 
 impl HangupWatcher {
@@ -139,7 +138,10 @@ impl HangupWatcher {
                 Ok(_) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return,
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(_) => return self.wake_closed.set(true),
+                Err(e) => {
+                    tracing::warn!("reading the hangup watcher's wake channel failed; no longer polling it: {e}");
+                    return self.wake_closed.set(true);
+                }
             }
         }
     }
@@ -160,7 +162,7 @@ impl Waker {
 
 impl Drop for Waker {
     fn drop(&mut self) {
-        // The flag first: closing `wake_tx` right after is what wakes the watcher.
+        // Set the flag before waking, so the watcher sees it when it re-checks.
         self.torn_down.store(true, Ordering::Release);
     }
 }
@@ -170,13 +172,14 @@ impl Drop for Waker {
 /// The listener sets `SO_EXCLUSIVEADDRUSE`, so no other process can bind its port, and is closed
 /// as soon as the pair exists. A foreign process may still connect to the port before that; the
 /// accepted connection is ours only if its peer address is the connecting socket's own, and any
-/// other is dropped. Each foreign connection is consumed by the loop, so it ends without a bound.
+/// other is dropped.
 fn wake_pair() -> std::io::Result<(TcpStream, TcpStream)> {
-    wake_pair_with(|_| {})
+    wake_pair_with(|_, _| {})
 }
 
-/// [`wake_pair`], calling `listening` with the listener's address once it accepts connections.
-fn wake_pair_with(listening: impl FnOnce(SocketAddr)) -> std::io::Result<(TcpStream, TcpStream)> {
+/// [`wake_pair`], calling `listening` with the listener and its address once it accepts
+/// connections.
+fn wake_pair_with(listening: impl FnOnce(&Socket, SocketAddr)) -> std::io::Result<(TcpStream, TcpStream)> {
     let listener = Socket::new(Domain::IPV4, Type::STREAM, None)?;
     exclusive_addr_use(&listener)?;
     listener.bind(&SockAddr::from(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)))?;
@@ -185,7 +188,7 @@ fn wake_pair_with(listening: impl FnOnce(SocketAddr)) -> std::io::Result<(TcpStr
         .local_addr()?
         .as_socket()
         .ok_or_else(|| std::io::Error::other("the wake listener has no socket address"))?;
-    listening(addr);
+    listening(&listener, addr);
 
     let tx = TcpStream::connect(addr)?;
     let tx_local = tx.local_addr()?;

@@ -32,7 +32,9 @@ use crate::winutil::OwnedHandle;
 #[cfg(windows)]
 use std::path::{Path, PathBuf};
 #[cfg(windows)]
-use std::sync::{Arc, Mutex};
+use std::sync::mpsc::TrySendError;
+#[cfg(windows)]
+use std::sync::{Arc, Condvar, Mutex};
 
 /// Bind the hardened socket and serve connections, one handler thread each. Single-instance
 /// is enforced by a named mutex acquired before binding.
@@ -79,15 +81,32 @@ pub fn child_cwd(handshake_cwd: &str, home: Option<std::path::PathBuf>) -> Optio
 /// Read the handshake, then dispatch to the PTY or EXEC relay.
 #[cfg(windows)]
 fn handle_connection(conn: socket2::Socket) -> anyhow::Result<()> {
-    handle_connection_with(conn, HangupWatcher::new)
+    handle_connection_with(conn, Hooks::production())
 }
 
-/// How an EXEC session obtains its [`HangupWatcher`]; a parameter so a test can force a failure.
+/// How a session obtains its [`HangupWatcher`]; a parameter so a test can force a failure.
 #[cfg(windows)]
 type WatchFactory = fn(&ConnTx) -> std::io::Result<(HangupWatcher, Waker)>;
 
+/// What a test can replace or observe in a session; production uses [`Hooks::production`].
 #[cfg(windows)]
-fn handle_connection_with(conn: socket2::Socket, make_watcher: WatchFactory) -> anyhow::Result<()> {
+struct Hooks {
+    make_watcher: WatchFactory,
+    parked: ParkSignal,
+}
+
+#[cfg(windows)]
+impl Hooks {
+    fn production() -> Self {
+        Self {
+            make_watcher: HangupWatcher::new,
+            parked: ParkSignal::default(),
+        }
+    }
+}
+
+#[cfg(windows)]
+fn handle_connection_with(conn: socket2::Socket, hooks: Hooks) -> anyhow::Result<()> {
     let (mut rx, tx) = afunix::split(conn)?;
     let mut fr = FrameReader::new();
     let frame = read_one_frame(&mut rx, &mut fr)?;
@@ -97,8 +116,8 @@ fn handle_connection_with(conn: socket2::Socket, make_watcher: WatchFactory) -> 
     let cwd_buf = child_cwd(&hs.cwd, home_dir());
     let cwd = cwd_buf.as_deref();
     match hs.mode {
-        Mode::Pty => handle_pty(rx, fr, tx, &command, hs.cols, hs.rows, cwd),
-        Mode::Exec => handle_exec(rx, fr, tx, &command, cwd, make_watcher),
+        Mode::Pty => handle_pty(rx, fr, tx, &command, (hs.cols, hs.rows), cwd, hooks),
+        Mode::Exec => handle_exec(rx, fr, tx, &command, cwd, hooks),
     }
 }
 
@@ -116,11 +135,14 @@ fn handle_pty(
     mut fr: FrameReader,
     tx: ConnTx,
     command: &str,
-    cols: u16,
-    rows: u16,
+    (cols, rows): (u16, u16),
     cwd: Option<&Path>,
+    hooks: Hooks,
 ) -> anyhow::Result<()> {
     let mut session = PtySession::spawn(command, cols, rows, cwd)?;
+    let job = session.job();
+    // Before `tx` moves into the shared mutex.
+    let hangup = start_hangup_watch(&tx, &job, hooks.make_watcher);
 
     let out_raw = session.out_read_raw();
     let in_raw = session.in_write_raw();
@@ -128,7 +150,6 @@ fn handle_pty(
     // it (→ None) and closes it under the lock, so resize can never touch a closed HPCON.
     let hpc_cell = Arc::new(Mutex::new(Some(session.take_hpc_raw())));
     let tx_arc = Arc::new(Mutex::new(tx));
-    let job = session.job();
 
     // Output pump: ConPTY output -> DATA(Pty). It deliberately does NOT emit EXIT.
     // `read_handle` returns 0 for a read *error* as well as for EOF, so this thread cannot
@@ -169,7 +190,7 @@ fn handle_pty(
         let job = Arc::clone(&job);
         std::thread::spawn(move || {
             let mut sink = PtyInputSink {
-                writer: HandleWriter::spawn(in_raw, None),
+                writer: HandleWriter::spawn(in_raw, None, hooks.parked),
                 hpc_cell,
             };
             pump_until_peer_gone(&mut rx, &mut fr, &mut sink);
@@ -207,6 +228,9 @@ fn handle_pty(
         let mut g = tx_arc.lock().unwrap();
         let _ = write_frame(&mut *g, FrameKind::Exit, &ExitCode(code).encode());
         let _ = g.shutdown_both(); // FIN + unblock the input pump's read
+    }
+    if let Some(hangup) = hangup {
+        hangup.finish();
     }
     let _ = in_thread.join();
     // Threads joined; `session` now drops and closes the process/thread + pipe handles.
@@ -249,25 +273,18 @@ fn handle_exec(
     tx: ConnTx,
     command: &str,
     cwd: Option<&Path>,
-    make_watcher: WatchFactory,
+    hooks: Hooks,
 ) -> anyhow::Result<()> {
     let mut child = ExecChild::spawn(command, cwd)?;
-    // Before `tx` moves into the shared mutex. A broken broker must not cost the user a session,
-    // so a failure here only costs this session the protection of the third detector below.
-    let (hangup, waker) = match make_watcher(&tx) {
-        Ok((hangup, waker)) => (Some(hangup), Some(waker)),
-        Err(e) => {
-            tracing::warn!("could not create the hangup watcher; a silent command will outlive its client: {e}");
-            (None, None)
-        }
-    };
+    let job = child.job();
+    // Before `tx` moves into the shared mutex.
+    let hangup = start_hangup_watch(&tx, &job, hooks.make_watcher);
     let out_raw = child.stdout_read_raw();
     let err_raw = child.stderr_read_raw();
     let stdin_owned = child.take_stdin_write();
     let stdin_raw = stdin_owned.as_ref().map_or(0, |h| h.raw());
     // stdout, stderr, and the EXIT frame all share tx → serialize with a mutex.
     let tx_arc = Arc::new(Mutex::new(tx));
-    let job = child.job();
 
     let t_out = spawn_stream_pump(out_raw, Stream::Stdout, Arc::clone(&tx_arc), Arc::clone(&job));
     let t_err = spawn_stream_pump(err_raw, Stream::Stderr, Arc::clone(&tx_arc), Arc::clone(&job));
@@ -282,7 +299,7 @@ fn handle_exec(
         let job = Arc::clone(&job);
         std::thread::spawn(move || {
             let mut sink = ExecInputSink {
-                writer: HandleWriter::spawn(stdin_raw, stdin_owned),
+                writer: HandleWriter::spawn(stdin_raw, stdin_owned, hooks.parked),
             };
             pump_until_peer_gone(&mut rx, &mut fr, &mut sink);
             // Reap first: dropping the sink joins the writer thread, which may be parked
@@ -294,20 +311,6 @@ fn handle_exec(
             drop(sink); // also closes the child's stdin if the EOF marker never arrived
         })
     };
-
-    // The third detector, for the one case the other two cannot see: a command that is silent
-    // (no output pump ever fails a write) while the stdin pump is parked in the bounded queue
-    // (nothing reads the socket). It watches the socket without reading it.
-    let t_hup = hangup.map(|hangup| {
-        let job = Arc::clone(&job);
-        std::thread::spawn(move || match hangup.wait() {
-            // Also returns after a normal teardown, when the reap is already done and idempotent.
-            Ok(()) => {
-                reap_tree(&job);
-            }
-            Err(e) => tracing::warn!("the hangup watcher failed; a silent command will outlive its client: {e}"),
-        })
-    });
 
     let wait_result = child.wait();
     // The command is gone, so the session is over. Reaping now takes its descendants with it
@@ -323,20 +326,74 @@ fn handle_exec(
         let _ = write_frame(&mut *g, FrameKind::Exit, &ExitCode(code).encode());
         let _ = g.shutdown_both(); // FIN + unblock the stdin pump's read
     }
-    // After the shutdown: a poll on a duplicate of an idle socket does not notice it.
-    if let (Some(waker), Some(t_hup)) = (waker, t_hup) {
-        match waker.wake() {
-            Ok(()) => {
-                let _ = t_hup.join();
-            }
-            // Joining would block until the peer's FIN; the thread holds only a socket duplicate
-            // and the job, so detaching it is safe. The waker's drop still sets the teardown flag.
-            Err(e) => tracing::error!("could not wake the hangup watcher; leaving it to end on its own: {e}"),
-        }
+    if let Some(hangup) = hangup {
+        hangup.finish();
     }
     let _ = t_in.join();
     wait_result?;
     Ok(())
+}
+
+/// The hangup watcher's thread and the means to end it.
+#[cfg(windows)]
+struct HangupGuard {
+    waker: Waker,
+    thread: std::thread::JoinHandle<()>,
+}
+
+/// Start the third detector, for the one case the other two cannot see: a command that is silent
+/// (no output pump ever fails a write) while the input pump is parked in the bounded queue
+/// (nothing reads the socket). It watches the socket without reading it and reaps on a hangup.
+///
+/// `None` if the watcher cannot be created. A failure here must not cost the user a session; it
+/// only loses the hangup protection.
+#[cfg(windows)]
+fn start_hangup_watch(tx: &ConnTx, job: &Arc<cosca::Job>, make_watcher: WatchFactory) -> Option<HangupGuard> {
+    let (hangup, waker) = match make_watcher(tx) {
+        Ok(pair) => pair,
+        Err(e) => {
+            tracing::warn!("could not create the hangup watcher; a silent command will outlive its client: {e}");
+            return None;
+        }
+    };
+    let job = Arc::clone(job);
+    let thread = std::thread::spawn(move || {
+        // The wait also ends after a normal teardown.
+        end_of_watch(hangup.wait(), || {
+            if let Some(w) = teardown_warning(reap_tree(&job)) {
+                tracing::error!("{w}");
+            }
+        });
+    });
+    Some(HangupGuard { waker, thread })
+}
+
+/// What the end of a hangup watcher's wait means. `Ok` is a hangup or a teardown wake, so the
+/// command is reaped; `Err` is the poll failing, which says nothing about the peer.
+#[cfg(windows)]
+fn end_of_watch(waited: std::io::Result<()>, reap: impl FnOnce()) {
+    match waited {
+        Ok(()) => reap(),
+        Err(e) => tracing::warn!("the hangup watcher failed; a silent command will outlive its client: {e}"),
+    }
+}
+
+#[cfg(windows)]
+impl HangupGuard {
+    /// End the watch once the session has been shut down.
+    fn finish(self) {
+        let Self { waker, thread } = self;
+        // Wake explicitly: the shutdown alone does not wake the watcher's poll (see hangup).
+        match waker.wake() {
+            Ok(()) => {
+                let _ = thread.join();
+            }
+            // Dropping the waker closes the wake channel, which normally ends the watcher. If the
+            // channel itself failed it may not, and a join could block until the peer's FIN. The
+            // thread holds only a socket duplicate and the job, so detaching it is safe.
+            Err(e) => tracing::error!("could not wake the hangup watcher; leaving it to end on its own: {e}"),
+        }
+    }
 }
 
 /// Pump one child output stream (stdout/stderr) into `DATA(stream)` frames on the shared
@@ -412,18 +469,43 @@ impl FrameSink for ExecInputSink {
 /// into unbounded growth in a resident agent that is shared with the user's other sessions, so
 /// the cap is what keeps one session from taking down the rest. Once it is full the reader
 /// does park in the send — the socket then applies the same backpressure sshd gets from its
-/// channel window — and the output pumps are the detector that still sees a disconnect.
+/// channel window — and the output pumps and the hangup watcher are what still see a disconnect.
 #[cfg(windows)]
 struct HandleWriter {
     tx: Option<std::sync::mpsc::SyncSender<Option<Vec<u8>>>>,
     thread: Option<std::thread::JoinHandle<()>>,
+    parked: ParkSignal,
+}
+
+/// Raised when a [`HandleWriter`] finds its queue full, i.e. when its caller is about to park in
+/// the send. Lets a test wait for that state instead of guessing when it arrives.
+#[cfg(windows)]
+#[derive(Clone, Default)]
+pub struct ParkSignal(Arc<(Mutex<bool>, Condvar)>);
+
+#[cfg(windows)]
+impl ParkSignal {
+    fn raise(&self) {
+        let (raised, condvar) = &*self.0;
+        *raised.lock().unwrap() = true;
+        condvar.notify_all();
+    }
+
+    /// Block until raised.
+    pub fn wait(&self) {
+        let (raised, condvar) = &*self.0;
+        let mut guard = raised.lock().unwrap();
+        while !*guard {
+            guard = condvar.wait(guard).unwrap();
+        }
+    }
 }
 
 #[cfg(windows)]
 impl HandleWriter {
     /// `owned` is the handle to close on the stdin-EOF marker; the PTY path passes `None`
     /// because the pseudoconsole's input handle belongs to the session.
-    fn spawn(raw: isize, owned: Option<OwnedHandle>) -> Self {
+    fn spawn(raw: isize, owned: Option<OwnedHandle>, parked: ParkSignal) -> Self {
         // Frames are at most `protocol::MAX_FRAME`, but the shim sends 32 KiB chunks, so
         // this is well under a megabyte in practice.
         let (tx, rx) = std::sync::mpsc::sync_channel::<Option<Vec<u8>>>(16);
@@ -439,6 +521,7 @@ impl HandleWriter {
         Self {
             tx: Some(tx),
             thread: Some(thread),
+            parked,
         }
     }
 
@@ -448,8 +531,15 @@ impl HandleWriter {
         let Some(tx) = &self.tx else {
             return Ok(()); // stdin already closed by the marker; further input is discarded
         };
-        tx.send(Some(bytes.to_vec()))
-            .map_err(|_| anyhow::anyhow!("the handle writer stopped"))
+        let stopped = || anyhow::anyhow!("the handle writer stopped");
+        match tx.try_send(Some(bytes.to_vec())) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(msg)) => {
+                self.parked.raise();
+                tx.send(msg).map_err(|_| stopped())
+            }
+            Err(TrySendError::Disconnected(_)) => Err(stopped()),
+        }
     }
 
     /// Close the underlying handle without ending the session.

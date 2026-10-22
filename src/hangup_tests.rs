@@ -2,6 +2,30 @@ use super::*;
 use crate::afunix::split;
 use socket2::{Domain, SockAddr, Socket, Type};
 use std::io::{Read, Write};
+use std::sync::Mutex;
+
+/// What `f` logged on this thread, as text.
+fn logged(f: impl FnOnce()) -> String {
+    struct Capture(Arc<Mutex<Vec<u8>>>);
+    impl Write for Capture {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let sink = Arc::new(Mutex::new(Vec::new()));
+    let writer = Arc::clone(&sink);
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(move || Capture(Arc::clone(&writer)))
+        .with_ansi(false)
+        .finish();
+    tracing::subscriber::with_default(subscriber, f);
+    let bytes = sink.lock().unwrap().clone();
+    String::from_utf8_lossy(&bytes).into_owned()
+}
 
 /// A connected AF_UNIX pair in a temp dir (no ACLs: these tests exercise the watcher, not the
 /// security boundary). Returns the server side, the client side and the dir to remove.
@@ -78,21 +102,43 @@ fn watcher_returns_when_woken_before_it_waits() {
 }
 
 /// Bytes that did not come from `wake` leave the teardown flag clear, so the watcher reports a
-/// wake but keeps waiting; only a hangup or a real wake ends `wait`. More than a read buffer's
-/// worth of them must neither end the wait nor fail it.
+/// wake but keeps waiting; only a hangup or a real wake ends `wait`. More than one read buffer's
+/// worth of them must be drained in a single report (the channel is read until `WouldBlock`),
+/// neither ending the wait nor failing it.
 #[test]
-fn a_large_write_without_the_teardown_flag_does_not_end_the_wait() {
+fn a_large_write_without_the_teardown_flag_is_drained_whole_and_does_not_end_the_wait() {
     let (server, client, dir) = pair("spurious");
     let (_rx, tx) = split(server).unwrap();
     let (watcher, waker) = HangupWatcher::new(&tx).unwrap();
-    let junk = vec![0u8; 2 * WAKE_READ_BUF];
+    // Room for everything below, so it all reaches the receiving end without anyone reading.
+    let wanted = 2 * WAKE_READ_BUF + 1;
+    socket2::SockRef::from(&watcher.wake_rx)
+        .set_recv_buffer_size(4 * WAKE_READ_BUF)
+        .unwrap();
+    let junk = vec![0u8; wanted];
     let mut sent = 0;
-    // A non-blocking write takes what fits; one send buffer's worth is enough to exceed a read.
-    while sent < WAKE_READ_BUF + 1 {
-        sent += (&waker.wake_tx).write(&junk[sent..]).unwrap();
+    while sent < wanted {
+        match (&waker.wake_tx).write(&junk[sent..]) {
+            Ok(n) => sent += n,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(e) => panic!("writing to the wake channel failed: {e}"),
+        }
+    }
+    assert_eq!(sent, wanted, "the wake channel took less than a read buffer and a half");
+    // Wait until every byte has arrived, so no byte is still in flight when the drain looks.
+    let mut peeked = vec![0u8; wanted];
+    loop {
+        match watcher.wake_rx.peek(&mut peeked) {
+            Ok(n) if n == wanted => break,
+            Ok(_) => std::thread::yield_now(),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => std::thread::yield_now(),
+            Err(e) => panic!("peeking at the wake channel failed: {e}"),
+        }
     }
     assert_eq!(watcher.poll_once().unwrap(), Ready::Wake);
     assert!(!watcher.torn_down.load(Ordering::Acquire));
+    // One report drained all of it: a drain that stopped after one read would leave the rest.
+    assert_eq!(watcher.poll_ready(0).unwrap(), None);
     // Still waiting: closing the peer is what ends it.
     let t = std::thread::spawn(move || watcher.wait());
     client.shutdown(std::net::Shutdown::Both).unwrap();
@@ -120,6 +166,53 @@ fn a_closed_wake_channel_without_the_flag_keeps_watching_the_session() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A failed read on the wake channel (here a reset) is logged, then ends polling the channel like
+/// EOF does: a reset socket stays readable forever.
+#[test]
+fn a_failed_read_on_the_wake_channel_is_logged_and_stops_polling_it() {
+    let (server, client, dir) = pair("reset");
+    let (_rx, tx) = split(server).unwrap();
+    let (watcher, waker) = HangupWatcher::new(&tx).unwrap();
+    // A zero linger turns the waker's close into a RST, which the watcher reads as an error.
+    socket2::SockRef::from(&waker.wake_tx)
+        .set_linger(Some(std::time::Duration::ZERO))
+        .unwrap();
+    drop(waker);
+    let mut ready = None;
+    let log = logged(|| ready = Some(watcher.poll_once().unwrap()));
+    assert_eq!(ready, Some(Ready::Wake));
+    assert!(
+        log.contains("WARN") && log.contains("wake channel"),
+        "the failed read was not logged: {log:?}"
+    );
+    // With the failed channel still polled, it would report readable here.
+    assert_eq!(watcher.poll_ready(0).unwrap(), None);
+    drop(client);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A full wake queue means a wake is already pending, so waking again is success and still sets
+/// the flag.
+#[test]
+fn waking_a_full_wake_queue_is_success() {
+    let (server, client, dir) = pair("full");
+    let (_rx, tx) = split(server).unwrap();
+    let (watcher, waker) = HangupWatcher::new(&tx).unwrap();
+    // Nobody reads: fill the queue until the socket says it is full.
+    let filler = [0u8; 4096];
+    loop {
+        match (&waker.wake_tx).write(&filler) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(e) => panic!("filling the wake channel failed: {e}"),
+        }
+    }
+    waker.wake().unwrap();
+    assert!(watcher.torn_down.load(Ordering::Acquire));
+    drop(client);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Dropping the waker ends the wait, as a wake does.
 #[test]
 fn watcher_returns_when_the_waker_is_dropped() {
@@ -139,8 +232,8 @@ fn watcher_returns_when_the_waker_is_dropped() {
 fn a_foreign_connection_to_the_listener_does_not_become_the_wake_channel() {
     let mut foreign = None;
     let mut rebind = None;
-    let (rx, tx) = wake_pair_with(|addr| {
-        // SO_REUSEADDR is how a second socket would take over a port that is not exclusive.
+    let (rx, tx) = wake_pair_with(|_, addr| {
+        // SO_REUSEADDR would let a second socket take over a non-exclusive port.
         let other = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
         other.set_reuse_address(true).unwrap();
         rebind = Some(other.bind(&SockAddr::from(addr)));
@@ -168,6 +261,41 @@ fn a_foreign_connection_to_the_listener_does_not_become_the_wake_channel() {
     );
 }
 
+/// Whether `SO_EXCLUSIVEADDRUSE` is set on `socket`.
+fn is_exclusive(socket: &Socket) -> bool {
+    use windows::Win32::Networking::WinSock::getsockopt;
+    use windows::core::PSTR;
+    let mut value = 0i32;
+    let mut len = size_of::<i32>() as i32;
+    // SAFETY: a plain getsockopt on a live socket into an int-sized buffer.
+    let rc = unsafe {
+        getsockopt(
+            SOCKET(socket.as_raw_socket() as usize),
+            SOL_SOCKET,
+            SO_EXCLUSIVEADDRUSE,
+            PSTR(&mut value as *mut i32 as *mut u8),
+            &mut len,
+        )
+    };
+    assert_eq!(rc, 0, "getsockopt failed: {}", std::io::Error::last_os_error());
+    value != 0
+}
+
+/// The listener has `SO_EXCLUSIVEADDRUSE`. A rebind attempt cannot pin this: on this OS another
+/// socket cannot bind a specific loopback address that a plain listener holds either, so the
+/// option is read back instead. The control: a socket without it reads back clear.
+#[test]
+fn the_wake_listener_has_the_exclusive_option() {
+    let plain = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
+    assert!(!is_exclusive(&plain), "the control: a plain socket reads back clear");
+    exclusive_addr_use(&plain).unwrap();
+    assert!(is_exclusive(&plain), "the readback sees the option once it is set");
+
+    let mut exclusive = None;
+    wake_pair_with(|listener, _| exclusive = Some(is_exclusive(listener))).unwrap();
+    assert_eq!(exclusive, Some(true));
+}
+
 /// Two pairs never share endpoints: each wake reaches only its own watcher.
 #[test]
 fn wake_pairs_are_independent() {
@@ -185,11 +313,12 @@ fn wake_pairs_are_independent() {
     );
 }
 
-/// A foreign connection reset before it is accepted consumes its queue entry; it does not abort
-/// the wake pair's creation.
+/// Smoke test: Windows loopback does not surface a reset at `accept`, so this never reaches the
+/// skip branch of `accept_own`; the injected `accept_own_*` tests are the coverage for it. It
+/// only checks that connections closed with a reset do not break the pair.
 #[test]
-fn a_foreign_connection_reset_before_accept_does_not_abort_the_pair() {
-    let (rx, tx) = wake_pair_with(|addr| {
+fn foreign_connections_closed_with_a_reset_do_not_break_the_pair_smoke() {
+    let (rx, tx) = wake_pair_with(|_, addr| {
         for _ in 0..50 {
             let foreign = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
             foreign.connect(&SockAddr::from(addr)).unwrap();
@@ -208,7 +337,7 @@ fn a_foreign_connection_reset_before_accept_does_not_abort_the_pair() {
 }
 
 /// `accept` failing with a reset or an abort means the queue entry is gone, so the loop accepts
-/// again; the real OS rarely surfaces this on loopback, so the errors are injected.
+/// again; the errors cannot be provoked reliably on loopback, so they are injected.
 #[test]
 fn accept_own_skips_entries_the_peer_reset_and_returns_the_matching_one() {
     use std::io::{Error, ErrorKind};
