@@ -3,7 +3,7 @@
 use ::windows::Win32::System::Console::{CONSOLE_MODE, GetConsoleMode, GetStdHandle, STD_INPUT_HANDLE};
 use ::windows::Win32::System::Environment::GetCommandLineW;
 
-use super::Encoding;
+use super::{Detected, Encoding};
 use crate::provision::registry::{OPENSSH_KEY, escape_arguments_under};
 
 /// The command line exactly as the parent passed it, program name included.
@@ -21,13 +21,37 @@ pub fn current() -> String {
 /// `tests/session_encoding_windows.rs` measures it). Without a console, sshd's
 /// `DefaultShellEscapeArguments` decides between the escaped and the wrapped form, and sshd
 /// reads it from the registry, so the shim does too.
-pub fn encoding() -> Encoding {
+pub fn detect() -> Detected {
     if stdin_is_console() {
-        Encoding::Verbatim
-    } else if escape_arguments_under(OPENSSH_KEY) {
-        Encoding::Escaped
+        Detected {
+            encoding: Encoding::Verbatim,
+            warning: None,
+        }
     } else {
-        Encoding::Wrapped
+        piped_encoding(escape_arguments_under(OPENSSH_KEY))
+    }
+}
+
+/// The non-PTY form for what reading `DefaultShellEscapeArguments` gave. When the read failed,
+/// sshd's own read failed the same way and kept escaping on, so the shim assumes that; if the
+/// real value is 0, the command is then decoded as the wrong form, which the warning says.
+fn piped_encoding(read: ::windows::core::Result<bool>) -> Detected {
+    match read {
+        Ok(true) => Detected {
+            encoding: Encoding::Escaped,
+            warning: None,
+        },
+        Ok(false) => Detected {
+            encoding: Encoding::Wrapped,
+            warning: None,
+        },
+        Err(error) => Detected {
+            encoding: Encoding::Escaped,
+            warning: Some(format!(
+                "cannot read HKLM\\{OPENSSH_KEY}\\DefaultShellEscapeArguments ({error}); assuming sshd \
+                 escapes the command (its default); if the value is 0, this command may be decoded wrongly"
+            )),
+        },
     }
 }
 
@@ -37,3 +61,7 @@ fn stdin_is_console() -> bool {
     // call fail.
     unsafe { GetStdHandle(STD_INPUT_HANDLE).is_ok_and(|stdin| GetConsoleMode(stdin, &mut mode).is_ok()) }
 }
+
+#[cfg(test)]
+#[path = "windows_tests.rs"]
+mod windows_tests;

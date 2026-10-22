@@ -6,6 +6,9 @@ pub fn current() -> String {
 }
 
 /// No sshd to ask; the default every real one starts with.
-pub fn encoding() -> super::Encoding {
-    super::Encoding::Escaped
+pub fn detect() -> super::Detected {
+    super::Detected {
+        encoding: super::Encoding::Escaped,
+        warning: None,
+    }
 }

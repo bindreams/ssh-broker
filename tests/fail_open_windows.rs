@@ -11,6 +11,11 @@
 //! leaves such a test green. Only running the actual binary traverses the real path.
 #![cfg(windows)]
 
+#[path = "common/pty.rs"]
+mod pty;
+#[path = "common/sshd_encoder.rs"]
+mod sshd_encoder;
+
 /// An `ssh host "cmd"` session that fails open must run the command ITSELF, with no shell
 /// interposed to re-parse its quoting.
 ///
@@ -135,17 +140,55 @@ fn exec_fail_open_runs_an_unquoted_program_path_appended_to_the_command_line() {
     assert_unquoted_program_ran(&out);
 }
 
-/// A PTY-shaped command keeps its quotes: the quoted program path is found, and the quoted
-/// argument reaches the program as written, double space and quotes included.
+/// `cmd.exe /c` text for the command of the two tests below: a quoted spaced program path, and
+/// an argument with a double space inside quotes. `cmd` echoes the quotes it is given.
+fn quoted_command(program: &std::path::Path) -> String {
+    format!(r#""{}" /c echo "quoted  ok""#, program.display())
+}
+
+/// A PTY session (`ssh -t host cmd`): sshd appends the command to the shell's line as written
+/// and runs the shell on a pseudoconsole, so the shim must keep the quotes. The shim runs under
+/// a real pseudoconsole here, because that is what tells it the command is verbatim
+/// (`tests/session_encoding_windows.rs` measures the signal).
+///
+/// The program writes to a file rather than the console, so the assertion does not depend on how
+/// the pseudoconsole renders a double space.
 #[test]
-fn exec_fail_open_keeps_the_quotes_of_a_command_appended_to_the_command_line() {
+fn exec_fail_open_keeps_the_quotes_of_a_pty_command() {
+    let (root, program) = spaced_program("sb-failopen-quoted-pty");
+    let out_file = root.join("out.txt");
+    let command = format!("{}>\"{}\"", quoted_command(&program), out_file.display());
+    let shim = env!("CARGO_BIN_EXE_ssh-broker");
+    let (code, console) = pty::run_on_pseudoconsole(&sshd_encoder::verbatim_line(shim, &command));
+    let written = std::fs::read_to_string(&out_file).unwrap_or_default();
+    let _ = std::fs::remove_dir_all(&root);
+
+    assert!(
+        console.contains("agent unavailable"),
+        "precondition: the fail-open path must be the one that ran, not the relay.\nconsole: {console}"
+    );
+    assert_eq!(code, 0, "the command failed.\nconsole: {console}");
+    assert!(
+        written.contains(r#""quoted  ok""#),
+        "the quoted argument lost its quotes or its double space.\nwritten: {written:?}\nconsole: {console}"
+    );
+}
+
+/// A session without a PTY: sshd escapes the command into one argument of the shell's line (with
+/// `DefaultShellEscapeArguments` on, which is the default), so the shim must undo that and run
+/// the command as the client sent it. Piped stdio is what tells the shim the command is escaped.
+///
+/// The encoder is the port of sshd's in `tests/common/sshd_encoder.rs`.
+#[test]
+fn exec_fail_open_decodes_the_escaped_command_of_a_session_without_a_pty() {
     use std::os::windows::process::CommandExt;
 
-    let (root, program) = spaced_program("sb-failopen-quoted-raw");
-    let command = format!(r#""{}" /c echo "quoted  ok""#, program.display());
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_ssh-broker"))
+    let (root, program) = spaced_program("sb-failopen-quoted-escaped");
+    let shim = env!("CARGO_BIN_EXE_ssh-broker");
+    let argument = sshd_encoder::escaped_argument(&quoted_command(&program));
+    let out = std::process::Command::new(shim)
         .arg("-c")
-        .raw_arg(&command)
+        .raw_arg(argument)
         .output()
         .expect("run the shim binary");
     let _ = std::fs::remove_dir_all(&root);
@@ -158,6 +201,6 @@ fn exec_fail_open_keeps_the_quotes_of_a_command_appended_to_the_command_line() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         stdout.contains(r#""quoted  ok""#),
-        "the quoted argument lost its quotes or its double space (cmd echoes the quotes it is given).\nstdout: {stdout}\nstderr: {stderr}"
+        "the quoted argument lost its quotes or its double space.\nstdout: {stdout}\nstderr: {stderr}"
     );
 }

@@ -23,6 +23,7 @@ pub const OPENSSH_KEY: &str = r"SOFTWARE\OpenSSH";
 #[cfg(windows)]
 mod win {
     use super::registry_pair;
+    use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, WIN32_ERROR};
     use windows::Win32::System::Registry::{
         HKEY, HKEY_LOCAL_MACHINE, KEY_QUERY_VALUE, KEY_WOW64_64KEY, REG_SZ, RRF_RT_REG_SZ, RegCloseKey, RegGetValueW,
         RegOpenKeyExW, RegQueryValueExW, RegSetKeyValueW,
@@ -96,26 +97,29 @@ mod win {
 
     /// Whether sshd escapes the command it hands the `DefaultShell`, read the way sshd reads
     /// `DefaultShellEscapeArguments` (`pwd.c` `set_defaultshell`): into four bytes whatever the
-    /// value's type, nonzero or unreadable meaning on. A failed read leaves sshd's default,
-    /// so it leaves ours.
-    fn escape_arguments_in(root: HKEY, subkey: &str) -> bool {
+    /// value's type, nonzero meaning on. A value or key that does not exist leaves sshd's default
+    /// (on), so it is `Ok(true)`. A value that exists but cannot be read also leaves sshd's
+    /// default, but the real setting is then unknown, so it is an `Err` the caller can report.
+    fn escape_arguments_in(root: HKEY, subkey: &str) -> windows::core::Result<bool> {
         let sub = wide(subkey);
         let name = wide("DefaultShellEscapeArguments");
         let mut key = HKEY::default();
         let mut value = [0u8; 4];
         let mut cb = value.len() as u32;
-        unsafe {
-            if RegOpenKeyExW(
+        let opened = unsafe {
+            RegOpenKeyExW(
                 root,
                 PCWSTR(sub.as_ptr()),
                 None,
                 KEY_QUERY_VALUE | KEY_WOW64_64KEY,
                 &mut key,
             )
-            .is_err()
-            {
-                return true;
-            }
+        };
+        if is_absent(opened) {
+            return Ok(true);
+        }
+        opened.ok()?;
+        let read = unsafe {
             let read = RegQueryValueExW(
                 key,
                 PCWSTR(name.as_ptr()),
@@ -125,15 +129,22 @@ mod win {
                 Some(&mut cb),
             );
             let _ = RegCloseKey(key);
-            if read.is_err() {
-                return true;
-            }
+            read
+        };
+        if is_absent(read) {
+            return Ok(true);
         }
-        u32::from_le_bytes(value) != 0
+        read.ok()?;
+        Ok(u32::from_le_bytes(value) != 0)
+    }
+
+    /// The key or value is not there, as opposed to being there and unreadable.
+    fn is_absent(status: WIN32_ERROR) -> bool {
+        status == ERROR_FILE_NOT_FOUND || status == ERROR_PATH_NOT_FOUND
     }
 
     /// Production: whether sshd escapes the command, from `HKLM\<subkey>`.
-    pub fn escape_arguments_under(subkey: &str) -> bool {
+    pub fn escape_arguments_under(subkey: &str) -> windows::core::Result<bool> {
         escape_arguments_in(HKEY_LOCAL_MACHINE, subkey)
     }
 
@@ -147,7 +158,7 @@ mod win {
         read_under(windows::Win32::System::Registry::HKEY_CURRENT_USER, subkey)
     }
     #[cfg(test)]
-    pub fn escape_arguments_hkcu(subkey: &str) -> bool {
+    pub fn escape_arguments_hkcu(subkey: &str) -> windows::core::Result<bool> {
         escape_arguments_in(windows::Win32::System::Registry::HKEY_CURRENT_USER, subkey)
     }
     #[cfg(test)]

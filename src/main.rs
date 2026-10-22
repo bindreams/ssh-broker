@@ -8,8 +8,9 @@ use ssh_broker::{Route, agent, cmdline, provision, route, shim};
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
-    match route(&args, &cmdline::current(), cmdline::encoding()) {
-        Route::Shim { exec } => shim::run(exec),
+    let detected = cmdline::detect();
+    match route(&args, &cmdline::current(), detected.encoding) {
+        Route::Shim { exec } => shim::run(exec, detected.warning),
         Route::Agent => agent::run(),
         Route::Apply => provision::apply(),
         Route::Verify => provision::verify(),

@@ -55,8 +55,11 @@ const VT_OUT: CONSOLE_MODE =
 /// shell — never let an error reach `main()` (which would exit 1 and print to the terminal,
 /// corrupting an interactive PTY). The log guard is flushed before every `process::exit`,
 /// since `process::exit` runs no destructors and the log is the only PTY-mode diagnostic.
-pub fn run_on(exec: Option<String>) -> anyhow::Result<()> {
+pub fn run_on(exec: Option<String>, warning: Option<String>) -> anyhow::Result<()> {
     let log = init_file_logging();
+    if let Some(warning) = warning {
+        tracing::warn!("{warning}");
+    }
 
     // EVERY command relays. There is deliberately no local route for file transfers.
     //

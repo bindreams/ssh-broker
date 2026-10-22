@@ -2,7 +2,7 @@
 //!
 //! `std::env::args` has already split and unquoted the command line, which loses the exact
 //! command sshd sent: see [`decode_command`] for the three forms it arrives in, and
-//! [`encoding`] for how the shim tells them apart.
+//! [`detect`] for how the shim tells them apart.
 
 #[cfg(not(windows))]
 mod other;
@@ -10,9 +10,17 @@ mod other;
 mod windows;
 
 #[cfg(not(windows))]
-pub use other::{current, encoding};
+pub use other::{current, detect};
 #[cfg(windows)]
-pub use windows::{current, encoding};
+pub use windows::{current, detect};
+
+/// What [`detect`] found: how sshd encoded the command line, and, when that rests on an assumption,
+/// what to log once logging is up (detection runs before the log is opened).
+#[derive(Debug)]
+pub struct Detected {
+    pub encoding: Encoding,
+    pub warning: Option<String>,
+}
 
 /// How sshd built the `DefaultShell` command line; see [`decode_command`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

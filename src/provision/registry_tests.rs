@@ -25,9 +25,9 @@ fn writes_and_reads_default_shell_pair() {
 }
 
 /// `escape_arguments` mirrors how sshd reads `DefaultShellEscapeArguments` (`pwd.c`
-/// `set_defaultshell`): the value is read into four bytes whatever its type, zero turns escaping
-/// off, and any failure to read leaves it on. Runs under a throwaway HKCU key, so it needs no
-/// elevation; the production path is identical but targets HKLM.
+/// `set_defaultshell`): the value is read into four bytes whatever its type, and zero turns
+/// escaping off. A missing key or value leaves escaping on. Runs under a throwaway HKCU key, so
+/// it needs no elevation; the production path is identical but targets HKLM.
 #[cfg(windows)]
 #[test]
 fn escape_arguments_reads_the_value_the_way_sshd_does() {
@@ -36,22 +36,43 @@ fn escape_arguments_reads_the_value_the_way_sshd_does() {
     let subkey = format!(r"SOFTWARE\ssh-broker-escape-test-{}", std::process::id());
     let dword = |v: u32| super::set_value_hkcu(&subkey, NAME, REG_DWORD.0, &v.to_le_bytes());
 
-    let absent = super::escape_arguments_hkcu(&subkey);
+    let absent_key = super::escape_arguments_hkcu(&subkey);
+    super::set_value_hkcu(&subkey, "Other", REG_DWORD.0, &1u32.to_le_bytes());
+    let absent_value = super::escape_arguments_hkcu(&subkey);
     dword(0);
     let zero = super::escape_arguments_hkcu(&subkey);
     dword(1);
     let one = super::escape_arguments_hkcu(&subkey);
     dword(7);
     let seven = super::escape_arguments_hkcu(&subkey);
-    // Too big for four bytes, so sshd's read fails and escaping stays on.
+    // The four bytes of a REG_SZ "0" and its terminator read as 0x30, which is nonzero.
     let sz: Vec<u8> = "0\0".encode_utf16().flat_map(u16::to_le_bytes).collect();
     super::set_value_hkcu(&subkey, NAME, REG_SZ.0, &sz);
     let string_zero = super::escape_arguments_hkcu(&subkey);
     super::delete_hkcu(&subkey);
 
-    assert!(absent, "a missing key or value leaves escaping on");
-    assert!(!zero, "0 turns escaping off");
-    assert!(one, "1 leaves it on");
-    assert!(seven, "any nonzero value leaves it on");
-    assert!(string_zero, "a string that does not fit four bytes leaves it on");
+    assert!(absent_key.unwrap(), "a missing key leaves escaping on");
+    assert!(absent_value.unwrap(), "a missing value leaves escaping on");
+    assert!(!zero.unwrap(), "0 turns escaping off");
+    assert!(one.unwrap(), "1 leaves it on");
+    assert!(seven.unwrap(), "any nonzero value leaves it on");
+    assert!(string_zero.unwrap(), "a string is read as raw bytes");
+}
+
+/// A value that exists but cannot be read is an error, not an answer: sshd's read fails and it
+/// keeps escaping on, but the caller needs to know the value it assumed was never seen. A value
+/// longer than four bytes is one such case that needs no elevation to produce.
+#[cfg(windows)]
+#[test]
+fn escape_arguments_reports_a_value_it_cannot_read() {
+    use windows::Win32::System::Registry::REG_BINARY;
+    let subkey = format!(r"SOFTWARE\ssh-broker-escape-unreadable-test-{}", std::process::id());
+    super::set_value_hkcu(&subkey, "DefaultShellEscapeArguments", REG_BINARY.0, &[0u8; 8]);
+    let read = super::escape_arguments_hkcu(&subkey);
+    super::delete_hkcu(&subkey);
+
+    assert!(
+        read.is_err(),
+        "an eight-byte value does not fit the four bytes sshd reads"
+    );
 }

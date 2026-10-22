@@ -8,14 +8,15 @@ use std::sync::{Arc, Mutex};
 
 /// Shim entrypoint. `exec` is `Some(command)` for the `-c "cmd"` EXEC path, `None`
 /// for an interactive PTY session. The Windows path connects to the agent and relays;
-/// elsewhere there is no session-1 console to relay.
-pub fn run(exec: Option<String>) -> anyhow::Result<()> {
+/// elsewhere there is no session-1 console to relay. `warning` is logged once the shim's log is
+/// open (see `cmdline::Detected`).
+pub fn run(exec: Option<String>, warning: Option<String>) -> anyhow::Result<()> {
     #[cfg(windows)]
-    return crate::shim_pty::run_on(exec);
+    return crate::shim_pty::run_on(exec, warning);
 
     #[cfg(not(windows))]
     {
-        let _ = exec;
+        let _ = (exec, warning);
         anyhow::bail!("the shim relays the session-1 console and runs only on Windows")
     }
 }

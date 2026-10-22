@@ -1,81 +1,25 @@
 //! The encoder-inverse property: for every command in a corpus, the command `route` recovers
 //! from the line sshd builds equals the command sshd was given, in each of sshd's three forms.
 //!
-//! The encoder below is a port of Win32-OpenSSH (`PowerShell/openssh-portable`, `latestw_all`
-//! at 274893f): `do_exec_windows` in `contrib/win32/win32compat/w32-doexec.c`, and
-//! `build_exec_command` / `build_commandline_string` in `misc.c`. It is test code, so a change
-//! to the decoder cannot pass by changing the encoder it is checked against.
+//! The encoder is a port of Win32-OpenSSH, kept in `tests/common/sshd_encoder.rs` so the
+//! integration tests use the same one. It is test code, so a change to the decoder cannot pass
+//! by changing the encoder it is checked against.
 
 use crate::cmdline::{Encoding, split_args};
 use crate::route::{Route, route};
 
+#[path = "../tests/common/sshd_encoder.rs"]
+mod sshd_encoder;
+use sshd_encoder::{build_exec_command, escape_arg};
+
 const SHELL: &str = r"C:\Program Files\ssh-broker\ssh-broker.exe";
 
-// The sshd encoder, ported =====
-
-/// `build_exec_command` (`misc.c`): sshd rewrites a command that names `scp`, `sftp-server` or
-/// `internal-sftp` before it builds the line. Prefix matches are ASCII case-insensitive.
-fn build_exec_command(command: &str) -> String {
-    let b = command.as_bytes();
-    let starts = |n: usize, name: &[u8]| b.len() >= n && b[..n].eq_ignore_ascii_case(name);
-    // The `.exe` extension is optional and skipped when present.
-    let after_exe = |name_len: usize| {
-        if b.len() >= name_len + 4 && b[name_len..name_len + 4].eq_ignore_ascii_case(b".exe") {
-            name_len + 4
-        } else {
-            name_len
-        }
-    };
-    if starts(13, b"internal-sftp") {
-        format!("sftp-server.exe{}", &command[13..])
-    } else if starts(11, b"sftp-server") {
-        format!("sftp-server.exe{}", &command[after_exe(11)..])
-    } else if starts(3, b"scp") {
-        format!("scp.exe{}", &command[after_exe(3)..])
-    } else {
-        command.to_string()
-    }
-}
-
-/// The per-argument part of `build_commandline_string` (`misc.c`): quoted only if it contains a
-/// space and does not start with `'`; every `"` is escaped; backslashes are doubled only when
-/// they precede a `"`. A trailing backslash is not doubled before the closing quote.
-fn escape_arg(arg: &str) -> String {
-    let quote = !arg.starts_with('\'') && arg.contains(' ');
-    let mut out = String::new();
-    if quote {
-        out.push('"');
-    }
-    let mut chars = arg.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            '\\' => {
-                let mut run = 1;
-                while chars.next_if_eq(&'\\').is_some() {
-                    run += 1;
-                }
-                let doubled = chars.peek() == Some(&'"');
-                out.extend(std::iter::repeat_n('\\', if doubled { run * 2 } else { run }));
-            }
-            '"' => out.push_str("\\\""),
-            c => out.push(c),
-        }
-    }
-    if quote {
-        out.push('"');
-    }
-    out
-}
-
-/// The line sshd hands the `DefaultShell` for `command` (`w32-doexec.c:329-341`, `:370-400`).
+/// `Encoding` selects which of the three lines sshd builds.
 fn encode(encoding: Encoding, command: &str) -> String {
     match encoding {
-        // PTY: `"shell" -c <command>`, the command appended raw.
-        Encoding::Verbatim => format!("\"{SHELL}\" -c {command}"),
-        // `spawn_argv = {shell, "-c", exec_command}` through `build_commandline_string`.
-        Encoding::Escaped => format!("\"{SHELL}\" -c {}", escape_arg(&build_exec_command(command))),
-        // `sprintf("%s %s \"%s\"", shell, option, exec_command)`.
-        Encoding::Wrapped => format!("\"{SHELL}\" -c \"{}\"", build_exec_command(command)),
+        Encoding::Verbatim => sshd_encoder::verbatim_line(SHELL, command),
+        Encoding::Escaped => sshd_encoder::escaped_line(SHELL, command),
+        Encoding::Wrapped => sshd_encoder::wrapped_line(SHELL, command),
     }
 }
 
