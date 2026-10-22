@@ -89,6 +89,26 @@ fn watcher_returns_after_local_shutdown() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// What the agent does at EXIT: `shutdown_write` while the client's input sits unread and the
+/// client stays open. Unlike `shutdown_both`, which reports a hangup once input is unread, this
+/// leaves the poll silent, so the waker is the only thing that ends the wait. `poll_ready(0)`
+/// is the poll `wait` loops on, asked once without blocking; the shutdown has returned, so the
+/// answer is final.
+#[test]
+fn watcher_waits_for_the_waker_after_a_local_shutdown_write_with_unread_input() {
+    let (server, mut client, dir) = pair("local-write");
+    let (_rx, tx) = split(server).unwrap();
+    let (watcher, waker) = HangupWatcher::new(&tx).unwrap();
+    client.write_all(b"unread-frames").unwrap();
+    tx.shutdown_write().unwrap();
+    assert_eq!(watcher.poll_ready(0).unwrap(), None);
+    waker.wake().unwrap();
+    let t = std::thread::spawn(move || watcher.wait());
+    t.join().unwrap().unwrap();
+    drop(client);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A wake sent before the watcher starts waiting is not lost.
 #[test]
 fn watcher_returns_when_woken_before_it_waits() {

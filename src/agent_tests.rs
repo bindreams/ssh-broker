@@ -188,92 +188,65 @@ fn agent_exec_handler_separates_streams_and_returns_code() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// How much stdin the client streams while the command exits.
-#[derive(Clone, Copy, Debug)]
-enum Streamed {
-    Bytes(usize),
-    /// Without end, until the client has the EXIT frame, so input is in flight when the agent closes.
-    UntilExit,
-}
+/// After EXIT the agent only FINs its write half; it keeps reading, and so discarding, the
+/// client's input until the client closes. Closing the read side instead resets the connection
+/// whenever input is in flight, and the reset discards an EXIT frame the client has not read yet.
+///
+/// The client therefore gets the EXIT frame and the agent's FIN before it sends anything more,
+/// which leaves no race: the agent has finished its teardown. Every write after that must
+/// succeed. Had the agent shut its read side down, the first would reset the connection and a
+/// later one would fail (or block, once the socket buffers fill with data nobody reads).
+fn assert_input_after_exit_is_still_read(tag: &str, mode: Mode) {
+    use std::io::Read;
 
-/// A command that exits at once while the client is still streaming input must still deliver its
-/// exit code. The agent closes the connection with that input unread; closing the read side
-/// before the client has gone resets the connection and loses the EXIT frame. Looped because the
-/// reset is a race.
-fn assert_fast_exit_keeps_the_exit_code(tag: &str, mode: Mode) {
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    /// More than the socket buffers hold, so a reader that is gone cannot hide behind them.
+    const AFTER_EXIT: usize = 8 * 1024 * 1024;
 
     let dir = hardened_dir(tag);
     let sock = dir.join("s");
     let listener = Listener::bind(&sock).unwrap();
 
-    for streamed in [Streamed::Bytes(1), Streamed::Bytes(100 * 1024), Streamed::UntilExit] {
-        for round in 0..10 {
-            let client_path = sock.clone();
-            let client = thread::spawn(move || {
-                let conn = afunix::connect(&client_path).unwrap();
-                let (mut crx, mut ctx) = afunix::split(conn).unwrap();
-                let hs = Handshake {
-                    mode,
-                    command: Some("cmd.exe /c exit /b 3".into()),
-                    ..Handshake::pty_default()
-                };
-                write_frame(&mut ctx, FrameKind::Handshake, &hs.encode().unwrap()).unwrap();
-                let stream = if mode == Mode::Pty { Stream::Pty } else { Stream::Stdin };
-                let done = Arc::new(AtomicBool::new(false));
-                // As the shim does: input streams from its own thread while this one reads. The
-                // agent may close first, so write errors are expected and end the writer.
-                let writer = {
-                    let done = Arc::clone(&done);
-                    thread::spawn(move || {
-                        let chunk = [b'x'; 8 * 1024];
-                        match streamed {
-                            Streamed::Bytes(len) => {
-                                for part in vec![b'x'; len].chunks(chunk.len()) {
-                                    if write_data(&mut ctx, stream, part).is_err() {
-                                        return;
-                                    }
-                                }
-                                let _ = write_data(&mut ctx, stream, b"");
-                            }
-                            Streamed::UntilExit => {
-                                while !done.load(Ordering::SeqCst) {
-                                    if write_data(&mut ctx, stream, &chunk).is_err() {
-                                        return;
-                                    }
-                                }
-                            }
-                        }
-                    })
-                };
-                let mut fr = FrameReader::new();
-                let mut sink = TestSink::default();
-                let outcome = pump_decode(&mut crx, &mut fr, &mut sink);
-                done.store(true, Ordering::SeqCst);
-                writer.join().unwrap();
-                outcome
-            });
+    let client_path = sock.clone();
+    let client = thread::spawn(move || {
+        let conn = afunix::connect(&client_path).unwrap();
+        let (mut crx, mut ctx) = afunix::split(conn).unwrap();
+        let hs = Handshake {
+            mode,
+            command: Some("cmd.exe /c exit /b 3".into()),
+            ..Handshake::pty_default()
+        };
+        write_frame(&mut ctx, FrameKind::Handshake, &hs.encode().unwrap()).unwrap();
+        let mut fr = FrameReader::new();
+        let mut sink = TestSink::default();
+        let outcome = pump_decode(&mut crx, &mut fr, &mut sink).expect("the EXIT frame was lost");
+        assert_eq!(outcome, Outcome::Exited(3));
+        // Everything the agent will ever send has been sent once it has FINed.
+        let mut buf = [0u8; 4096];
+        while crx.read(&mut buf).expect("reading up to the agent's FIN") != 0 {}
 
-            let conn = listener.accept().unwrap();
-            super::handle_connection(conn).unwrap();
-
-            let outcome = client.join().unwrap();
-            let ctx = format!("{mode:?}, {streamed:?}, round {round}");
-            assert_eq!(outcome.expect(&ctx), Outcome::Exited(3), "{ctx}");
+        let stream = if mode == Mode::Pty { Stream::Pty } else { Stream::Stdin };
+        let chunk = [b'x'; 32 * 1024];
+        for _ in 0..AFTER_EXIT / chunk.len() {
+            write_data(&mut ctx, stream, &chunk).expect("input after EXIT must still be read");
         }
-    }
+        ctx.shutdown_both().unwrap();
+    });
+
+    let conn = listener.accept().unwrap();
+    super::handle_connection(conn).unwrap();
+
+    client.join().unwrap();
     std::fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
-fn agent_exec_that_exits_at_once_keeps_its_exit_code_while_input_streams() {
-    assert_fast_exit_keeps_the_exit_code("exec-fast-exit", Mode::Exec);
+fn agent_exec_keeps_reading_input_after_exit_until_the_client_closes() {
+    assert_input_after_exit_is_still_read("exec-after-exit", Mode::Exec);
 }
 
 #[test]
-fn agent_pty_that_exits_at_once_keeps_its_exit_code_while_input_streams() {
-    assert_fast_exit_keeps_the_exit_code("pty-fast-exit", Mode::Pty);
+fn agent_pty_keeps_reading_input_after_exit_until_the_client_closes() {
+    assert_input_after_exit_is_still_read("pty-after-exit", Mode::Pty);
 }
 
 /// A broken broker must not cost the user a session: if the hangup watcher cannot be created the

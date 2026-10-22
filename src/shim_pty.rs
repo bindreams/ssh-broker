@@ -399,7 +399,8 @@ fn input_worker(
 ) {
     unsafe { input_loop(stdin_raw, stdout_raw, &mut tx, &gate, &stopping) };
     // FIN: in the disconnect-first case this makes the agent kill the brokered shell and
-    // unblocks MAIN's pump; in the EXIT case it is harmless (the agent already closed).
+    // unblocks MAIN's pump; in the EXIT case it ends the agent's drain, which keeps reading
+    // until the client closes.
     let _ = tx.shutdown_both();
 }
 

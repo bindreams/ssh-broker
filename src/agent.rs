@@ -227,8 +227,9 @@ fn handle_pty(
         // can still be writing frames.
         let mut g = tx_arc.lock().unwrap();
         let _ = write_frame(&mut *g, FrameKind::Exit, &ExitCode(code).encode());
-        // FIN the write half only: the input pump keeps reading until the client closes, so the
-        // socket never closes with unread input, which would reset it and lose the EXIT frame.
+        // FIN the write half only: the input pump keeps reading until the client closes, so for a
+        // conforming client the socket never closes with unread input, which would reset it and
+        // lose the EXIT frame.
         let _ = g.shutdown_write();
     }
     if let Some(hangup) = hangup {
@@ -326,8 +327,9 @@ fn handle_exec(
     {
         let mut g = tx_arc.lock().unwrap();
         let _ = write_frame(&mut *g, FrameKind::Exit, &ExitCode(code).encode());
-        // FIN the write half only: the stdin pump keeps reading until the client closes, so the
-        // socket never closes with unread input, which would reset it and lose the EXIT frame.
+        // FIN the write half only: the stdin pump keeps reading until the client closes, so for a
+        // conforming client the socket never closes with unread input, which would reset it and
+        // lose the EXIT frame.
         let _ = g.shutdown_write();
     }
     if let Some(hangup) = hangup {
