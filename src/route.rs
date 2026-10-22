@@ -27,10 +27,11 @@ pub enum Route {
 ///
 /// For `-c` the exec command is recovered from `command_line`, the process's raw command
 /// line, not from `args`: sshd does not always quote the command, and `args` has lost the
-/// quotes and spaces it carried (see [`cmdline::decode_command`]). Routing never inspects the
+/// quotes and spaces it carried. `encoding` says how sshd wrote the line (see
+/// [`cmdline::decode_command`]). Routing never inspects the
 /// command, so every `-c` command takes the same path. If the raw line does not have the
 /// `-c` shape `args` reports, the command is `args[1..]` joined with spaces.
-pub fn route(args: &[String], command_line: &str) -> Route {
+pub fn route(args: &[String], command_line: &str, encoding: cmdline::Encoding) -> Route {
     match args.first().map(String::as_str) {
         Some("agent") => Route::Agent,
         Some("apply") => Route::Apply,
@@ -39,7 +40,7 @@ pub fn route(args: &[String], command_line: &str) -> Route {
         Some("-c") => {
             // `-c` with no command after it degrades to an interactive shim.
             let exec = match cmdline::dash_c_tail(command_line) {
-                Some(tail) => cmdline::decode_command(tail),
+                Some(tail) => cmdline::decode_command(tail, encoding),
                 None if args.len() > 1 => Some(args[1..].join(" ")),
                 None => None,
             };

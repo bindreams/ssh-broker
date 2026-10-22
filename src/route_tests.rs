@@ -4,11 +4,16 @@
 //! `route` receives is derived from it the way the C runtime would.
 
 use super::{Route, route};
-use crate::cmdline::split_args;
+use crate::cmdline::{Encoding, split_args};
 
-fn route_line(line: &str) -> Route {
+fn route_line_as(line: &str, encoding: Encoding) -> Route {
     let args = split_args(line);
-    route(&args[1..], line)
+    route(&args[1..], line, encoding)
+}
+
+/// A line whose form does not matter: verbs, and commands with nothing sshd would escape.
+fn route_line(line: &str) -> Route {
+    route_line_as(line, Encoding::Escaped)
 }
 
 fn shim(exec: &str) -> Route {
@@ -78,7 +83,7 @@ fn every_dash_c_command_routes_to_the_relay_with_its_text_intact() {
         r"C:\a b\ssh-broker.exe verify",
     ] {
         assert_eq!(
-            route_line(&format!("ssh-broker.exe -c {command}")),
+            route_line_as(&format!("ssh-broker.exe -c {command}"), Encoding::Verbatim),
             shim(command),
             "{command}"
         );
@@ -112,7 +117,10 @@ fn shim_command_is_trimmed_at_the_parse_site() {
 fn dash_c_keeps_an_unquoted_spaced_program_path_verbatim() {
     let command = r"C:\Program Files\OpenSSH\sftp-server.exe -l INFO";
     // A PTY session: sshd appends the command to the line unquoted.
-    assert_eq!(route_line(&format!("ssh-broker.exe -c {command}")), shim(command));
+    assert_eq!(
+        route_line_as(&format!("ssh-broker.exe -c {command}"), Encoding::Verbatim),
+        shim(command)
+    );
     // A non-PTY session: sshd passes the command as one quoted argument.
     assert_eq!(route_line(&format!(r#"ssh-broker.exe -c "{command}""#)), shim(command));
 }
@@ -120,7 +128,10 @@ fn dash_c_keeps_an_unquoted_spaced_program_path_verbatim() {
 #[test]
 fn dash_c_keeps_a_quoted_program_path_verbatim() {
     let command = r#""C:\Program Files\OpenSSH\sftp-server.exe" -l INFO"#;
-    assert_eq!(route_line(&format!("ssh-broker.exe -c {command}")), shim(command));
+    assert_eq!(
+        route_line_as(&format!("ssh-broker.exe -c {command}"), Encoding::Verbatim),
+        shim(command)
+    );
     // As one escaped argument.
     assert_eq!(
         route_line(r#"ssh-broker.exe -c "\"C:\Program Files\OpenSSH\sftp-server.exe\" -l INFO""#),
@@ -133,7 +144,10 @@ fn dash_c_keeps_a_quoted_program_path_verbatim() {
 #[test]
 fn a_verbatim_command_keeps_its_quotes_empty_argument_and_double_space() {
     let command = r#""C:\a b\p.exe" "x y" "" end  of  line"#;
-    assert_eq!(route_line(&format!("ssh-broker.exe -c {command}")), shim(command));
+    assert_eq!(
+        route_line_as(&format!("ssh-broker.exe -c {command}"), Encoding::Verbatim),
+        shim(command)
+    );
 }
 
 /// A non-PTY session passes the command as one escaped argument; unescaping it must restore the
@@ -149,6 +163,9 @@ fn an_escaped_single_argument_keeps_its_quotes_empty_argument_and_double_space()
 /// A raw line that does not show `-c` first (never the case under sshd) falls back to argv.
 #[test]
 fn a_raw_line_without_dash_c_falls_back_to_the_joined_args() {
-    assert_eq!(route(&["-c".into(), "a b".into(), "c".into()], ""), shim("a b c"));
-    assert_eq!(route(&["-c".into()], ""), Route::Shim { exec: None });
+    assert_eq!(
+        route(&["-c".into(), "a b".into(), "c".into()], "", Encoding::Escaped),
+        shim("a b c")
+    );
+    assert_eq!(route(&["-c".into()], "", Encoding::Escaped), Route::Shim { exec: None });
 }

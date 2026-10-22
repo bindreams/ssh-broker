@@ -4,3 +4,8 @@
 pub fn current() -> String {
     std::env::args().collect::<Vec<_>>().join(" ")
 }
+
+/// No sshd to ask; the default every real one starts with.
+pub fn encoding() -> super::Encoding {
+    super::Encoding::Escaped
+}
