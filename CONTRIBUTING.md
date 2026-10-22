@@ -145,10 +145,12 @@ as machine-independent Windows paths.
 
 A release is two manual workflows, both taking the version (the `Cargo.toml` version, without `v`):
 
-1. **Draft Release** (`draft-release.yaml`) from a commit on `main`: validates the version, runs CI on the commit, builds the Windows asset (`.github/workflows/release-asset.yaml`), attests the zip, and creates a draft release `v<version>` with the zip and its `.sha256`.
-2. **Publish Release** (`publish-release.yaml`), behind the `Deploy` environment: re-verifies the draft's hash and attestation, publishes it, checks the tag points at the verified commit, and re-verifies the published zip.
+1. **Draft Release** (`draft-release.yaml`), dispatched from `main`: validates the version, runs CI on the commit, builds the Windows asset (`.github/workflows/release-asset.yaml`), attests the zip, and creates a draft release `v<version>` with the zip and its `.sha256`.
+2. **Publish Release** (`publish-release.yaml`), behind the `Deploy` environment: checks the draft's commit is on `main` and declares the version, re-verifies the draft's hash and its attestation (from `main`, for that commit), re-uploads the verified files, publishes it, checks the tag points at the verified commit, and re-verifies the published zip.
 
-`release-asset.yaml` also runs on pull requests that touch what goes into the asset, so packaging, the import check and the attestation are exercised before a release. The exe is built with `+crt-static` and `.github/scripts/check-imports.sh` fails the build if it imports a VC or UCRT runtime DLL: it is sshd's `DefaultShell` and must start on a guest without the redistributable.
+`release-asset.yaml` also runs on pull requests that touch what goes into the asset, so packaging, the import check and the attestation are exercised before a release. The exe is built with `+crt-static` and `.github/scripts/check-imports.sh` fails the build if it imports any DLL outside an allowlist of OS-shipped ones (never the VC or UCRT runtime): it is sshd's `DefaultShell` and must start on a guest without the redistributable. A new dependency that imports another system DLL is added to the allowlist in that script. Pull requests from forks build and run the check but skip the attestation, which needs a token they do not get.
+
+Before the first publish, enable immutable releases on the repository and create the `Deploy` environment with a required reviewer. Without immutable releases the final re-verification detects, but does not prevent, a draft asset being swapped in the moments before publishing.
 
 ## Pull requests
 

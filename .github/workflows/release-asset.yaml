@@ -104,7 +104,10 @@ jobs:
           printf '%s  %s\n' "$hash" "$zip" > "dist/${zip}.sha256"
           cat "dist/${zip}.sha256"
 
+      # A pull request from a fork gets a read-only token with no OIDC, so it cannot attest. It
+      # still builds, runs the import gate and packages; only the attestation is skipped.
       - name: Attest build provenance
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
         with:
           subject-path: dist/*.zip
@@ -156,7 +159,9 @@ jobs:
         shell: bash
         run: cd dist && sha256sum -c ./*.sha256
 
+      # Nothing to verify for a fork pull request: see "Attest build provenance".
       - name: Verify the attestation
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
         shell: bash
         run: |
           set -euo pipefail

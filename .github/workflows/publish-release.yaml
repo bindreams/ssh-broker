@@ -31,6 +31,9 @@ jobs:
       GH_REPO: ${{ github.repository }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          # Full history so the ancestry check can resolve origin/main.
+          fetch-depth: 0
 
       - name: Normalize and validate version
         id: version
@@ -70,6 +73,55 @@ jobs:
           fi
           echo "commit_sha=$TARGET" >> "$GITHUB_OUTPUT"
 
+      # A draft is only trustworthy if it was built from merged code: a valid attestation alone
+      # also covers a pull-request build, or an older zip renamed to this version.
+      - name: Verify the draft's commit is on main
+        env:
+          SHA: ${{ steps.release.outputs.commit_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --quiet origin main
+
+          set +e
+          git merge-base --is-ancestor "$SHA" origin/main
+          STATUS=$?
+          set -e
+
+          case "$STATUS" in
+            0) echo "$SHA is an ancestor of origin/main" ;;
+            1)
+              echo "::error::$SHA is not an ancestor of origin/main. Release only from merged commits."
+              exit 1
+              ;;
+            *)
+              echo "::error::git merge-base failed (exit $STATUS); cannot confirm $SHA is on main"
+              exit 1
+              ;;
+          esac
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ steps.release.outputs.commit_sha }}
+          path: release-src
+
+      - name: Install pinned toolchain
+        working-directory: release-src
+        run: rustup toolchain install
+
+      - name: Verify the draft's commit declares this version
+        working-directory: release-src
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          MANIFEST="$(cargo metadata --no-deps --locked --format-version 1 | jq -r '.packages[0].version')"
+          if [ "$MANIFEST" != "$VERSION" ]; then
+            echo "::error::The draft's commit declares $MANIFEST but this dispatch asked for $VERSION"
+            exit 1
+          fi
+
       - name: Download the draft's assets
         env:
           TAG: ${{ steps.version.outputs.tag }}
@@ -98,11 +150,13 @@ jobs:
           gh attestation verify "draft/${ZIP}" \
             -R "$GH_REPO" \
             --signer-workflow "${GH_REPO}/.github/workflows/release-asset.yaml" \
-            --source-digest "$SHA"
+            --source-digest "$SHA" \
+            --source-ref refs/heads/main
 
       - name: Publish GitHub release
         env:
           TAG: ${{ steps.version.outputs.tag }}
+          ZIP: ${{ steps.version.outputs.zip }}
           SHA: ${{ steps.release.outputs.commit_sha }}
         shell: bash
         run: |
@@ -112,6 +166,11 @@ jobs:
           # no tag, so this is safe on every reachable path, and it turns a race into an early,
           # explicit refusal instead of a mis-binding caught only by the read-back below.
           bash .github/scripts/assert-tag-absent.sh "$TAG"
+
+          # Replace the draft's assets with the bytes verified above, in case they changed since.
+          # GitHub has no compare-and-swap, so a swap in the window between this upload and the
+          # edit is not prevented; the published asset is re-verified below to detect it.
+          gh release upload "$TAG" "draft/${ZIP}" "draft/${ZIP}.sha256" --clobber
 
           gh release edit "$TAG" --draft=false
 
@@ -144,7 +203,8 @@ jobs:
           gh attestation verify "published/${ZIP}" \
             -R "$GH_REPO" \
             --signer-workflow "${GH_REPO}/.github/workflows/release-asset.yaml" \
-            --source-digest "$SHA"
+            --source-digest "$SHA" \
+            --source-ref refs/heads/main
           {
             echo "Release published: https://github.com/${GH_REPO}/releases/tag/${TAG}"
             echo

@@ -98,8 +98,19 @@ jobs:
         shell: bash
         run: bash .github/scripts/assert-tag-absent.sh "v${VERSION}"
 
-      # `workflow_dispatch` accepts --ref, so without this a draft can be pinned to unmerged code
-      # and every downstream check still passes.
+      # The attested source ref is the ref this workflow runs from, and publish-release.yaml
+      # requires `refs/heads/main`. `workflow_dispatch` accepts --ref, so it is enforced here.
+      - name: Verify the workflow runs from main
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "::error::Draft Release must be dispatched from main, not $GITHUB_REF"
+            exit 1
+          fi
+
+      # Without this a draft can be pinned to unmerged code and every downstream check still
+      # passes.
       - name: Verify the release commit is on main
         env:
           SHA: ${{ github.sha }}
