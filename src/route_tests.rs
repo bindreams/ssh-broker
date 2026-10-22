@@ -84,3 +84,41 @@ fn shim_command_is_trimmed_at_the_parse_site() {
     };
     assert_eq!(exec.as_deref(), Some(""));
 }
+
+/// `CreateProcessW(NULL, cmdline)` resolves an unquoted program path with spaces by prefix
+/// widening, so the shim must hand it the command line untouched: no tokenizing, no
+/// re-quoting. sshd's `Subsystem sftp <path>` takes the rest of the line verbatim, and the path
+/// is commonly unquoted.
+#[test]
+fn dash_c_reassembles_an_unquoted_spaced_program_path() {
+    let want = Route::Shim {
+        exec: Some(r"C:\Program Files\OpenSSH\sftp-server.exe -l INFO".into()),
+    };
+    // Split across argv at the space inside the path.
+    assert_eq!(
+        route(&[
+            "-c".into(),
+            r"C:\Program".into(),
+            r"Files\OpenSSH\sftp-server.exe -l INFO".into()
+        ]),
+        want
+    );
+    // Arrived as one argument.
+    assert_eq!(
+        route(&["-c".into(), r"C:\Program Files\OpenSSH\sftp-server.exe -l INFO".into()]),
+        want
+    );
+}
+
+#[test]
+fn dash_c_keeps_a_quoted_program_path_verbatim() {
+    assert_eq!(
+        route(&[
+            "-c".into(),
+            r#""C:\Program Files\OpenSSH\sftp-server.exe" -l INFO"#.into()
+        ]),
+        Route::Shim {
+            exec: Some(r#""C:\Program Files\OpenSSH\sftp-server.exe" -l INFO"#.into())
+        }
+    );
+}

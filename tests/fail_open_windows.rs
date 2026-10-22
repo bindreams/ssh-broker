@@ -63,3 +63,42 @@ fn exec_fail_open_runs_the_command_with_no_shell_in_between() {
         String::from_utf8_lossy(&out.stderr).trim()
     );
 }
+
+/// The same path, with the agent unreachable: an unquoted program path containing spaces, with
+/// arguments after it, must still launch. `CreateProcessW` resolves it by prefix widening, so the
+/// shim must pass the command line through without tokenizing it (see
+/// `src/agent_program_path_tests.rs` for the relayed twin).
+///
+/// The program is a copy of `cmd.exe` in `Spaced Dir`, so the test needs no fixture binary.
+#[test]
+fn exec_fail_open_runs_an_unquoted_program_path_containing_spaces() {
+    let root = std::env::temp_dir().join(format!("sb-failopen-spaced-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let program_dir = root.join("Spaced Dir");
+    std::fs::create_dir_all(&program_dir).unwrap();
+    let program = program_dir.join("sftp-server.exe");
+    let system_root = std::env::var_os("SystemRoot").expect("SystemRoot is set on Windows");
+    std::fs::copy(
+        std::path::PathBuf::from(system_root).join(r"System32\cmd.exe"),
+        &program,
+    )
+    .unwrap();
+
+    let command = format!("{} /c echo unquoted-ok", program.display());
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_ssh-broker"))
+        .args(["-c", &command])
+        .output()
+        .expect("run the shim binary");
+    let _ = std::fs::remove_dir_all(&root);
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("agent unavailable"),
+        "precondition: the fail-open path must be the one that ran, not the relay.\nstderr: {stderr}"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("unquoted-ok"),
+        "the unquoted spaced program did not run.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+}
