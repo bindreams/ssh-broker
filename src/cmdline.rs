@@ -12,7 +12,7 @@ mod windows;
 #[cfg(not(windows))]
 pub use other::{current, detect};
 #[cfg(windows)]
-pub use windows::{current, detect};
+pub use windows::{current, detect, detect_piped};
 
 /// What [`detect`] found: how sshd encoded the command line, and, when that rests on an assumption,
 /// what to log once logging is up (detection runs before the log is opened).
@@ -31,6 +31,50 @@ pub enum Encoding {
     Escaped,
     /// No PTY, `DefaultShellEscapeArguments=0`: the command is wrapped in quotes, unescaped.
     Wrapped,
+}
+
+/// The kinds of `DefaultShell` path sshd tells apart (`w32-doexec.c:308-318`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShellKind {
+    Cmd,
+    PowerShell,
+    ShellHost,
+    Bash,
+    Cygwin,
+    Other,
+}
+
+/// Classify a `DefaultShell` path the way sshd does: it lowercases the path and turns `/` into
+/// `\` (`pwd.c:113-114`, `wmisc.c:919`, `:1288`), then takes the first substring that matches,
+/// in this order (`w32-doexec.c:308-318`).
+pub fn shell_kind(path: &str) -> ShellKind {
+    let path = path.replace('/', "\\").to_ascii_lowercase();
+    if path.contains(r"system32\cmd") {
+        ShellKind::Cmd
+    } else if path.contains("powershell") {
+        ShellKind::PowerShell
+    } else if path.contains("ssh-shellhost") {
+        ShellKind::ShellHost
+    } else if path.contains(r"\bash") {
+        ShellKind::Bash
+    } else if path.contains("cygwin") {
+        ShellKind::Cygwin
+    } else {
+        ShellKind::Other
+    }
+}
+
+impl ShellKind {
+    /// The non-PTY form sshd uses for this kind of shell, or `None` when `DefaultShellEscapeArguments`
+    /// decides: sshd escapes for PowerShell, bash and cygwin, wraps for cmd and ssh-shellhost, and
+    /// reads the flag only for any other path (`w32-doexec.c:370-371`).
+    pub fn encoding(self) -> Option<Encoding> {
+        match self {
+            ShellKind::Cmd | ShellKind::ShellHost => Some(Encoding::Wrapped),
+            ShellKind::PowerShell | ShellKind::Bash | ShellKind::Cygwin => Some(Encoding::Escaped),
+            ShellKind::Other => None,
+        }
+    }
 }
 
 /// Space and tab separate arguments; nothing else does.
@@ -130,16 +174,13 @@ pub fn dash_c_tail(line: &str) -> Option<&str> {
 /// - [`Encoding::Wrapped`], no PTY and `DefaultShellEscapeArguments=0`: the command is wrapped
 ///   in quotes with nothing escaped, so the quotes inside it are its own.
 ///
-/// An empty command leaves nothing after `-c` in the first two forms, and is `None`.
-pub fn decode_command(tail: &str, encoding: Encoding) -> Option<String> {
-    if tail.is_empty() {
-        return None;
-    }
-    Some(match encoding {
+/// An empty tail is an empty command: `-c` was given, so the client asked to run something.
+pub fn decode_command(tail: &str, encoding: Encoding) -> String {
+    match encoding {
         Encoding::Verbatim => tail.to_string(),
         Encoding::Escaped => unescape_argument(unwrap_quotes(tail).unwrap_or(tail)),
         Encoding::Wrapped => unwrap_quotes(tail).unwrap_or(tail).to_string(),
-    })
+    }
 }
 
 /// `s` without the quote that opens and the quote that closes it; `None` if it has no such pair.

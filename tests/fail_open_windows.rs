@@ -174,6 +174,21 @@ fn exec_fail_open_keeps_the_quotes_of_a_pty_command() {
     );
 }
 
+/// The precondition of the test below, checked loudly: the form the shim will decode on pipes is
+/// the one it detects from this machine's `DefaultShell` and `DefaultShellEscapeArguments`
+/// (`DefaultShell` unset or elsewhere than cmd, with the flag on or unset, gives the escaped form).
+fn require_escaped_form(shim: &str) {
+    let detected = ssh_broker::cmdline::detect_piped(shim);
+    assert!(
+        detected.encoding == ssh_broker::cmdline::Encoding::Escaped && detected.warning.is_none(),
+        "this test encodes the command as sshd does for the escaped form, but this machine's \
+         OpenSSH settings make the shim expect {:?} (warning: {:?}). Check \
+         HKLM\\SOFTWARE\\OpenSSH\\DefaultShell and DefaultShellEscapeArguments.",
+        detected.encoding,
+        detected.warning
+    );
+}
+
 /// A session without a PTY: sshd escapes the command into one argument of the shell's line (with
 /// `DefaultShellEscapeArguments` on, which is the default), so the shim must undo that and run
 /// the command as the client sent it. Piped stdio is what tells the shim the command is escaped.
@@ -185,6 +200,7 @@ fn exec_fail_open_decodes_the_escaped_command_of_a_session_without_a_pty() {
 
     let (root, program) = spaced_program("sb-failopen-quoted-escaped");
     let shim = env!("CARGO_BIN_EXE_ssh-broker");
+    require_escaped_form(shim);
     let argument = sshd_encoder::escaped_argument(&quoted_command(&program));
     let out = std::process::Command::new(shim)
         .arg("-c")

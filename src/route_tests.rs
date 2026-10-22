@@ -33,10 +33,15 @@ fn dash_c_is_exec_shim() {
     assert_eq!(route_line(r#"ssh-broker.exe -c "echo hi""#), shim("echo hi"));
 }
 
+/// `-c` was given, so it is an exec request even when the command is empty (the shell runs
+/// nothing for `-c ""`). Only a line with no `-c` at all is an interactive session.
 #[test]
-fn dash_c_with_no_command_is_none() {
-    assert_eq!(route_line("ssh-broker.exe -c"), Route::Shim { exec: None });
-    assert_eq!(route_line("ssh-broker.exe -c "), Route::Shim { exec: None });
+fn dash_c_with_an_empty_command_is_an_empty_exec() {
+    for encoding in [Encoding::Verbatim, Encoding::Escaped, Encoding::Wrapped] {
+        assert_eq!(route_line_as("ssh-broker.exe -c", encoding), shim(""), "{encoding:?}");
+        assert_eq!(route_line_as("ssh-broker.exe -c ", encoding), shim(""), "{encoding:?}");
+    }
+    assert_eq!(route_line_as(r#"ssh-broker.exe -c """#, Encoding::Wrapped), shim(""));
 }
 
 #[test]
@@ -167,5 +172,5 @@ fn a_raw_line_without_dash_c_falls_back_to_the_joined_args() {
         route(&["-c".into(), "a b".into(), "c".into()], "", Encoding::Escaped),
         shim("a b c")
     );
-    assert_eq!(route(&["-c".into()], "", Encoding::Escaped), Route::Shim { exec: None });
+    assert_eq!(route(&["-c".into()], "", Encoding::Escaped), shim(""));
 }

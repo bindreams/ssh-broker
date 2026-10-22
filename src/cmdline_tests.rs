@@ -3,7 +3,7 @@
 //! The three shapes sshd's `-c` tail takes are taken from Win32-OpenSSH `w32-doexec.c` and
 //! `misc.c` (`build_commandline_string`); see `decode_command`.
 
-use super::{Encoding, dash_c_tail, decode_command, split_args};
+use super::{Encoding, ShellKind, dash_c_tail, decode_command, shell_kind, split_args};
 
 fn args(line: &str) -> Vec<String> {
     split_args(line)
@@ -68,17 +68,14 @@ fn dash_c_tail_does_not_unquote_the_command() {
 
 #[test]
 fn an_escaped_single_argument_decodes_to_the_command() {
+    assert_eq!(decode_command(r#""echo  hi""#, Encoding::Escaped), "echo  hi");
     assert_eq!(
-        decode_command(r#""echo  hi""#, Encoding::Escaped).as_deref(),
-        Some("echo  hi")
+        decode_command(r#""\"C:\a b\p.exe\" \"x y\"""#, Encoding::Escaped),
+        r#""C:\a b\p.exe" "x y""#
     );
-    assert_eq!(
-        decode_command(r#""\"C:\a b\p.exe\" \"x y\"""#, Encoding::Escaped).as_deref(),
-        Some(r#""C:\a b\p.exe" "x y""#)
-    );
-    assert_eq!(decode_command(r"whoami", Encoding::Escaped).as_deref(), Some("whoami"));
+    assert_eq!(decode_command(r"whoami", Encoding::Escaped), "whoami");
     // No space, so sshd leaves it unquoted but still escapes the quotes.
-    assert_eq!(decode_command(r#"a\"b"#, Encoding::Escaped).as_deref(), Some(r#"a"b"#));
+    assert_eq!(decode_command(r#"a\"b"#, Encoding::Escaped), r#"a"b"#);
 }
 
 // Shape (b): a PTY session (`ssh -t host cmd`). sshd appends the command verbatim.
@@ -86,32 +83,33 @@ fn an_escaped_single_argument_decodes_to_the_command() {
 #[test]
 fn a_verbatim_command_is_kept_exactly() {
     assert_eq!(
-        decode_command(r#""C:\a b\p.exe" "x y""#, Encoding::Verbatim).as_deref(),
-        Some(r#""C:\a b\p.exe" "x y""#)
+        decode_command(r#""C:\a b\p.exe" "x y""#, Encoding::Verbatim),
+        r#""C:\a b\p.exe" "x y""#
     );
     // An empty argument and a run of spaces both survive.
+    assert_eq!(decode_command(r#"p.exe "" end"#, Encoding::Verbatim), r#"p.exe "" end"#);
     assert_eq!(
-        decode_command(r#"p.exe "" end"#, Encoding::Verbatim).as_deref(),
-        Some(r#"p.exe "" end"#)
+        decode_command("echo  two  spaces", Encoding::Verbatim),
+        "echo  two  spaces"
     );
     assert_eq!(
-        decode_command("echo  two  spaces", Encoding::Verbatim).as_deref(),
-        Some("echo  two  spaces")
-    );
-    assert_eq!(
-        decode_command(r"C:\Program Files\OpenSSH\sftp-server.exe -l INFO", Encoding::Verbatim).as_deref(),
-        Some(r"C:\Program Files\OpenSSH\sftp-server.exe -l INFO")
+        decode_command(r"C:\Program Files\OpenSSH\sftp-server.exe -l INFO", Encoding::Verbatim),
+        r"C:\Program Files\OpenSSH\sftp-server.exe -l INFO"
     );
 }
 
+/// `-c` was given, so the client asked to run something; an empty command is an exec request
+/// that runs nothing, not an interactive session.
 #[test]
-fn an_empty_tail_is_no_command() {
-    assert_eq!(decode_command("", Encoding::Verbatim), None);
+fn an_empty_tail_is_an_empty_command() {
+    for encoding in [Encoding::Verbatim, Encoding::Escaped, Encoding::Wrapped] {
+        assert_eq!(decode_command("", encoding), "", "{encoding:?}");
+    }
 }
 
 #[test]
 fn an_empty_quoted_argument_is_an_empty_command() {
-    assert_eq!(decode_command(r#""""#, Encoding::Wrapped).as_deref(), Some(""));
+    assert_eq!(decode_command(r#""""#, Encoding::Wrapped), "");
 }
 
 // Shape (a) again: the forms a C-runtime splitter reads wrongly.
@@ -119,24 +117,18 @@ fn an_empty_quoted_argument_is_an_empty_command() {
 #[test]
 fn an_escaped_command_sshd_left_unwrapped_is_not_split() {
     // A leading `'` suppresses the wrapper, spaces and all.
-    assert_eq!(
-        decode_command(r#"'a \"b\" c'"#, Encoding::Escaped).as_deref(),
-        Some(r#"'a "b" c'"#)
-    );
+    assert_eq!(decode_command(r#"'a \"b\" c'"#, Encoding::Escaped), r#"'a "b" c'"#);
     // Only a space triggers the wrapper, so a tab stays bare.
-    assert_eq!(decode_command("a\tb", Encoding::Escaped).as_deref(), Some("a\tb"));
+    assert_eq!(decode_command("a\tb", Encoding::Escaped), "a\tb");
 }
 
 #[test]
 fn an_escaped_command_ending_in_a_backslash_keeps_it() {
     // sshd does not double the backslash before the closing quote.
+    assert_eq!(decode_command(r#""echo C:\a b\""#, Encoding::Escaped), r"echo C:\a b\");
     assert_eq!(
-        decode_command(r#""echo C:\a b\""#, Encoding::Escaped).as_deref(),
-        Some(r"echo C:\a b\")
-    );
-    assert_eq!(
-        decode_command(r#""echo C:\a b\\""#, Encoding::Escaped).as_deref(),
-        Some(r"echo C:\a b\\")
+        decode_command(r#""echo C:\a b\\""#, Encoding::Escaped),
+        r"echo C:\a b\\"
     );
 }
 
@@ -144,15 +136,12 @@ fn an_escaped_command_ending_in_a_backslash_keeps_it() {
 
 #[test]
 fn a_wrapped_command_keeps_the_quotes_inside_it() {
-    assert_eq!(
-        decode_command(r#""echo "a b"""#, Encoding::Wrapped).as_deref(),
-        Some(r#"echo "a b""#)
-    );
-    assert_eq!(decode_command(r#""a"b""#, Encoding::Wrapped).as_deref(), Some(r#"a"b"#));
+    assert_eq!(decode_command(r#""echo "a b"""#, Encoding::Wrapped), r#"echo "a b""#);
+    assert_eq!(decode_command(r#""a"b""#, Encoding::Wrapped), r#"a"b"#);
     // Nothing is escaped, so a backslash before a quote is the command's own.
     assert_eq!(
-        decode_command(r#""echo \"a b\"""#, Encoding::Wrapped).as_deref(),
-        Some(r#"echo \"a b\""#)
+        decode_command(r#""echo \"a b\"""#, Encoding::Wrapped),
+        r#"echo \"a b\""#
     );
 }
 
@@ -161,11 +150,61 @@ fn a_wrapped_command_keeps_the_quotes_inside_it() {
 #[test]
 fn a_verbatim_single_token_keeps_its_quotes() {
     assert_eq!(
-        decode_command(r#""C:\a b\p.exe""#, Encoding::Verbatim).as_deref(),
-        Some(r#""C:\a b\p.exe""#)
+        decode_command(r#""C:\a b\p.exe""#, Encoding::Verbatim),
+        r#""C:\a b\p.exe""#
     );
-    assert_eq!(
-        decode_command(r#"--opt="a b""#, Encoding::Verbatim).as_deref(),
-        Some(r#"--opt="a b""#)
-    );
+    assert_eq!(decode_command(r#"--opt="a b""#, Encoding::Verbatim), r#"--opt="a b""#);
+}
+
+// Which non-PTY form sshd uses also depends on the DefaultShell path (`w32-doexec.c:308-318`,
+// `:370-371`).
+
+#[test]
+fn shell_kind_matches_sshds_substring_checks() {
+    for (path, kind) in [
+        (r"C:\Windows\System32\cmd.exe", ShellKind::Cmd),
+        (
+            r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+            ShellKind::PowerShell,
+        ),
+        // Only the directory name matches.
+        (r"C:\Program Files\PowerShell\7\pwsh.exe", ShellKind::PowerShell),
+        (r"C:\tools\pwsh.exe", ShellKind::Other),
+        (r"C:\tools\ssh-shellhost.exe", ShellKind::ShellHost),
+        (r"C:\Program Files\Git\usr\bin\bash.exe", ShellKind::Bash),
+        (r"C:\cygwin64\bin\zsh.exe", ShellKind::Cygwin),
+        (r"C:\ProgramData\ssh-broker\ssh-broker.exe", ShellKind::Other),
+        ("", ShellKind::Other),
+    ] {
+        assert_eq!(shell_kind(path), kind, "{path}");
+    }
+}
+
+/// sshd lowercases the path and turns `/` into `\` before it looks (`pwd.c:113-114`).
+#[test]
+fn shell_kind_ignores_case_and_slash_direction() {
+    assert_eq!(shell_kind("C:/Windows/System32/CMD.EXE"), ShellKind::Cmd);
+    assert_eq!(shell_kind("c:/x/PowerShell.exe"), ShellKind::PowerShell);
+    assert_eq!(shell_kind("c:/x/Bash.exe"), ShellKind::Bash);
+}
+
+/// The first check that matches wins, in sshd's order.
+#[test]
+fn shell_kind_checks_in_sshds_order() {
+    assert_eq!(shell_kind(r"c:\cygwin\powershell.exe"), ShellKind::PowerShell);
+    assert_eq!(shell_kind(r"c:\windows\system32\cmd-powershell.exe"), ShellKind::Cmd);
+    assert_eq!(shell_kind(r"c:\bash\ssh-shellhost.exe"), ShellKind::ShellHost);
+    assert_eq!(shell_kind(r"c:\cygwin\bash.exe"), ShellKind::Bash);
+}
+
+/// cmd and ssh-shellhost get the wrapped form; PowerShell, bash and cygwin the escaped form; any
+/// other path follows the registry flag (`None` here).
+#[test]
+fn a_shell_kind_fixes_the_form_except_for_other_paths() {
+    assert_eq!(ShellKind::Cmd.encoding(), Some(Encoding::Wrapped));
+    assert_eq!(ShellKind::ShellHost.encoding(), Some(Encoding::Wrapped));
+    assert_eq!(ShellKind::PowerShell.encoding(), Some(Encoding::Escaped));
+    assert_eq!(ShellKind::Bash.encoding(), Some(Encoding::Escaped));
+    assert_eq!(ShellKind::Cygwin.encoding(), Some(Encoding::Escaped));
+    assert_eq!(ShellKind::Other.encoding(), None);
 }

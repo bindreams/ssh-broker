@@ -38,14 +38,13 @@ pub fn route(args: &[String], command_line: &str, encoding: cmdline::Encoding) -
         Some("verify") => Route::Verify,
         Some("verify-probe") => Route::VerifyProbe,
         Some("-c") => {
-            // `-c` with no command after it degrades to an interactive shim.
+            // `-c` was given, so this is an exec request even when the command is empty.
             let exec = match cmdline::dash_c_tail(command_line) {
                 Some(tail) => cmdline::decode_command(tail, encoding),
-                None if args.len() > 1 => Some(args[1..].join(" ")),
-                None => None,
+                None => args[1..].join(" "),
             };
             Route::Shim {
-                exec: crate::shim::normalize_exec(exec),
+                exec: crate::shim::normalize_exec(Some(exec)),
             }
         }
         _ => Route::Shim { exec: None },

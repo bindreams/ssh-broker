@@ -84,19 +84,15 @@ const CORPUS: &[&str] = &[
 
 /// What `route` must make of `command` once sshd has encoded it in `encoding`.
 ///
-/// Three things are not the command itself. sshd rewrites an `scp`/`sftp` command first
-/// (`build_exec_command`). The shim then trims the edges, which carry no meaning
-/// (`shim::normalize_exec`). And an empty command leaves nothing after `-c` in the first two
-/// forms, so it reads as no command; stock clients send an interactive session in that case.
-fn expected(encoding: Encoding, command: &str) -> Option<String> {
+/// Two things are not the command itself. sshd rewrites an `scp`/`sftp` command first
+/// (`build_exec_command`), and the shim then trims the edges, which carry no meaning
+/// (`shim::normalize_exec`). An empty command stays an (empty) exec in every form.
+fn expected(encoding: Encoding, command: &str) -> String {
     let sent = match encoding {
         Encoding::Verbatim => command.to_string(),
         Encoding::Escaped | Encoding::Wrapped => build_exec_command(command),
     };
-    if sent.is_empty() && encoding != Encoding::Wrapped {
-        return None;
-    }
-    Some(sent.trim_matches(crate::shim::BOUNDARY).to_string())
+    sent.trim_matches(crate::shim::BOUNDARY).to_string()
 }
 
 fn routed(encoding: Encoding, command: &str) -> Option<String> {
@@ -114,7 +110,7 @@ fn decoding_inverts_sshds_encoding_for_every_command_in_the_corpus() {
     for encoding in [Encoding::Verbatim, Encoding::Escaped, Encoding::Wrapped] {
         for command in CORPUS {
             let got = routed(encoding, command);
-            let want = expected(encoding, command);
+            let want = Some(expected(encoding, command));
             if got != want {
                 failures.push(format!(
                     "{encoding:?} {command:?}\n  line: {}\n  want: {want:?}\n  got:  {got:?}",
