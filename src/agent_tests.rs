@@ -128,6 +128,43 @@ fn agent_exec_handler_separates_streams_and_returns_code() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// A broken broker must not cost the user a session: if the hangup watcher cannot be created the
+/// command still runs and reports its exit code, without that protection.
+#[test]
+fn agent_exec_runs_the_command_when_the_hangup_watcher_cannot_be_created() {
+    let dir = hardened_dir("exec-no-watcher");
+    let sock = dir.join("s");
+    let listener = Listener::bind(&sock).unwrap();
+
+    let client_path = sock.clone();
+    let client = thread::spawn(move || {
+        let conn = afunix::connect(&client_path).unwrap();
+        let (mut crx, mut ctx) = afunix::split(conn).unwrap();
+        let hs = Handshake {
+            mode: Mode::Exec,
+            command: Some("cmd.exe /c echo OUT& exit /b 4".into()),
+            ..Handshake::pty_default()
+        };
+        write_frame(&mut ctx, FrameKind::Handshake, &hs.encode().unwrap()).unwrap();
+        write_data(&mut ctx, Stream::Stdin, b"").unwrap();
+        let mut fr = FrameReader::new();
+        let mut sink = TestSink::default();
+        let outcome = pump_decode(&mut crx, &mut fr, &mut sink).unwrap();
+        (outcome, sink.stdout)
+    });
+
+    let conn = listener.accept().unwrap();
+    super::handle_connection_with(conn, |_| Err(std::io::Error::other("forced watcher failure"))).unwrap();
+
+    let (outcome, stdout) = client.join().unwrap();
+    assert_eq!(outcome, Outcome::Exited(4));
+    assert!(
+        String::from_utf8_lossy(&stdout).contains("OUT"),
+        "stdout was: {stdout:?}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 #[test]
 fn agent_exec_relays_stdin_and_returns_sorted_output() {
     // The documented core of the stdin path: feed a stdin-reading child (`sort`) its full
