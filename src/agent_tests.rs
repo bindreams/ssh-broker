@@ -188,6 +188,94 @@ fn agent_exec_handler_separates_streams_and_returns_code() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// How much stdin the client streams while the command exits.
+#[derive(Clone, Copy, Debug)]
+enum Streamed {
+    Bytes(usize),
+    /// Without end, until the client has the EXIT frame, so input is in flight when the agent closes.
+    UntilExit,
+}
+
+/// A command that exits at once while the client is still streaming input must still deliver its
+/// exit code. The agent closes the connection with that input unread; closing the read side
+/// before the client has gone resets the connection and loses the EXIT frame. Looped because the
+/// reset is a race.
+fn assert_fast_exit_keeps_the_exit_code(tag: &str, mode: Mode) {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let dir = hardened_dir(tag);
+    let sock = dir.join("s");
+    let listener = Listener::bind(&sock).unwrap();
+
+    for streamed in [Streamed::Bytes(1), Streamed::Bytes(100 * 1024), Streamed::UntilExit] {
+        for round in 0..10 {
+            let client_path = sock.clone();
+            let client = thread::spawn(move || {
+                let conn = afunix::connect(&client_path).unwrap();
+                let (mut crx, mut ctx) = afunix::split(conn).unwrap();
+                let hs = Handshake {
+                    mode,
+                    command: Some("cmd.exe /c exit /b 3".into()),
+                    ..Handshake::pty_default()
+                };
+                write_frame(&mut ctx, FrameKind::Handshake, &hs.encode().unwrap()).unwrap();
+                let stream = if mode == Mode::Pty { Stream::Pty } else { Stream::Stdin };
+                let done = Arc::new(AtomicBool::new(false));
+                // As the shim does: input streams from its own thread while this one reads. The
+                // agent may close first, so write errors are expected and end the writer.
+                let writer = {
+                    let done = Arc::clone(&done);
+                    thread::spawn(move || {
+                        let chunk = [b'x'; 8 * 1024];
+                        match streamed {
+                            Streamed::Bytes(len) => {
+                                for part in vec![b'x'; len].chunks(chunk.len()) {
+                                    if write_data(&mut ctx, stream, part).is_err() {
+                                        return;
+                                    }
+                                }
+                                let _ = write_data(&mut ctx, stream, b"");
+                            }
+                            Streamed::UntilExit => {
+                                while !done.load(Ordering::SeqCst) {
+                                    if write_data(&mut ctx, stream, &chunk).is_err() {
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                    })
+                };
+                let mut fr = FrameReader::new();
+                let mut sink = TestSink::default();
+                let outcome = pump_decode(&mut crx, &mut fr, &mut sink);
+                done.store(true, Ordering::SeqCst);
+                writer.join().unwrap();
+                outcome
+            });
+
+            let conn = listener.accept().unwrap();
+            super::handle_connection(conn).unwrap();
+
+            let outcome = client.join().unwrap();
+            let ctx = format!("{mode:?}, {streamed:?}, round {round}");
+            assert_eq!(outcome.expect(&ctx), Outcome::Exited(3), "{ctx}");
+        }
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn agent_exec_that_exits_at_once_keeps_its_exit_code_while_input_streams() {
+    assert_fast_exit_keeps_the_exit_code("exec-fast-exit", Mode::Exec);
+}
+
+#[test]
+fn agent_pty_that_exits_at_once_keeps_its_exit_code_while_input_streams() {
+    assert_fast_exit_keeps_the_exit_code("pty-fast-exit", Mode::Pty);
+}
+
 /// A broken broker must not cost the user a session: if the hangup watcher cannot be created the
 /// command still runs and reports its exit code, without that protection.
 #[test]

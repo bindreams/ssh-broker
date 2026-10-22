@@ -227,13 +227,15 @@ fn watcher_returns_when_the_waker_is_dropped() {
 }
 
 /// A connection to the listener's port that is not the pair's own never becomes the wake channel,
-/// even when it arrives first, and the listener's port cannot be bound by another socket.
+/// even when it arrives first, and a `SO_REUSEADDR` socket cannot bind the listener's address.
 #[test]
 fn a_foreign_connection_to_the_listener_does_not_become_the_wake_channel() {
     let mut foreign = None;
     let mut rebind = None;
     let (rx, tx) = wake_pair_with(|_, addr| {
-        // SO_REUSEADDR would let a second socket take over a non-exclusive port.
+        // Measured: a SO_REUSEADDR socket cannot bind the listener's exact address, with or
+        // without SO_EXCLUSIVEADDRUSE; a wildcard bind on its port succeeds either way. The
+        // option itself is pinned by `the_wake_listener_has_the_exclusive_option`.
         let other = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
         other.set_reuse_address(true).unwrap();
         rebind = Some(other.bind(&SockAddr::from(addr)));

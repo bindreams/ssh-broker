@@ -6,7 +6,7 @@
 //!
 //! [`HangupWatcher`] blocks in `WSAPoll` on a duplicate of the session socket, which reports
 //! `POLLHUP` for a closed peer without consuming a byte. A poll on a duplicate does not wake for
-//! the session's own `shutdown_both` unless input is unread, so a second socket joins the same
+//! a local `shutdown_both` unless input is unread, so a second socket joins the same
 //! poll: [`Waker::wake`] writes to it at teardown. It is one end of a loopback TCP connection
 //! this module made (see [`wake_pair`]), so no other process can write to the other end.
 
