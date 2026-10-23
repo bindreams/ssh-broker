@@ -108,8 +108,8 @@ mod imp {
         let (user, exe) = layout::prepare(&layout, &current, arg_user().as_deref(), current_user_name().as_deref())?;
 
         // 2. Register both tasks (idempotent /F).
-        register_agent_task(&layout, &exe, &user)?;
-        register_selfheal_task(&exe, &user)?;
+        register_agent_task(&layout, &exe)?;
+        register_selfheal_task(&exe)?;
 
         // 3. Write the escape flag and read it back at once, then flip the DefaultShell pair LAST
         //    and only to the validated canonical path; read that back too. sshd reads these once
@@ -136,8 +136,8 @@ mod imp {
         Ok(())
     }
 
-    fn register_agent_task(layout: &Layout, exe: &Path, user: &str) -> anyhow::Result<()> {
-        let xml = schtasks::agent_task_xml(&exe.to_string_lossy(), user);
+    fn register_agent_task(layout: &Layout, exe: &Path) -> anyhow::Result<()> {
+        let xml = schtasks::agent_task_xml(&exe.to_string_lossy());
         let xml_path = layout.base.join("agent-task.xml");
         // schtasks /XML requires a UTF-16 file (a UTF-8 one is rejected).
         std::fs::write(&xml_path, schtasks::xml_file_bytes(&xml)).context("write agent task xml")?;
@@ -149,8 +149,8 @@ mod imp {
         Ok(())
     }
 
-    fn register_selfheal_task(exe: &Path, user: &str) -> anyhow::Result<()> {
-        run_schtasks(&schtasks::selfheal_task_argv(&exe.to_string_lossy(), user)).context("register self-heal task")?;
+    fn register_selfheal_task(exe: &Path) -> anyhow::Result<()> {
+        run_schtasks(&schtasks::selfheal_task_argv(&exe.to_string_lossy())).context("register self-heal task")?;
         Ok(())
     }
 
@@ -233,14 +233,14 @@ mod imp {
         // Local: the socket dir ACL verifies for the configured account (== the agent's grantee).
         rows.push(layout::socket_dir_row(&base));
 
-        // Local: both tasks registered, and the agent task is InteractiveToken (session 1).
+        // Local: the agent task is registered in its group form (any user, interactive session).
         let (agent_xml, agent_ok) = query_schtasks(&schtasks::query_task_argv(schtasks::AGENT_TASK));
         let registered = schtasks::parse_query_registered(&agent_xml, agent_ok);
-        let interactive = schtasks::xml_has_interactive_token(&agent_xml);
+        let group_task = schtasks::xml_is_group_logon_task(&agent_xml);
         rows.push(report::Check::new(
             "agent task",
-            registered && interactive,
-            format!("registered={registered} interactive_token={interactive}"),
+            registered && group_task,
+            format!("registered={registered} group_logon_task={group_task}"),
         ));
         // Informational: verify runs via the LeastPrivilege agent (non-elevated) and cannot
         // reliably query a SYSTEM-owned task, so this never gates verify (apply errors loudly

@@ -100,3 +100,34 @@ impl Drop for TempProfile {
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }
+
+// Elevation -----
+
+/// Fail loudly unless this process is an elevated administrator. For the tests that need it, so
+/// they stop before they touch anything when run by hand on an ordinary host.
+pub fn assert_elevated() {
+    use windows::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows::Win32::Security::{GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation};
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    let mut token = HANDLE::default();
+    // SAFETY: valid out-pointers; the handle is closed below.
+    let elevated = unsafe {
+        OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).unwrap();
+        let mut info = TOKEN_ELEVATION::default();
+        let mut len = 0u32;
+        let ok = GetTokenInformation(
+            token,
+            TokenElevation,
+            Some(&mut info as *mut _ as *mut core::ffi::c_void),
+            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+            &mut len,
+        );
+        let _ = CloseHandle(token);
+        ok.is_ok() && info.TokenIsElevated != 0
+    };
+    assert!(
+        elevated,
+        "this test needs an elevated administrator (CI runs it); not running it here"
+    );
+}
