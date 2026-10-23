@@ -266,3 +266,89 @@ fn the_local_passthrough_spawn_accepts_whitespace_at_the_edges_of_a_command() {
         assert_eq!(code, 3, "{command:?}");
     }
 }
+
+// Where the shim connects, and what it says when it cannot ------------------------------
+
+use crate::socket_loc::{SocketLocation, SocketLocationError};
+
+fn too_long() -> anyhow::Error {
+    SocketLocationError::TooLong {
+        path: std::path::PathBuf::from(r"C:\very\long\agent.sock"),
+        bytes: 120,
+        max: 107,
+    }
+    .into()
+}
+
+#[test]
+fn unresolvable_socket_location_fails_open_with_the_reason() {
+    let mut stderr = Vec::new();
+    let relayed = super::try_relay_at(Err(too_long()), &Some("echo hi".into()), &mut stderr).unwrap();
+
+    assert_eq!(
+        relayed, None,
+        "an unresolvable location is fail-open, like an unreachable agent"
+    );
+    let text = String::from_utf8(stderr).unwrap();
+    assert!(text.starts_with("ssh-broker: agent unavailable"), "{text}");
+    assert!(text.contains("the AF_UNIX limit is 107"), "the reason is named: {text}");
+}
+
+#[test]
+fn location_error_reaches_stderr_in_pty_mode() {
+    // No relay has started and the console has not been touched, so a line on stderr before the
+    // fallback shell corrupts nothing. The log is no substitute: for an interactive session it is
+    // the only other place the reason goes, and the user does not read it.
+    let mut stderr = Vec::new();
+    let relayed = super::try_relay_at(Err(too_long()), &None, &mut stderr).unwrap();
+
+    assert_eq!(relayed, None);
+    let text = String::from_utf8(stderr).unwrap();
+    assert!(text.contains("agent unavailable"), "{text}");
+    assert!(text.contains("the AF_UNIX limit is 107"), "{text}");
+}
+
+#[test]
+fn unavailable_message_always_begins_with_the_phrase_the_tests_grep_for() {
+    assert!(super::unavailable_message(None).starts_with("ssh-broker: agent unavailable"));
+    assert!(super::unavailable_message(Some(&"no profile")).starts_with("ssh-broker: agent unavailable"));
+    assert!(super::unavailable_message(Some(&"no profile")).contains("no profile"));
+}
+
+#[test]
+fn connect_failure_in_the_callers_own_dir_fails_open_without_a_reason_on_stderr() {
+    // A location that resolves but has no agent behind it: the old behaviour, message unchanged.
+    let dir = std::env::temp_dir().join(format!("sb-shim-noagent-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let location = SocketLocation {
+        path: dir.join("agent.sock"),
+        dir: dir.clone(),
+    };
+    let mut stderr = Vec::new();
+    let relayed = super::try_relay_at(Ok(location), &Some("echo hi".into()), &mut stderr).unwrap();
+
+    assert_eq!(relayed, None);
+    assert_eq!(
+        String::from_utf8(stderr).unwrap(),
+        "ssh-broker: agent unavailable — falling back to a local shell\n"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn connect_failure_in_pty_mode_writes_nothing_to_stderr() {
+    // A connect failure keeps the old rule: stderr would corrupt an interactive stream that the
+    // relay may yet use, so the reason goes to the log only.
+    let dir = std::env::temp_dir().join(format!("sb-shim-noagent-pty-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let location = SocketLocation {
+        path: dir.join("agent.sock"),
+        dir: dir.clone(),
+    };
+    let mut stderr = Vec::new();
+    let relayed = super::try_relay_at(Ok(location), &None, &mut stderr).unwrap();
+
+    assert_eq!(relayed, None);
+    assert!(stderr.is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
+}

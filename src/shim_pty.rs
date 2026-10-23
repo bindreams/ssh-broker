@@ -21,6 +21,7 @@ use crate::shim::{
     FailOpen, Fallback, MouseModeSniffer, XtwinopsFilter, decide_fail_open, decide_fallback, is_blank_command,
     make_handshake, map_outcome, run_exec_on, size_to_resize,
 };
+use crate::socket_loc::SocketLocation;
 use crate::{afunix, conpty, vtinput};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -143,16 +144,50 @@ fn fail_open_command(decision: &FailOpen) -> &str {
 /// shim should fail open (agent unreachable, or no interactive console). Any `Err` is a
 /// pre-spawn setup failure (connect/split/handshake/console) — the agent spawned nothing, so
 /// the caller can safely fail open without a double-execution or an orphaned shell.
+///
+/// The socket is the one in the profile of the account this process runs as, and no other: see
+/// [`crate::userdir::current_socket_location`].
 fn try_relay(exec: &Option<String>) -> anyhow::Result<Option<i32>> {
-    let path = crate::userdir::current_socket_location()?.path;
+    try_relay_at(crate::userdir::current_socket_location(), exec, &mut std::io::stderr())
+}
+
+/// The phrase `tests/fail_open_windows.rs` greps for; every fail-open message begins with it.
+/// `reason` is why the agent cannot be reached, when the shim knows and the user can act on it.
+fn unavailable_message(reason: Option<&dyn std::fmt::Display>) -> String {
+    match reason {
+        Some(reason) => format!("ssh-broker: agent unavailable — falling back to a local shell ({reason})"),
+        None => "ssh-broker: agent unavailable — falling back to a local shell".to_string(),
+    }
+}
+
+/// [`try_relay`] for a given socket location (or the reason there is none), writing a user
+/// message to `stderr` where one is safe.
+fn try_relay_at(
+    location: anyhow::Result<SocketLocation>,
+    exec: &Option<String>,
+    stderr: &mut dyn std::io::Write,
+) -> anyhow::Result<Option<i32>> {
+    let location = match location {
+        Ok(location) => location,
+        Err(e) => {
+            // No profile, or a profile path too long for a socket: the cause is the user's own
+            // setup and nothing but this line will tell them. Nothing is relayed and the console
+            // is untouched, so a line on stderr is safe even for an interactive session.
+            let reason = format!("{e:#}");
+            tracing::warn!("{}", unavailable_message(Some(&reason)));
+            let _ = writeln!(stderr, "{}", unavailable_message(Some(&reason)));
+            return Ok(None);
+        }
+    };
+    let path = location.path;
     let conn = afunix::connect(&path);
     if decide_fallback(conn.is_err()) == Fallback::LocalShellWithWarning {
-        let msg = "ssh-broker: agent unavailable — falling back to a local shell";
+        let msg = unavailable_message(None);
         tracing::warn!("{msg} (path={path:?}, err={:?})", conn.as_ref().err());
         // EXEC has a clean stderr channel; in PTY mode a stderr write would corrupt the
         // terminal stream, so there the warning goes only to the log file.
         if exec.is_some() {
-            eprintln!("{msg}");
+            let _ = writeln!(stderr, "{msg}");
         }
         return Ok(None);
     }
