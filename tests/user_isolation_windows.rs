@@ -863,7 +863,7 @@ fn a_loader_failure_as_bob_ends_the_process_with_its_status_and_no_message_box()
     // A copy of the shim that imports a DLL that does not exist: the loader cannot start it.
     let broken = shared.0.join("broken.exe");
     let mut image = std::fs::read(env!("CARGO_BIN_EXE_ssh-broker")).unwrap();
-    let (from, to) = (b"wtsapi32.dll ", b"wtsapi99.dll ");
+    let (from, to) = (b"wtsapi32.dll\0", b"wtsapi99.dll\0");
     let at = image
         .windows(from.len())
         .position(|w| w == from)
