@@ -34,11 +34,10 @@ pub fn spawn_line(command: &str) -> &str {
     command.trim_start_matches(BOUNDARY)
 }
 
-/// The characters that carry no meaning at a command's edges. Windows separates arguments on
-/// space and tab only; CR and LF are here because sshd can hand over a line-terminated command
-/// and they would otherwise stay glued to the program name. Deliberately NOT Rust's `trim`,
-/// whose Unicode `White_Space` set would strip characters this pipeline treats as part of an
-/// argument.
+/// The characters `CreateProcessW` rejects at the start of a command line (space and tab with
+/// `ERROR_INVALID_PARAMETER`, CR and LF with `ERROR_FILE_NOT_FOUND`), and the ones a command made
+/// only of is blank. Deliberately NOT Rust's `trim`, whose Unicode `White_Space` set would strip
+/// characters this pipeline treats as part of an argument.
 pub const BOUNDARY: [char; 4] = [' ', '\t', '\r', '\n'];
 
 /// Whether an exec command is empty or only [`BOUNDARY`] characters. Such a command runs nothing
