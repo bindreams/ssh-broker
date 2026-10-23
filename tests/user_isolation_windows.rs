@@ -38,17 +38,21 @@ use windows::Win32::Security::{
     TOKEN_DUPLICATE, TOKEN_ELEVATION, TOKEN_QUERY, TokenDefaultDacl, TokenElevation, TokenImpersonation, TokenPrimary,
 };
 use windows::Win32::System::Threading::{
-    CREATE_NO_WINDOW, CREATE_PROCESS_LOGON_FLAGS, CREATE_SUSPENDED, CreateProcessWithTokenW, GetCurrentProcess,
-    LOGON_WITH_PROFILE, OpenProcessToken, PROCESS_INFORMATION, ResumeThread, STARTUPINFOW, SetThreadToken,
-    TerminateProcess,
+    CREATE_NO_WINDOW, CREATE_PROCESS_LOGON_FLAGS, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT,
+    CreateProcessWithTokenW, GetCurrentProcess, LOGON_WITH_PROFILE, OpenProcessToken, PROCESS_INFORMATION,
+    ResumeThread, STARTUPINFOW, SetThreadToken, TerminateProcess,
 };
 use windows::Win32::UI::Shell::{CreateProfile, DeleteProfileW};
 use windows::core::{BOOL, PCWSTR, PWSTR};
 
 #[path = "common/bounded_wait.rs"]
 mod bounded_wait;
+#[path = "common/desktop.rs"]
+mod desktop;
 #[path = "common/env_probe.rs"]
 mod env_probe;
+#[path = "common/environment.rs"]
+mod environment;
 #[path = "common/hard_errors.rs"]
 mod hard_errors;
 
@@ -170,20 +174,21 @@ impl Account {
         self.profile.as_deref().expect("this account has no profile")
     }
 
-    /// [`Account::run_with`] without loading the account's profile.
+    /// [`Account::run_with`] without loading the account's profile and with the environment the
+    /// system makes for the account.
     fn run(&self, exe: &Path, command_line: &str, cwd: &Path, evidence: &[PathBuf]) -> u32 {
-        self.run_with(exe, command_line, cwd, evidence, CREATE_PROCESS_LOGON_FLAGS(0))
+        self.run_with(exe, command_line, cwd, evidence, CREATE_PROCESS_LOGON_FLAGS(0), None)
     }
 
     /// Run `exe` with `command_line` under this account's network-logon token, the way sshd runs
-    /// its shell, on this process's window station and desktop. `logon_flags` is
-    /// `CreateProcessWithTokenW`'s `dwLogonFlags`: without [`LOGON_WITH_PROFILE`] the account's
-    /// registry hive is not loaded, and the environment block, made from the account's profile
-    /// because none is passed, has `USERPROFILE=C:\Users\Default`. Returns the exit code. A loader
-    /// failure of the child ends it with its NTSTATUS as the exit code (see [`hard_errors`]) rather
-    /// than a message box. A child still running after [`bounded_wait::CHILD_EXIT_BOUND`] fails the
-    /// test with the process tree, this account's ssh-broker folder and `evidence` printed, and is
-    /// killed.
+    /// its shell, on a window station and desktop made for this one child (see [`desktop`]).
+    /// `logon_flags` is `CreateProcessWithTokenW`'s `dwLogonFlags`: without [`LOGON_WITH_PROFILE`]
+    /// the account's registry hive is not loaded. `environment` is a block from [`environment`]
+    /// to pass as is; without one the system makes the account's, with `USERPROFILE=C:\Users\Default`
+    /// unless the profile is loaded. Returns the exit code. A loader failure of the child ends it
+    /// with its NTSTATUS as the exit code (see [`hard_errors`]) rather than a message box. A child
+    /// still running after [`bounded_wait::CHILD_EXIT_BOUND`] fails the test with the process tree,
+    /// this account's ssh-broker folder and `evidence` printed, and is killed.
     fn run_with(
         &self,
         exe: &Path,
@@ -191,7 +196,14 @@ impl Account {
         cwd: &Path,
         evidence: &[PathBuf],
         logon_flags: CREATE_PROCESS_LOGON_FLAGS,
+        environment: Option<&[u16]>,
     ) -> u32 {
+        // The account's SID and the administrator's: the child runs as the first and is started by
+        // the second.
+        let starter = Sid::current_user().unwrap().to_sddl().unwrap();
+        let private = desktop::PrivateDesktop::create(&[&self.sid_text, &starter])
+            .unwrap_or_else(|e| panic!("create a window station and desktop for {}: {e}", self.name));
+
         let network = self.network_token();
         let mut primary = HANDLE::default();
         // SAFETY: valid in/out handles.
@@ -209,10 +221,16 @@ impl Account {
         let primary = OwnedHandle(primary);
 
         let mut command = wide(command_line);
+        let mut station_and_desktop = wide(private.name());
         let startup = STARTUPINFOW {
             cb: std::mem::size_of::<STARTUPINFOW>() as u32,
+            lpDesktop: PWSTR(station_and_desktop.as_mut_ptr()),
             ..Default::default()
         };
+        let mut flags = CREATE_SUSPENDED | CREATE_NO_WINDOW;
+        if environment.is_some() {
+            flags |= CREATE_UNICODE_ENVIRONMENT;
+        }
         let mut info = PROCESS_INFORMATION::default();
         // SAFETY: every pointer is to a local that outlives the call.
         unsafe {
@@ -221,8 +239,8 @@ impl Account {
                 logon_flags,
                 PCWSTR(wide(&exe.to_string_lossy()).as_ptr()),
                 Some(PWSTR(command.as_mut_ptr())),
-                CREATE_SUSPENDED | CREATE_NO_WINDOW,
-                None,
+                flags,
+                environment.map(|block| block.as_ptr().cast::<core::ffi::c_void>()),
                 PCWSTR(wide(&cwd.to_string_lossy()).as_ptr()),
                 &startup,
                 &mut info,
@@ -771,6 +789,55 @@ fn a_suspended_child_has_its_hard_error_boxes_suppressed() {
 }
 
 #[test]
+fn a_grant_names_each_sid_with_the_rights_given() {
+    assert_eq!(
+        desktop::grant_sddl(&["S-1-5-18", "S-1-1-0"], 0x2_037F),
+        "D:(A;;0x2037f;;;S-1-5-18)(A;;0x2037f;;;S-1-1-0)"
+    );
+}
+
+#[test]
+fn a_grant_is_a_descriptor_the_system_accepts() {
+    // Parsing creates nothing: no window station, no desktop.
+    desktop::Descriptor::parse(&desktop::grant_sddl(&["S-1-5-18", "BA"], desktop::DESKTOP_ACCESS))
+        .expect("the desktop grant parses");
+    desktop::Descriptor::parse(&desktop::grant_sddl(&["S-1-5-18", "BA"], desktop::STATION_ACCESS))
+        .expect("the window station grant parses");
+}
+
+#[test]
+fn an_environment_block_is_sorted_by_name_and_ends_in_two_nuls() {
+    let vars = [("b", "2"), ("=C:", "C:\\x"), ("A", "1")].map(|(k, v)| (k.into(), v.into()));
+    let block = environment::block(vars);
+    let text = String::from_utf16(&block).unwrap();
+    assert_eq!(text, "=C:=C:\\x\0A=1\0b=2\0\0");
+}
+
+#[test]
+fn an_empty_environment_block_is_two_nuls() {
+    assert_eq!(environment::block(std::iter::empty()), vec![0u16, 0u16]);
+}
+
+#[test]
+fn a_child_gets_a_private_desktop_and_this_process_keeps_its_window_station() {
+    assert_elevated();
+    let me = Sid::current_user().unwrap().to_sddl().unwrap();
+    let before = desktop::process_window_station();
+
+    let private = desktop::PrivateDesktop::create(&[&me]).expect("create a private window station and desktop");
+    let during = desktop::process_window_station();
+    let name = private.name().to_owned();
+    drop(private);
+
+    assert_eq!(
+        during, before,
+        "creating one leaves this process's window station alone"
+    );
+    assert_eq!(desktop::process_window_station(), before, "and so does closing it");
+    assert!(name.ends_with("\\Default"), "{name}");
+}
+
+#[test]
 fn a_loader_status_in_an_exit_code_is_named() {
     assert_eq!(hard_errors::describe_exit(0), "0");
     assert_eq!(hard_errors::describe_exit(1), "1");
@@ -802,6 +869,48 @@ fn a_loader_failure_as_bob_ends_the_process_with_its_status_and_no_message_box()
         hard_errors::describe_exit(code),
         hard_errors::describe_exit(0xC000_0135),
         "the loader ended the process with STATUS_DLL_NOT_FOUND"
+    );
+}
+
+/// Child half of [`a_child_as_bob_loads_the_window_libraries`]: runs only when started from the
+/// shared directory with a `libs.txt` beside the binary, as bob. Fails if a window library will
+/// not load.
+#[test]
+fn child_loads_the_window_libraries() {
+    let Some(exe_dir) = std::env::current_exe().unwrap().parent().map(Path::to_path_buf) else {
+        return;
+    };
+    if !exe_dir.join("libs.txt").exists() {
+        return; // not started as the child
+    }
+    let failed: Vec<String> = env_probe::DLLS
+        .iter()
+        .filter_map(|dll| env_probe::load(dll).err().map(|e| format!("{dll}: {e}")))
+        .collect();
+    assert!(failed.is_empty(), "did not load: {failed:?}");
+}
+
+/// What the shim and `ssh` need from an account's processes: user32 and the libraries on top of
+/// it (ole32) initialise. They do not where the process has no usable window station and desktop.
+#[test]
+fn a_child_as_bob_loads_the_window_libraries() {
+    let bob = Account::create("bob", false);
+    let shared = SharedDir::new("libs");
+    let exe = shared.0.join("isolation.exe");
+    std::fs::copy(std::env::current_exe().unwrap(), &exe).unwrap();
+    std::fs::write(shared.0.join("libs.txt"), "").unwrap();
+    let command = format!(
+        "\"{}\" --exact child_loads_the_window_libraries --nocapture",
+        exe.display()
+    );
+
+    let code = bob.run(&exe, &command, &shared.0, &[]);
+
+    assert_eq!(
+        code,
+        0,
+        "the child, running as bob, failed ({}): see its output above",
+        hard_errors::describe_exit(code)
     );
 }
 
@@ -852,7 +961,7 @@ fn probe_as(bob: &Account, shared: &SharedDir, exe: &Path, logon_flags: CREATE_P
         std::fs::write(&probe, format!("sid={}\ndll={dll}\n", bob.sid_text)).unwrap();
         let _ = std::fs::remove_file(&report);
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            bob.run_with(exe, &command, &shared.0, &[], logon_flags)
+            bob.run_with(exe, &command, &shared.0, &[], logon_flags, None)
         }));
         let ended = match outcome {
             Ok(code) => format!("the child exited with {}", hard_errors::describe_exit(code)),
@@ -943,7 +1052,17 @@ fn shim_as_bob_never_reaches_another_users_listener() {
     let evidence = ["out.txt", "err.txt"].map(|name| shared.0.join(name));
     // With his profile loaded: `CreateProcessWithTokenW` loads it only when asked (Microsoft docs,
     // Remarks).
-    let code = bob.run_with(&cmd, &command, &shared.0, &evidence, LOGON_WITH_PROFILE);
+    // The administrator's own environment goes in as is (`USERPROFILE`, `LOCALAPPDATA` and all),
+    // so the shim has to take bob's socket from his token and not from what it inherits.
+    let admin_environment = environment::current_block();
+    let code = bob.run_with(
+        &cmd,
+        &command,
+        &shared.0,
+        &evidence,
+        LOGON_WITH_PROFILE,
+        Some(&admin_environment),
+    );
     assert!(
         code == 0,
         "the fail-open command ran; the shim run ended with {}

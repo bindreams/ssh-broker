@@ -30,7 +30,7 @@ fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
-fn load(dll: &str) -> windows::core::Result<HMODULE> {
+pub fn load(dll: &str) -> windows::core::Result<HMODULE> {
     // SAFETY: NUL-terminated name.
     unsafe { LoadLibraryW(PCWSTR(wide(dll).as_ptr())) }
 }
