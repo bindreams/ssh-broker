@@ -115,3 +115,174 @@ fn current_socket_location_ignores_decoy_environment() {
         .unwrap_or_else(|| panic!("the child printed no location: {stdout}"));
     assert_eq!(PathBuf::from(line), expected);
 }
+
+// ensure_socket_dir ---------------------------------------------------------------------
+
+use crate::acl::{self, Sid};
+use crate::socket_loc::{SOCKET_DIR_NAME, SOCKET_FILE_NAME};
+use crate::test_support::{FILE_ALL, aces, dacl_sddl};
+use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+/// A stand-in profile under the temp dir, removed on drop. `AppData\Local` exists inside it, as
+/// it does in a real profile.
+struct TempProfile(PathBuf);
+
+impl TempProfile {
+    fn new(tag: &str) -> TempProfile {
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!("sb-ud-{tag}-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(root.join("AppData").join("Local")).unwrap();
+        TempProfile(root)
+    }
+
+    fn location(&self) -> SocketLocation {
+        let dir = self.0.join("AppData").join("Local").join(SOCKET_DIR_NAME);
+        SocketLocation {
+            path: dir.join(SOCKET_FILE_NAME),
+            dir,
+        }
+    }
+}
+
+impl Drop for TempProfile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn me() -> Sid {
+    Sid::current_user().unwrap()
+}
+
+#[test]
+fn ensure_socket_dir_creates_a_dir_that_verifies() {
+    let profile = TempProfile::new("create");
+    let loc = profile.location();
+    ensure_socket_dir(&loc, &me()).unwrap();
+    assert!(acl::verify_dir_acl(&loc.dir, &me()).unwrap());
+}
+
+#[test]
+fn ensure_socket_dir_is_idempotent() {
+    let profile = TempProfile::new("idem");
+    let loc = profile.location();
+    ensure_socket_dir(&loc, &me()).unwrap();
+    std::fs::write(loc.lock_path(), "").unwrap();
+    ensure_socket_dir(&loc, &me()).unwrap();
+    assert!(acl::verify_dir_acl(&loc.dir, &me()).unwrap());
+    assert!(loc.lock_path().is_file(), "what was inside is left alone");
+}
+
+#[test]
+fn ensure_socket_dir_repairs_a_dir_widened_with_an_everyone_ace() {
+    let profile = TempProfile::new("repair");
+    let loc = profile.location();
+    ensure_socket_dir(&loc, &me()).unwrap();
+    let status = std::process::Command::new("icacls")
+        .arg(&loc.dir)
+        .args(["/grant", "*S-1-1-0:(OI)(CI)F"])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    assert!(!acl::verify_dir_acl(&loc.dir, &me()).unwrap(), "control: widened");
+
+    ensure_socket_dir(&loc, &me()).unwrap();
+    assert!(acl::verify_dir_acl(&loc.dir, &me()).unwrap());
+}
+
+#[test]
+fn ensure_socket_dir_does_not_create_a_missing_profile() {
+    let profile = TempProfile::new("missing");
+    std::fs::remove_dir_all(profile.0.join("AppData")).unwrap();
+    let loc = profile.location();
+    assert!(ensure_socket_dir(&loc, &me()).is_err());
+    assert!(!profile.0.join("AppData").exists(), "nothing was invented");
+}
+
+#[test]
+fn ensure_socket_dir_refuses_a_junction_at_the_dir() {
+    let profile = TempProfile::new("junction");
+    let loc = profile.location();
+    let target = profile.0.join("elsewhere");
+    std::fs::create_dir(&target).unwrap();
+    let before = dacl_sddl(&target);
+    let out = std::process::Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(&loc.dir)
+        .arg(&target)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "mklink /J: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    let err = format!("{:#}", ensure_socket_dir(&loc, &me()).unwrap_err());
+    assert!(err.contains("reparse point"), "{err}");
+    assert_eq!(dacl_sddl(&target), before, "the junction target was not touched");
+
+    std::fs::remove_dir(&loc.dir).unwrap();
+}
+
+#[test]
+fn ensure_socket_dir_refuses_a_file_at_the_dir() {
+    let profile = TempProfile::new("file");
+    let loc = profile.location();
+    std::fs::write(&loc.dir, "x").unwrap();
+    let err = format!("{:#}", ensure_socket_dir(&loc, &me()).unwrap_err());
+    assert!(err.contains("not a directory"), "{err}");
+    assert_eq!(std::fs::read_to_string(&loc.dir).unwrap(), "x");
+}
+
+/// The three ACEs a private directory carries, by SDDL alias, as `(type, mask, trustee)`.
+fn trustees(path: &Path) -> Vec<(String, u32, String)> {
+    let sddl = dacl_sddl(path);
+    let mut out: Vec<_> = aces(&sddl)
+        .into_iter()
+        .map(|(kind, _, mask, who)| (kind.to_owned(), mask, who.to_owned()))
+        .collect();
+    out.sort();
+    out
+}
+
+#[test]
+fn ensure_socket_dir_acl_is_exactly_user_system_administrators() {
+    let profile = TempProfile::new("exact");
+    let loc = profile.location();
+    ensure_socket_dir(&loc, &me()).unwrap();
+    let sddl = dacl_sddl(&loc.dir);
+    assert!(sddl.starts_with("D:P"), "protected: {sddl}");
+    let list = trustees(&loc.dir);
+    assert_eq!(list.len(), 3, "{sddl}");
+    assert!(
+        list.iter().all(|(kind, mask, _)| kind == "A" && *mask == FILE_ALL),
+        "{sddl}"
+    );
+    for alias in ["SY", "BA"] {
+        assert!(list.iter().any(|(_, _, who)| who == alias), "{alias} in {sddl}");
+    }
+    assert!(!sddl.contains("ID;"), "nothing is inherited: {sddl}");
+}
+
+#[test]
+fn ensure_socket_dir_creates_a_logs_dir_with_the_same_exact_acl() {
+    let profile = TempProfile::new("logs");
+    let loc = profile.location();
+    ensure_socket_dir(&loc, &me()).unwrap();
+    assert!(loc.logs_dir().is_dir());
+    assert!(acl::verify_file_acl(&loc.logs_dir(), &me()).unwrap());
+    assert_eq!(trustees(&loc.logs_dir()), trustees(&loc.dir));
+}
+
+#[test]
+fn ensure_socket_dir_gives_what_it_makes_inside_exactly_the_three_aces() {
+    let profile = TempProfile::new("born");
+    let loc = profile.location();
+    ensure_socket_dir(&loc, &me()).unwrap();
+    std::fs::write(loc.lock_path(), "").unwrap();
+    assert!(acl::verify_file_acl(&loc.lock_path(), &me()).unwrap());
+    assert_eq!(trustees(&loc.lock_path()), trustees(&loc.dir));
+}

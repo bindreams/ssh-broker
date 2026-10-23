@@ -17,6 +17,7 @@ use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 use windows::Win32::UI::Shell::GetUserProfileDirectoryW;
 use windows::core::PWSTR;
 
+use crate::acl::{self, Sid};
 use crate::socket_loc::{self, SocketLocation};
 use crate::winutil::OwnedHandle;
 
@@ -53,6 +54,38 @@ pub fn current_socket_location() -> anyhow::Result<SocketLocation> {
     unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) }.context("open the process token")?;
     let token = OwnedHandle(token);
     socket_location_of_token(token.0)
+}
+
+/// Create `loc.dir` and its `logs` folder if they are missing, and leave both exactly
+/// `{user, SYSTEM, Administrators}`, with ACEs the files made inside inherit.
+///
+/// Only the leaves are created: the parent (`AppData\Local`) must already exist, because a
+/// missing parent means there is no profile and inventing one would put a socket where no
+/// logon ever looks. An existing leaf is repaired only if it is a real directory (not a junction
+/// or symlink: hardening follows the path and would re-own whatever it points to) whose owner is
+/// the user, SYSTEM or Administrators; anything else is refused and left untouched. A directory
+/// this accepts is not thereby trusted: `Listener::bind` verifies it again before it binds.
+pub fn ensure_socket_dir(loc: &SocketLocation, user: &Sid) -> anyhow::Result<()> {
+    ensure_private_dir(&loc.dir, user)?;
+    ensure_private_dir(&loc.logs_dir(), user)
+}
+
+fn ensure_private_dir(dir: &std::path::Path, user: &Sid) -> anyhow::Result<()> {
+    match std::fs::create_dir(dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e).with_context(|| format!("create {}", dir.display())),
+    }
+    if let Some(problem) = acl::private_dir_problem(dir, user)? {
+        anyhow::bail!("{} cannot be used as the private folder: {problem}", dir.display());
+    }
+    acl::harden_dir(dir, user).with_context(|| format!("harden {}", dir.display()))?;
+    anyhow::ensure!(
+        acl::verify_dir_acl(dir, user).with_context(|| format!("verify the ACL of {}", dir.display()))?,
+        "the ACL of {} did not verify after hardening it",
+        dir.display()
+    );
+    Ok(())
 }
 
 #[cfg(test)]
