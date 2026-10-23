@@ -77,7 +77,7 @@ pub fn run_on(exec: Option<RawExec>, detect: impl FnOnce() -> Encoding) -> anyho
     // out to be untrue — `exec_relay_is_byte_clean_*` covers the framing in both directions, and
     // `verify`'s probe covers a real child, real pipes and a real socket in both directions too.
     // What remains is a throughput difference, which does not earn a classifier.
-    match try_relay(&exec, crate::userdir::current_socket_location) {
+    match try_relay(&exec, crate::userdir::current_socket_location, std::io::stdin()) {
         Ok(Some(code)) => {
             drop(log); // flush the appender before process::exit
             // Bypass main()'s Result→0/1 collapse; the i32→u32 cast is bit-preserving.
@@ -147,12 +147,14 @@ fn fail_open_command(decision: &FailOpen) -> &str {
 ///
 /// `locate` says where the socket is. `run_on` passes [`crate::userdir::current_socket_location`],
 /// the profile of the account this process runs as and no other; it is a parameter so a test can
-/// pin that this function connects only to what it is given.
+/// pin that this function connects only to what it is given. `stdin` is what an EXEC session
+/// forwards to the child (the process's own stdin in `run_on`).
 fn try_relay(
     exec: &Option<String>,
     locate: impl FnOnce() -> anyhow::Result<SocketLocation>,
+    stdin: impl std::io::Read + Send + 'static,
 ) -> anyhow::Result<Option<i32>> {
-    try_relay_at(locate(), exec, &mut std::io::stderr())
+    try_relay_at(locate(), exec, &mut std::io::stderr(), stdin)
 }
 
 /// The phrase `tests/fail_open_windows.rs` greps for; every fail-open message begins with it.
@@ -170,6 +172,7 @@ fn try_relay_at(
     location: anyhow::Result<SocketLocation>,
     exec: &Option<String>,
     stderr: &mut dyn std::io::Write,
+    stdin: impl std::io::Read + Send + 'static,
 ) -> anyhow::Result<Option<i32>> {
     let location = match location {
         Ok(location) => location,
@@ -206,7 +209,7 @@ fn try_relay_at(
                 &hs,
                 std::io::stdout(),
                 std::io::stderr(),
-                std::io::stdin(),
+                stdin,
             )?))
         }
         None => {

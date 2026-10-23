@@ -231,7 +231,7 @@ fn too_long() -> anyhow::Error {
 #[test]
 fn unresolvable_socket_location_fails_open_with_the_reason() {
     let mut stderr = Vec::new();
-    let relayed = super::try_relay_at(Err(too_long()), &Some("echo hi".into()), &mut stderr).unwrap();
+    let relayed = super::try_relay_at(Err(too_long()), &Some("echo hi".into()), &mut stderr, std::io::empty()).unwrap();
 
     assert_eq!(
         relayed, None,
@@ -248,7 +248,7 @@ fn location_error_reaches_stderr_in_pty_mode() {
     // fallback shell corrupts nothing. The log is no substitute: for an interactive session it is
     // the only other place the reason goes, and the user does not read it.
     let mut stderr = Vec::new();
-    let relayed = super::try_relay_at(Err(too_long()), &None, &mut stderr).unwrap();
+    let relayed = super::try_relay_at(Err(too_long()), &None, &mut stderr, std::io::empty()).unwrap();
 
     assert_eq!(relayed, None);
     let text = String::from_utf8(stderr).unwrap();
@@ -273,7 +273,7 @@ fn connect_failure_in_the_callers_own_dir_fails_open_without_a_reason_on_stderr(
         dir: dir.clone(),
     };
     let mut stderr = Vec::new();
-    let relayed = super::try_relay_at(Ok(location), &Some("echo hi".into()), &mut stderr).unwrap();
+    let relayed = super::try_relay_at(Ok(location), &Some("echo hi".into()), &mut stderr, std::io::empty()).unwrap();
 
     assert_eq!(relayed, None);
     assert_eq!(
@@ -294,7 +294,7 @@ fn connect_failure_in_pty_mode_writes_nothing_to_stderr() {
         dir: dir.clone(),
     };
     let mut stderr = Vec::new();
-    let relayed = super::try_relay_at(Ok(location), &None, &mut stderr).unwrap();
+    let relayed = super::try_relay_at(Ok(location), &None, &mut stderr, std::io::empty()).unwrap();
 
     assert_eq!(relayed, None);
     assert!(stderr.is_empty());
@@ -304,7 +304,7 @@ fn connect_failure_in_pty_mode_writes_nothing_to_stderr() {
 #[test]
 fn try_relay_connects_to_the_location_its_provider_names() {
     use crate::afunix::{self, Listener};
-    use crate::protocol::{ExitCode, FrameKind, FrameReader, Handshake, read_one_frame, write_frame};
+    use crate::protocol::{ExitCode, FrameKind, FrameReader, Handshake, Stream, read_one_frame, write_frame};
     // `run_on` hands `try_relay` the token's profile location. What `try_relay` must do with it
     // is use it and nothing else: a path it worked out from the environment would miss this
     // listener, which sits in a profile no environment variable names.
@@ -314,13 +314,21 @@ fn try_relay_connects_to_the_location_its_provider_names() {
     let listener = Listener::bind(&location.path).unwrap();
     let agent = std::thread::spawn(move || {
         let (mut rx, mut tx) = afunix::split(listener.accept().unwrap()).unwrap();
-        let frame = read_one_frame(&mut rx, &mut FrameReader::new()).unwrap();
+        let mut frames = FrameReader::new();
+        let frame = read_one_frame(&mut rx, &mut frames).unwrap();
         assert_eq!(frame.kind, FrameKind::Handshake);
+        // Read the stdin-EOF marker before answering, so nothing the shim sent is unread when
+        // this side closes: an unread byte at close can make the peer lose the Exit.
+        let eof = read_one_frame(&mut rx, &mut frames).unwrap();
+        assert_eq!(
+            (eof.kind, eof.payload.as_slice()),
+            (FrameKind::Data, &[Stream::Stdin as u8][..])
+        );
         write_frame(&mut tx, FrameKind::Exit, &ExitCode(7).encode()).unwrap();
         Handshake::decode(&frame.payload).unwrap()
     });
 
-    let relayed = super::try_relay(&Some("echo hi".into()), || Ok(location)).unwrap();
+    let relayed = super::try_relay(&Some("echo hi".into()), || Ok(location), std::io::empty()).unwrap();
 
     assert_eq!(
         relayed,
