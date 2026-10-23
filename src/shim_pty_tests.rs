@@ -300,3 +300,28 @@ fn connect_failure_in_pty_mode_writes_nothing_to_stderr() {
     assert!(stderr.is_empty());
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn try_relay_connects_to_the_location_its_provider_names() {
+    use crate::afunix::{self, Listener};
+    use crate::protocol::{ExitCode, FrameKind, FrameReader, Handshake, read_one_frame, write_frame};
+    // `run_on` hands `try_relay` the token's profile location. What `try_relay` must do with it
+    // is use it and nothing else: a path it worked out from the environment would miss this
+    // listener, which sits in a profile no environment variable names.
+    let profile = crate::test_support::TempProfile::new("shim-wiring");
+    let location = profile.location();
+    crate::userdir::ensure_socket_dir(&location, &crate::acl::Sid::current_user().unwrap()).unwrap();
+    let listener = Listener::bind(&location.path).unwrap();
+    let agent = std::thread::spawn(move || {
+        let (mut rx, mut tx) = afunix::split(listener.accept().unwrap()).unwrap();
+        let frame = read_one_frame(&mut rx, &mut FrameReader::new()).unwrap();
+        assert_eq!(frame.kind, FrameKind::Handshake);
+        write_frame(&mut tx, FrameKind::Exit, &ExitCode(7).encode()).unwrap();
+        Handshake::decode(&frame.payload).unwrap()
+    });
+
+    let relayed = super::try_relay(&Some("echo hi".into()), || Ok(location)).unwrap();
+
+    assert_eq!(relayed, Some(7), "the shim reached the listener at the provided location");
+    assert_eq!(agent.join().unwrap().command.as_deref(), Some("echo hi"));
+}

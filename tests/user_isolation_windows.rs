@@ -543,9 +543,10 @@ fn bob_cannot_connect_to_a_socket_in_another_users_dir() {
 
 #[test]
 fn shim_as_bob_never_reaches_another_users_listener() {
-    // The administrator's agent is listening. An administrator who SSHes in as bob gets bob's
-    // shim, which looks in bob's profile, finds nothing, and fails open. Run with the caller's
-    // environment, whose USERPROFILE and LOCALAPPDATA are the administrator's.
+    // The administrator's agent is listening, and bob may open its socket. An administrator who
+    // SSHes in as bob gets bob's shim, which looks in bob's profile, finds nothing, and fails
+    // open. Run with the caller's environment, whose USERPROFILE and LOCALAPPDATA are the
+    // administrator's.
     let bob = Account::create("bob", true);
     let admin = Sid::current_user().unwrap();
     let admin_loc = userdir::current_socket_location().unwrap();
@@ -554,6 +555,15 @@ fn shim_as_bob_never_reaches_another_users_listener() {
         .unwrap()
         .expect("no agent runs on the CI host");
     let listener = Listener::bind(&admin_loc.path).unwrap();
+    // The file DACL would turn bob away on its own, which would hide a shim that looked in the
+    // wrong profile. Grant bob the socket, so that only the path decides: a shim that followed
+    // the administrator's environment would connect here and fail the sentinel check below.
+    let status = Command::new("icacls")
+        .arg(&admin_loc.path)
+        .args(["/grant", &format!("*{}:(F)", bob.sid_text)])
+        .status()
+        .unwrap();
+    assert!(status.success(), "icacls /grant");
 
     // Records the first thing that connects and the first byte it sends.
     let (first_byte, seen) = mpsc::channel();
