@@ -164,16 +164,18 @@ fn remove_if_present(result: std::io::Result<()>) -> std::io::Result<()> {
 /// migration of a single-user install, then the exe. Returns the canonical exe path.
 ///
 /// `agent_task_xml` is the queried XML of the registered agent task (`None` if there is none),
-/// and `stop_legacy_agent` stops the agent of a single-user install. It is called only when a
-/// legacy artifact is found, so re-running `apply` and the boot self-heal leave live agents alone.
+/// and `stop_agents` stops every running agent. It is called only when it has to be: a legacy
+/// artifact is found, or an installed exe is about to be replaced by a different build. So
+/// re-running `apply` and the boot self-heal with the installed build leave live agents alone.
+/// The caller starts agents again once the tasks are registered.
 pub fn prepare(
     layout: &Layout,
     current_exe: &Path,
     agent_task_xml: Option<&str>,
-    stop_legacy_agent: impl FnOnce() -> anyhow::Result<()>,
+    stop_agents: impl FnOnce() -> anyhow::Result<()>,
 ) -> anyhow::Result<PathBuf> {
     let base = ensure_base(layout)?;
-    prepare_in(&base, current_exe, agent_task_xml, stop_legacy_agent)
+    prepare_in(&base, current_exe, agent_task_xml, stop_agents)
 }
 
 /// [`prepare`] on a base that already passed [`ensure_base`].
@@ -181,17 +183,28 @@ pub fn prepare_in(
     base: &TrustedBase<'_>,
     current_exe: &Path,
     agent_task_xml: Option<&str>,
-    stop_legacy_agent: impl FnOnce() -> anyhow::Result<()>,
+    stop_agents: impl FnOnce() -> anyhow::Result<()>,
 ) -> anyhow::Result<PathBuf> {
     let legacy = legacy_artifacts(base, agent_task_xml);
+    let replaces_exe = would_replace_installed_exe(base.layout, current_exe);
     if legacy.any() {
         println!("apply: replacing a single-user install ({})", legacy.describe());
+    }
+    if legacy.any() || replaces_exe {
         // Before the exe is copied: a running agent holds it open, and the copy would fail with a
         // sharing violation and leave the old exe under the new tasks.
-        stop_legacy_agent().context("stop the agent of the single-user install")?;
+        stop_agents().context("stop the running agents")?;
+    }
+    if legacy.any() {
         remove_legacy(base, &legacy)?;
     }
     install_self(base.layout, current_exe)
+}
+
+/// Whether installing `current` would overwrite an installed exe with a different build.
+fn would_replace_installed_exe(layout: &Layout, current: &Path) -> bool {
+    let canonical = layout.canonical_exe();
+    current != canonical && canonical.is_file() && !files_identical(current, &canonical)
 }
 
 /// Copy `current` to the canonical path unless it is already there or identical.

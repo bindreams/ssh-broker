@@ -40,6 +40,8 @@ If a user is logged on in two sessions, the second session's agent waits and tak
 
 `ssh-broker verify` reports on the account that runs it and no other; each user runs it for themselves. If its `socket reachable` row fails, run `ssh-broker agent` in your desktop session: the logon task discards the agent's stderr, and an error before the agent's log opens (`%LOCALAPPDATA%\ssh-broker\logs\agent.log`) is printed there and nowhere else.
 
+A profile path so long that the socket path would pass the 107-byte AF_UNIX limit (only possible with a relocated profile root) is refused with the reason: the socket stays inside the profile, because that is what keeps it private, and the shim fails open.
+
 ## Requirements
 
 **PowerShell Core (`pwsh`) must be installed.** Stock Windows ships `powershell.exe` 5.1, which is a different binary. `pwsh` is what the agent hosts for every interactive session — a configurable shell is not implemented — and what the shim falls back to when the agent is unreachable and there is no command to run. `ssh host "cmd"` does not involve a shell on either path: the relay and the fail-open both spawn the command directly, so pipes, redirection and `&&` are the client's business, not the server's. The Windows test suite also assumes `pwsh`.
@@ -65,11 +67,13 @@ sha256sum -c ssh-broker-<version>-x86_64-pc-windows-msvc.zip.sha256
 
 Then extract it and, from an elevated prompt, run `ssh-broker.exe apply`. It installs the broker for every user: each user who logs on gets their own agent. `ssh-broker.exe verify` checks the result for the user who runs it. The executable is statically linked, so it needs no Visual C++ redistributable.
 
-## Upgrading from a single-user install
+## Upgrading
+
+Run `apply` again from an elevated prompt with the newer build. A running agent holds the installed exe open, so when `apply` replaces the exe with a different build it first stops every agent, then starts one in each logged-on session. Their open SSH sessions end; users reconnect. An `apply` of the build that is already installed leaves agents alone.
+
+### From a single-user install
 
 Earlier builds ran one agent for one configured account (`apply --user`, `config.toml`, a shared `C:\ProgramData\ssh-broker\s` socket directory). Run `apply` again from an elevated prompt: it stops that agent, deletes `config.toml` and the old socket directory, and replaces both tasks. The old agent's sessions end. The old `C:\ProgramData\ssh-broker\logs` stays on disk and may be deleted. `--user` is gone, because there is no target account any more; a leftover boot-time task that still passes it is accepted with a warning, so it can finish the repair.
-
-A profile path so long that the socket path would pass the 107-byte AF_UNIX limit (only possible with a relocated profile root) is refused with the reason: the socket stays inside the profile, because that is what keeps it private, and the shim fails open.
 
 ## Status
 

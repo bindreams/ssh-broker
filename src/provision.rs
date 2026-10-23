@@ -115,7 +115,9 @@ mod imp {
         // 1. Install this exe to a STABLE path (see layout::prepare). Everything registers the
         //    canonical path: a temp path would brick SSH the instant it is deleted; the shim's
         //    fail-open can't help if sshd execs a missing binary. The install directory is gated
-        //    first, so a planted one is never adopted, and a single-user install is replaced.
+        //    first, so a planted one is never adopted, and a single-user install is replaced. A
+        //    different build over an installed one stops every agent first (they hold the exe
+        //    open); step 4 starts them again.
         let current = std::env::current_exe().context("current_exe")?;
         let (agent_xml, agent_ok) = query_schtasks(&schtasks::query_task_argv(schtasks::AGENT_TASK));
         let registered_xml = schtasks::parse_query_registered(&agent_xml, agent_ok).then_some(agent_xml);
@@ -140,9 +142,10 @@ mod imp {
         );
 
         // 4. Start an agent in each session that already has a user, so nobody has to log off and
-        //    on again (the logon trigger covers every later logon). An agent that is already
-        //    running in its session exits at once, so this is safe to repeat. Best-effort: the
-        //    install is complete without it.
+        //    on again (the logon trigger covers every later logon), and to bring back the agents
+        //    step 1 stopped for a new build. An agent that is already running in its session
+        //    exits at once, so this is safe to repeat. Best-effort: the install is complete
+        //    without it.
         match sessions::interactive_sessions() {
             Ok(ids) => {
                 let mut started = 0usize;

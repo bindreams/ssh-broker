@@ -270,6 +270,63 @@ fn prepare_in_stops_the_agent_for_a_legacy_task_with_no_files() {
 }
 
 #[test]
+fn prepare_in_stops_the_agents_before_it_replaces_a_changed_exe() {
+    // Not a migration: a newer build over an installed one. Every running agent holds the old exe
+    // open, so without the stop the copy fails and the old exe stays under the new tasks.
+    let base = TempBase::existing("prepare-update");
+    std::fs::write(base.0.join("ssh-broker.exe"), "old build").unwrap();
+    let source = new_exe(&base, "new build");
+    let layout = base.layout();
+    let group = agent_task_xml(r"C:\x.exe");
+    let seen = std::cell::RefCell::new(None);
+
+    let exe = prepare_in(&forged(&layout), &source, Some(&group), || {
+        *seen.borrow_mut() = Some(std::fs::read_to_string(layout.canonical_exe()).unwrap());
+        Ok(())
+    })
+    .unwrap();
+
+    assert_eq!(
+        seen.borrow().as_deref(),
+        Some("old build"),
+        "agents were stopped while the old exe was still in place"
+    );
+    assert_eq!(std::fs::read_to_string(exe).unwrap(), "new build");
+}
+
+#[test]
+fn prepare_in_does_not_stop_agents_when_the_exe_is_unchanged() {
+    // Re-running `apply`, and the boot self-heal, with the build that is installed.
+    let base = TempBase::existing("prepare-same");
+    std::fs::write(base.0.join("ssh-broker.exe"), "same build").unwrap();
+    let source = new_exe(&base, "same build");
+    let layout = base.layout();
+    let group = agent_task_xml(r"C:\x.exe");
+
+    prepare_in(&forged(&layout), &source, Some(&group), || {
+        panic!("the exe is not replaced, so no agent needs to leave")
+    })
+    .unwrap();
+}
+
+#[test]
+fn prepare_in_changes_nothing_when_agents_cannot_be_stopped_for_an_update() {
+    let base = TempBase::existing("prepare-update-stuck");
+    std::fs::write(base.0.join("ssh-broker.exe"), "old build").unwrap();
+    let source = new_exe(&base, "new build");
+    let layout = base.layout();
+    let group = agent_task_xml(r"C:\x.exe");
+
+    let err = format!(
+        "{:#}",
+        prepare_in(&forged(&layout), &source, Some(&group), || anyhow::bail!("access denied")).unwrap_err()
+    );
+
+    assert!(err.contains("access denied"), "{err}");
+    assert_eq!(std::fs::read_to_string(layout.canonical_exe()).unwrap(), "old build");
+}
+
+#[test]
 fn prepare_in_does_not_stop_agents_when_nothing_is_legacy() {
     // Re-running `apply`, and the boot self-heal, must leave live agents alone.
     let base = TempBase::existing("prepare-clean");
