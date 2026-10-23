@@ -29,6 +29,7 @@ pub mod route;
 pub mod shim;
 #[cfg(windows)]
 pub mod shim_pty;
+pub mod socket_loc;
 pub mod vtinput;
 #[cfg(windows)]
 pub mod winutil;
