@@ -152,6 +152,18 @@ fn socket_reachable_row_follows_the_connection() {
 }
 
 #[test]
+fn socket_reachable_row_tells_the_user_how_to_see_why_the_agent_is_not_there() {
+    // An agent the logon task starts has its stderr discarded, and a start-up error before its log
+    // opens goes nowhere else. Run by hand in a desktop session, it prints the error.
+    let profile = TempProfile::new("row-reach-hint");
+    let row = socket_reachable_row(&Ok(profile.location()));
+
+    assert!(!row.pass);
+    assert!(row.detail.contains("ssh-broker agent"), "{}", row.detail);
+    assert!(row.detail.contains("desktop session"), "{}", row.detail);
+}
+
+#[test]
 fn socket_reachable_row_fails_without_a_location() {
     assert!(!socket_reachable_row(&too_long_location()).pass);
 }

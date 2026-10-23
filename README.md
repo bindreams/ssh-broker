@@ -38,6 +38,8 @@ The two halves talk over an AF_UNIX socket, `%LOCALAPPDATA%\ssh-broker\agent.soc
 
 If a user is logged on in two sessions, the second session's agent waits and takes over when the first one's session ends, so the user keeps an agent for as long as they are logged on anywhere. A second agent in the same session exits at once.
 
+`ssh-broker verify` reports on the account that runs it and no other; each user runs it for themselves. If its `socket reachable` row fails, run `ssh-broker agent` in your desktop session: the logon task discards the agent's stderr, and an error before the agent's log opens (`%LOCALAPPDATA%\ssh-broker\logs\agent.log`) is printed there and nowhere else.
+
 ## Requirements
 
 **PowerShell Core (`pwsh`) must be installed.** Stock Windows ships `powershell.exe` 5.1, which is a different binary. `pwsh` is what the agent hosts for every interactive session — a configurable shell is not implemented — and what the shim falls back to when the agent is unreachable and there is no command to run. `ssh host "cmd"` does not involve a shell on either path: the relay and the fail-open both spawn the command directly, so pipes, redirection and `&&` are the client's business, not the server's. The Windows test suite also assumes `pwsh`.
@@ -65,7 +67,7 @@ Then extract it and, from an elevated prompt, run `ssh-broker.exe apply`. It ins
 
 ## Upgrading from a single-user install
 
-Earlier builds ran one agent for one configured account (`apply --user`, `config.toml`, a shared `C:\ProgramData\ssh-broker\s` socket directory). Run `apply` again from an elevated prompt: it stops that agent, deletes `config.toml` and the old socket directory, and replaces both tasks. The old agent's sessions end. `--user` is gone, because there is no target account any more; a leftover boot-time task that still passes it is accepted with a warning, so it can finish the repair.
+Earlier builds ran one agent for one configured account (`apply --user`, `config.toml`, a shared `C:\ProgramData\ssh-broker\s` socket directory). Run `apply` again from an elevated prompt: it stops that agent, deletes `config.toml` and the old socket directory, and replaces both tasks. The old agent's sessions end. The old `C:\ProgramData\ssh-broker\logs` stays on disk and may be deleted. `--user` is gone, because there is no target account any more; a leftover boot-time task that still passes it is accepted with a warning, so it can finish the repair.
 
 A profile path so long that the socket path would pass the 107-byte AF_UNIX limit (only possible with a relocated profile root) is refused with the reason: the socket stays inside the profile, because that is what keeps it private, and the shim fails open.
 

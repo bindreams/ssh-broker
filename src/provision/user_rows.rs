@@ -72,13 +72,17 @@ pub fn socket_file_row(location: &anyhow::Result<SocketLocation>, user: &Sid) ->
     }
 }
 
+/// What to do when the agent is not there. The logon task discards the agent's stderr, and an error
+/// before its log opens goes nowhere else; run by hand it prints that error.
+const AGENT_HINT: &str = " (to see why, run `ssh-broker agent` in your desktop session)";
+
 /// `socket reachable`: this account's agent answers on its socket.
 pub fn socket_reachable_row(location: &anyhow::Result<SocketLocation>) -> Check {
     const NAME: &str = "socket reachable";
     match location {
         Ok(loc) => match afunix::connect(&loc.path) {
             Ok(_) => Check::new(NAME, true, String::new()),
-            Err(e) => Check::new(NAME, false, format!("{e:#}")),
+            Err(e) => Check::new(NAME, false, format!("{e:#}{AGENT_HINT}")),
         },
         Err(_) => Check::new(NAME, false, "no socket location"),
     }
