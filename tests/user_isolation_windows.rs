@@ -38,18 +38,19 @@ use windows::Win32::Security::{
     TOKEN_DUPLICATE, TOKEN_ELEVATION, TOKEN_QUERY, TokenDefaultDacl, TokenElevation, TokenImpersonation, TokenPrimary,
 };
 use windows::Win32::System::Threading::{
-    CREATE_NO_WINDOW, CREATE_SUSPENDED, CreateProcessWithTokenW, GetCurrentProcess, OpenProcessToken,
-    PROCESS_INFORMATION, ResumeThread, STARTUPINFOW, SetThreadToken, TerminateProcess,
+    CREATE_NO_WINDOW, CREATE_PROCESS_LOGON_FLAGS, CREATE_SUSPENDED, CreateProcessWithTokenW, GetCurrentProcess,
+    LOGON_WITH_PROFILE, OpenProcessToken, PROCESS_INFORMATION, ResumeThread, STARTUPINFOW, SetThreadToken,
+    TerminateProcess,
 };
 use windows::Win32::UI::Shell::{CreateProfile, DeleteProfileW};
 use windows::core::{BOOL, PCWSTR, PWSTR};
 
 #[path = "common/bounded_wait.rs"]
 mod bounded_wait;
+#[path = "common/env_probe.rs"]
+mod env_probe;
 #[path = "common/hard_errors.rs"]
 mod hard_errors;
-#[path = "common/window_access.rs"]
-mod window_access;
 
 // Fixture ---------------------------------------------------------------------------------
 
@@ -169,14 +170,28 @@ impl Account {
         self.profile.as_deref().expect("this account has no profile")
     }
 
-    /// Run `exe` with `command_line` under this account's network-logon token, the way sshd runs
-    /// its shell, with the CALLER's environment (so a stale `USERPROFILE` is in play). Returns the
-    /// exit code. A loader failure of the child ends it with its NTSTATUS as the exit code (see
-    /// [`hard_errors`]) rather than a message box. The child runs on this process's window station
-    /// and desktop, to which the account is granted access for the call (see [`window_access`]).
-    /// A child still running after [`bounded_wait::CHILD_EXIT_BOUND`] fails the test with the process
-    /// tree, this account's ssh-broker folder and `evidence` printed, and is killed.
+    /// [`Account::run_with`] without loading the account's profile.
     fn run(&self, exe: &Path, command_line: &str, cwd: &Path, evidence: &[PathBuf]) -> u32 {
+        self.run_with(exe, command_line, cwd, evidence, CREATE_PROCESS_LOGON_FLAGS(0))
+    }
+
+    /// Run `exe` with `command_line` under this account's network-logon token, the way sshd runs
+    /// its shell, on this process's window station and desktop. `logon_flags` is
+    /// `CreateProcessWithTokenW`'s `dwLogonFlags`: without [`LOGON_WITH_PROFILE`] the account's
+    /// registry hive is not loaded, and the environment block, made from the account's profile
+    /// because none is passed, has `USERPROFILE=C:\Users\Default`. Returns the exit code. A loader
+    /// failure of the child ends it with its NTSTATUS as the exit code (see [`hard_errors`]) rather
+    /// than a message box. A child still running after [`bounded_wait::CHILD_EXIT_BOUND`] fails the
+    /// test with the process tree, this account's ssh-broker folder and `evidence` printed, and is
+    /// killed.
+    fn run_with(
+        &self,
+        exe: &Path,
+        command_line: &str,
+        cwd: &Path,
+        evidence: &[PathBuf],
+        logon_flags: CREATE_PROCESS_LOGON_FLAGS,
+    ) -> u32 {
         let network = self.network_token();
         let mut primary = HANDLE::default();
         // SAFETY: valid in/out handles.
@@ -194,11 +209,8 @@ impl Account {
         let primary = OwnedHandle(primary);
 
         let mut command = wide(command_line);
-        let desktop = window_access::grant_current(&self.sid_text);
-        let mut lp_desktop = wide(&desktop.lp_desktop);
         let startup = STARTUPINFOW {
             cb: std::mem::size_of::<STARTUPINFOW>() as u32,
-            lpDesktop: PWSTR(lp_desktop.as_mut_ptr()),
             ..Default::default()
         };
         let mut info = PROCESS_INFORMATION::default();
@@ -206,7 +218,7 @@ impl Account {
         unsafe {
             CreateProcessWithTokenW(
                 primary.0,
-                Default::default(),
+                logon_flags,
                 PCWSTR(wide(&exe.to_string_lossy()).as_ptr()),
                 Some(PWSTR(command.as_mut_ptr())),
                 CREATE_SUSPENDED | CREATE_NO_WINDOW,
@@ -758,93 +770,6 @@ fn a_suspended_child_has_its_hard_error_boxes_suppressed() {
     assert!(!after, "the child no longer raises hard-error boxes");
 }
 
-/// A SID that names no account, so a grant to it changes nothing in practice.
-const NOBODY: &str = "S-1-5-21-111-222-333-4444";
-
-/// A new desktop in this process's window station, closed on drop: it shows nothing and switches
-/// nothing, and it lets a test edit a DACL without touching the desktop this process runs on.
-struct ScratchDesktop(windows::Win32::System::StationsAndDesktops::HDESK, String);
-
-impl ScratchDesktop {
-    fn new(tag: &str) -> ScratchDesktop {
-        use windows::Win32::System::StationsAndDesktops::{CreateDesktopW, DESKTOP_CONTROL_FLAGS};
-        let name = format!("sb-test-{tag}-{}", std::process::id());
-        // SAFETY: NUL-terminated name; the handle is closed in `drop`.
-        let handle = unsafe {
-            CreateDesktopW(
-                PCWSTR(wide(&name).as_ptr()),
-                PCWSTR::null(),
-                None,
-                DESKTOP_CONTROL_FLAGS(0),
-                window_access::DESKTOP_RIGHTS | 0x0006_0000,
-                None,
-            )
-        }
-        .expect("CreateDesktopW");
-        ScratchDesktop(handle, name)
-    }
-}
-
-impl Drop for ScratchDesktop {
-    fn drop(&mut self) {
-        // SAFETY: the handle came from `CreateDesktopW` and is closed once.
-        let _ = unsafe { windows::Win32::System::StationsAndDesktops::CloseDesktop(self.0) };
-    }
-}
-
-#[test]
-fn granting_a_desktop_to_an_account_adds_it_and_revoking_restores_the_dacl() {
-    let desktop = ScratchDesktop::new("grant");
-    let before = window_access::desktop_sddl(&desktop.1);
-    assert!(!before.contains(NOBODY), "control: {before}");
-
-    let grant = window_access::grant_desktop(&desktop.1, NOBODY);
-    let during = window_access::desktop_sddl(&desktop.1);
-    drop(grant);
-    let after = window_access::desktop_sddl(&desktop.1);
-
-    assert!(during.contains(NOBODY), "the grant is in the DACL: {during}");
-    assert_eq!(after, before, "revoking leaves the DACL as it was");
-}
-
-#[test]
-fn two_accounts_granted_at_once_are_both_in_the_dacl_and_both_revoked() {
-    let desktop = ScratchDesktop::new("two");
-    let before = window_access::desktop_sddl(&desktop.1);
-    let other = "S-1-5-21-111-222-333-5555";
-
-    let first = window_access::grant_desktop(&desktop.1, NOBODY);
-    let second = window_access::grant_desktop(&desktop.1, other);
-    let both = window_access::desktop_sddl(&desktop.1);
-    drop(first);
-    let one = window_access::desktop_sddl(&desktop.1);
-    drop(second);
-
-    assert!(both.contains(NOBODY) && both.contains(other), "{both}");
-    assert!(!one.contains(NOBODY) && one.contains(other), "{one}");
-    assert_eq!(window_access::desktop_sddl(&desktop.1), before);
-}
-
-#[test]
-fn this_process_desktop_is_named_station_backslash_desktop() {
-    let (station, desktop) = window_access::current_names();
-
-    assert!(!station.is_empty() && !desktop.is_empty());
-    assert_eq!(
-        window_access::lp_desktop(&station, &desktop),
-        format!(r"{station}\{desktop}")
-    );
-    // Both open by name with the rights a grant needs, which is how a grant finds them.
-    assert!(
-        !window_access::station_sddl(&station).starts_with('('),
-        "readable: {station}"
-    );
-    assert!(
-        !window_access::desktop_sddl(&desktop).starts_with('('),
-        "readable: {desktop}"
-    );
-}
-
 #[test]
 fn a_loader_status_in_an_exit_code_is_named() {
     assert_eq!(hard_errors::describe_exit(0), "0");
@@ -880,13 +805,94 @@ fn a_loader_failure_as_bob_ends_the_process_with_its_status_and_no_message_box()
     );
 }
 
+/// Child half of the measurement in [`shim_as_bob_never_reaches_another_users_listener`]: runs
+/// only when started from the shared directory with a `probe.txt` beside the binary, and writes
+/// what it sees to `probe-report.txt` there.
+#[test]
+fn child_reports_its_session_hive_and_dll_load() {
+    let Some(exe_dir) = std::env::current_exe().unwrap().parent().map(Path::to_path_buf) else {
+        return;
+    };
+    let Ok(text) = std::fs::read_to_string(exe_dir.join("probe.txt")) else {
+        return; // not started as the child
+    };
+    let value = |key: &str| {
+        text.lines()
+            .find_map(|l| l.strip_prefix(key))
+            .unwrap_or_else(|| panic!("probe.txt has no {key}"))
+    };
+    std::fs::write(
+        exe_dir.join("probe-report.txt"),
+        env_probe::report(value("sid="), value("dll=")),
+    )
+    .unwrap();
+}
+
+/// The text of a panic payload.
+fn panic_text(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_owned()))
+        .unwrap_or_else(|| "(a panic with no text)".to_owned())
+}
+
+/// Run [`child_reports_its_session_hive_and_dll_load`] as `bob` once per DLL of
+/// [`env_probe::DLLS`], launched with `logon_flags`, and return what each child said. A launch or
+/// wait that fails is part of the answer, not a failure of the measurement.
+fn probe_as(bob: &Account, shared: &SharedDir, exe: &Path, logon_flags: CREATE_PROCESS_LOGON_FLAGS) -> String {
+    use std::fmt::Write as _;
+    let command = format!(
+        "\"{}\" --exact child_reports_its_session_hive_and_dll_load",
+        exe.display()
+    );
+    let (probe, report) = (shared.0.join("probe.txt"), shared.0.join("probe-report.txt"));
+    let mut all = String::new();
+    for dll in env_probe::DLLS {
+        std::fs::write(&probe, format!("sid={}\ndll={dll}\n", bob.sid_text)).unwrap();
+        let _ = std::fs::remove_file(&report);
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            bob.run_with(exe, &command, &shared.0, &[], logon_flags)
+        }));
+        let ended = match outcome {
+            Ok(code) => format!("the child exited with {}", hard_errors::describe_exit(code)),
+            Err(payload) => format!("the child did not complete: {}", panic_text(payload.as_ref())),
+        };
+        let said = std::fs::read_to_string(&report).unwrap_or_else(|e| format!("(no report: {e})\n"));
+        let _ = writeln!(all, "-- {dll}: {ended}\n{said}");
+    }
+    all
+}
+
+/// Prints the measurement when the test it belongs to fails (libtest shows a failed test's output).
+struct PrintOnPanic(String);
+
+impl Drop for PrintOnPanic {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            eprintln!("{}", self.0);
+        }
+    }
+}
+
 #[test]
 fn shim_as_bob_never_reaches_another_users_listener() {
     // The administrator's agent is listening, and bob may open its socket. An administrator who
     // SSHes in as bob gets bob's shim, which looks in bob's profile, finds nothing, and fails
-    // open. Run with the caller's environment, whose USERPROFILE and LOCALAPPDATA are the
-    // administrator's.
+    // open.
     let bob = Account::create("bob", true);
+    let shared = SharedDir::new("shim");
+
+    // MEASUREMENT (temporary): what bob's process sees, launched as the other tests launch it and
+    // with his profile loaded. Printed if this test fails.
+    let probe_exe = shared.0.join("isolation.exe");
+    std::fs::copy(std::env::current_exe().unwrap(), &probe_exe).unwrap();
+    let _measurement = PrintOnPanic(format!(
+        "MEASUREMENT, profile not loaded (dwLogonFlags = 0):\n{}\nMEASUREMENT, profile loaded (LOGON_WITH_PROFILE):\n{}",
+        probe_as(&bob, &shared, &probe_exe, CREATE_PROCESS_LOGON_FLAGS(0)),
+        probe_as(&bob, &shared, &probe_exe, LOGON_WITH_PROFILE),
+    ));
+
     let admin = Sid::current_user().unwrap();
     let admin_loc = userdir::current_socket_location().unwrap();
     userdir::ensure_socket_dir(&admin_loc, &admin).unwrap();
@@ -914,7 +920,6 @@ fn shim_as_bob_never_reaches_another_users_listener() {
         first_byte.send((n, byte[0])).unwrap();
     });
 
-    let shared = SharedDir::new("shim");
     let shim = shared.0.join("ssh-broker.exe");
     std::fs::copy(env!("CARGO_BIN_EXE_ssh-broker"), &shim).unwrap();
     // Shaped like a non-PTY sshd session, which the shim tells from a PTY one by its stdin: a
@@ -936,7 +941,9 @@ fn shim_as_bob_never_reaches_another_users_listener() {
     let command = format!("\"{}\" /c \"{}\"", cmd.display(), script.display());
 
     let evidence = ["out.txt", "err.txt"].map(|name| shared.0.join(name));
-    let code = bob.run(&cmd, &command, &shared.0, &evidence);
+    // With his profile loaded: `CreateProcessWithTokenW` loads it only when asked (Microsoft docs,
+    // Remarks).
+    let code = bob.run_with(&cmd, &command, &shared.0, &evidence, LOGON_WITH_PROFILE);
     assert!(
         code == 0,
         "the fail-open command ran; the shim run ended with {}

@@ -58,7 +58,6 @@ tracing-appender = "0.2"
 windows = { version = "0.62.2", features = [
     "Win32_UI_Shell", # CommandLineToArgvW: tests/conhost_windows.rs checks the test encoder's tokenizer against it
     "Win32_NetworkManagement_NetManagement", # NetUserAdd/NetUserDel: tests/user_isolation_windows.rs makes throwaway accounts
-    "Win32_System_StationsAndDesktops",      # window station and desktop DACLs: tests/common/window_access.rs lets a throwaway account run processes on them
-    "Win32_Graphics_Gdi",                    # CreateDesktopW's DEVMODEW parameter (the same module's self-test makes a scratch desktop)
     "Wdk_System_Threading",                  # ProcessDefaultHardErrorMode: tests/common/hard_errors.rs makes a child's loader failure exit instead of raise a message box
+    "Win32_System_LibraryLoader",            # LoadLibraryW/GetProcAddress: the measurement child in tests/user_isolation_windows.rs loads user32, gdi32, combase and ole32 by name
 ] }
