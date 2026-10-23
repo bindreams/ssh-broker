@@ -69,7 +69,7 @@ Then extract it and, from an elevated prompt, run `ssh-broker.exe apply`. It ins
 
 ## Upgrading
 
-Run `apply` again from an elevated prompt with the newer build. A running agent holds the installed exe open, so when `apply` replaces the exe with a different build it first stops every agent, then starts one in each logged-on session. Their open SSH sessions end; users reconnect. An `apply` of the build that is already installed leaves agents alone.
+Run `apply` again from an elevated prompt with the newer build. A running agent holds the installed exe open, so when `apply` replaces the exe with a different build it first stops every agent the logon task started, then starts one in each logged-on session (also if a later step fails). Their open SSH sessions end; users reconnect. An agent started by hand with `ssh-broker agent` is not stopped: if it still holds the exe, `apply` fails with a message saying so; stop it and run `apply` again. An `apply` of the build that is already installed leaves agents alone.
 
 ### From a single-user install
 

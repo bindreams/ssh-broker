@@ -370,8 +370,7 @@ mod imp {
                     },
                 ));
                 // `detail()` distinguishes "the child reported a mismatch" from "the child never
-                // reported at all" (an exe older than this check, which `apply` tolerates when a
-                // running agent holds the canonical path open). Both FAIL — default-deny — but
+                // reported at all" (an installed exe older than this check). Both FAIL — default-deny — but
                 // they have different remedies, and claiming the payload was mangled when nothing
                 // ever looked at it would be a diagnosis the code cannot support.
                 rows.push(report::Check::new(

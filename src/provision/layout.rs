@@ -208,25 +208,20 @@ fn would_replace_installed_exe(layout: &Layout, current: &Path) -> bool {
 }
 
 /// Copy `current` to the canonical path unless it is already there or identical.
+///
+/// A copy that fails is an error. By now every agent the logon task started has been stopped, so
+/// what still holds the exe open is something else (an agent started by hand). Keeping the old exe
+/// under the new tasks would report an install that did not happen.
 fn install_self(layout: &Layout, current: &Path) -> anyhow::Result<PathBuf> {
     let canonical = layout.canonical_exe();
-    if current != canonical
-        && !files_identical(current, &canonical)
-        && let Err(e) = std::fs::copy(current, &canonical)
-    {
-        // A running agent holds the canonical exe open (sharing violation). Don't abort
-        // the whole idempotent re-apply: if a canonical exe already exists, keep it and
-        // repair the rest of the state (installing a NEW build needs the agent stopped).
-        anyhow::ensure!(
-            canonical.is_file(),
-            "copy self to {} failed and no canonical exe exists: {e}",
-            canonical.display()
-        );
-        eprintln!(
-            "apply: could not update {} ({e}); using the existing exe \
-             — stop the agent to update the binary",
-            canonical.display()
-        );
+    if current != canonical && !files_identical(current, &canonical) {
+        std::fs::copy(current, &canonical).with_context(|| {
+            format!(
+                "could not replace {}: it is in use, probably by an agent started by hand with \
+                 `ssh-broker agent`; stop that agent and run apply again",
+                canonical.display()
+            )
+        })?;
     }
     anyhow::ensure!(canonical.is_file(), "canonical exe missing after install");
     Ok(canonical)

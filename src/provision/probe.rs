@@ -50,9 +50,9 @@ pub struct ProbeResult {
 
 /// Outcome of the upstream (client → child) transparency check.
 ///
-/// `Absent` is deliberately distinct from `Fail`. `apply` tolerates NOT replacing the canonical
-/// exe when a running agent holds it open (see `install_self`), so a probe child older than this
-/// check is a reachable state on an otherwise healthy box. Reporting that as "the payload did not
+/// `Absent` is deliberately distinct from `Fail`. A probe child older than this check is
+/// reachable: `apply` has not been run since the build that added it (a failed `apply` leaves
+/// the old exe in place). Reporting that as "the payload did not
 /// reach the child intact" would be a diagnosis the code cannot support: the payload may have
 /// arrived perfectly and the child simply never looked. Both still FAIL the gate — the difference
 /// is only in what `verify` tells the operator to do about it.

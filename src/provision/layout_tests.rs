@@ -330,6 +330,33 @@ fn prepare_in_changes_nothing_when_agents_cannot_be_stopped_for_an_update() {
 }
 
 #[test]
+fn prepare_in_fails_when_the_exe_is_still_in_use_after_the_stop() {
+    // An agent started by hand (`ssh-broker agent`) is not a task instance, so the stop misses it
+    // and it keeps the exe open. `apply` must not report `ok` with the old exe under the new tasks.
+    use std::os::windows::fs::OpenOptionsExt;
+    let base = TempBase::existing("prepare-held");
+    std::fs::write(base.0.join("ssh-broker.exe"), "old build").unwrap();
+    let source = new_exe(&base, "new build");
+    let layout = base.layout();
+    let group = agent_task_xml(r"C:\x.exe");
+    // Exclusive: no sharing, so the copy over it fails as it does over a running exe.
+    let _held = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .open(layout.canonical_exe())
+        .unwrap();
+
+    let err = format!(
+        "{:#}",
+        prepare_in(&forged(&layout), &source, Some(&group), || Ok(())).unwrap_err()
+    );
+
+    assert!(err.contains("in use"), "{err}");
+    assert!(err.contains("started by hand"), "{err}");
+    assert!(err.contains("ssh-broker.exe"), "{err}");
+}
+
+#[test]
 fn prepare_in_does_not_stop_agents_when_nothing_is_legacy() {
     // Re-running `apply`, and the boot self-heal, must leave live agents alone.
     let base = TempBase::existing("prepare-clean");
