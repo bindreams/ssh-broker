@@ -16,6 +16,8 @@ pub mod registry;
 pub mod report;
 pub mod schtasks;
 #[cfg(windows)]
+pub mod sessions;
+#[cfg(windows)]
 pub mod taskscheduler;
 
 /// `apply` subcommand: idempotently assert all desired state. Windows-only.
@@ -88,7 +90,7 @@ mod provision_tests;
 #[cfg(windows)]
 mod imp {
     use super::layout::{self, Layout};
-    use super::{probe, registry, report, schtasks, taskscheduler};
+    use super::{probe, registry, report, schtasks, sessions, taskscheduler};
     use crate::{afunix, shim};
     use anyhow::Context;
     use std::path::Path;
@@ -135,11 +137,25 @@ mod imp {
             "DefaultShell read-back mismatch (shell={shell:?}, opt={opt:?})"
         );
 
-        // 4. Start the agent now so no re-login is needed (the logon trigger covers the rest).
-        if probe::active_console_session() != 0xFFFF_FFFF
-            && let Err(e) = run_schtasks(&schtasks::run_task_argv(schtasks::AGENT_TASK))
-        {
-            eprintln!("apply: agent task registered but immediate start failed: {e}");
+        // 4. Start an agent in each session that already has a user, so nobody has to log off and
+        //    on again (the logon trigger covers every later logon). An agent that is already
+        //    running in its session exits at once, so this is safe to repeat. Best-effort: the
+        //    install is complete without it.
+        match sessions::interactive_sessions() {
+            Ok(ids) => {
+                let mut started = 0usize;
+                for id in &ids {
+                    match taskscheduler::run_in_session(schtasks::AGENT_TASK, *id) {
+                        Ok(()) => started += 1,
+                        Err(e) => eprintln!("apply: could not start the agent in session {id}: {e:#}"),
+                    }
+                }
+                println!(
+                    "apply: started the agent in {started} of {} logged-on session(s)",
+                    ids.len()
+                );
+            }
+            Err(e) => eprintln!("apply: tasks registered but the logged-on sessions could not be listed: {e:#}"),
         }
         println!(
             "apply: ok — DefaultShell -> {}, agent + self-heal tasks installed",

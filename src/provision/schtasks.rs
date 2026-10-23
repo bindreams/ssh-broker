@@ -106,11 +106,6 @@ pub fn selfheal_task_argv(exe: &str) -> Vec<String> {
     ]
 }
 
-/// `schtasks /Run /TN <name>` — start the task now. Replaced by a per-session start (task 9).
-pub fn run_task_argv(name: &str) -> Vec<String> {
-    vec!["/Run".into(), "/TN".into(), name.into()]
-}
-
 /// `schtasks /Query /TN <name> /XML` — dump a task's definition (for the verify checks).
 pub fn query_task_argv(name: &str) -> Vec<String> {
     vec!["/Query".into(), "/TN".into(), name.into(), "/XML".into()]
