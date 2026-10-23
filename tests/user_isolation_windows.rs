@@ -37,7 +37,6 @@ use windows::Win32::Security::{
     PSECURITY_DESCRIPTOR, SecurityImpersonation, SetTokenInformation, TOKEN_ALL_ACCESS, TOKEN_DEFAULT_DACL,
     TOKEN_DUPLICATE, TOKEN_ELEVATION, TOKEN_QUERY, TokenDefaultDacl, TokenElevation, TokenImpersonation, TokenPrimary,
 };
-use windows::Win32::System::LibraryLoader::LoadLibraryW;
 use windows::Win32::System::Threading::{
     CREATE_NO_WINDOW, CREATE_SUSPENDED, CreateProcessWithTokenW, GetCurrentProcess, OpenProcessToken,
     PROCESS_INFORMATION, ResumeThread, STARTUPINFOW, SetThreadToken, TerminateProcess,
@@ -49,23 +48,13 @@ use windows::core::{BOOL, PCWSTR, PWSTR};
 mod bounded_wait;
 #[path = "common/hard_errors.rs"]
 mod hard_errors;
-#[path = "common/pe_imports.rs"]
-mod pe_imports;
-#[path = "common/thread_stacks.rs"]
-mod thread_stacks;
+#[path = "common/window_access.rs"]
+mod window_access;
 
 // Fixture ---------------------------------------------------------------------------------
 
 fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(std::iter::once(0)).collect()
-}
-
-/// A progress line on stderr, written past libtest's capture, so a run that never finishes still
-/// shows in the CI log which test got how far.
-fn note(what: impl std::fmt::Display) {
-    use std::io::Write;
-    let thread = std::thread::current();
-    let _ = writeln!(std::io::stderr(), "[{}] {what}", thread.name().unwrap_or("?"));
 }
 
 /// Fail loudly unless this process is an elevated administrator.
@@ -183,8 +172,10 @@ impl Account {
     /// Run `exe` with `command_line` under this account's network-logon token, the way sshd runs
     /// its shell, with the CALLER's environment (so a stale `USERPROFILE` is in play). Returns the
     /// exit code. A loader failure of the child ends it with its NTSTATUS as the exit code (see
-    /// [`hard_errors`]) rather than a message box. A child still running after [`bounded_wait::CHILD_EXIT_BOUND`] fails the test
-    /// with the process tree, thread stacks, this account's ssh-broker folder and `evidence` printed, and is killed.
+    /// [`hard_errors`]) rather than a message box. The child runs on this process's window station
+    /// and desktop, to which the account is granted access for the call (see [`window_access`]).
+    /// A child still running after [`bounded_wait::CHILD_EXIT_BOUND`] fails the test with the process
+    /// tree, this account's ssh-broker folder and `evidence` printed, and is killed.
     fn run(&self, exe: &Path, command_line: &str, cwd: &Path, evidence: &[PathBuf]) -> u32 {
         let network = self.network_token();
         let mut primary = HANDLE::default();
@@ -203,8 +194,11 @@ impl Account {
         let primary = OwnedHandle(primary);
 
         let mut command = wide(command_line);
+        let desktop = window_access::grant_current(&self.sid_text);
+        let mut lp_desktop = wide(&desktop.lp_desktop);
         let startup = STARTUPINFOW {
             cb: std::mem::size_of::<STARTUPINFOW>() as u32,
+            lpDesktop: PWSTR(lp_desktop.as_mut_ptr()),
             ..Default::default()
         };
         let mut info = PROCESS_INFORMATION::default();
@@ -223,10 +217,6 @@ impl Account {
             )
         }
         .unwrap_or_else(|e| panic!("start {exe:?} as {}: {e}", self.name));
-        note(format_args!(
-            "started {exe:?} as {} (pid {})",
-            self.name, info.dwProcessId
-        ));
         let process = OwnedHandle(info.hProcess);
         let thread = OwnedHandle(info.hThread);
         // Before its first instruction: a loader failure then ends the process, with the failing
@@ -251,15 +241,13 @@ impl Account {
             evidence.push(profile.join("AppData").join("Local").join("ssh-broker"));
         }
         let what = format!("{exe:?} as {}", self.name);
-        let code = bounded_wait::wait_for_exit(
+        bounded_wait::wait_for_exit(
             process.0,
             info.dwProcessId,
             &what,
             bounded_wait::CHILD_EXIT_BOUND,
             &evidence,
-        );
-        note(format_args!("{what} exited with {}", hard_errors::describe_exit(code)));
-        code
+        )
     }
 }
 
@@ -268,13 +256,10 @@ impl Drop for Account {
         // SAFETY: NUL-terminated inputs.
         unsafe {
             if self.profile.is_some() {
-                note(format_args!("deleting the profile of {}", self.name));
                 let _ = DeleteProfileW(PCWSTR(wide(&self.sid_text).as_ptr()), PCWSTR::null(), PCWSTR::null());
             }
-            note(format_args!("deleting the account {}", self.name));
             let _ = NetUserDel(PCWSTR::null(), PCWSTR(wide(&self.name).as_ptr()));
         }
-        note(format_args!("removed {}", self.name));
     }
 }
 
@@ -541,12 +526,6 @@ fn a_permissive_default_dacl_is_in_effect_where_nothing_is_inherited() {
         icacls_report(&plain),
         dacl_sddl(&plain)
     );
-    if exact {
-        // Past libtest's capture, so the evidence survives a run that never prints failures.
-        note(format_args!(
-            "the control file is exact, which it must not be\n{report}"
-        ));
-    }
     assert!(
         !exact,
         "a file made under a permissive default DACL, in a directory that passes nothing down, is not exact\n{report}"
@@ -748,10 +727,6 @@ fn a_child_that_never_exits_is_reported_and_its_tree_killed() {
         "lists the grandchild: {message}"
     );
     assert!(message.contains("left-behind-marker"), "prints the evidence: {message}");
-    assert!(
-        message.contains("thread stacks:") && message.contains("ntdll!"),
-        "shows where the threads are blocked: {message}"
-    );
     // Killed: this returns instead of waiting out the 600 pings.
     child.wait().unwrap();
 }
@@ -783,17 +758,90 @@ fn a_suspended_child_has_its_hard_error_boxes_suppressed() {
     assert!(!after, "the child no longer raises hard-error boxes");
 }
 
-#[test]
-fn the_import_list_of_this_binary_names_its_dlls() {
-    let imports = pe_imports::imports(&std::env::current_exe().unwrap()).unwrap();
+/// A SID that names no account, so a grant to it changes nothing in practice.
+const NOBODY: &str = "S-1-5-21-111-222-333-4444";
 
+/// A new desktop in this process's window station, closed on drop: it shows nothing and switches
+/// nothing, and it lets a test edit a DACL without touching the desktop this process runs on.
+struct ScratchDesktop(windows::Win32::System::StationsAndDesktops::HDESK, String);
+
+impl ScratchDesktop {
+    fn new(tag: &str) -> ScratchDesktop {
+        use windows::Win32::System::StationsAndDesktops::{CreateDesktopW, DESKTOP_CONTROL_FLAGS};
+        let name = format!("sb-test-{tag}-{}", std::process::id());
+        // SAFETY: NUL-terminated name; the handle is closed in `drop`.
+        let handle = unsafe {
+            CreateDesktopW(
+                PCWSTR(wide(&name).as_ptr()),
+                PCWSTR::null(),
+                None,
+                DESKTOP_CONTROL_FLAGS(0),
+                window_access::DESKTOP_RIGHTS | 0x0006_0000,
+                None,
+            )
+        }
+        .expect("CreateDesktopW");
+        ScratchDesktop(handle, name)
+    }
+}
+
+impl Drop for ScratchDesktop {
+    fn drop(&mut self) {
+        // SAFETY: the handle came from `CreateDesktopW` and is closed once.
+        let _ = unsafe { windows::Win32::System::StationsAndDesktops::CloseDesktop(self.0) };
+    }
+}
+
+#[test]
+fn granting_a_desktop_to_an_account_adds_it_and_revoking_restores_the_dacl() {
+    let desktop = ScratchDesktop::new("grant");
+    let before = window_access::desktop_sddl(&desktop.1);
+    assert!(!before.contains(NOBODY), "control: {before}");
+
+    let grant = window_access::grant_desktop(&desktop.1, NOBODY);
+    let during = window_access::desktop_sddl(&desktop.1);
+    drop(grant);
+    let after = window_access::desktop_sddl(&desktop.1);
+
+    assert!(during.contains(NOBODY), "the grant is in the DACL: {during}");
+    assert_eq!(after, before, "revoking leaves the DACL as it was");
+}
+
+#[test]
+fn two_accounts_granted_at_once_are_both_in_the_dacl_and_both_revoked() {
+    let desktop = ScratchDesktop::new("two");
+    let before = window_access::desktop_sddl(&desktop.1);
+    let other = "S-1-5-21-111-222-333-5555";
+
+    let first = window_access::grant_desktop(&desktop.1, NOBODY);
+    let second = window_access::grant_desktop(&desktop.1, other);
+    let both = window_access::desktop_sddl(&desktop.1);
+    drop(first);
+    let one = window_access::desktop_sddl(&desktop.1);
+    drop(second);
+
+    assert!(both.contains(NOBODY) && both.contains(other), "{both}");
+    assert!(!one.contains(NOBODY) && one.contains(other), "{one}");
+    assert_eq!(window_access::desktop_sddl(&desktop.1), before);
+}
+
+#[test]
+fn this_process_desktop_is_named_station_backslash_desktop() {
+    let (station, desktop) = window_access::current_names();
+
+    assert!(!station.is_empty() && !desktop.is_empty());
+    assert_eq!(
+        window_access::lp_desktop(&station, &desktop),
+        format!(r"{station}\{desktop}")
+    );
+    // Both open by name with the rights a grant needs, which is how a grant finds them.
     assert!(
-        imports.iter().any(|name| name.eq_ignore_ascii_case("kernel32.dll")),
-        "{imports:?}"
+        !window_access::station_sddl(&station).starts_with('('),
+        "readable: {station}"
     );
     assert!(
-        imports.iter().all(|name| name.to_ascii_lowercase().ends_with(".dll")),
-        "{imports:?}"
+        !window_access::desktop_sddl(&desktop).starts_with('('),
+        "readable: {desktop}"
     );
 }
 
@@ -806,40 +854,6 @@ fn a_loader_status_in_an_exit_code_is_named() {
         "0xc0000135 (STATUS_DLL_NOT_FOUND)"
     );
     assert_eq!(hard_errors::describe_exit(0xC123_4567), "0xc1234567");
-}
-
-/// Child half of the import check in [`shim_as_bob_never_reaches_another_users_listener`]: runs
-/// only from the shared directory with an `imports.txt` (one DLL name per line) beside the
-/// binary, as bob. Loads each name the way the loader would for an import and writes one line per
-/// name to `probe.txt`; fails if any did not load.
-#[test]
-fn child_loads_every_import_it_is_given() {
-    let Some(exe_dir) = std::env::current_exe().unwrap().parent().map(Path::to_path_buf) else {
-        return;
-    };
-    let Ok(names) = std::fs::read_to_string(exe_dir.join("imports.txt")) else {
-        return; // not started as the child
-    };
-    let mut report = String::new();
-    let mut failed = false;
-    for name in names.lines() {
-        // SAFETY: NUL-terminated name. The module stays loaded; this process is short-lived.
-        match unsafe { LoadLibraryW(PCWSTR(wide(name).as_ptr())) } {
-            Ok(_) => report.push_str(&format!(
-                "{name}: loaded
-"
-            )),
-            Err(e) => {
-                failed = true;
-                report.push_str(&format!(
-                    "{name}: FAILED {e}
-"
-                ));
-            }
-        }
-    }
-    std::fs::write(exe_dir.join("probe.txt"), &report).unwrap();
-    assert!(!failed, "{report}");
 }
 
 #[test]
@@ -903,52 +917,15 @@ fn shim_as_bob_never_reaches_another_users_listener() {
     let shared = SharedDir::new("shim");
     let shim = shared.0.join("ssh-broker.exe");
     std::fs::copy(env!("CARGO_BIN_EXE_ssh-broker"), &shim).unwrap();
-    // A loader failure of the shim names no DLL, so first load each of its imports as bob.
-    let probe = shared.0.join("isolation.exe");
-    std::fs::copy(std::env::current_exe().unwrap(), &probe).unwrap();
-    std::fs::write(
-        shared.0.join("imports.txt"),
-        pe_imports::imports(&shim).unwrap().join(
-            "
-",
-        ),
-    )
-    .unwrap();
-    let probe_code = bob.run(
-        &probe,
-        &format!(
-            "\"{}\" --exact child_loads_every_import_it_is_given --nocapture",
-            probe.display()
-        ),
-        &shared.0,
-        &[],
-    );
-    let probe_report =
-        std::fs::read_to_string(shared.0.join("probe.txt")).unwrap_or_else(|e| format!("(no probe.txt: {e})"));
-    assert!(
-        probe_code == 0,
-        "bob cannot load every import of the shim (probe exit {}):
-{probe_report}",
-        hard_errors::describe_exit(probe_code)
-    );
     // Shaped like a non-PTY sshd session, which the shim tells from a PTY one by its stdin: a
     // console stdin (what `run` gives a process) makes it keep the quotes around the command, and
     // `"cmd.exe /c echo shim-ran"` names no program. So stdin is NUL. The redirections come first
     // because `cmd` leaves the space before a trailing one in the command line the shim reads.
-    // `progress.txt` and `env.txt` are for a run that hangs: the failure report prints them.
     let script = shared.0.join("run.cmd");
-    let progress = shared.0.join("progress.txt");
     std::fs::write(
         &script,
         format!(
-            "@echo off\r\n\
-             >>\"{progress}\" echo script started\r\n\
-             >\"{env}\" set\r\n\
-             >>\"{progress}\" echo starting the shim\r\n\
-             <nul >\"{out}\" 2>\"{err}\" \"{shim}\" -c \"cmd.exe /c echo shim-ran\"\r\n\
-             >>\"{progress}\" echo the shim exited with %ERRORLEVEL%\r\n",
-            progress = progress.display(),
-            env = shared.0.join("env.txt").display(),
+            "@echo off\r\n<nul >\"{out}\" 2>\"{err}\" \"{shim}\" -c \"cmd.exe /c echo shim-ran\"\r\n",
             out = shared.0.join("out.txt").display(),
             err = shared.0.join("err.txt").display(),
             shim = shim.display(),
@@ -958,7 +935,7 @@ fn shim_as_bob_never_reaches_another_users_listener() {
     let cmd = Path::new(&std::env::var_os("SystemRoot").unwrap()).join(r"System32\cmd.exe");
     let command = format!("\"{}\" /c \"{}\"", cmd.display(), script.display());
 
-    let evidence = ["progress.txt", "env.txt", "out.txt", "err.txt"].map(|name| shared.0.join(name));
+    let evidence = ["out.txt", "err.txt"].map(|name| shared.0.join(name));
     let code = bob.run(&cmd, &command, &shared.0, &evidence);
     assert!(
         code == 0,
@@ -978,7 +955,6 @@ shared directory: {}",
     );
     assert!(stdout.contains("shim-ran"), "and ran the command locally: {stdout}");
 
-    note("the shim ran; connecting the sentinel");
     // Connections are accepted in order, so if the shim had connected it would be first. Ours
     // comes second at best, and its marker byte is what the acceptor must see.
     let mut sentinel = afunix::connect(&admin_loc.path).unwrap();

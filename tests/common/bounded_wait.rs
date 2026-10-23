@@ -23,7 +23,7 @@ pub const CHILD_EXIT_BOUND: Duration = Duration::from_secs(120);
 /// Wait for `process` (process id `pid`, described as `what`) to exit and return its exit code.
 ///
 /// On expiry of `bound` this prints what the child left behind (`evidence`: files, or the files
-/// of a directory), the process tree under `pid` with each thread's wait reason and call stack, then kills that
+/// of a directory), the process tree under `pid` with each thread's state and wait reason, then kills that
 /// tree, and panics naming `what`. Never waits again after the kill, so it cannot hang itself.
 pub fn wait_for_exit(process: HANDLE, pid: u32, what: &str, bound: Duration, evidence: &[PathBuf]) -> u32 {
     let millis = u32::try_from(bound.as_millis()).expect("a bound shorter than INFINITE");
@@ -39,8 +39,6 @@ pub fn wait_for_exit(process: HANDLE, pid: u32, what: &str, bound: Duration, evi
 
     let mut report = format!("{what} (pid {pid}) did not exit within {bound:?}.\n\nprocess tree:\n");
     report.push_str(&process_tree(pid));
-    report.push_str("\nthread stacks:\n");
-    report.push_str(&super::thread_stacks::tree_stacks(pid));
     for path in evidence {
         report.push_str(&format!("\nevidence {}:\n", path.display()));
         dump(path, &mut report);
