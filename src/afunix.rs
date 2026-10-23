@@ -1,12 +1,12 @@
 //! afunix: AF_UNIX stream listener/connector via socket2 (Windows-supported).
 //!
-//! The socket path is kept short and is shared by both the agent (bind) and the shim
-//! (connect). The `sockaddr_un` path limit (~108 bytes) is surfaced loudly rather than
+//! The agent binds and the shim connects at a path both derive from the user's profile (see
+//! `socket_loc`). The `sockaddr_un` path limit (~108 bytes) is surfaced loudly rather than
 //! failing cryptically deep in the OS.
 
 use socket2::{Domain, SockAddr, Socket, Type};
 use std::io::{Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Build a `SockAddr` for an AF_UNIX pathname socket, surfacing an over-long path
 /// (`sockaddr_un` overflow) as a clear error instead of a cryptic OS failure.
@@ -19,36 +19,35 @@ pub fn unix_addr(path: &Path) -> anyhow::Result<SockAddr> {
     })
 }
 
-/// The fixed production socket directory — the hardened, ACL-locked dir the agent binds
-/// inside and the shim connects into. Kept deliberately short to stay within the
-/// `sockaddr_un` path limit, and under `ProgramData` (a system path, not user-specific).
-#[cfg(windows)]
-pub fn socket_dir() -> std::path::PathBuf {
-    crate::provision::layout::Layout::production().socket_dir()
-}
+/// A live agent already answers on the socket path.
+///
+/// Typed so that a caller can tell "someone else serves" from a failure to bind. The agent holds
+/// the per-user lock when it binds, so for it this is an error, not a reason to exit quietly.
+#[derive(Debug, thiserror::Error)]
+#[error("an agent is already listening on {}", .0.display())]
+pub struct AlreadyListening(pub PathBuf);
 
-/// The fixed production socket path, shared by the agent (bind) and the shim (connect)
-/// so they always agree. Lives directly under [`socket_dir`].
-#[cfg(windows)]
-pub fn socket_path() -> std::path::PathBuf {
-    socket_dir().join("a.sock")
-}
-
-/// AF_UNIX stream listener. On Windows, `bind` is **fail-closed**: it refuses unless the
-/// socket directory's DACL verifies as locked down — Windows AF_UNIX has no
-/// `SO_PEERCRED`, so that NTFS ACL is the entire access-control boundary.
+/// AF_UNIX stream listener. On Windows, `bind` is **fail-closed** twice: it refuses unless the
+/// socket directory's DACL verifies as locked down (it decides who can create or replace the
+/// socket), and it removes the socket again unless the socket **file's** own DACL verifies (it
+/// decides who can connect: Windows AF_UNIX has no `SO_PEERCRED`, and traverse checks on the
+/// folders above are bypassed by `SeChangeNotifyPrivilege`).
 pub struct Listener {
     sock: Socket,
 }
 
 impl Listener {
     pub fn bind(path: &Path) -> anyhow::Result<Self> {
+        Self::bind_with(path, &socket_file_acl_ok)
+    }
+
+    /// [`Self::bind`] with the check of the bound socket file as a parameter, so a test can make
+    /// it refuse. Production passes the real one.
+    fn bind_with(path: &Path, socket_file_ok: &dyn Fn(&Path) -> anyhow::Result<bool>) -> anyhow::Result<Self> {
         // Fail-closed: never bind in a directory that isn't locked down. The grantee is
-        // `current_user` because the AGENT (which calls bind) runs as the auto-login
-        // account the boundary protects — so current_user IS the target. (The by-name
-        // resolution the acl docstring describes is the `apply`/provisioning path, which
-        // may run as SYSTEM; that is Phase 7. If bind ever ran under a different identity,
-        // a dir hardened for the real user would simply fail this gate — fail-closed.)
+        // `current_user` because the AGENT (which calls bind) runs as the user whose profile
+        // holds the directory. If bind ever ran under a different identity, a directory
+        // hardened for the real user would simply fail this gate.
         #[cfg(windows)]
         {
             let dir = path
@@ -62,12 +61,12 @@ impl Listener {
             );
         }
         // Reclaim a leftover socket file from a PRIOR run — but never blind-unlink: a live
-        // agent might hold it. Probe-connect to classify, and refuse if live. (Concurrent
-        // double-launch is closed by the agent's single-instance mutex, acquired before
-        // bind — Phase 4; the probe only handles a stale file left by a dead predecessor.)
+        // agent might hold it. Probe-connect to classify, and refuse if live. (A concurrent
+        // double-launch is closed by the per-user lock the agent holds before it binds; the probe
+        // only handles a stale file left by a dead predecessor.)
         if path.exists() {
             if connect(path).is_ok() {
-                anyhow::bail!("an agent is already listening on {}; refusing to bind", path.display());
+                return Err(AlreadyListening(path.to_path_buf()).into());
             }
             // No listener answered. Only reclaim if the entry is actually a socket, and
             // surface a removal failure rather than letting bind fail cryptically.
@@ -88,6 +87,20 @@ impl Listener {
         }
         let sock = Socket::new(Domain::UNIX, Type::STREAM, None)?;
         sock.bind(&unix_addr(path)?)?;
+        // The file exists now but nothing listens, so nobody can queue a connection: prove who
+        // may connect before anyone can. A socket whose ACL cannot be proven is not left behind.
+        let proven = socket_file_ok(path);
+        if !matches!(proven, Ok(true)) {
+            drop(sock);
+            let _ = std::fs::remove_file(path);
+            return match proven {
+                Ok(_) => Err(anyhow::anyhow!(
+                    "the socket file {} does not grant exactly the user, SYSTEM and Administrators;                      refusing to listen (fail-closed)",
+                    path.display()
+                )),
+                Err(e) => Err(e.context(format!("check the socket file {}", path.display()))),
+            };
+        }
         sock.listen(128)?;
         // Don't leak the listening socket into spawned children (would defeat the ACL).
         #[cfg(windows)]
@@ -101,6 +114,18 @@ impl Listener {
         set_no_inherit(&sock)?;
         Ok(sock)
     }
+}
+
+/// Does the socket file at `path` grant exactly the current user, SYSTEM and Administrators?
+#[cfg(windows)]
+fn socket_file_acl_ok(path: &Path) -> anyhow::Result<bool> {
+    crate::acl::verify_file_acl(path, &crate::acl::Sid::current_user()?)
+}
+
+/// Off Windows there is no ACL to check; the directory's mode is the platform's concern.
+#[cfg(not(windows))]
+fn socket_file_acl_ok(_path: &Path) -> anyhow::Result<bool> {
+    Ok(true)
 }
 
 /// Connect to an AF_UNIX stream socket at `path`.

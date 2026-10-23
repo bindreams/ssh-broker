@@ -366,18 +366,6 @@ fn agent_exec_tears_down_when_ssh_disconnects_first() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-#[test]
-fn single_instance_blocks_a_second_acquire() {
-    let first = super::SingleInstance::acquire().unwrap();
-    assert!(
-        super::SingleInstance::acquire().is_err(),
-        "a second acquire must fail while the first guard is held"
-    );
-    drop(first);
-    // Once released, the name is free again.
-    let _again = super::SingleInstance::acquire().unwrap();
-}
-
 /// `read_one_frame` is exercised indirectly above; `handle_connection` also reads the
 /// handshake via it. This asserts the handler rejects a non-handshake first frame.
 #[test]

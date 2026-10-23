@@ -144,7 +144,7 @@ fn fail_open_command(decision: &FailOpen) -> &str {
 /// pre-spawn setup failure (connect/split/handshake/console) — the agent spawned nothing, so
 /// the caller can safely fail open without a double-execution or an orphaned shell.
 fn try_relay(exec: &Option<String>) -> anyhow::Result<Option<i32>> {
-    let path = afunix::socket_path();
+    let path = crate::userdir::current_socket_location()?.path;
     let conn = afunix::connect(&path);
     if decide_fallback(conn.is_err()) == Fallback::LocalShellWithWarning {
         let msg = "ssh-broker: agent unavailable — falling back to a local shell";

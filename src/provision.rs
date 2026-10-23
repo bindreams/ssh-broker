@@ -257,7 +257,7 @@ mod imp {
         ));
 
         // Local: the socket is reachable.
-        let reachable = afunix::connect(&afunix::socket_path()).is_ok();
+        let reachable = crate::userdir::current_socket_location().is_ok_and(|loc| afunix::connect(&loc.path).is_ok());
         rows.push(report::Check::new("socket reachable", reachable, String::new()));
 
         // Through the agent: the real parity proof (run in session 1 by verify-probe). Bounded,
@@ -378,7 +378,7 @@ mod imp {
     /// very property being measured. This is the end-to-end half of byte-transparency — a real
     /// child, real pipes, a real socket — which the in-memory relay tests cannot reach.
     fn drive_probe(exe: &Path) -> anyhow::Result<(probe::ProbeResult, bool)> {
-        let sock = afunix::connect(&afunix::socket_path()).context("connect to agent")?;
+        let sock = afunix::connect(&crate::userdir::current_socket_location()?.path).context("connect to agent")?;
         let (rx, tx) = afunix::split(sock)?;
         let cmd = format!("\"{}\" verify-probe", exe.display());
         let hs = shim::make_handshake(&Some(cmd), "xterm".into(), 80, 24);

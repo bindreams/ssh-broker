@@ -1,22 +1,27 @@
-//! agent: resident in session 1 (started by the auto-login logon task). Per AF_UNIX
-//! connection it hosts the shell — in a ConPTY for interactive (PTY) sessions, or with
-//! redirected pipes for EXEC (`ssh host "cmd"`) — inheriting the session-1 token (working
-//! DPAPI/profile + no RedirectionGuard) and relays it to the SSH-side shim.
+//! agent: resident in a user's interactive session (started by the logon task, once per
+//! logon). Per AF_UNIX connection it hosts the shell — in a ConPTY for interactive (PTY)
+//! sessions, or with redirected pipes for EXEC (`ssh host "cmd"`) — inheriting the session's
+//! token (working DPAPI/profile + no RedirectionGuard) and relays it to the SSH-side shim.
+//!
+//! The socket is inside the user's own profile (see `socket_loc`), so an agent serves exactly
+//! one account: the one whose token it runs under.
 
-/// `agent` subcommand entrypoint. Windows-only: the agent must run in the interactive
-/// session-1 console to confer RDP parity.
+/// `agent` subcommand entrypoint. Windows-only: the agent must run in the user's interactive
+/// session to confer RDP parity.
 pub fn run() -> anyhow::Result<()> {
     #[cfg(windows)]
-    return run_on(&crate::afunix::socket_path());
+    return start();
 
     #[cfg(not(windows))]
     return Err(anyhow::anyhow!(
-        "the agent runs only on Windows (it hosts the shell in the session-1 console)"
+        "the agent runs only on Windows (it hosts the shell in an interactive session)"
     ));
 }
 
 #[cfg(windows)]
 use crate::afunix::{self, ConnRx, ConnTx, Listener};
+#[cfg(windows)]
+use crate::agent_lock::{SessionSlot, UserLock, session_allows_agent};
 #[cfg(windows)]
 use crate::conpty::{self, PtySession};
 #[cfg(windows)]
@@ -28,6 +33,8 @@ use crate::protocol::{ExitCode, FrameKind, FrameReader, Handshake, Mode, Resize,
 #[cfg(windows)]
 use crate::relay::{FrameSink, pump_until_peer_gone, write_data};
 #[cfg(windows)]
+use crate::socket_loc::SocketLocation;
+#[cfg(windows)]
 use crate::winutil::OwnedHandle;
 #[cfg(windows)]
 use std::path::{Path, PathBuf};
@@ -36,12 +43,42 @@ use std::sync::mpsc::TrySendError;
 #[cfg(windows)]
 use std::sync::{Arc, Condvar, Mutex};
 
-/// Bind the hardened socket and serve connections, one handler thread each. Single-instance
-/// is enforced by a named mutex acquired before binding.
+/// Everything between "the task started us" and "serve": check where we are, make the user's
+/// private folder, and become the one agent that serves this user.
 #[cfg(windows)]
-fn run_on(path: &Path) -> anyhow::Result<()> {
-    let _instance = SingleInstance::acquire()?;
-    let listener = Listener::bind(path)?;
+fn start() -> anyhow::Result<()> {
+    let session = crate::provision::probe::current_session_id();
+    anyhow::ensure!(
+        session_allows_agent(session),
+        "the agent will not run in session 0: a shell hosted there has the limited environment this tool exists to          avoid. It belongs in the user's interactive session; the logon task starts it there"
+    );
+    let location = crate::userdir::current_socket_location()?;
+    let user = crate::acl::Sid::current_user()?;
+    crate::userdir::ensure_socket_dir(&location, &user)?;
+
+    // One agent per session: `apply` and the boot self-heal start one per logged-on session
+    // every time they run, and the logon task starts one per logon.
+    let Some(_slot) = SessionSlot::try_acquire()? else {
+        tracing::info!("another agent already runs in this session; exiting");
+        return Ok(());
+    };
+    // One serving agent per user. A second session of the same user waits instead of leaving:
+    // the serving agent dies with its session, and this user may still be logged on here.
+    let _lock = match UserLock::try_acquire(&location.lock_path())? {
+        Some(lock) => lock,
+        None => {
+            tracing::info!("waiting for the agent of another session of this user to end");
+            UserLock::acquire(&location.lock_path())?
+        }
+    };
+    run_on(&location)
+}
+
+/// Bind the hardened socket and serve connections, one handler thread each. The caller holds
+/// the user's lock, so no other agent of this user binds meanwhile.
+#[cfg(windows)]
+fn run_on(location: &SocketLocation) -> anyhow::Result<()> {
+    let listener = Listener::bind(&location.path)?;
     loop {
         let conn = listener.accept()?;
         std::thread::spawn(move || {
@@ -601,48 +638,6 @@ fn reap_tree(job: &cosca::Job) -> bool {
         Err(e) => {
             tracing::warn!("tearing down the process tree failed: {e}");
             false
-        }
-    }
-}
-
-// ── single-instance ────────────────────────────────────────────────────────────────
-
-/// Single-instance guard: a named mutex so only one agent binds the socket (the real fix
-/// for a concurrent double-launch, which the bind probe-connect alone can't close).
-#[cfg(windows)]
-struct SingleInstance {
-    handle: windows::Win32::Foundation::HANDLE,
-}
-
-#[cfg(windows)]
-impl SingleInstance {
-    fn acquire() -> anyhow::Result<SingleInstance> {
-        use windows::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastError};
-        use windows::Win32::System::Threading::CreateMutexW;
-        use windows::core::PCWSTR;
-        let name: Vec<u16> = "Global\\ssh-broker-agent"
-            .encode_utf16()
-            .chain(std::iter::once(0))
-            .collect();
-        unsafe {
-            let handle = CreateMutexW(None, true, PCWSTR(name.as_ptr()))?;
-            if GetLastError() == ERROR_ALREADY_EXISTS {
-                let _ = CloseHandle(handle);
-                anyhow::bail!("another ssh-broker agent is already running");
-            }
-            Ok(SingleInstance { handle })
-        }
-    }
-}
-
-#[cfg(windows)]
-impl Drop for SingleInstance {
-    fn drop(&mut self) {
-        use windows::Win32::Foundation::CloseHandle;
-        use windows::Win32::System::Threading::ReleaseMutex;
-        unsafe {
-            let _ = ReleaseMutex(self.handle);
-            let _ = CloseHandle(self.handle);
         }
     }
 }

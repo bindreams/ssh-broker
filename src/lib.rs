@@ -15,6 +15,8 @@
 pub mod acl;
 pub mod afunix;
 pub mod agent;
+#[cfg(windows)]
+pub mod agent_lock;
 pub mod cmdline;
 #[cfg(windows)]
 pub mod conpty;
