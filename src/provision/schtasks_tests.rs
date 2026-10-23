@@ -141,6 +141,26 @@ fn xml_is_group_logon_task_tolerates_case_and_whitespace_in_the_queried_form() {
     assert!(xml_is_group_logon_task(&queried));
 }
 
+#[test]
+fn agent_task_row_passes_for_the_group_task() {
+    let row = agent_task_row(&agent_task_xml(r"C:\x.exe"), true);
+    assert!(row.pass, "{}", row.detail);
+}
+
+#[test]
+fn agent_task_row_fails_for_a_legacy_per_user_task() {
+    let row = agent_task_row(&legacy_task_xml("DOMAIN\\someone"), true);
+    assert!(!row.pass);
+    assert!(row.detail.contains("apply"), "it says what to do: {}", row.detail);
+}
+
+#[test]
+fn agent_task_row_fails_when_the_task_is_not_registered() {
+    let row = agent_task_row("", false);
+    assert!(!row.pass);
+    assert!(row.detail.contains("registered=false"), "{}", row.detail);
+}
+
 // Task Scheduler itself (Elevated, CI only) ---------------------------------------------
 
 #[cfg(windows)]

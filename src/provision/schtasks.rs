@@ -12,6 +12,8 @@
 //! `RunLevel=LeastPrivilege` (not Highest) keeps the plain token: elevation would re-arm
 //! RedirectionGuard (breaking symlink-traversal parity) and not match the folder ACL.
 
+use super::report::Check;
+
 pub const AGENT_TASK: &str = "ssh-broker-agent";
 pub const SELFHEAL_TASK: &str = "ssh-broker-apply";
 
@@ -127,6 +129,20 @@ pub fn xml_is_group_logon_task(query_xml: &str) -> bool {
         .collect();
     let group = format!("<groupid>{}</groupid>", USERS_GROUP_SID.to_ascii_lowercase());
     squeezed.contains(&group) && (squeezed.contains("<logontrigger>") || squeezed.contains("<logontrigger/>"))
+}
+
+/// The `agent task` row of `verify`, from the query's output and whether the query succeeded.
+pub fn agent_task_row(query_xml: &str, query_ok: bool) -> Check {
+    let registered = parse_query_registered(query_xml, query_ok);
+    let group = xml_is_group_logon_task(query_xml);
+    let detail = if registered && !group {
+        "registered=true group_logon_task=false: a per-user task from an earlier install; run `apply` elevated to \
+         replace it"
+            .to_string()
+    } else {
+        format!("registered={registered} group_logon_task={group}")
+    };
+    Check::new("agent task", registered && group, detail)
 }
 
 #[cfg(test)]

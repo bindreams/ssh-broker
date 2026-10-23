@@ -19,6 +19,8 @@ pub mod schtasks;
 pub mod sessions;
 #[cfg(windows)]
 pub mod taskscheduler;
+#[cfg(windows)]
+pub(crate) mod user_rows;
 
 /// `apply` subcommand: idempotently assert all desired state. Windows-only.
 pub fn apply() -> anyhow::Result<()> {
@@ -90,7 +92,7 @@ mod provision_tests;
 #[cfg(windows)]
 mod imp {
     use super::layout::{self, Layout};
-    use super::{probe, registry, report, schtasks, sessions, taskscheduler};
+    use super::{probe, registry, report, schtasks, sessions, taskscheduler, user_rows};
     use crate::{afunix, shim};
     use anyhow::Context;
     use std::path::Path;
@@ -260,13 +262,7 @@ mod imp {
 
         // Local: the agent task is registered in its group form (any user, interactive session).
         let (agent_xml, agent_ok) = query_schtasks(&schtasks::query_task_argv(schtasks::AGENT_TASK));
-        let registered = schtasks::parse_query_registered(&agent_xml, agent_ok);
-        let group_task = schtasks::xml_is_group_logon_task(&agent_xml);
-        rows.push(report::Check::new(
-            "agent task",
-            registered && group_task,
-            format!("registered={registered} group_logon_task={group_task}"),
-        ));
+        rows.push(schtasks::agent_task_row(&agent_xml, agent_ok));
         // Informational: verify runs via the LeastPrivilege agent (non-elevated) and cannot
         // reliably query a SYSTEM-owned task, so this never gates verify (apply errors loudly
         // if registration fails, and the reboot self-heal is exercised in the Phase-8 test).
@@ -281,9 +277,19 @@ mod imp {
             },
         ));
 
-        // Local: the socket is reachable.
-        let reachable = crate::userdir::current_socket_location().is_ok_and(|loc| afunix::connect(&loc.path).is_ok());
-        rows.push(report::Check::new("socket reachable", reachable, String::new()));
+        // Per user: this account's socket, its folder and file ACLs, and whether its agent
+        // answers. `verify` reports on the account that runs it.
+        let location = crate::userdir::current_socket_location();
+        match crate::acl::Sid::current_user() {
+            Ok(user) => {
+                rows.push(user_rows::socket_location_row(&location));
+                rows.push(user_rows::socket_dir_row(&location, &user));
+                rows.push(user_rows::socket_file_row(&location, &user));
+            }
+            Err(e) => rows.push(report::Check::new("socket location", false, format!("{e:#}"))),
+        }
+        rows.push(user_rows::socket_reachable_row(&location));
+        rows.push(user_rows::other_users_row());
 
         // Through the agent: the real parity proof (run in session 1 by verify-probe). Bounded,
         // because the probe child blocks reading the upstream payload before it writes anything,
