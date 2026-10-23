@@ -37,15 +37,20 @@ use windows::Win32::Security::{
     PSECURITY_DESCRIPTOR, SecurityImpersonation, SetTokenInformation, TOKEN_ALL_ACCESS, TOKEN_DEFAULT_DACL,
     TOKEN_DUPLICATE, TOKEN_ELEVATION, TOKEN_QUERY, TokenDefaultDacl, TokenElevation, TokenImpersonation, TokenPrimary,
 };
+use windows::Win32::System::LibraryLoader::LoadLibraryW;
 use windows::Win32::System::Threading::{
-    CREATE_NO_WINDOW, CreateProcessWithTokenW, GetCurrentProcess, OpenProcessToken, PROCESS_INFORMATION, STARTUPINFOW,
-    SetThreadToken,
+    CREATE_NO_WINDOW, CREATE_SUSPENDED, CreateProcessWithTokenW, GetCurrentProcess, OpenProcessToken,
+    PROCESS_INFORMATION, ResumeThread, STARTUPINFOW, SetThreadToken, TerminateProcess,
 };
 use windows::Win32::UI::Shell::{CreateProfile, DeleteProfileW};
 use windows::core::{BOOL, PCWSTR, PWSTR};
 
 #[path = "common/bounded_wait.rs"]
 mod bounded_wait;
+#[path = "common/hard_errors.rs"]
+mod hard_errors;
+#[path = "common/pe_imports.rs"]
+mod pe_imports;
 #[path = "common/thread_stacks.rs"]
 mod thread_stacks;
 
@@ -177,7 +182,8 @@ impl Account {
 
     /// Run `exe` with `command_line` under this account's network-logon token, the way sshd runs
     /// its shell, with the CALLER's environment (so a stale `USERPROFILE` is in play). Returns the
-    /// exit code. A child still running after [`bounded_wait::CHILD_EXIT_BOUND`] fails the test
+    /// exit code. A loader failure of the child ends it with its NTSTATUS as the exit code (see
+    /// [`hard_errors`]) rather than a message box. A child still running after [`bounded_wait::CHILD_EXIT_BOUND`] fails the test
     /// with the process tree, thread stacks, this account's ssh-broker folder and `evidence` printed, and is killed.
     fn run(&self, exe: &Path, command_line: &str, cwd: &Path, evidence: &[PathBuf]) -> u32 {
         let network = self.network_token();
@@ -209,7 +215,7 @@ impl Account {
                 Default::default(),
                 PCWSTR(wide(&exe.to_string_lossy()).as_ptr()),
                 Some(PWSTR(command.as_mut_ptr())),
-                CREATE_NO_WINDOW,
+                CREATE_SUSPENDED | CREATE_NO_WINDOW,
                 None,
                 PCWSTR(wide(&cwd.to_string_lossy()).as_ptr()),
                 &startup,
@@ -222,7 +228,24 @@ impl Account {
             self.name, info.dwProcessId
         ));
         let process = OwnedHandle(info.hProcess);
-        let _thread = OwnedHandle(info.hThread);
+        let thread = OwnedHandle(info.hThread);
+        // Before its first instruction: a loader failure then ends the process, with the failing
+        // status as its exit code, instead of waiting on a message box that nobody can answer.
+        if let Err(e) = hard_errors::suppress_hard_error_boxes(process.0) {
+            // SAFETY: the handle is the live process this function just created.
+            let _ = unsafe { TerminateProcess(process.0, 1) };
+            panic!("switch off the hard-error boxes of {exe:?} as {}: {e}", self.name);
+        }
+        // SAFETY: the handle is the primary thread of the process just created.
+        if unsafe { ResumeThread(thread.0) } == u32::MAX {
+            // SAFETY: as above.
+            let _ = unsafe { TerminateProcess(process.0, 1) };
+            panic!(
+                "resume {exe:?} as {}: {}",
+                self.name,
+                windows::core::Error::from_thread()
+            );
+        }
         let mut evidence = evidence.to_vec();
         if let Some(profile) = &self.profile {
             evidence.push(profile.join("AppData").join("Local").join("ssh-broker"));
@@ -235,7 +258,7 @@ impl Account {
             bounded_wait::CHILD_EXIT_BOUND,
             &evidence,
         );
-        note(format_args!("{what} exited with {code}"));
+        note(format_args!("{what} exited with {}", hard_errors::describe_exit(code)));
         code
     }
 }
@@ -734,6 +757,116 @@ fn a_child_that_never_exits_is_reported_and_its_tree_killed() {
 }
 
 #[test]
+fn a_suspended_child_has_its_hard_error_boxes_suppressed() {
+    use std::os::windows::io::AsRawHandle;
+    use std::os::windows::process::CommandExt;
+    use std::process::Stdio;
+
+    // Suspended, so it never runs and never opens anything. CREATE_DEFAULT_ERROR_MODE gives it
+    // the system default, whatever this process's mode is.
+    let mut child = Command::new("cmd.exe")
+        .creation_flags(0x0000_0004 | CREATE_NO_WINDOW.0 | 0x0400_0000)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let process = HANDLE(child.as_raw_handle());
+
+    let before = hard_errors::raises_hard_error_boxes(process);
+    hard_errors::suppress_hard_error_boxes(process).unwrap();
+    let after = hard_errors::raises_hard_error_boxes(process);
+    child.kill().unwrap();
+    child.wait().unwrap();
+
+    assert!(before, "control: a default child raises hard-error boxes");
+    assert!(!after, "the child no longer raises hard-error boxes");
+}
+
+#[test]
+fn the_import_list_of_this_binary_names_its_dlls() {
+    let imports = pe_imports::imports(&std::env::current_exe().unwrap()).unwrap();
+
+    assert!(
+        imports.iter().any(|name| name.eq_ignore_ascii_case("kernel32.dll")),
+        "{imports:?}"
+    );
+    assert!(
+        imports.iter().all(|name| name.to_ascii_lowercase().ends_with(".dll")),
+        "{imports:?}"
+    );
+}
+
+#[test]
+fn a_loader_status_in_an_exit_code_is_named() {
+    assert_eq!(hard_errors::describe_exit(0), "0");
+    assert_eq!(hard_errors::describe_exit(1), "1");
+    assert_eq!(
+        hard_errors::describe_exit(0xC000_0135),
+        "0xc0000135 (STATUS_DLL_NOT_FOUND)"
+    );
+    assert_eq!(hard_errors::describe_exit(0xC123_4567), "0xc1234567");
+}
+
+/// Child half of the import check in [`shim_as_bob_never_reaches_another_users_listener`]: runs
+/// only from the shared directory with an `imports.txt` (one DLL name per line) beside the
+/// binary, as bob. Loads each name the way the loader would for an import and writes one line per
+/// name to `probe.txt`; fails if any did not load.
+#[test]
+fn child_loads_every_import_it_is_given() {
+    let Some(exe_dir) = std::env::current_exe().unwrap().parent().map(Path::to_path_buf) else {
+        return;
+    };
+    let Ok(names) = std::fs::read_to_string(exe_dir.join("imports.txt")) else {
+        return; // not started as the child
+    };
+    let mut report = String::new();
+    let mut failed = false;
+    for name in names.lines() {
+        // SAFETY: NUL-terminated name. The module stays loaded; this process is short-lived.
+        match unsafe { LoadLibraryW(PCWSTR(wide(name).as_ptr())) } {
+            Ok(_) => report.push_str(&format!(
+                "{name}: loaded
+"
+            )),
+            Err(e) => {
+                failed = true;
+                report.push_str(&format!(
+                    "{name}: FAILED {e}
+"
+                ));
+            }
+        }
+    }
+    std::fs::write(exe_dir.join("probe.txt"), &report).unwrap();
+    assert!(!failed, "{report}");
+}
+
+#[test]
+fn a_loader_failure_as_bob_ends_the_process_with_its_status_and_no_message_box() {
+    let bob = Account::create("ldr", false);
+    let shared = SharedDir::new("ldr");
+    // A copy of the shim that imports a DLL that does not exist: the loader cannot start it.
+    let broken = shared.0.join("broken.exe");
+    let mut image = std::fs::read(env!("CARGO_BIN_EXE_ssh-broker")).unwrap();
+    let (from, to) = (b"wtsapi32.dll ", b"wtsapi99.dll ");
+    let at = image
+        .windows(from.len())
+        .position(|w| w == from)
+        .expect("the shim imports wtsapi32.dll");
+    image[at..at + to.len()].copy_from_slice(to);
+    std::fs::write(&broken, &image).unwrap();
+
+    let code = bob.run(&broken, &format!("\"{}\"", broken.display()), &shared.0, &[]);
+
+    assert_eq!(
+        hard_errors::describe_exit(code),
+        hard_errors::describe_exit(0xC000_0135),
+        "the loader ended the process with STATUS_DLL_NOT_FOUND"
+    );
+}
+
+#[test]
 fn shim_as_bob_never_reaches_another_users_listener() {
     // The administrator's agent is listening, and bob may open its socket. An administrator who
     // SSHes in as bob gets bob's shim, which looks in bob's profile, finds nothing, and fails
@@ -770,6 +903,34 @@ fn shim_as_bob_never_reaches_another_users_listener() {
     let shared = SharedDir::new("shim");
     let shim = shared.0.join("ssh-broker.exe");
     std::fs::copy(env!("CARGO_BIN_EXE_ssh-broker"), &shim).unwrap();
+    // A loader failure of the shim names no DLL, so first load each of its imports as bob.
+    let probe = shared.0.join("isolation.exe");
+    std::fs::copy(std::env::current_exe().unwrap(), &probe).unwrap();
+    std::fs::write(
+        shared.0.join("imports.txt"),
+        pe_imports::imports(&shim).unwrap().join(
+            "
+",
+        ),
+    )
+    .unwrap();
+    let probe_code = bob.run(
+        &probe,
+        &format!(
+            "\"{}\" --exact child_loads_every_import_it_is_given --nocapture",
+            probe.display()
+        ),
+        &shared.0,
+        &[],
+    );
+    let probe_report =
+        std::fs::read_to_string(shared.0.join("probe.txt")).unwrap_or_else(|e| format!("(no probe.txt: {e})"));
+    assert!(
+        probe_code == 0,
+        "bob cannot load every import of the shim (probe exit {}):
+{probe_report}",
+        hard_errors::describe_exit(probe_code)
+    );
     // Shaped like a non-PTY sshd session, which the shim tells from a PTY one by its stdin: a
     // console stdin (what `run` gives a process) makes it keep the quotes around the command, and
     // `"cmd.exe /c echo shim-ran"` names no program. So stdin is NUL. The redirections come first
@@ -799,7 +960,15 @@ fn shim_as_bob_never_reaches_another_users_listener() {
 
     let evidence = ["progress.txt", "env.txt", "out.txt", "err.txt"].map(|name| shared.0.join(name));
     let code = bob.run(&cmd, &command, &shared.0, &evidence);
-    assert_eq!(code, 0, "the fail-open command ran");
+    assert!(
+        code == 0,
+        "the fail-open command ran; the shim run ended with {}
+shim: {}
+shared directory: {}",
+        hard_errors::describe_exit(code),
+        icacls_report(&shim),
+        icacls_report(&shared.0)
+    );
 
     let stderr = std::fs::read_to_string(shared.0.join("err.txt")).unwrap();
     let stdout = std::fs::read_to_string(shared.0.join("out.txt")).unwrap();

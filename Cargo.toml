@@ -61,4 +61,6 @@ windows = { version = "0.62.2", features = [
     "Win32_System_Diagnostics_Debug",        # StackWalk64: tests/common/thread_stacks.rs shows where a hung child is blocked
     "Win32_System_Diagnostics_ToolHelp",     # process and thread lists for the same
     "Win32_System_Kernel",                   # the CONTEXT that GetThreadContext fills
+    "Wdk_System_Threading",                  # ProcessDefaultHardErrorMode: tests/common/hard_errors.rs makes a child's loader failure exit instead of raise a message box
+    "Win32_System_LibraryLoader",            # LoadLibraryW: tests/user_isolation_windows.rs loads each import of the shim as bob
 ] }
