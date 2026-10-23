@@ -146,58 +146,7 @@ fn xml_is_group_logon_task_tolerates_case_and_whitespace_in_the_queried_form() {
 #[cfg(windows)]
 mod service {
     use super::*;
-    use crate::test_support::assert_elevated;
-    use std::process::Command;
-
-    /// A uniquely named throwaway task, deleted when dropped.
-    struct Throwaway(String);
-
-    impl Throwaway {
-        fn new(tag: &str) -> Throwaway {
-            assert_elevated();
-            Throwaway(format!("ssh-broker-test-{tag}-{}", std::process::id()))
-        }
-
-        fn register(&self, xml: &str) {
-            let file = std::env::temp_dir().join(format!("{}.xml", self.0));
-            std::fs::write(&file, xml_file_bytes(xml)).unwrap();
-            let out = Command::new("schtasks")
-                .args(create_from_xml_argv(&self.0, &file.to_string_lossy()))
-                .output()
-                .unwrap();
-            let _ = std::fs::remove_file(&file);
-            assert!(
-                out.status.success(),
-                "schtasks /Create failed: {}{}",
-                String::from_utf8_lossy(&out.stdout),
-                String::from_utf8_lossy(&out.stderr)
-            );
-        }
-
-        fn queried_xml(&self) -> String {
-            let out = Command::new("schtasks")
-                .args(query_task_argv(&self.0))
-                .output()
-                .unwrap();
-            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-            // A redirected `schtasks` may emit UTF-16 or the console code page.
-            let bytes = out.stdout;
-            if bytes.starts_with(&[0xFF, 0xFE]) {
-                let (pairs, _) = bytes[2..].as_chunks::<2>();
-                String::from_utf16_lossy(&pairs.iter().copied().map(u16::from_le_bytes).collect::<Vec<_>>())
-            } else {
-                String::from_utf8_lossy(&bytes).into_owned()
-            }
-        }
-    }
-
-    impl Drop for Throwaway {
-        fn drop(&mut self) {
-            let _ = Command::new("schtasks")
-                .args(["/Delete", "/TN", &self.0, "/F"])
-                .output();
-        }
-    }
+    use crate::test_support::ThrowawayTask as Throwaway;
 
     /// Elevated (CI only).
     #[test]

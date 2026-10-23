@@ -16,6 +16,8 @@ pub mod probe;
 pub mod registry;
 pub mod report;
 pub mod schtasks;
+#[cfg(windows)]
+pub mod taskscheduler;
 
 /// `apply` subcommand: idempotently assert all desired state. Windows-only.
 pub fn apply() -> anyhow::Result<()> {

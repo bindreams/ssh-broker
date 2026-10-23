@@ -2,6 +2,7 @@
 //! stand-in profile directory.
 
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::socket_loc::{SOCKET_DIR_NAME, SOCKET_FILE_NAME, SocketLocation};
@@ -130,4 +131,59 @@ pub fn assert_elevated() {
         elevated,
         "this test needs an elevated administrator (CI runs it); not running it here"
     );
+}
+
+// Scheduled tasks -----
+
+use crate::provision::schtasks::{create_from_xml_argv, query_task_argv, xml_file_bytes};
+
+/// A uniquely named throwaway scheduled task, deleted when dropped. Elevated tests only: `new`
+/// refuses to run anywhere else, before it touches the Task Scheduler.
+pub struct ThrowawayTask(pub String);
+
+impl ThrowawayTask {
+    pub fn new(tag: &str) -> ThrowawayTask {
+        assert_elevated();
+        ThrowawayTask(format!("ssh-broker-test-{tag}-{}", std::process::id()))
+    }
+
+    pub fn register(&self, xml: &str) {
+        let file = std::env::temp_dir().join(format!("{}.xml", self.0));
+        std::fs::write(&file, xml_file_bytes(xml)).unwrap();
+        let out = Command::new("schtasks")
+            .args(create_from_xml_argv(&self.0, &file.to_string_lossy()))
+            .output()
+            .unwrap();
+        let _ = std::fs::remove_file(&file);
+        assert!(
+            out.status.success(),
+            "schtasks /Create failed: {}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    pub fn queried_xml(&self) -> String {
+        let out = Command::new("schtasks")
+            .args(query_task_argv(&self.0))
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        // A redirected `schtasks` may emit UTF-16 or the console code page.
+        let bytes = out.stdout;
+        if bytes.starts_with(&[0xFF, 0xFE]) {
+            let (pairs, _) = bytes[2..].as_chunks::<2>();
+            String::from_utf16_lossy(&pairs.iter().copied().map(u16::from_le_bytes).collect::<Vec<_>>())
+        } else {
+            String::from_utf8_lossy(&bytes).into_owned()
+        }
+    }
+}
+
+impl Drop for ThrowawayTask {
+    fn drop(&mut self) {
+        let _ = Command::new("schtasks")
+            .args(["/Delete", "/TN", &self.0, "/F"])
+            .output();
+    }
 }
