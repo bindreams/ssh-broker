@@ -322,6 +322,10 @@ fn try_relay_connects_to_the_location_its_provider_names() {
 
     let relayed = super::try_relay(&Some("echo hi".into()), || Ok(location)).unwrap();
 
-    assert_eq!(relayed, Some(7), "the shim reached the listener at the provided location");
+    assert_eq!(
+        relayed,
+        Some(7),
+        "the shim reached the listener at the provided location"
+    );
     assert_eq!(agent.join().unwrap().command.as_deref(), Some("echo hi"));
 }

@@ -149,8 +149,14 @@ fn session_slot_is_released_on_drop() {
 #[test]
 fn session_slots_of_different_sessions_do_not_conflict() {
     let dir = TempLock::new("slot-x");
-    let _a = SessionSlot::try_acquire(&dir.0.join("session-1.lock")).unwrap().unwrap();
-    assert!(SessionSlot::try_acquire(&dir.0.join("session-2.lock")).unwrap().is_some());
+    let _a = SessionSlot::try_acquire(&dir.0.join("session-1.lock"))
+        .unwrap()
+        .unwrap();
+    assert!(
+        SessionSlot::try_acquire(&dir.0.join("session-2.lock"))
+            .unwrap()
+            .is_some()
+    );
 }
 
 #[test]
@@ -158,7 +164,10 @@ fn a_foreign_object_in_the_session_namespace_cannot_take_the_slot() {
     // The slot used to be the named mutex `Local\ssh-broker-agent`, which any process in the
     // session can create first, whatever account it runs as. It is now a lock on a file in the
     // user's verified folder, so a mutex of that old name means nothing to it.
-    let wide: Vec<u16> = r"Local\ssh-broker-agent".encode_utf16().chain(std::iter::once(0)).collect();
+    let wide: Vec<u16> = r"Local\ssh-broker-agent"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
     // SAFETY: `wide` is NUL-terminated and outlives the call; the handle is closed below.
     let squatter = unsafe { CreateMutexW(None, true, PCWSTR(wide.as_ptr())) }.unwrap();
 

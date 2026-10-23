@@ -319,7 +319,10 @@ fn prepare_in_changes_nothing_when_agents_cannot_be_stopped_for_an_update() {
 
     let err = format!(
         "{:#}",
-        prepare_in(&forged(&layout), &source, Some(&group), || anyhow::bail!("access denied")).unwrap_err()
+        prepare_in(&forged(&layout), &source, Some(&group), || anyhow::bail!(
+            "access denied"
+        ))
+        .unwrap_err()
     );
 
     assert!(err.contains("access denied"), "{err}");
