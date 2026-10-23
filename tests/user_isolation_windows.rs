@@ -35,11 +35,14 @@ use windows::Win32::Security::{
     TokenElevation, TokenImpersonation, TokenPrimary,
 };
 use windows::Win32::System::Threading::{
-    CREATE_NO_WINDOW, CreateProcessWithTokenW, GetCurrentProcess, GetExitCodeProcess, INFINITE, OpenProcessToken,
-    PROCESS_INFORMATION, STARTUPINFOW, SetThreadToken, WaitForSingleObject,
+    CREATE_NO_WINDOW, CreateProcessWithTokenW, GetCurrentProcess, OpenProcessToken, PROCESS_INFORMATION, STARTUPINFOW,
+    SetThreadToken,
 };
 use windows::Win32::UI::Shell::{CreateProfile, DeleteProfileW};
 use windows::core::{BOOL, PCWSTR, PWSTR};
+
+#[path = "common/bounded_wait.rs"]
+mod bounded_wait;
 
 // Fixture ---------------------------------------------------------------------------------
 
@@ -169,8 +172,9 @@ impl Account {
 
     /// Run `exe` with `command_line` under this account's network-logon token, the way sshd runs
     /// its shell, with the CALLER's environment (so a stale `USERPROFILE` is in play). Returns the
-    /// exit code.
-    fn run(&self, exe: &Path, command_line: &str, cwd: &Path) -> u32 {
+    /// exit code. A child still running after [`bounded_wait::CHILD_EXIT_BOUND`] fails the test
+    /// with the process tree, this account's ssh-broker logs and `evidence` printed, and is killed.
+    fn run(&self, exe: &Path, command_line: &str, cwd: &Path, evidence: &[PathBuf]) -> u32 {
         let network = self.network_token();
         let mut primary = HANDLE::default();
         // SAFETY: valid in/out handles.
@@ -208,16 +212,25 @@ impl Account {
             )
         }
         .unwrap_or_else(|e| panic!("start {exe:?} as {}: {e}", self.name));
-        note(format_args!("started {exe:?} as {}", self.name));
+        note(format_args!(
+            "started {exe:?} as {} (pid {})",
+            self.name, info.dwProcessId
+        ));
         let process = OwnedHandle(info.hProcess);
         let _thread = OwnedHandle(info.hThread);
-        let mut code = 0u32;
-        // SAFETY: the process handle is ours; INFINITE waits for the child itself to exit.
-        unsafe {
-            WaitForSingleObject(process.0, INFINITE);
-            GetExitCodeProcess(process.0, &mut code).unwrap();
+        let mut evidence = evidence.to_vec();
+        if let Some(profile) = &self.profile {
+            evidence.push(profile.join("AppData").join("Local").join("ssh-broker").join("logs"));
         }
-        note(format_args!("{exe:?} as {} exited with {code}", self.name));
+        let what = format!("{exe:?} as {}", self.name);
+        let code = bounded_wait::wait_for_exit(
+            process.0,
+            info.dwProcessId,
+            &what,
+            bounded_wait::CHILD_EXIT_BOUND,
+            &evidence,
+        );
+        note(format_args!("{what} exited with {code}"));
         code
     }
 }
@@ -267,6 +280,21 @@ fn icacls_report(path: &Path) -> String {
     match Command::new("icacls").arg(path).output() {
         Ok(out) => String::from_utf8_lossy(&out.stdout).trim().to_owned(),
         Err(e) => format!("icacls did not run: {e}"),
+    }
+}
+
+/// The owner and DACL of `path` as SDDL (inherited ACEs carry `ID`), for an assertion message.
+fn sddl_report(path: &Path) -> String {
+    let script = format!(
+        "(Get-Acl -LiteralPath '{}').Sddl",
+        path.display().to_string().replace('\'', "''")
+    );
+    match Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .output()
+    {
+        Ok(out) => String::from_utf8_lossy(&out.stdout).trim().to_owned(),
+        Err(e) => format!("powershell did not run: {e}"),
     }
 }
 
@@ -413,12 +441,23 @@ fn a_permissive_default_dacl_is_in_effect_where_nothing_is_inherited() {
     let file = plain.join("born.txt");
     with_permissive_default_dacl(|| std::fs::write(&file, "x").unwrap());
 
-    assert!(
-        !acl::verify_file_acl(&file, &me).unwrap(),
-        "a file made under a permissive default DACL, in a directory that passes nothing down, is not exact\n\
-         the file: {}\nits directory: {}",
+    let exact = acl::verify_file_acl(&file, &me).unwrap();
+    let report = format!(
+        "the file: {}\nits SDDL: {}\nits directory: {}\nits SDDL: {}",
         icacls_report(&file),
-        icacls_report(&plain)
+        sddl_report(&file),
+        icacls_report(&plain),
+        sddl_report(&plain)
+    );
+    if exact {
+        // Past libtest's capture, so the evidence survives a run that never prints failures.
+        note(format_args!(
+            "the control file is exact, which it must not be\n{report}"
+        ));
+    }
+    assert!(
+        !exact,
+        "a file made under a permissive default DACL, in a directory that passes nothing down, is not exact\n{report}"
     );
 }
 
@@ -574,9 +613,51 @@ fn bob_cannot_connect_to_a_socket_in_another_users_dir() {
         exe.display()
     );
 
-    let code = bob.run(&exe, &command, &shared.0);
+    let code = bob.run(&exe, &command, &shared.0, &[]);
 
     assert_eq!(code, 0, "the child, running as bob, failed: see its output above");
+}
+
+#[test]
+fn a_child_that_never_exits_is_reported_and_its_tree_killed() {
+    use std::os::windows::io::AsRawHandle;
+    use std::os::windows::process::CommandExt;
+    use std::process::Stdio;
+
+    let evidence = std::env::temp_dir().join(format!("sb-iso-bounded-{}.txt", std::process::id()));
+    std::fs::write(&evidence, "left-behind-marker").unwrap();
+    // cmd.exe runs ping.exe, so the tree has a grandchild; the ping outlives any test run.
+    let mut child = Command::new("cmd.exe")
+        .args(["/c", "ping -n 600 127.0.0.1 >nul"])
+        .creation_flags(CREATE_NO_WINDOW.0)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        bounded_wait::wait_for_exit(
+            HANDLE(child.as_raw_handle()),
+            child.id(),
+            "the ping tree",
+            std::time::Duration::from_secs(3),
+            std::slice::from_ref(&evidence),
+        )
+    }));
+    let payload = outcome.expect_err("a child that never exits must fail the wait");
+    let message = payload.downcast_ref::<String>().cloned().unwrap_or_default();
+    let _ = std::fs::remove_file(&evidence);
+
+    assert!(message.contains("the ping tree"), "names what was awaited: {message}");
+    assert!(message.contains("did not exit within"), "{message}");
+    assert!(
+        message.to_lowercase().contains("ping.exe"),
+        "lists the grandchild: {message}"
+    );
+    assert!(message.contains("left-behind-marker"), "prints the evidence: {message}");
+    // Killed: this returns instead of waiting out the 600 pings.
+    child.wait().unwrap();
 }
 
 #[test]
@@ -620,21 +701,31 @@ fn shim_as_bob_never_reaches_another_users_listener() {
     // console stdin (what `run` gives a process) makes it keep the quotes around the command, and
     // `"cmd.exe /c echo shim-ran"` names no program. So stdin is NUL. The redirections come first
     // because `cmd` leaves the space before a trailing one in the command line the shim reads.
+    // `progress.txt` and `env.txt` are for a run that hangs: the failure report prints them.
     let script = shared.0.join("run.cmd");
+    let progress = shared.0.join("progress.txt");
     std::fs::write(
         &script,
         format!(
-            "@echo off\r\n<nul >\"{}\" 2>\"{}\" \"{}\" -c \"cmd.exe /c echo shim-ran\"\r\n",
-            shared.0.join("out.txt").display(),
-            shared.0.join("err.txt").display(),
-            shim.display(),
+            "@echo off\r\n\
+             >>\"{progress}\" echo script started\r\n\
+             >\"{env}\" set\r\n\
+             >>\"{progress}\" echo starting the shim\r\n\
+             <nul >\"{out}\" 2>\"{err}\" \"{shim}\" -c \"cmd.exe /c echo shim-ran\"\r\n\
+             >>\"{progress}\" echo the shim exited with %ERRORLEVEL%\r\n",
+            progress = progress.display(),
+            env = shared.0.join("env.txt").display(),
+            out = shared.0.join("out.txt").display(),
+            err = shared.0.join("err.txt").display(),
+            shim = shim.display(),
         ),
     )
     .unwrap();
     let cmd = Path::new(&std::env::var_os("SystemRoot").unwrap()).join(r"System32\cmd.exe");
     let command = format!("\"{}\" /c \"{}\"", cmd.display(), script.display());
 
-    let code = bob.run(&cmd, &command, &shared.0);
+    let evidence = ["progress.txt", "env.txt", "out.txt", "err.txt"].map(|name| shared.0.join(name));
+    let code = bob.run(&cmd, &command, &shared.0, &evidence);
     assert_eq!(code, 0, "the fail-open command ran");
 
     let stderr = std::fs::read_to_string(shared.0.join("err.txt")).unwrap();
