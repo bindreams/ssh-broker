@@ -181,7 +181,7 @@ impl Sid {
     }
 
     /// The SID in SDDL string form ("S-1-5-…"), for embedding in a security descriptor.
-    fn to_sddl(&self) -> anyhow::Result<String> {
+    pub fn to_sddl(&self) -> anyhow::Result<String> {
         sid_to_string(self.as_psid())
     }
 }
