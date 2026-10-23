@@ -1,15 +1,14 @@
 //! provision: self-install (`apply`) and self-check (`verify`) — the DefaultShell values, the
-//! session-1 agent logon task, the ONSTART self-heal task, the socket dir + ACL, and parity
-//! probes (DPAPI/symlink/session) run THROUGH the agent.
+//! agent logon task (one agent per logged-on user), the ONSTART self-heal task, and parity
+//! probes (DPAPI/symlink/session) run THROUGH the invoking user's agent.
 //!
-//! The pure, host-tested logic lives in the submodules (config/registry/schtasks/probe/report);
-//! this root holds the Windows orchestration. `apply` is ordered so a partial run never bricks
-//! SSH (the DefaultShell registry flip is LAST, after the socket dir is bindable and the exe is
-//! proven present), and resolves the ACL grantee BY NAME so a SYSTEM-run self-heal grants the
-//! same account the agent binds as.
+//! The pure, host-tested logic lives in the submodules (registry/schtasks/probe/report); this root
+//! holds the Windows orchestration. `apply` is ordered so a partial run never bricks SSH (the
+//! DefaultShell registry flip is LAST, after the exe is proven present). It knows no user: each
+//! agent makes and hardens its own socket directory in its own profile, so a SYSTEM-run
+//! self-heal has nothing to resolve.
 
 pub mod bounded;
-pub mod config;
 #[cfg(windows)]
 pub(crate) mod layout;
 pub mod probe;
@@ -44,6 +43,32 @@ pub fn verify_probe() -> anyhow::Result<()> {
     anyhow::bail!("verify-probe runs only on Windows");
 }
 
+/// Check the arguments after `apply`, returning the warnings to print.
+///
+/// `apply` takes none. The one exception is the removed `--user <name>`: an earlier build baked
+/// it into the boot-time self-heal task, and during a half-done migration that task runs the new
+/// exe with it. Refusing would leave the install unrepaired by the very task that exists to
+/// repair it, so it is accepted, ignored, and reported.
+pub fn check_apply_args(args: &[String]) -> anyhow::Result<Vec<String>> {
+    let mut warnings = Vec::new();
+    let mut rest = args.iter().peekable();
+    while let Some(arg) = rest.next() {
+        if arg == "--user" {
+            // Its value is part of the flag, not an argument of its own.
+            if rest.peek().is_some_and(|value| !value.starts_with('-')) {
+                rest.next();
+            }
+            warnings.push(
+                "apply: --user is ignored: ssh-broker runs one agent per logged-on user and has no target account"
+                    .to_string(),
+            );
+        } else {
+            anyhow::bail!("apply takes no arguments, got {arg:?}");
+        }
+    }
+    Ok(warnings)
+}
+
 /// The directory `apply` installs into. The one place the path is written; [`layout::Layout`]
 /// derives from it.
 pub const BASE_DIR: &str = r"C:\ProgramData\ssh-broker";
@@ -56,41 +81,17 @@ pub fn canonical_exe() -> std::path::PathBuf {
     std::path::Path::new(BASE_DIR).join(EXE_NAME)
 }
 
+#[cfg(test)]
+#[path = "provision_tests.rs"]
+mod provision_tests;
+
 #[cfg(windows)]
 mod imp {
     use super::layout::{self, Layout};
-    use super::{probe, registry, report, schtasks};
+    use super::{probe, registry, report, schtasks, taskscheduler};
     use crate::{afunix, shim};
     use anyhow::Context;
     use std::path::Path;
-
-    /// The interactive user running `apply` (lowest-precedence fallback). Returns None for a
-    /// service identity — `apply` may run as SYSTEM (the ONSTART self-heal), and the agent's
-    /// ACL grantee must be the real auto-login user, NEVER SYSTEM (which would brick the bind
-    /// gate). When this yields None under SYSTEM with no `--user`/config, resolution fails loudly.
-    fn current_user_name() -> Option<String> {
-        let name = std::env::var("USERNAME").ok()?;
-        let upper = name.to_ascii_uppercase();
-        if name.is_empty()
-            || upper == "SYSTEM"
-            || upper.ends_with('$') // machine account, e.g. MACHINE$
-            || upper == "LOCAL SERVICE"
-            || upper == "NETWORK SERVICE"
-        {
-            return None;
-        }
-        Some(name)
-    }
-
-    /// `--user <name>` from argv (baked into the SYSTEM ONSTART self-heal task's command).
-    fn arg_user() -> Option<String> {
-        let args: Vec<String> = std::env::args().collect();
-        args.iter()
-            .position(|a| a == "--user")
-            .and_then(|i| args.get(i + 1))
-            .filter(|s| !s.is_empty())
-            .cloned()
-    }
 
     /// Case-insensitive compare of a registry path string (quotes trimmed) to a path.
     fn eq_path(a: &str, b: &Path) -> bool {
@@ -100,14 +101,23 @@ mod imp {
     pub fn apply() -> anyhow::Result<()> {
         let layout = Layout::production();
 
-        // 0. Resolve the target account BY NAME (CLI --user > saved config > interactive user),
-        //    failing loudly rather than guessing from a SYSTEM token. The install
-        //    directory is gated first, so a planted one is never adopted.
-        // 1. Install this exe to a STABLE path and fill the base (see layout::populate). Everything
-        //    registers the canonical path: a temp path would brick SSH the instant it is deleted;
-        //    the shim's fail-open can't help if sshd execs a missing binary.
+        // 0. `apply` takes no arguments. A removed `--user` (still in an old self-heal task) is
+        //    warned about and ignored.
+        let args: Vec<String> = std::env::args().skip(2).collect();
+        for warning in super::check_apply_args(&args)? {
+            eprintln!("{warning}");
+        }
+
+        // 1. Install this exe to a STABLE path (see layout::prepare). Everything registers the
+        //    canonical path: a temp path would brick SSH the instant it is deleted; the shim's
+        //    fail-open can't help if sshd execs a missing binary. The install directory is gated
+        //    first, so a planted one is never adopted, and a single-user install is replaced.
         let current = std::env::current_exe().context("current_exe")?;
-        let (user, exe) = layout::prepare(&layout, &current, arg_user().as_deref(), current_user_name().as_deref())?;
+        let (agent_xml, agent_ok) = query_schtasks(&schtasks::query_task_argv(schtasks::AGENT_TASK));
+        let registered_xml = schtasks::parse_query_registered(&agent_xml, agent_ok).then_some(agent_xml);
+        let exe = layout::prepare(&layout, &current, registered_xml.as_deref(), || {
+            taskscheduler::stop_instances(schtasks::AGENT_TASK)
+        })?;
 
         // 2. Register both tasks (idempotent /F).
         register_agent_task(&layout, &exe)?;
@@ -132,7 +142,7 @@ mod imp {
             eprintln!("apply: agent task registered but immediate start failed: {e}");
         }
         println!(
-            "apply: ok — DefaultShell -> {}, agent + self-heal tasks installed for {user}",
+            "apply: ok — DefaultShell -> {}, agent + self-heal tasks installed",
             exe.display()
         );
         Ok(())
@@ -231,9 +241,6 @@ mod imp {
         rows.push(registry::escape_arguments_check(registry::escape_arguments_under(
             registry::OPENSSH_KEY,
         )));
-
-        // Local: the socket dir ACL verifies for the configured account (== the agent's grantee).
-        rows.push(layout::socket_dir_row(&base));
 
         // Local: the agent task is registered in its group form (any user, interactive session).
         let (agent_xml, agent_ok) = query_schtasks(&schtasks::query_task_argv(schtasks::AGENT_TASK));

@@ -1,7 +1,7 @@
 use super::*;
-use crate::acl::{self, Sid};
-use crate::provision::config::Config;
-use crate::test_support::{FILE_ALL, FILE_READ_EXECUTE, aces, dacl_sddl};
+use crate::acl;
+use crate::provision::schtasks::agent_task_xml;
+use crate::test_support::{FILE_READ_EXECUTE, aces, dacl_sddl};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// A not-yet-created base directory under the temp dir that is removed on drop.
@@ -45,16 +45,19 @@ fn names_in(dir: &Path) -> Vec<String> {
     names
 }
 
-fn config_for(user: &str) -> String {
-    Config {
-        target_user: user.into(),
-    }
-    .to_toml()
-    .unwrap()
-}
+/// The queried XML of an agent task an earlier build registered: one account, no group.
+const LEGACY_TASK_XML: &str = r#"<Task><Principals><Principal id="Author"><UserId>DOM\someone</UserId>
+<LogonType>InteractiveToken</LogonType></Principal></Principals></Task>"#;
 
-fn plant_config(base: &TempBase, user: &str) {
-    std::fs::write(base.0.join("config.toml"), config_for(user)).unwrap();
+/// What a single-user install left in the install directory.
+fn plant_legacy(base: &TempBase) {
+    std::fs::write(base.0.join("config.toml"), "target_user = \"someone\"\n").unwrap();
+    let socket_dir = base.0.join("s");
+    std::fs::create_dir(&socket_dir).unwrap();
+    // A real AF_UNIX socket file, which is a reparse point, as the old agent left it.
+    let sock = socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None).unwrap();
+    sock.bind(&socket2::SockAddr::unix(socket_dir.join("a.sock")).unwrap())
+        .unwrap();
 }
 
 // The trust gate ------------------------------------------------------------------------
@@ -73,6 +76,7 @@ fn ensure_base_writes_nothing_into_a_hostile_preexisting_base() {
 #[test]
 fn check_base_gives_the_reason_for_an_untrusted_directory() {
     let base = TempBase::existing("check");
+
     let layout = base.layout();
 
     let reason = check_base(&layout).expect_err("a default directory is untrusted");
@@ -110,181 +114,211 @@ fn trusted_base_gate_does_not_run_the_action_on_an_untrusted_base() {
     assert!(ran.get());
 }
 
-// The saved account -----------------------------------------------------------------------
+// Legacy detection ------------------------------------------------------------------------
 
 #[test]
-fn saved_user_is_none_when_there_is_no_config() {
-    let base = TempBase::existing("saved-none");
+fn a_clean_base_has_no_legacy_artifacts() {
+    let base = TempBase::existing("legacy-clean");
     let layout = base.layout();
-
-    assert_eq!(saved_user(&forged(&layout)).unwrap(), None);
+    let found = legacy_artifacts(&forged(&layout), None);
+    assert!(!found.any());
+    let found = legacy_artifacts(&forged(&layout), Some(&agent_task_xml(r"C:\x.exe")));
+    assert!(!found.any(), "the group-form task is the current one, not a legacy one");
 }
 
 #[test]
-fn saved_user_reads_the_config() {
-    let base = TempBase::existing("saved");
-    plant_config(&base, "saved-user");
-    let layout = base.layout();
-
-    assert_eq!(saved_user(&forged(&layout)).unwrap().as_deref(), Some("saved-user"));
+fn legacy_is_detected_from_the_config_alone() {
+    let base = TempBase::existing("legacy-config");
+    std::fs::write(base.0.join("config.toml"), "x").unwrap();
+    let found = legacy_artifacts(&forged(&base.layout()), None);
+    assert!(found.any() && found.config && !found.socket_dir && !found.task);
 }
 
 #[test]
-fn saved_user_is_an_error_for_a_malformed_config() {
-    let base = TempBase::existing("saved-bad");
-    std::fs::write(base.0.join("config.toml"), "target_user = [").unwrap();
-    let layout = base.layout();
-
-    let err = format!("{:#}", saved_user(&forged(&layout)).unwrap_err());
-
-    assert!(err.contains("config.toml"), "{err}");
+fn legacy_is_detected_from_the_socket_dir_alone() {
+    let base = TempBase::existing("legacy-sdir");
+    std::fs::create_dir(base.0.join("s")).unwrap();
+    let found = legacy_artifacts(&forged(&base.layout()), None);
+    assert!(found.any() && found.socket_dir && !found.config && !found.task);
 }
 
 #[test]
-fn saved_user_is_an_error_for_a_config_it_cannot_read() {
-    let base = TempBase::existing("saved-unreadable");
-    std::fs::create_dir(base.0.join("config.toml")).unwrap();
+fn legacy_is_detected_from_a_per_user_task_alone() {
+    // A half-finished earlier migration or a manual cleanup can leave only the old task, and with
+    // it a running legacy agent. No config and no `s\`: the task is what says so.
+    let base = TempBase::existing("legacy-task");
+    let found = legacy_artifacts(&forged(&base.layout()), Some(LEGACY_TASK_XML));
+    assert!(found.any() && found.task && !found.config && !found.socket_dir);
+}
+
+// Removing the legacy artifacts ----------------------------------------------------------
+
+#[test]
+fn remove_legacy_deletes_the_old_socket_dir_and_config() {
+    let base = TempBase::existing("remove");
+    plant_legacy(&base);
     let layout = base.layout();
+    let base_ref = forged(&layout);
+    let found = legacy_artifacts(&base_ref, None);
+    assert!(found.config && found.socket_dir, "control");
 
-    let err = format!("{:#}", saved_user(&forged(&layout)).unwrap_err());
+    remove_legacy(&base_ref, &found).unwrap();
 
-    assert!(err.contains("config.toml"), "{err}");
+    assert!(names_in(&base.0).is_empty(), "{:?}", names_in(&base.0));
+    assert!(!legacy_artifacts(&base_ref, None).any());
 }
 
 #[test]
-fn resolve_user_prefers_cli_then_the_saved_config_then_the_interactive_user() {
-    let base = TempBase::existing("resolve");
+fn remove_legacy_is_a_noop_on_a_clean_base() {
+    let base = TempBase::existing("remove-clean");
+    std::fs::write(base.0.join("keep.txt"), "x").unwrap();
     let layout = base.layout();
-    let trusted = forged(&layout);
-    assert_eq!(resolve_user(&trusted, None, Some("me")).unwrap(), "me");
-
-    plant_config(&base, "saved-user");
-    assert_eq!(resolve_user(&trusted, None, Some("me")).unwrap(), "saved-user");
-    assert_eq!(
-        resolve_user(&trusted, Some("cli-user"), Some("me")).unwrap(),
-        "cli-user"
-    );
+    remove_legacy(&forged(&layout), &Legacy::default()).unwrap();
+    assert_eq!(names_in(&base.0), ["keep.txt"]);
 }
 
 #[test]
-fn resolve_user_fails_on_a_malformed_config_instead_of_falling_back() {
-    let base = TempBase::existing("resolve-bad");
-    std::fs::write(base.0.join("config.toml"), "target_user = [").unwrap();
+fn remove_legacy_leaves_exe_logs_and_other_files() {
+    let base = TempBase::existing("remove-others");
+    plant_legacy(&base);
+    std::fs::write(base.0.join("ssh-broker.exe"), "exe").unwrap();
+    std::fs::create_dir(base.0.join("logs")).unwrap();
+    std::fs::write(base.0.join("logs").join("shim.log"), "old log").unwrap();
     let layout = base.layout();
+    let base_ref = forged(&layout);
 
-    let err = format!("{:#}", resolve_user(&forged(&layout), None, Some("me")).unwrap_err());
+    remove_legacy(&base_ref, &legacy_artifacts(&base_ref, None)).unwrap();
 
-    assert!(err.contains("config.toml"), "{err}");
-    assert!(err.contains("--user"), "the error says how to recover: {err}");
-}
-
-#[test]
-fn resolve_user_ignores_a_malformed_config_when_the_cli_names_the_user() {
-    let base = TempBase::existing("resolve-bad-cli");
-    std::fs::write(base.0.join("config.toml"), "target_user = [").unwrap();
-    let layout = base.layout();
-
-    assert_eq!(
-        resolve_user(&forged(&layout), Some("cli-user"), Some("me")).unwrap(),
-        "cli-user"
-    );
-}
-
-#[test]
-fn resolve_user_reads_the_config_for_an_empty_cli_user() {
-    let base = TempBase::existing("resolve-bad-empty-cli");
-    std::fs::write(base.0.join("config.toml"), "target_user = [").unwrap();
-    let layout = base.layout();
-
-    assert!(resolve_user(&forged(&layout), Some(""), Some("me")).is_err());
+    assert_eq!(names_in(&base.0), ["logs", "ssh-broker.exe"]);
+    assert_eq!(names_in(&base.0.join("logs")), ["shim.log"]);
 }
 
 // The apply sequence ----------------------------------------------------------------------
 
+/// A stand-in for the running exe: any file, since `prepare` only copies it.
+fn new_exe(base: &TempBase, bytes: &str) -> PathBuf {
+    let path = base.0.join("new-build.exe");
+    std::fs::write(&path, bytes).unwrap();
+    path
+}
+
 #[test]
-fn prepare_refuses_a_hostile_base_before_it_reads_its_config() {
+fn prepare_refuses_a_hostile_base_before_it_reads_or_stops_anything() {
     let base = TempBase::existing("prepare-hostile");
-    plant_config(&base, "planted-user");
-
-    // Read first, the planted config would supply the user and get past the lookup's
-    // "cannot resolve" failure; it must fail at the base instead.
-    let err = format!(
-        "{:#}",
-        prepare(&base.layout(), &std::env::current_exe().unwrap(), None, None).expect_err("hostile base")
-    );
-
-    assert!(err.contains("cannot be trusted"), "{err}");
-    assert_eq!(names_in(&base.0), ["config.toml"], "nothing may be written into it");
-}
-
-/// Elevated (CI only): `prepare` creates the base.
-#[test]
-fn prepare_resolves_the_user_before_it_writes_anything() {
-    let base = TempBase::new("prepare-no-user");
-    let layout = base.layout();
-
-    let err = format!(
-        "{:#}",
-        prepare(&layout, &std::env::current_exe().unwrap(), None, None).expect_err("no user to resolve")
-    );
-
-    assert!(err.contains("cannot resolve the target user"), "{err}");
-    assert!(layout.base.is_dir(), "the base itself is made first");
-    assert!(
-        names_in(&layout.base).is_empty(),
-        "nothing may be written before the user resolves"
-    );
-}
-
-/// Elevated (CI only): `prepare` creates the base.
-#[test]
-fn prepare_looks_the_account_up_before_it_writes_anything() {
-    let base = TempBase::new("prepare-bad-user");
-    let layout = base.layout();
+    std::fs::write(base.0.join("config.toml"), "planted").unwrap();
+    let stopped = std::cell::Cell::new(false);
 
     let err = format!(
         "{:#}",
         prepare(
-            &layout,
+            &base.layout(),
             &std::env::current_exe().unwrap(),
-            Some("no-such-account-for-ssh-broker-tests"),
-            None
+            Some(LEGACY_TASK_XML),
+            || {
+                stopped.set(true);
+                Ok(())
+            }
         )
-        .expect_err("no such account")
+        .expect_err("hostile base")
     );
 
-    assert!(err.contains("no-such-account-for-ssh-broker-tests"), "{err}");
-    assert!(
-        names_in(&layout.base).is_empty(),
-        "nothing may be written before the lookup"
-    );
+    assert!(err.contains("cannot be trusted"), "{err}");
+    assert_eq!(names_in(&base.0), ["config.toml"], "nothing may be written into it");
+    assert!(!stopped.get(), "no agent is stopped on the word of an untrusted base");
 }
 
-/// Elevated (CI only): `ensure_base` creates the base.
+#[test]
+fn prepare_in_stops_the_legacy_agent_before_replacing_the_exe() {
+    // A live agent holds its exe open, so the copy would fail with a sharing violation and the
+    // old exe would stay under the new tasks. The stop has to come first.
+    let base = TempBase::existing("prepare-order");
+    plant_legacy(&base);
+    std::fs::write(base.0.join("ssh-broker.exe"), "old build").unwrap();
+    let source = new_exe(&base, "new build");
+    let layout = base.layout();
+    let seen = std::cell::RefCell::new(None);
+
+    let exe = prepare_in(&forged(&layout), &source, None, || {
+        *seen.borrow_mut() = Some(std::fs::read_to_string(layout.canonical_exe()).unwrap());
+        Ok(())
+    })
+    .unwrap();
+
+    assert_eq!(
+        seen.borrow().as_deref(),
+        Some("old build"),
+        "the old exe was still in place"
+    );
+    assert_eq!(std::fs::read_to_string(exe).unwrap(), "new build");
+    assert!(!base.0.join("config.toml").exists() && !base.0.join("s").exists());
+}
+
+#[test]
+fn prepare_in_stops_the_agent_for_a_legacy_task_with_no_files() {
+    let base = TempBase::existing("prepare-task");
+    let source = new_exe(&base, "new build");
+    let layout = base.layout();
+    let stopped = std::cell::Cell::new(false);
+
+    prepare_in(&forged(&layout), &source, Some(LEGACY_TASK_XML), || {
+        stopped.set(true);
+        Ok(())
+    })
+    .unwrap();
+
+    assert!(stopped.get());
+}
+
+#[test]
+fn prepare_in_does_not_stop_agents_when_nothing_is_legacy() {
+    // Re-running `apply`, and the boot self-heal, must leave live agents alone.
+    let base = TempBase::existing("prepare-clean");
+    let source = new_exe(&base, "new build");
+    let layout = base.layout();
+    let group = agent_task_xml(r"C:\x.exe");
+
+    prepare_in(&forged(&layout), &source, Some(&group), || {
+        panic!("a clean install has no legacy agent to stop")
+    })
+    .unwrap();
+}
+
+#[test]
+fn prepare_in_fails_and_changes_nothing_when_the_agent_cannot_be_stopped() {
+    let base = TempBase::existing("prepare-stuck");
+    plant_legacy(&base);
+    std::fs::write(base.0.join("ssh-broker.exe"), "old build").unwrap();
+    let source = new_exe(&base, "new build");
+    let layout = base.layout();
+
+    let err = format!(
+        "{:#}",
+        prepare_in(&forged(&layout), &source, None, || anyhow::bail!("access denied")).unwrap_err()
+    );
+
+    assert!(err.contains("access denied"), "{err}");
+    assert!(
+        base.0.join("config.toml").exists() && base.0.join("s").exists(),
+        "nothing removed"
+    );
+    assert_eq!(std::fs::read_to_string(layout.canonical_exe()).unwrap(), "old build");
+}
+
+/// Elevated (CI only): `prepare` creates the base.
 #[test]
 fn populate_builds_a_verified_layout() {
     let base = TempBase::new("populate");
     let layout = base.layout();
-    let me = Sid::current_user().unwrap();
-    let trusted = ensure_base(&layout).unwrap();
 
-    let exe = populate(&trusted, &std::env::current_exe().unwrap(), "layout-test-user", &me).unwrap();
+    let exe = prepare(&layout, &std::env::current_exe().unwrap(), None, || Ok(())).unwrap();
 
     assert_eq!(exe, layout.canonical_exe());
     assert!(exe.is_file());
     assert!(acl::verify_install_dir_acl(&layout.base).unwrap());
-    assert!(acl::verify_dir_acl(&layout.socket_dir(), &me).unwrap());
-    assert_eq!(saved_user(&trusted).unwrap().as_deref(), Some("layout-test-user"));
-
-    // logs\ carries exactly the install directory's DACL, inherited: no extra access, none missing.
-    assert!(layout.logs_dir().is_dir());
     assert_eq!(
-        aces(&dacl_sddl(&layout.logs_dir())),
-        [
-            ("A", "OICIID", FILE_ALL, "SY"),
-            ("A", "OICIID", FILE_ALL, "BA"),
-            ("A", "OICIID", FILE_READ_EXECUTE, "BU"),
-        ]
+        names_in(&layout.base),
+        ["ssh-broker.exe"],
+        "nothing else lives in the install dir"
     );
 }
 
@@ -304,69 +338,6 @@ fn install_dir_row_carries_the_reason_the_directory_is_untrusted() {
     assert_eq!(good.detail, layout.base.display().to_string());
 }
 
-#[test]
-fn socket_dir_row_does_not_read_the_config_of_an_untrusted_base() {
-    let base = TempBase::existing("row-untrusted");
-    plant_config(&base, "planted-user");
-
-    let row = socket_dir_row(&Err("planted".into()));
-
-    assert!(!row.pass);
-    assert!(row.detail.contains("untrusted"), "{}", row.detail);
-    assert!(
-        !row.detail.contains("planted-user"),
-        "the planted config must not be read: {}",
-        row.detail
-    );
-}
-
-#[test]
-fn socket_dir_row_fails_without_a_saved_account() {
-    let base = TempBase::existing("row-none");
-    let layout = base.layout();
-
-    let row = socket_dir_row(&Ok(forged(&layout)));
-
-    assert!(!row.pass);
-    assert!(row.detail.contains("no config target_user"), "{}", row.detail);
-}
-
-#[test]
-fn socket_dir_row_names_an_account_that_does_not_resolve() {
-    let base = TempBase::existing("row-lookup");
-    plant_config(&base, "no-such-account-for-ssh-broker-tests");
-    let layout = base.layout();
-
-    let row = socket_dir_row(&Ok(forged(&layout)));
-
-    assert!(!row.pass);
-    assert!(
-        row.detail.contains("no-such-account-for-ssh-broker-tests"),
-        "{}",
-        row.detail
-    );
-}
-
-#[test]
-fn socket_dir_row_passes_for_a_hardened_socket_dir_of_the_saved_account() {
-    let base = TempBase::existing("row-ok");
-    let layout = base.layout();
-    let user = std::env::var("USERNAME").expect("USERNAME is set for an interactive user");
-    plant_config(&base, &user);
-    std::fs::create_dir(layout.socket_dir()).unwrap();
-    acl::harden_dir(&layout.socket_dir(), &Sid::current_user().unwrap()).unwrap();
-
-    let row = socket_dir_row(&Ok(forged(&layout)));
-
-    assert!(row.pass, "{}", row.detail);
-
-    // The same account with an unhardened socket dir fails.
-    let other = TempBase::existing("row-unhardened");
-    plant_config(&other, &user);
-    std::fs::create_dir(other.layout().socket_dir()).unwrap();
-    assert!(!socket_dir_row(&Ok(forged(&other.layout()))).pass);
-}
-
 // Reading a DACL by SID -------------------------------------------------------------------
 
 #[test]
@@ -374,7 +345,7 @@ fn aces_reads_an_sddl_dacl() {
     assert_eq!(
         aces("D:AI(A;OICIID;FA;;;SY)(A;OICIID;FRFX;;;BA)(A;;0x1200a9;;;BU)"),
         [
-            ("A", "OICIID", FILE_ALL, "SY"),
+            ("A", "OICIID", crate::test_support::FILE_ALL, "SY"),
             ("A", "OICIID", FILE_READ_EXECUTE, "BA"),
             ("A", "", FILE_READ_EXECUTE, "BU"),
         ]
