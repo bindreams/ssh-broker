@@ -5,8 +5,9 @@
 //! - [`SessionSlot`]: is there already an agent in *this session*? `apply` and the boot
 //!   self-heal start an agent per logged-on session each time they run; the logon task starts
 //!   one per logon. A second agent in a session that has one has nothing to add, so it exits.
-//!   The name is in the `Local\` namespace, which is per session: another user's session has a
-//!   namespace of its own, so one user cannot hold, or squat, another's slot.
+//!   The slot is a lock on a per-session file in the user's verified private folder, not a named
+//!   kernel object: any process in the session could create such an object first, whatever
+//!   account it runs as, and only the user, SYSTEM and Administrators can create a file here.
 //! - [`UserLock`]: is there already an agent for *this user* in another session? One user can be
 //!   logged on twice (console and RDP). Only one agent can own the socket, and the other must not
 //!   leave: the owner lives and dies with its session, and the user may still be logged on in the
@@ -18,16 +19,12 @@ use std::os::windows::io::AsRawHandle;
 use std::path::Path;
 
 use anyhow::Context;
-use windows::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, ERROR_LOCK_VIOLATION, GetLastError, HANDLE};
+use windows::Win32::Foundation::{ERROR_LOCK_VIOLATION, HANDLE};
 use windows::Win32::Storage::FileSystem::{
     LOCK_FILE_FLAGS, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx,
 };
 use windows::Win32::System::IO::OVERLAPPED;
-use windows::Win32::System::Threading::CreateMutexW;
-use windows::core::{HRESULT, PCWSTR};
-
-/// The per-session slot's name.
-pub const SESSION_SLOT_NAME: &str = r"Local\ssh-broker-agent";
+use windows::core::HRESULT;
 
 /// Whether an agent may run in session `id`. Session 0 is the services session, where a logon
 /// task's agent would have the very environment this project exists to leave: the shell would be
@@ -38,37 +35,15 @@ pub fn session_allows_agent(id: u32) -> bool {
 
 /// The right to be the one agent of this session. Held until dropped.
 #[derive(Debug)]
-pub struct SessionSlot(HANDLE);
-
-// SAFETY: the handle is a kernel object owned by this value alone and is only closed on drop.
-unsafe impl Send for SessionSlot {}
-
-impl SessionSlot {
-    /// Take this session's slot. `None` if another agent in this session holds it.
-    pub fn try_acquire() -> anyhow::Result<Option<SessionSlot>> {
-        Self::try_acquire_named(SESSION_SLOT_NAME)
-    }
-
-    fn try_acquire_named(name: &str) -> anyhow::Result<Option<SessionSlot>> {
-        let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
-        // SAFETY: `wide` is NUL-terminated and outlives the call. Ownership of the mutex is not
-        // taken (`false`): the name existing is the whole signal, so a crash releases it.
-        let handle = unsafe { CreateMutexW(None, false, PCWSTR(wide.as_ptr())) }
-            .with_context(|| format!("create the session slot {name}"))?;
-        // SAFETY: read straight after the call it describes, on the same thread.
-        if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
-            // SAFETY: `handle` is the one just opened, closed once.
-            let _ = unsafe { CloseHandle(handle) };
-            return Ok(None);
-        }
-        Ok(Some(SessionSlot(handle)))
-    }
+pub struct SessionSlot {
+    _lock: UserLock,
 }
 
-impl Drop for SessionSlot {
-    fn drop(&mut self) {
-        // SAFETY: `self.0` is the handle this value owns, closed once.
-        let _ = unsafe { CloseHandle(self.0) };
+impl SessionSlot {
+    /// Take the slot, a lock on `path`, the session's file in the user's folder. `None` if another
+    /// agent in this session holds it.
+    pub fn try_acquire(path: &Path) -> anyhow::Result<Option<SessionSlot>> {
+        Ok(UserLock::try_acquire(path)?.map(|_lock| SessionSlot { _lock }))
     }
 }
 

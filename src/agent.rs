@@ -59,7 +59,7 @@ fn start() -> anyhow::Result<()> {
     // Held to the end: dropping the guard stops the writer and later lines are lost. Before this
     // point there is no log, and an error goes to stderr, which a logon task discards.
     let _log = crate::filelog::init_in(&location.logs_dir(), "agent.log");
-    let result = serve(&location);
+    let result = serve(&location, session);
     if let Err(e) = &result {
         tracing::error!("the agent stopped: {e:#}");
     }
@@ -68,10 +68,10 @@ fn start() -> anyhow::Result<()> {
 
 /// Become the one agent that serves this user, then serve.
 #[cfg(windows)]
-fn serve(location: &SocketLocation) -> anyhow::Result<()> {
+fn serve(location: &SocketLocation, session: u32) -> anyhow::Result<()> {
     // One agent per session: `apply` and the boot self-heal start one per logged-on session
     // every time they run, and the logon task starts one per logon.
-    let Some(_slot) = SessionSlot::try_acquire()? else {
+    let Some(_slot) = SessionSlot::try_acquire(&location.session_lock_path(session))? else {
         tracing::info!("another agent already runs in this session; exiting");
         return Ok(());
     };

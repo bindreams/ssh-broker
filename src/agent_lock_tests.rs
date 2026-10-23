@@ -3,6 +3,9 @@ use super::*;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
+use windows::Win32::Foundation::CloseHandle;
+use windows::Win32::System::Threading::CreateMutexW;
+use windows::core::PCWSTR;
 
 fn unique(tag: &str) -> String {
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -129,28 +132,40 @@ fn a_sharing_violation_on_the_lock_file_is_an_error_not_a_held_lock() {
 // SessionSlot --------------------------------------------------------------------------
 
 #[test]
-fn session_slot_second_try_in_the_same_session_is_none() {
-    let name = unique("slot");
-    let first = SessionSlot::try_acquire_named(&name).unwrap();
+fn session_slot_second_try_for_the_same_session_is_none() {
+    let dir = TempLock::new("slot");
+    let first = SessionSlot::try_acquire(&dir.path()).unwrap();
     assert!(first.is_some());
-    assert!(SessionSlot::try_acquire_named(&name).unwrap().is_none());
+    assert!(SessionSlot::try_acquire(&dir.path()).unwrap().is_none());
 }
 
 #[test]
 fn session_slot_is_released_on_drop() {
-    let name = unique("slot-drop");
-    drop(SessionSlot::try_acquire_named(&name).unwrap().unwrap());
-    assert!(SessionSlot::try_acquire_named(&name).unwrap().is_some());
+    let dir = TempLock::new("slot-drop");
+    drop(SessionSlot::try_acquire(&dir.path()).unwrap().unwrap());
+    assert!(SessionSlot::try_acquire(&dir.path()).unwrap().is_some());
 }
 
 #[test]
-fn session_slot_names_do_not_conflict() {
-    let _a = SessionSlot::try_acquire_named(&unique("slot-x")).unwrap().unwrap();
-    assert!(SessionSlot::try_acquire_named(&unique("slot-y")).unwrap().is_some());
+fn session_slots_of_different_sessions_do_not_conflict() {
+    let dir = TempLock::new("slot-x");
+    let _a = SessionSlot::try_acquire(&dir.0.join("session-1.lock")).unwrap().unwrap();
+    assert!(SessionSlot::try_acquire(&dir.0.join("session-2.lock")).unwrap().is_some());
 }
 
 #[test]
-fn the_production_slot_lives_in_the_session_local_namespace() {
-    // `Local\` is per session, so another user's session cannot hold this user's slot.
-    assert!(SESSION_SLOT_NAME.starts_with(r"Local\"));
+fn a_foreign_object_in_the_session_namespace_cannot_take_the_slot() {
+    // The slot used to be the named mutex `Local\ssh-broker-agent`, which any process in the
+    // session can create first, whatever account it runs as. It is now a lock on a file in the
+    // user's verified folder, so a mutex of that old name means nothing to it.
+    let wide: Vec<u16> = r"Local\ssh-broker-agent".encode_utf16().chain(std::iter::once(0)).collect();
+    // SAFETY: `wide` is NUL-terminated and outlives the call; the handle is closed below.
+    let squatter = unsafe { CreateMutexW(None, true, PCWSTR(wide.as_ptr())) }.unwrap();
+
+    let dir = TempLock::new("slot-squat");
+    let slot = SessionSlot::try_acquire(&dir.path()).unwrap();
+
+    // SAFETY: the handle was just created and is closed once.
+    let _ = unsafe { CloseHandle(squatter) };
+    assert!(slot.is_some(), "the squatter's object did not stop the slot");
 }

@@ -29,6 +29,14 @@ fn lock_and_logs_live_inside_the_socket_dir() {
 }
 
 #[test]
+fn each_session_has_its_own_lock_file_inside_the_socket_dir() {
+    let loc = for_profile(&profile("a")).unwrap();
+    assert_eq!(loc.session_lock_path(2), loc.dir.join("session-2.lock"));
+    assert_ne!(loc.session_lock_path(2), loc.session_lock_path(3));
+    assert_ne!(loc.session_lock_path(2), loc.lock_path(), "not the user lock");
+}
+
+#[test]
 fn for_profile_accepts_exactly_107_bytes_and_rejects_108() {
     let ok = for_profile(&profile_for_socket_path_of(MAX_SOCKET_PATH_BYTES)).unwrap();
     assert_eq!(ok.path.as_os_str().len(), MAX_SOCKET_PATH_BYTES);

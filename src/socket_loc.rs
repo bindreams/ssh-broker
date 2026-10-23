@@ -30,6 +30,11 @@ impl SocketLocation {
         self.dir.join(LOCK_FILE_NAME)
     }
 
+    /// The lock file that makes an agent the one agent of session `session`.
+    pub fn session_lock_path(&self, session: u32) -> PathBuf {
+        self.dir.join(format!("session-{session}.lock"))
+    }
+
     /// The folder the shim and the agent log into.
     pub fn logs_dir(&self) -> PathBuf {
         self.dir.join(LOGS_DIR_NAME)
