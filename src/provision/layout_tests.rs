@@ -456,3 +456,10 @@ fn dacl_sddl_reports_the_inherited_aces_of_a_plain_directory() {
         "a plain temp directory inherits every ACE: {sddl}"
     );
 }
+
+/// `canonical_exe` is the path the cfg-free pins (`sshd_reads_the_flag_for_the_path_apply_registers`)
+/// assert on, so it must be the one `apply` installs to and registers.
+#[test]
+fn the_production_layout_installs_the_exe_that_the_cfg_free_pins_assert_on() {
+    assert_eq!(Layout::production().canonical_exe(), crate::provision::canonical_exe());
+}

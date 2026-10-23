@@ -125,6 +125,10 @@ fn handle_connection_with(conn: socket2::Socket, hooks: Hooks) -> anyhow::Result
 #[path = "agent_cwd_tests.rs"]
 mod agent_cwd_tests;
 
+#[cfg(all(windows, test))]
+#[path = "agent_program_path_tests.rs"]
+mod agent_program_path_tests;
+
 // ── PTY relay ────────────────────────────────────────────────────────────────────────
 
 /// Interactive PTY relay: spawn the shell in a ConPTY and bridge it with three threads and

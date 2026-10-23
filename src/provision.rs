@@ -1,4 +1,4 @@
-//! provision: self-install (`apply`) and self-check (`verify`) — DefaultShell pair, the
+//! provision: self-install (`apply`) and self-check (`verify`) — the DefaultShell values, the
 //! session-1 agent logon task, the ONSTART self-heal task, the socket dir + ACL, and parity
 //! probes (DPAPI/symlink/session) run THROUGH the agent.
 //!
@@ -40,6 +40,18 @@ pub fn verify_probe() -> anyhow::Result<()> {
     return imp::verify_probe();
     #[cfg(not(windows))]
     anyhow::bail!("verify-probe runs only on Windows");
+}
+
+/// The directory `apply` installs into. The one place the path is written; [`layout::Layout`]
+/// derives from it.
+pub const BASE_DIR: &str = r"C:\ProgramData\ssh-broker";
+
+/// The installed exe's file name.
+pub const EXE_NAME: &str = "ssh-broker.exe";
+
+/// The path `apply` installs the shim to and registers as `DefaultShell`.
+pub fn canonical_exe() -> std::path::PathBuf {
+    std::path::Path::new(BASE_DIR).join(EXE_NAME)
 }
 
 #[cfg(windows)]
@@ -99,9 +111,12 @@ mod imp {
         register_agent_task(&layout, &exe, &user)?;
         register_selfheal_task(&exe, &user)?;
 
-        // 3. Flip the DefaultShell pair LAST and only to the validated canonical path; read back.
+        // 3. Write the escape flag and read it back at once, then flip the DefaultShell pair LAST
+        //    and only to the validated canonical path; read that back too. sshd reads these once
+        //    per session, so the shim cannot ask later which form sshd used: `apply` owns the flag
+        //    (see `registry::desired_values`).
         registry::set_default_shell_under(registry::OPENSSH_KEY, &exe.to_string_lossy())
-            .context("write DefaultShell pair")?;
+            .context("write the DefaultShell values")?;
         let (shell, opt) = registry::read_default_shell_under(registry::OPENSSH_KEY)?;
         anyhow::ensure!(
             eq_path(&shell, &exe) && opt == "-c",
@@ -208,6 +223,12 @@ mod imp {
         // can write to it).
         let base = layout::check_base(&layout);
         rows.push(layout::install_dir_row(&base));
+
+        // Local: sshd escapes the command, the only non-PTY form the shim decodes. sshd reads the
+        // value once per session, so this is the one place it is checked.
+        rows.push(registry::escape_arguments_check(registry::escape_arguments_under(
+            registry::OPENSSH_KEY,
+        )));
 
         // Local: the socket dir ACL verifies for the configured account (== the agent's grantee).
         rows.push(layout::socket_dir_row(&base));

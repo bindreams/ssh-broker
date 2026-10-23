@@ -244,3 +244,25 @@ fn file_logging_is_enabled_for_a_writable_log_directory() {
     drop(guard);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The fail-open spawn trims leading whitespace for `CreateProcessW`, which rejects it; the
+/// relay's spawn does the same (`pipes_tests`).
+#[test]
+fn the_local_passthrough_spawn_accepts_whitespace_at_the_edges_of_a_command() {
+    use windows::Win32::System::Threading::{GetExitCodeProcess, INFINITE, WaitForSingleObject};
+
+    for command in [
+        "  cmd.exe /c exit /b 3",
+        "\tcmd.exe /c exit /b 3\r\n",
+        "\r\ncmd.exe /c exit /b 3",
+    ] {
+        let (process, _job) =
+            unsafe { spawn_contained(command, None) }.unwrap_or_else(|e| panic!("{command:?}: {e:?}"));
+        let mut code = 0u32;
+        unsafe {
+            WaitForSingleObject(process.0, INFINITE);
+            GetExitCodeProcess(process.0, &mut code).unwrap();
+        }
+        assert_eq!(code, 3, "{command:?}");
+    }
+}

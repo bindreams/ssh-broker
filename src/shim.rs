@@ -1,6 +1,7 @@
 //! shim: the SSH `DefaultShell` (default action). Relays the terminal/streams to
 //! the agent over AF_UNIX; fails open to a local shell if the agent is unreachable.
 
+use crate::cmdline::RawExec;
 use crate::protocol::{FrameKind, FrameReader, Handshake, Mode, Resize, Stream, write_frame};
 use crate::relay::{FrameSink, Outcome, pump_decode, write_data};
 use std::io::{Read, Write};
@@ -9,9 +10,9 @@ use std::sync::{Arc, Mutex};
 /// Shim entrypoint. `exec` is `Some(command)` for the `-c "cmd"` EXEC path, `None`
 /// for an interactive PTY session. The Windows path connects to the agent and relays;
 /// elsewhere there is no session-1 console to relay.
-pub fn run(exec: Option<String>) -> anyhow::Result<()> {
+pub fn run(exec: Option<RawExec>) -> anyhow::Result<()> {
     #[cfg(windows)]
-    return crate::shim_pty::run_on(exec);
+    return crate::shim_pty::run_on(exec, crate::cmdline::detect);
 
     #[cfg(not(windows))]
     {
@@ -20,27 +21,36 @@ pub fn run(exec: Option<String>) -> anyhow::Result<()> {
     }
 }
 
-/// Trim the command sshd handed us, so the string that is RELAYED is the string that is
-/// EXECUTED. Applied in `route`, the one place the binary assembles a command, so no argv the
-/// binary parses reaches the shim untrimmed. A library caller invoking `shim::run` directly
-/// bypasses it and should normalize first.
+/// The command line to hand to `CreateProcessW`.
 ///
-/// A whitespace-only command stays `Some` and empty. `ssh host " "` is a genuine exec request —
-/// measured against a stock client, only `ssh host ""` degrades to an interactive session — and
-/// mapping it to `None` would route it to the interactive path, handing the caller a shell REPL
-/// on the SSH channel. The empty command then fails at spawn — EXEC calls `CreateProcessW`
-/// directly, with no shell to treat it as a no-op — which is the right outcome: a failed
-/// command rather than a shell.
-pub(crate) fn normalize_exec(exec: Option<String>) -> Option<String> {
-    exec.map(|c| c.trim_matches(BOUNDARY).to_string())
+/// The command is relayed as the client sent it, minus its leading [`BOUNDARY`] characters:
+/// `CreateProcessW` fails on a line that starts with one (`ERROR_INVALID_PARAMETER` for space or
+/// tab; a CR or LF is read as part of the program name). Nothing trailing is trimmed, so programs that read their
+/// raw command line (`cmd /c echo a   `) see it. A trailing line break after a bare program name
+/// therefore fails like a misspelled program; no string rule can tell which shapes
+/// `CreateProcessW` would run as sent, since it depends on the files on disk. Both spawn sites
+/// (`pipes::ExecChild::spawn` and `shim_pty::spawn_contained`) call this.
+pub fn spawn_line(command: &str) -> &str {
+    command.trim_start_matches(BOUNDARY)
 }
 
-/// The characters that carry no meaning at a command's edges. Windows separates arguments on
-/// space and tab only; CR and LF are here because sshd can hand over a line-terminated command
-/// and they would otherwise stay glued to the program name. Deliberately NOT Rust's `trim`,
-/// whose Unicode `White_Space` set would strip characters this pipeline treats as part of an
-/// argument — one definition, used wherever a command's edges are trimmed.
-pub(crate) const BOUNDARY: [char; 4] = [' ', '\t', '\r', '\n'];
+/// Space, tab, CR and LF: the characters trimmed from the start of a spawn line, and the only ones
+/// a blank command may consist of. Space and tab are what Windows separates arguments on; CR and LF
+/// are included because a line break is blank to a shell. Deliberately NOT Rust's `trim`, whose Unicode `White_Space` set would strip
+/// characters this pipeline treats as part of an argument.
+pub const BOUNDARY: [char; 4] = [' ', '\t', '\r', '\n'];
+
+/// Whether an exec command is empty or only [`BOUNDARY`] characters. Such a command runs nothing
+/// and exits 0, as the shell does for `-c ""`; `CreateProcessW` would fail on it. It is checked
+/// once, at the top of `shim_pty::run_on`, before anything connects to the agent.
+///
+/// A blank command stays an exec request rather than becoming an interactive one: `ssh host " "`
+/// is a genuine exec (measured against a stock client, only `ssh host ""` degrades to an
+/// interactive session), and mapping it to `None` would hand the caller a shell REPL on the SSH
+/// channel.
+pub fn is_blank_command(command: &str) -> bool {
+    command.trim_matches(BOUNDARY).is_empty()
+}
 
 // ── EXEC relay ───────────────────────────────────────────────────────────────────────
 

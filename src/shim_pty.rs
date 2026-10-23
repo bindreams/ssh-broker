@@ -14,11 +14,12 @@
 //! not), JOINS the worker, then the guard restores modes AFTER the join — so the worker can
 //! never read with a half-restored mode (the use-after-close hazard the agent review found).
 
+use crate::cmdline::{Encoding, RawExec, resolve_exec};
 use crate::protocol::{FrameKind, FrameReader, Handshake, Stream, write_frame};
 use crate::relay::{FrameSink, pump_decode, write_data};
 use crate::shim::{
-    FailOpen, Fallback, MouseModeSniffer, XtwinopsFilter, decide_fail_open, decide_fallback, make_handshake,
-    map_outcome, run_exec_on, size_to_resize,
+    FailOpen, Fallback, MouseModeSniffer, XtwinopsFilter, decide_fail_open, decide_fallback, is_blank_command,
+    make_handshake, map_outcome, run_exec_on, size_to_resize,
 };
 use crate::{afunix, conpty, vtinput};
 use std::sync::Arc;
@@ -55,8 +56,16 @@ const VT_OUT: CONSOLE_MODE =
 /// shell — never let an error reach `main()` (which would exit 1 and print to the terminal,
 /// corrupting an interactive PTY). The log guard is flushed before every `process::exit`,
 /// since `process::exit` runs no destructors and the log is the only PTY-mode diagnostic.
-pub fn run_on(exec: Option<String>) -> anyhow::Result<()> {
+///
+/// A `-c` session resolves its command first, once the log is open: `detect` says how sshd
+/// encoded it (see [`resolve_exec`]), and a blank command ends the run there, exit 0.
+pub fn run_on(exec: Option<RawExec>, detect: impl FnOnce() -> Encoding) -> anyhow::Result<()> {
     let log = init_file_logging();
+    let exec = exec.map(|exec| resolve_exec(exec, detect));
+    if exec.as_deref().is_some_and(is_blank_command) {
+        drop(log); // flush: `process::exit` runs no destructors
+        std::process::exit(0)
+    }
 
     // EVERY command relays. There is deliberately no local route for file transfers.
     //
@@ -277,7 +286,10 @@ unsafe fn spawn_contained(
         si.hStdOutput = o;
         si.hStdError = e;
     }
-    let mut cmd: Vec<u16> = command.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut cmd: Vec<u16> = crate::shim::spawn_line(command)
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
     let mut pi = PROCESS_INFORMATION::default();
     unsafe {
         CreateProcessW(

@@ -3,7 +3,7 @@
 //! PTY path (raw mode, `ReadConsoleInputW`) is exercised on a real Windows host end-to-end.
 use super::{
     ExecOutSink, FailOpen, Fallback, MouseModeSniffer, XtwinopsFilter, decide_fail_open, decide_fallback,
-    make_handshake, map_outcome, size_to_resize,
+    is_blank_command, make_handshake, map_outcome, size_to_resize, spawn_line,
 };
 use crate::protocol::{ExitCode, FrameKind, FrameReader, Handshake, Mode, Resize, Stream, read_one_frame, write_frame};
 use crate::relay::{FrameSink, Outcome, duplex, write_data};
@@ -207,33 +207,47 @@ fn size_event_maps_to_resize_frame() {
     assert_eq!(size_to_resize(120, 40), Resize { cols: 120, rows: 40 });
 }
 
-/// `ssh host " "` is a genuine exec request; only `ssh host ""` degrades to interactive
-/// (measured against a stock client — `ssh.c` sends a shell request only for an empty
-/// command buffer, so sshd never sees an empty exec). Mapping a blank command to `None` would hand the caller an
-/// interactive REPL on the SSH channel instead of running its no-op.
+/// The leading `BOUNDARY` characters are trimmed (`CreateProcessW` fails on a line that starts
+/// with one). Nothing else is: a Unicode space is part of an argument.
 #[test]
-fn normalize_exec_trims_but_keeps_a_blank_command_an_exec() {
-    assert_eq!(super::normalize_exec(Some("  cmd  ".into())), Some("cmd".into()));
-    assert_eq!(
-        super::normalize_exec(Some(" ".into())),
-        Some(String::new()),
-        "stays an exec"
-    );
-    assert_eq!(super::normalize_exec(None), None);
+fn spawn_line_trims_the_leading_boundary_characters() {
+    assert_eq!(spawn_line("  cmd /c x"), "cmd /c x");
+    assert_eq!(spawn_line("\t\r\n scp -t /p"), "scp -t /p");
+    assert_eq!(spawn_line("\u{a0}scp -t /p\u{a0}"), "\u{a0}scp -t /p\u{a0}");
+    assert_eq!(spawn_line("a  b"), "a  b");
 }
 
-/// `BOUNDARY` is deliberately narrower than Rust's `trim`: only the separators this pipeline
-/// treats as meaningful. A Unicode space is part of an argument, not padding around one.
+/// Trailing space and tab reach the program: `cmd /c echo a   ` prints `a   `.
 #[test]
-fn boundary_is_narrower_than_unicode_whitespace() {
-    assert_eq!(
-        super::normalize_exec(Some("\u{a0}scp -t /p".into())),
-        Some("\u{a0}scp -t /p".into())
-    );
-    assert_eq!(
-        super::normalize_exec(Some("\r\n scp -t /p \t".into())),
-        Some("scp -t /p".into())
-    );
+fn spawn_line_keeps_trailing_spaces_and_tabs() {
+    assert_eq!(spawn_line("cmd /c echo a   "), "cmd /c echo a   ");
+    assert_eq!(spawn_line("  cmd /c echo a \t"), "cmd /c echo a \t");
+    assert_eq!(spawn_line("whoami "), "whoami ");
+}
+
+/// Nothing trailing is trimmed, whatever the shape of the line: a trailing line break fails like a
+/// misspelled program (`CreateProcessW` reports `ERROR_FILE_NOT_FOUND`), by design. Which shapes
+/// `CreateProcessW` would run as sent depends on the files on disk, so no string rule can tell
+/// them apart.
+#[test]
+fn spawn_line_keeps_trailing_line_breaks_in_every_shape() {
+    // arguments
+    assert_eq!(spawn_line("scp -t /p\r\n"), "scp -t /p\r\n");
+    assert_eq!(spawn_line("scp -t /p \t\r\n"), "scp -t /p \t\r\n");
+    // bare program name
+    assert_eq!(spawn_line("whoami\n"), "whoami\n");
+    assert_eq!(spawn_line("\r\n whoami\r\n"), "whoami\r\n");
+    assert_eq!(spawn_line("whoami\r\n\r\n"), "whoami\r\n\r\n");
+    // quoted program name
+    assert_eq!(spawn_line("\"whoami\"\n"), "\"whoami\"\n");
+    assert_eq!(spawn_line("\"C:\\tools\\prog.exe\"\r\n"), "\"C:\\tools\\prog.exe\"\r\n");
+    assert_eq!(spawn_line("\r\n\"whoami\"\n"), "\"whoami\"\n");
+    // unclosed quote
+    assert_eq!(spawn_line("\"whoami\n"), "\"whoami\n");
+    assert_eq!(spawn_line(" \"whoami\r\n"), "\"whoami\r\n");
+    // unquoted spaced path, with and without arguments
+    assert_eq!(spawn_line("C:\\Sp Dir\\p.exe\n"), "C:\\Sp Dir\\p.exe\n");
+    assert_eq!(spawn_line("C:\\Sp Dir\\p.exe /?\r\n"), "C:\\Sp Dir\\p.exe /?\r\n");
 }
 
 #[test]
@@ -485,4 +499,17 @@ fn sniffer_focus_independent_of_mouse_flags() {
     t.observe(b"\x1b[?1000h\x1b[?1006h"); // mouse tracking + SGR
     assert!(t.forward_mouse());
     assert!(!t.focus_on());
+}
+
+/// A blank exec (empty, or only space, tab, CR and LF) runs nothing, as the shell does for
+/// `-c ""`. The set is spelled out here so a change to `BOUNDARY` shows up as a failure.
+#[test]
+fn a_blank_command_is_empty_or_only_space_tab_cr_lf() {
+    for blank in ["", " ", "\t", "\r", "\n", "\r\n", " \t\r\n "] {
+        assert!(is_blank_command(blank), "{blank:?}");
+    }
+    // A Unicode space is part of an argument (see `BOUNDARY`), so it is not blank.
+    for not_blank in ["\u{a0}", "cmd", " cmd ", "\0", "\u{b}", "\u{c}"] {
+        assert!(!is_blank_command(not_blank), "{not_blank:?}");
+    }
 }
