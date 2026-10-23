@@ -47,6 +47,14 @@ fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
+/// A progress line on stderr, written past libtest's capture, so a run that never finishes still
+/// shows in the CI log which test got how far.
+fn note(what: impl std::fmt::Display) {
+    use std::io::Write;
+    let thread = std::thread::current();
+    let _ = writeln!(std::io::stderr(), "[{}] {what}", thread.name().unwrap_or("?"));
+}
+
 /// Fail loudly unless this process is an elevated administrator.
 fn assert_elevated() {
     let mut token = HANDLE::default();
@@ -200,6 +208,7 @@ impl Account {
             )
         }
         .unwrap_or_else(|e| panic!("start {exe:?} as {}: {e}", self.name));
+        note(format_args!("started {exe:?} as {}", self.name));
         let process = OwnedHandle(info.hProcess);
         let _thread = OwnedHandle(info.hThread);
         let mut code = 0u32;
@@ -208,6 +217,7 @@ impl Account {
             WaitForSingleObject(process.0, INFINITE);
             GetExitCodeProcess(process.0, &mut code).unwrap();
         }
+        note(format_args!("{exe:?} as {} exited with {code}", self.name));
         code
     }
 }
@@ -217,10 +227,13 @@ impl Drop for Account {
         // SAFETY: NUL-terminated inputs.
         unsafe {
             if self.profile.is_some() {
+                note(format_args!("deleting the profile of {}", self.name));
                 let _ = DeleteProfileW(PCWSTR(wide(&self.sid_text).as_ptr()), PCWSTR::null(), PCWSTR::null());
             }
+            note(format_args!("deleting the account {}", self.name));
             let _ = NetUserDel(PCWSTR::null(), PCWSTR(wide(&self.name).as_ptr()));
         }
+        note(format_args!("removed {}", self.name));
     }
 }
 
@@ -246,6 +259,14 @@ impl SharedDir {
 impl Drop for SharedDir {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// What `icacls` prints for `path`, for an assertion message.
+fn icacls_report(path: &Path) -> String {
+    match Command::new("icacls").arg(path).output() {
+        Ok(out) => String::from_utf8_lossy(&out.stdout).trim().to_owned(),
+        Err(e) => format!("icacls did not run: {e}"),
     }
 }
 
@@ -394,7 +415,10 @@ fn a_permissive_default_dacl_is_in_effect_where_nothing_is_inherited() {
 
     assert!(
         !acl::verify_file_acl(&file, &me).unwrap(),
-        "a file made under a permissive default DACL, in a directory that passes nothing down, is not exact"
+        "a file made under a permissive default DACL, in a directory that passes nothing down, is not exact\n\
+         the file: {}\nits directory: {}",
+        icacls_report(&file),
+        icacls_report(&plain)
     );
 }
 
@@ -592,14 +616,18 @@ fn shim_as_bob_never_reaches_another_users_listener() {
     let shared = SharedDir::new("shim");
     let shim = shared.0.join("ssh-broker.exe");
     std::fs::copy(env!("CARGO_BIN_EXE_ssh-broker"), &shim).unwrap();
+    // Shaped like a non-PTY sshd session, which the shim tells from a PTY one by its stdin: a
+    // console stdin (what `run` gives a process) makes it keep the quotes around the command, and
+    // `"cmd.exe /c echo shim-ran"` names no program. So stdin is NUL. The redirections come first
+    // because `cmd` leaves the space before a trailing one in the command line the shim reads.
     let script = shared.0.join("run.cmd");
     std::fs::write(
         &script,
         format!(
-            "@\"{}\" -c \"cmd.exe /c echo shim-ran\" > \"{}\" 2> \"{}\"\r\n",
-            shim.display(),
+            "@echo off\r\n<nul >\"{}\" 2>\"{}\" \"{}\" -c \"cmd.exe /c echo shim-ran\"\r\n",
             shared.0.join("out.txt").display(),
-            shared.0.join("err.txt").display()
+            shared.0.join("err.txt").display(),
+            shim.display(),
         ),
     )
     .unwrap();
@@ -617,6 +645,7 @@ fn shim_as_bob_never_reaches_another_users_listener() {
     );
     assert!(stdout.contains("shim-ran"), "and ran the command locally: {stdout}");
 
+    note("the shim ran; connecting the sentinel");
     // Connections are accepted in order, so if the shim had connected it would be first. Ours
     // comes second at best, and its marker byte is what the acceptor must see.
     let mut sentinel = afunix::connect(&admin_loc.path).unwrap();
