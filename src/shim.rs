@@ -23,9 +23,9 @@ pub fn run(exec: Option<RawExec>) -> anyhow::Result<()> {
 
 /// The command line to hand to `CreateProcessW`.
 ///
-/// The command is relayed as the client sent it, minus its leading edge: `CreateProcessW` rejects
-/// a line that starts with a [`BOUNDARY`] character (`ERROR_INVALID_PARAMETER` for space or tab,
-/// `ERROR_FILE_NOT_FOUND` for CR or LF). Nothing trailing is trimmed, so programs that read their
+/// The command is relayed as the client sent it, minus its leading [`BOUNDARY`] characters:
+/// `CreateProcessW` fails on a line that starts with one (`ERROR_INVALID_PARAMETER` for space or
+/// tab; a CR or LF is read as part of the program name). Nothing trailing is trimmed, so programs that read their
 /// raw command line (`cmd /c echo a   `) see it. A trailing line break after a bare program name
 /// therefore fails like a misspelled program; no string rule can tell which shapes
 /// `CreateProcessW` would run as sent, since it depends on the files on disk. Both spawn sites
@@ -34,9 +34,9 @@ pub fn spawn_line(command: &str) -> &str {
     command.trim_start_matches(BOUNDARY)
 }
 
-/// The characters `CreateProcessW` rejects at the start of a command line (space and tab with
-/// `ERROR_INVALID_PARAMETER`, CR and LF with `ERROR_FILE_NOT_FOUND`), and the ones a command made
-/// only of is blank. Deliberately NOT Rust's `trim`, whose Unicode `White_Space` set would strip
+/// Space, tab, CR and LF: the characters trimmed from the start of a spawn line, and the only ones
+/// a blank command may consist of. Space and tab are what Windows separates arguments on; CR and LF
+/// are included because a line break is blank to a shell. Deliberately NOT Rust's `trim`, whose Unicode `White_Space` set would strip
 /// characters this pipeline treats as part of an argument.
 pub const BOUNDARY: [char; 4] = [' ', '\t', '\r', '\n'];
 

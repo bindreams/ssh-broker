@@ -207,9 +207,8 @@ fn size_event_maps_to_resize_frame() {
     assert_eq!(size_to_resize(120, 40), Resize { cols: 120, rows: 40 });
 }
 
-/// `CreateProcessW` rejects a line with leading whitespace (`ERROR_INVALID_PARAMETER` for space
-/// or tab, `ERROR_FILE_NOT_FOUND` for CR or LF), so the leading `BOUNDARY` characters are
-/// trimmed. Nothing else is: a Unicode space is part of an argument.
+/// The leading `BOUNDARY` characters are trimmed (`CreateProcessW` fails on a line that starts
+/// with one). Nothing else is: a Unicode space is part of an argument.
 #[test]
 fn spawn_line_trims_the_leading_boundary_characters() {
     assert_eq!(spawn_line("  cmd /c x"), "cmd /c x");
