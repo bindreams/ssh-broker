@@ -30,6 +30,8 @@ pub mod shim;
 #[cfg(windows)]
 pub mod shim_pty;
 pub mod socket_loc;
+#[cfg(windows)]
+pub mod userdir;
 pub mod vtinput;
 #[cfg(windows)]
 pub mod winutil;
