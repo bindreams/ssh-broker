@@ -50,12 +50,25 @@ fn start() -> anyhow::Result<()> {
     let session = crate::provision::probe::current_session_id();
     anyhow::ensure!(
         session_allows_agent(session),
-        "the agent will not run in session 0: a shell hosted there has the limited environment this tool exists to          avoid. It belongs in the user's interactive session; the logon task starts it there"
+        "the agent will not run in session 0: a shell hosted there has the limited environment this tool \
+         exists to avoid. It belongs in the user's interactive session; the logon task starts it there"
     );
     let location = crate::userdir::current_socket_location()?;
     let user = crate::acl::Sid::current_user()?;
     crate::userdir::ensure_socket_dir(&location, &user)?;
+    // Held to the end: dropping the guard stops the writer and later lines are lost. Before this
+    // point there is no log, and an error goes to stderr, which a logon task discards.
+    let _log = crate::filelog::init_in(&location.logs_dir(), "agent.log");
+    let result = serve(&location);
+    if let Err(e) = &result {
+        tracing::error!("the agent stopped: {e:#}");
+    }
+    result
+}
 
+/// Become the one agent that serves this user, then serve.
+#[cfg(windows)]
+fn serve(location: &SocketLocation) -> anyhow::Result<()> {
     // One agent per session: `apply` and the boot self-heal start one per logged-on session
     // every time they run, and the logon task starts one per logon.
     let Some(_slot) = SessionSlot::try_acquire()? else {
@@ -71,7 +84,7 @@ fn start() -> anyhow::Result<()> {
             UserLock::acquire(&location.lock_path())?
         }
     };
-    run_on(&location)
+    run_on(location)
 }
 
 /// Bind the hardened socket and serve connections, one handler thread each. The caller holds

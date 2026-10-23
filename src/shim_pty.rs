@@ -61,7 +61,7 @@ const VT_OUT: CONSOLE_MODE =
 /// A `-c` session resolves its command first, once the log is open: `detect` says how sshd
 /// encoded it (see [`resolve_exec`]), and a blank command ends the run there, exit 0.
 pub fn run_on(exec: Option<RawExec>, detect: impl FnOnce() -> Encoding) -> anyhow::Result<()> {
-    let log = init_file_logging();
+    let log = crate::filelog::init_for_current_user("shim.log");
     let exec = exec.map(|exec| resolve_exec(exec, detect));
     if exec.as_deref().is_some_and(is_blank_command) {
         drop(log); // flush: `process::exit` runs no destructors
@@ -696,34 +696,6 @@ impl<Ops: ConsoleOps> Drop for ConsoleModesState<Ops> {
             }
         }
     }
-}
-
-// ── logging ────────────────────────────────────────────────────────────────────────
-
-/// Initialise a rolling file log under ProgramData. Best-effort: returns `None` (logging
-/// disabled) on any failure so the shim still works. NEVER logs to stdout/stderr in PTY mode.
-fn init_file_logging() -> Option<tracing_appender::non_blocking::WorkerGuard> {
-    init_file_logging_in(&log_dir())
-}
-
-/// [`init_file_logging`] against an explicit directory, so a test can point it at one that
-/// refuses writes.
-fn init_file_logging_in(dir: &std::path::Path) -> Option<tracing_appender::non_blocking::WorkerGuard> {
-    std::fs::create_dir_all(dir).ok()?;
-    // `rolling::daily` panics when the first log file cannot be created; the builder returns the
-    // error instead.
-    let appender = tracing_appender::rolling::RollingFileAppender::builder()
-        .rotation(tracing_appender::rolling::Rotation::DAILY)
-        .filename_prefix("shim.log")
-        .build(dir)
-        .ok()?;
-    let (nb, guard) = tracing_appender::non_blocking(appender);
-    let _ = tracing_subscriber::fmt().with_writer(nb).with_ansi(false).try_init();
-    Some(guard)
-}
-
-fn log_dir() -> std::path::PathBuf {
-    crate::provision::layout::Layout::production().logs_dir()
 }
 
 #[cfg(test)]

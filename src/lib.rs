@@ -21,6 +21,8 @@ pub mod cmdline;
 #[cfg(windows)]
 pub mod conpty;
 #[cfg(windows)]
+pub mod filelog;
+#[cfg(windows)]
 pub mod hangup;
 #[cfg(windows)]
 pub mod pipes;

@@ -193,58 +193,6 @@ fn enter_rolls_back_only_what_it_actually_changed_on_partial_failure() {
     );
 }
 
-/// A directory that refuses new files, removed (deny ACE lifted first) when dropped.
-struct WriteDeniedDir(std::path::PathBuf);
-
-impl WriteDeniedDir {
-    fn new(tag: &str) -> Self {
-        let dir = std::env::temp_dir().join(format!("sb-logdeny-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        // DENY beats the runner's admin ALLOW, so this holds for an elevated test process too.
-        let status = std::process::Command::new("icacls")
-            .arg(&dir)
-            .args(["/deny", "*S-1-1-0:(OI)(CI)(WD)"])
-            .status()
-            .expect("run icacls");
-        assert!(status.success(), "icacls /deny should succeed");
-        Self(dir)
-    }
-}
-
-impl Drop for WriteDeniedDir {
-    fn drop(&mut self) {
-        let _ = std::process::Command::new("icacls")
-            .arg(&self.0)
-            .args(["/remove:d", "*S-1-1-0"])
-            .status();
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
-/// A log directory the user cannot write must disable logging, not abort the shim (a panic exits
-/// 101 before the fail-open path runs).
-#[test]
-fn file_logging_is_disabled_not_fatal_when_the_log_directory_is_unwritable() {
-    let dir = WriteDeniedDir::new("unwritable");
-    assert!(
-        super::init_file_logging_in(&dir.0).is_none(),
-        "an unwritable log directory must yield no logging, not a guard"
-    );
-}
-
-#[test]
-fn file_logging_is_enabled_for_a_writable_log_directory() {
-    let dir = std::env::temp_dir().join(format!("sb-logok-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-
-    let guard = super::init_file_logging_in(&dir);
-
-    assert!(guard.is_some(), "a writable log directory must yield a guard");
-    drop(guard);
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
 /// The fail-open spawn trims leading whitespace for `CreateProcessW`, which rejects it; the
 /// relay's spawn does the same (`pipes_tests`).
 #[test]

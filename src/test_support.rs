@@ -1,6 +1,10 @@
-//! Helpers shared by the Windows unit tests: reading a DACL by well-known SID alias.
+//! Helpers shared by the Windows unit tests: reading a DACL by well-known SID alias, and a
+//! stand-in profile directory.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use crate::socket_loc::{SOCKET_DIR_NAME, SOCKET_FILE_NAME, SocketLocation};
 
 use windows::Win32::Foundation::{HLOCAL, LocalFree};
 use windows::Win32::Security::Authorization::{
@@ -65,4 +69,34 @@ pub fn aces(sddl: &str) -> Vec<(&str, &str, u32, &str)> {
             (f[0], f[1], mask, f[5])
         })
         .collect()
+}
+
+// A stand-in profile -----
+
+/// A stand-in profile under the temp dir, removed on drop. `AppData\Local` exists inside it, as
+/// it does in a real profile.
+pub struct TempProfile(pub PathBuf);
+
+impl TempProfile {
+    pub fn new(tag: &str) -> TempProfile {
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!("sb-ud-{tag}-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(root.join("AppData").join("Local")).unwrap();
+        TempProfile(root)
+    }
+
+    pub fn location(&self) -> SocketLocation {
+        let dir = self.0.join("AppData").join("Local").join(SOCKET_DIR_NAME);
+        SocketLocation {
+            path: dir.join(SOCKET_FILE_NAME),
+            dir,
+        }
+    }
+}
+
+impl Drop for TempProfile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }

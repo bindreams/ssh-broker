@@ -79,6 +79,11 @@ fn ensure_private_dir(dir: &std::path::Path, user: &Sid) -> anyhow::Result<()> {
     if let Some(problem) = acl::private_dir_problem(dir, user)? {
         anyhow::bail!("{} cannot be used as the private folder: {problem}", dir.display());
     }
+    // Already exactly right: leave it. Re-applying the DACL re-propagates it to the socket file,
+    // and the shim runs this on every connection while an agent serves.
+    if acl::verify_dir_acl(dir, user)? {
+        return Ok(());
+    }
     acl::harden_dir(dir, user).with_context(|| format!("harden {}", dir.display()))?;
     anyhow::ensure!(
         acl::verify_dir_acl(dir, user).with_context(|| format!("verify the ACL of {}", dir.display()))?,

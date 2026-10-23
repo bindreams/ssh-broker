@@ -119,38 +119,8 @@ fn current_socket_location_ignores_decoy_environment() {
 // ensure_socket_dir ---------------------------------------------------------------------
 
 use crate::acl::{self, Sid};
-use crate::socket_loc::{SOCKET_DIR_NAME, SOCKET_FILE_NAME};
-use crate::test_support::{FILE_ALL, aces, dacl_sddl};
+use crate::test_support::{FILE_ALL, TempProfile, aces, dacl_sddl};
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
-
-/// A stand-in profile under the temp dir, removed on drop. `AppData\Local` exists inside it, as
-/// it does in a real profile.
-struct TempProfile(PathBuf);
-
-impl TempProfile {
-    fn new(tag: &str) -> TempProfile {
-        static COUNTER: AtomicUsize = AtomicUsize::new(0);
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let root = std::env::temp_dir().join(format!("sb-ud-{tag}-{}-{n}", std::process::id()));
-        std::fs::create_dir_all(root.join("AppData").join("Local")).unwrap();
-        TempProfile(root)
-    }
-
-    fn location(&self) -> SocketLocation {
-        let dir = self.0.join("AppData").join("Local").join(SOCKET_DIR_NAME);
-        SocketLocation {
-            path: dir.join(SOCKET_FILE_NAME),
-            dir,
-        }
-    }
-}
-
-impl Drop for TempProfile {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
 
 fn me() -> Sid {
     Sid::current_user().unwrap()

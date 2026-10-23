@@ -95,7 +95,8 @@ impl Listener {
             let _ = std::fs::remove_file(path);
             return match proven {
                 Ok(_) => Err(anyhow::anyhow!(
-                    "the socket file {} does not grant exactly the user, SYSTEM and Administrators;                      refusing to listen (fail-closed)",
+                    "the socket file {} does not grant exactly the user, SYSTEM and Administrators; \
+                     refusing to listen (fail-closed)",
                     path.display()
                 )),
                 Err(e) => Err(e.context(format!("check the socket file {}", path.display()))),
