@@ -19,7 +19,7 @@ use std::sync::mpsc;
 
 use ssh_broker::acl::{self, Sid};
 use ssh_broker::afunix::{self, Listener};
-use ssh_broker::agent_lock::UserLock;
+use ssh_broker::agent_lock::{SessionSlot, UserLock};
 use ssh_broker::socket_loc::SocketLocation;
 use ssh_broker::userdir;
 use ssh_broker::winutil::OwnedHandle;
@@ -409,10 +409,15 @@ fn a_creator_whose_default_dacl_is_world_accessible_still_gets_an_exact_socket_a
     with_permissive_default_dacl(|| {
         userdir::ensure_socket_dir(&loc, &me).unwrap();
         let _lock = UserLock::try_acquire(&loc.lock_path()).unwrap().unwrap();
+        let _slot = SessionSlot::try_acquire(&loc.session_lock_path(1)).unwrap().unwrap();
         let _listener = Listener::bind(&loc.path).unwrap();
 
         assert!(acl::verify_file_acl(&loc.path, &me).unwrap(), "agent.sock");
         assert!(acl::verify_file_acl(&loc.lock_path(), &me).unwrap(), "agent.lock");
+        assert!(
+            acl::verify_file_acl(&loc.session_lock_path(1), &me).unwrap(),
+            "session slot"
+        );
         assert!(acl::verify_file_acl(&loc.logs_dir(), &me).unwrap(), "logs");
     });
 }
@@ -427,6 +432,7 @@ fn each_users_socket_dir_acl_is_exact() {
     with_permissive_default_dacl(|| {
         userdir::ensure_socket_dir(&loc, &admin).unwrap();
         let _lock = UserLock::try_acquire(&loc.lock_path()).unwrap().unwrap();
+        let _slot = SessionSlot::try_acquire(&loc.session_lock_path(1)).unwrap().unwrap();
         let _listener = Listener::bind(&loc.path).unwrap();
 
         assert!(acl::verify_dir_acl(&loc.dir, &admin).unwrap());
@@ -437,7 +443,15 @@ fn each_users_socket_dir_acl_is_exact() {
         // Born with exactly the three, although the creating token would have let everyone in.
         assert!(acl::verify_file_acl(&loc.path, &admin).unwrap(), "agent.sock");
         assert!(acl::verify_file_acl(&loc.lock_path(), &admin).unwrap(), "agent.lock");
+        assert!(
+            acl::verify_file_acl(&loc.session_lock_path(1), &admin).unwrap(),
+            "session slot"
+        );
         assert!(!acl::verify_file_acl(&loc.path, &bob.sid).unwrap());
+        assert!(
+            !acl::verify_file_acl(&loc.session_lock_path(1), &bob.sid).unwrap(),
+            "the session slot is not bob's"
+        );
     });
 }
 

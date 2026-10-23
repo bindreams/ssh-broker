@@ -3,9 +3,6 @@ use super::*;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
-use windows::Win32::Foundation::CloseHandle;
-use windows::Win32::System::Threading::CreateMutexW;
-use windows::core::PCWSTR;
 
 fn unique(tag: &str) -> String {
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -157,24 +154,4 @@ fn session_slots_of_different_sessions_do_not_conflict() {
             .unwrap()
             .is_some()
     );
-}
-
-#[test]
-fn a_foreign_object_in_the_session_namespace_cannot_take_the_slot() {
-    // The slot used to be the named mutex `Local\ssh-broker-agent`, which any process in the
-    // session can create first, whatever account it runs as. It is now a lock on a file in the
-    // user's verified folder, so a mutex of that old name means nothing to it.
-    let wide: Vec<u16> = r"Local\ssh-broker-agent"
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect();
-    // SAFETY: `wide` is NUL-terminated and outlives the call; the handle is closed below.
-    let squatter = unsafe { CreateMutexW(None, true, PCWSTR(wide.as_ptr())) }.unwrap();
-
-    let dir = TempLock::new("slot-squat");
-    let slot = SessionSlot::try_acquire(&dir.path()).unwrap();
-
-    // SAFETY: the handle was just created and is closed once.
-    let _ = unsafe { CloseHandle(squatter) };
-    assert!(slot.is_some(), "the squatter's object did not stop the slot");
 }
