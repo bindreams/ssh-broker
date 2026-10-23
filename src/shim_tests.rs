@@ -226,29 +226,29 @@ fn spawn_line_keeps_trailing_spaces_and_tabs() {
     assert_eq!(spawn_line("whoami "), "whoami ");
 }
 
-/// CR or LF after arguments is part of the line (`CreateProcessW` runs it as is).
+/// Nothing trailing is trimmed, whatever the shape of the line: a trailing line break fails like a
+/// misspelled program (`CreateProcessW` reports `ERROR_FILE_NOT_FOUND`), by design. Which shapes
+/// `CreateProcessW` would run as sent depends on the files on disk, so no string rule can tell
+/// them apart.
 #[test]
-fn spawn_line_keeps_trailing_line_breaks_after_arguments() {
+fn spawn_line_keeps_trailing_line_breaks_in_every_shape() {
+    // arguments
     assert_eq!(spawn_line("scp -t /p\r\n"), "scp -t /p\r\n");
     assert_eq!(spawn_line("scp -t /p \t\r\n"), "scp -t /p \t\r\n");
-}
-
-/// A bare program name followed by CR or LF names a file that cannot exist (`CreateProcessW`
-/// fails with `ERROR_FILE_NOT_FOUND`), so the line break is trimmed.
-#[test]
-fn spawn_line_trims_line_breaks_after_a_bare_program_name() {
-    assert_eq!(spawn_line("whoami\n"), "whoami");
-    assert_eq!(spawn_line("\r\n whoami\r\n"), "whoami");
-    assert_eq!(spawn_line("whoami\r\n\r\n"), "whoami");
-}
-
-/// A quoted program name ends at its closing quote, so a line break after it is an argument
-/// (`CreateProcessW` runs `"whoami"\n`) and is kept.
-#[test]
-fn spawn_line_keeps_line_breaks_after_a_quoted_program_name() {
+    // bare program name
+    assert_eq!(spawn_line("whoami\n"), "whoami\n");
+    assert_eq!(spawn_line("\r\n whoami\r\n"), "whoami\r\n");
+    assert_eq!(spawn_line("whoami\r\n\r\n"), "whoami\r\n\r\n");
+    // quoted program name
     assert_eq!(spawn_line("\"whoami\"\n"), "\"whoami\"\n");
     assert_eq!(spawn_line("\"C:\\tools\\prog.exe\"\r\n"), "\"C:\\tools\\prog.exe\"\r\n");
     assert_eq!(spawn_line("\r\n\"whoami\"\n"), "\"whoami\"\n");
+    // unclosed quote
+    assert_eq!(spawn_line("\"whoami\n"), "\"whoami\n");
+    assert_eq!(spawn_line(" \"whoami\r\n"), "\"whoami\r\n");
+    // unquoted spaced path, with and without arguments
+    assert_eq!(spawn_line("C:\\Sp Dir\\p.exe\n"), "C:\\Sp Dir\\p.exe\n");
+    assert_eq!(spawn_line("C:\\Sp Dir\\p.exe /?\r\n"), "C:\\Sp Dir\\p.exe /?\r\n");
 }
 
 #[test]

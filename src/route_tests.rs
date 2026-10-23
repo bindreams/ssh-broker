@@ -112,7 +112,7 @@ fn every_dash_c_command_routes_to_the_relay_with_its_text_intact() {
 }
 
 /// The command is relayed as the client sent it, edges included: the string the shim sends is
-/// the string the client wrote. (`shim::spawn_line` trims only for `CreateProcessW`.)
+/// the string the client wrote. (`shim::spawn_line` trims only its leading edge, for `CreateProcessW`.)
 #[test]
 fn a_command_keeps_the_whitespace_at_its_edges() {
     assert_eq!(command(r#"ssh-broker.exe -c "  scp -t /x  ""#), some("  scp -t /x  "));

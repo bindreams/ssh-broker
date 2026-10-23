@@ -23,22 +23,15 @@ pub fn run(exec: Option<RawExec>) -> anyhow::Result<()> {
 
 /// The command line to hand to `CreateProcessW`.
 ///
-/// The command is relayed as the client sent it; only what `CreateProcessW` cannot run is
-/// trimmed. It rejects a line that starts with a [`BOUNDARY`] character (`ERROR_INVALID_PARAMETER`
-/// for space or tab, `ERROR_FILE_NOT_FOUND` for CR or LF), so the leading edge is trimmed. An
-/// unquoted line with no space or tab is a bare program name, and a trailing CR or LF would
-/// become part of a file name that cannot exist, so those are trimmed too. A quoted program name
-/// ends at its closing quote, so a line break after it is an argument and is kept, as are
-/// trailing characters after arguments: programs that read their raw command line
-/// (`cmd /c echo a   `) see them. Both spawn sites (`pipes::ExecChild::spawn` and
-/// `shim_pty::spawn_contained`) call this.
+/// The command is relayed as the client sent it, minus its leading edge: `CreateProcessW` rejects
+/// a line that starts with a [`BOUNDARY`] character (`ERROR_INVALID_PARAMETER` for space or tab,
+/// `ERROR_FILE_NOT_FOUND` for CR or LF). Nothing trailing is trimmed, so programs that read their
+/// raw command line (`cmd /c echo a   `) see it. A trailing line break after a bare program name
+/// therefore fails like a misspelled program; no string rule can tell which shapes
+/// `CreateProcessW` would run as sent, since it depends on the files on disk. Both spawn sites
+/// (`pipes::ExecChild::spawn` and `shim_pty::spawn_contained`) call this.
 pub fn spawn_line(command: &str) -> &str {
-    let line = command.trim_start_matches(BOUNDARY);
-    if line.starts_with('"') || line.contains([' ', '\t']) {
-        line
-    } else {
-        line.trim_end_matches(['\r', '\n'])
-    }
+    command.trim_start_matches(BOUNDARY)
 }
 
 /// The characters that carry no meaning at a command's edges. Windows separates arguments on
