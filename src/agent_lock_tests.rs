@@ -73,22 +73,33 @@ fn a_waiting_acquire_takes_over_when_the_holder_drops() {
     let dir = TempLock::new("takeover");
     let holder = UserLock::try_acquire(&dir.path()).unwrap().unwrap();
 
+    let (waiting, saw_it_held) = mpsc::channel();
     let (acquired, wait_done) = mpsc::channel();
     let path = dir.path();
     let waiter = std::thread::spawn(move || {
-        let lock = UserLock::acquire(&path).unwrap();
+        let lock = UserLock::acquire(&path, || waiting.send(()).unwrap()).unwrap();
         acquired.send(()).unwrap();
         lock
     });
 
+    // The waiter found the lock held and is about to block on it: only now is the drop a
+    // hand-over rather than a lock nobody held. Each wait is on the real condition.
+    saw_it_held.recv().expect("acquire never reported that it had to wait");
     drop(holder);
-    // Blocks on the real condition: the waiter holds the lock.
-    wait_done.recv().unwrap();
+    wait_done.recv().expect("the waiter failed instead of taking over");
     let lock = waiter.join().unwrap();
     assert!(
         UserLock::try_acquire(&dir.path()).unwrap().is_none(),
         "the waiter now holds it"
     );
+    drop(lock);
+}
+
+#[test]
+fn acquire_of_a_free_lock_does_not_report_waiting() {
+    let dir = TempLock::new("free");
+    let lock = UserLock::acquire(&dir.path(), || panic!("nobody holds the lock")).unwrap();
+    assert!(UserLock::try_acquire(&dir.path()).unwrap().is_none());
     drop(lock);
 }
 

@@ -92,10 +92,17 @@ impl UserLock {
         }
     }
 
-    /// Wait for the lock, however long that takes. The holder is another agent that exists, so
-    /// there is nothing to time out on: the wait ends when it dies.
-    pub fn acquire(path: &Path) -> anyhow::Result<UserLock> {
+    /// Take the lock, waiting for it if another handle holds it. `on_wait` runs once, after the
+    /// lock was found held and before the wait begins, so a caller can say it is waiting and a
+    /// test can tell "held, about to block" from "free". The wait has no limit: the holder is
+    /// another agent that exists, so there is nothing to time out on; it ends when the holder dies.
+    pub fn acquire(path: &Path, on_wait: impl FnOnce()) -> anyhow::Result<UserLock> {
         let file = open(path)?;
+        match lock(&file, LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY) {
+            Ok(()) => return Ok(UserLock { _file: file }),
+            Err(e) if e.code() == HRESULT::from_win32(ERROR_LOCK_VIOLATION.0) => on_wait(),
+            Err(e) => return Err(e).with_context(|| format!("lock {}", path.display())),
+        }
         lock(&file, LOCKFILE_EXCLUSIVE_LOCK).with_context(|| format!("lock {}", path.display()))?;
         Ok(UserLock { _file: file })
     }

@@ -227,7 +227,7 @@ fn an_agent_that_takes_over_the_lock_reclaims_the_dead_agents_socket() {
     drop(first_lock);
 
     // The second takes the lock, then binds over the stale file.
-    let _second_lock = UserLock::acquire(&lock).unwrap();
+    let _second_lock = UserLock::acquire(&lock, || panic!("the lock was free")).unwrap();
     let _second = super::Listener::bind(&sock).unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }

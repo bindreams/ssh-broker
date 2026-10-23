@@ -77,13 +77,9 @@ fn serve(location: &SocketLocation) -> anyhow::Result<()> {
     };
     // One serving agent per user. A second session of the same user waits instead of leaving:
     // the serving agent dies with its session, and this user may still be logged on here.
-    let _lock = match UserLock::try_acquire(&location.lock_path())? {
-        Some(lock) => lock,
-        None => {
-            tracing::info!("waiting for the agent of another session of this user to end");
-            UserLock::acquire(&location.lock_path())?
-        }
-    };
+    let _lock = UserLock::acquire(&location.lock_path(), || {
+        tracing::info!("waiting for the agent of another session of this user to end");
+    })?;
     run_on(location)
 }
 
