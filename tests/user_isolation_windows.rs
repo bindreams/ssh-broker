@@ -23,16 +23,19 @@ use ssh_broker::agent_lock::{SessionSlot, UserLock};
 use ssh_broker::socket_loc::SocketLocation;
 use ssh_broker::userdir;
 use ssh_broker::winutil::OwnedHandle;
-use windows::Win32::Foundation::HANDLE;
+use windows::Win32::Foundation::{HANDLE, HLOCAL, LocalFree};
 use windows::Win32::NetworkManagement::NetManagement::{
     NetUserAdd, NetUserDel, UF_DONT_EXPIRE_PASSWD, UF_SCRIPT, USER_INFO_1, USER_PRIV_USER,
 };
-use windows::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
+use windows::Win32::Security::Authorization::{
+    ConvertSecurityDescriptorToStringSecurityDescriptorW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
+    GetNamedSecurityInfoW, SE_FILE_OBJECT, SetNamedSecurityInfoW,
+};
 use windows::Win32::Security::{
-    ACL, DuplicateTokenEx, GetSecurityDescriptorDacl, GetTokenInformation, LOGON32_LOGON_NETWORK,
-    LOGON32_PROVIDER_DEFAULT, LogonUserW, PSECURITY_DESCRIPTOR, SecurityImpersonation, SetTokenInformation,
-    TOKEN_ALL_ACCESS, TOKEN_DEFAULT_DACL, TOKEN_DUPLICATE, TOKEN_ELEVATION, TOKEN_QUERY, TokenDefaultDacl,
-    TokenElevation, TokenImpersonation, TokenPrimary,
+    ACL, DACL_SECURITY_INFORMATION, DuplicateTokenEx, GetSecurityDescriptorDacl, GetTokenInformation,
+    LOGON32_LOGON_NETWORK, LOGON32_PROVIDER_DEFAULT, LogonUserW, PROTECTED_DACL_SECURITY_INFORMATION,
+    PSECURITY_DESCRIPTOR, SecurityImpersonation, SetTokenInformation, TOKEN_ALL_ACCESS, TOKEN_DEFAULT_DACL,
+    TOKEN_DUPLICATE, TOKEN_ELEVATION, TOKEN_QUERY, TokenDefaultDacl, TokenElevation, TokenImpersonation, TokenPrimary,
 };
 use windows::Win32::System::Threading::{
     CREATE_NO_WINDOW, CreateProcessWithTokenW, GetCurrentProcess, OpenProcessToken, PROCESS_INFORMATION, STARTUPINFOW,
@@ -43,6 +46,8 @@ use windows::core::{BOOL, PCWSTR, PWSTR};
 
 #[path = "common/bounded_wait.rs"]
 mod bounded_wait;
+#[path = "common/thread_stacks.rs"]
+mod thread_stacks;
 
 // Fixture ---------------------------------------------------------------------------------
 
@@ -173,7 +178,7 @@ impl Account {
     /// Run `exe` with `command_line` under this account's network-logon token, the way sshd runs
     /// its shell, with the CALLER's environment (so a stale `USERPROFILE` is in play). Returns the
     /// exit code. A child still running after [`bounded_wait::CHILD_EXIT_BOUND`] fails the test
-    /// with the process tree, this account's ssh-broker logs and `evidence` printed, and is killed.
+    /// with the process tree, thread stacks, this account's ssh-broker folder and `evidence` printed, and is killed.
     fn run(&self, exe: &Path, command_line: &str, cwd: &Path, evidence: &[PathBuf]) -> u32 {
         let network = self.network_token();
         let mut primary = HANDLE::default();
@@ -220,7 +225,7 @@ impl Account {
         let _thread = OwnedHandle(info.hThread);
         let mut evidence = evidence.to_vec();
         if let Some(profile) = &self.profile {
-            evidence.push(profile.join("AppData").join("Local").join("ssh-broker").join("logs"));
+            evidence.push(profile.join("AppData").join("Local").join("ssh-broker"));
         }
         let what = format!("{exe:?} as {}", self.name);
         let code = bounded_wait::wait_for_exit(
@@ -283,18 +288,86 @@ fn icacls_report(path: &Path) -> String {
     }
 }
 
-/// The owner and DACL of `path` as SDDL (inherited ACEs carry `ID`), for an assertion message.
-fn sddl_report(path: &Path) -> String {
-    let script = format!(
-        "(Get-Acl -LiteralPath '{}').Sddl",
-        path.display().to_string().replace('\'', "''")
-    );
-    match Command::new("powershell")
-        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
-        .output()
-    {
-        Ok(out) => String::from_utf8_lossy(&out.stdout).trim().to_owned(),
-        Err(e) => format!("powershell did not run: {e}"),
+/// The DACL of `path` as SDDL, read through the security API (an inherited ACE carries `ID`, an
+/// ACE that passes access down `OI` or `CI`), for an assertion message and for the precondition
+/// of the control test.
+fn dacl_sddl(path: &Path) -> String {
+    let path_w = wide(&path.to_string_lossy());
+    let mut sd = PSECURITY_DESCRIPTOR::default();
+    // SAFETY: NUL-terminated path, valid out-pointers; both allocations are freed below.
+    unsafe {
+        let rc = GetNamedSecurityInfoW(
+            PCWSTR(path_w.as_ptr()),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            None,
+            None,
+            &mut sd,
+        );
+        if let Err(e) = rc.ok() {
+            return format!("(cannot read the DACL: {e})");
+        }
+        let mut text = PWSTR::null();
+        let converted =
+            ConvertSecurityDescriptorToStringSecurityDescriptorW(sd, 1, DACL_SECURITY_INFORMATION, &mut text, None);
+        let out = match converted {
+            Ok(()) => text.to_string().unwrap_or_else(|e| format!("(not UTF-16: {e})")),
+            Err(e) => format!("(cannot convert the DACL: {e})"),
+        };
+        let _ = LocalFree(Some(HLOCAL(text.0.cast())));
+        let _ = LocalFree(Some(HLOCAL(sd.0)));
+        out
+    }
+}
+
+/// Whether the DACL in `sddl` is protected, and none of its ACEs is inherited or passes access to
+/// children (flags `ID`, `OI`, `CI`, `IO`, `NP`).
+fn passes_nothing_down(sddl: &str) -> bool {
+    let Some(dacl) = sddl.strip_prefix("D:") else {
+        return false;
+    };
+    let Some((header, aces)) = dacl.split_once('(') else {
+        return false;
+    };
+    // Protected, and not auto-inherited (`AI` is harmless but `AR` asks for inheritance).
+    if !header.contains('P') || header.contains("AR") {
+        return false;
+    }
+    format!("({aces}")
+        .split(')')
+        .filter(|ace| !ace.is_empty())
+        .all(|ace| ace.trim_start_matches('(').split(';').nth(1).is_some_and(str::is_empty))
+}
+
+/// Give `dir` a protected DACL of exactly `user`, SYSTEM and Administrators with Full Control,
+/// each ACE without inheritance flags: nothing is inherited into it and nothing passes down. Set
+/// through the security API, so no tool's reading of "remove inheritance" is involved.
+fn set_plain_protected_dacl(dir: &Path, user: &Sid) {
+    let sddl = wide(&format!(
+        "D:P(A;;FA;;;{})(A;;FA;;;SY)(A;;FA;;;BA)",
+        user.to_sddl().unwrap()
+    ));
+    let dir_w = wide(&dir.to_string_lossy());
+    // SAFETY: NUL-terminated inputs; the descriptor outlives the call and is freed after it.
+    unsafe {
+        let mut sd = PSECURITY_DESCRIPTOR::default();
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(PCWSTR(sddl.as_ptr()), 1, &mut sd, None).unwrap();
+        let (mut present, mut defaulted) = (BOOL(0), BOOL(0));
+        let mut dacl: *mut ACL = std::ptr::null_mut();
+        GetSecurityDescriptorDacl(sd, &mut present, &mut dacl, &mut defaulted).unwrap();
+        let rc = SetNamedSecurityInfoW(
+            PCWSTR(dir_w.as_ptr()),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            Some(dacl as *const ACL),
+            None,
+        );
+        let _ = LocalFree(Some(HLOCAL(sd.0)));
+        rc.ok().unwrap();
     }
 }
 
@@ -424,30 +497,26 @@ fn a_permissive_default_dacl_is_in_effect_where_nothing_is_inherited() {
     let dir = StandInProfile::new("control");
     let plain = dir.0.join("plain");
     std::fs::create_dir(&plain).unwrap();
-    // Protected and with ACEs that do not propagate.
-    let status = Command::new("icacls")
-        .arg(&plain)
-        .args([
-            "/inheritance:r",
-            "/grant:r",
-            &format!("*{}:F", me.to_sddl().unwrap()),
-            "*S-1-5-18:F",
-            "*S-1-5-32-544:F",
-        ])
-        .status()
-        .unwrap();
-    assert!(status.success());
+    // Protected, with ACEs that do not propagate. `icacls` is not used: a runner's temporary
+    // directory left inheritable ACEs on the result, so the precondition is read back.
+    set_plain_protected_dacl(&plain, &me);
+    let plain_dacl = dacl_sddl(&plain);
+    assert!(
+        passes_nothing_down(&plain_dacl),
+        "the control directory must inherit nothing and pass nothing down: {plain_dacl}\n{}",
+        icacls_report(&plain)
+    );
 
     let file = plain.join("born.txt");
     with_permissive_default_dacl(|| std::fs::write(&file, "x").unwrap());
 
     let exact = acl::verify_file_acl(&file, &me).unwrap();
     let report = format!(
-        "the file: {}\nits SDDL: {}\nits directory: {}\nits SDDL: {}",
+        "the file: {}\nits DACL: {}\nits directory: {}\nits DACL: {}",
         icacls_report(&file),
-        sddl_report(&file),
+        dacl_sddl(&file),
         icacls_report(&plain),
-        sddl_report(&plain)
+        dacl_sddl(&plain)
     );
     if exact {
         // Past libtest's capture, so the evidence survives a run that never prints failures.
@@ -656,6 +725,10 @@ fn a_child_that_never_exits_is_reported_and_its_tree_killed() {
         "lists the grandchild: {message}"
     );
     assert!(message.contains("left-behind-marker"), "prints the evidence: {message}");
+    assert!(
+        message.contains("thread stacks:") && message.contains("ntdll!"),
+        "shows where the threads are blocked: {message}"
+    );
     // Killed: this returns instead of waiting out the 600 pings.
     child.wait().unwrap();
 }

@@ -58,4 +58,7 @@ tracing-appender = "0.2"
 windows = { version = "0.62.2", features = [
     "Win32_UI_Shell", # CommandLineToArgvW: tests/conhost_windows.rs checks the test encoder's tokenizer against it
     "Win32_NetworkManagement_NetManagement", # NetUserAdd/NetUserDel: tests/user_isolation_windows.rs makes throwaway accounts
+    "Win32_System_Diagnostics_Debug",        # StackWalk64: tests/common/thread_stacks.rs shows where a hung child is blocked
+    "Win32_System_Diagnostics_ToolHelp",     # process and thread lists for the same
+    "Win32_System_Kernel",                   # the CONTEXT that GetThreadContext fills
 ] }
