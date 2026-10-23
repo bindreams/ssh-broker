@@ -10,6 +10,8 @@
 
 pub mod bounded;
 #[cfg(windows)]
+mod flow;
+#[cfg(windows)]
 pub(crate) mod layout;
 pub mod probe;
 pub mod registry;
@@ -92,7 +94,7 @@ mod provision_tests;
 #[cfg(windows)]
 mod imp {
     use super::layout::{self, Layout};
-    use super::{probe, registry, report, schtasks, sessions, taskscheduler, user_rows};
+    use super::{flow, probe, registry, report, schtasks, sessions, taskscheduler, user_rows};
     use crate::{afunix, shim};
     use anyhow::Context;
     use std::path::Path;
@@ -117,35 +119,56 @@ mod imp {
         //    fail-open can't help if sshd execs a missing binary. The install directory is gated
         //    first, so a planted one is never adopted, and a single-user install is replaced. A
         //    different build over an installed one stops every agent first (they hold the exe
-        //    open); step 4 starts them again.
+        //    open); they start again afterwards, even if a later step fails.
         let current = std::env::current_exe().context("current_exe")?;
         let (agent_xml, agent_ok) = query_schtasks(&schtasks::query_task_argv(schtasks::AGENT_TASK));
         let registered_xml = schtasks::parse_query_registered(&agent_xml, agent_ok).then_some(agent_xml);
-        let exe = layout::prepare(&layout, &current, registered_xml.as_deref(), || {
-            taskscheduler::stop_instances(schtasks::AGENT_TASK)
-        })?;
+        let exe = flow::run(
+            || taskscheduler::stop_instances(schtasks::AGENT_TASK),
+            |stop_agents| {
+                let exe = layout::prepare(&layout, &current, registered_xml.as_deref(), stop_agents)?;
 
-        // 2. Register both tasks (idempotent /F).
-        register_agent_task(&layout, &exe)?;
-        register_selfheal_task(&exe)?;
+                // 2. Register both tasks (idempotent /F).
+                register_agent_task(&layout, &exe)?;
+                register_selfheal_task(&exe)?;
 
-        // 3. Write the escape flag and read it back at once, then flip the DefaultShell pair LAST
-        //    and only to the validated canonical path; read that back too. sshd reads these once
-        //    per session, so the shim cannot ask later which form sshd used: `apply` owns the flag
-        //    (see `registry::desired_values`).
-        registry::set_default_shell_under(registry::OPENSSH_KEY, &exe.to_string_lossy())
-            .context("write the DefaultShell values")?;
-        let (shell, opt) = registry::read_default_shell_under(registry::OPENSSH_KEY)?;
-        anyhow::ensure!(
-            eq_path(&shell, &exe) && opt == "-c",
-            "DefaultShell read-back mismatch (shell={shell:?}, opt={opt:?})"
+                // 3. Write the escape flag and read it back at once, then flip the DefaultShell
+                //    pair LAST and only to the validated canonical path; read that back too. sshd
+                //    reads these once per session, so the shim cannot ask later which form sshd
+                //    used: `apply` owns the flag (see `registry::desired_values`).
+                registry::set_default_shell_under(registry::OPENSSH_KEY, &exe.to_string_lossy())
+                    .context("write the DefaultShell values")?;
+                let (shell, opt) = registry::read_default_shell_under(registry::OPENSSH_KEY)?;
+                anyhow::ensure!(
+                    eq_path(&shell, &exe) && opt == "-c",
+                    "DefaultShell read-back mismatch (shell={shell:?}, opt={opt:?})"
+                );
+                Ok(exe)
+            },
+            agent_task_is_group_form,
+            start_agents,
+        )?;
+        println!(
+            "apply: ok — DefaultShell -> {}, agent + self-heal tasks installed",
+            exe.display()
         );
+        Ok(())
+    }
 
-        // 4. Start an agent in each session that already has a user, so nobody has to log off and
-        //    on again (the logon trigger covers every later logon), and to bring back the agents
-        //    step 1 stopped for a new build. An agent that is already running in its session
-        //    exits at once, so this is safe to repeat. Best-effort: the install is complete
-        //    without it.
+    /// Whether the registered agent task is the group logon task, the form that can start an agent
+    /// in any session. An older single-user task cannot, so a failed `apply` that stopped agents
+    /// does not run it.
+    fn agent_task_is_group_form() -> bool {
+        let (xml, ok) = query_schtasks(&schtasks::query_task_argv(schtasks::AGENT_TASK));
+        schtasks::parse_query_registered(&xml, ok) && schtasks::xml_is_group_logon_task(&xml)
+    }
+
+    /// Step 4 of `apply`: start an agent in each session that already has a user, so nobody has to
+    /// log off and on again (the logon trigger covers every later logon), and to bring back the
+    /// agents step 1 stopped. An agent that is already running in its session exits at once, so
+    /// this is safe to repeat. Best-effort: the install is complete without it, and a failed
+    /// `apply` runs it too.
+    fn start_agents() {
         match sessions::interactive_sessions() {
             Ok(ids) => {
                 let mut started = 0usize;
@@ -160,13 +183,8 @@ mod imp {
                     ids.len()
                 );
             }
-            Err(e) => eprintln!("apply: tasks registered but the logged-on sessions could not be listed: {e:#}"),
+            Err(e) => eprintln!("apply: the logged-on sessions could not be listed: {e:#}"),
         }
-        println!(
-            "apply: ok — DefaultShell -> {}, agent + self-heal tasks installed",
-            exe.display()
-        );
-        Ok(())
     }
 
     fn register_agent_task(layout: &Layout, exe: &Path) -> anyhow::Result<()> {
