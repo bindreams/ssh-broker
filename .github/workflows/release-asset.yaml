@@ -1,0 +1,180 @@
+name: Release Asset
+
+# Builds the Windows release asset and attests it. Called by draft-release.yaml; also runs on pull
+# requests that touch what makes the asset, so the packaging is exercised before any release.
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: "Version the caller expects; must equal Cargo.toml's"
+        required: false
+        type: string
+    outputs:
+      zip:
+        description: Name of the archive in the `release-asset` artifact
+        value: ${{ jobs.package.outputs.zip }}
+  pull_request:
+    paths:
+      - .github/workflows/release-asset.yaml
+      - .github/scripts/**
+      - src/**
+      - Cargo.toml
+      - Cargo.lock
+      - rust-toolchain.toml
+      - LICENSE.md
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  package:
+    name: Package (windows/amd64)
+    runs-on: windows-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      # Needed by the attestation step.
+      id-token: write
+      attestations: write
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      zip: ${{ steps.version.outputs.zip }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Resolve the target triple
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "TRIPLE=$(bash .github/scripts/asset-name.sh --triple)" >> "$GITHUB_ENV"
+
+      - name: Install pinned toolchain
+        run: rustup toolchain install
+
+      - name: Assert the build host is the release target
+        shell: bash
+        run: |
+          set -euo pipefail
+          host="$(rustc -vV | tr -d '\r' | sed -n 's/^host: //p')"
+          if [[ "$host" != "$TRIPLE" ]]; then
+              echo "::error::rustc host is '$host', expected '$TRIPLE'"
+              exit 1
+          fi
+
+      # The manifest is the source of truth in both modes. The pull_request trigger has no input;
+      # a caller that passes one must agree with it.
+      - name: Resolve the version
+        id: version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          manifest="$(bash .github/scripts/manifest-version.sh)"
+          if [[ -n "$INPUT_VERSION" && "$INPUT_VERSION" != "$manifest" ]]; then
+              echo "::error::Cargo.toml declares $manifest but the caller asked for $INPUT_VERSION"
+              exit 1
+          fi
+          echo "version=$manifest" >> "$GITHUB_OUTPUT"
+          echo "zip=$(bash .github/scripts/asset-name.sh "$manifest")" >> "$GITHUB_OUTPUT"
+
+      # `+crt-static`: the exe is sshd's DefaultShell, and a fresh guest has no VC++
+      # redistributable. `--target` keeps the flag off build scripts and proc macros.
+      - name: Build
+        env:
+          RUSTFLAGS: -C target-feature=+crt-static
+        shell: bash
+        run: cargo build --release --locked --target "$TRIPLE"
+
+      - name: Check the exe imports only system DLLs
+        shell: bash
+        run: bash .github/scripts/check-imports.sh "target/${TRIPLE}/release/ssh-broker.exe"
+
+      - name: Stage the archive contents
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir stage dist
+          cp "target/${TRIPLE}/release/ssh-broker.exe" LICENSE.md stage/
+
+      - name: Zip
+        env:
+          ZIP: ${{ steps.version.outputs.zip }}
+        shell: pwsh
+        run: Compress-Archive -Path stage/ssh-broker.exe, stage/LICENSE.md -DestinationPath "dist/$env:ZIP"
+
+      # `<hex>  <name>`, the form `sha256sum -c` takes. Spelled out because Git for Windows'
+      # `sha256sum` marks binary-mode entries with `*`.
+      - name: Hash
+        env:
+          ZIP: ${{ steps.version.outputs.zip }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          hash="$(sha256sum "dist/${ZIP}" | cut -d ' ' -f 1)"
+          printf '%s  %s\n' "$hash" "$ZIP" > "dist/${ZIP}.sha256"
+          cat "dist/${ZIP}.sha256"
+
+      # A pull request from a fork gets a read-only token with no OIDC, so it cannot attest. It
+      # still builds, runs the import gate and packages; only the attestation is skipped.
+      - name: Attest build provenance
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
+        with:
+          subject-path: dist/*.zip
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: release-asset
+          path: dist/
+          if-no-files-found: error
+
+  # Verifies from a different runner and from the artifact, i.e. what a consumer would hold.
+  verify-asset:
+    name: Verify asset
+    needs: package
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      ZIP: ${{ needs.package.outputs.zip }}
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: release-asset
+          path: dist
+
+      - name: Check the artifact holds exactly the two files, and the archive exactly two members
+        shell: bash
+        run: |
+          set -euo pipefail
+          want_files="$(printf '%s\n' "$ZIP" "$ZIP.sha256" | sort)"
+          got_files="$(ls dist | sort)"
+          if [[ "$got_files" != "$want_files" ]]; then
+              echo "::error::artifact files are not exactly the expected pair"
+              echo "want:"; echo "$want_files"; echo "got:"; echo "$got_files"
+              exit 1
+          fi
+          want_members="$(printf '%s\n' LICENSE.md ssh-broker.exe)"
+          got_members="$(unzip -Z1 "dist/${ZIP}" | sort)"
+          if [[ "$got_members" != "$want_members" ]]; then
+              echo "::error::archive members are not exactly ssh-broker.exe and LICENSE.md"
+              echo "got:"; echo "$got_members"
+              exit 1
+          fi
+
+      - name: Check the hash
+        shell: bash
+        run: cd dist && sha256sum -c ./*.sha256
+
+      - name: Verify the attestation
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh attestation verify "dist/${ZIP}" \
+              -R "$GITHUB_REPOSITORY" \
+              --signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/release-asset.yaml" \
+              --source-digest "$GITHUB_SHA"

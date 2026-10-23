@@ -1,0 +1,150 @@
+name: Draft Release
+
+# Step one of two: validate, test the release commit, build and attest the Windows asset, and
+# create a DRAFT release with the asset attached. publish-release.yaml publishes it.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version (e.g. 0.1.0)"
+        required: true
+        type: string
+
+concurrency:
+  group: draft-release-${{ inputs.version }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  validate:
+    name: Validate version
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      # `write`, not `read`: GitHub returns draft releases only to callers with push access, so a
+      # read-scoped token reports every existing draft as absent.
+      contents: write
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          # Full history so the ancestry check can resolve origin/main.
+          fetch-depth: 0
+
+      - name: Install pinned toolchain
+        run: rustup toolchain install
+
+      - name: Normalize and validate version
+        id: version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          V="$(bash .github/scripts/normalize-version.sh "$INPUT_VERSION")"
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+
+      - name: Verify manifest version matches
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          MANIFEST="$(bash .github/scripts/manifest-version.sh)"
+          if [ "$MANIFEST" != "$VERSION" ]; then
+            echo "::error::Cargo.toml declares $MANIFEST but this dispatch asked for $VERSION"
+            exit 1
+          fi
+
+      - name: Fail if the release already exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ steps.version.outputs.version }}
+        shell: bash
+        run: bash .github/scripts/assert-release-absent.sh "v${VERSION}"
+
+      # A tag with no release attached is the dangerous case: `gh release create --target` is
+      # SILENTLY IGNORED when the tag exists, binding the release to the old tag's commit.
+      - name: Fail if the tag already exists
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        shell: bash
+        run: bash .github/scripts/assert-tag-absent.sh "v${VERSION}"
+
+      - name: Verify the workflow runs from main and the release commit is on main
+        env:
+          SHA: ${{ github.sha }}
+        shell: bash
+        run: bash .github/scripts/assert-ancestor-of-main.sh "$SHA"
+
+  ci:
+    name: CI
+    needs: validate
+    # Main's last green run does not imply THIS commit is green.
+    uses: ./.github/workflows/ci.yaml
+
+  package:
+    name: Package
+    needs: validate
+    uses: ./.github/workflows/release-asset.yaml
+    with:
+      version: ${{ needs.validate.outputs.version }}
+    # A reusable workflow cannot be granted more than its caller holds.
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+
+  release:
+    name: Create draft release
+    needs: [validate, ci, package]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      # Re-check after CI and packaging, immediately before the draft is created.
+      - name: Re-check that the tag is still absent
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+        shell: bash
+        run: bash .github/scripts/assert-tag-absent.sh "v${VERSION}"
+
+      - name: Re-check that the release is still absent
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ needs.validate.outputs.version }}
+        shell: bash
+        run: bash .github/scripts/assert-release-absent.sh "v${VERSION}"
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: release-asset
+          path: dist
+
+      - name: Create draft release pinned to commit SHA
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ needs.validate.outputs.version }}
+          SHA: ${{ github.sha }}
+          ZIP: dist/${{ needs.package.outputs.zip }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="v${VERSION}"
+          URL="$(gh release create "$TAG" \
+            --draft \
+            --generate-notes \
+            --title "$TAG" \
+            --target "$SHA" \
+            "$ZIP" "${ZIP}.sha256")"
+          echo "Draft release created for commit $SHA:"
+          echo "  $URL"
