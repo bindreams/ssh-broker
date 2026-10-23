@@ -6,9 +6,9 @@ invariants: [CONTRIBUTING.md](CONTRIBUTING.md). This file is the short orientati
 ## What it is
 
 One binary with four entry points plus a hidden `verify-probe` child, dispatched by argv. The **shim** is sshd's `DefaultShell`
-and is the default action; the **agent** runs in an interactive session and hosts the shell in
-a pseudoconsole (PTY) or on redirected pipes (`ssh host cmd`); the two speak framed messages
-over an ACL-gated AF_UNIX socket. `apply` and
+and is the default action; the **agent** runs in a user's interactive session (one per logged-on
+user) and hosts the shell in a pseudoconsole (PTY) or on redirected pipes (`ssh host cmd`); the two
+speak framed messages over an ACL-gated AF_UNIX socket in that user's profile. `apply` and
 `verify` install and check that arrangement.
 
 The point is lineage: a shell that is a child of the agent rather than of `sshd` inherits
@@ -31,9 +31,12 @@ checked.
 | `protocol` | frame codec, handshake, `FrameReader` |
 | `relay` | transport-agnostic pumping; `PumpError` names which side failed |
 | `winutil` | Windows RAII (`OwnedHandle`, `AttrList`), job containment, cosca→Win32 errors |
-| `afunix`, `acl` | the socket, and the ACL that is the security boundary |
+| `afunix`, `acl` | the socket, and the file and folder ACLs that are the security boundary |
+| `socket_loc`, `userdir` | where a user's socket lives (from the token's profile, length-checked), and creating its private folder |
+| `agent_lock` | one agent per session, one serving agent per user |
+| `filelog` | the rolling log in the user's own folder |
 | `vtinput` | Win32 `INPUT_RECORD` → VT sequences (pure, host-testable) |
-| `provision` | `apply`/`verify`: DefaultShell, logon task, socket dir, parity probes |
+| `provision` | `apply`/`verify`: DefaultShell, logon task, per-user socket rows, parity probes |
 
 ## Invariants you must not break
 
@@ -47,8 +50,9 @@ diff. (No lint enforces any of these — `clippy.toml` is deliberately empty.) F
 - **Unit tests in a sibling `foo_tests.rs`**, never an inline `#[cfg(test)] mod`. The hook
   catches the inline form; that the sibling is wired up with `#[path]` is *(review)*.
 - **No personal home paths** in tracked files; usernames and machine names *(review)*.
-- **`acl::verify_dir_acl` is exact-match and fail-closed.** It is the whole security boundary;
-  if it cannot prove the directory is safe, refuse to bind.
+- **`acl::verify_dir_acl` and `acl::verify_file_acl` are exact-match and fail-closed.** Together they
+  are the security boundary: the socket file's ACL decides who can connect, the folder's decides who
+  can replace the socket. If either cannot be proven, refuse to bind.
 - **The shim fails open on the relay path** *(review)*, given `pwsh`. A broken broker must
   not cost you SSH access. The security boundary never degrades — the ACL gate and the bind
   fail closed. Provisioning has best-effort steps of its own, marked where they occur.
