@@ -183,7 +183,7 @@ fn stop_and_wait<P>(
         }
         if first_stop.is_some_and(|first: Instant| first.elapsed() >= bound) {
             anyhow::bail!(
-                "the task {task_name} still has {} running instance(s) after being stopped for {} s ({});                  run apply again",
+                "the task {task_name} still has {} running instance(s) after being stopped for {} s ({}); run apply again",
                 instances.count,
                 bound.as_secs(),
                 describe_instances(&instances.pids)

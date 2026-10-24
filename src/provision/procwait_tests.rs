@@ -202,7 +202,10 @@ fn a_wait_that_fails_leaves_the_process_a_survivor_with_the_error_and_the_rest_a
     let survivor = &still.survivors[0];
     assert_eq!(survivor.pid, failing_pid);
     assert!(
-        survivor.unconfirmed.as_deref().is_some_and(|e| e.contains("handle")),
+        survivor
+            .unconfirmed
+            .as_deref()
+            .is_some_and(|e| e.contains("os error 6")),
         "{survivor:?}"
     );
     let text = format!("{err:#}");

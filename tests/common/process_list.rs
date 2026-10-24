@@ -169,7 +169,9 @@ fn walk(root: HANDLE, root_pid: u32, known: &[Member]) -> Descendants {
     Descendants { members, unopened }
 }
 
-/// Terminate `root` and every descendant of it, and wait for each to exit. A pass looks only after
+/// Terminate `root` and the descendants reachable from it through a chain of parents this holds
+/// open (a child of a process that exited before it was found is not), and wait for each to exit.
+/// A pass looks only after
 /// every process ended so far has exited, and looks under all of them, so a child that one of
 /// them started before it exited is found by its recorded parent, as [`descendants`] does; the
 /// last pass finds nothing new. Returns what could not be ended: a member that could not be

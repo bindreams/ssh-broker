@@ -206,7 +206,7 @@ mod imp {
                 let plan = flow::plan_start(&targets.ids, survivors);
                 for (id, pids) in &plan.held {
                     eprintln!(
-                        "apply: no agent was started in session {id}: its old agent (process {}) is still running; run apply again once it has exited",
+                        "apply: no agent was started in session {id}: its old agent (process {}) was stopped but has not been seen to exit; run apply again once it has exited",
                         pids.iter().map(u32::to_string).collect::<Vec<_>>().join(", ")
                     );
                 }
