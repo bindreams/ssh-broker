@@ -61,4 +61,5 @@ windows = { version = "0.62.2", features = [
     "Wdk_System_Threading",                  # ProcessDefaultHardErrorMode: tests/common/hard_errors.rs makes a child's loader failure exit instead of raise a message box
     "Win32_System_LibraryLoader",            # LoadLibraryW/GetProcAddress: tests/common/desktop.rs binds user32 at run time, and tests/user_isolation_windows.rs loads user32, gdi32, combase and ole32 by name
     "Win32_System_StationsAndDesktops",      # HWINSTA/HDESK: tests/common/desktop.rs gives each child its own window station and desktop
+    "Win32_System_Diagnostics_ToolHelp",     # CreateToolhelp32Snapshot: tests/common/process_list.rs lists a process's children
 ] }

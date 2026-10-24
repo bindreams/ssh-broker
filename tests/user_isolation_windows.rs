@@ -13,6 +13,7 @@
 #![cfg(windows)]
 
 use std::os::windows::ffi::OsStringExt;
+use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::mpsc;
@@ -48,12 +49,16 @@ use windows::core::{BOOL, PCWSTR, PWSTR};
 
 #[path = "common/bounded_wait.rs"]
 mod bounded_wait;
+#[path = "common/child_entry.rs"]
+mod child_entry;
 #[path = "common/desktop.rs"]
 mod desktop;
 #[path = "common/environment.rs"]
 mod environment;
 #[path = "common/hard_errors.rs"]
 mod hard_errors;
+#[path = "common/process_list.rs"]
+mod process_list;
 
 // Fixture ---------------------------------------------------------------------------------
 
@@ -86,6 +91,30 @@ fn assert_elevated() {
     );
 }
 
+/// `sb<tag><pid>_<n>` in hex: at most 20 characters, as an account name must be, for a tag of up to
+/// 5 characters and a counter below 65536 (more fails loudly). The separator keeps `(pid, n)`
+/// pairs whose digits run together apart.
+fn account_name(tag: &str, pid: u32, n: u32) -> String {
+    let name = format!("sb{tag}{pid:x}_{n:x}");
+    assert!(
+        name.chars().count() <= 20,
+        "{name} is longer than an account name may be"
+    );
+    name
+}
+
+/// A name no other account of this test run has, whichever thread asks: this process's id and a
+/// process-wide counter. (Across runs, ids are not reused while an account of the earlier run is
+/// still there, since a run removes its accounts when it ends.)
+fn next_account_name(tag: &str) -> String {
+    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    account_name(
+        tag,
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
 /// A throwaway local account, removed (profile first) when dropped.
 struct Account {
     name: String,
@@ -97,16 +126,12 @@ struct Account {
 
 impl Account {
     /// Create the account; with a profile, create the profile too (so `ProfileList` has an entry).
-    /// `tag` keeps names apart within one test run.
+    /// `tag` (at most 5 characters) names what the account is for.
     fn create(tag: &str, with_profile: bool) -> Account {
         assert_elevated();
-        let unique = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .subsec_nanos();
-        // At most 20 characters, as an account name must be.
-        let name = format!("sb{tag}{}", unique % 1_000_000);
-        let password = format!("Sb-{unique:x}-Aa1!");
+        let name = next_account_name(tag);
+        // Not the account name itself, which the password policy refuses.
+        let password = format!("Pw-{}-Aa1!", &name[2..]);
         let name_w = wide(&name);
         let mut password_w = wide(&password);
         let mut name_mut = name_w.clone();
@@ -297,12 +322,24 @@ impl Drop for Account {
 struct SharedDir(PathBuf);
 
 impl SharedDir {
+    /// The directory, readable and writable by everyone.
     fn new(tag: &str) -> SharedDir {
+        let shared = SharedDir::without_grant(tag);
+        let status = desktop::status(
+            Command::new("icacls")
+                .arg(&shared.0)
+                .args(["/grant", "*S-1-1-0:(OI)(CI)M"]),
+        )
+        .unwrap();
+        assert!(status.success(), "icacls on the shared directory");
+        shared
+    }
+
+    /// The directory as the temp dir makes it: for a child that runs as this account.
+    fn without_grant(tag: &str) -> SharedDir {
         let dir = std::env::temp_dir().join(format!("sb-iso-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let status = desktop::status(Command::new("icacls").arg(&dir).args(["/grant", "*S-1-1-0:(OI)(CI)M"])).unwrap();
-        assert!(status.success(), "icacls on the shared directory");
         SharedDir(dir)
     }
 }
@@ -638,22 +675,22 @@ fn ensure_socket_dir_refuses_a_dir_owned_by_another_user() {
     );
 }
 
-/// Child half of [`bob_cannot_connect_to_a_socket_in_another_users_dir`]: runs only when started
-/// from the shared directory with a `child.txt` beside the binary, as bob. Passes when it can
-/// connect where it was given a grant and is refused where it was not.
+/// What [`child_connects_only_where_it_was_granted`] records once its checks have passed.
+const CONNECT_RESULT: &str = "connected to the control socket\nrefused the other socket: access denied\n";
+
+/// Child half of [`bob_cannot_connect_to_a_socket_in_another_users_dir`], started only by it as
+/// bob (see [`child_entry`]). Connects where it was given a grant, is refused where it was not,
+/// and only then records [`CONNECT_RESULT`].
 #[test]
+#[ignore = "run as a child of bob_cannot_connect_to_a_socket_in_another_users_dir"]
 fn child_connects_only_where_it_was_granted() {
-    let Some(exe_dir) = std::env::current_exe().unwrap().parent().map(Path::to_path_buf) else {
-        return;
-    };
-    let Ok(text) = std::fs::read_to_string(exe_dir.join("child.txt")) else {
-        return; // not started as the child
-    };
+    let dir = child_entry::dir();
+    let text = child_entry::input(&dir);
     let path_after = |key: &str| {
         PathBuf::from(
             text.lines()
                 .find_map(|l| l.strip_prefix(key))
-                .unwrap_or_else(|| panic!("child.txt has no {key}")),
+                .unwrap_or_else(|| panic!("the child's input has no {key}")),
         )
     };
     let allowed = path_after("allowed=");
@@ -665,6 +702,8 @@ fn child_connects_only_where_it_was_granted() {
         .downcast_ref::<std::io::Error>()
         .is_some_and(|e| e.kind() == std::io::ErrorKind::PermissionDenied);
     assert!(denied_by_acl, "expected access denied, got {err:#}");
+
+    child_entry::write_result(&dir, CONNECT_RESULT);
 }
 
 #[test]
@@ -701,25 +740,21 @@ fn bob_cannot_connect_to_a_socket_in_another_users_dir() {
 
     let exe = shared.0.join("isolation.exe");
     std::fs::copy(std::env::current_exe().unwrap(), &exe).unwrap();
-    std::fs::write(
-        shared.0.join("child.txt"),
-        format!("allowed={}\ndenied={}\n", control.path.display(), denied.path.display()),
-    )
-    .unwrap();
-    let command = format!(
-        "\"{}\" --exact child_connects_only_where_it_was_granted --nocapture",
-        exe.display()
+    child_entry::write_input(
+        &shared.0,
+        &format!("allowed={}\ndenied={}\n", control.path.display(), denied.path.display()),
     );
+    let command = child_entry::command_line(&exe, "child_connects_only_where_it_was_granted", &shared.0);
 
     let code = bob.run(&exe, &command, &shared.0, &[]);
 
     assert_eq!(code, 0, "the child, running as bob, failed: see its output above");
+    assert_eq!(child_entry::result(&shared.0), CONNECT_RESULT);
 }
 
 #[test]
 fn a_child_that_never_exits_is_reported_and_its_tree_killed() {
     use std::os::windows::io::AsRawHandle;
-    use std::os::windows::process::CommandExt;
     use std::process::Stdio;
 
     let evidence = std::env::temp_dir().join(format!("sb-iso-bounded-{}.txt", std::process::id()));
@@ -734,6 +769,19 @@ fn a_child_that_never_exits_is_reported_and_its_tree_killed() {
             .stderr(Stdio::null()),
     )
     .unwrap();
+
+    // The report must list the grandchild, so it has to exist before the bound starts. Re-check
+    // the process list until cmd.exe has started ping.exe; stop if cmd.exe is gone instead.
+    while !process_list::children_of(child.id())
+        .iter()
+        .any(|name| name.eq_ignore_ascii_case("ping.exe"))
+    {
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "cmd.exe exited before it started ping.exe"
+        );
+        std::thread::yield_now();
+    }
 
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         bounded_wait::wait_for_exit(
@@ -760,9 +808,56 @@ fn a_child_that_never_exits_is_reported_and_its_tree_killed() {
 }
 
 #[test]
+fn the_process_list_names_a_processs_children_and_no_others() {
+    use std::process::Stdio;
+
+    // ping.exe started directly has no ping.exe child (it has a conhost.exe); the cmd.exe running
+    // one has it.
+    let mut leaf = desktop::spawn(
+        Command::new("ping")
+            .args(["-n", "600", "127.0.0.1"])
+            .creation_flags(CREATE_NO_WINDOW.0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null()),
+    )
+    .unwrap();
+    let mut parent = desktop::spawn(
+        Command::new("cmd.exe")
+            .args(["/c", "ping -n 600 127.0.0.1 >nul"])
+            .creation_flags(CREATE_NO_WINDOW.0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null()),
+    )
+    .unwrap();
+    let has_ping = |pid: u32| {
+        process_list::children_of(pid)
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case("ping.exe"))
+    };
+    while !has_ping(parent.id()) {
+        assert!(parent.try_wait().unwrap().is_none(), "cmd.exe exited early");
+        std::thread::yield_now();
+    }
+    let leaf_has_ping = has_ping(leaf.id());
+    // Only the two processes started here: the leaf, and the tree under the cmd.exe.
+    let _ = leaf.kill();
+    let _ = desktop::status(
+        Command::new("taskkill")
+            .args(["/T", "/F", "/PID", &parent.id().to_string()])
+            .creation_flags(CREATE_NO_WINDOW.0)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null()),
+    );
+    let _ = (leaf.wait(), parent.wait());
+
+    assert!(!leaf_has_ping, "a ping.exe has no ping.exe child");
+}
+
+#[test]
 fn a_suspended_child_has_its_hard_error_boxes_suppressed() {
     use std::os::windows::io::AsRawHandle;
-    use std::os::windows::process::CommandExt;
     use std::process::Stdio;
 
     // Suspended, so it never runs and never opens anything. CREATE_DEFAULT_ERROR_MODE gives it
@@ -785,6 +880,94 @@ fn a_suspended_child_has_its_hard_error_boxes_suppressed() {
 
     assert!(before, "control: a default child raises hard-error boxes");
     assert!(!after, "the child no longer raises hard-error boxes");
+}
+
+#[test]
+fn account_names_differ_for_every_process_and_counter_and_fit_the_limit() {
+    let mut seen = std::collections::HashSet::new();
+    // Pairs whose digits run together if the two numbers are joined without a separator.
+    for (pid, n) in [(0x1a, 2), (0x1, 0xa2), (0x12, 0xa), (u32::MAX, 0xffff), (7, 0), (0, 7)] {
+        let name = account_name("alice", pid, n);
+        assert!(seen.insert(name.clone()), "{name} repeats");
+        assert!(
+            name.chars().count() <= 20,
+            "{name} is longer than an account name may be"
+        );
+    }
+}
+
+#[test]
+fn accounts_made_at_the_same_moment_on_many_threads_get_distinct_names() {
+    let names: Vec<String> = std::thread::scope(|scope| {
+        let threads: Vec<_> = (0..8)
+            .map(|_| scope.spawn(|| (0..50).map(|_| next_account_name("bob")).collect::<Vec<_>>()))
+            .collect();
+        threads.into_iter().flat_map(|t| t.join().unwrap()).collect()
+    });
+    let distinct: std::collections::HashSet<_> = names.iter().collect();
+    assert_eq!(distinct.len(), names.len());
+}
+
+#[test]
+fn a_child_entry_run_without_its_signal_panics() {
+    let outcome = std::panic::catch_unwind(|| child_entry::dir_from(["exe".to_owned(), "--exact".to_owned()]));
+    let payload = outcome.expect_err("a child half without the signal must not pass");
+    let message = payload.downcast_ref::<String>().cloned().unwrap_or_default();
+    assert!(message.contains(child_entry::SIGNAL), "{message}");
+}
+
+#[test]
+fn a_child_entry_takes_its_directory_from_the_signal() {
+    let args = ["exe", "--exact", "x", &format!("{}C:\\a b\\c", child_entry::SIGNAL)].map(str::to_owned);
+    assert_eq!(child_entry::dir_from(args), PathBuf::from("C:\\a b\\c"));
+}
+
+#[test]
+fn a_child_entry_panics_when_its_input_is_unreadable() {
+    let missing = std::env::temp_dir().join(format!("sb-iso-no-such-dir-{}", std::process::id()));
+    let outcome = std::panic::catch_unwind(|| child_entry::input(&missing));
+    assert!(outcome.is_err(), "an unreadable input must fail the child");
+}
+
+#[test]
+fn a_parent_fails_when_the_child_wrote_no_result() {
+    let missing = std::env::temp_dir().join(format!("sb-iso-no-such-dir-{}", std::process::id()));
+    let outcome = std::panic::catch_unwind(|| child_entry::result(&missing));
+    let payload = outcome.expect_err("no result must fail the parent");
+    let message = payload.downcast_ref::<String>().cloned().unwrap_or_default();
+    assert!(message.contains("wrote no result"), "{message}");
+}
+
+/// What libtest does with a stale filter: exit 0 having run nothing. Only the result file tells
+/// that apart from a child that ran and passed.
+#[test]
+fn a_child_filter_that_matches_no_test_exits_0_and_leaves_no_result() {
+    let shared = SharedDir::without_grant("nomatch");
+    child_entry::write_input(&shared.0, "");
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    command
+        .args(child_entry::args("no_such_child_entry", &shared.0))
+        .creation_flags(CREATE_NO_WINDOW.0);
+    let status = desktop::status(&mut command).unwrap();
+
+    assert!(status.success(), "libtest exits 0 when nothing matched: {status:?}");
+    assert!(!child_entry::result_path(&shared.0).exists());
+}
+
+/// The whole pair, started as the current account instead of bob: the signal reaches the child,
+/// the child checks and records, and the result is the content the parent asserts.
+#[test]
+fn the_window_library_child_started_as_this_account_records_what_it_loaded() {
+    let shared = SharedDir::without_grant("libs-self");
+    child_entry::write_input(&shared.0, LIBS_INPUT);
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    command
+        .args(child_entry::args("child_loads_the_window_libraries", &shared.0))
+        .creation_flags(CREATE_NO_WINDOW.0);
+    let status = desktop::status(&mut command).unwrap();
+
+    assert!(status.success(), "{status:?}");
+    assert_eq!(child_entry::result(&shared.0), LIBS_RESULT);
 }
 
 #[test]
@@ -958,27 +1141,34 @@ fn a_loader_failure_as_bob_ends_the_process_with_its_status_and_no_message_box()
     );
 }
 
-/// Child half of [`a_child_as_bob_loads_the_window_libraries`]: runs only when started from the
-/// shared directory with a `libs.txt` beside the binary, as bob. Fails if a window library will
-/// not load.
+/// The libraries [`child_loads_the_window_libraries`] must load, one per line: what the parent
+/// hands it.
+const LIBS_INPUT: &str = "user32.dll\ngdi32.dll\ncombase.dll\nole32.dll\n";
+/// What [`child_loads_the_window_libraries`] records once all of them have loaded.
+const LIBS_RESULT: &str = "loaded user32.dll\nloaded gdi32.dll\nloaded combase.dll\nloaded ole32.dll\n";
+
+/// Child half of [`a_child_as_bob_loads_the_window_libraries`], started only by it as bob (see
+/// [`child_entry`]). Fails if a library named in its input will not load, and records
+/// [`LIBS_RESULT`] only after all of them did.
 #[test]
+#[ignore = "run as a child of a_child_as_bob_loads_the_window_libraries"]
 fn child_loads_the_window_libraries() {
-    let Some(exe_dir) = std::env::current_exe().unwrap().parent().map(Path::to_path_buf) else {
-        return;
-    };
-    if !exe_dir.join("libs.txt").exists() {
-        return; // not started as the child
-    }
-    let failed: Vec<String> = ["user32.dll", "gdi32.dll", "combase.dll", "ole32.dll"]
-        .iter()
+    let dir = child_entry::dir();
+    let input = child_entry::input(&dir);
+    assert_eq!(input, LIBS_INPUT, "the child's input names the libraries to load");
+
+    let mut result = String::new();
+    let mut failed = Vec::new();
+    for dll in input.lines() {
         // SAFETY: NUL-terminated name.
-        .filter_map(|dll| {
-            unsafe { LoadLibraryW(PCWSTR(wide(dll).as_ptr())) }
-                .err()
-                .map(|e| format!("{dll}: {e}"))
-        })
-        .collect();
+        match unsafe { LoadLibraryW(PCWSTR(wide(dll).as_ptr())) } {
+            Ok(_) => result.push_str(&format!("loaded {dll}\n")),
+            Err(e) => failed.push(format!("{dll}: {e}")),
+        }
+    }
     assert!(failed.is_empty(), "did not load: {failed:?}");
+
+    child_entry::write_result(&dir, &result);
 }
 
 /// What the shim and `ssh` need from an account's processes: user32 and the libraries on top of
@@ -989,11 +1179,8 @@ fn a_child_as_bob_loads_the_window_libraries() {
     let shared = SharedDir::new("libs");
     let exe = shared.0.join("isolation.exe");
     std::fs::copy(std::env::current_exe().unwrap(), &exe).unwrap();
-    std::fs::write(shared.0.join("libs.txt"), "").unwrap();
-    let command = format!(
-        "\"{}\" --exact child_loads_the_window_libraries --nocapture",
-        exe.display()
-    );
+    child_entry::write_input(&shared.0, LIBS_INPUT);
+    let command = child_entry::command_line(&exe, "child_loads_the_window_libraries", &shared.0);
 
     let code = bob.run(&exe, &command, &shared.0, &[]);
 
@@ -1003,6 +1190,7 @@ fn a_child_as_bob_loads_the_window_libraries() {
         "the child, running as bob, failed ({}): see its output above",
         hard_errors::describe_exit(code)
     );
+    assert_eq!(child_entry::result(&shared.0), LIBS_RESULT);
 }
 
 #[test]
