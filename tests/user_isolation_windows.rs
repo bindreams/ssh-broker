@@ -748,7 +748,10 @@ fn bob_cannot_connect_to_a_socket_in_another_users_dir() {
 
     let code = bob.run(&exe, &command, &shared.0, &[]);
 
-    assert_eq!(code, 0, "the child, running as bob, failed: see its output above");
+    assert_eq!(
+        code, 0,
+        "the child, running as bob, failed (its output is not captured: a CreateProcessWithTokenW child has no stdio here)"
+    );
     assert_eq!(child_entry::result(&shared.0), CONNECT_RESULT);
 }
 
@@ -938,7 +941,10 @@ fn shim_as_bob_reaches_a_listener_in_bobs_own_location() {
     std::fs::copy(std::env::current_exe().unwrap(), &exe).unwrap();
     let command = child_entry::command_line(&exe, "child_makes_its_own_socket_dir", &shared.0);
     let code = bob.run(&exe, &command, &shared.0, &[]);
-    assert_eq!(code, 0, "the child, running as bob, failed: see its output above");
+    assert_eq!(
+        code, 0,
+        "the child, running as bob, failed (its output is not captured: a CreateProcessWithTokenW child has no stdio here)"
+    );
     assert_eq!(
         PathBuf::from(child_entry::result(&shared.0).trim_end()),
         bob_loc.path,

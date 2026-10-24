@@ -152,18 +152,25 @@ fn a_process_that_cannot_be_identified_is_an_error_never_nothing_to_wait_for() {
     let mut child = child_until_stdin_closes();
     // The first identification is of the exe looked for; the second, of the image the process
     // runs, fails. By order, not by path: the two paths may be spelled alike.
-    let identified_the_exe = std::cell::Cell::new(false);
+    let calls = std::cell::Cell::new(0u32);
     let outcome = open_if_image_by(child.id(), &cmd_exe(), &|_| {
-        if identified_the_exe.replace(true) {
-            Err(std::io::Error::from_raw_os_error(5))
-        } else {
+        calls.set(calls.get() + 1);
+        if calls.get() == 1 {
             Ok(FileId::default())
+        } else {
+            Err(std::io::Error::from_raw_os_error(5))
         }
     });
     drop(child.stdin.take());
     child.wait().unwrap();
+    // Reaching the second identification proves the process was opened and its image read; an
+    // earlier failure there also names the pid, so the pid alone would not.
+    assert_eq!(calls.get(), 2, "the process's image was identified");
     let text = format!("{:#}", outcome.err().expect("could not tell"));
-    assert!(text.contains(&child.id().to_string()), "names the process: {text}");
+    assert!(
+        text.contains(&format!("which process {} runs", child.id())),
+        "names the process whose image could not be identified: {text}"
+    );
 }
 
 #[test]
