@@ -6,13 +6,9 @@ use super::spawn_contained;
 /// The local passthrough must contain its child in a job object, exactly as the relayed path
 /// does, so that failing open can never become a way to outlive the session.
 ///
-/// This used to be the property that made a MISCLASSIFIED command harmless: while the shim routed
-/// suspected transfers around the relay, a string the client chose decided a security outcome, and
-/// naming any binary `scp.exe` was enough to be spawned outside the job object and survive session
-/// teardown. That classifier is gone and every command relays now, and `spawn_contained` is what
-/// BOTH fail-open arms funnel through — the EXEC passthrough, and (since the interactive arm
-/// stopped using the separate, uncontained `exec_local_shell`) the plain `pwsh` an interactive
-/// session gets too. So this containment is the sole thing between an unreachable agent and a
+/// `spawn_contained` is what BOTH fail-open arms funnel through — the EXEC passthrough, and (since
+/// the interactive arm stopped using the separate, uncontained `exec_local_shell`) the plain `pwsh`
+/// an interactive session gets too. So this containment is the sole thing between an unreachable agent and a
 /// process that outlives the session the README promises to reap.
 ///
 /// Read that as a statement about the PRODUCTION WIRING, not about this test's reach. This test

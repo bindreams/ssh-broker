@@ -42,14 +42,10 @@ fn mode(process: HANDLE) -> windows::core::Result<u32> {
     Ok(value)
 }
 
-/// Whether `process` would show a message box for a hard error such as a loader failure.
-pub fn raises_hard_error_boxes(process: HANDLE) -> bool {
-    mode(process).expect("NtQueryInformationProcess(ProcessDefaultHardErrorMode)") & RAISE_HARD_ERROR_BOXES != 0
-}
-
 /// Switch off the hard-error boxes (and the crash dialog) of `process`, which must not have run
 /// yet: a child created suspended. The setting is the process's own, so it does not depend on
-/// what the creator's error mode was, nor on whether a launcher service passed it on.
+/// what the creator's error mode was, nor on whether a launcher service passed it on. Guarantee:
+/// on `Ok`, the process ends on a loader failure instead of raising a message box.
 pub fn suppress_hard_error_boxes(process: HANDLE) -> windows::core::Result<()> {
     let value = (mode(process)? & !RAISE_HARD_ERROR_BOXES) | NO_GP_FAULT_ERROR_BOX;
     // SAFETY: `value` is a valid 4-byte buffer; `process` is a live handle with set access.

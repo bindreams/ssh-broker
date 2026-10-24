@@ -13,7 +13,6 @@
 #![cfg(windows)]
 
 use std::os::windows::ffi::OsStringExt;
-use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::mpsc;
@@ -38,7 +37,6 @@ use windows::Win32::Security::{
     PSECURITY_DESCRIPTOR, SecurityImpersonation, SetTokenInformation, TOKEN_ALL_ACCESS, TOKEN_DEFAULT_DACL,
     TOKEN_DUPLICATE, TOKEN_ELEVATION, TOKEN_QUERY, TokenDefaultDacl, TokenElevation, TokenImpersonation, TokenPrimary,
 };
-use windows::Win32::System::LibraryLoader::LoadLibraryW;
 use windows::Win32::System::Threading::{
     CREATE_NO_WINDOW, CREATE_PROCESS_LOGON_FLAGS, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT,
     CreateProcessWithTokenW, GetCurrentProcess, LOGON_WITH_PROFILE, OpenProcessToken, PROCESS_INFORMATION,
@@ -445,6 +443,7 @@ fn set_plain_protected_dacl(dir: &Path, user: &Sid) {
 struct StandInProfile(PathBuf);
 
 impl StandInProfile {
+    /// A fresh, empty stand-in under the temp dir, removed on drop.
     fn new(tag: &str) -> StandInProfile {
         let root = std::env::temp_dir().join(format!("sb-iso-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
@@ -452,6 +451,7 @@ impl StandInProfile {
         StandInProfile(root)
     }
 
+    /// The socket location the product derives for this profile.
     fn location(&self) -> SocketLocation {
         ssh_broker::socket_loc::for_profile(&self.0).expect("the stand-in profile path is short enough")
     }
@@ -752,487 +752,26 @@ fn bob_cannot_connect_to_a_socket_in_another_users_dir() {
     assert_eq!(child_entry::result(&shared.0), CONNECT_RESULT);
 }
 
-#[test]
-fn a_child_that_never_exits_is_reported_and_its_tree_killed() {
-    use std::os::windows::io::AsRawHandle;
-    use std::process::Stdio;
+/// What the shim prints on stderr when it finds no agent behind the location it resolved and
+/// has no reason to add: a location that resolved, and a shim whose log works.
+const NO_AGENT_LINE: &str = "ssh-broker: agent unavailable \u{2014} falling back to a local shell\n";
 
-    let evidence = std::env::temp_dir().join(format!("sb-iso-bounded-{}.txt", std::process::id()));
-    std::fs::write(&evidence, "left-behind-marker").unwrap();
-    // cmd.exe runs ping.exe, so the tree has a grandchild; the ping outlives any test run.
-    let mut child = desktop::spawn(
-        Command::new("cmd.exe")
-            .args(["/c", "ping -n 600 127.0.0.1 >nul"])
-            .creation_flags(CREATE_NO_WINDOW.0)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null()),
-    )
-    .unwrap();
-
-    // The report must list the grandchild, so it has to exist before the bound starts. Re-check
-    // the process list until cmd.exe has started ping.exe; stop if cmd.exe is gone instead.
-    while !process_list::children_of(child.id())
-        .iter()
-        .any(|name| name.eq_ignore_ascii_case("ping.exe"))
-    {
-        assert!(
-            child.try_wait().unwrap().is_none(),
-            "cmd.exe exited before it started ping.exe"
-        );
-        std::thread::yield_now();
-    }
-
-    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        bounded_wait::wait_for_exit(
-            HANDLE(child.as_raw_handle()),
-            child.id(),
-            "the ping tree",
-            std::time::Duration::from_secs(3),
-            std::slice::from_ref(&evidence),
-        )
-    }));
-    let payload = outcome.expect_err("a child that never exits must fail the wait");
-    let message = payload.downcast_ref::<String>().cloned().unwrap_or_default();
-    let _ = std::fs::remove_file(&evidence);
-
-    assert!(message.contains("the ping tree"), "names what was awaited: {message}");
-    assert!(message.contains("did not exit within"), "{message}");
-    assert!(
-        message.to_lowercase().contains("ping.exe"),
-        "lists the grandchild: {message}"
-    );
-    assert!(message.contains("left-behind-marker"), "prints the evidence: {message}");
-    // Killed: this returns instead of waiting out the 600 pings.
-    child.wait().unwrap();
+/// The files [`run_shim_as`] leaves behind.
+struct ShimRun {
+    code: u32,
+    stdout: String,
+    stderr: String,
 }
 
-#[test]
-fn the_process_list_names_a_processs_children_and_no_others() {
-    use std::process::Stdio;
-
-    // ping.exe started directly has no ping.exe child (it has a conhost.exe); the cmd.exe running
-    // one has it.
-    let mut leaf = desktop::spawn(
-        Command::new("ping")
-            .args(["-n", "600", "127.0.0.1"])
-            .creation_flags(CREATE_NO_WINDOW.0)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null()),
-    )
-    .unwrap();
-    let mut parent = desktop::spawn(
-        Command::new("cmd.exe")
-            .args(["/c", "ping -n 600 127.0.0.1 >nul"])
-            .creation_flags(CREATE_NO_WINDOW.0)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null()),
-    )
-    .unwrap();
-    let has_ping = |pid: u32| {
-        process_list::children_of(pid)
-            .iter()
-            .any(|name| name.eq_ignore_ascii_case("ping.exe"))
-    };
-    while !has_ping(parent.id()) {
-        assert!(parent.try_wait().unwrap().is_none(), "cmd.exe exited early");
-        std::thread::yield_now();
-    }
-    let leaf_has_ping = has_ping(leaf.id());
-    // Only the two processes started here: the leaf, and the tree under the cmd.exe.
-    let _ = leaf.kill();
-    let _ = desktop::status(
-        Command::new("taskkill")
-            .args(["/T", "/F", "/PID", &parent.id().to_string()])
-            .creation_flags(CREATE_NO_WINDOW.0)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null()),
-    );
-    let _ = (leaf.wait(), parent.wait());
-
-    assert!(!leaf_has_ping, "a ping.exe has no ping.exe child");
-}
-
-#[test]
-fn a_suspended_child_has_its_hard_error_boxes_suppressed() {
-    use std::os::windows::io::AsRawHandle;
-    use std::process::Stdio;
-
-    // Suspended, so it never runs and never opens anything. CREATE_DEFAULT_ERROR_MODE gives it
-    // the system default, whatever this process's mode is.
-    let mut child = desktop::spawn(
-        Command::new("cmd.exe")
-            .creation_flags(0x0000_0004 | CREATE_NO_WINDOW.0 | 0x0400_0000)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null()),
-    )
-    .unwrap();
-    let process = HANDLE(child.as_raw_handle());
-
-    let before = hard_errors::raises_hard_error_boxes(process);
-    hard_errors::suppress_hard_error_boxes(process).unwrap();
-    let after = hard_errors::raises_hard_error_boxes(process);
-    child.kill().unwrap();
-    child.wait().unwrap();
-
-    assert!(before, "control: a default child raises hard-error boxes");
-    assert!(!after, "the child no longer raises hard-error boxes");
-}
-
-#[test]
-fn account_names_differ_for_every_process_and_counter_and_fit_the_limit() {
-    let mut seen = std::collections::HashSet::new();
-    // Pairs whose digits run together if the two numbers are joined without a separator.
-    for (pid, n) in [(0x1a, 2), (0x1, 0xa2), (0x12, 0xa), (u32::MAX, 0xffff), (7, 0), (0, 7)] {
-        let name = account_name("alice", pid, n);
-        assert!(seen.insert(name.clone()), "{name} repeats");
-        assert!(
-            name.chars().count() <= 20,
-            "{name} is longer than an account name may be"
-        );
-    }
-}
-
-#[test]
-fn accounts_made_at_the_same_moment_on_many_threads_get_distinct_names() {
-    let names: Vec<String> = std::thread::scope(|scope| {
-        let threads: Vec<_> = (0..8)
-            .map(|_| scope.spawn(|| (0..50).map(|_| next_account_name("bob")).collect::<Vec<_>>()))
-            .collect();
-        threads.into_iter().flat_map(|t| t.join().unwrap()).collect()
-    });
-    let distinct: std::collections::HashSet<_> = names.iter().collect();
-    assert_eq!(distinct.len(), names.len());
-}
-
-#[test]
-fn a_child_entry_run_without_its_signal_panics() {
-    let outcome = std::panic::catch_unwind(|| child_entry::dir_from(["exe".to_owned(), "--exact".to_owned()]));
-    let payload = outcome.expect_err("a child half without the signal must not pass");
-    let message = payload.downcast_ref::<String>().cloned().unwrap_or_default();
-    assert!(message.contains(child_entry::SIGNAL), "{message}");
-}
-
-#[test]
-fn a_child_entry_takes_its_directory_from_the_signal() {
-    let args = ["exe", "--exact", "x", &format!("{}C:\\a b\\c", child_entry::SIGNAL)].map(str::to_owned);
-    assert_eq!(child_entry::dir_from(args), PathBuf::from("C:\\a b\\c"));
-}
-
-#[test]
-fn a_child_entry_panics_when_its_input_is_unreadable() {
-    let missing = std::env::temp_dir().join(format!("sb-iso-no-such-dir-{}", std::process::id()));
-    let outcome = std::panic::catch_unwind(|| child_entry::input(&missing));
-    assert!(outcome.is_err(), "an unreadable input must fail the child");
-}
-
-#[test]
-fn a_parent_fails_when_the_child_wrote_no_result() {
-    let missing = std::env::temp_dir().join(format!("sb-iso-no-such-dir-{}", std::process::id()));
-    let outcome = std::panic::catch_unwind(|| child_entry::result(&missing));
-    let payload = outcome.expect_err("no result must fail the parent");
-    let message = payload.downcast_ref::<String>().cloned().unwrap_or_default();
-    assert!(message.contains("wrote no result"), "{message}");
-}
-
-/// What libtest does with a stale filter: exit 0 having run nothing. Only the result file tells
-/// that apart from a child that ran and passed.
-#[test]
-fn a_child_filter_that_matches_no_test_exits_0_and_leaves_no_result() {
-    let shared = SharedDir::without_grant("nomatch");
-    child_entry::write_input(&shared.0, "");
-    let mut command = Command::new(std::env::current_exe().unwrap());
-    command
-        .args(child_entry::args("no_such_child_entry", &shared.0))
-        .creation_flags(CREATE_NO_WINDOW.0);
-    let status = desktop::status(&mut command).unwrap();
-
-    assert!(status.success(), "libtest exits 0 when nothing matched: {status:?}");
-    assert!(!child_entry::result_path(&shared.0).exists());
-}
-
-/// The whole pair, started as the current account instead of bob: the signal reaches the child,
-/// the child checks and records, and the result is the content the parent asserts.
-#[test]
-fn the_window_library_child_started_as_this_account_records_what_it_loaded() {
-    let shared = SharedDir::without_grant("libs-self");
-    child_entry::write_input(&shared.0, LIBS_INPUT);
-    let mut command = Command::new(std::env::current_exe().unwrap());
-    command
-        .args(child_entry::args("child_loads_the_window_libraries", &shared.0))
-        .creation_flags(CREATE_NO_WINDOW.0);
-    let status = desktop::status(&mut command).unwrap();
-
-    assert!(status.success(), "{status:?}");
-    assert_eq!(child_entry::result(&shared.0), LIBS_RESULT);
-}
-
-#[test]
-fn a_grant_names_each_sid_with_the_rights_given() {
-    assert_eq!(
-        desktop::grant_sddl(&["S-1-5-18", "S-1-1-0"], 0x2_037F),
-        "D:(A;;0x2037f;;;S-1-5-18)(A;;0x2037f;;;S-1-1-0)"
-    );
-}
-
-#[test]
-fn a_grant_is_a_descriptor_the_system_accepts() {
-    // Parsing creates nothing: no window station, no desktop.
-    desktop::Descriptor::parse(&desktop::grant_sddl(&["S-1-5-18", "BA"], desktop::DESKTOP_ACCESS))
-        .expect("the desktop grant parses");
-    desktop::Descriptor::parse(&desktop::grant_sddl(&["S-1-5-18", "BA"], desktop::STATION_ACCESS))
-        .expect("the window station grant parses");
-}
-
-#[test]
-fn an_environment_block_is_sorted_by_name_and_ends_in_two_nuls() {
-    let vars = [("b", "2"), ("=C:", "C:\\x"), ("A", "1")].map(|(k, v)| (k.into(), v.into()));
-    let block = environment::block(vars);
-    let text = String::from_utf16(&block).unwrap();
-    assert_eq!(text, "=C:=C:\\x\0A=1\0b=2\0\0");
-}
-
-#[test]
-fn an_empty_environment_block_is_two_nuls() {
-    assert_eq!(environment::block(std::iter::empty()), vec![0u16, 0u16]);
-}
-
-#[test]
-fn a_child_gets_a_private_desktop_and_this_process_keeps_its_window_station() {
-    assert_elevated();
-    let me = Sid::current_user().unwrap().to_sddl().unwrap();
-    let before = desktop::process_window_station();
-
-    let private = desktop::PrivateDesktop::create(&[&me]).expect("create a private window station and desktop");
-    let during = desktop::process_window_station();
-    let name = private.name().to_owned();
-    drop(private);
-
-    assert_eq!(
-        during, before,
-        "creating one leaves this process's window station alone"
-    );
-    assert_eq!(desktop::process_window_station(), before, "and so does closing it");
-    assert!(name.ends_with("\\Default"), "{name}");
-}
-
-/// Creating a [`desktop::PrivateDesktop`] switches this process's window station for a moment, and
-/// a child started without a desktop of its own inherits whichever station is current. So every
-/// start of a child goes through the guarded `desktop::{spawn, status, output}`, and the one
-/// `CreateProcess*` call here names its desktop. This reads the sources of this binary and fails
-/// on a start that bypasses the guard. `pty.rs` is left out: only binaries that never switch
-/// the station use it.
-#[test]
-fn no_child_is_started_outside_the_window_station_guard() {
-    // Built from pieces so that this test does not match itself.
-    let direct = [
-        concat!(".spa", "wn()"),
-        concat!(".sta", "tus()"),
-        concat!(".out", "put()"),
-    ];
-    let raw = [
-        concat!("CreateProcess", "W("),
-        concat!("CreateProcess", "AsUserW("),
-        concat!("CreateProcess", "WithLogonW("),
-    ];
-    let tests = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
-    let mut files = vec![tests.join("user_isolation_windows.rs")];
-    for entry in std::fs::read_dir(tests.join("common")).unwrap() {
-        let path = entry.unwrap().path();
-        let name = path.file_name().unwrap().to_string_lossy().into_owned();
-        if name.ends_with(".rs") && name != "desktop.rs" && name != "pty.rs" {
-            files.push(path);
-        }
-    }
-
-    let mut bypasses = Vec::new();
-    for file in files {
-        let text = std::fs::read_to_string(&file).unwrap();
-        for (number, line) in text.lines().enumerate() {
-            if direct.iter().chain(&raw).any(|needle| line.contains(needle)) {
-                bypasses.push(format!("{}:{}: {}", file.display(), number + 1, line.trim()));
-            }
-        }
-    }
-    assert!(
-        bypasses.is_empty(),
-        "start children through desktop::spawn, status or output:\n{}",
-        bypasses.join("\n")
-    );
-}
-
-/// CI only (creating a window station needs an administrator). Under a process-wide station
-/// switch that readers and spawns did not respect, a reader would see a private station here.
-#[test]
-fn creating_private_desktops_in_parallel_never_shows_a_reader_another_station() {
-    use std::sync::atomic::{AtomicBool, Ordering};
-
-    assert_elevated();
-    let me = Sid::current_user().unwrap().to_sddl().unwrap();
-    let original = desktop::process_window_station();
-    let done = AtomicBool::new(false);
-
-    let seen_other = std::thread::scope(|scope| {
-        let creators: Vec<_> = (0..4)
-            .map(|_| {
-                scope.spawn(|| {
-                    for _ in 0..5 {
-                        desktop::PrivateDesktop::create(&[&me]).expect("create a private window station and desktop");
-                    }
-                })
-            })
-            .collect();
-        let reader = scope.spawn(|| {
-            let mut other = 0u32;
-            while !done.load(Ordering::Acquire) {
-                if desktop::process_window_station() != original {
-                    other += 1;
-                }
-                std::thread::yield_now();
-            }
-            other
-        });
-        for creator in creators {
-            creator.join().unwrap();
-        }
-        done.store(true, Ordering::Release);
-        reader.join().unwrap()
-    });
-
-    assert_eq!(seen_other, 0, "a reader saw a window station other than the original");
-    assert_eq!(desktop::process_window_station(), original);
-}
-
-#[test]
-fn a_loader_status_in_an_exit_code_is_named() {
-    assert_eq!(hard_errors::describe_exit(0), "0");
-    assert_eq!(hard_errors::describe_exit(1), "1");
-    assert_eq!(
-        hard_errors::describe_exit(0xC000_0135),
-        "0xc0000135 (STATUS_DLL_NOT_FOUND)"
-    );
-    assert_eq!(hard_errors::describe_exit(0xC123_4567), "0xc1234567");
-}
-
-#[test]
-fn a_loader_failure_as_bob_ends_the_process_with_its_status_and_no_message_box() {
-    let bob = Account::create("ldr", false);
-    let shared = SharedDir::new("ldr");
-    // A copy of the shim that imports a DLL that does not exist: the loader cannot start it.
-    let broken = shared.0.join("broken.exe");
-    let mut image = std::fs::read(env!("CARGO_BIN_EXE_ssh-broker")).unwrap();
-    let (from, to) = (b"wtsapi32.dll\0", b"wtsapi99.dll\0");
-    let at = image
-        .windows(from.len())
-        .position(|w| w == from)
-        .expect("the shim imports wtsapi32.dll");
-    image[at..at + to.len()].copy_from_slice(to);
-    std::fs::write(&broken, &image).unwrap();
-
-    let code = bob.run(&broken, &format!("\"{}\"", broken.display()), &shared.0, &[]);
-
-    assert_eq!(
-        hard_errors::describe_exit(code),
-        hard_errors::describe_exit(0xC000_0135),
-        "the loader ended the process with STATUS_DLL_NOT_FOUND"
-    );
-}
-
-/// The libraries [`child_loads_the_window_libraries`] must load, one per line: what the parent
-/// hands it.
-const LIBS_INPUT: &str = "user32.dll\ngdi32.dll\ncombase.dll\nole32.dll\n";
-/// What [`child_loads_the_window_libraries`] records once all of them have loaded.
-const LIBS_RESULT: &str = "loaded user32.dll\nloaded gdi32.dll\nloaded combase.dll\nloaded ole32.dll\n";
-
-/// Child half of [`a_child_as_bob_loads_the_window_libraries`], started only by it as bob (see
-/// [`child_entry`]). Fails if a library named in its input will not load, and records
-/// [`LIBS_RESULT`] only after all of them did.
-#[test]
-#[ignore = "run as a child of a_child_as_bob_loads_the_window_libraries"]
-fn child_loads_the_window_libraries() {
-    let dir = child_entry::dir();
-    let input = child_entry::input(&dir);
-    assert_eq!(input, LIBS_INPUT, "the child's input names the libraries to load");
-
-    let mut result = String::new();
-    let mut failed = Vec::new();
-    for dll in input.lines() {
-        // SAFETY: NUL-terminated name.
-        match unsafe { LoadLibraryW(PCWSTR(wide(dll).as_ptr())) } {
-            Ok(_) => result.push_str(&format!("loaded {dll}\n")),
-            Err(e) => failed.push(format!("{dll}: {e}")),
-        }
-    }
-    assert!(failed.is_empty(), "did not load: {failed:?}");
-
-    child_entry::write_result(&dir, &result);
-}
-
-/// What the shim and `ssh` need from an account's processes: user32 and the libraries on top of
-/// it (ole32) initialise. They do not where the process has no usable window station and desktop.
-#[test]
-fn a_child_as_bob_loads_the_window_libraries() {
-    let bob = Account::create("bob", false);
-    let shared = SharedDir::new("libs");
-    let exe = shared.0.join("isolation.exe");
-    std::fs::copy(std::env::current_exe().unwrap(), &exe).unwrap();
-    child_entry::write_input(&shared.0, LIBS_INPUT);
-    let command = child_entry::command_line(&exe, "child_loads_the_window_libraries", &shared.0);
-
-    let code = bob.run(&exe, &command, &shared.0, &[]);
-
-    assert_eq!(
-        code,
-        0,
-        "the child, running as bob, failed ({}): see its output above",
-        hard_errors::describe_exit(code)
-    );
-    assert_eq!(child_entry::result(&shared.0), LIBS_RESULT);
-}
-
-#[test]
-fn shim_as_bob_never_reaches_another_users_listener() {
-    // The administrator's agent is listening, and bob may open its socket. An administrator who
-    // SSHes in as bob gets bob's shim, which looks in bob's profile, finds nothing, and fails
-    // open.
-    let bob = Account::create("bob", true);
-    let shared = SharedDir::new("shim");
-
-    let admin = Sid::current_user().unwrap();
-    let admin_loc = userdir::current_socket_location().unwrap();
-    userdir::ensure_socket_dir(&admin_loc, &admin).unwrap();
-    let _lock = UserLock::try_acquire(&admin_loc.lock_path())
-        .unwrap()
-        .expect("no agent runs on the CI host");
-    let listener = Listener::bind(&admin_loc.path).unwrap();
-    // The file DACL would turn bob away on its own, which would hide a shim that looked in the
-    // wrong profile. Grant bob the socket, so that only the path decides: a shim that followed
-    // the administrator's environment would connect here and fail the sentinel check below.
-    let status = desktop::status(
-        Command::new("icacls")
-            .arg(&admin_loc.path)
-            .args(["/grant", &format!("*{}:(F)", bob.sid_text)]),
-    )
-    .unwrap();
-    assert!(status.success(), "icacls /grant");
-
-    // Records the first thing that connects and the first byte it sends.
-    let (first_byte, seen) = mpsc::channel();
-    let acceptor = std::thread::spawn(move || {
-        use std::io::Read;
-        let mut conn = listener.accept().unwrap();
-        let mut byte = [0u8; 1];
-        let n = conn.read(&mut byte).unwrap();
-        first_byte.send((n, byte[0])).unwrap();
-    });
-
+/// Run a copy of the shim as `bob`, started by this administrator, in the shape sshd gives it: a
+/// non-PTY `-c "cmd.exe /c echo shim-ran"`. Guarantees that bob's profile is loaded and that the
+/// administrator's own environment (`USERPROFILE`, `LOCALAPPDATA` and all) is passed in as is, so
+/// the shim has to take bob's socket from his token and not from what it inherits.
+fn run_shim_as(bob: &Account, shared: &SharedDir) -> ShimRun {
     let shim = shared.0.join("ssh-broker.exe");
     std::fs::copy(env!("CARGO_BIN_EXE_ssh-broker"), &shim).unwrap();
-    // Shaped like a non-PTY sshd session, which the shim tells from a PTY one by its stdin: a
-    // console stdin (what `run` gives a process) makes it keep the quotes around the command, and
+    // The shim tells a non-PTY sshd session from a PTY one by its stdin: a console stdin (what
+    // `run` gives a process) makes it keep the quotes around the command, and
     // `"cmd.exe /c echo shim-ran"` names no program. So stdin is NUL. The redirections come first
     // because `cmd` leaves the space before a trailing one in the command line the shim reads.
     let script = shared.0.join("run.cmd");
@@ -1252,8 +791,6 @@ fn shim_as_bob_never_reaches_another_users_listener() {
     let evidence = ["out.txt", "err.txt"].map(|name| shared.0.join(name));
     // With his profile loaded: `CreateProcessWithTokenW` loads it only when asked (Microsoft docs,
     // Remarks).
-    // The administrator's own environment goes in as is (`USERPROFILE`, `LOCALAPPDATA` and all),
-    // so the shim has to take bob's socket from his token and not from what it inherits.
     let admin_environment = environment::current_block();
     let code = bob.run_with(
         &cmd,
@@ -1263,33 +800,127 @@ fn shim_as_bob_never_reaches_another_users_listener() {
         LOGON_WITH_PROFILE,
         Some(&admin_environment),
     );
+    ShimRun {
+        code,
+        stdout: std::fs::read_to_string(shared.0.join("out.txt")).unwrap(),
+        stderr: std::fs::read_to_string(shared.0.join("err.txt")).unwrap(),
+    }
+}
+
+/// A listener that records what the first connection to it sends. Raw sockets, so that it can
+/// listen in a directory hardened for another account, which `Listener::bind` refuses.
+struct Recorder {
+    path: PathBuf,
+    seen: mpsc::Receiver<Vec<u8>>,
+    thread: std::thread::JoinHandle<()>,
+}
+
+impl Recorder {
+    fn listen(path: &Path) -> Recorder {
+        let socket = socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None).unwrap();
+        socket.bind(&socket2::SockAddr::unix(path).unwrap()).unwrap();
+        socket.listen(8).unwrap();
+        let (first, seen) = mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            use std::io::Read;
+            let (mut conn, _) = socket.accept().unwrap();
+            let mut buf = [0u8; 256];
+            let n = conn.read(&mut buf).unwrap();
+            first.send(buf[..n].to_vec()).unwrap();
+        });
+        Recorder {
+            path: path.to_owned(),
+            seen,
+            thread,
+        }
+    }
+
+    /// What the first connection sent, after a connection of our own that sends `sentinel`: the
+    /// connections are accepted in order, so anything that connected before this call comes
+    /// first, and `sentinel` coming back means that nothing did. Removes the socket file.
+    fn first_sender(self, sentinel: &[u8]) -> Vec<u8> {
+        let mut ours = afunix::connect(&self.path).unwrap();
+        std::io::Write::write_all(&mut ours, sentinel).unwrap();
+        let first = self.seen.recv().unwrap();
+        self.thread.join().unwrap();
+        let _ = std::fs::remove_file(&self.path);
+        first
+    }
+}
+
+const SENTINEL: &[u8] = b"sentinel: not a frame";
+
+#[test]
+fn shim_as_bob_never_reaches_another_users_listener() {
+    // The administrator's agent is listening, and bob may open its socket. An administrator who
+    // SSHes in as bob gets bob's shim, which looks in bob's profile, finds nothing, and fails
+    // open.
+    let bob = Account::create("bob", true);
+    let shared = SharedDir::new("shim");
+
+    let admin = Sid::current_user().unwrap();
+    let admin_loc = userdir::current_socket_location().unwrap();
+    userdir::ensure_socket_dir(&admin_loc, &admin).unwrap();
+    let _lock = UserLock::try_acquire(&admin_loc.lock_path())
+        .unwrap()
+        .expect("no agent runs on the CI host");
+    let listener = Recorder::listen(&admin_loc.path);
+    // The file DACL would turn bob away on its own, which would hide a shim that looked in the
+    // wrong profile. Grant bob the socket, so that only the path decides: a shim that followed
+    // the administrator's environment would connect here and fail the sentinel check below.
+    let status = desktop::status(
+        Command::new("icacls")
+            .arg(&admin_loc.path)
+            .args(["/grant", &format!("*{}:(F)", bob.sid_text)]),
+    )
+    .unwrap();
+    assert!(status.success(), "icacls /grant");
+
+    let run = run_shim_as(&bob, &shared);
+
     assert!(
-        code == 0,
-        "the fail-open command ran; the shim run ended with {}
-shim: {}
-shared directory: {}",
-        hard_errors::describe_exit(code),
-        icacls_report(&shim),
+        run.code == 0,
+        "the fail-open command ran; the shim run ended with {}\nshim: {}\nshared directory: {}",
+        hard_errors::describe_exit(run.code),
+        icacls_report(&shared.0.join("ssh-broker.exe")),
         icacls_report(&shared.0)
     );
-
-    let stderr = std::fs::read_to_string(shared.0.join("err.txt")).unwrap();
-    let stdout = std::fs::read_to_string(shared.0.join("out.txt")).unwrap();
+    // The location resolved (to bob's own) and nothing listens there: no reason, no log failure.
+    assert_eq!(run.stderr, NO_AGENT_LINE, "the shim failed open for the wrong reason");
     assert!(
-        stderr.contains("agent unavailable"),
-        "the shim failed open and said so: {stderr}"
+        run.stdout.contains("shim-ran"),
+        "and ran the command locally: {}",
+        run.stdout
     );
-    assert!(stdout.contains("shim-ran"), "and ran the command locally: {stdout}");
-
-    // Connections are accepted in order, so if the shim had connected it would be first. Ours
-    // comes second at best, and its marker byte is what the acceptor must see.
-    let mut sentinel = afunix::connect(&admin_loc.path).unwrap();
-    std::io::Write::write_all(&mut sentinel, b"S").unwrap();
     assert_eq!(
-        seen.recv().unwrap(),
-        (1, b'S'),
+        listener.first_sender(SENTINEL),
+        SENTINEL,
         "something else connected before the sentinel"
     );
-    acceptor.join().unwrap();
-    let _ = std::fs::remove_file(&admin_loc.path);
+}
+
+/// The control for the test above: the same shim, run the same way, does connect when a listener
+/// is in bob's own location. Without it, the refusal above could be a shim that never connects.
+#[test]
+fn shim_as_bob_reaches_a_listener_in_bobs_own_location() {
+    let bob = Account::create("bob", true);
+    let shared = SharedDir::new("shim-own");
+    let bob_loc = userdir::socket_location_of_token(bob.network_token().0).unwrap();
+    // The administrator makes bob's folder; it is exactly bob, SYSTEM and Administrators, and the
+    // socket file made in it inherits the same, so bob may connect.
+    userdir::ensure_socket_dir(&bob_loc, &bob.sid).unwrap();
+    let listener = Recorder::listen(&bob_loc.path);
+
+    let run = run_shim_as(&bob, &shared);
+
+    let first = listener.first_sender(SENTINEL);
+    assert_ne!(
+        first,
+        SENTINEL,
+        "the shim run as bob did not connect to bob's own socket {}\nits stderr: {}\nits exit: {}",
+        bob_loc.path.display(),
+        run.stderr,
+        hard_errors::describe_exit(run.code)
+    );
+    assert!(!first.is_empty(), "the shim connected but sent nothing");
 }

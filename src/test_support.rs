@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use crate::socket_loc::{SOCKET_DIR_NAME, SOCKET_FILE_NAME, SocketLocation};
+use crate::socket_loc::SocketLocation;
 
 use windows::Win32::Foundation::{HLOCAL, LocalFree};
 use windows::Win32::Security::Authorization::{
@@ -88,11 +88,7 @@ impl TempProfile {
     }
 
     pub fn location(&self) -> SocketLocation {
-        let dir = self.0.join("AppData").join("Local").join(SOCKET_DIR_NAME);
-        SocketLocation {
-            path: dir.join(SOCKET_FILE_NAME),
-            dir,
-        }
+        crate::socket_loc::for_profile(&self.0).expect("the stand-in profile path is short enough")
     }
 }
 

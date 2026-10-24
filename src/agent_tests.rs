@@ -393,9 +393,7 @@ fn agent_rejects_non_handshake_first_frame() {
 
 /// A disconnect must be noticed even when the input pump is stuck and cannot read the socket.
 ///
-/// The regression this pins reached review once: the output pumps' reap was deleted as
-/// "redundant", on the premise that the input pump is always parked in a socket read. It is
-/// not. Writes to the child's stdin are queued to a writer thread, and once the child stops
+/// Writes to the child's stdin are queued to a writer thread, and once the child stops
 /// draining its stdin pipe AND that queue fills, the pump parks in the send — blind to the
 /// socket. The output pumps are then the only detector left.
 ///

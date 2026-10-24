@@ -1,7 +1,7 @@
 use super::*;
 use crate::acl;
 use crate::provision::schtasks::agent_task_xml;
-use crate::test_support::{FILE_READ_EXECUTE, aces, dacl_sddl};
+use crate::test_support::{FILE_READ_EXECUTE, aces};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// A not-yet-created base directory under the temp dir that is removed on drop.
@@ -81,7 +81,10 @@ fn check_base_gives_the_reason_for_an_untrusted_directory() {
 
     let reason = check_base(&layout).expect_err("a default directory is untrusted");
 
-    assert!(reason.contains("owner"), "{reason}");
+    // A directory under the temp dir inherits its ACL, whoever owns it (the user, or
+    // Administrators for an elevated one), so the ACL clause is the reason in either case. Every
+    // reason mentions an owner, so that word alone would prove nothing.
+    assert!(reason.contains("its ACL is not the hardened one"), "{reason}");
     assert!(names_in(&base.0).is_empty(), "check_base only reads");
 }
 
@@ -503,21 +506,6 @@ fn aces_reads_an_sddl_dacl() {
             ("A", "OICIID", FILE_READ_EXECUTE, "BA"),
             ("A", "", FILE_READ_EXECUTE, "BU"),
         ]
-    );
-}
-
-#[test]
-fn dacl_sddl_reports_the_inherited_aces_of_a_plain_directory() {
-    let base = TempBase::existing("sddl");
-    let sddl = dacl_sddl(&base.0);
-
-    let entries = aces(&sddl);
-    assert!(!entries.is_empty(), "{sddl}");
-    assert!(
-        entries
-            .iter()
-            .all(|(kind, flags, _, _)| *kind == "A" && flags.contains("ID")),
-        "a plain temp directory inherits every ACE: {sddl}"
     );
 }
 

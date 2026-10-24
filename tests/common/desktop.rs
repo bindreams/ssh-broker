@@ -47,6 +47,7 @@ fn wide(text: &str) -> Vec<u16> {
 pub struct Descriptor(PSECURITY_DESCRIPTOR);
 
 impl Descriptor {
+    /// The descriptor for `sddl`; an error, never a descriptor that grants something else.
     pub fn parse(sddl: &str) -> windows::core::Result<Descriptor> {
         let mut sd = PSECURITY_DESCRIPTOR::default();
         // SAFETY: NUL-terminated input, valid out-pointer; the result is freed in `drop`.
@@ -146,17 +147,9 @@ fn station_unchanged() -> RwLockReadGuard<'static, ()> {
     STATION.read().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// This process's window station handle, as a number (to compare before and after).
-pub fn process_window_station() -> usize {
-    let _unchanged = station_unchanged();
-    // SAFETY: takes no arguments; the handle is the process's own and is not closed.
-    unsafe { (user32().get_process_window_station)() }.0 as usize
-}
-
 /// Start `command`. A child started without a desktop of its own takes this process's current
 /// window station, so the start waits for any switch to finish and holds it off until the child
-/// exists. Every start of a child in this binary goes through here, [`status`] or [`output`]
-/// (a test checks the sources).
+/// exists. Every start of a child in this binary goes through here, [`status`] or [`output`].
 pub fn spawn(command: &mut Command) -> io::Result<Child> {
     let _unchanged = station_unchanged();
     command.spawn()

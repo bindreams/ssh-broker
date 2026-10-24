@@ -1,6 +1,6 @@
 //! Tests for the current user's profile and socket location.
 //!
-//! Anything that needs a second account or elevation lives in `userdir_isolation_tests.rs`.
+//! Anything that needs a second account or elevation lives in `tests/user_isolation_windows.rs`.
 use super::*;
 use crate::winutil::OwnedHandle;
 use std::path::PathBuf;
@@ -41,7 +41,7 @@ fn current_socket_location_fits_sockaddr_un() {
 #[test]
 fn profile_dir_of_token_rejects_an_invalid_handle() {
     let err = profile_dir_of_token(HANDLE::default()).unwrap_err();
-    assert!(!format!("{err:#}").is_empty());
+    assert!(format!("{err:#}").contains("no profile directory"), "{err:#}");
 }
 
 #[test]
@@ -72,14 +72,24 @@ fn for_profile_limit_agrees_with_unix_addr() {
 // Re-run as a child with a decoy environment -----
 
 const CHILD_FLAG: &str = "SSH_BROKER_USERDIR_TEST_CHILD";
+const DECOY_PROFILE: &str = r"C:\decoy\profile";
 
-/// Not a test of its own: when the parent below re-runs this binary with the flag set, it prints
-/// the location the process resolves. Without the flag it passes at once.
+/// Child half of [`current_socket_location_ignores_decoy_environment`], started only by it. Knows
+/// it is the child from [`CHILD_FLAG`] and panics without it, so a bare `--ignored` run is not a
+/// pass. Prints the location it resolves, after checking that the decoy reached it; the parent
+/// fails when the line is missing.
 #[test]
+#[ignore = "run as a child of current_socket_location_ignores_decoy_environment"]
 fn child_prints_its_socket_location() {
-    if std::env::var_os(CHILD_FLAG).is_none() {
-        return;
-    }
+    assert!(
+        std::env::var_os(CHILD_FLAG).is_some(),
+        "this is a child half; its parent starts it with {CHILD_FLAG} set"
+    );
+    assert_eq!(
+        std::env::var("USERPROFILE").as_deref(),
+        Ok(DECOY_PROFILE),
+        "the decoy environment did not reach the child"
+    );
     let loc = current_socket_location().unwrap();
     println!("LOCATION={}", loc.path.display());
 }
@@ -93,10 +103,11 @@ fn current_socket_location_ignores_decoy_environment() {
         .args([
             "--exact",
             "userdir::userdir_tests::child_prints_its_socket_location",
+            "--ignored",
             "--nocapture",
         ])
         .env(CHILD_FLAG, "1")
-        .env("USERPROFILE", r"C:\decoy\profile")
+        .env("USERPROFILE", DECOY_PROFILE)
         .env("LOCALAPPDATA", r"C:\decoy\profile\AppData\Local")
         .env("APPDATA", r"C:\decoy\profile\AppData\Roaming")
         .env("HOMEDRIVE", "C:")
@@ -112,7 +123,7 @@ fn current_socket_location_ignores_decoy_environment() {
     let line = stdout
         .lines()
         .find_map(|l| l.strip_prefix("LOCATION="))
-        .unwrap_or_else(|| panic!("the child printed no location: {stdout}"));
+        .unwrap_or_else(|| panic!("the child printed no location (it did not run?): {stdout}"));
     assert_eq!(PathBuf::from(line), expected);
 }
 

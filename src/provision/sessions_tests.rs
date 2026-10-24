@@ -53,10 +53,27 @@ fn target_sessions_is_empty_when_nobody_is_logged_on() {
 
 #[test]
 fn interactive_sessions_reads_this_host_and_never_names_session_zero() {
-    // Read-only: enumerates sessions and asks each for its user name.
+    // Read-only: enumerates sessions and asks each for its user name. Where this process runs in
+    // an interactive session (a desktop, an RDP session) its own session must be listed, which
+    // proves the enumeration reaches real sessions. On a runner whose processes run in session 0
+    // there is no such session to find, and what this proves is that session 0 is left out.
+    use windows::Win32::System::RemoteDesktop::ProcessIdToSessionId;
+    use windows::Win32::System::Threading::GetCurrentProcessId;
+
+    let mut own = 0u32;
+    // SAFETY: a valid out-pointer.
+    unsafe { ProcessIdToSessionId(GetCurrentProcessId(), &mut own) }.unwrap();
+
     let targets = interactive_sessions().unwrap();
+
     assert!(!targets.ids.contains(&0), "{targets:?}");
     assert!(targets.unknown.iter().all(|(id, _)| *id != 0), "{targets:?}");
+    if own != 0 {
+        assert!(
+            targets.ids.contains(&own) || targets.unknown.iter().any(|(id, _)| *id == own),
+            "this process runs in session {own}, which is not listed: {targets:?}"
+        );
+    }
 }
 
 #[test]

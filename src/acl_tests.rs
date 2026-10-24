@@ -4,14 +4,37 @@
 use super::*;
 
 #[test]
-fn current_user_sid_resolves() {
-    assert!(Sid::current_user().is_ok());
+fn current_user_sid_is_the_one_whoami_reports() {
+    // `whoami` reads the same token through another path, so it is the independent source.
+    use std::os::windows::process::CommandExt;
+    let out = std::process::Command::new("whoami")
+        .args(["/user", "/fo", "csv", "/nh"])
+        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "whoami failed: {out:?}");
+    let text = String::from_utf8_lossy(&out.stdout);
+    let reported = text
+        .trim()
+        .rsplit(',')
+        .next()
+        .map(|field| field.trim_matches('"'))
+        .unwrap_or_default();
+
+    assert!(reported.starts_with("S-1-"), "whoami printed no SID: {text}");
+    assert_eq!(Sid::current_user().unwrap().to_sddl().unwrap(), reported);
 }
 
 #[test]
-fn well_known_sids_resolve() {
-    assert!(Sid::well_known(WellKnown::System).is_ok());
-    assert!(Sid::well_known(WellKnown::Administrators).is_ok());
+fn well_known_sids_are_the_documented_ones() {
+    assert_eq!(
+        Sid::well_known(WellKnown::System).unwrap().to_sddl().unwrap(),
+        "S-1-5-18"
+    );
+    assert_eq!(
+        Sid::well_known(WellKnown::Administrators).unwrap().to_sddl().unwrap(),
+        "S-1-5-32-544"
+    );
 }
 
 #[test]
@@ -769,8 +792,8 @@ fn a_subdirectory_created_in_a_hardened_dir_inherits_the_three_aces() {
 
 #[test]
 fn dir_with_non_inheritable_aces_does_not_verify() {
-    // What an earlier build left behind: exact, protected, but the ACEs do not reach the socket
-    // file. The file would be born with the creator's default DACL, so this dir is not trusted.
+    // An exact, protected DACL whose ACEs do not inherit: the socket file would be born with the
+    // creator's default DACL, so the dir is not trusted.
     let dir = TempPath::new("non-inheritable");
     std::fs::create_dir(&dir.0).unwrap();
     let me = Sid::current_user().unwrap();
