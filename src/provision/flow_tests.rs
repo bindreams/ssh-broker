@@ -71,6 +71,7 @@ fn agents_survive_a_failed_stop_in_the_sessions_the_start_is_told_to_leave_alone
     let left = vec![Survivor {
         pid: 5,
         session: Some(2),
+        unconfirmed: None,
     }];
     let told = RefCell::new(Vec::new());
     let result = run(
@@ -157,10 +158,12 @@ fn a_session_whose_old_agent_survived_gets_no_new_one() {
         Survivor {
             pid: 5,
             session: Some(2),
+            unconfirmed: None,
         },
         Survivor {
             pid: 6,
             session: Some(2),
+            unconfirmed: None,
         },
     ];
     let plan = plan_start(&[1, 2, 3], &survivors);
@@ -171,7 +174,14 @@ fn a_session_whose_old_agent_survived_gets_no_new_one() {
 #[test]
 fn a_survivor_in_an_unknown_session_holds_every_session() {
     use crate::provision::procwait::Survivor;
-    let plan = plan_start(&[1, 2], &[Survivor { pid: 9, session: None }]);
+    let plan = plan_start(
+        &[1, 2],
+        &[Survivor {
+            pid: 9,
+            session: None,
+            unconfirmed: None,
+        }],
+    );
     assert!(plan.start.is_empty());
     assert_eq!(plan.held, [(1, vec![9]), (2, vec![9])]);
 }

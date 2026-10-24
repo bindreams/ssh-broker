@@ -122,7 +122,7 @@ mod imp {
         //    first, so a planted one is never adopted, and a single-user install is replaced. A
         //    different build over an installed one stops every agent first (they hold the exe
         //    open) and waits for them to exit, with the logon task disabled so that no logon
-        //    starts one from the old exe meanwhile. Every run ends by enabling the task, which
+        //    starts one from the old exe meanwhile. Every run from here ends by enabling the task, which
         //    also heals one an earlier, killed `apply` left disabled; the agents start again
         //    afterwards, even if a later step fails, except in a session whose old agent has not
         //    exited.

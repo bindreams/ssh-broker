@@ -175,6 +175,46 @@ fn an_exe_that_does_not_exist_is_held_by_no_process() {
 }
 
 #[test]
+fn a_wait_that_fails_leaves_the_process_a_survivor_with_the_error_and_the_rest_are_still_waited_for() {
+    // If the exit cannot be confirmed the process may still be dying, holding its session's slot:
+    // agents must not be started in that session, which is what a survivor is for.
+    let mut fails = child_until_stdin_closes();
+    let mut exits = child_until_stdin_closes();
+    let processes: Vec<_> = [&fails, &exits]
+        .iter()
+        .map(|c| open_if_image(c.id(), &cmd_exe()).unwrap().unwrap())
+        .collect();
+    drop(exits.stdin.take());
+    exits.wait().unwrap();
+    let failing_pid = fails.id();
+
+    let err = wait_all_exited_by(&processes, Duration::from_secs(60), &|process, _millis| {
+        if process.pid == failing_pid {
+            Err(std::io::Error::from_raw_os_error(6))
+        } else {
+            wait_on(process, 0)
+        }
+    })
+    .unwrap_err();
+
+    let still = err.downcast_ref::<StillRunning>().expect("a typed error");
+    assert_eq!(still.survivors.len(), 1, "{still}");
+    let survivor = &still.survivors[0];
+    assert_eq!(survivor.pid, failing_pid);
+    assert!(
+        survivor.unconfirmed.as_deref().is_some_and(|e| e.contains("handle")),
+        "{survivor:?}"
+    );
+    let text = format!("{err:#}");
+    assert!(text.contains(&failing_pid.to_string()), "{text}");
+    assert!(text.contains("could not confirm"), "{text}");
+    assert!(text.contains("run apply again"), "{text}");
+
+    drop(fails.stdin.take());
+    fails.wait().unwrap();
+}
+
+#[test]
 fn processes_that_outlive_the_bound_are_all_named_with_their_sessions() {
     let mut exits = child_until_stdin_closes();
     let mut stays_a = child_until_stdin_closes();

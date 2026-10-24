@@ -115,9 +115,23 @@ fn stop_that_failed_is_an_error_naming_the_task() {
 /// the engine has not launched it yet).
 type Listing = Vec<u32>;
 
+/// Long enough that no test of the order of the steps reaches it.
+const NO_BOUND: Duration = Duration::from_secs(3600);
+
 /// The steps of a stop over a script of listings (the last one repeats), recording the order they
 /// run in.
 fn run_stop_and_wait(
+    listings: Vec<Listing>,
+    disable: bool,
+    stop: bool,
+    wait: bool,
+    events: &RefCell<Vec<String>>,
+) -> anyhow::Result<()> {
+    run_stop_and_wait_within(NO_BOUND, listings, disable, stop, wait, events)
+}
+
+fn run_stop_and_wait_within(
+    bound: Duration,
     listings: Vec<Listing>,
     disable: bool,
     stop: bool,
@@ -128,6 +142,8 @@ fn run_stop_and_wait(
     let outcome = |ok: bool| if ok { Ok(()) } else { anyhow::bail!("failed") };
     let mut listings = listings.into_iter().peekable();
     stop_and_wait(
+        "the-task",
+        bound,
         || {
             log("disable");
             outcome(disable)
@@ -141,6 +157,7 @@ fn run_stop_and_wait(
             log(&format!("list {pids:?}"));
             Ok(Instances {
                 count: pids.len(),
+                pids: pids.clone(),
                 processes: pids.into_iter().filter(|pid| *pid != 0).collect(),
             })
         },
@@ -203,6 +220,25 @@ fn the_stop_repeats_for_as_long_as_an_instance_appears_with_no_count_of_passes()
     listings.push(vec![]);
     run_stop_and_wait(listings, true, true, true, &events).unwrap();
     assert_eq!(events.borrow().iter().filter(|e| *e == "stop").count(), 1000);
+}
+
+#[test]
+fn an_instance_that_stop_never_clears_fails_the_stop_naming_the_task_and_the_instance() {
+    // The service keeps listing an instance that `Stop` does not remove (a stale entry). That is
+    // an external condition that might never clear, so past the bound it is an error and the
+    // caller's failure path puts the task back. With a zero bound the first stop has been made
+    // and the next look ends it.
+    let events = RefCell::new(Vec::new());
+    let err = run_stop_and_wait_within(Duration::ZERO, vec![vec![0, 44]], true, true, true, &events).unwrap_err();
+    let text = format!("{err:#}");
+    assert!(text.contains("the-task"), "{text}");
+    assert!(text.contains("44"), "names the instance with a process: {text}");
+    assert!(text.contains("not launched"), "names the instance with none: {text}");
+    assert_eq!(
+        events.into_inner(),
+        ["disable", "list [0, 44]", "stop", "wait [44]", "list [0, 44]"],
+        "stopped once before giving up, and did not stop again"
+    );
 }
 
 #[test]

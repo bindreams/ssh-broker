@@ -114,17 +114,19 @@ fn image_of(process: &OwnedHandle) -> anyhow::Result<PathBuf> {
     Ok(PathBuf::from(String::from_utf16_lossy(&buf[..len as usize])))
 }
 
-/// A process that outlived the bound.
+/// A process that outlived the bound, or whose exit could not be confirmed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Survivor {
     pub pid: u32,
     /// The session it runs in, or `None` if that could not be read.
     pub session: Option<u32>,
+    /// Why its exit could not be confirmed, if the wait itself failed; `None` if it timed out.
+    pub unconfirmed: Option<String>,
 }
 
-/// Agent processes still alive when the bound ran out. The old agent of each holds its session's
-/// slot, so an agent started in that session meanwhile would find the slot taken, exit, and leave
-/// the session with none once the old one dies.
+/// Agent processes still alive when the bound ran out, or that could not be confirmed gone. The
+/// old agent of each holds its session's slot, so an agent started in that session meanwhile would
+/// find the slot taken, exit, and leave the session with none once the old one dies.
 #[derive(Debug)]
 pub struct StillRunning {
     pub survivors: Vec<Survivor>,
@@ -139,13 +141,32 @@ impl StillRunning {
 
 impl std::fmt::Display for StillRunning {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let pids: Vec<String> = self.survivors.iter().map(|s| s.pid.to_string()).collect();
+        let (unconfirmed, timed_out): (Vec<_>, Vec<_>) = self.survivors.iter().partition(|s| s.unconfirmed.is_some());
+        let mut parts = Vec::new();
+        if !timed_out.is_empty() {
+            let pids: Vec<String> = timed_out.iter().map(|s| s.pid.to_string()).collect();
+            parts.push(format!(
+                "process {} did not exit within {} s of being stopped",
+                pids.join(", "),
+                self.bound.as_secs()
+            ));
+        }
+        for survivor in unconfirmed {
+            parts.push(format!(
+                "could not confirm that process {} has exited ({})",
+                survivor.pid,
+                survivor.unconfirmed.as_deref().unwrap_or_default()
+            ));
+        }
         write!(
             f,
-            "process {} did not exit within {} s of being stopped; run apply again once {} exited",
-            pids.join(", "),
-            self.bound.as_secs(),
-            if pids.len() == 1 { "it has" } else { "they have" }
+            "{}; run apply again once {} exited",
+            parts.join("; "),
+            if self.survivors.len() == 1 {
+                "it has"
+            } else {
+                "they have"
+            }
         )
     }
 }
@@ -154,8 +175,31 @@ impl std::error::Error for StillRunning {}
 
 /// Return once every process in `processes` has exited. Processes still alive after `bound`
 /// (shared by all of them, counted from the call) are an error, [`StillRunning`], naming each: the
-/// exit is an external event that might never come.
+/// exit is an external event that might never come. A process whose wait fails is one whose exit
+/// is not confirmed, and is carried the same way, with the error.
 pub fn wait_all_exited(processes: &[Process], bound: Duration) -> anyhow::Result<()> {
+    wait_all_exited_by(processes, bound, &wait_on)
+}
+
+/// Wait up to `millis` for `process` to exit: `true` if it did, `false` if the time ran out.
+fn wait_on(process: &Process, millis: u32) -> std::io::Result<bool> {
+    // SAFETY: the handle is open for the life of `process`.
+    let outcome = unsafe { WaitForSingleObject(process.handle.0, millis) }; // sleep-ok: failure bound on an external process exit, reported as an error
+    if outcome == WAIT_OBJECT_0 {
+        Ok(true)
+    } else if outcome == WAIT_TIMEOUT {
+        Ok(false)
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// [`wait_all_exited`] with the wait on one process as a parameter, so a test can make it fail.
+fn wait_all_exited_by(
+    processes: &[Process],
+    bound: Duration,
+    wait: &dyn Fn(&Process, u32) -> std::io::Result<bool>,
+) -> anyhow::Result<()> {
     let deadline = Instant::now().checked_add(bound);
     let mut survivors = Vec::new();
     for process in processes {
@@ -166,19 +210,16 @@ pub fn wait_all_exited(processes: &[Process], bound: Duration) -> anyhow::Result
             None => u128::from(u32::MAX - 1),
         };
         let millis = u32::try_from(millis).unwrap_or(u32::MAX - 1);
-        // SAFETY: the handle is open for the life of `process`.
-        let outcome = unsafe { WaitForSingleObject(process.handle.0, millis) }; // sleep-ok: failure bound on an external process exit, reported as an error
-        if outcome == WAIT_OBJECT_0 {
-            continue;
-        }
-        if outcome == WAIT_TIMEOUT {
-            survivors.push(Survivor {
-                pid: process.pid,
-                session: session_of(process.pid),
-            });
-            continue;
-        }
-        return Err(std::io::Error::last_os_error()).with_context(|| format!("wait for process {}", process.pid));
+        let unconfirmed = match wait(process, millis) {
+            Ok(true) => continue,
+            Ok(false) => None,
+            Err(e) => Some(e.to_string()),
+        };
+        survivors.push(Survivor {
+            pid: process.pid,
+            session: session_of(process.pid),
+            unconfirmed,
+        });
     }
     if survivors.is_empty() {
         Ok(())

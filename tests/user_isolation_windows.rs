@@ -552,8 +552,8 @@ fn a_user_with_no_profile_has_no_socket_location() {
     let token = nobody.network_token();
     let err = userdir::socket_location_of_token(token.0).unwrap_err();
     assert!(
-        !format!("{err:#}").is_empty(),
-        "the shim reports this reason and fails open"
+        format!("{err:#}").contains("no profile directory"),
+        "the shim reports this reason and fails open: {err:#}"
     );
 }
 
@@ -807,8 +807,11 @@ fn run_shim_as(bob: &Account, shared: &SharedDir) -> ShimRun {
     }
 }
 
-/// A listener that records what the first connection to it sends. Raw sockets, so that it can
-/// listen in a directory hardened for another account, which `Listener::bind` refuses.
+const SENTINEL: &[u8] = b"sentinel: not a frame";
+
+/// A listener that records what each connection to it sends, in the order accepted, and keeps
+/// listening until the connection that sends [`SENTINEL`] has been read. Raw sockets, so that it
+/// can listen in a directory hardened for another account, which `Listener::bind` refuses.
 struct Recorder {
     path: PathBuf,
     seen: mpsc::Receiver<Vec<u8>>,
@@ -820,13 +823,20 @@ impl Recorder {
         let socket = socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None).unwrap();
         socket.bind(&socket2::SockAddr::unix(path).unwrap()).unwrap();
         socket.listen(8).unwrap();
-        let (first, seen) = mpsc::channel();
+        let (sent, seen) = mpsc::channel();
         let thread = std::thread::spawn(move || {
             use std::io::Read;
-            let (mut conn, _) = socket.accept().unwrap();
-            let mut buf = [0u8; 256];
-            let n = conn.read(&mut buf).unwrap();
-            first.send(buf[..n].to_vec()).unwrap();
+            loop {
+                let (mut conn, _) = socket.accept().unwrap();
+                let mut buf = [0u8; 256];
+                let n = conn.read(&mut buf).unwrap();
+                let message = buf[..n].to_vec();
+                let ours = message == SENTINEL;
+                sent.send(message).unwrap();
+                if ours {
+                    return;
+                }
+            }
         });
         Recorder {
             path: path.to_owned(),
@@ -835,20 +845,20 @@ impl Recorder {
         }
     }
 
-    /// What the first connection sent, after a connection of our own that sends `sentinel`: the
-    /// connections are accepted in order, so anything that connected before this call comes
-    /// first, and `sentinel` coming back means that nothing did. Removes the socket file.
-    fn first_sender(self, sentinel: &[u8]) -> Vec<u8> {
+    /// What the first connection sent, after a connection of our own that sends [`SENTINEL`]:
+    /// the connections are accepted in order, so anything that connected before this call comes
+    /// first, and [`SENTINEL`] coming back means that nothing did. The listener is open for
+    /// every connection up to ours, so a connection made earlier is not turned away. Removes the
+    /// socket file.
+    fn first_sender(self) -> Vec<u8> {
         let mut ours = afunix::connect(&self.path).unwrap();
-        std::io::Write::write_all(&mut ours, sentinel).unwrap();
+        std::io::Write::write_all(&mut ours, SENTINEL).unwrap();
         let first = self.seen.recv().unwrap();
         self.thread.join().unwrap();
         let _ = std::fs::remove_file(&self.path);
         first
     }
 }
-
-const SENTINEL: &[u8] = b"sentinel: not a frame";
 
 #[test]
 fn shim_as_bob_never_reaches_another_users_listener() {
@@ -893,7 +903,7 @@ fn shim_as_bob_never_reaches_another_users_listener() {
         run.stdout
     );
     assert_eq!(
-        listener.first_sender(SENTINEL),
+        listener.first_sender(),
         SENTINEL,
         "something else connected before the sentinel"
     );
@@ -913,7 +923,7 @@ fn shim_as_bob_reaches_a_listener_in_bobs_own_location() {
 
     let run = run_shim_as(&bob, &shared);
 
-    let first = listener.first_sender(SENTINEL);
+    let first = listener.first_sender();
     assert_ne!(
         first,
         SENTINEL,

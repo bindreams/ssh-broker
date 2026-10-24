@@ -2,21 +2,23 @@
 //!
 //! Windows never updates a process's recorded parent id, and ids are reused, so "the processes
 //! whose parent id is X" can include one that is no descendant of X. A process counts only if it
-//! was created after its parent, and each is held by handle, which keeps its id from being reused
-//! while the tree is in use. A process that cannot be opened is not a member: it is named in
-//! [`Descendants::unopened`] instead, so a process left alive is never silent.
+//! was created after its parent and its own recorded parent, read from the handle just opened
+//! (not from the earlier snapshot), is that parent. Each member is held by handle, which keeps its
+//! id from being reused while the tree is in use. A process that cannot be opened is not a member:
+//! it is named in [`Descendants::unopened`] instead, so a process left alive is never silent.
 #![allow(dead_code)]
 
 use std::collections::BTreeSet;
 
 use ssh_broker::winutil::OwnedHandle;
-use windows::Win32::Foundation::{ERROR_INVALID_PARAMETER, FILETIME, HANDLE};
+use windows::Wdk::System::Threading::{NtQueryInformationProcess, ProcessBasicInformation};
+use windows::Win32::Foundation::{ERROR_INVALID_PARAMETER, FILETIME, HANDLE, WAIT_OBJECT_0};
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
 };
 use windows::Win32::System::Threading::{
-    GetExitCodeProcess, GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
-    TerminateProcess,
+    GetExitCodeProcess, GetProcessTimes, OpenProcess, PROCESS_BASIC_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
+    PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, TerminateProcess, WaitForSingleObject,
 };
 
 /// A descendant, held open.
@@ -27,13 +29,6 @@ pub struct Member {
     pub exe: String,
     created: u64,
     process: OwnedHandle,
-}
-
-impl Member {
-    /// Names this process object for good: an id alone can be reused.
-    fn key(&self) -> (u32, u64) {
-        (self.pid, self.created)
-    }
 }
 
 /// What [`descendants`] found.
@@ -91,24 +86,57 @@ fn creation_time(process: HANDLE) -> windows::core::Result<u64> {
     Ok((u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime))
 }
 
+/// The parent id recorded in `process` itself.
+fn recorded_parent(process: HANDLE) -> windows::core::Result<u32> {
+    let mut info = PROCESS_BASIC_INFORMATION::default();
+    // SAFETY: `info` is a valid out buffer of the size passed; `process` is a live handle with query
+    // access.
+    unsafe {
+        NtQueryInformationProcess(
+            process,
+            ProcessBasicInformation,
+            &mut info as *mut PROCESS_BASIC_INFORMATION as *mut std::ffi::c_void,
+            std::mem::size_of::<PROCESS_BASIC_INFORMATION>() as u32,
+            std::ptr::null_mut(),
+        )
+    }
+    .ok()?;
+    Ok(info.InheritedFromUniqueProcessId as u32)
+}
+
 /// Every process under `root` (process `root_pid`, itself excluded) that is provably a
 /// descendant: its recorded parent is `root_pid` or a descendant, and it was created after that
 /// parent. `root` stays open for the call, so `root_pid` cannot have been reused.
 pub fn descendants(root: HANDLE, root_pid: u32) -> Descendants {
+    walk(root, root_pid, &[])
+}
+
+/// The descendants of `root` that are not in `known`, looking under `known` too. A member of
+/// `known` is held open, so its id cannot have been reused, even after it has exited.
+fn walk(root: HANDLE, root_pid: u32, known: &[Member]) -> Descendants {
     let root_created = creation_time(root).expect("GetProcessTimes of the root process");
     let entries = snapshot();
     let mut members: Vec<Member> = Vec::new();
     let mut unopened = Vec::new();
     // (pid, creation time) of the processes whose children are looked for; the root first.
     let mut parents = vec![(root_pid, root_created)];
+    parents.extend(known.iter().map(|m| (m.pid, m.created)));
     while let Some((parent_pid, parent_created)) = parents.pop() {
         for entry in entries.iter().filter(|e| e.parent == parent_pid && e.pid != 0) {
-            if entry.pid == root_pid || members.iter().any(|m| m.pid == entry.pid) {
+            if entry.pid == root_pid
+                || known.iter().any(|m| m.pid == entry.pid)
+                || members.iter().any(|m| m.pid == entry.pid)
+            {
                 continue;
             }
             // SAFETY: a plain open by id; the handle is closed by `OwnedHandle`.
-            let opened =
-                unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE, false, entry.pid) };
+            let opened = unsafe {
+                OpenProcess(
+                    PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE | PROCESS_SYNCHRONIZE,
+                    false,
+                    entry.pid,
+                )
+            };
             let process = match opened {
                 Ok(handle) => OwnedHandle(handle),
                 // Gone since the snapshot: it cannot be a survivor.
@@ -118,12 +146,15 @@ pub fn descendants(root: HANDLE, root_pid: u32) -> Descendants {
                     continue;
                 }
             };
-            let Ok(created) = creation_time(process.0) else {
-                unopened.push(format!("pid {} {}: no creation time", entry.pid, entry.exe));
+            let (Ok(created), Ok(parent)) = (creation_time(process.0), recorded_parent(process.0)) else {
+                unopened.push(format!("pid {} {}: no creation time or parent", entry.pid, entry.exe));
                 continue;
             };
-            if created < parent_created {
-                continue; // older than the process it names: a reused id, not a child
+            // The id may have been reused since the snapshot: what was opened must itself say that
+            // it is a child of this parent (held open, so no newcomer has the parent's id), and be
+            // younger than it.
+            if parent != parent_pid || created < parent_created {
+                continue;
             }
             parents.push((entry.pid, created));
             members.push(Member {
@@ -138,39 +169,52 @@ pub fn descendants(root: HANDLE, root_pid: u32) -> Descendants {
     Descendants { members, unopened }
 }
 
-/// Terminate `root` and every descendant of it, including any started while this runs. Returns
-/// what could not be ended: a member that could not be opened or terminated, each with the reason.
-/// Does not wait for the processes to be gone.
+/// Terminate `root` and every descendant of it, and wait for each to exit. A pass looks only after
+/// every process ended so far has exited, and looks under all of them, so a child that one of
+/// them started before it exited is found by its recorded parent, as [`descendants`] does; the
+/// last pass finds nothing new. Returns what could not be ended: a member that could not be
+/// opened, terminated or waited for, each with the reason.
 pub fn terminate_tree(root: HANDLE, root_pid: u32) -> BTreeSet<String> {
     let mut problems = BTreeSet::new();
-    // SAFETY: `root` is a live process handle owned by the caller.
-    if let Err(e) = unsafe { TerminateProcess(root, 1) }
-        && !has_exited(root)
-    {
-        problems.insert(format!("root pid {root_pid}: {e}"));
-    }
-    // Each pass ends the members it has not ended before. The root is already ended, so nothing
-    // new starts under it; a pass that finds nothing new is the last.
-    let mut ended = BTreeSet::new();
+    end(root, &format!("root pid {root_pid}"), &mut problems);
+    let mut ended: Vec<Member> = Vec::new();
     loop {
-        let found = descendants(root, root_pid);
+        let found = walk(root, root_pid, &ended);
         problems.extend(found.unopened);
-        let mut fresh = false;
-        for member in &found.members {
-            if !ended.insert(member.key()) {
-                continue;
-            }
-            fresh = true;
-            // SAFETY: the member's handle is open for this loop iteration.
-            if let Err(e) = unsafe { TerminateProcess(member.process.0, 1) }
-                && !has_exited(member.process.0)
-            {
-                problems.insert(format!("pid {} {}: {e}", member.pid, member.exe));
-            }
-        }
-        if !fresh {
+        if found.members.is_empty() {
             return problems;
         }
+        for member in found.members {
+            end(
+                member.process.0,
+                &format!("pid {} {}", member.pid, member.exe),
+                &mut problems,
+            );
+            ended.push(member);
+        }
+    }
+}
+
+/// How long a terminated process may take to be gone. Termination is asynchronous but quick; a
+/// process still there after this is stuck in the kernel, and is reported instead of waited for.
+const EXIT_AFTER_TERMINATE_BOUND_MS: u32 = 30_000;
+
+/// Terminate `process` and wait for it to exit, up to [`EXIT_AFTER_TERMINATE_BOUND_MS`]; a
+/// process that is still there then is added to `problems`.
+fn end(process: HANDLE, name: &str, problems: &mut BTreeSet<String>) {
+    // SAFETY: `process` is a live process handle with terminate access.
+    if let Err(e) = unsafe { TerminateProcess(process, 1) }
+        && !has_exited(process)
+    {
+        problems.insert(format!("{name}: {e}"));
+        return;
+    }
+    // SAFETY: as above; the handle carries SYNCHRONIZE.
+    let rc = unsafe { WaitForSingleObject(process, EXIT_AFTER_TERMINATE_BOUND_MS) }; // sleep-ok: failure bound on a terminated process's exit, an external event; expiry is reported and is not read as state
+    if rc != WAIT_OBJECT_0 {
+        problems.insert(format!(
+            "{name}: still there {EXIT_AFTER_TERMINATE_BOUND_MS} ms after being terminated ({rc:?})"
+        ));
     }
 }
 

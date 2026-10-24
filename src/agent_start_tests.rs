@@ -184,7 +184,10 @@ fn run_script(script: Vec<Result<u32, AcceptError>>) -> (Vec<u32>, anyhow::Error
                 .next()
                 .unwrap_or_else(|| Err(AcceptError::Fatal(anyhow::anyhow!("end of script"))))
         },
-        |conn, _live| handled.push(conn),
+        |conn, _live| {
+            handled.push(conn);
+            Ok(())
+        },
     );
     (handled, end)
 }
@@ -273,6 +276,7 @@ fn a_connection_that_ended_during_the_failed_accept_is_a_reason_to_try_again() {
         |conn, live| {
             handled.push(conn);
             lives.borrow_mut().push(live);
+            Ok(())
         },
     );
     assert_eq!(handled, [1, 2]);
@@ -286,13 +290,15 @@ fn exhaustion_waits_for_a_live_connection_to_end_before_accepting_again() {
 
     let lives = Arc::new(Mutex::new(Vec::new()));
     let released = Arc::new(AtomicBool::new(false));
-    let (failing, on_failing) = mpsc::channel::<()>();
-    // Ends the connection when the accept has failed. The flag is raised before the connection
-    // ends, so it is up whenever the loop accepts again after waiting for the end.
+    let (waiting, on_waiting) = mpsc::channel::<()>();
+    // Ends the connection only once the loop has said that it is blocked waiting for one, so a
+    // loop that accepts again without waiting reaches the third accept first and fails it. The
+    // flag is raised before the connection ends, so it is up whenever the loop accepts again after
+    // waiting for the end.
     let releaser = std::thread::spawn({
         let (lives, released) = (Arc::clone(&lives), Arc::clone(&released));
         move || {
-            on_failing.recv().unwrap();
+            on_waiting.recv().unwrap();
             released.store(true, Ordering::SeqCst);
             lives.lock().unwrap().clear();
         }
@@ -300,15 +306,12 @@ fn exhaustion_waits_for_a_live_connection_to_end_before_accepting_again() {
 
     let mut calls = 0;
     let mut handled = Vec::new();
-    let end = serve_connections(
+    let end = serve_connections_observed(
         || {
             calls += 1;
             match calls {
                 1 => Ok(1),
-                2 => {
-                    failing.send(()).unwrap();
-                    Err(exhausted(10024))
-                }
+                2 => Err(exhausted(10024)),
                 3 => {
                     assert!(
                         released.load(Ordering::SeqCst),
@@ -322,11 +325,98 @@ fn exhaustion_waits_for_a_live_connection_to_end_before_accepting_again() {
         |conn, live| {
             handled.push(conn);
             lives.lock().unwrap().push(live);
+            Ok(())
         },
+        || waiting.send(()).unwrap(),
     );
     releaser.join().unwrap();
     assert_eq!(handled, [1, 2]);
     assert!(format!("{end:#}").ends_with("end of script"), "{end:#}");
+}
+
+// threads -----
+
+#[test]
+fn a_thread_that_cannot_be_started_hands_the_connection_back_uncounted() {
+    let connections = Connections::new();
+    let live = connections.begin();
+    let before = connections.ended();
+    let failed = hand_to_thread(
+        7u32,
+        live,
+        |_work| Err(std::io::Error::other("no thread")),
+        |_| panic!("no thread, no handler"),
+    )
+    .unwrap_err();
+    assert_eq!(failed.to_string(), "no thread");
+    // Neither live nor ended: it never ran, so it frees nothing that waiting could be for.
+    assert_eq!(connections.ended(), before);
+    assert!(!connections.wait_for_an_end(before, || {}));
+}
+
+#[test]
+fn a_thread_that_starts_runs_the_handler_and_ends_the_connection_after_it() {
+    let connections = Connections::new();
+    let since = connections.ended();
+    let (done, handled) = std::sync::mpsc::channel();
+    hand_to_thread(
+        7u32,
+        connections.begin(),
+        |work| std::thread::Builder::new().spawn(work).map(drop),
+        move |conn| done.send(conn).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(handled.recv().unwrap(), 7);
+    assert!(connections.wait_for_an_end(since, || {}));
+}
+
+#[test]
+fn a_connection_whose_thread_cannot_start_is_dropped_and_the_loop_goes_on_if_one_is_live() {
+    let lives = RefCell::new(Vec::new());
+    let mut accepted = 0;
+    let mut handled = Vec::new();
+    let end = serve_connections(
+        || {
+            accepted += 1;
+            match accepted {
+                1..=3 => Ok(accepted),
+                _ => Err(AcceptError::Fatal(anyhow::anyhow!("end of script"))),
+            }
+        },
+        |conn, live| {
+            if conn == 2 {
+                // This one's thread fails; connection 1, live, ends meanwhile.
+                lives.borrow_mut().clear();
+                live.abandon();
+                return Err(std::io::Error::other("no thread"));
+            }
+            handled.push(conn);
+            lives.borrow_mut().push(live);
+            Ok(())
+        },
+    );
+    assert_eq!(handled, [1, 3]);
+    assert!(format!("{end:#}").ends_with("end of script"), "{end:#}");
+}
+
+#[test]
+fn a_thread_that_cannot_start_with_no_connection_live_is_fatal_and_says_why() {
+    let mut accepted = 0;
+    let end = serve_connections(
+        || {
+            accepted += 1;
+            Ok(accepted)
+        },
+        |_conn, live| {
+            // What `hand_to_thread` does: the failed connection is neither live nor ended.
+            live.abandon();
+            Err(std::io::Error::other("no thread"))
+        },
+    );
+    assert_eq!(accepted, 1, "accepted again with nothing that could free a thread");
+    let text = format!("{end:#}");
+    assert!(text.contains("no thread"), "{text}");
+    assert!(text.contains("no connection"), "{text}");
 }
 
 #[test]
@@ -342,7 +432,7 @@ fn a_connection_handler_that_panics_still_counts_as_ended() {
     })
     .join()
     .unwrap_err();
-    assert!(connections.wait_for_an_end(before));
+    assert!(connections.wait_for_an_end(before, || {}));
 }
 
 // home directory -----

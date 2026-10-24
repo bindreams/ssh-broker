@@ -141,16 +141,51 @@ fn run_on(location: &SocketLocation) -> anyhow::Result<()> {
     Err(serve_connections(
         || listener.accept(),
         |conn, live| {
-            std::thread::spawn(move || {
-                // Ends with the thread, after the connection is closed: that is when its
-                // descriptors are free again.
-                let _live = live;
-                if let Err(e) = handle_connection(conn) {
-                    tracing::warn!("connection handler error: {e:?}");
-                }
-            });
+            hand_to_thread(
+                conn,
+                live,
+                |work| std::thread::Builder::new().spawn(work).map(drop),
+                |conn| {
+                    if let Err(e) = handle_connection(conn) {
+                        tracing::warn!("connection handler error: {e:?}");
+                    }
+                },
+            )
         },
     ))
+}
+
+/// Run `handle` on a thread started by `spawn`, which owns `conn` and `live`. The connection ends
+/// after `handle` returns and `conn` is closed: that is when its descriptors are free again.
+///
+/// If the thread cannot be started, `conn` is dropped and `live` is given up without counting an
+/// end: the connection never ran, so it frees nothing for [`serve_connections`] to wait for.
+#[cfg(windows)]
+fn hand_to_thread<C: Send + 'static>(
+    conn: C,
+    live: Live,
+    spawn: impl FnOnce(Box<dyn FnOnce() + Send>) -> std::io::Result<()>,
+    handle: impl FnOnce(C) + Send + 'static,
+) -> std::io::Result<()> {
+    // The thread takes the connection from here, so a failed start leaves it with the caller.
+    let (give, take) = std::sync::mpsc::channel::<(C, Live)>();
+    let work = Box::new(move || {
+        if let Ok((conn, live)) = take.recv() {
+            let _live = live;
+            handle(conn);
+        }
+    });
+    match spawn(work) {
+        Ok(()) => {
+            // A send fails only if the thread has gone without running, which drops the pair.
+            let _ = give.send((conn, live));
+            Ok(())
+        }
+        Err(e) => {
+            live.abandon();
+            Err(e)
+        }
+    }
 }
 
 /// The connections this agent is serving, so that a shortage of descriptors can wait for one to end.
@@ -170,7 +205,7 @@ struct Tally {
 
 /// A live connection. Dropping it, on any exit from the handler including a panic, ends it.
 #[cfg(windows)]
-struct Live(Arc<Connections>);
+struct Live(Option<Arc<Connections>>);
 
 #[cfg(windows)]
 impl Connections {
@@ -187,7 +222,7 @@ impl Connections {
 
     fn begin(self: &Arc<Self>) -> Live {
         self.lock().live += 1;
-        Live(Arc::clone(self))
+        Live(Some(Arc::clone(self)))
     }
 
     /// How many connections have ended so far.
@@ -197,7 +232,12 @@ impl Connections {
 
     /// Return once more than `since` connections have ended (`true`), or at once with `false` if
     /// none is live and none has ended since: then nothing is left that could end.
-    fn wait_for_an_end(&self, since: u64) -> bool {
+    ///
+    /// `blocking` is called once, only if this has to block, and before it does. The lock is held
+    /// then and released by the wait itself, so a connection that `blocking` causes to end does so
+    /// after this is waiting. It must not take the lock (any `Live` dropped in it would).
+    fn wait_for_an_end(&self, since: u64, blocking: impl FnOnce()) -> bool {
+        let mut blocking = Some(blocking);
         let mut tally = self.lock();
         loop {
             if tally.ended > since {
@@ -205,6 +245,9 @@ impl Connections {
             }
             if tally.live == 0 {
                 return false;
+            }
+            if let Some(blocking) = blocking.take() {
+                blocking();
             }
             tally = self
                 .ended
@@ -215,12 +258,25 @@ impl Connections {
 }
 
 #[cfg(windows)]
+impl Live {
+    /// Give this connection up as if it had never begun: it is not live any more, and has not
+    /// ended, so nothing that waits for an end is woken by it.
+    fn abandon(mut self) {
+        if let Some(connections) = self.0.take() {
+            connections.lock().live -= 1;
+        }
+    }
+}
+
+#[cfg(windows)]
 impl Drop for Live {
     fn drop(&mut self) {
-        let mut tally = self.0.lock();
-        tally.live -= 1;
-        tally.ended += 1;
-        self.0.ended.notify_all();
+        if let Some(connections) = self.0.take() {
+            let mut tally = connections.lock();
+            tally.live -= 1;
+            tally.ended += 1;
+            connections.ended.notify_all();
+        }
     }
 }
 
@@ -229,33 +285,54 @@ impl Drop for Live {
 ///
 /// A connection that is lost (reset while queued, or one that cannot be set up) is logged and
 /// dropped: it must not end service for every session of the user. An interrupted `accept` is
-/// called again. A shortage of descriptors or buffers is waited out: the loop blocks until one of
-/// this agent's own connections ends, which is the only thing that can free either, and then tries
-/// again. With no live connection nothing can, and the shortage is fatal.
+/// called again. A shortage of descriptors or buffers, and a `serve` that could not start a thread
+/// for its connection (it returns the error, having given up its `Live`), is waited out: the loop
+/// blocks until one of this agent's own connections ends, which is the only thing that can free
+/// any of those, and then accepts again. With no live connection nothing can, and the shortage is
+/// fatal.
 #[cfg(windows)]
 fn serve_connections<C>(
+    accept: impl FnMut() -> Result<C, AcceptError>,
+    serve: impl FnMut(C, Live) -> std::io::Result<()>,
+) -> anyhow::Error {
+    serve_connections_observed(accept, serve, || {})
+}
+
+/// [`serve_connections`], calling `blocking` each time the loop is about to block waiting for a
+/// connection to end (see [`Connections::wait_for_an_end`] for what that guarantees).
+#[cfg(windows)]
+fn serve_connections_observed<C>(
     mut accept: impl FnMut() -> Result<C, AcceptError>,
-    mut serve: impl FnMut(C, Live),
+    mut serve: impl FnMut(C, Live) -> std::io::Result<()>,
+    mut blocking: impl FnMut(),
 ) -> anyhow::Error {
     let connections = Connections::new();
     loop {
         // Read before the attempt: a connection that ends while it fails is then not missed.
         let ended_before = connections.ended();
-        match accept() {
-            Ok(conn) => serve(conn, connections.begin()),
-            Err(AcceptError::Connection(e)) => tracing::warn!("dropped a connection: {e:#}"),
-            Err(AcceptError::Interrupted(_)) => {}
+        let shortage = match accept() {
+            Ok(conn) => match serve(conn, connections.begin()) {
+                Ok(()) => continue,
+                Err(e) => {
+                    tracing::warn!("dropped a connection: no thread for it ({e}); waiting for a connection to end");
+                    anyhow::Error::new(e).context("could not start a thread for a connection")
+                }
+            },
+            Err(AcceptError::Connection(e)) => {
+                tracing::warn!("dropped a connection: {e:#}");
+                continue;
+            }
+            Err(AcceptError::Interrupted(_)) => continue,
             Err(AcceptError::Exhausted { code, source }) => {
                 tracing::warn!(
                     "accept failed for lack of resources (code {code}); waiting for a connection to end: {source}"
                 );
-                if !connections.wait_for_an_end(ended_before) {
-                    return anyhow::Error::new(source).context(format!(
-                        "accept failed with code {code} and no connection of this agent is live to free a resource"
-                    ));
-                }
+                anyhow::Error::new(source).context(format!("accept failed with code {code}"))
             }
             Err(AcceptError::Fatal(e)) => return e.context("the listener failed"),
+        };
+        if !connections.wait_for_an_end(ended_before, &mut blocking) {
+            return shortage.context("no connection of this agent is live to free a resource");
         }
     }
 }

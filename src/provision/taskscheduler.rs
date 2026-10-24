@@ -15,6 +15,7 @@
 //! caller needs no COM state and must be a plain thread (not one already in another COM mode).
 
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, S_FALSE, S_OK};
@@ -117,7 +118,8 @@ fn set_task_enabled(task: &IRegisteredTask, name: &str, enabled: bool) -> anyhow
 /// agent from the old exe before the caller has replaced it; the caller enables it again with
 /// [`set_enabled`] (registering the task afresh does so too).
 ///
-/// A process that outlives [`procwait::EXIT_BOUND`] fails the stop with [`procwait::StillRunning`].
+/// A process that outlives [`procwait::EXIT_BOUND`] fails the stop with [`procwait::StillRunning`];
+/// so does an instance the service still lists that long after the first `Stop`.
 pub fn stop_instances(task_name: &str, image: &Path) -> anyhow::Result<()> {
     let _com = Com::init()?;
     let service = connect()?;
@@ -125,6 +127,8 @@ pub fn stop_instances(task_name: &str, image: &Path) -> anyhow::Result<()> {
         return Ok(());
     };
     stop_and_wait(
+        task_name,
+        procwait::EXIT_BOUND,
         || set_task_enabled(&task, task_name, false),
         || running_instances(&task, image),
         // SAFETY: `task` is a live interface on this thread; `Stop` takes no pointers. The raw
@@ -143,6 +147,8 @@ pub fn stop_instances(task_name: &str, image: &Path) -> anyhow::Result<()> {
 /// an instance.
 struct Instances<P> {
     count: usize,
+    /// The process id of each instance, 0 for one the engine has not launched.
+    pids: Vec<u32>,
     processes: Vec<P>,
 }
 
@@ -154,23 +160,50 @@ struct Instances<P> {
 /// The look is repeated until the task has no instance. An instance that was queued or starting
 /// when `Stop` ran has no process yet, and the engine can launch it afterwards, so one stop is not
 /// enough. This is a condition re-checked, not an attempt count: each pass is two calls to the
-/// service, which cancels a starting instance when it is stopped, and the only timer is the bound
-/// on a process's exit inside `wait`.
+/// service, which cancels a starting instance when it is stopped. The service is an external party
+/// that might keep listing an instance `Stop` cannot clear (a stale entry), so once `bound` has
+/// passed since the first stop the look that still finds one fails, naming the task and the
+/// instances; the caller's failure path enables the task again. A pass that waits for processes
+/// blocks on their exit, so it does not spin; a pass with only unlaunched instances looks again
+/// at once, bounded by the same failure bound.
 fn stop_and_wait<P>(
+    task_name: &str,
+    bound: Duration,
     disable: impl FnOnce() -> anyhow::Result<()>,
     mut list: impl FnMut() -> anyhow::Result<Instances<P>>,
     mut stop: impl FnMut() -> anyhow::Result<()>,
     mut wait: impl FnMut(Vec<P>) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     disable()?;
+    let mut first_stop = None;
     loop {
         let instances = list()?;
         if instances.count == 0 {
             return Ok(());
         }
+        if first_stop.is_some_and(|first: Instant| first.elapsed() >= bound) {
+            anyhow::bail!(
+                "the task {task_name} still has {} running instance(s) after being stopped for {} s ({});                  run apply again",
+                instances.count,
+                bound.as_secs(),
+                describe_instances(&instances.pids)
+            );
+        }
+        first_stop.get_or_insert_with(Instant::now);
         stop()?;
         wait(instances.processes)?;
     }
+}
+
+fn describe_instances(pids: &[u32]) -> String {
+    let each: Vec<String> = pids
+        .iter()
+        .map(|pid| match pid {
+            0 => "one not launched yet".to_string(),
+            pid => format!("process {pid}"),
+        })
+        .collect();
+    each.join(", ")
 }
 
 /// The running instances of `task`, and the processes among them that run `image`. An instance
@@ -181,12 +214,14 @@ fn running_instances(task: &IRegisteredTask, image: &Path) -> anyhow::Result<Ins
         let instances = task.GetInstances(0).context("list the running instances")?;
         let count = instances.Count().context("count the running instances")?;
         let mut found = Vec::new();
+        let mut pids = Vec::new();
         // The collection is indexed from 1.
         for index in 1..=count {
             let instance = instances
                 .get_Item(&VARIANT::from(index))
                 .with_context(|| format!("read running instance {index}"))?;
             let pid = instance.EnginePID().context("read the process of a running instance")?;
+            pids.push(pid);
             if pid == 0 {
                 continue;
             }
@@ -194,6 +229,7 @@ fn running_instances(task: &IRegisteredTask, image: &Path) -> anyhow::Result<Ins
         }
         Ok(Instances {
             count: usize::try_from(count).unwrap_or(0),
+            pids,
             processes: found,
         })
     }
