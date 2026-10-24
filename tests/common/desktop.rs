@@ -232,12 +232,16 @@ impl PrivateDesktop {
             } else {
                 Ok(())
             };
-            let restored = if (api.set_process_window_station)(original).as_bool() {
-                Ok(())
-            } else {
-                Err(windows::core::Error::from_thread())
-            };
-            if let Err(e) = created.and(restored) {
+            // A process left on the private station would hand it to every later spawn and reader,
+            // so no test in this binary could be trusted: end the binary rather than release the lock.
+            if !(api.set_process_window_station)(original).as_bool() {
+                eprintln!(
+                    "could not put back this process's window station after creating {station_name}: {}",
+                    windows::core::Error::from_thread()
+                );
+                std::process::abort();
+            }
+            if let Err(e) = created {
                 if !desktop.is_invalid() {
                     let _ = (api.close_desktop)(desktop);
                 }
