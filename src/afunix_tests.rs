@@ -280,6 +280,7 @@ fn an_agent_that_takes_over_the_lock_reclaims_the_dead_agents_socket() {
 
 // accept errors -----
 
+#[cfg(windows)]
 fn raw(code: i32) -> std::io::Error {
     std::io::Error::from_raw_os_error(code)
 }

@@ -150,11 +150,14 @@ fn another_case_of_the_same_path_is_the_same_file() {
 #[test]
 fn a_process_that_cannot_be_identified_is_an_error_never_nothing_to_wait_for() {
     let mut child = child_until_stdin_closes();
-    let outcome = open_if_image_by(child.id(), &cmd_exe(), &|path| {
-        if path == cmd_exe() {
-            Ok(FileId::default())
-        } else {
+    // The first identification is of the exe looked for; the second, of the image the process
+    // runs, fails. By order, not by path: the two paths may be spelled alike.
+    let identified_the_exe = std::cell::Cell::new(false);
+    let outcome = open_if_image_by(child.id(), &cmd_exe(), &|_| {
+        if identified_the_exe.replace(true) {
             Err(std::io::Error::from_raw_os_error(5))
+        } else {
+            Ok(FileId::default())
         }
     });
     drop(child.stdin.take());

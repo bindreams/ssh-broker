@@ -191,40 +191,28 @@ fn classify_accept_error(e: std::io::Error) -> AcceptError {
         ErrorKind::Interrupted => return AcceptError::Interrupted(e),
         _ => {}
     }
-    match e.raw_os_error().and_then(accept_code) {
-        Some(AcceptCode::Interrupted) => AcceptError::Interrupted(e),
-        Some(AcceptCode::Exhausted(code)) => AcceptError::Exhausted { code, source: e },
-        Some(AcceptCode::CannotOccur(code)) => AcceptError::Fatal(anyhow::Error::new(e).context(format!(
-            "accept returned code {code}, which a blocking listener with no Winsock 1.1 blocking hook cannot return"
-        ))),
-        None => AcceptError::Fatal(e.into()),
-    }
+    by_winsock_code(e)
 }
 
-/// A Winsock code `std` has no `ErrorKind` for, by what it means for `accept`.
-enum AcceptCode {
-    Interrupted,
-    Exhausted(i32),
-    CannotOccur(i32),
-}
-
+/// The Winsock codes `std` has no `ErrorKind` for, by what they mean for `accept`.
 #[cfg(windows)]
-fn accept_code(code: i32) -> Option<AcceptCode> {
+fn by_winsock_code(e: std::io::Error) -> AcceptError {
     use windows::Win32::Networking::WinSock::{WSAEINPROGRESS, WSAEINTR, WSAEMFILE, WSAENOBUFS, WSAEWOULDBLOCK};
-    if code == WSAEINTR.0 {
-        Some(AcceptCode::Interrupted)
-    } else if code == WSAEMFILE.0 || code == WSAENOBUFS.0 {
-        Some(AcceptCode::Exhausted(code))
-    } else if code == WSAEWOULDBLOCK.0 || code == WSAEINPROGRESS.0 {
-        Some(AcceptCode::CannotOccur(code))
-    } else {
-        None
+    match e.raw_os_error() {
+        Some(code) if code == WSAEINTR.0 => AcceptError::Interrupted(e),
+        Some(code) if code == WSAEMFILE.0 || code == WSAENOBUFS.0 => AcceptError::Exhausted { code, source: e },
+        Some(code) if code == WSAEWOULDBLOCK.0 || code == WSAEINPROGRESS.0 => {
+            AcceptError::Fatal(anyhow::Error::new(e).context(format!(
+                "accept returned code {code}, which a blocking listener with no Winsock 1.1 blocking hook cannot return"
+            )))
+        }
+        _ => AcceptError::Fatal(e.into()),
     }
 }
 
 #[cfg(not(windows))]
-fn accept_code(_: i32) -> Option<AcceptCode> {
-    None
+fn by_winsock_code(e: std::io::Error) -> AcceptError {
+    AcceptError::Fatal(e.into())
 }
 
 /// Refuse a freshly accepted connection that a child could inherit.
