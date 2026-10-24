@@ -50,7 +50,7 @@ fn start_and_find(name: &str, image: &Path) -> Vec<Process> {
     // The instance appears when the service has launched it; there is no event to wait on, so
     // this re-reads the real condition until it holds.
     loop {
-        let found = running_processes(&task, image).unwrap();
+        let found = running_instances(&task, image).unwrap().processes;
         if !found.is_empty() {
             return found;
         }
@@ -111,18 +111,38 @@ fn stop_that_failed_is_an_error_naming_the_task() {
     assert!(format!("{err:#}").contains("the-task"), "{err:#}");
 }
 
-/// The four steps of a stop, recording the order they run in.
-fn run_stop_and_wait(disable: bool, stop: bool, wait: bool, events: &RefCell<Vec<String>>) -> anyhow::Result<()> {
+/// What a listing of the task's instances shows: for each instance, the pid its process has (0 if
+/// the engine has not launched it yet).
+type Listing = Vec<u32>;
+
+/// The steps of a stop over a script of listings (the last one repeats), recording the order they
+/// run in.
+fn run_stop_and_wait(
+    listings: Vec<Listing>,
+    disable: bool,
+    stop: bool,
+    wait: bool,
+    events: &RefCell<Vec<String>>,
+) -> anyhow::Result<()> {
     let log = |e: &str| events.borrow_mut().push(e.to_string());
     let outcome = |ok: bool| if ok { Ok(()) } else { anyhow::bail!("failed") };
+    let mut listings = listings.into_iter().peekable();
     stop_and_wait(
         || {
             log("disable");
             outcome(disable)
         },
         || {
-            log("list");
-            Ok(vec![11u32, 22])
+            let pids = if listings.len() > 1 {
+                listings.next().unwrap()
+            } else {
+                listings.peek().cloned().unwrap_or_default()
+            };
+            log(&format!("list {pids:?}"));
+            Ok(Instances {
+                count: pids.len(),
+                processes: pids.into_iter().filter(|pid| *pid != 0).collect(),
+            })
         },
         || {
             log("stop");
@@ -136,33 +156,74 @@ fn run_stop_and_wait(disable: bool, stop: bool, wait: bool, events: &RefCell<Vec
 }
 
 #[test]
-fn the_task_is_disabled_then_its_processes_listed_then_stopped_and_only_then_waited_for() {
+fn the_task_is_disabled_then_listed_then_stopped_then_waited_for_then_listed_again() {
     // Disabled first, so a logon cannot start an agent from the old exe in between; listed before
-    // the stop, because the instances are gone from the task afterwards; waited for last, so the
-    // caller proceeds only once every process has exited.
+    // the stop, because the instances are gone from the task afterwards; waited for before the
+    // next look, so the caller proceeds only once every process has exited and none is left.
     let events = RefCell::new(Vec::new());
-    run_stop_and_wait(true, true, true, &events).unwrap();
-    assert_eq!(events.into_inner(), ["disable", "list", "stop", "wait [11, 22]"]);
+    run_stop_and_wait(vec![vec![11, 22], vec![]], true, true, true, &events).unwrap();
+    assert_eq!(
+        events.into_inner(),
+        ["disable", "list [11, 22]", "stop", "wait [11, 22]", "list []"]
+    );
+}
+
+#[test]
+fn a_task_with_no_instance_is_not_stopped() {
+    let events = RefCell::new(Vec::new());
+    run_stop_and_wait(vec![vec![]], true, true, true, &events).unwrap();
+    assert_eq!(events.into_inner(), ["disable", "list []"]);
+}
+
+#[test]
+fn an_instance_the_engine_had_not_launched_is_stopped_and_looked_for_again() {
+    // Its pid is 0, so there is no process to wait for yet; the engine can still launch it after
+    // the stop, so the stop is repeated until the task has no instance.
+    let events = RefCell::new(Vec::new());
+    run_stop_and_wait(vec![vec![0], vec![33], vec![]], true, true, true, &events).unwrap();
+    assert_eq!(
+        events.into_inner(),
+        [
+            "disable",
+            "list [0]",
+            "stop",
+            "wait []",
+            "list [33]",
+            "stop",
+            "wait [33]",
+            "list []"
+        ]
+    );
+}
+
+#[test]
+fn the_stop_repeats_for_as_long_as_an_instance_appears_with_no_count_of_passes() {
+    let events = RefCell::new(Vec::new());
+    let mut listings: Vec<Listing> = (0..1000).map(|_| vec![0]).collect();
+    listings.push(vec![]);
+    run_stop_and_wait(listings, true, true, true, &events).unwrap();
+    assert_eq!(events.borrow().iter().filter(|e| *e == "stop").count(), 1000);
 }
 
 #[test]
 fn nothing_is_stopped_when_the_task_cannot_be_disabled() {
     let events = RefCell::new(Vec::new());
-    assert!(run_stop_and_wait(false, true, true, &events).is_err());
+    assert!(run_stop_and_wait(vec![vec![11]], false, true, true, &events).is_err());
     assert_eq!(events.into_inner(), ["disable"]);
 }
 
 #[test]
 fn a_failed_stop_is_not_followed_by_a_wait() {
     let events = RefCell::new(Vec::new());
-    assert!(run_stop_and_wait(true, false, true, &events).is_err());
-    assert_eq!(events.into_inner(), ["disable", "list", "stop"]);
+    assert!(run_stop_and_wait(vec![vec![11]], true, false, true, &events).is_err());
+    assert_eq!(events.into_inner(), ["disable", "list [11]", "stop"]);
 }
 
 #[test]
-fn a_process_that_does_not_exit_fails_the_stop() {
+fn a_process_that_does_not_exit_fails_the_stop_without_another_pass() {
     let events = RefCell::new(Vec::new());
-    assert!(run_stop_and_wait(true, true, false, &events).is_err());
+    assert!(run_stop_and_wait(vec![vec![11], vec![]], true, true, false, &events).is_err());
+    assert_eq!(events.into_inner(), ["disable", "list [11]", "stop", "wait [11]"]);
 }
 
 // Stopping a real task (Elevated, CI only) -----
@@ -200,8 +261,20 @@ fn stop_instances_returns_after_the_instance_process_has_exited_and_leaves_the_t
         "left disabled so a logon cannot start an agent before the caller resumes it"
     );
 
+    // `verify` reads this off the queried XML, so the service has to write it there.
+    let disabled_xml = task_xml(&task.0).unwrap().unwrap();
+    assert!(
+        crate::provision::schtasks::xml_is_disabled(&disabled_xml),
+        "{disabled_xml}"
+    );
+
     set_enabled(&task.0, true).unwrap();
     assert_eq!(state_of(&task.0), TASK_STATE_READY.0, "resumed");
+    let enabled_xml = task_xml(&task.0).unwrap().unwrap();
+    assert!(
+        !crate::provision::schtasks::xml_is_disabled(&enabled_xml),
+        "{enabled_xml}"
+    );
 }
 
 /// Elevated (CI only).

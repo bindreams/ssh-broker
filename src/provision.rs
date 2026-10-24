@@ -96,7 +96,7 @@ mod provision_tests;
 #[cfg(windows)]
 mod imp {
     use super::layout::{self, Layout};
-    use super::{flow, probe, registry, report, schtasks, sessions, taskscheduler, user_rows};
+    use super::{flow, probe, procwait, registry, report, schtasks, sessions, taskscheduler, user_rows};
     use crate::{afunix, shim};
     use anyhow::Context;
     use std::path::Path;
@@ -122,8 +122,10 @@ mod imp {
         //    first, so a planted one is never adopted, and a single-user install is replaced. A
         //    different build over an installed one stops every agent first (they hold the exe
         //    open) and waits for them to exit, with the logon task disabled so that no logon
-        //    starts one from the old exe meanwhile; the task is enabled and the agents start again
-        //    afterwards, even if a later step fails.
+        //    starts one from the old exe meanwhile. Every run ends by enabling the task, which
+        //    also heals one an earlier, killed `apply` left disabled; the agents start again
+        //    afterwards, even if a later step fails, except in a session whose old agent has not
+        //    exited.
         let current = std::env::current_exe().context("current_exe")?;
         let registered_xml = schtasks::registered_xml(taskscheduler::task_xml(schtasks::AGENT_TASK))?;
         let exe = flow::run(
@@ -175,20 +177,25 @@ mod imp {
         }
     }
 
-    /// Undo the stop's disabling of the agent task, so the next logon starts an agent. Registering
-    /// the task afresh enables it too, but a failed `apply` may not have got that far.
-    fn enable_agent_task() {
-        if let Err(e) = taskscheduler::set_enabled(schtasks::AGENT_TASK, true) {
-            eprintln!("apply: could not enable the {} task again: {e:#}", schtasks::AGENT_TASK);
-        }
+    /// Enable the agent task: undo the stop's disabling of it, and heal a task that an earlier
+    /// `apply` left disabled by being killed. Registering the task afresh enables it too, but a
+    /// failed `apply` may not have got that far.
+    fn enable_agent_task() -> anyhow::Result<()> {
+        taskscheduler::set_enabled(schtasks::AGENT_TASK, true).with_context(|| {
+            format!(
+                "could not enable the {} task again; no agent starts at a logon until it is",
+                schtasks::AGENT_TASK
+            )
+        })
     }
 
     /// Step 4 of `apply`: start an agent in each session that already has a user, so nobody has to
     /// log off and on again (the logon trigger covers every later logon), and to bring back the
     /// agents step 1 stopped. An agent that is already running in its session exits at once, so
     /// this is safe to repeat. Best-effort: the install is complete without it, and a failed
-    /// `apply` runs it too.
-    fn start_agents() {
+    /// `apply` runs it too. A session whose old agent survived the stop is left alone: see
+    /// [`flow::plan_start`].
+    fn start_agents(survivors: &[procwait::Survivor]) {
         match sessions::interactive_sessions() {
             Ok(targets) => {
                 for (id, why) in &targets.unknown {
@@ -196,8 +203,15 @@ mod imp {
                         "apply: could not tell whether session {id} has a user, so no agent was started there: {why}"
                     );
                 }
+                let plan = flow::plan_start(&targets.ids, survivors);
+                for (id, pids) in &plan.held {
+                    eprintln!(
+                        "apply: no agent was started in session {id}: its old agent (process {}) is still running; run apply again once it has exited",
+                        pids.iter().map(u32::to_string).collect::<Vec<_>>().join(", ")
+                    );
+                }
                 let mut started = 0usize;
-                for id in &targets.ids {
+                for id in &plan.start {
                     match taskscheduler::run_in_session(schtasks::AGENT_TASK, *id) {
                         Ok(()) => started += 1,
                         Err(e) => eprintln!("apply: could not start the agent in session {id}: {e:#}"),

@@ -8,8 +8,8 @@
 //! before it replaces the exe a running legacy agent holds open; COM does it without parsing text.
 //!
 //! Stopping is more than `Stop`: the call returns before the processes are gone, so it also waits
-//! for them (see [`procwait`]), and it disables the task meanwhile so that no logon starts a fresh
-//! agent from the exe about to be replaced.
+//! for them (see [`procwait`]), looks again for an instance that was still starting, and disables
+//! the task meanwhile so that no logon starts a fresh agent from the exe about to be replaced.
 //!
 //! Each call initialises COM on the calling thread and uninitialises it before returning, so the
 //! caller needs no COM state and must be a plain thread (not one already in another COM mode).
@@ -116,6 +116,8 @@ fn set_task_enabled(task: &IRegisteredTask, name: &str, enabled: bool) -> anyhow
 /// `image` is the exe the task runs. The task is left **disabled**, so that no logon can start an
 /// agent from the old exe before the caller has replaced it; the caller enables it again with
 /// [`set_enabled`] (registering the task afresh does so too).
+///
+/// A process that outlives [`procwait::EXIT_BOUND`] fails the stop with [`procwait::StillRunning`].
 pub fn stop_instances(task_name: &str, image: &Path) -> anyhow::Result<()> {
     let _com = Com::init()?;
     let service = connect()?;
@@ -124,7 +126,7 @@ pub fn stop_instances(task_name: &str, image: &Path) -> anyhow::Result<()> {
     };
     stop_and_wait(
         || set_task_enabled(&task, task_name, false),
-        || running_processes(&task, image),
+        || running_instances(&task, image),
         // SAFETY: `task` is a live interface on this thread; `Stop` takes no pointers. The raw
         // vtable call keeps the HRESULT, which the generated wrapper turns into `Ok` for S_FALSE.
         || {
@@ -136,24 +138,44 @@ pub fn stop_instances(task_name: &str, image: &Path) -> anyhow::Result<()> {
     )
 }
 
-/// The steps of a stop, in the only order that is safe. Disabled first, so the logon trigger cannot
-/// start an agent from the old exe meanwhile; listed before the stop, because the instances are
-/// gone afterwards; waited for last, so the caller goes on only when every process has exited.
-fn stop_and_wait<P>(
-    disable: impl FnOnce() -> anyhow::Result<()>,
-    list: impl FnOnce() -> anyhow::Result<Vec<P>>,
-    stop: impl FnOnce() -> anyhow::Result<()>,
-    wait: impl FnOnce(Vec<P>) -> anyhow::Result<()>,
-) -> anyhow::Result<()> {
-    disable()?;
-    let processes = list()?;
-    stop()?;
-    wait(processes)
+/// The running instances of a task: how many there are, and the processes among them that are
+/// the agent. An instance the engine has not launched yet has no process to show, and is still
+/// an instance.
+struct Instances<P> {
+    count: usize,
+    processes: Vec<P>,
 }
 
-/// The processes of the running instances of `task` that run `image`. An instance whose process is
-/// gone, or is not `image`, has nothing to wait for.
-fn running_processes(task: &IRegisteredTask, image: &Path) -> anyhow::Result<Vec<Process>> {
+/// The steps of a stop, in the only order that is safe. Disabled first, so the logon trigger cannot
+/// start an agent from the old exe meanwhile; listed before each stop, because the instances are
+/// gone afterwards; waited for before the next look, so the caller goes on only when every process
+/// has exited.
+///
+/// The look is repeated until the task has no instance. An instance that was queued or starting
+/// when `Stop` ran has no process yet, and the engine can launch it afterwards, so one stop is not
+/// enough. This is a condition re-checked, not an attempt count: each pass is two calls to the
+/// service, which cancels a starting instance when it is stopped, and the only timer is the bound
+/// on a process's exit inside `wait`.
+fn stop_and_wait<P>(
+    disable: impl FnOnce() -> anyhow::Result<()>,
+    mut list: impl FnMut() -> anyhow::Result<Instances<P>>,
+    mut stop: impl FnMut() -> anyhow::Result<()>,
+    mut wait: impl FnMut(Vec<P>) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    disable()?;
+    loop {
+        let instances = list()?;
+        if instances.count == 0 {
+            return Ok(());
+        }
+        stop()?;
+        wait(instances.processes)?;
+    }
+}
+
+/// The running instances of `task`, and the processes among them that run `image`. An instance
+/// whose process is gone, or is not `image`, has nothing to wait for.
+fn running_instances(task: &IRegisteredTask, image: &Path) -> anyhow::Result<Instances<Process>> {
     // SAFETY: `task` and the interfaces taken from it are live and used on this thread only.
     unsafe {
         let instances = task.GetInstances(0).context("list the running instances")?;
@@ -170,7 +192,10 @@ fn running_processes(task: &IRegisteredTask, image: &Path) -> anyhow::Result<Vec
             }
             found.extend(procwait::open_if_image(pid, image)?);
         }
-        Ok(found)
+        Ok(Instances {
+            count: usize::try_from(count).unwrap_or(0),
+            processes: found,
+        })
     }
 }
 

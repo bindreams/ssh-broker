@@ -225,7 +225,7 @@ fn would_replace_installed_exe(layout: &Layout, current: &Path) -> bool {
 ///
 /// A copy that fails is an error. By now every agent the logon task started has been stopped and
 /// has exited, so a sharing violation means something else holds the exe open (an agent started
-/// by hand). Keeping the old exe under the new tasks would report an install that did not happen.
+/// by hand, or the shim of an open SSH session: the exe is sshd's DefaultShell). Keeping the old exe under the new tasks would report an install that did not happen.
 fn install_self(layout: &Layout, current: &Path) -> anyhow::Result<PathBuf> {
     let canonical = layout.canonical_exe();
     if current != canonical && !files_identical(current, &canonical) {
@@ -249,9 +249,12 @@ fn copy_failure(canonical: &Path, err: &std::io::Error) -> String {
     );
     if in_use {
         format!(
-            "could not replace {}: {err}. It is in use although the agents of the logon task have exited, \
-             probably by an agent started by hand with `ssh-broker agent`; stop that agent and run apply again",
-            canonical.display()
+            "could not replace {}: {err}. It is in use although the agents of the logon task have exited: \
+             either by an agent started by hand with `ssh-broker agent`, or by the shim of an open SSH \
+             session (the exe is sshd's DefaultShell). Find the processes with `tasklist /fi \"imagename eq {}\"`, \
+             end them or close the SSH sessions, and run apply again",
+            canonical.display(),
+            super::EXE_NAME
         )
     } else {
         format!("could not replace {}: {err}", canonical.display())

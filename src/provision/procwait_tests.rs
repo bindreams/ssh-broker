@@ -35,7 +35,7 @@ fn a_running_process_of_the_expected_image_is_opened() {
 fn a_process_of_another_image_is_not_taken_for_the_agent() {
     // A reused PID names some other program; waiting on it would wait on the wrong thing.
     let mut child = child_until_stdin_closes();
-    let other = PathBuf::from(r"C:\Windows\System32\notepad.exe");
+    let other = PathBuf::from(std::env::var_os("SystemRoot").expect("SystemRoot is set")).join(r"System32\find.exe");
     assert!(open_if_image(child.id(), &other).unwrap().is_none());
     drop(child.stdin.take());
     child.wait().unwrap();
@@ -69,4 +69,138 @@ fn the_wait_ends_when_the_process_exits_and_fails_at_the_bound_while_it_runs() {
 #[test]
 fn waiting_for_no_processes_returns_at_once() {
     wait_all_exited(&[], Duration::from_millis(1)).unwrap();
+}
+
+/// A temp directory holding a copy of `cmd.exe`, so that a process can run from a path of its own.
+struct CmdCopy {
+    dir: PathBuf,
+}
+
+impl CmdCopy {
+    fn new(tag: &str) -> CmdCopy {
+        let dir = std::env::temp_dir().join(format!("sb-procwait-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::copy(cmd_exe(), dir.join("cmd.exe")).unwrap();
+        CmdCopy { dir }
+    }
+
+    fn exe(&self) -> PathBuf {
+        self.dir.join("cmd.exe")
+    }
+
+    /// The copy, running until its stdin closes.
+    fn spawn_until_stdin_closes(&self) -> Child {
+        Command::new(self.exe())
+            .args(["/d", "/c", "set /p unused="])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+            .unwrap()
+    }
+}
+
+impl Drop for CmdCopy {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+#[test]
+fn a_process_is_found_by_the_file_it_runs_not_by_the_spelling_of_its_path() {
+    // A junction on the install path names the same file by another path. Comparing path text
+    // would call the process a stranger and the wait would silently do nothing.
+    let copy = CmdCopy::new("junction");
+    let link = copy.dir.with_extension("link");
+    let _ = std::fs::remove_dir(&link);
+    let made = Command::new(cmd_exe())
+        .args(["/d", "/c", "mklink", "/J"])
+        .arg(&link)
+        .arg(&copy.dir)
+        .stdout(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW)
+        .status()
+        .unwrap();
+    assert!(made.success(), "control: the junction was made");
+
+    let mut child = copy.spawn_until_stdin_closes();
+    let through_the_link = link.join("cmd.exe");
+    assert_ne!(through_the_link, copy.exe(), "control: another spelling");
+    let found = open_if_image(child.id(), &through_the_link);
+
+    drop(child.stdin.take());
+    child.wait().unwrap();
+    std::fs::remove_dir(&link).unwrap();
+    assert_eq!(found.unwrap().map(|p| p.pid), Some(child.id()));
+}
+
+#[test]
+fn another_case_of_the_same_path_is_the_same_file() {
+    let copy = CmdCopy::new("case");
+    let mut child = copy.spawn_until_stdin_closes();
+    let upper = PathBuf::from(copy.exe().to_string_lossy().to_uppercase());
+    let found = open_if_image(child.id(), &upper);
+    drop(child.stdin.take());
+    child.wait().unwrap();
+    assert_eq!(found.unwrap().map(|p| p.pid), Some(child.id()));
+}
+
+#[test]
+fn a_process_that_cannot_be_identified_is_an_error_never_nothing_to_wait_for() {
+    let mut child = child_until_stdin_closes();
+    let outcome = open_if_image_by(child.id(), &cmd_exe(), &|path| {
+        if path == cmd_exe() {
+            Ok(FileId::default())
+        } else {
+            Err(std::io::Error::from_raw_os_error(5))
+        }
+    });
+    drop(child.stdin.take());
+    child.wait().unwrap();
+    let text = format!("{:#}", outcome.err().expect("could not tell"));
+    assert!(text.contains(&child.id().to_string()), "names the process: {text}");
+}
+
+#[test]
+fn an_exe_that_does_not_exist_is_held_by_no_process() {
+    // Nothing can be running a file that is not there (the first `apply` of an install).
+    let mut child = child_until_stdin_closes();
+    let absent = std::env::temp_dir().join(format!("sb-procwait-absent-{}.exe", std::process::id()));
+    let found = open_if_image(child.id(), &absent);
+    drop(child.stdin.take());
+    child.wait().unwrap();
+    assert!(found.unwrap().is_none());
+}
+
+#[test]
+fn processes_that_outlive_the_bound_are_all_named_with_their_sessions() {
+    let mut exits = child_until_stdin_closes();
+    let mut stays_a = child_until_stdin_closes();
+    let mut stays_b = child_until_stdin_closes();
+    let processes: Vec<_> = [&exits, &stays_a, &stays_b]
+        .iter()
+        .map(|c| open_if_image(c.id(), &cmd_exe()).unwrap().unwrap())
+        .collect();
+    drop(exits.stdin.take());
+    exits.wait().unwrap();
+
+    let err = wait_all_exited(&processes, Duration::from_millis(50)).unwrap_err();
+    let still = err.downcast_ref::<StillRunning>().expect("a typed error");
+    let mut pids: Vec<u32> = still.survivors.iter().map(|s| s.pid).collect();
+    pids.sort();
+    let mut expected = vec![stays_a.id(), stays_b.id()];
+    expected.sort();
+    assert_eq!(pids, expected, "the one that exited is not named");
+    let session = crate::provision::probe::current_session_id();
+    assert!(still.survivors.iter().all(|s| s.session == Some(session)));
+    let text = format!("{err:#}");
+    assert!(text.contains(&stays_a.id().to_string()), "{text}");
+    assert!(text.contains("run apply again"), "{text}");
+
+    drop(stays_a.stdin.take());
+    drop(stays_b.stdin.take());
+    stays_a.wait().unwrap();
+    stays_b.wait().unwrap();
 }

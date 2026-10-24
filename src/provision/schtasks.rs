@@ -135,6 +135,25 @@ pub fn xml_is_group_logon_task(query_xml: &str) -> bool {
     squeezed.contains(&group) && (squeezed.contains("<logontrigger>") || squeezed.contains("<logontrigger/>"))
 }
 
+/// Whether a queried task XML switches the task off: `<Enabled>false</Enabled>` in its `Settings`.
+/// The logon trigger has an `Enabled` of its own, which is not this one. The service leaves the
+/// setting out when it holds its default, enabled.
+pub fn xml_is_disabled(query_xml: &str) -> bool {
+    let squeezed: String = query_xml
+        .chars()
+        .filter(|c| !c.is_ascii_whitespace())
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
+    let Some(start) = squeezed.find("<settings>") else {
+        return false;
+    };
+    let settings = &squeezed[start..];
+    let settings = settings.find("</settings>").map_or(settings, |end| &settings[..end]);
+    ["false", "0"]
+        .iter()
+        .any(|value| settings.contains(&format!("<enabled>{value}</enabled>")))
+}
+
 /// The `agent task` row of `verify`, from the query of the task's XML: `Ok(None)` if there is no
 /// such task, and the cause if the query could not be answered.
 pub fn agent_task_row(query: &anyhow::Result<Option<String>>) -> Check {
@@ -144,14 +163,19 @@ pub fn agent_task_row(query: &anyhow::Result<Option<String>>) -> Check {
     };
     let registered = xml.is_some();
     let group = xml.is_some_and(xml_is_group_logon_task);
+    let disabled = xml.is_some_and(xml_is_disabled);
     let detail = if registered && !group {
         "registered=true group_logon_task=false: a per-user task from an earlier install; run `apply` elevated to \
          replace it"
             .to_string()
+    } else if disabled {
+        "registered=true group_logon_task=true enabled=false: the task is disabled, so no agent starts at a logon; a \
+         killed `apply` leaves it so. Run `apply` elevated to enable it"
+            .to_string()
     } else {
         format!("registered={registered} group_logon_task={group}")
     };
-    Check::new("agent task", registered && group, detail)
+    Check::new("agent task", registered && group && !disabled, detail)
 }
 
 #[cfg(test)]

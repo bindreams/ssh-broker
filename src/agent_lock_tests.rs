@@ -180,10 +180,8 @@ fn agents_racing_for_one_session_never_both_hold_it() {
             })
         })
         .collect();
-    let holders = racers
-        .into_iter()
-        .map(|r| r.join().unwrap())
-        .filter(Option::is_some)
-        .count();
-    assert_eq!(holders, 1);
+    // Every result is collected before any is counted: a lazy count would drop each winner's slot
+    // as it counted, freeing the byte for a straggler still racing.
+    let results: Vec<_> = racers.into_iter().map(|r| r.join().unwrap()).collect();
+    assert_eq!(results.iter().filter(|r| r.is_some()).count(), 1);
 }

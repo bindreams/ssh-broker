@@ -381,6 +381,21 @@ fn prepare_in_fails_when_the_exe_is_still_in_use_after_the_stop() {
 }
 
 #[test]
+fn an_exe_in_use_is_blamed_on_both_possible_holders_and_the_message_says_how_to_find_them() {
+    // The exe is sshd's DefaultShell, so the shim of any open SSH session holds it as well as a
+    // hand-started agent does; naming only the agent sends the administrator looking for a
+    // process that may not exist.
+    let msg = copy_failure(
+        Path::new(r"C:\x\ssh-broker.exe"),
+        &std::io::Error::from_raw_os_error(32),
+    );
+    assert!(msg.contains("started by hand"), "{msg}");
+    assert!(msg.contains("SSH session"), "{msg}");
+    assert!(msg.contains("tasklist"), "how to find the holders: {msg}");
+    assert!(msg.contains("run apply again"), "{msg}");
+}
+
+#[test]
 fn a_copy_stopped_by_a_sharing_violation_is_called_in_use() {
     for code in [32, 1224] {
         let msg = copy_failure(
@@ -403,6 +418,7 @@ fn a_copy_that_failed_for_another_reason_is_reported_by_its_error_not_as_in_use(
         );
         assert!(!msg.contains("in use"), "{msg}");
         assert!(!msg.contains("started by hand"), "{msg}");
+        assert!(!msg.contains("SSH session"), "{msg}");
         assert!(msg.contains(&format!("os error {code}")), "{msg}");
         assert!(msg.contains("ssh-broker.exe"), "{msg}");
     }

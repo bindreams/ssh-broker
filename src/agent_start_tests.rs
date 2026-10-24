@@ -173,7 +173,8 @@ fn serve_holds_the_session_slot_before_it_takes_the_user_lock_and_both_while_it_
 
 // accept loop -----
 
-/// Run the accept loop over a script of outcomes; it ends with a fatal error when the script does.
+/// Run the accept loop over a script of outcomes, ending every connection as soon as it is handed
+/// over; it ends with a fatal error when the script does.
 fn run_script(script: Vec<Result<u32, AcceptError>>) -> (Vec<u32>, anyhow::Error) {
     let mut script = script.into_iter();
     let mut handled = Vec::new();
@@ -183,16 +184,20 @@ fn run_script(script: Vec<Result<u32, AcceptError>>) -> (Vec<u32>, anyhow::Error
                 .next()
                 .unwrap_or_else(|| Err(AcceptError::Fatal(anyhow::anyhow!("end of script"))))
         },
-        |conn| handled.push(conn),
+        |conn, _live| handled.push(conn),
     );
     (handled, end)
 }
 
-fn transient(code: i32) -> AcceptError {
-    AcceptError::Transient {
-        code: Some(code),
+fn exhausted(code: i32) -> AcceptError {
+    AcceptError::Exhausted {
+        code,
         source: std::io::Error::from_raw_os_error(code),
     }
+}
+
+fn interrupted() -> AcceptError {
+    AcceptError::Interrupted(std::io::Error::from_raw_os_error(10004))
 }
 
 fn lost() -> AcceptError {
@@ -218,37 +223,126 @@ fn a_broken_listener_ends_the_loop_at_once() {
 }
 
 #[test]
-fn a_transient_failure_is_forgiven_once_and_forgotten_by_the_next_connection() {
-    let (handled, end) = run_script(vec![Err(transient(10024)), Ok(1), Err(transient(10024)), Ok(2)]);
+fn an_interruption_is_retried_however_often_it_comes() {
+    // Interrupting a blocking `accept` consumes nothing, so a run of them is not a failing
+    // listener and has no count at which it becomes one.
+    let mut script: Vec<_> = (0..10_000).map(|_| Err(interrupted())).collect();
+    script.push(Ok(1));
+    let (handled, end) = run_script(script);
+    assert_eq!(handled, [1]);
+    assert!(format!("{end:#}").ends_with("end of script"), "{end:#}");
+}
+
+#[test]
+fn exhaustion_with_no_live_connection_is_fatal_and_names_the_code() {
+    // Only one of this agent's own connections ending can free a descriptor or a buffer.
+    let (handled, end) = run_script(vec![Err(exhausted(10024)), Ok(1)]);
+    assert!(handled.is_empty());
+    let text = format!("{end:#}");
+    assert!(text.contains("10024"), "{text}");
+    assert!(text.contains("no connection"), "{text}");
+}
+
+#[test]
+fn a_connection_that_ended_before_the_failure_frees_nothing_new() {
+    let (handled, end) = run_script(vec![Ok(1), Err(exhausted(10055)), Ok(2)]);
+    assert_eq!(handled, [1]);
+    assert!(format!("{end:#}").contains("10055"), "{end:#}");
+}
+
+#[test]
+fn a_connection_that_ended_during_the_failed_accept_is_a_reason_to_try_again() {
+    // The resource may have been freed between the failure and the check: that is a connection
+    // ending since the attempt began, wherever the check falls.
+    let lives = RefCell::new(Vec::new());
+    let mut calls = 0;
+    let mut handled = Vec::new();
+    let end = serve_connections(
+        || {
+            calls += 1;
+            match calls {
+                1 => Ok(1),
+                2 => {
+                    lives.borrow_mut().clear();
+                    Err(exhausted(10024))
+                }
+                3 => Ok(2),
+                _ => Err(AcceptError::Fatal(anyhow::anyhow!("end of script"))),
+            }
+        },
+        |conn, live| {
+            handled.push(conn);
+            lives.borrow_mut().push(live);
+        },
+    );
     assert_eq!(handled, [1, 2]);
     assert!(format!("{end:#}").ends_with("end of script"), "{end:#}");
 }
 
 #[test]
-fn the_same_transient_failure_twice_with_no_connection_between_is_a_broken_listener() {
-    // Nothing clears, so the loop would spin on warnings: the repeat is fatal, by its kind and
-    // not by counting attempts.
-    let (handled, end) = run_script(vec![Err(transient(10024)), Err(transient(10024)), Ok(1)]);
-    assert!(handled.is_empty());
-    let text = format!("{end:#}");
-    assert!(text.contains("10024"), "names the failure: {text}");
-    assert!(text.contains("again"), "{text}");
+fn exhaustion_waits_for_a_live_connection_to_end_before_accepting_again() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex, mpsc};
+
+    let lives = Arc::new(Mutex::new(Vec::new()));
+    let released = Arc::new(AtomicBool::new(false));
+    let (failing, on_failing) = mpsc::channel::<()>();
+    // Ends the connection when the accept has failed. The flag is raised before the connection
+    // ends, so it is up whenever the loop accepts again after waiting for the end.
+    let releaser = std::thread::spawn({
+        let (lives, released) = (Arc::clone(&lives), Arc::clone(&released));
+        move || {
+            on_failing.recv().unwrap();
+            released.store(true, Ordering::SeqCst);
+            lives.lock().unwrap().clear();
+        }
+    });
+
+    let mut calls = 0;
+    let mut handled = Vec::new();
+    let end = serve_connections(
+        || {
+            calls += 1;
+            match calls {
+                1 => Ok(1),
+                2 => {
+                    failing.send(()).unwrap();
+                    Err(exhausted(10024))
+                }
+                3 => {
+                    assert!(
+                        released.load(Ordering::SeqCst),
+                        "accepted again before a connection ended"
+                    );
+                    Ok(2)
+                }
+                _ => Err(AcceptError::Fatal(anyhow::anyhow!("end of script"))),
+            }
+        },
+        |conn, live| {
+            handled.push(conn);
+            lives.lock().unwrap().push(live);
+        },
+    );
+    releaser.join().unwrap();
+    assert_eq!(handled, [1, 2]);
+    assert!(format!("{end:#}").ends_with("end of script"), "{end:#}");
 }
 
 #[test]
-fn alternating_transient_failures_cannot_spin_either() {
-    let (_, end) = run_script(vec![
-        Err(transient(10024)),
-        Err(transient(10055)),
-        Err(transient(10024)),
-    ]);
-    assert!(format!("{end:#}").contains("10024"), "{end:#}");
-}
-
-#[test]
-fn a_lost_connection_between_two_identical_transient_failures_does_not_clear_them() {
-    let (_, end) = run_script(vec![Err(transient(10055)), Err(lost()), Err(transient(10055))]);
-    assert!(format!("{end:#}").contains("10055"), "{end:#}");
+fn a_connection_handler_that_panics_still_counts_as_ended() {
+    // The end is signalled by a guard, so a handler thread that unwinds does not leave the loop
+    // waiting for a connection that is already gone.
+    let connections = Connections::new();
+    let live = connections.begin();
+    let before = connections.ended();
+    std::thread::spawn(move || {
+        let _live = live;
+        panic!("handler failed");
+    })
+    .join()
+    .unwrap_err();
+    assert!(connections.wait_for_an_end(before));
 }
 
 // home directory -----

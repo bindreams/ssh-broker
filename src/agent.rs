@@ -140,8 +140,11 @@ fn run_on(location: &SocketLocation) -> anyhow::Result<()> {
     let listener = Listener::bind(&location.path)?;
     Err(serve_connections(
         || listener.accept(),
-        |conn| {
+        |conn, live| {
             std::thread::spawn(move || {
+                // Ends with the thread, after the connection is closed: that is when its
+                // descriptors are free again.
+                let _live = live;
                 if let Err(e) = handle_connection(conn) {
                     tracing::warn!("connection handler error: {e:?}");
                 }
@@ -150,31 +153,107 @@ fn run_on(location: &SocketLocation) -> anyhow::Result<()> {
     ))
 }
 
-/// Accept connections and hand each to `serve` until the listener breaks; returns that error.
+/// The connections this agent is serving, so that a shortage of descriptors can wait for one to end.
+#[cfg(windows)]
+struct Connections {
+    tally: Mutex<Tally>,
+    ended: Condvar,
+}
+
+#[cfg(windows)]
+struct Tally {
+    live: usize,
+    /// How many connections have ever ended: a counter, so "one ended since I looked" is a
+    /// comparison and not a guess at what changed.
+    ended: u64,
+}
+
+/// A live connection. Dropping it, on any exit from the handler including a panic, ends it.
+#[cfg(windows)]
+struct Live(Arc<Connections>);
+
+#[cfg(windows)]
+impl Connections {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            tally: Mutex::new(Tally { live: 0, ended: 0 }),
+            ended: Condvar::new(),
+        })
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Tally> {
+        self.tally.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn begin(self: &Arc<Self>) -> Live {
+        self.lock().live += 1;
+        Live(Arc::clone(self))
+    }
+
+    /// How many connections have ended so far.
+    fn ended(&self) -> u64 {
+        self.lock().ended
+    }
+
+    /// Return once more than `since` connections have ended (`true`), or at once with `false` if
+    /// none is live and none has ended since: then nothing is left that could end.
+    fn wait_for_an_end(&self, since: u64) -> bool {
+        let mut tally = self.lock();
+        loop {
+            if tally.ended > since {
+                return true;
+            }
+            if tally.live == 0 {
+                return false;
+            }
+            tally = self
+                .ended
+                .wait(tally)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for Live {
+    fn drop(&mut self) {
+        let mut tally = self.0.lock();
+        tally.live -= 1;
+        tally.ended += 1;
+        self.0.ended.notify_all();
+    }
+}
+
+/// Accept connections and hand each to `serve`, with the guard that says when it ends, until the
+/// listener breaks; returns that error.
 ///
 /// A connection that is lost (reset while queued, or one that cannot be set up) is logged and
-/// dropped: it must not end service for every session of the user. A transient failure is
-/// forgiven once; the same one again with no connection accepted since means nothing is clearing
-/// it, and carrying on would only log forever, so it ends the loop. That is a rule about the
-/// kind of failure, not a count of attempts.
+/// dropped: it must not end service for every session of the user. An interrupted `accept` is
+/// called again. A shortage of descriptors or buffers is waited out: the loop blocks until one of
+/// this agent's own connections ends, which is the only thing that can free either, and then tries
+/// again. With no live connection nothing can, and the shortage is fatal.
 #[cfg(windows)]
-fn serve_connections<C>(mut accept: impl FnMut() -> Result<C, AcceptError>, mut serve: impl FnMut(C)) -> anyhow::Error {
-    // The transient failures seen since the last accepted connection.
-    let mut seen: Vec<Option<i32>> = Vec::new();
+fn serve_connections<C>(
+    mut accept: impl FnMut() -> Result<C, AcceptError>,
+    mut serve: impl FnMut(C, Live),
+) -> anyhow::Error {
+    let connections = Connections::new();
     loop {
+        // Read before the attempt: a connection that ends while it fails is then not missed.
+        let ended_before = connections.ended();
         match accept() {
-            Ok(conn) => {
-                seen.clear();
-                serve(conn);
-            }
+            Ok(conn) => serve(conn, connections.begin()),
             Err(AcceptError::Connection(e)) => tracing::warn!("dropped a connection: {e:#}"),
-            Err(AcceptError::Transient { code, source }) => {
-                if seen.contains(&code) {
-                    return anyhow::Error::new(source)
-                        .context("accept failed again with no connection accepted since; the listener is broken");
+            Err(AcceptError::Interrupted(_)) => {}
+            Err(AcceptError::Exhausted { code, source }) => {
+                tracing::warn!(
+                    "accept failed for lack of resources (code {code}); waiting for a connection to end: {source}"
+                );
+                if !connections.wait_for_an_end(ended_before) {
+                    return anyhow::Error::new(source).context(format!(
+                        "accept failed with code {code} and no connection of this agent is live to free a resource"
+                    ));
                 }
-                tracing::warn!("accept failed, trying again: {source}");
-                seen.push(code);
             }
             Err(AcceptError::Fatal(e)) => return e.context("the listener failed"),
         }

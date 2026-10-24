@@ -182,6 +182,45 @@ fn agent_task_row_gives_the_cause_when_the_query_failed() {
     );
 }
 
+/// The agent task as the service stores it after the task is disabled: the setting is in
+/// `Settings`, apart from the logon trigger's own `Enabled`.
+fn disabled_agent_task_xml() -> String {
+    let xml = agent_task_xml(r"C:\x.exe");
+    let settings = xml.find("<Settings>").unwrap();
+    let (head, tail) = xml.split_at(settings);
+    format!(
+        "{head}{}",
+        tail.replacen("<Enabled>true</Enabled>", "<Enabled>false</Enabled>", 1)
+    )
+}
+
+#[test]
+fn agent_task_row_fails_for_a_disabled_task_and_says_to_run_apply() {
+    // A killed `apply` leaves the task disabled; nothing then starts at any logon.
+    let xml = disabled_agent_task_xml();
+    assert!(xml_is_group_logon_task(&xml), "control: otherwise the group task");
+    let row = agent_task_row(&Ok(Some(xml)));
+    assert!(!row.pass, "{}", row.detail);
+    assert!(row.detail.contains("disabled"), "{}", row.detail);
+    assert!(row.detail.contains("apply"), "{}", row.detail);
+}
+
+#[test]
+fn a_task_with_no_enabled_setting_is_enabled() {
+    // The service leaves the element out when it holds its default, true.
+    let xml = agent_task_xml(r"C:\x.exe").replace("    <Enabled>true</Enabled>\n  </Settings>", "  </Settings>");
+    let settings = &xml[xml.find("<Settings>").unwrap()..];
+    assert!(!settings.contains("<Enabled>"), "control: no setting");
+    assert!(agent_task_row(&Ok(Some(xml))).pass);
+}
+
+#[test]
+fn a_disabled_logon_trigger_alone_is_not_a_disabled_task() {
+    // The trigger's own `Enabled` is not the task's; only `Settings` says the task is off.
+    let xml = agent_task_xml(r"C:\x.exe").replacen("<Enabled>true</Enabled>", "<Enabled>false</Enabled>", 1);
+    assert!(agent_task_row(&Ok(Some(xml))).pass);
+}
+
 // Task Scheduler itself (Elevated, CI only) ---------------------------------------------
 
 #[cfg(windows)]
