@@ -1,17 +1,28 @@
 //! provision::schtasks — Task Scheduler XML + argv builders and query parsers (pure).
 //!
-//! The agent task is registered from XML (not the bare CLI) specifically to set
-//! `<LogonType>InteractiveToken</LogonType>`: that, NOT the trigger, is what makes the agent
-//! run in the interactive console session (session 1) instead of session 0. A bare
-//! `/SC ONLOGON /RU <user>` (no interactive token), `/RU SYSTEM`, or an S4U principal all land
-//! in session 0 — silently reproducing the limited environment this project exists to escape.
-//! `RunLevel=LeastPrivilege` (not Highest) keeps the plain auto-login token: elevation would
-//! re-arm RedirectionGuard (breaking symlink-traversal parity) and not match the dir ACL.
+//! The agent task is registered from XML because the bare CLI cannot express its principal. It
+//! runs for **any member of `BUILTIN\Users`** (`<GroupId>`), with a logon trigger that names no
+//! user: the service starts one instance per interactive logon, in that user's session, as that
+//! user, and registering it needs no password. A group principal is itself the interactive-session
+//! form, so it carries no `<LogonType>`; this is the shape of the `Wininet\CacheTask` and
+//! `MsCtfMonitor` tasks Windows ships. A bare `/SC ONLOGON /RU <user>`, `/RU SYSTEM`, or an S4U
+//! principal would land in session 0 — silently reproducing the limited environment this project
+//! exists to escape. `MultipleInstancesPolicy` is `Parallel`: `IgnoreNew` is documented without a
+//! per-user qualifier, so it could drop the second user's agent while the first is running.
+//! `RunLevel=LeastPrivilege` (not Highest) keeps the plain token: elevation would re-arm
+//! RedirectionGuard (breaking symlink-traversal parity) and not match the folder ACL.
+
+use anyhow::Context;
+
+use super::report::Check;
 
 pub const AGENT_TASK: &str = "ssh-broker-agent";
 pub const SELFHEAL_TASK: &str = "ssh-broker-apply";
 
-/// Minimal XML escaping for the few characters that can appear in a path/account name.
+/// `BUILTIN\Users`: every account that can log on interactively, administrators included.
+pub const USERS_GROUP_SID: &str = "S-1-5-32-545";
+
+/// Minimal XML escaping for the few characters that can appear in a path.
 fn xml_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -20,23 +31,21 @@ fn xml_escape(s: &str) -> String {
         .replace('\'', "&apos;")
 }
 
-/// The agent logon task definition: runs `<exe> agent` in session 1 via InteractiveToken,
-/// triggered on the target user's logon, started immediately by `apply` via `/Run`.
-pub fn agent_task_xml(exe: &str, user: &str) -> String {
+/// The agent logon task definition: runs `<exe> agent` in the interactive session of whichever
+/// user logs on. Names no account; `apply` registers it without a password.
+pub fn agent_task_xml(exe: &str) -> String {
     let exe = xml_escape(exe);
-    let user = xml_escape(user);
     format!(
         r#"<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
-  <RegistrationInfo><Description>ssh-broker session-1 relay agent</Description></RegistrationInfo>
-  <Triggers><LogonTrigger><Enabled>true</Enabled><UserId>{user}</UserId></LogonTrigger></Triggers>
-  <Principals><Principal id="Author">
-    <UserId>{user}</UserId>
-    <LogonType>InteractiveToken</LogonType>
+  <RegistrationInfo><Description>ssh-broker relay agent, one per logged-on user</Description></RegistrationInfo>
+  <Triggers><LogonTrigger><Enabled>true</Enabled></LogonTrigger></Triggers>
+  <Principals><Principal id="Users">
+    <GroupId>{USERS_GROUP_SID}</GroupId>
     <RunLevel>LeastPrivilege</RunLevel>
   </Principal></Principals>
   <Settings>
-    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <MultipleInstancesPolicy>Parallel</MultipleInstancesPolicy>
     <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
     <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
     <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
@@ -48,7 +57,7 @@ pub fn agent_task_xml(exe: &str, user: &str) -> String {
     <RestartOnFailure><Interval>PT1M</Interval><Count>3</Count></RestartOnFailure>
     <Enabled>true</Enabled>
   </Settings>
-  <Actions Context="Author"><Exec>
+  <Actions Context="Users"><Exec>
     <Command>{exe}</Command>
     <Arguments>agent</Arguments>
   </Exec></Actions>
@@ -80,19 +89,17 @@ pub fn create_from_xml_argv(name: &str, xml_path: &str) -> Vec<String> {
     ]
 }
 
-/// The ONSTART self-heal task argv: re-runs `apply` as SYSTEM on boot. `--user` is baked in so
-/// the SYSTEM run resolves the SAME ACL grantee (never its own SYSTEM token). It runs `apply`,
-/// never `agent` (an agent here would bind in session 0).
-pub fn selfheal_task_argv(exe: &str, user: &str) -> Vec<String> {
+/// The ONSTART self-heal task argv: re-runs `apply` as SYSTEM on boot. `apply` knows no user, so
+/// nothing is baked in. It runs `apply`, never `agent` (an agent here would bind in session 0).
+pub fn selfheal_task_argv(exe: &str) -> Vec<String> {
     vec![
         "/Create".into(),
         "/TN".into(),
         SELFHEAL_TASK.into(),
         "/TR".into(),
-        // Quote BOTH the exe and the user: a space-containing account (valid on Windows) would
-        // otherwise truncate when CommandLineToArgvW re-parses this on the SYSTEM boot run,
-        // hardening the socket dir for the wrong account and bricking the agent's bind gate.
-        format!("\"{exe}\" apply --user \"{user}\""),
+        // Quote the exe: a path with a space would otherwise truncate when CommandLineToArgvW
+        // re-parses this on the SYSTEM boot run.
+        format!("\"{exe}\" apply"),
         "/SC".into(),
         "ONSTART".into(),
         "/RU".into(),
@@ -103,26 +110,72 @@ pub fn selfheal_task_argv(exe: &str, user: &str) -> Vec<String> {
     ]
 }
 
-/// `schtasks /Run /TN <name>` — start the (InteractiveToken) agent task now, so the user need
-/// not re-login. `/Run` honours the task's principal, landing the agent in session 1.
-pub fn run_task_argv(name: &str) -> Vec<String> {
-    vec!["/Run".into(), "/TN".into(), name.into()]
-}
-
 /// `schtasks /Query /TN <name> /XML` — dump a task's definition (for the verify checks).
 pub fn query_task_argv(name: &str) -> Vec<String> {
     vec!["/Query".into(), "/TN".into(), name.into(), "/XML".into()]
 }
 
-/// A task is registered iff the query succeeded and returned a task definition.
-pub fn parse_query_registered(stdout: &str, exit_ok: bool) -> bool {
-    exit_ok && stdout.contains("<Task")
+/// What `apply` takes from the query of the agent task: its XML, or `None` if there is no such
+/// task. A query that could not be answered (access denied, the service down) is an error: taking
+/// it for "not registered" would skip the migration and the restart after a failed apply.
+pub fn registered_xml(query: anyhow::Result<Option<String>>) -> anyhow::Result<Option<String>> {
+    query.with_context(|| format!("could not tell whether the {AGENT_TASK} task is registered"))
 }
 
-/// Whether a queried task XML declares the InteractiveToken logon type (i.e. it will run in
-/// the interactive session). Case-insensitive and whitespace-tolerant.
-pub fn xml_has_interactive_token(query_xml: &str) -> bool {
-    query_xml.to_ascii_lowercase().contains("interactivetoken")
+/// Whether a queried task XML is the group logon task [`agent_task_xml`] makes: a principal in
+/// [`USERS_GROUP_SID`] and a logon trigger. Case- and whitespace-insensitive, since the service
+/// re-serialises what it is given. The older per-user task has no `GroupId`.
+pub fn xml_is_group_logon_task(query_xml: &str) -> bool {
+    let squeezed: String = query_xml
+        .chars()
+        .filter(|c| !c.is_ascii_whitespace())
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
+    let group = format!("<groupid>{}</groupid>", USERS_GROUP_SID.to_ascii_lowercase());
+    squeezed.contains(&group) && (squeezed.contains("<logontrigger>") || squeezed.contains("<logontrigger/>"))
+}
+
+/// Whether a queried task XML switches the task off: `<Enabled>false</Enabled>` in its `Settings`.
+/// The logon trigger has an `Enabled` of its own, which is not this one. The service leaves the
+/// setting out when it holds its default, enabled.
+pub fn xml_is_disabled(query_xml: &str) -> bool {
+    let squeezed: String = query_xml
+        .chars()
+        .filter(|c| !c.is_ascii_whitespace())
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
+    let Some(start) = squeezed.find("<settings>") else {
+        return false;
+    };
+    let settings = &squeezed[start..];
+    let settings = settings.find("</settings>").map_or(settings, |end| &settings[..end]);
+    ["false", "0"]
+        .iter()
+        .any(|value| settings.contains(&format!("<enabled>{value}</enabled>")))
+}
+
+/// The `agent task` row of `verify`, from the query of the task's XML: `Ok(None)` if there is no
+/// such task, and the cause if the query could not be answered.
+pub fn agent_task_row(query: &anyhow::Result<Option<String>>) -> Check {
+    let xml = match query {
+        Ok(xml) => xml.as_deref(),
+        Err(e) => return Check::new("agent task", false, format!("could not query the task: {e:#}")),
+    };
+    let registered = xml.is_some();
+    let group = xml.is_some_and(xml_is_group_logon_task);
+    let disabled = xml.is_some_and(xml_is_disabled);
+    let detail = if registered && !group {
+        "registered=true group_logon_task=false: a per-user task from an earlier install; run `apply` elevated to \
+         replace it"
+            .to_string()
+    } else if disabled {
+        "registered=true group_logon_task=true enabled=false: the task is disabled, so no agent starts at a logon; a \
+         killed `apply` leaves it so. Run `apply` elevated to enable it"
+            .to_string()
+    } else {
+        format!("registered={registered} group_logon_task={group}")
+    };
+    Check::new("agent task", registered && group && !disabled, detail)
 }
 
 #[cfg(test)]

@@ -14,27 +14,47 @@ known verb in first position selects a subcommand, anything else is the shim.
 | Verb | Module | Runs where |
 |---|---|---|
 | *(none)* or `-c "cmd"` | `shim`, `shim_pty` | the SSH session, as sshd's `DefaultShell` |
-| `agent` | `agent` | the interactive session, started by a logon task |
+| `agent` | `agent` | a user's interactive session, one per logged-on user, started by a logon task for any member of `BUILTIN\Users` |
 | `apply` | `provision` | wherever an admin runs it; needs elevation |
 | `verify` | `provision` | on the host itself, unelevated by design |
 | `verify-probe` | `provision` | the child the **agent** spawns in its interactive session, driven through the relay by `verify` |
 
 Supporting modules: `protocol` (frame codec and handshake), `relay` (transport-agnostic
-pumping), `afunix` + `acl` (the socket and its security boundary), `conpty` (the pseudoconsole
+pumping), `afunix` + `acl` (the socket and its security boundary), `socket_loc` + `userdir` (where a
+user's socket lives, derived from the profile of the token), `agent_lock` (one agent per session, one
+serving agent per user), `filelog` (the per-user log folder), `conpty` (the pseudoconsole
 host), `pipes` (the redirected-pipe EXEC child), `vtinput` (Win32 input records → VT),
 `winutil` (Windows RAII guards, job containment, cosca→Win32 error conversion).
 
 The functionality lives in the library rather than the binary so it is reachable from tests on
 every host platform; `main.rs` is a thin dispatcher.
 
-### The security boundary is the socket directory
+### The security boundary is the socket file and its folder
 
-The agent runs as a specific user and the shim runs as the authenticated SSH user. What keeps
-one user out of another's session is the socket directory's ACL, not anything in this code.
-`acl::verify_dir_acl` is therefore **exact-match and fail-closed**: it rejects an absent DACL,
-a non-protected one, inherited ACEs, DENY entries, non-FullControl grants, extra grantees, and
-an owner outside the allowed set. If it cannot prove the directory is safe, the agent refuses
-to bind.
+There is one agent per user, and its socket is `<profile>\AppData\Local\ssh-broker\agent.sock`.
+The shim runs as the authenticated SSH user and derives that path from its own token's profile
+(`userdir`), never from the environment or an argument, so it cannot be pointed at another
+account's agent. What keeps one user out of another's session is then two ACLs, not anything in
+this code:
+
+- The socket **file's** DACL decides who can `connect()`. Folder ACLs above it do not: every
+  ordinary user holds `SeChangeNotifyPrivilege`, which skips traverse checks, so a second user who
+  knows the path reaches the file itself.
+- The socket **folder's** DACL decides who can create, replace or delete the socket.
+
+Both must grant Full Control to exactly the user, SYSTEM and Administrators. The folder's ACEs are
+inheritable so the socket, `agent.lock`, `sessions.lock` and `logs` are born with that set instead of the creating
+token's default DACL; `tests/user_isolation_windows.rs` pins this with a creator whose default DACL
+is world-accessible. `acl::verify_dir_acl` and `acl::verify_file_acl` are **exact-match and
+fail-closed**: they reject an absent DACL, a non-protected folder DACL, DENY entries,
+non-FullControl grants, extra grantees, and an owner outside the allowed set. `Listener::bind`
+verifies the folder, binds, verifies the socket file, and only then listens; it removes a socket it
+cannot prove. If it cannot prove the folder is safe, the agent refuses to bind.
+
+`userdir::ensure_socket_dir` repairs the folder's ACL only for a real directory (not a junction or
+symlink) owned by the user, SYSTEM or Administrators, and refuses anything else untouched. A profile
+path that would push the socket past the 107-byte AF_UNIX limit is an error, not a reason to use
+another location (`socket_loc::SocketLocationError::TooLong`).
 
 The install directory is the other half of the boundary: the agent and the SYSTEM self-heal task run the exe in it, so a directory a standard user can write to is a privilege escalation. `apply` verifies it exactly and reads and writes nothing in it until that passes.
 

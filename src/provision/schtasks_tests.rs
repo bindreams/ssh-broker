@@ -1,29 +1,62 @@
-//! Host tests for the pure schtasks builders/parsers. The InteractiveToken assertion is the
-//! build-time guard against the silent-session-0 footgun.
+//! Host tests for the pure schtasks builders/parsers, plus two elevated registration tests that
+//! run in CI only. The group-principal assertions are the build-time guard against the two
+//! ways this task can silently stop working: naming one user again, or landing in session 0.
 use super::*;
 
+/// The agent task as an older build registered it: one account, InteractiveToken.
+fn legacy_task_xml(user: &str) -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <Triggers><LogonTrigger><Enabled>true</Enabled><UserId>{user}</UserId></LogonTrigger></Triggers>
+  <Principals><Principal id="Author">
+    <UserId>{user}</UserId>
+    <LogonType>InteractiveToken</LogonType>
+    <RunLevel>LeastPrivilege</RunLevel>
+  </Principal></Principals>
+  <Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy></Settings>
+  <Actions Context="Author"><Exec><Command>C:\x.exe</Command><Arguments>agent</Arguments></Exec></Actions>
+</Task>
+"#
+    )
+}
+
 #[test]
-fn agent_xml_sets_interactive_token_and_least_privilege() {
-    let xml = agent_task_xml(r"C:\ProgramData\ssh-broker\ssh-broker.exe", "Test.User");
+fn agent_xml_runs_for_any_member_of_users() {
+    let xml = agent_task_xml(r"C:\ProgramData\ssh-broker\ssh-broker.exe");
+    assert!(xml.contains("<GroupId>S-1-5-32-545</GroupId>"), "BUILTIN\\Users");
+    assert!(xml.contains("<LogonTrigger>"));
     assert!(
-        xml.contains("<LogonType>InteractiveToken</LogonType>"),
-        "must be InteractiveToken"
+        xml.contains("<MultipleInstancesPolicy>Parallel</MultipleInstancesPolicy>"),
+        "IgnoreNew could drop the second user's agent"
     );
     assert!(
         xml.contains("<RunLevel>LeastPrivilege</RunLevel>"),
-        "must be LeastPrivilege"
+        "elevation would re-arm RedirectionGuard"
     );
     assert!(xml.contains(r"C:\ProgramData\ssh-broker\ssh-broker.exe"));
     assert!(xml.contains("<Arguments>agent</Arguments>"));
-    assert!(xml.contains("<UserId>Test.User</UserId>"));
-    assert!(xml_has_interactive_token(&xml));
     // schtasks /XML rejects UTF-8; the declaration must match the UTF-16 file we write.
     assert!(xml.contains(r#"encoding="UTF-16""#));
 }
 
 #[test]
+fn agent_xml_names_no_user_and_no_logon_type() {
+    let xml = agent_task_xml(r"C:\x.exe");
+    assert!(
+        !xml.contains("UserId"),
+        "a user in the task is the bug this unit removes"
+    );
+    assert!(
+        !xml.contains("LogonType"),
+        "a group principal is itself the interactive-session form; a LogonType here is untested \
+         against the service"
+    );
+}
+
+#[test]
 fn xml_file_bytes_is_utf16le_with_bom() {
-    let xml = agent_task_xml("C:\\x.exe", "u");
+    let xml = agent_task_xml("C:\\x.exe");
     let bytes = xml_file_bytes(&xml);
     assert_eq!(&bytes[..2], &[0xFF, 0xFE], "must start with a UTF-16LE BOM");
     // The body after the BOM decodes back to the original XML.
@@ -35,40 +68,36 @@ fn xml_file_bytes_is_utf16le_with_bom() {
 
 #[test]
 fn agent_xml_escapes_special_chars() {
-    let xml = agent_task_xml(r"C:\a&b\x.exe", "DOM\\u<r");
+    let xml = agent_task_xml(r"C:\a&b\x<y>.exe");
     assert!(xml.contains("a&amp;b"));
-    assert!(xml.contains("u&lt;r"));
+    assert!(xml.contains("x&lt;y&gt;"));
     assert!(!xml.contains("a&b\\x")); // raw '&' must not survive
 }
 
 #[test]
-fn selfheal_argv_is_system_onstart_and_bakes_user() {
-    let argv = selfheal_task_argv(r"C:\x\ssh-broker.exe", "Test.User");
+fn agent_xml_keeps_a_path_with_spaces_whole() {
+    let xml = agent_task_xml(r"C:\Program Data\ssh-broker\ssh-broker.exe");
+    assert!(xml.contains(r"<Command>C:\Program Data\ssh-broker\ssh-broker.exe</Command>"));
+}
+
+#[test]
+fn selfheal_argv_is_system_onstart_and_takes_no_user() {
+    let argv = selfheal_task_argv(r"C:\x\ssh-broker.exe");
     assert!(argv.contains(&"ONSTART".to_string()));
     assert!(argv.contains(&"SYSTEM".to_string()));
     assert!(argv.contains(&"HIGHEST".to_string()));
-    // /TR quotes BOTH the exe and the user, carries `apply --user <name>`, never `agent`.
+    // /TR quotes the exe and carries `apply` alone; never `agent`, never a user.
     let tr = argv.iter().position(|a| a == "/TR").map(|i| &argv[i + 1]).unwrap();
-    assert_eq!(tr, "\"C:\\x\\ssh-broker.exe\" apply --user \"Test.User\"");
-    assert!(!tr.contains(" agent"));
+    assert_eq!(tr, "\"C:\\x\\ssh-broker.exe\" apply");
+    assert!(!tr.contains(" agent") && !tr.contains("--user"));
 }
 
 #[test]
-fn selfheal_tr_quotes_a_spaced_account_so_it_survives_reparse() {
-    // A space-containing account must stay ONE token through CommandLineToArgvW on the SYSTEM
-    // boot run; the quotes are what guarantee that (an unquoted name would truncate).
-    let argv = selfheal_task_argv(r"C:\x\ssh-broker.exe", "Test User");
-    let tr = argv.iter().position(|a| a == "/TR").map(|i| &argv[i + 1]).unwrap();
-    assert!(tr.ends_with("apply --user \"Test User\""), "user not quoted: {tr}");
-}
-
-#[test]
-fn create_run_query_argv_shapes() {
+fn create_and_query_argv_shapes() {
     assert_eq!(
         create_from_xml_argv(AGENT_TASK, r"C:\t\task.xml"),
         vec!["/Create", "/TN", "ssh-broker-agent", "/XML", r"C:\t\task.xml", "/F"]
     );
-    assert_eq!(run_task_argv(AGENT_TASK), vec!["/Run", "/TN", "ssh-broker-agent"]);
     assert_eq!(
         query_task_argv(AGENT_TASK),
         vec!["/Query", "/TN", "ssh-broker-agent", "/XML"]
@@ -76,14 +105,160 @@ fn create_run_query_argv_shapes() {
 }
 
 #[test]
-fn query_parsing_registered_and_token() {
-    let xml = agent_task_xml("C:\\x.exe", "u");
-    assert!(parse_query_registered(&xml, true)); // exists + XML returned
-    assert!(!parse_query_registered(&xml, false)); // nonzero exit = not registered
-    assert!(!parse_query_registered("ERROR: task not found", true)); // no <Task
-    // A task that is NOT InteractiveToken must be detected as such.
-    assert!(!xml_has_interactive_token(
-        "<Principal><LogonType>S4U</LogonType></Principal>"
-    ));
-    assert!(xml_has_interactive_token(&xml));
+fn apply_takes_the_queried_xml_and_treats_an_absent_task_as_none() {
+    let xml = agent_task_xml(r"C:\x.exe");
+    assert_eq!(registered_xml(Ok(Some(xml.clone()))).unwrap(), Some(xml));
+    assert_eq!(registered_xml(Ok(None)).unwrap(), None);
+}
+
+#[test]
+fn apply_refuses_to_guess_when_the_query_was_inconclusive() {
+    // "Could not ask" is not "not registered": taking it for absent skips the migration and the
+    // restart after a failed apply.
+    let err = registered_xml(Err(anyhow::anyhow!("access is denied"))).unwrap_err();
+    let text = format!("{err:#}");
+    assert!(text.contains("access is denied"), "{text}");
+    assert!(text.contains(AGENT_TASK), "{text}");
+}
+
+#[test]
+fn xml_is_group_logon_task_accepts_the_new_xml_and_rejects_the_legacy_one() {
+    assert!(xml_is_group_logon_task(&agent_task_xml(r"C:\x.exe")));
+    assert!(
+        !xml_is_group_logon_task(&legacy_task_xml("DOMAIN\\someone")),
+        "a per-user InteractiveToken task is the legacy form"
+    );
+    assert!(!xml_is_group_logon_task(""), "no task");
+}
+
+#[test]
+fn xml_is_group_logon_task_rejects_another_group_and_a_missing_trigger() {
+    let other_group = agent_task_xml(r"C:\x.exe").replace("S-1-5-32-545", "S-1-5-32-544");
+    assert!(!xml_is_group_logon_task(&other_group), "Administrators is not Users");
+    let no_trigger = agent_task_xml(r"C:\x.exe").replace("LogonTrigger", "BootTrigger");
+    assert!(!xml_is_group_logon_task(&no_trigger));
+}
+
+#[test]
+fn xml_is_group_logon_task_tolerates_case_and_whitespace_in_the_queried_form() {
+    let queried = agent_task_xml(r"C:\x.exe")
+        .replace(
+            "<GroupId>S-1-5-32-545</GroupId>",
+            "<GroupId>\n  s-1-5-32-545 \n</GroupId>",
+        )
+        .replace("<LogonTrigger>", "<LogonTrigger >");
+    assert!(xml_is_group_logon_task(&queried));
+}
+
+#[test]
+fn agent_task_row_passes_for_the_group_task() {
+    let row = agent_task_row(&Ok(Some(agent_task_xml(r"C:\x.exe"))));
+    assert!(row.pass, "{}", row.detail);
+}
+
+#[test]
+fn agent_task_row_fails_for_a_legacy_per_user_task() {
+    let row = agent_task_row(&Ok(Some(legacy_task_xml("DOMAIN\\someone"))));
+    assert!(!row.pass);
+    assert!(row.detail.contains("apply"), "it says what to do: {}", row.detail);
+}
+
+#[test]
+fn agent_task_row_fails_when_the_task_is_not_registered() {
+    let row = agent_task_row(&Ok(None));
+    assert!(!row.pass);
+    assert!(row.detail.contains("registered=false"), "{}", row.detail);
+}
+
+#[test]
+fn agent_task_row_gives_the_cause_when_the_query_failed() {
+    let row = agent_task_row(&Err(anyhow::anyhow!("access is denied")));
+    assert!(!row.pass);
+    assert!(row.detail.contains("access is denied"), "{}", row.detail);
+    assert!(
+        !row.detail.contains("registered=false"),
+        "a failed query is not an absent task: {}",
+        row.detail
+    );
+}
+
+/// The agent task as the service stores it after the task is disabled: the setting is in
+/// `Settings`, apart from the logon trigger's own `Enabled`.
+fn disabled_agent_task_xml() -> String {
+    let xml = agent_task_xml(r"C:\x.exe");
+    let settings = xml.find("<Settings>").unwrap();
+    let (head, tail) = xml.split_at(settings);
+    format!(
+        "{head}{}",
+        tail.replacen("<Enabled>true</Enabled>", "<Enabled>false</Enabled>", 1)
+    )
+}
+
+#[test]
+fn agent_task_row_fails_for_a_disabled_task_and_says_to_run_apply() {
+    // A killed `apply` leaves the task disabled; nothing then starts at any logon.
+    let xml = disabled_agent_task_xml();
+    assert!(xml_is_group_logon_task(&xml), "control: otherwise the group task");
+    let row = agent_task_row(&Ok(Some(xml)));
+    assert!(!row.pass, "{}", row.detail);
+    assert!(row.detail.contains("disabled"), "{}", row.detail);
+    assert!(row.detail.contains("apply"), "{}", row.detail);
+}
+
+#[test]
+fn a_task_with_no_enabled_setting_is_enabled() {
+    // The service leaves the element out when it holds its default, true.
+    let xml = agent_task_xml(r"C:\x.exe").replace("    <Enabled>true</Enabled>\n  </Settings>", "  </Settings>");
+    let settings = &xml[xml.find("<Settings>").unwrap()..];
+    assert!(!settings.contains("<Enabled>"), "control: no setting");
+    assert!(agent_task_row(&Ok(Some(xml))).pass);
+}
+
+#[test]
+fn a_disabled_logon_trigger_alone_is_not_a_disabled_task() {
+    // The trigger's own `Enabled` is not the task's; only `Settings` says the task is off.
+    let xml = agent_task_xml(r"C:\x.exe").replacen("<Enabled>true</Enabled>", "<Enabled>false</Enabled>", 1);
+    assert!(agent_task_row(&Ok(Some(xml))).pass);
+}
+
+// Task Scheduler itself (Elevated, CI only) ---------------------------------------------
+
+#[cfg(windows)]
+mod service {
+    use super::*;
+    use crate::test_support::ThrowawayTask as Throwaway;
+
+    /// Elevated (CI only).
+    #[test]
+    fn task_scheduler_accepts_the_group_agent_task() {
+        let task = Throwaway::new("group");
+        task.register(&agent_task_xml(r"C:\Windows\System32\cmd.exe"));
+        let xml = task.queried_xml();
+        assert!(
+            xml_is_group_logon_task(&xml),
+            "the service must keep the group principal and the logon trigger:\n{xml}"
+        );
+    }
+
+    /// Elevated (CI only).
+    #[test]
+    fn reapplying_replaces_a_legacy_per_user_task() {
+        let task = Throwaway::new("legacy");
+        let me = format!(
+            "{}\\{}",
+            std::env::var("USERDOMAIN").unwrap(),
+            std::env::var("USERNAME").unwrap()
+        );
+        task.register(&legacy_task_xml(&me));
+        assert!(
+            !xml_is_group_logon_task(&task.queried_xml()),
+            "control: the legacy form"
+        );
+
+        task.register(&agent_task_xml(r"C:\Windows\System32\cmd.exe"));
+        assert!(
+            xml_is_group_logon_task(&task.queried_xml()),
+            "`/F` replaced it in place"
+        );
+    }
 }

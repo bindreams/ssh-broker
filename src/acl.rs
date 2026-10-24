@@ -1,14 +1,21 @@
-//! acl: build & verify the socket-dir DACL — the sole access-control boundary.
+//! acl: build & verify the DACLs of a user's socket directory and socket file.
 //!
-//! Windows AF_UNIX has no `SO_PEERCRED`, so the NTFS DACL on the socket directory IS
-//! the access control: whoever can `connect()` gets a full interactive shell as the
-//! user. We therefore set an explicit, **PROTECTED** (non-inherited) DACL granting
-//! Full Control only to `{target user, SYSTEM, Administrators}`, and refuse to operate
-//! unless a read-back **exactly** matches that set (fail-closed).
+//! Windows AF_UNIX has no `SO_PEERCRED`, so NTFS access control is what decides who can
+//! `connect()`, and whoever can gets a full interactive shell as the user. Two objects carry it:
 //!
-//! The target user is resolved BY NAME (the account the agent's shell logs in as,
-//! configured at setup), never the current process token — `apply` may run as SYSTEM
-//! under the ONSTART self-heal task, so the current token is not the grantee.
+//! - The socket **file's** DACL decides who can connect. Traverse checks on the folders above it
+//!   are bypassed by `SeChangeNotifyPrivilege`, which every ordinary user holds, so the folder's
+//!   DACL does not stop a second user who knows the path.
+//! - The socket **directory's** DACL decides who can create, replace or delete the socket.
+//!
+//! Both must grant Full Control only to `{user, SYSTEM, Administrators}`. The directory gets an
+//! explicit, **PROTECTED** DACL whose ACEs are inheritable, so the socket file (and the lock
+//! file, and the logs folder) is born with exactly that set instead of the creating token's
+//! default DACL. [`verify_dir_acl`] and [`verify_file_acl`] read the DACLs back and refuse
+//! anything but an exact match (fail-closed).
+//!
+//! The user is the account the agent runs as: the agent lives in that user's profile, so its own
+//! token is the grantee.
 //!
 //! The install directory (`C:\ProgramData\ssh-broker`) is the other half of the boundary: the
 //! agent runs the exe in it as the user and the self-heal task runs it as SYSTEM, so a directory
@@ -167,8 +174,14 @@ impl Sid {
         }
     }
 
+    /// `DOMAIN\name (S-1-5-...)` as far as the account database resolves it, else the SID
+    /// string. For report rows and error messages; never fails.
+    pub fn describe(&self) -> String {
+        describe_sid(self.as_psid())
+    }
+
     /// The SID in SDDL string form ("S-1-5-…"), for embedding in a security descriptor.
-    fn to_sddl(&self) -> anyhow::Result<String> {
+    pub fn to_sddl(&self) -> anyhow::Result<String> {
         sid_to_string(self.as_psid())
     }
 }
@@ -248,11 +261,13 @@ fn wide(path: &Path) -> Vec<u16> {
 }
 
 /// Apply the explicit, PROTECTED owner-only DACL (`{target_user, SYSTEM, Administrators}`
-/// Full Control, target_user as owner) to `dir`, removing any inherited or broader access.
+/// Full Control, target_user as owner) to `dir`, removing any inherited or broader access. The
+/// ACEs are inheritable (`OI|CI`) so everything created inside is born with the same set.
 pub fn harden_dir(dir: &Path, target_user: &Sid) -> anyhow::Result<()> {
     let target = target_user.to_sddl()?;
-    // P = protected (no inheritance); FA = Full; SY = SYSTEM, BA = BUILTIN\Administrators.
-    let sddl = format!("O:{target}D:P(A;;FA;;;{target})(A;;FA;;;SY)(A;;FA;;;BA)");
+    // P = protected (no inheritance from the parent); OICI = inherited by files and folders
+    // below; FA = Full; SY = SYSTEM, BA = BUILTIN\Administrators.
+    let sddl = format!("O:{target}D:P(A;OICI;FA;;;{target})(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)");
     let sddl_w: Vec<u16> = sddl.encode_utf16().chain(std::iter::once(0)).collect();
     let path_w = wide(dir);
     unsafe {
@@ -291,6 +306,15 @@ struct Grant<'a> {
     mask: u32,
     /// The exact `AceFlags` the ACE must carry, or `None` to allow any flags but `INHERITED_ACE`.
     flags: Option<u8>,
+}
+
+/// Whether a DACL must be the object's own protected set, or may be the set it inherited.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Inheritance {
+    /// Protected, and no ACE inherited: a directory this module hardened.
+    Explicit,
+    /// Protected or not, inherited ACEs allowed: a file born inside such a directory.
+    Inherited,
 }
 
 /// A security descriptor read back from an object: the DACL and owner point into `sd`.
@@ -358,6 +382,11 @@ impl Security {
     /// precisely `grants` (each once), no inherited, DENY or other ACEs. Anything else, including a
     /// NULL or absent DACL, is `false`: fail-closed.
     fn dacl_matches(&self, grants: &[Grant]) -> anyhow::Result<bool> {
+        self.dacl_matches_as(grants, Inheritance::Explicit)
+    }
+
+    /// [`Self::dacl_matches`] with the inheritance state the policy allows.
+    fn dacl_matches_as(&self, grants: &[Grant], inheritance: Inheritance) -> anyhow::Result<bool> {
         unsafe {
             // A NULL/absent DACL means unrestricted access — never acceptable.
             if self.dacl.is_null() {
@@ -370,7 +399,10 @@ impl Security {
             let mut control = 0u16;
             let mut revision = 0u32;
             GetSecurityDescriptorControl(self.sd.0, &mut control, &mut revision)?;
-            if control & SE_DACL_PRESENT.0 == 0 || control & SE_DACL_PROTECTED.0 == 0 {
+            if control & SE_DACL_PRESENT.0 == 0 {
+                return Ok(false);
+            }
+            if inheritance == Inheritance::Explicit && control & SE_DACL_PROTECTED.0 == 0 {
                 return Ok(false);
             }
 
@@ -389,8 +421,9 @@ impl Security {
                 GetAce(self.dacl, i, &mut ace)?;
                 let header = &*(ace as *const ACE_HEADER);
 
-                // Any inherited ACE means the dir is not the locked-down explicit set.
-                if header.AceFlags & (INHERITED_ACE.0 as u8) != 0 {
+                // An explicit policy takes no inherited ACE: the dir is not the locked-down set.
+                let inherited = header.AceFlags & (INHERITED_ACE.0 as u8) != 0;
+                if inherited && inheritance == Inheritance::Explicit {
                     return Ok(false);
                 }
                 // Only ALLOW ACEs are permitted; a DENY (or any other type) fails closed.
@@ -413,7 +446,9 @@ impl Security {
                             return Ok(false); // duplicate ACE for the same grantee
                         }
                         // Each grant must carry exactly the mask (and flags) the policy names.
-                        if allowed.Mask != grant.mask || grant.flags.is_some_and(|f| header.AceFlags != f) {
+                        // `INHERITED_ACE` is judged above; the rest of the flags are the policy's.
+                        let flags = header.AceFlags & !(INHERITED_ACE.0 as u8);
+                        if allowed.Mask != grant.mask || grant.flags.is_some_and(|f| flags != f) {
                             return Ok(false);
                         }
                         seen[idx] = true;
@@ -433,22 +468,89 @@ impl Security {
     }
 }
 
-/// Read `dir`'s DACL + owner back and return `true` iff it is EXACTLY the locked-down
-/// allow-set: a PRESENT, PROTECTED DACL whose ACEs are precisely Full-Control ALLOWs for
-/// `{target_user, SYSTEM, Administrators}` (each once), owner within the allow-set, and no
-/// inherited or DENY ACEs. Anything else (incl. a NULL/absent DACL) returns `false` —
-/// fail-closed.
-pub fn verify_dir_acl(dir: &Path, target_user: &Sid) -> anyhow::Result<bool> {
-    let system = Sid::well_known(WellKnown::System)?;
-    let admins = Sid::well_known(WellKnown::Administrators)?;
+/// `AceFlags` of the directory's ACEs: `OI|CI`, and not `INHERITED_ACE`.
+const PRIVATE_DIR_ACE_FLAGS: u8 = (OBJECT_INHERIT_ACE.0 | CONTAINER_INHERIT_ACE.0) as u8;
+
+/// The three Full-Control grants of a user's private directory. `flags` is what the directory
+/// itself must carry; a file inside takes any flags.
+fn private_grants<'a>(user: &'a Sid, system: &'a Sid, admins: &'a Sid, flags: Option<u8>) -> [Grant<'a>; 3] {
     let full = |sid| Grant {
         sid,
         mask: FILE_ALL_ACCESS.0,
-        flags: None,
+        flags,
     };
+    [full(user), full(system), full(admins)]
+}
+
+/// Read `dir`'s DACL + owner back and return `true` iff it is EXACTLY the locked-down
+/// allow-set: a PRESENT, PROTECTED DACL whose ACEs are precisely inheritable (`OI|CI`)
+/// Full-Control ALLOWs for `{target_user, SYSTEM, Administrators}` (each once), owner within the
+/// allow-set, and no inherited or DENY ACEs. Anything else (incl. a NULL/absent DACL) returns
+/// `false` — fail-closed. The ACEs must be inheritable: a directory whose ACEs do not reach the
+/// socket file leaves the file with the creator's default DACL.
+pub fn verify_dir_acl(dir: &Path, target_user: &Sid) -> anyhow::Result<bool> {
+    let system = Sid::well_known(WellKnown::System)?;
+    let admins = Sid::well_known(WellKnown::Administrators)?;
     let security = Security::from_path(dir)?;
     Ok(security.owner_in(&[target_user, &system, &admins])?
-        && security.dacl_matches(&[full(target_user), full(&system), full(&admins)])?)
+        && security.dacl_matches(&private_grants(
+            target_user,
+            &system,
+            &admins,
+            Some(PRIVATE_DIR_ACE_FLAGS),
+        ))?)
+}
+
+/// `true` iff `file` (the socket, the lock, a folder made inside a hardened directory) grants
+/// Full Control to exactly `{user, SYSTEM, Administrators}` and to no one else, with an owner in
+/// that set. The ACEs may be inherited, which is how such a file is born. Anything else is
+/// `false`: fail-closed. For the socket this is the check that decides who can connect.
+pub fn verify_file_acl(file: &Path, user: &Sid) -> anyhow::Result<bool> {
+    file_policy_holds(&Security::from_path(file)?, user)
+}
+
+/// [`verify_file_acl`] on an already-read security descriptor.
+fn file_policy_holds(security: &Security, user: &Sid) -> anyhow::Result<bool> {
+    let system = Sid::well_known(WellKnown::System)?;
+    let admins = Sid::well_known(WellKnown::Administrators)?;
+    Ok(security.owner_in(&[user, &system, &admins])?
+        && security.dacl_matches_as(&private_grants(user, &system, &admins, None), Inheritance::Inherited)?)
+}
+
+/// Why `dir` must not be adopted as `user`'s private directory, or `None` if it may be (and
+/// [`harden_dir`] may repair it). It is read without following a link: a junction or symlink is
+/// refused, as is anything that is not a directory, and so is an owner other than `user`,
+/// SYSTEM or Administrators. Hardening re-owns and re-ACLs the object it is given, so it must not
+/// be given a link to somewhere else or a directory somebody else owns.
+pub fn private_dir_problem(dir: &Path, user: &Sid) -> anyhow::Result<Option<String>> {
+    let Some(handle) = open_for_inspection(dir)? else {
+        return Ok(Some(
+            "this process is denied access to read its ACL, so it cannot be shown to be its own".to_owned(),
+        ));
+    };
+    let security = Security::from_handle(handle.0).with_context(|| format!("read the ACL of {}", dir.display()))?;
+    let owner = describe_sid(security.owner);
+
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    unsafe { GetFileInformationByHandle(handle.0, &mut info) }
+        .with_context(|| format!("read the attributes of {}", dir.display()))?;
+    if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
+        return Ok(Some(format!(
+            "it is a reparse point (junction or symlink); owner {owner}"
+        )));
+    }
+    if info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY.0 == 0 {
+        return Ok(Some(format!("it is not a directory; owner {owner}")));
+    }
+    let system = Sid::well_known(WellKnown::System)?;
+    let admins = Sid::well_known(WellKnown::Administrators)?;
+    if !security.owner_in(&[user, &system, &admins])? {
+        return Ok(Some(format!(
+            "its owner is {owner}, not {}, SYSTEM or Administrators",
+            user.describe()
+        )));
+    }
+    Ok(None)
 }
 
 // install directory ====================================================================

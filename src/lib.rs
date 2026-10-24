@@ -15,9 +15,13 @@
 pub mod acl;
 pub mod afunix;
 pub mod agent;
+#[cfg(windows)]
+pub mod agent_lock;
 pub mod cmdline;
 #[cfg(windows)]
 pub mod conpty;
+#[cfg(windows)]
+pub mod filelog;
 #[cfg(windows)]
 pub mod hangup;
 #[cfg(windows)]
@@ -29,6 +33,11 @@ pub mod route;
 pub mod shim;
 #[cfg(windows)]
 pub mod shim_pty;
+pub mod socket_loc;
+#[cfg(all(windows, test))]
+mod test_support;
+#[cfg(windows)]
+pub mod userdir;
 pub mod vtinput;
 #[cfg(windows)]
 pub mod winutil;

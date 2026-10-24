@@ -131,13 +131,6 @@ fn bind_refuses_an_unhardened_directory() {
 
 #[cfg(windows)]
 #[test]
-fn production_socket_path_fits_sockaddr_un() {
-    // The fixed production path must not overflow the sockaddr_un limit.
-    assert!(super::unix_addr(&super::socket_path()).is_ok());
-}
-
-#[cfg(windows)]
-#[test]
 fn bound_listener_socket_is_not_inheritable() {
     let dir = setup_socket_dir("noinherit");
     let p = dir.join("s");
@@ -147,4 +140,235 @@ fn bound_listener_socket_is_not_inheritable() {
         "the listening socket must not be inheritable (else children leak the ACL boundary)"
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(windows)]
+#[test]
+fn a_connection_is_born_non_inheritable() {
+    // Measures the OS: `accept_raw` is `accept` and nothing more. A listener made with
+    // `WSA_FLAG_NO_HANDLE_INHERIT` yields sockets that are non-inheritable from the start, so no
+    // child spawned by another thread can inherit one between `accept` and any later fix-up.
+    let dir = setup_socket_dir("born");
+    let p = dir.join("s");
+    let listener = super::Listener::bind(&p).unwrap();
+    let client = super::connect(&p).unwrap();
+    let (accepted, _) = listener.sock.accept_raw().unwrap();
+    assert!(
+        !super::is_inheritable(&accepted).unwrap(),
+        "an accepted socket of a no-inherit listener is inheritable at birth"
+    );
+    drop((accepted, client));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(windows)]
+#[test]
+fn an_accepted_connection_is_not_inheritable() {
+    let dir = setup_socket_dir("accepted");
+    let p = dir.join("s");
+    let listener = super::Listener::bind(&p).unwrap();
+    let _client = super::connect(&p).unwrap();
+    let accepted = listener.accept().unwrap();
+    assert!(!super::is_inheritable(&accepted).unwrap());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(windows)]
+#[test]
+fn a_connection_that_arrives_inheritable_is_dropped_not_fixed_up() {
+    // Control: a socket made without the flag is inheritable, so the check can tell.
+    let sock = socket2::Socket::new_raw(socket2::Domain::UNIX, socket2::Type::STREAM, None).unwrap();
+    assert!(super::is_inheritable(&sock).unwrap(), "control: made without the flag");
+    // Fixing it up afterwards would leave the window open for the whole life of the accept loop's
+    // handoff; a connection that was ever inheritable is refused.
+    let err = super::finish_accept(Ok(sock), super::harden_accepted).expect_err("must be refused");
+    match err {
+        super::AcceptError::Connection(e) => assert!(format!("{e:#}").contains("inheritable"), "{e:#}"),
+        other => panic!("{other:?}"),
+    }
+}
+
+// the socket file's own ACL ----------------------------------------------------------------
+
+#[cfg(windows)]
+#[test]
+fn bind_creates_a_socket_file_with_exactly_the_three_aces() {
+    let dir = setup_socket_dir("file-acl");
+    let p = dir.join("agent.sock");
+    let _listener = super::Listener::bind(&p).unwrap();
+    let me = crate::acl::Sid::current_user().unwrap();
+    assert!(
+        crate::acl::verify_file_acl(&p, &me).unwrap(),
+        "the file is born with the directory's inheritable ACEs and nothing else"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(windows)]
+#[test]
+fn bind_refuses_a_dir_that_is_widened_after_it_was_hardened() {
+    let dir = setup_socket_dir("widened");
+    let status = std::process::Command::new("icacls")
+        .arg(&dir)
+        .args(["/grant", "*S-1-1-0:(OI)(CI)F"])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let p = dir.join("agent.sock");
+    let err = format!("{:#}", super::Listener::bind(&p).err().expect("must refuse"));
+    assert!(err.contains("not locked down"), "{err}");
+    assert!(!p.exists(), "nothing was bound");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(windows)]
+#[test]
+fn bind_removes_the_socket_and_refuses_when_the_file_acl_does_not_verify() {
+    let dir = setup_socket_dir("bad-file");
+    let p = dir.join("agent.sock");
+    let err = super::Listener::bind_with(&p, &|_| Ok(false))
+        .err()
+        .expect("must refuse");
+    assert!(format!("{err:#}").contains("socket file"), "{err:#}");
+    assert!(!p.exists(), "a socket whose ACL is unproven is not left behind");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(windows)]
+#[test]
+fn bind_removes_the_socket_when_the_file_acl_cannot_be_read() {
+    let dir = setup_socket_dir("unreadable-file");
+    let p = dir.join("agent.sock");
+    let result = super::Listener::bind_with(&p, &|_| anyhow::bail!("cannot read it"));
+    assert!(result.is_err());
+    assert!(!p.exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn bind_reports_a_live_listener_as_already_listening() {
+    let dir = setup_socket_dir("already");
+    let p = dir.join("s");
+    let _first = super::Listener::bind(&p).unwrap();
+    let err = super::Listener::bind(&p).err().expect("a live listener holds the path");
+    assert!(
+        err.downcast_ref::<super::AlreadyListening>().is_some(),
+        "the caller must be able to tell this from a real failure: {err:#}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(windows)]
+#[test]
+fn an_agent_that_takes_over_the_lock_reclaims_the_dead_agents_socket() {
+    use crate::agent_lock::UserLock;
+    let dir = setup_socket_dir("takeover");
+    let sock = dir.join("agent.sock");
+    let lock = dir.join("agent.lock");
+
+    // The first agent serves under the lock and dies: lock released, socket file left behind.
+    let first_lock = UserLock::try_acquire(&lock).unwrap().unwrap();
+    drop(super::Listener::bind(&sock).unwrap());
+    assert!(sock.exists(), "control: the dead agent left its socket file");
+    drop(first_lock);
+
+    // The second takes the lock, then binds over the stale file.
+    let _second_lock = UserLock::acquire(&lock, || panic!("the lock was free")).unwrap();
+    let _second = super::Listener::bind(&sock).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// accept errors -----
+
+#[cfg(windows)]
+fn raw(code: i32) -> std::io::Error {
+    std::io::Error::from_raw_os_error(code)
+}
+
+#[cfg(windows)]
+#[test]
+fn a_connection_the_peer_dropped_while_queued_is_that_connections_loss() {
+    // WSAECONNRESET and WSAECONNABORTED: the listener is fine; this one connection is gone.
+    for code in [10054, 10053] {
+        assert!(
+            matches!(
+                super::classify_accept_error(raw(code)),
+                super::AcceptError::Connection(_)
+            ),
+            "{code}"
+        );
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn an_interruption_is_to_be_retried() {
+    // WSAEINTR: a blocking call was cancelled; nothing was consumed and nothing is wrong.
+    assert!(matches!(
+        super::classify_accept_error(raw(10004)),
+        super::AcceptError::Interrupted(_)
+    ));
+}
+
+#[cfg(windows)]
+#[test]
+fn a_shortage_of_descriptors_or_buffers_is_exhaustion_and_keeps_its_code() {
+    // WSAEMFILE and WSAENOBUFS clear only when something else lets go of a resource.
+    for code in [10024, 10055] {
+        match super::classify_accept_error(raw(code)) {
+            super::AcceptError::Exhausted { code: got, .. } => assert_eq!(got, code),
+            other => panic!("{code} classified as {other:?}"),
+        }
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn codes_a_blocking_listener_cannot_return_are_fatal_and_say_so() {
+    // WSAEWOULDBLOCK needs a non-blocking socket and WSAEINPROGRESS a Winsock 1.1 blocking call in
+    // progress; this listener is neither, so getting one means something is wrong with it.
+    for code in [10035, 10036] {
+        match super::classify_accept_error(raw(code)) {
+            super::AcceptError::Fatal(e) => {
+                let text = format!("{e:#}");
+                assert!(text.contains(&code.to_string()), "{text}");
+                assert!(text.contains("cannot return"), "{text}");
+            }
+            other => panic!("{code} classified as {other:?}"),
+        }
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn a_broken_listener_is_fatal() {
+    // WSAEINVAL (not listening), WSAENOTSOCK, WSAENETDOWN, and a code Winsock does not document
+    // for accept: none of them is a connection's fault or goes away by itself.
+    for code in [10022, 10038, 10050, 99999] {
+        assert!(
+            matches!(super::classify_accept_error(raw(code)), super::AcceptError::Fatal(_)),
+            "{code}"
+        );
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn an_accepted_connection_that_cannot_be_hardened_is_dropped_not_fatal() {
+    // The socket must not reach a child with its inherit flag set, so it is dropped; the
+    // listener has nothing wrong with it.
+    let sock = socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None).unwrap();
+    let err = super::finish_accept(Ok(sock), |_| anyhow::bail!("SetHandleInformation failed"))
+        .expect_err("a connection that cannot be hardened is not handed out");
+    match err {
+        super::AcceptError::Connection(e) => assert!(format!("{e:#}").contains("SetHandleInformation"), "{e:#}"),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn an_accepted_connection_that_hardens_is_handed_out() {
+    let sock = socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None).unwrap();
+    assert!(super::finish_accept(Ok(sock), |_| Ok(())).is_ok());
 }
