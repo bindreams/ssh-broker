@@ -909,6 +909,21 @@ fn shim_as_bob_never_reaches_another_users_listener() {
     );
 }
 
+/// Child half of [`shim_as_bob_reaches_a_listener_in_bobs_own_location`], started only by it as
+/// bob (see [`child_entry`]). Makes the private folder of its own token's socket location, as
+/// bob's agent does, and only then records the socket path. Setting bob as the folder's owner
+/// takes `SeRestorePrivilege`, which an administrator does not enable by default.
+#[test]
+#[ignore = "run as a child of shim_as_bob_reaches_a_listener_in_bobs_own_location"]
+fn child_makes_its_own_socket_dir() {
+    let dir = child_entry::dir();
+    let loc = userdir::current_socket_location().unwrap_or_else(|e| panic!("resolve the socket location: {e:#}"));
+    let me = Sid::current_user().unwrap();
+    userdir::ensure_socket_dir(&loc, &me).unwrap_or_else(|e| panic!("make the private folder: {e:#}"));
+
+    child_entry::write_result(&dir, &format!("{}\n", loc.path.display()));
+}
+
 /// The control for the test above: the same shim, run the same way, does connect when a listener
 /// is in bob's own location. Without it, the refusal above could be a shim that never connects.
 #[test]
@@ -916,9 +931,20 @@ fn shim_as_bob_reaches_a_listener_in_bobs_own_location() {
     let bob = Account::create("bob", true);
     let shared = SharedDir::new("shim-own");
     let bob_loc = userdir::socket_location_of_token(bob.network_token().0).unwrap();
-    // The administrator makes bob's folder; it is exactly bob, SYSTEM and Administrators, and the
-    // socket file made in it inherits the same, so bob may connect.
-    userdir::ensure_socket_dir(&bob_loc, &bob.sid).unwrap();
+
+    // Bob makes his own folder, as his agent does: it is exactly bob, SYSTEM and Administrators,
+    // and the socket file made in it inherits the same, so bob may connect.
+    let exe = shared.0.join("isolation.exe");
+    std::fs::copy(std::env::current_exe().unwrap(), &exe).unwrap();
+    let command = child_entry::command_line(&exe, "child_makes_its_own_socket_dir", &shared.0);
+    let code = bob.run(&exe, &command, &shared.0, &[]);
+    assert_eq!(code, 0, "the child, running as bob, failed: see its output above");
+    assert_eq!(
+        PathBuf::from(child_entry::result(&shared.0).trim_end()),
+        bob_loc.path,
+        "the child resolved a different location than his token gives the administrator"
+    );
+
     let listener = Recorder::listen(&bob_loc.path);
 
     let run = run_shim_as(&bob, &shared);
