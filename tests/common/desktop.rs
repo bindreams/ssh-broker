@@ -11,8 +11,10 @@
 #![allow(dead_code)]
 
 use std::ffi::c_void;
+use std::io;
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Mutex, OnceLock, PoisonError};
+use std::sync::{OnceLock, PoisonError, RwLock, RwLockReadGuard};
 
 use windows::Win32::Foundation::{HLOCAL, LocalFree};
 use windows::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
@@ -129,10 +131,49 @@ fn user32() -> &'static User32 {
     })
 }
 
+// The process's window station ----------------------------------------------------------------
+
+/// Held exclusively while [`PrivateDesktop::create`] has this process on a station of its own, and
+/// shared by everything that starts a child or reads the process's station. `CreateDesktopW`
+/// puts the desktop on the calling process's current station and offers no other way to name one
+/// (Microsoft, "CreateDesktopW": "associates it with the current window station of the calling
+/// process"; the name may not contain a backslash), so the switch cannot be avoided, only made
+/// invisible.
+static STATION: RwLock<()> = RwLock::new(());
+
+/// Shared hold on the window station: while it lives, the process's station is the original.
+fn station_unchanged() -> RwLockReadGuard<'static, ()> {
+    STATION.read().unwrap_or_else(PoisonError::into_inner)
+}
+
 /// This process's window station handle, as a number (to compare before and after).
 pub fn process_window_station() -> usize {
+    let _unchanged = station_unchanged();
     // SAFETY: takes no arguments; the handle is the process's own and is not closed.
     unsafe { (user32().get_process_window_station)() }.0 as usize
+}
+
+/// Start `command`. A child started without a desktop of its own takes this process's current
+/// window station, so the start waits for any switch to finish and holds it off until the child
+/// exists. Every start of a child in this binary goes through here, [`status`] or [`output`]
+/// (a test checks the sources).
+pub fn spawn(command: &mut Command) -> io::Result<Child> {
+    let _unchanged = station_unchanged();
+    command.spawn()
+}
+
+/// Like [`Command::status`]: inherited stdio, wait for the exit.
+pub fn status(command: &mut Command) -> io::Result<ExitStatus> {
+    spawn(command)?.wait()
+}
+
+/// Like [`Command::output`]: stdin closed, stdout and stderr captured.
+pub fn output(command: &mut Command) -> io::Result<Output> {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    spawn(command)?.wait_with_output()
 }
 
 // The pair -----------------------------------------------------------------------------------
@@ -145,10 +186,6 @@ pub struct PrivateDesktop {
     name: String,
 }
 
-/// Creating the desktop needs the new station to be this process's for a moment. The process's
-/// station is process-wide, so one creation at a time, and it is put back before the lock is
-/// released.
-static SWITCHING: Mutex<()> = Mutex::new(());
 static NEXT: AtomicU32 = AtomicU32::new(0);
 
 impl PrivateDesktop {
@@ -162,7 +199,9 @@ impl PrivateDesktop {
         let station_name = format!("sb-iso-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed));
         let api = user32();
 
-        let _only_one = SWITCHING.lock().unwrap_or_else(PoisonError::into_inner);
+        // Creating the desktop needs the new station to be this process's for a moment. Exclusive:
+        // no child starts and no reader looks while it is, and it is put back before release.
+        let _switching = STATION.write().unwrap_or_else(PoisonError::into_inner);
         // SAFETY: NUL-terminated names, descriptors that outlive the calls, handles owned here.
         unsafe {
             let original = (api.get_process_window_station)();

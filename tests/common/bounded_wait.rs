@@ -14,6 +14,8 @@ use std::time::Duration;
 use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows::Win32::System::Threading::{GetExitCodeProcess, TerminateProcess, WaitForSingleObject};
 
+use crate::desktop;
+
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// How long a child started as another account may take to exit. Generous: the slowest step seen
@@ -65,11 +67,11 @@ fn process_tree(root: u32) -> String {
            if ($proc) {{ foreach ($t in $proc.Threads) {{ '    thread {{0}} {{1}} {{2}}' -f $t.Id, $t.ThreadState, $t.WaitReason }} }} \
          }} }}"
     );
-    match Command::new("powershell")
-        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()
-    {
+    match desktop::output(
+        Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            .creation_flags(CREATE_NO_WINDOW),
+    ) {
         Ok(out) => format!(
             "{}{}",
             String::from_utf8_lossy(&out.stdout),
@@ -82,11 +84,11 @@ fn process_tree(root: u32) -> String {
 /// `taskkill /T /F` on the tree under `pid`: only the process this test started and its
 /// descendants. Returns what it printed.
 fn kill_tree(pid: u32) -> String {
-    match Command::new("taskkill")
-        .args(["/T", "/F", "/PID", &pid.to_string()])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()
-    {
+    match desktop::output(
+        Command::new("taskkill")
+            .args(["/T", "/F", "/PID", &pid.to_string()])
+            .creation_flags(CREATE_NO_WINDOW),
+    ) {
         Ok(out) => format!(
             "{}{}",
             String::from_utf8_lossy(&out.stdout).trim(),

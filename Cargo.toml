@@ -59,6 +59,6 @@ windows = { version = "0.62.2", features = [
     "Win32_UI_Shell", # CommandLineToArgvW: tests/conhost_windows.rs checks the test encoder's tokenizer against it
     "Win32_NetworkManagement_NetManagement", # NetUserAdd/NetUserDel: tests/user_isolation_windows.rs makes throwaway accounts
     "Wdk_System_Threading",                  # ProcessDefaultHardErrorMode: tests/common/hard_errors.rs makes a child's loader failure exit instead of raise a message box
-    "Win32_System_LibraryLoader",            # LoadLibraryW/GetProcAddress: tests/common/desktop.rs binds user32 at run time and the children load user32, gdi32, combase and ole32 by name
+    "Win32_System_LibraryLoader",            # LoadLibraryW/GetProcAddress: tests/common/desktop.rs binds user32 at run time, and tests/user_isolation_windows.rs loads user32, gdi32, combase and ole32 by name
     "Win32_System_StationsAndDesktops",      # HWINSTA/HDESK: tests/common/desktop.rs gives each child its own window station and desktop
 ] }

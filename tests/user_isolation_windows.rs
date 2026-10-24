@@ -37,6 +37,7 @@ use windows::Win32::Security::{
     PSECURITY_DESCRIPTOR, SecurityImpersonation, SetTokenInformation, TOKEN_ALL_ACCESS, TOKEN_DEFAULT_DACL,
     TOKEN_DUPLICATE, TOKEN_ELEVATION, TOKEN_QUERY, TokenDefaultDacl, TokenElevation, TokenImpersonation, TokenPrimary,
 };
+use windows::Win32::System::LibraryLoader::LoadLibraryW;
 use windows::Win32::System::Threading::{
     CREATE_NO_WINDOW, CREATE_PROCESS_LOGON_FLAGS, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT,
     CreateProcessWithTokenW, GetCurrentProcess, LOGON_WITH_PROFILE, OpenProcessToken, PROCESS_INFORMATION,
@@ -49,8 +50,6 @@ use windows::core::{BOOL, PCWSTR, PWSTR};
 mod bounded_wait;
 #[path = "common/desktop.rs"]
 mod desktop;
-#[path = "common/env_probe.rs"]
-mod env_probe;
 #[path = "common/environment.rs"]
 mod environment;
 #[path = "common/hard_errors.rs"]
@@ -302,11 +301,7 @@ impl SharedDir {
         let dir = std::env::temp_dir().join(format!("sb-iso-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let status = Command::new("icacls")
-            .arg(&dir)
-            .args(["/grant", "*S-1-1-0:(OI)(CI)M"])
-            .status()
-            .unwrap();
+        let status = desktop::status(Command::new("icacls").arg(&dir).args(["/grant", "*S-1-1-0:(OI)(CI)M"])).unwrap();
         assert!(status.success(), "icacls on the shared directory");
         SharedDir(dir)
     }
@@ -320,7 +315,7 @@ impl Drop for SharedDir {
 
 /// What `icacls` prints for `path`, for an assertion message.
 fn icacls_report(path: &Path) -> String {
-    match Command::new("icacls").arg(path).output() {
+    match desktop::output(Command::new("icacls").arg(path)) {
         Ok(out) => String::from_utf8_lossy(&out.stdout).trim().to_owned(),
         Err(e) => format!("icacls did not run: {e}"),
     }
@@ -626,11 +621,12 @@ fn ensure_socket_dir_refuses_a_dir_owned_by_another_user() {
     let profile = StandInProfile::new("foreign");
     let loc = profile.location();
     std::fs::create_dir(&loc.dir).unwrap();
-    let status = Command::new("icacls")
-        .arg(&loc.dir)
-        .args(["/setowner", &format!("*{}", bob.sid_text)])
-        .status()
-        .unwrap();
+    let status = desktop::status(
+        Command::new("icacls")
+            .arg(&loc.dir)
+            .args(["/setowner", &format!("*{}", bob.sid_text)]),
+    )
+    .unwrap();
     assert!(status.success(), "icacls /setowner");
 
     let err = format!("{:#}", userdir::ensure_socket_dir(&loc, &admin).unwrap_err());
@@ -695,11 +691,12 @@ fn bob_cannot_connect_to_a_socket_in_another_users_dir() {
     assert!(acl::verify_file_acl(&denied.path, &admin).unwrap(), "control: exact");
     // The control socket additionally grants bob, so a refusal elsewhere is the ACL's doing and
     // not an unreachable path or a missing right.
-    let status = Command::new("icacls")
-        .arg(&control.path)
-        .args(["/grant", &format!("*{}:(F)", bob.sid_text)])
-        .status()
-        .unwrap();
+    let status = desktop::status(
+        Command::new("icacls")
+            .arg(&control.path)
+            .args(["/grant", &format!("*{}:(F)", bob.sid_text)]),
+    )
+    .unwrap();
     assert!(status.success());
 
     let exe = shared.0.join("isolation.exe");
@@ -728,14 +725,15 @@ fn a_child_that_never_exits_is_reported_and_its_tree_killed() {
     let evidence = std::env::temp_dir().join(format!("sb-iso-bounded-{}.txt", std::process::id()));
     std::fs::write(&evidence, "left-behind-marker").unwrap();
     // cmd.exe runs ping.exe, so the tree has a grandchild; the ping outlives any test run.
-    let mut child = Command::new("cmd.exe")
-        .args(["/c", "ping -n 600 127.0.0.1 >nul"])
-        .creation_flags(CREATE_NO_WINDOW.0)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
+    let mut child = desktop::spawn(
+        Command::new("cmd.exe")
+            .args(["/c", "ping -n 600 127.0.0.1 >nul"])
+            .creation_flags(CREATE_NO_WINDOW.0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null()),
+    )
+    .unwrap();
 
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         bounded_wait::wait_for_exit(
@@ -769,13 +767,14 @@ fn a_suspended_child_has_its_hard_error_boxes_suppressed() {
 
     // Suspended, so it never runs and never opens anything. CREATE_DEFAULT_ERROR_MODE gives it
     // the system default, whatever this process's mode is.
-    let mut child = Command::new("cmd.exe")
-        .creation_flags(0x0000_0004 | CREATE_NO_WINDOW.0 | 0x0400_0000)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
+    let mut child = desktop::spawn(
+        Command::new("cmd.exe")
+            .creation_flags(0x0000_0004 | CREATE_NO_WINDOW.0 | 0x0400_0000)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null()),
+    )
+    .unwrap();
     let process = HANDLE(child.as_raw_handle());
 
     let before = hard_errors::raises_hard_error_boxes(process);
@@ -837,6 +836,93 @@ fn a_child_gets_a_private_desktop_and_this_process_keeps_its_window_station() {
     assert!(name.ends_with("\\Default"), "{name}");
 }
 
+/// Creating a [`desktop::PrivateDesktop`] switches this process's window station for a moment, and
+/// a child started without a desktop of its own inherits whichever station is current. So every
+/// start of a child goes through the guarded `desktop::{spawn, status, output}`, and the one
+/// `CreateProcess*` call here names its desktop. This reads the sources of this binary and fails
+/// on a start that bypasses the guard. `pty.rs` is left out: only binaries that never switch
+/// the station use it.
+#[test]
+fn no_child_is_started_outside_the_window_station_guard() {
+    // Built from pieces so that this test does not match itself.
+    let direct = [
+        concat!(".spa", "wn()"),
+        concat!(".sta", "tus()"),
+        concat!(".out", "put()"),
+    ];
+    let raw = [
+        concat!("CreateProcess", "W("),
+        concat!("CreateProcess", "AsUserW("),
+        concat!("CreateProcess", "WithLogonW("),
+    ];
+    let tests = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
+    let mut files = vec![tests.join("user_isolation_windows.rs")];
+    for entry in std::fs::read_dir(tests.join("common")).unwrap() {
+        let path = entry.unwrap().path();
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        if name.ends_with(".rs") && name != "desktop.rs" && name != "pty.rs" {
+            files.push(path);
+        }
+    }
+
+    let mut bypasses = Vec::new();
+    for file in files {
+        let text = std::fs::read_to_string(&file).unwrap();
+        for (number, line) in text.lines().enumerate() {
+            if direct.iter().chain(&raw).any(|needle| line.contains(needle)) {
+                bypasses.push(format!("{}:{}: {}", file.display(), number + 1, line.trim()));
+            }
+        }
+    }
+    assert!(
+        bypasses.is_empty(),
+        "start children through desktop::spawn, status or output:\n{}",
+        bypasses.join("\n")
+    );
+}
+
+/// CI only (creating a window station needs an administrator). Under a process-wide station
+/// switch that readers and spawns did not respect, a reader would see a private station here.
+#[test]
+fn creating_private_desktops_in_parallel_never_shows_a_reader_another_station() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    assert_elevated();
+    let me = Sid::current_user().unwrap().to_sddl().unwrap();
+    let original = desktop::process_window_station();
+    let done = AtomicBool::new(false);
+
+    let seen_other = std::thread::scope(|scope| {
+        let creators: Vec<_> = (0..4)
+            .map(|_| {
+                scope.spawn(|| {
+                    for _ in 0..5 {
+                        desktop::PrivateDesktop::create(&[&me]).expect("create a private window station and desktop");
+                    }
+                })
+            })
+            .collect();
+        let reader = scope.spawn(|| {
+            let mut other = 0u32;
+            while !done.load(Ordering::Acquire) {
+                if desktop::process_window_station() != original {
+                    other += 1;
+                }
+                std::thread::yield_now();
+            }
+            other
+        });
+        for creator in creators {
+            creator.join().unwrap();
+        }
+        done.store(true, Ordering::Release);
+        reader.join().unwrap()
+    });
+
+    assert_eq!(seen_other, 0, "a reader saw a window station other than the original");
+    assert_eq!(desktop::process_window_station(), original);
+}
+
 #[test]
 fn a_loader_status_in_an_exit_code_is_named() {
     assert_eq!(hard_errors::describe_exit(0), "0");
@@ -883,9 +969,14 @@ fn child_loads_the_window_libraries() {
     if !exe_dir.join("libs.txt").exists() {
         return; // not started as the child
     }
-    let failed: Vec<String> = env_probe::DLLS
+    let failed: Vec<String> = ["user32.dll", "gdi32.dll", "combase.dll", "ole32.dll"]
         .iter()
-        .filter_map(|dll| env_probe::load(dll).err().map(|e| format!("{dll}: {e}")))
+        // SAFETY: NUL-terminated name.
+        .filter_map(|dll| {
+            unsafe { LoadLibraryW(PCWSTR(wide(dll).as_ptr())) }
+                .err()
+                .map(|e| format!("{dll}: {e}"))
+        })
         .collect();
     assert!(failed.is_empty(), "did not load: {failed:?}");
 }
@@ -914,76 +1005,6 @@ fn a_child_as_bob_loads_the_window_libraries() {
     );
 }
 
-/// Child half of the measurement in [`shim_as_bob_never_reaches_another_users_listener`]: runs
-/// only when started from the shared directory with a `probe.txt` beside the binary, and writes
-/// what it sees to `probe-report.txt` there.
-#[test]
-fn child_reports_its_session_hive_and_dll_load() {
-    let Some(exe_dir) = std::env::current_exe().unwrap().parent().map(Path::to_path_buf) else {
-        return;
-    };
-    let Ok(text) = std::fs::read_to_string(exe_dir.join("probe.txt")) else {
-        return; // not started as the child
-    };
-    let value = |key: &str| {
-        text.lines()
-            .find_map(|l| l.strip_prefix(key))
-            .unwrap_or_else(|| panic!("probe.txt has no {key}"))
-    };
-    std::fs::write(
-        exe_dir.join("probe-report.txt"),
-        env_probe::report(value("sid="), value("dll=")),
-    )
-    .unwrap();
-}
-
-/// The text of a panic payload.
-fn panic_text(payload: &(dyn std::any::Any + Send)) -> String {
-    payload
-        .downcast_ref::<String>()
-        .cloned()
-        .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_owned()))
-        .unwrap_or_else(|| "(a panic with no text)".to_owned())
-}
-
-/// Run [`child_reports_its_session_hive_and_dll_load`] as `bob` once per DLL of
-/// [`env_probe::DLLS`], launched with `logon_flags`, and return what each child said. A launch or
-/// wait that fails is part of the answer, not a failure of the measurement.
-fn probe_as(bob: &Account, shared: &SharedDir, exe: &Path, logon_flags: CREATE_PROCESS_LOGON_FLAGS) -> String {
-    use std::fmt::Write as _;
-    let command = format!(
-        "\"{}\" --exact child_reports_its_session_hive_and_dll_load",
-        exe.display()
-    );
-    let (probe, report) = (shared.0.join("probe.txt"), shared.0.join("probe-report.txt"));
-    let mut all = String::new();
-    for dll in env_probe::DLLS {
-        std::fs::write(&probe, format!("sid={}\ndll={dll}\n", bob.sid_text)).unwrap();
-        let _ = std::fs::remove_file(&report);
-        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            bob.run_with(exe, &command, &shared.0, &[], logon_flags, None)
-        }));
-        let ended = match outcome {
-            Ok(code) => format!("the child exited with {}", hard_errors::describe_exit(code)),
-            Err(payload) => format!("the child did not complete: {}", panic_text(payload.as_ref())),
-        };
-        let said = std::fs::read_to_string(&report).unwrap_or_else(|e| format!("(no report: {e})\n"));
-        let _ = writeln!(all, "-- {dll}: {ended}\n{said}");
-    }
-    all
-}
-
-/// Prints the measurement when the test it belongs to fails (libtest shows a failed test's output).
-struct PrintOnPanic(String);
-
-impl Drop for PrintOnPanic {
-    fn drop(&mut self) {
-        if std::thread::panicking() {
-            eprintln!("{}", self.0);
-        }
-    }
-}
-
 #[test]
 fn shim_as_bob_never_reaches_another_users_listener() {
     // The administrator's agent is listening, and bob may open its socket. An administrator who
@@ -991,16 +1012,6 @@ fn shim_as_bob_never_reaches_another_users_listener() {
     // open.
     let bob = Account::create("bob", true);
     let shared = SharedDir::new("shim");
-
-    // MEASUREMENT (temporary): what bob's process sees, launched as the other tests launch it and
-    // with his profile loaded. Printed if this test fails.
-    let probe_exe = shared.0.join("isolation.exe");
-    std::fs::copy(std::env::current_exe().unwrap(), &probe_exe).unwrap();
-    let _measurement = PrintOnPanic(format!(
-        "MEASUREMENT, profile not loaded (dwLogonFlags = 0):\n{}\nMEASUREMENT, profile loaded (LOGON_WITH_PROFILE):\n{}",
-        probe_as(&bob, &shared, &probe_exe, CREATE_PROCESS_LOGON_FLAGS(0)),
-        probe_as(&bob, &shared, &probe_exe, LOGON_WITH_PROFILE),
-    ));
 
     let admin = Sid::current_user().unwrap();
     let admin_loc = userdir::current_socket_location().unwrap();
@@ -1012,11 +1023,12 @@ fn shim_as_bob_never_reaches_another_users_listener() {
     // The file DACL would turn bob away on its own, which would hide a shim that looked in the
     // wrong profile. Grant bob the socket, so that only the path decides: a shim that followed
     // the administrator's environment would connect here and fail the sentinel check below.
-    let status = Command::new("icacls")
-        .arg(&admin_loc.path)
-        .args(["/grant", &format!("*{}:(F)", bob.sid_text)])
-        .status()
-        .unwrap();
+    let status = desktop::status(
+        Command::new("icacls")
+            .arg(&admin_loc.path)
+            .args(["/grant", &format!("*{}:(F)", bob.sid_text)]),
+    )
+    .unwrap();
     assert!(status.success(), "icacls /grant");
 
     // Records the first thing that connects and the first byte it sends.
