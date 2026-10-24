@@ -105,11 +105,20 @@ fn create_and_query_argv_shapes() {
 }
 
 #[test]
-fn query_parsing_registered() {
-    let xml = agent_task_xml("C:\\x.exe");
-    assert!(parse_query_registered(&xml, true)); // exists + XML returned
-    assert!(!parse_query_registered(&xml, false)); // nonzero exit = not registered
-    assert!(!parse_query_registered("ERROR: task not found", true)); // no <Task
+fn apply_takes_the_queried_xml_and_treats_an_absent_task_as_none() {
+    let xml = agent_task_xml(r"C:\x.exe");
+    assert_eq!(registered_xml(Ok(Some(xml.clone()))).unwrap(), Some(xml));
+    assert_eq!(registered_xml(Ok(None)).unwrap(), None);
+}
+
+#[test]
+fn apply_refuses_to_guess_when_the_query_was_inconclusive() {
+    // "Could not ask" is not "not registered": taking it for absent skips the migration and the
+    // restart after a failed apply.
+    let err = registered_xml(Err(anyhow::anyhow!("access is denied"))).unwrap_err();
+    let text = format!("{err:#}");
+    assert!(text.contains("access is denied"), "{text}");
+    assert!(text.contains(AGENT_TASK), "{text}");
 }
 
 #[test]
@@ -143,22 +152,34 @@ fn xml_is_group_logon_task_tolerates_case_and_whitespace_in_the_queried_form() {
 
 #[test]
 fn agent_task_row_passes_for_the_group_task() {
-    let row = agent_task_row(&agent_task_xml(r"C:\x.exe"), true);
+    let row = agent_task_row(&Ok(Some(agent_task_xml(r"C:\x.exe"))));
     assert!(row.pass, "{}", row.detail);
 }
 
 #[test]
 fn agent_task_row_fails_for_a_legacy_per_user_task() {
-    let row = agent_task_row(&legacy_task_xml("DOMAIN\\someone"), true);
+    let row = agent_task_row(&Ok(Some(legacy_task_xml("DOMAIN\\someone"))));
     assert!(!row.pass);
     assert!(row.detail.contains("apply"), "it says what to do: {}", row.detail);
 }
 
 #[test]
 fn agent_task_row_fails_when_the_task_is_not_registered() {
-    let row = agent_task_row("", false);
+    let row = agent_task_row(&Ok(None));
     assert!(!row.pass);
     assert!(row.detail.contains("registered=false"), "{}", row.detail);
+}
+
+#[test]
+fn agent_task_row_gives_the_cause_when_the_query_failed() {
+    let row = agent_task_row(&Err(anyhow::anyhow!("access is denied")));
+    assert!(!row.pass);
+    assert!(row.detail.contains("access is denied"), "{}", row.detail);
+    assert!(
+        !row.detail.contains("registered=false"),
+        "a failed query is not an absent task: {}",
+        row.detail
+    );
 }
 
 // Task Scheduler itself (Elevated, CI only) ---------------------------------------------
@@ -174,7 +195,6 @@ mod service {
         let task = Throwaway::new("group");
         task.register(&agent_task_xml(r"C:\Windows\System32\cmd.exe"));
         let xml = task.queried_xml();
-        assert!(parse_query_registered(&xml, true));
         assert!(
             xml_is_group_logon_task(&xml),
             "the service must keep the group principal and the logon trigger:\n{xml}"

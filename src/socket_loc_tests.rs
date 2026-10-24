@@ -29,11 +29,10 @@ fn lock_and_logs_live_inside_the_socket_dir() {
 }
 
 #[test]
-fn each_session_has_its_own_lock_file_inside_the_socket_dir() {
+fn the_session_slots_share_one_lock_file_inside_the_socket_dir() {
     let loc = for_profile(&profile("a")).unwrap();
-    assert_eq!(loc.session_lock_path(2), loc.dir.join("session-2.lock"));
-    assert_ne!(loc.session_lock_path(2), loc.session_lock_path(3));
-    assert_ne!(loc.session_lock_path(2), loc.lock_path(), "not the user lock");
+    assert_eq!(loc.sessions_lock_path(), loc.dir.join("sessions.lock"));
+    assert_ne!(loc.sessions_lock_path(), loc.lock_path(), "not the user lock");
 }
 
 #[test]

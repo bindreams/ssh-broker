@@ -231,3 +231,70 @@ fn an_agent_that_takes_over_the_lock_reclaims_the_dead_agents_socket() {
     let _second = super::Listener::bind(&sock).unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// accept errors -----
+
+fn raw(code: i32) -> std::io::Error {
+    std::io::Error::from_raw_os_error(code)
+}
+
+#[cfg(windows)]
+#[test]
+fn a_connection_the_peer_dropped_while_queued_is_that_connections_loss() {
+    // WSAECONNRESET and WSAECONNABORTED: the listener is fine; this one connection is gone.
+    for code in [10054, 10053] {
+        assert!(
+            matches!(
+                super::classify_accept_error(raw(code)),
+                super::AcceptError::Connection(_)
+            ),
+            "{code}"
+        );
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn an_interruption_or_exhaustion_is_transient_and_keeps_its_code() {
+    // WSAEINTR, WSAEMFILE, WSAENOBUFS, WSAEWOULDBLOCK, WSAEINPROGRESS: clear on their own, or not.
+    for code in [10004, 10024, 10055, 10035, 10036] {
+        match super::classify_accept_error(raw(code)) {
+            super::AcceptError::Transient { code: got, .. } => assert_eq!(got, Some(code)),
+            other => panic!("{code} classified as {other:?}"),
+        }
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn a_broken_listener_is_fatal() {
+    // WSAEINVAL (not listening), WSAENOTSOCK, WSAENETDOWN, and a code Winsock does not document
+    // for accept: none of them is a connection's fault or goes away by itself.
+    for code in [10022, 10038, 10050, 99999] {
+        assert!(
+            matches!(super::classify_accept_error(raw(code)), super::AcceptError::Fatal(_)),
+            "{code}"
+        );
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn an_accepted_connection_that_cannot_be_hardened_is_dropped_not_fatal() {
+    // The socket must not reach a child with its inherit flag set, so it is dropped; the
+    // listener has nothing wrong with it.
+    let sock = socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None).unwrap();
+    let err = super::finish_accept(Ok(sock), |_| anyhow::bail!("SetHandleInformation failed"))
+        .expect_err("a connection that cannot be hardened is not handed out");
+    match err {
+        super::AcceptError::Connection(e) => assert!(format!("{e:#}").contains("SetHandleInformation"), "{e:#}"),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn an_accepted_connection_that_hardens_is_handed_out() {
+    let sock = socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None).unwrap();
+    assert!(super::finish_accept(Ok(sock), |_| Ok(())).is_ok());
+}

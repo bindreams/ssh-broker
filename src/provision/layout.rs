@@ -30,7 +30,7 @@ impl Layout {
         self.base.join(super::EXE_NAME)
     }
 
-    /// The saved account of a single-user install. No longer written or read; `apply` removes it.
+    /// A single-user install's saved account; `apply` removes it.
     fn legacy_config_path(&self) -> PathBuf {
         self.base.join("config.toml")
     }
@@ -129,12 +129,24 @@ impl Legacy {
 /// Look for the artifacts of a single-user install. `agent_task_xml` is the queried XML of the
 /// registered agent task, or `None` if there is none. The install directory is only inspected
 /// (never read), but it is still taken as a [`TrustedBase`]: nothing looks into an untrusted one.
-pub fn legacy_artifacts(base: &TrustedBase<'_>, agent_task_xml: Option<&str>) -> Legacy {
-    let exists = |path: PathBuf| path.symlink_metadata().is_ok();
-    Legacy {
-        config: exists(base.layout.legacy_config_path()),
-        socket_dir: exists(base.layout.legacy_socket_dir()),
+///
+/// A path that cannot be inspected for a reason other than not existing is an error: calling it
+/// absent would skip its cleanup.
+pub fn legacy_artifacts(base: &TrustedBase<'_>, agent_task_xml: Option<&str>) -> anyhow::Result<Legacy> {
+    let exists = |path: PathBuf| present(&path).with_context(|| format!("inspect {}", path.display()));
+    Ok(Legacy {
+        config: exists(base.layout.legacy_config_path())?,
+        socket_dir: exists(base.layout.legacy_socket_dir())?,
         task: agent_task_xml.is_some_and(|xml| !schtasks::xml_is_group_logon_task(xml)),
+    })
+}
+
+/// Whether `path` exists, without following a link at it. Only NotFound means no.
+fn present(path: &Path) -> std::io::Result<bool> {
+    match path.symlink_metadata() {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
     }
 }
 
@@ -164,7 +176,9 @@ fn remove_if_present(result: std::io::Result<()>) -> std::io::Result<()> {
 /// migration of a single-user install, then the exe. Returns the canonical exe path.
 ///
 /// `agent_task_xml` is the queried XML of the registered agent task (`None` if there is none),
-/// and `stop_agents` stops every running agent. It is called only when it has to be: a legacy
+/// and `stop_agents` stops every running agent and returns only once each has exited (the exe is
+/// copied right after, and a process that is stopped but not yet gone still holds it). It is called
+/// only when it has to be: a legacy
 /// artifact is found, or an installed exe is about to be replaced by a different build. So
 /// re-running `apply` and the boot self-heal with the installed build leave live agents alone.
 /// The caller starts agents again once the tasks are registered.
@@ -185,7 +199,7 @@ pub fn prepare_in(
     agent_task_xml: Option<&str>,
     stop_agents: impl FnOnce() -> anyhow::Result<()>,
 ) -> anyhow::Result<PathBuf> {
-    let legacy = legacy_artifacts(base, agent_task_xml);
+    let legacy = legacy_artifacts(base, agent_task_xml)?;
     let replaces_exe = would_replace_installed_exe(base.layout, current_exe);
     if legacy.any() {
         println!("apply: replacing a single-user install ({})", legacy.describe());
@@ -209,22 +223,39 @@ fn would_replace_installed_exe(layout: &Layout, current: &Path) -> bool {
 
 /// Copy `current` to the canonical path unless it is already there or identical.
 ///
-/// A copy that fails is an error. By now every agent the logon task started has been stopped, so
-/// what still holds the exe open is something else (an agent started by hand). Keeping the old exe
-/// under the new tasks would report an install that did not happen.
+/// A copy that fails is an error. By now every agent the logon task started has been stopped and
+/// has exited, so a sharing violation means something else holds the exe open (an agent started
+/// by hand). Keeping the old exe under the new tasks would report an install that did not happen.
 fn install_self(layout: &Layout, current: &Path) -> anyhow::Result<PathBuf> {
     let canonical = layout.canonical_exe();
     if current != canonical && !files_identical(current, &canonical) {
-        std::fs::copy(current, &canonical).with_context(|| {
-            format!(
-                "could not replace {}: it is in use, probably by an agent started by hand with \
-                 `ssh-broker agent`; stop that agent and run apply again",
-                canonical.display()
-            )
-        })?;
+        std::fs::copy(current, &canonical).map_err(|e| anyhow::anyhow!(copy_failure(&canonical, &e)))?;
     }
     anyhow::ensure!(canonical.is_file(), "canonical exe missing after install");
     Ok(canonical)
+}
+
+/// `ERROR_SHARING_VIOLATION`: another handle on the file allows no write.
+const ERROR_SHARING_VIOLATION: i32 = 32;
+/// `ERROR_USER_MAPPED_FILE`: the file has a mapped section open.
+const ERROR_USER_MAPPED_FILE: i32 = 1224;
+
+/// Why replacing `canonical` failed. It says "in use" only for the codes that mean something holds
+/// the file open; every other failure is named by its own error.
+fn copy_failure(canonical: &Path, err: &std::io::Error) -> String {
+    let in_use = matches!(
+        err.raw_os_error(),
+        Some(ERROR_SHARING_VIOLATION | ERROR_USER_MAPPED_FILE)
+    );
+    if in_use {
+        format!(
+            "could not replace {}: {err}. It is in use although the agents of the logon task have exited, \
+             probably by an agent started by hand with `ssh-broker agent`; stop that agent and run apply again",
+            canonical.display()
+        )
+    } else {
+        format!("could not replace {}: {err}", canonical.display())
+    }
 }
 
 fn files_identical(a: &Path, b: &Path) -> bool {

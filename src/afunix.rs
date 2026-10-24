@@ -109,12 +109,99 @@ impl Listener {
         Ok(Listener { sock })
     }
 
-    pub fn accept(&self) -> anyhow::Result<Socket> {
-        let sock = self.sock.accept()?.0;
-        #[cfg(windows)]
-        set_no_inherit(&sock)?;
-        Ok(sock)
+    /// Accept one connection. A failure says what the caller should do about it: see
+    /// [`AcceptError`].
+    pub fn accept(&self) -> Result<Socket, AcceptError> {
+        finish_accept(self.sock.accept().map(|(sock, _)| sock), harden_accepted)
     }
+}
+
+/// Why `accept` failed, by what the serving loop should do next.
+#[derive(Debug)]
+pub enum AcceptError {
+    /// This one connection is lost (the peer dropped it while it queued, or it could not be set
+    /// up). The listener is fine, and each such failure consumed a connection, so a run of them is
+    /// bounded by the peers' own behaviour.
+    Connection(anyhow::Error),
+    /// A condition that may clear by itself (an interruption, a shortage of descriptors or
+    /// buffers) and may not. Nothing is consumed, so the caller must treat the same condition
+    /// twice running as the listener being broken.
+    Transient { code: Option<i32>, source: std::io::Error },
+    /// The listener is broken, or the failure is one `accept` is not documented to have.
+    Fatal(anyhow::Error),
+}
+
+impl std::fmt::Display for AcceptError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AcceptError::Connection(e) | AcceptError::Fatal(e) => write!(f, "{e:#}"),
+            AcceptError::Transient { source, .. } => write!(f, "{source}"),
+        }
+    }
+}
+
+impl std::error::Error for AcceptError {}
+
+/// Turn the outcome of the OS `accept` into a connection ready to hand out. A connection that
+/// cannot be hardened is never handed out: it would reach children of the brokered shell.
+fn finish_accept(
+    raw: std::io::Result<Socket>,
+    harden: impl FnOnce(&Socket) -> anyhow::Result<()>,
+) -> Result<Socket, AcceptError> {
+    match raw {
+        Ok(sock) => match harden(&sock) {
+            Ok(()) => Ok(sock),
+            Err(e) => Err(AcceptError::Connection(
+                e.context("could not stop an accepted connection being inherited; dropping it"),
+            )),
+        },
+        Err(e) => Err(classify_accept_error(e)),
+    }
+}
+
+/// Sort an `accept` failure by Winsock's documented causes: a peer that reset or aborted a queued
+/// connection is that connection's loss; an interruption or a shortage of descriptors or buffers
+/// is transient; everything else (not listening, not a socket, the network down) is a broken
+/// listener. `std` maps only some Winsock codes to a kind, so the transient ones go by code.
+fn classify_accept_error(e: std::io::Error) -> AcceptError {
+    use std::io::ErrorKind;
+    match e.kind() {
+        ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted => AcceptError::Connection(e.into()),
+        ErrorKind::Interrupted | ErrorKind::WouldBlock => AcceptError::Transient {
+            code: e.raw_os_error(),
+            source: e,
+        },
+        _ if is_transient_code(&e) => AcceptError::Transient {
+            code: e.raw_os_error(),
+            source: e,
+        },
+        _ => AcceptError::Fatal(e.into()),
+    }
+}
+
+/// The transient Winsock codes `std` has no kind for: `WSAEINTR` (the call was interrupted),
+/// `WSAEINPROGRESS` (a blocking call is in progress), `WSAEWOULDBLOCK`, `WSAEMFILE` (no descriptors
+/// left) and `WSAENOBUFS` (no buffer space).
+#[cfg(windows)]
+fn is_transient_code(e: &std::io::Error) -> bool {
+    use windows::Win32::Networking::WinSock::{WSAEINPROGRESS, WSAEINTR, WSAEMFILE, WSAENOBUFS, WSAEWOULDBLOCK};
+    [WSAEINTR, WSAEINPROGRESS, WSAEWOULDBLOCK, WSAEMFILE, WSAENOBUFS]
+        .iter()
+        .any(|code| e.raw_os_error() == Some(code.0))
+}
+
+#[cfg(not(windows))]
+fn is_transient_code(_: &std::io::Error) -> bool {
+    false
+}
+
+/// Stop a freshly accepted connection from being inherited by children.
+fn harden_accepted(sock: &Socket) -> anyhow::Result<()> {
+    #[cfg(windows)]
+    set_no_inherit(sock)?;
+    #[cfg(not(windows))]
+    let _ = sock;
+    Ok(())
 }
 
 /// Does the socket file at `path` grant exactly the current user, SYSTEM and Administrators?

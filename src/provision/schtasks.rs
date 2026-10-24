@@ -12,6 +12,8 @@
 //! `RunLevel=LeastPrivilege` (not Highest) keeps the plain token: elevation would re-arm
 //! RedirectionGuard (breaking symlink-traversal parity) and not match the folder ACL.
 
+use anyhow::Context;
+
 use super::report::Check;
 
 pub const AGENT_TASK: &str = "ssh-broker-agent";
@@ -113,9 +115,11 @@ pub fn query_task_argv(name: &str) -> Vec<String> {
     vec!["/Query".into(), "/TN".into(), name.into(), "/XML".into()]
 }
 
-/// A task is registered iff the query succeeded and returned a task definition.
-pub fn parse_query_registered(stdout: &str, exit_ok: bool) -> bool {
-    exit_ok && stdout.contains("<Task")
+/// What `apply` takes from the query of the agent task: its XML, or `None` if there is no such
+/// task. A query that could not be answered (access denied, the service down) is an error: taking
+/// it for "not registered" would skip the migration and the restart after a failed apply.
+pub fn registered_xml(query: anyhow::Result<Option<String>>) -> anyhow::Result<Option<String>> {
+    query.with_context(|| format!("could not tell whether the {AGENT_TASK} task is registered"))
 }
 
 /// Whether a queried task XML is the group logon task [`agent_task_xml`] makes: a principal in
@@ -131,10 +135,15 @@ pub fn xml_is_group_logon_task(query_xml: &str) -> bool {
     squeezed.contains(&group) && (squeezed.contains("<logontrigger>") || squeezed.contains("<logontrigger/>"))
 }
 
-/// The `agent task` row of `verify`, from the query's output and whether the query succeeded.
-pub fn agent_task_row(query_xml: &str, query_ok: bool) -> Check {
-    let registered = parse_query_registered(query_xml, query_ok);
-    let group = xml_is_group_logon_task(query_xml);
+/// The `agent task` row of `verify`, from the query of the task's XML: `Ok(None)` if there is no
+/// such task, and the cause if the query could not be answered.
+pub fn agent_task_row(query: &anyhow::Result<Option<String>>) -> Check {
+    let xml = match query {
+        Ok(xml) => xml.as_deref(),
+        Err(e) => return Check::new("agent task", false, format!("could not query the task: {e:#}")),
+    };
+    let registered = xml.is_some();
+    let group = xml.is_some_and(xml_is_group_logon_task);
     let detail = if registered && !group {
         "registered=true group_logon_task=false: a per-user task from an earlier install; run `apply` elevated to \
          replace it"

@@ -120,9 +120,9 @@ fn trusted_base_gate_does_not_run_the_action_on_an_untrusted_base() {
 fn a_clean_base_has_no_legacy_artifacts() {
     let base = TempBase::existing("legacy-clean");
     let layout = base.layout();
-    let found = legacy_artifacts(&forged(&layout), None);
+    let found = legacy_artifacts(&forged(&layout), None).unwrap();
     assert!(!found.any());
-    let found = legacy_artifacts(&forged(&layout), Some(&agent_task_xml(r"C:\x.exe")));
+    let found = legacy_artifacts(&forged(&layout), Some(&agent_task_xml(r"C:\x.exe"))).unwrap();
     assert!(!found.any(), "the group-form task is the current one, not a legacy one");
 }
 
@@ -130,7 +130,7 @@ fn a_clean_base_has_no_legacy_artifacts() {
 fn legacy_is_detected_from_the_config_alone() {
     let base = TempBase::existing("legacy-config");
     std::fs::write(base.0.join("config.toml"), "x").unwrap();
-    let found = legacy_artifacts(&forged(&base.layout()), None);
+    let found = legacy_artifacts(&forged(&base.layout()), None).unwrap();
     assert!(found.any() && found.config && !found.socket_dir && !found.task);
 }
 
@@ -138,7 +138,7 @@ fn legacy_is_detected_from_the_config_alone() {
 fn legacy_is_detected_from_the_socket_dir_alone() {
     let base = TempBase::existing("legacy-sdir");
     std::fs::create_dir(base.0.join("s")).unwrap();
-    let found = legacy_artifacts(&forged(&base.layout()), None);
+    let found = legacy_artifacts(&forged(&base.layout()), None).unwrap();
     assert!(found.any() && found.socket_dir && !found.config && !found.task);
 }
 
@@ -147,8 +147,29 @@ fn legacy_is_detected_from_a_per_user_task_alone() {
     // A half-finished earlier migration or a manual cleanup can leave only the old task, and with
     // it a running legacy agent. No config and no `s\`: the task is what says so.
     let base = TempBase::existing("legacy-task");
-    let found = legacy_artifacts(&forged(&base.layout()), Some(LEGACY_TASK_XML));
+    let found = legacy_artifacts(&forged(&base.layout()), Some(LEGACY_TASK_XML)).unwrap();
     assert!(found.any() && found.task && !found.config && !found.socket_dir);
+}
+
+#[test]
+fn a_legacy_path_that_cannot_be_inspected_is_an_error_naming_it_not_an_absent_one() {
+    // Only NotFound means absent. Any other failure (here an invalid path, in life an access
+    // error) leaves the question open, and a migration that guesses "absent" skips the cleanup.
+    let layout = Layout {
+        base: PathBuf::from("C:\\ssh-broker\0unusable"),
+    };
+    let err = format!("{:#}", legacy_artifacts(&forged(&layout), None).unwrap_err());
+    assert!(err.contains("config.toml"), "{err}");
+}
+
+#[test]
+fn only_not_found_counts_as_absent() {
+    let base = TempBase::existing("present");
+    std::fs::write(base.0.join("here"), "x").unwrap();
+    assert!(present(&base.0.join("here")).unwrap());
+    assert!(!present(&base.0.join("missing")).unwrap());
+    // A NUL in the path is a different failure from NotFound.
+    assert!(present(&base.0.join("bad\0name")).is_err());
 }
 
 // Removing the legacy artifacts ----------------------------------------------------------
@@ -159,13 +180,13 @@ fn remove_legacy_deletes_the_old_socket_dir_and_config() {
     plant_legacy(&base);
     let layout = base.layout();
     let base_ref = forged(&layout);
-    let found = legacy_artifacts(&base_ref, None);
+    let found = legacy_artifacts(&base_ref, None).unwrap();
     assert!(found.config && found.socket_dir, "control");
 
     remove_legacy(&base_ref, &found).unwrap();
 
     assert!(names_in(&base.0).is_empty(), "{:?}", names_in(&base.0));
-    assert!(!legacy_artifacts(&base_ref, None).any());
+    assert!(!legacy_artifacts(&base_ref, None).unwrap().any());
 }
 
 #[test]
@@ -187,7 +208,7 @@ fn remove_legacy_leaves_exe_logs_and_other_files() {
     let layout = base.layout();
     let base_ref = forged(&layout);
 
-    remove_legacy(&base_ref, &legacy_artifacts(&base_ref, None)).unwrap();
+    remove_legacy(&base_ref, &legacy_artifacts(&base_ref, None).unwrap()).unwrap();
 
     assert_eq!(names_in(&base.0), ["logs", "ssh-broker.exe"]);
     assert_eq!(names_in(&base.0.join("logs")), ["shim.log"]);
@@ -354,6 +375,52 @@ fn prepare_in_fails_when_the_exe_is_still_in_use_after_the_stop() {
     assert!(err.contains("in use"), "{err}");
     assert!(err.contains("started by hand"), "{err}");
     assert!(err.contains("ssh-broker.exe"), "{err}");
+}
+
+#[test]
+fn a_copy_stopped_by_a_sharing_violation_is_called_in_use() {
+    for code in [32, 1224] {
+        let msg = copy_failure(
+            Path::new(r"C:\x\ssh-broker.exe"),
+            &std::io::Error::from_raw_os_error(code),
+        );
+        assert!(msg.contains("in use"), "{msg}");
+        assert!(msg.contains("started by hand"), "{msg}");
+        assert!(msg.contains(&format!("os error {code}")), "{msg}");
+    }
+}
+
+#[test]
+fn a_copy_that_failed_for_another_reason_is_reported_by_its_error_not_as_in_use() {
+    // 5: access denied; 112: disk full.
+    for code in [5, 112] {
+        let msg = copy_failure(
+            Path::new(r"C:\x\ssh-broker.exe"),
+            &std::io::Error::from_raw_os_error(code),
+        );
+        assert!(!msg.contains("in use"), "{msg}");
+        assert!(!msg.contains("started by hand"), "{msg}");
+        assert!(msg.contains(&format!("os error {code}")), "{msg}");
+        assert!(msg.contains("ssh-broker.exe"), "{msg}");
+    }
+}
+
+#[test]
+fn prepare_in_reports_a_failed_copy_by_its_cause() {
+    // The destination is a directory: the copy fails, but not because anything holds it open.
+    let base = TempBase::existing("prepare-copy-fails");
+    let source = new_exe(&base, "new build");
+    let layout = base.layout();
+    std::fs::create_dir(layout.canonical_exe()).unwrap();
+
+    let err = format!(
+        "{:#}",
+        prepare_in(&forged(&layout), &source, None, || Ok(())).unwrap_err()
+    );
+
+    assert!(err.contains("ssh-broker.exe"), "{err}");
+    assert!(err.contains("os error"), "{err}");
+    assert!(!err.contains("in use"), "{err}");
 }
 
 #[test]

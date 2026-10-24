@@ -22,29 +22,38 @@ pub fn socket_location_row(location: &anyhow::Result<SocketLocation>) -> Check {
 
 /// `socket dir ACL`: the socket folder grants exactly this account, SYSTEM and Administrators.
 pub fn socket_dir_row(location: &anyhow::Result<SocketLocation>, user: &Sid) -> Check {
-    const NAME: &str = "socket dir ACL";
     let Ok(loc) = location else {
-        return Check::new(NAME, false, "no socket location");
+        return Check::new("socket dir ACL", false, "no socket location");
     };
-    if !loc.dir.exists() {
-        return Check::new(
-            NAME,
-            false,
-            format!("{} does not exist: no agent has made it yet", loc.dir.display()),
-        );
+    dir_row("socket dir ACL", &loc.dir, "no agent has made it yet", user)
+}
+
+/// `log folder`: the folder the shim and the agent log into grants exactly this account, SYSTEM
+/// and Administrators. If it is missing or wrong, the shim and the agent run without a log, and
+/// nothing else says so.
+pub fn log_folder_row(location: &anyhow::Result<SocketLocation>, user: &Sid) -> Check {
+    let Ok(loc) = location else {
+        return Check::new("log folder", false, "no socket location");
+    };
+    dir_row("log folder", &loc.logs_dir(), "no log is being written", user)
+}
+
+fn dir_row(name: &'static str, dir: &std::path::Path, absent_means: &str, user: &Sid) -> Check {
+    if !dir.exists() {
+        return Check::new(name, false, format!("{} does not exist: {absent_means}", dir.display()));
     }
-    match acl::verify_dir_acl(&loc.dir, user) {
-        Ok(true) => Check::new(NAME, true, format!("grantee={}", user.describe())),
+    match acl::verify_dir_acl(dir, user) {
+        Ok(true) => Check::new(name, true, format!("grantee={}", user.describe())),
         Ok(false) => Check::new(
-            NAME,
+            name,
             false,
             format!(
                 "{} does not grant exactly {}, SYSTEM and Administrators",
-                loc.dir.display(),
+                dir.display(),
                 user.describe()
             ),
         ),
-        Err(e) => Check::new(NAME, false, format!("{e:#}")),
+        Err(e) => Check::new(name, false, format!("{e:#}")),
     }
 }
 

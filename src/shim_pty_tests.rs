@@ -231,7 +231,14 @@ fn too_long() -> anyhow::Error {
 #[test]
 fn unresolvable_socket_location_fails_open_with_the_reason() {
     let mut stderr = Vec::new();
-    let relayed = super::try_relay_at(Err(too_long()), &Some("echo hi".into()), &mut stderr, std::io::empty()).unwrap();
+    let relayed = super::try_relay_at(
+        Err(too_long()),
+        &Some("echo hi".into()),
+        &mut stderr,
+        None,
+        std::io::empty(),
+    )
+    .unwrap();
 
     assert_eq!(
         relayed, None,
@@ -248,7 +255,7 @@ fn location_error_reaches_stderr_in_pty_mode() {
     // fallback shell corrupts nothing. The log is no substitute: for an interactive session it is
     // the only other place the reason goes, and the user does not read it.
     let mut stderr = Vec::new();
-    let relayed = super::try_relay_at(Err(too_long()), &None, &mut stderr, std::io::empty()).unwrap();
+    let relayed = super::try_relay_at(Err(too_long()), &None, &mut stderr, None, std::io::empty()).unwrap();
 
     assert_eq!(relayed, None);
     let text = String::from_utf8(stderr).unwrap();
@@ -273,7 +280,14 @@ fn connect_failure_in_the_callers_own_dir_fails_open_without_a_reason_on_stderr(
         dir: dir.clone(),
     };
     let mut stderr = Vec::new();
-    let relayed = super::try_relay_at(Ok(location), &Some("echo hi".into()), &mut stderr, std::io::empty()).unwrap();
+    let relayed = super::try_relay_at(
+        Ok(location),
+        &Some("echo hi".into()),
+        &mut stderr,
+        None,
+        std::io::empty(),
+    )
+    .unwrap();
 
     assert_eq!(relayed, None);
     assert_eq!(
@@ -294,25 +308,22 @@ fn connect_failure_in_pty_mode_writes_nothing_to_stderr() {
         dir: dir.clone(),
     };
     let mut stderr = Vec::new();
-    let relayed = super::try_relay_at(Ok(location), &None, &mut stderr, std::io::empty()).unwrap();
+    let relayed = super::try_relay_at(Ok(location), &None, &mut stderr, None, std::io::empty()).unwrap();
 
     assert_eq!(relayed, None);
     assert!(stderr.is_empty());
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-#[test]
-fn try_relay_connects_to_the_location_its_provider_names() {
-    use crate::afunix::{self, Listener};
+/// A fake agent that answers the first connection's handshake and stdin-EOF marker with `Exit(code)`
+/// and returns the handshake it was sent.
+fn fake_agent_exiting_with(
+    listener: crate::afunix::Listener,
+    code: i32,
+) -> std::thread::JoinHandle<crate::protocol::Handshake> {
+    use crate::afunix;
     use crate::protocol::{ExitCode, FrameKind, FrameReader, Handshake, Stream, read_one_frame, write_frame};
-    // `run_on` hands `try_relay` the token's profile location. What `try_relay` must do with it
-    // is use it and nothing else: a path it worked out from the environment would miss this
-    // listener, which sits in a profile no environment variable names.
-    let profile = crate::test_support::TempProfile::new("shim-wiring");
-    let location = profile.location();
-    crate::userdir::ensure_socket_dir(&location, &crate::acl::Sid::current_user().unwrap()).unwrap();
-    let listener = Listener::bind(&location.path).unwrap();
-    let agent = std::thread::spawn(move || {
+    std::thread::spawn(move || {
         let (mut rx, mut tx) = afunix::split(listener.accept().unwrap()).unwrap();
         let mut frames = FrameReader::new();
         let frame = read_one_frame(&mut rx, &mut frames).unwrap();
@@ -324,11 +335,24 @@ fn try_relay_connects_to_the_location_its_provider_names() {
             (eof.kind, eof.payload.as_slice()),
             (FrameKind::Data, &[Stream::Stdin as u8][..])
         );
-        write_frame(&mut tx, FrameKind::Exit, &ExitCode(7).encode()).unwrap();
+        write_frame(&mut tx, FrameKind::Exit, &ExitCode(code).encode()).unwrap();
         Handshake::decode(&frame.payload).unwrap()
-    });
+    })
+}
 
-    let relayed = super::try_relay(&Some("echo hi".into()), || Ok(location), std::io::empty()).unwrap();
+#[test]
+fn try_relay_connects_to_the_location_its_provider_names() {
+    use crate::afunix::Listener;
+    // `run_on` hands `try_relay` the token's profile location. What `try_relay` must do with it
+    // is use it and nothing else: a path it worked out from the environment would miss this
+    // listener, which sits in a profile no environment variable names.
+    let profile = crate::test_support::TempProfile::new("shim-wiring");
+    let location = profile.location();
+    crate::userdir::ensure_socket_dir(&location, &crate::acl::Sid::current_user().unwrap()).unwrap();
+    let listener = Listener::bind(&location.path).unwrap();
+    let agent = fake_agent_exiting_with(listener, 7);
+
+    let relayed = super::try_relay(&Some("echo hi".into()), || Ok(location), None, std::io::empty()).unwrap();
 
     assert_eq!(
         relayed,
@@ -336,4 +360,74 @@ fn try_relay_connects_to_the_location_its_provider_names() {
         "the shim reached the listener at the provided location"
     );
     assert_eq!(agent.join().unwrap().command.as_deref(), Some("echo hi"));
+}
+
+// A log that could not be set up -----
+
+#[test]
+fn a_failed_log_is_named_where_the_shim_already_explains_a_fallback_for_a_command() {
+    let dir = std::env::temp_dir().join(format!("sb-shim-nolog-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let location = SocketLocation {
+        path: dir.join("agent.sock"),
+        dir: dir.clone(),
+    };
+    let mut stderr = Vec::new();
+    let cause = "the folder belongs to someone else";
+    let relayed = super::try_relay_at(
+        Ok(location),
+        &Some("echo hi".into()),
+        &mut stderr,
+        Some(cause),
+        std::io::empty(),
+    )
+    .unwrap();
+
+    assert_eq!(relayed, None);
+    let text = String::from_utf8(stderr).unwrap();
+    assert!(text.starts_with("ssh-broker: agent unavailable"), "{text}");
+    assert!(text.contains(cause), "the cause of the missing log is named: {text}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_failed_log_adds_nothing_to_an_interactive_fallback_that_prints_nothing_today() {
+    // In PTY mode a connect failure writes nothing to stderr (it could corrupt the stream the relay
+    // may yet use); a missing log does not change that.
+    let dir = std::env::temp_dir().join(format!("sb-shim-nolog-pty-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let location = SocketLocation {
+        path: dir.join("agent.sock"),
+        dir: dir.clone(),
+    };
+    let mut stderr = Vec::new();
+    let relayed = super::try_relay_at(Ok(location), &None, &mut stderr, Some("no log"), std::io::empty()).unwrap();
+
+    assert_eq!(relayed, None);
+    assert!(stderr.is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_failed_log_does_not_touch_the_stderr_of_a_relayed_command() {
+    // The diagnostics buffer is the shim's own; a relayed command's stderr is the command's.
+    use crate::afunix::Listener;
+    let profile = crate::test_support::TempProfile::new("shim-nolog-relay");
+    let location = profile.location();
+    crate::userdir::ensure_socket_dir(&location, &crate::acl::Sid::current_user().unwrap()).unwrap();
+    let agent = fake_agent_exiting_with(Listener::bind(&location.path).unwrap(), 0);
+    let mut stderr = Vec::new();
+
+    let relayed = super::try_relay_at(
+        Ok(location),
+        &Some("echo hi".into()),
+        &mut stderr,
+        Some("no log"),
+        std::io::empty(),
+    )
+    .unwrap();
+
+    assert_eq!(relayed, Some(0));
+    assert!(stderr.is_empty(), "{}", String::from_utf8_lossy(&stderr));
+    agent.join().unwrap();
 }

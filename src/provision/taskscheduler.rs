@@ -7,17 +7,25 @@
 //! logon. And `schtasks /End` is the only CLI way to stop instances, which a migration needs
 //! before it replaces the exe a running legacy agent holds open; COM does it without parsing text.
 //!
+//! Stopping is more than `Stop`: the call returns before the processes are gone, so it also waits
+//! for them (see [`procwait`]), and it disables the task meanwhile so that no logon starts a fresh
+//! agent from the exe about to be replaced.
+//!
 //! Each call initialises COM on the calling thread and uninitialises it before returning, so the
 //! caller needs no COM state and must be a plain thread (not one already in another COM mode).
 
+use std::path::Path;
+
 use anyhow::Context;
-use windows::Win32::Foundation::ERROR_FILE_NOT_FOUND;
+use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, S_FALSE, S_OK};
 use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize,
 };
 use windows::Win32::System::TaskScheduler::{IRegisteredTask, ITaskService, TASK_RUN_USE_SESSION_ID, TaskScheduler};
 use windows::Win32::System::Variant::VARIANT;
-use windows::core::{BSTR, HRESULT};
+use windows::core::{BSTR, HRESULT, Interface};
+
+use super::procwait::{self, Process};
 
 /// `SCHED_E_TASK_NOT_RUNNING`: `Stop` on a task with no running instance.
 const SCHED_E_TASK_NOT_RUNNING: HRESULT = HRESULT(0x8004130Bu32 as i32);
@@ -72,19 +80,115 @@ fn registered_task(service: &ITaskService, name: &str) -> anyhow::Result<Option<
     }
 }
 
-/// Stop every running instance of `task_name`. A task that does not exist, or has no running
-/// instance, is not an error: there is nothing to stop.
-pub fn stop_instances(task_name: &str) -> anyhow::Result<()> {
+/// The XML definition of the task `name`, or `None` if there is no such task. A query that could
+/// not be answered (access denied, the service unreachable) is an error, never `None`.
+pub fn task_xml(name: &str) -> anyhow::Result<Option<String>> {
+    let _com = Com::init()?;
+    let service = connect()?;
+    let Some(task) = registered_task(&service, name)? else {
+        return Ok(None);
+    };
+    // SAFETY: `task` is a live interface on this thread.
+    let xml = unsafe { task.Xml() }.with_context(|| format!("read the definition of the task {name}"))?;
+    Ok(Some(xml.to_string()))
+}
+
+/// Enable or disable the task `name`. A task that does not exist has nothing to change and is not
+/// an error, as in [`stop_instances`].
+pub fn set_enabled(name: &str, enabled: bool) -> anyhow::Result<()> {
+    let _com = Com::init()?;
+    let service = connect()?;
+    let Some(task) = registered_task(&service, name)? else {
+        return Ok(());
+    };
+    set_task_enabled(&task, name, enabled)
+}
+
+fn set_task_enabled(task: &IRegisteredTask, name: &str, enabled: bool) -> anyhow::Result<()> {
+    // SAFETY: `task` is a live interface on this thread; `SetEnabled` takes a plain boolean.
+    unsafe { task.SetEnabled(enabled.into()) }
+        .with_context(|| format!("{} the task {name}", if enabled { "enable" } else { "disable" }))
+}
+
+/// Stop every running instance of `task_name` and return once the process of each has exited. A
+/// task that does not exist, or has no running instance, is not an error: there is nothing to stop.
+///
+/// `image` is the exe the task runs. The task is left **disabled**, so that no logon can start an
+/// agent from the old exe before the caller has replaced it; the caller enables it again with
+/// [`set_enabled`] (registering the task afresh does so too).
+pub fn stop_instances(task_name: &str, image: &Path) -> anyhow::Result<()> {
     let _com = Com::init()?;
     let service = connect()?;
     let Some(task) = registered_task(&service, task_name)? else {
         return Ok(());
     };
-    // SAFETY: `task` is a live interface on this thread; `Stop` takes no pointers.
-    match unsafe { task.Stop(0) } {
-        Ok(()) => Ok(()),
-        Err(e) if e.code() == SCHED_E_TASK_NOT_RUNNING => Ok(()),
-        Err(e) => Err(e).with_context(|| format!("stop the running instances of {task_name}")),
+    stop_and_wait(
+        || set_task_enabled(&task, task_name, false),
+        || running_processes(&task, image),
+        // SAFETY: `task` is a live interface on this thread; `Stop` takes no pointers. The raw
+        // vtable call keeps the HRESULT, which the generated wrapper turns into `Ok` for S_FALSE.
+        || {
+            stop_outcome(task_name, unsafe {
+                (Interface::vtable(&task).Stop)(Interface::as_raw(&task), 0)
+            })
+        },
+        |processes| procwait::wait_all_exited(&processes, procwait::EXIT_BOUND),
+    )
+}
+
+/// The steps of a stop, in the only order that is safe. Disabled first, so the logon trigger cannot
+/// start an agent from the old exe meanwhile; listed before the stop, because the instances are
+/// gone afterwards; waited for last, so the caller goes on only when every process has exited.
+fn stop_and_wait<P>(
+    disable: impl FnOnce() -> anyhow::Result<()>,
+    list: impl FnOnce() -> anyhow::Result<Vec<P>>,
+    stop: impl FnOnce() -> anyhow::Result<()>,
+    wait: impl FnOnce(Vec<P>) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    disable()?;
+    let processes = list()?;
+    stop()?;
+    wait(processes)
+}
+
+/// The processes of the running instances of `task` that run `image`. An instance whose process is
+/// gone, or is not `image`, has nothing to wait for.
+fn running_processes(task: &IRegisteredTask, image: &Path) -> anyhow::Result<Vec<Process>> {
+    // SAFETY: `task` and the interfaces taken from it are live and used on this thread only.
+    unsafe {
+        let instances = task.GetInstances(0).context("list the running instances")?;
+        let count = instances.Count().context("count the running instances")?;
+        let mut found = Vec::new();
+        // The collection is indexed from 1.
+        for index in 1..=count {
+            let instance = instances
+                .get_Item(&VARIANT::from(index))
+                .with_context(|| format!("read running instance {index}"))?;
+            let pid = instance.EnginePID().context("read the process of a running instance")?;
+            if pid == 0 {
+                continue;
+            }
+            found.extend(procwait::open_if_image(pid, image)?);
+        }
+        Ok(found)
+    }
+}
+
+/// What `Stop` returned. `S_FALSE` is a success code ("the user cannot successfully stop instances
+/// of the task") and means nothing was stopped; only `S_OK`, or a task with nothing running, is
+/// a stop.
+fn stop_outcome(task_name: &str, code: HRESULT) -> anyhow::Result<()> {
+    if code == S_OK || code == SCHED_E_TASK_NOT_RUNNING {
+        Ok(())
+    } else if code == S_FALSE {
+        anyhow::bail!("the current user cannot stop the running instances of {task_name} (Stop returned S_FALSE)")
+    } else if code.is_err() {
+        Err(windows::core::Error::from(code)).with_context(|| format!("stop the running instances of {task_name}"))
+    } else {
+        anyhow::bail!(
+            "stopping {task_name} returned the unexpected success code {:#010x}",
+            code.0
+        )
     }
 }
 

@@ -5,9 +5,12 @@
 //! - [`SessionSlot`]: is there already an agent in *this session*? `apply` and the boot
 //!   self-heal start an agent per logged-on session each time they run; the logon task starts
 //!   one per logon. A second agent in a session that has one has nothing to add, so it exits.
-//!   The slot is a lock on a per-session file in the user's verified private folder, not a named
+//!   The slot is a byte-range lock on a file in the user's verified private folder, not a named
 //!   kernel object: any process in the session could create such an object first, whatever
 //!   account it runs as, and only the user, SYSTEM and Administrators can create a file here.
+//!   Every session of the user locks its own byte (the session id) of one file, so session ids
+//!   that grow until reboot add no files, and there is no file to delete while another agent
+//!   might be opening it.
 //! - [`UserLock`]: is there already an agent for *this user* in another session? One user can be
 //!   logged on twice (console and RDP). Only one agent can own the socket, and the other must not
 //!   leave: the owner lives and dies with its session, and the user may still be logged on in the
@@ -36,14 +39,15 @@ pub fn session_allows_agent(id: u32) -> bool {
 /// The right to be the one agent of this session. Held until dropped.
 #[derive(Debug)]
 pub struct SessionSlot {
-    _lock: UserLock,
+    _file: File,
 }
 
 impl SessionSlot {
-    /// Take the slot, a lock on `path`, the session's file in the user's folder. `None` if another
-    /// agent in this session holds it.
-    pub fn try_acquire(path: &Path) -> anyhow::Result<Option<SessionSlot>> {
-        Ok(UserLock::try_acquire(path)?.map(|_lock| SessionSlot { _lock }))
+    /// Take the slot of `session`: the byte at offset `session` of `path`, the user's file for
+    /// all sessions. `None` if another agent in this session holds it. A lock past the end of the
+    /// file is valid, so the file itself stays empty.
+    pub fn try_acquire(path: &Path, session: u32) -> anyhow::Result<Option<SessionSlot>> {
+        Ok(try_lock(path, u64::from(session))?.map(|_file| SessionSlot { _file }))
     }
 }
 
@@ -59,12 +63,7 @@ impl UserLock {
     /// other failure, including a sharing violation from a handle that does not hold it (a
     /// scanner, the indexer), is an error, not proof that someone else serves.
     pub fn try_acquire(path: &Path) -> anyhow::Result<Option<UserLock>> {
-        let file = open(path)?;
-        match lock(&file, LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY) {
-            Ok(()) => Ok(Some(UserLock { _file: file })),
-            Err(e) if e.code() == HRESULT::from_win32(ERROR_LOCK_VIOLATION.0) => Ok(None),
-            Err(e) => Err(e).with_context(|| format!("lock {}", path.display())),
-        }
+        Ok(try_lock(path, 0)?.map(|_file| UserLock { _file }))
     }
 
     /// Take the lock, waiting for it if another handle holds it. `on_wait` runs once, after the
@@ -73,12 +72,12 @@ impl UserLock {
     /// another agent that exists, so there is nothing to time out on; it ends when the holder dies.
     pub fn acquire(path: &Path, on_wait: impl FnOnce()) -> anyhow::Result<UserLock> {
         let file = open(path)?;
-        match lock(&file, LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY) {
+        match lock(&file, LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY, 0) {
             Ok(()) => return Ok(UserLock { _file: file }),
             Err(e) if e.code() == HRESULT::from_win32(ERROR_LOCK_VIOLATION.0) => on_wait(),
             Err(e) => return Err(e).with_context(|| format!("lock {}", path.display())),
         }
-        lock(&file, LOCKFILE_EXCLUSIVE_LOCK).with_context(|| format!("lock {}", path.display()))?;
+        lock(&file, LOCKFILE_EXCLUSIVE_LOCK, 0).with_context(|| format!("lock {}", path.display()))?;
         Ok(UserLock { _file: file })
     }
 }
@@ -95,9 +94,23 @@ fn open(path: &Path) -> anyhow::Result<File> {
         .with_context(|| format!("open {}", path.display()))
 }
 
-fn lock(file: &File, flags: LOCK_FILE_FLAGS) -> windows::core::Result<()> {
+/// Open `path` and take the byte at `offset` without waiting: the open file if it was free, `None`
+/// if another handle holds it. Any other failure, including a sharing violation from a handle that
+/// does not hold it (a scanner, the indexer), is an error, not proof that someone else serves.
+fn try_lock(path: &Path, offset: u64) -> anyhow::Result<Option<File>> {
+    let file = open(path)?;
+    match lock(&file, LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY, offset) {
+        Ok(()) => Ok(Some(file)),
+        Err(e) if e.code() == HRESULT::from_win32(ERROR_LOCK_VIOLATION.0) => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("lock {}", path.display())),
+    }
+}
+
+fn lock(file: &File, flags: LOCK_FILE_FLAGS, offset: u64) -> windows::core::Result<()> {
     let mut overlapped = OVERLAPPED::default();
-    // SAFETY: the handle is open for the life of `file`; one byte at offset 0, and a synchronous
+    overlapped.Anonymous.Anonymous.Offset = offset as u32;
+    overlapped.Anonymous.Anonymous.OffsetHigh = (offset >> 32) as u32;
+    // SAFETY: the handle is open for the life of `file`; one byte at `offset`, and a synchronous
     // handle makes the exclusive form block until the range is free.
     unsafe { LockFileEx(HANDLE(file.as_raw_handle()), flags, None, 1, 0, &mut overlapped) }
 }

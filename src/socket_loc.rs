@@ -15,6 +15,7 @@ pub const MAX_SOCKET_PATH_BYTES: usize = 107;
 pub const SOCKET_DIR_NAME: &str = "ssh-broker";
 pub const SOCKET_FILE_NAME: &str = "agent.sock";
 pub const LOCK_FILE_NAME: &str = "agent.lock";
+pub const SESSIONS_LOCK_FILE_NAME: &str = "sessions.lock";
 pub const LOGS_DIR_NAME: &str = "logs";
 
 /// A user's socket directory and the socket inside it.
@@ -30,9 +31,10 @@ impl SocketLocation {
         self.dir.join(LOCK_FILE_NAME)
     }
 
-    /// The lock file that makes an agent the one agent of session `session`.
-    pub fn session_lock_path(&self, session: u32) -> PathBuf {
-        self.dir.join(format!("session-{session}.lock"))
+    /// The one file in which each session of the user locks its own byte, which makes an agent the
+    /// one agent of its session.
+    pub fn sessions_lock_path(&self) -> PathBuf {
+        self.dir.join(SESSIONS_LOCK_FILE_NAME)
     }
 
     /// The folder the shim and the agent log into.

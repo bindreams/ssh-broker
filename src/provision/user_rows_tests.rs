@@ -93,6 +93,61 @@ fn socket_dir_row_fails_when_there_is_no_location() {
     assert!(row.detail.contains("no socket location"), "{}", row.detail);
 }
 
+// log folder --------------------------------------------------------------------------------
+
+#[test]
+fn log_folder_row_passes_for_this_users_hardened_logs_folder() {
+    let profile = TempProfile::new("row-log-ok");
+    ensure_socket_dir(&profile.location(), &me()).unwrap();
+
+    let row = log_folder_row(&Ok(profile.location()), &me());
+
+    assert!(row.pass, "{}", row.detail);
+}
+
+#[test]
+fn log_folder_row_names_the_folder_when_there_is_none() {
+    // Neither the agent nor the shim has made it yet, or the shim could not: either way nothing
+    // is being logged, and the row says where the log would go.
+    let profile = TempProfile::new("row-log-absent");
+    let loc = profile.location();
+
+    let row = log_folder_row(&Ok(loc.clone()), &me());
+
+    assert!(!row.pass);
+    assert!(
+        row.detail.contains(&loc.logs_dir().display().to_string()),
+        "{}",
+        row.detail
+    );
+    assert!(row.detail.contains("does not exist"), "{}", row.detail);
+}
+
+#[test]
+fn log_folder_row_fails_for_a_widened_logs_folder() {
+    let profile = TempProfile::new("row-log-wide");
+    let loc = profile.location();
+    ensure_socket_dir(&loc, &me()).unwrap();
+    let status = std::process::Command::new("icacls")
+        .arg(loc.logs_dir())
+        .args(["/grant", "*S-1-1-0:(OI)(CI)F"])
+        .status()
+        .unwrap();
+    assert!(status.success());
+
+    let row = log_folder_row(&Ok(loc), &me());
+
+    assert!(!row.pass);
+    assert!(row.detail.contains("does not grant exactly"), "{}", row.detail);
+}
+
+#[test]
+fn log_folder_row_fails_when_there_is_no_location() {
+    let row = log_folder_row(&too_long_location(), &me());
+    assert!(!row.pass);
+    assert!(row.detail.contains("no socket location"), "{}", row.detail);
+}
+
 // socket file ACL ---------------------------------------------------------------------------
 
 #[test]

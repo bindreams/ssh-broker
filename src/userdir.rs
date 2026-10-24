@@ -47,13 +47,23 @@ pub fn socket_location_of_token(token: HANDLE) -> anyhow::Result<SocketLocation>
     Ok(socket_loc::for_profile(&profile)?)
 }
 
-/// The socket location of the account this process runs as.
-pub fn current_socket_location() -> anyhow::Result<SocketLocation> {
+/// A `TOKEN_QUERY` handle on this process's token.
+fn own_token() -> anyhow::Result<OwnedHandle> {
     let mut token = HANDLE::default();
     // SAFETY: `token` is a valid out-pointer; the handle is closed by `OwnedHandle`.
     unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) }.context("open the process token")?;
-    let token = OwnedHandle(token);
-    socket_location_of_token(token.0)
+    Ok(OwnedHandle(token))
+}
+
+/// The profile directory of the account this process runs as, from its token and not from the
+/// environment.
+pub fn current_profile_dir() -> anyhow::Result<PathBuf> {
+    profile_dir_of_token(own_token()?.0)
+}
+
+/// The socket location of the account this process runs as.
+pub fn current_socket_location() -> anyhow::Result<SocketLocation> {
+    socket_location_of_token(own_token()?.0)
 }
 
 /// Create `loc.dir` and its `logs` folder if they are missing, and leave both exactly

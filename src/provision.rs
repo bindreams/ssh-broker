@@ -14,6 +14,8 @@ mod flow;
 #[cfg(windows)]
 pub(crate) mod layout;
 pub mod probe;
+#[cfg(windows)]
+pub(crate) mod procwait;
 pub mod registry;
 pub mod report;
 pub mod schtasks;
@@ -119,12 +121,13 @@ mod imp {
         //    fail-open can't help if sshd execs a missing binary. The install directory is gated
         //    first, so a planted one is never adopted, and a single-user install is replaced. A
         //    different build over an installed one stops every agent first (they hold the exe
-        //    open); they start again afterwards, even if a later step fails.
+        //    open) and waits for them to exit, with the logon task disabled so that no logon
+        //    starts one from the old exe meanwhile; the task is enabled and the agents start again
+        //    afterwards, even if a later step fails.
         let current = std::env::current_exe().context("current_exe")?;
-        let (agent_xml, agent_ok) = query_schtasks(&schtasks::query_task_argv(schtasks::AGENT_TASK));
-        let registered_xml = schtasks::parse_query_registered(&agent_xml, agent_ok).then_some(agent_xml);
+        let registered_xml = schtasks::registered_xml(taskscheduler::task_xml(schtasks::AGENT_TASK))?;
         let exe = flow::run(
-            || taskscheduler::stop_instances(schtasks::AGENT_TASK),
+            || taskscheduler::stop_instances(schtasks::AGENT_TASK, &layout.canonical_exe()),
             |stop_agents| {
                 let exe = layout::prepare(&layout, &current, registered_xml.as_deref(), stop_agents)?;
 
@@ -146,6 +149,7 @@ mod imp {
                 Ok(exe)
             },
             agent_task_is_group_form,
+            enable_agent_task,
             start_agents,
         )?;
         println!(
@@ -158,9 +162,25 @@ mod imp {
     /// Whether the registered agent task is the group logon task, the form that can start an agent
     /// in any session. An older single-user task cannot, so a failed `apply` that stopped agents
     /// does not run it.
+    ///
+    /// A query that cannot be answered counts as "no": starting through a task of unknown form
+    /// could start the single-user agent this migration is replacing.
     fn agent_task_is_group_form() -> bool {
-        let (xml, ok) = query_schtasks(&schtasks::query_task_argv(schtasks::AGENT_TASK));
-        schtasks::parse_query_registered(&xml, ok) && schtasks::xml_is_group_logon_task(&xml)
+        match taskscheduler::task_xml(schtasks::AGENT_TASK) {
+            Ok(xml) => xml.is_some_and(|xml| schtasks::xml_is_group_logon_task(&xml)),
+            Err(e) => {
+                eprintln!("apply: not restarting the agents: {e:#}");
+                false
+            }
+        }
+    }
+
+    /// Undo the stop's disabling of the agent task, so the next logon starts an agent. Registering
+    /// the task afresh enables it too, but a failed `apply` may not have got that far.
+    fn enable_agent_task() {
+        if let Err(e) = taskscheduler::set_enabled(schtasks::AGENT_TASK, true) {
+            eprintln!("apply: could not enable the {} task again: {e:#}", schtasks::AGENT_TASK);
+        }
     }
 
     /// Step 4 of `apply`: start an agent in each session that already has a user, so nobody has to
@@ -170,9 +190,14 @@ mod imp {
     /// `apply` runs it too.
     fn start_agents() {
         match sessions::interactive_sessions() {
-            Ok(ids) => {
+            Ok(targets) => {
+                for (id, why) in &targets.unknown {
+                    eprintln!(
+                        "apply: could not tell whether session {id} has a user, so no agent was started there: {why}"
+                    );
+                }
                 let mut started = 0usize;
-                for id in &ids {
+                for id in &targets.ids {
                     match taskscheduler::run_in_session(schtasks::AGENT_TASK, *id) {
                         Ok(()) => started += 1,
                         Err(e) => eprintln!("apply: could not start the agent in session {id}: {e:#}"),
@@ -180,7 +205,7 @@ mod imp {
                 }
                 println!(
                     "apply: started the agent in {started} of {} logged-on session(s)",
-                    ids.len()
+                    targets.total()
                 );
             }
             Err(e) => eprintln!("apply: the logged-on sessions could not be listed: {e:#}"),
@@ -242,14 +267,6 @@ mod imp {
         Ok(decode_output(&out.stdout))
     }
 
-    /// Run `schtasks` capturing (stdout, success) without erroring (for verify's queries).
-    fn query_schtasks(args: &[String]) -> (String, bool) {
-        match std::process::Command::new("schtasks").args(args).output() {
-            Ok(o) => (decode_output(&o.stdout), o.status.success()),
-            Err(_) => (String::new(), false),
-        }
-    }
-
     // ── verify ─────────────────────────────────────────────────────────────────────
 
     pub fn verify() -> anyhow::Result<()> {
@@ -282,19 +299,17 @@ mod imp {
         )));
 
         // Local: the agent task is registered in its group form (any user, interactive session).
-        let (agent_xml, agent_ok) = query_schtasks(&schtasks::query_task_argv(schtasks::AGENT_TASK));
-        rows.push(schtasks::agent_task_row(&agent_xml, agent_ok));
+        rows.push(schtasks::agent_task_row(&taskscheduler::task_xml(schtasks::AGENT_TASK)));
         // Informational: verify runs via the LeastPrivilege agent (non-elevated) and cannot
         // reliably query a SYSTEM-owned task, so this never gates verify (apply errors loudly
         // if registration fails, and the reboot self-heal is exercised in the Phase-8 test).
-        let (_, heal_ok) = query_schtasks(&schtasks::query_task_argv(schtasks::SELFHEAL_TASK));
         rows.push(report::Check::new(
             "self-heal task (info)",
             true,
-            if heal_ok {
-                "registered"
-            } else {
-                "not queryable (needs elevation)"
+            match taskscheduler::task_xml(schtasks::SELFHEAL_TASK) {
+                Ok(Some(_)) => "registered".to_string(),
+                Ok(None) => "not registered".to_string(),
+                Err(e) => format!("not queryable (needs elevation?): {e:#}"),
             },
         ));
 
@@ -306,6 +321,7 @@ mod imp {
                 rows.push(user_rows::socket_location_row(&location));
                 rows.push(user_rows::socket_dir_row(&location, &user));
                 rows.push(user_rows::socket_file_row(&location, &user));
+                rows.push(user_rows::log_folder_row(&location, &user));
             }
             Err(e) => rows.push(report::Check::new("socket location", false, format!("{e:#}"))),
         }
@@ -457,9 +473,7 @@ mod imp {
         let dpapi = probe::dpapi_roundtrip(b"ssh-broker-parity-probe");
         let symlink = probe::symlink_probe();
         // Read the UPSTREAM payload first. This direction — client → child — is the one an
-        // `sftp put` / `scp` upload rides, and until now nothing carried binary through a real
-        // pipe and checked it arrived unchanged: the in-memory test stops at a fake agent thread,
-        // and this probe fed `io::empty()`. The two directions are measured INDEPENDENTLY: the
+        // `sftp put` / `scp` upload rides. The two directions are measured INDEPENDENTLY: the
         // downstream payload emitted below is a fixed write that carries nothing back about what
         // arrived here, so a corrupted upload surfaces ONLY as `upstream=fail` and never as a
         // downstream mismatch. The comparison itself lives in `probe::upstream_payload_ok` so it

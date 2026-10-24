@@ -19,7 +19,7 @@ pub fn run() -> anyhow::Result<()> {
 }
 
 #[cfg(windows)]
-use crate::afunix::{self, ConnRx, ConnTx, Listener};
+use crate::afunix::{self, AcceptError, ConnRx, ConnTx, Listener};
 #[cfg(windows)]
 use crate::agent_lock::{SessionSlot, UserLock, session_allows_agent};
 #[cfg(windows)]
@@ -47,18 +47,33 @@ use std::sync::{Arc, Condvar, Mutex};
 /// private folder, and become the one agent that serves this user.
 #[cfg(windows)]
 fn start() -> anyhow::Result<()> {
-    let session = crate::provision::probe::current_session_id();
+    start_with(
+        crate::provision::probe::current_session_id(),
+        crate::userdir::current_socket_location,
+        |logs| crate::filelog::init_in(logs, "agent.log"),
+        serve,
+    )
+}
+
+/// [`start`] with its inputs as parameters, so a test can pick the session and see what runs.
+#[cfg(windows)]
+fn start_with(
+    session: u32,
+    locate: impl FnOnce() -> anyhow::Result<SocketLocation>,
+    init_log: impl FnOnce(&Path) -> anyhow::Result<tracing_appender::non_blocking::WorkerGuard>,
+    serve: impl FnOnce(&SocketLocation, u32) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
     anyhow::ensure!(
         session_allows_agent(session),
         "the agent will not run in session 0: a shell hosted there has the limited environment this tool \
          exists to avoid. It belongs in the user's interactive session; the logon task starts it there"
     );
-    let location = crate::userdir::current_socket_location()?;
+    let location = locate()?;
     let user = crate::acl::Sid::current_user()?;
     crate::userdir::ensure_socket_dir(&location, &user)?;
-    // Held to the end: dropping the guard stops the writer and later lines are lost. Before this
-    // point there is no log, and an error goes to stderr, which a logon task discards.
-    let _log = crate::filelog::init_in(&location.logs_dir(), "agent.log");
+    // Held to the end: dropping the guard stops the writer and later lines are lost. Until the
+    // log opens an error goes to stderr, which a logon task discards; a hand-run agent shows it.
+    let _log = keep_log_or_report(init_log(&location.logs_dir()), &mut std::io::stderr());
     let result = serve(&location, session);
     if let Err(e) = &result {
         tracing::error!("the agent stopped: {e:#}");
@@ -66,21 +81,56 @@ fn start() -> anyhow::Result<()> {
     result
 }
 
+/// Keep the log if it opened. If not, say why on `stderr` and go on: serving does not need a log.
+#[cfg(windows)]
+fn keep_log_or_report(
+    log: anyhow::Result<tracing_appender::non_blocking::WorkerGuard>,
+    stderr: &mut dyn std::io::Write,
+) -> Option<tracing_appender::non_blocking::WorkerGuard> {
+    match log {
+        Ok(guard) => Some(guard),
+        Err(e) => {
+            let _ = writeln!(stderr, "ssh-broker agent: serving without a log: {e:#}");
+            None
+        }
+    }
+}
+
 /// Become the one agent that serves this user, then serve.
 #[cfg(windows)]
 fn serve(location: &SocketLocation, session: u32) -> anyhow::Result<()> {
+    serve_with(
+        location,
+        session,
+        |path| {
+            // One serving agent per user. A second session of the same user waits instead of
+            // leaving: the serving agent dies with its session, and this user may still be logged
+            // on here.
+            UserLock::acquire(path, || {
+                tracing::info!("waiting for the agent of another session of this user to end");
+            })
+        },
+        run_on,
+    )
+}
+
+/// [`serve`] with the user lock and the serving as parameters, so a test can see the order.
+#[cfg(windows)]
+fn serve_with(
+    location: &SocketLocation,
+    session: u32,
+    user_lock: impl FnOnce(&Path) -> anyhow::Result<UserLock>,
+    run: impl FnOnce(&SocketLocation) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
     // One agent per session: `apply` and the boot self-heal start one per logged-on session
-    // every time they run, and the logon task starts one per logon.
-    let Some(_slot) = SessionSlot::try_acquire(&location.session_lock_path(session))? else {
+    // every time they run, and the logon task starts one per logon. This comes first, because the
+    // user lock may be held for as long as another session lives.
+    let Some(_slot) = SessionSlot::try_acquire(&location.sessions_lock_path(), session)? else {
         tracing::info!("another agent already runs in this session; exiting");
         return Ok(());
     };
-    // One serving agent per user. A second session of the same user waits instead of leaving:
-    // the serving agent dies with its session, and this user may still be logged on here.
-    let _lock = UserLock::acquire(&location.lock_path(), || {
-        tracing::info!("waiting for the agent of another session of this user to end");
-    })?;
-    run_on(location)
+    let _lock = user_lock(&location.lock_path())?;
+    run(location)
 }
 
 /// Bind the hardened socket and serve connections, one handler thread each. The caller holds
@@ -88,13 +138,46 @@ fn serve(location: &SocketLocation, session: u32) -> anyhow::Result<()> {
 #[cfg(windows)]
 fn run_on(location: &SocketLocation) -> anyhow::Result<()> {
     let listener = Listener::bind(&location.path)?;
+    Err(serve_connections(
+        || listener.accept(),
+        |conn| {
+            std::thread::spawn(move || {
+                if let Err(e) = handle_connection(conn) {
+                    tracing::warn!("connection handler error: {e:?}");
+                }
+            });
+        },
+    ))
+}
+
+/// Accept connections and hand each to `serve` until the listener breaks; returns that error.
+///
+/// A connection that is lost (reset while queued, or one that cannot be set up) is logged and
+/// dropped: it must not end service for every session of the user. A transient failure is
+/// forgiven once; the same one again with no connection accepted since means nothing is clearing
+/// it, and carrying on would only log forever, so it ends the loop. That is a rule about the
+/// kind of failure, not a count of attempts.
+#[cfg(windows)]
+fn serve_connections<C>(mut accept: impl FnMut() -> Result<C, AcceptError>, mut serve: impl FnMut(C)) -> anyhow::Error {
+    // The transient failures seen since the last accepted connection.
+    let mut seen: Vec<Option<i32>> = Vec::new();
     loop {
-        let conn = listener.accept()?;
-        std::thread::spawn(move || {
-            if let Err(e) = handle_connection(conn) {
-                tracing::warn!("connection handler error: {e:?}");
+        match accept() {
+            Ok(conn) => {
+                seen.clear();
+                serve(conn);
             }
-        });
+            Err(AcceptError::Connection(e)) => tracing::warn!("dropped a connection: {e:#}"),
+            Err(AcceptError::Transient { code, source }) => {
+                if seen.contains(&code) {
+                    return anyhow::Error::new(source)
+                        .context("accept failed again with no connection accepted since; the listener is broken");
+                }
+                tracing::warn!("accept failed, trying again: {source}");
+                seen.push(code);
+            }
+            Err(AcceptError::Fatal(e)) => return e.context("the listener failed"),
+        }
     }
 }
 
@@ -104,12 +187,32 @@ fn default_shell() -> String {
     "pwsh.exe -NoLogo".to_string()
 }
 
-/// The session-1 user's home directory (`%USERPROFILE%`), if it exists. The agent runs AS that
-/// user, so its own environment carries the correct profile path.
+/// The home directory of the account the agent runs as: its token's profile. The environment is
+/// not consulted, because it belongs to whoever started the process. `None` (logged) if there is
+/// no such directory.
 #[cfg(windows)]
 fn home_dir() -> Option<PathBuf> {
-    let p = PathBuf::from(std::env::var_os("USERPROFILE")?);
-    p.is_dir().then_some(p)
+    match find_home(crate::userdir::current_profile_dir()) {
+        Ok(home) => Some(home),
+        Err(why) => {
+            tracing::warn!("no home directory to start the child in: {why}");
+            None
+        }
+    }
+}
+
+/// `profile` as a home directory, or why it is not one.
+#[cfg(windows)]
+fn find_home(profile: anyhow::Result<PathBuf>) -> Result<PathBuf, String> {
+    let profile = profile.map_err(|e| format!("{e:#}"))?;
+    if profile.is_dir() {
+        Ok(profile)
+    } else {
+        Err(format!(
+            "the profile directory {} is not a directory",
+            profile.display()
+        ))
+    }
 }
 
 /// The working directory to start the child in: the handshake's explicit `cwd` if any, else the
@@ -170,6 +273,10 @@ fn handle_connection_with(conn: socket2::Socket, hooks: Hooks) -> anyhow::Result
 #[cfg(test)]
 #[path = "agent_cwd_tests.rs"]
 mod agent_cwd_tests;
+
+#[cfg(all(windows, test))]
+#[path = "agent_start_tests.rs"]
+mod agent_start_tests;
 
 #[cfg(all(windows, test))]
 #[path = "agent_program_path_tests.rs"]

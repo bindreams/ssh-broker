@@ -43,7 +43,7 @@ this code:
 - The socket **folder's** DACL decides who can create, replace or delete the socket.
 
 Both must grant Full Control to exactly the user, SYSTEM and Administrators. The folder's ACEs are
-inheritable so the socket, `agent.lock` and `logs` are born with that set instead of the creating
+inheritable so the socket, `agent.lock`, `sessions.lock` and `logs` are born with that set instead of the creating
 token's default DACL; `tests/user_isolation_windows.rs` pins this with a creator whose default DACL
 is world-accessible. `acl::verify_dir_acl` and `acl::verify_file_acl` are **exact-match and
 fail-closed**: they reject an absent DACL, a non-protected folder DACL, DENY entries,

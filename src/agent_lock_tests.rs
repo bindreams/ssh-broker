@@ -131,27 +131,59 @@ fn a_sharing_violation_on_the_lock_file_is_an_error_not_a_held_lock() {
 #[test]
 fn session_slot_second_try_for_the_same_session_is_none() {
     let dir = TempLock::new("slot");
-    let first = SessionSlot::try_acquire(&dir.path()).unwrap();
+    let first = SessionSlot::try_acquire(&dir.path(), 2).unwrap();
     assert!(first.is_some());
-    assert!(SessionSlot::try_acquire(&dir.path()).unwrap().is_none());
+    assert!(SessionSlot::try_acquire(&dir.path(), 2).unwrap().is_none());
 }
 
 #[test]
 fn session_slot_is_released_on_drop() {
     let dir = TempLock::new("slot-drop");
-    drop(SessionSlot::try_acquire(&dir.path()).unwrap().unwrap());
-    assert!(SessionSlot::try_acquire(&dir.path()).unwrap().is_some());
+    drop(SessionSlot::try_acquire(&dir.path(), 2).unwrap().unwrap());
+    assert!(SessionSlot::try_acquire(&dir.path(), 2).unwrap().is_some());
 }
 
 #[test]
-fn session_slots_of_different_sessions_do_not_conflict() {
+fn session_slots_of_different_sessions_in_one_file_do_not_conflict() {
     let dir = TempLock::new("slot-x");
-    let _a = SessionSlot::try_acquire(&dir.0.join("session-1.lock"))
-        .unwrap()
-        .unwrap();
-    assert!(
-        SessionSlot::try_acquire(&dir.0.join("session-2.lock"))
-            .unwrap()
-            .is_some()
-    );
+    let _a = SessionSlot::try_acquire(&dir.path(), 1).unwrap().unwrap();
+    assert!(SessionSlot::try_acquire(&dir.path(), 2).unwrap().is_some());
+    assert!(SessionSlot::try_acquire(&dir.path(), u32::MAX).unwrap().is_some());
+}
+
+#[test]
+fn slots_for_many_sessions_leave_one_file_not_one_per_session() {
+    // Session ids only grow until reboot; a file per id would pile up for as long as the machine
+    // stays up. The sessions share one file, so there is nothing to clean up.
+    let dir = TempLock::new("slot-files");
+    for session in 1..=40 {
+        drop(SessionSlot::try_acquire(&dir.path(), session).unwrap().unwrap());
+    }
+    let files = std::fs::read_dir(&dir.0).unwrap().count();
+    assert_eq!(files, 1, "one lock file for every session");
+}
+
+#[test]
+fn agents_racing_for_one_session_never_both_hold_it() {
+    use std::sync::{Arc, Barrier};
+    const RACERS: usize = 8;
+    let dir = TempLock::new("slot-race");
+    let start = Arc::new(Barrier::new(RACERS));
+    let racers: Vec<_> = (0..RACERS)
+        .map(|_| {
+            let path = dir.path();
+            let start = Arc::clone(&start);
+            std::thread::spawn(move || {
+                start.wait();
+                // Returned, not dropped: a winner keeps the slot until it is joined.
+                SessionSlot::try_acquire(&path, 5).unwrap()
+            })
+        })
+        .collect();
+    let holders = racers
+        .into_iter()
+        .map(|r| r.join().unwrap())
+        .filter(Option::is_some)
+        .count();
+    assert_eq!(holders, 1);
 }
