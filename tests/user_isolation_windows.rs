@@ -104,8 +104,8 @@ fn account_name(tag: &str, pid: u32, n: u32) -> String {
 }
 
 /// A name no other account of this test run has, whichever thread asks: this process's id and a
-/// process-wide counter. (Across runs, ids are not reused while an account of the earlier run is
-/// still there, since a run removes its accounts when it ends.)
+/// process-wide counter. An account left behind by an aborted earlier run with the same id makes
+/// `NetUserAdd` fail with "user exists"; nothing is overwritten.
 fn next_account_name(tag: &str) -> String {
     static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     account_name(
