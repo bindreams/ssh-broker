@@ -6,7 +6,7 @@
 
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::System::Console::{
-    GetConsoleMode, GetStdHandle, INPUT_RECORD, ReadConsoleInputW, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+    GetConsoleMode, GetStdHandle, INPUT_RECORD, ReadConsoleInputW, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, WriteConsoleW,
 };
 use zeroize::Zeroize;
 
@@ -57,9 +57,21 @@ impl ConsolePrompt {
         self.modes
     }
 
-    /// Write `text` to the console (VT, CRLF line ends).
+    /// Write `text` to the console (VT, CRLF line ends). It goes as UTF-16: raw UTF-8 bytes are read
+    /// in the console's output code page, which is not UTF-8 unless something set it, and an account
+    /// name with a non-ASCII letter then shows as other characters.
     pub fn write_text(&mut self, text: &str) {
-        crate::conpty::write_all_handle(self.modes.stdout.0 as isize, text.as_bytes());
+        let units: Vec<u16> = text.encode_utf16().collect();
+        let mut rest = units.as_slice();
+        while !rest.is_empty() {
+            let mut written = 0u32;
+            // SAFETY: `rest` and `written` are valid for the call; the handle is the console's output.
+            let wrote = unsafe { WriteConsoleW(self.modes.stdout, rest, Some(&mut written), None) };
+            if wrote.is_err() || written == 0 {
+                return;
+            }
+            rest = &rest[written as usize..];
+        }
     }
 
     /// Block until one entry step finishes: a submitted password, an empty Enter, or a cancel.
