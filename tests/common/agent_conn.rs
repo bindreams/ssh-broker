@@ -21,6 +21,10 @@ use windows::Win32::System::Threading::TerminateProcess;
 use crate::account_fixture::Account;
 use crate::stand_in::{Kit, wait_for_serving_marker};
 
+/// How long a session may stay silent while a test reads from it. A read that gets nothing for this
+/// long fails with a transport error (`TimedOut`), and the test's message names what it awaited.
+const SILENCE_BOUND: std::time::Duration = std::time::Duration::from_secs(240);
+
 /// The product's view of a fixture account.
 pub fn local_account(account: &Account) -> LocalAccount {
     LocalAccount {
@@ -51,7 +55,7 @@ impl BackgroundAgent {
             process: started.process,
             location,
         };
-        match event.wait_with(agent.process.0).unwrap() {
+        match crate::stand_in::wait_ready(&event, agent.process.0, "the background agent") {
             Waited::Ready => {}
             Waited::AgentExited(code) => panic!(
                 "the background agent ended with {code:#x} before its socket folder existed:\n{}",
@@ -128,6 +132,8 @@ impl AgentConn {
     pub fn connect(location: &SocketLocation) -> AgentConn {
         let conn = afunix::connect(&location.path)
             .unwrap_or_else(|e| panic!("connect to the agent at {}: {e:#}", location.path.display()));
+        // A failure bound on the agent's output, an external event that may never come.
+        conn.set_read_timeout(Some(SILENCE_BOUND)).unwrap();
         let (rx, tx) = afunix::split(conn).unwrap();
         AgentConn {
             rx,
@@ -191,7 +197,7 @@ impl AgentConn {
         match outcome {
             Err(PumpError::Sink(e)) if e.is::<Found>() => text,
             other => panic!(
-                "the session ended before it showed {needle:?} ({other:?}); it showed:
+                "the session ended, broke or stayed silent for {SILENCE_BOUND:?} before it showed {needle:?} ({other:?}); it showed:
 {text}"
             ),
         }
@@ -204,7 +210,15 @@ impl AgentConn {
         let exit = match outcome {
             Ok(Outcome::Exited(code)) => Some(code),
             Ok(Outcome::PeerClosed) => None,
-            Err(e) => panic!("the agent's stream broke: {e:?}"),
+            Err(e) => panic!(
+                "the agent's stream broke or stayed silent for {SILENCE_BOUND:?} while the test waited for the session to end: {e:?}
+stdout: {:?}
+stderr: {:?}
+pty: {:?}",
+                String::from_utf8_lossy(&self.transcript.stdout),
+                String::from_utf8_lossy(&self.transcript.stderr),
+                String::from_utf8_lossy(&self.transcript.pty)
+            ),
         };
         Finished {
             stdout: String::from_utf8_lossy(&self.transcript.stdout).into_owned(),

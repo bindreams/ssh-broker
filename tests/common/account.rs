@@ -458,6 +458,12 @@ impl Spawned {
 
 impl Drop for Account {
     fn drop(&mut self) {
+        // Nothing the account started may outlive its test: a background session holds the profile
+        // and the socket, and the next test's logons share the machine.
+        let left = crate::process_list::terminate_processes_of(&self.sid_text);
+        if !left.is_empty() {
+            eprintln!("processes of {} that could not be ended: {left:?}", self.name);
+        }
         // SAFETY: NUL-terminated inputs.
         unsafe {
             if self.profile.is_some() {

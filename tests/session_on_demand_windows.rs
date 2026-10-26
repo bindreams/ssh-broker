@@ -167,7 +167,7 @@ fn ready_event_made_by_an_administrators_shim_is_signalled_by_the_agent() {
     let password = password::password(&account.password);
     let started = logon::start_background_agent(&account_of(&account), &password, &kit.exe, &name)
         .unwrap_or_else(|e| panic!("logon failed: {e:?}"));
-    let waited = event.wait_with(started.process.0).unwrap();
+    let waited = stand_in::wait_ready(&event, started.process.0, "the started agent");
     assert_eq!(waited, Waited::Ready, "agent.error: {}", kit.read("agent.error"));
     assert_eq!(kit.agent_info("sid"), account.sid_text);
 }
@@ -209,7 +209,7 @@ fn logon_child_survives_the_callers_job_closing() {
     shim.process.wait();
 
     go.signal().unwrap();
-    match ack.wait_with(agent.0).unwrap() {
+    match stand_in::wait_ready(&ack, agent.0, "the logon child") {
         Waited::Ready => {}
         Waited::AgentExited(code) => panic!(
             "M3: the logon child (pid {agent_pid}) did not survive its caller's job closing: it exited with {code:#x} \
@@ -232,7 +232,7 @@ fn logon_with_seclogon_stopped_returns_windows_reason() {
     let password = password::password(&account.password);
     match logon::start_background_agent(&account_of(&account), &password, &kit.exe, &name) {
         Ok(started) => {
-            let waited = event.wait_with(started.process.0).unwrap();
+            let waited = stand_in::wait_ready(&event, started.process.0, "the started agent");
             assert_eq!(waited, Waited::Ready, "agent.error: {}", kit.read("agent.error"));
         }
         Err(failure) => assert!(!failure.reason.is_empty(), "no reason for code {}", failure.code),
@@ -297,7 +297,7 @@ fn logon_as_account_with_space_in_name() {
     let password = password::password(&account.password);
     let started = logon::start_background_agent(&account_of(&account), &password, &kit.exe, &ready_name)
         .unwrap_or_else(|e| panic!("logon as {name:?} failed: {e:?}"));
-    let waited = event.wait_with(started.process.0).unwrap();
+    let waited = stand_in::wait_ready(&event, started.process.0, "the started agent");
     assert_eq!(waited, Waited::Ready, "agent.error: {}", kit.read("agent.error"));
     assert_eq!(kit.agent_info("sid"), account.sid_text);
 }

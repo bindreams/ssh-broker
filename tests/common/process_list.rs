@@ -197,6 +197,53 @@ pub fn terminate_tree(root: HANDLE, root_pid: u32) -> BTreeSet<String> {
     }
 }
 
+/// Terminate every process that runs as the user `sid_text` (SDDL form) and wait for each to exit,
+/// pass after pass until a pass finds none: a process ended in one pass can have started another.
+/// A process that cannot be ended is reported and is not looked at again.
+///
+/// Processes that cannot be opened are skipped: the system's own are, and an account's own are
+/// opened by the administrator that runs the tests.
+pub fn terminate_processes_of(sid_text: &str) -> BTreeSet<String> {
+    let own = std::process::id();
+    let mut problems = BTreeSet::new();
+    let mut given_up: BTreeSet<u32> = BTreeSet::new();
+    loop {
+        let mut found = Vec::new();
+        for entry in snapshot() {
+            if entry.pid == own || entry.pid == 0 || given_up.contains(&entry.pid) {
+                continue;
+            }
+            // SAFETY: a plain open by id; the handle is closed by `OwnedHandle`.
+            let Ok(handle) = (unsafe {
+                OpenProcess(
+                    PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE | PROCESS_SYNCHRONIZE,
+                    false,
+                    entry.pid,
+                )
+            }) else {
+                continue;
+            };
+            let process = OwnedHandle(handle);
+            let Ok(owner) = ssh_broker::acl::Sid::of_process(process.0) else {
+                continue;
+            };
+            if owner.to_sddl().is_ok_and(|owner| owner == sid_text) {
+                found.push((entry, process));
+            }
+        }
+        if found.is_empty() {
+            return problems;
+        }
+        for (entry, process) in found {
+            let before = problems.len();
+            end(process.0, &format!("pid {} {}", entry.pid, entry.exe), &mut problems);
+            if problems.len() != before {
+                given_up.insert(entry.pid);
+            }
+        }
+    }
+}
+
 /// How long a terminated process may take to be gone. Termination is asynchronous but quick; a
 /// process still there after this is stuck in the kernel, and is reported instead of waited for.
 const EXIT_AFTER_TERMINATE_BOUND_MS: u32 = 30_000;

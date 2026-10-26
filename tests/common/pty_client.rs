@@ -5,10 +5,17 @@
 //! pseudoconsole and relays it over standard handles. The test types into the console as win32 input
 //! mode key events, the form the agent's own pseudoconsoles take, and reads the VT it writes back.
 //!
-//! The including crate declares `account_fixture`, `bounded_wait`, `desktop` and `stand_in`.
+//! The including crate declares `account_fixture`, `bounded_wait`, `desktop`, `process_list` and
+//! `stand_in`.
+//!
+//! Every wait for the console is bounded by the console's silence: output that never comes is an
+//! external event that might never happen, and a test that waited for it would hang with its
+//! failure unprinted. Expiry fails the test with what the console showed and the process tree.
 #![allow(dead_code)]
 
 use std::path::Path;
+use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
+use std::time::Duration;
 
 use ssh_broker::conpty::{read_handle, write_all_handle};
 use ssh_broker::vtinput::{KeyEvent, encode_key_event};
@@ -22,6 +29,16 @@ use crate::account_fixture::{Account, Spawned};
 use crate::stand_in::Kit;
 
 const LEFT_CTRL: u32 = 0x0008;
+
+/// How long the console may stay silent while a test waits for it. Generous: creating a profile and
+/// signing in takes the better part of two minutes on a loaded runner.
+const SILENCE_BOUND: Duration = Duration::from_secs(240);
+
+/// The read end of the console's output, moved to the thread that reads it.
+struct ReadEnd(OwnedHandle);
+
+// SAFETY: a pipe handle may be used from any thread; this thread is its only user.
+unsafe impl Send for ReadEnd {}
 
 /// A pipe whose read end is `read` and write end `write`; the end named by `inherit_read` is the one
 /// the child gets (inheritable), the other stays private.
@@ -45,7 +62,8 @@ fn pipe(inherit_read: bool) -> (OwnedHandle, OwnedHandle) {
 pub struct PtyRun {
     helper: Spawned,
     input: OwnedHandle,
-    output: OwnedHandle,
+    /// What the reader thread has read, in chunks; disconnected when the console closes.
+    output: Receiver<Vec<u8>>,
     /// Everything the shim has written so far.
     transcript: Vec<u8>,
 }
@@ -74,11 +92,49 @@ impl PtyRun {
         // The child's ends are the child's now; keeping ours open would hold the pipes past its exit.
         drop(child_in);
         drop(child_out);
+        let (chunks, output) = channel();
+        let end = ReadEnd(my_out);
+        std::thread::Builder::new()
+            .name("pty-reader".into())
+            .spawn(move || {
+                let end = end;
+                loop {
+                    let mut buf = [0u8; 4096];
+                    let n = read_handle(end.0.raw(), &mut buf);
+                    if n == 0 || chunks.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+            })
+            .expect("start the console reader");
         PtyRun {
             helper,
             input: my_in,
-            output: my_out,
+            output,
             transcript: Vec::new(),
+        }
+    }
+
+    /// Take the next chunk of the console's output into the transcript; `false` once the console has
+    /// closed. Fails the test, saying it was waiting for `awaited`, if the console stays silent for
+    /// [`SILENCE_BOUND`].
+    fn take_chunk(&mut self, awaited: &str) -> bool {
+        let received = self.output.recv_timeout(SILENCE_BOUND); // sleep-ok: failure bound on the console's output, an external event that may never come; expiry fails the test and is not read as state
+        match received {
+            Ok(chunk) => {
+                self.transcript.extend_from_slice(&chunk);
+                true
+            }
+            Err(RecvTimeoutError::Disconnected) => false,
+            Err(RecvTimeoutError::Timeout) => panic!(
+                "the console was silent for {SILENCE_BOUND:?} while the test waited for {awaited}; it showed:
+{}
+
+process tree:
+{}",
+                self.text(),
+                crate::bounded_wait::process_tree(self.helper.process.0, self.helper.pid)
+            ),
         }
     }
 
@@ -159,20 +215,19 @@ impl PtyRun {
     }
 
     /// Read until the console has shown one of `needles`; returns which. The wait is on the shim
-    /// producing output, and ends in a failure that prints the transcript if the console closes first.
+    /// producing output, and ends in a failure that prints the transcript if the console closes
+    /// first or stays silent for [`SILENCE_BOUND`].
     pub fn read_until_any(&mut self, needles: &[&str]) -> usize {
         loop {
             let text = self.text();
             if let Some(found) = needles.iter().position(|needle| text.contains(needle)) {
                 return found;
             }
-            let mut buf = [0u8; 4096];
-            let n = read_handle(self.output.raw(), &mut buf);
             assert!(
-                n > 0,
-                "the console closed before it showed any of {needles:?}; it showed:\n{text}"
+                self.take_chunk(&format!("one of {needles:?}")),
+                "the console closed before it showed any of {needles:?}; it showed:
+{text}"
             );
-            self.transcript.extend_from_slice(&buf[..n]);
         }
     }
 
@@ -182,14 +237,17 @@ impl PtyRun {
 
     /// Read until the console closes, and return the shim's exit code.
     pub fn finish(&mut self) -> i32 {
-        loop {
-            let mut buf = [0u8; 4096];
-            let n = read_handle(self.output.raw(), &mut buf);
-            if n == 0 {
-                break;
-            }
-            self.transcript.extend_from_slice(&buf[..n]);
-        }
+        while self.take_chunk("the console to close") {}
         self.helper.wait() as i32
+    }
+}
+
+impl Drop for PtyRun {
+    fn drop(&mut self) {
+        // The helper, the shim and whatever they started end with the test, also when it failed.
+        let left = crate::process_list::terminate_tree(self.helper.process.0, self.helper.pid);
+        if !left.is_empty() {
+            eprintln!("processes of the console run that could not be ended: {left:?}");
+        }
     }
 }

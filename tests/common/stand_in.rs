@@ -15,7 +15,7 @@ use windows::Win32::Storage::FileSystem::{
     FindFirstChangeNotificationW, FindNextChangeNotification,
 };
 use windows::Win32::System::Threading::{
-    CREATE_PROCESS_LOGON_FLAGS, INFINITE, TerminateProcess, WaitForMultipleObjects, WaitForSingleObject,
+    CREATE_PROCESS_LOGON_FLAGS, TerminateProcess, WaitForMultipleObjects, WaitForSingleObject,
 };
 use windows::core::PCWSTR;
 
@@ -131,7 +131,7 @@ pub fn start_shim(kit: &Kit, account: &Account, hold: bool, before_resume: impl 
     );
     before_resume(&process);
     process.resume();
-    match reported.wait_with(process.process.0).unwrap() {
+    match wait_ready(&reported, process.process.0, "the stand-in shim") {
         Waited::Ready => {}
         Waited::AgentExited(code) => panic!(
             "the stand-in shim ended with {code:#x} before it reported; shim.result: {}",
@@ -231,21 +231,49 @@ impl Drop for RealAgent {
     }
 }
 
+/// How long an agent that was started may take to listen. Generous: a first logon creates the profile.
+pub const SERVING_BOUND: std::time::Duration = std::time::Duration::from_secs(180);
+
 /// Block until the agent that serves `location` has rewritten its `serving` marker, that is, until
 /// it is listening. A directory watch is armed before the marker is looked for, so a write between
-/// the look and the wait is not missed. An agent that ends first fails the wait with its exit code.
+/// the look and the wait is not missed. An agent that ends first fails the wait with its exit code;
+/// an agent that neither listens nor ends fails it after [`SERVING_BOUND`], an external event that
+/// may never come.
 pub fn wait_for_serving_marker(location: &SocketLocation, agent: HANDLE) {
-    wait_for_marker(location, Some(agent), None)
+    wait_for_marker(location, Some(agent), SERVING_BOUND)
 }
 
 /// [`wait_for_serving_marker`] for an agent that no handle is held on (a scheduled task starts it):
 /// the start is an external event that may never come, so the wait has a failure bound and its
 /// expiry fails the test saying so.
 pub fn wait_for_serving_marker_of_a_task(location: &SocketLocation, bound: std::time::Duration) {
-    wait_for_marker(location, None, Some(bound))
+    wait_for_marker(location, None, bound)
 }
 
-fn wait_for_marker(location: &SocketLocation, agent: Option<HANDLE>, bound: Option<std::time::Duration>) {
+/// Wait for `event` to be signalled or for `agent` (a process handle) to end, as
+/// [`ReadyEvent::wait_with`] does, but with a failure bound: an agent that neither signals nor ends
+/// is an external event that may never come, and expiry fails the test naming `what`.
+pub fn wait_ready(event: &ReadyEvent, agent: HANDLE, what: &str) -> Waited {
+    let handles = [event.as_handle(), agent];
+    let millis = u32::try_from(SERVING_BOUND.as_millis()).expect("a bound shorter than INFINITE");
+    // SAFETY: both handles are valid for the call.
+    let woke = unsafe { WaitForMultipleObjects(&handles, false, millis) }; // sleep-ok: failure bound on an agent's ready signal, an external event; expiry fails the test and is not read as state
+    if woke == WAIT_OBJECT_0 {
+        Waited::Ready
+    } else if woke.0 == WAIT_OBJECT_0.0 + 1 {
+        let mut code = 0u32;
+        // SAFETY: a valid process handle and out-pointer.
+        unsafe { windows::Win32::System::Threading::GetExitCodeProcess(agent, &mut code) }
+            .expect("read the agent's exit code");
+        Waited::AgentExited(code)
+    } else if woke == WAIT_TIMEOUT {
+        panic!("{what} neither signalled that it was ready nor ended within {SERVING_BOUND:?}")
+    } else {
+        panic!("waiting for {what}'s ready event failed: {woke:?}")
+    }
+}
+
+fn wait_for_marker(location: &SocketLocation, agent: Option<HANDLE>, bound: std::time::Duration) {
     use std::os::windows::ffi::OsStrExt;
     // The socket folder may not exist yet, so the watch is on its parent and covers the subtree.
     let watched = location.dir.parent().expect("the socket folder has a parent");
@@ -264,17 +292,15 @@ fn wait_for_marker(location: &SocketLocation, agent: Option<HANDLE>, bound: Opti
             break;
         }
         let handles: Vec<HANDLE> = std::iter::once(watch).chain(agent).collect();
-        let millis = bound.map_or(INFINITE, |bound| {
-            u32::try_from(bound.as_millis()).expect("a bound shorter than INFINITE")
-        });
+        let millis = u32::try_from(bound.as_millis()).expect("a bound shorter than INFINITE");
         // SAFETY: every handle is valid.
-        let woke = unsafe { WaitForMultipleObjects(&handles, false, millis) }; // sleep-ok: with a bound, a failure bound on a task start that may never come; expiry fails the test
+        let woke = unsafe { WaitForMultipleObjects(&handles, false, millis) }; // sleep-ok: failure bound on an agent start that may never come; expiry fails the test
         if woke == WAIT_OBJECT_0 {
             // SAFETY: a valid watch handle.
             unsafe { FindNextChangeNotification(watch) }.unwrap();
         } else if woke == WAIT_TIMEOUT {
             panic!(
-                "no agent was serving {} after {bound:?}: the scheduled task did not start one",
+                "no agent was serving {} after {bound:?}: it neither wrote its serving marker nor ended,                  or the scheduled task did not start one",
                 location.dir.display()
             );
         } else if let Some(agent) = agent {

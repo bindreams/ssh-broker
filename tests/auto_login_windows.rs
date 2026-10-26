@@ -285,7 +285,7 @@ fn a_stale_password_is_not_visible_in_the_last_result() {
 
     // The stored password goes stale; the next run cannot log on. The task ignores a start while an
     // instance is listed, so the run after the logout must find none.
-    task_instances::wait_until_none(&task_name(&account.sid_text));
+    task_instances::wait_until_none(&task_name(&account.sid_text), TASK_START_BOUND);
     let failed_logon = logon_session::failed_logon_watch(&account.name);
     account.set_password("Changed-Pw-9z!Aa");
     taskscheduler::run_task(&task_name(&account.sid_text)).unwrap();

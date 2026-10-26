@@ -52,7 +52,7 @@ pub fn wait_for_exit(process: HANDLE, pid: u32, what: &str, bound: Duration, evi
 
 /// `root` and its descendants (see [`process_list`]) with each one's command line, and its
 /// threads with their state and wait reason: what a hung tree is blocked on.
-fn process_tree(root: HANDLE, root_pid: u32) -> String {
+pub fn process_tree(root: HANDLE, root_pid: u32) -> String {
     let tree = process_list::descendants(root, root_pid);
     let mut ids = vec![root_pid];
     ids.extend(tree.members.iter().map(|m| m.pid));
