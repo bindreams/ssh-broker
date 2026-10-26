@@ -10,7 +10,7 @@ use windows::Win32::Security::{GetTokenInformation, TOKEN_QUERY, TOKEN_STATISTIC
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
 };
-use windows::Win32::System::EventLog::{EVT_HANDLE, EvtClose, EvtSubscribe, EvtSubscribeToFutureEvents};
+use windows::Win32::System::EventLog::{EVT_HANDLE, EvtClose, EvtNext, EvtSubscribe, EvtSubscribeToFutureEvents};
 use windows::Win32::System::Threading::{
     CreateEventW, OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
     WaitForSingleObject,
@@ -97,6 +97,8 @@ pub fn assert_logoff_auditing() {
 pub struct EventWatch {
     subscription: EVT_HANDLE,
     signal: OwnedHandle,
+    /// A matching event arrived before the first `EvtNext` call in [`EventWatch::on`] returned.
+    arrived_early: bool,
 }
 
 /// The XPath for event `id` whose `Data` field `field` is `value`.
@@ -106,10 +108,19 @@ fn query_for(id: u32, field: &str, value: &str) -> String {
 
 impl EventWatch {
     pub fn new(query: &str) -> EventWatch {
+        EventWatch::on("Security", query)
+    }
+
+    /// Subscribe to `channel`. A pull subscription signals its event only after a call of `EvtNext`
+    /// has returned `ERROR_NO_MORE_ITEMS`: the service does not signal for a client that has not yet
+    /// asked (measured: with no such call a logged event never signalled, on the Application channel
+    /// and, in CI, for the 4625 and 4634 events this module watches). So the subscription is primed
+    /// with one call here, and an event that arrived before it is remembered.
+    pub fn on(channel: &str, query: &str) -> EventWatch {
         // SAFETY: an unnamed manual-reset event.
         let signal = OwnedHandle(unsafe { CreateEventW(None, true, false, PCWSTR::null()) }.expect("CreateEventW"));
         let query: Vec<u16> = query.encode_utf16().chain(std::iter::once(0)).collect();
-        let channel: Vec<u16> = "Security".encode_utf16().chain(std::iter::once(0)).collect();
+        let channel: Vec<u16> = channel.encode_utf16().chain(std::iter::once(0)).collect();
         // SAFETY: NUL-terminated inputs; the signal event outlives the subscription (dropped after it).
         let subscription = unsafe {
             EvtSubscribe(
@@ -124,13 +135,32 @@ impl EventWatch {
             )
         }
         .unwrap_or_else(|e| panic!("subscribe to the Security log (needs an elevated administrator): {e}"));
-        EventWatch { subscription, signal }
+        let mut event = [0isize; 1];
+        let mut returned = 0u32;
+        // SAFETY: a valid subscription and buffers of the sizes passed; no wait (timeout 0).
+        let primed = unsafe { EvtNext(subscription, &mut event, 0, 0, &mut returned) };
+        let arrived_early = primed.is_ok() && returned > 0;
+        if arrived_early {
+            // SAFETY: the event handle EvtNext just returned.
+            let _ = unsafe { EvtClose(EVT_HANDLE(event[0])) };
+        } else if let Err(e) = primed {
+            // ERROR_NO_MORE_ITEMS (259): nothing yet, and the service now signals when something comes.
+            assert_eq!(e.code().0 as u32, 0x8007_0103, "prime the event subscription: {e}");
+        }
+        EventWatch {
+            subscription,
+            signal,
+            arrived_early,
+        }
     }
 
     /// Wait for a matching event for at most `bound`. An event the OS may never deliver is an
     /// external event, so this is the one bounded wait; the caller treats expiry as a failure that
     /// reports what was measured, never as a pass.
     pub fn wait(&self, bound: Duration) -> bool {
+        if self.arrived_early {
+            return true;
+        }
         let millis = u32::try_from(bound.as_millis()).expect("a bound shorter than INFINITE");
         // SAFETY: a valid event handle.
         let rc = unsafe { WaitForSingleObject(self.signal.0, millis) }; // sleep-ok: failure bound on an OS event that may never come; expiry fails the test and is not read as state
