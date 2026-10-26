@@ -24,12 +24,14 @@ pub mod conpty;
 pub mod filelog;
 #[cfg(windows)]
 pub mod hangup;
+pub mod password_entry;
 #[cfg(windows)]
 pub mod pipes;
 pub mod protocol;
 pub mod provision;
 pub mod relay;
 pub mod route;
+pub mod secret;
 pub mod shim;
 #[cfg(windows)]
 pub mod shim_pty;
