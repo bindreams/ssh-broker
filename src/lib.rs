@@ -44,8 +44,6 @@ pub mod password_entry;
 pub mod pipes;
 pub mod protocol;
 pub mod provision;
-#[cfg(windows)]
-pub mod ready;
 pub mod relay;
 pub mod route;
 pub mod secret;
@@ -55,6 +53,8 @@ pub mod shim_offer;
 #[cfg(windows)]
 pub mod shim_pty;
 pub mod socket_loc;
+#[cfg(windows)]
+pub mod socket_watch;
 #[cfg(windows)]
 pub mod starting_agent;
 #[cfg(all(windows, test))]

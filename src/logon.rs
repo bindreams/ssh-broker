@@ -79,12 +79,9 @@ impl std::fmt::Display for LogonFailure {
 }
 
 /// The command line of the background agent: the exe quoted (it may hold spaces), the verb, and the
-/// two flags. The agent exits unless its token's SID equals `expect_user`.
-pub fn command_line(exe: &Path, ready_name: &str, expect_user: &str) -> String {
-    format!(
-        "\"{}\" agent --background --ready-event {ready_name} --expect-user {expect_user}",
-        exe.display()
-    )
+/// flag. The agent exits unless its token's SID equals `expect_user`.
+pub fn command_line(exe: &Path, expect_user: &str) -> String {
+    format!("\"{}\" agent --background --expect-user {expect_user}", exe.display())
 }
 
 fn wide(text: &str) -> Vec<u16> {
@@ -92,14 +89,14 @@ fn wide(text: &str) -> Vec<u16> {
 }
 
 /// Sign `account` on with `password` and start `exe agent --background` as that account. Returns
-/// once the call has; the agent signals `ready_name` when its socket folder exists.
+/// once the call has. The caller learns that the agent serves from the files it writes (see
+/// `socket_watch`), and that it ended from the process handle in [`StartedAgent`].
 pub fn start_background_agent(
     account: &LocalAccount,
     password: &Password,
     exe: &Path,
-    ready_name: &str,
 ) -> Result<StartedAgent, LogonFailure> {
-    let mut command = wide(&command_line(exe, ready_name, &account.sid));
+    let mut command = wide(&command_line(exe, &account.sid));
     let exe_w = wide(&exe.to_string_lossy());
     // The caller's directory may be one the account cannot enter; the install directory is
     // readable by every user.

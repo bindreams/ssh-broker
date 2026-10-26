@@ -12,12 +12,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 use socket2::Socket;
 use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
-use windows::Win32::Storage::FileSystem::{
-    FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_CHANGE_SIZE, FindCloseChangeNotification,
-    FindFirstChangeNotificationW, FindNextChangeNotification,
-};
-use windows::Win32::System::Threading::{INFINITE, WaitForMultipleObjects};
-use windows::core::PCWSTR;
+use windows::Win32::System::Threading::{GetExitCodeProcess, INFINITE, WaitForMultipleObjects};
 
 use crate::account::{self, LocalAccount};
 use crate::acl::Sid;
@@ -30,8 +25,8 @@ use crate::offer::{
 };
 use crate::password_entry::{Password, Step};
 use crate::provision::procwait;
-use crate::ready::{ReadyEvent, Waited};
 use crate::socket_loc::SocketLocation;
+use crate::socket_watch::SocketWatch;
 use crate::{afunix, provision, starting_agent};
 
 // plan -----
@@ -173,36 +168,49 @@ pub fn wait_while_starting<C>(
     }
 }
 
-/// A directory-change watch on the socket folder: file names, size, last write.
-struct DirWatch(HANDLE);
-
-impl DirWatch {
-    fn arm(dir: &Path) -> anyhow::Result<DirWatch> {
-        use std::os::windows::ffi::OsStrExt;
-        let dir_w: Vec<u16> = dir.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
-        // SAFETY: a NUL-terminated path; the handle is closed on drop.
-        unsafe {
-            FindFirstChangeNotificationW(
-                PCWSTR(dir_w.as_ptr()),
-                false,
-                FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_SIZE | FILE_NOTIFY_CHANGE_LAST_WRITE,
-            )
-        }
-        .map(DirWatch)
-        .with_context(|| format!("watch {}", dir.display()))
+/// Wait until the agent process `agent` ends or `watch` fires, whichever is first.
+fn wait_for_change_or_exit(watch: &SocketWatch, agent: HANDLE) -> anyhow::Result<Woke> {
+    let handles = [watch.handle(), agent];
+    // SAFETY: both handles are valid for the call.
+    let woke = unsafe { WaitForMultipleObjects(&handles, false, INFINITE) };
+    if woke == WAIT_OBJECT_0 {
+        return Ok(Woke::Changed);
     }
-
-    fn rearm(&self) -> anyhow::Result<()> {
-        // SAFETY: a valid watch handle.
-        unsafe { FindNextChangeNotification(self.0) }.context("re-arm the folder watch")
+    if woke.0 == WAIT_OBJECT_0.0 + 1 {
+        let mut code = 0u32;
+        // SAFETY: a valid process handle and out-pointer.
+        unsafe { GetExitCodeProcess(agent, &mut code) }.context("read the agent's exit code")?;
+        return Ok(Woke::AgentExited(code));
     }
+    anyhow::bail!("waiting for the agent's socket failed: {woke:?}")
 }
 
-impl Drop for DirWatch {
-    fn drop(&mut self) {
-        // SAFETY: the handle from `arm`.
-        let _ = unsafe { FindCloseChangeNotification(self.0) };
-    }
+/// Wait, on real primitives and with no time limit, until the agent process `agent` has made a
+/// connection possible: `connect` is tried on the socket's location each time the folder (or, before
+/// a first logon, the profile list) changes. The location is found from the shim's own token as soon
+/// as the profile exists. See [`wait_until_serving`] for the order of arming and connecting.
+pub fn wait_for_agent<C>(
+    watch: SocketWatch,
+    agent: HANDLE,
+    mut connect: impl FnMut(&SocketLocation) -> Option<C>,
+) -> anyhow::Result<Served<C>> {
+    let watch = RefCell::new(watch);
+    wait_until_serving(
+        || {
+            let watch = watch.borrow();
+            watch.location().and_then(&mut connect)
+        },
+        || {
+            let woke = wait_for_change_or_exit(&watch.borrow(), agent)?;
+            if let Woke::AgentExited(_) = woke {
+                // The connect that follows an exit must know the location, which may have
+                // appeared (a first logon) since the last look.
+                watch.borrow_mut().rearm()?;
+            }
+            Ok(woke)
+        },
+        || watch.borrow_mut().rearm(),
+    )
 }
 
 // the shim's hook -----
@@ -289,7 +297,6 @@ impl Rescue for Prompting {
 
 /// A started background session, until its socket answers.
 struct Started {
-    ready: ReadyEvent,
     agent: StartedAgent,
 }
 
@@ -311,12 +318,9 @@ impl OfferIo for LiveIo {
     }
 
     fn start_session(&mut self, password: &Password) -> Result<(), StartFailure> {
-        let (ready, name) = ReadyEvent::create().map_err(|e| StartFailure::Internal {
-            reason: format!("{e:#}"),
-        })?;
-        match logon::start_background_agent(&self.account, password, &self.exe, &name) {
+        match logon::start_background_agent(&self.account, password, &self.exe) {
             Ok(agent) => {
-                self.started = Some(Started { ready, agent });
+                self.started = Some(Started { agent });
                 Ok(())
             }
             Err(failure) => Err(StartFailure::Windows { reason: failure.reason }),
@@ -366,49 +370,20 @@ fn run_offer(account: LocalAccount, kind_of_absence: Absence) -> Rescued {
 }
 
 /// Wait until the agent just started serves and return the connection, or the line that says why
-/// it will not. Every wait here is on the agent itself: its ready event, its process, and the
-/// folder it writes into.
+/// it will not. Every wait here is on the agent itself: its process, and the files it writes.
 fn settle(started: Started) -> Result<Socket, String> {
-    let Started { ready, agent } = started;
+    let Started { agent } = started;
     let logs = || {
         crate::userdir::current_socket_location()
             .map(|location| location.logs_dir())
             .unwrap_or_default()
     };
-    // 1. The agent's socket folder exists, or the agent ended first.
-    match ready.wait_with(agent.process.0) {
-        Ok(Waited::Ready) => {}
-        Ok(Waited::AgentExited(code)) => return Err(text::agent_ended(code, &logs())),
-        Err(e) => return Err(text::start_failed(&format!("{e:#}"))),
-    }
-    // 2. The profile exists now: look for the socket again, from this process's own token.
-    let location = crate::userdir::current_socket_location().map_err(|e| text::start_failed(&format!("{e:#}")))?;
-    // 3 and 4.
-    let watch = DirWatch::arm(&location.dir).map_err(|e| text::start_failed(&format!("{e:#}")))?;
-    let served = wait_until_serving(
-        || afunix::connect(&location.path).ok(),
-        || {
-            let handles = [watch.0, agent.process.0];
-            // SAFETY: both handles are valid for the call.
-            let woke = unsafe { WaitForMultipleObjects(&handles, false, INFINITE) };
-            if woke == WAIT_OBJECT_0 {
-                return Ok(Woke::Changed);
-            }
-            if woke.0 == WAIT_OBJECT_0.0 + 1 {
-                let mut code = 0u32;
-                // SAFETY: a valid process handle and out-pointer.
-                unsafe { windows::Win32::System::Threading::GetExitCodeProcess(agent.process.0, &mut code) }
-                    .context("read the agent's exit code")?;
-                return Ok(Woke::AgentExited(code));
-            }
-            anyhow::bail!("waiting for the agent's socket failed: {woke:?}")
-        },
-        || watch.rearm(),
-    )
-    .map_err(|e| text::start_failed(&format!("{e:#}")))?;
+    let watch = SocketWatch::for_current_user().map_err(|e| text::start_failed(&format!("{e:#}")))?;
+    let served = wait_for_agent(watch, agent.process.0, |location| afunix::connect(&location.path).ok())
+        .map_err(|e| text::start_failed(&format!("{e:#}")))?;
     match served {
         Served::Connected(socket) => Ok(socket),
-        Served::Ended { code } => Err(text::agent_ended(code, &location.logs_dir())),
+        Served::Ended { code } => Err(text::agent_ended(code, &logs())),
         // `Woke::Gone` is never returned by the wait above, which watches the agent's own process.
         Served::Gone => Err(text::start_failed("the agent ended before it served")),
     }
@@ -444,8 +419,8 @@ impl Evidence {
 
     /// Wait on the folder watch and on every item of the evidence; an item that ends is
     /// `Woke::Gone`.
-    fn wait(&mut self, watch: &DirWatch) -> anyhow::Result<Woke> {
-        let mut handles = vec![watch.0];
+    fn wait(&mut self, watch: &SocketWatch) -> anyhow::Result<Woke> {
+        let mut handles = vec![watch.handle()];
         handles.extend(self.holder.iter().map(starting_agent::HolderWatch::handle));
         handles.extend(self.agents.iter().map(procwait::Process::handle));
         handles.truncate(1 + MAX_EVIDENCE_HANDLES);
@@ -479,13 +454,13 @@ impl Evidence {
 /// lock's holder and the agent processes; all are real conditions, so it has no time limit.
 fn await_starting_agent(location: &SocketLocation, image: &Path, user: &Sid) -> anyhow::Result<Starting<Socket>> {
     let lock = location.lock_path();
-    let watch = DirWatch::arm(&location.dir)?;
+    let watch = RefCell::new(SocketWatch::for_location(location)?);
     let evidence = RefCell::new(Evidence::default());
     wait_while_starting(
         || afunix::connect(&location.path).ok(),
         || evidence.borrow_mut().look(&lock, image, user),
-        || evidence.borrow_mut().wait(&watch),
-        || watch.rearm(),
+        || evidence.borrow_mut().wait(&watch.borrow()),
+        || watch.borrow_mut().rearm(),
     )
 }
 

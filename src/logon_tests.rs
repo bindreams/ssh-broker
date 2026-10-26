@@ -2,29 +2,24 @@
 use super::*;
 
 const SID: &str = "S-1-5-21-1-2-3-1001";
-const NAME: &str = r"Global\ssh-broker-ready-0123456789abcdef0123456789abcdef";
 
 #[test]
 fn command_line_quotes_a_spaced_exe_path() {
-    let line = command_line(Path::new(r"C:\Program Files\ssh-broker\ssh-broker.exe"), NAME, SID);
+    let line = command_line(Path::new(r"C:\Program Files\ssh-broker\ssh-broker.exe"), SID);
     assert_eq!(
         line,
-        format!(
-            r#""C:\Program Files\ssh-broker\ssh-broker.exe" agent --background --ready-event {NAME} --expect-user {SID}"#
-        )
+        format!(r#""C:\Program Files\ssh-broker\ssh-broker.exe" agent --background --expect-user {SID}"#)
     );
 }
 
 /// The password reaches the logon call as its own argument and nowhere else: the command line holds
-/// the exe, the verb and two flags, and takes no secret.
+/// the exe, the verb and one flag, and takes no secret.
 #[test]
 fn command_line_has_no_password() {
-    let line = command_line(Path::new(r"C:\ProgramData\ssh-broker\ssh-broker.exe"), NAME, SID);
+    let line = command_line(Path::new(r"C:\ProgramData\ssh-broker\ssh-broker.exe"), SID);
     assert_eq!(
         line,
-        format!(
-            r#""C:\ProgramData\ssh-broker\ssh-broker.exe" agent --background --ready-event {NAME} --expect-user {SID}"#
-        )
+        format!(r#""C:\ProgramData\ssh-broker\ssh-broker.exe" agent --background --expect-user {SID}"#)
     );
     assert!(!line.to_lowercase().contains("pass"), "{line}");
 }

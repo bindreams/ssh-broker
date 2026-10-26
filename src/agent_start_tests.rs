@@ -23,13 +23,8 @@ fn guard() -> tracing_appender::non_blocking::WorkerGuard {
 
 const ME: &str = "S-1-5-21-1-2-3-1001";
 
-fn never_ready(_: &str) -> anyhow::Result<()> {
-    panic!("must not signal a ready event")
-}
-
-fn background(ready_event: Option<&str>, expect_user: Option<&str>) -> BackgroundArgs {
+fn background(expect_user: Option<&str>) -> BackgroundArgs {
     BackgroundArgs {
-        ready_event: ready_event.map(str::to_string),
         expect_user: expect_user.map(str::to_string),
     }
 }
@@ -47,7 +42,6 @@ fn start_refuses_session_zero_before_it_touches_anything() {
         ME,
         || -> anyhow::Result<SocketLocation> { panic!("must not look for the profile in session 0") },
         |_| -> anyhow::Result<_> { panic!("must not open a log in session 0") },
-        never_ready,
         |_, _| panic!("must not serve in session 0"),
     )
     .unwrap_err();
@@ -62,7 +56,6 @@ fn desktop_agent_still_refuses_session_zero_with_65() {
         ME,
         || -> anyhow::Result<SocketLocation> { panic!("must not look for the profile") },
         |_| -> anyhow::Result<_> { panic!("must not open a log") },
-        never_ready,
         |_, _| panic!("must not serve"),
     )
     .unwrap_err();
@@ -72,14 +65,13 @@ fn desktop_agent_still_refuses_session_zero_with_65() {
 
 #[test]
 fn expect_user_mismatch_exits_64_before_touching_the_folder() {
-    let args = background(Some("ev"), Some("S-1-5-21-1-2-3-9999"));
+    let args = background(Some("S-1-5-21-1-2-3-9999"));
     let err = start_with(
         Some(&args),
         2,
         ME,
         || -> anyhow::Result<SocketLocation> { panic!("must not look for the profile for another user") },
         |_| -> anyhow::Result<_> { panic!("must not open a log for another user") },
-        never_ready,
         |_, _| panic!("must not serve another user"),
     )
     .unwrap_err();
@@ -89,14 +81,13 @@ fn expect_user_mismatch_exits_64_before_touching_the_folder() {
 
 #[test]
 fn locate_failure_exits_66() {
-    let args = background(Some("ev"), Some(ME));
+    let args = background(Some(ME));
     let err = start_with(
         Some(&args),
         2,
         ME,
         || anyhow::bail!("the account has no profile directory"),
         |_| -> anyhow::Result<_> { panic!("must not open a log without a folder") },
-        never_ready,
         |_, _| panic!("must not serve without a folder"),
     )
     .unwrap_err();
@@ -114,14 +105,13 @@ fn folder_refusal_exits_67() {
     let loc = profile.location();
     // A file where the private folder belongs: nothing can be made safe there.
     std::fs::write(&loc.dir, b"planted").unwrap();
-    let args = background(Some("ev"), Some(ME));
+    let args = background(Some(ME));
     let err = start_with(
         Some(&args),
         2,
         ME,
         || Ok(loc.clone()),
         |_| -> anyhow::Result<_> { panic!("must not open a log in a refused folder") },
-        never_ready,
         |_, _| panic!("must not serve from a refused folder"),
     )
     .unwrap_err();
@@ -134,14 +124,13 @@ fn background_agent_is_allowed_in_session_zero() {
     let profile = TempProfile::new("start-bg0");
     let loc = profile.location();
     let served = Cell::new(None);
-    let args = background(None, Some(ME));
+    let args = background(Some(ME));
     start_with(
         Some(&args),
         0,
         ME,
         || Ok(loc.clone()),
         |_| Ok(guard()),
-        never_ready,
         |_, session| {
             served.set(Some(session));
             Ok(())
@@ -166,7 +155,6 @@ fn start_makes_the_private_folder_then_serves_that_session_from_it() {
             assert_eq!(logs, loc.logs_dir());
             Ok(guard())
         },
-        never_ready,
         |at, session| {
             assert!(
                 acl::verify_dir_acl(&at.dir, &Sid::current_user().unwrap()).unwrap(),
@@ -193,7 +181,6 @@ fn start_serves_without_a_log_when_the_log_cannot_be_opened() {
         ME,
         || Ok(loc.clone()),
         |_| anyhow::bail!("the disk is full"),
-        never_ready,
         |_, _| {
             served.set(true);
             Ok(())
@@ -214,7 +201,6 @@ fn start_returns_the_error_serving_stopped_with() {
         ME,
         || Ok(loc.clone()),
         |_| Ok(guard()),
-        never_ready,
         |_, _| anyhow::bail!("listener broke"),
     )
     .unwrap_err();
@@ -255,7 +241,6 @@ fn failure_after_the_log_opens_exits_1_and_logs_the_cause() {
             ME,
             || Ok(loc.clone()),
             |_| Ok(guard()),
-            never_ready,
             |_, _| anyhow::bail!("the listener broke"),
         )
     })
@@ -266,118 +251,27 @@ fn failure_after_the_log_opens_exits_1_and_logs_the_cause() {
 }
 
 #[test]
-fn ready_is_signalled_once_after_the_log_opens() {
-    let profile = TempProfile::new("start-ready");
+fn a_background_agent_opens_its_log_then_serves_and_signals_nothing_else() {
+    let profile = TempProfile::new("start-order");
     let loc = profile.location();
     let events = RefCell::new(Vec::new());
-    let args = background(Some("Global\\ssh-broker-ready-x"), Some(ME));
+    let args = background(Some(ME));
     start_with(
         Some(&args),
         2,
         ME,
         || Ok(loc.clone()),
         |_| {
-            events.borrow_mut().push("log".to_string());
+            events.borrow_mut().push("log");
             Ok(guard())
         },
-        |name| {
-            events.borrow_mut().push(format!("ready {name}"));
-            Ok(())
-        },
         |_, _| {
-            events.borrow_mut().push("serve".to_string());
+            events.borrow_mut().push("serve");
             Ok(())
         },
     )
     .unwrap();
-    assert_eq!(
-        events.into_inner(),
-        ["log", "ready Global\\ssh-broker-ready-x", "serve"],
-        "signalled exactly once, after the log opened and before serving"
-    );
-}
-
-#[test]
-fn ready_is_signalled_even_when_the_slot_is_taken() {
-    let profile = TempProfile::new("start-ready-slot");
-    let loc = profile.location();
-    std::fs::create_dir_all(&loc.dir).unwrap();
-    let _other = SessionSlot::try_acquire(&loc.sessions_lock_path(), 7).unwrap().unwrap();
-    let signalled = Cell::new(0);
-    let args = background(Some("ev"), Some(ME));
-    start_with(
-        Some(&args),
-        7,
-        ME,
-        || Ok(loc.clone()),
-        |_| Ok(guard()),
-        |_| {
-            signalled.set(signalled.get() + 1);
-            Ok(())
-        },
-        |at, session| {
-            serve_with(
-                at,
-                session,
-                |_| panic!("the user lock is taken only after the session slot"),
-                |_| panic!("an agent that does not hold the slot serves nothing"),
-            )
-        },
-    )
-    .unwrap();
-    assert_eq!(signalled.get(), 1, "the shim must wake even when this agent leaves");
-}
-
-#[test]
-fn agent_without_flags_never_signals() {
-    let profile = TempProfile::new("start-noflags");
-    let loc = profile.location();
-    start_with(
-        None,
-        3,
-        ME,
-        || Ok(loc.clone()),
-        |_| Ok(guard()),
-        never_ready,
-        |_, _| Ok(()),
-    )
-    .unwrap();
-}
-
-#[test]
-fn a_background_agent_without_a_ready_event_never_signals() {
-    let profile = TempProfile::new("start-noevent");
-    let loc = profile.location();
-    let args = background(None, Some(ME));
-    start_with(
-        Some(&args),
-        3,
-        ME,
-        || Ok(loc.clone()),
-        |_| Ok(guard()),
-        never_ready,
-        |_, _| Ok(()),
-    )
-    .unwrap();
-}
-
-#[test]
-fn a_failed_ready_signal_ends_the_agent_with_the_cause_and_serves_nothing() {
-    let profile = TempProfile::new("start-ready-fail");
-    let loc = profile.location();
-    let args = background(Some("ev"), Some(ME));
-    let err = start_with(
-        Some(&args),
-        3,
-        ME,
-        || Ok(loc.clone()),
-        |_| Ok(guard()),
-        |_| anyhow::bail!("access denied"),
-        |_, _| panic!("a shim that cannot be woken must not wait on an agent that serves"),
-    )
-    .unwrap_err();
-    assert!(format!("{err:#}").contains("access denied"), "{err:#}");
-    assert_eq!(exit_code_of(&err), 1);
+    assert_eq!(events.into_inner(), ["log", "serve"]);
 }
 
 // the serving marker -----

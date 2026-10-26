@@ -50,8 +50,6 @@ use crate::pipes::ExecChild;
 #[cfg(windows)]
 use crate::protocol::{ExitCode, FrameKind, FrameReader, Handshake, Mode, Resize, Stream, read_one_frame, write_frame};
 #[cfg(windows)]
-use crate::ready::ReadyEvent;
-#[cfg(windows)]
 use crate::relay::{FrameSink, pump_until_peer_gone, write_data};
 #[cfg(windows)]
 use crate::route::{AgentArgs, BackgroundArgs};
@@ -80,7 +78,6 @@ fn start(args: AgentArgs) -> anyhow::Result<()> {
         &current_sid,
         crate::userdir::current_socket_location,
         |logs| crate::filelog::init_in(logs, "agent.log"),
-        |name| ReadyEvent::open(name)?.signal(),
         |location, session| serve(location, session, background),
     )
 }
@@ -88,8 +85,7 @@ fn start(args: AgentArgs) -> anyhow::Result<()> {
 /// [`start`] with its inputs as parameters, so a test can pick the session and see what runs.
 ///
 /// `background` is `Some` for `agent --background`. The refusals before the log opens leave their
-/// exit code as the only record (see [`Refusal`]); `signal_ready` is called once, with the event's
-/// name, as soon as the log has opened and the socket folder exists, whatever `serve` then does.
+/// exit code as the only record (see [`Refusal`]).
 #[cfg(windows)]
 fn start_with(
     background: Option<&BackgroundArgs>,
@@ -97,7 +93,6 @@ fn start_with(
     current_sid: &str,
     locate: impl FnOnce() -> anyhow::Result<SocketLocation>,
     init_log: impl FnOnce(&Path) -> anyhow::Result<tracing_appender::non_blocking::WorkerGuard>,
-    signal_ready: impl FnOnce(&str) -> anyhow::Result<()>,
     serve: impl FnOnce(&SocketLocation, u32) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     check_start(background, session, current_sid)?;
@@ -108,12 +103,6 @@ fn start_with(
     // Held to the end: dropping the guard stops the writer and later lines are lost. Until the
     // log opens an error goes to stderr, which a logon task discards; a hand-run agent shows it.
     let _log = keep_log_or_report(init_log(&location.logs_dir()), &mut std::io::stderr());
-    if let Some(name) = background.and_then(|b| b.ready_event.as_deref())
-        && let Err(e) = signal_ready(name)
-    {
-        tracing::error!("could not signal the ready event: {e:#}");
-        return Err(e.context("signal the ready event"));
-    }
     let result = serve(&location, session);
     if let Err(e) = &result {
         tracing::error!("the agent stopped: {e:#}");

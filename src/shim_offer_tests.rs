@@ -286,3 +286,72 @@ fn a_failing_look_wait_or_rearm_is_an_error_not_a_hang() {
     .unwrap_err();
     assert!(format!("{failed:#}").contains("rearm failed"));
 }
+
+// wait_for_agent: the shim's own token and a temporary profile; no account, no logon -----
+
+mod wait_for_agent_on_files {
+    use super::*;
+    use crate::test_support::TempProfile;
+    use std::os::windows::io::AsRawHandle;
+    use std::os::windows::process::CommandExt;
+    use windows::Win32::System::Threading::CreateEventW;
+
+    /// A handle that is never signalled: an agent that is neither done nor gone.
+    fn live_agent() -> crate::winutil::OwnedHandle {
+        // SAFETY: an unnamed manual-reset event, not signalled.
+        crate::winutil::OwnedHandle(unsafe { CreateEventW(None, true, false, windows::core::PCWSTR::null()) }.unwrap())
+    }
+
+    fn marker_exists(location: &SocketLocation) -> Option<()> {
+        location.serving_marker_path().is_file().then_some(())
+    }
+
+    #[test]
+    fn a_marker_written_while_the_shim_waits_connects_it() {
+        let profile = TempProfile::new("wait-marker");
+        let location = profile.location();
+        let agent = live_agent();
+        let watch = SocketWatch::for_location(&location).unwrap();
+        // Whether this thread runs before, during or after the wait, the shim must find the marker.
+        let writer = {
+            let location = location.clone();
+            std::thread::spawn(move || {
+                crate::userdir::ensure_socket_dir(&location, &crate::acl::Sid::current_user().unwrap()).unwrap();
+                crate::agent_background::mark_listening(&location).unwrap();
+            })
+        };
+        let served = wait_for_agent(watch, agent.0, marker_exists).unwrap();
+        writer.join().unwrap();
+        assert_eq!(served, Served::Connected(()));
+    }
+
+    #[test]
+    fn an_agent_that_ends_with_no_marker_is_reported_with_its_exit_code() {
+        let profile = TempProfile::new("wait-ended");
+        let location = profile.location();
+        let mut child = std::process::Command::new("cmd.exe")
+            .args(["/c", "exit 3"])
+            .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+            .spawn()
+            .unwrap();
+        let handle = windows::Win32::Foundation::HANDLE(child.as_raw_handle());
+        let watch = SocketWatch::for_location(&location).unwrap();
+        let served = wait_for_agent(watch, handle, marker_exists).unwrap();
+        child.wait().unwrap();
+        assert_eq!(served, Served::Ended { code: 3 });
+    }
+
+    #[test]
+    fn a_marker_already_there_connects_without_waiting() {
+        let profile = TempProfile::new("wait-there");
+        let location = profile.location();
+        crate::userdir::ensure_socket_dir(&location, &crate::acl::Sid::current_user().unwrap()).unwrap();
+        crate::agent_background::mark_listening(&location).unwrap();
+        let agent = live_agent();
+        let watch = SocketWatch::for_location(&location).unwrap();
+        assert_eq!(
+            wait_for_agent(watch, agent.0, marker_exists).unwrap(),
+            Served::Connected(())
+        );
+    }
+}

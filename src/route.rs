@@ -46,8 +46,6 @@ pub struct AgentArgs {
 /// logon. Each is optional here; `agent_background::check_start` decides what a start needs.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct BackgroundArgs {
-    /// Name of the event to signal once the socket folder exists.
-    pub ready_event: Option<String>,
     /// SID text the agent's own token must have.
     pub expect_user: Option<String>,
 }
@@ -100,7 +98,7 @@ pub fn route(args: &[String], command_line: &str) -> Route {
     }
 }
 
-/// `[]` or `--background [--ready-event <name>] [--expect-user <sid>]`, each flag at most once. A
+/// `[]` or `--background [--expect-user <sid>]`, the flag at most once. A
 /// flag is accepted only after `--background`.
 fn agent_args(rest: &[String]) -> Option<AgentArgs> {
     let Some((first, flags)) = rest.split_first() else {
@@ -113,7 +111,6 @@ fn agent_args(rest: &[String]) -> Option<AgentArgs> {
     let mut flags = flags.iter();
     while let Some(flag) = flags.next() {
         let slot = match flag.as_str() {
-            "--ready-event" => &mut background.ready_event,
             "--expect-user" => &mut background.expect_user,
             _ => return None,
         };

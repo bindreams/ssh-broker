@@ -69,10 +69,9 @@ fn agent_alone_is_a_desktop_agent() {
     );
 }
 
-fn background(ready_event: Option<&str>, expect_user: Option<&str>) -> Route {
+fn background(expect_user: Option<&str>) -> Route {
     Route::Agent(AgentArgs {
         background: Some(BackgroundArgs {
-            ready_event: ready_event.map(str::to_string),
             expect_user: expect_user.map(str::to_string),
         }),
     })
@@ -80,33 +79,30 @@ fn background(ready_event: Option<&str>, expect_user: Option<&str>) -> Route {
 
 #[test]
 fn agent_background_flags_parse() {
-    assert_eq!(route_line("ssh-broker.exe agent --background"), background(None, None));
+    assert_eq!(route_line("ssh-broker.exe agent --background"), background(None));
     assert_eq!(
-        route_line(r"ssh-broker.exe agent --background --ready-event Global\sb-ab --expect-user S-1-5-21-1-2-3-1001"),
-        background(Some(r"Global\sb-ab"), Some("S-1-5-21-1-2-3-1001"))
+        route_line("ssh-broker.exe agent --background --expect-user S-1-5-21-1-2-3-1001"),
+        background(Some("S-1-5-21-1-2-3-1001"))
     );
-    // Order does not matter, and the flags may precede each other.
+}
+
+#[test]
+fn the_ready_event_flag_is_gone() {
+    // The shim no longer passes a named event; a build that still did would fail loudly.
     assert_eq!(
-        route_line("ssh-broker.exe agent --background --expect-user S-1-5-18 --ready-event ev"),
-        background(Some("ev"), Some("S-1-5-18"))
-    );
-    assert_eq!(
-        route_line("ssh-broker.exe agent --background --expect-user S-1-5-18"),
-        background(None, Some("S-1-5-18"))
+        route_line("ssh-broker.exe agent --background --ready-event ev --expect-user S-1-5-18"),
+        Route::Usage(Verb::Agent)
     );
 }
 
 #[test]
 fn agent_unknown_flag_is_not_the_shim() {
     for line in [
-        "ssh-broker.exe agent --ready-event ev",
         "ssh-broker.exe agent --expect-user S-1-5-18",
         "ssh-broker.exe agent --bogus",
         "ssh-broker.exe agent stray",
         "ssh-broker.exe agent --background --bogus",
-        "ssh-broker.exe agent --background --ready-event",
         "ssh-broker.exe agent --background --expect-user",
-        "ssh-broker.exe agent --background --ready-event a --ready-event b",
         "ssh-broker.exe agent --background --expect-user a --expect-user b",
         "ssh-broker.exe agent --background --background",
         "ssh-broker.exe agent --background stray",
@@ -128,7 +124,7 @@ fn logout_takes_no_arguments() {
 #[test]
 fn a_flag_name_is_not_a_flag_value() {
     assert_eq!(
-        route_line("ssh-broker.exe agent --background --ready-event --expect-user x"),
+        route_line("ssh-broker.exe agent --background --expect-user --expect-user x"),
         Route::Usage(Verb::Agent)
     );
 }

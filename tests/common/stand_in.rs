@@ -7,19 +7,18 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use ssh_broker::ready::{ReadyEvent, Waited, generate_name};
 use ssh_broker::socket_loc::SocketLocation;
+use ssh_broker::socket_watch::SocketWatch;
 use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
-use windows::Win32::Storage::FileSystem::{
-    FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_CHANGE_SIZE, FindCloseChangeNotification,
-    FindFirstChangeNotificationW, FindNextChangeNotification,
-};
 use windows::Win32::System::Threading::{
     CREATE_PROCESS_LOGON_FLAGS, TerminateProcess, WaitForMultipleObjects, WaitForSingleObject,
 };
-use windows::core::PCWSTR;
 
 use crate::account_fixture::{Account, SharedDir, Spawned};
+
+#[path = "file_signal.rs"]
+pub mod file_signal;
+use file_signal::FileWaited;
 
 /// The stand-in example, which `cargo test` builds.
 pub fn example_exe() -> PathBuf {
@@ -107,14 +106,12 @@ pub struct ShimRun {
 
 /// Start the stand-in shim as `account`'s network token with `before_resume` called while it is
 /// still suspended (to put it in a job), wait until it reports, and return what it recorded. The
-/// wait is on the "reported" event and on the shim's own exit, so a shim that dies is a failure and
-/// not a hang. With `hold` the shim then stays alive until it is killed.
+/// report is the appearance of `shim.result`, awaited together with the shim's own exit, so a shim
+/// that dies is a failure and not a hang. With `hold` the shim then stays alive until it is killed.
 pub fn start_shim(kit: &Kit, account: &Account, hold: bool, before_resume: impl FnOnce(&Spawned)) -> ShimRun {
-    let reported_name = generate_name().unwrap();
-    let reported = ReadyEvent::create_named(&reported_name, &account.sid_text).unwrap();
     std::fs::write(
         kit.path("shim.input"),
-        format!("{}\n{}\n{reported_name}\n", account.password, kit.exe.display()),
+        format!("{}\n{}\n", account.password, kit.exe.display()),
     )
     .unwrap();
     if hold {
@@ -131,12 +128,14 @@ pub fn start_shim(kit: &Kit, account: &Account, hold: bool, before_resume: impl 
     );
     before_resume(&process);
     process.resume();
-    match wait_ready(&reported, process.process.0, "the stand-in shim") {
-        Waited::Ready => {}
-        Waited::AgentExited(code) => panic!(
-            "the stand-in shim ended with {code:#x} before it reported; shim.result: {}",
-            kit.read("shim.result")
-        ),
+    match file_signal::wait_for_file(
+        &kit.path("shim.result"),
+        Some(process.process.0),
+        Some(SERVING_BOUND),
+        "the stand-in shim's report",
+    ) {
+        FileWaited::Appeared => {}
+        FileWaited::ProcessEnded(code) => panic!("the stand-in shim ended with {code:#x} before it reported"),
     }
     ShimRun {
         process,
@@ -250,60 +249,29 @@ pub fn wait_for_serving_marker_of_a_task(location: &SocketLocation, bound: std::
     wait_for_marker(location, None, bound)
 }
 
-/// Wait for `event` to be signalled or for `agent` (a process handle) to end, as
-/// [`ReadyEvent::wait_with`] does, but with a failure bound: an agent that neither signals nor ends
-/// is an external event that may never come, and expiry fails the test naming `what`.
-pub fn wait_ready(event: &ReadyEvent, agent: HANDLE, what: &str) -> Waited {
-    let handles = [event.as_handle(), agent];
-    let millis = u32::try_from(SERVING_BOUND.as_millis()).expect("a bound shorter than INFINITE");
-    // SAFETY: both handles are valid for the call.
-    let woke = unsafe { WaitForMultipleObjects(&handles, false, millis) }; // sleep-ok: failure bound on an agent's ready signal, an external event; expiry fails the test and is not read as state
-    if woke == WAIT_OBJECT_0 {
-        Waited::Ready
-    } else if woke.0 == WAIT_OBJECT_0.0 + 1 {
-        let mut code = 0u32;
-        // SAFETY: a valid process handle and out-pointer.
-        unsafe { windows::Win32::System::Threading::GetExitCodeProcess(agent, &mut code) }
-            .expect("read the agent's exit code");
-        Waited::AgentExited(code)
-    } else if woke == WAIT_TIMEOUT {
-        panic!("{what} neither signalled that it was ready nor ended within {SERVING_BOUND:?}")
-    } else {
-        panic!("waiting for {what}'s ready event failed: {woke:?}")
-    }
-}
-
 fn wait_for_marker(location: &SocketLocation, agent: Option<HANDLE>, bound: std::time::Duration) {
-    use std::os::windows::ffi::OsStrExt;
-    // The socket folder may not exist yet, so the watch is on its parent and covers the subtree.
-    let watched = location.dir.parent().expect("the socket folder has a parent");
-    let watched_w: Vec<u16> = watched.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
-    // SAFETY: a NUL-terminated path; the handle is closed below.
-    let watch = unsafe {
-        FindFirstChangeNotificationW(
-            PCWSTR(watched_w.as_ptr()),
-            true,
-            FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_SIZE | FILE_NOTIFY_CHANGE_LAST_WRITE,
-        )
-    }
-    .unwrap();
+    // The socket folder, and the profile above it, may not exist yet: the watch follows the path down.
+    let mut watch = SocketWatch::for_location(location).unwrap_or_else(|e| panic!("{e:#}"));
     loop {
         if location.serving_marker_path().is_file() {
-            break;
+            return;
         }
-        let handles: Vec<HANDLE> = std::iter::once(watch).chain(agent).collect();
+        let handles: Vec<HANDLE> = std::iter::once(watch.handle()).chain(agent).collect();
         let millis = u32::try_from(bound.as_millis()).expect("a bound shorter than INFINITE");
         // SAFETY: every handle is valid.
         let woke = unsafe { WaitForMultipleObjects(&handles, false, millis) }; // sleep-ok: failure bound on an agent start that may never come; expiry fails the test
         if woke == WAIT_OBJECT_0 {
-            // SAFETY: a valid watch handle.
-            unsafe { FindNextChangeNotification(watch) }.unwrap();
+            watch.rearm().unwrap_or_else(|e| panic!("{e:#}"));
         } else if woke == WAIT_TIMEOUT {
             panic!(
                 "no agent was serving {} after {bound:?}: it neither wrote its serving marker nor ended,                  or the scheduled task did not start one",
                 location.dir.display()
             );
         } else if let Some(agent) = agent {
+            // The agent may have written the marker as its last act.
+            if location.serving_marker_path().is_file() {
+                return;
+            }
             let mut code = 0u32;
             // SAFETY: a valid process handle and out-pointer.
             let _ = unsafe { windows::Win32::System::Threading::GetExitCodeProcess(agent, &mut code) };
@@ -312,8 +280,6 @@ fn wait_for_marker(location: &SocketLocation, agent: Option<HANDLE>, bound: std:
             panic!("waiting for the serving marker failed: {woke:?}");
         }
     }
-    // SAFETY: the handle from above.
-    let _ = unsafe { FindCloseChangeNotification(watch) };
 }
 
 /// Everything the agent logged in `location`'s logs folder.

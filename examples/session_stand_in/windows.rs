@@ -3,12 +3,15 @@ use std::path::{Path, PathBuf};
 use ssh_broker::account::current_account;
 use ssh_broker::acl::Sid;
 use ssh_broker::logon::start_background_agent;
-use ssh_broker::ready::{ReadyEvent, Waited};
 use ssh_broker::route::{AgentArgs, BackgroundArgs, Route};
+use ssh_broker::shim_offer::{Served, wait_for_agent};
+use ssh_broker::socket_watch::SocketWatch;
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::System::Threading::{CreateEventW, GetProcessId, INFINITE, WaitForSingleObject};
 use windows::core::PCWSTR;
 
+#[path = "../../tests/common/file_signal.rs"]
+mod file_signal;
 #[path = "../../tests/common/password.rs"]
 mod password;
 
@@ -24,19 +27,21 @@ pub fn main() {
     }
 }
 
+/// What `start_background_agent` starts: records who it runs as, makes its socket folder and writes
+/// the `serving` marker the way the real agent does after `listen()`, and, if `agent.plan` exists,
+/// waits for the file `agent.go` and then writes `agent.ack`.
 fn agent(dir: &Path, args: &[String]) {
     let Route::Agent(AgentArgs {
-        background:
-            Some(BackgroundArgs {
-                ready_event: Some(name),
-                expect_user: Some(expect),
-            }),
+        background: Some(BackgroundArgs {
+            expect_user: Some(expect),
+        }),
     }) = ssh_broker::route(args, &ssh_broker::cmdline::current())
     else {
         std::fs::write(dir.join("agent.error"), "unexpected command line").unwrap();
         std::process::exit(2);
     };
-    let sid = Sid::current_user().unwrap().to_sddl().unwrap();
+    let user = Sid::current_user().unwrap();
+    let sid = user.to_sddl().unwrap();
     let session = ssh_broker::provision::probe::current_session_id();
     let info = format!(
         "pid={}\nsid={sid}\nexpect_user_matches={}\nsession={session}\n",
@@ -44,42 +49,33 @@ fn agent(dir: &Path, args: &[String]) {
         sid == expect
     );
     std::fs::write(dir.join("agent.info"), info).unwrap();
-    let ready = match ReadyEvent::open(&name) {
-        Ok(ready) => ready,
-        Err(e) => {
-            std::fs::write(dir.join("agent.error"), format!("open the ready event: {e:#}")).unwrap();
-            std::process::exit(3);
-        }
-    };
-    ready.signal().unwrap();
-    let Ok(plan) = std::fs::read_to_string(dir.join("agent.plan")) else {
+    let made = ssh_broker::userdir::current_socket_location()
+        .and_then(|location| {
+            ssh_broker::userdir::ensure_socket_dir(&location, &user)?;
+            Ok(location)
+        })
+        .and_then(|location| Ok(ssh_broker::agent_background::mark_listening(&location)?));
+    if let Err(e) = made {
+        std::fs::write(
+            dir.join("agent.error"),
+            format!("make the socket folder and marker: {e:#}"),
+        )
+        .unwrap();
+        std::process::exit(3);
+    }
+    if !dir.join("agent.plan").exists() {
         return;
-    };
-    let named = |key: &str| {
-        let line = plan.lines().find_map(|l| l.strip_prefix(key)).unwrap();
-        ReadyEvent::open(line).unwrap()
-    };
-    let (go, ack) = (named("go="), named("ack="));
-    // SAFETY: a valid event handle; the wait is on an event the test sets.
-    unsafe { WaitForSingleObject(go.as_handle(), INFINITE) };
-    ack.signal().unwrap();
+    }
+    file_signal::wait_for_file(&dir.join("agent.go"), None, None, "the test's go signal");
+    file_signal::publish(&dir.join("agent.ack"), "ack");
 }
 
 fn shim(dir: &Path) {
     let input = std::fs::read_to_string(dir.join("shim.input")).unwrap();
     let mut lines = input.lines();
-    let (password, agent_exe, reported) = (lines.next().unwrap(), lines.next().unwrap(), lines.next().unwrap());
+    let (password, agent_exe) = (lines.next().unwrap(), lines.next().unwrap());
     let result = run_shim(password, &PathBuf::from(agent_exe));
-    let reported = match ReadyEvent::open(reported) {
-        Ok(event) => event,
-        Err(e) => {
-            let result = format!("{result}\nopen the reported event failed: {e:#}");
-            std::fs::write(dir.join("shim.result"), result).unwrap();
-            std::process::exit(4);
-        }
-    };
-    std::fs::write(dir.join("shim.result"), result).unwrap();
-    reported.signal().unwrap();
+    file_signal::publish(&dir.join("shim.result"), &result);
     if dir.join("shim.hold").exists() {
         // Blocks until this process is killed (the caller's job closing).
         // SAFETY: an unnamed, never-signalled event.
@@ -90,125 +86,32 @@ fn shim(dir: &Path) {
     }
 }
 
+/// What the real shim does after the prompt, with the stand-in agent: start the agent through the
+/// logon, then wait, from this token and with the product's own watch, until the agent has made its
+/// folder and written the marker.
 fn run_shim(password: &str, agent_exe: &Path) -> String {
     let account = match current_account() {
         Ok(account) => account,
         Err(e) => return format!("current_account failed: {e:#}"),
     };
-    let (ready, name) = match ReadyEvent::create() {
-        Ok(made) => made,
-        Err(e) => return format!("create the ready event failed: {e:#}\n{}", diagnose_named_objects()),
+    let watch = match SocketWatch::for_current_user() {
+        Ok(watch) => watch,
+        Err(e) => return format!("watch the socket failed: {e:#}"),
     };
-    let started = match start_background_agent(&account, &password::password(password), agent_exe, &name) {
+    let started = match start_background_agent(&account, &password::password(password), agent_exe) {
         Ok(started) => started,
         Err(e) => return format!("logon failed: {} {}", e.code, e.reason),
     };
     // SAFETY: a valid process handle.
     let pid = unsafe { GetProcessId(started.process.0) };
-    match ready.wait_with(HANDLE(started.process.0.0)) {
-        Ok(Waited::Ready) => format!("Ready pid={pid}"),
-        Ok(Waited::AgentExited(code)) => format!("AgentExited {code} pid={pid}"),
+    let served = wait_for_agent(watch, HANDLE(started.process.0.0), |location| {
+        location.serving_marker_path().is_file().then_some(())
+    });
+    match served {
+        Ok(Served::Connected(())) => format!("Ready pid={pid}"),
+        Ok(Served::Ended { code }) => format!("AgentExited {code} pid={pid}"),
+        Ok(Served::Gone) => format!("AgentGone pid={pid}"),
         Err(e) => format!("wait failed: {e:#}"),
-    }
-}
-
-/// What this token can and cannot do with named events, for the report of a failed ready event:
-/// the token (`whoami /all`) and `CreateEventW` in each namespace, with no descriptor, with a plain
-/// one, with the product's DACL, and with the product's DACL and label.
-fn diagnose_named_objects() -> String {
-    let token = std::process::Command::new("whoami")
-        .arg("/all")
-        .output()
-        .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
-        .unwrap_or_else(|e| format!("(whoami did not run: {e})"));
-    let sid = Sid::current_user().and_then(|sid| sid.to_sddl()).unwrap_or_default();
-    let session = ssh_broker::provision::probe::current_session_id();
-    let mut report = format!("session={session} sid={sid}\n");
-    let tag = std::process::id();
-    let dacl = format!("D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x100002;;;{sid})");
-    let tries: [(String, String, Option<String>); 8] = [
-        ("unnamed".into(), String::new(), None),
-        ("Global, no descriptor".into(), format!(r"Global\sb-diag-a-{tag}"), None),
-        ("Local, no descriptor".into(), format!(r"Local\sb-diag-b-{tag}"), None),
-        (
-            "Global, Everyone all access".into(),
-            format!(r"Global\sb-diag-c-{tag}"),
-            Some("D:(A;;GA;;;WD)".into()),
-        ),
-        (
-            "Global, the product's DACL, no label".into(),
-            format!(r"Global\sb-diag-d-{tag}"),
-            Some(dacl.clone()),
-        ),
-        (
-            "Global, the product's DACL and label".into(),
-            format!(r"Global\sb-diag-e-{tag}"),
-            Some(ssh_broker::ready::descriptor_sddl(&sid)),
-        ),
-        (
-            "Local, the product's DACL and label".into(),
-            format!(r"Local\sb-diag-f-{tag}"),
-            Some(ssh_broker::ready::descriptor_sddl(&sid)),
-        ),
-        (
-            "Global, label only".into(),
-            format!(r"Global\sb-diag-g-{tag}"),
-            Some("S:(ML;;NW;;;ME)".into()),
-        ),
-    ];
-    for (what, name, sddl) in tries {
-        report += &format!("CreateEventW {what}: {}\n", try_event(&name, sddl.as_deref()));
-    }
-    report + "whoami /all:\n" + &token
-}
-
-/// `CreateEventW` of `name` (unnamed if empty) with the descriptor `sddl`, as text: the outcome.
-fn try_event(name: &str, sddl: Option<&str>) -> String {
-    use windows::Win32::Foundation::{HLOCAL, LocalFree};
-    use windows::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
-    use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
-    use windows::core::BOOL;
-
-    let wide = |text: &str| -> Vec<u16> { text.encode_utf16().chain(std::iter::once(0)).collect() };
-    let mut descriptor = PSECURITY_DESCRIPTOR::default();
-    if let Some(sddl) = sddl {
-        // SAFETY: NUL-terminated input and a valid out-pointer; freed below.
-        if let Err(e) = unsafe {
-            ConvertStringSecurityDescriptorToSecurityDescriptorW(PCWSTR(wide(sddl).as_ptr()), 1, &mut descriptor, None)
-        } {
-            return format!("the descriptor {sddl:?} did not build: {e}");
-        }
-    }
-    let attributes = SECURITY_ATTRIBUTES {
-        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
-        lpSecurityDescriptor: descriptor.0,
-        bInheritHandle: BOOL(0),
-    };
-    let name_w = wide(name);
-    // SAFETY: the pointers are to locals that outlive the call.
-    let made = unsafe {
-        CreateEventW(
-            sddl.map(|_| &attributes as *const SECURITY_ATTRIBUTES),
-            true,
-            false,
-            if name.is_empty() {
-                PCWSTR::null()
-            } else {
-                PCWSTR(name_w.as_ptr())
-            },
-        )
-    };
-    if sddl.is_some() {
-        // SAFETY: the descriptor the conversion allocated.
-        let _ = unsafe { LocalFree(Some(HLOCAL(descriptor.0))) };
-    }
-    match made {
-        Ok(handle) => {
-            // SAFETY: the handle just made.
-            let _ = unsafe { windows::Win32::Foundation::CloseHandle(handle) };
-            "ok".into()
-        }
-        Err(e) => format!("{e}"),
     }
 }
 

@@ -11,7 +11,6 @@ use ssh_broker::account::LocalAccount;
 use ssh_broker::afunix::{self, ConnRx, ConnTx};
 use ssh_broker::logon;
 use ssh_broker::protocol::{FrameKind, FrameReader, Handshake, Mode, Stream, write_frame};
-use ssh_broker::ready::{self, ReadyEvent, Waited};
 use ssh_broker::relay::{FrameSink, Outcome, PumpError, pump_decode, write_data};
 use ssh_broker::socket_loc::{self, SocketLocation};
 use ssh_broker::vtinput::{KeyEvent, encode_key_event};
@@ -45,23 +44,14 @@ impl BackgroundAgent {
     /// Start it from `kit`'s copy of the real exe and wait until it is listening. Panics with what
     /// the agent left (exit code, `agent.log`) if it ends first.
     pub fn start(kit: &Kit, account: &Account) -> BackgroundAgent {
-        let name = ready::generate_name().unwrap();
-        let event = ReadyEvent::create_named(&name, &account.sid_text).unwrap();
         let password = crate::password::password(&account.password);
-        let started = logon::start_background_agent(&local_account(account), &password, &kit.exe, &name)
+        let started = logon::start_background_agent(&local_account(account), &password, &kit.exe)
             .unwrap_or_else(|e| panic!("the logon for {} failed: {e:?}", account.name));
         let location = socket_loc::for_profile(account.profile()).unwrap();
         let agent = BackgroundAgent {
             process: started.process,
             location,
         };
-        match crate::stand_in::wait_ready(&event, agent.process.0, "the background agent") {
-            Waited::Ready => {}
-            Waited::AgentExited(code) => panic!(
-                "the background agent ended with {code:#x} before its socket folder existed:\n{}",
-                crate::stand_in::read_logs(&agent.location)
-            ),
-        }
         wait_for_serving_marker(&agent.location, agent.process.0);
         agent
     }

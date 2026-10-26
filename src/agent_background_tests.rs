@@ -7,7 +7,6 @@ const OTHER: &str = "S-1-5-21-1-2-3-1002";
 
 fn background(expect_user: Option<&str>) -> BackgroundArgs {
     BackgroundArgs {
-        ready_event: None,
         expect_user: expect_user.map(str::to_string),
     }
 }

@@ -41,7 +41,7 @@ checked.
 | `secret`, `password_entry` | wiped password buffers, and the key-event state machine that fills one |
 | `console_modes`, `console_prompt` | the console's raw mode as a guard; the password prompt on it, and why the shim has no agent |
 | `shim_offer` | the shim's hook for a missing agent: the notice, or the prompt, the logon and the wait for the agent |
-| `account`, `logon`, `ready` | who the token is, the secondary-logon call that starts a background agent, the event it signals |
+| `account`, `logon`, `socket_watch` | who the token is, the secondary-logon call that starts a background agent, and the folder and profile-list watch with which the shim learns the agent serves (no named kernel object) |
 | `agent_background`, `agent/logout`, `logout` | the background agent's start checks and exit codes; ending a session, both sides |
 
 ## Invariants you must not break

@@ -373,7 +373,7 @@ fn agent_alone_is_a_desktop_agent() {
 
 #[test]
 fn agent_background_with_flags_is_a_background_agent() {
-    let line = r"C:\ProgramData\ssh-broker\ssh-broker.exe agent --background --ready-event Global\sb-x --expect-user S-1-5-21-1";
+    let line = r"C:\ProgramData\ssh-broker\ssh-broker.exe agent --background --expect-user S-1-5-21-1";
     assert_eq!(role_of(line), Role::BackgroundAgent);
     assert_eq!(
         role_of(r"C:\ProgramData\ssh-broker\ssh-broker.exe agent --background"),

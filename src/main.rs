@@ -37,7 +37,7 @@ fn main() -> anyhow::Result<()> {
 
 fn usage(verb: Verb) -> &'static str {
     match verb {
-        Verb::Agent => "usage: ssh-broker agent [--background [--ready-event <name>] [--expect-user <sid>]]",
+        Verb::Agent => "usage: ssh-broker agent [--background [--expect-user <sid>]]",
         Verb::Logout => "usage: ssh-broker logout",
     }
 }
