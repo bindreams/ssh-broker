@@ -24,6 +24,7 @@ pub mod conpty;
 pub mod filelog;
 #[cfg(windows)]
 pub mod hangup;
+pub mod offer;
 pub mod password_entry;
 #[cfg(windows)]
 pub mod pipes;
