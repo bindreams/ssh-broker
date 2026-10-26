@@ -192,3 +192,178 @@ fn every_session_starts_when_nothing_survived() {
     assert_eq!(plan.start, [1, 2]);
     assert!(plan.held.is_empty());
 }
+
+// session tasks and background agents -----
+
+use crate::provision::procwait::{StillRunning, Survivor};
+use std::time::Duration;
+
+fn task(name: &str, enabled: bool) -> SessionTask {
+    SessionTask {
+        name: name.into(),
+        enabled,
+    }
+}
+
+/// `stop_sessions` over a fake machine: the tasks listed, the agents running (a pid each), and a
+/// record of every call. The wait fails with a survivor when `survivor` names one.
+struct World {
+    tasks: Vec<SessionTask>,
+    agents: RefCell<Vec<u32>>,
+    survivor: Option<u32>,
+    events: RefCell<Vec<String>>,
+    recorded: RefCell<Vec<String>>,
+}
+
+impl World {
+    fn new(tasks: Vec<SessionTask>, agents: Vec<u32>) -> World {
+        World {
+            tasks,
+            agents: RefCell::new(agents),
+            survivor: None,
+            events: RefCell::default(),
+            recorded: RefCell::default(),
+        }
+    }
+
+    fn stop(&self) -> anyhow::Result<()> {
+        stop_sessions(
+            || Ok(self.tasks.iter().map(|t| task(&t.name, t.enabled)).collect()),
+            &self.recorded,
+            |name| {
+                self.events.borrow_mut().push(format!("stop task {name}"));
+                Ok(())
+            },
+            || Ok(self.agents.borrow().clone()),
+            |pid| {
+                self.events.borrow_mut().push(format!("end {pid}"));
+                Ok(())
+            },
+            |pids| {
+                self.events.borrow_mut().push(format!("wait {pids:?}"));
+                self.agents.borrow_mut().retain(|pid| !pids.contains(pid));
+                match self.survivor {
+                    Some(pid) => Err(StillRunning::new(
+                        vec![Survivor {
+                            pid,
+                            session: Some(0),
+                            unconfirmed: None,
+                        }],
+                        Duration::from_secs(60),
+                    )
+                    .into()),
+                    None => Ok(()),
+                }
+            },
+        )
+    }
+}
+
+#[test]
+fn a_background_agent_that_is_not_a_task_instance_is_ended() {
+    let world = World::new(vec![], vec![4242]);
+    world.stop().unwrap();
+    assert_eq!(*world.events.borrow(), ["end 4242", "wait [4242]"]);
+}
+
+#[test]
+fn every_session_task_is_stopped_and_only_the_enabled_ones_are_recorded() {
+    let world = World::new(vec![task("a", true), task("b", false), task("c", true)], vec![]);
+    world.stop().unwrap();
+    assert_eq!(*world.events.borrow(), ["stop task a", "stop task b", "stop task c"]);
+    assert_eq!(*world.recorded.borrow(), ["a", "c"], "a task that was off stays off");
+}
+
+#[test]
+fn a_task_is_recorded_before_its_stop_so_a_failed_stop_still_gets_it_back() {
+    let world = World::new(vec![task("a", true)], vec![]);
+    let result = stop_sessions(
+        || Ok(world.tasks.iter().map(|t| task(&t.name, t.enabled)).collect()),
+        &world.recorded,
+        |_| anyhow::bail!("access denied"),
+        || Ok(vec![]),
+        |_| Ok(()),
+        |_: Vec<u32>| Ok(()),
+    );
+    assert!(result.is_err());
+    assert_eq!(*world.recorded.borrow(), ["a"]);
+}
+
+#[test]
+fn the_agents_are_looked_for_again_until_none_is_left() {
+    // An agent started by a task between the look and the end shows up on the next look.
+    let looks = RefCell::new(vec![vec![1], vec![2], vec![]].into_iter());
+    let ended = RefCell::new(Vec::new());
+    stop_sessions(
+        || Ok(vec![]),
+        &RefCell::default(),
+        |_| Ok(()),
+        || Ok(looks.borrow_mut().next().unwrap()),
+        |pid| {
+            ended.borrow_mut().push(*pid);
+            Ok(())
+        },
+        |_| Ok(()),
+    )
+    .unwrap();
+    assert_eq!(ended.into_inner(), [1, 2]);
+}
+
+#[test]
+fn background_agent_survivor_blocks_the_copy_with_its_pid() {
+    let mut world = World::new(vec![], vec![4242]);
+    world.survivor = Some(4242);
+    let text = format!("{:#}", world.stop().unwrap_err());
+    assert!(text.contains("process 4242"), "{text}");
+    assert!(text.contains("run apply again"), "{text}");
+}
+
+#[test]
+fn session_tasks_are_reenabled_after_a_failed_install() {
+    let world = World::new(vec![task("a", true), task("b", false)], vec![]);
+    let enabled = RefCell::new(Vec::new());
+    let ran = RefCell::new(Vec::new());
+    let result: anyhow::Result<()> = run(
+        || world.stop(),
+        |stop| {
+            stop()?;
+            anyhow::bail!("register failed")
+        },
+        || true,
+        || {
+            resume_sessions(&world.recorded, |name| {
+                enabled.borrow_mut().push(name.to_string());
+                Ok(())
+            })
+        },
+        |_| {
+            start_sessions(&world.recorded, |name| {
+                ran.borrow_mut().push(name.to_string());
+                Ok(())
+            })
+        },
+    );
+    assert_eq!(format!("{:#}", result.unwrap_err()), "register failed");
+    assert_eq!(
+        enabled.into_inner(),
+        ["a"],
+        "the task that was on is on again, the other stays off"
+    );
+    assert_eq!(ran.into_inner(), ["a"], "and is started again");
+}
+
+#[test]
+fn a_session_task_that_cannot_be_enabled_again_is_an_error_and_the_rest_still_are() {
+    let recorded = RefCell::new(vec!["a".to_string(), "b".to_string()]);
+    let tried = RefCell::new(Vec::new());
+    let result = resume_sessions(&recorded, |name| {
+        tried.borrow_mut().push(name.to_string());
+        if name == "a" {
+            anyhow::bail!("access denied")
+        }
+        Ok(())
+    });
+    assert_eq!(tried.into_inner(), ["a", "b"]);
+    let text = format!("{:#}", result.unwrap_err());
+    assert!(text.contains("access denied") && text.contains("a"), "{text}");
+}

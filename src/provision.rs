@@ -17,7 +17,7 @@ pub(crate) mod layout;
 pub mod password_variant;
 pub mod probe;
 #[cfg(windows)]
-pub(crate) mod procwait;
+pub mod procwait;
 pub mod registry;
 pub mod report;
 pub mod schtasks;
@@ -131,8 +131,14 @@ mod imp {
         //    exited.
         let current = std::env::current_exe().context("current_exe")?;
         let registered_xml = schtasks::registered_xml(taskscheduler::task_xml(schtasks::AGENT_TASK))?;
+        // The auto-login tasks that were enabled when the agents were stopped, to be enabled and
+        // started again afterwards.
+        let enabled_sessions = std::cell::RefCell::new(Vec::new());
         let exe = flow::run(
-            || taskscheduler::stop_instances(schtasks::AGENT_TASK, &layout.canonical_exe()),
+            || {
+                taskscheduler::stop_instances(schtasks::AGENT_TASK, &layout.canonical_exe())?;
+                stop_background_sessions(&layout.canonical_exe(), &enabled_sessions)
+            },
             |stop_agents| {
                 let exe = layout::prepare(&layout, &current, registered_xml.as_deref(), stop_agents)?;
 
@@ -154,14 +160,44 @@ mod imp {
                 Ok(exe)
             },
             agent_task_is_group_form,
-            enable_agent_task,
-            start_agents,
+            || {
+                let agent_task = enable_agent_task();
+                let sessions = flow::resume_sessions(&enabled_sessions, |name| taskscheduler::set_enabled(name, true));
+                match (agent_task, sessions) {
+                    (Err(e), Err(sessions)) => {
+                        eprintln!("apply: {sessions:#}");
+                        Err(e)
+                    }
+                    (Err(e), Ok(())) | (Ok(()), Err(e)) => Err(e),
+                    (Ok(()), Ok(())) => Ok(()),
+                }
+            },
+            |survivors| {
+                start_agents(survivors);
+                flow::start_sessions(&enabled_sessions, taskscheduler::run_task);
+            },
         )?;
         println!(
             "apply: ok — DefaultShell -> {}, agent + self-heal tasks installed",
             exe.display()
         );
         Ok(())
+    }
+
+    /// The background sessions' part of the stop that precedes replacing the exe: the auto-login
+    /// tasks are disabled and their instances stopped, then every background agent left (the prompt
+    /// path starts one without a task) is ended. A shim is never ended: it holds the exe only until
+    /// its SSH session closes, and the copy reports it if it still does.
+    fn stop_background_sessions(image: &Path, enabled: &std::cell::RefCell<Vec<String>>) -> anyhow::Result<()> {
+        flow::stop_sessions(
+            taskscheduler::session_tasks,
+            enabled,
+            |name| taskscheduler::stop_instances(name, image),
+            || procwait::background_agents(image),
+            |agent| agent.terminate(),
+            |agents| procwait::wait_all_exited(&agents, procwait::EXIT_BOUND),
+        )
+        .context("stop the background sessions")
     }
 
     /// Whether the registered agent task is the group logon task, the form that can start an agent

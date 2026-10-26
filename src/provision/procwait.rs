@@ -11,12 +11,16 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
-use windows::Win32::Foundation::{ERROR_INVALID_PARAMETER, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
+use windows::Wdk::System::Threading::{NtQueryInformationProcess, ProcessCommandLineInformation};
+use windows::Win32::Foundation::{ERROR_INVALID_PARAMETER, HANDLE, UNICODE_STRING, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows::Win32::Storage::FileSystem::{FILE_ID_INFO, FileIdInfo, GetFileInformationByHandleEx};
+use windows::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
+};
 use windows::Win32::System::RemoteDesktop::ProcessIdToSessionId;
 use windows::Win32::System::Threading::{
-    OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
-    QueryFullProcessImageNameW, WaitForSingleObject,
+    OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
+    QueryFullProcessImageNameW, TerminateProcess, WaitForSingleObject,
 };
 use windows::core::{HRESULT, PWSTR};
 
@@ -31,6 +35,141 @@ pub const EXIT_BOUND: Duration = Duration::from_secs(60);
 pub struct Process {
     pub pid: u32,
     handle: OwnedHandle,
+}
+
+impl Process {
+    /// End the process. The handle held here keeps its PID from being reused, so reopening it by
+    /// PID for the right to terminate it reaches the same process.
+    pub fn terminate(&self) -> anyhow::Result<()> {
+        // SAFETY: plain value arguments; the handle is owned by `OwnedHandle` from here.
+        let handle = unsafe { OpenProcess(PROCESS_TERMINATE, false, self.pid) }
+            .map(OwnedHandle)
+            .with_context(|| format!("open process {} to end it", self.pid))?;
+        // SAFETY: a live process handle with the right to terminate.
+        unsafe { TerminateProcess(handle.0, 1) }.with_context(|| format!("end process {}", self.pid))
+    }
+}
+
+/// What an ssh-broker process is, from its command line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Role {
+    /// The shim of an SSH session (sshd's `DefaultShell`), or any other verb.
+    Shim,
+    /// `agent`: started by the logon task in a user's desktop session.
+    DesktopAgent,
+    /// `agent --background`: started by the password prompt or by an auto-login task.
+    BackgroundAgent,
+}
+
+/// The role of the process whose command line is `command_line`. The first argument after the
+/// program decides: `agent` with `--background` among its flags is a background agent, `agent`
+/// without it a desktop agent; anything else is a shim, including no argument and `-c <text>`
+/// (sshd's form), whose text may itself contain the word `agent`.
+pub fn role_of(command_line: &str) -> Role {
+    let args = crate::cmdline::split_args(command_line);
+    match args.get(1).map(String::as_str) {
+        Some("agent") if args[2..].iter().any(|arg| arg == "--background") => Role::BackgroundAgent,
+        Some("agent") => Role::DesktopAgent,
+        _ => Role::Shim,
+    }
+}
+
+/// The items of `roles` that are background agents.
+pub fn select_background_agents<P>(roles: impl Iterator<Item = (P, Role)>) -> impl Iterator<Item = P> {
+    roles.filter_map(|(item, role)| (role == Role::BackgroundAgent).then_some(item))
+}
+
+/// The command line `process` was started with. A process that is running the installed exe and
+/// whose command line cannot be read is an error, the way an unidentifiable image is: it might be
+/// the agent.
+pub fn command_line_of(process: &Process) -> anyhow::Result<String> {
+    let mut needed = 0u32;
+    // SAFETY: a size probe: no buffer, zero length.
+    let _ = unsafe {
+        NtQueryInformationProcess(
+            process.handle.0,
+            ProcessCommandLineInformation,
+            std::ptr::null_mut(),
+            0,
+            &mut needed,
+        )
+    };
+    anyhow::ensure!(needed > 0, "process {} reported no command line size", process.pid);
+    // Aligned for the `UNICODE_STRING` the answer starts with.
+    let mut buffer = vec![0u64; (needed as usize).div_ceil(8)];
+    // SAFETY: the buffer holds at least `needed` bytes, which is what the call is told.
+    let status = unsafe {
+        NtQueryInformationProcess(
+            process.handle.0,
+            ProcessCommandLineInformation,
+            buffer.as_mut_ptr().cast(),
+            (buffer.len() * 8) as u32,
+            &mut needed,
+        )
+    };
+    anyhow::ensure!(
+        status.is_ok(),
+        "read the command line of process {} (NTSTATUS {:#010x})",
+        process.pid,
+        status.0
+    );
+    // SAFETY: on success the buffer starts with a `UNICODE_STRING` whose `Buffer` points into the buffer.
+    let text = unsafe {
+        let string = &*(buffer.as_ptr() as *const UNICODE_STRING);
+        std::slice::from_raw_parts(string.Buffer.0, usize::from(string.Length) / 2)
+    };
+    Ok(String::from_utf16_lossy(text))
+}
+
+/// Every background agent running `image` right now, other than this process, each held by a
+/// handle. The image of a process is compared by file identity; its role by its command line.
+///
+/// A process the snapshot names `ssh-broker.exe` that cannot be identified or whose command line
+/// cannot be read is an error: it might be a background agent. Any other process whose image
+/// cannot be read (protected system processes, for one) cannot be the installed exe and is skipped.
+pub fn background_agents(image: &Path) -> anyhow::Result<Vec<Process>> {
+    let own = std::process::id();
+    let mut candidates = Vec::new();
+    for (pid, name) in process_names()? {
+        if pid == own {
+            continue;
+        }
+        let ours_by_name = name.eq_ignore_ascii_case(super::EXE_NAME);
+        let process = match open_if_image(pid, image) {
+            Ok(Some(process)) => process,
+            Ok(None) => continue,
+            Err(e) if ours_by_name => return Err(e),
+            Err(_) => continue,
+        };
+        let role = role_of(&command_line_of(&process)?);
+        candidates.push((process, role));
+    }
+    Ok(select_background_agents(candidates.into_iter()).collect())
+}
+
+/// The process ids of the machine with the name of each one's image.
+fn process_names() -> anyhow::Result<Vec<(u32, String)>> {
+    // SAFETY: a snapshot of all processes; the handle is closed by `OwnedHandle`.
+    let snapshot =
+        OwnedHandle(unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }.context("snapshot the process list")?);
+    let mut entry = PROCESSENTRY32W {
+        dwSize: size_of::<PROCESSENTRY32W>() as u32,
+        ..Default::default()
+    };
+    let mut names = Vec::new();
+    // SAFETY: `entry` is a valid out-pointer with `dwSize` set; the snapshot outlives the loop.
+    let mut more = unsafe { Process32FirstW(snapshot.0, &mut entry) }.is_ok();
+    while more {
+        let len = entry
+            .szExeFile
+            .iter()
+            .position(|&unit| unit == 0)
+            .unwrap_or(entry.szExeFile.len());
+        names.push((entry.th32ProcessID, String::from_utf16_lossy(&entry.szExeFile[..len])));
+        // SAFETY: as above.
+        more = unsafe { Process32NextW(snapshot.0, &mut entry) }.is_ok();
+    }
+    Ok(names)
 }
 
 /// What names a file whatever path it is reached by: the volume and the file's id on it.

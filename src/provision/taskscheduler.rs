@@ -310,6 +310,37 @@ pub fn register_password_task(
     Ok(())
 }
 
+/// The auto-login tasks (`ssh-broker-session-*`) and whether each is enabled.
+pub fn session_tasks() -> anyhow::Result<Vec<super::flow::SessionTask>> {
+    let _com = Com::init()?;
+    let service = connect()?;
+    // SAFETY: as in `connect`; 1 is TASK_ENUM_HIDDEN, so hidden tasks are listed too.
+    unsafe {
+        let tasks = service
+            .GetFolder(&BSTR::from("\\"))
+            .context("open the root task folder")?
+            .GetTasks(1)
+            .context("list the tasks")?;
+        let count = tasks.Count().context("count the tasks")?;
+        let mut found = Vec::new();
+        // The collection is indexed from 1.
+        for index in 1..=count {
+            let task = tasks
+                .get_Item(&VARIANT::from(index))
+                .with_context(|| format!("read task {index}"))?;
+            let name = task.Name().context("read a task name")?.to_string();
+            if name.starts_with(super::session_task::TASK_PREFIX) {
+                let enabled = task
+                    .Enabled()
+                    .with_context(|| format!("read whether {name} is enabled"))?
+                    .as_bool();
+                found.push(super::flow::SessionTask { name, enabled });
+            }
+        }
+        Ok(found)
+    }
+}
+
 /// Delete the task `name`, which also deletes the credential stored for it (spike M5(e)). Whether
 /// there was a task.
 pub fn delete_task(name: &str) -> anyhow::Result<bool> {

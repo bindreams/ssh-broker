@@ -257,3 +257,84 @@ fn processes_that_outlive_the_bound_are_all_named_with_their_sessions() {
     stays_a.wait().unwrap();
     stays_b.wait().unwrap();
 }
+
+// the role of an ssh-broker process, from its command line -----
+
+#[test]
+fn agent_alone_is_a_desktop_agent() {
+    assert_eq!(
+        role_of(r"C:\ProgramData\ssh-broker\ssh-broker.exe agent"),
+        Role::DesktopAgent
+    );
+}
+
+#[test]
+fn agent_background_with_flags_is_a_background_agent() {
+    let line = r"C:\ProgramData\ssh-broker\ssh-broker.exe agent --background --ready-event Global\sb-x --expect-user S-1-5-21-1";
+    assert_eq!(role_of(line), Role::BackgroundAgent);
+    assert_eq!(
+        role_of(r"C:\ProgramData\ssh-broker\ssh-broker.exe agent --background"),
+        Role::BackgroundAgent
+    );
+}
+
+#[test]
+fn a_shim_whose_command_text_mentions_agent_is_a_shim() {
+    assert_eq!(
+        role_of(r#"C:\ProgramData\ssh-broker\ssh-broker.exe -c "agent --background""#),
+        Role::Shim
+    );
+    assert_eq!(
+        role_of(r"C:\ProgramData\ssh-broker\ssh-broker.exe -c agent --background"),
+        Role::Shim
+    );
+}
+
+#[test]
+fn no_arguments_is_a_shim() {
+    assert_eq!(role_of(r"C:\ProgramData\ssh-broker\ssh-broker.exe"), Role::Shim);
+    assert_eq!(role_of(""), Role::Shim);
+}
+
+#[test]
+fn a_spaced_exe_path_is_parsed() {
+    assert_eq!(
+        role_of(r#""C:\Program Files\ssh-broker\ssh-broker.exe" agent --background"#),
+        Role::BackgroundAgent
+    );
+    assert_eq!(
+        role_of(r#""C:\Program Files\ssh-broker\ssh-broker.exe" agent"#),
+        Role::DesktopAgent
+    );
+}
+
+#[test]
+fn other_verbs_are_not_agents() {
+    for verb in ["verify", "apply", "logout", "auto-login on"] {
+        assert_eq!(role_of(&format!(r"C:\x\ssh-broker.exe {verb}")), Role::Shim, "{verb}");
+    }
+}
+
+#[test]
+fn only_a_background_agent_is_selected_to_end() {
+    let lines = [
+        (1u32, r"C:\x\ssh-broker.exe"),
+        (2, r"C:\x\ssh-broker.exe agent"),
+        (3, r"C:\x\ssh-broker.exe agent --background --expect-user S-1"),
+        (4, r#"C:\x\ssh-broker.exe -c "agent --background""#),
+    ];
+    let selected: Vec<u32> = select_background_agents(lines.iter().map(|(pid, line)| (*pid, role_of(line)))).collect();
+    assert_eq!(selected, [3]);
+}
+
+#[test]
+fn the_command_line_of_a_running_process_is_readable() {
+    let mut child = child_until_stdin_closes();
+    let process = open_if_image(child.id(), &cmd_exe())
+        .unwrap()
+        .expect("the child runs cmd.exe");
+    let line = command_line_of(&process).unwrap();
+    assert!(line.contains("set /p unused="), "{line}");
+    drop(child.stdin.take());
+    child.wait().unwrap();
+}

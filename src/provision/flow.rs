@@ -1,6 +1,8 @@
 //! The shape of `apply`: install, then bring agents back. Held apart from the Windows calls so
 //! the failure paths can be tested with stand-ins.
 
+use std::cell::RefCell;
+
 use super::procwait::{StillRunning, Survivor};
 
 /// Run `install`, then `start` the agents.
@@ -49,6 +51,85 @@ pub fn run<T>(
         start(survivors.unwrap_or_default());
     }
     result
+}
+
+/// A per-user auto-login task, as `apply` finds it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionTask {
+    pub name: String,
+    pub enabled: bool,
+}
+
+/// The part of the stop that concerns background sessions: every auto-login task is stopped (which
+/// disables it, stops its instances and waits for their processes), then every background agent
+/// still running is ended and waited for, whether or not a task started it (the prompt path starts
+/// one without a task).
+///
+/// `enabled` collects the names of the tasks that were **enabled** before, each recorded before its
+/// stop is tried, so that a stop that fails part-way still gets them back ([`resume_sessions`]). A
+/// task that was off stays off. The agents are looked for again after each round until none is
+/// left: a condition re-checked, not an attempt count; a process that outlives the bound fails the
+/// stop through `wait`, naming its pid.
+///
+/// Only a background agent is ended here. A shim is left alone and, if it holds the exe, the copy
+/// reports it as it does today; a desktop agent that is not an instance of the logon task keeps its
+/// behaviour too.
+pub fn stop_sessions<P>(
+    tasks: impl FnOnce() -> anyhow::Result<Vec<SessionTask>>,
+    enabled: &RefCell<Vec<String>>,
+    mut stop_task: impl FnMut(&str) -> anyhow::Result<()>,
+    mut agents: impl FnMut() -> anyhow::Result<Vec<P>>,
+    mut end: impl FnMut(&P) -> anyhow::Result<()>,
+    mut wait: impl FnMut(Vec<P>) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    for task in tasks()? {
+        if task.enabled {
+            enabled.borrow_mut().push(task.name.clone());
+        }
+        stop_task(&task.name)?;
+    }
+    loop {
+        let found = agents()?;
+        if found.is_empty() {
+            return Ok(());
+        }
+        for agent in &found {
+            end(agent)?;
+        }
+        wait(found)?;
+    }
+}
+
+/// Enable again the tasks [`stop_sessions`] recorded. Every one is tried; the first failure is the
+/// result, naming the task.
+pub fn resume_sessions(
+    enabled: &RefCell<Vec<String>>,
+    mut enable: impl FnMut(&str) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    let mut first = None;
+    for name in enabled.borrow().iter() {
+        if let Err(e) = enable(name) {
+            let e = e.context(format!(
+                "could not enable the {name} task again; no session starts at boot until it is"
+            ));
+            if first.is_none() {
+                first = Some(e);
+            } else {
+                eprintln!("apply: {e:#}");
+            }
+        }
+    }
+    first.map_or(Ok(()), Err)
+}
+
+/// Start the tasks [`stop_sessions`] recorded, so the users who had auto-login have their session
+/// again. Best-effort, like the start of the desktop agents: the install is complete without it.
+pub fn start_sessions(enabled: &RefCell<Vec<String>>, mut run: impl FnMut(&str) -> anyhow::Result<()>) {
+    for name in enabled.borrow().iter() {
+        if let Err(e) = run(name) {
+            eprintln!("apply: could not start the {name} task: {e:#}");
+        }
+    }
 }
 
 /// Which of the sessions with a user get an agent started, and which are left alone.
