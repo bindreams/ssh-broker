@@ -23,6 +23,8 @@ pub fn main() {
         Some("shim") => shim(Path::new(&args[1])),
         Some("pty") => pty(Path::new(&args[1]), &args[2]),
         Some("connect") => connect(Path::new(&args[1]), Path::new(&args[2])),
+        // `<DefaultShell> -c <command>`: what sshd runs when this is the DefaultShell.
+        Some("-c") => probe(),
         _ => std::process::exit(2),
     }
 }
@@ -113,6 +115,50 @@ fn run_shim(password: &str, agent_exe: &Path) -> String {
         Ok(Served::Gone) => format!("AgentGone pid={pid}"),
         Err(e) => format!("wait failed: {e:#}"),
     }
+}
+
+/// What the shim would find itself in under sshd: its session, its job and its logon type, printed as
+/// `key=value` lines. Run as sshd's `DefaultShell`, this is the measurement of the shim's own
+/// environment (`tests/real_sshd_windows.rs`).
+fn probe() {
+    use windows::Win32::System::JobObjects::{
+        IsProcessInJob, JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+        QueryInformationJobObject,
+    };
+    use windows::Win32::System::Threading::GetCurrentProcess;
+    use windows::core::BOOL;
+
+    let mut in_job = BOOL(0);
+    // SAFETY: valid handles and out-pointer; no job handle means "any job".
+    let asked = unsafe { IsProcessInJob(GetCurrentProcess(), None, &mut in_job) };
+    println!("session={}", ssh_broker::provision::probe::current_session_id());
+    println!("logon_type={:?}", ssh_broker::provision::probe::current_logon_type());
+    println!("in_job={}", asked.is_ok() && in_job.as_bool());
+    let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+    // SAFETY: a buffer of the size passed; no job handle queries the calling process's own job.
+    let queried = unsafe {
+        QueryInformationJobObject(
+            None,
+            JobObjectExtendedLimitInformation,
+            (&mut info as *mut JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            None,
+        )
+    };
+    match queried {
+        Ok(()) => {
+            let flags = info.BasicLimitInformation.LimitFlags.0;
+            println!("job_limit_flags={flags:#x}");
+            println!("job_kill_on_close={}", flags & 0x2000 != 0);
+            println!("job_breakaway_ok={}", flags & 0x800 != 0);
+            println!("job_silent_breakaway_ok={}", flags & 0x1000 != 0);
+        }
+        Err(e) => println!("job_limit_flags=unavailable ({e})"),
+    }
+    println!(
+        "sid={}",
+        Sid::current_user().and_then(|sid| sid.to_sddl()).unwrap_or_default()
+    );
 }
 
 /// Host `command` in a pseudoconsole, the way the agent hosts a shell: input arrives on stdin as

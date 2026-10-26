@@ -15,6 +15,12 @@ default-filter = 'not (binary(session_on_demand_windows) & test(/^logon_with_sec
 # timed out.
 slow-timeout = { period = "120s", terminate-after = 5, grace-period = "1s" }
 
+# The real-sshd test measures things the plan has never seen (the shim's session, logon type and job under
+# sshd): its output is the result, so a passing run prints it too.
+[[profile.ci.overrides]]
+filter = 'binary(real_sshd_windows)'
+success-output = "immediate"
+
 [profile.ci-exclusive]
 inherits = "ci"
 default-filter = '(binary(session_on_demand_windows) & test(/^logon_with_seclogon_(stopped|disabled)_returns_windows_reason$/)) | (binary(upgrade_windows) & test(=apply_upgrade_ends_a_background_session_and_restarts_auto_login))'
