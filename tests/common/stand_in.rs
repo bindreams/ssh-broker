@@ -235,6 +235,17 @@ impl Drop for RealAgent {
 /// it is listening. A directory watch is armed before the marker is looked for, so a write between
 /// the look and the wait is not missed. An agent that ends first fails the wait with its exit code.
 pub fn wait_for_serving_marker(location: &SocketLocation, agent: HANDLE) {
+    wait_for_marker(location, Some(agent), None)
+}
+
+/// [`wait_for_serving_marker`] for an agent that no handle is held on (a scheduled task starts it):
+/// the start is an external event that may never come, so the wait has a failure bound and its
+/// expiry fails the test saying so.
+pub fn wait_for_serving_marker_of_a_task(location: &SocketLocation, bound: std::time::Duration) {
+    wait_for_marker(location, None, Some(bound))
+}
+
+fn wait_for_marker(location: &SocketLocation, agent: Option<HANDLE>, bound: Option<std::time::Duration>) {
     use std::os::windows::ffi::OsStrExt;
     // The socket folder may not exist yet, so the watch is on its parent and covers the subtree.
     let watched = location.dir.parent().expect("the socket folder has a parent");
@@ -252,16 +263,27 @@ pub fn wait_for_serving_marker(location: &SocketLocation, agent: HANDLE) {
         if location.serving_marker_path().is_file() {
             break;
         }
-        // SAFETY: both handles are valid.
-        let woke = unsafe { WaitForMultipleObjects(&[watch, agent], false, INFINITE) };
+        let handles: Vec<HANDLE> = std::iter::once(watch).chain(agent).collect();
+        let millis = bound.map_or(INFINITE, |bound| {
+            u32::try_from(bound.as_millis()).expect("a bound shorter than INFINITE")
+        });
+        // SAFETY: every handle is valid.
+        let woke = unsafe { WaitForMultipleObjects(&handles, false, millis) }; // sleep-ok: with a bound, a failure bound on a task start that may never come; expiry fails the test
         if woke == WAIT_OBJECT_0 {
             // SAFETY: a valid watch handle.
             unsafe { FindNextChangeNotification(watch) }.unwrap();
-        } else {
+        } else if woke == WAIT_TIMEOUT {
+            panic!(
+                "no agent was serving {} after {bound:?}: the scheduled task did not start one",
+                location.dir.display()
+            );
+        } else if let Some(agent) = agent {
             let mut code = 0u32;
             // SAFETY: a valid process handle and out-pointer.
             let _ = unsafe { windows::Win32::System::Threading::GetExitCodeProcess(agent, &mut code) };
             panic!("the agent ended with {code:#x} before it was listening");
+        } else {
+            panic!("waiting for the serving marker failed: {woke:?}");
         }
     }
     // SAFETY: the handle from above.

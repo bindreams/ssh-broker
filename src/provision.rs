@@ -13,12 +13,15 @@ pub mod bounded;
 mod flow;
 #[cfg(windows)]
 pub(crate) mod layout;
+#[cfg(windows)]
+pub mod password_variant;
 pub mod probe;
 #[cfg(windows)]
 pub(crate) mod procwait;
 pub mod registry;
 pub mod report;
 pub mod schtasks;
+pub mod session_task;
 #[cfg(windows)]
 pub mod sessions;
 #[cfg(windows)]
@@ -96,7 +99,7 @@ mod provision_tests;
 #[cfg(windows)]
 mod imp {
     use super::layout::{self, Layout};
-    use super::{flow, probe, procwait, registry, report, schtasks, sessions, taskscheduler, user_rows};
+    use super::{flow, probe, procwait, registry, report, schtasks, session_task, sessions, taskscheduler, user_rows};
     use crate::{afunix, shim};
     use anyhow::Context;
     use std::path::Path;
@@ -314,6 +317,20 @@ mod imp {
 
         // Local: the agent task is registered in its group form (any user, interactive session).
         rows.push(schtasks::agent_task_row(&taskscheduler::task_xml(schtasks::AGENT_TASK)));
+        // Local: this account's auto-login task, if it has one (informational for everyone who has not
+        // turned auto-login on, which passes).
+        match crate::acl::Sid::current_user().and_then(|sid| sid.to_sddl()) {
+            Ok(sid) => rows.push(session_task::task_row(
+                &taskscheduler::task_state(&session_task::task_name(&sid)),
+                &layout.canonical_exe().to_string_lossy(),
+                &sid,
+            )),
+            Err(e) => rows.push(report::Check::new(
+                "auto-login task",
+                false,
+                format!("could not tell who this is: {e:#}"),
+            )),
+        }
         // Informational: verify runs via the LeastPrivilege agent (non-elevated) and cannot
         // reliably query a SYSTEM-owned task, so this never gates verify (apply errors loudly
         // if registration fails, and the reboot self-heal is exercised in the Phase-8 test).

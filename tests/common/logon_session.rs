@@ -72,39 +72,43 @@ pub fn processes_of(id: u64) -> Vec<(u32, OwnedHandle)> {
     found
 }
 
-/// Fail unless Logoff auditing for success is on: without it the system writes no event 4634 and
-/// the watch below could only time out.
-pub fn assert_logoff_auditing() {
+/// Fail unless `auditpol` reports `setting` ("Success" or "Failure") on for `subcategory`: without
+/// the auditing the system writes no event, and the watch below could only time out.
+pub fn assert_auditing(subcategory: &str, setting: &str) {
     let out = std::process::Command::new("auditpol")
-        .args(["/get", "/subcategory:Logoff"])
+        .args(["/get", &format!("/subcategory:{subcategory}")])
         .output()
         .expect("run auditpol");
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(
-        text.contains("Success"),
-        "precondition: Logoff auditing for success must be on (CI runs `auditpol /set /subcategory:\"Logoff\" /success:enable`); auditpol says:\n{text}"
+        text.contains(setting),
+        "precondition: {subcategory} auditing for {} must be on (CI runs `auditpol /set /subcategory:\"{subcategory}\" /{}:enable`); auditpol says:\n{text}",
+        setting.to_lowercase(),
+        setting.to_lowercase(),
     );
 }
 
-/// A subscription to the Security event 4634 (an account was logged off) of one logon session.
-pub struct LogoffWatch {
+/// Fail unless Logoff auditing for success is on.
+pub fn assert_logoff_auditing() {
+    assert_auditing("Logoff", "Success");
+}
+
+/// A subscription to Security events that match an XPath query, from now on.
+pub struct EventWatch {
     subscription: EVT_HANDLE,
     signal: OwnedHandle,
 }
 
-impl LogoffWatch {
-    /// Subscribe to events from now on. Create it before the session can end.
-    pub fn new(id: u64) -> LogoffWatch {
+/// The XPath for event `id` whose `Data` field `field` is `value`.
+fn query_for(id: u32, field: &str, value: &str) -> String {
+    format!("*[System[EventID={id}]] and *[EventData[Data[@Name='{field}']='{value}']]")
+}
+
+impl EventWatch {
+    pub fn new(query: &str) -> EventWatch {
         // SAFETY: an unnamed manual-reset event.
         let signal = OwnedHandle(unsafe { CreateEventW(None, true, false, PCWSTR::null()) }.expect("CreateEventW"));
-        let query: Vec<u16> = format!(
-            "*[System[EventID=4634]] and *[EventData[Data[@Name='TargetLogonId']='{lower}' or Data[@Name='TargetLogonId']='{upper}']]",
-            lower = format_args!("{id:#x}"),
-            upper = format_args!("0x{id:X}"),
-        )
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect();
+        let query: Vec<u16> = query.encode_utf16().chain(std::iter::once(0)).collect();
         let channel: Vec<u16> = "Security".encode_utf16().chain(std::iter::once(0)).collect();
         // SAFETY: NUL-terminated inputs; the signal event outlives the subscription (dropped after it).
         let subscription = unsafe {
@@ -120,10 +124,10 @@ impl LogoffWatch {
             )
         }
         .unwrap_or_else(|e| panic!("subscribe to the Security log (needs an elevated administrator): {e}"));
-        LogoffWatch { subscription, signal }
+        EventWatch { subscription, signal }
     }
 
-    /// Wait for the logoff event for at most `bound`. An event the OS may never deliver is an
+    /// Wait for a matching event for at most `bound`. An event the OS may never deliver is an
     /// external event, so this is the one bounded wait; the caller treats expiry as a failure that
     /// reports what was measured, never as a pass.
     pub fn wait(&self, bound: Duration) -> bool {
@@ -134,9 +138,31 @@ impl LogoffWatch {
     }
 }
 
-impl Drop for LogoffWatch {
+impl Drop for EventWatch {
     fn drop(&mut self) {
         // SAFETY: the handle from `new`.
         let _ = unsafe { EvtClose(self.subscription) };
     }
+}
+
+/// The logoff event (Security 4634) of one logon session.
+pub struct LogoffWatch(EventWatch);
+
+impl LogoffWatch {
+    /// Subscribe to events from now on. Create it before the session can end.
+    pub fn new(id: u64) -> LogoffWatch {
+        // The event log spells the id in lower case hex, but accept either.
+        let lower = query_for(4634, "TargetLogonId", &format!("{id:#x}"));
+        let upper = query_for(4634, "TargetLogonId", &format!("0x{id:X}"));
+        LogoffWatch(EventWatch::new(&format!("({lower}) or ({upper})")))
+    }
+
+    pub fn wait(&self, bound: Duration) -> bool {
+        self.0.wait(bound)
+    }
+}
+
+/// A failed logon (Security 4625) of the account named `user`.
+pub fn failed_logon_watch(user: &str) -> EventWatch {
+    EventWatch::new(&query_for(4625, "TargetUserName", user))
 }

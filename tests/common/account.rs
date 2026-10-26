@@ -182,6 +182,76 @@ impl Account {
         account
     }
 
+    /// Grant the account "Log on as a batch job" (`SeBatchLogonRight`), which Task Scheduler needs
+    /// to run a password task for a standard user. Machine policy: CI only, and the right goes with
+    /// the account when it is deleted.
+    pub fn grant_batch_logon_right(&self) {
+        use windows::Win32::Foundation::{HLOCAL, LocalFree};
+        use windows::Win32::Security::Authentication::Identity::{
+            LSA_OBJECT_ATTRIBUTES, LSA_UNICODE_STRING, LsaAddAccountRights, LsaClose, LsaNtStatusToWinError,
+            LsaOpenPolicy,
+        };
+        use windows::Win32::Security::Authorization::ConvertStringSidToSidW;
+        use windows::Win32::Security::PSID;
+
+        assert_elevated();
+        let mut sid = PSID::default();
+        // SAFETY: a NUL-terminated string and a valid out-pointer; the SID is freed below.
+        unsafe { ConvertStringSidToSidW(PCWSTR(wide(&self.sid_text).as_ptr()), &mut sid) }.expect("the account's SID");
+        let attributes = LSA_OBJECT_ATTRIBUTES {
+            Length: std::mem::size_of::<LSA_OBJECT_ATTRIBUTES>() as u32,
+            ..Default::default()
+        };
+        let mut policy = Default::default();
+        // POLICY_CREATE_ACCOUNT | POLICY_LOOKUP_NAMES
+        // SAFETY: valid pointers for the call; the policy handle is closed below.
+        let opened = unsafe { LsaOpenPolicy(None, &attributes, 16 | 2048, &mut policy) };
+        assert_eq!(opened.0, 0, "LsaOpenPolicy: {opened:?}");
+        let mut right = wide("SeBatchLogonRight");
+        let units = (right.len() - 1) as u16;
+        let rights = [LSA_UNICODE_STRING {
+            Length: units * 2,
+            MaximumLength: units * 2 + 2,
+            Buffer: PWSTR(right.as_mut_ptr()),
+        }];
+        // SAFETY: valid pointers for the call.
+        let added = unsafe { LsaAddAccountRights(policy, sid, &rights) };
+        // SAFETY: the handles and the SID from above.
+        unsafe {
+            let _ = LsaClose(policy);
+            let _ = LocalFree(Some(HLOCAL(sid.0)));
+        }
+        assert_eq!(
+            added.0,
+            0,
+            "LsaAddAccountRights failed with win32 error {}",
+            // SAFETY: a plain status conversion.
+            unsafe { LsaNtStatusToWinError(added) }
+        );
+    }
+
+    /// Make the account a member of the local Administrators group. It is removed with the account.
+    pub fn make_administrator(&self) {
+        use windows::Win32::NetworkManagement::NetManagement::{LOCALGROUP_MEMBERS_INFO_3, NetLocalGroupAddMembers};
+
+        assert_elevated();
+        let mut member = wide(&format!(".\\{}", self.name));
+        let info = LOCALGROUP_MEMBERS_INFO_3 {
+            lgrmi3_domainandname: PWSTR(member.as_mut_ptr()),
+        };
+        // SAFETY: `info` and the string it points at outlive the call.
+        let rc = unsafe {
+            NetLocalGroupAddMembers(
+                PCWSTR::null(),
+                PCWSTR(wide("Administrators").as_ptr()),
+                3,
+                &info as *const _ as *const u8,
+                1,
+            )
+        };
+        assert_eq!(rc, 0, "NetLocalGroupAddMembers({}) failed with {rc}", self.name);
+    }
+
     /// The token sshd's key-authenticated logon gives: a network logon, no loaded profile.
     pub fn network_token(&self) -> OwnedHandle {
         let mut token = HANDLE::default();

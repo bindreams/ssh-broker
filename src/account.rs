@@ -56,7 +56,7 @@ pub fn classify(domain: &str, machine: &str) -> AccountKind {
 }
 
 /// The NetBIOS name of this PC: the domain `LookupAccountSidW` gives its local accounts.
-fn computer_name() -> anyhow::Result<String> {
+pub fn computer_name() -> anyhow::Result<String> {
     let mut len = 0u32;
     // SAFETY: a null buffer is the documented size probe; it fails with the length needed.
     let _ = unsafe { GetComputerNameW(None, &mut len) };

@@ -18,11 +18,14 @@ use windows::Win32::System::Threading::{
 use windows::core::{HRESULT, PCWSTR, PWSTR};
 
 use crate::account::LocalAccount;
+use crate::autologin::BatchRight;
 use crate::password_entry::Password;
 use crate::winutil::OwnedHandle;
 
 /// `ERROR_FILENAME_EXCED_RANGE`: Windows' answer to a password over its length limit.
 const ERROR_FILENAME_EXCED_RANGE: u32 = 206;
+/// `ERROR_LOGON_TYPE_NOT_GRANTED`: the account does not hold the right for this logon type.
+const ERROR_LOGON_TYPE_NOT_GRANTED: u32 = 1385;
 const PASSWORD_TOO_LONG: &str = "the password is too long for Windows.";
 
 /// The background agent the logon started. Dropping it closes the handle; the agent keeps running.
@@ -133,6 +136,43 @@ pub fn start_background_agent(
             })
         }
         Err(e) => Err(LogonFailure::from_error(&e)),
+    }
+}
+
+/// Whether `account` may log on as a batch job, which a boot task needs. A network-less logon of the
+/// batch type, closed at once: with the password in hand, Windows says `ERROR_LOGON_TYPE_NOT_GRANTED`
+/// (1385) when the right is missing (spike M5(d)).
+pub fn check_batch_logon(account: &LocalAccount, password: &Password) -> BatchRight {
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Security::{LOGON32_LOGON_BATCH, LOGON32_PROVIDER_DEFAULT, LogonUserW};
+    let user = wide(&account.name);
+    let mut token = HANDLE::default();
+    let logged_on = password.with_nul(|password| {
+        // SAFETY: NUL-terminated inputs and a valid out-pointer; `password` is the wiped copy.
+        unsafe {
+            LogonUserW(
+                PCWSTR(user.as_ptr()),
+                PCWSTR(wide(".").as_ptr()),
+                PCWSTR(password.as_ptr()),
+                LOGON32_LOGON_BATCH,
+                LOGON32_PROVIDER_DEFAULT,
+                &mut token,
+            )
+        }
+    });
+    match logged_on {
+        Ok(()) => {
+            drop(OwnedHandle(token));
+            BatchRight::Granted
+        }
+        Err(e) => {
+            let failure = LogonFailure::from_error(&e);
+            if failure.code == ERROR_LOGON_TYPE_NOT_GRANTED {
+                BatchRight::Missing
+            } else {
+                BatchRight::Refused(failure.reason)
+            }
+        }
     }
 }
 

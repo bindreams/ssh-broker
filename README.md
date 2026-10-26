@@ -60,6 +60,29 @@ Three ways out of the prompt, none of which starts a session:
 
 Enter on an empty line does not mean "plain shell": it says empty passwords are not supported yet (ssh-broker#45) and asks again.
 
+### Starting one at boot: `auto-login`
+
+`auto-login` stores your Windows password with Task Scheduler and registers a task that starts your background session at boot, so the session exists before anyone logs in and nobody types a password after a restart.
+
+```
+C:\ProgramData\ssh-broker\ssh-broker.exe auto-login on  [<account>]
+C:\ProgramData\ssh-broker\ssh-broker.exe auto-login off [<account>]
+```
+
+Both need **an elevated administrator shell**, and take the account to act on (the account running the command by default). Task Scheduler refuses a boot trigger to any token that is not an elevated administrator's, for a standard user and for a non-elevated administrator alike. A shell that ssh-broker hosts is not elevated, so:
+
+- at the PC, open an elevated prompt (one UAC prompt);
+- over SSH as an administrator, run `ssh-broker.exe logout`, reconnect and press Ctrl+C at the password prompt for a plain shell: that shell runs under sshd's own token, which for an administrator may be elevated (to be confirmed against a real `sshd`);
+- a standard user cannot run it alone: an administrator runs it for them and types their password.
+
+`on` asks for the account's password, checks that Windows accepts it for a batch logon, registers the task, reads the registered task back and compares it with what it asked for (a mismatch deletes the task and fails), and starts the task once so the session begins now. The task runs the installed exe, in the administrator-only install directory, with the plain token, and its permissions let only SYSTEM and Administrators change it.
+
+The account must hold **"Log on as a batch job"**. Administrators hold it by default; a standard account does not, and `on` refuses, naming the right: an administrator can grant it in Local Security Policy (User Rights Assignment). ssh-broker never changes machine policy.
+
+`off` deletes the task, which deletes the stored password with it. A session that is running continues until `logout`. `verify` has an `auto-login task` row: it checks the task's definition and reports its last result, and says plainly that a failed logon is not recorded there, so a stale password or a missing batch right shows only as a session that did not start; you are then asked for the password again at the next login.
+
+Windows' own auto-logon is a different, documented option: signing the user in at boot (Sysinternals Autologon, or `netplwiz` where it applies) gives a desktop session, and the logon task's desktop agent then serves. ssh-broker does not configure it; it stores the password as an LSA secret and leaves a signed-in desktop.
+
 ### Ending one
 
 `ssh-broker logout` ends your background session: the agent, every shell it hosts and the processes they started. Run it with the installed exe's full path, `C:\ProgramData\ssh-broker\ssh-broker.exe logout`, because `apply` does not put the install directory on `PATH`. The usual place to type it is a shell the session itself gave you; the agent waits for the command to finish and print its reply before it ends anything, and your SSH connection then closes.

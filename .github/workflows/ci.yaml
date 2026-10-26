@@ -104,11 +104,14 @@ jobs:
       - name: Install pinned toolchain
         run: rustup toolchain install
 
-      # The test that waits for a logon session to be destroyed (`logon_session_is_logged_off_after_logout`)
-      # waits for the Security event 4634, which the system writes only with this auditing on.
-      - name: Audit logoffs
+      # Two tests wait for a Security event, which the system writes only with the auditing on: the end
+      # of a logon session (`logon_session_is_logged_off_after_logout`, 4634) and a refused logon
+      # (`a_stale_password_is_not_visible_in_the_last_result`, 4625).
+      - name: Audit logons and logoffs
         if: runner.os == 'Windows'
-        run: auditpol /set /subcategory:"Logoff" /success:enable
+        run: |
+          auditpol /set /subcategory:"Logoff" /success:enable
+          auditpol /set /subcategory:"Logon" /failure:enable
 
       - name: cargo test
         run: cargo test --locked

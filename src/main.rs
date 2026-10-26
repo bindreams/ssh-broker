@@ -21,7 +21,14 @@ fn main() -> anyhow::Result<()> {
             std::process::exit(2);
         }
         Route::Logout => logout_command(),
-        Route::AutoLogin(_) => anyhow::bail!("auto-login is not built yet"),
+        Route::AutoLogin(None) => {
+            eprintln!("usage: ssh-broker auto-login on|off [<account>]");
+            std::process::exit(2);
+        }
+        Route::AutoLogin(Some(args)) => auto_login_command(args).map_err(|e| {
+            eprintln!("{e:#}");
+            std::process::exit(1)
+        }),
         Route::Apply => provision::apply(),
         Route::Verify => provision::verify(),
         Route::VerifyProbe => provision::verify_probe(),
@@ -43,4 +50,14 @@ fn logout_command() -> anyhow::Result<()> {
 #[cfg(not(windows))]
 fn logout_command() -> anyhow::Result<()> {
     anyhow::bail!("logout ends a Windows background session and runs only on Windows")
+}
+
+#[cfg(windows)]
+fn auto_login_command(args: ssh_broker::route::AutoLoginArgs) -> anyhow::Result<()> {
+    ssh_broker::autologin::run(args)
+}
+
+#[cfg(not(windows))]
+fn auto_login_command(_args: ssh_broker::route::AutoLoginArgs) -> anyhow::Result<()> {
+    anyhow::bail!("auto-login stores a Windows password for a boot task and runs only on Windows")
 }

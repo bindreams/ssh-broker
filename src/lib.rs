@@ -21,6 +21,8 @@ pub mod agent;
 pub mod agent_background;
 #[cfg(windows)]
 pub mod agent_lock;
+#[cfg(windows)]
+pub mod autologin;
 pub mod cmdline;
 #[cfg(windows)]
 pub mod conpty;

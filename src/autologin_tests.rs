@@ -1,0 +1,322 @@
+//! Unit tests for `autologin`: the refusals and the order of the steps, over a fake environment
+//! (no elevation, no account, no task, no console).
+use super::*;
+use crate::offer::AccountKind;
+use crate::password_entry::{PasswordEntry, Step};
+use crate::provision::session_task::{TaskState, task_name, task_xml};
+use crate::vtinput::KeyEvent;
+
+const EXE: &str = r"C:\ProgramData\ssh-broker\ssh-broker.exe";
+const SECRET: &str = "hunter2-sentinel";
+
+fn password(text: &str) -> Password {
+    let key = |vk: u16, ch: u16| KeyEvent {
+        virtual_key_code: vk,
+        virtual_scan_code: 0,
+        unicode_char: ch,
+        key_down: true,
+        control_key_state: 0,
+        repeat_count: 1,
+    };
+    let mut entry = PasswordEntry::new();
+    for unit in text.encode_utf16() {
+        entry.key(&key(0x41, unit));
+    }
+    match entry.key(&key(0x0D, 0x0D)) {
+        Step::Submit(p) => p,
+        _ => panic!("empty"),
+    }
+}
+
+fn account(name: &str, sid: &str, kind: AccountKind) -> LocalAccount {
+    LocalAccount {
+        name: name.into(),
+        sid: sid.into(),
+        kind,
+    }
+}
+
+fn alice() -> LocalAccount {
+    account("alice", "S-1-5-21-1-2-3-1001", AccountKind::Local)
+}
+
+/// A fake world that records what `on` and `off` did to it.
+struct Fake {
+    elevated: bool,
+    terminal: bool,
+    password: Option<&'static str>,
+    batch: BatchRight,
+    registered_ok: bool,
+    /// What the read-back returns: the registered definition by default.
+    read_back: Option<Option<TaskState>>,
+    exists: bool,
+    calls: Vec<String>,
+    said: Vec<String>,
+}
+
+impl Fake {
+    fn new() -> Fake {
+        Fake {
+            elevated: true,
+            terminal: true,
+            password: Some(SECRET),
+            batch: BatchRight::Granted,
+            registered_ok: true,
+            read_back: None,
+            exists: true,
+            calls: Vec::new(),
+            said: Vec::new(),
+        }
+    }
+
+    fn said(&self) -> String {
+        self.said.join("\n")
+    }
+}
+
+impl AutoLoginEnv for Fake {
+    fn is_elevated(&self) -> anyhow::Result<bool> {
+        Ok(self.elevated)
+    }
+    fn has_terminal(&self) -> bool {
+        self.terminal
+    }
+    fn exe(&self) -> std::path::PathBuf {
+        EXE.into()
+    }
+    fn check_install(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn ask_password(&mut self, _: &LocalAccount) -> anyhow::Result<Option<Password>> {
+        self.calls.push("ask".into());
+        Ok(self.password.map(password))
+    }
+    fn batch_right(&self, _: &LocalAccount, _: &Password) -> BatchRight {
+        self.batch.clone()
+    }
+    fn register(&mut self, account: &LocalAccount, xml: &str, _: &Password, sddl: &str) -> anyhow::Result<()> {
+        self.calls.push(format!("register {} {}", account.sid, sddl));
+        self.calls.push(format!("xml-names {}", xml.contains(&account.sid)));
+        if self.registered_ok {
+            Ok(())
+        } else {
+            anyhow::bail!("The user name or password is incorrect.")
+        }
+    }
+    fn read_back(&self, name: &str) -> anyhow::Result<Option<TaskState>> {
+        let sid = name.strip_prefix("ssh-broker-session-").unwrap();
+        Ok(match &self.read_back {
+            Some(state) => state.as_ref().map(|s| TaskState {
+                xml: s.xml.clone(),
+                sddl: s.sddl.clone(),
+                last_result: s.last_result,
+            }),
+            None => Some(TaskState {
+                xml: task_xml(EXE, sid),
+                sddl: format!("D:(A;;FA;;;SY)(A;;FA;;;BA)(A;;FRFX;;;{sid})"),
+                last_result: 0x0004_1303,
+            }),
+        })
+    }
+    fn delete(&mut self, name: &str) -> anyhow::Result<bool> {
+        self.calls.push(format!("delete {name}"));
+        Ok(std::mem::replace(&mut self.exists, false))
+    }
+    fn run_now(&mut self, name: &str) -> anyhow::Result<()> {
+        self.calls.push(format!("run {name}"));
+        Ok(())
+    }
+    fn say(&mut self, line: &str) {
+        self.said.push(line.to_string());
+    }
+}
+
+fn error_text(result: anyhow::Result<()>) -> String {
+    format!("{:#}", result.unwrap_err())
+}
+
+#[test]
+fn on_refuses_a_non_elevated_shell_with_the_way_to_an_elevated_one() {
+    let mut env = Fake::new();
+    env.elevated = false;
+    let text = error_text(on(&mut env, &alice()));
+    assert!(
+        text.contains("auto-login on needs an elevated administrator shell"),
+        "{text}"
+    );
+    assert!(text.contains("A shell hosted by ssh-broker is not elevated."), "{text}");
+    assert!(text.contains(&format!("run {EXE} logout")), "the full exe path: {text}");
+    assert!(text.contains("press Ctrl+C at the password prompt"), "{text}");
+    assert!(env.calls.is_empty(), "nothing was asked or changed: {:?}", env.calls);
+}
+
+#[test]
+fn off_refuses_a_non_elevated_shell() {
+    let mut env = Fake::new();
+    env.elevated = false;
+    let text = error_text(off(&mut env, &alice()));
+    assert!(
+        text.contains("auto-login off needs an elevated administrator shell"),
+        "{text}"
+    );
+    assert!(env.calls.is_empty());
+}
+
+#[test]
+fn on_needs_a_terminal() {
+    let mut env = Fake::new();
+    env.terminal = false;
+    let text = error_text(on(&mut env, &alice()));
+    assert_eq!(
+        text,
+        "ssh-broker: auto-login on needs a terminal to ask for the password."
+    );
+    assert!(env.calls.is_empty());
+}
+
+#[test]
+fn on_refuses_a_non_local_account() {
+    let mut env = Fake::new();
+    let other = account("Zoe", "S-1-5-21-9-9-9-1001", AccountKind::NotLocal);
+    let text = error_text(on(&mut env, &other));
+    assert!(text.contains("Zoe is not a local account"), "{text}");
+    assert!(text.contains("ssh-broker#45"), "{text}");
+    assert!(
+        env.calls.is_empty(),
+        "no password is asked for an account that cannot be used"
+    );
+}
+
+#[test]
+fn on_refuses_a_missing_batch_right_naming_it() {
+    let mut env = Fake::new();
+    env.batch = BatchRight::Missing;
+    let text = error_text(on(&mut env, &alice()));
+    assert!(text.contains("Log on as a batch job"), "{text}");
+    assert!(text.contains("Local Security Policy"), "{text}");
+    assert!(text.contains("never changes machine policy"), "{text}");
+    assert!(
+        !env.calls.iter().any(|call| call.starts_with("register")),
+        "nothing is registered without the right: {:?}",
+        env.calls
+    );
+}
+
+#[test]
+fn on_refuses_a_password_windows_does_not_accept_with_its_reason() {
+    let mut env = Fake::new();
+    env.batch = BatchRight::Refused("The user name or password is incorrect.".into());
+    let text = error_text(on(&mut env, &alice()));
+    assert!(text.contains("The user name or password is incorrect."), "{text}");
+    assert!(!env.calls.iter().any(|call| call.starts_with("register")));
+}
+
+#[test]
+fn on_with_a_cancelled_prompt_changes_nothing() {
+    let mut env = Fake::new();
+    env.password = None;
+    let text = error_text(on(&mut env, &alice()));
+    assert!(text.contains("cancelled"), "{text}");
+    assert_eq!(env.calls, ["ask"]);
+}
+
+#[test]
+fn on_registers_verifies_and_runs_the_task_once() {
+    let mut env = Fake::new();
+    on(&mut env, &alice()).unwrap();
+    let name = task_name("S-1-5-21-1-2-3-1001");
+    assert_eq!(
+        env.calls,
+        [
+            "ask".to_string(),
+            "register S-1-5-21-1-2-3-1001 D:(A;;FA;;;SY)(A;;FA;;;BA)(A;;FRFX;;;S-1-5-21-1-2-3-1001)".to_string(),
+            "xml-names true".to_string(),
+            format!("run {name}"),
+        ]
+    );
+    assert!(env.said().contains("auto-login is on for alice"), "{}", env.said());
+}
+
+#[test]
+fn on_deletes_a_task_that_fails_the_read_back() {
+    let mut env = Fake::new();
+    let sid = "S-1-5-21-1-2-3-1001";
+    env.read_back = Some(Some(TaskState {
+        xml: task_xml(r"C:\evil.exe", sid),
+        sddl: String::new(),
+        last_result: 0,
+    }));
+    let text = error_text(on(&mut env, &alice()));
+    assert!(text.contains("does not match"), "{text}");
+    assert!(
+        env.calls.contains(&format!("delete {}", task_name(sid))),
+        "{:?}",
+        env.calls
+    );
+    assert!(!env.calls.iter().any(|call| call.starts_with("run")), "{:?}", env.calls);
+}
+
+#[test]
+fn on_fails_when_the_task_is_not_there_to_read_back() {
+    let mut env = Fake::new();
+    env.read_back = Some(None);
+    let text = error_text(on(&mut env, &alice()));
+    assert!(text.contains("not registered"), "{text}");
+    assert!(!env.calls.iter().any(|call| call.starts_with("run")));
+}
+
+#[test]
+fn on_with_a_registration_windows_refuses_leaves_no_task_and_shows_why() {
+    let mut env = Fake::new();
+    env.registered_ok = false;
+    let text = error_text(on(&mut env, &alice()));
+    assert!(text.contains("The user name or password is incorrect."), "{text}");
+    assert!(!env.calls.iter().any(|call| call.starts_with("run")));
+}
+
+#[test]
+fn on_targets_the_named_account_not_the_caller() {
+    let mut env = Fake::new();
+    let bob = account("bob", "S-1-5-21-1-2-3-2002", AccountKind::Local);
+    on(&mut env, &bob).unwrap();
+    assert!(
+        env.calls.iter().any(|call| call.contains("S-1-5-21-1-2-3-2002")),
+        "{:?}",
+        env.calls
+    );
+    assert!(
+        !env.calls.iter().any(|call| call.contains("S-1-5-21-1-2-3-1001")),
+        "{:?}",
+        env.calls
+    );
+    assert!(env.said().contains("bob"), "{}", env.said());
+}
+
+#[test]
+fn the_password_is_in_nothing_it_says() {
+    let mut env = Fake::new();
+    on(&mut env, &alice()).unwrap();
+    env.batch = BatchRight::Missing;
+    let error = error_text(on(&mut env, &alice()));
+    assert!(!env.said().contains(SECRET));
+    assert!(!error.contains(SECRET));
+}
+
+#[test]
+fn off_deletes_the_task_and_says_a_running_session_continues() {
+    let mut env = Fake::new();
+    off(&mut env, &alice()).unwrap();
+    assert_eq!(env.calls, [format!("delete {}", task_name("S-1-5-21-1-2-3-1001"))]);
+    let said = env.said();
+    assert!(said.contains("auto-login is off for alice"), "{said}");
+    assert!(said.contains(&format!("{EXE} logout")), "{said}");
+}
+
+#[test]
+fn off_twice_is_ok() {
+    let mut env = Fake::new();
+    off(&mut env, &alice()).unwrap();
+    env.said.clear();
+    off(&mut env, &alice()).unwrap();
+    assert!(env.said().contains("already off"), "{}", env.said());
+}
