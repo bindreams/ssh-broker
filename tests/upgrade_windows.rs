@@ -6,14 +6,17 @@
 //! back. It refuses to start where an install exists.
 #![cfg(windows)]
 
+use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
 use ssh_broker::autologin::{self, PasswordSource, WindowsEnv};
 use ssh_broker::provision::{self, procwait, schtasks, taskscheduler};
-use windows::Win32::Foundation::WAIT_TIMEOUT;
-use windows::Win32::System::Threading::{CREATE_PROCESS_LOGON_FLAGS, TerminateProcess, WaitForSingleObject};
+use windows::Win32::Foundation::{HANDLE, HANDLE_FLAG_INHERIT, SetHandleInformation, WAIT_TIMEOUT};
+use windows::Win32::System::Threading::{
+    CREATE_PROCESS_LOGON_FLAGS, GetExitCodeProcess, TerminateProcess, WaitForSingleObject,
+};
 
 #[path = "common/account.rs"]
 mod account_fixture;
@@ -178,19 +181,39 @@ fn apply_upgrade_ends_a_background_session_and_restarts_auto_login() {
     // command itself, for as long as the command lasts. A shim relayed through an agent would end
     // when `apply` ends that agent (exit 254, measured in CI), and so would not hold the exe.
     let no_agent = Account::create("up3", true);
-    let shim = no_agent.spawn_with(
+    // Its standard handles are the null device: a shim with none cannot write the command's first line
+    // of output and ends with it.
+    let null = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("NUL")
+        .expect("open NUL");
+    let null_handle = HANDLE(null.as_raw_handle());
+    // SAFETY: a valid handle; the service copies inheritable handles into the child.
+    unsafe { SetHandleInformation(null_handle, HANDLE_FLAG_INHERIT.0, HANDLE_FLAG_INHERIT) }
+        .expect("make NUL inheritable");
+    let shim = no_agent.spawn_with_stdio(
         &installed,
         &format!("\"{}\" -c \"cmd.exe /c ping -n 100000 127.0.0.1\"", installed.display()),
         kit.dir(),
         &[],
         CREATE_PROCESS_LOGON_FLAGS(0),
         None,
+        Some([null_handle; 3]),
     );
     shim.resume();
     let shim_has_ended = || {
         // SAFETY: a valid process handle.
         let state = unsafe { WaitForSingleObject(shim.process.0, 0) }; // sleep-ok: zero-timeout state check of a process handle, not a wait
         state != WAIT_TIMEOUT
+    };
+
+    let shim_exit_code = || {
+        let mut code = 0u32;
+        // SAFETY: a valid process handle and out-pointer; the code is STILL_ACTIVE (259) while it runs.
+        unsafe { GetExitCodeProcess(shim.process.0, &mut code) }
+            .ok()
+            .map(|()| code)
     };
 
     // A state check, not a wait: the shim runs for as long as its command does, and holds the exe from
@@ -209,8 +232,9 @@ fn apply_upgrade_ends_a_background_session_and_restarts_auto_login() {
     );
     assert!(
         !output.status.success(),
-        "the shim holds the exe, so the copy fails (shim ended by now: {}):\n{text}",
-        shim_has_ended()
+        "the shim holds the exe, so the copy fails (shim ended by now: {}, exit code {:?}):\n{text}",
+        shim_has_ended(),
+        shim_exit_code()
     );
     assert!(
         text.contains("in use"),
