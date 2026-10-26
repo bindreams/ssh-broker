@@ -20,7 +20,7 @@ fn main() -> anyhow::Result<()> {
             eprintln!("{}", usage(verb));
             std::process::exit(2);
         }
-        Route::Logout => anyhow::bail!("logout is not built yet"),
+        Route::Logout => logout_command(),
         Route::AutoLogin(_) => anyhow::bail!("auto-login is not built yet"),
         Route::Apply => provision::apply(),
         Route::Verify => provision::verify(),
@@ -33,4 +33,14 @@ fn usage(verb: Verb) -> &'static str {
         Verb::Agent => "usage: ssh-broker agent [--background [--ready-event <name>] [--expect-user <sid>]]",
         Verb::Logout => "usage: ssh-broker logout",
     }
+}
+
+#[cfg(windows)]
+fn logout_command() -> anyhow::Result<()> {
+    ssh_broker::logout::run()
+}
+
+#[cfg(not(windows))]
+fn logout_command() -> anyhow::Result<()> {
+    anyhow::bail!("logout ends a Windows background session and runs only on Windows")
 }

@@ -30,6 +30,8 @@ pub mod filelog;
 pub mod hangup;
 #[cfg(windows)]
 pub mod logon;
+#[cfg(windows)]
+pub mod logout;
 pub mod offer;
 pub mod password_entry;
 #[cfg(windows)]

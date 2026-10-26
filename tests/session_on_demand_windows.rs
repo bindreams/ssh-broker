@@ -23,6 +23,8 @@ use windows::core::PWSTR;
 
 #[path = "common/account.rs"]
 mod account_fixture;
+#[path = "common/agent_conn.rs"]
+mod agent_conn;
 #[path = "common/bounded_wait.rs"]
 mod bounded_wait;
 #[path = "common/desktop.rs"]
@@ -31,6 +33,8 @@ mod desktop;
 mod hard_errors;
 #[path = "common/job.rs"]
 mod job;
+#[path = "common/logon_session.rs"]
+mod logon_session;
 #[path = "common/machine.rs"]
 mod machine;
 #[path = "common/password.rs"]
@@ -41,6 +45,7 @@ mod process_list;
 mod stand_in;
 
 use account_fixture::Account;
+use agent_conn::{AgentConn, BackgroundAgent};
 use job::KillOnCloseJob;
 use stand_in::{Kit, RealAgent, SeclogonGuard, start_shim};
 
@@ -321,4 +326,150 @@ fn second_agent_in_the_same_session_leaves_without_binding() {
         "the second agent must say why it left:\n{log}"
     );
     assert!(first.is_running(), "the first agent must still be serving");
+}
+
+// logout -----
+
+/// The longest the logoff event of an ended logon session is awaited. The event is one the OS may
+/// never deliver, so this bounds a wait on the outside world; expiry is a failure that reports the
+/// measurement, never a pass.
+const LOGOFF_EVENT_BOUND: std::time::Duration = std::time::Duration::from_secs(180);
+
+/// The command that asks the agent to end, run inside it.
+fn logout_command(kit: &Kit) -> String {
+    format!("\"{}\" logout", kit.exe.display())
+}
+
+/// Elevated (CI only). The client of `logout` is a child of the shell the agent hosts: the agent
+/// must not end that tree before the client has shown the reply.
+#[test]
+fn logout_message_reaches_a_pty_client_running_inside_the_agent() {
+    let _machine = machine::shared();
+    let kit = Kit::copy_of_broker("lopty");
+    let account = Account::create("lopty", true);
+    let agent = BackgroundAgent::start(&kit, &account);
+
+    let mut session = AgentConn::connect(&agent.location);
+    session.start_pty("cmd.exe");
+    session.type_line(&logout_command(&kit));
+    let done = session.read_to_end();
+    assert!(
+        done.pty.contains("ending your background session."),
+        "the PTY transcript lacks the reply:
+{}",
+        done.pty
+    );
+}
+
+/// Elevated (CI only). The exec relay runs `logout` in the agent: its stderr and its exit code (0)
+/// come back to the shim.
+#[test]
+fn logout_exit_code_reaches_an_exec_client_inside_the_agent() {
+    let _machine = machine::shared();
+    let kit = Kit::copy_of_broker("loexec");
+    let account = Account::create("loexec", true);
+    let agent = BackgroundAgent::start(&kit, &account);
+
+    let mut session = AgentConn::connect(&agent.location);
+    session.start_exec(&logout_command(&kit));
+    session.end_stdin();
+    let done = session.read_to_end();
+    assert!(
+        done.stderr.contains("ending your background session."),
+        "stderr: {:?}, stdout: {:?}",
+        done.stderr,
+        done.stdout
+    );
+    assert_eq!(done.exit, Some(0), "the shim exits with logout's code");
+}
+
+/// Ask the agent to end from inside it, over a second connection.
+fn logout_from_inside(kit: &Kit, agent: &BackgroundAgent) -> agent_conn::Finished {
+    let mut asker = AgentConn::connect(&agent.location);
+    asker.start_exec(&logout_command(kit));
+    asker.end_stdin();
+    asker.read_to_end()
+}
+
+/// Elevated (CI only). Every process holding the account's logon session ends because of `logout`:
+/// the test lists them first and then waits on their handles, so a `logout` that ends fewer is a
+/// failure of the job, not a pass by timing.
+#[test]
+fn logout_ends_every_process_of_the_logon_session() {
+    let _machine = machine::shared();
+    let kit = Kit::copy_of_broker("loall");
+    let account = Account::create("loall", true);
+    let agent = BackgroundAgent::start(&kit, &account);
+    let id = logon_session::logon_id(agent.process.0);
+
+    // A shell is running in the session when the end comes.
+    let mut shell = AgentConn::connect(&agent.location);
+    shell.start_pty("cmd.exe");
+    shell.type_line("echo shell-is-up");
+    shell.read_until_pty_shows("shell-is-up");
+
+    let own = std::process::id();
+    let held: Vec<_> = logon_session::processes_of(id)
+        .into_iter()
+        .filter(|(pid, _)| *pid != own)
+        .collect();
+    assert!(
+        held.len() >= 2,
+        "expected the agent and its shell in logon session {id:#x}, found {:?}",
+        held.iter().map(|(pid, _)| pid).collect::<Vec<_>>()
+    );
+
+    let reply = logout_from_inside(&kit, &agent);
+    assert_eq!(reply.exit, Some(0), "stderr: {}", reply.stderr);
+    for (pid, process) in &held {
+        bounded_wait::wait_for_exit(
+            process.0,
+            *pid,
+            "a process of the logon session after logout",
+            bounded_wait::CHILD_EXIT_BOUND,
+            &[],
+        );
+    }
+}
+
+/// Elevated (CI only). Spike M6, not settled in three runs: does the logon session itself go away
+/// once its last process has ended? There is no primitive that says a session is gone, and looking
+/// at `LsaEnumerateLogonSessions` right after the last exit races LSA's teardown, which starts when
+/// the last token handle closes. So this waits for the event Windows writes when it destroys a
+/// session, Security 4634 for this logon id, subscribed before `logout` runs. If it does not come
+/// within the bound, that is M6's measured result, reported as such.
+#[test]
+fn logon_session_is_logged_off_after_logout() {
+    let _machine = machine::shared();
+    logon_session::assert_logoff_auditing();
+    let kit = Kit::copy_of_broker("lolog");
+    let account = Account::create("lolog", true);
+    let agent = BackgroundAgent::start(&kit, &account);
+    let id = logon_session::logon_id(agent.process.0);
+    let watch = logon_session::LogoffWatch::new(id);
+
+    let own = std::process::id();
+    let held: Vec<_> = logon_session::processes_of(id)
+        .into_iter()
+        .filter(|(pid, _)| *pid != own)
+        .collect();
+    let reply = logout_from_inside(&kit, &agent);
+    assert_eq!(reply.exit, Some(0), "stderr: {}", reply.stderr);
+    for (pid, process) in &held {
+        bounded_wait::wait_for_exit(
+            process.0,
+            *pid,
+            "a process of the logon session after logout",
+            bounded_wait::CHILD_EXIT_BOUND,
+            &[],
+        );
+    }
+    // Every handle this test holds on the session's processes keeps their tokens, and so the session, alive.
+    drop(held);
+    drop(agent);
+
+    assert!(
+        watch.wait(LOGOFF_EVENT_BOUND),
+        "M6: logon session {id:#x} still present: no 4634 although every process of it has ended"
+    );
 }

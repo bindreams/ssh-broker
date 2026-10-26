@@ -33,6 +33,9 @@ pub fn exit_code_of(err: &anyhow::Error) -> i32 {
 }
 
 #[cfg(windows)]
+mod logout;
+
+#[cfg(windows)]
 use crate::afunix::{self, AcceptError, ConnRx, ConnTx, Listener};
 #[cfg(windows)]
 use crate::agent_background::{Refusal, check_start, mark_listening};
@@ -57,6 +60,8 @@ use crate::socket_loc::SocketLocation;
 #[cfg(windows)]
 use crate::winutil::OwnedHandle;
 #[cfg(windows)]
+use logout::Control;
+#[cfg(windows)]
 use std::path::{Path, PathBuf};
 #[cfg(windows)]
 use std::sync::mpsc::TrySendError;
@@ -68,6 +73,7 @@ use std::sync::{Arc, Condvar, Mutex};
 #[cfg(windows)]
 fn start(args: AgentArgs) -> anyhow::Result<()> {
     let current_sid = crate::acl::Sid::current_user()?.to_sddl()?;
+    let background = args.background.is_some();
     start_with(
         args.background.as_ref(),
         crate::provision::probe::current_session_id(),
@@ -75,7 +81,7 @@ fn start(args: AgentArgs) -> anyhow::Result<()> {
         crate::userdir::current_socket_location,
         |logs| crate::filelog::init_in(logs, "agent.log"),
         |name| ReadyEvent::open(name)?.signal(),
-        serve,
+        |location, session| serve(location, session, background),
     )
 }
 
@@ -132,7 +138,7 @@ fn keep_log_or_report(
 
 /// Become the one agent that serves this user, then serve.
 #[cfg(windows)]
-fn serve(location: &SocketLocation, session: u32) -> anyhow::Result<()> {
+fn serve(location: &SocketLocation, session: u32, background: bool) -> anyhow::Result<()> {
     serve_with(
         location,
         session,
@@ -144,7 +150,7 @@ fn serve(location: &SocketLocation, session: u32) -> anyhow::Result<()> {
                 tracing::info!("waiting for the agent of another session of this user to end");
             })
         },
-        run_on,
+        |location| run_on(location, background),
     )
 }
 
@@ -170,22 +176,27 @@ fn serve_with(
 /// Bind the hardened socket and serve connections, one handler thread each. The caller holds
 /// the user's lock, so no other agent of this user binds meanwhile.
 #[cfg(windows)]
-fn run_on(location: &SocketLocation) -> anyhow::Result<()> {
+fn run_on(location: &SocketLocation, background: bool) -> anyhow::Result<()> {
+    let connections = Connections::new();
+    let control = Arc::new(Control::new(background, Arc::clone(&connections)));
     run_on_with(location, Listener::bind, mark_listening, |listener| {
-        serve_connections(
+        serve_connections_with(
+            connections,
             || listener.accept(),
             |conn, live| {
+                let control = Arc::clone(&control);
                 hand_to_thread(
                     conn,
                     live,
                     |work| std::thread::Builder::new().spawn(work).map(drop),
-                    |conn| {
-                        if let Err(e) = handle_connection(conn) {
+                    move |conn| {
+                        if let Err(e) = handle_connection_in(conn, Hooks::production(), &control) {
                             tracing::warn!("connection handler error: {e:?}");
                         }
                     },
                 )
             },
+            || {},
         )
     })
 }
@@ -280,6 +291,17 @@ impl Connections {
         self.lock().ended
     }
 
+    /// Return once at most `n` connections are live.
+    fn wait_until_at_most(&self, n: usize) {
+        let mut tally = self.lock();
+        while tally.live > n {
+            tally = self
+                .ended
+                .wait(tally)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+
     /// Return once more than `since` connections have ended (`true`), or at once with `false` if
     /// none is live and none has ended since: then nothing is left that could end.
     ///
@@ -340,7 +362,7 @@ impl Drop for Live {
 /// blocks until one of this agent's own connections ends, which is the only thing that can free
 /// any of those, and then accepts again. With no live connection nothing can, and the shortage is
 /// fatal.
-#[cfg(windows)]
+#[cfg(all(windows, test))]
 fn serve_connections<C>(
     accept: impl FnMut() -> Result<C, AcceptError>,
     serve: impl FnMut(C, Live) -> std::io::Result<()>,
@@ -350,13 +372,24 @@ fn serve_connections<C>(
 
 /// [`serve_connections`], calling `blocking` each time the loop is about to block waiting for a
 /// connection to end (see [`Connections::wait_for_an_end`] for what that guarantees).
-#[cfg(windows)]
+#[cfg(all(windows, test))]
 fn serve_connections_observed<C>(
+    accept: impl FnMut() -> Result<C, AcceptError>,
+    serve: impl FnMut(C, Live) -> std::io::Result<()>,
+    blocking: impl FnMut(),
+) -> anyhow::Error {
+    serve_connections_with(Connections::new(), accept, serve, blocking)
+}
+
+/// [`serve_connections_observed`] over a tally the caller also holds, so that a connection can wait
+/// for the others to finish (`logout`).
+#[cfg(windows)]
+fn serve_connections_with<C>(
+    connections: Arc<Connections>,
     mut accept: impl FnMut() -> Result<C, AcceptError>,
     mut serve: impl FnMut(C, Live) -> std::io::Result<()>,
     mut blocking: impl FnMut(),
 ) -> anyhow::Error {
-    let connections = Connections::new();
     loop {
         // Read before the attempt: a connection that ends while it fails is then not missed.
         let ended_before = connections.ended();
@@ -434,9 +467,23 @@ pub fn child_cwd(handshake_cwd: &str, home: Option<std::path::PathBuf>) -> Optio
 }
 
 /// Read the handshake, then dispatch to the PTY or EXEC relay.
-#[cfg(windows)]
+#[cfg(all(windows, test))]
 fn handle_connection(conn: socket2::Socket) -> anyhow::Result<()> {
     handle_connection_with(conn, Hooks::production())
+}
+
+/// [`handle_connection`] with hooks, for a connection that no accept loop owns: it is a desktop
+/// agent's, which `logout` does not end.
+#[cfg(all(windows, test))]
+fn handle_connection_with(conn: socket2::Socket, hooks: Hooks) -> anyhow::Result<()> {
+    handle_connection_in(conn, hooks, &Control::standalone())
+}
+
+/// What a session runs with: the hooks a test can replace, and the agent's shared control.
+#[cfg(windows)]
+struct Env<'a> {
+    hooks: Hooks,
+    control: &'a Control,
 }
 
 /// How a session obtains its [`HangupWatcher`]; a parameter so a test can force a failure.
@@ -461,19 +508,29 @@ impl Hooks {
 }
 
 #[cfg(windows)]
-fn handle_connection_with(conn: socket2::Socket, hooks: Hooks) -> anyhow::Result<()> {
-    let (mut rx, tx) = afunix::split(conn)?;
+fn handle_connection_in(conn: socket2::Socket, hooks: Hooks, control: &Control) -> anyhow::Result<()> {
+    let (mut rx, mut tx) = afunix::split(conn)?;
     let mut fr = FrameReader::new();
     let frame = read_one_frame(&mut rx, &mut fr)?;
     anyhow::ensure!(frame.kind == FrameKind::Handshake, "first frame was not a handshake");
     let hs = Handshake::decode(&frame.payload)?;
+    if hs.mode == Mode::Logout {
+        return logout::handle_logout(&mut rx, &mut tx, control, || {
+            tracing::info!("the background session has ended");
+            std::process::exit(0)
+        });
+    }
+    anyhow::ensure!(
+        !control.is_ending(),
+        "the agent is ending its session; no new shell starts"
+    );
     let command = hs.command.clone().unwrap_or_else(default_shell);
     let cwd_buf = child_cwd(&hs.cwd, home_dir());
     let cwd = cwd_buf.as_deref();
     match hs.mode {
-        Mode::Pty => handle_pty(rx, fr, tx, &command, (hs.cols, hs.rows), cwd, hooks),
-        Mode::Exec => handle_exec(rx, fr, tx, &command, cwd, hooks),
-        Mode::Logout => anyhow::bail!("this agent does not end sessions yet"),
+        Mode::Pty => handle_pty(rx, fr, tx, &command, (hs.cols, hs.rows), cwd, Env { hooks, control }),
+        Mode::Exec => handle_exec(rx, fr, tx, &command, cwd, Env { hooks, control }),
+        Mode::Logout => unreachable!("answered above"),
     }
 }
 
@@ -501,10 +558,12 @@ fn handle_pty(
     command: &str,
     (cols, rows): (u16, u16),
     cwd: Option<&Path>,
-    hooks: Hooks,
+    env: Env<'_>,
 ) -> anyhow::Result<()> {
+    let Env { hooks, control } = env;
     let mut session = PtySession::spawn(command, cols, rows, cwd)?;
     let job = session.job();
+    let _registration = register_session(control, &job);
     // Before `tx` moves into the shared mutex.
     let hangup = start_hangup_watch(&tx, &job, hooks.make_watcher);
 
@@ -605,6 +664,20 @@ fn handle_pty(
     Ok(())
 }
 
+/// Record the session so that `logout` can end its shell tree. If the agent is already ending, the
+/// tree is ended here, at once: the session then runs its normal teardown with a shell that is gone.
+#[cfg(windows)]
+fn register_session<'a>(control: &'a Control, job: &Arc<cosca::Job>) -> Option<logout::Registration<'a>> {
+    let kill_job = Arc::clone(job);
+    let registration = control.register(Arc::new(move || {
+        reap_tree(&kill_job);
+    }));
+    if registration.is_none() {
+        reap_tree(job);
+    }
+    registration
+}
+
 /// Routes decoded input frames into the pseudoconsole.
 #[cfg(windows)]
 struct PtyInputSink {
@@ -640,10 +713,12 @@ fn handle_exec(
     tx: ConnTx,
     command: &str,
     cwd: Option<&Path>,
-    hooks: Hooks,
+    env: Env<'_>,
 ) -> anyhow::Result<()> {
+    let Env { hooks, control } = env;
     let mut child = ExecChild::spawn(command, cwd)?;
     let job = child.job();
+    let _registration = register_session(control, &job);
     // Before `tx` moves into the shared mutex.
     let hangup = start_hangup_watch(&tx, &job, hooks.make_watcher);
     let out_raw = child.stdout_read_raw();

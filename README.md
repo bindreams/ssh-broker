@@ -42,6 +42,19 @@ If a user is logged on in two sessions, the second session's agent waits and tak
 
 A profile path so long that the socket path would pass the 107-byte AF_UNIX limit (only possible with a relocated profile root) is refused with the reason: the socket stays inside the profile, because that is what keeps it private, and the shim fails open.
 
+## Background sessions
+
+### Ending one
+
+`ssh-broker logout` ends your background session: the agent, every shell it hosts and the processes they started. Run it with the installed exe's full path, `C:\ProgramData\ssh-broker\ssh-broker.exe logout`, because `apply` does not put the install directory on `PATH`. The usual place to type it is a shell the session itself gave you; the agent waits for the command to finish and print its reply before it ends anything, and your SSH connection then closes.
+
+| Exit code | Meaning |
+|---|---|
+| 0 | The session ended. |
+| 1 | You have no session to end. |
+| 2 | Your agent runs in your desktop session; signing out of Windows ends it. |
+| 3 | The agent did not answer. An agent older than this ssh-broker cannot understand `logout`: run `apply`. A crashed agent looks the same. |
+
 ## Requirements
 
 **PowerShell Core (`pwsh`) must be installed.** Stock Windows ships `powershell.exe` 5.1, which is a different binary. `pwsh` is what the agent hosts for every interactive session — a configurable shell is not implemented — and what the shim falls back to when the agent is unreachable and there is no command to run. `ssh host "cmd"` does not involve a shell on either path: the relay and the fail-open both spawn the command directly, so pipes, redirection and `&&` are the client's business, not the server's. The Windows test suite also assumes `pwsh`.
