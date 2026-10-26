@@ -55,6 +55,8 @@ pub mod shim_offer;
 #[cfg(windows)]
 pub mod shim_pty;
 pub mod socket_loc;
+#[cfg(windows)]
+pub mod starting_agent;
 #[cfg(all(windows, test))]
 mod test_support;
 #[cfg(windows)]

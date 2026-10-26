@@ -162,3 +162,13 @@ fn a_failing_wait_or_rearm_is_an_error_not_a_hang() {
         wait_until_serving::<u32>(|| None, || Ok(Woke::Changed), || anyhow::bail!("rearm failed")).unwrap_err();
     assert!(format!("{failed:#}").contains("rearm failed"));
 }
+
+#[test]
+fn a_starting_agent_that_is_gone_gets_one_more_connect_and_a_serving_peer_is_used() {
+    let script = Script::new(vec![None, Some(3)], vec![Woke::Gone]);
+    assert!(matches!(script.run(), Served::Connected(3)));
+    assert_eq!(*script.events.borrow(), ["connect", "wait", "connect"]);
+
+    let script = Script::new(vec![None, None], vec![Woke::Gone]);
+    assert!(matches!(script.run(), Served::Gone));
+}

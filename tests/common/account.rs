@@ -231,24 +231,33 @@ impl Account {
     }
 
     /// Make the account a member of the local Administrators group. It is removed with the account.
+    /// The member is given by SID (level 0): a name needs the machine's own name as its domain, and
+    /// `.` there is answered with `ERROR_NO_SUCH_MEMBER` (1387).
     pub fn make_administrator(&self) {
-        use windows::Win32::NetworkManagement::NetManagement::{LOCALGROUP_MEMBERS_INFO_3, NetLocalGroupAddMembers};
+        use windows::Win32::Foundation::{HLOCAL, LocalFree};
+        use windows::Win32::NetworkManagement::NetManagement::{LOCALGROUP_MEMBERS_INFO_0, NetLocalGroupAddMembers};
+        use windows::Win32::Security::Authorization::ConvertStringSidToSidW;
+        use windows::Win32::Security::PSID;
 
         assert_elevated();
-        let mut member = wide(&format!(".\\{}", self.name));
-        let info = LOCALGROUP_MEMBERS_INFO_3 {
-            lgrmi3_domainandname: PWSTR(member.as_mut_ptr()),
-        };
-        // SAFETY: `info` and the string it points at outlive the call.
+        let mut sid = PSID::default();
+        // SAFETY: a NUL-terminated string and a valid out-pointer; the SID is freed below.
+        unsafe { ConvertStringSidToSidW(PCWSTR(wide(&self.sid_text).as_ptr()), &mut sid) }.expect("the account's SID");
+        let info = LOCALGROUP_MEMBERS_INFO_0 { lgrmi0_sid: sid };
+        // SAFETY: `info` and the SID it points at outlive the call.
         let rc = unsafe {
             NetLocalGroupAddMembers(
                 PCWSTR::null(),
                 PCWSTR(wide("Administrators").as_ptr()),
-                3,
+                0,
                 &info as *const _ as *const u8,
                 1,
             )
         };
+        // SAFETY: the SID from above.
+        unsafe {
+            let _ = LocalFree(Some(HLOCAL(sid.0)));
+        }
         assert_eq!(rc, 0, "NetLocalGroupAddMembers({}) failed with {rc}", self.name);
     }
 

@@ -112,6 +112,14 @@ jobs:
         run: |
           auditpol /set /subcategory:"Logoff" /success:enable
           auditpol /set /subcategory:"Logon" /failure:enable
+          wevtutil sl Microsoft-Windows-TaskScheduler/Operational /e:true
 
       - name: cargo test
-        run: cargo test --locked
+        run: cargo test --locked --no-fail-fast
+
+      # What the system recorded about logons and scheduled tasks, for a failed run to be read from the log.
+      - name: Logon and task events
+        if: failure() && runner.os == 'Windows'
+        run: |
+          wevtutil qe Security /q:"*[System[(EventID=4625)]]" /c:20 /rd:true /f:text
+          wevtutil qe Microsoft-Windows-TaskScheduler/Operational /c:80 /rd:true /f:text

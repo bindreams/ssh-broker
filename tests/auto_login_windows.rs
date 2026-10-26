@@ -36,6 +36,8 @@ mod process_list;
 mod stand_in;
 #[path = "common/system_task.rs"]
 mod system_task;
+#[path = "common/task_instances.rs"]
+mod task_instances;
 
 use account_fixture::Account;
 use agent_conn::{AgentConn, local_account};
@@ -281,7 +283,9 @@ fn a_stale_password_is_not_visible_in_the_last_result() {
     stand_in::wait_for_serving_marker_of_a_task(&location(&account), TASK_START_BOUND);
     logout_with(&kit, &account);
 
-    // The stored password goes stale; the next run cannot log on.
+    // The stored password goes stale; the next run cannot log on. The task ignores a start while an
+    // instance is listed, so the run after the logout must find none.
+    task_instances::wait_until_none(&task_name(&account.sid_text));
     let failed_logon = logon_session::failed_logon_watch(&account.name);
     account.set_password("Changed-Pw-9z!Aa");
     taskscheduler::run_task(&task_name(&account.sid_text)).unwrap();

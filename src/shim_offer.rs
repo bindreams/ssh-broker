@@ -29,7 +29,7 @@ use crate::offer::{
 use crate::password_entry::{Password, Step};
 use crate::ready::{ReadyEvent, Waited};
 use crate::socket_loc::SocketLocation;
-use crate::{afunix, provision};
+use crate::{afunix, provision, starting_agent};
 
 // plan -----
 
@@ -75,6 +75,8 @@ pub enum Woke {
     Changed,
     /// The agent process ended with this exit code.
     AgentExited(u32),
+    /// The holder of the user's lock ended; its exit code is not known.
+    Gone,
 }
 
 /// How the wait ended.
@@ -85,6 +87,8 @@ pub enum Served<C> {
     Ended {
         code: u32,
     },
+    /// The agent that held the user's lock ended and nothing else serves.
+    Gone,
 }
 
 /// Connect, and while that is refused wait for the folder to change or the agent to end.
@@ -95,7 +99,8 @@ pub enum Served<C> {
 /// refused, and the marker the agent writes after `listen()` is the change that wakes the shim again:
 /// nothing is inferred from the file's creation.
 ///
-/// When the agent has ended, connect once more: the loser of a start race exits 0 while another agent
+/// When the agent has ended (or, for an agent this process did not start, its lock was released),
+/// connect once more: the loser of a start race exits 0 while another agent
 /// serves, and an agent that left non-zero can still have a serving peer.
 pub fn wait_until_serving<C>(
     mut connect: impl FnMut() -> Option<C>,
@@ -112,6 +117,12 @@ pub fn wait_until_serving<C>(
                 return Ok(match connect() {
                     Some(connected) => Served::Connected(connected),
                     None => Served::Ended { code },
+                });
+            }
+            Woke::Gone => {
+                return Ok(match connect() {
+                    Some(connected) => Served::Connected(connected),
+                    None => Served::Gone,
                 });
             }
         }
@@ -204,6 +215,18 @@ impl Rescue for Prompting {
             }
         };
         let kind_of_absence = absence(absent.connect, absent.location);
+        // An agent that has made its socket and not yet called `listen()` refuses the connect like
+        // no agent at all. It is waited for, never prompted over.
+        if let (Absence::NoAgent, Ok(location)) = (kind_of_absence, absent.location) {
+            match await_starting_agent(location) {
+                Ok(Starting::Served(socket)) => return Rescued::Connected { socket, modes: None },
+                Ok(Starting::No | Starting::Gone) => {}
+                Err(e) => {
+                    tracing::warn!("cannot tell whether an agent is starting, so no session is offered: {e:#}");
+                    return Rescued::Plain;
+                }
+            }
+        }
         let console = !absent.exec && console_available();
         match plan(absent.exec, console, kind_of_absence, account) {
             Plan::Nothing => Rescued::Plain,
@@ -339,7 +362,56 @@ fn settle(started: Started) -> Result<Socket, String> {
     match served {
         Served::Connected(socket) => Ok(socket),
         Served::Ended { code } => Err(text::agent_ended(code, &location.logs_dir())),
+        // `Woke::Gone` is never returned by the wait above, which watches the agent's own process.
+        Served::Gone => Err(text::start_failed("the agent ended before it served")),
     }
+}
+
+// a starting agent -----
+
+/// What the shim found out about an agent that refused its connect.
+enum Starting {
+    /// Nobody holds the user's lock: there is no agent.
+    No,
+    /// An agent was starting and now serves.
+    Served(Socket),
+    /// An agent was starting and ended without serving.
+    Gone,
+}
+
+/// Whether an agent that refused the connect is only starting, and if so wait until it serves or
+/// ends. The signal is the user's lock (see [`starting_agent`]), never the code of the refusal.
+///
+/// The folder watch is armed before the connect that follows the check, so the marker the agent
+/// writes after `listen()` is seen by that connect or by the watch. The wait is on the folder and
+/// on the lock's holder; both are real conditions, so it has no time limit.
+fn await_starting_agent(location: &SocketLocation) -> anyhow::Result<Starting> {
+    let lock = location.lock_path();
+    if !starting_agent::is_held(&lock).context("tell whether an agent holds the user's lock")? {
+        return Ok(Starting::No);
+    }
+    let watch = DirWatch::arm(&location.dir)?;
+    let holder = starting_agent::HolderWatch::start(&lock)?;
+    let served = wait_until_serving(
+        || afunix::connect(&location.path).ok(),
+        || {
+            let handles = [watch.0, holder.handle()];
+            // SAFETY: both handles are valid for the call.
+            let woke = unsafe { WaitForMultipleObjects(&handles, false, INFINITE) };
+            if woke == WAIT_OBJECT_0 {
+                Ok(Woke::Changed)
+            } else if woke.0 == WAIT_OBJECT_0.0 + 1 {
+                Ok(Woke::Gone)
+            } else {
+                anyhow::bail!("waiting for the starting agent failed: {woke:?}")
+            }
+        },
+        || watch.rearm(),
+    )?;
+    Ok(match served {
+        Served::Connected(socket) => Starting::Served(socket),
+        Served::Gone | Served::Ended { .. } => Starting::Gone,
+    })
 }
 
 #[cfg(test)]
