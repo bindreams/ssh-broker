@@ -56,11 +56,19 @@ fn say(run: &mut PtyRun, marker: &str) {
     run.read_until(marker);
 }
 
-/// Type the password at the prompt and wait for a shell.
+/// Type the password at the prompt and wait for a shell. The plain shell the shim falls back to shows
+/// the same prompt as the relayed one, so a login that fell back fails here, with the reason the shim
+/// gave, and not later in a check that cannot tell the two apart.
 fn log_in(run: &mut PtyRun, password: &str) {
     run.read_until(PROMPT);
     run.type_line(password);
     run.read_until(SHELL_PROMPT);
+    let shown = run.text();
+    assert!(
+        !shown.contains(COST),
+        "the login fell back to a plain shell instead of starting a session:
+{shown}"
+    );
 }
 
 fn leave(run: &mut PtyRun) {

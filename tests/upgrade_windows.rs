@@ -7,11 +7,13 @@
 #![cfg(windows)]
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 use ssh_broker::autologin::{self, PasswordSource, WindowsEnv};
 use ssh_broker::provision::{self, procwait, schtasks, taskscheduler};
+use windows::Win32::Foundation::WAIT_TIMEOUT;
+use windows::Win32::System::Threading::{CREATE_PROCESS_LOGON_FLAGS, TerminateProcess, WaitForSingleObject};
 
 #[path = "common/account.rs"]
 mod account_fixture;
@@ -171,19 +173,30 @@ fn apply_upgrade_ends_a_background_session_and_restarts_auto_login() {
     installed_kit.exe = installed.clone();
     let session = BackgroundAgent::start(&installed_kit, &prompted);
 
-    // An open SSH session: the shim holds the installed exe.
-    let mut shim = Command::new(&installed)
-        .args(["-c", "cmd.exe /c ping -n 100000 127.0.0.1"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("start a shim");
+    // An open SSH session: the shim holds the installed exe. It is the shim of an account that has no
+    // agent (as sshd would run it, under that account's network token): it fails open and runs its
+    // command itself, for as long as the command lasts. A shim relayed through an agent would end
+    // when `apply` ends that agent (exit 254, measured in CI), and so would not hold the exe.
+    let no_agent = Account::create("up3", true);
+    let shim = no_agent.spawn_with(
+        &installed,
+        &format!("\"{}\" -c \"cmd.exe /c ping -n 100000 127.0.0.1\"", installed.display()),
+        kit.dir(),
+        &[],
+        CREATE_PROCESS_LOGON_FLAGS(0),
+        None,
+    );
+    shim.resume();
+    let shim_has_ended = || {
+        // SAFETY: a valid process handle.
+        let state = unsafe { WaitForSingleObject(shim.process.0, 0) }; // sleep-ok: zero-timeout state check of a process handle, not a wait
+        state != WAIT_TIMEOUT
+    };
 
     // A state check, not a wait: the shim runs for as long as its command does, and holds the exe from
     // its creation. If it has ended, the copy below has nothing to fail on.
     assert!(
-        shim.try_wait().unwrap().is_none(),
+        !shim_has_ended(),
         "the shim ended by itself before apply ran, so it cannot hold the exe"
     );
 
@@ -196,8 +209,8 @@ fn apply_upgrade_ends_a_background_session_and_restarts_auto_login() {
     );
     assert!(
         !output.status.success(),
-        "the shim holds the exe, so the copy fails (shim after apply: {:?}):\n{text}",
-        shim.try_wait()
+        "the shim holds the exe, so the copy fails (shim ended by now: {}):\n{text}",
+        shim_has_ended()
     );
     assert!(
         text.contains("in use"),
@@ -214,10 +227,7 @@ fn apply_upgrade_ends_a_background_session_and_restarts_auto_login() {
         &[],
     );
     // The shim was left alone.
-    assert!(
-        shim.try_wait().unwrap().is_none(),
-        "apply must not end an SSH session's shim"
-    );
+    assert!(!shim_has_ended(), "apply must not end an SSH session's shim");
 
     // The auto-login session was ended and started again: a different process serves the account.
     let started = Instant::now();
@@ -233,7 +243,7 @@ fn apply_upgrade_ends_a_background_session_and_restarts_auto_login() {
         std::thread::yield_now();
     }
 
-    let _ = shim.kill();
-    let _ = shim.wait();
+    // SAFETY: a valid process handle; ending a shim that already ended is harmless.
+    let _ = unsafe { TerminateProcess(shim.process.0, 1) };
     let _ = autologin::off(&mut WindowsEnv::new(PasswordSource::Given(None)), &local_account(&auto));
 }
