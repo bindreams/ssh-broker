@@ -68,6 +68,8 @@ fn agent(dir: &Path, args: &[String]) {
     if !dir.join("agent.plan").exists() {
         return;
     }
+    // The record that this process got as far as waiting: a process that ended without it never did.
+    file_signal::publish(&dir.join("agent.waiting"), "waiting");
     file_signal::wait_for_file(&dir.join("agent.go"), None, None, "the test's go signal");
     file_signal::publish(&dir.join("agent.ack"), "ack");
 }

@@ -6,16 +6,21 @@
 //! the call's argument, in a NUL-terminated copy that `Password::with_nul` wipes when the call
 //! returns; it is on no command line, in no environment and in no error text.
 //!
-//! No `CREATE_BREAKAWAY_FROM_JOB`: sshd's job does not allow breakaway, and the child is started by
-//! the service, not by the caller. Whether the child outlives the caller's job is the CI test
-//! `logon_child_survives_the_callers_job_closing`.
+//! The service puts the child in the caller's job (CI, M3: the child of a caller in a kill-on-close job
+//! ended with the job, exit code 0). `CREATE_BREAKAWAY_FROM_JOB` is passed when the caller's job allows
+//! breakaway (`JOB_OBJECT_LIMIT_BREAKAWAY_OK`) and not otherwise: in a job that does not allow it the
+//! call fails with `ERROR_ACCESS_DENIED`, which would cost the user their login.
 
 use std::path::Path;
 
-use windows::Win32::System::Threading::{
-    CREATE_NO_WINDOW, CreateProcessWithLogonW, LOGON_WITH_PROFILE, PROCESS_INFORMATION, STARTUPINFOW,
+use windows::Win32::System::JobObjects::{
+    IsProcessInJob, JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation, QueryInformationJobObject,
 };
-use windows::core::{HRESULT, PCWSTR, PWSTR};
+use windows::Win32::System::Threading::{
+    CREATE_BREAKAWAY_FROM_JOB, CREATE_NO_WINDOW, CreateProcessWithLogonW, GetCurrentProcess, LOGON_WITH_PROFILE,
+    PROCESS_CREATION_FLAGS, PROCESS_INFORMATION, STARTUPINFOW,
+};
+use windows::core::{BOOL, HRESULT, PCWSTR, PWSTR};
 
 use crate::account::LocalAccount;
 use crate::autologin::BatchRight;
@@ -84,6 +89,56 @@ pub fn command_line(exe: &Path, expect_user: &str) -> String {
     format!("\"{}\" agent --background --expect-user {expect_user}", exe.display())
 }
 
+/// `JOB_OBJECT_LIMIT_BREAKAWAY_OK`: a process in the job may start a child outside it.
+const JOB_BREAKAWAY_OK: u32 = 0x0000_0800;
+
+/// The job the calling process is in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CallerJob {
+    NotInJob,
+    /// The `LimitFlags` of the job.
+    Limits(u32),
+    /// Windows would not say.
+    Unreadable,
+}
+
+impl CallerJob {
+    /// The job of this process.
+    pub fn of_this_process() -> CallerJob {
+        let mut in_job = BOOL(0);
+        // SAFETY: a valid handle and out-pointer; no job handle means any job.
+        if unsafe { IsProcessInJob(GetCurrentProcess(), None, &mut in_job) }.is_err() {
+            return CallerJob::Unreadable;
+        }
+        if !in_job.as_bool() {
+            return CallerJob::NotInJob;
+        }
+        let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        // SAFETY: a buffer of the size passed; no job handle queries the calling process's own job.
+        let queried = unsafe {
+            QueryInformationJobObject(
+                None,
+                JobObjectExtendedLimitInformation,
+                (&raw mut info).cast(),
+                size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                None,
+            )
+        };
+        match queried {
+            Ok(()) => CallerJob::Limits(info.BasicLimitInformation.LimitFlags.0),
+            Err(_) => CallerJob::Unreadable,
+        }
+    }
+}
+
+/// The creation flags of the logon call for a caller in `job`.
+pub fn creation_flags(job: &CallerJob) -> PROCESS_CREATION_FLAGS {
+    match job {
+        CallerJob::Limits(flags) if flags & JOB_BREAKAWAY_OK != 0 => CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB,
+        _ => CREATE_NO_WINDOW,
+    }
+}
+
 fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(std::iter::once(0)).collect()
 }
@@ -107,6 +162,7 @@ pub fn start_background_agent(
     };
     let mut info = PROCESS_INFORMATION::default();
     let user = wide(&account.name);
+    let flags = creation_flags(&CallerJob::of_this_process());
     let result = password.with_nul(|password| {
         // SAFETY: every pointer is to a local that outlives the call; `password` is the wiped copy.
         unsafe {
@@ -117,7 +173,7 @@ pub fn start_background_agent(
                 LOGON_WITH_PROFILE,
                 PCWSTR(exe_w.as_ptr()),
                 Some(PWSTR(command.as_mut_ptr())),
-                CREATE_NO_WINDOW,
+                flags,
                 None,
                 directory.as_ref().map_or(PCWSTR::null(), |dir| PCWSTR(dir.as_ptr())),
                 &startup,

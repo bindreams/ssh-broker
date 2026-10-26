@@ -7,8 +7,9 @@ use std::ffi::c_void;
 use ssh_broker::winutil::OwnedHandle;
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::System::JobObjects::{
-    AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation, SetInformationJobObject,
+    AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT, JOB_OBJECT_LIMIT_BREAKAWAY_OK,
+    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+    SetInformationJobObject,
 };
 use windows::core::PCWSTR;
 
@@ -16,11 +17,21 @@ pub struct KillOnCloseJob(Option<OwnedHandle>);
 
 impl KillOnCloseJob {
     pub fn create() -> KillOnCloseJob {
+        KillOnCloseJob::with_flags(JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE)
+    }
+
+    /// A kill-on-close job that also lets its processes start children outside it
+    /// (`JOB_OBJECT_LIMIT_BREAKAWAY_OK`).
+    pub fn create_allowing_breakaway() -> KillOnCloseJob {
+        KillOnCloseJob::with_flags(JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_BREAKAWAY_OK)
+    }
+
+    fn with_flags(flags: JOB_OBJECT_LIMIT) -> KillOnCloseJob {
         // SAFETY: valid arguments; the handle is closed by `OwnedHandle`.
         unsafe {
             let job = OwnedHandle(CreateJobObjectW(None, PCWSTR::null()).expect("CreateJobObjectW"));
             let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            info.BasicLimitInformation.LimitFlags = flags;
             SetInformationJobObject(
                 job.0,
                 JobObjectExtendedLimitInformation,

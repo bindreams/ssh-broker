@@ -49,6 +49,7 @@ windows = { version = "0.62.2", features = [
     "Win32_System_Ole",            # ITaskService::Connect takes VARIANTs
     "Win32_System_Variant",
     "Win32_System_WindowsProgramming", # GetComputerNameW: is an account local to this PC
+    "Win32_System_JobObjects",     # IsProcessInJob/QueryInformationJobObject: the logon asks for breakaway only where the caller's job allows it
     "Wdk_Foundation",
     "Win32_System_Diagnostics_ToolHelp", # CreateToolhelp32Snapshot: apply lists the processes to find background agents; tests/common/process_list.rs finds a process's descendants
     "Wdk_System_Threading",         # NtQueryInformationProcess: the command line of a process, to tell a background agent from a shim; ProcessDefaultHardErrorMode in tests/common/hard_errors.rs

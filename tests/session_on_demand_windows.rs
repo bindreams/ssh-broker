@@ -128,20 +128,27 @@ fn an_administrators_shim_sees_the_agent_it_starts() {
     );
 }
 
-/// Elevated (CI only). M3: the logon child is started by the Secondary Logon service, and whether it
-/// shares its caller's kill-on-close job is the open question. The caller is a network-token process
-/// in such a job; the child signals ready; the job is closed; then the child is told to acknowledge.
-/// It acknowledges (it survived) or it is gone (it died with the job). The wait is on the
-/// acknowledgement and on the child's exit, so neither outcome hangs.
-#[test]
-fn logon_child_survives_the_callers_job_closing() {
+/// What became of the logon child when its caller's job was closed.
+enum M3Outcome {
+    /// It acknowledged after the close.
+    Survived,
+    /// It was gone. `child` and `shim` are the exit codes of the logon child and of the caller (which
+    /// the close certainly ended); `had_waited` says whether the child had recorded that it was
+    /// waiting, which a process that ended by itself while waiting could not have skipped.
+    Ended { child: u32, shim: u32, had_waited: bool },
+}
+
+/// M3: the caller is a network-token process in `job`; it starts the logon child through the
+/// product's `start_background_agent`. The child records that it is waiting; the job is closed; then
+/// the child is told to acknowledge. Both outcomes end the wait: it waits on the acknowledgement and
+/// on the child's exit.
+fn logon_child_after_the_callers_job_closes(tag: &str, mut job: KillOnCloseJob) -> M3Outcome {
     let _machine = machine::shared();
-    let kit = Kit::new("m3");
-    let account = Account::create("m3", true);
+    let kit = Kit::new(tag);
+    let account = Account::create(tag, true);
     // The stand-in agent, once it is up, waits for the file `agent.go` and then writes `agent.ack`.
     std::fs::write(kit.path("agent.plan"), "").unwrap();
 
-    let mut job = KillOnCloseJob::create();
     let shim = start_shim(&kit, &account, true, |shim| job.assign(shim.process.0));
     assert!(shim.result.starts_with("Ready"), "shim.result: {}", shim.result);
     let agent_pid: u32 = kit.agent_info("pid").parse().unwrap();
@@ -156,10 +163,22 @@ fn logon_child_survives_the_callers_job_closing() {
         }
         .unwrap_or_else(|e| panic!("open the logon child (pid {agent_pid}): {e}")),
     );
+    // Close the job only once the child is waiting, so that nothing it does after the close is in doubt.
+    match stand_in::file_signal::wait_for_file(
+        &kit.path("agent.waiting"),
+        Some(agent.0),
+        Some(stand_in::SERVING_BOUND),
+        "the logon child's record that it is waiting",
+    ) {
+        FileWaited::Appeared => {}
+        FileWaited::ProcessEnded(code) => {
+            panic!("the logon child (pid {agent_pid}) ended with {code:#x} before the job was closed")
+        }
+    }
 
     job.close();
     // The job's close is what ends the shim; wait for that before the child is asked anything.
-    shim.process.wait();
+    let shim_code = shim.process.wait();
 
     stand_in::file_signal::publish(&kit.path("agent.go"), "go");
     match stand_in::file_signal::wait_for_file(
@@ -168,11 +187,46 @@ fn logon_child_survives_the_callers_job_closing() {
         Some(stand_in::SERVING_BOUND),
         "the logon child's acknowledgement",
     ) {
-        FileWaited::Appeared => {}
-        FileWaited::ProcessEnded(code) => panic!(
-            "M3: the logon child (pid {agent_pid}) did not survive its caller's job closing: it exited with {code:#x} \
-             before acknowledging. CREATE_BREAKAWAY_FROM_JOB is the next thing to try, and an owner question where the \
-             job forbids breakaway"
+        FileWaited::Appeared => M3Outcome::Survived,
+        FileWaited::ProcessEnded(child) => M3Outcome::Ended {
+            child,
+            shim: shim_code,
+            had_waited: kit.path("agent.waiting").is_file(),
+        },
+    }
+}
+
+/// Elevated (CI only). M3, measured and not decided: the caller's job allows no breakaway, so the
+/// product asks for none. The outcome is printed; either outcome is a fact for the owner, and the
+/// test fails only if the logon itself does.
+#[test]
+fn logon_child_in_a_job_that_forbids_breakaway_is_measured() {
+    match logon_child_after_the_callers_job_closes("m3a", KillOnCloseJob::create()) {
+        M3Outcome::Survived => {
+            eprintln!("M3 (job without BREAKAWAY_OK): the logon child survived its caller's job closing")
+        }
+        M3Outcome::Ended {
+            child,
+            shim,
+            had_waited,
+        } => eprintln!(
+            "M3 (job without BREAKAWAY_OK): the logon child ended with the job: exit code {child:#x} (the caller's,              ended by the same close: {shim:#x}); it had recorded that it was waiting: {had_waited}"
+        ),
+    }
+}
+
+/// Elevated (CI only). M3: where the caller's job allows breakaway the product asks for it, and the
+/// logon child outlives the job.
+#[test]
+fn logon_child_survives_the_callers_job_closing_where_breakaway_is_allowed() {
+    match logon_child_after_the_callers_job_closes("m3b", KillOnCloseJob::create_allowing_breakaway()) {
+        M3Outcome::Survived => {}
+        M3Outcome::Ended {
+            child,
+            shim,
+            had_waited,
+        } => panic!(
+            "M3: the logon child ended with its caller's job although the job allows breakaway and the logon asked              for it: exit code {child:#x} (the caller's: {shim:#x}); it had recorded that it was waiting: {had_waited}"
         ),
     }
 }
