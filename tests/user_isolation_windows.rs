@@ -603,7 +603,19 @@ fn shim_as_bob_never_reaches_another_users_listener() {
         icacls_report(&shared.0)
     );
     // The location resolved (to bob's own) and nothing listens there: no reason, no log failure.
-    assert_eq!(run.stderr, NO_AGENT_LINE, "the shim failed open for the wrong reason");
+    // A command session of an account with no session says so once, then gives the usual fallback line.
+    let notice = format!("ssh-broker: {} has no Windows session on this PC", bob.name);
+    assert!(
+        run.stderr.starts_with(&notice) && run.stderr.ends_with(NO_AGENT_LINE),
+        "the shim failed open for the wrong reason: {:?}",
+        run.stderr
+    );
+    assert_eq!(
+        run.stderr.matches("ssh-broker: ").count(),
+        2,
+        "the notice and the fallback line, once each: {:?}",
+        run.stderr
+    );
     assert!(
         run.stdout.contains("shim-ran"),
         "and ran the command locally: {}",

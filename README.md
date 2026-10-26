@@ -44,6 +44,22 @@ A profile path so long that the socket path would pass the 107-byte AF_UNIX limi
 
 ## Background sessions
 
+A user with no session on the PC (nobody logged in at the console or over RDP) has no interactive session to relay into. An interactive SSH login then asks for the Windows password:
+
+```
+ssh-broker: <user> has no Windows session on this PC. Enter your Windows password to start one. (The password goes to Windows to sign you in; ssh-broker does not store it.) Press Ctrl+C for a plain shell.
+```
+
+The password is not echoed, goes to Windows (`CreateProcessWithLogonW`) and nowhere else, and is wiped from the buffers ssh-broker holds as soon as the call returns. Windows signs the account in and starts `ssh-broker agent --background` in a new logon session with a loaded profile; the login relays into it. The session has no desktop and lasts until the PC restarts or you run `logout`. If you sign in at the desktop afterwards, no second agent starts: the background session keeps serving.
+
+Three ways out of the prompt, none of which starts a session:
+
+- **Ctrl+C or Ctrl+D**, at any point while typing, gives the plain shell and a line that says what it lacks.
+- **A wrong password** prints Windows' reason and gives the plain shell. There is one attempt per connection; reconnecting asks again. Windows' account lockout policy counts these like any other failed sign-in.
+- **A login that cannot ask** (`ssh host cmd`, `scp`, `sftp`, `ssh -T`) never prompts. It runs as before, with one line on stderr that names `ssh -t` and `auto-login on`.
+
+Enter on an empty line does not mean "plain shell": it says empty passwords are not supported yet (ssh-broker#45) and asks again.
+
 ### Ending one
 
 `ssh-broker logout` ends your background session: the agent, every shell it hosts and the processes they started. Run it with the installed exe's full path, `C:\ProgramData\ssh-broker\ssh-broker.exe logout`, because `apply` does not put the install directory on `PATH`. The usual place to type it is a shell the session itself gave you; the agent waits for the command to finish and print its reply before it ends anything, and your SSH connection then closes.
@@ -61,7 +77,7 @@ A profile path so long that the socket path would pass the 107-byte AF_UNIX limi
 
 ## Limits worth knowing before you install it
 
-- **A user with no interactive session gets a plain passthrough shell.** No design can conjure an interactive session without that user's credentials; this relays into one that already exists. If nobody is logged in at the console or over RDP, there is nothing to relay into.
+- **A background session needs your password once.** If you have no session on the PC, an interactive login (`ssh -t`) asks for your Windows password and starts one (below). A login that cannot ask (a command, `scp`, `sftp`, or no terminal), and a login that declines, gets the plain passthrough shell, without DPAPI, a loaded profile or symlink traversal. Only local accounts with a non-empty password are supported (ssh-broker#45).
 - **Your session's background processes die with it.** When the session ends, everything it spawned is terminated — including a process that redirected its output to a file and never touched the session's pipes. There is no `nohup` equivalent here. This matches what stock Windows OpenSSH does; it is the opposite of Unix, where the session waits for pipe EOF.
 - **The shim fails open.** If the agent is unreachable it runs your command locally and says why, rather than locking you out of the machine. That is deliberate: a broken broker must never cost you SSH access. The reason goes to stderr for `ssh host cmd`; for an interactive session it goes to the log in your own `%LOCALAPPDATA%\ssh-broker\logs` (the agent logs there too), because writing to stderr there would corrupt the terminal stream. The one exception is a reason that comes from your own setup, such as a profile path too long for a socket: that is printed to stderr in both modes, before the fallback shell starts. If the shim cannot set up its log (the folder belongs to someone else, say), it carries on without one; for `ssh host cmd` the fallback message then also says why there is no log, and in the other cases `verify`'s `log folder` row is where to look. An interactive fallback launches `pwsh`, so it inherits the requirement above; `ssh host cmd` runs the command directly, with no shell in between.
 - **Everything goes through the relay, including `sftp` and `scp`.** No command is *classified* and routed around it — the fail-open above is a different thing, running locally because the agent is unreachable rather than because of what the command is. Deciding what to route would mean classifying a command from a string the client chose — and sshd rewrites commands before the shim ever sees them. The relay carries arbitrary bytes unchanged in both directions (tested, and checked end to end by `verify`), so transfers work normally; running them locally would be faster, and that is a trade we take deliberately rather than guess at what a command is.

@@ -5,7 +5,7 @@ invariants: [CONTRIBUTING.md](CONTRIBUTING.md). This file is the short orientati
 
 ## What it is
 
-One binary with four entry points plus a hidden `verify-probe` child, dispatched by argv. The **shim** is sshd's `DefaultShell`
+One binary with a handful of entry points plus a hidden `verify-probe` child, dispatched by argv. The **shim** is sshd's `DefaultShell`
 and is the default action; the **agent** runs in a user's interactive session (one per logged-on
 user) and hosts the shell in a pseudoconsole (PTY) or on redirected pipes (`ssh host cmd`); the two
 speak framed messages over an ACL-gated AF_UNIX socket in that user's profile. `apply` and
@@ -37,6 +37,12 @@ checked.
 | `filelog` | the rolling log in the user's own folder |
 | `vtinput` | Win32 `INPUT_RECORD` → VT sequences (pure, host-testable) |
 | `provision` | `apply`/`verify`: DefaultShell, logon task, per-user socket rows, parity probes |
+| `offer`, `offer/text` | the session offer as a pure state machine over injected I/O, and every line it shows |
+| `secret`, `password_entry` | wiped password buffers, and the key-event state machine that fills one |
+| `console_modes`, `console_prompt` | the console's raw mode as a guard; the password prompt on it, and why the shim has no agent |
+| `shim_offer` | the shim's hook for a missing agent: the notice, or the prompt, the logon and the wait for the agent |
+| `account`, `logon`, `ready` | who the token is, the secondary-logon call that starts a background agent, the event it signals |
+| `agent_background`, `agent/logout`, `logout` | the background agent's start checks and exit codes; ending a session, both sides |
 
 ## Invariants you must not break
 

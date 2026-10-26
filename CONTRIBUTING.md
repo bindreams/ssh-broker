@@ -154,6 +154,13 @@ up with `#[path]` is *(review-enforced)*. Inline modules hide host-testable logi
 otherwise platform-gated — which is how `child_cwd`'s tests once became unreachable from the
 macOS build.
 
+**The password has one path** *(review-enforced)*. The shim reads it from the console into a
+`SecretUnits` (`secret.rs`: fully initialised backing, wiped on drop and before a growth frees the old
+store), hands it to `CreateProcessWithLogonW` in a NUL-terminated copy that `Password::with_nul` wipes
+when the call returns, and wipes the console's record buffer after every read. It never goes on a command
+line, into the environment, a file, a log, a `tracing` field, a `Debug` impl or an error text. A new
+use of it is a new path: review it as one.
+
 **No personal home paths** in tracked files *(hook-enforced)*; no usernames or machine names
 *(review)* — the hook matches home-directory shapes only, so a bare username or a hostname is
 caught by reading the diff. This repo is public and its history had to be rewritten once to

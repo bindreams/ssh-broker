@@ -48,6 +48,10 @@ pub enum StartFailure {
     Windows {
         reason: String,
     },
+    /// Something of ours failed before or after the logon call.
+    Internal {
+        reason: String,
+    },
     Disconnected,
 }
 
@@ -97,6 +101,11 @@ pub fn offer(kind: SessionKind, account: AccountKind, absence: Absence, user: &s
                     Err(StartFailure::Disconnected) => Offered::Gone,
                     Err(StartFailure::Windows { reason }) => {
                         io.write(&text::windows_failure(&reason));
+                        io.write(text::COST_LINE);
+                        Offered::Plain
+                    }
+                    Err(StartFailure::Internal { reason }) => {
+                        io.write(&text::start_failed(&reason));
                         io.write(text::COST_LINE);
                         Offered::Plain
                     }

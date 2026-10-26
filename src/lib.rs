@@ -25,6 +25,10 @@ pub mod cmdline;
 #[cfg(windows)]
 pub mod conpty;
 #[cfg(windows)]
+pub mod console_modes;
+#[cfg(windows)]
+pub mod console_prompt;
+#[cfg(windows)]
 pub mod filelog;
 #[cfg(windows)]
 pub mod hangup;
@@ -44,6 +48,8 @@ pub mod relay;
 pub mod route;
 pub mod secret;
 pub mod shim;
+#[cfg(windows)]
+pub mod shim_offer;
 #[cfg(windows)]
 pub mod shim_pty;
 pub mod socket_loc;

@@ -21,8 +21,8 @@ use windows::Win32::Security::{
 };
 use windows::Win32::System::Threading::{
     CREATE_NO_WINDOW, CREATE_PROCESS_LOGON_FLAGS, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT,
-    CreateProcessWithTokenW, GetCurrentProcess, OpenProcessToken, PROCESS_INFORMATION, ResumeThread, STARTUPINFOW,
-    TerminateProcess,
+    CreateProcessWithTokenW, GetCurrentProcess, OpenProcessToken, PROCESS_INFORMATION, ResumeThread,
+    STARTF_USESTDHANDLES, STARTUPINFOW, TerminateProcess,
 };
 use windows::Win32::UI::Shell::{CreateProfile, DeleteProfileW};
 use windows::core::{PCWSTR, PWSTR};
@@ -246,6 +246,22 @@ impl Account {
         logon_flags: CREATE_PROCESS_LOGON_FLAGS,
         environment: Option<&[u16]>,
     ) -> Spawned {
+        self.spawn_with_stdio(exe, command_line, cwd, evidence, logon_flags, environment, None)
+    }
+
+    /// [`Account::spawn_with`] with the child's standard handles (input, output, error) given. They
+    /// must be inheritable; the secondary logon service copies them into the child.
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_with_stdio(
+        &self,
+        exe: &Path,
+        command_line: &str,
+        cwd: &Path,
+        evidence: &[PathBuf],
+        logon_flags: CREATE_PROCESS_LOGON_FLAGS,
+        environment: Option<&[u16]>,
+        stdio: Option<[HANDLE; 3]>,
+    ) -> Spawned {
         // The account's SID and the administrator's: the child runs as the first and is started by
         // the second.
         let starter = Sid::current_user().unwrap().to_sddl().unwrap();
@@ -270,11 +286,17 @@ impl Account {
 
         let mut command = wide(command_line);
         let mut station_and_desktop = wide(private.name());
-        let startup = STARTUPINFOW {
+        let mut startup = STARTUPINFOW {
             cb: std::mem::size_of::<STARTUPINFOW>() as u32,
             lpDesktop: PWSTR(station_and_desktop.as_mut_ptr()),
             ..Default::default()
         };
+        if let Some([input, output, error]) = stdio {
+            startup.dwFlags = STARTF_USESTDHANDLES;
+            startup.hStdInput = input;
+            startup.hStdOutput = output;
+            startup.hStdError = error;
+        }
         let mut flags = CREATE_SUSPENDED | CREATE_NO_WINDOW;
         if environment.is_some() {
             flags |= CREATE_UNICODE_ENVIRONMENT;

@@ -37,3 +37,29 @@ pub fn non_interactive_notice(user: &str, exe: &str) -> String {
          symlink traversal. Use ssh -t to be asked for your password, or run {exe} auto-login on once."
     )
 }
+
+/// The sentence for a background agent that ended before it served. 64 to 67 are the agent's own
+/// refusals (see `agent_background::Refusal`); it has no console, so its exit code is all it can say.
+/// `logs` is the folder of its log.
+pub fn agent_ended(code: u32, logs: &std::path::Path) -> String {
+    let sentence = match code {
+        0 => "another agent took your session but did not answer.".to_string(),
+        64 => "the background session started for a different account than yours and refused to serve.".to_string(),
+        65 => "the agent refused to run in the session it was started in.".to_string(),
+        66 => "the background session started, but your profile has no room for ssh-broker's socket. A profile path \
+               over the 107-byte AF_UNIX limit cannot hold it."
+            .to_string(),
+        67 => "the background session started, but its ssh-broker folder was not safe to use.".to_string(),
+        other => format!(
+            "the agent exited with code {other}; see the agent.log files in {}",
+            logs.display()
+        ),
+    };
+    format!("ssh-broker: {sentence}\r\n")
+}
+
+/// The background session could not be started or waited for, for a reason that is ours and not
+/// Windows' (those use [`windows_failure`]).
+pub fn start_failed(reason: &str) -> String {
+    format!("ssh-broker: the background session did not start: {reason}\r\n")
+}

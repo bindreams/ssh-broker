@@ -15,22 +15,22 @@
 //! never read with a half-restored mode (the use-after-close hazard).
 
 use crate::cmdline::{Encoding, RawExec, resolve_exec};
+use crate::console_modes::ConsoleModes;
 use crate::protocol::{FrameKind, FrameReader, Handshake, Stream, write_frame};
 use crate::relay::{FrameSink, pump_decode, write_data};
 use crate::shim::{
     FailOpen, Fallback, MouseModeSniffer, XtwinopsFilter, decide_fail_open, decide_fallback, is_blank_command,
     make_handshake, map_outcome, run_exec_on, size_to_resize,
 };
+use crate::shim_offer::{Absent, Prompting, Rescue, Rescued};
 use crate::socket_loc::SocketLocation;
 use crate::{afunix, conpty, vtinput};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::System::Console::{
-    CONSOLE_MODE, CONSOLE_SCREEN_BUFFER_INFO, DISABLE_NEWLINE_AUTO_RETURN, ENABLE_EXTENDED_FLAGS, ENABLE_MOUSE_INPUT,
-    ENABLE_PROCESSED_OUTPUT, ENABLE_VIRTUAL_TERMINAL_PROCESSING, ENABLE_WINDOW_INPUT, GetConsoleMode,
-    GetConsoleScreenBufferInfo, GetStdHandle, INPUT_RECORD, ReadConsoleInputW, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
-    SetConsoleCtrlHandler, SetConsoleMode, WriteConsoleInputW,
+    CONSOLE_SCREEN_BUFFER_INFO, GetConsoleScreenBufferInfo, GetStdHandle, INPUT_RECORD, ReadConsoleInputW,
+    STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, WriteConsoleInputW,
 };
 
 // INPUT_RECORD.EventType values (processthreadsapi/consoleapi). windows-rs 0.62 does not
@@ -39,16 +39,6 @@ const EVT_KEY: u16 = 0x0001;
 const EVT_MOUSE: u16 = 0x0002;
 const EVT_WINDOW_BUFFER_SIZE: u16 = 0x0004;
 const EVT_FOCUS: u16 = 0x0010;
-
-/// stdin raw-input mode: window + mouse events as records, extended flags (disables
-/// quick-edit). The absolute store implicitly clears PROCESSED/LINE/ECHO input, so Ctrl-C
-/// arrives as a KEY record (uc=0x03) rather than a signal. VT-input is intentionally omitted
-/// — we read raw `INPUT_RECORD`s and re-encode them ourselves.
-const RAW_IN: CONSOLE_MODE = CONSOLE_MODE(ENABLE_WINDOW_INPUT.0 | ENABLE_MOUSE_INPUT.0 | ENABLE_EXTENDED_FLAGS.0);
-/// stdout bits OR-ed onto the inherited mode: render the agent's VT, and stop CR injection
-/// on LF (the agent's stream already carries explicit CR/LF).
-const VT_OUT: CONSOLE_MODE =
-    CONSOLE_MODE(ENABLE_PROCESSED_OUTPUT.0 | ENABLE_VIRTUAL_TERMINAL_PROCESSING.0 | DISABLE_NEWLINE_AUTO_RETURN.0);
 
 // ── run() wiring + fail-open ───────────────────────────────────────────────────────
 
@@ -87,6 +77,7 @@ pub fn run_on(exec: Option<RawExec>, detect: impl FnOnce() -> Encoding) -> anyho
         crate::userdir::current_socket_location,
         log_failure.as_deref(),
         std::io::stdin(),
+        &mut Prompting,
     ) {
         Ok(Some(code)) => {
             drop(log); // flush the appender before process::exit
@@ -165,8 +156,9 @@ fn try_relay(
     locate: impl FnOnce() -> anyhow::Result<SocketLocation>,
     log_failure: Option<&str>,
     stdin: impl std::io::Read + Send + 'static,
+    rescue: &mut dyn Rescue,
 ) -> anyhow::Result<Option<i32>> {
-    try_relay_at(locate(), exec, &mut std::io::stderr(), log_failure, stdin)
+    try_relay_at(locate(), exec, &mut std::io::stderr(), log_failure, stdin, rescue)
 }
 
 /// The phrase `tests/fail_open_windows.rs` greps for; every fail-open message begins with it.
@@ -192,39 +184,30 @@ fn try_relay_at(
     stderr: &mut dyn std::io::Write,
     log_failure: Option<&str>,
     stdin: impl std::io::Read + Send + 'static,
+    rescue: &mut dyn Rescue,
 ) -> anyhow::Result<Option<i32>> {
-    let location = match location {
-        Ok(location) => location,
-        Err(e) => {
-            // No profile, or a profile path too long for a socket: the cause is the user's own
-            // setup and nothing but this line will tell them. Nothing is relayed and the console
-            // is untouched, so a line on stderr is safe even for an interactive session.
-            let reason = format!("{e:#}");
-            tracing::warn!("{}", unavailable_message(Some(&reason)));
-            let _ = writeln!(stderr, "{}", unavailable_message(Some(&reason)));
-            return Ok(None);
-        }
+    let connection = match &location {
+        Ok(location) => afunix::connect(&location.path),
+        // The cause is shown by the fail-open below; this only says there was nothing to connect to.
+        Err(e) => Err(anyhow::anyhow!("{e:#}")),
     };
-    let path = location.path;
-    let conn = afunix::connect(&path);
-    if decide_fallback(conn.is_err()) == Fallback::LocalShellWithWarning {
-        let msg = unavailable_message(None);
-        tracing::warn!("{msg} (path={path:?}, err={:?})", conn.as_ref().err());
-        // EXEC has a clean stderr channel; in PTY mode a stderr write would corrupt the
-        // terminal stream, so there the warning goes only to the log file.
-        if exec.is_some() {
-            match log_failure {
-                Some(why) => {
-                    let _ = writeln!(stderr, "{msg} (the shim has no log: {why})");
-                }
-                None => {
-                    let _ = writeln!(stderr, "{msg}");
-                }
-            }
+    // A user with no agent may be offered a session (or told how to get one). What the rescue does
+    // not use, the fail-open below still handles exactly as it did before.
+    let (conn, rescued_modes) = if connection.is_err() {
+        let absent = Absent {
+            exec: exec.is_some(),
+            location: &location,
+            connect: &connection,
+        };
+        match rescue.rescue(&absent, stderr) {
+            Rescued::Connected { socket, modes } => (socket, modes),
+            Rescued::Gone => return Ok(Some(255)),
+            Rescued::Plain => return fail_open_reason(&location, &connection, exec, stderr, log_failure),
         }
-        return Ok(None);
-    }
-    let (rx, tx) = afunix::split(conn?)?;
+    } else {
+        (connection?, None)
+    };
+    let (rx, tx) = afunix::split(conn)?;
 
     match exec {
         Some(cmd) => {
@@ -240,8 +223,12 @@ fn try_relay_at(
         }
         None => {
             // Interactive: a real console is required to capture input. No handshake has been
-            // sent yet, so a missing console fails open without orphaning an agent shell.
-            let modes = ConsoleModes::enter()?;
+            // sent yet, so a missing console fails open without orphaning an agent shell. A
+            // prompt that signed the user on hands over the raw console it was using.
+            let modes = match rescued_modes {
+                Some(modes) => modes,
+                None => ConsoleModes::enter()?,
+            };
             if !modes.is_console {
                 drop(modes); // restore is a no-op when !is_console
                 tracing::warn!("no interactive console (redirected stdio) — local shell");
@@ -252,6 +239,47 @@ fn try_relay_at(
             Ok(Some(run_pty(modes, rx, FrameReader::new(), tx, &hs)?))
         }
     }
+}
+
+/// The message of a fail-open, for a location that cannot be used or a connect that failed.
+/// Always `Ok(None)`: the caller falls back to a local shell.
+fn fail_open_reason(
+    location: &anyhow::Result<SocketLocation>,
+    connection: &anyhow::Result<socket2::Socket>,
+    exec: &Option<String>,
+    stderr: &mut dyn std::io::Write,
+    log_failure: Option<&str>,
+) -> anyhow::Result<Option<i32>> {
+    let location = match location {
+        Ok(location) => location,
+        Err(e) => {
+            // No profile, or a profile path too long for a socket: the cause is the user's own
+            // setup and nothing but this line will tell them. Nothing is relayed and the console
+            // is untouched, so a line on stderr is safe even for an interactive session.
+            let reason = format!("{e:#}");
+            tracing::warn!("{}", unavailable_message(Some(&reason)));
+            let _ = writeln!(stderr, "{}", unavailable_message(Some(&reason)));
+            return Ok(None);
+        }
+    };
+    let path = &location.path;
+    if decide_fallback(connection.is_err()) == Fallback::LocalShellWithWarning {
+        let msg = unavailable_message(None);
+        tracing::warn!("{msg} (path={path:?}, err={:?})", connection.as_ref().err());
+        // EXEC has a clean stderr channel; in PTY mode a stderr write would corrupt the
+        // terminal stream, so there the warning goes only to the log file.
+        if exec.is_some() {
+            match log_failure {
+                Some(why) => {
+                    let _ = writeln!(stderr, "{msg} (the shim has no log: {why})");
+                }
+                None => {
+                    let _ = writeln!(stderr, "{msg}");
+                }
+            }
+        }
+    }
+    Ok(None)
 }
 
 /// `$TERM` from the SSH environment, defaulting to a sane 256-colour terminal.
@@ -589,134 +617,6 @@ fn console_size(stdout: HANDLE) -> (u16, u16) {
             vtinput::win_size(w.Left, w.Top, w.Right, w.Bottom)
         } else {
             (80, 24)
-        }
-    }
-}
-
-// ── console raw-mode RAII ──────────────────────────────────────────────────────────
-
-/// The Win32 calls `ConsoleModes` drives to apply/restore raw mode, behind a trait so the
-/// guard's rollback-on-partial-failure behavior is host-testable without a real console via a
-/// fake that fails the SECOND `set_mode` call (`src/shim_pty_tests.rs`). `Win32ConsoleOps` is
-/// the real implementation the `ConsoleModes` alias below is backed by at runtime.
-trait ConsoleOps {
-    fn set_mode(&self, handle: HANDLE, mode: CONSOLE_MODE) -> windows::core::Result<()>;
-    fn set_ctrl_suppressed(&self, suppress: bool) -> windows::core::Result<()>;
-}
-
-struct Win32ConsoleOps;
-
-impl ConsoleOps for Win32ConsoleOps {
-    fn set_mode(&self, handle: HANDLE, mode: CONSOLE_MODE) -> windows::core::Result<()> {
-        unsafe { SetConsoleMode(handle, mode) }
-    }
-
-    fn set_ctrl_suppressed(&self, suppress: bool) -> windows::core::Result<()> {
-        unsafe { SetConsoleCtrlHandler(None, suppress) }
-    }
-}
-
-/// Saves and restores the stdin/stdout console modes (and the Ctrl handler). `is_console` is
-/// false when stdin/stdout are not consoles (redirected pipes) — then nothing is changed and
-/// Drop is a no-op, and the caller fails open (a non-console can't drive `ReadConsoleInputW`).
-///
-/// Generic over `ConsoleOps` purely for testability; real callers use the `ConsoleModes` alias
-/// below, which is always `Win32ConsoleOps`-backed.
-struct ConsoleModesState<Ops: ConsoleOps> {
-    ops: Ops,
-    stdin: HANDLE,
-    stdout: HANDLE,
-    in_orig: CONSOLE_MODE,
-    out_orig: CONSOLE_MODE,
-    is_console: bool,
-    // Whether `set_ctrl_suppressed(true)` actually SUCCEEDED. Unlike the two `SetConsoleMode`
-    // restores below (writing back a captured value is a harmless no-op even on a path where
-    // that particular handle's mode was never actually changed), `SetConsoleCtrlHandler` is an
-    // ABSOLUTE state change inherited by child processes, not a value restore — unconditionally
-    // clearing it on Drop, on a path where the corresponding suppress call never ran (or
-    // failed), would clear an attribute this guard never set (e.g. one the process inherited
-    // from sshd). Gating the restore on this flag keeps Drop symmetric with what actually changed.
-    ctrl_suppressed: bool,
-}
-
-type ConsoleModes = ConsoleModesState<Win32ConsoleOps>;
-
-impl<Ops: ConsoleOps> ConsoleModesState<Ops> {
-    /// Applies raw mode via `ops`, constructing the guard NOW, holding the ORIGINAL modes,
-    /// before either is changed below. `modes` is then a local variable in scope for the rest of
-    /// this function, so if the stdout `set_mode` fails via `?` after the stdin one already
-    /// succeeded, Rust drops every local on that early return — running `modes`'s `Drop` and
-    /// restoring stdin's mode before this function returns the error.
-    fn enter_with(
-        ops: Ops,
-        stdin: HANDLE,
-        stdout: HANDLE,
-        in_orig: CONSOLE_MODE,
-        out_orig: CONSOLE_MODE,
-        is_console: bool,
-    ) -> windows::core::Result<Self> {
-        let mut modes = ConsoleModesState {
-            ops,
-            stdin,
-            stdout,
-            in_orig,
-            out_orig,
-            is_console,
-            ctrl_suppressed: false,
-        };
-        if is_console {
-            modes.ops.set_mode(stdin, RAW_IN)?;
-            modes.ops.set_mode(stdout, CONSOLE_MODE(out_orig.0 | VT_OUT.0))?;
-            // Suppress Ctrl events as signals to the shim (insurance; the primary path is the
-            // cleared ENABLE_PROCESSED_INPUT delivering Ctrl-C as a KEY record). Best-effort:
-            // failure here does not fail `enter_with`, it just leaves `ctrl_suppressed` false so
-            // Drop does not try to undo a change that never happened — but it must not be silent,
-            // for the same reason the Drop-side restores below are logged.
-            modes.ctrl_suppressed = match modes.ops.set_ctrl_suppressed(true) {
-                Ok(()) => true,
-                Err(e) => {
-                    tracing::error!("failed to suppress the console Ctrl handler: {e:?}");
-                    false
-                }
-            };
-        }
-        Ok(modes)
-    }
-}
-
-impl ConsoleModesState<Win32ConsoleOps> {
-    fn enter() -> windows::core::Result<ConsoleModes> {
-        unsafe {
-            let stdin = GetStdHandle(STD_INPUT_HANDLE)?;
-            let stdout = GetStdHandle(STD_OUTPUT_HANDLE)?;
-            let mut in_orig = CONSOLE_MODE(0);
-            let mut out_orig = CONSOLE_MODE(0);
-            let is_console =
-                GetConsoleMode(stdin, &mut in_orig).is_ok() && GetConsoleMode(stdout, &mut out_orig).is_ok();
-            Self::enter_with(Win32ConsoleOps, stdin, stdout, in_orig, out_orig, is_console)
-        }
-    }
-}
-
-impl<Ops: ConsoleOps> Drop for ConsoleModesState<Ops> {
-    fn drop(&mut self) {
-        if self.is_console {
-            // Restoring a captured value is a harmless no-op even if that particular call never
-            // actually changed anything, so these two stay unconditional. A failure here can
-            // leave the session in a corrupted terminal state (raw mode, no echo/line input)
-            // with nothing left to do about it from this function — but it must not be silent,
-            // or that corruption has zero diagnostic trail in the log.
-            if let Err(e) = self.ops.set_mode(self.stdin, self.in_orig) {
-                tracing::error!("failed to restore stdin console mode: {e:?}");
-            }
-            if let Err(e) = self.ops.set_mode(self.stdout, self.out_orig) {
-                tracing::error!("failed to restore stdout console mode: {e:?}");
-            }
-            if self.ctrl_suppressed
-                && let Err(e) = self.ops.set_ctrl_suppressed(false)
-            {
-                tracing::error!("failed to restore the console Ctrl handler: {e:?}");
-            }
         }
     }
 }

@@ -264,3 +264,59 @@ fn notice_names_the_full_exe_path() {
     assert!(notice.contains("alice has no Windows session on this PC"), "{notice}");
     assert!(!notice.contains('\n'), "one line, no terminator: {notice:?}");
 }
+
+#[test]
+fn agent_exit_code_sentences() {
+    let logs = std::path::Path::new(r"C:\Users\me\AppData\Local\ssh-broker\logs");
+    let line = |code| text::agent_ended(code, logs);
+    for code in [64, 65, 66, 67] {
+        let sentence = line(code);
+        assert!(sentence.starts_with("ssh-broker: "), "{sentence}");
+        assert!(sentence.ends_with("\r\n"), "{sentence:?}");
+        assert!(
+            !sentence.contains("exited with code"),
+            "a known code has its own sentence: {sentence}"
+        );
+    }
+    assert!(line(64).contains("different account"));
+    assert!(line(66).contains("socket"));
+    assert!(line(67).contains("folder"));
+    assert_ne!(line(64), line(65));
+    assert_ne!(line(66), line(67));
+    assert!(line(0).contains("took your session but did not answer"));
+    let other = line(1);
+    assert!(other.contains("exited with code 1"), "{other}");
+    assert!(other.contains(logs.to_str().unwrap()), "{other}");
+    assert!(
+        line(0xC000_0142).contains("exited with code 3221225794"),
+        "{}",
+        line(0xC000_0142)
+    );
+}
+
+#[test]
+fn a_failed_start_line_names_the_reason_once() {
+    let line = text::start_failed("the profile cannot be loaded");
+    assert_eq!(
+        line,
+        "ssh-broker: the background session did not start: the profile cannot be loaded\r\n"
+    );
+}
+
+#[test]
+fn a_failure_of_our_own_is_not_blamed_on_windows() {
+    let mut io = Fake::with_steps(vec![Ok(Step::Submit(password("pw")))]);
+    io.start_result = Some(Err(StartFailure::Internal {
+        reason: "could not make the ready event".into(),
+    }));
+    let out = run_pty(&mut io);
+    assert_eq!(out, Offered::Plain);
+    assert!(
+        io.written
+            .contains("ssh-broker: the background session did not start: could not make the ready event"),
+        "{}",
+        io.written
+    );
+    assert!(!io.written.contains("Windows did not sign you in"), "{}", io.written);
+    assert!(io.written.ends_with(text::COST_LINE));
+}

@@ -2,6 +2,7 @@
 //! these compile and run only on a Windows host — in CI, the `Test (windows/amd64)` job.
 
 use super::spawn_contained;
+use crate::shim_offer::NoRescue;
 
 /// The local passthrough must contain its child in a job object, exactly as the relayed path
 /// does, so that failing open can never become a way to outlive the session.
@@ -83,112 +84,6 @@ fn fail_open_maps_interactive_to_pwsh_and_passes_an_exec_command_through() {
 // would leave it green. That property is gated end to end, through the real binary, by
 // `tests/fail_open_windows.rs`.
 
-// ── ConsoleModes rollback-on-partial-failure ────────────────────────────────────────
-
-/// A fake `ConsoleOps` that fails the SECOND `set_mode` call it ever sees and records every
-/// call, so the test can assert exactly what happened rather than merely that something did.
-/// `Rc<RefCell<_>>` so the test keeps its own handle to inspect the record after the guard
-/// (which owns a clone of this fake) has been dropped.
-#[derive(Clone, Default)]
-struct FailSecondSetMode {
-    set_mode_calls: std::rc::Rc<std::cell::RefCell<Vec<(isize, u32)>>>,
-    ctrl_calls: std::rc::Rc<std::cell::RefCell<Vec<bool>>>,
-}
-
-impl super::ConsoleOps for FailSecondSetMode {
-    fn set_mode(
-        &self,
-        handle: windows::Win32::Foundation::HANDLE,
-        mode: windows::Win32::System::Console::CONSOLE_MODE,
-    ) -> windows::core::Result<()> {
-        let mut calls = self.set_mode_calls.borrow_mut();
-        calls.push((handle.0 as isize, mode.0));
-        // Construction makes exactly two `set_mode` calls (stdin, then stdout) before anything
-        // else touches this fake, so call #2 overall is deterministically the stdout one.
-        if calls.len() == 2 {
-            Err(windows::core::Error::new(
-                windows::Win32::Foundation::E_FAIL,
-                "fake SetConsoleMode failure",
-            ))
-        } else {
-            Ok(())
-        }
-    }
-
-    fn set_ctrl_suppressed(&self, suppress: bool) -> windows::core::Result<()> {
-        self.ctrl_calls.borrow_mut().push(suppress);
-        Ok(())
-    }
-}
-
-/// Regression test for the exact bug this diff fixes: a late `set_mode` failure must still roll
-/// back whatever mode was already changed, and must NOT attempt to restore a Ctrl-handler
-/// suppression it never actually applied.
-///
-/// Before the fix, `ConsoleModes::enter` applied both `SetConsoleMode` calls and only
-/// constructed the guard on full success — so a failure on the SECOND call left the FIRST
-/// change (stdin set to raw mode) live, with no guard ever having existed to undo it: stdin was
-/// left raw — no echo, no line input — for the rest of the session. This can't be reproduced
-/// through a real console (there is no portable way to make the second of two back-to-back
-/// `SetConsoleMode` calls fail while the first succeeds), so this test drives the exact same
-/// sequence through a fake `ConsoleOps` instead, which is deterministic and needs no console at
-/// all — this is why `ConsoleModesState` is generic over `ConsoleOps` in the first place.
-#[test]
-fn enter_rolls_back_only_what_it_actually_changed_on_partial_failure() {
-    use windows::Win32::Foundation::HANDLE;
-    use windows::Win32::System::Console::CONSOLE_MODE;
-
-    // Two distinct, real (non-dangling) addresses to tell the fake handles apart by value — never
-    // dereferenced, `FailSecondSetMode` only ever compares/records `HANDLE.0`.
-    static STDIN_MARKER: u8 = 0;
-    static STDOUT_MARKER: u8 = 0;
-    let ops = FailSecondSetMode::default();
-    let stdin = HANDLE(&raw const STDIN_MARKER as *mut core::ffi::c_void);
-    let stdout = HANDLE(&raw const STDOUT_MARKER as *mut core::ffi::c_void);
-    let in_orig = CONSOLE_MODE(0x1111);
-    let out_orig = CONSOLE_MODE(0x2222);
-
-    let result = super::ConsoleModesState::enter_with(ops.clone(), stdin, stdout, in_orig, out_orig, true);
-
-    assert!(
-        result.is_err(),
-        "the second set_mode call was made to fail, so enter_with must propagate an Err"
-    );
-
-    let calls = ops.set_mode_calls.borrow();
-    // Two construction calls (stdin succeeds, stdout fails) plus two Drop restores (stdin then
-    // stdout) = four, in that order — Drop running at all on this early-return path is the
-    // regression this whole test exists to catch.
-    assert_eq!(
-        calls.len(),
-        4,
-        "expected 2 construction calls + 2 Drop restore calls, got: {calls:?}"
-    );
-    assert_eq!(
-        calls[0],
-        (stdin.0 as isize, super::RAW_IN.0),
-        "construction must set stdin to raw mode first"
-    );
-    assert_eq!(
-        calls[2],
-        (stdin.0 as isize, in_orig.0),
-        "Drop must restore stdin's ORIGINAL mode — this is the exact regression: without \
-         constructing the guard before the mutations, this restore never happened at all"
-    );
-    assert_eq!(
-        calls[3],
-        (stdout.0 as isize, out_orig.0),
-        "Drop must also restore stdout's original mode, even though the mutating call for it \
-         is what failed"
-    );
-
-    assert!(
-        ops.ctrl_calls.borrow().is_empty(),
-        "set_ctrl_suppressed(true) was never reached (the stdout set_mode failed first), so \
-         Drop must not attempt to restore a suppression that was never applied"
-    );
-}
-
 /// The fail-open spawn trims leading whitespace for `CreateProcessW`, which rejects it; the
 /// relay's spawn does the same (`pipes_tests`).
 #[test]
@@ -233,6 +128,7 @@ fn unresolvable_socket_location_fails_open_with_the_reason() {
         &mut stderr,
         None,
         std::io::empty(),
+        &mut NoRescue,
     )
     .unwrap();
 
@@ -251,7 +147,15 @@ fn location_error_reaches_stderr_in_pty_mode() {
     // fallback shell corrupts nothing. The log is no substitute: for an interactive session it is
     // the only other place the reason goes, and the user does not read it.
     let mut stderr = Vec::new();
-    let relayed = super::try_relay_at(Err(too_long()), &None, &mut stderr, None, std::io::empty()).unwrap();
+    let relayed = super::try_relay_at(
+        Err(too_long()),
+        &None,
+        &mut stderr,
+        None,
+        std::io::empty(),
+        &mut NoRescue,
+    )
+    .unwrap();
 
     assert_eq!(relayed, None);
     let text = String::from_utf8(stderr).unwrap();
@@ -282,6 +186,7 @@ fn connect_failure_in_the_callers_own_dir_fails_open_without_a_reason_on_stderr(
         &mut stderr,
         None,
         std::io::empty(),
+        &mut NoRescue,
     )
     .unwrap();
 
@@ -304,7 +209,7 @@ fn connect_failure_in_pty_mode_writes_nothing_to_stderr() {
         dir: dir.clone(),
     };
     let mut stderr = Vec::new();
-    let relayed = super::try_relay_at(Ok(location), &None, &mut stderr, None, std::io::empty()).unwrap();
+    let relayed = super::try_relay_at(Ok(location), &None, &mut stderr, None, std::io::empty(), &mut NoRescue).unwrap();
 
     assert_eq!(relayed, None);
     assert!(stderr.is_empty());
@@ -348,7 +253,14 @@ fn try_relay_connects_to_the_location_its_provider_names() {
     let listener = Listener::bind(&location.path).unwrap();
     let agent = fake_agent_exiting_with(listener, 7);
 
-    let relayed = super::try_relay(&Some("echo hi".into()), || Ok(location), None, std::io::empty()).unwrap();
+    let relayed = super::try_relay(
+        &Some("echo hi".into()),
+        || Ok(location),
+        None,
+        std::io::empty(),
+        &mut NoRescue,
+    )
+    .unwrap();
 
     assert_eq!(
         relayed,
@@ -376,6 +288,7 @@ fn a_failed_log_is_named_where_the_shim_already_explains_a_fallback_for_a_comman
         &mut stderr,
         Some(cause),
         std::io::empty(),
+        &mut NoRescue,
     )
     .unwrap();
 
@@ -397,7 +310,15 @@ fn a_failed_log_adds_nothing_to_an_interactive_fallback_that_prints_nothing_toda
         dir: dir.clone(),
     };
     let mut stderr = Vec::new();
-    let relayed = super::try_relay_at(Ok(location), &None, &mut stderr, Some("no log"), std::io::empty()).unwrap();
+    let relayed = super::try_relay_at(
+        Ok(location),
+        &None,
+        &mut stderr,
+        Some("no log"),
+        std::io::empty(),
+        &mut NoRescue,
+    )
+    .unwrap();
 
     assert_eq!(relayed, None);
     assert!(stderr.is_empty());
@@ -420,10 +341,161 @@ fn a_failed_log_does_not_touch_the_stderr_of_a_relayed_command() {
         &mut stderr,
         Some("no log"),
         std::io::empty(),
+        &mut NoRescue,
     )
     .unwrap();
 
     assert_eq!(relayed, Some(0));
     assert!(stderr.is_empty(), "{}", String::from_utf8_lossy(&stderr));
     agent.join().unwrap();
+}
+
+// The rescue: a user with no agent -----
+
+use crate::shim_offer::{Absent, Rescue, Rescued};
+
+/// A rescue that records what it was shown and answers as told.
+struct Scripted {
+    answer: Option<Rescued>,
+    /// Written to stderr before answering, like the notice.
+    line: Option<&'static str>,
+    /// `(exec, location resolved, connect failed)` per call.
+    seen: Vec<(bool, bool, bool)>,
+}
+
+impl Scripted {
+    fn answering(answer: Rescued) -> Scripted {
+        Scripted {
+            answer: Some(answer),
+            line: None,
+            seen: Vec::new(),
+        }
+    }
+}
+
+impl Rescue for Scripted {
+    fn rescue(&mut self, absent: &Absent<'_>, stderr: &mut dyn std::io::Write) -> Rescued {
+        self.seen
+            .push((absent.exec, absent.location.is_ok(), absent.connect.is_err()));
+        if let Some(line) = self.line {
+            writeln!(stderr, "{line}").unwrap();
+        }
+        self.answer.take().expect("asked more than once")
+    }
+}
+
+fn no_agent_location(tag: &str) -> (crate::test_support::TempProfile, SocketLocation) {
+    let profile = crate::test_support::TempProfile::new(tag);
+    let location = profile.location();
+    (profile, location)
+}
+
+#[test]
+fn a_rescue_is_asked_when_the_connect_fails_and_its_line_comes_before_the_fallback_message() {
+    let (_profile, location) = no_agent_location("rescue-plain");
+    let mut rescue = Scripted::answering(Rescued::Plain);
+    rescue.line = Some("NOTICE");
+    let mut stderr = Vec::new();
+    let relayed = super::try_relay_at(
+        Ok(location),
+        &Some("echo hi".into()),
+        &mut stderr,
+        None,
+        std::io::empty(),
+        &mut rescue,
+    )
+    .unwrap();
+
+    assert_eq!(relayed, None);
+    assert_eq!(rescue.seen, [(true, true, true)]);
+    assert_eq!(
+        String::from_utf8(stderr).unwrap(),
+        "NOTICE\nssh-broker: agent unavailable — falling back to a local shell\n"
+    );
+}
+
+#[test]
+fn a_rescue_is_shown_a_location_error_and_the_fallback_message_stays() {
+    let mut rescue = Scripted::answering(Rescued::Plain);
+    let mut stderr = Vec::new();
+    let relayed = super::try_relay_at(
+        Err(crate::userdir::NoProfile.into()),
+        &None,
+        &mut stderr,
+        None,
+        std::io::empty(),
+        &mut rescue,
+    )
+    .unwrap();
+
+    assert_eq!(relayed, None);
+    assert_eq!(rescue.seen, [(false, false, true)]);
+    let text = String::from_utf8(stderr).unwrap();
+    assert!(text.contains("agent unavailable"), "{text}");
+    assert!(text.contains("no profile directory"), "{text}");
+}
+
+#[test]
+fn a_rescue_is_not_asked_when_the_connect_succeeds() {
+    use crate::afunix::Listener;
+    struct Never;
+    impl Rescue for Never {
+        fn rescue(&mut self, _: &Absent<'_>, _: &mut dyn std::io::Write) -> Rescued {
+            panic!("an agent answered: nothing to rescue")
+        }
+    }
+    let profile = crate::test_support::TempProfile::new("rescue-never");
+    let location = profile.location();
+    crate::userdir::ensure_socket_dir(&location, &crate::acl::Sid::current_user().unwrap()).unwrap();
+    let agent = fake_agent_exiting_with(Listener::bind(&location.path).unwrap(), 5);
+
+    let relayed = super::try_relay_at(
+        Ok(location),
+        &Some("echo hi".into()),
+        &mut Vec::new(),
+        None,
+        std::io::empty(),
+        &mut Never,
+    )
+    .unwrap();
+
+    assert_eq!(relayed, Some(5));
+    agent.join().unwrap();
+}
+
+#[test]
+fn a_rescue_that_connects_gets_the_session_relayed_through_its_connection() {
+    use crate::afunix::Listener;
+    // The shim's own location has no agent; the rescue starts one somewhere the shim looks next.
+    let (_empty, nowhere) = no_agent_location("rescue-empty");
+    let served = crate::test_support::TempProfile::new("rescue-served");
+    let at = served.location();
+    crate::userdir::ensure_socket_dir(&at, &crate::acl::Sid::current_user().unwrap()).unwrap();
+    let agent = fake_agent_exiting_with(Listener::bind(&at.path).unwrap(), 9);
+    let socket = crate::afunix::connect(&at.path).unwrap();
+    let mut rescue = Scripted::answering(Rescued::Connected { socket, modes: None });
+
+    let relayed = super::try_relay_at(
+        Ok(nowhere),
+        &Some("echo hi".into()),
+        &mut Vec::new(),
+        None,
+        std::io::empty(),
+        &mut rescue,
+    )
+    .unwrap();
+
+    assert_eq!(relayed, Some(9));
+    assert_eq!(agent.join().unwrap().command.as_deref(), Some("echo hi"));
+}
+
+#[test]
+fn a_rescue_that_finds_the_input_gone_ends_the_shim_with_255_and_runs_nothing() {
+    let (_profile, location) = no_agent_location("rescue-gone");
+    let mut rescue = Scripted::answering(Rescued::Gone);
+    let mut stderr = Vec::new();
+    let relayed = super::try_relay_at(Ok(location), &None, &mut stderr, None, std::io::empty(), &mut rescue).unwrap();
+
+    assert_eq!(relayed, Some(255));
+    assert!(stderr.is_empty(), "no fallback message: nothing runs");
 }

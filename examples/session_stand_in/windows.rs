@@ -18,6 +18,8 @@ pub fn main() {
     match args.first().map(String::as_str) {
         Some("agent") => agent(&dir, &args),
         Some("shim") => shim(Path::new(&args[1])),
+        Some("pty") => pty(Path::new(&args[1]), &args[2]),
+        Some("connect") => connect(Path::new(&args[1]), Path::new(&args[2])),
         _ => std::process::exit(2),
     }
 }
@@ -100,4 +102,61 @@ fn run_shim(password: &str, agent_exe: &Path) -> String {
         Ok(Waited::AgentExited(code)) => format!("AgentExited {code} pid={pid}"),
         Err(e) => format!("wait failed: {e:#}"),
     }
+}
+
+/// Host `command` in a pseudoconsole, the way the agent hosts a shell: input arrives on stdin as
+/// win32-input-mode key sequences, output leaves on stdout, and the exit code is the command's. The
+/// caller starts this as an account's network token, so `command` (the shim) runs as that account
+/// on a console of its own.
+fn pty(cwd: &Path, command: &str) {
+    use std::io::{Read, Write};
+
+    let mut session =
+        ssh_broker::conpty::PtySession::spawn(command, 80, 25, Some(cwd)).expect("start the pseudoconsole");
+    let (in_raw, out_raw) = (session.in_write_raw(), session.out_read_raw());
+    std::thread::spawn(move || {
+        let mut stdin = std::io::stdin();
+        let mut buf = [0u8; 4096];
+        loop {
+            match stdin.read(&mut buf) {
+                Ok(0) | Err(_) => return,
+                Ok(n) => {
+                    if !ssh_broker::conpty::write_all_handle(in_raw, &buf[..n]) {
+                        return;
+                    }
+                }
+            }
+        }
+    });
+    let output = std::thread::spawn(move || {
+        let mut stdout = std::io::stdout();
+        let mut buf = [0u8; 4096];
+        loop {
+            let n = ssh_broker::conpty::read_handle(out_raw, &mut buf);
+            if n == 0 || stdout.write_all(&buf[..n]).and_then(|()| stdout.flush()).is_err() {
+                return;
+            }
+        }
+    });
+    let code = session.wait().unwrap_or(1);
+    // Closing the pseudoconsole delivers its buffered tail and ends the output thread.
+    session.close_pty();
+    let _ = output.join();
+    std::process::exit(code);
+}
+
+/// Connect to the socket at `socket` and write what happened to `result`: `connected`, `os error <n>`
+/// or the error's text.
+fn connect(socket: &Path, result: &Path) {
+    let text = match ssh_broker::afunix::connect(socket) {
+        Ok(_) => "connected".to_string(),
+        Err(e) => match e
+            .downcast_ref::<std::io::Error>()
+            .and_then(std::io::Error::raw_os_error)
+        {
+            Some(code) => format!("os error {code}"),
+            None => format!("{e:#}"),
+        },
+    };
+    std::fs::write(result, text).unwrap();
 }

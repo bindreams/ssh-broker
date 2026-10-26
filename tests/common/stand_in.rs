@@ -43,6 +43,8 @@ pub fn example_exe() -> PathBuf {
 pub struct Kit {
     dir: SharedDir,
     pub exe: PathBuf,
+    /// A copy of the stand-in example, in a kit whose `exe` is the real broker.
+    pub helper: PathBuf,
 }
 
 impl Kit {
@@ -55,11 +57,23 @@ impl Kit {
         Kit::with_exe(tag, Path::new(env!("CARGO_BIN_EXE_ssh-broker")))
     }
 
+    /// A kit holding the real `ssh-broker.exe` as `exe` and the stand-in example as `helper`.
+    pub fn broker_with_helper(tag: &str) -> Kit {
+        let mut kit = Kit::copy_of_broker(tag);
+        kit.helper = kit.dir.0.join("helper.exe");
+        std::fs::copy(example_exe(), &kit.helper).unwrap();
+        kit
+    }
+
     fn with_exe(tag: &str, source: &Path) -> Kit {
         let dir = SharedDir::new(tag);
         let exe = dir.0.join("stand_in.exe");
         std::fs::copy(source, &exe).unwrap();
-        Kit { dir, exe }
+        Kit {
+            dir,
+            helper: exe.clone(),
+            exe,
+        }
     }
 
     pub fn dir(&self) -> &Path {
