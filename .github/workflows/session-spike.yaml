@@ -19,10 +19,13 @@ jobs:
     name: Session spike
     runs-on: windows-latest
     timeout-minutes: 180
-    env:
-      SPIKE_FACTS_FILE: ${{ runner.temp }}\spike-facts.txt
     steps:
       - uses: actions/checkout@v7
+
+      # The runner context is not available in a job-level env, so the path is set here.
+      - name: Choose the facts file
+        shell: pwsh
+        run: Add-Content -Path $env:GITHUB_ENV -Value "SPIKE_FACTS_FILE=$env:RUNNER_TEMP\spike-facts.txt"
 
       - name: Install pinned toolchain
         timeout-minutes: 10
