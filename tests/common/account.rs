@@ -280,6 +280,11 @@ impl Account {
     }
 
     /// The profile `CreateProfile` made. Panics for an account made without one.
+    /// The profile folder, if the account was made with one.
+    pub fn try_profile(&self) -> Option<&Path> {
+        self.profile.as_deref()
+    }
+
     pub fn profile(&self) -> &Path {
         self.profile.as_deref().expect("this account has no profile")
     }

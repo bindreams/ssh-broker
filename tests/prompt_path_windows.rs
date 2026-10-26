@@ -49,6 +49,20 @@ fn kit(tag: &str) -> Kit {
     Kit::broker_with_helper(tag)
 }
 
+/// The shim of `account` on a console, with the logs the shim and its agent write printed when a wait
+/// for the console fails: they say how far the shim got.
+fn start_run(kit: &Kit, account: &Account) -> PtyRun {
+    let profile = account.try_profile().map(std::path::Path::to_path_buf);
+    PtyRun::start(kit, account, &kit.exe).with_context(move || {
+        let logs = profile
+            .as_deref()
+            .and_then(|profile| socket_loc::for_profile(profile).ok())
+            .map(|location| stand_in::read_logs(&location))
+            .unwrap_or_default();
+        format!("logs of the account (shim.log, agent.log):\n{logs}")
+    })
+}
+
 /// A marker the shell prints but does not echo back as typed: its two halves are joined by the shell.
 fn say(run: &mut PtyRun, marker: &str) {
     let (head, tail) = marker.split_at(marker.len() / 2);
@@ -82,7 +96,7 @@ fn prompt_then_password_relays_into_a_background_session() {
     let _machine = machine::shared();
     let kit = kit("pp1");
     let account = Account::create("pp1", true);
-    let mut run = PtyRun::start(&kit, &account, &kit.exe);
+    let mut run = start_run(&kit, &account);
     run.read_until(WAY_OUT);
     log_in(&mut run, &account.password);
 
@@ -114,7 +128,7 @@ fn new_account_without_profile_gets_a_profile_and_a_session() {
     let before = userdir::profile_dir_of_token(token.0).unwrap_err();
     assert!(before.downcast_ref::<userdir::NoProfile>().is_some(), "{before:#}");
 
-    let mut run = PtyRun::start(&kit, &account, &kit.exe);
+    let mut run = start_run(&kit, &account);
     log_in(&mut run, &account.password);
     say(&mut run, "session-up");
     leave(&mut run);
@@ -129,7 +143,7 @@ fn wrong_password_gives_plain_shell_with_reason_and_no_second_prompt() {
     let _machine = machine::shared();
     let kit = kit("pp3");
     let account = Account::create("pp3", true);
-    let mut run = PtyRun::start(&kit, &account, &kit.exe);
+    let mut run = start_run(&kit, &account);
     log_in_expecting_plain(&mut run, "not-the-password");
     run.read_until("Windows did not sign you in:");
     say(&mut run, "plain-shell-works");
@@ -155,7 +169,7 @@ fn typed_password_is_never_echoed() {
     let kit = kit("pp4");
     let secret = "Sentinel-7q2x!Aa";
     let account = Account::create_named(&format!("sb ec{:x}", std::process::id()), secret, true);
-    let mut run = PtyRun::start(&kit, &account, &kit.exe);
+    let mut run = start_run(&kit, &account);
     log_in(&mut run, secret);
     say(&mut run, "session-up");
     leave(&mut run);
@@ -179,7 +193,7 @@ fn ctrl_c_gives_plain_shell() {
     let _machine = machine::shared();
     let kit = kit("pp5");
     let account = Account::create("pp5", true);
-    let mut run = PtyRun::start(&kit, &account, &kit.exe);
+    let mut run = start_run(&kit, &account);
     run.read_until(PROMPT);
     run.ctrl_c();
     run.read_until(COST);
@@ -197,7 +211,7 @@ fn ctrl_d_gives_plain_shell() {
     for (tag, as_character) in [("pp6a", true), ("pp6b", false)] {
         let kit = kit(tag);
         let account = Account::create(tag, true);
-        let mut run = PtyRun::start(&kit, &account, &kit.exe);
+        let mut run = start_run(&kit, &account);
         run.read_until(PROMPT);
         if as_character {
             run.ctrl_d_character();
@@ -216,7 +230,7 @@ fn empty_enter_reprompts() {
     let _machine = machine::shared();
     let kit = kit("pp7");
     let account = Account::create("pp7", true);
-    let mut run = PtyRun::start(&kit, &account, &kit.exe);
+    let mut run = start_run(&kit, &account);
     run.read_until(PROMPT);
     run.press_enter();
     run.read_until("empty passwords are not supported yet");
@@ -237,7 +251,7 @@ fn password_with_non_bmp_characters_logs_on_through_the_prompt() {
     let kit = kit("pp8");
     let secret = "Pw-\u{1F600}-Aa1!-x";
     let account = Account::create_named(&format!("sb np{:x}", std::process::id()), secret, true);
-    let mut run = PtyRun::start(&kit, &account, &kit.exe);
+    let mut run = start_run(&kit, &account);
     run.read_until(PROMPT);
     run.send_raw(&format!("{secret}\r"));
     run.read_until(SHELL_PROMPT);
@@ -253,7 +267,7 @@ fn account_with_space_and_non_ascii_name_gets_a_session_through_the_prompt() {
     let kit = kit("pp9");
     let name = format!("sb \u{00e9}z{:x}", std::process::id());
     let account = Account::create_named(&name, "Pw-Sp-Aa1!-9", true);
-    let mut run = PtyRun::start(&kit, &account, &kit.exe);
+    let mut run = start_run(&kit, &account);
     run.read_until(&format!("ssh-broker: {name} has no Windows session on this PC."));
     run.type_line(&account.password);
     run.read_until(SHELL_PROMPT);
@@ -268,11 +282,11 @@ fn second_connection_reuses_the_running_session() {
     let _machine = machine::shared();
     let kit = kit("pp10");
     let account = Account::create("pp10", true);
-    let mut first = PtyRun::start(&kit, &account, &kit.exe);
+    let mut first = start_run(&kit, &account);
     log_in(&mut first, &account.password);
     say(&mut first, "first-up");
 
-    let mut second = PtyRun::start(&kit, &account, &kit.exe);
+    let mut second = start_run(&kit, &account);
     second.read_until(SHELL_PROMPT);
     say(&mut second, "second-up");
     assert!(
@@ -291,13 +305,13 @@ fn login_after_logout_prompts_again() {
     let _machine = machine::shared();
     let kit = kit("pp11");
     let account = Account::create("pp11", true);
-    let mut first = PtyRun::start(&kit, &account, &kit.exe);
+    let mut first = start_run(&kit, &account);
     log_in(&mut first, &account.password);
     first.type_line(&format!("& '{}' logout", kit.exe.display()));
     first.read_until("ending your background session.");
     first.finish();
 
-    let mut second = PtyRun::start(&kit, &account, &kit.exe);
+    let mut second = start_run(&kit, &account);
     log_in(&mut second, &account.password);
     say(&mut second, "second-up");
     leave(&mut second);
@@ -311,10 +325,7 @@ fn two_simultaneous_first_connections_end_with_one_agent_and_no_hang() {
     let _machine = machine::shared();
     let kit = kit("pp12");
     let account = Account::create("pp12", true);
-    let mut runs = [
-        PtyRun::start(&kit, &account, &kit.exe),
-        PtyRun::start(&kit, &account, &kit.exe),
-    ];
+    let mut runs = [start_run(&kit, &account), start_run(&kit, &account)];
     for run in &mut runs {
         run.read_until(PROMPT);
     }
@@ -340,11 +351,32 @@ fn two_simultaneous_first_connections_end_with_one_agent_and_no_hang() {
         .lines()
         .filter(|line| line.contains("agent --background") && line.contains(&account.sid_text))
         .count();
-    assert_eq!(
-        agents, 1,
-        "one agent must serve, command lines:
-{lines}"
-    );
+    if agents != 1 {
+        let location = socket_loc::for_profile(account.profile()).unwrap();
+        let ours: Vec<&str> = lines.lines().filter(|line| line.contains("ssh-broker")).collect();
+        panic!(
+            "one agent must serve; {agents} of {} do.
+ssh-broker processes:
+{}
+
+first console:
+{}
+
+second console:
+{}
+
+logs:
+{}",
+            account.sid_text,
+            ours.join(
+                "
+"
+            ),
+            runs[0].text(),
+            runs[1].text(),
+            stand_in::read_logs(&location)
+        );
+    }
 }
 
 /// The command line of every process on the machine, one per line.
@@ -412,7 +444,7 @@ fn password_never_appears_in_logs_or_command_lines() {
     let kit = kit("pp14");
     let secret = "Sentinel-5k8m!Bb";
     let account = Account::create_named(&format!("sb pw{:x}", std::process::id()), secret, true);
-    let mut run = PtyRun::start(&kit, &account, &kit.exe);
+    let mut run = start_run(&kit, &account);
     log_in(&mut run, secret);
     say(&mut run, "session-up");
 
@@ -431,7 +463,7 @@ fn second_agent_in_the_same_session_leaves_and_the_session_keeps_serving() {
     let _machine = machine::shared();
     let kit = kit("pp15");
     let account = Account::create("pp15", true);
-    let mut run = PtyRun::start(&kit, &account, &kit.exe);
+    let mut run = start_run(&kit, &account);
     log_in(&mut run, &account.password);
 
     let second = RealAgent::start(&kit, &account);

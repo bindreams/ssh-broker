@@ -66,6 +66,8 @@ pub struct PtyRun {
     output: Receiver<Vec<u8>>,
     /// Everything the shim has written so far.
     transcript: Vec<u8>,
+    /// More to print when a wait fails (the logs the shim and its agent wrote, for one).
+    context: Option<Box<dyn Fn() -> String>>,
 }
 
 impl PtyRun {
@@ -112,7 +114,18 @@ impl PtyRun {
             input: my_in,
             output,
             transcript: Vec::new(),
+            context: None,
         }
+    }
+
+    /// Print `context()` with the report of a wait that fails.
+    pub fn with_context(mut self, context: impl Fn() -> String + 'static) -> PtyRun {
+        self.context = Some(Box::new(context));
+        self
+    }
+
+    fn extra(&self) -> String {
+        self.context.as_ref().map(|context| context()).unwrap_or_default()
     }
 
     /// Take the next chunk of the console's output into the transcript; `false` once the console has
@@ -131,9 +144,12 @@ impl PtyRun {
 {}
 
 process tree:
+{}
+
 {}",
                 self.text(),
-                crate::bounded_wait::process_tree(self.helper.process.0, self.helper.pid)
+                crate::bounded_wait::process_tree(self.helper.process.0, self.helper.pid),
+                self.extra()
             ),
         }
     }
@@ -226,7 +242,10 @@ process tree:
             assert!(
                 self.take_chunk(&format!("one of {needles:?}")),
                 "the console closed before it showed any of {needles:?}; it showed:
-{text}"
+{text}
+
+{}",
+                self.extra()
             );
         }
     }

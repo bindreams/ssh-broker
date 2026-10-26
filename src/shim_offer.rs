@@ -318,12 +318,25 @@ impl OfferIo for LiveIo {
     }
 
     fn start_session(&mut self, password: &Password) -> Result<(), StartFailure> {
+        tracing::info!(
+            "asking Windows to sign {} in and start the background session",
+            self.account.name
+        );
         match logon::start_background_agent(&self.account, password, &self.exe) {
             Ok(agent) => {
+                tracing::info!("Windows started the background session; waiting for it to serve");
                 self.started = Some(Started { agent });
                 Ok(())
             }
-            Err(failure) => Err(StartFailure::Windows { reason: failure.reason }),
+            Err(failure) => {
+                tracing::info!(
+                    "Windows did not sign {} in: {} ({})",
+                    self.account.name,
+                    failure.reason,
+                    failure.code
+                );
+                Err(StartFailure::Windows { reason: failure.reason })
+            }
         }
     }
 }
