@@ -1,0 +1,65 @@
+# Throwaway measurement run for ssh-broker U1-B, Task 0. Lives on the branch U1-B-spike only and is
+# never merged. It creates local accounts and logs them on, so it runs here and nowhere else.
+#
+# Each measurement prints lines `SPIKE <run>.<process>.<key>=<value>` to the log (and to the step
+# summary). The only bound on the run is the job's timeout: a step that waits on a condition has no
+# limit of its own, so M6 (which waits for a logon session to end) runs last.
+name: Session spike
+
+on:
+  push:
+    branches: [U1-B-spike]
+  workflow_dispatch:
+
+jobs:
+  spike:
+    name: Session spike
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install pinned toolchain
+        run: rustup toolchain install
+
+      # M8 needs the OpenSSH server; the spike reports "skipped" if it is not there.
+      - name: Install the OpenSSH server (best effort)
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $cap = Get-WindowsCapability -Online -Name 'OpenSSH.Server*' | Select-Object -First 1
+          $cap | Format-List Name, State
+          if ($cap.State -ne 'Installed') { Add-WindowsCapability -Online -Name $cap.Name }
+          Get-Service sshd | Format-List Name, Status, StartType
+
+      - name: Build the example and the exe
+        run: cargo build --locked --bin ssh-broker --example session_spike
+
+      - name: env, M1, M2
+        if: always()
+        run: target\debug\examples\session_spike.exe env m1
+
+      - name: M3
+        if: always()
+        run: target\debug\examples\session_spike.exe m3
+
+      - name: M4
+        if: always()
+        run: target\debug\examples\session_spike.exe m4
+
+      - name: M5
+        if: always()
+        run: target\debug\examples\session_spike.exe m5
+
+      - name: M7
+        if: always()
+        run: target\debug\examples\session_spike.exe m7
+
+      - name: M8
+        if: always()
+        run: target\debug\examples\session_spike.exe m8
+
+      # Last: waits with no limit for a logon session to leave the system.
+      - name: M6
+        if: always()
+        run: target\debug\examples\session_spike.exe m6

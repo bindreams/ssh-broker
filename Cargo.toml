@@ -63,4 +63,7 @@ windows = { version = "0.62.2", features = [
     "Win32_System_Kernel",                   # PROCESS_BASIC_INFORMATION: tests/common/process_list.rs reads a process's own recorded parent
     "Win32_System_StationsAndDesktops",     # HWINSTA/HDESK: tests/common/desktop.rs gives each child its own window station and desktop
     "Win32_System_Diagnostics_ToolHelp",     # CreateToolhelp32Snapshot: tests/common/process_list.rs finds a process's descendants
+    "Win32_System_JobObjects",               # examples/session_spike (throwaway): the emulated sshd job
+    "Win32_Security_Authentication_Identity", # examples/session_spike: LsaEnumerateLogonSessions / LsaGetLogonSessionData
+    "Win32_System_SystemServices",           # examples/session_spike: PROCESS_MITIGATION_REDIRECTION_TRUST_POLICY
 ] }

@@ -33,7 +33,9 @@ use windows::core::HRESULT;
 /// task's agent would have the very environment this project exists to leave: the shell would be
 /// a child of a session-0 process and a user's socket would be served from there.
 pub fn session_allows_agent(id: u32) -> bool {
-    id != 0
+    // SPIKE (branch U1-B-spike only, never merged): M4 runs the real agent where the logon lands.
+    let _ = id;
+    true
 }
 
 /// The right to be the one agent of this session. Held until dropped.
