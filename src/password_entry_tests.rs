@@ -47,6 +47,45 @@ fn key_up_is_ignored() {
     assert_eq!(p.as_wide(), [0x62]);
 }
 
+/// What a console shows for a character typed as UTF-8 that has no key of its own (measured on a
+/// pseudoconsole, build 26100): the unit is on the key-UP record of Alt, as for Alt+numpad entry; the
+/// key-down of Alt carries no character.
+fn alt_delivery(unit: u16) -> [KeyEvent; 2] {
+    const VK_MENU: u16 = 0x12;
+    [event(VK_MENU, 0, true, LEFT_ALT), event(VK_MENU, unit, false, 0)]
+}
+
+#[test]
+fn a_character_delivered_on_the_alt_key_up_is_typed() {
+    let mut e = PasswordEntry::new();
+    type_str(&mut e, "Pw-");
+    for unit in "\u{1F600}".encode_utf16() {
+        for k in alt_delivery(unit) {
+            assert!(matches!(e.key(&k), Step::Continue));
+        }
+    }
+    type_str(&mut e, "-x");
+    let expect: Vec<u16> = "Pw-\u{1F600}-x".encode_utf16().collect();
+    assert_eq!(submitted(e.key(&enter())).as_wide(), expect.as_slice());
+}
+
+#[test]
+fn an_alt_key_up_without_a_character_adds_nothing() {
+    let mut e = PasswordEntry::new();
+    for k in alt_delivery(0) {
+        assert!(matches!(e.key(&k), Step::Continue));
+    }
+    assert!(matches!(e.key(&enter()), Step::Empty));
+}
+
+#[test]
+fn the_key_up_of_an_ordinary_key_with_a_character_is_not_typed_twice() {
+    let mut e = PasswordEntry::new();
+    e.key(&event(0x50, 0x50, true, 0));
+    e.key(&event(0x50, 0x50, false, 0));
+    assert_eq!(submitted(e.key(&enter())).as_wide(), [0x50]);
+}
+
 #[test]
 fn enter_submits_what_was_typed() {
     let mut e = PasswordEntry::new();

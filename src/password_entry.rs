@@ -7,6 +7,7 @@ use crate::secret::SecretUnits;
 use crate::vtinput::KeyEvent;
 
 const VK_BACK: u16 = 0x08;
+const VK_MENU: u16 = 0x12; // Alt
 const VK_RETURN: u16 = 0x0D;
 const VK_C: u16 = 0x43;
 const VK_D: u16 = 0x44;
@@ -60,6 +61,12 @@ impl PasswordEntry {
     /// entry empty and usable.
     pub fn key(&mut self, k: &KeyEvent) -> Step {
         if !k.key_down {
+            // A console delivers a character that has no key of its own (one outside the BMP, typed as
+            // UTF-8) on the key-UP record of Alt, as it does for Alt+numpad entry. Any other key-up
+            // repeats its key-down.
+            if k.virtual_key_code == VK_MENU {
+                self.type_char(k);
+            }
             return Step::Continue;
         }
         let ctrl = k.control_key_state & CTRL_PRESSED != 0;
@@ -78,12 +85,17 @@ impl PasswordEntry {
             self.text.pop_scalar();
             return Step::Continue;
         }
+        self.type_char(k);
+        Step::Continue
+    }
+
+    /// Add the event's character, as many times as it repeats, unless it is a control character.
+    fn type_char(&mut self, k: &KeyEvent) {
         if k.unicode_char >= 0x20 {
             for _ in 0..k.repeat_count.max(1) {
                 self.text.push(k.unicode_char);
             }
         }
-        Step::Continue
     }
 
     /// The whole store, for tests.
