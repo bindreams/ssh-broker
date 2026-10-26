@@ -1,7 +1,8 @@
 //! The process the logon starts: the `ssh-broker agent --background` stand-in. It records what a
 //! background agent would see, then optionally holds until told to go on.
 //!
-//! `child <rundir> <name> [junction=<dir>] [ready=<event>] [go=<event>] [ack=<event>] [grandchild=1]`
+//! `child <rundir> <name> [junction=<dir>] [ready=<event>] [go=<event>] [ack=<event>] [grandchild=1]
+//! [selfreg=on|off]`
 
 use std::os::windows::io::AsRawHandle;
 use std::os::windows::process::CommandExt;
@@ -9,7 +10,7 @@ use std::path::Path;
 
 use windows::Win32::Foundation::HANDLE;
 
-use crate::rec::Rec;
+use crate::rec::{Input, Rec};
 use crate::win::{self, Event};
 
 pub fn run(args: &[String]) -> i32 {
@@ -22,7 +23,15 @@ pub fn run(args: &[String]) -> i32 {
             .map(str::to_owned)
     };
     let rec = Rec::create(dir, name);
+    // `selfreg=on|off`: M5(a). RedirectionGuard is switched on first when asked, so the facts show it.
+    let selfreg = opt("selfreg");
+    if selfreg.as_deref() == Some("on") {
+        win::redirection_guard_on(&rec);
+    }
     facts(&rec, opt("junction").as_deref());
+    if selfreg.is_some() {
+        crate::selfreg::attempt(&rec, name, &Input::read(dir));
+    }
 
     // A shell of the session: another process of the same logon.
     let mut grandchild = None;
@@ -47,16 +56,16 @@ pub fn run(args: &[String]) -> i32 {
 
     if let Some(ready) = opt("ready") {
         if let Some(child) = &grandchild {
-            let gc_ready = Event::open(&format!("{ready}-gc")).expect("open the grandchild's ready event");
+            let gc_ready = Event::open_recorded(&rec, "grandchild_ready", &format!("{ready}-gc"));
             win::wait_any(&[gc_ready.handle(), HANDLE(child.as_raw_handle())]);
         }
-        Event::open(&ready).expect("open the ready event").set();
+        Event::open_recorded(&rec, "ready", &ready).set();
     }
     if let Some(go) = opt("go") {
-        win::wait_one(Event::open(&go).expect("open the go event").handle());
+        win::wait_one(Event::open_recorded(&rec, "go", &go).handle());
         rec.put("after_go", "alive");
         if let Some(ack) = opt("ack") {
-            Event::open(&ack).expect("open the ack event").set();
+            Event::open_recorded(&rec, "ack", &ack).set();
         }
     }
     0

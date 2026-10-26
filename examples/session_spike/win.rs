@@ -108,8 +108,21 @@ pub fn wait_one(handle: HANDLE) {
     assert_eq!(rc, WAIT_OBJECT_0, "wait failed: {rc:?}");
 }
 
-/// A manual-reset event. Named ones are open to everyone, so any account can set or wait on them.
+/// A manual-reset event.
 pub struct Event(OwnedHandle);
+
+/// The security descriptor of a named event: SYSTEM and Administrators everything, each account in
+/// `account_sids` SYNCHRONIZE | EVENT_MODIFY_STATE, and an explicit Medium mandatory label that
+/// forbids only writes from below. Without a label the kernel gives an object the creator's
+/// integrity, and a Medium process of the test account then cannot open the event of the High
+/// orchestrator for `EVENT_MODIFY_STATE` (`0x80070005` in the second run).
+fn event_sddl(account_sids: &[&str]) -> String {
+    let accounts: String = account_sids
+        .iter()
+        .map(|sid| format!("(A;;0x100002;;;{sid})"))
+        .collect();
+    format!("D:(A;;GA;;;SY)(A;;GA;;;BA){accounts}S:(ML;;NW;;;ME)")
+}
 
 impl Event {
     pub fn unnamed() -> Event {
@@ -119,12 +132,12 @@ impl Event {
         ))
     }
 
-    pub fn create(name: &str) -> windows::core::Result<Event> {
+    pub fn create(name: &str, account_sids: &[&str]) -> windows::core::Result<Event> {
         let mut sd = PSECURITY_DESCRIPTOR::default();
         // SAFETY: NUL-terminated input; the descriptor outlives the call and is freed after it.
         unsafe {
             ConvertStringSecurityDescriptorToSecurityDescriptorW(
-                PCWSTR(wide("D:(A;;GA;;;WD)").as_ptr()),
+                PCWSTR(wide(&event_sddl(account_sids)).as_ptr()),
                 1,
                 &mut sd,
                 None,
@@ -140,6 +153,43 @@ impl Event {
         }
     }
 
+    /// The DACL and the mandatory label the kernel holds for this event, as SDDL.
+    pub fn sddl(&self) -> String {
+        use windows::Win32::Security::Authorization::{
+            ConvertSecurityDescriptorToStringSecurityDescriptorW, GetSecurityInfo, SE_KERNEL_OBJECT,
+        };
+        use windows::Win32::Security::{DACL_SECURITY_INFORMATION, LABEL_SECURITY_INFORMATION};
+        let info = DACL_SECURITY_INFORMATION | LABEL_SECURITY_INFORMATION;
+        let mut descriptor = PSECURITY_DESCRIPTOR::default();
+        // SAFETY: a valid handle and out-pointer; the descriptor is freed below.
+        unsafe {
+            let rc = GetSecurityInfo(
+                self.0.0,
+                SE_KERNEL_OBJECT,
+                info,
+                None,
+                None,
+                None,
+                None,
+                Some(&mut descriptor),
+            );
+            if rc.0 != 0 {
+                return format!("ERROR GetSecurityInfo win32 {}", rc.0);
+            }
+            let mut text = PWSTR::null();
+            let converted = ConvertSecurityDescriptorToStringSecurityDescriptorW(descriptor, 1, info, &mut text, None);
+            let out = match converted {
+                Ok(()) => text.to_string().unwrap_or_default(),
+                Err(e) => format!("ERROR {}", describe(&e)),
+            };
+            if !text.is_null() {
+                let _ = LocalFree(Some(HLOCAL(text.0.cast())));
+            }
+            let _ = LocalFree(Some(HLOCAL(descriptor.0)));
+            out
+        }
+    }
+
     pub fn open(name: &str) -> windows::core::Result<Event> {
         use windows::Win32::System::Threading::{EVENT_MODIFY_STATE, SYNCHRONIZATION_SYNCHRONIZE};
         // SAFETY: NUL-terminated name.
@@ -151,6 +201,23 @@ impl Event {
             )
         }?;
         Ok(Event(OwnedHandle(handle)))
+    }
+
+    /// Open `name` and record that it opened (or why not) as `event_open.<what>`. A failure ends the process.
+    pub fn open_recorded(rec: &Rec, what: &str, name: &str) -> Event {
+        match Event::open(name) {
+            Ok(event) => {
+                rec.put(
+                    &format!("event_open.{what}"),
+                    "opened for EVENT_MODIFY_STATE | SYNCHRONIZE",
+                );
+                event
+            }
+            Err(e) => {
+                rec.err(&format!("event_open.{what}"), &e);
+                panic!("open the {what} event: {}", describe(&e));
+            }
+        }
     }
 
     pub fn set(&self) {
@@ -326,10 +393,10 @@ pub fn kill_account_processes(sid: &str) {
         if pid == me {
             continue;
         }
-        if process_identity(pid).is_some_and(|(user, _)| user == sid) {
-            if let Some(process) = open_process(pid, PROCESS_TERMINATE) {
-                terminate(process.0);
-            }
+        if process_identity(pid).is_some_and(|(user, _)| user == sid)
+            && let Some(process) = open_process(pid, PROCESS_TERMINATE)
+        {
+            terminate(process.0);
         }
     }
 }

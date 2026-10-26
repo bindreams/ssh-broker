@@ -10,7 +10,9 @@ use windows::Win32::Foundation::HANDLE;
 use windows::Win32::NetworkManagement::NetManagement::{
     NetUserAdd, NetUserDel, UF_DONT_EXPIRE_PASSWD, UF_SCRIPT, USER_INFO_1, USER_PRIV_USER,
 };
-use windows::Win32::Security::{LOGON32_LOGON_NETWORK, LOGON32_PROVIDER_DEFAULT, LogonUserW};
+use windows::Win32::Security::{
+    LOGON32_LOGON_BATCH, LOGON32_LOGON_INTERACTIVE, LOGON32_LOGON_NETWORK, LOGON32_PROVIDER_DEFAULT, LogonUserW,
+};
 use windows::Win32::UI::Shell::{CreateProfile, DeleteProfileW};
 use windows::core::{PCWSTR, PWSTR};
 
@@ -24,6 +26,14 @@ pub enum Kind {
     Disabled,
     MustChangePassword,
     BlankPassword,
+}
+
+/// The logon type of a token made for an account.
+#[derive(Clone, Copy)]
+pub enum LogonKind {
+    Network,
+    Interactive,
+    Batch,
 }
 
 pub struct Account {
@@ -125,6 +135,12 @@ impl Account {
 
     /// The token sshd's key-authenticated logon gives: a network logon, no loaded profile.
     pub fn network_token(&self) -> OwnedHandle {
+        self.token(LogonKind::Network)
+            .unwrap_or_else(|e| panic!("LogonUser({}) failed: {e}", self.name))
+    }
+
+    /// A token from `LogonUserW` of the given logon type.
+    pub fn token(&self, kind: LogonKind) -> windows::core::Result<OwnedHandle> {
         let mut token = HANDLE::default();
         // SAFETY: NUL-terminated inputs, a valid out-pointer.
         unsafe {
@@ -132,13 +148,16 @@ impl Account {
                 PCWSTR(wide(&self.name).as_ptr()),
                 PCWSTR(wide(".").as_ptr()),
                 PCWSTR(wide(&self.password).as_ptr()),
-                LOGON32_LOGON_NETWORK,
+                match kind {
+                    LogonKind::Network => LOGON32_LOGON_NETWORK,
+                    LogonKind::Interactive => LOGON32_LOGON_INTERACTIVE,
+                    LogonKind::Batch => LOGON32_LOGON_BATCH,
+                },
                 LOGON32_PROVIDER_DEFAULT,
                 &mut token,
             )
-        }
-        .unwrap_or_else(|e| panic!("LogonUser({}) failed: {e}", self.name));
-        OwnedHandle(token)
+        }?;
+        Ok(OwnedHandle(token))
     }
 
     pub fn set_password(&mut self, new: &str) {

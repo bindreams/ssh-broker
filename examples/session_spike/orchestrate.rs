@@ -1,4 +1,4 @@
-//! The orchestrator: `session_spike <group>...` with groups `env m1 m3 m4 m5 m6 m7 m8`.
+//! The orchestrator: `session_spike <group>...` with groups `env m1 m3 m4 m5 m5run m5run-batch m6 m7 m8`.
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
@@ -61,6 +61,8 @@ pub fn run(groups_wanted: &[String]) -> i32 {
             "m3" => groups::m3(&shared),
             "m4" => groups::m4(&shared),
             "m5" => m5::m5(&shared),
+            "m5run" => m5::m5run(&shared, false),
+            "m5run-batch" => m5::m5run(&shared, true),
             "m6" => groups::m6(&shared),
             "m7" => groups::m7(&shared),
             "m8" => m8::m8(&shared),

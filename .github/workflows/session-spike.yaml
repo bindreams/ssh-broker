@@ -63,8 +63,20 @@ jobs:
 
       - name: M5
         if: always()
-        timeout-minutes: 10
+        timeout-minutes: 15
         run: target\debug\examples\session_spike.exe m5
+
+      # (d) and (g): a task the scheduler never runs holds its step until the step's timeout, so each
+      # of these has a step of its own. The second gives the account SeBatchLogonRight first.
+      - name: M5 run on demand
+        if: always()
+        timeout-minutes: 10
+        run: target\debug\examples\session_spike.exe m5run
+
+      - name: M5 run on demand, account holds SeBatchLogonRight
+        if: always()
+        timeout-minutes: 10
+        run: target\debug\examples\session_spike.exe m5run-batch
 
       - name: M7
         if: always()

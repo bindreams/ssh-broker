@@ -20,13 +20,18 @@ pub fn run(dir: &Path, scenario: &str) -> i32 {
     rec.put("pid", std::process::id());
     let input = Input::read(dir);
     win::redirection_guard_state(&rec, "standin_before_we_apply");
-    win::redirection_guard_on(&rec);
+    // M5(a) also runs the stand-in without RedirectionGuard (`rg=off`) to see whether it matters.
+    if input.get("rg") == Some("off") {
+        rec.put("redirection_guard_applied", "no: the run asked for rg=off");
+    } else {
+        win::redirection_guard_on(&rec);
+    }
     let outcome = catch_unwind(AssertUnwindSafe(|| {
         self_facts(&rec, dir);
         match scenario {
             "m1" => m1(&rec, dir, &input),
             "m4" => m4(&rec, &input),
-            "m5a" => m5a(&rec, &input),
+            "m5a" => m5a(&rec, dir, &input),
             "m7" => m7(&rec, &input),
             "m7gated" => m7gated(&rec, &input),
             other => rec.put("fatal", format!("unknown scenario {other}")),
@@ -128,13 +133,13 @@ fn m1(rec: &Rec, dir: &Path, input: &Input) {
     rec.put("stand_in_ts_session", win::session_of(std::process::id()));
 
     if let Some(ready) = input.get("ready") {
-        let ready = Event::open(ready).expect("open the child's ready event");
+        let ready = Event::open_recorded(rec, "child_ready", ready);
         let woken = win::wait_any(&[ready.handle(), process.0]);
         rec.put("child_ready", woken == 0);
-        if woken == 0 {
-            if let Some(name) = input.get("standin_ready") {
-                Event::open(name).expect("open the stand-in's ready event").set();
-            }
+        if woken == 0
+            && let Some(name) = input.get("standin_ready")
+        {
+            Event::open_recorded(rec, "standin_ready", name).set();
         }
     }
     win::wait_one(process.0);
@@ -142,7 +147,7 @@ fn m1(rec: &Rec, dir: &Path, input: &Input) {
     drop(process);
     if let Some(name) = input.get("closed") {
         // The stand-in holds no handle to the child any more.
-        Event::open(name).expect("open the closed event").set();
+        Event::open_recorded(rec, "closed", name).set();
     }
 
     if input.get("redirect").is_some() {
@@ -403,40 +408,39 @@ fn log_tail(rec: &Rec, loc: &ssh_broker::socket_loc::SocketLocation) {
 
 // M5(a): a standard user registering a task for itself --------------------------------------------
 
-fn m5a(rec: &Rec, input: &Input) {
-    use crate::tasks::{self, Spec};
-    tasks::init_com();
-    let machine = std::env::var("COMPUTERNAME").unwrap_or_default();
-    let user = input.req("user");
-    let qualified = format!("{machine}\\{user}");
-    let exe = PathBuf::from(input.req("exe"));
-    let name = "sbspike-selfreg";
-    let spec = Spec {
-        name,
-        qualified_name: &qualified,
-        bare_name: user,
-        sid: input.req("sid"),
-        password: input.req("password"),
-        exe: &exe,
-        args: "child x y",
-        sddl: None,
-    };
-    match tasks::register_password_task(&spec) {
-        Ok(variant) => {
-            rec.put(
-                "register_own_task",
-                format!("ACCEPTED (account named in the XML by variant {variant})"),
-            );
-            match tasks::delete(name) {
-                Ok(()) => rec.put("register_own_task.cleanup", "deleted"),
-                Err(e) => rec.err("register_own_task.cleanup", &e),
+/// The registration from this process, whose token and RedirectionGuard setting the orchestrator
+/// chose; and, if `clw=1`, from `CreateProcessWithLogonW` children (an interactive logon, as the
+/// product's background agent would be) with RedirectionGuard off and on.
+fn m5a(rec: &Rec, dir: &Path, input: &Input) {
+    crate::selfreg::attempt(rec, "standin", input);
+    if input.get("clw").is_none() {
+        return;
+    }
+    let exe = Path::new(input.req("exe"));
+    for guard in ["off", "on"] {
+        let name = format!("selfreg_clw_rg{guard}");
+        let args = format!("child {} {name} selfreg={guard}", quote(&dir.display().to_string()));
+        let started = logon::start(
+            &Logon {
+                user: input.req("user"),
+                password: input.req("password"),
+                exe,
+                args: &args,
+                breakaway: false,
+                redirect_to: None,
+            },
+            rec,
+            &name,
+        );
+        match started {
+            Ok(child) => {
+                win::wait_one(child.process.0);
+                rec.put(
+                    &format!("{name}.exit_code"),
+                    format!("{:#x}", win::exit_code(child.process.0)),
+                );
             }
-        }
-        Err(failures) => {
-            rec.put("register_own_task", "REFUSED");
-            for (i, failure) in failures.iter().enumerate() {
-                rec.put(&format!("register_own_task.failure{i}"), failure);
-            }
+            Err(e) => rec.err(&format!("{name}.start"), &e),
         }
     }
 }
@@ -487,9 +491,7 @@ fn m7(rec: &Rec, input: &Input) {
 }
 
 fn m7gated(rec: &Rec, input: &Input) {
-    Event::open(input.req("standin_ready"))
-        .expect("open the ready event")
-        .set();
-    win::wait_one(Event::open(input.req("go")).expect("open the go event").handle());
+    Event::open_recorded(rec, "standin_ready", input.req("standin_ready")).set();
+    win::wait_one(Event::open_recorded(rec, "go", input.req("go")).handle());
     try_logon(rec, "gated_logon", input.req("user"), input.req("password"));
 }

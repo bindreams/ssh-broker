@@ -5,9 +5,9 @@ use std::process::Command;
 use windows::Win32::Foundation::LUID;
 
 use crate::account::{Account, Kind};
-use crate::harness::{Shared, start_stand_in};
+use crate::harness::{Shared, create_events, start_stand_in};
 use crate::rec::{Follower, Rec, fact};
-use crate::win::{self, Event, event_name};
+use crate::win::{self, event_name};
 
 fn command_lines(program: &str, args: &[&str]) -> Vec<String> {
     match Command::new(program).args(args).output() {
@@ -114,10 +114,7 @@ pub fn m3(shared: &Shared) {
         let go = event_name("go");
         let ack = event_name("ack");
         let standin_ready = event_name("standin-ready");
-        let events: Vec<Event> = [&child_ready, &go, &ack, &standin_ready]
-            .iter()
-            .map(|n| Event::create(n).expect("create an event"))
-            .collect();
+        let events = create_events(label, &[&child_ready, &go, &ack, &standin_ready], Some(&b.sid_text));
         let mut input = vec![
             ("ready", child_ready.clone()),
             ("go", go.clone()),
@@ -212,10 +209,13 @@ pub fn m6(shared: &Shared) {
     let go = event_name("go-never");
     let standin_ready = event_name("standin-ready");
     let closed = event_name("closed");
-    let events: Vec<Event> = [&child_ready, &go, &standin_ready, &closed]
-        .iter()
-        .map(|n| Event::create(n).expect("create an event"))
-        .collect();
+    // The grandchild's ready event: the child opens it, the grandchild sets it.
+    let grandchild_ready = format!("{child_ready}-gc");
+    let events = create_events(
+        "m6",
+        &[&child_ready, &go, &standin_ready, &closed, &grandchild_ready],
+        Some(&b.sid_text),
+    );
     let run = start_stand_in(
         shared,
         &b,
@@ -331,11 +331,8 @@ pub fn m7(shared: &Shared) {
     for (label, disable) in [("stopped", false), ("disabled", true)] {
         let standin_ready = event_name("standin-ready");
         let go = event_name("go");
-        let events = [
-            Event::create(&standin_ready).expect("create an event"),
-            Event::create(&go).expect("create an event"),
-        ];
         let run_label = format!("m7-seclogon-{label}");
+        let events = create_events(&run_label, &[&standin_ready, &go], Some(&a.sid_text));
         let run = start_stand_in(
             shared,
             &a,

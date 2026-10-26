@@ -2,7 +2,7 @@
 //!
 //! One binary, several roles chosen by the first argument:
 //!
-//! - `<group>...` (`env m1 m3 m4 m5 m6 m7 m8`): the orchestrator. Creates throwaway accounts, so it
+//! - `<group>...` (`env m1 m3 m4 m5 m5run m5run-batch m6 m7 m8`): the orchestrator. Creates throwaway accounts, so it
 //!   refuses to run outside GitHub Actions or without elevation.
 //! - `stand-in <rundir> <scenario>`: plays sshd's shim for one account (started by the orchestrator
 //!   with a network-logon token, in a kill-on-close job; or by a real sshd for M8).
@@ -25,6 +25,9 @@ mod child;
 #[cfg(windows)]
 #[path = "../tests/common/desktop.rs"]
 mod desktop;
+#[cfg(windows)]
+#[path = "session_spike/evlog.rs"]
+mod evlog;
 #[cfg(windows)]
 #[path = "session_spike/groups.rs"]
 mod groups;
@@ -50,6 +53,12 @@ mod orchestrate;
 #[path = "session_spike/rec.rs"]
 mod rec;
 #[cfg(windows)]
+#[path = "session_spike/rights.rs"]
+mod rights;
+#[cfg(windows)]
+#[path = "session_spike/selfreg.rs"]
+mod selfreg;
+#[cfg(windows)]
 #[path = "session_spike/stand_in.rs"]
 mod stand_in;
 #[cfg(windows)]
@@ -68,7 +77,7 @@ fn main() {
         Some("capture") if args.len() >= 4 => capture::run(&args[1..]),
         Some(_) => orchestrate::run(&args),
         None => {
-            eprintln!("usage: session_spike <group>... (env m1 m3 m4 m5 m6 m7 m8)");
+            eprintln!("usage: session_spike <group>... (env m1 m3 m4 m5 m5run m5run-batch m6 m7 m8)");
             2
         }
     };

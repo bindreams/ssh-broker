@@ -97,11 +97,11 @@ static SUMMARY: Mutex<Option<std::fs::File>> = Mutex::new(None);
 
 /// Open the job summary, if there is one, for [`emit`].
 pub fn open_summary() {
-    if let Some(path) = std::env::var_os("GITHUB_STEP_SUMMARY") {
-        if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
-            let _ = file.write_all(b"\n");
-            *SUMMARY.lock().unwrap() = Some(file);
-        }
+    if let Some(path) = std::env::var_os("GITHUB_STEP_SUMMARY")
+        && let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path)
+    {
+        let _ = file.write_all(b"\n");
+        *SUMMARY.lock().unwrap() = Some(file);
     }
 }
 

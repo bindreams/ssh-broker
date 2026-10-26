@@ -21,7 +21,7 @@ use windows::core::{PCWSTR, PWSTR};
 
 use crate::account::Account;
 use crate::rec::{Follower, Input, fact};
-use crate::win::{self, wide};
+use crate::win::{self, Event, wide};
 use crate::{desktop, hard_errors};
 
 /// A directory every account can write, with a copy of this example and of `ssh-broker.exe`.
@@ -85,6 +85,34 @@ pub fn start_stand_in(
     scenario: &str,
     input: &[(&str, String)],
 ) -> StandIn {
+    start_stand_in_with_token(shared, account, label, scenario, input, account.network_token())
+}
+
+/// Create the named events of one run, each openable by the account `account_sid` and by SYSTEM,
+/// and record each event's DACL and mandatory label as the kernel holds them.
+pub fn create_events(label: &str, names: &[&str], account_sid: Option<&str>) -> Vec<Event> {
+    let sids: Vec<&str> = account_sid.into_iter().collect();
+    names
+        .iter()
+        .enumerate()
+        .map(|(i, name)| {
+            let event = Event::create(name, &sids).expect("create an event");
+            fact(label, &format!("orchestrator.event{i}_sddl"), event.sddl());
+            event
+        })
+        .collect()
+}
+
+/// As [`start_stand_in`], but the stand-in runs under `token` (a primary-token candidate made by
+/// `LogonUserW` for `account`, of whichever logon type the caller chose).
+pub fn start_stand_in_with_token(
+    shared: &Shared,
+    account: &Account,
+    label: &str,
+    scenario: &str,
+    input: &[(&str, String)],
+    token: OwnedHandle,
+) -> StandIn {
     let dir = shared.run_dir(label);
     let mut pairs: Vec<(&str, String)> = vec![
         ("user", account.name.clone()),
@@ -102,12 +130,11 @@ pub fn start_stand_in(
     let starter = Sid::current_user().unwrap().to_sddl().unwrap();
     let private = desktop::PrivateDesktop::create(&[&account.sid_text, &starter])
         .unwrap_or_else(|e| panic!("create a window station and desktop for {}: {e}", account.name));
-    let network = account.network_token();
     let mut primary = HANDLE::default();
     // SAFETY: valid in/out handles.
     unsafe {
         DuplicateTokenEx(
-            network.0,
+            token.0,
             TOKEN_ALL_ACCESS,
             None,
             SecurityImpersonation,
