@@ -14,7 +14,6 @@ postcard = { version = "1.1", features = ["use-std"] } # compact serde wire form
 socket2 = "0.6"                                         # AF_UNIX on Windows (Domain::UNIX, SockAddr::unix, shutdown) — no extra feature needed (0.6.4)
 tracing = "0.1"              # structured logging
 tracing-subscriber = "0.3"  # file/stderr log sink (Phase 6 routes off the PTY)
-toml = "1.0"                 # provision config.toml (de)serialize — pure, host-buildable (0.8.x)
 
 [dev-dependencies]
 pipe = "0.4"                 # two unidirectional pipes compose the splittable relay test transport, EOF-on-writer-drop (Phase 2; 0.4.0)
@@ -42,6 +41,11 @@ windows = { version = "0.62.2", features = [
     "Win32_System_Registry",       # DefaultShell registry pair (Reg* APIs)
     "Win32_Networking_WinSock",    # WSAPoll for the hangup watcher
     "Win32_Security_Cryptography", # DPAPI parity probe (CryptProtectData/CryptUnprotectData)
+    "Win32_UI_Shell",              # GetUserProfileDirectoryW: the profile of a token
+    "Win32_System_TaskScheduler",  # stop/start the agent task per session (COM)
+    "Win32_System_Com",            # CoInitializeEx / CoCreateInstance for the Task Scheduler
+    "Win32_System_Ole",            # ITaskService::Connect takes VARIANTs
+    "Win32_System_Variant",
     "Wdk_Foundation",
     "Wdk_Storage_FileSystem",       # NtOpenFile: open a directory for ACL inspection without SYNCHRONIZE
 ] }
@@ -53,4 +57,10 @@ tracing-appender = "0.2"
 [target.'cfg(windows)'.dev-dependencies]
 windows = { version = "0.62.2", features = [
     "Win32_UI_Shell", # CommandLineToArgvW: tests/conhost_windows.rs checks the test encoder's tokenizer against it
+    "Win32_NetworkManagement_NetManagement", # NetUserAdd/NetUserDel: tests/user_isolation_windows.rs makes throwaway accounts
+    "Wdk_System_Threading",                  # ProcessDefaultHardErrorMode: tests/common/hard_errors.rs makes a child's loader failure exit instead of raise a message box
+    "Win32_System_LibraryLoader",            # LoadLibraryW/GetProcAddress: tests/common/desktop.rs binds user32 at run time
+    "Win32_System_Kernel",                   # PROCESS_BASIC_INFORMATION: tests/common/process_list.rs reads a process's own recorded parent
+    "Win32_System_StationsAndDesktops",     # HWINSTA/HDESK: tests/common/desktop.rs gives each child its own window station and desktop
+    "Win32_System_Diagnostics_ToolHelp",     # CreateToolhelp32Snapshot: tests/common/process_list.rs finds a process's descendants
 ] }

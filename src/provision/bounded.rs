@@ -36,13 +36,10 @@ pub const DEFAULT_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 ///
 /// A present-but-unparseable value is an ERROR, never a quiet fallback to the default: someone who
 /// asked to wait indefinitely and instead got 30 seconds would be handed a failure row with the
-/// wrong diagnosis. (An earlier version of this defended guessing by citing `--user` as precedent;
-/// that was wrong in both directions — `--user` has no value to parse, and when it resolves to
-/// nothing `config::resolve_target_user` fails loudly and names the flag.)
+/// wrong diagnosis.
 ///
 /// Takes `args` as a parameter rather than reading `std::env::args()` so it is testable from any
-/// host. Its only caller is `#[cfg(windows)]` with no test module, which is precisely how this
-/// crate has previously shipped logic that nothing could reach.
+/// host. Its only caller is `#[cfg(windows)]` with no test module.
 pub fn probe_timeout_from_args(args: &[String]) -> anyhow::Result<Option<Duration>> {
     const FLAG: &str = "--probe-timeout";
     let mut raw: Option<&str> = None;

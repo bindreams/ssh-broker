@@ -6,13 +6,9 @@ use super::spawn_contained;
 /// The local passthrough must contain its child in a job object, exactly as the relayed path
 /// does, so that failing open can never become a way to outlive the session.
 ///
-/// This used to be the property that made a MISCLASSIFIED command harmless: while the shim routed
-/// suspected transfers around the relay, a string the client chose decided a security outcome, and
-/// naming any binary `scp.exe` was enough to be spawned outside the job object and survive session
-/// teardown. That classifier is gone and every command relays now, and `spawn_contained` is what
-/// BOTH fail-open arms funnel through — the EXEC passthrough, and (since the interactive arm
-/// stopped using the separate, uncontained `exec_local_shell`) the plain `pwsh` an interactive
-/// session gets too. So this containment is the sole thing between an unreachable agent and a
+/// `spawn_contained` is what BOTH fail-open arms funnel through — the EXEC passthrough, and (since
+/// the interactive arm stopped using the separate, uncontained `exec_local_shell`) the plain `pwsh`
+/// an interactive session gets too. So this containment is the sole thing between an unreachable agent and a
 /// process that outlives the session the README promises to reap.
 ///
 /// Read that as a statement about the PRODUCTION WIRING, not about this test's reach. This test
@@ -193,58 +189,6 @@ fn enter_rolls_back_only_what_it_actually_changed_on_partial_failure() {
     );
 }
 
-/// A directory that refuses new files, removed (deny ACE lifted first) when dropped.
-struct WriteDeniedDir(std::path::PathBuf);
-
-impl WriteDeniedDir {
-    fn new(tag: &str) -> Self {
-        let dir = std::env::temp_dir().join(format!("sb-logdeny-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        // DENY beats the runner's admin ALLOW, so this holds for an elevated test process too.
-        let status = std::process::Command::new("icacls")
-            .arg(&dir)
-            .args(["/deny", "*S-1-1-0:(OI)(CI)(WD)"])
-            .status()
-            .expect("run icacls");
-        assert!(status.success(), "icacls /deny should succeed");
-        Self(dir)
-    }
-}
-
-impl Drop for WriteDeniedDir {
-    fn drop(&mut self) {
-        let _ = std::process::Command::new("icacls")
-            .arg(&self.0)
-            .args(["/remove:d", "*S-1-1-0"])
-            .status();
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
-/// A log directory the user cannot write must disable logging, not abort the shim (a panic exits
-/// 101 before the fail-open path runs).
-#[test]
-fn file_logging_is_disabled_not_fatal_when_the_log_directory_is_unwritable() {
-    let dir = WriteDeniedDir::new("unwritable");
-    assert!(
-        super::init_file_logging_in(&dir.0).is_none(),
-        "an unwritable log directory must yield no logging, not a guard"
-    );
-}
-
-#[test]
-fn file_logging_is_enabled_for_a_writable_log_directory() {
-    let dir = std::env::temp_dir().join(format!("sb-logok-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-
-    let guard = super::init_file_logging_in(&dir);
-
-    assert!(guard.is_some(), "a writable log directory must yield a guard");
-    drop(guard);
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
 /// The fail-open spawn trims leading whitespace for `CreateProcessW`, which rejects it; the
 /// relay's spawn does the same (`pipes_tests`).
 #[test]
@@ -265,4 +209,221 @@ fn the_local_passthrough_spawn_accepts_whitespace_at_the_edges_of_a_command() {
         }
         assert_eq!(code, 3, "{command:?}");
     }
+}
+
+// Where the shim connects, and what it says when it cannot ------------------------------
+
+use crate::socket_loc::{SocketLocation, SocketLocationError};
+
+fn too_long() -> anyhow::Error {
+    SocketLocationError::TooLong {
+        path: std::path::PathBuf::from(r"C:\very\long\agent.sock"),
+        bytes: 120,
+        max: 107,
+    }
+    .into()
+}
+
+#[test]
+fn unresolvable_socket_location_fails_open_with_the_reason() {
+    let mut stderr = Vec::new();
+    let relayed = super::try_relay_at(
+        Err(too_long()),
+        &Some("echo hi".into()),
+        &mut stderr,
+        None,
+        std::io::empty(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        relayed, None,
+        "an unresolvable location is fail-open, like an unreachable agent"
+    );
+    let text = String::from_utf8(stderr).unwrap();
+    assert!(text.starts_with("ssh-broker: agent unavailable"), "{text}");
+    assert!(text.contains("the AF_UNIX limit is 107"), "the reason is named: {text}");
+}
+
+#[test]
+fn location_error_reaches_stderr_in_pty_mode() {
+    // No relay has started and the console has not been touched, so a line on stderr before the
+    // fallback shell corrupts nothing. The log is no substitute: for an interactive session it is
+    // the only other place the reason goes, and the user does not read it.
+    let mut stderr = Vec::new();
+    let relayed = super::try_relay_at(Err(too_long()), &None, &mut stderr, None, std::io::empty()).unwrap();
+
+    assert_eq!(relayed, None);
+    let text = String::from_utf8(stderr).unwrap();
+    assert!(text.contains("agent unavailable"), "{text}");
+    assert!(text.contains("the AF_UNIX limit is 107"), "{text}");
+}
+
+#[test]
+fn unavailable_message_always_begins_with_the_phrase_the_tests_grep_for() {
+    assert!(super::unavailable_message(None).starts_with("ssh-broker: agent unavailable"));
+    assert!(super::unavailable_message(Some(&"no profile")).starts_with("ssh-broker: agent unavailable"));
+    assert!(super::unavailable_message(Some(&"no profile")).contains("no profile"));
+}
+
+#[test]
+fn connect_failure_in_the_callers_own_dir_fails_open_without_a_reason_on_stderr() {
+    // A location that resolves but has no agent behind it: the old behaviour, message unchanged.
+    let dir = std::env::temp_dir().join(format!("sb-shim-noagent-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let location = SocketLocation {
+        path: dir.join("agent.sock"),
+        dir: dir.clone(),
+    };
+    let mut stderr = Vec::new();
+    let relayed = super::try_relay_at(
+        Ok(location),
+        &Some("echo hi".into()),
+        &mut stderr,
+        None,
+        std::io::empty(),
+    )
+    .unwrap();
+
+    assert_eq!(relayed, None);
+    assert_eq!(
+        String::from_utf8(stderr).unwrap(),
+        "ssh-broker: agent unavailable — falling back to a local shell\n"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn connect_failure_in_pty_mode_writes_nothing_to_stderr() {
+    // A connect failure keeps the old rule: stderr would corrupt an interactive stream that the
+    // relay may yet use, so the reason goes to the log only.
+    let dir = std::env::temp_dir().join(format!("sb-shim-noagent-pty-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let location = SocketLocation {
+        path: dir.join("agent.sock"),
+        dir: dir.clone(),
+    };
+    let mut stderr = Vec::new();
+    let relayed = super::try_relay_at(Ok(location), &None, &mut stderr, None, std::io::empty()).unwrap();
+
+    assert_eq!(relayed, None);
+    assert!(stderr.is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A fake agent that answers the first connection's handshake and stdin-EOF marker with `Exit(code)`
+/// and returns the handshake it was sent.
+fn fake_agent_exiting_with(
+    listener: crate::afunix::Listener,
+    code: i32,
+) -> std::thread::JoinHandle<crate::protocol::Handshake> {
+    use crate::afunix;
+    use crate::protocol::{ExitCode, FrameKind, FrameReader, Handshake, Stream, read_one_frame, write_frame};
+    std::thread::spawn(move || {
+        let (mut rx, mut tx) = afunix::split(listener.accept().unwrap()).unwrap();
+        let mut frames = FrameReader::new();
+        let frame = read_one_frame(&mut rx, &mut frames).unwrap();
+        assert_eq!(frame.kind, FrameKind::Handshake);
+        // Read the stdin-EOF marker before answering, so nothing the shim sent is unread when
+        // this side closes: an unread byte at close can make the peer lose the Exit.
+        let eof = read_one_frame(&mut rx, &mut frames).unwrap();
+        assert_eq!(
+            (eof.kind, eof.payload.as_slice()),
+            (FrameKind::Data, &[Stream::Stdin as u8][..])
+        );
+        write_frame(&mut tx, FrameKind::Exit, &ExitCode(code).encode()).unwrap();
+        Handshake::decode(&frame.payload).unwrap()
+    })
+}
+
+#[test]
+fn try_relay_connects_to_the_location_its_provider_names() {
+    use crate::afunix::Listener;
+    // `run_on` hands `try_relay` the token's profile location. What `try_relay` must do with it
+    // is use it and nothing else: a path it worked out from the environment would miss this
+    // listener, which sits in a profile no environment variable names.
+    let profile = crate::test_support::TempProfile::new("shim-wiring");
+    let location = profile.location();
+    crate::userdir::ensure_socket_dir(&location, &crate::acl::Sid::current_user().unwrap()).unwrap();
+    let listener = Listener::bind(&location.path).unwrap();
+    let agent = fake_agent_exiting_with(listener, 7);
+
+    let relayed = super::try_relay(&Some("echo hi".into()), || Ok(location), None, std::io::empty()).unwrap();
+
+    assert_eq!(
+        relayed,
+        Some(7),
+        "the shim reached the listener at the provided location"
+    );
+    assert_eq!(agent.join().unwrap().command.as_deref(), Some("echo hi"));
+}
+
+// A log that could not be set up -----
+
+#[test]
+fn a_failed_log_is_named_where_the_shim_already_explains_a_fallback_for_a_command() {
+    let dir = std::env::temp_dir().join(format!("sb-shim-nolog-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let location = SocketLocation {
+        path: dir.join("agent.sock"),
+        dir: dir.clone(),
+    };
+    let mut stderr = Vec::new();
+    let cause = "the folder belongs to someone else";
+    let relayed = super::try_relay_at(
+        Ok(location),
+        &Some("echo hi".into()),
+        &mut stderr,
+        Some(cause),
+        std::io::empty(),
+    )
+    .unwrap();
+
+    assert_eq!(relayed, None);
+    let text = String::from_utf8(stderr).unwrap();
+    assert!(text.starts_with("ssh-broker: agent unavailable"), "{text}");
+    assert!(text.contains(cause), "the cause of the missing log is named: {text}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_failed_log_adds_nothing_to_an_interactive_fallback_that_prints_nothing_today() {
+    // In PTY mode a connect failure writes nothing to stderr (it could corrupt the stream the relay
+    // may yet use); a missing log does not change that.
+    let dir = std::env::temp_dir().join(format!("sb-shim-nolog-pty-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let location = SocketLocation {
+        path: dir.join("agent.sock"),
+        dir: dir.clone(),
+    };
+    let mut stderr = Vec::new();
+    let relayed = super::try_relay_at(Ok(location), &None, &mut stderr, Some("no log"), std::io::empty()).unwrap();
+
+    assert_eq!(relayed, None);
+    assert!(stderr.is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_failed_log_does_not_touch_the_stderr_of_a_relayed_command() {
+    // The diagnostics buffer is the shim's own; a relayed command's stderr is the command's.
+    use crate::afunix::Listener;
+    let profile = crate::test_support::TempProfile::new("shim-nolog-relay");
+    let location = profile.location();
+    crate::userdir::ensure_socket_dir(&location, &crate::acl::Sid::current_user().unwrap()).unwrap();
+    let agent = fake_agent_exiting_with(Listener::bind(&location.path).unwrap(), 0);
+    let mut stderr = Vec::new();
+
+    let relayed = super::try_relay_at(
+        Ok(location),
+        &Some("echo hi".into()),
+        &mut stderr,
+        Some("no log"),
+        std::io::empty(),
+    )
+    .unwrap();
+
+    assert_eq!(relayed, Some(0));
+    assert!(stderr.is_empty(), "{}", String::from_utf8_lossy(&stderr));
+    agent.join().unwrap();
 }

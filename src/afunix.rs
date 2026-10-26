@@ -1,12 +1,12 @@
 //! afunix: AF_UNIX stream listener/connector via socket2 (Windows-supported).
 //!
-//! The socket path is kept short and is shared by both the agent (bind) and the shim
-//! (connect). The `sockaddr_un` path limit (~108 bytes) is surfaced loudly rather than
+//! The agent binds and the shim connects at a path both derive from the user's profile (see
+//! `socket_loc`). The `sockaddr_un` path limit (~108 bytes) is surfaced loudly rather than
 //! failing cryptically deep in the OS.
 
 use socket2::{Domain, SockAddr, Socket, Type};
 use std::io::{Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Build a `SockAddr` for an AF_UNIX pathname socket, surfacing an over-long path
 /// (`sockaddr_un` overflow) as a clear error instead of a cryptic OS failure.
@@ -19,36 +19,35 @@ pub fn unix_addr(path: &Path) -> anyhow::Result<SockAddr> {
     })
 }
 
-/// The fixed production socket directory — the hardened, ACL-locked dir the agent binds
-/// inside and the shim connects into. Kept deliberately short to stay within the
-/// `sockaddr_un` path limit, and under `ProgramData` (a system path, not user-specific).
-#[cfg(windows)]
-pub fn socket_dir() -> std::path::PathBuf {
-    crate::provision::layout::Layout::production().socket_dir()
-}
+/// A live agent already answers on the socket path.
+///
+/// Typed so that a caller can tell "someone else serves" from a failure to bind. The agent holds
+/// the per-user lock when it binds, so for it this is an error, not a reason to exit quietly.
+#[derive(Debug, thiserror::Error)]
+#[error("an agent is already listening on {}", .0.display())]
+pub struct AlreadyListening(pub PathBuf);
 
-/// The fixed production socket path, shared by the agent (bind) and the shim (connect)
-/// so they always agree. Lives directly under [`socket_dir`].
-#[cfg(windows)]
-pub fn socket_path() -> std::path::PathBuf {
-    socket_dir().join("a.sock")
-}
-
-/// AF_UNIX stream listener. On Windows, `bind` is **fail-closed**: it refuses unless the
-/// socket directory's DACL verifies as locked down — Windows AF_UNIX has no
-/// `SO_PEERCRED`, so that NTFS ACL is the entire access-control boundary.
+/// AF_UNIX stream listener. On Windows, `bind` is **fail-closed** twice: it refuses unless the
+/// socket directory's DACL verifies as locked down (it decides who can create or replace the
+/// socket), and it removes the socket again unless the socket **file's** own DACL verifies (it
+/// decides who can connect: Windows AF_UNIX has no `SO_PEERCRED`, and traverse checks on the
+/// folders above are bypassed by `SeChangeNotifyPrivilege`).
 pub struct Listener {
     sock: Socket,
 }
 
 impl Listener {
     pub fn bind(path: &Path) -> anyhow::Result<Self> {
+        Self::bind_with(path, &socket_file_acl_ok)
+    }
+
+    /// [`Self::bind`] with the check of the bound socket file as a parameter, so a test can make
+    /// it refuse. Production passes the real one.
+    fn bind_with(path: &Path, socket_file_ok: &dyn Fn(&Path) -> anyhow::Result<bool>) -> anyhow::Result<Self> {
         // Fail-closed: never bind in a directory that isn't locked down. The grantee is
-        // `current_user` because the AGENT (which calls bind) runs as the auto-login
-        // account the boundary protects — so current_user IS the target. (The by-name
-        // resolution the acl docstring describes is the `apply`/provisioning path, which
-        // may run as SYSTEM; that is Phase 7. If bind ever ran under a different identity,
-        // a dir hardened for the real user would simply fail this gate — fail-closed.)
+        // `current_user` because the AGENT (which calls bind) runs as the user whose profile
+        // holds the directory. If bind ever ran under a different identity, a directory
+        // hardened for the real user would simply fail this gate.
         #[cfg(windows)]
         {
             let dir = path
@@ -62,12 +61,12 @@ impl Listener {
             );
         }
         // Reclaim a leftover socket file from a PRIOR run — but never blind-unlink: a live
-        // agent might hold it. Probe-connect to classify, and refuse if live. (Concurrent
-        // double-launch is closed by the agent's single-instance mutex, acquired before
-        // bind — Phase 4; the probe only handles a stale file left by a dead predecessor.)
+        // agent might hold it. Probe-connect to classify, and refuse if live. (A concurrent
+        // double-launch is closed by the per-user lock the agent holds before it binds; the probe
+        // only handles a stale file left by a dead predecessor.)
         if path.exists() {
             if connect(path).is_ok() {
-                anyhow::bail!("an agent is already listening on {}; refusing to bind", path.display());
+                return Err(AlreadyListening(path.to_path_buf()).into());
             }
             // No listener answered. Only reclaim if the entry is actually a socket, and
             // surface a removal failure rather than letting bind fail cryptically.
@@ -88,6 +87,21 @@ impl Listener {
         }
         let sock = Socket::new(Domain::UNIX, Type::STREAM, None)?;
         sock.bind(&unix_addr(path)?)?;
+        // The file exists now but nothing listens, so nobody can queue a connection: prove who
+        // may connect before anyone can. A socket whose ACL cannot be proven is not left behind.
+        let proven = socket_file_ok(path);
+        if !matches!(proven, Ok(true)) {
+            drop(sock);
+            let _ = std::fs::remove_file(path);
+            return match proven {
+                Ok(_) => Err(anyhow::anyhow!(
+                    "the socket file {} does not grant exactly the user, SYSTEM and Administrators; \
+                     refusing to listen (fail-closed)",
+                    path.display()
+                )),
+                Err(e) => Err(e.context(format!("check the socket file {}", path.display()))),
+            };
+        }
         sock.listen(128)?;
         // Don't leak the listening socket into spawned children (would defeat the ACL).
         #[cfg(windows)]
@@ -95,12 +109,146 @@ impl Listener {
         Ok(Listener { sock })
     }
 
-    pub fn accept(&self) -> anyhow::Result<Socket> {
-        let sock = self.sock.accept()?.0;
-        #[cfg(windows)]
-        set_no_inherit(&sock)?;
-        Ok(sock)
+    /// Accept one connection. A failure says what the caller should do about it: see
+    /// [`AcceptError`].
+    ///
+    /// The connection is never inheritable, not even for an instant: the listener is made with
+    /// `WSA_FLAG_NO_HANDLE_INHERIT`, which Winsock carries to the sockets `accept` returns, and a
+    /// connection that arrives inheritable anyway is refused rather than fixed up afterwards (a
+    /// child spawned on another thread in between would inherit it).
+    pub fn accept(&self) -> Result<Socket, AcceptError> {
+        finish_accept(accept_from(&self.sock), harden_accepted)
     }
+}
+
+/// Why `accept` failed, by what the serving loop should do next.
+#[derive(Debug)]
+pub enum AcceptError {
+    /// This one connection is lost (the peer dropped it while it queued, or it could not be set
+    /// up). The listener is fine, and each such failure consumed a connection, so a run of them is
+    /// bounded by the peers' own behaviour.
+    Connection(anyhow::Error),
+    /// `WSAEINTR`: the call was interrupted. Nothing was consumed; call `accept` again.
+    Interrupted(std::io::Error),
+    /// `WSAEMFILE` or `WSAENOBUFS`: no descriptor or buffer is left. It clears only when something
+    /// lets go of one, so the caller waits for one of its own connections to end and then tries
+    /// again; with none, nothing can free a resource and the listener is as good as broken.
+    Exhausted { code: i32, source: std::io::Error },
+    /// The listener is broken, or the failure is one a blocking listener is not documented to have.
+    Fatal(anyhow::Error),
+}
+
+impl std::fmt::Display for AcceptError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AcceptError::Connection(e) | AcceptError::Fatal(e) => write!(f, "{e:#}"),
+            AcceptError::Interrupted(source) | AcceptError::Exhausted { source, .. } => write!(f, "{source}"),
+        }
+    }
+}
+
+impl std::error::Error for AcceptError {}
+
+/// The OS `accept`, with nothing done to the socket afterwards on Windows (see [`Listener::accept`]).
+#[cfg(windows)]
+fn accept_from(listener: &Socket) -> std::io::Result<Socket> {
+    listener.accept_raw().map(|(sock, _)| sock)
+}
+
+/// Off Windows `accept` also sets close-on-exec, which is the platform's way of the same thing.
+#[cfg(not(windows))]
+fn accept_from(listener: &Socket) -> std::io::Result<Socket> {
+    listener.accept().map(|(sock, _)| sock)
+}
+
+/// Turn the outcome of the OS `accept` into a connection ready to hand out. A connection that
+/// fails `harden` is never handed out: it would reach children of the brokered shell.
+fn finish_accept(
+    raw: std::io::Result<Socket>,
+    harden: impl FnOnce(&Socket) -> anyhow::Result<()>,
+) -> Result<Socket, AcceptError> {
+    match raw {
+        Ok(sock) => match harden(&sock) {
+            Ok(()) => Ok(sock),
+            Err(e) => Err(AcceptError::Connection(
+                e.context("an accepted connection is not safe to hand out; dropping it"),
+            )),
+        },
+        Err(e) => Err(classify_accept_error(e)),
+    }
+}
+
+/// Sort an `accept` failure by Winsock's documented causes. A peer that reset or aborted a queued
+/// connection is that connection's loss; `WSAEINTR` is an interruption; `WSAEMFILE` and
+/// `WSAENOBUFS` are exhaustion; everything else (not listening, not a socket, the network down) is
+/// a broken listener. That includes `WSAEWOULDBLOCK` and `WSAEINPROGRESS`: the first needs a
+/// non-blocking socket and the second a Winsock 1.1 blocking call in progress, and this listener
+/// is blocking and installs no blocking hook, so they cannot occur.
+fn classify_accept_error(e: std::io::Error) -> AcceptError {
+    use std::io::ErrorKind;
+    match e.kind() {
+        ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted => return AcceptError::Connection(e.into()),
+        ErrorKind::Interrupted => return AcceptError::Interrupted(e),
+        _ => {}
+    }
+    by_winsock_code(e)
+}
+
+/// The Winsock codes `std` has no `ErrorKind` for, by what they mean for `accept`.
+#[cfg(windows)]
+fn by_winsock_code(e: std::io::Error) -> AcceptError {
+    use windows::Win32::Networking::WinSock::{WSAEINPROGRESS, WSAEINTR, WSAEMFILE, WSAENOBUFS, WSAEWOULDBLOCK};
+    match e.raw_os_error() {
+        Some(code) if code == WSAEINTR.0 => AcceptError::Interrupted(e),
+        Some(code) if code == WSAEMFILE.0 || code == WSAENOBUFS.0 => AcceptError::Exhausted { code, source: e },
+        Some(code) if code == WSAEWOULDBLOCK.0 || code == WSAEINPROGRESS.0 => {
+            AcceptError::Fatal(anyhow::Error::new(e).context(format!(
+                "accept returned code {code}, which a blocking listener with no Winsock 1.1 blocking hook cannot return"
+            )))
+        }
+        _ => AcceptError::Fatal(e.into()),
+    }
+}
+
+#[cfg(not(windows))]
+fn by_winsock_code(e: std::io::Error) -> AcceptError {
+    AcceptError::Fatal(e.into())
+}
+
+/// Refuse a freshly accepted connection that a child could inherit.
+fn harden_accepted(sock: &Socket) -> anyhow::Result<()> {
+    #[cfg(windows)]
+    anyhow::ensure!(
+        !is_inheritable(sock)?,
+        "the connection is inheritable by child processes"
+    );
+    #[cfg(not(windows))]
+    let _ = sock;
+    Ok(())
+}
+
+/// Whether a child process could inherit `sock`.
+#[cfg(windows)]
+fn is_inheritable(sock: &Socket) -> anyhow::Result<bool> {
+    use std::os::windows::io::AsRawSocket;
+    use windows::Win32::Foundation::{GetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT};
+    let handle = HANDLE(sock.as_raw_socket() as usize as *mut core::ffi::c_void);
+    let mut flags = 0u32;
+    // SAFETY: `handle` is the open socket of `sock`; `flags` is a valid out pointer.
+    unsafe { GetHandleInformation(handle, &mut flags) }?;
+    Ok(flags & HANDLE_FLAG_INHERIT.0 != 0)
+}
+
+/// Does the socket file at `path` grant exactly the current user, SYSTEM and Administrators?
+#[cfg(windows)]
+fn socket_file_acl_ok(path: &Path) -> anyhow::Result<bool> {
+    crate::acl::verify_file_acl(path, &crate::acl::Sid::current_user()?)
+}
+
+/// Off Windows there is no ACL to check; the directory's mode is the platform's concern.
+#[cfg(not(windows))]
+fn socket_file_acl_ok(_path: &Path) -> anyhow::Result<bool> {
+    Ok(true)
 }
 
 /// Connect to an AF_UNIX stream socket at `path`.
@@ -194,16 +342,7 @@ impl Write for ConnTx {
 #[cfg(all(windows, test))]
 impl Listener {
     pub(crate) fn inherit_flag_is_clear(&self) -> bool {
-        use std::os::windows::io::AsRawSocket;
-        use windows::Win32::Foundation::{GetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT};
-        let handle = HANDLE(self.sock.as_raw_socket() as usize as *mut core::ffi::c_void);
-        let mut flags = 0u32;
-        unsafe {
-            if GetHandleInformation(handle, &mut flags).is_err() {
-                return false;
-            }
-        }
-        flags & HANDLE_FLAG_INHERIT.0 == 0
+        matches!(is_inheritable(&self.sock), Ok(false))
     }
 }
 

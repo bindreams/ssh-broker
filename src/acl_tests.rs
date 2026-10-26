@@ -4,14 +4,37 @@
 use super::*;
 
 #[test]
-fn current_user_sid_resolves() {
-    assert!(Sid::current_user().is_ok());
+fn current_user_sid_is_the_one_whoami_reports() {
+    // `whoami` reads the same token through another path, so it is the independent source.
+    use std::os::windows::process::CommandExt;
+    let out = std::process::Command::new("whoami")
+        .args(["/user", "/fo", "csv", "/nh"])
+        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "whoami failed: {out:?}");
+    let text = String::from_utf8_lossy(&out.stdout);
+    let reported = text
+        .trim()
+        .rsplit(',')
+        .next()
+        .map(|field| field.trim_matches('"'))
+        .unwrap_or_default();
+
+    assert!(reported.starts_with("S-1-"), "whoami printed no SID: {text}");
+    assert_eq!(Sid::current_user().unwrap().to_sddl().unwrap(), reported);
 }
 
 #[test]
-fn well_known_sids_resolve() {
-    assert!(Sid::well_known(WellKnown::System).is_ok());
-    assert!(Sid::well_known(WellKnown::Administrators).is_ok());
+fn well_known_sids_are_the_documented_ones() {
+    assert_eq!(
+        Sid::well_known(WellKnown::System).unwrap().to_sddl().unwrap(),
+        "S-1-5-18"
+    );
+    assert_eq!(
+        Sid::well_known(WellKnown::Administrators).unwrap().to_sddl().unwrap(),
+        "S-1-5-32-544"
+    );
 }
 
 #[test]
@@ -727,4 +750,202 @@ fn nt_path_prefixes_each_win32_path_form() {
     assert_eq!(nt(r"\\.\C:\a\b"), r"\??\C:\a\b");
     assert_eq!(nt(r"\\server\share\a"), r"\??\UNC\server\share\a");
     assert_eq!(nt(r"\\?\UNC\server\share\a"), r"\??\UNC\server\share\a");
+}
+
+// per-user socket directory and socket file ------------------------------------------------
+
+/// A directory made by this module's `harden_dir` for the current user.
+fn hardened_user_dir(tag: &str) -> TempPath {
+    let dir = TempPath::new(tag);
+    std::fs::create_dir(&dir.0).unwrap();
+    harden_dir(&dir.0, &Sid::current_user().unwrap()).unwrap();
+    dir
+}
+
+#[test]
+fn hardened_dir_aces_are_inheritable() {
+    let dir = hardened_user_dir("inheritable");
+    let listing = icacls_str(&dir.0, &[]);
+    // Three ACEs, each applying to this folder, subfolders and files.
+    assert_eq!(listing.matches("(OI)(CI)(F)").count(), 3, "{listing}");
+}
+
+#[test]
+fn a_file_created_in_a_hardened_dir_is_born_with_exactly_the_three_aces() {
+    let dir = hardened_user_dir("born");
+    let file = dir.0.join("agent.lock");
+    std::fs::write(&file, "").unwrap();
+    let me = Sid::current_user().unwrap();
+    assert!(verify_file_acl(&file, &me).unwrap());
+}
+
+#[test]
+fn a_subdirectory_created_in_a_hardened_dir_inherits_the_three_aces() {
+    let dir = hardened_user_dir("subdir");
+    let sub = dir.0.join("logs");
+    std::fs::create_dir(&sub).unwrap();
+    let me = Sid::current_user().unwrap();
+    // Inherited ACEs are not a protected, uninherited set, so the dir verifier is the wrong test:
+    // the file verifier accepts inherited ACEs, and a directory carries the same three.
+    assert!(verify_file_acl(&sub, &me).unwrap());
+}
+
+#[test]
+fn dir_with_non_inheritable_aces_does_not_verify() {
+    // An exact, protected DACL whose ACEs do not inherit: the socket file would be born with the
+    // creator's default DACL, so the dir is not trusted.
+    let dir = TempPath::new("non-inheritable");
+    std::fs::create_dir(&dir.0).unwrap();
+    let me = Sid::current_user().unwrap();
+    let sid = me.to_sddl().unwrap();
+    set_security(&dir.0, &format!("O:{sid}D:P(A;;FA;;;{sid})(A;;FA;;;SY)(A;;FA;;;BA)"));
+    assert!(!verify_dir_acl(&dir.0, &me).unwrap());
+}
+
+#[test]
+fn dir_hardened_for_one_user_does_not_verify_for_another() {
+    let dir = hardened_user_dir("other-user");
+    let me = Sid::current_user().unwrap();
+    assert!(verify_dir_acl(&dir.0, &me).unwrap(), "control");
+    assert!(!verify_dir_acl(&dir.0, &Sid::well_known(WellKnown::Users).unwrap()).unwrap());
+}
+
+#[test]
+fn describe_names_the_account() {
+    let text = Sid::well_known(WellKnown::System).unwrap().describe();
+    assert!(text.contains("S-1-5-18"), "{text}");
+}
+
+#[test]
+fn verify_file_acl_rejects_a_file_widened_after_the_fact() {
+    let dir = hardened_user_dir("widened-file");
+    let file = dir.0.join("agent.sock");
+    std::fs::write(&file, "").unwrap();
+    let me = Sid::current_user().unwrap();
+    assert!(verify_file_acl(&file, &me).unwrap(), "control");
+    icacls_str(&file, &["/grant", "*S-1-1-0:(R)"]);
+    assert!(!verify_file_acl(&file, &me).unwrap());
+}
+
+/// `sddl` for a file that inherited its three ACEs, owned by `owner`.
+fn inherited_file_sddl(owner: &str, user: &str) -> String {
+    format!("O:{owner}D:AI(A;ID;FA;;;{user})(A;ID;FA;;;SY)(A;ID;FA;;;BA)")
+}
+
+#[test]
+fn the_file_policy_accepts_the_inherited_set_and_rejects_every_deviation() {
+    let me = Sid::current_user().unwrap();
+    let user = me.to_sddl().unwrap();
+    let holds = |sddl: &str| file_policy_holds(&in_memory(sddl), &me).unwrap();
+
+    assert!(
+        holds(&inherited_file_sddl(&user, &user)),
+        "control: the exact inherited set"
+    );
+    assert!(
+        holds(&inherited_file_sddl("BA", &user)),
+        "an Administrators-owned file is in the set"
+    );
+    assert!(
+        holds(&format!("O:{user}D:(A;;FA;;;{user})(A;;FA;;;SY)(A;;FA;;;BA)")),
+        "explicit ACEs are as good as inherited ones"
+    );
+
+    assert!(
+        !holds(&format!("{}(A;ID;FA;;;WD)", inherited_file_sddl(&user, &user))),
+        "an extra Everyone ACE"
+    );
+    assert!(
+        !holds(&format!("O:{user}D:AI(A;ID;FA;;;{user})(A;ID;FA;;;SY)")),
+        "a missing Administrators ACE"
+    );
+    assert!(
+        !holds(&format!(
+            "O:{user}D:AI(D;ID;FA;;;WD)(A;ID;FA;;;{user})(A;ID;FA;;;SY)(A;ID;FA;;;BA)"
+        )),
+        "a DENY ACE"
+    );
+    assert!(
+        !holds(&format!("O:{user}D:AI(A;ID;FR;;;{user})(A;ID;FA;;;SY)(A;ID;FA;;;BA)")),
+        "a reduced mask"
+    );
+    assert!(
+        !holds(&format!(
+            "O:{user}D:AI(A;ID;FA;;;{user})(A;ID;FA;;;{user})(A;ID;FA;;;SY)(A;ID;FA;;;BA)"
+        )),
+        "the user twice"
+    );
+    assert!(!holds(&inherited_file_sddl("WD", &user)), "an owner outside the set");
+    assert!(
+        !file_policy_holds(
+            &in_memory(&inherited_file_sddl(&user, &user)),
+            &Sid::well_known(WellKnown::Users).unwrap()
+        )
+        .unwrap(),
+        "the set is for one user only"
+    );
+}
+
+// The leaf of a per-user directory is inspected without being followed ---------------------
+
+#[test]
+fn private_dir_problem_is_none_for_a_real_directory_this_user_owns() {
+    let dir = TempPath::new("problem-none");
+    std::fs::create_dir(&dir.0).unwrap();
+    let me = Sid::current_user().unwrap();
+    assert_eq!(private_dir_problem(&dir.0, &me).unwrap(), None);
+}
+
+#[test]
+fn private_dir_problem_refuses_a_junction_and_names_it() {
+    let target = TempPath::new("problem-junction-target");
+    std::fs::create_dir(&target.0).unwrap();
+    let link = TempPath::new("problem-junction");
+    let out = Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(&link.0)
+        .arg(&target.0)
+        .output()
+        .expect("run mklink");
+    assert!(
+        out.status.success(),
+        "mklink /J failed: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    let me = Sid::current_user().unwrap();
+    let problem = private_dir_problem(&link.0, &me)
+        .unwrap()
+        .expect("a junction is refused");
+    assert!(problem.contains("reparse point"), "{problem}");
+
+    std::fs::remove_dir(&link.0).unwrap();
+}
+
+#[test]
+fn private_dir_problem_refuses_a_regular_file() {
+    let path = TempPath::new("problem-file");
+    std::fs::write(&path.0, "x").unwrap();
+    let me = Sid::current_user().unwrap();
+    let problem = private_dir_problem(&path.0, &me).unwrap().expect("a file is refused");
+    assert!(problem.contains("not a directory"), "{problem}");
+    std::fs::remove_file(&path.0).unwrap();
+}
+
+/// Elevated (CI only): setting an owner other than the caller's needs SeRestorePrivilege.
+#[test]
+fn private_dir_problem_refuses_an_owner_outside_user_system_administrators() {
+    let dir = TempPath::new("problem-owner");
+    std::fs::create_dir(&dir.0).unwrap();
+    enable_restore_privilege();
+    let me = Sid::current_user().unwrap();
+
+    set_install_policy(&dir.0, &Sid::well_known(WellKnown::Users).unwrap());
+    let problem = private_dir_problem(&dir.0, &me)
+        .unwrap()
+        .expect("a Users owner is refused");
+    assert!(problem.contains("owner"), "{problem}");
+
+    set_install_policy(&dir.0, &Sid::well_known(WellKnown::Administrators).unwrap());
+    assert_eq!(private_dir_problem(&dir.0, &me).unwrap(), None, "control");
 }

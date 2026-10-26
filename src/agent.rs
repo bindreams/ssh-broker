@@ -1,22 +1,27 @@
-//! agent: resident in session 1 (started by the auto-login logon task). Per AF_UNIX
-//! connection it hosts the shell — in a ConPTY for interactive (PTY) sessions, or with
-//! redirected pipes for EXEC (`ssh host "cmd"`) — inheriting the session-1 token (working
-//! DPAPI/profile + no RedirectionGuard) and relays it to the SSH-side shim.
+//! agent: resident in a user's interactive session (started by the logon task, once per
+//! logon). Per AF_UNIX connection it hosts the shell — in a ConPTY for interactive (PTY)
+//! sessions, or with redirected pipes for EXEC (`ssh host "cmd"`) — inheriting the session's
+//! token (working DPAPI/profile + no RedirectionGuard) and relays it to the SSH-side shim.
+//!
+//! The socket is inside the user's own profile (see `socket_loc`), so an agent serves exactly
+//! one account: the one whose token it runs under.
 
-/// `agent` subcommand entrypoint. Windows-only: the agent must run in the interactive
-/// session-1 console to confer RDP parity.
+/// `agent` subcommand entrypoint. Windows-only: the agent must run in the user's interactive
+/// session to confer RDP parity.
 pub fn run() -> anyhow::Result<()> {
     #[cfg(windows)]
-    return run_on(&crate::afunix::socket_path());
+    return start();
 
     #[cfg(not(windows))]
     return Err(anyhow::anyhow!(
-        "the agent runs only on Windows (it hosts the shell in the session-1 console)"
+        "the agent runs only on Windows (it hosts the shell in an interactive session)"
     ));
 }
 
 #[cfg(windows)]
-use crate::afunix::{self, ConnRx, ConnTx, Listener};
+use crate::afunix::{self, AcceptError, ConnRx, ConnTx, Listener};
+#[cfg(windows)]
+use crate::agent_lock::{SessionSlot, UserLock, session_allows_agent};
 #[cfg(windows)]
 use crate::conpty::{self, PtySession};
 #[cfg(windows)]
@@ -28,6 +33,8 @@ use crate::protocol::{ExitCode, FrameKind, FrameReader, Handshake, Mode, Resize,
 #[cfg(windows)]
 use crate::relay::{FrameSink, pump_until_peer_gone, write_data};
 #[cfg(windows)]
+use crate::socket_loc::SocketLocation;
+#[cfg(windows)]
 use crate::winutil::OwnedHandle;
 #[cfg(windows)]
 use std::path::{Path, PathBuf};
@@ -36,19 +43,297 @@ use std::sync::mpsc::TrySendError;
 #[cfg(windows)]
 use std::sync::{Arc, Condvar, Mutex};
 
-/// Bind the hardened socket and serve connections, one handler thread each. Single-instance
-/// is enforced by a named mutex acquired before binding.
+/// Everything between "the task started us" and "serve": check where we are, make the user's
+/// private folder, and become the one agent that serves this user.
 #[cfg(windows)]
-fn run_on(path: &Path) -> anyhow::Result<()> {
-    let _instance = SingleInstance::acquire()?;
-    let listener = Listener::bind(path)?;
-    loop {
-        let conn = listener.accept()?;
-        std::thread::spawn(move || {
-            if let Err(e) = handle_connection(conn) {
-                tracing::warn!("connection handler error: {e:?}");
+fn start() -> anyhow::Result<()> {
+    start_with(
+        crate::provision::probe::current_session_id(),
+        crate::userdir::current_socket_location,
+        |logs| crate::filelog::init_in(logs, "agent.log"),
+        serve,
+    )
+}
+
+/// [`start`] with its inputs as parameters, so a test can pick the session and see what runs.
+#[cfg(windows)]
+fn start_with(
+    session: u32,
+    locate: impl FnOnce() -> anyhow::Result<SocketLocation>,
+    init_log: impl FnOnce(&Path) -> anyhow::Result<tracing_appender::non_blocking::WorkerGuard>,
+    serve: impl FnOnce(&SocketLocation, u32) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        session_allows_agent(session),
+        "the agent will not run in session 0: a shell hosted there has the limited environment this tool \
+         exists to avoid. It belongs in the user's interactive session; the logon task starts it there"
+    );
+    let location = locate()?;
+    let user = crate::acl::Sid::current_user()?;
+    crate::userdir::ensure_socket_dir(&location, &user)?;
+    // Held to the end: dropping the guard stops the writer and later lines are lost. Until the
+    // log opens an error goes to stderr, which a logon task discards; a hand-run agent shows it.
+    let _log = keep_log_or_report(init_log(&location.logs_dir()), &mut std::io::stderr());
+    let result = serve(&location, session);
+    if let Err(e) = &result {
+        tracing::error!("the agent stopped: {e:#}");
+    }
+    result
+}
+
+/// Keep the log if it opened. If not, say why on `stderr` and go on: serving does not need a log.
+#[cfg(windows)]
+fn keep_log_or_report(
+    log: anyhow::Result<tracing_appender::non_blocking::WorkerGuard>,
+    stderr: &mut dyn std::io::Write,
+) -> Option<tracing_appender::non_blocking::WorkerGuard> {
+    match log {
+        Ok(guard) => Some(guard),
+        Err(e) => {
+            let _ = writeln!(stderr, "ssh-broker agent: serving without a log: {e:#}");
+            None
+        }
+    }
+}
+
+/// Become the one agent that serves this user, then serve.
+#[cfg(windows)]
+fn serve(location: &SocketLocation, session: u32) -> anyhow::Result<()> {
+    serve_with(
+        location,
+        session,
+        |path| {
+            // One serving agent per user. A second session of the same user waits instead of
+            // leaving: the serving agent dies with its session, and this user may still be logged
+            // on here.
+            UserLock::acquire(path, || {
+                tracing::info!("waiting for the agent of another session of this user to end");
+            })
+        },
+        run_on,
+    )
+}
+
+/// [`serve`] with the user lock and the serving as parameters, so a test can see the order.
+#[cfg(windows)]
+fn serve_with(
+    location: &SocketLocation,
+    session: u32,
+    user_lock: impl FnOnce(&Path) -> anyhow::Result<UserLock>,
+    run: impl FnOnce(&SocketLocation) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    // One agent per session: `apply` and the boot self-heal start one per logged-on session
+    // every time they run, and the logon task starts one per logon. This comes first, because the
+    // user lock may be held for as long as another session lives.
+    let Some(_slot) = SessionSlot::try_acquire(&location.sessions_lock_path(), session)? else {
+        tracing::info!("another agent already runs in this session; exiting");
+        return Ok(());
+    };
+    let _lock = user_lock(&location.lock_path())?;
+    run(location)
+}
+
+/// Bind the hardened socket and serve connections, one handler thread each. The caller holds
+/// the user's lock, so no other agent of this user binds meanwhile.
+#[cfg(windows)]
+fn run_on(location: &SocketLocation) -> anyhow::Result<()> {
+    let listener = Listener::bind(&location.path)?;
+    Err(serve_connections(
+        || listener.accept(),
+        |conn, live| {
+            hand_to_thread(
+                conn,
+                live,
+                |work| std::thread::Builder::new().spawn(work).map(drop),
+                |conn| {
+                    if let Err(e) = handle_connection(conn) {
+                        tracing::warn!("connection handler error: {e:?}");
+                    }
+                },
+            )
+        },
+    ))
+}
+
+/// Run `handle` on a thread started by `spawn`, which owns `conn` and `live`. The connection ends
+/// after `handle` returns and `conn` is closed: that is when its descriptors are free again.
+///
+/// If the thread cannot be started, `conn` is dropped and `live` is given up without counting an
+/// end: the connection never ran, so it frees nothing for [`serve_connections`] to wait for.
+#[cfg(windows)]
+fn hand_to_thread<C: Send + 'static>(
+    conn: C,
+    live: Live,
+    spawn: impl FnOnce(Box<dyn FnOnce() + Send>) -> std::io::Result<()>,
+    handle: impl FnOnce(C) + Send + 'static,
+) -> std::io::Result<()> {
+    // The thread takes the connection from here, so a failed start leaves it with the caller.
+    let (give, take) = std::sync::mpsc::channel::<(C, Live)>();
+    let work = Box::new(move || {
+        if let Ok((conn, live)) = take.recv() {
+            let _live = live;
+            handle(conn);
+        }
+    });
+    match spawn(work) {
+        Ok(()) => {
+            // A send fails only if the thread has gone without running, which drops the pair.
+            let _ = give.send((conn, live));
+            Ok(())
+        }
+        Err(e) => {
+            live.abandon();
+            Err(e)
+        }
+    }
+}
+
+/// The connections this agent is serving, so that a shortage of descriptors can wait for one to end.
+#[cfg(windows)]
+struct Connections {
+    tally: Mutex<Tally>,
+    ended: Condvar,
+}
+
+#[cfg(windows)]
+struct Tally {
+    live: usize,
+    /// How many connections have ever ended: a counter, so "one ended since I looked" is a
+    /// comparison and not a guess at what changed.
+    ended: u64,
+}
+
+/// A live connection. Dropping it, on any exit from the handler including a panic, ends it.
+#[cfg(windows)]
+struct Live(Option<Arc<Connections>>);
+
+#[cfg(windows)]
+impl Connections {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            tally: Mutex::new(Tally { live: 0, ended: 0 }),
+            ended: Condvar::new(),
+        })
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Tally> {
+        self.tally.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn begin(self: &Arc<Self>) -> Live {
+        self.lock().live += 1;
+        Live(Some(Arc::clone(self)))
+    }
+
+    /// How many connections have ended so far.
+    fn ended(&self) -> u64 {
+        self.lock().ended
+    }
+
+    /// Return once more than `since` connections have ended (`true`), or at once with `false` if
+    /// none is live and none has ended since: then nothing is left that could end.
+    ///
+    /// `blocking` is called once, only if this has to block, and before it does. The lock is held
+    /// then and released by the wait itself, so a connection that `blocking` causes to end does so
+    /// after this is waiting. It must not take the lock (any `Live` dropped in it would).
+    fn wait_for_an_end(&self, since: u64, blocking: impl FnOnce()) -> bool {
+        let mut blocking = Some(blocking);
+        let mut tally = self.lock();
+        loop {
+            if tally.ended > since {
+                return true;
             }
-        });
+            if tally.live == 0 {
+                return false;
+            }
+            if let Some(blocking) = blocking.take() {
+                blocking();
+            }
+            tally = self
+                .ended
+                .wait(tally)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Live {
+    /// Give this connection up as if it had never begun: it is not live any more, and has not
+    /// ended, so nothing that waits for an end is woken by it.
+    fn abandon(mut self) {
+        if let Some(connections) = self.0.take() {
+            connections.lock().live -= 1;
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for Live {
+    fn drop(&mut self) {
+        if let Some(connections) = self.0.take() {
+            let mut tally = connections.lock();
+            tally.live -= 1;
+            tally.ended += 1;
+            connections.ended.notify_all();
+        }
+    }
+}
+
+/// Accept connections and hand each to `serve`, with the guard that says when it ends, until the
+/// listener breaks; returns that error.
+///
+/// A connection that is lost (reset while queued, or one that cannot be set up) is logged and
+/// dropped: it must not end service for every session of the user. An interrupted `accept` is
+/// called again. A shortage of descriptors or buffers, and a `serve` that could not start a thread
+/// for its connection (it returns the error, having given up its `Live`), is waited out: the loop
+/// blocks until one of this agent's own connections ends, which is the only thing that can free
+/// any of those, and then accepts again. With no live connection nothing can, and the shortage is
+/// fatal.
+#[cfg(windows)]
+fn serve_connections<C>(
+    accept: impl FnMut() -> Result<C, AcceptError>,
+    serve: impl FnMut(C, Live) -> std::io::Result<()>,
+) -> anyhow::Error {
+    serve_connections_observed(accept, serve, || {})
+}
+
+/// [`serve_connections`], calling `blocking` each time the loop is about to block waiting for a
+/// connection to end (see [`Connections::wait_for_an_end`] for what that guarantees).
+#[cfg(windows)]
+fn serve_connections_observed<C>(
+    mut accept: impl FnMut() -> Result<C, AcceptError>,
+    mut serve: impl FnMut(C, Live) -> std::io::Result<()>,
+    mut blocking: impl FnMut(),
+) -> anyhow::Error {
+    let connections = Connections::new();
+    loop {
+        // Read before the attempt: a connection that ends while it fails is then not missed.
+        let ended_before = connections.ended();
+        let shortage = match accept() {
+            Ok(conn) => match serve(conn, connections.begin()) {
+                Ok(()) => continue,
+                Err(e) => {
+                    tracing::warn!("dropped a connection: no thread for it ({e}); waiting for a connection to end");
+                    anyhow::Error::new(e).context("could not start a thread for a connection")
+                }
+            },
+            Err(AcceptError::Connection(e)) => {
+                tracing::warn!("dropped a connection: {e:#}");
+                continue;
+            }
+            Err(AcceptError::Interrupted(_)) => continue,
+            Err(AcceptError::Exhausted { code, source }) => {
+                tracing::warn!(
+                    "accept failed for lack of resources (code {code}); waiting for a connection to end: {source}"
+                );
+                anyhow::Error::new(source).context(format!("accept failed with code {code}"))
+            }
+            Err(AcceptError::Fatal(e)) => return e.context("the listener failed"),
+        };
+        if !connections.wait_for_an_end(ended_before, &mut blocking) {
+            return shortage.context("no connection of this agent is live to free a resource");
+        }
     }
 }
 
@@ -58,12 +343,32 @@ fn default_shell() -> String {
     "pwsh.exe -NoLogo".to_string()
 }
 
-/// The session-1 user's home directory (`%USERPROFILE%`), if it exists. The agent runs AS that
-/// user, so its own environment carries the correct profile path.
+/// The home directory of the account the agent runs as: its token's profile. The environment is
+/// not consulted, because it belongs to whoever started the process. `None` (logged) if there is
+/// no such directory.
 #[cfg(windows)]
 fn home_dir() -> Option<PathBuf> {
-    let p = PathBuf::from(std::env::var_os("USERPROFILE")?);
-    p.is_dir().then_some(p)
+    match find_home(crate::userdir::current_profile_dir()) {
+        Ok(home) => Some(home),
+        Err(why) => {
+            tracing::warn!("no home directory to start the child in: {why}");
+            None
+        }
+    }
+}
+
+/// `profile` as a home directory, or why it is not one.
+#[cfg(windows)]
+fn find_home(profile: anyhow::Result<PathBuf>) -> Result<PathBuf, String> {
+    let profile = profile.map_err(|e| format!("{e:#}"))?;
+    if profile.is_dir() {
+        Ok(profile)
+    } else {
+        Err(format!(
+            "the profile directory {} is not a directory",
+            profile.display()
+        ))
+    }
 }
 
 /// The working directory to start the child in: the handshake's explicit `cwd` if any, else the
@@ -124,6 +429,10 @@ fn handle_connection_with(conn: socket2::Socket, hooks: Hooks) -> anyhow::Result
 #[cfg(test)]
 #[path = "agent_cwd_tests.rs"]
 mod agent_cwd_tests;
+
+#[cfg(all(windows, test))]
+#[path = "agent_start_tests.rs"]
+mod agent_start_tests;
 
 #[cfg(all(windows, test))]
 #[path = "agent_program_path_tests.rs"]
@@ -601,48 +910,6 @@ fn reap_tree(job: &cosca::Job) -> bool {
         Err(e) => {
             tracing::warn!("tearing down the process tree failed: {e}");
             false
-        }
-    }
-}
-
-// ── single-instance ────────────────────────────────────────────────────────────────
-
-/// Single-instance guard: a named mutex so only one agent binds the socket (the real fix
-/// for a concurrent double-launch, which the bind probe-connect alone can't close).
-#[cfg(windows)]
-struct SingleInstance {
-    handle: windows::Win32::Foundation::HANDLE,
-}
-
-#[cfg(windows)]
-impl SingleInstance {
-    fn acquire() -> anyhow::Result<SingleInstance> {
-        use windows::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastError};
-        use windows::Win32::System::Threading::CreateMutexW;
-        use windows::core::PCWSTR;
-        let name: Vec<u16> = "Global\\ssh-broker-agent"
-            .encode_utf16()
-            .chain(std::iter::once(0))
-            .collect();
-        unsafe {
-            let handle = CreateMutexW(None, true, PCWSTR(name.as_ptr()))?;
-            if GetLastError() == ERROR_ALREADY_EXISTS {
-                let _ = CloseHandle(handle);
-                anyhow::bail!("another ssh-broker agent is already running");
-            }
-            Ok(SingleInstance { handle })
-        }
-    }
-}
-
-#[cfg(windows)]
-impl Drop for SingleInstance {
-    fn drop(&mut self) {
-        use windows::Win32::Foundation::CloseHandle;
-        use windows::Win32::System::Threading::ReleaseMutex;
-        unsafe {
-            let _ = ReleaseMutex(self.handle);
-            let _ = CloseHandle(self.handle);
         }
     }
 }

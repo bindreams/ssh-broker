@@ -12,7 +12,7 @@
 //! EXIT, MAIN sets a `stopping` flag, wakes the parked read by injecting a benign console
 //! record (`WriteConsoleInputW` — reliable for console reads where `CancelSynchronousIo` is
 //! not), JOINS the worker, then the guard restores modes AFTER the join — so the worker can
-//! never read with a half-restored mode (the use-after-close hazard the agent review found).
+//! never read with a half-restored mode (the use-after-close hazard).
 
 use crate::cmdline::{Encoding, RawExec, resolve_exec};
 use crate::protocol::{FrameKind, FrameReader, Handshake, Stream, write_frame};
@@ -21,6 +21,7 @@ use crate::shim::{
     FailOpen, Fallback, MouseModeSniffer, XtwinopsFilter, decide_fail_open, decide_fallback, is_blank_command,
     make_handshake, map_outcome, run_exec_on, size_to_resize,
 };
+use crate::socket_loc::SocketLocation;
 use crate::{afunix, conpty, vtinput};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -60,7 +61,12 @@ const VT_OUT: CONSOLE_MODE =
 /// A `-c` session resolves its command first, once the log is open: `detect` says how sshd
 /// encoded it (see [`resolve_exec`]), and a blank command ends the run there, exit 0.
 pub fn run_on(exec: Option<RawExec>, detect: impl FnOnce() -> Encoding) -> anyhow::Result<()> {
-    let log = init_file_logging();
+    // A log that cannot be set up never stops the shim. The cause is kept, to be said where the
+    // shim already explains a fallback to the user.
+    let (log, log_failure) = match crate::filelog::init_for_current_user("shim.log") {
+        Ok(guard) => (Some(guard), None),
+        Err(e) => (None, Some(format!("{e:#}"))),
+    };
     let exec = exec.map(|exec| resolve_exec(exec, detect));
     if exec.as_deref().is_some_and(is_blank_command) {
         drop(log); // flush: `process::exit` runs no destructors
@@ -76,7 +82,12 @@ pub fn run_on(exec: Option<RawExec>, detect: impl FnOnce() -> Encoding) -> anyho
     // out to be untrue — `exec_relay_is_byte_clean_*` covers the framing in both directions, and
     // `verify`'s probe covers a real child, real pipes and a real socket in both directions too.
     // What remains is a throughput difference, which does not earn a classifier.
-    match try_relay(&exec) {
+    match try_relay(
+        &exec,
+        crate::userdir::current_socket_location,
+        log_failure.as_deref(),
+        std::io::stdin(),
+    ) {
         Ok(Some(code)) => {
             drop(log); // flush the appender before process::exit
             // Bypass main()'s Result→0/1 collapse; the i32→u32 cast is bit-preserving.
@@ -143,16 +154,73 @@ fn fail_open_command(decision: &FailOpen) -> &str {
 /// shim should fail open (agent unreachable, or no interactive console). Any `Err` is a
 /// pre-spawn setup failure (connect/split/handshake/console) — the agent spawned nothing, so
 /// the caller can safely fail open without a double-execution or an orphaned shell.
-fn try_relay(exec: &Option<String>) -> anyhow::Result<Option<i32>> {
-    let path = afunix::socket_path();
+///
+/// `locate` says where the socket is. `run_on` passes [`crate::userdir::current_socket_location`],
+/// the profile of the account this process runs as and no other; it is a parameter so a test can
+/// pin that this function connects only to what it is given. `log_failure` is why the shim has no
+/// log, if it has none (see [`try_relay_at`]). `stdin` is what an EXEC session forwards to the
+/// child (the process's own stdin in `run_on`).
+fn try_relay(
+    exec: &Option<String>,
+    locate: impl FnOnce() -> anyhow::Result<SocketLocation>,
+    log_failure: Option<&str>,
+    stdin: impl std::io::Read + Send + 'static,
+) -> anyhow::Result<Option<i32>> {
+    try_relay_at(locate(), exec, &mut std::io::stderr(), log_failure, stdin)
+}
+
+/// The phrase `tests/fail_open_windows.rs` greps for; every fail-open message begins with it.
+/// `reason` is why the agent cannot be reached, when the shim knows and the user can act on it.
+fn unavailable_message(reason: Option<&dyn std::fmt::Display>) -> String {
+    match reason {
+        Some(reason) => format!("ssh-broker: agent unavailable — falling back to a local shell ({reason})"),
+        None => "ssh-broker: agent unavailable — falling back to a local shell".to_string(),
+    }
+}
+
+/// [`try_relay`] for a given socket location (or the reason there is none), writing a user
+/// message to `stderr` where one is safe.
+///
+/// `log_failure`, why there is no log, is added to the message of a fallback for a command: the
+/// log is where that fallback's reason would otherwise go, and it is gone. Nothing is written for
+/// it on the relay path, where stderr belongs to the command, nor in PTY mode, where a write
+/// could corrupt the stream. A location that cannot be resolved already prints its own cause,
+/// which is the cause of the missing log too.
+fn try_relay_at(
+    location: anyhow::Result<SocketLocation>,
+    exec: &Option<String>,
+    stderr: &mut dyn std::io::Write,
+    log_failure: Option<&str>,
+    stdin: impl std::io::Read + Send + 'static,
+) -> anyhow::Result<Option<i32>> {
+    let location = match location {
+        Ok(location) => location,
+        Err(e) => {
+            // No profile, or a profile path too long for a socket: the cause is the user's own
+            // setup and nothing but this line will tell them. Nothing is relayed and the console
+            // is untouched, so a line on stderr is safe even for an interactive session.
+            let reason = format!("{e:#}");
+            tracing::warn!("{}", unavailable_message(Some(&reason)));
+            let _ = writeln!(stderr, "{}", unavailable_message(Some(&reason)));
+            return Ok(None);
+        }
+    };
+    let path = location.path;
     let conn = afunix::connect(&path);
     if decide_fallback(conn.is_err()) == Fallback::LocalShellWithWarning {
-        let msg = "ssh-broker: agent unavailable — falling back to a local shell";
+        let msg = unavailable_message(None);
         tracing::warn!("{msg} (path={path:?}, err={:?})", conn.as_ref().err());
         // EXEC has a clean stderr channel; in PTY mode a stderr write would corrupt the
         // terminal stream, so there the warning goes only to the log file.
         if exec.is_some() {
-            eprintln!("{msg}");
+            match log_failure {
+                Some(why) => {
+                    let _ = writeln!(stderr, "{msg} (the shim has no log: {why})");
+                }
+                None => {
+                    let _ = writeln!(stderr, "{msg}");
+                }
+            }
         }
         return Ok(None);
     }
@@ -167,7 +235,7 @@ fn try_relay(exec: &Option<String>) -> anyhow::Result<Option<i32>> {
                 &hs,
                 std::io::stdout(),
                 std::io::stderr(),
-                std::io::stdin(),
+                stdin,
             )?))
         }
         None => {
@@ -207,18 +275,8 @@ fn term() -> String {
 /// binary stream, which is what an `sftp` session landing on the EXEC arm would be. The child
 /// writes raw to sshd's pipes, exactly as the original DefaultShell did.
 ///
-/// **Deliberate behaviour change** (do not "simplify" this back): the EXEC arm used to run
-/// `exec_local_shell(Some(cmd))`, i.e. `pwsh -Command <cmd>`, so `ssh host "a | b"` piped and
-/// `ssh host "cd x && y"` chained even during an agent outage. That shell hop is gone on purpose:
-/// EXEC fail-open now matches the relay path's own bare `CreateProcessW` exactly, so during an
-/// outage those shell operators stop working — they become the client's business, same as they
-/// already are on the working (relayed) path, rather than an outage-only convenience the relay
-/// never offered.
-///
-/// The interactive arm changed too, and for a correctness reason rather than a behavioural one:
-/// it used to run through a plain, uncontained `std::process::Command` (`exec_local_shell`),
-/// so its children did NOT die with the session — contradicting the README. Routing it through
-/// this same contained spawn closes that gap; see `spawn_contained`.
+/// No shell hop, so shell operators are the client's business, as on the relay path. Both arms
+/// spawn through [`spawn_contained`], so the child dies with the session.
 fn run_local_passthrough(command: &str) -> anyhow::Result<i32> {
     use windows::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
     use windows::Win32::System::Console::STD_ERROR_HANDLE;
@@ -661,34 +719,6 @@ impl<Ops: ConsoleOps> Drop for ConsoleModesState<Ops> {
             }
         }
     }
-}
-
-// ── logging ────────────────────────────────────────────────────────────────────────
-
-/// Initialise a rolling file log under ProgramData. Best-effort: returns `None` (logging
-/// disabled) on any failure so the shim still works. NEVER logs to stdout/stderr in PTY mode.
-fn init_file_logging() -> Option<tracing_appender::non_blocking::WorkerGuard> {
-    init_file_logging_in(&log_dir())
-}
-
-/// [`init_file_logging`] against an explicit directory, so a test can point it at one that
-/// refuses writes.
-fn init_file_logging_in(dir: &std::path::Path) -> Option<tracing_appender::non_blocking::WorkerGuard> {
-    std::fs::create_dir_all(dir).ok()?;
-    // `rolling::daily` panics when the first log file cannot be created; the builder returns the
-    // error instead.
-    let appender = tracing_appender::rolling::RollingFileAppender::builder()
-        .rotation(tracing_appender::rolling::Rotation::DAILY)
-        .filename_prefix("shim.log")
-        .build(dir)
-        .ok()?;
-    let (nb, guard) = tracing_appender::non_blocking(appender);
-    let _ = tracing_subscriber::fmt().with_writer(nb).with_ansi(false).try_init();
-    Some(guard)
-}
-
-fn log_dir() -> std::path::PathBuf {
-    crate::provision::layout::Layout::production().logs_dir()
 }
 
 #[cfg(test)]

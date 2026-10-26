@@ -9,9 +9,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 
-use super::config;
 use super::report::Check;
-use crate::acl::{self, Sid};
+use super::schtasks;
+use crate::acl;
 
 /// The install directory and the paths derived from it.
 #[derive(Debug)]
@@ -26,22 +26,19 @@ impl Layout {
         }
     }
 
-    pub fn config_path(&self) -> PathBuf {
-        self.base.join("config.toml")
-    }
-
     pub fn canonical_exe(&self) -> PathBuf {
         self.base.join(super::EXE_NAME)
     }
 
-    /// The agent's socket directory.
-    pub fn socket_dir(&self) -> PathBuf {
-        self.base.join("s")
+    /// A single-user install's saved account; `apply` removes it.
+    fn legacy_config_path(&self) -> PathBuf {
+        self.base.join("config.toml")
     }
 
-    /// The shim's log directory.
-    pub fn logs_dir(&self) -> PathBuf {
-        self.base.join("logs")
+    /// The socket directory of a single-user install. `apply` removes it; sockets now live in
+    /// each user's profile.
+    fn legacy_socket_dir(&self) -> PathBuf {
+        self.base.join("s")
     }
 }
 
@@ -76,41 +73,6 @@ pub fn check_base(layout: &Layout) -> BaseCheck<'_> {
     }
 }
 
-/// The target account by name: CLI `--user` > the saved config > the interactive user. The
-/// config is read only when `--user` does not settle it, so a damaged config cannot block the
-/// `apply --user X` that repairs it.
-pub fn resolve_user(
-    base: &TrustedBase<'_>,
-    cli_user: Option<&str>,
-    current_user: Option<&str>,
-) -> anyhow::Result<String> {
-    let saved = if cli_user.is_some_and(|user| !user.is_empty()) {
-        None
-    } else {
-        saved_user(base).with_context(|| {
-            format!(
-                "fix or delete {}, or pass --user <account>",
-                base.layout.config_path().display()
-            )
-        })?
-    };
-    config::resolve_target_user(cli_user, saved.as_deref(), current_user)
-}
-
-/// The account recorded in the saved config, or `None` if there is no config. A config that
-/// cannot be read or parsed is an error. The config lives in the install directory, hence the
-/// [`TrustedBase`].
-pub fn saved_user(base: &TrustedBase<'_>) -> anyhow::Result<Option<String>> {
-    let path = base.layout.config_path();
-    let text = match std::fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
-    };
-    let saved = config::Config::from_toml(&text).with_context(|| format!("parse {}", path.display()))?;
-    Ok(Some(saved.target_user))
-}
-
 /// Run `action`, which reads from or runs something in the install directory, only if the
 /// directory passed its ACL check.
 pub fn run_if_trusted_base<T>(
@@ -131,101 +93,176 @@ pub fn install_dir_row(base: &BaseCheck<'_>) -> Check {
     }
 }
 
-/// The `socket dir ACL` row of `verify`: the socket directory verifies for the account in the
-/// saved config (the agent's grantee).
-pub fn socket_dir_row(base: &BaseCheck<'_>) -> Check {
-    const NAME: &str = "socket dir ACL";
-    let Ok(base) = base else {
-        return Check::new(NAME, false, "install dir untrusted: its config is not read");
-    };
-    let user = match saved_user(base) {
-        Ok(Some(user)) => user,
-        Ok(None) => return Check::new(NAME, false, "no config target_user"),
-        Err(e) => return Check::new(NAME, false, format!("{e:#}")),
-    };
-    let verified = Sid::lookup(&user)
-        .with_context(|| format!("resolve {user:?}"))
-        .and_then(|sid| acl::verify_dir_acl(&base.layout.socket_dir(), &sid).context("verify socket dir ACL"));
-    match verified {
-        Ok(ok) => Check::new(NAME, ok, format!("grantee={user}")),
-        Err(e) => Check::new(NAME, false, format!("grantee={user}: {e:#}")),
+/// What a single-user install left behind: the artifacts `apply` removes or replaces.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Legacy {
+    /// `config.toml`, which named the one account the agent served.
+    pub config: bool,
+    /// The shared `s\` socket directory.
+    pub socket_dir: bool,
+    /// A registered agent task that is not the group form: it names one account, and a running
+    /// agent of that form holds the exe open and a machine-wide mutex.
+    pub task: bool,
+}
+
+impl Legacy {
+    pub fn any(&self) -> bool {
+        self.config || self.socket_dir || self.task
+    }
+
+    /// What was found, for the line `apply` prints.
+    pub fn describe(&self) -> String {
+        let mut found = Vec::new();
+        if self.task {
+            found.push("the per-user agent task");
+        }
+        if self.config {
+            found.push("config.toml");
+        }
+        if self.socket_dir {
+            found.push("the shared socket directory");
+        }
+        found.join(", ")
+    }
+}
+
+/// Look for the artifacts of a single-user install. `agent_task_xml` is the queried XML of the
+/// registered agent task, or `None` if there is none. The install directory is only inspected
+/// (never read), but it is still taken as a [`TrustedBase`]: nothing looks into an untrusted one.
+///
+/// A path that cannot be inspected for a reason other than not existing is an error: calling it
+/// absent would skip its cleanup.
+pub fn legacy_artifacts(base: &TrustedBase<'_>, agent_task_xml: Option<&str>) -> anyhow::Result<Legacy> {
+    let exists = |path: PathBuf| present(&path).with_context(|| format!("inspect {}", path.display()));
+    Ok(Legacy {
+        config: exists(base.layout.legacy_config_path())?,
+        socket_dir: exists(base.layout.legacy_socket_dir())?,
+        task: agent_task_xml.is_some_and(|xml| !schtasks::xml_is_group_logon_task(xml)),
+    })
+}
+
+/// Whether `path` exists, without following a link at it. Only NotFound means no.
+fn present(path: &Path) -> std::io::Result<bool> {
+    match path.symlink_metadata() {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// Remove the files and directories in `legacy`. The task needs no removal: registering the new
+/// one with `/F` replaces it.
+pub fn remove_legacy(base: &TrustedBase<'_>, legacy: &Legacy) -> anyhow::Result<()> {
+    let layout = base.layout;
+    if legacy.config {
+        remove_if_present(std::fs::remove_file(layout.legacy_config_path()))
+            .with_context(|| format!("remove {}", layout.legacy_config_path().display()))?;
+    }
+    if legacy.socket_dir {
+        remove_if_present(std::fs::remove_dir_all(layout.legacy_socket_dir()))
+            .with_context(|| format!("remove {}", layout.legacy_socket_dir().display()))?;
+    }
+    Ok(())
+}
+
+fn remove_if_present(result: std::io::Result<()>) -> std::io::Result<()> {
+    match result {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        other => other,
     }
 }
 
 /// `apply`'s steps up to the registrations, in the only order that is safe: the base, then the
-/// account (which reads the saved config), then everything written into it. Returns the account
-/// and the canonical exe path.
+/// migration of a single-user install, then the exe. Returns the canonical exe path.
+///
+/// `agent_task_xml` is the queried XML of the registered agent task (`None` if there is none),
+/// and `stop_agents` stops every running agent and returns only once each has exited (the exe is
+/// copied right after, and a process that is stopped but not yet gone still holds it). It is called
+/// only when it has to be: a legacy
+/// artifact is found, or an installed exe is about to be replaced by a different build. So
+/// re-running `apply` and the boot self-heal with the installed build leave live agents alone.
+/// The caller starts agents again once the tasks are registered.
 pub fn prepare(
     layout: &Layout,
     current_exe: &Path,
-    cli_user: Option<&str>,
-    current_user: Option<&str>,
-) -> anyhow::Result<(String, PathBuf)> {
+    agent_task_xml: Option<&str>,
+    stop_agents: impl FnOnce() -> anyhow::Result<()>,
+) -> anyhow::Result<PathBuf> {
     let base = ensure_base(layout)?;
-    let user = resolve_user(&base, cli_user, current_user)?;
-    let sid = Sid::lookup(&user).with_context(|| format!("resolving SID for {user:?}"))?;
-    let exe = populate(&base, current_exe, &user, &sid)?;
-    Ok((user, exe))
+    prepare_in(&base, current_exe, agent_task_xml, stop_agents)
 }
 
-/// Fill a base that passed [`ensure_base`]. Returns the canonical exe path.
-pub fn populate(base: &TrustedBase<'_>, current_exe: &Path, user: &str, sid: &Sid) -> anyhow::Result<PathBuf> {
-    let layout = base.layout;
-    let exe = install_self(layout, current_exe)?;
+/// [`prepare`] on a base that already passed [`ensure_base`].
+pub fn prepare_in(
+    base: &TrustedBase<'_>,
+    current_exe: &Path,
+    agent_task_xml: Option<&str>,
+    stop_agents: impl FnOnce() -> anyhow::Result<()>,
+) -> anyhow::Result<PathBuf> {
+    let legacy = legacy_artifacts(base, agent_task_xml)?;
+    let replaces_exe = would_replace_installed_exe(base.layout, current_exe);
+    if legacy.any() {
+        println!("apply: replacing a single-user install ({})", legacy.describe());
+    }
+    if legacy.any() || replaces_exe {
+        // Before the exe is copied: a running agent holds it open, and the copy would fail with a
+        // sharing violation and leave the old exe under the new tasks.
+        stop_agents().context("stop the running agents")?;
+    }
+    if legacy.any() {
+        remove_legacy(base, &legacy)?;
+    }
+    install_self(base.layout, current_exe)
+}
 
-    std::fs::create_dir_all(layout.logs_dir()).context("create logs dir")?;
-
-    let sdir = layout.socket_dir();
-    std::fs::create_dir_all(&sdir).context("create socket dir")?;
-    acl::harden_dir(&sdir, sid).context("harden socket dir")?;
-    anyhow::ensure!(
-        acl::verify_dir_acl(&sdir, sid).context("verify socket dir ACL")?,
-        "socket dir ACL did not verify after harden"
-    );
-
-    write_config(layout, user)?;
-    Ok(exe)
+/// Whether installing `current` would overwrite an installed exe with a different build.
+fn would_replace_installed_exe(layout: &Layout, current: &Path) -> bool {
+    let canonical = layout.canonical_exe();
+    current != canonical && canonical.is_file() && !files_identical(current, &canonical)
 }
 
 /// Copy `current` to the canonical path unless it is already there or identical.
+///
+/// A copy that fails is an error. By now every agent the logon task started has been stopped and
+/// has exited, so a sharing violation means something else holds the exe open (an agent started
+/// by hand, or the shim of an open SSH session: the exe is sshd's DefaultShell). Keeping the old exe under the new tasks would report an install that did not happen.
 fn install_self(layout: &Layout, current: &Path) -> anyhow::Result<PathBuf> {
     let canonical = layout.canonical_exe();
-    if current != canonical
-        && !files_identical(current, &canonical)
-        && let Err(e) = std::fs::copy(current, &canonical)
-    {
-        // A running agent holds the canonical exe open (sharing violation). Don't abort
-        // the whole idempotent re-apply: if a canonical exe already exists, keep it and
-        // repair the rest of the state (installing a NEW build needs the agent stopped).
-        anyhow::ensure!(
-            canonical.is_file(),
-            "copy self to {} failed and no canonical exe exists: {e}",
-            canonical.display()
-        );
-        eprintln!(
-            "apply: could not update {} ({e}); using the existing exe \
-             — stop the agent to update the binary",
-            canonical.display()
-        );
+    if current != canonical && !files_identical(current, &canonical) {
+        std::fs::copy(current, &canonical).map_err(|e| anyhow::anyhow!(copy_failure(&canonical, &e)))?;
     }
     anyhow::ensure!(canonical.is_file(), "canonical exe missing after install");
     Ok(canonical)
 }
 
-fn files_identical(a: &Path, b: &Path) -> bool {
-    matches!((std::fs::read(a), std::fs::read(b)), (Ok(x), Ok(y)) if x == y)
+/// `ERROR_SHARING_VIOLATION`: another handle on the file allows no write.
+const ERROR_SHARING_VIOLATION: i32 = 32;
+/// `ERROR_USER_MAPPED_FILE`: the file has a mapped section open.
+const ERROR_USER_MAPPED_FILE: i32 = 1224;
+
+/// Why replacing `canonical` failed. It says "in use" only for the codes that mean something holds
+/// the file open; every other failure is named by its own error.
+fn copy_failure(canonical: &Path, err: &std::io::Error) -> String {
+    let in_use = matches!(
+        err.raw_os_error(),
+        Some(ERROR_SHARING_VIOLATION | ERROR_USER_MAPPED_FILE)
+    );
+    if in_use {
+        format!(
+            "could not replace {}: {err}. It is in use although the agents of the logon task have exited: \
+             either by an agent started by hand with `ssh-broker agent`, or by the shim of an open SSH \
+             session (the exe is sshd's DefaultShell). Find the processes with `tasklist /fi \"imagename eq {}\"`, \
+             end them or close the SSH sessions, and run apply again",
+            canonical.display(),
+            super::EXE_NAME
+        )
+    } else {
+        format!("could not replace {}: {err}", canonical.display())
+    }
 }
 
-fn write_config(layout: &Layout, user: &str) -> anyhow::Result<()> {
-    let toml = config::Config {
-        target_user: user.to_string(),
-    }
-    .to_toml()?;
-    // Direct overwrite: config.toml is read only by apply/verify, never concurrently with
-    // this write, so atomicity buys nothing — and a plain write is reliably idempotent on
-    // every re-apply (a temp+rename adds a Windows replace-semantics footgun for no gain).
-    std::fs::write(layout.config_path(), toml).context("write config")?;
-    Ok(())
+fn files_identical(a: &Path, b: &Path) -> bool {
+    matches!((std::fs::read(a), std::fs::read(b)), (Ok(x), Ok(y)) if x == y)
 }
 
 #[cfg(test)]

@@ -1,21 +1,30 @@
 //! provision: self-install (`apply`) and self-check (`verify`) — the DefaultShell values, the
-//! session-1 agent logon task, the ONSTART self-heal task, the socket dir + ACL, and parity
-//! probes (DPAPI/symlink/session) run THROUGH the agent.
+//! agent logon task (one agent per logged-on user), the ONSTART self-heal task, and parity
+//! probes (DPAPI/symlink/session) run THROUGH the invoking user's agent.
 //!
-//! The pure, host-tested logic lives in the submodules (config/registry/schtasks/probe/report);
-//! this root holds the Windows orchestration. `apply` is ordered so a partial run never bricks
-//! SSH (the DefaultShell registry flip is LAST, after the socket dir is bindable and the exe is
-//! proven present), and resolves the ACL grantee BY NAME so a SYSTEM-run self-heal grants the
-//! same account the agent binds as.
+//! The pure, host-tested logic lives in the submodules (registry/schtasks/probe/report); this root
+//! holds the Windows orchestration. `apply` is ordered so a partial run never bricks SSH (the
+//! DefaultShell registry flip is LAST, after the exe is proven present). It knows no user: each
+//! agent makes and hardens its own socket directory in its own profile, so a SYSTEM-run
+//! self-heal has nothing to resolve.
 
 pub mod bounded;
-pub mod config;
+#[cfg(windows)]
+mod flow;
 #[cfg(windows)]
 pub(crate) mod layout;
 pub mod probe;
+#[cfg(windows)]
+pub(crate) mod procwait;
 pub mod registry;
 pub mod report;
 pub mod schtasks;
+#[cfg(windows)]
+pub mod sessions;
+#[cfg(windows)]
+pub mod taskscheduler;
+#[cfg(windows)]
+pub(crate) mod user_rows;
 
 /// `apply` subcommand: idempotently assert all desired state. Windows-only.
 pub fn apply() -> anyhow::Result<()> {
@@ -42,6 +51,32 @@ pub fn verify_probe() -> anyhow::Result<()> {
     anyhow::bail!("verify-probe runs only on Windows");
 }
 
+/// Check the arguments after `apply`, returning the warnings to print.
+///
+/// `apply` takes none. The one exception is the removed `--user <name>`: an earlier build baked
+/// it into the boot-time self-heal task, and during a half-done migration that task runs the new
+/// exe with it. Refusing would leave the install unrepaired by the very task that exists to
+/// repair it, so it is accepted, ignored, and reported.
+pub fn check_apply_args(args: &[String]) -> anyhow::Result<Vec<String>> {
+    let mut warnings = Vec::new();
+    let mut rest = args.iter().peekable();
+    while let Some(arg) = rest.next() {
+        if arg == "--user" {
+            // Its value is part of the flag, not an argument of its own.
+            if rest.peek().is_some_and(|value| !value.starts_with('-')) {
+                rest.next();
+            }
+            warnings.push(
+                "apply: --user is ignored: ssh-broker runs one agent per logged-on user and has no target account"
+                    .to_string(),
+            );
+        } else {
+            anyhow::bail!("apply takes no arguments, got {arg:?}");
+        }
+    }
+    Ok(warnings)
+}
+
 /// The directory `apply` installs into. The one place the path is written; [`layout::Layout`]
 /// derives from it.
 pub const BASE_DIR: &str = r"C:\ProgramData\ssh-broker";
@@ -54,41 +89,17 @@ pub fn canonical_exe() -> std::path::PathBuf {
     std::path::Path::new(BASE_DIR).join(EXE_NAME)
 }
 
+#[cfg(test)]
+#[path = "provision_tests.rs"]
+mod provision_tests;
+
 #[cfg(windows)]
 mod imp {
     use super::layout::{self, Layout};
-    use super::{probe, registry, report, schtasks};
+    use super::{flow, probe, procwait, registry, report, schtasks, sessions, taskscheduler, user_rows};
     use crate::{afunix, shim};
     use anyhow::Context;
     use std::path::Path;
-
-    /// The interactive user running `apply` (lowest-precedence fallback). Returns None for a
-    /// service identity — `apply` may run as SYSTEM (the ONSTART self-heal), and the agent's
-    /// ACL grantee must be the real auto-login user, NEVER SYSTEM (which would brick the bind
-    /// gate). When this yields None under SYSTEM with no `--user`/config, resolution fails loudly.
-    fn current_user_name() -> Option<String> {
-        let name = std::env::var("USERNAME").ok()?;
-        let upper = name.to_ascii_uppercase();
-        if name.is_empty()
-            || upper == "SYSTEM"
-            || upper.ends_with('$') // machine account, e.g. MACHINE$
-            || upper == "LOCAL SERVICE"
-            || upper == "NETWORK SERVICE"
-        {
-            return None;
-        }
-        Some(name)
-    }
-
-    /// `--user <name>` from argv (baked into the SYSTEM ONSTART self-heal task's command).
-    fn arg_user() -> Option<String> {
-        let args: Vec<String> = std::env::args().collect();
-        args.iter()
-            .position(|a| a == "--user")
-            .and_then(|i| args.get(i + 1))
-            .filter(|s| !s.is_empty())
-            .cloned()
-    }
 
     /// Case-insensitive compare of a registry path string (quotes trimmed) to a path.
     fn eq_path(a: &str, b: &Path) -> bool {
@@ -98,46 +109,125 @@ mod imp {
     pub fn apply() -> anyhow::Result<()> {
         let layout = Layout::production();
 
-        // 0. Resolve the target account BY NAME (CLI --user > saved config > interactive user),
-        //    failing loudly rather than guessing from a SYSTEM token. The install
-        //    directory is gated first, so a planted one is never adopted.
-        // 1. Install this exe to a STABLE path and fill the base (see layout::populate). Everything
-        //    registers the canonical path: a temp path would brick SSH the instant it is deleted;
-        //    the shim's fail-open can't help if sshd execs a missing binary.
-        let current = std::env::current_exe().context("current_exe")?;
-        let (user, exe) = layout::prepare(&layout, &current, arg_user().as_deref(), current_user_name().as_deref())?;
-
-        // 2. Register both tasks (idempotent /F).
-        register_agent_task(&layout, &exe, &user)?;
-        register_selfheal_task(&exe, &user)?;
-
-        // 3. Write the escape flag and read it back at once, then flip the DefaultShell pair LAST
-        //    and only to the validated canonical path; read that back too. sshd reads these once
-        //    per session, so the shim cannot ask later which form sshd used: `apply` owns the flag
-        //    (see `registry::desired_values`).
-        registry::set_default_shell_under(registry::OPENSSH_KEY, &exe.to_string_lossy())
-            .context("write the DefaultShell values")?;
-        let (shell, opt) = registry::read_default_shell_under(registry::OPENSSH_KEY)?;
-        anyhow::ensure!(
-            eq_path(&shell, &exe) && opt == "-c",
-            "DefaultShell read-back mismatch (shell={shell:?}, opt={opt:?})"
-        );
-
-        // 4. Start the agent now so no re-login is needed (the logon trigger covers the rest).
-        if probe::active_console_session() != 0xFFFF_FFFF
-            && let Err(e) = run_schtasks(&schtasks::run_task_argv(schtasks::AGENT_TASK))
-        {
-            eprintln!("apply: agent task registered but immediate start failed: {e}");
+        // 0. `apply` takes no arguments. A removed `--user` (still in an old self-heal task) is
+        //    warned about and ignored.
+        let args: Vec<String> = std::env::args().skip(2).collect();
+        for warning in super::check_apply_args(&args)? {
+            eprintln!("{warning}");
         }
+
+        // 1. Install this exe to a STABLE path (see layout::prepare). Everything registers the
+        //    canonical path: a temp path would brick SSH the instant it is deleted; the shim's
+        //    fail-open can't help if sshd execs a missing binary. The install directory is gated
+        //    first, so a planted one is never adopted, and a single-user install is replaced. A
+        //    different build over an installed one stops every agent first (they hold the exe
+        //    open) and waits for them to exit, with the logon task disabled so that no logon
+        //    starts one from the old exe meanwhile. Every run from here ends by enabling the task, which
+        //    also heals one an earlier, killed `apply` left disabled; the agents start again
+        //    afterwards, even if a later step fails, except in a session whose old agent has not
+        //    exited.
+        let current = std::env::current_exe().context("current_exe")?;
+        let registered_xml = schtasks::registered_xml(taskscheduler::task_xml(schtasks::AGENT_TASK))?;
+        let exe = flow::run(
+            || taskscheduler::stop_instances(schtasks::AGENT_TASK, &layout.canonical_exe()),
+            |stop_agents| {
+                let exe = layout::prepare(&layout, &current, registered_xml.as_deref(), stop_agents)?;
+
+                // 2. Register both tasks (idempotent /F).
+                register_agent_task(&layout, &exe)?;
+                register_selfheal_task(&exe)?;
+
+                // 3. Write the escape flag and read it back at once, then flip the DefaultShell
+                //    pair LAST and only to the validated canonical path; read that back too. sshd
+                //    reads these once per session, so the shim cannot ask later which form sshd
+                //    used: `apply` owns the flag (see `registry::desired_values`).
+                registry::set_default_shell_under(registry::OPENSSH_KEY, &exe.to_string_lossy())
+                    .context("write the DefaultShell values")?;
+                let (shell, opt) = registry::read_default_shell_under(registry::OPENSSH_KEY)?;
+                anyhow::ensure!(
+                    eq_path(&shell, &exe) && opt == "-c",
+                    "DefaultShell read-back mismatch (shell={shell:?}, opt={opt:?})"
+                );
+                Ok(exe)
+            },
+            agent_task_is_group_form,
+            enable_agent_task,
+            start_agents,
+        )?;
         println!(
-            "apply: ok — DefaultShell -> {}, agent + self-heal tasks installed for {user}",
+            "apply: ok — DefaultShell -> {}, agent + self-heal tasks installed",
             exe.display()
         );
         Ok(())
     }
 
-    fn register_agent_task(layout: &Layout, exe: &Path, user: &str) -> anyhow::Result<()> {
-        let xml = schtasks::agent_task_xml(&exe.to_string_lossy(), user);
+    /// Whether the registered agent task is the group logon task, the form that can start an agent
+    /// in any session. An older single-user task cannot, so a failed `apply` that stopped agents
+    /// does not run it.
+    ///
+    /// A query that cannot be answered counts as "no": starting through a task of unknown form
+    /// could start the single-user agent this migration is replacing.
+    fn agent_task_is_group_form() -> bool {
+        match taskscheduler::task_xml(schtasks::AGENT_TASK) {
+            Ok(xml) => xml.is_some_and(|xml| schtasks::xml_is_group_logon_task(&xml)),
+            Err(e) => {
+                eprintln!("apply: not restarting the agents: {e:#}");
+                false
+            }
+        }
+    }
+
+    /// Enable the agent task: undo the stop's disabling of it, and heal a task that an earlier
+    /// `apply` left disabled by being killed. Registering the task afresh enables it too, but a
+    /// failed `apply` may not have got that far.
+    fn enable_agent_task() -> anyhow::Result<()> {
+        taskscheduler::set_enabled(schtasks::AGENT_TASK, true).with_context(|| {
+            format!(
+                "could not enable the {} task again; no agent starts at a logon until it is",
+                schtasks::AGENT_TASK
+            )
+        })
+    }
+
+    /// Step 4 of `apply`: start an agent in each session that already has a user, so nobody has to
+    /// log off and on again (the logon trigger covers every later logon), and to bring back the
+    /// agents step 1 stopped. An agent that is already running in its session exits at once, so
+    /// this is safe to repeat. Best-effort: the install is complete without it, and a failed
+    /// `apply` runs it too. A session whose old agent survived the stop is left alone: see
+    /// [`flow::plan_start`].
+    fn start_agents(survivors: &[procwait::Survivor]) {
+        match sessions::interactive_sessions() {
+            Ok(targets) => {
+                for (id, why) in &targets.unknown {
+                    eprintln!(
+                        "apply: could not tell whether session {id} has a user, so no agent was started there: {why}"
+                    );
+                }
+                let plan = flow::plan_start(&targets.ids, survivors);
+                for (id, pids) in &plan.held {
+                    eprintln!(
+                        "apply: no agent was started in session {id}: its old agent (process {}) was stopped but has not been seen to exit; run apply again once it has exited",
+                        pids.iter().map(u32::to_string).collect::<Vec<_>>().join(", ")
+                    );
+                }
+                let mut started = 0usize;
+                for id in &plan.start {
+                    match taskscheduler::run_in_session(schtasks::AGENT_TASK, *id) {
+                        Ok(()) => started += 1,
+                        Err(e) => eprintln!("apply: could not start the agent in session {id}: {e:#}"),
+                    }
+                }
+                println!(
+                    "apply: started the agent in {started} of {} logged-on session(s)",
+                    targets.total()
+                );
+            }
+            Err(e) => eprintln!("apply: the logged-on sessions could not be listed: {e:#}"),
+        }
+    }
+
+    fn register_agent_task(layout: &Layout, exe: &Path) -> anyhow::Result<()> {
+        let xml = schtasks::agent_task_xml(&exe.to_string_lossy());
         let xml_path = layout.base.join("agent-task.xml");
         // schtasks /XML requires a UTF-16 file (a UTF-8 one is rejected).
         std::fs::write(&xml_path, schtasks::xml_file_bytes(&xml)).context("write agent task xml")?;
@@ -149,8 +239,8 @@ mod imp {
         Ok(())
     }
 
-    fn register_selfheal_task(exe: &Path, user: &str) -> anyhow::Result<()> {
-        run_schtasks(&schtasks::selfheal_task_argv(&exe.to_string_lossy(), user)).context("register self-heal task")?;
+    fn register_selfheal_task(exe: &Path) -> anyhow::Result<()> {
+        run_schtasks(&schtasks::selfheal_task_argv(&exe.to_string_lossy())).context("register self-heal task")?;
         Ok(())
     }
 
@@ -191,14 +281,6 @@ mod imp {
         Ok(decode_output(&out.stdout))
     }
 
-    /// Run `schtasks` capturing (stdout, success) without erroring (for verify's queries).
-    fn query_schtasks(args: &[String]) -> (String, bool) {
-        match std::process::Command::new("schtasks").args(args).output() {
-            Ok(o) => (decode_output(&o.stdout), o.status.success()),
-            Err(_) => (String::new(), false),
-        }
-    }
-
     // ── verify ─────────────────────────────────────────────────────────────────────
 
     pub fn verify() -> anyhow::Result<()> {
@@ -230,35 +312,35 @@ mod imp {
             registry::OPENSSH_KEY,
         )));
 
-        // Local: the socket dir ACL verifies for the configured account (== the agent's grantee).
-        rows.push(layout::socket_dir_row(&base));
-
-        // Local: both tasks registered, and the agent task is InteractiveToken (session 1).
-        let (agent_xml, agent_ok) = query_schtasks(&schtasks::query_task_argv(schtasks::AGENT_TASK));
-        let registered = schtasks::parse_query_registered(&agent_xml, agent_ok);
-        let interactive = schtasks::xml_has_interactive_token(&agent_xml);
-        rows.push(report::Check::new(
-            "agent task",
-            registered && interactive,
-            format!("registered={registered} interactive_token={interactive}"),
-        ));
+        // Local: the agent task is registered in its group form (any user, interactive session).
+        rows.push(schtasks::agent_task_row(&taskscheduler::task_xml(schtasks::AGENT_TASK)));
         // Informational: verify runs via the LeastPrivilege agent (non-elevated) and cannot
         // reliably query a SYSTEM-owned task, so this never gates verify (apply errors loudly
         // if registration fails, and the reboot self-heal is exercised in the Phase-8 test).
-        let (_, heal_ok) = query_schtasks(&schtasks::query_task_argv(schtasks::SELFHEAL_TASK));
         rows.push(report::Check::new(
             "self-heal task (info)",
             true,
-            if heal_ok {
-                "registered"
-            } else {
-                "not queryable (needs elevation)"
+            match taskscheduler::task_xml(schtasks::SELFHEAL_TASK) {
+                Ok(Some(_)) => "registered".to_string(),
+                Ok(None) => "not registered".to_string(),
+                Err(e) => format!("not queryable (needs elevation?): {e:#}"),
             },
         ));
 
-        // Local: the socket is reachable.
-        let reachable = afunix::connect(&afunix::socket_path()).is_ok();
-        rows.push(report::Check::new("socket reachable", reachable, String::new()));
+        // Per user: this account's socket, its folder and file ACLs, and whether its agent
+        // answers. `verify` reports on the account that runs it.
+        let location = crate::userdir::current_socket_location();
+        match crate::acl::Sid::current_user() {
+            Ok(user) => {
+                rows.push(user_rows::socket_location_row(&location));
+                rows.push(user_rows::socket_dir_row(&location, &user));
+                rows.push(user_rows::socket_file_row(&location, &user));
+                rows.push(user_rows::log_folder_row(&location, &user));
+            }
+            Err(e) => rows.push(report::Check::new("socket location", false, format!("{e:#}"))),
+        }
+        rows.push(user_rows::socket_reachable_row(&location));
+        rows.push(user_rows::other_users_row());
 
         // Through the agent: the real parity proof (run in session 1 by verify-probe). Bounded,
         // because the probe child blocks reading the upstream payload before it writes anything,
@@ -318,8 +400,7 @@ mod imp {
                     },
                 ));
                 // `detail()` distinguishes "the child reported a mismatch" from "the child never
-                // reported at all" (an exe older than this check, which `apply` tolerates when a
-                // running agent holds the canonical path open). Both FAIL — default-deny — but
+                // reported at all" (an installed exe older than this check). Both FAIL — default-deny — but
                 // they have different remedies, and claiming the payload was mangled when nothing
                 // ever looked at it would be a diagnosis the code cannot support.
                 rows.push(report::Check::new(
@@ -378,7 +459,7 @@ mod imp {
     /// very property being measured. This is the end-to-end half of byte-transparency — a real
     /// child, real pipes, a real socket — which the in-memory relay tests cannot reach.
     fn drive_probe(exe: &Path) -> anyhow::Result<(probe::ProbeResult, bool)> {
-        let sock = afunix::connect(&afunix::socket_path()).context("connect to agent")?;
+        let sock = afunix::connect(&crate::userdir::current_socket_location()?.path).context("connect to agent")?;
         let (rx, tx) = afunix::split(sock)?;
         let cmd = format!("\"{}\" verify-probe", exe.display());
         let hs = shim::make_handshake(&Some(cmd), "xterm".into(), 80, 24);
@@ -406,9 +487,7 @@ mod imp {
         let dpapi = probe::dpapi_roundtrip(b"ssh-broker-parity-probe");
         let symlink = probe::symlink_probe();
         // Read the UPSTREAM payload first. This direction — client → child — is the one an
-        // `sftp put` / `scp` upload rides, and until now nothing carried binary through a real
-        // pipe and checked it arrived unchanged: the in-memory test stops at a fake agent thread,
-        // and this probe fed `io::empty()`. The two directions are measured INDEPENDENTLY: the
+        // `sftp put` / `scp` upload rides. The two directions are measured INDEPENDENTLY: the
         // downstream payload emitted below is a fixed write that carries nothing back about what
         // arrived here, so a corrupted upload surfaces ONLY as `upstream=fail` and never as a
         // downstream mismatch. The comparison itself lives in `probe::upstream_payload_ok` so it
