@@ -270,8 +270,8 @@ impl SshSession {
     /// Read until ssh closes its output, then wait for it to end.
     fn finish(mut self) -> i32 {
         loop {
-            match self.output.recv_timeout(SILENCE_BOUND) {
-                // sleep-ok: failure bound on the session's end, an external event that may never come
+            let received = self.output.recv_timeout(SILENCE_BOUND); // sleep-ok: failure bound on the session's end, an external event that may never come; expiry fails the test and is not read as state
+            match received {
                 Ok(chunk) => self.transcript.extend_from_slice(&chunk),
                 Err(RecvTimeoutError::Disconnected) => break,
                 Err(RecvTimeoutError::Timeout) => {
