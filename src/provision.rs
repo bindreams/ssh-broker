@@ -364,11 +364,12 @@ mod imp {
                 // interactive sessions — and DPAPI/symlink below confirm it is a genuine one.
                 rows.push(report::Check::new(
                     "interactive session (via agent)",
-                    p.session_id != 0,
+                    probe::is_genuine_session(p.session_id, p.logon_type),
                     format!(
-                        "session_id={} (active console={})",
+                        "session_id={} (active console={}, logon type={})",
                         p.session_id,
-                        probe::active_console_session()
+                        probe::active_console_session(),
+                        p.logon_type.map_or("unknown".to_string(), |t| t.to_string())
                     ),
                 ));
                 rows.push(report::Check::new("DPAPI (via agent)", p.dpapi_ok, String::new()));
@@ -484,6 +485,7 @@ mod imp {
 
     pub fn verify_probe() -> anyhow::Result<()> {
         let sid = probe::current_session_id();
+        let logon_type = probe::current_logon_type();
         let dpapi = probe::dpapi_roundtrip(b"ssh-broker-parity-probe");
         let symlink = probe::symlink_probe();
         // Read the UPSTREAM payload first. This direction — client → child — is the one an
@@ -510,8 +512,12 @@ mod imp {
             use std::io::Write;
             let mut stdout = std::io::stdout().lock();
             probe::emit_binary_probe(&mut stdout).context("emit the binary-transparency payload")?;
-            writeln!(stdout, "{}", probe::format_probe_line(sid, dpapi, symlink, upstream_ok))
-                .context("write the PROBE line")?;
+            writeln!(
+                stdout,
+                "{}",
+                probe::format_probe_line(sid, dpapi, symlink, upstream_ok, logon_type)
+            )
+            .context("write the PROBE line")?;
             stdout.flush().context("flush probe output")?;
         }
         // Parity gates: escaped session 0 AND a working DPAPI (proves a real user profile, the
@@ -523,7 +529,7 @@ mod imp {
         // and this child is the wrong place to judge it — exiting non-zero would report a
         // transport fault as a parity failure, and the parent could not tell the two apart. It
         // rides up in the PROBE line instead, where `verify` gates it as a row of its own.
-        let pass = sid != 0 && dpapi && !symlink.is_failure();
+        let pass = probe::is_genuine_session(sid, logon_type) && dpapi && !symlink.is_failure();
         if !pass {
             std::process::exit(1);
         }

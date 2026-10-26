@@ -7,21 +7,37 @@
 //! one account: the one whose token it runs under.
 
 /// `agent` subcommand entrypoint. Windows-only: the agent must run in the user's interactive
-/// session to confer RDP parity.
-pub fn run(_args: crate::route::AgentArgs) -> anyhow::Result<()> {
+/// session to confer RDP parity, or as a background session (`--background`).
+pub fn run(args: crate::route::AgentArgs) -> anyhow::Result<()> {
     #[cfg(windows)]
-    return start();
+    return start(args);
 
     #[cfg(not(windows))]
-    return Err(anyhow::anyhow!(
-        "the agent runs only on Windows (it hosts the shell in an interactive session)"
-    ));
+    {
+        let _ = args;
+        Err(anyhow::anyhow!(
+            "the agent runs only on Windows (it hosts the shell in an interactive session)"
+        ))
+    }
+}
+
+/// The process exit code for an error [`run`] returned: a start refusal's own code (the record a
+/// background agent leaves, see `agent_background`), else 1.
+pub fn exit_code_of(err: &anyhow::Error) -> i32 {
+    #[cfg(windows)]
+    if let Some(refusal) = err.downcast_ref::<crate::agent_background::Refusal>() {
+        return refusal.code();
+    }
+    let _ = err;
+    1
 }
 
 #[cfg(windows)]
 use crate::afunix::{self, AcceptError, ConnRx, ConnTx, Listener};
 #[cfg(windows)]
-use crate::agent_lock::{SessionSlot, UserLock, session_allows_agent};
+use crate::agent_background::{Refusal, check_start, mark_listening};
+#[cfg(windows)]
+use crate::agent_lock::{SessionSlot, UserLock};
 #[cfg(windows)]
 use crate::conpty::{self, PtySession};
 #[cfg(windows)]
@@ -31,7 +47,11 @@ use crate::pipes::ExecChild;
 #[cfg(windows)]
 use crate::protocol::{ExitCode, FrameKind, FrameReader, Handshake, Mode, Resize, Stream, read_one_frame, write_frame};
 #[cfg(windows)]
+use crate::ready::ReadyEvent;
+#[cfg(windows)]
 use crate::relay::{FrameSink, pump_until_peer_gone, write_data};
+#[cfg(windows)]
+use crate::route::{AgentArgs, BackgroundArgs};
 #[cfg(windows)]
 use crate::socket_loc::SocketLocation;
 #[cfg(windows)]
@@ -46,34 +66,48 @@ use std::sync::{Arc, Condvar, Mutex};
 /// Everything between "the task started us" and "serve": check where we are, make the user's
 /// private folder, and become the one agent that serves this user.
 #[cfg(windows)]
-fn start() -> anyhow::Result<()> {
+fn start(args: AgentArgs) -> anyhow::Result<()> {
+    let current_sid = crate::acl::Sid::current_user()?.to_sddl()?;
     start_with(
+        args.background.as_ref(),
         crate::provision::probe::current_session_id(),
+        &current_sid,
         crate::userdir::current_socket_location,
         |logs| crate::filelog::init_in(logs, "agent.log"),
+        |name| ReadyEvent::open(name)?.signal(),
         serve,
     )
 }
 
 /// [`start`] with its inputs as parameters, so a test can pick the session and see what runs.
+///
+/// `background` is `Some` for `agent --background`. The refusals before the log opens leave their
+/// exit code as the only record (see [`Refusal`]); `signal_ready` is called once, with the event's
+/// name, as soon as the log has opened and the socket folder exists, whatever `serve` then does.
 #[cfg(windows)]
 fn start_with(
+    background: Option<&BackgroundArgs>,
     session: u32,
+    current_sid: &str,
     locate: impl FnOnce() -> anyhow::Result<SocketLocation>,
     init_log: impl FnOnce(&Path) -> anyhow::Result<tracing_appender::non_blocking::WorkerGuard>,
+    signal_ready: impl FnOnce(&str) -> anyhow::Result<()>,
     serve: impl FnOnce(&SocketLocation, u32) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        session_allows_agent(session),
-        "the agent will not run in session 0: a shell hosted there has the limited environment this tool \
-         exists to avoid. It belongs in the user's interactive session; the logon task starts it there"
-    );
-    let location = locate()?;
+    check_start(background, session, current_sid)?;
+    let refused = |refusal: Refusal, cause: anyhow::Error| anyhow::Error::new(refusal).context(format!("{cause:#}"));
+    let location = locate().map_err(|e| refused(Refusal::NoSocketLocation, e))?;
     let user = crate::acl::Sid::current_user()?;
-    crate::userdir::ensure_socket_dir(&location, &user)?;
+    crate::userdir::ensure_socket_dir(&location, &user).map_err(|e| refused(Refusal::SocketFolderRefused, e))?;
     // Held to the end: dropping the guard stops the writer and later lines are lost. Until the
     // log opens an error goes to stderr, which a logon task discards; a hand-run agent shows it.
     let _log = keep_log_or_report(init_log(&location.logs_dir()), &mut std::io::stderr());
+    if let Some(name) = background.and_then(|b| b.ready_event.as_deref())
+        && let Err(e) = signal_ready(name)
+    {
+        tracing::error!("could not signal the ready event: {e:#}");
+        return Err(e.context("signal the ready event"));
+    }
     let result = serve(&location, session);
     if let Err(e) = &result {
         tracing::error!("the agent stopped: {e:#}");
@@ -137,22 +171,38 @@ fn serve_with(
 /// the user's lock, so no other agent of this user binds meanwhile.
 #[cfg(windows)]
 fn run_on(location: &SocketLocation) -> anyhow::Result<()> {
-    let listener = Listener::bind(&location.path)?;
-    Err(serve_connections(
-        || listener.accept(),
-        |conn, live| {
-            hand_to_thread(
-                conn,
-                live,
-                |work| std::thread::Builder::new().spawn(work).map(drop),
-                |conn| {
-                    if let Err(e) = handle_connection(conn) {
-                        tracing::warn!("connection handler error: {e:?}");
-                    }
-                },
-            )
-        },
-    ))
+    run_on_with(location, Listener::bind, mark_listening, |listener| {
+        serve_connections(
+            || listener.accept(),
+            |conn, live| {
+                hand_to_thread(
+                    conn,
+                    live,
+                    |work| std::thread::Builder::new().spawn(work).map(drop),
+                    |conn| {
+                        if let Err(e) = handle_connection(conn) {
+                            tracing::warn!("connection handler error: {e:?}");
+                        }
+                    },
+                )
+            },
+        )
+    })
+}
+
+/// [`run_on`] with its steps as parameters, so a test can see their order: bind, then mark, then
+/// accept. The marker comes after `bind` returns, which includes `listen`, so a shim that wakes
+/// on it can connect.
+#[cfg(windows)]
+fn run_on_with<L>(
+    location: &SocketLocation,
+    bind: impl FnOnce(&Path) -> anyhow::Result<L>,
+    mark: impl FnOnce(&SocketLocation) -> std::io::Result<()>,
+    accept_loop: impl FnOnce(L) -> anyhow::Error,
+) -> anyhow::Result<()> {
+    let listener = bind(&location.path)?;
+    mark(location).map_err(|e| anyhow::Error::new(e).context("write the serving marker"))?;
+    Err(accept_loop(listener))
 }
 
 /// Run `handle` on a thread started by `spawn`, which owns `conn` and `live`. The connection ends

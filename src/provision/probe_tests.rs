@@ -1,12 +1,12 @@
 //! Host tests for the pure probe-line format/parse.
 use super::{
     ProbeResult, SymlinkState, UpstreamState, binary_probe_ok, binary_probe_payload, emit_binary_probe,
-    format_probe_line, parse_probe_line, upstream_payload_ok,
+    format_probe_line, is_genuine_session, parse_probe_line, upstream_payload_ok,
 };
 
 #[test]
 fn probe_line_round_trips() {
-    let line = format_probe_line(1, true, SymlinkState::Blocked, true);
+    let line = format_probe_line(1, true, SymlinkState::Blocked, true, None);
     assert_eq!(line, "PROBE session_id=1 dpapi=ok symlink=blocked upstream=ok");
     assert_eq!(
         parse_probe_line(&line).unwrap(),
@@ -15,6 +15,7 @@ fn probe_line_round_trips() {
             dpapi_ok: true,
             symlink: SymlinkState::Blocked,
             upstream: UpstreamState::Ok,
+            logon_type: None,
         }
     );
 }
@@ -49,7 +50,7 @@ fn a_missing_upstream_token_is_absent_not_a_reported_failure() {
         old.detail()
     );
 
-    let failed = format_probe_line(1, true, SymlinkState::Ok, false);
+    let failed = format_probe_line(1, true, SymlinkState::Ok, false, None);
     assert!(failed.contains("upstream=fail"));
     let got = parse_probe_line(&failed).unwrap().upstream;
     assert_eq!(got, UpstreamState::Fail);
@@ -118,7 +119,7 @@ fn upstream_payload_propagates_a_read_error() {
 #[test]
 fn symlink_states_round_trip() {
     for st in [SymlinkState::Ok, SymlinkState::Blocked, SymlinkState::Skipped] {
-        let line = format_probe_line(2, false, st, true);
+        let line = format_probe_line(2, false, st, true, None);
         assert_eq!(parse_probe_line(&line).unwrap().symlink, st);
     }
     // Only a confirmed block is a parity failure.
@@ -182,6 +183,7 @@ fn parse_is_default_deny_on_gating_keys() {
             dpapi_ok: false,
             symlink: SymlinkState::Skipped,
             upstream: UpstreamState::Absent,
+            logon_type: None,
         }
     );
 }
@@ -196,6 +198,7 @@ fn parse_tolerates_surrounding_noise() {
             dpapi_ok: true,
             symlink: SymlinkState::Ok,
             upstream: UpstreamState::Ok,
+            logon_type: None,
         }
     );
 }
@@ -203,4 +206,48 @@ fn parse_tolerates_surrounding_noise() {
 #[test]
 fn parse_errors_when_no_probe_line() {
     assert!(parse_probe_line("nothing here\njust noise").is_err());
+}
+
+#[test]
+fn probe_line_round_trips_with_logon_type() {
+    let line = format_probe_line(0, true, SymlinkState::Ok, true, Some(4));
+    assert_eq!(line, "PROBE session_id=0 dpapi=ok symlink=ok upstream=ok logon=4");
+    assert_eq!(parse_probe_line(&line).unwrap().logon_type, Some(4));
+}
+
+/// A probe child older than this field, or one that could not read its logon session, says nothing:
+/// that must read as "not proven", never as a logon type.
+#[test]
+fn probe_line_without_logon_parses_to_none() {
+    let line = "PROBE session_id=1 dpapi=ok symlink=ok upstream=ok";
+    assert_eq!(parse_probe_line(line).unwrap().logon_type, None);
+    let garbled = "PROBE session_id=1 dpapi=ok symlink=ok upstream=ok logon=x";
+    assert_eq!(parse_probe_line(garbled).unwrap().logon_type, None);
+}
+
+#[test]
+fn session_one_is_genuine() {
+    assert!(is_genuine_session(1, None));
+    assert!(is_genuine_session(2, Some(3)));
+}
+
+#[test]
+fn session_zero_batch_is_genuine() {
+    assert!(is_genuine_session(0, Some(4)));
+}
+
+#[test]
+fn session_zero_interactive_is_genuine() {
+    assert!(is_genuine_session(0, Some(2)));
+}
+
+#[test]
+fn session_zero_network_is_not() {
+    assert!(!is_genuine_session(0, Some(3)));
+}
+
+#[test]
+fn session_zero_unreadable_is_not() {
+    assert!(!is_genuine_session(0, None));
+    assert!(!is_genuine_session(0, Some(0)));
 }

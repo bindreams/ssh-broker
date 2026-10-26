@@ -42,7 +42,7 @@ mod stand_in;
 
 use account_fixture::Account;
 use job::KillOnCloseJob;
-use stand_in::{Kit, SeclogonGuard, start_shim};
+use stand_in::{Kit, RealAgent, SeclogonGuard, start_shim};
 
 /// The product's view of a fixture account.
 fn account_of(account: &Account) -> LocalAccount {
@@ -295,4 +295,30 @@ fn logon_as_account_with_space_in_name() {
     let waited = event.wait_with(started.process.0).unwrap();
     assert_eq!(waited, Waited::Ready, "agent.error: {}", kit.read("agent.error"));
     assert_eq!(kit.agent_info("sid"), account.sid_text);
+}
+
+// The background agent -----------------------------------------------------------------------
+
+/// Elevated (CI only). Spike M4: a second agent of the same user in the same session never binds and
+/// leaves (the `SessionSlot`), so no competing agent serves. Both are the real agent, started as one
+/// account's network token; the wait for the second is on its exit.
+#[test]
+fn second_agent_in_the_same_session_leaves_without_binding() {
+    let _machine = machine::shared();
+    let kit = Kit::copy_of_broker("m4");
+    let account = Account::create("m4", true);
+    let location = ssh_broker::socket_loc::for_profile(account.profile()).unwrap();
+
+    let first = RealAgent::start(&kit, &account);
+    stand_in::wait_for_serving_marker(&location, first.process.process.0);
+    assert!(first.is_running(), "the first agent must be serving");
+
+    let second = RealAgent::start(&kit, &account);
+    assert_eq!(second.process.wait(), 0, "the second agent must leave without an error");
+    let log = stand_in::read_logs(&location);
+    assert!(
+        log.contains("another agent already runs in this session"),
+        "the second agent must say why it left:\n{log}"
+    );
+    assert!(first.is_running(), "the first agent must still be serving");
 }

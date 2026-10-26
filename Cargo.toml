@@ -41,6 +41,7 @@ windows = { version = "0.62.2", features = [
     "Win32_System_RemoteDesktop",
     "Win32_System_Registry",       # DefaultShell registry pair (Reg* APIs)
     "Win32_Networking_WinSock",    # WSAPoll for the hangup watcher
+    "Win32_Security_Authentication_Identity", # LsaGetLogonSessionData: the logon type of the probe's session
     "Win32_Security_Cryptography", # DPAPI parity probe (CryptProtectData/CryptUnprotectData)
     "Win32_UI_Shell",              # GetUserProfileDirectoryW: the profile of a token
     "Win32_System_TaskScheduler",  # stop/start the agent task per session (COM)

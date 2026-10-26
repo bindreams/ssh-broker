@@ -11,7 +11,11 @@ fn main() -> anyhow::Result<()> {
 
     match route(&args, &cmdline::current()) {
         Route::Shim { exec } => shim::run(exec),
-        Route::Agent(args) => agent::run(args),
+        Route::Agent(args) => agent::run(args).map_err(|e| {
+            // An agent without a console has no other way to say why it stopped.
+            eprintln!("ssh-broker agent: {e:#}");
+            std::process::exit(agent::exit_code_of(&e))
+        }),
         Route::Usage(verb) => {
             eprintln!("{}", usage(verb));
             std::process::exit(2);

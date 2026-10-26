@@ -7,6 +7,13 @@ use crate::afunix::AcceptError;
 use crate::test_support::TempProfile;
 use std::cell::{Cell, RefCell};
 use std::os::windows::process::CommandExt;
+use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
+use windows::Win32::Storage::FileSystem::{
+    FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_CHANGE_SIZE, FindCloseChangeNotification,
+    FindFirstChangeNotificationW, FindNextChangeNotification,
+};
+use windows::Win32::System::Threading::WaitForSingleObject;
+use windows::core::PCWSTR;
 
 fn guard() -> tracing_appender::non_blocking::WorkerGuard {
     tracing_appender::non_blocking(std::io::sink()).1
@@ -14,16 +21,134 @@ fn guard() -> tracing_appender::non_blocking::WorkerGuard {
 
 // start -----
 
+const ME: &str = "S-1-5-21-1-2-3-1001";
+
+fn never_ready(_: &str) -> anyhow::Result<()> {
+    panic!("must not signal a ready event")
+}
+
+fn background(ready_event: Option<&str>, expect_user: Option<&str>) -> BackgroundArgs {
+    BackgroundArgs {
+        ready_event: ready_event.map(str::to_string),
+        expect_user: expect_user.map(str::to_string),
+    }
+}
+
+/// The `Refusal` an error carries, if any.
+fn refusal(err: &anyhow::Error) -> Option<Refusal> {
+    err.downcast_ref::<Refusal>().copied()
+}
+
 #[test]
 fn start_refuses_session_zero_before_it_touches_anything() {
     let err = start_with(
+        None,
         0,
+        ME,
         || -> anyhow::Result<SocketLocation> { panic!("must not look for the profile in session 0") },
         |_| -> anyhow::Result<_> { panic!("must not open a log in session 0") },
+        never_ready,
         |_, _| panic!("must not serve in session 0"),
     )
     .unwrap_err();
     assert!(format!("{err:#}").contains("session 0"), "{err:#}");
+}
+
+#[test]
+fn desktop_agent_still_refuses_session_zero_with_65() {
+    let err = start_with(
+        None,
+        0,
+        ME,
+        || -> anyhow::Result<SocketLocation> { panic!("must not look for the profile") },
+        |_| -> anyhow::Result<_> { panic!("must not open a log") },
+        never_ready,
+        |_, _| panic!("must not serve"),
+    )
+    .unwrap_err();
+    assert_eq!(refusal(&err), Some(Refusal::SessionRefused));
+    assert_eq!(exit_code_of(&err), 65);
+}
+
+#[test]
+fn expect_user_mismatch_exits_64_before_touching_the_folder() {
+    let args = background(Some("ev"), Some("S-1-5-21-1-2-3-9999"));
+    let err = start_with(
+        Some(&args),
+        2,
+        ME,
+        || -> anyhow::Result<SocketLocation> { panic!("must not look for the profile for another user") },
+        |_| -> anyhow::Result<_> { panic!("must not open a log for another user") },
+        never_ready,
+        |_, _| panic!("must not serve another user"),
+    )
+    .unwrap_err();
+    assert_eq!(refusal(&err), Some(Refusal::WrongUser));
+    assert_eq!(exit_code_of(&err), 64);
+}
+
+#[test]
+fn locate_failure_exits_66() {
+    let args = background(Some("ev"), Some(ME));
+    let err = start_with(
+        Some(&args),
+        2,
+        ME,
+        || anyhow::bail!("the account has no profile directory"),
+        |_| -> anyhow::Result<_> { panic!("must not open a log without a folder") },
+        never_ready,
+        |_, _| panic!("must not serve without a folder"),
+    )
+    .unwrap_err();
+    assert_eq!(refusal(&err), Some(Refusal::NoSocketLocation));
+    assert_eq!(exit_code_of(&err), 66);
+    assert!(
+        format!("{err:#}").contains("no profile directory"),
+        "the cause is kept: {err:#}"
+    );
+}
+
+#[test]
+fn folder_refusal_exits_67() {
+    let profile = TempProfile::new("start-refused");
+    let loc = profile.location();
+    // A file where the private folder belongs: nothing can be made safe there.
+    std::fs::write(&loc.dir, b"planted").unwrap();
+    let args = background(Some("ev"), Some(ME));
+    let err = start_with(
+        Some(&args),
+        2,
+        ME,
+        || Ok(loc.clone()),
+        |_| -> anyhow::Result<_> { panic!("must not open a log in a refused folder") },
+        never_ready,
+        |_, _| panic!("must not serve from a refused folder"),
+    )
+    .unwrap_err();
+    assert_eq!(refusal(&err), Some(Refusal::SocketFolderRefused));
+    assert_eq!(exit_code_of(&err), 67);
+}
+
+#[test]
+fn background_agent_is_allowed_in_session_zero() {
+    let profile = TempProfile::new("start-bg0");
+    let loc = profile.location();
+    let served = Cell::new(None);
+    let args = background(None, Some(ME));
+    start_with(
+        Some(&args),
+        0,
+        ME,
+        || Ok(loc.clone()),
+        |_| Ok(guard()),
+        never_ready,
+        |_, session| {
+            served.set(Some(session));
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert_eq!(served.take(), Some(0));
 }
 
 #[test]
@@ -33,12 +158,15 @@ fn start_makes_the_private_folder_then_serves_that_session_from_it() {
     let served = Cell::new(None);
 
     start_with(
+        None,
         3,
+        ME,
         || Ok(loc.clone()),
         |logs| {
             assert_eq!(logs, loc.logs_dir());
             Ok(guard())
         },
+        never_ready,
         |at, session| {
             assert!(
                 acl::verify_dir_acl(&at.dir, &Sid::current_user().unwrap()).unwrap(),
@@ -60,9 +188,12 @@ fn start_serves_without_a_log_when_the_log_cannot_be_opened() {
     let served = Cell::new(false);
 
     start_with(
+        None,
         3,
+        ME,
         || Ok(loc.clone()),
         |_| anyhow::bail!("the disk is full"),
+        never_ready,
         |_, _| {
             served.set(true);
             Ok(())
@@ -78,30 +209,290 @@ fn start_returns_the_error_serving_stopped_with() {
     let profile = TempProfile::new("start-err");
     let loc = profile.location();
     let err = start_with(
+        None,
         3,
+        ME,
         || Ok(loc.clone()),
         |_| Ok(guard()),
+        never_ready,
         |_, _| anyhow::bail!("listener broke"),
     )
     .unwrap_err();
     assert_eq!(format!("{err:#}"), "listener broke");
+    assert_eq!(exit_code_of(&err), 1, "a failure after the log opens is not a refusal");
+}
+
+/// A `tracing` writer that keeps what it is given.
+#[derive(Clone, Default)]
+struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for Captured {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 #[test]
-fn a_failed_log_setup_is_printed_with_its_cause_and_the_agent_goes_on() {
-    let mut stderr = Vec::new();
-    let kept = keep_log_or_report(Err(anyhow::anyhow!("the folder belongs to someone else")), &mut stderr);
-    let text = String::from_utf8(stderr).unwrap();
-    assert!(kept.is_none());
-    assert!(text.contains("the folder belongs to someone else"), "{text}");
-    assert!(text.contains("without a log"), "{text}");
+fn failure_after_the_log_opens_exits_1_and_logs_the_cause() {
+    let profile = TempProfile::new("start-logs");
+    let loc = profile.location();
+    let captured = Captured::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer({
+            let captured = captured.clone();
+            move || captured.clone()
+        })
+        .with_ansi(false)
+        .finish();
+    let err = tracing::subscriber::with_default(subscriber, || {
+        start_with(
+            None,
+            3,
+            ME,
+            || Ok(loc.clone()),
+            |_| Ok(guard()),
+            never_ready,
+            |_, _| anyhow::bail!("the listener broke"),
+        )
+    })
+    .unwrap_err();
+    assert_eq!(exit_code_of(&err), 1);
+    let logged = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+    assert!(logged.contains("the listener broke"), "{logged}");
 }
 
 #[test]
-fn a_log_that_opened_prints_nothing_and_is_kept() {
-    let mut stderr = Vec::new();
-    assert!(keep_log_or_report(Ok(guard()), &mut stderr).is_some());
-    assert!(stderr.is_empty());
+fn ready_is_signalled_once_after_the_log_opens() {
+    let profile = TempProfile::new("start-ready");
+    let loc = profile.location();
+    let events = RefCell::new(Vec::new());
+    let args = background(Some("Global\\ssh-broker-ready-x"), Some(ME));
+    start_with(
+        Some(&args),
+        2,
+        ME,
+        || Ok(loc.clone()),
+        |_| {
+            events.borrow_mut().push("log".to_string());
+            Ok(guard())
+        },
+        |name| {
+            events.borrow_mut().push(format!("ready {name}"));
+            Ok(())
+        },
+        |_, _| {
+            events.borrow_mut().push("serve".to_string());
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        events.into_inner(),
+        ["log", "ready Global\\ssh-broker-ready-x", "serve"],
+        "signalled exactly once, after the log opened and before serving"
+    );
+}
+
+#[test]
+fn ready_is_signalled_even_when_the_slot_is_taken() {
+    let profile = TempProfile::new("start-ready-slot");
+    let loc = profile.location();
+    std::fs::create_dir_all(&loc.dir).unwrap();
+    let _other = SessionSlot::try_acquire(&loc.sessions_lock_path(), 7).unwrap().unwrap();
+    let signalled = Cell::new(0);
+    let args = background(Some("ev"), Some(ME));
+    start_with(
+        Some(&args),
+        7,
+        ME,
+        || Ok(loc.clone()),
+        |_| Ok(guard()),
+        |_| {
+            signalled.set(signalled.get() + 1);
+            Ok(())
+        },
+        |at, session| {
+            serve_with(
+                at,
+                session,
+                |_| panic!("the user lock is taken only after the session slot"),
+                |_| panic!("an agent that does not hold the slot serves nothing"),
+            )
+        },
+    )
+    .unwrap();
+    assert_eq!(signalled.get(), 1, "the shim must wake even when this agent leaves");
+}
+
+#[test]
+fn agent_without_flags_never_signals() {
+    let profile = TempProfile::new("start-noflags");
+    let loc = profile.location();
+    start_with(
+        None,
+        3,
+        ME,
+        || Ok(loc.clone()),
+        |_| Ok(guard()),
+        never_ready,
+        |_, _| Ok(()),
+    )
+    .unwrap();
+}
+
+#[test]
+fn a_background_agent_without_a_ready_event_never_signals() {
+    let profile = TempProfile::new("start-noevent");
+    let loc = profile.location();
+    let args = background(None, Some(ME));
+    start_with(
+        Some(&args),
+        3,
+        ME,
+        || Ok(loc.clone()),
+        |_| Ok(guard()),
+        never_ready,
+        |_, _| Ok(()),
+    )
+    .unwrap();
+}
+
+#[test]
+fn a_failed_ready_signal_ends_the_agent_with_the_cause_and_serves_nothing() {
+    let profile = TempProfile::new("start-ready-fail");
+    let loc = profile.location();
+    let args = background(Some("ev"), Some(ME));
+    let err = start_with(
+        Some(&args),
+        3,
+        ME,
+        || Ok(loc.clone()),
+        |_| Ok(guard()),
+        |_| anyhow::bail!("access denied"),
+        |_, _| panic!("a shim that cannot be woken must not wait on an agent that serves"),
+    )
+    .unwrap_err();
+    assert!(format!("{err:#}").contains("access denied"), "{err:#}");
+    assert_eq!(exit_code_of(&err), 1);
+}
+
+// the serving marker -----
+
+/// A directory watch on `dir`: signalled by a file being created, resized or written.
+struct Watch(HANDLE);
+
+impl Watch {
+    fn arm(dir: &Path) -> Watch {
+        use std::os::windows::ffi::OsStrExt;
+        let dir_w: Vec<u16> = dir.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+        // SAFETY: a NUL-terminated path; the handle is closed in `drop`.
+        let handle = unsafe {
+            FindFirstChangeNotificationW(
+                PCWSTR(dir_w.as_ptr()),
+                false,
+                FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_SIZE | FILE_NOTIFY_CHANGE_LAST_WRITE,
+            )
+        }
+        .unwrap();
+        Watch(handle)
+    }
+
+    /// Whether the watch is signalled now: a state check, not a wait.
+    fn signalled(&self) -> bool {
+        // SAFETY: a valid watch handle.
+        let state = unsafe { WaitForSingleObject(self.0, 0) }; // sleep-ok: zero-timeout state check after the write has returned, not a wait
+        state == WAIT_OBJECT_0
+    }
+
+    /// Re-arm: the next change signals it again, and until then it is not signalled.
+    fn rearm(&self) {
+        // SAFETY: a valid watch handle.
+        unsafe { FindNextChangeNotification(self.0) }.unwrap();
+    }
+}
+
+impl Drop for Watch {
+    fn drop(&mut self) {
+        // SAFETY: the handle from `arm`.
+        let _ = unsafe { FindCloseChangeNotification(self.0) };
+    }
+}
+
+#[test]
+fn mark_listening_changes_the_folder() {
+    let profile = TempProfile::new("marker");
+    let loc = profile.location();
+    std::fs::create_dir_all(&loc.dir).unwrap();
+    let watch = Watch::arm(&loc.dir);
+    // The folder's own creation may have signalled the watch: consume that, so only the marker can.
+    watch.rearm();
+    assert!(!watch.signalled(), "nothing has changed since the watch was re-armed");
+
+    mark_listening(&loc).unwrap();
+    assert!(watch.signalled(), "the marker write must be a change of the folder");
+
+    watch.rearm();
+    mark_listening(&loc).unwrap();
+    assert!(watch.signalled(), "a second marker write is a change again");
+}
+
+#[test]
+fn every_agent_marks_after_bind() {
+    let profile = TempProfile::new("marker-order");
+    let loc = profile.location();
+    let events = RefCell::new(Vec::new());
+    let err = run_on_with(
+        &loc,
+        |path| {
+            assert_eq!(path, loc.path);
+            events.borrow_mut().push("bind");
+            Ok(())
+        },
+        |at| {
+            assert_eq!(at, &loc);
+            events.borrow_mut().push("mark");
+            Ok(())
+        },
+        |()| {
+            events.borrow_mut().push("accept");
+            anyhow::anyhow!("end of loop")
+        },
+    )
+    .unwrap_err();
+    assert_eq!(events.into_inner(), ["bind", "mark", "accept"]);
+    assert_eq!(format!("{err:#}"), "end of loop");
+}
+
+#[test]
+fn a_failed_bind_marks_nothing_and_accepts_nothing() {
+    let profile = TempProfile::new("marker-bindfail");
+    let loc = profile.location();
+    let err = run_on_with(
+        &loc,
+        |_| -> anyhow::Result<()> { anyhow::bail!("not safe to bind") },
+        |_| panic!("no marker without a listener"),
+        |()| panic!("no accept without a listener"),
+    )
+    .unwrap_err();
+    assert!(format!("{err:#}").contains("not safe to bind"));
+}
+
+#[test]
+fn a_failed_marker_write_ends_the_agent_before_it_accepts() {
+    let profile = TempProfile::new("marker-fail");
+    let loc = profile.location();
+    let err = run_on_with(
+        &loc,
+        |_| Ok(()),
+        |_| Err(std::io::Error::other("disk full")),
+        |()| panic!("a shim cannot be woken, so nothing is accepted"),
+    )
+    .unwrap_err();
+    assert!(format!("{err:#}").contains("disk full"), "{err:#}");
 }
 
 // serve -----

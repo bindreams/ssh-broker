@@ -8,7 +8,16 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use ssh_broker::ready::{ReadyEvent, Waited, generate_name};
-use windows::Win32::System::Threading::CREATE_PROCESS_LOGON_FLAGS;
+use ssh_broker::socket_loc::SocketLocation;
+use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
+use windows::Win32::Storage::FileSystem::{
+    FILE_NOTIFY_CHANGE_FILE_NAME, FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_CHANGE_SIZE, FindCloseChangeNotification,
+    FindFirstChangeNotificationW, FindNextChangeNotification,
+};
+use windows::Win32::System::Threading::{
+    CREATE_PROCESS_LOGON_FLAGS, INFINITE, TerminateProcess, WaitForMultipleObjects, WaitForSingleObject,
+};
+use windows::core::PCWSTR;
 
 use crate::account_fixture::{Account, SharedDir, Spawned};
 
@@ -38,9 +47,18 @@ pub struct Kit {
 
 impl Kit {
     pub fn new(tag: &str) -> Kit {
+        Kit::with_exe(tag, &example_exe())
+    }
+
+    /// A kit holding a copy of the real `ssh-broker.exe`.
+    pub fn copy_of_broker(tag: &str) -> Kit {
+        Kit::with_exe(tag, Path::new(env!("CARGO_BIN_EXE_ssh-broker")))
+    }
+
+    fn with_exe(tag: &str, source: &Path) -> Kit {
         let dir = SharedDir::new(tag);
         let exe = dir.0.join("stand_in.exe");
-        std::fs::copy(example_exe(), &exe).unwrap();
+        std::fs::copy(source, &exe).unwrap();
         Kit { dir, exe }
     }
 
@@ -157,4 +175,92 @@ impl Drop for SeclogonGuard {
             powershell("Start-Service -Name seclogon");
         }
     }
+}
+
+/// The real `ssh-broker agent --background`, started as an account's network token and ended when
+/// this is dropped.
+pub struct RealAgent {
+    pub process: Spawned,
+}
+
+impl RealAgent {
+    pub fn start(kit: &Kit, account: &Account) -> RealAgent {
+        let command_line = format!(
+            "\"{}\" agent --background --expect-user {}",
+            kit.exe.display(),
+            account.sid_text
+        );
+        let process = account.spawn_with(
+            &kit.exe,
+            &command_line,
+            kit.dir(),
+            &[],
+            CREATE_PROCESS_LOGON_FLAGS(0),
+            None,
+        );
+        process.resume();
+        RealAgent { process }
+    }
+
+    /// Whether the agent process has not ended: a state check, not a wait.
+    pub fn is_running(&self) -> bool {
+        // SAFETY: a valid process handle.
+        let state = unsafe { WaitForSingleObject(self.process.process.0, 0) }; // sleep-ok: zero-timeout state check of a process handle, not a wait
+        state == WAIT_TIMEOUT
+    }
+}
+
+impl Drop for RealAgent {
+    fn drop(&mut self) {
+        // SAFETY: a valid process handle; ending an agent that already ended is harmless.
+        let _ = unsafe { TerminateProcess(self.process.process.0, 1) };
+    }
+}
+
+/// Block until the agent that serves `location` has rewritten its `serving` marker, that is, until
+/// it is listening. A directory watch is armed before the marker is looked for, so a write between
+/// the look and the wait is not missed. An agent that ends first fails the wait with its exit code.
+pub fn wait_for_serving_marker(location: &SocketLocation, agent: HANDLE) {
+    use std::os::windows::ffi::OsStrExt;
+    // The socket folder may not exist yet, so the watch is on its parent and covers the subtree.
+    let watched = location.dir.parent().expect("the socket folder has a parent");
+    let watched_w: Vec<u16> = watched.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    // SAFETY: a NUL-terminated path; the handle is closed below.
+    let watch = unsafe {
+        FindFirstChangeNotificationW(
+            PCWSTR(watched_w.as_ptr()),
+            true,
+            FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_SIZE | FILE_NOTIFY_CHANGE_LAST_WRITE,
+        )
+    }
+    .unwrap();
+    loop {
+        if location.serving_marker_path().is_file() {
+            break;
+        }
+        // SAFETY: both handles are valid.
+        let woke = unsafe { WaitForMultipleObjects(&[watch, agent], false, INFINITE) };
+        if woke == WAIT_OBJECT_0 {
+            // SAFETY: a valid watch handle.
+            unsafe { FindNextChangeNotification(watch) }.unwrap();
+        } else {
+            let mut code = 0u32;
+            // SAFETY: a valid process handle and out-pointer.
+            let _ = unsafe { windows::Win32::System::Threading::GetExitCodeProcess(agent, &mut code) };
+            panic!("the agent ended with {code:#x} before it was listening");
+        }
+    }
+    // SAFETY: the handle from above.
+    let _ = unsafe { FindCloseChangeNotification(watch) };
+}
+
+/// Everything the agent logged in `location`'s logs folder.
+pub fn read_logs(location: &SocketLocation) -> String {
+    let mut text = String::new();
+    if let Ok(entries) = std::fs::read_dir(location.logs_dir()) {
+        for entry in entries.flatten() {
+            text.push_str(&std::fs::read_to_string(entry.path()).unwrap_or_default());
+        }
+    }
+    text
 }
