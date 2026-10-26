@@ -105,10 +105,22 @@ pub fn open_summary() {
     }
 }
 
-/// One line to the job log and the job summary.
+/// One line to the job log, the job summary and `SPIKE_FACTS_FILE`. The file is the copy that
+/// survives when GitHub keeps no log for a cancelled job; it is uploaded as an artifact.
 pub fn emit(line: &str) {
     println!("{line}");
     let _ = std::io::stdout().flush();
+    if let Some(path) = std::env::var_os("SPIKE_FACTS_FILE") {
+        // One append per line: a step killed at its timeout leaves every earlier line in the file.
+        let written = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .and_then(|mut file| file.write_all(format!("{line}\n").as_bytes())); // one write: threads emit too
+        if let Err(e) = written {
+            eprintln!("cannot append to {}: {e}", path.to_string_lossy());
+        }
+    }
     if let Some(file) = SUMMARY.lock().unwrap().as_mut() {
         let _ = writeln!(file, "    {line}");
     }

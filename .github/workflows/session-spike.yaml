@@ -2,8 +2,11 @@
 # never merged. It creates local accounts and logs them on, so it runs here and nowhere else.
 #
 # Each measurement prints lines `SPIKE <run>.<process>.<key>=<value>` to the log (and to the step
-# summary). The only bound on the run is the job's timeout: a step that waits on a condition has no
-# limit of its own, so M6 (which waits for a logon session to end) runs last.
+# summary), and appends them to $SPIKE_FACTS_FILE, which the last step uploads as an artifact:
+# GitHub kept no log at all for a job cancelled at its timeout. Every measurement step has its own
+# timeout (the bound on an external event that may never come), so one that hangs costs only its
+# own results; the job's timeout is above the sum of the steps'. M6 (which waits for a logon
+# session to end) runs last.
 name: Session spike
 
 on:
@@ -15,16 +18,20 @@ jobs:
   spike:
     name: Session spike
     runs-on: windows-latest
-    timeout-minutes: 90
+    timeout-minutes: 180
+    env:
+      SPIKE_FACTS_FILE: ${{ runner.temp }}\spike-facts.txt
     steps:
       - uses: actions/checkout@v7
 
       - name: Install pinned toolchain
+        timeout-minutes: 10
         run: rustup toolchain install
 
       # M8 needs the OpenSSH server; the spike reports "skipped" if it is not there.
       - name: Install the OpenSSH server (best effort)
         continue-on-error: true
+        timeout-minutes: 10
         shell: pwsh
         run: |
           $cap = Get-WindowsCapability -Online -Name 'OpenSSH.Server*' | Select-Object -First 1
@@ -33,33 +40,50 @@ jobs:
           Get-Service sshd | Format-List Name, Status, StartType
 
       - name: Build the example and the exe
+        timeout-minutes: 30
         run: cargo build --locked --bin ssh-broker --example session_spike
 
       - name: env, M1, M2
         if: always()
+        timeout-minutes: 10
         run: target\debug\examples\session_spike.exe env m1
 
       - name: M3
         if: always()
+        timeout-minutes: 10
         run: target\debug\examples\session_spike.exe m3
 
       - name: M4
         if: always()
+        timeout-minutes: 15
         run: target\debug\examples\session_spike.exe m4
 
       - name: M5
         if: always()
+        timeout-minutes: 10
         run: target\debug\examples\session_spike.exe m5
 
       - name: M7
         if: always()
+        timeout-minutes: 10
         run: target\debug\examples\session_spike.exe m7
 
       - name: M8
         if: always()
+        timeout-minutes: 15
         run: target\debug\examples\session_spike.exe m8
 
-      # Last: waits with no limit for a logon session to leave the system.
+      # Last: waits with no limit of its own for a logon session to leave the system; the step timeout bounds it.
       - name: M6
         if: always()
+        timeout-minutes: 20
         run: target\debug\examples\session_spike.exe m6
+
+      - name: Upload the facts
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        timeout-minutes: 5
+        with:
+          name: spike-facts
+          path: ${{ env.SPIKE_FACTS_FILE }}
+          if-no-files-found: warn

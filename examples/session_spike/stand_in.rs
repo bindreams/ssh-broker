@@ -12,7 +12,7 @@ use windows::Win32::Foundation::HANDLE;
 
 use crate::logon::{self, Logon, Started};
 use crate::rec::{Input, Rec};
-use crate::win::{self, DirWatch, Event};
+use crate::win::{self, Event};
 
 pub fn run(dir: &Path, scenario: &str) -> i32 {
     let rec = Rec::create(dir, "standin");
@@ -219,10 +219,30 @@ fn counts(log: &str) -> (usize, usize) {
     (log.matches(WAITING).count(), log.matches(SLOT_EXIT).count())
 }
 
+// Neither wait below can be driven by a directory-change notification, which is what the first
+// version used and what hung M4:
+// - the agent binds its socket (the file appears: one notification), checks the file's ACL, and
+//   only then listens, with no file change after the first. A connect made on that notification
+//   is refused, and no later notification comes while the agent serves.
+// - NTFS can hold back size and last-write notifications for a file that is appended to through
+//   an open handle (the agent's log) until the handle closes.
+// So each looks at the real condition again every second, and stops when the agent exits. The
+// one-second wait on the agent's handle is the interval between two looks, not a proof of state.
+
 /// Wait with no limit until `agent` logs that it waits or that it leaves for another agent of
 /// its session, or exits.
-fn wait_mark(loc: &ssh_broker::socket_loc::SocketLocation, baseline: (usize, usize), agent: HANDLE) -> Mark {
-    let watch = DirWatch::new(&loc.logs_dir(), false).expect("watch the logs folder");
+fn wait_mark(
+    rec: &Rec,
+    label: &str,
+    loc: &ssh_broker::socket_loc::SocketLocation,
+    baseline: (usize, usize),
+    agent: HANDLE,
+) -> Mark {
+    rec.put(
+        "m4.waiting",
+        format!("{label}: for a log line that it waits or leaves for another agent of its session, or for it to exit"),
+    );
+    let mut exited = false;
     loop {
         let (waiting, slot) = counts(&agent_log(loc));
         if waiting > baseline.0 {
@@ -231,39 +251,49 @@ fn wait_mark(loc: &ssh_broker::socket_loc::SocketLocation, baseline: (usize, usi
         if slot > baseline.1 {
             return Mark::SlotExit;
         }
-        if win::wait_any(&[watch.handle(), agent]) == 0 {
-            watch.rearm();
-        } else {
-            let (waiting, slot) = counts(&agent_log(loc));
-            return if waiting > baseline.0 {
-                Mark::Waiting
-            } else if slot > baseline.1 {
-                Mark::SlotExit
-            } else {
-                Mark::Exited(win::exit_code(agent))
-            };
+        if exited {
+            // Looked at the log once more after the exit, so its last lines count.
+            return Mark::Exited(win::exit_code(agent));
         }
+        exited = win::wait_bounded(agent, 1);
     }
 }
 
 /// Wait with no limit until a connection to the agent's socket succeeds; `Err` carries the exit
-/// code if the agent exits first.
-fn wait_serving(loc: &ssh_broker::socket_loc::SocketLocation, agent: HANDLE) -> Result<(), u32> {
-    let local = loc.dir.parent().expect("the socket folder has a parent").to_owned();
-    let watch = DirWatch::new(&local, true).expect("watch the profile's AppData\\Local");
+/// code if the agent exits first. A change in why the connect fails is recorded.
+fn wait_serving(
+    rec: &Rec,
+    label: &str,
+    loc: &ssh_broker::socket_loc::SocketLocation,
+    agent: HANDLE,
+) -> Result<(), u32> {
+    rec.put(
+        "m4.waiting",
+        format!(
+            "{label}: for a connection to {} to succeed, or for it to exit",
+            loc.path.display()
+        ),
+    );
+    let mut last_error: Option<String> = None;
     loop {
-        if ssh_broker::afunix::connect(&loc.path).is_ok() {
-            return Ok(());
+        match ssh_broker::afunix::connect(&loc.path) {
+            Ok(_) => return Ok(()),
+            Err(e) => {
+                let text = format!("{e:#}");
+                if last_error.as_deref() != Some(text.as_str()) {
+                    rec.put(&format!("m4.{label}.connect_failed"), &text);
+                    last_error = Some(text);
+                }
+            }
         }
-        if win::wait_any(&[watch.handle(), agent]) == 0 {
-            watch.rearm();
-        } else {
+        if win::wait_bounded(agent, 1) {
             return Err(win::exit_code(agent));
         }
     }
 }
 
 fn start_agent(rec: &Rec, label: &str, input: &Input) -> Option<Started> {
+    rec.put("m4.waiting", format!("{label}: CreateProcessWithLogonW to return"));
     let started = logon::start(
         &Logon {
             user: input.req("user"),
@@ -300,7 +330,7 @@ fn m4(rec: &Rec, input: &Input) {
     let Some(first) = start_agent(rec, "agent1", input) else {
         return;
     };
-    match wait_serving(&loc, first.process.0) {
+    match wait_serving(rec, "agent1", &loc, first.process.0) {
         Ok(()) => rec.put("agent1.state", "serving (a connection to its socket succeeded)"),
         Err(code) => {
             rec.put("agent1.state", format!("exited {code:#x} before it served"));
@@ -316,7 +346,7 @@ fn m4(rec: &Rec, input: &Input) {
         let Some(agent) = start_agent(rec, label, input) else {
             continue;
         };
-        let mark = wait_mark(&loc, baseline, agent.process.0);
+        let mark = wait_mark(rec, label, &loc, baseline, agent.process.0);
         match mark {
             Mark::Waiting => {
                 rec.put(
@@ -343,9 +373,10 @@ fn m4(rec: &Rec, input: &Input) {
     match &waiter {
         Some(waiter) => {
             win::terminate(first.process.0);
+            rec.put("m4.waiting", "agent1: to exit after TerminateProcess");
             win::wait_one(first.process.0);
             rec.put("agent1.killed", "true");
-            match wait_serving(&loc, waiter.process.0) {
+            match wait_serving(rec, "takeover", &loc, waiter.process.0) {
                 Ok(()) => rec.put("takeover", "the waiting agent bound and serves after agent1 was killed"),
                 Err(code) => rec.put(
                     "takeover",
@@ -356,6 +387,7 @@ fn m4(rec: &Rec, input: &Input) {
         None => rec.put("takeover", "not testable: no second agent waited on the lock"),
     }
     log_tail(rec, &loc);
+    rec.put("m4.waiting", "nothing: ending the agents and the stand-in");
     for agent in waiter.iter().chain(others.iter()).chain(std::iter::once(&first)) {
         win::terminate(agent.process.0);
     }

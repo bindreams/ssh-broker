@@ -187,6 +187,7 @@ pub fn m4(shared: &Shared) {
     }
     let b = Account::create("b", true, Kind::Standard);
     let run = start_stand_in(shared, &b, "m4", "m4", &[]);
+    fact("m4", "orchestrator.waiting", "for the stand-in process to exit");
     run.wait();
     run.finish();
 }
