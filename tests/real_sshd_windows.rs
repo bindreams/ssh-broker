@@ -67,17 +67,19 @@ fn run(program: &str, args: &[&str]) -> (bool, String) {
     (out.status.success(), text)
 }
 
+/// Make `path` readable by SYSTEM, Administrators and the account only. A file takes plain `F`:
+/// `(OI)(CI)` on a file leaves it with an empty DACL, which sshd's `authorized_keys` check refuses.
 fn icacls(path: &Path, account_sid: &str) {
+    let inherit = if path.is_dir() { "(OI)(CI)" } else { "" };
     let grants = [
-        "/inheritance:r",
-        "/grant:r",
-        "*S-1-5-18:(OI)(CI)F",
-        "*S-1-5-32-544:(OI)(CI)F",
+        "/inheritance:r".to_owned(),
+        "/grant:r".to_owned(),
+        format!("*S-1-5-18:{inherit}F"),
+        format!("*S-1-5-32-544:{inherit}F"),
+        format!("*{account_sid}:{inherit}F"),
     ];
-    let user = format!("*{account_sid}:(OI)(CI)F");
     let mut args: Vec<&str> = vec![path.to_str().unwrap()];
-    args.extend(grants);
-    args.push(&user);
+    args.extend(grants.iter().map(String::as_str));
     let (ok, text) = run("icacls", &args);
     assert!(ok, "icacls {path:?}: {text}");
 }
@@ -97,6 +99,20 @@ fn diagnostics(ssh_stderr: &Path, authorized_keys: &Path) -> String {
     report += &format!(
         "--- icacls authorized_keys ---\n{}\n",
         run("icacls", &[authorized_keys.to_str().unwrap()]).1
+    );
+    // Why sshd refused a key (bad ownership or modes, an AllowGroups miss) is in its own log, not in the event log.
+    let sshd_log = Path::new(&std::env::var("ProgramData").unwrap_or_default())
+        .join("ssh")
+        .join("logs")
+        .join("sshd.log");
+    let sshd_log_text =
+        std::fs::read_to_string(&sshd_log).unwrap_or_else(|e| format!("(no {}: {e})", sshd_log.display()));
+    let tail: Vec<&str> = sshd_log_text.lines().rev().take(80).collect();
+    report += &format!(
+        "--- {} (last {} lines) ---\n{}\n",
+        sshd_log.display(),
+        tail.len(),
+        tail.into_iter().rev().collect::<Vec<_>>().join("\n")
     );
     report += &format!(
         "--- OpenSSH/Operational ---\n{}\n",
