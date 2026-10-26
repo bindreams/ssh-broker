@@ -12,7 +12,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use windows::Wdk::System::Threading::{NtQueryInformationProcess, ProcessCommandLineInformation};
-use windows::Win32::Foundation::{ERROR_INVALID_PARAMETER, HANDLE, UNICODE_STRING, WAIT_OBJECT_0, WAIT_TIMEOUT};
+use windows::Win32::Foundation::{
+    ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER, HANDLE, UNICODE_STRING, WAIT_OBJECT_0, WAIT_TIMEOUT,
+};
 use windows::Win32::Storage::FileSystem::{FILE_ID_INFO, FileIdInfo, GetFileInformationByHandleEx};
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
@@ -24,6 +26,7 @@ use windows::Win32::System::Threading::{
 };
 use windows::core::{HRESULT, PWSTR};
 
+use crate::acl::Sid;
 use crate::winutil::OwnedHandle;
 
 /// How long a stopped agent may take to exit before the stop is reported as failed. The exit is
@@ -38,6 +41,11 @@ pub struct Process {
 }
 
 impl Process {
+    /// The process handle, for waiting on it. Owned by `self`.
+    pub fn handle(&self) -> HANDLE {
+        self.handle.0
+    }
+
     /// End the process. The handle held here keeps its PID from being reused, so reopening it by
     /// PID for the right to terminate it reaches the same process.
     pub fn terminate(&self) -> anyhow::Result<()> {
@@ -228,20 +236,94 @@ fn open_if_image_by(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e).with_context(|| format!("identify {}", image.display())),
     };
-    // SAFETY: plain value arguments; the handle is owned by `OwnedHandle` from here.
-    let handle = match unsafe { OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, false, pid) } {
-        Ok(handle) => OwnedHandle(handle),
-        Err(e) if e.code() == HRESULT::from_win32(ERROR_INVALID_PARAMETER.0) => return Ok(None),
-        Err(e) => return Err(e).with_context(|| format!("open process {pid}")),
+    let Some(handle) = open_for_waiting(pid)? else {
+        return Ok(None);
     };
-    let path = image_of(&handle).with_context(|| format!("read the image of process {pid}"))?;
+    Ok(runs_image(&handle, pid, &wanted, identify)?.then_some(Process { pid, handle }))
+}
+
+/// Open the process `pid` for waiting and reading; `None` if it has exited.
+fn open_for_waiting(pid: u32) -> anyhow::Result<Option<OwnedHandle>> {
+    // SAFETY: plain value arguments; the handle is owned by `OwnedHandle` from here.
+    match unsafe { OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, false, pid) } {
+        Ok(handle) => Ok(Some(OwnedHandle(handle))),
+        Err(e) if e.code() == HRESULT::from_win32(ERROR_INVALID_PARAMETER.0) => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("open process {pid}")),
+    }
+}
+
+/// Whether the process held by `handle` runs the file `wanted`.
+fn runs_image(
+    handle: &OwnedHandle,
+    pid: u32,
+    wanted: &FileId,
+    identify: &dyn Fn(&Path) -> std::io::Result<FileId>,
+) -> anyhow::Result<bool> {
+    let path = image_of(handle).with_context(|| format!("read the image of process {pid}"))?;
     let running = identify(&path).with_context(|| {
         format!(
             "identify {}, which process {pid} runs, to tell if it runs the agent",
             path.display()
         )
     })?;
-    Ok((running == wanted).then_some(Process { pid, handle }))
+    Ok(running == *wanted)
+}
+
+/// Every agent (desktop or background) of `user` that is running `image` right now, other than this
+/// process, each held by a handle: the agents that exist, whether or not they serve yet. A process
+/// that has ended is not one.
+///
+/// A process of another user is none of this user's: it cannot be opened, or its token names
+/// someone else, and it is skipped. A process of `user` whose image cannot be identified or whose
+/// command line cannot be read is an error: it might be the agent.
+pub fn user_agents(image: &Path, user: &Sid) -> anyhow::Result<Vec<Process>> {
+    let wanted_user = user.to_sddl()?;
+    let wanted = match file_id(image) {
+        Ok(id) => id,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e).with_context(|| format!("identify {}", image.display())),
+    };
+    let own = std::process::id();
+    let mut agents = Vec::new();
+    for (pid, name) in process_names()? {
+        if pid == own || !name.eq_ignore_ascii_case(super::EXE_NAME) {
+            continue;
+        }
+        let handle = match open_for_waiting(pid) {
+            Ok(Some(handle)) => handle,
+            Ok(None) => continue,
+            Err(e) if is_denied(&e) => continue,
+            Err(e) => return Err(e),
+        };
+        match Sid::of_process(handle.0) {
+            Ok(owner) if owner.to_sddl()? == wanted_user => {}
+            Ok(_) => continue,
+            Err(e) if is_denied(&e) => continue,
+            Err(e) => return Err(e).with_context(|| format!("read the owner of process {pid}")),
+        }
+        if !runs_image(&handle, pid, &wanted, &file_id)? {
+            continue;
+        }
+        // SAFETY: the handle carries SYNCHRONIZE.
+        let state = unsafe { WaitForSingleObject(handle.0, 0) }; // sleep-ok: zero-timeout state check of a process handle, not a wait
+        if state == WAIT_OBJECT_0 {
+            // Ended, but still listed while some handle on it is open. Waiting on it returns at once.
+            continue;
+        }
+        let process = Process { pid, handle };
+        if role_of(&command_line_of(&process)?) != Role::Shim {
+            agents.push(process);
+        }
+    }
+    Ok(agents)
+}
+
+/// Whether `error` is Windows refusing access.
+fn is_denied(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .filter_map(|cause| cause.downcast_ref::<windows::core::Error>())
+        .any(|e| e.code() == HRESULT::from_win32(ERROR_ACCESS_DENIED.0))
 }
 
 fn image_of(process: &OwnedHandle) -> anyhow::Result<PathBuf> {

@@ -96,9 +96,15 @@ impl Sid {
     /// SID of the user owning the current process token. Used by tests and by the
     /// interactive `apply` path; production provisioning resolves the grantee by name.
     pub fn current_user() -> anyhow::Result<Sid> {
+        // SAFETY: the pseudo-handle of the current process needs no closing.
+        Sid::of_process(unsafe { GetCurrentProcess() })
+    }
+
+    /// SID of the user owning the token of `process`, which needs `PROCESS_QUERY_LIMITED_INFORMATION`.
+    pub fn of_process(process: HANDLE) -> anyhow::Result<Sid> {
         unsafe {
             let mut token = HANDLE::default();
-            OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token)?;
+            OpenProcessToken(process, TOKEN_QUERY, &mut token)?;
             // Size probe: the first call is expected to fail with the needed length.
             let mut len = 0u32;
             let _ = GetTokenInformation(token, TokenUser, None, 0, &mut len);

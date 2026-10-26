@@ -5,6 +5,7 @@
 //! `offer::offer` over the real console (`ConsolePrompt`); when it starts a background session,
 //! this waits, on real primitives and without a timeout, until the agent's socket answers.
 
+use std::cell::RefCell;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -19,6 +20,7 @@ use windows::Win32::System::Threading::{INFINITE, WaitForMultipleObjects};
 use windows::core::PCWSTR;
 
 use crate::account::{self, LocalAccount};
+use crate::acl::Sid;
 use crate::console_modes::ConsoleModes;
 use crate::console_prompt::{ConsolePrompt, absence, console_available};
 use crate::logon::{self, StartedAgent};
@@ -27,6 +29,7 @@ use crate::offer::{
     text,
 };
 use crate::password_entry::{Password, Step};
+use crate::provision::procwait;
 use crate::ready::{ReadyEvent, Waited};
 use crate::socket_loc::SocketLocation;
 use crate::{afunix, provision, starting_agent};
@@ -75,7 +78,7 @@ pub enum Woke {
     Changed,
     /// The agent process ended with this exit code.
     AgentExited(u32),
-    /// The holder of the user's lock ended; its exit code is not known.
+    /// The holder of the user's lock, or an agent process, ended; its exit code is not known.
     Gone,
 }
 
@@ -125,6 +128,47 @@ pub fn wait_until_serving<C>(
                     None => Served::Gone,
                 });
             }
+        }
+    }
+}
+
+/// What `wait_while_starting` found out.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Starting<C> {
+    /// No agent exists, and none was seen starting.
+    No,
+    /// An agent was starting and now serves.
+    Served(C),
+    /// An agent was starting and ended without any agent serving.
+    Gone,
+}
+
+/// Connect; while that is refused and an agent exists, wait for the folder to change or for an
+/// agent to end. `look` says whether an agent exists: one that holds the user's lock, or a running
+/// agent process of the user (which may not have taken the lock yet).
+///
+/// The watch is armed by the caller before the first `connect`, and re-armed after every folder
+/// change before the next `connect`, as in [`wait_until_serving`]. When an agent ends (`Woke::Gone`),
+/// the loop connects once more and looks again: another agent may remain, and the wait goes on
+/// until none does. Refused with nobody there is `No` when no agent was ever seen, `Gone` when one was.
+pub fn wait_while_starting<C>(
+    mut connect: impl FnMut() -> Option<C>,
+    mut look: impl FnMut() -> anyhow::Result<bool>,
+    mut wait: impl FnMut() -> anyhow::Result<Woke>,
+    mut rearm: impl FnMut() -> anyhow::Result<()>,
+) -> anyhow::Result<Starting<C>> {
+    let mut seen = false;
+    loop {
+        if let Some(connected) = connect() {
+            return Ok(Starting::Served(connected));
+        }
+        if !look()? {
+            return Ok(if seen { Starting::Gone } else { Starting::No });
+        }
+        seen = true;
+        match wait()? {
+            Woke::Changed => rearm()?,
+            Woke::AgentExited(_) | Woke::Gone => {}
         }
     }
 }
@@ -215,10 +259,13 @@ impl Rescue for Prompting {
             }
         };
         let kind_of_absence = absence(absent.connect, absent.location);
-        // An agent that has made its socket and not yet called `listen()` refuses the connect like
-        // no agent at all. It is waited for, never prompted over.
+        // An agent that has made its socket and not yet called `listen()`, or that has started and not
+        // yet made its socket, refuses the connect like no agent at all. It is waited for, never
+        // prompted over.
         if let (Absence::NoAgent, Ok(location)) = (kind_of_absence, absent.location) {
-            match await_starting_agent(location) {
+            match crate::acl::Sid::current_user()
+                .and_then(|user| await_starting_agent(location, &provision::canonical_exe(), &user))
+            {
                 Ok(Starting::Served(socket)) => return Rescued::Connected { socket, modes: None },
                 Ok(Starting::No | Starting::Gone) => {}
                 Err(e) => {
@@ -369,49 +416,77 @@ fn settle(started: Started) -> Result<Socket, String> {
 
 // a starting agent -----
 
-/// What the shim found out about an agent that refused its connect.
-enum Starting {
-    /// Nobody holds the user's lock: there is no agent.
-    No,
-    /// An agent was starting and now serves.
-    Served(Socket),
-    /// An agent was starting and ended without serving.
-    Gone,
+/// What there is to wait for while an agent starts: the holder of the user's lock, and the running
+/// agent processes of the user. Either one may be there without the other: an agent takes the lock
+/// some time after its process starts.
+#[derive(Default)]
+struct Evidence {
+    holder: Option<starting_agent::HolderWatch>,
+    agents: Vec<procwait::Process>,
+}
+
+/// The most handles one wait takes (`MAXIMUM_WAIT_OBJECTS`) less the folder watch. The rest are
+/// still in `Evidence::agents` and are waited for on a later pass.
+const MAX_EVIDENCE_HANDLES: usize = 63;
+
+impl Evidence {
+    /// Look again: who holds the lock, and which agent processes run. True if any agent exists.
+    fn look(&mut self, lock: &Path, image: &Path, user: &Sid) -> anyhow::Result<bool> {
+        self.agents = procwait::user_agents(image, user).context("look for the user's agent processes")?;
+        let held = starting_agent::is_held(lock).context("tell whether an agent holds the user's lock")?;
+        if !held {
+            self.holder = None;
+        } else if self.holder.is_none() {
+            self.holder = Some(starting_agent::HolderWatch::start(lock)?);
+        }
+        Ok(held || !self.agents.is_empty())
+    }
+
+    /// Wait on the folder watch and on every item of the evidence; an item that ends is
+    /// `Woke::Gone`.
+    fn wait(&mut self, watch: &DirWatch) -> anyhow::Result<Woke> {
+        let mut handles = vec![watch.0];
+        handles.extend(self.holder.iter().map(starting_agent::HolderWatch::handle));
+        handles.extend(self.agents.iter().map(procwait::Process::handle));
+        handles.truncate(1 + MAX_EVIDENCE_HANDLES);
+        // SAFETY: every handle is valid for the call: the evidence is owned by `self`.
+        let woke = unsafe { WaitForMultipleObjects(&handles, false, INFINITE) };
+        let index = woke.0.wrapping_sub(WAIT_OBJECT_0.0) as usize;
+        if index == 0 {
+            Ok(Woke::Changed)
+        } else if index < handles.len() {
+            // The holder's event stays set once it fires; a lock held again needs a new watch.
+            if self
+                .holder
+                .as_ref()
+                .is_some_and(|holder| holder.handle() == handles[index])
+            {
+                self.holder = None;
+            }
+            Ok(Woke::Gone)
+        } else {
+            anyhow::bail!("waiting for the starting agent failed: {woke:?}")
+        }
+    }
 }
 
 /// Whether an agent that refused the connect is only starting, and if so wait until it serves or
-/// ends. The signal is the user's lock (see [`starting_agent`]), never the code of the refusal.
+/// every agent has ended. An agent exists if it holds the user's lock or its process runs (see
+/// [`starting_agent`] and [`procwait::user_agents`]), never by the code of the refusal.
 ///
-/// The folder watch is armed before the connect that follows the check, so the marker the agent
-/// writes after `listen()` is seen by that connect or by the watch. The wait is on the folder and
-/// on the lock's holder; both are real conditions, so it has no time limit.
-fn await_starting_agent(location: &SocketLocation) -> anyhow::Result<Starting> {
+/// The folder watch is armed before the connect that follows each look, so the marker the agent
+/// writes after `listen()` is seen by that connect or by the watch. The wait is on the folder, the
+/// lock's holder and the agent processes; all are real conditions, so it has no time limit.
+fn await_starting_agent(location: &SocketLocation, image: &Path, user: &Sid) -> anyhow::Result<Starting<Socket>> {
     let lock = location.lock_path();
-    if !starting_agent::is_held(&lock).context("tell whether an agent holds the user's lock")? {
-        return Ok(Starting::No);
-    }
     let watch = DirWatch::arm(&location.dir)?;
-    let holder = starting_agent::HolderWatch::start(&lock)?;
-    let served = wait_until_serving(
+    let evidence = RefCell::new(Evidence::default());
+    wait_while_starting(
         || afunix::connect(&location.path).ok(),
-        || {
-            let handles = [watch.0, holder.handle()];
-            // SAFETY: both handles are valid for the call.
-            let woke = unsafe { WaitForMultipleObjects(&handles, false, INFINITE) };
-            if woke == WAIT_OBJECT_0 {
-                Ok(Woke::Changed)
-            } else if woke.0 == WAIT_OBJECT_0.0 + 1 {
-                Ok(Woke::Gone)
-            } else {
-                anyhow::bail!("waiting for the starting agent failed: {woke:?}")
-            }
-        },
+        || evidence.borrow_mut().look(&lock, image, user),
+        || evidence.borrow_mut().wait(&watch),
         || watch.rearm(),
-    )?;
-    Ok(match served {
-        Served::Connected(socket) => Starting::Served(socket),
-        Served::Gone | Served::Ended { .. } => Starting::Gone,
-    })
+    )
 }
 
 #[cfg(test)]

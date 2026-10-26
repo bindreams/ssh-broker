@@ -172,3 +172,117 @@ fn a_starting_agent_that_is_gone_gets_one_more_connect_and_a_serving_peer_is_use
     let script = Script::new(vec![None, None], vec![Woke::Gone]);
     assert!(matches!(script.run(), Served::Gone));
 }
+
+// wait_while_starting -----
+
+/// Scripted answers for `wait_while_starting`, recording the order of its calls.
+struct Starts {
+    connects: RefCell<Vec<Option<u32>>>,
+    looks: RefCell<Vec<bool>>,
+    wakes: RefCell<Vec<Woke>>,
+    events: RefCell<Vec<&'static str>>,
+}
+
+impl Starts {
+    fn new(connects: Vec<Option<u32>>, looks: Vec<bool>, wakes: Vec<Woke>) -> Starts {
+        Starts {
+            connects: RefCell::new(connects.into_iter().rev().collect()),
+            looks: RefCell::new(looks.into_iter().rev().collect()),
+            wakes: RefCell::new(wakes.into_iter().rev().collect()),
+            events: RefCell::default(),
+        }
+    }
+
+    fn run(&self) -> Starting<u32> {
+        wait_while_starting(
+            || {
+                self.events.borrow_mut().push("connect");
+                self.connects
+                    .borrow_mut()
+                    .pop()
+                    .expect("connected more often than scripted")
+            },
+            || {
+                self.events.borrow_mut().push("look");
+                Ok(self.looks.borrow_mut().pop().expect("looked more often than scripted"))
+            },
+            || {
+                self.events.borrow_mut().push("wait");
+                Ok(self.wakes.borrow_mut().pop().expect("waited more often than scripted"))
+            },
+            || {
+                self.events.borrow_mut().push("rearm");
+                Ok(())
+            },
+        )
+        .unwrap()
+    }
+}
+
+#[test]
+fn a_connect_that_succeeds_at_once_looks_for_nothing() {
+    let starts = Starts::new(vec![Some(1)], vec![], vec![]);
+    assert_eq!(starts.run(), Starting::Served(1));
+    assert_eq!(*starts.events.borrow(), ["connect"]);
+}
+
+#[test]
+fn a_refusal_with_no_agent_anywhere_is_no_agent_and_waits_for_nothing() {
+    let starts = Starts::new(vec![None], vec![false], vec![]);
+    assert_eq!(starts.run(), Starting::No);
+    assert_eq!(*starts.events.borrow(), ["connect", "look"]);
+}
+
+#[test]
+fn an_agent_process_that_holds_no_lock_yet_is_waited_for_and_then_used() {
+    // The look is true on the agent's process alone: nothing here depends on the lock.
+    let starts = Starts::new(
+        vec![None, None, Some(5)],
+        vec![true, true],
+        vec![Woke::Changed, Woke::Changed],
+    );
+    assert_eq!(starts.run(), Starting::Served(5));
+    assert_eq!(
+        *starts.events.borrow(),
+        [
+            "connect", "look", "wait", "rearm", "connect", "look", "wait", "rearm", "connect"
+        ],
+        "the watch is re-armed before every connect that follows a wake"
+    );
+}
+
+#[test]
+fn every_agent_that_ends_is_looked_for_again_before_the_wait_is_given_up() {
+    // The first agent ends while a second process is still starting: the wait goes on.
+    let starts = Starts::new(
+        vec![None, None, Some(9)],
+        vec![true, true],
+        vec![Woke::Gone, Woke::Changed],
+    );
+    assert_eq!(starts.run(), Starting::Served(9));
+}
+
+#[test]
+fn an_agent_that_ended_without_serving_and_left_no_other_is_gone_not_absent() {
+    let starts = Starts::new(vec![None, None], vec![true, false], vec![Woke::Gone]);
+    assert_eq!(starts.run(), Starting::Gone);
+    assert_eq!(*starts.events.borrow(), ["connect", "look", "wait", "connect", "look"]);
+}
+
+#[test]
+fn a_failing_look_wait_or_rearm_is_an_error_not_a_hang() {
+    let failed =
+        wait_while_starting::<u32>(|| None, || anyhow::bail!("look failed"), || Ok(Woke::Gone), || Ok(())).unwrap_err();
+    assert!(format!("{failed:#}").contains("look failed"));
+    let failed =
+        wait_while_starting::<u32>(|| None, || Ok(true), || anyhow::bail!("wait failed"), || Ok(())).unwrap_err();
+    assert!(format!("{failed:#}").contains("wait failed"));
+    let failed = wait_while_starting::<u32>(
+        || None,
+        || Ok(true),
+        || Ok(Woke::Changed),
+        || anyhow::bail!("rearm failed"),
+    )
+    .unwrap_err();
+    assert!(format!("{failed:#}").contains("rearm failed"));
+}

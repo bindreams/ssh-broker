@@ -4,6 +4,8 @@ use super::*;
 use std::os::windows::process::CommandExt;
 use std::process::{Child, Command, Stdio};
 
+use crate::acl::Sid;
+
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 fn cmd_exe() -> PathBuf {
@@ -256,6 +258,107 @@ fn processes_that_outlive_the_bound_are_all_named_with_their_sessions() {
     drop(stays_b.stdin.take());
     stays_a.wait().unwrap();
     stays_b.wait().unwrap();
+}
+
+// the agents of one user -----
+
+/// A copy of `cmd.exe` named like the installed exe, so that the process snapshot lists it as an
+/// ssh-broker process.
+struct NamedCopy(CmdCopy);
+
+impl NamedCopy {
+    fn new(tag: &str) -> NamedCopy {
+        let copy = CmdCopy::new(tag);
+        std::fs::rename(copy.exe(), copy.dir.join(crate::provision::EXE_NAME)).unwrap();
+        NamedCopy(copy)
+    }
+
+    fn exe(&self) -> PathBuf {
+        self.0.dir.join(crate::provision::EXE_NAME)
+    }
+
+    /// The copy with `args` after the program (cmd ignores them and reads its stdin), until its
+    /// stdin closes.
+    fn spawn(&self, args: &[&str]) -> Child {
+        Command::new(self.exe())
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+            .unwrap()
+    }
+}
+
+fn end(mut child: Child) {
+    drop(child.stdin.take());
+    child.wait().unwrap();
+}
+
+fn pids(agents: &[Process]) -> Vec<u32> {
+    let mut pids: Vec<u32> = agents.iter().map(|p| p.pid).collect();
+    pids.sort();
+    pids
+}
+
+#[test]
+fn a_running_agent_of_the_user_is_found_before_it_has_taken_any_lock() {
+    let copy = NamedCopy::new("mine");
+    let background = copy.spawn(&["agent", "--background"]);
+    let desktop = copy.spawn(&["agent"]);
+    let shim = copy.spawn(&["-c", "agent --background"]);
+    let me = Sid::current_user().unwrap();
+
+    let found = user_agents(&copy.exe(), &me).unwrap();
+    let mut expected = vec![background.id(), desktop.id()];
+    expected.sort();
+    assert_eq!(pids(&found), expected, "both agents, and not the shim");
+
+    drop(found);
+    end(background);
+    end(desktop);
+    end(shim);
+}
+
+#[test]
+fn another_users_agent_is_none_of_this_users() {
+    let copy = NamedCopy::new("other");
+    let agent = copy.spawn(&["agent", "--background"]);
+    let someone_else = Sid::well_known(crate::acl::WellKnown::System).unwrap();
+    assert!(user_agents(&copy.exe(), &someone_else).unwrap().is_empty());
+    end(agent);
+}
+
+#[test]
+fn an_agent_of_another_image_is_not_taken_for_this_one() {
+    let copy = NamedCopy::new("image");
+    let agent = copy.spawn(&["agent", "--background"]);
+    let elsewhere = NamedCopy::new("elsewhere");
+    let me = Sid::current_user().unwrap();
+    assert!(user_agents(&elsewhere.exe(), &me).unwrap().is_empty());
+    end(agent);
+}
+
+#[test]
+fn an_image_that_does_not_exist_has_no_agents() {
+    let absent = std::env::temp_dir().join(format!("sb-procwait-absent-{}.exe", std::process::id()));
+    assert!(user_agents(&absent, &Sid::current_user().unwrap()).unwrap().is_empty());
+}
+
+#[test]
+fn an_agent_that_has_ended_is_not_found_while_a_handle_keeps_it_listed() {
+    let copy = NamedCopy::new("ended");
+    let mut agent = copy.spawn(&["agent", "--background"]);
+    let me = Sid::current_user().unwrap();
+    let held = user_agents(&copy.exe(), &me).unwrap();
+    assert_eq!(pids(&held), vec![agent.id()], "control: it is found while it runs");
+
+    drop(agent.stdin.take());
+    wait_all_exited(&held, Duration::from_secs(60)).unwrap();
+    // `held` and `agent` keep the ended process in the system's list; waiting on it would return at once.
+    assert!(user_agents(&copy.exe(), &me).unwrap().is_empty());
+    agent.wait().unwrap();
 }
 
 // the role of an ssh-broker process, from its command line -----
