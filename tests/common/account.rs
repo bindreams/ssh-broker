@@ -229,6 +229,23 @@ impl Account {
         logon_flags: CREATE_PROCESS_LOGON_FLAGS,
         environment: Option<&[u16]>,
     ) -> u32 {
+        let child = self.spawn_with(exe, command_line, cwd, evidence, logon_flags, environment);
+        child.resume();
+        child.wait()
+    }
+
+    /// [`Account::run_with`] up to the child's first instruction: the child is returned suspended,
+    /// so the caller can put it in a job first. [`Spawned::resume`] starts it and [`Spawned::wait`]
+    /// is the bounded wait for its exit.
+    pub fn spawn_with(
+        &self,
+        exe: &Path,
+        command_line: &str,
+        cwd: &Path,
+        evidence: &[PathBuf],
+        logon_flags: CREATE_PROCESS_LOGON_FLAGS,
+        environment: Option<&[u16]>,
+    ) -> Spawned {
         // The account's SID and the administrator's: the child runs as the first and is started by
         // the second.
         let starter = Sid::current_user().unwrap().to_sddl().unwrap();
@@ -287,27 +304,53 @@ impl Account {
             let _ = unsafe { TerminateProcess(process.0, 1) };
             panic!("switch off the hard-error boxes of {exe:?} as {}: {e}", self.name);
         }
-        // SAFETY: the handle is the primary thread of the process just created.
-        if unsafe { ResumeThread(thread.0) } == u32::MAX {
-            // SAFETY: as above.
-            let _ = unsafe { TerminateProcess(process.0, 1) };
-            panic!(
-                "resume {exe:?} as {}: {}",
-                self.name,
-                windows::core::Error::from_thread()
-            );
-        }
         let mut evidence = evidence.to_vec();
         if let Some(profile) = &self.profile {
             evidence.push(profile.join("AppData").join("Local").join("ssh-broker"));
         }
-        let what = format!("{exe:?} as {}", self.name);
+        Spawned {
+            process,
+            thread,
+            pid: info.dwProcessId,
+            what: format!("{exe:?} as {}", self.name),
+            evidence,
+            _desktop: private,
+        }
+    }
+}
+
+/// A child started suspended by [`Account::spawn_with`]. Its window station and desktop live as long
+/// as this does.
+pub struct Spawned {
+    pub process: OwnedHandle,
+    thread: OwnedHandle,
+    pub pid: u32,
+    what: String,
+    evidence: Vec<PathBuf>,
+    _desktop: crate::desktop::PrivateDesktop,
+}
+
+impl Spawned {
+    /// Start the child.
+    pub fn resume(&self) {
+        // SAFETY: the handle is the primary thread of the process just created.
+        if unsafe { ResumeThread(self.thread.0) } == u32::MAX {
+            // SAFETY: as above.
+            let _ = unsafe { TerminateProcess(self.process.0, 1) };
+            panic!("resume {}: {}", self.what, windows::core::Error::from_thread());
+        }
+    }
+
+    /// Wait for the child to exit and return its exit code. A child still running after
+    /// [`crate::bounded_wait::CHILD_EXIT_BOUND`] fails the test with the process tree and the
+    /// evidence printed, and is killed.
+    pub fn wait(&self) -> u32 {
         crate::bounded_wait::wait_for_exit(
-            process.0,
-            info.dwProcessId,
-            &what,
+            self.process.0,
+            self.pid,
+            &self.what,
             crate::bounded_wait::CHILD_EXIT_BOUND,
-            &evidence,
+            &self.evidence,
         )
     }
 }

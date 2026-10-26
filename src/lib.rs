@@ -26,12 +26,16 @@ pub mod conpty;
 pub mod filelog;
 #[cfg(windows)]
 pub mod hangup;
+#[cfg(windows)]
+pub mod logon;
 pub mod offer;
 pub mod password_entry;
 #[cfg(windows)]
 pub mod pipes;
 pub mod protocol;
 pub mod provision;
+#[cfg(windows)]
+pub mod ready;
 pub mod relay;
 pub mod route;
 pub mod secret;
