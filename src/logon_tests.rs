@@ -78,3 +78,69 @@ fn a_job_that_forbids_breakaway_gets_no_flag() {
 fn a_job_that_cannot_be_read_gets_no_flag() {
     assert_eq!(creation_flags(&CallerJob::Unreadable), CREATE_NO_WINDOW);
 }
+
+fn refused(code: u32) -> Result<u32, LogonFailure> {
+    Err(LogonFailure::from_win32(code))
+}
+
+const ACCESS_DENIED: u32 = 5;
+const LOGON_FAILURE: u32 = 1326;
+const ASKED: PROCESS_CREATION_FLAGS = PROCESS_CREATION_FLAGS(CREATE_NO_WINDOW.0 | CREATE_BREAKAWAY_FROM_JOB.0);
+
+/// An outer job in a chain can refuse what the innermost allows; the refusal is `ERROR_ACCESS_DENIED`.
+/// The call is then made once more as a caller that asks for no breakaway, and that answer is final.
+#[test]
+fn a_refused_breakaway_is_followed_by_one_call_without_it() {
+    let mut calls = Vec::new();
+    let result = with_breakaway_fallback(ASKED, |flags| {
+        calls.push(flags);
+        if flags == ASKED { refused(ACCESS_DENIED) } else { Ok(7) }
+    });
+    assert_eq!(result.unwrap(), 7);
+    assert_eq!(calls, [ASKED, CREATE_NO_WINDOW]);
+}
+
+#[test]
+fn the_answer_of_the_second_call_is_final() {
+    let mut calls = 0;
+    let result = with_breakaway_fallback(ASKED, |_| {
+        calls += 1;
+        refused(ACCESS_DENIED)
+    });
+    assert_eq!(result.unwrap_err().code, ACCESS_DENIED);
+    assert_eq!(calls, 2);
+}
+
+/// A wrong password is not a refused breakaway: the password is tried once.
+#[test]
+fn any_other_failure_is_not_followed_by_a_second_call() {
+    let mut calls = 0;
+    let result = with_breakaway_fallback(ASKED, |_| {
+        calls += 1;
+        refused(LOGON_FAILURE)
+    });
+    assert_eq!(result.unwrap_err().code, LOGON_FAILURE);
+    assert_eq!(calls, 1);
+}
+
+#[test]
+fn a_call_that_did_not_ask_for_breakaway_is_made_once() {
+    let mut calls = 0;
+    let result = with_breakaway_fallback(CREATE_NO_WINDOW, |_| {
+        calls += 1;
+        refused(ACCESS_DENIED)
+    });
+    assert_eq!(result.unwrap_err().code, ACCESS_DENIED);
+    assert_eq!(calls, 1);
+}
+
+#[test]
+fn a_call_that_succeeds_is_made_once() {
+    let mut calls = 0;
+    let result = with_breakaway_fallback(ASKED, |_| {
+        calls += 1;
+        Ok(1)
+    });
+    assert_eq!(result.unwrap(), 1);
+    assert_eq!(calls, 1);
+}

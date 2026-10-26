@@ -109,11 +109,18 @@ pub struct ShimRun {
 /// report is the appearance of `shim.result`, awaited together with the shim's own exit, so a shim
 /// that dies is a failure and not a hang. With `hold` the shim then stays alive until it is killed.
 pub fn start_shim(kit: &Kit, account: &Account, hold: bool, before_resume: impl FnOnce(&Spawned)) -> ShimRun {
-    std::fs::write(
-        kit.path("shim.input"),
-        format!("{}\n{}\n", account.password, kit.exe.display()),
-    )
-    .unwrap();
+    start_shim_typing(kit, account, &account.password, hold, before_resume)
+}
+
+/// [`start_shim`] with the shim typing `typed` as the password, which may be wrong.
+pub fn start_shim_typing(
+    kit: &Kit,
+    account: &Account,
+    typed: &str,
+    hold: bool,
+    before_resume: impl FnOnce(&Spawned),
+) -> ShimRun {
+    std::fs::write(kit.path("shim.input"), format!("{typed}\n{}\n", kit.exe.display())).unwrap();
     if hold {
         std::fs::write(kit.path("shim.hold"), "").unwrap();
     }

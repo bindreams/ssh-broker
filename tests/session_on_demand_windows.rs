@@ -41,7 +41,7 @@ use account_fixture::Account;
 use agent_conn::{AgentConn, BackgroundAgent};
 use job::KillOnCloseJob;
 use stand_in::file_signal::FileWaited;
-use stand_in::{Kit, RealAgent, SeclogonGuard, start_shim};
+use stand_in::{Kit, RealAgent, SeclogonGuard, start_shim, start_shim_typing};
 
 /// The product's view of a fixture account.
 fn account_of(account: &Account) -> LocalAccount {
@@ -138,18 +138,22 @@ enum M3Outcome {
     Ended { child: u32, shim: u32, had_waited: bool },
 }
 
-/// M3: the caller is a network-token process in `job`; it starts the logon child through the
-/// product's `start_background_agent`. The child records that it is waiting; the job is closed; then
-/// the child is told to acknowledge. Both outcomes end the wait: it waits on the acknowledgement and
-/// on the child's exit.
-fn logon_child_after_the_callers_job_closes(tag: &str, mut job: KillOnCloseJob) -> M3Outcome {
+/// M3: the caller is a network-token process in `jobs`, outermost first (a chain of nested jobs when
+/// there are several); it starts the logon child through the product's `start_background_agent`. The
+/// child records that it is waiting; the jobs are closed, innermost first; then the child is told to
+/// acknowledge. Both outcomes end the wait: it waits on the acknowledgement and on the child's exit.
+fn logon_child_after_the_callers_jobs_close(tag: &str, mut jobs: Vec<KillOnCloseJob>) -> M3Outcome {
     let _machine = machine::shared();
     let kit = Kit::new(tag);
     let account = Account::create(tag, true);
     // The stand-in agent, once it is up, waits for the file `agent.go` and then writes `agent.ack`.
     std::fs::write(kit.path("agent.plan"), "").unwrap();
 
-    let shim = start_shim(&kit, &account, true, |shim| job.assign(shim.process.0));
+    let shim = start_shim(&kit, &account, true, |shim| {
+        for job in &jobs {
+            job.assign(shim.process.0);
+        }
+    });
     assert!(shim.result.starts_with("Ready"), "shim.result: {}", shim.result);
     let agent_pid: u32 = kit.agent_info("pid").parse().unwrap();
     // SAFETY: a plain open by id; the handle is closed by `OwnedHandle`.
@@ -176,8 +180,10 @@ fn logon_child_after_the_callers_job_closes(tag: &str, mut job: KillOnCloseJob) 
         }
     }
 
-    job.close();
-    // The job's close is what ends the shim; wait for that before the child is asked anything.
+    for job in jobs.iter_mut().rev() {
+        job.close();
+    }
+    // The close is what ends the shim; wait for that before the child is asked anything.
     let shim_code = shim.process.wait();
 
     stand_in::file_signal::publish(&kit.path("agent.go"), "go");
@@ -201,7 +207,7 @@ fn logon_child_after_the_callers_job_closes(tag: &str, mut job: KillOnCloseJob) 
 /// test fails only if the logon itself does.
 #[test]
 fn logon_child_in_a_job_that_forbids_breakaway_is_measured() {
-    match logon_child_after_the_callers_job_closes("m3a", KillOnCloseJob::create()) {
+    match logon_child_after_the_callers_jobs_close("m3a", vec![KillOnCloseJob::create()]) {
         M3Outcome::Survived => {
             eprintln!("M3 (job without BREAKAWAY_OK): the logon child survived its caller's job closing")
         }
@@ -219,7 +225,7 @@ fn logon_child_in_a_job_that_forbids_breakaway_is_measured() {
 /// logon child outlives the job.
 #[test]
 fn logon_child_survives_the_callers_job_closing_where_breakaway_is_allowed() {
-    match logon_child_after_the_callers_job_closes("m3b", KillOnCloseJob::create_allowing_breakaway()) {
+    match logon_child_after_the_callers_jobs_close("m3b", vec![KillOnCloseJob::create_allowing_breakaway()]) {
         M3Outcome::Survived => {}
         M3Outcome::Ended {
             child,
@@ -228,6 +234,84 @@ fn logon_child_survives_the_callers_job_closing_where_breakaway_is_allowed() {
         } => panic!(
             "M3: the logon child ended with its caller's job although the job allows breakaway and the logon asked              for it: exit code {child:#x} (the caller's: {shim:#x}); it had recorded that it was waiting: {had_waited}"
         ),
+    }
+}
+
+/// A chain of two nested jobs, outermost first, each allowing breakaway or not. Windows shows a process
+/// only the innermost, which is what the product reads.
+fn nested_jobs(outer_allows: bool, inner_allows: bool) -> Vec<KillOnCloseJob> {
+    let job = |allows| {
+        if allows {
+            KillOnCloseJob::create_allowing_breakaway()
+        } else {
+            KillOnCloseJob::create()
+        }
+    };
+    vec![job(outer_allows), job(inner_allows)]
+}
+
+/// Elevated (CI only). Every job of the chain allows breakaway: the product asks for it and the logon
+/// child outlives the chain.
+#[test]
+fn logon_child_survives_nested_jobs_that_all_allow_breakaway() {
+    match logon_child_after_the_callers_jobs_close("m3n1", nested_jobs(true, true)) {
+        M3Outcome::Survived => {}
+        M3Outcome::Ended { child, shim, .. } => panic!(
+            "the logon child ended with a chain of jobs that all allow breakaway: exit code {child:#x} (the caller's: {shim:#x})"
+        ),
+    }
+}
+
+/// Elevated (CI only). The innermost job allows breakaway and an outer one does not: the product asks
+/// for it, Windows refuses, and the logon still succeeds (the helper asserts the report is
+/// `Ready`). What happens to the child is printed: it is in a chain that forbids breakaway.
+#[test]
+fn logon_succeeds_when_an_outer_job_forbids_the_breakaway_the_inner_one_allows() {
+    let outcome = logon_child_after_the_callers_jobs_close("m3n2", nested_jobs(false, true));
+    print_chain_outcome("outer forbids, inner allows", &outcome);
+}
+
+/// Elevated (CI only). The innermost job forbids breakaway and an outer one allows it: the product
+/// asks for none, and the logon succeeds.
+#[test]
+fn logon_succeeds_when_the_inner_job_forbids_breakaway_and_an_outer_one_allows_it() {
+    let outcome = logon_child_after_the_callers_jobs_close("m3n3", nested_jobs(true, false));
+    print_chain_outcome("outer allows, inner forbids", &outcome);
+}
+
+fn print_chain_outcome(chain: &str, outcome: &M3Outcome) {
+    match outcome {
+        M3Outcome::Survived => eprintln!("M3 nested jobs ({chain}): the logon child survived the chain closing"),
+        M3Outcome::Ended { child, shim, .. } => {
+            eprintln!(
+                "M3 nested jobs ({chain}): the logon child ended with the chain: {child:#x} (the caller's: {shim:#x})"
+            )
+        }
+    }
+}
+
+/// Elevated (CI only). A wrong password in a chain that refuses breakaway is answered `1326` and not
+/// access denied: the refusal comes after Windows has checked the password, so the product's one
+/// fallback on access denied never tries a wrong password twice.
+#[test]
+fn a_wrong_password_in_a_job_chain_is_answered_with_a_logon_failure() {
+    let _machine = machine::shared();
+    let kit = Kit::new("m3n4");
+    let account = Account::create("m3n4", true);
+    let mut jobs = nested_jobs(false, true);
+    let shim = start_shim_typing(&kit, &account, "not-the-password", false, |shim| {
+        for job in &jobs {
+            job.assign(shim.process.0);
+        }
+    });
+    assert!(
+        shim.result.starts_with("logon failed: 1326 "),
+        "a wrong password must be a logon failure, not a refused breakaway: {}",
+        shim.result
+    );
+    shim.process.wait();
+    for job in jobs.iter_mut().rev() {
+        job.close();
     }
 }
 

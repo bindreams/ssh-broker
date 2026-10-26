@@ -10,6 +10,11 @@
 //! ended with the job, exit code 0). `CREATE_BREAKAWAY_FROM_JOB` is passed when the caller's job allows
 //! breakaway (`JOB_OBJECT_LIMIT_BREAKAWAY_OK`) and not otherwise: in a job that does not allow it the
 //! call fails with `ERROR_ACCESS_DENIED`, which would cost the user their login.
+//!
+//! A caller can sit in a chain of nested jobs, and the query without a handle reads one job of it, so
+//! "the job allows it" is not the whole answer: an outer job can refuse what the one read allows.
+//! [`with_breakaway_fallback`] makes that refusal, and only that, cost the child its survival instead
+//! of the user their login.
 
 use std::path::Path;
 
@@ -31,6 +36,8 @@ use crate::winutil::OwnedHandle;
 const ERROR_FILENAME_EXCED_RANGE: u32 = 206;
 /// `ERROR_LOGON_TYPE_NOT_GRANTED`: the account does not hold the right for this logon type.
 const ERROR_LOGON_TYPE_NOT_GRANTED: u32 = 1385;
+/// `ERROR_ACCESS_DENIED`: what a refused `CREATE_BREAKAWAY_FROM_JOB` is answered with.
+const ERROR_ACCESS_DENIED: u32 = 5;
 const PASSWORD_TOO_LONG: &str = "the password is too long for Windows.";
 
 /// The background agent the logon started. Dropping it closes the handle; the agent keeps running.
@@ -139,6 +146,29 @@ pub fn creation_flags(job: &CallerJob) -> PROCESS_CREATION_FLAGS {
     }
 }
 
+/// Make `call` with `flags`. If it asked for breakaway and was refused with `ERROR_ACCESS_DENIED`, make
+/// it once more without; that answer is final.
+///
+/// Why this is right. The refusal comes at the child's creation, after Windows has checked the
+/// password: a wrong password is answered `ERROR_LOGON_FAILURE` (1326), not access denied, so a
+/// password that failed is not tried twice (`tests/session_on_demand_windows.rs` pins it). A refusal of
+/// another cause (an account that may not run the program) is answered the same way by the second
+/// call, whose answer is the one the user sees. The second call is what every logon was before the flag
+/// existed: the child lives in the caller's job, as long as the job does. It is one fallback on one
+/// refusal, not a retry: nothing repeats.
+fn with_breakaway_fallback<T>(
+    flags: PROCESS_CREATION_FLAGS,
+    mut call: impl FnMut(PROCESS_CREATION_FLAGS) -> Result<T, LogonFailure>,
+) -> Result<T, LogonFailure> {
+    match call(flags) {
+        Err(failure) if failure.code == ERROR_ACCESS_DENIED && flags.0 & CREATE_BREAKAWAY_FROM_JOB.0 != 0 => {
+            tracing::info!("a job around this process refuses breakaway; starting the session inside it");
+            call(PROCESS_CREATION_FLAGS(flags.0 & !CREATE_BREAKAWAY_FROM_JOB.0))
+        }
+        other => other,
+    }
+}
+
 fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(std::iter::once(0)).collect()
 }
@@ -162,24 +192,29 @@ pub fn start_background_agent(
     };
     let mut info = PROCESS_INFORMATION::default();
     let user = wide(&account.name);
-    let flags = creation_flags(&CallerJob::of_this_process());
+    let job = CallerJob::of_this_process();
+    let flags = creation_flags(&job);
+    tracing::info!("logon call: caller's job {job:?}, creation flags {:#x}", flags.0);
     let result = password.with_nul(|password| {
-        // SAFETY: every pointer is to a local that outlives the call; `password` is the wiped copy.
-        unsafe {
-            CreateProcessWithLogonW(
-                PCWSTR(user.as_ptr()),
-                PCWSTR(wide(".").as_ptr()),
-                PCWSTR(password.as_ptr()),
-                LOGON_WITH_PROFILE,
-                PCWSTR(exe_w.as_ptr()),
-                Some(PWSTR(command.as_mut_ptr())),
-                flags,
-                None,
-                directory.as_ref().map_or(PCWSTR::null(), |dir| PCWSTR(dir.as_ptr())),
-                &startup,
-                &mut info,
-            )
-        }
+        with_breakaway_fallback(flags, |flags| {
+            // SAFETY: every pointer is to a local that outlives the call; `password` is the wiped copy.
+            unsafe {
+                CreateProcessWithLogonW(
+                    PCWSTR(user.as_ptr()),
+                    PCWSTR(wide(".").as_ptr()),
+                    PCWSTR(password.as_ptr()),
+                    LOGON_WITH_PROFILE,
+                    PCWSTR(exe_w.as_ptr()),
+                    Some(PWSTR(command.as_mut_ptr())),
+                    flags,
+                    None,
+                    directory.as_ref().map_or(PCWSTR::null(), |dir| PCWSTR(dir.as_ptr())),
+                    &startup,
+                    &mut info,
+                )
+            }
+            .map_err(|e| LogonFailure::from_error(&e))
+        })
     });
     match result {
         Ok(()) => {
@@ -188,7 +223,7 @@ pub fn start_background_agent(
                 process: OwnedHandle(info.hProcess),
             })
         }
-        Err(e) => Err(LogonFailure::from_error(&e)),
+        Err(failure) => Err(failure),
     }
 }
 
