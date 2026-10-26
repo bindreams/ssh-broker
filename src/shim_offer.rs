@@ -213,6 +213,26 @@ pub fn wait_for_agent<C>(
     )
 }
 
+/// What the wait for the shim's own agent found, corrected for a start race.
+///
+/// Two first connections of one user each log on and each start an agent. The agent that finds the
+/// session's slot taken exits 0 at once, and the winner may not be listening yet, so "my agent ended" is
+/// not "nobody serves". When the own agent ended (or the lock's holder did), `others` looks for any
+/// other agent of the user: one that serves is used, one that is starting is waited for, and only when
+/// none exists is the end reported.
+pub fn serve_after_own_agent<C>(
+    own: Served<C>,
+    others: impl FnOnce() -> anyhow::Result<Starting<C>>,
+) -> anyhow::Result<Served<C>> {
+    if let Served::Connected(_) = own {
+        return Ok(own);
+    }
+    Ok(match others()? {
+        Starting::Served(connected) => Served::Connected(connected),
+        Starting::No | Starting::Gone => own,
+    })
+}
+
 // the shim's hook -----
 
 /// A shim that found no agent, as the rescue sees it.
@@ -391,9 +411,16 @@ fn settle(started: Started) -> Result<Socket, String> {
             .map(|location| location.logs_dir())
             .unwrap_or_default()
     };
-    let watch = SocketWatch::for_current_user().map_err(|e| text::start_failed(&format!("{e:#}")))?;
-    let served = wait_for_agent(watch, agent.process.0, |location| afunix::connect(&location.path).ok())
-        .map_err(|e| text::start_failed(&format!("{e:#}")))?;
+    let failed = |e: anyhow::Error| text::start_failed(&format!("{e:#}"));
+    let watch = SocketWatch::for_current_user().map_err(failed)?;
+    let served =
+        wait_for_agent(watch, agent.process.0, |location| afunix::connect(&location.path).ok()).map_err(failed)?;
+    let served = serve_after_own_agent(served, || {
+        let location = crate::userdir::current_socket_location()?;
+        let user = Sid::current_user()?;
+        await_starting_agent(&location, &provision::canonical_exe(), &user)
+    })
+    .map_err(failed)?;
     match served {
         Served::Connected(socket) => Ok(socket),
         Served::Ended { code } => Err(text::agent_ended(code, &logs())),

@@ -355,3 +355,44 @@ mod wait_for_agent_on_files {
         );
     }
 }
+
+// after the shim's own agent -----
+
+/// Two first connections start two agents; the one that finds the session's slot taken exits 0 at once,
+/// and the winner may not be listening yet. The shim of the loser then waits for the winner and uses it.
+#[test]
+fn an_own_agent_that_left_while_another_one_starts_is_replaced_by_the_one_that_serves() {
+    let served = serve_after_own_agent(Served::Ended { code: 0 }, || Ok(Starting::Served("winner"))).unwrap();
+    assert_eq!(served, Served::Connected("winner"));
+}
+
+#[test]
+fn an_own_agent_that_left_with_no_other_keeps_its_exit_code() {
+    for others in [Starting::No, Starting::Gone] {
+        let served = serve_after_own_agent(Served::Ended { code: 66 }, || Ok(others)).unwrap();
+        assert_eq!(served, Served::Ended::<&str> { code: 66 });
+    }
+}
+
+#[test]
+fn a_lock_holder_that_left_with_no_other_is_still_gone() {
+    let served = serve_after_own_agent(Served::Gone, || Ok(Starting::<&str>::No)).unwrap();
+    assert_eq!(served, Served::Gone);
+}
+
+#[test]
+fn an_own_agent_that_serves_is_used_without_looking_for_another() {
+    let served = serve_after_own_agent(Served::Connected("mine"), || -> anyhow::Result<Starting<&str>> {
+        panic!("nothing else needs to be looked for")
+    })
+    .unwrap();
+    assert_eq!(served, Served::Connected("mine"));
+}
+
+#[test]
+fn a_failing_look_for_another_agent_is_an_error() {
+    let result = serve_after_own_agent(Served::Ended { code: 0 }, || -> anyhow::Result<Starting<&str>> {
+        anyhow::bail!("cannot look")
+    });
+    assert!(result.is_err());
+}

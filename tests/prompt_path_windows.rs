@@ -31,6 +31,9 @@ mod pty_client;
 #[path = "common/stand_in.rs"]
 mod stand_in;
 
+use ssh_broker::winutil::OwnedHandle;
+use windows::Win32::System::Threading::{GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+
 use account_fixture::Account;
 use agent_conn::AgentConn;
 use pty_client::PtyRun;
@@ -76,12 +79,48 @@ fn say(run: &mut PtyRun, marker: &str) {
 fn log_in(run: &mut PtyRun, password: &str) {
     run.read_until(PROMPT);
     run.type_line(password);
+    expect_session(run);
+}
+
+/// Wait for the shell that follows a submitted password, and fail if the shim fell back to a plain one.
+fn expect_session(run: &mut PtyRun) {
     run.read_until(SHELL_PROMPT);
     let shown = run.text();
     assert!(
         !shown.contains(COST),
         "the login fell back to a plain shell instead of starting a session:
 {shown}"
+    );
+}
+
+/// The shell is the session's: the user's DPAPI works in it, which the plain shell of the shim's network
+/// token cannot do (the cost line says so). The prompt does not tell the two apart.
+fn assert_relayed(run: &mut PtyRun) {
+    run.type_line(
+        "try { [void][Security.Cryptography.ProtectedData]::Protect([byte[]](1,2,3), $null, 'CurrentUser'); \
+         Write-Output ('dpapi' + '-ok') } catch { Write-Output ('dpapi' + '-failed ' + $_) }",
+    );
+    let found = run.read_until_any(&["dpapi-ok", "dpapi-failed"]);
+    assert_eq!(
+        found,
+        0,
+        "the shell is not the session's (DPAPI failed):\n{}",
+        run.text()
+    );
+}
+
+/// Print whether the shell can make a named kernel object: a PowerShell prompt's PSReadLine makes one
+/// and crashes without it. A measurement, not a check.
+fn measure_named_objects(run: &mut PtyRun, which: &str) {
+    run.type_line(
+        "try { [void][Threading.Mutex]::new($false, 'sbprobe' + $PID); Write-Output ('mutex' + '-ok') } \
+         catch { Write-Output ('mutex' + '-failed ' + $_.Exception.GetType().Name) }",
+    );
+    let found = run.read_until_any(&["mutex-ok", "mutex-failed"]);
+    let crashed = run.text().contains("Oops, something went wrong");
+    eprintln!(
+        "named objects in {which}: a mutex can{} be made; PSReadLine crashed at its first prompt: {crashed}",
+        if found == 0 { "" } else { "not" }
     );
 }
 
@@ -109,6 +148,7 @@ fn prompt_then_password_relays_into_a_background_session() {
          Write-Output ('dpapi' + '-ok') } catch { Write-Output ('dpapi' + '-failed ' + $_) }",
     );
     run.read_until("dpapi-ok");
+    measure_named_objects(&mut run, "a single relayed session");
     // Links a non-administrator made resolve (no RedirectionGuard on the shell).
     run.type_line(
         "New-Item -ItemType Junction -Path \"$env:TEMP\\sbjunction\" -Target $env:USERPROFILE | Out-Null; \
@@ -244,7 +284,9 @@ fn empty_enter_reprompts() {
 }
 
 /// Elevated (CI only). Review Focus 3: a password with a character outside the BMP, typed as UTF-8
-/// the way a terminal sends it, reaches Windows as the exact UTF-16.
+/// the way a terminal sends it, reaches Windows as the exact UTF-16: the login is the session's, not
+/// the plain shell that follows a refused password. A console delivers such a character on the Alt
+/// key-up record, which the prompt must read.
 #[test]
 fn password_with_non_bmp_characters_logs_on_through_the_prompt() {
     let _machine = machine::shared();
@@ -254,7 +296,8 @@ fn password_with_non_bmp_characters_logs_on_through_the_prompt() {
     let mut run = start_run(&kit, &account);
     run.read_until(PROMPT);
     run.send_raw(&format!("{secret}\r"));
-    run.read_until(SHELL_PROMPT);
+    expect_session(&mut run);
+    assert_relayed(&mut run);
     say(&mut run, "session-up");
     leave(&mut run);
 }
@@ -317,9 +360,9 @@ fn login_after_logout_prompts_again() {
     leave(&mut second);
 }
 
-/// Elevated (CI only). Review Focus 2: two first connections of one new account at once. Each may
-/// prompt and log on; exactly one agent serves; each ends in a shell, either the session or a plain one
-/// with the reason, and neither hangs.
+/// Elevated (CI only). Review Focus 2: two first connections of one new account at once. Each prompts and
+/// logs on, so two agents start; exactly one serves, both consoles end in the session's shell (DPAPI
+/// works in it) as children of that one agent, neither hangs, and the agent outlives both consoles.
 #[test]
 fn two_simultaneous_first_connections_end_with_one_agent_and_no_hang() {
     let _machine = machine::shared();
@@ -332,30 +375,85 @@ fn two_simultaneous_first_connections_end_with_one_agent_and_no_hang() {
     for run in &mut runs {
         run.type_line(&account.password);
     }
+    let mut parents = Vec::new();
     for run in &mut runs {
-        run.read_until(SHELL_PROMPT);
+        expect_session(run);
+        assert_relayed(run);
         say(run, "made-it");
-        let text = run.text();
-        let relayed = !text.contains(COST);
-        assert!(
-            relayed || text.contains("ssh-broker: "),
-            "a plain shell must say why:\n{text}"
-        );
+        measure_named_objects(run, "one of two simultaneous relayed sessions");
+        parents.push(parent_pid(run));
     }
+    // One agent served both shells: the parent of each is the same process, and it is an agent of this
+    // account. Holding it open from here on lets its exit code be read if it ends.
+    assert_eq!(
+        parents[0],
+        parents[1],
+        "{}",
+        report("the two shells have different parents.", &runs, &account)
+    );
+    let agent = AgentProcess::open(parents[0]);
+    let line = command_line_of(parents[0]);
+    assert!(
+        line.contains("agent --background") && line.contains(&account.sid_text),
+        "{}",
+        report(
+            &format!(
+                "the parent of the shells (pid {}) is not this account's agent: {line}",
+                parents[0]
+            ),
+            &runs,
+            &account
+        )
+    );
+    let agents = agent_count(&account);
+    assert_eq!(
+        agents,
+        1,
+        "{}",
+        report(
+            &format!("{agents} agents of this account run while both shells are connected."),
+            &runs,
+            &account
+        )
+    );
+
     for run in &mut runs {
         leave(run);
     }
-    // Exactly one agent of this account is left running: the loser of the start race has gone.
-    let lines = command_lines();
-    let agents = lines
-        .lines()
-        .filter(|line| line.contains("agent --background") && line.contains(&account.sid_text))
-        .count();
-    if agents != 1 {
-        let location = socket_loc::for_profile(account.profile()).unwrap();
-        let ours: Vec<&str> = lines.lines().filter(|line| line.contains("ssh-broker")).collect();
+    // The agent outlives its connections: the loser of the start race is the one that went.
+    if let Some(code) = agent.exit_code() {
         panic!(
-            "one agent must serve; {agents} of {} do.
+            "{}",
+            report(
+                &format!(
+                    "the agent (pid {}) ended after both consoles left, with exit code {code:#x}.",
+                    parents[0]
+                ),
+                &runs,
+                &account
+            )
+        );
+    }
+    let agents = agent_count(&account);
+    assert_eq!(
+        agents,
+        1,
+        "{}",
+        report(
+            &format!("{agents} agents of this account run after both consoles left."),
+            &runs,
+            &account
+        )
+    );
+}
+
+/// The failure report of the two-consoles test: what happened, and what each console showed.
+fn report(why: &str, runs: &[PtyRun; 2], account: &Account) -> String {
+    let location = socket_loc::for_profile(account.profile()).unwrap();
+    let lines = command_lines();
+    let ours: Vec<&str> = lines.lines().filter(|line| line.contains("ssh-broker")).collect();
+    format!(
+        "{why}
 ssh-broker processes:
 {}
 
@@ -366,16 +464,84 @@ second console:
 {}
 
 logs:
+{}
+
+application crash events:
 {}",
-            account.sid_text,
-            ours.join(
-                "
-"
-            ),
-            runs[0].text(),
-            runs[1].text(),
-            stand_in::read_logs(&location)
-        );
+        ours.join("\n"),
+        runs[0].text(),
+        runs[1].text(),
+        stand_in::read_logs(&location),
+        crash_events()
+    )
+}
+
+/// The pid of the shell's parent, which is the agent that hosts it.
+fn parent_pid(run: &mut PtyRun) -> u32 {
+    run.type_line("Write-Output ('parent-' + 'pid=' + (Get-Process -Id $PID).Parent.Id + ';do' + 'ne')");
+    run.read_until(";done");
+    let text = run.text();
+    let after = text.rsplit("parent-pid=").next().unwrap_or_default();
+    let digits: String = after.chars().take_while(char::is_ascii_digit).collect();
+    digits
+        .parse()
+        .unwrap_or_else(|_| panic!("the shell did not report its parent:\n{text}"))
+}
+
+/// How many background agents of `account` run.
+fn agent_count(account: &Account) -> usize {
+    command_lines()
+        .lines()
+        .filter(|line| line.contains("agent --background") && line.contains(&account.sid_text))
+        .count()
+}
+
+/// The command line of process `pid`.
+fn command_line_of(pid: u32) -> String {
+    let script = format!("(Get-CimInstance Win32_Process -Filter 'ProcessId={pid}').CommandLine");
+    let out = desktop::output(std::process::Command::new("powershell").args([
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        &script,
+    ]))
+    .unwrap();
+    String::from_utf8_lossy(&out.stdout).trim().to_owned()
+}
+
+/// Crash reports of the last while, from the Application log (read only): what a process that vanished
+/// without a line in its own log left behind.
+fn crash_events() -> String {
+    let out = desktop::output(std::process::Command::new("wevtutil").args([
+        "qe",
+        "Application",
+        "/q:*[System[(EventID=1000 or EventID=1001)]]",
+        "/c:6",
+        "/rd:true",
+        "/f:text",
+    ]))
+    .unwrap();
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// A handle on a process opened while it runs, so that its exit code can be read after it ends.
+struct AgentProcess(OwnedHandle);
+
+impl AgentProcess {
+    fn open(pid: u32) -> AgentProcess {
+        // SAFETY: a plain open by id; the handle is closed by `OwnedHandle`.
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }
+            .unwrap_or_else(|e| panic!("open the agent (pid {pid}): {e}"));
+        AgentProcess(OwnedHandle(handle))
+    }
+
+    /// The exit code, or `None` while the process runs.
+    fn exit_code(&self) -> Option<u32> {
+        const STILL_ACTIVE: u32 = 259;
+        let mut code = 0u32;
+        // SAFETY: a live handle and an out-pointer.
+        unsafe { GetExitCodeProcess(self.0.0, &mut code) }.expect("read the agent's exit code");
+        (code != STILL_ACTIVE).then_some(code)
     }
 }
 
