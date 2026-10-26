@@ -180,6 +180,12 @@ impl Sid {
         describe_sid(self.as_psid())
     }
 
+    /// `(domain, name)` the account database holds for this SID.
+    pub fn account(&self) -> anyhow::Result<(String, String)> {
+        account_of_sid(self.as_psid())
+            .ok_or_else(|| anyhow::anyhow!("no account is known by the SID {}", self.describe()))
+    }
+
     /// The SID in SDDL string form ("S-1-5-…"), for embedding in a security descriptor.
     pub fn to_sddl(&self) -> anyhow::Result<String> {
         sid_to_string(self.as_psid())
@@ -204,6 +210,20 @@ fn describe_sid(psid: PSID) -> String {
             return "<none>".into();
         }
         let text = sid_to_string(psid).unwrap_or_else(|_| "<unprintable SID>".into());
+        let Some((domain, name)) = account_of_sid(psid) else {
+            return text;
+        };
+        if domain.is_empty() {
+            format!("{name} ({text})")
+        } else {
+            format!("{domain}\\{name} ({text})")
+        }
+    }
+}
+
+/// `(domain, name)` the account database holds for a valid `psid`, or `None` if it holds none.
+fn account_of_sid(psid: PSID) -> Option<(String, String)> {
+    unsafe {
         let (mut cch_name, mut cch_domain) = (0u32, 0u32);
         let mut sid_use = SID_NAME_USE(0);
         let _ = LookupAccountSidW(
@@ -216,11 +236,11 @@ fn describe_sid(psid: PSID) -> String {
             &mut sid_use,
         ); // size probe -> Err
         if cch_name == 0 {
-            return text;
+            return None;
         }
         let mut name = vec![0u16; cch_name as usize];
         let mut domain = vec![0u16; (cch_domain as usize).max(1)];
-        if LookupAccountSidW(
+        LookupAccountSidW(
             PCWSTR::null(),
             psid,
             Some(PWSTR(name.as_mut_ptr())),
@@ -229,17 +249,11 @@ fn describe_sid(psid: PSID) -> String {
             &mut cch_domain,
             &mut sid_use,
         )
-        .is_err()
-        {
-            return text;
-        }
-        let name = String::from_utf16_lossy(&name[..cch_name as usize]);
-        let domain = String::from_utf16_lossy(&domain[..cch_domain as usize]);
-        if domain.is_empty() {
-            format!("{name} ({text})")
-        } else {
-            format!("{domain}\\{name} ({text})")
-        }
+        .ok()?;
+        Some((
+            String::from_utf16_lossy(&domain[..cch_domain as usize]),
+            String::from_utf16_lossy(&name[..cch_name as usize]),
+        ))
     }
 }
 

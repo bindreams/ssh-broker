@@ -47,6 +47,7 @@ windows = { version = "0.62.2", features = [
     "Win32_System_Com",            # CoInitializeEx / CoCreateInstance for the Task Scheduler
     "Win32_System_Ole",            # ITaskService::Connect takes VARIANTs
     "Win32_System_Variant",
+    "Win32_System_WindowsProgramming", # GetComputerNameW: is an account local to this PC
     "Wdk_Foundation",
     "Wdk_Storage_FileSystem",       # NtOpenFile: open a directory for ACL inspection without SYNCHRONIZE
 ] }

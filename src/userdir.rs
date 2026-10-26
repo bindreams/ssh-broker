@@ -21,16 +21,22 @@ use crate::acl::{self, Sid};
 use crate::socket_loc::{self, SocketLocation};
 use crate::winutil::OwnedHandle;
 
-/// The profile directory of the account `token` belongs to. `token` needs `TOKEN_QUERY`.
+/// The account has no profile directory yet: it has never been signed on. Downcastable from the
+/// error of [`profile_dir_of_token`].
+#[derive(Debug, thiserror::Error)]
+#[error("the account has no profile directory (the size probe returned 0)")]
+pub struct NoProfile;
+
+/// The profile directory of the account `token` belongs to. `token` needs `TOKEN_QUERY`. An
+/// account without a profile fails with [`NoProfile`].
 pub fn profile_dir_of_token(token: HANDLE) -> anyhow::Result<PathBuf> {
     // Size probe: the first call fails with the needed length, in UTF-16 units with the NUL.
     let mut len = 0u32;
     // SAFETY: a null buffer with a zero length is the documented size probe.
     let _ = unsafe { GetUserProfileDirectoryW(token, None, &mut len) };
-    anyhow::ensure!(
-        len > 0,
-        "the account has no profile directory (the size probe returned 0)"
-    );
+    if len == 0 {
+        return Err(NoProfile.into());
+    }
     let mut buf = vec![0u16; len as usize];
     // SAFETY: `buf` holds `len` units, which is what the call is told.
     unsafe { GetUserProfileDirectoryW(token, Some(PWSTR(buf.as_mut_ptr())), &mut len) }

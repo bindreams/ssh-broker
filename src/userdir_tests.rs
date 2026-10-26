@@ -44,6 +44,15 @@ fn profile_dir_of_token_rejects_an_invalid_handle() {
     assert!(format!("{err:#}").contains("no profile directory"), "{err:#}");
 }
 
+/// A required length of 0 is the discriminator (measured: a never-logged-on account gets error
+/// 0x8007007a with length 0, an account with a profile the same error with a length), so a caller
+/// can tell "no profile yet" from every other failure.
+#[test]
+fn a_zero_length_probe_is_the_typed_no_profile_error() {
+    let err = profile_dir_of_token(HANDLE::default()).unwrap_err();
+    assert!(err.downcast_ref::<NoProfile>().is_some(), "{err:#}");
+}
+
 #[test]
 fn for_profile_limit_agrees_with_unix_addr() {
     // Pins `MAX_SOCKET_PATH_BYTES` to what `socket2` accepts on this platform.
