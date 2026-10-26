@@ -8,7 +8,7 @@
 
 /// `agent` subcommand entrypoint. Windows-only: the agent must run in the user's interactive
 /// session to confer RDP parity.
-pub fn run() -> anyhow::Result<()> {
+pub fn run(_args: crate::route::AgentArgs) -> anyhow::Result<()> {
     #[cfg(windows)]
     return start();
 
@@ -423,6 +423,7 @@ fn handle_connection_with(conn: socket2::Socket, hooks: Hooks) -> anyhow::Result
     match hs.mode {
         Mode::Pty => handle_pty(rx, fr, tx, &command, (hs.cols, hs.rows), cwd, hooks),
         Mode::Exec => handle_exec(rx, fr, tx, &command, cwd, hooks),
+        Mode::Logout => anyhow::bail!("this agent does not end sessions yet"),
     }
 }
 

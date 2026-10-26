@@ -233,3 +233,20 @@ fn read_one_frame_errors_on_eof_before_complete() {
     let mut fr = FrameReader::new();
     assert!(read_one_frame(&mut conn, &mut fr).is_err());
 }
+
+/// Reordering `Mode` would change the meaning of an installed agent's handshakes: a new variant goes last.
+#[test]
+fn mode_logout_encodes_after_exec() {
+    assert_eq!(postcard::to_stdvec(&Mode::Pty).unwrap(), [0]);
+    assert_eq!(postcard::to_stdvec(&Mode::Exec).unwrap(), [1]);
+    assert_eq!(postcard::to_stdvec(&Mode::Logout).unwrap(), [2]);
+}
+
+#[test]
+fn logout_handshake_roundtrips() {
+    let h = Handshake {
+        mode: Mode::Logout,
+        ..Handshake::pty_default()
+    };
+    assert_eq!(Handshake::decode(&h.encode().unwrap()).unwrap().mode, Mode::Logout);
+}

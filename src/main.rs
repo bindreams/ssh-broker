@@ -3,6 +3,7 @@
 //! Everything of substance lives in the library crate; this binary only decides which
 //! entry point argv selects. See `lib.rs` for the architecture.
 
+use ssh_broker::route::Verb;
 use ssh_broker::{Route, agent, cmdline, provision, route, shim};
 
 fn main() -> anyhow::Result<()> {
@@ -10,9 +11,22 @@ fn main() -> anyhow::Result<()> {
 
     match route(&args, &cmdline::current()) {
         Route::Shim { exec } => shim::run(exec),
-        Route::Agent => agent::run(),
+        Route::Agent(args) => agent::run(args),
+        Route::Usage(verb) => {
+            eprintln!("{}", usage(verb));
+            std::process::exit(2);
+        }
+        Route::Logout => anyhow::bail!("logout is not built yet"),
+        Route::AutoLogin(_) => anyhow::bail!("auto-login is not built yet"),
         Route::Apply => provision::apply(),
         Route::Verify => provision::verify(),
         Route::VerifyProbe => provision::verify_probe(),
+    }
+}
+
+fn usage(verb: Verb) -> &'static str {
+    match verb {
+        Verb::Agent => "usage: ssh-broker agent [--background [--ready-event <name>] [--expect-user <sid>]]",
+        Verb::Logout => "usage: ssh-broker logout",
     }
 }

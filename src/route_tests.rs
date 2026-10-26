@@ -3,7 +3,7 @@
 //! Each case is a whole command line, as sshd's `DefaultShell` launch produces it; the argv
 //! `route` receives is derived from it the way the C runtime would.
 
-use super::{Route, route};
+use super::{AgentArgs, AutoLoginArgs, BackgroundArgs, Route, Toggle, Verb, route};
 use crate::cmdline::{Encoding, RawExec, resolve_exec, split_args};
 
 fn route_line(line: &str) -> Route {
@@ -62,8 +62,111 @@ fn dash_c_with_an_empty_command_is_an_empty_exec() {
 }
 
 #[test]
-fn agent_verb_is_agent() {
-    assert_eq!(route_line("ssh-broker.exe agent"), Route::Agent);
+fn agent_alone_is_a_desktop_agent() {
+    assert_eq!(
+        route_line("ssh-broker.exe agent"),
+        Route::Agent(AgentArgs { background: None })
+    );
+}
+
+fn background(ready_event: Option<&str>, expect_user: Option<&str>) -> Route {
+    Route::Agent(AgentArgs {
+        background: Some(BackgroundArgs {
+            ready_event: ready_event.map(str::to_string),
+            expect_user: expect_user.map(str::to_string),
+        }),
+    })
+}
+
+#[test]
+fn agent_background_flags_parse() {
+    assert_eq!(route_line("ssh-broker.exe agent --background"), background(None, None));
+    assert_eq!(
+        route_line(r"ssh-broker.exe agent --background --ready-event Global\sb-ab --expect-user S-1-5-21-1-2-3-1001"),
+        background(Some(r"Global\sb-ab"), Some("S-1-5-21-1-2-3-1001"))
+    );
+    // Order does not matter, and the flags may precede each other.
+    assert_eq!(
+        route_line("ssh-broker.exe agent --background --expect-user S-1-5-18 --ready-event ev"),
+        background(Some("ev"), Some("S-1-5-18"))
+    );
+    assert_eq!(
+        route_line("ssh-broker.exe agent --background --expect-user S-1-5-18"),
+        background(None, Some("S-1-5-18"))
+    );
+}
+
+#[test]
+fn agent_unknown_flag_is_not_the_shim() {
+    for line in [
+        "ssh-broker.exe agent --ready-event ev",
+        "ssh-broker.exe agent --expect-user S-1-5-18",
+        "ssh-broker.exe agent --bogus",
+        "ssh-broker.exe agent stray",
+        "ssh-broker.exe agent --background --bogus",
+        "ssh-broker.exe agent --background --ready-event",
+        "ssh-broker.exe agent --background --expect-user",
+        "ssh-broker.exe agent --background --ready-event a --ready-event b",
+        "ssh-broker.exe agent --background --expect-user a --expect-user b",
+        "ssh-broker.exe agent --background --background",
+        "ssh-broker.exe agent --background stray",
+    ] {
+        assert_eq!(route_line(line), Route::Usage(Verb::Agent), "{line}");
+    }
+}
+
+#[test]
+fn logout_routes() {
+    assert_eq!(route_line("ssh-broker.exe logout"), Route::Logout);
+}
+
+#[test]
+fn logout_takes_no_arguments() {
+    assert_eq!(route_line("ssh-broker.exe logout now"), Route::Usage(Verb::Logout));
+}
+
+#[test]
+fn a_flag_name_is_not_a_flag_value() {
+    assert_eq!(
+        route_line("ssh-broker.exe agent --background --ready-event --expect-user x"),
+        Route::Usage(Verb::Agent)
+    );
+}
+
+#[test]
+fn auto_login_on_off_account_and_invalid() {
+    let args = |toggle, account: Option<&str>| {
+        Route::AutoLogin(Some(AutoLoginArgs {
+            toggle,
+            account: account.map(str::to_string),
+        }))
+    };
+    assert_eq!(route_line("ssh-broker.exe auto-login on"), args(Toggle::On, None));
+    assert_eq!(route_line("ssh-broker.exe auto-login off"), args(Toggle::Off, None));
+    assert_eq!(
+        route_line(r#"ssh-broker.exe auto-login on "Zoe Muller""#),
+        args(Toggle::On, Some("Zoe Muller"))
+    );
+    assert_eq!(
+        route_line("ssh-broker.exe auto-login off alice"),
+        args(Toggle::Off, Some("alice"))
+    );
+    for line in [
+        "ssh-broker.exe auto-login",
+        "ssh-broker.exe auto-login maybe",
+        "ssh-broker.exe auto-login on a b",
+        "ssh-broker.exe auto-login --on",
+    ] {
+        assert_eq!(route_line(line), Route::AutoLogin(None), "{line}");
+    }
+}
+
+/// `ssh host logout` arrives as `-c logout`, like every other verb name.
+#[test]
+fn a_c_flag_after_a_verb_is_still_exec() {
+    assert_eq!(command("ssh-broker.exe -c logout"), some("logout"));
+    assert_eq!(command("ssh-broker.exe -c \"auto-login on\""), some("auto-login on"));
+    assert_eq!(command("ssh-broker.exe -c agent"), some("agent"));
 }
 
 #[test]
@@ -77,7 +180,7 @@ fn apply_and_verify_verbs() {
 /// client command, whatever the command is called.
 #[test]
 fn a_command_named_like_a_verb_is_still_shim_exec() {
-    for verb in ["agent", "apply", "verify", "verify-probe"] {
+    for verb in ["agent", "apply", "verify", "verify-probe", "logout", "auto-login"] {
         assert_eq!(command(&format!("ssh-broker.exe -c {verb}")), some(verb));
         assert_eq!(
             command(&format!(r#"ssh-broker.exe -c "{verb} --x y""#)),

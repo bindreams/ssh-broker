@@ -15,11 +15,54 @@ pub enum Route {
     Shim {
         exec: Option<RawExec>,
     },
-    Agent,
+    /// The per-user agent: in the user's desktop session, or with `--background`.
+    Agent(AgentArgs),
+    /// A known verb with arguments it does not take: print its usage and stop. The verb is
+    /// known, so this never falls through to the shim.
+    Usage(Verb),
+    /// End the invoking user's background session.
+    Logout,
+    /// `auto-login on|off [<account>]`; `None` when the arguments are not that: print the usage.
+    AutoLogin(Option<AutoLoginArgs>),
     Apply,
     Verify,
     /// Hidden: the parity-probe child the agent spawns in session 1 (used by `verify`).
     VerifyProbe,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verb {
+    Agent,
+    Logout,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct AgentArgs {
+    /// `Some` for `agent --background`.
+    pub background: Option<BackgroundArgs>,
+}
+
+/// The flags of `agent --background`, which the shim passes when it starts the agent through a
+/// logon. Each is optional here; `agent_background::check_start` decides what a start needs.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct BackgroundArgs {
+    /// Name of the event to signal once the socket folder exists.
+    pub ready_event: Option<String>,
+    /// SID text the agent's own token must have.
+    pub expect_user: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Toggle {
+    On,
+    Off,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct AutoLoginArgs {
+    pub toggle: Toggle,
+    /// The account to act on; the invoking user when absent.
+    pub account: Option<String>,
 }
 
 /// Dispatch `args` (the arguments after the program name). A known verb in first position
@@ -32,7 +75,10 @@ pub enum Route {
 /// `args` reports; if it does not, the command is `args[1..]` joined with spaces.
 pub fn route(args: &[String], command_line: &str) -> Route {
     match args.first().map(String::as_str) {
-        Some("agent") => Route::Agent,
+        Some("agent") => agent_args(&args[1..]).map_or(Route::Usage(Verb::Agent), Route::Agent),
+        Some("logout") if args.len() == 1 => Route::Logout,
+        Some("logout") => Route::Usage(Verb::Logout),
+        Some("auto-login") => Route::AutoLogin(auto_login_args(&args[1..])),
         Some("apply") => Route::Apply,
         Some("verify") => Route::Verify,
         Some("verify-probe") => Route::VerifyProbe,
@@ -52,6 +98,48 @@ pub fn route(args: &[String], command_line: &str) -> Route {
         }
         _ => Route::Shim { exec: None },
     }
+}
+
+/// `[]` or `--background [--ready-event <name>] [--expect-user <sid>]`, each flag at most once. A
+/// flag is accepted only after `--background`.
+fn agent_args(rest: &[String]) -> Option<AgentArgs> {
+    let Some((first, flags)) = rest.split_first() else {
+        return Some(AgentArgs::default());
+    };
+    if first != "--background" {
+        return None;
+    }
+    let mut background = BackgroundArgs::default();
+    let mut flags = flags.iter();
+    while let Some(flag) = flags.next() {
+        let slot = match flag.as_str() {
+            "--ready-event" => &mut background.ready_event,
+            "--expect-user" => &mut background.expect_user,
+            _ => return None,
+        };
+        let value = flags.next().filter(|value| !value.starts_with("--"))?;
+        if slot.replace(value.clone()).is_some() {
+            return None;
+        }
+    }
+    Some(AgentArgs {
+        background: Some(background),
+    })
+}
+
+/// `on|off [<account>]`.
+fn auto_login_args(rest: &[String]) -> Option<AutoLoginArgs> {
+    let (toggle, account) = match rest {
+        [toggle] => (toggle, None),
+        [toggle, account] if !account.starts_with('-') => (toggle, Some(account.clone())),
+        _ => return None,
+    };
+    let toggle = match toggle.as_str() {
+        "on" => Toggle::On,
+        "off" => Toggle::Off,
+        _ => return None,
+    };
+    Some(AutoLoginArgs { toggle, account })
 }
 
 #[cfg(test)]
