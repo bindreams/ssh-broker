@@ -228,7 +228,9 @@ fn logon_with_seclogon_stopped_returns_windows_reason() {
     let kit = Kit::new("m7s");
     let account = Account::create("m7s", true);
     let _seclogon = SeclogonGuard::engage(false);
-    let (event, name) = ReadyEvent::create().unwrap();
+    // The agent runs as the fixture account, so the event names that account, not this administrator.
+    let name = ready::generate_name().unwrap();
+    let event = ReadyEvent::create_named(&name, &account.sid_text).unwrap();
     let password = password::password(&account.password);
     match logon::start_background_agent(&account_of(&account), &password, &kit.exe, &name) {
         Ok(started) => {
@@ -421,6 +423,10 @@ fn logout_ends_every_process_of_the_logon_session() {
 
     let reply = logout_from_inside(&kit, &agent);
     assert_eq!(reply.exit, Some(0), "stderr: {}", reply.stderr);
+    // The agent ends after every connection has finished, and a connection finishes when its client
+    // closes it. The shim does that on the exit code; this client must too.
+    shell.read_to_end();
+    drop(shell);
     for (pid, process) in &held {
         bounded_wait::wait_for_exit(
             process.0,

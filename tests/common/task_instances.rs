@@ -28,10 +28,12 @@ const TASK_NOT_RUNNING: HRESULT = HRESULT(0x8004_130Bu32 as i32);
 /// its expiry fails the test naming the task and the process.
 pub fn wait_until_none(name: &str, bound: Duration) {
     let millis = u32::try_from(bound.as_millis()).expect("a bound shorter than INFINITE");
-    // SAFETY: COM is initialised for this call and released before it returns; the interfaces are
-    // used on this thread only.
+    // SAFETY: COM is initialised for this call; the interfaces are used on this thread only.
     unsafe {
         CoInitializeEx(None, COINIT_MULTITHREADED).ok().expect("initialise COM");
+        // Declared before every interface, so dropped after all of them: releasing an interface after
+        // `CoUninitialize` is an access violation.
+        let _com = ComScope;
         let service: ITaskService =
             CoCreateInstance(&TaskScheduler, None, CLSCTX_INPROC_SERVER).expect("create the Task Scheduler service");
         let none = VARIANT::default();
@@ -74,6 +76,15 @@ pub fn wait_until_none(name: &str, bound: Duration) {
                 }
             }
         }
-        CoUninitialize();
+    }
+}
+
+/// Uninitialises COM on this thread when dropped.
+struct ComScope;
+
+impl Drop for ComScope {
+    fn drop(&mut self) {
+        // SAFETY: paired with the `CoInitializeEx` on this thread that made it.
+        unsafe { CoUninitialize() };
     }
 }

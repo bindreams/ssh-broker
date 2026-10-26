@@ -180,6 +180,13 @@ fn apply_upgrade_ends_a_background_session_and_restarts_auto_login() {
         .spawn()
         .expect("start a shim");
 
+    // A state check, not a wait: the shim runs for as long as its command does, and holds the exe from
+    // its creation. If it has ended, the copy below has nothing to fail on.
+    assert!(
+        shim.try_wait().unwrap().is_none(),
+        "the shim ended by itself before apply ran, so it cannot hold the exe"
+    );
+
     // The new build: the copy of this exe. It cannot replace the installed one while the shim runs.
     let output = apply(broker);
     let text = format!(
@@ -189,7 +196,8 @@ fn apply_upgrade_ends_a_background_session_and_restarts_auto_login() {
     );
     assert!(
         !output.status.success(),
-        "the shim holds the exe, so the copy fails:\n{text}"
+        "the shim holds the exe, so the copy fails (shim after apply: {:?}):\n{text}",
+        shim.try_wait()
     );
     assert!(
         text.contains("in use"),
