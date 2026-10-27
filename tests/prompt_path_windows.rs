@@ -32,7 +32,9 @@ mod pty_client;
 mod stand_in;
 
 use ssh_broker::winutil::OwnedHandle;
-use windows::Win32::System::Threading::{GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+use windows::Win32::System::Threading::{
+    GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+};
 
 use account_fixture::Account;
 use agent_conn::AgentConn;
@@ -397,9 +399,13 @@ fn login_after_logout_prompts_again() {
     let account = Account::create("pp11", true);
     let mut first = start_run(&kit, &account);
     log_in(&mut first, &account.password);
+    let agent = AgentProcess::open(parent_pid(&mut first));
     first.type_line(&format!("& '{}' logout", kit.exe.display()));
     first.read_until("ending your background session.");
     first.finish();
+    // The login that follows is the one after the session ended: a login that arrives while the agent
+    // is still draining is answered "ending", not prompted (that answer has its own unit test).
+    agent.wait_for_exit();
 
     let mut second = start_run(&kit, &account);
     log_in(&mut second, &account.password);
@@ -599,14 +605,25 @@ fn crash_events() -> String {
 }
 
 /// A handle on a process opened while it runs, so that its exit code can be read after it ends.
-struct AgentProcess(OwnedHandle);
+struct AgentProcess(OwnedHandle, u32);
 
 impl AgentProcess {
     fn open(pid: u32) -> AgentProcess {
         // SAFETY: a plain open by id; the handle is closed by `OwnedHandle`.
-        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE, false, pid) }
             .unwrap_or_else(|e| panic!("open the agent (pid {pid}): {e}"));
-        AgentProcess(OwnedHandle(handle))
+        AgentProcess(OwnedHandle(handle), pid)
+    }
+
+    /// Wait for the process to exit; a process that does not fails the test, naming it.
+    fn wait_for_exit(&self) {
+        bounded_wait::wait_for_exit(
+            self.0.0,
+            self.1,
+            "the agent after logout",
+            bounded_wait::CHILD_EXIT_BOUND,
+            &[],
+        );
     }
 
     /// The exit code, or `None` while the process runs.

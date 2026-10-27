@@ -98,11 +98,13 @@ impl Control {
             state.ending = true;
             (first, state.sessions.iter().map(|(_, kill)| Arc::clone(kill)).collect())
         };
-        for kill in killers {
-            kill();
-        }
+        // Before the shells end: a user who sees one end and logs in again should find no listener,
+        // not an agent that is on its way out.
         if first {
             (self.waker)();
+        }
+        for kill in killers {
+            kill();
         }
     }
 }

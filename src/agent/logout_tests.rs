@@ -252,6 +252,24 @@ fn ending_wakes_the_accept_loop_once_however_many_logouts_ask() {
 }
 
 #[test]
+fn the_accept_loop_is_woken_before_the_shells_are_ended() {
+    // The listener should be gone, or going, by the time a user sees their shell end and logs in again.
+    let events = Arc::new(Mutex::new(Vec::<&str>::new()));
+    let control = {
+        let events = Arc::clone(&events);
+        Control::new(true, Connections::new()).with_waker(move || events.lock().unwrap().push("woken"))
+    };
+    let _session = control
+        .register({
+            let events = Arc::clone(&events);
+            Arc::new(move || events.lock().unwrap().push("killed"))
+        })
+        .unwrap();
+    handle_logout(&mut Closed, &mut Vec::new(), &control, || {}).unwrap();
+    assert_eq!(*events.lock().unwrap(), ["woken", "killed"]);
+}
+
+#[test]
 fn the_accept_loop_is_woken_after_the_flag_is_up() {
     // A loop woken before the flag is raised would look, find nothing to stop for and accept again.
     let seen = Arc::new(Mutex::new(None));
