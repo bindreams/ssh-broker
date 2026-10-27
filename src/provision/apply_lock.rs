@@ -22,6 +22,10 @@ pub struct ApplyLock {
 /// at `pending_path`. The record is read only after the lock is held, so it cannot be one a
 /// running `apply` is about to change.
 ///
+/// The lock file is private to SYSTEM and Administrators ([`crate::acl::ensure_admin_only_file`]),
+/// made so or checked to be so before the lock is asked for: a lock any local user could open could
+/// be held by one for ever, and `apply` and the boot self-heal would wait on it without end.
+///
 /// `on_wait` runs once, after the lock was found held and before the wait begins. The wait has no
 /// limit: the holder is an `apply` that exists, and the system ends the lock if it dies.
 pub fn acquire_and_load(
@@ -29,6 +33,18 @@ pub fn acquire_and_load(
     pending_path: &Path,
     on_wait: impl FnOnce(),
 ) -> anyhow::Result<(ApplyLock, Vec<String>)> {
+    acquire_and_load_with(crate::acl::ensure_admin_only_file, lock_path, pending_path, on_wait)
+}
+
+/// [`acquire_and_load`] with the making of the lock file as a parameter, so a test can see that it
+/// comes first and needs no elevation.
+fn acquire_and_load_with(
+    make_private: impl FnOnce(&Path) -> anyhow::Result<()>,
+    lock_path: &Path,
+    pending_path: &Path,
+    on_wait: impl FnOnce(),
+) -> anyhow::Result<(ApplyLock, Vec<String>)> {
+    make_private(lock_path)?;
     let lock = ApplyLock {
         _lock: UserLock::acquire(lock_path, on_wait)?,
     };

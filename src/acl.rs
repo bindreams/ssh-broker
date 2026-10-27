@@ -58,6 +58,9 @@ use windows::core::{BOOL, HRESULT, PCWSTR, PWSTR};
 
 use crate::winutil::OwnedHandle;
 
+mod admin_file;
+pub use admin_file::{admin_only_file_problem, ensure_admin_only_file};
+
 /// ACCESS_ALLOWED_ACE_TYPE (winnt.h) — stored raw in `ACE_HEADER.AceType` (a `u8`).
 const ACE_TYPE_ALLOWED: u8 = 0;
 

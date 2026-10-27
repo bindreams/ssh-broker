@@ -56,7 +56,7 @@ symlink) owned by the user, SYSTEM or Administrators, and refuses anything else 
 path that would push the socket past the 107-byte AF_UNIX limit is an error, not a reason to use
 another location (`socket_loc::SocketLocationError::TooLong`).
 
-The install directory is the other half of the boundary: the agent and the SYSTEM self-heal task run the exe in it, so a directory a standard user can write to is a privilege escalation. `apply` verifies it exactly and reads and writes nothing in it until that passes.
+The install directory is the other half of the boundary: the agent and the SYSTEM self-heal task run the exe in it, so a directory a standard user can write to is a privilege escalation. `apply` verifies it exactly and reads and writes nothing in it until that passes. Users can read what is in it, so a file in it that a user must not open (`apply.lock`: a byte-range lock needs only a read handle) gets its own protected DACL of SYSTEM and Administrators at creation, verified exactly (`acl::ensure_admin_only_file`).
 
 ### Fail-open is deliberate, and never in the security boundary
 
