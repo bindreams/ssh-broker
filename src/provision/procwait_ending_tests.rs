@@ -10,18 +10,29 @@ use super::*;
 use std::os::windows::process::CommandExt;
 use std::process::{Child, Command, Stdio};
 
-use windows::Wdk::System::Threading::PROCESSINFOCLASS;
 use windows::Win32::Foundation::DBG_CONTINUE;
 use windows::Win32::System::Diagnostics::Debug::{
     ContinueDebugEvent, DEBUG_EVENT, EXIT_PROCESS_DEBUG_EVENT, WaitForDebugEvent,
 };
-use windows::Win32::System::Threading::INFINITE;
+use windows::Win32::System::Threading::{GetExitCodeProcess, INFINITE};
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const DEBUG_ONLY_THIS_PROCESS: u32 = 0x0000_0002;
 
 fn cmd_exe() -> PathBuf {
     PathBuf::from(std::env::var_os("SystemRoot").expect("SystemRoot is set")).join(r"System32\cmd.exe")
+}
+
+/// A running `cmd.exe` that exits when its stdin closes, and not before.
+fn child_until_stdin_closes() -> Child {
+    Command::new(cmd_exe())
+        .args(["/d", "/c", "set /p unused="])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn()
+        .unwrap()
 }
 
 /// A process that was terminated and is held in its exit by this thread, its debugger. Dropping it
@@ -90,62 +101,80 @@ fn reply(event: &DEBUG_EVENT) {
     unsafe { ContinueDebugEvent(event.dwProcessId, event.dwThreadId, DBG_CONTINUE) }.expect("reply to a debug event");
 }
 
-/// The NTSTATUS of a zero-length query of `class` on `handle`.
-fn probe_status(handle: &OwnedHandle, class: PROCESSINFOCLASS) -> i32 {
-    let mut needed = 0u32;
-    // SAFETY: a size probe: no buffer, zero length.
-    unsafe { NtQueryInformationProcess(handle.0, class, std::ptr::null_mut(), 0, &mut needed) }.0
+/// Every answer that could tell `handle`'s process is ending, for a message that settles which does.
+fn measured(handle: &OwnedHandle) -> String {
+    let mut exit_code = 0u32;
+    // SAFETY: the handle carries PROCESS_QUERY_LIMITED_INFORMATION; a valid out-pointer.
+    let exit_code = unsafe { GetExitCodeProcess(handle.0, &mut exit_code) }
+        .map(|()| format!("{exit_code:#x}"))
+        .unwrap_or_else(|e| format!("failed: {e}"));
+    format!(
+        "{}; GetExitCodeProcess {exit_code}; signalled {}",
+        EndingSigns::of(handle),
+        has_exited(handle)
+    )
 }
 
 #[test]
-fn a_process_held_in_its_exit_is_not_exited_and_every_failed_read_of_it_says_it_is_ending() {
+fn a_process_held_in_its_exit_is_not_exited_is_ending_and_is_read_as_usual() {
     let held = HeldEnding::start();
     let handle = open_for_waiting(held.pid())
         .unwrap()
         .expect("the process is still listed");
-    let image_probe = probe_status(&handle, ProcessImageFileNameWin32);
-    let command_line_probe = probe_status(&handle, ProcessCommandLineInformation);
-    let measured = format!(
-        "zero-length probe of the image name: {image_probe:#010x}; of the command line: {command_line_probe:#010x}"
-    );
+    let mut running = child_until_stdin_closes();
+    let running_handle = open_for_waiting(running.id())
+        .unwrap()
+        .expect("the running process is listed");
+    let held_answers = measured(&handle);
+    let running_answers = measured(&running_handle);
+    let measured = format!("held: {held_answers}; running: {running_answers}");
 
     assert!(
         !has_exited(&handle),
         "the process finished exiting before its debugger replied, so it was never held ({measured})"
     );
+    assert!(
+        EndingSigns::of(&handle).ending(),
+        "nothing says the held process is ending ({measured})"
+    );
+    assert!(
+        !EndingSigns::of(&running_handle).ending(),
+        "something says a running process is ending ({measured})"
+    );
 
+    // A read of an ending process either succeeds and identifies it as usual, or fails as ending.
     let image = image_of(&handle);
     let process = Process {
         pid: held.pid(),
         handle,
     };
     let command_line = command_line_of(&process);
-    let measured = format!(
-        "{measured}; image read: {:?}; command line read: {:?}",
-        image
-            .as_ref()
-            .map(|path| path.display().to_string())
-            .map_err(|e| format!("{e:#}")),
-        command_line.as_ref().map_err(|e| format!("{e:#}"))
-    );
-    assert!(
-        image.is_err() || command_line.is_err(),
-        "nothing about the held process failed, so this test pins no detection ({measured})"
-    );
-
-    // A failed read of an ending process is told to be that, and not taken for a failure.
-    if image.is_err() {
-        assert!(
+    match &image {
+        Ok(path) => assert_eq!(
+            file_id(path).unwrap(),
+            file_id(&cmd_exe()).unwrap(),
+            "the image read succeeded and named another file ({measured})"
+        ),
+        Err(e) => assert!(
             is_ending_now(&process.handle),
-            "the image read failed but the probe did not say ending ({measured})"
-        );
+            "the image read failed ({e:#}) and the process was not said to be ending ({measured})"
+        ),
     }
-    if let Err(e) = &command_line {
-        assert!(
+    match &command_line {
+        Ok(text) => assert_eq!(
+            role_of(text),
+            Role::Shim,
+            "the command line read succeeded and was not cmd.exe's ({measured}): {text}"
+        ),
+        Err(e) => assert!(
             is_ending(e),
-            "the command line read failed and was not told to be ending ({measured})"
-        );
+            "the command line read failed and was not told to be ending ({measured}): {e:#}"
+        ),
     }
+
+    drop(running_handle);
+    drop(running.stdin.take());
+    running.wait().unwrap();
 }
 
 #[test]
@@ -180,9 +209,12 @@ fn terminating_a_held_ending_process_is_not_an_error() {
     let handle = open_for_waiting(held.pid())
         .unwrap()
         .expect("the process is still listed");
+    let measured = measured(&handle);
     let process = Process {
         pid: held.pid(),
         handle,
     };
-    process.terminate().unwrap();
+    process
+        .terminate()
+        .unwrap_or_else(|e| panic!("terminating a held process failed: {e:#} ({measured})"));
 }

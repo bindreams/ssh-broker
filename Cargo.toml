@@ -54,6 +54,8 @@ windows = { version = "0.62.2", features = [
     "Wdk_Foundation",
     "Win32_System_Diagnostics_ToolHelp", # CreateToolhelp32Snapshot: apply lists the processes to find background agents; tests/common/process_list.rs finds a process's descendants
     "Wdk_System_Threading",         # NtQueryInformationProcess: the command line of a process, to tell a background agent from a shim; ProcessDefaultHardErrorMode in tests/common/hard_errors.rs
+    "Wdk_System_SystemServices",    # PROCESS_EXTENDED_BASIC_INFORMATION: whether the kernel says a process is ending (src/provision/procwait.rs)
+    "Win32_System_Kernel",          # PROCESS_BASIC_INFORMATION, which the extended record holds
     "Wdk_Storage_FileSystem",       # NtOpenFile: open a directory for ACL inspection without SYNCHRONIZE
 ] }
 

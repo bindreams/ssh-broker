@@ -4,6 +4,8 @@ use super::*;
 use std::os::windows::process::CommandExt;
 use std::process::{Child, Command, Stdio};
 
+use windows::Win32::Foundation::{STATUS_ACCESS_DENIED, STATUS_INFO_LENGTH_MISMATCH, STILL_ACTIVE};
+
 use crate::acl::Sid;
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -512,6 +514,8 @@ struct Made {
     owner: Result<&'static str, Fail>,
     image: Result<bool, Fail>,
     exited: bool,
+    /// The kernel says it is ending while every read of it still succeeds (a process held in its exit).
+    ending: bool,
     command_line: Result<&'static str, Fail>,
 }
 
@@ -523,6 +527,7 @@ fn made(pid: u32) -> Made {
         owner: Ok(ME),
         image: Ok(true),
         exited: false,
+        ending: false,
         command_line: Ok(r"C:\x\ssh-broker.exe agent --background"),
     }
 }
@@ -536,6 +541,9 @@ impl Inspect for Made {
     }
     fn has_exited(&self) -> bool {
         self.exited
+    }
+    fn is_ending(&self) -> bool {
+        self.ending
     }
     fn command_line(&self) -> anyhow::Result<String> {
         self.command_line.map(str::to_owned).map_err(|f| f.error(self.pid))
@@ -596,6 +604,16 @@ fn a_process_whose_image_is_refused_because_it_is_ending_is_skipped_not_fatal() 
 }
 
 #[test]
+fn a_process_the_kernel_says_is_ending_is_none_of_the_users_though_every_read_of_it_succeeds() {
+    // CI round 21: a process held in its exit is readable, not signalled, and refuses TerminateProcess.
+    let held = Made {
+        ending: true,
+        ..made(10)
+    };
+    assert_eq!(scanned(&[held, made(20)]).unwrap(), [20]);
+}
+
+#[test]
 fn a_process_that_ends_between_the_image_and_the_command_line_is_skipped() {
     let ending = Made {
         command_line: Err(Fail::Ending),
@@ -629,6 +647,9 @@ impl Inspect for ExitsWhenAsked {
     }
     fn has_exited(&self) -> bool {
         self.asked.get()
+    }
+    fn is_ending(&self) -> bool {
+        false
     }
     fn command_line(&self) -> anyhow::Result<String> {
         self.asked.set(true);
@@ -819,4 +840,70 @@ fn an_unreadable_process_is_told_apart_as_exited_ending_or_failed() {
     assert_eq!(unreadable(&denied, true), Unreadable::Exited);
     assert_eq!(unreadable(&ending, false), Unreadable::Ending);
     assert_eq!(unreadable(&denied, false), Unreadable::Failed);
+}
+
+// what tells a process is ending -----
+
+/// What the kernel answers about a running process.
+fn running_signs() -> EndingSigns {
+    EndingSigns {
+        probe: STATUS_INFO_LENGTH_MISMATCH.0,
+        basic: 0,
+        exit_status: STILL_ACTIVE.0,
+        deleting: false,
+    }
+}
+
+#[test]
+fn a_running_process_shows_no_sign_of_ending() {
+    assert!(!running_signs().ending());
+}
+
+#[test]
+fn each_sign_alone_says_the_process_is_ending() {
+    let probe = EndingSigns {
+        probe: STATUS_PROCESS_IS_TERMINATING.0,
+        ..running_signs()
+    };
+    let basic = EndingSigns {
+        basic: STATUS_PROCESS_IS_TERMINATING.0,
+        ..running_signs()
+    };
+    let deleting = EndingSigns {
+        deleting: true,
+        ..running_signs()
+    };
+    let exit_status = EndingSigns {
+        exit_status: 1,
+        ..running_signs()
+    };
+    for (what, signs) in [
+        ("probe", probe),
+        ("query", basic),
+        ("deleting flag", deleting),
+        ("exit status", exit_status),
+    ] {
+        assert!(signs.ending(), "{what}: {signs}");
+    }
+}
+
+#[test]
+fn a_refused_query_is_no_sign_of_ending_whatever_it_left_in_its_fields() {
+    // A real access denial on a running process stays an error: the fields of a query that failed
+    // are not an answer.
+    let refused = EndingSigns {
+        basic: STATUS_ACCESS_DENIED.0,
+        exit_status: 1,
+        deleting: true,
+        ..running_signs()
+    };
+    assert!(!refused.ending(), "{refused}");
+}
+
+#[test]
+fn the_signs_print_every_answer_for_a_test_that_measures_them() {
+    let text = running_signs().to_string();
+    assert!(text.contains("0xc0000004"), "{text}");
+    assert!(text.contains("exit status 0x00000103"), "{text}");
+    assert!(text.contains("deleting false"), "{text}");
 }

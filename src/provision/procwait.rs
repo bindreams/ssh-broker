@@ -11,12 +11,13 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
+use windows::Wdk::System::SystemServices::PROCESS_EXTENDED_BASIC_INFORMATION;
 use windows::Wdk::System::Threading::{
-    NtQueryInformationProcess, ProcessCommandLineInformation, ProcessImageFileNameWin32,
+    NtQueryInformationProcess, ProcessBasicInformation, ProcessCommandLineInformation, ProcessImageFileNameWin32,
 };
 use windows::Win32::Foundation::{
-    ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER, HANDLE, STATUS_PROCESS_IS_TERMINATING, UNICODE_STRING, WAIT_OBJECT_0,
-    WAIT_TIMEOUT,
+    ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER, HANDLE, NTSTATUS, STATUS_PROCESS_IS_TERMINATING, STILL_ACTIVE,
+    UNICODE_STRING, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows::Win32::Storage::FileSystem::{FILE_ID_INFO, FileIdInfo, GetFileInformationByHandleEx};
 use windows::Win32::System::Diagnostics::ToolHelp::{
@@ -55,8 +56,9 @@ impl Process {
     /// A process that has ended by the time this fails is the goal state, not an error:
     /// `TerminateProcess` on one is refused with access denied.
     ///
-    /// The same goes for one that is ending: `TerminateProcess` is refused on it too, and it is on
-    /// its way out already.
+    /// The same goes for one that is ending ([`is_ending_now`]): `TerminateProcess` is refused on it
+    /// too, and it is on its way out already. Access denied on a process that is running stays an
+    /// error.
     pub fn terminate(&self) -> anyhow::Result<()> {
         match self.try_terminate() {
             Err(_) if has_exited(&self.handle) || is_ending_now(&self.handle) => Ok(()),
@@ -103,26 +105,92 @@ fn is_ending(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| cause.is::<Ending>())
 }
 
-/// Whether the process held by `handle` has begun to end, by asking the kernel for a thing about it
-/// and seeing whether the answer is `STATUS_PROCESS_IS_TERMINATING`. A process is never in that state
-/// again once it is out of it, so a `true` stays true.
-///
-/// No documentation says what the kernel answers for an ending process, and the answer may depend on
-/// the order of its checks (a zero-length buffer is the kind of thing it may refuse first). The tests
-/// in `procwait_ending_tests.rs` hold a real process in its exit and pin what it answers.
+/// Whether the process held by `handle` has begun to end: see [`EndingSigns::ending`].
 fn is_ending_now(handle: &OwnedHandle) -> bool {
-    let mut needed = 0u32;
-    // SAFETY: a size probe: no buffer, zero length.
-    let status = unsafe {
-        NtQueryInformationProcess(
-            handle.0,
-            ProcessImageFileNameWin32,
-            std::ptr::null_mut(),
-            0,
-            &mut needed,
+    EndingSigns::of(handle).ending()
+}
+
+/// `IsProcessDeleting` in the flags of `PROCESS_EXTENDED_BASIC_INFORMATION`.
+const IS_PROCESS_DELETING: u32 = 1 << 2;
+
+/// Everything the kernel says about whether a process is ending: the answers to the queries that can
+/// tell. A process that has been terminated stays listed, with an unsignalled handle, until its last
+/// thread has left; in that time `TerminateProcess` is refused with access denied
+/// (`STATUS_PROCESS_IS_TERMINATING`), and which other queries refuse it too depends on how far the exit
+/// has got. A process held in its exit by a debugger answers the reads of its image and command line,
+/// and refuses `TerminateProcess` (CI round 21). No document says which query tells it, so each is
+/// kept, and the tests in `procwait_ending_tests.rs` print all of them for a held process and a
+/// running one.
+#[derive(Debug, Clone, Copy)]
+struct EndingSigns {
+    /// The NTSTATUS of a zero-length probe of the image name.
+    probe: i32,
+    /// The NTSTATUS of the query for the extended basic information.
+    basic: i32,
+    /// The exit status it holds: `STILL_ACTIVE` until the process is terminated. Meaningless if
+    /// `basic` is a failure.
+    exit_status: i32,
+    /// Its `IsProcessDeleting` flag. Meaningless if `basic` is a failure.
+    deleting: bool,
+}
+
+impl EndingSigns {
+    fn of(handle: &OwnedHandle) -> Self {
+        let mut needed = 0u32;
+        // SAFETY: a size probe: no buffer, zero length.
+        let probe = unsafe {
+            NtQueryInformationProcess(
+                handle.0,
+                ProcessImageFileNameWin32,
+                std::ptr::null_mut(),
+                0,
+                &mut needed,
+            )
+        };
+        let mut info = PROCESS_EXTENDED_BASIC_INFORMATION {
+            Size: size_of::<PROCESS_EXTENDED_BASIC_INFORMATION>(),
+            ..Default::default()
+        };
+        // SAFETY: `info` is the size the call is told, and its `Size` is set as the class requires.
+        let basic = unsafe {
+            NtQueryInformationProcess(
+                handle.0,
+                ProcessBasicInformation,
+                (&raw mut info).cast(),
+                size_of::<PROCESS_EXTENDED_BASIC_INFORMATION>() as u32,
+                &mut needed,
+            )
+        };
+        EndingSigns {
+            probe: probe.0,
+            basic: basic.0,
+            exit_status: info.BasicInfo.ExitStatus.0,
+            // SAFETY: every bit pattern of the flags is a value of the union's other field.
+            deleting: unsafe { info.Anonymous.Flags } & IS_PROCESS_DELETING != 0,
+        }
+    }
+
+    /// Whether any sign says the process is ending. Each is a sign by itself and none can be taken
+    /// for it by a process that is running: a failed query is no answer, so a refusal of anything
+    /// else (access denied on a process we may not open) is not one. A process is never out of this
+    /// state once it is in it, so a `true` stays true.
+    fn ending(&self) -> bool {
+        let terminating = STATUS_PROCESS_IS_TERMINATING.0;
+        if self.probe == terminating || self.basic == terminating {
+            return true;
+        }
+        NTSTATUS(self.basic).is_ok() && (self.deleting || self.exit_status != STILL_ACTIVE.0)
+    }
+}
+
+impl std::fmt::Display for EndingSigns {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "image name probe {:#010x}; basic information {:#010x}, exit status {:#010x}, deleting {}",
+            self.probe, self.basic, self.exit_status, self.deleting
         )
-    };
-    status == STATUS_PROCESS_IS_TERMINATING
+    }
 }
 
 /// What to make of a process whose image or command line could not be read.
@@ -191,7 +259,7 @@ pub fn command_line_of(process: &Process) -> anyhow::Result<String> {
             &mut needed,
         )
     };
-    if probe == STATUS_PROCESS_IS_TERMINATING {
+    if probe == STATUS_PROCESS_IS_TERMINATING || (needed == 0 && is_ending_now(&process.handle)) {
         return Err(Ending { pid: process.pid }.into());
     }
     anyhow::ensure!(
@@ -212,7 +280,7 @@ pub fn command_line_of(process: &Process) -> anyhow::Result<String> {
             &mut needed,
         )
     };
-    if status == STATUS_PROCESS_IS_TERMINATING {
+    if status == STATUS_PROCESS_IS_TERMINATING || (!status.is_ok() && is_ending_now(&process.handle)) {
         return Err(Ending { pid: process.pid }.into());
     }
     anyhow::ensure!(
@@ -485,6 +553,8 @@ trait Inspect {
     /// Whether the process runs the file `wanted`.
     fn runs_image(&self, wanted: &FileId) -> anyhow::Result<bool>;
     fn has_exited(&self) -> bool;
+    /// Whether the kernel says the process is ending, whether or not its reads still succeed.
+    fn is_ending(&self) -> bool;
     fn command_line(&self) -> anyhow::Result<String>;
 }
 
@@ -501,6 +571,10 @@ impl Inspect for Process {
 
     fn has_exited(&self) -> bool {
         has_exited(&self.handle)
+    }
+
+    fn is_ending(&self) -> bool {
+        is_ending_now(&self.handle)
     }
 
     fn command_line(&self) -> anyhow::Result<String> {
@@ -533,10 +607,10 @@ fn scan_user_agents<P: Inspect>(
     Ok(agents)
 }
 
-/// Whether `process` is an agent of the user `user` running `image`. A process that has exited, or
-/// exits or begins to end while it is read, is none; any other failure to read it is the error.
+/// Whether `process` is an agent of the user `user` running `image`. A process that has exited or is
+/// ending, or exits or begins to end while it is read, is none; any other failure to read it is the error.
 fn is_agent_of(process: &impl Inspect, user: &str, image: &FileId) -> anyhow::Result<bool> {
-    if process.has_exited() {
+    if process.has_exited() || process.is_ending() {
         return Ok(false);
     }
     let verdict = (|| {
