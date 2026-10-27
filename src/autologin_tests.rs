@@ -50,6 +50,8 @@ struct Fake {
     /// What the read-back returns: the registered definition by default.
     read_back: Option<Option<TaskState>>,
     exists: bool,
+    /// Deleting fails with this message.
+    delete_fails: Option<&'static str>,
     calls: Vec<String>,
     said: Vec<String>,
 }
@@ -64,6 +66,7 @@ impl Fake {
             registered_ok: true,
             read_back: None,
             exists: true,
+            delete_fails: None,
             calls: Vec::new(),
             said: Vec::new(),
         }
@@ -120,6 +123,9 @@ impl AutoLoginEnv for Fake {
     }
     fn delete(&mut self, name: &str) -> anyhow::Result<bool> {
         self.calls.push(format!("delete {name}"));
+        if let Some(why) = self.delete_fails {
+            anyhow::bail!(why);
+        }
         Ok(std::mem::replace(&mut self.exists, false))
     }
     fn run_now(&mut self, name: &str) -> anyhow::Result<()> {
@@ -248,12 +254,30 @@ fn on_deletes_a_task_that_fails_the_read_back() {
     }));
     let text = error_text(on(&mut env, &alice()));
     assert!(text.contains("does not match"), "{text}");
+    assert!(text.contains("it was removed"), "{text}");
     assert!(
         env.calls.contains(&format!("delete {}", task_name(sid))),
         "{:?}",
         env.calls
     );
     assert!(!env.calls.iter().any(|call| call.starts_with("run")), "{:?}", env.calls);
+}
+
+#[test]
+fn on_does_not_claim_the_task_was_removed_when_removing_it_failed() {
+    let mut env = Fake::new();
+    env.read_back = Some(Some(TaskState {
+        xml: task_xml(r"C:\evil.exe", "S-1-5-21-1-2-3-1001"),
+        sddl: String::new(),
+        last_result: 0,
+    }));
+    env.delete_fails = Some("Access is denied.");
+    let text = error_text(on(&mut env, &alice()));
+    assert!(text.contains("does not match"), "{text}");
+    assert!(!text.contains("it was removed"), "{text}");
+    assert!(text.contains("could not be removed"), "{text}");
+    assert!(text.contains("Access is denied."), "{text}");
+    assert!(text.contains("may still be registered"), "{text}");
 }
 
 #[test]

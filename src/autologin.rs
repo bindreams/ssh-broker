@@ -119,9 +119,13 @@ pub fn on(env: &mut dyn AutoLoginEnv, account: &LocalAccount) -> anyhow::Result<
         Err(e) => Some(format!("it could not be read back: {e:#}")),
     };
     if let Some(problem) = problem {
-        let _ = env.delete(&name);
+        let removal = match env.delete(&name) {
+            Ok(true) => "it was removed".to_string(),
+            Ok(false) => "it is no longer registered".to_string(),
+            Err(e) => format!("it could not be removed ({e:#}) and may still be registered with the stored password"),
+        };
         anyhow::bail!(
-            "ssh-broker: the registered task does not match what auto-login on asked for ({problem}); it was removed."
+            "ssh-broker: the registered task does not match what auto-login on asked for ({problem}); {removal}."
         );
     }
 
