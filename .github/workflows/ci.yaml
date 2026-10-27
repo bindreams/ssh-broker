@@ -138,9 +138,6 @@ jobs:
           New-Item -ItemType Directory -Force C:\ProgramData\ssh-broker | Out-Null
           Copy-Item target\debug\ssh-broker.exe C:\ProgramData\ssh-broker\ssh-broker.exe
 
-      # The test accounts' profiles and the build fill the runner's disk (CI round 12: CreateProfile failed with
-      # "not enough space"); each report prints the free space and what holds it, to be read from the log.
-
       - name: Disk report (before the tests)
         if: (success() || failure()) && runner.os == 'Windows'
         run: .github/scripts/disk-report.ps1 'before the tests'
