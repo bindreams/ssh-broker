@@ -320,11 +320,12 @@ struct Started {
     agent: StartedAgent,
 }
 
-/// The line for the user when the session just started ends with this connection, or `None`.
+/// The line for the user when the session just started ends, or may end, with this connection, or `None`.
 fn survival_notice(survival: Survival) -> Option<&'static str> {
     match survival {
         Survival::OutlivesConnection => None,
         Survival::EndsWithConnection => Some(text::SESSION_ENDS_WITH_CONNECTION_LINE),
+        Survival::MayEndWithConnection => Some(text::SESSION_MAY_END_WITH_CONNECTION_LINE),
     }
 }
 

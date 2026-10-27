@@ -130,16 +130,20 @@ fn an_administrators_shim_sees_the_agent_it_starts() {
 
 /// The jobs of this test process, which every M3 case needs to be none: the case builds the caller's whole
 /// chain of jobs itself, and a job the runner put the test in (nextest puts each test in one without
-/// BREAKAWAY_OK, and `cargo` puts what it runs in another) holds the logon child and its probe whatever the
-/// case does, and never closes during the test. So the M3 cases run from a CI step that starts this test
-/// binary directly (`.github/workflows/ci.yaml`, "M3 tests outside any job"), and `nextest.toml` leaves them
-/// out. Returns what was found, for the failure messages.
+/// BREAKAWAY_OK, `cargo` puts what it runs in another, and the runner puts a step's processes in a third,
+/// with no limits) holds the logon child and its probe whatever the case does, and never closes during the
+/// test. So the M3 cases run from a one-shot scheduled task that starts this test binary
+/// (`.github/workflows/ci.yaml`, "M3 tests outside any job"), and `nextest.toml` leaves them out. Returns
+/// what was found, for the failure messages.
 fn assert_test_process_is_in_no_job(case: &str) -> logon::CallerJob {
     let base = logon::CallerJob::of_this_process();
     assert_eq!(
         base,
         logon::CallerJob::NotInJob,
-        "{case}: this test process is in a job ({base:?}), so the jobs the case builds are not the caller's whole chain          and nothing can be measured. Run the M3 cases from the binary itself, not through nextest or cargo:          `<test binary> m3_`"
+        "{case}: this test process is in a job ({base:?}), so the jobs the case builds are not the caller's whole \
+         chain and nothing can be measured. Run the M3 cases from a process that is in no job (CI: a one-shot \
+         scheduled task, see \"M3 tests outside any job\" in ci.yaml), not through nextest, cargo or a runner step: \
+         `<test binary> m3_`"
     );
     base
 }
@@ -290,34 +294,49 @@ impl M3Run {
         )
     }
 
-    /// The logon's claim, which the prompt path turns into a line for the user, is the survival that
-    /// was measured. Prints the measurement on a mismatch so that the rule can be revisited from it.
-    fn assert_claim_matches_measurement(&self, chain: &str) {
-        let survived = self.survived(chain);
-        let claim = if self.reported.contains("survival=OutlivesConnection") {
-            true
-        } else if self.reported.contains("survival=EndsWithConnection") {
-            false
-        } else {
-            panic!("{chain}: the logon reported no survival: {}", self.measured())
-        };
+    /// The logon's claim, which the prompt path turns into a line for the user, is `expected`, and, where
+    /// it is a claim about the outcome (`OutlivesConnection`, `EndsWithConnection`), it is what was
+    /// measured. `MayEndWithConnection` claims nothing about the outcome, so the measurement is printed
+    /// and not compared.
+    fn assert_claim(&self, expected: logon::Survival, chain: &str) {
+        use logon::Survival::{EndsWithConnection, MayEndWithConnection, OutlivesConnection};
+        let claim = [OutlivesConnection, EndsWithConnection, MayEndWithConnection]
+            .into_iter()
+            .find(|claim| self.reported.contains(&format!("survival={claim:?}")))
+            .unwrap_or_else(|| panic!("{chain}: the logon reported no survival: {}", self.measured()));
         assert_eq!(
             claim,
-            survived,
-            "{chain}: the logon's claim (outlives: {claim}) is not what happened (outlived: {survived}); {}",
+            expected,
+            "{chain}: the logon's claim is not the one this chain calls for; {}",
             self.measured()
         );
+        match claim {
+            OutlivesConnection => assert!(
+                self.survived(chain),
+                "{chain}: the logon claims the session outlives the connection and it did not; {}",
+                self.measured()
+            ),
+            EndsWithConnection => assert!(
+                !self.survived(chain),
+                "{chain}: the logon claims the session ends with the connection and it outlived it; {}",
+                self.measured()
+            ),
+            MayEndWithConnection => println!(
+                "{chain}: the logon claims nothing about the outcome; {}",
+                self.measured()
+            ),
+        }
     }
 }
 
 /// Elevated (CI only). M3: the caller's job allows no breakaway, so the product asks for none, the
 /// child stays in the job and ends with it, and the logon reports that the session does not outlive
-/// the connection (the prompt path says so to the user).
+/// the connection (the prompt path says so to the user). The job kills on close, so the claim is
+/// `EndsWithConnection` and is compared with the fate.
 #[test]
 fn m3_child_in_a_job_that_forbids_breakaway_ends_with_the_job_and_the_logon_says_so() {
     let run = logon_child_after_the_callers_jobs_close("m3a", vec![KillOnCloseJob::create()]);
-    assert!(!run.survived("job without BREAKAWAY_OK"), "{}", run.measured());
-    run.assert_claim_matches_measurement("job without BREAKAWAY_OK");
+    run.assert_claim(logon::Survival::EndsWithConnection, "job without BREAKAWAY_OK");
 }
 
 /// Elevated (CI only). M3: where the caller's job allows breakaway the product asks for it, and the
@@ -325,12 +344,7 @@ fn m3_child_in_a_job_that_forbids_breakaway_ends_with_the_job_and_the_logon_says
 #[test]
 fn m3_child_survives_the_callers_job_closing_where_breakaway_is_allowed() {
     let run = logon_child_after_the_callers_jobs_close("m3b", vec![KillOnCloseJob::create_allowing_breakaway()]);
-    assert!(
-        run.survived("job with BREAKAWAY_OK"),
-        "the logon child ended with its caller's job although the job allows breakaway and the logon asked for it; {}",
-        run.measured()
-    );
-    run.assert_claim_matches_measurement("job with BREAKAWAY_OK");
+    run.assert_claim(logon::Survival::OutlivesConnection, "job with BREAKAWAY_OK");
 }
 
 /// A chain of two nested jobs, outermost first, each allowing breakaway or not. Windows shows a process
@@ -351,21 +365,17 @@ fn nested_jobs(outer_allows: bool, inner_allows: bool) -> Vec<KillOnCloseJob> {
 #[test]
 fn m3_child_survives_nested_jobs_that_all_allow_breakaway() {
     let run = logon_child_after_the_callers_jobs_close("m3n1", nested_jobs(true, true));
-    assert!(
-        run.survived("all nested jobs allow"),
-        "the logon child ended with a chain of jobs that all allow breakaway; {}",
-        run.measured()
-    );
-    run.assert_claim_matches_measurement("all nested jobs allow");
+    run.assert_claim(logon::Survival::OutlivesConnection, "all nested jobs allow");
 }
 
 /// Elevated (CI only). The innermost job allows breakaway and an outer one does not. Whether Windows
 /// refuses the flagged call, and where the child ends up, is what this measures (CI round 8: it does not
-/// refuse). The logon must succeed, and what it tells the user must be what happened.
+/// refuse). The logon must succeed; the probe stays in the outer job, whose flags cannot be read, so the
+/// claim is `MayEndWithConnection` and the fate is printed, not compared.
 #[test]
 fn m3_logon_succeeds_when_an_outer_job_forbids_the_breakaway_the_inner_one_allows() {
     let run = logon_child_after_the_callers_jobs_close("m3n2", nested_jobs(false, true));
-    run.assert_claim_matches_measurement("outer forbids, inner allows");
+    run.assert_claim(logon::Survival::MayEndWithConnection, "outer forbids, inner allows");
 }
 
 /// Elevated (CI only). The innermost job forbids breakaway and an outer one allows it: the product
@@ -373,8 +383,7 @@ fn m3_logon_succeeds_when_an_outer_job_forbids_the_breakaway_the_inner_one_allow
 #[test]
 fn m3_logon_succeeds_when_the_inner_job_forbids_breakaway_and_an_outer_one_allows_it() {
     let run = logon_child_after_the_callers_jobs_close("m3n3", nested_jobs(true, false));
-    assert!(!run.survived("outer allows, inner forbids"), "{}", run.measured());
-    run.assert_claim_matches_measurement("outer allows, inner forbids");
+    run.assert_claim(logon::Survival::EndsWithConnection, "outer allows, inner forbids");
 }
 
 /// Elevated (CI only). A wrong password in a chain that refuses breakaway is answered `1326` and not

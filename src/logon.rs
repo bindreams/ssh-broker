@@ -56,10 +56,13 @@ pub struct StartedAgent {
 /// Whether the session the logon started outlives the connection that asked for it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Survival {
-    /// The agent is outside every job, so nothing the connection owns closes on it.
+    /// The agent is outside every job the caller is in, so nothing the connection owns closes on it.
     OutlivesConnection,
-    /// The agent is inside a job, which closes with the connection or may.
+    /// The agent stays in a job that is known to kill what is in it when it closes.
     EndsWithConnection,
+    /// The agent stays in a job that is not known to kill it: an outer job whose flags cannot be read,
+    /// or the innermost one without `KILL_ON_JOB_CLOSE`. Whether it ends is up to whoever owns the job.
+    MayEndWithConnection,
 }
 
 /// The jobs a process is in, as Windows reports them for that process itself.
@@ -85,17 +88,26 @@ impl ChildJob {
     }
 }
 
-/// What the session gets from the probe (see [`probe`]). The caller's job flags do not say: a job that
-/// allows breakaway can sit inside one that keeps the child (CI round 8), and Windows answers the
-/// flagged call without refusing it. The logon child does not say either: it is in a job of the
-/// Secondary Logon service's even when it outlives its caller's (CI round 9).
-/// The jobs of a caller of ssh-broker are sshd's (kill-on-close), so a process that stays in any job
-/// ends with the connection; a probe that gave no answer is not claimed to outlive it.
-pub fn survival_of(probe: Probe) -> Survival {
+/// What the session gets from the probe (see [`probe`]) for a caller in `job`. The caller's job flags
+/// do not say where the child lands: a job that allows breakaway can sit inside one that keeps the
+/// child (CI round 8), and Windows answers the flagged call without refusing it. The logon child does
+/// not say either: it is in a job of the Secondary Logon service's even when it outlives its caller's
+/// (CI round 9).
+///
+/// A job ends what is in it only if it kills on close, or its owner ends it (CI round 11: the job of a
+/// GitHub runner step has no limits). The flags of the innermost job are readable and the probe is
+/// all that is known of the outer ones, so:
+/// - nothing kept the probe: it outlives;
+/// - the innermost job refused the breakaway, so the child stays in it, and it kills on close: it ends;
+/// - anything else (an outer job kept the probe, the innermost does not kill, no answer): it may end.
+pub fn survival_of(job: &CallerJob, probe: Probe) -> Survival {
     match probe {
         Probe::CallerInNoJob | Probe::Started(ChildJob::NotInJob) => Survival::OutlivesConnection,
-        Probe::Started(ChildJob::InJob | ChildJob::Unreadable) | Probe::Refused | Probe::Failed => {
+        Probe::Refused if matches!(job, CallerJob::Limits(flags) if flags & JOB_KILL_ON_CLOSE != 0) => {
             Survival::EndsWithConnection
+        }
+        Probe::Refused | Probe::Started(ChildJob::InJob | ChildJob::Unreadable) | Probe::Failed => {
+            Survival::MayEndWithConnection
         }
     }
 }
@@ -153,6 +165,8 @@ pub fn command_line(exe: &Path, expect_user: &str) -> String {
 
 /// `JOB_OBJECT_LIMIT_BREAKAWAY_OK`: a process in the job may start a child outside it.
 const JOB_BREAKAWAY_OK: u32 = 0x0000_0800;
+/// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`: closing the job ends every process in it.
+const JOB_KILL_ON_CLOSE: u32 = 0x0000_2000;
 
 /// The job the calling process is in.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -281,7 +295,7 @@ pub fn start_background_agent(
     match result {
         Ok(((), kept_breakaway)) => {
             drop(OwnedHandle(info.hThread));
-            let survival = survival_of(probe);
+            let survival = survival_of(&job, probe);
             // The child's own membership is logged for comparison with the probe's.
             let child_job = ChildJob::of_process(info.hProcess);
             tracing::info!(

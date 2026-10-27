@@ -157,47 +157,84 @@ fn a_call_that_asked_for_no_breakaway_did_not_keep_one() {
 
 // survival -----
 
+/// A job that has `KILL_ON_JOB_CLOSE` and nothing else: what sshd keeps a session in.
+fn killing() -> CallerJob {
+    CallerJob::Limits(KILL_ON_JOB_CLOSE)
+}
+
 /// The claim comes from a probe the shim starts itself and examines before the logon, not from the
 /// flags of the call (CI round 8) and not from the logon child's own membership (CI round 9: a child
 /// that broke away is still in a job of the Secondary Logon service's, and survives all the same).
 /// A caller in no job has nothing to survive.
 #[test]
 fn a_caller_in_no_job_outlives_the_connection() {
-    assert_eq!(survival_of(Probe::CallerInNoJob), Survival::OutlivesConnection);
+    assert_eq!(
+        survival_of(&CallerJob::NotInJob, Probe::CallerInNoJob),
+        Survival::OutlivesConnection
+    );
 }
 
 /// Every job of the chain let the probe go: the logon child gets out too.
 #[test]
 fn a_probe_that_got_out_of_every_job_outlives_the_connection() {
     assert_eq!(
-        survival_of(Probe::Started(ChildJob::NotInJob)),
+        survival_of(&killing(), Probe::Started(ChildJob::NotInJob)),
         Survival::OutlivesConnection
     );
 }
 
-/// Some outer job kept the probe although the innermost let it go (CI round 8, m3n2).
+/// An outer job kept the probe although the innermost let it go (CI round 8, m3n2). The flags of an
+/// outer job cannot be read, and a job ends what is in it only if it kills on close (CI round 11: the
+/// runner's job has no limits), so this is not claimed either way.
 #[test]
-fn a_probe_that_is_still_in_a_job_ends_with_the_connection() {
+fn a_probe_that_an_outer_job_kept_may_end_with_the_connection() {
     assert_eq!(
-        survival_of(Probe::Started(ChildJob::InJob)),
+        survival_of(&killing(), Probe::Started(ChildJob::InJob)),
+        Survival::MayEndWithConnection
+    );
+}
+
+/// The innermost job forbids breakaway (the probe's `ERROR_ACCESS_DENIED`) and kills on close: the child
+/// is in it and goes when it closes.
+#[test]
+fn a_probe_that_a_killing_innermost_job_refused_ends_with_the_connection() {
+    assert_eq!(survival_of(&killing(), Probe::Refused), Survival::EndsWithConnection);
+    assert_eq!(
+        survival_of(
+            &CallerJob::Limits(KILL_ON_JOB_CLOSE | SILENT_BREAKAWAY_OK),
+            Probe::Refused
+        ),
         Survival::EndsWithConnection
     );
 }
 
-/// The innermost job forbids breakaway: the probe's `ERROR_ACCESS_DENIED`.
+/// A job that does not kill on close ends nothing by closing: the child may still be ended by whoever
+/// owns the job, which cannot be known.
 #[test]
-fn a_probe_that_breakaway_refused_ends_with_the_connection() {
-    assert_eq!(survival_of(Probe::Refused), Survival::EndsWithConnection);
+fn a_probe_that_an_innermost_job_without_kill_on_close_refused_may_end() {
+    assert_eq!(
+        survival_of(&CallerJob::Limits(0), Probe::Refused),
+        Survival::MayEndWithConnection
+    );
+    assert_eq!(
+        survival_of(&CallerJob::Limits(SILENT_BREAKAWAY_OK), Probe::Refused),
+        Survival::MayEndWithConnection
+    );
 }
 
-/// A membership or a probe that Windows would not give is not evidence that the child gets out.
+/// A membership, a job or a probe that Windows would not give is evidence of nothing: neither that the
+/// child gets out nor that it goes.
 #[test]
-fn a_probe_that_gave_no_answer_is_not_claimed_to_outlive() {
+fn a_probe_that_gave_no_answer_is_claimed_neither_way() {
     assert_eq!(
-        survival_of(Probe::Started(ChildJob::Unreadable)),
-        Survival::EndsWithConnection
+        survival_of(&killing(), Probe::Started(ChildJob::Unreadable)),
+        Survival::MayEndWithConnection
     );
-    assert_eq!(survival_of(Probe::Failed), Survival::EndsWithConnection);
+    assert_eq!(survival_of(&killing(), Probe::Failed), Survival::MayEndWithConnection);
+    assert_eq!(
+        survival_of(&CallerJob::Unreadable, Probe::Failed),
+        Survival::MayEndWithConnection
+    );
 }
 
 /// The probe is a process that is started and ended: only a caller that is in a job needs one.

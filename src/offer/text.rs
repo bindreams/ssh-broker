@@ -7,6 +7,9 @@ pub const COST_LINE: &str =
 /// Shown when the session just started lives in a job that closes with the connection.
 pub const SESSION_ENDS_WITH_CONNECTION_LINE: &str = "ssh-broker: this connection cannot let the Windows session outlive it, so the session ends when you disconnect.\r\n";
 
+/// Shown when the session just started lives in a job that may close with the connection.
+pub const SESSION_MAY_END_WITH_CONNECTION_LINE: &str = "ssh-broker: this connection may not let the Windows session outlive it; if so, the session ends when you disconnect.\r\n";
+
 /// The prompt: the owner's sentence, then the sentence that names the way out.
 pub fn prompt(user: &str) -> String {
     format!(
