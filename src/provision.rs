@@ -8,6 +8,8 @@
 //! agent makes and hardens its own socket directory in its own profile, so a SYSTEM-run
 //! self-heal has nothing to resolve.
 
+#[cfg(windows)]
+mod apply_lock;
 pub mod bounded;
 #[cfg(windows)]
 mod flow;
@@ -102,8 +104,8 @@ mod provision_tests;
 mod imp {
     use super::layout::{self, Layout};
     use super::{
-        flow, pending_sessions, probe, procwait, registry, report, schtasks, session_task, sessions, taskscheduler,
-        user_rows,
+        apply_lock, flow, pending_sessions, probe, procwait, registry, report, schtasks, session_task, sessions,
+        taskscheduler, user_rows,
     };
     use crate::{afunix, shim};
     use anyhow::Context;
@@ -135,15 +137,20 @@ mod imp {
         //    afterwards, even if a later step fails, except in a session whose old agent has not
         //    exited.
         let current = std::env::current_exe().context("current_exe")?;
+        // The install directory first: the lock file lives in it, and nothing is read from it or
+        // written into it before it is proved ours. One `apply` runs at a time, for its whole run: a
+        // second one (the boot self-heal is one) waits here, so it never meets the first's disabled
+        // tasks or its record as if a killed run had left them.
+        let base = layout::ensure_base(&layout)?;
+        let (_apply_lock, owed) =
+            apply_lock::acquire_and_load(&layout.apply_lock_path(), &layout.pending_sessions_path(), || {
+                eprintln!("apply: another apply is running; waiting for it to finish")
+            })?;
         let registered_xml = schtasks::registered_xml(taskscheduler::task_xml(schtasks::AGENT_TASK))?;
         // The auto-login tasks that were enabled when the agents were stopped, to be enabled and
         // started again afterwards. It starts with the tasks an earlier `apply` that was killed
-        // after disabling them still owes (the record is read only from a checked install directory).
-        let owed = match layout::check_base(&layout) {
-            Ok(base) => pending_sessions::load(&base.layout().pending_sessions_path())?,
-            // Not ours yet: `prepare` makes it ours or refuses, and nothing in it is believed meanwhile.
-            Err(_) => Vec::new(),
-        };
+        // after disabling them still owes: the record is read under the lock, so no `apply` that is
+        // running now wrote it.
         let enabled_sessions = std::cell::RefCell::new(owed);
         let exe = flow::run(
             || {
@@ -155,7 +162,7 @@ mod imp {
                 )
             },
             |stop_agents| {
-                let exe = layout::prepare(&layout, &current, registered_xml.as_deref(), stop_agents)?;
+                let exe = layout::prepare_in(&base, &current, registered_xml.as_deref(), stop_agents)?;
 
                 // 2. Register both tasks (idempotent /F).
                 register_agent_task(&layout, &exe)?;

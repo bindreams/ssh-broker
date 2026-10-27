@@ -153,10 +153,13 @@ jobs:
       # process must be in no job. nextest and cargo each put what they run in one, and so does the runner
       # for a step (a job with no limits, CI round 11). Task Scheduler starts a task outside all of them, so
       # the test binary runs as a one-shot task of SYSTEM with its output in a file that this step prints.
-      # Each case asserts at its start that it is in no job. The filter is the one in `.config/nextest.toml`
-      # that leaves them out of the step above. The wait re-checks the task's own state: it is over when the
-      # task is ready again and its last result has moved off "never run" (267011); the task's last result is
-      # the exit code of the test binary, which fails this step when it is not 0.
+      # Each case asserts at its start that it is in no job. The filter `m3_` is a substring match and the one
+      # in `.config/nextest.toml` that leaves them out of the step above (`/^m3_/`) is anchored, so the step
+      # lists what `m3_` selects first and fails if that is nothing or includes a test that does not start with
+      # `m3_` (which both would run). libtest exits 0 when a filter selects nothing, so after the run the step
+      # also compares the number of tests that passed with the number listed. The wait re-checks the task's own
+      # state: it is over when the task is ready again and its last result has moved off "never run" (267011);
+      # the task's last result is the exit code of the test binary, which fails this step when it is not 0.
       - name: M3 tests outside any job
         if: (success() || failure()) && runner.os == 'Windows'
         run: |
@@ -166,6 +169,11 @@ jobs:
             Where-Object { $_.executable -and $_.target.name -eq 'session_on_demand_windows' } |
             ForEach-Object { $_.executable }
           if (-not $exe) { throw "cargo did not name the session_on_demand_windows test binary" }
+          $listed = @(& $exe m3_ --list | ForEach-Object { if ($_ -match '^(.*): test$') { $Matches[1] } })
+          if ($LASTEXITCODE -ne 0) { throw "listing the m3_ tests failed with exit code $LASTEXITCODE" }
+          if ($listed.Count -eq 0) { throw "no test of session_on_demand_windows matches m3_: this step would run nothing" }
+          $stray = @($listed | Where-Object { $_ -notmatch '^m3_' })
+          if ($stray.Count -gt 0) { throw "matched by m3_ but not starting with it, so nextest runs them too: $($stray -join ', ')" }
           $out = Join-Path $env:RUNNER_TEMP 'm3-outside-any-job.txt'
           Remove-Item -Force -ErrorAction SilentlyContinue $out
           $task = "sb-m3-$PID"
@@ -184,9 +192,13 @@ jobs:
             Stop-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue
             Unregister-ScheduledTask -TaskName $task -Confirm:$false
           }
-          if (Test-Path $out) { Get-Content $out } else { Write-Output "the task wrote no output to $out" }
+          $text = if (Test-Path $out) { Get-Content -Raw $out } else { '' }
+          if ($text) { Write-Output $text } else { Write-Output "the task wrote no output to $out" }
           Write-Output "m3 test binary exit code: $code"
           if ($code -ne 0) { exit 1 }
+          $passed = 0
+          foreach ($m in [regex]::Matches($text, 'test result: ok\. (\d+) passed')) { $passed += [int]$m.Groups[1].Value }
+          if ($passed -ne $listed.Count) { throw "m3 tests passed: $passed, listed: $($listed.Count)" }
 
       - name: Disk report (after the M3 tests)
         if: (success() || failure()) && runner.os == 'Windows'

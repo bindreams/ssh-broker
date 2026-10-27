@@ -656,22 +656,29 @@ fn a_loop_that_was_stopped_before_it_began_accepts_nothing() {
 
 #[test]
 fn a_stopped_loop_ends_ok_only_after_every_connection_has_finished() {
-    let connections = Connections::new();
+    // The waiter says it is about to park, and only then does the connection finish. A waiter that
+    // did not wait reports that it returned first.
+    let (events, on_event) = std::sync::mpsc::channel();
+    let connections = Connections::observing_drain({
+        let events = events.clone();
+        move || {
+            let _ = events.send("parked");
+        }
+    });
     let other = connections.begin();
     let _logout = connections.begin();
     let _logout_wait = connections.begin_logout();
-    let (done, finished) = std::sync::mpsc::channel();
     let waiter = std::thread::spawn({
         let connections = Arc::clone(&connections);
         move || {
             let end = finish_stopped(anyhow::Error::new(Stopped), &connections);
-            done.send(()).unwrap();
+            let _ = events.send("returned");
             end
         }
     });
-    assert!(finished.try_recv().is_err(), "ended while a connection was relaying");
+    assert_eq!(on_event.recv().unwrap(), "parked", "the waiter did not wait");
     drop(other);
-    finished.recv().unwrap();
+    assert_eq!(on_event.recv().unwrap(), "returned");
     let end = waiter.join().unwrap();
     assert!(end.downcast_ref::<Stopped>().is_some(), "{end:#}");
 }
@@ -684,6 +691,19 @@ fn an_error_that_is_not_a_stop_is_still_an_error() {
     assert!(
         format!("{end:#}").contains("the listener failed"),
         "returns without waiting"
+    );
+}
+
+// the wake -----
+
+#[test]
+fn the_wake_runs_on_a_thread_of_its_own_so_the_caller_never_waits_for_it() {
+    let (ran_on, on_thread) = std::sync::mpsc::channel();
+    wake_without_blocking(move || ran_on.send(std::thread::current().id()).unwrap());
+    assert_ne!(
+        on_thread.recv().unwrap(),
+        std::thread::current().id(),
+        "the wake ran on the caller's thread"
     );
 }
 

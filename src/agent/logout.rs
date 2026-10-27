@@ -14,6 +14,7 @@ use std::io::Read;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use super::Connections;
+use crate::afunix::{ConnRx, ConnTx};
 use crate::protocol::{ExitCode, FrameKind, Stream, write_frame};
 use crate::relay::write_data;
 
@@ -24,8 +25,11 @@ pub const DESKTOP_REPLY: &str =
     "ssh-broker: your agent runs in your desktop session; signing out of Windows ends it.\r\n";
 /// What `logout` exits with when the agent runs in the desktop session.
 pub const DESKTOP_EXIT_CODE: i32 = 2;
-/// What a login exits with when it reached the agent after the end began: it got no shell.
-pub const ENDING_REFUSED_EXIT_CODE: i32 = 1;
+/// What a login is told when it reached the agent after the end began: it got no shell.
+pub const ENDING_REFUSAL: &str = "ssh-broker: your background session is ending; reconnect in a moment.\r\n";
+/// What that login exits with. 255 is ssh's code for a failed connection and the shim's for a dead
+/// agent; 1 would look like the command's own failure (`grep` found nothing).
+pub const ENDING_REFUSED_EXIT_CODE: i32 = 255;
 
 /// What an agent shares among its connections.
 pub(super) struct Control {
@@ -93,7 +97,7 @@ impl Control {
     }
 
     /// Begin to end: from now on no session registers, and every registered one is ended.
-    fn end_all(&self) {
+    pub(super) fn end_all(&self) {
         let (first, killers): (bool, Vec<Killer>) = {
             let mut state = self.lock();
             let first = !state.ending;
@@ -137,7 +141,10 @@ pub(super) fn handle_logout<R: Read, W: std::io::Write>(
         reply(tx, DESKTOP_REPLY, DESKTOP_EXIT_CODE)?;
         return Ok(());
     }
-    reply(tx, ENDING_REPLY, 0)?;
+    // Every logout ends the agent, also one whose client has gone before the reply: it asked.
+    if let Err(e) = reply(tx, ENDING_REPLY, 0) {
+        tracing::warn!("could not deliver the logout reply: {e:#}");
+    }
     wait_for_close(rx);
     tracing::info!("ending the background session at the user's request");
     let _logout = control.connections.begin_logout();
@@ -149,8 +156,16 @@ pub(super) fn handle_logout<R: Read, W: std::io::Write>(
 
 /// Answer a login that reached the agent after the end began: it is told, and exits with
 /// [`ENDING_REFUSED_EXIT_CODE`], instead of being dropped without a word.
-pub(super) fn refuse_while_ending<W: std::io::Write>(tx: &mut W) -> anyhow::Result<()> {
-    reply(tx, ENDING_REPLY, ENDING_REFUSED_EXIT_CODE)
+///
+/// The reply is followed by a FIN and a read until the client closes, as every reply that must
+/// arrive is: the client has sent its handshake and goes on sending input (an exec shim always ends
+/// with the stdin EOF marker), and closing with that unread would reset the connection and lose the
+/// reply.
+pub(super) fn refuse_while_ending(rx: &mut ConnRx, tx: &mut ConnTx) -> anyhow::Result<()> {
+    reply(tx, ENDING_REFUSAL, ENDING_REFUSED_EXIT_CODE)?;
+    tx.shutdown_write()?;
+    wait_for_close(rx);
+    Ok(())
 }
 
 fn reply<W: std::io::Write>(tx: &mut W, text: &str, code: i32) -> anyhow::Result<()> {

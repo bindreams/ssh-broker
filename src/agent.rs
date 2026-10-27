@@ -174,36 +174,85 @@ fn run_on(location: &SocketLocation, background: bool) -> anyhow::Result<()> {
     let connections = Connections::new();
     // Ending wakes the blocked `accept` with a connection of its own; the loop then sees the flag.
     let socket = location.path.clone();
-    let control =
-        Arc::new(Control::new(background, Arc::clone(&connections)).with_waker(move || drop(afunix::connect(&socket))));
+    let control = Arc::new(Control::new(background, Arc::clone(&connections)).with_waker(move || {
+        let socket = socket.clone();
+        wake_without_blocking(move || drop(afunix::connect(&socket)))
+    }));
     run_on_with(location, Listener::bind, mark_listening, |listener| {
-        let end = serve_connections_with(
-            Arc::clone(&connections),
-            || listener.accept(),
-            |conn, live| {
-                let control = Arc::clone(&control);
-                hand_to_thread(
-                    conn,
-                    live,
-                    |work| std::thread::Builder::new().spawn(work).map(drop),
-                    move |conn| {
-                        if let Err(e) = handle_connection_in(conn, Hooks::production(), &control) {
-                            tracing::warn!("connection handler error: {e:?}");
-                        }
-                    },
-                )
-            },
-            || {},
-            || control.is_ending(),
-        );
-        // No more logins: the socket stops accepting here, not when the process exits.
-        drop(listener);
-        finish_stopped(end, &connections)
+        serve_until_drained(listener, &connections, &control)
     })
     .or_else(|err| match err.downcast_ref::<Stopped>() {
         Some(Stopped) => Ok(()),
         None => Err(err),
     })
+}
+
+/// Serve `listener` until the agent is told to end, then wait until every connection but the
+/// `logout` requests has finished (see [`finish_stopped`]) and return the error that stopped the
+/// loop.
+///
+/// The listener stays open through the wait, and a second loop answers what arrives on it: a login
+/// that comes while the agent drains gets the ending refusal at once, where a closed socket would
+/// have left its shim waiting for an agent it takes to be starting, for as long as the drain lasts.
+/// That loop ends with the process.
+#[cfg(windows)]
+fn serve_until_drained(listener: Listener, connections: &Arc<Connections>, control: &Arc<Control>) -> anyhow::Error {
+    let listener = Arc::new(listener);
+    let end = accept_loop(&listener, connections, control, || control.is_ending());
+    if end.downcast_ref::<Stopped>().is_some() {
+        let (listener, connections, control) = (listener, Arc::clone(connections), Arc::clone(control));
+        let refusing = std::thread::Builder::new().spawn(move || {
+            let end = accept_loop(&listener, &connections, &control, || false);
+            tracing::warn!("no longer answering logins while the agent ends: {end:#}");
+        });
+        if let Err(e) = refusing {
+            tracing::warn!("could not keep answering logins while the agent ends: {e}");
+        }
+    }
+    finish_stopped(end, connections)
+}
+
+/// [`serve_connections_with`] over `listener`, handing each connection to a thread of its own.
+#[cfg(windows)]
+fn accept_loop(
+    listener: &Listener,
+    connections: &Arc<Connections>,
+    control: &Arc<Control>,
+    stopping: impl Fn() -> bool,
+) -> anyhow::Error {
+    serve_connections_with(
+        Arc::clone(connections),
+        || listener.accept(),
+        |conn, live| {
+            let control = Arc::clone(control);
+            hand_to_thread(
+                conn,
+                live,
+                |work| std::thread::Builder::new().spawn(work).map(drop),
+                move |conn| {
+                    if let Err(e) = handle_connection_in(conn, Hooks::production(), &control) {
+                        tracing::warn!("connection handler error: {e:?}");
+                    }
+                },
+            )
+        },
+        || {},
+        stopping,
+    )
+}
+
+/// Run `wake` on a thread of its own, so that the caller never waits for it. The wake is a connect
+/// to the agent's own listener, and a connect to a listener whose queue is full may wait for room in
+/// it; the caller is the `logout` handler, which has shells to end. A wake that has to wait wakes
+/// nothing that needs waking: the queue is full only if the accept loop is not blocked in `accept`,
+/// and a loop that is not blocked reads the flag before its next `accept`. If no thread can be
+/// started the wake is skipped, for the same reason, and the process still ends when the `logout`
+/// handler is done.
+#[cfg(windows)]
+fn wake_without_blocking(wake: impl FnOnce() + Send + 'static) {
+    if let Err(e) = std::thread::Builder::new().spawn(wake) {
+        tracing::warn!("could not wake the accept loop: {e}");
+    }
 }
 
 /// The accept loop stopped because the agent is ending (see [`serve_connections_with`]).
@@ -278,6 +327,10 @@ struct Connections {
     ended: Condvar,
     /// How long [`Connections::wait_until_only_logouts_live`] waits for connections that do not finish.
     drain_bound: std::time::Duration,
+    /// Called each time the drain is about to park, with the tally locked: the lock is released by
+    /// the park itself, so what this causes to happen to a connection happens after the drain is
+    /// waiting. It must not take the lock. A test uses it to know that the drain is waiting.
+    drain_parks: Box<dyn Fn() + Send + Sync>,
 }
 
 /// The longest an ending agent waits for its connections to finish relaying. Each is waiting on a
@@ -318,8 +371,19 @@ impl Connections {
     }
 
     fn with_drain_bound(drain_bound: std::time::Duration) -> Arc<Self> {
+        Self::with_drain(drain_bound, || {})
+    }
+
+    /// [`Connections::new`] that calls `parks` each time the drain is about to park.
+    #[cfg(test)]
+    fn observing_drain(parks: impl Fn() + Send + Sync + 'static) -> Arc<Self> {
+        Self::with_drain(DRAIN_BOUND, parks)
+    }
+
+    fn with_drain(drain_bound: std::time::Duration, parks: impl Fn() + Send + Sync + 'static) -> Arc<Self> {
         Arc::new(Self {
             drain_bound,
+            drain_parks: Box::new(parks),
             tally: Mutex::new(Tally {
                 live: 0,
                 ended: 0,
@@ -360,7 +424,13 @@ impl Connections {
         let tally = self.lock();
         let (tally, _) = self
             .ended
-            .wait_timeout_while(tally, self.drain_bound, |tally| tally.live > tally.logouts)
+            .wait_timeout_while(tally, self.drain_bound, |tally| {
+                let parks = tally.live > tally.logouts;
+                if parks {
+                    (self.drain_parks)();
+                }
+                parks
+            })
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let still_live = tally.live.saturating_sub(tally.logouts);
         if still_live == 0 {
@@ -586,6 +656,9 @@ type WatchFactory = fn(&ConnTx) -> std::io::Result<(HangupWatcher, Waker)>;
 struct Hooks {
     make_watcher: WatchFactory,
     parked: ParkSignal,
+    /// Called once the session's shell is started and before it is registered, the window in which
+    /// the agent can begin to end.
+    after_spawn: Box<dyn Fn() + Send + Sync>,
 }
 
 #[cfg(windows)]
@@ -594,6 +667,7 @@ impl Hooks {
         Self {
             make_watcher: HangupWatcher::new,
             parked: ParkSignal::default(),
+            after_spawn: Box::new(|| {}),
         }
     }
 }
@@ -611,8 +685,9 @@ fn handle_connection_in(conn: socket2::Socket, hooks: Hooks, control: &Control) 
             end_process(0)
         });
     }
+    // Before a shell is started for nothing; the registration below is what decides.
     if control.is_ending() {
-        return logout::refuse_while_ending(&mut tx);
+        return logout::refuse_while_ending(&mut rx, &mut tx);
     }
     let command = hs.command.clone().unwrap_or_else(default_shell);
     let cwd_buf = child_cwd(&hs.cwd, home_dir());
@@ -644,7 +719,7 @@ mod agent_program_path_tests;
 fn handle_pty(
     mut rx: ConnRx,
     mut fr: FrameReader,
-    tx: ConnTx,
+    mut tx: ConnTx,
     command: &str,
     (cols, rows): (u16, u16),
     cwd: Option<&Path>,
@@ -652,8 +727,11 @@ fn handle_pty(
 ) -> anyhow::Result<()> {
     let Env { hooks, control } = env;
     let mut session = PtySession::spawn(command, cols, rows, cwd)?;
+    (hooks.after_spawn)();
     let job = session.job();
-    let _registration = register_session(control, &job);
+    let Some(_registration) = register_session(control, &job) else {
+        return logout::refuse_while_ending(&mut rx, &mut tx);
+    };
     // Before `tx` moves into the shared mutex.
     let hangup = start_hangup_watch(&tx, &job, hooks.make_watcher);
 
@@ -754,8 +832,9 @@ fn handle_pty(
     Ok(())
 }
 
-/// Record the session so that `logout` can end its shell tree. If the agent is already ending, the
-/// tree is ended here, at once: the session then runs its normal teardown with a shell that is gone.
+/// Record the session so that `logout` can end its shell tree. `None` means the agent is already
+/// ending: the tree is ended here, at once, and the caller answers the login with the refusal
+/// instead of relaying a shell that is gone.
 #[cfg(windows)]
 fn register_session<'a>(control: &'a Control, job: &Arc<cosca::Job>) -> Option<logout::Registration<'a>> {
     let kill_job = Arc::clone(job);
@@ -800,15 +879,18 @@ impl FrameSink for PtyInputSink {
 fn handle_exec(
     mut rx: ConnRx,
     mut fr: FrameReader,
-    tx: ConnTx,
+    mut tx: ConnTx,
     command: &str,
     cwd: Option<&Path>,
     env: Env<'_>,
 ) -> anyhow::Result<()> {
     let Env { hooks, control } = env;
     let mut child = ExecChild::spawn(command, cwd)?;
+    (hooks.after_spawn)();
     let job = child.job();
-    let _registration = register_session(control, &job);
+    let Some(_registration) = register_session(control, &job) else {
+        return logout::refuse_while_ending(&mut rx, &mut tx);
+    };
     // Before `tx` moves into the shared mutex.
     let hangup = start_hangup_watch(&tx, &job, hooks.make_watcher);
     let out_raw = child.stdout_read_raw();

@@ -24,6 +24,17 @@ impl TempBase {
     }
 }
 
+/// [`ensure_base`], then [`prepare_in`]: what `apply` does.
+fn prepare(
+    layout: &Layout,
+    current_exe: &Path,
+    agent_task_xml: Option<&str>,
+    stop_agents: impl FnOnce() -> anyhow::Result<()>,
+) -> anyhow::Result<PathBuf> {
+    let base = ensure_base(layout)?;
+    prepare_in(&base, current_exe, agent_task_xml, stop_agents)
+}
+
 impl Drop for TempBase {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);

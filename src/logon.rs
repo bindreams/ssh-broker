@@ -94,21 +94,29 @@ impl ChildJob {
 /// not say either: it is in a job of the Secondary Logon service's even when it outlives its caller's
 /// (CI round 9).
 ///
+/// `kept_breakaway` is whether the logon call itself asked for breakaway and was not refused. The
+/// probe always asks, so what it found describes the child only if the call did too; if not, the
+/// child is in the caller's job whatever the probe got out of, and only the innermost job's flags
+/// are known.
+///
 /// A job ends what is in it only if it kills on close, or its owner ends it (CI round 11: the job of a
 /// GitHub runner step has no limits). The flags of the innermost job are readable and the probe is
 /// all that is known of the outer ones, so:
-/// - nothing kept the probe: it outlives;
-/// - the innermost job refused the breakaway, so the child stays in it, and it kills on close: it ends;
+/// - the caller is in no job, or the call kept breakaway and nothing kept the probe: it outlives;
+/// - the child stays in the innermost job (the call did not keep breakaway, or the probe was
+///   refused) and that job kills on close: it ends;
 /// - anything else (an outer job kept the probe, the innermost does not kill, no answer): it may end.
-pub fn survival_of(job: &CallerJob, probe: Probe) -> Survival {
+pub fn survival_of(job: &CallerJob, probe: Probe, kept_breakaway: bool) -> Survival {
+    let stays_in_innermost = || match job {
+        CallerJob::Limits(flags) if flags & JOB_KILL_ON_CLOSE != 0 => Survival::EndsWithConnection,
+        _ => Survival::MayEndWithConnection,
+    };
     match probe {
-        Probe::CallerInNoJob | Probe::Started(ChildJob::NotInJob) => Survival::OutlivesConnection,
-        Probe::Refused if matches!(job, CallerJob::Limits(flags) if flags & JOB_KILL_ON_CLOSE != 0) => {
-            Survival::EndsWithConnection
-        }
-        Probe::Refused | Probe::Started(ChildJob::InJob | ChildJob::Unreadable) | Probe::Failed => {
-            Survival::MayEndWithConnection
-        }
+        Probe::CallerInNoJob => Survival::OutlivesConnection,
+        _ if !kept_breakaway => stays_in_innermost(),
+        Probe::Started(ChildJob::NotInJob) => Survival::OutlivesConnection,
+        Probe::Refused => stays_in_innermost(),
+        Probe::Started(ChildJob::InJob | ChildJob::Unreadable) | Probe::Failed => Survival::MayEndWithConnection,
     }
 }
 
@@ -295,7 +303,7 @@ pub fn start_background_agent(
     match result {
         Ok(((), kept_breakaway)) => {
             drop(OwnedHandle(info.hThread));
-            let survival = survival_of(&job, probe);
+            let survival = survival_of(&job, probe, kept_breakaway);
             // The child's own membership is logged for comparison with the probe's.
             let child_job = ChildJob::of_process(info.hProcess);
             tracing::info!(

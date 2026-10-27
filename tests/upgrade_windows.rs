@@ -349,8 +349,8 @@ fn apply_upgrade_that_succeeds_ends_a_background_session_and_restarts_auto_login
     scene.assert_auto_login_restarted(&text);
     let tasks = taskscheduler::session_tasks().unwrap();
     assert!(
-        tasks.iter().any(|task| task.enabled),
-        "the auto-login task is not enabled again: {tasks:?}"
+        !tasks.is_empty() && tasks.iter().all(|task| task.enabled),
+        "an auto-login task is not enabled again: {tasks:?}"
     );
     assert!(
         !Path::new(provision::BASE_DIR).join("sessions-to-enable.txt").exists(),

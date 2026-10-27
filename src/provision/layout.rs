@@ -36,6 +36,11 @@ impl Layout {
         self.base.join("sessions-to-enable.txt")
     }
 
+    /// The file whose lock lets one `apply` run at a time; see [`super::apply_lock`].
+    pub fn apply_lock_path(&self) -> PathBuf {
+        self.base.join("apply.lock")
+    }
+
     /// A single-user install's saved account; `apply` removes it.
     fn legacy_config_path(&self) -> PathBuf {
         self.base.join("config.toml")
@@ -188,17 +193,8 @@ fn remove_if_present(result: std::io::Result<()>) -> std::io::Result<()> {
 /// artifact is found, or an installed exe is about to be replaced by a different build. So
 /// re-running `apply` and the boot self-heal with the installed build leave live agents alone.
 /// The caller starts agents again once the tasks are registered.
-pub fn prepare(
-    layout: &Layout,
-    current_exe: &Path,
-    agent_task_xml: Option<&str>,
-    stop_agents: impl FnOnce() -> anyhow::Result<()>,
-) -> anyhow::Result<PathBuf> {
-    let base = ensure_base(layout)?;
-    prepare_in(&base, current_exe, agent_task_xml, stop_agents)
-}
-
-/// [`prepare`] on a base that already passed [`ensure_base`].
+///
+/// `base` is the proof from [`ensure_base`].
 pub fn prepare_in(
     base: &TrustedBase<'_>,
     current_exe: &Path,

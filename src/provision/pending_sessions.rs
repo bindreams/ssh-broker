@@ -8,9 +8,12 @@
 //! directory has passed its ACL check.
 
 use std::io::Write;
+use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
 
 use anyhow::Context;
+use windows::Win32::Storage::FileSystem::{MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW};
+use windows::core::PCWSTR;
 
 use super::session_task::TASK_PREFIX;
 
@@ -30,8 +33,12 @@ pub fn load(path: &Path) -> anyhow::Result<Vec<String>> {
         .collect())
 }
 
-/// Make `names` the tasks owed an enable; none removes the file. The new contents replace the old
-/// in one step and are on disk when this returns, so a crash leaves the old list or the new one.
+/// Make `names` the tasks owed an enable; none removes the file.
+///
+/// The new contents replace the old in one step and are on disk when this returns (the file is
+/// flushed, and the replacement is written through), so a crash, also of the machine, leaves the
+/// old list or the new one. Removing the file is not written through: a removal that a crash undoes
+/// leaves a list whose tasks are enabled already, and enabling them again is harmless.
 pub fn store(path: &Path, names: &[String]) -> anyhow::Result<()> {
     if names.is_empty() {
         return match std::fs::remove_file(path) {
@@ -50,9 +57,25 @@ pub fn store(path: &Path, names: &[String]) -> anyhow::Result<()> {
             writeln!(file, "{name}")?;
         }
         file.sync_all()?;
-        std::fs::rename(&temporary, path)
+        replace_file(&temporary, path)
     };
     write().with_context(|| format!("write {}", path.display()))
+}
+
+/// Move `from` over `to`, replacing it, and return only once the move is on disk: `std::fs::rename`
+/// is not written through, so a crash just after it could undo the move.
+fn replace_file(from: &Path, to: &Path) -> std::io::Result<()> {
+    let wide = |path: &Path| -> Vec<u16> { path.as_os_str().encode_wide().chain(std::iter::once(0)).collect() };
+    let (from, to) = (wide(from), wide(to));
+    // SAFETY: both paths are NUL-terminated and outlive the call.
+    unsafe {
+        MoveFileExW(
+            PCWSTR(from.as_ptr()),
+            PCWSTR(to.as_ptr()),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    }
+    .map_err(std::io::Error::from)
 }
 
 #[cfg(test)]

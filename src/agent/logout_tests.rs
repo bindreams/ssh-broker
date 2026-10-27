@@ -1,7 +1,9 @@
 //! Unit tests for the agent's answer to `logout`. In-process: no socket, no shell, no process ends.
 use super::*;
+use crate::afunix::{ConnRx, ConnTx, split};
 use crate::agent::Drained;
 use crate::protocol::{ExitCode, FrameKind, FrameReader, Stream};
+use crate::relay::{Outcome, TestSink, pump_decode, write_data};
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
@@ -176,35 +178,34 @@ fn a_session_that_starts_after_the_end_began_is_refused_registration() {
 
 #[test]
 fn the_process_ends_only_after_every_other_connection_has_finished() {
-    let connections = Connections::new();
+    // The drain says it is about to park, and only then does the other connection finish. A handler
+    // that skipped the drain would report the end first.
+    let (events, on_event) = mpsc::channel();
+    let connections = Connections::observing_drain({
+        let events = events.clone();
+        move || {
+            let _ = events.send("parked");
+        }
+    });
     let this_connection = connections.begin();
     let other = connections.begin();
     let control = Arc::new(Control::new(true, Arc::clone(&connections)));
-    let (ending, on_ending) = mpsc::channel();
-    let _session = control
-        .register(Arc::new(move || {
-            let _ = ending.send(());
-        }))
-        .unwrap();
-    let ended = Arc::new(AtomicBool::new(false));
 
-    let worker = {
-        let (control, ended) = (Arc::clone(&control), Arc::clone(&ended));
-        std::thread::spawn(move || {
-            let _live = this_connection;
-            handle_logout(&mut Closed, &mut Vec::new(), &control, || {
-                ended.store(true, Ordering::SeqCst)
-            })
-            .unwrap();
+    let worker = std::thread::spawn(move || {
+        let _live = this_connection;
+        handle_logout(&mut Closed, &mut Vec::new(), &control, || {
+            let _ = events.send("ended");
         })
-    };
-    // The session's shell has been ended; its connection is still relaying the last output.
-    on_ending.recv().unwrap();
-    assert!(!ended.load(Ordering::SeqCst), "the other connection has not finished");
-
+        .unwrap();
+    });
+    assert_eq!(
+        on_event.recv().unwrap(),
+        "parked",
+        "the process ended before the other connection had finished"
+    );
     drop(other);
+    assert_eq!(on_event.recv().unwrap(), "ended");
     worker.join().unwrap();
-    assert!(ended.load(Ordering::SeqCst));
 }
 
 #[test]
@@ -289,14 +290,147 @@ fn the_accept_loop_is_woken_after_the_flag_is_up() {
     *slot.lock().unwrap() = None;
 }
 
+/// A connected AF_UNIX pair in a temp dir (no ACLs: these tests exercise the reply, not the security
+/// boundary). Returns the server's halves, the client's halves and the dir to remove.
+fn socket_pair(tag: &str) -> ((ConnRx, ConnTx), (ConnRx, ConnTx), std::path::PathBuf) {
+    use socket2::{Domain, SockAddr, Socket, Type};
+    let dir = std::env::temp_dir().join(format!("sb-logout-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("s");
+    let listener = Socket::new(Domain::UNIX, Type::STREAM, None).unwrap();
+    listener.bind(&SockAddr::unix(&path).unwrap()).unwrap();
+    listener.listen(1).unwrap();
+    let client = Socket::new(Domain::UNIX, Type::STREAM, None).unwrap();
+    client.connect(&SockAddr::unix(&path).unwrap()).unwrap();
+    let (server, _) = listener.accept().unwrap();
+    (split(server).unwrap(), split(client).unwrap(), dir)
+}
+
 #[test]
-fn a_connection_that_arrives_while_ending_is_told_so_and_gets_a_failing_exit_code() {
-    let mut written = Vec::new();
-    refuse_while_ending(&mut written).unwrap();
-    let (data, exit) = decode(&written);
-    assert_eq!(data, [(Stream::Stderr as u8, ENDING_REPLY.to_string())]);
-    assert_eq!(exit, Some(ENDING_REFUSED_EXIT_CODE));
-    assert_ne!(ENDING_REFUSED_EXIT_CODE, 0, "the login did not get a shell");
+fn a_connection_that_arrives_while_ending_is_told_so_and_exits_255() {
+    let ((mut srx, mut stx), (mut crx, mut ctx), dir) = socket_pair("refusal");
+    // The client has sent its stdin EOF marker, as an exec shim always does, before it reads.
+    write_data(&mut ctx, Stream::Stdin, b"").unwrap();
+    let server = std::thread::spawn(move || refuse_while_ending(&mut srx, &mut stx).unwrap());
+
+    let mut sink = TestSink::default();
+    let outcome = pump_decode(&mut crx, &mut FrameReader::new(), &mut sink).expect("the reply was lost");
+    assert_eq!(outcome, Outcome::Exited(255));
+    assert_eq!(sink.stderr, ENDING_REFUSAL.as_bytes());
+    // The server is done only once the client has closed.
+    drop((crx, ctx));
+    server.join().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn the_refusal_is_one_line_that_says_the_session_is_ending_and_to_reconnect() {
+    assert_eq!(ENDING_REFUSAL.matches('\n').count(), 1);
+    assert!(ENDING_REFUSAL.ends_with("\r\n"));
+    assert!(ENDING_REFUSAL.contains("ending"), "{ENDING_REFUSAL}");
+    assert!(ENDING_REFUSAL.contains("reconnect"), "{ENDING_REFUSAL}");
+    // 255 is what ssh uses for a failed connection and what the shim uses for a dead agent; 1 would
+    // look like the command's own failure (grep found nothing).
+    assert_eq!(ENDING_REFUSED_EXIT_CODE, 255);
+}
+
+#[test]
+fn the_refusal_arrives_although_the_client_keeps_sending_input() {
+    // More than the socket buffers hold, so a server that has stopped reading cannot hide behind them.
+    const AFTER_HANDSHAKE: usize = 8 * 1024 * 1024;
+    let ((mut srx, mut stx), (mut crx, mut ctx), dir) = socket_pair("refusal-input");
+    let client = std::thread::spawn(move || {
+        let chunk = [b'x'; 32 * 1024];
+        for _ in 0..AFTER_HANDSHAKE / chunk.len() {
+            write_data(&mut ctx, Stream::Stdin, &chunk).expect("input after the handshake must still be read");
+        }
+        let mut sink = TestSink::default();
+        let outcome = pump_decode(&mut crx, &mut FrameReader::new(), &mut sink).expect("the reply was lost");
+        (outcome, sink.stderr)
+    });
+    refuse_while_ending(&mut srx, &mut stx).unwrap();
+    let (outcome, stderr) = client.join().unwrap();
+    assert_eq!(outcome, Outcome::Exited(ENDING_REFUSED_EXIT_CODE));
+    assert_eq!(stderr, ENDING_REFUSAL.as_bytes());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_login_that_registers_after_the_flag_is_up_but_before_the_shells_are_ended_is_refused() {
+    // The window between raising the flag and ending the registered shells: a session that
+    // registered in it would be neither ended with the rest nor refused.
+    let refused = Arc::new(AtomicBool::new(false));
+    let slot: Arc<Mutex<Option<Arc<Control>>>> = Arc::new(Mutex::new(None));
+    let control = Arc::new(Control::new(true, Connections::new()).with_waker({
+        let (refused, slot) = (Arc::clone(&refused), Arc::clone(&slot));
+        move || {
+            let control = slot.lock().unwrap().clone().unwrap();
+            let killed = Arc::new(AtomicUsize::new(0));
+            refused.store(control.register(counting_killer(&killed)).is_none(), Ordering::SeqCst);
+        }
+    }));
+    *slot.lock().unwrap() = Some(Arc::clone(&control));
+    let killed = Arc::new(AtomicUsize::new(0));
+    let _before = control.register(counting_killer(&killed)).unwrap();
+
+    handle_logout(&mut Closed, &mut Vec::new(), &control, || {}).unwrap();
+
+    assert!(
+        refused.load(Ordering::SeqCst),
+        "a login that came after the flag was accepted"
+    );
+    assert_eq!(
+        killed.load(Ordering::SeqCst),
+        1,
+        "a login that came before it is ended with the rest"
+    );
+    *slot.lock().unwrap() = None;
+}
+
+#[test]
+fn a_session_that_registers_while_the_shells_are_being_ended_is_refused() {
+    let slot: Arc<Mutex<Option<Arc<Control>>>> = Arc::new(Mutex::new(None));
+    let control = Arc::new(Control::new(true, Connections::new()));
+    *slot.lock().unwrap() = Some(Arc::clone(&control));
+    let refused = Arc::new(AtomicBool::new(false));
+    let _first = control
+        .register({
+            let (refused, slot) = (Arc::clone(&refused), Arc::clone(&slot));
+            Arc::new(move || {
+                let control = slot.lock().unwrap().clone().unwrap();
+                let killed = Arc::new(AtomicUsize::new(0));
+                refused.store(control.register(counting_killer(&killed)).is_none(), Ordering::SeqCst);
+            })
+        })
+        .unwrap();
+
+    handle_logout(&mut Closed, &mut Vec::new(), &control, || {}).unwrap();
+
+    assert!(refused.load(Ordering::SeqCst));
+    *slot.lock().unwrap() = None;
+}
+
+#[test]
+fn a_logout_whose_client_is_gone_before_the_reply_still_ends_the_agent() {
+    struct Gone;
+    impl Write for Gone {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::ErrorKind::BrokenPipe.into())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::ErrorKind::BrokenPipe.into())
+        }
+    }
+    let control = Control::new(true, Connections::new());
+    let killed = Arc::new(AtomicUsize::new(0));
+    let _session = control.register(counting_killer(&killed)).unwrap();
+    let ended = AtomicBool::new(false);
+
+    handle_logout(&mut Closed, &mut Gone, &control, || ended.store(true, Ordering::SeqCst)).unwrap();
+
+    assert!(ended.load(Ordering::SeqCst), "every logout ends the agent");
+    assert_eq!(killed.load(Ordering::SeqCst), 1);
 }
 
 // a handler that never returns -----

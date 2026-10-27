@@ -169,7 +169,7 @@ fn killing() -> CallerJob {
 #[test]
 fn a_caller_in_no_job_outlives_the_connection() {
     assert_eq!(
-        survival_of(&CallerJob::NotInJob, Probe::CallerInNoJob),
+        survival_of(&CallerJob::NotInJob, Probe::CallerInNoJob, true),
         Survival::OutlivesConnection
     );
 }
@@ -178,7 +178,7 @@ fn a_caller_in_no_job_outlives_the_connection() {
 #[test]
 fn a_probe_that_got_out_of_every_job_outlives_the_connection() {
     assert_eq!(
-        survival_of(&killing(), Probe::Started(ChildJob::NotInJob)),
+        survival_of(&killing(), Probe::Started(ChildJob::NotInJob), true),
         Survival::OutlivesConnection
     );
 }
@@ -189,7 +189,7 @@ fn a_probe_that_got_out_of_every_job_outlives_the_connection() {
 #[test]
 fn a_probe_that_an_outer_job_kept_may_end_with_the_connection() {
     assert_eq!(
-        survival_of(&killing(), Probe::Started(ChildJob::InJob)),
+        survival_of(&killing(), Probe::Started(ChildJob::InJob), true),
         Survival::MayEndWithConnection
     );
 }
@@ -198,11 +198,15 @@ fn a_probe_that_an_outer_job_kept_may_end_with_the_connection() {
 /// is in it and goes when it closes.
 #[test]
 fn a_probe_that_a_killing_innermost_job_refused_ends_with_the_connection() {
-    assert_eq!(survival_of(&killing(), Probe::Refused), Survival::EndsWithConnection);
+    assert_eq!(
+        survival_of(&killing(), Probe::Refused, true),
+        Survival::EndsWithConnection
+    );
     assert_eq!(
         survival_of(
             &CallerJob::Limits(KILL_ON_JOB_CLOSE | SILENT_BREAKAWAY_OK),
-            Probe::Refused
+            Probe::Refused,
+            true
         ),
         Survival::EndsWithConnection
     );
@@ -213,11 +217,11 @@ fn a_probe_that_a_killing_innermost_job_refused_ends_with_the_connection() {
 #[test]
 fn a_probe_that_an_innermost_job_without_kill_on_close_refused_may_end() {
     assert_eq!(
-        survival_of(&CallerJob::Limits(0), Probe::Refused),
+        survival_of(&CallerJob::Limits(0), Probe::Refused, true),
         Survival::MayEndWithConnection
     );
     assert_eq!(
-        survival_of(&CallerJob::Limits(SILENT_BREAKAWAY_OK), Probe::Refused),
+        survival_of(&CallerJob::Limits(SILENT_BREAKAWAY_OK), Probe::Refused, true),
         Survival::MayEndWithConnection
     );
 }
@@ -227,13 +231,56 @@ fn a_probe_that_an_innermost_job_without_kill_on_close_refused_may_end() {
 #[test]
 fn a_probe_that_gave_no_answer_is_claimed_neither_way() {
     assert_eq!(
-        survival_of(&killing(), Probe::Started(ChildJob::Unreadable)),
+        survival_of(&killing(), Probe::Started(ChildJob::Unreadable), true),
         Survival::MayEndWithConnection
     );
-    assert_eq!(survival_of(&killing(), Probe::Failed), Survival::MayEndWithConnection);
     assert_eq!(
-        survival_of(&CallerJob::Unreadable, Probe::Failed),
+        survival_of(&killing(), Probe::Failed, true),
         Survival::MayEndWithConnection
+    );
+    assert_eq!(
+        survival_of(&CallerJob::Unreadable, Probe::Failed, true),
+        Survival::MayEndWithConnection
+    );
+}
+
+/// The probe always asks for breakaway, so what it found describes the logon child only if the logon
+/// call asked too and kept it. When the call fell back to no breakaway (an outer job refused it), the
+/// child is in the caller's job whatever the probe got out of, and the claim is the one for staying in
+/// the innermost job.
+#[test]
+fn a_logon_that_fell_back_to_no_breakaway_stays_in_the_callers_job_whatever_the_probe_found() {
+    for probe in [
+        Probe::Started(ChildJob::NotInJob),
+        Probe::Started(ChildJob::InJob),
+        Probe::Started(ChildJob::Unreadable),
+        Probe::Refused,
+        Probe::Failed,
+    ] {
+        assert_eq!(
+            survival_of(&killing(), probe, false),
+            Survival::EndsWithConnection,
+            "{probe:?} in a killing job"
+        );
+        assert_eq!(
+            survival_of(&CallerJob::Limits(0), probe, false),
+            Survival::MayEndWithConnection,
+            "{probe:?} in a job that does not kill"
+        );
+        assert_eq!(
+            survival_of(&CallerJob::Unreadable, probe, false),
+            Survival::MayEndWithConnection,
+            "{probe:?} in a job nobody could read"
+        );
+    }
+}
+
+/// A caller in no job has nothing to fall back into.
+#[test]
+fn a_caller_in_no_job_outlives_the_connection_without_breakaway_too() {
+    assert_eq!(
+        survival_of(&CallerJob::NotInJob, Probe::CallerInNoJob, false),
+        Survival::OutlivesConnection
     );
 }
 

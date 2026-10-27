@@ -86,7 +86,7 @@ fn agent_pty_session_creates_a_hangup_watcher_and_survives_its_failure() {
             CREATED.fetch_add(1, Ordering::SeqCst);
             HangupWatcher::new(tx)
         },
-        parked: ParkSignal::default(),
+        ..Hooks::production()
     };
     let (outcome, text) = run_pty_echo_session("pty-watcher", counting);
     assert_eq!(outcome, Outcome::Exited(0));
@@ -99,11 +99,154 @@ fn agent_pty_session_creates_a_hangup_watcher_and_survives_its_failure() {
 
     let failing = Hooks {
         make_watcher: |_| Err(std::io::Error::other("forced watcher failure")),
-        parked: ParkSignal::default(),
+        ..Hooks::production()
     };
     let (outcome, text) = run_pty_echo_session("pty-no-watcher", failing);
     assert_eq!(outcome, Outcome::Exited(0));
     assert!(text.contains("pty-ok"), "relayed output was: {text:?}");
+}
+
+// A login that reaches an ending agent -----
+
+/// More than the socket buffers hold, so an agent that has stopped reading cannot hide behind them.
+const INPUT_AFTER_HANDSHAKE: usize = 8 * 1024 * 1024;
+
+/// Send a login in `mode` that never ends by itself, then input after the handshake, and return
+/// what the agent answers. `agent` handles the connection.
+fn refused_login(tag: &str, mode: Mode, agent: impl FnOnce(socket2::Socket)) -> (Outcome, Vec<u8>) {
+    let dir = hardened_dir(tag);
+    let sock = dir.join("s");
+    let listener = Listener::bind(&sock).unwrap();
+    let client_path = sock.clone();
+    let client = thread::spawn(move || {
+        let conn = afunix::connect(&client_path).unwrap();
+        let (mut crx, mut ctx) = afunix::split(conn).unwrap();
+        let hs = Handshake {
+            mode,
+            command: Some("cmd.exe /c ping -n 120 127.0.0.1 > nul".into()),
+            ..Handshake::pty_default()
+        };
+        write_frame(&mut ctx, FrameKind::Handshake, &hs.encode().unwrap()).unwrap();
+        let stream = if mode == Mode::Pty { Stream::Pty } else { Stream::Stdin };
+        let chunk = [b'x'; 32 * 1024];
+        for _ in 0..INPUT_AFTER_HANDSHAKE / chunk.len() {
+            write_data(&mut ctx, stream, &chunk).expect("input after the handshake must still be read");
+        }
+        let mut fr = FrameReader::new();
+        let mut sink = TestSink::default();
+        let outcome = pump_decode(&mut crx, &mut fr, &mut sink).expect("the refusal was lost");
+        (outcome, sink.stderr)
+    });
+    agent(listener.accept().unwrap());
+    let answer = client.join().unwrap();
+    std::fs::remove_dir_all(&dir).ok();
+    answer
+}
+
+fn assert_refused((outcome, stderr): (Outcome, Vec<u8>)) {
+    assert_eq!(outcome, Outcome::Exited(255));
+    assert_eq!(stderr, super::logout::ENDING_REFUSAL.as_bytes());
+}
+
+#[test]
+fn an_exec_login_to_an_ending_agent_is_refused_before_a_shell_starts() {
+    let control = super::Control::new(true, super::Connections::new());
+    control.end_all();
+    assert_refused(refused_login("refused-exec", Mode::Exec, |conn| {
+        let hooks = Hooks {
+            after_spawn: Box::new(|| panic!("a shell was started for a login the agent had refused")),
+            ..Hooks::production()
+        };
+        super::handle_connection_in(conn, hooks, &control).unwrap();
+    }));
+}
+
+#[test]
+fn an_exec_login_that_loses_the_race_with_the_end_is_refused_not_relayed() {
+    let control = std::sync::Arc::new(super::Control::new(true, super::Connections::new()));
+    assert_refused(refused_login("raced-exec", Mode::Exec, |conn| {
+        // The end begins after the shell has started and before it is registered.
+        let hooks = Hooks {
+            after_spawn: {
+                let control = std::sync::Arc::clone(&control);
+                Box::new(move || control.end_all())
+            },
+            ..Hooks::production()
+        };
+        super::handle_connection_in(conn, hooks, &control).unwrap();
+    }));
+}
+
+#[test]
+fn a_pty_login_that_loses_the_race_with_the_end_is_refused_not_relayed() {
+    let control = std::sync::Arc::new(super::Control::new(true, super::Connections::new()));
+    assert_refused(refused_login("raced-pty", Mode::Pty, |conn| {
+        let hooks = Hooks {
+            after_spawn: {
+                let control = std::sync::Arc::clone(&control);
+                Box::new(move || control.end_all())
+            },
+            ..Hooks::production()
+        };
+        super::handle_connection_in(conn, hooks, &control).unwrap();
+    }));
+}
+
+/// While the agent waits for its connections to finish, a login is answered with the refusal at
+/// once: the listener stays open, and the answer does not wait for the drain.
+#[test]
+fn a_login_that_arrives_while_the_agent_drains_gets_the_refusal_at_once() {
+    use std::sync::Arc;
+    use std::sync::mpsc;
+
+    let dir = hardened_dir("drain-login");
+    let sock = dir.join("s");
+    let listener = Listener::bind(&sock).unwrap();
+    let (events, on_event) = mpsc::channel();
+    let connections = super::Connections::observing_drain({
+        let events = events.clone();
+        move || {
+            let _ = events.send("draining");
+        }
+    });
+    // A connection that is still relaying: the drain cannot finish until the test lets it go.
+    let relaying = connections.begin();
+    let control = Arc::new(super::Control::new(true, Arc::clone(&connections)).with_waker({
+        let sock = sock.clone();
+        move || {
+            super::wake_without_blocking({
+                let sock = sock.clone();
+                move || drop(afunix::connect(&sock))
+            })
+        }
+    }));
+    let serving = thread::spawn({
+        let (connections, control) = (Arc::clone(&connections), Arc::clone(&control));
+        move || super::serve_until_drained(listener, &connections, &control)
+    });
+
+    control.end_all();
+    assert_eq!(on_event.recv().unwrap(), "draining");
+
+    let conn = afunix::connect(&sock).expect("the listener was closed while the agent drained");
+    let (mut crx, mut ctx) = afunix::split(conn).unwrap();
+    let hs = Handshake {
+        mode: Mode::Exec,
+        command: Some("cmd.exe /c exit /b 0".into()),
+        ..Handshake::pty_default()
+    };
+    write_frame(&mut ctx, FrameKind::Handshake, &hs.encode().unwrap()).unwrap();
+    write_data(&mut ctx, Stream::Stdin, b"").unwrap();
+    let mut sink = TestSink::default();
+    let outcome = pump_decode(&mut crx, &mut FrameReader::new(), &mut sink).expect("the refusal was lost");
+    assert_refused((outcome, sink.stderr));
+
+    // Only now does the relaying connection finish, and the drain with it.
+    drop((crx, ctx));
+    drop(relaying);
+    let end = serving.join().unwrap();
+    assert!(end.downcast_ref::<super::Stopped>().is_some(), "{end:#}");
+    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
@@ -277,7 +420,7 @@ fn agent_exec_runs_the_command_when_the_hangup_watcher_cannot_be_created() {
     let conn = listener.accept().unwrap();
     let hooks = Hooks {
         make_watcher: |_| Err(std::io::Error::other("forced watcher failure")),
-        parked: ParkSignal::default(),
+        ..Hooks::production()
     };
     super::handle_connection_with(conn, hooks).unwrap();
 
