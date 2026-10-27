@@ -21,7 +21,7 @@ use ssh_broker::socket_loc;
 use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
 use windows::Win32::System::Threading::WaitForSingleObject;
 
-use crate::account_fixture::{Account, hive};
+use crate::account_fixture::{Account, hive, profile};
 use crate::agent_conn::AgentConn;
 use crate::bounded_wait::CHILD_EXIT_BOUND;
 use crate::logon_session::{self, LogoffWatch};
@@ -32,12 +32,19 @@ pub const LOGOFF_EVENT_BOUND: Duration = Duration::from_secs(180);
 
 /// Ask the background agent of `account` (the one running `exe`) to end with `exe logout`, run inside the
 /// agent as the account, wait for every process of its logon session to exit, then for the session's
-/// logoff. `Ok(true)` when a session was ended; `Ok(false)` when the account has no agent running `exe`.
-/// A failure names the step. It does not kill anything: the caller decides what the fallback is.
+/// logoff and for the account's hive to unload. `Ok(true)` when a session was ended; `Ok(false)` when the
+/// account has no agent running `exe`. A failure names the step. It does not kill anything: the caller
+/// decides what the fallback is. One line about the attempt goes to the measurement file, pass or fail.
 pub fn log_out(exe: &Path, account: &Account) -> Result<bool, String> {
     match account.try_profile() {
-        Some(profile) => attempt("end the session", || try_end(exe, &account.name, &account.sid, profile))?,
-        None => Ok(false),
+        Some(profile) => end("log_out", exe, &account.name, &account.sid, &account.sid_text, profile),
+        None => {
+            hive::record(&format!(
+                "session end [log_out] {} ({}): the account has no profile, so no agent to end",
+                account.name, account.sid_text
+            ));
+            Ok(false)
+        }
     }
 }
 
@@ -48,6 +55,7 @@ pub struct LogOutOnDrop {
     exe: PathBuf,
     name: String,
     sid: Sid,
+    sid_text: String,
     profile: Option<PathBuf>,
 }
 
@@ -57,6 +65,7 @@ impl LogOutOnDrop {
             exe: exe.to_owned(),
             name: account.name.clone(),
             sid: Sid::lookup(&account.name).expect("look up the account's SID"),
+            sid_text: account.sid_text.clone(),
             profile: account.try_profile().map(Path::to_owned),
         }
     }
@@ -64,10 +73,14 @@ impl LogOutOnDrop {
 
 impl Drop for LogOutOnDrop {
     fn drop(&mut self) {
-        let Some(profile) = &self.profile else { return };
-        // A panic here, while a failed test unwinds, would abort the test process.
-        let ended = attempt("end the session", || try_end(&self.exe, &self.name, &self.sid, profile)).and_then(|r| r);
-        if let Err(why) = ended {
+        let Some(profile) = &self.profile else {
+            hive::record(&format!(
+                "session end [drop] {} ({}): the account has no profile, so no agent to end",
+                self.name, self.sid_text
+            ));
+            return;
+        };
+        if let Err(why) = end("drop", &self.exe, &self.name, &self.sid, &self.sid_text, profile) {
             hive::record(&format!(
                 "the logout of {} failed ({why}); its processes are ended by killing them instead",
                 self.name
@@ -76,8 +89,44 @@ impl Drop for LogOutOnDrop {
     }
 }
 
-fn try_end(exe: &Path, name: &str, sid: &Sid, profile: &Path) -> Result<bool, String> {
+/// [`try_end`], then the wait for the hive to unload, with one line in the measurement file saying what each
+/// step found. A panic of a step (this runs in a drop, while a failed test may unwind) is an error.
+fn end(who: &str, exe: &Path, name: &str, sid: &Sid, sid_text: &str, profile: &Path) -> Result<bool, String> {
+    let mut steps = Vec::new();
+    let ended = attempt("end the session", || try_end(exe, name, sid, profile, &mut steps)).and_then(|r| r);
+    // Always looked at, so that the line says where the hive is whatever the steps before did.
+    let unloaded = profile::wait_unloaded(sid_text);
+    let outcome = match (&ended, &unloaded) {
+        (Ok(true), Err(why)) => Err(format!("the hive of {name} did not unload after the logoff: {why}")),
+        (Ok(ended), _) => Ok(*ended),
+        (Err(why), _) => Err(why.clone()),
+    };
+    let hive_text = match &unloaded {
+        Ok(unload) => unload.to_string(),
+        Err(why) => why.clone(),
+    };
+    hive::record(&format!(
+        "session end [{who}] {name} ({sid_text}): {}; hive: {hive_text}; result: {}",
+        steps.join("; "),
+        match &outcome {
+            Ok(true) => "a session was ended".to_owned(),
+            Ok(false) => "no agent to end".to_owned(),
+            Err(why) => format!("failed: {why}"),
+        }
+    ));
+    outcome
+}
+
+/// The steps of ending the session; each fact is pushed to `steps` as soon as it is known, so a step that
+/// fails leaves the ones before it.
+fn try_end(exe: &Path, name: &str, sid: &Sid, profile: &Path, steps: &mut Vec<String>) -> Result<bool, String> {
     let agents = procwait::user_agents(exe, sid).map_err(|e| format!("look for the agents of {name}: {e:#}"))?;
+    steps.push(format!(
+        "agents running {}: {} (pids {:?})",
+        exe.display(),
+        agents.len(),
+        agents.iter().map(|agent| agent.pid).collect::<Vec<_>>()
+    ));
     if agents.is_empty() {
         return Ok(false);
     }
@@ -94,6 +143,11 @@ fn try_end(exe: &Path, name: &str, sid: &Sid, profile: &Path) -> Result<bool, St
         .flat_map(|id| logon_session::processes_of(*id))
         .filter(|(pid, _)| *pid != own)
         .collect();
+    steps.push(format!(
+        "logon sessions {:?}, {} other process(es) in them",
+        ids.iter().map(|id| format!("{id:#x}")).collect::<Vec<_>>(),
+        held.len()
+    ));
 
     let location = socket_loc::for_profile(profile).map_err(|e| e.to_string())?;
     let finished = attempt("ask the agent to log out", || {
@@ -102,6 +156,7 @@ fn try_end(exe: &Path, name: &str, sid: &Sid, profile: &Path) -> Result<bool, St
         asker.end_stdin();
         asker.read_to_end()
     })?;
+    steps.push(format!("logout exit {:?}", finished.exit));
     if finished.exit != Some(0) {
         return Err(format!(
             "logout exited with {:?}; stderr: {}",
@@ -111,18 +166,27 @@ fn try_end(exe: &Path, name: &str, sid: &Sid, profile: &Path) -> Result<bool, St
     for (pid, process) in &held {
         wait_exited(process.0, *pid, name)?;
     }
+    steps.push("every process of the sessions exited".to_owned());
     // A handle on a process keeps its token, and so the logon session, alive.
     drop(held);
     drop(agents);
+    let mut missing = Vec::new();
     for (id, watch) in &watches {
-        if !watch.wait(LOGOFF_EVENT_BOUND) {
-            return Err(format!(
-                "logon session {id:#x} of {name} still present: no 4634 within {LOGOFF_EVENT_BOUND:?} although every \
-                 process of it has ended"
-            ));
+        let seen = watch.wait(LOGOFF_EVENT_BOUND);
+        steps.push(format!("4634 for {id:#x}: {}", if seen { "seen" } else { "not seen" }));
+        if !seen {
+            missing.push(format!("{id:#x}"));
         }
     }
-    Ok(true)
+    if missing.is_empty() {
+        Ok(true)
+    } else {
+        Err(format!(
+            "logon session(s) {} of {name} still present: no 4634 within {LOGOFF_EVENT_BOUND:?} although every \
+             process of them has ended",
+            missing.join(", ")
+        ))
+    }
 }
 
 /// Wait for `process` to exit, up to [`CHILD_EXIT_BOUND`]: an exit that may never come.

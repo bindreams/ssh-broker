@@ -299,7 +299,8 @@ fn wait_for_marker(location: &SocketLocation, agent: Option<HANDLE>, bound: std:
             watch.rearm().unwrap_or_else(|e| panic!("{e:#}"));
         } else if woke == WAIT_TIMEOUT {
             panic!(
-                "no agent was serving {} after {bound:?}: it neither wrote its serving marker nor ended,                  or the scheduled task did not start one",
+                "no agent was serving {} after {bound:?}: it neither wrote its serving marker nor ended, \
+                 or the scheduled task did not start one",
                 location.dir.display()
             );
         } else if let Some(agent) = agent {

@@ -61,38 +61,51 @@ pub(super) fn delete(sid_text: &str) -> windows::core::Result<()> {
     unsafe { DeleteProfileW(PCWSTR(wide(sid_text).as_ptr()), PCWSTR::null(), PCWSTR::null()) }
 }
 
-/// Wait for `HKEY_USERS\<sid>` to unload, and say when it did or that it had not after [`UNLOAD_BOUND`]. A
-/// measurement of the normal end of a session, not a check: nothing is asserted from the answer.
-pub fn measure_unload(sid_text: &str) -> String {
-    let watch = match HiveWatch::arm() {
-        Ok(watch) => watch,
-        Err(e) => return format!("not measured: {e}"),
-    };
+/// When `HKEY_USERS\<sid>` was found unloaded.
+pub enum Unload {
+    /// The first look found it unloaded.
+    Already,
+    /// It was loaded at the first look and unloaded this long after.
+    After(Duration),
+}
+
+impl std::fmt::Display for Unload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Unload::Already => f.write_str("already unloaded when first looked at"),
+            Unload::After(took) => write!(f, "unloaded {took:?} after it was first looked at"),
+        }
+    }
+}
+
+/// Wait for `HKEY_USERS\<sid>` to unload. Fails, saying what is loaded, if it is still loaded
+/// [`UNLOAD_BOUND`] after the first look: an external event that can fail to come.
+pub fn wait_unloaded(sid_text: &str) -> Result<Unload, String> {
+    let watch = HiveWatch::arm().map_err(|e| format!("not measured: {e}"))?;
     let started = Instant::now();
     let mut first = true;
     loop {
         match hive_loaded(sid_text) {
             Ok(false) => {
-                return if first {
-                    "already unloaded when first looked at".to_string()
+                return Ok(if first {
+                    Unload::Already
                 } else {
-                    format!("unloaded {:?} after it was first looked at", started.elapsed())
-                };
+                    Unload::After(started.elapsed())
+                });
             }
-            Ok(true) if first => first = false,
-            Ok(true) => {}
-            Err(e) => return format!("not measured: {e}"),
+            Ok(true) => first = false,
+            Err(e) => return Err(format!("not measured: {e}")),
         }
         let left = UNLOAD_BOUND.saturating_sub(started.elapsed());
         if left.is_zero() {
-            return format!(
+            return Err(format!(
                 "still loaded {UNLOAD_BOUND:?} after it was first looked at; {}",
                 hive_state(sid_text)
-            );
+            ));
         }
-        if let Err(e) = watch.wait(left.min(RECHECK)) {
-            return format!("not measured: {e}");
-        }
+        watch
+            .wait(left.min(RECHECK))
+            .map_err(|e| format!("not measured: {e}"))?;
     }
 }
 
