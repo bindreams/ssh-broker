@@ -32,6 +32,8 @@ mod machine;
 mod password;
 #[path = "common/process_list.rs"]
 mod process_list;
+#[path = "common/session_end.rs"]
+mod session_end;
 #[path = "common/stand_in.rs"]
 mod stand_in;
 #[path = "common/system_task.rs"]
@@ -72,14 +74,12 @@ fn with_session(kit: &Kit, account: &Account, check: impl FnOnce(&mut dyn FnMut(
     logout_with(kit, account);
 }
 
-/// Ask the agent to end the session with the kit's copy of the exe.
+/// End the session with the product's `logout` (the kit's copy of the exe, run inside the agent) and wait for
+/// its logoff, so that the system unloads the profile.
 fn logout_with(kit: &Kit, account: &Account) {
-    let location = location(account);
-    let mut asker = AgentConn::connect(&location);
-    asker.start_exec(&format!("\"{}\" logout", kit.exe.display()));
-    asker.end_stdin();
-    let done = asker.read_to_end();
-    assert_eq!(done.exit, Some(0), "logout: {}", done.stderr);
+    let ended =
+        session_end::log_out(&kit.exe, account).unwrap_or_else(|why| panic!("logout of {}: {why}", account.name));
+    assert!(ended, "no agent of {} was running to log out", account.name);
 }
 
 fn state_of(account: &Account) -> Option<ssh_broker::provision::session_task::TaskState> {
@@ -99,6 +99,7 @@ fn on_registers_a_verified_task_and_off_deletes_it() {
     let _machine = machine::shared();
     let kit = kit("al1");
     let account = account_with_batch_right("al1");
+    let _end = session_end::LogOutOnDrop::new(&kit.exe, &account);
     let local = local_account(&account);
 
     autologin::on(&mut env(&kit, &account.password), &local).unwrap();
@@ -118,6 +119,7 @@ fn off_twice_is_ok() {
     let _machine = machine::shared();
     let kit = kit("al2");
     let account = account_with_batch_right("al2");
+    let _end = session_end::LogOutOnDrop::new(&kit.exe, &account);
     let local = local_account(&account);
 
     autologin::on(&mut env(&kit, &account.password), &local).unwrap();
@@ -146,6 +148,7 @@ fn stored_task_starts_a_working_session_with_dpapi() {
     let _machine = machine::shared();
     let kit = kit("al4");
     let account = account_with_batch_right("al4");
+    let _end = session_end::LogOutOnDrop::new(&kit.exe, &account);
     let local = local_account(&account);
 
     autologin::on(&mut env(&kit, &account.password), &local).unwrap();
@@ -189,6 +192,7 @@ fn stored_task_for_an_administrator_starts_a_session() {
     let _machine = machine::shared();
     let kit = kit("al5");
     let account = Account::create("al5", true);
+    let _end = session_end::LogOutOnDrop::new(&kit.exe, &account);
     account.make_administrator();
     let local = local_account(&account);
 
@@ -229,6 +233,7 @@ fn credential_is_gone_after_off() {
     let _machine = machine::shared();
     let kit = kit("al7");
     let account = account_with_batch_right("al7");
+    let _end = session_end::LogOutOnDrop::new(&kit.exe, &account);
     let local = local_account(&account);
 
     autologin::on(&mut env(&kit, &account.password), &local).unwrap();
@@ -254,6 +259,7 @@ fn on_twice_then_off_leaves_no_credential() {
     let _machine = machine::shared();
     let kit = kit("al8");
     let account = account_with_batch_right("al8");
+    let _end = session_end::LogOutOnDrop::new(&kit.exe, &account);
     let local = local_account(&account);
 
     autologin::on(&mut env(&kit, &account.password), &local).unwrap();
@@ -276,6 +282,7 @@ fn a_stale_password_is_not_visible_in_the_last_result() {
     logon_session::assert_auditing("Logon", "Failure");
     let kit = kit("al9");
     let mut account = account_with_batch_right("al9");
+    let _end = session_end::LogOutOnDrop::new(&kit.exe, &account);
     let local: LocalAccount = local_account(&account);
     let exe = kit.exe.to_string_lossy().into_owned();
 

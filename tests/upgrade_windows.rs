@@ -28,12 +28,16 @@ mod bounded_wait;
 mod desktop;
 #[path = "common/hard_errors.rs"]
 mod hard_errors;
+#[path = "common/logon_session.rs"]
+mod logon_session;
 #[path = "common/machine.rs"]
 mod machine;
 #[path = "common/password.rs"]
 mod password;
 #[path = "common/process_list.rs"]
 mod process_list;
+#[path = "common/session_end.rs"]
+mod session_end;
 #[path = "common/stand_in.rs"]
 mod stand_in;
 
@@ -137,6 +141,8 @@ struct Scene {
     // Fields drop in order, and an account's profile stays in use while this test holds a handle on a process
     // of the account: `session` is the prompt-path agent of `prompted`, so `prompted` comes after it.
     _prompted: Account,
+    // Ends the auto-login session with the product's `logout` before `auto` goes (see `session_end`).
+    _end_auto: session_end::LogOutOnDrop,
     auto: Account,
     _install: Install,
 }
@@ -165,6 +171,7 @@ fn scene() -> Scene {
     // An auto-login session, from a task, running the installed exe.
     let auto = Account::create("up1", true);
     auto.grant_batch_logon_right();
+    let end_auto = session_end::LogOutOnDrop::new(&installed, &auto);
     autologin::on(
         &mut WindowsEnv::new(PasswordSource::Given(Some(password::password(&auto.password)))),
         &local_account(&auto),
@@ -193,6 +200,7 @@ fn scene() -> Scene {
         before,
         session,
         _prompted: prompted,
+        _end_auto: end_auto,
         auto,
         _install: install,
     }

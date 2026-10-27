@@ -21,18 +21,24 @@ use ssh_broker::provision::registry::{OPENSSH_KEY, set_default_shell_under};
 
 #[path = "common/account.rs"]
 mod account_fixture;
+#[path = "common/agent_conn.rs"]
+mod agent_conn;
 #[path = "common/bounded_wait.rs"]
 mod bounded_wait;
 #[path = "common/desktop.rs"]
 mod desktop;
 #[path = "common/hard_errors.rs"]
 mod hard_errors;
+#[path = "common/logon_session.rs"]
+mod logon_session;
 #[path = "common/machine.rs"]
 mod machine;
 #[path = "common/password.rs"]
 mod password;
 #[path = "common/process_list.rs"]
 mod process_list;
+#[path = "common/session_end.rs"]
+mod session_end;
 #[path = "common/stand_in.rs"]
 mod stand_in;
 
@@ -441,6 +447,8 @@ fn prompt_path_through_real_sshd() {
     account_fixture::assert_elevated();
     let kit = Kit::broker_with_helper("sshd");
     let account = Account::create("sshd", true);
+    // The session is ended with `logout` before the account goes, passing or failing (see `session_end`).
+    let _end = session_end::LogOutOnDrop::new(&kit.exe, &account);
     let login = Login::new(&kit, &account);
 
     // 1. What the shim runs in under sshd: the probe is the DefaultShell for one command.
@@ -497,6 +505,7 @@ fn prompt_path_through_real_sshd() {
 /// prompts and logs on, both end in the same session's shell, neither hangs, and the session outlives both.
 fn two_simultaneous_first_connections(kit: &Kit) {
     let account = Account::create("sshd2", true);
+    let _end = session_end::LogOutOnDrop::new(&kit.exe, &account);
     let login = Login::new(kit, &account);
 
     let mut sessions = [login.start(), login.start()];

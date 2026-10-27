@@ -543,29 +543,16 @@ impl Drop for Account {
         // last process has exited, so this waits for that (CI round 14: a delete right after the exit failed
         // with "in use" and the profile, about 1.3 GB, stayed).
         let removed = profile::remove(&self.sid_text);
-        // Measured before the account is deleted, while whatever holds the profile still does.
-        let holders = removed.as_ref().err().map(|_| holders::report(&self.sid_text));
-        // A hive that stays loaded after the wait (CI round 16: no process handle on it, no logon session of
-        // the account) is unloaded here by hand and the profile deleted, which leaves nothing on the disk. The
-        // measurement is recorded, since the teardown hides it. If the unload fails the test fails as before.
-        let removed = match removed {
-            Err(why) => {
-                let forced = hive::unload_and_delete(&self.sid_text);
-                hive::record(&format!(
-                    "profile of {} ({}) stayed loaded: {why}\n{}\n  by hand:\n  {}",
-                    self.name,
-                    self.sid_text,
-                    holders.as_deref().unwrap_or_default(),
-                    forced.text
-                ));
-                if forced.deleted {
-                    Ok(())
-                } else {
-                    Err(format!("{why}; by hand:\n  {}", forced.text))
-                }
-            }
-            Ok(()) => Ok(()),
-        };
+        // Measured before the account is deleted, while whatever holds the profile still does. A hive that stays
+        // loaded is not unloaded by hand: `RegUnLoadKey` is refused (CI round 17). The tests end a background
+        // session with its `logout` first (see `session_end`), which is what lets the system unload it.
+        let holders = removed.as_ref().err().map(|_| {
+            format!(
+                "ProfileList: {}\n{}",
+                hive::profile_list(&self.sid_text),
+                holders::report(&self.sid_text)
+            )
+        });
         // SAFETY: NUL-terminated inputs.
         let _ = unsafe { NetUserDel(PCWSTR::null(), PCWSTR(wide(&self.name).as_ptr())) };
         if let Err(why) = removed {

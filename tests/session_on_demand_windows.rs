@@ -36,6 +36,8 @@ mod machine;
 mod password;
 #[path = "common/process_list.rs"]
 mod process_list;
+#[path = "common/session_end.rs"]
+mod session_end;
 #[path = "common/stand_in.rs"]
 mod stand_in;
 
@@ -551,11 +553,6 @@ fn second_agent_in_the_same_session_leaves_without_binding() {
 
 // logout -----
 
-/// The longest the logoff event of an ended logon session is awaited. The event is one the OS may
-/// never deliver, so this bounds a wait on the outside world; expiry is a failure that reports the
-/// measurement, never a pass.
-const LOGOFF_EVENT_BOUND: std::time::Duration = std::time::Duration::from_secs(180);
-
 /// The command that asks the agent to end, run inside it.
 fn logout_command(kit: &Kit) -> String {
     format!("\"{}\" logout", kit.exe.display())
@@ -694,7 +691,7 @@ fn logon_session_is_logged_off_after_logout() {
     drop(agent);
 
     assert!(
-        watch.wait(LOGOFF_EVENT_BOUND),
+        watch.wait(session_end::LOGOFF_EVENT_BOUND),
         "M6: logon session {id:#x} still present: no 4634 although every process of it has ended"
     );
 
