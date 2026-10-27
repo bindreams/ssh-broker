@@ -142,7 +142,7 @@ struct Keys {
 }
 
 fn install_key(account: &Account) -> Keys {
-    let dir = TempDir(std::env::temp_dir().join(format!("sb-sshkey-{}", std::process::id())));
+    let dir = TempDir(std::env::temp_dir().join(format!("sb-sshkey-{}-{}", account.name, std::process::id())));
     let _ = std::fs::remove_dir_all(&dir.0);
     std::fs::create_dir_all(&dir.0).unwrap();
     let private = dir.0.join("id");
@@ -283,6 +283,26 @@ impl SshSession {
         }
     }
 
+    /// Read until the session has shown one of `needles`; the index of the first one found.
+    fn read_until_any(&mut self, needles: &[&str]) -> usize {
+        loop {
+            let text = self.text();
+            if let Some(found) = needles.iter().position(|needle| text.contains(needle)) {
+                return found;
+            }
+            let received = self.output.recv_timeout(SILENCE_BOUND); // sleep-ok: failure bound on the session's output, an external event that may never come; expiry fails the test and is not read as state
+            match received {
+                Ok(chunk) => self.transcript.extend_from_slice(&chunk),
+                Err(RecvTimeoutError::Disconnected) => {
+                    self.fail(&format!("ssh ended before the session showed one of {needles:?}"))
+                }
+                Err(RecvTimeoutError::Timeout) => self.fail(&format!(
+                    "the session was silent for {SILENCE_BOUND:?} while the test waited for one of {needles:?}"
+                )),
+            }
+        }
+    }
+
     /// Read until ssh closes its output, then wait for it to end.
     fn finish(mut self) -> i32 {
         loop {
@@ -305,53 +325,202 @@ impl Drop for SshSession {
     }
 }
 
-/// Elevated (CI only). M8: the shim as sshd's `DefaultShell`, for an account with no session.
+/// A throwaway account sshd admits, with its key and the diagnostics a failed login needs.
+struct Login<'a> {
+    account: &'a Account,
+    keys: Keys,
+    stderr_path: PathBuf,
+}
+
+impl<'a> Login<'a> {
+    fn new(kit: &Kit, account: &'a Account) -> Login<'a> {
+        admit(account);
+        Login {
+            account,
+            keys: install_key(account),
+            stderr_path: kit.path(&format!("ssh-stderr-{}.txt", account.name)),
+        }
+    }
+
+    fn command(&self) -> Command {
+        ssh_command(
+            &self.keys,
+            self.account,
+            std::fs::File::create(&self.stderr_path).unwrap(),
+        )
+    }
+
+    fn diagnostics(&self) -> impl Fn() -> String + 'static {
+        let (stderr_path, authorized_keys) = (self.stderr_path.clone(), self.keys.authorized_keys.clone());
+        move || diagnostics(&stderr_path, &authorized_keys)
+    }
+
+    /// An interactive login through sshd.
+    fn start(&self) -> SshSession {
+        SshSession::start(self.command(), self.diagnostics())
+    }
+
+    /// A login that ends in a shell without a prompt: the account's session was already running.
+    fn start_into_running_session(&self) -> SshSession {
+        let mut session = self.start();
+        if session.read_until_any(&[PROMPT, SHELL_PROMPT]) == 0 {
+            session.fail("the login asked for the password: no session was running")
+        }
+        session
+    }
+}
+
+impl SshSession {
+    /// Type the password at the prompt and wait for the shell.
+    fn log_in(&mut self, password: &str) {
+        self.read_until(PROMPT);
+        self.type_line(password);
+        self.read_until(SHELL_PROMPT);
+    }
+
+    /// The shell is the background session's and can make a named kernel object, which PSReadLine's
+    /// history needs: DPAPI and a mutex work. Returns the pid of the shell's parent, the agent.
+    fn check_relayed_shell(&mut self) -> u32 {
+        self.type_line(
+            "try { [void][Security.Cryptography.ProtectedData]::Protect([byte[]](1,2,3), $null, 'CurrentUser'); \
+             Write-Output ('dpapi' + '-ok') } catch { Write-Output ('dpapi' + '-failed ' + $_) }",
+        );
+        if self.read_until_any(&["dpapi-ok", "dpapi-failed"]) != 0 {
+            self.fail("the shell is not the session's (DPAPI failed)");
+        }
+        self.type_line(
+            "try { [void][Threading.Mutex]::new($false, 'sbprobe' + $PID); Write-Output ('mutex' + '-ok') } \
+             catch { Write-Output ('mutex' + '-failed ' + $_.Exception.GetType().Name) }",
+        );
+        if self.read_until_any(&["mutex-ok", "mutex-failed"]) != 0 {
+            self.fail("a named mutex cannot be made in the relayed shell");
+        }
+        self.type_line("Write-Output ('parent-' + 'pid=' + (Get-Process -Id $PID).Parent.Id + ';do' + 'ne')");
+        self.read_until(";done");
+        let text = self.text();
+        let after = text.rsplit("parent-pid=").next().unwrap_or_default();
+        let digits: String = after.chars().take_while(char::is_ascii_digit).collect();
+        digits
+            .parse()
+            .unwrap_or_else(|_| self.fail("the shell did not report its parent"))
+    }
+
+    /// PSReadLine crashes at every prompt when it cannot make its named mutex, and prints it on the
+    /// console. Call after the last command, so every prompt of the session has been shown.
+    fn assert_no_psreadline_crash(&self) {
+        let text = self.text();
+        if text.contains("Oops, something went wrong") || text.contains("PSReadLine") {
+            self.fail("PSReadLine crashed in the relayed shell");
+        }
+    }
+
+    /// A marker the shell prints but does not echo back as typed.
+    fn say(&mut self, marker: &str) {
+        let (head, tail) = marker.split_at(marker.len() / 2);
+        self.type_line(&format!("Write-Output ('{head}' + '{tail}')"));
+        self.read_until(marker);
+    }
+
+    fn leave(mut self) {
+        self.assert_no_psreadline_crash();
+        self.type_line("exit");
+        let code = self.finish();
+        assert_eq!(code, 0, "ssh exited with {code}");
+    }
+}
+
+/// Elevated (CI only). M8: the shim as sshd's `DefaultShell`, for an account with no session. Beyond
+/// the login: the relayed shell can make a named mutex and PSReadLine does not crash in it (the
+/// prompt-path tests run their shims in the runner's session, where another user's token can make
+/// none); a second connection while the first is open uses the same agent; and the session is still
+/// there for a third after every connection has gone (the agent is not in sshd's job). Last, two first
+/// connections of another new account at once.
 #[test]
 fn prompt_path_through_real_sshd() {
     let _machine = machine::shared();
     account_fixture::assert_elevated();
     let kit = Kit::broker_with_helper("sshd");
     let account = Account::create("sshd", true);
-    admit(&account);
-    let keys = install_key(&account);
-    let stderr_path = kit.path("ssh-stderr.txt");
-    let diag = {
-        let (stderr_path, authorized_keys) = (stderr_path.clone(), keys.authorized_keys.clone());
-        move || diagnostics(&stderr_path, &authorized_keys)
-    };
-    let open_stderr = || std::fs::File::create(&stderr_path).unwrap();
+    let login = Login::new(&kit, &account);
 
     // 1. What the shim runs in under sshd: the probe is the DefaultShell for one command.
     set_default_shell_under(OPENSSH_KEY, &kit.helper.to_string_lossy()).expect("set the probe as DefaultShell");
-    let mut probe = ssh_command(&keys, &account, open_stderr());
+    let mut probe = login.command();
     let out = probe.arg("probe").stdin(Stdio::null()).output().expect("run ssh");
     let facts = String::from_utf8_lossy(&out.stdout).into_owned();
     assert!(
         out.status.success() && facts.contains("session="),
         "the probe did not run through sshd (exit {:?}); stdout:\n{facts}\n{}",
         out.status.code(),
-        diag()
+        (login.diagnostics())()
     );
     eprintln!("M8 the shim's environment under sshd (session, logon type, job):\n{facts}");
 
     // 2. The product's path: the shim is the DefaultShell, the account has no session.
     set_default_shell_under(OPENSSH_KEY, &kit.exe.to_string_lossy()).expect("set the shim as DefaultShell");
-    let mut session = SshSession::start(ssh_command(&keys, &account, open_stderr()), diag);
-    session.read_until(PROMPT);
-    session.type_line(&account.password);
-    session.read_until(SHELL_PROMPT);
+    let mut first = login.start();
+    first.log_in(&account.password);
+    first.type_line("Write-Output ('profile=' + $env:USERPROFILE + '.')");
+    first.read_until(&format!("profile={}.", account.profile().display()));
+    first.type_line("Write-Output ('session-id=' + (Get-Process -Id $PID).SessionId + '.')");
+    first.read_until("session-id=");
+    let agent = first.check_relayed_shell();
+    eprintln!("M8 the relayed session showed:\n{}", first.text());
 
-    session.type_line("Write-Output ('profile=' + $env:USERPROFILE + '.')");
-    session.read_until(&format!("profile={}.", account.profile().display()));
-    session.type_line("Write-Output ('session-id=' + (Get-Process -Id $PID).SessionId + '.')");
-    session.read_until("session-id=");
-    session.type_line(
-        "try { [void][Security.Cryptography.ProtectedData]::Protect([byte[]](1,2,3), $null, 'CurrentUser'); \
-         Write-Output ('dpapi' + '-ok') } catch { Write-Output ('dpapi' + '-failed ' + $_) }",
+    // 3. A second connection while the first is open: no prompt, the same agent.
+    let mut second = login.start_into_running_session();
+    assert_eq!(
+        second.check_relayed_shell(),
+        agent,
+        "the second connection's shell is not a child of the first one's agent"
     );
-    session.read_until("dpapi-ok");
-    eprintln!("M8 the relayed session showed:\n{}", session.text());
-    session.type_line("exit");
-    let code = session.finish();
-    assert_eq!(code, 0, "ssh exited with {code}");
+
+    // 4. The first one leaves; the second still has its session.
+    first.leave();
+    second.say("second-still-up");
+    second.leave();
+
+    // 5. Every connection has gone and the session is still running: a new login gets no password prompt.
+    let mut third = login.start_into_running_session();
+    assert_eq!(
+        third.check_relayed_shell(),
+        agent,
+        "the third connection found another agent"
+    );
+    third.leave();
+
+    // 6. Two first connections of another new account at once.
+    two_simultaneous_first_connections(&kit);
+}
+
+/// Two first connections of one new account through sshd at once, with the shim as `DefaultShell`: each
+/// prompts and logs on, both end in the same session's shell, neither hangs, and the session outlives both.
+fn two_simultaneous_first_connections(kit: &Kit) {
+    let account = Account::create("sshd2", true);
+    let login = Login::new(kit, &account);
+
+    let mut sessions = [login.start(), login.start()];
+    for session in &mut sessions {
+        session.read_until(PROMPT);
+    }
+    for session in &mut sessions {
+        session.type_line(&account.password);
+    }
+    let mut agents = Vec::new();
+    for session in &mut sessions {
+        session.read_until(SHELL_PROMPT);
+        agents.push(session.check_relayed_shell());
+    }
+    assert_eq!(agents[0], agents[1], "the two shells have different agents");
+    let [first, second] = sessions;
+    first.leave();
+    second.leave();
+
+    let mut third = login.start_into_running_session();
+    assert_eq!(
+        third.check_relayed_shell(),
+        agents[0],
+        "the third connection found another agent"
+    );
+    third.leave();
 }
