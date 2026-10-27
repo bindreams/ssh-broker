@@ -7,6 +7,24 @@ fn unix_addr_accepts_a_normal_short_path() {
 }
 
 #[test]
+fn a_read_limit_is_rounded_up_to_whole_milliseconds_and_never_to_zero() {
+    use std::time::Duration;
+    for (limit, rounded) in [
+        (Duration::ZERO, Duration::from_millis(1)),
+        (Duration::from_nanos(1), Duration::from_millis(1)),
+        (Duration::from_micros(500), Duration::from_millis(1)),
+        (Duration::from_micros(999), Duration::from_millis(1)),
+        (Duration::from_millis(1), Duration::from_millis(1)),
+        (Duration::from_nanos(1_000_001), Duration::from_millis(2)),
+        (Duration::from_micros(1500), Duration::from_millis(2)),
+        (Duration::from_secs(30), Duration::from_secs(30)),
+        (Duration::MAX, Duration::from_millis(u64::MAX)),
+    ] {
+        assert_eq!(super::whole_milliseconds_up(limit), rounded, "{limit:?}");
+    }
+}
+
+#[test]
 fn unix_addr_rejects_an_overlong_path() {
     // sockaddr_un sun_path is ~108 bytes; a 200-char path must be rejected loudly.
     let long = format!("/tmp/{}.sock", "x".repeat(200));

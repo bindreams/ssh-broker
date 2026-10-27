@@ -6,8 +6,10 @@
 //! inside its job, so ending the tree earlier could cut the reply and the exit code off), ends
 //! every session's shell tree, waits until every other connection has finished relaying (so each
 //! shell's last output reaches its client the way it does when a shell exits by itself), and only
-//! then ends the process. Both waits are on a client that may never read or close, so each has the
-//! bound `DRAIN_BOUND`: past it the process goes on without the client, and the log says so.
+//! then ends the process. Every wait on a client (the logout request's, a refused login's, the
+//! drain's) is on a client that may never read or close, so each has the bound `DRAIN_BOUND`: past it
+//! the process goes on without the client, and the log says so. A refused login, once its reply and
+//! FIN are out, has nothing to deliver and does not count as live for the drain.
 //!
 //! The listener stays open until the process ends. A login that arrives meanwhile is refused with
 //! [`ENDING_REFUSAL`]. The session slot and the user lock stay held until the process ends too, so a
@@ -149,13 +151,7 @@ pub(super) fn handle_logout<R: LimitedRead, W: std::io::Write>(
     if let Err(e) = reply(tx, ENDING_REPLY, 0) {
         tracing::warn!("could not deliver the logout reply: {e:#}");
     }
-    let bound = control.connections.drain_bound;
-    if wait_for_close_within(rx, bound) == Waited::Abandoned {
-        tracing::warn!(
-            "the client of the logout request had not closed its connection {} s after the reply; ending without it",
-            bound.as_secs_f32()
-        );
-    }
+    wait_for_client(rx, control, "the logout request");
     tracing::info!("ending the background session at the user's request");
     let _logout = control.connections.begin_logout();
     control.end_all();
@@ -170,11 +166,17 @@ pub(super) fn handle_logout<R: LimitedRead, W: std::io::Write>(
 /// The reply is followed by a FIN and a read until the client closes, as every reply that must
 /// arrive is: the client has sent its handshake and goes on sending input (an exec shim always ends
 /// with the stdin EOF marker), and closing with that unread would reset the connection and lose the
-/// reply.
-pub(super) fn refuse_while_ending(rx: &mut ConnRx, tx: &mut ConnTx) -> anyhow::Result<()> {
+/// reply. The read has the drain's bound ([`wait_for_client`]), and once the reply and the FIN are
+/// out the connection has nothing left to deliver, so the drain does not wait for it.
+pub(super) fn refuse_while_ending<R: LimitedRead>(
+    rx: &mut R,
+    tx: &mut ConnTx,
+    control: &Control,
+) -> anyhow::Result<()> {
     reply(tx, ENDING_REFUSAL, ENDING_REFUSED_EXIT_CODE)?;
     tx.shutdown_write()?;
-    wait_for_close(rx);
+    let _nothing_to_deliver = control.connections.begin_refusal();
+    wait_for_client(rx, control, "a refused login");
     Ok(())
 }
 
@@ -187,8 +189,7 @@ fn reply<W: std::io::Write>(tx: &mut W, text: &str, code: i32) -> anyhow::Result
 
 /// A connection whose blocking reads can be given a limit.
 pub(super) trait LimitedRead: Read {
-    /// Make a read that finds nothing fail with `TimedOut` or `WouldBlock` once `limit` (not zero)
-    /// has passed.
+    /// Make a read that finds nothing fail with `TimedOut` or `WouldBlock` once `limit` has passed.
     fn limit_reads(&mut self, limit: Duration) -> std::io::Result<()>;
 }
 
@@ -207,8 +208,23 @@ enum Waited {
     Abandoned,
 }
 
-/// [`wait_for_close`] for a client that may never close: after `bound` it gives up. The bound is the
+/// Wait until a client, which may never read or close, has closed its end of the connection `rx`.
+/// Every wait of the agent on a client goes through here: the bound is the drain's, and when it
+/// passes the agent goes on without the client and logs that `who` was left. The bound is the
 /// failure bound on an external client, never proof that the client has read the reply.
+fn wait_for_client<R: LimitedRead>(rx: &mut R, control: &Control, who: &str) {
+    let bound = control.connections.drain_bound;
+    if wait_for_close_within(rx, bound) == Waited::Abandoned {
+        tracing::warn!(
+            "the client of {who} had not closed its connection {} s after the reply; not waiting for it any longer",
+            bound.as_secs_f32()
+        );
+    }
+}
+
+/// Block until the client has closed its end (or the connection has failed), or `bound` has passed.
+/// Any duration works as the bound: the limit on each read is the time left, which the connection
+/// rounds up to whole milliseconds (see [`ConnRx::set_read_timeout`]).
 fn wait_for_close_within<R: LimitedRead>(rx: &mut R, bound: Duration) -> Waited {
     let deadline = Instant::now() + bound;
     let mut buf = [0u8; 256];
@@ -217,7 +233,8 @@ fn wait_for_close_within<R: LimitedRead>(rx: &mut R, bound: Duration) -> Waited 
         if left.is_zero() {
             return Waited::Abandoned;
         }
-        if rx.limit_reads(left).is_err() {
+        if let Err(e) = rx.limit_reads(left) {
+            tracing::warn!("could not limit the wait for the client to close: {e}; not waiting for it");
             return Waited::Closed;
         }
         match rx.read(&mut buf) {
@@ -225,18 +242,6 @@ fn wait_for_close_within<R: LimitedRead>(rx: &mut R, bound: Duration) -> Waited 
             // The deadline is looked at again at the top.
             Err(e) if matches!(e.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock) => {}
             Ok(0) | Err(_) => return Waited::Closed,
-            Ok(_) => {}
-        }
-    }
-}
-
-/// Block until the client has closed its end (or the connection has failed).
-fn wait_for_close<R: Read>(rx: &mut R) {
-    let mut buf = [0u8; 256];
-    loop {
-        match rx.read(&mut buf) {
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-            Ok(0) | Err(_) => return,
             Ok(_) => {}
         }
     }

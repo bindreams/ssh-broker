@@ -219,19 +219,36 @@ fn run_on(location: &SocketLocation, background: bool) -> anyhow::Result<()> {
 /// [`keep_answering`]).
 #[cfg(windows)]
 fn serve_until_drained(listener: Listener, connections: &Arc<Connections>, control: &Arc<Control>) -> anyhow::Error {
+    let (accepting, accepting_control) = (Arc::clone(connections), Arc::clone(control));
+    serve_until_drained_in(
+        listener,
+        connections,
+        |work| std::thread::Builder::new().spawn(work).map(drop),
+        move |listener, serving| {
+            accept_loop(listener, &accepting, &accepting_control, || {
+                serving && accepting_control.is_ending()
+            })
+        },
+    )
+}
+
+/// [`serve_until_drained`] with the accepting and the thread start as parameters, so a test can see
+/// that the listener goes to [`hold_until_end`]. `accept` is called with `true` for the serving loop,
+/// which stops when the agent ends, and with `false` for the loop that answers during the drain.
+#[cfg(windows)]
+fn serve_until_drained_in<L: Send + Sync + 'static>(
+    listener: L,
+    connections: &Connections,
+    spawn: impl FnOnce(Box<dyn FnOnce() + Send>) -> std::io::Result<()>,
+    accept: impl Fn(&L, bool) -> anyhow::Error + Send + 'static,
+) -> anyhow::Error {
     let listener = Arc::new(listener);
-    let end = accept_loop(&listener, connections, control, || control.is_ending());
+    let end = accept(&listener, true);
     if end.downcast_ref::<Stopped>().is_some() {
-        let (connections, control) = (Arc::clone(connections), Arc::clone(control));
-        keep_answering(
-            listener,
-            hold_until_end,
-            |work| std::thread::Builder::new().spawn(work).map(drop),
-            move |listener| {
-                let end = accept_loop(listener, &connections, &control, || false);
-                tracing::warn!("no longer answering logins while the agent ends: {end:#}");
-            },
-        );
+        keep_answering(listener, hold_until_end, spawn, move |listener| {
+            let end = accept(listener, false);
+            tracing::warn!("no longer answering logins while the agent ends: {end:#}");
+        });
     }
     finish_stopped(end, connections)
 }
@@ -398,7 +415,8 @@ struct Tally {
     /// How many connections have ever ended: a counter, so "one ended since I looked" is a
     /// comparison and not a guess at what changed.
     ended: u64,
-    /// How many of the live connections are `logout` requests waiting for the others to finish.
+    /// How many of the live connections the drain does not wait for: `logout` requests, which wait for
+    /// the others, and refused logins, which have nothing left to deliver.
     logouts: usize,
 }
 
@@ -451,7 +469,20 @@ impl Connections {
 
     /// Record that a live connection is a `logout` request. It lasts while the guard does.
     fn begin_logout(self: &Arc<Self>) -> LogoutWait {
+        self.set_aside()
+    }
+
+    /// Record that a live connection is a refused login that has been answered: it has nothing left to
+    /// deliver, so the drain does not wait for it. It lasts while the guard does.
+    fn begin_refusal(self: &Arc<Self>) -> LogoutWait {
+        self.set_aside()
+    }
+
+    /// Count a live connection out of what the drain waits for, and wake the drain: it may be
+    /// parked on exactly this connection.
+    fn set_aside(self: &Arc<Self>) -> LogoutWait {
         self.lock().logouts += 1;
+        self.ended.notify_all();
         LogoutWait(Arc::clone(self))
     }
 
@@ -513,7 +544,8 @@ impl Connections {
     }
 }
 
-/// A live connection that is a `logout` request; see [`Connections::begin_logout`].
+/// A live connection the drain does not wait for; see [`Connections::begin_logout`] and
+/// [`Connections::begin_refusal`].
 #[cfg(windows)]
 struct LogoutWait(Arc<Connections>);
 
@@ -744,7 +776,7 @@ fn handle_connection_in(conn: socket2::Socket, hooks: Hooks, control: &Control) 
     }
     // Before a shell is started for nothing; the registration below is what decides.
     if control.is_ending() {
-        return logout::refuse_while_ending(&mut rx, &mut tx);
+        return logout::refuse_while_ending(&mut rx, &mut tx, control);
     }
     let command = hs.command.clone().unwrap_or_else(default_shell);
     let cwd_buf = child_cwd(&hs.cwd, home_dir());
@@ -791,7 +823,7 @@ fn handle_pty(
     (hooks.after_spawn)();
     let job = session.job();
     let Some(_registration) = register_session(control, &job) else {
-        return refuse_unserved_pty(session, &mut rx, &mut tx, &*hooks.observe);
+        return refuse_unserved_pty(session, &mut rx, &mut tx, control, &*hooks.observe);
     };
     // Before `tx` moves into the shared mutex.
     let hangup = start_hangup_watch(&tx, &job, hooks.make_watcher);
@@ -901,6 +933,7 @@ fn refuse_unserved_pty(
     mut session: PtySession,
     rx: &mut ConnRx,
     tx: &mut ConnTx,
+    control: &Control,
     observe: &(dyn Fn(Observed) + Send + Sync),
 ) -> anyhow::Result<()> {
     let out_raw = session.out_read_raw();
@@ -921,7 +954,7 @@ fn refuse_unserved_pty(
     }
     observe(Observed::RefusedConsoleClosed { bytes });
     drop(session); // the pipe ends go after the reader has finished with them
-    logout::refuse_while_ending(rx, tx)
+    logout::refuse_while_ending(rx, tx, control)
 }
 
 /// Run `close`, which flushes into a pipe `read_chunk` reads (it returns 0 at the end), with a
@@ -993,7 +1026,7 @@ fn handle_exec(
     (hooks.after_spawn)();
     let job = child.job();
     let Some(_registration) = register_session(control, &job) else {
-        return logout::refuse_while_ending(&mut rx, &mut tx);
+        return logout::refuse_while_ending(&mut rx, &mut tx, control);
     };
     // Before `tx` moves into the shared mutex.
     let hangup = start_hangup_watch(&tx, &job, hooks.make_watcher);

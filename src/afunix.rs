@@ -296,11 +296,20 @@ pub fn split(sock: Socket) -> anyhow::Result<(ConnRx, ConnTx)> {
 
 impl ConnRx {
     /// Make a `read` that finds nothing fail with `TimedOut` or `WouldBlock` once `limit` has
-    /// passed (`None`: block as long as it takes). `limit` is not zero. The socket's state is
-    /// undefined after such a failure on Windows: read it no more.
+    /// passed (`None`: block as long as it takes).
+    ///
+    /// `limit` is rounded up to whole milliseconds, and to at least one: the OS takes whole
+    /// milliseconds, and a limit that reached it as 0 would mean no limit at all. Measured on
+    /// AF_UNIX: after a timeout, a read still delivers what arrives and still reports the close.
     pub fn set_read_timeout(&self, limit: Option<std::time::Duration>) -> std::io::Result<()> {
-        self.0.set_read_timeout(limit)
+        self.0.set_read_timeout(limit.map(whole_milliseconds_up))
     }
+}
+
+/// `limit` rounded up to whole milliseconds, at least one.
+fn whole_milliseconds_up(limit: std::time::Duration) -> std::time::Duration {
+    let millis = limit.as_nanos().div_ceil(1_000_000).max(1);
+    std::time::Duration::from_millis(u64::try_from(millis).unwrap_or(u64::MAX))
 }
 
 impl ConnTx {

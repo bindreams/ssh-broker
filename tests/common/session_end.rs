@@ -3,9 +3,10 @@
 //!
 //! A test ends such a session with `logout`, run inside the agent as the account, and checks what
 //! ssh-broker controls: its agents ended, every process of their logon sessions exited (also those
-//! started after `logout` was asked, such as the `logout` client), and `logout` exited 0. It does not ask Windows to unload the account's hive or to delete its profile: Windows keeps
-//! the hive of a Task Scheduler or sshd logon loaded (CI rounds 19 and 20), as it does for a user who
-//! logged in at the console (owner, 2026-10-27). Killing the account's processes (`Account::drop`) is the
+//! started after `logout` was asked, such as the `logout` client), and `logout` exited 0. It does not
+//! ask Windows to unload the account's hive or to delete its profile: Windows keeps the hive of a Task
+//! Scheduler or sshd logon loaded (CI rounds 19 and 20), as it does for a user who logged in at the
+//! console (owner, 2026-10-27). Killing the account's processes (`Account::drop`) is the
 //! fallback, and every use of it is recorded.
 //!
 //! The logoff of a session (Security 4634) is waited for. It comes for a secondary-logon session and for
@@ -284,8 +285,9 @@ fn try_end(
 /// Wait for `process` to exit, up to [`CHILD_EXIT_BOUND`]: an exit that may never come.
 fn wait_exited(process: HANDLE, pid: u32, name: &str) -> Result<(), String> {
     let millis = u32::try_from(CHILD_EXIT_BOUND.as_millis()).expect("a bound shorter than INFINITE");
+    // The bound is on an external event, a process's exit; expiry is reported and is not read as state.
     // SAFETY: a live process handle with SYNCHRONIZE access, held by the caller.
-    let rc = unsafe { WaitForSingleObject(process, millis) }; // sleep-ok: failure bound on a process's exit, an external event; expiry is reported and is not read as state
+    let rc = unsafe { WaitForSingleObject(process, millis) }; // sleep-ok: failure bound on an external exit
     if rc == WAIT_OBJECT_0 {
         Ok(())
     } else {

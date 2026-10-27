@@ -571,6 +571,37 @@ fn the_listener_stays_open_when_the_loop_that_answers_logins_has_returned() {
     assert!(!closed(&flag), "the listener closed when the loop returned");
 }
 
+#[test]
+fn serve_until_drained_hands_the_listener_to_the_process_end_and_does_not_drop_it() {
+    // `serve_until_drained` is the one place that passes `hold_until_end`; `keep_answering` is tested
+    // with its own `hold`. The hold is process-wide and never released, so this test leaves one
+    // stand-in listener open for the rest of the test process.
+    let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let connections = Connections::new();
+
+    let end = serve_until_drained_in(
+        Closes(Arc::clone(&flag)),
+        &connections,
+        |work| {
+            work();
+            Ok(())
+        },
+        |_, serving| {
+            if serving {
+                anyhow::Error::new(Stopped)
+            } else {
+                anyhow::anyhow!("no longer accepting")
+            }
+        },
+    );
+
+    assert!(end.downcast_ref::<Stopped>().is_some());
+    assert!(
+        !closed(&flag),
+        "the listener closed when serving ended, not when the process ends"
+    );
+}
+
 // closing a pseudoconsole -----
 
 /// A console whose close pushes its pending output into a pipe nobody else reads: the stand-in is a

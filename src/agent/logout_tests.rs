@@ -57,7 +57,7 @@ impl Gate {
 impl Read for Gate {
     fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
         let limit = self.limit.expect("a read of the logout client must have a limit");
-        let got = self.closed.recv_timeout(limit); // sleep-ok: stands in for a socket's receive timeout; a close is the other way out
+        let got = self.closed.recv_timeout(limit); // sleep-ok: stands in for a socket's receive timeout
         match got {
             Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => Ok(0),
             Err(mpsc::RecvTimeoutError::Timeout) => Err(std::io::ErrorKind::TimedOut.into()),
@@ -68,6 +68,23 @@ impl Read for Gate {
 impl LimitedRead for Gate {
     fn limit_reads(&mut self, limit: Duration) -> std::io::Result<()> {
         self.limit = Some(limit);
+        Ok(())
+    }
+}
+
+/// A client that stays connected until the test drops the sender, whatever limit a read has: for a
+/// test of something other than the bound.
+struct Open(mpsc::Receiver<()>);
+
+impl Read for Open {
+    fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+        let _ = self.0.recv();
+        Ok(0)
+    }
+}
+
+impl LimitedRead for Open {
+    fn limit_reads(&mut self, _: Duration) -> std::io::Result<()> {
         Ok(())
     }
 }
@@ -371,7 +388,7 @@ fn a_connection_that_arrives_while_ending_is_told_so_and_exits_255() {
     let ((mut srx, mut stx), (mut crx, mut ctx), dir) = socket_pair("refusal");
     // The client has sent its stdin EOF marker, as an exec shim always does, before it reads.
     write_data(&mut ctx, Stream::Stdin, b"").unwrap();
-    let server = std::thread::spawn(move || refuse_while_ending(&mut srx, &mut stx).unwrap());
+    let server = std::thread::spawn(move || refuse_while_ending(&mut srx, &mut stx, &Control::standalone()).unwrap());
 
     let mut sink = TestSink::default();
     let outcome = pump_decode(&mut crx, &mut FrameReader::new(), &mut sink).expect("the reply was lost");
@@ -408,7 +425,7 @@ fn the_refusal_arrives_although_the_client_keeps_sending_input() {
         let outcome = pump_decode(&mut crx, &mut FrameReader::new(), &mut sink).expect("the reply was lost");
         (outcome, sink.stderr)
     });
-    refuse_while_ending(&mut srx, &mut stx).unwrap();
+    refuse_while_ending(&mut srx, &mut stx, &Control::standalone()).unwrap();
     let (outcome, stderr) = client.join().unwrap();
     assert_eq!(outcome, Outcome::Exited(ENDING_REFUSED_EXIT_CODE));
     assert_eq!(stderr, ENDING_REFUSAL.as_bytes());
@@ -492,6 +509,102 @@ fn a_logout_whose_client_is_gone_before_the_reply_still_ends_the_agent() {
     assert_eq!(killed.load(Ordering::SeqCst), 1);
 }
 
+// a login refused while the agent ends -----
+
+#[test]
+fn a_refused_login_whose_client_never_closes_is_let_go_after_the_bound_and_the_log_says_so() {
+    let ((_srx, mut stx), (_crx, _ctx), dir) = socket_pair("refusal-silent");
+    let control = Control::new(true, Connections::with_drain_bound(SHORT_BOUND));
+    let (_silent, closed) = mpsc::channel::<()>();
+
+    let (log, result) = logged(|| refuse_while_ending(&mut Gate::new(closed), &mut stx, &control));
+
+    result.unwrap();
+    assert!(log.contains("had not closed its connection"), "{log}");
+    assert!(log.contains("refused"), "{log}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_refused_login_whose_client_closes_in_time_is_not_reported() {
+    let ((_srx, mut stx), (_crx, _ctx), dir) = socket_pair("refusal-closes");
+    let control = Control::new(true, Connections::new());
+
+    let (log, result) = logged(|| refuse_while_ending(&mut Closed, &mut stx, &control));
+
+    result.unwrap();
+    assert!(!log.contains("had not closed"), "{log}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_refused_login_that_stays_connected_does_not_hold_the_drain() {
+    // The client stays until the failsafe lets it go. The refusal begins once the drain is parked, so
+    // only the refusal's own wake can end the drain before then; the drain's bound is 30 s, longer
+    // than the failsafe, and its verdict at the bound would be the same, so the failsafe flag is
+    // what tells them apart.
+    const FAILSAFE: Duration = Duration::from_secs(5);
+    let ((_srx, mut stx), (_crx, _ctx), dir) = socket_pair("refusal-drain");
+    let (parks, parked) = mpsc::channel::<()>();
+    let connections = Connections::observing_drain(move || {
+        let _ = parks.send(());
+    });
+    let control = Arc::new(Control::new(true, Arc::clone(&connections)));
+    let live = connections.begin();
+    let (silent, closed) = mpsc::channel::<()>();
+    let (done, finished) = mpsc::channel::<()>();
+    let failsafe_fired = Arc::new(AtomicBool::new(false));
+    let failsafe = std::thread::spawn({
+        let failsafe_fired = Arc::clone(&failsafe_fired);
+        move || {
+            let waited = finished.recv_timeout(FAILSAFE); // sleep-ok: failsafe, a hang becomes a failure
+            failsafe_fired.store(waited == Err(mpsc::RecvTimeoutError::Timeout), Ordering::SeqCst);
+            drop(silent);
+        }
+    });
+    let refusal = std::thread::spawn({
+        let control = Arc::clone(&control);
+        move || {
+            parked.recv().unwrap();
+            let _live = live;
+            refuse_while_ending(&mut Open(closed), &mut stx, &control).unwrap();
+        }
+    });
+
+    let drained = connections.wait_until_only_logouts_live();
+
+    drop(done);
+    failsafe.join().unwrap();
+    refusal.join().unwrap();
+    assert!(
+        !failsafe_fired.load(Ordering::SeqCst),
+        "the drain waited for a refused login that had nothing to deliver"
+    );
+    assert_eq!(drained, Drained::Complete);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_wait_whose_limit_cannot_be_set_is_logged() {
+    struct Unlimited;
+    impl Read for Unlimited {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            panic!("a read without a limit");
+        }
+    }
+    impl LimitedRead for Unlimited {
+        fn limit_reads(&mut self, _: Duration) -> std::io::Result<()> {
+            Err(std::io::Error::other("no such option"))
+        }
+    }
+
+    let (log, waited) = logged(|| wait_for_close_within(&mut Unlimited, Duration::from_secs(30)));
+
+    assert_eq!(waited, Waited::Closed);
+    assert!(log.contains("could not limit"), "{log}");
+    assert!(log.contains("no such option"), "{log}");
+}
+
 // a handler that never returns -----
 
 /// The drain bound of these tests: the handler they hold never finishes, so the bound is what ends
@@ -532,25 +645,32 @@ fn a_logout_client_that_closes_in_time_is_not_reported() {
     assert!(!log.contains("had not closed"), "{log}");
 }
 
-#[test]
-fn a_read_limit_on_a_connection_ends_a_read_that_finds_nothing() {
-    // If the limit does nothing the read blocks; the helper closes the client once the failsafe
-    // passes, so the test then fails instead of hanging. A working limit ends the read first and
-    // releases the helper.
+/// Run `f` on the server's read half while its client stays connected and says nothing. If `f`
+/// blocks, the helper closes the client once the failsafe passes, so that `f` returns and the test
+/// then fails instead of hanging. A bound that works ends `f` first and releases the helper.
+fn against_a_silent_client<T>(tag: &str, f: impl FnOnce(&mut ConnRx) -> T) -> T {
     const FAILSAFE: Duration = Duration::from_secs(5);
-    let ((mut srx, _stx), (crx, ctx), dir) = socket_pair("limited-read");
+    let ((mut srx, _stx), (crx, ctx), dir) = socket_pair(tag);
     let (done, finished) = mpsc::channel::<()>();
     let failsafe = std::thread::spawn(move || {
-        let _ = finished.recv_timeout(FAILSAFE); // sleep-ok: failsafe that only turns a hang into a failure; a working limit releases it first
+        let _ = finished.recv_timeout(FAILSAFE); // sleep-ok: failsafe, a hang becomes a failure
         let _ = ctx.shutdown_both();
         drop((crx, ctx));
     });
-
-    srx.limit_reads(SHORT_BOUND).unwrap();
-    let result = srx.read(&mut [0u8; 8]);
+    let result = f(&mut srx);
     drop(done);
-    let err = result.expect_err("nothing was sent, and the client is still connected");
+    failsafe.join().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    result
+}
 
+#[test]
+fn a_read_limit_on_a_connection_ends_a_read_that_finds_nothing() {
+    let result = against_a_silent_client("limited-read", |rx| {
+        rx.limit_reads(SHORT_BOUND).unwrap();
+        rx.read(&mut [0u8; 8])
+    });
+    let err = result.expect_err("nothing was sent, and the client is still connected");
     assert!(
         matches!(
             err.kind(),
@@ -558,8 +678,42 @@ fn a_read_limit_on_a_connection_ends_a_read_that_finds_nothing() {
         ),
         "{err:?}"
     );
-    failsafe.join().unwrap();
-    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Limits that are not whole milliseconds. The OS takes whole milliseconds and reads 0 as "no limit".
+const LIMITS: [Duration; 6] = [
+    Duration::from_micros(1),
+    Duration::from_micros(500),
+    Duration::from_micros(999),
+    Duration::from_millis(1),
+    Duration::from_micros(1500),
+    Duration::from_nanos(1_000_001),
+];
+
+#[test]
+fn a_read_limit_of_any_length_ends_a_read_that_finds_nothing() {
+    for (i, limit) in LIMITS.into_iter().enumerate() {
+        let result = against_a_silent_client(&format!("limited-read-{i}"), |rx| {
+            rx.limit_reads(limit).unwrap();
+            rx.read(&mut [0u8; 8])
+        });
+        let err = result.expect_err(&format!("a limit of {limit:?} did not end the read"));
+        assert!(
+            matches!(
+                err.kind(),
+                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+            ),
+            "{limit:?}: {err:?}"
+        );
+    }
+}
+
+#[test]
+fn a_wait_for_a_client_that_never_closes_ends_whatever_the_bound() {
+    for (i, bound) in LIMITS.into_iter().enumerate() {
+        let waited = against_a_silent_client(&format!("wait-bound-{i}"), |rx| wait_for_close_within(rx, bound));
+        assert_eq!(waited, Waited::Abandoned, "{bound:?}");
+    }
 }
 
 #[test]
