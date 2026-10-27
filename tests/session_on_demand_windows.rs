@@ -128,6 +128,22 @@ fn an_administrators_shim_sees_the_agent_it_starts() {
     );
 }
 
+/// The jobs of this test process, which every M3 case needs to be none: the case builds the caller's whole
+/// chain of jobs itself, and a job the runner put the test in (nextest puts each test in one without
+/// BREAKAWAY_OK, and `cargo` puts what it runs in another) holds the logon child and its probe whatever the
+/// case does, and never closes during the test. So the M3 cases run from a CI step that starts this test
+/// binary directly (`.github/workflows/ci.yaml`, "M3 tests outside any job"), and `nextest.toml` leaves them
+/// out. Returns what was found, for the failure messages.
+fn assert_test_process_is_in_no_job(case: &str) -> logon::CallerJob {
+    let base = logon::CallerJob::of_this_process();
+    assert_eq!(
+        base,
+        logon::CallerJob::NotInJob,
+        "{case}: this test process is in a job ({base:?}), so the jobs the case builds are not the caller's whole chain          and nothing can be measured. Run the M3 cases from the binary itself, not through nextest or cargo:          `<test binary> m3_`"
+    );
+    base
+}
+
 /// What became of the logon child when its caller's job was closed.
 enum M3Outcome {
     /// It acknowledged after the close.
@@ -147,6 +163,7 @@ enum M3Outcome {
 /// shim's report, the value the prompt path turns into a line for the user), and the child's job
 /// membership as this test reads it from outside, before the jobs close.
 fn logon_child_after_the_callers_jobs_close(tag: &str, mut jobs: Vec<KillOnCloseJob>) -> M3Run {
+    let base = assert_test_process_is_in_no_job(tag);
     let _machine = machine::shared();
     let kit = Kit::new(tag);
     let account = Account::create(tag, true);
@@ -186,6 +203,8 @@ fn logon_child_after_the_callers_jobs_close(tag: &str, mut jobs: Vec<KillOnClose
     }
 
     let membership = logon::ChildJob::of_process(agent.0);
+    // Written by the shim before it reported; the probe, the caller's job and the claim are in it.
+    let logon_log = kit.read("shim.log");
 
     for job in jobs.iter_mut().rev() {
         job.close();
@@ -204,6 +223,8 @@ fn logon_child_after_the_callers_jobs_close(tag: &str, mut jobs: Vec<KillOnClose
             outcome: M3Outcome::Survived,
             reported,
             membership,
+            base,
+            logon_log,
         },
         FileWaited::ProcessEnded(child) => M3Run {
             outcome: M3Outcome::Ended {
@@ -213,6 +234,8 @@ fn logon_child_after_the_callers_jobs_close(tag: &str, mut jobs: Vec<KillOnClose
             },
             reported,
             membership,
+            base,
+            logon_log,
         },
     }
 }
@@ -224,6 +247,10 @@ struct M3Run {
     reported: String,
     /// Whether the child was in a job when the test looked, before any job closed.
     membership: logon::ChildJob,
+    /// The jobs of the test process at the start of the case (none, or the case did not run).
+    base: logon::CallerJob,
+    /// The log lines of the logon in the shim: the caller's job, the probe's result, the claim.
+    logon_log: String,
 }
 
 impl M3Run {
@@ -257,8 +284,9 @@ impl M3Run {
             ),
         };
         format!(
-            "measured: {fate}; the child's job membership before the close: {:?}; the logon reported: {}",
-            self.membership, self.reported
+            "measured: {fate}; the child's job membership before the close: {:?}; the test process's jobs at the start: {:?}; the logon reported: {}; the logon's log:
+{}",
+            self.membership, self.base, self.reported, self.logon_log
         )
     }
 
@@ -286,7 +314,7 @@ impl M3Run {
 /// child stays in the job and ends with it, and the logon reports that the session does not outlive
 /// the connection (the prompt path says so to the user).
 #[test]
-fn logon_child_in_a_job_that_forbids_breakaway_ends_with_the_job_and_the_logon_says_so() {
+fn m3_child_in_a_job_that_forbids_breakaway_ends_with_the_job_and_the_logon_says_so() {
     let run = logon_child_after_the_callers_jobs_close("m3a", vec![KillOnCloseJob::create()]);
     assert!(!run.survived("job without BREAKAWAY_OK"), "{}", run.measured());
     run.assert_claim_matches_measurement("job without BREAKAWAY_OK");
@@ -295,7 +323,7 @@ fn logon_child_in_a_job_that_forbids_breakaway_ends_with_the_job_and_the_logon_s
 /// Elevated (CI only). M3: where the caller's job allows breakaway the product asks for it, and the
 /// logon child outlives the job.
 #[test]
-fn logon_child_survives_the_callers_job_closing_where_breakaway_is_allowed() {
+fn m3_child_survives_the_callers_job_closing_where_breakaway_is_allowed() {
     let run = logon_child_after_the_callers_jobs_close("m3b", vec![KillOnCloseJob::create_allowing_breakaway()]);
     assert!(
         run.survived("job with BREAKAWAY_OK"),
@@ -321,7 +349,7 @@ fn nested_jobs(outer_allows: bool, inner_allows: bool) -> Vec<KillOnCloseJob> {
 /// Elevated (CI only). Every job of the chain allows breakaway: the product asks for it and the logon
 /// child outlives the chain.
 #[test]
-fn logon_child_survives_nested_jobs_that_all_allow_breakaway() {
+fn m3_child_survives_nested_jobs_that_all_allow_breakaway() {
     let run = logon_child_after_the_callers_jobs_close("m3n1", nested_jobs(true, true));
     assert!(
         run.survived("all nested jobs allow"),
@@ -335,7 +363,7 @@ fn logon_child_survives_nested_jobs_that_all_allow_breakaway() {
 /// refuses the flagged call, and where the child ends up, is what this measures (CI round 8: it does not
 /// refuse). The logon must succeed, and what it tells the user must be what happened.
 #[test]
-fn logon_succeeds_when_an_outer_job_forbids_the_breakaway_the_inner_one_allows() {
+fn m3_logon_succeeds_when_an_outer_job_forbids_the_breakaway_the_inner_one_allows() {
     let run = logon_child_after_the_callers_jobs_close("m3n2", nested_jobs(false, true));
     run.assert_claim_matches_measurement("outer forbids, inner allows");
 }
@@ -343,7 +371,7 @@ fn logon_succeeds_when_an_outer_job_forbids_the_breakaway_the_inner_one_allows()
 /// Elevated (CI only). The innermost job forbids breakaway and an outer one allows it: the product
 /// asks for none, the logon succeeds, and the child ends with the chain.
 #[test]
-fn logon_succeeds_when_the_inner_job_forbids_breakaway_and_an_outer_one_allows_it() {
+fn m3_logon_succeeds_when_the_inner_job_forbids_breakaway_and_an_outer_one_allows_it() {
     let run = logon_child_after_the_callers_jobs_close("m3n3", nested_jobs(true, false));
     assert!(!run.survived("outer allows, inner forbids"), "{}", run.measured());
     run.assert_claim_matches_measurement("outer allows, inner forbids");

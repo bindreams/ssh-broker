@@ -14,7 +14,8 @@
 //! - `connect <socket> <result file>`: connects to an AF_UNIX socket and writes the outcome to the file.
 //! - `shim <dir>`: a stand-in for the shim under sshd. Reads `shim.input` (the account's password, the
 //!   agent exe), starts the agent through the logon, waits for the agent's marker with the product's
-//!   own `SocketWatch`, and writes `shim.result` (the file appearing is the "reported" signal). With
+//!   own `SocketWatch`, and writes `shim.result` (the file appearing is the "reported" signal); what
+//!   the logon logs goes to `shim.log`. With
 //!   `shim.hold` present it then blocks until it is killed.
 
 #[cfg(windows)]

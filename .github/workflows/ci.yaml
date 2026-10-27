@@ -139,6 +139,22 @@ jobs:
       - name: cargo nextest
         run: cargo nextest run --locked --profile ci
 
+      # The `m3_` tests measure what a caller's jobs do to the logon child (`logon::probe`), so the test
+      # process must be in no job, and nextest and cargo each put what they run in one. So the test binary
+      # runs by itself; each case asserts at its start that it is in no job. The filter is the one in
+      # `.config/nextest.toml` that leaves them out of the step above.
+      - name: M3 tests outside any job
+        if: (success() || failure()) && runner.os == 'Windows'
+        run: |
+          $built = cargo test --locked --test session_on_demand_windows --no-run --message-format=json
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $exe = $built | ForEach-Object { $_ | ConvertFrom-Json } |
+            Where-Object { $_.executable -and $_.target.name -eq 'session_on_demand_windows' } |
+            ForEach-Object { $_.executable }
+          if (-not $exe) { throw "cargo did not name the session_on_demand_windows test binary" }
+          & $exe m3_
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: Take that exe away again
         if: (success() || failure()) && runner.os == 'Windows'
         run: Remove-Item -Recurse -Force C:\ProgramData\ssh-broker

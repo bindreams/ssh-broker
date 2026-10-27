@@ -80,7 +80,17 @@ fn shim(dir: &Path) {
     let input = std::fs::read_to_string(dir.join("shim.input")).unwrap();
     let mut lines = input.lines();
     let (password, agent_exe) = (lines.next().unwrap(), lines.next().unwrap());
-    let result = run_shim(password, &PathBuf::from(agent_exe));
+    // The logon's own log lines (its job, its probe, its claim) go to `shim.log`, for a test to print.
+    let result = match std::fs::File::create(dir.join("shim.log")) {
+        Ok(file) => {
+            let log = tracing_subscriber::fmt()
+                .with_writer(std::sync::Mutex::new(file))
+                .with_ansi(false)
+                .finish();
+            tracing::subscriber::with_default(log, || run_shim(password, &PathBuf::from(agent_exe)))
+        }
+        Err(e) => format!("create shim.log failed: {e}"),
+    };
     file_signal::publish(&dir.join("shim.result"), &result);
     if dir.join("shim.hold").exists() {
         // Blocks until this process is killed (the caller's job closing).
