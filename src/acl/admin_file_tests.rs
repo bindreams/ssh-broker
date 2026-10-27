@@ -120,15 +120,25 @@ fn a_directory_in_its_place_is_refused() {
 
 #[test]
 fn a_create_that_fails_for_another_reason_than_rights_does_not_blame_the_rights() {
+    use windows::Win32::Foundation::ERROR_PATH_NOT_FOUND;
     // The parent directory is missing: not elevated or not, the create fails the same way.
     let missing = TempFile::new("no-parent").0.join("child");
-    let err = format!("{:#}", ensure_admin_only_file(&missing).unwrap_err());
+    let error = ensure_admin_only_file(&missing).unwrap_err();
+    let err = format!("{error:#}");
     assert!(err.contains(&missing.display().to_string()), "names the file: {err}");
     assert!(
         !err.contains("elevated administrator"),
         "sends the user to elevate for a missing directory: {err}"
     );
-    assert!(err.contains("cannot find the path"), "gives the OS error: {err}");
+    // The code, not the OS's message, which is in the machine's language.
+    let os = error
+        .downcast_ref::<windows::core::Error>()
+        .unwrap_or_else(|| panic!("keeps the OS error: {err}"));
+    assert_eq!(
+        os.code(),
+        HRESULT::from_win32(ERROR_PATH_NOT_FOUND.0),
+        "gives the OS error: {err}"
+    );
 }
 
 #[test]

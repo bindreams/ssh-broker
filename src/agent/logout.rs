@@ -10,8 +10,8 @@
 //! wait has a bound (`DRAIN_BOUND`): past it the process ends with the connections left, and the log
 //! says how many.
 //!
-//! The listener stays open until the process ends, or until the loop that refuses logins stops on a
-//! fatal accept error. A login that arrives meanwhile is refused with [`ENDING_REFUSAL`]. The session
+//! The listener stays open until the process ends, or until the thread that refuses logins cannot be
+//! started, or its loop stops on a fatal accept error. A login that arrives meanwhile is refused with [`ENDING_REFUSAL`]. The session
 //! slot and the user lock stay held until the process ends, so a successor agent binds only after
 //! this one is gone.
 
