@@ -4,8 +4,11 @@
 # single hang prevents.
 
 # The three tests that take the machine alone (`machine::exclusive()`): they stop `seclogon` or
-# replace the machine install, so no other test may run beside them. `ci` leaves them out and
-# `ci-exclusive` runs them alone. Keep the two filters complementary.
+# replace the machine install, so no other test may run beside them. What excludes them is the
+# cross-process lock in `tests/common/machine.rs`, which holds for any test that calls `exclusive()`.
+# This split only keeps them from waiting out the whole parallel run (the lock is not fair to a
+# writer): `ci` leaves them out and `ci-exclusive` runs them alone. Keep the two filters
+# complementary; a test missing from them is still correct, only slow.
 [profile.ci]
 fail-fast = false
 default-filter = 'not (binary(session_on_demand_windows) & test(/^logon_with_seclogon_(stopped|disabled)_returns_windows_reason$/)) & not (binary(upgrade_windows) & test(=apply_upgrade_ends_a_background_session_and_restarts_auto_login))'

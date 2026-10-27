@@ -17,6 +17,7 @@ tracing-subscriber = "0.3"  # file/stderr log sink (Phase 6 routes off the PTY)
 zeroize = "1"                # volatile wipe of password buffers (secret.rs)
 
 [dev-dependencies]
+fd-lock = "4.0.4"
 pipe = "0.4"                 # two unidirectional pipes compose the splittable relay test transport, EOF-on-writer-drop (Phase 2; 0.4.0)
 
 # Windows-only dependencies. Not compiled on the macOS host, so the pure-logic
