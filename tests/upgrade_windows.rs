@@ -125,13 +125,21 @@ fn apply(exe: &Path) -> std::process::Output {
     desktop::output(Command::new(exe).arg("apply")).expect("run apply")
 }
 
-/// Elevated (CI only). With a background session the prompt started, an auto-login task, and an open
-/// SSH-session shim all present: the prompt-path session ends, the shim survives (and holds the exe,
-/// so the copy reports it), and the auto-login session is running again afterwards.
-#[test]
-fn apply_upgrade_ends_a_background_session_and_restarts_auto_login() {
-    let _machine = machine::exclusive();
-    let _install = Install::capture();
+/// What the upgrade tests start from: the old build installed, an auto-login session running it from a
+/// task, and a session the prompt started (no task behind it).
+struct Scene {
+    broker: &'static Path,
+    installed: PathBuf,
+    kit: Kit,
+    auto: Account,
+    /// The processes of the auto-login agent before the upgrade.
+    before: Vec<u32>,
+    session: BackgroundAgent,
+    _install: Install,
+}
+
+fn scene() -> Scene {
+    let install = Install::capture();
     let broker = Path::new(env!("CARGO_BIN_EXE_ssh-broker"));
 
     // The installed build: this exe with a few bytes appended, so the next build differs from it.
@@ -175,6 +183,64 @@ fn apply_upgrade_ends_a_background_session_and_restarts_auto_login() {
     let mut installed_kit = Kit::copy_of_broker("up2");
     installed_kit.exe = installed.clone();
     let session = BackgroundAgent::start(&installed_kit, &prompted);
+    Scene {
+        broker,
+        installed,
+        kit,
+        auto,
+        before,
+        session,
+        _install: install,
+    }
+}
+
+impl Scene {
+    /// The prompt-path session was ended by `apply`.
+    fn assert_prompt_session_ended(&self) {
+        bounded_wait::wait_for_exit(
+            self.session.process.0,
+            // SAFETY: a valid process handle.
+            unsafe { windows::Win32::System::Threading::GetProcessId(self.session.process.0) },
+            "the prompt-path background agent after apply",
+            bounded_wait::CHILD_EXIT_BOUND,
+            &[],
+        );
+    }
+
+    /// The auto-login session was ended and started again: a different process serves the account.
+    fn assert_auto_login_restarted(&self, apply_output: &str) {
+        let started = Instant::now();
+        loop {
+            let now = agent_pids(&self.auto.sid_text);
+            if now.iter().any(|pid| !self.before.contains(pid)) {
+                break;
+            }
+            assert!(
+                started.elapsed() < TASK_START_BOUND,
+                "the auto-login agent was not started again after apply (before {:?}, now {now:?})\n{apply_output}",
+                self.before
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    fn end_auto_login(&self) {
+        let _ = autologin::off(
+            &mut WindowsEnv::new(PasswordSource::Given(None)),
+            &local_account(&self.auto),
+        );
+    }
+}
+
+/// Elevated (CI only). With a background session the prompt started, an auto-login task, and an open
+/// SSH-session shim all present: the prompt-path session ends, the shim survives (and holds the exe,
+/// so the copy reports it), and the auto-login session is running again afterwards. The install
+/// fails here, by design; the upgrade that succeeds is the next test.
+#[test]
+fn apply_upgrade_that_fails_on_a_held_exe_still_restarts_auto_login() {
+    let _machine = machine::exclusive();
+    let scene = scene();
+    let installed = &scene.installed;
 
     // An open SSH session: the shim holds the installed exe. It is the shim of an account that has no
     // agent (as sshd would run it, under that account's network token): it fails open and runs its
@@ -193,9 +259,9 @@ fn apply_upgrade_ends_a_background_session_and_restarts_auto_login() {
     unsafe { SetHandleInformation(null_handle, HANDLE_FLAG_INHERIT.0, HANDLE_FLAG_INHERIT) }
         .expect("make NUL inheritable");
     let shim = no_agent.spawn_with_stdio(
-        &installed,
+        installed,
         &format!("\"{}\" -c \"cmd.exe /c ping -n 100000 127.0.0.1\"", installed.display()),
-        kit.dir(),
+        scene.kit.dir(),
         &[],
         CREATE_PROCESS_LOGON_FLAGS(0),
         None,
@@ -224,7 +290,7 @@ fn apply_upgrade_ends_a_background_session_and_restarts_auto_login() {
     );
 
     // The new build: the copy of this exe. It cannot replace the installed one while the shim runs.
-    let output = apply(broker);
+    let output = apply(scene.broker);
     let text = format!(
         "{}{}",
         String::from_utf8_lossy(&output.stdout),
@@ -241,33 +307,54 @@ fn apply_upgrade_ends_a_background_session_and_restarts_auto_login() {
         "today's message for a shim that holds the exe:\n{text}"
     );
 
-    // The prompt-path session was ended, by apply.
-    bounded_wait::wait_for_exit(
-        session.process.0,
-        // SAFETY: a valid process handle.
-        unsafe { windows::Win32::System::Threading::GetProcessId(session.process.0) },
-        "the prompt-path background agent after apply",
-        bounded_wait::CHILD_EXIT_BOUND,
-        &[],
-    );
+    scene.assert_prompt_session_ended();
     // The shim was left alone.
     assert!(!shim_has_ended(), "apply must not end an SSH session's shim");
-
-    // The auto-login session was ended and started again: a different process serves the account.
-    let started = Instant::now();
-    loop {
-        let now = agent_pids(&auto.sid_text);
-        if now.iter().any(|pid| !before.contains(pid)) {
-            break;
-        }
-        assert!(
-            started.elapsed() < TASK_START_BOUND,
-            "the auto-login agent was not started again after apply (before {before:?}, now {now:?})\n{text}"
-        );
-        std::thread::yield_now();
-    }
+    scene.assert_auto_login_restarted(&text);
 
     // SAFETY: a valid process handle; ending a shim that already ended is harmless.
     let _ = unsafe { TerminateProcess(shim.process.0, 1) };
-    let _ = autologin::off(&mut WindowsEnv::new(PasswordSource::Given(None)), &local_account(&auto));
+    scene.end_auto_login();
+}
+
+/// Elevated (CI only). The upgrade that succeeds: nothing holds the installed exe (no SSH session is
+/// open), so `apply` ends the prompt-path session and the auto-login one, replaces the exe with the new
+/// build, enables the auto-login task again and starts it, and leaves no record of tasks it owes.
+#[test]
+fn apply_upgrade_that_succeeds_ends_a_background_session_and_restarts_auto_login() {
+    let _machine = machine::exclusive();
+    let scene = scene();
+    let old_bytes = std::fs::read(&scene.installed).unwrap();
+
+    let output = apply(scene.broker);
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.status.success(), "the upgrade failed:\n{text}");
+
+    // The new build is installed.
+    let new_bytes = std::fs::read(&scene.installed).unwrap();
+    assert_ne!(new_bytes, old_bytes, "the installed exe is still the old build");
+    assert_eq!(
+        new_bytes,
+        std::fs::read(scene.broker).unwrap(),
+        "the installed exe is not the build that ran apply"
+    );
+
+    scene.assert_prompt_session_ended();
+    // The auto-login session runs again, from the new exe: a different process serves the account, and
+    // the task is enabled.
+    scene.assert_auto_login_restarted(&text);
+    let tasks = taskscheduler::session_tasks().unwrap();
+    assert!(
+        tasks.iter().any(|task| task.enabled),
+        "the auto-login task is not enabled again: {tasks:?}"
+    );
+    assert!(
+        !Path::new(provision::BASE_DIR).join("sessions-to-enable.txt").exists(),
+        "apply left its record of tasks it owes after enabling them"
+    );
+    scene.end_auto_login();
 }
