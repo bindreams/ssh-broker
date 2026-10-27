@@ -30,6 +30,12 @@ impl Layout {
         self.base.join(super::EXE_NAME)
     }
 
+    /// The auto-login tasks a running `apply` has disabled and not yet enabled again; see
+    /// [`super::pending_sessions`].
+    pub fn pending_sessions_path(&self) -> PathBuf {
+        self.base.join("sessions-to-enable.txt")
+    }
+
     /// A single-user install's saved account; `apply` removes it.
     fn legacy_config_path(&self) -> PathBuf {
         self.base.join("config.toml")

@@ -43,6 +43,11 @@ fn flow_resuming(
             events.borrow_mut().push("resume");
             resume_result()
         },
+        || {
+            events.borrow_mut().push("resume sessions");
+            Ok(())
+        },
+        || events.borrow_mut().push("start sessions"),
         |left| {
             events.borrow_mut().push("start");
             assert!(left.is_empty(), "no agent survived");
@@ -55,14 +60,14 @@ fn flow_resuming(
 fn agents_start_after_a_successful_install() {
     let (events, result) = flow(true, || Ok(()), true, true);
     result.unwrap();
-    assert_eq!(events, ["stop", "install", "resume", "start"]);
+    assert_eq!(events, ["stop", "install", "resume", "resume sessions", "start sessions", "start"]);
 }
 
 #[test]
 fn agents_that_were_stopped_start_again_when_a_later_step_fails() {
     let (events, result) = flow(true, || Ok(()), false, true);
     assert_eq!(format!("{:#}", result.unwrap_err()), "register failed");
-    assert_eq!(events, ["stop", "install", "resume", "safe?", "start"]);
+    assert_eq!(events, ["stop", "install", "resume", "resume sessions", "start sessions", "safe?", "start"]);
 }
 
 #[test]
@@ -82,6 +87,8 @@ fn agents_survive_a_failed_stop_in_the_sessions_the_start_is_told_to_leave_alone
         },
         || true,
         || Ok(()),
+        || Ok(()),
+        || {},
         |survivors| told.borrow_mut().extend_from_slice(survivors),
     );
     let text = format!("{:#}", result.unwrap_err());
@@ -98,14 +105,14 @@ fn agents_survive_a_failed_stop_in_the_sessions_the_start_is_told_to_leave_alone
 fn agents_start_again_when_the_stop_failed_part_way() {
     let (events, result) = flow(true, || anyhow::bail!("access denied"), true, true);
     assert_eq!(format!("{:#}", result.unwrap_err()), "access denied");
-    assert_eq!(events, ["stop", "resume", "safe?", "start"]);
+    assert_eq!(events, ["stop", "resume", "resume sessions", "start sessions", "safe?", "start"]);
 }
 
 #[test]
-fn nothing_starts_when_no_agent_was_stopped() {
+fn no_agent_starts_when_none_was_stopped() {
     let (events, result) = flow(false, || Ok(()), false, true);
     assert!(result.is_err());
-    assert_eq!(events, ["install", "resume"]);
+    assert_eq!(events, ["install", "resume", "resume sessions", "start sessions"]);
 }
 
 #[test]
@@ -114,15 +121,19 @@ fn the_task_is_enabled_again_even_when_no_agent_was_stopped() {
     // `apply` that was killed between its disable and its enable.
     let (events, result) = flow(false, || Ok(()), true, true);
     result.unwrap();
-    assert_eq!(events, ["install", "resume", "start"]);
+    assert_eq!(events, ["install", "resume", "resume sessions", "start sessions", "start"]);
 }
 
 #[test]
-fn an_apply_that_could_not_enable_the_task_fails_and_starts_nothing() {
+fn an_apply_that_could_not_enable_the_task_fails_and_starts_no_agent() {
     // A disabled task starts no agent at any logon, so the install did not take.
     let (events, result) = flow_resuming(true, || Ok(()), true, true, || anyhow::bail!("access denied"));
     assert!(format!("{:#}", result.unwrap_err()).contains("access denied"));
-    assert_eq!(events, ["stop", "install", "resume"]);
+    assert_eq!(
+        events,
+        ["stop", "install", "resume", "resume sessions", "start sessions"],
+        "the sessions are independent of the agent task"
+    );
 }
 
 #[test]
@@ -131,16 +142,19 @@ fn a_failed_install_is_reported_as_it_was_when_the_task_could_not_be_enabled_eit
     assert_eq!(format!("{:#}", result.unwrap_err()), "register failed");
     assert_eq!(
         events,
-        ["stop", "install", "resume"],
-        "no start: the task cannot start one"
+        ["stop", "install", "resume", "resume sessions", "start sessions"],
+        "no agent start: the task cannot start one"
     );
 }
 
 #[test]
-fn nothing_starts_when_the_registered_task_cannot_start_an_agent() {
+fn no_agent_starts_when_the_registered_task_cannot_start_one() {
     let (events, result) = flow(true, || Ok(()), false, false);
     assert!(result.is_err());
-    assert_eq!(events, ["stop", "install", "resume", "safe?"]);
+    assert_eq!(
+        events,
+        ["stop", "install", "resume", "resume sessions", "start sessions", "safe?"]
+    );
 }
 
 #[test]
@@ -230,6 +244,10 @@ impl World {
         stop_sessions(
             || Ok(self.tasks.iter().map(|t| task(&t.name, t.enabled)).collect()),
             &self.recorded,
+            |names| {
+                self.events.borrow_mut().push(format!("record {names:?}"));
+                Ok(())
+            },
             |name| {
                 self.events.borrow_mut().push(format!("stop task {name}"));
                 Ok(())
@@ -263,14 +281,17 @@ impl World {
 fn a_background_agent_that_is_not_a_task_instance_is_ended() {
     let world = World::new(vec![], vec![4242]);
     world.stop().unwrap();
-    assert_eq!(*world.events.borrow(), ["end 4242", "wait [4242]"]);
+    assert_eq!(*world.events.borrow(), ["record []", "end 4242", "wait [4242]"]);
 }
 
 #[test]
 fn every_session_task_is_stopped_and_only_the_enabled_ones_are_recorded() {
     let world = World::new(vec![task("a", true), task("b", false), task("c", true)], vec![]);
     world.stop().unwrap();
-    assert_eq!(*world.events.borrow(), ["stop task a", "stop task b", "stop task c"]);
+    assert_eq!(
+        *world.events.borrow(),
+        [r#"record ["a", "c"]"#, "stop task a", "stop task b", "stop task c"]
+    );
     assert_eq!(*world.recorded.borrow(), ["a", "c"], "a task that was off stays off");
 }
 
@@ -280,6 +301,7 @@ fn a_task_is_recorded_before_its_stop_so_a_failed_stop_still_gets_it_back() {
     let result = stop_sessions(
         || Ok(world.tasks.iter().map(|t| task(&t.name, t.enabled)).collect()),
         &world.recorded,
+        |_| Ok(()),
         |_| anyhow::bail!("access denied"),
         || Ok(vec![]),
         |_| Ok(()),
@@ -297,6 +319,7 @@ fn the_agents_are_looked_for_again_until_none_is_left() {
     stop_sessions(
         || Ok(vec![]),
         &RefCell::default(),
+        |_| Ok(()),
         |_| Ok(()),
         || Ok(looks.borrow_mut().next().unwrap()),
         |pid| {
@@ -319,29 +342,34 @@ fn background_agent_survivor_blocks_the_copy_with_its_pid() {
 }
 
 #[test]
-fn session_tasks_are_reenabled_after_a_failed_install() {
+fn session_tasks_are_reenabled_and_started_after_a_failed_install_whatever_the_agent_task_is() {
+    // The agent task's form decides whether the desktop agents restart; the session tasks do not
+    // depend on it, so a failed query of it (`restart_is_safe` false) must not leave them stopped.
     let world = World::new(vec![task("a", true), task("b", false)], vec![]);
     let enabled = RefCell::new(Vec::new());
     let ran = RefCell::new(Vec::new());
+    let agents_started = RefCell::new(false);
     let result: anyhow::Result<()> = run(
         || world.stop(),
         |stop| {
             stop()?;
             anyhow::bail!("register failed")
         },
-        || true,
+        || false,
+        || Ok(()),
         || {
             resume_sessions(&world.recorded, |name| {
                 enabled.borrow_mut().push(name.to_string());
                 Ok(())
             })
         },
-        |_| {
+        || {
             start_sessions(&world.recorded, |name| {
                 ran.borrow_mut().push(name.to_string());
                 Ok(())
             })
         },
+        |_| *agents_started.borrow_mut() = true,
     );
     assert_eq!(format!("{:#}", result.unwrap_err()), "register failed");
     assert_eq!(
@@ -350,6 +378,106 @@ fn session_tasks_are_reenabled_after_a_failed_install() {
         "the task that was on is on again, the other stays off"
     );
     assert_eq!(ran.into_inner(), ["a"], "and is started again");
+    assert!(!agents_started.into_inner(), "the desktop agents are not, by their own rule");
+}
+
+#[test]
+fn the_tasks_to_enable_again_are_recorded_before_any_is_disabled() {
+    let world = World::new(vec![task("a", true), task("b", false), task("c", true)], vec![]);
+    world.stop().unwrap();
+    assert_eq!(
+        *world.events.borrow(),
+        [
+            r#"record ["a", "c"]"#,
+            "stop task a",
+            "stop task b",
+            "stop task c"
+        ]
+    );
+}
+
+#[test]
+fn a_task_that_cannot_be_recorded_is_not_disabled() {
+    let world = World::new(vec![task("a", true)], vec![]);
+    let result = stop_sessions(
+        || Ok(world.tasks.iter().map(|t| task(&t.name, t.enabled)).collect()),
+        &world.recorded,
+        |_| anyhow::bail!("disk full"),
+        |name| {
+            world.events.borrow_mut().push(format!("stop task {name}"));
+            Ok(())
+        },
+        || Ok(Vec::<u32>::new()),
+        |_| Ok(()),
+        |_| Ok(()),
+    );
+    assert!(format!("{:#}", result.unwrap_err()).contains("disk full"));
+    assert!(world.events.borrow().is_empty(), "nothing was disabled without a record");
+}
+
+#[test]
+fn an_apply_killed_between_two_disables_leaves_the_next_one_able_to_enable_both() {
+    use crate::provision::pending_sessions;
+    use crate::test_support::TempProfile;
+    let dir = TempProfile::new("flow-crash");
+    let pending = dir.0.join("pending.txt");
+    let prefix = crate::provision::session_task::TASK_PREFIX;
+    let (a, b) = (format!("{prefix}a"), format!("{prefix}b"));
+
+    // First apply: both tasks are on; "a" is disabled, then the process dies before "b".
+    let first = RefCell::new(Vec::new());
+    let died = stop_sessions(
+        || Ok(vec![task(&a, true), task(&b, true)]),
+        &first,
+        |names| pending_sessions::store(&pending, names),
+        |name| {
+            if name == b {
+                anyhow::bail!("killed here")
+            }
+            Ok(())
+        },
+        || Ok(Vec::<u32>::new()),
+        |_| Ok(()),
+        |_| Ok(()),
+    );
+    assert!(died.is_err());
+    // Nothing runs after the kill: no resume, no cleanup.
+
+    // Next apply: "a" is found disabled, "b" enabled. The record brings "a" back.
+    let second = RefCell::new(pending_sessions::load(&pending).unwrap());
+    stop_sessions(
+        || Ok(vec![task(&a, false), task(&b, true)]),
+        &second,
+        |names| pending_sessions::store(&pending, names),
+        |_| Ok(()),
+        || Ok(Vec::<u32>::new()),
+        |_| Ok(()),
+        |_| Ok(()),
+    )
+    .unwrap();
+    let enabled = RefCell::new(Vec::new());
+    resume_sessions(&second, |name| {
+        enabled.borrow_mut().push(name.to_string());
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(enabled.into_inner(), [a, b], "the task that was on stays recorded until enabled");
+}
+
+#[test]
+fn a_task_owed_from_an_earlier_apply_is_not_recorded_twice() {
+    let owed = RefCell::new(vec!["a".to_string()]);
+    stop_sessions(
+        || Ok(vec![task("a", true), task("b", true)]),
+        &owed,
+        |_| Ok(()),
+        |_| Ok(()),
+        || Ok(Vec::<u32>::new()),
+        |_| Ok(()),
+        |_| Ok(()),
+    )
+    .unwrap();
+    assert_eq!(*owed.borrow(), ["a", "b"]);
 }
 
 #[test]

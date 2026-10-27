@@ -13,10 +13,13 @@ use super::procwait::{StillRunning, Survivor};
 /// `apply` does not leave every logged-on user without an agent. `restart_is_safe` says whether
 /// the registered agent task can start one: an older single-user task cannot.
 ///
-/// `resume` enables the agent task and runs on every call, whatever came before: a stop disables
-/// the task, and an earlier `apply` that was killed before it got here may have left it so. If it
-/// fails, no agent is started (the task cannot start one), and the failure is the result unless
-/// `install` had already failed, in which case that error is returned as it was.
+/// `resume_agent_task` enables the agent task and runs on every call, whatever came before: a stop
+/// disables the task, and an earlier `apply` that was killed before it got here may have left it
+/// so. `resume_sessions` does the same for the auto-login tasks, and `start_sessions` then starts
+/// them. The sessions do not depend on the agent task or on `restart_is_safe`: they are brought
+/// back on every path where they could be enabled again, including a failed install. If either
+/// resume fails, no agent is started (the task cannot start one), and the failure is the result
+/// unless `install` had already failed, in which case that error is returned as it was.
 ///
 /// If the stop left agents running (see [`StillRunning`], found under any context `install`
 /// added), `start` is told which: an agent started in the session of a survivor would find that
@@ -25,7 +28,9 @@ pub fn run<T>(
     stop: impl FnOnce() -> anyhow::Result<()>,
     install: impl FnOnce(&mut dyn FnMut() -> anyhow::Result<()>) -> anyhow::Result<T>,
     restart_is_safe: impl FnOnce() -> bool,
-    resume: impl FnOnce() -> anyhow::Result<()>,
+    resume_agent_task: impl FnOnce() -> anyhow::Result<()>,
+    resume_sessions: impl FnOnce() -> anyhow::Result<()>,
+    start_sessions: impl FnOnce(),
     start: impl FnOnce(&[Survivor]),
 ) -> anyhow::Result<T> {
     let mut stop = Some(stop);
@@ -34,7 +39,20 @@ pub fn run<T>(
         attempted = true;
         stop.take().expect("the stop is called at most once")()
     });
-    if let Err(e) = resume() {
+    let agent_task = resume_agent_task();
+    let sessions = resume_sessions();
+    if sessions.is_ok() {
+        start_sessions();
+    }
+    let resumed = match (agent_task, sessions) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(e), Err(sessions)) => {
+            eprintln!("apply: {sessions:#}");
+            Err(e)
+        }
+        (Err(e), Ok(())) | (Ok(()), Err(e)) => Err(e),
+    };
+    if let Err(e) = resumed {
         return match result {
             Ok(_) => Err(e),
             Err(install_error) => {
@@ -65,9 +83,12 @@ pub struct SessionTask {
 /// still running is ended and waited for, whether or not a task started it (the prompt path starts
 /// one without a task).
 ///
-/// `enabled` collects the names of the tasks that were **enabled** before, each recorded before its
-/// stop is tried, so that a stop that fails part-way still gets them back ([`resume_sessions`]). A
-/// task that was off stays off. The agents are looked for again after each round until none is
+/// `enabled` collects the names of the tasks that were **enabled** before, so that a stop that fails
+/// part-way still gets them back ([`resume_sessions`]); the caller may start it with the names an
+/// earlier, killed `apply` still owes. A task that was off stays off. `record` is given the whole
+/// list before any task is stopped (the first stop disables), and a record that fails stops
+/// everything before anything is disabled: a process killed after that point leaves the list for
+/// the next `apply`. The agents are looked for again after each round until none is
 /// left: a condition re-checked, not an attempt count; a process that outlives the bound fails the
 /// stop through `wait`, naming its pid.
 ///
@@ -77,15 +98,21 @@ pub struct SessionTask {
 pub fn stop_sessions<P>(
     tasks: impl FnOnce() -> anyhow::Result<Vec<SessionTask>>,
     enabled: &RefCell<Vec<String>>,
+    record: impl FnOnce(&[String]) -> anyhow::Result<()>,
     mut stop_task: impl FnMut(&str) -> anyhow::Result<()>,
     mut agents: impl FnMut() -> anyhow::Result<Vec<P>>,
     mut end: impl FnMut(&P) -> anyhow::Result<()>,
     mut wait: impl FnMut(Vec<P>) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
-    for task in tasks()? {
-        if task.enabled {
-            enabled.borrow_mut().push(task.name.clone());
+    let tasks = tasks()?;
+    for task in tasks.iter().filter(|task| task.enabled) {
+        let mut owed = enabled.borrow_mut();
+        if !owed.contains(&task.name) {
+            owed.push(task.name.clone());
         }
+    }
+    record(&enabled.borrow())?;
+    for task in &tasks {
         stop_task(&task.name)?;
     }
     loop {

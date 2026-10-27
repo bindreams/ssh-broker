@@ -15,6 +15,8 @@ mod flow;
 pub(crate) mod layout;
 #[cfg(windows)]
 pub mod password_variant;
+#[cfg(windows)]
+pub(crate) mod pending_sessions;
 pub mod probe;
 #[cfg(windows)]
 pub mod procwait;
@@ -99,7 +101,10 @@ mod provision_tests;
 #[cfg(windows)]
 mod imp {
     use super::layout::{self, Layout};
-    use super::{flow, probe, procwait, registry, report, schtasks, session_task, sessions, taskscheduler, user_rows};
+    use super::{
+        flow, pending_sessions, probe, procwait, registry, report, schtasks, session_task, sessions, taskscheduler,
+        user_rows,
+    };
     use crate::{afunix, shim};
     use anyhow::Context;
     use std::path::Path;
@@ -132,12 +137,18 @@ mod imp {
         let current = std::env::current_exe().context("current_exe")?;
         let registered_xml = schtasks::registered_xml(taskscheduler::task_xml(schtasks::AGENT_TASK))?;
         // The auto-login tasks that were enabled when the agents were stopped, to be enabled and
-        // started again afterwards.
-        let enabled_sessions = std::cell::RefCell::new(Vec::new());
+        // started again afterwards. It starts with the tasks an earlier `apply` that was killed
+        // after disabling them still owes (the record is read only from a checked install directory).
+        let owed = match layout::check_base(&layout) {
+            Ok(base) => pending_sessions::load(&base.layout().pending_sessions_path())?,
+            // Not ours yet: `prepare` makes it ours or refuses, and nothing in it is believed meanwhile.
+            Err(_) => Vec::new(),
+        };
+        let enabled_sessions = std::cell::RefCell::new(owed);
         let exe = flow::run(
             || {
                 taskscheduler::stop_instances(schtasks::AGENT_TASK, &layout.canonical_exe())?;
-                stop_background_sessions(&layout.canonical_exe(), &enabled_sessions)
+                stop_background_sessions(&layout.canonical_exe(), &layout.pending_sessions_path(), &enabled_sessions)
             },
             |stop_agents| {
                 let exe = layout::prepare(&layout, &current, registered_xml.as_deref(), stop_agents)?;
@@ -160,22 +171,18 @@ mod imp {
                 Ok(exe)
             },
             agent_task_is_group_form,
+            enable_agent_task,
             || {
-                let agent_task = enable_agent_task();
-                let sessions = flow::resume_sessions(&enabled_sessions, |name| taskscheduler::set_enabled(name, true));
-                match (agent_task, sessions) {
-                    (Err(e), Err(sessions)) => {
-                        eprintln!("apply: {sessions:#}");
-                        Err(e)
-                    }
-                    (Err(e), Ok(())) | (Ok(()), Err(e)) => Err(e),
-                    (Ok(()), Ok(())) => Ok(()),
+                flow::resume_sessions(&enabled_sessions, |name| taskscheduler::set_enabled(name, true))?;
+                // Every task is enabled again: nothing is owed any more. A directory that is not
+                // ours is left alone: its file is not the one that was ignored at the start.
+                match layout::check_base(&layout) {
+                    Ok(base) => pending_sessions::store(&base.layout().pending_sessions_path(), &[]),
+                    Err(_) => Ok(()),
                 }
             },
-            |survivors| {
-                start_agents(survivors);
-                flow::start_sessions(&enabled_sessions, taskscheduler::run_task);
-            },
+            || flow::start_sessions(&enabled_sessions, taskscheduler::run_task),
+            start_agents,
         )?;
         println!(
             "apply: ok — DefaultShell -> {}, agent + self-heal tasks installed",
@@ -188,10 +195,15 @@ mod imp {
     /// tasks are disabled and their instances stopped, then every background agent left (the prompt
     /// path starts one without a task) is ended. A shim is never ended: it holds the exe only until
     /// its SSH session closes, and the copy reports it if it still does.
-    fn stop_background_sessions(image: &Path, enabled: &std::cell::RefCell<Vec<String>>) -> anyhow::Result<()> {
+    fn stop_background_sessions(
+        image: &Path,
+        pending: &Path,
+        enabled: &std::cell::RefCell<Vec<String>>,
+    ) -> anyhow::Result<()> {
         flow::stop_sessions(
             taskscheduler::session_tasks,
             enabled,
+            |names| pending_sessions::store(pending, names),
             |name| taskscheduler::stop_instances(name, image),
             || procwait::background_agents(image),
             |agent| agent.terminate(),
