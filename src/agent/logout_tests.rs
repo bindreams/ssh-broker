@@ -205,3 +205,27 @@ fn the_process_ends_only_after_every_other_connection_has_finished() {
     worker.join().unwrap();
     assert!(ended.load(Ordering::SeqCst));
 }
+
+#[test]
+fn two_logouts_at_once_both_end_the_agent() {
+    let connections = Connections::new();
+    let control = Arc::new(Control::new(true, Arc::clone(&connections)));
+    let ended = Arc::new(AtomicUsize::new(0));
+    let workers: Vec<_> = (0..2)
+        .map(|_| {
+            let live = connections.begin();
+            let (control, ended) = (Arc::clone(&control), Arc::clone(&ended));
+            std::thread::spawn(move || {
+                let _live = live;
+                handle_logout(&mut Closed, &mut Vec::new(), &control, || {
+                    ended.fetch_add(1, Ordering::SeqCst);
+                })
+                .unwrap();
+            })
+        })
+        .collect();
+    for worker in workers {
+        worker.join().unwrap();
+    }
+    assert_eq!(ended.load(Ordering::SeqCst), 2, "every logout ends the agent");
+}

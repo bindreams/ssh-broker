@@ -251,6 +251,8 @@ struct Tally {
     /// How many connections have ever ended: a counter, so "one ended since I looked" is a
     /// comparison and not a guess at what changed.
     ended: u64,
+    /// How many of the live connections are `logout` requests waiting for the others to finish.
+    logouts: usize,
 }
 
 /// A live connection. Dropping it, on any exit from the handler including a panic, ends it.
@@ -261,7 +263,11 @@ struct Live(Option<Arc<Connections>>);
 impl Connections {
     fn new() -> Arc<Self> {
         Arc::new(Self {
-            tally: Mutex::new(Tally { live: 0, ended: 0 }),
+            tally: Mutex::new(Tally {
+                live: 0,
+                ended: 0,
+                logouts: 0,
+            }),
             ended: Condvar::new(),
         })
     }
@@ -280,10 +286,18 @@ impl Connections {
         self.lock().ended
     }
 
-    /// Return once at most `n` connections are live.
-    fn wait_until_at_most(&self, n: usize) {
+    /// Record that a live connection is a `logout` request. It lasts while the guard does.
+    fn begin_logout(self: &Arc<Self>) -> LogoutWait {
+        self.lock().logouts += 1;
+        LogoutWait(Arc::clone(self))
+    }
+
+    /// Return once every live connection is a `logout` request: the shells' last output has been
+    /// delivered. Each request is itself live until its handler returns, so counting them in
+    /// would make two requests wait for each other for ever.
+    fn wait_until_only_logouts_live(&self) {
         let mut tally = self.lock();
-        while tally.live > n {
+        while tally.live > tally.logouts {
             tally = self
                 .ended
                 .wait(tally)
@@ -315,6 +329,18 @@ impl Connections {
                 .wait(tally)
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
         }
+    }
+}
+
+/// A live connection that is a `logout` request; see [`Connections::begin_logout`].
+#[cfg(windows)]
+struct LogoutWait(Arc<Connections>);
+
+#[cfg(windows)]
+impl Drop for LogoutWait {
+    fn drop(&mut self) {
+        self.0.lock().logouts -= 1;
+        self.0.ended.notify_all();
     }
 }
 

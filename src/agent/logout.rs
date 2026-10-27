@@ -120,9 +120,9 @@ pub(super) fn handle_logout<R: Read, W: std::io::Write>(
     reply(tx, ENDING_REPLY, 0)?;
     wait_for_close(rx);
     tracing::info!("ending the background session at the user's request");
+    let _logout = control.connections.begin_logout();
     control.end_all();
-    // This connection is live until its handler returns, so "everyone else is done" is one.
-    control.connections.wait_until_at_most(1);
+    control.connections.wait_until_only_logouts_live();
     end_process();
     Ok(())
 }
