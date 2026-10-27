@@ -168,6 +168,7 @@ fn a_process_that_cannot_be_identified_is_an_error_never_nothing_to_wait_for() {
                 Err(std::io::Error::from_raw_os_error(5))
             }
         },
+        &image_of,
         IfEnding::TakeForRunning,
     );
     drop(child.stdin.take());
@@ -179,6 +180,26 @@ fn a_process_that_cannot_be_identified_is_an_error_never_nothing_to_wait_for() {
     assert!(
         text.contains(&format!("which process {} runs", child.id())),
         "names the process whose image could not be identified: {text}"
+    );
+}
+
+#[test]
+fn a_process_whose_image_cannot_be_read_because_it_is_ending_is_taken_only_when_the_caller_says_so() {
+    // This test's own process stands for the one that ends: it is running, and the image read is
+    // made to say it is ending, which is what the kernel answers a process in its exit that has
+    // let go of its image. The real kernel answers in no way a test can make on demand.
+    let pid = std::process::id();
+    let ending = |_: &OwnedHandle| Err(Ending { pid }.into());
+    let open = |if_ending| open_if_image_by(pid, &cmd_exe(), &|_| Ok(FileId::default()), &ending, if_ending);
+
+    assert_eq!(
+        open(IfEnding::TakeForRunning).unwrap().map(|p| p.pid),
+        Some(pid),
+        "an ending process that may run the image is waited for"
+    );
+    assert!(
+        open(IfEnding::Skip).unwrap().is_none(),
+        "an ending process nothing says runs the image is none to wait for"
     );
 }
 

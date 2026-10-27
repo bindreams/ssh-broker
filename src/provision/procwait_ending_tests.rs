@@ -186,8 +186,8 @@ fn a_held_ending_process_is_taken_for_running_the_image_only_when_the_caller_say
     let image_unreadable = image_of(&handle).is_err();
     drop(handle);
 
-    let taken = open_if_image_by(held.pid(), &cmd_exe(), &file_id, IfEnding::TakeForRunning).unwrap();
-    let skipped = open_if_image_by(held.pid(), &cmd_exe(), &file_id, IfEnding::Skip).unwrap();
+    let taken = open_if_image_by(held.pid(), &cmd_exe(), &file_id, &image_of, IfEnding::TakeForRunning).unwrap();
+    let skipped = open_if_image_by(held.pid(), &cmd_exe(), &file_id, &image_of, IfEnding::Skip).unwrap();
 
     assert_eq!(
         taken.map(|p| p.pid),

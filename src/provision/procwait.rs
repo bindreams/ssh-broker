@@ -119,8 +119,8 @@ const IS_PROCESS_DELETING: u32 = 1 << 2;
 /// (`STATUS_PROCESS_IS_TERMINATING`), and which other queries refuse it too depends on how far the exit
 /// has got. A process held in its exit by a debugger answers the reads of its image and command line,
 /// and refuses `TerminateProcess` (CI round 21). No document says which query tells it, so each is
-/// kept, and the tests in `procwait_ending_tests.rs` print all of them for a held process and a
-/// running one.
+/// kept, and the failure message of each assertion in `procwait_ending_tests.rs` shows all of them for
+/// a held process and a running one.
 #[derive(Debug, Clone, Copy)]
 struct EndingSigns {
     /// The NTSTATUS of a zero-length probe of the image name.
@@ -311,7 +311,7 @@ pub fn background_agents(image: &Path) -> anyhow::Result<Vec<Process>> {
         &process_names()?,
         std::process::id(),
         super::EXE_NAME,
-        &|pid, if_ending| open_if_image_by(pid, image, &file_id, if_ending),
+        &|pid, if_ending| open_if_image_by(pid, image, &file_id, &image_of, if_ending),
     )
 }
 
@@ -426,7 +426,7 @@ fn file_id(path: &Path) -> std::io::Result<FileId> {
 /// or another case of the path is still the same exe. A process whose file cannot be identified is
 /// an error: it might be the agent. Holding the handle is what keeps the identity from here on.
 pub fn open_if_image(pid: u32, image: &Path) -> anyhow::Result<Option<Process>> {
-    open_if_image_by(pid, image, &file_id, IfEnding::TakeForRunning)
+    open_if_image_by(pid, image, &file_id, &image_of, IfEnding::TakeForRunning)
 }
 
 /// What to make of a process whose image cannot be read because it is ending.
@@ -440,12 +440,13 @@ enum IfEnding {
     Skip,
 }
 
-/// [`open_if_image`] with the identity of a file by path and what to do with an ending process as
-/// parameters, so a test can make the identification fail.
+/// [`open_if_image`] with the identity of a file by path, the read of a process's image and what to do
+/// with an ending process as parameters, so a test can make either read fail.
 fn open_if_image_by(
     pid: u32,
     image: &Path,
     identify: &dyn Fn(&Path) -> std::io::Result<FileId>,
+    read_image: &dyn Fn(&OwnedHandle) -> anyhow::Result<PathBuf>,
     if_ending: IfEnding,
 ) -> anyhow::Result<Option<Process>> {
     let wanted = match identify(image) {
@@ -460,7 +461,7 @@ fn open_if_image_by(
     if has_exited(&handle) {
         return Ok(None);
     }
-    match runs_image(&handle, pid, &wanted, identify) {
+    match runs_image(&handle, pid, &wanted, identify, read_image) {
         Ok(runs) => Ok(runs.then_some(Process { pid, handle })),
         Err(e) => match unreadable(&e, has_exited(&handle)) {
             // It may have ended since the check above.
@@ -492,8 +493,9 @@ fn runs_image(
     pid: u32,
     wanted: &FileId,
     identify: &dyn Fn(&Path) -> std::io::Result<FileId>,
+    read_image: &dyn Fn(&OwnedHandle) -> anyhow::Result<PathBuf>,
 ) -> anyhow::Result<bool> {
-    let path = image_of(handle)
+    let path = read_image(handle)
         .map_err(|e| {
             if is_ending_now(handle) {
                 anyhow::Error::new(Ending { pid })
@@ -566,7 +568,7 @@ impl Inspect for Process {
     }
 
     fn runs_image(&self, wanted: &FileId) -> anyhow::Result<bool> {
-        runs_image(&self.handle, self.pid, wanted, &file_id)
+        runs_image(&self.handle, self.pid, wanted, &file_id, &image_of)
     }
 
     fn has_exited(&self) -> bool {
