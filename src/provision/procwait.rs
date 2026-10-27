@@ -106,6 +106,10 @@ fn is_ending(error: &anyhow::Error) -> bool {
 /// Whether the process held by `handle` has begun to end, by asking the kernel for a thing about it
 /// and seeing whether the answer is `STATUS_PROCESS_IS_TERMINATING`. A process is never in that state
 /// again once it is out of it, so a `true` stays true.
+///
+/// No documentation says what the kernel answers for an ending process, and the answer may depend on
+/// the order of its checks (a zero-length buffer is the kind of thing it may refuse first). The tests
+/// in `procwait_ending_tests.rs` hold a real process in its exit and pin what it answers.
 fn is_ending_now(handle: &OwnedHandle) -> bool {
     let mut needed = 0u32;
     // SAFETY: a size probe: no buffer, zero length.
@@ -229,35 +233,62 @@ pub fn command_line_of(process: &Process) -> anyhow::Result<String> {
 /// handle. The image of a process is compared by file identity; its role by its command line.
 ///
 /// A process the snapshot names `ssh-broker.exe` that cannot be identified or whose command line
-/// cannot be read is an error: it might be a background agent. One that is ending is taken for one:
-/// it holds the exe until it is gone. Any other process whose image
-/// cannot be read (protected system processes, for one) cannot be the installed exe and is skipped.
+/// cannot be read is an error: it might be a background agent. One of that name that is ending is
+/// taken for one: it holds the exe until it is gone. A process of any other name that is ending is
+/// skipped, whatever it runs: nothing known about it says it holds the exe, and `apply` would wait for
+/// it. Any other process whose image cannot be read (protected system processes, for one) cannot be
+/// the installed exe and is skipped.
 pub fn background_agents(image: &Path) -> anyhow::Result<Vec<Process>> {
-    let own = std::process::id();
-    let mut candidates = Vec::new();
-    for (pid, name) in process_names()? {
-        if pid == own {
+    scan_background_agents(
+        &process_names()?,
+        std::process::id(),
+        super::EXE_NAME,
+        &|pid, if_ending| open_if_image_by(pid, image, &file_id, if_ending),
+    )
+}
+
+/// [`background_agents`] over the processes `names` lists, each opened by `open` (told what to make of
+/// a process that is ending), so a test can make up processes. `ours` is the installed exe's name.
+fn scan_background_agents<P: Inspect>(
+    names: &[(u32, String)],
+    own: u32,
+    ours: &str,
+    open: &dyn Fn(u32, IfEnding) -> anyhow::Result<Option<P>>,
+) -> anyhow::Result<Vec<P>> {
+    let mut agents = Vec::new();
+    for (pid, name) in names {
+        if *pid == own {
             continue;
         }
-        let ours_by_name = name.eq_ignore_ascii_case(super::EXE_NAME);
-        let process = match open_if_image(pid, image) {
+        let ours_by_name = name.eq_ignore_ascii_case(ours);
+        let if_ending = if ours_by_name {
+            IfEnding::TakeForRunning
+        } else {
+            IfEnding::Skip
+        };
+        let process = match open(*pid, if_ending) {
             Ok(Some(process)) => process,
             Ok(None) => continue,
             Err(e) if ours_by_name => return Err(e),
             Err(_) => continue,
         };
-        match command_line_of(&process) {
-            Ok(line) => candidates.push((process, role_of(&line))),
-            Err(e) => match unreadable(&e, has_exited(&process.handle)) {
+        match process.command_line() {
+            Ok(line) => {
+                if role_of(&line) == Role::BackgroundAgent {
+                    agents.push(process);
+                }
+            }
+            Err(e) => match unreadable(&e, process.has_exited()) {
                 Unreadable::Exited => {}
-                // Its role cannot be read while it ends. It may be an agent and holds the exe until it
-                // is gone, so it is taken for one, to be waited for.
-                Unreadable::Ending => candidates.push((process, Role::BackgroundAgent)),
+                // Its role cannot be read while it ends. By our name it may be an agent and holds the
+                // exe until it is gone, so it is taken for one, to be waited for.
+                Unreadable::Ending if ours_by_name => agents.push(process),
+                Unreadable::Ending => {}
                 Unreadable::Failed => return Err(e),
             },
         }
     }
-    Ok(select_background_agents(candidates.into_iter()).collect())
+    Ok(agents)
 }
 
 /// The process ids of the machine with the name of each one's image.
@@ -327,14 +358,27 @@ fn file_id(path: &Path) -> std::io::Result<FileId> {
 /// or another case of the path is still the same exe. A process whose file cannot be identified is
 /// an error: it might be the agent. Holding the handle is what keeps the identity from here on.
 pub fn open_if_image(pid: u32, image: &Path) -> anyhow::Result<Option<Process>> {
-    open_if_image_by(pid, image, &file_id)
+    open_if_image_by(pid, image, &file_id, IfEnding::TakeForRunning)
 }
 
-/// [`open_if_image`] with the identity of a file by path as a parameter, so a test can make it fail.
+/// What to make of a process whose image cannot be read because it is ending.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IfEnding {
+    /// It holds the file until it is gone, and nothing says it is not the agent: it is waited for. For
+    /// a caller that has a reason to think the process is the one (its name, or a scheduler that
+    /// named its pid).
+    TakeForRunning,
+    /// Nothing is known about which file it runs: it is nothing to wait for.
+    Skip,
+}
+
+/// [`open_if_image`] with the identity of a file by path and what to do with an ending process as
+/// parameters, so a test can make the identification fail.
 fn open_if_image_by(
     pid: u32,
     image: &Path,
     identify: &dyn Fn(&Path) -> std::io::Result<FileId>,
+    if_ending: IfEnding,
 ) -> anyhow::Result<Option<Process>> {
     let wanted = match identify(image) {
         Ok(id) => id,
@@ -353,9 +397,12 @@ fn open_if_image_by(
         Err(e) => match unreadable(&e, has_exited(&handle)) {
             // It may have ended since the check above.
             Unreadable::Exited => Ok(None),
-            // Its image is unreadable while it ends, and it holds the file until it is gone: it is
-            // waited for, as the agent it may be. The wait ends when it does.
-            Unreadable::Ending => Ok(Some(Process { pid, handle })),
+            // Its image is unreadable while it ends, and if it runs the file it holds it until it is
+            // gone. The wait ends when it does.
+            Unreadable::Ending => Ok(match if_ending {
+                IfEnding::TakeForRunning => Some(Process { pid, handle }),
+                IfEnding::Skip => None,
+            }),
             Unreadable::Failed => Err(e),
         },
     }
@@ -652,3 +699,7 @@ fn session_of(pid: u32) -> Option<u32> {
 #[cfg(test)]
 #[path = "procwait_tests.rs"]
 mod procwait_tests;
+
+#[cfg(test)]
+#[path = "procwait_ending_tests.rs"]
+mod procwait_ending_tests;

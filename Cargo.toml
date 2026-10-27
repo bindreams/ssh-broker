@@ -70,4 +70,5 @@ windows = { version = "0.62.2", features = [
     "Win32_System_StationsAndDesktops",     # HWINSTA/HDESK: tests/common/desktop.rs gives each child its own window station and desktop
     "Win32_System_EventLog",                 # EvtSubscribe: tests/common/logon_session.rs waits for the logoff event of a logon session
     "Win32_System_JobObjects",               # CreateJobObjectW: tests/common/job.rs stands in for sshd's kill-on-close job
+    "Win32_System_Diagnostics_Debug",        # WaitForDebugEvent: src/provision/procwait_ending_tests.rs holds a process in its exit
 ] }

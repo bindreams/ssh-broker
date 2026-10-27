@@ -9,7 +9,7 @@
 use std::path::Path;
 
 use anyhow::Context;
-use windows::Win32::Foundation::{ERROR_FILE_EXISTS, HANDLE};
+use windows::Win32::Foundation::ERROR_FILE_EXISTS;
 use windows::Win32::Security::Authorization::{ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1};
 use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
 use windows::Win32::Storage::FileSystem::{

@@ -155,14 +155,19 @@ fn a_process_that_cannot_be_identified_is_an_error_never_nothing_to_wait_for() {
     // The first identification is of the exe looked for; the second, of the image the process
     // runs, fails. By order, not by path: the two paths may be spelled alike.
     let calls = std::cell::Cell::new(0u32);
-    let outcome = open_if_image_by(child.id(), &cmd_exe(), &|_| {
-        calls.set(calls.get() + 1);
-        if calls.get() == 1 {
-            Ok(FileId::default())
-        } else {
-            Err(std::io::Error::from_raw_os_error(5))
-        }
-    });
+    let outcome = open_if_image_by(
+        child.id(),
+        &cmd_exe(),
+        &|_| {
+            calls.set(calls.get() + 1);
+            if calls.get() == 1 {
+                Ok(FileId::default())
+            } else {
+                Err(std::io::Error::from_raw_os_error(5))
+            }
+        },
+        IfEnding::TakeForRunning,
+    );
     drop(child.stdin.take());
     child.wait().unwrap();
     // Reaching the second identification proves the process was opened and its image read; an
@@ -717,6 +722,91 @@ fn a_process_that_cannot_be_opened_is_none_of_the_users() {
     })
     .unwrap();
     assert!(found.is_empty());
+}
+
+// the scan for background agents, over processes the test makes up -----
+
+const OURS: &str = crate::provision::EXE_NAME;
+
+/// A made-up process whose image cannot be read because it is ending: `open` takes it for running
+/// the image only if it is told to, as the real one does.
+fn ending_image(pid: u32) -> Made {
+    Made {
+        command_line: Err(Fail::Ending),
+        ..made(pid)
+    }
+}
+
+/// The pids a scan returned, and for each pid asked about whether an ending one was to be taken.
+type Scanned = (Vec<u32>, Vec<(u32, bool)>);
+
+/// The pids the scan for background agents returns, and what it was told to do with an ending process
+/// when it opened each one. `ending` holds the pids whose image is unreadable because they are ending.
+fn background_scanned(names: &[(u32, &str)], processes: &[Made], ending: &[u32]) -> anyhow::Result<Scanned> {
+    let names: Vec<(u32, String)> = names.iter().map(|(pid, name)| (*pid, (*name).to_owned())).collect();
+    let asked = std::cell::RefCell::new(Vec::new());
+    let found = scan_background_agents(&names, 1, OURS, &|pid, if_ending| {
+        asked.borrow_mut().push((pid, if_ending == IfEnding::TakeForRunning));
+        if ending.contains(&pid) && if_ending == IfEnding::Skip {
+            return Ok(None);
+        }
+        Ok(processes.iter().find(|p| p.pid == pid).cloned())
+    })?;
+    Ok((found.iter().map(|p| p.pid).collect(), asked.into_inner()))
+}
+
+#[test]
+fn the_scan_for_background_agents_finds_background_agents_and_not_other_roles() {
+    let desktop = Made {
+        command_line: Ok(r"C:\x\ssh-broker.exe agent"),
+        ..made(20)
+    };
+    let (found, _) = background_scanned(&[(10, OURS), (20, OURS)], &[made(10), desktop], &[]).unwrap();
+    assert_eq!(found, [10]);
+}
+
+#[test]
+fn an_ending_process_of_another_name_is_not_a_background_agent() {
+    // CI round 19 review: any process that was mid-exit when `apply` ran (a browser's child, a build
+    // tool) had an unreadable image, and was classed an agent that `apply` then waited for.
+    let (found, asked) =
+        background_scanned(&[(10, "chrome.exe"), (20, OURS)], &[ending_image(10), made(20)], &[10]).unwrap();
+    assert_eq!(found, [20]);
+    assert!(
+        asked.contains(&(10, false)),
+        "an ending process of another name must be opened to be skipped: {asked:?}"
+    );
+}
+
+#[test]
+fn an_ending_process_with_our_name_is_a_background_agent_to_wait_for() {
+    // It holds the exe until it is gone, and nothing says it is not the agent.
+    let (found, asked) = background_scanned(&[(10, OURS), (20, OURS)], &[ending_image(10), made(20)], &[10]).unwrap();
+    assert_eq!(found, [10, 20]);
+    assert!(asked.contains(&(10, true)), "{asked:?}");
+}
+
+#[test]
+fn the_name_of_an_ending_process_is_compared_without_regard_to_case() {
+    let (found, _) = background_scanned(&[(10, "SSH-Broker.EXE")], &[ending_image(10)], &[10]).unwrap();
+    assert_eq!(found, [10]);
+}
+
+#[test]
+fn a_process_of_another_name_that_runs_the_image_and_ends_while_read_is_skipped() {
+    // It was opened as running the image, then its command line was refused because it is ending.
+    let (found, _) = background_scanned(&[(10, "copy.exe"), (20, OURS)], &[ending_image(10), made(20)], &[]).unwrap();
+    assert_eq!(found, [20]);
+}
+
+#[test]
+fn a_process_with_our_name_that_cannot_be_read_for_no_known_reason_fails_the_scan() {
+    let refused = Made {
+        command_line: Err(Fail::Denied),
+        ..made(10)
+    };
+    let err = background_scanned(&[(10, OURS)], &[refused], &[]).unwrap_err();
+    assert!(format!("{err:#}").contains("10"), "{err:#}");
 }
 
 // what to make of a process that cannot be read -----
