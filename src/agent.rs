@@ -415,8 +415,7 @@ struct Tally {
     /// How many connections have ever ended: a counter, so "one ended since I looked" is a
     /// comparison and not a guess at what changed.
     ended: u64,
-    /// How many of the live connections the drain does not wait for: `logout` requests, which wait for
-    /// the others, and refused logins, which have nothing left to deliver.
+    /// How many of the live connections are `logout` requests waiting for the others to finish.
     logouts: usize,
 }
 
@@ -469,20 +468,7 @@ impl Connections {
 
     /// Record that a live connection is a `logout` request. It lasts while the guard does.
     fn begin_logout(self: &Arc<Self>) -> LogoutWait {
-        self.set_aside()
-    }
-
-    /// Record that a live connection is a refused login that has been answered: it has nothing left to
-    /// deliver, so the drain does not wait for it. It lasts while the guard does.
-    fn begin_refusal(self: &Arc<Self>) -> LogoutWait {
-        self.set_aside()
-    }
-
-    /// Count a live connection out of what the drain waits for, and wake the drain: it may be
-    /// parked on exactly this connection.
-    fn set_aside(self: &Arc<Self>) -> LogoutWait {
         self.lock().logouts += 1;
-        self.ended.notify_all();
         LogoutWait(Arc::clone(self))
     }
 
@@ -544,8 +530,7 @@ impl Connections {
     }
 }
 
-/// A live connection the drain does not wait for; see [`Connections::begin_logout`] and
-/// [`Connections::begin_refusal`].
+/// A live connection that is a `logout` request; see [`Connections::begin_logout`].
 #[cfg(windows)]
 struct LogoutWait(Arc<Connections>);
 

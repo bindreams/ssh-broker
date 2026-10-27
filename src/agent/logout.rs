@@ -8,8 +8,9 @@
 //! shell's last output reaches its client the way it does when a shell exits by itself), and only
 //! then ends the process. Every wait on a client (the logout request's, a refused login's, the
 //! drain's) is on a client that may never read or close, so each has the bound `DRAIN_BOUND`: past it
-//! the process goes on without the client, and the log says so. A refused login, once its reply and
-//! FIN are out, has nothing to deliver and does not count as live for the drain.
+//! the process goes on without the client, and the log says so. A refused login counts as live for
+//! the drain until its wait on the client returns, so the process does not end with the client's
+//! input unread, which would reset the connection and lose the reply.
 //!
 //! The listener stays open until the process ends. A login that arrives meanwhile is refused with
 //! [`ENDING_REFUSAL`]. The session slot and the user lock stay held until the process ends too, so a
@@ -166,8 +167,8 @@ pub(super) fn handle_logout<R: LimitedRead, W: std::io::Write>(
 /// The reply is followed by a FIN and a read until the client closes, as every reply that must
 /// arrive is: the client has sent its handshake and goes on sending input (an exec shim always ends
 /// with the stdin EOF marker), and closing with that unread would reset the connection and lose the
-/// reply. The read has the drain's bound ([`wait_for_client`]), and once the reply and the FIN are
-/// out the connection has nothing left to deliver, so the drain does not wait for it.
+/// reply. The read has the drain's bound ([`wait_for_client`]). The connection stays live for the
+/// drain until the read returns, so the process does not end under it.
 pub(super) fn refuse_while_ending<R: LimitedRead>(
     rx: &mut R,
     tx: &mut ConnTx,
@@ -175,7 +176,6 @@ pub(super) fn refuse_while_ending<R: LimitedRead>(
 ) -> anyhow::Result<()> {
     reply(tx, ENDING_REFUSAL, ENDING_REFUSED_EXIT_CODE)?;
     tx.shutdown_write()?;
-    let _nothing_to_deliver = control.connections.begin_refusal();
     wait_for_client(rx, control, "a refused login");
     Ok(())
 }

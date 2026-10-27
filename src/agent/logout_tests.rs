@@ -73,12 +73,16 @@ impl LimitedRead for Gate {
 }
 
 /// A client that stays connected until the test drops the sender, whatever limit a read has: for a
-/// test of something other than the bound.
-struct Open(mpsc::Receiver<()>);
+/// test of something other than the bound. It says (on `reading`) each time a read begins.
+struct Open {
+    reading: mpsc::Sender<()>,
+    closed: mpsc::Receiver<()>,
+}
 
 impl Read for Open {
     fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
-        let _ = self.0.recv();
+        let _ = self.reading.send(());
+        let _ = self.closed.recv();
         Ok(0)
     }
 }
@@ -537,49 +541,60 @@ fn a_refused_login_whose_client_closes_in_time_is_not_reported() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-#[test]
-fn a_refused_login_that_stays_connected_does_not_hold_the_drain() {
-    // The client stays until the failsafe lets it go. The refusal begins once the drain is parked, so
-    // only the refusal's own wake can end the drain before then; the drain's bound is 30 s, longer
-    // than the failsafe, and its verdict at the bound would be the same, so the failsafe flag is
-    // what tells them apart.
-    const FAILSAFE: Duration = Duration::from_secs(5);
-    let ((_srx, mut stx), (_crx, _ctx), dir) = socket_pair("refusal-drain");
-    let (parks, parked) = mpsc::channel::<()>();
-    let connections = Connections::observing_drain(move || {
-        let _ = parks.send(());
-    });
-    let control = Arc::new(Control::new(true, Arc::clone(&connections)));
+/// Run a refusal of a login whose client stays connected, on a thread of its own, as one live
+/// connection of `connections`. Returns once the refusal is reading from the client (so the reply
+/// and the FIN are out), with the means to close the client and to join the refusal.
+fn refusal_awaiting_its_client(
+    connections: &Arc<Connections>,
+    tag: &str,
+) -> (mpsc::Sender<()>, std::thread::JoinHandle<()>, std::path::PathBuf) {
+    let ((server_rx, mut stx), client, dir) = socket_pair(tag);
+    let control = Arc::new(Control::new(true, Arc::clone(connections)));
     let live = connections.begin();
     let (silent, closed) = mpsc::channel::<()>();
-    let (done, finished) = mpsc::channel::<()>();
-    let failsafe_fired = Arc::new(AtomicBool::new(false));
-    let failsafe = std::thread::spawn({
-        let failsafe_fired = Arc::clone(&failsafe_fired);
-        move || {
-            let waited = finished.recv_timeout(FAILSAFE); // sleep-ok: failsafe, a hang becomes a failure
-            failsafe_fired.store(waited == Err(mpsc::RecvTimeoutError::Timeout), Ordering::SeqCst);
-            drop(silent);
-        }
+    let (reading, started) = mpsc::channel::<()>();
+    let refusal = std::thread::spawn(move || {
+        // The sockets stay open while the refusal runs.
+        let _sockets = (server_rx, client);
+        let _live = live;
+        refuse_while_ending(&mut Open { reading, closed }, &mut stx, &control).unwrap();
     });
-    let refusal = std::thread::spawn({
-        let control = Arc::clone(&control);
-        move || {
-            parked.recv().unwrap();
-            let _live = live;
-            refuse_while_ending(&mut Open(closed), &mut stx, &control).unwrap();
-        }
-    });
+    started.recv().unwrap();
+    (silent, refusal, dir)
+}
+
+#[test]
+fn the_drain_does_not_complete_while_a_refused_client_is_still_connected() {
+    // The client has input the refusal has not read, and the process ends when the drain returns:
+    // closing with that unread resets the connection and loses the reply. The drain's bound is the
+    // only thing that can end it while the client stays.
+    let connections = Connections::with_drain_bound(SHORT_BOUND);
+    let (silent, refusal, dir) = refusal_awaiting_its_client(&connections, "refusal-holds-drain");
 
     let drained = connections.wait_until_only_logouts_live();
 
-    drop(done);
-    failsafe.join().unwrap();
+    drop(silent);
     refusal.join().unwrap();
-    assert!(
-        !failsafe_fired.load(Ordering::SeqCst),
-        "the drain waited for a refused login that had nothing to deliver"
-    );
+    assert_eq!(drained, Drained::Abandoned { still_live: 1 });
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn the_drain_completes_once_a_refused_client_has_closed() {
+    // The client closes inside the drain's park, which is after the drain is waiting.
+    let client: Arc<Mutex<Option<mpsc::Sender<()>>>> = Arc::default();
+    let connections = Connections::observing_drain({
+        let client = Arc::clone(&client);
+        move || drop(client.lock().unwrap().take())
+    });
+    let (silent, refusal, dir) = refusal_awaiting_its_client(&connections, "refusal-ends-drain");
+    *client.lock().unwrap() = Some(silent);
+
+    let drained = connections.wait_until_only_logouts_live();
+
+    // A drain that returned before the client closed must not leave the refusal waiting for ever.
+    drop(client.lock().unwrap().take());
+    refusal.join().unwrap();
     assert_eq!(drained, Drained::Complete);
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -710,7 +725,9 @@ fn a_read_limit_of_any_length_ends_a_read_that_finds_nothing() {
 
 #[test]
 fn a_wait_for_a_client_that_never_closes_ends_whatever_the_bound() {
-    for (i, bound) in LIMITS.into_iter().enumerate() {
+    // Not the 1 us limit: a bound that short has passed before the wait issues a read, so the row
+    // would not exercise the limit. `a_read_limit_of_any_length_*` pins that limit with a read.
+    for (i, bound) in LIMITS.into_iter().enumerate().skip(1) {
         let waited = against_a_silent_client(&format!("wait-bound-{i}"), |rx| wait_for_close_within(rx, bound));
         assert_eq!(waited, Waited::Abandoned, "{bound:?}");
     }
