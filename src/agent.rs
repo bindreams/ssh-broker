@@ -677,9 +677,10 @@ struct Hooks {
 #[cfg(windows)]
 #[cfg_attr(not(test), allow(dead_code))]
 enum Observed {
-    /// The shell has started. `output` is the read end of the pseudoconsole's output pipe, which is
-    /// valid until the session ends, so only a call made from the hook itself may use it.
-    ShellStarted { output: isize },
+    /// The shell has started. `output` is the read end of the pseudoconsole's output pipe and
+    /// `process` the shell's process handle; both are valid until the session is dropped, which is
+    /// after a refused login has reported [`Observed::RefusedConsoleClosed`].
+    ShellStarted { output: isize, process: isize },
     /// A refused login has closed its pseudoconsole after reading `bytes` of its output.
     RefusedConsoleClosed { bytes: usize },
 }
@@ -753,6 +754,7 @@ fn handle_pty(
     let mut session = PtySession::spawn(command, cols, rows, cwd)?;
     (hooks.observe)(Observed::ShellStarted {
         output: session.out_read_raw(),
+        process: session.process_raw(),
     });
     (hooks.after_spawn)();
     let job = session.job();

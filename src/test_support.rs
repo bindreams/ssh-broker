@@ -185,45 +185,11 @@ impl Drop for ThrowawayTask {
     }
 }
 
-// Waiting for a file -----
+// Waiting for a pipe to fill, and for a process to end -----
 
-/// Wait until `file` exists, by watching its folder `dir` for changes and re-checking after each, for
-/// a file that a child process might never make: `false` if `bound` ran out first. The bound is the
-/// failure the caller reports, naming what it waited for; it is not read as state.
-pub fn wait_for_file_within(dir: &Path, file: &Path, bound: Duration) -> bool {
-    use std::os::windows::ffi::OsStrExt;
-    use windows::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
-    use windows::Win32::Storage::FileSystem::{
-        FILE_NOTIFY_CHANGE_FILE_NAME, FindCloseChangeNotification, FindFirstChangeNotificationW,
-        FindNextChangeNotification,
-    };
-    use windows::Win32::System::Threading::{INFINITE, WaitForSingleObject};
-
-    let dir_w: Vec<u16> = dir.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
-    // Armed before the first check, so a creation between the check and the wait still signals.
-    // SAFETY: a NUL-terminated path; the handle is closed below.
-    let watch = unsafe { FindFirstChangeNotificationW(PCWSTR(dir_w.as_ptr()), false, FILE_NOTIFY_CHANGE_FILE_NAME) }
-        .expect("watch the folder for the file");
-    let deadline = std::time::Instant::now() + bound;
-    let mut made = file.exists();
-    while !made {
-        let left = deadline.saturating_duration_since(std::time::Instant::now());
-        let millis = u32::try_from(left.as_millis()).map_or(INFINITE - 1, |millis| millis.min(INFINITE - 1));
-        // SAFETY: the valid watch handle.
-        let woke = unsafe { WaitForSingleObject(watch, millis) }; // sleep-ok: failure bound on a process that may never make the file; expiry is reported, not read as state
-        if woke == WAIT_TIMEOUT {
-            made = file.exists();
-            break;
-        }
-        assert_eq!(woke, WAIT_OBJECT_0, "wait for the folder watch of {}", dir.display());
-        // SAFETY: re-armed after each wake so the next change signals again.
-        unsafe { FindNextChangeNotification(watch) }.expect("re-arm the folder watch");
-        made = file.exists();
-    }
-    // SAFETY: the handle from above.
-    let _ = unsafe { FindCloseChangeNotification(watch) };
-    made
-}
+/// What `CreatePipe(.., 0)` gives a pipe when `GetNamedPipeInfo` does not report its size. In CI a
+/// pseudoconsole's output pipe held 4101 bytes with the shell blocked on it and nothing reading.
+pub const DEFAULT_PIPE_BUFFER: u32 = 4096;
 
 /// The bytes waiting in the pipe whose read end is `read`, or the reason they could not be counted.
 /// `read` has to be open for the call.
@@ -245,6 +211,59 @@ pub fn pipe_pending(read: isize) -> Result<u32, String> {
     }
     .map(|()| pending)
     .map_err(|e| e.to_string())
+}
+
+/// The input buffer size of the pipe whose read end is `read`, in bytes, if the system reports one.
+pub fn pipe_buffer(read: isize) -> Option<u32> {
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::System::Pipes::GetNamedPipeInfo;
+
+    let mut size = 0u32;
+    // SAFETY: a size query on a handle the caller keeps open for the call.
+    unsafe {
+        GetNamedPipeInfo(
+            HANDLE(read as *mut core::ffi::c_void),
+            None,
+            None,
+            Some(&mut size),
+            None,
+        )
+    }
+    .ok()
+    .filter(|()| size > 0)
+    .map(|()| size)
+}
+
+/// Wait until at least `at_least` bytes are waiting in the pipe whose read end is `read`, by counting
+/// them again after each pause: nothing signals that a pipe has filled. `Err` says why the bound ran
+/// out, or why the bytes could not be counted. The bound is the failure the caller reports; the pause
+/// only paces the counting.
+pub fn wait_for_pipe_pending(read: isize, at_least: u32, bound: Duration) -> Result<u32, String> {
+    let deadline = std::time::Instant::now() + bound;
+    loop {
+        let pending = pipe_pending(read).map_err(|e| format!("counting the bytes waiting failed: {e}"))?;
+        if pending >= at_least {
+            return Ok(pending);
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(format!(
+                "{pending} bytes were waiting after {bound:?}, short of {at_least}"
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(5)); // sleep-ok: paces the re-count of the real condition above; the bound is the failure report and the pause is not read as state
+    }
+}
+
+/// Whether the process `process` (a handle the caller keeps open for the call) has ended, waiting up
+/// to `bound` for an end that was asked for and may not come: `false` if the bound ran out.
+pub fn process_ended_within(process: isize, bound: Duration) -> bool {
+    use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
+    use windows::Win32::System::Threading::WaitForSingleObject;
+
+    let millis = u32::try_from(bound.as_millis()).map_or(u32::MAX - 1, |millis| millis.min(u32::MAX - 1));
+    // SAFETY: the caller keeps the process handle open for the call.
+    let woke = unsafe { WaitForSingleObject(HANDLE(process as *mut core::ffi::c_void), millis) }; // sleep-ok: failure bound on a process's end, an external event; expiry is reported and is not read as state
+    woke == WAIT_OBJECT_0
 }
 
 // Naming a hang -----

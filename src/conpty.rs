@@ -238,6 +238,12 @@ impl PtySession {
         self.out_read.0.0 as isize
     }
 
+    /// Raw handle (as `isize`) of the shell's process, valid until the session is dropped; for a test
+    /// that has to see the shell end.
+    pub fn process_raw(&self) -> isize {
+        self.process.0.0 as isize
+    }
+
     /// Raw input-write handle (as `isize`) for forwarding decoded input.
     pub fn in_write_raw(&self) -> isize {
         self.in_write.0.0 as isize

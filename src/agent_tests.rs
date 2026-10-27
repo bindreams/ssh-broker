@@ -212,76 +212,80 @@ impl Seen {
     }
 }
 
-/// How long the shell below may take to make its marker, and the test to finish. Both are failure
-/// bounds on external events (a shell, conhost) that might never come, well inside nextest's limit; the
-/// test takes seconds when it works.
-const MARKER_BOUND: std::time::Duration = std::time::Duration::from_secs(60);
+/// How long the pseudoconsole's output pipe may take to fill, how long the refused shell may take to
+/// end, and how long the test may take. Failure bounds on external events (a shell, conhost) that
+/// might never come, well inside nextest's limit; the test takes seconds when it works.
+const FILL_BOUND: std::time::Duration = std::time::Duration::from_secs(60);
+const SHELL_END_BOUND: std::time::Duration = std::time::Duration::from_secs(60);
 const TEST_BOUND: std::time::Duration = std::time::Duration::from_secs(120);
 
-/// The shell has written far more than the pseudoconsole's output pipe holds when the login loses
-/// the race, and nothing reads that pipe on the refusal path unless the refusal drains it: closing
-/// the pseudoconsole flushes conhost's pending output into the pipe, and blocks where it is full. The
-/// handler would never return, so this test would hang (the watchdog ends it and says how far it got)
-/// and not pass.
+/// A login that loses the race with the end, while its shell is writing without end into a
+/// pseudoconsole whose output pipe is full and which nothing reads: the refusal has to close the
+/// pseudoconsole with that output still pending, which blocks where nothing drains it. The handler
+/// would never return, so this test would hang (the watchdog ends it and says how far it got) and not
+/// pass. It pins that the refusal reaches the client and ends the shell.
 ///
-/// The shell cannot make its marker while the pipe is full and nothing reads it. If the pipe holds
-/// less than the shell writes, the wait for the marker runs out, and says how many bytes were waiting
-/// in the pipe then.
+/// The end begins once the unread output has filled the pipe, which is when the shell blocks and conhost
+/// holds the rest. The shell makes no marker: it cannot be waited for, and it never finishes.
 #[test]
 fn a_pty_login_refused_after_the_shell_wrote_a_lot_is_still_refused() {
-    use crate::test_support::{Watchdog, pipe_pending, wait_for_file_within};
+    use crate::test_support::{
+        DEFAULT_PIPE_BUFFER, Watchdog, pipe_buffer, process_ended_within, wait_for_pipe_pending,
+    };
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicIsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 
     const LINE: &str = "0123456789012345678901234567890123456789012345678901234567890123456789";
-    let marker_dir = std::env::temp_dir().join(format!("sb-agent-wrote-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&marker_dir);
-    std::fs::create_dir_all(&marker_dir).unwrap();
-    let marker = marker_dir.join("wrote");
-    // The marker is made after the output, so the hook below runs the end once the shell's output is
-    // in conhost (the shell then stays alive, so only the reap ends it).
-    let command = format!(
-        r#"cmd.exe /d /s /c "(for /l %i in (1,1,3000) do @echo {LINE}) & echo.> "{}" & ping -n 120 127.0.0.1 > nul""#,
-        marker.display()
-    );
+    // Far more lines than the pipe holds, and more than a test lasts for.
+    let command = format!(r#"cmd.exe /d /s /c "for /l %i in (1,1,2147483647) do @echo {LINE}""#);
     let seen = Seen::default();
     let _watchdog = Watchdog::arm("the refused PTY login", TEST_BOUND, {
         let seen = seen.clone();
         move || seen.text()
     });
-    let output = Arc::new(AtomicIsize::new(0));
+    let (output, process) = (Arc::new(AtomicIsize::new(0)), Arc::new(AtomicIsize::new(0)));
+    let shell_ended = Arc::new(AtomicBool::new(false));
     let control = Arc::new(super::Control::new(true, super::Connections::new()));
     assert_refused(refused_login_of("raced-pty-output", Mode::Pty, &command, |conn| {
         let hooks = Hooks {
             observe: {
-                let (seen, output) = (seen.clone(), Arc::clone(&output));
+                let (seen, output, process, shell_ended) = (
+                    seen.clone(),
+                    Arc::clone(&output),
+                    Arc::clone(&process),
+                    Arc::clone(&shell_ended),
+                );
                 Box::new(move |event| match event {
-                    super::Observed::ShellStarted { output: pipe } => {
+                    super::Observed::ShellStarted {
+                        output: pipe,
+                        process: shell,
+                    } => {
                         output.store(pipe, Ordering::SeqCst);
+                        process.store(shell, Ordering::SeqCst);
                         seen.note("the shell started");
                     }
                     super::Observed::RefusedConsoleClosed { bytes } => {
                         seen.note(format!("ClosePseudoConsole returned after {bytes} bytes were read"));
+                        // Before the session is dropped, which closes the handle.
+                        shell_ended.store(
+                            process_ended_within(process.load(Ordering::SeqCst), SHELL_END_BOUND),
+                            Ordering::SeqCst,
+                        );
                     }
                 })
             },
             after_spawn: {
                 let (control, seen, output) = (Arc::clone(&control), seen.clone(), Arc::clone(&output));
-                let (marker, marker_dir) = (marker.clone(), marker_dir.clone());
                 Box::new(move || {
-                    if !wait_for_file_within(&marker_dir, &marker, MARKER_BOUND) {
-                        panic!(
-                            concat!(
-                                "waiting for the shell to make {} within {:?}: it did not. ",
-                                "Bytes waiting in the output pipe, which nothing reads yet: {:?}. Seen: {}"
-                            ),
-                            marker.display(),
-                            MARKER_BOUND,
-                            pipe_pending(output.load(Ordering::SeqCst)),
+                    let pipe = output.load(Ordering::SeqCst);
+                    let full = pipe_buffer(pipe).unwrap_or(DEFAULT_PIPE_BUFFER);
+                    match wait_for_pipe_pending(pipe, full, FILL_BOUND) {
+                        Ok(pending) => seen.note(format!("{pending} bytes were waiting, of {full} that fill the pipe")),
+                        Err(why) => panic!(
+                            "the shell's unread output did not fill the output pipe within {FILL_BOUND:?}: {why}. Seen: {}",
                             seen.text()
-                        );
+                        ),
                     }
-                    seen.note("the shell made the marker");
                     control.end_all();
                     seen.note("the agent was told to end");
                 })
@@ -291,7 +295,11 @@ fn a_pty_login_refused_after_the_shell_wrote_a_lot_is_still_refused() {
         super::handle_connection_in(conn, hooks, &control).unwrap();
         seen.note("the agent answered the refusal");
     }));
-    std::fs::remove_dir_all(&marker_dir).ok();
+    assert!(
+        shell_ended.load(Ordering::SeqCst),
+        "the refused login's shell was still running {SHELL_END_BOUND:?} after the refusal. Seen: {}",
+        seen.text()
+    );
 }
 
 /// While the agent waits for its connections to finish, a login is answered with the refusal at
