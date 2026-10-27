@@ -254,6 +254,25 @@ process tree:
         self.read_until_any(&[needle]);
     }
 
+    /// Read until the console has shown `needle` at least `count` times in all. The transcript is never
+    /// consumed, so a second wait for the same text needs `count` 2, or it returns at once.
+    pub fn read_until_count(&mut self, needle: &str, count: usize) {
+        loop {
+            let text = self.text();
+            if text.matches(needle).count() >= count {
+                return;
+            }
+            assert!(
+                self.take_chunk(&format!("{count} times {needle:?}")),
+                "the console closed before it showed {needle:?} {count} times; it showed:
+{text}
+
+{}",
+                self.extra()
+            );
+        }
+    }
+
     /// Read until the console closes, and return the shim's exit code.
     pub fn finish(&mut self) -> i32 {
         while self.take_chunk("the console to close") {}

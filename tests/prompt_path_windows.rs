@@ -288,12 +288,15 @@ fn empty_enter_reprompts() {
     let mut run = start_run(&kit, &account);
     run.read_until(PROMPT);
     run.press_enter();
-    run.read_until("empty passwords are not supported yet");
+    run.read_until_count("empty passwords are not supported yet", 1);
     run.press_enter();
-    run.read_until("empty passwords are not supported yet");
-    // Still asking: a password now signs in.
+    // The second Enter is answered too: a count of two, since the first answer is still on the screen.
+    run.read_until_count("empty passwords are not supported yet", 2);
+    // Still asking: a password now signs in, and the shell is the session's, not a plain one that
+    // would take the typed password as a command.
     run.type_line(&account.password);
-    run.read_until(SHELL_PROMPT);
+    expect_session(&mut run);
+    assert_relayed(&mut run);
     say(&mut run, "session-up");
     leave(&mut run);
 }
@@ -344,12 +347,23 @@ fn second_connection_reuses_the_running_session() {
     log_in(&mut first, &account.password);
     say(&mut first, "first-up");
 
+    let first_parent = parent_pid(&mut first);
+
     let mut second = start_run(&kit, &account);
     second.read_until(SHELL_PROMPT);
     say(&mut second, "second-up");
     assert!(
         !second.text().contains(PROMPT),
         "the running session must be used without a prompt:\n{}",
+        second.text()
+    );
+    // Relayed into the running session: the session's DPAPI works, and the shell is a child of the
+    // same agent. A second shim that failed open shows the same prompt and neither of these.
+    assert_relayed(&mut second);
+    assert_eq!(
+        parent_pid(&mut second),
+        first_parent,
+        "the second connection was not served by the running agent:\n{}",
         second.text()
     );
     leave(&mut second);
@@ -432,6 +446,10 @@ fn two_simultaneous_first_connections_end_with_one_agent_and_no_hang() {
         )
     );
 
+    // `leave` returns once the console helper, which holds the job the shim runs in, has exited. Closing
+    // that job is what could end the agent, and a process ended by it is not gone the instant its
+    // helper is, so the survival is shown by a third login being served, below, and not by a look at
+    // the agent's state alone.
     for run in &mut runs {
         leave(run);
     }
@@ -462,6 +480,27 @@ fn two_simultaneous_first_connections_end_with_one_agent_and_no_hang() {
             &account
         )
     );
+    // Served after every console left: no prompt, the session's DPAPI, and the same agent as the parent.
+    let mut third = start_run(&kit, &account);
+    third.read_until(SHELL_PROMPT);
+    assert!(
+        !third.text().contains(PROMPT),
+        "a login after both consoles left was asked for a password: the agent did not survive:
+{}",
+        third.text()
+    );
+    assert_relayed(&mut third);
+    assert_eq!(
+        parent_pid(&mut third),
+        parents[0],
+        "{}",
+        report(
+            "the login after both consoles left was not served by the agent that served them.",
+            &runs,
+            &account
+        )
+    );
+    leave(&mut third);
 }
 
 /// The failure report of the two-consoles test: what happened, and what each console showed.
