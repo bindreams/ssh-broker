@@ -543,7 +543,7 @@ fn scanned(processes: &[Made]) -> anyhow::Result<Vec<u32>> {
         .iter()
         .map(|p| (p.pid, crate::provision::EXE_NAME.to_owned()))
         .collect();
-    let found = scan_user_agents(&names, 1, ME, &FileId::default(), &|pid| {
+    let found = scan_user_agents(&names, 1, crate::provision::EXE_NAME, ME, &FileId::default(), &|pid| {
         Ok(processes.iter().find(|p| p.pid == pid).cloned())
     })?;
     Ok(found.iter().map(|p| p.pid).collect())
@@ -634,7 +634,7 @@ impl Inspect for ExitsWhenAsked {
 #[test]
 fn a_process_that_exits_while_its_command_line_is_read_is_skipped() {
     let names = vec![(20, crate::provision::EXE_NAME.to_owned())];
-    let found = scan_user_agents(&names, 1, ME, &FileId::default(), &|pid| {
+    let found = scan_user_agents(&names, 1, crate::provision::EXE_NAME, ME, &FileId::default(), &|pid| {
         Ok(Some(ExitsWhenAsked {
             made: Made {
                 command_line: Err(Fail::Denied),
@@ -674,7 +674,7 @@ fn a_process_of_the_user_whose_command_line_is_refused_for_no_known_reason_fails
 #[test]
 fn this_process_and_processes_of_other_names_are_not_looked_at() {
     let names = vec![(1, crate::provision::EXE_NAME.to_owned()), (2, "other.exe".to_owned())];
-    let found = scan_user_agents::<Made>(&names, 1, ME, &FileId::default(), &|pid| {
+    let found = scan_user_agents::<Made>(&names, 1, crate::provision::EXE_NAME, ME, &FileId::default(), &|pid| {
         panic!("process {pid} was opened")
     })
     .unwrap();
@@ -682,9 +682,40 @@ fn this_process_and_processes_of_other_names_are_not_looked_at() {
 }
 
 #[test]
+fn the_scan_looks_for_the_file_name_of_the_image_it_is_given_not_for_the_installed_name() {
+    // CI round 18: the tests run a copy of the exe under another name, and the scan, which looked at
+    // `ssh-broker.exe` only, found none of its agents.
+    let names = vec![
+        (10, "stand_in.exe".to_owned()),
+        (20, crate::provision::EXE_NAME.to_owned()),
+    ];
+    let opened = std::cell::RefCell::new(Vec::new());
+    let found = scan_user_agents(&names, 1, "stand_in.exe", ME, &FileId::default(), &|pid| {
+        opened.borrow_mut().push(pid);
+        Ok(Some(made(pid)))
+    })
+    .unwrap();
+    assert_eq!(found.iter().map(|p| p.pid).collect::<Vec<_>>(), [10]);
+    assert_eq!(*opened.borrow(), [10], "a process of another name is not opened");
+}
+
+#[test]
+fn the_scan_compares_file_names_without_regard_to_case() {
+    let names = vec![(10, "Stand_In.EXE".to_owned())];
+    let found = scan_user_agents(&names, 1, "stand_in.exe", ME, &FileId::default(), &|pid| {
+        Ok(Some(made(pid)))
+    })
+    .unwrap();
+    assert_eq!(found.len(), 1);
+}
+
+#[test]
 fn a_process_that_cannot_be_opened_is_none_of_the_users() {
     let names = vec![(5, crate::provision::EXE_NAME.to_owned())];
-    let found = scan_user_agents::<Made>(&names, 1, ME, &FileId::default(), &|_| Ok(None)).unwrap();
+    let found = scan_user_agents::<Made>(&names, 1, crate::provision::EXE_NAME, ME, &FileId::default(), &|_| {
+        Ok(None)
+    })
+    .unwrap();
     assert!(found.is_empty());
 }
 

@@ -398,7 +398,9 @@ fn runs_image(
 
 /// Every agent (desktop or background) of `user` that is running `image` right now, other than this
 /// process, each held by a handle: the agents that exist, whether or not they serve yet. A process
-/// that has ended, or is ending, is not one.
+/// that has ended, or is ending, is not one. Only processes whose snapshot name is the file name of
+/// `image` are looked at (the installed exe is `ssh-broker.exe`; a copy run under another name is found
+/// by that name); the file's identity decides the rest.
 ///
 /// A process that cannot be opened, or whose token cannot be read, is refused to this user, and a
 /// process of the user is not (it is made with a default access list that names the user): it is
@@ -411,9 +413,14 @@ pub fn user_agents(image: &Path, user: &Sid) -> anyhow::Result<Vec<Process>> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(e).with_context(|| format!("identify {}", image.display())),
     };
+    let name = image
+        .file_name()
+        .and_then(|name| name.to_str())
+        .with_context(|| format!("{} has no file name to look for", image.display()))?;
     scan_user_agents(
         &process_names()?,
         std::process::id(),
+        name,
         &wanted_user,
         &wanted,
         &|pid| match open_for_waiting(pid) {
@@ -455,17 +462,18 @@ impl Inspect for Process {
 }
 
 /// [`user_agents`] over the processes `names` lists, each opened by `open` (`None`: not to be
-/// looked at), so a test can make up processes.
+/// looked at), so a test can make up processes. Only those named `name` are opened.
 fn scan_user_agents<P: Inspect>(
     names: &[(u32, String)],
     own: u32,
+    name: &str,
     user: &str,
     image: &FileId,
     open: &dyn Fn(u32) -> anyhow::Result<Option<P>>,
 ) -> anyhow::Result<Vec<P>> {
     let mut agents = Vec::new();
-    for (pid, name) in names {
-        if *pid == own || !name.eq_ignore_ascii_case(super::EXE_NAME) {
+    for (pid, process_name) in names {
+        if *pid == own || !process_name.eq_ignore_ascii_case(name) {
             continue;
         }
         let Some(process) = open(*pid)? else {
