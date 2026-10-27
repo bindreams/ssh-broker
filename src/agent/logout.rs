@@ -6,7 +6,9 @@
 //! inside its job, so ending the tree earlier could cut the reply and the exit code off), ends
 //! every session's shell tree, waits until every other connection has finished relaying (so each
 //! shell's last output reaches its client the way it does when a shell exits by itself), and only
-//! then ends the process.
+//! then ends the process. A connection waits on its client, which may never read or close, so that
+//! wait has a bound (`DRAIN_BOUND`): past it the process ends with the connections left, and the log
+//! says how many.
 
 use std::io::Read;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};

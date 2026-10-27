@@ -271,6 +271,25 @@ fn hand_to_thread<C: Send + 'static>(
 struct Connections {
     tally: Mutex<Tally>,
     ended: Condvar,
+    /// How long [`Connections::wait_until_only_logouts_live`] waits for connections that do not finish.
+    drain_bound: std::time::Duration,
+}
+
+/// The longest an ending agent waits for its connections to finish relaying. Each is waiting on a
+/// client (to read the last output, to close), and a client may never do either; this is the failure
+/// bound on that wait, never a proof that the output arrived. When it passes the agent ends anyway
+/// and logs how many connections it left.
+#[cfg(windows)]
+const DRAIN_BOUND: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How [`Connections::wait_until_only_logouts_live`] ended.
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Drained {
+    /// Every connection but the `logout` requests finished.
+    Complete,
+    /// The bound passed with `still_live` connections unfinished.
+    Abandoned { still_live: usize },
 }
 
 #[cfg(windows)]
@@ -290,7 +309,12 @@ struct Live(Option<Arc<Connections>>);
 #[cfg(windows)]
 impl Connections {
     fn new() -> Arc<Self> {
+        Self::with_drain_bound(DRAIN_BOUND)
+    }
+
+    fn with_drain_bound(drain_bound: std::time::Duration) -> Arc<Self> {
         Arc::new(Self {
+            drain_bound,
             tally: Mutex::new(Tally {
                 live: 0,
                 ended: 0,
@@ -323,13 +347,25 @@ impl Connections {
     /// Return once every live connection is a `logout` request: the shells' last output has been
     /// delivered. Each request is itself live until its handler returns, so counting them in
     /// would make two requests wait for each other for ever.
-    fn wait_until_only_logouts_live(&self) {
-        let mut tally = self.lock();
-        while tally.live > tally.logouts {
-            tally = self
-                .ended
-                .wait(tally)
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+    ///
+    /// A connection waits on its client, which may never act, so the wait ends after the drain bound
+    /// with the connections still live. The condition is re-checked after every wake; the bound only
+    /// stops the wait, it does not decide the condition.
+    fn wait_until_only_logouts_live(&self) -> Drained {
+        let tally = self.lock();
+        let (tally, _) = self
+            .ended
+            .wait_timeout_while(tally, self.drain_bound, |tally| tally.live > tally.logouts)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let still_live = tally.live.saturating_sub(tally.logouts);
+        if still_live == 0 {
+            Drained::Complete
+        } else {
+            tracing::warn!(
+                "{still_live} connection(s) had not finished {} s after the end began; ending without them",
+                self.drain_bound.as_secs_f32()
+            );
+            Drained::Abandoned { still_live }
         }
     }
 

@@ -1,5 +1,6 @@
 //! Unit tests for the agent's answer to `logout`. In-process: no socket, no shell, no process ends.
 use super::*;
+use crate::agent::Drained;
 use crate::protocol::{ExitCode, FrameKind, FrameReader, Stream};
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -296,4 +297,62 @@ fn a_connection_that_arrives_while_ending_is_told_so_and_gets_a_failing_exit_cod
     assert_eq!(data, [(Stream::Stderr as u8, ENDING_REPLY.to_string())]);
     assert_eq!(exit, Some(ENDING_REFUSED_EXIT_CODE));
     assert_ne!(ENDING_REFUSED_EXIT_CODE, 0, "the login did not get a shell");
+}
+
+// a handler that never returns -----
+
+/// The drain bound of these tests: the handler they hold never finishes, so the bound is what ends
+/// the wait, and its length changes nothing about what is asserted.
+const SHORT_BOUND: std::time::Duration = std::time::Duration::from_millis(10);
+
+#[test]
+fn a_connection_handler_that_never_returns_does_not_keep_the_agent_alive() {
+    let connections = Connections::with_drain_bound(SHORT_BOUND);
+    let stuck = connections.begin();
+    let this_connection = connections.begin();
+    let control = Control::new(true, Arc::clone(&connections));
+    let ended = AtomicBool::new(false);
+
+    let _live = this_connection;
+    handle_logout(&mut Closed, &mut Vec::new(), &control, || {
+        ended.store(true, Ordering::SeqCst)
+    })
+    .unwrap();
+
+    assert!(ended.load(Ordering::SeqCst), "the logout ended the agent");
+    drop(stuck);
+}
+
+#[test]
+fn a_logout_that_waited_in_vain_says_how_many_connections_it_left() {
+    let connections = Connections::with_drain_bound(SHORT_BOUND);
+    let _a = connections.begin();
+    let _b = connections.begin();
+    let _logout_connection = connections.begin();
+    let _logout = connections.begin_logout();
+    assert_eq!(
+        connections.wait_until_only_logouts_live(),
+        Drained::Abandoned { still_live: 2 }
+    );
+}
+
+#[test]
+fn a_drain_that_finishes_in_time_reports_complete() {
+    let connections = Connections::with_drain_bound(SHORT_BOUND);
+    let _logout_connection = connections.begin();
+    let _logout = connections.begin_logout();
+    assert_eq!(connections.wait_until_only_logouts_live(), Drained::Complete);
+}
+
+#[test]
+fn a_connection_that_finishes_within_the_bound_is_waited_for() {
+    // The bound is for what never finishes: a connection that does finish is awaited, however
+    // long the bound.
+    let connections = Connections::new();
+    let other = connections.begin();
+    let _logout_connection = connections.begin();
+    let _logout = connections.begin_logout();
+    let finisher = std::thread::spawn(move || drop(other));
+    assert_eq!(connections.wait_until_only_logouts_live(), Drained::Complete);
+    finisher.join().unwrap();
 }

@@ -860,3 +860,11 @@ fn home_comes_from_the_token_not_the_environment() {
         .unwrap_or_else(|| panic!("the child printed no home: {stdout}"));
     assert_eq!(PathBuf::from(line), expected);
 }
+
+#[test]
+fn a_stopped_loop_ends_although_a_connection_never_finishes() {
+    let connections = Connections::with_drain_bound(std::time::Duration::from_millis(10));
+    let _hung = connections.begin();
+    let end = finish_stopped(anyhow::Error::new(Stopped), &connections);
+    assert!(end.downcast_ref::<Stopped>().is_some(), "{end:#}");
+}
