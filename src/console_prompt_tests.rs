@@ -120,3 +120,18 @@ fn absence_of_a_connect_to_a_stale_socket_file_is_no_agent() {
         code_of(&connect)
     );
 }
+
+// is_no_agent: the same codes, for a caller that has only the connect error -----
+
+#[test]
+fn only_the_observed_codes_for_nothing_listening_are_no_agent() {
+    for code in [10050, 10061] {
+        let error: anyhow::Error = std::io::Error::from_raw_os_error(code).into();
+        assert!(is_no_agent(&error), "code {code}");
+    }
+    for code in [5, 10013, 10048] {
+        let error: anyhow::Error = std::io::Error::from_raw_os_error(code).into();
+        assert!(!is_no_agent(&error), "code {code}");
+    }
+    assert!(!is_no_agent(&anyhow::anyhow!("not an OS error")));
+}

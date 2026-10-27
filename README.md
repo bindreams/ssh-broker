@@ -93,6 +93,7 @@ Windows' own auto-logon is a different, documented option: signing the user in a
 | 1 | You have no session to end. |
 | 2 | Your agent runs in your desktop session; signing out of Windows ends it. |
 | 3 | The agent did not answer. An agent older than this ssh-broker cannot understand `logout`: run `apply`. A crashed agent looks the same. |
+| 4 | Your agent could not be reached for another reason (access denied, a socket path that is too long): the message names it. |
 
 ## Requirements
 

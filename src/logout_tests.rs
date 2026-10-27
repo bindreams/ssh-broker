@@ -45,17 +45,36 @@ fn the_agents_reply_goes_to_stderr_and_its_exit_code_is_ours() {
     assert_eq!(err, "desktop\r\n");
 }
 
-#[test]
-fn logout_with_no_agent_exits_1() {
+/// `logout_at` with a connect that fails with `error`, and a verdict that only a missing agent
+/// is "no session".
+fn logout_failing_to_connect(error: anyhow::Error) -> (i32, String) {
     let mut err = Vec::new();
     let code = logout_at(
-        || Err::<(Cursor<Vec<u8>>, Vec<u8>), _>(anyhow::anyhow!("no such file")),
+        || Err::<(Cursor<Vec<u8>>, Vec<u8>), _>(error),
+        |e| e.to_string() == "nothing listens",
         &mut err,
         EXE,
         |code| code,
     );
+    (code, String::from_utf8(err).unwrap())
+}
+
+#[test]
+fn logout_with_no_agent_exits_1() {
+    let (code, err) = logout_failing_to_connect(anyhow::anyhow!("nothing listens"));
     assert_eq!(code, 1);
-    assert_eq!(String::from_utf8(err).unwrap(), "ssh-broker: no session to end.\n");
+    assert_eq!(err, "ssh-broker: no session to end.\n");
+}
+
+#[test]
+fn logout_that_cannot_reach_an_agent_says_why_and_is_not_no_session() {
+    // An agent that serves this user but refuses the connection is not "no session to end".
+    let (code, err) = logout_failing_to_connect(anyhow::anyhow!("Access is denied. (0x80070005)"));
+    assert_eq!(code, UNREACHABLE_CODE);
+    assert_ne!(code, 1);
+    assert!(!err.contains("no session to end"), "{err}");
+    assert!(err.contains("could not reach your session"), "{err}");
+    assert!(err.contains("Access is denied"), "{err}");
 }
 
 #[test]
@@ -117,6 +136,7 @@ fn the_connection_is_still_open_when_the_exit_code_is_handed_over() {
             let tx = Held(held, Cursor::new(Vec::new()));
             Ok((rx, tx))
         },
+        |_| false,
         &mut err,
         EXE,
         |_code| !dropped.get(),

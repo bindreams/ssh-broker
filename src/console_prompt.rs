@@ -145,16 +145,18 @@ pub fn absence(connect: &anyhow::Result<socket2::Socket>, location: &anyhow::Res
         Err(_) => return Absence::Other,
     };
     let _ = location;
-    let Err(error) = connect else {
-        return Absence::Other;
-    };
-    match error
-        .downcast_ref::<std::io::Error>()
-        .and_then(std::io::Error::raw_os_error)
-    {
-        Some(code) if NO_AGENT_CODES.contains(&code) => Absence::NoAgent,
+    match connect {
+        Err(error) if is_no_agent(error) => Absence::NoAgent,
         _ => Absence::Other,
     }
+}
+
+/// Whether a failed `connect` to the user's socket means nothing serves it, by the OS code.
+pub fn is_no_agent(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<std::io::Error>()
+        .and_then(std::io::Error::raw_os_error)
+        .is_some_and(|code| NO_AGENT_CODES.contains(&code))
 }
 
 #[cfg(test)]

@@ -16,6 +16,8 @@ use crate::shim::{make_handshake, map_outcome};
 pub const NO_SESSION: &str = "ssh-broker: no session to end.";
 /// The exit code when the agent closed the connection without a single frame.
 pub const NO_ANSWER_CODE: i32 = 3;
+/// The exit code when the agent could not be reached for a reason other than not being there.
+pub const UNREACHABLE_CODE: i32 = 4;
 
 /// The one sentence for an agent that closed without answering. An agent of a build before
 /// `logout` cannot decode the request and drops the connection without a reply; a crashed or
@@ -66,16 +68,26 @@ pub fn logout_on<R: Read, W: Write>(rx: &mut R, tx: &mut W, err: &mut dyn Write,
 }
 
 /// Connect with `connect`, run [`logout_on`], and hand its exit code to `exit` **while the
-/// connection is still open**. No agent to connect to is `NO_SESSION` and exit code 1.
+/// connection is still open**. A connect that fails because there is no agent (`no_session` says
+/// so) is `NO_SESSION` and exit code 1; any other failure is reported with its cause and exits
+/// with [`UNREACHABLE_CODE`], since an agent may well serve this user.
 pub fn logout_at<R: Read, W: Write, T>(
     connect: impl FnOnce() -> anyhow::Result<(R, W)>,
+    no_session: impl FnOnce(&anyhow::Error) -> bool,
     err: &mut dyn Write,
     exe: &str,
     exit: impl FnOnce(i32) -> T,
 ) -> T {
-    let Ok((mut rx, mut tx)) = connect() else {
-        let _ = writeln!(err, "{NO_SESSION}");
-        return exit(1);
+    let (mut rx, mut tx) = match connect() {
+        Ok(connection) => connection,
+        Err(e) if no_session(&e) => {
+            let _ = writeln!(err, "{NO_SESSION}");
+            return exit(1);
+        }
+        Err(e) => {
+            let _ = writeln!(err, "ssh-broker: could not reach your session: {e:#}");
+            return exit(UNREACHABLE_CODE);
+        }
     };
     let code = logout_on(&mut rx, &mut tx, err, exe);
     exit(code)
@@ -90,7 +102,11 @@ pub fn run() -> anyhow::Result<()> {
         let conn = crate::afunix::connect(&location.path)?;
         crate::afunix::split(conn)
     };
-    logout_at(connect, &mut std::io::stderr(), &exe.to_string_lossy(), |code| {
+    // No profile and nothing listening both mean there is no session; anything else is not that.
+    let no_session = |e: &anyhow::Error| {
+        e.downcast_ref::<crate::userdir::NoProfile>().is_some() || crate::console_prompt::is_no_agent(e)
+    };
+    logout_at(connect, no_session, &mut std::io::stderr(), &exe.to_string_lossy(), |code| {
         std::process::exit(code)
     })
 }
