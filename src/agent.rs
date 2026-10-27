@@ -169,9 +169,8 @@ fn run_on(location: &SocketLocation, background: bool) -> anyhow::Result<()> {
     let connections = Connections::new();
     // Ending wakes the blocked `accept` with a connection of its own; the loop then sees the flag.
     let socket = location.path.clone();
-    let control = Arc::new(
-        Control::new(background, Arc::clone(&connections)).with_waker(move || drop(afunix::connect(&socket))),
-    );
+    let control =
+        Arc::new(Control::new(background, Arc::clone(&connections)).with_waker(move || drop(afunix::connect(&socket))));
     run_on_with(location, Listener::bind, mark_listening, |listener| {
         let end = serve_connections_with(
             Arc::clone(&connections),

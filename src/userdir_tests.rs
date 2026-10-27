@@ -62,7 +62,11 @@ fn only_an_insufficient_buffer_with_no_length_is_no_profile() {
     assert!(other.downcast_ref::<NoProfile>().is_none(), "{other:#}");
     assert!(format!("{other:#}").contains("GetUserProfileDirectoryW"), "{other:#}");
 
-    assert_eq!(probe_failure(&insufficient, 42).unwrap(), 42, "a length is the size to read");
+    assert_eq!(
+        probe_failure(&insufficient, 42).unwrap(),
+        42,
+        "a length is the size to read"
+    );
     assert_eq!(probe_failure(&denied, 42).unwrap(), 42);
 }
 

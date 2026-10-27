@@ -240,7 +240,11 @@ fn ending_wakes_the_accept_loop_once_however_many_logouts_ask() {
             woken.fetch_add(1, Ordering::SeqCst);
         })
     };
-    assert_eq!(woken.load(Ordering::SeqCst), 0, "nothing wakes it before the end begins");
+    assert_eq!(
+        woken.load(Ordering::SeqCst),
+        0,
+        "nothing wakes it before the end begins"
+    );
     handle_logout(&mut Closed, &mut Vec::new(), &control, || {}).unwrap();
     assert_eq!(woken.load(Ordering::SeqCst), 1);
     handle_logout(&mut Closed, &mut Vec::new(), &control, || {}).unwrap();

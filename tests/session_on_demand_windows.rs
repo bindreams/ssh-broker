@@ -142,7 +142,10 @@ enum M3Outcome {
 /// there are several); it starts the logon child through the product's `start_background_agent`. The
 /// child records that it is waiting; the jobs are closed, innermost first; then the child is told to
 /// acknowledge. Both outcomes end the wait: it waits on the acknowledgement and on the child's exit.
-fn logon_child_after_the_callers_jobs_close(tag: &str, mut jobs: Vec<KillOnCloseJob>) -> M3Outcome {
+///
+/// Returns what became of the child, and what the logon reported about its survival (`survival=...`
+/// in the shim's report, the value the prompt path turns into a line for the user).
+fn logon_child_after_the_callers_jobs_close(tag: &str, mut jobs: Vec<KillOnCloseJob>) -> (M3Outcome, String) {
     let _machine = machine::shared();
     let kit = Kit::new(tag);
     let account = Account::create(tag, true);
@@ -155,6 +158,7 @@ fn logon_child_after_the_callers_jobs_close(tag: &str, mut jobs: Vec<KillOnClose
         }
     });
     assert!(shim.result.starts_with("Ready"), "shim.result: {}", shim.result);
+    let reported = shim.result.clone();
     let agent_pid: u32 = kit.agent_info("pid").parse().unwrap();
     // SAFETY: a plain open by id; the handle is closed by `OwnedHandle`.
     let agent = OwnedHandle(
@@ -193,39 +197,64 @@ fn logon_child_after_the_callers_jobs_close(tag: &str, mut jobs: Vec<KillOnClose
         Some(stand_in::SERVING_BOUND),
         "the logon child's acknowledgement",
     ) {
-        FileWaited::Appeared => M3Outcome::Survived,
-        FileWaited::ProcessEnded(child) => M3Outcome::Ended {
-            child,
-            shim: shim_code,
-            had_waited: kit.path("agent.waiting").is_file(),
-        },
+        FileWaited::Appeared => (M3Outcome::Survived, reported),
+        FileWaited::ProcessEnded(child) => (
+            M3Outcome::Ended {
+                child,
+                shim: shim_code,
+                had_waited: kit.path("agent.waiting").is_file(),
+            },
+            reported,
+        ),
     }
 }
 
-/// Elevated (CI only). M3, measured and not decided: the caller's job allows no breakaway, so the
-/// product asks for none. The outcome is printed; either outcome is a fact for the owner, and the
-/// test fails only if the logon itself does.
-#[test]
-fn logon_child_in_a_job_that_forbids_breakaway_is_measured() {
-    match logon_child_after_the_callers_jobs_close("m3a", vec![KillOnCloseJob::create()]) {
-        M3Outcome::Survived => {
-            eprintln!("M3 (job without BREAKAWAY_OK): the logon child survived its caller's job closing")
-        }
+/// The logon told the prompt path the session `outlives` its connection, or not.
+fn assert_survival_reported(reported: &str, outlives: bool) {
+    let expected = if outlives {
+        "survival=OutlivesConnection"
+    } else {
+        "survival=EndsWithConnection"
+    };
+    assert!(reported.contains(expected), "expected {expected} in: {reported}");
+}
+
+/// The child ended with its caller's job, having been waiting: what a session that stays in a job
+/// that closes does, and what `survival=EndsWithConnection` tells the user.
+fn assert_ended_with_the_job(chain: &str, outcome: &M3Outcome) {
+    match outcome {
+        M3Outcome::Ended { had_waited: true, .. } => {}
         M3Outcome::Ended {
             child,
             shim,
-            had_waited,
-        } => eprintln!(
-            "M3 (job without BREAKAWAY_OK): the logon child ended with the job: exit code {child:#x} (the caller's,              ended by the same close: {shim:#x}); it had recorded that it was waiting: {had_waited}"
+            had_waited: false,
+        } => panic!(
+            "{chain}: the logon child ended ({child:#x}; the caller's: {shim:#x}) without having recorded that it was waiting"
+        ),
+        M3Outcome::Survived => panic!(
+            "{chain}: the logon child survived its caller's jobs closing, although the logon did not (or could not) break away; the line the user is shown says the session ends"
         ),
     }
+}
+
+/// Elevated (CI only). M3: the caller's job allows no breakaway, so the product asks for none, the
+/// child stays in the job and ends with it, and the logon reports that the session does not outlive
+/// the connection (the prompt path says so to the user).
+#[test]
+fn logon_child_in_a_job_that_forbids_breakaway_ends_with_the_job_and_the_logon_says_so() {
+    let (outcome, reported) = logon_child_after_the_callers_jobs_close("m3a", vec![KillOnCloseJob::create()]);
+    assert_ended_with_the_job("job without BREAKAWAY_OK", &outcome);
+    assert_survival_reported(&reported, false);
 }
 
 /// Elevated (CI only). M3: where the caller's job allows breakaway the product asks for it, and the
 /// logon child outlives the job.
 #[test]
 fn logon_child_survives_the_callers_job_closing_where_breakaway_is_allowed() {
-    match logon_child_after_the_callers_jobs_close("m3b", vec![KillOnCloseJob::create_allowing_breakaway()]) {
+    let (outcome, reported) =
+        logon_child_after_the_callers_jobs_close("m3b", vec![KillOnCloseJob::create_allowing_breakaway()]);
+    assert_survival_reported(&reported, true);
+    match outcome {
         M3Outcome::Survived => {}
         M3Outcome::Ended {
             child,
@@ -254,7 +283,9 @@ fn nested_jobs(outer_allows: bool, inner_allows: bool) -> Vec<KillOnCloseJob> {
 /// child outlives the chain.
 #[test]
 fn logon_child_survives_nested_jobs_that_all_allow_breakaway() {
-    match logon_child_after_the_callers_jobs_close("m3n1", nested_jobs(true, true)) {
+    let (outcome, reported) = logon_child_after_the_callers_jobs_close("m3n1", nested_jobs(true, true));
+    assert_survival_reported(&reported, true);
+    match outcome {
         M3Outcome::Survived => {}
         M3Outcome::Ended { child, shim, .. } => panic!(
             "the logon child ended with a chain of jobs that all allow breakaway: exit code {child:#x} (the caller's: {shim:#x})"
@@ -263,31 +294,22 @@ fn logon_child_survives_nested_jobs_that_all_allow_breakaway() {
 }
 
 /// Elevated (CI only). The innermost job allows breakaway and an outer one does not: the product asks
-/// for it, Windows refuses, and the logon still succeeds (the helper asserts the report is
-/// `Ready`). What happens to the child is printed: it is in a chain that forbids breakaway.
+/// for it, Windows refuses, the logon still succeeds without it, and the child ends with the chain.
+/// The logon reports that the session does not outlive the connection.
 #[test]
 fn logon_succeeds_when_an_outer_job_forbids_the_breakaway_the_inner_one_allows() {
-    let outcome = logon_child_after_the_callers_jobs_close("m3n2", nested_jobs(false, true));
-    print_chain_outcome("outer forbids, inner allows", &outcome);
+    let (outcome, reported) = logon_child_after_the_callers_jobs_close("m3n2", nested_jobs(false, true));
+    assert_ended_with_the_job("outer forbids, inner allows", &outcome);
+    assert_survival_reported(&reported, false);
 }
 
 /// Elevated (CI only). The innermost job forbids breakaway and an outer one allows it: the product
-/// asks for none, and the logon succeeds.
+/// asks for none, the logon succeeds, and the child ends with the chain.
 #[test]
 fn logon_succeeds_when_the_inner_job_forbids_breakaway_and_an_outer_one_allows_it() {
-    let outcome = logon_child_after_the_callers_jobs_close("m3n3", nested_jobs(true, false));
-    print_chain_outcome("outer allows, inner forbids", &outcome);
-}
-
-fn print_chain_outcome(chain: &str, outcome: &M3Outcome) {
-    match outcome {
-        M3Outcome::Survived => eprintln!("M3 nested jobs ({chain}): the logon child survived the chain closing"),
-        M3Outcome::Ended { child, shim, .. } => {
-            eprintln!(
-                "M3 nested jobs ({chain}): the logon child ended with the chain: {child:#x} (the caller's: {shim:#x})"
-            )
-        }
-    }
+    let (outcome, reported) = logon_child_after_the_callers_jobs_close("m3n3", nested_jobs(true, false));
+    assert_ended_with_the_job("outer allows, inner forbids", &outcome);
+    assert_survival_reported(&reported, false);
 }
 
 /// Elevated (CI only). A wrong password in a chain that refuses breakaway is answered `1326` and not

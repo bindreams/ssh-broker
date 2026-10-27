@@ -96,7 +96,11 @@ fn a_refused_breakaway_is_followed_by_one_call_without_it() {
         calls.push(flags);
         if flags == ASKED { refused(ACCESS_DENIED) } else { Ok(7) }
     });
-    assert_eq!(result.unwrap(), (7, false), "the call that answered did not keep the breakaway");
+    assert_eq!(
+        result.unwrap(),
+        (7, false),
+        "the call that answered did not keep the breakaway"
+    );
     assert_eq!(calls, [ASKED, CREATE_NO_WINDOW]);
 }
 

@@ -51,7 +51,11 @@ fn a_line_that_is_not_a_session_task_name_is_not_owed() {
     // Only tasks of this program are ever enabled from the file, whatever it says.
     let dir = TempProfile::new("pending-foreign");
     let path = dir.0.join("pending.txt");
-    let text = format!("{}\r\nMicrosoft\\Windows\\Defrag\r\n\r\n{}\n", session("a"), session("b"));
+    let text = format!(
+        "{}\r\nMicrosoft\\Windows\\Defrag\r\n\r\n{}\n",
+        session("a"),
+        session("b")
+    );
     std::fs::write(&path, text).unwrap();
     assert_eq!(load(&path).unwrap(), [session("a"), session("b")]);
 }

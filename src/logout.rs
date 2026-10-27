@@ -106,9 +106,13 @@ pub fn run() -> anyhow::Result<()> {
     let no_session = |e: &anyhow::Error| {
         e.downcast_ref::<crate::userdir::NoProfile>().is_some() || crate::console_prompt::is_no_agent(e)
     };
-    logout_at(connect, no_session, &mut std::io::stderr(), &exe.to_string_lossy(), |code| {
-        std::process::exit(code)
-    })
+    logout_at(
+        connect,
+        no_session,
+        &mut std::io::stderr(),
+        &exe.to_string_lossy(),
+        |code| std::process::exit(code),
+    )
 }
 
 #[cfg(test)]

@@ -681,7 +681,10 @@ fn an_error_that_is_not_a_stop_is_still_an_error() {
     let connections = Connections::new();
     let _live = connections.begin();
     let end = finish_stopped(anyhow::anyhow!("the listener failed"), &connections);
-    assert!(format!("{end:#}").contains("the listener failed"), "returns without waiting");
+    assert!(
+        format!("{end:#}").contains("the listener failed"),
+        "returns without waiting"
+    );
 }
 
 // threads -----

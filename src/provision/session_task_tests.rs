@@ -319,9 +319,6 @@ fn a_disabled_boot_trigger_is_named_as_the_problem() {
 
 #[test]
 fn a_boot_trigger_the_service_wrote_without_its_default_enabled_is_fine() {
-    let xml = task_xml(EXE, SID).replace(
-        "<BootTrigger><Enabled>true</Enabled></BootTrigger>",
-        "<BootTrigger />",
-    );
+    let xml = task_xml(EXE, SID).replace("<BootTrigger><Enabled>true</Enabled></BootTrigger>", "<BootTrigger />");
     assert_eq!(task_problem(&state(xml), EXE, SID), None);
 }

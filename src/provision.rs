@@ -148,7 +148,11 @@ mod imp {
         let exe = flow::run(
             || {
                 taskscheduler::stop_instances(schtasks::AGENT_TASK, &layout.canonical_exe())?;
-                stop_background_sessions(&layout.canonical_exe(), &layout.pending_sessions_path(), &enabled_sessions)
+                stop_background_sessions(
+                    &layout.canonical_exe(),
+                    &layout.pending_sessions_path(),
+                    &enabled_sessions,
+                )
             },
             |stop_agents| {
                 let exe = layout::prepare(&layout, &current, registered_xml.as_deref(), stop_agents)?;

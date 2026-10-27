@@ -114,7 +114,7 @@ fn run_shim(password: &str, agent_exe: &Path) -> String {
         location.serving_marker_path().is_file().then_some(())
     });
     match served {
-        Ok(Served::Connected(())) => format!("Ready pid={pid}"),
+        Ok(Served::Connected(())) => format!("Ready pid={pid} survival={:?}", started.survival),
         Ok(Served::Ended { code }) => format!("AgentExited {code} pid={pid}"),
         Ok(Served::Gone) => format!("AgentGone pid={pid}"),
         Err(e) => format!("wait failed: {e:#}"),

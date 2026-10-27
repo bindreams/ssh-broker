@@ -60,14 +60,35 @@ fn flow_resuming(
 fn agents_start_after_a_successful_install() {
     let (events, result) = flow(true, || Ok(()), true, true);
     result.unwrap();
-    assert_eq!(events, ["stop", "install", "resume", "resume sessions", "start sessions", "start"]);
+    assert_eq!(
+        events,
+        [
+            "stop",
+            "install",
+            "resume",
+            "resume sessions",
+            "start sessions",
+            "start"
+        ]
+    );
 }
 
 #[test]
 fn agents_that_were_stopped_start_again_when_a_later_step_fails() {
     let (events, result) = flow(true, || Ok(()), false, true);
     assert_eq!(format!("{:#}", result.unwrap_err()), "register failed");
-    assert_eq!(events, ["stop", "install", "resume", "resume sessions", "start sessions", "safe?", "start"]);
+    assert_eq!(
+        events,
+        [
+            "stop",
+            "install",
+            "resume",
+            "resume sessions",
+            "start sessions",
+            "safe?",
+            "start"
+        ]
+    );
 }
 
 #[test]
@@ -105,7 +126,10 @@ fn agents_survive_a_failed_stop_in_the_sessions_the_start_is_told_to_leave_alone
 fn agents_start_again_when_the_stop_failed_part_way() {
     let (events, result) = flow(true, || anyhow::bail!("access denied"), true, true);
     assert_eq!(format!("{:#}", result.unwrap_err()), "access denied");
-    assert_eq!(events, ["stop", "resume", "resume sessions", "start sessions", "safe?", "start"]);
+    assert_eq!(
+        events,
+        ["stop", "resume", "resume sessions", "start sessions", "safe?", "start"]
+    );
 }
 
 #[test]
@@ -121,7 +145,10 @@ fn the_task_is_enabled_again_even_when_no_agent_was_stopped() {
     // `apply` that was killed between its disable and its enable.
     let (events, result) = flow(false, || Ok(()), true, true);
     result.unwrap();
-    assert_eq!(events, ["install", "resume", "resume sessions", "start sessions", "start"]);
+    assert_eq!(
+        events,
+        ["install", "resume", "resume sessions", "start sessions", "start"]
+    );
 }
 
 #[test]
@@ -153,7 +180,14 @@ fn no_agent_starts_when_the_registered_task_cannot_start_one() {
     assert!(result.is_err());
     assert_eq!(
         events,
-        ["stop", "install", "resume", "resume sessions", "start sessions", "safe?"]
+        [
+            "stop",
+            "install",
+            "resume",
+            "resume sessions",
+            "start sessions",
+            "safe?"
+        ]
     );
 }
 
@@ -378,7 +412,10 @@ fn session_tasks_are_reenabled_and_started_after_a_failed_install_whatever_the_a
         "the task that was on is on again, the other stays off"
     );
     assert_eq!(ran.into_inner(), ["a"], "and is started again");
-    assert!(!agents_started.into_inner(), "the desktop agents are not, by their own rule");
+    assert!(
+        !agents_started.into_inner(),
+        "the desktop agents are not, by their own rule"
+    );
 }
 
 #[test]
@@ -387,12 +424,7 @@ fn the_tasks_to_enable_again_are_recorded_before_any_is_disabled() {
     world.stop().unwrap();
     assert_eq!(
         *world.events.borrow(),
-        [
-            r#"record ["a", "c"]"#,
-            "stop task a",
-            "stop task b",
-            "stop task c"
-        ]
+        [r#"record ["a", "c"]"#, "stop task a", "stop task b", "stop task c"]
     );
 }
 
@@ -412,7 +444,10 @@ fn a_task_that_cannot_be_recorded_is_not_disabled() {
         |_| Ok(()),
     );
     assert!(format!("{:#}", result.unwrap_err()).contains("disk full"));
-    assert!(world.events.borrow().is_empty(), "nothing was disabled without a record");
+    assert!(
+        world.events.borrow().is_empty(),
+        "nothing was disabled without a record"
+    );
 }
 
 #[test]
@@ -461,7 +496,11 @@ fn an_apply_killed_between_two_disables_leaves_the_next_one_able_to_enable_both(
         Ok(())
     })
     .unwrap();
-    assert_eq!(enabled.into_inner(), [a, b], "the task that was on stays recorded until enabled");
+    assert_eq!(
+        enabled.into_inner(),
+        [a, b],
+        "the task that was on stays recorded until enabled"
+    );
 }
 
 #[test]
