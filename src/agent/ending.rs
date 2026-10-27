@@ -6,6 +6,8 @@
 //! into the C runtime's `exit` from another), so two could be inside the process's exit at once.
 //! Every end goes through [`end_process`] now, and the first one in is the only one that ends it.
 //!
+//! What the agent must keep until the process is gone lives here as well (see [`hold_until_end`]).
+//!
 //! The log's guard lives here too, because the thread that ends the process is not the one that
 //! opened the log, and the exit runs no destructor: [`end_process`] drops the guard, which writes out
 //! what is queued, before it leaves.
@@ -22,6 +24,14 @@ pub fn keep_log(guard: impl Send + 'static) {
     ENDING.keep_log(guard);
 }
 
+/// Keep `held` until the process is gone, past the end of every function that owns it. The agent's
+/// session slot and user lock go here: a successor waits on them, and must not get them while this
+/// agent's listener still answers, which it does until the process exits. The system releases them
+/// with the process; [`end_process`] drops nothing held here.
+pub fn hold_until_end(held: impl Send + 'static) {
+    ENDING.hold_until_end(held);
+}
+
 /// End the process with `code`. The first caller ends it; a caller that comes while that is in
 /// progress waits for it, and the process is gone before that wait is over.
 pub fn end_process(code: i32) -> ! {
@@ -33,6 +43,8 @@ struct Ending {
     once: Once,
     /// The log's guard, or whatever stands in for it: only its drop matters.
     log: Mutex<Option<Box<dyn Send>>>,
+    /// What is kept until the system releases it with the process; never dropped.
+    held: Mutex<Vec<Box<dyn Send>>>,
 }
 
 impl Ending {
@@ -40,11 +52,16 @@ impl Ending {
         Self {
             once: Once::new(),
             log: Mutex::new(None),
+            held: Mutex::new(Vec::new()),
         }
     }
 
     fn keep_log(&self, guard: impl Send + 'static) {
         *self.log.lock().unwrap_or_else(|e| e.into_inner()) = Some(Box::new(guard));
+    }
+
+    fn hold_until_end(&self, held: impl Send + 'static) {
+        self.held.lock().unwrap_or_else(|e| e.into_inner()).push(Box::new(held));
     }
 
     /// Flush the log and run `leave`, if no caller has begun to; otherwise wait until the one that

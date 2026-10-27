@@ -183,3 +183,32 @@ impl Drop for ThrowawayTask {
             .output();
     }
 }
+
+// Waiting for a file -----
+
+/// Block until `file` exists, by watching its folder `dir` for changes and re-checking after each.
+/// For a test that waits for a child process to say it got somewhere; there is no bound, because the
+/// test runner ends a test that never finishes and names it.
+pub fn wait_for_file(dir: &Path, file: &Path) {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::Storage::FileSystem::{
+        FILE_NOTIFY_CHANGE_FILE_NAME, FindCloseChangeNotification, FindFirstChangeNotificationW,
+        FindNextChangeNotification,
+    };
+    use windows::Win32::System::Threading::{INFINITE, WaitForSingleObject};
+
+    let dir_w: Vec<u16> = dir.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    // Armed before the first check, so a creation between the check and the wait still signals.
+    // SAFETY: a NUL-terminated path; the handle is closed below.
+    let watch = unsafe { FindFirstChangeNotificationW(PCWSTR(dir_w.as_ptr()), false, FILE_NOTIFY_CHANGE_FILE_NAME) }
+        .expect("watch the folder for the file");
+    while !file.exists() {
+        // SAFETY: the valid watch handle; re-armed after each wake so the next change signals again.
+        unsafe {
+            WaitForSingleObject(watch, INFINITE);
+            FindNextChangeNotification(watch).expect("re-arm the folder watch");
+        }
+    }
+    // SAFETY: the handle from above.
+    let _ = unsafe { FindCloseChangeNotification(watch) };
+}

@@ -33,7 +33,7 @@ pub fn exit_code_of(err: &anyhow::Error) -> i32 {
 }
 
 mod ending;
-pub use ending::{end_process, keep_log};
+pub use ending::{end_process, hold_until_end, keep_log};
 #[cfg(windows)]
 mod logout;
 
@@ -145,26 +145,36 @@ fn serve(location: &SocketLocation, session: u32, background: bool) -> anyhow::R
             })
         },
         |location| run_on(location, background),
+        hold_until_end,
     )
 }
 
-/// [`serve`] with the user lock and the serving as parameters, so a test can see the order.
+/// [`serve`] with the user lock, the serving and the keeping as parameters, so a test can see the
+/// order.
+///
+/// The slot and the lock are handed to `hold` when serving is over, whatever it returned, and not
+/// dropped: the process ends right after, and until then this agent's listener still answers (the
+/// loop that refuses logins during the drain). A successor that took the lock now would bind into
+/// that and be refused as already listening. The system releases both with the process.
 #[cfg(windows)]
 fn serve_with(
     location: &SocketLocation,
     session: u32,
     user_lock: impl FnOnce(&Path) -> anyhow::Result<UserLock>,
     run: impl FnOnce(&SocketLocation) -> anyhow::Result<()>,
+    hold: impl FnOnce(Box<dyn std::any::Any + Send>),
 ) -> anyhow::Result<()> {
     // One agent per session: `apply` and the boot self-heal start one per logged-on session
     // every time they run, and the logon task starts one per logon. This comes first, because the
     // user lock may be held for as long as another session lives.
-    let Some(_slot) = SessionSlot::try_acquire(&location.sessions_lock_path(), session)? else {
+    let Some(slot) = SessionSlot::try_acquire(&location.sessions_lock_path(), session)? else {
         tracing::info!("another agent already runs in this session; exiting");
         return Ok(());
     };
-    let _lock = user_lock(&location.lock_path())?;
-    run(location)
+    let lock = user_lock(&location.lock_path())?;
+    let result = run(location);
+    hold(Box::new((slot, lock)));
+    result
 }
 
 /// Bind the hardened socket and serve connections, one handler thread each. The caller holds
@@ -730,7 +740,7 @@ fn handle_pty(
     (hooks.after_spawn)();
     let job = session.job();
     let Some(_registration) = register_session(control, &job) else {
-        return logout::refuse_while_ending(&mut rx, &mut tx);
+        return refuse_unserved_pty(session, &mut rx, &mut tx);
     };
     // Before `tx` moves into the shared mutex.
     let hangup = start_hangup_watch(&tx, &job, hooks.make_watcher);
@@ -830,6 +840,34 @@ fn handle_pty(
     // Threads joined; `session` now drops and closes the process/thread + pipe handles.
     wait_result?;
     Ok(())
+}
+
+/// Answer a login whose shell has been ended before it was served with the refusal. The pseudoconsole
+/// is closed first, with its output read as the regular teardown reads it: the shell has been running
+/// since `spawn`, and closing flushes whatever it wrote into a pipe that nothing else reads.
+#[cfg(windows)]
+fn refuse_unserved_pty(mut session: PtySession, rx: &mut ConnRx, tx: &mut ConnTx) -> anyhow::Result<()> {
+    let out_raw = session.out_read_raw();
+    let hpc = session.take_hpc_raw();
+    let mut buf = [0u8; 32 * 1024];
+    if let Err(e) = close_while_draining(|| conpty::read_handle(out_raw, &mut buf), || conpty::close_pty_raw(hpc)) {
+        // Closing without a reader could block for ever; the pseudoconsole is left to the process's end.
+        tracing::warn!("could not read the output of a refused shell; its pseudoconsole stays open: {e}");
+    }
+    drop(session); // the pipe ends go after the reader has finished with them
+    logout::refuse_while_ending(rx, tx)
+}
+
+/// Run `close`, which flushes into a pipe `read_chunk` reads (it returns 0 at the end), with a
+/// reader on a thread of its own, and return once both are done. If the reader cannot be started,
+/// `close` is not run, because it may block for ever on a pipe nobody reads, and the error says why.
+#[cfg(windows)]
+fn close_while_draining(mut read_chunk: impl FnMut() -> usize + Send, close: impl FnOnce()) -> std::io::Result<()> {
+    std::thread::scope(|scope| {
+        std::thread::Builder::new().spawn_scoped(scope, || while read_chunk() > 0 {})?;
+        close();
+        Ok(())
+    })
 }
 
 /// Record the session so that `logout` can end its shell tree. `None` means the agent is already

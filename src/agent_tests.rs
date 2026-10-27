@@ -114,6 +114,12 @@ const INPUT_AFTER_HANDSHAKE: usize = 8 * 1024 * 1024;
 /// Send a login in `mode` that never ends by itself, then input after the handshake, and return
 /// what the agent answers. `agent` handles the connection.
 fn refused_login(tag: &str, mode: Mode, agent: impl FnOnce(socket2::Socket)) -> (Outcome, Vec<u8>) {
+    refused_login_of(tag, mode, "cmd.exe /c ping -n 120 127.0.0.1 > nul", agent)
+}
+
+/// [`refused_login`] for a login that runs `command`.
+fn refused_login_of(tag: &str, mode: Mode, command: &str, agent: impl FnOnce(socket2::Socket)) -> (Outcome, Vec<u8>) {
+    let command = command.to_owned();
     let dir = hardened_dir(tag);
     let sock = dir.join("s");
     let listener = Listener::bind(&sock).unwrap();
@@ -123,7 +129,7 @@ fn refused_login(tag: &str, mode: Mode, agent: impl FnOnce(socket2::Socket)) -> 
         let (mut crx, mut ctx) = afunix::split(conn).unwrap();
         let hs = Handshake {
             mode,
-            command: Some("cmd.exe /c ping -n 120 127.0.0.1 > nul".into()),
+            command: Some(command),
             ..Handshake::pty_default()
         };
         write_frame(&mut ctx, FrameKind::Handshake, &hs.encode().unwrap()).unwrap();
@@ -190,6 +196,41 @@ fn a_pty_login_that_loses_the_race_with_the_end_is_refused_not_relayed() {
         };
         super::handle_connection_in(conn, hooks, &control).unwrap();
     }));
+}
+
+/// The shell has written far more than the pseudoconsole's output pipe holds when the login loses
+/// the race, and nothing reads that pipe on the refusal path unless the refusal drains it: closing
+/// the pseudoconsole flushes conhost's pending output into the pipe, and blocks where it is full. The
+/// handler would never return, so this test would hang (nextest ends it and names it) and not pass.
+#[test]
+fn a_pty_login_refused_after_the_shell_wrote_a_lot_is_still_refused() {
+    const LINE: &str = "0123456789012345678901234567890123456789012345678901234567890123456789";
+    let marker_dir = std::env::temp_dir().join(format!("sb-agent-wrote-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&marker_dir);
+    std::fs::create_dir_all(&marker_dir).unwrap();
+    let marker = marker_dir.join("wrote");
+    // The marker is made after the output, so the hook below runs the end once the shell's output is
+    // in conhost (the shell then stays alive, so only the reap ends it).
+    let command = format!(
+        r#"cmd.exe /d /s /c "(for /l %i in (1,1,3000) do @echo {LINE}) & echo.> "{}" & ping -n 120 127.0.0.1 > nul""#,
+        marker.display()
+    );
+    let control = std::sync::Arc::new(super::Control::new(true, super::Connections::new()));
+    assert_refused(refused_login_of("raced-pty-output", Mode::Pty, &command, |conn| {
+        let hooks = Hooks {
+            after_spawn: {
+                let control = std::sync::Arc::clone(&control);
+                let (marker, marker_dir) = (marker.clone(), marker_dir.clone());
+                Box::new(move || {
+                    crate::test_support::wait_for_file(&marker_dir, &marker);
+                    control.end_all();
+                })
+            },
+            ..Hooks::production()
+        };
+        super::handle_connection_in(conn, hooks, &control).unwrap();
+    }));
+    std::fs::remove_dir_all(&marker_dir).ok();
 }
 
 /// While the agent waits for its connections to finish, a login is answered with the refusal at

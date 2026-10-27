@@ -9,6 +9,10 @@
 //! then ends the process. A connection waits on its client, which may never read or close, so that
 //! wait has a bound (`DRAIN_BOUND`): past it the process ends with the connections left, and the log
 //! says how many.
+//!
+//! The listener stays open until the process ends, and a login that arrives meanwhile is refused with
+//! [`ENDING_REFUSAL`]. The session slot and the user lock stay held too, so a successor agent binds
+//! only after this one is gone.
 
 use std::io::Read;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -37,7 +41,7 @@ pub(super) struct Control {
     state: Mutex<State>,
     connections: Arc<Connections>,
     /// Makes the accept loop look at [`Control::is_ending`]: a loop blocked in `accept` does not
-    /// otherwise notice the flag.
+    /// otherwise notice the flag. The loop then stops, and the listener stays open for the refusals.
     waker: Box<dyn Fn() + Send + Sync>,
 }
 
@@ -104,8 +108,8 @@ impl Control {
             state.ending = true;
             (first, state.sessions.iter().map(|(_, kill)| Arc::clone(kill)).collect())
         };
-        // Before the shells end: a user who sees one end and logs in again should find no listener,
-        // not an agent that is on its way out.
+        // Before the shells end, so the accept loop stops starting shells that would have to be ended
+        // too. The listener stays open: a login that comes now is refused (`refuse_while_ending`).
         if first {
             (self.waker)();
         }

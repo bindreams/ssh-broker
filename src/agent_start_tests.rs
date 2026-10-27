@@ -411,6 +411,7 @@ fn serve_returns_ok_at_once_when_another_agent_holds_the_session() {
         7,
         |_| panic!("the user lock is taken only after the session slot"),
         |_| panic!("nothing is served by an agent that does not hold the slot"),
+        |_| panic!("an agent that holds nothing has nothing to hold on to"),
     )
     .unwrap();
 }
@@ -419,6 +420,7 @@ fn serve_returns_ok_at_once_when_another_agent_holds_the_session() {
 fn serve_holds_the_session_slot_before_it_takes_the_user_lock_and_both_while_it_serves() {
     let (_profile, loc) = location_with_dir("serve-order");
     let events = RefCell::new(Vec::new());
+    let held = RefCell::new(None);
 
     serve_with(
         &loc,
@@ -443,17 +445,87 @@ fn serve_holds_the_session_slot_before_it_takes_the_user_lock_and_both_while_it_
             assert!(UserLock::try_acquire(&loc.lock_path()).unwrap().is_none());
             Ok(())
         },
+        |guard| *held.borrow_mut() = Some(guard),
     )
     .unwrap();
 
     assert_eq!(events.into_inner(), ["user lock", "serve"]);
+    // The process is still ending: a successor that took the locks now would bind while the old
+    // agent's listener still answers, and be refused as `AlreadyListening`. The system releases
+    // them when the process is gone.
+    assert!(
+        SessionSlot::try_acquire(&loc.sessions_lock_path(), 7)
+            .unwrap()
+            .is_none(),
+        "the session slot was given up before the process ended"
+    );
+    assert!(
+        UserLock::try_acquire(&loc.lock_path()).unwrap().is_none(),
+        "the user lock was given up before the process ended"
+    );
+
+    drop(held.into_inner());
     assert!(
         SessionSlot::try_acquire(&loc.sessions_lock_path(), 7)
             .unwrap()
             .is_some(),
-        "released"
+        "released with the process"
     );
-    assert!(UserLock::try_acquire(&loc.lock_path()).unwrap().is_some(), "released");
+    assert!(
+        UserLock::try_acquire(&loc.lock_path()).unwrap().is_some(),
+        "released with the process"
+    );
+}
+
+#[test]
+fn serve_keeps_both_locks_when_the_serving_failed() {
+    let (_profile, loc) = location_with_dir("serve-failed");
+    let held = RefCell::new(None);
+
+    let err = serve_with(
+        &loc,
+        7,
+        |path| UserLock::acquire(path, || ()),
+        |_| anyhow::bail!("the listener is broken"),
+        |guard| *held.borrow_mut() = Some(guard),
+    )
+    .unwrap_err();
+
+    assert!(format!("{err:#}").contains("listener is broken"), "{err:#}");
+    assert!(held.borrow().is_some(), "the guards were handed over");
+}
+
+// closing a pseudoconsole -----
+
+/// A console whose close pushes its pending output into a pipe nobody else reads: the stand-in is a
+/// rendezvous channel, which blocks the close at its first chunk until a reader takes it. Without the
+/// reader the close would never return and this test would hang.
+#[test]
+fn a_pseudoconsole_is_closed_while_its_output_is_read() {
+    let (pipe_in, pipe_out) = std::sync::mpsc::sync_channel::<usize>(0);
+    let read = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    close_while_draining(
+        {
+            let read = Arc::clone(&read);
+            move || {
+                let n = pipe_out.recv().unwrap_or(0);
+                read.fetch_add(n, std::sync::atomic::Ordering::SeqCst);
+                n
+            }
+        },
+        move || {
+            for _ in 0..50 {
+                pipe_in.send(10).unwrap();
+            }
+            // Dropping `pipe_in` is the end of the output, as the close ends the real pipe.
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        read.load(std::sync::atomic::Ordering::SeqCst),
+        500,
+        "every pending chunk was read before the close returned"
+    );
 }
 
 // accept loop -----
@@ -678,7 +750,10 @@ fn a_stopped_loop_ends_ok_only_after_every_connection_has_finished() {
     });
     assert_eq!(on_event.recv().unwrap(), "parked", "the waiter did not wait");
     drop(other);
-    assert_eq!(on_event.recv().unwrap(), "returned");
+    // The wait parks again at every spurious wake-up of its condition variable, so more than one
+    // "parked" may be queued; the return is the first event that is not one.
+    let next = std::iter::from_fn(|| on_event.recv().ok()).find(|event| *event != "parked");
+    assert_eq!(next, Some("returned"));
     let end = waiter.join().unwrap();
     assert!(end.downcast_ref::<Stopped>().is_some(), "{end:#}");
 }

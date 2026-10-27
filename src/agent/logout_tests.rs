@@ -204,7 +204,10 @@ fn the_process_ends_only_after_every_other_connection_has_finished() {
         "the process ended before the other connection had finished"
     );
     drop(other);
-    assert_eq!(on_event.recv().unwrap(), "ended");
+    // The drain parks again at every spurious wake-up of its condition variable, so more than one
+    // "parked" may be queued; the end is the first event that is not one.
+    let next = std::iter::from_fn(|| on_event.recv().ok()).find(|event| *event != "parked");
+    assert_eq!(next, Some("ended"));
     worker.join().unwrap();
 }
 

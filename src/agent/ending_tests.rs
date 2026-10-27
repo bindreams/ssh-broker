@@ -69,3 +69,19 @@ fn the_log_is_flushed_before_the_process_is_left_by_whichever_thread_ends_it() {
         "the guard was still alive when the process was left"
     );
 }
+
+/// What the agent holds for its successor to wait on (its session slot and user lock) is still held
+/// when the process is left, and is never dropped by the end: the system releases it with the
+/// process, which is what keeps a successor from binding while the old listener still answers.
+#[test]
+fn what_is_held_until_the_end_is_still_held_when_the_process_is_left() {
+    let ending = Ending::new();
+    let dropped = Arc::new(AtomicBool::new(false));
+    ending.hold_until_end(DropFlag(dropped.clone()));
+
+    let mut dropped_when_left = None;
+    ending.end(|| dropped_when_left = Some(dropped.load(Ordering::SeqCst)));
+
+    assert_eq!(dropped_when_left, Some(false), "released before the process was left");
+    assert!(!dropped.load(Ordering::SeqCst), "released by the end itself");
+}
