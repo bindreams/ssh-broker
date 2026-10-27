@@ -4,6 +4,10 @@
 pub const COST_LINE: &str =
     "ssh-broker: starting a plain shell, without DPAPI, a loaded profile or symlink traversal.\r\n";
 
+/// Shown when the session just started lives in a job that closes with the connection.
+pub const SESSION_ENDS_WITH_CONNECTION_LINE: &str =
+    "ssh-broker: this connection cannot let the Windows session outlive it, so the session ends when you disconnect.\r\n";
+
 /// The prompt: the owner's sentence, then the sentence that names the way out.
 pub fn prompt(user: &str) -> String {
     format!(

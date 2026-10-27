@@ -96,7 +96,7 @@ fn a_refused_breakaway_is_followed_by_one_call_without_it() {
         calls.push(flags);
         if flags == ASKED { refused(ACCESS_DENIED) } else { Ok(7) }
     });
-    assert_eq!(result.unwrap(), 7);
+    assert_eq!(result.unwrap(), (7, false), "the call that answered did not keep the breakaway");
     assert_eq!(calls, [ASKED, CREATE_NO_WINDOW]);
 }
 
@@ -141,6 +141,34 @@ fn a_call_that_succeeds_is_made_once() {
         calls += 1;
         Ok(1)
     });
-    assert_eq!(result.unwrap(), 1);
+    assert_eq!(result.unwrap(), (1, true), "the breakaway that was asked for was kept");
     assert_eq!(calls, 1);
+}
+
+#[test]
+fn a_call_that_asked_for_no_breakaway_did_not_keep_one() {
+    let result = with_breakaway_fallback(CREATE_NO_WINDOW, |_| Ok(1));
+    assert_eq!(result.unwrap(), (1, false));
+}
+
+// survival -----
+
+#[test]
+fn a_session_outlives_its_connection_outside_any_job_or_with_breakaway_kept() {
+    assert_eq!(survival_of(&CallerJob::NotInJob, false), Survival::OutlivesConnection);
+    let allowing = CallerJob::Limits(KILL_ON_JOB_CLOSE | BREAKAWAY_OK);
+    assert_eq!(survival_of(&allowing, true), Survival::OutlivesConnection);
+}
+
+#[test]
+fn a_session_ends_with_its_connection_when_it_stayed_in_the_callers_job() {
+    let allowing = CallerJob::Limits(KILL_ON_JOB_CLOSE | BREAKAWAY_OK);
+    // The flag was asked for and an outer job refused it: the fallback call kept the child in the job.
+    assert_eq!(survival_of(&allowing, false), Survival::EndsWithConnection);
+    assert_eq!(
+        survival_of(&CallerJob::Limits(KILL_ON_JOB_CLOSE), false),
+        Survival::EndsWithConnection
+    );
+    // A job that cannot be read cannot be asked for breakaway.
+    assert_eq!(survival_of(&CallerJob::Unreadable, false), Survival::EndsWithConnection);
 }

@@ -18,7 +18,7 @@ use crate::account::{self, LocalAccount};
 use crate::acl::Sid;
 use crate::console_modes::ConsoleModes;
 use crate::console_prompt::{ConsolePrompt, absence, console_available};
-use crate::logon::{self, StartedAgent};
+use crate::logon::{self, StartedAgent, Survival};
 use crate::offer::{
     Absence, AccountKind, Disconnected, OfferIo, Offered, SessionKind, StartFailure, non_interactive_notice, offer,
     text,
@@ -320,6 +320,14 @@ struct Started {
     agent: StartedAgent,
 }
 
+/// The line for the user when the session just started ends with this connection, or `None`.
+fn survival_notice(survival: Survival) -> Option<&'static str> {
+    match survival {
+        Survival::OutlivesConnection => None,
+        Survival::EndsWithConnection => Some(text::SESSION_ENDS_WITH_CONNECTION_LINE),
+    }
+}
+
 /// The console and the logon, as `offer` drives them.
 struct LiveIo {
     prompt: ConsolePrompt,
@@ -387,11 +395,17 @@ fn run_offer(account: LocalAccount, kind_of_absence: Absence) -> Rescued {
                 debug_assert!(false, "a started offer holds its agent");
                 return Rescued::Plain;
             };
+            let survival = started.agent.survival;
             match settle(started) {
-                Ok(socket) => Rescued::Connected {
-                    socket,
-                    modes: Some(prompt.into_modes()),
-                },
+                Ok(socket) => {
+                    if let Some(line) = survival_notice(survival) {
+                        prompt.write_text(line);
+                    }
+                    Rescued::Connected {
+                        socket,
+                        modes: Some(prompt.into_modes()),
+                    }
+                }
                 Err(line) => {
                     prompt.write_text(&line);
                     prompt.write_text(text::COST_LINE);

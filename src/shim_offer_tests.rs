@@ -396,3 +396,22 @@ fn a_failing_look_for_another_agent_is_an_error() {
     });
     assert!(result.is_err());
 }
+
+// the line about a session that ends with the connection -----
+
+#[test]
+fn a_session_that_ends_with_its_connection_says_so_in_one_line() {
+    use crate::logon::Survival;
+    let line = survival_notice(Survival::EndsWithConnection).expect("the user is told");
+    assert_eq!(
+        line,
+        "ssh-broker: this connection cannot let the Windows session outlive it, so the session ends when you disconnect.\r\n"
+    );
+    assert_eq!(line.matches('\n').count(), 1, "one line");
+}
+
+#[test]
+fn a_session_that_outlives_its_connection_says_nothing() {
+    use crate::logon::Survival;
+    assert_eq!(survival_notice(Survival::OutlivesConnection), None);
+}

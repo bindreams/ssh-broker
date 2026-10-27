@@ -43,6 +43,26 @@ const PASSWORD_TOO_LONG: &str = "the password is too long for Windows.";
 /// The background agent the logon started. Dropping it closes the handle; the agent keeps running.
 pub struct StartedAgent {
     pub process: OwnedHandle,
+    pub survival: Survival,
+}
+
+/// Whether the session the logon started outlives the connection that asked for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Survival {
+    /// The agent is outside the caller's job, or the caller has none.
+    OutlivesConnection,
+    /// The agent is inside a job that closes with the connection, and ends with it.
+    EndsWithConnection,
+}
+
+/// What the logon of a caller in `job` gave the session. `kept_breakaway` is whether the call that
+/// started the agent asked for breakaway (see [`with_breakaway_fallback`]).
+pub fn survival_of(job: &CallerJob, kept_breakaway: bool) -> Survival {
+    if kept_breakaway || *job == CallerJob::NotInJob {
+        Survival::OutlivesConnection
+    } else {
+        Survival::EndsWithConnection
+    }
 }
 
 /// Why Windows refused: its error code and its own sentence.
@@ -147,7 +167,8 @@ pub fn creation_flags(job: &CallerJob) -> PROCESS_CREATION_FLAGS {
 }
 
 /// Make `call` with `flags`. If it asked for breakaway and was refused with `ERROR_ACCESS_DENIED`, make
-/// it once more without; that answer is final.
+/// it once more without; that answer is final. Along with the answer comes whether the call that gave
+/// it asked for breakaway.
 ///
 /// Why this is right. The refusal comes at the child's creation, after Windows has checked the
 /// password: a wrong password is answered `ERROR_LOGON_FAILURE` (1326), not access denied, so a
@@ -159,13 +180,14 @@ pub fn creation_flags(job: &CallerJob) -> PROCESS_CREATION_FLAGS {
 fn with_breakaway_fallback<T>(
     flags: PROCESS_CREATION_FLAGS,
     mut call: impl FnMut(PROCESS_CREATION_FLAGS) -> Result<T, LogonFailure>,
-) -> Result<T, LogonFailure> {
+) -> Result<(T, bool), LogonFailure> {
+    let asked = flags.0 & CREATE_BREAKAWAY_FROM_JOB.0 != 0;
     match call(flags) {
-        Err(failure) if failure.code == ERROR_ACCESS_DENIED && flags.0 & CREATE_BREAKAWAY_FROM_JOB.0 != 0 => {
+        Err(failure) if failure.code == ERROR_ACCESS_DENIED && asked => {
             tracing::info!("a job around this process refuses breakaway; starting the session inside it");
-            call(PROCESS_CREATION_FLAGS(flags.0 & !CREATE_BREAKAWAY_FROM_JOB.0))
+            call(PROCESS_CREATION_FLAGS(flags.0 & !CREATE_BREAKAWAY_FROM_JOB.0)).map(|answer| (answer, false))
         }
-        other => other,
+        other => other.map(|answer| (answer, asked)),
     }
 }
 
@@ -217,10 +239,11 @@ pub fn start_background_agent(
         })
     });
     match result {
-        Ok(()) => {
+        Ok(((), kept_breakaway)) => {
             drop(OwnedHandle(info.hThread));
             Ok(StartedAgent {
                 process: OwnedHandle(info.hProcess),
+                survival: survival_of(&job, kept_breakaway),
             })
         }
         Err(failure) => Err(failure),
