@@ -154,12 +154,21 @@ up with `#[path]` is *(review-enforced)*. Inline modules hide host-testable logi
 otherwise platform-gated — which is how `child_cwd`'s tests once became unreachable from the
 macOS build.
 
-**The password has one path** *(review-enforced)*. The shim reads it from the console into a
-`SecretUnits` (`secret.rs`: fully initialised backing, wiped on drop and before a growth frees the old
-store), hands it to `CreateProcessWithLogonW` in a NUL-terminated copy that `Password::with_nul` wipes
-when the call returns, and wipes the console's record buffer after every read. It never goes on a command
-line, into the environment, a file, a log, a `tracing` field, a `Debug` impl or an error text. A new
-use of it is a new path: review it as one.
+**The password has three sinks** *(review-enforced)*. It is read from the console (the shim's prompt, and
+`auto-login on`'s) into a `SecretUnits` (`secret.rs`: fully initialised backing, wiped on drop and before a
+growth frees the old store); the console's record buffer is wiped after every read. From there it goes only to
+Windows, in these places:
+
+- `CreateProcessWithLogonW`, to start a background session (`logon::start_background_agent`), in a
+  NUL-terminated copy that `Password::with_nul` wipes when the call returns;
+- `LogonUserW`, to ask whether the account may log on as a batch job (`logon::check_batch_logon`), in the same
+  kind of wiped copy;
+- Task Scheduler's `RegisterTask`, which **stores** it in its credential store for `auto-login on`
+  (`provision::password_variant`): a BSTR copy that is zeroed before it is freed. Task Scheduler's own copy
+  and the RPC buffers that carry it are outside this process.
+
+It never goes on a command line, into the environment, a file, a log, a `tracing` field, a `Debug` impl or an
+error text. A new use of it is a new sink: review it as one.
 
 **No personal home paths** in tracked files *(hook-enforced)*; no usernames or machine names
 *(review)* — the hook matches home-directory shapes only, so a bare username or a hostname is
