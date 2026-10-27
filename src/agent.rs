@@ -33,7 +33,7 @@ pub fn exit_code_of(err: &anyhow::Error) -> i32 {
 }
 
 mod ending;
-pub use ending::end_process;
+pub use ending::{end_process, keep_log};
 #[cfg(windows)]
 mod logout;
 
@@ -102,9 +102,12 @@ fn start_with(
     let location = locate().map_err(|e| refused(Refusal::NoSocketLocation, e))?;
     let user = crate::acl::Sid::current_user()?;
     crate::userdir::ensure_socket_dir(&location, &user).map_err(|e| refused(Refusal::SocketFolderRefused, e))?;
-    // Held to the end: dropping the guard stops the writer and later lines are lost. Until the
-    // log opens an error goes to stderr, which a logon task discards; a hand-run agent shows it.
-    let _log = keep_log_or_report(init_log(&location.logs_dir()), &mut std::io::stderr());
+    // Held to the end of the process and flushed by `end_process`, from whichever thread ends it:
+    // dropping the guard stops the writer and later lines are lost. Until the log opens an error goes
+    // to stderr, which a logon task discards; a hand-run agent shows it.
+    if let Some(log) = keep_log_or_report(init_log(&location.logs_dir()), &mut std::io::stderr()) {
+        keep_log(log);
+    }
     let result = serve(&location, session);
     if let Err(e) = &result {
         tracing::error!("the agent stopped: {e:#}");
