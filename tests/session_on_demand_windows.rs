@@ -12,7 +12,9 @@ use ssh_broker::logon;
 use ssh_broker::userdir::{self, NoProfile};
 use ssh_broker::winutil::OwnedHandle;
 use windows::Win32::NetworkManagement::NetManagement::UF_ACCOUNTDISABLE;
-use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE};
+use windows::Win32::System::Threading::{
+    OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, TerminateProcess,
+};
 
 #[path = "common/account.rs"]
 mod account_fixture;
@@ -41,7 +43,7 @@ use account_fixture::Account;
 use agent_conn::{AgentConn, BackgroundAgent};
 use job::KillOnCloseJob;
 use stand_in::file_signal::FileWaited;
-use stand_in::{Kit, RealAgent, SeclogonGuard, start_shim, start_shim_typing};
+use stand_in::{Kit, RealAgent, SeclogonGuard, start_shim, start_shim_as_service, start_shim_typing};
 
 /// The product's view of a fixture account.
 fn account_of(account: &Account) -> LocalAccount {
@@ -174,7 +176,16 @@ fn logon_child_after_the_callers_jobs_close(tag: &str, mut jobs: Vec<KillOnClose
     // The stand-in agent, once it is up, waits for the file `agent.go` and then writes `agent.ack`.
     std::fs::write(kit.path("agent.plan"), "").unwrap();
 
-    let shim = start_shim(&kit, &account, true, |shim| {
+    // Started the way sshd starts a shell, so the shim's chain is the case's jobs and no more (CI round 12:
+    // the Secondary Logon service adds a job of its own to what it starts).
+    let shim = start_shim_as_service(&kit, &account, true, |shim| {
+        // Suspended, before any job: the shim is in none, so the jobs assigned next are its whole chain.
+        assert_eq!(
+            logon::ChildJob::of_process(shim.process.0),
+            logon::ChildJob::NotInJob,
+            "{tag}: the shim was started in a job before the case put it in any, so the case's jobs are not its \
+             whole chain"
+        );
         for job in &jobs {
             job.assign(shim.process.0);
         }
@@ -210,10 +221,15 @@ fn logon_child_after_the_callers_jobs_close(tag: &str, mut jobs: Vec<KillOnClose
     // Written by the shim before it reported; the probe, the caller's job and the claim are in it.
     let logon_log = kit.read("shim.log");
 
+    if jobs.is_empty() {
+        // No job holds the shim, so nothing ends it with a close: end it, as a connection that drops does.
+        // SAFETY: a live process handle this test owns.
+        unsafe { TerminateProcess(shim.process.process.0, 1) }.expect("end the shim");
+    }
     for job in jobs.iter_mut().rev() {
         job.close();
     }
-    // The close is what ends the shim; wait for that before the child is asked anything.
+    // The close (or the end above) is what ends the shim; wait for that before the child is asked anything.
     let shim_code = shim.process.wait();
 
     stand_in::file_signal::publish(&kit.path("agent.go"), "go");
@@ -384,6 +400,20 @@ fn m3_logon_succeeds_when_an_outer_job_forbids_the_breakaway_the_inner_one_allow
 fn m3_logon_succeeds_when_the_inner_job_forbids_breakaway_and_an_outer_one_allows_it() {
     let run = logon_child_after_the_callers_jobs_close("m3n3", nested_jobs(true, false));
     run.assert_claim(logon::Survival::EndsWithConnection, "outer allows, inner forbids");
+}
+
+/// Elevated (CI only). M3: the caller is in no job at all (sshd, started the way a service starts a shell,
+/// with nothing between). Nothing holds the logon child, so the logon sees no job, starts no probe, and
+/// claims `OutlivesConnection`; the shim is ended and the child outlives it.
+#[test]
+fn m3_child_survives_a_caller_that_is_in_no_job() {
+    let run = logon_child_after_the_callers_jobs_close("m3o", Vec::new());
+    assert!(
+        run.logon_log.contains("caller's job NotInJob"),
+        "the shim's chain was not empty: {}",
+        run.measured()
+    );
+    run.assert_claim(logon::Survival::OutlivesConnection, "caller in no job");
 }
 
 /// Elevated (CI only). A wrong password in a chain that refuses breakaway is answered `1326` and not

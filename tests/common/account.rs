@@ -10,7 +10,7 @@ use std::process::Command;
 
 use ssh_broker::acl::Sid;
 use ssh_broker::winutil::OwnedHandle;
-use windows::Win32::Foundation::HANDLE;
+use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, HANDLE};
 use windows::Win32::NetworkManagement::NetManagement::{
     NetUserAdd, NetUserDel, NetUserSetInfo, UF_DONT_EXPIRE_PASSWD, UF_SCRIPT, USER_ACCOUNT_FLAGS, USER_INFO_1,
     USER_INFO_1003, USER_PRIV_USER,
@@ -20,12 +20,12 @@ use windows::Win32::Security::{
     SecurityImpersonation, TOKEN_ALL_ACCESS, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation, TokenPrimary,
 };
 use windows::Win32::System::Threading::{
-    CREATE_NO_WINDOW, CREATE_PROCESS_LOGON_FLAGS, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT,
+    CREATE_NO_WINDOW, CREATE_PROCESS_LOGON_FLAGS, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW,
     CreateProcessWithTokenW, GetCurrentProcess, OpenProcessToken, PROCESS_INFORMATION, ResumeThread,
     STARTF_USESTDHANDLES, STARTUPINFOW, TerminateProcess,
 };
 use windows::Win32::UI::Shell::{CreateProfile, DeleteProfileW};
-use windows::core::{PCWSTR, PWSTR};
+use windows::core::{HRESULT, PCWSTR, PWSTR};
 
 pub fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(std::iter::once(0)).collect()
@@ -346,6 +346,37 @@ impl Account {
         environment: Option<&[u16]>,
         stdio: Option<[HANDLE; 3]>,
     ) -> Spawned {
+        self.spawn_inner(
+            Starter::SecondaryLogon(logon_flags),
+            exe,
+            command_line,
+            cwd,
+            evidence,
+            environment,
+            stdio,
+        )
+    }
+
+    /// [`Account::spawn_with`] the way sshd starts a session's shell: `CreateProcessAsUserW` from a
+    /// service that holds `SeAssignPrimaryTokenPrivilege`, with no Secondary Logon service between, so
+    /// the child's chain of jobs is the caller's and nothing else. Only a SYSTEM process may call it
+    /// (the M3 cases run as one, see [`Starter::AsUser`]); anything else fails the test at the call.
+    /// The child gets this process's environment.
+    pub fn spawn_as_service(&self, exe: &Path, command_line: &str, cwd: &Path, evidence: &[PathBuf]) -> Spawned {
+        self.spawn_inner(Starter::AsUser, exe, command_line, cwd, evidence, None, None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_inner(
+        &self,
+        starter_kind: Starter,
+        exe: &Path,
+        command_line: &str,
+        cwd: &Path,
+        evidence: &[PathBuf],
+        environment: Option<&[u16]>,
+        stdio: Option<[HANDLE; 3]>,
+    ) -> Spawned {
         // The account's SID and the administrator's: the child runs as the first and is started by
         // the second.
         let starter = Sid::current_user().unwrap().to_sddl().unwrap();
@@ -386,21 +417,41 @@ impl Account {
             flags |= CREATE_UNICODE_ENVIRONMENT;
         }
         let mut info = PROCESS_INFORMATION::default();
+        let exe_w = wide(&exe.to_string_lossy());
+        let cwd_w = wide(&cwd.to_string_lossy());
+        let environment = environment.map(|block| block.as_ptr().cast::<core::ffi::c_void>());
         // SAFETY: every pointer is to a local that outlives the call.
-        unsafe {
-            CreateProcessWithTokenW(
-                primary.0,
-                logon_flags,
-                PCWSTR(wide(&exe.to_string_lossy()).as_ptr()),
-                Some(PWSTR(command.as_mut_ptr())),
-                flags,
-                environment.map(|block| block.as_ptr().cast::<core::ffi::c_void>()),
-                PCWSTR(wide(&cwd.to_string_lossy()).as_ptr()),
-                &startup,
-                &mut info,
-            )
+        match starter_kind {
+            Starter::SecondaryLogon(logon_flags) => unsafe {
+                CreateProcessWithTokenW(
+                    primary.0,
+                    logon_flags,
+                    PCWSTR(exe_w.as_ptr()),
+                    Some(PWSTR(command.as_mut_ptr())),
+                    flags,
+                    environment,
+                    PCWSTR(cwd_w.as_ptr()),
+                    &startup,
+                    &mut info,
+                )
+            },
+            Starter::AsUser => unsafe {
+                CreateProcessAsUserW(
+                    Some(primary.0),
+                    PCWSTR(exe_w.as_ptr()),
+                    Some(PWSTR(command.as_mut_ptr())),
+                    None,
+                    None,
+                    stdio.is_some(),
+                    flags,
+                    environment,
+                    PCWSTR(cwd_w.as_ptr()),
+                    &startup,
+                    &mut info,
+                )
+            },
         }
-        .unwrap_or_else(|e| panic!("start {exe:?} as {}: {e}", self.name));
+        .unwrap_or_else(|e| panic!("start {exe:?} as {} ({starter_kind:?}): {e}", self.name));
         let process = OwnedHandle(info.hProcess);
         let thread = OwnedHandle(info.hThread);
         // Before its first instruction: a loader failure then ends the process, with the failing
@@ -423,6 +474,17 @@ impl Account {
             _desktop: private,
         }
     }
+}
+
+/// The call that starts a child as an account.
+#[derive(Clone, Copy, Debug)]
+pub enum Starter {
+    /// `CreateProcessWithTokenW` with these `dwLogonFlags`: the Secondary Logon service starts the child,
+    /// and puts it in a job of its own besides the caller's (CI round 12).
+    SecondaryLogon(CREATE_PROCESS_LOGON_FLAGS),
+    /// `CreateProcessAsUserW` from this process, which must hold `SeAssignPrimaryTokenPrivilege` (a SYSTEM
+    /// process does): what sshd, a service, does.
+    AsUser,
 }
 
 /// A child started suspended by [`Account::spawn_with`]. Its window station and desktop live as long
@@ -469,13 +531,21 @@ impl Drop for Account {
         if !left.is_empty() {
             eprintln!("processes of {} that could not be ended: {left:?}", self.name);
         }
+        // Always, not only for an account made with a profile: a logon with `LOGON_WITH_PROFILE` makes the
+        // profile of an account that had none, and a profile left behind fills the runner's disk (CI round
+        // 12). An account that has none answers "not found".
         // SAFETY: NUL-terminated inputs.
-        unsafe {
-            if self.profile.is_some() {
-                let _ = DeleteProfileW(PCWSTR(wide(&self.sid_text).as_ptr()), PCWSTR::null(), PCWSTR::null());
-            }
-            let _ = NetUserDel(PCWSTR::null(), PCWSTR(wide(&self.name).as_ptr()));
+        let deleted = unsafe { DeleteProfileW(PCWSTR(wide(&self.sid_text).as_ptr()), PCWSTR::null(), PCWSTR::null()) };
+        if let Err(e) = deleted
+            && e.code() != HRESULT::from_win32(ERROR_FILE_NOT_FOUND.0)
+        {
+            eprintln!(
+                "the profile of {} was not deleted and stays on the disk: {e}",
+                self.name
+            );
         }
+        // SAFETY: NUL-terminated inputs.
+        let _ = unsafe { NetUserDel(PCWSTR::null(), PCWSTR(wide(&self.name).as_ptr())) };
     }
 }
 

@@ -120,19 +120,47 @@ pub fn start_shim_typing(
     hold: bool,
     before_resume: impl FnOnce(&Spawned),
 ) -> ShimRun {
+    start_shim_with(kit, typed, hold, before_resume, |command_line| {
+        account.spawn_with(
+            &kit.exe,
+            command_line,
+            kit.dir(),
+            &[kit.dir().to_path_buf()],
+            CREATE_PROCESS_LOGON_FLAGS(0),
+            None,
+        )
+    })
+}
+
+/// [`start_shim`] started the way sshd starts it (`CreateProcessAsUserW`, no Secondary Logon service), so
+/// that the shim's chain of jobs is what `before_resume` puts it in and nothing else. SYSTEM only; see
+/// [`Account::spawn_as_service`].
+pub fn start_shim_as_service(
+    kit: &Kit,
+    account: &Account,
+    hold: bool,
+    before_resume: impl FnOnce(&Spawned),
+) -> ShimRun {
+    start_shim_with(kit, &account.password, hold, before_resume, |command_line| {
+        account.spawn_as_service(&kit.exe, command_line, kit.dir(), &[kit.dir().to_path_buf()])
+    })
+}
+
+/// The part of the shim's start that does not depend on how the process is created: its input files, then
+/// `spawn` with the command line, `before_resume`, and the wait for its report.
+fn start_shim_with(
+    kit: &Kit,
+    typed: &str,
+    hold: bool,
+    before_resume: impl FnOnce(&Spawned),
+    spawn: impl FnOnce(&str) -> Spawned,
+) -> ShimRun {
     std::fs::write(kit.path("shim.input"), format!("{typed}\n{}\n", kit.exe.display())).unwrap();
     if hold {
         std::fs::write(kit.path("shim.hold"), "").unwrap();
     }
     let command_line = format!("\"{}\" shim \"{}\"", kit.exe.display(), kit.dir().display());
-    let process = account.spawn_with(
-        &kit.exe,
-        &command_line,
-        kit.dir(),
-        &[kit.dir().to_path_buf()],
-        CREATE_PROCESS_LOGON_FLAGS(0),
-        None,
-    );
+    let process = spawn(&command_line);
     before_resume(&process);
     process.resume();
     match file_signal::wait_for_file(
