@@ -11,9 +11,12 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
-use windows::Wdk::System::Threading::{NtQueryInformationProcess, ProcessCommandLineInformation};
+use windows::Wdk::System::Threading::{
+    NtQueryInformationProcess, ProcessCommandLineInformation, ProcessImageFileNameWin32,
+};
 use windows::Win32::Foundation::{
-    ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER, HANDLE, UNICODE_STRING, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER, HANDLE, STATUS_PROCESS_IS_TERMINATING, UNICODE_STRING, WAIT_OBJECT_0,
+    WAIT_TIMEOUT,
 };
 use windows::Win32::Storage::FileSystem::{FILE_ID_INFO, FileIdInfo, GetFileInformationByHandleEx};
 use windows::Win32::System::Diagnostics::ToolHelp::{
@@ -51,9 +54,12 @@ impl Process {
     ///
     /// A process that has ended by the time this fails is the goal state, not an error:
     /// `TerminateProcess` on one is refused with access denied.
+    ///
+    /// The same goes for one that is ending: `TerminateProcess` is refused on it too, and it is on
+    /// its way out already.
     pub fn terminate(&self) -> anyhow::Result<()> {
         match self.try_terminate() {
-            Err(_) if has_exited(&self.handle) => Ok(()),
+            Err(_) if has_exited(&self.handle) || is_ending_now(&self.handle) => Ok(()),
             result => result,
         }
     }
@@ -74,6 +80,67 @@ fn has_exited(handle: &OwnedHandle) -> bool {
     // SAFETY: the handle carries SYNCHRONIZE.
     let state = unsafe { WaitForSingleObject(handle.0, 0) }; // sleep-ok: zero-timeout state check of a process handle, not a wait
     state == WAIT_OBJECT_0
+}
+
+/// A process that has begun to end and has not yet exited: the kernel answers every query about it
+/// with `STATUS_PROCESS_IS_TERMINATING`, which Win32 callers see as access denied. Its handle is not
+/// signalled yet, so [`has_exited`] says no.
+#[derive(Debug)]
+pub struct Ending {
+    pub pid: u32,
+}
+
+impl std::fmt::Display for Ending {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "process {} is ending (STATUS_PROCESS_IS_TERMINATING)", self.pid)
+    }
+}
+
+impl std::error::Error for Ending {}
+
+/// Whether `error` says a process is ending.
+fn is_ending(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| cause.is::<Ending>())
+}
+
+/// Whether the process held by `handle` has begun to end, by asking the kernel for a thing about it
+/// and seeing whether the answer is `STATUS_PROCESS_IS_TERMINATING`. A process is never in that state
+/// again once it is out of it, so a `true` stays true.
+fn is_ending_now(handle: &OwnedHandle) -> bool {
+    let mut needed = 0u32;
+    // SAFETY: a size probe: no buffer, zero length.
+    let status = unsafe {
+        NtQueryInformationProcess(
+            handle.0,
+            ProcessImageFileNameWin32,
+            std::ptr::null_mut(),
+            0,
+            &mut needed,
+        )
+    };
+    status == STATUS_PROCESS_IS_TERMINATING
+}
+
+/// What to make of a process whose image or command line could not be read.
+#[derive(Debug, PartialEq, Eq)]
+enum Unreadable {
+    /// It has exited: there is nothing left of it to be an agent.
+    Exited,
+    /// It is ending: it will exit, and is no agent that will ever serve.
+    Ending,
+    /// Nothing says it is going away: a failure, to be reported.
+    Failed,
+}
+
+/// Sort the failure `error` to read a process, `exited` being whether the process has exited by now.
+fn unreadable(error: &anyhow::Error, exited: bool) -> Unreadable {
+    if exited {
+        Unreadable::Exited
+    } else if is_ending(error) {
+        Unreadable::Ending
+    } else {
+        Unreadable::Failed
+    }
 }
 
 /// What an ssh-broker process is, from its command line.
@@ -111,7 +178,7 @@ pub fn select_background_agents<P>(roles: impl Iterator<Item = (P, Role)>) -> im
 pub fn command_line_of(process: &Process) -> anyhow::Result<String> {
     let mut needed = 0u32;
     // SAFETY: a size probe: no buffer, zero length.
-    let _ = unsafe {
+    let probe = unsafe {
         NtQueryInformationProcess(
             process.handle.0,
             ProcessCommandLineInformation,
@@ -120,7 +187,15 @@ pub fn command_line_of(process: &Process) -> anyhow::Result<String> {
             &mut needed,
         )
     };
-    anyhow::ensure!(needed > 0, "process {} reported no command line size", process.pid);
+    if probe == STATUS_PROCESS_IS_TERMINATING {
+        return Err(Ending { pid: process.pid }.into());
+    }
+    anyhow::ensure!(
+        needed > 0,
+        "process {} reported no command line size (NTSTATUS {:#010x})",
+        process.pid,
+        probe.0
+    );
     // Aligned for the `UNICODE_STRING` the answer starts with.
     let mut buffer = vec![0u64; (needed as usize).div_ceil(8)];
     // SAFETY: the buffer holds at least `needed` bytes, which is what the call is told.
@@ -133,6 +208,9 @@ pub fn command_line_of(process: &Process) -> anyhow::Result<String> {
             &mut needed,
         )
     };
+    if status == STATUS_PROCESS_IS_TERMINATING {
+        return Err(Ending { pid: process.pid }.into());
+    }
     anyhow::ensure!(
         status.is_ok(),
         "read the command line of process {} (NTSTATUS {:#010x})",
@@ -151,7 +229,8 @@ pub fn command_line_of(process: &Process) -> anyhow::Result<String> {
 /// handle. The image of a process is compared by file identity; its role by its command line.
 ///
 /// A process the snapshot names `ssh-broker.exe` that cannot be identified or whose command line
-/// cannot be read is an error: it might be a background agent. Any other process whose image
+/// cannot be read is an error: it might be a background agent. One that is ending is taken for one:
+/// it holds the exe until it is gone. Any other process whose image
 /// cannot be read (protected system processes, for one) cannot be the installed exe and is skipped.
 pub fn background_agents(image: &Path) -> anyhow::Result<Vec<Process>> {
     let own = std::process::id();
@@ -169,8 +248,13 @@ pub fn background_agents(image: &Path) -> anyhow::Result<Vec<Process>> {
         };
         match command_line_of(&process) {
             Ok(line) => candidates.push((process, role_of(&line))),
-            Err(_) if has_exited(&process.handle) => {}
-            Err(e) => return Err(e),
+            Err(e) => match unreadable(&e, has_exited(&process.handle)) {
+                Unreadable::Exited => {}
+                // Its role cannot be read while it ends. It may be an agent and holds the exe until it
+                // is gone, so it is taken for one, to be waited for.
+                Unreadable::Ending => candidates.push((process, Role::BackgroundAgent)),
+                Unreadable::Failed => return Err(e),
+            },
         }
     }
     Ok(select_background_agents(candidates.into_iter()).collect())
@@ -266,9 +350,14 @@ fn open_if_image_by(
     }
     match runs_image(&handle, pid, &wanted, identify) {
         Ok(runs) => Ok(runs.then_some(Process { pid, handle })),
-        // It may have ended since the check above.
-        Err(_) if has_exited(&handle) => Ok(None),
-        Err(e) => Err(e),
+        Err(e) => match unreadable(&e, has_exited(&handle)) {
+            // It may have ended since the check above.
+            Unreadable::Exited => Ok(None),
+            // Its image is unreadable while it ends, and it holds the file until it is gone: it is
+            // waited for, as the agent it may be. The wait ends when it does.
+            Unreadable::Ending => Ok(Some(Process { pid, handle })),
+            Unreadable::Failed => Err(e),
+        },
     }
 }
 
@@ -289,7 +378,15 @@ fn runs_image(
     wanted: &FileId,
     identify: &dyn Fn(&Path) -> std::io::Result<FileId>,
 ) -> anyhow::Result<bool> {
-    let path = image_of(handle).with_context(|| format!("read the image of process {pid}"))?;
+    let path = image_of(handle)
+        .map_err(|e| {
+            if is_ending_now(handle) {
+                anyhow::Error::new(Ending { pid })
+            } else {
+                e
+            }
+        })
+        .with_context(|| format!("read the image of process {pid}"))?;
     let running = identify(&path).with_context(|| {
         format!(
             "identify {}, which process {pid} runs, to tell if it runs the agent",
@@ -301,11 +398,12 @@ fn runs_image(
 
 /// Every agent (desktop or background) of `user` that is running `image` right now, other than this
 /// process, each held by a handle: the agents that exist, whether or not they serve yet. A process
-/// that has ended is not one.
+/// that has ended, or is ending, is not one.
 ///
-/// A process of another user is none of this user's: it cannot be opened, or its token names
-/// someone else, and it is skipped. A process of `user` whose image cannot be identified or whose
-/// command line cannot be read is an error: it might be the agent.
+/// A process that cannot be opened, or whose token cannot be read, is refused to this user, and a
+/// process of the user is not (it is made with a default access list that names the user): it is
+/// none of this user's and is skipped. A process of `user` whose image cannot be identified or whose
+/// command line cannot be read, and which is not ending, is an error naming it: it might be the agent.
 pub fn user_agents(image: &Path, user: &Sid) -> anyhow::Result<Vec<Process>> {
     let wanted_user = user.to_sddl()?;
     let wanted = match file_id(image) {
@@ -313,40 +411,95 @@ pub fn user_agents(image: &Path, user: &Sid) -> anyhow::Result<Vec<Process>> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(e).with_context(|| format!("identify {}", image.display())),
     };
-    let own = std::process::id();
+    scan_user_agents(
+        &process_names()?,
+        std::process::id(),
+        &wanted_user,
+        &wanted,
+        &|pid| match open_for_waiting(pid) {
+            Ok(opened) => Ok(opened.map(|handle| Process { pid, handle })),
+            Err(e) if is_denied(&e) => Ok(None),
+            Err(e) => Err(e),
+        },
+    )
+}
+
+/// What the scan for a user's agents asks of a process it has opened.
+trait Inspect {
+    /// The SID of the process's owner, in SDDL form.
+    fn owner(&self) -> anyhow::Result<String>;
+    /// Whether the process runs the file `wanted`.
+    fn runs_image(&self, wanted: &FileId) -> anyhow::Result<bool>;
+    fn has_exited(&self) -> bool;
+    fn command_line(&self) -> anyhow::Result<String>;
+}
+
+impl Inspect for Process {
+    fn owner(&self) -> anyhow::Result<String> {
+        Sid::of_process(self.handle.0)
+            .and_then(|owner| owner.to_sddl())
+            .with_context(|| format!("read the owner of process {}", self.pid))
+    }
+
+    fn runs_image(&self, wanted: &FileId) -> anyhow::Result<bool> {
+        runs_image(&self.handle, self.pid, wanted, &file_id)
+    }
+
+    fn has_exited(&self) -> bool {
+        has_exited(&self.handle)
+    }
+
+    fn command_line(&self) -> anyhow::Result<String> {
+        command_line_of(self)
+    }
+}
+
+/// [`user_agents`] over the processes `names` lists, each opened by `open` (`None`: not to be
+/// looked at), so a test can make up processes.
+fn scan_user_agents<P: Inspect>(
+    names: &[(u32, String)],
+    own: u32,
+    user: &str,
+    image: &FileId,
+    open: &dyn Fn(u32) -> anyhow::Result<Option<P>>,
+) -> anyhow::Result<Vec<P>> {
     let mut agents = Vec::new();
-    for (pid, name) in process_names()? {
-        if pid == own || !name.eq_ignore_ascii_case(super::EXE_NAME) {
+    for (pid, name) in names {
+        if *pid == own || !name.eq_ignore_ascii_case(super::EXE_NAME) {
             continue;
         }
-        let handle = match open_for_waiting(pid) {
-            Ok(Some(handle)) => handle,
-            Ok(None) => continue,
-            Err(e) if is_denied(&e) => continue,
-            Err(e) => return Err(e),
+        let Some(process) = open(*pid)? else {
+            continue;
         };
-        match Sid::of_process(handle.0) {
-            Ok(owner) if owner.to_sddl()? == wanted_user => {}
-            Ok(_) => continue,
-            Err(e) if is_denied(&e) => continue,
-            Err(e) => return Err(e).with_context(|| format!("read the owner of process {pid}")),
-        }
-        if !runs_image(&handle, pid, &wanted, &file_id)? {
-            continue;
-        }
-        if has_exited(&handle) {
-            // Ended, but still listed while some handle on it is open. Waiting on it returns at once.
-            continue;
-        }
-        let process = Process { pid, handle };
-        match command_line_of(&process) {
-            Ok(line) if role_of(&line) != Role::Shim => agents.push(process),
-            Ok(_) => {}
-            Err(_) if has_exited(&process.handle) => {}
-            Err(e) => return Err(e),
+        if is_agent_of(&process, user, image)? {
+            agents.push(process);
         }
     }
     Ok(agents)
+}
+
+/// Whether `process` is an agent of the user `user` running `image`. A process that has exited, or
+/// exits or begins to end while it is read, is none; any other failure to read it is the error.
+fn is_agent_of(process: &impl Inspect, user: &str, image: &FileId) -> anyhow::Result<bool> {
+    if process.has_exited() {
+        return Ok(false);
+    }
+    let verdict = (|| {
+        match process.owner() {
+            Ok(owner) if owner == user => {}
+            Ok(_) => return Ok(false),
+            Err(e) if is_denied(&e) => return Ok(false),
+            Err(e) => return Err(e),
+        }
+        if !process.runs_image(image)? {
+            return Ok(false);
+        }
+        Ok(role_of(&process.command_line()?) != Role::Shim)
+    })();
+    match verdict {
+        Err(e) if unreadable(&e, process.has_exited()) != Unreadable::Failed => Ok(false),
+        verdict => verdict,
+    }
 }
 
 /// Whether `error` is Windows refusing access.

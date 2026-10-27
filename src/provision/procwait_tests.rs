@@ -475,3 +475,227 @@ fn the_command_line_of_a_running_process_is_readable() {
     drop(child.stdin.take());
     child.wait().unwrap();
 }
+
+// the scan for a user's agents, over processes the test makes up -----
+
+/// How reading something about a made-up process fails.
+#[derive(Clone, Copy)]
+enum Fail {
+    /// The kernel answers `STATUS_PROCESS_IS_TERMINATING` (which Win32 callers see as access denied).
+    Ending,
+    /// Access denied with nothing to say the process is going away.
+    Denied,
+}
+
+impl Fail {
+    fn error(self, pid: u32) -> anyhow::Error {
+        match self {
+            Fail::Ending => anyhow::Error::new(Ending { pid }).context(format!("read something of process {pid}")),
+            Fail::Denied => {
+                let denied = windows::core::Error::from(HRESULT::from_win32(ERROR_ACCESS_DENIED.0));
+                anyhow::Error::new(denied).context(format!("read something of process {pid}"))
+            }
+        }
+    }
+}
+
+/// A process the scan is told about. Every question has the answer of a process that is an agent of
+/// the user unless the test changes it.
+#[derive(Clone)]
+struct Made {
+    pid: u32,
+    owner: Result<&'static str, Fail>,
+    image: Result<bool, Fail>,
+    exited: bool,
+    command_line: Result<&'static str, Fail>,
+}
+
+const ME: &str = "S-1-5-21-1-2-3-1001";
+
+fn made(pid: u32) -> Made {
+    Made {
+        pid,
+        owner: Ok(ME),
+        image: Ok(true),
+        exited: false,
+        command_line: Ok(r"C:\x\ssh-broker.exe agent --background"),
+    }
+}
+
+impl Inspect for Made {
+    fn owner(&self) -> anyhow::Result<String> {
+        self.owner.map(str::to_owned).map_err(|f| f.error(self.pid))
+    }
+    fn runs_image(&self, _wanted: &FileId) -> anyhow::Result<bool> {
+        self.image.map_err(|f| f.error(self.pid))
+    }
+    fn has_exited(&self) -> bool {
+        self.exited
+    }
+    fn command_line(&self) -> anyhow::Result<String> {
+        self.command_line.map(str::to_owned).map_err(|f| f.error(self.pid))
+    }
+}
+
+/// The pids the scan returns for `processes`, which all carry the installed exe's name.
+fn scanned(processes: &[Made]) -> anyhow::Result<Vec<u32>> {
+    let names: Vec<(u32, String)> = processes
+        .iter()
+        .map(|p| (p.pid, crate::provision::EXE_NAME.to_owned()))
+        .collect();
+    let found = scan_user_agents(&names, 1, ME, &FileId::default(), &|pid| {
+        Ok(processes.iter().find(|p| p.pid == pid).cloned())
+    })?;
+    Ok(found.iter().map(|p| p.pid).collect())
+}
+
+#[test]
+fn the_scan_finds_the_agents_of_the_user_and_not_a_shim() {
+    let shim = Made {
+        command_line: Ok(r"C:\x\ssh-broker.exe"),
+        ..made(30)
+    };
+    assert_eq!(scanned(&[made(10), made(20), shim]).unwrap(), [10, 20]);
+}
+
+#[test]
+fn a_process_of_another_user_or_another_image_is_none_of_the_users() {
+    let other_user = Made {
+        owner: Ok("S-1-5-18"),
+        ..made(10)
+    };
+    let other_image = Made {
+        image: Ok(false),
+        ..made(20)
+    };
+    assert_eq!(scanned(&[other_user, other_image, made(30)]).unwrap(), [30]);
+}
+
+#[test]
+fn a_process_whose_token_is_refused_is_none_of_the_users() {
+    let refused = Made {
+        owner: Err(Fail::Denied),
+        ..made(10)
+    };
+    assert_eq!(scanned(&[refused, made(20)]).unwrap(), [20]);
+}
+
+#[test]
+fn a_process_whose_image_is_refused_because_it_is_ending_is_skipped_not_fatal() {
+    // CI round 15: the image read of a process that other tests were ending failed the whole scan.
+    let ending = Made {
+        image: Err(Fail::Ending),
+        ..made(10)
+    };
+    assert_eq!(scanned(&[ending, made(20)]).unwrap(), [20]);
+}
+
+#[test]
+fn a_process_that_ends_between_the_image_and_the_command_line_is_skipped() {
+    let ending = Made {
+        command_line: Err(Fail::Ending),
+        ..made(10)
+    };
+    assert_eq!(scanned(&[ending, made(20)]).unwrap(), [20]);
+}
+
+#[test]
+fn a_process_that_has_exited_is_skipped_whatever_it_refuses() {
+    let gone = Made {
+        exited: true,
+        image: Err(Fail::Denied),
+        ..made(10)
+    };
+    assert_eq!(scanned(&[gone, made(30)]).unwrap(), [30]);
+}
+
+/// A process that is alive at the first look and has exited by the time a read of it has failed.
+struct ExitsWhenAsked {
+    made: Made,
+    asked: std::cell::Cell<bool>,
+}
+
+impl Inspect for ExitsWhenAsked {
+    fn owner(&self) -> anyhow::Result<String> {
+        self.made.owner()
+    }
+    fn runs_image(&self, wanted: &FileId) -> anyhow::Result<bool> {
+        self.made.runs_image(wanted)
+    }
+    fn has_exited(&self) -> bool {
+        self.asked.get()
+    }
+    fn command_line(&self) -> anyhow::Result<String> {
+        self.asked.set(true);
+        self.made.command_line()
+    }
+}
+
+#[test]
+fn a_process_that_exits_while_its_command_line_is_read_is_skipped() {
+    let names = vec![(20, crate::provision::EXE_NAME.to_owned())];
+    let found = scan_user_agents(&names, 1, ME, &FileId::default(), &|pid| {
+        Ok(Some(ExitsWhenAsked {
+            made: Made {
+                command_line: Err(Fail::Denied),
+                ..made(pid)
+            },
+            asked: std::cell::Cell::new(false),
+        }))
+    })
+    .unwrap();
+    assert!(found.is_empty());
+}
+
+#[test]
+fn a_process_of_the_user_whose_image_is_refused_for_no_known_reason_fails_the_scan_naming_it() {
+    let unreadable = Made {
+        image: Err(Fail::Denied),
+        ..made(4242)
+    };
+    let err = scanned(&[made(10), unreadable]).unwrap_err();
+    let text = format!("{err:#}");
+    assert!(text.contains("4242"), "names the process: {text}");
+    assert!(text.contains("Access is denied"), "names the cause: {text}");
+}
+
+#[test]
+fn a_process_of_the_user_whose_command_line_is_refused_for_no_known_reason_fails_the_scan_naming_it() {
+    let unreadable = Made {
+        command_line: Err(Fail::Denied),
+        ..made(4243)
+    };
+    let err = scanned(&[unreadable]).unwrap_err();
+    let text = format!("{err:#}");
+    assert!(text.contains("4243"), "names the process: {text}");
+    assert!(text.contains("Access is denied"), "names the cause: {text}");
+}
+
+#[test]
+fn this_process_and_processes_of_other_names_are_not_looked_at() {
+    let names = vec![(1, crate::provision::EXE_NAME.to_owned()), (2, "other.exe".to_owned())];
+    let found = scan_user_agents::<Made>(&names, 1, ME, &FileId::default(), &|pid| {
+        panic!("process {pid} was opened")
+    })
+    .unwrap();
+    assert!(found.is_empty());
+}
+
+#[test]
+fn a_process_that_cannot_be_opened_is_none_of_the_users() {
+    let names = vec![(5, crate::provision::EXE_NAME.to_owned())];
+    let found = scan_user_agents::<Made>(&names, 1, ME, &FileId::default(), &|_| Ok(None)).unwrap();
+    assert!(found.is_empty());
+}
+
+// what to make of a process that cannot be read -----
+
+#[test]
+fn an_unreadable_process_is_told_apart_as_exited_ending_or_failed() {
+    let ending = Fail::Ending.error(1);
+    let denied = Fail::Denied.error(1);
+    assert_eq!(unreadable(&ending, true), Unreadable::Exited);
+    assert_eq!(unreadable(&denied, true), Unreadable::Exited);
+    assert_eq!(unreadable(&ending, false), Unreadable::Ending);
+    assert_eq!(unreadable(&denied, false), Unreadable::Failed);
+}
