@@ -336,6 +336,24 @@ fn account_with_space_and_non_ascii_name_gets_a_session_through_the_prompt() {
     leave(&mut run);
 }
 
+/// Elevated (CI only). A local account whose name contains `@`: Windows reads `name@domain` as a UPN,
+/// which `CreateProcessWithLogonW` accepts only with no domain, and the logon passes `.` as the domain.
+/// The session must start through the prompt all the same, or this test shows the code Windows gave.
+#[test]
+fn account_with_an_at_sign_in_its_name_gets_a_session_through_the_prompt() {
+    let _machine = machine::shared();
+    let kit = kit("pp13");
+    let name = format!("sb@{:x}", std::process::id());
+    let account = Account::create_named(&name, "Pw-At-Aa1!-3", true);
+    let mut run = start_run(&kit, &account);
+    run.read_until(&format!("ssh-broker: {name} has no Windows session on this PC."));
+    run.type_line(&account.password);
+    expect_session(&mut run);
+    assert_relayed(&mut run);
+    say(&mut run, "session-up");
+    leave(&mut run);
+}
+
 /// Elevated (CI only). The first login starts the session; a later connection finds it and does not
 /// ask again.
 #[test]
