@@ -157,22 +157,32 @@ fn a_call_that_asked_for_no_breakaway_did_not_keep_one() {
 
 // survival -----
 
+/// The claim follows the child's own job membership after the spawn, not the caller's flags: a caller
+/// whose innermost job allows breakaway can still have an outer job that keeps the child (CI round 8).
 #[test]
-fn a_session_outlives_its_connection_outside_any_job_or_with_breakaway_kept() {
-    assert_eq!(survival_of(&CallerJob::NotInJob, false), Survival::OutlivesConnection);
-    let allowing = CallerJob::Limits(KILL_ON_JOB_CLOSE | BREAKAWAY_OK);
-    assert_eq!(survival_of(&allowing, true), Survival::OutlivesConnection);
+fn a_child_in_no_job_outlives_the_connection() {
+    assert_eq!(survival_of(ChildJob::NotInJob), Survival::OutlivesConnection);
 }
 
 #[test]
-fn a_session_ends_with_its_connection_when_it_stayed_in_the_callers_job() {
-    let allowing = CallerJob::Limits(KILL_ON_JOB_CLOSE | BREAKAWAY_OK);
-    // The flag was asked for and an outer job refused it: the fallback call kept the child in the job.
-    assert_eq!(survival_of(&allowing, false), Survival::EndsWithConnection);
-    assert_eq!(
-        survival_of(&CallerJob::Limits(KILL_ON_JOB_CLOSE), false),
-        Survival::EndsWithConnection
-    );
-    // A job that cannot be read cannot be asked for breakaway.
-    assert_eq!(survival_of(&CallerJob::Unreadable, false), Survival::EndsWithConnection);
+fn a_child_in_a_job_ends_with_the_connection() {
+    assert_eq!(survival_of(ChildJob::InJob), Survival::EndsWithConnection);
+}
+
+/// A membership Windows would not answer is not evidence that the child got out.
+#[test]
+fn a_child_whose_membership_cannot_be_read_is_not_claimed_to_outlive() {
+    assert_eq!(survival_of(ChildJob::Unreadable), Survival::EndsWithConnection);
+}
+
+/// The reading of a process's own membership agrees with the caller-job reading of the same process.
+#[test]
+fn the_membership_of_this_process_agrees_with_its_job_reading() {
+    // SAFETY: the pseudo-handle of the current process needs no closing.
+    let own = ChildJob::of_process(unsafe { GetCurrentProcess() });
+    match CallerJob::of_this_process() {
+        CallerJob::NotInJob => assert_eq!(own, ChildJob::NotInJob),
+        CallerJob::Limits(_) => assert_eq!(own, ChildJob::InJob),
+        CallerJob::Unreadable => {}
+    }
 }

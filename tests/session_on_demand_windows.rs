@@ -143,9 +143,10 @@ enum M3Outcome {
 /// child records that it is waiting; the jobs are closed, innermost first; then the child is told to
 /// acknowledge. Both outcomes end the wait: it waits on the acknowledgement and on the child's exit.
 ///
-/// Returns what became of the child, and what the logon reported about its survival (`survival=...`
-/// in the shim's report, the value the prompt path turns into a line for the user).
-fn logon_child_after_the_callers_jobs_close(tag: &str, mut jobs: Vec<KillOnCloseJob>) -> (M3Outcome, String) {
+/// Returns what became of the child, what the logon reported about its survival (`survival=...` in the
+/// shim's report, the value the prompt path turns into a line for the user), and the child's job
+/// membership as this test reads it from outside, before the jobs close.
+fn logon_child_after_the_callers_jobs_close(tag: &str, mut jobs: Vec<KillOnCloseJob>) -> M3Run {
     let _machine = machine::shared();
     let kit = Kit::new(tag);
     let account = Account::create(tag, true);
@@ -184,6 +185,8 @@ fn logon_child_after_the_callers_jobs_close(tag: &str, mut jobs: Vec<KillOnClose
         }
     }
 
+    let membership = logon::ChildJob::of_process(agent.0);
+
     for job in jobs.iter_mut().rev() {
         job.close();
     }
@@ -197,43 +200,85 @@ fn logon_child_after_the_callers_jobs_close(tag: &str, mut jobs: Vec<KillOnClose
         Some(stand_in::SERVING_BOUND),
         "the logon child's acknowledgement",
     ) {
-        FileWaited::Appeared => (M3Outcome::Survived, reported),
-        FileWaited::ProcessEnded(child) => (
-            M3Outcome::Ended {
+        FileWaited::Appeared => M3Run {
+            outcome: M3Outcome::Survived,
+            reported,
+            membership,
+        },
+        FileWaited::ProcessEnded(child) => M3Run {
+            outcome: M3Outcome::Ended {
                 child,
                 shim: shim_code,
                 had_waited: kit.path("agent.waiting").is_file(),
             },
             reported,
-        ),
+            membership,
+        },
     }
 }
 
-/// The logon told the prompt path the session `outlives` its connection, or not.
-fn assert_survival_reported(reported: &str, outlives: bool) {
-    let expected = if outlives {
-        "survival=OutlivesConnection"
-    } else {
-        "survival=EndsWithConnection"
-    };
-    assert!(reported.contains(expected), "expected {expected} in: {reported}");
+/// What one M3 run measured.
+struct M3Run {
+    outcome: M3Outcome,
+    /// The shim's report, which carries the logon's claim (`survival=...`).
+    reported: String,
+    /// Whether the child was in a job when the test looked, before any job closed.
+    membership: logon::ChildJob,
 }
 
-/// The child ended with its caller's job, having been waiting: what a session that stays in a job
-/// that closes does, and what `survival=EndsWithConnection` tells the user.
-fn assert_ended_with_the_job(chain: &str, outcome: &M3Outcome) {
-    match outcome {
-        M3Outcome::Ended { had_waited: true, .. } => {}
-        M3Outcome::Ended {
-            child,
-            shim,
-            had_waited: false,
-        } => panic!(
-            "{chain}: the logon child ended ({child:#x}; the caller's: {shim:#x}) without having recorded that it was waiting"
-        ),
-        M3Outcome::Survived => panic!(
-            "{chain}: the logon child survived its caller's jobs closing, although the logon did not (or could not) break away; the line the user is shown says the session ends"
-        ),
+impl M3Run {
+    /// Whether the child outlived its caller's jobs. A child that ended without having recorded that it
+    /// was waiting ended by itself, which says nothing about the jobs: that is a failure of the run.
+    fn survived(&self, chain: &str) -> bool {
+        match &self.outcome {
+            M3Outcome::Survived => true,
+            M3Outcome::Ended { had_waited: true, .. } => false,
+            M3Outcome::Ended {
+                child,
+                shim,
+                had_waited: false,
+            } => panic!(
+                "{chain}: the logon child ended ({child:#x}; the caller's: {shim:#x}) without having recorded that it was waiting: {}",
+                self.measured()
+            ),
+        }
+    }
+
+    /// Everything the run measured, for a failure message.
+    fn measured(&self) -> String {
+        let fate = match &self.outcome {
+            M3Outcome::Survived => "the child survived its caller's jobs closing".to_string(),
+            M3Outcome::Ended {
+                child,
+                shim,
+                had_waited,
+            } => format!(
+                "the child ended with its caller's jobs: exit code {child:#x} (the caller's: {shim:#x}), it had recorded that it was waiting: {had_waited}"
+            ),
+        };
+        format!(
+            "measured: {fate}; the child's job membership before the close: {:?}; the logon reported: {}",
+            self.membership, self.reported
+        )
+    }
+
+    /// The logon's claim, which the prompt path turns into a line for the user, is the survival that
+    /// was measured. Prints the measurement on a mismatch so that the rule can be revisited from it.
+    fn assert_claim_matches_measurement(&self, chain: &str) {
+        let survived = self.survived(chain);
+        let claim = if self.reported.contains("survival=OutlivesConnection") {
+            true
+        } else if self.reported.contains("survival=EndsWithConnection") {
+            false
+        } else {
+            panic!("{chain}: the logon reported no survival: {}", self.measured())
+        };
+        assert_eq!(
+            claim,
+            survived,
+            "{chain}: the logon's claim (outlives: {claim}) is not what happened (outlived: {survived}); {}",
+            self.measured()
+        );
     }
 }
 
@@ -242,32 +287,26 @@ fn assert_ended_with_the_job(chain: &str, outcome: &M3Outcome) {
 /// the connection (the prompt path says so to the user).
 #[test]
 fn logon_child_in_a_job_that_forbids_breakaway_ends_with_the_job_and_the_logon_says_so() {
-    let (outcome, reported) = logon_child_after_the_callers_jobs_close("m3a", vec![KillOnCloseJob::create()]);
-    assert_ended_with_the_job("job without BREAKAWAY_OK", &outcome);
-    assert_survival_reported(&reported, false);
+    let run = logon_child_after_the_callers_jobs_close("m3a", vec![KillOnCloseJob::create()]);
+    assert!(!run.survived("job without BREAKAWAY_OK"), "{}", run.measured());
+    run.assert_claim_matches_measurement("job without BREAKAWAY_OK");
 }
 
 /// Elevated (CI only). M3: where the caller's job allows breakaway the product asks for it, and the
 /// logon child outlives the job.
 #[test]
 fn logon_child_survives_the_callers_job_closing_where_breakaway_is_allowed() {
-    let (outcome, reported) =
-        logon_child_after_the_callers_jobs_close("m3b", vec![KillOnCloseJob::create_allowing_breakaway()]);
-    assert_survival_reported(&reported, true);
-    match outcome {
-        M3Outcome::Survived => {}
-        M3Outcome::Ended {
-            child,
-            shim,
-            had_waited,
-        } => panic!(
-            "M3: the logon child ended with its caller's job although the job allows breakaway and the logon asked for it: exit code {child:#x} (the caller's: {shim:#x}); it had recorded that it was waiting: {had_waited}"
-        ),
-    }
+    let run = logon_child_after_the_callers_jobs_close("m3b", vec![KillOnCloseJob::create_allowing_breakaway()]);
+    assert!(
+        run.survived("job with BREAKAWAY_OK"),
+        "the logon child ended with its caller's job although the job allows breakaway and the logon asked for it; {}",
+        run.measured()
+    );
+    run.assert_claim_matches_measurement("job with BREAKAWAY_OK");
 }
 
 /// A chain of two nested jobs, outermost first, each allowing breakaway or not. Windows shows a process
-/// only the innermost, which is what the product reads.
+/// only the innermost, which is what the product reads of its caller.
 fn nested_jobs(outer_allows: bool, inner_allows: bool) -> Vec<KillOnCloseJob> {
     let job = |allows| {
         if allows {
@@ -283,33 +322,31 @@ fn nested_jobs(outer_allows: bool, inner_allows: bool) -> Vec<KillOnCloseJob> {
 /// child outlives the chain.
 #[test]
 fn logon_child_survives_nested_jobs_that_all_allow_breakaway() {
-    let (outcome, reported) = logon_child_after_the_callers_jobs_close("m3n1", nested_jobs(true, true));
-    assert_survival_reported(&reported, true);
-    match outcome {
-        M3Outcome::Survived => {}
-        M3Outcome::Ended { child, shim, .. } => panic!(
-            "the logon child ended with a chain of jobs that all allow breakaway: exit code {child:#x} (the caller's: {shim:#x})"
-        ),
-    }
+    let run = logon_child_after_the_callers_jobs_close("m3n1", nested_jobs(true, true));
+    assert!(
+        run.survived("all nested jobs allow"),
+        "the logon child ended with a chain of jobs that all allow breakaway; {}",
+        run.measured()
+    );
+    run.assert_claim_matches_measurement("all nested jobs allow");
 }
 
-/// Elevated (CI only). The innermost job allows breakaway and an outer one does not: the product asks
-/// for it, Windows refuses, the logon still succeeds without it, and the child ends with the chain.
-/// The logon reports that the session does not outlive the connection.
+/// Elevated (CI only). The innermost job allows breakaway and an outer one does not. Whether Windows
+/// refuses the flagged call, and where the child ends up, is what this measures (CI round 8: it does not
+/// refuse). The logon must succeed, and what it tells the user must be what happened.
 #[test]
 fn logon_succeeds_when_an_outer_job_forbids_the_breakaway_the_inner_one_allows() {
-    let (outcome, reported) = logon_child_after_the_callers_jobs_close("m3n2", nested_jobs(false, true));
-    assert_ended_with_the_job("outer forbids, inner allows", &outcome);
-    assert_survival_reported(&reported, false);
+    let run = logon_child_after_the_callers_jobs_close("m3n2", nested_jobs(false, true));
+    run.assert_claim_matches_measurement("outer forbids, inner allows");
 }
 
 /// Elevated (CI only). The innermost job forbids breakaway and an outer one allows it: the product
 /// asks for none, the logon succeeds, and the child ends with the chain.
 #[test]
 fn logon_succeeds_when_the_inner_job_forbids_breakaway_and_an_outer_one_allows_it() {
-    let (outcome, reported) = logon_child_after_the_callers_jobs_close("m3n3", nested_jobs(true, false));
-    assert_ended_with_the_job("outer allows, inner forbids", &outcome);
-    assert_survival_reported(&reported, false);
+    let run = logon_child_after_the_callers_jobs_close("m3n3", nested_jobs(true, false));
+    assert!(!run.survived("outer allows, inner forbids"), "{}", run.measured());
+    run.assert_claim_matches_measurement("outer allows, inner forbids");
 }
 
 /// Elevated (CI only). A wrong password in a chain that refuses breakaway is answered `1326` and not

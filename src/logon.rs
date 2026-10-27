@@ -7,7 +7,8 @@
 //! returns; it is on no command line, in no environment and in no error text.
 //!
 //! The service puts the child in the caller's job (CI, M3: the child of a caller in a kill-on-close job
-//! ended with the job, exit code 0). `CREATE_BREAKAWAY_FROM_JOB` is passed when the caller's job allows
+//! ended with the job, exit code 0). Whether it got out is read from the child (`ChildJob`), not
+//! inferred from the flags the call was made with. `CREATE_BREAKAWAY_FROM_JOB` is passed when the caller's job allows
 //! breakaway (`JOB_OBJECT_LIMIT_BREAKAWAY_OK`) and not otherwise: in a job that does not allow it the
 //! call fails with `ERROR_ACCESS_DENIED`, which would cost the user their login.
 //!
@@ -18,6 +19,7 @@
 
 use std::path::Path;
 
+use windows::Win32::Foundation::HANDLE;
 use windows::Win32::System::JobObjects::{
     IsProcessInJob, JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation, QueryInformationJobObject,
 };
@@ -49,19 +51,44 @@ pub struct StartedAgent {
 /// Whether the session the logon started outlives the connection that asked for it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Survival {
-    /// The agent is outside the caller's job, or the caller has none.
+    /// The agent is outside every job, so nothing the connection owns closes on it.
     OutlivesConnection,
-    /// The agent is inside a job that closes with the connection, and ends with it.
+    /// The agent is inside a job, which closes with the connection or may.
     EndsWithConnection,
 }
 
-/// What the logon of a caller in `job` gave the session. `kept_breakaway` is whether the call that
-/// started the agent asked for breakaway (see [`with_breakaway_fallback`]).
-pub fn survival_of(job: &CallerJob, kept_breakaway: bool) -> Survival {
-    if kept_breakaway || *job == CallerJob::NotInJob {
-        Survival::OutlivesConnection
-    } else {
-        Survival::EndsWithConnection
+/// The jobs a process is in, as Windows reports them for that process itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChildJob {
+    NotInJob,
+    /// In at least one job.
+    InJob,
+    /// Windows would not say.
+    Unreadable,
+}
+
+impl ChildJob {
+    /// Whether `process` (a handle with `PROCESS_QUERY_LIMITED_INFORMATION`) is in any job.
+    pub fn of_process(process: HANDLE) -> ChildJob {
+        let mut in_job = BOOL(0);
+        // SAFETY: a valid handle and out-pointer; no job handle means any job.
+        match unsafe { IsProcessInJob(process, None, &mut in_job) } {
+            Err(_) => ChildJob::Unreadable,
+            Ok(()) if in_job.as_bool() => ChildJob::InJob,
+            Ok(()) => ChildJob::NotInJob,
+        }
+    }
+}
+
+/// What the session gets from where the started agent actually is. The caller's job flags do not say:
+/// a job that allows breakaway can sit inside one that keeps the child (CI round 8), and Windows
+/// answers the flagged call without refusing it. So the claim is read from the child, after the spawn.
+/// The jobs of a caller of ssh-broker are sshd's (kill-on-close), so a child in any job ends with the
+/// connection; one whose membership cannot be read is not claimed to outlive it.
+pub fn survival_of(child: ChildJob) -> Survival {
+    match child {
+        ChildJob::NotInJob => Survival::OutlivesConnection,
+        ChildJob::InJob | ChildJob::Unreadable => Survival::EndsWithConnection,
     }
 }
 
@@ -241,9 +268,14 @@ pub fn start_background_agent(
     match result {
         Ok(((), kept_breakaway)) => {
             drop(OwnedHandle(info.hThread));
+            let child_job = ChildJob::of_process(info.hProcess);
+            let survival = survival_of(child_job);
+            tracing::info!(
+                "logon started the agent: breakaway kept by the call: {kept_breakaway}, the agent is {child_job:?}, so {survival:?}"
+            );
             Ok(StartedAgent {
                 process: OwnedHandle(info.hProcess),
-                survival: survival_of(&job, kept_breakaway),
+                survival,
             })
         }
         Err(failure) => Err(failure),
@@ -254,7 +286,6 @@ pub fn start_background_agent(
 /// batch type, closed at once: with the password in hand, Windows says `ERROR_LOGON_TYPE_NOT_GRANTED`
 /// (1385) when the right is missing (spike M5(d)).
 pub fn check_batch_logon(account: &LocalAccount, password: &Password) -> BatchRight {
-    use windows::Win32::Foundation::HANDLE;
     use windows::Win32::Security::{LOGON32_LOGON_BATCH, LOGON32_PROVIDER_DEFAULT, LogonUserW};
     let user = wide(&account.name);
     let mut token = HANDLE::default();
