@@ -1,6 +1,7 @@
-# Print the free space of the runner's drives and the size of what the tests fill them with, then fail if a
-# test account's profile is left (a folder `sb*` in the users root or a profile-list entry for one). Every test removes
-# its account's profile, so one that stays is a leak (CI round 14: 1.3 GB each filled the disk).
+# Print the free space of the runner's drives and the size of what the tests fill them with, and list the profile of
+# every test account that is left (a folder `sb*` in the users root or a profile-list entry for one), with its size.
+# It does not fail on them: Task Scheduler and sshd logons leave a profile that the tests clear themselves (owner
+# decision on the hive), and the sizes show a leak (CI round 14: 1.3 GB each filled the disk).
 # Usage: disk-report.ps1 <label>. CI only; it changes nothing.
 param([Parameter(Mandatory)][string]$Label)
 
@@ -49,5 +50,4 @@ if ($count -ne 0 -or $entries.Count -ne 0) {
     Write-Output ('test account profiles are left after "{0}":' -f $Label)
     $profiles | ForEach-Object { Write-Output ('  folder {0}' -f $_.FullName) }
     $entries | ForEach-Object { Write-Output ('  profile list entry {0}' -f (Get-ItemProperty $_.PSPath).ProfileImagePath) }
-    exit 1
 }
