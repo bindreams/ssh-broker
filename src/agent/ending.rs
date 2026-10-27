@@ -12,13 +12,13 @@
 
 use std::sync::{Mutex, Once};
 
-use tracing_appender::non_blocking::WorkerGuard;
-
 static ENDING: Ending = Ending::new();
 
 /// Hand the log's guard over, to be flushed when the process ends. Until then it keeps the writer
-/// alive: dropping a guard stops the writer and later lines are lost.
-pub fn keep_log(guard: WorkerGuard) {
+/// alive: dropping a guard stops the writer and later lines are lost. Any value will do: only its
+/// drop matters, so this module does not name the log crate (a Windows-only dependency) and builds
+/// on every target.
+pub fn keep_log(guard: impl Send + 'static) {
     ENDING.keep_log(guard);
 }
 
