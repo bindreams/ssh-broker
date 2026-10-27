@@ -252,7 +252,8 @@ const EXIT_AFTER_TERMINATE_BOUND_MS: u32 = 30_000;
 /// process that is still there then is added to `problems`.
 fn end(process: HANDLE, name: &str, problems: &mut BTreeSet<String>) {
     // SAFETY: `process` is a live process handle with terminate access.
-    if let Err(e) = unsafe { TerminateProcess(process, 1) }
+    let terminated = unsafe { TerminateProcess(process, 1) };
+    if let Err(e) = &terminated
         && !has_exited(process)
     {
         problems.insert(format!("{name}: {e}"));
@@ -261,8 +262,16 @@ fn end(process: HANDLE, name: &str, problems: &mut BTreeSet<String>) {
     // SAFETY: as above; the handle carries SYNCHRONIZE.
     let rc = unsafe { WaitForSingleObject(process, EXIT_AFTER_TERMINATE_BOUND_MS) }; // sleep-ok: failure bound on a terminated process's exit, an external event; expiry is reported and is not read as state
     if rc != WAIT_OBJECT_0 {
+        // An exit status that is already set while the process is listed means it began to end by
+        // itself and is stuck ending; a refused `TerminateProcess` then says nothing about the kernel.
+        let how = match terminated {
+            Ok(()) => "after being terminated".to_string(),
+            Err(e) => format!(
+                "(TerminateProcess was refused: {e}; the exit status was already set, so the process had begun to end by itself and is stuck ending)"
+            ),
+        };
         problems.insert(format!(
-            "{name}: still there {EXIT_AFTER_TERMINATE_BOUND_MS} ms after being terminated ({rc:?})"
+            "{name}: still there {EXIT_AFTER_TERMINATE_BOUND_MS} ms {how} ({rc:?})"
         ));
     }
 }

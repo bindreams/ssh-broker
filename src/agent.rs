@@ -32,6 +32,8 @@ pub fn exit_code_of(err: &anyhow::Error) -> i32 {
     1
 }
 
+mod ending;
+pub use ending::end_process;
 #[cfg(windows)]
 mod logout;
 
@@ -603,7 +605,7 @@ fn handle_connection_in(conn: socket2::Socket, hooks: Hooks, control: &Control) 
     if hs.mode == Mode::Logout {
         return logout::handle_logout(&mut rx, &mut tx, control, || {
             tracing::info!("the background session has ended");
-            std::process::exit(0)
+            end_process(0)
         });
     }
     if control.is_ending() {

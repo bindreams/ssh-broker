@@ -68,6 +68,16 @@ fn start_run(kit: &Kit, account: &Account) -> PtyRun {
     })
 }
 
+/// The folder the agent of `account` logs into, as evidence for a wait that fails.
+fn logs_of(account: &Account) -> Vec<std::path::PathBuf> {
+    account
+        .try_profile()
+        .and_then(|profile| socket_loc::for_profile(profile).ok())
+        .map(|location| location.logs_dir())
+        .into_iter()
+        .collect()
+}
+
 /// A marker the shell prints but does not echo back as typed: its two halves are joined by the shell.
 fn say(run: &mut PtyRun, marker: &str) {
     let (head, tail) = marker.split_at(marker.len() / 2);
@@ -405,7 +415,7 @@ fn login_after_logout_prompts_again() {
     first.finish();
     // The login that follows is the one after the session ended: a login that arrives while the agent
     // is still draining is answered "ending", not prompted (that answer has its own unit test).
-    agent.wait_for_exit();
+    agent.wait_for_exit(&logs_of(&account));
 
     let mut second = start_run(&kit, &account);
     log_in(&mut second, &account.password);
@@ -615,14 +625,15 @@ impl AgentProcess {
         AgentProcess(OwnedHandle(handle), pid)
     }
 
-    /// Wait for the process to exit; a process that does not fails the test, naming it.
-    fn wait_for_exit(&self) {
+    /// Wait for the process to exit; a process that does not fails the test, naming it and printing
+    /// what the agent logged in `logs`.
+    fn wait_for_exit(&self, logs: &[std::path::PathBuf]) {
         bounded_wait::wait_for_exit(
             self.0.0,
             self.1,
             "the agent after logout",
             bounded_wait::CHILD_EXIT_BOUND,
-            &[],
+            logs,
         );
     }
 

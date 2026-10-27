@@ -11,11 +11,16 @@ fn main() -> anyhow::Result<()> {
 
     match route(&args, &cmdline::current()) {
         Route::Shim { exec } => shim::run(exec),
-        Route::Agent(args) => agent::run(args).map_err(|e| {
-            // An agent without a console has no other way to say why it stopped.
-            eprintln!("ssh-broker agent: {e:#}");
-            std::process::exit(agent::exit_code_of(&e))
-        }),
+        // The agent has threads that end the process too (`logout`); every end goes through one guard,
+        // so that none is inside the process's exit while another begins it.
+        Route::Agent(args) => match agent::run(args) {
+            Ok(()) => agent::end_process(0),
+            Err(e) => {
+                // An agent without a console has no other way to say why it stopped.
+                eprintln!("ssh-broker agent: {e:#}");
+                agent::end_process(agent::exit_code_of(&e))
+            }
+        },
         Route::Usage(verb) => {
             eprintln!("{}", usage(verb));
             std::process::exit(2);
