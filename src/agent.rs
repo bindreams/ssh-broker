@@ -215,22 +215,43 @@ fn run_on(location: &SocketLocation, background: bool) -> anyhow::Result<()> {
 /// The listener stays open through the wait, and a second loop answers what arrives on it: a login
 /// that comes while the agent drains gets the ending refusal at once, where a closed socket would
 /// have left its shim waiting for an agent it takes to be starting, for as long as the drain lasts.
-/// That loop ends with the process.
+/// The listener is held until the process ends, whether or not that loop runs or keeps running (see
+/// [`keep_answering`]).
 #[cfg(windows)]
 fn serve_until_drained(listener: Listener, connections: &Arc<Connections>, control: &Arc<Control>) -> anyhow::Error {
     let listener = Arc::new(listener);
     let end = accept_loop(&listener, connections, control, || control.is_ending());
     if end.downcast_ref::<Stopped>().is_some() {
-        let (listener, connections, control) = (listener, Arc::clone(connections), Arc::clone(control));
-        let refusing = std::thread::Builder::new().spawn(move || {
-            let end = accept_loop(&listener, &connections, &control, || false);
-            tracing::warn!("no longer answering logins while the agent ends: {end:#}");
-        });
-        if let Err(e) = refusing {
-            tracing::warn!("could not keep answering logins while the agent ends: {e}");
-        }
+        let (connections, control) = (Arc::clone(connections), Arc::clone(control));
+        keep_answering(
+            listener,
+            hold_until_end,
+            |work| std::thread::Builder::new().spawn(work).map(drop),
+            move |listener| {
+                let end = accept_loop(listener, &connections, &control, || false);
+                tracing::warn!("no longer answering logins while the agent ends: {end:#}");
+            },
+        );
     }
     finish_stopped(end, connections)
+}
+
+/// Run `answer` over `listener` on a thread started by `spawn`; the listener is also handed to
+/// `hold`, before the thread starts, so that it outlives the thread however the thread ends: a
+/// failed start, or `answer` returning on a fatal accept error or for lack of a live connection to
+/// free a resource. A closed socket would leave the shim of a login that arrives meanwhile waiting
+/// for an agent it takes to be starting.
+#[cfg(windows)]
+fn keep_answering<L: Send + Sync + 'static>(
+    listener: Arc<L>,
+    hold: impl FnOnce(Arc<L>),
+    spawn: impl FnOnce(Box<dyn FnOnce() + Send>) -> std::io::Result<()>,
+    answer: impl FnOnce(&L) + Send + 'static,
+) {
+    hold(Arc::clone(&listener));
+    if let Err(e) = spawn(Box::new(move || answer(&listener))) {
+        tracing::warn!("could not keep answering logins while the agent ends: {e}");
+    }
 }
 
 /// [`serve_connections_with`] over `listener`, handing each connection to a thread of its own.

@@ -294,6 +294,15 @@ pub fn split(sock: Socket) -> anyhow::Result<(ConnRx, ConnTx)> {
     Ok((ConnRx(sock), ConnTx(write_half)))
 }
 
+impl ConnRx {
+    /// Make a `read` that finds nothing fail with `TimedOut` or `WouldBlock` once `limit` has
+    /// passed (`None`: block as long as it takes). `limit` is not zero. The socket's state is
+    /// undefined after such a failure on Windows: read it no more.
+    pub fn set_read_timeout(&self, limit: Option<std::time::Duration>) -> std::io::Result<()> {
+        self.0.set_read_timeout(limit)
+    }
+}
+
 impl ConnTx {
     /// A new handle on the same underlying socket, for a thread that must watch the connection
     /// without owning one of the split halves.

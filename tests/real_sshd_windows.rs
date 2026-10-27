@@ -447,7 +447,8 @@ fn prompt_path_through_real_sshd() {
     account_fixture::assert_elevated();
     let kit = Kit::broker_with_helper("sshd");
     let account = Account::create("sshd", true);
-    // The session is ended with `logout` before the account goes, passing or failing (see `session_end`).
+    // The session is ended with `logout` before the account goes, passing or failing; a logout that
+    // fails fails a passing test (see `session_end`).
     let _end = session_end::LogOutOnDrop::new(&kit.exe, &account, ServiceLogon::Sshd);
     let login = Login::new(&kit, &account);
 

@@ -2,8 +2,8 @@
 //! **CI only.**
 //!
 //! A test ends such a session with `logout`, run inside the agent as the account, and checks what
-//! ssh-broker controls: its agents ended, every process of their logon sessions exited, and `logout`
-//! exited 0. It does not ask Windows to unload the account's hive or to delete its profile: Windows keeps
+//! ssh-broker controls: its agents ended, every process of their logon sessions exited (also those
+//! started after `logout` was asked, such as the `logout` client), and `logout` exited 0. It does not ask Windows to unload the account's hive or to delete its profile: Windows keeps
 //! the hive of a Task Scheduler or sshd logon loaded (CI rounds 19 and 20), as it does for a user who
 //! logged in at the console (owner, 2026-10-27). Killing the account's processes (`Account::drop`) is the
 //! fallback, and every use of it is recorded.
@@ -71,8 +71,9 @@ pub fn log_out(exe: &Path, account: &Account, how: ServiceLogon) -> Result<Optio
 }
 
 /// Ends the background session of an account when dropped, passing or failing. Declare it after the
-/// account, so that it drops first. If the logout fails the account's processes are killed by the
-/// account's own drop instead, and the failure is recorded. Creating it declares how the test starts the
+/// account, so that it drops first. If the logout fails the failure is recorded, the account's
+/// processes are killed by the account's own drop, and the test fails (a test that is already failing
+/// keeps its own panic). Creating it declares how the test starts the
 /// account's session (`how`, see [`Account::started_by`]).
 pub struct LogOutOnDrop {
     exe: PathBuf,
@@ -115,10 +116,11 @@ impl Drop for LogOutOnDrop {
             profile,
             self.how,
         ) {
-            hive::record(&format!(
-                "the logout of {} failed ({why}); its processes are ended by killing them instead",
-                self.name
-            ));
+            let failure = format!("the logout of {} failed: {why}", self.name);
+            hive::record(&format!("{failure}; its processes are ended by killing them instead"));
+            if !std::thread::panicking() {
+                panic!("{failure}");
+            }
         }
     }
 }
@@ -206,7 +208,7 @@ fn try_end(
     for (pid, process) in &held {
         wait_exited(process.0, *pid, name)?;
     }
-    steps.push("every process of the sessions exited".to_owned());
+    steps.push("every process listed before logout exited".to_owned());
     // A handle on a process keeps its token, and so the logon session, alive.
     drop(held);
     drop(agents);
@@ -220,6 +222,33 @@ fn try_end(
         ));
     }
     steps.push("no agent left".to_owned());
+    // Also what started after the list was taken: the `logout` client and its console host, a child that
+    // escaped the agent's job. A process that has exited but is still held by another is no process here.
+    let running = || -> Vec<_> {
+        ids.iter()
+            .flat_map(|id| logon_session::processes_of(*id))
+            .filter(|(pid, process)| *pid != own && !has_exited(process.0))
+            .collect()
+    };
+    let late = running();
+    steps.push(format!(
+        "{} process(es) in the sessions after logout (pids {:?})",
+        late.len(),
+        late.iter().map(|(pid, _)| *pid).collect::<Vec<_>>()
+    ));
+    for (pid, process) in &late {
+        wait_exited(process.0, *pid, name)?;
+    }
+    drop(late);
+    let remaining = running();
+    if !remaining.is_empty() {
+        return Err(format!(
+            "process(es) {:?} of {name} still run in the logon sessions after logout",
+            remaining.iter().map(|(pid, _)| *pid).collect::<Vec<_>>()
+        ));
+    }
+    drop(remaining);
+    steps.push("no process left in the sessions".to_owned());
     let mut logged_off = BTreeSet::new();
     let mut missing = Vec::new();
     for (id, watch) in &watches {
@@ -264,6 +293,13 @@ fn wait_exited(process: HANDLE, pid: u32, name: &str) -> Result<(), String> {
             "process {pid} of {name} was still running {CHILD_EXIT_BOUND:?} after logout ({rc:?})"
         ))
     }
+}
+
+/// Whether `process` has exited: a state check, not a wait.
+fn has_exited(process: HANDLE) -> bool {
+    // SAFETY: a live process handle with SYNCHRONIZE access, held by the caller.
+    let rc = unsafe { WaitForSingleObject(process, 0) }; // sleep-ok: zero-timeout state check, not a wait
+    rc == WAIT_OBJECT_0
 }
 
 /// Run `step`, turning a panic into an error that names `what`.

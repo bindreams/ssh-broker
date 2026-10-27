@@ -35,14 +35,70 @@ impl Read for Closed {
     }
 }
 
-/// A client that stays connected until the test says it closes.
-struct Gate(mpsc::Receiver<()>);
+impl LimitedRead for Closed {
+    fn limit_reads(&mut self, _: Duration) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// A client that stays connected until the test says it closes (a send, or dropping the sender).
+/// A read that was not given a limit panics: it could wait for ever.
+struct Gate {
+    closed: mpsc::Receiver<()>,
+    limit: Option<Duration>,
+}
+
+impl Gate {
+    fn new(closed: mpsc::Receiver<()>) -> Gate {
+        Gate { closed, limit: None }
+    }
+}
 
 impl Read for Gate {
     fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
-        let _ = self.0.recv();
-        Ok(0)
+        let limit = self.limit.expect("a read of the logout client must have a limit");
+        let got = self.closed.recv_timeout(limit); // sleep-ok: stands in for a socket's receive timeout; a close is the other way out
+        match got {
+            Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => Ok(0),
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(std::io::ErrorKind::TimedOut.into()),
+        }
     }
+}
+
+impl LimitedRead for Gate {
+    fn limit_reads(&mut self, limit: Duration) -> std::io::Result<()> {
+        self.limit = Some(limit);
+        Ok(())
+    }
+}
+
+/// What `f` logged, and what it returned.
+fn logged<T>(f: impl FnOnce() -> T) -> (String, T) {
+    #[derive(Clone, Default)]
+    struct Buf(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for Buf {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Buf {
+        type Writer = Buf;
+        fn make_writer(&'a self) -> Buf {
+            self.clone()
+        }
+    }
+    let buf = Buf::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(buf.clone())
+        .with_ansi(false)
+        .finish();
+    let result = tracing::subscriber::with_default(subscriber, f);
+    let log = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+    (log, result)
 }
 
 fn counting_killer(count: &Arc<AtomicUsize>) -> Killer {
@@ -124,7 +180,7 @@ fn background_agent_does_not_end_until_the_client_has_closed() {
     let worker = {
         let control = Arc::clone(&control);
         std::thread::spawn(move || {
-            handle_logout(&mut Gate(closed), &mut Tx(replied), &control, || {
+            handle_logout(&mut Gate::new(closed), &mut Tx(replied), &control, || {
                 ended.send(()).unwrap()
             })
             .unwrap();
@@ -441,6 +497,83 @@ fn a_logout_whose_client_is_gone_before_the_reply_still_ends_the_agent() {
 /// The drain bound of these tests: the handler they hold never finishes, so the bound is what ends
 /// the wait, and its length changes nothing about what is asserted.
 const SHORT_BOUND: std::time::Duration = std::time::Duration::from_millis(10);
+
+#[test]
+fn a_logout_client_that_never_closes_does_not_keep_the_agent_alive_and_the_log_says_so() {
+    let connections = Connections::with_drain_bound(SHORT_BOUND);
+    let control = Control::new(true, connections);
+    let killed = Arc::new(AtomicUsize::new(0));
+    let _session = control.register(counting_killer(&killed)).unwrap();
+    let ended = AtomicBool::new(false);
+    // The sender stays alive and silent: the client is connected and says nothing.
+    let (_silent, closed) = mpsc::channel::<()>();
+
+    let (log, result) = logged(|| {
+        handle_logout(&mut Gate::new(closed), &mut Vec::new(), &control, || {
+            ended.store(true, Ordering::SeqCst)
+        })
+    });
+
+    result.unwrap();
+    assert!(ended.load(Ordering::SeqCst), "the logout ended the agent");
+    assert_eq!(killed.load(Ordering::SeqCst), 1, "and its sessions");
+    assert!(log.contains("had not closed its connection"), "{log}");
+}
+
+#[test]
+fn a_logout_client_that_closes_in_time_is_not_reported() {
+    let control = Control::new(true, Connections::new());
+    let (close, closed) = mpsc::channel();
+    close.send(()).unwrap();
+
+    let (log, result) = logged(|| handle_logout(&mut Gate::new(closed), &mut Vec::new(), &control, || {}));
+
+    result.unwrap();
+    assert!(!log.contains("had not closed"), "{log}");
+}
+
+#[test]
+fn a_read_limit_on_a_connection_ends_a_read_that_finds_nothing() {
+    // If the limit does nothing the read blocks; the helper closes the client once the failsafe
+    // passes, so the test then fails instead of hanging. A working limit ends the read first and
+    // releases the helper.
+    const FAILSAFE: Duration = Duration::from_secs(5);
+    let ((mut srx, _stx), (crx, ctx), dir) = socket_pair("limited-read");
+    let (done, finished) = mpsc::channel::<()>();
+    let failsafe = std::thread::spawn(move || {
+        let _ = finished.recv_timeout(FAILSAFE); // sleep-ok: failsafe that only turns a hang into a failure; a working limit releases it first
+        let _ = ctx.shutdown_both();
+        drop((crx, ctx));
+    });
+
+    srx.limit_reads(SHORT_BOUND).unwrap();
+    let result = srx.read(&mut [0u8; 8]);
+    drop(done);
+    let err = result.expect_err("nothing was sent, and the client is still connected");
+
+    assert!(
+        matches!(
+            err.kind(),
+            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+        ),
+        "{err:?}"
+    );
+    failsafe.join().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_connection_with_a_read_limit_still_delivers_what_arrives_and_reports_the_close() {
+    let ((mut srx, _stx), (crx, mut ctx), dir) = socket_pair("limited-read-data");
+    srx.limit_reads(Duration::from_secs(30)).unwrap();
+    ctx.write_all(b"hi").unwrap();
+    let mut buf = [0u8; 8];
+    assert_eq!(srx.read(&mut buf).unwrap(), 2);
+    ctx.shutdown_write().unwrap();
+    assert_eq!(wait_for_close_within(&mut srx, Duration::from_secs(30)), Waited::Closed);
+    drop((crx, ctx));
+    let _ = std::fs::remove_dir_all(&dir);
+}
 
 #[test]
 fn a_connection_handler_that_never_returns_does_not_keep_the_agent_alive() {

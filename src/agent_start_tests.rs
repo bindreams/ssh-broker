@@ -516,6 +516,61 @@ fn serve_hands_the_slot_and_the_lock_to_the_process_end_and_does_not_drop_them()
     );
 }
 
+// the listener of an ending agent -----
+
+/// A stand-in listener that says when it is closed.
+struct Closes(Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for Closes {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+fn closed(flag: &Arc<std::sync::atomic::AtomicBool>) -> bool {
+    flag.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+#[test]
+fn the_listener_stays_open_when_the_thread_that_answers_logins_cannot_start() {
+    let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let held = RefCell::new(Vec::new());
+
+    keep_answering(
+        Arc::new(Closes(Arc::clone(&flag))),
+        |listener| held.borrow_mut().push(listener),
+        |_work| Err(std::io::Error::other("no thread")),
+        |_| unreachable!("the thread did not start"),
+    );
+
+    assert!(!closed(&flag), "the listener closed while the agent still ends");
+    drop(held);
+    assert!(closed(&flag), "and it is released with whoever held it");
+}
+
+#[test]
+fn the_listener_stays_open_when_the_loop_that_answers_logins_has_returned() {
+    let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let held = RefCell::new(Vec::new());
+    let answered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    keep_answering(
+        Arc::new(Closes(Arc::clone(&flag))),
+        |listener| held.borrow_mut().push(listener),
+        |work| {
+            work();
+            Ok(())
+        },
+        {
+            let answered = Arc::clone(&answered);
+            move |_| answered.store(true, std::sync::atomic::Ordering::SeqCst)
+        },
+    );
+
+    assert!(closed(&answered), "the loop ran");
+    assert!(!closed(&flag), "the listener closed when the loop returned");
+}
+
 // closing a pseudoconsole -----
 
 /// A console whose close pushes its pending output into a pipe nobody else reads: the stand-in is a

@@ -6,17 +6,16 @@
 //! inside its job, so ending the tree earlier could cut the reply and the exit code off), ends
 //! every session's shell tree, waits until every other connection has finished relaying (so each
 //! shell's last output reaches its client the way it does when a shell exits by itself), and only
-//! then ends the process. A connection waits on its client, which may never read or close, so that
-//! wait has a bound (`DRAIN_BOUND`): past it the process ends with the connections left, and the log
-//! says how many.
+//! then ends the process. Both waits are on a client that may never read or close, so each has the
+//! bound `DRAIN_BOUND`: past it the process goes on without the client, and the log says so.
 //!
-//! The listener stays open until the process ends, or until the thread that refuses logins cannot be
-//! started, or its loop stops on a fatal accept error. A login that arrives meanwhile is refused with [`ENDING_REFUSAL`]. The session
-//! slot and the user lock stay held until the process ends, so a successor agent binds only after
-//! this one is gone.
+//! The listener stays open until the process ends. A login that arrives meanwhile is refused with
+//! [`ENDING_REFUSAL`]. The session slot and the user lock stay held until the process ends too, so a
+//! successor agent binds only after this one is gone.
 
 use std::io::Read;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, Instant};
 
 use super::Connections;
 use crate::afunix::{ConnRx, ConnTx};
@@ -136,7 +135,7 @@ impl Drop for Registration<'_> {
 ///
 /// `end_process` ends the process; it is a parameter so a test can see when it is called. A
 /// desktop agent answers and keeps serving.
-pub(super) fn handle_logout<R: Read, W: std::io::Write>(
+pub(super) fn handle_logout<R: LimitedRead, W: std::io::Write>(
     rx: &mut R,
     tx: &mut W,
     control: &Control,
@@ -150,7 +149,13 @@ pub(super) fn handle_logout<R: Read, W: std::io::Write>(
     if let Err(e) = reply(tx, ENDING_REPLY, 0) {
         tracing::warn!("could not deliver the logout reply: {e:#}");
     }
-    wait_for_close(rx);
+    let bound = control.connections.drain_bound;
+    if wait_for_close_within(rx, bound) == Waited::Abandoned {
+        tracing::warn!(
+            "the client of the logout request had not closed its connection {} s after the reply; ending without it",
+            bound.as_secs_f32()
+        );
+    }
     tracing::info!("ending the background session at the user's request");
     let _logout = control.connections.begin_logout();
     control.end_all();
@@ -178,6 +183,51 @@ fn reply<W: std::io::Write>(tx: &mut W, text: &str, code: i32) -> anyhow::Result
     write_frame(tx, FrameKind::Exit, &ExitCode(code).encode())?;
     tx.flush()?;
     Ok(())
+}
+
+/// A connection whose blocking reads can be given a limit.
+pub(super) trait LimitedRead: Read {
+    /// Make a read that finds nothing fail with `TimedOut` or `WouldBlock` once `limit` (not zero)
+    /// has passed.
+    fn limit_reads(&mut self, limit: Duration) -> std::io::Result<()>;
+}
+
+impl LimitedRead for ConnRx {
+    fn limit_reads(&mut self, limit: Duration) -> std::io::Result<()> {
+        self.set_read_timeout(Some(limit))
+    }
+}
+
+/// How [`wait_for_close_within`] ended.
+#[derive(Debug, PartialEq, Eq)]
+enum Waited {
+    /// The client closed, or the connection failed.
+    Closed,
+    /// The bound passed with the client still connected.
+    Abandoned,
+}
+
+/// [`wait_for_close`] for a client that may never close: after `bound` it gives up. The bound is the
+/// failure bound on an external client, never proof that the client has read the reply.
+fn wait_for_close_within<R: LimitedRead>(rx: &mut R, bound: Duration) -> Waited {
+    let deadline = Instant::now() + bound;
+    let mut buf = [0u8; 256];
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Waited::Abandoned;
+        }
+        if rx.limit_reads(left).is_err() {
+            return Waited::Closed;
+        }
+        match rx.read(&mut buf) {
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            // The deadline is looked at again at the top.
+            Err(e) if matches!(e.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock) => {}
+            Ok(0) | Err(_) => return Waited::Closed,
+            Ok(_) => {}
+        }
+    }
 }
 
 /// Block until the client has closed its end (or the connection has failed).
