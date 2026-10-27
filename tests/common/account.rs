@@ -4,10 +4,12 @@
 //! The including test crate declares `bounded_wait`, `desktop` and `hard_errors` beside this module.
 #![allow(dead_code)]
 
+#[path = "hive.rs"]
+pub mod hive;
 #[path = "holders.rs"]
 mod holders;
 #[path = "profile.rs"]
-mod profile;
+pub mod profile;
 
 use std::os::windows::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
@@ -543,6 +545,27 @@ impl Drop for Account {
         let removed = profile::remove(&self.sid_text);
         // Measured before the account is deleted, while whatever holds the profile still does.
         let holders = removed.as_ref().err().map(|_| holders::report(&self.sid_text));
+        // A hive that stays loaded after the wait (CI round 16: no process handle on it, no logon session of
+        // the account) is unloaded here by hand and the profile deleted, which leaves nothing on the disk. The
+        // measurement is recorded, since the teardown hides it. If the unload fails the test fails as before.
+        let removed = match removed {
+            Err(why) => {
+                let forced = hive::unload_and_delete(&self.sid_text);
+                hive::record(&format!(
+                    "profile of {} ({}) stayed loaded: {why}\n{}\n  by hand:\n  {}",
+                    self.name,
+                    self.sid_text,
+                    holders.as_deref().unwrap_or_default(),
+                    forced.text
+                ));
+                if forced.deleted {
+                    Ok(())
+                } else {
+                    Err(format!("{why}; by hand:\n  {}", forced.text))
+                }
+            }
+            Ok(()) => Ok(()),
+        };
         // SAFETY: NUL-terminated inputs.
         let _ = unsafe { NetUserDel(PCWSTR::null(), PCWSTR(wide(&self.name).as_ptr())) };
         if let Err(why) = removed {

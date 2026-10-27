@@ -56,9 +56,44 @@ pub fn remove(sid_text: &str) -> Result<(), String> {
     }
 }
 
-fn delete(sid_text: &str) -> windows::core::Result<()> {
+pub(super) fn delete(sid_text: &str) -> windows::core::Result<()> {
     // SAFETY: NUL-terminated input; no computer name.
     unsafe { DeleteProfileW(PCWSTR(wide(sid_text).as_ptr()), PCWSTR::null(), PCWSTR::null()) }
+}
+
+/// Wait for `HKEY_USERS\<sid>` to unload, and say when it did or that it had not after [`UNLOAD_BOUND`]. A
+/// measurement of the normal end of a session, not a check: nothing is asserted from the answer.
+pub fn measure_unload(sid_text: &str) -> String {
+    let watch = match HiveWatch::arm() {
+        Ok(watch) => watch,
+        Err(e) => return format!("not measured: {e}"),
+    };
+    let started = Instant::now();
+    let mut first = true;
+    loop {
+        match hive_loaded(sid_text) {
+            Ok(false) => {
+                return if first {
+                    "already unloaded when first looked at".to_string()
+                } else {
+                    format!("unloaded {:?} after it was first looked at", started.elapsed())
+                };
+            }
+            Ok(true) if first => first = false,
+            Ok(true) => {}
+            Err(e) => return format!("not measured: {e}"),
+        }
+        let left = UNLOAD_BOUND.saturating_sub(started.elapsed());
+        if left.is_zero() {
+            return format!(
+                "still loaded {UNLOAD_BOUND:?} after it was first looked at; {}",
+                hive_state(sid_text)
+            );
+        }
+        if let Err(e) = watch.wait(left.min(RECHECK)) {
+            return format!("not measured: {e}");
+        }
+    }
 }
 
 /// Whether `HKEY_USERS\<sid>` (the loaded hive) and its classes hive are present, as text.

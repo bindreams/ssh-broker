@@ -697,4 +697,15 @@ fn logon_session_is_logged_off_after_logout() {
         watch.wait(LOGOFF_EVENT_BOUND),
         "M6: logon session {id:#x} still present: no 4634 although every process of it has ended"
     );
+
+    // Measured, not asserted: does the account's hive unload once its session has ended the normal way (the
+    // product's own `logout`)? CI round 16 found hives that stayed loaded 120 s after a test killed the
+    // account's processes, which is not this path. The answer goes to the measurement file CI prints.
+    account_fixture::hive::record(&format!(
+        "after the product's logout and the logoff of session {id:#x}, {} ({}): hive {}; ProfileList {}",
+        account.name,
+        account.sid_text,
+        account_fixture::profile::measure_unload(&account.sid_text),
+        account_fixture::hive::profile_list(&account.sid_text),
+    ));
 }

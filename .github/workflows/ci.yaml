@@ -237,6 +237,14 @@ jobs:
         if: (success() || failure()) && runner.os == 'Windows'
         run: .github/scripts/disk-report.ps1 'end'
 
+      # What the tests recorded about hives that stayed loaded and about the unload after a normal logout
+      # (tests/common/hive.rs); nextest hides the output of a test that passes.
+      - name: Profile unload measurements
+        if: (success() || failure()) && runner.os == 'Windows'
+        run: |
+          $file = 'C:\ProgramData\sb-profile-measure.log'
+          if (Test-Path -LiteralPath $file) { Get-Content -LiteralPath $file } else { 'no measurement was recorded' }
+
       # What the system recorded about logons, scheduled tasks and sshd, for a failed run to be read from the log.
       - name: Logon and task events
         if: failure() && runner.os == 'Windows'
