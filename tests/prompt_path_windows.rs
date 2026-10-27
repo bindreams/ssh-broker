@@ -103,6 +103,24 @@ fn expect_session(run: &mut PtyRun) {
         "the login fell back to a plain shell instead of starting a session:
 {shown}"
     );
+    without_psreadline(run);
+}
+
+/// Wait for a PowerShell prompt and then take PSReadLine out of that shell: see [`without_psreadline`].
+fn shell_up(run: &mut PtyRun) {
+    run.read_until(SHELL_PROMPT);
+    without_psreadline(run);
+}
+
+/// Take PSReadLine out of the shell, so the host's own reader reads the lines typed after this one.
+/// Under this harness the shell's PSReadLine cannot make its history mutex (`measure_named_objects`
+/// prints the denial; real sshd gives the shell a token that can, which `real_sshd_windows` asserts)
+/// and prints a crash report at every prompt. Input typed while a report is printing is no part of
+/// what these tests name, and one run lost it (the console went silent after the first character of
+/// `exit`).
+fn without_psreadline(run: &mut PtyRun) {
+    run.type_line("Remove-Module PSReadLine -ErrorAction SilentlyContinue; Write-Output ('psreadline' + '-off')");
+    run.read_until("psreadline-off");
 }
 
 /// The shell is the session's: the user's DPAPI works in it, which the plain shell of the shim's network
@@ -225,7 +243,7 @@ fn log_in_expecting_plain(run: &mut PtyRun, password: &str) {
     run.read_until(PROMPT);
     run.type_line(password);
     run.read_until(COST);
-    run.read_until(SHELL_PROMPT);
+    shell_up(run);
 }
 
 /// Elevated (CI only). The sentinel password is typed through the console; nothing the console
@@ -264,7 +282,7 @@ fn ctrl_c_gives_plain_shell() {
     run.read_until(PROMPT);
     run.ctrl_c();
     run.read_until(COST);
-    run.read_until(SHELL_PROMPT);
+    shell_up(&mut run);
     say(&mut run, "plain-shell-works");
     leave(&mut run);
 }
@@ -286,7 +304,7 @@ fn ctrl_d_gives_plain_shell() {
             run.ctrl_d_virtual_key();
         }
         run.read_until(COST);
-        run.read_until(SHELL_PROMPT);
+        shell_up(&mut run);
         leave(&mut run);
     }
 }
@@ -343,7 +361,7 @@ fn account_with_space_and_non_ascii_name_gets_a_session_through_the_prompt() {
     let mut run = start_run(&kit, &account);
     run.read_until(&format!("ssh-broker: {name} has no Windows session on this PC."));
     run.type_line(&account.password);
-    run.read_until(SHELL_PROMPT);
+    shell_up(&mut run);
     say(&mut run, "session-up");
     leave(&mut run);
 }
@@ -380,7 +398,7 @@ fn second_connection_reuses_the_running_session() {
     let first_parent = parent_pid(&mut first);
 
     let mut second = start_run(&kit, &account);
-    second.read_until(SHELL_PROMPT);
+    shell_up(&mut second);
     say(&mut second, "second-up");
     assert!(
         !second.text().contains(PROMPT),
@@ -516,7 +534,7 @@ fn two_simultaneous_first_connections_end_with_one_agent_and_no_hang() {
     );
     // Served after every console left: no prompt, the session's DPAPI, and the same agent as the parent.
     let mut third = start_run(&kit, &account);
-    third.read_until(SHELL_PROMPT);
+    shell_up(&mut third);
     assert!(
         !third.text().contains(PROMPT),
         "a login after both consoles left was asked for a password: the agent did not survive:

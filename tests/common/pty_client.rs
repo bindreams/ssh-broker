@@ -66,6 +66,11 @@ pub struct PtyRun {
     output: Receiver<Vec<u8>>,
     /// Everything the shim has written so far.
     transcript: Vec<u8>,
+    /// The length in characters of each line the test typed (not the text: a line may be a password),
+    /// and the bytes of key events sent in all, for the report of a wait that fails: they say whether
+    /// the console went quiet after the last input, and which.
+    typed: Vec<usize>,
+    sent: usize,
     /// More to print when a wait fails (the logs the shim and its agent wrote, for one).
     context: Option<Box<dyn Fn() -> String>>,
 }
@@ -114,6 +119,8 @@ impl PtyRun {
             input: my_in,
             output,
             transcript: Vec::new(),
+            typed: Vec::new(),
+            sent: 0,
             context: None,
         }
     }
@@ -143,11 +150,17 @@ impl PtyRun {
                 "the console was silent for {SILENCE_BOUND:?} while the test waited for {awaited}; it showed:
 {}
 
+the last bytes it wrote (raw): {:?}
+the lengths of the last lines typed, {} bytes of key events sent in all: {:?}
+
 process tree:
 {}
 
 {}",
                 self.text(),
+                String::from_utf8_lossy(&self.transcript[self.transcript.len().saturating_sub(400)..]),
+                self.sent,
+                &self.typed[self.typed.len().saturating_sub(3)..],
                 crate::bounded_wait::process_tree(self.helper.process.0, self.helper.pid),
                 self.extra()
             ),
@@ -155,6 +168,7 @@ process tree:
     }
 
     fn send(&mut self, bytes: &[u8]) {
+        self.sent += bytes.len();
         assert!(
             write_all_handle(self.input.raw(), bytes),
             "could not write to the console; it showed:\n{}",
@@ -195,6 +209,7 @@ process tree:
     }
 
     pub fn type_line(&mut self, text: &str) {
+        self.typed.push(text.chars().count());
         self.type_text(text);
         self.press_enter();
     }
