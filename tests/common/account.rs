@@ -4,6 +4,8 @@
 //! The including test crate declares `bounded_wait`, `desktop` and `hard_errors` beside this module.
 #![allow(dead_code)]
 
+#[path = "holders.rs"]
+mod holders;
 #[path = "profile.rs"]
 mod profile;
 
@@ -539,14 +541,18 @@ impl Drop for Account {
         // last process has exited, so this waits for that (CI round 14: a delete right after the exit failed
         // with "in use" and the profile, about 1.3 GB, stayed).
         let removed = profile::remove(&self.sid_text);
+        // Measured before the account is deleted, while whatever holds the profile still does.
+        let holders = removed.as_ref().err().map(|_| holders::report(&self.sid_text));
         // SAFETY: NUL-terminated inputs.
         let _ = unsafe { NetUserDel(PCWSTR::null(), PCWSTR(wide(&self.name).as_ptr())) };
         if let Err(why) = removed {
             let message = format!(
                 "the profile of {} ({}) was not deleted and stays on the disk: {why}. Processes of the account that \
                  could not be ended: {left:?}. A handle this test process still holds on a process of the account \
-                 also keeps its logon session, and so its profile, in use.",
-                self.name, self.sid_text
+                 also keeps its logon session, and so its profile, in use.\n{}",
+                self.name,
+                self.sid_text,
+                holders.unwrap_or_default()
             );
             // A panic while unwinding would abort the test process.
             if std::thread::panicking() {
