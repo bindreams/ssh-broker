@@ -48,7 +48,17 @@ impl Process {
 
     /// End the process. The handle held here keeps its PID from being reused, so reopening it by
     /// PID for the right to terminate it reaches the same process.
+    ///
+    /// A process that has ended by the time this fails is the goal state, not an error:
+    /// `TerminateProcess` on one is refused with access denied.
     pub fn terminate(&self) -> anyhow::Result<()> {
+        match self.try_terminate() {
+            Err(_) if has_exited(&self.handle) => Ok(()),
+            result => result,
+        }
+    }
+
+    fn try_terminate(&self) -> anyhow::Result<()> {
         // SAFETY: plain value arguments; the handle is owned by `OwnedHandle` from here.
         let handle = unsafe { OpenProcess(PROCESS_TERMINATE, false, self.pid) }
             .map(OwnedHandle)
@@ -56,6 +66,14 @@ impl Process {
         // SAFETY: a live process handle with the right to terminate.
         unsafe { TerminateProcess(handle.0, 1) }.with_context(|| format!("end process {}", self.pid))
     }
+}
+
+/// Whether the process held by `handle` has ended. It can still be listed while some handle on it
+/// is open, with its image and command line unreadable.
+fn has_exited(handle: &OwnedHandle) -> bool {
+    // SAFETY: the handle carries SYNCHRONIZE.
+    let state = unsafe { WaitForSingleObject(handle.0, 0) }; // sleep-ok: zero-timeout state check of a process handle, not a wait
+    state == WAIT_OBJECT_0
 }
 
 /// What an ssh-broker process is, from its command line.
@@ -149,8 +167,11 @@ pub fn background_agents(image: &Path) -> anyhow::Result<Vec<Process>> {
             Err(e) if ours_by_name => return Err(e),
             Err(_) => continue,
         };
-        let role = role_of(&command_line_of(&process)?);
-        candidates.push((process, role));
+        match command_line_of(&process) {
+            Ok(line) => candidates.push((process, role_of(&line))),
+            Err(_) if has_exited(&process.handle) => {}
+            Err(e) => return Err(e),
+        }
     }
     Ok(select_background_agents(candidates.into_iter()).collect())
 }
@@ -239,7 +260,16 @@ fn open_if_image_by(
     let Some(handle) = open_for_waiting(pid)? else {
         return Ok(None);
     };
-    Ok(runs_image(&handle, pid, &wanted, identify)?.then_some(Process { pid, handle }))
+    // Ended but still listed: nothing to wait for, and its image can no longer be read.
+    if has_exited(&handle) {
+        return Ok(None);
+    }
+    match runs_image(&handle, pid, &wanted, identify) {
+        Ok(runs) => Ok(runs.then_some(Process { pid, handle })),
+        // It may have ended since the check above.
+        Err(_) if has_exited(&handle) => Ok(None),
+        Err(e) => Err(e),
+    }
 }
 
 /// Open the process `pid` for waiting and reading; `None` if it has exited.
@@ -304,15 +334,16 @@ pub fn user_agents(image: &Path, user: &Sid) -> anyhow::Result<Vec<Process>> {
         if !runs_image(&handle, pid, &wanted, &file_id)? {
             continue;
         }
-        // SAFETY: the handle carries SYNCHRONIZE.
-        let state = unsafe { WaitForSingleObject(handle.0, 0) }; // sleep-ok: zero-timeout state check of a process handle, not a wait
-        if state == WAIT_OBJECT_0 {
+        if has_exited(&handle) {
             // Ended, but still listed while some handle on it is open. Waiting on it returns at once.
             continue;
         }
         let process = Process { pid, handle };
-        if role_of(&command_line_of(&process)?) != Role::Shim {
-            agents.push(process);
+        match command_line_of(&process) {
+            Ok(line) if role_of(&line) != Role::Shim => agents.push(process),
+            Ok(_) => {}
+            Err(_) if has_exited(&process.handle) => {}
+            Err(e) => return Err(e),
         }
     }
     Ok(agents)

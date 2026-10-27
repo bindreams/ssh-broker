@@ -361,6 +361,40 @@ fn an_agent_that_has_ended_is_not_found_while_a_handle_keeps_it_listed() {
     agent.wait().unwrap();
 }
 
+#[test]
+fn a_process_that_has_ended_but_is_still_held_is_nothing_to_wait_for_not_an_error() {
+    // The snapshot can name a process that ends before it is opened: its image can no longer be
+    // read, and `background_agents` would fail the whole `apply` on it.
+    let copy = NamedCopy::new("held-ended");
+    let mut agent = copy.spawn(&["agent", "--background"]);
+    let held = user_agents(&copy.exe(), &Sid::current_user().unwrap()).unwrap();
+    drop(agent.stdin.take());
+    wait_all_exited(&held, Duration::from_secs(60)).unwrap();
+    assert!(open_if_image(agent.id(), &copy.exe()).unwrap().is_none());
+    agent.wait().unwrap();
+}
+
+#[test]
+fn ending_a_process_that_has_already_ended_is_success() {
+    let mut child = child_until_stdin_closes();
+    let process = open_if_image(child.id(), &cmd_exe()).unwrap().unwrap();
+    drop(child.stdin.take());
+    wait_all_exited(std::slice::from_ref(&process), Duration::from_secs(60)).unwrap();
+    // The handles on it keep it listed; ending it is the goal state already.
+    process.terminate().unwrap();
+    child.wait().unwrap();
+}
+
+#[test]
+fn ending_a_running_process_ends_it() {
+    let mut child = child_until_stdin_closes();
+    let process = open_if_image(child.id(), &cmd_exe()).unwrap().unwrap();
+    process.terminate().unwrap();
+    wait_all_exited(std::slice::from_ref(&process), Duration::from_secs(60)).unwrap();
+    assert_eq!(child.wait().unwrap().code(), Some(1));
+    drop(child.stdin.take());
+}
+
 // the role of an ssh-broker process, from its command line -----
 
 #[test]
