@@ -31,7 +31,8 @@ pub fn end_process(code: i32) -> ! {
 
 struct Ending {
     once: Once,
-    log: Mutex<Option<WorkerGuard>>,
+    /// The log's guard, or whatever stands in for it: only its drop matters.
+    log: Mutex<Option<Box<dyn Send>>>,
 }
 
 impl Ending {
@@ -42,8 +43,8 @@ impl Ending {
         }
     }
 
-    fn keep_log(&self, guard: WorkerGuard) {
-        *self.log.lock().unwrap_or_else(|e| e.into_inner()) = Some(guard);
+    fn keep_log(&self, guard: impl Send + 'static) {
+        *self.log.lock().unwrap_or_else(|e| e.into_inner()) = Some(Box::new(guard));
     }
 
     /// Flush the log and run `leave`, if no caller has begun to; otherwise wait until the one that

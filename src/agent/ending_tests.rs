@@ -1,7 +1,7 @@
 //! Unit tests for the one way the agent's process ends. In-process: nothing here ends the process.
 use super::*;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Barrier, Mutex};
+use std::sync::{Arc, Barrier};
 
 /// Threads that all begin to end the process at once (the logout handler once its drain is over, the
 /// accept loop once it has stopped, the main thread on an error) end it by one path: the end runs once,
@@ -32,44 +32,40 @@ fn threads_that_begin_to_end_the_process_together_end_it_once() {
     assert_eq!(ends.load(Ordering::SeqCst), 1);
 }
 
-/// A file the log writes to, readable by the test while the log still holds it.
-struct SharedBuffer(std::sync::Arc<Mutex<Vec<u8>>>);
+/// Stands in for the log's guard: dropping the real one writes out what is queued, so what matters is
+/// that it is dropped, and before the process is left.
+struct DropFlag(Arc<AtomicBool>);
 
-impl std::io::Write for SharedBuffer {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(bytes);
-        Ok(bytes.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
+impl Drop for DropFlag {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
     }
 }
 
 /// The thread that ends the process is not the one that opened the log (the `logout` handler runs on
-/// a connection's thread; the log belongs to the thread that started the agent). The lines written
-/// before the end are in the log by the time the process is left: the process's exit runs no
-/// destructor, so nothing else would flush the writer's queue.
+/// a connection's thread; the log belongs to the thread that started the agent). The guard is dropped
+/// by the time the process is left: the process's exit runs no destructor, so nothing else would flush
+/// the writer's queue. This fails if the drop is taken out, whatever the writer's timing.
 #[test]
 fn the_log_is_flushed_before_the_process_is_left_by_whichever_thread_ends_it() {
     let ending = Ending::new();
-    let written = std::sync::Arc::new(Mutex::new(Vec::new()));
-    let (mut writer, guard) = tracing_appender::non_blocking(SharedBuffer(written.clone()));
-    ending.keep_log(guard);
-    std::io::Write::write_all(&mut writer, b"the background session has ended\n").unwrap();
+    let dropped = Arc::new(AtomicBool::new(false));
+    ending.keep_log(DropFlag(dropped.clone()));
+    assert!(!dropped.load(Ordering::SeqCst), "keeping the guard must not drop it");
 
-    let seen_when_left = std::thread::scope(|scope| {
+    let dropped_when_left = std::thread::scope(|scope| {
         scope
             .spawn(|| {
-                let mut seen = Vec::new();
-                ending.end(|| seen = written.lock().unwrap().clone());
+                let mut seen = None;
+                ending.end(|| seen = Some(dropped.load(Ordering::SeqCst)));
                 seen
             })
             .join()
             .unwrap()
     });
     assert_eq!(
-        String::from_utf8(seen_when_left).unwrap(),
-        "the background session has ended\n"
+        dropped_when_left,
+        Some(true),
+        "the guard was still alive when the process was left"
     );
 }
