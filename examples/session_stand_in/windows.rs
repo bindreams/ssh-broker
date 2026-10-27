@@ -12,6 +12,8 @@ use windows::core::PCWSTR;
 
 #[path = "../../tests/common/file_signal.rs"]
 mod file_signal;
+#[path = "hosted_console.rs"]
+mod hosted_console;
 #[path = "../../tests/common/password.rs"]
 mod password;
 
@@ -163,16 +165,18 @@ fn probe() {
     );
 }
 
-/// Host `command` in a pseudoconsole, the way the agent hosts a shell: input arrives on stdin as
+/// Host `command` in a pseudoconsole, the way sshd hosts the shim: input arrives on stdin as
 /// win32-input-mode key sequences, output leaves on stdout, and the exit code is the command's. The
 /// caller starts this as an account's network token, so `command` (the shim) runs as that account
-/// on a console of its own.
+/// on a console of its own. The command runs in a kill-on-close job that allows breakaway, which is the
+/// job it has under sshd (M8), and the job closes when this process ends, as sshd's does with the
+/// session.
 fn pty(cwd: &Path, command: &str) {
     use std::io::{Read, Write};
 
-    let mut session =
-        ssh_broker::conpty::PtySession::spawn(command, 80, 25, Some(cwd)).expect("start the pseudoconsole");
-    let (in_raw, out_raw) = (session.in_write_raw(), session.out_read_raw());
+    let job = hosted_console::job::KillOnCloseJob::create_allowing_breakaway();
+    let mut console = hosted_console::HostedConsole::start(command, cwd, &job).expect("start the pseudoconsole");
+    let (in_raw, out_raw) = (console.in_write.raw(), console.out_read.raw());
     std::thread::spawn(move || {
         let mut stdin = std::io::stdin();
         let mut buf = [0u8; 4096];
@@ -197,10 +201,12 @@ fn pty(cwd: &Path, command: &str) {
             }
         }
     });
-    let code = session.wait().unwrap_or(1);
+    let code = console.wait();
     // Closing the pseudoconsole delivers its buffered tail and ends the output thread.
-    session.close_pty();
+    console.close();
     let _ = output.join();
+    // Process exit closes the job, which ends what is still in it; a logon child that broke away stays.
+    drop(job);
     std::process::exit(code);
 }
 

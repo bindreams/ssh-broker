@@ -129,6 +129,20 @@ fn leave(run: &mut PtyRun) {
     run.finish();
 }
 
+/// The consoles of these tests run the shim in the job it has under sshd (kill-on-close with breakaway
+/// allowed, `LimitFlags` 0x2800 = 10240; measured by `real_sshd_windows`), so that what a console's end
+/// does to the agent is what a session's end does under sshd. Read from the shim's own log, so call it
+/// once the consoles have left.
+fn assert_shim_ran_in_sshds_job(account: &Account) {
+    let location = socket_loc::for_profile(account.profile()).unwrap();
+    let logs = stand_in::read_logs(&location);
+    assert!(
+        logs.contains("logon call: caller's job Limits(10240)"),
+        "the shim did not run in a job like sshd's (kill-on-close, breakaway allowed); its logs:
+{logs}"
+    );
+}
+
 /// Elevated (CI only).
 #[test]
 fn prompt_then_password_relays_into_a_background_session() {
@@ -156,6 +170,7 @@ fn prompt_then_password_relays_into_a_background_session() {
     );
     run.read_until("link-ok");
     leave(&mut run);
+    assert_shim_ran_in_sshds_job(&account);
 }
 
 /// Elevated (CI only). Review Focus 5: no `ProfileList` entry yet, and the first logon creates one.
@@ -420,7 +435,9 @@ fn two_simultaneous_first_connections_end_with_one_agent_and_no_hang() {
     for run in &mut runs {
         leave(run);
     }
-    // The agent outlives its connections: the loser of the start race is the one that went.
+    // The agent outlives its connections (U1B.md: it lives until logout, restart or upgrade). The shims
+    // ran in sshd's job, so the end of a console is the end of an sshd session.
+    assert_shim_ran_in_sshds_job(&account);
     if let Some(code) = agent.exit_code() {
         panic!(
             "{}",

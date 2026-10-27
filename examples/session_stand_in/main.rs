@@ -8,8 +8,9 @@
 //! - `agent --background --expect-user <sid>`: what `start_background_agent` starts. Records who it
 //!   runs as in `agent.info`, makes its socket folder and writes the `serving` marker, then, if
 //!   `agent.plan` exists, waits for the file `agent.go` and writes the file `agent.ack`.
-//! - `pty <dir> <command line>`: hosts the command (the real shim) in a pseudoconsole, the way the agent
-//!   hosts a shell, reading key sequences on stdin and writing the console on stdout.
+//! - `pty <dir> <command line>`: hosts the command (the real shim) in a pseudoconsole, in the job sshd keeps
+//!   its session in (kill-on-close, breakaway allowed), reading key sequences on stdin and writing the
+//!   console on stdout.
 //! - `connect <socket> <result file>`: connects to an AF_UNIX socket and writes the outcome to the file.
 //! - `shim <dir>`: a stand-in for the shim under sshd. Reads `shim.input` (the account's password, the
 //!   agent exe), starts the agent through the logon, waits for the agent's marker with the product's

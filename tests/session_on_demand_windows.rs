@@ -232,7 +232,7 @@ fn logon_child_survives_the_callers_job_closing_where_breakaway_is_allowed() {
             shim,
             had_waited,
         } => panic!(
-            "M3: the logon child ended with its caller's job although the job allows breakaway and the logon asked              for it: exit code {child:#x} (the caller's: {shim:#x}); it had recorded that it was waiting: {had_waited}"
+            "M3: the logon child ended with its caller's job although the job allows breakaway and the logon asked for it: exit code {child:#x} (the caller's: {shim:#x}); it had recorded that it was waiting: {had_waited}"
         ),
     }
 }
