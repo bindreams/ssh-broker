@@ -2,12 +2,9 @@
 //!
 //! Included by `account.rs`. A hive stays loaded while a logon session of the account lives, and a
 //! session lives while some process holds a handle on one of its tokens (or on a process that has one).
-//! [`report`] names both: the logon sessions of the account that still exist, and the processes that hold
-//! a handle on its registry keys, found with Sysinternals `handle.exe` (the CI job fetches it and sets
-//! `SB_HANDLE_EXE`).
+//! [`report`] names the logon sessions of the account that still exist.
 #![allow(dead_code)]
 
-use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use windows::Win32::Foundation::{HLOCAL, LUID, LocalFree};
@@ -18,17 +15,9 @@ use windows::Win32::Security::Authentication::Identity::{
 use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
 use windows::core::PWSTR;
 
-/// The variable the CI job sets to the path of `handle64.exe`.
-pub const HANDLE_EXE_VARIABLE: &str = "SB_HANDLE_EXE";
-
-/// The logon sessions that exist for the account `sid_text` (SDDL form) and the processes with a handle
-/// on a registry key of it, as text for a failure message.
+/// The logon sessions that exist for the account `sid_text` (SDDL form), as text for a failure message.
 pub fn report(sid_text: &str) -> String {
-    format!(
-        "logon sessions of the account:\n{}\nhandles on its registry keys (handle.exe):\n{}",
-        logon_sessions(sid_text),
-        handles(sid_text)
-    )
+    format!("logon sessions of the account:\n{}", logon_sessions(sid_text))
 }
 
 fn logon_sessions(sid_text: &str) -> String {
@@ -121,25 +110,4 @@ unsafe fn lsa_string(text: &LSA_UNICODE_STRING) -> String {
     }
     // SAFETY: `Length` bytes of UTF-16 at `Buffer`.
     String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(text.Buffer.0, usize::from(text.Length) / 2) })
-}
-
-/// The output of `handle.exe -a` filtered on the account's SID: the processes that hold a handle on
-/// `HKU\<sid>` or its `_Classes`, or on anything else named with the SID.
-fn handles(sid_text: &str) -> String {
-    let Some(exe) = std::env::var_os(HANDLE_EXE_VARIABLE) else {
-        return format!(
-            "  not measured: {HANDLE_EXE_VARIABLE} is not set (the CI job fetches handle64.exe and sets it)"
-        );
-    };
-    match Command::new(&exe)
-        .args(["-accepteula", "-nobanner", "-a", sid_text])
-        .output()
-    {
-        Ok(out) => format!(
-            "{}{}",
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        ),
-        Err(e) => format!("  could not run {}: {e}", exe.to_string_lossy()),
-    }
 }

@@ -22,6 +22,15 @@ default-filter = 'not (binary(session_on_demand_windows) & test(/^logon_with_sec
 # timed out.
 slow-timeout = { period = "120s", terminate-after = 5, grace-period = "1s" }
 
+# A test that makes an account ends it in its teardown, which on a hive that stays loaded waits
+# `UNLOAD_BOUND` (120 s) up to three times (`end` in `log_out`, `end` in `LogOutOnDrop::drop`,
+# `profile::remove`) and up to `LOGOFF_EVENT_BOUND` (180 s) for the logoff event: 540 s after the test
+# body. The default 600 s would end such a test in the middle of its teardown, lose the message and
+# leave the account and its profile. These binaries get the default plus that teardown: 10 x 120 s.
+[[profile.ci.overrides]]
+filter = 'binary(auto_login_windows) | binary(prompt_path_windows) | binary(real_sshd_windows) | binary(session_on_demand_windows) | binary(upgrade_windows) | binary(user_isolation_windows)'
+slow-timeout = { period = "120s", terminate-after = 10, grace-period = "1s" }
+
 # The real-sshd test measures things the plan has never seen (the shim's session, logon type and job under
 # sshd): its output is the result, so a passing run prints it too.
 [[profile.ci.overrides]]
