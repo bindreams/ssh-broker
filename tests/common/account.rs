@@ -4,13 +4,16 @@
 //! The including test crate declares `bounded_wait`, `desktop` and `hard_errors` beside this module.
 #![allow(dead_code)]
 
+#[path = "profile.rs"]
+mod profile;
+
 use std::os::windows::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use ssh_broker::acl::Sid;
 use ssh_broker::winutil::OwnedHandle;
-use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, HANDLE};
+use windows::Win32::Foundation::HANDLE;
 use windows::Win32::NetworkManagement::NetManagement::{
     NetUserAdd, NetUserDel, NetUserSetInfo, UF_DONT_EXPIRE_PASSWD, UF_SCRIPT, USER_ACCOUNT_FLAGS, USER_INFO_1,
     USER_INFO_1003, USER_PRIV_USER,
@@ -24,8 +27,8 @@ use windows::Win32::System::Threading::{
     CreateProcessWithTokenW, GetCurrentProcess, OpenProcessToken, PROCESS_INFORMATION, ResumeThread,
     STARTF_USESTDHANDLES, STARTUPINFOW, TerminateProcess,
 };
-use windows::Win32::UI::Shell::{CreateProfile, DeleteProfileW};
-use windows::core::{HRESULT, PCWSTR, PWSTR};
+use windows::Win32::UI::Shell::CreateProfile;
+use windows::core::{PCWSTR, PWSTR};
 
 pub fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(std::iter::once(0)).collect()
@@ -532,20 +535,26 @@ impl Drop for Account {
             eprintln!("processes of {} that could not be ended: {left:?}", self.name);
         }
         // Always, not only for an account made with a profile: a logon with `LOGON_WITH_PROFILE` makes the
-        // profile of an account that had none, and a profile left behind fills the runner's disk (CI round
-        // 12). An account that has none answers "not found".
-        // SAFETY: NUL-terminated inputs.
-        let deleted = unsafe { DeleteProfileW(PCWSTR(wide(&self.sid_text).as_ptr()), PCWSTR::null(), PCWSTR::null()) };
-        if let Err(e) = deleted
-            && e.code() != HRESULT::from_win32(ERROR_FILE_NOT_FOUND.0)
-        {
-            eprintln!(
-                "the profile of {} was not deleted and stays on the disk: {e}",
-                self.name
-            );
-        }
+        // profile of an account that had none. The system unloads the profile a moment after the account's
+        // last process has exited, so this waits for that (CI round 14: a delete right after the exit failed
+        // with "in use" and the profile, about 1.3 GB, stayed).
+        let removed = profile::remove(&self.sid_text);
         // SAFETY: NUL-terminated inputs.
         let _ = unsafe { NetUserDel(PCWSTR::null(), PCWSTR(wide(&self.name).as_ptr())) };
+        if let Err(why) = removed {
+            let message = format!(
+                "the profile of {} ({}) was not deleted and stays on the disk: {why}. Processes of the account that \
+                 could not be ended: {left:?}. A handle this test process still holds on a process of the account \
+                 also keeps its logon session, and so its profile, in use.",
+                self.name, self.sid_text
+            );
+            // A panic while unwinding would abort the test process.
+            if std::thread::panicking() {
+                eprintln!("{message}");
+            } else {
+                panic!("{message}");
+            }
+        }
     }
 }
 

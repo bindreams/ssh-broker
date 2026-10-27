@@ -131,10 +131,13 @@ struct Scene {
     broker: &'static Path,
     installed: PathBuf,
     kit: Kit,
-    auto: Account,
     /// The processes of the auto-login agent before the upgrade.
     before: Vec<u32>,
     session: BackgroundAgent,
+    // Fields drop in order, and an account's profile stays in use while this test holds a handle on a process
+    // of the account: `session` is the prompt-path agent of `prompted`, so `prompted` comes after it.
+    _prompted: Account,
+    auto: Account,
     _install: Install,
 }
 
@@ -187,9 +190,10 @@ fn scene() -> Scene {
         broker,
         installed,
         kit,
-        auto,
         before,
         session,
+        _prompted: prompted,
+        auto,
         _install: install,
     }
 }
@@ -223,8 +227,12 @@ impl Scene {
             std::thread::yield_now();
         }
     }
+}
 
-    fn end_auto_login(&self) {
+impl Drop for Scene {
+    /// The auto-login task is removed before the account goes, whether the test passed or not: a task left
+    /// behind starts the agent again as the account, and its session holds the profile.
+    fn drop(&mut self) {
         let _ = autologin::off(
             &mut WindowsEnv::new(PasswordSource::Given(None)),
             &local_account(&self.auto),
@@ -314,7 +322,6 @@ fn apply_upgrade_that_fails_on_a_held_exe_still_restarts_auto_login() {
 
     // SAFETY: a valid process handle; ending a shim that already ended is harmless.
     let _ = unsafe { TerminateProcess(shim.process.0, 1) };
-    scene.end_auto_login();
 }
 
 /// Elevated (CI only). The upgrade that succeeds: nothing holds the installed exe (no SSH session is
@@ -356,5 +363,4 @@ fn apply_upgrade_that_succeeds_ends_a_background_session_and_restarts_auto_login
         !Path::new(provision::BASE_DIR).join("sessions-to-enable.txt").exists(),
         "apply left its record of tasks it owes after enabling them"
     );
-    scene.end_auto_login();
 }

@@ -1,4 +1,6 @@
-# Print the free space of the runner's drives and the size of what the tests fill them with.
+# Print the free space of the runner's drives and the size of what the tests fill them with, then fail if a
+# test account's profile is left (a folder `sb*` in the users root or a profile-list entry for one). Every test removes
+# its account's profile, so one that stays is a leak (CI round 14: 1.3 GB each filled the disk).
 # Usage: disk-report.ps1 <label>. CI only; it changes nothing.
 param([Parameter(Mandatory)][string]$Label)
 
@@ -38,6 +40,14 @@ foreach ($profile in $profiles) {
         Measure-Object -Property Length -Sum).Sum
 }
 Write-Output ('{0}*: {1} folders, {2:N2} GB' -f $prefix, $count, ($total / 1GB))
-Write-Output ('profile list entries under {0}*: {1}' -f $prefix, @(
+$entries = @(
     Get-ChildItem 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList' -ErrorAction SilentlyContinue |
-        Where-Object { (Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue).ProfileImagePath -like "$prefix*" }).Count)
+        Where-Object { (Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue).ProfileImagePath -like "$prefix*" })
+Write-Output ('profile list entries under {0}*: {1}' -f $prefix, $entries.Count)
+
+if ($count -ne 0 -or $entries.Count -ne 0) {
+    Write-Output ('test account profiles are left after "{0}":' -f $Label)
+    $profiles | ForEach-Object { Write-Output ('  folder {0}' -f $_.FullName) }
+    $entries | ForEach-Object { Write-Output ('  profile list entry {0}' -f (Get-ItemProperty $_.PSPath).ProfileImagePath) }
+    exit 1
+}
