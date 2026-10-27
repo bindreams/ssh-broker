@@ -214,10 +214,14 @@ impl Seen {
 
 /// How long the pseudoconsole's output pipe may take to fill, how long the refused shell may take to
 /// end, and how long the test may take. Failure bounds on external events (a shell, conhost) that
-/// might never come, well inside nextest's limit; the test takes seconds when it works.
+/// might never come, well inside nextest's limit; the test takes seconds when it works. The test's
+/// bound is the other two plus a margin, so the failing wait's own message prints before the watchdog
+/// aborts the process.
 const FILL_BOUND: std::time::Duration = std::time::Duration::from_secs(60);
 const SHELL_END_BOUND: std::time::Duration = std::time::Duration::from_secs(60);
-const TEST_BOUND: std::time::Duration = std::time::Duration::from_secs(120);
+const REPORT_MARGIN: std::time::Duration = std::time::Duration::from_secs(30);
+const TEST_BOUND: std::time::Duration =
+    std::time::Duration::from_secs(FILL_BOUND.as_secs() + SHELL_END_BOUND.as_secs() + REPORT_MARGIN.as_secs());
 
 /// A login that loses the race with the end, while its shell is writing without end into a
 /// pseudoconsole whose output pipe is full and which nothing reads: the refusal has to close the
