@@ -7,7 +7,7 @@
 #[path = "hive.rs"]
 pub mod hive;
 #[path = "holders.rs"]
-mod holders;
+pub mod holders;
 #[path = "profile.rs"]
 pub mod profile;
 
@@ -87,6 +87,27 @@ pub fn next_account_name(tag: &str) -> String {
     )
 }
 
+/// How a service logged the account on: the logons whose hive Windows keeps loaded after the product's
+/// `logout`, as it does for a user who logged in at the console (owner, 2026-10-27; CI rounds 19 and 20).
+/// A test says which one it started, and what it checks at the end of the session follows from it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ServiceLogon {
+    /// A Task Scheduler task with a stored password (`auto-login on`): a Batch logon, whose session
+    /// Windows sometimes keeps although no process of it is left.
+    TaskScheduler,
+    /// sshd's logon of an SSH connection.
+    Sshd,
+}
+
+impl std::fmt::Display for ServiceLogon {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            ServiceLogon::TaskScheduler => "Task Scheduler",
+            ServiceLogon::Sshd => "sshd",
+        })
+    }
+}
+
 /// A throwaway local account, removed (profile first) when dropped.
 pub struct Account {
     pub name: String,
@@ -94,6 +115,8 @@ pub struct Account {
     pub sid: Sid,
     pub sid_text: String,
     pub profile: Option<PathBuf>,
+    /// Set by the test that has a service log the account on, see [`Account::started_by`].
+    service_logon: std::sync::OnceLock<ServiceLogon>,
 }
 
 impl Account {
@@ -171,6 +194,7 @@ impl Account {
             sid,
             sid_text,
             profile: None,
+            service_logon: std::sync::OnceLock::new(),
         };
         if with_profile {
             let mut buf = [0u16; 260];
@@ -286,12 +310,29 @@ impl Account {
         OwnedHandle(token)
     }
 
-    /// The profile `CreateProfile` made. Panics for an account made without one.
+    /// Say that the test has `how` log the account on. The account's teardown then does not require the
+    /// profile to be deletable (see [`profile::remove_or_clear`]). An account the test logs on by secondary
+    /// logon (`run`, `spawn_with`, the prompt path) is not declared: Windows releases those.
+    pub fn started_by(&self, how: ServiceLogon) {
+        let declared = self.service_logon.get_or_init(|| how);
+        assert_eq!(
+            *declared, how,
+            "{} was declared as logged on by {declared} and now by {how}",
+            self.name
+        );
+    }
+
+    /// How a service logged the account on, if the test said so.
+    pub fn service_logon(&self) -> Option<ServiceLogon> {
+        self.service_logon.get().copied()
+    }
+
     /// The profile folder, if the account was made with one.
     pub fn try_profile(&self) -> Option<&Path> {
         self.profile.as_deref()
     }
 
+    /// The profile `CreateProfile` made. Panics for an account made without one.
     pub fn profile(&self) -> &Path {
         self.profile.as_deref().expect("this account has no profile")
     }
@@ -539,13 +580,19 @@ impl Drop for Account {
             eprintln!("processes of {} that could not be ended: {left:?}", self.name);
         }
         // Always, not only for an account made with a profile: a logon with `LOGON_WITH_PROFILE` makes the
-        // profile of an account that had none. The system unloads the profile a moment after the account's
-        // last process has exited, so this waits for that (CI round 14: a delete right after the exit failed
-        // with "in use" and the profile, about 1.3 GB, stayed).
-        let removed = profile::remove(&self.sid_text);
+        // profile of an account that had none. After a secondary logon the system unloads the profile a moment
+        // after the account's last process has exited, so this waits for that (CI round 14: a delete right
+        // after the exit failed with "in use" and the profile, about 1.3 GB, stayed). After a service's logon
+        // Windows keeps the hive loaded (see `profile`), so there the profile is deleted if Windows allows it,
+        // and else cleared of what can be deleted.
+        let removed = match self.service_logon.get() {
+            None => profile::remove(&self.sid_text).map(|()| None),
+            Some(how) => profile::remove_or_clear(&self.sid_text, self.profile.as_deref()).map(|r| Some((*how, r))),
+        };
         // Measured before the account is deleted, while whatever holds the profile still does. A hive that stays
-        // loaded is not unloaded by hand: `RegUnLoadKey` is refused (CI round 17). The tests end a background
-        // session with its `logout` first (see `session_end`), which is what lets the system unload it.
+        // loaded is not unloaded by hand: `RegUnLoadKey` is refused (CI round 17). A test ends a background
+        // session with its `logout` first (see `session_end`), which is what lets the system unload the hive
+        // of a secondary logon.
         let holders = removed.as_ref().err().map(|_| {
             format!(
                 "ProfileList: {}\n{}",
@@ -555,6 +602,12 @@ impl Drop for Account {
         });
         // SAFETY: NUL-terminated inputs.
         let _ = unsafe { NetUserDel(PCWSTR::null(), PCWSTR(wide(&self.name).as_ptr())) };
+        if let Ok(Some((how, removal))) = &removed {
+            hive::record(&format!(
+                "session end [account removed] {} ({}), logged on by {how}: {removal}; the account is deleted",
+                self.name, self.sid_text
+            ));
+        }
         if let Err(why) = removed {
             let message = format!(
                 "the profile of {} ({}) was not deleted and stays on the disk: {why}. Processes of the account that \

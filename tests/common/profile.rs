@@ -1,13 +1,21 @@
 //! Deleting a test account's profile once nothing holds it any more. **CI only.**
 //!
 //! Included by `account.rs`. A profile is deleted by `DeleteProfileW`, which answers
-//! `ERROR_SHARING_VIOLATION` while the account's registry hive is loaded. The hive is unloaded by the
-//! system, after the last process of the account has exited and the last handle on one of its tokens is
-//! closed, and that happens a moment after the exit (CI round 14: most profiles stayed). So the delete
-//! is retried until it succeeds, woken by a change of the subkeys of `HKEY_USERS` (a hive being unloaded
-//! is one), and a profile that stays loaded fails the test.
+//! `ERROR_SHARING_VIOLATION` while the account's registry hive is loaded. After a secondary logon the hive
+//! is unloaded by the system, after the last process of the account has exited and the last handle on one
+//! of its tokens is closed, and that happens a moment after the exit (CI round 14: most profiles stayed).
+//! So [`remove`] retries the delete until it succeeds, woken by a change of the subkeys of `HKEY_USERS` (a
+//! hive being unloaded is one), and a profile that stays loaded fails the test.
+//!
+//! After a Task Scheduler or sshd logon Windows keeps the hive loaded for as long as it was measured (40
+//! min; an sshd restart does not release it; CI rounds 19 and 20), as it does for a user who logged in at
+//! the console. Owner, 2026-10-27: that is Windows' behaviour and not a defect. [`remove_or_clear`] is for
+//! those accounts: it deletes the profile when Windows allows it, and otherwise deletes what can be deleted
+//! of the profile folder (the hive's files stay), so that the disk does not fill.
 #![allow(dead_code)]
 
+use std::os::windows::fs::FileTypeExt;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use ssh_broker::winutil::OwnedHandle;
@@ -54,6 +62,152 @@ pub fn remove(sid_text: &str) -> Result<(), String> {
             Err(e) => return Err(format!("{e}; {}", hive_state(sid_text))),
         }
     }
+}
+
+/// What [`remove_or_clear`] did.
+pub enum Removal {
+    /// The profile is deleted (or there was none).
+    Deleted,
+    /// The hive is loaded, so Windows refuses to delete the profile; the folder was cleared of what could be
+    /// deleted.
+    HiveLoaded(Cleared),
+}
+
+/// What is left of a profile folder after [`clear_folder`].
+pub struct Cleared {
+    pub folder: PathBuf,
+    /// Files and links deleted.
+    pub removed: u64,
+    /// What could not be deleted, each with the reason (the loaded hive's files are among them).
+    pub kept: Vec<String>,
+}
+
+impl std::fmt::Display for Removal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Removal::Deleted => f.write_str("the profile was deleted"),
+            Removal::HiveLoaded(cleared) => {
+                const SHOWN: usize = 6;
+                write!(
+                    f,
+                    "the hive is still loaded, so the profile stays: {} had {} files deleted, {} entries stayed",
+                    cleared.folder.display(),
+                    cleared.removed,
+                    cleared.kept.len()
+                )?;
+                if !cleared.kept.is_empty() {
+                    let shown: Vec<&str> = cleared.kept.iter().take(SHOWN).map(String::as_str).collect();
+                    write!(f, " ({}", shown.join("; "))?;
+                    if cleared.kept.len() > SHOWN {
+                        write!(f, "; and {} more", cleared.kept.len() - SHOWN)?;
+                    }
+                    f.write_str(")")?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+/// [`remove`] for an account whose logon Windows may keep the hive of (Task Scheduler's, sshd's): one
+/// delete, no wait for the hive. If Windows refuses because the hive is loaded, `folder` (the profile
+/// folder, if the account has one) is cleared of what can be deleted. Any other refusal is [`remove`]'s.
+pub fn remove_or_clear(sid_text: &str, folder: Option<&Path>) -> Result<Removal, String> {
+    match delete(sid_text) {
+        Ok(()) => return Ok(Removal::Deleted),
+        Err(e) if e.code() == HRESULT::from_win32(ERROR_FILE_NOT_FOUND.0) => return Ok(Removal::Deleted),
+        Err(e) if e.code() == HRESULT::from_win32(ERROR_SHARING_VIOLATION.0) => {
+            let loaded = hive_loaded(sid_text) == Ok(true) || hive_loaded(&format!("{sid_text}_Classes")) == Ok(true);
+            if loaded {
+                let folder = folder.ok_or_else(|| {
+                    format!(
+                        "{e}; the hive is loaded and the account has no profile folder to clear of what can be deleted"
+                    )
+                })?;
+                return Ok(Removal::HiveLoaded(clear_folder(folder)?));
+            }
+        }
+        Err(_) => {}
+    }
+    remove(sid_text).map(|()| Removal::Deleted)
+}
+
+/// Delete every file, link and folder under the profile folder `root` that can be deleted, and not
+/// `root` itself. Links are removed, never followed. Refuses a folder whose name does not start with `sb`,
+/// as every test account's profile does, so that a wrong path cannot cost anything else.
+pub fn clear_folder(root: &Path) -> Result<Cleared, String> {
+    let named_for_a_test_account = root
+        .file_name()
+        .is_some_and(|name| name.to_string_lossy().starts_with("sb"));
+    if !named_for_a_test_account {
+        return Err(format!(
+            "{} is not named like a test account's profile folder (sb...), so it was not cleared",
+            root.display()
+        ));
+    }
+    let mut cleared = Cleared {
+        folder: root.to_owned(),
+        removed: 0,
+        kept: Vec::new(),
+    };
+    clear_inside(root, &mut cleared);
+    Ok(cleared)
+}
+
+fn clear_inside(dir: &Path, cleared: &mut Cleared) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) => {
+            cleared.kept.push(format!("{}: {e}", dir.display()));
+            return;
+        }
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                cleared.kept.push(format!("{}: {e}", dir.display()));
+                continue;
+            }
+        };
+        let path = entry.path();
+        let kind = match entry.file_type() {
+            Ok(kind) => kind,
+            Err(e) => {
+                cleared.kept.push(format!("{}: {e}", path.display()));
+                continue;
+            }
+        };
+        let outcome = if kind.is_symlink_dir() {
+            // A junction or directory symlink: the link goes, what it points at is not touched.
+            std::fs::remove_dir(&path)
+        } else if kind.is_dir() {
+            let before = cleared.kept.len();
+            clear_inside(&path, cleared);
+            // Something kept inside it has been named already.
+            if cleared.kept.len() != before {
+                continue;
+            }
+            std::fs::remove_dir(&path)
+        } else {
+            remove_file(&path)
+        };
+        match outcome {
+            Ok(()) => cleared.removed += 1,
+            Err(e) => cleared.kept.push(format!("{}: {e}", path.display())),
+        }
+    }
+}
+
+fn remove_file(path: &Path) -> std::io::Result<()> {
+    std::fs::remove_file(path).or_else(|first| {
+        // A read-only file is not deleted until it is made writable.
+        let mut permissions = std::fs::metadata(path).map_err(|_| first)?.permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        permissions.set_readonly(false);
+        std::fs::set_permissions(path, permissions)?;
+        std::fs::remove_file(path)
+    })
 }
 
 pub(super) fn delete(sid_text: &str) -> windows::core::Result<()> {
@@ -110,7 +264,7 @@ pub fn wait_unloaded(sid_text: &str) -> Result<Unload, String> {
 }
 
 /// Whether `HKEY_USERS\<sid>` (the loaded hive) and its classes hive are present, as text.
-fn hive_state(sid_text: &str) -> String {
+pub fn hive_state(sid_text: &str) -> String {
     let state = |subkey: String| match hive_loaded(&subkey) {
         Ok(true) => "loaded".to_string(),
         Ok(false) => "not loaded".to_string(),

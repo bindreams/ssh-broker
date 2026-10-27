@@ -274,21 +274,47 @@ pub const SERVING_BOUND: std::time::Duration = std::time::Duration::from_secs(18
 /// an agent that neither listens nor ends fails it after [`SERVING_BOUND`], an external event that
 /// may never come.
 pub fn wait_for_serving_marker(location: &SocketLocation, agent: HANDLE) {
-    wait_for_marker(location, Some(agent), SERVING_BOUND)
+    wait_for_marker(location, Some(agent), SERVING_BOUND, &|| {
+        location.serving_marker_path().is_file()
+    })
 }
 
 /// [`wait_for_serving_marker`] for an agent that no handle is held on (a scheduled task starts it):
 /// the start is an external event that may never come, so the wait has a failure bound and its
 /// expiry fails the test saying so.
 pub fn wait_for_serving_marker_of_a_task(location: &SocketLocation, bound: std::time::Duration) {
-    wait_for_marker(location, None, bound)
+    wait_for_marker(location, None, bound, &|| location.serving_marker_path().is_file())
 }
 
-fn wait_for_marker(location: &SocketLocation, agent: Option<HANDLE>, bound: std::time::Duration) {
+/// The text of the `serving` marker (`<pid> <time>\n`), if it exists.
+pub fn serving_marker_text(location: &SocketLocation) -> Option<String> {
+    std::fs::read_to_string(location.serving_marker_path()).ok()
+}
+
+/// [`wait_for_serving_marker_of_a_task`] for a start after an earlier agent has served and ended: the earlier
+/// agent's marker stays in the folder, so this waits for one whose text is not `previous` (the text
+/// [`serving_marker_text`] gave after that agent ended). A marker still being written has no line end yet and
+/// does not count.
+pub fn wait_for_new_serving_marker_of_a_task(
+    location: &SocketLocation,
+    previous: Option<&str>,
+    bound: std::time::Duration,
+) {
+    wait_for_marker(location, None, bound, &|| {
+        serving_marker_text(location).is_some_and(|text| text.ends_with('\n') && Some(text.as_str()) != previous)
+    })
+}
+
+fn wait_for_marker(
+    location: &SocketLocation,
+    agent: Option<HANDLE>,
+    bound: std::time::Duration,
+    is_ready: &dyn Fn() -> bool,
+) {
     // The socket folder, and the profile above it, may not exist yet: the watch follows the path down.
     let mut watch = SocketWatch::for_location(location).unwrap_or_else(|e| panic!("{e:#}"));
     loop {
-        if location.serving_marker_path().is_file() {
+        if is_ready() {
             return;
         }
         let handles: Vec<HANDLE> = std::iter::once(watch.handle()).chain(agent).collect();
@@ -305,7 +331,7 @@ fn wait_for_marker(location: &SocketLocation, agent: Option<HANDLE>, bound: std:
             );
         } else if let Some(agent) = agent {
             // The agent may have written the marker as its last act.
-            if location.serving_marker_path().is_file() {
+            if is_ready() {
                 return;
             }
             let mut code = 0u32;

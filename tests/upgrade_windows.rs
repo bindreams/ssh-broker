@@ -41,7 +41,7 @@ mod session_end;
 #[path = "common/stand_in.rs"]
 mod stand_in;
 
-use account_fixture::Account;
+use account_fixture::{Account, ServiceLogon};
 use agent_conn::{BackgroundAgent, local_account};
 use stand_in::Kit;
 
@@ -171,7 +171,7 @@ fn scene() -> Scene {
     // An auto-login session, from a task, running the installed exe.
     let auto = Account::create("up1", true);
     auto.grant_batch_logon_right();
-    let end_auto = session_end::LogOutOnDrop::new(&installed, &auto);
+    let end_auto = session_end::LogOutOnDrop::new(&installed, &auto, ServiceLogon::TaskScheduler);
     autologin::on(
         &mut WindowsEnv::new(PasswordSource::Given(Some(password::password(&auto.password)))),
         &local_account(&auto),

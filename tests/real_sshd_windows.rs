@@ -42,7 +42,7 @@ mod session_end;
 #[path = "common/stand_in.rs"]
 mod stand_in;
 
-use account_fixture::Account;
+use account_fixture::{Account, ServiceLogon};
 use stand_in::Kit;
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -448,7 +448,7 @@ fn prompt_path_through_real_sshd() {
     let kit = Kit::broker_with_helper("sshd");
     let account = Account::create("sshd", true);
     // The session is ended with `logout` before the account goes, passing or failing (see `session_end`).
-    let _end = session_end::LogOutOnDrop::new(&kit.exe, &account);
+    let _end = session_end::LogOutOnDrop::new(&kit.exe, &account, ServiceLogon::Sshd);
     let login = Login::new(&kit, &account);
 
     // 1. What the shim runs in under sshd: the probe is the DefaultShell for one command.
@@ -505,7 +505,7 @@ fn prompt_path_through_real_sshd() {
 /// prompts and logs on, both end in the same session's shell, neither hangs, and the session outlives both.
 fn two_simultaneous_first_connections(kit: &Kit) {
     let account = Account::create("sshd2", true);
-    let _end = session_end::LogOutOnDrop::new(&kit.exe, &account);
+    let _end = session_end::LogOutOnDrop::new(&kit.exe, &account, ServiceLogon::Sshd);
     let login = Login::new(kit, &account);
 
     let mut sessions = [login.start(), login.start()];

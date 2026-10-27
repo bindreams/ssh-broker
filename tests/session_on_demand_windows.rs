@@ -695,9 +695,9 @@ fn logon_session_is_logged_off_after_logout() {
         "M6: logon session {id:#x} still present: no 4634 although every process of it has ended"
     );
 
-    // The product's own end of a session leaves nothing that keeps the profile loaded (CI round 17 measured it
-    // for this seclogon session; the auto-login path asserts the same in `session_end`). The line goes to the
-    // measurement file CI prints, pass or fail.
+    // The product's own end of a secondary-logon session leaves nothing that keeps the profile loaded (CI round
+    // 17 measured it; Windows does keep the hive of a Task Scheduler or sshd logon, which `session_end` does not
+    // ask to unload). The line goes to the measurement file CI prints, pass or fail.
     let unloaded = account_fixture::profile::wait_unloaded(&account.sid_text);
     account_fixture::hive::record(&format!(
         "after the product's logout and the logoff of session {id:#x}, {} ({}): hive {}; ProfileList {}",

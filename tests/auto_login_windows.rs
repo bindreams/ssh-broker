@@ -8,6 +8,8 @@
 //! `WindowsEnv::with_exe_unchecked`).
 #![cfg(windows)]
 
+use std::collections::BTreeSet;
+
 use ssh_broker::account::LocalAccount;
 use ssh_broker::autologin::{self, PasswordSource, WindowsEnv};
 use ssh_broker::provision::session_task::{task_name, task_problem};
@@ -41,7 +43,7 @@ mod system_task;
 #[path = "common/task_instances.rs"]
 mod task_instances;
 
-use account_fixture::Account;
+use account_fixture::{Account, ServiceLogon, holders};
 use agent_conn::{AgentConn, local_account};
 use stand_in::Kit;
 
@@ -74,12 +76,13 @@ fn with_session(kit: &Kit, account: &Account, check: impl FnOnce(&mut dyn FnMut(
     logout_with(kit, account);
 }
 
-/// End the session with the product's `logout` (the kit's copy of the exe, run inside the agent) and wait for
-/// its logoff, so that the system unloads the profile.
-fn logout_with(kit: &Kit, account: &Account) {
-    let ended =
-        session_end::log_out(&kit.exe, account).unwrap_or_else(|why| panic!("logout of {}: {why}", account.name));
-    assert!(ended, "no agent of {} was running to log out", account.name);
+/// End the session a task started with the product's `logout` (the kit's copy of the exe, run inside the
+/// agent) and wait for its logoff. It checks what ssh-broker controls (see `session_end`), not that Windows
+/// unloads the hive of a Task Scheduler logon.
+fn logout_with(kit: &Kit, account: &Account) -> session_end::Ended {
+    session_end::log_out(&kit.exe, account, ServiceLogon::TaskScheduler)
+        .unwrap_or_else(|why| panic!("logout of {}: {why}", account.name))
+        .unwrap_or_else(|| panic!("no agent of {} was running to log out", account.name))
 }
 
 fn state_of(account: &Account) -> Option<ssh_broker::provision::session_task::TaskState> {
@@ -99,7 +102,7 @@ fn on_registers_a_verified_task_and_off_deletes_it() {
     let _machine = machine::shared();
     let kit = kit("al1");
     let account = account_with_batch_right("al1");
-    let _end = session_end::LogOutOnDrop::new(&kit.exe, &account);
+    let _end = session_end::LogOutOnDrop::new(&kit.exe, &account, ServiceLogon::TaskScheduler);
     let local = local_account(&account);
 
     autologin::on(&mut env(&kit, &account.password), &local).unwrap();
@@ -119,7 +122,7 @@ fn off_twice_is_ok() {
     let _machine = machine::shared();
     let kit = kit("al2");
     let account = account_with_batch_right("al2");
-    let _end = session_end::LogOutOnDrop::new(&kit.exe, &account);
+    let _end = session_end::LogOutOnDrop::new(&kit.exe, &account, ServiceLogon::TaskScheduler);
     let local = local_account(&account);
 
     autologin::on(&mut env(&kit, &account.password), &local).unwrap();
@@ -148,7 +151,7 @@ fn stored_task_starts_a_working_session_with_dpapi() {
     let _machine = machine::shared();
     let kit = kit("al4");
     let account = account_with_batch_right("al4");
-    let _end = session_end::LogOutOnDrop::new(&kit.exe, &account);
+    let _end = session_end::LogOutOnDrop::new(&kit.exe, &account, ServiceLogon::TaskScheduler);
     let local = local_account(&account);
 
     autologin::on(&mut env(&kit, &account.password), &local).unwrap();
@@ -192,7 +195,7 @@ fn stored_task_for_an_administrator_starts_a_session() {
     let _machine = machine::shared();
     let kit = kit("al5");
     let account = Account::create("al5", true);
-    let _end = session_end::LogOutOnDrop::new(&kit.exe, &account);
+    let _end = session_end::LogOutOnDrop::new(&kit.exe, &account, ServiceLogon::TaskScheduler);
     account.make_administrator();
     let local = local_account(&account);
 
@@ -233,7 +236,7 @@ fn credential_is_gone_after_off() {
     let _machine = machine::shared();
     let kit = kit("al7");
     let account = account_with_batch_right("al7");
-    let _end = session_end::LogOutOnDrop::new(&kit.exe, &account);
+    let _end = session_end::LogOutOnDrop::new(&kit.exe, &account, ServiceLogon::TaskScheduler);
     let local = local_account(&account);
 
     autologin::on(&mut env(&kit, &account.password), &local).unwrap();
@@ -259,7 +262,7 @@ fn on_twice_then_off_leaves_no_credential() {
     let _machine = machine::shared();
     let kit = kit("al8");
     let account = account_with_batch_right("al8");
-    let _end = session_end::LogOutOnDrop::new(&kit.exe, &account);
+    let _end = session_end::LogOutOnDrop::new(&kit.exe, &account, ServiceLogon::TaskScheduler);
     let local = local_account(&account);
 
     autologin::on(&mut env(&kit, &account.password), &local).unwrap();
@@ -282,7 +285,7 @@ fn a_stale_password_is_not_visible_in_the_last_result() {
     logon_session::assert_auditing("Logon", "Failure");
     let kit = kit("al9");
     let mut account = account_with_batch_right("al9");
-    let _end = session_end::LogOutOnDrop::new(&kit.exe, &account);
+    let _end = session_end::LogOutOnDrop::new(&kit.exe, &account, ServiceLogon::TaskScheduler);
     let local: LocalAccount = local_account(&account);
     let exe = kit.exe.to_string_lossy().into_owned();
 
@@ -311,4 +314,87 @@ fn a_stale_password_is_not_visible_in_the_last_result() {
         row.detail
     );
     autologin::off(&mut env(&kit, &account.password), &local).unwrap();
+}
+
+/// How many times the session is started and ended in `logon_sessions_with_no_process_do_not_pile_up`.
+const CYCLES: usize = 3;
+
+/// The logon sessions of `account` that LSA lists and that have no process left, other than those Windows
+/// has logged off (`logged_off`: the logoff event was seen, so LSA may still list them for a moment while it
+/// tears them down).
+fn sessions_without_a_process(account: &Account, logged_off: &BTreeSet<u64>) -> Vec<holders::LogonSession> {
+    let own = std::process::id();
+    holders::sessions_of(&account.sid_text)
+        .unwrap_or_else(|why| panic!("list the logon sessions of {}: {why}", account.name))
+        .into_iter()
+        .filter(|session| !logged_off.contains(&session.id))
+        .filter(|session| {
+            logon_session::processes_of(session.id)
+                .iter()
+                .all(|(pid, _)| *pid == own)
+        })
+        .collect()
+}
+
+/// Elevated (CI only). A measurement of a possible defect (CI round 20: Windows kept the Batch logon session
+/// of two Task Scheduler starts although no process of it was left). One account, auto-login on, the
+/// session started by the task and ended with the product's `logout`, [`CYCLES`] times. After each cycle
+/// the account's logon sessions that LSA lists and that have no process left are counted; the count must not
+/// grow from the first cycle to the last, or sessions pile up.
+#[test]
+fn logon_sessions_with_no_process_do_not_pile_up() {
+    let _machine = machine::shared();
+    let kit = kit("alcyc");
+    let account = account_with_batch_right("alcyc");
+    let _end = session_end::LogOutOnDrop::new(&kit.exe, &account, ServiceLogon::TaskScheduler);
+    let local = local_account(&account);
+    let location = location(&account);
+    let task = task_name(&account.sid_text);
+
+    let mut left_after: Vec<Vec<holders::LogonSession>> = Vec::new();
+    let mut previous_marker: Option<String> = None;
+    for cycle in 1..=CYCLES {
+        if cycle == 1 {
+            autologin::on(&mut env(&kit, &account.password), &local).unwrap();
+        } else {
+            // The task ignores a start while an instance is listed.
+            task_instances::wait_until_none(&task, TASK_START_BOUND);
+            taskscheduler::run_task(&task).unwrap();
+        }
+        // The marker of the agent before stays in the folder: wait for the new agent's.
+        stand_in::wait_for_new_serving_marker_of_a_task(&location, previous_marker.as_deref(), TASK_START_BOUND);
+        let ended = logout_with(&kit, &account);
+        previous_marker = stand_in::serving_marker_text(&location);
+        left_after.push(sessions_without_a_process(&account, &ended.logged_off));
+    }
+    autologin::off(&mut env(&kit, &account.password), &local).unwrap();
+
+    let first = left_after.first().map_or(0, Vec::len);
+    let last = left_after.last().map_or(0, Vec::len);
+    assert!(
+        last <= first,
+        "logon sessions of {} with no process left grew from {first} after cycle 1 to {last} after cycle \
+         {CYCLES}. Sessions listed by LSA after each cycle:\n{}",
+        account.name,
+        left_after
+            .iter()
+            .enumerate()
+            .map(|(index, sessions)| format!(
+                "after cycle {}: {}{}",
+                index + 1,
+                sessions.len(),
+                sessions
+                    .iter()
+                    .map(|session| format!("\n  {session}"))
+                    .collect::<String>()
+            ))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    // The count is printed when it passes too: it is the measurement.
+    account_fixture::hive::record(&format!(
+        "logon sessions of {} with no process left, after each of {CYCLES} cycles: {:?}",
+        account.name,
+        left_after.iter().map(Vec::len).collect::<Vec<_>>()
+    ));
 }
