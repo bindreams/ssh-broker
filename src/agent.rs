@@ -133,6 +133,17 @@ fn keep_log_or_report(
 /// Become the one agent that serves this user, then serve.
 #[cfg(windows)]
 fn serve(location: &SocketLocation, session: u32, background: bool) -> anyhow::Result<()> {
+    serve_in(location, session, |location| run_on(location, background))
+}
+
+/// [`serve`] with the serving as a parameter, so a test can see that what the agent holds goes to
+/// [`hold_until_end`].
+#[cfg(windows)]
+fn serve_in(
+    location: &SocketLocation,
+    session: u32,
+    run: impl FnOnce(&SocketLocation) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
     serve_with(
         location,
         session,
@@ -144,7 +155,7 @@ fn serve(location: &SocketLocation, session: u32, background: bool) -> anyhow::R
                 tracing::info!("waiting for the agent of another session of this user to end");
             })
         },
-        |location| run_on(location, background),
+        run,
         hold_until_end,
     )
 }

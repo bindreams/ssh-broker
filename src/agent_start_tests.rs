@@ -495,6 +495,27 @@ fn serve_keeps_both_locks_when_the_serving_failed() {
     assert!(held.borrow().is_some(), "the guards were handed over");
 }
 
+#[test]
+fn serve_hands_the_slot_and_the_lock_to_the_process_end_and_does_not_drop_them() {
+    // `serve` is the one place that passes `hold_until_end`; `serve_with` is tested with its own
+    // `hold`. The hold is process-wide and never released, so the locks stay taken in this test
+    // process: a session number and folder of their own keep other tests clear of them.
+    let (_profile, loc) = location_with_dir("serve-held-to-end");
+
+    serve_in(&loc, 4242, |_| Ok(())).unwrap();
+
+    assert!(
+        SessionSlot::try_acquire(&loc.sessions_lock_path(), 4242)
+            .unwrap()
+            .is_none(),
+        "the session slot was dropped when serving ended, not held until the process ends"
+    );
+    assert!(
+        UserLock::try_acquire(&loc.lock_path()).unwrap().is_none(),
+        "the user lock was dropped when serving ended, not held until the process ends"
+    );
+}
+
 // closing a pseudoconsole -----
 
 /// A console whose close pushes its pending output into a pipe nobody else reads: the stand-in is a
