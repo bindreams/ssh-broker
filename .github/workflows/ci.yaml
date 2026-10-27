@@ -98,7 +98,8 @@ jobs:
     name: Test (${{ matrix.label }})
     needs: platforms
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
+    # The last step of the Windows job waits up to two bounds of 20 min each for hives to unload.
+    timeout-minutes: 100
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.platforms.outputs.matrix) }}
@@ -253,3 +254,10 @@ jobs:
           wevtutil qe Security /q:"*[System[(EventID=4625)]]" /c:20 /rd:true /f:text
           wevtutil qe Microsoft-Windows-TaskScheduler/Operational /c:80 /rd:true /f:text
           wevtutil qe OpenSSH/Operational /c:80 /rd:true /f:text
+
+      # A test account's hive that Task Scheduler's or sshd's logon left loaded after the product's `logout`
+      # (CI round 19): does Windows unload it later, and when? Waits for each, restarts sshd, waits again, and
+      # prints the logon sessions at both ends. Measures only; it never fails the job.
+      - name: Hive unload wait
+        if: always() && runner.os == 'Windows'
+        run: .github/scripts/hive-unload-wait.ps1
