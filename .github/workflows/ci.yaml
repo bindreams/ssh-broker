@@ -140,9 +140,13 @@ jobs:
         run: cargo nextest run --locked --profile ci
 
       # The `m3_` tests measure what a caller's jobs do to the logon child (`logon::probe`), so the test
-      # process must be in no job, and nextest and cargo each put what they run in one. So the test binary
-      # runs by itself; each case asserts at its start that it is in no job. The filter is the one in
-      # `.config/nextest.toml` that leaves them out of the step above.
+      # process must be in no job. nextest and cargo each put what they run in one, and so does the runner
+      # for a step (a job with no limits, CI round 11). Task Scheduler starts a task outside all of them, so
+      # the test binary runs as a one-shot task of SYSTEM with its output in a file that this step prints.
+      # Each case asserts at its start that it is in no job. The filter is the one in `.config/nextest.toml`
+      # that leaves them out of the step above. The wait re-checks the task's own state: it is over when the
+      # task is ready again and its last result has moved off "never run" (267011); the task's last result is
+      # the exit code of the test binary, which fails this step when it is not 0.
       - name: M3 tests outside any job
         if: (success() || failure()) && runner.os == 'Windows'
         run: |
@@ -152,8 +156,27 @@ jobs:
             Where-Object { $_.executable -and $_.target.name -eq 'session_on_demand_windows' } |
             ForEach-Object { $_.executable }
           if (-not $exe) { throw "cargo did not name the session_on_demand_windows test binary" }
-          & $exe m3_
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $out = Join-Path $env:RUNNER_TEMP 'm3-outside-any-job.txt'
+          Remove-Item -Force -ErrorAction SilentlyContinue $out
+          $task = "sb-m3-$PID"
+          $action = New-ScheduledTaskAction -Execute 'cmd.exe' -WorkingDirectory (Get-Location).Path `
+            -Argument ('/s /c ""{0}" m3_ > "{1}" 2>&1"' -f $exe, $out)
+          $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -RunLevel Highest
+          Register-ScheduledTask -TaskName $task -Action $action -Principal $principal | Out-Null
+          try {
+            Start-ScheduledTask -TaskName $task
+            do {
+              $info = Get-ScheduledTaskInfo -TaskName $task
+              $state = (Get-ScheduledTask -TaskName $task).State
+            } while ($info.LastTaskResult -eq 267011 -or $state -ne 'Ready')
+            $code = $info.LastTaskResult
+          } finally {
+            Stop-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue
+            Unregister-ScheduledTask -TaskName $task -Confirm:$false
+          }
+          if (Test-Path $out) { Get-Content $out } else { Write-Output "the task wrote no output to $out" }
+          Write-Output "m3 test binary exit code: $code"
+          if ($code -ne 0) { exit 1 }
 
       - name: Take that exe away again
         if: (success() || failure()) && runner.os == 'Windows'
