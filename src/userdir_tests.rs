@@ -39,18 +39,31 @@ fn current_socket_location_fits_sockaddr_un() {
 }
 
 #[test]
-fn profile_dir_of_token_rejects_an_invalid_handle() {
+fn profile_dir_of_token_rejects_an_invalid_handle_with_the_windows_error() {
     let err = profile_dir_of_token(HANDLE::default()).unwrap_err();
-    assert!(format!("{err:#}").contains("no profile directory"), "{err:#}");
+    let text = format!("{err:#}");
+    assert!(text.contains("GetUserProfileDirectoryW"), "{text}");
+    assert!(err.downcast_ref::<NoProfile>().is_none(), "{text}");
 }
 
-/// A required length of 0 is the discriminator (measured: a never-logged-on account gets error
-/// 0x8007007a with length 0, an account with a profile the same error with a length), so a caller
-/// can tell "no profile yet" from every other failure.
+/// A required length of 0 with `ERROR_INSUFFICIENT_BUFFER` is "no profile yet" (measured: a
+/// never-logged-on account gets 0x8007007a with length 0, an account with a profile the same error
+/// with a length). Any other failure that leaves the length 0 is not.
 #[test]
-fn a_zero_length_probe_is_the_typed_no_profile_error() {
-    let err = profile_dir_of_token(HANDLE::default()).unwrap_err();
-    assert!(err.downcast_ref::<NoProfile>().is_some(), "{err:#}");
+fn only_an_insufficient_buffer_with_no_length_is_no_profile() {
+    use windows::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_INSUFFICIENT_BUFFER};
+    let insufficient = windows::core::Error::from(windows::core::HRESULT::from_win32(ERROR_INSUFFICIENT_BUFFER.0));
+    let denied = windows::core::Error::from(windows::core::HRESULT::from_win32(ERROR_ACCESS_DENIED.0));
+
+    let no_profile = probe_failure(&insufficient, 0).unwrap_err();
+    assert!(no_profile.downcast_ref::<NoProfile>().is_some(), "{no_profile:#}");
+
+    let other = probe_failure(&denied, 0).unwrap_err();
+    assert!(other.downcast_ref::<NoProfile>().is_none(), "{other:#}");
+    assert!(format!("{other:#}").contains("GetUserProfileDirectoryW"), "{other:#}");
+
+    assert_eq!(probe_failure(&insufficient, 42).unwrap(), 42, "a length is the size to read");
+    assert_eq!(probe_failure(&denied, 42).unwrap(), 42);
 }
 
 #[test]

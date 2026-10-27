@@ -11,11 +11,11 @@ use std::os::windows::ffi::OsStringExt;
 use std::path::PathBuf;
 
 use anyhow::Context;
-use windows::Win32::Foundation::HANDLE;
+use windows::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, HANDLE};
 use windows::Win32::Security::TOKEN_QUERY;
 use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 use windows::Win32::UI::Shell::GetUserProfileDirectoryW;
-use windows::core::PWSTR;
+use windows::core::{HRESULT, PWSTR};
 
 use crate::acl::{self, Sid};
 use crate::socket_loc::{self, SocketLocation};
@@ -33,9 +33,8 @@ pub fn profile_dir_of_token(token: HANDLE) -> anyhow::Result<PathBuf> {
     // Size probe: the first call fails with the needed length, in UTF-16 units with the NUL.
     let mut len = 0u32;
     // SAFETY: a null buffer with a zero length is the documented size probe.
-    let _ = unsafe { GetUserProfileDirectoryW(token, None, &mut len) };
-    if len == 0 {
-        return Err(NoProfile.into());
+    if let Err(e) = unsafe { GetUserProfileDirectoryW(token, None, &mut len) } {
+        len = probe_failure(&e, len)?;
     }
     let mut buf = vec![0u16; len as usize];
     // SAFETY: `buf` holds `len` units, which is what the call is told.
@@ -44,6 +43,19 @@ pub fn profile_dir_of_token(token: HANDLE) -> anyhow::Result<PathBuf> {
     let units = buf.iter().position(|&u| u == 0).unwrap_or(buf.len());
     anyhow::ensure!(units > 0, "the profile directory is empty");
     Ok(PathBuf::from(std::ffi::OsString::from_wide(&buf[..units])))
+}
+
+/// What the size probe's failure means. The probe is expected to fail with the length it needs
+/// (`ERROR_INSUFFICIENT_BUFFER`); with no length that is an account that has never been signed on
+/// (measured), and with any other error it is that error, named.
+fn probe_failure(error: &windows::core::Error, len: u32) -> anyhow::Result<u32> {
+    if len != 0 {
+        return Ok(len);
+    }
+    if error.code() == HRESULT::from_win32(ERROR_INSUFFICIENT_BUFFER.0) {
+        return Err(NoProfile.into());
+    }
+    Err(anyhow::Error::new(error.clone()).context("GetUserProfileDirectoryW (size probe)"))
 }
 
 /// The socket location of the account `token` belongs to.
