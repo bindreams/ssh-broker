@@ -22,12 +22,17 @@ pub const DESKTOP_REPLY: &str =
     "ssh-broker: your agent runs in your desktop session; signing out of Windows ends it.\r\n";
 /// What `logout` exits with when the agent runs in the desktop session.
 pub const DESKTOP_EXIT_CODE: i32 = 2;
+/// What a login exits with when it reached the agent after the end began: it got no shell.
+pub const ENDING_REFUSED_EXIT_CODE: i32 = 1;
 
 /// What an agent shares among its connections.
 pub(super) struct Control {
     background: bool,
     state: Mutex<State>,
     connections: Arc<Connections>,
+    /// Makes the accept loop look at [`Control::is_ending`]: a loop blocked in `accept` does not
+    /// otherwise notice the flag.
+    waker: Box<dyn Fn() + Send + Sync>,
 }
 
 type Killer = Arc<dyn Fn() + Send + Sync>;
@@ -45,7 +50,14 @@ impl Control {
             background,
             state: Mutex::new(State::default()),
             connections,
+            waker: Box::new(|| {}),
         }
+    }
+
+    /// Call `waker` when the end begins, after [`Control::is_ending`] has become true.
+    pub(super) fn with_waker(mut self, waker: impl Fn() + Send + Sync + 'static) -> Control {
+        self.waker = Box::new(waker);
+        self
     }
 
     /// A control for a connection handled outside the accept loop: a desktop agent that nobody
@@ -80,13 +92,17 @@ impl Control {
 
     /// Begin to end: from now on no session registers, and every registered one is ended.
     fn end_all(&self) {
-        let killers: Vec<Killer> = {
+        let (first, killers): (bool, Vec<Killer>) = {
             let mut state = self.lock();
+            let first = !state.ending;
             state.ending = true;
-            state.sessions.iter().map(|(_, kill)| Arc::clone(kill)).collect()
+            (first, state.sessions.iter().map(|(_, kill)| Arc::clone(kill)).collect())
         };
         for kill in killers {
             kill();
+        }
+        if first {
+            (self.waker)();
         }
     }
 }
@@ -125,6 +141,12 @@ pub(super) fn handle_logout<R: Read, W: std::io::Write>(
     control.connections.wait_until_only_logouts_live();
     end_process();
     Ok(())
+}
+
+/// Answer a login that reached the agent after the end began: it is told, and exits with
+/// [`ENDING_REFUSED_EXIT_CODE`], instead of being dropped without a word.
+pub(super) fn refuse_while_ending<W: std::io::Write>(tx: &mut W) -> anyhow::Result<()> {
+    reply(tx, ENDING_REPLY, ENDING_REFUSED_EXIT_CODE)
 }
 
 fn reply<W: std::io::Write>(tx: &mut W, text: &str, code: i32) -> anyhow::Result<()> {

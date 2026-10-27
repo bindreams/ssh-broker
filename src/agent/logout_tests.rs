@@ -229,3 +229,49 @@ fn two_logouts_at_once_both_end_the_agent() {
     }
     assert_eq!(ended.load(Ordering::SeqCst), 2, "every logout ends the agent");
 }
+
+#[test]
+fn ending_wakes_the_accept_loop_once_however_many_logouts_ask() {
+    let woken = Arc::new(AtomicUsize::new(0));
+    let connections = Connections::new();
+    let control = {
+        let woken = Arc::clone(&woken);
+        Control::new(true, connections).with_waker(move || {
+            woken.fetch_add(1, Ordering::SeqCst);
+        })
+    };
+    assert_eq!(woken.load(Ordering::SeqCst), 0, "nothing wakes it before the end begins");
+    handle_logout(&mut Closed, &mut Vec::new(), &control, || {}).unwrap();
+    assert_eq!(woken.load(Ordering::SeqCst), 1);
+    handle_logout(&mut Closed, &mut Vec::new(), &control, || {}).unwrap();
+    assert_eq!(woken.load(Ordering::SeqCst), 1, "it is already awake");
+}
+
+#[test]
+fn the_accept_loop_is_woken_after_the_flag_is_up() {
+    // A loop woken before the flag is raised would look, find nothing to stop for and accept again.
+    let seen = Arc::new(Mutex::new(None));
+    let slot: Arc<Mutex<Option<Arc<Control>>>> = Arc::new(Mutex::new(None));
+    let control = Arc::new(Control::new(true, Connections::new()).with_waker({
+        let (seen, slot) = (Arc::clone(&seen), Arc::clone(&slot));
+        move || {
+            let control = slot.lock().unwrap().clone().unwrap();
+            *seen.lock().unwrap() = Some(control.is_ending());
+        }
+    }));
+    *slot.lock().unwrap() = Some(Arc::clone(&control));
+    handle_logout(&mut Closed, &mut Vec::new(), &control, || {}).unwrap();
+    assert_eq!(*seen.lock().unwrap(), Some(true));
+    // Break the reference cycle.
+    *slot.lock().unwrap() = None;
+}
+
+#[test]
+fn a_connection_that_arrives_while_ending_is_told_so_and_gets_a_failing_exit_code() {
+    let mut written = Vec::new();
+    refuse_while_ending(&mut written).unwrap();
+    let (data, exit) = decode(&written);
+    assert_eq!(data, [(Stream::Stderr as u8, ENDING_REPLY.to_string())]);
+    assert_eq!(exit, Some(ENDING_REFUSED_EXIT_CODE));
+    assert_ne!(ENDING_REFUSED_EXIT_CODE, 0, "the login did not get a shell");
+}

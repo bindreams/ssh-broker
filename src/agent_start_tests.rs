@@ -619,6 +619,71 @@ fn exhaustion_waits_for_a_live_connection_to_end_before_accepting_again() {
     assert!(format!("{end:#}").ends_with("end of script"), "{end:#}");
 }
 
+// stopping -----
+
+#[test]
+fn the_loop_stops_accepting_once_told_to_and_says_it_stopped() {
+    let stop = Cell::new(false);
+    let mut accepted = 0;
+    let end = serve_connections_with(
+        Connections::new(),
+        || {
+            accepted += 1;
+            Ok(accepted)
+        },
+        |_conn, _live| {
+            stop.set(true);
+            Ok(())
+        },
+        || {},
+        || stop.get(),
+    );
+    assert_eq!(accepted, 1, "accepted again after being told to stop");
+    assert!(end.downcast_ref::<Stopped>().is_some(), "{end:#}");
+}
+
+#[test]
+fn a_loop_that_was_stopped_before_it_began_accepts_nothing() {
+    let end = serve_connections_with(
+        Connections::new(),
+        || -> Result<u32, AcceptError> { panic!("nothing is accepted once stopping") },
+        |_conn, _live| Ok(()),
+        || {},
+        || true,
+    );
+    assert!(end.downcast_ref::<Stopped>().is_some(), "{end:#}");
+}
+
+#[test]
+fn a_stopped_loop_ends_ok_only_after_every_connection_has_finished() {
+    let connections = Connections::new();
+    let other = connections.begin();
+    let _logout = connections.begin();
+    let _logout_wait = connections.begin_logout();
+    let (done, finished) = std::sync::mpsc::channel();
+    let waiter = std::thread::spawn({
+        let connections = Arc::clone(&connections);
+        move || {
+            let end = finish_stopped(anyhow::Error::new(Stopped), &connections);
+            done.send(()).unwrap();
+            end
+        }
+    });
+    assert!(finished.try_recv().is_err(), "ended while a connection was relaying");
+    drop(other);
+    finished.recv().unwrap();
+    let end = waiter.join().unwrap();
+    assert!(end.downcast_ref::<Stopped>().is_some(), "{end:#}");
+}
+
+#[test]
+fn an_error_that_is_not_a_stop_is_still_an_error() {
+    let connections = Connections::new();
+    let _live = connections.begin();
+    let end = finish_stopped(anyhow::anyhow!("the listener failed"), &connections);
+    assert!(format!("{end:#}").contains("the listener failed"), "returns without waiting");
+}
+
 // threads -----
 
 #[test]

@@ -167,10 +167,14 @@ fn serve_with(
 #[cfg(windows)]
 fn run_on(location: &SocketLocation, background: bool) -> anyhow::Result<()> {
     let connections = Connections::new();
-    let control = Arc::new(Control::new(background, Arc::clone(&connections)));
+    // Ending wakes the blocked `accept` with a connection of its own; the loop then sees the flag.
+    let socket = location.path.clone();
+    let control = Arc::new(
+        Control::new(background, Arc::clone(&connections)).with_waker(move || drop(afunix::connect(&socket))),
+    );
     run_on_with(location, Listener::bind, mark_listening, |listener| {
-        serve_connections_with(
-            connections,
+        let end = serve_connections_with(
+            Arc::clone(&connections),
             || listener.accept(),
             |conn, live| {
                 let control = Arc::clone(&control);
@@ -186,8 +190,33 @@ fn run_on(location: &SocketLocation, background: bool) -> anyhow::Result<()> {
                 )
             },
             || {},
-        )
+            || control.is_ending(),
+        );
+        // No more logins: the socket stops accepting here, not when the process exits.
+        drop(listener);
+        finish_stopped(end, &connections)
     })
+    .or_else(|err| match err.downcast_ref::<Stopped>() {
+        Some(Stopped) => Ok(()),
+        None => Err(err),
+    })
+}
+
+/// The accept loop stopped because the agent is ending (see [`serve_connections_with`]).
+#[cfg(windows)]
+#[derive(Debug, thiserror::Error)]
+#[error("the agent stopped accepting connections because its session is ending")]
+struct Stopped;
+
+/// After the loop returned `end`: if it stopped on purpose, wait until every connection but the
+/// `logout` requests has finished, so each shell's last output reaches its client, and return
+/// `end` either way. The agent's process ends when this returns.
+#[cfg(windows)]
+fn finish_stopped(end: anyhow::Error, connections: &Connections) -> anyhow::Error {
+    if end.downcast_ref::<Stopped>().is_some() {
+        connections.wait_until_only_logouts_live();
+    }
+    end
 }
 
 /// [`run_on`] with its steps as parameters, so a test can see their order: bind, then mark, then
@@ -393,19 +422,26 @@ fn serve_connections_observed<C>(
     serve: impl FnMut(C, Live) -> std::io::Result<()>,
     blocking: impl FnMut(),
 ) -> anyhow::Error {
-    serve_connections_with(Connections::new(), accept, serve, blocking)
+    serve_connections_with(Connections::new(), accept, serve, blocking, || false)
 }
 
 /// [`serve_connections_observed`] over a tally the caller also holds, so that a connection can wait
 /// for the others to finish (`logout`).
+///
+/// `stopping` is asked before every `accept`; once it says so the loop returns [`Stopped`]. The
+/// party that makes it true must also make a blocked `accept` return (a connection of its own).
 #[cfg(windows)]
 fn serve_connections_with<C>(
     connections: Arc<Connections>,
     mut accept: impl FnMut() -> Result<C, AcceptError>,
     mut serve: impl FnMut(C, Live) -> std::io::Result<()>,
     mut blocking: impl FnMut(),
+    stopping: impl Fn() -> bool,
 ) -> anyhow::Error {
     loop {
+        if stopping() {
+            return anyhow::Error::new(Stopped);
+        }
         // Read before the attempt: a connection that ends while it fails is then not missed.
         let ended_before = connections.ended();
         let shortage = match accept() {
@@ -535,10 +571,9 @@ fn handle_connection_in(conn: socket2::Socket, hooks: Hooks, control: &Control) 
             std::process::exit(0)
         });
     }
-    anyhow::ensure!(
-        !control.is_ending(),
-        "the agent is ending its session; no new shell starts"
-    );
+    if control.is_ending() {
+        return logout::refuse_while_ending(&mut tx);
+    }
     let command = hs.command.clone().unwrap_or_else(default_shell);
     let cwd_buf = child_cwd(&hs.cwd, home_dir());
     let cwd = cwd_buf.as_deref();
