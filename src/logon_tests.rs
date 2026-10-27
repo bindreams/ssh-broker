@@ -157,22 +157,71 @@ fn a_call_that_asked_for_no_breakaway_did_not_keep_one() {
 
 // survival -----
 
-/// The claim follows the child's own job membership after the spawn, not the caller's flags: a caller
-/// whose innermost job allows breakaway can still have an outer job that keeps the child (CI round 8).
+/// The claim comes from a probe the shim starts itself and examines before the logon, not from the
+/// flags of the call (CI round 8) and not from the logon child's own membership (CI round 9: a child
+/// that broke away is still in a job of the Secondary Logon service's, and survives all the same).
+/// A caller in no job has nothing to survive.
 #[test]
-fn a_child_in_no_job_outlives_the_connection() {
-    assert_eq!(survival_of(ChildJob::NotInJob), Survival::OutlivesConnection);
+fn a_caller_in_no_job_outlives_the_connection() {
+    assert_eq!(survival_of(Probe::CallerInNoJob), Survival::OutlivesConnection);
 }
 
+/// Every job of the chain let the probe go: the logon child gets out too.
 #[test]
-fn a_child_in_a_job_ends_with_the_connection() {
-    assert_eq!(survival_of(ChildJob::InJob), Survival::EndsWithConnection);
+fn a_probe_that_got_out_of_every_job_outlives_the_connection() {
+    assert_eq!(
+        survival_of(Probe::Started(ChildJob::NotInJob)),
+        Survival::OutlivesConnection
+    );
 }
 
-/// A membership Windows would not answer is not evidence that the child got out.
+/// Some outer job kept the probe although the innermost let it go (CI round 8, m3n2).
 #[test]
-fn a_child_whose_membership_cannot_be_read_is_not_claimed_to_outlive() {
-    assert_eq!(survival_of(ChildJob::Unreadable), Survival::EndsWithConnection);
+fn a_probe_that_is_still_in_a_job_ends_with_the_connection() {
+    assert_eq!(
+        survival_of(Probe::Started(ChildJob::InJob)),
+        Survival::EndsWithConnection
+    );
+}
+
+/// The innermost job forbids breakaway: the probe's `ERROR_ACCESS_DENIED`.
+#[test]
+fn a_probe_that_breakaway_refused_ends_with_the_connection() {
+    assert_eq!(survival_of(Probe::Refused), Survival::EndsWithConnection);
+}
+
+/// A membership or a probe that Windows would not give is not evidence that the child gets out.
+#[test]
+fn a_probe_that_gave_no_answer_is_not_claimed_to_outlive() {
+    assert_eq!(
+        survival_of(Probe::Started(ChildJob::Unreadable)),
+        Survival::EndsWithConnection
+    );
+    assert_eq!(survival_of(Probe::Failed), Survival::EndsWithConnection);
+}
+
+/// The probe is a process that is started and ended: only a caller that is in a job needs one.
+#[test]
+fn a_caller_in_no_job_is_not_probed() {
+    let probe = probe_for(&CallerJob::NotInJob, || panic!("a process was started"));
+    assert_eq!(probe, Probe::CallerInNoJob);
+}
+
+/// A job that cannot be read is not evidence that there is none, and the probe is not started on
+/// the strength of a job nobody could read.
+#[test]
+fn a_caller_whose_job_cannot_be_read_is_not_probed_and_not_claimed_to_outlive() {
+    let probe = probe_for(&CallerJob::Unreadable, || panic!("a process was started"));
+    assert_eq!(probe, Probe::Failed);
+}
+
+/// Whatever the flags of the job say: the probe asks Windows, which knows the whole chain.
+#[test]
+fn a_caller_in_a_job_is_probed_whether_or_not_its_job_allows_breakaway() {
+    for flags in [0x0800, 0x2000, 0x2800] {
+        let probe = probe_for(&CallerJob::Limits(flags), || Probe::Refused);
+        assert_eq!(probe, Probe::Refused, "limit flags {flags:#x}");
+    }
 }
 
 /// The reading of a process's own membership agrees with the caller-job reading of the same process.

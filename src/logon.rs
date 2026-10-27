@@ -7,15 +7,18 @@
 //! returns; it is on no command line, in no environment and in no error text.
 //!
 //! The service puts the child in the caller's job (CI, M3: the child of a caller in a kill-on-close job
-//! ended with the job, exit code 0). Whether it got out is read from the child (`ChildJob`), not
-//! inferred from the flags the call was made with. `CREATE_BREAKAWAY_FROM_JOB` is passed when the caller's job allows
-//! breakaway (`JOB_OBJECT_LIMIT_BREAKAWAY_OK`) and not otherwise: in a job that does not allow it the
+//! ended with the job, exit code 0). Whether it gets out is found by a probe the shim starts and reads
+//! before the call ([`probe`]), not inferred from the flags the call is made with and not read from
+//! the child. `CREATE_BREAKAWAY_FROM_JOB` is passed when the caller's job allows breakaway
+//! (`JOB_OBJECT_LIMIT_BREAKAWAY_OK`) and not otherwise: in a job that does not allow it the
 //! call fails with `ERROR_ACCESS_DENIED`, which would cost the user their login.
 //!
 //! A caller can sit in a chain of nested jobs, and the query without a handle reads one job of it, so
 //! "the job allows it" is not the whole answer: an outer job can refuse what the one read allows.
 //! [`with_breakaway_fallback`] makes that refusal, and only that, cost the child its survival instead
 //! of the user their login.
+
+mod probe;
 
 use std::path::Path;
 
@@ -33,6 +36,8 @@ use crate::account::LocalAccount;
 use crate::autologin::BatchRight;
 use crate::password_entry::Password;
 use crate::winutil::OwnedHandle;
+pub use probe::Probe;
+use probe::{probe_for, start_probe};
 
 /// `ERROR_FILENAME_EXCED_RANGE`: Windows' answer to a password over its length limit.
 const ERROR_FILENAME_EXCED_RANGE: u32 = 206;
@@ -80,15 +85,18 @@ impl ChildJob {
     }
 }
 
-/// What the session gets from where the started agent actually is. The caller's job flags do not say:
-/// a job that allows breakaway can sit inside one that keeps the child (CI round 8), and Windows
-/// answers the flagged call without refusing it. So the claim is read from the child, after the spawn.
-/// The jobs of a caller of ssh-broker are sshd's (kill-on-close), so a child in any job ends with the
-/// connection; one whose membership cannot be read is not claimed to outlive it.
-pub fn survival_of(child: ChildJob) -> Survival {
-    match child {
-        ChildJob::NotInJob => Survival::OutlivesConnection,
-        ChildJob::InJob | ChildJob::Unreadable => Survival::EndsWithConnection,
+/// What the session gets from the probe (see [`probe`]). The caller's job flags do not say: a job that
+/// allows breakaway can sit inside one that keeps the child (CI round 8), and Windows answers the
+/// flagged call without refusing it. The logon child does not say either: it is in a job of the
+/// Secondary Logon service's even when it outlives its caller's (CI round 9).
+/// The jobs of a caller of ssh-broker are sshd's (kill-on-close), so a process that stays in any job
+/// ends with the connection; a probe that gave no answer is not claimed to outlive it.
+pub fn survival_of(probe: Probe) -> Survival {
+    match probe {
+        Probe::CallerInNoJob | Probe::Started(ChildJob::NotInJob) => Survival::OutlivesConnection,
+        Probe::Started(ChildJob::InJob | ChildJob::Unreadable) | Probe::Refused | Probe::Failed => {
+            Survival::EndsWithConnection
+        }
     }
 }
 
@@ -243,7 +251,12 @@ pub fn start_background_agent(
     let user = wide(&account.name);
     let job = CallerJob::of_this_process();
     let flags = creation_flags(&job);
-    tracing::info!("logon call: caller's job {job:?}, creation flags {:#x}", flags.0);
+    // Before the logon, so that what it finds is what the call is about to meet.
+    let probe = probe_for(&job, start_probe);
+    tracing::info!(
+        "logon call: caller's job {job:?}, creation flags {:#x}, survival probe {probe:?}",
+        flags.0
+    );
     let result = password.with_nul(|password| {
         with_breakaway_fallback(flags, |flags| {
             // SAFETY: every pointer is to a local that outlives the call; `password` is the wiped copy.
@@ -268,10 +281,11 @@ pub fn start_background_agent(
     match result {
         Ok(((), kept_breakaway)) => {
             drop(OwnedHandle(info.hThread));
+            let survival = survival_of(probe);
+            // The child's own membership is logged for comparison with the probe's.
             let child_job = ChildJob::of_process(info.hProcess);
-            let survival = survival_of(child_job);
             tracing::info!(
-                "logon started the agent: breakaway kept by the call: {kept_breakaway}, the agent is {child_job:?}, so {survival:?}"
+                "logon started the agent: breakaway kept by the call: {kept_breakaway}, the agent is {child_job:?}, the probe found {probe:?}, so {survival:?}"
             );
             Ok(StartedAgent {
                 process: OwnedHandle(info.hProcess),
