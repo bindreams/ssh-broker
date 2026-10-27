@@ -117,3 +117,26 @@ fn a_directory_in_its_place_is_refused() {
     std::fs::remove_dir(&dir.0).unwrap();
     assert!(err.contains("directory"), "{err}");
 }
+
+#[test]
+fn a_create_that_fails_for_another_reason_than_rights_does_not_blame_the_rights() {
+    // The parent directory is missing: not elevated or not, the create fails the same way.
+    let missing = TempFile::new("no-parent").0.join("child");
+    let err = format!("{:#}", ensure_admin_only_file(&missing).unwrap_err());
+    assert!(err.contains(&missing.display().to_string()), "names the file: {err}");
+    assert!(
+        !err.contains("elevated administrator"),
+        "sends the user to elevate for a missing directory: {err}"
+    );
+    assert!(err.contains("cannot find the path"), "gives the OS error: {err}");
+}
+
+#[test]
+fn a_create_refused_for_rights_says_to_elevate() {
+    use windows::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_INVALID_OWNER};
+    for code in [ERROR_ACCESS_DENIED, ERROR_INVALID_OWNER] {
+        let error = windows::core::Error::from(HRESULT::from_win32(code.0));
+        let text = format!("{:#}", create_failure(error, Path::new(r"C:\x\apply.lock")));
+        assert!(text.contains("elevated administrator"), "{code:?}: {text}");
+    }
+}

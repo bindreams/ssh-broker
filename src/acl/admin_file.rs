@@ -9,7 +9,7 @@
 use std::path::Path;
 
 use anyhow::Context;
-use windows::Win32::Foundation::ERROR_FILE_EXISTS;
+use windows::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_FILE_EXISTS, ERROR_INVALID_OWNER};
 use windows::Win32::Security::Authorization::{ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1};
 use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
 use windows::Win32::Storage::FileSystem::{
@@ -71,15 +71,25 @@ fn create_admin_only_file(path: &Path) -> anyhow::Result<()> {
             // Creating over a directory is refused as "access denied", not as "exists": what is
             // there is the caller's to judge, whatever the code.
             Err(_) if std::fs::symlink_metadata(path).is_ok() => {}
-            Err(e) => {
-                return Err(anyhow::Error::new(e).context(format!(
-                    "create {} (this needs an elevated administrator)",
-                    path.display()
-                )));
-            }
+            Err(e) => return Err(create_failure(e, path)),
         }
     }
     Ok(())
+}
+
+/// The error for a create that failed. Only a refusal of rights (access denied, or the owner in the
+/// descriptor not being assignable to this token) says what to do about it: the other causes (a
+/// missing parent directory, a sharing violation) are the OS's to name.
+fn create_failure(error: windows::core::Error, path: &Path) -> anyhow::Error {
+    let refused = [ERROR_ACCESS_DENIED, ERROR_INVALID_OWNER]
+        .iter()
+        .any(|code| error.code() == HRESULT::from_win32(code.0));
+    let context = if refused {
+        format!("create {} (this needs an elevated administrator)", path.display())
+    } else {
+        format!("create {}", path.display())
+    };
+    anyhow::Error::new(error).context(context)
 }
 
 /// Why `path` is not a file this build made, or `None` if it is one. It is read without following a
