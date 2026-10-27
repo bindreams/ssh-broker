@@ -179,6 +179,13 @@ fn task_problem_flags_each_mismatch() {
             )),
         ),
         (
+            "a disabled boot trigger",
+            state(good.replace(
+                "<BootTrigger><Enabled>true</Enabled></BootTrigger>",
+                "<BootTrigger><Enabled>false</Enabled></BootTrigger>",
+            )),
+        ),
+        (
             "a DACL granting Everyone write",
             TaskState {
                 sddl: format!("{}(A;;FA;;;WD)", measured_sddl(SID)),
@@ -298,4 +305,23 @@ fn task_row_says_a_failed_logon_is_not_recorded() {
         "the row must not claim to have checked the password or the batch right: {}",
         row.detail
     );
+}
+
+#[test]
+fn a_disabled_boot_trigger_is_named_as_the_problem() {
+    let xml = task_xml(EXE, SID).replace(
+        "<BootTrigger><Enabled>true</Enabled></BootTrigger>",
+        "<BootTrigger><Enabled>false</Enabled></BootTrigger>",
+    );
+    let problem = task_problem(&state(xml), EXE, SID).expect("a trigger that never fires is a problem");
+    assert!(problem.contains("trigger") && problem.contains("disabled"), "{problem}");
+}
+
+#[test]
+fn a_boot_trigger_the_service_wrote_without_its_default_enabled_is_fine() {
+    let xml = task_xml(EXE, SID).replace(
+        "<BootTrigger><Enabled>true</Enabled></BootTrigger>",
+        "<BootTrigger />",
+    );
+    assert_eq!(task_problem(&state(xml), EXE, SID), None);
 }

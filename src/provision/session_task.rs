@@ -90,13 +90,18 @@ fn elements<'a>(squeezed: &'a str, tag: &str) -> Vec<&'a str> {
     found
 }
 
-/// The names of the triggers in squeezed XML (`boottrigger`, `logontrigger`, ...).
-fn trigger_names(squeezed: &str) -> Vec<String> {
+/// The inside of the `Triggers` element of squeezed XML.
+fn triggers_of(squeezed: &str) -> &str {
     let Some(start) = squeezed.find("<triggers>") else {
-        return Vec::new();
+        return "";
     };
     let triggers = &squeezed[start + "<triggers>".len()..];
-    let triggers = triggers.find("</triggers>").map_or(triggers, |end| &triggers[..end]);
+    triggers.find("</triggers>").map_or(triggers, |end| &triggers[..end])
+}
+
+/// The names of the triggers in squeezed XML (`boottrigger`, `logontrigger`, ...).
+fn trigger_names(squeezed: &str) -> Vec<String> {
+    let triggers = triggers_of(squeezed);
     let mut names = Vec::new();
     let mut rest = triggers;
     while let Some(open) = rest.find('<') {
@@ -220,6 +225,12 @@ pub fn task_problem(state: &TaskState, exe: &str, sid: &str) -> Option<String> {
     let triggers = trigger_names(&xml);
     if triggers != ["boottrigger"] {
         return Some(format!("trigger: expected only a boot trigger, found {triggers:?}"));
+    }
+    if ["false", "0"]
+        .iter()
+        .any(|value| triggers_of(&xml).contains(&format!("<enabled>{value}</enabled>")))
+    {
+        return Some("trigger: the boot trigger is disabled, so the task never starts at boot".to_string());
     }
     let commands = elements(&xml, "command");
     let expected_exe = squeeze(&xml_escape(exe));
