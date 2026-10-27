@@ -27,8 +27,8 @@ pub enum Refusal {
     /// No profile, or a profile path too long for a socket.
     #[error("the agent cannot place its socket in this account's profile")]
     NoSocketLocation = 66,
-    /// The private socket folder is missing or is not safe to use.
-    #[error("the agent's private socket folder cannot be used")]
+    /// The private socket folder could not be made, or was found not safe to use (its owner or ACL).
+    #[error("the agent's private socket folder could not be made or is not safe to use")]
     SocketFolderRefused = 67,
 }
 

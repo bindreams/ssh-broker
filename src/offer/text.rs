@@ -52,7 +52,8 @@ pub fn agent_ended(code: u32, logs: &std::path::Path) -> String {
         66 => "the background session started, but your profile has no room for ssh-broker's socket. A profile path \
                over the 107-byte AF_UNIX limit cannot hold it."
             .to_string(),
-        67 => "the background session started, but its ssh-broker folder was not safe to use.".to_string(),
+        67 => "the background session started, but its ssh-broker folder could not be made or was not safe to use."
+            .to_string(),
         other => format!(
             "the agent exited with code {other}; see the agent.log files in {}",
             logs.display()

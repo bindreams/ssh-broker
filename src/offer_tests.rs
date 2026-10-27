@@ -281,6 +281,8 @@ fn agent_exit_code_sentences() {
     assert!(line(64).contains("different account"));
     assert!(line(66).contains("socket"));
     assert!(line(67).contains("folder"));
+    // 67 is any failure to set the folder up, not only an unsafe one.
+    assert!(line(67).contains("could not be made or was not safe"), "{}", line(67));
     assert_ne!(line(64), line(65));
     assert_ne!(line(66), line(67));
     assert!(line(0).contains("took your session but did not answer"));
