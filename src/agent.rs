@@ -669,6 +669,19 @@ struct Hooks {
     /// Called once the session's shell is started and before it is registered, the window in which
     /// the agent can begin to end.
     after_spawn: Box<dyn Fn() + Send + Sync>,
+    /// Told what a PTY session does that no result shows, for a test that has to say where a hang is.
+    observe: Box<dyn Fn(Observed) + Send + Sync>,
+}
+
+/// What a PTY session reports to [`Hooks::observe`]; only tests read the fields.
+#[cfg(windows)]
+#[cfg_attr(not(test), allow(dead_code))]
+enum Observed {
+    /// The shell has started. `output` is the read end of the pseudoconsole's output pipe, which is
+    /// valid until the session ends, so only a call made from the hook itself may use it.
+    ShellStarted { output: isize },
+    /// A refused login has closed its pseudoconsole after reading `bytes` of its output.
+    RefusedConsoleClosed { bytes: usize },
 }
 
 #[cfg(windows)]
@@ -678,6 +691,7 @@ impl Hooks {
             make_watcher: HangupWatcher::new,
             parked: ParkSignal::default(),
             after_spawn: Box::new(|| {}),
+            observe: Box::new(|_| {}),
         }
     }
 }
@@ -737,10 +751,13 @@ fn handle_pty(
 ) -> anyhow::Result<()> {
     let Env { hooks, control } = env;
     let mut session = PtySession::spawn(command, cols, rows, cwd)?;
+    (hooks.observe)(Observed::ShellStarted {
+        output: session.out_read_raw(),
+    });
     (hooks.after_spawn)();
     let job = session.job();
     let Some(_registration) = register_session(control, &job) else {
-        return refuse_unserved_pty(session, &mut rx, &mut tx);
+        return refuse_unserved_pty(session, &mut rx, &mut tx, &*hooks.observe);
     };
     // Before `tx` moves into the shared mutex.
     let hangup = start_hangup_watch(&tx, &job, hooks.make_watcher);
@@ -846,14 +863,29 @@ fn handle_pty(
 /// is closed first, with its output read as the regular teardown reads it: the shell has been running
 /// since `spawn`, and closing flushes whatever it wrote into a pipe that nothing else reads.
 #[cfg(windows)]
-fn refuse_unserved_pty(mut session: PtySession, rx: &mut ConnRx, tx: &mut ConnTx) -> anyhow::Result<()> {
+fn refuse_unserved_pty(
+    mut session: PtySession,
+    rx: &mut ConnRx,
+    tx: &mut ConnTx,
+    observe: &(dyn Fn(Observed) + Send + Sync),
+) -> anyhow::Result<()> {
     let out_raw = session.out_read_raw();
     let hpc = session.take_hpc_raw();
     let mut buf = [0u8; 32 * 1024];
-    if let Err(e) = close_while_draining(|| conpty::read_handle(out_raw, &mut buf), || conpty::close_pty_raw(hpc)) {
+    let mut bytes = 0usize;
+    let drained = close_while_draining(
+        || {
+            let n = conpty::read_handle(out_raw, &mut buf);
+            bytes += n;
+            n
+        },
+        || conpty::close_pty_raw(hpc),
+    );
+    if let Err(e) = drained {
         // Closing without a reader could block for ever; the pseudoconsole is left to the process's end.
         tracing::warn!("could not read the output of a refused shell; its pseudoconsole stays open: {e}");
     }
+    observe(Observed::RefusedConsoleClosed { bytes });
     drop(session); // the pipe ends go after the reader has finished with them
     logout::refuse_while_ending(rx, tx)
 }

@@ -4,6 +4,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 use crate::socket_loc::SocketLocation;
 
@@ -186,11 +187,12 @@ impl Drop for ThrowawayTask {
 
 // Waiting for a file -----
 
-/// Block until `file` exists, by watching its folder `dir` for changes and re-checking after each.
-/// For a test that waits for a child process to say it got somewhere; there is no bound, because the
-/// test runner ends a test that never finishes and names it.
-pub fn wait_for_file(dir: &Path, file: &Path) {
+/// Wait until `file` exists, by watching its folder `dir` for changes and re-checking after each, for
+/// a file that a child process might never make: `false` if `bound` ran out first. The bound is the
+/// failure the caller reports, naming what it waited for; it is not read as state.
+pub fn wait_for_file_within(dir: &Path, file: &Path, bound: Duration) -> bool {
     use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
     use windows::Win32::Storage::FileSystem::{
         FILE_NOTIFY_CHANGE_FILE_NAME, FindCloseChangeNotification, FindFirstChangeNotificationW,
         FindNextChangeNotification,
@@ -202,13 +204,87 @@ pub fn wait_for_file(dir: &Path, file: &Path) {
     // SAFETY: a NUL-terminated path; the handle is closed below.
     let watch = unsafe { FindFirstChangeNotificationW(PCWSTR(dir_w.as_ptr()), false, FILE_NOTIFY_CHANGE_FILE_NAME) }
         .expect("watch the folder for the file");
-    while !file.exists() {
-        // SAFETY: the valid watch handle; re-armed after each wake so the next change signals again.
-        unsafe {
-            WaitForSingleObject(watch, INFINITE);
-            FindNextChangeNotification(watch).expect("re-arm the folder watch");
+    let deadline = std::time::Instant::now() + bound;
+    let mut made = file.exists();
+    while !made {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        let millis = u32::try_from(left.as_millis()).map_or(INFINITE - 1, |millis| millis.min(INFINITE - 1));
+        // SAFETY: the valid watch handle.
+        let woke = unsafe { WaitForSingleObject(watch, millis) }; // sleep-ok: failure bound on a process that may never make the file; expiry is reported, not read as state
+        if woke == WAIT_TIMEOUT {
+            made = file.exists();
+            break;
         }
+        assert_eq!(woke, WAIT_OBJECT_0, "wait for the folder watch of {}", dir.display());
+        // SAFETY: re-armed after each wake so the next change signals again.
+        unsafe { FindNextChangeNotification(watch) }.expect("re-arm the folder watch");
+        made = file.exists();
     }
     // SAFETY: the handle from above.
     let _ = unsafe { FindCloseChangeNotification(watch) };
+    made
+}
+
+/// The bytes waiting in the pipe whose read end is `read`, or the reason they could not be counted.
+/// `read` has to be open for the call.
+pub fn pipe_pending(read: isize) -> Result<u32, String> {
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::System::Pipes::PeekNamedPipe;
+
+    let mut pending = 0u32;
+    // SAFETY: a size query: no buffer; the caller keeps the handle open for the call.
+    unsafe {
+        PeekNamedPipe(
+            HANDLE(read as *mut core::ffi::c_void),
+            None,
+            0,
+            None,
+            Some(&mut pending),
+            None,
+        )
+    }
+    .map(|()| pending)
+    .map_err(|e| e.to_string())
+}
+
+// Naming a hang -----
+
+/// Ends the process, with a message that says where the test was, if the test is still running
+/// `bound` after this was made. For a test of code that may hang: nextest ends a hung test after its
+/// own limit with no more than "running for over 60 seconds". The bound is the failure surfaced to a
+/// human; nothing is concluded from the time passing but that the test did not finish.
+///
+/// The process is aborted, not the test panicked, because the thread that hangs is the test's own and
+/// no panic reaches it.
+pub struct Watchdog {
+    done: Option<std::sync::mpsc::Sender<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Watchdog {
+    /// `what` is the test's job; `seen` says how far it got, and is called on the watchdog's thread.
+    pub fn arm(what: &'static str, bound: Duration, seen: impl Fn() -> String + Send + 'static) -> Watchdog {
+        let (done, finished) = std::sync::mpsc::channel::<()>();
+        let thread = std::thread::spawn(move || {
+            // The sender is dropped when the test ends, which wakes this with `Disconnected`.
+            let ended = finished.recv_timeout(bound); // sleep-ok: failure bound on a hang of the test itself
+            if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = ended {
+                eprintln!("HANG: {what} did not finish within {bound:?}. Seen: {}", seen());
+                std::process::abort();
+            }
+        });
+        Watchdog {
+            done: Some(done),
+            thread: Some(thread),
+        }
+    }
+}
+
+impl Drop for Watchdog {
+    fn drop(&mut self) {
+        drop(self.done.take());
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
 }

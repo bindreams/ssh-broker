@@ -198,12 +198,41 @@ fn a_pty_login_that_loses_the_race_with_the_end_is_refused_not_relayed() {
     }));
 }
 
+/// How far a test got, for the message of a failure bound that runs out.
+#[derive(Clone, Default)]
+struct Seen(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+impl Seen {
+    fn note(&self, what: impl Into<String>) {
+        self.0.lock().unwrap().push(what.into());
+    }
+
+    fn text(&self) -> String {
+        self.0.lock().unwrap().join("; ")
+    }
+}
+
+/// How long the shell below may take to make its marker, and the test to finish. Both are failure
+/// bounds on external events (a shell, conhost) that might never come, well inside nextest's limit; the
+/// test takes seconds when it works.
+const MARKER_BOUND: std::time::Duration = std::time::Duration::from_secs(60);
+const TEST_BOUND: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// The shell has written far more than the pseudoconsole's output pipe holds when the login loses
 /// the race, and nothing reads that pipe on the refusal path unless the refusal drains it: closing
 /// the pseudoconsole flushes conhost's pending output into the pipe, and blocks where it is full. The
-/// handler would never return, so this test would hang (nextest ends it and names it) and not pass.
+/// handler would never return, so this test would hang (the watchdog ends it and says how far it got)
+/// and not pass.
+///
+/// The shell cannot make its marker while the pipe is full and nothing reads it. If the pipe holds
+/// less than the shell writes, the wait for the marker runs out, and says how many bytes were waiting
+/// in the pipe then.
 #[test]
 fn a_pty_login_refused_after_the_shell_wrote_a_lot_is_still_refused() {
+    use crate::test_support::{Watchdog, pipe_pending, wait_for_file_within};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicIsize, Ordering};
+
     const LINE: &str = "0123456789012345678901234567890123456789012345678901234567890123456789";
     let marker_dir = std::env::temp_dir().join(format!("sb-agent-wrote-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&marker_dir);
@@ -215,20 +244,52 @@ fn a_pty_login_refused_after_the_shell_wrote_a_lot_is_still_refused() {
         r#"cmd.exe /d /s /c "(for /l %i in (1,1,3000) do @echo {LINE}) & echo.> "{}" & ping -n 120 127.0.0.1 > nul""#,
         marker.display()
     );
-    let control = std::sync::Arc::new(super::Control::new(true, super::Connections::new()));
+    let seen = Seen::default();
+    let _watchdog = Watchdog::arm("the refused PTY login", TEST_BOUND, {
+        let seen = seen.clone();
+        move || seen.text()
+    });
+    let output = Arc::new(AtomicIsize::new(0));
+    let control = Arc::new(super::Control::new(true, super::Connections::new()));
     assert_refused(refused_login_of("raced-pty-output", Mode::Pty, &command, |conn| {
         let hooks = Hooks {
+            observe: {
+                let (seen, output) = (seen.clone(), Arc::clone(&output));
+                Box::new(move |event| match event {
+                    super::Observed::ShellStarted { output: pipe } => {
+                        output.store(pipe, Ordering::SeqCst);
+                        seen.note("the shell started");
+                    }
+                    super::Observed::RefusedConsoleClosed { bytes } => {
+                        seen.note(format!("ClosePseudoConsole returned after {bytes} bytes were read"));
+                    }
+                })
+            },
             after_spawn: {
-                let control = std::sync::Arc::clone(&control);
+                let (control, seen, output) = (Arc::clone(&control), seen.clone(), Arc::clone(&output));
                 let (marker, marker_dir) = (marker.clone(), marker_dir.clone());
                 Box::new(move || {
-                    crate::test_support::wait_for_file(&marker_dir, &marker);
+                    if !wait_for_file_within(&marker_dir, &marker, MARKER_BOUND) {
+                        panic!(
+                            concat!(
+                                "waiting for the shell to make {} within {:?}: it did not. ",
+                                "Bytes waiting in the output pipe, which nothing reads yet: {:?}. Seen: {}"
+                            ),
+                            marker.display(),
+                            MARKER_BOUND,
+                            pipe_pending(output.load(Ordering::SeqCst)),
+                            seen.text()
+                        );
+                    }
+                    seen.note("the shell made the marker");
                     control.end_all();
+                    seen.note("the agent was told to end");
                 })
             },
             ..Hooks::production()
         };
         super::handle_connection_in(conn, hooks, &control).unwrap();
+        seen.note("the agent answered the refusal");
     }));
     std::fs::remove_dir_all(&marker_dir).ok();
 }
