@@ -6,8 +6,6 @@ use std::cell::Cell;
 use std::io::Cursor;
 use std::rc::Rc;
 
-const EXE: &str = r"C:\ProgramData\ssh-broker\ssh-broker.exe";
-
 /// What an agent would send: stderr text, then an exit code.
 fn reply(text: &str, code: i32) -> Vec<u8> {
     let mut bytes = Vec::new();
@@ -19,7 +17,9 @@ fn reply(text: &str, code: i32) -> Vec<u8> {
 fn logout(server_says: Vec<u8>) -> (i32, String, Vec<u8>) {
     let mut sent = Vec::new();
     let mut err = Vec::new();
-    let code = logout_on(&mut Cursor::new(server_says), &mut sent, &mut err, EXE);
+    let Asked::Code(code) = logout_on(&mut Cursor::new(server_says), &mut sent, &mut err) else {
+        panic!("the agent answered, so it was not unanswered");
+    };
     (code, String::from_utf8(err).unwrap(), sent)
 }
 
@@ -49,11 +49,11 @@ fn the_agents_reply_goes_to_stderr_and_its_exit_code_is_ours() {
 /// is "no session".
 fn logout_failing_to_connect(error: anyhow::Error) -> (i32, String) {
     let mut err = Vec::new();
+    let mut error = Some(error);
     let code = logout_at(
-        || Err::<(Cursor<Vec<u8>>, Vec<u8>), _>(error),
+        || Err::<(Cursor<Vec<u8>>, Vec<u8>), _>(error.take().expect("asked to connect once")),
         |e| e.to_string() == "nothing listens",
         &mut err,
-        EXE,
         |code| code,
     );
     (code, String::from_utf8(err).unwrap())
@@ -77,21 +77,113 @@ fn logout_that_cannot_reach_an_agent_says_why_and_is_not_no_session() {
     assert!(err.contains("Access is denied"), "{err}");
 }
 
-#[test]
-fn eof_before_any_frame_after_logout_is_the_old_agent_signal() {
-    let (code, err, _) = logout(Vec::new());
-    assert_eq!(code, 3);
-    assert!(err.contains("the agent did not answer"), "{err}");
-    assert!(err.contains(&format!("run {EXE} apply")), "{err}");
-    assert!(err.contains("older than this ssh-broker"), "{err}");
+/// `logout_at` over connections that `script` hands out in turn: each is what the agent says, or the
+/// error of a connect that fails. Returns the exit code, what was written to stderr and how many
+/// connections were made.
+fn logout_over(script: impl IntoIterator<Item = Result<Vec<u8>, &'static str>>) -> (i32, String, usize) {
+    let mut script = script.into_iter();
+    let mut connects = 0;
+    let mut err = Vec::new();
+    let code = logout_at(
+        || {
+            connects += 1;
+            match script.next().expect("the script ended: logout asked again") {
+                Ok(says) => Ok((Cursor::new(says), Vec::new())),
+                Err(why) => Err(anyhow::anyhow!(why)),
+            }
+        },
+        |e| e.to_string() == "nothing listens",
+        &mut err,
+        |code| code,
+    );
+    (code, String::from_utf8(err).unwrap(), connects)
 }
 
 #[test]
-fn a_crash_after_a_frame_is_not_the_old_agent_signal() {
+fn a_connection_that_ends_before_the_agents_first_byte_is_followed_by_a_new_one_and_no_agent_means_no_session() {
+    // The agent was ending when this logout reached it: its listener closed with the request queued.
+    // The session is gone by the time of the next connect, which is what running `logout` a moment
+    // later says too.
+    let (code, err, connects) = logout_over([Ok(Vec::new()), Err("nothing listens")]);
+    assert_eq!(code, 1);
+    assert_eq!(
+        err,
+        "ssh-broker: no session to end.
+"
+    );
+    assert_eq!(connects, 2);
+}
+
+#[test]
+fn a_connection_that_ends_before_the_agents_first_byte_is_followed_by_a_new_one_that_is_answered() {
+    let (code, err, connects) = logout_over([
+        Ok(Vec::new()),
+        Ok(reply(
+            "ssh-broker: ending your background session.
+",
+            0,
+        )),
+    ]);
+    assert_eq!(code, 0);
+    assert_eq!(
+        err,
+        "ssh-broker: ending your background session.
+"
+    );
+    assert_eq!(connects, 2);
+}
+
+#[test]
+fn logout_goes_round_for_as_long_as_the_agent_hangs_up_and_never_advises_apply() {
+    // No count ends the loop: a connect that finds no listener does.
+    const HANGUPS: usize = 100;
+    let script = std::iter::repeat_n(Ok(Vec::new()), HANGUPS).chain([Err("nothing listens")]);
+    let (code, err, connects) = logout_over(script);
+    assert_eq!(code, 1);
+    assert!(!err.contains("apply"), "{err}");
+    assert_eq!(connects, HANGUPS + 1);
+}
+
+/// A connection whose read fails as told.
+struct Failing(std::io::ErrorKind);
+
+impl Read for Failing {
+    fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+        Err(self.0.into())
+    }
+}
+
+#[test]
+fn a_connection_that_is_reset_or_gone_before_the_agents_first_byte_is_unanswered() {
+    use std::io::ErrorKind::{BrokenPipe, ConnectionAborted, ConnectionReset};
+    for kind in [ConnectionReset, ConnectionAborted, BrokenPipe] {
+        let asked = logout_on(&mut Failing(kind), &mut Vec::new(), &mut Vec::new());
+        assert!(matches!(asked, Asked::Unanswered), "{kind:?}");
+    }
+}
+
+#[test]
+fn a_request_that_cannot_be_sent_because_the_agent_has_gone_is_unanswered() {
+    struct Gone;
+    impl Write for Gone {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::ErrorKind::BrokenPipe.into())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::ErrorKind::BrokenPipe.into())
+        }
+    }
+    let mut err = Vec::new();
+    let asked = logout_on(&mut Cursor::new(Vec::new()), &mut Gone, &mut err);
+    assert!(matches!(asked, Asked::Unanswered));
+    assert!(err.is_empty(), "nothing is said until the next connect has answered");
+}
+
+#[test]
+fn a_crash_after_a_frame_is_not_unanswered() {
     let mut half = Vec::new();
     write_data(&mut half, Stream::Stderr, b"partial\r\n").unwrap();
     let (code, err, _) = logout(half);
-    assert_ne!(code, 3);
     assert_eq!(
         code, 255,
         "the exec relay's code for a peer that closed without an exit"
@@ -133,12 +225,11 @@ fn the_connection_is_still_open_when_the_exit_code_is_handed_over() {
     let was_open = logout_at(
         move || {
             let rx = Held(Rc::clone(&held), Cursor::new(reply("bye\r\n", 0)));
-            let tx = Held(held, Cursor::new(Vec::new()));
+            let tx = Held(Rc::clone(&held), Cursor::new(Vec::new()));
             Ok((rx, tx))
         },
         |_| false,
         &mut err,
-        EXE,
         |_code| !dropped.get(),
     );
     assert!(was_open, "the exit must happen while the socket is held");

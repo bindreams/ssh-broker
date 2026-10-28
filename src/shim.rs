@@ -71,12 +71,10 @@ where
     E: Write,
     I: Read + Send + 'static,
 {
-    let mut input = ExecInput::new(stdin);
-    match input.attach(tx, hs)? {
-        Attached::Ready => {}
-        Attached::Closed(e) => return Err(e),
-        Attached::InputLost => unreachable!("a first connection has had no input"),
-    }
+    let _keep_open = match start_exec_input(tx, hs, stdin)? {
+        Started::Ready(keep) => keep,
+        Started::Closed(e) => return Err(e),
+    };
     // Route the outcome through the shared exit-code policy so a dead agent (PeerClosed) is
     // 255 and a protocol error is 254 — never the in-band exit 1 that would be
     // indistinguishable from a real command's failure (e.g. `findstr`/`grep` no-match).
@@ -97,8 +95,10 @@ pub struct Pumped {
 
 impl Pumped {
     /// The connection ended without the agent having sent a byte: the agent was ending, or was gone,
-    /// before it took this session. The shim may go back to the path it takes when there is no agent.
-    /// A protocol or sink failure cannot happen without a byte.
+    /// before it took this session, because an agent that is alive answers every connection it cannot
+    /// serve. An interactive session goes back to the path it takes when there is no agent; a command is
+    /// never sent again, since the agent may have started it. A protocol or sink failure cannot happen
+    /// without a byte.
     pub fn no_answer(&self) -> bool {
         !self.heard
             && match &self.outcome {
@@ -165,94 +165,45 @@ impl<R: Read> Read for Heard<R> {
     }
 }
 
-/// The input of an EXEC session, which stays with the shim across the connections it tries.
-///
-/// A blocking read of stdin cannot be taken back, so one thread reads it for the whole run and writes
-/// to the current connection. [`ExecInput::attach`] makes a connection current. A connection that
-/// ends before the agent answers can be replaced by another only while no input has gone to it: input
-/// sent to a connection nobody read is lost, and the command would run on what is left of it.
-pub struct ExecInput<W> {
-    link: Arc<Mutex<Link<W>>>,
-    /// Stdin until the forwarder takes it, which is when the first connection has its handshake.
-    stdin: Option<Box<dyn Read + Send>>,
-}
-
-struct Link<W> {
-    tx: Option<W>,
-    /// Input has been taken from stdin for the current connection. Set before the write, with the
-    /// lock held, so a replacement sees every byte that might be lost.
-    consumed: bool,
-    /// Stdin has ended, and the marker went to the connection that was current then.
-    eof: bool,
-}
-
-/// What [`ExecInput::attach`] did.
-#[derive(Debug)]
-pub enum Attached {
-    /// The handshake went out; input follows it.
-    Ready,
-    /// Input already went to the connection being replaced, so no other can take its place.
-    InputLost,
+/// What [`start_exec_input`] did.
+pub enum Started<W> {
+    /// The handshake went out and the input is being forwarded. The session lasts while the guard does.
+    Ready(KeepOpen<W>),
     /// The peer had closed the connection when the handshake went out.
     Closed(anyhow::Error),
 }
 
-impl<W: Write + Send + 'static> ExecInput<W> {
-    pub fn new(stdin: impl Read + Send + 'static) -> Self {
-        Self {
-            link: Arc::new(Mutex::new(Link {
-                tx: None,
-                consumed: false,
-                eof: false,
-            })),
-            stdin: Some(Box::new(stdin)),
-        }
-    }
-
-    /// Whether input has gone to the current connection, so that no other can take its place.
-    pub fn input_lost(&self) -> bool {
-        self.link.lock().unwrap().consumed
-    }
-
-    /// Send `hs` on `tx` and make it the connection input goes to, dropping the one before it. The
-    /// handshake goes first, so the agent spawns the child before any stdin flows.
-    ///
-    /// If the peer has closed the connection, `tx` is current all the same and the answer says so.
-    pub fn attach(&mut self, tx: W, hs: &Handshake) -> anyhow::Result<Attached> {
-        let encoded = hs.encode()?;
-        let mut link = self.link.lock().unwrap();
-        if link.consumed {
-            return Ok(Attached::InputLost);
-        }
-        let eof = link.eof;
-        let tx = link.tx.insert(tx);
-        let sent = write_frame(tx, FrameKind::Handshake, &encoded)
-            // The marker is owed to this connection too if stdin has already ended.
-            .and_then(|()| {
-                if eof {
-                    write_data(tx, Stream::Stdin, b"")
-                } else {
-                    Ok(())
-                }
-            });
-        drop(link);
-        // Detached: the thread cannot be woken from its read, so the process's exit reaps it.
-        if let Some(stdin) = self.stdin.take() {
-            let link = Arc::clone(&self.link);
-            std::thread::spawn(move || forward_stdin(stdin, link));
-        }
-        match sent {
-            Ok(()) => Ok(Attached::Ready),
-            Err(e) if peer_gone(&e).is_some() => Ok(Attached::Closed(e)),
-            Err(e) => Err(e),
-        }
-    }
+/// Holds the write half of an EXEC connection open. The agent takes a close of the socket for a
+/// disconnect and kills the command, so the half must outlive the end of the input, which ends the
+/// thread that forwards it: it is dropped after the `EXIT` frame has arrived.
+pub struct KeepOpen<W> {
+    _tx: Arc<Mutex<W>>,
 }
 
-/// Forward `stdin` to `DATA(Stdin)` frames on the current connection; on EOF (or a read error, treated
-/// as EOF) send the empty-`Stdin` EOF marker so a reader like `sort`/`findstr` finishes — WITHOUT
-/// closing the connection. Best-effort: a write failure means the peer is gone, so just stop.
-fn forward_stdin<I: Read, W: Write>(mut stdin: I, link: Arc<Mutex<Link<W>>>) {
+/// Send `hs` on `tx`, then forward `stdin` to it on a thread of its own, up to an end-of-input marker.
+/// The handshake goes first, so the agent starts the command before any input flows.
+///
+/// The thread is detached: a blocking read of stdin cannot be woken, and the process's exit reaps it.
+pub fn start_exec_input<W: Write + Send + 'static>(
+    mut tx: W,
+    hs: &Handshake,
+    stdin: impl Read + Send + 'static,
+) -> anyhow::Result<Started<W>> {
+    match write_frame(&mut tx, FrameKind::Handshake, &hs.encode()?) {
+        Ok(()) => {}
+        Err(e) if peer_gone(&e).is_some() => return Ok(Started::Closed(e)),
+        Err(e) => return Err(e),
+    }
+    let tx = Arc::new(Mutex::new(tx));
+    let forwarding = Arc::clone(&tx);
+    std::thread::spawn(move || forward_stdin(stdin, forwarding));
+    Ok(Started::Ready(KeepOpen { _tx: tx }))
+}
+
+/// Forward `stdin` to `DATA(Stdin)` frames; on EOF (or a read error, treated as EOF) send the
+/// empty-`Stdin` EOF marker so a reader like `sort`/`findstr` finishes, without closing the connection.
+/// Best-effort: a write failure means the peer is gone, so just stop.
+fn forward_stdin<I: Read, W: Write>(mut stdin: I, tx: Arc<Mutex<W>>) {
     let mut buf = [0u8; 32 * 1024];
     loop {
         match stdin.read(&mut buf) {
@@ -261,19 +212,15 @@ fn forward_stdin<I: Read, W: Write>(mut stdin: I, link: Arc<Mutex<Link<W>>>) {
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Ok(0) | Err(_) => break,
             Ok(n) => {
-                let mut link = link.lock().unwrap();
-                link.consumed = true;
-                let tx = link.tx.as_mut().expect("input flows only after the handshake");
-                if write_data(tx, Stream::Stdin, &buf[..n]).is_err() {
+                let mut g = tx.lock().unwrap();
+                if write_data(&mut *g, Stream::Stdin, &buf[..n]).is_err() {
                     return;
                 }
             }
         }
     }
-    let mut link = link.lock().unwrap();
-    link.eof = true;
-    let tx = link.tx.as_mut().expect("input flows only after the handshake");
-    let _ = write_data(tx, Stream::Stdin, b""); // stdin-EOF marker
+    let mut g = tx.lock().unwrap();
+    let _ = write_data(&mut *g, Stream::Stdin, b""); // stdin-EOF marker
 }
 
 /// Routes the agent's decoded output streams to the EXEC writers, keeping stderr separate.

@@ -19,8 +19,8 @@ use crate::console_modes::ConsoleModes;
 use crate::protocol::{FrameKind, FrameReader, Handshake, Stream, write_frame};
 use crate::relay::{FrameSink, write_data};
 use crate::shim::{
-    Attached, ExecInput, FailOpen, Fallback, MouseModeSniffer, Pumped, XtwinopsFilter, decide_fail_open,
-    decide_fallback, is_blank_command, make_handshake, peer_gone, pump_exec, pump_heard, size_to_resize,
+    FailOpen, Fallback, MouseModeSniffer, Pumped, Started, XtwinopsFilter, decide_fail_open, decide_fallback,
+    is_blank_command, make_handshake, peer_gone, pump_exec, pump_heard, size_to_resize, start_exec_input,
 };
 use crate::shim_offer::{Absent, Prompting, Rescue, Rescued};
 use crate::socket_loc::SocketLocation;
@@ -208,70 +208,92 @@ fn try_relay_with(
     rescue: &mut dyn Rescue,
     interactive: &mut dyn FnMut(Socket, Option<ConsoleModes>) -> anyhow::Result<Interactive>,
 ) -> anyhow::Result<Option<i32>> {
-    // Only an EXEC session has input to carry across connections.
-    let mut input = exec.as_ref().map(|_| ExecInput::new(stdin));
-    // A connection the agent ends before it says anything takes the session round again: the agent
-    // was ending or is gone, and the next connect finds out which. It ends when a connect finds no
-    // listener, or an agent answers.
-    let mut again = false;
-    loop {
-        if again && input.as_ref().is_some_and(ExecInput::input_lost) {
-            let _ = writeln!(stderr, "{INPUT_LOST}");
-            return Ok(Some(255));
-        }
-        let connection = match &location {
-            Ok(location) => afunix::connect(&location.path),
-            // The cause is shown by the fail-open below; this only says there was nothing to connect to.
-            Err(e) => Err(anyhow::anyhow!("{e:#}")),
+    if let Some(cmd) = exec {
+        return match connect_or_rescue(&location, exec, stderr, log_failure, rescue)? {
+            Connected::Agent(conn, _) => relay_exec(conn, cmd, stdin, stderr),
+            Connected::Done(code) => Ok(code),
         };
-        // A user with no agent may be offered a session (or told how to get one). What the rescue does
-        // not use, the fail-open below still handles exactly as it did before.
-        let (conn, rescued_modes) = if connection.is_err() {
-            if again && input.is_some() {
-                // A command is not run here after the agent may have started it, and the thread that
-                // fed the agent still reads the shim's stdin, which a local child would share.
-                let _ = writeln!(stderr, "{AGENT_GONE}");
-                return Ok(Some(255));
-            }
-            let absent = Absent {
-                exec: exec.is_some(),
-                location: &location,
-                connect: &connection,
-            };
-            match rescue.rescue(&absent, stderr) {
-                Rescued::Connected { socket, modes } => (socket, modes),
-                Rescued::Gone => return Ok(Some(255)),
-                Rescued::Plain => return fail_open_reason(&location, &connection, exec, stderr, log_failure),
-            }
-        } else {
-            (connection?, None)
-        };
-
-        let pumped = match (exec, input.as_mut()) {
-            (Some(cmd), Some(input)) => {
-                let (rx, tx) = afunix::split(conn)?;
-                let hs = make_handshake(&Some(cmd.clone()), term(), 80, 24); // EXEC ignores cols/rows
-                match input.attach(tx, &hs)? {
-                    Attached::Ready => pump_exec(rx, std::io::stdout(), std::io::stderr()),
-                    Attached::InputLost => {
-                        let _ = writeln!(stderr, "{INPUT_LOST}");
-                        return Ok(Some(255));
-                    }
-                    Attached::Closed(e) => Pumped::closed(e),
-                }
-            }
-            _ => match interactive(conn, rescued_modes)? {
-                Interactive::Pumped(pumped) => pumped,
-                Interactive::NoConsole => return Ok(None),
-            },
-        };
-        if pumped.no_answer() {
-            tracing::warn!("the agent ended the connection before it answered; connecting again");
-            again = true;
-            continue;
-        }
-        return Ok(Some(pumped.code()));
     }
+    // An interactive session whose connection the agent ends before it says anything goes round again:
+    // the agent is ending or gone, because an agent that is alive answers every connection it cannot
+    // serve. The next connect finds out which. It ends when a connect finds no listener, or an agent
+    // answers.
+    loop {
+        let (conn, rescued_modes) = match connect_or_rescue(&location, exec, stderr, log_failure, rescue)? {
+            Connected::Agent(conn, modes) => (conn, modes),
+            Connected::Done(code) => return Ok(code),
+        };
+        match interactive(conn, rescued_modes)? {
+            Interactive::Pumped(pumped) if pumped.no_answer() => {
+                tracing::warn!("the agent ended the connection before it answered; connecting again");
+            }
+            Interactive::Pumped(pumped) => return Ok(Some(pumped.code())),
+            Interactive::NoConsole => return Ok(None),
+        }
+    }
+}
+
+/// What [`connect_or_rescue`] came to.
+enum Connected {
+    /// A connection to the agent, with the console a rescue left raw.
+    Agent(Socket, Option<ConsoleModes>),
+    /// There is none: what [`try_relay_with`] returns instead.
+    Done(Option<i32>),
+}
+
+/// A connection to the agent, or what [`try_relay_with`] returns instead when there is none.
+///
+/// A user with no agent may be offered a session (or told how to get one). What the rescue does not
+/// use, the fail-open handles exactly as it did before.
+fn connect_or_rescue(
+    location: &anyhow::Result<SocketLocation>,
+    exec: &Option<String>,
+    stderr: &mut dyn std::io::Write,
+    log_failure: Option<&str>,
+    rescue: &mut dyn Rescue,
+) -> anyhow::Result<Connected> {
+    let connection = match location {
+        Ok(location) => afunix::connect(&location.path),
+        // The cause is shown by the fail-open below; this only says there was nothing to connect to.
+        Err(e) => Err(anyhow::anyhow!("{e:#}")),
+    };
+    let connection: anyhow::Result<Socket> = match connection {
+        Ok(socket) => return Ok(Connected::Agent(socket, None)),
+        Err(e) => Err(e),
+    };
+    let absent = Absent {
+        exec: exec.is_some(),
+        location,
+        connect: &connection,
+    };
+    Ok(match rescue.rescue(&absent, stderr) {
+        Rescued::Connected { socket, modes } => Connected::Agent(socket, modes),
+        Rescued::Gone => Connected::Done(Some(255)),
+        Rescued::Plain => Connected::Done(fail_open_reason(location, &connection, exec, stderr, log_failure)?),
+    })
+}
+
+/// Relay an EXEC session over `conn`, once. The agent may have started the command before it ended a
+/// connection without a byte, and an agent that answers next could run it again, so the command is
+/// neither sent again nor run anywhere else.
+fn relay_exec(
+    conn: Socket,
+    cmd: &str,
+    stdin: impl std::io::Read + Send + 'static,
+    stderr: &mut dyn std::io::Write,
+) -> anyhow::Result<Option<i32>> {
+    let (rx, tx) = afunix::split(conn)?;
+    let hs = make_handshake(&Some(cmd.to_owned()), term(), 80, 24); // EXEC ignores cols/rows
+    // Held until the session is over: the agent takes a close for a disconnect.
+    let pumped = match start_exec_input(tx, &hs, stdin)? {
+        Started::Ready(_keep_open) => pump_exec(rx, std::io::stdout(), std::io::stderr()),
+        Started::Closed(e) => Pumped::closed(e),
+    };
+    if pumped.no_answer() {
+        let _ = writeln!(stderr, "{AGENT_ENDED_UNANSWERED}");
+        return Ok(Some(255));
+    }
+    Ok(Some(pumped.code()))
 }
 
 /// Relay an interactive session over `conn`. A real console is required to capture input. No
@@ -293,13 +315,9 @@ fn relay_interactive(conn: Socket, rescued_modes: Option<ConsoleModes>) -> anyho
     Ok(Interactive::Pumped(run_pty(modes, rx, FrameReader::new(), tx, &hs)?))
 }
 
-/// What an EXEC session says when its input went to a connection the agent ended unread.
-const INPUT_LOST: &str = "ssh-broker: the agent closed the connection before it answered, after input had been sent to it; \
-     the command was not run again";
-
-/// What an EXEC session says when the agent ended the connection before it answered and is gone.
-const AGENT_GONE: &str = "ssh-broker: the agent closed the connection before it answered and is gone; \
-     the command was not run again";
+/// What an EXEC session says when the agent ended the connection before it answered.
+const AGENT_ENDED_UNANSWERED: &str =
+    "ssh-broker: the agent ended before it answered; the command may or may not have run";
 
 /// The message of a fail-open, for a location that cannot be used or a connect that failed.
 /// Always `Ok(None)`: the caller falls back to a local shell.

@@ -543,7 +543,7 @@ impl Rescue for Never {
 }
 
 #[test]
-fn a_command_whose_connection_ends_before_the_agent_answers_is_refused_with_a_message_not_run_locally() {
+fn a_command_whose_connection_ends_before_the_agent_answers_says_it_may_have_run_and_is_not_run_locally() {
     // The frames read are none (the connection closes with the handshake unread), or the handshake and
     // the stdin-EOF marker an exec shim sends at once.
     for (tag, frames) in [("hangup-unread", 0), ("hangup-read", 2)] {
@@ -564,12 +564,63 @@ fn a_command_whose_connection_ends_before_the_agent_answers_is_refused_with_a_me
 
         assert_eq!(relayed, Some(255), "{tag}");
         let text = String::from_utf8(stderr).unwrap();
-        assert!(
-            text.starts_with("ssh-broker: the agent closed the connection"),
-            "{tag}: {text}"
+        assert_eq!(
+            text,
+            "ssh-broker: the agent ended before it answered; the command may or may not have run
+",
+            "{tag}"
         );
-        assert!(text.contains("was not run again"), "{tag}: {text}");
     }
+}
+
+#[test]
+fn a_command_is_never_sent_to_an_agent_a_second_time() {
+    // The agent may have started the command before it closed the connection, and the agent that
+    // answers next could run it again. This agent is still there and would answer.
+    use crate::afunix;
+    use crate::protocol::{ExitCode, FrameKind, FrameReader, read_one_frame, write_frame};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    let (_profile, location, listener) = location_with_listener("never-twice");
+    let socket = location.path.clone();
+    let stop = std::sync::Arc::new(AtomicBool::new(false));
+    let connections = std::sync::Arc::new(AtomicUsize::new(0));
+    let agent = std::thread::spawn({
+        let (stop, connections) = (std::sync::Arc::clone(&stop), std::sync::Arc::clone(&connections));
+        move || {
+            loop {
+                let conn = listener.accept().unwrap();
+                if stop.load(Ordering::SeqCst) {
+                    return;
+                }
+                let nth = connections.fetch_add(1, Ordering::SeqCst) + 1;
+                let (mut rx, mut tx) = afunix::split(conn).unwrap();
+                read_one_frame(&mut rx, &mut FrameReader::new()).unwrap();
+                if nth > 1 {
+                    // A second connection would be served: the command would run twice.
+                    write_frame(&mut tx, FrameKind::Exit, &ExitCode(0).encode()).unwrap();
+                    let _ = tx.shutdown_write();
+                }
+                drop((rx, tx));
+            }
+        }
+    });
+
+    let relayed = super::try_relay_at(
+        Ok(location),
+        &Some("echo hi".into()),
+        &mut Vec::new(),
+        None,
+        std::io::empty(),
+        &mut Never,
+    )
+    .unwrap();
+
+    // Only now is the agent told to stop; its next accept is this connection.
+    stop.store(true, Ordering::SeqCst);
+    drop(afunix::connect(&socket).unwrap());
+    agent.join().unwrap();
+    assert_eq!(relayed, Some(255));
+    assert_eq!(connections.load(Ordering::SeqCst), 1, "the command was sent again");
 }
 
 #[test]
@@ -651,28 +702,51 @@ fn an_interactive_session_goes_round_again_to_an_agent_that_answers_the_second_t
 }
 
 #[test]
-fn input_already_sent_to_a_connection_that_ended_is_not_run_again() {
-    let (_profile, location, listener) = location_with_listener("hangup-input");
-    // The handshake and the first chunk of input, so the shim has handed input to the connection.
-    let agent = agent_that_hangs_up(listener, 2);
-    let mut stderr = Vec::new();
+fn an_interactive_session_goes_round_for_as_long_as_the_agent_hangs_up_and_answers_in_the_end() {
+    // No count ends the loop: an agent that is there and has closed a hundred connections without a
+    // byte is still asked again, and the session it then serves is the one relayed.
+    use super::Interactive;
+    use crate::relay::Outcome;
+    use crate::shim::Pumped;
+    const HANGUPS: usize = 100;
+    let (_profile, location, listener) = location_with_listener("hangup-many");
+    let (finished, wait_finished) = std::sync::mpsc::channel::<()>();
+    let agent = std::thread::spawn(move || {
+        for _ in 0..HANGUPS {
+            drop(listener.accept().unwrap());
+        }
+        let last = listener.accept().unwrap();
+        wait_finished.recv().ok();
+        drop(last);
+    });
+    let mut attempts = 0;
 
-    let relayed = super::try_relay_at(
+    let relayed = super::try_relay_with(
         Ok(location),
-        &Some("sort".into()),
-        &mut stderr,
+        &None,
+        &mut Vec::new(),
         None,
-        std::io::Cursor::new(b"b\na\n".to_vec()),
+        std::io::empty(),
         &mut Never,
+        &mut |_conn, _modes| {
+            attempts += 1;
+            Ok(Interactive::Pumped(if attempts <= HANGUPS {
+                Pumped::closed(anyhow::Error::new(std::io::Error::from(
+                    std::io::ErrorKind::ConnectionReset,
+                )))
+            } else {
+                Pumped {
+                    outcome: Ok(Outcome::Exited(7)),
+                    heard: true,
+                }
+            }))
+        },
     )
     .unwrap();
-    agent.join().unwrap();
 
-    assert_eq!(
-        relayed,
-        Some(255),
-        "the session failed, it was not run on what was left"
-    );
-    let text = String::from_utf8(stderr).unwrap();
-    assert!(text.contains("was not run again"), "{text}");
+    // Before the agent is joined: a shim that gave up early leaves it waiting for connections.
+    assert_eq!(attempts, HANGUPS + 1);
+    assert_eq!(relayed, Some(7));
+    finished.send(()).unwrap();
+    agent.join().unwrap();
 }
