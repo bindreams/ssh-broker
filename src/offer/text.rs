@@ -46,8 +46,8 @@ pub fn non_interactive_notice(user: &str, exe: &str) -> String {
 
 /// The sentence for a background agent that ended before it served. 64 to 67 are the agent's own
 /// refusals (see `agent_background::Refusal`); it has no console, so its exit code is all it can say.
-/// `logs` is the folder of its log.
-pub fn agent_ended(code: u32, logs: &std::path::Path) -> String {
+/// `logs` is the folder of its log, if it could be found: without it the sentence has no pointer.
+pub fn agent_ended(code: u32, logs: Option<&std::path::Path>) -> String {
     let sentence = match code {
         0 => "another agent took your session but did not answer.".to_string(),
         64 => "the background session started for a different account than yours and refused to serve.".to_string(),
@@ -57,10 +57,13 @@ pub fn agent_ended(code: u32, logs: &std::path::Path) -> String {
             .to_string(),
         67 => "the background session started, but its ssh-broker folder could not be made or was not safe to use."
             .to_string(),
-        other => format!(
-            "the agent exited with code {other}; see the agent.log files in {}",
-            logs.display()
-        ),
+        other => match logs {
+            Some(logs) => format!(
+                "the agent exited with code {other}; see the agent.log files in {}",
+                logs.display()
+            ),
+            None => format!("the agent exited with code {other}"),
+        },
     };
     format!("ssh-broker: {sentence}\r\n")
 }

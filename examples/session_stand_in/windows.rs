@@ -121,7 +121,7 @@ fn run_shim(password: &str, agent_exe: &Path) -> String {
     // SAFETY: a valid process handle.
     let pid = unsafe { GetProcessId(started.process.0) };
     let served = wait_for_agent(watch, HANDLE(started.process.0.0), |location| {
-        location.serving_marker_path().is_file().then_some(())
+        Ok(location.serving_marker_path().is_file().then_some(()))
     });
     match served {
         Ok(Served::Connected(())) => format!("Ready pid={pid} survival={:?}", started.survival),

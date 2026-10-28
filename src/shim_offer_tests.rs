@@ -105,10 +105,11 @@ impl Script {
         wait_until_serving(
             || {
                 self.events.borrow_mut().push("connect");
-                self.connects
+                Ok(self
+                    .connects
                     .borrow_mut()
                     .pop()
-                    .expect("connected more often than scripted")
+                    .expect("connected more often than scripted"))
             },
             || {
                 self.events.borrow_mut().push("wait");
@@ -156,10 +157,10 @@ fn an_agent_that_ended_with_no_peer_serving_reports_its_exit_code() {
 
 #[test]
 fn a_failing_wait_or_rearm_is_an_error_not_a_hang() {
-    let failed = wait_until_serving::<u32>(|| None, || anyhow::bail!("wait failed"), || Ok(())).unwrap_err();
+    let failed = wait_until_serving::<u32>(|| Ok(None), || anyhow::bail!("wait failed"), || Ok(())).unwrap_err();
     assert!(format!("{failed:#}").contains("wait failed"));
     let failed =
-        wait_until_serving::<u32>(|| None, || Ok(Woke::Changed), || anyhow::bail!("rearm failed")).unwrap_err();
+        wait_until_serving::<u32>(|| Ok(None), || Ok(Woke::Changed), || anyhow::bail!("rearm failed")).unwrap_err();
     assert!(format!("{failed:#}").contains("rearm failed"));
 }
 
@@ -197,10 +198,11 @@ impl Starts {
         wait_while_starting(
             || {
                 self.events.borrow_mut().push("connect");
-                self.connects
+                Ok(self
+                    .connects
                     .borrow_mut()
                     .pop()
-                    .expect("connected more often than scripted")
+                    .expect("connected more often than scripted"))
             },
             || {
                 self.events.borrow_mut().push("look");
@@ -271,20 +273,80 @@ fn an_agent_that_ended_without_serving_and_left_no_other_is_gone_not_absent() {
 
 #[test]
 fn a_failing_look_wait_or_rearm_is_an_error_not_a_hang() {
-    let failed =
-        wait_while_starting::<u32>(|| None, || anyhow::bail!("look failed"), || Ok(Woke::Gone), || Ok(())).unwrap_err();
+    let failed = wait_while_starting::<u32>(
+        || Ok(None),
+        || anyhow::bail!("look failed"),
+        || Ok(Woke::Gone),
+        || Ok(()),
+    )
+    .unwrap_err();
     assert!(format!("{failed:#}").contains("look failed"));
     let failed =
-        wait_while_starting::<u32>(|| None, || Ok(true), || anyhow::bail!("wait failed"), || Ok(())).unwrap_err();
+        wait_while_starting::<u32>(|| Ok(None), || Ok(true), || anyhow::bail!("wait failed"), || Ok(())).unwrap_err();
     assert!(format!("{failed:#}").contains("wait failed"));
     let failed = wait_while_starting::<u32>(
-        || None,
+        || Ok(None),
         || Ok(true),
         || Ok(Woke::Changed),
         || anyhow::bail!("rearm failed"),
     )
     .unwrap_err();
     assert!(format!("{failed:#}").contains("rearm failed"));
+}
+
+#[test]
+fn a_connect_that_fails_for_a_reason_that_waiting_does_not_clear_ends_the_wait_as_an_error() {
+    let denied = || -> anyhow::Result<Option<u32>> { anyhow::bail!("access denied") };
+    let failed = wait_until_serving(denied, || panic!("waited on an error"), || Ok(())).unwrap_err();
+    assert!(format!("{failed:#}").contains("access denied"), "{failed:#}");
+    let failed =
+        wait_while_starting(denied, || panic!("looked on an error"), || panic!("waited"), || Ok(())).unwrap_err();
+    assert!(format!("{failed:#}").contains("access denied"), "{failed:#}");
+}
+
+// logs_dir -----
+
+#[test]
+fn the_log_folder_is_named_when_the_location_is_known_and_the_failure_is_logged_when_it_is_not() {
+    let profile = crate::test_support::TempProfile::new("logs-dir");
+    let location = profile.location();
+    assert_eq!(logs_dir(Ok(location.clone())), Some(location.logs_dir()));
+
+    let (log, dir) = crate::test_support::logged(|| logs_dir(Err(anyhow::anyhow!("no profile for this token"))));
+    assert_eq!(dir, None, "no folder is invented");
+    assert!(log.contains("no profile for this token"), "{log}");
+}
+
+// connect_if_listening -----
+
+#[test]
+fn a_socket_that_is_not_there_is_nobody_listening() {
+    let profile = crate::test_support::TempProfile::new("connect-missing");
+    let location = profile.location();
+    // The folder is missing.
+    assert!(connect_if_listening(&location.path).unwrap().is_none());
+    // The folder is there and the socket file is not.
+    std::fs::create_dir_all(&location.dir).unwrap();
+    assert!(connect_if_listening(&location.path).unwrap().is_none());
+}
+
+#[test]
+fn a_socket_with_nobody_listening_on_it_is_nobody_listening() {
+    use socket2::{Domain, SockAddr, Socket, Type};
+    let profile = crate::test_support::TempProfile::new("connect-unlistened");
+    let location = profile.location();
+    std::fs::create_dir_all(&location.dir).unwrap();
+    // The file exists and `listen()` has not run, as in the agent's start.
+    let socket = Socket::new(Domain::UNIX, Type::STREAM, None).unwrap();
+    socket.bind(&SockAddr::unix(&location.path).unwrap()).unwrap();
+    assert!(connect_if_listening(&location.path).unwrap().is_none());
+}
+
+#[test]
+fn a_connect_that_fails_for_any_other_reason_is_an_error_naming_the_path() {
+    let long = std::path::PathBuf::from(format!(r"C:\{}\agent.sock", "x".repeat(120)));
+    let failed = connect_if_listening(&long).unwrap_err();
+    assert!(format!("{failed:#}").contains("too long"), "{failed:#}");
 }
 
 // wait_for_agent: the shim's own token and a temporary profile; no account, no logon -----
@@ -302,8 +364,8 @@ mod wait_for_agent_on_files {
         crate::winutil::OwnedHandle(unsafe { CreateEventW(None, true, false, windows::core::PCWSTR::null()) }.unwrap())
     }
 
-    fn marker_exists(location: &SocketLocation) -> Option<()> {
-        location.serving_marker_path().is_file().then_some(())
+    fn marker_exists(location: &SocketLocation) -> anyhow::Result<Option<()>> {
+        Ok(location.serving_marker_path().is_file().then_some(()))
     }
 
     #[test]

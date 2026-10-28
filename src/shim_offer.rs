@@ -17,7 +17,7 @@ use windows::Win32::System::Threading::{GetExitCodeProcess, INFINITE, WaitForMul
 use crate::account::{self, LocalAccount};
 use crate::acl::Sid;
 use crate::console_modes::ConsoleModes;
-use crate::console_prompt::{ConsolePrompt, absence, console_available};
+use crate::console_prompt::{ConsolePrompt, absence, console_available, is_no_agent};
 use crate::logon::{self, StartedAgent, Survival};
 use crate::offer::{
     Absence, AccountKind, Disconnected, OfferIo, Offered, SessionKind, StartFailure, non_interactive_notice, offer,
@@ -89,7 +89,9 @@ pub enum Served<C> {
     Gone,
 }
 
-/// Connect, and while that is refused wait for the folder to change or the agent to end.
+/// Connect, and while that is refused wait for the folder to change or the agent to end. `connect`
+/// is `Ok(None)` when nothing listens yet (see [`connect_if_listening`]); any other failure ends the
+/// wait as an error, since waiting does not clear it.
 ///
 /// The watch is armed by the caller before the first `connect`. After a wake it is re-armed **before**
 /// the next connect, so a change between the wake and that connect is seen by the connect or by the
@@ -101,24 +103,24 @@ pub enum Served<C> {
 /// connect once more: the loser of a start race exits 0 while another agent
 /// serves, and an agent that left non-zero can still have a serving peer.
 pub fn wait_until_serving<C>(
-    mut connect: impl FnMut() -> Option<C>,
+    mut connect: impl FnMut() -> anyhow::Result<Option<C>>,
     mut wait: impl FnMut() -> anyhow::Result<Woke>,
     mut rearm: impl FnMut() -> anyhow::Result<()>,
 ) -> anyhow::Result<Served<C>> {
     loop {
-        if let Some(connected) = connect() {
+        if let Some(connected) = connect()? {
             return Ok(Served::Connected(connected));
         }
         match wait()? {
             Woke::Changed => rearm()?,
             Woke::AgentExited(code) => {
-                return Ok(match connect() {
+                return Ok(match connect()? {
                     Some(connected) => Served::Connected(connected),
                     None => Served::Ended { code },
                 });
             }
             Woke::Gone => {
-                return Ok(match connect() {
+                return Ok(match connect()? {
                     Some(connected) => Served::Connected(connected),
                     None => Served::Gone,
                 });
@@ -147,14 +149,14 @@ pub enum Starting<C> {
 /// the loop connects once more and looks again: another agent may remain, and the wait goes on
 /// until none does. Refused with nobody there is `No` when no agent was ever seen, `Gone` when one was.
 pub fn wait_while_starting<C>(
-    mut connect: impl FnMut() -> Option<C>,
+    mut connect: impl FnMut() -> anyhow::Result<Option<C>>,
     mut look: impl FnMut() -> anyhow::Result<bool>,
     mut wait: impl FnMut() -> anyhow::Result<Woke>,
     mut rearm: impl FnMut() -> anyhow::Result<()>,
 ) -> anyhow::Result<Starting<C>> {
     let mut seen = false;
     loop {
-        if let Some(connected) = connect() {
+        if let Some(connected) = connect()? {
             return Ok(Starting::Served(connected));
         }
         if !look()? {
@@ -192,13 +194,13 @@ fn wait_for_change_or_exit(watch: &SocketWatch, agent: HANDLE) -> anyhow::Result
 pub fn wait_for_agent<C>(
     watch: SocketWatch,
     agent: HANDLE,
-    mut connect: impl FnMut(&SocketLocation) -> Option<C>,
+    mut connect: impl FnMut(&SocketLocation) -> anyhow::Result<Option<C>>,
 ) -> anyhow::Result<Served<C>> {
     let watch = RefCell::new(watch);
     wait_until_serving(
         || {
             let watch = watch.borrow();
-            watch.location().and_then(&mut connect)
+            watch.location().map_or(Ok(None), &mut connect)
         },
         || {
             let woke = wait_for_change_or_exit(&watch.borrow(), agent)?;
@@ -421,15 +423,11 @@ fn run_offer(account: LocalAccount, kind_of_absence: Absence) -> Rescued {
 /// it will not. Every wait here is on the agent itself: its process, and the files it writes.
 fn settle(started: Started) -> Result<Socket, String> {
     let Started { agent } = started;
-    let logs = || {
-        crate::userdir::current_socket_location()
-            .map(|location| location.logs_dir())
-            .unwrap_or_default()
-    };
+    let logs = || logs_dir(crate::userdir::current_socket_location());
     let failed = |e: anyhow::Error| text::start_failed(&format!("{e:#}"));
     let watch = SocketWatch::for_current_user().map_err(failed)?;
     let served =
-        wait_for_agent(watch, agent.process.0, |location| afunix::connect(&location.path).ok()).map_err(failed)?;
+        wait_for_agent(watch, agent.process.0, |location| connect_if_listening(&location.path)).map_err(failed)?;
     let served = serve_after_own_agent(served, || {
         let location = crate::userdir::current_socket_location()?;
         let user = Sid::current_user()?;
@@ -438,13 +436,36 @@ fn settle(started: Started) -> Result<Socket, String> {
     .map_err(failed)?;
     match served {
         Served::Connected(socket) => Ok(socket),
-        Served::Ended { code } => Err(text::agent_ended(code, &logs())),
+        Served::Ended { code } => Err(text::agent_ended(code, logs().as_deref())),
         // `Woke::Gone` is never returned by the wait above, which watches the agent's own process.
         Served::Gone => Err(text::start_failed("the agent ended before it served")),
     }
 }
 
+/// The folder of the agent's log, if the socket location is known; otherwise `None`, and why is logged.
+fn logs_dir(location: anyhow::Result<SocketLocation>) -> Option<PathBuf> {
+    match location {
+        Ok(location) => Some(location.logs_dir()),
+        Err(e) => {
+            tracing::warn!("cannot tell where the agent's log is: {e:#}");
+            None
+        }
+    }
+}
+
 // a starting agent -----
+
+/// Connect to the agent's socket. `Ok(None)` is "nobody listens there": the folder or the socket file
+/// is missing, or the file is there and `listen()` has not run (see [`is_no_agent`]). Any other
+/// failure (access denied, a path too long, a protocol error) is not a sign that an agent is starting
+/// and does not clear by waiting, so it is an error.
+fn connect_if_listening(path: &Path) -> anyhow::Result<Option<Socket>> {
+    match afunix::connect(path) {
+        Ok(socket) => Ok(Some(socket)),
+        Err(e) if is_no_agent(&e) => Ok(None),
+        Err(e) => Err(e.context(format!("connect to the agent's socket {}", path.display()))),
+    }
+}
 
 /// What there is to wait for while an agent starts: the holder of the user's lock, and the running
 /// agent processes of the user. Either one may be there without the other: an agent takes the lock
@@ -512,7 +533,7 @@ fn await_starting_agent(location: &SocketLocation, image: &Path, user: &Sid) -> 
     let watch = RefCell::new(SocketWatch::for_location(location)?);
     let evidence = RefCell::new(Evidence::default());
     wait_while_starting(
-        || afunix::connect(&location.path).ok(),
+        || connect_if_listening(&location.path),
         || evidence.borrow_mut().look(&lock, image, user),
         || evidence.borrow_mut().wait(&watch.borrow()),
         || watch.borrow_mut().rearm(),

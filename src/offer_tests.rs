@@ -268,7 +268,7 @@ fn notice_names_the_full_exe_path() {
 #[test]
 fn agent_exit_code_sentences() {
     let logs = std::path::Path::new(r"C:\Users\me\AppData\Local\ssh-broker\logs");
-    let line = |code| text::agent_ended(code, logs);
+    let line = |code| text::agent_ended(code, Some(logs));
     for code in [64, 65, 66, 67] {
         let sentence = line(code);
         assert!(sentence.starts_with("ssh-broker: "), "{sentence}");
@@ -294,6 +294,12 @@ fn agent_exit_code_sentences() {
         "{}",
         line(0xC000_0142)
     );
+}
+
+#[test]
+fn an_exit_code_with_no_known_log_folder_points_at_no_folder() {
+    let line = text::agent_ended(1, None);
+    assert_eq!(line, "ssh-broker: the agent exited with code 1\r\n");
 }
 
 #[test]

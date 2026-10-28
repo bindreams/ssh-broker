@@ -307,3 +307,35 @@ impl Drop for Watchdog {
         }
     }
 }
+
+// Logging -----
+
+/// Run `f` and return what it logged, with its result.
+pub fn logged<T>(f: impl FnOnce() -> T) -> (String, T) {
+    use std::sync::{Arc, Mutex};
+    #[derive(Clone, Default)]
+    struct Buf(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for Buf {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Buf {
+        type Writer = Buf;
+        fn make_writer(&'a self) -> Buf {
+            self.clone()
+        }
+    }
+    let buf = Buf::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(buf.clone())
+        .with_ansi(false)
+        .finish();
+    let result = tracing::subscriber::with_default(subscriber, f);
+    let log = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+    (log, result)
+}
