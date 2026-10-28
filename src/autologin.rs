@@ -18,6 +18,7 @@ use anyhow::Context;
 use crate::account::LocalAccount;
 use crate::offer::{AccountKind, text};
 use crate::password_entry::{Password, Step};
+use crate::provision::layout::Layout;
 use crate::provision::session_task::{TaskState, requested_sddl, task_name, task_problem, task_xml};
 
 /// Whether an account may log on as a batch job, checked with its password.
@@ -85,7 +86,7 @@ fn batch_right_missing(user: &str) -> String {
 }
 
 fn no_lock_warning(cause: &str) -> String {
-    format!("ssh-broker: warning: the apply lock was not taken ({cause}); deleting the task anyway.")
+    format!("ssh-broker: warning: {cause}; deleting the task anyway.")
 }
 
 /// `ssh-broker auto-login on` for `account`.
@@ -104,6 +105,9 @@ pub fn on(env: &mut dyn AutoLoginEnv, account: &LocalAccount) -> anyhow::Result<
         account.kind == AccountKind::Local,
         text::not_local(&account.name).trim_end().to_string()
     );
+    // Read-only and before the prompt: with no install there is nothing to register the task for, and
+    // the password would be typed for nothing. Checked again under the lock, as it may change meanwhile.
+    env.check_install()?;
     // Not under the lock: a prompt left open must not hold up `apply` or the boot self-heal.
     let password = env
         .ask_password(account)?
@@ -177,14 +181,16 @@ pub fn off(env: &mut dyn AutoLoginEnv, account: &LocalAccount) -> anyhow::Result
         InstallDir::Missing => None,
         InstallDir::Untrusted(reason) => {
             env.say(&no_lock_warning(&format!(
-                "the install directory is not trusted ({reason})"
+                "the apply lock was not taken: the install directory is not trusted ({reason})"
             )));
             None
         }
         InstallDir::Trusted => match env.lock_apply() {
             Ok(lock) => Some(lock),
             Err(e) => {
-                env.say(&no_lock_warning(&format!("it could not be taken: {e:#}")));
+                // The error already says the lock could not be taken, in the words of `lock_apply`.
+                let cause = format!("{e:#}");
+                env.say(&no_lock_warning(cause.strip_prefix("ssh-broker: ").unwrap_or(&cause)));
                 None
             }
         },
@@ -213,14 +219,32 @@ pub enum PasswordSource {
 /// The real machine: Task Scheduler, the console, LSA.
 pub struct WindowsEnv {
     source: PasswordSource,
+    /// The install directory, which holds the apply lock and the exe the task runs.
+    layout: Layout,
+    /// Runs once when the apply lock is found held, before the wait for it begins.
+    on_lock_wait: Box<dyn FnMut()>,
     /// The exe the task runs, when it is not the installed one (tests); the install is then not checked.
     exe_override: Option<PathBuf>,
 }
 
 impl WindowsEnv {
     pub fn new(source: PasswordSource) -> WindowsEnv {
+        WindowsEnv::with_layout(source, Layout::production(), || {
+            eprintln!("ssh-broker: an apply or auto-login command is running; waiting for it to finish")
+        })
+    }
+
+    /// An env over the install directory of `layout`; `on_lock_wait` runs when the apply lock is held
+    /// by another and the wait for it is about to begin.
+    pub(crate) fn with_layout(
+        source: PasswordSource,
+        layout: Layout,
+        on_lock_wait: impl FnMut() + 'static,
+    ) -> WindowsEnv {
         WindowsEnv {
             source,
+            layout,
+            on_lock_wait: Box::new(on_lock_wait),
             exe_override: None,
         }
     }
@@ -228,8 +252,8 @@ impl WindowsEnv {
     /// For tests: the task runs `exe`, and the install directory is not examined.
     pub fn with_exe_unchecked(source: PasswordSource, exe: PathBuf) -> WindowsEnv {
         WindowsEnv {
-            source,
             exe_override: Some(exe),
+            ..WindowsEnv::new(source)
         }
     }
 }
@@ -257,29 +281,25 @@ impl AutoLoginEnv for WindowsEnv {
     }
 
     fn exe(&self) -> PathBuf {
-        self.exe_override
-            .clone()
-            .unwrap_or_else(crate::provision::canonical_exe)
+        self.exe_override.clone().unwrap_or_else(|| self.layout.canonical_exe())
     }
 
     fn install_dir(&self) -> InstallDir {
         if self.exe_override.is_some() {
             return InstallDir::Trusted;
         }
-        install_dir_of(&crate::provision::layout::Layout::production())
+        install_dir_of(&self.layout)
     }
 
     fn lock_apply(&mut self) -> anyhow::Result<Box<dyn std::any::Any>> {
         if self.exe_override.is_some() {
             return Ok(Box::new(()));
         }
-        let layout = crate::provision::layout::Layout::production();
-        crate::provision::layout::ensure_base(&layout)
+        crate::provision::layout::ensure_base(&self.layout)
             .context("ssh-broker: could not prepare the install directory that holds the apply lock")?;
-        let lock = crate::provision::apply_lock::acquire(&layout.apply_lock_path(), || {
-            eprintln!("ssh-broker: an apply or auto-login command is running; waiting for it to finish")
-        })
-        .context("ssh-broker: could not take the apply lock")?;
+        let on_wait = &mut self.on_lock_wait;
+        let lock = crate::provision::apply_lock::acquire(&self.layout.apply_lock_path(), on_wait)
+            .context("ssh-broker: could not take the apply lock")?;
         Ok(Box::new(lock))
     }
 
@@ -287,19 +307,20 @@ impl AutoLoginEnv for WindowsEnv {
         if self.exe_override.is_some() {
             return Ok(());
         }
-        let layout = crate::provision::layout::Layout::production();
-        if let Err(reason) = crate::provision::layout::check_base(&layout) {
-            anyhow::bail!(
+        let layout = &self.layout;
+        match install_dir_of(layout) {
+            InstallDir::Missing => {}
+            InstallDir::Untrusted(reason) => anyhow::bail!(
                 "ssh-broker: the install directory is not trusted ({reason}); the task would run from it with a \
                  stored password. Run apply, or inspect the directory"
-            );
+            ),
+            InstallDir::Trusted if layout.canonical_exe().is_file() => return Ok(()),
+            InstallDir::Trusted => {}
         }
-        anyhow::ensure!(
-            layout.canonical_exe().is_file(),
+        anyhow::bail!(
             "ssh-broker: {} is not installed; run apply first",
             layout.canonical_exe().display()
-        );
-        Ok(())
+        )
     }
 
     fn ask_password(&mut self, account: &LocalAccount) -> anyhow::Result<Option<Password>> {
