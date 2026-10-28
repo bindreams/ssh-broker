@@ -52,7 +52,7 @@ fn a_second_logout_that_registers_ends_the_drain_of_the_first_at_once() {
     // registers, the condition holds, and the drain must see it: its bound is an hour, so only a wake
     // can end it in time.
     let (events, on_event) = mpsc::channel();
-    let connections = Connections::with_drain(Duration::from_secs(3600), move || {
+    let connections = Connections::with_drain(Duration::from_secs(3600), move |_| {
         let _ = events.send("parked");
     });
     let first = connections.begin();
@@ -84,7 +84,7 @@ fn a_second_logout_that_registers_ends_the_drain_of_the_first_at_once() {
 /// wake can end it in time.
 fn drain_ends_when(mutation: impl FnOnce(Live)) {
     let (events, on_event) = mpsc::channel();
-    let connections = Connections::with_drain(Duration::from_secs(3600), move || {
+    let connections = Connections::with_drain(Duration::from_secs(3600), move |_| {
         let _ = events.send("parked");
     });
     let _logout_connection = connections.begin();
@@ -119,16 +119,17 @@ fn a_connection_given_up_because_no_thread_could_be_started_ends_the_drain_at_on
 
 /// A drain parked on a connection that is not a `logout` request. `before` adds to the tally before
 /// the drain parks; `mutation` then changes it without satisfying the drain, and returns the
-/// connections it leaves live. The drain must re-judge after the change (the hook reports a second
-/// park); its bound is an hour, so only a wake can make it. Then every connection ends and the drain
-/// completes.
+/// connections it leaves live. The drain must re-judge after the change: the hook reports a park that
+/// saw one more connection to wait for than the first park did (a spurious wake-up before the change
+/// re-judges the old tally, so it cannot pass for the wake). Its bound is an hour, so only a wake can
+/// make it. Then every connection ends and the drain completes.
 fn drain_rejudges_when<T>(
     before: impl FnOnce(&Arc<Connections>) -> T,
     mutation: impl FnOnce(&Arc<Connections>, T) -> Vec<Live>,
 ) {
     let (events, on_event) = mpsc::channel();
-    let connections = Connections::with_drain(Duration::from_secs(3600), move || {
-        let _ = events.send("parked");
+    let connections = Connections::with_drain(Duration::from_secs(3600), move |waiting| {
+        let _ = events.send(waiting);
     });
     let _logout_connection = connections.begin();
     let _logout = connections.begin_logout();
@@ -143,11 +144,13 @@ fn drain_rejudges_when<T>(
         let connections = Arc::clone(&connections);
         move || connections.wait_until_only_logouts_live()
     });
-    assert_eq!(on_event.recv().unwrap(), "parked");
+    assert_eq!(on_event.recv().unwrap(), 1, "the drain parked on a different tally");
 
     let kept = mutation(&connections, added);
 
-    assert_eq!(on_event.recv().unwrap(), "parked", "the drain did not re-judge");
+    // A park that still sees the old tally is a spurious wake-up before the change: it is not the wake.
+    let judged = on_event.iter().find(|waiting| *waiting != 1);
+    assert_eq!(judged, Some(2), "the drain did not re-judge the changed tally");
     assert!(!failsafe.finish(), "the drain re-judged only when the failsafe woke it");
     drop(other);
     drop(kept);

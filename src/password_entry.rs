@@ -58,7 +58,8 @@ impl PasswordEntry {
     }
 
     /// Apply one key event. `Submit` moves the text out; `Cancel` wipes it. Either leaves the
-    /// entry empty and usable.
+    /// entry empty and usable. A character or Backspace acts `repeat_count` times (the console
+    /// merges a repeated key-down into one record); Enter and Ctrl+C or Ctrl+D act once.
     pub fn key(&mut self, k: &KeyEvent) -> Step {
         if !k.key_down {
             // A console delivers a character that has no key of its own (one outside the BMP, typed as
@@ -82,7 +83,9 @@ impl PasswordEntry {
             return Step::Submit(Password(std::mem::take(&mut self.text)));
         }
         if k.virtual_key_code == VK_BACK {
-            self.text.pop_scalar();
+            for _ in 0..k.repeat_count.max(1) {
+                self.text.pop_scalar();
+            }
             return Step::Continue;
         }
         self.type_char(k);

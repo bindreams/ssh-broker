@@ -2,7 +2,9 @@
 //!
 //! The console is already in the raw mode the relay uses (`console_modes`), so nothing is echoed and
 //! Ctrl+C arrives as a key. Records are peeked one batch at a time and fed to `PasswordEntry`
-//! (`batch`); only the records fed are taken from the console's queue, and every copy is wiped.
+//! (`batch`), except the last record of each peek, which is fed from the read that removes it (the
+//! console may have merged a repeat into it since); only the records fed are taken from the
+//! console's queue, and every copy is wiped.
 
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::System::Console::{

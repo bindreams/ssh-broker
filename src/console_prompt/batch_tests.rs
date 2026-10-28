@@ -268,7 +268,8 @@ fn a_key_the_console_repeats_into_the_last_peeked_record_is_typed_every_time() {
 }
 
 /// A repeat merged into the finishing Enter is the user holding Enter: one submit, and nothing else
-/// is taken or changed.
+/// is taken or changed. (The feed-from-read path is pinned by the two merged-repeat tests beside it,
+/// for a character and for Backspace; this one holds with or without it.)
 #[test]
 fn a_repeat_merged_into_the_finishing_enter_submits_once() {
     let mut queue = FakeQueue::with(typed("pw\r"));
@@ -279,4 +280,19 @@ fn a_repeat_merged_into_the_finishing_enter_submits_once() {
     assert_eq!(queue.removed, 3);
     assert_eq!(queue.left(), "");
     assert!(entry.backing().iter().all(|unit| *unit == 0), "the entry kept text");
+}
+
+/// The console merges a repeated Backspace into the last queued record too: the entry deletes as many
+/// characters as the record the read removed says.
+#[test]
+fn a_backspace_the_console_repeats_into_the_last_peeked_record_deletes_every_time() {
+    let mut records = typed("abcd");
+    records.push(key(0x08, 0x08));
+    let mut queue = FakeQueue::with(records);
+    queue.merge_into_tail_after_peek = Some(3);
+    queue.arrivals.push_back(typed("\r"));
+    let mut batch = Batch::new();
+    let mut entry = PasswordEntry::new();
+    assert_eq!(submitted(batch.step(&mut queue, &mut entry).unwrap()), "a");
+    assert_eq!(queue.left(), "");
 }

@@ -200,6 +200,97 @@ fn repeat_count_repeats_the_character() {
     assert_eq!(submitted(e.key(&enter())).as_wide(), [0x61; 3]);
 }
 
+/// What a key leaves behind: the entry's text (read by pressing Enter), or the step that ended it.
+#[derive(Debug, PartialEq)]
+enum Outcome {
+    Text(String),
+    Submitted(String),
+    Empty,
+    Cancel,
+}
+
+fn outcome_of(setup: &str, key: &KeyEvent) -> Outcome {
+    let mut e = PasswordEntry::new();
+    type_str(&mut e, setup);
+    let read = |p: Password| String::from_utf16(p.as_wide()).unwrap();
+    match e.key(key) {
+        Step::Submit(p) => Outcome::Submitted(read(p)),
+        Step::Empty => Outcome::Empty,
+        Step::Cancel => Outcome::Cancel,
+        Step::Continue => match e.key(&enter()) {
+            Step::Submit(p) => Outcome::Text(read(p)),
+            Step::Empty => Outcome::Text(String::new()),
+            other => panic!("Enter after a key gave {other:?}"),
+        },
+    }
+}
+
+/// The console merges a repeated key-down into one record and raises its count, so an editing key's
+/// effect is the same whether it arrives as `n` records or as one record with count `n`. A finishing
+/// key acts once, whatever its count.
+#[test]
+fn every_key_the_entry_handles_honours_its_repeat_count() {
+    const VK_MENU: u16 = 0x12;
+    type Case = (&'static str, &'static str, fn(u16) -> KeyEvent, fn(usize) -> Outcome);
+    let cases: [Case; 9] = [
+        (
+            "character",
+            "ab",
+            |_| typed(0x78),
+            |n| Outcome::Text(format!("ab{}", "x".repeat(n))),
+        ),
+        (
+            "character on the key-up of Alt",
+            "ab",
+            |_| event(VK_MENU, 0x78, false, 0),
+            |n| Outcome::Text(format!("ab{}", "x".repeat(n))),
+        ),
+        (
+            "control character",
+            "ab",
+            |_| typed(0x09),
+            |_| Outcome::Text("ab".into()),
+        ),
+        (
+            "backspace",
+            "abcd",
+            |_| event(VK_BACK, 0x08, true, 0),
+            |n| Outcome::Text("abcd"[..4 - n.min(4)].into()),
+        ),
+        (
+            "backspace over surrogate pairs",
+            "a\u{1F600}\u{1F600}",
+            |_| event(VK_BACK, 0x08, true, 0),
+            |n| Outcome::Text(if n == 1 { "a\u{1F600}" } else { "" }.into()),
+        ),
+        (
+            "backspace on nothing",
+            "",
+            |_| event(VK_BACK, 0x08, true, 0),
+            |_| Outcome::Text(String::new()),
+        ),
+        ("enter", "pw", |_| enter(), |_| Outcome::Submitted("pw".into())),
+        ("enter on nothing", "", |_| enter(), |_| Outcome::Empty),
+        (
+            "ctrl+c",
+            "pw",
+            |_| event(0x43, 0x03, true, LEFT_CTRL),
+            |_| Outcome::Cancel,
+        ),
+    ];
+    for (name, setup, key, expect) in cases {
+        for repeat in [1u16, 3] {
+            let mut k = key(repeat);
+            k.repeat_count = repeat;
+            assert_eq!(
+                outcome_of(setup, &k),
+                expect(repeat as usize),
+                "{name}, repeat {repeat}"
+            );
+        }
+    }
+}
+
 #[test]
 fn alt_modified_keys_with_no_character_add_nothing() {
     let mut e = PasswordEntry::new();

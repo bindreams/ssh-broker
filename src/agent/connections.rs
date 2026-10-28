@@ -16,8 +16,10 @@ pub(super) struct Connections {
     drain_bound: std::time::Duration,
     /// Called each time the drain is about to park, with the tally locked: the lock is released by
     /// the park itself, so what this causes to happen to a connection happens after the drain is
-    /// waiting. It must not take the lock. A test uses it to know that the drain is waiting.
-    drain_parks: Box<dyn Fn() + Send + Sync>,
+    /// waiting. It must not take the lock. A test uses it to know that the drain is waiting. It gets
+    /// the number of live connections that are not `logout` requests, as the tally has it now, so a
+    /// test can tell a park that saw its change from one that did not.
+    drain_parks: Box<dyn Fn(usize) + Send + Sync>,
     /// How the end went, once it is decided (see [`Connections::settle`]).
     settled: std::sync::OnceLock<Drained>,
 }
@@ -62,16 +64,19 @@ impl Connections {
     }
 
     pub(super) fn with_drain_bound(drain_bound: std::time::Duration) -> Arc<Self> {
-        Self::with_drain(drain_bound, || {})
+        Self::with_drain(drain_bound, |_| {})
     }
 
     /// [`Connections::new`] that calls `parks` each time the drain is about to park.
     #[cfg(test)]
     pub(super) fn observing_drain(parks: impl Fn() + Send + Sync + 'static) -> Arc<Self> {
-        Self::with_drain(DRAIN_BOUND, parks)
+        Self::with_drain(DRAIN_BOUND, move |_| parks())
     }
 
-    pub(super) fn with_drain(drain_bound: std::time::Duration, parks: impl Fn() + Send + Sync + 'static) -> Arc<Self> {
+    pub(super) fn with_drain(
+        drain_bound: std::time::Duration,
+        parks: impl Fn(usize) + Send + Sync + 'static,
+    ) -> Arc<Self> {
         Arc::new(Self {
             drain_bound,
             drain_parks: Box::new(parks),
@@ -151,7 +156,7 @@ impl Connections {
             .wait_timeout_while(tally, self.drain_bound, |tally| {
                 let parks = tally.live > tally.logouts;
                 if parks {
-                    (self.drain_parks)();
+                    (self.drain_parks)(tally.live - tally.logouts);
                 }
                 parks
             })
@@ -233,7 +238,7 @@ impl Connections {
             .wait_while(tally, |tally| {
                 let parks = tally.listener_open && tally.wake_failed.is_none();
                 if parks {
-                    (self.drain_parks)();
+                    (self.drain_parks)(tally.live.saturating_sub(tally.logouts));
                 }
                 parks
             })
