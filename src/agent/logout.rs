@@ -20,12 +20,12 @@
 //! listener, and its shim treats that as an agent that is gone. The session slot and the user lock
 //! stay held until the process ends, so a successor agent starts only after this one is gone.
 
-use std::io::Read;
+use std::io::{Read, Write};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
-use super::{Connections, Drained};
-use crate::afunix::{ConnRx, ConnTx};
+use super::{Connections, Drained, HalfClose};
+use crate::afunix::{ConnRx, Whole};
 use crate::protocol::{ExitCode, FrameKind, Stream, write_frame};
 use crate::relay::write_data;
 
@@ -174,14 +174,60 @@ pub(super) fn handle_logout<R: LimitedRead, W: std::io::Write>(
 /// with the stdin EOF marker), and closing with that unread would reset the connection and lose the
 /// reply. The read has the drain's bound ([`wait_for_client`]). The connection stays live for the
 /// drain until the read returns, so the process does not end under it.
-pub(super) fn refuse_while_ending<R: LimitedRead>(
+pub(super) fn refuse_while_ending<R: LimitedRead, W: Write + HalfClose>(
     rx: &mut R,
-    tx: &mut ConnTx,
+    tx: &mut W,
     control: &Control,
 ) -> anyhow::Result<()> {
-    reply(tx, ENDING_REFUSAL, ENDING_REFUSED_EXIT_CODE)?;
+    answer_and_wait(
+        rx,
+        tx,
+        control,
+        ENDING_REFUSAL,
+        ENDING_REFUSED_EXIT_CODE,
+        "a refused login",
+    )
+}
+
+/// What the shim exits with when the agent could not read the request.
+pub const BAD_REQUEST_EXIT_CODE: i32 = 254;
+/// What the shim exits with when the agent could not serve a request it read.
+pub const FAILED_EXIT_CODE: i32 = 255;
+
+/// Tell a client the agent could not serve its connection, which is a fault of the agent's or the
+/// request's and not the end: `what` says what could not be done, `cause` why, and the client exits
+/// with `code`. The connection is answered like a refusal (see [`refuse_while_ending`]), because the
+/// shim treats a connection that ends without a byte as an agent that is going away. Returns `cause`,
+/// for the caller to log, with `what` as its context.
+pub(super) fn fail_connection<R: LimitedRead, W: Write + HalfClose>(
+    rx: &mut R,
+    tx: &mut W,
+    control: &Control,
+    what: &str,
+    cause: anyhow::Error,
+    code: i32,
+) -> anyhow::Error {
+    let text = format!("ssh-broker: {what}: {cause:#}\r\n");
+    // A client that has gone cannot be told; the caller logs the cause either way.
+    if let Err(e) = answer_and_wait(rx, tx, control, &text, code, "a failed connection") {
+        tracing::debug!("could not tell the client why its connection failed: {e:#}");
+    }
+    cause.context(what.to_owned())
+}
+
+/// Send `text` and `code`, FIN the write half and wait for the client to close (see
+/// [`wait_for_client`]).
+fn answer_and_wait<R: LimitedRead, W: Write + HalfClose>(
+    rx: &mut R,
+    tx: &mut W,
+    control: &Control,
+    text: &str,
+    code: i32,
+    who: &str,
+) -> anyhow::Result<()> {
+    reply(tx, text, code)?;
     tx.shutdown_write()?;
-    wait_for_client(rx, control, "a refused login");
+    wait_for_client(rx, control, who);
     Ok(())
 }
 
@@ -199,6 +245,12 @@ pub(super) trait LimitedRead: Read {
 }
 
 impl LimitedRead for ConnRx {
+    fn limit_reads(&mut self, limit: Duration) -> std::io::Result<()> {
+        self.set_read_timeout(Some(limit))
+    }
+}
+
+impl LimitedRead for &Whole {
     fn limit_reads(&mut self, limit: Duration) -> std::io::Result<()> {
         self.set_read_timeout(Some(limit))
     }

@@ -412,20 +412,10 @@ fn the_accept_loop_is_woken_after_the_flag_that_stops_it_is_up() {
     assert_eq!(*seen.lock().unwrap(), Some(true));
 }
 
-/// A connected AF_UNIX pair in a temp dir (no ACLs: these tests exercise the reply, not the security
-/// boundary). Returns the server's halves, the client's halves and the dir to remove.
+/// [`crate::test_support::raw_socket_pair`] with both ends split: the server's halves, the client's
+/// halves and the dir to remove.
 fn socket_pair(tag: &str) -> ((ConnRx, ConnTx), (ConnRx, ConnTx), std::path::PathBuf) {
-    use socket2::{Domain, SockAddr, Socket, Type};
-    let dir = std::env::temp_dir().join(format!("sb-logout-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("s");
-    let listener = Socket::new(Domain::UNIX, Type::STREAM, None).unwrap();
-    listener.bind(&SockAddr::unix(&path).unwrap()).unwrap();
-    listener.listen(1).unwrap();
-    let client = Socket::new(Domain::UNIX, Type::STREAM, None).unwrap();
-    client.connect(&SockAddr::unix(&path).unwrap()).unwrap();
-    let (server, _) = listener.accept().unwrap();
+    let (server, client, dir) = crate::test_support::raw_socket_pair(tag);
     (split(server).unwrap(), split(client).unwrap(), dir)
 }
 

@@ -154,6 +154,31 @@ fn assert_refused((outcome, stderr): (Outcome, Vec<u8>)) {
     assert_eq!(stderr, super::logout::ENDING_REFUSAL.as_bytes());
 }
 
+/// A login whose program does not exist is answered with the cause and exit 255, not dropped: the
+/// shim takes a connection that ends without a byte for an agent that is going away.
+fn assert_unstartable_is_answered(tag: &str, mode: Mode, what: &str) {
+    let (outcome, stderr) = refused_login_of(tag, mode, "ssh-broker-no-such-program-4f1c", |conn| {
+        let result = super::handle_connection_in(conn, Hooks::production(), &super::Control::standalone());
+        assert!(result.is_err(), "the failure is returned for the log");
+    });
+    assert_eq!(outcome, Outcome::Exited(255));
+    let text = String::from_utf8_lossy(&stderr);
+    assert!(
+        text.starts_with(&format!("ssh-broker: the agent could not start the {what}: ")),
+        "{text}"
+    );
+}
+
+#[test]
+fn an_exec_command_that_does_not_exist_is_answered_not_dropped() {
+    assert_unstartable_is_answered("nosuch-exec", Mode::Exec, "command");
+}
+
+#[test]
+fn a_pty_shell_that_does_not_exist_is_answered_not_dropped() {
+    assert_unstartable_is_answered("nosuch-pty", Mode::Pty, "shell");
+}
+
 #[test]
 fn an_exec_login_to_an_ending_agent_is_refused_before_a_shell_starts() {
     let control = super::Control::new(true, super::Connections::new());

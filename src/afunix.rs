@@ -283,13 +283,56 @@ pub struct ConnTx(Socket);
 /// handle, so one thread can `pump_decode` while another writes frames — mirroring the
 /// relay's two-pump model.
 pub fn split(sock: Socket) -> anyhow::Result<(ConnRx, ConnTx)> {
-    let write_half = sock.try_clone()?;
+    try_split(sock).map_err(|(_, e)| e)
+}
+
+/// A connection that [`try_split`] could not split: both directions on the one socket, for a party
+/// that has to answer it all the same.
+pub struct Whole(Socket);
+
+impl Whole {
+    pub fn of(sock: Socket) -> Whole {
+        Whole(sock)
+    }
+
+    /// See [`ConnRx::set_read_timeout`].
+    pub fn set_read_timeout(&self, limit: Option<std::time::Duration>) -> std::io::Result<()> {
+        self.0.set_read_timeout(limit.map(whole_milliseconds_up))
+    }
+
+    /// Send FIN on the write direction.
+    pub fn shutdown_write(&self) -> anyhow::Result<()> {
+        self.0.shutdown(std::net::Shutdown::Write)?;
+        Ok(())
+    }
+}
+
+impl Read for &Whole {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        (&self.0).read(buf)
+    }
+}
+
+impl Write for &Whole {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        (&self.0).write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        (&self.0).flush()
+    }
+}
+
+/// [`split`] that gives the connection back, with the reason, when it cannot be split.
+pub fn try_split(sock: Socket) -> Result<(ConnRx, ConnTx), (Whole, anyhow::Error)> {
+    let write_half = match sock.try_clone() {
+        Ok(write_half) => write_half,
+        Err(e) => return Err((Whole(sock), e.into())),
+    };
     // Clear inherit on BOTH halves: callers should hand in an already-cleared socket
     // (from accept/connect), but split is `pub` and must not depend on that.
     #[cfg(windows)]
-    {
-        set_no_inherit(&sock)?;
-        set_no_inherit(&write_half)?;
+    if let Err(e) = set_no_inherit(&sock).and_then(|()| set_no_inherit(&write_half)) {
+        return Err((Whole(sock), e));
     }
     Ok((ConnRx(sock), ConnTx(write_half)))
 }

@@ -1127,7 +1127,7 @@ fn a_thread_that_cannot_be_started_hands_the_connection_back_uncounted() {
     let connections = Connections::new();
     let live = connections.begin();
     let before = connections.ended();
-    let failed = hand_to_thread(
+    let (conn, failed) = hand_to_thread(
         7u32,
         live,
         |_work| Err(std::io::Error::other("no thread")),
@@ -1135,6 +1135,10 @@ fn a_thread_that_cannot_be_started_hands_the_connection_back_uncounted() {
     )
     .unwrap_err();
     assert_eq!(failed.to_string(), "no thread");
+    assert_eq!(
+        conn, 7,
+        "the connection comes back, to be served when a thread can be started"
+    );
     // Neither live nor ended: it never ran, so it frees nothing that waiting could be for.
     assert_eq!(connections.ended(), before);
     assert!(!connections.wait_for_an_end(before, || {}));
@@ -1157,9 +1161,12 @@ fn a_thread_that_starts_runs_the_handler_and_ends_the_connection_after_it() {
 }
 
 #[test]
-fn a_connection_whose_thread_cannot_start_is_dropped_and_the_loop_goes_on_if_one_is_live() {
+fn a_connection_whose_thread_cannot_start_is_kept_and_served_once_a_connection_has_ended() {
+    // The agent never closes a connection it has accepted without a word: it keeps this one until
+    // something that holds a thread has ended, and tries again with the same connection.
     let lives = RefCell::new(Vec::new());
     let mut accepted = 0;
+    let mut tried = Vec::new();
     let mut handled = Vec::new();
     let end = serve_connections(
         || {
@@ -1170,18 +1177,20 @@ fn a_connection_whose_thread_cannot_start_is_dropped_and_the_loop_goes_on_if_one
             }
         },
         |conn, live| {
-            if conn == 2 {
-                // This one's thread fails; connection 1, live, ends meanwhile.
+            tried.push(conn);
+            if conn == 2 && tried.iter().filter(|tried| **tried == 2).count() == 1 {
+                // The first try of this one's thread fails; connection 1, live, ends meanwhile.
                 lives.borrow_mut().clear();
                 live.abandon();
-                return Err(std::io::Error::other("no thread"));
+                return Err((conn, std::io::Error::other("no thread")));
             }
             handled.push(conn);
             lives.borrow_mut().push(live);
             Ok(())
         },
     );
-    assert_eq!(handled, [1, 3]);
+    assert_eq!(tried, [1, 2, 2, 3]);
+    assert_eq!(handled, [1, 2, 3], "the connection was dropped, not kept");
     assert!(format!("{end:#}").ends_with("end of script"), "{end:#}");
 }
 
@@ -1193,10 +1202,10 @@ fn a_thread_that_cannot_start_with_no_connection_live_is_fatal_and_says_why() {
             accepted += 1;
             Ok(accepted)
         },
-        |_conn, live| {
+        |conn, live| {
             // What `hand_to_thread` does: the failed connection is neither live nor ended.
             live.abandon();
-            Err(std::io::Error::other("no thread"))
+            Err((conn, std::io::Error::other("no thread")))
         },
     );
     assert_eq!(accepted, 1, "accepted again with nothing that could free a thread");

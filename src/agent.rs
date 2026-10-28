@@ -341,15 +341,16 @@ fn run_on_with<L>(
 /// Run `handle` on a thread started by `spawn`, which owns `conn` and `live`. The connection ends
 /// after `handle` returns and `conn` is closed: that is when its descriptors are free again.
 ///
-/// If the thread cannot be started, `conn` is dropped and `live` is given up without counting an
-/// end: the connection never ran, so it frees nothing for [`serve_connections`] to wait for.
+/// If the thread cannot be started, `conn` is handed back with the error and `live` is given up
+/// without counting an end: the connection never ran, so it frees nothing for [`serve_connections`] to
+/// wait for. The caller keeps the connection: dropping it would close it without a byte.
 #[cfg(windows)]
 fn hand_to_thread<C: Send + 'static>(
     conn: C,
     live: Live,
     spawn: impl FnOnce(Box<dyn FnOnce() + Send>) -> std::io::Result<()>,
     handle: impl FnOnce(C) + Send + 'static,
-) -> std::io::Result<()> {
+) -> Result<(), NotServed<C>> {
     // The thread takes the connection from here, so a failed start leaves it with the caller.
     let (give, take) = std::sync::mpsc::channel::<(C, Live)>();
     let work = Box::new(move || {
@@ -366,10 +367,14 @@ fn hand_to_thread<C: Send + 'static>(
         }
         Err(e) => {
             live.abandon();
-            Err(e)
+            Err((conn, e))
         }
     }
 }
+
+/// A connection no thread could be started for, and why.
+#[cfg(windows)]
+type NotServed<C> = (C, std::io::Error);
 
 /// The connections this agent is serving, so that a shortage of descriptors can wait for one to end.
 #[cfg(windows)]
@@ -472,8 +477,11 @@ impl Connections {
     }
 
     /// Record that a live connection is a `logout` request. It lasts while the guard does.
+    ///
+    /// Wakes the drains: a connection that was live but not yet a request held them back.
     fn begin_logout(self: &Arc<Self>) -> LogoutWait {
         self.lock().logouts += 1;
+        self.ended.notify_all();
         LogoutWait(Arc::clone(self))
     }
 
@@ -560,6 +568,9 @@ impl Connections {
     fn close_listener(&self, wake: &dyn Fn()) {
         let mut tally = self.lock();
         tally.closing = true;
+        // A loop parked for a resource (see `wait_for_an_end`) is not in `accept`, where the wake
+        // reaches it.
+        self.ended.notify_all();
         if !tally.listener_open {
             return;
         }
@@ -582,7 +593,9 @@ impl Connections {
     }
 
     /// Return once more than `since` connections have ended (`true`), or at once with `false` if
-    /// none is live and none has ended since: then nothing is left that could end.
+    /// none is live and none has ended since: then nothing is left that could end. Also returns
+    /// `true` once the end is decided ([`Connections::settle`]): the caller reads its stop flag and
+    /// returns, which is what the end waits for.
     ///
     /// `blocking` is called once, only if this has to block, and before it does. The lock is held
     /// then and released by the wait itself, so a connection that `blocking` causes to end does so
@@ -591,7 +604,7 @@ impl Connections {
         let mut blocking = Some(blocking);
         let mut tally = self.lock();
         loop {
-            if tally.ended > since {
+            if tally.ended > since || tally.closing {
                 return true;
             }
             if tally.live == 0 {
@@ -649,14 +662,14 @@ impl Drop for Live {
 /// A connection that is lost (reset while queued, or one that cannot be set up) is logged and
 /// dropped: it must not end service for every session of the user. An interrupted `accept` is
 /// called again. A shortage of descriptors or buffers, and a `serve` that could not start a thread
-/// for its connection (it returns the error, having given up its `Live`), is waited out: the loop
-/// blocks until one of this agent's own connections ends, which is the only thing that can free
-/// any of those, and then accepts again. With no live connection nothing can, and the shortage is
-/// fatal.
+/// for its connection (it returns the connection and the error, having given up its `Live`), is
+/// waited out: the loop blocks until one of this agent's own connections ends, which is the only thing
+/// that can free any of those, and then accepts again, or serves the same connection again if it was
+/// kept. With no live connection nothing can, and the shortage is fatal.
 #[cfg(all(windows, test))]
 fn serve_connections<C>(
     accept: impl FnMut() -> Result<C, AcceptError>,
-    serve: impl FnMut(C, Live) -> std::io::Result<()>,
+    serve: impl FnMut(C, Live) -> Result<(), NotServed<C>>,
 ) -> anyhow::Error {
     serve_connections_observed(accept, serve, || {})
 }
@@ -666,7 +679,7 @@ fn serve_connections<C>(
 #[cfg(all(windows, test))]
 fn serve_connections_observed<C>(
     accept: impl FnMut() -> Result<C, AcceptError>,
-    serve: impl FnMut(C, Live) -> std::io::Result<()>,
+    serve: impl FnMut(C, Live) -> Result<(), NotServed<C>>,
     blocking: impl FnMut(),
 ) -> anyhow::Error {
     serve_connections_with(Connections::new(), accept, serve, blocking, || false)
@@ -681,21 +694,30 @@ fn serve_connections_observed<C>(
 fn serve_connections_with<C>(
     connections: Arc<Connections>,
     mut accept: impl FnMut() -> Result<C, AcceptError>,
-    mut serve: impl FnMut(C, Live) -> std::io::Result<()>,
+    mut serve: impl FnMut(C, Live) -> Result<(), NotServed<C>>,
     mut blocking: impl FnMut(),
     stopping: impl Fn() -> bool,
 ) -> anyhow::Error {
+    // A connection that no thread could be started for. The agent does not close it without a byte
+    // (its client would take that for an agent that is going away): it serves it once a connection
+    // has ended, unless the end is decided first.
+    let mut kept = None;
     loop {
         if stopping() {
             return anyhow::Error::new(Stopped);
         }
         // Read before the attempt: a connection that ends while it fails is then not missed.
         let ended_before = connections.ended();
-        let shortage = match accept() {
+        let next = match kept.take() {
+            Some(conn) => Ok(conn),
+            None => accept(),
+        };
+        let shortage = match next {
             Ok(conn) => match serve(conn, connections.begin()) {
                 Ok(()) => continue,
-                Err(e) => {
-                    tracing::warn!("dropped a connection: no thread for it ({e}); waiting for a connection to end");
+                Err((conn, e)) => {
+                    tracing::warn!("no thread for a connection ({e}); waiting for a connection to end");
+                    kept = Some(conn);
                     anyhow::Error::new(e).context("could not start a thread for a connection")
                 }
             },
@@ -788,10 +810,26 @@ struct Env<'a> {
 #[cfg(windows)]
 type WatchFactory = fn(&ConnTx) -> std::io::Result<(HangupWatcher, Waker)>;
 
+/// How a session starts its shell in a pseudoconsole (`command`, `cols`, `rows`, `cwd`); a parameter
+/// so a test can force a failure without starting a process.
+#[cfg(windows)]
+type PtyStarter = fn(&str, u16, u16, Option<&Path>) -> anyhow::Result<PtySession>;
+
+/// How a session starts its command on pipes (`command`, `cwd`); a parameter like [`PtyStarter`].
+#[cfg(windows)]
+type ExecStarter = fn(&str, Option<&Path>) -> anyhow::Result<ExecChild>;
+
+/// How a connection is split into halves; a parameter so a test can force a failure.
+#[cfg(windows)]
+type Splitter = fn(socket2::Socket) -> Result<(ConnRx, ConnTx), (afunix::Whole, anyhow::Error)>;
+
 /// What a test can replace or observe in a session; production uses [`Hooks::production`].
 #[cfg(windows)]
 struct Hooks {
     make_watcher: WatchFactory,
+    start_pty: PtyStarter,
+    start_exec: ExecStarter,
+    split: Splitter,
     parked: ParkSignal,
     /// Called once the session's shell is started and before it is registered, the window in which
     /// the agent can begin to end.
@@ -817,6 +855,9 @@ impl Hooks {
     fn production() -> Self {
         Self {
             make_watcher: HangupWatcher::new,
+            start_pty: |command, cols, rows, cwd| Ok(PtySession::spawn(command, cols, rows, cwd)?),
+            start_exec: |command, cwd| Ok(ExecChild::spawn(command, cwd)?),
+            split: afunix::try_split,
             parked: ParkSignal::default(),
             after_spawn: Box::new(|| {}),
             observe: Box::new(|_| {}),
@@ -824,13 +865,41 @@ impl Hooks {
     }
 }
 
+/// Serve one connection. The agent never closes a connection without a byte while it is alive: a
+/// connection it cannot set up, read or carry out is answered with a frame the shim prints (see
+/// [`logout::fail_connection`]), and the error comes back for the log. A client that leaves before
+/// it sends anything has nothing to be told, and is not an error.
 #[cfg(windows)]
 fn handle_connection_in(conn: socket2::Socket, hooks: Hooks, control: &Control) -> anyhow::Result<()> {
-    let (mut rx, mut tx) = afunix::split(conn)?;
+    let (mut rx, mut tx) = match (hooks.split)(conn) {
+        Ok(halves) => halves,
+        Err((whole, cause)) => {
+            let (mut rx, mut tx) = (&whole, &whole);
+            return Err(logout::fail_connection(
+                &mut rx,
+                &mut tx,
+                control,
+                "the agent could not set up the connection",
+                cause,
+                logout::FAILED_EXIT_CODE,
+            ));
+        }
+    };
     let mut fr = FrameReader::new();
-    let frame = read_one_frame(&mut rx, &mut fr)?;
-    anyhow::ensure!(frame.kind == FrameKind::Handshake, "first frame was not a handshake");
-    let hs = Handshake::decode(&frame.payload)?;
+    let hs = match read_handshake(&mut rx, &mut fr) {
+        Ok(Some(hs)) => hs,
+        Ok(None) => return Ok(()),
+        Err(cause) => {
+            return Err(logout::fail_connection(
+                &mut rx,
+                &mut tx,
+                control,
+                "the agent could not read the request",
+                cause,
+                logout::BAD_REQUEST_EXIT_CODE,
+            ));
+        }
+    };
     if hs.mode == Mode::Logout {
         return logout::handle_logout(&mut rx, &mut tx, control, || {
             tracing::info!("the background session has ended");
@@ -851,6 +920,34 @@ fn handle_connection_in(conn: socket2::Socket, hooks: Hooks, control: &Control) 
     }
 }
 
+/// The handshake that opens a connection. `None` if the client closed the connection before it sent
+/// a byte: the wake that ends the accept loop does, and a client that gave up does; neither is a fault.
+#[cfg(windows)]
+fn read_handshake(rx: &mut impl std::io::Read, fr: &mut FrameReader) -> anyhow::Result<Option<Handshake>> {
+    struct Counted<'a, R> {
+        inner: &'a mut R,
+        any: bool,
+    }
+    impl<R: std::io::Read> std::io::Read for Counted<'_, R> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.inner.read(buf)?;
+            self.any |= n > 0;
+            Ok(n)
+        }
+    }
+    let mut rx = Counted { inner: rx, any: false };
+    let frame = match read_one_frame(&mut rx, fr) {
+        Ok(frame) => frame,
+        Err(e) if !rx.any => {
+            tracing::debug!("a client left without sending a request: {e:#}");
+            return Ok(None);
+        }
+        Err(e) => return Err(e),
+    };
+    anyhow::ensure!(frame.kind == FrameKind::Handshake, "first frame was not a handshake");
+    Ok(Some(Handshake::decode(&frame.payload)?))
+}
+
 #[cfg(test)]
 #[path = "agent_cwd_tests.rs"]
 mod agent_cwd_tests;
@@ -862,6 +959,14 @@ mod agent_start_tests;
 #[cfg(all(windows, test))]
 #[path = "agent_program_path_tests.rs"]
 mod agent_program_path_tests;
+
+#[cfg(all(windows, test))]
+#[path = "agent_end_tests.rs"]
+mod agent_end_tests;
+
+#[cfg(all(windows, test))]
+#[path = "agent_reply_tests.rs"]
+mod agent_reply_tests;
 
 // ── PTY relay ────────────────────────────────────────────────────────────────────────
 
@@ -878,7 +983,19 @@ fn handle_pty(
     env: Env<'_>,
 ) -> anyhow::Result<()> {
     let Env { hooks, control } = env;
-    let mut session = PtySession::spawn(command, cols, rows, cwd)?;
+    let mut session = match (hooks.start_pty)(command, cols, rows, cwd) {
+        Ok(session) => session,
+        Err(cause) => {
+            return Err(logout::fail_connection(
+                &mut rx,
+                &mut tx,
+                control,
+                "the agent could not start the shell",
+                cause,
+                logout::FAILED_EXIT_CODE,
+            ));
+        }
+    };
     (hooks.observe)(Observed::ShellStarted {
         output: session.out_read_raw(),
         process: session.process_raw(),
@@ -1001,6 +1118,13 @@ impl HalfClose for ConnTx {
     }
 }
 
+#[cfg(windows)]
+impl HalfClose for &afunix::Whole {
+    fn shutdown_write(&self) -> anyhow::Result<()> {
+        afunix::Whole::shutdown_write(self)
+    }
+}
+
 /// Send the shell's exit code and FIN the write half. A client that has gone loses the code, which
 /// is routine and logged at debug; any other failure loses it too and is logged as a warning.
 #[cfg(windows)]
@@ -1115,7 +1239,19 @@ fn handle_exec(
     env: Env<'_>,
 ) -> anyhow::Result<()> {
     let Env { hooks, control } = env;
-    let mut child = ExecChild::spawn(command, cwd)?;
+    let mut child = match (hooks.start_exec)(command, cwd) {
+        Ok(child) => child,
+        Err(cause) => {
+            return Err(logout::fail_connection(
+                &mut rx,
+                &mut tx,
+                control,
+                "the agent could not start the command",
+                cause,
+                logout::FAILED_EXIT_CODE,
+            ));
+        }
+    };
     (hooks.after_spawn)();
     let job = child.job();
     let Some(_registration) = register_session(control, &job) else {
