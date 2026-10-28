@@ -543,19 +543,41 @@ fn a_refusal_before_any_change_takes_no_lock() {
 }
 
 #[test]
-fn a_lock_that_cannot_be_taken_stops_on_and_off_before_they_change_anything() {
+fn a_lock_that_cannot_be_taken_stops_on_before_it_changes_anything() {
     let mut env = Fake::new();
     env.lock_fails = Some("the install directory is not ours");
-    let on_text = error_text(on(&mut env, &alice()));
+    let text = error_text(on(&mut env, &alice()));
     assert_eq!(
         env.calls,
         ["ask"],
         "the password is asked for before the lock; nothing is changed"
     );
-    let off_text = error_text(off(&mut env, &alice()));
-    assert!(on_text.contains("the install directory is not ours"), "{on_text}");
-    assert!(off_text.contains("the install directory is not ours"), "{off_text}");
-    assert_eq!(env.calls, ["ask"], "off changed nothing either: {:?}", env.calls);
+    assert!(text.contains("the install directory is not ours"), "{text}");
+}
+
+#[test]
+fn off_deletes_the_task_without_the_lock_when_the_lock_cannot_be_taken_and_says_why() {
+    let mut env = Fake::new();
+    env.lock_fails = Some("the lock file has the wrong access");
+    off(&mut env, &alice()).unwrap();
+    assert_eq!(env.locks, 0);
+    assert_eq!(env.calls, [format!("delete {}", task_name("S-1-5-21-1-2-3-1001"))]);
+    let said = env.said();
+    assert!(said.contains("warning"), "{said}");
+    assert!(
+        said.contains("the lock file has the wrong access"),
+        "the cause is named: {said}"
+    );
+    assert!(said.contains("auto-login is off for alice"), "{said}");
+}
+
+#[test]
+fn off_with_a_lock_that_cannot_be_taken_still_reports_a_task_that_cannot_be_deleted() {
+    let mut env = Fake::new();
+    env.lock_fails = Some("the lock file has the wrong access");
+    env.delete_fails = Some("Access is denied.");
+    let text = error_text(off(&mut env, &alice()));
+    assert!(text.contains("Access is denied."), "{text}");
 }
 
 // the install directory -----

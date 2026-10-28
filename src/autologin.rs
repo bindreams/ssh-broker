@@ -46,8 +46,9 @@ pub trait AutoLoginEnv {
     /// Whether there is a terminal to ask for the password on.
     fn has_terminal(&self) -> bool;
     /// Take the lock that keeps `apply` and these commands from running at once, waiting for
-    /// whoever holds it. The lock is held until the returned value is dropped. Needs the elevation
-    /// that the callers have already proved: the lock file is private to administrators.
+    /// whoever holds it (no limit: it returns only once taken). An `Err` is therefore a failure to
+    /// take it, never a wait that ran out. The lock is held until the returned value is dropped. Needs
+    /// the elevation that the callers have already proved: the lock file is private to administrators.
     fn lock_apply(&mut self) -> anyhow::Result<Box<dyn std::any::Any>>;
     /// What the install directory is, without creating or changing anything.
     fn install_dir(&self) -> InstallDir;
@@ -81,6 +82,10 @@ fn batch_right_missing(user: &str) -> String {
          An administrator can grant \"Log on as a batch job\" in Local Security Policy (User Rights Assignment). \
          ssh-broker never changes machine policy."
     )
+}
+
+fn no_lock_warning(cause: &str) -> String {
+    format!("ssh-broker: warning: the apply lock was not taken ({cause}); deleting the task anyway.")
 }
 
 /// `ssh-broker auto-login on` for `account`.
@@ -164,19 +169,25 @@ pub fn off(env: &mut dyn AutoLoginEnv, account: &LocalAccount) -> anyhow::Result
         env.is_elevated().context("read the token's elevation")?,
         not_elevated("off", &exe)
     );
-    // The task holds a stored password, so `off` must be able to delete it where no `apply` can run
-    // to hold the lock: without an install directory there is nothing to lock, and one that fails
-    // its check is refused by `apply` as well.
+    // The task holds a stored password, so `off` must be able to delete it where the lock cannot be
+    // had: without an install directory there is nothing to lock, one that fails its check is refused
+    // by `apply` as well, and a lock that fails to be taken (not one that is held: that waits, and
+    // returns only once taken) would otherwise leave the task and its password in place.
     let _apply = match env.install_dir() {
         InstallDir::Missing => None,
         InstallDir::Untrusted(reason) => {
-            env.say(&format!(
-                "ssh-broker: warning: the install directory is not trusted ({reason}), so the apply lock was not taken; \
-                 deleting the task anyway."
-            ));
+            env.say(&no_lock_warning(&format!(
+                "the install directory is not trusted ({reason})"
+            )));
             None
         }
-        InstallDir::Trusted => Some(env.lock_apply()?),
+        InstallDir::Trusted => match env.lock_apply() {
+            Ok(lock) => Some(lock),
+            Err(e) => {
+                env.say(&no_lock_warning(&format!("it could not be taken: {e:#}")));
+                None
+            }
+        },
     };
     if env.delete(&task_name(&account.sid))? {
         env.say(&format!(
