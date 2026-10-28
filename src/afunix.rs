@@ -124,10 +124,13 @@ impl Listener {
 /// Why `accept` failed, by what the serving loop should do next.
 #[derive(Debug)]
 pub enum AcceptError {
-    /// This one connection is lost (the peer dropped it while it queued, or it could not be set
-    /// up). The listener is fine, and each such failure consumed a connection, so a run of them is
-    /// bounded by the peers' own behaviour.
+    /// This one connection is lost: the peer dropped it while it queued. The listener is fine, and
+    /// each such failure consumed a connection, so a run of them is bounded by the peers' own
+    /// behaviour.
     Connection(anyhow::Error),
+    /// A connection arrived but must not be handed out (it is inheritable by child processes). The
+    /// peer is waiting, so the caller answers it on `socket` and does not hand it to a shell.
+    Refused { socket: Socket, cause: anyhow::Error },
     /// `WSAEINTR`: the call was interrupted. Nothing was consumed; call `accept` again.
     Interrupted(std::io::Error),
     /// `WSAEMFILE` or `WSAENOBUFS`: no descriptor or buffer is left. It clears only when something
@@ -141,7 +144,9 @@ pub enum AcceptError {
 impl std::fmt::Display for AcceptError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            AcceptError::Connection(e) | AcceptError::Fatal(e) => write!(f, "{e:#}"),
+            AcceptError::Connection(e) | AcceptError::Fatal(e) | AcceptError::Refused { cause: e, .. } => {
+                write!(f, "{e:#}")
+            }
             AcceptError::Interrupted(source) | AcceptError::Exhausted { source, .. } => write!(f, "{source}"),
         }
     }
@@ -162,7 +167,8 @@ fn accept_from(listener: &Socket) -> std::io::Result<Socket> {
 }
 
 /// Turn the outcome of the OS `accept` into a connection ready to hand out. A connection that
-/// fails `harden` is never handed out: it would reach children of the brokered shell.
+/// fails `harden` is never handed out: it would reach children of the brokered shell. It comes back
+/// as [`AcceptError::Refused`], for the caller to answer.
 fn finish_accept(
     raw: std::io::Result<Socket>,
     harden: impl FnOnce(&Socket) -> anyhow::Result<()>,
@@ -170,9 +176,10 @@ fn finish_accept(
     match raw {
         Ok(sock) => match harden(&sock) {
             Ok(()) => Ok(sock),
-            Err(e) => Err(AcceptError::Connection(
-                e.context("an accepted connection is not safe to hand out; dropping it"),
-            )),
+            Err(e) => Err(AcceptError::Refused {
+                socket: sock,
+                cause: e.context("an accepted connection is not safe to hand out"),
+            }),
         },
         Err(e) => Err(classify_accept_error(e)),
     }

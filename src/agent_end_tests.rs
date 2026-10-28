@@ -60,7 +60,7 @@ fn a_second_logout_that_registers_ends_the_drain_of_the_first_at_once() {
     let failsafe = Failsafe::new({
         let connections = Arc::clone(&connections);
         // What an unrelated wake-up would do: the condition is true by then, so the drain ends.
-        move || connections.ended.notify_all()
+        move || connections.wake()
     });
     let draining = std::thread::spawn({
         let connections = Arc::clone(&connections);
@@ -76,6 +76,44 @@ fn a_second_logout_that_registers_ends_the_drain_of_the_first_at_once() {
         "the drain did not end when the second logout registered"
     );
     drop((first, second));
+}
+
+/// A drain parked on one connection that is not a `logout` request, which `mutation` then ends or gives
+/// up. The condition holds from then on, and the drain must see it: its bound is an hour, so only a
+/// wake can end it in time.
+fn drain_ends_when(mutation: impl FnOnce(Live)) {
+    let (events, on_event) = mpsc::channel();
+    let connections = Connections::with_drain(Duration::from_secs(3600), move || {
+        let _ = events.send("parked");
+    });
+    let _logout_connection = connections.begin();
+    let _logout = connections.begin_logout();
+    let other = connections.begin();
+    let failsafe = Failsafe::new({
+        let connections = Arc::clone(&connections);
+        // What an unrelated wake-up would do: the condition is true by then, so the drain ends.
+        move || connections.wake()
+    });
+    let draining = std::thread::spawn({
+        let connections = Arc::clone(&connections);
+        move || connections.wait_until_only_logouts_live()
+    });
+    assert_eq!(on_event.recv().unwrap(), "parked");
+
+    mutation(other);
+
+    assert_eq!(draining.join().unwrap(), Drained::Complete);
+    assert!(!failsafe.finish(), "the drain did not end when the tally changed");
+}
+
+#[test]
+fn a_connection_that_ends_ends_the_drain_at_once() {
+    drain_ends_when(drop);
+}
+
+#[test]
+fn a_connection_given_up_because_no_thread_could_be_started_ends_the_drain_at_once() {
+    drain_ends_when(Live::abandon);
 }
 
 // the accept loop -----

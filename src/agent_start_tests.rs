@@ -546,10 +546,7 @@ fn the_listener_is_closed_when_the_loop_stops_and_not_held_until_the_process_end
 
     assert!(end.downcast_ref::<Stopped>().is_some(), "{end:#}");
     assert!(closed(&flag), "the listener is still open after the loop stopped");
-    assert!(
-        !connections.lock().listener_open,
-        "the tally still says a loop holds it"
-    );
+    assert!(!connections.listener_is_open(), "the tally still says a loop holds it");
 }
 
 #[test]
@@ -1192,6 +1189,50 @@ fn a_connection_whose_thread_cannot_start_is_kept_and_served_once_a_connection_h
     assert_eq!(tried, [1, 2, 2, 3]);
     assert_eq!(handled, [1, 2, 3], "the connection was dropped, not kept");
     assert!(format!("{end:#}").ends_with("end of script"), "{end:#}");
+}
+
+#[test]
+fn a_kept_connection_is_served_once_more_when_the_end_is_decided_not_closed_bare() {
+    // Serving it is what answers it: an agent that is ending refuses the login with a reply.
+    let stop = Cell::new(false);
+    let lives = RefCell::new(Vec::new());
+    let mut accepted = 0;
+    let mut tried = Vec::new();
+    let mut handled = Vec::new();
+    let end = serve_connections_with(
+        Connections::new(),
+        || {
+            accepted += 1;
+            match accepted {
+                1 | 2 => Ok(accepted),
+                _ => Err(AcceptError::Fatal(anyhow::anyhow!(
+                    "accepted after the end was decided"
+                ))),
+            }
+        },
+        |conn, live| {
+            tried.push(conn);
+            if conn == 2 && tried.iter().filter(|tried| **tried == 2).count() == 1 {
+                // The end is decided while this one has no thread; connection 1 ends, so the loop wakes.
+                stop.set(true);
+                lives.borrow_mut().clear();
+                live.abandon();
+                return Err((conn, std::io::Error::other("no thread")));
+            }
+            handled.push(conn);
+            lives.borrow_mut().push(live);
+            Ok(())
+        },
+        || {},
+        || stop.get(),
+    );
+    assert_eq!(
+        tried,
+        [1, 2, 2],
+        "the kept connection was dropped when the end was decided"
+    );
+    assert_eq!(handled, [1, 2]);
+    assert!(end.downcast_ref::<Stopped>().is_some(), "{end:#}");
 }
 
 #[test]

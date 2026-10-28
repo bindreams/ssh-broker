@@ -162,3 +162,88 @@ fn a_client_that_leaves_in_the_middle_of_a_frame_is_still_a_bad_request() {
     assert!(result.is_err());
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn a_handler_that_panics_answers_its_connection_with_255_before_it_closes() {
+    let hooks = Hooks {
+        start_pty: |_, _, _, _| panic!("the starter failed"),
+        ..Hooks::production()
+    };
+    let (server, client, dir) = crate::test_support::raw_socket_pair("panic-reply");
+    let agent = std::thread::spawn(move || serve_connection(server, hooks, &Control::standalone()));
+    let (mut rx, mut tx) = afunix::split(client).unwrap();
+    handshake(Mode::Pty, "pwsh.exe")(&mut tx);
+    let mut sink = TestSink::default();
+    let outcome = pump_decode(&mut rx, &mut FrameReader::new(), &mut sink).expect("the reply was lost");
+    drop((rx, tx));
+    let handler = agent.join();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert_eq!(outcome, Outcome::Exited(255));
+    assert_eq!(
+        String::from_utf8(sink.stderr).unwrap(),
+        "ssh-broker: the agent failed while serving this connection: the handler panicked\r\n"
+    );
+    assert!(handler.is_err(), "the panic is not swallowed");
+}
+
+#[test]
+fn a_handler_that_does_not_panic_adds_nothing_to_its_reply() {
+    // A desktop agent answers a logout request and returns without closing anything itself: the
+    // connection ends with the handler, and no second reply is behind the first.
+    let (server, client, dir) = crate::test_support::raw_socket_pair("no-panic-reply");
+    let agent = std::thread::spawn(move || serve_connection(server, Hooks::production(), &Control::standalone()));
+    let (mut rx, mut tx) = afunix::split(client).unwrap();
+    // Nothing after the handshake: unread input at the agent's close would reset the connection.
+    let logout = Handshake {
+        mode: Mode::Logout,
+        ..Handshake::pty_default()
+    };
+    write_frame(&mut tx, FrameKind::Handshake, &logout.encode().unwrap()).unwrap();
+    let mut sink = TestSink::default();
+    let outcome = pump_decode(&mut rx, &mut FrameReader::new(), &mut sink).expect("the reply was lost");
+    let mut rest = Vec::new();
+    std::io::Read::read_to_end(&mut rx, &mut rest).unwrap();
+    drop((rx, tx));
+    let result = agent.join().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert_eq!(outcome, Outcome::Exited(2));
+    assert!(result.is_ok());
+    assert!(rest.is_empty(), "bytes after the reply: {rest:?}");
+}
+
+#[test]
+fn a_connection_refused_at_accept_is_answered_with_255_not_dropped() {
+    // The system hands out a connection the agent must not give to a shell: its peer is told why.
+    let (server, client, dir) = crate::test_support::raw_socket_pair("refused");
+    let connections = Connections::new();
+    let control = Arc::new(Control::standalone());
+    let mut script = Some(AcceptError::Refused {
+        socket: server,
+        cause: anyhow::anyhow!("the connection is inheritable by child processes"),
+    });
+    let end = accept_loop_with(
+        || {
+            Err(script
+                .take()
+                .unwrap_or_else(|| AcceptError::Fatal(anyhow::anyhow!("end of script"))))
+        },
+        &connections,
+        &control,
+        || false,
+    );
+    assert!(format!("{end:#}").ends_with("end of script"), "{end:#}");
+
+    let (mut rx, tx) = afunix::split(client).unwrap();
+    let mut sink = TestSink::default();
+    let outcome = pump_decode(&mut rx, &mut FrameReader::new(), &mut sink).expect("the reply was lost");
+    drop((rx, tx));
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert_eq!(outcome, Outcome::Exited(255));
+    assert_eq!(
+        String::from_utf8(sink.stderr).unwrap(),
+        "ssh-broker: the agent could not use the connection: the connection is inheritable by child processes\r\n"
+    );
+}

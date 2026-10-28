@@ -16,8 +16,10 @@
 //! The listener stays open through the drain, and a login that arrives meanwhile is refused with
 //! [`ENDING_REFUSAL`]. Once the drain is over the accept loop stops, after counting the connection it
 //! is accepting, and the listener is closed; then the drain judges again, so every connection the
-//! loop took gets its refusal. A connection that was queued and never accepted is reset with the
-//! listener, and its shim treats that as an agent that is gone. The session slot and the user lock
+//! loop took gets its refusal. That includes a connection kept for want of a thread when the end is
+//! decided: it is served once more. Only if that has no thread either is it closed without a reply. A
+//! connection that was queued and never accepted is reset with the listener, and its shim treats that
+//! as an agent that is gone. The session slot and the user lock
 //! stay held until the process ends, so a successor agent starts only after this one is gone.
 
 use std::io::{Read, Write};
@@ -215,6 +217,57 @@ pub(super) fn fail_connection<R: LimitedRead, W: Write + HalfClose>(
     cause.context(what.to_owned())
 }
 
+/// Answers a connection whose handler thread panics. A panic closes the connection without a byte,
+/// which a client takes for an agent that is going away; this writes the failure reply
+/// ([`FAILED_EXIT_CODE`]) first, on a second handle to the same socket, and waits for the client to
+/// close like any other failure reply. Dropped without a panic, it does nothing.
+pub(super) struct PanicReply<'a> {
+    conn: Option<socket2::Socket>,
+    control: &'a Control,
+}
+
+impl<'a> PanicReply<'a> {
+    pub(super) fn new(conn: &socket2::Socket, control: &'a Control) -> Self {
+        let conn = match conn.try_clone() {
+            Ok(conn) => Some(conn),
+            Err(e) => {
+                tracing::warn!("a panic of this connection's handler will not be answered: {e}");
+                None
+            }
+        };
+        PanicReply { conn, control }
+    }
+}
+
+impl Drop for PanicReply<'_> {
+    fn drop(&mut self) {
+        let Some(conn) = self.conn.take() else { return };
+        if !std::thread::panicking() {
+            return;
+        }
+        let cause = anyhow::anyhow!("the handler panicked");
+        let failure = fail_socket(
+            conn,
+            self.control,
+            "the agent failed while serving this connection",
+            cause,
+        );
+        tracing::error!("{failure:#}");
+    }
+}
+
+/// [`fail_connection`] with [`FAILED_EXIT_CODE`] on a connection that nothing has split yet. The split
+/// also makes the socket non-inheritable; if it fails, the reply goes on the whole socket.
+pub(super) fn fail_socket(conn: socket2::Socket, control: &Control, what: &str, cause: anyhow::Error) -> anyhow::Error {
+    match crate::afunix::try_split(conn) {
+        Ok((mut rx, mut tx)) => fail_connection(&mut rx, &mut tx, control, what, cause, FAILED_EXIT_CODE),
+        Err((whole, _)) => {
+            let (mut rx, mut tx) = (&whole, &whole);
+            fail_connection(&mut rx, &mut tx, control, what, cause, FAILED_EXIT_CODE)
+        }
+    }
+}
+
 /// Send `text` and `code`, FIN the write half and wait for the client to close (see
 /// [`wait_for_client`]).
 fn answer_and_wait<R: LimitedRead, W: Write + HalfClose>(
@@ -270,7 +323,7 @@ enum Waited {
 /// passes the agent goes on without the client and logs that `who` was left. The bound is the
 /// failure bound on an external client, never proof that the client has read the reply.
 fn wait_for_client<R: LimitedRead>(rx: &mut R, control: &Control, who: &str) {
-    let bound = control.connections.drain_bound;
+    let bound = control.connections.drain_bound();
     if wait_for_close_within(rx, bound) == Waited::Abandoned {
         tracing::warn!(
             "the client of {who} had not closed its connection {} s after the reply; not waiting for it any longer",

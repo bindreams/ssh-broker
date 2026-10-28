@@ -35,6 +35,8 @@ pub fn exit_code_of(err: &anyhow::Error) -> i32 {
 mod ending;
 pub use ending::{end_process, hold_until_end, keep_log};
 #[cfg(windows)]
+mod connections;
+#[cfg(windows)]
 mod logout;
 
 #[cfg(windows)]
@@ -59,6 +61,8 @@ use crate::route::{AgentArgs, BackgroundArgs};
 use crate::socket_loc::SocketLocation;
 #[cfg(windows)]
 use crate::winutil::OwnedHandle;
+#[cfg(windows)]
+use connections::{Connections, Drained, Live};
 #[cfg(windows)]
 use logout::Control;
 #[cfg(windows)]
@@ -258,23 +262,34 @@ fn accept_loop(
 /// connection's `accept` and its count.
 #[cfg(windows)]
 fn accept_loop_with(
-    accept: impl FnMut() -> Result<socket2::Socket, AcceptError>,
+    mut accept: impl FnMut() -> Result<socket2::Socket, AcceptError>,
     connections: &Arc<Connections>,
     control: &Arc<Control>,
     stopping: impl Fn() -> bool,
 ) -> anyhow::Error {
     serve_connections_with(
         Arc::clone(connections),
-        accept,
-        |conn, live| {
+        move || match accept() {
+            Ok(conn) => Ok(Arrived::Usable(conn)),
+            Err(AcceptError::Refused { socket, cause }) => Ok(Arrived::Refused(socket, cause)),
+            Err(e) => Err(e),
+        },
+        |arrived, live| {
             let control = Arc::clone(control);
             hand_to_thread(
-                conn,
+                arrived,
                 live,
                 |work| std::thread::Builder::new().spawn(work).map(drop),
-                move |conn| {
-                    if let Err(e) = handle_connection_in(conn, Hooks::production(), &control) {
-                        tracing::warn!("connection handler error: {e:?}");
+                move |arrived| match arrived {
+                    Arrived::Usable(conn) => {
+                        if let Err(e) = serve_connection(conn, Hooks::production(), &control) {
+                            tracing::warn!("connection handler error: {e:?}");
+                        }
+                    }
+                    Arrived::Refused(conn, cause) => {
+                        let failure =
+                            logout::fail_socket(conn, &control, "the agent could not use the connection", cause);
+                        tracing::warn!("refused a connection: {failure:#}");
                     }
                 },
             )
@@ -282,6 +297,13 @@ fn accept_loop_with(
         || {},
         stopping,
     )
+}
+
+/// What the accept loop took: a connection to serve, or one the agent must not serve and answers.
+#[cfg(windows)]
+enum Arrived {
+    Usable(socket2::Socket),
+    Refused(socket2::Socket, anyhow::Error),
 }
 
 /// Run `wake` on a thread of its own, so that the caller never waits for it. The wake is a connect
@@ -376,286 +398,6 @@ fn hand_to_thread<C: Send + 'static>(
 #[cfg(windows)]
 type NotServed<C> = (C, std::io::Error);
 
-/// The connections this agent is serving, so that a shortage of descriptors can wait for one to end.
-#[cfg(windows)]
-struct Connections {
-    tally: Mutex<Tally>,
-    ended: Condvar,
-    /// How long [`Connections::wait_until_only_logouts_live`] waits for connections that do not finish.
-    drain_bound: std::time::Duration,
-    /// Called each time the drain is about to park, with the tally locked: the lock is released by
-    /// the park itself, so what this causes to happen to a connection happens after the drain is
-    /// waiting. It must not take the lock. A test uses it to know that the drain is waiting.
-    drain_parks: Box<dyn Fn() + Send + Sync>,
-    /// How the end went, once it is decided (see [`Connections::settle`]).
-    settled: std::sync::OnceLock<Drained>,
-}
-
-/// The longest an ending agent waits for its connections to finish relaying. Each is waiting on a
-/// client (to read the last output, to close), and a client may never do either; this is the failure
-/// bound on that wait, never a proof that the output arrived. When it passes the agent ends anyway
-/// and logs how many connections it left.
-#[cfg(windows)]
-const DRAIN_BOUND: std::time::Duration = std::time::Duration::from_secs(30);
-
-/// How [`Connections::wait_until_only_logouts_live`] ended.
-#[cfg(windows)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Drained {
-    /// Every connection but the `logout` requests finished.
-    Complete,
-    /// The bound passed with `still_live` connections unfinished.
-    Abandoned { still_live: usize },
-}
-
-#[cfg(windows)]
-struct Tally {
-    live: usize,
-    /// How many connections have ever ended: a counter, so "one ended since I looked" is a
-    /// comparison and not a guess at what changed.
-    ended: u64,
-    /// How many of the live connections are `logout` requests waiting for the others to finish.
-    logouts: usize,
-    /// The end is decided: the accept loop returns after the connection it is accepting, which it
-    /// counts first.
-    closing: bool,
-    /// An accept loop holds the listener.
-    listener_open: bool,
-    /// Why the loop could not be woken, if it could not: nothing will make it return.
-    wake_failed: Option<String>,
-}
-
-/// A live connection. Dropping it, on any exit from the handler including a panic, ends it.
-#[cfg(windows)]
-struct Live(Option<Arc<Connections>>);
-
-#[cfg(windows)]
-impl Connections {
-    fn new() -> Arc<Self> {
-        Self::with_drain_bound(DRAIN_BOUND)
-    }
-
-    fn with_drain_bound(drain_bound: std::time::Duration) -> Arc<Self> {
-        Self::with_drain(drain_bound, || {})
-    }
-
-    /// [`Connections::new`] that calls `parks` each time the drain is about to park.
-    #[cfg(test)]
-    fn observing_drain(parks: impl Fn() + Send + Sync + 'static) -> Arc<Self> {
-        Self::with_drain(DRAIN_BOUND, parks)
-    }
-
-    fn with_drain(drain_bound: std::time::Duration, parks: impl Fn() + Send + Sync + 'static) -> Arc<Self> {
-        Arc::new(Self {
-            drain_bound,
-            drain_parks: Box::new(parks),
-            tally: Mutex::new(Tally {
-                live: 0,
-                ended: 0,
-                logouts: 0,
-                closing: false,
-                listener_open: false,
-                wake_failed: None,
-            }),
-            ended: Condvar::new(),
-            settled: std::sync::OnceLock::new(),
-        })
-    }
-
-    fn lock(&self) -> std::sync::MutexGuard<'_, Tally> {
-        self.tally.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
-    fn begin(self: &Arc<Self>) -> Live {
-        self.lock().live += 1;
-        Live(Some(Arc::clone(self)))
-    }
-
-    /// How many connections have ended so far.
-    fn ended(&self) -> u64 {
-        self.lock().ended
-    }
-
-    /// Record that a live connection is a `logout` request. It lasts while the guard does.
-    ///
-    /// Wakes the drains: a connection that was live but not yet a request held them back.
-    fn begin_logout(self: &Arc<Self>) -> LogoutWait {
-        self.lock().logouts += 1;
-        self.ended.notify_all();
-        LogoutWait(Arc::clone(self))
-    }
-
-    /// Return once every live connection is a `logout` request: the shells' last output has been
-    /// delivered. (The end is decided by [`Connections::settle`], which calls this twice.) Each request is itself live until its handler returns, so counting them in
-    /// would make two requests wait for each other for ever.
-    ///
-    /// A connection waits on its client, which may never act, so the wait ends after the drain bound
-    /// with the connections still live. The condition is re-checked after every wake; the bound only
-    /// stops the wait, it does not decide the condition.
-    fn wait_until_only_logouts_live(&self) -> Drained {
-        let tally = self.lock();
-        let (tally, _) = self
-            .ended
-            .wait_timeout_while(tally, self.drain_bound, |tally| {
-                let parks = tally.live > tally.logouts;
-                if parks {
-                    (self.drain_parks)();
-                }
-                parks
-            })
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let still_live = tally.live.saturating_sub(tally.logouts);
-        if still_live == 0 {
-            Drained::Complete
-        } else {
-            tracing::warn!(
-                "{still_live} connection(s) had not finished {} s after the end began; ending without them",
-                self.drain_bound.as_secs_f32()
-            );
-            Drained::Abandoned { still_live }
-        }
-    }
-
-    /// An accept loop is about to run over the listener.
-    fn listener_opened(&self) {
-        self.lock().listener_open = true;
-    }
-
-    /// The loop has returned and the listener is closed.
-    fn listener_closed(&self) {
-        self.lock().listener_open = false;
-        self.ended.notify_all();
-    }
-
-    /// Whether the end is decided: the accept loop stops after its current accept.
-    fn is_closing(&self) -> bool {
-        self.lock().closing
-    }
-
-    /// The loop cannot be woken, so waiting for it would not end: the end goes on without it, and
-    /// says why (see [`Connections::settle`]).
-    fn wake_failed(&self, why: &str) {
-        self.lock().wake_failed.get_or_insert_with(|| why.to_string());
-        self.ended.notify_all();
-    }
-
-    /// Decide the end of the agent: wait until only `logout` requests are live, stop the accept loop
-    /// and close the listener, and judge again. Returns how the last judgement went. Any number of
-    /// callers (the `logout` handlers, the thread that ran the loop) may ask; the first does the work
-    /// and the others wait for it.
-    ///
-    /// The first wait is with the listener open, so a login that arrives meanwhile gets the refusal.
-    /// The loop counts every connection it accepts before it looks at the flag set here, and the
-    /// listener is closed once it has returned, so the second judgement sees every connection the loop
-    /// took. A connection the system queued and nobody accepted is reset with the listener; its shim
-    /// goes back to its no-agent path. If the first wait gave up on connections that do not finish, the
-    /// second is not made: those would not finish either.
-    ///
-    /// `wake` makes a loop that is blocked in `accept` return from it.
-    fn settle(&self, wake: &dyn Fn()) -> Drained {
-        *self.settled.get_or_init(|| {
-            let first = self.wait_until_only_logouts_live();
-            self.close_listener(wake);
-            match first {
-                Drained::Complete => self.wait_until_only_logouts_live(),
-                abandoned @ Drained::Abandoned { .. } => abandoned,
-            }
-        })
-    }
-
-    /// Raise the flag, wake the loop and wait until it has returned and the listener is closed, or
-    /// until the wake has failed. Nothing is waited for if no loop holds a listener.
-    fn close_listener(&self, wake: &dyn Fn()) {
-        let mut tally = self.lock();
-        tally.closing = true;
-        // A loop parked for a resource (see `wait_for_an_end`) is not in `accept`, where the wake
-        // reaches it.
-        self.ended.notify_all();
-        if !tally.listener_open {
-            return;
-        }
-        drop(tally);
-        wake();
-        let tally = self.lock();
-        let tally = self
-            .ended
-            .wait_while(tally, |tally| {
-                let parks = tally.listener_open && tally.wake_failed.is_none();
-                if parks {
-                    (self.drain_parks)();
-                }
-                parks
-            })
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let (true, Some(why)) = (tally.listener_open, &tally.wake_failed) {
-            tracing::warn!("could not wake the accept loop: {why}; ending with the listener open");
-        }
-    }
-
-    /// Return once more than `since` connections have ended (`true`), or at once with `false` if
-    /// none is live and none has ended since: then nothing is left that could end. Also returns
-    /// `true` once the end is decided ([`Connections::settle`]): the caller reads its stop flag and
-    /// returns, which is what the end waits for.
-    ///
-    /// `blocking` is called once, only if this has to block, and before it does. The lock is held
-    /// then and released by the wait itself, so a connection that `blocking` causes to end does so
-    /// after this is waiting. It must not take the lock (any `Live` dropped in it would).
-    fn wait_for_an_end(&self, since: u64, blocking: impl FnOnce()) -> bool {
-        let mut blocking = Some(blocking);
-        let mut tally = self.lock();
-        loop {
-            if tally.ended > since || tally.closing {
-                return true;
-            }
-            if tally.live == 0 {
-                return false;
-            }
-            if let Some(blocking) = blocking.take() {
-                blocking();
-            }
-            tally = self
-                .ended
-                .wait(tally)
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-        }
-    }
-}
-
-/// A live connection that is a `logout` request; see [`Connections::begin_logout`].
-#[cfg(windows)]
-struct LogoutWait(Arc<Connections>);
-
-#[cfg(windows)]
-impl Drop for LogoutWait {
-    fn drop(&mut self) {
-        self.0.lock().logouts -= 1;
-        self.0.ended.notify_all();
-    }
-}
-
-#[cfg(windows)]
-impl Live {
-    /// Give this connection up as if it had never begun: it is not live any more, and has not
-    /// ended, so nothing that waits for an end is woken by it.
-    fn abandon(mut self) {
-        if let Some(connections) = self.0.take() {
-            connections.lock().live -= 1;
-        }
-    }
-}
-
-#[cfg(windows)]
-impl Drop for Live {
-    fn drop(&mut self) {
-        if let Some(connections) = self.0.take() {
-            let mut tally = connections.lock();
-            tally.live -= 1;
-            tally.ended += 1;
-            connections.ended.notify_all();
-        }
-    }
-}
-
 /// Accept connections and hand each to `serve`, with the guard that says when it ends, until the
 /// listener breaks; returns that error.
 ///
@@ -704,6 +446,14 @@ fn serve_connections_with<C>(
     let mut kept = None;
     loop {
         if stopping() {
+            // The end is decided while a connection waits for a thread. It is served once more, which
+            // gets it the ending refusal (see `handle_connection_in`) and counts it, so the drain waits
+            // for the refusal. If there is still no thread, its client sees the agent end.
+            if let Some(conn) = kept.take()
+                && let Err((_, e)) = serve(conn, connections.begin())
+            {
+                tracing::warn!("no thread to refuse a connection with ({e}); closing it as the agent ends");
+            }
             return anyhow::Error::new(Stopped);
         }
         // Read before the attempt: a connection that ends while it fails is then not missed.
@@ -723,6 +473,13 @@ fn serve_connections_with<C>(
             },
             Err(AcceptError::Connection(e)) => {
                 tracing::warn!("dropped a connection: {e:#}");
+                continue;
+            }
+            // The caller's `accept` turns a refused connection into a `C` it can answer (see
+            // `accept_loop_with`); one that gets here would be closed without a byte.
+            Err(AcceptError::Refused { cause, .. }) => {
+                debug_assert!(false, "a refused connection reached the loop: {cause:#}");
+                tracing::error!("dropped a refused connection, which should have been answered: {cause:#}");
                 continue;
             }
             Err(AcceptError::Interrupted(_)) => continue,
@@ -863,6 +620,14 @@ impl Hooks {
             observe: Box::new(|_| {}),
         }
     }
+}
+
+/// [`handle_connection_in`] for a thread of its own: if the thread panics, the connection is answered
+/// with the failure reply before it closes (see [`logout::PanicReply`]).
+#[cfg(windows)]
+fn serve_connection(conn: socket2::Socket, hooks: Hooks, control: &Control) -> anyhow::Result<()> {
+    let _answer_a_panic = logout::PanicReply::new(&conn, control);
+    handle_connection_in(conn, hooks, control)
 }
 
 /// Serve one connection. The agent never closes a connection without a byte while it is alive: a

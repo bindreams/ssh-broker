@@ -93,10 +93,11 @@ Windows' own auto-logon is a different, documented option: signing the user in a
 | 1 | You have no session to end (also when the session was ending already and is gone by the time `logout` connects again). |
 | 2 | Your agent runs in your desktop session; signing out of Windows ends it. |
 | 4 | Your agent could not be reached for another reason (access denied, a socket path that is too long): the message names it. |
+| 254 | The agent closed two connections in a row without answering, which an agent of this version never does (it may be an older ssh-broker). |
 
 A login that reaches the agent while it is ending gets no shell. It prints `ssh-broker: your background session is ending; reconnect in a moment.` and exits 255, the code ssh uses for a connection that failed, so a script cannot take it for the command's own failure.
 
-A login the agent cannot serve for another reason also gets a line saying why, and ends the connection with a code that is not the command's: 255 when the agent could not start the shell or the command (`ssh-broker: the agent could not start the command: ...`), 254 when it could not read the request. A command whose connection ends before the agent says anything prints `ssh-broker: the agent ended before it answered; the command may or may not have run` and exits 255; it is never sent again.
+A login the agent cannot serve for another reason also gets a line saying why, and ends the connection with a code that is not the command's: 255 when the agent could not start the shell or the command (`ssh-broker: the agent could not start the command: ...`), 254 when it could not read the request. A command whose connection ends before the agent says anything prints `ssh-broker: the agent ended before it answered; the command may or may not have run` and exits 255; it is never sent again. A login (or `logout`) whose connection is closed without an answer twice in a row prints `ssh-broker: the agent closed the connection twice without answering; it may be a different ssh-broker version` and exits 254. A connection that the agent cannot use, or whose handler failed, is answered with a line saying so and exits 255.
 
 ## Requirements
 

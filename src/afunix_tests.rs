@@ -193,7 +193,7 @@ fn an_accepted_connection_is_not_inheritable() {
 
 #[cfg(windows)]
 #[test]
-fn a_connection_that_arrives_inheritable_is_dropped_not_fixed_up() {
+fn a_connection_that_arrives_inheritable_is_refused_not_fixed_up() {
     // Control: a socket made without the flag is inheritable, so the check can tell.
     let sock = socket2::Socket::new_raw(socket2::Domain::UNIX, socket2::Type::STREAM, None).unwrap();
     assert!(super::is_inheritable(&sock).unwrap(), "control: made without the flag");
@@ -201,7 +201,9 @@ fn a_connection_that_arrives_inheritable_is_dropped_not_fixed_up() {
     // handoff; a connection that was ever inheritable is refused.
     let err = super::finish_accept(Ok(sock), super::harden_accepted).expect_err("must be refused");
     match err {
-        super::AcceptError::Connection(e) => assert!(format!("{e:#}").contains("inheritable"), "{e:#}"),
+        super::AcceptError::Refused { cause, .. } => {
+            assert!(format!("{cause:#}").contains("inheritable"), "{cause:#}")
+        }
         other => panic!("{other:?}"),
     }
 }
@@ -372,14 +374,16 @@ fn a_broken_listener_is_fatal() {
 
 #[cfg(windows)]
 #[test]
-fn an_accepted_connection_that_cannot_be_hardened_is_dropped_not_fatal() {
-    // The socket must not reach a child with its inherit flag set, so it is dropped; the
+fn an_accepted_connection_that_cannot_be_hardened_is_refused_not_fatal() {
+    // The socket must not reach a child with its inherit flag set, so it is refused (and answered); the
     // listener has nothing wrong with it.
     let sock = socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None).unwrap();
     let err = super::finish_accept(Ok(sock), |_| anyhow::bail!("SetHandleInformation failed"))
         .expect_err("a connection that cannot be hardened is not handed out");
     match err {
-        super::AcceptError::Connection(e) => assert!(format!("{e:#}").contains("SetHandleInformation"), "{e:#}"),
+        super::AcceptError::Refused { cause, .. } => {
+            assert!(format!("{cause:#}").contains("SetHandleInformation"), "{cause:#}")
+        }
         other => panic!("{other:?}"),
     }
 }
