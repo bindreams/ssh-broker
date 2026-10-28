@@ -313,22 +313,26 @@ fn wait_for_marker(
 ) {
     // The socket folder, and the profile above it, may not exist yet: the watch follows the path down.
     let mut watch = SocketWatch::for_location(location).unwrap_or_else(|e| panic!("{e:#}"));
+    // One deadline for the whole wait: every change in the folder wakes it, and none restarts the bound.
+    let deadline = std::time::Instant::now() + bound;
     loop {
         if is_ready() {
             return;
         }
+        let millis = file_signal::time_left(Some(deadline)).unwrap_or_else(|| {
+            panic!(
+                "no agent was serving {} after {bound:?}: it neither wrote its serving marker nor ended, \
+                 or the scheduled task did not start one",
+                location.dir.display()
+            )
+        });
         let handles: Vec<HANDLE> = std::iter::once(watch.handle()).chain(agent).collect();
-        let millis = u32::try_from(bound.as_millis()).expect("a bound shorter than INFINITE");
         // SAFETY: every handle is valid.
         let woke = unsafe { WaitForMultipleObjects(&handles, false, millis) }; // sleep-ok: failure bound on an agent start that may never come; expiry fails the test
         if woke == WAIT_OBJECT_0 {
             watch.rearm().unwrap_or_else(|e| panic!("{e:#}"));
         } else if woke == WAIT_TIMEOUT {
-            panic!(
-                "no agent was serving {} after {bound:?}: it neither wrote its serving marker nor ended, \
-                 or the scheduled task did not start one",
-                location.dir.display()
-            );
+            // The loop looks once more and then reports the expiry.
         } else if let Some(agent) = agent {
             // The agent may have written the marker as its last act.
             if is_ready() {

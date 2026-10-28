@@ -88,7 +88,7 @@ pub fn next_account_name(tag: &str) -> String {
 }
 
 /// How a service logged the account on: the logons whose hive Windows keeps loaded after the product's
-/// `logout`, as it does for a user who logged in at the console (owner, 2026-10-27; CI rounds 19 and 20).
+/// `logout`, as it does for a user who logged in at the console.
 /// A test says which one it started, and what it checks at the end of the session follows from it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ServiceLogon {
@@ -528,7 +528,7 @@ impl Account {
 #[derive(Clone, Copy, Debug)]
 pub enum Starter {
     /// `CreateProcessWithTokenW` with these `dwLogonFlags`: the Secondary Logon service starts the child,
-    /// and puts it in a job of its own besides the caller's (CI round 12).
+    /// and puts it in a job of its own besides the caller's.
     SecondaryLogon(CREATE_PROCESS_LOGON_FLAGS),
     /// `CreateProcessAsUserW` from this process, which must hold `SeAssignPrimaryTokenPrivilege` (a SYSTEM
     /// process does): what sshd, a service, does.
@@ -581,8 +581,8 @@ impl Drop for Account {
         }
         // Always, not only for an account made with a profile: a logon with `LOGON_WITH_PROFILE` makes the
         // profile of an account that had none. After a secondary logon the system unloads the profile a moment
-        // after the account's last process has exited, so this waits for that (CI round 14: a delete right
-        // after the exit failed with "in use" and the profile, about 1.3 GB, stayed). After a service's logon
+        // after the account's last process has exited, so this waits for that (a delete right after the exit
+        // fails with "in use" and leaves the profile, about 1.3 GB). After a service's logon
         // Windows keeps the hive loaded (see `profile`), so there the profile is deleted if Windows allows it,
         // and else cleared of what can be deleted.
         let removed = match self.service_logon.get() {
@@ -590,7 +590,7 @@ impl Drop for Account {
             Some(how) => profile::remove_or_clear(&self.sid_text, self.profile.as_deref()).map(|r| Some((*how, r))),
         };
         // Measured before the account is deleted, while whatever holds the profile still does. A hive that stays
-        // loaded is not unloaded by hand: `RegUnLoadKey` is refused (CI round 17). A test ends a background
+        // loaded is not unloaded by hand: `RegUnLoadKey` is refused. A test ends a background
         // session with its `logout` first (see `session_end`), which is what lets the system unload the hive
         // of a secondary logon.
         let holders = removed.as_ref().err().map(|_| {
@@ -601,22 +601,33 @@ impl Drop for Account {
             )
         });
         // SAFETY: NUL-terminated inputs.
-        let _ = unsafe { NetUserDel(PCWSTR::null(), PCWSTR(wide(&self.name).as_ptr())) };
-        if let Ok(Some((how, removal))) = &removed {
+        let deletion = unsafe { NetUserDel(PCWSTR::null(), PCWSTR(wide(&self.name).as_ptr())) };
+        let account_left = (deletion != 0).then(|| {
+            format!(
+                "the account {} stays on the machine: NetUserDel returned {deletion}",
+                self.name
+            )
+        });
+        if let (Ok(Some((how, removal))), None) = (&removed, &account_left) {
             hive::record(&format!(
                 "session end [account removed] {} ({}), logged on by {how}: {removal}; the account is deleted",
                 self.name, self.sid_text
             ));
         }
+        let mut problems = Vec::new();
         if let Err(why) = removed {
-            let message = format!(
+            problems.push(format!(
                 "the profile of {} ({}) was not deleted and stays on the disk: {why}. Processes of the account that \
                  could not be ended: {left:?}. A handle this test process still holds on a process of the account \
                  also keeps its logon session, and so its profile, in use.\n{}",
                 self.name,
                 self.sid_text,
                 holders.unwrap_or_default()
-            );
+            ));
+        }
+        problems.extend(account_left);
+        if !problems.is_empty() {
+            let message = problems.join("\n");
             // A panic while unwinding would abort the test process.
             if std::thread::panicking() {
                 eprintln!("{message}");

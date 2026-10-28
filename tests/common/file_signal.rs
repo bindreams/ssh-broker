@@ -4,7 +4,7 @@
 #![allow(dead_code)]
 
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ssh_broker::socket_watch::DirWatch;
 use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
@@ -35,13 +35,15 @@ pub fn publish(path: &Path, text: &str) {
 pub fn wait_for_file(path: &Path, process: Option<HANDLE>, bound: Option<Duration>, what: &str) -> FileWaited {
     let dir = path.parent().expect("a signal file has a directory");
     let watch = DirWatch::arm(dir).unwrap_or_else(|e| panic!("{e:#}"));
-    let millis = bound.map_or(INFINITE, |b| {
-        u32::try_from(b.as_millis()).expect("a bound shorter than INFINITE")
-    });
+    // One deadline for the whole wait: every change in the directory wakes it, and none restarts the bound.
+    let deadline = bound.map(|b| Instant::now() + b);
     loop {
         if path.is_file() {
             return FileWaited::Appeared;
         }
+        let millis = time_left(deadline).unwrap_or_else(|| {
+            panic!("{what}: {} did not appear within {bound:?}", path.display());
+        });
         let handles: Vec<HANDLE> = std::iter::once(watch.handle()).chain(process).collect();
         // SAFETY: every handle is valid for the call.
         let woke = unsafe { WaitForMultipleObjects(&handles, false, millis) }; // sleep-ok: failure bound on a process that may never write the file; expiry fails the wait and is not read as state
@@ -57,9 +59,22 @@ pub fn wait_for_file(path: &Path, process: Option<HANDLE>, bound: Option<Duratio
                 .unwrap_or_else(|e| panic!("read the exit code while waiting for {what}: {e}"));
             return FileWaited::ProcessEnded(code);
         } else if woke == WAIT_TIMEOUT {
-            panic!("{what}: {} did not appear within {bound:?}", path.display());
+            // The loop looks once more and then reports the expiry.
         } else {
             panic!("waiting for {what} ({}) failed: {woke:?}", path.display());
         }
     }
+}
+
+/// The milliseconds of `deadline` that are left for a wait (`INFINITE` without a deadline), or `None` when
+/// it has passed.
+pub fn time_left(deadline: Option<Instant>) -> Option<u32> {
+    let Some(deadline) = deadline else {
+        return Some(INFINITE);
+    };
+    let left = deadline.saturating_duration_since(Instant::now());
+    if left.is_zero() {
+        return None;
+    }
+    Some(u32::try_from(left.as_millis().max(1)).map_or(INFINITE - 1, |ms| ms.min(INFINITE - 1)))
 }
