@@ -30,6 +30,16 @@ pub enum BatchRight {
     Refused(String),
 }
 
+/// What the install directory, which holds the apply lock, is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InstallDir {
+    /// There is none: no `apply` has run, or it was removed.
+    Missing,
+    /// It exists and fails its check, in its words; `apply` refuses it too.
+    Untrusted(String),
+    Trusted,
+}
+
 /// What `on` and `off` need from the machine.
 pub trait AutoLoginEnv {
     fn is_elevated(&self) -> anyhow::Result<bool>;
@@ -39,6 +49,8 @@ pub trait AutoLoginEnv {
     /// whoever holds it. The lock is held until the returned value is dropped. Needs the elevation
     /// that the callers have already proved: the lock file is private to administrators.
     fn lock_apply(&mut self) -> anyhow::Result<Box<dyn std::any::Any>>;
+    /// What the install directory is, without creating or changing anything.
+    fn install_dir(&self) -> InstallDir;
     /// The installed exe, which the task runs and the messages name.
     fn exe(&self) -> PathBuf;
     /// Whether the install directory is trusted: the task runs the exe in it with a stored credential.
@@ -87,14 +99,14 @@ pub fn on(env: &mut dyn AutoLoginEnv, account: &LocalAccount) -> anyhow::Result<
         account.kind == AccountKind::Local,
         text::not_local(&account.name).trim_end().to_string()
     );
+    // Not under the lock: a prompt left open must not hold up `apply` or the boot self-heal.
+    let password = env
+        .ask_password(account)?
+        .ok_or_else(|| anyhow::anyhow!("ssh-broker: cancelled; nothing was changed."))?;
     // Held to the end: an `apply` in the middle of this would stop or start a session that this is
     // changing, and one that replaces the exe could do it between the check of it and the task's run.
     let _apply = env.lock_apply()?;
     env.check_install()?;
-
-    let password = env
-        .ask_password(account)?
-        .ok_or_else(|| anyhow::anyhow!("ssh-broker: cancelled; nothing was changed."))?;
     match env.batch_right(account, &password) {
         BatchRight::Granted => {}
         BatchRight::Missing => anyhow::bail!(batch_right_missing(&account.name)),
@@ -152,7 +164,20 @@ pub fn off(env: &mut dyn AutoLoginEnv, account: &LocalAccount) -> anyhow::Result
         env.is_elevated().context("read the token's elevation")?,
         not_elevated("off", &exe)
     );
-    let _apply = env.lock_apply()?;
+    // The task holds a stored password, so `off` must be able to delete it where no `apply` can run
+    // to hold the lock: without an install directory there is nothing to lock, and one that fails
+    // its check is refused by `apply` as well.
+    let _apply = match env.install_dir() {
+        InstallDir::Missing => None,
+        InstallDir::Untrusted(reason) => {
+            env.say(&format!(
+                "ssh-broker: warning: the install directory is not trusted ({reason}), so the apply lock was not taken; \
+                 deleting the task anyway."
+            ));
+            None
+        }
+        InstallDir::Trusted => Some(env.lock_apply()?),
+    };
     if env.delete(&task_name(&account.sid))? {
         env.say(&format!(
             "ssh-broker: auto-login is off for {}. A session that is running continues until {exe} logout.",
@@ -198,6 +223,17 @@ impl WindowsEnv {
     }
 }
 
+/// Look at the install directory, read-only.
+fn install_dir_of(layout: &crate::provision::layout::Layout) -> InstallDir {
+    match std::fs::symlink_metadata(&layout.base) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => InstallDir::Missing,
+        _ => match crate::provision::layout::check_base(layout) {
+            Ok(_) => InstallDir::Trusted,
+            Err(reason) => InstallDir::Untrusted(reason),
+        },
+    }
+}
+
 const EMPTY_PASSWORD_LINE: &str = "ssh-broker: empty passwords are not supported yet (ssh-broker#45). Enter a password, or press Ctrl+C to cancel.\r\n";
 
 impl AutoLoginEnv for WindowsEnv {
@@ -213,6 +249,13 @@ impl AutoLoginEnv for WindowsEnv {
         self.exe_override
             .clone()
             .unwrap_or_else(crate::provision::canonical_exe)
+    }
+
+    fn install_dir(&self) -> InstallDir {
+        if self.exe_override.is_some() {
+            return InstallDir::Trusted;
+        }
+        install_dir_of(&crate::provision::layout::Layout::production())
     }
 
     fn lock_apply(&mut self) -> anyhow::Result<Box<dyn std::any::Any>> {

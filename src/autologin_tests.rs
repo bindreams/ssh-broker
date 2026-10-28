@@ -62,8 +62,13 @@ struct Fake {
     locks: u32,
     /// Taking the lock fails with this message.
     lock_fails: Option<&'static str>,
-    /// The steps that ran while the lock was not held.
+    /// The steps that ran while the lock was not held, and those that ran while it was.
     unlocked: std::cell::RefCell<Vec<&'static str>>,
+    locked: std::cell::RefCell<Vec<&'static str>>,
+    /// Whether the lock was held when the password was asked for.
+    held_when_asked: Vec<bool>,
+    /// What `off` finds the install directory to be.
+    install: InstallDir,
 }
 
 /// The lock a [`Fake`] hands out: held until dropped.
@@ -78,7 +83,9 @@ impl Drop for Held {
 impl Fake {
     /// Note a step that needs the lock.
     fn step(&self, name: &'static str) {
-        if !self.held.get() {
+        if self.held.get() {
+            self.locked.borrow_mut().push(name);
+        } else {
             self.unlocked.borrow_mut().push(name);
         }
     }
@@ -103,6 +110,9 @@ impl Fake {
             locks: 0,
             lock_fails: None,
             unlocked: Default::default(),
+            locked: Default::default(),
+            held_when_asked: Vec::new(),
+            install: InstallDir::Trusted,
         }
     }
 
@@ -129,16 +139,20 @@ impl AutoLoginEnv for Fake {
         self.held.set(true);
         Ok(Box::new(Held(self.held.clone())))
     }
+    fn install_dir(&self) -> InstallDir {
+        self.install.clone()
+    }
     fn check_install(&self) -> anyhow::Result<()> {
         self.step("check_install");
         Ok(())
     }
     fn ask_password(&mut self, _: &LocalAccount) -> anyhow::Result<Option<Password>> {
-        self.step("ask");
+        self.held_when_asked.push(self.held.get());
         self.calls.push("ask".into());
         Ok(self.password.map(password))
     }
     fn batch_right(&self, _: &LocalAccount, password: &Password) -> BatchRight {
+        self.step("batch_right");
         self.probed.borrow_mut().push(password.as_wide().to_vec());
         self.batch.clone()
     }
@@ -414,13 +428,38 @@ fn on_holds_the_apply_lock_for_every_step_and_lets_go_at_the_end() {
     on(&mut env, &alice()).unwrap();
     assert_eq!(env.locks, 1);
     assert_eq!(*env.unlocked.borrow(), Vec::<&str>::new(), "steps outside the lock");
+    assert_eq!(
+        *env.locked.borrow(),
+        ["check_install", "batch_right", "register", "read_back", "run_now"],
+        "every step that reads or changes the install or the task is under the lock"
+    );
     assert!(!env.held.get(), "the lock is let go when on returns");
+}
+
+#[test]
+fn on_does_not_hold_the_apply_lock_while_it_asks_for_the_password() {
+    let mut env = Fake::new();
+    on(&mut env, &alice()).unwrap();
+    assert_eq!(
+        env.held_when_asked,
+        [false],
+        "a prompt left open must not hold up apply"
+    );
+}
+
+#[test]
+fn on_with_a_cancelled_prompt_takes_no_lock() {
+    let mut env = Fake::new();
+    env.password = None;
+    on(&mut env, &alice()).unwrap_err();
+    assert_eq!(env.locks, 0);
+    assert!(env.locked.borrow().is_empty() && env.unlocked.borrow().is_empty());
 }
 
 #[test]
 fn on_lets_go_of_the_apply_lock_when_it_fails_after_taking_it() {
     let mut env = Fake::new();
-    env.password = None;
+    env.batch = BatchRight::Missing;
     on(&mut env, &alice()).unwrap_err();
     assert_eq!(env.locks, 1);
     assert!(!env.held.get());
@@ -433,7 +472,52 @@ fn off_holds_the_apply_lock_for_its_step_and_lets_go_at_the_end() {
     off(&mut env, &alice()).unwrap();
     assert_eq!(env.locks, 1);
     assert_eq!(*env.unlocked.borrow(), Vec::<&str>::new(), "steps outside the lock");
+    assert_eq!(*env.locked.borrow(), ["delete"]);
     assert!(!env.held.get());
+}
+
+#[test]
+fn off_deletes_the_task_without_the_lock_when_there_is_no_install_directory() {
+    let mut env = Fake::new();
+    env.install = InstallDir::Missing;
+    off(&mut env, &alice()).unwrap();
+    assert_eq!(env.locks, 0, "no lock, and so nothing created to hold one");
+    assert_eq!(env.calls, [format!("delete {}", task_name("S-1-5-21-1-2-3-1001"))]);
+    assert!(env.said().contains("auto-login is off for alice"), "{}", env.said());
+}
+
+#[test]
+fn off_deletes_the_task_without_the_lock_when_the_install_directory_fails_its_check_and_says_why() {
+    let mut env = Fake::new();
+    env.install = InstallDir::Untrusted("its owner is BUILTIN-Users, not the Administrators group".into());
+    off(&mut env, &alice()).unwrap();
+    assert_eq!(env.locks, 0);
+    assert_eq!(env.calls, [format!("delete {}", task_name("S-1-5-21-1-2-3-1001"))]);
+    let said = env.said();
+    assert!(
+        said.contains("its owner is BUILTIN-Users"),
+        "the reason is named: {said}"
+    );
+    assert!(said.contains("warning"), "{said}");
+    assert!(said.contains("auto-login is off for alice"), "{said}");
+}
+
+#[test]
+fn off_takes_the_lock_when_the_install_directory_passes_its_check() {
+    let mut env = Fake::new();
+    env.install = InstallDir::Trusted;
+    off(&mut env, &alice()).unwrap();
+    assert_eq!(env.locks, 1);
+    assert!(!env.said().contains("warning"), "{}", env.said());
+}
+
+#[test]
+fn off_with_an_untrusted_directory_still_reports_a_task_that_cannot_be_deleted() {
+    let mut env = Fake::new();
+    env.install = InstallDir::Untrusted("it is not a directory".into());
+    env.delete_fails = Some("Access is denied.");
+    let text = error_text(off(&mut env, &alice()));
+    assert!(text.contains("Access is denied."), "{text}");
 }
 
 #[test]
@@ -463,10 +547,63 @@ fn a_lock_that_cannot_be_taken_stops_on_and_off_before_they_change_anything() {
     let mut env = Fake::new();
     env.lock_fails = Some("the install directory is not ours");
     let on_text = error_text(on(&mut env, &alice()));
+    assert_eq!(
+        env.calls,
+        ["ask"],
+        "the password is asked for before the lock; nothing is changed"
+    );
     let off_text = error_text(off(&mut env, &alice()));
     assert!(on_text.contains("the install directory is not ours"), "{on_text}");
     assert!(off_text.contains("the install directory is not ours"), "{off_text}");
-    assert!(env.calls.is_empty(), "nothing was asked or changed: {:?}", env.calls);
+    assert_eq!(env.calls, ["ask"], "off changed nothing either: {:?}", env.calls);
+}
+
+// the install directory -----
+
+/// A path under the temp dir that is removed on drop, whether it is a directory or a file.
+struct TempPath(std::path::PathBuf);
+
+impl TempPath {
+    fn new(tag: &str) -> TempPath {
+        TempPath(std::env::temp_dir().join(format!("sb-autologin-{tag}-{}", std::process::id())))
+    }
+}
+
+impl Drop for TempPath {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+fn state_of(path: &std::path::Path) -> InstallDir {
+    install_dir_of(&crate::provision::layout::Layout {
+        base: path.to_path_buf(),
+    })
+}
+
+#[test]
+fn an_install_directory_that_does_not_exist_is_missing_and_stays_missing() {
+    let path = TempPath::new("missing");
+    assert_eq!(state_of(&path.0), InstallDir::Missing);
+    assert!(!path.0.exists(), "looking must create nothing");
+}
+
+#[test]
+fn an_install_directory_that_is_not_the_hardened_one_is_untrusted_with_the_reason() {
+    let dir = TempPath::new("plain");
+    std::fs::create_dir_all(&dir.0).unwrap();
+    let InstallDir::Untrusted(reason) = state_of(&dir.0) else {
+        panic!("a plain temp directory is not the hardened install directory")
+    };
+    assert!(!reason.is_empty());
+
+    let file = TempPath::new("file");
+    std::fs::write(&file.0, b"").unwrap();
+    let InstallDir::Untrusted(reason) = state_of(&file.0) else {
+        panic!("a file is not an install directory")
+    };
+    assert!(reason.contains("not a directory"), "{reason}");
 }
 
 /// A prompt that answers with a script and records what it is told to show.
