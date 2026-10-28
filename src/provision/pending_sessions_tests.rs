@@ -59,3 +59,16 @@ fn a_line_that_is_not_a_session_task_name_is_not_owed() {
     std::fs::write(&path, text).unwrap();
     assert_eq!(load(&path).unwrap(), [session("a"), session("b")]);
 }
+
+#[test]
+fn an_untrusted_install_directory_is_said_not_silently_left_with_its_record() {
+    let mut said = Vec::new();
+    clear_after_resume(Err("the ACL grants Users write".to_string()), |line| {
+        said.push(line.to_string())
+    })
+    .unwrap();
+    assert_eq!(
+        said,
+        ["apply: not clearing the record of disabled sessions: the ACL grants Users write"]
+    );
+}

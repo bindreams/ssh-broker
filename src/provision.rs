@@ -187,10 +187,7 @@ mod imp {
                 flow::resume_sessions(&enabled_sessions, |name| taskscheduler::set_enabled(name, true))?;
                 // Every task is enabled again: nothing is owed any more. A directory that is not
                 // ours is left alone: its file is not the one that was ignored at the start.
-                match layout::check_base(&layout) {
-                    Ok(base) => pending_sessions::store(&base.layout().pending_sessions_path(), &[]),
-                    Err(_) => Ok(()),
-                }
+                pending_sessions::clear_after_resume(layout::check_base(&layout), |line| eprintln!("{line}"))
             },
             || flow::start_sessions(&enabled_sessions, taskscheduler::run_task),
             start_agents,

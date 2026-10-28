@@ -15,6 +15,7 @@ use anyhow::Context;
 use windows::Win32::Storage::FileSystem::{MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW};
 use windows::core::PCWSTR;
 
+use super::layout::BaseCheck;
 use super::session_task::TASK_PREFIX;
 
 /// The names of the tasks owed an enable, in the order they were stored. No file is none. A line
@@ -60,6 +61,20 @@ pub fn store(path: &Path, names: &[String]) -> anyhow::Result<()> {
         replace_file(&temporary, path)
     };
     write().with_context(|| format!("write {}", path.display()))
+}
+
+/// Clear the record once every owed task is enabled again, if the install directory still passes its
+/// check. When it does not, the record stays (it is not ours to touch) and `say` is told why.
+pub fn clear_after_resume(base: BaseCheck<'_>, say: impl FnOnce(&str)) -> anyhow::Result<()> {
+    match base {
+        Ok(base) => store(&base.layout().pending_sessions_path(), &[]),
+        Err(reason) => {
+            say(&format!(
+                "apply: not clearing the record of disabled sessions: {reason}"
+            ));
+            Ok(())
+        }
+    }
 }
 
 /// Move `from` over `to`, replacing it, and return only once the move is on disk: `std::fs::rename`
