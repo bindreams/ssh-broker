@@ -117,6 +117,59 @@ fn a_connection_given_up_because_no_thread_could_be_started_ends_the_drain_at_on
     drain_ends_when(Live::abandon);
 }
 
+/// A drain parked on a connection that is not a `logout` request. `before` adds to the tally before
+/// the drain parks; `mutation` then changes it without satisfying the drain, and returns the
+/// connections it leaves live. The drain must re-judge after the change (the hook reports a second
+/// park); its bound is an hour, so only a wake can make it. Then every connection ends and the drain
+/// completes.
+fn drain_rejudges_when<T>(
+    before: impl FnOnce(&Arc<Connections>) -> T,
+    mutation: impl FnOnce(&Arc<Connections>, T) -> Vec<Live>,
+) {
+    let (events, on_event) = mpsc::channel();
+    let connections = Connections::with_drain(Duration::from_secs(3600), move || {
+        let _ = events.send("parked");
+    });
+    let _logout_connection = connections.begin();
+    let _logout = connections.begin_logout();
+    let other = connections.begin();
+    let added = before(&connections);
+    let failsafe = Failsafe::new({
+        let connections = Arc::clone(&connections);
+        // The wake a skipped one would have been: it makes the drain re-judge, and `fired` says so.
+        move || connections.wake()
+    });
+    let draining = std::thread::spawn({
+        let connections = Arc::clone(&connections);
+        move || connections.wait_until_only_logouts_live()
+    });
+    assert_eq!(on_event.recv().unwrap(), "parked");
+
+    let kept = mutation(&connections, added);
+
+    assert_eq!(on_event.recv().unwrap(), "parked", "the drain did not re-judge");
+    assert!(!failsafe.finish(), "the drain re-judged only when the failsafe woke it");
+    drop(other);
+    drop(kept);
+    assert_eq!(draining.join().unwrap(), Drained::Complete);
+}
+
+#[test]
+fn a_connection_that_begins_wakes_the_drain_to_judge_again() {
+    drain_rejudges_when(|_| (), |connections, ()| vec![connections.begin()]);
+}
+
+#[test]
+fn a_logout_request_that_ends_while_other_connections_are_live_wakes_the_drain_to_judge_again() {
+    drain_rejudges_when(
+        |connections| (connections.begin(), connections.begin_logout()),
+        |_, (live, request)| {
+            drop(request);
+            vec![live]
+        },
+    );
+}
+
 // the accept loop -----
 
 /// The accept loop parked in `wait_for_an_end` while the end is decided. `accept` and `serve` make the
