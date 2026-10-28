@@ -4,6 +4,7 @@
 use super::*;
 use crate::acl::{self, Sid};
 use crate::afunix::AcceptError;
+use crate::protocol::{ExitCode, FrameKind, FrameReader};
 use crate::test_support::TempProfile;
 use std::cell::{Cell, RefCell};
 use std::os::windows::process::CommandExt;
@@ -532,74 +533,301 @@ fn closed(flag: &Arc<std::sync::atomic::AtomicBool>) -> bool {
 }
 
 #[test]
-fn the_listener_stays_open_when_the_thread_that_answers_logins_cannot_start() {
-    let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let held = RefCell::new(Vec::new());
-
-    keep_answering(
-        Arc::new(Closes(Arc::clone(&flag))),
-        |listener| held.borrow_mut().push(listener),
-        |_work| Err(std::io::Error::other("no thread")),
-        |_| unreachable!("the thread did not start"),
-    );
-
-    assert!(!closed(&flag), "the listener closed while the agent still ends");
-    drop(held);
-    assert!(closed(&flag), "and it is released with whoever held it");
-}
-
-#[test]
-fn the_listener_stays_open_when_the_loop_that_answers_logins_has_returned() {
-    let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let held = RefCell::new(Vec::new());
-    let answered = Arc::new(std::sync::atomic::AtomicBool::new(false));
-
-    keep_answering(
-        Arc::new(Closes(Arc::clone(&flag))),
-        |listener| held.borrow_mut().push(listener),
-        |work| {
-            work();
-            Ok(())
-        },
-        {
-            let answered = Arc::clone(&answered);
-            move |_| answered.store(true, std::sync::atomic::Ordering::SeqCst)
-        },
-    );
-
-    assert!(closed(&answered), "the loop ran");
-    assert!(!closed(&flag), "the listener closed when the loop returned");
-}
-
-#[test]
-fn serve_until_drained_hands_the_listener_to_the_process_end_and_does_not_drop_it() {
-    // `serve_until_drained` is the one place that passes `hold_until_end`; `keep_answering` is tested
-    // with its own `hold`. The hold is process-wide and never released, so this test leaves one
-    // stand-in listener open for the rest of the test process.
+fn the_listener_is_closed_when_the_loop_stops_and_not_held_until_the_process_ends() {
     let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let connections = Connections::new();
 
     let end = serve_until_drained_in(
         Closes(Arc::clone(&flag)),
         &connections,
-        |work| {
-            work();
-            Ok(())
-        },
-        |_, serving| {
-            if serving {
-                anyhow::Error::new(Stopped)
-            } else {
-                anyhow::anyhow!("no longer accepting")
-            }
-        },
+        || false,
+        |_| anyhow::Error::new(Stopped),
     );
 
-    assert!(end.downcast_ref::<Stopped>().is_some());
+    assert!(end.downcast_ref::<Stopped>().is_some(), "{end:#}");
+    assert!(closed(&flag), "the listener is still open after the loop stopped");
     assert!(
-        !closed(&flag),
-        "the listener closed when serving ended, not when the process ends"
+        !connections.lock().listener_open,
+        "the tally still says a loop holds it"
     );
+}
+
+#[test]
+fn the_listener_is_closed_when_the_loop_fails_too() {
+    let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let connections = Connections::new();
+
+    let end = serve_until_drained_in(
+        Closes(Arc::clone(&flag)),
+        &connections,
+        || false,
+        |_| anyhow::anyhow!("the listener failed"),
+    );
+
+    assert!(format!("{end:#}").contains("the listener failed"), "{end:#}");
+    assert!(closed(&flag));
+}
+
+// deciding the end -----
+
+/// The accept loop as the end meets it: blocked in `accept` until it is woken, it takes one more
+/// connection and counts it, and then returns and closes the listener. The connection stays live until
+/// the test releases it. It says what it does on `events`.
+fn accepting_loop(
+    connections: &Arc<Connections>,
+    woken: std::sync::mpsc::Receiver<()>,
+    release: std::sync::mpsc::Receiver<()>,
+    events: std::sync::mpsc::Sender<&'static str>,
+) -> std::thread::JoinHandle<()> {
+    let connections = Arc::clone(connections);
+    std::thread::spawn(move || {
+        if woken.recv().is_err() {
+            let _ = events.send("never woken");
+            return;
+        }
+        let late = connections.begin();
+        let _ = events.send("counted");
+        connections.listener_closed();
+        let _ = release.recv();
+        let _ = events.send("releasing");
+        drop(late);
+    })
+}
+
+#[test]
+fn the_end_is_judged_only_after_the_accept_loop_has_counted_what_it_took_and_closed_the_listener() {
+    use std::sync::mpsc;
+    let (events, on_event) = mpsc::channel::<&'static str>();
+    let connections = Connections::observing_drain({
+        let events = events.clone();
+        move || {
+            let _ = events.send("parked");
+        }
+    });
+    connections.listener_opened();
+    let (wake, woken) = mpsc::channel();
+    let (release, released) = mpsc::channel();
+    let accepting = accepting_loop(&connections, woken, released, events.clone());
+    let settler = std::thread::spawn({
+        let (connections, events) = (Arc::clone(&connections), events.clone());
+        move || {
+            let drained = connections.settle(&move || {
+                let _ = wake.send(());
+            });
+            let _ = events.send("settled");
+            drained
+        }
+    });
+
+    let mut seen = Vec::new();
+    let mut release = Some(release);
+    loop {
+        let event = on_event.recv().unwrap();
+        seen.push(event);
+        // The judge is waiting for the connection the loop took after the flag went up.
+        if event == "parked"
+            && seen.contains(&"counted")
+            && let Some(release) = release.take()
+        {
+            release.send(()).unwrap();
+        }
+        if event == "settled" {
+            break;
+        }
+    }
+    accepting.join().unwrap();
+    let drained = settler.join().unwrap();
+    seen.extend(on_event.try_iter());
+
+    let steps: Vec<_> = seen.iter().filter(|event| **event != "parked").collect();
+    assert_eq!(
+        steps,
+        [&"counted", &"releasing", &"settled"],
+        "the end was judged before the loop had stopped, or before the connection it took had finished"
+    );
+    assert_eq!(drained, Drained::Complete);
+}
+
+#[test]
+fn an_end_with_no_accept_loop_wakes_nothing_and_waits_for_nothing() {
+    let connections = Connections::new();
+    let drained = connections.settle(&|| panic!("there is no loop to wake"));
+    assert_eq!(drained, Drained::Complete);
+    assert!(
+        connections.is_closing(),
+        "the flag is up for any loop that starts later"
+    );
+}
+
+#[test]
+fn a_wake_that_failed_is_logged_and_the_end_does_not_wait_for_the_loop() {
+    let connections = Connections::new();
+    connections.listener_opened();
+    let (log, drained) =
+        crate::test_support::logged(|| connections.settle(&|| connections.wake_failed("no thread for it")));
+    assert_eq!(drained, Drained::Complete);
+    assert!(
+        log.contains("could not wake the accept loop: no thread for it"),
+        "{log}"
+    );
+    assert!(log.contains("ending with the listener open"), "{log}");
+}
+
+#[test]
+fn a_wake_that_fails_on_its_own_thread_ends_the_wait_for_the_loop() {
+    let connections = Connections::new();
+    connections.listener_opened();
+    let (log, drained) = crate::test_support::logged(|| {
+        connections.settle(&|| {
+            wake_without_blocking(&connections, || anyhow::bail!("the connect was refused"));
+        })
+    });
+    assert_eq!(drained, Drained::Complete);
+    assert!(log.contains("the connect was refused"), "{log}");
+}
+
+#[test]
+fn callers_that_ask_for_the_end_together_get_one_decision() {
+    let connections = Connections::new();
+    connections.listener_opened();
+    let woken = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    // The wake is what closes the listener, as it makes the loop return.
+    let wake = {
+        let (connections, woken) = (Arc::clone(&connections), Arc::clone(&woken));
+        move || {
+            woken.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            connections.listener_closed();
+        }
+    };
+    let callers: Vec<_> = (0..4)
+        .map(|_| {
+            let (connections, wake) = (Arc::clone(&connections), wake.clone());
+            std::thread::spawn(move || connections.settle(&wake))
+        })
+        .collect();
+    for caller in callers {
+        assert_eq!(caller.join().unwrap(), Drained::Complete);
+    }
+    assert_eq!(woken.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[test]
+fn a_drain_that_gave_up_on_connections_does_not_wait_for_them_a_second_time() {
+    let connections = Connections::with_drain_bound(std::time::Duration::from_millis(10));
+    let _hung = connections.begin();
+    let (log, drained) = crate::test_support::logged(|| connections.settle(&|| {}));
+    assert_eq!(drained, Drained::Abandoned { still_live: 1 });
+    assert_eq!(log.matches("had not finished").count(), 1, "{log}");
+}
+
+#[test]
+fn a_loop_that_failed_while_the_agent_ends_still_waits_for_the_drain() {
+    let (events, on_event) = std::sync::mpsc::channel();
+    let connections = Connections::observing_drain({
+        let events = events.clone();
+        move || {
+            let _ = events.send("parked");
+        }
+    });
+    let other = connections.begin();
+    let waiter = std::thread::spawn({
+        let connections = Arc::clone(&connections);
+        move || {
+            let end = finish_stopped(anyhow::anyhow!("the listener failed"), &connections, true);
+            let _ = events.send("returned");
+            end
+        }
+    });
+    assert_eq!(on_event.recv().unwrap(), "parked", "the waiter did not wait");
+    drop(other);
+    let next = std::iter::from_fn(|| on_event.recv().ok()).find(|event| *event != "parked");
+    assert_eq!(next, Some("returned"));
+    assert!(format!("{:#}", waiter.join().unwrap()).contains("the listener failed"));
+}
+
+// the exit code -----
+
+/// A write half that fails as told and counts the FINs.
+struct Wire {
+    written: Vec<u8>,
+    write_fails: Option<std::io::ErrorKind>,
+    close_fails: Option<std::io::ErrorKind>,
+    closed: std::cell::Cell<usize>,
+}
+
+impl Wire {
+    fn new(write_fails: Option<std::io::ErrorKind>, close_fails: Option<std::io::ErrorKind>) -> Wire {
+        Wire {
+            written: Vec::new(),
+            write_fails,
+            close_fails,
+            closed: std::cell::Cell::new(0),
+        }
+    }
+}
+
+impl std::io::Write for Wire {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if let Some(kind) = self.write_fails {
+            return Err(kind.into());
+        }
+        self.written.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl HalfClose for Wire {
+    fn shutdown_write(&self) -> anyhow::Result<()> {
+        self.closed.set(self.closed.get() + 1);
+        match self.close_fails {
+            Some(kind) => Err(std::io::Error::from(kind).into()),
+            None => Ok(()),
+        }
+    }
+}
+
+#[test]
+fn the_exit_code_is_sent_and_the_write_half_closed_without_a_word_in_the_log() {
+    let mut wire = Wire::new(None, None);
+    let (log, ()) = crate::test_support::logged(|| send_exit(&mut wire, 3));
+    assert_eq!(log, "");
+    let mut reader = FrameReader::new();
+    reader.push(&wire.written);
+    let frame = reader.next_frame().unwrap().expect("the frame was written");
+    assert_eq!(frame.kind, FrameKind::Exit);
+    assert_eq!(ExitCode::decode(&frame.payload).unwrap().0, 3);
+    assert_eq!(wire.closed.get(), 1);
+}
+
+#[test]
+fn a_lost_exit_code_is_a_warning_and_the_write_half_is_still_closed() {
+    let mut wire = Wire::new(Some(std::io::ErrorKind::PermissionDenied), None);
+    let (log, ()) = crate::test_support::logged(|| send_exit(&mut wire, 3));
+    assert!(log.contains("WARN"), "{log}");
+    assert!(log.contains("could not send the exit code (exit code 3)"), "{log}");
+    assert_eq!(wire.closed.get(), 1, "the FIN is sent although the frame was not");
+}
+
+#[test]
+fn a_write_half_that_cannot_be_closed_is_a_warning() {
+    let mut wire = Wire::new(None, Some(std::io::ErrorKind::PermissionDenied));
+    let (log, ()) = crate::test_support::logged(|| send_exit(&mut wire, 0));
+    assert!(log.contains("WARN"), "{log}");
+    assert!(log.contains("could not close the write half (exit code 0)"), "{log}");
+}
+
+#[test]
+fn a_client_that_has_gone_loses_the_exit_code_quietly() {
+    // Routine: the client disconnected first. Not a warning, which is for the unexpected.
+    let mut wire = Wire::new(
+        Some(std::io::ErrorKind::ConnectionReset),
+        Some(std::io::ErrorKind::BrokenPipe),
+    );
+    let (log, ()) = crate::test_support::logged(|| send_exit(&mut wire, 1));
+    assert!(!log.contains("WARN"), "{log}");
 }
 
 // closing a pseudoconsole -----
@@ -850,7 +1078,7 @@ fn a_stopped_loop_ends_ok_only_after_every_connection_has_finished() {
     let waiter = std::thread::spawn({
         let connections = Arc::clone(&connections);
         move || {
-            let end = finish_stopped(anyhow::Error::new(Stopped), &connections);
+            let end = finish_stopped(anyhow::Error::new(Stopped), &connections, false);
             let _ = events.send("returned");
             end
         }
@@ -869,7 +1097,7 @@ fn a_stopped_loop_ends_ok_only_after_every_connection_has_finished() {
 fn an_error_that_is_not_a_stop_is_still_an_error() {
     let connections = Connections::new();
     let _live = connections.begin();
-    let end = finish_stopped(anyhow::anyhow!("the listener failed"), &connections);
+    let end = finish_stopped(anyhow::anyhow!("the listener failed"), &connections, false);
     assert!(
         format!("{end:#}").contains("the listener failed"),
         "returns without waiting"
@@ -881,7 +1109,10 @@ fn an_error_that_is_not_a_stop_is_still_an_error() {
 #[test]
 fn the_wake_runs_on_a_thread_of_its_own_so_the_caller_never_waits_for_it() {
     let (ran_on, on_thread) = std::sync::mpsc::channel();
-    wake_without_blocking(move || ran_on.send(std::thread::current().id()).unwrap());
+    wake_without_blocking(&Connections::new(), move || {
+        ran_on.send(std::thread::current().id()).unwrap();
+        Ok(())
+    });
     assert_ne!(
         on_thread.recv().unwrap(),
         std::thread::current().id(),
@@ -1067,6 +1298,6 @@ fn home_comes_from_the_token_not_the_environment() {
 fn a_stopped_loop_ends_although_a_connection_never_finishes() {
     let connections = Connections::with_drain_bound(std::time::Duration::from_millis(10));
     let _hung = connections.begin();
-    let end = finish_stopped(anyhow::Error::new(Stopped), &connections);
+    let end = finish_stopped(anyhow::Error::new(Stopped), &connections, false);
     assert!(end.downcast_ref::<Stopped>().is_some(), "{end:#}");
 }

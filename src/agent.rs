@@ -164,9 +164,8 @@ fn serve_in(
 /// order.
 ///
 /// The slot and the lock are handed to `hold` when serving is over, whatever it returned, and not
-/// dropped: the process ends right after, and until then this agent's listener still answers (the
-/// loop that refuses logins during the drain). A successor that took the lock now would bind into
-/// that and be refused as already listening. The system releases both with the process.
+/// dropped: the process ends right after, and a successor that took the lock before then would start
+/// while this agent is still ending. The system releases both with the process.
 #[cfg(windows)]
 fn serve_with(
     location: &SocketLocation,
@@ -193,11 +192,13 @@ fn serve_with(
 #[cfg(windows)]
 fn run_on(location: &SocketLocation, background: bool) -> anyhow::Result<()> {
     let connections = Connections::new();
-    // Ending wakes the blocked `accept` with a connection of its own; the loop then sees the flag.
+    // Closing the listener wakes the blocked `accept` with a connection of its own; the loop then sees
+    // the flag. A wake that fails is reported to the connections, which stop waiting for the loop.
     let socket = location.path.clone();
+    let waking = Arc::clone(&connections);
     let control = Arc::new(Control::new(background, Arc::clone(&connections)).with_waker(move || {
         let socket = socket.clone();
-        wake_without_blocking(move || drop(afunix::connect(&socket)))
+        wake_without_blocking(&waking, move || afunix::connect(&socket).map(drop))
     }));
     run_on_with(location, Listener::bind, mark_listening, |listener| {
         serve_until_drained(listener, &connections, &control)
@@ -208,67 +209,38 @@ fn run_on(location: &SocketLocation, background: bool) -> anyhow::Result<()> {
     })
 }
 
-/// Serve `listener` until the agent is told to end, then wait until every connection but the
-/// `logout` requests has finished (see [`finish_stopped`]) and return the error that stopped the
-/// loop.
+/// Serve `listener` until the agent has decided to end, then return the error that stopped the loop.
 ///
-/// The listener stays open through the wait, and a second loop answers what arrives on it: a login
-/// that comes while the agent drains gets the ending refusal at once, where a closed socket would
-/// have left its shim waiting for an agent it takes to be starting, for as long as the drain lasts.
-/// The listener is held until the process ends, whether or not that loop runs or keeps running (see
-/// [`keep_answering`]).
+/// The one loop keeps accepting through the drain: a login that comes while the agent drains gets the
+/// ending refusal at once, where a closed socket would have left its shim waiting for an agent it
+/// takes to be starting, for as long as the drain lasts. It stops when the drain has finished
+/// ([`Connections::settle`]), after counting the connection it was accepting, and the listener is
+/// closed here, before the drain judges again.
 #[cfg(windows)]
 fn serve_until_drained(listener: Listener, connections: &Arc<Connections>, control: &Arc<Control>) -> anyhow::Error {
-    let (accepting, accepting_control) = (Arc::clone(connections), Arc::clone(control));
     serve_until_drained_in(
         listener,
         connections,
-        |work| std::thread::Builder::new().spawn(work).map(drop),
-        move |listener, serving| {
-            accept_loop(listener, &accepting, &accepting_control, || {
-                serving && accepting_control.is_ending()
-            })
-        },
+        || control.is_ending(),
+        |listener| accept_loop(listener, connections, control, || connections.is_closing()),
     )
 }
 
-/// [`serve_until_drained`] with the accepting and the thread start as parameters, so a test can see
-/// that the listener goes to [`hold_until_end`]. `accept` is called with `true` for the serving loop,
-/// which stops when the agent ends, and with `false` for the loop that answers during the drain.
+/// [`serve_until_drained`] with the accepting as a parameter, so a test can see that the listener is
+/// closed before the end is judged. `ending` says whether the agent has begun to end, which makes a
+/// failed loop wait for the drain as a stopped one does.
 #[cfg(windows)]
-fn serve_until_drained_in<L: Send + Sync + 'static>(
+fn serve_until_drained_in<L>(
     listener: L,
     connections: &Connections,
-    spawn: impl FnOnce(Box<dyn FnOnce() + Send>) -> std::io::Result<()>,
-    accept: impl Fn(&L, bool) -> anyhow::Error + Send + 'static,
+    ending: impl FnOnce() -> bool,
+    accept: impl FnOnce(&L) -> anyhow::Error,
 ) -> anyhow::Error {
-    let listener = Arc::new(listener);
-    let end = accept(&listener, true);
-    if end.downcast_ref::<Stopped>().is_some() {
-        keep_answering(listener, hold_until_end, spawn, move |listener| {
-            let end = accept(listener, false);
-            tracing::warn!("no longer answering logins while the agent ends: {end:#}");
-        });
-    }
-    finish_stopped(end, connections)
-}
-
-/// Run `answer` over `listener` on a thread started by `spawn`; the listener is also handed to
-/// `hold`, before the thread starts, so that it outlives the thread however the thread ends: a
-/// failed start, or `answer` returning on a fatal accept error or for lack of a live connection to
-/// free a resource. A closed socket would leave the shim of a login that arrives meanwhile waiting
-/// for an agent it takes to be starting.
-#[cfg(windows)]
-fn keep_answering<L: Send + Sync + 'static>(
-    listener: Arc<L>,
-    hold: impl FnOnce(Arc<L>),
-    spawn: impl FnOnce(Box<dyn FnOnce() + Send>) -> std::io::Result<()>,
-    answer: impl FnOnce(&L) + Send + 'static,
-) {
-    hold(Arc::clone(&listener));
-    if let Err(e) = spawn(Box::new(move || answer(&listener))) {
-        tracing::warn!("could not keep answering logins while the agent ends: {e}");
-    }
+    connections.listener_opened();
+    let end = accept(&listener);
+    drop(listener);
+    connections.listener_closed();
+    finish_stopped(end, connections, ending())
 }
 
 /// [`serve_connections_with`] over `listener`, handing each connection to a thread of its own.
@@ -279,9 +251,21 @@ fn accept_loop(
     control: &Arc<Control>,
     stopping: impl Fn() -> bool,
 ) -> anyhow::Error {
+    accept_loop_with(|| listener.accept(), connections, control, stopping)
+}
+
+/// [`accept_loop`] over an `accept` the caller supplies, so a test can stop the loop between a
+/// connection's `accept` and its count.
+#[cfg(windows)]
+fn accept_loop_with(
+    accept: impl FnMut() -> Result<socket2::Socket, AcceptError>,
+    connections: &Arc<Connections>,
+    control: &Arc<Control>,
+    stopping: impl Fn() -> bool,
+) -> anyhow::Error {
     serve_connections_with(
         Arc::clone(connections),
-        || listener.accept(),
+        accept,
         |conn, live| {
             let control = Arc::clone(control);
             hand_to_thread(
@@ -302,31 +286,39 @@ fn accept_loop(
 
 /// Run `wake` on a thread of its own, so that the caller never waits for it. The wake is a connect
 /// to the agent's own listener, and a connect to a listener whose queue is full may wait for room in
-/// it; the caller is the `logout` handler, which has shells to end. A wake that has to wait wakes
-/// nothing that needs waking: the queue is full only if the accept loop is not blocked in `accept`,
-/// and a loop that is not blocked reads the flag before its next `accept`. If no thread can be
-/// started the wake is skipped, for the same reason, and the process still ends when the `logout`
-/// handler is done.
+/// it; the caller may be the `logout` handler. A wake that has to wait wakes nothing that needs
+/// waking: the queue is full only if the accept loop is not blocked in `accept`, and a loop that is
+/// not blocked reads the flag before its next `accept`.
+///
+/// A wake that fails, or a thread that cannot be started, is reported to `connections` (see
+/// [`Connections::wake_failed`]).
 #[cfg(windows)]
-fn wake_without_blocking(wake: impl FnOnce() + Send + 'static) {
-    if let Err(e) = std::thread::Builder::new().spawn(wake) {
-        tracing::warn!("could not wake the accept loop: {e}");
+fn wake_without_blocking(connections: &Arc<Connections>, wake: impl FnOnce() -> anyhow::Result<()> + Send + 'static) {
+    let on_thread = Arc::clone(connections);
+    let started = std::thread::Builder::new().spawn(move || {
+        if let Err(e) = wake() {
+            on_thread.wake_failed(&format!("{e:#}"));
+        }
+    });
+    if let Err(e) = started {
+        connections.wake_failed(&format!("no thread for it: {e}"));
     }
 }
 
-/// The accept loop stopped because the agent is ending (see [`serve_connections_with`]).
+/// The accept loop stopped because the end is decided (see [`serve_connections_with`]).
 #[cfg(windows)]
 #[derive(Debug, thiserror::Error)]
 #[error("the agent stopped accepting connections because its session is ending")]
 struct Stopped;
 
-/// After the loop returned `end`: if it stopped on purpose, wait until every connection but the
-/// `logout` requests has finished, so each shell's last output reaches its client, and return
-/// `end` either way. The agent's process ends when this returns.
+/// After the loop returned `end`: if it stopped on purpose, or the agent is ending and the loop failed,
+/// wait until the end is decided (see [`Connections::settle`]) and return `end` either way. The agent's
+/// process ends when this returns.
 #[cfg(windows)]
-fn finish_stopped(end: anyhow::Error, connections: &Connections) -> anyhow::Error {
-    if end.downcast_ref::<Stopped>().is_some() {
-        connections.wait_until_only_logouts_live();
+fn finish_stopped(end: anyhow::Error, connections: &Connections, ending: bool) -> anyhow::Error {
+    if ending || end.downcast_ref::<Stopped>().is_some() {
+        // The listener is closed, so there is nothing to wake.
+        connections.settle(&|| {});
     }
     end
 }
@@ -390,6 +382,8 @@ struct Connections {
     /// the park itself, so what this causes to happen to a connection happens after the drain is
     /// waiting. It must not take the lock. A test uses it to know that the drain is waiting.
     drain_parks: Box<dyn Fn() + Send + Sync>,
+    /// How the end went, once it is decided (see [`Connections::settle`]).
+    settled: std::sync::OnceLock<Drained>,
 }
 
 /// The longest an ending agent waits for its connections to finish relaying. Each is waiting on a
@@ -417,6 +411,13 @@ struct Tally {
     ended: u64,
     /// How many of the live connections are `logout` requests waiting for the others to finish.
     logouts: usize,
+    /// The end is decided: the accept loop returns after the connection it is accepting, which it
+    /// counts first.
+    closing: bool,
+    /// An accept loop holds the listener.
+    listener_open: bool,
+    /// Why the loop could not be woken, if it could not: nothing will make it return.
+    wake_failed: Option<String>,
 }
 
 /// A live connection. Dropping it, on any exit from the handler including a panic, ends it.
@@ -447,8 +448,12 @@ impl Connections {
                 live: 0,
                 ended: 0,
                 logouts: 0,
+                closing: false,
+                listener_open: false,
+                wake_failed: None,
             }),
             ended: Condvar::new(),
+            settled: std::sync::OnceLock::new(),
         })
     }
 
@@ -473,7 +478,7 @@ impl Connections {
     }
 
     /// Return once every live connection is a `logout` request: the shells' last output has been
-    /// delivered. Each request is itself live until its handler returns, so counting them in
+    /// delivered. (The end is decided by [`Connections::settle`], which calls this twice.) Each request is itself live until its handler returns, so counting them in
     /// would make two requests wait for each other for ever.
     ///
     /// A connection waits on its client, which may never act, so the wait ends after the drain bound
@@ -500,6 +505,79 @@ impl Connections {
                 self.drain_bound.as_secs_f32()
             );
             Drained::Abandoned { still_live }
+        }
+    }
+
+    /// An accept loop is about to run over the listener.
+    fn listener_opened(&self) {
+        self.lock().listener_open = true;
+    }
+
+    /// The loop has returned and the listener is closed.
+    fn listener_closed(&self) {
+        self.lock().listener_open = false;
+        self.ended.notify_all();
+    }
+
+    /// Whether the end is decided: the accept loop stops after its current accept.
+    fn is_closing(&self) -> bool {
+        self.lock().closing
+    }
+
+    /// The loop cannot be woken, so waiting for it would not end: the end goes on without it, and
+    /// says why (see [`Connections::settle`]).
+    fn wake_failed(&self, why: &str) {
+        self.lock().wake_failed.get_or_insert_with(|| why.to_string());
+        self.ended.notify_all();
+    }
+
+    /// Decide the end of the agent: wait until only `logout` requests are live, stop the accept loop
+    /// and close the listener, and judge again. Returns how the last judgement went. Any number of
+    /// callers (the `logout` handlers, the thread that ran the loop) may ask; the first does the work
+    /// and the others wait for it.
+    ///
+    /// The first wait is with the listener open, so a login that arrives meanwhile gets the refusal.
+    /// The loop counts every connection it accepts before it looks at the flag set here, and the
+    /// listener is closed once it has returned, so the second judgement sees every connection the loop
+    /// took. A connection the system queued and nobody accepted is reset with the listener; its shim
+    /// goes back to its no-agent path. If the first wait gave up on connections that do not finish, the
+    /// second is not made: those would not finish either.
+    ///
+    /// `wake` makes a loop that is blocked in `accept` return from it.
+    fn settle(&self, wake: &dyn Fn()) -> Drained {
+        *self.settled.get_or_init(|| {
+            let first = self.wait_until_only_logouts_live();
+            self.close_listener(wake);
+            match first {
+                Drained::Complete => self.wait_until_only_logouts_live(),
+                abandoned @ Drained::Abandoned { .. } => abandoned,
+            }
+        })
+    }
+
+    /// Raise the flag, wake the loop and wait until it has returned and the listener is closed, or
+    /// until the wake has failed. Nothing is waited for if no loop holds a listener.
+    fn close_listener(&self, wake: &dyn Fn()) {
+        let mut tally = self.lock();
+        tally.closing = true;
+        if !tally.listener_open {
+            return;
+        }
+        drop(tally);
+        wake();
+        let tally = self.lock();
+        let tally = self
+            .ended
+            .wait_while(tally, |tally| {
+                let parks = tally.listener_open && tally.wake_failed.is_none();
+                if parks {
+                    (self.drain_parks)();
+                }
+                parks
+            })
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let (true, Some(why)) = (tally.listener_open, &tally.wake_failed) {
+            tracing::warn!("could not wake the accept loop: {why}; ending with the listener open");
         }
     }
 
@@ -895,11 +973,10 @@ fn handle_pty(
         // The shell is gone and the output is drained, so the code is final and nothing else
         // can still be writing frames.
         let mut g = tx_arc.lock().unwrap();
-        let _ = write_frame(&mut *g, FrameKind::Exit, &ExitCode(code).encode());
         // FIN the write half only: the input pump keeps reading until the client closes, so for a
         // conforming client the socket never closes with unread input, which would reset it and
         // lose the EXIT frame.
-        let _ = g.shutdown_write();
+        send_exit(&mut *g, code);
     }
     if let Some(hangup) = hangup {
         hangup.finish();
@@ -908,6 +985,37 @@ fn handle_pty(
     // Threads joined; `session` now drops and closes the process/thread + pipe handles.
     wait_result?;
     Ok(())
+}
+
+/// The write half of a connection, which can be closed on its own.
+#[cfg(windows)]
+trait HalfClose: std::io::Write {
+    /// Send FIN on the write half.
+    fn shutdown_write(&self) -> anyhow::Result<()>;
+}
+
+#[cfg(windows)]
+impl HalfClose for ConnTx {
+    fn shutdown_write(&self) -> anyhow::Result<()> {
+        ConnTx::shutdown_write(self)
+    }
+}
+
+/// Send the shell's exit code and FIN the write half. A client that has gone loses the code, which
+/// is routine and logged at debug; any other failure loses it too and is logged as a warning.
+#[cfg(windows)]
+fn send_exit(tx: &mut impl HalfClose, code: i32) {
+    let write = write_frame(tx, FrameKind::Exit, &ExitCode(code).encode());
+    let close = tx.shutdown_write();
+    for (what, result) in [("send the exit code", write), ("close the write half", close)] {
+        if let Err(e) = result {
+            if crate::shim::peer_gone(&e).is_some() {
+                tracing::debug!("the client is gone; could not {what} (exit code {code}): {e:#}");
+            } else {
+                tracing::warn!("could not {what} (exit code {code}): {e:#}");
+            }
+        }
+    }
 }
 
 /// Answer a login whose shell has been ended before it was served with the refusal. The pseudoconsole
@@ -1059,11 +1167,10 @@ fn handle_exec(
     let _ = t_err.join();
     {
         let mut g = tx_arc.lock().unwrap();
-        let _ = write_frame(&mut *g, FrameKind::Exit, &ExitCode(code).encode());
         // FIN the write half only: the stdin pump keeps reading until the client closes, so for a
         // conforming client the socket never closes with unread input, which would reset it and
         // lose the EXIT frame.
-        let _ = g.shutdown_write();
+        send_exit(&mut *g, code);
     }
     if let Some(hangup) = hangup {
         hangup.finish();

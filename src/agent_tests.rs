@@ -325,21 +325,18 @@ fn a_login_that_arrives_while_the_agent_drains_gets_the_refusal_at_once() {
     });
     // A connection that is still relaying: the drain cannot finish until the test lets it go.
     let relaying = connections.begin();
-    let control = Arc::new(super::Control::new(true, Arc::clone(&connections)).with_waker({
-        let sock = sock.clone();
-        move || {
-            super::wake_without_blocking({
-                let sock = sock.clone();
-                move || drop(afunix::connect(&sock))
-            })
-        }
-    }));
+    let control =
+        Arc::new(super::Control::new(true, Arc::clone(&connections)).with_waker(wake_through(&connections, &sock)));
     let serving = thread::spawn({
         let (connections, control) = (Arc::clone(&connections), Arc::clone(&control));
         move || super::serve_until_drained(listener, &connections, &control)
     });
-
+    // What the `logout` handler does.
     control.end_all();
+    let settling = thread::spawn({
+        let control = Arc::clone(&control);
+        move || control.settle()
+    });
     assert_eq!(on_event.recv().unwrap(), "draining");
 
     let conn = afunix::connect(&sock).expect("the listener was closed while the agent drained");
@@ -358,6 +355,117 @@ fn a_login_that_arrives_while_the_agent_drains_gets_the_refusal_at_once() {
     // Only now does the relaying connection finish, and the drain with it.
     drop((crx, ctx));
     drop(relaying);
+    let end = serving.join().unwrap();
+    assert!(end.downcast_ref::<super::Stopped>().is_some(), "{end:#}");
+    assert_eq!(settling.join().unwrap(), super::Drained::Complete);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The wake the agent uses: a connect to its own listener, on a thread of its own.
+fn wake_through(
+    connections: &std::sync::Arc<super::Connections>,
+    sock: &std::path::Path,
+) -> impl Fn() + Send + Sync + 'static {
+    let (connections, sock) = (std::sync::Arc::clone(connections), sock.to_path_buf());
+    move || {
+        let sock = sock.clone();
+        super::wake_without_blocking(&connections, move || afunix::connect(&sock).map(drop))
+    }
+}
+
+/// A login that the accept loop has taken from the listener and not yet counted, when the agent
+/// decides to end. Judged then, the agent would have no connection live: the process would end and
+/// reset the login with its handshake and input unread. The end waits for the loop instead, which
+/// counts the login, and the login gets the refusal.
+#[test]
+fn a_login_accepted_while_the_end_is_decided_is_refused_not_reset() {
+    use std::sync::Arc;
+    use std::sync::mpsc;
+
+    let dir = hardened_dir("accepted-uncounted");
+    let sock = dir.join("s");
+    let listener = Listener::bind(&sock).unwrap();
+    let (events, on_event) = mpsc::channel::<&'static str>();
+    let connections = super::Connections::observing_drain({
+        let events = events.clone();
+        move || {
+            let _ = events.send("parked");
+        }
+    });
+    let control =
+        Arc::new(super::Control::new(true, Arc::clone(&connections)).with_waker(wake_through(&connections, &sock)));
+    control.end_all();
+
+    // The login: its handshake and the stdin end marker, then whatever the agent answers.
+    let client = thread::spawn({
+        let sock = sock.clone();
+        move || {
+            let conn = afunix::connect(&sock).unwrap();
+            let (mut crx, mut ctx) = afunix::split(conn).unwrap();
+            let hs = Handshake {
+                mode: Mode::Exec,
+                command: Some("cmd.exe /c exit /b 0".into()),
+                ..Handshake::pty_default()
+            };
+            write_frame(&mut ctx, FrameKind::Handshake, &hs.encode().unwrap()).unwrap();
+            write_data(&mut ctx, Stream::Stdin, b"").unwrap();
+            let mut sink = TestSink::default();
+            let outcome = pump_decode(&mut crx, &mut FrameReader::new(), &mut sink).map_err(|e| format!("{e:#}"));
+            (outcome, sink.stderr)
+        }
+    });
+
+    // The loop stops between taking the login and counting it, until the test lets it go on.
+    let (accepted, wait_accepted) = mpsc::channel();
+    let (go_on, wait_go_on) = mpsc::channel::<()>();
+    let serving = thread::spawn({
+        let (connections, control) = (Arc::clone(&connections), Arc::clone(&control));
+        move || {
+            super::serve_until_drained_in(
+                listener,
+                &connections,
+                || control.is_ending(),
+                |listener| {
+                    let mut first = true;
+                    super::accept_loop_with(
+                        || {
+                            let conn = listener.accept();
+                            if std::mem::take(&mut first) {
+                                accepted.send(()).unwrap();
+                                wait_go_on.recv().ok();
+                            }
+                            conn
+                        },
+                        &connections,
+                        &control,
+                        || connections.is_closing(),
+                    )
+                },
+            )
+        }
+    });
+    wait_accepted.recv().unwrap();
+    // The agent decides to end now: nothing is live.
+    let settling = thread::spawn({
+        let (control, events) = (Arc::clone(&control), events.clone());
+        move || {
+            let drained = control.settle();
+            let _ = events.send("settled");
+            drained
+        }
+    });
+    let first = on_event.recv().unwrap();
+    // Let the loop go on, whatever happened, so that nothing is left waiting.
+    go_on.send(()).unwrap();
+    assert_eq!(
+        first, "parked",
+        "the end was decided while a login was accepted and not counted"
+    );
+
+    let (outcome, stderr) = client.join().unwrap();
+    assert_eq!(outcome, Ok(Outcome::Exited(255)), "the login was reset, not refused");
+    assert_eq!(stderr, super::logout::ENDING_REFUSAL.as_bytes());
+    assert_eq!(settling.join().unwrap(), super::Drained::Complete);
     let end = serving.join().unwrap();
     assert!(end.downcast_ref::<super::Stopped>().is_some(), "{end:#}");
     std::fs::remove_dir_all(&dir).ok();

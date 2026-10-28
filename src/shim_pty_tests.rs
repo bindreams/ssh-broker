@@ -499,3 +499,180 @@ fn a_rescue_that_finds_the_input_gone_ends_the_shim_with_255_and_runs_nothing() 
     assert_eq!(relayed, Some(255));
     assert!(stderr.is_empty(), "no fallback message: nothing runs");
 }
+
+// An agent that ends the connection before it says anything -----
+
+/// A fake agent that takes one connection, reads `frames` frames from it, closes it, and then closes
+/// its listener, so that the next connect finds nobody. The shim may connect again before the listener
+/// closes; that connection is reset with it, and the shim goes round once more.
+fn agent_that_hangs_up(listener: crate::afunix::Listener, frames: usize) -> std::thread::JoinHandle<()> {
+    use crate::afunix;
+    use crate::protocol::{FrameReader, read_one_frame};
+    std::thread::spawn(move || {
+        let (mut rx, tx) = afunix::split(listener.accept().unwrap()).unwrap();
+        let mut reader = FrameReader::new();
+        for _ in 0..frames {
+            read_one_frame(&mut rx, &mut reader).unwrap();
+        }
+        drop((rx, tx));
+        drop(listener);
+    })
+}
+
+fn location_with_listener(
+    tag: &str,
+) -> (
+    crate::test_support::TempProfile,
+    SocketLocation,
+    crate::afunix::Listener,
+) {
+    let profile = crate::test_support::TempProfile::new(tag);
+    let location = profile.location();
+    crate::userdir::ensure_socket_dir(&location, &crate::acl::Sid::current_user().unwrap()).unwrap();
+    let listener = crate::afunix::Listener::bind(&location.path).unwrap();
+    (profile, location, listener)
+}
+
+/// A rescue that must not be asked.
+struct Never;
+
+impl Rescue for Never {
+    fn rescue(&mut self, _: &Absent<'_>, _: &mut dyn std::io::Write) -> Rescued {
+        panic!("the shim asked for a rescue after the agent had ended its connection")
+    }
+}
+
+#[test]
+fn a_command_whose_connection_ends_before_the_agent_answers_is_refused_with_a_message_not_run_locally() {
+    // The frames read are none (the connection closes with the handshake unread), or the handshake and
+    // the stdin-EOF marker an exec shim sends at once.
+    for (tag, frames) in [("hangup-unread", 0), ("hangup-read", 2)] {
+        let (_profile, location, listener) = location_with_listener(tag);
+        let agent = agent_that_hangs_up(listener, frames);
+        let mut stderr = Vec::new();
+
+        let relayed = super::try_relay_at(
+            Ok(location),
+            &Some("echo hi".into()),
+            &mut stderr,
+            None,
+            std::io::empty(),
+            &mut Never,
+        )
+        .unwrap();
+        agent.join().unwrap();
+
+        assert_eq!(relayed, Some(255), "{tag}");
+        let text = String::from_utf8(stderr).unwrap();
+        assert!(
+            text.starts_with("ssh-broker: the agent closed the connection"),
+            "{tag}: {text}"
+        );
+        assert!(text.contains("was not run again"), "{tag}: {text}");
+    }
+}
+
+#[test]
+fn an_interactive_session_whose_connection_ends_before_the_agent_answers_takes_the_no_agent_path() {
+    use super::Interactive;
+    use crate::shim::Pumped;
+    let (_profile, location, listener) = location_with_listener("hangup-pty");
+    let agent = agent_that_hangs_up(listener, 0);
+    let mut rescue = Scripted::answering(Rescued::Plain);
+    let mut stderr = Vec::new();
+    let mut attempts = 0;
+
+    let relayed = super::try_relay_with(
+        Ok(location),
+        &None,
+        &mut stderr,
+        None,
+        std::io::empty(),
+        &mut rescue,
+        &mut |_conn, _modes| {
+            attempts += 1;
+            Ok(Interactive::Pumped(Pumped::closed(anyhow::Error::new(
+                std::io::Error::from(std::io::ErrorKind::ConnectionReset),
+            ))))
+        },
+    )
+    .unwrap();
+    agent.join().unwrap();
+
+    // A connection made before the listener closed is reset with it, which sends the shim round again.
+    assert!(attempts >= 1, "the shim never relayed");
+    assert_eq!(relayed, None, "the shim fails open as it does for no agent");
+    assert_eq!(rescue.seen, [(false, true, true)], "the no-agent path was taken once");
+    assert!(stderr.is_empty(), "an interactive fallback prints nothing");
+}
+
+#[test]
+fn an_interactive_session_goes_round_again_to_an_agent_that_answers_the_second_time() {
+    use super::Interactive;
+    use crate::relay::Outcome;
+    use crate::shim::Pumped;
+    let (_profile, location, listener) = location_with_listener("hangup-then-serve");
+    let (finished, wait_finished) = std::sync::mpsc::channel::<()>();
+    let agent = std::thread::spawn(move || {
+        drop(listener.accept().unwrap());
+        let second = listener.accept().unwrap();
+        wait_finished.recv().ok();
+        drop(second);
+    });
+    let mut attempts = 0;
+
+    let relayed = super::try_relay_with(
+        Ok(location),
+        &None,
+        &mut Vec::new(),
+        None,
+        std::io::empty(),
+        &mut Never,
+        &mut |_conn, _modes| {
+            attempts += 1;
+            Ok(Interactive::Pumped(if attempts == 1 {
+                Pumped::closed(anyhow::Error::new(std::io::Error::from(
+                    std::io::ErrorKind::ConnectionReset,
+                )))
+            } else {
+                Pumped {
+                    outcome: Ok(Outcome::Exited(7)),
+                    heard: true,
+                }
+            }))
+        },
+    )
+    .unwrap();
+    finished.send(()).unwrap();
+    agent.join().unwrap();
+
+    assert_eq!(attempts, 2);
+    assert_eq!(relayed, Some(7));
+}
+
+#[test]
+fn input_already_sent_to_a_connection_that_ended_is_not_run_again() {
+    let (_profile, location, listener) = location_with_listener("hangup-input");
+    // The handshake and the first chunk of input, so the shim has handed input to the connection.
+    let agent = agent_that_hangs_up(listener, 2);
+    let mut stderr = Vec::new();
+
+    let relayed = super::try_relay_at(
+        Ok(location),
+        &Some("sort".into()),
+        &mut stderr,
+        None,
+        std::io::Cursor::new(b"b\na\n".to_vec()),
+        &mut Never,
+    )
+    .unwrap();
+    agent.join().unwrap();
+
+    assert_eq!(
+        relayed,
+        Some(255),
+        "the session failed, it was not run on what was left"
+    );
+    let text = String::from_utf8(stderr).unwrap();
+    assert!(text.contains("was not run again"), "{text}");
+}

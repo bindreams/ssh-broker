@@ -6,7 +6,7 @@ use super::{
     is_blank_command, make_handshake, map_outcome, size_to_resize, spawn_line,
 };
 use crate::protocol::{ExitCode, FrameKind, FrameReader, Handshake, Mode, Resize, Stream, read_one_frame, write_frame};
-use crate::relay::{FrameSink, Outcome, duplex, write_data};
+use crate::relay::{FrameSink, Outcome, TestSink, duplex, write_data};
 
 #[test]
 fn exec_shim_relays_streams_and_exit() {
@@ -512,4 +512,202 @@ fn a_blank_command_is_empty_or_only_space_tab_cr_lf() {
     for not_blank in ["\u{a0}", "cmd", " cmd ", "\0", "\u{b}", "\u{c}"] {
         assert!(!is_blank_command(not_blank), "{not_blank:?}");
     }
+}
+
+// The agent that never answers, and the input that must not be lost -----
+
+use super::{Attached, ExecInput, PumpError, Pumped, peer_gone};
+use std::sync::mpsc;
+
+/// A connection that hands what is written to it to the test, a write at a time.
+struct Wire(mpsc::Sender<Vec<u8>>);
+
+impl std::io::Write for Wire {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .send(bytes.to_vec())
+            .map_err(|_| std::io::Error::from(std::io::ErrorKind::BrokenPipe))?;
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn wire() -> (Wire, mpsc::Receiver<Vec<u8>>) {
+    let (tx, rx) = mpsc::channel();
+    (Wire(tx), rx)
+}
+
+/// The next `n` frames written to a connection, as `(kind, payload)`. Blocks until they arrive.
+fn frames(from: &mpsc::Receiver<Vec<u8>>, n: usize) -> Vec<(FrameKind, Vec<u8>)> {
+    let mut fr = FrameReader::new();
+    let mut got = Vec::new();
+    while got.len() < n {
+        while let Some(frame) = fr.next_frame().unwrap() {
+            got.push((frame.kind, frame.payload));
+        }
+        if got.len() < n {
+            fr.push(&from.recv().expect("the connection closed before the frames came"));
+        }
+    }
+    got
+}
+
+fn exec_handshake() -> Handshake {
+    make_handshake(&Some("sort".into()), "xterm".into(), 80, 24)
+}
+
+fn stdin_data(payload: &[u8]) -> (FrameKind, Vec<u8>) {
+    let mut p = vec![Stream::Stdin as u8];
+    p.extend_from_slice(payload);
+    (FrameKind::Data, p)
+}
+
+/// Input that arrives when the test says so: a read blocks until a chunk is sent, and ends at EOF
+/// when the sender is dropped.
+struct Gated(mpsc::Receiver<Vec<u8>>);
+
+impl std::io::Read for Gated {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self.0.recv() {
+            Ok(chunk) => {
+                buf[..chunk.len()].copy_from_slice(&chunk);
+                Ok(chunk.len())
+            }
+            Err(_) => Ok(0),
+        }
+    }
+}
+
+#[test]
+fn a_connection_can_be_replaced_while_no_input_has_gone_to_it_and_the_new_one_gets_the_eof_marker() {
+    let (first, from_first) = wire();
+    let (second, from_second) = wire();
+    let mut input = ExecInput::new(std::io::empty());
+    assert!(matches!(
+        input.attach(first, &exec_handshake()).unwrap(),
+        Attached::Ready
+    ));
+    // Stdin was empty: the marker follows the handshake.
+    assert_eq!(frames(&from_first, 2)[1], stdin_data(b""));
+
+    assert!(!input.input_lost(), "an end of input is not input");
+    assert!(matches!(
+        input.attach(second, &exec_handshake()).unwrap(),
+        Attached::Ready
+    ));
+    // Nothing more is coming, so a marker that was never owed ends the read with an error and does
+    // not leave it waiting.
+    drop(input);
+    let sent = frames(&from_second, 2);
+    assert_eq!(sent[0].0, FrameKind::Handshake);
+    assert_eq!(
+        sent[1],
+        stdin_data(b""),
+        "the end of input is owed to the new connection too"
+    );
+    assert!(from_first.recv().is_err(), "the replaced connection is closed");
+}
+
+#[test]
+fn input_that_went_to_a_connection_is_not_moved_to_another() {
+    let (first, from_first) = wire();
+    let (second, from_second) = wire();
+    let mut input = ExecInput::new(std::io::Cursor::new(b"b\na\n".to_vec()));
+    assert!(matches!(
+        input.attach(first, &exec_handshake()).unwrap(),
+        Attached::Ready
+    ));
+    assert_eq!(frames(&from_first, 2)[1], stdin_data(b"b\na\n"));
+
+    assert!(input.input_lost());
+    assert!(matches!(
+        input.attach(second, &exec_handshake()).unwrap(),
+        Attached::InputLost
+    ));
+    assert!(
+        from_second.recv().is_err(),
+        "nothing went to the connection that was refused"
+    );
+}
+
+#[test]
+fn input_that_arrives_after_a_connection_was_replaced_goes_to_the_new_one() {
+    let (first, from_first) = wire();
+    let (second, from_second) = wire();
+    let (send, gated) = mpsc::channel();
+    let mut input = ExecInput::new(Gated(gated));
+    assert!(matches!(
+        input.attach(first, &exec_handshake()).unwrap(),
+        Attached::Ready
+    ));
+    assert_eq!(frames(&from_first, 1)[0].0, FrameKind::Handshake);
+    // The forwarder is parked in its read of stdin: the same thread serves the next connection.
+    assert!(matches!(
+        input.attach(second, &exec_handshake()).unwrap(),
+        Attached::Ready
+    ));
+    assert_eq!(frames(&from_second, 1)[0].0, FrameKind::Handshake);
+
+    send.send(b"late".to_vec()).unwrap();
+    assert_eq!(frames(&from_second, 1)[0], stdin_data(b"late"));
+}
+
+#[test]
+fn a_handshake_to_a_peer_that_has_gone_is_reported_not_raised() {
+    let (gone, from_gone) = wire();
+    drop(from_gone);
+    let mut input = ExecInput::new(std::io::empty());
+    match input.attach(gone, &exec_handshake()).unwrap() {
+        Attached::Closed(e) => assert_eq!(peer_gone(&e), Some(std::io::ErrorKind::BrokenPipe)),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn a_handshake_that_fails_for_another_reason_is_an_error() {
+    struct Denied;
+    impl std::io::Write for Denied {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::ErrorKind::PermissionDenied.into())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut input = ExecInput::new(std::io::empty());
+    assert!(input.attach(Denied, &exec_handshake()).is_err());
+}
+
+#[test]
+fn only_a_connection_that_ended_without_a_byte_from_the_agent_is_unanswered() {
+    use std::io::ErrorKind::{ConnectionReset, PermissionDenied};
+    let transport = |kind| Err(PumpError::Transport(std::io::Error::from(kind)));
+    let protocol = || Err(PumpError::Protocol(anyhow::anyhow!("bad frame")));
+    let cases: [(&str, Result<Outcome, PumpError>, bool, bool); 7] = [
+        ("closed, silent", Ok(Outcome::PeerClosed), false, true),
+        ("reset, silent", transport(ConnectionReset), false, true),
+        ("closed after a byte", Ok(Outcome::PeerClosed), true, false),
+        ("reset after a byte", transport(ConnectionReset), true, false),
+        ("exited", Ok(Outcome::Exited(0)), true, false),
+        ("another transport failure", transport(PermissionDenied), false, false),
+        ("protocol error", protocol(), true, false),
+    ];
+    for (name, outcome, heard, unanswered) in cases {
+        assert_eq!(Pumped { outcome, heard }.no_answer(), unanswered, "{name}");
+    }
+}
+
+#[test]
+fn the_pump_notes_whether_the_agent_sent_a_byte() {
+    let mut silent: &[u8] = b"";
+    let pumped = super::pump_heard(&mut silent, &mut FrameReader::new(), &mut TestSink::default());
+    assert!(!pumped.heard && pumped.no_answer());
+
+    let mut exit = Vec::new();
+    write_frame(&mut exit, FrameKind::Exit, &ExitCode(3).encode()).unwrap();
+    let pumped = super::pump_heard(&mut exit.as_slice(), &mut FrameReader::new(), &mut TestSink::default());
+    assert!(pumped.heard && !pumped.no_answer());
+    assert_eq!(pumped.code(), 3);
 }

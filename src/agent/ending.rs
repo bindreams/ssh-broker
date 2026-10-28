@@ -26,7 +26,7 @@ pub fn keep_log(guard: impl Send + 'static) {
 
 /// Keep `held` until the process is gone, past the end of every function that owns it. The agent's
 /// session slot and user lock go here: a successor waits on them, and must not get them while this
-/// agent's listener still answers, which it does until the process exits. The system releases them
+/// agent is still ending (its connections finish, its listener closes). The system releases them
 /// with the process; [`end_process`] drops nothing held here.
 pub fn hold_until_end(held: impl Send + 'static) {
     ENDING.hold_until_end(held);

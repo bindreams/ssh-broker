@@ -17,14 +17,15 @@
 use crate::cmdline::{Encoding, RawExec, resolve_exec};
 use crate::console_modes::ConsoleModes;
 use crate::protocol::{FrameKind, FrameReader, Handshake, Stream, write_frame};
-use crate::relay::{FrameSink, pump_decode, write_data};
+use crate::relay::{FrameSink, write_data};
 use crate::shim::{
-    FailOpen, Fallback, MouseModeSniffer, XtwinopsFilter, decide_fail_open, decide_fallback, is_blank_command,
-    make_handshake, map_outcome, run_exec_on, size_to_resize,
+    Attached, ExecInput, FailOpen, Fallback, MouseModeSniffer, Pumped, XtwinopsFilter, decide_fail_open,
+    decide_fallback, is_blank_command, make_handshake, peer_gone, pump_exec, pump_heard, size_to_resize,
 };
 use crate::shim_offer::{Absent, Prompting, Rescue, Rescued};
 use crate::socket_loc::SocketLocation;
 use crate::{afunix, conpty, vtinput};
+use socket2::Socket;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use windows::Win32::Foundation::HANDLE;
@@ -186,60 +187,128 @@ fn try_relay_at(
     stdin: impl std::io::Read + Send + 'static,
     rescue: &mut dyn Rescue,
 ) -> anyhow::Result<Option<i32>> {
-    let connection = match &location {
-        Ok(location) => afunix::connect(&location.path),
-        // The cause is shown by the fail-open below; this only says there was nothing to connect to.
-        Err(e) => Err(anyhow::anyhow!("{e:#}")),
-    };
-    // A user with no agent may be offered a session (or told how to get one). What the rescue does
-    // not use, the fail-open below still handles exactly as it did before.
-    let (conn, rescued_modes) = if connection.is_err() {
-        let absent = Absent {
-            exec: exec.is_some(),
-            location: &location,
-            connect: &connection,
-        };
-        match rescue.rescue(&absent, stderr) {
-            Rescued::Connected { socket, modes } => (socket, modes),
-            Rescued::Gone => return Ok(Some(255)),
-            Rescued::Plain => return fail_open_reason(&location, &connection, exec, stderr, log_failure),
-        }
-    } else {
-        (connection?, None)
-    };
-    let (rx, tx) = afunix::split(conn)?;
+    try_relay_with(
+        location,
+        exec,
+        stderr,
+        log_failure,
+        stdin,
+        rescue,
+        &mut relay_interactive,
+    )
+}
 
-    match exec {
-        Some(cmd) => {
-            let hs = make_handshake(&Some(cmd.clone()), term(), 80, 24); // EXEC ignores cols/rows
-            Ok(Some(run_exec_on(
-                rx,
-                tx,
-                &hs,
-                std::io::stdout(),
-                std::io::stderr(),
-                stdin,
-            )?))
+/// What an interactive attempt came to.
+enum Interactive {
+    /// The relay ran; see [`Pumped`].
+    Pumped(Pumped),
+    /// There is no console to relay: fail open.
+    NoConsole,
+}
+
+/// [`try_relay_at`] with the interactive relay as a parameter, so that a test can stand in for the
+/// console.
+fn try_relay_with(
+    location: anyhow::Result<SocketLocation>,
+    exec: &Option<String>,
+    stderr: &mut dyn std::io::Write,
+    log_failure: Option<&str>,
+    stdin: impl std::io::Read + Send + 'static,
+    rescue: &mut dyn Rescue,
+    interactive: &mut dyn FnMut(Socket, Option<ConsoleModes>) -> anyhow::Result<Interactive>,
+) -> anyhow::Result<Option<i32>> {
+    // Only an EXEC session has input to carry across connections.
+    let mut input = exec.as_ref().map(|_| ExecInput::new(stdin));
+    // A connection the agent ends before it says anything takes the session round again: the agent
+    // was ending or is gone, and the next connect finds out which. It ends when a connect finds no
+    // listener, or an agent answers.
+    let mut again = false;
+    loop {
+        if again && input.as_ref().is_some_and(ExecInput::input_lost) {
+            let _ = writeln!(stderr, "{INPUT_LOST}");
+            return Ok(Some(255));
         }
-        None => {
-            // Interactive: a real console is required to capture input. No handshake has been
-            // sent yet, so a missing console fails open without orphaning an agent shell. A
-            // prompt that signed the user on hands over the raw console it was using.
-            let modes = match rescued_modes {
-                Some(modes) => modes,
-                None => ConsoleModes::enter()?,
-            };
-            if !modes.is_console {
-                drop(modes); // restore is a no-op when !is_console
-                tracing::warn!("no interactive console (redirected stdio) — local shell");
-                return Ok(None);
+        let connection = match &location {
+            Ok(location) => afunix::connect(&location.path),
+            // The cause is shown by the fail-open below; this only says there was nothing to connect to.
+            Err(e) => Err(anyhow::anyhow!("{e:#}")),
+        };
+        // A user with no agent may be offered a session (or told how to get one). What the rescue does
+        // not use, the fail-open below still handles exactly as it did before.
+        let (conn, rescued_modes) = if connection.is_err() {
+            if again && input.is_some() {
+                // A command is not run here after the agent may have started it, and the thread that
+                // fed the agent still reads the shim's stdin, which a local child would share.
+                let _ = writeln!(stderr, "{AGENT_GONE}");
+                return Ok(Some(255));
             }
-            let (cols, rows) = console_size(modes.stdout);
-            let hs = make_handshake(&None, term(), cols, rows);
-            Ok(Some(run_pty(modes, rx, FrameReader::new(), tx, &hs)?))
+            let absent = Absent {
+                exec: exec.is_some(),
+                location: &location,
+                connect: &connection,
+            };
+            match rescue.rescue(&absent, stderr) {
+                Rescued::Connected { socket, modes } => (socket, modes),
+                Rescued::Gone => return Ok(Some(255)),
+                Rescued::Plain => return fail_open_reason(&location, &connection, exec, stderr, log_failure),
+            }
+        } else {
+            (connection?, None)
+        };
+
+        let pumped = match (exec, input.as_mut()) {
+            (Some(cmd), Some(input)) => {
+                let (rx, tx) = afunix::split(conn)?;
+                let hs = make_handshake(&Some(cmd.clone()), term(), 80, 24); // EXEC ignores cols/rows
+                match input.attach(tx, &hs)? {
+                    Attached::Ready => pump_exec(rx, std::io::stdout(), std::io::stderr()),
+                    Attached::InputLost => {
+                        let _ = writeln!(stderr, "{INPUT_LOST}");
+                        return Ok(Some(255));
+                    }
+                    Attached::Closed(e) => Pumped::closed(e),
+                }
+            }
+            _ => match interactive(conn, rescued_modes)? {
+                Interactive::Pumped(pumped) => pumped,
+                Interactive::NoConsole => return Ok(None),
+            },
+        };
+        if pumped.no_answer() {
+            tracing::warn!("the agent ended the connection before it answered; connecting again");
+            again = true;
+            continue;
         }
+        return Ok(Some(pumped.code()));
     }
 }
+
+/// Relay an interactive session over `conn`. A real console is required to capture input. No
+/// handshake has been sent yet, so a missing console fails open without orphaning an agent shell. A
+/// prompt that signed the user on hands over the raw console it was using.
+fn relay_interactive(conn: Socket, rescued_modes: Option<ConsoleModes>) -> anyhow::Result<Interactive> {
+    let (rx, tx) = afunix::split(conn)?;
+    let modes = match rescued_modes {
+        Some(modes) => modes,
+        None => ConsoleModes::enter()?,
+    };
+    if !modes.is_console {
+        drop(modes); // restore is a no-op when !is_console
+        tracing::warn!("no interactive console (redirected stdio) — local shell");
+        return Ok(Interactive::NoConsole);
+    }
+    let (cols, rows) = console_size(modes.stdout);
+    let hs = make_handshake(&None, term(), cols, rows);
+    Ok(Interactive::Pumped(run_pty(modes, rx, FrameReader::new(), tx, &hs)?))
+}
+
+/// What an EXEC session says when its input went to a connection the agent ended unread.
+const INPUT_LOST: &str = "ssh-broker: the agent closed the connection before it answered, after input had been sent to it; \
+     the command was not run again";
+
+/// What an EXEC session says when the agent ended the connection before it answered and is gone.
+const AGENT_GONE: &str = "ssh-broker: the agent closed the connection before it answered and is gone; \
+     the command was not run again";
 
 /// The message of a fail-open, for a location that cannot be used or a connect that failed.
 /// Always `Ok(None)`: the caller falls back to a local shell.
@@ -409,13 +478,19 @@ fn run_pty(
     mut fr: FrameReader,
     mut tx: afunix::ConnTx,
     hs: &Handshake,
-) -> anyhow::Result<i32> {
+) -> anyhow::Result<Pumped> {
     let stdin_raw = modes.stdin.0 as isize;
     let stdout_raw = modes.stdout.0 as isize;
 
     // Handshake first (MAIN owns tx until the worker spawn consumes it), so the agent has
     // spawned + sized the shell before the first keystroke/resize frame arrives.
-    write_frame(&mut tx, FrameKind::Handshake, &hs.encode()?)?;
+    if let Err(e) = write_frame(&mut tx, FrameKind::Handshake, &hs.encode()?) {
+        return if peer_gone(&e).is_some() {
+            Ok(Pumped::closed(e))
+        } else {
+            Err(e)
+        };
+    }
 
     let gate = Arc::new(MouseGate::default());
     let stopping = Arc::new(AtomicBool::new(false));
@@ -434,7 +509,7 @@ fn run_pty(
         sniffer: MouseModeSniffer::new(),
         gate,
     };
-    let outcome = pump_decode(&mut rx, &mut fr, &mut sink);
+    let pumped = pump_heard(&mut rx, &mut fr, &mut sink);
 
     // Ordered teardown: stop, wake the parked ReadConsoleInputW, join. Console modes are
     // restored by `modes` dropping at scope end — AFTER the join, so the worker is provably
@@ -443,9 +518,8 @@ fn run_pty(
     wake_console_input(stdin_raw);
     let _ = worker.join();
 
-    let code = map_outcome(outcome);
     drop(modes); // explicit: restore console modes before we return into run_on's process::exit
-    Ok(code)
+    Ok(pumped)
 }
 
 /// Routes the agent's output to the real console: observe mouse-mode changes (publishing the

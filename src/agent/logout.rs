@@ -5,22 +5,26 @@
 //! its connection (the usual client is `logout` typed in a shell that is a child of this agent,
 //! inside its job, so ending the tree earlier could cut the reply and the exit code off), ends
 //! every session's shell tree, waits until every other connection has finished relaying (so each
-//! shell's last output reaches its client the way it does when a shell exits by itself), and only
-//! then ends the process. Every wait on a client (the logout request's, a refused login's, the
-//! drain's) is on a client that may never read or close, so each has the bound `DRAIN_BOUND`: past it
-//! the process goes on without the client, and the log says so. A refused login counts as live for
-//! the drain until its wait on the client returns, so the process does not end with the client's
-//! input unread, which would reset the connection and lose the reply.
+//! shell's last output reaches its client the way it does when a shell exits by itself), stops
+//! accepting and closes the listener, and only then ends the process. Every wait on a client (the
+//! logout request's, a refused login's, the drain's) is on a client that may never read or close, so
+//! each has the bound `DRAIN_BOUND`: past it the process goes on without the client, and the log says
+//! so. A refused login counts as live for the drain until its wait on the client returns, so the
+//! process does not end with the client's input unread, which would reset the connection and lose
+//! the reply.
 //!
-//! The listener stays open until the process ends. A login that arrives meanwhile is refused with
-//! [`ENDING_REFUSAL`]. The session slot and the user lock stay held until the process ends too, so a
-//! successor agent binds only after this one is gone.
+//! The listener stays open through the drain, and a login that arrives meanwhile is refused with
+//! [`ENDING_REFUSAL`]. Once the drain is over the accept loop stops, after counting the connection it
+//! is accepting, and the listener is closed; then the drain judges again, so every connection the
+//! loop took gets its refusal. A connection that was queued and never accepted is reset with the
+//! listener, and its shim treats that as an agent that is gone. The session slot and the user lock
+//! stay held until the process ends, so a successor agent starts only after this one is gone.
 
 use std::io::Read;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
-use super::Connections;
+use super::{Connections, Drained};
 use crate::afunix::{ConnRx, ConnTx};
 use crate::protocol::{ExitCode, FrameKind, Stream, write_frame};
 use crate::relay::write_data;
@@ -43,8 +47,8 @@ pub(super) struct Control {
     background: bool,
     state: Mutex<State>,
     connections: Arc<Connections>,
-    /// Makes the accept loop look at [`Control::is_ending`]: a loop blocked in `accept` does not
-    /// otherwise notice the flag. The loop then stops, and the listener stays open for the refusals.
+    /// Makes the accept loop look at the flag that closes it (see [`Connections::settle`]): a loop
+    /// blocked in `accept` does not otherwise notice it.
     waker: Box<dyn Fn() + Send + Sync>,
 }
 
@@ -67,7 +71,7 @@ impl Control {
         }
     }
 
-    /// Call `waker` when the end begins, after [`Control::is_ending`] has become true.
+    /// Call `waker` to make the accept loop return from `accept`, once the end is decided.
     pub(super) fn with_waker(mut self, waker: impl Fn() + Send + Sync + 'static) -> Control {
         self.waker = Box::new(waker);
         self
@@ -103,22 +107,23 @@ impl Control {
         Some(Registration { control: self, id })
     }
 
-    /// Begin to end: from now on no session registers, and every registered one is ended.
+    /// Begin to end: from now on no session registers, and every registered one is ended. A login
+    /// that comes now is refused (`refuse_while_ending`).
     pub(super) fn end_all(&self) {
-        let (first, killers): (bool, Vec<Killer>) = {
+        let killers: Vec<Killer> = {
             let mut state = self.lock();
-            let first = !state.ending;
             state.ending = true;
-            (first, state.sessions.iter().map(|(_, kill)| Arc::clone(kill)).collect())
+            state.sessions.iter().map(|(_, kill)| Arc::clone(kill)).collect()
         };
-        // Before the shells end, so the accept loop stops starting shells that would have to be ended
-        // too. The listener stays open: a login that comes now is refused (`refuse_while_ending`).
-        if first {
-            (self.waker)();
-        }
         for kill in killers {
             kill();
         }
+    }
+
+    /// Wait until the shells' output is delivered, then stop the accept loop and close the listener
+    /// (see [`Connections::settle`]). The process may end when this returns.
+    pub(super) fn settle(&self) -> Drained {
+        self.connections.settle(&*self.waker)
     }
 }
 
@@ -156,7 +161,7 @@ pub(super) fn handle_logout<R: LimitedRead, W: std::io::Write>(
     tracing::info!("ending the background session at the user's request");
     let _logout = control.connections.begin_logout();
     control.end_all();
-    control.connections.wait_until_only_logouts_live();
+    control.settle();
     end_process();
     Ok(())
 }

@@ -312,13 +312,23 @@ fn two_logouts_at_once_both_end_the_agent() {
     assert_eq!(ended.load(Ordering::SeqCst), 2, "every logout ends the agent");
 }
 
+/// A control whose accept loop is the test: `woke` is told each time the loop is woken, and the wake
+/// makes the loop return and close the listener, as a real one does.
+fn control_with_a_loop(connections: &Arc<Connections>, woke: impl Fn() + Send + Sync + 'static) -> Control {
+    connections.listener_opened();
+    let connections = Arc::clone(connections);
+    Control::new(true, Arc::clone(&connections)).with_waker(move || {
+        woke();
+        connections.listener_closed();
+    })
+}
+
 #[test]
 fn ending_wakes_the_accept_loop_once_however_many_logouts_ask() {
     let woken = Arc::new(AtomicUsize::new(0));
-    let connections = Connections::new();
     let control = {
         let woken = Arc::clone(&woken);
-        Control::new(true, connections).with_waker(move || {
+        control_with_a_loop(&Connections::new(), move || {
             woken.fetch_add(1, Ordering::SeqCst);
         })
     };
@@ -334,40 +344,72 @@ fn ending_wakes_the_accept_loop_once_however_many_logouts_ask() {
 }
 
 #[test]
-fn the_accept_loop_is_woken_before_the_shells_are_ended() {
-    // The listener should be gone, or going, by the time a user sees their shell end and logs in again.
-    let events = Arc::new(Mutex::new(Vec::<&str>::new()));
-    let control = {
-        let events = Arc::clone(&events);
-        Control::new(true, Connections::new()).with_waker(move || events.lock().unwrap().push("woken"))
-    };
+fn the_accept_loop_is_woken_once_the_shells_are_ended_and_every_other_connection_has_finished() {
+    // The listener answers logins with the refusal until the shells' last output is delivered; only
+    // then is the loop told to stop.
+    let (events, on_event) = mpsc::channel::<&'static str>();
+    let connections = Connections::observing_drain({
+        let events = events.clone();
+        move || {
+            let _ = events.send("parked");
+        }
+    });
+    let control = control_with_a_loop(&connections, {
+        let events = events.clone();
+        move || {
+            let _ = events.send("woken");
+        }
+    });
     let _session = control
         .register({
-            let events = Arc::clone(&events);
-            Arc::new(move || events.lock().unwrap().push("killed"))
+            let events = events.clone();
+            Arc::new(move || {
+                let _ = events.send("killed");
+            })
         })
         .unwrap();
-    handle_logout(&mut Closed, &mut Vec::new(), &control, || {}).unwrap();
-    assert_eq!(*events.lock().unwrap(), ["woken", "killed"]);
+    let this_connection = connections.begin();
+    let other = connections.begin();
+
+    let mut seen = Vec::new();
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            let _live = this_connection;
+            handle_logout(&mut Closed, &mut Vec::new(), &control, || {
+                let _ = events.send("ended");
+            })
+            .unwrap();
+        });
+        let mut other = Some(other);
+        loop {
+            let event = on_event.recv().unwrap();
+            seen.push(event);
+            if event == "parked"
+                && let Some(other) = other.take()
+            {
+                let _ = events.send("finished");
+                drop(other);
+            }
+            if event == "ended" {
+                break;
+            }
+        }
+    });
+    let steps: Vec<_> = seen.iter().filter(|event| **event != "parked").collect();
+    assert_eq!(steps, [&"killed", &"finished", &"woken", &"ended"]);
 }
 
 #[test]
-fn the_accept_loop_is_woken_after_the_flag_is_up() {
+fn the_accept_loop_is_woken_after_the_flag_that_stops_it_is_up() {
     // A loop woken before the flag is raised would look, find nothing to stop for and accept again.
+    let connections = Connections::new();
     let seen = Arc::new(Mutex::new(None));
-    let slot: Arc<Mutex<Option<Arc<Control>>>> = Arc::new(Mutex::new(None));
-    let control = Arc::new(Control::new(true, Connections::new()).with_waker({
-        let (seen, slot) = (Arc::clone(&seen), Arc::clone(&slot));
-        move || {
-            let control = slot.lock().unwrap().clone().unwrap();
-            *seen.lock().unwrap() = Some(control.is_ending());
-        }
-    }));
-    *slot.lock().unwrap() = Some(Arc::clone(&control));
+    let control = control_with_a_loop(&connections, {
+        let (connections, seen) = (Arc::clone(&connections), Arc::clone(&seen));
+        move || *seen.lock().unwrap() = Some(connections.is_closing())
+    });
     handle_logout(&mut Closed, &mut Vec::new(), &control, || {}).unwrap();
     assert_eq!(*seen.lock().unwrap(), Some(true));
-    // Break the reference cycle.
-    *slot.lock().unwrap() = None;
 }
 
 /// A connected AF_UNIX pair in a temp dir (no ACLs: these tests exercise the reply, not the security
@@ -434,38 +476,6 @@ fn the_refusal_arrives_although_the_client_keeps_sending_input() {
     assert_eq!(outcome, Outcome::Exited(ENDING_REFUSED_EXIT_CODE));
     assert_eq!(stderr, ENDING_REFUSAL.as_bytes());
     let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn a_login_that_registers_after_the_flag_is_up_but_before_the_shells_are_ended_is_refused() {
-    // The window between raising the flag and ending the registered shells: a session that
-    // registered in it would be neither ended with the rest nor refused.
-    let refused = Arc::new(AtomicBool::new(false));
-    let slot: Arc<Mutex<Option<Arc<Control>>>> = Arc::new(Mutex::new(None));
-    let control = Arc::new(Control::new(true, Connections::new()).with_waker({
-        let (refused, slot) = (Arc::clone(&refused), Arc::clone(&slot));
-        move || {
-            let control = slot.lock().unwrap().clone().unwrap();
-            let killed = Arc::new(AtomicUsize::new(0));
-            refused.store(control.register(counting_killer(&killed)).is_none(), Ordering::SeqCst);
-        }
-    }));
-    *slot.lock().unwrap() = Some(Arc::clone(&control));
-    let killed = Arc::new(AtomicUsize::new(0));
-    let _before = control.register(counting_killer(&killed)).unwrap();
-
-    handle_logout(&mut Closed, &mut Vec::new(), &control, || {}).unwrap();
-
-    assert!(
-        refused.load(Ordering::SeqCst),
-        "a login that came after the flag was accepted"
-    );
-    assert_eq!(
-        killed.load(Ordering::SeqCst),
-        1,
-        "a login that came before it is ended with the rest"
-    );
-    *slot.lock().unwrap() = None;
 }
 
 #[test]

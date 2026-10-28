@@ -72,7 +72,7 @@ fn the_log_is_flushed_before_the_process_is_left_by_whichever_thread_ends_it() {
 
 /// What the agent holds for its successor to wait on (its session slot and user lock) is still held
 /// when the process is left, and is never dropped by the end: the system releases it with the
-/// process, which is what keeps a successor from binding while the old listener still answers.
+/// process, which is what keeps a successor from starting while the old agent is still ending.
 #[test]
 fn what_is_held_until_the_end_is_still_held_when_the_process_is_left() {
     let ending = Ending::new();
