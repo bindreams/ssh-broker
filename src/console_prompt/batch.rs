@@ -1,10 +1,16 @@
 //! Reading the console's input records into `PasswordEntry`, without taking any it does not feed.
 //!
-//! A step peeks at the head of the console queue, feeds the records to the entry in turn, and then
-//! removes from the queue exactly the records it fed, up to and including the one that finished the
-//! step. The rest (a paste's remainder, input typed while the agent starts) keeps its place for the
-//! next step and, once the prompt is over, for the relay. Every buffer that held records is
-//! overwritten before the step returns.
+//! A step peeks at the head of the console queue, feeds the records to the entry in turn, and removes
+//! from the queue exactly the records it fed, up to and including the one that finished the step. The
+//! rest (a paste's remainder, input typed while the agent starts) keeps its place for the next step
+//! and, once the prompt is over, for the relay.
+//!
+//! The console merges a key-down that repeats the last queued one into that record (it raises
+//! `wRepeatCount`), so the last peeked record may differ from the one the read removes. That record is
+//! fed from the read, with the count it has by then: the password is exactly what was typed. If it is
+//! the finishing key, its further repeats are the user holding that key: the prompt ends on the first
+//! and drops the rest. Every buffer, and every copy of a record, is overwritten before the step
+//! returns.
 
 use windows::Win32::System::Console::INPUT_RECORD;
 use zeroize::Zeroize;
@@ -51,18 +57,21 @@ impl Batch {
     fn step_inner(&mut self, queue: &mut impl InputQueue, entry: &mut PasswordEntry) -> windows::core::Result<Step> {
         loop {
             let peeked = (queue.peek(&mut self.records)? as usize).min(BATCH);
-            // An empty queue: wait for a record. The one that arrives is fed in any case, so taking it
-            // out of the queue is taking exactly what is fed.
-            let (len, already_taken) = if peeked == 0 {
-                (queue.read(&mut self.records[..1])? as usize, true)
-            } else {
-                (peeked, false)
-            };
-            let (fed, step) = self.feed(len, entry);
+            // Only the last record of the queue can change after the peek (the console merges a repeated
+            // key-down into it), and it is the last peeked one. The records before it are fed from the
+            // peek, and the last is fed from the read that removes it.
+            let stable = peeked.saturating_sub(1);
+            let (fed, step) = self.feed(stable, entry);
             self.wipe();
-            if !already_taken {
+            if let Some(step) = step {
                 self.take(queue, fed)?;
+                return Ok(step);
             }
+            self.take(queue, stable)?;
+            // With an empty queue this waits for a record, which is fed in any case.
+            let read = (queue.read(&mut self.records[..1])? as usize).min(1);
+            let (_, step) = self.feed(read, entry);
+            self.wipe();
             if let Some(step) = step {
                 return Ok(step);
             }
@@ -70,7 +79,8 @@ impl Batch {
     }
 
     /// Feed the entry the first `len` records in turn until a step finishes. Returns how many were
-    /// fed (the finishing one included) and the step. A fed record is overwritten at once.
+    /// fed (the finishing one included) and the step. A fed record is overwritten at once, and so are
+    /// the copies made of it.
     fn feed(&mut self, len: usize, entry: &mut PasswordEntry) -> (usize, Option<Step>) {
         for (index, slot) in self.records[..len].iter_mut().enumerate() {
             let mut record = std::mem::replace(slot, zeroed_record());
@@ -78,8 +88,8 @@ impl Batch {
                 continue;
             }
             // SAFETY: the event type says this is a key record.
-            let key = unsafe { record.Event.KeyEvent };
-            let event = KeyEvent {
+            let mut key = unsafe { record.Event.KeyEvent };
+            let mut event = KeyEvent {
                 virtual_key_code: key.wVirtualKeyCode,
                 virtual_scan_code: key.wVirtualScanCode,
                 // SAFETY: the character is read as the UTF-16 unit it is.
@@ -89,7 +99,12 @@ impl Batch {
                 repeat_count: key.wRepeatCount,
             };
             wipe_records(std::slice::from_mut(&mut record));
-            match entry.key(&event) {
+            // SAFETY: `KEY_EVENT_RECORD` is plain data; all-zero bytes are a valid value.
+            unsafe { wipe_plain(&mut key) };
+            let step = entry.key(&event);
+            // SAFETY: `KeyEvent` is integers and a `bool`; all-zero bytes are a valid value.
+            unsafe { wipe_plain(&mut event) };
+            match step {
                 Step::Continue => {}
                 step => return (index + 1, Some(step)),
             }
@@ -122,6 +137,17 @@ impl Drop for Batch {
 fn zeroed_record() -> INPUT_RECORD {
     // SAFETY: `INPUT_RECORD` is plain data; all-zero bytes are a valid value.
     unsafe { std::mem::zeroed() }
+}
+
+/// Overwrite a value that holds typed text.
+///
+/// # Safety
+/// All-zero bytes must be a valid `T`.
+unsafe fn wipe_plain<T>(value: &mut T) {
+    // SAFETY: the bytes of `value` are writable, and the caller says zeros are a valid `T`.
+    let bytes =
+        unsafe { std::slice::from_raw_parts_mut(std::ptr::from_mut(value).cast::<u8>(), std::mem::size_of::<T>()) };
+    bytes.zeroize();
 }
 
 /// Overwrite console records: they hold the characters just typed.

@@ -49,6 +49,9 @@ struct FakeQueue {
     queue: VecDeque<INPUT_RECORD>,
     arrivals: VecDeque<Vec<INPUT_RECORD>>,
     removed: usize,
+    /// After the next peek that reaches the end of the queue, the console merges a repeat of the last
+    /// key-down into that record: its `wRepeatCount` becomes this.
+    merge_into_tail_after_peek: Option<u16>,
     fail_peek: bool,
     fail_read: bool,
 }
@@ -83,6 +86,11 @@ impl InputQueue for FakeQueue {
         let count = records.len().min(self.queue.len());
         for (slot, record) in records.iter_mut().zip(&self.queue) {
             *slot = *record;
+        }
+        if count == self.queue.len()
+            && let (Some(repeat), Some(tail)) = (self.merge_into_tail_after_peek.take(), self.queue.back_mut())
+        {
+            tail.Event.KeyEvent.wRepeatCount = repeat;
         }
         Ok(count as u32)
     }
@@ -244,4 +252,31 @@ fn a_failed_read_leaves_nothing_behind() {
     let mut entry = PasswordEntry::new();
     assert!(batch.step(&mut queue, &mut entry).is_err());
     assert!(is_zeroed(&batch.records));
+}
+
+/// The console merges a key-down that repeats the last queued one into that record, between the peek
+/// and the read. The character is typed as often as the record the read removed says.
+#[test]
+fn a_key_the_console_repeats_into_the_last_peeked_record_is_typed_every_time() {
+    let mut queue = FakeQueue::with(typed("ab"));
+    queue.merge_into_tail_after_peek = Some(3);
+    queue.arrivals.push_back(typed("\r"));
+    let mut batch = Batch::new();
+    let mut entry = PasswordEntry::new();
+    assert_eq!(submitted(batch.step(&mut queue, &mut entry).unwrap()), "abbb");
+    assert_eq!(queue.left(), "");
+}
+
+/// A repeat merged into the finishing Enter is the user holding Enter: one submit, and nothing else
+/// is taken or changed.
+#[test]
+fn a_repeat_merged_into_the_finishing_enter_submits_once() {
+    let mut queue = FakeQueue::with(typed("pw\r"));
+    queue.merge_into_tail_after_peek = Some(4);
+    let mut batch = Batch::new();
+    let mut entry = PasswordEntry::new();
+    assert_eq!(submitted(batch.step(&mut queue, &mut entry).unwrap()), "pw");
+    assert_eq!(queue.removed, 3);
+    assert_eq!(queue.left(), "");
+    assert!(entry.backing().iter().all(|unit| *unit == 0), "the entry kept text");
 }
