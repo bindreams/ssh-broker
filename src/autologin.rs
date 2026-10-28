@@ -237,15 +237,7 @@ impl AutoLoginEnv for WindowsEnv {
              Scheduler and does not keep it.) Press Ctrl+C to cancel.\r\n",
             account.name
         ));
-        loop {
-            match prompt.read_step() {
-                Ok(Step::Submit(password)) => return Ok(Some(password)),
-                Ok(Step::Empty) => prompt.write_text(EMPTY_PASSWORD_LINE),
-                Ok(Step::Cancel) => return Ok(None),
-                Ok(Step::Continue) => {}
-                Err(_) => anyhow::bail!("ssh-broker: the console input failed; nothing was changed"),
-            }
-        }
+        ask_until_answered(&mut prompt)
     }
 
     fn batch_right(&self, account: &LocalAccount, password: &Password) -> BatchRight {
@@ -277,6 +269,37 @@ impl AutoLoginEnv for WindowsEnv {
 
     fn say(&mut self, line: &str) {
         println!("{line}");
+    }
+}
+
+/// What the password prompt needs from the console.
+trait Prompt {
+    fn read_step(&mut self) -> Result<Step, windows::core::Error>;
+    fn write_text(&mut self, text: &str);
+}
+
+impl Prompt for crate::console_prompt::ConsolePrompt {
+    fn read_step(&mut self) -> Result<Step, windows::core::Error> {
+        crate::console_prompt::ConsolePrompt::read_step(self)
+    }
+
+    fn write_text(&mut self, text: &str) {
+        crate::console_prompt::ConsolePrompt::write_text(self, text);
+    }
+}
+
+/// Read until a password is submitted (`Some`) or the user cancels (`None`); an empty Enter asks again.
+fn ask_until_answered(prompt: &mut dyn Prompt) -> anyhow::Result<Option<Password>> {
+    loop {
+        match prompt.read_step() {
+            Ok(Step::Submit(password)) => return Ok(Some(password)),
+            Ok(Step::Empty) => prompt.write_text(EMPTY_PASSWORD_LINE),
+            Ok(Step::Cancel) => return Ok(None),
+            Ok(Step::Continue) => {}
+            Err(e) => {
+                return Err(anyhow::Error::new(e).context("ssh-broker: the console input failed; nothing was changed"));
+            }
+        }
     }
 }
 

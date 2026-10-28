@@ -54,6 +54,9 @@ struct Fake {
     delete_fails: Option<&'static str>,
     calls: Vec<String>,
     said: Vec<String>,
+    /// The password each step was given, as the UTF-16 units it received.
+    probed: std::cell::RefCell<Vec<Vec<u16>>>,
+    registered: Vec<Vec<u16>>,
 }
 
 impl Fake {
@@ -69,6 +72,8 @@ impl Fake {
             delete_fails: None,
             calls: Vec::new(),
             said: Vec::new(),
+            probed: Default::default(),
+            registered: Vec::new(),
         }
     }
 
@@ -94,10 +99,12 @@ impl AutoLoginEnv for Fake {
         self.calls.push("ask".into());
         Ok(self.password.map(password))
     }
-    fn batch_right(&self, _: &LocalAccount, _: &Password) -> BatchRight {
+    fn batch_right(&self, _: &LocalAccount, password: &Password) -> BatchRight {
+        self.probed.borrow_mut().push(password.as_wide().to_vec());
         self.batch.clone()
     }
-    fn register(&mut self, account: &LocalAccount, xml: &str, _: &Password, sddl: &str) -> anyhow::Result<()> {
+    fn register(&mut self, account: &LocalAccount, xml: &str, password: &Password, sddl: &str) -> anyhow::Result<()> {
+        self.registered.push(password.as_wide().to_vec());
         self.calls.push(format!("register {} {}", account.sid, sddl));
         self.calls.push(format!("xml-names {}", xml.contains(&account.sid)));
         if self.registered_ok {
@@ -241,6 +248,17 @@ fn on_registers_verifies_and_runs_the_task_once() {
         ]
     );
     assert!(env.said().contains("auto-login is on for alice"), "{}", env.said());
+    let typed: Vec<u16> = SECRET.encode_utf16().collect();
+    assert_eq!(
+        *env.probed.borrow(),
+        vec![typed.clone()],
+        "the batch right is probed with the typed password"
+    );
+    assert_eq!(
+        env.registered,
+        vec![typed],
+        "the task is registered with the typed password"
+    );
 }
 
 #[test]
@@ -343,4 +361,56 @@ fn off_twice_is_ok() {
     env.said.clear();
     off(&mut env, &alice()).unwrap();
     assert!(env.said().contains("already off"), "{}", env.said());
+}
+
+/// A prompt that answers with a script and records what it is told to show.
+struct ScriptedPrompt {
+    answers: std::collections::VecDeque<Result<Step, windows::core::Error>>,
+    shown: Vec<String>,
+}
+
+impl Prompt for ScriptedPrompt {
+    fn read_step(&mut self) -> Result<Step, windows::core::Error> {
+        self.answers.pop_front().expect("the prompt was read past its script")
+    }
+    fn write_text(&mut self, text: &str) {
+        self.shown.push(text.to_string());
+    }
+}
+
+fn scripted(answers: Vec<Result<Step, windows::core::Error>>) -> ScriptedPrompt {
+    ScriptedPrompt {
+        answers: answers.into(),
+        shown: Vec::new(),
+    }
+}
+
+#[test]
+fn a_console_that_fails_to_read_says_why() {
+    let cause = windows::core::Error::new(windows::core::HRESULT(0x8007_0006_u32 as i32), "the handle is invalid");
+    let mut prompt = scripted(vec![Err(cause)]);
+    let text = format!("{:#}", ask_until_answered(&mut prompt).expect_err("an error"));
+    assert!(
+        text.starts_with("ssh-broker: the console input failed; nothing was changed"),
+        "{text}"
+    );
+    assert!(text.contains("the handle is invalid"), "the cause is carried: {text}");
+}
+
+#[test]
+fn an_empty_enter_asks_again_and_the_next_password_is_the_answer() {
+    let mut prompt = scripted(vec![
+        Ok(Step::Empty),
+        Ok(Step::Continue),
+        Ok(Step::Submit(password("pw"))),
+    ]);
+    let answer = ask_until_answered(&mut prompt).unwrap().expect("a password");
+    assert_eq!(answer.as_wide(), "pw".encode_utf16().collect::<Vec<_>>());
+    assert_eq!(prompt.shown, [EMPTY_PASSWORD_LINE]);
+}
+
+#[test]
+fn a_cancel_is_no_password() {
+    let mut prompt = scripted(vec![Ok(Step::Cancel)]);
+    assert!(ask_until_answered(&mut prompt).unwrap().is_none());
 }
