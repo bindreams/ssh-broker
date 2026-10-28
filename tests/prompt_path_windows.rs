@@ -203,7 +203,7 @@ fn prompt_then_password_relays_into_a_background_session() {
     assert_shim_ran_in_sshds_job(&account);
 }
 
-/// Elevated (CI only). Review Focus 5: no `ProfileList` entry yet, and the first logon creates one.
+/// Elevated (CI only). No `ProfileList` entry yet, and the first logon creates one.
 #[test]
 fn new_account_without_profile_gets_a_profile_and_a_session() {
     let _machine = machine::shared();
@@ -331,7 +331,39 @@ fn empty_enter_reprompts() {
     leave(&mut run);
 }
 
-/// Elevated (CI only). Review Focus 3: a password with a character outside the BMP, typed as UTF-8
+/// Elevated (CI only). An Enter and then the password, written to the console together (a paste): the
+/// Enter is answered as an empty password and the password after it is still read.
+#[test]
+fn a_password_written_with_an_empty_enter_is_read() {
+    let _machine = machine::shared();
+    let kit = kit("pp14");
+    let account = Account::create("pp14", true);
+    let mut run = start_run(&kit, &account);
+    run.read_until(PROMPT);
+    run.send_raw(&format!("\r{}\r", account.password));
+    run.read_until_count("empty passwords are not supported yet", 1);
+    expect_session(&mut run);
+    assert_relayed(&mut run);
+    leave(&mut run);
+}
+
+/// Elevated (CI only). A command written to the console in the same piece as the password reaches the
+/// session's shell: the prompt does not drop what follows the password's Enter.
+#[test]
+fn a_command_written_with_the_password_runs_in_the_session() {
+    let _machine = machine::shared();
+    let kit = kit("pp15");
+    let account = Account::create("pp15", true);
+    let mut run = start_run(&kit, &account);
+    run.read_until(PROMPT);
+    run.send_raw(&format!("{}\rWrite-Output ('typed' + 'ahead-ok')\r", account.password));
+    run.read_until("typedahead-ok");
+    expect_session(&mut run);
+    assert_relayed(&mut run);
+    leave(&mut run);
+}
+
+/// Elevated (CI only). A password with a character outside the BMP, typed as UTF-8
 /// the way a terminal sends it, reaches Windows as the exact UTF-16: the login is the session's, not
 /// the plain shell that follows a refused password. A console delivers such a character on the Alt
 /// key-up record, which the prompt must read.
@@ -350,7 +382,7 @@ fn password_with_non_bmp_characters_logs_on_through_the_prompt() {
     leave(&mut run);
 }
 
-/// Elevated (CI only). Review Focus 4: a space and non-ASCII letters in the account name, through the
+/// Elevated (CI only). A space and non-ASCII letters in the account name, through the
 /// prompt text, the logon call, `--expect-user` and the socket path.
 #[test]
 fn account_with_space_and_non_ascii_name_gets_a_session_through_the_prompt() {
@@ -441,7 +473,7 @@ fn login_after_logout_prompts_again() {
     leave(&mut second);
 }
 
-/// Elevated (CI only). Review Focus 2: two first connections of one new account at once. Each prompts and
+/// Elevated (CI only). Two first connections of one new account at once. Each prompts and
 /// logs on, so two agents start; exactly one serves, both consoles end in the session's shell (DPAPI
 /// works in it) as children of that one agent, neither hangs, and the agent outlives both consoles.
 #[test]
@@ -505,7 +537,7 @@ fn two_simultaneous_first_connections_end_with_one_agent_and_no_hang() {
     for run in &mut runs {
         leave(run);
     }
-    // The agent outlives its connections (U1B.md: it lives until logout, restart or upgrade). The shims
+    // The agent outlives its connections until logout, restart or upgrade. The shims
     // ran in sshd's job, so the end of a console is the end of an sshd session.
     assert_shim_ran_in_sshds_job(&account);
     if let Some(code) = agent.exit_code() {

@@ -1,24 +1,23 @@
 //! console_prompt: the password prompt on the real console, and why the shim has no agent.
 //!
 //! The console is already in the raw mode the relay uses (`console_modes`), so nothing is echoed and
-//! Ctrl+C arrives as a key. Records are read one batch at a time and fed to `PasswordEntry`; the
-//! batch buffer is wiped after every read so that no typed character is left in it.
+//! Ctrl+C arrives as a key. Records are read one batch at a time and fed to `PasswordEntry` (`batch`),
+//! which wipes every record once it is fed.
 
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::System::Console::{
-    GetConsoleMode, GetStdHandle, INPUT_RECORD, ReadConsoleInputW, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, WriteConsoleW,
+    GetConsoleMode, GetStdHandle, ReadConsoleInputW, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, WriteConsoleInputW,
+    WriteConsoleW,
 };
-use zeroize::Zeroize;
 
 use crate::console_modes::ConsoleModes;
-use crate::offer::{Absence, Disconnected};
+use crate::offer::Absence;
 use crate::password_entry::{PasswordEntry, Step};
 use crate::socket_loc::SocketLocation;
 use crate::userdir::NoProfile;
-use crate::vtinput::KeyEvent;
 
-/// `INPUT_RECORD.EventType` of a key record.
-const EVT_KEY: u16 = 0x0001;
+mod batch;
+use batch::Batch;
 
 /// Whether stdin and stdout are both a console: the precondition for a prompt. A session without
 /// one is a login without a terminal and is never prompted, nor is its console mode touched.
@@ -35,6 +34,8 @@ pub fn console_available() -> bool {
 
 /// The raw console, and the password being typed into it.
 pub struct ConsolePrompt {
+    // Before `modes`, so that the typed-ahead input goes back before the console modes are restored.
+    type_ahead: TypeAhead,
     modes: ConsoleModes,
     entry: PasswordEntry,
 }
@@ -47,14 +48,21 @@ impl ConsolePrompt {
             return Ok(None);
         }
         Ok(Some(ConsolePrompt {
+            type_ahead: TypeAhead {
+                batch: Batch::new(),
+                stdin: modes.stdin,
+            },
             modes,
             entry: PasswordEntry::new(),
         }))
     }
 
-    /// Hand the raw console on, for the relay that follows a successful logon.
+    /// Hand the raw console on, for the relay that follows a successful logon. Input typed ahead of
+    /// the prompt's end is back in the console's buffer by then, for the relay to read.
     pub(crate) fn into_modes(self) -> ConsoleModes {
-        self.modes
+        let ConsolePrompt { type_ahead, modes, .. } = self;
+        drop(type_ahead);
+        modes
     }
 
     /// Write `text` to the console (VT, CRLF line ends). It goes as UTF-16: raw UTF-8 bytes are read
@@ -74,56 +82,51 @@ impl ConsolePrompt {
         }
     }
 
-    /// Block until one entry step finishes: a submitted password, an empty Enter, or a cancel.
-    /// `Disconnected` if the console input fails (the SSH side is gone).
-    pub fn read_step(&mut self) -> Result<Step, Disconnected> {
+    /// Block until one entry step finishes: a submitted password, an empty Enter, or a cancel. Records
+    /// read after the finishing one are kept: the next step starts with them, and once the prompt is
+    /// over they go back into the console for its next reader.
+    /// The error is the console input's failure (the SSH side is gone).
+    pub fn read_step(&mut self) -> Result<Step, windows::core::Error> {
         let stdin: HANDLE = self.modes.stdin;
-        let mut records: [INPUT_RECORD; 32] = unsafe { std::mem::zeroed() };
         loop {
-            let mut count = 0u32;
-            // SAFETY: `records` and `count` are valid for the call.
-            if unsafe { ReadConsoleInputW(stdin, &mut records, &mut count) }.is_err() {
-                wipe_records(&mut records);
-                return Err(Disconnected);
-            }
-            let mut finished = None;
-            for record in &records[..count as usize] {
-                if record.EventType != EVT_KEY {
-                    continue;
-                }
-                // SAFETY: the event type says this is a key record.
-                let key = unsafe { record.Event.KeyEvent };
-                let event = KeyEvent {
-                    virtual_key_code: key.wVirtualKeyCode,
-                    virtual_scan_code: key.wVirtualScanCode,
-                    // SAFETY: the character is read as the UTF-16 unit it is.
-                    unicode_char: unsafe { key.uChar.UnicodeChar },
-                    key_down: key.bKeyDown.as_bool(),
-                    control_key_state: key.dwControlKeyState,
-                    repeat_count: key.wRepeatCount,
-                };
-                match self.entry.key(&event) {
-                    Step::Continue => {}
-                    step => {
-                        finished = Some(step);
-                        break;
-                    }
-                }
-            }
-            wipe_records(&mut records);
-            if let Some(step) = finished {
+            if let Some(step) = self.type_ahead.batch.step(&mut self.entry) {
                 return Ok(step);
             }
+            self.type_ahead.batch.fill(|records| {
+                let mut count = 0u32;
+                // SAFETY: `records` and `count` are valid for the call.
+                unsafe { ReadConsoleInputW(stdin, records, &mut count) }?;
+                Ok(count)
+            })?;
         }
     }
 }
 
-/// Overwrite a batch of console records: they hold the characters just typed.
-fn wipe_records(records: &mut [INPUT_RECORD]) {
-    // SAFETY: `INPUT_RECORD` is plain data; zeroing its bytes in place is sound.
-    let bytes =
-        unsafe { std::slice::from_raw_parts_mut(records.as_mut_ptr().cast::<u8>(), std::mem::size_of_val(records)) };
-    bytes.zeroize();
+/// The records read and not yet fed to the entry. Dropping it puts them back into the console.
+struct TypeAhead {
+    batch: Batch,
+    stdin: HANDLE,
+}
+
+impl Drop for TypeAhead {
+    fn drop(&mut self) {
+        let stdin = self.stdin;
+        self.batch.give_back(|mut rest| {
+            while !rest.is_empty() {
+                let mut written = 0u32;
+                // SAFETY: `rest` and `written` are valid for the call; `stdin` is the console's input.
+                if let Err(e) = unsafe { WriteConsoleInputW(stdin, rest, &mut written) } {
+                    tracing::warn!("could not put the typed-ahead input back into the console: {e}");
+                    return;
+                }
+                if written == 0 {
+                    tracing::warn!("the console took none of the typed-ahead input put back");
+                    return;
+                }
+                rest = &rest[written as usize..];
+            }
+        });
+    }
 }
 
 /// The OS errors a `connect` to the user's socket fails with when nothing serves it, as the tests

@@ -345,7 +345,10 @@ impl OfferIo for LiveIo {
     }
 
     fn read_password(&mut self) -> Result<Step, Disconnected> {
-        self.prompt.read_step()
+        self.prompt.read_step().map_err(|e| {
+            tracing::warn!("the console input failed: {e}");
+            Disconnected
+        })
     }
 
     fn start_session(&mut self, password: &Password) -> Result<(), StartFailure> {
