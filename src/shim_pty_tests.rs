@@ -502,9 +502,8 @@ fn a_rescue_that_finds_the_input_gone_ends_the_shim_with_255_and_runs_nothing() 
 
 // An agent that ends the connection before it says anything -----
 
-/// A fake agent that takes one connection, reads `frames` frames from it, closes it, and then closes
-/// its listener, so that the next connect finds nobody. The shim may connect again before the listener
-/// closes; that connection is reset with it, and the shim goes round once more.
+/// A fake agent that takes one connection, reads `frames` frames from it, closes its listener and
+/// then the connection, so that the next connect finds nobody: it is an agent that is ending.
 fn agent_that_hangs_up(listener: crate::afunix::Listener, frames: usize) -> std::thread::JoinHandle<()> {
     use crate::afunix;
     use crate::protocol::{FrameReader, read_one_frame};
@@ -514,8 +513,8 @@ fn agent_that_hangs_up(listener: crate::afunix::Listener, frames: usize) -> std:
         for _ in 0..frames {
             read_one_frame(&mut rx, &mut reader).unwrap();
         }
-        drop((rx, tx));
         drop(listener);
+        drop((rx, tx));
     })
 }
 
@@ -628,7 +627,7 @@ fn an_interactive_session_whose_connection_ends_before_the_agent_answers_takes_t
     use super::Interactive;
     use crate::shim::Pumped;
     let (_profile, location, listener) = location_with_listener("hangup-pty");
-    let agent = agent_that_hangs_up(listener, 0);
+    let mut agent = Some(agent_that_hangs_up(listener, 0));
     let mut rescue = Scripted::answering(Rescued::Plain);
     let mut stderr = Vec::new();
     let mut attempts = 0;
@@ -642,16 +641,16 @@ fn an_interactive_session_whose_connection_ends_before_the_agent_answers_takes_t
         &mut rescue,
         &mut |_conn, _modes| {
             attempts += 1;
+            // The pump ends when the agent closes the connection, which it does after its listener.
+            agent.take().expect("one attempt").join().unwrap();
             Ok(Interactive::Pumped(Pumped::closed(anyhow::Error::new(
                 std::io::Error::from(std::io::ErrorKind::ConnectionReset),
             ))))
         },
     )
     .unwrap();
-    agent.join().unwrap();
 
-    // A connection made before the listener closed is reset with it, which sends the shim round again.
-    assert!(attempts >= 1, "the shim never relayed");
+    assert_eq!(attempts, 1);
     assert_eq!(relayed, None, "the shim fails open as it does for no agent");
     assert_eq!(rescue.seen, [(false, true, true)], "the no-agent path was taken once");
     assert!(stderr.is_empty(), "an interactive fallback prints nothing");
@@ -701,24 +700,95 @@ fn an_interactive_session_goes_round_again_to_an_agent_that_answers_the_second_t
     assert_eq!(relayed, Some(7));
 }
 
-#[test]
-fn an_interactive_session_goes_round_for_as_long_as_the_agent_hangs_up_and_answers_in_the_end() {
-    // No count ends the loop: an agent that is there and has closed a hundred connections without a
-    // byte is still asked again, and the session it then serves is the one relayed.
-    use super::Interactive;
-    use crate::relay::Outcome;
-    use crate::shim::Pumped;
-    const HANGUPS: usize = 100;
-    let (_profile, location, listener) = location_with_listener("hangup-many");
+/// The agent at `location` takes `connections` connections, closes each without a byte, and keeps its
+/// listener until `finished` is sent.
+fn agent_that_always_hangs_up(
+    listener: crate::afunix::Listener,
+    connections: usize,
+) -> (std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>) {
     let (finished, wait_finished) = std::sync::mpsc::channel::<()>();
     let agent = std::thread::spawn(move || {
-        for _ in 0..HANGUPS {
+        for _ in 0..connections {
             drop(listener.accept().unwrap());
         }
-        let last = listener.accept().unwrap();
         wait_finished.recv().ok();
-        drop(last);
     });
+    (finished, agent)
+}
+
+fn hung_up() -> super::Interactive {
+    super::Interactive::Pumped(crate::shim::Pumped::closed(anyhow::Error::new(std::io::Error::from(
+        std::io::ErrorKind::ConnectionReset,
+    ))))
+}
+
+#[test]
+fn a_second_connection_that_ends_without_a_byte_is_a_protocol_violation_not_a_reason_to_connect_again() {
+    // An agent that follows the protocol closes a connection without a byte only while its listener
+    // closes, so the connect after that fails or reaches an agent that answers. This one is still
+    // there and hangs up again.
+    let (_profile, location, listener) = location_with_listener("hangup-twice");
+    let socket = location.path.clone();
+    let (finished, agent) = agent_that_always_hangs_up(listener, 2);
+    let mut stderr = Vec::new();
+    let mut attempts = 0;
+
+    let relayed = super::try_relay_with(
+        Ok(location),
+        &None,
+        &mut stderr,
+        None,
+        std::io::empty(),
+        &mut Never,
+        &mut |_conn, _modes| {
+            attempts += 1;
+            // Not a loop limit of the shim: the test fails instead of hanging if the shim never stops.
+            assert!(
+                attempts <= 2,
+                "the shim connected a third time to an agent that hung up twice"
+            );
+            Ok(hung_up())
+        },
+    )
+    .unwrap();
+    finished.send(()).unwrap();
+    agent.join().unwrap();
+
+    assert_eq!(attempts, 2);
+    assert_eq!(relayed, Some(254));
+    assert_eq!(
+        String::from_utf8(stderr).unwrap(),
+        format!(
+            "ssh-broker: the agent at {} closed the connection twice without answering; it may be a different ssh-broker version
+",
+            socket.display()
+        )
+    );
+}
+
+/// A rescue that answers from a list.
+struct Answers(std::collections::VecDeque<Rescued>);
+
+impl Rescue for Answers {
+    fn rescue(&mut self, _: &Absent<'_>, _: &mut dyn std::io::Write) -> Rescued {
+        self.0.pop_front().expect("asked more often than answered")
+    }
+}
+
+#[test]
+fn a_no_byte_close_before_and_after_a_connect_that_failed_are_not_consecutive() {
+    // The first agent ends: it hangs up and its listener is gone. The connect after that fails and the
+    // rescue starts another agent, which hangs up on its first connection without a byte, too. That is
+    // a different agent, not the same one twice.
+    use crate::afunix::Listener;
+    let (_profile, location, listener) = location_with_listener("hu-first");
+    let mut first = Some(agent_that_hangs_up(listener, 0));
+    let served = crate::test_support::TempProfile::new("hu-served");
+    let at = served.location();
+    crate::userdir::ensure_socket_dir(&at, &crate::acl::Sid::current_user().unwrap()).unwrap();
+    let (finished, second) = agent_that_always_hangs_up(Listener::bind(&at.path).unwrap(), 1);
+    let socket = crate::afunix::connect(&at.path).unwrap();
+    let mut rescue = Answers([Rescued::Connected { socket, modes: None }, Rescued::Plain].into());
     let mut attempts = 0;
 
     let relayed = super::try_relay_with(
@@ -727,26 +797,21 @@ fn an_interactive_session_goes_round_for_as_long_as_the_agent_hangs_up_and_answe
         &mut Vec::new(),
         None,
         std::io::empty(),
-        &mut Never,
+        &mut rescue,
         &mut |_conn, _modes| {
             attempts += 1;
-            Ok(Interactive::Pumped(if attempts <= HANGUPS {
-                Pumped::closed(anyhow::Error::new(std::io::Error::from(
-                    std::io::ErrorKind::ConnectionReset,
-                )))
-            } else {
-                Pumped {
-                    outcome: Ok(Outcome::Exited(7)),
-                    heard: true,
-                }
-            }))
+            // The pump of the first connection ends when the agent closes it, after its listener.
+            if let Some(first) = first.take() {
+                first.join().unwrap();
+            }
+            Ok(hung_up())
         },
     )
     .unwrap();
-
-    // Before the agent is joined: a shim that gave up early leaves it waiting for connections.
-    assert_eq!(attempts, HANGUPS + 1);
-    assert_eq!(relayed, Some(7));
     finished.send(()).unwrap();
-    agent.join().unwrap();
+    second.join().unwrap();
+
+    assert_eq!(attempts, 2);
+    assert_eq!(relayed, None, "the last rescue gave up: the shim fails open");
+    assert!(rescue.0.is_empty(), "the rescue was asked after each failed connect");
 }

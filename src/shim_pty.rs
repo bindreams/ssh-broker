@@ -19,8 +19,9 @@ use crate::console_modes::ConsoleModes;
 use crate::protocol::{FrameKind, FrameReader, Handshake, Stream, write_frame};
 use crate::relay::{FrameSink, write_data};
 use crate::shim::{
-    FailOpen, Fallback, MouseModeSniffer, Pumped, Started, XtwinopsFilter, decide_fail_open, decide_fallback,
-    is_blank_command, make_handshake, peer_gone, pump_exec, pump_heard, size_to_resize, start_exec_input,
+    FailOpen, Fallback, MouseModeSniffer, PROTOCOL_VIOLATION_CODE, Pumped, Started, XtwinopsFilter,
+    closed_twice_message, decide_fail_open, decide_fallback, is_blank_command, make_handshake, peer_gone, pump_exec,
+    pump_heard, size_to_resize, start_exec_input,
 };
 use crate::shim_offer::{Absent, Prompting, Rescue, Rescued};
 use crate::socket_loc::SocketLocation;
@@ -210,21 +211,35 @@ fn try_relay_with(
 ) -> anyhow::Result<Option<i32>> {
     if let Some(cmd) = exec {
         return match connect_or_rescue(&location, exec, stderr, log_failure, rescue)? {
-            Connected::Agent(conn, _) => relay_exec(conn, cmd, stdin, stderr),
+            Connected::Agent { socket, .. } => relay_exec(socket, cmd, stdin, stderr),
             Connected::Done(code) => Ok(code),
         };
     }
     // An interactive session whose connection the agent ends before it says anything goes round again:
-    // the agent is ending or gone, because an agent that is alive answers every connection it cannot
-    // serve. The next connect finds out which. It ends when a connect finds no listener, or an agent
-    // answers.
+    // the agent is ending, because an agent that follows the protocol closes a connection without a
+    // byte only while its listener closes. The next connect then finds no listener or an agent that
+    // answers. A second close without a byte from a connect that succeeded, right after the first,
+    // breaks the protocol, and the session ends there. A connect that fails in between (and the rescue
+    // that follows it) starts the count again: that agent is gone.
+    let mut closed_before = false;
     loop {
         let (conn, rescued_modes) = match connect_or_rescue(&location, exec, stderr, log_failure, rescue)? {
-            Connected::Agent(conn, modes) => (conn, modes),
+            Connected::Agent { socket, modes, rescued } => {
+                closed_before &= !rescued;
+                (socket, modes)
+            }
             Connected::Done(code) => return Ok(code),
         };
         match interactive(conn, rescued_modes)? {
             Interactive::Pumped(pumped) if pumped.no_answer() => {
+                if closed_before {
+                    let path = location.as_ref().ok().map(|location| location.path.as_path());
+                    let message = closed_twice_message(path);
+                    tracing::error!("{message}");
+                    let _ = writeln!(stderr, "{message}");
+                    return Ok(Some(PROTOCOL_VIOLATION_CODE));
+                }
+                closed_before = true;
                 tracing::warn!("the agent ended the connection before it answered; connecting again");
             }
             Interactive::Pumped(pumped) => return Ok(Some(pumped.code())),
@@ -235,8 +250,13 @@ fn try_relay_with(
 
 /// What [`connect_or_rescue`] came to.
 enum Connected {
-    /// A connection to the agent, with the console a rescue left raw.
-    Agent(Socket, Option<ConsoleModes>),
+    /// A connection to the agent, with the console a rescue left raw. `rescued`: the connect found no
+    /// agent and the rescue made this connection.
+    Agent {
+        socket: Socket,
+        modes: Option<ConsoleModes>,
+        rescued: bool,
+    },
     /// There is none: what [`try_relay_with`] returns instead.
     Done(Option<i32>),
 }
@@ -258,7 +278,13 @@ fn connect_or_rescue(
         Err(e) => Err(anyhow::anyhow!("{e:#}")),
     };
     let connection: anyhow::Result<Socket> = match connection {
-        Ok(socket) => return Ok(Connected::Agent(socket, None)),
+        Ok(socket) => {
+            return Ok(Connected::Agent {
+                socket,
+                modes: None,
+                rescued: false,
+            });
+        }
         Err(e) => Err(e),
     };
     let absent = Absent {
@@ -267,7 +293,11 @@ fn connect_or_rescue(
         connect: &connection,
     };
     Ok(match rescue.rescue(&absent, stderr) {
-        Rescued::Connected { socket, modes } => Connected::Agent(socket, modes),
+        Rescued::Connected { socket, modes } => Connected::Agent {
+            socket,
+            modes,
+            rescued: true,
+        },
         Rescued::Gone => Connected::Done(Some(255)),
         Rescued::Plain => Connected::Done(fail_open_reason(location, &connection, exec, stderr, log_failure)?),
     })

@@ -93,6 +93,21 @@ pub struct Pumped {
     pub heard: bool,
 }
 
+/// The exit code of a client that stops because the agent broke the protocol: the code of a protocol
+/// error (see [`map_outcome`]).
+pub const PROTOCOL_VIOLATION_CODE: i32 = 254;
+
+/// What a client says when two connections in a row that connected were closed without a byte. An agent
+/// that follows the protocol closes a connection without a byte only while its listener is closing, so
+/// the connect after that fails or reaches an agent that answers: this one is something else, such as
+/// an older agent that does not know the request.
+pub fn closed_twice_message(agent: Option<&std::path::Path>) -> String {
+    let at = agent.map(|path| format!(" at {}", path.display())).unwrap_or_default();
+    format!(
+        "ssh-broker: the agent{at} closed the connection twice without answering; it may be a different ssh-broker version"
+    )
+}
+
 impl Pumped {
     /// The connection ended without the agent having sent a byte: the agent was ending, or was gone,
     /// before it took this session, because an agent that is alive answers every connection it cannot

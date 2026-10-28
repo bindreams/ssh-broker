@@ -10,7 +10,7 @@ use std::io::{Read, Write};
 
 use crate::protocol::{FrameKind, FrameReader, Mode, Stream, write_frame};
 use crate::relay::{FrameSink, Outcome};
-use crate::shim::{make_handshake, peer_gone, pump_heard};
+use crate::shim::{PROTOCOL_VIOLATION_CODE, closed_twice_message, make_handshake, peer_gone, pump_heard};
 
 /// What `logout` says when there is no agent to ask.
 pub const NO_SESSION: &str = "ssh-broker: no session to end.";
@@ -72,13 +72,17 @@ pub fn logout_on<R: Read, W: Write>(rx: &mut R, tx: &mut W, err: &mut dyn Write)
 /// A connection that ends before the agent's first byte means the agent is ending (its listener closed
 /// with this request queued) or gone: the session the user asked to end is ending already. It connects
 /// again, and the next connect finds no agent (the outcome of running `logout` a moment later) or an
-/// agent that answers.
+/// agent that answers. A second connection in a row that ends before the first byte breaks the
+/// protocol (an agent that follows it closes without a byte only while its listener closes, as an
+/// older agent that does not know the request does not): it is reported and exits with
+/// [`PROTOCOL_VIOLATION_CODE`](crate::shim::PROTOCOL_VIOLATION_CODE).
 pub fn logout_at<R: Read, W: Write, T>(
     mut connect: impl FnMut() -> anyhow::Result<(R, W)>,
     no_session: impl Fn(&anyhow::Error) -> bool,
     err: &mut dyn Write,
     exit: impl FnOnce(i32) -> T,
 ) -> T {
+    let mut closed_before = false;
     loop {
         let (mut rx, mut tx) = match connect() {
             Ok(connection) => connection,
@@ -93,7 +97,11 @@ pub fn logout_at<R: Read, W: Write, T>(
         };
         match logout_on(&mut rx, &mut tx, err) {
             Asked::Code(code) => return exit(code),
-            Asked::Unanswered => {}
+            Asked::Unanswered if closed_before => {
+                let _ = writeln!(err, "{}", closed_twice_message(None));
+                return exit(PROTOCOL_VIOLATION_CODE);
+            }
+            Asked::Unanswered => closed_before = true,
         }
     }
 }

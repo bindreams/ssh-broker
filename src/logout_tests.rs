@@ -134,14 +134,18 @@ fn a_connection_that_ends_before_the_agents_first_byte_is_followed_by_a_new_one_
 }
 
 #[test]
-fn logout_goes_round_for_as_long_as_the_agent_hangs_up_and_never_advises_apply() {
-    // No count ends the loop: a connect that finds no listener does.
-    const HANGUPS: usize = 100;
-    let script = std::iter::repeat_n(Ok(Vec::new()), HANGUPS).chain([Err("nothing listens")]);
-    let (code, err, connects) = logout_over(script);
-    assert_eq!(code, 1);
-    assert!(!err.contains("apply"), "{err}");
-    assert_eq!(connects, HANGUPS + 1);
+fn a_second_connection_that_ends_before_the_agents_first_byte_is_a_protocol_violation() {
+    // An agent that follows the protocol closes a connection without a byte only while its listener
+    // closes, so the connect after that fails or is answered. The script has no third connection:
+    // asking again would fail the test.
+    let (code, err, connects) = logout_over([Ok(Vec::new()), Ok(Vec::new())]);
+    assert_eq!(code, crate::shim::PROTOCOL_VIOLATION_CODE);
+    assert_eq!(
+        err,
+        "ssh-broker: the agent closed the connection twice without answering; it may be a different ssh-broker version
+"
+    );
+    assert_eq!(connects, 2);
 }
 
 /// A connection whose read fails as told.
