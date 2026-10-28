@@ -9,7 +9,7 @@
 //! self-heal has nothing to resolve.
 
 #[cfg(windows)]
-mod apply_lock;
+pub(crate) mod apply_lock;
 pub mod bounded;
 #[cfg(windows)]
 mod flow;
@@ -17,8 +17,6 @@ mod flow;
 pub(crate) mod layout;
 #[cfg(windows)]
 pub mod password_variant;
-#[cfg(windows)]
-pub(crate) mod pending_sessions;
 pub mod probe;
 #[cfg(windows)]
 pub mod procwait;
@@ -104,8 +102,7 @@ mod provision_tests;
 mod imp {
     use super::layout::{self, Layout};
     use super::{
-        apply_lock, flow, pending_sessions, probe, procwait, registry, report, schtasks, session_task, sessions,
-        taskscheduler, user_rows,
+        apply_lock, flow, probe, procwait, registry, report, schtasks, session_task, sessions, taskscheduler, user_rows,
     };
     use crate::{afunix, shim};
     use anyhow::Context;
@@ -138,28 +135,21 @@ mod imp {
         //    exited.
         let current = std::env::current_exe().context("current_exe")?;
         // The install directory first: the lock file lives in it, and nothing is read from it or
-        // written into it before it is proved ours. One `apply` runs at a time, for its whole run: a
-        // second one (the boot self-heal is one) waits here, so it never meets the first's disabled
-        // tasks or its record as if a killed run had left them.
+        // written into it before it is proved ours. One `apply` runs at a time, for its whole run,
+        // and no `auto-login on|off` runs during it: a second `apply` (the boot self-heal is one)
+        // waits here, so it never stops or starts what the first is working on.
         let base = layout::ensure_base(&layout)?;
-        let (_apply_lock, owed) =
-            apply_lock::acquire_and_load(&layout.apply_lock_path(), &layout.pending_sessions_path(), || {
-                eprintln!("apply: another apply is running; waiting for it to finish")
-            })?;
+        let _apply_lock = apply_lock::acquire(&layout.apply_lock_path(), || {
+            eprintln!("apply: another apply or an auto-login command is running; waiting for it to finish")
+        })?;
         let registered_xml = schtasks::registered_xml(taskscheduler::task_xml(schtasks::AGENT_TASK))?;
-        // The auto-login tasks that were enabled when the agents were stopped, to be enabled and
-        // started again afterwards. It starts with the tasks an earlier `apply` that was killed
-        // after disabling them still owes: the record is read under the lock, so no `apply` that is
-        // running now wrote it.
-        let enabled_sessions = std::cell::RefCell::new(owed);
+        // The auto-login tasks that were enabled when the agents were stopped, to be started again
+        // afterwards.
+        let enabled_sessions = std::cell::RefCell::new(Vec::new());
         let exe = flow::run(
             || {
                 taskscheduler::stop_instances(schtasks::AGENT_TASK, &layout.canonical_exe())?;
-                stop_background_sessions(
-                    &layout.canonical_exe(),
-                    &layout.pending_sessions_path(),
-                    &enabled_sessions,
-                )
+                stop_background_sessions(&layout.canonical_exe(), &enabled_sessions)
             },
             |stop_agents| {
                 let exe = layout::prepare_in(&base, &current, registered_xml.as_deref(), stop_agents)?;
@@ -183,12 +173,6 @@ mod imp {
             },
             agent_task_is_group_form,
             enable_agent_task,
-            || {
-                flow::resume_sessions(&enabled_sessions, |name| taskscheduler::set_enabled(name, true))?;
-                // Every task is enabled again: nothing is owed any more. A directory that is not
-                // ours is left alone: its file is not the one that was ignored at the start.
-                pending_sessions::clear_after_resume(layout::check_base(&layout), |line| eprintln!("{line}"))
-            },
             || flow::start_sessions(&enabled_sessions, taskscheduler::run_task),
             start_agents,
         )?;
@@ -200,19 +184,14 @@ mod imp {
     }
 
     /// The background sessions' part of the stop that precedes replacing the exe: the auto-login
-    /// tasks are disabled and their instances stopped, then every background agent left (the prompt
-    /// path starts one without a task) is ended. A shim is never ended: it holds the exe only until
+    /// tasks' instances are stopped (the tasks stay enabled), then every background agent left (the
+    /// prompt path starts one without a task) is ended. A shim is never ended: it holds the exe only until
     /// its SSH session closes, and the copy reports it if it still does.
-    fn stop_background_sessions(
-        image: &Path,
-        pending: &Path,
-        enabled: &std::cell::RefCell<Vec<String>>,
-    ) -> anyhow::Result<()> {
+    fn stop_background_sessions(image: &Path, enabled: &std::cell::RefCell<Vec<String>>) -> anyhow::Result<()> {
         flow::stop_sessions(
             taskscheduler::session_tasks,
             enabled,
-            |names| pending_sessions::store(pending, names),
-            |name| taskscheduler::stop_instances(name, image),
+            |name| taskscheduler::stop_instances_keeping_enabled(name, image),
             || procwait::background_agents(image),
             |agent| agent.terminate(),
             |agents| procwait::wait_all_exited(&agents, procwait::EXIT_BOUND),

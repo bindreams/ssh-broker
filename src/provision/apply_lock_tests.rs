@@ -7,78 +7,60 @@ fn not_private(_: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn session(sid: &str) -> String {
-    format!("{}{sid}", super::super::session_task::TASK_PREFIX)
-}
-
 #[test]
-fn a_free_lock_is_taken_without_waiting_and_loads_the_record() {
+fn a_free_lock_is_taken_without_waiting() {
     let dir = TempProfile::new("apply-lock-free");
-    let (lock, owed) = acquire_and_load_with(
-        not_private,
-        &dir.0.join("apply.lock"),
-        &dir.0.join("pending.txt"),
-        || panic!("nobody holds the lock"),
-    )
+    let lock = acquire_with(not_private, &dir.0.join("apply.lock"), || {
+        panic!("nobody holds the lock")
+    })
     .unwrap();
-    assert!(owed.is_empty());
     drop(lock);
 }
 
 #[test]
-fn a_second_apply_waits_for_the_first_and_reads_the_record_the_first_left() {
+fn a_second_holder_waits_for_the_first() {
     let dir = TempProfile::new("apply-lock-contend");
-    let (lock_path, pending) = (dir.0.join("apply.lock"), dir.0.join("pending.txt"));
-    let (first, owed) =
-        acquire_and_load_with(not_private, &lock_path, &pending, || panic!("nobody holds the lock")).unwrap();
-    assert!(owed.is_empty());
+    let lock_path = dir.0.join("apply.lock");
+    let first = acquire_with(not_private, &lock_path, || panic!("nobody holds the lock")).unwrap();
 
     let (waiting, saw_it_held) = mpsc::channel();
+    let (taken, second_took_it) = mpsc::channel();
     let second = std::thread::spawn({
-        let (lock_path, pending) = (lock_path.clone(), pending.clone());
+        let lock_path = lock_path.clone();
         move || {
-            let (lock, owed) =
-                acquire_and_load_with(not_private, &lock_path, &pending, || waiting.send(()).unwrap()).unwrap();
+            let lock = acquire_with(not_private, &lock_path, || waiting.send(()).unwrap()).unwrap();
+            taken.send(()).unwrap();
             drop(lock);
-            owed
         }
     });
-    // The second is about to block on the lock. The first, still holding it, records what it
-    // disabled: a second that read the record before the lock would miss this.
     saw_it_held
         .recv()
-        .expect("the second apply did not report that it had to wait");
-    pending_sessions::store(&pending, &[session("a")]).unwrap();
+        .expect("the second holder did not report that it had to wait");
     drop(first);
-    assert_eq!(second.join().unwrap(), [session("a")]);
+    second_took_it.recv().expect("the second holder never got the lock");
+    second.join().unwrap();
 }
 
 #[test]
 fn the_lock_is_released_when_the_holder_drops() {
     let dir = TempProfile::new("apply-lock-drop");
-    let (lock_path, pending) = (dir.0.join("apply.lock"), dir.0.join("pending.txt"));
-    drop(acquire_and_load_with(not_private, &lock_path, &pending, || {}).unwrap());
-    drop(
-        acquire_and_load_with(not_private, &lock_path, &pending, || {
-            panic!("the first apply let go of it")
-        })
-        .unwrap(),
-    );
+    let lock_path = dir.0.join("apply.lock");
+    drop(acquire_with(not_private, &lock_path, || {}).unwrap());
+    drop(acquire_with(not_private, &lock_path, || panic!("the first holder let go of it")).unwrap());
 }
 
 #[test]
 fn the_lock_file_is_made_private_before_the_lock_is_asked_for() {
     let dir = TempProfile::new("apply-lock-private");
-    let (lock_path, pending) = (dir.0.join("apply.lock"), dir.0.join("pending.txt"));
+    let lock_path = dir.0.join("apply.lock");
     let made = std::cell::RefCell::new(Vec::new());
-    let (lock, _) = acquire_and_load_with(
+    let lock = acquire_with(
         |path| {
             made.borrow_mut().push(path.to_path_buf());
             assert!(!path.exists(), "the file is made by the private step, not by the lock");
             Ok(())
         },
         &lock_path,
-        &pending,
         || panic!("nobody holds the lock"),
     )
     .unwrap();
@@ -89,11 +71,10 @@ fn the_lock_file_is_made_private_before_the_lock_is_asked_for() {
 #[test]
 fn a_lock_file_that_cannot_be_made_private_is_not_locked_and_not_created() {
     let dir = TempProfile::new("apply-lock-refused");
-    let (lock_path, pending) = (dir.0.join("apply.lock"), dir.0.join("pending.txt"));
-    let err = acquire_and_load_with(
+    let lock_path = dir.0.join("apply.lock");
+    let err = acquire_with(
         |_| anyhow::bail!("open to Users"),
         &lock_path,
-        &pending,
         || panic!("no wait on a refused file"),
     )
     .unwrap_err();

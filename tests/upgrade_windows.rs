@@ -334,7 +334,7 @@ fn apply_upgrade_that_fails_on_a_held_exe_still_restarts_auto_login() {
 
 /// Elevated (CI only). The upgrade that succeeds: nothing holds the installed exe (no SSH session is
 /// open), so `apply` ends the prompt-path session and the auto-login one, replaces the exe with the new
-/// build, enables the auto-login task again and starts it, and leaves no record of tasks it owes.
+/// build and starts the auto-login task again, which stays enabled throughout.
 #[test]
 fn apply_upgrade_that_succeeds_ends_a_background_session_and_restarts_auto_login() {
     let _machine = machine::exclusive();
@@ -360,15 +360,11 @@ fn apply_upgrade_that_succeeds_ends_a_background_session_and_restarts_auto_login
 
     scene.assert_prompt_session_ended();
     // The auto-login session runs again, from the new exe: a different process serves the account, and
-    // the task is enabled.
+    // the task is still enabled.
     scene.assert_auto_login_restarted(&text);
     let tasks = taskscheduler::session_tasks().unwrap();
     assert!(
         !tasks.is_empty() && tasks.iter().all(|task| task.enabled),
-        "an auto-login task is not enabled again: {tasks:?}"
-    );
-    assert!(
-        !Path::new(provision::BASE_DIR).join("sessions-to-enable.txt").exists(),
-        "apply left its record of tasks it owes after enabling them"
+        "an auto-login task is not enabled after apply: {tasks:?}"
     );
 }

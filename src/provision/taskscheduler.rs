@@ -126,6 +126,17 @@ fn set_task_enabled(task: &IRegisteredTask, name: &str, enabled: bool) -> anyhow
 /// A process that outlives [`procwait::EXIT_BOUND`] fails the stop with [`procwait::StillRunning`];
 /// so does an instance the service still lists that long after the first `Stop`.
 pub fn stop_instances(task_name: &str, image: &Path) -> anyhow::Result<()> {
+    stop_task_instances(task_name, image, true)
+}
+
+/// [`stop_instances`] for a task whose only trigger is not a logon (the auto-login tasks start at
+/// boot): nothing starts it during the stop, so it is left **enabled**, and a killed caller leaves
+/// it as it was.
+pub fn stop_instances_keeping_enabled(task_name: &str, image: &Path) -> anyhow::Result<()> {
+    stop_task_instances(task_name, image, false)
+}
+
+fn stop_task_instances(task_name: &str, image: &Path, disable: bool) -> anyhow::Result<()> {
     let _com = Com::init()?;
     let service = connect()?;
     let Some(task) = registered_task(&service, task_name)? else {
@@ -134,7 +145,7 @@ pub fn stop_instances(task_name: &str, image: &Path) -> anyhow::Result<()> {
     stop_and_wait(
         task_name,
         procwait::EXIT_BOUND,
-        || set_task_enabled(&task, task_name, false),
+        disable.then_some(|| set_task_enabled(&task, task_name, false)),
         || running_instances(&task, image),
         // SAFETY: `task` is a live interface on this thread; `Stop` takes no pointers. The raw
         // vtable call keeps the HRESULT, which the generated wrapper turns into `Ok` for S_FALSE.
@@ -157,10 +168,10 @@ struct Instances<P> {
     processes: Vec<P>,
 }
 
-/// The steps of a stop, in the only order that is safe. Disabled first, so the logon trigger cannot
-/// start an agent from the old exe meanwhile; listed before each stop, because the instances are
-/// gone afterwards; waited for before the next look, so the caller goes on only when every process
-/// has exited.
+/// The steps of a stop, in the only order that is safe. Disabled first (when `disable` is given), so
+/// the logon trigger cannot start an agent from the old exe meanwhile; listed before each stop,
+/// because the instances are gone afterwards; waited for before the next look, so the caller goes
+/// on only when every process has exited.
 ///
 /// The look is repeated until the task has no instance. An instance that was queued or starting
 /// when `Stop` ran has no process yet, and the engine can launch it afterwards, so one stop is not
@@ -174,12 +185,14 @@ struct Instances<P> {
 fn stop_and_wait<P>(
     task_name: &str,
     bound: Duration,
-    disable: impl FnOnce() -> anyhow::Result<()>,
+    disable: Option<impl FnOnce() -> anyhow::Result<()>>,
     mut list: impl FnMut() -> anyhow::Result<Instances<P>>,
     mut stop: impl FnMut() -> anyhow::Result<()>,
     mut wait: impl FnMut(Vec<P>) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
-    disable()?;
+    if let Some(disable) = disable {
+        disable()?;
+    }
     let mut first_stop = None;
     loop {
         let instances = list()?;

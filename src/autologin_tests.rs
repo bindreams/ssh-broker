@@ -57,6 +57,31 @@ struct Fake {
     /// The password each step was given, as the UTF-16 units it received.
     probed: std::cell::RefCell<Vec<Vec<u16>>>,
     registered: Vec<Vec<u16>>,
+    /// Whether the apply lock is held now, and how many times it was taken.
+    held: std::rc::Rc<std::cell::Cell<bool>>,
+    locks: u32,
+    /// Taking the lock fails with this message.
+    lock_fails: Option<&'static str>,
+    /// The steps that ran while the lock was not held.
+    unlocked: std::cell::RefCell<Vec<&'static str>>,
+}
+
+/// The lock a [`Fake`] hands out: held until dropped.
+struct Held(std::rc::Rc<std::cell::Cell<bool>>);
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        self.0.set(false);
+    }
+}
+
+impl Fake {
+    /// Note a step that needs the lock.
+    fn step(&self, name: &'static str) {
+        if !self.held.get() {
+            self.unlocked.borrow_mut().push(name);
+        }
+    }
 }
 
 impl Fake {
@@ -74,6 +99,10 @@ impl Fake {
             said: Vec::new(),
             probed: Default::default(),
             registered: Vec::new(),
+            held: Default::default(),
+            locks: 0,
+            lock_fails: None,
+            unlocked: Default::default(),
         }
     }
 
@@ -92,10 +121,20 @@ impl AutoLoginEnv for Fake {
     fn exe(&self) -> std::path::PathBuf {
         EXE.into()
     }
+    fn lock_apply(&mut self) -> anyhow::Result<Box<dyn std::any::Any>> {
+        if let Some(why) = self.lock_fails {
+            anyhow::bail!(why);
+        }
+        self.locks += 1;
+        self.held.set(true);
+        Ok(Box::new(Held(self.held.clone())))
+    }
     fn check_install(&self) -> anyhow::Result<()> {
+        self.step("check_install");
         Ok(())
     }
     fn ask_password(&mut self, _: &LocalAccount) -> anyhow::Result<Option<Password>> {
+        self.step("ask");
         self.calls.push("ask".into());
         Ok(self.password.map(password))
     }
@@ -104,6 +143,7 @@ impl AutoLoginEnv for Fake {
         self.batch.clone()
     }
     fn register(&mut self, account: &LocalAccount, xml: &str, password: &Password, sddl: &str) -> anyhow::Result<()> {
+        self.step("register");
         self.registered.push(password.as_wide().to_vec());
         self.calls.push(format!("register {} {}", account.sid, sddl));
         self.calls.push(format!("xml-names {}", xml.contains(&account.sid)));
@@ -114,6 +154,7 @@ impl AutoLoginEnv for Fake {
         }
     }
     fn read_back(&self, name: &str) -> anyhow::Result<Option<TaskState>> {
+        self.step("read_back");
         let sid = name.strip_prefix("ssh-broker-session-").unwrap();
         Ok(match &self.read_back {
             Some(state) => state.as_ref().map(|s| TaskState {
@@ -129,6 +170,7 @@ impl AutoLoginEnv for Fake {
         })
     }
     fn delete(&mut self, name: &str) -> anyhow::Result<bool> {
+        self.step("delete");
         self.calls.push(format!("delete {name}"));
         if let Some(why) = self.delete_fails {
             anyhow::bail!(why);
@@ -136,6 +178,7 @@ impl AutoLoginEnv for Fake {
         Ok(std::mem::replace(&mut self.exists, false))
     }
     fn run_now(&mut self, name: &str) -> anyhow::Result<()> {
+        self.step("run_now");
         self.calls.push(format!("run {name}"));
         Ok(())
     }
@@ -361,6 +404,69 @@ fn off_twice_is_ok() {
     env.said.clear();
     off(&mut env, &alice()).unwrap();
     assert!(env.said().contains("already off"), "{}", env.said());
+}
+
+// the apply lock -----
+
+#[test]
+fn on_holds_the_apply_lock_for_every_step_and_lets_go_at_the_end() {
+    let mut env = Fake::new();
+    on(&mut env, &alice()).unwrap();
+    assert_eq!(env.locks, 1);
+    assert_eq!(*env.unlocked.borrow(), Vec::<&str>::new(), "steps outside the lock");
+    assert!(!env.held.get(), "the lock is let go when on returns");
+}
+
+#[test]
+fn on_lets_go_of_the_apply_lock_when_it_fails_after_taking_it() {
+    let mut env = Fake::new();
+    env.password = None;
+    on(&mut env, &alice()).unwrap_err();
+    assert_eq!(env.locks, 1);
+    assert!(!env.held.get());
+    assert!(env.unlocked.borrow().is_empty(), "{:?}", env.unlocked.borrow());
+}
+
+#[test]
+fn off_holds_the_apply_lock_for_its_step_and_lets_go_at_the_end() {
+    let mut env = Fake::new();
+    off(&mut env, &alice()).unwrap();
+    assert_eq!(env.locks, 1);
+    assert_eq!(*env.unlocked.borrow(), Vec::<&str>::new(), "steps outside the lock");
+    assert!(!env.held.get());
+}
+
+#[test]
+fn a_refusal_before_any_change_takes_no_lock() {
+    let mut not_elevated = Fake::new();
+    not_elevated.elevated = false;
+    on(&mut not_elevated, &alice()).unwrap_err();
+    off(&mut not_elevated, &alice()).unwrap_err();
+    let mut no_terminal = Fake::new();
+    no_terminal.terminal = false;
+    on(&mut no_terminal, &alice()).unwrap_err();
+    let mut not_local = Fake::new();
+    on(
+        &mut not_local,
+        &account("Zoe", "S-1-5-21-9-9-9-1001", AccountKind::NotLocal),
+    )
+    .unwrap_err();
+    assert_eq!(
+        [not_elevated.locks, no_terminal.locks, not_local.locks],
+        [0, 0, 0],
+        "the lock file needs an elevated administrator and a refusal changes nothing"
+    );
+}
+
+#[test]
+fn a_lock_that_cannot_be_taken_stops_on_and_off_before_they_change_anything() {
+    let mut env = Fake::new();
+    env.lock_fails = Some("the install directory is not ours");
+    let on_text = error_text(on(&mut env, &alice()));
+    let off_text = error_text(off(&mut env, &alice()));
+    assert!(on_text.contains("the install directory is not ours"), "{on_text}");
+    assert!(off_text.contains("the install directory is not ours"), "{off_text}");
+    assert!(env.calls.is_empty(), "nothing was asked or changed: {:?}", env.calls);
 }
 
 /// A prompt that answers with a script and records what it is told to show.

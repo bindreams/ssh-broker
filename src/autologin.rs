@@ -35,6 +35,10 @@ pub trait AutoLoginEnv {
     fn is_elevated(&self) -> anyhow::Result<bool>;
     /// Whether there is a terminal to ask for the password on.
     fn has_terminal(&self) -> bool;
+    /// Take the lock that keeps `apply` and these commands from running at once, waiting for
+    /// whoever holds it. The lock is held until the returned value is dropped. Needs the elevation
+    /// that the callers have already proved: the lock file is private to administrators.
+    fn lock_apply(&mut self) -> anyhow::Result<Box<dyn std::any::Any>>;
     /// The installed exe, which the task runs and the messages name.
     fn exe(&self) -> PathBuf;
     /// Whether the install directory is trusted: the task runs the exe in it with a stored credential.
@@ -83,6 +87,9 @@ pub fn on(env: &mut dyn AutoLoginEnv, account: &LocalAccount) -> anyhow::Result<
         account.kind == AccountKind::Local,
         text::not_local(&account.name).trim_end().to_string()
     );
+    // Held to the end: an `apply` in the middle of this would stop or start a session that this is
+    // changing, and one that replaces the exe could do it between the check of it and the task's run.
+    let _apply = env.lock_apply()?;
     env.check_install()?;
 
     let password = env
@@ -145,6 +152,7 @@ pub fn off(env: &mut dyn AutoLoginEnv, account: &LocalAccount) -> anyhow::Result
         env.is_elevated().context("read the token's elevation")?,
         not_elevated("off", &exe)
     );
+    let _apply = env.lock_apply()?;
     if env.delete(&task_name(&account.sid))? {
         env.say(&format!(
             "ssh-broker: auto-login is off for {}. A session that is running continues until {exe} logout.",
@@ -205,6 +213,20 @@ impl AutoLoginEnv for WindowsEnv {
         self.exe_override
             .clone()
             .unwrap_or_else(crate::provision::canonical_exe)
+    }
+
+    fn lock_apply(&mut self) -> anyhow::Result<Box<dyn std::any::Any>> {
+        if self.exe_override.is_some() {
+            return Ok(Box::new(()));
+        }
+        let layout = crate::provision::layout::Layout::production();
+        crate::provision::layout::ensure_base(&layout)
+            .context("ssh-broker: could not prepare the install directory that holds the apply lock")?;
+        let lock = crate::provision::apply_lock::acquire(&layout.apply_lock_path(), || {
+            eprintln!("ssh-broker: an apply or auto-login command is running; waiting for it to finish")
+        })
+        .context("ssh-broker: could not take the apply lock")?;
+        Ok(Box::new(lock))
     }
 
     fn check_install(&self) -> anyhow::Result<()> {

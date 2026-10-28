@@ -30,13 +30,8 @@ impl Layout {
         self.base.join(super::EXE_NAME)
     }
 
-    /// The auto-login tasks a running `apply` has disabled and not yet enabled again; see
-    /// [`super::pending_sessions`].
-    pub fn pending_sessions_path(&self) -> PathBuf {
-        self.base.join("sessions-to-enable.txt")
-    }
-
-    /// The file whose lock lets one `apply` run at a time; see [`super::apply_lock`].
+    /// The file whose lock lets one `apply` (or `auto-login on|off`) run at a time; see
+    /// [`super::apply_lock`].
     pub fn apply_lock_path(&self) -> PathBuf {
         self.base.join("apply.lock")
     }
