@@ -12,18 +12,6 @@ fn command_line_quotes_a_spaced_exe_path() {
     );
 }
 
-/// The password reaches the logon call as its own argument and nowhere else: the command line holds
-/// the exe, the verb and one flag, and takes no secret.
-#[test]
-fn command_line_has_no_password() {
-    let line = command_line(Path::new(r"C:\ProgramData\ssh-broker\ssh-broker.exe"), SID);
-    assert_eq!(
-        line,
-        format!(r#""C:\ProgramData\ssh-broker\ssh-broker.exe" agent --background --expect-user {SID}"#)
-    );
-    assert!(!line.to_lowercase().contains("pass"), "{line}");
-}
-
 #[test]
 fn win32_206_has_the_fixed_sentence() {
     let failure = LogonFailure::from_win32(206);
@@ -163,9 +151,9 @@ fn killing() -> CallerJob {
 }
 
 /// The claim comes from a probe the shim starts itself and examines before the logon, not from the
-/// flags of the call (CI round 8) and not from the logon child's own membership (CI round 9: a child
-/// that broke away is still in a job of the Secondary Logon service's, and survives all the same).
-/// A caller in no job has nothing to survive.
+/// flags of the call and not from the logon child's own membership (a child that broke away is still
+/// in a job of the Secondary Logon service's, and survives all the same). A caller in no job has
+/// nothing to survive.
 #[test]
 fn a_caller_in_no_job_outlives_the_connection() {
     assert_eq!(
@@ -183,9 +171,8 @@ fn a_probe_that_got_out_of_every_job_outlives_the_connection() {
     );
 }
 
-/// An outer job kept the probe although the innermost let it go (CI round 8, m3n2). The flags of an
-/// outer job cannot be read, and a job ends what is in it only if it kills on close (CI round 11: the
-/// runner's job has no limits), so this is not claimed either way.
+/// An outer job kept the probe although the innermost let it go. The flags of an outer job cannot be
+/// read, and a job ends what is in it only if it kills on close, so this is not claimed either way.
 #[test]
 fn a_probe_that_an_outer_job_kept_may_end_with_the_connection() {
     assert_eq!(

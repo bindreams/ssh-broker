@@ -2,9 +2,8 @@
 //!
 //! The agent has several threads that end the process: the `logout` handler once the shells'
 //! output is delivered, the accept loop once it has stopped, and the main thread when the agent
-//! fails. Each of them used to end it on its own (`process::exit` from one, a return from `main`
-//! into the C runtime's `exit` from another), so two could be inside the process's exit at once.
-//! Every end goes through [`end_process`] now, and the first one in is the only one that ends it.
+//! fails. Every end goes through [`end_process`]; the first caller in is the only one that ends the
+//! process, so two threads are never inside the process's exit at once.
 //!
 //! What the agent must keep until the process is gone lives here as well (see [`hold_until_end`]).
 //!

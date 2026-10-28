@@ -88,7 +88,7 @@ fn agent_background_flags_parse() {
 
 #[test]
 fn the_ready_event_flag_is_gone() {
-    // The shim no longer passes a named event; a build that still did would fail loudly.
+    // The shim passes no named event.
     assert_eq!(
         route_line("ssh-broker.exe agent --background --ready-event ev --expect-user S-1-5-18"),
         Route::Usage(Verb::Agent)

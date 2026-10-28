@@ -735,8 +735,8 @@ fn a_read_limit_of_any_length_ends_a_read_that_finds_nothing() {
 
 #[test]
 fn a_wait_for_a_client_that_never_closes_ends_whatever_the_bound() {
-    // Not the 1 us limit: a bound that short has passed before the wait issues a read, so the row
-    // would not exercise the limit. `a_read_limit_of_any_length_*` pins that limit with a read.
+    // The loop skips the 1 us bound: it has passed before the wait issues a read, so that row would not
+    // exercise the wait. `a_read_limit_of_any_length_*` pins that limit with a read.
     for (i, bound) in LIMITS.into_iter().enumerate().skip(1) {
         let waited = against_a_silent_client(&format!("wait-bound-{i}"), |rx| wait_for_close_within(rx, bound));
         assert_eq!(waited, Waited::Abandoned, "{bound:?}");

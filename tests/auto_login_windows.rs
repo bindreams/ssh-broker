@@ -336,8 +336,8 @@ fn sessions_without_a_process(account: &Account, logged_off: &BTreeSet<u64>) -> 
         .collect()
 }
 
-/// Elevated (CI only). A measurement of a possible defect (CI round 20: Windows kept the Batch logon session
-/// of two Task Scheduler starts although no process of it was left). One account, auto-login on, the
+/// Elevated (CI only). A measurement of a possible defect (Windows can keep the Batch logon session
+/// of a Task Scheduler start although no process of it is left). One account, auto-login on, the
 /// session started by the task and ended with the product's `logout`, [`CYCLES`] times. After each cycle
 /// the account's logon sessions that LSA lists and that have no process left are counted; the count must not
 /// grow from the first cycle to the last, or sessions pile up.

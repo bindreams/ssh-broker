@@ -19,7 +19,7 @@ pub enum SessionKind {
     ExecOrNoTerminal,
 }
 
-/// Whether the account can be signed on from a password (local accounts only, ssh-broker#45).
+/// Whether the account can be signed on from a password (local accounts only).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AccountKind {
     Local,

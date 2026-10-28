@@ -150,7 +150,7 @@ jobs:
 
       # The `m3_` tests measure what a caller's jobs do to the logon child (`logon::probe`), so the test
       # process must be in no job. nextest and cargo each put what they run in one, and so does the runner
-      # for a step (a job with no limits, CI round 11). Task Scheduler starts a task outside all of them, so
+      # for a step (a job with no limits). Task Scheduler starts a task outside all of them, so
       # the test binary runs as a one-shot task of SYSTEM with its output in a file that this step prints.
       # Each case asserts at its start that it is in no job. The filter `m3_` is a substring match and the one
       # in `.config/nextest.toml` that leaves them out of the step above (`/^m3_/`) is anchored, so the step

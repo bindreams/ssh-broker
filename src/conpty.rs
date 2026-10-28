@@ -250,7 +250,7 @@ impl PtySession {
     }
 
     /// Hand the pseudoconsole's raw handle to the caller, who then owns closing it (via
-    /// [`close_pty_raw`]); `PtySession`'s own Drop no longer closes it. Used by the agent
+    /// [`close_pty_raw`]); `PtySession`'s Drop does not close it. Used by the agent
     /// so the HPCON can be shared (behind a mutex) between the resize and teardown paths.
     pub fn take_hpc_raw(&mut self) -> isize {
         match self.hpc.take() {

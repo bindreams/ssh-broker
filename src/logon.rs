@@ -90,16 +90,15 @@ impl ChildJob {
 
 /// What the session gets from the probe (see [`probe`]) for a caller in `job`. The caller's job flags
 /// do not say where the child lands: a job that allows breakaway can sit inside one that keeps the
-/// child (CI round 8), and Windows answers the flagged call without refusing it. The logon child does
-/// not say either: it is in a job of the Secondary Logon service's even when it outlives its caller's
-/// (CI round 9).
+/// child, and Windows answers the flagged call without refusing it. The logon child does not say
+/// either: it is in a job of the Secondary Logon service's even when it outlives its caller's.
 ///
 /// `kept_breakaway` is whether the logon call itself asked for breakaway and was not refused. The
 /// probe always asks, so what it found describes the child only if the call did too; if not, the
 /// child is in the caller's job whatever the probe got out of, and only the innermost job's flags
 /// are known.
 ///
-/// A job ends what is in it only if it kills on close, or its owner ends it (CI round 11: the job of a
+/// A job ends what is in it only if it kills on close, or its owner ends it (the job of a
 /// GitHub runner step has no limits). The flags of the innermost job are readable and the probe is
 /// all that is known of the outer ones, so:
 /// - the caller is in no job, or the call kept breakaway and nothing kept the probe: it outlives;

@@ -1,11 +1,11 @@
 //! What the system says about a test account's registry hive, and where measurements are recorded.
 //! **CI only.**
 //!
-//! In CI round 16 the hive of a profile (`HKEY_USERS\<sid>` and `_Classes`) stayed loaded 120 s after
-//! the account's processes ended, with no process handle on it and no logon session of the account (bar one
-//! Batch session). The profile service decides when a hive unloads, from the reference count in
-//! `ProfileList\<sid>`; [`profile_list`] prints it. Unloading the hive by hand was tried in round 17 and
-//! refused (`RegUnLoadKey`: access denied, with the backup and restore privileges enabled).
+//! The hive of a profile (`HKEY_USERS\<sid>` and `_Classes`) can stay loaded 120 s after the account's
+//! processes ended, with no process handle on it and no logon session of the account (bar one Batch
+//! session). The profile service decides when a hive unloads, from the reference count in
+//! `ProfileList\<sid>`; [`profile_list`] prints it. `RegUnLoadKey` by hand is refused (access denied, even
+//! with backup/restore privileges), so a test cannot unload it.
 //!
 //! A teardown hides a passing test's output, so a measurement is also written to a file that CI prints
 //! ([`record`]).

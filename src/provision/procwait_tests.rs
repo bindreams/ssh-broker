@@ -616,7 +616,7 @@ fn a_process_whose_token_is_refused_is_none_of_the_users() {
 
 #[test]
 fn a_process_whose_image_is_refused_because_it_is_ending_is_skipped_not_fatal() {
-    // CI round 15: the image read of a process that other tests were ending failed the whole scan.
+    // The image read of a process that is being ended fails; that must not fail the whole scan.
     let ending = Made {
         image: Err(Fail::Ending),
         ..made(10)
@@ -626,7 +626,7 @@ fn a_process_whose_image_is_refused_because_it_is_ending_is_skipped_not_fatal() 
 
 #[test]
 fn a_process_the_kernel_says_is_ending_is_none_of_the_users_though_every_read_of_it_succeeds() {
-    // CI round 21: a process held in its exit is readable, not signalled, and refuses TerminateProcess.
+    // A process held in its exit is readable, not signalled, and refuses TerminateProcess.
     let held = Made {
         ending: true,
         ..made(10)
@@ -730,8 +730,8 @@ fn this_process_and_processes_of_other_names_are_not_looked_at() {
 
 #[test]
 fn the_scan_looks_for_the_file_name_of_the_image_it_is_given_not_for_the_installed_name() {
-    // CI round 18: the tests run a copy of the exe under another name, and the scan, which looked at
-    // `ssh-broker.exe` only, found none of its agents.
+    // The tests run a copy of the exe under another name; a scan for `ssh-broker.exe` only would find
+    // none of its agents.
     let names = vec![
         (10, "stand_in.exe".to_owned()),
         (20, crate::provision::EXE_NAME.to_owned()),
@@ -809,8 +809,8 @@ fn the_scan_for_background_agents_finds_background_agents_and_not_other_roles() 
 
 #[test]
 fn an_ending_process_of_another_name_is_not_a_background_agent() {
-    // CI round 19 review: any process that was mid-exit when `apply` ran (a browser's child, a build
-    // tool) had an unreadable image, and was classed an agent that `apply` then waited for.
+    // A process mid-exit (a browser's child, a build tool) has an unreadable image; it must not be
+    // classed an agent that `apply` then waits for.
     let (found, asked) =
         background_scanned(&[(10, "chrome.exe"), (20, OURS)], &[ending_image(10), made(20)], &[10]).unwrap();
     assert_eq!(found, [20]);

@@ -118,7 +118,7 @@ const IS_PROCESS_DELETING: u32 = 1 << 2;
 /// thread has left; in that time `TerminateProcess` is refused with access denied
 /// (`STATUS_PROCESS_IS_TERMINATING`), and which other queries refuse it too depends on how far the exit
 /// has got. A process held in its exit by a debugger answers the reads of its image and command line,
-/// and refuses `TerminateProcess` (CI round 21). No document says which query tells it, so each is
+/// and refuses `TerminateProcess`. No document says which query tells it, so each is
 /// kept. In `procwait_ending_tests.rs` the assertions of the first test show them for a held process and
 /// a running one, those of the third for the held process only, and the second test's show none.
 #[derive(Debug, Clone, Copy)]

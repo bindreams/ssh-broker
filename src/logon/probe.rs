@@ -1,9 +1,9 @@
 //! The probe: what a breakaway from the caller's jobs gets a new process, found out before the logon.
 //!
 //! The logon child cannot be asked. It is in some job of the Secondary Logon service's whatever
-//! happens (CI round 9: a child that outlived its caller's jobs was still `InJob`), and the flags of
-//! the call say what was asked, not what Windows did (CI round 8: an outer job kept a child the
-//! innermost one let go). So the shim starts a process of its own, with the flags the logon would use,
+//! happens (a child that outlives its caller's jobs is still `InJob`), and the flags of the call say
+//! what was asked, not what Windows did (an outer job can keep a child the innermost one let go).
+//! So the shim starts a process of its own, with the flags the logon would use,
 //! and reads where it landed. The probe is suspended for its whole life and never runs a line of code.
 
 use std::mem::size_of;

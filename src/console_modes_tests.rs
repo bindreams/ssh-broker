@@ -38,18 +38,8 @@ impl super::ConsoleOps for FailSecondSetMode {
     }
 }
 
-/// Regression test for the exact bug this diff fixes: a late `set_mode` failure must still roll
-/// back whatever mode was already changed, and must NOT attempt to restore a Ctrl-handler
-/// suppression it never actually applied.
-///
-/// Before the fix, `ConsoleModes::enter` applied both `SetConsoleMode` calls and only
-/// constructed the guard on full success — so a failure on the SECOND call left the FIRST
-/// change (stdin set to raw mode) live, with no guard ever having existed to undo it: stdin was
-/// left raw — no echo, no line input — for the rest of the session. This can't be reproduced
-/// through a real console (there is no portable way to make the second of two back-to-back
-/// `SetConsoleMode` calls fail while the first succeeds), so this test drives the exact same
-/// sequence through a fake `ConsoleOps` instead, which is deterministic and needs no console at
-/// all — this is why `ConsoleModesState` is generic over `ConsoleOps` in the first place.
+/// `enter` must undo the first `SetConsoleMode` change when the second fails, else stdin stays raw (no
+/// echo, no line input).
 #[test]
 fn enter_rolls_back_only_what_it_actually_changed_on_partial_failure() {
     use windows::Win32::Foundation::HANDLE;

@@ -17,6 +17,11 @@
 //!   own `SocketWatch`, and writes `shim.result` (the file appearing is the "reported" signal); what
 //!   the logon logs goes to `shim.log`. With
 //!   `shim.hold` present it then blocks until it is killed.
+//!
+//! The `shim` and `agent` roles do only what the logon-call tests need of the production shim and agent;
+//! they are not those programs. The tests that use them cover `logon` and `SocketWatch`. The production
+//! shim's own flow (the prompt, the wait for a starting agent, the fallbacks) is covered only by
+//! `tests/prompt_path_windows.rs`.
 
 #[cfg(windows)]
 mod windows;

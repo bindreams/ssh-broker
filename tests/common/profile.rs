@@ -3,13 +3,13 @@
 //! Included by `account.rs`. A profile is deleted by `DeleteProfileW`, which answers
 //! `ERROR_SHARING_VIOLATION` while the account's registry hive is loaded. After a secondary logon the hive
 //! is unloaded by the system, after the last process of the account has exited and the last handle on one
-//! of its tokens is closed, and that happens a moment after the exit (CI round 14: most profiles stayed).
+//! of its tokens is closed, and that happens a moment after the exit.
 //! So [`remove`] retries the delete until it succeeds, woken by a change of the subkeys of `HKEY_USERS` (a
 //! hive being unloaded is one), and a profile that stays loaded fails the test.
 //!
 //! After a Task Scheduler or sshd logon Windows keeps the hive loaded for as long as it was measured (40
-//! min; an sshd restart does not release it; CI rounds 19 and 20), as it does for a user who logged in at
-//! the console. Owner, 2026-10-27: that is Windows' behaviour and not a defect. [`remove_or_clear`] is for
+//! min; an sshd restart does not release it), as it does for a user who logged in at the console. That
+//! is Windows' behaviour and not a defect. [`remove_or_clear`] is for
 //! those accounts: it deletes the profile when Windows allows it, and otherwise deletes what can be deleted
 //! of the profile folder (the hive's files stay), so that the disk does not fill.
 #![allow(dead_code)]

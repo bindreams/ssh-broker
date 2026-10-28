@@ -2,7 +2,7 @@
 //!
 //! The shim learns that an agent it started (or one that is starting) is ready from the file
 //! system, under its own token. It uses no named kernel object: a network-logon token in session 2
-//! is refused every named event (measured, CI round 4), so nothing the shim needs may depend on the
+//! is refused every named event (measured), so nothing the shim needs may depend on the
 //! object namespace.
 //!
 //! What is watched depends on how far the user's profile has got:

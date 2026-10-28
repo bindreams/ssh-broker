@@ -5,8 +5,7 @@
 //! ssh-broker controls: its agents ended, every process of their logon sessions exited (also those
 //! started after `logout` was asked, such as the `logout` client), and `logout` exited 0. It does not
 //! ask Windows to unload the account's hive or to delete its profile: Windows keeps the hive of a Task
-//! Scheduler or sshd logon loaded (CI rounds 19 and 20), as it does for a user who logged in at the
-//! console (owner, 2026-10-27). Killing the account's processes (`Account::drop`) is the
+//! Scheduler or sshd logon loaded, as it does for a user who logged in at the console. Killing the account's processes (`Account::drop`) is the
 //! fallback, and every use of it is recorded.
 //!
 //! The logoff of a session (Security 4634) is waited for. It comes for a secondary-logon session and for
@@ -265,7 +264,7 @@ fn try_end(
         return Ok(Some(Ended { logged_off }));
     }
     match how {
-        // Windows keeps some Batch sessions of Task Scheduler with no process left (CI round 20). Whether
+        // Windows keeps some Batch sessions of Task Scheduler with no process left. Whether
         // they pile up is measured by `tests/auto_login_windows.rs`; here it is recorded.
         ServiceLogon::TaskScheduler => {
             steps.push(format!(

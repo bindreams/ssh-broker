@@ -92,21 +92,12 @@ pub fn run_on(exec: Option<RawExec>, detect: impl FnOnce() -> Encoding) -> anyho
             tracing::warn!("shim relay setup failed: {e:?}; falling back to a local shell");
         }
     }
-    // Fail open. An EXEC command runs through the contained passthrough, NOT a shell: `pwsh
-    // -Command` reinterprets quoting, and an `sftp` session on a box with no interactive session
-    // to relay into lands exactly here — a shell would mangle its binary stream. That also matches
-    // the relay path, itself a bare `CreateProcessW`, so fail-open and relay no longer disagree
-    // about whether a command gets shell semantics. An interactive session carries no command, so
-    // it gets a plain `pwsh` instead — but through the SAME contained passthrough, not a separate
-    // uncontained spawn: see `run_local_passthrough` for why that used to be a real containment
-    // gap, not just an inaccurate claim in prose. `decide_fail_open` is where the exec/interactive
-    // choice is made and tested, and `fail_open_command` maps it to the single spawn below — ONE
-    // call site, so neither arm can regain shell semantics or lose containment on its own.
+    // Fail open. An EXEC command runs through the contained passthrough, not a shell, which would mangle
+    // sftp's binary stream; an interactive session gets plain `pwsh` through the same path. One spawn
+    // site (`fail_open_command`, pinned by tests) keeps both arms contained.
     //
-    // The log guard deliberately stays ALIVE until each exit. Dropping it here (as this once did)
-    // shuts the `tracing-appender` worker down, and its lossy writer then silently discards every
-    // later line — so the `tracing::error!` below, the only PTY-mode diagnostic for a failed
-    // fallback, went nowhere at all.
+    // The log guard stays alive until each exit: dropping it here stops the `tracing-appender` worker,
+    // whose lossy writer then discards every later line, including the `tracing::error!` below.
     let decision = decide_fail_open(exec);
     let command = fail_open_command(&decision);
     match run_local_passthrough(command) {

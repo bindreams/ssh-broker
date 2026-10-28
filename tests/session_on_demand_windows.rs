@@ -59,6 +59,7 @@ fn account_of(account: &Account) -> LocalAccount {
 // Account identity ---------------------------------------------------------------------------
 
 /// Elevated (CI only).
+/// Covers `userdir::profile_dir_of_token`.
 #[test]
 fn profile_dir_of_token_reports_no_profile_for_an_account_that_never_logged_on() {
     let _machine = machine::shared();
@@ -72,6 +73,7 @@ fn profile_dir_of_token_reports_no_profile_for_an_account_that_never_logged_on()
 }
 
 /// Elevated (CI only).
+/// Covers `account::account_named`.
 #[test]
 fn account_named_resolves_a_fixture_account_with_a_space_in_its_name() {
     let _machine = machine::shared();
@@ -84,6 +86,7 @@ fn account_named_resolves_a_fixture_account_with_a_space_in_its_name() {
 }
 
 /// Elevated (CI only).
+/// Covers `account::is_elevated`.
 #[test]
 fn is_elevated_is_true_for_the_ci_token() {
     let _machine = machine::shared();
@@ -96,7 +99,9 @@ fn is_elevated_is_true_for_the_ci_token() {
 /// Elevated (CI only). The sshd shape: the shim is a network-logon token of a standard account in a
 /// kill-on-close job. It starts the agent through the logon and learns that the agent serves from
 /// the files it writes (the product's own `SocketWatch`), under that token; no named kernel object
-/// is involved, because that token is refused every one (CI round 4).
+/// is involved, because that token is refused every one.
+/// Covers `logon::start_background_agent` and `SocketWatch` with the stand-in shim; the production
+/// shim's own flow is covered only by `prompt_path_windows.rs`.
 #[test]
 fn a_network_token_shim_sees_the_agent_it_starts() {
     let _machine = machine::shared();
@@ -113,6 +118,8 @@ fn a_network_token_shim_sees_the_agent_it_starts() {
 
 /// Elevated (CI only). An administrator's shim runs at High integrity and the agent at Medium; the
 /// shim still learns that the agent serves from the files it writes.
+/// Covers `logon::start_background_agent` and `SocketWatch` with the stand-in shim; the production
+/// shim's own flow is covered only by `prompt_path_windows.rs`.
 #[test]
 fn an_administrators_shim_sees_the_agent_it_starts() {
     let _machine = machine::shared();
@@ -178,8 +185,8 @@ fn logon_child_after_the_callers_jobs_close(tag: &str, mut jobs: Vec<KillOnClose
     // The stand-in agent, once it is up, waits for the file `agent.go` and then writes `agent.ack`.
     std::fs::write(kit.path("agent.plan"), "").unwrap();
 
-    // Started the way sshd starts a shell, so the shim's chain is the case's jobs and no more (CI round 12:
-    // the Secondary Logon service adds a job of its own to what it starts).
+    // Started the way sshd starts a shell, so the shim's chain is the case's jobs and no more (the
+    // Secondary Logon service adds a job of its own to what it starts).
     let shim = start_shim_as_service(&kit, &account, true, |shim| {
         // Suspended, before any job: the shim is in none, so the jobs assigned next are its whole chain.
         assert_eq!(
@@ -351,6 +358,8 @@ impl M3Run {
 /// child stays in the job and ends with it, and the logon reports that the session does not outlive
 /// the connection (the prompt path says so to the user). The job kills on close, so the claim is
 /// `EndsWithConnection` and is compared with the fate.
+/// Covers `logon::probe` and the survival claim of `logon::start_background_agent` with the stand-in
+/// shim; what the production shim tells the user about it is not covered here.
 #[test]
 fn m3_child_in_a_job_that_forbids_breakaway_ends_with_the_job_and_the_logon_says_so() {
     let run = logon_child_after_the_callers_jobs_close("m3a", vec![KillOnCloseJob::create()]);
@@ -359,6 +368,8 @@ fn m3_child_in_a_job_that_forbids_breakaway_ends_with_the_job_and_the_logon_says
 
 /// Elevated (CI only). M3: where the caller's job allows breakaway the product asks for it, and the
 /// logon child outlives the job.
+/// Covers `logon::probe` and the survival claim of `logon::start_background_agent` with the stand-in
+/// shim; what the production shim tells the user about it is not covered here.
 #[test]
 fn m3_child_survives_the_callers_job_closing_where_breakaway_is_allowed() {
     let run = logon_child_after_the_callers_jobs_close("m3b", vec![KillOnCloseJob::create_allowing_breakaway()]);
@@ -380,6 +391,8 @@ fn nested_jobs(outer_allows: bool, inner_allows: bool) -> Vec<KillOnCloseJob> {
 
 /// Elevated (CI only). Every job of the chain allows breakaway: the product asks for it and the logon
 /// child outlives the chain.
+/// Covers `logon::probe` and the survival claim of `logon::start_background_agent` with the stand-in
+/// shim; what the production shim tells the user about it is not covered here.
 #[test]
 fn m3_child_survives_nested_jobs_that_all_allow_breakaway() {
     let run = logon_child_after_the_callers_jobs_close("m3n1", nested_jobs(true, true));
@@ -387,9 +400,11 @@ fn m3_child_survives_nested_jobs_that_all_allow_breakaway() {
 }
 
 /// Elevated (CI only). The innermost job allows breakaway and an outer one does not. Whether Windows
-/// refuses the flagged call, and where the child ends up, is what this measures (CI round 8: it does not
-/// refuse). The logon must succeed; the probe stays in the outer job, whose flags cannot be read, so the
-/// claim is `MayEndWithConnection` and the fate is printed, not compared.
+/// refuses the flagged call, and where the child ends up, is what this measures (it does not refuse).
+/// The logon must succeed; the probe stays in the outer job, whose flags cannot be read, so the claim is
+/// `MayEndWithConnection` and the fate is printed, not compared.
+/// Covers `logon::probe` and the survival claim of `logon::start_background_agent` with the stand-in
+/// shim; what the production shim tells the user about it is not covered here.
 #[test]
 fn m3_logon_succeeds_when_an_outer_job_forbids_the_breakaway_the_inner_one_allows() {
     let run = logon_child_after_the_callers_jobs_close("m3n2", nested_jobs(false, true));
@@ -398,6 +413,8 @@ fn m3_logon_succeeds_when_an_outer_job_forbids_the_breakaway_the_inner_one_allow
 
 /// Elevated (CI only). The innermost job forbids breakaway and an outer one allows it: the product
 /// asks for none, the logon succeeds, and the child ends with the chain.
+/// Covers `logon::probe` and the survival claim of `logon::start_background_agent` with the stand-in
+/// shim; what the production shim tells the user about it is not covered here.
 #[test]
 fn m3_logon_succeeds_when_the_inner_job_forbids_breakaway_and_an_outer_one_allows_it() {
     let run = logon_child_after_the_callers_jobs_close("m3n3", nested_jobs(true, false));
@@ -407,6 +424,8 @@ fn m3_logon_succeeds_when_the_inner_job_forbids_breakaway_and_an_outer_one_allow
 /// Elevated (CI only). M3: the caller is in no job at all (sshd, started the way a service starts a shell,
 /// with nothing between). Nothing holds the logon child, so the logon sees no job, starts no probe, and
 /// claims `OutlivesConnection`; the shim is ended and the child outlives it.
+/// Covers `logon::probe` and the survival claim of `logon::start_background_agent` with the stand-in
+/// shim; what the production shim tells the user about it is not covered here.
 #[test]
 fn m3_child_survives_a_caller_that_is_in_no_job() {
     let run = logon_child_after_the_callers_jobs_close("m3o", Vec::new());
@@ -421,6 +440,7 @@ fn m3_child_survives_a_caller_that_is_in_no_job() {
 /// Elevated (CI only). A wrong password in a chain that refuses breakaway is answered `1326` and not
 /// access denied: the refusal comes after Windows has checked the password, so the product's one
 /// fallback on access denied never tries a wrong password twice.
+/// Covers the fallback of `logon::start_background_agent` on access denied.
 #[test]
 fn a_wrong_password_in_a_job_chain_is_answered_with_a_logon_failure() {
     let _machine = machine::shared();
@@ -446,6 +466,8 @@ fn a_wrong_password_in_a_job_chain_is_answered_with_a_logon_failure() {
 /// Elevated (CI only). M7: with `seclogon` stopped (demand start) the call either starts the service
 /// and succeeds, or fails with Windows' reason; either way the outcome is whole and the service is
 /// put back.
+/// Covers `logon::start_background_agent`'s answer; the shim's prompt and fallbacks around it are
+/// covered only by `prompt_path_windows.rs`.
 #[test]
 fn logon_with_seclogon_stopped_returns_windows_reason() {
     let _machine = machine::exclusive();
@@ -464,6 +486,8 @@ fn logon_with_seclogon_stopped_returns_windows_reason() {
 
 /// Elevated (CI only). M7: with `seclogon` disabled nothing can start it, so the call fails, and
 /// the failure carries Windows' sentence.
+/// Covers `logon::start_background_agent`'s answer; the shim's prompt and fallbacks around it are
+/// covered only by `prompt_path_windows.rs`.
 #[test]
 fn logon_with_seclogon_disabled_returns_windows_reason() {
     let _machine = machine::exclusive();
@@ -478,6 +502,8 @@ fn logon_with_seclogon_disabled_returns_windows_reason() {
 }
 
 /// Elevated (CI only).
+/// Covers `logon::start_background_agent`'s answer; the shim's prompt and fallbacks around it are
+/// covered only by `prompt_path_windows.rs`.
 #[test]
 fn wrong_password_returns_windows_reason() {
     let _machine = machine::shared();
@@ -492,6 +518,8 @@ fn wrong_password_returns_windows_reason() {
 }
 
 /// Elevated (CI only).
+/// Covers `logon::start_background_agent`'s answer; the shim's prompt and fallbacks around it are
+/// covered only by `prompt_path_windows.rs`.
 #[test]
 fn disabled_account_returns_reason() {
     let _machine = machine::shared();
@@ -506,6 +534,8 @@ fn disabled_account_returns_reason() {
 }
 
 /// Elevated (CI only). The stand-in child needs no console; the account name holds a space.
+/// Covers `logon::start_background_agent` and `stand_in::wait_for_serving_marker` for an account name
+/// with a space.
 #[test]
 fn logon_as_account_with_space_in_name() {
     let _machine = machine::shared();
@@ -530,6 +560,7 @@ fn logon_as_account_with_space_in_name() {
 /// Elevated (CI only). Spike M4: a second agent of the same user in the same session never binds and
 /// leaves (the `SessionSlot`), so no competing agent serves. Both are the real agent, started as one
 /// account's network token; the wait for the second is on its exit.
+/// Covers the real agent's `SessionSlot`.
 #[test]
 fn second_agent_in_the_same_session_leaves_without_binding() {
     let _machine = machine::shared();
@@ -560,6 +591,8 @@ fn logout_command(kit: &Kit) -> String {
 
 /// Elevated (CI only). The client of `logout` is a child of the shell the agent hosts: the agent
 /// must not end that tree before the client has shown the reply.
+/// Covers the real agent's `logout` handler; the shim's reconnect after the end is covered only by
+/// `prompt_path_windows.rs` (`login_after_logout_prompts_again`).
 #[test]
 fn logout_message_reaches_a_pty_client_running_inside_the_agent() {
     let _machine = machine::shared();
@@ -581,6 +614,7 @@ fn logout_message_reaches_a_pty_client_running_inside_the_agent() {
 
 /// Elevated (CI only). The exec relay runs `logout` in the agent: its stderr and its exit code (0)
 /// come back to the shim.
+/// Covers the real agent's `logout` handler on the exec relay.
 #[test]
 fn logout_exit_code_reaches_an_exec_client_inside_the_agent() {
     let _machine = machine::shared();
@@ -612,6 +646,7 @@ fn logout_from_inside(kit: &Kit, agent: &BackgroundAgent) -> agent_conn::Finishe
 /// Elevated (CI only). Every process holding the account's logon session ends because of `logout`:
 /// the test lists them first and then waits on their handles, so a `logout` that ends fewer is a
 /// failure of the job, not a pass by timing.
+/// Covers the real agent's `logout` handler.
 #[test]
 fn logout_ends_every_process_of_the_logon_session() {
     let _machine = machine::shared();
@@ -660,6 +695,7 @@ fn logout_ends_every_process_of_the_logon_session() {
 /// the last token handle closes. So this waits for the event Windows writes when it destroys a
 /// session, Security 4634 for this logon id, subscribed before `logout` runs. If it does not come
 /// within the bound, that is M6's measured result, reported as such.
+/// Covers the real agent's `logout` handler.
 #[test]
 fn logon_session_is_logged_off_after_logout() {
     let _machine = machine::shared();
@@ -695,9 +731,9 @@ fn logon_session_is_logged_off_after_logout() {
         "M6: logon session {id:#x} still present: no 4634 although every process of it has ended"
     );
 
-    // The product's own end of a secondary-logon session leaves nothing that keeps the profile loaded (CI round
-    // 17 measured it; Windows does keep the hive of a Task Scheduler or sshd logon, which `session_end` does not
-    // ask to unload). The line goes to the measurement file CI prints, pass or fail.
+    // The product's own end of a secondary-logon session leaves nothing that keeps the profile loaded
+    // (Windows does keep the hive of a Task Scheduler or sshd logon, which `session_end` does not ask to
+    // unload). The line goes to the measurement file CI prints, pass or fail.
     let unloaded = account_fixture::profile::wait_unloaded(&account.sid_text);
     account_fixture::hive::record(&format!(
         "after the product's logout and the logoff of session {id:#x}, {} ({}): hive {}; ProfileList {}",
