@@ -1,13 +1,13 @@
 //! console_prompt: the password prompt on the real console, and why the shim has no agent.
 //!
 //! The console is already in the raw mode the relay uses (`console_modes`), so nothing is echoed and
-//! Ctrl+C arrives as a key. Records are read one batch at a time and fed to `PasswordEntry` (`batch`),
-//! which wipes every record once it is fed.
+//! Ctrl+C arrives as a key. Records are peeked one batch at a time and fed to `PasswordEntry`
+//! (`batch`); only the records fed are taken from the console's queue, and every copy is wiped.
 
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::System::Console::{
-    GetConsoleMode, GetStdHandle, ReadConsoleInputW, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, WriteConsoleInputW,
-    WriteConsoleW,
+    GetConsoleMode, GetStdHandle, INPUT_RECORD, PeekConsoleInputW, ReadConsoleInputW, STD_INPUT_HANDLE,
+    STD_OUTPUT_HANDLE, WriteConsoleW,
 };
 
 use crate::console_modes::ConsoleModes;
@@ -17,7 +17,7 @@ use crate::socket_loc::SocketLocation;
 use crate::userdir::NoProfile;
 
 mod batch;
-use batch::Batch;
+use batch::{Batch, InputQueue};
 
 /// Whether stdin and stdout are both a console: the precondition for a prompt. A session without
 /// one is a login without a terminal and is never prompted, nor is its console mode touched.
@@ -34,8 +34,7 @@ pub fn console_available() -> bool {
 
 /// The raw console, and the password being typed into it.
 pub struct ConsolePrompt {
-    // Before `modes`, so that the typed-ahead input goes back before the console modes are restored.
-    type_ahead: TypeAhead,
+    batch: Batch,
     modes: ConsoleModes,
     entry: PasswordEntry,
 }
@@ -48,21 +47,16 @@ impl ConsolePrompt {
             return Ok(None);
         }
         Ok(Some(ConsolePrompt {
-            type_ahead: TypeAhead {
-                batch: Batch::new(),
-                stdin: modes.stdin,
-            },
+            batch: Batch::new(),
             modes,
             entry: PasswordEntry::new(),
         }))
     }
 
     /// Hand the raw console on, for the relay that follows a successful logon. Input typed ahead of
-    /// the prompt's end is back in the console's buffer by then, for the relay to read.
+    /// the prompt's end was never taken from the console's queue, so the relay reads it in order.
     pub(crate) fn into_modes(self) -> ConsoleModes {
-        let ConsolePrompt { type_ahead, modes, .. } = self;
-        drop(type_ahead);
-        modes
+        self.modes
     }
 
     /// Write `text` to the console (VT, CRLF line ends). It goes as UTF-16: raw UTF-8 bytes are read
@@ -82,50 +76,32 @@ impl ConsolePrompt {
         }
     }
 
-    /// Block until one entry step finishes: a submitted password, an empty Enter, or a cancel. Records
-    /// read after the finishing one are kept: the next step starts with them, and once the prompt is
-    /// over they go back into the console for its next reader.
+    /// Block until one entry step finishes: a submitted password, an empty Enter, or a cancel. Of
+    /// the console's input only the records up to the finishing one are taken: the rest stays queued
+    /// for the next step or, once the prompt is over, for the relay.
     /// The error is the console input's failure (the SSH side is gone).
     pub fn read_step(&mut self) -> Result<Step, windows::core::Error> {
-        let stdin: HANDLE = self.modes.stdin;
-        loop {
-            if let Some(step) = self.type_ahead.batch.step(&mut self.entry) {
-                return Ok(step);
-            }
-            self.type_ahead.batch.fill(|records| {
-                let mut count = 0u32;
-                // SAFETY: `records` and `count` are valid for the call.
-                unsafe { ReadConsoleInputW(stdin, records, &mut count) }?;
-                Ok(count)
-            })?;
-        }
+        let mut console = ConsoleInput(self.modes.stdin);
+        self.batch.step(&mut console, &mut self.entry)
     }
 }
 
-/// The records read and not yet fed to the entry. Dropping it puts them back into the console.
-struct TypeAhead {
-    batch: Batch,
-    stdin: HANDLE,
-}
+/// The real console's input queue.
+struct ConsoleInput(HANDLE);
 
-impl Drop for TypeAhead {
-    fn drop(&mut self) {
-        let stdin = self.stdin;
-        self.batch.give_back(|mut rest| {
-            while !rest.is_empty() {
-                let mut written = 0u32;
-                // SAFETY: `rest` and `written` are valid for the call; `stdin` is the console's input.
-                if let Err(e) = unsafe { WriteConsoleInputW(stdin, rest, &mut written) } {
-                    tracing::warn!("could not put the typed-ahead input back into the console: {e}");
-                    return;
-                }
-                if written == 0 {
-                    tracing::warn!("the console took none of the typed-ahead input put back");
-                    return;
-                }
-                rest = &rest[written as usize..];
-            }
-        });
+impl InputQueue for ConsoleInput {
+    fn peek(&mut self, records: &mut [INPUT_RECORD]) -> windows::core::Result<u32> {
+        let mut count = 0u32;
+        // SAFETY: `records` and `count` are valid for the call; the handle is the console's input.
+        unsafe { PeekConsoleInputW(self.0, records, &mut count) }?;
+        Ok(count)
+    }
+
+    fn read(&mut self, records: &mut [INPUT_RECORD]) -> windows::core::Result<u32> {
+        let mut count = 0u32;
+        // SAFETY: `records` and `count` are valid for the call; the handle is the console's input.
+        unsafe { ReadConsoleInputW(self.0, records, &mut count) }?;
+        Ok(count)
     }
 }
 

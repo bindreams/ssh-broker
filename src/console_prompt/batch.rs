@@ -1,9 +1,10 @@
-//! The console records the prompt has read and not yet fed to `PasswordEntry`.
+//! Reading the console's input records into `PasswordEntry`, without taking any it does not feed.
 //!
-//! A read returns up to `BATCH` records, and an entry step can finish in the middle of one: a paste
-//! of "\rSecret1\r" is an empty Enter, then a password. The records after the finishing one stay here,
-//! for the next step or, once the prompt is over, to be put back into the console for whoever reads it
-//! next. Every record is overwritten once consumed and when the batch is dropped.
+//! A step peeks at the head of the console queue, feeds the records to the entry in turn, and then
+//! removes from the queue exactly the records it fed, up to and including the one that finished the
+//! step. The rest (a paste's remainder, input typed while the agent starts) keeps its place for the
+//! next step and, once the prompt is over, for the relay. Every buffer that held records is
+//! overwritten before the step returns.
 
 use windows::Win32::System::Console::INPUT_RECORD;
 use zeroize::Zeroize;
@@ -11,55 +12,68 @@ use zeroize::Zeroize;
 use crate::password_entry::{PasswordEntry, Step};
 use crate::vtinput::KeyEvent;
 
-/// Records one read takes.
-const BATCH: usize = 32;
+/// Records one peek takes.
+pub(super) const BATCH: usize = 32;
 
 /// `INPUT_RECORD.EventType` of a key record.
 const EVT_KEY: u16 = 0x0001;
 
+/// The console's input queue.
+pub(super) trait InputQueue {
+    /// Copy up to `records.len()` records from the head of the queue, leaving them there. Returns
+    /// how many; 0 if the queue is empty.
+    fn peek(&mut self, records: &mut [INPUT_RECORD]) -> windows::core::Result<u32>;
+
+    /// Remove up to `records.len()` records from the head of the queue into `records`, waiting for
+    /// at least one. Returns how many.
+    fn read(&mut self, records: &mut [INPUT_RECORD]) -> windows::core::Result<u32>;
+}
+
 pub(super) struct Batch {
     records: [INPUT_RECORD; BATCH],
-    /// The first record not yet fed; the records before it are zeroed.
-    next: usize,
-    len: usize,
 }
 
 impl Batch {
     pub fn new() -> Self {
         Batch {
-            // SAFETY: `INPUT_RECORD` is plain data; all-zero bytes are a valid value.
-            records: unsafe { std::mem::zeroed() },
-            next: 0,
-            len: 0,
+            records: [zeroed_record(); BATCH],
         }
     }
 
-    /// Replace the batch, which must be fed to its end, with the records `read` fills in and counts.
-    pub fn fill(
-        &mut self,
-        read: impl FnOnce(&mut [INPUT_RECORD]) -> windows::core::Result<u32>,
-    ) -> windows::core::Result<()> {
-        debug_assert!(self.next == self.len, "records not yet fed would be lost");
+    /// Block until one entry step finishes, and return it. The records after the finishing one are
+    /// not taken from the queue. On return, successful or not, the buffer is all zeros.
+    pub fn step(&mut self, queue: &mut impl InputQueue, entry: &mut PasswordEntry) -> windows::core::Result<Step> {
+        let result = self.step_inner(queue, entry);
         self.wipe();
-        match read(&mut self.records) {
-            Ok(count) => {
-                debug_assert!(count as usize <= BATCH);
-                self.len = (count as usize).min(BATCH);
-                Ok(())
+        result
+    }
+
+    fn step_inner(&mut self, queue: &mut impl InputQueue, entry: &mut PasswordEntry) -> windows::core::Result<Step> {
+        loop {
+            let peeked = (queue.peek(&mut self.records)? as usize).min(BATCH);
+            // An empty queue: wait for a record. The one that arrives is fed in any case, so taking it
+            // out of the queue is taking exactly what is fed.
+            let (len, already_taken) = if peeked == 0 {
+                (queue.read(&mut self.records[..1])? as usize, true)
+            } else {
+                (peeked, false)
+            };
+            let (fed, step) = self.feed(len, entry);
+            self.wipe();
+            if !already_taken {
+                self.take(queue, fed)?;
             }
-            Err(e) => {
-                self.wipe();
-                Err(e)
+            if let Some(step) = step {
+                return Ok(step);
             }
         }
     }
 
-    /// Feed the entry the key records in turn until a step finishes, and return it. The rest stay.
-    /// `None` when the batch is fed to its end with no step finished: read the next one.
-    pub fn step(&mut self, entry: &mut PasswordEntry) -> Option<Step> {
-        while self.next < self.len {
-            let mut record = std::mem::replace(&mut self.records[self.next], zeroed_record());
-            self.next += 1;
+    /// Feed the entry the first `len` records in turn until a step finishes. Returns how many were
+    /// fed (the finishing one included) and the step. A fed record is overwritten at once.
+    fn feed(&mut self, len: usize, entry: &mut PasswordEntry) -> (usize, Option<Step>) {
+        for (index, slot) in self.records[..len].iter_mut().enumerate() {
+            let mut record = std::mem::replace(slot, zeroed_record());
             if record.EventType != EVT_KEY {
                 continue;
             }
@@ -77,24 +91,25 @@ impl Batch {
             wipe_records(std::slice::from_mut(&mut record));
             match entry.key(&event) {
                 Step::Continue => {}
-                step => return Some(step),
+                step => return (index + 1, Some(step)),
             }
         }
-        None
+        (len, None)
     }
 
-    /// Hand the records not yet fed to `put_back` (in the order they were read), then wipe them.
-    pub fn give_back(&mut self, put_back: impl FnOnce(&[INPUT_RECORD])) {
-        if self.next < self.len {
-            put_back(&self.records[self.next..self.len]);
+    /// Remove exactly `count` records, the ones fed, from the head of the queue.
+    fn take(&mut self, queue: &mut impl InputQueue, count: usize) -> windows::core::Result<()> {
+        let mut left = count;
+        while left > 0 {
+            let taken = (queue.read(&mut self.records[..left])? as usize).min(left);
+            self.wipe();
+            left -= taken;
         }
-        self.wipe();
+        Ok(())
     }
 
     fn wipe(&mut self) {
         wipe_records(&mut self.records);
-        self.next = 0;
-        self.len = 0;
     }
 }
 
@@ -110,7 +125,7 @@ fn zeroed_record() -> INPUT_RECORD {
 }
 
 /// Overwrite console records: they hold the characters just typed.
-pub(super) fn wipe_records(records: &mut [INPUT_RECORD]) {
+fn wipe_records(records: &mut [INPUT_RECORD]) {
     // SAFETY: `INPUT_RECORD` is plain data; zeroing its bytes in place is sound.
     let bytes =
         unsafe { std::slice::from_raw_parts_mut(records.as_mut_ptr().cast::<u8>(), std::mem::size_of_val(records)) };

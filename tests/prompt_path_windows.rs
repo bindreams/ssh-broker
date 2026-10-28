@@ -331,8 +331,11 @@ fn empty_enter_reprompts() {
     leave(&mut run);
 }
 
-/// Elevated (CI only). An Enter and then the password, written to the console together (a paste): the
-/// Enter is answered as an empty password and the password after it is still read.
+/// Elevated (CI only). An Enter and then the password, written to the console in one piece (a paste):
+/// the Enter is answered as an empty password and the password after it is still read. Whether the
+/// console delivers the piece as one batch of records or as two is up to conhost, so this covers both;
+/// the same-batch case is pinned by the unit test
+/// `batch::batch_tests::a_password_after_an_empty_enter_in_one_batch_is_not_lost`.
 #[test]
 fn a_password_written_with_an_empty_enter_is_read() {
     let _machine = machine::shared();
