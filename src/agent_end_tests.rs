@@ -25,8 +25,9 @@ impl Failsafe {
         let thread = std::thread::spawn({
             let fired = Arc::clone(&fired);
             move || {
-                // sleep-ok: failsafe, a wake that never comes becomes a failure
-                if finished.recv_timeout(FAILSAFE).is_err() {
+                // A wake that never comes becomes a failure.
+                let expired = finished.recv_timeout(FAILSAFE).is_err(); // sleep-ok: failure bound turned into a failed assertion
+                if expired {
                     fired.store(true, Ordering::SeqCst);
                     release();
                 }
