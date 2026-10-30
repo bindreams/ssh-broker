@@ -392,7 +392,7 @@ pub struct FileId {
 }
 
 /// The identity of the file at `path`.
-fn file_id(path: &Path) -> std::io::Result<FileId> {
+pub fn file_id(path: &Path) -> std::io::Result<FileId> {
     /// `FILE_READ_ATTRIBUTES`: enough to ask for the id, and needs no read access to the file.
     const FILE_READ_ATTRIBUTES: u32 = 0x80;
     /// Read, write and delete sharing: this open must not get in the way of a running exe.
