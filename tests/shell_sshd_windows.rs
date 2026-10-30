@@ -569,46 +569,53 @@ fn assert_unstartable_warning(stderr: &str, stub: &std::path::Path) {
     );
 }
 
-/// The warning for a shell that cannot be used is on the screen of a session with a terminal: ConPTY's opening
-/// output (a clear of the screen, a cursor move) must not wipe it. The sessions are rendered the way a terminal
-/// renders them, from the bytes ssh delivers: a command with a terminal through the shim alone and through the
-/// agent, and a login through the agent.
+/// What a user sees of a session with a terminal when the shell cannot be used: the screen a terminal shows from the
+/// bytes ssh delivers, with every clear and cursor move applied.
+fn assert_warning_on_screen(what: &str, stream: &[u8], raw: &str) {
+    let screen = sshd_rig::screen_text(stream);
+    eprintln!("the screen of {what}:\n{screen}\nthe raw stream: {raw:?}");
+    assert!(
+        screen.contains("built-in-ok"),
+        "{what}: the command did not run:\n{screen}\nraw: {raw:?}"
+    );
+    assert!(
+        screen.contains("cannot use the shell from") && screen.contains("config.yaml"),
+        "{what}: the warning is not on the screen:\n{screen}\nraw: {raw:?}"
+    );
+}
+
+/// The warning for a shell that cannot be used is on the screen of a command with a terminal that the shim runs
+/// itself (no agent).
 #[test]
-fn the_warning_survives_on_the_screen_of_a_session_with_a_terminal() {
+fn the_warning_survives_on_the_screen_of_a_terminal_session_through_the_shim_alone() {
     let _machine = machine::exclusive();
     let rig = Rig::new("shd10");
     let login = rig.login();
     rig.broker_is_default_shell();
-    let broken = "shell: {strt: pwsh.exe}\n";
+    rig.account.write_user_config("shell: {strt: pwsh.exe}\n");
 
-    let assert_warned = |what: &str, stream: &[u8], raw: &str| {
-        let screen = sshd_rig::screen_text(stream);
-        eprintln!("the screen of {what}:\n{screen}\nthe raw stream: {raw:?}");
-        assert!(
-            screen.contains("built-in-ok"),
-            "{what}: the command did not run:\n{screen}\nraw: {raw:?}"
-        );
-        assert!(
-            screen.contains("cannot use the shell from") && screen.contains("config.yaml"),
-            "{what}: the warning is not on the screen:\n{screen}\nraw: {raw:?}"
-        );
-    };
-
-    // No agent: the shim runs the command.
-    rig.account.write_user_config(broken);
-    let local = rig.ssh(&login, true, "echo built-in-ok");
-    assert_warned(
+    let out = rig.ssh(&login, true, "echo built-in-ok");
+    assert_warning_on_screen(
         "a command with a terminal, through the shim alone",
-        &local.stdout,
-        &text(&local),
+        &out.stdout,
+        &text(&out),
     );
+}
 
-    // The agent runs the command, and the login.
-    rig.account.write_user_config("shell: pwsh.exe\n");
+/// The same through the agent, for a command and for a login. ConPTY opens the agent's pseudoconsole with a clear of
+/// the screen that reaches the client after anything written ahead of it; the warning has to be on the screen after
+/// that clear (measured, ssh-broker#55).
+#[test]
+fn the_warning_survives_on_the_screen_of_a_terminal_session_through_the_agent() {
+    let _machine = machine::exclusive();
+    let rig = Rig::new("shd11");
+    let login = rig.login();
+    rig.broker_is_default_shell();
     let session = rig.start_session(&login);
-    rig.account.write_user_config(broken);
+    rig.account.write_user_config("shell: {strt: pwsh.exe}\n");
+
     let relayed = rig.ssh(&login, true, "echo built-in-ok");
-    assert_warned(
+    assert_warning_on_screen(
         "a command with a terminal, through the agent",
         &relayed.stdout,
         &text(&relayed),
