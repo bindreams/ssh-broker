@@ -214,8 +214,13 @@ fn new_account_without_profile_gets_a_profile_and_a_session() {
     assert!(before.downcast_ref::<userdir::NoProfile>().is_some(), "{before:#}");
 
     let mut run = start_run(&kit, &account);
-    log_in(&mut run, &account.password);
-    say(&mut run, "session-up");
+    // No profile means no user config before the first logon, so the session's shell is the built-in
+    // cmd.exe: it shows its banner, and `^` keeps the marker out of the echo of the typed line.
+    run.read_until(PROMPT);
+    run.type_line(&account.password);
+    run.read_until("Microsoft Windows [Version");
+    run.type_line("echo session-^up");
+    run.read_until("session-up");
     leave(&mut run);
 
     let profile = userdir::profile_dir_of_token(account.network_token().0).expect("the logon made the profile");
