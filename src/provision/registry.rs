@@ -58,17 +58,45 @@ pub fn escape_arguments_check<E: std::fmt::Display>(read: Result<bool, E>) -> Ch
     }
 }
 
+/// What sshd reads to start a session's shell (`pwd.c` `set_defaultshell`): the four
+/// `HKLM\SOFTWARE\OpenSSH` values `apply` carries into the system config before it overwrites them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SshdShell {
+    /// `DefaultShell`; `None` when absent or empty.
+    pub shell: Option<String>,
+    /// `DefaultShellCommandOption`; `None` when absent or empty.
+    pub command_option: Option<String>,
+    /// `DefaultShellArguments`; `None` when absent or empty.
+    pub arguments: Option<String>,
+    /// Whether sshd escapes the command: absent or too long means yes (see
+    /// [`escape_arguments_from_status`]).
+    pub escape_arguments: bool,
+}
+
+impl SshdShell {
+    /// No `DefaultShell`: sshd runs the system `cmd.exe` and ignores the other three values.
+    pub fn none() -> SshdShell {
+        SshdShell {
+            shell: None,
+            command_option: None,
+            arguments: None,
+            escape_arguments: true,
+        }
+    }
+}
+
 /// The production OpenSSH key under `HKEY_LOCAL_MACHINE`.
 pub const OPENSSH_KEY: &str = r"SOFTWARE\OpenSSH";
 
 #[cfg(windows)]
 mod win {
-    use super::{ESCAPE_ARGUMENTS, RegValue, desired_values};
+    use super::{ESCAPE_ARGUMENTS, RegValue, SshdShell, desired_values};
     use anyhow::Context;
     use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_MORE_DATA, ERROR_PATH_NOT_FOUND, WIN32_ERROR};
     use windows::Win32::System::Registry::{
-        HKEY, HKEY_LOCAL_MACHINE, KEY_QUERY_VALUE, KEY_WOW64_64KEY, REG_DWORD, REG_SZ, REG_VALUE_TYPE, RRF_RT_REG_SZ,
-        RegCloseKey, RegGetValueW, RegOpenKeyExW, RegQueryValueExW, RegSetKeyValueW,
+        HKEY, HKEY_LOCAL_MACHINE, KEY_QUERY_VALUE, KEY_WOW64_64KEY, REG_DWORD, REG_SZ, REG_VALUE_TYPE, RRF_NOEXPAND,
+        RRF_RT_REG_EXPAND_SZ, RRF_RT_REG_SZ, RegCloseKey, RegGetValueW, RegOpenKeyExW, RegQueryValueExW,
+        RegSetKeyValueW,
     };
     use windows::core::PCWSTR;
 
@@ -143,6 +171,62 @@ mod win {
         }
         let chars = (cb as usize / 2).saturating_sub(1); // drop the NUL terminator
         Ok(String::from_utf16_lossy(&buf[..chars.min(buf.len())]))
+    }
+
+    /// A string value as stored, unexpanded; `None` when the key or value is absent or the value is
+    /// empty (sshd treats an empty one as absent). Any other failure is an error: it leaves what
+    /// sshd reads unknown.
+    fn read_optional_string(root: HKEY, subkey: &str, name: &str) -> anyhow::Result<Option<String>> {
+        let (sub, name_w) = (wide(subkey), wide(name));
+        let flags = RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ | RRF_NOEXPAND;
+        let mut cb = 0u32;
+        // The first read has room for nothing and learns the size; a value that grows before the
+        // next asks again with the size it now has.
+        loop {
+            let mut buffer = vec![0u16; (cb as usize).div_ceil(2) + 1];
+            let mut capacity = (buffer.len() * 2) as u32;
+            // SAFETY: `sub` and `name_w` are NUL-terminated; `buffer` holds `capacity` bytes.
+            let status = unsafe {
+                RegGetValueW(
+                    root,
+                    PCWSTR(sub.as_ptr()),
+                    PCWSTR(name_w.as_ptr()),
+                    flags,
+                    None,
+                    Some(buffer.as_mut_ptr().cast()),
+                    Some(&mut capacity),
+                )
+            };
+            if is_absent(status) {
+                return Ok(None);
+            }
+            if status == ERROR_MORE_DATA {
+                cb = capacity;
+                continue;
+            }
+            status.ok().with_context(|| format!("read {name}"))?;
+            let units = (capacity as usize / 2).saturating_sub(1); // drop the NUL
+            let text = String::from_utf16_lossy(&buffer[..units.min(buffer.len())]);
+            return Ok((!text.is_empty()).then_some(text));
+        }
+    }
+
+    fn read_sshd_shell_in(root: HKEY, subkey: &str) -> anyhow::Result<SshdShell> {
+        let Some(shell) = read_optional_string(root, subkey, "DefaultShell")? else {
+            // sshd ignores the other values when there is no shell.
+            return Ok(SshdShell::none());
+        };
+        Ok(SshdShell {
+            shell: Some(shell),
+            command_option: read_optional_string(root, subkey, "DefaultShellCommandOption")?,
+            arguments: read_optional_string(root, subkey, "DefaultShellArguments")?,
+            escape_arguments: escape_arguments_in(root, subkey).context("read DefaultShellEscapeArguments")?,
+        })
+    }
+
+    /// Production: the four shell values from `HKLM\<subkey>`, as sshd reads them.
+    pub fn read_sshd_shell_under(subkey: &str) -> anyhow::Result<SshdShell> {
+        read_sshd_shell_in(HKEY_LOCAL_MACHINE, subkey)
     }
 
     /// Production: write [`desired_values`] under `HKLM\<subkey>`.
@@ -240,6 +324,10 @@ mod win {
         )
     }
     #[cfg(test)]
+    pub fn read_sshd_shell_hkcu(subkey: &str) -> anyhow::Result<SshdShell> {
+        read_sshd_shell_in(windows::Win32::System::Registry::HKEY_CURRENT_USER, subkey)
+    }
+    #[cfg(test)]
     pub fn read_string_hkcu(subkey: &str, name: &str) -> anyhow::Result<String> {
         read_value(windows::Win32::System::Registry::HKEY_CURRENT_USER, subkey, name)
     }
@@ -301,11 +389,11 @@ mod win {
 
 #[cfg(all(windows, test))]
 pub use win::{
-    delete_hkcu, escape_arguments_from_status, escape_arguments_hkcu, read_dword_hkcu, read_hkcu, read_string_hkcu,
-    set_hkcu, set_hkcu_confirming, set_value_hkcu,
+    delete_hkcu, escape_arguments_from_status, escape_arguments_hkcu, read_dword_hkcu, read_hkcu, read_sshd_shell_hkcu,
+    read_string_hkcu, set_hkcu, set_hkcu_confirming, set_value_hkcu,
 };
 #[cfg(windows)]
-pub use win::{escape_arguments_under, read_default_shell_under, set_default_shell_under};
+pub use win::{escape_arguments_under, read_default_shell_under, read_sshd_shell_under, set_default_shell_under};
 
 #[cfg(test)]
 #[path = "registry_tests.rs"]

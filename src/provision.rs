@@ -27,6 +27,8 @@ pub mod session_task;
 #[cfg(windows)]
 pub mod sessions;
 #[cfg(windows)]
+pub(crate) mod system_config;
+#[cfg(windows)]
 pub mod taskscheduler;
 #[cfg(windows)]
 pub(crate) mod user_rows;
@@ -102,7 +104,8 @@ mod provision_tests;
 mod imp {
     use super::layout::{self, Layout};
     use super::{
-        apply_lock, flow, probe, procwait, registry, report, schtasks, session_task, sessions, taskscheduler, user_rows,
+        apply_lock, flow, probe, procwait, registry, report, schtasks, session_task, sessions, system_config,
+        taskscheduler, user_rows,
     };
     use crate::protocol::Launch;
     use crate::{afunix, shim};
@@ -157,10 +160,12 @@ mod imp {
                 register_agent_task(&layout, &exe)?;
                 register_selfheal_task(&exe)?;
 
-                // 3. Write the escape flag and read it back at once, then flip the DefaultShell
-                //    pair LAST and only to the validated canonical path; read that back too. sshd
-                //    reads these once per session, so the shim cannot ask later which form sshd
-                //    used: `apply` owns the flag (see `registry::desired_values`).
+                // 3. Carry the previous sshd shell into the system config, while the registry still
+                //    holds it. Then write the escape flag and read it back at once, then flip the
+                //    DefaultShell pair LAST and only to the validated canonical path; read that back
+                //    too. sshd reads these once per session, so the shim cannot ask later which form
+                //    sshd used: `apply` owns the flag (see `registry::desired_values`).
+                carry_previous_shell(&base);
                 registry::set_default_shell_under(registry::OPENSSH_KEY, &exe.to_string_lossy())
                     .context("write the DefaultShell values")?;
                 let (shell, opt) = registry::read_default_shell_under(registry::OPENSSH_KEY)?;
@@ -180,6 +185,66 @@ mod imp {
             exe.display()
         );
         Ok(())
+    }
+
+    /// Write the system config from the shell sshd runs now, if it is not ssh-broker and there is no
+    /// config yet (see [`system_config`]). Must run before the registry is overwritten. The install is
+    /// complete without the config, so a failure is said on stderr and `apply` goes on.
+    ///
+    /// `DefaultShellArguments` is left in the registry afterwards: removing it would be a fifth value
+    /// `apply` owns.
+    fn carry_previous_shell(base: &layout::TrustedBase<'_>) {
+        let previous = match registry::read_sshd_shell_under(registry::OPENSSH_KEY) {
+            Ok(previous) => previous,
+            Err(e) => {
+                eprintln!(
+                    "apply: could not read the shell sshd uses now, so it is not carried into config.yaml: {e:#}"
+                );
+                return;
+            }
+        };
+        let config = base.layout().system_config_path();
+        let config_exists = match config.try_exists() {
+            Ok(exists) => exists,
+            Err(e) => {
+                eprintln!(
+                    "apply: cannot tell whether {} exists, so the previous shell is not carried: {e}",
+                    config.display()
+                );
+                return;
+            }
+        };
+        let host = crate::shell::WindowsHost;
+        let file_exists = |path: &Path| {
+            use crate::shell::Host;
+            let text = path.to_string_lossy();
+            if text.contains(['\\', '/', ':']) {
+                host.is_file(path)
+            } else {
+                host.find_program(&text).is_some()
+            }
+        };
+        let is_system_cmd = |path: &Path| {
+            use crate::shell::Host;
+            host.is_system_cmd(path).unwrap_or(false)
+        };
+        match system_config::decide(&previous, config_exists, &file_exists, &is_system_cmd) {
+            system_config::Decision::Write(block) => match system_config::create_once(base, &block) {
+                Ok(true) => println!(
+                    "apply: wrote {} from the shell sshd used before ({})",
+                    config.display(),
+                    previous.shell.as_deref().unwrap_or_default()
+                ),
+                Ok(false) => {}
+                Err(e) => eprintln!("apply: could not write {}: {e:#}", config.display()),
+            },
+            system_config::Decision::Skip(system_config::Skip::PreviousMissing) => eprintln!(
+                "apply: the shell sshd uses now ({}) does not exist, so it is not carried into {}",
+                previous.shell.as_deref().unwrap_or_default(),
+                config.display()
+            ),
+            system_config::Decision::Skip(_) => {}
+        }
     }
 
     /// The background sessions' part of the stop that precedes replacing the exe: the auto-login

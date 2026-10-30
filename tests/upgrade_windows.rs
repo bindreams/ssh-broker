@@ -49,9 +49,10 @@ use stand_in::Kit;
 const TASK_START_BOUND: Duration = Duration::from_secs(180);
 
 const OPENSSH_KEY: &str = r"HKLM\SOFTWARE\OpenSSH";
-const SHELL_VALUES: [&str; 3] = [
+const SHELL_VALUES: [&str; 4] = [
     "DefaultShell",
     "DefaultShellCommandOption",
+    "DefaultShellArguments",
     "DefaultShellEscapeArguments",
 ];
 
@@ -431,4 +432,85 @@ fn apply_of_the_installed_build_leaves_a_running_auto_login_session_running() {
         scene.before,
         "the auto-login session was stopped or restarted by an apply that replaced nothing\n{text}"
     );
+}
+
+/// Set one of sshd's values under the real key (`Install` puts them back).
+fn set_sshd_value(name: &str, kind: &str, data: &str) {
+    let out = reg(&["add", OPENSSH_KEY, "/v", name, "/t", kind, "/d", data, "/f"]);
+    assert!(
+        out.status.success(),
+        "reg add {name}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// Elevated (CI only). `apply` over a machine whose sshd runs another shell with options writes the
+/// system config from all four values, before it overwrites them, and a second `apply` (even over
+/// yet another shell) leaves the file as it is.
+#[test]
+fn apply_carries_all_four_values_and_a_second_apply_does_not_rewrite_them() {
+    use ssh_broker::shell::Escaping;
+    use ssh_broker::shell::config::{ShellBlock, parse};
+
+    let _machine = machine::exclusive();
+    let _install = Install::capture();
+    let dir = std::env::temp_dir().join(format!("sb-carry-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    // Files that exist; `apply` never runs them.
+    let (pwsh, other) = (dir.join("pwsh.exe"), dir.join("other.exe"));
+    for file in [&pwsh, &other] {
+        std::fs::write(file, b"MZ").unwrap();
+    }
+    let broker = Path::new(env!("CARGO_BIN_EXE_ssh-broker"));
+    let config = Path::new(provision::BASE_DIR).join("config.yaml");
+
+    set_sshd_value("DefaultShell", "REG_SZ", &pwsh.to_string_lossy());
+    set_sshd_value("DefaultShellCommandOption", "REG_SZ", "-Command");
+    set_sshd_value("DefaultShellArguments", "REG_SZ", r#"-NoLogo -File "C:\a b\x.ps1""#);
+    set_sshd_value("DefaultShellEscapeArguments", "REG_DWORD", "0");
+
+    let first = apply(broker);
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&first.stdout),
+        String::from_utf8_lossy(&first.stderr)
+    );
+    assert!(first.status.success(), "the apply failed:\n{text}");
+    assert!(text.contains("wrote"), "{text}");
+    let written = std::fs::read(&config).unwrap_or_else(|e| panic!("no config after apply: {e}\n{text}"));
+    assert_eq!(
+        parse(&written).unwrap(),
+        Some(ShellBlock {
+            start: vec![pwsh.to_string_lossy().into_owned()],
+            without_command: Some(vec!["-NoLogo".into(), "-File".into(), r"C:\a b\x.ps1".into()]),
+            with_command: Some(vec!["-Command".into()]),
+            escaping: Some(Escaping::Cmd),
+        })
+    );
+
+    // The reads came before the overwrites: sshd now runs ssh-broker with its own option and flag.
+    let (shell, option) = provision::registry::read_default_shell_under(provision::registry::OPENSSH_KEY).unwrap();
+    assert!(
+        shell.ends_with("ssh-broker.exe") && option == "-c",
+        "{shell:?} {option:?}"
+    );
+    assert!(provision::registry::escape_arguments_under(provision::registry::OPENSSH_KEY).unwrap());
+
+    // Another shell in the registry and a second apply: the file stays byte for byte.
+    set_sshd_value("DefaultShell", "REG_SZ", &other.to_string_lossy());
+    let second = apply(broker);
+    assert!(
+        second.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&second.stdout),
+        String::from_utf8_lossy(&second.stderr)
+    );
+    assert_eq!(
+        std::fs::read(&config).unwrap(),
+        written,
+        "the second apply rewrote the config"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
 }

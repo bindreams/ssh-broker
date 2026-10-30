@@ -228,3 +228,60 @@ fn escape_arguments_reports_a_read_that_fails_for_another_reason() {
     assert!(!super::escape_arguments_from_status(ERROR_SUCCESS, [0; 4]).unwrap());
     assert!(super::escape_arguments_from_status(ERROR_SUCCESS, [1, 0, 0, 0]).unwrap());
 }
+
+/// `apply` reads the four values the way sshd does before it overwrites them. Under a key of the
+/// test's own (HKCU, deleted afterwards); CI only, as it writes the registry.
+#[cfg(windows)]
+#[test]
+fn the_four_shell_values_are_read_as_sshd_reads_them() {
+    use super::SshdShell;
+    use windows::Win32::System::Registry::{REG_DWORD, REG_EXPAND_SZ, REG_SZ};
+    let sz = |text: &str| -> Vec<u8> {
+        text.encode_utf16()
+            .chain(std::iter::once(0))
+            .flat_map(u16::to_le_bytes)
+            .collect()
+    };
+
+    // No key at all: nothing to carry, and sshd's defaults.
+    let key = TestKey::new("sshd-none");
+    assert_eq!(super::read_sshd_shell_hkcu(key.path()).unwrap(), SshdShell::none());
+
+    // All four, with an argument string longer than a fixed buffer of 512 would hold.
+    let long = format!("-File {}", "x".repeat(2000));
+    let key = TestKey::new("sshd-all");
+    let sub = key.path();
+    super::set_value_hkcu(
+        sub,
+        "DefaultShell",
+        REG_SZ.0,
+        &sz(r"C:\Program Files\PowerShell\7\pwsh.exe"),
+    );
+    super::set_value_hkcu(sub, "DefaultShellCommandOption", REG_SZ.0, &sz("-Command"));
+    super::set_value_hkcu(sub, "DefaultShellArguments", REG_SZ.0, &sz(&long));
+    super::set_value_hkcu(sub, "DefaultShellEscapeArguments", REG_DWORD.0, &0u32.to_le_bytes());
+    let got = super::read_sshd_shell_hkcu(sub).unwrap();
+    assert_eq!(got.shell.as_deref(), Some(r"C:\Program Files\PowerShell\7\pwsh.exe"));
+    assert_eq!(got.command_option.as_deref(), Some("-Command"));
+    assert_eq!(got.arguments.as_deref(), Some(long.as_str()));
+    assert!(!got.escape_arguments);
+
+    // Empty values count as absent, and the options are not expanded.
+    let key = TestKey::new("sshd-empty");
+    let sub = key.path();
+    super::set_value_hkcu(sub, "DefaultShell", REG_EXPAND_SZ.0, &sz(r"%ProgramFiles%\x\sh.exe"));
+    super::set_value_hkcu(sub, "DefaultShellCommandOption", REG_SZ.0, &sz(""));
+    let got = super::read_sshd_shell_hkcu(sub).unwrap();
+    assert_eq!(got.shell.as_deref(), Some(r"%ProgramFiles%\x\sh.exe"));
+    assert_eq!(
+        (got.command_option, got.arguments, got.escape_arguments),
+        (None, None, true)
+    );
+
+    // With no DefaultShell, sshd ignores the rest.
+    let key = TestKey::new("sshd-orphans");
+    let sub = key.path();
+    super::set_value_hkcu(sub, "DefaultShellCommandOption", REG_SZ.0, &sz("-x"));
+    super::set_value_hkcu(sub, "DefaultShellEscapeArguments", REG_DWORD.0, &0u32.to_le_bytes());
+    assert_eq!(super::read_sshd_shell_hkcu(sub).unwrap(), SshdShell::none());
+}
