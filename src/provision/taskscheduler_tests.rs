@@ -68,6 +68,12 @@ fn stop_instances_succeeds_for_a_task_that_does_not_exist() {
 }
 
 #[test]
+fn a_task_that_does_not_exist_has_no_running_instance() {
+    let name = format!("ssh-broker-test-absent-{}", std::process::id());
+    assert!(!has_running_instance(&name).unwrap());
+}
+
+#[test]
 fn enabling_a_task_that_does_not_exist_is_not_an_error() {
     // A failed `apply` enables the task again whether or not it got as far as registering it.
     let name = format!("ssh-broker-test-absent-{}", std::process::id());
@@ -311,6 +317,22 @@ fn stop_instances_returns_after_the_instance_process_has_exited_and_leaves_the_t
         !crate::provision::schtasks::xml_is_disabled(&enabled_xml),
         "{enabled_xml}"
     );
+}
+
+/// Elevated (CI only).
+#[test]
+fn a_task_has_a_running_instance_from_its_start_until_it_is_stopped() {
+    let task = ThrowawayTask::new("has-instance");
+    task.register(FOREVER_TASK_XML);
+    assert!(!has_running_instance(&task.0).unwrap(), "control: nothing is running");
+
+    let image = forever_image();
+    let processes = start_and_find(&task.0, &image);
+    assert!(has_running_instance(&task.0).unwrap());
+
+    stop_instances(&task.0, &image).unwrap();
+    wait_all_exited(&processes, Duration::ZERO).expect("the process had exited when stop_instances returned");
+    assert!(!has_running_instance(&task.0).unwrap());
 }
 
 /// Elevated (CI only).

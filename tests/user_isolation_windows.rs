@@ -12,7 +12,6 @@
 //! shell, never in another user's.
 #![cfg(windows)]
 
-use std::os::windows::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::mpsc;
@@ -24,27 +23,20 @@ use ssh_broker::socket_loc::SocketLocation;
 use ssh_broker::userdir;
 use ssh_broker::winutil::OwnedHandle;
 use windows::Win32::Foundation::{HANDLE, HLOCAL, LocalFree};
-use windows::Win32::NetworkManagement::NetManagement::{
-    NetUserAdd, NetUserDel, UF_DONT_EXPIRE_PASSWD, UF_SCRIPT, USER_INFO_1, USER_PRIV_USER,
-};
 use windows::Win32::Security::Authorization::{
     ConvertSecurityDescriptorToStringSecurityDescriptorW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
     GetNamedSecurityInfoW, SE_FILE_OBJECT, SetNamedSecurityInfoW,
 };
 use windows::Win32::Security::{
-    ACL, DACL_SECURITY_INFORMATION, DuplicateTokenEx, GetSecurityDescriptorDacl, GetTokenInformation,
-    LOGON32_LOGON_NETWORK, LOGON32_PROVIDER_DEFAULT, LogonUserW, PROTECTED_DACL_SECURITY_INFORMATION,
+    ACL, DACL_SECURITY_INFORMATION, DuplicateTokenEx, GetSecurityDescriptorDacl, PROTECTED_DACL_SECURITY_INFORMATION,
     PSECURITY_DESCRIPTOR, SecurityImpersonation, SetTokenInformation, TOKEN_ALL_ACCESS, TOKEN_DEFAULT_DACL,
-    TOKEN_DUPLICATE, TOKEN_ELEVATION, TOKEN_QUERY, TokenDefaultDacl, TokenElevation, TokenImpersonation, TokenPrimary,
+    TOKEN_DUPLICATE, TOKEN_QUERY, TokenDefaultDacl, TokenImpersonation,
 };
-use windows::Win32::System::Threading::{
-    CREATE_NO_WINDOW, CREATE_PROCESS_LOGON_FLAGS, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT,
-    CreateProcessWithTokenW, GetCurrentProcess, LOGON_WITH_PROFILE, OpenProcessToken, PROCESS_INFORMATION,
-    ResumeThread, STARTUPINFOW, SetThreadToken, TerminateProcess,
-};
-use windows::Win32::UI::Shell::{CreateProfile, DeleteProfileW};
+use windows::Win32::System::Threading::{GetCurrentProcess, LOGON_WITH_PROFILE, OpenProcessToken, SetThreadToken};
 use windows::core::{BOOL, PCWSTR, PWSTR};
 
+#[path = "common/account.rs"]
+mod account;
 #[path = "common/bounded_wait.rs"]
 mod bounded_wait;
 #[path = "common/child_entry.rs"]
@@ -58,295 +50,7 @@ mod hard_errors;
 #[path = "common/process_list.rs"]
 mod process_list;
 
-// Fixture ---------------------------------------------------------------------------------
-
-fn wide(text: &str) -> Vec<u16> {
-    text.encode_utf16().chain(std::iter::once(0)).collect()
-}
-
-/// Fail loudly unless this process is an elevated administrator.
-fn assert_elevated() {
-    let mut token = HANDLE::default();
-    // SAFETY: valid out-pointers; the token is closed by `OwnedHandle`.
-    let elevated = unsafe {
-        OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).unwrap();
-        let token = OwnedHandle(token);
-        let mut info = TOKEN_ELEVATION::default();
-        let mut len = 0u32;
-        GetTokenInformation(
-            token.0,
-            TokenElevation,
-            Some(&mut info as *mut _ as *mut core::ffi::c_void),
-            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
-            &mut len,
-        )
-        .is_ok()
-            && info.TokenIsElevated != 0
-    };
-    assert!(
-        elevated,
-        "this test needs an elevated administrator (CI runs it); not running it here"
-    );
-}
-
-/// `sb<tag><pid>_<n>` in hex: at most 20 characters, as an account name must be, for a tag of up to
-/// 5 characters and a counter below 65536 (more fails loudly). The separator keeps `(pid, n)`
-/// pairs whose digits run together apart.
-fn account_name(tag: &str, pid: u32, n: u32) -> String {
-    let name = format!("sb{tag}{pid:x}_{n:x}");
-    assert!(
-        name.chars().count() <= 20,
-        "{name} is longer than an account name may be"
-    );
-    name
-}
-
-/// A name no other account of this test run has, whichever thread asks: this process's id and a
-/// process-wide counter. An account left behind by an aborted earlier run with the same id makes
-/// `NetUserAdd` fail with "user exists"; nothing is overwritten.
-fn next_account_name(tag: &str) -> String {
-    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-    account_name(
-        tag,
-        std::process::id(),
-        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-    )
-}
-
-/// A throwaway local account, removed (profile first) when dropped.
-struct Account {
-    name: String,
-    password: String,
-    sid: Sid,
-    sid_text: String,
-    profile: Option<PathBuf>,
-}
-
-impl Account {
-    /// Create the account; with a profile, create the profile too (so `ProfileList` has an entry).
-    /// `tag` (at most 5 characters) names what the account is for.
-    fn create(tag: &str, with_profile: bool) -> Account {
-        assert_elevated();
-        let name = next_account_name(tag);
-        // Not the account name itself, which the password policy refuses.
-        let password = format!("Pw-{}-Aa1!", &name[2..]);
-        let name_w = wide(&name);
-        let mut password_w = wide(&password);
-        let mut name_mut = name_w.clone();
-        let info = USER_INFO_1 {
-            usri1_name: PWSTR(name_mut.as_mut_ptr()),
-            usri1_password: PWSTR(password_w.as_mut_ptr()),
-            usri1_password_age: 0,
-            usri1_priv: USER_PRIV_USER,
-            usri1_home_dir: PWSTR::null(),
-            usri1_comment: PWSTR::null(),
-            usri1_flags: UF_SCRIPT | UF_DONT_EXPIRE_PASSWD,
-            usri1_script_path: PWSTR::null(),
-        };
-        // SAFETY: `info` and the strings it points at outlive the call.
-        let rc = unsafe { NetUserAdd(PCWSTR::null(), 1, &info as *const _ as *const u8, None) };
-        assert_eq!(rc, 0, "NetUserAdd({name}) failed with {rc}");
-
-        let sid = Sid::lookup(&name).unwrap();
-        let sid_text = sid.to_sddl().unwrap();
-        let mut account = Account {
-            name,
-            password,
-            sid,
-            sid_text,
-            profile: None,
-        };
-        if with_profile {
-            let mut buf = [0u16; 260];
-            // SAFETY: NUL-terminated inputs; `buf` is the output buffer and its length.
-            unsafe {
-                CreateProfile(
-                    PCWSTR(wide(&account.sid_text).as_ptr()),
-                    PCWSTR(name_w.as_ptr()),
-                    &mut buf,
-                )
-            }
-            .expect("CreateProfile");
-            let len = buf.iter().position(|&u| u == 0).unwrap();
-            account.profile = Some(PathBuf::from(std::ffi::OsString::from_wide(&buf[..len])));
-        }
-        account
-    }
-
-    /// The token sshd's key-authenticated logon gives: a network logon, no loaded profile.
-    fn network_token(&self) -> OwnedHandle {
-        let mut token = HANDLE::default();
-        // SAFETY: NUL-terminated inputs, a valid out-pointer.
-        unsafe {
-            LogonUserW(
-                PCWSTR(wide(&self.name).as_ptr()),
-                PCWSTR(wide(".").as_ptr()),
-                PCWSTR(wide(&self.password).as_ptr()),
-                LOGON32_LOGON_NETWORK,
-                LOGON32_PROVIDER_DEFAULT,
-                &mut token,
-            )
-        }
-        .unwrap_or_else(|e| panic!("LogonUser({}) failed: {e}", self.name));
-        OwnedHandle(token)
-    }
-
-    /// The profile `CreateProfile` made. Panics for an account made without one.
-    fn profile(&self) -> &Path {
-        self.profile.as_deref().expect("this account has no profile")
-    }
-
-    /// [`Account::run_with`] without loading the account's profile and with the environment the
-    /// system makes for the account.
-    fn run(&self, exe: &Path, command_line: &str, cwd: &Path, evidence: &[PathBuf]) -> u32 {
-        self.run_with(exe, command_line, cwd, evidence, CREATE_PROCESS_LOGON_FLAGS(0), None)
-    }
-
-    /// Run `exe` with `command_line` under this account's network-logon token, the way sshd runs
-    /// its shell, on a window station and desktop made for this one child (see [`desktop`]).
-    /// `logon_flags` is `CreateProcessWithTokenW`'s `dwLogonFlags`: without [`LOGON_WITH_PROFILE`]
-    /// the account's registry hive is not loaded. `environment` is a block from [`environment`]
-    /// to pass as is; without one the system makes the account's, with `USERPROFILE=C:\Users\Default`
-    /// unless the profile is loaded. Returns the exit code. A loader failure of the child ends it
-    /// with its NTSTATUS as the exit code (see [`hard_errors`]) rather than a message box. A child
-    /// still running after [`bounded_wait::CHILD_EXIT_BOUND`] fails the test with the process tree,
-    /// this account's ssh-broker folder and `evidence` printed, and is killed.
-    fn run_with(
-        &self,
-        exe: &Path,
-        command_line: &str,
-        cwd: &Path,
-        evidence: &[PathBuf],
-        logon_flags: CREATE_PROCESS_LOGON_FLAGS,
-        environment: Option<&[u16]>,
-    ) -> u32 {
-        // The account's SID and the administrator's: the child runs as the first and is started by
-        // the second.
-        let starter = Sid::current_user().unwrap().to_sddl().unwrap();
-        let private = desktop::PrivateDesktop::create(&[&self.sid_text, &starter])
-            .unwrap_or_else(|e| panic!("create a window station and desktop for {}: {e}", self.name));
-
-        let network = self.network_token();
-        let mut primary = HANDLE::default();
-        // SAFETY: valid in/out handles.
-        unsafe {
-            DuplicateTokenEx(
-                network.0,
-                TOKEN_ALL_ACCESS,
-                None,
-                SecurityImpersonation,
-                TokenPrimary,
-                &mut primary,
-            )
-        }
-        .expect("duplicate the token as a primary token");
-        let primary = OwnedHandle(primary);
-
-        let mut command = wide(command_line);
-        let mut station_and_desktop = wide(private.name());
-        let startup = STARTUPINFOW {
-            cb: std::mem::size_of::<STARTUPINFOW>() as u32,
-            lpDesktop: PWSTR(station_and_desktop.as_mut_ptr()),
-            ..Default::default()
-        };
-        let mut flags = CREATE_SUSPENDED | CREATE_NO_WINDOW;
-        if environment.is_some() {
-            flags |= CREATE_UNICODE_ENVIRONMENT;
-        }
-        let mut info = PROCESS_INFORMATION::default();
-        // SAFETY: every pointer is to a local that outlives the call.
-        unsafe {
-            CreateProcessWithTokenW(
-                primary.0,
-                logon_flags,
-                PCWSTR(wide(&exe.to_string_lossy()).as_ptr()),
-                Some(PWSTR(command.as_mut_ptr())),
-                flags,
-                environment.map(|block| block.as_ptr().cast::<core::ffi::c_void>()),
-                PCWSTR(wide(&cwd.to_string_lossy()).as_ptr()),
-                &startup,
-                &mut info,
-            )
-        }
-        .unwrap_or_else(|e| panic!("start {exe:?} as {}: {e}", self.name));
-        let process = OwnedHandle(info.hProcess);
-        let thread = OwnedHandle(info.hThread);
-        // Before its first instruction: a loader failure then ends the process, with the failing
-        // status as its exit code, instead of waiting on a message box that nobody can answer.
-        if let Err(e) = hard_errors::suppress_hard_error_boxes(process.0) {
-            // SAFETY: the handle is the live process this function just created.
-            let _ = unsafe { TerminateProcess(process.0, 1) };
-            panic!("switch off the hard-error boxes of {exe:?} as {}: {e}", self.name);
-        }
-        // SAFETY: the handle is the primary thread of the process just created.
-        if unsafe { ResumeThread(thread.0) } == u32::MAX {
-            // SAFETY: as above.
-            let _ = unsafe { TerminateProcess(process.0, 1) };
-            panic!(
-                "resume {exe:?} as {}: {}",
-                self.name,
-                windows::core::Error::from_thread()
-            );
-        }
-        let mut evidence = evidence.to_vec();
-        if let Some(profile) = &self.profile {
-            evidence.push(profile.join("AppData").join("Local").join("ssh-broker"));
-        }
-        let what = format!("{exe:?} as {}", self.name);
-        bounded_wait::wait_for_exit(
-            process.0,
-            info.dwProcessId,
-            &what,
-            bounded_wait::CHILD_EXIT_BOUND,
-            &evidence,
-        )
-    }
-}
-
-impl Drop for Account {
-    fn drop(&mut self) {
-        // SAFETY: NUL-terminated inputs.
-        unsafe {
-            if self.profile.is_some() {
-                let _ = DeleteProfileW(PCWSTR(wide(&self.sid_text).as_ptr()), PCWSTR::null(), PCWSTR::null());
-            }
-            let _ = NetUserDel(PCWSTR::null(), PCWSTR(wide(&self.name).as_ptr()));
-        }
-    }
-}
-
-/// A fresh directory under the temp dir, removed on drop, that every account can read, run from
-/// and write to: the place the test binary copy and its result files live.
-struct SharedDir(PathBuf);
-
-impl SharedDir {
-    /// The directory, readable and writable by everyone.
-    fn new(tag: &str) -> SharedDir {
-        let shared = SharedDir::without_grant(tag);
-        let status = desktop::status(
-            Command::new("icacls")
-                .arg(&shared.0)
-                .args(["/grant", "*S-1-1-0:(OI)(CI)M"]),
-        )
-        .unwrap();
-        assert!(status.success(), "icacls on the shared directory");
-        shared
-    }
-
-    /// The directory as the temp dir makes it: for a child that runs as this account.
-    fn without_grant(tag: &str) -> SharedDir {
-        let dir = std::env::temp_dir().join(format!("sb-iso-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        SharedDir(dir)
-    }
-}
-
-impl Drop for SharedDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
+use account::{Account, SharedDir, wide};
 
 /// What `icacls` prints for `path`, for an assertion message.
 fn icacls_report(path: &Path) -> String {
@@ -899,7 +603,19 @@ fn shim_as_bob_never_reaches_another_users_listener() {
         icacls_report(&shared.0)
     );
     // The location resolved (to bob's own) and nothing listens there: no reason, no log failure.
-    assert_eq!(run.stderr, NO_AGENT_LINE, "the shim failed open for the wrong reason");
+    // A command session of an account with no session says so once, then gives the usual fallback line.
+    let notice = format!("ssh-broker: {} has no Windows session on this PC", bob.name);
+    assert!(
+        run.stderr.starts_with(&notice) && run.stderr.ends_with(NO_AGENT_LINE),
+        "the shim failed open for the wrong reason: {:?}",
+        run.stderr
+    );
+    assert_eq!(
+        run.stderr.matches("ssh-broker: ").count(),
+        2,
+        "the notice and the fallback line, once each: {:?}",
+        run.stderr
+    );
     assert!(
         run.stdout.contains("shim-ran"),
         "and ran the command locally: {}",

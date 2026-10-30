@@ -46,6 +46,23 @@ pub struct ProbeResult {
     /// see what arrived, so the PROBE line is the only way to learn the client → child direction;
     /// the downstream half is checked by comparing the child's stdout directly.
     pub upstream: UpstreamState,
+    /// The logon type of the probe's logon session (`SECURITY_LOGON_TYPE`), when it could be read.
+    /// `None` is "not proven", like a missing `dpapi`.
+    pub logon_type: Option<u32>,
+}
+
+/// `SECURITY_LOGON_TYPE` Interactive.
+const LOGON_TYPE_INTERACTIVE: u32 = 2;
+/// `SECURITY_LOGON_TYPE` Batch: what Task Scheduler gives an auto-login task.
+const LOGON_TYPE_BATCH: u32 = 4;
+
+/// Whether a probe that ran in session `session_id` with a logon session of `logon_type` is in a
+/// genuine user session. Session 0 is the services session of a network logon, the limited
+/// environment this tool exists to leave; but a user's own interactive or batch logon (the
+/// auto-login task's) lands there too and has a loaded profile and DPAPI. Default-deny: a network
+/// logon, an unknown type or an unreadable one in session 0 is not genuine.
+pub fn is_genuine_session(session_id: u32, logon_type: Option<u32>) -> bool {
+    session_id != 0 || matches!(logon_type, Some(LOGON_TYPE_INTERACTIVE | LOGON_TYPE_BATCH))
 }
 
 /// Outcome of the upstream (client → child) transparency check.
@@ -158,9 +175,16 @@ fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 }
 
 /// The single line `verify-probe` prints to stdout.
-pub fn format_probe_line(session_id: u32, dpapi_ok: bool, symlink: SymlinkState, upstream_ok: bool) -> String {
+pub fn format_probe_line(
+    session_id: u32,
+    dpapi_ok: bool,
+    symlink: SymlinkState,
+    upstream_ok: bool,
+    logon_type: Option<u32>,
+) -> String {
+    let logon = logon_type.map_or(String::new(), |t| format!(" logon={t}"));
     format!(
-        "PROBE session_id={session_id} dpapi={} symlink={} upstream={}",
+        "PROBE session_id={session_id} dpapi={} symlink={} upstream={}{logon}",
         if dpapi_ok { "ok" } else { "fail" },
         symlink.as_str(),
         if upstream_ok { "ok" } else { "fail" }
@@ -184,6 +208,7 @@ pub fn parse_probe_line(stdout: &str) -> anyhow::Result<ProbeResult> {
         // default of "ok" would restore exactly the unverified assertion it exists to replace.
         // `Absent` rather than `Fail` so the row can say WHICH of the two happened.
         upstream: UpstreamState::Absent,
+        logon_type: None,
     };
     for tok in line.split_whitespace() {
         if let Some(v) = tok.strip_prefix("session_id=") {
@@ -194,6 +219,8 @@ pub fn parse_probe_line(stdout: &str) -> anyhow::Result<ProbeResult> {
             r.symlink = SymlinkState::parse(v);
         } else if let Some(v) = tok.strip_prefix("upstream=") {
             r.upstream = UpstreamState::parse(v);
+        } else if let Some(v) = tok.strip_prefix("logon=") {
+            r.logon_type = v.parse().ok();
         }
     }
     Ok(r)
@@ -208,6 +235,47 @@ pub fn current_session_id() -> u32 {
     let mut sid = 0u32;
     let _ = unsafe { windows::Win32::System::RemoteDesktop::ProcessIdToSessionId(std::process::id(), &mut sid) };
     sid
+}
+
+/// The logon type of this process's logon session, read from LSA by the token's logon id. `None`
+/// when any step fails: the caller treats "unknown" as "not proven".
+#[cfg(windows)]
+pub fn current_logon_type() -> Option<u32> {
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Security::Authentication::Identity::{
+        LsaFreeReturnBuffer, LsaGetLogonSessionData, SECURITY_LOGON_SESSION_DATA,
+    };
+    use windows::Win32::Security::{GetTokenInformation, TOKEN_QUERY, TOKEN_STATISTICS, TokenStatistics};
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    let mut token = HANDLE::default();
+    // SAFETY: a valid out-pointer; the handle is closed by `OwnedHandle`.
+    unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) }.ok()?;
+    let token = crate::winutil::OwnedHandle(token);
+    let mut stats = TOKEN_STATISTICS::default();
+    let mut len = 0u32;
+    // SAFETY: `stats` is a `TOKEN_STATISTICS` and the length passed is its size.
+    unsafe {
+        GetTokenInformation(
+            token.0,
+            TokenStatistics,
+            Some(&mut stats as *mut _ as *mut core::ffi::c_void),
+            std::mem::size_of::<TOKEN_STATISTICS>() as u32,
+            &mut len,
+        )
+    }
+    .ok()?;
+    let mut data: *mut SECURITY_LOGON_SESSION_DATA = std::ptr::null_mut();
+    // SAFETY: a valid logon id and out-pointer; the buffer LSA allocates is freed below.
+    let status = unsafe { LsaGetLogonSessionData(&stats.AuthenticationId, &mut data) };
+    if status.0 != 0 || data.is_null() {
+        return None;
+    }
+    // SAFETY: LSA returned a valid structure, read before it is freed.
+    let logon_type = unsafe { (*data).LogonType };
+    // SAFETY: the buffer came from LSA.
+    let _ = unsafe { LsaFreeReturnBuffer(data.cast()) };
+    Some(logon_type)
 }
 
 /// The active physical console session id (`WTSGetActiveConsoleSessionId`); `0xFFFF_FFFF` if

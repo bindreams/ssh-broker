@@ -569,7 +569,7 @@ fn verify_install_dir_acl_rejects_a_reduced_mask_for_administrators() {
 }
 
 /// The security descriptor of `sddl`, held in memory (never applied to an object).
-fn in_memory(sddl: &str) -> Security {
+pub(super) fn in_memory(sddl: &str) -> Security {
     let sddl_w: Vec<u16> = sddl.encode_utf16().chain(std::iter::once(0)).collect();
     unsafe {
         let mut psd = PSECURITY_DESCRIPTOR::default();

@@ -17,6 +17,7 @@ pub const SOCKET_FILE_NAME: &str = "agent.sock";
 pub const LOCK_FILE_NAME: &str = "agent.lock";
 pub const SESSIONS_LOCK_FILE_NAME: &str = "sessions.lock";
 pub const LOGS_DIR_NAME: &str = "logs";
+pub const SERVING_MARKER_NAME: &str = "serving";
 
 /// A user's socket directory and the socket inside it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,6 +36,12 @@ impl SocketLocation {
     /// one agent of its session.
     pub fn sessions_lock_path(&self) -> PathBuf {
         self.dir.join(SESSIONS_LOCK_FILE_NAME)
+    }
+
+    /// The file every agent rewrites once its listener is up. Its content means nothing and it is
+    /// never read: the change in the folder is the signal a waiting shim watches for.
+    pub fn serving_marker_path(&self) -> PathBuf {
+        self.dir.join(SERVING_MARKER_NAME)
     }
 
     /// The folder the shim and the agent log into.

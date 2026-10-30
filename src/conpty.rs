@@ -238,13 +238,19 @@ impl PtySession {
         self.out_read.0.0 as isize
     }
 
+    /// Raw handle (as `isize`) of the shell's process, valid until the session is dropped; for a test
+    /// that has to see the shell end.
+    pub fn process_raw(&self) -> isize {
+        self.process.0.0 as isize
+    }
+
     /// Raw input-write handle (as `isize`) for forwarding decoded input.
     pub fn in_write_raw(&self) -> isize {
         self.in_write.0.0 as isize
     }
 
     /// Hand the pseudoconsole's raw handle to the caller, who then owns closing it (via
-    /// [`close_pty_raw`]); `PtySession`'s own Drop no longer closes it. Used by the agent
+    /// [`close_pty_raw`]); `PtySession`'s Drop does not close it. Used by the agent
     /// so the HPCON can be shared (behind a mutex) between the resize and teardown paths.
     pub fn take_hpc_raw(&mut self) -> isize {
         match self.hpc.take() {

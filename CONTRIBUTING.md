@@ -56,7 +56,7 @@ symlink) owned by the user, SYSTEM or Administrators, and refuses anything else 
 path that would push the socket past the 107-byte AF_UNIX limit is an error, not a reason to use
 another location (`socket_loc::SocketLocationError::TooLong`).
 
-The install directory is the other half of the boundary: the agent and the SYSTEM self-heal task run the exe in it, so a directory a standard user can write to is a privilege escalation. `apply` verifies it exactly and reads and writes nothing in it until that passes.
+The install directory is the other half of the boundary: the agent and the SYSTEM self-heal task run the exe in it, so a directory a standard user can write to is a privilege escalation. `apply` verifies it exactly and reads and writes nothing in it until that passes. Users can read what is in it, so a file in it that a user must not open (`apply.lock`: a byte-range lock needs only a read handle) gets its own protected DACL of SYSTEM and Administrators at creation, verified exactly (`acl::ensure_admin_only_file`).
 
 ### Fail-open is deliberate, and never in the security boundary
 
@@ -153,6 +153,22 @@ inline `#[cfg(test)] mod`. The hook catches the inline form; that the sibling is
 up with `#[path]` is *(review-enforced)*. Inline modules hide host-testable logic inside files that are
 otherwise platform-gated — which is how `child_cwd`'s tests once became unreachable from the
 macOS build.
+
+**The password has three sinks** *(review-enforced)*. It is read from the console (the shim's prompt, and
+`auto-login on`'s) into a `SecretUnits` (`secret.rs`: fully initialised backing, wiped on drop and before a
+growth frees the old store); the console's record buffer is wiped after every read. From there it goes only to
+Windows, in these places:
+
+- `CreateProcessWithLogonW`, to start a background session (`logon::start_background_agent`), in a
+  NUL-terminated copy that `Password::with_nul` wipes when the call returns;
+- `LogonUserW`, to ask whether the account may log on as a batch job (`logon::check_batch_logon`), in the same
+  kind of wiped copy;
+- Task Scheduler's `RegisterTask`, which **stores** it in its credential store for `auto-login on`
+  (`provision::password_variant`): a BSTR copy that is zeroed before it is freed. Task Scheduler's own copy
+  and the RPC buffers that carry it are outside this process.
+
+It never goes on a command line, into the environment, a file, a log, a `tracing` field, a `Debug` impl or an
+error text. A new use of it is a new sink: review it as one.
 
 **No personal home paths** in tracked files *(hook-enforced)*; no usernames or machine names
 *(review)* — the hook matches home-directory shapes only, so a bare username or a hostname is

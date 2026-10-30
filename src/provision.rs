@@ -8,17 +8,22 @@
 //! agent makes and hardens its own socket directory in its own profile, so a SYSTEM-run
 //! self-heal has nothing to resolve.
 
+#[cfg(windows)]
+pub(crate) mod apply_lock;
 pub mod bounded;
 #[cfg(windows)]
 mod flow;
 #[cfg(windows)]
 pub(crate) mod layout;
+#[cfg(windows)]
+pub mod password_variant;
 pub mod probe;
 #[cfg(windows)]
-pub(crate) mod procwait;
+pub mod procwait;
 pub mod registry;
 pub mod report;
 pub mod schtasks;
+pub mod session_task;
 #[cfg(windows)]
 pub mod sessions;
 #[cfg(windows)]
@@ -96,7 +101,9 @@ mod provision_tests;
 #[cfg(windows)]
 mod imp {
     use super::layout::{self, Layout};
-    use super::{flow, probe, procwait, registry, report, schtasks, sessions, taskscheduler, user_rows};
+    use super::{
+        apply_lock, flow, probe, procwait, registry, report, schtasks, session_task, sessions, taskscheduler, user_rows,
+    };
     use crate::{afunix, shim};
     use anyhow::Context;
     use std::path::Path;
@@ -121,17 +128,29 @@ mod imp {
         //    fail-open can't help if sshd execs a missing binary. The install directory is gated
         //    first, so a planted one is never adopted, and a single-user install is replaced. A
         //    different build over an installed one stops every agent first (they hold the exe
-        //    open) and waits for them to exit, with the logon task disabled so that no logon
-        //    starts one from the old exe meanwhile. Every run from here ends by enabling the task, which
-        //    also heals one an earlier, killed `apply` left disabled; the agents start again
-        //    afterwards, even if a later step fails, except in a session whose old agent has not
-        //    exited.
+        //    open) and waits for them to exit, with the logon task and the auto-login tasks
+        //    disabled so that nothing starts one from the old exe meanwhile. Every run from here
+        //    ends by enabling those tasks and starting the auto-login ones that have no session
+        //    (see `flow::repair_sessions`), which also heals what an earlier, killed `apply` left;
+        //    the agents start again afterwards, even if a later step fails, except in a session
+        //    whose old agent has not exited.
         let current = std::env::current_exe().context("current_exe")?;
+        // The install directory first: the lock file lives in it, and nothing is read from it or
+        // written into it before it is proved ours. One `apply` runs at a time, for its whole run,
+        // and no `auto-login on|off` runs during it: a second `apply` (the boot self-heal is one)
+        // waits here, so it never stops or starts what the first is working on.
+        let base = layout::ensure_base(&layout)?;
+        let _apply_lock = apply_lock::acquire(&layout.apply_lock_path(), || {
+            eprintln!("apply: another apply or an auto-login command is running; waiting for it to finish")
+        })?;
         let registered_xml = schtasks::registered_xml(taskscheduler::task_xml(schtasks::AGENT_TASK))?;
         let exe = flow::run(
-            || taskscheduler::stop_instances(schtasks::AGENT_TASK, &layout.canonical_exe()),
+            || {
+                taskscheduler::stop_instances(schtasks::AGENT_TASK, &layout.canonical_exe())?;
+                stop_background_sessions(&layout.canonical_exe())
+            },
             |stop_agents| {
-                let exe = layout::prepare(&layout, &current, registered_xml.as_deref(), stop_agents)?;
+                let exe = layout::prepare_in(&base, &current, registered_xml.as_deref(), stop_agents)?;
 
                 // 2. Register both tasks (idempotent /F).
                 register_agent_task(&layout, &exe)?;
@@ -152,6 +171,7 @@ mod imp {
             },
             agent_task_is_group_form,
             enable_agent_task,
+            repair_session_tasks,
             start_agents,
         )?;
         println!(
@@ -159,6 +179,22 @@ mod imp {
             exe.display()
         );
         Ok(())
+    }
+
+    /// The background sessions' part of the stop that precedes replacing the exe: the auto-login
+    /// tasks are disabled and their instances stopped, then every background agent left (the
+    /// prompt path starts one without a task) is ended. A shim is never ended: it holds the exe only until
+    /// its SSH session closes, and the copy reports it if it still does.
+    fn stop_background_sessions(image: &Path) -> anyhow::Result<()> {
+        flow::stop_sessions(
+            taskscheduler::session_tasks,
+            |name| taskscheduler::set_enabled(name, false),
+            |name| taskscheduler::stop_instances(name, image),
+            || procwait::background_agents(image),
+            |agent| agent.terminate(),
+            |agents| procwait::wait_all_exited(&agents, procwait::EXIT_BOUND),
+        )
+        .context("stop the background sessions")
     }
 
     /// Whether the registered agent task is the group logon task, the form that can start an agent
@@ -187,6 +223,18 @@ mod imp {
                 schtasks::AGENT_TASK
             )
         })
+    }
+
+    /// Enable every auto-login task that is disabled and start each one that has no session: undoes
+    /// the stop's disabling, and repairs what an `apply` that was killed (or a task disabled by hand)
+    /// left. See [`flow::repair_sessions`].
+    fn repair_session_tasks() -> anyhow::Result<()> {
+        flow::repair_sessions(
+            taskscheduler::session_tasks,
+            |name| taskscheduler::set_enabled(name, true),
+            taskscheduler::has_running_instance,
+            taskscheduler::run_task,
+        )
     }
 
     /// Step 4 of `apply`: start an agent in each session that already has a user, so nobody has to
@@ -314,6 +362,20 @@ mod imp {
 
         // Local: the agent task is registered in its group form (any user, interactive session).
         rows.push(schtasks::agent_task_row(&taskscheduler::task_xml(schtasks::AGENT_TASK)));
+        // Local: this account's auto-login task, if it has one (informational for everyone who has not
+        // turned auto-login on, which passes).
+        match crate::acl::Sid::current_user().and_then(|sid| sid.to_sddl()) {
+            Ok(sid) => rows.push(session_task::task_row(
+                &taskscheduler::task_state(&session_task::task_name(&sid)),
+                &layout.canonical_exe().to_string_lossy(),
+                &sid,
+            )),
+            Err(e) => rows.push(report::Check::new(
+                "auto-login task",
+                false,
+                format!("could not tell who this is: {e:#}"),
+            )),
+        }
         // Informational: verify runs via the LeastPrivilege agent (non-elevated) and cannot
         // reliably query a SYSTEM-owned task, so this never gates verify (apply errors loudly
         // if registration fails, and the reboot self-heal is exercised in the Phase-8 test).
@@ -364,11 +426,12 @@ mod imp {
                 // interactive sessions — and DPAPI/symlink below confirm it is a genuine one.
                 rows.push(report::Check::new(
                     "interactive session (via agent)",
-                    p.session_id != 0,
+                    probe::is_genuine_session(p.session_id, p.logon_type),
                     format!(
-                        "session_id={} (active console={})",
+                        "session_id={} (active console={}, logon type={})",
                         p.session_id,
-                        probe::active_console_session()
+                        probe::active_console_session(),
+                        p.logon_type.map_or("unknown".to_string(), |t| t.to_string())
                     ),
                 ));
                 rows.push(report::Check::new("DPAPI (via agent)", p.dpapi_ok, String::new()));
@@ -484,6 +547,7 @@ mod imp {
 
     pub fn verify_probe() -> anyhow::Result<()> {
         let sid = probe::current_session_id();
+        let logon_type = probe::current_logon_type();
         let dpapi = probe::dpapi_roundtrip(b"ssh-broker-parity-probe");
         let symlink = probe::symlink_probe();
         // Read the UPSTREAM payload first. This direction — client → child — is the one an
@@ -510,8 +574,12 @@ mod imp {
             use std::io::Write;
             let mut stdout = std::io::stdout().lock();
             probe::emit_binary_probe(&mut stdout).context("emit the binary-transparency payload")?;
-            writeln!(stdout, "{}", probe::format_probe_line(sid, dpapi, symlink, upstream_ok))
-                .context("write the PROBE line")?;
+            writeln!(
+                stdout,
+                "{}",
+                probe::format_probe_line(sid, dpapi, symlink, upstream_ok, logon_type)
+            )
+            .context("write the PROBE line")?;
             stdout.flush().context("flush probe output")?;
         }
         // Parity gates: escaped session 0 AND a working DPAPI (proves a real user profile, the
@@ -523,7 +591,7 @@ mod imp {
         // and this child is the wrong place to judge it — exiting non-zero would report a
         // transport fault as a parity failure, and the parent could not tell the two apart. It
         // rides up in the PROBE line instead, where `verify` gates it as a row of its own.
-        let pass = sid != 0 && dpapi && !symlink.is_failure();
+        let pass = probe::is_genuine_session(sid, logon_type) && dpapi && !symlink.is_failure();
         if !pass {
             std::process::exit(1);
         }

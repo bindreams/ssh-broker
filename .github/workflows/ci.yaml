@@ -16,6 +16,10 @@ concurrency:
   group: ci-${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+env:
+  # The nextest version the test job installs.
+  NEXTEST_VERSION: "0.9.148"
+
 # No toolchain action: `rust-toolchain.toml` is a rustup directory override, so the
 # first `cargo`/`rustup` call in the workspace installs the pinned channel along with
 # its `components` and `targets`. The install step below exists to make that explicit
@@ -94,7 +98,7 @@ jobs:
     name: Test (${{ matrix.label }})
     needs: platforms
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.platforms.outputs.matrix) }}
@@ -104,5 +108,132 @@ jobs:
       - name: Install pinned toolchain
         run: rustup toolchain install
 
-      - name: cargo test
-        run: cargo test --locked
+      # Tests wait for a Security event, which the system writes only with the auditing on: the end of a
+      # logon session (4634: `logon_session_is_logged_off_after_logout` and every test that ends a background
+      # session with `logout`, see `tests/common/session_end.rs`) and a refused logon
+      # (`a_stale_password_is_not_visible_in_the_last_result`, 4625).
+      - name: Audit logons and logoffs
+        if: runner.os == 'Windows'
+        run: |
+          auditpol /set /subcategory:"Logoff" /success:enable
+          auditpol /set /subcategory:"Logon" /failure:enable
+          wevtutil sl Microsoft-Windows-TaskScheduler/Operational /e:true
+
+      # nextest, one process per test: each failure prints when it happens, and a test that hangs is
+      # ended at the bound in `.config/nextest.toml` and named. `cargo test` prints failures only when
+      # a binary has finished, so one hang hid every failure after it.
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2
+        with:
+          tool: cargo-nextest@${{ env.NEXTEST_VERSION }}
+
+      # The prompt path starts the background agent from the installed exe (`provision::canonical_exe()`),
+      # and no test installs it, so a logon in a prompt test has no file to start the agent from.
+      # It is taken away again below, because `upgrade_windows` asserts the directory is absent.
+      - name: Put the exe where the prompt path starts agents from
+        if: runner.os == 'Windows'
+        run: |
+          cargo build --locked
+          New-Item -ItemType Directory -Force C:\ProgramData\ssh-broker | Out-Null
+          Copy-Item target\debug\ssh-broker.exe C:\ProgramData\ssh-broker\ssh-broker.exe
+
+      - name: Disk report (before the tests)
+        if: (success() || failure()) && runner.os == 'Windows'
+        run: .github/scripts/disk-report.ps1 'before the tests'
+
+      - name: cargo nextest
+        run: cargo nextest run --locked --profile ci
+
+      - name: Disk report (after nextest)
+        if: (success() || failure()) && runner.os == 'Windows'
+        run: .github/scripts/disk-report.ps1 'after nextest'
+
+      # The `m3_` tests measure what a caller's jobs do to the logon child (`logon::probe`), so the test
+      # process must be in no job. nextest and cargo each put what they run in one, and so does the runner
+      # for a step (a job with no limits). Task Scheduler starts a task outside all of them, so
+      # the test binary runs as a one-shot task of SYSTEM with its output in a file that this step prints.
+      # Each case asserts at its start that it is in no job. The filter `m3_` is a substring match and the one
+      # in `.config/nextest.toml` that leaves them out of the step above (`/^m3_/`) is anchored, so the step
+      # lists what `m3_` selects first and fails if that is nothing or includes a test that does not start with
+      # `m3_` (which both would run). libtest exits 0 when a filter selects nothing, so after the run the step
+      # also compares the number of tests that passed with the number listed. The wait re-checks the task's own
+      # state: it is over when the task is ready again and its last result has moved off "never run" (267011);
+      # the task's last result is the exit code of the test binary, which fails this step when it is not 0.
+      - name: M3 tests outside any job
+        if: (success() || failure()) && runner.os == 'Windows'
+        run: |
+          $built = cargo test --locked --test session_on_demand_windows --no-run --message-format=json
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $exe = $built | ForEach-Object { $_ | ConvertFrom-Json } |
+            Where-Object { $_.executable -and $_.target.name -eq 'session_on_demand_windows' } |
+            ForEach-Object { $_.executable }
+          if (-not $exe) { throw "cargo did not name the session_on_demand_windows test binary" }
+          $listed = @(& $exe m3_ --list | ForEach-Object { if ($_ -match '^(.*): test$') { $Matches[1] } })
+          if ($LASTEXITCODE -ne 0) { throw "listing the m3_ tests failed with exit code $LASTEXITCODE" }
+          if ($listed.Count -eq 0) { throw "no test of session_on_demand_windows matches m3_: this step would run nothing" }
+          $stray = @($listed | Where-Object { $_ -notmatch '^m3_' })
+          if ($stray.Count -gt 0) { throw "matched by m3_ but not starting with it, so nextest runs them too: $($stray -join ', ')" }
+          $out = Join-Path $env:RUNNER_TEMP 'm3-outside-any-job.txt'
+          Remove-Item -Force -ErrorAction SilentlyContinue $out
+          $task = "sb-m3-$PID"
+          $action = New-ScheduledTaskAction -Execute 'cmd.exe' -WorkingDirectory (Get-Location).Path `
+            -Argument ('/s /c ""{0}" m3_ > "{1}" 2>&1"' -f $exe, $out)
+          $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -RunLevel Highest
+          Register-ScheduledTask -TaskName $task -Action $action -Principal $principal | Out-Null
+          try {
+            Start-ScheduledTask -TaskName $task
+            # The state is read first: a task seen Ready has finished, so the result read after it is this run's
+            # and not the result of a run that was still going when the state was read.
+            do {
+              $state = (Get-ScheduledTask -TaskName $task).State
+              $info = Get-ScheduledTaskInfo -TaskName $task
+            } while ($state -ne 'Ready' -or $info.LastTaskResult -eq 267011)
+            $code = $info.LastTaskResult
+          } finally {
+            Stop-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue
+            Unregister-ScheduledTask -TaskName $task -Confirm:$false
+          }
+          $text = if (Test-Path $out) { Get-Content -Raw $out } else { '' }
+          if ($text) { Write-Output $text } else { Write-Output "the task wrote no output to $out" }
+          Write-Output "m3 test binary exit code: $code"
+          if ($code -ne 0) { exit 1 }
+          $passed = 0
+          foreach ($m in [regex]::Matches($text, 'test result: ok\. (\d+) passed')) { $passed += [int]$m.Groups[1].Value }
+          if ($passed -ne $listed.Count) { throw "m3 tests passed: $passed, listed: $($listed.Count)" }
+
+      - name: Disk report (after the M3 tests)
+        if: (success() || failure()) && runner.os == 'Windows'
+        run: .github/scripts/disk-report.ps1 'after the M3 tests'
+
+      - name: Take that exe away again
+        if: (success() || failure()) && runner.os == 'Windows'
+        run: Remove-Item -Recurse -Force C:\ProgramData\ssh-broker
+
+      # The tests that take the machine alone (`machine::exclusive()`) run after the rest, one at a time.
+      - name: cargo nextest (machine-exclusive tests)
+        if: success() || failure()
+        run: cargo nextest run --locked --profile ci-exclusive --test-threads 1 --no-tests pass
+
+      - name: Doctests
+        if: success() || failure()
+        run: cargo test --locked --doc
+
+      - name: Disk report (end)
+        if: (success() || failure()) && runner.os == 'Windows'
+        run: .github/scripts/disk-report.ps1 'end'
+
+      # What the tests recorded about the end of sessions and the state of hives and profiles afterwards
+      # (tests/common/hive.rs); nextest hides the output of a test that passes.
+      - name: Profile unload measurements
+        if: (success() || failure()) && runner.os == 'Windows'
+        run: |
+          $file = 'C:\ProgramData\sb-profile-measure.log'
+          if (Test-Path -LiteralPath $file) { Get-Content -LiteralPath $file } else { 'no measurement was recorded' }
+
+      # What the system recorded about logons, scheduled tasks and sshd, for a failed run to be read from the log.
+      - name: Logon and task events
+        if: failure() && runner.os == 'Windows'
+        run: |
+          wevtutil qe Security /q:"*[System[(EventID=4625)]]" /c:20 /rd:true /f:text
+          wevtutil qe Microsoft-Windows-TaskScheduler/Operational /c:80 /rd:true /f:text
+          wevtutil qe OpenSSH/Operational /c:80 /rd:true /f:text

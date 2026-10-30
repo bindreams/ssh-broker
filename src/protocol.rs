@@ -128,6 +128,9 @@ pub const PROTOCOL_VERSION: u16 = 1;
 pub enum Mode {
     Pty,
     Exec,
+    /// End the user's background session (`ssh-broker logout`). Appended last: postcard encodes
+    /// the variant index, so an installed agent keeps reading the first two.
+    Logout,
 }
 
 /// The first frame on a connection (a HANDSHAKE-kind frame whose payload is this

@@ -22,11 +22,16 @@ use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, S_FALSE, S_OK};
 use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize,
 };
-use windows::Win32::System::TaskScheduler::{IRegisteredTask, ITaskService, TASK_RUN_USE_SESSION_ID, TaskScheduler};
+use windows::Win32::System::TaskScheduler::{
+    IRegisteredTask, ITaskService, TASK_CREATE_OR_UPDATE, TASK_LOGON_PASSWORD, TASK_RUN_USE_SESSION_ID, TaskScheduler,
+};
 use windows::Win32::System::Variant::VARIANT;
 use windows::core::{BSTR, HRESULT, Interface};
 
+use super::password_variant::PasswordVariant;
 use super::procwait::{self, Process};
+use super::session_task::TaskState;
+use crate::password_entry::Password;
 
 /// `SCHED_E_TASK_NOT_RUNNING`: `Stop` on a task with no running instance.
 const SCHED_E_TASK_NOT_RUNNING: HRESULT = HRESULT(0x8004130Bu32 as i32);
@@ -140,6 +145,20 @@ pub fn stop_instances(task_name: &str, image: &Path) -> anyhow::Result<()> {
         },
         |processes| procwait::wait_all_exited(&processes, procwait::EXIT_BOUND),
     )
+}
+
+/// Whether the task `name` has a running instance, launched or not. A task that does not exist has
+/// none.
+pub fn has_running_instance(name: &str) -> anyhow::Result<bool> {
+    let _com = Com::init()?;
+    let service = connect()?;
+    let Some(task) = registered_task(&service, name)? else {
+        return Ok(false);
+    };
+    // SAFETY: `task` and the collection taken from it are live and used on this thread only.
+    let count = unsafe { task.GetInstances(0).and_then(|instances| instances.Count()) }
+        .with_context(|| format!("count the running instances of {name}"))?;
+    Ok(count > 0)
 }
 
 /// The running instances of a task: how many there are, and the processes among them that are
@@ -268,6 +287,126 @@ pub fn run_in_session(task_name: &str, session_id: u32) -> anyhow::Result<()> {
     // SAFETY: the variant and BSTR are empty values that outlive the call.
     unsafe { task.RunEx(&VARIANT::default(), TASK_RUN_USE_SESSION_ID.0, session, &BSTR::new()) }
         .with_context(|| format!("start {task_name} in session {session_id}"))?;
+    Ok(())
+}
+
+/// Register (or replace) a task that runs as `account` (`MACHINE\user`) with the password stored in
+/// Task Scheduler's credential store, from the definition `xml`, with the DACL `sddl`.
+///
+/// Task Scheduler refuses a wrong password here (`0x8007052e`, spike M5(c)) and a boot trigger to a
+/// token that is not an elevated administrator's (`0x80070005`, M5(a)).
+pub fn register_password_task(
+    name: &str,
+    xml: &str,
+    account: &str,
+    password: &Password,
+    sddl: &str,
+) -> anyhow::Result<()> {
+    let _com = Com::init()?;
+    let service = connect()?;
+    let stored = PasswordVariant::new(password);
+    // SAFETY: as in `connect`; every argument outlives the call.
+    unsafe {
+        service
+            .GetFolder(&BSTR::from("\\"))
+            .context("open the root task folder")?
+            .RegisterTask(
+                &BSTR::from(name),
+                &BSTR::from(xml),
+                TASK_CREATE_OR_UPDATE.0,
+                &VARIANT::from(account),
+                stored.variant(),
+                TASK_LOGON_PASSWORD,
+                &VARIANT::from(sddl),
+            )
+    }
+    .with_context(|| format!("register the task {name} for {account}"))?;
+    Ok(())
+}
+
+/// The auto-login tasks (`ssh-broker-session-*`) and whether each is enabled.
+pub fn session_tasks() -> anyhow::Result<Vec<super::flow::SessionTask>> {
+    let _com = Com::init()?;
+    let service = connect()?;
+    // SAFETY: as in `connect`; 1 is TASK_ENUM_HIDDEN, so hidden tasks are listed too.
+    unsafe {
+        let tasks = service
+            .GetFolder(&BSTR::from("\\"))
+            .context("open the root task folder")?
+            .GetTasks(1)
+            .context("list the tasks")?;
+        let count = tasks.Count().context("count the tasks")?;
+        let mut found = Vec::new();
+        // The collection is indexed from 1.
+        for index in 1..=count {
+            let task = tasks
+                .get_Item(&VARIANT::from(index))
+                .with_context(|| format!("read task {index}"))?;
+            let name = task.Name().context("read a task name")?.to_string();
+            if name.starts_with(super::session_task::TASK_PREFIX) {
+                let enabled = task
+                    .Enabled()
+                    .with_context(|| format!("read whether {name} is enabled"))?
+                    .as_bool();
+                found.push(super::flow::SessionTask { name, enabled });
+            }
+        }
+        Ok(found)
+    }
+}
+
+/// Delete the task `name`, which also deletes the credential stored for it (spike M5(e)). Whether
+/// there was a task.
+pub fn delete_task(name: &str) -> anyhow::Result<bool> {
+    let _com = Com::init()?;
+    let service = connect()?;
+    // SAFETY: as in `connect`.
+    let deleted = unsafe {
+        service
+            .GetFolder(&BSTR::from("\\"))
+            .context("open the root task folder")?
+            .DeleteTask(&BSTR::from(name), 0)
+    };
+    match deleted {
+        Ok(()) => Ok(true),
+        Err(e) if e.code() == HRESULT::from_win32(ERROR_FILE_NOT_FOUND.0) => Ok(false),
+        Err(e) => Err(e).with_context(|| format!("delete the task {name}")),
+    }
+}
+
+/// What the service holds for the task `name`: its definition, its DACL and its last result. `None`
+/// if there is no such task; a query that cannot be answered is an error.
+pub fn task_state(name: &str) -> anyhow::Result<Option<TaskState>> {
+    let _com = Com::init()?;
+    let service = connect()?;
+    let Some(task) = registered_task(&service, name)? else {
+        return Ok(None);
+    };
+    // SAFETY: `task` is a live interface on this thread. 4 is DACL_SECURITY_INFORMATION.
+    unsafe {
+        Ok(Some(TaskState {
+            xml: task
+                .Xml()
+                .with_context(|| format!("read the definition of the task {name}"))?
+                .to_string(),
+            sddl: task
+                .GetSecurityDescriptor(4)
+                .with_context(|| format!("read the permissions of the task {name}"))?
+                .to_string(),
+            last_result: task
+                .LastTaskResult()
+                .with_context(|| format!("read the last result of the task {name}"))? as u32,
+        }))
+    }
+}
+
+/// Start the task `name` now, without waiting for it.
+pub fn run_task(name: &str) -> anyhow::Result<()> {
+    let _com = Com::init()?;
+    let service = connect()?;
+    let task = registered_task(&service, name)?.with_context(|| format!("the task {name} is not registered"))?;
+    // SAFETY: the variant is an empty value that outlives the call.
+    unsafe { task.Run(&VARIANT::default()) }.with_context(|| format!("start the task {name}"))?;
     Ok(())
 }
 

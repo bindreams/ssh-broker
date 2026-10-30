@@ -4,6 +4,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 use crate::socket_loc::SocketLocation;
 
@@ -98,6 +99,25 @@ impl Drop for TempProfile {
     }
 }
 
+// A connected AF_UNIX pair -----
+
+/// A connected AF_UNIX pair in a temp dir (no ACLs: these tests exercise the reply, not the security
+/// boundary). Returns the server's socket, the client's and the dir to remove.
+pub fn raw_socket_pair(tag: &str) -> (socket2::Socket, socket2::Socket, PathBuf) {
+    use socket2::{Domain, SockAddr, Socket, Type};
+    let dir = std::env::temp_dir().join(format!("sb-pair-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("s");
+    let listener = Socket::new(Domain::UNIX, Type::STREAM, None).unwrap();
+    listener.bind(&SockAddr::unix(&path).unwrap()).unwrap();
+    listener.listen(1).unwrap();
+    let client = Socket::new(Domain::UNIX, Type::STREAM, None).unwrap();
+    client.connect(&SockAddr::unix(&path).unwrap()).unwrap();
+    let (server, _) = listener.accept().unwrap();
+    (server, client, dir)
+}
+
 // Elevation -----
 
 /// Fail loudly unless this process is an elevated administrator. For the tests that need it, so
@@ -182,4 +202,159 @@ impl Drop for ThrowawayTask {
             .args(["/Delete", "/TN", &self.0, "/F"])
             .output();
     }
+}
+
+// Waiting for a pipe to fill, and for a process to end -----
+
+/// What `CreatePipe(.., 0)` gives a pipe when `GetNamedPipeInfo` does not report its size. In CI a
+/// pseudoconsole's output pipe held 4101 bytes with the shell blocked on it and nothing reading.
+pub const DEFAULT_PIPE_BUFFER: u32 = 4096;
+
+/// The bytes waiting in the pipe whose read end is `read`, or the reason they could not be counted.
+/// `read` has to be open for the call.
+pub fn pipe_pending(read: isize) -> Result<u32, String> {
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::System::Pipes::PeekNamedPipe;
+
+    let mut pending = 0u32;
+    // SAFETY: a size query: no buffer; the caller keeps the handle open for the call.
+    unsafe {
+        PeekNamedPipe(
+            HANDLE(read as *mut core::ffi::c_void),
+            None,
+            0,
+            None,
+            Some(&mut pending),
+            None,
+        )
+    }
+    .map(|()| pending)
+    .map_err(|e| e.to_string())
+}
+
+/// The input buffer size of the pipe whose read end is `read`, in bytes, if the system reports one.
+pub fn pipe_buffer(read: isize) -> Option<u32> {
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::System::Pipes::GetNamedPipeInfo;
+
+    let mut size = 0u32;
+    // SAFETY: a size query on a handle the caller keeps open for the call.
+    unsafe {
+        GetNamedPipeInfo(
+            HANDLE(read as *mut core::ffi::c_void),
+            None,
+            None,
+            Some(&mut size),
+            None,
+        )
+    }
+    .ok()
+    .filter(|()| size > 0)
+    .map(|()| size)
+}
+
+/// Wait until at least `at_least` bytes are waiting in the pipe whose read end is `read`, by counting
+/// them again after each pause: nothing signals that a pipe has filled. `Err` says why the bound ran
+/// out, or why the bytes could not be counted. The bound is the failure the caller reports; the pause
+/// only paces the counting.
+pub fn wait_for_pipe_pending(read: isize, at_least: u32, bound: Duration) -> Result<u32, String> {
+    let deadline = std::time::Instant::now() + bound;
+    loop {
+        let pending = pipe_pending(read).map_err(|e| format!("counting the bytes waiting failed: {e}"))?;
+        if pending >= at_least {
+            return Ok(pending);
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(format!(
+                "{pending} bytes were waiting after {bound:?}, short of {at_least}"
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(5)); // sleep-ok: paces the re-count of the real condition above; the bound is the failure report and the pause is not read as state
+    }
+}
+
+/// Whether the process `process` (a handle the caller keeps open for the call) has ended, waiting up
+/// to `bound` for an end that was asked for and may not come: `false` if the bound ran out.
+pub fn process_ended_within(process: isize, bound: Duration) -> bool {
+    use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
+    use windows::Win32::System::Threading::WaitForSingleObject;
+
+    let millis = u32::try_from(bound.as_millis()).map_or(u32::MAX - 1, |millis| millis.min(u32::MAX - 1));
+    // SAFETY: the caller keeps the process handle open for the call.
+    let woke = unsafe { WaitForSingleObject(HANDLE(process as *mut core::ffi::c_void), millis) }; // sleep-ok: failure bound on a process's end, an external event; expiry is reported and is not read as state
+    woke == WAIT_OBJECT_0
+}
+
+// Naming a hang -----
+
+/// Ends the process, with a message that says where the test was, if the test is still running
+/// `bound` after this was made. For a test of code that may hang: nextest ends a hung test after its
+/// own limit with no more than "running for over 60 seconds". The bound is the failure surfaced to a
+/// human; nothing is concluded from the time passing but that the test did not finish.
+///
+/// The process is aborted, not the test panicked, because the thread that hangs is the test's own and
+/// no panic reaches it.
+pub struct Watchdog {
+    done: Option<std::sync::mpsc::Sender<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Watchdog {
+    /// `what` is the test's job; `seen` says how far it got, and is called on the watchdog's thread.
+    pub fn arm(what: &'static str, bound: Duration, seen: impl Fn() -> String + Send + 'static) -> Watchdog {
+        let (done, finished) = std::sync::mpsc::channel::<()>();
+        let thread = std::thread::spawn(move || {
+            // The sender is dropped when the test ends, which wakes this with `Disconnected`.
+            let ended = finished.recv_timeout(bound); // sleep-ok: failure bound on a hang of the test itself
+            if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = ended {
+                eprintln!("HANG: {what} did not finish within {bound:?}. Seen: {}", seen());
+                std::process::abort();
+            }
+        });
+        Watchdog {
+            done: Some(done),
+            thread: Some(thread),
+        }
+    }
+}
+
+impl Drop for Watchdog {
+    fn drop(&mut self) {
+        drop(self.done.take());
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+// Logging -----
+
+/// Run `f` and return what it logged, with its result.
+pub fn logged<T>(f: impl FnOnce() -> T) -> (String, T) {
+    use std::sync::{Arc, Mutex};
+    #[derive(Clone, Default)]
+    struct Buf(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for Buf {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Buf {
+        type Writer = Buf;
+        fn make_writer(&'a self) -> Buf {
+            self.clone()
+        }
+    }
+    let buf = Buf::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(buf.clone())
+        .with_ansi(false)
+        .finish();
+    let result = tracing::subscriber::with_default(subscriber, f);
+    let log = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+    (log, result)
 }

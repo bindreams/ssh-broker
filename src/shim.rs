@@ -3,7 +3,7 @@
 
 use crate::cmdline::RawExec;
 use crate::protocol::{FrameKind, FrameReader, Handshake, Mode, Resize, Stream, write_frame};
-use crate::relay::{FrameSink, Outcome, pump_decode, write_data};
+use crate::relay::{FrameSink, Outcome, PumpError, pump_decode, write_data};
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
 
@@ -58,12 +58,12 @@ pub fn is_blank_command(command: &str) -> bool {
 /// forward `stdin` as `DATA(Stdin)` frames, and write the agent's `Stdout`/`Stderr` (kept
 /// separate) to `out`/`err`, returning the child's exit code.
 ///
-/// The write half (`tx`) is held by this function until AFTER the `EXIT` frame arrives, so
-/// it is not closed mid-run. That matters because of the EXEC convention (see
-/// `protocol::Stream`): the agent treats a full socket close as a *disconnect* and kills the
-/// child, whereas stdin-EOF is signalled by an empty `DATA(Stdin)` marker. Closing `tx` at
-/// stdin EOF would therefore kill a child that is still producing output.
-pub fn run_exec_on<R, W, O, E, I>(mut rx: R, tx: W, hs: &Handshake, out: O, err: E, stdin: I) -> anyhow::Result<i32>
+/// The write half (`tx`) is held until AFTER the `EXIT` frame arrives, so it is not closed mid-run.
+/// That matters because of the EXEC convention (see `protocol::Stream`): the agent treats a full
+/// socket close as a *disconnect* and kills the child, whereas stdin-EOF is signalled by an empty
+/// `DATA(Stdin)` marker. Closing `tx` at stdin EOF would therefore kill a child that is still
+/// producing output.
+pub fn run_exec_on<R, W, O, E, I>(rx: R, tx: W, hs: &Handshake, out: O, err: E, stdin: I) -> anyhow::Result<i32>
 where
     R: Read,
     W: Write + Send + 'static,
@@ -71,34 +71,153 @@ where
     E: Write,
     I: Read + Send + 'static,
 {
-    let tx = Arc::new(Mutex::new(tx));
-    // Handshake first, so the agent spawns the child before any stdin/output flows.
-    {
-        let mut g = tx.lock().unwrap();
-        write_frame(&mut *g, FrameKind::Handshake, &hs.encode()?)?;
-    }
-    // Detached stdin forwarder: it holds its own `tx` clone, but it is THIS scope's `tx`
-    // (dropped only after EXIT, below) that keeps the write half open past stdin EOF. A
-    // blocking stdin read cannot be portably cancelled, so the thread is not joined; the
-    // shim process exit reaps it.
-    {
-        let tx = Arc::clone(&tx);
-        std::thread::spawn(move || forward_stdin(stdin, tx));
-    }
-
-    let mut sink = ExecOutSink { out, err };
-    let mut fr = FrameReader::new();
-    let outcome = pump_decode(&mut rx, &mut fr, &mut sink);
-    // `tx` drops at the end of this scope — after the relay finished, never at stdin EOF.
+    let _keep_open = match start_exec_input(tx, hs, stdin)? {
+        Started::Ready(keep) => keep,
+        Started::Closed(e) => return Err(e),
+    };
     // Route the outcome through the shared exit-code policy so a dead agent (PeerClosed) is
     // 255 and a protocol error is 254 — never the in-band exit 1 that would be
     // indistinguishable from a real command's failure (e.g. `findstr`/`grep` no-match).
-    Ok(map_outcome(outcome))
+    Ok(pump_exec(rx, out, err).code())
 }
 
-/// Forward `stdin` to `DATA(Stdin)` frames; on EOF (or a read error, treated as EOF) send
-/// the empty-`Stdin` EOF marker so a reader like `sort`/`findstr` finishes — WITHOUT closing
-/// the connection. Best-effort: a write failure means the peer is gone, so just stop.
+/// Read the agent's side of an EXEC session until its `EXIT` frame or the end of the connection.
+pub fn pump_exec<R: Read, O: Write, E: Write>(mut rx: R, out: O, err: E) -> Pumped {
+    pump_heard(&mut rx, &mut FrameReader::new(), &mut ExecOutSink { out, err })
+}
+
+/// How a pump of the agent's frames ended, and whether the agent said anything first.
+pub struct Pumped {
+    pub outcome: Result<Outcome, PumpError>,
+    /// At least one byte came from the agent before the pump ended.
+    pub heard: bool,
+}
+
+/// The exit code of a client that stops because the agent broke the protocol: the code of a protocol
+/// error (see [`map_outcome`]).
+pub const PROTOCOL_VIOLATION_CODE: i32 = 254;
+
+/// What a client says when two connections in a row that connected were closed without a byte. An agent
+/// that follows the protocol closes a connection without a byte only while its listener is closing, so
+/// the connect after that fails or reaches an agent that answers: this one is something else, such as
+/// an older agent that does not know the request.
+pub fn closed_twice_message(agent: Option<&std::path::Path>) -> String {
+    let at = agent.map(|path| format!(" at {}", path.display())).unwrap_or_default();
+    format!(
+        "ssh-broker: the agent{at} closed the connection twice without answering; it may be a different ssh-broker version"
+    )
+}
+
+impl Pumped {
+    /// The connection ended without the agent having sent a byte: the agent was ending, or was gone,
+    /// before it took this session, because an agent that is alive answers every connection it cannot
+    /// serve. An interactive session goes back to the path it takes when there is no agent; a command is
+    /// never sent again, since the agent may have started it. A protocol or sink failure cannot happen
+    /// without a byte.
+    pub fn no_answer(&self) -> bool {
+        !self.heard
+            && match &self.outcome {
+                Ok(Outcome::PeerClosed) => true,
+                Err(PumpError::Transport(e)) => is_peer_gone(e.kind()),
+                _ => false,
+            }
+    }
+
+    /// A connection whose handshake could not be sent because the peer had closed it (see
+    /// [`peer_gone`]): the agent never answered.
+    pub fn closed(e: anyhow::Error) -> Pumped {
+        let kind = peer_gone(&e).unwrap_or(std::io::ErrorKind::ConnectionReset);
+        Pumped {
+            outcome: Err(PumpError::Transport(std::io::Error::new(kind, e))),
+            heard: false,
+        }
+    }
+
+    /// The shim's exit code (see [`map_outcome`]).
+    pub fn code(self) -> i32 {
+        map_outcome(self.outcome)
+    }
+}
+
+/// Whether an I/O error kind says the peer closed or reset the connection.
+fn is_peer_gone(kind: std::io::ErrorKind) -> bool {
+    use std::io::ErrorKind::{BrokenPipe, ConnectionAborted, ConnectionReset};
+    matches!(kind, ConnectionReset | ConnectionAborted | BrokenPipe)
+}
+
+/// The kind, if a failed write says the peer closed or reset the connection.
+pub fn peer_gone(e: &anyhow::Error) -> Option<std::io::ErrorKind> {
+    e.chain()
+        .filter_map(|cause| cause.downcast_ref::<std::io::Error>())
+        .map(std::io::Error::kind)
+        .find(|kind| is_peer_gone(*kind))
+}
+
+/// [`pump_decode`], noting whether the agent sent anything.
+pub fn pump_heard<R: Read>(rx: &mut R, fr: &mut FrameReader, sink: &mut impl FrameSink) -> Pumped {
+    let mut rx = Heard {
+        inner: rx,
+        heard: false,
+    };
+    let outcome = pump_decode(&mut rx, fr, sink);
+    Pumped {
+        outcome,
+        heard: rx.heard,
+    }
+}
+
+/// A reader that notes whether a read has returned a byte.
+struct Heard<R> {
+    inner: R,
+    heard: bool,
+}
+
+impl<R: Read> Read for Heard<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.heard |= n > 0;
+        Ok(n)
+    }
+}
+
+/// What [`start_exec_input`] did.
+pub enum Started<W> {
+    /// The handshake went out and the input is being forwarded. The session lasts while the guard does.
+    Ready(KeepOpen<W>),
+    /// The peer had closed the connection when the handshake went out.
+    Closed(anyhow::Error),
+}
+
+/// Holds the write half of an EXEC connection open. The agent takes a close of the socket for a
+/// disconnect and kills the command, so the half must outlive the end of the input, which ends the
+/// thread that forwards it: it is dropped after the `EXIT` frame has arrived.
+pub struct KeepOpen<W> {
+    _tx: Arc<Mutex<W>>,
+}
+
+/// Send `hs` on `tx`, then forward `stdin` to it on a thread of its own, up to an end-of-input marker.
+/// The handshake goes first, so the agent starts the command before any input flows.
+///
+/// The thread is detached: a blocking read of stdin cannot be woken, and the process's exit reaps it.
+pub fn start_exec_input<W: Write + Send + 'static>(
+    mut tx: W,
+    hs: &Handshake,
+    stdin: impl Read + Send + 'static,
+) -> anyhow::Result<Started<W>> {
+    match write_frame(&mut tx, FrameKind::Handshake, &hs.encode()?) {
+        Ok(()) => {}
+        Err(e) if peer_gone(&e).is_some() => return Ok(Started::Closed(e)),
+        Err(e) => return Err(e),
+    }
+    let tx = Arc::new(Mutex::new(tx));
+    let forwarding = Arc::clone(&tx);
+    std::thread::spawn(move || forward_stdin(stdin, forwarding));
+    Ok(Started::Ready(KeepOpen { _tx: tx }))
+}
+
+/// Forward `stdin` to `DATA(Stdin)` frames; on EOF (or a read error, treated as EOF) send the
+/// empty-`Stdin` EOF marker so a reader like `sort`/`findstr` finishes, without closing the connection.
+/// Best-effort: a write failure means the peer is gone, so just stop.
 fn forward_stdin<I: Read, W: Write>(mut stdin: I, tx: Arc<Mutex<W>>) {
     let mut buf = [0u8; 32 * 1024];
     loop {

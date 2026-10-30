@@ -1,0 +1,42 @@
+# The Elevated Windows tests (`tests/*_windows.rs`) log accounts on, start agents and wait for them.
+# A wait that never ends must end the one test and name it, so the run prints every failure and
+# every hang. `cargo test` prints a failure only when the whole binary has finished, which a
+# single hang prevents.
+
+# The tests that take the machine alone (`machine::exclusive()`): they stop `seclogon` or
+# replace the machine install, so no other test may run beside them. What excludes them is the
+# cross-process lock in `tests/common/machine.rs`, which holds for any test that calls `exclusive()`.
+# This split only keeps them from waiting out the whole parallel run (the lock is not fair to a
+# writer): `ci` leaves them out and `ci-exclusive` runs them alone. Keep the two filters
+# complementary; a test missing from them is still correct, only slow.
+
+# The `m3_` tests of `session_on_demand_windows` measure what a caller's jobs do to the logon child, so
+# the test process must be in no job. nextest puts every test in one, so `ci` leaves them out and the
+# workflow runs them from the test binary itself ("M3 tests outside any job" in ci.yaml).
+[profile.ci]
+fail-fast = false
+default-filter = 'not (binary(session_on_demand_windows) & test(/^logon_with_seclogon_(stopped|disabled)_returns_windows_reason$/)) & not (binary(upgrade_windows) & test(/^apply_/)) & not (binary(session_on_demand_windows) & test(/^m3_/))'
+# A failure bound on our own run, never a pass: the longest test (an account that needs a profile,
+# a logon, a session) takes a few minutes, and the waits inside a test have bounds of their own
+# that fail first with a message. A test still running at this bound is ended and reported as
+# timed out.
+slow-timeout = { period = "120s", terminate-after = 5, grace-period = "1s" }
+
+# A test that makes an account ends it in its teardown, which for a secondary-logon account whose hive
+# stays loaded waits `UNLOAD_BOUND` (120 s) in `profile::remove`, and each `logout` of a service-started
+# session waits up to `LOGOFF_EVENT_BOUND` (180 s) for the logoff event; `logon_sessions_with_no_process_do_not_pile_up`
+# ends three sessions in its body. The default 600 s could end such a test in the middle of its teardown,
+# lose the message and leave the account and its profile. These binaries get 10 x 120 s.
+[[profile.ci.overrides]]
+filter = 'binary(auto_login_windows) | binary(prompt_path_windows) | binary(real_sshd_windows) | binary(session_on_demand_windows) | binary(upgrade_windows) | binary(user_isolation_windows)'
+slow-timeout = { period = "120s", terminate-after = 10, grace-period = "1s" }
+
+# The real-sshd test measures things the plan has never seen (the shim's session, logon type and job under
+# sshd): its output is the result, so a passing run prints it too.
+[[profile.ci.overrides]]
+filter = 'binary(real_sshd_windows)'
+success-output = "immediate"
+
+[profile.ci-exclusive]
+inherits = "ci"
+default-filter = '(binary(session_on_demand_windows) & test(/^logon_with_seclogon_(stopped|disabled)_returns_windows_reason$/)) | (binary(upgrade_windows) & test(/^apply_/))'

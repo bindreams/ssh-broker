@@ -58,6 +58,9 @@ use windows::core::{BOOL, HRESULT, PCWSTR, PWSTR};
 
 use crate::winutil::OwnedHandle;
 
+mod admin_file;
+pub use admin_file::{admin_only_file_problem, ensure_admin_only_file};
+
 /// ACCESS_ALLOWED_ACE_TYPE (winnt.h) — stored raw in `ACE_HEADER.AceType` (a `u8`).
 const ACE_TYPE_ALLOWED: u8 = 0;
 
@@ -96,9 +99,15 @@ impl Sid {
     /// SID of the user owning the current process token. Used by tests and by the
     /// interactive `apply` path; production provisioning resolves the grantee by name.
     pub fn current_user() -> anyhow::Result<Sid> {
+        // SAFETY: the pseudo-handle of the current process needs no closing.
+        Sid::of_process(unsafe { GetCurrentProcess() })
+    }
+
+    /// SID of the user owning the token of `process`, which needs `PROCESS_QUERY_LIMITED_INFORMATION`.
+    pub fn of_process(process: HANDLE) -> anyhow::Result<Sid> {
         unsafe {
             let mut token = HANDLE::default();
-            OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token)?;
+            OpenProcessToken(process, TOKEN_QUERY, &mut token)?;
             // Size probe: the first call is expected to fail with the needed length.
             let mut len = 0u32;
             let _ = GetTokenInformation(token, TokenUser, None, 0, &mut len);
@@ -180,6 +189,12 @@ impl Sid {
         describe_sid(self.as_psid())
     }
 
+    /// `(domain, name)` the account database holds for this SID.
+    pub fn account(&self) -> anyhow::Result<(String, String)> {
+        account_of_sid(self.as_psid())
+            .ok_or_else(|| anyhow::anyhow!("no account is known by the SID {}", self.describe()))
+    }
+
     /// The SID in SDDL string form ("S-1-5-…"), for embedding in a security descriptor.
     pub fn to_sddl(&self) -> anyhow::Result<String> {
         sid_to_string(self.as_psid())
@@ -204,6 +219,20 @@ fn describe_sid(psid: PSID) -> String {
             return "<none>".into();
         }
         let text = sid_to_string(psid).unwrap_or_else(|_| "<unprintable SID>".into());
+        let Some((domain, name)) = account_of_sid(psid) else {
+            return text;
+        };
+        if domain.is_empty() {
+            format!("{name} ({text})")
+        } else {
+            format!("{domain}\\{name} ({text})")
+        }
+    }
+}
+
+/// `(domain, name)` the account database holds for a valid `psid`, or `None` if it holds none.
+fn account_of_sid(psid: PSID) -> Option<(String, String)> {
+    unsafe {
         let (mut cch_name, mut cch_domain) = (0u32, 0u32);
         let mut sid_use = SID_NAME_USE(0);
         let _ = LookupAccountSidW(
@@ -216,11 +245,11 @@ fn describe_sid(psid: PSID) -> String {
             &mut sid_use,
         ); // size probe -> Err
         if cch_name == 0 {
-            return text;
+            return None;
         }
         let mut name = vec![0u16; cch_name as usize];
         let mut domain = vec![0u16; (cch_domain as usize).max(1)];
-        if LookupAccountSidW(
+        LookupAccountSidW(
             PCWSTR::null(),
             psid,
             Some(PWSTR(name.as_mut_ptr())),
@@ -229,17 +258,11 @@ fn describe_sid(psid: PSID) -> String {
             &mut cch_domain,
             &mut sid_use,
         )
-        .is_err()
-        {
-            return text;
-        }
-        let name = String::from_utf16_lossy(&name[..cch_name as usize]);
-        let domain = String::from_utf16_lossy(&domain[..cch_domain as usize]);
-        if domain.is_empty() {
-            format!("{name} ({text})")
-        } else {
-            format!("{domain}\\{name} ({text})")
-        }
+        .ok()?;
+        Some((
+            String::from_utf16_lossy(&domain[..cch_domain as usize]),
+            String::from_utf16_lossy(&name[..cch_name as usize]),
+        ))
     }
 }
 

@@ -12,28 +12,51 @@
 //! [`route`].
 
 #[cfg(windows)]
+pub mod account;
+#[cfg(windows)]
 pub mod acl;
 pub mod afunix;
 pub mod agent;
 #[cfg(windows)]
+pub mod agent_background;
+#[cfg(windows)]
 pub mod agent_lock;
+#[cfg(windows)]
+pub mod autologin;
 pub mod cmdline;
 #[cfg(windows)]
 pub mod conpty;
 #[cfg(windows)]
+pub mod console_modes;
+#[cfg(windows)]
+pub mod console_prompt;
+#[cfg(windows)]
 pub mod filelog;
 #[cfg(windows)]
 pub mod hangup;
+#[cfg(windows)]
+pub mod logon;
+#[cfg(windows)]
+pub mod logout;
+pub mod offer;
+pub mod password_entry;
 #[cfg(windows)]
 pub mod pipes;
 pub mod protocol;
 pub mod provision;
 pub mod relay;
 pub mod route;
+pub mod secret;
 pub mod shim;
+#[cfg(windows)]
+pub mod shim_offer;
 #[cfg(windows)]
 pub mod shim_pty;
 pub mod socket_loc;
+#[cfg(windows)]
+pub mod socket_watch;
+#[cfg(windows)]
+pub mod starting_agent;
 #[cfg(all(windows, test))]
 mod test_support;
 #[cfg(windows)]

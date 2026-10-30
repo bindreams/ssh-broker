@@ -23,7 +23,7 @@ pub const SELFHEAL_TASK: &str = "ssh-broker-apply";
 pub const USERS_GROUP_SID: &str = "S-1-5-32-545";
 
 /// Minimal XML escaping for the few characters that can appear in a path.
-fn xml_escape(s: &str) -> String {
+pub(super) fn xml_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
@@ -31,21 +31,14 @@ fn xml_escape(s: &str) -> String {
         .replace('\'', "&apos;")
 }
 
-/// The agent logon task definition: runs `<exe> agent` in the interactive session of whichever
-/// user logs on. Names no account; `apply` registers it without a password.
-pub fn agent_task_xml(exe: &str) -> String {
-    let exe = xml_escape(exe);
+/// The `Settings` of the per-user tasks: no time limit, no battery conditions (the Task Scheduler
+/// default for the two flags is `true`, which would keep a laptop on battery from starting an
+/// agent with nothing reporting it), restart on failure, enabled. `multiple_instances` is the
+/// `MultipleInstancesPolicy` value.
+pub(super) fn settings_xml(multiple_instances: &str) -> String {
     format!(
-        r#"<?xml version="1.0" encoding="UTF-16"?>
-<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
-  <RegistrationInfo><Description>ssh-broker relay agent, one per logged-on user</Description></RegistrationInfo>
-  <Triggers><LogonTrigger><Enabled>true</Enabled></LogonTrigger></Triggers>
-  <Principals><Principal id="Users">
-    <GroupId>{USERS_GROUP_SID}</GroupId>
-    <RunLevel>LeastPrivilege</RunLevel>
-  </Principal></Principals>
-  <Settings>
-    <MultipleInstancesPolicy>Parallel</MultipleInstancesPolicy>
+        r#"  <Settings>
+    <MultipleInstancesPolicy>{multiple_instances}</MultipleInstancesPolicy>
     <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
     <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
     <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
@@ -56,7 +49,25 @@ pub fn agent_task_xml(exe: &str) -> String {
          ONSTART self-heal task and the agent task's own logon trigger — not before. -->
     <RestartOnFailure><Interval>PT1M</Interval><Count>3</Count></RestartOnFailure>
     <Enabled>true</Enabled>
-  </Settings>
+  </Settings>"#
+    )
+}
+
+/// The agent logon task definition: runs `<exe> agent` in the interactive session of whichever
+/// user logs on. Names no account; `apply` registers it without a password.
+pub fn agent_task_xml(exe: &str) -> String {
+    let exe = xml_escape(exe);
+    let settings = settings_xml("Parallel");
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo><Description>ssh-broker relay agent, one per logged-on user</Description></RegistrationInfo>
+  <Triggers><LogonTrigger><Enabled>true</Enabled></LogonTrigger></Triggers>
+  <Principals><Principal id="Users">
+    <GroupId>{USERS_GROUP_SID}</GroupId>
+    <RunLevel>LeastPrivilege</RunLevel>
+  </Principal></Principals>
+{settings}
   <Actions Context="Users"><Exec>
     <Command>{exe}</Command>
     <Arguments>agent</Arguments>

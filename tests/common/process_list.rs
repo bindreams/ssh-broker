@@ -197,6 +197,53 @@ pub fn terminate_tree(root: HANDLE, root_pid: u32) -> BTreeSet<String> {
     }
 }
 
+/// Terminate every process that runs as the user `sid_text` (SDDL form) and wait for each to exit,
+/// pass after pass until a pass finds none: a process ended in one pass can have started another.
+/// A process that cannot be ended is reported and is not looked at again.
+///
+/// Processes that cannot be opened are skipped: the system's own are, and an account's own are
+/// opened by the administrator that runs the tests.
+pub fn terminate_processes_of(sid_text: &str) -> BTreeSet<String> {
+    let own = std::process::id();
+    let mut problems = BTreeSet::new();
+    let mut given_up: BTreeSet<u32> = BTreeSet::new();
+    loop {
+        let mut found = Vec::new();
+        for entry in snapshot() {
+            if entry.pid == own || entry.pid == 0 || given_up.contains(&entry.pid) {
+                continue;
+            }
+            // SAFETY: a plain open by id; the handle is closed by `OwnedHandle`.
+            let Ok(handle) = (unsafe {
+                OpenProcess(
+                    PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE | PROCESS_SYNCHRONIZE,
+                    false,
+                    entry.pid,
+                )
+            }) else {
+                continue;
+            };
+            let process = OwnedHandle(handle);
+            let Ok(owner) = ssh_broker::acl::Sid::of_process(process.0) else {
+                continue;
+            };
+            if owner.to_sddl().is_ok_and(|owner| owner == sid_text) {
+                found.push((entry, process));
+            }
+        }
+        if found.is_empty() {
+            return problems;
+        }
+        for (entry, process) in found {
+            let before = problems.len();
+            end(process.0, &format!("pid {} {}", entry.pid, entry.exe), &mut problems);
+            if problems.len() != before {
+                given_up.insert(entry.pid);
+            }
+        }
+    }
+}
+
 /// How long a terminated process may take to be gone. Termination is asynchronous but quick; a
 /// process still there after this is stuck in the kernel, and is reported instead of waited for.
 const EXIT_AFTER_TERMINATE_BOUND_MS: u32 = 30_000;
@@ -205,7 +252,8 @@ const EXIT_AFTER_TERMINATE_BOUND_MS: u32 = 30_000;
 /// process that is still there then is added to `problems`.
 fn end(process: HANDLE, name: &str, problems: &mut BTreeSet<String>) {
     // SAFETY: `process` is a live process handle with terminate access.
-    if let Err(e) = unsafe { TerminateProcess(process, 1) }
+    let terminated = unsafe { TerminateProcess(process, 1) };
+    if let Err(e) = &terminated
         && !has_exited(process)
     {
         problems.insert(format!("{name}: {e}"));
@@ -214,8 +262,16 @@ fn end(process: HANDLE, name: &str, problems: &mut BTreeSet<String>) {
     // SAFETY: as above; the handle carries SYNCHRONIZE.
     let rc = unsafe { WaitForSingleObject(process, EXIT_AFTER_TERMINATE_BOUND_MS) }; // sleep-ok: failure bound on a terminated process's exit, an external event; expiry is reported and is not read as state
     if rc != WAIT_OBJECT_0 {
+        // An exit status that is already set while the process is listed means it began to end by
+        // itself and is stuck ending; a refused `TerminateProcess` then says nothing about the kernel.
+        let how = match terminated {
+            Ok(()) => "after being terminated".to_string(),
+            Err(e) => format!(
+                "(TerminateProcess was refused: {e}; the exit status was already set, so the process had begun to end by itself and is stuck ending)"
+            ),
+        };
         problems.insert(format!(
-            "{name}: still there {EXIT_AFTER_TERMINATE_BOUND_MS} ms after being terminated ({rc:?})"
+            "{name}: still there {EXIT_AFTER_TERMINATE_BOUND_MS} ms {how} ({rc:?})"
         ));
     }
 }

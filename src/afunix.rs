@@ -124,10 +124,13 @@ impl Listener {
 /// Why `accept` failed, by what the serving loop should do next.
 #[derive(Debug)]
 pub enum AcceptError {
-    /// This one connection is lost (the peer dropped it while it queued, or it could not be set
-    /// up). The listener is fine, and each such failure consumed a connection, so a run of them is
-    /// bounded by the peers' own behaviour.
+    /// This one connection is lost: the peer dropped it while it queued. The listener is fine, and
+    /// each such failure consumed a connection, so a run of them is bounded by the peers' own
+    /// behaviour.
     Connection(anyhow::Error),
+    /// A connection arrived but must not be handed out (it is inheritable by child processes). The
+    /// peer is waiting, so the caller answers it on `socket` and does not hand it to a shell.
+    Refused { socket: Socket, cause: anyhow::Error },
     /// `WSAEINTR`: the call was interrupted. Nothing was consumed; call `accept` again.
     Interrupted(std::io::Error),
     /// `WSAEMFILE` or `WSAENOBUFS`: no descriptor or buffer is left. It clears only when something
@@ -141,7 +144,9 @@ pub enum AcceptError {
 impl std::fmt::Display for AcceptError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            AcceptError::Connection(e) | AcceptError::Fatal(e) => write!(f, "{e:#}"),
+            AcceptError::Connection(e) | AcceptError::Fatal(e) | AcceptError::Refused { cause: e, .. } => {
+                write!(f, "{e:#}")
+            }
             AcceptError::Interrupted(source) | AcceptError::Exhausted { source, .. } => write!(f, "{source}"),
         }
     }
@@ -162,7 +167,8 @@ fn accept_from(listener: &Socket) -> std::io::Result<Socket> {
 }
 
 /// Turn the outcome of the OS `accept` into a connection ready to hand out. A connection that
-/// fails `harden` is never handed out: it would reach children of the brokered shell.
+/// fails `harden` is never handed out: it would reach children of the brokered shell. It comes back
+/// as [`AcceptError::Refused`], for the caller to answer.
 fn finish_accept(
     raw: std::io::Result<Socket>,
     harden: impl FnOnce(&Socket) -> anyhow::Result<()>,
@@ -170,9 +176,10 @@ fn finish_accept(
     match raw {
         Ok(sock) => match harden(&sock) {
             Ok(()) => Ok(sock),
-            Err(e) => Err(AcceptError::Connection(
-                e.context("an accepted connection is not safe to hand out; dropping it"),
-            )),
+            Err(e) => Err(AcceptError::Refused {
+                socket: sock,
+                cause: e.context("an accepted connection is not safe to hand out"),
+            }),
         },
         Err(e) => Err(classify_accept_error(e)),
     }
@@ -283,15 +290,76 @@ pub struct ConnTx(Socket);
 /// handle, so one thread can `pump_decode` while another writes frames — mirroring the
 /// relay's two-pump model.
 pub fn split(sock: Socket) -> anyhow::Result<(ConnRx, ConnTx)> {
-    let write_half = sock.try_clone()?;
+    try_split(sock).map_err(|(_, e)| e)
+}
+
+/// A connection that [`try_split`] could not split: both directions on the one socket, for a party
+/// that has to answer it all the same.
+pub struct Whole(Socket);
+
+impl Whole {
+    pub fn of(sock: Socket) -> Whole {
+        Whole(sock)
+    }
+
+    /// See [`ConnRx::set_read_timeout`].
+    pub fn set_read_timeout(&self, limit: Option<std::time::Duration>) -> std::io::Result<()> {
+        self.0.set_read_timeout(limit.map(whole_milliseconds_up))
+    }
+
+    /// Send FIN on the write direction.
+    pub fn shutdown_write(&self) -> anyhow::Result<()> {
+        self.0.shutdown(std::net::Shutdown::Write)?;
+        Ok(())
+    }
+}
+
+impl Read for &Whole {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        (&self.0).read(buf)
+    }
+}
+
+impl Write for &Whole {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        (&self.0).write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        (&self.0).flush()
+    }
+}
+
+/// [`split`] that gives the connection back, with the reason, when it cannot be split.
+pub fn try_split(sock: Socket) -> Result<(ConnRx, ConnTx), (Whole, anyhow::Error)> {
+    let write_half = match sock.try_clone() {
+        Ok(write_half) => write_half,
+        Err(e) => return Err((Whole(sock), e.into())),
+    };
     // Clear inherit on BOTH halves: callers should hand in an already-cleared socket
     // (from accept/connect), but split is `pub` and must not depend on that.
     #[cfg(windows)]
-    {
-        set_no_inherit(&sock)?;
-        set_no_inherit(&write_half)?;
+    if let Err(e) = set_no_inherit(&sock).and_then(|()| set_no_inherit(&write_half)) {
+        return Err((Whole(sock), e));
     }
     Ok((ConnRx(sock), ConnTx(write_half)))
+}
+
+impl ConnRx {
+    /// Make a `read` that finds nothing fail with `TimedOut` or `WouldBlock` once `limit` has
+    /// passed (`None`: block as long as it takes).
+    ///
+    /// `limit` is rounded up to whole milliseconds, and to at least one: the OS takes whole
+    /// milliseconds, and a limit that reached it as 0 would mean no limit at all. Measured on
+    /// AF_UNIX: after a timeout, a read still delivers what arrives and still reports the close.
+    pub fn set_read_timeout(&self, limit: Option<std::time::Duration>) -> std::io::Result<()> {
+        self.0.set_read_timeout(limit.map(whole_milliseconds_up))
+    }
+}
+
+/// `limit` rounded up to whole milliseconds, at least one.
+fn whole_milliseconds_up(limit: std::time::Duration) -> std::time::Duration {
+    let millis = limit.as_nanos().div_ceil(1_000_000).max(1);
+    std::time::Duration::from_millis(u64::try_from(millis).unwrap_or(u64::MAX))
 }
 
 impl ConnTx {

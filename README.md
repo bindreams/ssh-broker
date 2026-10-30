@@ -42,13 +42,70 @@ If a user is logged on in two sessions, the second session's agent waits and tak
 
 A profile path so long that the socket path would pass the 107-byte AF_UNIX limit (only possible with a relocated profile root) is refused with the reason: the socket stays inside the profile, because that is what keeps it private, and the shim fails open.
 
+## Background sessions
+
+A user with no session on the PC (nobody logged in at the console or over RDP) has no interactive session to relay into. An interactive SSH login then asks for the Windows password:
+
+```
+ssh-broker: <user> has no Windows session on this PC. Enter your Windows password to start one. (The password goes to Windows to sign you in; ssh-broker does not store it.) Press Ctrl+C for a plain shell.
+```
+
+The password is not echoed, goes to Windows (`CreateProcessWithLogonW`) and nowhere else, and is wiped from the buffers ssh-broker holds as soon as the call returns. Windows signs the account in and starts `ssh-broker agent --background` in a new logon session with a loaded profile; the login relays into it. The session has no desktop and lasts until the PC restarts or you run `logout`. If you sign in at the desktop afterwards, no second agent starts: the background session keeps serving.
+
+Three ways out of the prompt, none of which starts a session:
+
+- **Ctrl+C or Ctrl+D**, at any point while typing, gives the plain shell and a line that says what it lacks.
+- **A wrong password** prints Windows' reason and gives the plain shell. There is one attempt per connection; reconnecting asks again. Windows' account lockout policy counts these like any other failed sign-in.
+- **A login that cannot ask** (`ssh host cmd`, `scp`, `sftp`, `ssh -T`) never prompts. It runs as before, with one line on stderr that names `ssh -t` and `auto-login on`.
+
+Enter on an empty line does not mean "plain shell": it says empty passwords are not supported yet (ssh-broker#45) and asks again.
+
+### Starting one at boot: `auto-login`
+
+`auto-login` stores your Windows password with Task Scheduler and registers a task that starts your background session at boot, so the session exists before anyone logs in and nobody types a password after a restart.
+
+```
+C:\ProgramData\ssh-broker\ssh-broker.exe auto-login on  [<account>]
+C:\ProgramData\ssh-broker\ssh-broker.exe auto-login off [<account>]
+```
+
+Both need **an elevated administrator shell**, and take the account to act on (the account running the command by default). Task Scheduler refuses a boot trigger to any token that is not an elevated administrator's, for a standard user and for a non-elevated administrator alike. A shell that ssh-broker hosts is not elevated, so:
+
+- at the PC, open an elevated prompt (one UAC prompt);
+- over SSH as an administrator, run `ssh-broker.exe logout`, reconnect and press Ctrl+C at the password prompt for a plain shell: that shell runs under sshd's own token, which for an administrator may be elevated (to be confirmed against a real `sshd`);
+- a standard user cannot run it alone: an administrator runs it for them and types their password.
+
+`on` asks for the account's password, checks that Windows accepts it for a batch logon, registers the task, reads the registered task back and compares it with what it asked for (a mismatch deletes the task and fails), and starts the task once so the session begins now. The task runs the installed exe, in the administrator-only install directory, with the plain token, and its permissions let only SYSTEM and Administrators change it.
+
+The account must hold **"Log on as a batch job"**. Administrators hold it by default; a standard account does not, and `on` refuses, naming the right: an administrator can grant it in Local Security Policy (User Rights Assignment). ssh-broker never changes machine policy.
+
+`off` deletes the task, which deletes the stored password with it. A session that is running continues until `logout`. `on` and `off` take the lock `apply` takes (see Upgrading) for their steps, so neither runs in the middle of an `apply`, and an `apply` does not run in the middle of either: they wait for each other's steps. `on` first checks, changing nothing, that `apply` has installed the exe (otherwise it says to run `apply` first, before asking for anything and without creating the install directory), asks for the password, and only then takes the lock, so a prompt left open holds up nothing. `off` takes the lock only if there is an install directory that passes its check; if there is none, or it fails its check (so no `apply` can run), or the lock cannot be taken (an error such as a lock file with the wrong access; waiting for another holder is not one), it deletes the task without the lock, and in the last two cases prints a warning naming the reason or the cause. `verify` has an `auto-login task` row: it checks the task's definition and reports its last result, and says plainly that a failed logon is not recorded there, so a stale password or a missing batch right shows only as a session that did not start; you are then asked for the password again at the next login.
+
+Windows' own auto-logon is a different, documented option: signing the user in at boot (Sysinternals Autologon, or `netplwiz` where it applies) gives a desktop session, and the logon task's desktop agent then serves. ssh-broker does not configure it; it stores the password as an LSA secret and leaves a signed-in desktop.
+
+### Ending one
+
+`ssh-broker logout` ends your background session: the agent, every shell it hosts and the processes they started. Run it with the installed exe's full path, `C:\ProgramData\ssh-broker\ssh-broker.exe logout`, because `apply` does not put the install directory on `PATH`. The usual place to type it is a shell the session itself gave you; the agent waits for the command to finish and print its reply before it ends anything, and your SSH connection then closes.
+
+| Exit code | Meaning |
+|---|---|
+| 0 | The session ended. |
+| 1 | You have no session to end (also when the session was ending already and is gone by the time `logout` connects again). |
+| 2 | Your agent runs in your desktop session; signing out of Windows ends it. |
+| 4 | Your agent could not be reached for another reason (access denied, a socket path that is too long): the message names it. |
+| 254 | The agent closed two connections in a row without answering, which an agent of this version never does (it may be an older ssh-broker). |
+
+A login that reaches the agent while it is ending gets no shell. It prints `ssh-broker: your background session is ending; reconnect in a moment.` and exits 255, the code ssh uses for a connection that failed, so a script cannot take it for the command's own failure.
+
+A login the agent cannot serve for another reason also gets a line saying why, and ends the connection with a code that is not the command's: 255 when the agent could not start the shell or the command (`ssh-broker: the agent could not start the command: ...`), 254 when it could not read the request. A command whose connection ends before the agent says anything prints `ssh-broker: the agent ended before it answered; the command may or may not have run` and exits 255; it is never sent again. A login (or `logout`) whose connection is closed without an answer twice in a row prints `ssh-broker: the agent closed the connection twice without answering; it may be a different ssh-broker version` and exits 254. A connection that the agent cannot use, or whose handler failed, is answered with a line saying so and exits 255.
+
 ## Requirements
 
 **PowerShell Core (`pwsh`) must be installed.** Stock Windows ships `powershell.exe` 5.1, which is a different binary. `pwsh` is what the agent hosts for every interactive session — a configurable shell is not implemented — and what the shim falls back to when the agent is unreachable and there is no command to run. `ssh host "cmd"` does not involve a shell on either path: the relay and the fail-open both spawn the command directly, so pipes, redirection and `&&` are the client's business, not the server's. The Windows test suite also assumes `pwsh`.
 
 ## Limits worth knowing before you install it
 
-- **A user with no interactive session gets a plain passthrough shell.** No design can conjure an interactive session without that user's credentials; this relays into one that already exists. If nobody is logged in at the console or over RDP, there is nothing to relay into.
+- **A background session needs your password once.** If you have no session on the PC, an interactive login (`ssh -t`) asks for your Windows password and starts one (below). A login that cannot ask (a command, `scp`, `sftp`, or no terminal), and a login that declines, gets the plain passthrough shell, without DPAPI, a loaded profile or symlink traversal. Only local accounts with a non-empty password are supported (ssh-broker#45).
 - **Your session's background processes die with it.** When the session ends, everything it spawned is terminated — including a process that redirected its output to a file and never touched the session's pipes. There is no `nohup` equivalent here. This matches what stock Windows OpenSSH does; it is the opposite of Unix, where the session waits for pipe EOF.
 - **The shim fails open.** If the agent is unreachable it runs your command locally and says why, rather than locking you out of the machine. That is deliberate: a broken broker must never cost you SSH access. The reason goes to stderr for `ssh host cmd`; for an interactive session it goes to the log in your own `%LOCALAPPDATA%\ssh-broker\logs` (the agent logs there too), because writing to stderr there would corrupt the terminal stream. The one exception is a reason that comes from your own setup, such as a profile path too long for a socket: that is printed to stderr in both modes, before the fallback shell starts. If the shim cannot set up its log (the folder belongs to someone else, say), it carries on without one; for `ssh host cmd` the fallback message then also says why there is no log, and in the other cases `verify`'s `log folder` row is where to look. An interactive fallback launches `pwsh`, so it inherits the requirement above; `ssh host cmd` runs the command directly, with no shell in between.
 - **Everything goes through the relay, including `sftp` and `scp`.** No command is *classified* and routed around it — the fail-open above is a different thing, running locally because the agent is unreachable rather than because of what the command is. Deciding what to route would mean classifying a command from a string the client chose — and sshd rewrites commands before the shim ever sees them. The relay carries arbitrary bytes unchanged in both directions (tested, and checked end to end by `verify`), so transfers work normally; running them locally would be faster, and that is a trade we take deliberately rather than guess at what a command is.
@@ -69,7 +126,11 @@ Then extract it and, from an elevated prompt, run `ssh-broker.exe apply`. It ins
 
 ## Upgrading
 
-Run `apply` again from an elevated prompt with the newer build. A running agent holds the installed exe open, so when `apply` replaces the exe with a different build it first disables the logon task, so no logon starts an agent from the old exe meanwhile, stops every agent the task started and waits for each to exit, then enables the task again and starts one in each logged-on session (also if a later step fails). Their open SSH sessions end; users reconnect. An agent started by hand with `ssh-broker agent` is not stopped, and the shim of an SSH session that is still open holds the exe too (it is sshd's `DefaultShell`): if either still holds the exe, `apply` fails with a message saying so; find them with `tasklist /fi "imagename eq ssh-broker.exe"`, end them or close the sessions, and run `apply` again. If an agent does not exit after being stopped, `apply` fails naming its process id and starts no agent in that session; run `apply` again once the process has exited. A killed `apply` can leave the logon task disabled, which `verify` reports on its `agent task` row; a later `apply` enables it again once it is past its argument check and its query of the registered task (one that fails earlier leaves the task as it was). An `apply` of the build that is already installed leaves agents alone.
+Run `apply` again from an elevated prompt with the newer build. A running agent holds the installed exe open, so when `apply` replaces the exe with a different build it first disables the logon task, so no logon starts an agent from the old exe meanwhile, stops every agent the task started and waits for each to exit, then enables the task again and starts one in each logged-on session (also if a later step fails). Their open SSH sessions end; users reconnect. An agent started by hand with `ssh-broker agent` is not stopped, and the shim of an SSH session that is still open holds the exe too (it is sshd's `DefaultShell`): if either still holds the exe, `apply` fails with a message saying so; find them with `tasklist /fi "imagename eq ssh-broker.exe"`, end them or close the sessions, and run `apply` again. If an agent does not exit after being stopped, `apply` fails naming its process id and starts no agent in that session; run `apply` again once the process has exited. A killed `apply` can leave the logon task disabled, which `verify` reports on its `agent task` row; a later `apply` enables it again once it is past its argument check, the check of the install directory, the check of the lock file and the wait described next, and the query of the registered agent task (one that fails earlier leaves the task as it was). An `apply` of the build that is already installed leaves agents alone. Only one `apply` runs at a time on a machine, for its whole run (a lock on `apply.lock` in the install directory, a file only SYSTEM and Administrators can open, so that no standard user can hold it; `apply` refuses a lock file with any other access and tells you to remove it); the boot self-heal is an `apply` too, and one that starts while another is running waits for it. `auto-login on` and `off` take the same lock and wait for it in the same way.
+
+Background sessions are replaced the same way. Before it replaces the exe, `apply` disables every auto-login task, stops every user's auto-login session and ends every background session that no task owns (one the password prompt started), waiting for each process; after the copy it enables the auto-login tasks again and starts each one, also if a later step fails. A prompt-started session is not restarted: its user is asked for the password at the next login. Background sessions are found by the installed exe's file identity and told from a shim by their command line (`agent --background`), so an SSH session's shim is never ended by `apply`; it holds the exe until its session closes, and `apply` then fails with the message above.
+
+The contract: an upgrade is expected to succeed, and nothing is guaranteed to be in a valid state while it runs. If it is interrupted (a killed `apply`, a power cut), run `apply` again: it repairs an incomplete state. Every `apply` that is past the checks listed above for enabling the logon task (the argument check, the check of the install directory, the check of the lock file and the wait, and the query of the registered agent task), including one of the build that is already installed, ends by enabling every auto-login task that is disabled and starting each enabled one that has no running session (it does not stop or restart a session that is running), as it already does for the logon task; an `apply` that fails one of those checks repairs nothing. So a task you disabled by hand in Task Scheduler is enabled again by the next `apply`; `auto-login off` is the way to turn auto-login off.
 
 ### From a single-user install
 

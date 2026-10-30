@@ -11,8 +11,12 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
+use ssh_broker::winutil::OwnedHandle;
 use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
-use windows::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject};
+use windows::Win32::System::Threading::{
+    GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
+    WaitForSingleObject,
+};
 
 use crate::{desktop, process_list};
 
@@ -40,7 +44,27 @@ pub fn wait_for_exit(process: HANDLE, pid: u32, what: &str, bound: Duration, evi
     }
     assert_eq!(rc, WAIT_TIMEOUT, "waiting for {what} (pid {pid}) failed: {rc:?}");
 
-    let mut report = format!("{what} (pid {pid}) did not exit within {bound:?}.\n\nprocess tree:\n");
+    let mut report = format!("{what} (pid {pid}) did not exit within {bound:?}.\n");
+    // The caller's handle may carry no right to terminate; the report and the kill need that right, and
+    // a handle held keeps the pid from being reused, so reopening by pid reaches the same process.
+    // SAFETY: a plain open by id; the handle is closed by `OwnedHandle`.
+    let reopened = unsafe {
+        OpenProcess(
+            PROCESS_TERMINATE | PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
+            false,
+            pid,
+        )
+    };
+    let reopened = match reopened {
+        Ok(handle) => Some(OwnedHandle(handle)),
+        Err(e) => {
+            let _ = writeln!(report, "could not reopen the process with the right to end it: {e}");
+            None
+        }
+    };
+    let process = reopened.as_ref().map_or(process, |handle| handle.0);
+    let _ = writeln!(report, "exit status: {}", exit_status(process));
+    report.push_str("\nprocess tree:\n");
     report.push_str(&process_tree(process, pid));
     for path in evidence {
         report.push_str(&format!("\nevidence {}:\n", path.display()));
@@ -50,9 +74,23 @@ pub fn wait_for_exit(process: HANDLE, pid: u32, what: &str, bound: Duration, evi
     panic!("{report}\nprocesses that could not be ended: {left:?}");
 }
 
+/// The exit status of `process` as it reads while the process is still listed: `STILL_ACTIVE` means it
+/// runs; any other value means it began to end (`ExitProcess` or `TerminateProcess` ran) and has not
+/// finished, which is a different hang from a process that never tried to end.
+fn exit_status(process: HANDLE) -> String {
+    const STILL_ACTIVE: u32 = 259;
+    let mut code = 0u32;
+    // SAFETY: a live process handle and a valid out-pointer.
+    match unsafe { GetExitCodeProcess(process, &mut code) } {
+        Ok(()) if code == STILL_ACTIVE => "STILL_ACTIVE (259): it never began to end".to_string(),
+        Ok(()) => format!("{code:#x}: it began to end and has not finished"),
+        Err(e) => format!("unreadable: {e}"),
+    }
+}
+
 /// `root` and its descendants (see [`process_list`]) with each one's command line, and its
 /// threads with their state and wait reason: what a hung tree is blocked on.
-fn process_tree(root: HANDLE, root_pid: u32) -> String {
+pub fn process_tree(root: HANDLE, root_pid: u32) -> String {
     let tree = process_list::descendants(root, root_pid);
     let mut ids = vec![root_pid];
     ids.extend(tree.members.iter().map(|m| m.pid));

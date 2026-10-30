@@ -36,6 +36,12 @@ fn the_session_slots_share_one_lock_file_inside_the_socket_dir() {
 }
 
 #[test]
+fn the_serving_marker_lives_inside_the_socket_dir() {
+    let loc = for_profile(&profile("a")).unwrap();
+    assert_eq!(loc.serving_marker_path(), loc.dir.join("serving"));
+}
+
+#[test]
 fn for_profile_accepts_exactly_107_bytes_and_rejects_108() {
     let ok = for_profile(&profile_for_socket_path_of(MAX_SOCKET_PATH_BYTES)).unwrap();
     assert_eq!(ok.path.as_os_str().len(), MAX_SOCKET_PATH_BYTES);
