@@ -41,6 +41,31 @@ fn api(line: &str) -> Vec<String> {
     }
 }
 
+/// `text` with the `%NAME%` of every variable that is set replaced by its value, as conhost does to the
+/// line it is given (measured: the shell is started with `echo %PATH%` expanded). A name that is not set
+/// stays as written.
+fn expand_environment(text: &str) -> String {
+    use windows::Win32::System::Environment::ExpandEnvironmentStringsW;
+    let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+    // SAFETY: `wide` is NUL-terminated; the buffer holds the length the call reports, terminator included.
+    unsafe {
+        let needed = ExpandEnvironmentStringsW(PCWSTR(wide.as_ptr()), None);
+        assert!(
+            needed != 0,
+            "ExpandEnvironmentStringsW sized {text:?}: {}",
+            std::io::Error::last_os_error()
+        );
+        let mut buffer = vec![0u16; needed as usize];
+        let written = ExpandEnvironmentStringsW(PCWSTR(wide.as_ptr()), Some(&mut buffer));
+        assert!(
+            written != 0,
+            "ExpandEnvironmentStringsW on {text:?}: {}",
+            std::io::Error::last_os_error()
+        );
+        String::from_utf16_lossy(&buffer[..written as usize - 1])
+    }
+}
+
 fn probe() -> PathBuf {
     command_line_probe::path()
 }
@@ -72,7 +97,7 @@ fn conhost_rebuilds_the_command_line_as_the_model_says() {
     let out = dir.join("line.txt");
     let mut failures = Vec::new();
     for command in COMMANDS {
-        let want = sshd_encoder::verbatim_line(&probe.display().to_string(), command);
+        let want = expand_environment(&sshd_encoder::verbatim_line(&probe.display().to_string(), command));
         let got = received_under_conhost(&probe, command, &out);
         if got != want {
             failures.push(format!("{command:?}\n  want: {want:?}\n  got:  {got:?}"));
