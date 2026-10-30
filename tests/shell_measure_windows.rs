@@ -363,7 +363,7 @@ fn error_lines(stderr: &str) -> String {
 /// Elevated (CI only). Generic path: the flag decides the form.
 #[test]
 fn m3_generic() {
-    m3("generic", r"generic\probe.exe", &[None, Some(1)]);
+    m3("generic", r"generic\probe.exe", &[None, Some(0), Some(1)]);
 }
 
 /// Elevated (CI only). A path with `powershell`: the path alone fixes the form.
