@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use windows::Win32::Foundation::HANDLE;
 
-use crate::account_fixture::{self, Account};
+use crate::account_fixture::{self, Account, ServiceLogon};
 use crate::bounded_wait;
 
 pub const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -129,6 +129,8 @@ impl Rig {
         account_fixture::assert_elevated();
         let work = work_dir();
         let account = Account::create(tag, true);
+        // sshd is a service: its logon keeps the profile's hive loaded, which `Account`'s teardown must know.
+        account.started_by(ServiceLogon::Sshd);
         admit(&account);
         let keys = install_key(&account);
         let initial = run("reg", &["query", OPENSSH_REG]).1;

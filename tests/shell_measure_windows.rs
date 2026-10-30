@@ -119,6 +119,17 @@ fn m1_binary_safety() {
     for (shell_name, shell) in &shells {
         assert!(shell.is_file(), "{shell:?} is not on this image");
         set_shell(shell, None);
+        let mut args = rig.options();
+        args.extend([
+            rig.target().into(),
+            "--".into(),
+            "echo $PSVersionTable.PSVersion.Major".into(),
+        ]);
+        let who = run_tool("ssh", &args, &rig.work, false, &rig.work);
+        fact(&format!(
+            "m1.{shell_name}.which-shell-answered={} (cmd.exe prints the text as typed; pwsh prints its major version)",
+            clip(&String::from_utf8_lossy(&who.stdout))
+        ));
         for (file_name, bytes) in &files {
             let source = format!("m1-src-{file_name}.bin");
             std::fs::write(rig.work.join(&source), bytes).unwrap();
@@ -314,6 +325,8 @@ fn m3(tag: &str, rel: &str, escapes: &[Option<u32>]) {
                 let mut args = os(&["-v", if pty { "-tt" } else { "-T" }]);
                 args.extend(rig.options());
                 args.push(rig.target().into());
+                // `--`: a command that starts with `-` is an option to ssh otherwise.
+                args.push("--".into());
                 args.push((*command).into());
                 let outcome = run_tool("ssh", &args, &rig.work, pty, &rig.work);
                 let seen = match std::fs::read(&line_path) {
@@ -322,8 +335,8 @@ fn m3(tag: &str, rel: &str, escapes: &[Option<u32>]) {
                         text.lines().map(shown).collect::<Vec<_>>().join(" ; ")
                     }
                     Err(_) => format!(
-                        "(probe wrote nothing) ssh-stderr-tail={}",
-                        clip(&tail_of(&outcome.stderr, 300))
+                        "(probe wrote nothing) ssh-errors={}",
+                        clip(&error_lines(&outcome.stderr))
                     ),
                 };
                 fact(&format!(
@@ -337,9 +350,14 @@ fn m3(tag: &str, rel: &str, escapes: &[Option<u32>]) {
     }
 }
 
-fn tail_of(text: &str, n: usize) -> String {
-    let chars: Vec<char> = text.chars().collect();
-    chars[chars.len().saturating_sub(n)..].iter().collect()
+/// The lines of ssh's stderr that are not its own debug output, each cut to 200 characters.
+fn error_lines(stderr: &str) -> String {
+    stderr
+        .lines()
+        .filter(|line| !line.starts_with("debug"))
+        .map(|line| line.chars().take(200).collect::<String>())
+        .collect::<Vec<_>>()
+        .join(" | ")
 }
 
 /// Elevated (CI only). Generic path: the flag decides the form.
