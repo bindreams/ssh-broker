@@ -15,6 +15,9 @@ socket2 = "0.6"                                         # AF_UNIX on Windows (Do
 tracing = "0.1"              # structured logging
 tracing-subscriber = "0.3"  # file/stderr log sink (Phase 6 routes off the PTY)
 zeroize = "1"                # volatile wipe of password buffers (secret.rs)
+# cosca: `cosca::quote::windows` builds and splits command lines (`cmdline`, `shell`), and is
+# cross-platform, so the pure code builds on every host; Job Objects containment is Windows-only inside it.
+cosca = "0.5"
 
 [dev-dependencies]
 fd-lock = "4.0.4"
@@ -23,11 +26,6 @@ pipe = "0.4"                 # two unidirectional pipes compose the splittable r
 # Windows-only dependencies. Not compiled on the macOS host, so the pure-logic
 # protocol/relay phases unit-test natively here.
 [target.'cfg(windows)'.dependencies]
-# cosca: kernel-enforced process-tree containment (Windows Job Objects) for the agent and for
-# the shim's fail-open passthrough. Windows-gated again now that transfer detection is gone —
-# its `CommandLineToArgvW` splitter was the only cross-platform user.
-cosca = "0.5"
-
 windows = { version = "0.62.2", features = [
     "Win32_System_Console",
     "Win32_System_Environment",    # GetCommandLineW: the shim recovers sshd's exact `-c` text
@@ -74,3 +72,4 @@ windows = { version = "0.62.2", features = [
     "Win32_System_JobObjects",               # CreateJobObjectW: tests/common/job.rs stands in for sshd's kill-on-close job
     "Win32_System_Diagnostics_Debug",        # WaitForDebugEvent: src/provision/procwait_ending_tests.rs holds a process in its exit
 ] }
+

@@ -55,6 +55,19 @@ pub enum Encoding {
     Escaped,
 }
 
+/// The command line that `CommandLineToArgvW` (and the C runtime) split back into exactly `args`.
+///
+/// An adapter over `cosca::quote::windows::join_wide`, which is the quoting; nothing here
+/// quotes. Each argument is quoted on its own, so `join_args(&["a b"])` is one argument. The
+/// first argument may be a program path: a path holds no `"` and does not end in `\`, the only
+/// cases where the program name's rules differ from an argument's.
+pub fn join_args<S: AsRef<str>>(args: &[S]) -> String {
+    let wide: Vec<Vec<u16>> = args.iter().map(|a| a.as_ref().encode_utf16().collect()).collect();
+    let refs: Vec<&[u16]> = wide.iter().map(Vec::as_slice).collect();
+    // Only ASCII is added to valid UTF-16, so the result is valid.
+    String::from_utf16(&cosca::quote::windows::join_wide(&refs)).expect("join_wide adds only ASCII to valid UTF-16")
+}
+
 /// Space and tab separate arguments; nothing else does.
 const SEPARATORS: [char; 2] = [' ', '\t'];
 

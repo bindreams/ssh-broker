@@ -6,7 +6,10 @@
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Mutex};
 
-use super::{Encoding, RawExec, dash_c_tail, decode_command, resolve_exec, split_args};
+use super::{Encoding, RawExec, dash_c_tail, decode_command, join_args, resolve_exec, split_args};
+
+#[path = "../tests/common/command_corpus.rs"]
+mod command_corpus;
 
 fn args(line: &str) -> Vec<String> {
     split_args(line)
@@ -226,4 +229,61 @@ fn a_tail_that_fits_its_form_is_not_logged() {
         let (log, _) = logged(|| decode_command(tail, encoding));
         assert_eq!(log, "", "{encoding:?} {tail:?}");
     }
+}
+
+// join_args =====
+
+/// Every string up to `max_len` over `alphabet`, shortest first.
+fn strings(alphabet: &[char], max_len: usize) -> Vec<String> {
+    let mut layer = vec![String::new()];
+    let mut all = vec![String::new()];
+    for _ in 0..max_len {
+        layer = layer
+            .iter()
+            .flat_map(|prefix| alphabet.iter().map(move |c| format!("{prefix}{c}")))
+            .collect();
+        all.extend(layer.iter().cloned());
+    }
+    all
+}
+
+/// `split_args` is the MSVCRT splitter the repository already trusts; `join_args` must be inverted by it.
+#[test]
+fn join_args_round_trips_through_split_args() {
+    let mut failures = Vec::new();
+    let mut check = |args: &[&str]| {
+        let line = format!("prog {}", join_args(args));
+        let mut want = vec!["prog".to_string()];
+        want.extend(args.iter().map(|a| a.to_string()));
+        if split_args(&line) != want {
+            failures.push(format!("{args:?} -> {line:?}"));
+        }
+    };
+    for command in command_corpus::CORPUS {
+        check(&[command]);
+        check(&["-c", command]);
+    }
+    let all = strings(&['a', ' ', '\t', '"', '\\', '\''], 4);
+    for a in &all {
+        for b in &all {
+            if a.len() + b.len() <= 5 {
+                check(&[a, b]);
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
+fn join_args_quotes_one_argument_on_its_own() {
+    assert_eq!(join_args(&["a b"]), r#""a b""#);
+    assert_eq!(join_args(&["ab"]), "ab");
+    assert_eq!(join_args(&[""]), r#""""#);
+    assert_eq!(join_args::<&str>(&[]), "");
+    assert_eq!(join_args(&[r"C:\a b\"]), r#""C:\a b\\""#);
+}
+
+#[test]
+fn join_args_keeps_non_ascii_text() {
+    assert_eq!(join_args(&["héllo wörld ✓", "😀"]), r#""héllo wörld ✓" 😀"#);
 }

@@ -14,6 +14,10 @@ use crate::route::{Route, route};
 mod sshd_encoder;
 use sshd_encoder::{build_exec_command, conhost_escape, escape_arg, flag_decides_form, tokenize};
 
+#[path = "../tests/common/command_corpus.rs"]
+mod command_corpus;
+use command_corpus::CORPUS;
+
 const SHELL: &str = r"C:\Program Files\ssh-broker\ssh-broker.exe";
 
 /// The line the shim receives. `Encoding` selects which of the two lines sshd builds; a PTY
@@ -24,78 +28,6 @@ fn encode(encoding: Encoding, command: &str) -> String {
         Encoding::Escaped => sshd_encoder::escaped_line(SHELL, command),
     }
 }
-
-// The corpus =====
-
-/// Commands of every shape the encoder treats specially, plus the ones devvm sends.
-const CORPUS: &[&str] = &[
-    "whoami",
-    "echo hi",
-    "echo  two  spaces",
-    "echo\ttab",
-    "a\tb",
-    "\tleading-tab",
-    "trailing-tab\t",
-    "  leading and trailing  ",
-    " ",
-    "  ",
-    "",
-    // Line ends at the edges and inside.
-    "\n",
-    "\r\n",
-    "\r\nx\r\n",
-    " \r\n",
-    "x\ny",
-    "x\r\ny z",
-    // Quotes.
-    r#"echo "a b""#,
-    r#"a"b"#,
-    r#""quoted""#,
-    r#"--opt="a b""#,
-    r#"git commit -m "a b""#,
-    r#"""#,
-    r#"""x"#,
-    // A doubled quote inside quotes.
-    r#"echo "a""b" c"#,
-    r#"echo "a"" b" c"#,
-    r#"echo """ x"#,
-    r#"echo "x""""#,
-    r#"echo "a b""c d" e"#,
-    // sshd does not quote a command that starts with `'`, even with spaces in it.
-    "'single quoted start' x",
-    "'x'",
-    r#"'a "b" c'"#,
-    // Backslashes next to quotes and at the end.
-    r#"echo \"a b\""#,
-    r#"echo a\\"b c"#,
-    r#"echo "a b"\"#,
-    r"echo C:\dir\",
-    r"echo C:\a b\",
-    r"echo C:\a b\\",
-    r"echo \\server\share\x y",
-    r"\",
-    // Program paths, with and without spaces, quoted or not.
-    r#""C:\a b\p.exe" "x y""#,
-    r#"p.exe "" end"#,
-    r#""C:\a b\p.exe" "x y" "" end  of  line"#,
-    r"C:\Program Files\OpenSSH\sftp-server.exe -l INFO",
-    r#""C:\Program Files\OpenSSH\sftp-server.exe" -l INFO"#,
-    // Not ASCII.
-    "echo héllo wörld ✓",
-    "echo 日本語 \"x y\"",
-    // Commands sshd rewrites.
-    "scp -t /x",
-    "SCP.exe -f /x",
-    "scp",
-    "sftp-server -l INFO",
-    "Sftp-Server.EXE -l INFO",
-    "sftp-server.exe",
-    "internal-sftp",
-    "internal-sftp -l INFO",
-    // Commands named like verbs or options.
-    "agent",
-    "-c x",
-];
 
 /// The command conhost passes on for a PTY session: the arguments after `-c`, each escaped again
 /// and joined by one space. Derived from the tokens, not from the line `encode` builds.
