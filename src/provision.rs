@@ -210,6 +210,7 @@ mod imp {
                     eq_path(&shell, &exe) && opt == "-c",
                     "DefaultShell read-back mismatch (shell={shell:?}, opt={opt:?})"
                 );
+                remove_shell_arguments();
                 Ok(exe)
             },
             agent_task_is_group_form,
@@ -227,9 +228,6 @@ mod imp {
     /// Write the system config from the shell sshd runs now, if it is not ssh-broker and there is no
     /// config yet (see [`system_config`]). Must run before the registry is overwritten. The install is
     /// complete without the config, so a failure is said on stderr and `apply` goes on.
-    ///
-    /// Once the config holds `DefaultShellArguments`, the value is removed from the registry: sshd
-    /// would otherwise hand the arguments to ssh-broker ahead of `-c`.
     fn carry_previous_shell(base: &layout::TrustedBase<'_>) {
         let previous = match registry::read_sshd_shell_under(registry::OPENSSH_KEY) {
             Ok(previous) => previous,
@@ -273,13 +271,6 @@ mod imp {
                         config.display(),
                         previous.shell.as_deref().unwrap_or_default()
                     );
-                    if let Err(e) = registry::remove_shell_arguments_under(registry::OPENSSH_KEY) {
-                        eprintln!(
-                            "apply: DefaultShellArguments is still set under HKLM\\{}, and sshd passes it to ssh-broker \
-                             ahead of -c; remove it by hand: {e:#}",
-                            registry::OPENSSH_KEY
-                        );
-                    }
                 }
                 Ok(false) => {}
                 Err(e) => eprintln!("apply: could not write {}: {e:#}", config.display()),
@@ -291,6 +282,26 @@ mod imp {
             ),
             system_config::Decision::Skip(_) => {}
         }
+    }
+
+    /// Remove `DefaultShellArguments`, on every `apply`, once `DefaultShell` is ssh-broker: sshd
+    /// would hand the arguments to ssh-broker ahead of `-c`, and what they were is in the config
+    /// (carried by the `apply` that replaced the shell) or is not wanted. A value that is not there
+    /// is fine. A failure leaves the value for the next `apply` to remove, so it is said with the
+    /// value and the cause, and `apply` goes on.
+    fn remove_shell_arguments() {
+        let Err(e) = registry::remove_shell_arguments_under(registry::OPENSSH_KEY) else {
+            return;
+        };
+        let value = match registry::read_sshd_shell_under(registry::OPENSSH_KEY) {
+            Ok(shell) => format!("{:?}", shell.arguments.unwrap_or_default()),
+            Err(read) => format!("unreadable ({read:#})"),
+        };
+        eprintln!(
+            "apply: could not remove DefaultShellArguments ({value}) under HKLM\\{}, and sshd passes it to ssh-broker \
+             ahead of -c; the next apply tries again: {e:#}",
+            registry::OPENSSH_KEY
+        );
     }
 
     /// The background sessions' part of the stop that precedes replacing the exe: the auto-login

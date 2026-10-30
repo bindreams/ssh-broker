@@ -520,5 +520,30 @@ fn apply_carries_all_four_values_and_a_second_apply_does_not_rewrite_them() {
         "the second apply rewrote the config"
     );
 
+    // A value left behind (a removal that failed, or an administrator putting it back) while sshd
+    // already runs ssh-broker: the next `apply` removes it again, whatever it carried before.
+    let leftover = reg(&["query", OPENSSH_KEY, "/v", "DefaultShellArguments"]);
+    assert!(!leftover.status.success(), "the second apply left the arguments");
+    set_sshd_value("DefaultShellArguments", "REG_SZ", "-NoLogo");
+    let third = apply(broker);
+    assert!(
+        third.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&third.stdout),
+        String::from_utf8_lossy(&third.stderr)
+    );
+    let remaining = reg(&["query", OPENSSH_KEY, "/v", "DefaultShellArguments"]);
+    assert!(
+        !remaining.status.success(),
+        "a later apply left DefaultShellArguments set:
+{}",
+        String::from_utf8_lossy(&remaining.stdout)
+    );
+    assert_eq!(
+        std::fs::read(&config).unwrap(),
+        written,
+        "the third apply rewrote the config"
+    );
+
     let _ = std::fs::remove_dir_all(&dir);
 }
