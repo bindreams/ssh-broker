@@ -5,8 +5,6 @@
 name: Shell spike
 
 on:
-  push:
-    branches: [U1-C-spike]
   workflow_dispatch:
 
 jobs:

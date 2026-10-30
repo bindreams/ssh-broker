@@ -4,7 +4,8 @@
 //! test per step.
 //!
 //! M1 binary safety through sshd, M2 MSYS2 argument parsing, M3 what stock sshd gives a shell,
-//! M4 file identity of `cmd.exe` spellings, M5 `SearchPathW`, M6 PowerShell's stdin and stdout.
+//! M4 file identity of `cmd.exe` spellings, M5 `SearchPathW`, M6 PowerShell's stdin and stdout, M7 the user's own
+//! environment variables (`HKCU\Environment`) in the shell sshd starts and in the process a logon or a task starts.
 #![cfg(windows)]
 
 use std::ffi::OsString;
@@ -25,13 +26,20 @@ mod bounded_wait;
 mod corpus;
 #[path = "common/desktop.rs"]
 mod desktop;
+#[path = "common/file_signal.rs"]
+mod file_signal;
 #[path = "common/hard_errors.rs"]
 mod hard_errors;
+#[path = "common/password.rs"]
+mod password;
 #[path = "common/process_list.rs"]
 mod process_list;
 #[path = "shell_measure/rig.rs"]
 mod rig;
+#[path = "common/task_instances.rs"]
+mod task_instances;
 
+use account_fixture::Account;
 use corpus::{CORPUS, long_command, shown};
 use rig::{CREATE_NO_WINDOW, Rig, example, fact, os, run, run_tool, set_shell, work_dir};
 
@@ -738,5 +746,249 @@ fn m6_stdout() {
             out.status.code(),
             clip(&String::from_utf8_lossy(&out.stderr)),
         ));
+    }
+}
+
+// M7 =====
+
+/// What the account's own `HKCU\Environment` holds: name, registry type, value. `Path` is the user's part of
+/// `PATH`, which the system appends to its own when it builds an environment from the profile.
+const M7_VARIABLES: &[(&str, &str, &str)] = &[
+    ("M7_PROBE", "REG_SZ", "from-hkcu"),
+    ("XDG_CONFIG_HOME", "REG_SZ", r"C:\m7-xdg"),
+    ("M7_EXPAND", "REG_EXPAND_SZ", r"%USERPROFILE%\m7-expanded"),
+    ("Path", "REG_EXPAND_SZ", r"C:\m7-userpath"),
+];
+
+/// Write [`M7_VARIABLES`] into the account's `HKCU\Environment` before its first logon: the hive file is
+/// loaded under a scratch name, written and unloaded again. (If the hive is already loaded, it is written
+/// where it is loaded.) The account is the test's own throwaway; CI only.
+fn plant_user_environment(account: &Account, tag: &str) {
+    let live = format!(r"HKU\{}", account.sid_text);
+    let loaded = run("reg", &["query", &live]).0;
+    fact(&format!("m7.{tag}.hive-loaded-before-planting={loaded}"));
+    let (root, scratch) = if loaded {
+        (live, false)
+    } else {
+        let scratch = format!(r"HKU\sb{tag}tmp");
+        let file = account.profile().join("NTUSER.DAT");
+        fact(&format!("m7.{tag}.ntuser-dat-exists={}", file.is_file()));
+        let (ok, text) = run("reg", &["load", &scratch, file.to_str().unwrap()]);
+        assert!(ok, "reg load {file:?}: {text}");
+        (scratch, true)
+    };
+    let key = format!(r"{root}\Environment");
+    for (name, kind, value) in M7_VARIABLES {
+        let (ok, text) = run("reg", &["add", &key, "/v", name, "/t", kind, "/d", value, "/f"]);
+        assert!(ok, "reg add {name}: {text}");
+    }
+    fact(&format!("m7.{tag}.planted={}", clip(&run("reg", &["query", &key]).1)));
+    if scratch {
+        let (ok, text) = run("reg", &["unload", &root]);
+        assert!(ok, "reg unload {root}: {text}");
+    }
+}
+
+/// Whether the account's hive is loaded under its SID, and what `ProfileList` says.
+fn hive_state(account: &Account, label: &str) {
+    let loaded = run("reg", &["query", &format!(r"HKU\{}", account.sid_text)]).0;
+    fact(&format!(
+        "m7.{label}.hive-loaded={loaded} profile-list=[{}]",
+        account_fixture::hive::profile_list(&account.sid_text)
+    ));
+}
+
+/// The probe copied under the work directory, for the account to run.
+fn m7_probe(tag: &str) -> PathBuf {
+    let dir = work_dir().join(format!("m7-{tag}"));
+    std::fs::create_dir_all(&dir).unwrap();
+    let exe = dir.join("env_probe.exe");
+    std::fs::copy(example("env_probe"), &exe).unwrap();
+    exe
+}
+
+/// Where the probe publishes what it saw.
+fn m7_env_file(exe: &Path) -> PathBuf {
+    let mut path = exe.to_path_buf().into_os_string();
+    path.push(".env");
+    PathBuf::from(path)
+}
+
+/// The facts of one probe run: the variables the case is about, PATH's last entry, and the whole block.
+fn m7_report(label: &str, text: Option<String>) {
+    let Some(text) = text else {
+        fact(&format!("m7.{label}=(the probe wrote nothing)"));
+        return;
+    };
+    let vars: Vec<(&str, &str)> = text
+        .lines()
+        .filter_map(|line| {
+            let at = line.get(1..)?.find('=')? + 1;
+            Some((&line[..at], &line[at + 1..]))
+        })
+        .collect();
+    let get = |name: &str| vars.iter().find(|(n, _)| n.eq_ignore_ascii_case(name)).map(|(_, v)| *v);
+    for name in [
+        "M7_PROBE",
+        "XDG_CONFIG_HOME",
+        "M7_EXPAND",
+        "USERPROFILE",
+        "HOME",
+        "APPDATA",
+        "LOCALAPPDATA",
+        "USERNAME",
+    ] {
+        match get(name) {
+            Some(value) => fact(&format!("m7.{label}.{name}={value:?}")),
+            None => fact(&format!("m7.{label}.{name}=ABSENT")),
+        }
+    }
+    let path = get("Path").unwrap_or("");
+    fact(&format!(
+        "m7.{label}.PATH-last-entry={:?} has-user-path-entry={} entries={}",
+        path.split(';').rfind(|e| !e.is_empty()).unwrap_or(""),
+        path.split(';').any(|e| e == r"C:\m7-userpath"),
+        path.split(';').filter(|e| !e.is_empty()).count()
+    ));
+    fact(&format!(
+        "m7.{label}.raw={}",
+        text.lines().collect::<Vec<_>>().join(" | ")
+    ));
+}
+
+/// One ssh session to the account with the probe as the shell; what the probe wrote.
+fn m7_ssh(rig: &Rig, exe: &Path, pty: bool, label: &str) -> Option<String> {
+    let file = m7_env_file(exe);
+    let _ = std::fs::remove_file(&file);
+    let mut args = os(&[if pty { "-tt" } else { "-T" }]);
+    args.extend(rig.options());
+    args.push(rig.target().into());
+    args.push("--".into());
+    args.push("m7".into());
+    let outcome = run_tool("ssh", &args, &rig.work, pty, &rig.work);
+    fact(&format!(
+        "m7.{label}.ssh-exit={:?} ssh-errors={}",
+        outcome.code,
+        clip(&error_lines(&outcome.stderr))
+    ));
+    std::fs::read_to_string(&file).ok()
+}
+
+/// Elevated (CI only). M7 (a) and (b): the environment of the shell stock sshd starts, with no PTY and
+/// with one (`-tt`), for an account whose `HKCU\Environment` holds the variables above. Each case has an
+/// account of its own, so its first run is that account's first logon ("fresh": the hive was not loaded
+/// before); the second run follows the first on the same account ("again").
+#[test]
+fn m7_sshd() {
+    let cases = [(false, "m7n"), (true, "m7p")];
+    let rigs: Vec<Rig> = cases.iter().map(|(_, tag)| Rig::new(tag)).collect();
+    for ((pty, tag), rig) in cases.iter().zip(&rigs) {
+        plant_user_environment(&rig.account, tag);
+        let exe = m7_probe(tag);
+        set_shell(&exe, None);
+        for round in ["fresh", "again"] {
+            let label = format!("sshd.pty={pty}.{round}");
+            hive_state(&rig.account, &format!("{label}.before"));
+            let text = m7_ssh(rig, &exe, *pty, &label);
+            m7_report(&label, text);
+            hive_state(&rig.account, &format!("{label}.after"));
+        }
+    }
+}
+
+fn m7_local_account(account: &Account) -> ssh_broker::account::LocalAccount {
+    ssh_broker::account::LocalAccount {
+        name: account.name.clone(),
+        sid: account.sid_text.clone(),
+        kind: ssh_broker::account::AccountKind::Local,
+    }
+}
+
+/// Elevated (CI only). M7 (c), first path: the probe started by `logon::start_background_agent`, which is
+/// how the shim starts the background agent (`CreateProcessWithLogonW`, `LOGON_WITH_PROFILE`, a NULL
+/// environment). The probe ignores the agent's arguments.
+#[test]
+fn m7_logon() {
+    let account = Account::create("m7l", true);
+    plant_user_environment(&account, "m7l");
+    let exe = m7_probe("m7l");
+    let file = m7_env_file(&exe);
+    let local = m7_local_account(&account);
+    let password = password::password(&account.password);
+    for round in ["fresh", "again"] {
+        let label = format!("logon.{round}");
+        hive_state(&account, &format!("{label}.before"));
+        let _ = std::fs::remove_file(&file);
+        let started = ssh_broker::logon::start_background_agent(&local, &password, &exe)
+            .unwrap_or_else(|failure| panic!("the logon failed: {failure}"));
+        let handle = started.process.0;
+        let waited = file_signal::wait_for_file(
+            &file,
+            Some(handle),
+            Some(bounded_wait::CHILD_EXIT_BOUND),
+            "the probe started by the logon",
+        );
+        fact(&format!("m7.{label}.waited={waited:?}"));
+        // SAFETY: a valid process handle.
+        let pid = unsafe { windows::Win32::System::Threading::GetProcessId(handle) };
+        let code = bounded_wait::wait_for_exit(
+            handle,
+            pid,
+            "the probe started by the logon",
+            bounded_wait::CHILD_EXIT_BOUND,
+            &[],
+        );
+        fact(&format!("m7.{label}.exit-code={code}"));
+        m7_report(&label, std::fs::read_to_string(&file).ok());
+        hive_state(&account, &format!("{label}.after"));
+    }
+}
+
+/// Deletes the one-shot task when the test ends.
+struct TaskGuard(String);
+
+impl Drop for TaskGuard {
+    fn drop(&mut self) {
+        let _ = ssh_broker::provision::taskscheduler::delete_task(&self.0);
+    }
+}
+
+/// Elevated (CI only). M7 (c), second path: the probe started by the auto-login task (a stored-password
+/// task, `LogonType Password`, the definition `auto-login on` registers) run with `Run`.
+#[test]
+fn m7_task() {
+    use ssh_broker::provision::{session_task, taskscheduler};
+    let account = Account::create("m7t", true);
+    account.grant_batch_logon_right();
+    account.started_by(account_fixture::ServiceLogon::TaskScheduler);
+    plant_user_environment(&account, "m7t");
+    let exe = m7_probe("m7t");
+    let file = m7_env_file(&exe);
+    let name = session_task::task_name(&account.sid_text);
+    let machine_user = format!("{}\\{}", ssh_broker::account::computer_name().unwrap(), account.name);
+    let password = password::password(&account.password);
+    let _guard = TaskGuard(name.clone());
+    taskscheduler::register_password_task(
+        &name,
+        &session_task::task_xml(&exe.to_string_lossy(), &account.sid_text),
+        &machine_user,
+        &password,
+        &session_task::requested_sddl(&account.sid_text),
+    )
+    .unwrap_or_else(|e| panic!("register the task: {e:#}"));
+    for round in ["fresh", "again"] {
+        let label = format!("task.{round}");
+        hive_state(&account, &format!("{label}.before"));
+        let _ = std::fs::remove_file(&file);
+        taskscheduler::run_task(&name).unwrap_or_else(|e| panic!("run the task: {e:#}"));
+        file_signal::wait_for_file(
+            &file,
+            None,
+            Some(bounded_wait::CHILD_EXIT_BOUND),
+            "the probe started by the task",
+        );
+        task_instances::wait_until_none(&name, bounded_wait::CHILD_EXIT_BOUND);
+        m7_report(&label, std::fs::read_to_string(&file).ok());
+        hive_state(&account, &format!("{label}.after"));
     }
 }
