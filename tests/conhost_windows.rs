@@ -22,6 +22,8 @@ mod sshd_encoder;
 
 #[path = "common/command_corpus.rs"]
 mod command_corpus;
+#[path = "common/command_line_probe.rs"]
+mod command_line_probe;
 use command_corpus::CORPUS as COMMANDS;
 
 /// What `CommandLineToArgvW` makes of `line`.
@@ -40,19 +42,7 @@ fn api(line: &str) -> Vec<String> {
 }
 
 fn probe() -> PathBuf {
-    let exe = std::env::current_exe().unwrap();
-    let probe = exe
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .join("examples")
-        .join("command_line_probe.exe");
-    assert!(
-        probe.is_file(),
-        "the probe {probe:?} is not built: run `cargo build --examples` (`cargo test` builds it)"
-    );
-    probe
+    command_line_probe::path()
 }
 
 /// The command line the probe received when conhost ran `"<probe>" -c <command>`.

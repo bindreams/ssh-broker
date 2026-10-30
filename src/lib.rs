@@ -27,6 +27,9 @@ pub mod cmdline;
 #[cfg(test)]
 #[path = "../tests/common/command_corpus.rs"]
 mod command_corpus;
+#[cfg(all(windows, test))]
+#[path = "../tests/common/command_line_probe.rs"]
+mod command_line_probe;
 #[cfg(windows)]
 pub mod conpty;
 #[cfg(windows)]

@@ -1245,3 +1245,133 @@ fn teardown_warns_only_when_the_reap_failed() {
         "the warning must say what is about to happen: {w:?}"
     );
 }
+
+// The shell the configuration names -----
+
+/// A host whose configured shell is a copy of the command-line probe in a directory of its own. The
+/// probe records the exact line it was started with beside itself, so the tests read what the
+/// agent really passed to `CreateProcessW`.
+struct ProbeShell {
+    dir: std::path::PathBuf,
+    exe: std::path::PathBuf,
+}
+
+impl ProbeShell {
+    fn new(tag: &str) -> Self {
+        let dir = hardened_dir(tag);
+        let exe = dir.join("p.exe");
+        std::fs::copy(crate::command_line_probe::path(), &exe).unwrap();
+        ProbeShell { dir, exe }
+    }
+
+    /// A host with the probe as the user's shell. Built afresh for each use: it is a table.
+    fn host(&self) -> crate::shell::test_host::TestHost {
+        crate::shell::test_host::TestHost::new()
+            .with_bytes(&self.exe.to_string_lossy(), b"MZ")
+            .with_user_config(&format!("shell: '{}'\n", self.exe.display()))
+    }
+
+    fn recorded_line(&self) -> String {
+        let mut file = self.exe.clone().into_os_string();
+        file.push(".line");
+        std::fs::read_to_string(&file).unwrap_or_else(|e| panic!("the probe recorded nothing at {file:?}: {e}"))
+    }
+}
+
+impl Drop for ProbeShell {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.dir).ok();
+    }
+}
+
+/// One session under `host`: what the client saw (stdout and PTY output together, stderr apart).
+fn shell_session(
+    tag: &str,
+    mode: Mode,
+    command: Option<&str>,
+    host: crate::shell::test_host::TestHost,
+) -> (Outcome, String, String) {
+    let dir = hardened_dir(tag);
+    let sock = dir.join("s");
+    let listener = Listener::bind(&sock).unwrap();
+    let client_path = sock.clone();
+    let command = command.map(str::to_owned);
+    let client = thread::spawn(move || {
+        let conn = afunix::connect(&client_path).unwrap();
+        let (mut crx, mut ctx) = afunix::split(conn).unwrap();
+        let hs = Handshake {
+            mode,
+            command,
+            launch: crate::protocol::Launch::Shell,
+            ..Handshake::pty_default()
+        };
+        write_frame(&mut ctx, FrameKind::Handshake, &hs.encode().unwrap()).unwrap();
+        if mode == Mode::Exec {
+            write_data(&mut ctx, Stream::Stdin, b"").unwrap();
+        }
+        let mut fr = FrameReader::new();
+        let mut sink = TestSink::default();
+        let outcome = pump_decode(&mut crx, &mut fr, &mut sink).unwrap();
+        (outcome, sink)
+    });
+    let hooks = Hooks {
+        shell_host: Box::new(host),
+        ..Hooks::production()
+    };
+    let conn = listener.accept().unwrap();
+    super::handle_connection_with(conn, hooks).unwrap();
+    let (outcome, sink) = client.join().unwrap();
+    std::fs::remove_dir_all(&dir).ok();
+    (
+        outcome,
+        String::from_utf8_lossy(&sink.stdout).into_owned(),
+        String::from_utf8_lossy(&sink.stderr).into_owned(),
+    )
+}
+
+/// The probe is the shell, so the line it records is the line the agent started: the same one
+/// `shell::plan` makes, for a command with no terminal, a command with one, and a login.
+#[test]
+fn a_shell_launch_runs_the_command_through_the_configured_shell() {
+    use crate::shell::{Session, plan};
+    for (mode, command, terminal) in [
+        (Mode::Exec, Some("echo  \"a  b\"   x"), false),
+        (Mode::Pty, Some("echo  \"a  b\"   x"), true),
+        (Mode::Pty, None, false),
+    ] {
+        let shell = ProbeShell::new("shell-probe");
+        let (outcome, _, stderr) = shell_session("shell-probe-run", mode, command, shell.host());
+        assert_eq!(outcome, Outcome::Exited(0), "{mode:?} {command:?}: {stderr}");
+        let session = match command {
+            Some(text) => Session::Command { text, terminal },
+            None => Session::Interactive,
+        };
+        let want = plan(&shell.host(), &session).unwrap().command_line;
+        assert_eq!(shell.recorded_line(), want, "{mode:?} {command:?}");
+    }
+}
+
+/// A shell that cannot be used falls to the real `cmd.exe`, after one warning and before any
+/// output of the command.
+#[test]
+fn a_broken_config_sends_one_warning_then_runs_cmd_exe() {
+    use crate::shell::test_host::{TestHost, USER_CONFIG};
+    let broken = || TestHost::new().with_user_config("shell: {strt: pwsh.exe}\n");
+    let notice = format!("ssh-broker: cannot use the shell from {USER_CONFIG}");
+
+    let (outcome, stdout, stderr) = shell_session("warn-exec", Mode::Exec, Some("echo shell-ok"), broken());
+    assert_eq!(outcome, Outcome::Exited(0), "{stderr}");
+    assert!(stdout.contains("shell-ok"), "{stdout:?}");
+    assert!(stderr.starts_with(&notice), "{stderr:?}");
+    assert_eq!(stderr.matches("cannot use the shell").count(), 1, "{stderr:?}");
+
+    let (outcome, output, _) = shell_session("warn-pty", Mode::Pty, Some("echo shell-ok"), broken());
+    assert_eq!(outcome, Outcome::Exited(0));
+    assert!(output.starts_with(&notice), "{output:?}");
+    assert_eq!(output.matches("cannot use the shell").count(), 1, "{output:?}");
+    let after = &output[notice.len()..];
+    assert!(
+        after.contains("shell-ok"),
+        "the command's output follows the warning: {output:?}"
+    );
+}

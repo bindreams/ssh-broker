@@ -82,7 +82,7 @@ pub(crate) fn is_absolute_windows(path: &Path) -> bool {
 }
 
 #[cfg(test)]
-mod test_host;
+pub(crate) mod test_host;
 
 #[cfg(test)]
 #[path = "shell_tests.rs"]

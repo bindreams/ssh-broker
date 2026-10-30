@@ -37,6 +37,8 @@ pub use ending::{end_process, hold_until_end, keep_log};
 #[cfg(windows)]
 mod connections;
 #[cfg(windows)]
+mod launch;
+#[cfg(windows)]
 mod logout;
 
 #[cfg(windows)]
@@ -497,12 +499,6 @@ fn serve_connections_with<C>(
     }
 }
 
-/// Default shell when the handshake carries no command (config-driven shell is Phase 7).
-#[cfg(windows)]
-fn default_shell() -> String {
-    "pwsh.exe -NoLogo".to_string()
-}
-
 /// The home directory of the account the agent runs as: its token's profile. The environment is
 /// not consulted, because it belongs to whoever started the process. `None` (logged) if there is
 /// no such directory.
@@ -586,6 +582,8 @@ struct Hooks {
     make_watcher: WatchFactory,
     start_pty: PtyStarter,
     start_exec: ExecStarter,
+    /// What the shell configuration is resolved against: the machine, in production.
+    shell_host: Box<dyn crate::shell::Host + Send + Sync>,
     split: Splitter,
     parked: ParkSignal,
     /// Called once the session's shell is started and before it is registered, the window in which
@@ -614,6 +612,7 @@ impl Hooks {
             make_watcher: HangupWatcher::new,
             start_pty: |command, cols, rows, cwd| Ok(PtySession::spawn(command, cols, rows, cwd)?),
             start_exec: |command, cwd| Ok(ExecChild::spawn(command, cwd)?),
+            shell_host: Box::new(crate::shell::WindowsHost),
             split: afunix::try_split,
             parked: ParkSignal::default(),
             after_spawn: Box::new(|| {}),
@@ -675,7 +674,38 @@ fn handle_connection_in(conn: socket2::Socket, hooks: Hooks, control: &Control) 
     if control.is_ending() {
         return logout::refuse_while_ending(&mut rx, &mut tx, control);
     }
-    let command = hs.command.clone().unwrap_or_else(default_shell);
+    let launched = match launch::launch_line(&hs, &*hooks.shell_host) {
+        Ok(launched) => launched,
+        Err(launch::Refusal::BadRequest(cause)) => {
+            return Err(logout::fail_connection(
+                &mut rx,
+                &mut tx,
+                control,
+                "the agent could not read the request",
+                cause,
+                logout::BAD_REQUEST_EXIT_CODE,
+            ));
+        }
+        Err(launch::Refusal::Failed(cause)) => {
+            return Err(logout::fail_connection(
+                &mut rx,
+                &mut tx,
+                control,
+                "the agent could not prepare the shell",
+                cause,
+                logout::FAILED_EXIT_CODE,
+            ));
+        }
+    };
+    if let Some(text) = &launched.notice {
+        tracing::warn!("{text}");
+        let (stream, bytes) = launch::notice_frame(hs.mode, text);
+        // A client that has gone is found by the relay, which owns that case.
+        if let Err(e) = write_data(&mut tx, stream, &bytes) {
+            tracing::debug!("could not show the shell warning: {e:#}");
+        }
+    }
+    let command = launched.line;
     let cwd_buf = child_cwd(&hs.cwd, home_dir());
     let cwd = cwd_buf.as_deref();
     match hs.mode {
