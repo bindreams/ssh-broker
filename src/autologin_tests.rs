@@ -738,14 +738,18 @@ fn the_real_env_waits_for_a_holder_of_the_apply_lock_file() {
     let holder =
         crate::provision::apply_lock::acquire(&layout.apply_lock_path(), || panic!("nobody holds the lock")).unwrap();
     let (events, seen) = std::sync::mpsc::channel();
+    let released = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let asker = std::thread::spawn({
         let base = dir.0.clone();
+        let released = released.clone();
         move || {
             let waiting = events.clone();
             let mut env = env_in(&base, move || waiting.send(Lock::Waiting).unwrap());
             let lock = env.lock_apply().unwrap();
+            let after_release = released.load(std::sync::atomic::Ordering::SeqCst);
             events.send(Lock::Taken).unwrap();
             drop(lock);
+            after_release
         }
     });
     assert_eq!(
@@ -753,9 +757,13 @@ fn the_real_env_waits_for_a_holder_of_the_apply_lock_file() {
         Lock::Waiting,
         "lock_apply returned, or did not report a wait, while the apply lock file was held"
     );
+    released.store(true, std::sync::atomic::Ordering::SeqCst);
     drop(holder);
     assert_eq!(seen.recv().expect("the asker never got the lock"), Lock::Taken);
-    asker.join().unwrap();
+    assert!(
+        asker.join().unwrap(),
+        "lock_apply reported a wait and then returned before the holder let go"
+    );
 }
 
 /// Elevated (CI only). The guard `lock_apply` returns is the lock: while it lives, a second taker
