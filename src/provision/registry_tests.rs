@@ -362,3 +362,88 @@ fn a_value_of_another_type_is_read_as_the_text_sshd_runs() {
     assert_eq!(got.arguments.map(|text| text.chars().count()), Some(16384));
     assert_eq!(got.command_option, None);
 }
+
+/// After `apply` carries `DefaultShellArguments` into the config it removes the value: left, sshd
+/// would hand the arguments to the shim before `-c`. Removing a value that is not there, or under a
+/// key that is not there, is not an error, and no other value goes. Under a key of the test's own
+/// (HKCU, deleted afterwards); CI only, as it writes the registry.
+#[cfg(windows)]
+#[test]
+fn removing_the_shell_arguments_removes_that_value_and_nothing_else() {
+    use windows::Win32::System::Registry::REG_SZ;
+    let sz = |text: &str| -> Vec<u8> {
+        text.encode_utf16()
+            .chain(std::iter::once(0))
+            .flat_map(u16::to_le_bytes)
+            .collect()
+    };
+    let key = TestKey::new("remove-args");
+    let sub = key.path();
+    super::set_value_hkcu(sub, "DefaultShell", REG_SZ.0, &sz(r"C:\x\sh.exe"));
+    super::set_value_hkcu(sub, "DefaultShellArguments", REG_SZ.0, &sz("-NoLogo"));
+
+    super::remove_shell_arguments_hkcu(sub).unwrap();
+    let got = super::read_sshd_shell_hkcu(sub).unwrap();
+    assert_eq!(got.arguments, None);
+    assert_eq!(got.shell.as_deref(), Some(r"C:\x\sh.exe"));
+
+    super::remove_shell_arguments_hkcu(sub).unwrap();
+    let missing_key = TestKey::new("remove-args-no-key");
+    super::remove_shell_arguments_hkcu(missing_key.path()).unwrap();
+}
+
+/// The three string values at sshd's boundary: 16383 characters plus the terminator is 32768 bytes
+/// and is read; one more character is not, and reads as absent. A `DefaultShell` that does not fit
+/// makes sshd run the system `cmd.exe` and ignore the other three values. Under a key of the
+/// test's own (HKCU, deleted afterwards); CI only, as it writes the registry.
+#[cfg(windows)]
+#[test]
+fn string_values_at_sshds_buffer_boundary_are_read_and_one_character_more_is_absent() {
+    use super::SshdShell;
+    use windows::Win32::System::Registry::{REG_DWORD, REG_SZ};
+    let sz = |text: &str| -> Vec<u8> {
+        text.encode_utf16()
+            .chain(std::iter::once(0))
+            .flat_map(u16::to_le_bytes)
+            .collect()
+    };
+    let fits = "x".repeat(16383);
+    let too_long = "x".repeat(16384);
+
+    let key = TestKey::new("sshd-fits");
+    let sub = key.path();
+    super::set_value_hkcu(sub, "DefaultShell", REG_SZ.0, &sz(&fits));
+    super::set_value_hkcu(sub, "DefaultShellCommandOption", REG_SZ.0, &sz(&fits));
+    super::set_value_hkcu(sub, "DefaultShellArguments", REG_SZ.0, &sz(&fits));
+    let got = super::read_sshd_shell_hkcu(sub).unwrap();
+    assert_eq!(got.shell.as_deref(), Some(fits.as_str()));
+    assert_eq!(got.command_option.as_deref(), Some(fits.as_str()));
+    assert_eq!(got.arguments.as_deref(), Some(fits.as_str()));
+
+    // The option and the arguments that do not fit are absent; the shell is still read.
+    let key = TestKey::new("sshd-options-too-long");
+    let sub = key.path();
+    super::set_value_hkcu(sub, "DefaultShell", REG_SZ.0, &sz(r"C:\x\sh.exe"));
+    super::set_value_hkcu(sub, "DefaultShellCommandOption", REG_SZ.0, &sz(&too_long));
+    super::set_value_hkcu(sub, "DefaultShellArguments", REG_SZ.0, &sz(&too_long));
+    super::set_value_hkcu(sub, "DefaultShellEscapeArguments", REG_DWORD.0, &0u32.to_le_bytes());
+    let got = super::read_sshd_shell_hkcu(sub).unwrap();
+    assert_eq!(
+        (
+            got.shell.as_deref(),
+            got.command_option,
+            got.arguments,
+            got.escape_arguments
+        ),
+        (Some(r"C:\x\sh.exe"), None, None, false)
+    );
+
+    // A shell that does not fit is no shell, and the companions go with it.
+    let key = TestKey::new("sshd-shell-too-long");
+    let sub = key.path();
+    super::set_value_hkcu(sub, "DefaultShell", REG_SZ.0, &sz(&too_long));
+    super::set_value_hkcu(sub, "DefaultShellCommandOption", REG_SZ.0, &sz("-Command"));
+    super::set_value_hkcu(sub, "DefaultShellArguments", REG_SZ.0, &sz("-NoLogo"));
+    super::set_value_hkcu(sub, "DefaultShellEscapeArguments", REG_DWORD.0, &0u32.to_le_bytes());
+    assert_eq!(super::read_sshd_shell_hkcu(sub).unwrap(), SshdShell::none());
+}

@@ -100,7 +100,7 @@ mod win {
     use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_MORE_DATA, ERROR_PATH_NOT_FOUND, WIN32_ERROR};
     use windows::Win32::System::Registry::{
         HKEY, HKEY_LOCAL_MACHINE, KEY_QUERY_VALUE, KEY_WOW64_64KEY, REG_DWORD, REG_SZ, REG_VALUE_TYPE, RRF_RT_REG_SZ,
-        RegCloseKey, RegGetValueW, RegOpenKeyExW, RegQueryValueExW, RegSetKeyValueW,
+        RegCloseKey, RegDeleteKeyValueW, RegGetValueW, RegOpenKeyExW, RegQueryValueExW, RegSetKeyValueW,
     };
     use windows::core::PCWSTR;
 
@@ -250,6 +250,23 @@ mod win {
         })
     }
 
+    /// Remove `DefaultShellArguments` from `<root>\<subkey>`. A value or a key that is not there
+    /// is already what this wants.
+    fn remove_shell_arguments_in(root: HKEY, subkey: &str) -> anyhow::Result<()> {
+        let (sub, name) = (wide(subkey), wide("DefaultShellArguments"));
+        // SAFETY: both strings are NUL-terminated.
+        let status = unsafe { RegDeleteKeyValueW(root, PCWSTR(sub.as_ptr()), PCWSTR(name.as_ptr())) };
+        if is_absent(status) {
+            return Ok(());
+        }
+        status.ok().context("remove DefaultShellArguments")
+    }
+
+    /// Production: remove `DefaultShellArguments` from `HKLM\<subkey>`.
+    pub fn remove_shell_arguments_under(subkey: &str) -> anyhow::Result<()> {
+        remove_shell_arguments_in(HKEY_LOCAL_MACHINE, subkey)
+    }
+
     /// Production: the four shell values from `HKLM\<subkey>`, as sshd reads them.
     pub fn read_sshd_shell_under(subkey: &str) -> anyhow::Result<SshdShell> {
         read_sshd_shell_in(HKEY_LOCAL_MACHINE, subkey)
@@ -354,6 +371,10 @@ mod win {
         read_sshd_shell_in(windows::Win32::System::Registry::HKEY_CURRENT_USER, subkey)
     }
     #[cfg(test)]
+    pub fn remove_shell_arguments_hkcu(subkey: &str) -> anyhow::Result<()> {
+        remove_shell_arguments_in(windows::Win32::System::Registry::HKEY_CURRENT_USER, subkey)
+    }
+    #[cfg(test)]
     pub fn read_string_hkcu(subkey: &str, name: &str) -> anyhow::Result<String> {
         read_value(windows::Win32::System::Registry::HKEY_CURRENT_USER, subkey, name)
     }
@@ -416,10 +437,14 @@ mod win {
 #[cfg(all(windows, test))]
 pub use win::{
     delete_hkcu, escape_arguments_from_status, escape_arguments_hkcu, read_dword_hkcu, read_hkcu, read_sshd_shell_hkcu,
-    read_string_hkcu, set_hkcu, set_hkcu_confirming, set_value_hkcu, sshd_string_from_status,
+    read_string_hkcu, remove_shell_arguments_hkcu, set_hkcu, set_hkcu_confirming, set_value_hkcu,
+    sshd_string_from_status,
 };
 #[cfg(windows)]
-pub use win::{escape_arguments_under, read_default_shell_under, read_sshd_shell_under, set_default_shell_under};
+pub use win::{
+    escape_arguments_under, read_default_shell_under, read_sshd_shell_under, remove_shell_arguments_under,
+    set_default_shell_under,
+};
 
 #[cfg(test)]
 #[path = "registry_tests.rs"]

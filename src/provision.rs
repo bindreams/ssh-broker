@@ -228,8 +228,8 @@ mod imp {
     /// config yet (see [`system_config`]). Must run before the registry is overwritten. The install is
     /// complete without the config, so a failure is said on stderr and `apply` goes on.
     ///
-    /// `DefaultShellArguments` is left in the registry afterwards: removing it would be a fifth value
-    /// `apply` owns.
+    /// Once the config holds `DefaultShellArguments`, the value is removed from the registry: sshd
+    /// would otherwise hand the arguments to ssh-broker ahead of `-c`.
     fn carry_previous_shell(base: &layout::TrustedBase<'_>) {
         let previous = match registry::read_sshd_shell_under(registry::OPENSSH_KEY) {
             Ok(previous) => previous,
@@ -267,11 +267,20 @@ mod imp {
         };
         match system_config::decide(&previous, config_exists, &file_exists, &is_system_cmd) {
             system_config::Decision::Write(block) => match system_config::create_once(base, &block) {
-                Ok(true) => println!(
-                    "apply: wrote {} from the shell sshd used before ({})",
-                    config.display(),
-                    previous.shell.as_deref().unwrap_or_default()
-                ),
+                Ok(true) => {
+                    println!(
+                        "apply: wrote {} from the shell sshd used before ({})",
+                        config.display(),
+                        previous.shell.as_deref().unwrap_or_default()
+                    );
+                    if let Err(e) = registry::remove_shell_arguments_under(registry::OPENSSH_KEY) {
+                        eprintln!(
+                            "apply: DefaultShellArguments is still set under HKLM\\{}, and sshd passes it to ssh-broker \
+                             ahead of -c; remove it by hand: {e:#}",
+                            registry::OPENSSH_KEY
+                        );
+                    }
+                }
                 Ok(false) => {}
                 Err(e) => eprintln!("apply: could not write {}: {e:#}", config.display()),
             },

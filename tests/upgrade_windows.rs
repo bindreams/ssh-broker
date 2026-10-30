@@ -496,6 +496,14 @@ fn apply_carries_all_four_values_and_a_second_apply_does_not_rewrite_them() {
         "{shell:?} {option:?}"
     );
     assert!(provision::registry::escape_arguments_under(provision::registry::OPENSSH_KEY).unwrap());
+    // The arguments are in the config now, so sshd may not pass them to ssh-broker as well.
+    let remaining = reg(&["query", OPENSSH_KEY, "/v", "DefaultShellArguments"]);
+    assert!(
+        !remaining.status.success(),
+        "DefaultShellArguments is still set:
+{}",
+        String::from_utf8_lossy(&remaining.stdout)
+    );
 
     // Another shell in the registry and a second apply: the file stays byte for byte.
     set_sshd_value("DefaultShell", "REG_SZ", &other.to_string_lossy());
