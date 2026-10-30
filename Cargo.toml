@@ -30,6 +30,7 @@ pipe = "0.4"                 # two unidirectional pipes compose the splittable r
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62.2", features = [
     "Win32_System_Console",
+    "Win32_System_SystemInformation", # GetSystemDirectoryW: where the built-in cmd.exe is (src/shell/windows.rs)
     "Win32_System_Environment",    # GetCommandLineW: the shim recovers sshd's exact `-c` text
     "Win32_Foundation",
     "Win32_System_Pipes",

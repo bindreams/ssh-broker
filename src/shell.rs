@@ -8,6 +8,8 @@
 pub mod config;
 pub mod layers;
 pub mod pack;
+#[cfg(windows)]
+mod windows;
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -16,6 +18,8 @@ use serde::{Deserialize, Serialize};
 
 pub use layers::{Chosen, Origin, Problem, choose, user_config_path};
 pub use pack::{Defaults, Effective, Plan, Session, Source, Why, defaults, effective, plan};
+#[cfg(windows)]
+pub use windows::WindowsHost;
 
 /// How the broker packs the already-decoded command for the shell it starts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
