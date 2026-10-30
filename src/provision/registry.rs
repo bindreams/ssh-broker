@@ -62,11 +62,11 @@ pub fn escape_arguments_check<E: std::fmt::Display>(read: Result<bool, E>) -> Ch
 /// `HKLM\SOFTWARE\OpenSSH` values `apply` carries into the system config before it overwrites them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SshdShell {
-    /// `DefaultShell`; `None` when absent or empty.
+    /// `DefaultShell`; `None` when absent, empty or too long for sshd's buffer ([`SSHD_VALUE_BYTES`]).
     pub shell: Option<String>,
-    /// `DefaultShellCommandOption`; `None` when absent or empty.
+    /// `DefaultShellCommandOption`; `None` when absent, empty or too long for sshd's buffer.
     pub command_option: Option<String>,
-    /// `DefaultShellArguments`; `None` when absent or empty.
+    /// `DefaultShellArguments`; `None` when absent, empty or too long for sshd's buffer.
     pub arguments: Option<String>,
     /// Whether sshd escapes the command: absent or too long means yes (see
     /// [`escape_arguments_from_status`]).
@@ -85,18 +85,22 @@ impl SshdShell {
     }
 }
 
+/// The size, in bytes, of the buffer sshd reads each of `DefaultShell`, `DefaultShellCommandOption`
+/// and `DefaultShellArguments` into. `pwd.c` declares `wchar_t[PATH_MAX]` (32768) but passes
+/// `_countof` of it, a count of wide characters, as the size in bytes.
+pub const SSHD_VALUE_BYTES: u32 = 32768;
+
 /// The production OpenSSH key under `HKEY_LOCAL_MACHINE`.
 pub const OPENSSH_KEY: &str = r"SOFTWARE\OpenSSH";
 
 #[cfg(windows)]
 mod win {
-    use super::{ESCAPE_ARGUMENTS, RegValue, SshdShell, desired_values};
+    use super::{ESCAPE_ARGUMENTS, RegValue, SSHD_VALUE_BYTES, SshdShell, desired_values};
     use anyhow::Context;
     use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_MORE_DATA, ERROR_PATH_NOT_FOUND, WIN32_ERROR};
     use windows::Win32::System::Registry::{
-        HKEY, HKEY_LOCAL_MACHINE, KEY_QUERY_VALUE, KEY_WOW64_64KEY, REG_DWORD, REG_SZ, REG_VALUE_TYPE, RRF_NOEXPAND,
-        RRF_RT_REG_EXPAND_SZ, RRF_RT_REG_SZ, RegCloseKey, RegGetValueW, RegOpenKeyExW, RegQueryValueExW,
-        RegSetKeyValueW,
+        HKEY, HKEY_LOCAL_MACHINE, KEY_QUERY_VALUE, KEY_WOW64_64KEY, REG_DWORD, REG_EXPAND_SZ, REG_SZ, REG_VALUE_TYPE,
+        RRF_RT_REG_SZ, RegCloseKey, RegGetValueW, RegOpenKeyExW, RegQueryValueExW, RegSetKeyValueW,
     };
     use windows::core::PCWSTR;
 
@@ -173,42 +177,70 @@ mod win {
         Ok(String::from_utf16_lossy(&buf[..chars.min(buf.len())]))
     }
 
-    /// A string value as stored, unexpanded; `None` when the key or value is absent or the value is
-    /// empty (sshd treats an empty one as absent). Any other failure is an error: it leaves what
-    /// sshd reads unknown.
+    /// A string value as stored, unexpanded, read the way sshd reads it (see
+    /// [`sshd_string_from_status`]): `None` when the key or value is absent, empty, or longer than
+    /// sshd's buffer. Any other failure is an error: it leaves what sshd reads unknown.
     fn read_optional_string(root: HKEY, subkey: &str, name: &str) -> anyhow::Result<Option<String>> {
         let (sub, name_w) = (wide(subkey), wide(name));
-        let flags = RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ | RRF_NOEXPAND;
-        let mut cb = 0u32;
-        // The first read has room for nothing and learns the size; a value that grows before the
-        // next asks again with the size it now has.
-        loop {
-            let mut buffer = vec![0u16; (cb as usize).div_ceil(2) + 1];
-            let mut capacity = (buffer.len() * 2) as u32;
-            // SAFETY: `sub` and `name_w` are NUL-terminated; `buffer` holds `capacity` bytes.
-            let status = unsafe {
-                RegGetValueW(
-                    root,
-                    PCWSTR(sub.as_ptr()),
-                    PCWSTR(name_w.as_ptr()),
-                    flags,
-                    None,
-                    Some(buffer.as_mut_ptr().cast()),
-                    Some(&mut capacity),
-                )
-            };
-            if is_absent(status) {
-                return Ok(None);
-            }
-            if status == ERROR_MORE_DATA {
-                cb = capacity;
-                continue;
-            }
-            status.ok().with_context(|| format!("read {name}"))?;
-            let units = (capacity as usize / 2).saturating_sub(1); // drop the NUL
-            let text = String::from_utf16_lossy(&buffer[..units.min(buffer.len())]);
-            return Ok((!text.is_empty()).then_some(text));
+        let mut key = HKEY::default();
+        // SAFETY: `sub` is NUL-terminated and `key` receives the opened handle.
+        let opened = unsafe {
+            RegOpenKeyExW(
+                root,
+                PCWSTR(sub.as_ptr()),
+                None,
+                KEY_QUERY_VALUE | KEY_WOW64_64KEY,
+                &mut key,
+            )
+        };
+        if is_absent(opened) {
+            return Ok(None);
         }
+        opened.ok().with_context(|| format!("open the key of {name}"))?;
+        let mut buffer = vec![0u16; SSHD_VALUE_BYTES as usize / 2];
+        let mut bytes = SSHD_VALUE_BYTES;
+        let mut reg_type = REG_VALUE_TYPE::default();
+        // SAFETY: `name_w` is NUL-terminated; `buffer` holds `bytes` bytes.
+        let status = unsafe {
+            let status = RegQueryValueExW(
+                key,
+                PCWSTR(name_w.as_ptr()),
+                None,
+                Some(&mut reg_type),
+                Some(buffer.as_mut_ptr().cast()),
+                Some(&mut bytes),
+            );
+            let _ = RegCloseKey(key);
+            status
+        };
+        sshd_string_from_status(name, status, reg_type, &buffer, bytes)
+    }
+
+    /// What `RegQueryValueExW`'s answer says about one of the three string values. sshd acts only
+    /// on `ERROR_SUCCESS` (`pwd.c:78-89`): a missing value and one that does not fit its buffer
+    /// ([`SSHD_VALUE_BYTES`], `ERROR_MORE_DATA`) are both "not set". Any other failure, and a value
+    /// that is not a string, leave what sshd reads unknown. Text ends at the first NUL, as a C
+    /// string does; an empty value counts as absent.
+    pub fn sshd_string_from_status(
+        name: &str,
+        status: WIN32_ERROR,
+        reg_type: REG_VALUE_TYPE,
+        buffer: &[u16],
+        bytes: u32,
+    ) -> anyhow::Result<Option<String>> {
+        if is_absent(status) || status == ERROR_MORE_DATA {
+            return Ok(None);
+        }
+        status.ok().with_context(|| format!("read {name}"))?;
+        anyhow::ensure!(
+            reg_type == REG_SZ || reg_type == REG_EXPAND_SZ,
+            "{name} is not a string value (registry type {})",
+            reg_type.0
+        );
+        let units = (bytes as usize / 2).min(buffer.len());
+        let text = &buffer[..units];
+        let text = &text[..text.iter().position(|&unit| unit == 0).unwrap_or(text.len())];
+        Ok((!text.is_empty()).then(|| String::from_utf16_lossy(text)))
     }
 
     fn read_sshd_shell_in(root: HKEY, subkey: &str) -> anyhow::Result<SshdShell> {
@@ -390,7 +422,7 @@ mod win {
 #[cfg(all(windows, test))]
 pub use win::{
     delete_hkcu, escape_arguments_from_status, escape_arguments_hkcu, read_dword_hkcu, read_hkcu, read_sshd_shell_hkcu,
-    read_string_hkcu, set_hkcu, set_hkcu_confirming, set_value_hkcu,
+    read_string_hkcu, set_hkcu, set_hkcu_confirming, set_value_hkcu, sshd_string_from_status,
 };
 #[cfg(windows)]
 pub use win::{escape_arguments_under, read_default_shell_under, read_sshd_shell_under, set_default_shell_under};
