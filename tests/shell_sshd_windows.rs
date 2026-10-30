@@ -135,10 +135,7 @@ impl Rig {
     fn assert_relayed(&self, what: &str, shown: &str) {
         assert!(
             !shown.contains("agent unavailable"),
-            "{what}: the shim ran the session itself, not through the agent
-{shown}
-logs of the account:
-{}",
+            "{what}: the shim ran the session itself, not through the agent\n{shown}\nlogs of the account:\n{}",
             self.logs()
         );
     }
@@ -147,10 +144,7 @@ logs of the account:
     fn assert_local(&self, what: &str, shown: &str) {
         assert!(
             shown.contains("agent unavailable"),
-            "{what}: the shim did not run the session itself
-{shown}
-logs of the account:
-{}",
+            "{what}: the shim did not run the session itself\n{shown}\nlogs of the account:\n{}",
             self.logs()
         );
     }
@@ -296,14 +290,16 @@ fn byte_clean_through(shell_name: &str, shell_yaml: &str, tag: &str) {
             let down = rig.kit.path(&format!("down-{shell_name}-{tool}-{name}.bin"));
             let mut upload = Command::new(exe);
             let mut download = Command::new(exe);
-            for (command, from, to, batch) in [
+            for (direction, command, from, to, batch) in [
                 (
+                    "up",
                     &mut upload,
                     local.to_string_lossy().into_owned(),
                     format!("{target}:{up}"),
                     format!("put {} {up}", local.display()),
                 ),
                 (
+                    "down",
                     &mut download,
                     format!("{target}:{remote_source}"),
                     down.to_string_lossy().into_owned(),
@@ -313,7 +309,8 @@ fn byte_clean_through(shell_name: &str, shell_yaml: &str, tag: &str) {
                 command.args(client_options(&login));
                 match tool {
                     "sftp" => {
-                        let batch_file = rig.kit.path("batch.txt");
+                        // One file per direction: both commands are built before either runs.
+                        let batch_file = rig.kit.path(&format!("batch-{direction}.txt"));
                         std::fs::write(&batch_file, format!("{batch}\n")).unwrap();
                         command.arg("-v").arg("-b").arg(&batch_file).arg(&target);
                     }
@@ -328,21 +325,34 @@ fn byte_clean_through(shell_name: &str, shell_yaml: &str, tag: &str) {
             let sent = run_client(upload, false, rig.kit.dir());
             if std::fs::read(profile.join(&up)).ok().as_deref() != Some(bytes.as_slice()) {
                 failures.push(format!(
-                    "{shell_name} {tool} upload of {name}: exit {:?}\n{}",
-                    sent.code, sent.stderr
+                    "{shell_name} {tool} upload of {name}: exit {:?}, remote file {:?} of {} bytes sent\nstdout: {}\n{}",
+                    sent.code,
+                    std::fs::read(profile.join(&up)).map(|got| got.len()),
+                    bytes.len(),
+                    String::from_utf8_lossy(&sent.stdout),
+                    sent.stderr
                 ));
             }
             let got = run_client(download, false, rig.kit.dir());
             if std::fs::read(&down).ok().as_deref() != Some(bytes.as_slice()) {
                 failures.push(format!(
-                    "{shell_name} {tool} download of {name}: exit {:?}\n{}",
-                    got.code, got.stderr
+                    "{shell_name} {tool} download of {name}: exit {:?}, local file {:?} of {} bytes sent\nstdout: {}\n{}",
+                    got.code,
+                    std::fs::read(&down).map(|got| got.len()),
+                    bytes.len(),
+                    String::from_utf8_lossy(&got.stdout),
+                    got.stderr
                 ));
             }
         }
     }
     session.leave();
-    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    assert!(
+        failures.is_empty(),
+        "{}\nlogs of the account:\n{}",
+        failures.join("\n"),
+        rig.logs()
+    );
 }
 
 #[test]
@@ -358,19 +368,31 @@ fn scp_and_sftp_are_byte_clean_through_pwsh() {
 
 // A terminal, a broken config, the agent's PATH =====
 
-/// `ssh -t host command` gives the command a terminal (before, it ran on pipes), and its exit code arrives;
-/// `ssh -T` gives it pipes. The resize has its own test below.
+/// `ssh -t host command` gives the command a terminal (before, it ran on pipes) and ends with the exit code
+/// stock sshd gives it; `ssh -T` gives it pipes. The resize has its own test below.
 #[test]
 fn a_command_with_a_terminal_has_a_terminal() {
     let _machine = machine::exclusive();
     let rig = Rig::new("shd4");
     let login = rig.login();
+    // What stock sshd answers for a command with a terminal: the broker answers the same.
+    let system_cmd = PathBuf::from(std::env::var("SystemRoot").expect("SystemRoot")).join(r"System32\cmd.exe");
+    set_stock_shell(&system_cmd);
+    let stock = rig.ssh(&login, true, "exit 7");
+    eprintln!("stock sshd: exit {:?} for `exit 7` with a terminal", stock.code);
     rig.broker_is_default_shell();
     let session = rig.start_session(&login);
 
     let pty = rig.ssh(&login, true, "[Console]::IsOutputRedirected; exit 7");
     rig.assert_relayed("ssh -tt", &format!("{}{}", text(&pty), pty.stderr));
-    assert_eq!(pty.code, Some(7), "{}\n{}", text(&pty), pty.stderr);
+    assert_eq!(
+        pty.code,
+        stock.code,
+        "stock sshd answers {:?} for the same command with a terminal\n{}\n{}",
+        stock.code,
+        text(&pty),
+        pty.stderr
+    );
     assert!(
         text(&pty).contains("False"),
         "the command had no terminal: {:?}",

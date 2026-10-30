@@ -454,13 +454,7 @@ impl ConsoleClient {
     }
 
     fn fail(&self, what: &str) -> ! {
-        panic!(
-            "{what}; the console showed:
-{}
-{}",
-            self.text(),
-            (self.diagnostics)()
-        )
+        panic!("{what}; the console showed:\n{}\n{}", self.text(), (self.diagnostics)())
     }
 
     pub fn resize(&self, cols: u16, rows: u16) {
