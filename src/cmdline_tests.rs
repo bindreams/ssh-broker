@@ -8,9 +8,6 @@ use std::sync::{Arc, Mutex};
 
 use super::{Encoding, RawExec, dash_c_tail, decode_command, join_args, resolve_exec, split_args};
 
-#[path = "../tests/common/command_corpus.rs"]
-mod command_corpus;
-
 fn args(line: &str) -> Vec<String> {
     split_args(line)
 }
@@ -259,7 +256,7 @@ fn join_args_round_trips_through_split_args() {
             failures.push(format!("{args:?} -> {line:?}"));
         }
     };
-    for command in command_corpus::CORPUS {
+    for command in crate::command_corpus::CORPUS {
         check(&[command]);
         check(&["-c", command]);
     }

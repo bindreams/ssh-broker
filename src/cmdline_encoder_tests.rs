@@ -14,9 +14,7 @@ use crate::route::{Route, route};
 mod sshd_encoder;
 use sshd_encoder::{build_exec_command, conhost_escape, escape_arg, flag_decides_form, tokenize};
 
-#[path = "../tests/common/command_corpus.rs"]
-mod command_corpus;
-use command_corpus::CORPUS;
+use crate::command_corpus::CORPUS;
 
 const SHELL: &str = r"C:\Program Files\ssh-broker\ssh-broker.exe";
 

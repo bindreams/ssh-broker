@@ -1,0 +1,240 @@
+//! The `config.yaml` schema and its parser.
+//!
+//! Strict: an unknown key anywhere is an error, so a typo is a warning instead of being ignored.
+
+use std::fmt;
+
+use serde::de::Error as _;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+use super::Escaping;
+
+/// The `shell` block, as written. `None` fields are the defaults, which depend on the program;
+/// `Some(vec![])` is an explicit "none".
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ShellBlock {
+    /// Program, then its leading arguments. Never empty after [`parse`].
+    pub start: Vec<String>,
+    pub without_command: Option<Vec<String>>,
+    pub with_command: Option<Vec<String>>,
+    pub escaping: Option<Escaping>,
+}
+
+/// Why a config file is broken.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParseError {
+    /// What is wrong: the offending key or value and, when the parser gave one, the line.
+    pub reason: String,
+}
+
+impl fmt::Display for ParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.reason)
+    }
+}
+
+impl std::error::Error for ParseError {}
+
+/// The `shell` block of a config file's bytes. `Ok(None)`: a valid file with no `shell` (empty,
+/// or only comments).
+///
+/// Editors save UTF-8 (with or without a BOM) or UTF-16 with a BOM; the BOM decides.
+pub fn parse(bytes: &[u8]) -> Result<Option<ShellBlock>, ParseError> {
+    let (text, _, malformed) = encoding_rs::UTF_8.decode(bytes);
+    if malformed {
+        return Err(ParseError {
+            reason: "the file is not valid UTF-8 or UTF-16 text".into(),
+        });
+    }
+    let file: Option<File> = yaml_serde::from_str(&text).map_err(|e| ParseError { reason: e.to_string() })?;
+    let Some(raw) = file.and_then(|f| f.shell) else {
+        return Ok(None);
+    };
+    let block = ShellBlock::from(raw);
+    if block.start.is_empty() {
+        return Err(ParseError {
+            reason: "invalid `shell`: `start` is required and must not be empty".into(),
+        });
+    }
+    Ok(Some(block))
+}
+
+/// A config file holding `block`, in the canonical nested form.
+pub fn render_file(block: &ShellBlock) -> Result<String, ParseError> {
+    #[derive(Serialize)]
+    struct Out<'a> {
+        shell: &'a ShellBlock,
+    }
+    yaml_serde::to_string(&Out { shell: block }).map_err(|e| ParseError { reason: e.to_string() })
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct File {
+    #[serde(default, deserialize_with = "shell_field")]
+    shell: Option<RawShell>,
+}
+
+/// Present means a block: `shell:` with nothing after it is a mistake, not "no shell".
+fn shell_field<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<RawShell>, D::Error> {
+    RawShell::deserialize(deserializer).map(Some)
+}
+
+/// `shell:` as written: a program, or a mapping.
+struct RawShell(RawBlock);
+
+impl<'de> Deserialize<'de> for RawShell {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = yaml_serde::Value::deserialize(deserializer)?;
+        match value {
+            yaml_serde::Value::String(program) => Ok(RawShell(RawBlock {
+                start: Some(Args(vec![program])),
+                append: None,
+                escaping: None,
+            })),
+            yaml_serde::Value::Mapping(_) => yaml_serde::from_value(value)
+                .map(RawShell)
+                .map_err(|e| D::Error::custom(format!("invalid `shell`: {e}"))),
+            _ => Err(D::Error::custom("invalid `shell`: expected a program or a mapping")),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+struct RawBlock {
+    #[serde(default, deserialize_with = "start")]
+    start: Option<Args>,
+    append: Option<RawAppend>,
+    #[serde(default, deserialize_with = "escaping")]
+    escaping: Option<Escaping>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+struct RawAppend {
+    #[serde(default, deserialize_with = "without_command")]
+    without_command: Option<List>,
+    #[serde(default, deserialize_with = "with_command")]
+    with_command: Option<List>,
+}
+
+// A present key must hold a valid value (`key:` with nothing is a mistake), and the error names
+// the key, which `from_value` cannot locate. One wrapper per key because `deserialize_with`
+// takes no arguments.
+fn named<'de, D: Deserializer<'de>, T: Deserialize<'de>>(deserializer: D, key: &str) -> Result<Option<T>, D::Error> {
+    T::deserialize(deserializer)
+        .map(Some)
+        .map_err(|e| D::Error::custom(format!("`{key}`: {e}")))
+}
+
+fn start<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<Args>, D::Error> {
+    named(deserializer, "start")
+}
+
+fn escaping<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<Escaping>, D::Error> {
+    named(deserializer, "escaping")
+}
+
+fn without_command<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<List>, D::Error> {
+    named(deserializer, "without-command")
+}
+
+fn with_command<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<List>, D::Error> {
+    named(deserializer, "with-command")
+}
+
+/// A list of arguments (strings only: a number or a boolean is a mistake, not a coercion).
+struct List(Vec<String>);
+
+impl<'de> Deserialize<'de> for List {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = yaml_serde::Value::deserialize(deserializer)?;
+        let yaml_serde::Value::Sequence(items) = value else {
+            return Err(D::Error::custom("expected a list of strings"));
+        };
+        items
+            .into_iter()
+            .map(|item| match item {
+                yaml_serde::Value::String(s) => Ok(s),
+                other => Err(D::Error::custom(format!(
+                    "expected a string in the list, found {other:?}"
+                ))),
+            })
+            .collect::<Result<_, _>>()
+            .map(List)
+    }
+}
+
+/// `start`: one program (a string is exactly one argument, never split), or a list.
+struct Args(Vec<String>);
+
+impl<'de> Deserialize<'de> for Args {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = yaml_serde::Value::deserialize(deserializer)?;
+        match value {
+            yaml_serde::Value::String(program) => Ok(Args(vec![program])),
+            yaml_serde::Value::Sequence(_) => yaml_serde::from_value::<List>(value)
+                .map(|list| Args(list.0))
+                .map_err(|e| D::Error::custom(e.to_string())),
+            other => Err(D::Error::custom(format!(
+                "expected a program or a list of strings, found {other:?}"
+            ))),
+        }
+    }
+}
+
+impl From<RawShell> for ShellBlock {
+    fn from(raw: RawShell) -> Self {
+        let RawBlock {
+            start,
+            append,
+            escaping,
+        } = raw.0;
+        let (without_command, with_command) = match append {
+            Some(a) => (a.without_command.map(|l| l.0), a.with_command.map(|l| l.0)),
+            None => (None, None),
+        };
+        ShellBlock {
+            start: start.map(|s| s.0).unwrap_or_default(),
+            without_command,
+            with_command,
+            escaping,
+        }
+    }
+}
+
+impl Serialize for ShellBlock {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        #[serde(rename_all = "kebab-case")]
+        struct Append<'a> {
+            #[serde(skip_serializing_if = "Option::is_none")]
+            without_command: &'a Option<Vec<String>>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            with_command: &'a Option<Vec<String>>,
+        }
+        #[derive(Serialize)]
+        struct Out<'a> {
+            start: &'a Vec<String>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            append: Option<Append<'a>>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            escaping: &'a Option<Escaping>,
+        }
+        let append = (self.without_command.is_some() || self.with_command.is_some()).then_some(Append {
+            without_command: &self.without_command,
+            with_command: &self.with_command,
+        });
+        Out {
+            start: &self.start,
+            append,
+            escaping: &self.escaping,
+        }
+        .serialize(serializer)
+    }
+}
+
+#[cfg(test)]
+#[path = "config_tests.rs"]
+mod config_tests;

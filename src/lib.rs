@@ -24,6 +24,9 @@ pub mod agent_lock;
 #[cfg(windows)]
 pub mod autologin;
 pub mod cmdline;
+#[cfg(test)]
+#[path = "../tests/common/command_corpus.rs"]
+mod command_corpus;
 #[cfg(windows)]
 pub mod conpty;
 #[cfg(windows)]
@@ -47,6 +50,7 @@ pub mod provision;
 pub mod relay;
 pub mod route;
 pub mod secret;
+pub mod shell;
 pub mod shim;
 #[cfg(windows)]
 pub mod shim_offer;
