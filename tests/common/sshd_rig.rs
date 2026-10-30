@@ -409,11 +409,11 @@ impl SshSession {
 
 /// The screen a terminal would show after `stream`, the bytes a client received for a session with a terminal:
 /// what the user sees once every clear and cursor move is applied. Wrapped lines are joined and line ends removed,
-/// so a sentence is found whole whatever the terminal's width.
+/// so a sentence is found whole. The terminal is 120x30, the size sshd gives a session whose client has none to send.
 pub fn screen_text(stream: &[u8]) -> String {
     let (rows, cols) = (
-        std::num::NonZeroU16::new(24).unwrap(),
-        std::num::NonZeroU16::new(80).unwrap(),
+        std::num::NonZeroU16::new(30).unwrap(),
+        std::num::NonZeroU16::new(120).unwrap(),
     );
     let mut terminal = vt100::Parser::new(rows, cols, 0);
     terminal.process(stream);

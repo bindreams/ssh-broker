@@ -196,25 +196,18 @@ fn corpus_through_stock_and_broker(tag: &str, tty: bool) {
         let outcome = rig.ssh(&login, tty, command);
         let Some(line) = rig.probe_line() else {
             failures.push(format!(
-                "stock sshd: the probe did not run for {command:?}
-{}",
+                "stock sshd: the probe did not run for {command:?}\n{}",
                 outcome.stderr
             ));
             continue;
         };
-        // sshd lowercases the whole `DefaultShell` path (`pwd.c`).
-        let model = if tty {
-            sshd_encoder::verbatim_line(&probe.to_lowercase(), command)
-        } else {
-            sshd_encoder::escaped_line(&probe.to_lowercase(), command)
-        };
-        let want = split_args(&model);
-        if split_args(&line) != want {
-            failures.push(format!(
-                "stock sshd, {command:?}
-  line: {line:?}
-  model: {want:?}"
-            ));
+        // sshd lowercases the whole `DefaultShell` path (`pwd.c`). With a terminal conhost also expands
+        // `%VAR%` (modelled in `tests/conhost_windows.rs`), so the stock line itself is the model there.
+        if !tty {
+            let want = split_args(&sshd_encoder::escaped_line(&probe.to_lowercase(), command));
+            if split_args(&line) != want {
+                failures.push(format!("stock sshd, {command:?}\n  line: {line:?}\n  model: {want:?}"));
+            }
         }
         stock.push((*command, line));
     }
@@ -237,8 +230,7 @@ fn corpus_through_stock_and_broker(tag: &str, tty: bool) {
             }
             let Some(line) = rig.probe_line() else {
                 failures.push(format!(
-                    "broker ({path}): the probe did not run for {command:?}
-{}",
+                    "broker ({path}): the probe did not run for {command:?}\n{}",
                     outcome.stderr
                 ));
                 continue;
@@ -261,19 +253,14 @@ fn corpus_through_stock_and_broker(tag: &str, tty: bool) {
             }
             if got != want {
                 failures.push(format!(
-                    "broker ({path}), {command:?}
-  line: {line:?}
-  want: {want:?}"
+                    "broker ({path}), {command:?}\n  line: {line:?}\n  want: {want:?}"
                 ));
             }
         }
     };
     check("shim alone: no agent, fail-open", false);
     // The session starts under the account's pwsh; the probe is the shell again for the commands.
-    rig.account.write_user_config(
-        "shell: pwsh.exe
-",
-    );
+    rig.account.write_user_config("shell: pwsh.exe\n");
     let session = rig.start_session(&login);
     rig.use_probe_shell();
     check("through the agent", true);
@@ -288,14 +275,7 @@ fn corpus_through_stock_and_broker(tag: &str, tty: bool) {
             }
         }
     }
-    assert!(
-        failures.is_empty(),
-        "{}",
-        failures.join(
-            "
-"
-        )
-    );
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
 // scp and sftp =====
@@ -582,40 +562,64 @@ fn a_shell_that_exists_and_cannot_start_gives_cmd_exe_with_a_warning() {
 fn assert_unstartable_warning(stderr: &str, stub: &std::path::Path) {
     assert_eq!(stderr.matches("cannot use the shell from").count(), 1, "{stderr}");
     assert!(
-        stderr.contains("config.yaml") && stderr.contains(&stub.display().to_string()) && stderr.contains("os error"),
+        stderr.contains("config.yaml")
+            && stderr.contains(&stub.display().to_string())
+            && stderr.contains("cannot be started"),
         "{stderr}"
     );
 }
 
 /// The warning for a shell that cannot be used is on the screen of a session with a terminal: ConPTY's opening
-/// output (a clear of the screen, a cursor move) must not wipe it. Both forms of the session are rendered the
-/// way a terminal renders them, from the bytes ssh delivers: a command with a terminal, and a login.
+/// output (a clear of the screen, a cursor move) must not wipe it. The sessions are rendered the way a terminal
+/// renders them, from the bytes ssh delivers: a command with a terminal through the shim alone and through the
+/// agent, and a login through the agent.
 #[test]
 fn the_warning_survives_on_the_screen_of_a_session_with_a_terminal() {
     let _machine = machine::exclusive();
     let rig = Rig::new("shd10");
     let login = rig.login();
     rig.broker_is_default_shell();
-    let session = rig.start_session(&login);
-    rig.account.write_user_config("shell: {strt: pwsh.exe}\n");
+    let broken = "shell: {strt: pwsh.exe}\n";
 
-    let out = rig.ssh(&login, true, "echo built-in-ok");
-    let screen = sshd_rig::screen_text(&out.stdout);
-    eprintln!(
-        "the screen of the command session:\n{screen}\nthe raw stream: {:?}",
-        text(&out)
+    let assert_warned = |what: &str, stream: &[u8], raw: &str| {
+        let screen = sshd_rig::screen_text(stream);
+        eprintln!("the screen of {what}:\n{screen}\nthe raw stream: {raw:?}");
+        assert!(
+            screen.contains("built-in-ok"),
+            "{what}: the command did not run:\n{screen}\nraw: {raw:?}"
+        );
+        assert!(
+            screen.contains("cannot use the shell from") && screen.contains("config.yaml"),
+            "{what}: the warning is not on the screen:\n{screen}\nraw: {raw:?}"
+        );
+    };
+
+    // No agent: the shim runs the command.
+    rig.account.write_user_config(broken);
+    let local = rig.ssh(&login, true, "echo built-in-ok");
+    assert_warned(
+        "a command with a terminal, through the shim alone",
+        &local.stdout,
+        &text(&local),
     );
-    assert!(screen.contains("built-in-ok"), "the command did not run:\n{screen}");
-    assert!(
-        screen.contains("cannot use the shell from") && screen.contains("config.yaml"),
-        "the warning is not on the screen of a command with a terminal:\n{screen}\nraw: {:?}",
-        text(&out)
+
+    // The agent runs the command, and the login.
+    rig.account.write_user_config("shell: pwsh.exe\n");
+    let session = rig.start_session(&login);
+    rig.account.write_user_config(broken);
+    let relayed = rig.ssh(&login, true, "echo built-in-ok");
+    assert_warned(
+        "a command with a terminal, through the agent",
+        &relayed.stdout,
+        &text(&relayed),
     );
 
     let mut shown = login.start();
+    // Both are awaited, in whichever order they arrive.
+    shown.read_until("using the built-in cmd.exe");
     shown.read_until("Microsoft Windows");
     let screen = sshd_rig::screen_text(&shown.transcript);
-    eprintln!("the screen of the login:\n{screen}\nthe raw stream: {:?}", shown.text());
+    eprintln!("the screen of a login:\n{screen}\nthe raw stream: {:?}", shown.text());
     assert!(
         screen.contains("cannot use the shell from") && screen.contains("config.yaml"),
         "the warning is not on the screen of a login:\n{screen}\nraw: {:?}",
