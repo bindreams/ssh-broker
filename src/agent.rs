@@ -697,7 +697,8 @@ fn handle_connection_in(conn: socket2::Socket, hooks: Hooks, control: &Control) 
             ));
         }
     };
-    if let Some(text) = &launched.notice {
+    // A terminal session shows its warning after ConPTY's first output (see `handle_pty`).
+    if let (Some(text), false) = (&launched.notice, hs.mode == Mode::Pty) {
         show_notice(&mut tx, hs.mode, text);
     }
     let cwd_buf = child_cwd(&hs.cwd, home_dir());
@@ -709,13 +710,25 @@ fn handle_connection_in(conn: socket2::Socket, hooks: Hooks, control: &Control) 
     }
 }
 
-/// Show the warning for a shell that could not be used: the first data of the session, on the
-/// terminal for a PTY and on stderr for a command.
+/// Show the warning for a shell that could not be used on stderr of a command, before it starts.
+/// (A terminal session shows it through [`show_terminal_notice`].)
 #[cfg(windows)]
 fn show_notice(tx: &mut ConnTx, mode: Mode, text: &str) {
     tracing::warn!("{text}");
     let (stream, bytes) = launch::notice_frame(mode, text);
     // A client that has gone is found by the relay, which owns that case.
+    if let Err(e) = write_data(tx, stream, &bytes) {
+        tracing::debug!("could not show the shell warning: {e:#}");
+    }
+}
+
+/// Show the warning on the terminal. ConPTY opens with a clear of the screen (measured: the client
+/// receives `ESC[2J` and `ESC[H` after a warning that was sent first, and the warning is gone), so the
+/// warning follows the first output the pseudoconsole produces.
+#[cfg(windows)]
+fn show_terminal_notice(tx: &mut impl std::io::Write, text: &str) {
+    tracing::warn!("{text}");
+    let (stream, bytes) = launch::notice_frame(Mode::Pty, text);
     if let Err(e) = write_data(tx, stream, &bytes) {
         tracing::debug!("could not show the shell warning: {e:#}");
     }
@@ -784,13 +797,14 @@ fn handle_pty(
     env: Env<'_>,
 ) -> anyhow::Result<()> {
     let Env { hooks, control } = env;
-    // The warning for a shell that could not start goes out before the output threads exist, so it is
-    // the first thing on the terminal.
+    // The warning to show once the pseudoconsole has opened: the config's, or that of a shell that
+    // could not start.
+    let mut notice = launched.notice.clone();
     let started = launch::start(
         &*hooks.shell_host,
         launched,
         |command| (hooks.start_pty)(command, cols, rows, cwd),
-        |text| show_notice(&mut tx, Mode::Pty, text),
+        |text| notice = Some(text.to_owned()),
     );
     let mut session = match started {
         Ok(session) => session,
@@ -844,7 +858,12 @@ fn handle_pty(
                 }
                 let ok = {
                     let mut g = tx.lock().unwrap();
-                    write_data(&mut *g, Stream::Pty, &buf[..n]).is_ok()
+                    let ok = write_data(&mut *g, Stream::Pty, &buf[..n]).is_ok();
+                    // After the first output, which opens with ConPTY's clear of the screen.
+                    if let (true, Some(text)) = (ok, notice.take()) {
+                        show_terminal_notice(&mut *g, &text);
+                    }
+                    ok
                 };
                 if !ok {
                     // The socket is gone. Reap, but keep READING: this thread is the only
@@ -854,6 +873,10 @@ fn handle_pty(
                     reap_tree(&job);
                     delivering = false;
                 }
+            }
+            // A pseudoconsole that ended without any output still owes the warning.
+            if let (true, Some(text)) = (delivering, notice.take()) {
+                show_terminal_notice(&mut *tx.lock().unwrap(), &text);
             }
         })
     };

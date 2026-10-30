@@ -1367,11 +1367,14 @@ fn a_broken_config_sends_one_warning_then_runs_cmd_exe() {
 
     let (outcome, output, _) = shell_session("warn-pty", Mode::Pty, Some("echo shell-ok"), broken());
     assert_eq!(outcome, Outcome::Exited(0));
-    assert!(output.starts_with(&notice), "{output:?}");
     assert_eq!(output.matches("cannot use the shell").count(), 1, "{output:?}");
-    let after = &output[notice.len()..];
+    assert!(output.contains("shell-ok"), "{output:?}");
+    // The warning follows ConPTY's opening output, whose clear of the screen would erase it, and
+    // nothing clears the screen after it.
+    let at = output.find(&notice).unwrap_or_else(|| panic!("no warning: {output:?}"));
+    assert!(at > 0, "the warning came before ConPTY's opening output: {output:?}");
     assert!(
-        after.contains("shell-ok"),
-        "the command's output follows the warning: {output:?}"
+        !output[at..].contains("\u{1b}[2J"),
+        "the screen is cleared after the warning: {output:?}"
     );
 }
