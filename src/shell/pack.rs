@@ -91,6 +91,58 @@ pub struct Plan {
     pub effective: Effective,
 }
 
+impl Source {
+    /// How `verify` names the source.
+    fn label(&self) -> String {
+        match self {
+            Source::User(file) => format!("user: {}", file.display()),
+            Source::System(file) => format!("system: {}", file.display()),
+            Source::BuiltIn => "built-in".into(),
+            Source::SystemCmd => "the system cmd.exe".into(),
+            Source::OtherProgram => "any other program".into(),
+        }
+    }
+}
+
+/// The effective shell in the config's canonical form, each value followed by where it comes
+/// from, then the program `start` resolved to and, when a configured shell could not be used,
+/// the warning. What `verify` prints.
+pub fn render(effective: &Effective) -> String {
+    let list = |items: &[String]| {
+        let items: Vec<String> = items
+            .iter()
+            .map(|item| {
+                if item.is_empty() || item.contains([' ', ',', '[', ']', '#', '"', '\'']) {
+                    format!("{item:?}")
+                } else {
+                    item.clone()
+                }
+            })
+            .collect();
+        format!("[{}]", items.join(", "))
+    };
+    let escaping = match effective.escaping {
+        Escaping::Cmd => "cmd",
+        Escaping::Msvc => "msvc",
+    };
+    let why = &effective.why;
+    let mut text = format!(
+        "shell:\n  start: {}  ({})\n  append:\n    without-command: {}  ({})\n    with-command: {}  ({})\n  escaping: {escaping}  ({})\nprogram: {}",
+        list(&effective.start),
+        why.start.label(),
+        list(&effective.without_command),
+        why.without_command.label(),
+        list(&effective.with_command),
+        why.with_command.label(),
+        why.escaping.label(),
+        effective.program.display(),
+    );
+    if let Some(problem) = &effective.problem {
+        text.push_str(&format!("\nwarning: {}", problem.describe()));
+    }
+    text
+}
+
 impl Plan {
     /// The warning to show before the line starts, when the configured shell could not be used.
     pub fn notice(&self) -> Option<String> {

@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 pub use layers::{Chosen, Origin, Problem, choose, user_config_path};
-pub use pack::{Defaults, Effective, Plan, Session, Source, Why, defaults, effective, plan};
+pub use pack::{Defaults, Effective, Plan, Session, Source, Why, defaults, effective, plan, render};
 #[cfg(windows)]
 pub use windows::WindowsHost;
 

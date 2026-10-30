@@ -28,14 +28,19 @@ pub struct Problem {
 }
 
 impl Problem {
-    /// The warning a session shows before the built-in `cmd.exe` starts.
-    pub fn notice(&self) -> String {
+    /// What is wrong and what runs instead, as a sentence.
+    pub fn describe(&self) -> String {
         let value = self.value.as_ref().map(|v| format!(" ({v})")).unwrap_or_default();
         format!(
-            "ssh-broker: cannot use the shell from {}{value}: {}; using the built-in cmd.exe",
+            "cannot use the shell from {}{value}: {}; using the built-in cmd.exe",
             self.file.display(),
             self.reason
         )
+    }
+
+    /// The warning a session shows before the built-in `cmd.exe` starts.
+    pub fn notice(&self) -> String {
+        format!("ssh-broker: {}", self.describe())
     }
 }
 

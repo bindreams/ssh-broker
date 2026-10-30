@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use super::{Session, Source, defaults, effective, plan};
+use super::{Session, Source, defaults, effective, plan, render};
 use crate::cmdline::split_args;
 use crate::shell::test_host::{SYSTEM_CMD, TestHost};
 use crate::shell::{Escaping, Origin};
@@ -296,4 +296,64 @@ fn the_command_corpus_under_cmd_is_wrapped_and_otherwise_unchanged() {
         let want = format!(r#"{SYSTEM_CMD} /c "{}""#, crate::shim::spawn_line(text));
         assert_eq!(line(&host, &command(text)), want, "{text:?}");
     }
+}
+
+// render =====
+
+#[test]
+fn render_shows_every_value_with_its_origin() {
+    // A user shell with a default `with-command`.
+    let host = TestHost::new()
+        .with_program("pwsh.exe", PWSH)
+        .with_user_config("shell: {start: [pwsh.exe, -NoLogo], append: {without-command: [-NoExit]}}\n");
+    let text = render(&effective(&host).unwrap());
+    let user = format!("user: {}", crate::shell::test_host::USER_CONFIG);
+    let want = format!(
+        "shell:\n\
+         \x20 start: [pwsh.exe, -NoLogo]  ({user})\n\
+         \x20 append:\n\
+         \x20   without-command: [-NoExit]  ({user})\n\
+         \x20   with-command: [-c]  (any other program)\n\
+         \x20 escaping: msvc  (any other program)\n\
+         program: {PWSH}"
+    );
+    assert_eq!(text, want);
+
+    // The built-in: the system cmd.exe and its defaults.
+    let text = render(&effective(&TestHost::new()).unwrap());
+    assert!(text.contains(&format!("start: [{SYSTEM_CMD}]  (built-in)")), "{text}");
+    assert!(text.contains("escaping: cmd  (the system cmd.exe)"), "{text}");
+    assert!(text.contains("with-command: [/c]  (the system cmd.exe)"), "{text}");
+    assert!(text.contains("without-command: []  (the system cmd.exe)"), "{text}");
+    assert!(text.ends_with(&format!("program: {SYSTEM_CMD}")), "{text}");
+
+    // The system layer, and a value with a space.
+    let host = TestHost::new()
+        .with_program("p", PWSH)
+        .with_system_config("shell: {start: [p, \"a b\"]}\n");
+    let text = render(&effective(&host).unwrap());
+    assert!(
+        text.contains(&format!(
+            r#"start: [p, "a b"]  (system: {})"#,
+            crate::shell::test_host::SYSTEM_CONFIG
+        )),
+        "{text}"
+    );
+}
+
+#[test]
+fn render_shows_the_problem_and_the_fallback() {
+    let host = TestHost::new().with_user_config("shell: nonesuch.exe\n");
+    let text = render(&effective(&host).unwrap());
+    assert!(
+        text.contains("start: [C:\\Windows\\System32\\cmd.exe]  (built-in)"),
+        "{text}"
+    );
+    let warning = text.lines().last().unwrap();
+    assert!(
+        warning.starts_with("warning: cannot use the shell from ")
+            && warning.contains("(nonesuch.exe)")
+            && warning.ends_with("using the built-in cmd.exe"),
+        "{text}"
+    );
 }

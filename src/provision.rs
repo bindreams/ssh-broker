@@ -84,6 +84,44 @@ pub fn check_apply_args(args: &[String]) -> anyhow::Result<Vec<String>> {
     Ok(warnings)
 }
 
+/// The `verify` row for the shell configuration: it passes when the configured (or built-in) shell is
+/// in use, and fails when a fallback is, naming the file and the value.
+pub fn shell_config_row(effective: &anyhow::Result<crate::shell::Effective>) -> report::Check {
+    match effective {
+        Ok(effective) => match &effective.problem {
+            None => report::Check::new(
+                "shell config",
+                true,
+                format!(
+                    "{} ({})",
+                    effective.program.display(),
+                    match &effective.why.start {
+                        crate::shell::Source::User(file) => format!("user: {}", file.display()),
+                        crate::shell::Source::System(file) => format!("system: {}", file.display()),
+                        _ => "built-in".to_string(),
+                    }
+                ),
+            ),
+            Some(problem) => report::Check::new("shell config", false, problem.describe()),
+        },
+        Err(e) => report::Check::new("shell config", false, format!("{e:#}")),
+    }
+}
+
+/// The handshake `verify` sends to run its probe through the agent: ssh-broker's own command, run as
+/// it stands and not through the user's shell.
+pub fn probe_handshake(exe: &std::path::Path) -> crate::protocol::Handshake {
+    let command = format!("\"{}\" verify-probe", exe.display());
+    crate::shim::make_handshake(
+        &Some(command),
+        false,
+        crate::protocol::Launch::Direct,
+        "xterm".into(),
+        80,
+        24,
+    )
+}
+
 /// The directory `apply` installs into. The one place the path is written; [`layout::Layout`]
 /// derives from it.
 pub const BASE_DIR: &str = r"C:\ProgramData\ssh-broker";
@@ -107,7 +145,6 @@ mod imp {
         apply_lock, flow, probe, procwait, registry, report, schtasks, session_task, sessions, system_config,
         taskscheduler, user_rows,
     };
-    use crate::protocol::Launch;
     use crate::{afunix, shim};
     use anyhow::Context;
     use std::path::Path;
@@ -415,6 +452,11 @@ mod imp {
             Err(e) => rows.push(report::Check::new("DefaultShell pair", false, e.to_string())),
         }
 
+        // Local: the shell sessions start. A fallback to the built-in cmd.exe is a failure here: the
+        // user's config says something that is not true.
+        let effective = crate::shell::effective(&crate::shell::WindowsHost);
+        rows.push(super::shell_config_row(&effective));
+
         // Local: the install directory is exactly the hardened one (only SYSTEM and Administrators
         // can write to it).
         let base = layout::check_base(&layout);
@@ -548,6 +590,9 @@ mod imp {
         }
 
         println!("{}", report::format_report(&rows));
+        if let Ok(effective) = &effective {
+            println!("\n{}", crate::shell::render(effective));
+        }
         let code = report::verify_exit_code(&rows);
         if code != 0 {
             std::process::exit(code);
@@ -590,8 +635,7 @@ mod imp {
     fn drive_probe(exe: &Path) -> anyhow::Result<(probe::ProbeResult, bool)> {
         let sock = afunix::connect(&crate::userdir::current_socket_location()?.path).context("connect to agent")?;
         let (rx, tx) = afunix::split(sock)?;
-        let cmd = format!("\"{}\" verify-probe", exe.display());
-        let hs = shim::make_handshake(&Some(cmd), false, Launch::Direct, "xterm".into(), 80, 24);
+        let hs = super::probe_handshake(exe);
         let mut out = Vec::new();
         let mut err = Vec::new();
         // Feed the SAME payload upstream that the child echoes downstream. Passing `io::empty()`
