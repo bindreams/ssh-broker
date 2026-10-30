@@ -15,6 +15,7 @@ use std::process::Command;
 use ssh_broker::cmdline::split_args;
 use ssh_broker::provision::registry::{OPENSSH_KEY, set_default_shell_under};
 use ssh_broker::shim::spawn_line;
+use ssh_broker::socket_loc;
 
 #[path = "common/account.rs"]
 mod account_fixture;
@@ -111,11 +112,47 @@ impl Rig {
     }
 
     /// An interactive login that starts the account's background session, left open for the caller to end.
-    /// The account's config names pwsh at this point (the fixture default).
+    /// The account's config names pwsh at this point (the fixture default). The shell it shows is the
+    /// agent's (DPAPI works), not a plain one the shim fell back to after a logon that failed.
     fn start_session(&self, login: &Login<'_>) -> SshSession {
         let mut session = login.start();
         session.log_in(&self.account.password);
+        session.check_relayed_shell();
         session
+    }
+
+    /// What the shim and the agent logged for the account, for the message of a failed assertion.
+    fn logs(&self) -> String {
+        self.account
+            .try_profile()
+            .and_then(|profile| socket_loc::for_profile(profile).ok())
+            .map(|location| stand_in::read_logs(&location))
+            .unwrap_or_default()
+    }
+
+    /// Fail unless `shown` (what a session wrote) says the agent ran it: the shim says "agent unavailable"
+    /// when it ran the session itself.
+    fn assert_relayed(&self, what: &str, shown: &str) {
+        assert!(
+            !shown.contains("agent unavailable"),
+            "{what}: the shim ran the session itself, not through the agent
+{shown}
+logs of the account:
+{}",
+            self.logs()
+        );
+    }
+
+    /// The reverse of [`Rig::assert_relayed`], for a session started with no agent running.
+    fn assert_local(&self, what: &str, shown: &str) {
+        assert!(
+            shown.contains("agent unavailable"),
+            "{what}: the shim did not run the session itself
+{shown}
+logs of the account:
+{}",
+            self.logs()
+        );
     }
 }
 
@@ -157,7 +194,8 @@ fn broker_delivers_every_command_exactly_and_stock_sshd_matches_its_model() {
             ));
             continue;
         };
-        let want = split_args(&sshd_encoder::escaped_line(&probe, command));
+        // sshd lowercases the whole `DefaultShell` path (`pwd.c`).
+        let want = split_args(&sshd_encoder::escaped_line(&probe.to_lowercase(), command));
         if split_args(&line) != want {
             failures.push(format!("stock sshd, {command:?}\n  line: {line:?}\n  model: {want:?}"));
         }
@@ -167,10 +205,16 @@ fn broker_delivers_every_command_exactly_and_stock_sshd_matches_its_model() {
     // The broker, with the probe as the user's shell.
     rig.broker_is_default_shell();
     rig.use_probe_shell();
-    let mut check = |path: &str| {
+    let mut check = |path: &str, relayed: bool| {
         for command in &commands {
             rig.forget_line();
             let outcome = rig.ssh(&login, false, command);
+            let shown = format!("{}{}", text(&outcome), outcome.stderr);
+            if relayed {
+                rig.assert_relayed(&format!("broker ({path}), {command:?}"), &shown);
+            } else {
+                rig.assert_local(&format!("broker ({path}), {command:?}"), &shown);
+            }
             let Some(line) = rig.probe_line() else {
                 failures.push(format!(
                     "broker ({path}): the probe did not run for {command:?}\n{}",
@@ -187,12 +231,12 @@ fn broker_delivers_every_command_exactly_and_stock_sshd_matches_its_model() {
             }
         }
     };
-    check("shim alone: no agent, fail-open");
+    check("shim alone: no agent, fail-open", false);
     // The session starts under the account's pwsh; the probe is the shell again for the commands.
     rig.account.write_user_config("shell: pwsh.exe\n");
     let session = rig.start_session(&login);
     rig.use_probe_shell();
-    check("through the agent");
+    check("through the agent", true);
     session.leave();
 
     for (command, delivered) in &stock {
@@ -271,7 +315,7 @@ fn byte_clean_through(shell_name: &str, shell_yaml: &str, tag: &str) {
                     "sftp" => {
                         let batch_file = rig.kit.path("batch.txt");
                         std::fs::write(&batch_file, format!("{batch}\n")).unwrap();
-                        command.arg("-b").arg(&batch_file).arg(&target);
+                        command.arg("-v").arg("-b").arg(&batch_file).arg(&target);
                     }
                     "scp-O" => {
                         command.args(["-O", &from, &to]);
@@ -325,6 +369,7 @@ fn a_command_with_a_terminal_has_a_terminal() {
     let session = rig.start_session(&login);
 
     let pty = rig.ssh(&login, true, "[Console]::IsOutputRedirected; exit 7");
+    rig.assert_relayed("ssh -tt", &format!("{}{}", text(&pty), pty.stderr));
     assert_eq!(pty.code, Some(7), "{}\n{}", text(&pty), pty.stderr);
     assert!(
         text(&pty).contains("False"),
@@ -333,6 +378,7 @@ fn a_command_with_a_terminal_has_a_terminal() {
     );
 
     let pipes = rig.ssh(&login, false, "[Console]::IsOutputRedirected; exit 5");
+    rig.assert_relayed("ssh -T", &format!("{}{}", text(&pipes), pipes.stderr));
     assert_eq!(pipes.code, Some(5), "{}\n{}", text(&pipes), pipes.stderr);
     assert!(
         text(&pipes).contains("True"),
@@ -361,6 +407,7 @@ fn a_resize_reaches_a_command_with_a_terminal() {
     client.read_until("size=80x25");
     client.resize(100, 30);
     client.read_until("size=100x30");
+    rig.assert_relayed("ssh -tt with a resize", &client.text());
     assert_eq!(client.finish(), 0);
     session.leave();
 }
@@ -376,6 +423,7 @@ fn a_broken_user_config_warns_and_gives_cmd_exe() {
     rig.account.write_user_config("shell: {strt: pwsh.exe}\n");
 
     let out = rig.ssh(&login, false, "echo built-in-ok");
+    rig.assert_relayed("a broken config", &format!("{}{}", text(&out), out.stderr));
     assert!(text(&out).contains("built-in-ok"), "{}\n{}", text(&out), out.stderr);
     assert_eq!(
         out.stderr.matches("cannot use the shell from").count(),
@@ -402,6 +450,7 @@ fn a_path_lookup_finds_pwsh_in_the_agents_path() {
     rig.account.write_user_config("shell: pwsh.exe\n");
 
     let out = rig.ssh(&login, false, "$PSVersionTable.PSVersion.Major");
+    rig.assert_relayed("a path lookup", &format!("{}{}", text(&out), out.stderr));
     let shown = text(&out);
     assert!(
         shown.trim().parse::<u32>().is_ok(),
