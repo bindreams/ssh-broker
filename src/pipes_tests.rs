@@ -71,3 +71,17 @@ fn exec_keeps_the_trailing_spaces_of_a_command() {
 
     assert_eq!(String::from_utf8_lossy(&out), "a   \r\n");
 }
+
+/// A file that exists and cannot be started (here, not a program at all) is an error from `spawn`.
+/// Without the thread's hard-error boxes switched off, `CreateProcessW` raises a message box on the
+/// interactive desktop and waits for an answer; in a session nobody watches, that is a hang.
+#[test]
+fn a_file_that_cannot_start_is_an_error_and_not_a_message_box() {
+    let dir = std::env::temp_dir().join(format!("sb-pipes-stub-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let stub = dir.join("stub.exe");
+    std::fs::write(&stub, b"MZ").unwrap();
+    let result = ExecChild::spawn(&format!("\"{}\" -c x", stub.display()), None);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(result.is_err(), "a file that is not a program started");
+}

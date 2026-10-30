@@ -92,6 +92,7 @@ impl ExecChild {
             // containment permanently. Sequence fixed by `cosca::Job`: create suspended,
             // assign, and only then resume.
             let mut pi = PROCESS_INFORMATION::default();
+            let _no_boxes = crate::winutil::FailCriticalErrors::enter();
             CreateProcessW(
                 PCWSTR::null(),
                 Some(PWSTR(cmd.as_mut_ptr())),

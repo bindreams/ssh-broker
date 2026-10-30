@@ -45,3 +45,15 @@ fn conpty_resize_on_live_session_succeeds() {
     session.close_pty();
     let _ = reader.join();
 }
+
+/// As `pipes_tests::a_file_that_cannot_start_is_an_error_and_not_a_message_box`, for a pseudoconsole.
+#[test]
+fn a_file_that_cannot_start_is_an_error_and_not_a_message_box() {
+    let dir = std::env::temp_dir().join(format!("sb-conpty-stub-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let stub = dir.join("stub.exe");
+    std::fs::write(&stub, b"MZ").unwrap();
+    let result = PtySession::spawn(&format!("\"{}\" -c x", stub.display()), 80, 24, None);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(result.is_err(), "a file that is not a program started");
+}

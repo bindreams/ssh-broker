@@ -5,6 +5,7 @@
 //! and reasoned about once.
 
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
+use windows::Win32::System::Diagnostics::Debug::{SEM_FAILCRITICALERRORS, SetThreadErrorMode, THREAD_ERROR_MODE};
 use windows::Win32::System::Threading::{
     DeleteProcThreadAttributeList, InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
     UpdateProcThreadAttribute,
@@ -33,6 +34,30 @@ impl Drop for OwnedHandle {
                 let _ = CloseHandle(self.0);
             }
         }
+    }
+}
+
+/// While alive, a program that `CreateProcessW` cannot start (the wrong architecture, a file that is not
+/// a program, a blocked one) makes the call fail on this thread. Without it the call raises a message
+/// box on the session's desktop and waits for an answer, which nobody gives in a session that is not
+/// watched. It is the thread's error mode: the process, and so the programs it starts, are untouched.
+pub struct FailCriticalErrors(THREAD_ERROR_MODE);
+
+impl FailCriticalErrors {
+    pub fn enter() -> Self {
+        let mut previous = THREAD_ERROR_MODE(0);
+        // SAFETY: `previous` is a valid out pointer for the call.
+        if let Err(e) = unsafe { SetThreadErrorMode(SEM_FAILCRITICALERRORS, Some(&mut previous)) } {
+            tracing::warn!("could not switch off the message boxes of a failed start: {e}");
+        }
+        FailCriticalErrors(previous)
+    }
+}
+
+impl Drop for FailCriticalErrors {
+    fn drop(&mut self) {
+        // SAFETY: no pointers.
+        let _ = unsafe { SetThreadErrorMode(self.0, None) };
     }
 }
 
