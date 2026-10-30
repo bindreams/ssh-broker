@@ -466,7 +466,7 @@ fn apply_carries_all_four_values_and_a_second_apply_does_not_rewrite_them() {
     let config = Path::new(provision::BASE_DIR).join("config.yaml");
 
     set_sshd_value("DefaultShell", "REG_SZ", &pwsh.to_string_lossy());
-    set_sshd_value("DefaultShellCommandOption", "REG_SZ", "-Command");
+    set_sshd_value("DefaultShellCommandOption", "REG_SZ", "-NoProfile -Command");
     set_sshd_value("DefaultShellArguments", "REG_SZ", r#"-NoLogo -File "C:\a b\x.ps1""#);
     set_sshd_value("DefaultShellEscapeArguments", "REG_DWORD", "0");
 
@@ -484,7 +484,7 @@ fn apply_carries_all_four_values_and_a_second_apply_does_not_rewrite_them() {
         Some(ShellBlock {
             start: vec![pwsh.to_string_lossy().into_owned()],
             without_command: Some(vec!["-NoLogo".into(), "-File".into(), r"C:\a b\x.ps1".into()]),
-            with_command: Some(vec!["-Command".into()]),
+            with_command: Some(vec!["-NoProfile".into(), "-Command".into()]),
             escaping: Some(Escaping::Cmd),
         })
     );

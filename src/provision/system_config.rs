@@ -69,7 +69,9 @@ pub fn carried_block(prev: &SshdShell, shell_is_system_cmd: bool) -> ShellBlock 
         SshdClass::Other => Escaping::Cmd,
     };
 
-    let with_command = vec![sshd_option];
+    // sshd pastes the option as text into the lines it builds for a terminal and for `cmd.exe`, so
+    // `/d /c` is two arguments there, as `DefaultShellArguments` is split: split it the same way.
+    let with_command = split_arguments(&sshd_option).unwrap_or_default();
     ShellBlock {
         start: vec![shell.to_owned()],
         without_command: prev.arguments.as_deref().and_then(split_arguments),
@@ -78,8 +80,8 @@ pub fn carried_block(prev: &SshdShell, shell_is_system_cmd: bool) -> ShellBlock 
     }
 }
 
-/// `DefaultShellArguments` as the arguments sshd's pty line pastes after the shell: split as a
-/// command line. `None` when there are none.
+/// A `DefaultShellArguments` or `DefaultShellCommandOption` value as the arguments sshd's lines
+/// paste after the shell: split as a command line. `None` when there are none.
 fn split_arguments(arguments: &str) -> Option<Vec<String>> {
     // `split_wide` returns the program name too; a stand-in goes first and is dropped.
     let wide: Vec<u16> = format!("x {arguments}").encode_utf16().collect();

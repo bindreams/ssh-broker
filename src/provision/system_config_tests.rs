@@ -299,3 +299,26 @@ fn a_directory_in_the_way_is_not_replaced() {
     assert!(target.is_dir());
     assert_eq!(names(&dir.0), ["config.yaml"]);
 }
+
+#[test]
+fn a_command_option_with_several_words_is_split_like_the_arguments() {
+    let with = |shell: &str, system_cmd: bool, option: &str| {
+        let mut prev = sshd(shell);
+        prev.command_option = Some(option.into());
+        carried_block(&prev, system_cmd).with_command
+    };
+    assert_eq!(
+        with(r"C:\Windows\System32\cmd.exe", true, "/d /c"),
+        Some(vec!["/d".into(), "/c".into()])
+    );
+    assert_eq!(
+        with(TOOLS_PWSH, false, "-NoProfile -Command"),
+        Some(vec!["-NoProfile".into(), "-Command".into()])
+    );
+    assert_eq!(
+        with(TOOLS_PWSH, false, r#"-File "C:\my dir\run.ps1" -c"#),
+        Some(vec!["-File".into(), r"C:\my dir\run.ps1".into(), "-c".into()])
+    );
+    // The default option is still not written.
+    assert_eq!(with(TOOLS_PWSH, false, "-c"), None);
+}
