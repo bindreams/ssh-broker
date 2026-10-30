@@ -16,9 +16,10 @@ use super::procwait::{StillRunning, Survivor};
 /// so. `repair_sessions` does the same for the auto-login tasks and starts the ones with no
 /// session (see [`repair_sessions`]); it too runs on every call, including a failed install and an
 /// install that stopped nothing, and does not depend on the agent task or on `restart_is_safe`. If
-/// either fails to enable a task, no agent is started (a disabled task starts nothing), and the
-/// failure is the result unless `install` had already failed, in which case that error is returned
-/// as it was.
+/// the agent task cannot be enabled, no agent is started (a disabled task starts nothing); a
+/// failure of `repair_sessions` does not hold the start back. Either failure is the result unless
+/// `install` had already failed, in which case that error is returned as it was and the other is
+/// printed.
 ///
 /// If the stop left agents running (see [`StillRunning`], found under any context `install`
 /// added), `start` is told which: an agent started in the session of a survivor would find that
@@ -39,31 +40,32 @@ pub fn run<T>(
     });
     let agent_task = resume_agent_task();
     let sessions = repair_sessions();
-    let resumed = match (agent_task, sessions) {
-        (Ok(()), Ok(())) => Ok(()),
+    // A disabled agent task starts no agent, so its failure holds the start back. The auto-login
+    // tasks are other tasks: their failure is reported but does not.
+    let (agents_can_start, failure) = match (agent_task, sessions) {
+        (Ok(()), Ok(())) => (true, None),
+        (Ok(()), Err(e)) => (true, Some(e)),
+        (Err(e), Ok(())) => (false, Some(e)),
         (Err(e), Err(sessions)) => {
             eprintln!("apply: {sessions:#}");
-            Err(e)
+            (false, Some(e))
         }
-        (Err(e), Ok(())) | (Ok(()), Err(e)) => Err(e),
     };
-    if let Err(e) = resumed {
-        return match result {
-            Ok(_) => Err(e),
-            Err(install_error) => {
-                eprintln!("apply: {e:#}");
-                Err(install_error)
-            }
-        };
-    }
-    if result.is_ok() || (attempted && restart_is_safe()) {
+    if agents_can_start && (result.is_ok() || (attempted && restart_is_safe())) {
         let survivors = match &result {
             Err(e) => e.downcast_ref::<StillRunning>().map(|s| s.survivors.as_slice()),
             Ok(_) => None,
         };
         start(survivors.unwrap_or_default());
     }
-    result
+    match (result, failure) {
+        (result, None) => result,
+        (Ok(_), Some(e)) => Err(e),
+        (Err(install_error), Some(e)) => {
+            eprintln!("apply: {e:#}");
+            Err(install_error)
+        }
+    }
 }
 
 /// A per-user auto-login task, as `apply` finds it.

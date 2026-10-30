@@ -165,18 +165,23 @@ fn a_failed_install_is_reported_as_it_was_when_the_task_could_not_be_enabled_eit
 }
 
 #[test]
-fn an_apply_that_could_not_enable_a_session_task_fails_and_starts_no_agent() {
-    // A disabled auto-login task starts no session at boot, so the install did not take.
+fn an_apply_that_could_not_enable_a_session_task_fails_but_still_starts_the_agents() {
+    // A disabled auto-login task starts no session at boot, so the install did not take; the desktop
+    // agent is a different task and its start does not wait on that.
     let (events, result) = flow_resuming(true, || Ok(()), true, true, || Ok(()), || anyhow::bail!("task denied"));
     assert!(format!("{:#}", result.unwrap_err()).contains("task denied"));
-    assert_eq!(events, ["stop", "install", "resume", "repair sessions"]);
+    assert_eq!(events, ["stop", "install", "resume", "repair sessions", "start"]);
 }
 
 #[test]
 fn a_failed_install_is_reported_as_it_was_when_a_session_task_could_not_be_enabled_either() {
     let (events, result) = flow_resuming(true, || Ok(()), false, true, || Ok(()), || anyhow::bail!("task denied"));
     assert_eq!(format!("{:#}", result.unwrap_err()), "register failed");
-    assert_eq!(events, ["stop", "install", "resume", "repair sessions"]);
+    assert_eq!(
+        events,
+        ["stop", "install", "resume", "repair sessions", "safe?", "start"],
+        "the agents that were stopped start again, as after any failed install"
+    );
 }
 
 #[test]

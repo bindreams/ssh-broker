@@ -133,6 +133,9 @@ fn apply(exe: &Path) -> std::process::Output {
 /// task, and a session the prompt started (no task behind it).
 struct Scene {
     broker: &'static Path,
+    /// The build that is installed, as a file outside the install directory: `apply` of it is an
+    /// `apply` of the installed build.
+    old: PathBuf,
     installed: PathBuf,
     kit: Kit,
     /// The processes of the auto-login agent before the upgrade.
@@ -195,6 +198,7 @@ fn scene() -> Scene {
     let session = BackgroundAgent::start(&installed_kit, &prompted);
     Scene {
         broker,
+        old,
         installed,
         kit,
         before,
@@ -366,5 +370,65 @@ fn apply_upgrade_that_succeeds_ends_a_background_session_and_restarts_auto_login
     assert!(
         !tasks.is_empty() && tasks.iter().all(|task| task.enabled),
         "an auto-login task is not enabled after apply: {tasks:?}"
+    );
+}
+
+/// Elevated (CI only). An `apply` of the build that is already installed repairs an auto-login task
+/// that an interrupted upgrade left disabled with no session: it enables the task and starts its
+/// session.
+#[test]
+fn apply_of_the_installed_build_enables_a_disabled_auto_login_task_and_starts_its_session() {
+    let _machine = machine::exclusive();
+    let scene = scene();
+    let tasks = taskscheduler::session_tasks().unwrap();
+    assert!(!tasks.is_empty(), "the scene registers an auto-login task");
+    for task in &tasks {
+        // Disables the task and returns once its session has exited: what a killed upgrade leaves.
+        taskscheduler::stop_instances(&task.name, &scene.installed).unwrap();
+    }
+    assert!(
+        taskscheduler::session_tasks().unwrap().iter().all(|task| !task.enabled),
+        "control: every auto-login task is disabled"
+    );
+    assert!(
+        agent_pids(&scene.auto.sid_text).is_empty(),
+        "control: the auto-login session is not running"
+    );
+
+    let output = apply(&scene.old);
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.status.success(), "the apply failed:\n{text}");
+
+    let tasks = taskscheduler::session_tasks().unwrap();
+    assert!(
+        !tasks.is_empty() && tasks.iter().all(|task| task.enabled),
+        "an auto-login task is not enabled after apply: {tasks:?}"
+    );
+    scene.assert_auto_login_restarted(&text);
+}
+
+/// Elevated (CI only). An `apply` of the build that is already installed leaves a running auto-login
+/// session running: the same process serves the account afterwards.
+#[test]
+fn apply_of_the_installed_build_leaves_a_running_auto_login_session_running() {
+    let _machine = machine::exclusive();
+    let scene = scene();
+
+    let output = apply(&scene.old);
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.status.success(), "the apply failed:\n{text}");
+
+    assert_eq!(
+        agent_pids(&scene.auto.sid_text),
+        scene.before,
+        "the auto-login session was stopped or restarted by an apply that replaced nothing\n{text}"
     );
 }
