@@ -24,6 +24,7 @@ checked.
 |---|---|
 | `route` | argv → entry point. A known verb wins; anything else is the shim |
 | `cmdline` | the raw command line and the exact `-c` command sshd sent (argv has lost its quotes) |
+| `shell`, `shell/{config,layers,pack,windows}` | which shell a session starts and how its command is packed: the config file, the user/system/built-in layers, the spawn line; pure over a `Host`, one implementation for the agent and the shim |
 | `shim`, `shim_pty` | the SSH side: console raw mode, input encoding, fail-open |
 | `agent` | the interactive-session side: accept, handshake, relay threads, teardown |
 | `conpty` | pseudoconsole host for the PTY path |
@@ -59,7 +60,7 @@ diff. (No lint enforces any of these — `clippy.toml` is deliberately empty.) F
 - **`acl::verify_dir_acl` and `acl::verify_file_acl` are exact-match and fail-closed.** Together they
   are the security boundary: the socket file's ACL decides who can connect, the folder's decides who
   can replace the socket. If either cannot be proven, refuse to bind.
-- **The shim fails open on the relay path** *(review)*, given `pwsh`. A broken broker must
+- **The shim fails open on the relay path** *(review)*, through the configured shell (the built-in `cmd.exe` if that is unusable). A broken broker must
   not cost you SSH access. The security boundary never degrades — the ACL gate and the bind
   fail closed. Provisioning has best-effort steps of its own, marked where they occur.
 
