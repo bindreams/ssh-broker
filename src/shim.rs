@@ -387,7 +387,7 @@ pub fn fail_open(
     host: &dyn shell::Host,
     exec: &Option<Exec>,
     stderr: &mut dyn Write,
-    run: impl FnOnce(&str) -> anyhow::Result<i32>,
+    run: impl FnMut(&str) -> anyhow::Result<i32>,
 ) -> i32 {
     let session = match exec {
         Some(exec) => Session::Command {
@@ -411,12 +411,22 @@ pub fn fail_open(
             return 255;
         }
     };
-    if let Some(notice) = plan.notice() {
+    // Nothing is relayed and the console is untouched, so a warning line is safe in every mode.
+    let warn = |stderr: &mut dyn Write, notice: &str| {
         tracing::warn!("{notice}");
-        // Nothing is relayed and the console is untouched, so this line is safe in every mode.
         let _ = writeln!(stderr, "{notice}");
+    };
+    if let Some(notice) = plan.notice() {
+        warn(stderr, &notice);
     }
-    match run(&plan.command_line) {
+    // `run` returns when the session ends, so a replacement for a shell that cannot start is warned
+    // about by `start_or_fall_back` just before it runs.
+    let started = shell::start_or_fall_back(host, &session, &plan, run, |replacement| {
+        if let Some(notice) = replacement.notice() {
+            warn(&mut *stderr, &notice);
+        }
+    });
+    match started {
         Ok(code) => code,
         Err(e) => {
             tracing::error!("fail-open spawn of {:?} failed: {e:?}", plan.command_line);

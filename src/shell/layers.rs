@@ -69,30 +69,33 @@ pub fn user_config_path(host: &dyn Host) -> anyhow::Result<PathBuf> {
 }
 
 /// The built-in block: the system `cmd.exe`, every other value left to its defaults.
-pub(super) fn built_in(host: &dyn Host) -> ShellBlock {
-    ShellBlock {
-        start: vec![host.system_cmd().to_string_lossy().into_owned()],
+pub(super) fn built_in(host: &dyn Host) -> anyhow::Result<ShellBlock> {
+    Ok(ShellBlock {
+        start: vec![host.system_cmd()?.to_string_lossy().into_owned()],
         ..ShellBlock::default()
-    }
+    })
 }
 
 /// Read each layer fresh and pick the block. Called once per session: an edit shows in the next
-/// session, and one session sees one snapshot.
-pub fn choose(host: &dyn Host) -> Chosen {
-    let fallback = |problem| Chosen {
-        block: built_in(host),
-        origin: Origin::Default,
-        problem: Some(problem),
+/// session, and one session sees one snapshot. Fails only when the built-in block is needed and
+/// the system directory cannot be found.
+pub fn choose(host: &dyn Host) -> anyhow::Result<Chosen> {
+    let fallback = |problem| -> anyhow::Result<Chosen> {
+        Ok(Chosen {
+            block: built_in(host)?,
+            origin: Origin::Default,
+            problem: Some(problem),
+        })
     };
 
     match user_config_path(host) {
         Ok(path) => match layer(host, &path) {
             Layer::Block(block) => {
-                return Chosen {
+                return Ok(Chosen {
                     block,
                     origin: Origin::User(path),
                     problem: None,
-                };
+                });
             }
             Layer::Broken(problem) => return fallback(problem),
             Layer::NoShell => {}
@@ -103,17 +106,17 @@ pub fn choose(host: &dyn Host) -> Chosen {
 
     let path = host.system_config_path();
     match layer(host, &path) {
-        Layer::Block(block) => Chosen {
+        Layer::Block(block) => Ok(Chosen {
             block,
             origin: Origin::System(path),
             problem: None,
-        },
+        }),
         Layer::Broken(problem) => fallback(problem),
-        Layer::NoShell => Chosen {
-            block: built_in(host),
+        Layer::NoShell => Ok(Chosen {
+            block: built_in(host)?,
             origin: Origin::Default,
             problem: None,
-        },
+        }),
     }
 }
 

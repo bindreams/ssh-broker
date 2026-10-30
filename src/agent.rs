@@ -698,20 +698,26 @@ fn handle_connection_in(conn: socket2::Socket, hooks: Hooks, control: &Control) 
         }
     };
     if let Some(text) = &launched.notice {
-        tracing::warn!("{text}");
-        let (stream, bytes) = launch::notice_frame(hs.mode, text);
-        // A client that has gone is found by the relay, which owns that case.
-        if let Err(e) = write_data(&mut tx, stream, &bytes) {
-            tracing::debug!("could not show the shell warning: {e:#}");
-        }
+        show_notice(&mut tx, hs.mode, text);
     }
-    let command = launched.line;
     let cwd_buf = child_cwd(&hs.cwd, home_dir());
     let cwd = cwd_buf.as_deref();
     match hs.mode {
-        Mode::Pty => handle_pty(rx, fr, tx, &command, (hs.cols, hs.rows), cwd, Env { hooks, control }),
-        Mode::Exec => handle_exec(rx, fr, tx, &command, cwd, Env { hooks, control }),
+        Mode::Pty => handle_pty(rx, fr, tx, &launched, (hs.cols, hs.rows), cwd, Env { hooks, control }),
+        Mode::Exec => handle_exec(rx, fr, tx, &launched, cwd, Env { hooks, control }),
         Mode::Logout => unreachable!("answered above"),
+    }
+}
+
+/// Show the warning for a shell that could not be used: the first data of the session, on the
+/// terminal for a PTY and on stderr for a command.
+#[cfg(windows)]
+fn show_notice(tx: &mut ConnTx, mode: Mode, text: &str) {
+    tracing::warn!("{text}");
+    let (stream, bytes) = launch::notice_frame(mode, text);
+    // A client that has gone is found by the relay, which owns that case.
+    if let Err(e) = write_data(tx, stream, &bytes) {
+        tracing::debug!("could not show the shell warning: {e:#}");
     }
 }
 
@@ -772,13 +778,21 @@ fn handle_pty(
     mut rx: ConnRx,
     mut fr: FrameReader,
     mut tx: ConnTx,
-    command: &str,
+    launched: &launch::Launched<'_>,
     (cols, rows): (u16, u16),
     cwd: Option<&Path>,
     env: Env<'_>,
 ) -> anyhow::Result<()> {
     let Env { hooks, control } = env;
-    let mut session = match (hooks.start_pty)(command, cols, rows, cwd) {
+    // The warning for a shell that could not start goes out before the output threads exist, so it is
+    // the first thing on the terminal.
+    let started = launch::start(
+        &*hooks.shell_host,
+        launched,
+        |command| (hooks.start_pty)(command, cols, rows, cwd),
+        |text| show_notice(&mut tx, Mode::Pty, text),
+    );
+    let mut session = match started {
         Ok(session) => session,
         Err(cause) => {
             return Err(logout::fail_connection(
@@ -1029,12 +1043,18 @@ fn handle_exec(
     mut rx: ConnRx,
     mut fr: FrameReader,
     mut tx: ConnTx,
-    command: &str,
+    launched: &launch::Launched<'_>,
     cwd: Option<&Path>,
     env: Env<'_>,
 ) -> anyhow::Result<()> {
     let Env { hooks, control } = env;
-    let mut child = match (hooks.start_exec)(command, cwd) {
+    let started = launch::start(
+        &*hooks.shell_host,
+        launched,
+        |command| (hooks.start_exec)(command, cwd),
+        |text| show_notice(&mut tx, Mode::Exec, text),
+    );
+    let mut child = match started {
         Ok(child) => child,
         Err(cause) => {
             return Err(logout::fail_connection(

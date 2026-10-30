@@ -43,11 +43,12 @@ impl Host for WindowsHost {
     }
 
     fn is_system_cmd(&self, path: &Path) -> std::io::Result<bool> {
-        Ok(file_id(path)? == file_id(&self.system_cmd())?)
+        let system_cmd = self.system_cmd().map_err(std::io::Error::other)?;
+        Ok(file_id(path)? == file_id(&system_cmd)?)
     }
 
-    fn system_cmd(&self) -> PathBuf {
-        join_windows(&system_directory(), &["cmd.exe"])
+    fn system_cmd(&self) -> anyhow::Result<PathBuf> {
+        Ok(join_windows(&system_directory()?, &["cmd.exe"]))
     }
 
     fn system_config_path(&self) -> PathBuf {
@@ -104,11 +105,11 @@ fn wide(text: &std::ffi::OsStr) -> Vec<u16> {
 
 /// `C:\Windows\System32`, from the system and not from the `SystemRoot` variable: the
 /// environment belongs to whoever started the process.
-fn system_directory() -> PathBuf {
+fn system_directory() -> anyhow::Result<PathBuf> {
     // SAFETY: the buffer is the length the call is told. With no buffer it returns the length it
     // needs, NUL included.
     let needed = unsafe { GetSystemDirectoryW(None) } as usize;
-    assert!(
+    anyhow::ensure!(
         needed > 0,
         "GetSystemDirectoryW failed: {}",
         std::io::Error::last_os_error()
@@ -116,12 +117,12 @@ fn system_directory() -> PathBuf {
     let mut buffer = vec![0u16; needed];
     // SAFETY: as above.
     let len = unsafe { GetSystemDirectoryW(Some(&mut buffer)) } as usize;
-    assert!(
+    anyhow::ensure!(
         len > 0 && len < needed,
         "GetSystemDirectoryW failed: {}",
         std::io::Error::last_os_error()
     );
-    PathBuf::from(OsString::from_wide(&buffer[..len]))
+    Ok(PathBuf::from(OsString::from_wide(&buffer[..len])))
 }
 
 #[cfg(test)]

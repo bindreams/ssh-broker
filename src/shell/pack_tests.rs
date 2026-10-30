@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use super::{Session, Source, defaults, effective, plan, render};
+use super::{Session, Source, defaults, effective, plan, render, start_or_fall_back};
 use crate::cmdline::split_args;
 use crate::shell::test_host::{SYSTEM_CMD, TestHost};
 use crate::shell::{Escaping, Origin};
@@ -271,6 +271,143 @@ fn even_the_built_in_cmd_exe_missing_is_an_error() {
     assert!(plan(&host, &Session::Interactive).is_err());
 }
 
+#[test]
+fn the_built_in_cmd_exe_is_the_system_cmd_even_when_the_identity_probe_fails() {
+    let mut host = TestHost::new().with_user_config(
+        "shell: nonesuch.exe
+",
+    );
+    host.probe_fails = true;
+    let e = effective(&host).unwrap();
+    assert_eq!(
+        (e.escaping, e.with_command.clone()),
+        (Escaping::Cmd, vec!["/c".to_string()])
+    );
+    assert_eq!(
+        line(&host, &command("echo hi")),
+        format!(r#"{SYSTEM_CMD} /c "echo hi""#)
+    );
+}
+
+// a shell that exists and cannot start =====
+
+const OS_ERROR: &str = "%1 is not a valid Win32 application. (os error 193)";
+
+/// A spawn that refuses `refused` and records every line it is given.
+fn spawner<'a>(
+    refused: &'a str,
+    tried: &'a std::cell::RefCell<Vec<String>>,
+) -> impl FnMut(&str) -> anyhow::Result<()> + 'a {
+    move |line| {
+        tried.borrow_mut().push(line.to_string());
+        if line.contains(refused) {
+            anyhow::bail!("{OS_ERROR}");
+        }
+        Ok(())
+    }
+}
+
+#[test]
+fn a_shell_that_cannot_start_is_replaced_by_cmd_exe_with_a_problem_naming_the_os_error() {
+    let host = pwsh_host();
+    for session in [
+        Session::Interactive,
+        command("echo hi"),
+        Session::Command {
+            text: "echo hi",
+            terminal: true,
+        },
+    ] {
+        let first = plan(&host, &session).unwrap();
+        let tried = std::cell::RefCell::new(Vec::new());
+        let mut warned = None;
+        start_or_fall_back(&host, &session, &first, spawner("pwsh.exe", &tried), |replacement| {
+            // The warning comes before the replacement starts.
+            assert_eq!(tried.borrow().len(), 1);
+            warned = Some(replacement.clone());
+        })
+        .unwrap();
+        let replacement = warned.expect("the built-in cmd.exe is started instead");
+        assert_eq!(
+            *tried.borrow(),
+            [first.command_line.clone(), replacement.command_line.clone()]
+        );
+        assert!(
+            replacement.command_line.starts_with(SYSTEM_CMD),
+            "{}",
+            replacement.command_line
+        );
+        let problem = replacement.effective.problem.as_ref().expect("a problem");
+        assert_eq!(problem.file, PathBuf::from(crate::shell::test_host::USER_CONFIG));
+        assert_eq!(problem.value.as_deref(), Some("pwsh.exe"));
+        assert!(problem.reason.contains(OS_ERROR), "{}", problem.reason);
+        let notice = replacement.notice().unwrap();
+        assert!(
+            notice.contains("pwsh.exe") && notice.contains("os error 193"),
+            "{notice}"
+        );
+    }
+}
+
+#[test]
+fn a_replacement_packs_the_session_for_cmd_exe() {
+    let host = pwsh_host();
+    let session = command("echo hi");
+    let first = plan(&host, &session).unwrap();
+    let tried = std::cell::RefCell::new(Vec::new());
+    start_or_fall_back(&host, &session, &first, spawner("pwsh.exe", &tried), |_| {}).unwrap();
+    assert_eq!(tried.borrow()[1], format!(r#"{SYSTEM_CMD} /c "echo hi""#));
+}
+
+#[test]
+fn a_shell_that_starts_is_started_once_and_nothing_warns() {
+    let host = pwsh_host();
+    let first = plan(&host, &Session::Interactive).unwrap();
+    let tried = std::cell::RefCell::new(Vec::new());
+    start_or_fall_back(&host, &Session::Interactive, &first, spawner("never", &tried), |_| {
+        panic!("nothing to warn about")
+    })
+    .unwrap();
+    assert_eq!(tried.borrow().len(), 1);
+}
+
+#[test]
+fn the_built_in_cmd_exe_that_cannot_start_is_an_error_after_one_try() {
+    for host in [
+        TestHost::new(),
+        TestHost::new().with_user_config("shell: nonesuch.exe\n"),
+    ] {
+        let first = plan(&host, &Session::Interactive).unwrap();
+        let tried = std::cell::RefCell::new(Vec::new());
+        let error = start_or_fall_back(&host, &Session::Interactive, &first, spawner("cmd.exe", &tried), |_| {
+            panic!("no replacement exists")
+        })
+        .unwrap_err();
+        assert!(format!("{error:#}").contains(OS_ERROR), "{error:#}");
+        assert_eq!(tried.borrow().len(), 1, "{:?}", tried.borrow());
+    }
+}
+
+#[test]
+fn when_the_replacement_cannot_start_either_the_error_is_the_replacement_s() {
+    let host = pwsh_host();
+    let first = plan(&host, &Session::Interactive).unwrap();
+    let mut calls = 0;
+    let error = start_or_fall_back(
+        &host,
+        &Session::Interactive,
+        &first,
+        |_| -> anyhow::Result<()> {
+            calls += 1;
+            anyhow::bail!("attempt {calls}")
+        },
+        |_| {},
+    )
+    .unwrap_err();
+    assert_eq!(calls, 2);
+    assert!(format!("{error:#}").contains("attempt 2"), "{error:#}");
+}
+
 // the corpus =====
 
 #[test]
@@ -356,4 +493,28 @@ fn render_shows_the_problem_and_the_fallback() {
             && warning.ends_with("using the built-in cmd.exe"),
         "{text}"
     );
+}
+
+#[test]
+fn a_missing_system_directory_is_an_error_not_a_panic() {
+    let mut host = TestHost::new();
+    host.no_system_dir = true;
+    let error = effective(&host).unwrap_err();
+    assert!(format!("{error:#}").contains("GetSystemDirectoryW"), "{error:#}");
+    assert!(plan(&host, &Session::Interactive).is_err());
+
+    // A configured shell needs no system directory until it must be replaced.
+    let mut host = pwsh_host();
+    host.no_system_dir = true;
+    assert_eq!(effective(&host).unwrap().program, PathBuf::from(PWSH));
+    let first = plan(&host, &Session::Interactive).unwrap();
+    let error = start_or_fall_back(
+        &host,
+        &Session::Interactive,
+        &first,
+        |_| -> anyhow::Result<()> { anyhow::bail!("{OS_ERROR}") },
+        |_| panic!("nothing to replace it with"),
+    )
+    .unwrap_err();
+    assert!(format!("{error:#}").contains(OS_ERROR), "{error:#}");
 }

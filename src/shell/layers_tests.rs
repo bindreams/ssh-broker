@@ -11,7 +11,7 @@ fn start_of(chosen: &super::Chosen) -> Vec<String> {
 
 #[test]
 fn no_files_means_the_built_in_cmd_exe() {
-    let chosen = choose(&TestHost::new());
+    let chosen = choose(&TestHost::new()).unwrap();
     assert_eq!(start_of(&chosen), [SYSTEM_CMD]);
     assert_eq!(chosen.origin, Origin::Default);
     assert_eq!(chosen.problem, None);
@@ -23,7 +23,7 @@ fn a_user_shell_replaces_the_system_block_whole() {
     let host = TestHost::new()
         .with_user_config("shell: pwsh.exe\n")
         .with_system_config("shell: {start: bash.exe, escaping: cmd, append: {with-command: [-x]}}\n");
-    let chosen = choose(&host);
+    let chosen = choose(&host).unwrap();
     assert_eq!(start_of(&chosen), ["pwsh.exe"]);
     assert_eq!(chosen.block.escaping, None);
     assert_eq!(chosen.block.with_command, None);
@@ -38,7 +38,7 @@ fn a_user_file_without_shell_uses_the_system_block() {
         let host = TestHost::new()
             .with_user_config(user)
             .with_system_config("shell: pwsh.exe\n");
-        let chosen = choose(&host);
+        let chosen = choose(&host).unwrap();
         assert_eq!(start_of(&chosen), ["pwsh.exe"]);
         assert_eq!(chosen.origin, Origin::System(PathBuf::from(SYSTEM_CONFIG)));
         assert_eq!(chosen.problem, None);
@@ -47,7 +47,7 @@ fn a_user_file_without_shell_uses_the_system_block() {
 
 #[test]
 fn the_system_block_is_used_when_there_is_no_user_file() {
-    let chosen = choose(&TestHost::new().with_system_config("shell: pwsh.exe\n"));
+    let chosen = choose(&TestHost::new().with_system_config("shell: pwsh.exe\n")).unwrap();
     assert_eq!(start_of(&chosen), ["pwsh.exe"]);
     assert_eq!(chosen.origin, Origin::System(PathBuf::from(SYSTEM_CONFIG)));
 }
@@ -57,7 +57,7 @@ fn a_broken_user_file_falls_to_cmd_exe_not_to_the_system_layer() {
     let host = TestHost::new()
         .with_user_config("shell: {strt: pwsh.exe}\n")
         .with_system_config("shell: pwsh.exe\n");
-    let chosen = choose(&host);
+    let chosen = choose(&host).unwrap();
     assert_eq!(start_of(&chosen), [SYSTEM_CMD]);
     assert_eq!(chosen.origin, Origin::Default);
     let problem = chosen.problem.expect("a warning");
@@ -68,14 +68,14 @@ fn a_broken_user_file_falls_to_cmd_exe_not_to_the_system_layer() {
 #[test]
 fn a_broken_system_file_falls_to_cmd_exe_only_when_the_user_has_no_shell() {
     let host = TestHost::new().with_system_config("shell: [unclosed\n");
-    let chosen = choose(&host);
+    let chosen = choose(&host).unwrap();
     assert_eq!(start_of(&chosen), [SYSTEM_CMD]);
     assert_eq!(chosen.problem.expect("a warning").file, PathBuf::from(SYSTEM_CONFIG));
 
     let with_user_shell = TestHost::new()
         .with_user_config("shell: pwsh.exe\n")
         .with_system_config("shell: [unclosed\n");
-    let chosen = choose(&with_user_shell);
+    let chosen = choose(&with_user_shell).unwrap();
     assert_eq!(start_of(&chosen), ["pwsh.exe"]);
     assert_eq!(chosen.problem, None);
 }
@@ -86,7 +86,7 @@ fn an_unreadable_path_is_broken() {
         let host = TestHost::new()
             .with_entry(USER_CONFIG, entry)
             .with_system_config("shell: pwsh.exe\n");
-        let chosen = choose(&host);
+        let chosen = choose(&host).unwrap();
         assert_eq!(start_of(&chosen), [SYSTEM_CMD]);
         let problem = chosen.problem.expect("a warning");
         assert_eq!(problem.file, PathBuf::from(USER_CONFIG));
@@ -96,7 +96,7 @@ fn an_unreadable_path_is_broken() {
 
 #[test]
 fn bytes_that_are_not_text_are_broken_not_a_panic() {
-    let chosen = choose(&TestHost::new().with_bytes(USER_CONFIG, b"\xFF\xFE\x00\xD8"));
+    let chosen = choose(&TestHost::new().with_bytes(USER_CONFIG, b"\xFF\xFE\x00\xD8")).unwrap();
     assert_eq!(start_of(&chosen), [SYSTEM_CMD]);
     assert!(chosen.problem.is_some());
 }
@@ -106,7 +106,7 @@ fn xdg_config_home_wins_only_when_absolute_and_non_empty() {
     let xdg = r"D:\cfg\ssh-broker\config.yaml";
     let host = TestHost::new().with_env("XDG_CONFIG_HOME", r"D:\cfg");
     assert_eq!(user_config_path(&host).unwrap(), PathBuf::from(xdg));
-    let chosen = choose(&host.with_file(xdg, "shell: pwsh.exe\n"));
+    let chosen = choose(&host.with_file(xdg, "shell: pwsh.exe\n")).unwrap();
     assert_eq!(chosen.origin, Origin::User(PathBuf::from(xdg)));
 
     for ignored in ["", r"cfg", r".\cfg", r"\cfg", "C:cfg", "~"] {
@@ -128,7 +128,7 @@ fn a_profile_with_spaces_and_non_ascii_names_the_right_file() {
     host.profile = Some(PathBuf::from(profile));
     let path = format!("{profile}\\.config\\ssh-broker\\config.yaml");
     assert_eq!(user_config_path(&host).unwrap(), PathBuf::from(&path));
-    let chosen = choose(&host.with_file(&path, "shell: pwsh.exe\n"));
+    let chosen = choose(&host.with_file(&path, "shell: pwsh.exe\n")).unwrap();
     assert_eq!(start_of(&chosen), ["pwsh.exe"]);
     assert_eq!(chosen.origin, Origin::User(PathBuf::from(path)));
 }
@@ -147,7 +147,7 @@ fn no_profile_and_no_xdg_means_no_user_layer() {
     let mut host = TestHost::new().with_system_config("shell: pwsh.exe\n");
     host.profile = None;
     assert!(user_config_path(&host).is_err());
-    let chosen = choose(&host);
+    let chosen = choose(&host).unwrap();
     assert_eq!(start_of(&chosen), ["pwsh.exe"]);
     assert_eq!(chosen.problem, None);
 }

@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use super::{Launched, launch_line, notice_frame};
+use super::{Launched, launch_line, notice_frame, start};
 use crate::protocol::{Handshake, Launch, Mode, Stream};
 use crate::shell::test_host::{SYSTEM_CMD, TestHost, USER_CONFIG};
 
@@ -23,7 +23,7 @@ fn handshake(mode: Mode, command: Option<&str>, launch: Launch) -> Handshake {
     }
 }
 
-fn launched(hs: &Handshake, host: &TestHost) -> Launched {
+fn launched<'a>(hs: &'a Handshake, host: &TestHost) -> Launched<'a> {
     match launch_line(hs, host) {
         Ok(launched) => launched,
         Err(error) => panic!("{hs:?} was refused: {error:?}"),
@@ -34,7 +34,8 @@ fn launched(hs: &Handshake, host: &TestHost) -> Launched {
 fn a_direct_launch_runs_the_line_unchanged() {
     for mode in [Mode::Exec, Mode::Pty] {
         let line = r#""C:\a b\ssh-broker.exe" verify-probe"#;
-        let got = launched(&handshake(mode, Some(line), Launch::Direct), &pwsh_host());
+        let hs_got = handshake(mode, Some(line), Launch::Direct);
+        let got = launched(&hs_got, &pwsh_host());
         assert_eq!(got.line, line);
         assert_eq!(got.notice, None);
     }
@@ -43,19 +44,23 @@ fn a_direct_launch_runs_the_line_unchanged() {
 #[test]
 fn a_shell_launch_runs_the_command_through_the_configured_shell() {
     let host = pwsh_host();
-    let exec = launched(&handshake(Mode::Exec, Some("echo hi"), Launch::Shell), &host);
+    let hs_exec = handshake(Mode::Exec, Some("echo hi"), Launch::Shell);
+    let exec = launched(&hs_exec, &host);
     assert_eq!(exec.line, format!(r#""{PWSH}" -c "echo hi""#));
     // A terminal with a command appends it as written, the way OpenSSH does.
-    let pty = launched(&handshake(Mode::Pty, Some("echo  hi"), Launch::Shell), &host);
+    let hs_pty = handshake(Mode::Pty, Some("echo  hi"), Launch::Shell);
+    let pty = launched(&hs_pty, &host);
     assert_eq!(pty.line, format!(r#""{PWSH}" -c echo  hi"#));
-    let login = launched(&handshake(Mode::Pty, None, Launch::Shell), &host);
+    let hs_login = handshake(Mode::Pty, None, Launch::Shell);
+    let login = launched(&hs_login, &host);
     assert_eq!(login.line, format!(r#""{PWSH}""#));
 }
 
 #[test]
 fn the_built_in_cmd_exe_runs_with_cmd_packing() {
     let host = TestHost::new();
-    let exec = launched(&handshake(Mode::Exec, Some("echo hi"), Launch::Shell), &host);
+    let hs_exec = handshake(Mode::Exec, Some("echo hi"), Launch::Shell);
+    let exec = launched(&hs_exec, &host);
     assert_eq!(exec.line, format!(r#"{SYSTEM_CMD} /c "echo hi""#));
 }
 
@@ -73,7 +78,8 @@ fn exec_without_a_command_and_direct_without_a_command_are_bad_requests() {
 #[test]
 fn a_broken_config_sends_one_warning_then_runs_cmd_exe() {
     let host = TestHost::new().with_user_config("shell: {strt: pwsh.exe}\n");
-    let got = launched(&handshake(Mode::Exec, Some("echo hi"), Launch::Shell), &host);
+    let hs_got = handshake(Mode::Exec, Some("echo hi"), Launch::Shell);
+    let got = launched(&hs_got, &host);
     assert_eq!(got.line, format!(r#"{SYSTEM_CMD} /c "echo hi""#));
     let notice = got.notice.expect("a warning");
     assert!(
@@ -85,7 +91,8 @@ fn a_broken_config_sends_one_warning_then_runs_cmd_exe() {
 #[test]
 fn an_unresolvable_program_warns_with_its_name() {
     let host = TestHost::new().with_user_config("shell: nonesuch.exe\n");
-    let got = launched(&handshake(Mode::Pty, None, Launch::Shell), &host);
+    let hs_got = handshake(Mode::Pty, None, Launch::Shell);
+    let got = launched(&hs_got, &host);
     assert_eq!(got.line, SYSTEM_CMD);
     assert!(got.notice.unwrap().contains("nonesuch.exe"));
 }
@@ -134,4 +141,64 @@ fn the_warning_goes_to_the_stream_the_session_shows() {
     let (stream, bytes) = notice_frame(Mode::Exec, text);
     assert_eq!(stream, Stream::Stderr);
     assert_eq!(bytes, format!("{text}\n").into_bytes());
+}
+
+#[test]
+fn a_shell_that_cannot_start_is_replaced_by_cmd_exe_and_the_warning_names_the_error() {
+    let host = pwsh_host();
+    for (mode, command) in [
+        (Mode::Exec, Some("echo hi")),
+        (Mode::Pty, Some("echo hi")),
+        (Mode::Pty, None),
+    ] {
+        let hs = handshake(mode, command, Launch::Shell);
+        let first = launched(&hs, &host);
+        let mut tried = Vec::new();
+        let mut notice = None;
+        let started = start(
+            &host,
+            &first,
+            |line| {
+                tried.push(line.to_owned());
+                if line.contains("pwsh.exe") {
+                    anyhow::bail!("%1 is not a valid Win32 application. (os error 193)");
+                }
+                Ok(line.to_owned())
+            },
+            |text| notice = Some(text.to_owned()),
+        )
+        .unwrap();
+        assert!(started.starts_with(SYSTEM_CMD), "{started}");
+        assert_eq!(tried.len(), 2, "{tried:?}");
+        let notice = notice.expect("a warning for the replacement");
+        assert!(
+            notice.contains("pwsh.exe") && notice.contains(USER_CONFIG) && notice.contains("os error 193"),
+            "{notice}"
+        );
+    }
+}
+
+#[test]
+fn a_direct_launch_is_never_replaced() {
+    let hs = handshake(Mode::Exec, Some(r"C:\ssh-broker.exe verify-probe"), Launch::Direct);
+    let first = launched(&hs, &pwsh_host());
+    let mut tried = 0;
+    let error = start(
+        &pwsh_host(),
+        &first,
+        |_| -> anyhow::Result<()> {
+            tried += 1;
+            anyhow::bail!("refused")
+        },
+        |_| panic!("nothing to warn about"),
+    )
+    .unwrap_err();
+    assert_eq!((tried, format!("{error:#}")), (1, "refused".to_string()));
+}
+
+#[test]
+fn a_shell_that_starts_has_no_extra_warning() {
+    let hs = handshake(Mode::Exec, Some("echo hi"), Launch::Shell);
+    let first = launched(&hs, &pwsh_host());
+    start(&pwsh_host(), &first, |_| Ok(()), |_| panic!("nothing to warn about")).unwrap();
 }

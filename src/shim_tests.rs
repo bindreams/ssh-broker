@@ -311,12 +311,12 @@ fn exec(command: &str, terminal: bool) -> Option<Exec> {
 }
 
 /// Run `fail_open` with a `run` that records the line and returns `code`; returns what it saw.
-fn failed_open(host: &TestHost, exec: &Option<Exec>, code: anyhow::Result<i32>) -> (i32, Option<String>, String) {
+fn failed_open(host: &TestHost, exec: &Option<Exec>, code: Result<i32, &str>) -> (i32, Option<String>, String) {
     let mut stderr = Vec::new();
     let mut line = None;
     let got = fail_open(host, exec, &mut stderr, |l| {
         line = Some(l.to_owned());
-        code
+        code.map_err(|e| anyhow::anyhow!("{e}"))
     });
     (got, line, String::from_utf8(stderr).unwrap())
 }
@@ -402,12 +402,13 @@ fn a_warning_is_written_before_the_run_closure_is_called() {
 
 #[test]
 fn a_fail_open_that_cannot_run_exits_255_and_says_why_for_a_command_only() {
-    let host = pwsh_host();
-    let (code, _, stderr) = failed_open(&host, &exec("echo hi", false), Err(anyhow::anyhow!("access denied")));
+    // The built-in cmd.exe: a configured shell would be replaced by it, not fail.
+    let host = TestHost::new();
+    let (code, _, stderr) = failed_open(&host, &exec("echo hi", false), Err("access denied"));
     assert_eq!(code, 255);
     assert_eq!(stderr, "ssh-broker: could not run the command locally: access denied\n");
     // An interactive session's failure goes to the log only.
-    let (code, _, stderr) = failed_open(&host, &None, Err(anyhow::anyhow!("access denied")));
+    let (code, _, stderr) = failed_open(&host, &None, Err("access denied"));
     assert_eq!((code, stderr.as_str()), (255, ""));
 
     let too_long = "x".repeat(40_000);
@@ -825,4 +826,41 @@ fn the_pump_notes_whether_the_agent_sent_a_byte() {
     let pumped = super::pump_heard(&mut exit.as_slice(), &mut FrameReader::new(), &mut TestSink::default());
     assert!(pumped.heard && !pumped.no_answer());
     assert_eq!(pumped.code(), 3);
+}
+
+#[test]
+fn fail_open_runs_cmd_exe_and_warns_when_the_shell_exists_and_cannot_start() {
+    let host = pwsh_host();
+    for exec in [exec("echo hi", false), exec("echo hi", true), None] {
+        let mut stderr = Vec::new();
+        let mut tried = Vec::new();
+        let code = fail_open(&host, &exec, &mut stderr, |line| {
+            tried.push(line.to_owned());
+            if line.contains("pwsh.exe") {
+                anyhow::bail!("%1 is not a valid Win32 application. (os error 193)");
+            }
+            Ok(5)
+        });
+        assert_eq!(code, 5, "{exec:?}");
+        assert_eq!(tried.len(), 2, "{tried:?}");
+        assert!(tried[1].starts_with(SYSTEM_CMD), "{tried:?}");
+        let text = String::from_utf8(stderr).unwrap();
+        assert!(
+            text.starts_with("ssh-broker: cannot use the shell from ")
+                && text.contains(USER_CONFIG)
+                && text.contains("(pwsh.exe)")
+                && text.contains("os error 193"),
+            "{text:?}"
+        );
+        assert_eq!(text.matches("cannot use the shell").count(), 1, "{text:?}");
+    }
+}
+
+#[test]
+fn fail_open_exits_255_and_says_why_when_the_system_directory_is_missing() {
+    let mut host = TestHost::new();
+    host.no_system_dir = true;
+    let (code, line, stderr) = failed_open(&host, &exec("echo hi", false), Ok(0));
+    assert_eq!((code, line), (255, None));
+    assert!(stderr.contains("GetSystemDirectoryW"), "{stderr}");
 }

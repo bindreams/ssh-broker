@@ -30,6 +30,10 @@ pub struct TestHost {
     pub path: HashMap<String, PathBuf>,
     /// Paths that are the system `cmd.exe` by identity (besides [`SYSTEM_CMD`] itself).
     pub system_cmd_aliases: Vec<PathBuf>,
+    /// Every `is_system_cmd` answer is an error (the file cannot be opened for its identity).
+    pub probe_fails: bool,
+    /// The system directory cannot be found, so `system_cmd` is an error.
+    pub no_system_dir: bool,
     /// Every path `read_file` was asked for, in order.
     pub reads: Mutex<Vec<PathBuf>>,
 }
@@ -43,6 +47,8 @@ impl TestHost {
             entries: HashMap::new(),
             path: HashMap::new(),
             system_cmd_aliases: Vec::new(),
+            probe_fails: false,
+            no_system_dir: false,
             reads: Mutex::new(Vec::new()),
         };
         host.entries
@@ -121,6 +127,9 @@ impl Host for TestHost {
     }
 
     fn is_system_cmd(&self, path: &Path) -> io::Result<bool> {
+        if self.probe_fails {
+            return Err(io::Error::other("Access is denied. (os error 5)"));
+        }
         if !self.entries.contains_key(path) {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
@@ -130,8 +139,9 @@ impl Host for TestHost {
         Ok(path == Path::new(SYSTEM_CMD) || self.system_cmd_aliases.iter().any(|a| a == path))
     }
 
-    fn system_cmd(&self) -> PathBuf {
-        PathBuf::from(SYSTEM_CMD)
+    fn system_cmd(&self) -> anyhow::Result<PathBuf> {
+        anyhow::ensure!(!self.no_system_dir, "GetSystemDirectoryW failed (test)");
+        Ok(PathBuf::from(SYSTEM_CMD))
     }
 
     fn system_config_path(&self) -> PathBuf {

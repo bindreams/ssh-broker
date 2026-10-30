@@ -17,7 +17,9 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 pub use layers::{Chosen, Origin, Problem, choose, user_config_path};
-pub use pack::{Defaults, Effective, Plan, Session, Source, Why, defaults, effective, plan, render};
+pub use pack::{
+    Defaults, Effective, Plan, Session, Source, Why, defaults, effective, plan, render, start_or_fall_back,
+};
 #[cfg(windows)]
 pub use windows::WindowsHost;
 
@@ -50,8 +52,9 @@ pub trait Host {
     fn find_program(&self, name: &str) -> Option<PathBuf>;
     /// Whether `path` is the system `cmd.exe` by file identity.
     fn is_system_cmd(&self, path: &Path) -> std::io::Result<bool>;
-    /// `cmd.exe` in the system directory: the built-in shell.
-    fn system_cmd(&self) -> PathBuf;
+    /// `cmd.exe` in the system directory: the built-in shell. An error when the system directory
+    /// cannot be found.
+    fn system_cmd(&self) -> anyhow::Result<PathBuf>;
     /// `C:\ProgramData\ssh-broker\config.yaml`.
     fn system_config_path(&self) -> PathBuf;
 }

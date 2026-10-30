@@ -482,3 +482,51 @@ fn a_path_lookup_finds_pwsh_in_the_agents_path() {
     assert!(!out.stderr.contains("cannot use the shell"), "{}", out.stderr);
     session.leave();
 }
+
+/// A shell that exists and cannot be started (a stub that is not a program) is not a lockout: one
+/// warning that names the file, the value and the OS error, and `cmd.exe` runs the command. Through the
+/// agent, and through the shim alone when there is no agent.
+#[test]
+fn a_shell_that_exists_and_cannot_start_gives_cmd_exe_with_a_warning() {
+    let _machine = machine::exclusive();
+    let rig = Rig::new("shd8");
+    let login = rig.login();
+    rig.broker_is_default_shell();
+    let stub = rig.kit.path("unstartable.exe");
+    std::fs::write(&stub, b"MZ").unwrap();
+    let yaml = format!("shell: '{}'\n", stub.display());
+
+    // No agent: the shim runs it.
+    rig.account.write_user_config(&yaml);
+    let local = rig.ssh(&login, false, "echo built-in-ok");
+    let shown = format!("{}{}", text(&local), local.stderr);
+    rig.assert_local("an unstartable shell", &shown);
+    assert!(text(&local).contains("built-in-ok"), "{shown}");
+    assert_unstartable_warning(&local.stderr, &stub);
+
+    // The agent runs it; its session starts with the fixture's default shell.
+    rig.account.write_user_config(
+        "shell: pwsh.exe
+",
+    );
+    let session = rig.start_session(&login);
+    rig.account.write_user_config(&yaml);
+    let relayed = rig.ssh(&login, false, "echo built-in-ok");
+    rig.assert_relayed("an unstartable shell", &format!("{}{}", text(&relayed), relayed.stderr));
+    assert!(
+        text(&relayed).contains("built-in-ok"),
+        "{}\n{}",
+        text(&relayed),
+        relayed.stderr
+    );
+    assert_unstartable_warning(&relayed.stderr, &stub);
+    session.leave();
+}
+
+fn assert_unstartable_warning(stderr: &str, stub: &std::path::Path) {
+    assert_eq!(stderr.matches("cannot use the shell from").count(), 1, "{stderr}");
+    assert!(
+        stderr.contains("config.yaml") && stderr.contains(&stub.display().to_string()) && stderr.contains("os error"),
+        "{stderr}"
+    );
+}

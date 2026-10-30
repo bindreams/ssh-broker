@@ -9,6 +9,7 @@ use crate::test_support::TempProfile;
 fn system_dir() -> PathBuf {
     WindowsHost
         .system_cmd()
+        .unwrap()
         .parent()
         .expect("cmd.exe is in a directory")
         .to_path_buf()
@@ -23,7 +24,7 @@ fn touch(path: &Path) {
 
 #[test]
 fn the_built_in_is_cmd_exe_in_the_system_directory() {
-    let cmd = WindowsHost.system_cmd();
+    let cmd = WindowsHost.system_cmd().unwrap();
     assert!(cmd.is_absolute(), "{cmd:?}");
     assert!(cmd.is_file(), "{cmd:?}");
     assert!(cmd.ends_with("cmd.exe"), "{cmd:?}");
@@ -35,14 +36,14 @@ fn the_built_in_is_cmd_exe_in_the_system_directory() {
 fn cmd_by_path_in_any_spelling_is_the_system_cmd() {
     let dir = system_dir();
     let mut spellings: Vec<PathBuf> = vec![
-        PathBuf::from(WindowsHost.system_cmd().to_string_lossy().to_uppercase()),
-        PathBuf::from(WindowsHost.system_cmd().to_string_lossy().to_lowercase()),
-        PathBuf::from(WindowsHost.system_cmd().to_string_lossy().replace('\\', "/")),
+        PathBuf::from(WindowsHost.system_cmd().unwrap().to_string_lossy().to_uppercase()),
+        PathBuf::from(WindowsHost.system_cmd().unwrap().to_string_lossy().to_lowercase()),
+        PathBuf::from(WindowsHost.system_cmd().unwrap().to_string_lossy().replace('\\', "/")),
         dir.join("..").join(dir.file_name().unwrap()).join("cmd.exe"),
         dir.join(".").join("CMD.EXE"),
     ];
     // The 8.3 name, where the volume keeps one.
-    spellings.push(short_path(&WindowsHost.system_cmd()));
+    spellings.push(short_path(&WindowsHost.system_cmd().unwrap()));
     for path in spellings {
         assert!(WindowsHost.is_system_cmd(&path).unwrap(), "{path:?}");
     }
@@ -59,7 +60,7 @@ fn syswow64_and_a_copy_are_not_the_system_cmd() {
 
     let temp = TempProfile::new("shell-host-copy");
     let copy = temp.0.join("cmd.exe");
-    std::fs::copy(WindowsHost.system_cmd(), &copy).unwrap();
+    std::fs::copy(WindowsHost.system_cmd().unwrap(), &copy).unwrap();
     assert!(!WindowsHost.is_system_cmd(&copy).unwrap());
 }
 

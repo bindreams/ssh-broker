@@ -154,17 +154,18 @@ impl Plan {
 /// A program that cannot be used falls to the built-in `cmd.exe` with a [`Problem`]. Fails only
 /// when even the built-in `cmd.exe` is missing.
 pub fn effective(host: &dyn Host) -> anyhow::Result<Effective> {
-    let mut chosen = layers::choose(host);
+    settle(host, layers::choose(host)?)
+}
+
+/// [`effective`] for a block already chosen.
+fn settle(host: &dyn Host, mut chosen: layers::Chosen) -> anyhow::Result<Effective> {
     let program = match resolve_program(host, &chosen.block.start) {
         Ok(program) => program,
         Err(reason) => {
             let file = match &chosen.origin {
                 Origin::User(file) | Origin::System(file) => file.clone(),
                 Origin::Default => {
-                    anyhow::bail!(
-                        "the built-in shell {} cannot be used: {reason}",
-                        host.system_cmd().display()
-                    )
+                    anyhow::bail!("the built-in shell {} cannot be used: {reason}", built_in_name(host))
                 }
             };
             chosen.problem = Some(Problem {
@@ -172,24 +173,23 @@ pub fn effective(host: &dyn Host) -> anyhow::Result<Effective> {
                 value: chosen.block.start.first().cloned(),
                 reason,
             });
-            chosen.block = layers::built_in(host);
+            chosen.block = layers::built_in(host)?;
             chosen.origin = Origin::Default;
             resolve_program(host, &chosen.block.start).map_err(|reason| {
-                anyhow::anyhow!(
-                    "the built-in shell {} cannot be used: {reason}",
-                    host.system_cmd().display()
-                )
+                anyhow::anyhow!("the built-in shell {} cannot be used: {reason}", built_in_name(host))
             })?
         }
     };
 
-    let is_system_cmd = host.is_system_cmd(&program).unwrap_or_else(|error| {
-        tracing::warn!(
-            "cannot tell whether {} is the system cmd.exe ({error}); treating it as another program",
-            program.display()
-        );
-        false
-    });
+    // The built-in block is the system `cmd.exe` by construction, so no file is opened to find out.
+    let is_system_cmd = matches!(chosen.origin, Origin::Default)
+        || host.is_system_cmd(&program).unwrap_or_else(|error| {
+            tracing::warn!(
+                "cannot tell whether {} is the system cmd.exe ({error}); treating it as another program",
+                program.display()
+            );
+            false
+        });
     let d = defaults(is_system_cmd);
     let default_source = if is_system_cmd {
         Source::SystemCmd
@@ -228,6 +228,14 @@ pub fn effective(host: &dyn Host) -> anyhow::Result<Effective> {
     })
 }
 
+/// The built-in shell's path for a message.
+fn built_in_name(host: &dyn Host) -> String {
+    host.system_cmd().map_or_else(
+        |error| format!("cmd.exe ({error:#})"),
+        |path| path.display().to_string(),
+    )
+}
+
 /// The file `start[0]` names. A bare name is searched on `PATH`; anything with a separator or a
 /// drive must be an absolute path. `Err` is the reason, for the warning.
 fn resolve_program(host: &dyn Host, start: &[String]) -> Result<PathBuf, String> {
@@ -252,7 +260,11 @@ fn resolve_program(host: &dyn Host, start: &[String]) -> Result<PathBuf, String>
 /// The line to start for `session`. Fails when the line cannot be a command line: it is longer
 /// than `CreateProcessW` takes, or the command holds a NUL.
 pub fn plan(host: &dyn Host, session: &Session<'_>) -> anyhow::Result<Plan> {
-    let effective = effective(host)?;
+    pack(session, effective(host)?)
+}
+
+/// The line for `session` under the shell `effective`.
+fn pack(session: &Session<'_>, effective: Effective) -> anyhow::Result<Plan> {
     let program = effective.program.to_string_lossy();
     let mut head: Vec<&str> = vec![&program];
     head.extend(effective.start.iter().skip(1).map(String::as_str));
@@ -263,7 +275,7 @@ pub fn plan(host: &dyn Host, session: &Session<'_>) -> anyhow::Result<Plan> {
             join_args(&head)
         }
         Session::Command { text, terminal } => {
-            anyhow::ensure!(!text.contains('\0'), "the command holds a NUL character");
+            anyhow::ensure!(!text.contains(' '), "the command holds a NUL character");
             // The leading edge goes: `CreateProcessW` fails on a line that starts with it.
             let text = crate::shim::spawn_line(text);
             head.extend(effective.with_command.iter().map(String::as_str));
@@ -291,6 +303,50 @@ pub fn plan(host: &dyn Host, session: &Session<'_>) -> anyhow::Result<Plan> {
         command_line,
         effective,
     })
+}
+
+/// Start `plan` with `spawn`. When the spawn fails and `plan` is a configured shell (a file that
+/// resolves but cannot be started: a truncated file, the wrong architecture, AppLocker), the
+/// built-in `cmd.exe` is started instead, with a [`Problem`] that names the file, the value and
+/// the OS error. `warn` gets that replacement plan ([`Plan::notice`]) just before it is started,
+/// so the warning precedes the shell. A failure of the built-in itself, or of the replacement, is
+/// the error: there is nothing left to fall to, and one try is all either gets.
+pub fn start_or_fall_back<T>(
+    host: &dyn Host,
+    session: &Session<'_>,
+    plan: &Plan,
+    mut spawn: impl FnMut(&str) -> anyhow::Result<T>,
+    warn: impl FnOnce(&Plan),
+) -> anyhow::Result<T> {
+    let error = match spawn(&plan.command_line) {
+        Ok(started) => return Ok(started),
+        Err(error) => error,
+    };
+    let file = match &plan.effective.origin {
+        Origin::User(file) | Origin::System(file) => file.clone(),
+        Origin::Default => return Err(error),
+    };
+    let replacement = layers::built_in(host)
+        .map(|block| layers::Chosen {
+            block,
+            origin: Origin::Default,
+            problem: Some(Problem {
+                file,
+                value: plan.effective.start.first().cloned(),
+                reason: format!("it cannot be started: {error:#}"),
+            }),
+        })
+        .and_then(|chosen| settle(host, chosen))
+        .and_then(|effective| pack(session, effective));
+    let replacement = match replacement {
+        Ok(replacement) => replacement,
+        Err(unplanned) => {
+            tracing::warn!("no built-in cmd.exe line to replace a shell that cannot start: {unplanned:#}");
+            return Err(error);
+        }
+    };
+    warn(&replacement);
+    spawn(&replacement.command_line)
 }
 
 #[cfg(test)]
