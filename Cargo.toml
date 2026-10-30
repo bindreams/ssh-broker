@@ -18,7 +18,7 @@ zeroize = "1"                # volatile wipe of password buffers (secret.rs)
 # cosca: `cosca::quote::windows` builds and splits command lines (`cmdline`, `shell`), and is
 # cross-platform, so the pure code builds on every host; Job Objects containment is Windows-only inside it.
 cosca = "0.6"
-yaml_serde = "0.10.7"        # YAML 1.2 for config.yaml (shell.rs): the official yaml/yaml-serde library
+yaml_serde = { version = "0.10.7", default-features = false } # YAML 1.2 for config.yaml (shell.rs): the official yaml/yaml-serde library; no `std`, so its Mapping hashes with FNV, not RandomState, whose bcryptprimitives.dll import check-imports.sh rejects
 encoding_rs = "0.8"            # BOM-sniffing decode of config.yaml (UTF-8, UTF-16LE/BE)
 
 [dev-dependencies]
