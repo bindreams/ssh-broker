@@ -99,8 +99,8 @@ mod win {
     use anyhow::Context;
     use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_MORE_DATA, ERROR_PATH_NOT_FOUND, WIN32_ERROR};
     use windows::Win32::System::Registry::{
-        HKEY, HKEY_LOCAL_MACHINE, KEY_QUERY_VALUE, KEY_WOW64_64KEY, REG_DWORD, REG_EXPAND_SZ, REG_SZ, REG_VALUE_TYPE,
-        RRF_RT_REG_SZ, RegCloseKey, RegGetValueW, RegOpenKeyExW, RegQueryValueExW, RegSetKeyValueW,
+        HKEY, HKEY_LOCAL_MACHINE, KEY_QUERY_VALUE, KEY_WOW64_64KEY, REG_DWORD, REG_SZ, REG_VALUE_TYPE, RRF_RT_REG_SZ,
+        RegCloseKey, RegGetValueW, RegOpenKeyExW, RegQueryValueExW, RegSetKeyValueW,
     };
     use windows::core::PCWSTR;
 
@@ -199,32 +199,31 @@ mod win {
         opened.ok().with_context(|| format!("open the key of {name}"))?;
         let mut buffer = vec![0u16; SSHD_VALUE_BYTES as usize / 2];
         let mut bytes = SSHD_VALUE_BYTES;
-        let mut reg_type = REG_VALUE_TYPE::default();
         // SAFETY: `name_w` is NUL-terminated; `buffer` holds `bytes` bytes.
         let status = unsafe {
             let status = RegQueryValueExW(
                 key,
                 PCWSTR(name_w.as_ptr()),
                 None,
-                Some(&mut reg_type),
+                None,
                 Some(buffer.as_mut_ptr().cast()),
                 Some(&mut bytes),
             );
             let _ = RegCloseKey(key);
             status
         };
-        sshd_string_from_status(name, status, reg_type, &buffer, bytes)
+        sshd_string_from_status(name, status, &buffer, bytes)
     }
 
     /// What `RegQueryValueExW`'s answer says about one of the three string values. sshd acts only
     /// on `ERROR_SUCCESS` (`pwd.c:78-89`): a missing value and one that does not fit its buffer
-    /// ([`SSHD_VALUE_BYTES`], `ERROR_MORE_DATA`) are both "not set". Any other failure, and a value
-    /// that is not a string, leave what sshd reads unknown. Text ends at the first NUL, as a C
-    /// string does; an empty value counts as absent.
+    /// ([`SSHD_VALUE_BYTES`], `ERROR_MORE_DATA`) are both "not set". Any other failure leaves what
+    /// sshd reads unknown. sshd never looks at the value's type: the bytes are the text, whether the
+    /// value is a REG_SZ, a REG_EXPAND_SZ (not expanded), a REG_DWORD or anything else. Text ends at
+    /// the first NUL, as a C string does; an empty value counts as absent.
     pub fn sshd_string_from_status(
         name: &str,
         status: WIN32_ERROR,
-        reg_type: REG_VALUE_TYPE,
         buffer: &[u16],
         bytes: u32,
     ) -> anyhow::Result<Option<String>> {
@@ -232,11 +231,6 @@ mod win {
             return Ok(None);
         }
         status.ok().with_context(|| format!("read {name}"))?;
-        anyhow::ensure!(
-            reg_type == REG_SZ || reg_type == REG_EXPAND_SZ,
-            "{name} is not a string value (registry type {})",
-            reg_type.0
-        );
         let units = (bytes as usize / 2).min(buffer.len());
         let text = &buffer[..units];
         let text = &text[..text.iter().position(|&unit| unit == 0).unwrap_or(text.len())];
