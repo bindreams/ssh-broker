@@ -17,7 +17,7 @@ tracing-subscriber = "0.3"  # file/stderr log sink (Phase 6 routes off the PTY)
 zeroize = "1"                # volatile wipe of password buffers (secret.rs)
 # cosca: `cosca::quote::windows` builds and splits command lines (`cmdline`, `shell`), and is
 # cross-platform, so the pure code builds on every host; Job Objects containment is Windows-only inside it.
-cosca = "0.5"
+cosca = "0.6"
 yaml_serde = "0.10.7"        # YAML 1.2 for config.yaml (shell.rs): the official yaml/yaml-serde library
 encoding_rs = "0.8"            # BOM-sniffing decode of config.yaml (UTF-8, UTF-16LE/BE)
 
