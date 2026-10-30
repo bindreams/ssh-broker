@@ -48,7 +48,7 @@ mod sshd_rig;
 mod stand_in;
 
 use account_fixture::{Account, ServiceLogon};
-use sshd_rig::{Login, Outcome, SshSession, run_client, set_stock_shell};
+use sshd_rig::{ConsoleClient, Login, Outcome, SshSession, run_client, set_stock_shell};
 use stand_in::Kit;
 
 /// A throwaway account sshd admits, a probe shell it can run, and (on request) its running session.
@@ -315,8 +315,7 @@ fn scp_and_sftp_are_byte_clean_through_pwsh() {
 // A terminal, a broken config, the agent's PATH =====
 
 /// `ssh -t host command` gives the command a terminal (before, it ran on pipes), and its exit code arrives;
-/// `ssh -T` gives it pipes. (A resize needs an ssh client on a pseudoconsole of its own, which the
-/// harness that drives this one does not have.)
+/// `ssh -T` gives it pipes. The resize has its own test below.
 #[test]
 fn a_command_with_a_terminal_has_a_terminal() {
     let _machine = machine::exclusive();
@@ -340,6 +339,29 @@ fn a_command_with_a_terminal_has_a_terminal() {
         "the command had a terminal: {:?}",
         text(&pipes)
     );
+    session.leave();
+}
+
+/// A resize of the client's console reaches a command that has a terminal: ssh.exe on a pseudoconsole of the
+/// test's own tells sshd, which resizes its console, which the shim passes to the agent, which resizes the
+/// command's. The command is the stand-in's `console-size`, which reports its console's size at the start and
+/// again when the console is resized (it waits for that event, not for time).
+#[test]
+fn a_resize_reaches_a_command_with_a_terminal() {
+    let _machine = machine::exclusive();
+    let rig = Rig::new("shd7");
+    let login = rig.login();
+    rig.broker_is_default_shell();
+    let session = rig.start_session(&login);
+
+    let mut ssh = login.command();
+    let helper = rig.kit.helper.to_string_lossy().replace('\'', "''");
+    ssh.arg("-tt").arg("--").arg(format!("& '{helper}' console-size"));
+    let mut client = ConsoleClient::start(&ssh, 80, 25, login.diagnostics());
+    client.read_until("size=80x25");
+    client.resize(100, 30);
+    client.read_until("size=100x30");
+    assert_eq!(client.finish(), 0);
     session.leave();
 }
 

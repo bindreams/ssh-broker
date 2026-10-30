@@ -405,6 +405,104 @@ impl SshSession {
     }
 }
 
+// A client on a console of its own =====
+
+/// A client run on a pseudoconsole of the test's own, so that it sees a console it can be resized on.
+/// Read as text; the test never types, so nothing is sent to it.
+pub struct ConsoleClient {
+    console: ssh_broker::conpty::PtySession,
+    output: Receiver<Vec<u8>>,
+    transcript: Vec<u8>,
+    reader: Option<std::thread::JoinHandle<()>>,
+    diagnostics: Box<dyn Fn() -> String>,
+}
+
+impl ConsoleClient {
+    /// Start `command` (its program and arguments only) on a `cols`x`rows` console.
+    pub fn start(command: &Command, cols: u16, rows: u16, diagnostics: impl Fn() -> String + 'static) -> ConsoleClient {
+        let program = command.get_program().to_string_lossy().into_owned();
+        let args: Vec<String> = std::iter::once(program)
+            .chain(command.get_args().map(|arg| arg.to_string_lossy().into_owned()))
+            .collect();
+        let console = ssh_broker::conpty::PtySession::spawn(&ssh_broker::cmdline::join_args(&args), cols, rows, None)
+            .expect("start the client on a pseudoconsole");
+        let out_read = console.out_read_raw();
+        let (chunks, output) = channel();
+        let reader = std::thread::Builder::new()
+            .name("console-reader".into())
+            .spawn(move || {
+                let mut buf = [0u8; 4096];
+                loop {
+                    let n = ssh_broker::conpty::read_handle(out_read, &mut buf);
+                    if n == 0 || chunks.send(buf[..n].to_vec()).is_err() {
+                        return;
+                    }
+                }
+            })
+            .expect("start the console reader");
+        ConsoleClient {
+            console,
+            output,
+            transcript: Vec::new(),
+            reader: Some(reader),
+            diagnostics: Box::new(diagnostics),
+        }
+    }
+
+    pub fn text(&self) -> String {
+        String::from_utf8_lossy(&self.transcript).into_owned()
+    }
+
+    fn fail(&self, what: &str) -> ! {
+        panic!(
+            "{what}; the console showed:
+{}
+{}",
+            self.text(),
+            (self.diagnostics)()
+        )
+    }
+
+    pub fn resize(&self, cols: u16, rows: u16) {
+        self.console.resize(cols, rows).expect("resize the client's console");
+    }
+
+    /// Read until the console has shown `needle`. The wait is on the client producing output, bounded by
+    /// [`SILENCE_BOUND`] of silence.
+    pub fn read_until(&mut self, needle: &str) {
+        while !self.text().contains(needle) {
+            let received = self.output.recv_timeout(SILENCE_BOUND); // sleep-ok: failure bound on the client's output, an external event that may never come; expiry fails the test and is not read as state
+            match received {
+                Ok(chunk) => self.transcript.extend_from_slice(&chunk),
+                Err(RecvTimeoutError::Disconnected) => {
+                    self.fail(&format!("the client ended before the console showed {needle:?}"))
+                }
+                Err(RecvTimeoutError::Timeout) => self.fail(&format!(
+                    "the console was silent for {SILENCE_BOUND:?} while the test waited for {needle:?}"
+                )),
+            }
+        }
+    }
+
+    /// Wait for the client to end and return its exit code.
+    pub fn finish(self) -> i32 {
+        self.console.wait().expect("wait for the client")
+    }
+}
+
+impl Drop for ConsoleClient {
+    fn drop(&mut self) {
+        // The client and what it started end with the test, also when it failed. Closing the
+        // pseudoconsole then ends the output, and the reader is joined before the handle it reads
+        // is closed with the session.
+        let _ = self.console.job().kill_tree();
+        self.console.close_pty();
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
+        }
+    }
+}
+
 // Running a client to its end =====
 
 /// What a client left: its exit code (`None`: it did not end within the bound and was ended), and what it

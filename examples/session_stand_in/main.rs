@@ -2,7 +2,7 @@
 //! and `tests/prompt_path_windows.rs` copy it into a directory every account can run from and start it
 //! as throwaway accounts.
 //!
-//! Four roles, picked by the first argument. Everything it learns goes to files beside the exe, because
+//! Five roles, picked by the first argument. Everything it learns goes to files beside the exe, because
 //! the processes are started as other accounts with no console.
 //!
 //! - `agent --background --expect-user <sid>`: what `start_background_agent` starts. Records who it
@@ -12,6 +12,8 @@
 //!   its session in (kill-on-close, breakaway allowed), reading key sequences on stdin and writing the
 //!   console on stdout.
 //! - `connect <socket> <result file>`: connects to an AF_UNIX socket and writes the outcome to the file.
+//! - `console-size`: prints `size=<columns>x<rows>` of its console, waits for the console to be resized
+//!   and prints it again.
 //! - `shim <dir>`: a stand-in for the shim under sshd. Reads `shim.input` (the account's password, the
 //!   agent exe), starts the agent through the logon, waits for the agent's marker with the product's
 //!   own `SocketWatch`, and writes `shim.result` (the file appearing is the "reported" signal); what
