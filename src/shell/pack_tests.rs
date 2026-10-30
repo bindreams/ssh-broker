@@ -609,3 +609,22 @@ fn common_items_are_not_quoted() {
         r"[pwsh.exe, -NoLogo, /c, C:\Windows\System32\cmd.exe]"
     );
 }
+
+#[test]
+fn a_terminal_command_keeps_a_leading_line_break_as_stock_sshd_does() {
+    // The line is `"shell" -c <text>`, so only a space or tab before the text is a separator that can go.
+    for (text, want) in [
+        ("\r\nx\r\n", "\r\nx\r\n"),
+        ("\nx", "\nx"),
+        ("  \r\nx", "\r\nx"),
+        ("\t x", "x"),
+        (" \r\n x", "\r\n x"),
+    ] {
+        let session = Session::Command { text, terminal: true };
+        assert_eq!(
+            line(&TestHost::new(), &session),
+            format!("{SYSTEM_CMD} /c {want}"),
+            "{text:?}"
+        );
+    }
+}

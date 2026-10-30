@@ -311,14 +311,17 @@ fn pack(session: &Session<'_>, effective: Effective) -> anyhow::Result<Plan> {
             join_args(&head)
         }
         Session::Command { text, terminal } => {
-            anyhow::ensure!(!text.contains(' '), "the command holds a NUL character");
-            // The leading edge goes: `CreateProcessW` fails on a line that starts with it.
-            let text = crate::shim::spawn_line(text);
+            anyhow::ensure!(!text.contains('\0'), "the command holds a NUL character");
             head.extend(effective.with_command.iter().map(String::as_str));
             if *terminal {
-                // As OpenSSH does on a terminal: the text follows the arguments, as written.
+                // As OpenSSH does on a terminal: the text follows the arguments, as written. It is not
+                // at the start of the line, so only the separators before it go, which are not part of
+                // any argument; a line break stays, as it does in sshd's line.
+                let text = text.trim_start_matches([' ', '\t']);
                 format!("{} {text}", join_args(&head))
             } else {
+                // The leading edge goes: `CreateProcessW` fails on a line that starts with it.
+                let text = crate::shim::spawn_line(text);
                 match effective.escaping {
                     Escaping::Cmd => format!("{} \"{text}\"", join_args(&head)),
                     Escaping::Msvc => {
