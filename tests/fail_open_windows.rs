@@ -263,16 +263,19 @@ fn interactive_fail_open_starts_the_shell_with_its_login_arguments() {
     );
     // An interactive fail-open says nothing on the console, so the probe's record is the proof that it
     // ran: only the shim's own fail-open reads this home (an agent has its own environment).
-    run_pty_session_without_command(&home);
+    run_session_without_command(&home);
     assert_eq!(
         home.recorded_line(),
         join_args(&[home.probe().to_str().unwrap(), "-NoLogo", "-NoExit"])
     );
 }
 
-/// `ssh host` with a PTY and no command: sshd starts `conhost ... -- "shim"` and nothing else.
-fn run_pty_session_without_command(home: &Home) {
-    let shim = env!("CARGO_BIN_EXE_ssh-broker");
-    let xdg = home.xdg().into_os_string();
-    pty::run_under_conhost(&format!("\"{shim}\""), &[("XDG_CONFIG_HOME", xdg.as_os_str())]);
+/// `ssh host` with no command, run on pipes: on a console the shim would offer to start a session and wait
+/// for a password (`Prompting`), which is not the fail-open under test. What the shell is started with does
+/// not depend on the console.
+fn run_session_without_command(home: &Home) {
+    std::process::Command::new(env!("CARGO_BIN_EXE_ssh-broker"))
+        .env("XDG_CONFIG_HOME", home.xdg())
+        .output()
+        .expect("run the shim");
 }
