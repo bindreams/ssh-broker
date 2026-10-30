@@ -41,6 +41,12 @@ slow-timeout = { period = "120s", terminate-after = 10, grace-period = "1s" }
 filter = 'binary(real_sshd_windows)'
 success-output = "immediate"
 
+# `a_command_with_a_terminal_has_a_terminal` prints the exit code stock sshd gives `ssh -tt host "exit 7"`, which the
+# broker's is held to: a passing run prints it too.
+[[profile.ci.overrides]]
+filter = 'binary(shell_sshd_windows) & test(=a_command_with_a_terminal_has_a_terminal)'
+success-output = "immediate"
+
 [profile.ci-exclusive]
 inherits = "ci"
 default-filter = '(binary(session_on_demand_windows) & test(/^logon_with_seclogon_(stopped|disabled)_returns_windows_reason$/)) | (binary(upgrade_windows) & test(/^apply_/))'
