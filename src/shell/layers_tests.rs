@@ -162,3 +162,20 @@ fn a_relocated_profile_without_the_default_name_is_honored() {
         PathBuf::from(r"E:\profiles\anna\.config\ssh-broker\config.yaml")
     );
 }
+
+#[test]
+fn the_notice_names_the_file_the_value_and_the_reason() {
+    let problem = super::Problem {
+        file: PathBuf::from(USER_CONFIG),
+        value: Some("pwsh.exe".into()),
+        reason: "not found on PATH".into(),
+    };
+    assert_eq!(
+        problem.notice(),
+        format!(
+            "ssh-broker: cannot use the shell from {USER_CONFIG} (pwsh.exe): not found on PATH; using the built-in cmd.exe"
+        )
+    );
+    let parse = super::Problem { value: None, ..problem };
+    assert!(!parse.notice().contains("()"), "{}", parse.notice());
+}

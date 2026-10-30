@@ -27,6 +27,18 @@ pub struct Problem {
     pub reason: String,
 }
 
+impl Problem {
+    /// The warning a session shows before the built-in `cmd.exe` starts.
+    pub fn notice(&self) -> String {
+        let value = self.value.as_ref().map(|v| format!(" ({v})")).unwrap_or_default();
+        format!(
+            "ssh-broker: cannot use the shell from {}{value}: {}; using the built-in cmd.exe",
+            self.file.display(),
+            self.reason
+        )
+    }
+}
+
 /// The block that applies.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Chosen {

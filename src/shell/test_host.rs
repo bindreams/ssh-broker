@@ -66,6 +66,13 @@ impl TestHost {
         self
     }
 
+    /// A program file at `path`, found on `PATH` as `name`.
+    pub fn with_program(mut self, name: &str, path: &str) -> Self {
+        self.entries.insert(PathBuf::from(path), Entry::File(b"MZ".to_vec()));
+        self.path.insert(name.to_string(), PathBuf::from(path));
+        self
+    }
+
     pub fn with_env(mut self, name: &str, value: &str) -> Self {
         self.env.insert(name.to_string(), OsString::from(value));
         self
