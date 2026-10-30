@@ -68,6 +68,12 @@ fn stop_instances_succeeds_for_a_task_that_does_not_exist() {
 }
 
 #[test]
+fn a_task_that_does_not_exist_has_no_running_instance() {
+    let name = format!("ssh-broker-test-absent-{}", std::process::id());
+    assert!(!has_running_instance(&name).unwrap());
+}
+
+#[test]
 fn enabling_a_task_that_does_not_exist_is_not_an_error() {
     // A failed `apply` enables the task again whether or not it got as far as registering it.
     let name = format!("ssh-broker-test-absent-{}", std::process::id());
@@ -144,10 +150,10 @@ fn run_stop_and_wait_within(
     stop_and_wait(
         "the-task",
         bound,
-        Some(|| {
+        || {
             log("disable");
             outcome(disable)
-        }),
+        },
         || {
             let pids = if listings.len() > 1 {
                 listings.next().unwrap()
@@ -183,39 +189,6 @@ fn the_task_is_disabled_then_listed_then_stopped_then_waited_for_then_listed_aga
         events.into_inner(),
         ["disable", "list [11, 22]", "stop", "wait [11, 22]", "list []"]
     );
-}
-
-#[test]
-fn a_task_stopped_without_disabling_is_never_disabled() {
-    // The auto-login tasks: their only trigger is boot, so nothing starts one while it is stopped,
-    // and a disabled task would stay so if `apply` were killed.
-    let events = RefCell::new(Vec::new());
-    let log = |e: &str| events.borrow_mut().push(e.to_string());
-    let mut listings = vec![vec![11u32], vec![]].into_iter();
-    stop_and_wait(
-        "the-task",
-        NO_BOUND,
-        None::<fn() -> anyhow::Result<()>>,
-        || {
-            let pids = listings.next().unwrap();
-            log(&format!("list {pids:?}"));
-            Ok(Instances {
-                count: pids.len(),
-                pids: pids.clone(),
-                processes: pids,
-            })
-        },
-        || {
-            log("stop");
-            Ok(())
-        },
-        |pids| {
-            log(&format!("wait {pids:?}"));
-            Ok(())
-        },
-    )
-    .unwrap();
-    assert_eq!(events.into_inner(), ["list [11]", "stop", "wait [11]", "list []"]);
 }
 
 #[test]
@@ -348,23 +321,18 @@ fn stop_instances_returns_after_the_instance_process_has_exited_and_leaves_the_t
 
 /// Elevated (CI only).
 #[test]
-fn stop_instances_keeping_the_task_enabled_returns_after_the_process_has_exited_and_leaves_it_enabled() {
-    let task = ThrowawayTask::new("stop-enabled");
+fn a_task_has_a_running_instance_from_its_start_until_it_is_stopped() {
+    let task = ThrowawayTask::new("has-instance");
     task.register(FOREVER_TASK_XML);
+    assert!(!has_running_instance(&task.0).unwrap(), "control: nothing is running");
+
     let image = forever_image();
     let processes = start_and_find(&task.0, &image);
+    assert!(has_running_instance(&task.0).unwrap());
 
-    stop_instances_keeping_enabled(&task.0, &image).unwrap();
-
-    wait_all_exited(&processes, Duration::ZERO)
-        .expect("the process had exited when stop_instances_keeping_enabled returned");
-    assert_eq!(
-        state_of(&task.0),
-        TASK_STATE_READY.0,
-        "enabled and idle: an `apply` killed now leaves the task as it was"
-    );
-    let xml = task_xml(&task.0).unwrap().unwrap();
-    assert!(!crate::provision::schtasks::xml_is_disabled(&xml), "{xml}");
+    stop_instances(&task.0, &image).unwrap();
+    wait_all_exited(&processes, Duration::ZERO).expect("the process had exited when stop_instances returned");
+    assert!(!has_running_instance(&task.0).unwrap());
 }
 
 /// Elevated (CI only).

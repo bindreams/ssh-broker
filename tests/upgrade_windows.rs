@@ -334,7 +334,7 @@ fn apply_upgrade_that_fails_on_a_held_exe_still_restarts_auto_login() {
 
 /// Elevated (CI only). The upgrade that succeeds: nothing holds the installed exe (no SSH session is
 /// open), so `apply` ends the prompt-path session and the auto-login one, replaces the exe with the new
-/// build and starts the auto-login task again, which stays enabled throughout.
+/// build, and enables and starts the auto-login task again.
 #[test]
 fn apply_upgrade_that_succeeds_ends_a_background_session_and_restarts_auto_login() {
     let _machine = machine::exclusive();

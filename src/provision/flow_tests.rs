@@ -10,16 +10,18 @@ fn flow(
     install_ok: bool,
     safe: bool,
 ) -> (Vec<&'static str>, anyhow::Result<()>) {
-    flow_resuming(stops, stop_result, install_ok, safe, || Ok(()))
+    flow_resuming(stops, stop_result, install_ok, safe, || Ok(()), || Ok(()))
 }
 
-/// [`flow`] with the outcome of enabling the task again chosen too.
+/// [`flow`] with the outcome of enabling the agent task again and of repairing the auto-login
+/// tasks chosen too.
 fn flow_resuming(
     stops: bool,
     stop_result: fn() -> anyhow::Result<()>,
     install_ok: bool,
     safe: bool,
     resume_result: fn() -> anyhow::Result<()>,
+    repair_result: fn() -> anyhow::Result<()>,
 ) -> (Vec<&'static str>, anyhow::Result<()>) {
     let events = RefCell::new(Vec::new());
     let result = run(
@@ -43,7 +45,10 @@ fn flow_resuming(
             events.borrow_mut().push("resume");
             resume_result()
         },
-        || events.borrow_mut().push("start sessions"),
+        || {
+            events.borrow_mut().push("repair sessions");
+            repair_result()
+        },
         |left| {
             events.borrow_mut().push("start");
             assert!(left.is_empty(), "no agent survived");
@@ -56,7 +61,7 @@ fn flow_resuming(
 fn agents_start_after_a_successful_install() {
     let (events, result) = flow(true, || Ok(()), true, true);
     result.unwrap();
-    assert_eq!(events, ["stop", "install", "resume", "start sessions", "start"]);
+    assert_eq!(events, ["stop", "install", "resume", "repair sessions", "start"]);
 }
 
 #[test]
@@ -65,7 +70,7 @@ fn agents_that_were_stopped_start_again_when_a_later_step_fails() {
     assert_eq!(format!("{:#}", result.unwrap_err()), "register failed");
     assert_eq!(
         events,
-        ["stop", "install", "resume", "start sessions", "safe?", "start"]
+        ["stop", "install", "resume", "repair sessions", "safe?", "start"]
     );
 }
 
@@ -86,7 +91,7 @@ fn agents_survive_a_failed_stop_in_the_sessions_the_start_is_told_to_leave_alone
         },
         || true,
         || Ok(()),
-        || {},
+        || Ok(()),
         |survivors| told.borrow_mut().extend_from_slice(survivors),
     );
     let text = format!("{:#}", result.unwrap_err());
@@ -103,14 +108,14 @@ fn agents_survive_a_failed_stop_in_the_sessions_the_start_is_told_to_leave_alone
 fn agents_start_again_when_the_stop_failed_part_way() {
     let (events, result) = flow(true, || anyhow::bail!("access denied"), true, true);
     assert_eq!(format!("{:#}", result.unwrap_err()), "access denied");
-    assert_eq!(events, ["stop", "resume", "start sessions", "safe?", "start"]);
+    assert_eq!(events, ["stop", "resume", "repair sessions", "safe?", "start"]);
 }
 
 #[test]
 fn no_agent_starts_when_none_was_stopped() {
     let (events, result) = flow(false, || Ok(()), false, true);
     assert!(result.is_err());
-    assert_eq!(events, ["install", "resume", "start sessions"]);
+    assert_eq!(events, ["install", "resume", "repair sessions"]);
 }
 
 #[test]
@@ -119,37 +124,80 @@ fn the_task_is_enabled_again_even_when_no_agent_was_stopped() {
     // `apply` that was killed between its disable and its enable.
     let (events, result) = flow(false, || Ok(()), true, true);
     result.unwrap();
-    assert_eq!(events, ["install", "resume", "start sessions", "start"]);
+    assert_eq!(events, ["install", "resume", "repair sessions", "start"]);
 }
 
 #[test]
 fn an_apply_that_could_not_enable_the_task_fails_and_starts_no_agent() {
     // A disabled task starts no agent at any logon, so the install did not take.
-    let (events, result) = flow_resuming(true, || Ok(()), true, true, || anyhow::bail!("access denied"));
+    let (events, result) = flow_resuming(
+        true,
+        || Ok(()),
+        true,
+        true,
+        || anyhow::bail!("access denied"),
+        || Ok(()),
+    );
     assert!(format!("{:#}", result.unwrap_err()).contains("access denied"));
     assert_eq!(
         events,
-        ["stop", "install", "resume", "start sessions"],
+        ["stop", "install", "resume", "repair sessions"],
         "the sessions are independent of the agent task"
     );
 }
 
 #[test]
 fn a_failed_install_is_reported_as_it_was_when_the_task_could_not_be_enabled_either() {
-    let (events, result) = flow_resuming(true, || Ok(()), false, true, || anyhow::bail!("access denied"));
+    let (events, result) = flow_resuming(
+        true,
+        || Ok(()),
+        false,
+        true,
+        || anyhow::bail!("access denied"),
+        || Ok(()),
+    );
     assert_eq!(format!("{:#}", result.unwrap_err()), "register failed");
     assert_eq!(
         events,
-        ["stop", "install", "resume", "start sessions"],
+        ["stop", "install", "resume", "repair sessions"],
         "no agent start: the task cannot start one"
     );
+}
+
+#[test]
+fn an_apply_that_could_not_enable_a_session_task_fails_and_starts_no_agent() {
+    // A disabled auto-login task starts no session at boot, so the install did not take.
+    let (events, result) = flow_resuming(true, || Ok(()), true, true, || Ok(()), || anyhow::bail!("task denied"));
+    assert!(format!("{:#}", result.unwrap_err()).contains("task denied"));
+    assert_eq!(events, ["stop", "install", "resume", "repair sessions"]);
+}
+
+#[test]
+fn a_failed_install_is_reported_as_it_was_when_a_session_task_could_not_be_enabled_either() {
+    let (events, result) = flow_resuming(true, || Ok(()), false, true, || Ok(()), || anyhow::bail!("task denied"));
+    assert_eq!(format!("{:#}", result.unwrap_err()), "register failed");
+    assert_eq!(events, ["stop", "install", "resume", "repair sessions"]);
+}
+
+#[test]
+fn the_agent_task_failure_is_the_result_when_a_session_task_could_not_be_enabled_either() {
+    let (events, result) = flow_resuming(
+        true,
+        || Ok(()),
+        true,
+        true,
+        || anyhow::bail!("agent denied"),
+        || anyhow::bail!("task denied"),
+    );
+    assert!(format!("{:#}", result.unwrap_err()).contains("agent denied"));
+    assert_eq!(events, ["stop", "install", "resume", "repair sessions"]);
 }
 
 #[test]
 fn no_agent_starts_when_the_registered_task_cannot_start_one() {
     let (events, result) = flow(true, || Ok(()), false, false);
     assert!(result.is_err());
-    assert_eq!(events, ["stop", "install", "resume", "start sessions", "safe?"]);
+    assert_eq!(events, ["stop", "install", "resume", "repair sessions", "safe?"]);
 }
 
 #[test]
@@ -220,9 +268,9 @@ struct World {
     tasks: Vec<SessionTask>,
     agents: RefCell<Vec<u32>>,
     survivor: Option<u32>,
+    /// The name of a task whose disabling fails.
+    undisablable: Option<&'static str>,
     events: RefCell<Vec<String>>,
-    /// The tasks `stop_sessions` noted as enabled.
-    enabled: RefCell<Vec<String>>,
 }
 
 impl World {
@@ -231,15 +279,19 @@ impl World {
             tasks,
             agents: RefCell::new(agents),
             survivor: None,
+            undisablable: None,
             events: RefCell::default(),
-            enabled: RefCell::default(),
         }
     }
 
     fn stop(&self) -> anyhow::Result<()> {
         stop_sessions(
             || Ok(self.tasks.iter().map(|t| task(&t.name, t.enabled)).collect()),
-            &self.enabled,
+            |name| {
+                self.events.borrow_mut().push(format!("disable {name}"));
+                anyhow::ensure!(self.undisablable != Some(name), "cannot disable {name}");
+                Ok(())
+            },
             |name| {
                 self.events.borrow_mut().push(format!("stop task {name}"));
                 Ok(())
@@ -277,26 +329,33 @@ fn a_background_agent_that_is_not_a_task_instance_is_ended() {
 }
 
 #[test]
-fn every_session_task_is_stopped_and_only_the_enabled_ones_are_noted_to_start_again() {
-    let world = World::new(vec![task("a", true), task("b", false), task("c", true)], vec![]);
+fn every_session_task_is_disabled_before_any_is_stopped_and_before_an_agent_is_ended() {
+    // A task that is still enabled when another is stopped can start its session again (its
+    // restart-on-failure does), so all are disabled first, the ones that are off already too.
+    let world = World::new(vec![task("a", true), task("b", false), task("c", true)], vec![7]);
     world.stop().unwrap();
-    assert_eq!(*world.events.borrow(), ["stop task a", "stop task b", "stop task c"]);
-    assert_eq!(*world.enabled.borrow(), ["a", "c"], "a task that was off stays off");
+    assert_eq!(
+        *world.events.borrow(),
+        [
+            "disable a",
+            "disable b",
+            "disable c",
+            "stop task a",
+            "stop task b",
+            "stop task c",
+            "end 7",
+            "wait [7]"
+        ]
+    );
 }
 
 #[test]
-fn a_task_is_noted_before_its_stop_so_a_failed_stop_still_starts_it_again() {
-    let world = World::new(vec![task("a", true)], vec![]);
-    let result = stop_sessions(
-        || Ok(world.tasks.iter().map(|t| task(&t.name, t.enabled)).collect()),
-        &world.enabled,
-        |_| anyhow::bail!("access denied"),
-        || Ok(vec![]),
-        |_| Ok(()),
-        |_: Vec<u32>| Ok(()),
-    );
-    assert!(result.is_err());
-    assert_eq!(*world.enabled.borrow(), ["a"]);
+fn nothing_is_stopped_when_a_task_cannot_be_disabled() {
+    let mut world = World::new(vec![task("a", true), task("b", true)], vec![7]);
+    world.undisablable = Some("b");
+    let text = format!("{:#}", world.stop().unwrap_err());
+    assert!(text.contains("cannot disable b"), "{text}");
+    assert_eq!(*world.events.borrow(), ["disable a", "disable b"]);
 }
 
 #[test]
@@ -306,7 +365,7 @@ fn the_agents_are_looked_for_again_until_none_is_left() {
     let ended = RefCell::new(Vec::new());
     stop_sessions(
         || Ok(vec![]),
-        &RefCell::default(),
+        |_| Ok(()),
         |_| Ok(()),
         || Ok(looks.borrow_mut().next().unwrap()),
         |pid| {
@@ -328,12 +387,117 @@ fn background_agent_survivor_blocks_the_copy_with_its_pid() {
     assert!(text.contains("run apply again"), "{text}");
 }
 
+// repairing the session tasks -----
+
+/// The auto-login tasks as the machine has them, each with its name, whether it is enabled and
+/// whether an instance is running.
+struct Machine {
+    tasks: Vec<(&'static str, bool, bool)>,
+    /// The name of a task whose enabling fails, and of one whose start fails.
+    unenablable: Option<&'static str>,
+    unstartable: Option<&'static str>,
+    events: RefCell<Vec<String>>,
+}
+
+impl Machine {
+    fn new(tasks: Vec<(&'static str, bool, bool)>) -> Machine {
+        Machine {
+            tasks,
+            unenablable: None,
+            unstartable: None,
+            events: RefCell::default(),
+        }
+    }
+
+    fn repair(&self) -> anyhow::Result<()> {
+        repair_sessions(
+            || {
+                Ok(self
+                    .tasks
+                    .iter()
+                    .map(|&(name, enabled, _)| task(name, enabled))
+                    .collect())
+            },
+            |name| {
+                self.events.borrow_mut().push(format!("enable {name}"));
+                anyhow::ensure!(self.unenablable != Some(name), "access denied");
+                Ok(())
+            },
+            |name| {
+                self.events.borrow_mut().push(format!("running? {name}"));
+                Ok(self.tasks.iter().any(|&(n, _, running)| n == name && running))
+            },
+            |name| {
+                self.events.borrow_mut().push(format!("run {name}"));
+                anyhow::ensure!(self.unstartable != Some(name), "no such task");
+                Ok(())
+            },
+        )
+    }
+}
+
 #[test]
-fn session_tasks_are_started_again_after_a_failed_install_whatever_the_agent_task_is() {
+fn a_disabled_session_task_is_enabled_and_then_started() {
+    // The state a killed `apply` leaves, or a task disabled by hand.
+    let machine = Machine::new(vec![("a", false, false)]);
+    machine.repair().unwrap();
+    assert_eq!(*machine.events.borrow(), ["enable a", "running? a", "run a"]);
+}
+
+#[test]
+fn an_enabled_session_task_with_no_instance_is_started() {
+    let machine = Machine::new(vec![("a", true, false)]);
+    machine.repair().unwrap();
+    assert_eq!(*machine.events.borrow(), ["running? a", "run a"]);
+}
+
+#[test]
+fn an_enabled_session_task_with_a_running_instance_is_left_as_it_is() {
+    // Repairing is not restarting: a session that is up is not touched.
+    let machine = Machine::new(vec![("a", true, true), ("b", true, false)]);
+    machine.repair().unwrap();
+    assert_eq!(*machine.events.borrow(), ["running? a", "running? b", "run b"]);
+}
+
+#[test]
+fn a_task_that_cannot_be_enabled_is_not_started_and_the_others_are_repaired() {
+    let mut machine = Machine::new(vec![("a", false, false), ("b", false, false)]);
+    machine.unenablable = Some("a");
+    let text = format!("{:#}", machine.repair().unwrap_err());
+    assert!(text.contains("could not enable the a task again"), "{text}");
+    assert!(text.contains("access denied"), "{text}");
+    assert_eq!(
+        *machine.events.borrow(),
+        ["enable a", "enable b", "running? b", "run b"]
+    );
+}
+
+#[test]
+fn a_task_that_cannot_be_started_does_not_fail_the_repair_or_hold_back_the_others() {
+    let mut machine = Machine::new(vec![("a", true, false), ("b", true, false)]);
+    machine.unstartable = Some("a");
+    machine.repair().unwrap();
+    assert_eq!(*machine.events.borrow(), ["running? a", "run a", "running? b", "run b"]);
+}
+
+#[test]
+fn a_listing_of_the_tasks_that_fails_is_the_result() {
+    let result = repair_sessions(
+        || anyhow::bail!("service unreachable"),
+        |_| Ok(()),
+        |_| Ok(false),
+        |_| Ok(()),
+    );
+    assert!(format!("{:#}", result.unwrap_err()).contains("service unreachable"));
+}
+
+#[test]
+fn session_tasks_are_repaired_after_a_failed_install_whatever_the_agent_task_is() {
     // The agent task's form decides whether the desktop agents restart; the session tasks do not
-    // depend on it, so a failed query of it (`restart_is_safe` false) must not leave them stopped.
+    // depend on it, so a failed query of it (`restart_is_safe` false) must not leave them stopped
+    // or disabled.
     let world = World::new(vec![task("a", true), task("b", false)], vec![]);
-    let ran = RefCell::new(Vec::new());
+    let machine = Machine::new(vec![("a", false, false), ("b", false, false)]);
     let agents_started = RefCell::new(false);
     let result: anyhow::Result<()> = run(
         || world.stop(),
@@ -343,19 +507,14 @@ fn session_tasks_are_started_again_after_a_failed_install_whatever_the_agent_tas
         },
         || false,
         || Ok(()),
-        || {
-            start_sessions(&world.enabled, |name| {
-                ran.borrow_mut().push(name.to_string());
-                Ok(())
-            })
-        },
+        || machine.repair(),
         |_| *agents_started.borrow_mut() = true,
     );
     assert_eq!(format!("{:#}", result.unwrap_err()), "register failed");
     assert_eq!(
-        ran.into_inner(),
-        ["a"],
-        "the task that was on is started, the other is not"
+        *machine.events.borrow(),
+        ["enable a", "running? a", "run a", "enable b", "running? b", "run b"],
+        "both are enabled and started again, including the one that was off"
     );
     assert!(
         !agents_started.into_inner(),

@@ -1,8 +1,6 @@
 //! The shape of `apply`: install, then bring agents back. Held apart from the Windows calls so
 //! the failure paths can be tested with stand-ins.
 
-use std::cell::RefCell;
-
 use super::procwait::{StillRunning, Survivor};
 
 /// Run `install`, then `start` the agents.
@@ -15,12 +13,12 @@ use super::procwait::{StillRunning, Survivor};
 ///
 /// `resume_agent_task` enables the agent task and runs on every call, whatever came before: a stop
 /// disables the task, and an earlier `apply` that was killed before it got here may have left it
-/// so. `start_sessions` starts the auto-login tasks again; their stop does not disable them (their
-/// only trigger is boot, so nothing starts one meanwhile), so there is nothing to enable. It does
-/// not depend on the agent task or on `restart_is_safe`: it runs on every path, including a failed
-/// install. If the agent task cannot be enabled, no agent is started (the task cannot start one),
-/// and the failure is the result unless `install` had already failed, in which case that error is
-/// returned as it was.
+/// so. `repair_sessions` does the same for the auto-login tasks and starts the ones with no
+/// session (see [`repair_sessions`]); it too runs on every call, including a failed install and an
+/// install that stopped nothing, and does not depend on the agent task or on `restart_is_safe`. If
+/// either fails to enable a task, no agent is started (a disabled task starts nothing), and the
+/// failure is the result unless `install` had already failed, in which case that error is returned
+/// as it was.
 ///
 /// If the stop left agents running (see [`StillRunning`], found under any context `install`
 /// added), `start` is told which: an agent started in the session of a survivor would find that
@@ -30,7 +28,7 @@ pub fn run<T>(
     install: impl FnOnce(&mut dyn FnMut() -> anyhow::Result<()>) -> anyhow::Result<T>,
     restart_is_safe: impl FnOnce() -> bool,
     resume_agent_task: impl FnOnce() -> anyhow::Result<()>,
-    start_sessions: impl FnOnce(),
+    repair_sessions: impl FnOnce() -> anyhow::Result<()>,
     start: impl FnOnce(&[Survivor]),
 ) -> anyhow::Result<T> {
     let mut stop = Some(stop);
@@ -40,8 +38,16 @@ pub fn run<T>(
         stop.take().expect("the stop is called at most once")()
     });
     let agent_task = resume_agent_task();
-    start_sessions();
-    if let Err(e) = agent_task {
+    let sessions = repair_sessions();
+    let resumed = match (agent_task, sessions) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(e), Err(sessions)) => {
+            eprintln!("apply: {sessions:#}");
+            Err(e)
+        }
+        (Err(e), Ok(())) | (Ok(()), Err(e)) => Err(e),
+    };
+    if let Err(e) = resumed {
         return match result {
             Ok(_) => Err(e),
             Err(install_error) => {
@@ -67,32 +73,33 @@ pub struct SessionTask {
     pub enabled: bool,
 }
 
-/// The part of the stop that concerns background sessions: every auto-login task's instances are
-/// stopped (waiting for their processes), then every background agent still running is ended and
-/// waited for, whether or not a task started it (the prompt path starts one without a task). No
-/// task is disabled: a killed `apply` leaves each exactly as it was.
+/// The part of the stop that concerns background sessions: every auto-login task is disabled, then
+/// each one's instances are stopped (waiting for their processes), then every background agent
+/// still running is ended and waited for, whether or not a task started it (the prompt path starts
+/// one without a task).
 ///
-/// `enabled` collects the names of the tasks that are **enabled**, before any is stopped, so that a
-/// stop that fails part-way still gets them started again ([`start_sessions`]). A task that was off
-/// stays off and is not started. The agents are looked for again after each round until none is
-/// left: a condition re-checked, not an attempt count; a process that outlives the bound fails the
-/// stop through `wait`, naming its pid.
+/// All the tasks are disabled before any is stopped, so that none restarts its session (a task
+/// restarts itself when its process fails) while another is being stopped. They stay disabled for
+/// the caller to copy the exe; [`repair_sessions`] enables them again, and a run that is killed
+/// before that leaves them for the next `apply` to repair. The agents are looked for again after
+/// each round until none is left: a condition re-checked, not an attempt count; a process that
+/// outlives the bound fails the stop through `wait`, naming its pid.
 ///
 /// Only a background agent is ended here. A shim is left alone and, if it holds the exe, the copy
 /// reports it as it does today; a desktop agent that is not an instance of the logon task keeps its
 /// behaviour too.
 pub fn stop_sessions<P>(
     tasks: impl FnOnce() -> anyhow::Result<Vec<SessionTask>>,
-    enabled: &RefCell<Vec<String>>,
+    mut disable: impl FnMut(&str) -> anyhow::Result<()>,
     mut stop_task: impl FnMut(&str) -> anyhow::Result<()>,
     mut agents: impl FnMut() -> anyhow::Result<Vec<P>>,
     mut end: impl FnMut(&P) -> anyhow::Result<()>,
     mut wait: impl FnMut(Vec<P>) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     let tasks = tasks()?;
-    enabled
-        .borrow_mut()
-        .extend(tasks.iter().filter(|task| task.enabled).map(|task| task.name.clone()));
+    for task in &tasks {
+        disable(&task.name)?;
+    }
     for task in &tasks {
         stop_task(&task.name)?;
     }
@@ -108,15 +115,47 @@ pub fn stop_sessions<P>(
     }
 }
 
-/// Start the tasks [`stop_sessions`] noted as enabled, so the users who had auto-login have their
-/// session again. Best-effort, like the start of the desktop agents: the install is complete
-/// without it.
-pub fn start_sessions(enabled: &RefCell<Vec<String>>, mut run: impl FnMut(&str) -> anyhow::Result<()>) {
-    for name in enabled.borrow().iter() {
-        if let Err(e) = run(name) {
-            eprintln!("apply: could not start the {name} task: {e:#}");
+/// Bring the auto-login tasks to a working state, whatever an earlier `apply` left: every task that
+/// is disabled is enabled, and every task that is enabled and has no running instance is started,
+/// so the users who had auto-login have their session again. A session that is running is not
+/// touched.
+///
+/// Every task is tried. A task that cannot be enabled is not started, and the first such failure
+/// is the result, naming the task (the rest are printed). A failure to ask whether a task runs, or
+/// to start it, is printed and is not the result: like the start of the desktop agents, the install
+/// is complete without it.
+pub fn repair_sessions(
+    tasks: impl FnOnce() -> anyhow::Result<Vec<SessionTask>>,
+    mut enable: impl FnMut(&str) -> anyhow::Result<()>,
+    mut running: impl FnMut(&str) -> anyhow::Result<bool>,
+    mut run: impl FnMut(&str) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    let mut first = None;
+    for SessionTask { name, enabled } in tasks()? {
+        if !enabled && let Err(e) = enable(&name) {
+            let e = e.context(format!(
+                "could not enable the {name} task again; no session starts at boot until it is"
+            ));
+            if first.is_none() {
+                first = Some(e);
+            } else {
+                eprintln!("apply: {e:#}");
+            }
+            continue;
+        }
+        match running(&name) {
+            Ok(true) => {}
+            Ok(false) => {
+                if let Err(e) = run(&name) {
+                    eprintln!("apply: could not start the {name} task: {e:#}");
+                }
+            }
+            Err(e) => {
+                eprintln!("apply: could not tell whether the {name} task is running, so it was not started: {e:#}")
+            }
         }
     }
+    first.map_or(Ok(()), Err)
 }
 
 /// Which of the sessions with a user get an agent started, and which are left alone.

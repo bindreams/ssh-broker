@@ -128,11 +128,12 @@ mod imp {
         //    fail-open can't help if sshd execs a missing binary. The install directory is gated
         //    first, so a planted one is never adopted, and a single-user install is replaced. A
         //    different build over an installed one stops every agent first (they hold the exe
-        //    open) and waits for them to exit, with the logon task disabled so that no logon
-        //    starts one from the old exe meanwhile. Every run from here ends by enabling the task, which
-        //    also heals one an earlier, killed `apply` left disabled; the agents start again
-        //    afterwards, even if a later step fails, except in a session whose old agent has not
-        //    exited.
+        //    open) and waits for them to exit, with the logon task and the auto-login tasks
+        //    disabled so that nothing starts one from the old exe meanwhile. Every run from here
+        //    ends by enabling those tasks and starting the auto-login ones that have no session
+        //    (see `flow::repair_sessions`), which also heals what an earlier, killed `apply` left;
+        //    the agents start again afterwards, even if a later step fails, except in a session
+        //    whose old agent has not exited.
         let current = std::env::current_exe().context("current_exe")?;
         // The install directory first: the lock file lives in it, and nothing is read from it or
         // written into it before it is proved ours. One `apply` runs at a time, for its whole run,
@@ -143,13 +144,10 @@ mod imp {
             eprintln!("apply: another apply or an auto-login command is running; waiting for it to finish")
         })?;
         let registered_xml = schtasks::registered_xml(taskscheduler::task_xml(schtasks::AGENT_TASK))?;
-        // The auto-login tasks that were enabled when the agents were stopped, to be started again
-        // afterwards.
-        let enabled_sessions = std::cell::RefCell::new(Vec::new());
         let exe = flow::run(
             || {
                 taskscheduler::stop_instances(schtasks::AGENT_TASK, &layout.canonical_exe())?;
-                stop_background_sessions(&layout.canonical_exe(), &enabled_sessions)
+                stop_background_sessions(&layout.canonical_exe())
             },
             |stop_agents| {
                 let exe = layout::prepare_in(&base, &current, registered_xml.as_deref(), stop_agents)?;
@@ -173,7 +171,7 @@ mod imp {
             },
             agent_task_is_group_form,
             enable_agent_task,
-            || flow::start_sessions(&enabled_sessions, taskscheduler::run_task),
+            repair_session_tasks,
             start_agents,
         )?;
         println!(
@@ -184,14 +182,14 @@ mod imp {
     }
 
     /// The background sessions' part of the stop that precedes replacing the exe: the auto-login
-    /// tasks' instances are stopped (the tasks stay enabled), then every background agent left (the
+    /// tasks are disabled and their instances stopped, then every background agent left (the
     /// prompt path starts one without a task) is ended. A shim is never ended: it holds the exe only until
     /// its SSH session closes, and the copy reports it if it still does.
-    fn stop_background_sessions(image: &Path, enabled: &std::cell::RefCell<Vec<String>>) -> anyhow::Result<()> {
+    fn stop_background_sessions(image: &Path) -> anyhow::Result<()> {
         flow::stop_sessions(
             taskscheduler::session_tasks,
-            enabled,
-            |name| taskscheduler::stop_instances_keeping_enabled(name, image),
+            |name| taskscheduler::set_enabled(name, false),
+            |name| taskscheduler::stop_instances(name, image),
             || procwait::background_agents(image),
             |agent| agent.terminate(),
             |agents| procwait::wait_all_exited(&agents, procwait::EXIT_BOUND),
@@ -225,6 +223,18 @@ mod imp {
                 schtasks::AGENT_TASK
             )
         })
+    }
+
+    /// Enable every auto-login task that is disabled and start each one that has no session: undoes
+    /// the stop's disabling, and repairs what an `apply` that was killed (or a task disabled by hand)
+    /// left. See [`flow::repair_sessions`].
+    fn repair_session_tasks() -> anyhow::Result<()> {
+        flow::repair_sessions(
+            taskscheduler::session_tasks,
+            |name| taskscheduler::set_enabled(name, true),
+            taskscheduler::has_running_instance,
+            taskscheduler::run_task,
+        )
     }
 
     /// Step 4 of `apply`: start an agent in each session that already has a user, so nobody has to
