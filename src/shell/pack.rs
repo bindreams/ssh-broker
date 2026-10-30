@@ -104,23 +104,60 @@ impl Source {
     }
 }
 
+/// `items` as a YAML flow sequence that reads back as the same strings: plain when that is safe
+/// and double-quoted, with YAML's escapes, when it is not.
+pub(super) fn flow_list(items: &[String]) -> String {
+    let items: Vec<String> = items.iter().map(|item| yaml_scalar(item)).collect();
+    format!("[{}]", items.join(", "))
+}
+
+/// One string as a YAML scalar for a flow sequence.
+fn yaml_scalar(item: &str) -> String {
+    let mut chars = item.chars();
+    let (first, second) = (chars.next(), chars.next());
+    // A plain scalar must not start with an indicator, nor read as another type (a bool, a null, a number).
+    let starts_badly = match first {
+        None => true,
+        Some('-') => second.is_none_or(|c| c.is_ascii_digit() || c == '.'),
+        Some(c) => {
+            c.is_ascii_digit() || matches!(c, '+' | '.' | '?' | ':' | '&' | '*' | '!' | '|' | '>' | '%' | '@' | '~')
+        }
+    };
+    let reserved = ["true", "false", "null", "yes", "no", "on", "off", "y", "n"]
+        .iter()
+        .any(|word| item.eq_ignore_ascii_case(word));
+    let unsafe_char = |c: char| {
+        c.is_control()
+            || c.is_whitespace()
+            || matches!(c, ',' | '[' | ']' | '{' | '}' | '#' | '"' | '\'' | '`' | '\u{feff}')
+    };
+    if !starts_badly && !reserved && !item.chars().any(unsafe_char) {
+        return item.to_owned();
+    }
+    let mut quoted = String::from('"');
+    for c in item.chars() {
+        match c {
+            '"' => quoted.push_str("\\\""),
+            '\\' => quoted.push_str("\\\\"),
+            '\n' => quoted.push_str("\\n"),
+            '\r' => quoted.push_str("\\r"),
+            '\t' => quoted.push_str("\\t"),
+            ' ' => quoted.push(' '),
+            c if c.is_control() || c.is_whitespace() || c == '\u{feff}' => {
+                quoted.push_str(&format!("\\u{:04X}", c as u32))
+            }
+            c => quoted.push(c),
+        }
+    }
+    quoted.push('"');
+    quoted
+}
+
 /// The effective shell in the config's canonical form, each value followed by where it comes
 /// from, then the program `start` resolved to and, when a configured shell could not be used,
 /// the warning. What `verify` prints.
 pub fn render(effective: &Effective) -> String {
-    let list = |items: &[String]| {
-        let items: Vec<String> = items
-            .iter()
-            .map(|item| {
-                if item.is_empty() || item.contains([' ', ',', '[', ']', '#', '"', '\'']) {
-                    format!("{item:?}")
-                } else {
-                    item.clone()
-                }
-            })
-            .collect();
-        format!("[{}]", items.join(", "))
-    };
+    let list = flow_list;
     let escaping = match effective.escaping {
         Escaping::Cmd => "cmd",
         Escaping::Msvc => "msvc",
@@ -159,7 +196,7 @@ pub fn effective(host: &dyn Host) -> anyhow::Result<Effective> {
 
 /// [`effective`] for a block already chosen.
 fn settle(host: &dyn Host, mut chosen: layers::Chosen) -> anyhow::Result<Effective> {
-    let program = match resolve_program(host, &chosen.block.start) {
+    let program = match resolve_program(host, chosen.block.start.first().map_or("", String::as_str)) {
         Ok(program) => program,
         Err(reason) => {
             let file = match &chosen.origin {
@@ -175,7 +212,7 @@ fn settle(host: &dyn Host, mut chosen: layers::Chosen) -> anyhow::Result<Effecti
             });
             chosen.block = layers::built_in(host)?;
             chosen.origin = Origin::Default;
-            resolve_program(host, &chosen.block.start).map_err(|reason| {
+            resolve_program(host, chosen.block.start.first().map_or("", String::as_str)).map_err(|reason| {
                 anyhow::anyhow!("the built-in shell {} cannot be used: {reason}", built_in_name(host))
             })?
         }
@@ -238,8 +275,7 @@ fn built_in_name(host: &dyn Host) -> String {
 
 /// The file `start[0]` names. A bare name is searched on `PATH`; anything with a separator or a
 /// drive must be an absolute path. `Err` is the reason, for the warning.
-fn resolve_program(host: &dyn Host, start: &[String]) -> Result<PathBuf, String> {
-    let name = start.first().map(String::as_str).unwrap_or("");
+pub fn resolve_program(host: &dyn Host, name: &str) -> Result<PathBuf, String> {
     if name.is_empty() {
         return Err("the program name is empty".into());
     }

@@ -250,18 +250,21 @@ mod imp {
             }
         };
         let host = crate::shell::WindowsHost;
-        let file_exists = |path: &Path| {
-            use crate::shell::Host;
-            let text = path.to_string_lossy();
-            if text.contains(['\\', '/', ':']) {
-                host.is_file(path)
-            } else {
-                host.find_program(&text).is_some()
-            }
-        };
+        // The file the shell resolves to, found as a session finds it (a bare name on `PATH`), so the
+        // identity check below looks at that file and not at one of that name beside `apply`.
+        let resolve = |path: &Path| crate::shell::resolve_program(&host, &path.to_string_lossy()).ok();
+        let file_exists = |path: &Path| resolve(path).is_some();
         let is_system_cmd = |path: &Path| {
             use crate::shell::Host;
-            host.is_system_cmd(path).unwrap_or(false)
+            let Some(found) = resolve(path) else { return false };
+            host.is_system_cmd(&found).unwrap_or_else(|e| {
+                eprintln!(
+                    "apply: cannot tell whether {} is the system cmd.exe ({e}); its settings are compared with the \
+                     defaults for another program",
+                    found.display()
+                );
+                false
+            })
         };
         match system_config::decide(&previous, config_exists, &file_exists, &is_system_cmd) {
             system_config::Decision::Write(block) => match system_config::create_once(base, &block) {

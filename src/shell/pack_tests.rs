@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use super::{Session, Source, defaults, effective, plan, render, start_or_fall_back};
+use super::{Session, Source, defaults, effective, flow_list, plan, render, start_or_fall_back};
 use crate::cmdline::split_args;
 use crate::shell::test_host::{SYSTEM_CMD, TestHost};
 use crate::shell::{Escaping, Origin};
@@ -517,4 +517,95 @@ fn a_missing_system_directory_is_an_error_not_a_panic() {
     )
     .unwrap_err();
     assert!(format!("{error:#}").contains(OS_ERROR), "{error:#}");
+}
+
+// verify's lists are YAML =====
+
+#[test]
+fn a_rendered_list_parses_back_to_the_same_items() {
+    let items: Vec<String> = [
+        r"C:\Program Files\PowerShell\7\pwsh.exe",
+        r"C:\a\b.exe",
+        "/c",
+        "-NoLogo",
+        "a,b",
+        "{x}",
+        "[y]",
+        "a: b",
+        "k:v",
+        "#hash",
+        "a #b",
+        "true",
+        "False",
+        "null",
+        "~",
+        "yes",
+        "123",
+        "-5",
+        "1e3",
+        ".5",
+        ".inf",
+        "0x1F",
+        "",
+        "tab\there",
+        "new\nline",
+        "carriage\rreturn",
+        "del\u{7f}",
+        "bell\u{7}",
+        "nel\u{85}",
+        "ls\u{2028}",
+        "bom\u{feff}x",
+        "q\"uote",
+        "'single'",
+        r"back\slash",
+        "trail\\",
+        "two\\\\",
+        "é日本語",
+        "😀",
+        "&anchor",
+        "*alias",
+        "!tag",
+        "|pipe",
+        ">fold",
+        "%percent",
+        "@at",
+        "`tick",
+        "- dash",
+        "? q",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    for item in &items {
+        let list = flow_list(std::slice::from_ref(item));
+        let parsed = crate::shell::config::parse(format!("shell: {{start: {list}}}").as_bytes())
+            .unwrap_or_else(|e| panic!("{item:?} rendered as {list} does not parse: {}", e.reason))
+            .unwrap();
+        assert_eq!(parsed.start, std::slice::from_ref(item), "{item:?} rendered as {list}");
+    }
+    let list = flow_list(&items);
+    let parsed = crate::shell::config::parse(format!("shell: {{start: {list}}}").as_bytes())
+        .unwrap()
+        .unwrap();
+    assert_eq!(parsed.start, items);
+}
+
+#[test]
+fn a_quoted_item_escapes_only_what_yaml_needs() {
+    assert_eq!(flow_list(&["a b,[c]".into()]), r#"["a b,[c]"]"#);
+    assert_eq!(flow_list(&["q\"\\".into()]), r#"["q\"\\"]"#);
+    assert_eq!(flow_list(&["x\t\u{7f}".into()]), r#"["x\t\u007F"]"#);
+}
+
+#[test]
+fn common_items_are_not_quoted() {
+    assert_eq!(
+        flow_list(&[
+            "pwsh.exe".into(),
+            "-NoLogo".into(),
+            "/c".into(),
+            r"C:\Windows\System32\cmd.exe".into()
+        ]),
+        r"[pwsh.exe, -NoLogo, /c, C:\Windows\System32\cmd.exe]"
+    );
 }
