@@ -14,14 +14,14 @@
 //! not), JOINS the worker, then the guard restores modes AFTER the join — so the worker can
 //! never read with a half-restored mode (the use-after-close hazard).
 
-use crate::cmdline::{Encoding, RawExec, resolve_exec};
+use crate::cmdline::{Encoding, Exec, RawExec, resolve_exec};
 use crate::console_modes::ConsoleModes;
 use crate::protocol::{FrameKind, FrameReader, Handshake, Launch, Stream, write_frame};
 use crate::relay::{FrameSink, write_data};
 use crate::shim::{
-    FailOpen, Fallback, MouseModeSniffer, PROTOCOL_VIOLATION_CODE, Pumped, Started, XtwinopsFilter,
-    closed_twice_message, decide_fail_open, decide_fallback, is_blank_command, make_handshake, peer_gone, pump_exec,
-    pump_heard, size_to_resize, start_exec_input,
+    Fallback, MouseModeSniffer, PROTOCOL_VIOLATION_CODE, Pumped, Started, XtwinopsFilter, closed_twice_message,
+    decide_fallback, fail_open, is_blank_command, make_handshake, peer_gone, pump_exec, pump_heard, size_to_resize,
+    start_exec_input,
 };
 use crate::shim_offer::{Absent, Prompting, Rescue, Rescued};
 use crate::socket_loc::SocketLocation;
@@ -60,7 +60,7 @@ pub fn run_on(exec: Option<RawExec>, detect: impl FnOnce() -> Encoding) -> anyho
         Err(e) => (None, Some(format!("{e:#}"))),
     };
     let exec = exec.map(|exec| resolve_exec(exec, detect));
-    if exec.as_deref().is_some_and(is_blank_command) {
+    if exec.as_ref().is_some_and(|exec| is_blank_command(&exec.command)) {
         drop(log); // flush: `process::exit` runs no destructors
         std::process::exit(0)
     }
@@ -93,45 +93,19 @@ pub fn run_on(exec: Option<RawExec>, detect: impl FnOnce() -> Encoding) -> anyho
             tracing::warn!("shim relay setup failed: {e:?}; falling back to a local shell");
         }
     }
-    // Fail open. An EXEC command runs through the contained passthrough, not a shell, which would mangle
-    // sftp's binary stream; an interactive session gets plain `pwsh` through the same path. One spawn
-    // site (`fail_open_command`, pinned by tests) keeps both arms contained.
-    //
-    // The log guard stays alive until each exit: dropping it here stops the `tracing-appender` worker,
-    // whose lossy writer then discards every later line, including the `tracing::error!` below.
-    let decision = decide_fail_open(exec);
-    let command = fail_open_command(&decision);
-    match run_local_passthrough(command) {
-        Ok(code) => {
-            drop(log); // flush: `process::exit` runs no destructors
-            // Bypass main()'s Result→0/1 collapse; the i32→u32 cast is bit-preserving.
-            std::process::exit(code)
-        }
-        Err(e) => {
-            // A spawn failure must NOT escape to `main()`: that exits 1, the one code this crate
-            // forbids for a broker-side failure because it is indistinguishable from the command
-            // itself failing (`shim::map_outcome`). The relay reports the identical failure as
-            // 255, so this does too — the `Err` is never propagated out of this function.
-            tracing::error!("fail-open spawn of {command:?} failed: {e:?}");
-            // EXEC has a clean stderr channel; in PTY mode a stderr write would corrupt the
-            // terminal stream, so there the reason goes only to the log (README's "Limits").
-            if matches!(decision, FailOpen::Passthrough(_)) {
-                eprintln!("ssh-broker: could not run the command locally: {e}");
-            }
-            drop(log); // flush before exiting
-            std::process::exit(255)
-        }
-    }
-}
-
-/// The command each fail-open outcome runs. Pure, so the interactive arm's program is pinned by a
-/// test rather than by reading `run_on`: an interactive session has nothing of its own to run, so
-/// it gets `pwsh`, while an EXEC command is passed through untouched.
-fn fail_open_command(decision: &FailOpen) -> &str {
-    match decision {
-        FailOpen::Passthrough(cmd) => cmd.as_str(),
-        FailOpen::LocalShell => "pwsh -NoLogo",
-    }
+    // Fail open: the session runs here, through the shell the agent would have started and with the command
+    // packed the same way (`shim::fail_open`), in a job so the child dies with the session
+    // (`run_local_passthrough`). The log guard stays alive until the exit: dropping it stops the
+    // `tracing-appender` worker, whose lossy writer then discards every later line.
+    let code = fail_open(
+        &crate::shell::WindowsHost,
+        &exec,
+        &mut std::io::stderr(),
+        run_local_passthrough,
+    );
+    drop(log); // flush: `process::exit` runs no destructors
+    // Bypass main()'s Result→0/1 collapse; the i32→u32 cast is bit-preserving.
+    std::process::exit(code)
 }
 
 /// Attempt the relay. `Ok(Some(code))` = a relay completed (PTY or EXEC). `Ok(None)` = the
@@ -145,7 +119,7 @@ fn fail_open_command(decision: &FailOpen) -> &str {
 /// log, if it has none (see [`try_relay_at`]). `stdin` is what an EXEC session forwards to the
 /// child (the process's own stdin in `run_on`).
 fn try_relay(
-    exec: &Option<String>,
+    exec: &Option<Exec>,
     locate: impl FnOnce() -> anyhow::Result<SocketLocation>,
     log_failure: Option<&str>,
     stdin: impl std::io::Read + Send + 'static,
@@ -173,7 +147,7 @@ fn unavailable_message(reason: Option<&dyn std::fmt::Display>) -> String {
 /// which is the cause of the missing log too.
 fn try_relay_at(
     location: anyhow::Result<SocketLocation>,
-    exec: &Option<String>,
+    exec: &Option<Exec>,
     stderr: &mut dyn std::io::Write,
     log_failure: Option<&str>,
     stdin: impl std::io::Read + Send + 'static,
@@ -198,23 +172,31 @@ enum Interactive {
     NoConsole,
 }
 
+/// The interactive relay ([`relay_interactive`]): the connection, a console a rescue left raw, and the
+/// command of a session that has a terminal.
+type InteractiveRelay<'a> = dyn FnMut(Socket, Option<ConsoleModes>, Option<&str>) -> anyhow::Result<Interactive> + 'a;
+
 /// [`try_relay_at`] with the interactive relay as a parameter, so that a test can stand in for the
-/// console.
+/// console. `interactive` gets the command of a session that has a terminal (`ssh -t host cmd`),
+/// which it sends in the handshake.
 fn try_relay_with(
     location: anyhow::Result<SocketLocation>,
-    exec: &Option<String>,
+    exec: &Option<Exec>,
     stderr: &mut dyn std::io::Write,
     log_failure: Option<&str>,
     stdin: impl std::io::Read + Send + 'static,
     rescue: &mut dyn Rescue,
-    interactive: &mut dyn FnMut(Socket, Option<ConsoleModes>) -> anyhow::Result<Interactive>,
+    interactive: &mut InteractiveRelay<'_>,
 ) -> anyhow::Result<Option<i32>> {
-    if let Some(cmd) = exec {
-        return match connect_or_rescue(&location, exec, stderr, log_failure, rescue)? {
-            Connected::Agent { socket, .. } => relay_exec(socket, cmd, stdin, stderr),
+    if let Some(exec) = exec.as_ref().filter(|exec| !exec.terminal) {
+        return match connect_or_rescue(&location, true, stderr, log_failure, rescue)? {
+            Connected::Agent { socket, .. } => relay_exec(socket, &exec.command, stdin, stderr),
             Connected::Done(code) => Ok(code),
         };
     }
+    // A command with a terminal goes round the same loop as a login, except that it is never sent
+    // again: the agent may have started it before it ended the connection.
+    let command = exec.as_ref().map(|exec| exec.command.as_str());
     // An interactive session whose connection the agent ends before it says anything goes round again:
     // the agent is ending, because an agent that follows the protocol closes a connection without a
     // byte only while its listener closes. The next connect then finds no listener or an agent that
@@ -223,15 +205,20 @@ fn try_relay_with(
     // that follows it) starts the count again: that agent is gone.
     let mut closed_before = false;
     loop {
-        let (conn, rescued_modes) = match connect_or_rescue(&location, exec, stderr, log_failure, rescue)? {
+        let (conn, rescued_modes) = match connect_or_rescue(&location, command.is_some(), stderr, log_failure, rescue)?
+        {
             Connected::Agent { socket, modes, rescued } => {
                 closed_before &= !rescued;
                 (socket, modes)
             }
             Connected::Done(code) => return Ok(code),
         };
-        match interactive(conn, rescued_modes)? {
+        match interactive(conn, rescued_modes, command)? {
             Interactive::Pumped(pumped) if pumped.no_answer() => {
+                if command.is_some() {
+                    let _ = writeln!(stderr, "{AGENT_ENDED_UNANSWERED}");
+                    return Ok(Some(255));
+                }
                 if closed_before {
                     let path = location.as_ref().ok().map(|location| location.path.as_path());
                     let message = closed_twice_message(path);
@@ -267,7 +254,7 @@ enum Connected {
 /// use, the fail-open handles exactly as it did before.
 fn connect_or_rescue(
     location: &anyhow::Result<SocketLocation>,
-    exec: &Option<String>,
+    is_command: bool,
     stderr: &mut dyn std::io::Write,
     log_failure: Option<&str>,
     rescue: &mut dyn Rescue,
@@ -288,7 +275,7 @@ fn connect_or_rescue(
         Err(e) => Err(e),
     };
     let absent = Absent {
-        exec: exec.is_some(),
+        exec: is_command,
         location,
         connect: &connection,
     };
@@ -299,7 +286,13 @@ fn connect_or_rescue(
             rescued: true,
         },
         Rescued::Gone => Connected::Done(Some(255)),
-        Rescued::Plain => Connected::Done(fail_open_reason(location, &connection, exec, stderr, log_failure)?),
+        Rescued::Plain => Connected::Done(fail_open_reason(
+            location,
+            &connection,
+            is_command,
+            stderr,
+            log_failure,
+        )?),
     })
 }
 
@@ -328,8 +321,14 @@ fn relay_exec(
 
 /// Relay an interactive session over `conn`. A real console is required to capture input. No
 /// handshake has been sent yet, so a missing console fails open without orphaning an agent shell. A
-/// prompt that signed the user on hands over the raw console it was using.
-fn relay_interactive(conn: Socket, rescued_modes: Option<ConsoleModes>) -> anyhow::Result<Interactive> {
+/// prompt that signed the user on hands over the raw console it was using. `command` is the command of
+/// a session that has a terminal: the agent runs it in the pseudoconsole, as OpenSSH runs it under a
+/// pty.
+fn relay_interactive(
+    conn: Socket,
+    rescued_modes: Option<ConsoleModes>,
+    command: Option<&str>,
+) -> anyhow::Result<Interactive> {
     let (rx, tx) = afunix::split(conn)?;
     let modes = match rescued_modes {
         Some(modes) => modes,
@@ -341,7 +340,7 @@ fn relay_interactive(conn: Socket, rescued_modes: Option<ConsoleModes>) -> anyho
         return Ok(Interactive::NoConsole);
     }
     let (cols, rows) = console_size(modes.stdout);
-    let hs = make_handshake(&None, false, Launch::Shell, term(), cols, rows);
+    let hs = make_handshake(&command.map(str::to_owned), true, Launch::Shell, term(), cols, rows);
     Ok(Interactive::Pumped(run_pty(modes, rx, FrameReader::new(), tx, &hs)?))
 }
 
@@ -354,7 +353,7 @@ const AGENT_ENDED_UNANSWERED: &str =
 fn fail_open_reason(
     location: &anyhow::Result<SocketLocation>,
     connection: &anyhow::Result<socket2::Socket>,
-    exec: &Option<String>,
+    is_command: bool,
     stderr: &mut dyn std::io::Write,
     log_failure: Option<&str>,
 ) -> anyhow::Result<Option<i32>> {
@@ -376,7 +375,7 @@ fn fail_open_reason(
         tracing::warn!("{msg} (path={path:?}, err={:?})", connection.as_ref().err());
         // EXEC has a clean stderr channel; in PTY mode a stderr write would corrupt the
         // terminal stream, so there the warning goes only to the log file.
-        if exec.is_some() {
+        if is_command {
             match log_failure {
                 Some(why) => {
                     let _ = writeln!(stderr, "{msg} (the shim has no log: {why})");
@@ -395,25 +394,19 @@ fn term() -> String {
     std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".into())
 }
 
-/// Run `command` locally (in the session sshd launched us in), inheriting our stdio directly, and
-/// return its exit code.
+/// Run `command_line` locally (in the session sshd launched us in), inheriting our stdio directly,
+/// and return its exit code.
 ///
 /// It deliberately RETURNS the code rather than calling `process::exit` itself. Exiting here forced
 /// the caller to drop the log guard before this ran, which shut the appender down and silently
 /// discarded every diagnostic logged afterwards — including the one explaining a failed fallback.
 /// Returning leaves the caller owning both the exit and the flush that must precede it.
 ///
-/// This is the fail-open path for BOTH shim modes — the agent was unreachable, so the command
-/// runs here rather than not at all. For EXEC (`ssh host "cmd"`) `command` is the command itself;
-/// for an interactive session it is a literal `pwsh -NoLogo`, since that session carries nothing
-/// else to run (see the `FailOpen::LocalShell` arm in `run_on`). Either way it deliberately does
-/// not go through an EXTRA shell: `pwsh -Command <cmd>` would reinterpret quoting and mangle a
-/// binary stream, which is what an `sftp` session landing on the EXEC arm would be. The child
-/// writes raw to sshd's pipes, exactly as the original DefaultShell did.
-///
-/// No shell hop, so shell operators are the client's business, as on the relay path. Both arms
-/// spawn through [`spawn_contained`], so the child dies with the session.
-fn run_local_passthrough(command: &str) -> anyhow::Result<i32> {
+/// This is the fail-open path for every session. The line is already the shell's: `shim::fail_open`
+/// built it with the same planner the agent uses, so the command reaches the shell packed as it
+/// would have been under the agent. The child writes raw to sshd's pipes, exactly as the original
+/// DefaultShell did, and it is spawned through [`spawn_contained`], so it dies with the session.
+fn run_local_passthrough(command_line: &str) -> anyhow::Result<i32> {
     use windows::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
     use windows::Win32::System::Console::STD_ERROR_HANDLE;
     use windows::Win32::System::Threading::{GetExitCodeProcess, INFINITE, WaitForSingleObject};
@@ -427,7 +420,7 @@ fn run_local_passthrough(command: &str) -> anyhow::Result<i32> {
         }
         // `_job` must outlive the wait: `cosca::Job` sets KILL_ON_JOB_CLOSE, so dropping it early
         // would terminate the very child we are waiting on.
-        let (process, _job) = spawn_contained(command, Some([stdin, stdout, stderr]))?;
+        let (process, _job) = spawn_contained(command_line, Some([stdin, stdout, stderr]))?;
         WaitForSingleObject(process.0, INFINITE);
         let mut code = 0u32;
         if GetExitCodeProcess(process.0, &mut code).is_err() {

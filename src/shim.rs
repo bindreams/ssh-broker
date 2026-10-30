@@ -1,9 +1,10 @@
 //! shim: the SSH `DefaultShell` (default action). Relays the terminal/streams to
 //! the agent over AF_UNIX; fails open to a local shell if the agent is unreachable.
 
-use crate::cmdline::RawExec;
+use crate::cmdline::{Exec, RawExec};
 use crate::protocol::{FrameKind, FrameReader, Handshake, Launch, Mode, Resize, Stream, write_frame};
 use crate::relay::{FrameSink, Outcome, PumpError, pump_decode, write_data};
+use crate::shell::{self, Session};
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
 
@@ -359,11 +360,8 @@ pub enum Fallback {
     /// The agent answered — relay this session to it.
     Relay,
     /// The agent is unreachable — fail open so the box is never locked out, and warn (to a log
-    /// in PTY mode, to stderr in EXEC) that parity is unavailable.
-    ///
-    /// The name is historical and only half true: a shell is what an INTERACTIVE session gets.
-    /// An `ssh host "cmd"` session runs the command directly, with no shell in between to
-    /// reinterpret its quoting — [`decide_fail_open`] is where the two part company.
+    /// in PTY mode, to stderr in EXEC) that parity is unavailable. The session runs through the
+    /// configured shell, as it would have under the agent ([`fail_open`]).
     LocalShellWithWarning,
 }
 
@@ -377,23 +375,54 @@ pub fn decide_fallback(connect_err: bool) -> Fallback {
     }
 }
 
-/// What the shim runs once it has decided to fail open.
-#[derive(Debug, PartialEq, Eq)]
-pub enum FailOpen {
-    /// `ssh host "cmd"` — run the command itself, with NO shell between it and sshd's pipes.
-    Passthrough(String),
-    /// An interactive session carries no command to run, so it gets a plain `pwsh`.
-    LocalShell,
-}
-
-/// Decide what the fail-open path runs, from whether this session carried a command.
+/// Fail open: run the session locally, through the same shell and with the same packing as the
+/// agent would have used, and return the exit code. `run` starts a line and returns its exit code.
 ///
-/// Pure, and lifted out of `shim_pty::run_on` for the same reason as [`decide_fallback`]: that
-/// function ends in `process::exit`, so nothing could assert against the choice in place.
-pub fn decide_fail_open(exec: Option<String>) -> FailOpen {
-    match exec {
-        Some(cmd) => FailOpen::Passthrough(cmd),
-        None => FailOpen::LocalShell,
+/// The shell is resolved here, in the shim's own environment (`host`), by the one function the agent
+/// uses ([`shell::plan`]). When the configured shell cannot be used, the built-in `cmd.exe` runs
+/// instead and the reason goes to `stderr` first. A line that cannot be made, or a spawn that
+/// fails, exits 255: this crate's code for a broker-side failure, which 1 would hide among a
+/// command's own failures.
+pub fn fail_open(
+    host: &dyn shell::Host,
+    exec: &Option<Exec>,
+    stderr: &mut dyn Write,
+    run: impl FnOnce(&str) -> anyhow::Result<i32>,
+) -> i32 {
+    let session = match exec {
+        Some(exec) => Session::Command {
+            text: &exec.command,
+            terminal: exec.terminal,
+        },
+        None => Session::Interactive,
+    };
+    // A command has a clean stderr; an interactive session's console is not ours to write to
+    // while it might still be in raw mode, so its failures go to the log only.
+    let say = |stderr: &mut dyn Write, text: &str| {
+        if exec.is_some() {
+            let _ = writeln!(stderr, "{text}");
+        }
+    };
+    let plan = match shell::plan(host, &session) {
+        Ok(plan) => plan,
+        Err(e) => {
+            tracing::error!("fail-open could not make the shell's command line: {e:#}");
+            say(stderr, &format!("ssh-broker: could not run the command locally: {e:#}"));
+            return 255;
+        }
+    };
+    if let Some(notice) = plan.notice() {
+        tracing::warn!("{notice}");
+        // Nothing is relayed and the console is untouched, so this line is safe in every mode.
+        let _ = writeln!(stderr, "{notice}");
+    }
+    match run(&plan.command_line) {
+        Ok(code) => code,
+        Err(e) => {
+            tracing::error!("fail-open spawn of {:?} failed: {e:?}", plan.command_line);
+            say(stderr, &format!("ssh-broker: could not run the command locally: {e}"));
+            255
+        }
     }
 }
 

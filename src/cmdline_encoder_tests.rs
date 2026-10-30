@@ -52,7 +52,7 @@ fn routed(encoding: Encoding, command: &str) -> String {
     let line = encode(encoding, command);
     let args = split_args(&line);
     match route(&args[1..], &line) {
-        Route::Shim { exec: Some(exec) } => resolve_exec(exec, || encoding),
+        Route::Shim { exec: Some(exec) } => resolve_exec(exec, || encoding).command,
         other => panic!("{line:?} routed to {other:?}, not a shim exec"),
     }
 }

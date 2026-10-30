@@ -60,12 +60,12 @@ The install directory is the other half of the boundary: the agent and the SYSTE
 
 ### Fail-open is deliberate, and never in the security boundary
 
-If the shim cannot reach the agent it runs your command locally and reports why. A broken broker
-must not cost you access to the machine. An *interactive* session falls back to a plain `pwsh`, so
-that path inherits the project's PowerShell Core requirement; `ssh host "cmd"` instead runs the
-command directly, with no shell in between to re-quote it — which is what keeps an `sftp` or `scp`
-session landing here byte-clean. Either way the child is contained in a job object exactly as a
-relayed one is, so failing open is not a way to outlive the session. This is the relay path's
+If the shim cannot reach the agent it runs your session locally and reports why. A broken broker
+must not cost you access to the machine. The session runs through the configured shell, with the
+command packed the way the agent would have packed it: both call `shell::plan`, the shim with its
+own environment. If the configured shell cannot be used, the built-in `cmd.exe` runs after one
+warning. The child is contained in a job object exactly as a relayed one is, so failing open is not
+a way to outlive the session. This is the relay path's
 deliberate degradation, and the security boundary never degrades — the ACL check above and the
 bind both fail closed. Elsewhere the shim also prefers working over failing in smaller ways
 (logging disables itself rather than aborting, for one), and provisioning has best-effort steps of

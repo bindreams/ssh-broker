@@ -23,7 +23,7 @@ fn command_as(line: &str, encoding: Encoding) -> Option<String> {
     let Route::Shim { exec } = route_line(line) else {
         panic!("{line:?} must select the shim");
     };
-    exec.map(|exec| resolve_exec(exec, || encoding))
+    exec.map(|exec| resolve_exec(exec, || encoding).command)
 }
 
 /// A line whose form does not matter: commands with nothing sshd would escape.

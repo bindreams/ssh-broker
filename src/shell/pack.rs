@@ -91,6 +91,13 @@ pub struct Plan {
     pub effective: Effective,
 }
 
+impl Plan {
+    /// The warning to show before the line starts, when the configured shell could not be used.
+    pub fn notice(&self) -> Option<String> {
+        self.effective.problem.as_ref().map(Problem::notice)
+    }
+}
+
 /// Resolve the shell for this process: choose the block, find its program, settle the defaults.
 /// A program that cannot be used falls to the built-in `cmd.exe` with a [`Problem`]. Fails only
 /// when even the built-in `cmd.exe` is missing.

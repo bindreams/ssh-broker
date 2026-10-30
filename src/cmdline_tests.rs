@@ -175,20 +175,29 @@ pub(super) fn logged<T>(f: impl FnOnce() -> T) -> (String, T) {
 #[test]
 fn a_tail_is_decoded_by_the_encoding() {
     let tail = || RawExec::Tail(r#""echo \"a b\"""#.into());
-    let (log, command) = logged(|| resolve_exec(tail(), || Encoding::Escaped));
-    assert_eq!(command, r#"echo "a b""#);
+    let (log, exec) = logged(|| resolve_exec(tail(), || Encoding::Escaped));
+    assert_eq!(exec.command, r#"echo "a b""#);
     assert_eq!(log, "", "nothing to report");
-    let (_, command) = logged(|| resolve_exec(tail(), || Encoding::Verbatim));
-    assert_eq!(command, r#""echo \"a b\"""#);
+    let (_, exec) = logged(|| resolve_exec(tail(), || Encoding::Verbatim));
+    assert_eq!(exec.command, r#""echo \"a b\"""#);
 }
 
-/// argv carried a `-c` the raw line did not show: the joined argv is the command, nothing is
-/// detected, and the log says the line was unexpected.
+#[test]
+fn resolve_exec_reports_a_terminal_for_the_verbatim_form_only() {
+    for (encoding, terminal) in [(Encoding::Verbatim, true), (Encoding::Escaped, false)] {
+        let exec = resolve_exec(RawExec::Tail("echo hi".into()), || encoding);
+        assert_eq!(exec.terminal, terminal, "{encoding:?}");
+        let (_, argv) = logged(|| resolve_exec(RawExec::Argv("echo hi".into()), || encoding));
+        assert_eq!(argv.terminal, terminal, "argv, {encoding:?}");
+    }
+}
+
+/// argv carried a `-c` the raw line did not show: the joined argv is the command, undecoded, and
+/// the log says the line was unexpected.
 #[test]
 fn an_argv_command_is_used_as_it_is_and_logged() {
-    let detect = || -> Encoding { panic!("there is no encoding to detect for argv") };
-    let (log, command) = logged(|| resolve_exec(RawExec::Argv("a b c".into()), detect));
-    assert_eq!(command, "a b c");
+    let (log, exec) = logged(|| resolve_exec(RawExec::Argv("a b c".into()), || Encoding::Escaped));
+    assert_eq!(exec.command, "a b c");
     assert!(log.contains("WARN") && log.contains("no `-c`"), "{log}");
 }
 

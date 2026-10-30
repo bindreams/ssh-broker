@@ -46,8 +46,8 @@ pub(super) fn launch_line(hs: &Handshake, host: &dyn shell::Host) -> Result<Laun
             };
             let plan = shell::plan(host, &session).map_err(Refusal::Failed)?;
             Ok(Launched {
+                notice: plan.notice(),
                 line: plan.command_line,
-                notice: plan.effective.problem.map(|problem| problem.notice()),
             })
         }
     }

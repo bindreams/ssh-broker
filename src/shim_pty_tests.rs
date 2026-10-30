@@ -2,21 +2,37 @@
 //! these compile and run only on a Windows host — in CI, the `Test (windows/amd64)` job.
 
 use super::spawn_contained;
+use crate::cmdline::Exec;
 use crate::shim_offer::NoRescue;
+
+/// A command without a terminal: what `ssh host cmd` sends.
+fn exec(command: &str) -> Exec {
+    Exec {
+        command: command.into(),
+        terminal: false,
+    }
+}
+
+/// A command with a terminal: what `ssh -t host cmd` sends.
+fn exec_with_terminal(command: &str) -> Exec {
+    Exec {
+        command: command.into(),
+        terminal: true,
+    }
+}
 
 /// The local passthrough must contain its child in a job object, exactly as the relayed path
 /// does, so that failing open can never become a way to outlive the session.
 ///
-/// `spawn_contained` is what BOTH fail-open arms funnel through — the EXEC passthrough, and (since
-/// the interactive arm stopped using the separate, uncontained `exec_local_shell`) the plain `pwsh`
-/// an interactive session gets too. So this containment is the sole thing between an unreachable agent and a
+/// `spawn_contained` is what every fail-open session funnels through (`run_local_passthrough`), a
+/// command and a login alike. So this containment is the sole thing between an unreachable agent and a
 /// process that outlives the session the README promises to reap.
 ///
 /// Read that as a statement about the PRODUCTION WIRING, not about this test's reach. This test
 /// calls `spawn_contained` directly and therefore gates the spawn, not the wiring: it would stay
-/// green if an arm of `run_on` stopped calling it. What keeps the arms honest is that both now go
-/// through one `run_local_passthrough` call site, that `fail_open_command` pins the program each
-/// selects, and that `tests/fail_open_windows.rs` drives the EXEC arm end to end.
+/// green if `run_on` stopped calling it. What keeps the wiring honest is the single
+/// `run_local_passthrough` call site, and `tests/fail_open_windows.rs` and
+/// `tests/interactive_fail_open_containment.rs`, which drive both arms end to end.
 ///
 /// `cosca::Job` sets `KILL_ON_JOB_CLOSE`, so dropping the job must terminate the child. Before
 /// containment was added the child was created with `PROCESS_CREATION_FLAGS(0)` and no job at
@@ -50,39 +66,6 @@ fn the_local_passthrough_child_is_contained_in_a_job() {
     let rc = unsafe { WaitForSingleObject(process.0, INFINITE) };
     assert_eq!(rc, WAIT_OBJECT_0, "dropping the job must terminate the contained child");
 }
-
-/// The interactive fail-open arm must run a plain `pwsh`, and an EXEC command must pass through
-/// untouched.
-///
-/// This is worth pinning because both arms now reach the OS through the SINGLE
-/// `run_local_passthrough` call in `run_on` — the program string is the only thing that differs
-/// between them, so this is what stops either arm quietly acquiring a DIFFERENT PROGRAM. It does
-/// not stop a shell hop: a wrapper applied at that single call site leaves `fail_open_command`
-/// untouched and this test green — see the caveat below for what does catch that.
-///
-/// Being precise about what it does NOT prove, since overclaiming here is a defect this file has
-/// already shipped twice: it does not prove containment (that is
-/// `the_local_passthrough_child_is_contained_in_a_job`, plus the fact that one call site serves
-/// both arms), and it does not prove the absence of a wrapper around the command on the way to
-/// `CreateProcessW` (that is `tests/fail_open_windows.rs`, end to end through the binary).
-#[test]
-fn fail_open_maps_interactive_to_pwsh_and_passes_an_exec_command_through() {
-    use crate::shim::FailOpen;
-    assert_eq!(super::fail_open_command(&FailOpen::LocalShell), "pwsh -NoLogo");
-    let cmd = r#"scp -t "C:\path with spaces\out.bin""#;
-    assert_eq!(
-        super::fail_open_command(&FailOpen::Passthrough(cmd.to_string())),
-        cmd,
-        "an EXEC command must reach the spawn byte for byte"
-    );
-}
-
-// The gate for "an EXEC command reaches the OS verbatim, with no shell re-parsing its quoting"
-// deliberately does NOT live here. It cannot: a unit test can only call `spawn_contained`
-// directly, which bypasses `run_on` — so the mutation that matters
-// (`FailOpen::Passthrough(cmd) => run_local_passthrough(&format!("pwsh -Command {cmd}"))`)
-// would leave it green. That property is gated end to end, through the real binary, by
-// `tests/fail_open_windows.rs`.
 
 /// The fail-open spawn trims leading whitespace for `CreateProcessW`, which rejects it; the
 /// relay's spawn does the same (`pipes_tests`).
@@ -124,7 +107,7 @@ fn unresolvable_socket_location_fails_open_with_the_reason() {
     let mut stderr = Vec::new();
     let relayed = super::try_relay_at(
         Err(too_long()),
-        &Some("echo hi".into()),
+        &Some(exec("echo hi")),
         &mut stderr,
         None,
         std::io::empty(),
@@ -182,7 +165,7 @@ fn connect_failure_in_the_callers_own_dir_fails_open_without_a_reason_on_stderr(
     let mut stderr = Vec::new();
     let relayed = super::try_relay_at(
         Ok(location),
-        &Some("echo hi".into()),
+        &Some(exec("echo hi")),
         &mut stderr,
         None,
         std::io::empty(),
@@ -254,7 +237,7 @@ fn try_relay_connects_to_the_location_its_provider_names() {
     let agent = fake_agent_exiting_with(listener, 7);
 
     let relayed = super::try_relay(
-        &Some("echo hi".into()),
+        &Some(exec("echo hi")),
         || Ok(location),
         None,
         std::io::empty(),
@@ -284,7 +267,7 @@ fn a_failed_log_is_named_where_the_shim_already_explains_a_fallback_for_a_comman
     let cause = "the folder belongs to someone else";
     let relayed = super::try_relay_at(
         Ok(location),
-        &Some("echo hi".into()),
+        &Some(exec("echo hi")),
         &mut stderr,
         Some(cause),
         std::io::empty(),
@@ -337,7 +320,7 @@ fn a_failed_log_does_not_touch_the_stderr_of_a_relayed_command() {
 
     let relayed = super::try_relay_at(
         Ok(location),
-        &Some("echo hi".into()),
+        &Some(exec("echo hi")),
         &mut stderr,
         Some("no log"),
         std::io::empty(),
@@ -398,7 +381,7 @@ fn a_rescue_is_asked_when_the_connect_fails_and_its_line_comes_before_the_fallba
     let mut stderr = Vec::new();
     let relayed = super::try_relay_at(
         Ok(location),
-        &Some("echo hi".into()),
+        &Some(exec("echo hi")),
         &mut stderr,
         None,
         std::io::empty(),
@@ -451,7 +434,7 @@ fn a_rescue_is_not_asked_when_the_connect_succeeds() {
 
     let relayed = super::try_relay_at(
         Ok(location),
-        &Some("echo hi".into()),
+        &Some(exec("echo hi")),
         &mut Vec::new(),
         None,
         std::io::empty(),
@@ -477,7 +460,7 @@ fn a_rescue_that_connects_gets_the_session_relayed_through_its_connection() {
 
     let relayed = super::try_relay_at(
         Ok(nowhere),
-        &Some("echo hi".into()),
+        &Some(exec("echo hi")),
         &mut Vec::new(),
         None,
         std::io::empty(),
@@ -552,7 +535,7 @@ fn a_command_whose_connection_ends_before_the_agent_answers_says_it_may_have_run
 
         let relayed = super::try_relay_at(
             Ok(location),
-            &Some("echo hi".into()),
+            &Some(exec("echo hi")),
             &mut stderr,
             None,
             std::io::empty(),
@@ -606,7 +589,7 @@ fn a_command_is_never_sent_to_an_agent_a_second_time() {
 
     let relayed = super::try_relay_at(
         Ok(location),
-        &Some("echo hi".into()),
+        &Some(exec("echo hi")),
         &mut Vec::new(),
         None,
         std::io::empty(),
@@ -639,7 +622,7 @@ fn an_interactive_session_whose_connection_ends_before_the_agent_answers_takes_t
         None,
         std::io::empty(),
         &mut rescue,
-        &mut |_conn, _modes| {
+        &mut |_conn, _modes, _command| {
             attempts += 1;
             // The pump ends when the agent closes the connection, which it does after its listener.
             agent.take().expect("one attempt").join().unwrap();
@@ -678,7 +661,7 @@ fn an_interactive_session_goes_round_again_to_an_agent_that_answers_the_second_t
         None,
         std::io::empty(),
         &mut Never,
-        &mut |_conn, _modes| {
+        &mut |_conn, _modes, _command| {
             attempts += 1;
             Ok(Interactive::Pumped(if attempts == 1 {
                 Pumped::closed(anyhow::Error::new(std::io::Error::from(
@@ -740,7 +723,7 @@ fn a_second_connection_that_ends_without_a_byte_is_a_protocol_violation_not_a_re
         None,
         std::io::empty(),
         &mut Never,
-        &mut |_conn, _modes| {
+        &mut |_conn, _modes, _command| {
             attempts += 1;
             // Not a loop limit of the shim: the test fails instead of hanging if the shim never stops.
             assert!(
@@ -798,7 +781,7 @@ fn a_no_byte_close_before_and_after_a_connect_that_failed_are_not_consecutive() 
         None,
         std::io::empty(),
         &mut rescue,
-        &mut |_conn, _modes| {
+        &mut |_conn, _modes, _command| {
             attempts += 1;
             // The pump of the first connection ends when the agent closes it, after its listener.
             if let Some(first) = first.take() {
@@ -814,4 +797,93 @@ fn a_no_byte_close_before_and_after_a_connect_that_failed_are_not_consecutive() 
     assert_eq!(attempts, 2);
     assert_eq!(relayed, None, "the last rescue gave up: the shim fails open");
     assert!(rescue.0.is_empty(), "the rescue was asked after each failed connect");
+}
+
+// A command with a terminal -----
+
+#[test]
+fn a_command_with_a_console_relays_as_a_pty_session_with_the_command() {
+    use super::Interactive;
+    use crate::relay::Outcome;
+    use crate::shim::Pumped;
+    let (_profile, location, _listener) = location_with_listener("terminal-command");
+    let mut asked = Vec::new();
+
+    let relayed = super::try_relay_with(
+        Ok(location),
+        &Some(exec_with_terminal("echo  hi")),
+        &mut Vec::new(),
+        None,
+        std::io::empty(),
+        &mut Never,
+        &mut |_conn, _modes, command| {
+            asked.push(command.map(str::to_owned));
+            Ok(Interactive::Pumped(Pumped {
+                outcome: Ok(Outcome::Exited(3)),
+                heard: true,
+            }))
+        },
+    )
+    .unwrap();
+
+    assert_eq!(relayed, Some(3));
+    assert_eq!(
+        asked,
+        [Some("echo  hi".to_string())],
+        "the console relay carries the command"
+    );
+}
+
+#[test]
+fn a_command_without_a_terminal_does_not_take_the_console_relay() {
+    let (_profile, location, listener) = location_with_listener("exec-not-pty");
+    let agent = fake_agent_exiting_with(listener, 4);
+
+    let relayed = super::try_relay_with(
+        Ok(location),
+        &Some(exec("echo hi")),
+        &mut Vec::new(),
+        None,
+        std::io::empty(),
+        &mut Never,
+        &mut |_conn, _modes, _command| panic!("a command without a terminal used the console relay"),
+    )
+    .unwrap();
+
+    assert_eq!(relayed, Some(4));
+    assert_eq!(agent.join().unwrap().command.as_deref(), Some("echo hi"));
+}
+
+#[test]
+fn an_unanswered_terminal_command_is_not_sent_again() {
+    // The agent may have started the command before it ended the connection. This agent is still
+    // listening and would take a second one.
+    let (_profile, location, listener) = location_with_listener("terminal-twice");
+    let (finished, agent) = agent_that_always_hangs_up(listener, 1);
+    let mut stderr = Vec::new();
+    let mut attempts = 0;
+
+    let relayed = super::try_relay_with(
+        Ok(location),
+        &Some(exec_with_terminal("echo hi")),
+        &mut stderr,
+        None,
+        std::io::empty(),
+        &mut Never,
+        &mut |_conn, _modes, _command| {
+            attempts += 1;
+            assert!(attempts <= 1, "the command was sent again");
+            Ok(hung_up())
+        },
+    )
+    .unwrap();
+    finished.send(()).unwrap();
+    agent.join().unwrap();
+
+    assert_eq!(attempts, 1);
+    assert_eq!(relayed, Some(255));
+    assert_eq!(
+        String::from_utf8(stderr).unwrap(),
+        "ssh-broker: the agent ended before it answered; the command may or may not have run\n"
+    );
 }

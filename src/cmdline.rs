@@ -24,15 +24,31 @@ pub enum RawExec {
     Argv(String),
 }
 
+/// A `-c` command, decoded, and whether the client asked for a terminal with it (`ssh -t host cmd`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Exec {
+    pub command: String,
+    /// The session has a console ([`Encoding::Verbatim`]): the command gets a terminal.
+    pub terminal: bool,
+}
+
 /// The command `exec` carries. A tail is decoded by the form `detect` reports, called here rather
-/// than at startup because only a `-c` session needs it.
-pub fn resolve_exec(exec: RawExec, detect: impl FnOnce() -> Encoding) -> String {
-    match exec {
-        RawExec::Tail(tail) => decode_command(&tail, detect()),
+/// than at startup because only a `-c` session needs it; the same report says whether there is a
+/// terminal.
+pub fn resolve_exec(exec: RawExec, detect: impl FnOnce() -> Encoding) -> Exec {
+    let (command, encoding) = match exec {
+        RawExec::Tail(tail) => {
+            let encoding = detect();
+            (decode_command(&tail, encoding), encoding)
+        }
         RawExec::Argv(command) => {
             tracing::warn!("the raw command line has no `-c` although argv does; running the joined argv");
-            command
+            (command, detect())
         }
+    };
+    Exec {
+        command,
+        terminal: encoding == Encoding::Verbatim,
     }
 }
 
