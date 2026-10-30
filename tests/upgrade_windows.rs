@@ -496,7 +496,13 @@ fn apply_carries_all_four_values_and_a_second_apply_does_not_rewrite_them() {
         "{shell:?} {option:?}"
     );
     assert!(provision::registry::escape_arguments_under(provision::registry::OPENSSH_KEY).unwrap());
-    // The arguments are in the config now, so sshd may not pass them to ssh-broker as well.
+    // The arguments are in the config now, so sshd may not pass them to ssh-broker as well, and the
+    // removal says what it removed.
+    assert!(
+        text.contains("removed DefaultShellArguments") && text.contains("-NoLogo -File"),
+        "the removal did not print the value:
+{text}"
+    );
     let remaining = reg(&["query", OPENSSH_KEY, "/v", "DefaultShellArguments"]);
     assert!(
         !remaining.status.success(),
@@ -543,6 +549,88 @@ fn apply_carries_all_four_values_and_a_second_apply_does_not_rewrite_them() {
         std::fs::read(&config).unwrap(),
         written,
         "the third apply rewrote the config"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Elevated (CI only). With no `config.yaml` to hold them (nothing was carried: sshd ran no shell of
+/// its own), `apply` leaves `DefaultShellArguments` in the registry and says so with the value; once
+/// a later `apply` carries a shell into the config, that `apply` removes them.
+#[test]
+fn apply_keeps_default_shell_arguments_until_a_config_holds_them() {
+    let _machine = machine::exclusive();
+    let _install = Install::capture();
+    let dir = std::env::temp_dir().join(format!("sb-keep-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let pwsh = dir.join("pwsh.exe");
+    std::fs::write(&pwsh, b"MZ").unwrap();
+    let broker = Path::new(env!("CARGO_BIN_EXE_ssh-broker"));
+    let config = Path::new(provision::BASE_DIR).join("config.yaml");
+    let arguments = || {
+        reg(&["query", OPENSSH_KEY, "/v", "DefaultShellArguments"])
+            .status
+            .success()
+    };
+
+    // Arguments and no shell: nothing to carry, so no config.
+    let _ = reg(&["delete", OPENSSH_KEY, "/v", "DefaultShell", "/f"]);
+    set_sshd_value("DefaultShellArguments", "REG_SZ", "-NoLogo");
+    let first = apply(broker);
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&first.stdout),
+        String::from_utf8_lossy(&first.stderr)
+    );
+    assert!(
+        first.status.success(),
+        "the apply failed:
+{text}"
+    );
+    assert!(
+        !config.exists(),
+        "control: nothing should have been carried:
+{text}"
+    );
+    assert!(
+        arguments(),
+        "the arguments were removed with no config to hold them:
+{text}"
+    );
+    assert!(
+        text.contains("left DefaultShellArguments") && text.contains("-NoLogo"),
+        "apply did not say it left the arguments:
+{text}"
+    );
+
+    // Another apply with nothing to carry: still left, and said again.
+    let again = apply(broker);
+    assert!(again.status.success());
+    assert!(arguments(), "a second apply removed the arguments with no config");
+
+    // A shell to carry: the config is written, and the same apply removes the arguments.
+    set_sshd_value("DefaultShell", "REG_SZ", &pwsh.to_string_lossy());
+    let carrying = apply(broker);
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&carrying.stdout),
+        String::from_utf8_lossy(&carrying.stderr)
+    );
+    assert!(
+        carrying.status.success(),
+        "the apply failed:
+{text}"
+    );
+    assert!(
+        config.is_file(),
+        "no config after carrying a shell:
+{text}"
+    );
+    assert!(
+        !arguments(),
+        "the arguments are still set though a config holds them:
+{text}"
     );
 
     let _ = std::fs::remove_dir_all(&dir);
