@@ -16,7 +16,7 @@
 
 use crate::cmdline::{Encoding, RawExec, resolve_exec};
 use crate::console_modes::ConsoleModes;
-use crate::protocol::{FrameKind, FrameReader, Handshake, Stream, write_frame};
+use crate::protocol::{FrameKind, FrameReader, Handshake, Launch, Stream, write_frame};
 use crate::relay::{FrameSink, write_data};
 use crate::shim::{
     FailOpen, Fallback, MouseModeSniffer, PROTOCOL_VIOLATION_CODE, Pumped, Started, XtwinopsFilter,
@@ -313,7 +313,7 @@ fn relay_exec(
     stderr: &mut dyn std::io::Write,
 ) -> anyhow::Result<Option<i32>> {
     let (rx, tx) = afunix::split(conn)?;
-    let hs = make_handshake(&Some(cmd.to_owned()), term(), 80, 24); // EXEC ignores cols/rows
+    let hs = make_handshake(&Some(cmd.to_owned()), false, Launch::Shell, term(), 80, 24); // EXEC ignores cols/rows
     // Held until the session is over: the agent takes a close for a disconnect.
     let pumped = match start_exec_input(tx, &hs, stdin)? {
         Started::Ready(_keep_open) => pump_exec(rx, std::io::stdout(), std::io::stderr()),
@@ -341,7 +341,7 @@ fn relay_interactive(conn: Socket, rescued_modes: Option<ConsoleModes>) -> anyho
         return Ok(Interactive::NoConsole);
     }
     let (cols, rows) = console_size(modes.stdout);
-    let hs = make_handshake(&None, term(), cols, rows);
+    let hs = make_handshake(&None, false, Launch::Shell, term(), cols, rows);
     Ok(Interactive::Pumped(run_pty(modes, rx, FrameReader::new(), tx, &hs)?))
 }
 

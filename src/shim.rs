@@ -2,7 +2,7 @@
 //! the agent over AF_UNIX; fails open to a local shell if the agent is unreachable.
 
 use crate::cmdline::RawExec;
-use crate::protocol::{FrameKind, FrameReader, Handshake, Mode, Resize, Stream, write_frame};
+use crate::protocol::{FrameKind, FrameReader, Handshake, Launch, Mode, Resize, Stream, write_frame};
 use crate::relay::{FrameSink, Outcome, PumpError, pump_decode, write_data};
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
@@ -421,17 +421,30 @@ pub fn map_outcome(outcome: Result<Outcome, crate::relay::PumpError>) -> i32 {
 }
 
 /// Build the handshake from the shim's inputs (pure; the Windows caller supplies `term` from
-/// `$TERM` and `cols`/`rows` from the live console). EXEC mode iff a command is present; `cwd`
-/// and `env` are empty in v1 — the agent supplies the session-1 working dir and profile env.
-pub fn make_handshake(exec: &Option<String>, term: String, cols: u16, rows: u16) -> Handshake {
+/// `$TERM` and `cols`/`rows` from the live console). A command without a terminal is an EXEC
+/// session; a command with one (`ssh -t host cmd`) is a PTY session that carries the command.
+/// `cwd` and `env` are empty: the agent supplies the session-1 working dir and profile env.
+pub fn make_handshake(
+    exec: &Option<String>,
+    terminal: bool,
+    launch: Launch,
+    term: String,
+    cols: u16,
+    rows: u16,
+) -> Handshake {
     Handshake {
-        mode: if exec.is_some() { Mode::Exec } else { Mode::Pty },
+        mode: if exec.is_some() && !terminal {
+            Mode::Exec
+        } else {
+            Mode::Pty
+        },
         cols,
         rows,
         term,
         cwd: String::new(),
         command: exec.clone(),
         env: Vec::new(),
+        launch,
         ..Handshake::pty_default()
     }
 }

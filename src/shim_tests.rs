@@ -5,7 +5,9 @@ use super::{
     ExecOutSink, FailOpen, Fallback, MouseModeSniffer, XtwinopsFilter, decide_fail_open, decide_fallback,
     is_blank_command, make_handshake, map_outcome, size_to_resize, spawn_line,
 };
-use crate::protocol::{ExitCode, FrameKind, FrameReader, Handshake, Mode, Resize, Stream, read_one_frame, write_frame};
+use crate::protocol::{
+    ExitCode, FrameKind, FrameReader, Handshake, Launch, Mode, Resize, Stream, read_one_frame, write_frame,
+};
 use crate::relay::{FrameSink, Outcome, TestSink, duplex, write_data};
 
 #[test]
@@ -382,10 +384,11 @@ fn map_outcome_exit_code_policy() {
 // ── make_handshake (pure field mapping) ────────────────────────────────────────────
 
 #[test]
-fn make_handshake_pty_fields() {
-    let hs = make_handshake(&None, "screen-256color".into(), 100, 30);
+fn no_command_is_pty_without_a_command() {
+    let hs = make_handshake(&None, false, Launch::Shell, "screen-256color".into(), 100, 30);
     assert_eq!(hs.mode, Mode::Pty);
     assert_eq!(hs.command, None);
+    assert_eq!(hs.launch, Launch::Shell);
     assert_eq!((hs.cols, hs.rows), (100, 30));
     assert_eq!(hs.term, "screen-256color");
     assert!(hs.cwd.is_empty()); // agent uses the session-1 default cwd
@@ -394,10 +397,25 @@ fn make_handshake_pty_fields() {
 }
 
 #[test]
-fn make_handshake_exec_fields() {
-    let hs = make_handshake(&Some("git status".into()), "xterm".into(), 80, 24);
+fn a_command_without_a_terminal_is_exec() {
+    let hs = make_handshake(&Some("git status".into()), false, Launch::Shell, "xterm".into(), 80, 24);
     assert_eq!(hs.mode, Mode::Exec);
     assert_eq!(hs.command.as_deref(), Some("git status"));
+}
+
+#[test]
+fn a_command_with_a_terminal_is_a_pty_handshake_with_the_command() {
+    let hs = make_handshake(&Some("git status".into()), true, Launch::Shell, "xterm".into(), 120, 40);
+    assert_eq!(hs.mode, Mode::Pty);
+    assert_eq!(hs.command.as_deref(), Some("git status"));
+    assert_eq!((hs.cols, hs.rows), (120, 40));
+}
+
+#[test]
+fn the_launch_is_carried_as_given() {
+    for launch in [Launch::Shell, Launch::Direct] {
+        assert_eq!(make_handshake(&None, false, launch, String::new(), 0, 0).launch, launch);
+    }
 }
 
 // ── MouseModeSniffer (pure; gates mouse forwarding) ────────────────────────────────
@@ -556,7 +574,7 @@ fn frames(from: &mpsc::Receiver<Vec<u8>>, n: usize) -> Vec<(FrameKind, Vec<u8>)>
 }
 
 fn exec_handshake() -> Handshake {
-    make_handshake(&Some("sort".into()), "xterm".into(), 80, 24)
+    make_handshake(&Some("sort".into()), false, Launch::Shell, "xterm".into(), 80, 24)
 }
 
 fn stdin_data(payload: &[u8]) -> (FrameKind, Vec<u8>) {

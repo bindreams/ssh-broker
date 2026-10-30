@@ -104,6 +104,7 @@ mod imp {
     use super::{
         apply_lock, flow, probe, procwait, registry, report, schtasks, session_task, sessions, taskscheduler, user_rows,
     };
+    use crate::protocol::Launch;
     use crate::{afunix, shim};
     use anyhow::Context;
     use std::path::Path;
@@ -525,7 +526,7 @@ mod imp {
         let sock = afunix::connect(&crate::userdir::current_socket_location()?.path).context("connect to agent")?;
         let (rx, tx) = afunix::split(sock)?;
         let cmd = format!("\"{}\" verify-probe", exe.display());
-        let hs = shim::make_handshake(&Some(cmd), "xterm".into(), 80, 24);
+        let hs = shim::make_handshake(&Some(cmd), false, Launch::Direct, "xterm".into(), 80, 24);
         let mut out = Vec::new();
         let mut err = Vec::new();
         // Feed the SAME payload upstream that the child echoes downstream. Passing `io::empty()`

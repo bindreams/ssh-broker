@@ -66,6 +66,7 @@ fn handshake_roundtrips() {
         cwd: "C:\\Users\\example".into(),
         command: None,
         env: vec![("LANG".into(), "C".into())],
+        launch: Launch::Shell,
     };
     let bytes = h.encode().unwrap();
     assert_eq!(Handshake::decode(&bytes).unwrap(), h);
@@ -249,4 +250,50 @@ fn logout_handshake_roundtrips() {
         ..Handshake::pty_default()
     };
     assert_eq!(Handshake::decode(&h.encode().unwrap()).unwrap().mode, Mode::Logout);
+}
+
+#[test]
+fn launch_round_trips() {
+    for launch in [Launch::Shell, Launch::Direct] {
+        let h = Handshake {
+            launch,
+            command: Some("x".into()),
+            ..Handshake::pty_default()
+        };
+        assert_eq!(Handshake::decode(&h.encode().unwrap()).unwrap().launch, launch);
+    }
+    assert_eq!(Handshake::pty_default().launch, Launch::Direct);
+}
+
+/// A peer of the other version is refused by name, whichever side is older: the old handshake has
+/// no `launch`, and a decoder that read the whole struct first would say "unexpected end of input".
+#[test]
+fn a_version_1_handshake_is_refused_with_the_version_message() {
+    #[derive(serde::Serialize)]
+    struct V1 {
+        version: u16,
+        mode: Mode,
+        cols: u16,
+        rows: u16,
+        term: String,
+        cwd: String,
+        command: Option<String>,
+        env: Vec<(String, String)>,
+    }
+    let bytes = postcard::to_stdvec(&V1 {
+        version: 1,
+        mode: Mode::Exec,
+        cols: 80,
+        rows: 24,
+        term: "xterm".into(),
+        cwd: String::new(),
+        command: Some("whoami".into()),
+        env: Vec::new(),
+    })
+    .unwrap();
+    let error = Handshake::decode(&bytes).unwrap_err().to_string();
+    assert!(
+        error.contains("peer 1") && error.contains(&format!("ours {PROTOCOL_VERSION}")),
+        "{error}"
+    );
 }
