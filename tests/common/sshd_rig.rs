@@ -404,3 +404,75 @@ impl SshSession {
         assert_eq!(code, 0, "ssh exited with {code}");
     }
 }
+
+// Running a client to its end =====
+
+/// What a client left: its exit code (`None`: it did not end within the bound and was ended), and what it
+/// wrote to stdout and stderr.
+pub struct Outcome {
+    pub code: Option<u32>,
+    pub stdout: Vec<u8>,
+    pub stderr: String,
+}
+
+static RUNS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Run `command` with its output in files under `scratch`; stdin is null, or an open pipe dropped when the
+/// client has ended (`hold_stdin`: a PTY session needs one). The wait is bounded by `CHILD_EXIT_BOUND`:
+/// the client is an external process that may never end, and expiry is recorded, not read as state.
+pub fn run_client(mut command: Command, hold_stdin: bool, scratch: &Path) -> Outcome {
+    use std::os::windows::io::AsRawHandle as _;
+    let n = RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let out_path = scratch.join(format!("client-{}-{n}.out", std::process::id()));
+    let err_path = scratch.join(format!("client-{}-{n}.err", std::process::id()));
+    command
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdout(std::fs::File::create(&out_path).unwrap())
+        .stderr(std::fs::File::create(&err_path).unwrap())
+        .stdin(if hold_stdin { Stdio::piped() } else { Stdio::null() });
+    let mut child = command.spawn().expect("the client did not start");
+    let handle = windows::Win32::Foundation::HANDLE(child.as_raw_handle());
+    let pid = child.id();
+    let ended = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        crate::bounded_wait::wait_for_exit(handle, pid, "the client", crate::bounded_wait::CHILD_EXIT_BOUND, &[])
+    }));
+    let code = ended.ok();
+    if code.is_none() {
+        let _ = child.kill();
+    }
+    let _ = child.wait();
+    drop(child.stdin.take());
+    let stdout = std::fs::read(&out_path).unwrap_or_default();
+    let stderr = String::from_utf8_lossy(&std::fs::read(&err_path).unwrap_or_default()).into_owned();
+    let _ = std::fs::remove_file(&out_path);
+    let _ = std::fs::remove_file(&err_path);
+    Outcome { code, stdout, stderr }
+}
+
+/// Make `shell` sshd's `DefaultShell` the way stock sshd has it: no command option, no arguments, no escape
+/// flag (sshd then escapes). Machine-wide registry: CI only.
+pub fn set_stock_shell(shell: &Path) {
+    const KEY: &str = r"HKLM\SOFTWARE\OpenSSH";
+    let (ok, text) = run(
+        "reg",
+        &[
+            "add",
+            KEY,
+            "/v",
+            "DefaultShell",
+            "/t",
+            "REG_SZ",
+            "/d",
+            shell.to_str().unwrap(),
+            "/f",
+        ],
+    );
+    assert!(ok, "reg add DefaultShell: {text}");
+    for name in [
+        "DefaultShellCommandOption",
+        "DefaultShellArguments",
+        "DefaultShellEscapeArguments",
+    ] {
+        let _ = run("reg", &["delete", KEY, "/v", name, "/f"]);
+    }
+}

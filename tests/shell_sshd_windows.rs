@@ -1,0 +1,391 @@
+//! What the shell does with a session, through the runner's real `sshd`. Windows only; **Elevated
+//! (CI only)**.
+//!
+//! The probe (a copy of `examples/command_line_probe`) is the shell of a throwaway account's user
+//! config, so each test reads back the exact line the shell was started with: through the shim alone
+//! (no agent: the fail-open) and through the agent. The same corpus goes through stock sshd with the
+//! probe as `DefaultShell`, which says what OpenSSH delivers. The tests change sshd's `DefaultShell`
+//! and take the machine alone (`machine::exclusive()`); the runner is discarded after the job.
+#![cfg(windows)]
+
+use std::ffi::OsString;
+use std::path::PathBuf;
+use std::process::Command;
+
+use ssh_broker::cmdline::split_args;
+use ssh_broker::provision::registry::{OPENSSH_KEY, set_default_shell_under};
+use ssh_broker::shim::spawn_line;
+
+#[path = "common/account.rs"]
+mod account_fixture;
+#[path = "common/agent_conn.rs"]
+mod agent_conn;
+#[path = "common/bounded_wait.rs"]
+mod bounded_wait;
+#[path = "common/command_corpus.rs"]
+mod command_corpus;
+#[path = "common/command_line_probe.rs"]
+mod command_line_probe;
+#[path = "common/desktop.rs"]
+mod desktop;
+#[path = "common/hard_errors.rs"]
+mod hard_errors;
+#[path = "common/logon_session.rs"]
+mod logon_session;
+#[path = "common/machine.rs"]
+mod machine;
+#[path = "common/password.rs"]
+mod password;
+#[path = "common/process_list.rs"]
+mod process_list;
+#[path = "common/session_end.rs"]
+mod session_end;
+#[path = "common/sshd_encoder.rs"]
+mod sshd_encoder;
+#[path = "common/sshd_rig.rs"]
+mod sshd_rig;
+#[path = "common/stand_in.rs"]
+mod stand_in;
+
+use account_fixture::{Account, ServiceLogon};
+use sshd_rig::{Login, Outcome, SshSession, run_client, set_stock_shell};
+use stand_in::Kit;
+
+/// A throwaway account sshd admits, a probe shell it can run, and (on request) its running session.
+struct Rig {
+    kit: Kit,
+    account: Account,
+    probe: PathBuf,
+    _end: session_end::LogOutOnDrop,
+}
+
+impl Rig {
+    fn new(tag: &str) -> Rig {
+        account_fixture::assert_elevated();
+        let kit = Kit::broker_with_helper(tag);
+        let account = Account::create(tag, true);
+        let end = session_end::LogOutOnDrop::new(&kit.exe, &account, ServiceLogon::Sshd);
+        let probe = kit.path("probe.exe");
+        std::fs::copy(command_line_probe::path(), &probe).unwrap();
+        Rig {
+            kit,
+            account,
+            probe,
+            _end: end,
+        }
+    }
+
+    fn login(&self) -> Login<'_> {
+        Login::new(&self.kit, &self.account)
+    }
+
+    fn line_file(&self) -> PathBuf {
+        let mut file = self.probe.clone().into_os_string();
+        file.push(".line");
+        PathBuf::from(file)
+    }
+
+    /// The line the probe was last started with, if it ran since [`Rig::forget_line`].
+    fn probe_line(&self) -> Option<String> {
+        std::fs::read_to_string(self.line_file()).ok()
+    }
+
+    fn forget_line(&self) {
+        let _ = std::fs::remove_file(self.line_file());
+    }
+
+    fn use_probe_shell(&self) {
+        self.account
+            .write_user_config(&format!("shell: '{}'\n", self.probe.display()));
+    }
+
+    fn broker_is_default_shell(&self) {
+        set_default_shell_under(OPENSSH_KEY, &self.kit.exe.to_string_lossy()).expect("set the shim as DefaultShell");
+    }
+
+    /// `ssh host -- command` with (`tty`) or without a terminal.
+    fn ssh(&self, login: &Login<'_>, tty: bool, command: &str) -> Outcome {
+        let mut ssh = login.command();
+        ssh.arg(if tty { "-tt" } else { "-T" }).arg("--").arg(command);
+        run_client(ssh, tty, self.kit.dir())
+    }
+
+    /// An interactive login that starts the account's background session, left open for the caller to end.
+    /// The account's config names pwsh at this point (the fixture default).
+    fn start_session(&self, login: &Login<'_>) -> SshSession {
+        let mut session = login.start();
+        session.log_in(&self.account.password);
+        session
+    }
+}
+
+fn text(outcome: &Outcome) -> String {
+    String::from_utf8_lossy(&outcome.stdout).into_owned()
+}
+
+// The command the shell is given =====
+
+/// The corpus through stock sshd with the probe as `DefaultShell`, and through the broker with the probe as
+/// the user's shell: through the shim alone, then through the agent. The shell gets the command exactly as
+/// the client wrote it (less the edge whitespace and the rewrite sshd does of `scp` and `sftp-server`), as
+/// one argument. Stock sshd is checked against the port of its encoder in `tests/common/sshd_encoder.rs`,
+/// and the entries where it hands the shell something else are printed: that is the named table of
+/// differences, derived from the same port instead of written by hand.
+#[test]
+fn broker_delivers_every_command_exactly_and_stock_sshd_matches_its_model() {
+    let _machine = machine::exclusive();
+    let rig = Rig::new("shd1");
+    let login = rig.login();
+    let probe = rig.probe.to_string_lossy().into_owned();
+    let commands: Vec<&str> = command_corpus::CORPUS
+        .iter()
+        .copied()
+        .filter(|command| !ssh_broker::shim::is_blank_command(command))
+        .collect();
+    let mut failures = Vec::new();
+
+    // Stock sshd.
+    set_stock_shell(&rig.probe);
+    let mut stock = Vec::new();
+    for command in &commands {
+        rig.forget_line();
+        let outcome = rig.ssh(&login, false, command);
+        let Some(line) = rig.probe_line() else {
+            failures.push(format!(
+                "stock sshd: the probe did not run for {command:?}\n{}",
+                outcome.stderr
+            ));
+            continue;
+        };
+        let want = split_args(&sshd_encoder::escaped_line(&probe, command));
+        if split_args(&line) != want {
+            failures.push(format!("stock sshd, {command:?}\n  line: {line:?}\n  model: {want:?}"));
+        }
+        stock.push((*command, split_args(&line).get(2).cloned()));
+    }
+
+    // The broker, with the probe as the user's shell.
+    rig.broker_is_default_shell();
+    rig.use_probe_shell();
+    let mut check = |path: &str| {
+        for command in &commands {
+            rig.forget_line();
+            let outcome = rig.ssh(&login, false, command);
+            let Some(line) = rig.probe_line() else {
+                failures.push(format!(
+                    "broker ({path}): the probe did not run for {command:?}\n{}",
+                    outcome.stderr
+                ));
+                continue;
+            };
+            let delivered = sshd_encoder::build_exec_command(command);
+            let want = vec![probe.clone(), "-c".to_owned(), spawn_line(&delivered).to_owned()];
+            if split_args(&line) != want {
+                failures.push(format!(
+                    "broker ({path}), {command:?}\n  line: {line:?}\n  want: {want:?}"
+                ));
+            }
+        }
+    };
+    check("shim alone: no agent, fail-open");
+    // The session starts under the account's pwsh; the probe is the shell again for the commands.
+    rig.account.write_user_config("shell: pwsh.exe\n");
+    let session = rig.start_session(&login);
+    rig.use_probe_shell();
+    check("through the agent");
+    session.leave();
+
+    for (command, delivered) in &stock {
+        let exact = delivered.as_deref() == Some(spawn_line(&sshd_encoder::build_exec_command(command)));
+        if !exact {
+            eprintln!("stock sshd hands the shell {delivered:?} for {command:?}");
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+// scp and sftp =====
+
+/// All 256 byte values, then a deterministic run of pseudo-random bytes.
+fn payloads() -> Vec<(&'static str, Vec<u8>)> {
+    let mut state = 0x2545_F491_4F6C_DD1Du64;
+    let noise = (0..256 * 1024)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state as u8
+        })
+        .collect();
+    vec![("all256", (0..=255u8).collect()), ("noise", noise)]
+}
+
+fn client_options(login: &Login<'_>) -> Vec<OsString> {
+    // `Login::command` is `ssh -v -i key -o ... user@localhost`: the same options serve scp and sftp.
+    let ssh = login.command();
+    let args: Vec<OsString> = ssh.get_args().map(OsString::from).collect();
+    // Drop `-v` and the destination, which ssh takes and scp does not in this position.
+    args[1..args.len() - 1].to_vec()
+}
+
+/// Every byte value both ways through `scp -O`, `scp` (SFTP mode) and `sftp`, with the shell `shell_yaml`
+/// names. Stock sshd is byte-exact through both shells (measured), so the broker must be too.
+fn byte_clean_through(shell_name: &str, shell_yaml: &str, tag: &str) {
+    let _machine = machine::exclusive();
+    let rig = Rig::new(tag);
+    let login = rig.login();
+    rig.broker_is_default_shell();
+    let session = rig.start_session(&login);
+    rig.account.write_user_config(shell_yaml);
+    let profile = rig.account.profile().to_path_buf();
+    let target = format!("{}@localhost", rig.account.name);
+    let mut failures = Vec::new();
+
+    for (name, bytes) in payloads() {
+        let local = rig.kit.path(&format!("src-{name}.bin"));
+        std::fs::write(&local, &bytes).unwrap();
+        let remote_source = format!("remote-{name}.bin");
+        std::fs::write(profile.join(&remote_source), &bytes).unwrap();
+        for tool in ["scp-O", "scp", "sftp"] {
+            let exe = if tool == "sftp" { "sftp" } else { "scp" };
+            let up = format!("up-{shell_name}-{tool}-{name}.bin");
+            let down = rig.kit.path(&format!("down-{shell_name}-{tool}-{name}.bin"));
+            let mut upload = Command::new(exe);
+            let mut download = Command::new(exe);
+            for (command, from, to, batch) in [
+                (
+                    &mut upload,
+                    local.to_string_lossy().into_owned(),
+                    format!("{target}:{up}"),
+                    format!("put {} {up}", local.display()),
+                ),
+                (
+                    &mut download,
+                    format!("{target}:{remote_source}"),
+                    down.to_string_lossy().into_owned(),
+                    format!("get {remote_source} {}", down.display()),
+                ),
+            ] {
+                command.args(client_options(&login));
+                match tool {
+                    "sftp" => {
+                        let batch_file = rig.kit.path("batch.txt");
+                        std::fs::write(&batch_file, format!("{batch}\n")).unwrap();
+                        command.arg("-b").arg(&batch_file).arg(&target);
+                    }
+                    "scp-O" => {
+                        command.args(["-O", &from, &to]);
+                    }
+                    _ => {
+                        command.args([&from, &to]);
+                    }
+                }
+            }
+            let sent = run_client(upload, false, rig.kit.dir());
+            if std::fs::read(profile.join(&up)).ok().as_deref() != Some(bytes.as_slice()) {
+                failures.push(format!(
+                    "{shell_name} {tool} upload of {name}: exit {:?}\n{}",
+                    sent.code, sent.stderr
+                ));
+            }
+            let got = run_client(download, false, rig.kit.dir());
+            if std::fs::read(&down).ok().as_deref() != Some(bytes.as_slice()) {
+                failures.push(format!(
+                    "{shell_name} {tool} download of {name}: exit {:?}\n{}",
+                    got.code, got.stderr
+                ));
+            }
+        }
+    }
+    session.leave();
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
+fn scp_and_sftp_are_byte_clean_through_cmd() {
+    let system_root = std::env::var("SystemRoot").expect("SystemRoot");
+    byte_clean_through("cmd", &format!("shell: '{system_root}\\System32\\cmd.exe'\n"), "shd2");
+}
+
+#[test]
+fn scp_and_sftp_are_byte_clean_through_pwsh() {
+    byte_clean_through("pwsh", "shell: pwsh.exe\n", "shd3");
+}
+
+// A terminal, a broken config, the agent's PATH =====
+
+/// `ssh -t host command` gives the command a terminal (before, it ran on pipes), and its exit code arrives;
+/// `ssh -T` gives it pipes. (A resize needs an ssh client on a pseudoconsole of its own, which the
+/// harness that drives this one does not have.)
+#[test]
+fn a_command_with_a_terminal_has_a_terminal() {
+    let _machine = machine::exclusive();
+    let rig = Rig::new("shd4");
+    let login = rig.login();
+    rig.broker_is_default_shell();
+    let session = rig.start_session(&login);
+
+    let pty = rig.ssh(&login, true, "[Console]::IsOutputRedirected; exit 7");
+    assert_eq!(pty.code, Some(7), "{}\n{}", text(&pty), pty.stderr);
+    assert!(
+        text(&pty).contains("False"),
+        "the command had no terminal: {:?}",
+        text(&pty)
+    );
+
+    let pipes = rig.ssh(&login, false, "[Console]::IsOutputRedirected; exit 5");
+    assert_eq!(pipes.code, Some(5), "{}\n{}", text(&pipes), pipes.stderr);
+    assert!(
+        text(&pipes).contains("True"),
+        "the command had a terminal: {:?}",
+        text(&pipes)
+    );
+    session.leave();
+}
+
+/// A user config that cannot be used is one warning, and `cmd.exe` runs the command, through the agent.
+#[test]
+fn a_broken_user_config_warns_and_gives_cmd_exe() {
+    let _machine = machine::exclusive();
+    let rig = Rig::new("shd5");
+    let login = rig.login();
+    rig.broker_is_default_shell();
+    let session = rig.start_session(&login);
+    rig.account.write_user_config("shell: {strt: pwsh.exe}\n");
+
+    let out = rig.ssh(&login, false, "echo built-in-ok");
+    assert!(text(&out).contains("built-in-ok"), "{}\n{}", text(&out), out.stderr);
+    assert_eq!(
+        out.stderr.matches("cannot use the shell from").count(),
+        1,
+        "{}",
+        out.stderr
+    );
+    assert!(
+        out.stderr.contains("config.yaml") && out.stderr.contains("strt"),
+        "{}",
+        out.stderr
+    );
+    session.leave();
+}
+
+/// `shell: pwsh.exe` is found on the agent's own `PATH`.
+#[test]
+fn a_path_lookup_finds_pwsh_in_the_agents_path() {
+    let _machine = machine::exclusive();
+    let rig = Rig::new("shd6");
+    let login = rig.login();
+    rig.broker_is_default_shell();
+    let session = rig.start_session(&login);
+    rig.account.write_user_config("shell: pwsh.exe\n");
+
+    let out = rig.ssh(&login, false, "$PSVersionTable.PSVersion.Major");
+    let shown = text(&out);
+    assert!(
+        shown.trim().parse::<u32>().is_ok(),
+        "pwsh did not answer: {shown:?}\n{}",
+        out.stderr
+    );
+    assert!(!out.stderr.contains("cannot use the shell"), "{}", out.stderr);
+    session.leave();
+}
