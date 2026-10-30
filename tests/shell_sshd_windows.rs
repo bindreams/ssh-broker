@@ -164,8 +164,21 @@ fn text(outcome: &Outcome) -> String {
 /// differences, derived from the same port instead of written by hand.
 #[test]
 fn broker_delivers_every_command_exactly_and_stock_sshd_matches_its_model() {
+    corpus_through_stock_and_broker("shd1", false);
+}
+
+/// The same corpus with a terminal (`ssh -tt host command`). sshd then builds the line `"shell" -c command` with
+/// the command appended raw and conhost splits and rejoins it, so the shell is not given one argument; the
+/// broker must give the shell the arguments stock sshd gives it. The stock line is the model: what the broker's
+/// probe line splits into is compared with what stock sshd's does, entry by entry.
+#[test]
+fn broker_gives_a_command_with_a_terminal_the_arguments_stock_sshd_does() {
+    corpus_through_stock_and_broker("shd9", true);
+}
+
+fn corpus_through_stock_and_broker(tag: &str, tty: bool) {
     let _machine = machine::exclusive();
-    let rig = Rig::new("shd1");
+    let rig = Rig::new(tag);
     let login = rig.login();
     let probe = rig.probe.to_string_lossy().into_owned();
     let commands: Vec<&str> = command_corpus::CORPUS
@@ -175,25 +188,35 @@ fn broker_delivers_every_command_exactly_and_stock_sshd_matches_its_model() {
         .collect();
     let mut failures = Vec::new();
 
-    // Stock sshd.
+    // Stock sshd. `stock` holds the line the probe was started with, per command.
     set_stock_shell(&rig.probe);
     let mut stock = Vec::new();
     for command in &commands {
         rig.forget_line();
-        let outcome = rig.ssh(&login, false, command);
+        let outcome = rig.ssh(&login, tty, command);
         let Some(line) = rig.probe_line() else {
             failures.push(format!(
-                "stock sshd: the probe did not run for {command:?}\n{}",
+                "stock sshd: the probe did not run for {command:?}
+{}",
                 outcome.stderr
             ));
             continue;
         };
         // sshd lowercases the whole `DefaultShell` path (`pwd.c`).
-        let want = split_args(&sshd_encoder::escaped_line(&probe.to_lowercase(), command));
+        let model = if tty {
+            sshd_encoder::verbatim_line(&probe.to_lowercase(), command)
+        } else {
+            sshd_encoder::escaped_line(&probe.to_lowercase(), command)
+        };
+        let want = split_args(&model);
         if split_args(&line) != want {
-            failures.push(format!("stock sshd, {command:?}\n  line: {line:?}\n  model: {want:?}"));
+            failures.push(format!(
+                "stock sshd, {command:?}
+  line: {line:?}
+  model: {want:?}"
+            ));
         }
-        stock.push((*command, split_args(&line).get(2).cloned()));
+        stock.push((*command, line));
     }
 
     // The broker, with the probe as the user's shell.
@@ -202,44 +225,77 @@ fn broker_delivers_every_command_exactly_and_stock_sshd_matches_its_model() {
     let mut check = |path: &str, relayed: bool| {
         for command in &commands {
             rig.forget_line();
-            let outcome = rig.ssh(&login, false, command);
+            let outcome = rig.ssh(&login, tty, command);
             let shown = format!("{}{}", text(&outcome), outcome.stderr);
-            if relayed {
-                rig.assert_relayed(&format!("broker ({path}), {command:?}"), &shown);
-            } else {
-                rig.assert_local(&format!("broker ({path}), {command:?}"), &shown);
+            // A session with a terminal says "agent unavailable" to the log, not to the terminal.
+            if !tty {
+                if relayed {
+                    rig.assert_relayed(&format!("broker ({path}), {command:?}"), &shown);
+                } else {
+                    rig.assert_local(&format!("broker ({path}), {command:?}"), &shown);
+                }
             }
             let Some(line) = rig.probe_line() else {
                 failures.push(format!(
-                    "broker ({path}): the probe did not run for {command:?}\n{}",
+                    "broker ({path}): the probe did not run for {command:?}
+{}",
                     outcome.stderr
                 ));
                 continue;
             };
-            let delivered = sshd_encoder::build_exec_command(command);
-            let want = vec![probe.clone(), "-c".to_owned(), spawn_line(&delivered).to_owned()];
-            if split_args(&line) != want {
+            let want = if tty {
+                // What stock sshd did, with the shell's own spelling of its path.
+                let Some((_, stock_line)) = stock.iter().find(|(c, _)| c == command) else {
+                    continue; // stock sshd did not run it: said above
+                };
+                let mut want = split_args(stock_line);
+                want[0] = probe.clone();
+                want
+            } else {
+                let delivered = sshd_encoder::build_exec_command(command);
+                vec![probe.clone(), "-c".to_owned(), spawn_line(&delivered).to_owned()]
+            };
+            let mut got = split_args(&line);
+            if tty && !got.is_empty() && got[0].eq_ignore_ascii_case(&probe) {
+                got[0] = probe.clone();
+            }
+            if got != want {
                 failures.push(format!(
-                    "broker ({path}), {command:?}\n  line: {line:?}\n  want: {want:?}"
+                    "broker ({path}), {command:?}
+  line: {line:?}
+  want: {want:?}"
                 ));
             }
         }
     };
     check("shim alone: no agent, fail-open", false);
     // The session starts under the account's pwsh; the probe is the shell again for the commands.
-    rig.account.write_user_config("shell: pwsh.exe\n");
+    rig.account.write_user_config(
+        "shell: pwsh.exe
+",
+    );
     let session = rig.start_session(&login);
     rig.use_probe_shell();
     check("through the agent", true);
     session.leave();
 
-    for (command, delivered) in &stock {
-        let exact = delivered.as_deref() == Some(spawn_line(&sshd_encoder::build_exec_command(command)));
-        if !exact {
-            eprintln!("stock sshd hands the shell {delivered:?} for {command:?}");
+    if !tty {
+        for (command, delivered) in &stock {
+            let delivered = split_args(delivered).get(2).cloned();
+            let exact = delivered.as_deref() == Some(spawn_line(&sshd_encoder::build_exec_command(command)));
+            if !exact {
+                eprintln!("stock sshd hands the shell {delivered:?} for {command:?}");
+            }
         }
     }
-    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    assert!(
+        failures.is_empty(),
+        "{}",
+        failures.join(
+            "
+"
+        )
+    );
 }
 
 // scp and sftp =====
@@ -529,4 +585,43 @@ fn assert_unstartable_warning(stderr: &str, stub: &std::path::Path) {
         stderr.contains("config.yaml") && stderr.contains(&stub.display().to_string()) && stderr.contains("os error"),
         "{stderr}"
     );
+}
+
+/// The warning for a shell that cannot be used is on the screen of a session with a terminal: ConPTY's opening
+/// output (a clear of the screen, a cursor move) must not wipe it. Both forms of the session are rendered the
+/// way a terminal renders them, from the bytes ssh delivers: a command with a terminal, and a login.
+#[test]
+fn the_warning_survives_on_the_screen_of_a_session_with_a_terminal() {
+    let _machine = machine::exclusive();
+    let rig = Rig::new("shd10");
+    let login = rig.login();
+    rig.broker_is_default_shell();
+    let session = rig.start_session(&login);
+    rig.account.write_user_config("shell: {strt: pwsh.exe}\n");
+
+    let out = rig.ssh(&login, true, "echo built-in-ok");
+    let screen = sshd_rig::screen_text(&out.stdout);
+    eprintln!(
+        "the screen of the command session:\n{screen}\nthe raw stream: {:?}",
+        text(&out)
+    );
+    assert!(screen.contains("built-in-ok"), "the command did not run:\n{screen}");
+    assert!(
+        screen.contains("cannot use the shell from") && screen.contains("config.yaml"),
+        "the warning is not on the screen of a command with a terminal:\n{screen}\nraw: {:?}",
+        text(&out)
+    );
+
+    let mut shown = login.start();
+    shown.read_until("Microsoft Windows");
+    let screen = sshd_rig::screen_text(&shown.transcript);
+    eprintln!("the screen of the login:\n{screen}\nthe raw stream: {:?}", shown.text());
+    assert!(
+        screen.contains("cannot use the shell from") && screen.contains("config.yaml"),
+        "the warning is not on the screen of a login:\n{screen}\nraw: {:?}",
+        shown.text()
+    );
+    shown.type_line("exit");
+    let _ = shown.finish();
+    session.leave();
 }

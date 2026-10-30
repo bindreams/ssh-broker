@@ -23,6 +23,7 @@ encoding_rs = "0.8"            # BOM-sniffing decode of config.yaml (UTF-8, UTF-
 
 [dev-dependencies]
 fd-lock = "4.0.4"
+vt100 = "0.18"               # renders the VT stream a terminal session delivers to a screen, to check what a user sees (tests/common/sshd_rig.rs; 0.18.1)
 pipe = "0.4"                 # two unidirectional pipes compose the splittable relay test transport, EOF-on-writer-drop (Phase 2; 0.4.0)
 
 # Windows-only dependencies. Not compiled on the macOS host, so the pure-logic
