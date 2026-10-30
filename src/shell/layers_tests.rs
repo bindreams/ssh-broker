@@ -123,7 +123,7 @@ fn xdg_config_home_wins_only_when_absolute_and_non_empty() {
 
 #[test]
 fn a_profile_with_spaces_and_non_ascii_names_the_right_file() {
-    let profile = "C:\\Users\\Ünï cödé (work)";
+    let profile = "D:\\Profiles\\Ünï cödé (work)";
     let mut host = TestHost::new();
     host.profile = Some(PathBuf::from(profile));
     let path = format!("{profile}\\.config\\ssh-broker\\config.yaml");

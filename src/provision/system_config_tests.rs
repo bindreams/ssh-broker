@@ -191,7 +191,7 @@ fn the_written_yaml_parses_back_to_the_carried_block() {
         PWSH7,
         r"C:\Program Files (x86)\My Shell\sh.exe",
         r#"C:\a "quoted" dir\sh.exe"#,
-        "C:\\Users\\Ünï cödé\\sh.exe",
+        "D:\\Profiles\\Ünï cödé\\sh.exe",
     ] {
         let mut prev = sshd(shell);
         prev.command_option = Some("-Command".into());

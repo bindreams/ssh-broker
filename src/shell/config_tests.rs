@@ -146,8 +146,8 @@ fn editor_encodings_parse() {
 
 #[test]
 fn a_non_ascii_program_survives_every_editor_encoding() {
-    let text = "shell: C:\\Users\\Ünï cödé\\bin\\pwsh.exe\r\n";
-    let want = start("C:\\Users\\Ünï cödé\\bin\\pwsh.exe");
+    let text = "shell: D:\\Profiles\\Ünï cödé\\bin\\pwsh.exe\r\n";
+    let want = start("D:\\Profiles\\Ünï cödé\\bin\\pwsh.exe");
     let mut utf8_bom = vec![0xEF, 0xBB, 0xBF];
     utf8_bom.extend_from_slice(text.as_bytes());
     let mut utf16le = vec![0xFF, 0xFE];
@@ -222,7 +222,7 @@ fn a_serialized_block_parses_back_equal() {
     for program in [
         r"C:\Program Files (x86)\PowerShell\pwsh.exe",
         r#"C:\a "quoted" dir\pwsh.exe"#,
-        "C:\\Users\\Ünï cödé\\bin\\pwsh.exe",
+        "D:\\Profiles\\Ünï cödé\\bin\\pwsh.exe",
         "x: y",
         "- z",
         "#not a comment",

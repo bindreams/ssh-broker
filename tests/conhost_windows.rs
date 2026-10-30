@@ -146,7 +146,7 @@ fn join_args_agrees_with_command_line_to_argv_w() {
 fn a_resolved_program_path_survives_as_argv0() {
     for program in [
         r"C:\Program Files (x86)\x\pwsh.exe",
-        r"C:\Users\Ünï cödé\bin\pwsh.exe",
+        r"D:\Profiles\Ünï cödé\bin\pwsh.exe",
         r"C:\Windows\System32\cmd.exe",
     ] {
         let line = ssh_broker::cmdline::join_args(&[program, "-c", "echo hi"]);
