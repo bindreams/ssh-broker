@@ -361,3 +361,75 @@ fn console_fallback_with_an_unreadable_hand_off_starts_the_built_in_shell_for_a_
     );
     assert_eq!(out.status.code(), Some(0), "{stderr:?}");
 }
+
+/// Read the pseudoconsole's output into `seen` until it holds `needle`. A session that ends first is a failure.
+fn read_console_until(output: isize, seen: &mut String, needle: &str) {
+    let mut buf = [0u8; 4096];
+    while !seen.contains(needle) {
+        let n = ssh_broker::conpty::read_handle(output, &mut buf);
+        assert!(
+            n > 0,
+            "the console ended before it showed {needle:?}; it showed:\n{seen}"
+        );
+        seen.push_str(&String::from_utf8_lossy(&buf[..n]));
+    }
+}
+
+/// The fallback shell of a terminal session runs under the verb, which is the console's root process, so a
+/// Ctrl+C raised on the console reaches the verb as well as the shell. The shell answers it (here a probe that
+/// reports the event it gets), and the verb must stay: with the default handler it would end on the Ctrl+C, and
+/// take the shell and the session with it (ssh-broker#55).
+///
+/// The test clears the "ignore Ctrl+C" setting its own process may have inherited, which the verb and the
+/// probe then inherit, as they would from a process that never had it. (Measured in CI: the agent's sessions
+/// start with it set, and nothing there gets a Ctrl+C until a program clears it for itself; see the report.)
+#[test]
+fn console_fallback_stays_through_a_ctrl_c_that_the_shell_answers() {
+    use ssh_broker::conpty::{PtySession, write_all_handle};
+    use ssh_broker::vtinput::{KeyEvent, encode_key_event};
+    use windows::Win32::System::Console::SetConsoleCtrlHandler;
+
+    // SAFETY: no pointers. This process's own setting, which nextest gives to this test alone.
+    unsafe { SetConsoleCtrlHandler(None, false) }.expect("clear the inherited ignore of Ctrl+C");
+    let probe = command_line_probe::example("ctrl_probe");
+    let pipe = ssh_broker::winutil::Handoff::new().expect("make the hand-off pipe");
+    let verb_line = join_args(&[
+        env!("CARGO_BIN_EXE_ssh-broker"),
+        "console-fallback",
+        &(pipe.read().0.0 as usize).to_string(),
+    ]);
+    let mut console = PtySession::spawn(&verb_line, 120, 30, None, Some(pipe.read())).expect("start the verb");
+    pipe.send(&ssh_broker::handoff::encode("the notice", &join_args(&[&probe.to_string_lossy()])).unwrap())
+        .expect("hand the verb its line");
+    let output = console.out_read_raw();
+    let mut seen = String::new();
+    read_console_until(output, &mut seen, "ready");
+
+    // Ctrl+C as the shim sends a keystroke: the Ctrl key, C with its character, and both released.
+    const LEFT_CTRL: u32 = 0x0008;
+    let key = |virtual_key_code, virtual_scan_code, unicode_char, key_down, control_key_state| {
+        encode_key_event(&KeyEvent {
+            virtual_key_code,
+            virtual_scan_code,
+            unicode_char,
+            key_down,
+            control_key_state,
+            repeat_count: 1,
+        })
+    };
+    let keys = [
+        key(0x11, 0x1D, 0, true, LEFT_CTRL),
+        key(0x43, 0x2E, 3, true, LEFT_CTRL),
+        key(0x43, 0x2E, 3, false, LEFT_CTRL),
+        key(0x11, 0x1D, 0, false, 0),
+    ]
+    .concat();
+    assert!(write_all_handle(console.in_write_raw(), &keys), "write the keys");
+
+    // The probe says it got the event and ends; the verb passes its exit code on.
+    read_console_until(output, &mut seen, "finished.");
+    assert!(seen.contains("event "), "the probe got no Ctrl+C:\n{seen}");
+    let code = console.wait().unwrap();
+    assert_eq!(code, 0, "the verb ended with {code:#x}:\n{seen}");
+    console.close_pty();
+}

@@ -179,11 +179,6 @@ impl AgentConn {
         write_data(&mut self.tx, Stream::Pty, &bytes).unwrap();
     }
 
-    /// Write `bytes` as they are to a PTY session's input.
-    pub fn send_pty_bytes(&mut self, bytes: &[u8]) {
-        write_data(&mut self.tx, Stream::Pty, bytes).unwrap();
-    }
-
     /// Mark the end of stdin of an exec session.
     pub fn end_stdin(&mut self) {
         write_data(&mut self.tx, Stream::Stdin, b"").unwrap();
