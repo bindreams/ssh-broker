@@ -114,11 +114,33 @@ fn start_with(
     if let Some(log) = keep_log_or_report(init_log(&location.logs_dir()), &mut std::io::stderr()) {
         keep_log(log);
     }
+    sweep_fallback_files(&location.dir);
     let result = serve(&location, session);
     if let Err(e) = &result {
         tracing::error!("the agent stopped: {e:#}");
     }
     result
+}
+
+/// Remove the verb files that agents killed mid-start left in the private folder (see
+/// [`crate::fallback_file`]). This agent has staged none yet, so a file under its own pid is a
+/// leftover of an earlier process. A failure is logged: serving does not need the folder swept.
+#[cfg(windows)]
+fn sweep_fallback_files(dir: &Path) {
+    let own = std::process::id();
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(e) => {
+            tracing::warn!("cannot find this program, so leftover fallback files are not swept: {e}");
+            return;
+        }
+    };
+    let swept = crate::fallback_file::sweep(dir, |pid| {
+        Ok(pid != own && crate::provision::procwait::is_running_image(pid, &exe)?)
+    });
+    if let Err(e) = swept {
+        tracing::warn!("could not sweep {} for leftover fallback files: {e}", dir.display());
+    }
 }
 
 /// Keep the log if it opened. If not, say why on `stderr` and go on: serving does not need a log.

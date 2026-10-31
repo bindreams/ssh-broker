@@ -3,7 +3,7 @@
 
 use std::path::{Path, PathBuf};
 
-use super::{stage, take};
+use super::{stage, sweep, take};
 
 /// A fresh folder standing in for the user's private one; removed when dropped.
 pub(crate) struct Folder(pub(crate) PathBuf);
@@ -176,4 +176,105 @@ fn take_of_a_missing_or_garbled_file_is_an_error() {
 fn staging_in_a_missing_folder_is_an_error() {
     let folder = Folder::new("missing");
     assert!(stage(&folder.0.join("no-such-folder"), "n", "l").is_err());
+}
+
+// sweep -----
+
+/// A file named as `stage` names the files of the process `pid`, written without `stage`.
+fn file_of(folder: &Folder, pid: u32, n: u32, suffix: &str) -> String {
+    let name = format!("console-fallback-{pid}-{n}{suffix}");
+    std::fs::write(folder.0.join(&name), b"x").unwrap();
+    name
+}
+
+/// The files of a writer that is gone are removed; the files of one that is running stay. Both the
+/// finished file and the one a crash left half-made (`.tmp`) are the writer's.
+#[test]
+fn sweep_removes_the_files_of_a_dead_writer_and_keeps_those_of_a_live_one() {
+    let folder = Folder::new("sweep-pids");
+    let (dead, live) = (4_000_000_001, 4_000_000_002);
+    file_of(&folder, dead, 0, "");
+    file_of(&folder, dead, 1, ".tmp");
+    let kept = [file_of(&folder, live, 0, ""), file_of(&folder, live, 1, ".tmp")];
+
+    sweep(&folder.0, |pid| Ok(pid == live)).unwrap();
+
+    let mut want = kept.to_vec();
+    want.sort();
+    assert_eq!(folder.entries(), want);
+}
+
+/// A name that is not exactly `console-fallback-<pid>-<n>` or that plus `.tmp` is not ours to remove,
+/// and the writer is not even asked about it.
+#[test]
+fn sweep_leaves_alone_what_it_did_not_name() {
+    let folder = Folder::new("sweep-others");
+    let others = [
+        "agent.log",
+        "console-fallback-",
+        "console-fallback-12",
+        "console-fallback-x-1",
+        "console-fallback-12-x",
+        "console-fallback-12-1.bak",
+        "console-fallback-12-1.tmp.tmp",
+        "console-fallback--1-2",
+        "console-fallback-+12-1",
+        "console-fallback-12-1-3",
+        "xconsole-fallback-12-1",
+        "console-fallback-99999999999-1",
+    ];
+    for name in others {
+        std::fs::write(folder.0.join(name), b"x").unwrap();
+    }
+    std::fs::create_dir(folder.0.join("console-fallback-7-7")).unwrap();
+
+    sweep(&folder.0, |pid| {
+        panic!("asked about the writer {pid} of a file that is not ours")
+    })
+    .unwrap();
+
+    let mut want: Vec<String> = others.iter().map(|name| name.to_string()).collect();
+    want.push("console-fallback-7-7".into());
+    want.sort();
+    assert_eq!(folder.entries(), want);
+}
+
+/// When the writer cannot be told apart from a running one, its file stays (nothing proves it is an
+/// orphan) and the files of the others are still swept.
+#[test]
+fn sweep_keeps_a_file_whose_writer_it_could_not_check_and_goes_on() {
+    let folder = Folder::new("sweep-unsure");
+    let (unsure, dead) = (4_000_000_003, 4_000_000_004);
+    let kept = file_of(&folder, unsure, 0, "");
+    file_of(&folder, dead, 0, "");
+
+    sweep(&folder.0, |pid| {
+        if pid == unsure {
+            anyhow::bail!("cannot read the image of process {pid}")
+        }
+        Ok(false)
+    })
+    .unwrap();
+
+    assert_eq!(folder.entries(), [kept]);
+}
+
+/// A file that `stage` made is found by the sweep: the two agree on the name.
+#[test]
+fn sweep_removes_a_file_staged_by_a_writer_that_is_gone() {
+    let folder = Folder::new("sweep-staged");
+    stage(&folder.0, "n", "l").unwrap().hand_over();
+    let mine = std::process::id();
+
+    sweep(&folder.0, |pid| Ok(pid == mine)).unwrap();
+    assert_eq!(folder.entries().len(), 1, "the writer is running: the file stays");
+
+    sweep(&folder.0, |_| Ok(false)).unwrap();
+    assert_eq!(folder.entries(), Vec::<String>::new());
+}
+
+#[test]
+fn sweep_of_a_folder_that_is_not_there_is_an_error() {
+    let folder = Folder::new("sweep-missing");
+    assert!(sweep(&folder.0.join("nope"), |_| Ok(false)).is_err());
 }

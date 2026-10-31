@@ -429,6 +429,17 @@ pub fn open_if_image(pid: u32, image: &Path) -> anyhow::Result<Option<Process>> 
     open_if_image_by(pid, image, &file_id, &image_of, IfEnding::TakeForRunning)
 }
 
+/// Whether the process `pid` is running `image` now: [`open_if_image`] for a caller that wants no
+/// handle. A process this account cannot open or read is none of its own, so it is not running the
+/// image of an agent of this account.
+pub fn is_running_image(pid: u32, image: &Path) -> anyhow::Result<bool> {
+    match open_if_image(pid, image) {
+        Ok(opened) => Ok(opened.is_some()),
+        Err(e) if is_denied(&e) => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
 /// What to make of a process whose image cannot be read because it is ending.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum IfEnding {

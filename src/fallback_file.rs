@@ -8,7 +8,8 @@
 //! The file is made in the user's private folder (`socket_loc::SocketLocation::dir`), whose
 //! inheritable owner-only ACEs the file is born with. The verb starts the line the file holds, so
 //! [`take`] reads only a file in that folder, and only if the caller's check finds its ACL private.
-//! The file lives from [`stage`] until the verb has read it, or until the agent's spawn fails.
+//! The file lives from [`stage`] until the verb has read it, or until the agent's spawn fails. An
+//! agent killed in between leaves it behind; [`sweep`] removes such files when an agent starts.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -76,6 +77,51 @@ pub fn stage(dir: &Path, notice: &str, line: &str) -> std::io::Result<Staged> {
         }
         return Ok(Staged { path: Some(final_path) });
     }
+}
+
+/// The pid in the name of a file [`stage`] makes (or of the `.tmp` file it renames).
+fn writer_of(name: &str) -> Option<u32> {
+    let rest = name.strip_prefix(NAME_PREFIX)?;
+    let rest = rest.strip_suffix(".tmp").unwrap_or(rest);
+    let (pid, n) = rest.split_once('-')?;
+    let digits = |text: &str| !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit());
+    (digits(pid) && digits(n) && n.parse::<u64>().is_ok())
+        .then(|| pid.parse().ok())
+        .flatten()
+}
+
+/// Remove the files in `dir` whose writer is gone: an agent killed after [`stage`] and before its
+/// verb read the file leaves one behind.
+///
+/// `is_live` says whether a process with the writer's pid is the writer (a pid is reused, so it must
+/// tell a running agent from another program that has the number). A file whose writer it cannot
+/// check stays, since nothing shows it is an orphan; the next sweep asks again. Names that [`stage`]
+/// does not make are left alone and their writers are not asked about.
+pub fn sweep(dir: &Path, mut is_live: impl FnMut(u32) -> anyhow::Result<bool>) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let Some(pid) = entry.file_name().to_str().and_then(writer_of) else {
+            continue;
+        };
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        match is_live(pid) {
+            Ok(true) => {}
+            Ok(false) => {
+                if let Err(e) = std::fs::remove_file(entry.path())
+                    && e.kind() != std::io::ErrorKind::NotFound
+                {
+                    tracing::warn!("could not remove {}: {e}", entry.path().display());
+                }
+            }
+            Err(e) => tracing::warn!(
+                "left {} in place: could not tell if process {pid} is still running: {e:#}",
+                entry.path().display()
+            ),
+        }
+    }
+    Ok(())
 }
 
 /// The notice and the line `file` holds, and the file removed.
