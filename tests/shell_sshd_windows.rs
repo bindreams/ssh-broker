@@ -752,7 +752,7 @@ fn ctrl_c_in_a_terminal_session_whose_shell_fell_back_reaches_the_shell_and_the_
     conn.type_line("ping -n 60 127.0.0.1");
     conn.read_until_pty_shows("Reply from");
     conn.send_pty_bytes(&ctrl_c_keys());
-    conn.read_until_pty_shows("^C");
+    conn.read_until_pty_shows("Control-C");
     // `^i` is `i` to cmd.exe, so the text appears only as output, not as the echo of what was typed.
     conn.type_line("echo the-sess^ion-lives");
     conn.read_until_pty_shows("the-session-lives");
@@ -832,9 +832,12 @@ fn measure_ctrl_c_variants() {
             conn.type_line("ping -n 12 127.0.0.1");
             conn.read_until_pty_shows("Reply from");
             conn.send_pty_bytes(bytes);
-            let shown = conn.read_until_pty_shows("Ping statistics");
+            // ping answers Ctrl+C itself: it prints "Control-C" and its statistics.
+            let shown = conn.read_until_pty_shows("Lost = ");
+            let replies = shown.matches("Reply from").count();
             eprintln!(
-                "MEASURE ctrl+c, {session_kind}, {name}: interrupted = {}",
+                "MEASURE ctrl+c, {session_kind}, {name}: Control-C shown = {}, replies = {replies} of 12, ^C shown = {}",
+                shown.contains("Control-C"),
                 shown.contains("^C")
             );
             conn.type_line("exit");
