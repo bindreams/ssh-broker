@@ -744,16 +744,26 @@ fn ctrl_c_in_a_terminal_session_whose_shell_fell_back_reaches_the_shell_and_the_
     rig.account.write_user_config("shell: {strt: pwsh.exe}\n");
     let location = socket_loc::for_profile(rig.account.profile()).unwrap();
 
+    let probe = rig.kit.path("ctrl_probe.exe");
+    std::fs::copy(command_line_probe::example("ctrl_probe"), &probe).unwrap();
+
     let mut conn = agent_conn::AgentConn::connect(&location);
     conn.start_shell_pty(None);
     conn.read_until_pty_shows("Microsoft Windows");
 
-    // A program in the shell, interrupted by Ctrl+C: cmd.exe stays and shows the next prompt.
-    conn.type_line("ping -n 60 127.0.0.1");
-    conn.read_until_pty_shows("Reply from");
+    // A program in the shell that reports the Ctrl+C it gets. Typing `q` ends it if the Ctrl+C did not.
+    conn.type_line(&format!("\"{}\"", probe.display()));
+    conn.read_until_pty_shows("ready");
     conn.send_pty_bytes(&ctrl_c_keys());
-    conn.read_until_pty_shows("Control-C");
-    // `^i` is `i` to cmd.exe, so the text appears only as output, not as the echo of what was typed.
+    conn.type_line("q");
+    let shown = conn.read_until_pty_shows("finished.");
+    let after_ready = shown.rsplit("ready").next().unwrap_or_default();
+    assert!(
+        after_ready.contains("event "),
+        "the program got no Ctrl+C: {after_ready:?}"
+    );
+
+    // The session lives: cmd.exe answers. `^i` is `i` to cmd.exe, so the text appears only as output.
     conn.type_line("echo the-sess^ion-lives");
     conn.read_until_pty_shows("the-session-lives");
 
@@ -786,8 +796,8 @@ fn ctrl_c_keys() -> Vec<u8> {
     .concat()
 }
 
-// MEASUREMENT (ssh-broker#55 round 8, F1): which input interrupts a program through the agent's pseudoconsole.
-// Printed always; replaced by the real test.
+// MEASUREMENT (ssh-broker#55 round 8, F1): which input raises a console Ctrl+C for a program in the agent's
+// pseudoconsole. Printed always; replaced by the real test.
 #[test]
 fn measure_ctrl_c_variants() {
     let _machine = machine::exclusive();
@@ -796,6 +806,8 @@ fn measure_ctrl_c_variants() {
     rig.broker_is_default_shell();
     let session = rig.start_session(&login);
     let location = socket_loc::for_profile(rig.account.profile()).unwrap();
+    let probe = rig.kit.path("ctrl_probe.exe");
+    std::fs::copy(command_line_probe::example("ctrl_probe"), &probe).unwrap();
 
     let simple: Vec<u8> = {
         let key = |down: bool| {
@@ -821,27 +833,30 @@ fn measure_ctrl_c_variants() {
         } else {
             "shell: pwsh.exe\n"
         });
-        for (name, bytes) in &variants {
-            let mut conn = agent_conn::AgentConn::connect(&location);
-            if broken_config {
-                conn.start_shell_pty(None);
-            } else {
-                conn.start_pty("cmd.exe");
+        for argument in ["", " reenable"] {
+            for (name, bytes) in &variants {
+                let mut conn = agent_conn::AgentConn::connect(&location);
+                if broken_config {
+                    conn.start_shell_pty(None);
+                } else {
+                    conn.start_pty("cmd.exe");
+                }
+                conn.read_until_pty_shows("Microsoft Windows");
+                conn.type_line(&format!("\"{}\"{argument}", probe.display()));
+                conn.read_until_pty_shows("ready");
+                conn.send_pty_bytes(bytes);
+                // Ends the probe if the Ctrl+C did not.
+                conn.type_line("q");
+                let shown = conn.read_until_pty_shows("finished.");
+                let tail = shown
+                    .rsplit("ready")
+                    .next()
+                    .unwrap_or_default()
+                    .replace(char::is_control, " ");
+                eprintln!("MEASURE ctrl+c, {session_kind}, probe{argument:?}, {name}: after ready: {tail:?}");
+                conn.type_line("exit");
+                let _ = conn.read_to_end();
             }
-            conn.read_until_pty_shows("Microsoft Windows");
-            conn.type_line("ping -n 12 127.0.0.1");
-            conn.read_until_pty_shows("Reply from");
-            conn.send_pty_bytes(bytes);
-            // ping answers Ctrl+C itself: it prints "Control-C" and its statistics.
-            let shown = conn.read_until_pty_shows("Lost = ");
-            let replies = shown.matches("Reply from").count();
-            eprintln!(
-                "MEASURE ctrl+c, {session_kind}, {name}: Control-C shown = {}, replies = {replies} of 12, ^C shown = {}",
-                shown.contains("Control-C"),
-                shown.contains("^C")
-            );
-            conn.type_line("exit");
-            let _ = conn.read_to_end();
         }
     }
     session.leave();
