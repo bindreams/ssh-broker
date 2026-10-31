@@ -678,6 +678,7 @@ fn effective_of(start: &[&str], without: &[&str], with: &[&str], escaping: Escap
             escaping: Source::BuiltIn,
         },
         origin: Origin::Default,
+        start_kind: Default::default(),
         problem: None,
     }
 }
@@ -885,12 +886,47 @@ fn a_configured_shell_that_starts_is_reported_as_the_one_that_ran() {
         .expect("a notice for the loader status");
     for part in [
         crate::shell::test_host::USER_CONFIG,
-        "`shell.start`",
+        "`shell`",
         "pwsh.exe",
         "0xC0000135",
         "STATUS_DLL_NOT_FOUND",
     ] {
         assert!(notice.contains(part), "{part}: {notice}");
+    }
+}
+
+/// The whole text of the warning, so that a gap or a lost word in the sentence is caught.
+#[test]
+fn the_dll_warning_reads_as_one_sentence() {
+    let shell = started_shell(&pwsh_host(), "never").unwrap();
+    assert_eq!(
+        shell.exit_notice(DLL_NOT_FOUND).unwrap(),
+        format!(
+            "ssh-broker: the shell from {} (`shell`: pwsh.exe) ended with 0xC0000135 (STATUS_DLL_NOT_FOUND): a DLL \
+             that the shell, or a program it ran last, needs was not found",
+            crate::shell::test_host::USER_CONFIG
+        )
+    );
+}
+
+/// The warning names the setting as the config spells it.
+#[test]
+fn the_dll_warning_names_the_setting_as_the_config_spells_it() {
+    for (config, setting) in [
+        ("shell: pwsh.exe\n", "`shell`"),
+        ("shell: {start: pwsh.exe}\n", "`shell.start`"),
+        ("shell: {start: [pwsh.exe, -NoLogo]}\n", "`shell.start`"),
+        ("shell:\n  start: pwsh.exe\n", "`shell.start`"),
+    ] {
+        let host = TestHost::new().with_program("pwsh.exe", PWSH).with_user_config(config);
+        let notice = started_shell(&host, "never")
+            .unwrap()
+            .exit_notice(DLL_NOT_FOUND)
+            .unwrap();
+        assert!(
+            notice.contains(&format!("({setting}: pwsh.exe)")),
+            "{config:?}: {notice}"
+        );
     }
 }
 

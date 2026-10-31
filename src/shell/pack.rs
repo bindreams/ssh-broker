@@ -5,7 +5,7 @@
 
 use std::path::{Path, PathBuf};
 
-use super::config::{Notes, ShellBlock, comment_text, render_annotated};
+use super::config::{Notes, ShellBlock, StartKind, comment_text, render_annotated};
 use super::layers::{self, Origin, Problem};
 use super::{Escaping, Host, is_absolute_windows};
 use crate::cmdline::join_args;
@@ -81,6 +81,8 @@ pub struct Effective {
     pub escaping: Escaping,
     pub why: Why,
     pub origin: Origin,
+    /// How the config wrote the setting that holds the program.
+    pub start_kind: StartKind,
     /// Set when a configured shell could not be used and the built-in `cmd.exe` is in its place.
     pub problem: Option<Problem>,
 }
@@ -94,6 +96,7 @@ const STATUS_DLL_NOT_FOUND: u32 = 0xC000_0135;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfiguredShell {
     file: PathBuf,
+    setting: &'static str,
     value: String,
 }
 
@@ -105,6 +108,7 @@ impl ConfiguredShell {
         };
         Some(Self {
             file: file.clone(),
+            setting: plan.effective.start_kind.setting(),
             value: plan.effective.start.first().cloned().unwrap_or_default(),
         })
     }
@@ -113,8 +117,10 @@ impl ConfiguredShell {
     pub fn exit_notice(&self, code: i32) -> Option<String> {
         (code as u32 == STATUS_DLL_NOT_FOUND).then(|| {
             format!(
-                "ssh-broker: the shell from {} (`shell.start`: {}) ended with 0xC0000135 (STATUS_DLL_NOT_FOUND): a                  DLL that the shell, or a program it ran last, needs was not found",
+                "ssh-broker: the shell from {} (`{}`: {}) ended with 0xC0000135 (STATUS_DLL_NOT_FOUND): a DLL \
+                 that the shell, or a program it ran last, needs was not found",
                 self.file.display(),
+                self.setting,
                 self.value
             )
         })
@@ -256,6 +262,7 @@ fn settle(host: &dyn Host, mut chosen: layers::Chosen) -> anyhow::Result<Effecti
             escaping: escaping_source,
         },
         origin: chosen.origin,
+        start_kind: chosen.start_kind,
         problem: chosen.problem,
     })
 }
@@ -266,6 +273,28 @@ fn built_in_name(host: &dyn Host) -> String {
         |error| format!("cmd.exe ({error:#})"),
         |path| path.display().to_string(),
     )
+}
+
+/// The last component of a program name, as a path or a bare name.
+fn file_part(name: &str) -> &str {
+    name.rsplit(['\\', '/']).next().unwrap_or(name)
+}
+
+/// Whether `CreateProcess` (and so sshd) appends `.exe` to a file name: it does when there is no extension.
+fn takes_exe(file_name: &str) -> bool {
+    !file_name.contains('.')
+}
+
+/// The file name `CreateProcess` looks for when given the program `name`: its last component, with
+/// `.exe` appended when it has no extension. For a name that is compared and not looked up (see
+/// [`resolve_program`] for the lookup).
+pub fn program_file_name(name: &str) -> String {
+    let file_name = file_part(name);
+    if takes_exe(file_name) {
+        format!("{file_name}.exe")
+    } else {
+        file_name.to_owned()
+    }
 }
 
 /// The file `start[0]` names. A bare name is searched on `PATH`; anything with a separator or a
@@ -295,8 +324,7 @@ pub fn resolve_program_in(host: &dyn Host, first: &[PathBuf], name: &str) -> Res
         if is_file(path)? {
             return Ok(path.to_path_buf());
         }
-        let file_name = name.rsplit(['\\', '/']).next().unwrap_or(name);
-        if !file_name.contains('.') {
+        if takes_exe(file_part(name)) {
             let mut with_exe = path.as_os_str().to_owned();
             with_exe.push(".exe");
             let with_exe = PathBuf::from(with_exe);
@@ -397,6 +425,7 @@ pub fn built_in_plan(host: &dyn Host, session: &Session<'_>, problem: Option<Pro
     let chosen = layers::Chosen {
         block,
         origin: Origin::Default,
+        start_kind: StartKind::default(),
         problem,
     };
     pack(session, settle(host, chosen)?)

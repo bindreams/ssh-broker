@@ -138,8 +138,7 @@ pub fn decide(
     let Some(shell) = prev.shell.as_deref() else {
         return Decision::Skip(Skip::NoPreviousShell);
     };
-    let file_name = shell.rsplit(['\\', '/']).next().unwrap_or(shell);
-    if file_name.eq_ignore_ascii_case(super::EXE_NAME) {
+    if super::is_ssh_broker(shell) {
         return Decision::Skip(Skip::PreviousIsSshBroker);
     }
     match config_exists {

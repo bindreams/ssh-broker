@@ -6,7 +6,7 @@
 
 use std::path::{Path, PathBuf};
 
-use super::config::{self, ShellBlock};
+use super::config::{self, ShellBlock, StartKind};
 use super::{Host, is_absolute_windows, join_windows};
 
 /// Where the chosen block came from.
@@ -49,6 +49,8 @@ impl Problem {
 pub struct Chosen {
     pub block: ShellBlock,
     pub origin: Origin,
+    /// How the layer wrote the setting; the default for the built-in block, which no file wrote.
+    pub start_kind: StartKind,
     /// Set when a layer was broken and `block` is the built-in one.
     pub problem: Option<Problem>,
 }
@@ -84,16 +86,18 @@ pub fn choose(host: &dyn Host) -> anyhow::Result<Chosen> {
         Ok(Chosen {
             block: built_in(host)?,
             origin: Origin::Default,
+            start_kind: StartKind::default(),
             problem: Some(problem),
         })
     };
 
     match user_config_path(host) {
         Ok(path) => match layer(host, &path) {
-            Layer::Block(block) => {
+            Layer::Block(block, start_kind) => {
                 return Ok(Chosen {
                     block,
                     origin: Origin::User(path),
+                    start_kind,
                     problem: None,
                 });
             }
@@ -106,22 +110,24 @@ pub fn choose(host: &dyn Host) -> anyhow::Result<Chosen> {
 
     let path = host.system_config_path();
     match layer(host, &path) {
-        Layer::Block(block) => Ok(Chosen {
+        Layer::Block(block, start_kind) => Ok(Chosen {
             block,
             origin: Origin::System(path),
+            start_kind,
             problem: None,
         }),
         Layer::Broken(problem) => fallback(problem),
         Layer::NoShell => Ok(Chosen {
             block: built_in(host)?,
             origin: Origin::Default,
+            start_kind: StartKind::default(),
             problem: None,
         }),
     }
 }
 
 enum Layer {
-    Block(ShellBlock),
+    Block(ShellBlock, StartKind),
     NoShell,
     Broken(Problem),
 }
@@ -139,8 +145,8 @@ fn layer(host: &dyn Host, path: &Path) -> Layer {
         Ok(None) => return Layer::NoShell,
         Err(error) => return broken(format!("cannot read it: {error}")),
     };
-    match config::parse(&bytes) {
-        Ok(Some(block)) => Layer::Block(block),
+    match config::parse_spelled(&bytes) {
+        Ok(Some((block, kind))) => Layer::Block(block, kind),
         Ok(None) => Layer::NoShell,
         Err(error) => broken(error.reason),
     }

@@ -4,8 +4,8 @@
 use std::cell::Cell;
 use std::path::Path;
 
-use super::{Stream, hand_over, hand_over_unreadable};
-use crate::provision::registry::SshdShell;
+use super::{Handover, Stream, hand_over, replace_shell};
+use crate::provision::registry::{SshdShell, SshdShellReading};
 use crate::provision::system_config::{Decision, Skip};
 use crate::shell::config::ShellBlock;
 
@@ -109,18 +109,76 @@ fn a_skip_that_replaces_nothing_says_nothing() {
     }
 }
 
+fn reading() -> SshdShellReading {
+    SshdShellReading {
+        shell: Ok(Some(PWSH7.into())),
+        command_option: Ok(Some("-NoLogo -c".into())),
+        arguments: Ok(Some("-NoProfile".into())),
+        escape_arguments: Ok(false),
+    }
+}
+
+/// The owner's rule (7/7): the flip never happens unless the previous values were carried or printed. A
+/// value that cannot be read can be neither, so `apply` stops before the flip and says which, and what
+/// was read.
 #[test]
-fn an_unreadable_previous_shell_prints_the_cause() {
-    let mut lines = Vec::new();
-    let _ = hand_over_unreadable(&anyhow::anyhow!("access denied"), &mut |stream, text| {
-        lines.push((stream, text.to_owned()))
-    });
-    assert_eq!(
-        lines,
-        vec![(
-            Stream::Err,
-            "apply: could not read the shell sshd uses now, so it is not carried into config.yaml: access denied"
-                .to_owned()
-        )]
+fn an_unreadable_previous_shell_stops_before_the_flip() {
+    let mut unreadable = reading();
+    unreadable.command_option = Err("access denied".into());
+    let (carried, flipped) = (Cell::new(false), Cell::new(false));
+    let result = replace_shell(
+        || unreadable.into_shell(r"HKLM\SOFTWARE\OpenSSH"),
+        |_| {
+            carried.set(true);
+            Handover::nothing_to_carry()
+        },
+        |_| {
+            flipped.set(true);
+            Ok(())
+        },
     );
+    let text = format!("{:#}", result.unwrap_err());
+    assert!(
+        !carried.get() && !flipped.get(),
+        "carried {carried:?}, flipped {flipped:?}"
+    );
+    for part in [
+        "DefaultShellCommandOption (access denied)",
+        "DefaultShell was not changed",
+        &format!("DefaultShell = \"{PWSH7}\""),
+        "DefaultShellArguments = \"-NoProfile\"",
+        "DefaultShellEscapeArguments = off",
+    ] {
+        assert!(text.contains(part), "{part}: {text}");
+    }
+}
+
+#[test]
+fn a_readable_previous_shell_is_carried_and_then_flipped() {
+    let order = std::cell::RefCell::new(Vec::new());
+    let flipped = replace_shell(
+        || reading().into_shell("location"),
+        |previous| {
+            assert_eq!(previous.shell.as_deref(), Some(PWSH7));
+            order.borrow_mut().push("carry");
+            Handover::nothing_to_carry()
+        },
+        |_| {
+            order.borrow_mut().push("flip");
+            Ok(7)
+        },
+    )
+    .unwrap();
+    assert_eq!((flipped, order.into_inner()), (7, vec!["carry", "flip"]));
+}
+
+#[test]
+fn a_failed_flip_is_the_error() {
+    let error = replace_shell(
+        || reading().into_shell("location"),
+        |_| Handover::nothing_to_carry(),
+        |_| -> anyhow::Result<()> { anyhow::bail!("write failed") },
+    )
+    .unwrap_err();
+    assert_eq!(error.to_string(), "write failed");
 }

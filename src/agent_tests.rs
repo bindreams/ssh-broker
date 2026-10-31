@@ -1400,7 +1400,7 @@ fn a_configured_shell_that_ends_with_dll_not_found_gets_a_warning_naming_the_set
             "{tag}: {stdout:?} {stderr:?}"
         );
         let seen = format!("{stdout}{stderr}");
-        for part in [USER_CONFIG, "`shell.start`", "STATUS_DLL_NOT_FOUND"] {
+        for part in [USER_CONFIG, "`shell`", "STATUS_DLL_NOT_FOUND"] {
             assert!(seen.contains(part), "{tag}: {part}: {seen:?}");
         }
         assert_eq!(seen.matches("STATUS_DLL_NOT_FOUND").count(), 1, "{tag}: {seen:?}");

@@ -1,6 +1,6 @@
 //! Tests for the values `apply` owns under `HKLM\SOFTWARE\OpenSSH`: the pure list and the verify
 //! row (host) + the Reg* round-trips (Windows).
-use super::{RegValue, desired_values, escape_arguments_check};
+use super::{RegValue, SshdShell, SshdShellReading, desired_values, escape_arguments_check};
 
 /// A throwaway HKCU subkey, deleted when the guard drops, so a failing assertion leaves nothing
 /// behind.
@@ -234,7 +234,6 @@ fn escape_arguments_reports_a_read_that_fails_for_another_reason() {
 #[cfg(windows)]
 #[test]
 fn the_four_shell_values_are_read_as_sshd_reads_them() {
-    use super::SshdShell;
     use windows::Win32::System::Registry::{REG_DWORD, REG_EXPAND_SZ, REG_SZ};
     let sz = |text: &str| -> Vec<u8> {
         text.encode_utf16()
@@ -399,7 +398,6 @@ fn removing_the_shell_arguments_removes_that_value_and_nothing_else() {
 #[cfg(windows)]
 #[test]
 fn string_values_at_sshds_buffer_boundary_are_read_and_one_character_more_is_absent() {
-    use super::SshdShell;
     use windows::Win32::System::Registry::{REG_DWORD, REG_SZ};
     let sz = |text: &str| -> Vec<u8> {
         text.encode_utf16()
@@ -468,4 +466,85 @@ fn the_image_path_is_read_with_its_variables_expanded_and_is_none_when_absent() 
         super::read_image_path_hkcu(subkey).unwrap().as_deref(),
         Some(format!(r#""{system_root}\OpenSSH\sshd.exe" -x"#).as_str())
     );
+}
+
+// reading the four values, each on its own =====
+
+fn read_ok() -> SshdShellReading {
+    SshdShellReading {
+        shell: Ok(Some(r"C:\Program Files\PowerShell\7\pwsh.exe".into())),
+        command_option: Ok(Some("-NoLogo -c".into())),
+        arguments: Ok(None),
+        escape_arguments: Ok(false),
+    }
+}
+
+#[test]
+fn four_values_that_were_read_make_the_shell() {
+    assert_eq!(
+        read_ok().into_shell("location").unwrap(),
+        SshdShell {
+            shell: Some(r"C:\Program Files\PowerShell\7\pwsh.exe".into()),
+            command_option: Some("-NoLogo -c".into()),
+            arguments: None,
+            escape_arguments: false,
+        }
+    );
+}
+
+/// sshd ignores the other three values with no `DefaultShell`, so a failure to read them loses nothing.
+#[test]
+fn with_no_shell_the_other_values_do_not_matter() {
+    let reading = SshdShellReading {
+        shell: Ok(None),
+        command_option: Err("access denied".into()),
+        arguments: Err("access denied".into()),
+        escape_arguments: Err("access denied".into()),
+    };
+    assert_eq!(reading.into_shell("location").unwrap(), SshdShell::none());
+}
+
+#[test]
+fn a_value_that_could_not_be_read_is_named_with_its_cause_and_the_others_are_printed() {
+    let mut reading = read_ok();
+    reading.arguments = Err("access denied".into());
+    let text = reading.into_shell(r"HKLM\SOFTWARE\OpenSSH").unwrap_err().to_string();
+    assert_eq!(
+        text,
+        [
+            r"cannot read the shell sshd uses now: DefaultShellArguments (access denied) under ",
+            r"HKLM\SOFTWARE\OpenSSH, so DefaultShell was not changed. The values that could be read: ",
+            r#"DefaultShell = "C:\Program Files\PowerShell\7\pwsh.exe", DefaultShellCommandOption = "-NoLogo -c", "#,
+            "DefaultShellEscapeArguments = off",
+        ]
+        .concat()
+    );
+}
+
+#[test]
+fn every_failing_value_is_named_and_the_shell_itself_may_be_the_one() {
+    let reading = SshdShellReading {
+        shell: Err("access denied".into()),
+        command_option: Ok(Some("-c".into())),
+        arguments: Err("bad data".into()),
+        escape_arguments: Ok(true),
+    };
+    let text = reading.into_shell("location").unwrap_err().to_string();
+    for part in [
+        "DefaultShell (access denied)",
+        "DefaultShellArguments (bad data)",
+        "DefaultShellCommandOption = \"-c\"",
+        "DefaultShellEscapeArguments = on",
+        "DefaultShell was not changed",
+    ] {
+        assert!(text.contains(part), "{part}: {text}");
+    }
+}
+
+#[test]
+fn a_value_that_is_not_set_is_printed_as_not_set() {
+    let mut reading = read_ok();
+    reading.escape_arguments = Err("access denied".into());
+    let text = reading.into_shell("location").unwrap_err().to_string();
+    assert!(text.contains("DefaultShellArguments = not set"), "{text}");
 }

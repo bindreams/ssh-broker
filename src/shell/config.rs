@@ -20,6 +20,26 @@ pub struct ShellBlock {
     pub escaping: Option<Escaping>,
 }
 
+/// How a config file wrote the `shell` setting, which decides what its warnings call it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum StartKind {
+    /// `shell: X`: the setting is `shell`.
+    Scalar,
+    /// `shell:` as a mapping: the program is `shell.start`.
+    #[default]
+    Mapping,
+}
+
+impl StartKind {
+    /// The setting that holds the program, as the config spells it.
+    pub fn setting(self) -> &'static str {
+        match self {
+            StartKind::Scalar => "shell",
+            StartKind::Mapping => "shell.start",
+        }
+    }
+}
+
 /// Why a config file is broken.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParseError {
@@ -40,6 +60,11 @@ impl std::error::Error for ParseError {}
 ///
 /// Editors save UTF-8 (with or without a BOM) or UTF-16 with a BOM; the BOM decides.
 pub fn parse(bytes: &[u8]) -> Result<Option<ShellBlock>, ParseError> {
+    parse_spelled(bytes).map(|parsed| parsed.map(|(block, _)| block))
+}
+
+/// [`parse`], with how the file wrote the setting.
+pub fn parse_spelled(bytes: &[u8]) -> Result<Option<(ShellBlock, StartKind)>, ParseError> {
     let (text, _, malformed) = encoding_rs::UTF_8.decode(bytes);
     if malformed {
         return Err(ParseError {
@@ -50,6 +75,7 @@ pub fn parse(bytes: &[u8]) -> Result<Option<ShellBlock>, ParseError> {
     let Some(raw) = file.and_then(|f| f.shell) else {
         return Ok(None);
     };
+    let kind = raw.kind;
     let block = ShellBlock::from(raw);
     if block.start.is_empty() {
         return Err(ParseError {
@@ -57,7 +83,7 @@ pub fn parse(bytes: &[u8]) -> Result<Option<ShellBlock>, ParseError> {
         });
     }
     refuse_nul(&block)?;
-    Ok(Some(block))
+    Ok(Some((block, kind)))
 }
 
 /// `CreateProcessW` ends the line at the first NUL, so a NUL in any configured string would start
@@ -182,19 +208,28 @@ fn shell_field<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<RawS
 }
 
 /// `shell:` as written: a program, or a mapping.
-struct RawShell(RawBlock);
+struct RawShell {
+    block: RawBlock,
+    kind: StartKind,
+}
 
 impl<'de> Deserialize<'de> for RawShell {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let value = yaml_serde::Value::deserialize(deserializer)?;
         match value {
-            yaml_serde::Value::String(program) => Ok(RawShell(RawBlock {
-                start: Some(Args(vec![program])),
-                append: None,
-                escaping: None,
-            })),
+            yaml_serde::Value::String(program) => Ok(RawShell {
+                block: RawBlock {
+                    start: Some(Args(vec![program])),
+                    append: None,
+                    escaping: None,
+                },
+                kind: StartKind::Scalar,
+            }),
             yaml_serde::Value::Mapping(_) => yaml_serde::from_value(value)
-                .map(RawShell)
+                .map(|block| RawShell {
+                    block,
+                    kind: StartKind::Mapping,
+                })
                 .map_err(|e| D::Error::custom(format!("invalid `shell`: {e}"))),
             _ => Err(D::Error::custom("invalid `shell`: expected a program or a mapping")),
         }
@@ -291,7 +326,7 @@ impl From<RawShell> for ShellBlock {
             start,
             append,
             escaping,
-        } = raw.0;
+        } = raw.block;
         let (without_command, with_command) = match append {
             Some(a) => (a.without_command.map(|l| l.0), a.with_command.map(|l| l.0)),
             None => (None, None),

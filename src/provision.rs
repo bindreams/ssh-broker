@@ -131,6 +131,13 @@ pub const BASE_DIR: &str = r"C:\ProgramData\ssh-broker";
 /// The installed exe's file name.
 pub const EXE_NAME: &str = "ssh-broker.exe";
 
+/// Whether sshd, given `shell` as the `DefaultShell`, runs ssh-broker's own exe: it compares the file
+/// name as sshd's `CreateProcess` resolves it (`.exe` is appended to a name with no extension), so
+/// `...\ssh-broker` is ssh-broker too. The one place `apply` asks this.
+pub fn is_ssh_broker(shell: &str) -> bool {
+    crate::shell::program_file_name(shell).eq_ignore_ascii_case(EXE_NAME)
+}
+
 /// The path `apply` installs the shim to and registers as `DefaultShell`.
 pub fn canonical_exe() -> std::path::PathBuf {
     std::path::Path::new(BASE_DIR).join(EXE_NAME)
@@ -142,8 +149,9 @@ mod provision_tests;
 
 #[cfg(windows)]
 mod imp {
-    use super::handover::{Handover, hand_over, hand_over_unreadable, say_to_console};
+    use super::handover::{Handover, hand_over, replace_shell, say_to_console};
     use super::layout::{self, Layout};
+    use super::registry::SshdShell;
     use super::{
         apply_lock, flow, probe, procwait, registry, report, schtasks, session_task, sessions, system_config,
         taskscheduler, user_rows,
@@ -204,10 +212,16 @@ mod imp {
                 //    holds it. Then write the escape flag and read it back at once, then flip the
                 //    DefaultShell pair LAST and only to the validated canonical path; read that back
                 //    too. sshd reads these once per session, so the shim cannot ask later which form
-                //    sshd used: `apply` owns the flag (see `registry::desired_values`).
-                let handover = carry_previous_shell(&base);
-                registry::set_default_shell_under(registry::OPENSSH_KEY, &exe.to_string_lossy(), &handover)
-                    .context("write the DefaultShell values")?;
+                //    sshd used: `apply` owns the flag (see `registry::desired_values`). A shell that
+                //    cannot be read in full stops `apply` here, before any of it is written.
+                replace_shell(
+                    || registry::read_sshd_shell_under(registry::OPENSSH_KEY),
+                    |previous| carry_previous_shell(&base, previous),
+                    |handover| {
+                        registry::set_default_shell_under(registry::OPENSSH_KEY, &exe.to_string_lossy(), handover)
+                            .context("write the DefaultShell values")
+                    },
+                )?;
                 let (shell, opt) = registry::read_default_shell_under(registry::OPENSSH_KEY)?;
                 anyhow::ensure!(
                     eq_path(&shell, &exe) && opt == "-c",
@@ -231,13 +245,9 @@ mod imp {
     /// Write the system config from the shell sshd runs now, if it is not ssh-broker and there is no
     /// config yet (see [`system_config`]). Must run before the registry is overwritten. The install is
     /// complete without the config, so a failure is said on stderr and `apply` goes on; the
-    /// [`Handover`] it returns is what the flip takes.
-    fn carry_previous_shell(base: &layout::TrustedBase<'_>) -> Handover {
+    /// [`Handover`] it returns is what the flip takes. `previous` is what the registry holds now.
+    fn carry_previous_shell(base: &layout::TrustedBase<'_>, previous: &SshdShell) -> Handover {
         let mut say = say_to_console;
-        let previous = match registry::read_sshd_shell_under(registry::OPENSSH_KEY) {
-            Ok(previous) => previous,
-            Err(e) => return hand_over_unreadable(&e, &mut say),
-        };
         let config = base.layout().system_config_path();
         let config_exists = config
             .try_exists()
@@ -268,10 +278,10 @@ mod imp {
                 false
             })
         };
-        let decision = system_config::decide(&previous, config_exists, &search, &find, &is_system_cmd);
+        let decision = system_config::decide(previous, config_exists, &search, &find, &is_system_cmd);
         hand_over(
             &config,
-            &previous,
+            previous,
             decision,
             |block| system_config::create_once(base, block),
             &mut say,

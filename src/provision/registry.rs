@@ -85,6 +85,92 @@ impl SshdShell {
     }
 }
 
+/// What reading each of sshd's four shell values gave, each read on its own so that one failure hides
+/// no other. A failure is its cause as text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SshdShellReading {
+    pub shell: Result<Option<String>, String>,
+    pub command_option: Result<Option<String>, String>,
+    pub arguments: Result<Option<String>, String>,
+    pub escape_arguments: Result<bool, String>,
+}
+
+impl SshdShellReading {
+    /// The shell sshd uses, when every value that matters was read. With no `DefaultShell` sshd
+    /// ignores the other three, so their failures do not matter. `location` names the key for the error.
+    pub fn into_shell(self, location: &str) -> Result<SshdShell, UnreadShell> {
+        let Self {
+            shell,
+            command_option,
+            arguments,
+            escape_arguments,
+        } = self;
+        if matches!(shell, Ok(None)) {
+            return Ok(SshdShell::none());
+        }
+        let text = |value: &Option<String>| value.as_ref().map_or("not set".to_owned(), |v| format!("\"{v}\""));
+        let mut unread = Vec::new();
+        let mut read = Vec::new();
+        for (name, value) in [
+            ("DefaultShell", &shell),
+            ("DefaultShellCommandOption", &command_option),
+            ("DefaultShellArguments", &arguments),
+        ] {
+            match value {
+                Ok(value) => read.push(format!("{name} = {}", text(value))),
+                Err(cause) => unread.push(format!("{name} ({cause})")),
+            }
+        }
+        match &escape_arguments {
+            Ok(on) => read.push(format!("{ESCAPE_ARGUMENTS} = {}", if *on { "on" } else { "off" })),
+            Err(cause) => unread.push(format!("{ESCAPE_ARGUMENTS} ({cause})")),
+        }
+        match (shell, command_option, arguments, escape_arguments) {
+            (Ok(shell), Ok(command_option), Ok(arguments), Ok(escape_arguments)) => Ok(SshdShell {
+                shell,
+                command_option,
+                arguments,
+                escape_arguments,
+            }),
+            _ => Err(UnreadShell {
+                location: location.to_owned(),
+                unread,
+                read,
+            }),
+        }
+    }
+}
+
+/// The shell sshd uses now could not be read in full. Replacing it would lose what could not be read,
+/// so `apply` stops before it does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnreadShell {
+    location: String,
+    /// `Name (cause)` for each value that could not be read.
+    unread: Vec<String>,
+    /// `Name = value` for each value that was.
+    read: Vec<String>,
+}
+
+impl std::fmt::Display for UnreadShell {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "cannot read the shell sshd uses now: {} under {}, so DefaultShell was not changed. The values that \
+             could be read: {}",
+            self.unread.join(", "),
+            self.location,
+            if self.read.is_empty() {
+                "none".to_owned()
+            } else {
+                self.read.join(", ")
+            }
+        )
+    }
+}
+
+impl std::error::Error for UnreadShell {}
+
 /// The size, in bytes, of the buffer sshd reads each of `DefaultShell`, `DefaultShellCommandOption`
 /// and `DefaultShellArguments` into. `pwd.c` declares `wchar_t[PATH_MAX]` (32768) but passes
 /// `_countof` of it, a count of wide characters, as the size in bytes.
@@ -95,7 +181,9 @@ pub const OPENSSH_KEY: &str = r"SOFTWARE\OpenSSH";
 
 #[cfg(windows)]
 mod win {
-    use super::{ESCAPE_ARGUMENTS, RegValue, SSHD_VALUE_BYTES, SshdShell, desired_values};
+    use super::{
+        ESCAPE_ARGUMENTS, RegValue, SSHD_VALUE_BYTES, SshdShell, SshdShellReading, UnreadShell, desired_values,
+    };
     use crate::provision::handover::Handover;
     use anyhow::Context;
     use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_MORE_DATA, ERROR_PATH_NOT_FOUND, WIN32_ERROR};
@@ -238,17 +326,14 @@ mod win {
         Ok((!text.is_empty()).then(|| String::from_utf16_lossy(text)))
     }
 
-    fn read_sshd_shell_in(root: HKEY, subkey: &str) -> anyhow::Result<SshdShell> {
-        let Some(shell) = read_optional_string(root, subkey, "DefaultShell")? else {
-            // sshd ignores the other values when there is no shell.
-            return Ok(SshdShell::none());
-        };
-        Ok(SshdShell {
-            shell: Some(shell),
-            command_option: read_optional_string(root, subkey, "DefaultShellCommandOption")?,
-            arguments: read_optional_string(root, subkey, "DefaultShellArguments")?,
-            escape_arguments: escape_arguments_in(root, subkey).context("read DefaultShellEscapeArguments")?,
-        })
+    fn read_sshd_shell_in(root: HKEY, subkey: &str) -> SshdShellReading {
+        let optional = |name: &str| read_optional_string(root, subkey, name).map_err(|e| format!("{e:#}"));
+        SshdShellReading {
+            shell: optional("DefaultShell"),
+            command_option: optional("DefaultShellCommandOption"),
+            arguments: optional("DefaultShellArguments"),
+            escape_arguments: escape_arguments_in(root, subkey).map_err(|e| e.to_string()),
+        }
     }
 
     /// Remove `DefaultShellArguments` from `<root>\<subkey>`. A value or a key that is not there
@@ -269,8 +354,8 @@ mod win {
     }
 
     /// Production: the four shell values from `HKLM\<subkey>`, as sshd reads them.
-    pub fn read_sshd_shell_under(subkey: &str) -> anyhow::Result<SshdShell> {
-        read_sshd_shell_in(HKEY_LOCAL_MACHINE, subkey)
+    pub fn read_sshd_shell_under(subkey: &str) -> Result<SshdShell, UnreadShell> {
+        read_sshd_shell_in(HKEY_LOCAL_MACHINE, subkey).into_shell(&format!("HKLM\\{subkey}"))
     }
 
     /// The service key of sshd.
@@ -408,8 +493,9 @@ mod win {
         )
     }
     #[cfg(test)]
-    pub fn read_sshd_shell_hkcu(subkey: &str) -> anyhow::Result<SshdShell> {
+    pub fn read_sshd_shell_hkcu(subkey: &str) -> Result<SshdShell, UnreadShell> {
         read_sshd_shell_in(windows::Win32::System::Registry::HKEY_CURRENT_USER, subkey)
+            .into_shell(&format!("HKCU\\{subkey}"))
     }
     #[cfg(test)]
     pub fn remove_shell_arguments_hkcu(subkey: &str) -> anyhow::Result<()> {

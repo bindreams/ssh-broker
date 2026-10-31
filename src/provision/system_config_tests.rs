@@ -191,11 +191,27 @@ fn decide_table() {
         r"D:\other\SSH-Broker.EXE",
         "c:/x/ssh-broker.exe",
         "ssh-broker.exe",
+        // sshd runs these as ssh-broker.exe: `CreateProcess` appends `.exe` to a name with no extension.
+        r"C:\ProgramData\ssh-broker\ssh-broker",
+        "c:/x/SSH-Broker",
+        "ssh-broker",
     ] {
         assert_eq!(
             decide(&sshd(own), Ok(false), &dirs, &exists, &not_system),
             Decision::Skip(Skip::PreviousIsSshBroker),
             "{own}"
+        );
+    }
+    // A name with another extension is another file.
+    for other in [
+        r"C:\x\ssh-broker.cmd",
+        r"C:\x\ssh-broker.bak",
+        r"C:\x\ssh-broker.exe.bak",
+    ] {
+        assert_ne!(
+            decide(&sshd(other), Ok(false), &dirs, &exists, &not_system),
+            Decision::Skip(Skip::PreviousIsSshBroker),
+            "{other}"
         );
     }
 

@@ -7,7 +7,7 @@
 
 use std::path::Path;
 
-use super::registry::SshdShell;
+use super::registry::{SshdShell, UnreadShell};
 use super::system_config::{self, Decision};
 use crate::shell::config::ShellBlock;
 
@@ -51,12 +51,18 @@ impl Handover {
     }
 }
 
-/// The hand-over for a previous shell whose values could not be read: the cause is all there is to print.
-pub fn hand_over_unreadable(cause: &anyhow::Error, say: &mut dyn FnMut(Stream, &str)) -> Handover {
-    Handover::printed(
-        say,
-        &format!("apply: could not read the shell sshd uses now, so it is not carried into config.yaml: {cause:#}"),
-    )
+/// Replace the shell sshd uses: read it with `read`, `carry` its values (or print them), and only
+/// then `flip`, which takes the [`Handover`] that `carry` returned. A shell that could not be read in
+/// full is an error and `carry` and `flip` are not called: what cannot be read can be neither carried
+/// nor printed, so the shell is left as it is.
+pub fn replace_shell<T>(
+    read: impl FnOnce() -> Result<SshdShell, UnreadShell>,
+    carry: impl FnOnce(&SshdShell) -> Handover,
+    flip: impl FnOnce(&Handover) -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    let previous = read()?;
+    let handover = carry(&previous);
+    flip(&handover)
 }
 
 /// Act on `decision` for `previous`: write the config with `create` (which says whether it created the

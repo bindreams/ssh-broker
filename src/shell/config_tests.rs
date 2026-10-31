@@ -1,6 +1,6 @@
 //! Host tests for the `config.yaml` schema (pure; runs on any platform).
 
-use super::{Notes, ShellBlock, comment_text, parse, render_annotated, render_file};
+use super::{Notes, ShellBlock, StartKind, comment_text, parse, parse_spelled, render_annotated, render_file};
 use crate::shell::Escaping;
 
 fn block(text: &str) -> ShellBlock {
@@ -23,6 +23,20 @@ fn all_three_shorthands_parse_to_the_same_block() {
     assert_eq!(block("shell: {start: pwsh.exe}"), want);
     assert_eq!(block("shell: {start: [pwsh.exe]}"), want);
     assert_eq!(block("shell:\n  start:\n    - pwsh.exe\n"), want);
+}
+
+#[test]
+fn the_spelling_of_the_setting_is_kept_apart_from_the_block() {
+    for (text, kind, setting) in [
+        ("shell: pwsh.exe", StartKind::Scalar, "shell"),
+        ("shell: {start: pwsh.exe}", StartKind::Mapping, "shell.start"),
+        ("shell: {start: [pwsh.exe]}", StartKind::Mapping, "shell.start"),
+        ("shell:\n  start: pwsh.exe\n", StartKind::Mapping, "shell.start"),
+    ] {
+        let (block, got) = parse_spelled(text.as_bytes()).unwrap().unwrap();
+        assert_eq!(block, start("pwsh.exe"), "{text:?}");
+        assert_eq!((got, got.setting()), (kind, setting), "{text:?}");
+    }
 }
 
 #[test]

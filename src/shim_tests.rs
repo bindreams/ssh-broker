@@ -897,7 +897,7 @@ fn fail_open_warns_when_the_configured_shell_ends_with_dll_not_found_and_only_th
         assert_eq!(code, DLL_NOT_FOUND, "{exec:?}");
         assert!(
             stderr.contains(USER_CONFIG)
-                && stderr.contains("`shell.start`")
+                && stderr.contains("`shell`")
                 && stderr.contains("pwsh.exe")
                 && stderr.contains("STATUS_DLL_NOT_FOUND"),
             "{exec:?}: {stderr:?}"
