@@ -782,17 +782,27 @@ fn handle_pty(
 ) -> anyhow::Result<()> {
     let Env { hooks, control } = env;
     // The warning for a shell that could not be used is printed by `console-fallback` inside the
-    // pseudoconsole, which clears the screen after anything written ahead of it. Without a path
-    // to this program it goes out here, before the output threads exist.
+    // pseudoconsole, which clears the screen after anything written ahead of it. Without this
+    // program's path or the private folder it goes out here, before the output threads exist.
     let broker = std::env::current_exe()
         .inspect_err(|e| {
             tracing::warn!("cannot find this program, so a shell warning goes out ahead of the terminal: {e}")
         })
         .ok();
+    let private_dir = crate::userdir::current_socket_location()
+        .inspect_err(|e| {
+            tracing::warn!("cannot find the private folder, so a shell warning goes out ahead of the terminal: {e:#}")
+        })
+        .ok()
+        .map(|location| location.dir);
+    let console = match (&broker, &private_dir) {
+        (Some(exe), Some(dir)) => Some(launch::Console { exe, dir }),
+        _ => None,
+    };
     let started = launch::start(
         &*hooks.shell_host,
         launched,
-        broker.as_deref(),
+        console,
         |command| (hooks.start_pty)(command, cols, rows, cwd),
         |text| show_notice(&mut tx, Mode::Pty, text),
     );

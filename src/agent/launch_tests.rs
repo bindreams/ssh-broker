@@ -2,10 +2,12 @@
 
 use std::path::{Path, PathBuf};
 
-use super::{Launched, console_fallback_line, launch_line, notice_frame, start};
+use super::{Console, Launched, launch_line, notice_frame, start};
 use crate::cmdline::split_args;
+use crate::fallback_file::{fallback_file_tests::Folder, take};
 use crate::protocol::{Handshake, Launch, Mode, Stream};
 use crate::route::{Route, route};
+use crate::shell::pack::MAX_LINE_UNITS;
 use crate::shell::test_host::{SYSTEM_CMD, TestHost, USER_CONFIG};
 
 const PWSH: &str = r"C:\Program Files\PowerShell\7\pwsh.exe";
@@ -222,7 +224,7 @@ const BROKER: &str = r"C:\Program Files\ssh-broker\ssh-broker.exe";
 fn started(
     host: &TestHost,
     launched: &Launched<'_>,
-    console: Option<&Path>,
+    console: Option<Console<'_>>,
     fails: impl Fn(&str) -> bool,
 ) -> (Vec<String>, Vec<String>) {
     let (mut tried, mut warned) = (Vec::new(), Vec::new());
@@ -242,29 +244,38 @@ fn started(
     (tried, warned)
 }
 
-/// What the hidden verb is handed by the line that starts it: the notice, and the line it starts.
-fn handed_over(wrapper: &str) -> (String, String) {
+fn console(folder: &Folder) -> Option<Console<'_>> {
+    Some(Console {
+        exe: Path::new(BROKER),
+        dir: &folder.0,
+    })
+}
+
+/// What the hidden verb is handed by the line that starts it, read the way the verb reads it: the
+/// notice, and the line it starts. The file is the verb's to remove.
+fn handed_over(wrapper: &str, folder: &Folder) -> (String, String) {
     let args = split_args(wrapper);
     assert_eq!(args[0], BROKER, "{wrapper}");
     match route(&args[1..], wrapper) {
-        Route::ConsoleFallback { notice, line } => (notice, line),
+        Route::ConsoleFallback { file } => take(Path::new(&file), &folder.0, |_| Ok(true)).unwrap(),
         other => panic!("{wrapper:?} routes to {other:?}"),
     }
 }
 
 /// A pseudoconsole clears the screen after anything written to it ahead of the shell, so the
 /// warning of a terminal session is printed from inside it: the line that starts is the hidden
-/// verb, given the notice and the fallback shell's line.
+/// verb, given a file with the notice and the fallback shell's line.
 #[test]
 fn a_terminal_session_with_a_broken_config_starts_the_verb_that_prints_the_warning() {
+    let folder = Folder::new("verb");
     let host = TestHost::new().with_user_config("shell: {strt: pwsh.exe}\n");
     for command in [Some("echo hi"), None] {
         let hs = handshake(Mode::Pty, command, Launch::Shell);
         let first = launched(&hs, &host);
-        let (tried, warned) = started(&host, &first, Some(Path::new(BROKER)), |_| false);
+        let (tried, warned) = started(&host, &first, console(&folder), |_| false);
         assert_eq!(warned, Vec::<String>::new(), "{command:?}");
         assert_eq!(tried.len(), 1, "{command:?}: {tried:?}");
-        let (notice, line) = handed_over(&tried[0]);
+        let (notice, line) = handed_over(&tried[0], &folder);
         assert_eq!(Some(notice), first.notice, "{command:?}");
         assert_eq!(line, first.line, "{command:?}");
     }
@@ -272,14 +283,15 @@ fn a_terminal_session_with_a_broken_config_starts_the_verb_that_prints_the_warni
 
 #[test]
 fn a_shell_that_cannot_start_in_a_terminal_session_is_replaced_by_the_verb() {
+    let folder = Folder::new("replaced");
     let host = pwsh_host();
     let hs = handshake(Mode::Pty, Some("echo hi"), Launch::Shell);
     let first = launched(&hs, &host);
-    let (tried, warned) = started(&host, &first, Some(Path::new(BROKER)), |line| line.contains("pwsh.exe"));
+    let (tried, warned) = started(&host, &first, console(&folder), |line| line.contains("pwsh.exe"));
     assert_eq!(tried.len(), 2, "{tried:?}");
     assert_eq!(tried[0], first.line, "the configured shell is tried as it is");
     assert!(warned.is_empty(), "{warned:?}");
-    let (notice, line) = handed_over(&tried[1]);
+    let (notice, line) = handed_over(&tried[1], &folder);
     assert!(
         notice.contains("pwsh.exe") && notice.contains(USER_CONFIG) && notice.contains("os error 193"),
         "{notice}"
@@ -290,6 +302,7 @@ fn a_shell_that_cannot_start_in_a_terminal_session_is_replaced_by_the_verb() {
 /// Whatever the notice and the line hold, the verb is handed exactly them.
 #[test]
 fn the_verb_is_handed_the_notice_and_the_line_exactly() {
+    let folder = Folder::new("exact");
     for text in [
         r#"echo "a  b" \"#,
         "echo a\r\nb",
@@ -300,14 +313,74 @@ fn the_verb_is_handed_the_notice_and_the_line_exactly() {
         let host = TestHost::new().with_user_config("shell: {strt: pwsh.exe}\n");
         let hs = handshake(Mode::Pty, Some(text), Launch::Shell);
         let first = launched(&hs, &host);
-        let (tried, _) = started(&host, &first, Some(Path::new(BROKER)), |_| false);
-        let (notice, line) = handed_over(&tried[0]);
+        let (tried, _) = started(&host, &first, console(&folder), |_| false);
+        let (notice, line) = handed_over(&tried[0], &folder);
         assert_eq!(
             (Some(notice), line),
             (first.notice.clone(), first.line.clone()),
             "{text:?}"
         );
     }
+}
+
+/// The verb's line is the same short one however long the fallback shell's line is, so the warning
+/// of a session whose shell line is at the limit is printed in the pseudoconsole like any other.
+#[test]
+fn a_fallback_line_at_the_command_line_limit_still_gets_the_verb() {
+    let folder = Folder::new("limit");
+    let host = TestHost::new().with_user_config("shell: {strt: pwsh.exe}\n");
+    // The longest command whose own line still fits: the line is the shell's name, `/c` and the command.
+    let base = {
+        let probe = handshake(Mode::Pty, Some(""), Launch::Shell);
+        launched(&probe, &host).line.encode_utf16().count()
+    };
+    let command = "x".repeat(MAX_LINE_UNITS - 1 - base);
+    let hs = handshake(Mode::Pty, Some(&command), Launch::Shell);
+    let first = launched(&hs, &host);
+    assert_eq!(first.line.encode_utf16().count(), MAX_LINE_UNITS - 1);
+    let (tried, warned) = started(&host, &first, console(&folder), |_| false);
+    assert_eq!(warned, Vec::<String>::new());
+    assert_eq!(tried.len(), 1, "{tried:?}");
+    assert!(tried[0].encode_utf16().count() < 1000, "{} units", tried[0].len());
+    let (notice, line) = handed_over(&tried[0], &folder);
+    assert_eq!((Some(notice), line), (first.notice.clone(), first.line.clone()));
+}
+
+/// A verb that did not start leaves no file behind.
+#[test]
+fn the_file_is_removed_when_the_verb_cannot_start() {
+    let folder = Folder::new("spawn-fails");
+    let host = TestHost::new().with_user_config("shell: {strt: pwsh.exe}\n");
+    let hs = handshake(Mode::Pty, Some("echo hi"), Launch::Shell);
+    let first = launched(&hs, &host);
+    let (tried, _) = started(&host, &first, console(&folder), |_| true);
+    assert_eq!(tried.len(), 1, "{tried:?}");
+    assert_eq!(folder.entries(), Vec::<String>::new());
+}
+
+/// A verb that started owns its file: the verb removes it after reading.
+#[test]
+fn the_file_of_a_verb_that_started_is_left_for_it() {
+    let folder = Folder::new("spawn-ok");
+    let host = TestHost::new().with_user_config("shell: {strt: pwsh.exe}\n");
+    let hs = handshake(Mode::Pty, Some("echo hi"), Launch::Shell);
+    let first = launched(&hs, &host);
+    started(&host, &first, console(&folder), |_| false);
+    assert_eq!(folder.entries().len(), 1);
+}
+
+/// A folder the file cannot be made in does not cost the session: the warning goes ahead of the
+/// shell as it does without a pseudoconsole.
+#[test]
+fn a_file_that_cannot_be_made_has_the_warning_shown_before_the_shell() {
+    let folder = Folder::new("no-folder");
+    let missing = Folder(folder.0.join("missing"));
+    let host = TestHost::new().with_user_config("shell: {strt: pwsh.exe}\n");
+    let hs = handshake(Mode::Pty, Some("echo hi"), Launch::Shell);
+    let first = launched(&hs, &host);
+    let (tried, warned) = started(&host, &first, console(&missing), |_| false);
+    assert_eq!(tried, std::slice::from_ref(&first.line));
+    assert_eq!(warned, [first.notice.clone().unwrap()]);
 }
 
 /// Without a pseudoconsole to print on, the caller shows the warning before the shell starts.
@@ -332,42 +405,45 @@ fn a_shell_that_cannot_start_in_a_session_without_a_pseudoconsole_is_warned_abou
     assert!(warned[0].contains("os error 193"), "{warned:?}");
 }
 
-/// The verb's line has to fit in a command line too. When it does not, the shell starts as it is
-/// and the caller shows the warning.
-#[test]
-fn a_line_the_verb_cannot_carry_starts_the_shell_and_shows_the_warning() {
-    let host = TestHost::new().with_user_config("shell: {strt: pwsh.exe}\n");
-    // The shell's own line fits; the verb's holds that line and the notice besides.
-    let nearly_all = "x".repeat(32_600);
-    let hs = handshake(Mode::Pty, Some(&nearly_all), Launch::Shell);
-    let first = launched(&hs, &host);
-    let (tried, warned) = started(&host, &first, Some(Path::new(BROKER)), |_| false);
-    assert_eq!(tried, std::slice::from_ref(&first.line));
-    assert_eq!(warned, [first.notice.clone().unwrap()]);
-}
-
-/// A NUL ends a command line, so text that holds one cannot be carried.
-#[test]
-fn text_with_a_nul_cannot_be_carried_by_the_verb() {
-    let exe = Path::new(BROKER);
-    assert!(console_fallback_line(exe, "a notice", "cmd.exe /c x").is_some());
-    assert_eq!(console_fallback_line(exe, "a\0notice", "cmd.exe"), None);
-    assert_eq!(console_fallback_line(exe, "a notice", "cmd.exe /c a\0b"), None);
-}
-
 #[test]
 fn a_terminal_session_with_a_working_shell_starts_it_as_it_is() {
+    let folder = Folder::new("working");
     let host = pwsh_host();
     let hs = handshake(Mode::Pty, Some("echo hi"), Launch::Shell);
     let first = launched(&hs, &host);
-    let (tried, warned) = started(&host, &first, Some(Path::new(BROKER)), |_| false);
+    let (tried, warned) = started(&host, &first, console(&folder), |_| false);
     assert_eq!((tried, warned), (vec![first.line.clone()], Vec::new()));
+    assert_eq!(folder.entries(), Vec::<String>::new());
 }
 
 #[test]
 fn a_direct_launch_is_not_wrapped() {
+    let folder = Folder::new("direct");
     let hs = handshake(Mode::Pty, Some(r"C:\ssh-broker.exe verify-probe"), Launch::Direct);
     let first = launched(&hs, &pwsh_host());
-    let (tried, warned) = started(&pwsh_host(), &first, Some(Path::new(BROKER)), |_| false);
+    let (tried, warned) = started(&pwsh_host(), &first, console(&folder), |_| false);
     assert_eq!((tried, warned), (vec![first.line.clone()], Vec::new()));
+}
+
+/// A program path so long that the verb's own line does not fit: the warning goes ahead of the shell, and
+/// the file made for the verb is removed.
+#[test]
+fn a_verb_line_that_does_not_fit_has_the_warning_shown_before_the_shell() {
+    let folder = Folder::new("exe-long");
+    let exe = PathBuf::from(format!(r"C:\{}\ssh-broker.exe", "d".repeat(MAX_LINE_UNITS)));
+    let host = TestHost::new().with_user_config("shell: {strt: pwsh.exe}\n");
+    let hs = handshake(Mode::Pty, Some("echo hi"), Launch::Shell);
+    let first = launched(&hs, &host);
+    let (tried, warned) = started(
+        &host,
+        &first,
+        Some(Console {
+            exe: &exe,
+            dir: &folder.0,
+        }),
+        |_| false,
+    );
+    assert_eq!(tried, std::slice::from_ref(&first.line));
+    assert_eq!(warned, [first.notice.clone().unwrap()]);
+    assert_eq!(folder.entries(), Vec::<String>::new());
 }

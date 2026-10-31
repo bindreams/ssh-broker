@@ -436,25 +436,41 @@ fn run_local_passthrough(command_line: &str) -> anyhow::Result<i32> {
     }
 }
 
-/// `console-fallback`: the notice on this console, then `command_line` on it, in a job like every
-/// local child ([`spawn_contained`]). Returns the exit code of the line, or 255, this crate's code
-/// for a broker-side failure, when it cannot be started.
+/// `console-fallback`: the notice and the line `file` holds (see [`crate::fallback_file`]), the
+/// notice printed on this console, then the line started on it, in a job like every local child
+/// ([`spawn_contained`]). Returns the exit code of the line, or 255, this crate's code for a
+/// broker-side failure, when the file cannot be used or the line cannot be started.
 ///
 /// The agent starts this verb as the fallback shell of a terminal session instead of the shell, so
 /// that the notice is written inside the pseudoconsole, after the clear that opens it. The verb
 /// stays in the agent's job, so the shell is a descendant of the agent that dies with the session.
-pub fn console_fallback(notice: &str, command_line: &str) -> i32 {
+pub fn console_fallback(file: &std::path::Path) -> i32 {
     use std::io::Write;
+    let (notice, command_line) = match read_fallback_file(file) {
+        Ok(read) => read,
+        Err(error) => {
+            eprintln!("ssh-broker: could not read the fallback shell from its file: {error:#}");
+            return 255;
+        }
+    };
     let mut out = std::io::stdout();
     let notice_line = format!("{notice}\r\n");
     let _ = out.write_all(notice_line.as_bytes()).and_then(|()| out.flush());
-    match run_local_passthrough(command_line) {
+    match run_local_passthrough(&command_line) {
         Ok(code) => code,
         Err(error) => {
             eprintln!("ssh-broker: could not start the shell: {error:#}");
             255
         }
     }
+}
+
+/// The notice and the line in `file`, which must be in this account's private folder (from the
+/// token) and private to it. The file is removed.
+fn read_fallback_file(file: &std::path::Path) -> anyhow::Result<(String, String)> {
+    let dir = crate::userdir::current_socket_location()?.dir;
+    let user = crate::acl::Sid::current_user()?;
+    crate::fallback_file::take(file, &dir, |f| crate::acl::verify_file_acl(f, &user))
 }
 
 /// Spawn `command` suspended and contain it in a job object before it runs a single instruction.

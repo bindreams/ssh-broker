@@ -282,32 +282,74 @@ fn run_session_without_command(home: &Home) {
 
 // The fallback shell of a terminal session through the agent =====
 
-/// `console-fallback` writes its notice, runs its line on the same standard handles and exits with the
-/// line's code.
+/// A file for the verb in this account's private folder, which the test makes if it is missing: what the
+/// agent makes. Handed over, so that the verb alone removes it.
+fn fallback_file(notice: &str, line: &str) -> PathBuf {
+    let location = ssh_broker::userdir::current_socket_location().expect("the socket location");
+    let user = ssh_broker::acl::Sid::current_user().expect("the current user");
+    ssh_broker::userdir::ensure_socket_dir(&location, &user).expect("the private folder");
+    let staged = ssh_broker::fallback_file::stage(&location.dir, notice, line).expect("stage the fallback file");
+    let path = staged.path().to_owned();
+    staged.hand_over();
+    path
+}
+
+/// `console-fallback` reads its file, writes the notice, runs the line on the same standard handles, exits
+/// with the line's code and leaves no file.
 #[test]
 fn console_fallback_prints_the_notice_then_runs_the_line_and_exits_with_its_code() {
+    let file = fallback_file("the notice", r#"cmd.exe /c "echo from-shell& exit /b 7""#);
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_ssh-broker"))
-        .args([
-            "console-fallback",
-            "the notice",
-            r#"cmd.exe /c "echo from-shell& exit /b 7""#,
-        ])
+        .arg("console-fallback")
+        .arg(&file)
         .output()
         .expect("run console-fallback");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.starts_with("the notice\r\n"), "{stdout:?}");
     assert!(stdout.contains("from-shell"), "{stdout:?}");
     assert_eq!(out.status.code(), Some(7), "{stdout:?}");
+    assert!(!file.exists(), "{} was left behind", file.display());
 }
 
 /// A line that cannot start is the broker's failure (255), told on stderr, and not the notice's.
 #[test]
 fn console_fallback_with_a_line_that_cannot_start_exits_255() {
+    let file = fallback_file("the notice", r"C:\no\such\shell.exe");
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_ssh-broker"))
-        .args(["console-fallback", "the notice", r"C:\no\such\shell.exe"])
+        .arg("console-fallback")
+        .arg(&file)
         .output()
         .expect("run console-fallback");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(255), "{stderr:?}");
     assert!(stderr.contains("could not start the shell"), "{stderr:?}");
+}
+
+/// The verb starts the line its file holds, so a file that is not in the account's private folder is
+/// refused: the line is not run, and the file is not the verb's to remove.
+#[test]
+fn console_fallback_refuses_a_file_outside_the_private_folder() {
+    let ran = std::env::temp_dir().join(format!("console-fallback-ran-{}", std::process::id()));
+    let _ = std::fs::remove_file(&ran);
+    let outside = std::env::temp_dir().join(format!("console-fallback-outside-{}", std::process::id()));
+    std::fs::create_dir_all(&outside).unwrap();
+    let staged = ssh_broker::fallback_file::stage(
+        &outside,
+        "the notice",
+        &format!(r#"cmd.exe /c "echo x> {}""#, ran.display()),
+    )
+    .expect("stage the fallback file");
+    let file = staged.path().to_owned();
+    staged.hand_over();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_ssh-broker"))
+        .arg("console-fallback")
+        .arg(&file)
+        .output()
+        .expect("run console-fallback");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(255), "{stderr:?}");
+    assert!(stderr.contains("private folder"), "{stderr:?}");
+    assert!(!ran.exists(), "the line of a file outside the private folder ran");
+    assert!(file.exists(), "a file that is not ours was removed");
+    let _ = std::fs::remove_dir_all(&outside);
 }

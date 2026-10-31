@@ -22,16 +22,17 @@ pub fn run(exec: Option<RawExec>) -> anyhow::Result<()> {
     }
 }
 
-/// `console-fallback`: print `notice` on this console, start `line` on it and exit with its code.
-/// The agent starts this in place of a fallback shell in a pseudoconsole, because anything it writes
-/// to one ahead of the shell is cleared (see `agent::launch`).
-pub fn run_console_fallback(notice: &str, line: &str) -> anyhow::Result<()> {
+/// `console-fallback`: read the notice and the line from `file`, print the notice on this console,
+/// start the line on it and exit with its code. The agent starts this in place of a fallback shell
+/// in a pseudoconsole, because anything it writes to one ahead of the shell is cleared (see
+/// `agent::launch`).
+pub fn run_console_fallback(file: &str) -> anyhow::Result<()> {
     #[cfg(windows)]
-    std::process::exit(crate::shim_pty::console_fallback(notice, line));
+    std::process::exit(crate::shim_pty::console_fallback(std::path::Path::new(file)));
 
     #[cfg(not(windows))]
     {
-        let _ = (notice, line);
+        let _ = file;
         anyhow::bail!("console-fallback starts a shell for the agent and runs only on Windows")
     }
 }

@@ -28,11 +28,11 @@ pub enum Route {
     Verify,
     /// Hidden: the parity-probe child the agent spawns in session 1 (used by `verify`).
     VerifyProbe,
-    /// Hidden: the fallback shell of a terminal session through the agent. It prints `notice` on its
-    /// console, starts `line` on that console and exits with the code of `line`.
+    /// Hidden: the fallback shell of a terminal session through the agent. `file` holds a notice and
+    /// a line (see `fallback_file`); the verb prints the notice on its console, starts the line on
+    /// that console and exits with the code of the line.
     ConsoleFallback {
-        notice: String,
-        line: String,
+        file: String,
     },
 }
 
@@ -88,10 +88,7 @@ pub fn route(args: &[String], command_line: &str) -> Route {
         Some("verify") => Route::Verify,
         Some("verify-probe") => Route::VerifyProbe,
         Some("console-fallback") => match &args[1..] {
-            [notice, line] => Route::ConsoleFallback {
-                notice: notice.clone(),
-                line: line.clone(),
-            },
+            [file] => Route::ConsoleFallback { file: file.clone() },
             _ => Route::Usage(Verb::ConsoleFallback),
         },
         Some("-c") => {

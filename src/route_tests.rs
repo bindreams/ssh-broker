@@ -172,24 +172,19 @@ fn apply_and_verify_verbs() {
     assert_eq!(route_line("ssh-broker.exe verify-probe"), Route::VerifyProbe);
 }
 
-/// The hidden verb of a terminal session's fallback shell takes exactly a notice and a line; any
+/// The hidden verb of a terminal session's fallback shell takes exactly the path of its file; any
 /// other shape is a usage error, never the shim.
 #[test]
-fn console_fallback_takes_a_notice_and_a_line() {
+fn console_fallback_takes_the_path_of_its_file() {
     assert_eq!(
-        route(
-            &["console-fallback".into(), "a notice".into(), "cmd.exe /k".into()],
-            "ignored"
-        ),
+        route(&["console-fallback".into(), "C:/a b/file".into()], "ignored"),
         Route::ConsoleFallback {
-            notice: "a notice".into(),
-            line: "cmd.exe /k".into()
+            file: "C:/a b/file".into()
         }
     );
     for args in [
         vec!["console-fallback"],
-        vec!["console-fallback", "a notice"],
-        vec!["console-fallback", "a notice", "cmd.exe", "extra"],
+        vec!["console-fallback", "a notice", "cmd.exe"],
     ] {
         let args: Vec<String> = args.into_iter().map(str::to_owned).collect();
         assert_eq!(route(&args, "ignored"), Route::Usage(Verb::ConsoleFallback), "{args:?}");

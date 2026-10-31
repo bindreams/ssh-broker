@@ -636,3 +636,78 @@ fn the_warning_survives_on_the_screen_of_a_terminal_session_through_the_agent() 
     let _ = shown.finish();
     session.leave();
 }
+
+/// The warning is on the screen once. The terminal shows what was written after ConPTY's opening clear, so a
+/// warning that went out twice (once ahead of the shell and once from inside the pseudoconsole) would show twice
+/// if the second were not cleared, and a verb that prints it twice would show twice always.
+#[test]
+fn the_warning_is_on_the_screen_once_in_a_terminal_session_through_the_agent() {
+    let _machine = machine::exclusive();
+    let rig = Rig::new("shd12");
+    let login = rig.login();
+    rig.broker_is_default_shell();
+    let session = rig.start_session(&login);
+    rig.account.write_user_config("shell: {strt: pwsh.exe}\n");
+
+    let relayed = rig.ssh(&login, true, "echo built-in-ok");
+    let screen = sshd_rig::screen_text(&relayed.stdout);
+    eprintln!("the screen of a command with a terminal:\n{screen}");
+    assert_eq!(
+        screen.matches("cannot use the shell from").count(),
+        1,
+        "a command with a terminal:\n{screen}\nraw: {:?}",
+        text(&relayed)
+    );
+
+    let mut shown = login.start();
+    shown.read_until("using the built-in cmd.exe");
+    shown.read_until("Microsoft Windows");
+    shown.type_line("echo logged-in-ok");
+    shown.read_until("logged-in-ok");
+    let screen = sshd_rig::screen_text(&shown.transcript);
+    eprintln!("the screen of a login:\n{screen}");
+    assert_eq!(
+        screen.matches("cannot use the shell from").count(),
+        1,
+        "a login:\n{screen}\nraw: {:?}",
+        shown.text()
+    );
+    shown.type_line("exit");
+    let _ = shown.finish();
+    session.leave();
+}
+
+/// The line of the fallback shell near the 32,767 units a command line takes. The verb gets the warning and
+/// the line through a file in the private folder, so the warning is printed in the pseudoconsole however long the
+/// line is, and the file is gone when the session ends.
+#[test]
+fn the_warning_is_on_the_screen_when_the_fallback_line_is_near_the_command_line_limit() {
+    let _machine = machine::exclusive();
+    let rig = Rig::new("shd13");
+    let login = rig.login();
+    rig.broker_is_default_shell();
+    let session = rig.start_session(&login);
+    rig.account.write_user_config("shell: {strt: pwsh.exe}\n");
+    let location = socket_loc::for_profile(rig.account.profile()).unwrap();
+
+    // `<system directory>\cmd.exe /c ` is under 60 units and the warning and the verb's own name are over 300,
+    // so the line fits and the verb's line would not if it carried the line.
+    let command = "x".repeat(32_700);
+    let mut conn = agent_conn::AgentConn::connect(&location);
+    conn.start_shell_pty(Some(&command));
+    let finished = conn.read_to_end();
+    let screen = sshd_rig::screen_text(finished.pty.as_bytes());
+    eprintln!("the screen of the session:\n{screen}");
+    assert!(
+        screen.contains("cannot use the shell from") && screen.contains("config.yaml"),
+        "the warning is not on the screen:\n{screen}\nraw: {:?}",
+        finished.pty
+    );
+    let left: Vec<_> = std::fs::read_dir(&location.dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with("console-fallback-"))
+        .collect();
+    assert!(left.is_empty(), "the verb left its file behind: {left:?}");
+    session.leave();
+}
