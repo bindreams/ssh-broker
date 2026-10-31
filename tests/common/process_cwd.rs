@@ -7,7 +7,7 @@ use std::path::PathBuf;
 
 use ssh_broker::winutil::OwnedHandle;
 use windows::Wdk::System::Threading::{NtQueryInformationProcess, ProcessBasicInformation};
-use windows::Win32::Foundation::{ERROR_SUCCESS, GetLastError, HANDLE, LUID, UNICODE_STRING};
+use windows::Win32::Foundation::{ERROR_INVALID_PARAMETER, ERROR_SUCCESS, GetLastError, HANDLE, LUID, UNICODE_STRING};
 use windows::Win32::Security::{
     AdjustTokenPrivileges, LUID_AND_ATTRIBUTES, LookupPrivilegeValueW, SE_DEBUG_NAME, SE_PRIVILEGE_ENABLED,
     TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY,
@@ -63,14 +63,21 @@ fn read<T: Default>(process: HANDLE, address: *const c_void) -> Result<T, String
     Ok(value)
 }
 
-/// The current directory of process `pid`: the `CurrentDirectory.DosPath` of its process parameters.
-/// Needs [`enable_debug_privilege`] for a service.
-pub fn current_directory(pid: u32) -> Result<PathBuf, String> {
+/// Open process `pid` to read its owner and its current directory: `None` when there is no such process
+/// (it ended since it was listed). Holding the handle keeps the id from being reused. Needs
+/// [`enable_debug_privilege`] for a service.
+pub fn open(pid: u32) -> Result<Option<OwnedHandle>, String> {
     // SAFETY: a plain open by id; the handle is closed by `OwnedHandle`.
-    let process = OwnedHandle(
-        unsafe { OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, false, pid) }
-            .map_err(|e| format!("OpenProcess({pid}): {e}"))?,
-    );
+    match unsafe { OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, false, pid) } {
+        Ok(handle) => Ok(Some(OwnedHandle(handle))),
+        Err(e) if e.code() == ERROR_INVALID_PARAMETER.to_hresult() => Ok(None),
+        Err(e) => Err(format!("OpenProcess({pid}): {e}")),
+    }
+}
+
+/// The current directory of `process` (from [`open`]): the `CurrentDirectory.DosPath` of its process
+/// parameters.
+pub fn current_directory(process: &OwnedHandle) -> Result<PathBuf, String> {
     let mut info = PROCESS_BASIC_INFORMATION::default();
     // SAFETY: `info` is a valid out buffer of the size passed; `process` has query access.
     unsafe {
@@ -83,7 +90,7 @@ pub fn current_directory(pid: u32) -> Result<PathBuf, String> {
         )
     }
     .ok()
-    .map_err(|e| format!("NtQueryInformationProcess({pid}): {e}"))?;
+    .map_err(|e| format!("NtQueryInformationProcess: {e}"))?;
     let peb: PEB = read(process.0, info.PebBaseAddress as *const c_void)?;
     // `RTL_USER_PROCESS_PARAMETERS.CurrentDirectory.DosPath` follows the two lengths, the flags, the
     // console handle and flags and the three standard handles: at 0x38 in a 64-bit process, 0x24 in a 32-bit one.
@@ -103,6 +110,6 @@ pub fn current_directory(pid: u32) -> Result<PathBuf, String> {
             None,
         )
     }
-    .map_err(|e| format!("ReadProcessMemory of the path of process {pid}: {e}"))?;
+    .map_err(|e| format!("ReadProcessMemory of the path: {e}"))?;
     Ok(PathBuf::from(String::from_utf16_lossy(&units)))
 }

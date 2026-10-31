@@ -111,23 +111,26 @@ fn a_failed_create_is_the_programs_unless_the_working_directory_is_not_one() {
     );
 }
 
-/// The shell is blamed for every failure of `CreateProcessW` except the ones that are not about the
-/// program: a machine out of memory, handles, quota or commit, and a handle or parameter the caller
-/// got wrong. The built-in would meet those too; for any other code (the image, antivirus, a code
-/// policy, an unreadable disk or share, a code nobody listed) the built-in is the only safe
+/// The shell is blamed for every failure of `CreateProcessW` except a machine out of memory, handles,
+/// processes, quota or commit: the built-in would meet that too. For any other code (the image,
+/// antivirus, a code policy, an unreadable disk or share, a bad handle, parameter or buffer that some
+/// image-specific condition can also produce, a code nobody listed) the built-in is the only safe
 /// answer, and a wrong "program" costs a warning while a wrong "other" locks the user out.
 #[test]
-fn a_failed_create_blames_the_program_unless_the_machine_or_the_call_is_at_fault() {
+fn a_failed_create_blames_the_program_unless_the_machine_is_out_of_a_resource() {
     let program = [
         1,    // ERROR_INVALID_FUNCTION (unlisted)
         2,    // ERROR_FILE_NOT_FOUND
         3,    // ERROR_PATH_NOT_FOUND
         5,    // ERROR_ACCESS_DENIED
+        6,    // ERROR_INVALID_HANDLE
         11,   // ERROR_BAD_FORMAT
         21,   // ERROR_NOT_READY
         32,   // ERROR_SHARING_VIOLATION
         53,   // ERROR_BAD_NETPATH
         65,   // ERROR_NETWORK_ACCESS_DENIED
+        87,   // ERROR_INVALID_PARAMETER
+        122,  // ERROR_INSUFFICIENT_BUFFER
         123,  // ERROR_INVALID_NAME
         191,  // ERROR_INVALID_EXE_SIGNATURE
         192,  // ERROR_EXE_MARKED_INVALID
@@ -150,12 +153,9 @@ fn a_failed_create_blames_the_program_unless_the_machine_or_the_call_is_at_fault
     ];
     let other = [
         4,    // ERROR_TOO_MANY_OPEN_FILES
-        6,    // ERROR_INVALID_HANDLE
         8,    // ERROR_NOT_ENOUGH_MEMORY
         14,   // ERROR_OUTOFMEMORY
-        87,   // ERROR_INVALID_PARAMETER
         89,   // ERROR_NO_PROC_SLOTS
-        122,  // ERROR_INSUFFICIENT_BUFFER
         567,  // ERROR_PAGEFILE_QUOTA_EXCEEDED
         1130, // ERROR_NOT_ENOUGH_SERVER_MEMORY
         1450, // ERROR_NO_SYSTEM_RESOURCES

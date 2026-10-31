@@ -116,17 +116,33 @@ pub fn render_annotated(block: &ShellBlock, notes: &Notes<'_>) -> Result<String,
 
 /// `text` as one YAML comment line: every character the YAML reader rejects or ends a comment at (a
 /// C0 or C1 control, DEL, NEL, U+2028, U+2029, U+FFFE, U+FFFF) is written as its escape, so no text
-/// leaves the file unparseable. Every comment in a rendered config goes through this.
+/// leaves the file unparseable. A backslash that would read as the start of one of those escapes is
+/// doubled, so a newline and the text `\n` stay different; any other backslash is left, so a path reads
+/// as it is. Every comment in a rendered config goes through this.
 pub fn comment_text(text: &str) -> String {
-    text.chars()
-        .flat_map(|c| {
-            if c.is_control() || matches!(c, '\u{2028}' | '\u{2029}' | '\u{fffe}' | '\u{ffff}') {
-                c.escape_default().collect()
-            } else {
-                vec![c]
+    let is_escaped = |c: char| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}' | '\u{fffe}' | '\u{ffff}');
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    for (at, &c) in chars.iter().enumerate() {
+        if is_escaped(c) {
+            out.extend(c.escape_default());
+            continue;
+        }
+        if c == '\\' {
+            // What follows reads as an escape when written out: `\t`, `\r`, `\n`, `\u{..}`, or a doubled
+            // backslash, which is what this very rule writes.
+            let reads_as_escape = match &chars[at + 1..] {
+                ['u', '{', ..] => true,
+                [next, ..] => matches!(next, '\\' | 't' | 'r' | 'n') || is_escaped(*next),
+                [] => false,
+            };
+            if reads_as_escape {
+                out.push('\\');
             }
-        })
-        .collect()
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// One `key: value` of the block at `indent` columns. A list goes under its key, at the key's own

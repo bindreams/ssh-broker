@@ -245,13 +245,16 @@ mod imp {
         let host = crate::shell::WindowsHost;
         // The file the shell resolves to, found as sshd finds it (a bare name is searched in sshd's own
         // directory, the system and Windows directories, then on `PATH`), so the identity check below
-        // looks at that file and not at one of that name beside `apply`.
-        let image = registry::read_sshd_image_path().unwrap_or_else(|e| {
-            eprintln!("apply: cannot read where sshd runs from ({e:#}); a bare shell name is looked up without it");
-            None
-        });
-        let search = system_config::sshd_search_dirs(&host, image.as_deref())
-            .map_err(|e| format!("cannot find the system directory to look for the shell in: {e:#}"));
+        // looks at that file and not at one of that name beside `apply`. Looked up only when the
+        // decision needs it, so that what cannot be read is not reported when it does not matter.
+        let search = || {
+            let image = registry::read_sshd_image_path().unwrap_or_else(|e| {
+                eprintln!("apply: cannot read where sshd runs from ({e:#}); a bare shell name is looked up without it");
+                None
+            });
+            system_config::sshd_search_dirs(&host, image.as_deref())
+                .map_err(|e| format!("cannot find the system directory to look for the shell in: {e:#}"))
+        };
         let find =
             |dirs: &[PathBuf], path: &Path| crate::shell::resolve_program_in(&host, dirs, &path.to_string_lossy());
         let is_system_cmd = |found: &Path| {
@@ -265,13 +268,7 @@ mod imp {
                 false
             })
         };
-        let decision = system_config::decide(
-            &previous,
-            config_exists,
-            search.as_deref().map_err(Clone::clone),
-            &find,
-            &is_system_cmd,
-        );
+        let decision = system_config::decide(&previous, config_exists, &search, &find, &is_system_cmd);
         match decision {
             system_config::Decision::Write(block) => match system_config::create_once(base, &block) {
                 Ok(true) => {

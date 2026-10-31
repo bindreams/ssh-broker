@@ -117,17 +117,20 @@ pub enum Decision {
     Skip(Skip),
 }
 
+/// Finds the directories sshd searches for a bare shell name, or says why they are not known.
+pub type SearchDirs<'a> = dyn Fn() -> Result<Vec<PathBuf>, String> + 'a;
+
 /// Whether `apply` writes the config, and what. `config_exists` is whether the config is there, or
-/// why that is not known. `find` finds the file the previous shell names in `search_dirs` (or says
-/// why the directories are not known), as sshd finds it ([`sshd_search_dirs`]), or says why there is
-/// none; `is_system_cmd` says whether that file is the system `cmd.exe`. A bare name is carried as
+/// why that is not known. `search_dirs` is called only once the decision needs the directories, so
+/// a failure to find them is not reported when nothing depends on it. `find` finds the file the
+/// previous shell names in them, as sshd finds it ([`sshd_search_dirs`]), or says why there is none; `is_system_cmd` says whether that file is the system `cmd.exe`. A bare name is carried as
 /// the file found, because a session searches `PATH` alone and sshd searched more. Nothing that
 /// could not be found out is reported while it does not matter: with no previous shell, or ssh-broker's
 /// own, nothing is replaced, and a config that is there is never rewritten.
 pub fn decide(
     prev: &SshdShell,
     config_exists: Result<bool, String>,
-    search_dirs: Result<&[PathBuf], String>,
+    search_dirs: &SearchDirs,
     find: &Find,
     is_system_cmd: &dyn Fn(&Path) -> bool,
 ) -> Decision {
@@ -143,11 +146,11 @@ pub fn decide(
         Ok(true) => return Decision::Skip(Skip::FileExists),
         Ok(false) => {}
     }
-    let dirs = match search_dirs {
+    let dirs = match search_dirs() {
         Ok(dirs) => dirs,
         Err(cause) => return Decision::Skip(Skip::Unchecked(cause)),
     };
-    let found = match find(dirs, Path::new(shell)) {
+    let found = match find(&dirs, Path::new(shell)) {
         Ok(found) => found,
         Err(why) => return Decision::Skip(Skip::PreviousMissing(why)),
     };
@@ -178,8 +181,8 @@ fn previous_values(previous: &SshdShell) -> String {
 /// not carried.
 fn not_carried(config: &Path, previous: &SshdShell, reason: &str) -> String {
     format!(
-        "apply: {reason}, so the shell sshd used before is not carried into {config}; DefaultShell is replaced \
-         all the same. To restore it, put it in that config or under {values}",
+        "apply: {reason}, so this apply does not carry the shell sshd used before into {config}; DefaultShell is \
+         replaced all the same. To restore it, put it in that config or under {values}",
         config = config.display(),
         values = previous_values(previous),
     )

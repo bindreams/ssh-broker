@@ -732,10 +732,27 @@ fn the_warning_is_on_the_screen_when_the_fallback_line_is_near_the_command_line_
     session.leave();
 }
 
-/// The working directory of every `sshd.exe` with a session open, measured on the runner (CI run 41187603188
-/// read it as: the service and one more in `C:\`, the one running as the account in the account's profile).
-/// None is the system directory, so `provision::system_config::sshd_search_dirs` must not say a service runs
-/// there. Which of them looks up a bare `DefaultShell` is not measured here.
+/// The process id of the sshd service.
+fn sshd_service_pid() -> u32 {
+    let (ok, text) = sshd_rig::run("sc", &["queryex", "sshd"]);
+    assert!(ok, "sc queryex sshd failed:\n{text}");
+    text.lines()
+        .find_map(|line| {
+            let pid = line.trim().strip_prefix("PID")?.trim_start().strip_prefix(':')?;
+            pid.trim().parse::<u32>().ok()
+        })
+        .filter(|pid| *pid != 0)
+        .unwrap_or_else(|| panic!("the sshd service has no process id:\n{text}"))
+}
+
+/// The working directory of the `sshd.exe` processes of this test's session, measured on the runner (CI
+/// run 41187603188 read it as: the service and one more in `C:\`, the one running as the account in the
+/// account's profile). None is the system directory, so `provision::system_config::sshd_search_dirs` must
+/// not say a service runs there. Which of them looks up a bare `DefaultShell` is not measured here.
+///
+/// Only this session's processes are read: the service, the ones running as this test's account, and the
+/// `sshd` that started those. An `sshd` left by an earlier test belongs to another account or to no
+/// session of this one; one that ends while it is read is skipped, as it is no longer anything to measure.
 #[test]
 fn sshd_runs_in_the_drive_root_or_the_accounts_profile() {
     let _machine = machine::exclusive();
@@ -745,10 +762,36 @@ fn sshd_runs_in_the_drive_root_or_the_accounts_profile() {
     let session = rig.start_session(&login);
 
     process_cwd::enable_debug_privilege();
-    let measured: Vec<(u32, String, Result<PathBuf, String>)> = process_list::snapshot()
-        .into_iter()
-        .filter(|entry| entry.exe.to_ascii_lowercase().starts_with("sshd"))
-        .map(|entry| (entry.pid, entry.exe, process_cwd::current_directory(entry.pid)))
+    let service = sshd_service_pid();
+    // Each sshd that is still there is held open, so its id is not reused while it is judged.
+    let mut listed = Vec::new();
+    for entry in process_list::snapshot() {
+        if !entry.exe.to_ascii_lowercase().starts_with("sshd") {
+            continue;
+        }
+        let Some(process) = process_cwd::open(entry.pid).unwrap_or_else(|e| panic!("{e}")) else {
+            continue;
+        };
+        let owner = process_list::owner_sddl(process.0);
+        listed.push((entry, process, owner));
+    }
+    let of_account = |owner: &Option<String>| owner.as_deref() == Some(rig.account.sid_text.as_str());
+    let started_by_account: Vec<u32> = listed
+        .iter()
+        .filter(|(_, _, owner)| of_account(owner))
+        .map(|(entry, ..)| entry.parent)
+        .collect();
+    let measured: Vec<_> = listed
+        .iter()
+        .filter(|(entry, _, owner)| {
+            entry.pid == service || of_account(owner) || started_by_account.contains(&entry.pid)
+        })
+        .filter_map(|(entry, process, _)| match process_cwd::current_directory(process) {
+            Ok(cwd) => Some((entry.pid, entry.exe.clone(), cwd)),
+            // Ended while it was read: nothing left to measure.
+            Err(_) if process_list::has_exited(process.0) => None,
+            Err(e) => panic!("{} ({}): {e}", entry.exe, entry.pid),
+        })
         .collect();
     session.leave();
 
@@ -758,9 +801,6 @@ fn sshd_runs_in_the_drive_root_or_the_accounts_profile() {
     let shown = format!("{measured:?}");
     let mut in_profile = 0;
     for (pid, exe, cwd) in &measured {
-        let cwd = cwd
-            .as_ref()
-            .unwrap_or_else(|e| panic!("{exe} ({pid}): {e}\nmeasured: {shown}"));
         let cwd_text = trimmed(cwd);
         assert!(
             cwd_text == drive || cwd_text == profile,

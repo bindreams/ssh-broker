@@ -1,6 +1,6 @@
 //! Host tests for the `config.yaml` schema (pure; runs on any platform).
 
-use super::{Notes, ShellBlock, parse, render_annotated, render_file};
+use super::{Notes, ShellBlock, comment_text, parse, render_annotated, render_file};
 use crate::shell::Escaping;
 
 fn block(text: &str) -> ShellBlock {
@@ -335,4 +335,44 @@ fn no_notes_is_the_canonical_file() {
         render_annotated(&block, &Notes::default()).unwrap(),
         render_file(&block).unwrap()
     );
+}
+
+/// A comment shows a control character as its escape, so a backslash that would read as the start of
+/// one is doubled: a newline and the two characters `\n` stay different texts. A backslash that starts
+/// no escape is left alone, so a Windows path reads as it is.
+#[test]
+fn a_comment_tells_an_escape_from_the_text_that_looks_like_it() {
+    for (text, want) in [
+        ("a\nb", r"a\nb"),
+        (r"a\nb", r"a\\nb"),
+        (r"a\tb\r", r"a\\tb\\r"),
+        (r"a\\b", r"a\\\b"),
+        ("\\\n", r"\\\n"),
+        (r"\u{85}", r"\\u{85}"),
+        ("\u{85}", r"\u{85}"),
+        (
+            r"C:\Program Files\PowerShell\7\pwsh.exe",
+            r"C:\Program Files\PowerShell\7\pwsh.exe",
+        ),
+        (r"C:\Users\me\ssh-broker", r"C:\Users\me\ssh-broker"),
+        (r"\\server\share", r"\\\server\share"),
+        (r"trailing\", r"trailing\"),
+    ] {
+        assert_eq!(comment_text(text), want, "{text:?}");
+    }
+}
+
+/// No two different texts show as the same comment.
+#[test]
+fn different_texts_make_different_comments() {
+    let texts = [
+        "\n", r"\n", "\\\n", r"\\n", r"\\\n", "\t", r"\t", "\u{85}", r"\u{85}", r"\\u{85}", "\\\u{85}", "x", r"\",
+        r"\\",
+    ];
+    let mut seen = std::collections::HashMap::new();
+    for text in texts {
+        if let Some(other) = seen.insert(comment_text(text), text) {
+            panic!("{other:?} and {text:?} both show as {}", comment_text(text));
+        }
+    }
 }

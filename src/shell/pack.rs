@@ -128,14 +128,12 @@ pub fn render(effective: &Effective) -> String {
         with_command: Some(&labels[2]),
         escaping: Some(&labels[3]),
     };
+    let comment = |label: &str, value: &str| format!("# {label}{}\n", comment_text(value));
     let mut text = render_annotated(&block, &notes)
-        .unwrap_or_else(|error| format!("# the shell cannot be shown as a config: {error}\n"));
-    let comment = |text: &mut String, label: &str, value: &str| {
-        text.push_str(&format!("# {label}{}\n", comment_text(value)));
-    };
-    comment(&mut text, "program: ", &effective.program.display().to_string());
+        .unwrap_or_else(|error| comment("the shell cannot be shown as a config: ", &error.to_string()));
+    text.push_str(&comment("program: ", &effective.program.display().to_string()));
     if let Some(problem) = &effective.problem {
-        comment(&mut text, "warning: ", &problem.describe());
+        text.push_str(&comment("warning: ", &problem.describe()));
     }
     text.truncate(text.trim_end_matches('\n').len());
     text

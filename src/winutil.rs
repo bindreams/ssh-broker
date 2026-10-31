@@ -78,7 +78,7 @@ impl Drop for FailCriticalErrors {
 }
 
 /// The error of a `CreateProcessW` that failed. The program is at fault unless the failure is the
-/// machine's or the caller's ([`is_not_the_programs`]): the built-in would meet those too, while any
+/// machine's ([`is_not_the_programs`]): the built-in would meet those too, while any
 /// other cause (an image that is missing, malformed, quarantined, blocked by policy or unreadable)
 /// is answered by the built-in, and an unknown cause is safest answered there too, since blaming the
 /// machine ends the session where blaming the program gives a working shell and a warning. A given
@@ -97,14 +97,15 @@ pub fn start_error_of_create(error: windows::core::Error, cwd: Option<&std::path
 }
 
 /// Whether `error` is a Win32 code for a cause that is not the program: the machine ran out of
-/// memory, handles, processes, quota or commit, or the call itself was given a bad handle, parameter
-/// or buffer. Any other code, listed or not, is held against the program.
+/// memory, handles, processes, quota or commit. Any other code, listed or not, is held against the
+/// program, a bad handle, parameter or buffer included: an image-specific condition can produce those
+/// too, and blaming the machine for one ends the session.
 fn is_not_the_programs(error: &windows::core::Error) -> bool {
     use windows::Win32::Foundation::{
-        ERROR_COMMITMENT_LIMIT, ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_HANDLE, ERROR_INVALID_PARAMETER,
-        ERROR_NO_PROC_SLOTS, ERROR_NO_SYSTEM_RESOURCES, ERROR_NONPAGED_SYSTEM_RESOURCES, ERROR_NOT_ENOUGH_MEMORY,
-        ERROR_NOT_ENOUGH_QUOTA, ERROR_NOT_ENOUGH_SERVER_MEMORY, ERROR_OUTOFMEMORY, ERROR_PAGED_SYSTEM_RESOURCES,
-        ERROR_PAGEFILE_QUOTA, ERROR_PAGEFILE_QUOTA_EXCEEDED, ERROR_TOO_MANY_OPEN_FILES, ERROR_WORKING_SET_QUOTA,
+        ERROR_COMMITMENT_LIMIT, ERROR_NO_PROC_SLOTS, ERROR_NO_SYSTEM_RESOURCES, ERROR_NONPAGED_SYSTEM_RESOURCES,
+        ERROR_NOT_ENOUGH_MEMORY, ERROR_NOT_ENOUGH_QUOTA, ERROR_NOT_ENOUGH_SERVER_MEMORY, ERROR_OUTOFMEMORY,
+        ERROR_PAGED_SYSTEM_RESOURCES, ERROR_PAGEFILE_QUOTA, ERROR_PAGEFILE_QUOTA_EXCEEDED, ERROR_TOO_MANY_OPEN_FILES,
+        ERROR_WORKING_SET_QUOTA,
     };
     // An HRESULT made from a Win32 code: severity and the Win32 facility, then the code.
     let hresult = error.code().0 as u32;
@@ -114,12 +115,9 @@ fn is_not_the_programs(error: &windows::core::Error) -> bool {
     let code = hresult & 0xFFFF;
     [
         ERROR_TOO_MANY_OPEN_FILES,
-        ERROR_INVALID_HANDLE,
         ERROR_NOT_ENOUGH_MEMORY,
         ERROR_OUTOFMEMORY,
-        ERROR_INVALID_PARAMETER,
         ERROR_NO_PROC_SLOTS,
-        ERROR_INSUFFICIENT_BUFFER,
         ERROR_PAGEFILE_QUOTA_EXCEEDED,
         ERROR_NOT_ENOUGH_SERVER_MEMORY,
         ERROR_NO_SYSTEM_RESOURCES,

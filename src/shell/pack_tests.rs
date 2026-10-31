@@ -752,6 +752,10 @@ fn a_comment_holding_any_character_leaves_the_output_a_config() {
     let mut texts: Vec<String> = hostile.iter().map(|c| format!("x{c}y: z # w")).collect();
     texts.push(hostile.iter().collect());
     texts.push(" a\nb".into());
+    // A byte order mark is a character the reader accepts: it stays as it is, inside the comment.
+    texts.push("x\u{feff}y".into());
+    // Text that looks like an escape, beside real ones.
+    texts.push("C:\\new\\tools\\u{85}\u{85}\\".into());
     for text in texts {
         let mut effective = effective_of(&["prog", "arg"], &["-i"], &["-c"], Escaping::Msvc);
         effective.program = PathBuf::from(format!(r"C:\{text}\prog.exe"));
