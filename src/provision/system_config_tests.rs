@@ -3,10 +3,14 @@
 
 use std::path::{Path, PathBuf};
 
-use super::{Decision, Skip, SshdClass, carried_block, classify, create_once_at, decide, not_written, render};
+use super::{
+    Decision, Skip, SshdClass, carried_block, classify, create_once_at, decide, image_dir, not_written,
+    previous_missing, remove_temp, render, sshd_search_dirs,
+};
 use crate::provision::registry::SshdShell;
 use crate::shell::Escaping;
 use crate::shell::config::{ShellBlock, parse};
+use crate::shell::test_host::TestHost;
 
 const PWSH7: &str = r"C:\Program Files\PowerShell\7\pwsh.exe";
 const TOOLS_PWSH: &str = r"C:\tools\pwsh.exe";
@@ -173,8 +177,8 @@ fn the_message_for_a_config_that_could_not_be_written_holds_every_carried_value(
 
 #[test]
 fn decide_table() {
-    let exists = |_: &Path| true;
-    let missing = |_: &Path| false;
+    let exists = |p: &Path| Ok(p.to_path_buf());
+    let missing = |_: &Path| Err("there is no such file".to_string());
     let not_system = |_: &Path| false;
 
     for own in [
@@ -207,7 +211,7 @@ fn decide_table() {
     );
     assert_eq!(
         decide(&sshd(PWSH7), false, &missing, &not_system),
-        Decision::Skip(Skip::PreviousMissing)
+        Decision::Skip(Skip::PreviousMissing("there is no such file".into()))
     );
     match decide(&sshd(PWSH7), false, &exists, &not_system) {
         Decision::Write(block) => assert_eq!(block.start, [PWSH7]),
@@ -219,6 +223,148 @@ fn decide_table() {
         Decision::Write(block) => assert_eq!((block.with_command, block.escaping), (None, None)),
         other => panic!("{other:?}"),
     }
+}
+
+/// A bare `DefaultShell` is found where sshd found it, which a session (it searches `PATH` only)
+/// may not: the config names the file that was found, so it starts the shell sshd started. The
+/// carried options are still judged by the name sshd was given.
+#[test]
+fn a_bare_shell_is_carried_as_the_file_sshd_found() {
+    let found = |_: &Path| Ok(PathBuf::from(r"C:\Program Files\OpenSSH\powershell7.exe"));
+    let mut prev = sshd("powershell7");
+    prev.command_option = Some("-Command".into());
+    match decide(&prev, false, &found, &|_| false) {
+        Decision::Write(block) => {
+            assert_eq!(block.start, [r"C:\Program Files\OpenSSH\powershell7.exe"]);
+            assert_eq!(block.with_command, Some(vec!["-Command".to_string()]));
+        }
+        other => panic!("{other:?}"),
+    }
+    // A path is carried as written.
+    match decide(&sshd(r"C:\x\pwsh"), false, &found, &|_| false) {
+        Decision::Write(block) => assert_eq!(block.start, [r"C:\x\pwsh"]),
+        other => panic!("{other:?}"),
+    }
+}
+
+// the previous shell is missing =====
+
+/// `apply` replaces `DefaultShell` all the same, so the message for a shell it cannot carry holds
+/// every value of it, as the message for a config it cannot write does.
+#[test]
+fn the_message_for_a_previous_shell_that_is_missing_holds_every_previous_value() {
+    let prev = SshdShell {
+        shell: Some(PWSH7.into()),
+        command_option: Some("-NoLogo -c".into()),
+        arguments: Some("-NoProfile".into()),
+        escape_arguments: false,
+    };
+    let text = previous_missing(
+        Path::new(r"C:\ProgramData\ssh-broker\config.yaml"),
+        &prev,
+        "there is no such file",
+    );
+    for part in [
+        r"C:\ProgramData\ssh-broker\config.yaml",
+        "there is no such file",
+        PWSH7,
+        "-NoLogo -c",
+        "-NoProfile",
+        "escape arguments = no",
+        "DefaultShellCommandOption",
+        "DefaultShellArguments",
+    ] {
+        assert!(text.contains(part), "{part}: {text}");
+    }
+    assert!(!text.contains("escape arguments = yes"), "{text}");
+}
+
+// sshd's search =====
+
+const SSHD_IMAGE: &str = r"C:\Program Files\OpenSSH\sshd.exe";
+
+#[test]
+fn the_image_directory_is_read_from_a_service_image_path_in_any_form() {
+    for (image, dir) in [
+        (SSHD_IMAGE, Some(r"C:\Program Files\OpenSSH")),
+        (
+            r#""C:\Program Files\OpenSSH\sshd.exe""#,
+            Some(r"C:\Program Files\OpenSSH"),
+        ),
+        (
+            r#""C:\Program Files\OpenSSH\sshd.exe" -f "C:\x y\sshd_config""#,
+            Some(r"C:\Program Files\OpenSSH"),
+        ),
+        (
+            r"C:\Program Files\OpenSSH\SSHD.EXE -d",
+            Some(r"C:\Program Files\OpenSSH"),
+        ),
+        (
+            r"C:\Windows\System32\OpenSSH\sshd.exe",
+            Some(r"C:\Windows\System32\OpenSSH"),
+        ),
+        (r"D:/ssh/sshd.exe", Some("D:/ssh")),
+        ("sshd.exe", None),
+        ("", None),
+        ("  ", None),
+    ] {
+        assert_eq!(image_dir(image), dir.map(PathBuf::from), "{image:?}");
+    }
+}
+
+/// The directories `CreateProcess` looks in before `PATH`, in its order: the program's own
+/// directory, then the working directory (a service's is the system directory), the system
+/// directory and the Windows directory.
+#[test]
+fn sshd_searches_its_own_directory_the_system_directory_and_the_windows_directory_first() {
+    let host = TestHost::new();
+    assert_eq!(
+        sshd_search_dirs(&host, Some(SSHD_IMAGE)).unwrap(),
+        [
+            PathBuf::from(r"C:\Program Files\OpenSSH"),
+            PathBuf::from(r"C:\Windows\System32"),
+            PathBuf::from(r"C:\Windows"),
+        ]
+    );
+    assert_eq!(
+        sshd_search_dirs(&host, None).unwrap(),
+        [PathBuf::from(r"C:\Windows\System32"), PathBuf::from(r"C:\Windows")]
+    );
+    let mut host = TestHost::new();
+    host.no_system_dir = true;
+    assert!(sshd_search_dirs(&host, Some(SSHD_IMAGE)).is_err());
+}
+
+#[test]
+fn a_bare_shell_is_found_in_sshds_order() {
+    use crate::shell::resolve_program_in;
+    let host = TestHost::new()
+        .with_file(r"C:\Program Files\OpenSSH\only-sshd.exe", "MZ")
+        .with_file(r"C:\Windows\System32\only-system.exe", "MZ")
+        .with_file(r"C:\Windows\only-windows.exe", "MZ")
+        .with_program("only-path", r"C:\tools\only-path.exe")
+        .with_file(r"C:\Program Files\OpenSSH\both.exe", "MZ")
+        .with_program("both", r"C:\tools\both.exe")
+        .with_file(r"C:\Windows\System32\sys-and-win.exe", "MZ")
+        .with_file(r"C:\Windows\sys-and-win.exe", "MZ");
+    let dirs = sshd_search_dirs(&host, Some(SSHD_IMAGE)).unwrap();
+    for (name, want) in [
+        ("only-sshd", r"C:\Program Files\OpenSSH\only-sshd.exe"),
+        ("only-system.exe", r"C:\Windows\System32\only-system.exe"),
+        ("only-windows", r"C:\Windows\only-windows.exe"),
+        ("only-path", r"C:\tools\only-path.exe"),
+        ("both", r"C:\Program Files\OpenSSH\both.exe"),
+        ("sys-and-win", r"C:\Windows\System32\sys-and-win.exe"),
+    ] {
+        assert_eq!(
+            resolve_program_in(&host, &dirs, name),
+            Ok(PathBuf::from(want)),
+            "{name}"
+        );
+    }
+    assert!(resolve_program_in(&host, &dirs, "nonesuch").is_err());
+    // A search of PATH alone, as a session does, does not find what only sshd's directory holds.
+    assert!(crate::shell::resolve_program(&host, "only-sshd").is_err());
 }
 
 // the written file =====
@@ -296,6 +442,31 @@ fn create_once_never_replaces_an_existing_file_and_leaves_no_partial_file() {
     assert!(!create_once_at(&target, &second).unwrap(), "a file was there");
     assert_eq!(std::fs::read(&target).unwrap(), written, "the file is untouched");
     assert_eq!(names(&dir.0), ["config.yaml"]);
+}
+
+/// A temp file that cannot be removed stays in the install directory; the log says which and why.
+#[test]
+fn a_temp_file_that_cannot_be_removed_is_logged_and_one_that_is_gone_is_not() {
+    use std::os::windows::fs::OpenOptionsExt;
+    let dir = TempDir::new("temp-removal");
+    let temp = dir.0.join("config.yaml.tmp-1");
+    std::fs::write(&temp, "x").unwrap();
+    // Opened without FILE_SHARE_DELETE, so the removal is refused while it is held.
+    let held = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(1)
+        .open(&temp)
+        .unwrap();
+    let (log, ()) = crate::test_support::logged(|| remove_temp(&temp));
+    assert!(log.contains("WARN") && log.contains("config.yaml.tmp-1"), "{log}");
+    drop(held);
+    assert!(temp.exists());
+
+    let (log, ()) = crate::test_support::logged(|| remove_temp(&temp));
+    assert_eq!(log, "");
+    assert!(!temp.exists());
+    let (log, ()) = crate::test_support::logged(|| remove_temp(&temp));
+    assert_eq!(log, "", "a file that is not there is removed already");
 }
 
 #[test]

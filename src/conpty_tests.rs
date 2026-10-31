@@ -101,3 +101,36 @@ fn a_file_that_cannot_start_is_the_programs_fault_with_a_handle_to_inherit() {
     let _ = std::fs::remove_dir_all(&dir);
     assert!(matches!(error, StartError::Program(_)), "{error:?}");
 }
+
+/// The verb's child reads the hand-off pipe by the value it is given, and no other handle of its parent
+/// reaches it: the handle list is exactly the one handle. The other handle here is a pipe of this process
+/// that is inheritable (as every handle another thread creates while the child starts is).
+#[test]
+fn a_child_reads_the_handed_pipe_and_inherits_no_other_handle_of_its_parent() {
+    let pipe = crate::winutil::Handoff::new(0).unwrap();
+    let other = crate::winutil::Handoff::new(0).unwrap();
+    let probe = crate::command_line_probe::example("handle_probe");
+    let (pipe_value, other_value) = (pipe.read().0.0 as usize, other.read().0.0 as usize);
+    let line = crate::cmdline::join_args(&[
+        probe.to_str().unwrap(),
+        &pipe_value.to_string(),
+        &other_value.to_string(),
+    ]);
+    let mut session = PtySession::spawn(&line, 80, 24, None, Some(pipe.read())).expect("start the probe");
+    let reader = drain(session.out_read_raw());
+    pipe.send(b"handed over").expect("write the pipe");
+    let code = session.wait().unwrap();
+    session.close_pty();
+    let output = String::from_utf8_lossy(&reader.join().unwrap()).into_owned();
+    assert_eq!(code, 0, "{output}");
+    assert!(
+        output.contains("read:handed over"),
+        "the child did not read the pipe:\n{output}"
+    );
+    assert!(
+        output.contains("other:invalid"),
+        "the child can see another handle of its parent:\n{output}"
+    );
+    assert!(output.contains("finished."), "{output}");
+    drop(other);
+}

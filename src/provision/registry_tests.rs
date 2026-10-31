@@ -447,3 +447,24 @@ fn string_values_at_sshds_buffer_boundary_are_read_and_one_character_more_is_abs
     super::set_value_hkcu(sub, "DefaultShellEscapeArguments", REG_DWORD.0, &0u32.to_le_bytes());
     assert_eq!(super::read_sshd_shell_hkcu(sub).unwrap(), SshdShell::none());
 }
+
+/// sshd's service `ImagePath` is a `REG_EXPAND_SZ` that names the variables it uses: the directory
+/// sshd runs from is the expanded value's.
+#[test]
+fn the_image_path_is_read_with_its_variables_expanded_and_is_none_when_absent() {
+    use windows::Win32::System::Registry::REG_EXPAND_SZ;
+    let key = TestKey::new("image-path");
+    let subkey = key.path();
+    assert_eq!(super::read_image_path_hkcu(subkey).unwrap(), None, "no key");
+    super::set_value_hkcu(subkey, "Other", REG_EXPAND_SZ.0, &[0, 0]);
+    assert_eq!(super::read_image_path_hkcu(subkey).unwrap(), None, "no value");
+
+    let text = r#""%SystemRoot%\OpenSSH\sshd.exe" -x"#;
+    let bytes: Vec<u8> = text.encode_utf16().chain([0]).flat_map(u16::to_le_bytes).collect();
+    super::set_value_hkcu(subkey, "ImagePath", REG_EXPAND_SZ.0, &bytes);
+    let system_root = std::env::var("SystemRoot").expect("SystemRoot is set");
+    assert_eq!(
+        super::read_image_path_hkcu(subkey).unwrap().as_deref(),
+        Some(format!(r#""{system_root}\OpenSSH\sshd.exe" -x"#).as_str())
+    );
+}

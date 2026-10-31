@@ -466,7 +466,9 @@ fn ignore_ctrl_c() {
     ONCE.call_once(|| {
         // SAFETY: `ctrl_handler` has the signature the call needs and lives as long as the process.
         if let Err(e) = unsafe { SetConsoleCtrlHandler(Some(ctrl_handler), true) } {
+            // The user can end the session with Ctrl+C from here on, so they are told, as well as the log.
             tracing::warn!("could not keep this process through Ctrl+C: {e}");
+            eprintln!("ssh-broker: could not keep this process through Ctrl+C ({e}); Ctrl+C may end the session");
         }
     });
 }
@@ -492,7 +494,6 @@ extern "system" fn ctrl_handler(event: u32) -> windows::core::BOOL {
 /// a shell, the built-in `cmd.exe`, because a broken hand-off must not become a lockout; a command
 /// exits 255.
 pub fn console_fallback(handle: usize, login: bool) -> i32 {
-    use std::io::Write;
     // First, so that no Ctrl+C ends this process, and with it the session's job, while the hand-off
     // is read.
     ignore_ctrl_c();
@@ -512,12 +513,7 @@ pub fn console_fallback(handle: usize, login: bool) -> i32 {
             }
         }
     };
-    if !notice.is_empty() {
-        let mut out = std::io::stdout();
-        let _ = out
-            .write_all(format!("{notice}\r\n").as_bytes())
-            .and_then(|()| out.flush());
-    }
+    show_notice(&mut std::io::stdout(), &mut std::io::stderr(), &notice);
     match start_local(&command_line)
         .map_err(StartError::into_cause)
         .and_then(LocalChild::finish)
@@ -527,6 +523,20 @@ pub fn console_fallback(handle: usize, login: bool) -> i32 {
             eprintln!("ssh-broker: could not start the shell: {error:#}");
             255
         }
+    }
+}
+
+/// Print `notice` on the console the verb shares with the shell, ahead of it. A notice that cannot be
+/// written is said on `err`: it is what the user was meant to see, and the shell starts all the same.
+fn show_notice(out: &mut dyn std::io::Write, err: &mut dyn std::io::Write, notice: &str) {
+    if notice.is_empty() {
+        return;
+    }
+    if let Err(e) = out
+        .write_all(format!("{notice}\r\n").as_bytes())
+        .and_then(|()| out.flush())
+    {
+        let _ = writeln!(err, "ssh-broker: could not show the notice ({e}): {notice}");
     }
 }
 

@@ -272,6 +272,45 @@ mod win {
         read_sshd_shell_in(HKEY_LOCAL_MACHINE, subkey)
     }
 
+    /// The service key of sshd.
+    const SSHD_SERVICE_KEY: &str = r"SYSTEM\CurrentControlSet\Services\sshd";
+
+    /// `ImagePath` under `<root>\<subkey>`, with its `%VARIABLES%` expanded as the service manager
+    /// does for a `REG_EXPAND_SZ`. `None` when it is not there.
+    fn read_image_path_in(root: HKEY, subkey: &str) -> anyhow::Result<Option<String>> {
+        use windows::Win32::System::Environment::ExpandEnvironmentStringsW;
+        let Some(raw) = read_optional_string(root, subkey, "ImagePath")? else {
+            return Ok(None);
+        };
+        let raw_w = wide(&raw);
+        // SAFETY: `raw_w` is NUL-terminated. With no buffer the call returns the length it needs, NUL included.
+        let needed = unsafe { ExpandEnvironmentStringsW(PCWSTR(raw_w.as_ptr()), None) } as usize;
+        anyhow::ensure!(
+            needed > 0,
+            "expand the sshd ImagePath: {}",
+            std::io::Error::last_os_error()
+        );
+        let mut buffer = vec![0u16; needed];
+        // SAFETY: as above; the buffer is the length the call is told.
+        let len = unsafe { ExpandEnvironmentStringsW(PCWSTR(raw_w.as_ptr()), Some(&mut buffer)) } as usize;
+        anyhow::ensure!(
+            len > 0 && len <= buffer.len(),
+            "expand the sshd ImagePath: {}",
+            std::io::Error::last_os_error()
+        );
+        Ok(Some(String::from_utf16_lossy(&buffer[..len - 1])))
+    }
+
+    /// Production: the `ImagePath` of the sshd service, the command line the service manager runs.
+    pub fn read_sshd_image_path() -> anyhow::Result<Option<String>> {
+        read_image_path_in(HKEY_LOCAL_MACHINE, SSHD_SERVICE_KEY)
+    }
+
+    #[cfg(test)]
+    pub fn read_image_path_hkcu(subkey: &str) -> anyhow::Result<Option<String>> {
+        read_image_path_in(windows::Win32::System::Registry::HKEY_CURRENT_USER, subkey)
+    }
+
     /// Production: write [`desired_values`] under `HKLM\<subkey>`.
     pub fn set_default_shell_under(subkey: &str, exe: &str) -> anyhow::Result<()> {
         set_under(HKEY_LOCAL_MACHINE, subkey, exe, || {
@@ -436,14 +475,14 @@ mod win {
 
 #[cfg(all(windows, test))]
 pub use win::{
-    delete_hkcu, escape_arguments_from_status, escape_arguments_hkcu, read_dword_hkcu, read_hkcu, read_sshd_shell_hkcu,
-    read_string_hkcu, remove_shell_arguments_hkcu, set_hkcu, set_hkcu_confirming, set_value_hkcu,
+    delete_hkcu, escape_arguments_from_status, escape_arguments_hkcu, read_dword_hkcu, read_hkcu, read_image_path_hkcu,
+    read_sshd_shell_hkcu, read_string_hkcu, remove_shell_arguments_hkcu, set_hkcu, set_hkcu_confirming, set_value_hkcu,
     sshd_string_from_status,
 };
 #[cfg(windows)]
 pub use win::{
-    escape_arguments_under, read_default_shell_under, read_sshd_shell_under, remove_shell_arguments_under,
-    set_default_shell_under,
+    escape_arguments_under, read_default_shell_under, read_sshd_image_path, read_sshd_shell_under,
+    remove_shell_arguments_under, set_default_shell_under,
 };
 
 #[cfg(test)]

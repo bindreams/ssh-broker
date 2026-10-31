@@ -118,7 +118,15 @@ fn console_fallback_args(rest: &[String]) -> Option<(usize, bool)> {
         [flag, handle] if flag == "--login" => (true, handle),
         _ => return None,
     };
-    handle.parse().ok().map(|handle| (handle, login))
+    // Digits only (`parse` also takes a leading `+`), and not zero: a NULL handle is never valid.
+    if !handle.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    handle
+        .parse()
+        .ok()
+        .filter(|&handle| handle != 0)
+        .map(|handle| (handle, login))
 }
 
 /// `[]` or `--background [--expect-user <sid>]`, the flag at most once. A

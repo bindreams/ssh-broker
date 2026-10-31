@@ -33,13 +33,20 @@ impl Host for WindowsHost {
         }
     }
 
-    fn is_file(&self, path: &Path) -> bool {
-        std::fs::metadata(path).is_ok_and(|m| m.is_file())
+    fn is_file(&self, path: &Path) -> std::io::Result<bool> {
+        match std::fs::metadata(path) {
+            Ok(metadata) => Ok(metadata.is_file()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e),
+        }
     }
 
-    fn find_program(&self, name: &str) -> Option<PathBuf> {
-        let path = std::env::var_os("PATH")?;
-        find_in(&std::env::split_paths(&path).collect::<Vec<_>>(), name)
+    fn find_program_in(&self, first: &[PathBuf], name: &str) -> Option<PathBuf> {
+        let mut dirs = first.to_vec();
+        if let Some(path) = std::env::var_os("PATH") {
+            dirs.extend(std::env::split_paths(&path));
+        }
+        find_in(&dirs, name)
     }
 
     fn is_system_cmd(&self, path: &Path) -> std::io::Result<bool> {

@@ -8,14 +8,14 @@
 //! needs and nothing more. The file is never rewritten.
 
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 
 use super::layout::TrustedBase;
 use super::registry::SshdShell;
 use crate::shell::config::{ShellBlock, render_file};
-use crate::shell::{Escaping, defaults};
+use crate::shell::{Escaping, Host, defaults};
 
 /// The kind of shell sshd takes a `DefaultShell` for, which decides how it packs a command
 /// (`w32-doexec.c`): it lowercases the path, turns `/` into `\`, and the first substring below that
@@ -92,7 +92,7 @@ fn split_arguments(arguments: &str) -> Option<Vec<String>> {
 }
 
 /// Why nothing is written.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Skip {
     /// The previous shell is ssh-broker's own: an `apply` over an install has nothing to carry.
     PreviousIsSshBroker,
@@ -100,8 +100,9 @@ pub enum Skip {
     NoPreviousShell,
     /// A config is already there, and is never rewritten.
     FileExists,
-    /// The previous shell is not a file that exists; a config naming it would not start.
-    PreviousMissing,
+    /// The previous shell is not a file that exists, found as sshd finds it (the string is why not);
+    /// a config naming it would not start.
+    PreviousMissing(String),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -110,13 +111,14 @@ pub enum Decision {
     Skip(Skip),
 }
 
-/// Whether `apply` writes the config, and what. `file_exists` says whether the previous shell
-/// exists (a bare name is looked up on `PATH` by the caller); `is_system_cmd` whether it is the
-/// system `cmd.exe`.
+/// Whether `apply` writes the config, and what. `find` finds the file the previous shell names, as
+/// sshd finds it ([`sshd_search_dirs`]), or says why there is none; `is_system_cmd` says whether that
+/// file is the system `cmd.exe`. A bare name is carried as the file found, because a session searches
+/// `PATH` alone and sshd searched more.
 pub fn decide(
     prev: &SshdShell,
     config_exists: bool,
-    file_exists: &dyn Fn(&Path) -> bool,
+    find: &dyn Fn(&Path) -> Result<PathBuf, String>,
     is_system_cmd: &dyn Fn(&Path) -> bool,
 ) -> Decision {
     let Some(shell) = prev.shell.as_deref() else {
@@ -129,28 +131,91 @@ pub fn decide(
     if config_exists {
         return Decision::Skip(Skip::FileExists);
     }
-    let path = Path::new(shell);
-    if !file_exists(path) {
-        return Decision::Skip(Skip::PreviousMissing);
+    let found = match find(Path::new(shell)) {
+        Ok(found) => found,
+        Err(why) => return Decision::Skip(Skip::PreviousMissing(why)),
+    };
+    // The options are judged by the name sshd was given; only the program is replaced.
+    let mut block = carried_block(prev, is_system_cmd(&found));
+    if !shell.contains(['\\', '/', ':']) {
+        block.start = vec![found.to_string_lossy().into_owned()];
     }
-    Decision::Write(carried_block(prev, is_system_cmd(path)))
+    Decision::Write(block)
 }
 
-/// The warning for a config that could not be written: `apply` still replaces `DefaultShell`, so
-/// this holds the values of the shell it replaces, which nothing else keeps.
-pub fn not_written(config: &Path, previous: &SshdShell, cause: &str) -> String {
+/// The values of the shell `apply` replaces, as they are in the registry: what nothing else keeps.
+fn previous_values(previous: &SshdShell) -> String {
     let value = |value: &Option<String>| value.as_ref().map_or("not set".to_owned(), |v| format!("\"{v}\""));
     let escape = if previous.escape_arguments { "yes" } else { "no" };
     format!(
-        "apply: could not write {config}: {cause}; DefaultShell is replaced all the same. The shell sshd used \
-         before is in no config; to restore it, put it in that config or under HKLM\\{key}: DefaultShell = {shell}, \
-         DefaultShellCommandOption = {option}, DefaultShellArguments = {arguments}, escape arguments = {escape}",
-        config = config.display(),
+        "HKLM\\{key}: DefaultShell = {shell}, DefaultShellCommandOption = {option}, DefaultShellArguments = \
+         {arguments}, escape arguments = {escape}",
         key = super::registry::OPENSSH_KEY,
         shell = value(&previous.shell),
         option = value(&previous.command_option),
         arguments = value(&previous.arguments),
     )
+}
+
+/// The warning for a config that could not be written: `apply` still replaces `DefaultShell`, so
+/// this holds the values of the shell it replaces, which nothing else keeps.
+pub fn not_written(config: &Path, previous: &SshdShell, cause: &str) -> String {
+    format!(
+        "apply: could not write {config}: {cause}; DefaultShell is replaced all the same. The shell sshd used \
+         before is in no config; to restore it, put it in that config or under {values}",
+        config = config.display(),
+        values = previous_values(previous),
+    )
+}
+
+/// The warning for a previous shell that is not carried because sshd could not have started it
+/// (`why`): `apply` still replaces `DefaultShell`, so this holds every value of the shell it
+/// replaces, as [`not_written`] does.
+pub fn previous_missing(config: &Path, previous: &SshdShell, why: &str) -> String {
+    format!(
+        "apply: the shell sshd uses now ({shell}) cannot be used: {why}, so it is not carried into {config}; \
+         DefaultShell is replaced all the same. To restore it, put it in that config or under {values}",
+        shell = previous.shell.as_deref().unwrap_or_default(),
+        config = config.display(),
+        values = previous_values(previous),
+    )
+}
+
+/// The directories sshd's `CreateProcess` searches for a bare `DefaultShell` before `PATH`, in its
+/// order: the directory of sshd itself (`image_path`, the service's `ImagePath`, when it is known),
+/// the working directory (a service's is the system directory), the system directory and the Windows
+/// directory.
+pub fn sshd_search_dirs(host: &dyn Host, image_path: Option<&str>) -> anyhow::Result<Vec<PathBuf>> {
+    let system_dir = host
+        .system_cmd()?
+        .parent()
+        .context("the system directory has no name")?
+        .to_path_buf();
+    let windows_dir = system_dir
+        .parent()
+        .context("the system directory is not in a Windows directory")?
+        .to_path_buf();
+    let mut dirs: Vec<PathBuf> = image_path.and_then(image_dir).into_iter().collect();
+    dirs.extend([system_dir, windows_dir]);
+    Ok(dirs)
+}
+
+/// The directory of the program a service's `ImagePath` starts. The value is a command line:
+/// the program is quoted, or runs up to its `.exe`, and arguments may follow.
+pub(super) fn image_dir(image_path: &str) -> Option<PathBuf> {
+    let image_path = image_path.trim();
+    let program = match image_path.strip_prefix('"') {
+        Some(quoted) => quoted.split('"').next()?,
+        None => {
+            let end = image_path
+                .to_ascii_lowercase()
+                .find(".exe")
+                .map_or(image_path.len(), |at| at + ".exe".len());
+            &image_path[..end]
+        }
+    };
+    let (dir, _) = program.rsplit_once(['\\', '/'])?;
+    (!dir.is_empty()).then(|| PathBuf::from(dir))
 }
 
 /// The file's text: a note on where it came from, then the block.
@@ -172,6 +237,16 @@ pub fn create_once(base: &TrustedBase<'_>, block: &ShellBlock) -> anyhow::Result
     create_once_at(&base.layout().system_config_path(), block)
 }
 
+/// Remove the temporary file. A refusal leaves it in the install directory, so it is logged with
+/// the path; a file that is not there was never created, or is gone already.
+fn remove_temp(temp: &Path) {
+    match std::fs::remove_file(temp) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => tracing::warn!("could not remove the temporary file {}: {e}", temp.display()),
+    }
+}
+
 /// [`create_once`] for a path: the part that does not depend on the install directory.
 pub(super) fn create_once_at(target: &Path, block: &ShellBlock) -> anyhow::Result<bool> {
     let text = render(block)?;
@@ -188,11 +263,11 @@ pub(super) fn create_once_at(target: &Path, block: &ShellBlock) -> anyhow::Resul
     let linked = match written {
         Ok(()) => std::fs::hard_link(&temp, target),
         Err(e) => {
-            let _ = std::fs::remove_file(&temp);
+            remove_temp(&temp);
             return Err(e);
         }
     };
-    let _ = std::fs::remove_file(&temp);
+    remove_temp(&temp);
     match linked {
         Ok(()) => Ok(true),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),

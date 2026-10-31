@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 
 use super::{
-    Session, Source, StartError, built_in_plan, defaults, effective, flow_list, plan, render, resolve_program,
+    Session, Source, StartError, built_in_plan, defaults, effective, plan, render, resolve_program, resolve_program_in,
     start_or_fall_back,
 };
 use crate::cmdline::split_args;
@@ -518,22 +518,32 @@ fn render_shows_every_value_with_its_origin() {
     let user = format!("user: {}", crate::shell::test_host::USER_CONFIG);
     let want = format!(
         "shell:\n\
-         \x20 start: [pwsh.exe, -NoLogo]  ({user})\n\
+         \x20 start:  # {user}\n\
+         \x20 - pwsh.exe\n\
+         \x20 - -NoLogo\n\
          \x20 append:\n\
-         \x20   without-command: [-NoExit]  ({user})\n\
-         \x20   with-command: [-c]  (any other program)\n\
-         \x20 escaping: msvc  (any other program)\n\
-         program: {PWSH}"
+         \x20   without-command:  # {user}\n\
+         \x20   - -NoExit\n\
+         \x20   with-command:  # any other program\n\
+         \x20   - -c\n\
+         \x20 escaping: msvc  # any other program\n\
+         # program: {PWSH}"
     );
     assert_eq!(text, want);
 
     // The built-in: the system cmd.exe and its defaults.
     let text = render(&effective(&TestHost::new()).unwrap());
-    assert!(text.contains(&format!("start: [{SYSTEM_CMD}]  (built-in)")), "{text}");
-    assert!(text.contains("escaping: cmd  (the system cmd.exe)"), "{text}");
-    assert!(text.contains("with-command: [/c]  (the system cmd.exe)"), "{text}");
-    assert!(text.contains("without-command: []  (the system cmd.exe)"), "{text}");
-    assert!(text.ends_with(&format!("program: {SYSTEM_CMD}")), "{text}");
+    assert!(
+        text.contains(&format!("start:  # built-in\n  - {SYSTEM_CMD}\n")),
+        "{text}"
+    );
+    assert!(text.contains("escaping: cmd  # the system cmd.exe\n"), "{text}");
+    assert!(
+        text.contains("with-command:  # the system cmd.exe\n    - /c\n"),
+        "{text}"
+    );
+    assert!(text.contains("without-command: []  # the system cmd.exe\n"), "{text}");
+    assert!(text.ends_with(&format!("# program: {SYSTEM_CMD}")), "{text}");
 
     // The system layer, and a value with a space.
     let host = TestHost::new()
@@ -542,7 +552,7 @@ fn render_shows_every_value_with_its_origin() {
     let text = render(&effective(&host).unwrap());
     assert!(
         text.contains(&format!(
-            r#"start: [p, "a b"]  (system: {})"#,
+            "start:  # system: {}\n  - p\n  - a b\n",
             crate::shell::test_host::SYSTEM_CONFIG
         )),
         "{text}"
@@ -554,12 +564,12 @@ fn render_shows_the_problem_and_the_fallback() {
     let host = TestHost::new().with_user_config("shell: nonesuch.exe\n");
     let text = render(&effective(&host).unwrap());
     assert!(
-        text.contains("start: [C:\\Windows\\System32\\cmd.exe]  (built-in)"),
+        text.contains("start:  # built-in\n  - C:\\Windows\\System32\\cmd.exe\n"),
         "{text}"
     );
     let warning = text.lines().last().unwrap();
     assert!(
-        warning.starts_with("warning: cannot use the shell from ")
+        warning.starts_with("# warning: cannot use the shell from ")
             && warning.contains("(nonesuch.exe)")
             && warning.ends_with("using the built-in cmd.exe"),
         "{text}"
@@ -590,95 +600,132 @@ fn a_missing_system_directory_is_an_error_not_a_panic() {
     assert!(format!("{error:#}").contains(OS_ERROR), "{error:#}");
 }
 
-// verify's lists are YAML =====
+// verify's output is a config =====
 
-#[test]
-fn a_rendered_list_parses_back_to_the_same_items() {
-    let items: Vec<String> = [
-        r"C:\Program Files\PowerShell\7\pwsh.exe",
-        r"C:\a\b.exe",
-        "/c",
-        "-NoLogo",
-        "a,b",
-        "{x}",
-        "[y]",
-        "a: b",
-        "k:v",
-        "#hash",
-        "a #b",
-        "true",
-        "False",
-        "null",
-        "~",
-        "yes",
-        "123",
-        "-5",
-        "1e3",
-        ".5",
-        ".inf",
-        "0x1F",
-        "",
-        "tab\there",
-        "new\nline",
-        "carriage\rreturn",
-        "del\u{7f}",
-        "bell\u{7}",
-        "nel\u{85}",
-        "ls\u{2028}",
-        "bom\u{feff}x",
-        "q\"uote",
-        "'single'",
-        r"back\slash",
-        "trail\\",
-        "two\\\\",
-        "é日本語",
-        "😀",
-        "&anchor",
-        "*alias",
-        "!tag",
-        "|pipe",
-        ">fold",
-        "%percent",
-        "@at",
-        "`tick",
-        "- dash",
-        "? q",
-    ]
-    .iter()
-    .map(|s| s.to_string())
-    .collect();
-    for item in &items {
-        let list = flow_list(std::slice::from_ref(item));
-        let parsed = crate::shell::config::parse(format!("shell: {{start: {list}}}").as_bytes())
-            .unwrap_or_else(|e| panic!("{item:?} rendered as {list} does not parse: {}", e.reason))
-            .unwrap();
-        assert_eq!(parsed.start, std::slice::from_ref(item), "{item:?} rendered as {list}");
+/// Strings a list item can be: every one must come back from `parse` as itself.
+const ITEMS: &[&str] = &[
+    r"C:\Program Files\PowerShell\7\pwsh.exe",
+    "C:",
+    "a:",
+    "-c:",
+    "-c",
+    "/c",
+    "-NoLogo",
+    "a,b",
+    "{x}",
+    "[y]",
+    "a: b",
+    "k:v",
+    "#hash",
+    "a #b",
+    "true",
+    "False",
+    "null",
+    "~",
+    "yes",
+    "123",
+    "-5",
+    "1e3",
+    ".5",
+    ".inf",
+    "0x1F",
+    "",
+    " ",
+    " lead and trail ",
+    "tab\there",
+    "new\nline",
+    "carriage\rreturn",
+    "del\u{7f}",
+    "bell\u{7}",
+    "nel\u{85}",
+    "ls\u{2028}",
+    "bom\u{feff}x",
+    "q\"uote",
+    "'single'",
+    r"back\slash",
+    "trail\\",
+    "\u{e9}\u{65e5}\u{672c}\u{8a9e}",
+    "\u{1f600}",
+    "&anchor",
+    "*alias",
+    "!tag",
+    "|pipe",
+    ">fold",
+    "%percent",
+    "@at",
+    "`tick",
+    "- dash",
+    "? q",
+    "---",
+    "...",
+    "<<",
+    "=",
+];
+
+fn effective_of(start: &[&str], without: &[&str], with: &[&str], escaping: Escaping) -> super::Effective {
+    let owned = |items: &[&str]| items.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    super::Effective {
+        program: PathBuf::from(r"C:\a #b: c\prog.exe"),
+        start: owned(start),
+        without_command: owned(without),
+        with_command: owned(with),
+        escaping,
+        why: super::Why {
+            start: Source::User(PathBuf::from(r"C:\Users\me\.config\ssh-broker\config.yaml")),
+            without_command: Source::SystemCmd,
+            with_command: Source::OtherProgram,
+            escaping: Source::BuiltIn,
+        },
+        origin: Origin::Default,
+        problem: None,
     }
-    let list = flow_list(&items);
-    let parsed = crate::shell::config::parse(format!("shell: {{start: {list}}}").as_bytes())
-        .unwrap()
+}
+
+/// What `verify` prints is a config the parser reads back as the values it shows, whatever the
+/// strings are, because the YAML library renders the values and everything else is a comment.
+#[test]
+fn what_render_prints_parses_back_to_the_same_values() {
+    let mut cases: Vec<Vec<&str>> = ITEMS.iter().map(|item| vec!["prog", *item]).collect();
+    cases.push(ITEMS.to_vec());
+    for items in cases {
+        for escaping in [Escaping::Cmd, Escaping::Msvc] {
+            let effective = effective_of(&items, &items, &items, escaping);
+            let text = render(&effective);
+            let parsed = crate::shell::config::parse(text.as_bytes())
+                .unwrap_or_else(|e| panic!("{items:?} rendered as\n{text}\ndoes not parse: {}", e.reason))
+                .unwrap_or_else(|| panic!("{text}\nhas no shell block"));
+            assert_eq!(parsed.start, effective.start, "{text}");
+            assert_eq!(
+                parsed.without_command.as_ref(),
+                Some(&effective.without_command),
+                "{text}"
+            );
+            assert_eq!(parsed.with_command.as_ref(), Some(&effective.with_command), "{text}");
+            assert_eq!(parsed.escaping, Some(escaping), "{text}");
+        }
+    }
+}
+
+/// Empty lists, a program path that would end a plain scalar, and a warning of several lines
+/// leave the output a config.
+#[test]
+fn a_program_a_warning_and_empty_lists_do_not_break_the_config() {
+    let mut effective = effective_of(&["p"], &[], &[], Escaping::Cmd);
+    effective.problem = Some(crate::shell::Problem {
+        file: PathBuf::from(r"C:\x.yaml"),
+        value: Some("a: b\n#c".into()),
+        reason: "line one\nline two: x\r\n- three".into(),
+    });
+    let text = render(&effective);
+    let parsed = crate::shell::config::parse(text.as_bytes())
+        .unwrap_or_else(|e| panic!("{text}\ndoes not parse: {}", e.reason))
         .unwrap();
-    assert_eq!(parsed.start, items);
-}
-
-#[test]
-fn a_quoted_item_escapes_only_what_yaml_needs() {
-    assert_eq!(flow_list(&["a b,[c]".into()]), r#"["a b,[c]"]"#);
-    assert_eq!(flow_list(&["q\"\\".into()]), r#"["q\"\\"]"#);
-    assert_eq!(flow_list(&["x\t\u{7f}".into()]), r#"["x\t\u007F"]"#);
-}
-
-#[test]
-fn common_items_are_not_quoted() {
     assert_eq!(
-        flow_list(&[
-            "pwsh.exe".into(),
-            "-NoLogo".into(),
-            "/c".into(),
-            r"C:\Windows\System32\cmd.exe".into()
-        ]),
-        r"[pwsh.exe, -NoLogo, /c, C:\Windows\System32\cmd.exe]"
+        (parsed.start, parsed.without_command, parsed.with_command),
+        (vec!["p".to_string()], Some(vec![]), Some(vec![]))
     );
+    assert!(text.contains(r"program: C:\a #b: c\prog.exe"), "{text}");
+    assert!(text.contains("warning: "), "{text}");
 }
 
 #[test]
@@ -698,4 +745,59 @@ fn a_terminal_command_keeps_a_leading_line_break_as_stock_sshd_does() {
             "{text:?}"
         );
     }
+}
+
+// resolve_program =====
+
+/// A file that cannot be examined is not a file that is missing: the reason is the system's.
+#[test]
+fn a_file_that_cannot_be_examined_is_reported_with_the_systems_reason() {
+    let denied = "Access is denied. (os error 5)";
+    let host = TestHost::new().with_entry(
+        r"C:\locked\sh.exe",
+        crate::shell::test_host::Entry::Unreadable("Access is denied. (os error 5)"),
+    );
+    let reason = resolve_program(&host, r"C:\locked\sh.exe").unwrap_err();
+    assert!(reason.contains(denied), "{reason}");
+    // The same for the `.exe` a path without an extension may mean.
+    let reason = resolve_program(&host, r"C:\locked\sh").unwrap_err();
+    assert!(reason.contains(denied), "{reason}");
+    // A name that is merely absent still reads as missing.
+    assert_eq!(
+        resolve_program(&host, r"C:\locked\none.exe").unwrap_err(),
+        "there is no such file"
+    );
+}
+
+#[test]
+fn the_given_directories_are_searched_in_order_before_path() {
+    let host = TestHost::new()
+        .with_program("sh", r"C:\on-path\sh.exe")
+        .with_program("other", r"C:\on-path\other.exe")
+        .with_file(r"C:\second\sh.exe", "MZ")
+        .with_file(r"C:\first\sh.exe", "MZ");
+    let dirs = [PathBuf::from(r"C:\first"), PathBuf::from(r"C:\second")];
+    assert_eq!(
+        resolve_program_in(&host, &dirs, "sh"),
+        Ok(PathBuf::from(r"C:\first\sh.exe"))
+    );
+    assert_eq!(
+        resolve_program_in(&host, &dirs[1..], "sh"),
+        Ok(PathBuf::from(r"C:\second\sh.exe"))
+    );
+    // Nothing in the directories: PATH, as for a session.
+    assert_eq!(
+        resolve_program_in(&host, &dirs, "other"),
+        Ok(PathBuf::from(r"C:\on-path\other.exe"))
+    );
+    assert_eq!(resolve_program_in(&host, &[], "sh"), resolve_program(&host, "sh"));
+    assert_eq!(
+        resolve_program_in(&host, &dirs, "nonesuch"),
+        Err("not found on PATH".to_string())
+    );
+    // A name with a separator is a path: the directories do not matter.
+    assert_eq!(
+        resolve_program_in(&host, &dirs, r"C:\first\sh.exe"),
+        Ok(PathBuf::from(r"C:\first\sh.exe"))
+    );
 }

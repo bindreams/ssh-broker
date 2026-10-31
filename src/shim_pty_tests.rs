@@ -918,3 +918,37 @@ fn a_spawn_that_fails_does_not_put_the_command_line_in_its_error() {
     assert!(matches!(error, crate::shell::StartError::Program(_)), "{error:?}");
     assert!(!error.to_string().contains("the-command-text-of-the-user"), "{error}");
 }
+
+/// A writer that fails, as a console whose pseudoconsole is gone would.
+struct Broken;
+
+impl std::io::Write for Broken {
+    fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+        Err(std::io::Error::other("the pipe is being closed"))
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// The notice is the verb's one message to the user; if it cannot be written, the user is told
+/// that on the console, and the shell still starts.
+#[test]
+fn a_notice_is_written_with_a_carriage_return_and_a_failure_to_write_it_is_said() {
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    super::show_notice(&mut out, &mut err, "the notice");
+    assert_eq!(out, b"the notice\r\n");
+    assert!(err.is_empty());
+
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    super::show_notice(&mut out, &mut err, "");
+    assert!(out.is_empty() && err.is_empty(), "an empty notice prints nothing");
+
+    let mut err = Vec::new();
+    super::show_notice(&mut Broken, &mut err, "the notice");
+    let said = String::from_utf8(err).unwrap();
+    assert!(
+        said.starts_with("ssh-broker: could not show the notice") && said.contains("the pipe is being closed"),
+        "{said:?}"
+    );
+}

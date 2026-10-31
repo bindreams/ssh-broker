@@ -118,11 +118,24 @@ impl Host for TestHost {
         }
     }
 
-    fn is_file(&self, path: &Path) -> bool {
-        matches!(self.entries.get(path), Some(Entry::File(_)))
+    fn is_file(&self, path: &Path) -> io::Result<bool> {
+        match self.entries.get(path) {
+            Some(Entry::File(_)) => Ok(true),
+            Some(Entry::Unreadable(message)) => Err(io::Error::other(*message)),
+            Some(Entry::Dir) | None => Ok(false),
+        }
     }
 
-    fn find_program(&self, name: &str) -> Option<PathBuf> {
+    fn find_program_in(&self, first: &[PathBuf], name: &str) -> Option<PathBuf> {
+        let with_exe = (!name.contains('.')).then(|| format!("{name}.exe"));
+        for dir in first {
+            for candidate in std::iter::once(name).chain(with_exe.as_deref()) {
+                let path = super::join_windows(dir, &[candidate]);
+                if matches!(self.entries.get(&path), Some(Entry::File(_))) {
+                    return Some(path);
+                }
+            }
+        }
         self.path.get(name).cloned()
     }
 

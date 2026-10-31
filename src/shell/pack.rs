@@ -5,6 +5,7 @@
 
 use std::path::{Path, PathBuf};
 
+use super::config::{Notes, ShellBlock, render_annotated};
 use super::layers::{self, Origin, Problem};
 use super::{Escaping, Host, is_absolute_windows};
 use crate::cmdline::join_args;
@@ -104,79 +105,43 @@ impl Source {
     }
 }
 
-/// `items` as a YAML flow sequence that reads back as the same strings: plain when that is safe
-/// and double-quoted, with YAML's escapes, when it is not.
-pub(super) fn flow_list(items: &[String]) -> String {
-    let items: Vec<String> = items.iter().map(|item| yaml_scalar(item)).collect();
-    format!("[{}]", items.join(", "))
-}
-
-/// One string as a YAML scalar for a flow sequence.
-fn yaml_scalar(item: &str) -> String {
-    let mut chars = item.chars();
-    let (first, second) = (chars.next(), chars.next());
-    // A plain scalar must not start with an indicator, nor read as another type (a bool, a null, a number).
-    let starts_badly = match first {
-        None => true,
-        Some('-') => second.is_none_or(|c| c.is_ascii_digit() || c == '.'),
-        Some(c) => {
-            c.is_ascii_digit() || matches!(c, '+' | '.' | '?' | ':' | '&' | '*' | '!' | '|' | '>' | '%' | '@' | '~')
-        }
-    };
-    let reserved = ["true", "false", "null", "yes", "no", "on", "off", "y", "n"]
-        .iter()
-        .any(|word| item.eq_ignore_ascii_case(word));
-    let unsafe_char = |c: char| {
-        c.is_control()
-            || c.is_whitespace()
-            || matches!(c, ',' | '[' | ']' | '{' | '}' | '#' | '"' | '\'' | '`' | '\u{feff}')
-    };
-    if !starts_badly && !reserved && !item.chars().any(unsafe_char) {
-        return item.to_owned();
-    }
-    let mut quoted = String::from('"');
-    for c in item.chars() {
-        match c {
-            '"' => quoted.push_str("\\\""),
-            '\\' => quoted.push_str("\\\\"),
-            '\n' => quoted.push_str("\\n"),
-            '\r' => quoted.push_str("\\r"),
-            '\t' => quoted.push_str("\\t"),
-            ' ' => quoted.push(' '),
-            c if c.is_control() || c.is_whitespace() || c == '\u{feff}' => {
-                quoted.push_str(&format!("\\u{:04X}", c as u32))
-            }
-            c => quoted.push(c),
-        }
-    }
-    quoted.push('"');
-    quoted
-}
-
-/// The effective shell in the config's canonical form, each value followed by where it comes
-/// from, then the program `start` resolved to and, when a configured shell could not be used,
-/// the warning. What `verify` prints.
+/// The effective shell as a config file, each key followed by where its value comes from, then
+/// the program `start` resolved to and, when a configured shell could not be used, the warning,
+/// as comments. What `verify` prints; the config parser reads it back as the values it shows.
 pub fn render(effective: &Effective) -> String {
-    let list = flow_list;
-    let escaping = match effective.escaping {
-        Escaping::Cmd => "cmd",
-        Escaping::Msvc => "msvc",
-    };
     let why = &effective.why;
-    let mut text = format!(
-        "shell:\n  start: {}  ({})\n  append:\n    without-command: {}  ({})\n    with-command: {}  ({})\n  escaping: {escaping}  ({})\nprogram: {}",
-        list(&effective.start),
+    let block = ShellBlock {
+        start: effective.start.clone(),
+        without_command: Some(effective.without_command.clone()),
+        with_command: Some(effective.with_command.clone()),
+        escaping: Some(effective.escaping),
+    };
+    let labels = [
         why.start.label(),
-        list(&effective.without_command),
         why.without_command.label(),
-        list(&effective.with_command),
         why.with_command.label(),
         why.escaping.label(),
-        effective.program.display(),
-    );
+    ];
+    let notes = Notes {
+        start: Some(&labels[0]),
+        without_command: Some(&labels[1]),
+        with_command: Some(&labels[2]),
+        escaping: Some(&labels[3]),
+    };
+    let mut text = render_annotated(&block, &notes)
+        .unwrap_or_else(|error| format!("# the shell cannot be shown as a config: {error}\n"));
+    let comment = |text: &mut String, label: &str, value: &str| {
+        // YAML ends a comment at a CR as well as at an LF.
+        for (i, line) in value.split(['\r', '\n']).filter(|line| !line.is_empty()).enumerate() {
+            let label = if i == 0 { label } else { "" };
+            text.push_str(&format!("# {label}{line}\n"));
+        }
+    };
+    comment(&mut text, "program: ", &effective.program.display().to_string());
     if let Some(problem) = &effective.problem {
-        text.push_str(&format!("\nwarning: {}", problem.describe()));
+        comment(&mut text, "warning: ", &problem.describe());
     }
+    text.truncate(text.trim_end_matches('\n').len());
     text
 }
 
@@ -278,6 +243,13 @@ fn built_in_name(host: &dyn Host) -> String {
 /// with `.exe` appended, as `CreateProcess` (and so sshd) finds it. `Err` is the reason, for the
 /// warning.
 pub fn resolve_program(host: &dyn Host, name: &str) -> Result<PathBuf, String> {
+    resolve_program_in(host, &[], name)
+}
+
+/// [`resolve_program`] for a bare name that is searched in `first`, in order, before `PATH`: the
+/// directories a program that is not this one searches first (see `CreateProcess`). A name with a
+/// separator is a path, and `first` does not matter to it.
+pub fn resolve_program_in(host: &dyn Host, first: &[PathBuf], name: &str) -> Result<PathBuf, String> {
     if name.is_empty() {
         return Err("the program name is empty".into());
     }
@@ -286,7 +258,11 @@ pub fn resolve_program(host: &dyn Host, name: &str) -> Result<PathBuf, String> {
         if !is_absolute_windows(path) {
             return Err("a relative path; use an absolute path or a bare name to search PATH".into());
         }
-        if host.is_file(path) {
+        let is_file = |path: &Path| {
+            host.is_file(path)
+                .map_err(|e| format!("cannot tell whether {} is a file: {e}", path.display()))
+        };
+        if is_file(path)? {
             return Ok(path.to_path_buf());
         }
         let file_name = name.rsplit(['\\', '/']).next().unwrap_or(name);
@@ -294,13 +270,14 @@ pub fn resolve_program(host: &dyn Host, name: &str) -> Result<PathBuf, String> {
             let mut with_exe = path.as_os_str().to_owned();
             with_exe.push(".exe");
             let with_exe = PathBuf::from(with_exe);
-            if host.is_file(&with_exe) {
+            if is_file(&with_exe)? {
                 return Ok(with_exe);
             }
         }
         return Err("there is no such file".into());
     }
-    host.find_program(name).ok_or_else(|| "not found on PATH".to_string())
+    host.find_program_in(first, name)
+        .ok_or_else(|| "not found on PATH".to_string())
 }
 
 /// The line to start for `session`. Fails when the line cannot be a command line: it is longer

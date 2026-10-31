@@ -5,7 +5,7 @@
 use std::fmt;
 
 use serde::de::Error as _;
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use super::Escaping;
 
@@ -81,11 +81,74 @@ fn refuse_nul(block: &ShellBlock) -> Result<(), ParseError> {
 
 /// A config file holding `block`, in the canonical nested form.
 pub fn render_file(block: &ShellBlock) -> Result<String, ParseError> {
-    #[derive(Serialize)]
-    struct Out<'a> {
-        shell: &'a ShellBlock,
+    render_annotated(block, &Notes::default())
+}
+
+/// A comment for the line of each key [`render_annotated`] writes.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Notes<'a> {
+    pub start: Option<&'a str>,
+    pub without_command: Option<&'a str>,
+    pub with_command: Option<&'a str>,
+    pub escaping: Option<&'a str>,
+}
+
+/// [`render_file`] with a comment after each key that has a note. The YAML library renders every
+/// value; the keys, their nesting and the comments are all that is written here, so any string
+/// reads back as itself.
+pub fn render_annotated(block: &ShellBlock, notes: &Notes<'_>) -> Result<String, ParseError> {
+    let mut out = String::from("shell:\n");
+    entry(&mut out, 2, "start", &block.start, notes.start)?;
+    if block.without_command.is_some() || block.with_command.is_some() {
+        out.push_str("  append:\n");
+        if let Some(list) = &block.without_command {
+            entry(&mut out, 4, "without-command", list, notes.without_command)?;
+        }
+        if let Some(list) = &block.with_command {
+            entry(&mut out, 4, "with-command", list, notes.with_command)?;
+        }
     }
-    yaml_serde::to_string(&Out { shell: block }).map_err(|e| ParseError { reason: e.to_string() })
+    if let Some(escaping) = &block.escaping {
+        entry(&mut out, 2, "escaping", escaping, notes.escaping)?;
+    }
+    Ok(out)
+}
+
+/// One `key: value` of the block at `indent` columns. A list goes under its key, at the key's own
+/// indent, as a sequence under a mapping key may; any other value, and an empty list, follows the key.
+fn entry<T: Serialize>(
+    out: &mut String,
+    indent: usize,
+    key: &str,
+    value: &T,
+    note: Option<&str>,
+) -> Result<(), ParseError> {
+    let rendered = yaml_serde::to_string(value).map_err(|e| ParseError { reason: e.to_string() })?;
+    let pad = " ".repeat(indent);
+    // A control character in a note (a path can hold one) would end the comment early.
+    let note = note.map_or(String::new(), |n| {
+        let shown: String = n
+            .chars()
+            .flat_map(|c| {
+                if c.is_control() {
+                    c.escape_default().collect()
+                } else {
+                    vec![c]
+                }
+            })
+            .collect();
+        format!("  # {shown}")
+    });
+    let value = rendered.trim_end_matches('\n');
+    if value.contains('\n') || value.starts_with("- ") {
+        out.push_str(&format!("{pad}{key}:{note}\n"));
+        for line in value.lines() {
+            out.push_str(&format!("{pad}{line}\n"));
+        }
+    } else {
+        out.push_str(&format!("{pad}{key}: {value}{note}\n"));
+    }
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -221,37 +284,6 @@ impl From<RawShell> for ShellBlock {
             with_command,
             escaping,
         }
-    }
-}
-
-impl Serialize for ShellBlock {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        #[derive(Serialize)]
-        #[serde(rename_all = "kebab-case")]
-        struct Append<'a> {
-            #[serde(skip_serializing_if = "Option::is_none")]
-            without_command: &'a Option<Vec<String>>,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            with_command: &'a Option<Vec<String>>,
-        }
-        #[derive(Serialize)]
-        struct Out<'a> {
-            start: &'a Vec<String>,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            append: Option<Append<'a>>,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            escaping: &'a Option<Escaping>,
-        }
-        let append = (self.without_command.is_some() || self.with_command.is_some()).then_some(Append {
-            without_command: &self.without_command,
-            with_command: &self.with_command,
-        });
-        Out {
-            start: &self.start,
-            append,
-            escaping: &self.escaping,
-        }
-        .serialize(serializer)
     }
 }
 

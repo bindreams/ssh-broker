@@ -111,6 +111,43 @@ fn a_failed_create_is_the_programs_unless_the_working_directory_is_not_one() {
     );
 }
 
+/// Only a code that describes the image makes the shell at fault, so only those fall back to the
+/// built-in; a failure of the machine (memory, handles, the command line, a bad working directory)
+/// would meet the built-in too.
+#[test]
+fn a_failed_create_blames_the_program_only_for_codes_that_describe_its_image() {
+    let program = [2, 3, 5, 11, 32, 123, 191, 192, 193, 216, 740, 786, 1260, 1392, 1920];
+    let other = [
+        1,    // ERROR_INVALID_FUNCTION
+        6,    // ERROR_INVALID_HANDLE
+        8,    // ERROR_NOT_ENOUGH_MEMORY
+        14,   // ERROR_OUTOFMEMORY
+        87,   // ERROR_INVALID_PARAMETER
+        122,  // ERROR_INSUFFICIENT_BUFFER
+        206,  // ERROR_FILENAME_EXCED_RANGE
+        267,  // ERROR_DIRECTORY
+        1450, // ERROR_NO_SYSTEM_RESOURCES
+        1455, // ERROR_COMMITMENT_LIMIT
+    ];
+    for code in program {
+        let blamed = start_error_of_create(io_error(code), None);
+        assert!(
+            matches!(blamed, crate::shell::StartError::Program(_)),
+            "{code}: {blamed:?}"
+        );
+    }
+    for code in other {
+        let blamed = start_error_of_create(io_error(code), None);
+        assert!(
+            matches!(blamed, crate::shell::StartError::Other(_)),
+            "{code}: {blamed:?}"
+        );
+    }
+    // An error that is not a Win32 code (E_FAIL) says nothing about the image.
+    let blamed = start_error_of_create(windows::core::Error::from(windows::Win32::Foundation::E_FAIL), None);
+    assert!(matches!(blamed, crate::shell::StartError::Other(_)), "{blamed:?}");
+}
+
 fn inherit_flag(handle: HANDLE) -> bool {
     use windows::Win32::Foundation::{GetHandleInformation, HANDLE_FLAG_INHERIT};
     let mut flags = 0u32;

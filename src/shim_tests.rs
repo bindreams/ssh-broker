@@ -285,7 +285,7 @@ fn exec_out_sink_flushes_each_frame() {
 }
 
 #[test]
-fn fail_open_when_agent_unreachable() {
+fn an_unreachable_agent_decides_for_the_local_shell_and_a_reachable_one_for_the_relay() {
     assert_eq!(decide_fallback(true), Fallback::LocalShellWithWarning);
     assert_eq!(decide_fallback(false), Fallback::Relay);
 }
@@ -420,21 +420,24 @@ fn a_warning_is_written_before_the_run_closure_is_called() {
 }
 
 #[test]
-fn a_fail_open_that_cannot_run_exits_255_and_says_why_for_a_command_only() {
+fn a_fail_open_that_cannot_run_exits_255_and_says_why_in_every_mode() {
     // The built-in cmd.exe: a configured shell would be replaced by it, not fail.
     let host = TestHost::new();
     let (code, _, stderr) = failed_open(&host, &exec("echo hi", false), Err("access denied"));
     assert_eq!(code, 255);
     assert_eq!(stderr, "ssh-broker: could not run the command locally: access denied\n");
-    // An interactive session's failure goes to the log only.
+    // An interactive session has nothing else to show it: the user sees it or sees nothing.
     let (code, _, stderr) = failed_open(&host, &None, Err("access denied"));
-    assert_eq!((code, stderr.as_str()), (255, ""));
+    assert_eq!(code, 255);
+    assert_eq!(stderr, "ssh-broker: could not run the command locally: access denied\n");
 
     let too_long = "x".repeat(40_000);
-    let (code, line, stderr) = failed_open(&host, &exec(&too_long, false), Ok(0));
-    assert_eq!(code, 255);
-    assert_eq!(line, None, "nothing was started");
-    assert!(stderr.contains("32,767"), "{stderr}");
+    for exec in [exec(&too_long, false), exec(&too_long, true)] {
+        let (code, line, stderr) = failed_open(&host, &exec, Ok(0));
+        assert_eq!(code, 255);
+        assert_eq!(line, None, "nothing was started");
+        assert!(stderr.contains("32,767"), "{stderr}");
+    }
 }
 
 #[test]
@@ -905,9 +908,7 @@ fn fail_open_does_not_run_a_command_again_when_the_run_failed_after_the_shell_st
         assert_eq!(started.len(), 1, "the shell was started again: {started:?}");
         let text = String::from_utf8(stderr).unwrap();
         assert!(!text.contains("cannot use the shell"), "{text:?}");
-        if exec.is_some() {
-            assert!(text.contains("GetExitCodeProcess failed"), "{text:?}");
-        }
+        assert!(text.contains("GetExitCodeProcess failed"), "{text:?}");
     }
 }
 
@@ -915,7 +916,9 @@ fn fail_open_does_not_run_a_command_again_when_the_run_failed_after_the_shell_st
 fn fail_open_exits_255_and_says_why_when_the_system_directory_is_missing() {
     let mut host = TestHost::new();
     host.no_system_dir = true;
-    let (code, line, stderr) = failed_open(&host, &exec("echo hi", false), Ok(0));
-    assert_eq!((code, line), (255, None));
-    assert!(stderr.contains("GetSystemDirectoryW"), "{stderr}");
+    for exec in [exec("echo hi", false), None] {
+        let (code, line, stderr) = failed_open(&host, &exec, Ok(0));
+        assert_eq!((code, line), (255, None));
+        assert!(stderr.contains("GetSystemDirectoryW"), "{stderr}");
+    }
 }

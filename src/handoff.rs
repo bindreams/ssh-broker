@@ -14,9 +14,15 @@ pub fn encode(notice: &str, line: &str) -> anyhow::Result<Vec<u8>> {
 }
 
 /// The notice and the line in `bytes`, everything the pipe held up to its end. A pipe cut short
-/// (the agent died while writing) is an error, never a shorter line.
+/// (the agent died while writing) is an error, never a shorter line, and so are bytes left over.
 pub fn decode(bytes: &[u8]) -> anyhow::Result<(String, String)> {
-    postcard::from_bytes(bytes).context("the agent's hand-off is not a notice and a line")
+    let (handed, rest) = postcard::take_from_bytes(bytes).context("the agent's hand-off is not a notice and a line")?;
+    anyhow::ensure!(
+        rest.is_empty(),
+        "the agent's hand-off has {} bytes after the line",
+        rest.len()
+    );
+    Ok(handed)
 }
 
 #[cfg(test)]

@@ -21,3 +21,14 @@ fn a_hand_off_cut_short_is_an_error_at_every_length() {
         assert!(decode(&bytes[..len]).is_err(), "a prefix of {len} bytes was read");
     }
 }
+
+/// Bytes after the notice and the line are not part of a hand-off: a stream that holds more than
+/// was written is not the one the agent wrote.
+#[test]
+fn bytes_after_the_line_are_an_error() {
+    let mut bytes = encode("a notice", "cmd.exe /c echo hi").unwrap();
+    bytes.push(0);
+    assert!(decode(&bytes).is_err());
+    let doubled = [encode("n", "l").unwrap(), encode("n", "l").unwrap()].concat();
+    assert!(decode(&doubled).is_err());
+}

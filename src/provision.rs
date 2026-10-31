@@ -250,14 +250,24 @@ mod imp {
             }
         };
         let host = crate::shell::WindowsHost;
-        // The file the shell resolves to, found as a session finds it (a bare name on `PATH`), so the
-        // identity check below looks at that file and not at one of that name beside `apply`.
-        let resolve = |path: &Path| crate::shell::resolve_program(&host, &path.to_string_lossy()).ok();
-        let file_exists = |path: &Path| resolve(path).is_some();
-        let is_system_cmd = |path: &Path| {
+        // The file the shell resolves to, found as sshd finds it (a bare name is searched in sshd's own
+        // directory, the system and Windows directories, then on `PATH`), so the identity check below
+        // looks at that file and not at one of that name beside `apply`.
+        let image = registry::read_sshd_image_path().unwrap_or_else(|e| {
+            eprintln!("apply: cannot read where sshd runs from ({e:#}); a bare shell name is looked up without it");
+            None
+        });
+        let search = match system_config::sshd_search_dirs(&host, image.as_deref()) {
+            Ok(dirs) => dirs,
+            Err(e) => {
+                eprintln!("apply: cannot find the system directory, so the previous shell is not carried: {e:#}");
+                return;
+            }
+        };
+        let find = |path: &Path| crate::shell::resolve_program_in(&host, &search, &path.to_string_lossy());
+        let is_system_cmd = |found: &Path| {
             use crate::shell::Host;
-            let Some(found) = resolve(path) else { return false };
-            host.is_system_cmd(&found).unwrap_or_else(|e| {
+            host.is_system_cmd(found).unwrap_or_else(|e| {
                 eprintln!(
                     "apply: cannot tell whether {} is the system cmd.exe ({e}); its settings are compared with the \
                      defaults for another program",
@@ -266,7 +276,7 @@ mod imp {
                 false
             })
         };
-        match system_config::decide(&previous, config_exists, &file_exists, &is_system_cmd) {
+        match system_config::decide(&previous, config_exists, &find, &is_system_cmd) {
             system_config::Decision::Write(block) => match system_config::create_once(base, &block) {
                 Ok(true) => {
                     println!(
@@ -278,11 +288,9 @@ mod imp {
                 Ok(false) => {}
                 Err(e) => eprintln!("{}", system_config::not_written(&config, &previous, &format!("{e:#}"))),
             },
-            system_config::Decision::Skip(system_config::Skip::PreviousMissing) => eprintln!(
-                "apply: the shell sshd uses now ({}) does not exist, so it is not carried into {}",
-                previous.shell.as_deref().unwrap_or_default(),
-                config.display()
-            ),
+            system_config::Decision::Skip(system_config::Skip::PreviousMissing(why)) => {
+                eprintln!("{}", system_config::previous_missing(&config, &previous, &why))
+            }
             system_config::Decision::Skip(_) => {}
         }
     }

@@ -28,7 +28,7 @@ fn the_built_in_is_cmd_exe_in_the_system_directory() {
     assert!(cmd.is_absolute(), "{cmd:?}");
     assert!(cmd.is_file(), "{cmd:?}");
     assert!(cmd.ends_with("cmd.exe"), "{cmd:?}");
-    assert!(WindowsHost.is_file(&cmd));
+    assert_eq!(WindowsHost.is_file(&cmd).ok(), Some(true));
     assert!(WindowsHost.is_system_cmd(&cmd).unwrap());
 }
 
@@ -52,8 +52,9 @@ fn cmd_by_path_in_any_spelling_is_the_system_cmd() {
 #[test]
 fn syswow64_and_a_copy_are_not_the_system_cmd() {
     let wow = dir_sibling("SysWOW64").join("cmd.exe");
-    assert!(
-        WindowsHost.is_file(&wow),
+    assert_eq!(
+        WindowsHost.is_file(&wow).ok(),
+        Some(true),
         "{wow:?} is missing: is this a 64-bit Windows?"
     );
     assert!(!WindowsHost.is_system_cmd(&wow).unwrap());
@@ -68,7 +69,39 @@ fn syswow64_and_a_copy_are_not_the_system_cmd() {
 fn a_path_that_does_not_exist_is_an_error_not_false() {
     let missing = system_dir().join("no-such-cmd.exe");
     assert!(WindowsHost.is_system_cmd(&missing).is_err());
-    assert!(!WindowsHost.is_file(&missing));
+    assert_eq!(WindowsHost.is_file(&missing).ok(), Some(false));
+}
+
+/// A directory is not a file, and a path the system cannot examine is an error with its reason,
+/// not "missing".
+#[test]
+fn is_file_tells_a_directory_from_a_failure() {
+    assert_eq!(WindowsHost.is_file(&system_dir()).ok(), Some(false));
+    let error = WindowsHost
+        .is_file(Path::new("C:\\a\0b"))
+        .expect_err("a name with a NUL cannot be examined");
+    assert_ne!(error.kind(), std::io::ErrorKind::NotFound);
+}
+
+#[test]
+fn find_program_in_searches_the_given_directories_before_path() {
+    let temp = TempProfile::new("shell-host-first");
+    let (a, b) = (temp.0.join("a"), temp.0.join("b"));
+    touch(&b.join("only-here.exe"));
+    touch(&a.join("only-here.exe"));
+    assert_eq!(
+        WindowsHost.find_program_in(&[a.clone(), b.clone()], "only-here"),
+        Some(a.join("only-here.exe"))
+    );
+    assert_eq!(
+        WindowsHost.find_program_in(&[b.clone(), a], "only-here"),
+        Some(b.join("only-here.exe"))
+    );
+    // PATH still follows the directories.
+    assert_eq!(
+        WindowsHost.find_program_in(&[b], "cmd.exe"),
+        WindowsHost.find_program("cmd.exe")
+    );
 }
 
 fn dir_sibling(name: &str) -> PathBuf {

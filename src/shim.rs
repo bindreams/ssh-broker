@@ -399,34 +399,29 @@ pub fn fail_open<T>(
         },
         None => Session::Interactive,
     };
-    // A command has a clean stderr; an interactive session's console is not ours to write to
-    // while it might still be in raw mode, so its failures go to the log only.
-    let say = |stderr: &mut dyn Write, text: &str| {
-        if exec.is_some() {
-            let _ = writeln!(stderr, "{text}");
-        }
+    // Nothing is relayed here and the console is not in raw mode, so every message the user must see
+    // goes to stderr, in every mode: with no message, a session that ends at once says nothing.
+    let tell = |stderr: &mut dyn Write, text: &str| {
+        let _ = writeln!(stderr, "{text}");
     };
     let plan = match shell::plan(host, &session) {
         Ok(plan) => plan,
         Err(e) => {
             tracing::error!("fail-open could not make the shell's command line: {e:#}");
-            say(stderr, &format!("ssh-broker: could not run the command locally: {e:#}"));
+            tell(stderr, &format!("ssh-broker: could not run the command locally: {e:#}"));
             return 255;
         }
     };
-    // Nothing is relayed and the console is untouched, so a warning line is safe in every mode.
-    let warn = |stderr: &mut dyn Write, notice: &str| {
-        tracing::warn!("{notice}");
-        let _ = writeln!(stderr, "{notice}");
-    };
     if let Some(notice) = plan.notice() {
-        warn(stderr, &notice);
+        tracing::warn!("{notice}");
+        tell(stderr, &notice);
     }
     // A replacement for a shell that cannot start is warned about by `start_or_fall_back` just before
     // it starts.
     let started = shell::start_or_fall_back(host, &session, &plan, start, |replacement| {
         if let Some(notice) = replacement.notice() {
-            warn(&mut *stderr, &notice);
+            tracing::warn!("{notice}");
+            tell(&mut *stderr, &notice);
         }
     })
     .and_then(finish);
@@ -434,7 +429,7 @@ pub fn fail_open<T>(
         Ok(code) => code,
         Err(e) => {
             tracing::error!("fail-open spawn of {:?} failed: {e:?}", plan.command_line);
-            say(stderr, &format!("ssh-broker: could not run the command locally: {e}"));
+            tell(stderr, &format!("ssh-broker: could not run the command locally: {e}"));
             255
         }
     }

@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 pub use layers::{Chosen, Origin, Problem, choose, user_config_path};
 pub use pack::{
     Defaults, Effective, Plan, Session, Source, StartError, Why, built_in_plan, defaults, effective, plan, render,
-    resolve_program, start_or_fall_back,
+    resolve_program, resolve_program_in, start_or_fall_back,
 };
 #[cfg(windows)]
 pub use windows::WindowsHost;
@@ -46,11 +46,16 @@ pub trait Host {
     /// The file's bytes; `Ok(None)` when it does not exist. A directory, or a file that cannot
     /// be read, is an error.
     fn read_file(&self, path: &Path) -> std::io::Result<Option<Vec<u8>>>;
-    /// Whether `path` names an existing file (not a directory).
-    fn is_file(&self, path: &Path) -> bool;
-    /// The first file named `name` along the process's `PATH`; `.exe` is appended when `name`
-    /// has no extension.
-    fn find_program(&self, name: &str) -> Option<PathBuf>;
+    /// Whether `path` names an existing file: `Ok(false)` for a path that is missing or is a
+    /// directory, an error with the system's reason for a path that cannot be examined.
+    fn is_file(&self, path: &Path) -> std::io::Result<bool>;
+    /// The first file named `name` in `first`, in order, and then along the process's `PATH`;
+    /// `.exe` is appended when `name` has no extension.
+    fn find_program_in(&self, first: &[PathBuf], name: &str) -> Option<PathBuf>;
+    /// The first file named `name` along the process's `PATH`.
+    fn find_program(&self, name: &str) -> Option<PathBuf> {
+        self.find_program_in(&[], name)
+    }
     /// Whether `path` is the system `cmd.exe` by file identity.
     fn is_system_cmd(&self, path: &Path) -> std::io::Result<bool>;
     /// `cmd.exe` in the system directory: the built-in shell. An error when the system directory

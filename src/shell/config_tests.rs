@@ -1,6 +1,6 @@
 //! Host tests for the `config.yaml` schema (pure; runs on any platform).
 
-use super::{ShellBlock, parse, render_file};
+use super::{Notes, ShellBlock, parse, render_annotated, render_file};
 use crate::shell::Escaping;
 
 fn block(text: &str) -> ShellBlock {
@@ -300,5 +300,39 @@ fn the_rendered_file_is_the_canonical_nested_form() {
     assert_eq!(
         text,
         "shell:\n  start:\n  - pwsh.exe\n  append:\n    with-command:\n    - -c\n  escaping: msvc\n"
+    );
+}
+
+#[test]
+fn a_note_follows_its_key_as_a_comment_and_the_file_still_parses_equal() {
+    let block = ShellBlock {
+        start: vec!["pwsh.exe".into(), "C:".into()],
+        without_command: Some(vec![]),
+        with_command: Some(vec!["-c".into()]),
+        escaping: Some(Escaping::Msvc),
+    };
+    let text = render_annotated(
+        &block,
+        &Notes {
+            start: Some("a"),
+            without_command: Some("b"),
+            with_command: Some("c"),
+            escaping: Some("d"),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        text,
+        "shell:\n  start:  # a\n  - pwsh.exe\n  - 'C:'\n  append:\n    without-command: []  # b\n    with-command:  # c\n    - -c\n  escaping: msvc  # d\n"
+    );
+    assert_eq!(parse(text.as_bytes()).unwrap().unwrap(), block);
+}
+
+#[test]
+fn no_notes_is_the_canonical_file() {
+    let block = start("pwsh.exe");
+    assert_eq!(
+        render_annotated(&block, &Notes::default()).unwrap(),
+        render_file(&block).unwrap()
     );
 }

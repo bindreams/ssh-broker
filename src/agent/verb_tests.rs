@@ -56,11 +56,24 @@ fn the_verb_names_the_handle_it_inherits_and_reads_the_notice_and_the_line_from_
 
 #[test]
 fn a_start_that_fails_is_the_error_and_nothing_is_written() {
-    let error = start(Path::new(EXE), "n", "l", false, |_, _| -> Result<(), StartError> {
+    let mut reached = false;
+    let mut pipe_read = None;
+    let error = start(Path::new(EXE), "n", "l", false, |_, read| -> Result<(), StartError> {
+        reached = true;
+        // A copy of the read end outlives `start`, so what the failed start left in the pipe can be read.
+        pipe_read = Some(
+            unsafe { BorrowedHandle::borrow_raw(read.0.0 as RawHandle) }
+                .try_clone_to_owned()
+                .unwrap(),
+        );
         Err(StartError::Program(anyhow::anyhow!("blocked")))
     })
     .unwrap_err();
+    assert!(reached, "the starter was never called");
     assert!(matches!(error, StartError::Program(_)), "{error:?}");
+    let mut bytes = Vec::new();
+    std::fs::File::from(pipe_read.unwrap()).read_to_end(&mut bytes).unwrap();
+    assert!(bytes.is_empty(), "{} bytes were written", bytes.len());
 }
 
 /// The agent writes before the verb has read anything, and a verb that is slow to read (stuck in

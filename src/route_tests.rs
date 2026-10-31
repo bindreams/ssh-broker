@@ -197,6 +197,18 @@ fn console_fallback_takes_the_value_of_its_handle() {
         vec!["console-fallback", "a notice", "cmd.exe"],
         vec!["console-fallback", "C:/a b/file"],
         vec!["console-fallback", "-1"],
+        // A NULL handle is never valid; a sign is not part of a handle's value; a value that does not
+        // fit is not one.
+        vec!["console-fallback", "0"],
+        vec!["console-fallback", "00"],
+        vec!["console-fallback", "+5"],
+        vec!["console-fallback", "-0"],
+        vec!["console-fallback", "18446744073709551616"],
+        vec!["console-fallback", "99999999999999999999999999"],
+        vec!["console-fallback", "--login", "0"],
+        vec!["console-fallback", "--login", "+5"],
+        vec!["console-fallback", ""],
+        vec!["console-fallback", " 5"],
         vec!["console-fallback", "--login"],
         vec!["console-fallback", "--login", "x"],
         vec!["console-fallback", "12", "--login"],
