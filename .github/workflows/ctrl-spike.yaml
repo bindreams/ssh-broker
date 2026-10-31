@@ -92,6 +92,14 @@ jobs:
           Remove-Item C:\ProgramData\sb-ctrl-spike-clear-helper -ErrorAction SilentlyContinue
           cargo nextest run --locked --profile ci --no-fail-fast -E 'binary(real_sshd_windows) & test(=prompt_path_through_real_sshd)'
 
+      # A caller that never set the setting calls CreateProcessWithLogonW itself: the test process (clear, as
+      # measured above) calls `logon::start_background_agent`; the stand-in agent it starts records its own.
+      - name: L7 CreateProcessWithLogonW from a caller that has the setting clear
+        if: success() || failure()
+        run: |
+          "=== L7 starts here ===" | Out-File C:\ProgramData\sb-ctrl-spike-zzzz-marker.log
+          cargo nextest run --locked --profile ci --no-fail-fast -E 'binary(session_on_demand_windows) & test(=an_administrators_shim_sees_the_agent_it_starts)'
+
       - name: Everything the processes recorded
         if: success() || failure()
         run: |
