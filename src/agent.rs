@@ -697,9 +697,6 @@ fn handle_connection_in(conn: socket2::Socket, hooks: Hooks, control: &Control) 
             ));
         }
     };
-    if let Some(text) = &launched.notice {
-        show_notice(&mut tx, hs.mode, text);
-    }
     let cwd_buf = child_cwd(&hs.cwd, home_dir());
     let cwd = cwd_buf.as_deref();
     match hs.mode {
@@ -784,11 +781,18 @@ fn handle_pty(
     env: Env<'_>,
 ) -> anyhow::Result<()> {
     let Env { hooks, control } = env;
-    // The warning for a shell that could not start goes out before the output threads exist, so it is
-    // the first thing on the terminal.
+    // The warning for a shell that could not be used is printed by `console-fallback` inside the
+    // pseudoconsole, which clears the screen after anything written ahead of it. Without a path
+    // to this program it goes out here, before the output threads exist.
+    let broker = std::env::current_exe()
+        .inspect_err(|e| {
+            tracing::warn!("cannot find this program, so a shell warning goes out ahead of the terminal: {e}")
+        })
+        .ok();
     let started = launch::start(
         &*hooks.shell_host,
         launched,
+        broker.as_deref(),
         |command| (hooks.start_pty)(command, cols, rows, cwd),
         |text| show_notice(&mut tx, Mode::Pty, text),
     );
@@ -1051,6 +1055,7 @@ fn handle_exec(
     let started = launch::start(
         &*hooks.shell_host,
         launched,
+        None,
         |command| (hooks.start_exec)(command, cwd),
         |text| show_notice(&mut tx, Mode::Exec, text),
     );

@@ -37,6 +37,7 @@ fn main() -> anyhow::Result<()> {
         Route::Apply => provision::apply(),
         Route::Verify => provision::verify(),
         Route::VerifyProbe => provision::verify_probe(),
+        Route::ConsoleFallback { notice, line } => shim::run_console_fallback(&notice, &line),
     }
 }
 
@@ -44,6 +45,7 @@ fn usage(verb: Verb) -> &'static str {
     match verb {
         Verb::Agent => "usage: ssh-broker agent [--background [--expect-user <sid>]]",
         Verb::Logout => "usage: ssh-broker logout",
+        Verb::ConsoleFallback => "usage: ssh-broker console-fallback <notice> <command line> (internal)",
     }
 }
 

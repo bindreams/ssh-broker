@@ -279,3 +279,35 @@ fn run_session_without_command(home: &Home) {
         .output()
         .expect("run the shim");
 }
+
+// The fallback shell of a terminal session through the agent =====
+
+/// `console-fallback` writes its notice, runs its line on the same standard handles and exits with the
+/// line's code.
+#[test]
+fn console_fallback_prints_the_notice_then_runs_the_line_and_exits_with_its_code() {
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_ssh-broker"))
+        .args([
+            "console-fallback",
+            "the notice",
+            r#"cmd.exe /c "echo from-shell& exit /b 7""#,
+        ])
+        .output()
+        .expect("run console-fallback");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.starts_with("the notice\r\n"), "{stdout:?}");
+    assert!(stdout.contains("from-shell"), "{stdout:?}");
+    assert_eq!(out.status.code(), Some(7), "{stdout:?}");
+}
+
+/// A line that cannot start is the broker's failure (255), told on stderr, and not the notice's.
+#[test]
+fn console_fallback_with_a_line_that_cannot_start_exits_255() {
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_ssh-broker"))
+        .args(["console-fallback", "the notice", r"C:\no\such\shell.exe"])
+        .output()
+        .expect("run console-fallback");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(255), "{stderr:?}");
+    assert!(stderr.contains("could not start the shell"), "{stderr:?}");
+}

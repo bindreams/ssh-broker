@@ -436,6 +436,27 @@ fn run_local_passthrough(command_line: &str) -> anyhow::Result<i32> {
     }
 }
 
+/// `console-fallback`: the notice on this console, then `command_line` on it, in a job like every
+/// local child ([`spawn_contained`]). Returns the exit code of the line, or 255, this crate's code
+/// for a broker-side failure, when it cannot be started.
+///
+/// The agent starts this verb as the fallback shell of a terminal session instead of the shell, so
+/// that the notice is written inside the pseudoconsole, after the clear that opens it. The verb
+/// stays in the agent's job, so the shell is a descendant of the agent that dies with the session.
+pub fn console_fallback(notice: &str, command_line: &str) -> i32 {
+    use std::io::Write;
+    let mut out = std::io::stdout();
+    let notice_line = format!("{notice}\r\n");
+    let _ = out.write_all(notice_line.as_bytes()).and_then(|()| out.flush());
+    match run_local_passthrough(command_line) {
+        Ok(code) => code,
+        Err(error) => {
+            eprintln!("ssh-broker: could not start the shell: {error:#}");
+            255
+        }
+    }
+}
+
 /// Spawn `command` suspended and contain it in a job object before it runs a single instruction.
 ///
 /// This exists as its own function so the containment is *testable* in isolation. `run_on` still

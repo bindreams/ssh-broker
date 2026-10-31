@@ -6,7 +6,7 @@ negotiable.
 
 ## Architecture
 
-One binary, four entry points plus a hidden `verify-probe` child, selected by argv
+One binary, four entry points plus the hidden `verify-probe` and `console-fallback` children, selected by argv
 ([`src/route.rs`](src/route.rs)). The shim is
 the *default* action because `DefaultShell` is a bare path and cannot carry a subcommand: a
 known verb in first position selects a subcommand, anything else is the shim.
@@ -18,6 +18,7 @@ known verb in first position selects a subcommand, anything else is the shim.
 | `apply` | `provision` | wherever an admin runs it; needs elevation |
 | `verify` | `provision` | on the host itself, unelevated by design |
 | `verify-probe` | `provision` | the child the **agent** spawns in its interactive session, driven through the relay by `verify` |
+| `console-fallback <notice> <line>` | `shim`, `shim_pty` | the fallback shell of a terminal session through the agent: prints the notice on its pseudoconsole (which clears anything written ahead of it), starts `<line>` there, exits with its code |
 
 Supporting modules: `protocol` (frame codec and handshake), `relay` (transport-agnostic
 pumping), `afunix` + `acl` (the socket and its security boundary), `socket_loc` + `userdir` (where a

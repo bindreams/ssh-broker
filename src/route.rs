@@ -28,12 +28,19 @@ pub enum Route {
     Verify,
     /// Hidden: the parity-probe child the agent spawns in session 1 (used by `verify`).
     VerifyProbe,
+    /// Hidden: the fallback shell of a terminal session through the agent. It prints `notice` on its
+    /// console, starts `line` on that console and exits with the code of `line`.
+    ConsoleFallback {
+        notice: String,
+        line: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verb {
     Agent,
     Logout,
+    ConsoleFallback,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -80,6 +87,13 @@ pub fn route(args: &[String], command_line: &str) -> Route {
         Some("apply") => Route::Apply,
         Some("verify") => Route::Verify,
         Some("verify-probe") => Route::VerifyProbe,
+        Some("console-fallback") => match &args[1..] {
+            [notice, line] => Route::ConsoleFallback {
+                notice: notice.clone(),
+                line: line.clone(),
+            },
+            _ => Route::Usage(Verb::ConsoleFallback),
+        },
         Some("-c") => {
             // `-c` was given, so this is an exec request even when the command is empty.
             let exec = match cmdline::dash_c_tail(command_line) {

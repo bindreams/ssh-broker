@@ -1,9 +1,11 @@
 //! Host tests for the line a handshake asks the agent to start (pure; runs on any platform).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use super::{Launched, launch_line, notice_frame, start};
+use super::{Launched, console_fallback_line, launch_line, notice_frame, start};
+use crate::cmdline::split_args;
 use crate::protocol::{Handshake, Launch, Mode, Stream};
+use crate::route::{Route, route};
 use crate::shell::test_host::{SYSTEM_CMD, TestHost, USER_CONFIG};
 
 const PWSH: &str = r"C:\Program Files\PowerShell\7\pwsh.exe";
@@ -158,6 +160,7 @@ fn a_shell_that_cannot_start_is_replaced_by_cmd_exe_and_the_warning_names_the_er
         let started = start(
             &host,
             &first,
+            None,
             |line| {
                 tried.push(line.to_owned());
                 if line.contains("pwsh.exe") {
@@ -186,6 +189,7 @@ fn a_direct_launch_is_never_replaced() {
     let error = start(
         &pwsh_host(),
         &first,
+        None,
         |_| -> anyhow::Result<()> {
             tried += 1;
             anyhow::bail!("refused")
@@ -200,5 +204,170 @@ fn a_direct_launch_is_never_replaced() {
 fn a_shell_that_starts_has_no_extra_warning() {
     let hs = handshake(Mode::Exec, Some("echo hi"), Launch::Shell);
     let first = launched(&hs, &pwsh_host());
-    start(&pwsh_host(), &first, |_| Ok(()), |_| panic!("nothing to warn about")).unwrap();
+    start(
+        &pwsh_host(),
+        &first,
+        None,
+        |_| Ok(()),
+        |_| panic!("nothing to warn about"),
+    )
+    .unwrap();
+}
+
+// The warning of a terminal session ==========================================================
+
+const BROKER: &str = r"C:\Program Files\ssh-broker\ssh-broker.exe";
+
+/// The lines `start` spawned, and the warnings it asked the caller to show, for `launched`.
+fn started(
+    host: &TestHost,
+    launched: &Launched<'_>,
+    console: Option<&Path>,
+    fails: impl Fn(&str) -> bool,
+) -> (Vec<String>, Vec<String>) {
+    let (mut tried, mut warned) = (Vec::new(), Vec::new());
+    let _ = start(
+        host,
+        launched,
+        console,
+        |line| {
+            tried.push(line.to_owned());
+            if fails(line) {
+                anyhow::bail!("%1 is not a valid Win32 application. (os error 193)");
+            }
+            Ok(())
+        },
+        |text| warned.push(text.to_owned()),
+    );
+    (tried, warned)
+}
+
+/// What the hidden verb is handed by the line that starts it: the notice, and the line it starts.
+fn handed_over(wrapper: &str) -> (String, String) {
+    let args = split_args(wrapper);
+    assert_eq!(args[0], BROKER, "{wrapper}");
+    match route(&args[1..], wrapper) {
+        Route::ConsoleFallback { notice, line } => (notice, line),
+        other => panic!("{wrapper:?} routes to {other:?}"),
+    }
+}
+
+/// A pseudoconsole clears the screen after anything written to it ahead of the shell, so the
+/// warning of a terminal session is printed from inside it: the line that starts is the hidden
+/// verb, given the notice and the fallback shell's line.
+#[test]
+fn a_terminal_session_with_a_broken_config_starts_the_verb_that_prints_the_warning() {
+    let host = TestHost::new().with_user_config("shell: {strt: pwsh.exe}\n");
+    for command in [Some("echo hi"), None] {
+        let hs = handshake(Mode::Pty, command, Launch::Shell);
+        let first = launched(&hs, &host);
+        let (tried, warned) = started(&host, &first, Some(Path::new(BROKER)), |_| false);
+        assert_eq!(warned, Vec::<String>::new(), "{command:?}");
+        assert_eq!(tried.len(), 1, "{command:?}: {tried:?}");
+        let (notice, line) = handed_over(&tried[0]);
+        assert_eq!(Some(notice), first.notice, "{command:?}");
+        assert_eq!(line, first.line, "{command:?}");
+    }
+}
+
+#[test]
+fn a_shell_that_cannot_start_in_a_terminal_session_is_replaced_by_the_verb() {
+    let host = pwsh_host();
+    let hs = handshake(Mode::Pty, Some("echo hi"), Launch::Shell);
+    let first = launched(&hs, &host);
+    let (tried, warned) = started(&host, &first, Some(Path::new(BROKER)), |line| line.contains("pwsh.exe"));
+    assert_eq!(tried.len(), 2, "{tried:?}");
+    assert_eq!(tried[0], first.line, "the configured shell is tried as it is");
+    assert!(warned.is_empty(), "{warned:?}");
+    let (notice, line) = handed_over(&tried[1]);
+    assert!(
+        notice.contains("pwsh.exe") && notice.contains(USER_CONFIG) && notice.contains("os error 193"),
+        "{notice}"
+    );
+    assert_eq!(line, format!("{SYSTEM_CMD} /c echo hi"));
+}
+
+/// Whatever the notice and the line hold, the verb is handed exactly them.
+#[test]
+fn the_verb_is_handed_the_notice_and_the_line_exactly() {
+    for text in [
+        r#"echo "a  b" \"#,
+        "echo a\r\nb",
+        r#"echo \\"x\\" ""#,
+        "echo héllo ✓",
+        "echo \ttab",
+    ] {
+        let host = TestHost::new().with_user_config("shell: {strt: pwsh.exe}\n");
+        let hs = handshake(Mode::Pty, Some(text), Launch::Shell);
+        let first = launched(&hs, &host);
+        let (tried, _) = started(&host, &first, Some(Path::new(BROKER)), |_| false);
+        let (notice, line) = handed_over(&tried[0]);
+        assert_eq!(
+            (Some(notice), line),
+            (first.notice.clone(), first.line.clone()),
+            "{text:?}"
+        );
+    }
+}
+
+/// Without a pseudoconsole to print on, the caller shows the warning before the shell starts.
+#[test]
+fn a_session_without_a_pseudoconsole_has_its_warning_shown_before_the_shell() {
+    let host = TestHost::new().with_user_config("shell: {strt: pwsh.exe}\n");
+    let hs = handshake(Mode::Exec, Some("echo hi"), Launch::Shell);
+    let first = launched(&hs, &host);
+    let (tried, warned) = started(&host, &first, None, |_| false);
+    assert_eq!(tried, std::slice::from_ref(&first.line));
+    assert_eq!(warned, [first.notice.clone().unwrap()]);
+}
+
+#[test]
+fn a_shell_that_cannot_start_in_a_session_without_a_pseudoconsole_is_warned_about_once() {
+    let host = pwsh_host();
+    let hs = handshake(Mode::Exec, Some("echo hi"), Launch::Shell);
+    let first = launched(&hs, &host);
+    let (tried, warned) = started(&host, &first, None, |line| line.contains("pwsh.exe"));
+    assert_eq!(tried.len(), 2, "{tried:?}");
+    assert_eq!(warned.len(), 1, "{warned:?}");
+    assert!(warned[0].contains("os error 193"), "{warned:?}");
+}
+
+/// The verb's line has to fit in a command line too. When it does not, the shell starts as it is
+/// and the caller shows the warning.
+#[test]
+fn a_line_the_verb_cannot_carry_starts_the_shell_and_shows_the_warning() {
+    let host = TestHost::new().with_user_config("shell: {strt: pwsh.exe}\n");
+    // The shell's own line fits; the verb's holds that line and the notice besides.
+    let nearly_all = "x".repeat(32_600);
+    let hs = handshake(Mode::Pty, Some(&nearly_all), Launch::Shell);
+    let first = launched(&hs, &host);
+    let (tried, warned) = started(&host, &first, Some(Path::new(BROKER)), |_| false);
+    assert_eq!(tried, std::slice::from_ref(&first.line));
+    assert_eq!(warned, [first.notice.clone().unwrap()]);
+}
+
+/// A NUL ends a command line, so text that holds one cannot be carried.
+#[test]
+fn text_with_a_nul_cannot_be_carried_by_the_verb() {
+    let exe = Path::new(BROKER);
+    assert!(console_fallback_line(exe, "a notice", "cmd.exe /c x").is_some());
+    assert_eq!(console_fallback_line(exe, "a\0notice", "cmd.exe"), None);
+    assert_eq!(console_fallback_line(exe, "a notice", "cmd.exe /c a\0b"), None);
+}
+
+#[test]
+fn a_terminal_session_with_a_working_shell_starts_it_as_it_is() {
+    let host = pwsh_host();
+    let hs = handshake(Mode::Pty, Some("echo hi"), Launch::Shell);
+    let first = launched(&hs, &host);
+    let (tried, warned) = started(&host, &first, Some(Path::new(BROKER)), |_| false);
+    assert_eq!((tried, warned), (vec![first.line.clone()], Vec::new()));
+}
+
+#[test]
+fn a_direct_launch_is_not_wrapped() {
+    let hs = handshake(Mode::Pty, Some(r"C:\ssh-broker.exe verify-probe"), Launch::Direct);
+    let first = launched(&hs, &pwsh_host());
+    let (tried, warned) = started(&pwsh_host(), &first, Some(Path::new(BROKER)), |_| false);
+    assert_eq!((tried, warned), (vec![first.line.clone()], Vec::new()));
 }

@@ -2,6 +2,10 @@
 //!
 //! Pure over a [`shell::Host`], so it builds and tests on every platform.
 
+use std::cell::Cell;
+use std::path::Path;
+
+use crate::cmdline;
 use crate::protocol::{Handshake, Launch, Mode, Stream};
 use crate::shell::{self, Session};
 
@@ -59,22 +63,56 @@ pub(super) fn launch_line<'a>(hs: &'a Handshake, host: &dyn shell::Host) -> Resu
 
 /// Start `launched` with `spawn`. A configured shell that resolves but cannot start (a truncated
 /// file, the wrong architecture, AppLocker) is replaced by the built-in `cmd.exe`
-/// ([`shell::start_or_fall_back`]); `warn` gets the text of that warning just before the
-/// replacement starts.
+/// ([`shell::start_or_fall_back`]).
+///
+/// The warning for a shell that could not be used reaches the user one of two ways. With
+/// `console` (this program's path), the session is a pseudoconsole, which clears the screen after
+/// anything written ahead of the shell: the line that starts is the hidden `console-fallback` verb,
+/// which prints the warning from inside it and then starts the shell. Otherwise, or when the
+/// verb's line does not fit in a command line, `warn` gets the warning's text just before the shell
+/// starts.
 pub(super) fn start<T>(
     host: &dyn shell::Host,
     launched: &Launched<'_>,
+    console: Option<&Path>,
     mut spawn: impl FnMut(&str) -> anyhow::Result<T>,
-    warn: impl FnOnce(&str),
+    mut warn: impl FnMut(&str),
 ) -> anyhow::Result<T> {
-    match &launched.shell {
-        None => spawn(&launched.line),
-        Some((session, plan)) => shell::start_or_fall_back(host, session, plan, spawn, |replacement| {
-            if let Some(text) = replacement.notice() {
-                warn(&text);
-            }
-        }),
+    let Some((session, plan)) = &launched.shell else {
+        return spawn(&launched.line);
+    };
+    // The warning for the line `start_or_fall_back` spawns next.
+    let pending = Cell::new(launched.notice.clone());
+    shell::start_or_fall_back(
+        host,
+        session,
+        plan,
+        |line| match pending.take() {
+            None => spawn(line),
+            Some(text) => match console.and_then(|exe| console_fallback_line(exe, &text, line)) {
+                Some(wrapped) => {
+                    tracing::warn!("{text}");
+                    spawn(&wrapped)
+                }
+                None => {
+                    warn(&text);
+                    spawn(line)
+                }
+            },
+        },
+        |replacement| pending.set(replacement.notice()),
+    )
+}
+
+/// The line that starts `line` after printing `notice` on the console it is started on: `exe`'s
+/// `console-fallback` verb. `None` when that cannot be one command line: it holds a NUL, or it
+/// takes `CreateProcessW` more than it accepts.
+fn console_fallback_line(exe: &Path, notice: &str, line: &str) -> Option<String> {
+    if notice.contains('\0') || line.contains('\0') {
+        return None;
     }
+    let wrapped = cmdline::join_args(&[&*exe.to_string_lossy(), "console-fallback", notice, line]);
+    (wrapped.encode_utf16().count() < shell::pack::MAX_LINE_UNITS).then_some(wrapped)
 }
 
 /// The first data frame of a session whose shell could not be used: where it goes and what it

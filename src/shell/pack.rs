@@ -10,7 +10,7 @@ use super::{Escaping, Host, is_absolute_windows};
 use crate::cmdline::join_args;
 
 /// The most UTF-16 units `CreateProcessW` takes in a command line, with its terminating NUL.
-const MAX_LINE_UNITS: usize = 32_767;
+pub(crate) const MAX_LINE_UNITS: usize = 32_767;
 
 /// What kind of session to start.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -172,11 +172,43 @@ fn apply_and_verify_verbs() {
     assert_eq!(route_line("ssh-broker.exe verify-probe"), Route::VerifyProbe);
 }
 
+/// The hidden verb of a terminal session's fallback shell takes exactly a notice and a line; any
+/// other shape is a usage error, never the shim.
+#[test]
+fn console_fallback_takes_a_notice_and_a_line() {
+    assert_eq!(
+        route(
+            &["console-fallback".into(), "a notice".into(), "cmd.exe /k".into()],
+            "ignored"
+        ),
+        Route::ConsoleFallback {
+            notice: "a notice".into(),
+            line: "cmd.exe /k".into()
+        }
+    );
+    for args in [
+        vec!["console-fallback"],
+        vec!["console-fallback", "a notice"],
+        vec!["console-fallback", "a notice", "cmd.exe", "extra"],
+    ] {
+        let args: Vec<String> = args.into_iter().map(str::to_owned).collect();
+        assert_eq!(route(&args, "ignored"), Route::Usage(Verb::ConsoleFallback), "{args:?}");
+    }
+}
+
 /// `ssh host agent` arrives as `-c agent`, so argv[1] is `-c` and no verb can collide with a
 /// client command, whatever the command is called.
 #[test]
 fn a_command_named_like_a_verb_is_still_shim_exec() {
-    for verb in ["agent", "apply", "verify", "verify-probe", "logout", "auto-login"] {
+    for verb in [
+        "agent",
+        "apply",
+        "verify",
+        "verify-probe",
+        "console-fallback",
+        "logout",
+        "auto-login",
+    ] {
         assert_eq!(command(&format!("ssh-broker.exe -c {verb}")), some(verb));
         assert_eq!(
             command(&format!(r#"ssh-broker.exe -c "{verb} --x y""#)),

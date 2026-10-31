@@ -1351,8 +1351,10 @@ fn a_shell_launch_runs_the_command_through_the_configured_shell() {
     }
 }
 
-/// A shell that cannot be used falls to the real `cmd.exe`, after one warning and before any
-/// output of the command.
+/// A command without a terminal whose shell cannot be used falls to the real `cmd.exe`, after one
+/// warning and before any output of the command. A terminal session's warning is printed inside
+/// its pseudoconsole by `console-fallback`, which these tests cannot run (the test binary is not
+/// the broker); `tests/shell_sshd_windows.rs` covers it.
 #[test]
 fn a_broken_config_sends_one_warning_then_runs_cmd_exe() {
     use crate::shell::test_host::{TestHost, USER_CONFIG};
@@ -1364,14 +1366,4 @@ fn a_broken_config_sends_one_warning_then_runs_cmd_exe() {
     assert!(stdout.contains("shell-ok"), "{stdout:?}");
     assert!(stderr.starts_with(&notice), "{stderr:?}");
     assert_eq!(stderr.matches("cannot use the shell").count(), 1, "{stderr:?}");
-
-    let (outcome, output, _) = shell_session("warn-pty", Mode::Pty, Some("echo shell-ok"), broken());
-    assert_eq!(outcome, Outcome::Exited(0));
-    assert!(output.starts_with(&notice), "{output:?}");
-    assert_eq!(output.matches("cannot use the shell").count(), 1, "{output:?}");
-    let after = &output[notice.len()..];
-    assert!(
-        after.contains("shell-ok"),
-        "the command's output follows the warning: {output:?}"
-    );
 }

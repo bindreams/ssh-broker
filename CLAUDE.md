@@ -5,7 +5,7 @@ invariants: [CONTRIBUTING.md](CONTRIBUTING.md). This file is the short orientati
 
 ## What it is
 
-One binary with a handful of entry points plus a hidden `verify-probe` child, dispatched by argv. The **shim** is sshd's `DefaultShell`
+One binary with a handful of entry points plus the hidden `verify-probe` and `console-fallback` children, dispatched by argv. The **shim** is sshd's `DefaultShell`
 and is the default action; the **agent** runs in a user's interactive session (one per logged-on
 user) and hosts the shell in a pseudoconsole (PTY) or on redirected pipes (`ssh host cmd`); the two
 speak framed messages over an ACL-gated AF_UNIX socket in that user's profile. `apply` and
