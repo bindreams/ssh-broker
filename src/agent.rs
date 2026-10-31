@@ -82,6 +82,7 @@ use std::sync::{Arc, Condvar, Mutex};
 /// private folder, and become the one agent that serves this user.
 #[cfg(windows)]
 fn start(args: AgentArgs) -> anyhow::Result<()> {
+    crate::ctrl_flag_spike::record("agent at startup");
     let current_sid = crate::acl::Sid::current_user()?.to_sddl()?;
     let background = args.background.is_some();
     start_with(

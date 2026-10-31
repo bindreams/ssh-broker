@@ -278,6 +278,7 @@ pub fn start_background_agent(
         "logon call: caller's job {job:?}, creation flags {:#x}, survival probe {probe:?}",
         flags.0
     );
+    crate::ctrl_flag_spike::record("caller of CreateProcessWithLogonW");
     let result = password.with_nul(|password| {
         with_breakaway_fallback(flags, |flags| {
             // SAFETY: every pointer is to a local that outlives the call; `password` is the wiped copy.

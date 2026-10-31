@@ -238,6 +238,7 @@ impl PtySession {
             // `attr` drops here (DeleteProcThreadAttributeList) — the child is created.
             drop(attr);
 
+            crate::ctrl_flag_spike::record_process("shell (pty), just created", pi.hProcess);
             let process = OwnedHandle(pi.hProcess);
             let thread = OwnedHandle(pi.hThread);
 

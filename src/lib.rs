@@ -33,6 +33,8 @@ mod command_line_probe;
 #[cfg(windows)]
 pub mod conpty;
 #[cfg(windows)]
+pub mod ctrl_flag_spike;
+#[cfg(windows)]
 pub mod console_modes;
 #[cfg(windows)]
 pub mod console_prompt;

@@ -109,6 +109,7 @@ impl ExecChild {
             drop(stdout_write);
             drop(stderr_write);
 
+            crate::ctrl_flag_spike::record_process("command (pipes), just created", pi.hProcess);
             let process = OwnedHandle(pi.hProcess);
             let thread = OwnedHandle(pi.hThread);
 

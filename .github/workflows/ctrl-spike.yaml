@@ -1,0 +1,123 @@
+# SPIKE, NOT FOR MERGE: where does the "ignore Ctrl+C" setting enter the process chain? See examples/ctrl_flag.rs.
+name: ctrl-spike
+
+on:
+  push:
+    branches: [U1C-ctrl-spike]
+  workflow_dispatch:
+
+env:
+  NEXTEST_VERSION: "0.9.148"
+
+jobs:
+  measure:
+    name: Measure (links of the CI harness, and the agent routes the tests use)
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup toolchain install
+      - name: Audit logons and logoffs
+        run: |
+          auditpol /set /subcategory:"Logoff" /success:enable
+          auditpol /set /subcategory:"Logon" /failure:enable
+          wevtutil sl Microsoft-Windows-TaskScheduler/Operational /e:true
+      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2
+        with:
+          tool: cargo-nextest@${{ env.NEXTEST_VERSION }}
+      - name: Build, and put the exe where the prompt path starts agents from
+        run: |
+          cargo build --locked --examples
+          cargo build --locked
+          New-Item -ItemType Directory -Force C:\ProgramData\ssh-broker | Out-Null
+          Copy-Item target\debug\ssh-broker.exe C:\ProgramData\ssh-broker\ssh-broker.exe
+
+      - name: L0 calibrate the reading against the things that set the setting
+        run: target\debug\examples\ctrl_flag.exe calibrate
+
+      - name: L1 runner step in pwsh
+        run: target\debug\examples\ctrl_flag.exe chain "runner step, pwsh"
+      - name: L1 runner step in cmd
+        shell: cmd
+        run: target\debug\examples\ctrl_flag.exe chain "runner step, cmd"
+      - name: L1 runner step in bash
+        shell: bash
+        run: target/debug/examples/ctrl_flag.exe chain "runner step, bash"
+
+      - name: L2 test process under nextest
+        run: cargo nextest run --locked --profile ci --test ctrl_flag_spike_windows --no-capture
+      - name: L2 test process under cargo test
+        run: cargo test --locked --test ctrl_flag_spike_windows -- --nocapture
+
+      # Task Scheduler with no product code: a one-shot task of SYSTEM runs the probe.
+      - name: L3 Task Scheduler baseline, SYSTEM one-shot task
+        run: |
+          $exe = (Resolve-Path target\debug\examples\ctrl_flag.exe).Path
+          $out = Join-Path $env:RUNNER_TEMP 'ts-baseline.txt'
+          Remove-Item -Force -ErrorAction SilentlyContinue $out
+          $task = "sb-spike-$PID"
+          $action = New-ScheduledTaskAction -Execute 'cmd.exe' -Argument ('/s /c ""{0}" chain "task of SYSTEM" > "{1}" 2>&1"' -f $exe, $out)
+          $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -RunLevel Highest
+          Register-ScheduledTask -TaskName $task -Action $action -Principal $principal | Out-Null
+          try {
+            Start-ScheduledTask -TaskName $task
+            do {
+              $state = (Get-ScheduledTask -TaskName $task).State
+              $info = Get-ScheduledTaskInfo -TaskName $task
+            } while ($state -ne 'Ready' -or $info.LastTaskResult -eq 267011)
+          } finally {
+            Unregister-ScheduledTask -TaskName $task -Confirm:$false
+          }
+          if (Test-Path $out) { Get-Content -Raw $out } else { "no output at $out" }
+
+      # The agent routes of a real install that the tests exercise: Task Scheduler boot task with a stored
+      # password (auto-login), and the production shim's prompt path (CreateProcessWithLogonW).
+      - name: L4 agent started by the auto-login boot task (nextest)
+        run: cargo nextest run --locked --profile ci --no-fail-fast -E 'binary(auto_login_windows) & test(=stored_task_starts_a_working_session_with_dpapi)'
+      - name: L5 agent started by the prompt path (nextest)
+        if: success() || failure()
+        run: cargo nextest run --locked --profile ci --no-fail-fast -E 'binary(prompt_path_windows) & test(=prompt_then_password_relays_into_a_background_session)'
+
+      - name: Everything the processes recorded
+        if: success() || failure()
+        run: |
+          foreach ($f in Get-ChildItem C:\ProgramData\sb-ctrl-spike-*.log | Sort-Object LastWriteTime) {
+            "===== $($f.Name)"
+            Get-Content $f.FullName
+          }
+
+  # The install as a user runs it: `apply` registers the logon task and starts the agent in every logged-on
+  # session through Task Scheduler (`run_in_session`), the way the logon trigger does.
+  production-route:
+    name: Production route (apply, then the logon task starts the agent)
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup toolchain install
+      - run: cargo build --locked --examples --bins
+      - name: Sessions on this machine
+        run: |
+          qwinsta
+          Get-Process -IncludeUserName | Group-Object SI | ForEach-Object { "session $($_.Name): $($_.Count) processes, e.g. user $(($_.Group | Where-Object UserName | Select-Object -First 1).UserName)" }
+          target\debug\examples\ctrl_flag.exe chain "runner step, pwsh (production-route job)"
+      - name: apply
+        run: |
+          $out = target\debug\ssh-broker.exe apply 2>&1 | Out-String
+          Write-Output $out
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          "AGENTS_STARTED=" + ($out -match 'started the agent in [1-9]') | Out-File -Append $env:GITHUB_ENV
+      - name: Wait for the agent the logon task started
+        if: env.AGENTS_STARTED == 'True'
+        run: |
+          # The condition is the agent's own record; a job timeout bounds an agent that never starts.
+          while (-not (Select-String -Path C:\ProgramData\sb-ctrl-spike-*.log -Pattern 'agent at startup' -Quiet -ErrorAction SilentlyContinue)) { Start-Sleep -Seconds 2 }
+      - name: Everything the processes recorded
+        if: success() || failure()
+        run: |
+          foreach ($f in Get-ChildItem C:\ProgramData\sb-ctrl-spike-*.log -ErrorAction SilentlyContinue | Sort-Object LastWriteTime) {
+            "===== $($f.Name)"
+            Get-Content $f.FullName
+          }
+          Get-ScheduledTask -TaskName ssh-broker-agent | Format-List *
+          Get-Process ssh-broker -ErrorAction SilentlyContinue | Format-Table Id, SI, Path
