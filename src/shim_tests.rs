@@ -2,11 +2,14 @@
 //! duplex transport), the fail-open decision, and the pure helpers. The Windows console
 //! PTY path (raw mode, `ReadConsoleInputW`) is exercised on a real Windows host end-to-end.
 use super::{
-    ExecOutSink, FailOpen, Fallback, MouseModeSniffer, XtwinopsFilter, decide_fail_open, decide_fallback,
-    is_blank_command, make_handshake, map_outcome, size_to_resize, spawn_line,
+    ExecOutSink, Fallback, MouseModeSniffer, XtwinopsFilter, decide_fallback, fail_open, is_blank_command,
+    make_handshake, map_outcome, size_to_resize, spawn_line,
 };
-use crate::protocol::{ExitCode, FrameKind, FrameReader, Handshake, Mode, Resize, Stream, read_one_frame, write_frame};
+use crate::protocol::{
+    ExitCode, FrameKind, FrameReader, Handshake, Launch, Mode, Resize, Stream, read_one_frame, write_frame,
+};
 use crate::relay::{FrameSink, Outcome, TestSink, duplex, write_data};
+use std::io::Write;
 
 #[test]
 fn exec_shim_relays_streams_and_exit() {
@@ -287,38 +290,154 @@ fn fail_open_when_agent_unreachable() {
     assert_eq!(decide_fallback(false), Fallback::Relay);
 }
 
-/// Fail-open DECISION: `Some(cmd)` selects the passthrough with `cmd` carried verbatim, `None`
-/// selects the plain-shell arm.
-///
-/// This is deliberately a narrow, cheap gate — it only proves the two-arm `match` in
-/// `decide_fail_open` routes correctly and does not mutate `cmd` in transit. It does NOT prove
-/// that a command reaches `CreateProcessW` unmangled: `decide_fail_open` returns data, not a
-/// spawn, so a mutation downstream of it (e.g. `run_on` wrapping the passthrough command in
-/// another `pwsh -Command` before calling `run_local_passthrough`) would leave this test green
-/// while reintroducing exactly the re-quoting bug it used to guard against — this assertion alone
-/// cannot catch that. The real gate for "the command reaches the OS verbatim, with no shell
-/// re-parsing its quoting" is `tests/fail_open_windows.rs`, which runs the actual binary down the
-/// actual fail-open path and reads back the command line `cmd.exe` really received. It has to be
-/// an integration test: `run_on` ends in `process::exit`, so nothing in-process — here or in
-/// `shim_pty_tests.rs` — can observe that wiring, and a unit test calling `spawn_contained`
-/// directly would bypass `run_on` and stay green through exactly the mutation described above.
+// ── fail_open (the line it runs, and what it says first) ───────────────────────────
+
+use crate::cmdline::Exec;
+use crate::shell::StartError;
+use crate::shell::test_host::{SYSTEM_CMD, TestHost, USER_CONFIG};
+
+const PWSH: &str = r"C:\Program Files\PowerShell\7\pwsh.exe";
+
+fn pwsh_host() -> TestHost {
+    TestHost::new()
+        .with_program("pwsh.exe", PWSH)
+        .with_user_config("shell: pwsh.exe\n")
+}
+
+fn exec(command: &str, terminal: bool) -> Option<Exec> {
+    Some(Exec {
+        command: command.into(),
+        terminal,
+    })
+}
+
+/// Run `fail_open` with a `run` that records the line and returns `code`; returns what it saw.
+fn failed_open(host: &TestHost, exec: &Option<Exec>, code: Result<i32, &str>) -> (i32, Option<String>, String) {
+    let mut stderr = Vec::new();
+    let mut line = None;
+    let got = fail_open(
+        host,
+        exec,
+        &mut stderr,
+        |l| {
+            line = Some(l.to_owned());
+            code.map_err(|e| StartError::Program(anyhow::anyhow!("{e}")))
+        },
+        Ok,
+    );
+    (got, line, String::from_utf8(stderr).unwrap())
+}
+
 #[test]
-fn fail_open_runs_a_command_directly_and_only_interactive_gets_a_shell() {
-    // The command must survive verbatim through the decision itself: re-quoting is the failure
-    // mode ultimately being guarded against, and spaces plus backslashes are what a shell would
-    // mangle first — though proving nothing mangles them downstream needs the end-to-end test
-    // named above, not this one.
+fn fail_open_runs_the_planned_line_for_commands_and_for_the_interactive_session() {
+    let host = pwsh_host();
     let cmd = r#"scp -t "C:\path with spaces\out.bin""#;
+    let (code, line, stderr) = failed_open(&host, &exec(cmd, false), Ok(7));
+    assert_eq!(code, 7);
     assert_eq!(
-        decide_fail_open(Some(cmd.to_string())),
-        FailOpen::Passthrough(cmd.to_string()),
-        "an EXEC command must carry through the decision byte for byte"
+        line.as_deref(),
+        Some(crate::cmdline::join_args(&[PWSH, "-c", cmd]).as_str()),
+        "a command goes to the shell as one argument, not as a program"
     );
+    assert_eq!(stderr, "");
+
+    let (_, line, _) = failed_open(&host, &exec("echo  hi", true), Ok(0));
     assert_eq!(
-        decide_fail_open(None),
-        FailOpen::LocalShell,
-        "an interactive session carries no command to run, so it gets pwsh"
+        line.as_deref(),
+        Some(format!(r#""{PWSH}" -c echo  hi"#).as_str()),
+        "a terminal appends as is"
     );
+
+    let (_, line, _) = failed_open(&host, &None, Ok(0));
+    assert_eq!(line.as_deref(), Some(format!(r#""{PWSH}""#).as_str()));
+
+    let (_, line, _) = failed_open(&TestHost::new(), &exec("echo hi", false), Ok(0));
+    assert_eq!(line, Some(format!(r#"{SYSTEM_CMD} /c "echo hi""#)));
+}
+
+#[test]
+fn the_fallback_warning_is_said_once_and_the_child_runs_once() {
+    let host = TestHost::new().with_user_config("shell: {strt: x}\n");
+    for exec in [exec("echo hi", false), None] {
+        let mut children = 0;
+        let mut stderr = Vec::new();
+        fail_open(
+            &host,
+            &exec,
+            &mut stderr,
+            |_line| {
+                children += 1;
+                Ok(0)
+            },
+            Ok,
+        );
+        let text = String::from_utf8(stderr).unwrap();
+        assert!(text.starts_with("ssh-broker: cannot use the shell from "), "{text:?}");
+        assert!(
+            text.contains(USER_CONFIG) && text.ends_with("using the built-in cmd.exe\n"),
+            "{text:?}"
+        );
+        assert_eq!(text.matches("cannot use the shell").count(), 1);
+        assert_eq!(children, 1);
+    }
+}
+
+#[test]
+fn a_warning_is_written_before_the_run_closure_is_called() {
+    use std::cell::RefCell;
+    struct Spy<'a>(&'a RefCell<Vec<String>>);
+    impl Write for Spy<'_> {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .borrow_mut()
+                .push(format!("stderr:{}", String::from_utf8_lossy(bytes).trim_end()));
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let events = RefCell::new(Vec::new());
+    let host = TestHost::new().with_user_config("shell: nonesuch.exe\n");
+    fail_open(
+        &host,
+        &None,
+        &mut Spy(&events),
+        |_| {
+            events.borrow_mut().push("run".into());
+            Ok(0)
+        },
+        Ok,
+    );
+    let events = events.into_inner();
+    assert!(
+        events
+            .first()
+            .is_some_and(|e| e.starts_with("stderr:ssh-broker: cannot use the shell")),
+        "{events:?}"
+    );
+    assert_eq!(events.last().map(String::as_str), Some("run"), "{events:?}");
+}
+
+#[test]
+fn a_fail_open_that_cannot_run_exits_255_and_says_why_in_every_mode() {
+    // The built-in cmd.exe: a configured shell would be replaced by it, not fail.
+    let host = TestHost::new();
+    let (code, _, stderr) = failed_open(&host, &exec("echo hi", false), Err("access denied"));
+    assert_eq!(code, 255);
+    assert_eq!(stderr, "ssh-broker: could not run the command locally: access denied\n");
+    // An interactive session has nothing else to show it: the user sees it or sees nothing.
+    let (code, _, stderr) = failed_open(&host, &None, Err("access denied"));
+    assert_eq!(code, 255);
+    assert_eq!(stderr, "ssh-broker: could not run the command locally: access denied\n");
+
+    let too_long = "x".repeat(40_000);
+    for exec in [exec(&too_long, false), exec(&too_long, true)] {
+        let (code, line, stderr) = failed_open(&host, &exec, Ok(0));
+        assert_eq!(code, 255);
+        assert_eq!(line, None, "nothing was started");
+        assert!(stderr.contains("32,767"), "{stderr}");
+    }
 }
 
 #[test]
@@ -382,10 +501,11 @@ fn map_outcome_exit_code_policy() {
 // ── make_handshake (pure field mapping) ────────────────────────────────────────────
 
 #[test]
-fn make_handshake_pty_fields() {
-    let hs = make_handshake(&None, "screen-256color".into(), 100, 30);
+fn no_command_is_pty_without_a_command() {
+    let hs = make_handshake(&None, false, Launch::Shell, "screen-256color".into(), 100, 30);
     assert_eq!(hs.mode, Mode::Pty);
     assert_eq!(hs.command, None);
+    assert_eq!(hs.launch, Launch::Shell);
     assert_eq!((hs.cols, hs.rows), (100, 30));
     assert_eq!(hs.term, "screen-256color");
     assert!(hs.cwd.is_empty()); // agent uses the session-1 default cwd
@@ -394,10 +514,25 @@ fn make_handshake_pty_fields() {
 }
 
 #[test]
-fn make_handshake_exec_fields() {
-    let hs = make_handshake(&Some("git status".into()), "xterm".into(), 80, 24);
+fn a_command_without_a_terminal_is_exec() {
+    let hs = make_handshake(&Some("git status".into()), false, Launch::Shell, "xterm".into(), 80, 24);
     assert_eq!(hs.mode, Mode::Exec);
     assert_eq!(hs.command.as_deref(), Some("git status"));
+}
+
+#[test]
+fn a_command_with_a_terminal_is_a_pty_handshake_with_the_command() {
+    let hs = make_handshake(&Some("git status".into()), true, Launch::Shell, "xterm".into(), 120, 40);
+    assert_eq!(hs.mode, Mode::Pty);
+    assert_eq!(hs.command.as_deref(), Some("git status"));
+    assert_eq!((hs.cols, hs.rows), (120, 40));
+}
+
+#[test]
+fn the_launch_is_carried_as_given() {
+    for launch in [Launch::Shell, Launch::Direct] {
+        assert_eq!(make_handshake(&None, false, launch, String::new(), 0, 0).launch, launch);
+    }
 }
 
 // ── MouseModeSniffer (pure; gates mouse forwarding) ────────────────────────────────
@@ -556,7 +691,7 @@ fn frames(from: &mpsc::Receiver<Vec<u8>>, n: usize) -> Vec<(FrameKind, Vec<u8>)>
 }
 
 fn exec_handshake() -> Handshake {
-    make_handshake(&Some("sort".into()), "xterm".into(), 80, 24)
+    make_handshake(&Some("sort".into()), false, Launch::Shell, "xterm".into(), 80, 24)
 }
 
 fn stdin_data(payload: &[u8]) -> (FrameKind, Vec<u8>) {
@@ -713,4 +848,77 @@ fn the_pump_notes_whether_the_agent_sent_a_byte() {
     let pumped = super::pump_heard(&mut exit.as_slice(), &mut FrameReader::new(), &mut TestSink::default());
     assert!(pumped.heard && !pumped.no_answer());
     assert_eq!(pumped.code(), 3);
+}
+
+#[test]
+fn fail_open_runs_cmd_exe_and_warns_when_the_shell_exists_and_cannot_start() {
+    let host = pwsh_host();
+    for exec in [exec("echo hi", false), exec("echo hi", true), None] {
+        let mut stderr = Vec::new();
+        let mut tried = Vec::new();
+        let code = fail_open(
+            &host,
+            &exec,
+            &mut stderr,
+            |line| {
+                tried.push(line.to_owned());
+                if line.contains("pwsh.exe") {
+                    return Err(StartError::Program(anyhow::anyhow!(
+                        "%1 is not a valid Win32 application. (os error 193)"
+                    )));
+                }
+                Ok(5)
+            },
+            Ok,
+        );
+        assert_eq!(code, 5, "{exec:?}");
+        assert_eq!(tried.len(), 2, "{tried:?}");
+        assert!(tried[1].starts_with(SYSTEM_CMD), "{tried:?}");
+        let text = String::from_utf8(stderr).unwrap();
+        assert!(
+            text.starts_with("ssh-broker: cannot use the shell from ")
+                && text.contains(USER_CONFIG)
+                && text.contains("(pwsh.exe)")
+                && text.contains("os error 193"),
+            "{text:?}"
+        );
+        assert_eq!(text.matches("cannot use the shell").count(), 1, "{text:?}");
+    }
+}
+
+/// A shell that started and then failed on the broker's side (its exit code could not be read) has run the
+/// command; running the command again through cmd.exe would run it twice.
+#[test]
+fn fail_open_does_not_run_a_command_again_when_the_run_failed_after_the_shell_started() {
+    let host = pwsh_host();
+    for exec in [exec("echo hi", false), exec("echo hi", true), None] {
+        let mut stderr = Vec::new();
+        let mut started = Vec::new();
+        let code = fail_open(
+            &host,
+            &exec,
+            &mut stderr,
+            |line| {
+                started.push(line.to_owned());
+                Ok(())
+            },
+            |()| Err(anyhow::anyhow!("GetExitCodeProcess failed")),
+        );
+        assert_eq!(code, 255, "{exec:?}");
+        assert_eq!(started.len(), 1, "the shell was started again: {started:?}");
+        let text = String::from_utf8(stderr).unwrap();
+        assert!(!text.contains("cannot use the shell"), "{text:?}");
+        assert!(text.contains("GetExitCodeProcess failed"), "{text:?}");
+    }
+}
+
+#[test]
+fn fail_open_exits_255_and_says_why_when_the_system_directory_is_missing() {
+    let mut host = TestHost::new();
+    host.no_system_dir = true;
+    for exec in [exec("echo hi", false), None] {
+        let (code, line, stderr) = failed_open(&host, &exec, Ok(0));
+        assert_eq!((code, line), (255, None));
+        assert!(stderr.contains("GetSystemDirectoryW"), "{stderr}");
+    }
 }

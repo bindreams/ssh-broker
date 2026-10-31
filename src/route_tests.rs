@@ -23,7 +23,7 @@ fn command_as(line: &str, encoding: Encoding) -> Option<String> {
     let Route::Shim { exec } = route_line(line) else {
         panic!("{line:?} must select the shim");
     };
-    exec.map(|exec| resolve_exec(exec, || encoding))
+    exec.map(|exec| resolve_exec(exec, || encoding).command)
 }
 
 /// A line whose form does not matter: commands with nothing sshd would escape.
@@ -172,11 +172,65 @@ fn apply_and_verify_verbs() {
     assert_eq!(route_line("ssh-broker.exe verify-probe"), Route::VerifyProbe);
 }
 
+/// The hidden verb of a terminal session's fallback shell takes the value of the pipe handle it
+/// inherited, and `--login` before it for a session without a command; any other shape is a usage
+/// error, never the shim.
+#[test]
+fn console_fallback_takes_the_value_of_its_handle() {
+    let args = |args: &[&str]| args.iter().map(|a| (*a).to_owned()).collect::<Vec<_>>();
+    assert_eq!(
+        route(&args(&["console-fallback", "1234"]), "ignored"),
+        Route::ConsoleFallback {
+            handle: 1234,
+            login: false
+        }
+    );
+    assert_eq!(
+        route(&args(&["console-fallback", "--login", "88"]), "ignored"),
+        Route::ConsoleFallback {
+            handle: 88,
+            login: true
+        }
+    );
+    for args in [
+        vec!["console-fallback"],
+        vec!["console-fallback", "a notice", "cmd.exe"],
+        vec!["console-fallback", "C:/a b/file"],
+        vec!["console-fallback", "-1"],
+        // A NULL handle is never valid; a sign is not part of a handle's value; a value that does not
+        // fit is not one.
+        vec!["console-fallback", "0"],
+        vec!["console-fallback", "00"],
+        vec!["console-fallback", "+5"],
+        vec!["console-fallback", "-0"],
+        vec!["console-fallback", "18446744073709551616"],
+        vec!["console-fallback", "99999999999999999999999999"],
+        vec!["console-fallback", "--login", "0"],
+        vec!["console-fallback", "--login", "+5"],
+        vec!["console-fallback", ""],
+        vec!["console-fallback", " 5"],
+        vec!["console-fallback", "--login"],
+        vec!["console-fallback", "--login", "x"],
+        vec!["console-fallback", "12", "--login"],
+    ] {
+        let args: Vec<String> = args.into_iter().map(str::to_owned).collect();
+        assert_eq!(route(&args, "ignored"), Route::Usage(Verb::ConsoleFallback), "{args:?}");
+    }
+}
+
 /// `ssh host agent` arrives as `-c agent`, so argv[1] is `-c` and no verb can collide with a
 /// client command, whatever the command is called.
 #[test]
 fn a_command_named_like_a_verb_is_still_shim_exec() {
-    for verb in ["agent", "apply", "verify", "verify-probe", "logout", "auto-login"] {
+    for verb in [
+        "agent",
+        "apply",
+        "verify",
+        "verify-probe",
+        "console-fallback",
+        "logout",
+        "auto-login",
+    ] {
         assert_eq!(command(&format!("ssh-broker.exe -c {verb}")), some(verb));
         assert_eq!(
             command(&format!(r#"ssh-broker.exe -c "{verb} --x y""#)),

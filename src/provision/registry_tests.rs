@@ -228,3 +228,244 @@ fn escape_arguments_reports_a_read_that_fails_for_another_reason() {
     assert!(!super::escape_arguments_from_status(ERROR_SUCCESS, [0; 4]).unwrap());
     assert!(super::escape_arguments_from_status(ERROR_SUCCESS, [1, 0, 0, 0]).unwrap());
 }
+
+/// `apply` reads the four values the way sshd does before it overwrites them. Under a key of the
+/// test's own (HKCU, deleted afterwards); CI only, as it writes the registry.
+#[cfg(windows)]
+#[test]
+fn the_four_shell_values_are_read_as_sshd_reads_them() {
+    use super::SshdShell;
+    use windows::Win32::System::Registry::{REG_DWORD, REG_EXPAND_SZ, REG_SZ};
+    let sz = |text: &str| -> Vec<u8> {
+        text.encode_utf16()
+            .chain(std::iter::once(0))
+            .flat_map(u16::to_le_bytes)
+            .collect()
+    };
+
+    // No key at all: nothing to carry, and sshd's defaults.
+    let key = TestKey::new("sshd-none");
+    assert_eq!(super::read_sshd_shell_hkcu(key.path()).unwrap(), SshdShell::none());
+
+    // All four, with an argument string longer than a fixed buffer of 512 would hold.
+    let long = format!("-File {}", "x".repeat(2000));
+    let key = TestKey::new("sshd-all");
+    let sub = key.path();
+    super::set_value_hkcu(
+        sub,
+        "DefaultShell",
+        REG_SZ.0,
+        &sz(r"C:\Program Files\PowerShell\7\pwsh.exe"),
+    );
+    super::set_value_hkcu(sub, "DefaultShellCommandOption", REG_SZ.0, &sz("-Command"));
+    super::set_value_hkcu(sub, "DefaultShellArguments", REG_SZ.0, &sz(&long));
+    super::set_value_hkcu(sub, "DefaultShellEscapeArguments", REG_DWORD.0, &0u32.to_le_bytes());
+    let got = super::read_sshd_shell_hkcu(sub).unwrap();
+    assert_eq!(got.shell.as_deref(), Some(r"C:\Program Files\PowerShell\7\pwsh.exe"));
+    assert_eq!(got.command_option.as_deref(), Some("-Command"));
+    assert_eq!(got.arguments.as_deref(), Some(long.as_str()));
+    assert!(!got.escape_arguments);
+
+    // Empty values count as absent, and the options are not expanded.
+    let key = TestKey::new("sshd-empty");
+    let sub = key.path();
+    super::set_value_hkcu(sub, "DefaultShell", REG_EXPAND_SZ.0, &sz(r"%ProgramFiles%\x\sh.exe"));
+    super::set_value_hkcu(sub, "DefaultShellCommandOption", REG_SZ.0, &sz(""));
+    let got = super::read_sshd_shell_hkcu(sub).unwrap();
+    assert_eq!(got.shell.as_deref(), Some(r"%ProgramFiles%\x\sh.exe"));
+    assert_eq!(
+        (got.command_option, got.arguments, got.escape_arguments),
+        (None, None, true)
+    );
+
+    // With no DefaultShell, sshd ignores the rest.
+    let key = TestKey::new("sshd-orphans");
+    let sub = key.path();
+    super::set_value_hkcu(sub, "DefaultShellCommandOption", REG_SZ.0, &sz("-x"));
+    super::set_value_hkcu(sub, "DefaultShellEscapeArguments", REG_DWORD.0, &0u32.to_le_bytes());
+    assert_eq!(super::read_sshd_shell_hkcu(sub).unwrap(), SshdShell::none());
+}
+
+/// sshd hands `RegQueryValueExW` a PATH_MAX (32768) buffer but passes `_countof` of it, a count of
+/// wide characters, as the size in BYTES (`pwd.c` `set_defaultshell`). A value of more than 32768
+/// bytes, terminator included, fails with `ERROR_MORE_DATA`, and sshd then treats it as absent.
+/// sshd checks only the status, never the type: a value of any type is read as its bytes.
+#[cfg(windows)]
+#[test]
+fn a_value_that_does_not_fit_sshds_buffer_is_absent() {
+    use windows::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_MORE_DATA, ERROR_SUCCESS};
+    let read = |status, text: &str| {
+        let buffer: Vec<u16> = text.encode_utf16().collect();
+        super::sshd_string_from_status("X", status, &buffer, (buffer.len() * 2) as u32)
+    };
+
+    assert_eq!(super::SSHD_VALUE_BYTES, 32768);
+    assert_eq!(read(ERROR_MORE_DATA, "").unwrap(), None);
+    assert_eq!(read(ERROR_FILE_NOT_FOUND, "").unwrap(), None);
+    assert!(read(ERROR_ACCESS_DENIED, "").is_err());
+    assert_eq!(read(ERROR_SUCCESS, "abc\0").unwrap().as_deref(), Some("abc"));
+    // A value stored without its terminator, and text after an embedded one, which a C string
+    // never reaches.
+    assert_eq!(read(ERROR_SUCCESS, "abc").unwrap().as_deref(), Some("abc"));
+    assert_eq!(read(ERROR_SUCCESS, "ab\0cd\0").unwrap().as_deref(), Some("ab"));
+    assert_eq!(read(ERROR_SUCCESS, "\0").unwrap(), None);
+}
+
+/// sshd reads each of the three values as raw bytes, whatever the type: a REG_DWORD is two wide
+/// characters, a REG_EXPAND_SZ is its text with the `%VAR%` left in (sshd does not expand it), and the
+/// 32768-byte rule holds for a REG_BINARY too. The carry takes what sshd would run. Under a key of
+/// the test's own (HKCU, deleted afterwards); CI only, as it writes the registry.
+#[cfg(windows)]
+#[test]
+fn a_value_of_another_type_is_read_as_the_text_sshd_runs() {
+    use windows::Win32::System::Registry::{REG_BINARY, REG_DWORD, REG_EXPAND_SZ, REG_SZ};
+    let sz = |text: &str| -> Vec<u8> {
+        text.encode_utf16()
+            .chain(std::iter::once(0))
+            .flat_map(u16::to_le_bytes)
+            .collect()
+    };
+
+    // 0x0058_0041 is the wide characters "A" and "X".
+    let key = TestKey::new("sshd-dword");
+    let sub = key.path();
+    super::set_value_hkcu(sub, "DefaultShell", REG_DWORD.0, &0x0058_0041u32.to_le_bytes());
+    super::set_value_hkcu(
+        sub,
+        "DefaultShellCommandOption",
+        REG_DWORD.0,
+        &0x0042_0000u32.to_le_bytes(),
+    );
+    super::set_value_hkcu(sub, "DefaultShellArguments", REG_BINARY.0, &sz("-x"));
+    let got = super::read_sshd_shell_hkcu(sub).unwrap();
+    assert_eq!(got.shell.as_deref(), Some("AX"), "a DWORD is two wide characters");
+    assert_eq!(got.command_option, None, "a DWORD whose first character is 0 is empty");
+    assert_eq!(got.arguments.as_deref(), Some("-x"));
+
+    let key = TestKey::new("sshd-expand");
+    let sub = key.path();
+    super::set_value_hkcu(sub, "DefaultShell", REG_EXPAND_SZ.0, &sz(r"%ProgramFiles%\x\sh.exe"));
+    super::set_value_hkcu(sub, "DefaultShellCommandOption", REG_EXPAND_SZ.0, &sz("%OPT%"));
+    super::set_value_hkcu(sub, "DefaultShellArguments", REG_EXPAND_SZ.0, &sz("%ARGS%"));
+    let got = super::read_sshd_shell_hkcu(sub).unwrap();
+    assert_eq!(got.shell.as_deref(), Some(r"%ProgramFiles%\x\sh.exe"));
+    assert_eq!(got.command_option.as_deref(), Some("%OPT%"));
+    assert_eq!(got.arguments.as_deref(), Some("%ARGS%"));
+
+    // 32768 bytes of a REG_BINARY are read, 32770 are not.
+    let key = TestKey::new("sshd-binary");
+    let sub = key.path();
+    super::set_value_hkcu(sub, "DefaultShell", REG_SZ.0, &sz(r"C:\x\sh.exe"));
+    super::set_value_hkcu(sub, "DefaultShellArguments", REG_BINARY.0, &vec![b'a'; 32768]);
+    super::set_value_hkcu(sub, "DefaultShellCommandOption", REG_BINARY.0, &vec![b'a'; 32770]);
+    let got = super::read_sshd_shell_hkcu(sub).unwrap();
+    assert_eq!(got.arguments.map(|text| text.chars().count()), Some(16384));
+    assert_eq!(got.command_option, None);
+}
+
+/// After `apply` carries `DefaultShellArguments` into the config it removes the value: left, sshd
+/// would hand the arguments to the shim before `-c`. Removing a value that is not there, or under a
+/// key that is not there, is not an error, and no other value goes. Under a key of the test's own
+/// (HKCU, deleted afterwards); CI only, as it writes the registry.
+#[cfg(windows)]
+#[test]
+fn removing_the_shell_arguments_removes_that_value_and_nothing_else() {
+    use windows::Win32::System::Registry::REG_SZ;
+    let sz = |text: &str| -> Vec<u8> {
+        text.encode_utf16()
+            .chain(std::iter::once(0))
+            .flat_map(u16::to_le_bytes)
+            .collect()
+    };
+    let key = TestKey::new("remove-args");
+    let sub = key.path();
+    super::set_value_hkcu(sub, "DefaultShell", REG_SZ.0, &sz(r"C:\x\sh.exe"));
+    super::set_value_hkcu(sub, "DefaultShellArguments", REG_SZ.0, &sz("-NoLogo"));
+
+    super::remove_shell_arguments_hkcu(sub).unwrap();
+    let got = super::read_sshd_shell_hkcu(sub).unwrap();
+    assert_eq!(got.arguments, None);
+    assert_eq!(got.shell.as_deref(), Some(r"C:\x\sh.exe"));
+
+    super::remove_shell_arguments_hkcu(sub).unwrap();
+    let missing_key = TestKey::new("remove-args-no-key");
+    super::remove_shell_arguments_hkcu(missing_key.path()).unwrap();
+}
+
+/// The three string values at sshd's boundary: 16383 characters plus the terminator is 32768 bytes
+/// and is read; one more character is not, and reads as absent. A `DefaultShell` that does not fit
+/// makes sshd run the system `cmd.exe` and ignore the other three values. Under a key of the
+/// test's own (HKCU, deleted afterwards); CI only, as it writes the registry.
+#[cfg(windows)]
+#[test]
+fn string_values_at_sshds_buffer_boundary_are_read_and_one_character_more_is_absent() {
+    use super::SshdShell;
+    use windows::Win32::System::Registry::{REG_DWORD, REG_SZ};
+    let sz = |text: &str| -> Vec<u8> {
+        text.encode_utf16()
+            .chain(std::iter::once(0))
+            .flat_map(u16::to_le_bytes)
+            .collect()
+    };
+    let fits = "x".repeat(16383);
+    let too_long = "x".repeat(16384);
+
+    let key = TestKey::new("sshd-fits");
+    let sub = key.path();
+    super::set_value_hkcu(sub, "DefaultShell", REG_SZ.0, &sz(&fits));
+    super::set_value_hkcu(sub, "DefaultShellCommandOption", REG_SZ.0, &sz(&fits));
+    super::set_value_hkcu(sub, "DefaultShellArguments", REG_SZ.0, &sz(&fits));
+    let got = super::read_sshd_shell_hkcu(sub).unwrap();
+    assert_eq!(got.shell.as_deref(), Some(fits.as_str()));
+    assert_eq!(got.command_option.as_deref(), Some(fits.as_str()));
+    assert_eq!(got.arguments.as_deref(), Some(fits.as_str()));
+
+    // The option and the arguments that do not fit are absent; the shell is still read.
+    let key = TestKey::new("sshd-options-too-long");
+    let sub = key.path();
+    super::set_value_hkcu(sub, "DefaultShell", REG_SZ.0, &sz(r"C:\x\sh.exe"));
+    super::set_value_hkcu(sub, "DefaultShellCommandOption", REG_SZ.0, &sz(&too_long));
+    super::set_value_hkcu(sub, "DefaultShellArguments", REG_SZ.0, &sz(&too_long));
+    super::set_value_hkcu(sub, "DefaultShellEscapeArguments", REG_DWORD.0, &0u32.to_le_bytes());
+    let got = super::read_sshd_shell_hkcu(sub).unwrap();
+    assert_eq!(
+        (
+            got.shell.as_deref(),
+            got.command_option,
+            got.arguments,
+            got.escape_arguments
+        ),
+        (Some(r"C:\x\sh.exe"), None, None, false)
+    );
+
+    // A shell that does not fit is no shell, and the companions go with it.
+    let key = TestKey::new("sshd-shell-too-long");
+    let sub = key.path();
+    super::set_value_hkcu(sub, "DefaultShell", REG_SZ.0, &sz(&too_long));
+    super::set_value_hkcu(sub, "DefaultShellCommandOption", REG_SZ.0, &sz("-Command"));
+    super::set_value_hkcu(sub, "DefaultShellArguments", REG_SZ.0, &sz("-NoLogo"));
+    super::set_value_hkcu(sub, "DefaultShellEscapeArguments", REG_DWORD.0, &0u32.to_le_bytes());
+    assert_eq!(super::read_sshd_shell_hkcu(sub).unwrap(), SshdShell::none());
+}
+
+/// sshd's service `ImagePath` is a `REG_EXPAND_SZ` that names the variables it uses: the directory
+/// sshd runs from is the expanded value's.
+#[cfg(windows)]
+#[test]
+fn the_image_path_is_read_with_its_variables_expanded_and_is_none_when_absent() {
+    use windows::Win32::System::Registry::REG_EXPAND_SZ;
+    let key = TestKey::new("image-path");
+    let subkey = key.path();
+    assert_eq!(super::read_image_path_hkcu(subkey).unwrap(), None, "no key");
+    super::set_value_hkcu(subkey, "Other", REG_EXPAND_SZ.0, &[0, 0]);
+    assert_eq!(super::read_image_path_hkcu(subkey).unwrap(), None, "no value");
+
+    let text = r#""%SystemRoot%\OpenSSH\sshd.exe" -x"#;
+    let bytes: Vec<u8> = text.encode_utf16().chain([0]).flat_map(u16::to_le_bytes).collect();
+    super::set_value_hkcu(subkey, "ImagePath", REG_EXPAND_SZ.0, &bytes);
+    let system_root = std::env::var("SystemRoot").expect("SystemRoot is set");
+    assert_eq!(
+        super::read_image_path_hkcu(subkey).unwrap().as_deref(),
+        Some(format!(r#""{system_root}\OpenSSH\sshd.exe" -x"#).as_str())
+    );
+}

@@ -58,17 +58,49 @@ pub fn escape_arguments_check<E: std::fmt::Display>(read: Result<bool, E>) -> Ch
     }
 }
 
+/// What sshd reads to start a session's shell (`pwd.c` `set_defaultshell`): the four
+/// `HKLM\SOFTWARE\OpenSSH` values `apply` carries into the system config before it overwrites them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SshdShell {
+    /// `DefaultShell`; `None` when absent, empty or too long for sshd's buffer ([`SSHD_VALUE_BYTES`]).
+    pub shell: Option<String>,
+    /// `DefaultShellCommandOption`; `None` when absent, empty or too long for sshd's buffer.
+    pub command_option: Option<String>,
+    /// `DefaultShellArguments`; `None` when absent, empty or too long for sshd's buffer.
+    pub arguments: Option<String>,
+    /// Whether sshd escapes the command: absent or too long means yes (see
+    /// [`escape_arguments_from_status`]).
+    pub escape_arguments: bool,
+}
+
+impl SshdShell {
+    /// No `DefaultShell`: sshd runs the system `cmd.exe` and ignores the other three values.
+    pub fn none() -> SshdShell {
+        SshdShell {
+            shell: None,
+            command_option: None,
+            arguments: None,
+            escape_arguments: true,
+        }
+    }
+}
+
+/// The size, in bytes, of the buffer sshd reads each of `DefaultShell`, `DefaultShellCommandOption`
+/// and `DefaultShellArguments` into. `pwd.c` declares `wchar_t[PATH_MAX]` (32768) but passes
+/// `_countof` of it, a count of wide characters, as the size in bytes.
+pub const SSHD_VALUE_BYTES: u32 = 32768;
+
 /// The production OpenSSH key under `HKEY_LOCAL_MACHINE`.
 pub const OPENSSH_KEY: &str = r"SOFTWARE\OpenSSH";
 
 #[cfg(windows)]
 mod win {
-    use super::{ESCAPE_ARGUMENTS, RegValue, desired_values};
+    use super::{ESCAPE_ARGUMENTS, RegValue, SSHD_VALUE_BYTES, SshdShell, desired_values};
     use anyhow::Context;
     use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_MORE_DATA, ERROR_PATH_NOT_FOUND, WIN32_ERROR};
     use windows::Win32::System::Registry::{
         HKEY, HKEY_LOCAL_MACHINE, KEY_QUERY_VALUE, KEY_WOW64_64KEY, REG_DWORD, REG_SZ, REG_VALUE_TYPE, RRF_RT_REG_SZ,
-        RegCloseKey, RegGetValueW, RegOpenKeyExW, RegQueryValueExW, RegSetKeyValueW,
+        RegCloseKey, RegDeleteKeyValueW, RegGetValueW, RegOpenKeyExW, RegQueryValueExW, RegSetKeyValueW,
     };
     use windows::core::PCWSTR;
 
@@ -143,6 +175,140 @@ mod win {
         }
         let chars = (cb as usize / 2).saturating_sub(1); // drop the NUL terminator
         Ok(String::from_utf16_lossy(&buf[..chars.min(buf.len())]))
+    }
+
+    /// A string value as stored, unexpanded, read the way sshd reads it (see
+    /// [`sshd_string_from_status`]): `None` when the key or value is absent, empty, or longer than
+    /// sshd's buffer. Any other failure is an error: it leaves what sshd reads unknown.
+    fn read_optional_string(root: HKEY, subkey: &str, name: &str) -> anyhow::Result<Option<String>> {
+        let (sub, name_w) = (wide(subkey), wide(name));
+        let mut key = HKEY::default();
+        // SAFETY: `sub` is NUL-terminated and `key` receives the opened handle.
+        let opened = unsafe {
+            RegOpenKeyExW(
+                root,
+                PCWSTR(sub.as_ptr()),
+                None,
+                KEY_QUERY_VALUE | KEY_WOW64_64KEY,
+                &mut key,
+            )
+        };
+        if is_absent(opened) {
+            return Ok(None);
+        }
+        opened.ok().with_context(|| format!("open the key of {name}"))?;
+        let mut buffer = vec![0u16; SSHD_VALUE_BYTES as usize / 2];
+        let mut bytes = SSHD_VALUE_BYTES;
+        // SAFETY: `name_w` is NUL-terminated; `buffer` holds `bytes` bytes.
+        let status = unsafe {
+            let status = RegQueryValueExW(
+                key,
+                PCWSTR(name_w.as_ptr()),
+                None,
+                None,
+                Some(buffer.as_mut_ptr().cast()),
+                Some(&mut bytes),
+            );
+            let _ = RegCloseKey(key);
+            status
+        };
+        sshd_string_from_status(name, status, &buffer, bytes)
+    }
+
+    /// What `RegQueryValueExW`'s answer says about one of the three string values. sshd acts only
+    /// on `ERROR_SUCCESS` (`pwd.c:78-89`): a missing value and one that does not fit its buffer
+    /// ([`SSHD_VALUE_BYTES`], `ERROR_MORE_DATA`) are both "not set". Any other failure leaves what
+    /// sshd reads unknown. sshd never looks at the value's type: the bytes are the text, whether the
+    /// value is a REG_SZ, a REG_EXPAND_SZ (not expanded), a REG_DWORD or anything else. Text ends at
+    /// the first NUL, as a C string does; an empty value counts as absent.
+    pub fn sshd_string_from_status(
+        name: &str,
+        status: WIN32_ERROR,
+        buffer: &[u16],
+        bytes: u32,
+    ) -> anyhow::Result<Option<String>> {
+        if is_absent(status) || status == ERROR_MORE_DATA {
+            return Ok(None);
+        }
+        status.ok().with_context(|| format!("read {name}"))?;
+        let units = (bytes as usize / 2).min(buffer.len());
+        let text = &buffer[..units];
+        let text = &text[..text.iter().position(|&unit| unit == 0).unwrap_or(text.len())];
+        Ok((!text.is_empty()).then(|| String::from_utf16_lossy(text)))
+    }
+
+    fn read_sshd_shell_in(root: HKEY, subkey: &str) -> anyhow::Result<SshdShell> {
+        let Some(shell) = read_optional_string(root, subkey, "DefaultShell")? else {
+            // sshd ignores the other values when there is no shell.
+            return Ok(SshdShell::none());
+        };
+        Ok(SshdShell {
+            shell: Some(shell),
+            command_option: read_optional_string(root, subkey, "DefaultShellCommandOption")?,
+            arguments: read_optional_string(root, subkey, "DefaultShellArguments")?,
+            escape_arguments: escape_arguments_in(root, subkey).context("read DefaultShellEscapeArguments")?,
+        })
+    }
+
+    /// Remove `DefaultShellArguments` from `<root>\<subkey>`. A value or a key that is not there
+    /// is already what this wants.
+    fn remove_shell_arguments_in(root: HKEY, subkey: &str) -> anyhow::Result<()> {
+        let (sub, name) = (wide(subkey), wide("DefaultShellArguments"));
+        // SAFETY: both strings are NUL-terminated.
+        let status = unsafe { RegDeleteKeyValueW(root, PCWSTR(sub.as_ptr()), PCWSTR(name.as_ptr())) };
+        if is_absent(status) {
+            return Ok(());
+        }
+        status.ok().context("remove DefaultShellArguments")
+    }
+
+    /// Production: remove `DefaultShellArguments` from `HKLM\<subkey>`.
+    pub fn remove_shell_arguments_under(subkey: &str) -> anyhow::Result<()> {
+        remove_shell_arguments_in(HKEY_LOCAL_MACHINE, subkey)
+    }
+
+    /// Production: the four shell values from `HKLM\<subkey>`, as sshd reads them.
+    pub fn read_sshd_shell_under(subkey: &str) -> anyhow::Result<SshdShell> {
+        read_sshd_shell_in(HKEY_LOCAL_MACHINE, subkey)
+    }
+
+    /// The service key of sshd.
+    const SSHD_SERVICE_KEY: &str = r"SYSTEM\CurrentControlSet\Services\sshd";
+
+    /// `ImagePath` under `<root>\<subkey>`, with its `%VARIABLES%` expanded as the service manager
+    /// does for a `REG_EXPAND_SZ`. `None` when it is not there.
+    fn read_image_path_in(root: HKEY, subkey: &str) -> anyhow::Result<Option<String>> {
+        use windows::Win32::System::Environment::ExpandEnvironmentStringsW;
+        let Some(raw) = read_optional_string(root, subkey, "ImagePath")? else {
+            return Ok(None);
+        };
+        let raw_w = wide(&raw);
+        // SAFETY: `raw_w` is NUL-terminated. With no buffer the call returns the length it needs, NUL included.
+        let needed = unsafe { ExpandEnvironmentStringsW(PCWSTR(raw_w.as_ptr()), None) } as usize;
+        anyhow::ensure!(
+            needed > 0,
+            "expand the sshd ImagePath: {}",
+            std::io::Error::last_os_error()
+        );
+        let mut buffer = vec![0u16; needed];
+        // SAFETY: as above; the buffer is the length the call is told.
+        let len = unsafe { ExpandEnvironmentStringsW(PCWSTR(raw_w.as_ptr()), Some(&mut buffer)) } as usize;
+        anyhow::ensure!(
+            len > 0 && len <= buffer.len(),
+            "expand the sshd ImagePath: {}",
+            std::io::Error::last_os_error()
+        );
+        Ok(Some(String::from_utf16_lossy(&buffer[..len - 1])))
+    }
+
+    /// Production: the `ImagePath` of the sshd service, the command line the service manager runs.
+    pub fn read_sshd_image_path() -> anyhow::Result<Option<String>> {
+        read_image_path_in(HKEY_LOCAL_MACHINE, SSHD_SERVICE_KEY)
+    }
+
+    #[cfg(test)]
+    pub fn read_image_path_hkcu(subkey: &str) -> anyhow::Result<Option<String>> {
+        read_image_path_in(windows::Win32::System::Registry::HKEY_CURRENT_USER, subkey)
     }
 
     /// Production: write [`desired_values`] under `HKLM\<subkey>`.
@@ -240,6 +406,14 @@ mod win {
         )
     }
     #[cfg(test)]
+    pub fn read_sshd_shell_hkcu(subkey: &str) -> anyhow::Result<SshdShell> {
+        read_sshd_shell_in(windows::Win32::System::Registry::HKEY_CURRENT_USER, subkey)
+    }
+    #[cfg(test)]
+    pub fn remove_shell_arguments_hkcu(subkey: &str) -> anyhow::Result<()> {
+        remove_shell_arguments_in(windows::Win32::System::Registry::HKEY_CURRENT_USER, subkey)
+    }
+    #[cfg(test)]
     pub fn read_string_hkcu(subkey: &str, name: &str) -> anyhow::Result<String> {
         read_value(windows::Win32::System::Registry::HKEY_CURRENT_USER, subkey, name)
     }
@@ -301,11 +475,15 @@ mod win {
 
 #[cfg(all(windows, test))]
 pub use win::{
-    delete_hkcu, escape_arguments_from_status, escape_arguments_hkcu, read_dword_hkcu, read_hkcu, read_string_hkcu,
-    set_hkcu, set_hkcu_confirming, set_value_hkcu,
+    delete_hkcu, escape_arguments_from_status, escape_arguments_hkcu, read_dword_hkcu, read_hkcu, read_image_path_hkcu,
+    read_sshd_shell_hkcu, read_string_hkcu, remove_shell_arguments_hkcu, set_hkcu, set_hkcu_confirming, set_value_hkcu,
+    sshd_string_from_status,
 };
 #[cfg(windows)]
-pub use win::{escape_arguments_under, read_default_shell_under, set_default_shell_under};
+pub use win::{
+    escape_arguments_under, read_default_shell_under, read_sshd_image_path, read_sshd_shell_under,
+    remove_shell_arguments_under, set_default_shell_under,
+};
 
 #[cfg(test)]
 #[path = "registry_tests.rs"]

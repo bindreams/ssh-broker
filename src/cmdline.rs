@@ -24,15 +24,31 @@ pub enum RawExec {
     Argv(String),
 }
 
+/// A `-c` command, decoded, and whether the client asked for a terminal with it (`ssh -t host cmd`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Exec {
+    pub command: String,
+    /// The session has a console ([`Encoding::Verbatim`]): the command gets a terminal.
+    pub terminal: bool,
+}
+
 /// The command `exec` carries. A tail is decoded by the form `detect` reports, called here rather
-/// than at startup because only a `-c` session needs it.
-pub fn resolve_exec(exec: RawExec, detect: impl FnOnce() -> Encoding) -> String {
-    match exec {
-        RawExec::Tail(tail) => decode_command(&tail, detect()),
+/// than at startup because only a `-c` session needs it; the same report says whether there is a
+/// terminal.
+pub fn resolve_exec(exec: RawExec, detect: impl FnOnce() -> Encoding) -> Exec {
+    let (command, encoding) = match exec {
+        RawExec::Tail(tail) => {
+            let encoding = detect();
+            (decode_command(&tail, encoding), encoding)
+        }
         RawExec::Argv(command) => {
             tracing::warn!("the raw command line has no `-c` although argv does; running the joined argv");
-            command
+            (command, detect())
         }
+    };
+    Exec {
+        command,
+        terminal: encoding == Encoding::Verbatim,
     }
 }
 
@@ -53,6 +69,19 @@ pub enum Encoding {
     /// with the session being served. ssh-broker owns the setting instead: `apply` writes the flag
     /// and installs the shim at a path sshd does not special-case, and `verify` checks it.
     Escaped,
+}
+
+/// The command line that `CommandLineToArgvW` (and the C runtime) split back into exactly `args`.
+///
+/// An adapter over `cosca::quote::windows::join_wide`, which is the quoting; nothing here
+/// quotes. Each argument is quoted on its own, so `join_args(&["a b"])` is one argument. The
+/// first argument may be a program path: a path holds no `"` and does not end in `\`, the only
+/// cases where the program name's rules differ from an argument's.
+pub fn join_args<S: AsRef<str>>(args: &[S]) -> String {
+    let wide: Vec<Vec<u16>> = args.iter().map(|a| a.as_ref().encode_utf16().collect()).collect();
+    let refs: Vec<&[u16]> = wide.iter().map(Vec::as_slice).collect();
+    // Only ASCII is added to valid UTF-16, so the result is valid.
+    String::from_utf16(&cosca::quote::windows::join_wide(&refs)).expect("join_wide adds only ASCII to valid UTF-16")
 }
 
 /// Space and tab separate arguments; nothing else does.

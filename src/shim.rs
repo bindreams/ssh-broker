@@ -1,9 +1,10 @@
 //! shim: the SSH `DefaultShell` (default action). Relays the terminal/streams to
 //! the agent over AF_UNIX; fails open to a local shell if the agent is unreachable.
 
-use crate::cmdline::RawExec;
-use crate::protocol::{FrameKind, FrameReader, Handshake, Mode, Resize, Stream, write_frame};
+use crate::cmdline::{Exec, RawExec};
+use crate::protocol::{FrameKind, FrameReader, Handshake, Launch, Mode, Resize, Stream, write_frame};
 use crate::relay::{FrameSink, Outcome, PumpError, pump_decode, write_data};
+use crate::shell::{self, Session};
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
 
@@ -359,11 +360,8 @@ pub enum Fallback {
     /// The agent answered — relay this session to it.
     Relay,
     /// The agent is unreachable — fail open so the box is never locked out, and warn (to a log
-    /// in PTY mode, to stderr in EXEC) that parity is unavailable.
-    ///
-    /// The name is historical and only half true: a shell is what an INTERACTIVE session gets.
-    /// An `ssh host "cmd"` session runs the command directly, with no shell in between to
-    /// reinterpret its quoting — [`decide_fail_open`] is where the two part company.
+    /// in PTY mode, to stderr in EXEC) that parity is unavailable. The session runs through the
+    /// configured shell, as it would have under the agent ([`fail_open`]).
     LocalShellWithWarning,
 }
 
@@ -377,23 +375,63 @@ pub fn decide_fallback(connect_err: bool) -> Fallback {
     }
 }
 
-/// What the shim runs once it has decided to fail open.
-#[derive(Debug, PartialEq, Eq)]
-pub enum FailOpen {
-    /// `ssh host "cmd"` — run the command itself, with NO shell between it and sshd's pipes.
-    Passthrough(String),
-    /// An interactive session carries no command to run, so it gets a plain `pwsh`.
-    LocalShell,
-}
-
-/// Decide what the fail-open path runs, from whether this session carried a command.
+/// Fail open: run the session locally, through the same shell and with the same packing as the
+/// agent would have used, and return the exit code. `start` starts a line; `finish` waits for what
+/// it started and returns its exit code. Only a failed `start` falls back to another line: once
+/// the shell runs, a failure of `finish` is reported and nothing is run again.
 ///
-/// Pure, and lifted out of `shim_pty::run_on` for the same reason as [`decide_fallback`]: that
-/// function ends in `process::exit`, so nothing could assert against the choice in place.
-pub fn decide_fail_open(exec: Option<String>) -> FailOpen {
-    match exec {
-        Some(cmd) => FailOpen::Passthrough(cmd),
-        None => FailOpen::LocalShell,
+/// The shell is resolved here, in the shim's own environment (`host`), by the one function the agent
+/// uses ([`shell::plan`]). When the configured shell cannot be used, the built-in `cmd.exe` runs
+/// instead and the reason goes to `stderr` first. A line that cannot be made, or a spawn that
+/// fails, exits 255: this crate's code for a broker-side failure, which 1 would hide among a
+/// command's own failures.
+pub fn fail_open<T>(
+    host: &dyn shell::Host,
+    exec: &Option<Exec>,
+    stderr: &mut dyn Write,
+    start: impl FnMut(&str) -> Result<T, shell::StartError>,
+    finish: impl FnOnce(T) -> anyhow::Result<i32>,
+) -> i32 {
+    let session = match exec {
+        Some(exec) => Session::Command {
+            text: &exec.command,
+            terminal: exec.terminal,
+        },
+        None => Session::Interactive,
+    };
+    // Nothing is relayed here and the console is not in raw mode, so every message the user must see
+    // goes to stderr, in every mode: with no message, a session that ends at once says nothing.
+    let tell = |stderr: &mut dyn Write, text: &str| {
+        let _ = writeln!(stderr, "{text}");
+    };
+    let plan = match shell::plan(host, &session) {
+        Ok(plan) => plan,
+        Err(e) => {
+            tracing::error!("fail-open could not make the shell's command line: {e:#}");
+            tell(stderr, &format!("ssh-broker: could not run the command locally: {e:#}"));
+            return 255;
+        }
+    };
+    if let Some(notice) = plan.notice() {
+        tracing::warn!("{notice}");
+        tell(stderr, &notice);
+    }
+    // A replacement for a shell that cannot start is warned about by `start_or_fall_back` just before
+    // it starts.
+    let started = shell::start_or_fall_back(host, &session, &plan, start, |replacement| {
+        if let Some(notice) = replacement.notice() {
+            tracing::warn!("{notice}");
+            tell(&mut *stderr, &notice);
+        }
+    })
+    .and_then(finish);
+    match started {
+        Ok(code) => code,
+        Err(e) => {
+            tracing::error!("fail-open spawn of {:?} failed: {e:?}", plan.command_line);
+            tell(stderr, &format!("ssh-broker: could not run the command locally: {e}"));
+            255
+        }
     }
 }
 
@@ -421,17 +459,30 @@ pub fn map_outcome(outcome: Result<Outcome, crate::relay::PumpError>) -> i32 {
 }
 
 /// Build the handshake from the shim's inputs (pure; the Windows caller supplies `term` from
-/// `$TERM` and `cols`/`rows` from the live console). EXEC mode iff a command is present; `cwd`
-/// and `env` are empty in v1 — the agent supplies the session-1 working dir and profile env.
-pub fn make_handshake(exec: &Option<String>, term: String, cols: u16, rows: u16) -> Handshake {
+/// `$TERM` and `cols`/`rows` from the live console). A command without a terminal is an EXEC
+/// session; a command with one (`ssh -t host cmd`) is a PTY session that carries the command.
+/// `cwd` and `env` are empty: the agent supplies the session-1 working dir and profile env.
+pub fn make_handshake(
+    exec: &Option<String>,
+    terminal: bool,
+    launch: Launch,
+    term: String,
+    cols: u16,
+    rows: u16,
+) -> Handshake {
     Handshake {
-        mode: if exec.is_some() { Mode::Exec } else { Mode::Pty },
+        mode: if exec.is_some() && !terminal {
+            Mode::Exec
+        } else {
+            Mode::Pty
+        },
         cols,
         rows,
         term,
         cwd: String::new(),
         command: exec.clone(),
         env: Vec::new(),
+        launch,
         ..Handshake::pty_default()
     }
 }

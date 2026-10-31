@@ -28,12 +28,21 @@ pub enum Route {
     Verify,
     /// Hidden: the parity-probe child the agent spawns in session 1 (used by `verify`).
     VerifyProbe,
+    /// Hidden: the fallback shell of a terminal session through the agent. `handle` is the value of
+    /// an inherited pipe that holds a notice and a line (see `handoff`); the verb prints the notice
+    /// on its console, starts the line on that console and exits with the code of the line. `login`:
+    /// the session has no command (see `agent::launch::Spawn`).
+    ConsoleFallback {
+        handle: usize,
+        login: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verb {
     Agent,
     Logout,
+    ConsoleFallback,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -80,6 +89,10 @@ pub fn route(args: &[String], command_line: &str) -> Route {
         Some("apply") => Route::Apply,
         Some("verify") => Route::Verify,
         Some("verify-probe") => Route::VerifyProbe,
+        Some("console-fallback") => console_fallback_args(&args[1..])
+            .map_or(Route::Usage(Verb::ConsoleFallback), |(handle, login)| {
+                Route::ConsoleFallback { handle, login }
+            }),
         Some("-c") => {
             // `-c` was given, so this is an exec request even when the command is empty.
             let exec = match cmdline::dash_c_tail(command_line) {
@@ -96,6 +109,24 @@ pub fn route(args: &[String], command_line: &str) -> Route {
         }
         _ => Route::Shim { exec: None },
     }
+}
+
+/// `[--login] <handle>`: the value of the inherited pipe handle, and whether the session is a login.
+fn console_fallback_args(rest: &[String]) -> Option<(usize, bool)> {
+    let (login, handle) = match rest {
+        [handle] => (false, handle),
+        [flag, handle] if flag == "--login" => (true, handle),
+        _ => return None,
+    };
+    // Digits only (`parse` also takes a leading `+`), and not zero: a NULL handle is never valid.
+    if !handle.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    handle
+        .parse()
+        .ok()
+        .filter(|&handle| handle != 0)
+        .map(|handle| (handle, login))
 }
 
 /// `[]` or `--background [--expect-user <sid>]`, the flag at most once. A

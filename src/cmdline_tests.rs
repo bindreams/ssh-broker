@@ -6,7 +6,7 @@
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Mutex};
 
-use super::{Encoding, RawExec, dash_c_tail, decode_command, resolve_exec, split_args};
+use super::{Encoding, RawExec, dash_c_tail, decode_command, join_args, resolve_exec, split_args};
 
 fn args(line: &str) -> Vec<String> {
     split_args(line)
@@ -175,20 +175,29 @@ pub(super) fn logged<T>(f: impl FnOnce() -> T) -> (String, T) {
 #[test]
 fn a_tail_is_decoded_by_the_encoding() {
     let tail = || RawExec::Tail(r#""echo \"a b\"""#.into());
-    let (log, command) = logged(|| resolve_exec(tail(), || Encoding::Escaped));
-    assert_eq!(command, r#"echo "a b""#);
+    let (log, exec) = logged(|| resolve_exec(tail(), || Encoding::Escaped));
+    assert_eq!(exec.command, r#"echo "a b""#);
     assert_eq!(log, "", "nothing to report");
-    let (_, command) = logged(|| resolve_exec(tail(), || Encoding::Verbatim));
-    assert_eq!(command, r#""echo \"a b\"""#);
+    let (_, exec) = logged(|| resolve_exec(tail(), || Encoding::Verbatim));
+    assert_eq!(exec.command, r#""echo \"a b\"""#);
 }
 
-/// argv carried a `-c` the raw line did not show: the joined argv is the command, nothing is
-/// detected, and the log says the line was unexpected.
+#[test]
+fn resolve_exec_reports_a_terminal_for_the_verbatim_form_only() {
+    for (encoding, terminal) in [(Encoding::Verbatim, true), (Encoding::Escaped, false)] {
+        let exec = resolve_exec(RawExec::Tail("echo hi".into()), || encoding);
+        assert_eq!(exec.terminal, terminal, "{encoding:?}");
+        let (_, argv) = logged(|| resolve_exec(RawExec::Argv("echo hi".into()), || encoding));
+        assert_eq!(argv.terminal, terminal, "argv, {encoding:?}");
+    }
+}
+
+/// argv carried a `-c` the raw line did not show: the joined argv is the command, undecoded, and
+/// the log says the line was unexpected.
 #[test]
 fn an_argv_command_is_used_as_it_is_and_logged() {
-    let detect = || -> Encoding { panic!("there is no encoding to detect for argv") };
-    let (log, command) = logged(|| resolve_exec(RawExec::Argv("a b c".into()), detect));
-    assert_eq!(command, "a b c");
+    let (log, exec) = logged(|| resolve_exec(RawExec::Argv("a b c".into()), || Encoding::Escaped));
+    assert_eq!(exec.command, "a b c");
     assert!(log.contains("WARN") && log.contains("no `-c`"), "{log}");
 }
 
@@ -226,4 +235,61 @@ fn a_tail_that_fits_its_form_is_not_logged() {
         let (log, _) = logged(|| decode_command(tail, encoding));
         assert_eq!(log, "", "{encoding:?} {tail:?}");
     }
+}
+
+// join_args =====
+
+/// Every string up to `max_len` over `alphabet`, shortest first.
+fn strings(alphabet: &[char], max_len: usize) -> Vec<String> {
+    let mut layer = vec![String::new()];
+    let mut all = vec![String::new()];
+    for _ in 0..max_len {
+        layer = layer
+            .iter()
+            .flat_map(|prefix| alphabet.iter().map(move |c| format!("{prefix}{c}")))
+            .collect();
+        all.extend(layer.iter().cloned());
+    }
+    all
+}
+
+/// `split_args` is the MSVCRT splitter the repository already trusts; `join_args` must be inverted by it.
+#[test]
+fn join_args_round_trips_through_split_args() {
+    let mut failures = Vec::new();
+    let mut check = |args: &[&str]| {
+        let line = format!("prog {}", join_args(args));
+        let mut want = vec!["prog".to_string()];
+        want.extend(args.iter().map(|a| a.to_string()));
+        if split_args(&line) != want {
+            failures.push(format!("{args:?} -> {line:?}"));
+        }
+    };
+    for command in crate::command_corpus::CORPUS {
+        check(&[command]);
+        check(&["-c", command]);
+    }
+    let all = strings(&['a', ' ', '\t', '"', '\\', '\''], 4);
+    for a in &all {
+        for b in &all {
+            if a.len() + b.len() <= 5 {
+                check(&[a, b]);
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
+fn join_args_quotes_one_argument_on_its_own() {
+    assert_eq!(join_args(&["a b"]), r#""a b""#);
+    assert_eq!(join_args(&["ab"]), "ab");
+    assert_eq!(join_args(&[""]), r#""""#);
+    assert_eq!(join_args::<&str>(&[]), "");
+    assert_eq!(join_args(&[r"C:\a b\"]), r#""C:\a b\\""#);
+}
+
+#[test]
+fn join_args_keeps_non_ascii_text() {
+    assert_eq!(join_args(&["héllo wörld ✓", "😀"]), r#""héllo wörld ✓" 😀"#);
 }

@@ -37,7 +37,11 @@ pub use ending::{end_process, hold_until_end, keep_log};
 #[cfg(windows)]
 mod connections;
 #[cfg(windows)]
+mod launch;
+#[cfg(windows)]
 mod logout;
+#[cfg(windows)]
+mod verb;
 
 #[cfg(windows)]
 use crate::afunix::{self, AcceptError, ConnRx, ConnTx, Listener};
@@ -57,6 +61,8 @@ use crate::protocol::{ExitCode, FrameKind, FrameReader, Handshake, Mode, Resize,
 use crate::relay::{FrameSink, pump_until_peer_gone, write_data};
 #[cfg(windows)]
 use crate::route::{AgentArgs, BackgroundArgs};
+#[cfg(windows)]
+use crate::shell::StartError;
 #[cfg(windows)]
 use crate::socket_loc::SocketLocation;
 #[cfg(windows)]
@@ -497,12 +503,6 @@ fn serve_connections_with<C>(
     }
 }
 
-/// Default shell when the handshake carries no command (config-driven shell is Phase 7).
-#[cfg(windows)]
-fn default_shell() -> String {
-    "pwsh.exe -NoLogo".to_string()
-}
-
 /// The home directory of the account the agent runs as: its token's profile. The environment is
 /// not consulted, because it belongs to whoever started the process. `None` (logged) if there is
 /// no such directory.
@@ -567,14 +567,15 @@ struct Env<'a> {
 #[cfg(windows)]
 type WatchFactory = fn(&ConnTx) -> std::io::Result<(HangupWatcher, Waker)>;
 
-/// How a session starts its shell in a pseudoconsole (`command`, `cols`, `rows`, `cwd`); a parameter
-/// so a test can force a failure without starting a process.
+/// How a session starts its shell in a pseudoconsole (`command`, `cols`, `rows`, `cwd`, and the one
+/// handle besides the pseudoconsole's that the shell inherits, if any); a parameter so a test can
+/// force a failure without starting a process.
 #[cfg(windows)]
-type PtyStarter = fn(&str, u16, u16, Option<&Path>) -> anyhow::Result<PtySession>;
+type PtyStarter = fn(&str, u16, u16, Option<&Path>, Option<&OwnedHandle>) -> Result<PtySession, StartError>;
 
 /// How a session starts its command on pipes (`command`, `cwd`); a parameter like [`PtyStarter`].
 #[cfg(windows)]
-type ExecStarter = fn(&str, Option<&Path>) -> anyhow::Result<ExecChild>;
+type ExecStarter = fn(&str, Option<&Path>) -> Result<ExecChild, StartError>;
 
 /// How a connection is split into halves; a parameter so a test can force a failure.
 #[cfg(windows)]
@@ -586,6 +587,8 @@ struct Hooks {
     make_watcher: WatchFactory,
     start_pty: PtyStarter,
     start_exec: ExecStarter,
+    /// What the shell configuration is resolved against: the machine, in production.
+    shell_host: Box<dyn crate::shell::Host + Send + Sync>,
     split: Splitter,
     parked: ParkSignal,
     /// Called once the session's shell is started and before it is registered, the window in which
@@ -612,8 +615,9 @@ impl Hooks {
     fn production() -> Self {
         Self {
             make_watcher: HangupWatcher::new,
-            start_pty: |command, cols, rows, cwd| Ok(PtySession::spawn(command, cols, rows, cwd)?),
-            start_exec: |command, cwd| Ok(ExecChild::spawn(command, cwd)?),
+            start_pty: PtySession::spawn,
+            start_exec: ExecChild::spawn,
+            shell_host: Box::new(crate::shell::WindowsHost),
             split: afunix::try_split,
             parked: ParkSignal::default(),
             after_spawn: Box::new(|| {}),
@@ -675,13 +679,46 @@ fn handle_connection_in(conn: socket2::Socket, hooks: Hooks, control: &Control) 
     if control.is_ending() {
         return logout::refuse_while_ending(&mut rx, &mut tx, control);
     }
-    let command = hs.command.clone().unwrap_or_else(default_shell);
+    let launched = match launch::launch_line(&hs, &*hooks.shell_host) {
+        Ok(launched) => launched,
+        Err(launch::Refusal::BadRequest(cause)) => {
+            return Err(logout::fail_connection(
+                &mut rx,
+                &mut tx,
+                control,
+                "the agent could not read the request",
+                cause,
+                logout::BAD_REQUEST_EXIT_CODE,
+            ));
+        }
+        Err(launch::Refusal::Failed(cause)) => {
+            return Err(logout::fail_connection(
+                &mut rx,
+                &mut tx,
+                control,
+                "the agent could not prepare the shell",
+                cause,
+                logout::FAILED_EXIT_CODE,
+            ));
+        }
+    };
     let cwd_buf = child_cwd(&hs.cwd, home_dir());
     let cwd = cwd_buf.as_deref();
     match hs.mode {
-        Mode::Pty => handle_pty(rx, fr, tx, &command, (hs.cols, hs.rows), cwd, Env { hooks, control }),
-        Mode::Exec => handle_exec(rx, fr, tx, &command, cwd, Env { hooks, control }),
+        Mode::Pty => handle_pty(rx, fr, tx, &launched, (hs.cols, hs.rows), cwd, Env { hooks, control }),
+        Mode::Exec => handle_exec(rx, fr, tx, &launched, cwd, Env { hooks, control }),
         Mode::Logout => unreachable!("answered above"),
+    }
+}
+
+/// Show the warning for a shell that could not be used: the first data of the session, on the
+/// terminal for a PTY and on stderr for a command. `launch::start` has logged it.
+#[cfg(windows)]
+fn show_notice(tx: &mut ConnTx, mode: Mode, text: &str) {
+    let (stream, bytes) = launch::notice_frame(mode, text);
+    // A client that has gone is found by the relay, which owns that case.
+    if let Err(e) = write_data(tx, stream, &bytes) {
+        tracing::debug!("could not show the shell warning: {e:#}");
     }
 }
 
@@ -735,6 +772,22 @@ mod agent_reply_tests;
 
 // ── PTY relay ────────────────────────────────────────────────────────────────────────
 
+/// This program's path, looked up once for all the agent's sessions: the hidden `console-fallback`
+/// verb is started from it. `None` (with one warning) when it cannot be found, and then the warning of
+/// a terminal session goes out ahead of the shell.
+#[cfg(windows)]
+fn broker_exe() -> Option<&'static Path> {
+    static EXE: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    EXE.get_or_init(|| {
+        std::env::current_exe()
+            .inspect_err(|e| {
+                tracing::warn!("cannot find this program, so a shell warning goes out ahead of the terminal: {e}")
+            })
+            .ok()
+    })
+    .as_deref()
+}
+
 /// Interactive PTY relay: spawn the shell in a ConPTY and bridge it with three threads and
 /// an ordered, race-free teardown (criterion 2).
 #[cfg(windows)]
@@ -742,13 +795,33 @@ fn handle_pty(
     mut rx: ConnRx,
     mut fr: FrameReader,
     mut tx: ConnTx,
-    command: &str,
+    launched: &launch::Launched<'_>,
     (cols, rows): (u16, u16),
     cwd: Option<&Path>,
     env: Env<'_>,
 ) -> anyhow::Result<()> {
     let Env { hooks, control } = env;
-    let mut session = match (hooks.start_pty)(command, cols, rows, cwd) {
+    // The warning for a shell that could not be used is printed by `console-fallback` inside the
+    // pseudoconsole, which clears the screen after anything written ahead of it. Without this
+    // program's path it goes out here, before the output threads exist.
+    let started = launch::start(
+        &*hooks.shell_host,
+        launched,
+        broker_exe(),
+        |spawn| match spawn {
+            launch::Spawn::Line(line) => (hooks.start_pty)(line, cols, rows, cwd, None),
+            launch::Spawn::Verb {
+                exe,
+                notice,
+                line,
+                login,
+            } => verb::start(exe, notice, line, login, |verb_line, read| {
+                (hooks.start_pty)(verb_line, cols, rows, cwd, Some(read))
+            }),
+        },
+        |text| show_notice(&mut tx, Mode::Pty, text),
+    );
+    let mut session = match started {
         Ok(session) => session,
         Err(cause) => {
             return Err(logout::fail_connection(
@@ -999,12 +1072,24 @@ fn handle_exec(
     mut rx: ConnRx,
     mut fr: FrameReader,
     mut tx: ConnTx,
-    command: &str,
+    launched: &launch::Launched<'_>,
     cwd: Option<&Path>,
     env: Env<'_>,
 ) -> anyhow::Result<()> {
     let Env { hooks, control } = env;
-    let mut child = match (hooks.start_exec)(command, cwd) {
+    let started = launch::start(
+        &*hooks.shell_host,
+        launched,
+        None,
+        |spawn| match spawn {
+            launch::Spawn::Line(line) => (hooks.start_exec)(line, cwd),
+            launch::Spawn::Verb { .. } => Err(StartError::Other(anyhow::anyhow!(
+                "a session without a pseudoconsole is given no verb"
+            ))),
+        },
+        |text| show_notice(&mut tx, Mode::Exec, text),
+    );
+    let mut child = match started {
         Ok(child) => child,
         Err(cause) => {
             return Err(logout::fail_connection(

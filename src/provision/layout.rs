@@ -36,6 +36,11 @@ impl Layout {
         self.base.join("apply.lock")
     }
 
+    /// The system layer of the shell configuration; see [`crate::shell`].
+    pub fn system_config_path(&self) -> PathBuf {
+        self.base.join("config.yaml")
+    }
+
     /// A single-user install's saved account; `apply` removes it.
     fn legacy_config_path(&self) -> PathBuf {
         self.base.join("config.toml")

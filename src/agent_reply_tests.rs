@@ -3,8 +3,9 @@
 //! hooks fail on purpose, and the connections are AF_UNIX pairs in a temp dir.
 use super::*;
 use crate::afunix::{ConnTx, Whole};
-use crate::protocol::{FrameKind, Handshake, Mode, Stream, write_frame};
+use crate::protocol::{FrameKind, Handshake, Launch, Mode, Stream, write_frame};
 use crate::relay::{Outcome, TestSink, pump_decode, write_data};
+use crate::shell::test_host::{TestHost, USER_CONFIG};
 
 /// What a client saw: how the session ended and what the agent wrote to its stderr.
 struct Answer {
@@ -48,8 +49,8 @@ fn handshake(mode: Mode, command: &str) -> impl FnOnce(&mut ConnTx) + Send + 'st
 
 fn failing_starters() -> Hooks {
     Hooks {
-        start_exec: |_, _| Err(anyhow::anyhow!("the system cannot find the file")),
-        start_pty: |_, _, _, _| Err(anyhow::anyhow!("the system cannot find the file")),
+        start_exec: |_, _| Err(StartError::Program(anyhow::anyhow!("the system cannot find the file"))),
+        start_pty: |_, _, _, _, _| Err(StartError::Program(anyhow::anyhow!("the system cannot find the file"))),
         ..Hooks::production()
     }
 }
@@ -166,7 +167,7 @@ fn a_client_that_leaves_in_the_middle_of_a_frame_is_still_a_bad_request() {
 #[test]
 fn a_handler_that_panics_answers_its_connection_with_255_before_it_closes() {
     let hooks = Hooks {
-        start_pty: |_, _, _, _| panic!("the starter failed"),
+        start_pty: |_, _, _, _, _| panic!("the starter failed"),
         ..Hooks::production()
     };
     let (server, client, dir) = crate::test_support::raw_socket_pair("panic-reply");
@@ -246,4 +247,106 @@ fn a_connection_refused_at_accept_is_answered_with_255_not_dropped() {
         String::from_utf8(sink.stderr).unwrap(),
         "ssh-broker: the agent could not use the connection: the connection is inheritable by child processes\r\n"
     );
+}
+
+// Which line a handshake starts -----
+
+/// `command` as a `Launch::Shell` request in `mode`.
+fn shell_request(mode: Mode, command: Option<&str>) -> impl FnOnce(&mut ConnTx) + Send + 'static {
+    let hs = Handshake {
+        mode,
+        command: command.map(str::to_owned),
+        launch: Launch::Shell,
+        ..Handshake::pty_default()
+    };
+    move |tx| {
+        write_frame(tx, FrameKind::Handshake, &hs.encode().unwrap()).unwrap();
+        write_data(tx, Stream::Stdin, b"").unwrap();
+    }
+}
+
+fn with_host(host: TestHost) -> Hooks {
+    Hooks {
+        shell_host: Box::new(host),
+        ..failing_starters()
+    }
+}
+
+#[test]
+fn a_request_without_the_command_it_needs_is_answered_with_254_and_starts_nothing() {
+    for (tag, mode, launch) in [
+        ("exec-shell", Mode::Exec, Launch::Shell),
+        ("exec-direct", Mode::Exec, Launch::Direct),
+        ("pty-direct", Mode::Pty, Launch::Direct),
+    ] {
+        let hs = Handshake {
+            mode,
+            launch,
+            ..Handshake::pty_default()
+        };
+        let (answer, result) = answered(tag, failing_starters(), move |tx| {
+            write_frame(tx, FrameKind::Handshake, &hs.encode().unwrap()).unwrap();
+            write_data(tx, Stream::Stdin, b"").unwrap();
+        });
+        assert_eq!(answer.outcome, Outcome::Exited(254), "{tag}");
+        assert!(
+            answer
+                .stderr
+                .starts_with("ssh-broker: the agent could not read the request: "),
+            "{tag}: {}",
+            answer.stderr
+        );
+        assert!(answer.stderr.contains("needs a command"), "{tag}: {}", answer.stderr);
+        assert!(result.is_err(), "{tag}");
+    }
+}
+
+#[test]
+fn a_command_too_long_for_a_command_line_is_answered_with_255_and_starts_nothing() {
+    let long = "x".repeat(40_000);
+    let (answer, result) = answered(
+        "too-long",
+        with_host(TestHost::new()),
+        shell_request(Mode::Exec, Some(&long)),
+    );
+    assert_eq!(answer.outcome, Outcome::Exited(255));
+    assert!(answer.stderr.contains("32,767"), "{}", answer.stderr);
+    assert!(
+        !answer.stderr.contains("could not start"),
+        "a starter was reached: {}",
+        answer.stderr
+    );
+    assert!(result.is_err());
+}
+
+#[test]
+fn a_broken_config_shows_one_warning_before_anything_else() {
+    let host = TestHost::new().with_user_config("shell: {strt: pwsh.exe}\n");
+    let (answer, _result) = answered("warn-exec", with_host(host), shell_request(Mode::Exec, Some("echo hi")));
+    let warning = format!("ssh-broker: cannot use the shell from {USER_CONFIG}");
+    assert!(answer.stderr.starts_with(&warning), "{}", answer.stderr);
+    assert_eq!(
+        answer.stderr.matches("cannot use the shell").count(),
+        1,
+        "{}",
+        answer.stderr
+    );
+    assert!(
+        answer.stderr.contains("using the built-in cmd.exe\n"),
+        "{}",
+        answer.stderr
+    );
+    // The starter fails on purpose after it: the failure reply follows the warning.
+    assert!(
+        answer.stderr.contains("could not start the command"),
+        "{}",
+        answer.stderr
+    );
+}
+
+#[test]
+fn a_working_config_shows_no_warning() {
+    let host = TestHost::new();
+    let (answer, _result) = answered("no-warn", with_host(host), shell_request(Mode::Exec, Some("echo hi")));
+    assert!(!answer.stderr.contains("cannot use the shell"), "{}", answer.stderr);
 }
