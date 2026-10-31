@@ -22,17 +22,17 @@ pub fn run(exec: Option<RawExec>) -> anyhow::Result<()> {
     }
 }
 
-/// `console-fallback`: read the notice and the line from `file`, print the notice on this console,
-/// start the line on it and exit with its code. The agent starts this in place of a fallback shell
-/// in a pseudoconsole, because anything it writes to one ahead of the shell is cleared (see
-/// `agent::launch`).
-pub fn run_console_fallback(file: &str) -> anyhow::Result<()> {
+/// `console-fallback`: read the notice and the line from the inherited pipe `handle`, print the notice
+/// on this console, start the line on it and exit with its code. The agent starts this in place of a
+/// fallback shell in a pseudoconsole, because anything it writes to one ahead of the shell is cleared
+/// (see `agent::launch`). `login`: the session has no command.
+pub fn run_console_fallback(handle: usize, login: bool) -> anyhow::Result<()> {
     #[cfg(windows)]
-    std::process::exit(crate::shim_pty::console_fallback(std::path::Path::new(file)));
+    std::process::exit(crate::shim_pty::console_fallback(handle, login));
 
     #[cfg(not(windows))]
     {
-        let _ = file;
+        let _ = (handle, login);
         anyhow::bail!("console-fallback starts a shell for the agent and runs only on Windows")
     }
 }
@@ -391,18 +391,21 @@ pub fn decide_fallback(connect_err: bool) -> Fallback {
 }
 
 /// Fail open: run the session locally, through the same shell and with the same packing as the
-/// agent would have used, and return the exit code. `run` starts a line and returns its exit code.
+/// agent would have used, and return the exit code. `start` starts a line; `finish` waits for what
+/// it started and returns its exit code. Only a failed `start` falls back to another line: once
+/// the shell runs, a failure of `finish` is reported and nothing is run again.
 ///
 /// The shell is resolved here, in the shim's own environment (`host`), by the one function the agent
 /// uses ([`shell::plan`]). When the configured shell cannot be used, the built-in `cmd.exe` runs
 /// instead and the reason goes to `stderr` first. A line that cannot be made, or a spawn that
 /// fails, exits 255: this crate's code for a broker-side failure, which 1 would hide among a
 /// command's own failures.
-pub fn fail_open(
+pub fn fail_open<T>(
     host: &dyn shell::Host,
     exec: &Option<Exec>,
     stderr: &mut dyn Write,
-    run: impl FnMut(&str) -> anyhow::Result<i32>,
+    start: impl FnMut(&str) -> Result<T, shell::StartError>,
+    finish: impl FnOnce(T) -> anyhow::Result<i32>,
 ) -> i32 {
     let session = match exec {
         Some(exec) => Session::Command {
@@ -434,13 +437,14 @@ pub fn fail_open(
     if let Some(notice) = plan.notice() {
         warn(stderr, &notice);
     }
-    // `run` returns when the session ends, so a replacement for a shell that cannot start is warned
-    // about by `start_or_fall_back` just before it runs.
-    let started = shell::start_or_fall_back(host, &session, &plan, run, |replacement| {
+    // A replacement for a shell that cannot start is warned about by `start_or_fall_back` just before
+    // it starts.
+    let started = shell::start_or_fall_back(host, &session, &plan, start, |replacement| {
         if let Some(notice) = replacement.notice() {
             warn(&mut *stderr, &notice);
         }
-    });
+    })
+    .and_then(finish);
     match started {
         Ok(code) => code,
         Err(e) => {

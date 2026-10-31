@@ -36,9 +36,9 @@ pub mod conpty;
 pub mod console_modes;
 #[cfg(windows)]
 pub mod console_prompt;
-pub mod fallback_file;
 #[cfg(windows)]
 pub mod filelog;
+pub mod handoff;
 #[cfg(windows)]
 pub mod hangup;
 #[cfg(windows)]

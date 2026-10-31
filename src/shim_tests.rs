@@ -293,6 +293,7 @@ fn fail_open_when_agent_unreachable() {
 // ── fail_open (the line it runs, and what it says first) ───────────────────────────
 
 use crate::cmdline::Exec;
+use crate::shell::StartError;
 use crate::shell::test_host::{SYSTEM_CMD, TestHost, USER_CONFIG};
 
 const PWSH: &str = r"C:\Program Files\PowerShell\7\pwsh.exe";
@@ -314,10 +315,16 @@ fn exec(command: &str, terminal: bool) -> Option<Exec> {
 fn failed_open(host: &TestHost, exec: &Option<Exec>, code: Result<i32, &str>) -> (i32, Option<String>, String) {
     let mut stderr = Vec::new();
     let mut line = None;
-    let got = fail_open(host, exec, &mut stderr, |l| {
-        line = Some(l.to_owned());
-        code.map_err(|e| anyhow::anyhow!("{e}"))
-    });
+    let got = fail_open(
+        host,
+        exec,
+        &mut stderr,
+        |l| {
+            line = Some(l.to_owned());
+            code.map_err(|e| StartError::Program(anyhow::anyhow!("{e}")))
+        },
+        Ok,
+    );
     (got, line, String::from_utf8(stderr).unwrap())
 }
 
@@ -354,10 +361,16 @@ fn the_fallback_warning_precedes_the_child_on_stderr() {
     for exec in [exec("echo hi", false), None] {
         let mut events = Vec::new();
         let mut stderr = Vec::new();
-        fail_open(&host, &exec, &mut stderr, |_line| {
-            events.push("child");
-            Ok(0)
-        });
+        fail_open(
+            &host,
+            &exec,
+            &mut stderr,
+            |_line| {
+                events.push("child");
+                Ok(0)
+            },
+            Ok,
+        );
         let text = String::from_utf8(stderr).unwrap();
         assert!(text.starts_with("ssh-broker: cannot use the shell from "), "{text:?}");
         assert!(
@@ -386,10 +399,16 @@ fn a_warning_is_written_before_the_run_closure_is_called() {
     }
     let events = RefCell::new(Vec::new());
     let host = TestHost::new().with_user_config("shell: nonesuch.exe\n");
-    fail_open(&host, &None, &mut Spy(&events), |_| {
-        events.borrow_mut().push("run".into());
-        Ok(0)
-    });
+    fail_open(
+        &host,
+        &None,
+        &mut Spy(&events),
+        |_| {
+            events.borrow_mut().push("run".into());
+            Ok(0)
+        },
+        Ok,
+    );
     let events = events.into_inner();
     assert!(
         events
@@ -834,13 +853,21 @@ fn fail_open_runs_cmd_exe_and_warns_when_the_shell_exists_and_cannot_start() {
     for exec in [exec("echo hi", false), exec("echo hi", true), None] {
         let mut stderr = Vec::new();
         let mut tried = Vec::new();
-        let code = fail_open(&host, &exec, &mut stderr, |line| {
-            tried.push(line.to_owned());
-            if line.contains("pwsh.exe") {
-                anyhow::bail!("%1 is not a valid Win32 application. (os error 193)");
-            }
-            Ok(5)
-        });
+        let code = fail_open(
+            &host,
+            &exec,
+            &mut stderr,
+            |line| {
+                tried.push(line.to_owned());
+                if line.contains("pwsh.exe") {
+                    return Err(StartError::Program(anyhow::anyhow!(
+                        "%1 is not a valid Win32 application. (os error 193)"
+                    )));
+                }
+                Ok(5)
+            },
+            Ok,
+        );
         assert_eq!(code, 5, "{exec:?}");
         assert_eq!(tried.len(), 2, "{tried:?}");
         assert!(tried[1].starts_with(SYSTEM_CMD), "{tried:?}");
@@ -853,6 +880,34 @@ fn fail_open_runs_cmd_exe_and_warns_when_the_shell_exists_and_cannot_start() {
             "{text:?}"
         );
         assert_eq!(text.matches("cannot use the shell").count(), 1, "{text:?}");
+    }
+}
+
+/// A shell that started and then failed on the broker's side (its exit code could not be read) has run the
+/// command; running the command again through cmd.exe would run it twice.
+#[test]
+fn fail_open_does_not_run_a_command_again_when_the_run_failed_after_the_shell_started() {
+    let host = pwsh_host();
+    for exec in [exec("echo hi", false), exec("echo hi", true), None] {
+        let mut stderr = Vec::new();
+        let mut started = Vec::new();
+        let code = fail_open(
+            &host,
+            &exec,
+            &mut stderr,
+            |line| {
+                started.push(line.to_owned());
+                Ok(())
+            },
+            |()| Err(anyhow::anyhow!("GetExitCodeProcess failed")),
+        );
+        assert_eq!(code, 255, "{exec:?}");
+        assert_eq!(started.len(), 1, "the shell was started again: {started:?}");
+        let text = String::from_utf8(stderr).unwrap();
+        assert!(!text.contains("cannot use the shell"), "{text:?}");
+        if exec.is_some() {
+            assert!(text.contains("GetExitCodeProcess failed"), "{text:?}");
+        }
     }
 }
 

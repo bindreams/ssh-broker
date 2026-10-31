@@ -36,7 +36,7 @@ checked.
 | `socket_loc`, `userdir` | where a user's socket lives (from the token's profile, length-checked), and creating its private folder |
 | `agent_lock` | one agent per session, one serving agent per user |
 | `filelog` | the rolling log in the user's own folder |
-| `fallback_file` | the owner-only file in the private folder that carries a fallback shell's notice and line to the hidden `console-fallback` verb |
+| `handoff` | the notice and the line the agent writes into the inherited pipe it hands the hidden `console-fallback` verb |
 | `vtinput` | Win32 `INPUT_RECORD` → VT sequences (pure, host-testable) |
 | `provision` | `apply`/`verify`: DefaultShell, logon task, per-user socket rows, parity probes |
 | `offer`, `offer/text` | the session offer as a pure state machine over injected I/O, and every line it shows |

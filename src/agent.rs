@@ -40,6 +40,8 @@ mod connections;
 mod launch;
 #[cfg(windows)]
 mod logout;
+#[cfg(windows)]
+mod verb;
 
 #[cfg(windows)]
 use crate::afunix::{self, AcceptError, ConnRx, ConnTx, Listener};
@@ -59,6 +61,8 @@ use crate::protocol::{ExitCode, FrameKind, FrameReader, Handshake, Mode, Resize,
 use crate::relay::{FrameSink, pump_until_peer_gone, write_data};
 #[cfg(windows)]
 use crate::route::{AgentArgs, BackgroundArgs};
+#[cfg(windows)]
+use crate::shell::StartError;
 #[cfg(windows)]
 use crate::socket_loc::SocketLocation;
 #[cfg(windows)]
@@ -114,33 +118,11 @@ fn start_with(
     if let Some(log) = keep_log_or_report(init_log(&location.logs_dir()), &mut std::io::stderr()) {
         keep_log(log);
     }
-    sweep_fallback_files(&location.dir);
     let result = serve(&location, session);
     if let Err(e) = &result {
         tracing::error!("the agent stopped: {e:#}");
     }
     result
-}
-
-/// Remove the verb files that agents killed mid-start left in the private folder (see
-/// [`crate::fallback_file`]). This agent has staged none yet, so a file under its own pid is a
-/// leftover of an earlier process. A failure is logged: serving does not need the folder swept.
-#[cfg(windows)]
-fn sweep_fallback_files(dir: &Path) {
-    let own = std::process::id();
-    let exe = match std::env::current_exe() {
-        Ok(exe) => exe,
-        Err(e) => {
-            tracing::warn!("cannot find this program, so leftover fallback files are not swept: {e}");
-            return;
-        }
-    };
-    let swept = crate::fallback_file::sweep(dir, |pid| {
-        Ok(pid != own && crate::provision::procwait::is_running_image(pid, &exe)?)
-    });
-    if let Err(e) = swept {
-        tracing::warn!("could not sweep {} for leftover fallback files: {e}", dir.display());
-    }
 }
 
 /// Keep the log if it opened. If not, say why on `stderr` and go on: serving does not need a log.
@@ -585,14 +567,15 @@ struct Env<'a> {
 #[cfg(windows)]
 type WatchFactory = fn(&ConnTx) -> std::io::Result<(HangupWatcher, Waker)>;
 
-/// How a session starts its shell in a pseudoconsole (`command`, `cols`, `rows`, `cwd`); a parameter
-/// so a test can force a failure without starting a process.
+/// How a session starts its shell in a pseudoconsole (`command`, `cols`, `rows`, `cwd`, and the one
+/// handle besides the pseudoconsole's that the shell inherits, if any); a parameter so a test can
+/// force a failure without starting a process.
 #[cfg(windows)]
-type PtyStarter = fn(&str, u16, u16, Option<&Path>) -> anyhow::Result<PtySession>;
+type PtyStarter = fn(&str, u16, u16, Option<&Path>, Option<&OwnedHandle>) -> Result<PtySession, StartError>;
 
 /// How a session starts its command on pipes (`command`, `cwd`); a parameter like [`PtyStarter`].
 #[cfg(windows)]
-type ExecStarter = fn(&str, Option<&Path>) -> anyhow::Result<ExecChild>;
+type ExecStarter = fn(&str, Option<&Path>) -> Result<ExecChild, StartError>;
 
 /// How a connection is split into halves; a parameter so a test can force a failure.
 #[cfg(windows)]
@@ -632,8 +615,8 @@ impl Hooks {
     fn production() -> Self {
         Self {
             make_watcher: HangupWatcher::new,
-            start_pty: |command, cols, rows, cwd| Ok(PtySession::spawn(command, cols, rows, cwd)?),
-            start_exec: |command, cwd| Ok(ExecChild::spawn(command, cwd)?),
+            start_pty: PtySession::spawn,
+            start_exec: ExecChild::spawn,
             shell_host: Box::new(crate::shell::WindowsHost),
             split: afunix::try_split,
             parked: ParkSignal::default(),
@@ -790,6 +773,22 @@ mod agent_reply_tests;
 
 // ── PTY relay ────────────────────────────────────────────────────────────────────────
 
+/// This program's path, looked up once for all the agent's sessions: the hidden `console-fallback`
+/// verb is started from it. `None` (with one warning) when it cannot be found, and then the warning of
+/// a terminal session goes out ahead of the shell.
+#[cfg(windows)]
+fn broker_exe() -> Option<&'static Path> {
+    static EXE: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    EXE.get_or_init(|| {
+        std::env::current_exe()
+            .inspect_err(|e| {
+                tracing::warn!("cannot find this program, so a shell warning goes out ahead of the terminal: {e}")
+            })
+            .ok()
+    })
+    .as_deref()
+}
+
 /// Interactive PTY relay: spawn the shell in a ConPTY and bridge it with three threads and
 /// an ordered, race-free teardown (criterion 2).
 #[cfg(windows)]
@@ -805,27 +804,22 @@ fn handle_pty(
     let Env { hooks, control } = env;
     // The warning for a shell that could not be used is printed by `console-fallback` inside the
     // pseudoconsole, which clears the screen after anything written ahead of it. Without this
-    // program's path or the private folder it goes out here, before the output threads exist.
-    let broker = std::env::current_exe()
-        .inspect_err(|e| {
-            tracing::warn!("cannot find this program, so a shell warning goes out ahead of the terminal: {e}")
-        })
-        .ok();
-    let private_dir = crate::userdir::current_socket_location()
-        .inspect_err(|e| {
-            tracing::warn!("cannot find the private folder, so a shell warning goes out ahead of the terminal: {e:#}")
-        })
-        .ok()
-        .map(|location| location.dir);
-    let console = match (&broker, &private_dir) {
-        (Some(exe), Some(dir)) => Some(launch::Console { exe, dir }),
-        _ => None,
-    };
+    // program's path it goes out here, before the output threads exist.
     let started = launch::start(
         &*hooks.shell_host,
         launched,
-        console,
-        |command| (hooks.start_pty)(command, cols, rows, cwd),
+        broker_exe(),
+        |spawn| match spawn {
+            launch::Spawn::Line(line) => (hooks.start_pty)(line, cols, rows, cwd, None),
+            launch::Spawn::Verb {
+                exe,
+                notice,
+                line,
+                login,
+            } => verb::start(exe, notice, line, login, |verb_line, read| {
+                (hooks.start_pty)(verb_line, cols, rows, cwd, Some(read))
+            }),
+        },
         |text| show_notice(&mut tx, Mode::Pty, text),
     );
     let mut session = match started {
@@ -1088,7 +1082,12 @@ fn handle_exec(
         &*hooks.shell_host,
         launched,
         None,
-        |command| (hooks.start_exec)(command, cwd),
+        |spawn| match spawn {
+            launch::Spawn::Line(line) => (hooks.start_exec)(line, cwd),
+            launch::Spawn::Verb { .. } => Err(StartError::Other(anyhow::anyhow!(
+                "a session without a pseudoconsole is given no verb"
+            ))),
+        },
         |text| show_notice(&mut tx, Mode::Exec, text),
     );
     let mut child = match started {

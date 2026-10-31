@@ -18,8 +18,8 @@ use serde::{Deserialize, Serialize};
 
 pub use layers::{Chosen, Origin, Problem, choose, user_config_path};
 pub use pack::{
-    Defaults, Effective, Plan, Session, Source, Why, defaults, effective, plan, render, resolve_program,
-    start_or_fall_back,
+    Defaults, Effective, Plan, Session, Source, StartError, Why, built_in_plan, defaults, effective, plan, render,
+    resolve_program, start_or_fall_back,
 };
 #[cfg(windows)]
 pub use windows::WindowsHost;

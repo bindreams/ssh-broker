@@ -282,74 +282,82 @@ fn run_session_without_command(home: &Home) {
 
 // The fallback shell of a terminal session through the agent =====
 
-/// A file for the verb in this account's private folder, which the test makes if it is missing: what the
-/// agent makes. Handed over, so that the verb alone removes it.
-fn fallback_file(notice: &str, line: &str) -> PathBuf {
-    let location = ssh_broker::userdir::current_socket_location().expect("the socket location");
-    let user = ssh_broker::acl::Sid::current_user().expect("the current user");
-    ssh_broker::userdir::ensure_socket_dir(&location, &user).expect("the private folder");
-    let staged = ssh_broker::fallback_file::stage(&location.dir, notice, line).expect("stage the fallback file");
-    let path = staged.path().to_owned();
-    staged.hand_over();
-    path
+/// Run `console-fallback` the way the agent does: with the read end of a pipe inherited and its value as
+/// the argument, then `send` the hand-off. The verb's stdin is empty.
+fn run_verb(login: bool, send: impl FnOnce(ssh_broker::winutil::Handoff)) -> std::process::Output {
+    use std::process::Stdio;
+    let pipe = ssh_broker::winutil::Handoff::new().expect("make the hand-off pipe");
+    let mut verb = std::process::Command::new(env!("CARGO_BIN_EXE_ssh-broker"));
+    verb.arg("console-fallback");
+    if login {
+        verb.arg("--login");
+    }
+    verb.arg((pipe.read().0.0 as usize).to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let child = verb.spawn().expect("start console-fallback");
+    send(pipe);
+    child.wait_with_output().expect("wait for console-fallback")
 }
 
-/// `console-fallback` reads its file, writes the notice, runs the line on the same standard handles, exits
-/// with the line's code and leaves no file.
+fn handed(notice: &str, line: &str) -> impl FnOnce(ssh_broker::winutil::Handoff) {
+    let bytes = ssh_broker::handoff::encode(notice, line).expect("encode the hand-off");
+    move |pipe| pipe.send(&bytes).expect("send the hand-off")
+}
+
+/// `console-fallback` reads its hand-off, writes the notice, runs the line on the same standard handles and
+/// exits with the line's code.
 #[test]
 fn console_fallback_prints_the_notice_then_runs_the_line_and_exits_with_its_code() {
-    let file = fallback_file("the notice", r#"cmd.exe /c "echo from-shell& exit /b 7""#);
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_ssh-broker"))
-        .arg("console-fallback")
-        .arg(&file)
-        .output()
-        .expect("run console-fallback");
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.starts_with("the notice\r\n"), "{stdout:?}");
-    assert!(stdout.contains("from-shell"), "{stdout:?}");
-    assert_eq!(out.status.code(), Some(7), "{stdout:?}");
-    assert!(!file.exists(), "{} was left behind", file.display());
+    for login in [false, true] {
+        let out = run_verb(
+            login,
+            handed("the notice", r#"cmd.exe /c "echo from-shell& exit /b 7""#),
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(stdout.starts_with("the notice\r\n"), "{stdout:?}");
+        assert!(stdout.contains("from-shell"), "{stdout:?}");
+        assert_eq!(out.status.code(), Some(7), "{stdout:?}");
+    }
 }
 
 /// A line that cannot start is the broker's failure (255), told on stderr, and not the notice's.
 #[test]
 fn console_fallback_with_a_line_that_cannot_start_exits_255() {
-    let file = fallback_file("the notice", r"C:\no\such\shell.exe");
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_ssh-broker"))
-        .arg("console-fallback")
-        .arg(&file)
-        .output()
-        .expect("run console-fallback");
+    let out = run_verb(false, handed("the notice", r"C:\no\such\shell.exe"));
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(255), "{stderr:?}");
     assert!(stderr.contains("could not start the shell"), "{stderr:?}");
 }
 
-/// The verb starts the line its file holds, so a file that is not in the account's private folder is
-/// refused: the line is not run, and the file is not the verb's to remove.
+/// A hand-off that is cut short is never read as a shorter line. A command runs nothing and exits 255.
 #[test]
-fn console_fallback_refuses_a_file_outside_the_private_folder() {
-    let ran = std::env::temp_dir().join(format!("console-fallback-ran-{}", std::process::id()));
-    let _ = std::fs::remove_file(&ran);
-    let outside = std::env::temp_dir().join(format!("console-fallback-outside-{}", std::process::id()));
-    std::fs::create_dir_all(&outside).unwrap();
-    let staged = ssh_broker::fallback_file::stage(
-        &outside,
-        "the notice",
-        &format!(r#"cmd.exe /c "echo x> {}""#, ran.display()),
-    )
-    .expect("stage the fallback file");
-    let file = staged.path().to_owned();
-    staged.hand_over();
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_ssh-broker"))
-        .arg("console-fallback")
-        .arg(&file)
-        .output()
-        .expect("run console-fallback");
-    let stderr = String::from_utf8_lossy(&out.stderr);
+fn console_fallback_with_a_hand_off_cut_short_runs_nothing_for_a_command() {
+    let bytes = ssh_broker::handoff::encode("the notice", r#"cmd.exe /c "echo must-not-run""#).unwrap();
+    let out = run_verb(false, |pipe| pipe.send(&bytes[..bytes.len() / 2]).unwrap());
+    let (stdout, stderr) = (
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
     assert_eq!(out.status.code(), Some(255), "{stderr:?}");
-    assert!(stderr.contains("private folder"), "{stderr:?}");
-    assert!(!ran.exists(), "the line of a file outside the private folder ran");
-    assert!(file.exists(), "a file that is not ours was removed");
-    let _ = std::fs::remove_dir_all(&outside);
+    assert!(stderr.contains("could not read the fallback shell"), "{stderr:?}");
+    assert!(!stdout.contains("must-not-run"), "{stdout:?}");
+}
+
+/// ...and a login still gets a shell, the built-in cmd.exe, so a broken hand-off is no lockout. cmd.exe
+/// reads the verb's empty stdin and ends.
+#[test]
+fn console_fallback_with_an_unreadable_hand_off_starts_the_built_in_shell_for_a_login() {
+    let out = run_verb(true, |pipe| pipe.send(b"").unwrap());
+    let (stdout, stderr) = (
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert!(stderr.contains("could not read the fallback shell"), "{stderr:?}");
+    assert!(
+        stdout.contains("Microsoft Windows"),
+        "cmd.exe did not start: {stdout:?} {stderr:?}"
+    );
+    assert_eq!(out.status.code(), Some(0), "{stderr:?}");
 }

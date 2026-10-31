@@ -18,7 +18,7 @@ known verb in first position selects a subcommand, anything else is the shim.
 | `apply` | `provision` | wherever an admin runs it; needs elevation |
 | `verify` | `provision` | on the host itself, unelevated by design |
 | `verify-probe` | `provision` | the child the **agent** spawns in its interactive session, driven through the relay by `verify` |
-| `console-fallback <file>` | `shim`, `shim_pty`, `fallback_file` | the fallback shell of a terminal session through the agent: reads a notice and a line from `<file>` (in the user's private folder, owner-only, removed after reading), prints the notice on its pseudoconsole (which clears anything written ahead of it), starts the line there, exits with its code |
+| `console-fallback [--login] <handle>` | `shim`, `shim_pty`, `handoff` | the fallback shell of a terminal session through the agent: reads a notice and a line from the pipe handle the agent gave it alone (`PROC_THREAD_ATTRIBUTE_HANDLE_LIST`) until the agent closes its end, prints the notice on its pseudoconsole (which clears anything written ahead of it), starts the line there, exits with its code; it keeps through Ctrl+C for the shell, and when it cannot read the pipe it starts the built-in `cmd.exe` for a login (`--login`) and exits 255 for a command |
 
 Supporting modules: `protocol` (frame codec and handshake), `relay` (transport-agnostic
 pumping), `afunix` + `acl` (the socket and its security boundary), `socket_loc` + `userdir` (where a

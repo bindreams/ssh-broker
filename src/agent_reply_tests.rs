@@ -49,8 +49,8 @@ fn handshake(mode: Mode, command: &str) -> impl FnOnce(&mut ConnTx) + Send + 'st
 
 fn failing_starters() -> Hooks {
     Hooks {
-        start_exec: |_, _| Err(anyhow::anyhow!("the system cannot find the file")),
-        start_pty: |_, _, _, _| Err(anyhow::anyhow!("the system cannot find the file")),
+        start_exec: |_, _| Err(StartError::Program(anyhow::anyhow!("the system cannot find the file"))),
+        start_pty: |_, _, _, _, _| Err(StartError::Program(anyhow::anyhow!("the system cannot find the file"))),
         ..Hooks::production()
     }
 }
@@ -167,7 +167,7 @@ fn a_client_that_leaves_in_the_middle_of_a_frame_is_still_a_bad_request() {
 #[test]
 fn a_handler_that_panics_answers_its_connection_with_255_before_it_closes() {
     let hooks = Hooks {
-        start_pty: |_, _, _, _| panic!("the starter failed"),
+        start_pty: |_, _, _, _, _| panic!("the starter failed"),
         ..Hooks::production()
     };
     let (server, client, dir) = crate::test_support::raw_socket_pair("panic-reply");

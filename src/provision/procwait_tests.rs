@@ -928,17 +928,3 @@ fn the_signs_print_every_answer_for_a_test_that_measures_them() {
     assert!(text.contains("exit status 0x00000103"), "{text}");
     assert!(text.contains("deleting false"), "{text}");
 }
-
-#[test]
-fn a_pid_is_a_running_image_only_while_that_process_runs_it() {
-    let mut child = child_until_stdin_closes();
-    let other = PathBuf::from(std::env::var_os("SystemRoot").expect("SystemRoot is set")).join(r"System32\find.exe");
-    assert!(is_running_image(child.id(), &cmd_exe()).unwrap());
-    assert!(
-        !is_running_image(child.id(), &other).unwrap(),
-        "a reused PID is another program"
-    );
-    assert!(!is_running_image(u32::MAX - 1, &cmd_exe()).unwrap(), "no such process");
-    drop(child.stdin.take());
-    child.wait().unwrap();
-}

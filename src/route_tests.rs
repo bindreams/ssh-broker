@@ -172,19 +172,34 @@ fn apply_and_verify_verbs() {
     assert_eq!(route_line("ssh-broker.exe verify-probe"), Route::VerifyProbe);
 }
 
-/// The hidden verb of a terminal session's fallback shell takes exactly the path of its file; any
-/// other shape is a usage error, never the shim.
+/// The hidden verb of a terminal session's fallback shell takes the value of the pipe handle it
+/// inherited, and `--login` before it for a session without a command; any other shape is a usage
+/// error, never the shim.
 #[test]
-fn console_fallback_takes_the_path_of_its_file() {
+fn console_fallback_takes_the_value_of_its_handle() {
+    let args = |args: &[&str]| args.iter().map(|a| (*a).to_owned()).collect::<Vec<_>>();
     assert_eq!(
-        route(&["console-fallback".into(), "C:/a b/file".into()], "ignored"),
+        route(&args(&["console-fallback", "1234"]), "ignored"),
         Route::ConsoleFallback {
-            file: "C:/a b/file".into()
+            handle: 1234,
+            login: false
+        }
+    );
+    assert_eq!(
+        route(&args(&["console-fallback", "--login", "88"]), "ignored"),
+        Route::ConsoleFallback {
+            handle: 88,
+            login: true
         }
     );
     for args in [
         vec!["console-fallback"],
         vec!["console-fallback", "a notice", "cmd.exe"],
+        vec!["console-fallback", "C:/a b/file"],
+        vec!["console-fallback", "-1"],
+        vec!["console-fallback", "--login"],
+        vec!["console-fallback", "--login", "x"],
+        vec!["console-fallback", "12", "--login"],
     ] {
         let args: Vec<String> = args.into_iter().map(str::to_owned).collect();
         assert_eq!(route(&args, "ignored"), Route::Usage(Verb::ConsoleFallback), "{args:?}");

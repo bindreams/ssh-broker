@@ -137,3 +137,28 @@ fn measure_loader_failure_process_fails_critical_errors() {
     eprintln!("MEASURE the test process's own error mode was {previous:?}");
     measure_loader_failure("pipes, process error mode FAILCRITICALERRORS");
 }
+
+/// A working directory that is not one is the session's failure, not the program's: the shell would be
+/// blamed, and cmd.exe would meet the same failure.
+#[test]
+fn a_missing_working_directory_is_not_the_programs_fault() {
+    let missing = std::env::temp_dir().join(format!("sb-pipes-no-such-dir-{}", std::process::id()));
+    let error = ExecChild::spawn("cmd.exe /c exit", Some(&missing))
+        .err()
+        .expect("a missing working directory started a program");
+    assert!(matches!(error, StartError::Other(_)), "{error:?}");
+}
+
+/// A file that is not a program is the program's fault, whatever the working directory.
+#[test]
+fn a_file_that_cannot_start_is_the_programs_fault() {
+    let dir = std::env::temp_dir().join(format!("sb-pipes-fault-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let stub = dir.join("stub.exe");
+    std::fs::write(&stub, b"MZ").unwrap();
+    let error = ExecChild::spawn(&format!("\"{}\"", stub.display()), Some(&dir))
+        .err()
+        .expect("a file that is not a program started");
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(matches!(error, StartError::Program(_)), "{error:?}");
+}

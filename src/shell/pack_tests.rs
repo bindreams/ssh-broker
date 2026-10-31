@@ -2,7 +2,9 @@
 
 use std::path::PathBuf;
 
-use super::{Session, Source, defaults, effective, flow_list, plan, render, start_or_fall_back};
+use super::{
+    Session, Source, StartError, built_in_plan, defaults, effective, flow_list, plan, render, start_or_fall_back,
+};
 use crate::cmdline::split_args;
 use crate::shell::test_host::{SYSTEM_CMD, TestHost};
 use crate::shell::{Escaping, Origin};
@@ -297,11 +299,11 @@ const OS_ERROR: &str = "%1 is not a valid Win32 application. (os error 193)";
 fn spawner<'a>(
     refused: &'a str,
     tried: &'a std::cell::RefCell<Vec<String>>,
-) -> impl FnMut(&str) -> anyhow::Result<()> + 'a {
+) -> impl FnMut(&str) -> Result<(), StartError> + 'a {
     move |line| {
         tried.borrow_mut().push(line.to_string());
         if line.contains(refused) {
-            anyhow::bail!("{OS_ERROR}");
+            return Err(StartError::Program(anyhow::anyhow!("{OS_ERROR}")));
         }
         Ok(())
     }
@@ -346,6 +348,40 @@ fn a_shell_that_cannot_start_is_replaced_by_cmd_exe_with_a_problem_naming_the_os
             notice.contains("pwsh.exe") && notice.contains("os error 193"),
             "{notice}"
         );
+    }
+}
+
+/// A failure the shell did not cause (a bad working directory, no pseudoconsole) is reported as itself: the
+/// shell is not blamed, and cmd.exe would meet the same failure.
+#[test]
+fn a_failure_the_shell_did_not_cause_is_reported_as_itself_and_not_replaced() {
+    let host = pwsh_host();
+    let first = plan(&host, &Session::Interactive).unwrap();
+    let mut calls = 0;
+    let error = start_or_fall_back(
+        &host,
+        &Session::Interactive,
+        &first,
+        |_| -> Result<(), StartError> {
+            calls += 1;
+            Err(StartError::Other(anyhow::anyhow!("no such working directory")))
+        },
+        |_| panic!("the shell was not at fault"),
+    )
+    .unwrap_err();
+    assert_eq!(calls, 1);
+    assert!(format!("{error:#}").contains("no such working directory"), "{error:#}");
+}
+
+/// The built-in shell whatever the config says, for a session whose planned shell is out of reach.
+#[test]
+fn the_built_in_plan_is_cmd_exe_whatever_the_config_says() {
+    for host in [pwsh_host(), TestHost::new().with_user_config("shell: {strt: x}\n")] {
+        let plan = built_in_plan(&host, &Session::Interactive, None).unwrap();
+        assert_eq!(plan.command_line, SYSTEM_CMD);
+        assert_eq!(plan.notice(), None);
+        let plan = built_in_plan(&host, &command("echo hi"), None).unwrap();
+        assert_eq!(plan.command_line, format!(r#"{SYSTEM_CMD} /c "echo hi""#));
     }
 }
 
@@ -397,9 +433,9 @@ fn when_the_replacement_cannot_start_either_the_error_is_the_replacement_s() {
         &host,
         &Session::Interactive,
         &first,
-        |_| -> anyhow::Result<()> {
+        |_| -> Result<(), StartError> {
             calls += 1;
-            anyhow::bail!("attempt {calls}")
+            Err(StartError::Program(anyhow::anyhow!("attempt {calls}")))
         },
         |_| {},
     )
@@ -512,7 +548,7 @@ fn a_missing_system_directory_is_an_error_not_a_panic() {
         &host,
         &Session::Interactive,
         &first,
-        |_| -> anyhow::Result<()> { anyhow::bail!("{OS_ERROR}") },
+        |_| -> Result<(), StartError> { Err(StartError::Program(anyhow::anyhow!("{OS_ERROR}"))) },
         |_| panic!("nothing to replace it with"),
     )
     .unwrap_err();

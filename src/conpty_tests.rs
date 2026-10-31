@@ -20,7 +20,7 @@ fn drain(out_raw: isize) -> std::thread::JoinHandle<Vec<u8>> {
 
 #[test]
 fn conpty_runs_child_and_captures_output() {
-    let mut session = PtySession::spawn("cmd.exe /c echo conpty-works", 80, 24, None).unwrap();
+    let mut session = PtySession::spawn("cmd.exe /c echo conpty-works", 80, 24, None, None).unwrap();
     let reader = drain(session.out_read_raw());
 
     let code = session.wait().unwrap();
@@ -35,7 +35,7 @@ fn conpty_runs_child_and_captures_output() {
 #[test]
 fn conpty_resize_on_live_session_succeeds() {
     // A shell that stays open so the pseudoconsole is live when we resize it.
-    let mut session = PtySession::spawn("cmd.exe /k", 80, 24, None).unwrap();
+    let mut session = PtySession::spawn("cmd.exe /k", 80, 24, None, None).unwrap();
     let reader = drain(session.out_read_raw());
 
     session.resize(120, 40).expect("ResizePseudoConsole on a live session");
@@ -53,7 +53,7 @@ fn a_file_that_cannot_start_is_an_error_and_not_a_message_box() {
     std::fs::create_dir_all(&dir).unwrap();
     let stub = dir.join("stub.exe");
     std::fs::write(&stub, b"MZ").unwrap();
-    let result = PtySession::spawn(&format!("\"{}\" -c x", stub.display()), 80, 24, None);
+    let result = PtySession::spawn(&format!("\"{}\" -c x", stub.display()), 80, 24, None, None);
     let _ = std::fs::remove_dir_all(&dir);
     assert!(result.is_err(), "a file that is not a program started");
 }
@@ -64,7 +64,7 @@ fn measure_loader_failure_in_a_pseudoconsole() {
     use windows::Win32::System::Diagnostics::Debug::{SEM_FAILCRITICALERRORS, SetErrorMode};
     unsafe { SetErrorMode(SEM_FAILCRITICALERRORS) };
     let exe = crate::command_line_probe::example("missing_dll");
-    let mut session = match PtySession::spawn(&format!("\"{}\"", exe.display()), 80, 24, None) {
+    let mut session = match PtySession::spawn(&format!("\"{}\"", exe.display()), 80, 24, None, None) {
         Ok(session) => session,
         Err(e) => {
             eprintln!("MEASURE pty: start failed: {e}");
@@ -81,4 +81,30 @@ fn measure_loader_failure_in_a_pseudoconsole() {
     session.close_pty();
     let out = reader.join().unwrap();
     eprintln!("MEASURE pty: output {:?}", String::from_utf8_lossy(&out));
+}
+
+/// As in `pipes_tests`: the working directory is not the program's fault.
+#[test]
+fn a_missing_working_directory_is_not_the_programs_fault() {
+    let missing = std::env::temp_dir().join(format!("sb-conpty-no-such-dir-{}", std::process::id()));
+    let error = PtySession::spawn("cmd.exe /c exit", 80, 24, Some(&missing), None)
+        .err()
+        .expect("a missing working directory started a program");
+    assert!(matches!(error, StartError::Other(_)), "{error:?}");
+}
+
+/// A pseudoconsole child can be given one handle besides its console, and the spawn still reports a program
+/// that cannot start as the program's fault.
+#[test]
+fn a_file_that_cannot_start_is_the_programs_fault_with_a_handle_to_inherit() {
+    let dir = std::env::temp_dir().join(format!("sb-conpty-fault-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let stub = dir.join("stub.exe");
+    std::fs::write(&stub, b"MZ").unwrap();
+    let pipe = crate::winutil::Handoff::new().unwrap();
+    let error = PtySession::spawn(&format!("\"{}\"", stub.display()), 80, 24, None, Some(pipe.read()))
+        .err()
+        .expect("a file that is not a program started");
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(matches!(error, StartError::Program(_)), "{error:?}");
 }

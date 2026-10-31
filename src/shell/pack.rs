@@ -344,39 +344,78 @@ fn pack(session: &Session<'_>, effective: Effective) -> anyhow::Result<Plan> {
     })
 }
 
-/// Start `plan` with `spawn`. When the spawn fails and `plan` is a configured shell (a file that
-/// resolves but cannot be started: a truncated file, the wrong architecture, AppLocker), the
-/// built-in `cmd.exe` is started instead, with a [`Problem`] that names the file, the value and
-/// the OS error. `warn` gets that replacement plan ([`Plan::notice`]) just before it is started,
-/// so the warning precedes the shell. A failure of the built-in itself, or of the replacement, is
-/// the error: there is nothing left to fall to, and one try is all either gets.
+/// Why a line did not start. A spawn reports `Ok` only once the program is running, so a program
+/// that has run is never started again because of a failure that came after.
+#[derive(Debug)]
+pub enum StartError {
+    /// The OS could not start the program: a file that resolves and cannot be started (a truncated
+    /// file, the wrong architecture, AppLocker). A configured shell falls back to the built-in.
+    Program(anyhow::Error),
+    /// Something else failed (the working directory, the pseudoconsole, the job): the shell is not
+    /// at fault, and the built-in would meet the same failure.
+    Other(anyhow::Error),
+}
+
+impl StartError {
+    /// The cause, whichever kind it is.
+    pub fn into_cause(self) -> anyhow::Error {
+        match self {
+            StartError::Program(cause) | StartError::Other(cause) => cause,
+        }
+    }
+}
+
+impl std::fmt::Display for StartError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StartError::Program(cause) | StartError::Other(cause) => write!(f, "{cause:#}"),
+        }
+    }
+}
+
+/// The line for `session` under the built-in `cmd.exe`, whatever the configuration says. `problem`
+/// is why the configured shell is not used, for the notice ([`Plan::notice`]).
+pub fn built_in_plan(host: &dyn Host, session: &Session<'_>, problem: Option<Problem>) -> anyhow::Result<Plan> {
+    let block = layers::built_in(host)?;
+    let chosen = layers::Chosen {
+        block,
+        origin: Origin::Default,
+        problem,
+    };
+    pack(session, settle(host, chosen)?)
+}
+
+/// Start `plan` with `spawn`. When the program cannot be started ([`StartError::Program`]) and
+/// `plan` is a configured shell, the built-in `cmd.exe` is started instead, with a [`Problem`]
+/// that names the file, the value and the OS error. `warn` gets that replacement plan
+/// ([`Plan::notice`]) just before it is started, so the warning precedes the shell. Any other
+/// failure, a failure of the built-in itself and a failure of the replacement are the error: there
+/// is nothing left to fall to, and one try is all each gets.
 pub fn start_or_fall_back<T>(
     host: &dyn Host,
     session: &Session<'_>,
     plan: &Plan,
-    mut spawn: impl FnMut(&str) -> anyhow::Result<T>,
+    mut spawn: impl FnMut(&str) -> Result<T, StartError>,
     warn: impl FnOnce(&Plan),
 ) -> anyhow::Result<T> {
     let error = match spawn(&plan.command_line) {
         Ok(started) => return Ok(started),
-        Err(error) => error,
+        Err(StartError::Other(cause)) => return Err(cause),
+        Err(StartError::Program(error)) => error,
     };
     let file = match &plan.effective.origin {
         Origin::User(file) | Origin::System(file) => file.clone(),
         Origin::Default => return Err(error),
     };
-    let replacement = layers::built_in(host)
-        .map(|block| layers::Chosen {
-            block,
-            origin: Origin::Default,
-            problem: Some(Problem {
-                file,
-                value: plan.effective.start.first().cloned(),
-                reason: format!("it cannot be started: {error:#}"),
-            }),
-        })
-        .and_then(|chosen| settle(host, chosen))
-        .and_then(|effective| pack(session, effective));
+    let replacement = built_in_plan(
+        host,
+        session,
+        Some(Problem {
+            file,
+            value: plan.effective.start.first().cloned(),
+            reason: format!("it cannot be started: {error:#}"),
+        }),
+    );
     let replacement = match replacement {
         Ok(replacement) => replacement,
         Err(unplanned) => {
@@ -385,7 +424,7 @@ pub fn start_or_fall_back<T>(
         }
     };
     warn(&replacement);
-    spawn(&replacement.command_line)
+    spawn(&replacement.command_line).map_err(StartError::into_cause)
 }
 
 #[cfg(test)]

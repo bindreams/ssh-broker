@@ -887,3 +887,34 @@ fn an_unanswered_terminal_command_is_not_sent_again() {
         "ssh-broker: the agent ended before it answered; the command may or may not have run\n"
     );
 }
+
+// The root process of a console keeps running through Ctrl+C -----------------------------
+
+/// A shell started under the shim, or under the `console-fallback` verb in a pseudoconsole, shares the
+/// console with the process that started it, and a Ctrl+C is raised in every process on the console. The
+/// shell answers it itself (cmd.exe clears its line, a running program ends); the process that started the
+/// shell must stay, or the session ends with it.
+#[test]
+fn ctrl_c_and_ctrl_break_are_handled_and_every_other_console_event_is_left_to_the_default() {
+    use super::ctrl_handler;
+    use windows::Win32::System::Console::{
+        CTRL_BREAK_EVENT, CTRL_C_EVENT, CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT,
+    };
+    for event in [CTRL_C_EVENT, CTRL_BREAK_EVENT] {
+        assert!(ctrl_handler(event).as_bool(), "{event}");
+    }
+    for event in [CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT] {
+        assert!(!ctrl_handler(event).as_bool(), "{event}");
+    }
+}
+
+/// The reason a start failed goes into the warning the user reads, so it must not carry the whole
+/// command line, which can be 32 KB of the user's command.
+#[test]
+fn a_spawn_that_fails_does_not_put_the_command_line_in_its_error() {
+    let error = unsafe { spawn_contained(r"C:\no\such\shell.exe the-command-text-of-the-user", None) }
+        .map(|_| ())
+        .unwrap_err();
+    assert!(matches!(error, crate::shell::StartError::Program(_)), "{error:?}");
+    assert!(!error.to_string().contains("the-command-text-of-the-user"), "{error}");
+}

@@ -179,6 +179,22 @@ impl AgentConn {
         write_data(&mut self.tx, Stream::Pty, &bytes).unwrap();
     }
 
+    /// Press Ctrl+C in a PTY session: the key event conhost turns into a Ctrl+C for the programs on the console.
+    pub fn ctrl_c(&mut self) {
+        const LEFT_CTRL_PRESSED: u32 = 0x0008;
+        let key = |down: bool| KeyEvent {
+            virtual_key_code: 0x43, // 'C'
+            virtual_scan_code: 0,
+            unicode_char: 3,
+            key_down: down,
+            control_key_state: LEFT_CTRL_PRESSED,
+            repeat_count: 1,
+        };
+        let mut bytes = encode_key_event(&key(true));
+        bytes.extend(encode_key_event(&key(false)));
+        write_data(&mut self.tx, Stream::Pty, &bytes).unwrap();
+    }
+
     /// Mark the end of stdin of an exec session.
     pub fn end_stdin(&mut self) {
         write_data(&mut self.tx, Stream::Stdin, b"").unwrap();

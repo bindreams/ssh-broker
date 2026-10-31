@@ -18,6 +18,7 @@ use crate::cmdline::{Encoding, Exec, RawExec, resolve_exec};
 use crate::console_modes::ConsoleModes;
 use crate::protocol::{FrameKind, FrameReader, Handshake, Launch, Stream, write_frame};
 use crate::relay::{FrameSink, write_data};
+use crate::shell::{self, Session, StartError};
 use crate::shim::{
     Fallback, MouseModeSniffer, PROTOCOL_VIOLATION_CODE, Pumped, Started, XtwinopsFilter, closed_twice_message,
     decide_fallback, fail_open, is_blank_command, make_handshake, peer_gone, pump_exec, pump_heard, size_to_resize,
@@ -95,13 +96,14 @@ pub fn run_on(exec: Option<RawExec>, detect: impl FnOnce() -> Encoding) -> anyho
     }
     // Fail open: the session runs here, through the shell the agent would have started and with the command
     // packed the same way (`shim::fail_open`), in a job so the child dies with the session
-    // (`run_local_passthrough`). The log guard stays alive until the exit: dropping it stops the
+    // (`start_local`). The log guard stays alive until the exit: dropping it stops the
     // `tracing-appender` worker, whose lossy writer then discards every later line.
     let code = fail_open(
         &crate::shell::WindowsHost,
         &exec,
         &mut std::io::stderr(),
-        run_local_passthrough,
+        start_local,
+        LocalChild::finish,
     );
     drop(log); // flush: `process::exit` runs no destructors
     // Bypass main()'s Result→0/1 collapse; the i32→u32 cast is bit-preserving.
@@ -394,22 +396,30 @@ fn term() -> String {
     std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".into())
 }
 
-/// Run `command_line` locally (in the session sshd launched us in), inheriting our stdio directly,
-/// and return its exit code.
+/// A shell started locally (in the session sshd launched us in) and contained in a job, whose exit
+/// code [`LocalChild::finish`] waits for.
 ///
-/// It deliberately RETURNS the code rather than calling `process::exit` itself. Exiting here forced
-/// the caller to drop the log guard before this ran, which shut the appender down and silently
-/// discarded every diagnostic logged afterwards — including the one explaining a failed fallback.
-/// Returning leaves the caller owning both the exit and the flush that must precede it.
+/// `_job` must outlive the wait: `cosca::Job` sets KILL_ON_JOB_CLOSE, so dropping it early would
+/// terminate the very child we are waiting on.
+pub struct LocalChild {
+    process: crate::winutil::OwnedHandle,
+    _job: cosca::Job,
+}
+
+/// Start `command_line` locally, inheriting our stdio directly, in a job so the child dies with the
+/// session.
 ///
 /// This is the fail-open path for every session. The line is already the shell's: `shim::fail_open`
 /// built it with the same planner the agent uses, so the command reaches the shell packed as it
 /// would have been under the agent. The child writes raw to sshd's pipes, exactly as the original
-/// DefaultShell did, and it is spawned through [`spawn_contained`], so it dies with the session.
-fn run_local_passthrough(command_line: &str) -> anyhow::Result<i32> {
+/// DefaultShell did.
+///
+/// It returns when the shell is running, and [`LocalChild::finish`] waits for it: a failure of the
+/// wait is not a failure to start, and must not run the command again.
+fn start_local(command_line: &str) -> Result<LocalChild, StartError> {
     use windows::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
     use windows::Win32::System::Console::STD_ERROR_HANDLE;
-    use windows::Win32::System::Threading::{GetExitCodeProcess, INFINITE, WaitForSingleObject};
+    ignore_ctrl_c();
     unsafe {
         let stdin = GetStdHandle(STD_INPUT_HANDLE)?;
         let stdout = GetStdHandle(STD_OUTPUT_HANDLE)?;
@@ -418,45 +428,97 @@ fn run_local_passthrough(command_line: &str) -> anyhow::Result<i32> {
         for h in [stdin, stdout, stderr] {
             let _ = SetHandleInformation(h, HANDLE_FLAG_INHERIT.0, HANDLE_FLAG_INHERIT);
         }
-        // `_job` must outlive the wait: `cosca::Job` sets KILL_ON_JOB_CLOSE, so dropping it early
-        // would terminate the very child we are waiting on.
-        let (process, _job) = spawn_contained(command_line, Some([stdin, stdout, stderr]))?;
-        WaitForSingleObject(process.0, INFINITE);
-        let mut code = 0u32;
-        if GetExitCodeProcess(process.0, &mut code).is_err() {
-            // A failed query must not read as SUCCESS. `code` is still 0 here, so returning it
-            // would be indistinguishable from the command having succeeded — the exact confusion
-            // `shim::map_outcome` exists to prevent. Reporting it as an error routes it to the
-            // caller's 255, this crate's "the broker failed" code, which is what the relay reports
-            // for the same class of failure. Erroring rather than exiting here is also what lets
-            // the caller LOG it: exiting inside this function is why that diagnostic was lost.
-            anyhow::bail!("GetExitCodeProcess failed for the fail-open child");
-        }
-        Ok(code as i32)
+        let (process, job) = spawn_contained(command_line, Some([stdin, stdout, stderr]))?;
+        Ok(LocalChild { process, _job: job })
     }
 }
 
-/// `console-fallback`: the notice and the line `file` holds (see [`crate::fallback_file`]), the
-/// notice printed on this console, then the line started on it, in a job like every local child
-/// ([`spawn_contained`]). Returns the exit code of the line, or 255, this crate's code for a
-/// broker-side failure, when the file cannot be used or the line cannot be started.
+impl LocalChild {
+    /// Wait for the shell to end and return its exit code.
+    fn finish(self) -> anyhow::Result<i32> {
+        use windows::Win32::System::Threading::{GetExitCodeProcess, INFINITE, WaitForSingleObject};
+        unsafe {
+            WaitForSingleObject(self.process.0, INFINITE);
+            let mut code = 0u32;
+            if GetExitCodeProcess(self.process.0, &mut code).is_err() {
+                // A failed query must not read as SUCCESS. `code` is still 0 here, so returning it
+                // would be indistinguishable from the command having succeeded — the exact confusion
+                // `shim::map_outcome` exists to prevent. Reporting it as an error routes it to the
+                // caller's 255, this crate's "the broker failed" code, which is what the relay reports
+                // for the same class of failure. Erroring rather than exiting here is also what lets
+                // the caller LOG it: exiting inside this function is why that diagnostic was lost.
+                anyhow::bail!("GetExitCodeProcess failed for the fail-open child");
+            }
+            Ok(code as i32)
+        }
+    }
+}
+
+/// While this process starts a shell on the console it shares with it, a Ctrl+C or Ctrl+Break is
+/// the shell's: a program running in it ends, and cmd.exe clears its line. This process, which has
+/// only to wait, would otherwise end with the default handler, and with it the job that holds the
+/// shell. The handler is this process's own; the shell, started later, does not inherit it (unlike
+/// `SetConsoleCtrlHandler(NULL, TRUE)`, which a child inherits and which would stop Ctrl+C reaching
+/// the programs in the shell).
+fn ignore_ctrl_c() {
+    use windows::Win32::System::Console::SetConsoleCtrlHandler;
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        // SAFETY: `ctrl_handler` has the signature the call needs and lives as long as the process.
+        if let Err(e) = unsafe { SetConsoleCtrlHandler(Some(ctrl_handler), true) } {
+            tracing::warn!("could not keep this process through Ctrl+C: {e}");
+        }
+    });
+}
+
+/// Handled (`TRUE`) for Ctrl+C and Ctrl+Break; the others (close, logoff, shutdown) go to the default
+/// handler, which ends the process.
+extern "system" fn ctrl_handler(event: u32) -> windows::core::BOOL {
+    use windows::Win32::System::Console::{CTRL_BREAK_EVENT, CTRL_C_EVENT};
+    (event == CTRL_C_EVENT || event == CTRL_BREAK_EVENT).into()
+}
+
+/// `console-fallback`: read the notice and the line from the pipe handle `handle` (see
+/// [`crate::handoff`]), print the notice on this console, then start the line on it, in a job like
+/// every local child ([`start_local`]). Returns the exit code of the line, or 255, this crate's code
+/// for a broker-side failure, when the line cannot be started.
 ///
 /// The agent starts this verb as the fallback shell of a terminal session instead of the shell, so
 /// that the notice is written inside the pseudoconsole, after the clear that opens it. The verb
 /// stays in the agent's job, so the shell is a descendant of the agent that dies with the session.
-pub fn console_fallback(file: &std::path::Path) -> i32 {
+/// It is the root process of the console, so it keeps through Ctrl+C for the shell ([`ignore_ctrl_c`]).
+///
+/// When the pipe cannot be read, the error is printed on the console. A login (`login`) still gets
+/// a shell, the built-in `cmd.exe`, because a broken hand-off must not become a lockout; a command
+/// exits 255.
+pub fn console_fallback(handle: usize, login: bool) -> i32 {
     use std::io::Write;
-    let (notice, command_line) = match read_fallback_file(file) {
-        Ok(read) => read,
+    let (notice, command_line) = match read_handoff(handle) {
+        Ok(handed) => handed,
         Err(error) => {
-            eprintln!("ssh-broker: could not read the fallback shell from its file: {error:#}");
-            return 255;
+            eprintln!("ssh-broker: could not read the fallback shell from the agent: {error:#}");
+            if !login {
+                return 255;
+            }
+            match shell::built_in_plan(&shell::WindowsHost, &Session::Interactive, None) {
+                Ok(plan) => (String::new(), plan.command_line),
+                Err(error) => {
+                    eprintln!("ssh-broker: could not find the built-in shell either: {error:#}");
+                    return 255;
+                }
+            }
         }
     };
-    let mut out = std::io::stdout();
-    let notice_line = format!("{notice}\r\n");
-    let _ = out.write_all(notice_line.as_bytes()).and_then(|()| out.flush());
-    match run_local_passthrough(&command_line) {
+    if !notice.is_empty() {
+        let mut out = std::io::stdout();
+        let _ = out
+            .write_all(format!("{notice}\r\n").as_bytes())
+            .and_then(|()| out.flush());
+    }
+    match start_local(&command_line)
+        .map_err(StartError::into_cause)
+        .and_then(LocalChild::finish)
+    {
         Ok(code) => code,
         Err(error) => {
             eprintln!("ssh-broker: could not start the shell: {error:#}");
@@ -465,12 +527,19 @@ pub fn console_fallback(file: &std::path::Path) -> i32 {
     }
 }
 
-/// The notice and the line in `file`, which must be in this account's private folder (from the
-/// token) and private to it. The file is removed.
-fn read_fallback_file(file: &std::path::Path) -> anyhow::Result<(String, String)> {
-    let dir = crate::userdir::current_socket_location()?.dir;
-    let user = crate::acl::Sid::current_user()?;
-    crate::fallback_file::take(file, &dir, |f| crate::acl::verify_file_acl(f, &user))
+/// The notice and the line the agent wrote into the pipe `handle`, read to its end. The handle is
+/// closed, so the shell started next does not inherit it.
+fn read_handoff(handle: usize) -> anyhow::Result<(String, String)> {
+    use anyhow::Context;
+    use std::io::Read;
+    use std::os::windows::io::{FromRawHandle, RawHandle};
+    // SAFETY: the agent started this process with exactly this handle inherited and named it; nothing
+    // else here owns it.
+    let mut pipe = unsafe { std::fs::File::from_raw_handle(handle as RawHandle) };
+    let mut bytes = Vec::new();
+    pipe.read_to_end(&mut bytes).context("read the pipe")?;
+    drop(pipe);
+    crate::handoff::decode(&bytes)
 }
 
 /// Spawn `command` suspended and contain it in a job object before it runs a single instruction.
@@ -493,8 +562,7 @@ fn read_fallback_file(file: &std::path::Path) -> anyhow::Result<(String, String)
 unsafe fn spawn_contained(
     command: &str,
     stdio: Option<[windows::Win32::Foundation::HANDLE; 3]>,
-) -> anyhow::Result<(crate::winutil::OwnedHandle, cosca::Job)> {
-    use anyhow::Context;
+) -> Result<(crate::winutil::OwnedHandle, cosca::Job), StartError> {
     use windows::Win32::System::Threading::{
         CREATE_SUSPENDED, CreateProcessW, PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOW,
     };
@@ -528,7 +596,7 @@ unsafe fn spawn_contained(
             &si,
             &mut pi,
         )
-        .with_context(|| format!("spawn the fail-open local command: {command}"))?;
+        .map_err(|e| crate::winutil::start_error_of_create(e, None))?;
         let process = crate::winutil::OwnedHandle(pi.hProcess);
         let thread = crate::winutil::OwnedHandle(pi.hThread);
         let job = crate::winutil::contain_and_resume(process.0, thread.0, "shim fail-open")?;

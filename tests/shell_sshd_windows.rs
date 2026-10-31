@@ -140,6 +140,23 @@ impl Rig {
         );
     }
 
+    /// How many sessions the shim has run itself so far: it logs "agent unavailable" for each, whether
+    /// or not the session has a terminal (which has no stderr to say it on). Compare two readings around
+    /// a session to learn whether the agent served it; the log is flushed when the shim exits.
+    fn ran_locally(&self) -> usize {
+        self.logs().matches("agent unavailable").count()
+    }
+
+    /// Fail unless the agent served every session since `before` ([`Rig::ran_locally`]).
+    fn assert_agent_served(&self, what: &str, before: usize) {
+        assert_eq!(
+            self.ran_locally(),
+            before,
+            "{what}: the shim ran a session itself, not through the agent\nlogs of the account:\n{}",
+            self.logs()
+        );
+    }
+
     /// The reverse of [`Rig::assert_relayed`], for a session started with no agent running.
     fn assert_local(&self, what: &str, shown: &str) {
         assert!(
@@ -218,15 +235,19 @@ fn corpus_through_stock_and_broker(tag: &str, tty: bool) {
     let mut check = |path: &str, relayed: bool| {
         for command in &commands {
             rig.forget_line();
+            let before = rig.ran_locally();
             let outcome = rig.ssh(&login, tty, command);
             let shown = format!("{}{}", text(&outcome), outcome.stderr);
             // A session with a terminal says "agent unavailable" to the log, not to the terminal.
-            if !tty {
-                if relayed {
-                    rig.assert_relayed(&format!("broker ({path}), {command:?}"), &shown);
-                } else {
-                    rig.assert_local(&format!("broker ({path}), {command:?}"), &shown);
-                }
+            if relayed {
+                rig.assert_agent_served(&format!("broker ({path}), {command:?}"), before);
+            } else {
+                assert_eq!(
+                    rig.ran_locally(),
+                    before + 1,
+                    "broker ({path}), {command:?}: the shim did not run the session itself\n{shown}\nlogs of the account:\n{}",
+                    rig.logs()
+                );
             }
             let Some(line) = rig.probe_line() else {
                 failures.push(format!(
@@ -613,6 +634,7 @@ fn the_warning_survives_on_the_screen_of_a_terminal_session_through_the_agent() 
     rig.broker_is_default_shell();
     let session = rig.start_session(&login);
     rig.account.write_user_config("shell: {strt: pwsh.exe}\n");
+    let before = rig.ran_locally();
 
     let relayed = rig.ssh(&login, true, "echo built-in-ok");
     assert_warning_on_screen(
@@ -634,6 +656,7 @@ fn the_warning_survives_on_the_screen_of_a_terminal_session_through_the_agent() 
     );
     shown.type_line("exit");
     let _ = shown.finish();
+    rig.assert_agent_served("the sessions with a broken config", before);
     session.leave();
 }
 
@@ -648,6 +671,7 @@ fn the_warning_is_on_the_screen_once_in_a_terminal_session_through_the_agent() {
     rig.broker_is_default_shell();
     let session = rig.start_session(&login);
     rig.account.write_user_config("shell: {strt: pwsh.exe}\n");
+    let before = rig.ran_locally();
 
     let relayed = rig.ssh(&login, true, "echo built-in-ok");
     let screen = sshd_rig::screen_text(&relayed.stdout);
@@ -674,12 +698,12 @@ fn the_warning_is_on_the_screen_once_in_a_terminal_session_through_the_agent() {
     );
     shown.type_line("exit");
     let _ = shown.finish();
+    rig.assert_agent_served("the sessions with a broken config", before);
     session.leave();
 }
 
 /// The line of the fallback shell near the 32,767 units a command line takes. The verb gets the warning and
-/// the line through a file in the private folder, so the warning is printed in the pseudoconsole however long the
-/// line is, and the file is gone when the session ends.
+/// the line through a pipe, so the warning is printed in the pseudoconsole however long the line is.
 #[test]
 fn the_warning_is_on_the_screen_when_the_fallback_line_is_near_the_command_line_limit() {
     let _machine = machine::exclusive();
@@ -703,11 +727,38 @@ fn the_warning_is_on_the_screen_when_the_fallback_line_is_near_the_command_line_
         "the warning is not on the screen:\n{screen}\nraw: {:?}",
         finished.pty
     );
-    let left: Vec<_> = std::fs::read_dir(&location.dir)
-        .unwrap()
-        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-        .filter(|name| name.starts_with("console-fallback-"))
-        .collect();
-    assert!(left.is_empty(), "the verb left its file behind: {left:?}");
+    session.leave();
+}
+
+/// Ctrl+C in a terminal session whose shell fell back reaches the shell, and the session lives. The fallback
+/// shell runs under the hidden verb, which is the console's root process: with the default handler the
+/// verb would end on the Ctrl+C that cmd.exe answers, and the session with it (ssh-broker#55). Measured in CI:
+/// the agent's pseudoconsole raises the Ctrl+C in every process on it.
+#[test]
+fn ctrl_c_in_a_terminal_session_whose_shell_fell_back_reaches_the_shell_and_the_session_lives() {
+    let _machine = machine::exclusive();
+    let rig = Rig::new("shd14");
+    let login = rig.login();
+    rig.broker_is_default_shell();
+    let session = rig.start_session(&login);
+    rig.account.write_user_config("shell: {strt: pwsh.exe}\n");
+    let location = socket_loc::for_profile(rig.account.profile()).unwrap();
+
+    let mut conn = agent_conn::AgentConn::connect(&location);
+    conn.start_shell_pty(None);
+    conn.read_until_pty_shows("Microsoft Windows");
+
+    // A program in the shell, interrupted by Ctrl+C: cmd.exe stays and shows the next prompt.
+    conn.type_line("ping -n 60 127.0.0.1");
+    conn.read_until_pty_shows("Reply from");
+    conn.ctrl_c();
+    conn.read_until_pty_shows("^C");
+    // `^i` is `i` to cmd.exe, so the text appears only as output, not as the echo of what was typed.
+    conn.type_line("echo the-sess^ion-lives");
+    conn.read_until_pty_shows("the-session-lives");
+
+    conn.type_line("exit");
+    let finished = conn.read_to_end();
+    assert_eq!(finished.exit, Some(0), "{}", finished.pty);
     session.leave();
 }
