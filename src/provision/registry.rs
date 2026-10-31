@@ -142,7 +142,8 @@ impl SshdShellReading {
 }
 
 /// The shell sshd uses now could not be read in full. Replacing it would lose what could not be read,
-/// so `apply` stops before it does.
+/// so `apply` stops before it does. `apply` prints this text before and after the flip, so it says nothing
+/// about what was changed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnreadShell {
     location: String,
@@ -156,8 +157,7 @@ impl std::fmt::Display for UnreadShell {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "cannot read the shell sshd uses now: {} under {}, so DefaultShell was not changed. The values that \
-             could be read: {}",
+            "cannot read the shell sshd uses now: {} under {}. The values that could be read: {}",
             self.unread.join(", "),
             self.location,
             if self.read.is_empty() {

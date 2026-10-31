@@ -109,7 +109,10 @@ impl ConfiguredShell {
         Some(Self {
             file: file.clone(),
             setting: plan.effective.start_kind.setting(),
-            value: plan.effective.start.first().cloned().unwrap_or_default(),
+            value: match plan.effective.start.as_slice() {
+                [program] => program.clone(),
+                list => format!("[{}]", list.join(", ")),
+            },
         })
     }
 

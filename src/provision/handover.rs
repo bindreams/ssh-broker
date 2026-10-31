@@ -54,13 +54,18 @@ impl Handover {
 /// Replace the shell sshd uses: read it with `read`, `carry` its values (or print them), and only
 /// then `flip`, which takes the [`Handover`] that `carry` returned. A shell that could not be read in
 /// full is an error and `carry` and `flip` are not called: what cannot be read can be neither carried
-/// nor printed, so the shell is left as it is.
+/// nor printed, so the shell is left as it is, and the error says so.
 pub fn replace_shell<T>(
     read: impl FnOnce() -> Result<SshdShell, UnreadShell>,
     carry: impl FnOnce(&SshdShell) -> Handover,
     flip: impl FnOnce(&Handover) -> anyhow::Result<T>,
 ) -> anyhow::Result<T> {
-    let previous = read()?;
+    let previous = read().map_err(|unread| {
+        anyhow::anyhow!(
+            "{unread}. DefaultShell was not changed: fix the value or its permissions, or delete it, then run \
+             `apply` again"
+        )
+    })?;
     let handover = carry(&previous);
     flip(&handover)
 }

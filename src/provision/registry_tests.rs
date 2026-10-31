@@ -513,7 +513,7 @@ fn a_value_that_could_not_be_read_is_named_with_its_cause_and_the_others_are_pri
         text,
         [
             r"cannot read the shell sshd uses now: DefaultShellArguments (access denied) under ",
-            r"HKLM\SOFTWARE\OpenSSH, so DefaultShell was not changed. The values that could be read: ",
+            r"HKLM\SOFTWARE\OpenSSH. The values that could be read: ",
             r#"DefaultShell = "C:\Program Files\PowerShell\7\pwsh.exe", DefaultShellCommandOption = "-NoLogo -c", "#,
             "DefaultShellEscapeArguments = off",
         ]
@@ -535,10 +535,19 @@ fn every_failing_value_is_named_and_the_shell_itself_may_be_the_one() {
         "DefaultShellArguments (bad data)",
         "DefaultShellCommandOption = \"-c\"",
         "DefaultShellEscapeArguments = on",
-        "DefaultShell was not changed",
     ] {
         assert!(text.contains(part), "{part}: {text}");
     }
+}
+
+/// `apply` also prints this text after the flip (`remove_shell_arguments`), when `DefaultShell` is ssh-broker,
+/// so it claims nothing about what was or was not changed.
+#[test]
+fn the_text_makes_no_claim_about_the_default_shell_being_changed() {
+    let mut reading = read_ok();
+    reading.arguments = Err("access denied".into());
+    let text = reading.into_shell("location").unwrap_err().to_string();
+    assert!(!text.contains("changed"), "{text}");
 }
 
 #[test]

@@ -145,6 +145,7 @@ fn an_unreadable_previous_shell_stops_before_the_flip() {
     for part in [
         "DefaultShellCommandOption (access denied)",
         "DefaultShell was not changed",
+        "fix the value or its permissions, or delete it, then run `apply` again",
         &format!("DefaultShell = \"{PWSH7}\""),
         "DefaultShellArguments = \"-NoProfile\"",
         "DefaultShellEscapeArguments = off",

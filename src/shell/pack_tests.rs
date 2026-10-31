@@ -909,14 +909,41 @@ fn the_dll_warning_reads_as_one_sentence() {
     );
 }
 
-/// The warning names the setting as the config spells it.
+/// The warning names the setting as the config spells it, and shows the setting's whole value.
 #[test]
 fn the_dll_warning_names_the_setting_as_the_config_spells_it() {
-    for (config, setting) in [
-        ("shell: pwsh.exe\n", "`shell`"),
-        ("shell: {start: pwsh.exe}\n", "`shell.start`"),
-        ("shell: {start: [pwsh.exe, -NoLogo]}\n", "`shell.start`"),
-        ("shell:\n  start: pwsh.exe\n", "`shell.start`"),
+    for (config, setting, value) in [
+        (
+            "shell: pwsh.exe
+",
+            "`shell`",
+            "pwsh.exe",
+        ),
+        (
+            "shell: {start: pwsh.exe}
+",
+            "`shell.start`",
+            "pwsh.exe",
+        ),
+        (
+            "shell: {start: [pwsh.exe]}
+",
+            "`shell.start`",
+            "pwsh.exe",
+        ),
+        (
+            "shell: {start: [pwsh.exe, -NoLogo]}
+",
+            "`shell.start`",
+            "[pwsh.exe, -NoLogo]",
+        ),
+        (
+            "shell:
+  start: pwsh.exe
+",
+            "`shell.start`",
+            "pwsh.exe",
+        ),
     ] {
         let host = TestHost::new().with_program("pwsh.exe", PWSH).with_user_config(config);
         let notice = started_shell(&host, "never")
@@ -924,7 +951,7 @@ fn the_dll_warning_names_the_setting_as_the_config_spells_it() {
             .exit_notice(DLL_NOT_FOUND)
             .unwrap();
         assert!(
-            notice.contains(&format!("({setting}: pwsh.exe)")),
+            notice.contains(&format!("({setting}: {value})")),
             "{config:?}: {notice}"
         );
     }
