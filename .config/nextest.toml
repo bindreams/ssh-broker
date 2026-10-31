@@ -52,5 +52,5 @@ inherits = "ci"
 default-filter = '(binary(session_on_demand_windows) & test(/^logon_with_seclogon_(stopped|disabled)_returns_windows_reason$/)) | (binary(upgrade_windows) & test(/^apply_/))'
 
 [[profile.ci.overrides]]
-filter = 'test(/^measure_loader_failure/)'
+filter = 'test(/measure_loader_failure/)'
 success-output = "immediate"
