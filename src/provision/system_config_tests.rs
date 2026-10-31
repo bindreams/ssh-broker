@@ -298,6 +298,31 @@ fn decide_reports_what_it_could_not_find_out_unless_nothing_depends_on_it() {
     );
 }
 
+/// A directory (or anything not a file) at the config path cannot hold the config: the decision says so,
+/// without trying to write it or looking for the shell.
+#[test]
+fn decide_skips_a_config_path_that_is_not_a_file() {
+    let never_dirs = || -> Result<Vec<PathBuf>, String> { panic!("looked for the directories") };
+    let never_find = |_: &[PathBuf], _: &Path| -> Result<PathBuf, String> { panic!("looked for the shell") };
+    assert_eq!(
+        decide(&sshd(PWSH7), Ok(ConfigKind::Other), &never_dirs, &never_find, &|_| {
+            false
+        }),
+        Decision::Skip(Skip::NotAFile)
+    );
+    // With nothing to carry, nothing is said about the path.
+    assert_eq!(
+        decide(
+            &sshd(r"C:\x\ssh-broker.exe"),
+            Ok(ConfigKind::Other),
+            &never_dirs,
+            &never_find,
+            &|_| false
+        ),
+        Decision::Skip(Skip::NothingToCarry)
+    );
+}
+
 /// The directories to look for the shell in are looked up only when the decision gets that far: with no
 /// previous shell, ssh-broker's own, or a config that is there (or not known to be), finding them, and
 /// saying that it failed, would be noise about something that does not matter.
@@ -378,6 +403,7 @@ fn every_skip_that_replaces_a_shell_without_carrying_it_holds_every_previous_val
     let config = Path::new(r"C:\ProgramData\ssh-broker\config.yaml");
     for (skip, cause) in [
         (Skip::FileExists, "is already there"),
+        (Skip::NotAFile, "is not a file"),
         (
             Skip::PreviousMissing("there is no such file".into()),
             "there is no such file",
@@ -410,6 +436,25 @@ fn every_skip_that_replaces_a_shell_without_carrying_it_holds_every_previous_val
             assert!(!text.contains(past), "{skip:?}: {past}: {text}");
         }
     }
+}
+
+/// A config path that holds a directory is said to hold no file, and the advice is to replace what is there:
+/// "is never rewritten" and "put it in that config" cannot be done for it.
+#[test]
+fn the_notice_for_a_config_path_that_is_not_a_file_says_so_and_how_to_restore() {
+    let text = skip_notice(Path::new(CONFIG), &sshd(PWSH7), &Skip::NotAFile);
+    for part in [
+        &format!("{CONFIG} is not a file"),
+        "replace what is at that path with a config that holds it",
+    ] {
+        assert!(text.contains(part), "{part}: {text}");
+    }
+    for part in ["never rewritten", "already there", "put it in that config"] {
+        assert!(!text.contains(part), "{part}: {text}");
+    }
+    // The notice for a file that is there keeps its advice.
+    let text = skip_notice(Path::new(CONFIG), &sshd(PWSH7), &Skip::FileExists);
+    assert!(text.contains("put it in that config"), "{text}");
 }
 
 /// A shell that is set and not ssh-broker's has something to carry: a skip that claims otherwise is wrong,
@@ -589,12 +634,16 @@ fn create_once_never_replaces_an_existing_file_and_leaves_no_partial_file() {
         ..ShellBlock::default()
     };
 
-    assert!(create_once_at(&target, &first).unwrap());
+    assert_eq!(create_once_at(&target, &first).unwrap(), None);
     let written = std::fs::read(&target).unwrap();
     assert_eq!(parse(&written).unwrap(), Some(first));
     assert_eq!(names(&dir.0), ["config.yaml"], "no temp file is left");
 
-    assert!(!create_once_at(&target, &second).unwrap(), "a file was there");
+    assert_eq!(
+        create_once_at(&target, &second).unwrap(),
+        Some(Skip::FileExists),
+        "a file was there"
+    );
     assert_eq!(std::fs::read(&target).unwrap(), written, "the file is untouched");
     assert_eq!(names(&dir.0), ["config.yaml"]);
 }
@@ -633,7 +682,7 @@ fn create_once_leaves_a_file_with_other_content_alone() {
         start: vec!["b.exe".into()],
         ..ShellBlock::default()
     };
-    assert!(!create_once_at(&target, &block).unwrap());
+    assert_eq!(create_once_at(&target, &block).unwrap(), Some(Skip::FileExists));
     assert_eq!(std::fs::read_to_string(&target).unwrap(), "# mine\nshell: pwsh.exe\n");
 }
 
@@ -660,7 +709,7 @@ fn a_directory_in_the_way_is_not_replaced() {
         start: vec!["b.exe".into()],
         ..ShellBlock::default()
     };
-    assert!(!create_once_at(&target, &block).unwrap());
+    assert_eq!(create_once_at(&target, &block).unwrap(), Some(Skip::NotAFile));
     assert!(target.is_dir());
     assert_eq!(names(&dir.0), ["config.yaml"]);
 }
@@ -845,6 +894,10 @@ fn arguments_with_a_config_that_could_not_be_checked_are_left_and_the_text_says_
         assert!(text.contains(part), "{part}: {text}");
     }
     assert!(!text.contains(NO_LONGER_THERE), "{text}");
+    // Writing the config does not help when the file may be there and cannot be checked: the advice is to
+    // fix what stops the check.
+    assert!(text.contains("fix what stops that check and run apply again"), "{text}");
+    assert!(!text.contains("write the config"), "{text}");
 }
 
 // config_is_file -----

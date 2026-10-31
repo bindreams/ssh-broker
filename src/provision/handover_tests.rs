@@ -6,7 +6,7 @@ use std::path::Path;
 
 use super::{Handover, Stream, hand_over, remove_arguments, replace_shell};
 use crate::provision::registry::{SshdShell, SshdShellReading};
-use crate::provision::system_config::{ConfigKind, Decision, Skip};
+use crate::provision::system_config::{ConfigKind, Decision, Skip, decide};
 use crate::shell::config::ShellBlock;
 
 const PWSH7: &str = r"C:\Program Files\PowerShell\7\pwsh.exe";
@@ -40,7 +40,7 @@ fn block() -> ShellBlock {
 fn said_for(
     previous: &SshdShell,
     decision: Decision,
-    create: impl FnOnce(&ShellBlock) -> anyhow::Result<bool>,
+    create: impl FnOnce(&ShellBlock) -> anyhow::Result<Option<Skip>>,
 ) -> Vec<(Stream, String)> {
     let mut lines = Vec::new();
     let _ = hand_over(Path::new(CONFIG), previous, decision, create, &mut |stream, text| {
@@ -50,7 +50,7 @@ fn said_for(
 }
 
 /// Run `hand_over` for the foreign `previous()` and return what was said.
-fn said(decision: Decision, create: impl FnOnce(&ShellBlock) -> anyhow::Result<bool>) -> Vec<(Stream, String)> {
+fn said(decision: Decision, create: impl FnOnce(&ShellBlock) -> anyhow::Result<Option<Skip>>) -> Vec<(Stream, String)> {
     said_for(&previous(), decision, create)
 }
 
@@ -78,7 +78,7 @@ fn before_the_flip(text: &str) {
 
 #[test]
 fn a_config_created_by_someone_else_in_between_prints_the_previous_values() {
-    let lines = said(Decision::Write(block()), |_| Ok(false));
+    let lines = said(Decision::Write(block()), |_| Ok(Some(Skip::FileExists)));
     assert_eq!(lines.len(), 1, "{lines:?}");
     assert_eq!(lines[0].0, Stream::Err);
     holds_every_previous_value(&lines[0].1);
@@ -87,7 +87,7 @@ fn a_config_created_by_someone_else_in_between_prints_the_previous_values() {
 
 #[test]
 fn a_written_config_says_so_on_stdout_and_prints_no_warning() {
-    let lines = said(Decision::Write(block()), |_| Ok(true));
+    let lines = said(Decision::Write(block()), |_| Ok(None));
     assert_eq!(
         lines,
         vec![(
@@ -112,19 +112,58 @@ fn a_config_that_cannot_be_written_prints_the_previous_values_and_the_cause() {
 fn every_skip_that_loses_the_previous_shell_prints_the_previous_values_without_creating() {
     for skip in [
         Skip::FileExists,
+        Skip::NotAFile,
         Skip::PreviousMissing("there is no such file".into()),
         Skip::Unchecked("cannot tell whether the config exists".into()),
     ] {
         let created = Cell::new(false);
         let lines = said(Decision::Skip(skip.clone()), |_| {
             created.set(true);
-            Ok(true)
+            Ok(None)
         });
         assert!(!created.get(), "{skip:?}");
         assert_eq!(lines.len(), 1, "{skip:?}: {lines:?}");
         assert_eq!(lines[0].0, Stream::Err, "{skip:?}");
         holds_every_previous_value(&lines[0].1);
     }
+}
+
+/// A directory at the config path, from the check through the decision to what is printed: nothing is
+/// created, and the one line says the path is not a file, with every previous value.
+#[test]
+fn a_config_path_that_is_not_a_file_prints_that_and_the_previous_values_without_creating() {
+    let decision = decide(
+        &previous(),
+        Ok(ConfigKind::Other),
+        &|| Ok(vec![]),
+        &|_, path| Ok(path.to_path_buf()),
+        &|_| false,
+    );
+    let created = Cell::new(false);
+    let lines = said(decision, |_| {
+        created.set(true);
+        Ok(None)
+    });
+    assert!(!created.get());
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert_eq!(lines[0].0, Stream::Err);
+    holds_every_previous_value(&lines[0].1);
+    assert!(
+        lines[0].1.contains(&format!("{CONFIG} is not a file")),
+        "{}",
+        lines[0].1
+    );
+    assert!(!lines[0].1.contains("put it in that config"), "{}", lines[0].1);
+}
+
+/// The path turned into a non-file between the check and the create: the create says so and the line is the same.
+#[test]
+fn a_config_path_that_turns_into_a_non_file_before_the_create_prints_that() {
+    let lines = said(Decision::Write(block()), |_| Ok(Some(Skip::NotAFile)));
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert_eq!(lines[0].0, Stream::Err);
+    holds_every_previous_value(&lines[0].1);
+    assert!(lines[0].1.contains("is not a file"), "{}", lines[0].1);
 }
 
 /// What is carried is judged from the previous shell itself, whatever the decision says: ssh-broker's
@@ -149,7 +188,7 @@ fn a_previous_shell_that_is_ssh_broker_or_unset_says_nothing_whatever_the_decisi
             let created = Cell::new(false);
             let lines = said_for(&own(shell), decision, |_| {
                 created.set(true);
-                Ok(true)
+                Ok(None)
             });
             assert_eq!((lines, created.get()), (vec![], false), "{shell:?}");
         }
@@ -160,7 +199,7 @@ fn a_previous_shell_that_is_ssh_broker_or_unset_says_nothing_whatever_the_decisi
 /// are printed.
 #[test]
 fn a_nothing_to_carry_skip_for_a_foreign_shell_prints_the_previous_values() {
-    let lines = said(Decision::Skip(Skip::NothingToCarry), |_| Ok(true));
+    let lines = said(Decision::Skip(Skip::NothingToCarry), |_| Ok(None));
     assert_eq!(lines.len(), 1, "{lines:?}");
     assert_eq!(lines[0].0, Stream::Err);
     assert!(lines[0].1.contains(PWSH7), "{}", lines[0].1);

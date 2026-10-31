@@ -11,7 +11,7 @@
 use std::path::Path;
 
 use super::registry::{SshdShell, UnreadShell};
-use super::system_config::{self, ArgumentsPlan, ConfigKind, Decision};
+use super::system_config::{self, ArgumentsPlan, ConfigKind, Decision, Skip};
 use crate::shell::config::ShellBlock;
 
 /// Where a notice goes.
@@ -87,16 +87,16 @@ pub fn replace_shell<T>(
     flip(&handover).map_err(|e| e.context("DefaultShell was not changed"))
 }
 
-/// Act on `decision` for `previous`: write the config with `create` (which says whether it created the
-/// file, and is called only for a [`Decision::Write`]), or print what is not carried. `config` is the
-/// config's path. A previous shell with nothing to carry ([`system_config::nothing_to_carry`]) is known
+/// Act on `decision` for `previous`: write the config with `create` (which says why it did not create the
+/// file, or `None` when it did, and is called only for a [`Decision::Write`]), or print what is not carried.
+/// `config` is the config's path. A previous shell with nothing to carry ([`system_config::nothing_to_carry`]) is known
 /// from `previous` alone, whatever `decision` says; a decision that claims it for any other shell is
 /// printed, not believed.
 pub fn hand_over(
     config: &Path,
     previous: &SshdShell,
     decision: Decision,
-    create: impl FnOnce(&ShellBlock) -> anyhow::Result<bool>,
+    create: impl FnOnce(&ShellBlock) -> anyhow::Result<Option<Skip>>,
     say: &mut dyn FnMut(Stream, &str),
 ) -> Handover {
     if let Some(handover) = Handover::nothing_to_carry(previous) {
@@ -104,7 +104,7 @@ pub fn hand_over(
     }
     let skip = match decision {
         Decision::Write(block) => match create(&block) {
-            Ok(true) => {
+            Ok(None) => {
                 return Handover::carried(
                     say,
                     &format!(
@@ -115,7 +115,7 @@ pub fn hand_over(
                 );
             }
             // Someone else created the config between the check and the create: it is never rewritten.
-            Ok(false) => system_config::Skip::FileExists,
+            Ok(Some(skip)) => skip,
             Err(e) => {
                 return Handover::printed(say, &system_config::not_written(config, previous, &format!("{e:#}")));
             }

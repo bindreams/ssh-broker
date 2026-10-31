@@ -99,6 +99,8 @@ pub enum Skip {
     NothingToCarry,
     /// A config is already there, and is never rewritten.
     FileExists,
+    /// A directory or other non-file is at the config's path: it holds no config, and writing one needs it gone.
+    NotAFile,
     /// The previous shell is not a file that exists, found as sshd finds it (the string is why not);
     /// a config naming it would not start.
     PreviousMissing(String),
@@ -126,7 +128,7 @@ pub type SearchDirs<'a> = dyn Fn() -> Result<Vec<PathBuf>, String> + 'a;
 /// `is_system_cmd` says whether that file is the system `cmd.exe`. A bare name is carried as
 /// the file found, because a session searches `PATH` alone and sshd searched more. Nothing that
 /// could not be found out is reported while it does not matter: with no previous shell, or ssh-broker's
-/// own, nothing is replaced, and a config that is there is never rewritten.
+/// own, nothing is replaced, and a config that is there, or a path that is not a file, is not written.
 pub fn decide(
     prev: &SshdShell,
     config_is_file: Result<ConfigKind, String>,
@@ -141,8 +143,8 @@ pub fn decide(
     match config_is_file {
         Err(cause) => return Decision::Skip(Skip::Unchecked(cause)),
         Ok(ConfigKind::File) => return Decision::Skip(Skip::FileExists),
-        // Something else at the path is no config either; writing is tried and its failure is printed.
-        Ok(ConfigKind::Missing | ConfigKind::Other) => {}
+        Ok(ConfigKind::Other) => return Decision::Skip(Skip::NotAFile),
+        Ok(ConfigKind::Missing) => {}
     }
     let dirs = match search_dirs() {
         Ok(dirs) => dirs,
@@ -176,15 +178,18 @@ fn previous_values(previous: &SshdShell) -> String {
 
 /// The warning for a previous shell that is not carried. `apply` prints it before it replaces
 /// `DefaultShell`, which can still fail, so it says what `apply` does next and holds every value of
-/// the shell, which nothing else keeps. `reason` says why it is not carried.
-fn not_carried(config: &Path, previous: &SshdShell, reason: &str) -> String {
+/// the shell, which nothing else keeps. `reason` says why it is not carried, `in_config` how to put the shell
+/// in the config instead.
+fn not_carried(config: &Path, previous: &SshdShell, reason: &str, in_config: &str) -> String {
     format!(
         "apply: {reason}, so this apply does not carry the shell sshd used before into {config}; apply replaces \
-         DefaultShell next. To restore the shell, put it in that config or under {values}",
+         DefaultShell next. To restore the shell, {in_config} or under {values}",
         config = config.display(),
         values = previous_values(previous),
     )
 }
+
+const PUT_IN_CONFIG: &str = "put it in that config";
 
 /// The warning for a config that could not be written.
 pub fn not_written(config: &Path, previous: &SshdShell, cause: &str) -> String {
@@ -192,6 +197,7 @@ pub fn not_written(config: &Path, previous: &SshdShell, cause: &str) -> String {
         config,
         previous,
         &format!("could not write {}: {cause}", config.display()),
+        PUT_IN_CONFIG,
     )
 }
 
@@ -204,19 +210,24 @@ pub fn nothing_to_carry(previous: &SshdShell) -> bool {
 /// The warning for a [`Skip`] that leaves the previous shell uncarried while `apply` replaces it.
 /// [`Skip::NothingToCarry`] is no reason for a shell that has something to carry, and says so.
 pub fn skip_notice(config: &Path, previous: &SshdShell, skip: &Skip) -> String {
+    let mut in_config = PUT_IN_CONFIG;
     let reason = match skip {
         Skip::NothingToCarry => format!(
             "the shell sshd uses now ({}) was taken for one with nothing to carry, which it is not",
             previous.shell.as_deref().unwrap_or_default()
         ),
         Skip::FileExists => format!("{} is already there and is never rewritten", config.display()),
+        Skip::NotAFile => {
+            in_config = "replace what is at that path with a config that holds it (README, \"Shell configuration\")";
+            format!("{} is not a file", config.display())
+        }
         Skip::PreviousMissing(why) => format!(
             "the shell sshd uses now ({}) cannot be used: {why}",
             previous.shell.as_deref().unwrap_or_default()
         ),
         Skip::Unchecked(cause) => cause.clone(),
     };
-    not_carried(config, previous, &reason)
+    not_carried(config, previous, &reason, in_config)
 }
 
 /// What is at the system config's path.
@@ -287,7 +298,7 @@ pub fn plan_arguments(
             key,
             &value,
             &format!("{cause}, so it is not known whether there is a config to hold it"),
-            WRITE,
+            "fix what stops that check",
         )),
     }
 }
@@ -383,13 +394,14 @@ pub fn render(block: &ShellBlock) -> anyhow::Result<String> {
     ))
 }
 
-/// Write the system config for `block` if there is none, and say whether it did.
+/// Write the system config for `block` if there is none: `None` when it did, else why it did not
+/// ([`Skip::FileExists`], or [`Skip::NotAFile`] for a path that holds a directory or other non-file).
 ///
 /// The text goes to a temporary file in the same directory first and is then linked to the final
 /// name, which fails if the name is taken: the config appears whole or not at all, and a file that
 /// is there is never replaced. The new file inherits the install directory's ACL, which `base`
 /// proves was checked.
-pub fn create_once(base: &TrustedBase<'_>, block: &ShellBlock) -> anyhow::Result<bool> {
+pub fn create_once(base: &TrustedBase<'_>, block: &ShellBlock) -> anyhow::Result<Option<Skip>> {
     create_once_at(&base.layout().system_config_path(), block)
 }
 
@@ -404,7 +416,7 @@ fn remove_temp(temp: &Path) {
 }
 
 /// [`create_once`] for a path: the part that does not depend on the install directory.
-pub(super) fn create_once_at(target: &Path, block: &ShellBlock) -> anyhow::Result<bool> {
+pub(super) fn create_once_at(target: &Path, block: &ShellBlock) -> anyhow::Result<Option<Skip>> {
     let text = render(block)?;
     let mut temp = target.as_os_str().to_owned();
     temp.push(format!(".tmp-{}", std::process::id()));
@@ -425,8 +437,11 @@ pub(super) fn create_once_at(target: &Path, block: &ShellBlock) -> anyhow::Resul
     };
     remove_temp(&temp);
     match linked {
-        Ok(()) => Ok(true),
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Ok(()) => Ok(None),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(Some(match config_is_file(target) {
+            Ok(ConfigKind::Other) => Skip::NotAFile,
+            _ => Skip::FileExists,
+        })),
         Err(e) => Err(e).with_context(|| format!("create {}", target.display())),
     }
 }
