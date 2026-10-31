@@ -105,6 +105,50 @@ fn unknown_keys_and_bad_values_are_errors_naming_the_value() {
     }
 }
 
+/// `CreateProcessW` ends the line at the first NUL, so a NUL in any configured string would start
+/// the shell with part of its arguments dropped and no warning. The file is broken instead (the
+/// caller falls back to the built-in `cmd.exe` with the reason), and the reason names the key.
+#[test]
+fn a_nul_in_any_configured_string_is_an_error_naming_the_key() {
+    for (text, names) in [
+        (r#"shell: "pwsh\0.exe""#, "shell"),
+        (r#"shell: {start: "pwsh\0.exe"}"#, "start"),
+        (r#"shell: {start: [pwsh.exe, "-NoLogo\0-NoProfile"]}"#, "start"),
+        (r#"shell: {start: [pwsh.exe, "-a", "\0"]}"#, "start"),
+        (
+            r#"shell: {start: x, append: {with-command: ["-c\0x"]}}"#,
+            "with-command",
+        ),
+        (
+            r#"shell: {start: x, append: {with-command: [-c, "\0"]}}"#,
+            "with-command",
+        ),
+        (
+            r#"shell: {start: x, append: {without-command: ["-l\0-i"]}}"#,
+            "without-command",
+        ),
+        (
+            r#"shell: {start: x, append: {without-command: ["\0"]}}"#,
+            "without-command",
+        ),
+    ] {
+        let error = parse(text.as_bytes()).expect_err(text);
+        assert!(
+            error.reason.contains(names) && error.reason.contains("NUL"),
+            "{text:?}: the reason {:?} does not name {names:?} and the NUL",
+            error.reason
+        );
+    }
+}
+
+/// The refusal is for NUL only: an empty string and other control characters still parse.
+#[test]
+fn other_control_characters_are_still_accepted() {
+    let b = block(r#"shell: {start: [x, "a\tb", ""], append: {with-command: ["\x01"]}}"#);
+    assert_eq!(b.start, ["x", "a\tb", ""]);
+    assert_eq!(b.with_command.as_deref(), Some(&["\u{1}".to_string()][..]));
+}
+
 #[test]
 fn a_file_without_shell_is_none_and_an_empty_or_comment_only_file_too() {
     for text in ["", "\n", "# only a comment\n", "---\n", "---\n# c\n...\n", "  \n\n"] {

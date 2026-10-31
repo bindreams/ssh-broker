@@ -22,21 +22,6 @@ pub fn run(exec: Option<RawExec>) -> anyhow::Result<()> {
     }
 }
 
-/// `console-fallback`: read the notice and the line from the inherited pipe `handle`, print the notice
-/// on this console, start the line on it and exit with its code. The agent starts this in place of a
-/// fallback shell in a pseudoconsole, because anything it writes to one ahead of the shell is cleared
-/// (see `agent::launch`). `login`: the session has no command.
-pub fn run_console_fallback(handle: usize, login: bool) -> anyhow::Result<()> {
-    #[cfg(windows)]
-    std::process::exit(crate::shim_pty::console_fallback(handle, login));
-
-    #[cfg(not(windows))]
-    {
-        let _ = (handle, login);
-        anyhow::bail!("console-fallback starts a shell for the agent and runs only on Windows")
-    }
-}
-
 /// The command line to hand to `CreateProcessW`.
 ///
 /// The command is relayed as the client sent it, minus its leading [`BOUNDARY`] characters:

@@ -77,4 +77,3 @@ windows = { version = "0.62.2", features = [
     "Win32_System_JobObjects",               # CreateJobObjectW: tests/common/job.rs stands in for sshd's kill-on-close job
     "Win32_System_Diagnostics_Debug",        # WaitForDebugEvent: src/provision/procwait_ending_tests.rs holds a process in its exit
 ] }
-

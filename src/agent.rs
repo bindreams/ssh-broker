@@ -712,10 +712,9 @@ fn handle_connection_in(conn: socket2::Socket, hooks: Hooks, control: &Control) 
 }
 
 /// Show the warning for a shell that could not be used: the first data of the session, on the
-/// terminal for a PTY and on stderr for a command.
+/// terminal for a PTY and on stderr for a command. `launch::start` has logged it.
 #[cfg(windows)]
 fn show_notice(tx: &mut ConnTx, mode: Mode, text: &str) {
-    tracing::warn!("{text}");
     let (stream, bytes) = launch::notice_frame(mode, text);
     // A client that has gone is found by the relay, which owns that case.
     if let Err(e) = write_data(tx, stream, &bytes) {

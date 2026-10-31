@@ -56,7 +56,27 @@ pub fn parse(bytes: &[u8]) -> Result<Option<ShellBlock>, ParseError> {
             reason: "invalid `shell`: `start` is required and must not be empty".into(),
         });
     }
+    refuse_nul(&block)?;
     Ok(Some(block))
+}
+
+/// `CreateProcessW` ends the line at the first NUL, so a NUL in any configured string would start
+/// the shell with part of its arguments dropped. The file is broken instead, and its reason names
+/// the key.
+fn refuse_nul(block: &ShellBlock) -> Result<(), ParseError> {
+    let lists = [
+        ("start", Some(&block.start)),
+        ("with-command", block.with_command.as_ref()),
+        ("without-command", block.without_command.as_ref()),
+    ];
+    for (key, list) in lists {
+        if list.is_some_and(|items| items.iter().any(|item| item.contains('\0'))) {
+            return Err(ParseError {
+                reason: format!("invalid `shell`: `{key}` holds a NUL character, which a command line cannot carry"),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// A config file holding `block`, in the canonical nested form.

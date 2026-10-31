@@ -37,7 +37,7 @@ fn main() -> anyhow::Result<()> {
         Route::Apply => provision::apply(),
         Route::Verify => provision::verify(),
         Route::VerifyProbe => provision::verify_probe(),
-        Route::ConsoleFallback { handle, login } => shim::run_console_fallback(handle, login),
+        Route::ConsoleFallback { handle, login } => console_fallback_command(handle, login),
     }
 }
 
@@ -47,6 +47,20 @@ fn usage(verb: Verb) -> &'static str {
         Verb::Logout => "usage: ssh-broker logout",
         Verb::ConsoleFallback => "usage: ssh-broker console-fallback [--login] <handle> (internal)",
     }
+}
+
+/// `console-fallback`: read the notice and the line from the inherited pipe `handle`, print the notice
+/// on this console, start the line on it and exit with its code. The agent starts this in place of a
+/// fallback shell in a pseudoconsole, because anything it writes to one ahead of the shell is cleared
+/// (see `agent::launch`). `login`: the session has no command.
+#[cfg(windows)]
+fn console_fallback_command(handle: usize, login: bool) -> anyhow::Result<()> {
+    std::process::exit(ssh_broker::shim_pty::console_fallback(handle, login))
+}
+
+#[cfg(not(windows))]
+fn console_fallback_command(_handle: usize, _login: bool) -> anyhow::Result<()> {
+    anyhow::bail!("console-fallback starts a shell for the agent and runs only on Windows")
 }
 
 #[cfg(windows)]

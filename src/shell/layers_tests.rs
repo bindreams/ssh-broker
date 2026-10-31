@@ -179,3 +179,21 @@ fn the_notice_names_the_file_the_value_and_the_reason() {
     let parse = super::Problem { value: None, ..problem };
     assert!(!parse.notice().contains("()"), "{}", parse.notice());
 }
+
+/// A NUL in an argument is a broken file in either layer: the built-in `cmd.exe` with the warning,
+/// never the shell started with the line cut at the NUL.
+#[test]
+fn a_nul_in_an_argument_is_a_broken_file_in_either_layer() {
+    let text = r#"shell: {start: [pwsh.exe, "-NoLogo\0-NoProfile"]}"#;
+    for (host, file) in [
+        (TestHost::new().with_user_config(text), USER_CONFIG),
+        (TestHost::new().with_system_config(text), SYSTEM_CONFIG),
+    ] {
+        let chosen = choose(&host).unwrap();
+        assert_eq!(start_of(&chosen), [SYSTEM_CMD]);
+        assert_eq!(chosen.origin, Origin::Default);
+        let problem = chosen.problem.expect("a warning");
+        assert_eq!(problem.file, PathBuf::from(file));
+        assert!(problem.reason.contains("NUL"), "{}", problem.reason);
+    }
+}

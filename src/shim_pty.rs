@@ -493,6 +493,9 @@ extern "system" fn ctrl_handler(event: u32) -> windows::core::BOOL {
 /// exits 255.
 pub fn console_fallback(handle: usize, login: bool) -> i32 {
     use std::io::Write;
+    // First, so that no Ctrl+C ends this process, and with it the session's job, while the hand-off
+    // is read.
+    ignore_ctrl_c();
     let (notice, command_line) = match read_handoff(handle) {
         Ok(handed) => handed,
         Err(error) => {
