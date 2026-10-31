@@ -97,7 +97,9 @@ pub struct SshdShellReading {
 
 impl SshdShellReading {
     /// The shell sshd uses, when every value that matters was read. With no `DefaultShell` sshd
-    /// ignores the other three, so their failures do not matter. `location` names the key for the error.
+    /// ignores the other three, so their failures do not matter. With ssh-broker's own, `apply` replaces
+    /// it with itself and loses nothing, so a value that could not be read is taken as not set (escaping
+    /// on). `location` names the key for the error.
     pub fn into_shell(self, location: &str) -> Result<SshdShell, UnreadShell> {
         let Self {
             shell,
@@ -107,6 +109,16 @@ impl SshdShellReading {
         } = self;
         if matches!(shell, Ok(None)) {
             return Ok(SshdShell::none());
+        }
+        if let Ok(Some(own)) = &shell
+            && super::is_ssh_broker(own)
+        {
+            return Ok(SshdShell {
+                shell: Some(own.clone()),
+                command_option: command_option.ok().flatten(),
+                arguments: arguments.ok().flatten(),
+                escape_arguments: escape_arguments.unwrap_or(true),
+            });
         }
         let text = |value: &Option<String>| value.as_ref().map_or("not set".to_owned(), |v| format!("\"{v}\""));
         let mut unread = Vec::new();
@@ -142,7 +154,7 @@ impl SshdShellReading {
 }
 
 /// The shell sshd uses now could not be read in full. Replacing it would lose what could not be read,
-/// so `apply` stops before it does. `apply` prints this text before it writes anything and adds that
+/// so `apply` stops before it does. `apply` prints this text before it writes the registry and adds that
 /// `DefaultShell` was not changed; the text itself says nothing about what was changed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnreadShell {

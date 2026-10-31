@@ -200,3 +200,36 @@ fn a_failed_flip_is_the_error_and_says_the_default_shell_was_not_changed() {
     assert!(text.contains("write failed"), "{text}");
     assert!(!text.contains("replaced"), "{text}");
 }
+
+fn unreadable_arguments(shell: &str) -> SshdShellReading {
+    let mut reading = reading();
+    reading.shell = Ok(Some(shell.into()));
+    reading.arguments = Err("i/o error".into());
+    reading
+}
+
+/// Nothing is lost by replacing ssh-broker with itself, so an unreadable other value does not stop `apply`
+/// (it must still reach the removal of `DefaultShellArguments`); with a foreign shell it does.
+#[test]
+fn an_unreadable_value_stops_the_flip_only_for_a_shell_that_is_not_ssh_broker() {
+    for (shell, goes_on) in [
+        (r"C:\ProgramData\ssh-broker\ssh-broker.exe", true),
+        (r"C:\ProgramData\ssh-broker\ssh-broker", true),
+        (PWSH7, false),
+    ] {
+        let (carried, flipped) = (Cell::new(false), Cell::new(false));
+        let result = replace_shell(
+            || unreadable_arguments(shell).into_shell("location"),
+            |_| {
+                carried.set(true);
+                Handover::nothing_to_carry()
+            },
+            |_| {
+                flipped.set(true);
+                Ok(())
+            },
+        );
+        assert_eq!(result.is_ok(), goes_on, "{shell}: {result:?}");
+        assert_eq!((carried.get(), flipped.get()), (goes_on, goes_on), "{shell}");
+    }
+}

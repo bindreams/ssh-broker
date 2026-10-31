@@ -152,6 +152,7 @@ mod imp {
     use super::handover::{Handover, hand_over, replace_shell, say_to_console};
     use super::layout::{self, Layout};
     use super::registry::SshdShell;
+    use super::system_config::ArgumentsPlan;
     use super::{
         apply_lock, flow, probe, procwait, registry, report, schtasks, session_task, sessions, system_config,
         taskscheduler, user_rows,
@@ -251,9 +252,7 @@ mod imp {
     fn carry_previous_shell(base: &layout::TrustedBase<'_>, previous: &SshdShell) -> Handover {
         let mut say = say_to_console;
         let config = base.layout().system_config_path();
-        let config_exists = config
-            .try_exists()
-            .map_err(|e| format!("cannot tell whether {} exists: {e}", config.display()));
+        let config_exists = system_config::config_exists(&config);
         let host = crate::shell::WindowsHost;
         // The file the shell resolves to, found as sshd finds it (a bare name is searched in sshd's own
         // directory, the system and Windows directories, then on `PATH`), so the identity check below
@@ -292,29 +291,24 @@ mod imp {
 
     /// Remove `DefaultShellArguments` once `DefaultShell` is ssh-broker and `config` is a file:
     /// sshd would hand the arguments to ssh-broker ahead of `-c`, and the config is where they
-    /// were carried (by the `apply` that replaced the shell) or are not wanted. With no config the
-    /// value is the only copy of the old setup, so it is left, and said, for the next `apply` that
-    /// finds a config. Every removal and every leaving prints the value. A failed removal leaves
-    /// it for the next `apply`, says so with the cause, and `apply` goes on.
+    /// were carried (by the `apply` that replaced the shell) or are not wanted. A value that cannot be
+    /// read, or with no config known to hold it, is the only copy of the old setup: it is left, and
+    /// said (see [`system_config::plan_arguments`]), for the next `apply`. Every removal prints the value. A
+    /// failed removal leaves it for the next `apply`, says so with the cause, and `apply` goes on.
     fn remove_shell_arguments(config: &Path) {
         let key = registry::OPENSSH_KEY;
         // Read on its own: another value that cannot be read does not make this one unreadable.
-        let value = match registry::read_shell_arguments_under(key) {
-            Ok(Some(arguments)) => format!("{arguments:?}"),
-            // Absent, empty or too long for sshd: sshd ignores it, so there is nothing to pass on.
-            Ok(None) => return,
-            Err(read) => format!("unreadable ({read:#})"),
-        };
-        if !std::fs::metadata(config).is_ok_and(|m| m.is_file()) {
-            eprintln!("{}", system_config::arguments_left(config, key, &value));
-            return;
-        }
-        match registry::remove_shell_arguments_under(key) {
-            Ok(()) => println!("{}", system_config::arguments_removed(config, key, &value)),
-            Err(e) => eprintln!(
-                "{}",
-                system_config::arguments_not_removed(key, &value, &format!("{e:#}"))
-            ),
+        let read = registry::read_shell_arguments_under(key).map_err(|e| format!("{e:#}"));
+        match system_config::plan_arguments(config, key, read, || system_config::config_exists(config)) {
+            ArgumentsPlan::Nothing => {}
+            ArgumentsPlan::Leave(notice) => eprintln!("{notice}"),
+            ArgumentsPlan::Remove(value) => match registry::remove_shell_arguments_under(key) {
+                Ok(()) => println!("{}", system_config::arguments_removed(config, key, &value)),
+                Err(e) => eprintln!(
+                    "{}",
+                    system_config::arguments_not_removed(key, &value, &format!("{e:#}"))
+                ),
+            },
         }
     }
 

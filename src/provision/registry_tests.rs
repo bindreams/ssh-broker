@@ -581,3 +581,63 @@ fn a_value_that_is_not_set_is_printed_as_not_set() {
     let text = reading.into_shell("location").unwrap_err().to_string();
     assert!(text.contains("DefaultShellArguments = not set"), "{text}");
 }
+
+/// Replacing ssh-broker with ssh-broker loses nothing, so a value that cannot be read does not stop `apply`;
+/// it counts as not set.
+#[test]
+fn with_ssh_broker_as_the_shell_the_other_values_do_not_matter() {
+    for shell in [
+        r"C:\ProgramData\ssh-broker\ssh-broker.exe",
+        r"C:\ProgramData\ssh-broker\SSH-Broker",
+    ] {
+        let reading = SshdShellReading {
+            shell: Ok(Some(shell.into())),
+            command_option: Err("i/o error".into()),
+            arguments: Err("i/o error".into()),
+            escape_arguments: Err("i/o error".into()),
+        };
+        assert_eq!(
+            reading.into_shell("location").unwrap(),
+            SshdShell {
+                shell: Some(shell.into()),
+                command_option: None,
+                arguments: None,
+                escape_arguments: true,
+            },
+            "{shell}"
+        );
+    }
+}
+
+/// What was read stays: only a value that could not be read is set aside.
+#[test]
+fn with_ssh_broker_as_the_shell_the_values_that_were_read_are_kept() {
+    let shell = r"C:\ProgramData\ssh-broker\ssh-broker.exe";
+    let reading = SshdShellReading {
+        shell: Ok(Some(shell.into())),
+        command_option: Ok(Some("-c".into())),
+        arguments: Err("i/o error".into()),
+        escape_arguments: Ok(false),
+    };
+    let got = reading.into_shell("location").unwrap();
+    assert_eq!(
+        (got.command_option.as_deref(), got.arguments, got.escape_arguments),
+        (Some("-c"), None, false)
+    );
+}
+
+/// The exception is for ssh-broker alone: a shell that cannot be read is no exception, and a foreign
+/// shell with an unreadable value still stops.
+#[test]
+fn an_unreadable_value_still_stops_for_a_shell_that_is_not_ssh_broker() {
+    let mut reading = read_ok();
+    reading.arguments = Err("i/o error".into());
+    assert!(reading.into_shell("location").is_err());
+    let reading = SshdShellReading {
+        shell: Err("i/o error".into()),
+        command_option: Ok(None),
+        arguments: Ok(None),
+        escape_arguments: Ok(true),
+    };
+    assert!(reading.into_shell("location").is_err());
+}

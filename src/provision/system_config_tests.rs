@@ -4,8 +4,9 @@
 use std::path::{Path, PathBuf};
 
 use super::{
-    Decision, Skip, SshdClass, arguments_left, arguments_not_removed, arguments_removed, carried_block, classify,
-    create_once_at, decide, image_dir, not_written, remove_temp, render, skip_notice, sshd_search_dirs,
+    ArgumentsPlan, Decision, Skip, SshdClass, arguments_left, arguments_not_removed, arguments_removed, carried_block,
+    classify, config_exists, create_once_at, decide, image_dir, not_written, plan_arguments, remove_temp, render,
+    skip_notice, sshd_search_dirs,
 };
 use crate::provision::registry::SshdShell;
 use crate::shell::Escaping;
@@ -676,8 +677,14 @@ const KEY: &str = r"SOFTWARE\OpenSSH";
 
 #[test]
 fn the_arguments_left_text_names_the_value_the_key_and_what_to_do_and_does_not_say_the_shell_is_unchanged() {
-    let text = arguments_left(Path::new(CONFIG), KEY, "\"-NoLogo\"");
-    for part in ["-NoLogo", KEY, CONFIG, "DefaultShellArguments", "apply again"] {
+    let text = arguments_left(KEY, "\"-NoLogo\"", "there is no config to hold it");
+    for part in [
+        "-NoLogo",
+        KEY,
+        "there is no config to hold it",
+        "DefaultShellArguments",
+        "apply again",
+    ] {
         assert!(text.contains(part), "{part}: {text}");
     }
     after_the_flip(&text);
@@ -704,4 +711,96 @@ fn the_arguments_not_removed_text_names_the_value_and_the_cause_and_does_not_say
         assert!(text.contains(part), "{part}: {text}");
     }
     after_the_flip(&text);
+}
+
+// the DefaultShellArguments left or removed after the flip =====
+
+const NO_LONGER_THERE: &str = "there is no";
+
+fn plan(arguments: Result<Option<&str>, &str>, config: Result<bool, &str>) -> ArgumentsPlan {
+    plan_arguments(
+        Path::new(CONFIG),
+        KEY,
+        arguments.map(|a| a.map(str::to_owned)).map_err(str::to_owned),
+        || config.map_err(str::to_owned),
+    )
+}
+
+#[test]
+fn no_arguments_to_pass_on_is_nothing_to_do_and_the_config_is_not_looked_at() {
+    let plan = plan_arguments(Path::new(CONFIG), KEY, Ok(None), || panic!("the config is not needed"));
+    assert_eq!(plan, ArgumentsPlan::Nothing);
+}
+
+#[test]
+fn arguments_that_are_read_and_have_a_config_to_go_to_are_removed_with_the_value_shown() {
+    assert_eq!(
+        plan(Ok(Some("-NoLogo")), Ok(true)),
+        ArgumentsPlan::Remove("\"-NoLogo\"".to_owned())
+    );
+}
+
+/// A value that could not be read is neither carried nor shown, so it is never deleted: whatever the config
+/// is, it is left, and the text gives the cause.
+#[test]
+fn arguments_that_could_not_be_read_are_never_removed_and_the_cause_is_said() {
+    for config in [Ok(true), Ok(false), Err("cannot tell")] {
+        let ArgumentsPlan::Leave(text) = plan(Err("i/o error"), config) else {
+            panic!("{config:?}: removed or ignored a value it could not read");
+        };
+        for part in ["left DefaultShellArguments", "could not be read", "i/o error", KEY] {
+            assert!(text.contains(part), "{config:?}: {part}: {text}");
+        }
+        after_the_flip(&text);
+    }
+}
+
+#[test]
+fn arguments_with_no_config_are_left_and_the_text_says_there_is_none() {
+    let ArgumentsPlan::Leave(text) = plan(Ok(Some("-NoLogo")), Ok(false)) else {
+        panic!("removed a value with no config to hold it");
+    };
+    for part in ["-NoLogo", CONFIG, NO_LONGER_THERE, "apply again"] {
+        assert!(text.contains(part), "{part}: {text}");
+    }
+}
+
+/// A check that failed does not know the config is absent: the value is left and the text says it cannot
+/// tell, with the cause, not that there is no config.
+#[test]
+fn arguments_with_a_config_that_could_not_be_checked_are_left_and_the_text_says_it_cannot_tell() {
+    let ArgumentsPlan::Leave(text) = plan(
+        Ok(Some("-NoLogo")),
+        Err("cannot tell whether the config exists: i/o error"),
+    ) else {
+        panic!("removed a value although the config could not be checked");
+    };
+    for part in [
+        "-NoLogo",
+        "cannot tell whether the config exists: i/o error",
+        "apply again",
+    ] {
+        assert!(text.contains(part), "{part}: {text}");
+    }
+    assert!(!text.contains(NO_LONGER_THERE), "{text}");
+}
+
+// config_exists -----
+
+#[test]
+fn a_config_that_is_there_is_known_to_be_there_and_one_that_is_not_is_known_to_be_absent() {
+    let dir = TempDir::new("exists");
+    let config = dir.0.join("config.yaml");
+    assert_eq!(config_exists(&config), Ok(false));
+    std::fs::write(&config, "").unwrap();
+    assert_eq!(config_exists(&config), Ok(true));
+}
+
+/// A path the file system cannot answer for is an error that is not "absent": a NUL in the name is refused
+/// by the OS on every platform.
+#[test]
+fn a_config_that_cannot_be_checked_says_it_cannot_tell() {
+    let cause = config_exists(Path::new("config\0.yaml")).unwrap_err();
+    assert!(cause.starts_with("cannot tell whether config"), "{cause}");
+    assert!(cause.contains(" exists: "), "{cause}");
 }

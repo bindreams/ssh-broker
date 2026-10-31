@@ -212,14 +212,72 @@ pub fn skip_notice(config: &Path, previous: &SshdShell, skip: &Skip) -> Option<S
     Some(not_carried(config, previous, &reason))
 }
 
-/// The notice for a `DefaultShellArguments` `apply` leaves: `DefaultShell` is ssh-broker by now, `config`
-/// is not a file to hold the value, and `value` is how it was read.
-pub fn arguments_left(config: &Path, key: &str, value: &str) -> String {
+/// Whether `config` is there, or why that is not known: a failed check is not an absent file, so the
+/// cause is kept and worded as one that cannot tell. The one answer to "is the system config there" in
+/// `apply`.
+pub fn config_exists(config: &Path) -> Result<bool, String> {
+    config
+        .try_exists()
+        .map_err(|e| format!("cannot tell whether {} exists: {e}", config.display()))
+}
+
+/// What `apply` does with `DefaultShellArguments` once `DefaultShell` is ssh-broker.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ArgumentsPlan {
+    /// Sshd ignores the value (absent, empty or too long): nothing to pass on.
+    Nothing,
+    /// The value stays; the string is what `apply` says about it.
+    Leave(String),
+    /// The value is removed; the string is how it was read, for the notice.
+    Remove(String),
+}
+
+/// Decide what to do with `DefaultShellArguments` from how it was `arguments` read and whether the config
+/// that carries it is there (`config_exists`, asked only when the value is read and set). A value that
+/// was not read is never removed, since it could be neither shown nor carried; one with no config to hold
+/// it, or none known, is left too.
+pub fn plan_arguments(
+    config: &Path,
+    key: &str,
+    arguments: Result<Option<String>, String>,
+    config_exists: impl FnOnce() -> Result<bool, String>,
+) -> ArgumentsPlan {
+    let arguments = match arguments {
+        Ok(Some(arguments)) => arguments,
+        Ok(None) => return ArgumentsPlan::Nothing,
+        Err(cause) => return ArgumentsPlan::Leave(arguments_unreadable(key, &cause)),
+    };
+    let value = format!("{arguments:?}");
+    match config_exists() {
+        Ok(true) => ArgumentsPlan::Remove(value),
+        Ok(false) => ArgumentsPlan::Leave(arguments_left(
+            key,
+            &value,
+            &format!("there is no {} to hold it", config.display()),
+        )),
+        Err(cause) => ArgumentsPlan::Leave(arguments_left(
+            key,
+            &value,
+            &format!("{cause}, so it is not known whether there is a config to hold it"),
+        )),
+    }
+}
+
+/// The notice for a `DefaultShellArguments` `apply` leaves: `DefaultShell` is ssh-broker by now, `why`
+/// says why there is no config to hold the value, and `value` is how it was read.
+pub fn arguments_left(key: &str, value: &str, why: &str) -> String {
     format!(
-        "apply: left DefaultShellArguments ({value}) under HKLM\\{key}: there is no {} to hold it, and sshd passes \
-         it to ssh-broker ahead of -c; write the config (README, \"Shell configuration\") and run apply again, \
-         which removes it",
-        config.display()
+        "apply: left DefaultShellArguments ({value}) under HKLM\\{key}: {why}, and sshd passes it to ssh-broker \
+         ahead of -c; write the config (README, \"Shell configuration\") and run apply again, which removes it"
+    )
+}
+
+/// The notice for a `DefaultShellArguments` `apply` leaves because it could not read it, with the `cause`.
+pub fn arguments_unreadable(key: &str, cause: &str) -> String {
+    format!(
+        "apply: left DefaultShellArguments under HKLM\\{key}: it could not be read ({cause}), so it can be neither \
+         shown nor carried, and sshd passes it to ssh-broker ahead of -c; fix its permissions or delete it, then \
+         run apply again, which removes it"
     )
 }
 
