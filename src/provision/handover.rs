@@ -4,11 +4,14 @@
 //! [`Handover`], and the only ways to get one are here: the config was written from the previous
 //! values (carried), the text that holds every previous value was emitted (printed), or there is
 //! nothing to carry. No path through `apply` can replace the shell with the values neither kept nor shown.
+//! [`registry::remove_shell_arguments_under`](super::registry::remove_shell_arguments_under) is the same
+//! for the one value that is deleted afterwards: it takes a [`ShownValue`], which only the print of the
+//! value makes.
 
 use std::path::Path;
 
 use super::registry::{SshdShell, UnreadShell};
-use super::system_config::{self, Decision};
+use super::system_config::{self, ArgumentsPlan, Decision};
 use crate::shell::config::ShellBlock;
 
 /// Where a notice goes.
@@ -33,7 +36,9 @@ pub struct Handover(());
 
 impl Handover {
     /// The previous shell is ssh-broker's own, or there is none (sshd ran the built-in `cmd.exe`):
-    /// no value is lost by replacing it.
+    /// no value is lost by replacing it. [`hand_over`] decides that from the shell itself; this is `pub`
+    /// only for the integration tests, which have no way into the crate's `cfg(test)` code, and no
+    /// production code calls it.
     pub fn nothing_to_carry() -> Self {
         Self(())
     }
@@ -46,6 +51,19 @@ impl Handover {
 
     /// `text` holds every previous value and was emitted before the shell is replaced.
     fn printed(say: &mut dyn FnMut(Stream, &str), text: &str) -> Self {
+        say(Stream::Err, text);
+        Self(())
+    }
+}
+
+/// The text with a value that is about to be deleted was emitted.
+#[must_use = "the removal takes it"]
+#[derive(Debug)]
+pub struct ShownValue(());
+
+impl ShownValue {
+    /// `text` holds the value and is emitted before the value is deleted.
+    fn print(say: &mut dyn FnMut(Stream, &str), text: &str) -> Self {
         say(Stream::Err, text);
         Self(())
     }
@@ -73,7 +91,9 @@ pub fn replace_shell<T>(
 
 /// Act on `decision` for `previous`: write the config with `create` (which says whether it created the
 /// file, and is called only for a [`Decision::Write`]), or print what is not carried. `config` is the
-/// config's path.
+/// config's path. A previous shell with nothing to carry ([`system_config::nothing_to_carry`]) is known
+/// from `previous` alone, whatever `decision` says; a decision that claims it for any other shell is
+/// printed, not believed.
 pub fn hand_over(
     config: &Path,
     previous: &SshdShell,
@@ -81,6 +101,9 @@ pub fn hand_over(
     create: impl FnOnce(&ShellBlock) -> anyhow::Result<bool>,
     say: &mut dyn FnMut(Stream, &str),
 ) -> Handover {
+    if system_config::nothing_to_carry(previous) {
+        return Handover::nothing_to_carry();
+    }
     let skip = match decision {
         Decision::Write(block) => match create(&block) {
             Ok(true) => {
@@ -101,9 +124,34 @@ pub fn hand_over(
         },
         Decision::Skip(skip) => skip,
     };
-    match system_config::skip_notice(config, previous, &skip) {
-        Some(notice) => Handover::printed(say, &notice),
-        None => Handover::nothing_to_carry(),
+    Handover::printed(say, &system_config::skip_notice(config, previous, &skip))
+}
+
+/// Remove `DefaultShellArguments` once `DefaultShell` is ssh-broker (see [`system_config::plan_arguments`]
+/// for what is read and left). `config` is the config's path and `key` the registry key. The text with the
+/// value is emitted first and `remove`, which takes the [`ShownValue`] that makes, runs after it; then the
+/// removal, or its failure with the cause, is said. A failed removal leaves the value for the next `apply`.
+pub fn remove_arguments(
+    config: &Path,
+    key: &str,
+    read: Result<Option<String>, String>,
+    config_is_file: impl FnOnce() -> Result<bool, String>,
+    remove: impl FnOnce(&ShownValue) -> anyhow::Result<()>,
+    say: &mut dyn FnMut(Stream, &str),
+) {
+    match system_config::plan_arguments(config, key, read, config_is_file) {
+        ArgumentsPlan::Nothing => {}
+        ArgumentsPlan::Leave(notice) => say(Stream::Err, &notice),
+        ArgumentsPlan::Remove(value) => {
+            let shown = ShownValue::print(say, &system_config::arguments_removing(key, &value));
+            match remove(&shown) {
+                Ok(()) => say(Stream::Out, &system_config::arguments_removed(config, key, &value)),
+                Err(e) => say(
+                    Stream::Err,
+                    &system_config::arguments_not_removed(key, &value, &format!("{e:#}")),
+                ),
+            }
+        }
     }
 }
 

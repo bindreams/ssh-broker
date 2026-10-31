@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 
 use super::{
     ArgumentsPlan, Decision, Skip, SshdClass, arguments_left, arguments_not_removed, arguments_removed, carried_block,
-    classify, config_exists, create_once_at, decide, image_dir, not_written, plan_arguments, remove_temp, render,
-    skip_notice, sshd_search_dirs,
+    classify, config_is_file, create_once_at, decide, image_dir, not_written, nothing_to_carry, plan_arguments,
+    remove_temp, render, skip_notice, sshd_search_dirs,
 };
 use crate::provision::registry::SshdShell;
 use crate::shell::Escaping;
@@ -199,7 +199,7 @@ fn decide_table() {
     ] {
         assert_eq!(
             decide(&sshd(own), Ok(false), &dirs, &exists, &not_system),
-            Decision::Skip(Skip::PreviousIsSshBroker),
+            Decision::Skip(Skip::NothingToCarry),
             "{own}"
         );
     }
@@ -211,7 +211,7 @@ fn decide_table() {
     ] {
         assert_ne!(
             decide(&sshd(other), Ok(false), &dirs, &exists, &not_system),
-            Decision::Skip(Skip::PreviousIsSshBroker),
+            Decision::Skip(Skip::NothingToCarry),
             "{other}"
         );
     }
@@ -224,7 +224,7 @@ fn decide_table() {
     };
     assert_eq!(
         decide(&none, Ok(false), &dirs, &exists, &not_system),
-        Decision::Skip(Skip::NoPreviousShell)
+        Decision::Skip(Skip::NothingToCarry)
     );
 
     assert_eq!(
@@ -284,7 +284,7 @@ fn decide_reports_what_it_could_not_find_out_unless_nothing_depends_on_it() {
             &exists,
             &not_system
         ),
-        Decision::Skip(Skip::PreviousIsSshBroker)
+        Decision::Skip(Skip::NothingToCarry)
     );
     let none = SshdShell {
         shell: None,
@@ -294,7 +294,7 @@ fn decide_reports_what_it_could_not_find_out_unless_nothing_depends_on_it() {
     };
     assert_eq!(
         decide(&none, no_config, &no_dirs, &exists, &not_system),
-        Decision::Skip(Skip::NoPreviousShell)
+        Decision::Skip(Skip::NothingToCarry)
     );
 }
 
@@ -375,7 +375,7 @@ fn every_skip_that_replaces_a_shell_without_carrying_it_holds_every_previous_val
             "cannot tell whether the config exists",
         ),
     ] {
-        let text = skip_notice(config, &prev, &skip).unwrap_or_else(|| panic!("{skip:?} says nothing"));
+        let text = skip_notice(config, &prev, &skip);
         for part in [
             r"C:\ProgramData\ssh-broker\config.yaml",
             cause,
@@ -398,8 +398,28 @@ fn every_skip_that_replaces_a_shell_without_carrying_it_holds_every_previous_val
             assert!(!text.contains(past), "{skip:?}: {past}: {text}");
         }
     }
-    assert_eq!(skip_notice(config, &prev, &Skip::PreviousIsSshBroker), None);
-    assert_eq!(skip_notice(config, &prev, &Skip::NoPreviousShell), None);
+}
+
+/// A shell that is set and not ssh-broker's has something to carry: a skip that claims otherwise is wrong,
+/// and the notice still holds every value.
+#[test]
+fn a_nothing_to_carry_skip_for_a_shell_that_has_something_to_carry_prints_the_values() {
+    let prev = sshd(PWSH7);
+    let text = skip_notice(Path::new(CONFIG), &prev, &Skip::NothingToCarry);
+    assert!(text.contains(PWSH7) && text.contains("DefaultShellArguments"), "{text}");
+}
+
+#[test]
+fn nothing_to_carry_is_no_shell_or_ssh_broker_itself() {
+    let none = SshdShell {
+        shell: None,
+        ..sshd(PWSH7)
+    };
+    assert!(nothing_to_carry(&none));
+    for own in [r"C:\ProgramData\ssh-broker\ssh-broker.exe", "ssh-broker"] {
+        assert!(nothing_to_carry(&sshd(own)), "{own}");
+    }
+    assert!(!nothing_to_carry(&sshd(PWSH7)));
 }
 
 // sshd's search =====
@@ -751,6 +771,10 @@ fn arguments_that_could_not_be_read_are_never_removed_and_the_cause_is_said() {
         for part in ["left DefaultShellArguments", "could not be read", "i/o error", KEY] {
             assert!(text.contains(part), "{config:?}: {part}: {text}");
         }
+        // It cannot say what sshd does with a value nobody could read, and it names the condition under
+        // which a later `apply` removes it.
+        assert!(!text.contains("passes"), "{config:?}: {text}");
+        assert!(text.contains("once the system config is a file"), "{config:?}: {text}");
         after_the_flip(&text);
     }
 }
@@ -785,22 +809,31 @@ fn arguments_with_a_config_that_could_not_be_checked_are_left_and_the_text_says_
     assert!(!text.contains(NO_LONGER_THERE), "{text}");
 }
 
-// config_exists -----
+// config_is_file -----
 
 #[test]
-fn a_config_that_is_there_is_known_to_be_there_and_one_that_is_not_is_known_to_be_absent() {
-    let dir = TempDir::new("exists");
+fn a_config_that_is_a_file_is_known_to_be_one_and_one_that_is_not_there_is_known_to_be_absent() {
+    let dir = TempDir::new("is_file");
     let config = dir.0.join("config.yaml");
-    assert_eq!(config_exists(&config), Ok(false));
+    assert_eq!(config_is_file(&config), Ok(false));
     std::fs::write(&config, "").unwrap();
-    assert_eq!(config_exists(&config), Ok(true));
+    assert_eq!(config_is_file(&config), Ok(true));
+}
+
+/// A directory at the path holds no config: the loader cannot read it, so nothing is carried into it.
+#[test]
+fn a_directory_at_the_config_path_is_not_a_config() {
+    let dir = TempDir::new("is_file_dir");
+    let config = dir.0.join("config.yaml");
+    std::fs::create_dir(&config).unwrap();
+    assert_eq!(config_is_file(&config), Ok(false));
 }
 
 /// A path the file system cannot answer for is an error that is not "absent": a NUL in the name is refused
 /// by the OS on every platform.
 #[test]
 fn a_config_that_cannot_be_checked_says_it_cannot_tell() {
-    let cause = config_exists(Path::new("config\0.yaml")).unwrap_err();
+    let cause = config_is_file(Path::new("config\0.yaml")).unwrap_err();
     assert!(cause.starts_with("cannot tell whether config"), "{cause}");
-    assert!(cause.contains(" exists: "), "{cause}");
+    assert!(cause.contains(" is a file: "), "{cause}");
 }

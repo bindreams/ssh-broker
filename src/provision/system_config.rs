@@ -94,10 +94,9 @@ fn split_arguments(arguments: &str) -> Option<Vec<String>> {
 /// Why nothing is written.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Skip {
-    /// The previous shell is ssh-broker's own: an `apply` over an install has nothing to carry.
-    PreviousIsSshBroker,
-    /// No `DefaultShell`: sshd ran the system `cmd.exe`, which is the built-in.
-    NoPreviousShell,
+    /// The previous shell is ssh-broker's own (an `apply` over an install) or none (sshd ran the system
+    /// `cmd.exe`, which is the built-in): see [`nothing_to_carry`].
+    NothingToCarry,
     /// A config is already there, and is never rewritten.
     FileExists,
     /// The previous shell is not a file that exists, found as sshd finds it (the string is why not);
@@ -120,8 +119,8 @@ pub enum Decision {
 /// Finds the directories sshd searches for a bare shell name, or says why they are not known.
 pub type SearchDirs<'a> = dyn Fn() -> Result<Vec<PathBuf>, String> + 'a;
 
-/// Whether `apply` writes the config, and what. `config_exists` is whether the config is there, or
-/// why that is not known. `search_dirs` is called only once the decision needs the directories, so
+/// Whether `apply` writes the config, and what. `config_is_file` is whether the config is a file (see
+/// [`config_is_file`]), or why that is not known. `search_dirs` is called only once the decision needs the directories, so
 /// a failure to find them is not reported when nothing depends on it. `find` finds the file the
 /// previous shell names in them, as sshd finds it ([`sshd_search_dirs`]), or says why there is none;
 /// `is_system_cmd` says whether that file is the system `cmd.exe`. A bare name is carried as
@@ -130,18 +129,16 @@ pub type SearchDirs<'a> = dyn Fn() -> Result<Vec<PathBuf>, String> + 'a;
 /// own, nothing is replaced, and a config that is there is never rewritten.
 pub fn decide(
     prev: &SshdShell,
-    config_exists: Result<bool, String>,
+    config_is_file: Result<bool, String>,
     search_dirs: &SearchDirs,
     find: &Find,
     is_system_cmd: &dyn Fn(&Path) -> bool,
 ) -> Decision {
-    let Some(shell) = prev.shell.as_deref() else {
-        return Decision::Skip(Skip::NoPreviousShell);
-    };
-    if super::is_ssh_broker(shell) {
-        return Decision::Skip(Skip::PreviousIsSshBroker);
+    if nothing_to_carry(prev) {
+        return Decision::Skip(Skip::NothingToCarry);
     }
-    match config_exists {
+    let shell = prev.shell.as_deref().unwrap_or_default();
+    match config_is_file {
         Err(cause) => return Decision::Skip(Skip::Unchecked(cause)),
         Ok(true) => return Decision::Skip(Skip::FileExists),
         Ok(false) => {}
@@ -197,11 +194,20 @@ pub fn not_written(config: &Path, previous: &SshdShell, cause: &str) -> String {
     )
 }
 
-/// The warning for a [`Skip`] that leaves the previous shell uncarried while `apply` replaces it;
-/// none for a skip that replaces nothing.
-pub fn skip_notice(config: &Path, previous: &SshdShell, skip: &Skip) -> Option<String> {
+/// Whether replacing `previous` loses nothing: sshd ran no shell of its own (the built-in `cmd.exe`) or
+/// ssh-broker. The one place `apply` asks this.
+pub fn nothing_to_carry(previous: &SshdShell) -> bool {
+    previous.shell.as_deref().is_none_or(super::is_ssh_broker)
+}
+
+/// The warning for a [`Skip`] that leaves the previous shell uncarried while `apply` replaces it.
+/// [`Skip::NothingToCarry`] is no reason for a shell that has something to carry, and says so.
+pub fn skip_notice(config: &Path, previous: &SshdShell, skip: &Skip) -> String {
     let reason = match skip {
-        Skip::PreviousIsSshBroker | Skip::NoPreviousShell => return None,
+        Skip::NothingToCarry => format!(
+            "the shell sshd uses now ({}) was taken for one with nothing to carry, which it is not",
+            previous.shell.as_deref().unwrap_or_default()
+        ),
         Skip::FileExists => format!("{} is already there and is never rewritten", config.display()),
         Skip::PreviousMissing(why) => format!(
             "the shell sshd uses now ({}) cannot be used: {why}",
@@ -209,16 +215,19 @@ pub fn skip_notice(config: &Path, previous: &SshdShell, skip: &Skip) -> Option<S
         ),
         Skip::Unchecked(cause) => cause.clone(),
     };
-    Some(not_carried(config, previous, &reason))
+    not_carried(config, previous, &reason)
 }
 
-/// Whether `config` is there, or why that is not known: a failed check is not an absent file, so the
-/// cause is kept and worded as one that cannot tell. The one answer to "is the system config there" in
-/// `apply`.
-pub fn config_exists(config: &Path) -> Result<bool, String> {
-    config
-        .try_exists()
-        .map_err(|e| format!("cannot tell whether {} exists: {e}", config.display()))
+/// Whether `config` is a regular file, which is what the loader can read, or why that is not known: a
+/// failed check is not an absent file, so the cause is kept and worded as one that cannot tell. A
+/// directory or anything else at the path holds no config. The one answer to "is the system config
+/// there" in `apply`.
+pub fn config_is_file(config: &Path) -> Result<bool, String> {
+    match std::fs::metadata(config) {
+        Ok(metadata) => Ok(metadata.is_file()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(format!("cannot tell whether {} is a file: {e}", config.display())),
+    }
 }
 
 /// What `apply` does with `DefaultShellArguments` once `DefaultShell` is ssh-broker.
@@ -233,14 +242,14 @@ pub enum ArgumentsPlan {
 }
 
 /// Decide what to do with `DefaultShellArguments` from how it was `arguments` read and whether the config
-/// that carries it is there (`config_exists`, asked only when the value is read and set). A value that
+/// that carries it is a file (`config_is_file`, asked only when the value is read and set). A value that
 /// was not read is never removed, since it could be neither shown nor carried; one with no config to hold
 /// it, or none known, is left too.
 pub fn plan_arguments(
     config: &Path,
     key: &str,
     arguments: Result<Option<String>, String>,
-    config_exists: impl FnOnce() -> Result<bool, String>,
+    config_is_file: impl FnOnce() -> Result<bool, String>,
 ) -> ArgumentsPlan {
     let arguments = match arguments {
         Ok(Some(arguments)) => arguments,
@@ -248,7 +257,7 @@ pub fn plan_arguments(
         Err(cause) => return ArgumentsPlan::Leave(arguments_unreadable(key, &cause)),
     };
     let value = format!("{arguments:?}");
-    match config_exists() {
+    match config_is_file() {
         Ok(true) => ArgumentsPlan::Remove(value),
         Ok(false) => ArgumentsPlan::Leave(arguments_left(
             key,
@@ -273,11 +282,20 @@ pub fn arguments_left(key: &str, value: &str, why: &str) -> String {
 }
 
 /// The notice for a `DefaultShellArguments` `apply` leaves because it could not read it, with the `cause`.
+/// What sshd does with a value nobody could read is not known, so the text says none of it.
 pub fn arguments_unreadable(key: &str, cause: &str) -> String {
     format!(
         "apply: left DefaultShellArguments under HKLM\\{key}: it could not be read ({cause}), so it can be neither \
-         shown nor carried, and sshd passes it to ssh-broker ahead of -c; fix its permissions or delete it, then \
-         run apply again, which removes it"
+         shown nor carried; fix its permissions or delete it, then run apply again: a value that can be read is \
+         removed once the system config is a file"
+    )
+}
+
+/// The text `apply` emits before it removes `DefaultShellArguments`, with the `value` as it was read.
+pub fn arguments_removing(key: &str, value: &str) -> String {
+    format!(
+        "apply: removing DefaultShellArguments ({value}) from HKLM\\{key}, since sshd would pass it to ssh-broker \
+         ahead of -c"
     )
 }
 

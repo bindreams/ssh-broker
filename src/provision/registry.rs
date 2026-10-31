@@ -196,7 +196,7 @@ mod win {
     use super::{
         ESCAPE_ARGUMENTS, RegValue, SSHD_VALUE_BYTES, SshdShell, SshdShellReading, UnreadShell, desired_values,
     };
-    use crate::provision::handover::Handover;
+    use crate::provision::handover::{Handover, ShownValue};
     use anyhow::Context;
     use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_MORE_DATA, ERROR_PATH_NOT_FOUND, WIN32_ERROR};
     use windows::Win32::System::Registry::{
@@ -360,8 +360,9 @@ mod win {
         status.ok().context("remove DefaultShellArguments")
     }
 
-    /// Production: remove `DefaultShellArguments` from `HKLM\<subkey>`.
-    pub fn remove_shell_arguments_under(subkey: &str) -> anyhow::Result<()> {
+    /// Production: remove `DefaultShellArguments` from `HKLM\<subkey>`. The `shown` is the proof that the
+    /// text with the value was emitted before.
+    pub fn remove_shell_arguments_under(subkey: &str, _shown: &ShownValue) -> anyhow::Result<()> {
         remove_shell_arguments_in(HKEY_LOCAL_MACHINE, subkey)
     }
 

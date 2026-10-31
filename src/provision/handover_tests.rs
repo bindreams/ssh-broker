@@ -4,7 +4,7 @@
 use std::cell::Cell;
 use std::path::Path;
 
-use super::{Handover, Stream, hand_over, replace_shell};
+use super::{Handover, Stream, hand_over, remove_arguments, replace_shell};
 use crate::provision::registry::{SshdShell, SshdShellReading};
 use crate::provision::system_config::{Decision, Skip};
 use crate::shell::config::ShellBlock;
@@ -30,13 +30,22 @@ fn block() -> ShellBlock {
     }
 }
 
-/// Run `hand_over` and return what was said.
-fn said(decision: Decision, create: impl FnOnce(&ShellBlock) -> anyhow::Result<bool>) -> Vec<(Stream, String)> {
+/// Run `hand_over` for `previous` and return what was said.
+fn said_for(
+    previous: &SshdShell,
+    decision: Decision,
+    create: impl FnOnce(&ShellBlock) -> anyhow::Result<bool>,
+) -> Vec<(Stream, String)> {
     let mut lines = Vec::new();
-    let _ = hand_over(Path::new(CONFIG), &previous(), decision, create, &mut |stream, text| {
+    let _ = hand_over(Path::new(CONFIG), previous, decision, create, &mut |stream, text| {
         lines.push((stream, text.to_owned()))
     });
     lines
+}
+
+/// Run `hand_over` for the foreign `previous()` and return what was said.
+fn said(decision: Decision, create: impl FnOnce(&ShellBlock) -> anyhow::Result<bool>) -> Vec<(Stream, String)> {
+    said_for(&previous(), decision, create)
 }
 
 fn holds_every_previous_value(text: &str) {
@@ -112,11 +121,43 @@ fn every_skip_that_loses_the_previous_shell_prints_the_previous_values_without_c
     }
 }
 
+/// What is carried is judged from the previous shell itself, whatever the decision says: ssh-broker's
+/// own shell, or none, loses nothing and says nothing (and nothing is created for it).
 #[test]
-fn a_skip_that_replaces_nothing_says_nothing() {
-    for skip in [Skip::PreviousIsSshBroker, Skip::NoPreviousShell] {
-        assert_eq!(said(Decision::Skip(skip.clone()), |_| Ok(true)), vec![], "{skip:?}");
+fn a_previous_shell_that_is_ssh_broker_or_unset_says_nothing_whatever_the_decision() {
+    let own = |shell: Option<&str>| SshdShell {
+        shell: shell.map(str::to_owned),
+        ..previous()
+    };
+    for shell in [
+        Some(r"C:\ProgramData\ssh-broker\ssh-broker.exe"),
+        Some(r"C:\ProgramData\ssh-broker\ssh-broker"),
+        None,
+    ] {
+        for decision in [
+            Decision::Skip(Skip::NothingToCarry),
+            Decision::Skip(Skip::FileExists),
+            Decision::Skip(Skip::Unchecked("cannot tell".into())),
+            Decision::Write(block()),
+        ] {
+            let created = Cell::new(false);
+            let lines = said_for(&own(shell), decision, |_| {
+                created.set(true);
+                Ok(true)
+            });
+            assert_eq!((lines, created.get()), (vec![], false), "{shell:?}");
+        }
     }
+}
+
+/// A decision that claims there is nothing to carry cannot make a foreign shell vanish unseen: its values
+/// are printed.
+#[test]
+fn a_nothing_to_carry_skip_for_a_foreign_shell_prints_the_previous_values() {
+    let lines = said(Decision::Skip(Skip::NothingToCarry), |_| Ok(true));
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert_eq!(lines[0].0, Stream::Err);
+    assert!(lines[0].1.contains(PWSH7), "{}", lines[0].1);
 }
 
 fn reading() -> SshdShellReading {
@@ -232,4 +273,86 @@ fn an_unreadable_value_stops_the_flip_only_for_a_shell_that_is_not_ssh_broker() 
         assert_eq!(result.is_ok(), goes_on, "{shell}: {result:?}");
         assert_eq!((carried.get(), flipped.get()), (goes_on, goes_on), "{shell}");
     }
+}
+
+// the removal of DefaultShellArguments =====
+
+const KEY: &str = r"SOFTWARE\OpenSSH";
+
+#[derive(Debug, PartialEq, Eq)]
+enum Event {
+    Said(Stream, String),
+    Removed,
+}
+
+/// Run `remove_arguments` and return what happened, in order. `remove_fails` makes the removal fail.
+fn removal(read: Result<Option<&str>, &str>, config_is_file: Result<bool, &str>, remove_fails: bool) -> Vec<Event> {
+    let events = std::cell::RefCell::new(Vec::new());
+    remove_arguments(
+        Path::new(CONFIG),
+        KEY,
+        read.map(|v| v.map(str::to_owned)).map_err(str::to_owned),
+        || config_is_file.map_err(str::to_owned),
+        |_shown| {
+            events.borrow_mut().push(Event::Removed);
+            if remove_fails {
+                anyhow::bail!("access denied");
+            }
+            Ok(())
+        },
+        &mut |stream, text| events.borrow_mut().push(Event::Said(stream, text.to_owned())),
+    );
+    events.into_inner()
+}
+
+/// The owner's rule (7/7), applied to the value that is deleted: the text with the value is emitted
+/// before the delete runs, and the delete is confirmed after it.
+#[test]
+fn the_arguments_are_printed_before_they_are_removed_and_the_removal_is_confirmed_after() {
+    let events = removal(Ok(Some("-NoLogo")), Ok(true), false);
+    let [Event::Said(first, before), Event::Removed, Event::Said(second, after)] = &events[..] else {
+        panic!("{events:?}");
+    };
+    assert_eq!((*first, *second), (Stream::Err, Stream::Out));
+    assert!(
+        before.contains("removing DefaultShellArguments") && before.contains("-NoLogo"),
+        "{before}"
+    );
+    assert!(
+        after.contains("removed DefaultShellArguments") && after.contains(CONFIG),
+        "{after}"
+    );
+}
+
+#[test]
+fn a_failed_removal_was_announced_first_and_says_the_cause_and_that_the_next_apply_tries_again() {
+    let events = removal(Ok(Some("-NoLogo")), Ok(true), true);
+    let [Event::Said(_, before), Event::Removed, Event::Said(Stream::Err, after)] = &events[..] else {
+        panic!("{events:?}");
+    };
+    assert!(before.contains("-NoLogo"), "{before}");
+    for part in ["could not remove DefaultShellArguments", "access denied", "next apply"] {
+        assert!(after.contains(part), "{part}: {after}");
+    }
+}
+
+#[test]
+fn arguments_that_are_not_removed_are_never_removed_and_a_value_that_is_set_is_said() {
+    for (read, config_is_file) in [
+        (Err("i/o error"), Ok(true)),
+        (Err("i/o error"), Ok(false)),
+        (Ok(Some("-NoLogo")), Ok(false)),
+        (Ok(Some("-NoLogo")), Err("cannot tell")),
+    ] {
+        let events = removal(read, config_is_file, false);
+        assert!(
+            matches!(&events[..], [Event::Said(Stream::Err, _)]),
+            "{read:?} {config_is_file:?}: {events:?}"
+        );
+    }
+}
+
+#[test]
+fn no_arguments_say_nothing_and_remove_nothing() {
+    assert_eq!(removal(Ok(None), Ok(true), false), vec![]);
 }
