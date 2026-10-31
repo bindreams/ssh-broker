@@ -219,7 +219,9 @@ mod imp {
                     |previous| carry_previous_shell(&base, previous),
                     |handover| {
                         registry::set_default_shell_under(registry::OPENSSH_KEY, &exe.to_string_lossy(), handover)
-                            .context("write the DefaultShell values")
+                            .context(
+                                "write the DefaultShell values (the escape flag and the command option go first and may be set)",
+                            )
                     },
                 )?;
                 let (shell, opt) = registry::read_default_shell_under(registry::OPENSSH_KEY)?;
@@ -296,32 +298,22 @@ mod imp {
     /// it for the next `apply`, says so with the cause, and `apply` goes on.
     fn remove_shell_arguments(config: &Path) {
         let key = registry::OPENSSH_KEY;
-        let value = match registry::read_sshd_shell_under(key) {
-            Ok(shell) => match shell.arguments {
-                Some(arguments) => format!("{arguments:?}"),
-                // Absent, empty or too long for sshd: sshd ignores it, so there is nothing to pass on.
-                None => return,
-            },
+        // Read on its own: another value that cannot be read does not make this one unreadable.
+        let value = match registry::read_shell_arguments_under(key) {
+            Ok(Some(arguments)) => format!("{arguments:?}"),
+            // Absent, empty or too long for sshd: sshd ignores it, so there is nothing to pass on.
+            Ok(None) => return,
             Err(read) => format!("unreadable ({read:#})"),
         };
         if !std::fs::metadata(config).is_ok_and(|m| m.is_file()) {
-            eprintln!(
-                "apply: left DefaultShellArguments ({value}) under HKLM\\{key}: there is no {} to hold it, and sshd \
-                 passes it to ssh-broker ahead of -c; write the config (README, \"Shell configuration\") and run \
-                 apply again, which removes it",
-                config.display()
-            );
+            eprintln!("{}", system_config::arguments_left(config, key, &value));
             return;
         }
         match registry::remove_shell_arguments_under(key) {
-            Ok(()) => println!(
-                "apply: removed DefaultShellArguments ({value}) from HKLM\\{key}, since sshd would pass it to \
-                 ssh-broker ahead of -c; put it in {} if the shell needs it",
-                config.display()
-            ),
+            Ok(()) => println!("{}", system_config::arguments_removed(config, key, &value)),
             Err(e) => eprintln!(
-                "apply: could not remove DefaultShellArguments ({value}) under HKLM\\{key}, and sshd passes it to \
-                 ssh-broker ahead of -c; the next apply tries again: {e:#}"
+                "{}",
+                system_config::arguments_not_removed(key, &value, &format!("{e:#}"))
             ),
         }
     }

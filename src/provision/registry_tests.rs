@@ -391,6 +391,31 @@ fn removing_the_shell_arguments_removes_that_value_and_nothing_else() {
     super::remove_shell_arguments_hkcu(missing_key.path()).unwrap();
 }
 
+/// `apply` reads `DefaultShellArguments` on its own after the flip, so a value it cannot use in the
+/// shell it replaced (or that is absent) does not hide it. Under a key of the test's own (HKCU, deleted
+/// afterwards); CI only, as it writes the registry.
+#[cfg(windows)]
+#[test]
+fn the_shell_arguments_are_read_without_the_other_values() {
+    use windows::Win32::System::Registry::REG_SZ;
+    let sz = |text: &str| -> Vec<u8> {
+        text.encode_utf16()
+            .chain(std::iter::once(0))
+            .flat_map(u16::to_le_bytes)
+            .collect()
+    };
+    let key = TestKey::new("read-args");
+    let sub = key.path();
+    assert_eq!(super::read_shell_arguments_hkcu(sub).unwrap(), None);
+    // With no DefaultShell the four-value read ignores the arguments; the single read does not.
+    super::set_value_hkcu(sub, "DefaultShellArguments", REG_SZ.0, &sz("-NoLogo"));
+    assert_eq!(super::read_sshd_shell_hkcu(sub).unwrap().arguments, None);
+    assert_eq!(
+        super::read_shell_arguments_hkcu(sub).unwrap().as_deref(),
+        Some("-NoLogo")
+    );
+}
+
 /// The three string values at sshd's boundary: 16383 characters plus the terminator is 32768 bytes
 /// and is read; one more character is not, and reads as absent. A `DefaultShell` that does not fit
 /// makes sshd run the system `cmd.exe` and ignore the other three values. Under a key of the
@@ -540,8 +565,7 @@ fn every_failing_value_is_named_and_the_shell_itself_may_be_the_one() {
     }
 }
 
-/// `apply` also prints this text after the flip (`remove_shell_arguments`), when `DefaultShell` is ssh-broker,
-/// so it claims nothing about what was or was not changed.
+/// `apply` adds what was or was not changed itself (`replace_shell`), so this text claims nothing about it.
 #[test]
 fn the_text_makes_no_claim_about_the_default_shell_being_changed() {
     let mut reading = read_ok();

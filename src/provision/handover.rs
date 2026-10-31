@@ -67,7 +67,7 @@ pub fn replace_shell<T>(
         )
     })?;
     let handover = carry(&previous);
-    flip(&handover)
+    flip(&handover).map_err(|e| e.context("DefaultShell was not changed"))
 }
 
 /// Act on `decision` for `previous`: write the config with `create` (which says whether it created the

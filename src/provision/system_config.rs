@@ -176,13 +176,13 @@ fn previous_values(previous: &SshdShell) -> String {
     )
 }
 
-/// The warning for a previous shell that is not carried: `apply` still replaces `DefaultShell`, so
-/// this holds every value of the shell it replaces, which nothing else keeps. `reason` says why it is
-/// not carried.
+/// The warning for a previous shell that is not carried. `apply` prints it before it replaces
+/// `DefaultShell`, which can still fail, so it says what `apply` does next and holds every value of
+/// the shell, which nothing else keeps. `reason` says why it is not carried.
 fn not_carried(config: &Path, previous: &SshdShell, reason: &str) -> String {
     format!(
-        "apply: {reason}, so this apply does not carry the shell sshd used before into {config}; DefaultShell is \
-         replaced all the same. To restore it, put it in that config or under {values}",
+        "apply: {reason}, so this apply does not carry the shell sshd used before into {config}; apply replaces \
+         DefaultShell next. To restore the shell, put it in that config or under {values}",
         config = config.display(),
         values = previous_values(previous),
     )
@@ -210,6 +210,34 @@ pub fn skip_notice(config: &Path, previous: &SshdShell, skip: &Skip) -> Option<S
         Skip::Unchecked(cause) => cause.clone(),
     };
     Some(not_carried(config, previous, &reason))
+}
+
+/// The notice for a `DefaultShellArguments` `apply` leaves: `DefaultShell` is ssh-broker by now, `config`
+/// is not a file to hold the value, and `value` is how it was read.
+pub fn arguments_left(config: &Path, key: &str, value: &str) -> String {
+    format!(
+        "apply: left DefaultShellArguments ({value}) under HKLM\\{key}: there is no {} to hold it, and sshd passes \
+         it to ssh-broker ahead of -c; write the config (README, \"Shell configuration\") and run apply again, \
+         which removes it",
+        config.display()
+    )
+}
+
+/// The notice for a `DefaultShellArguments` `apply` removed.
+pub fn arguments_removed(config: &Path, key: &str, value: &str) -> String {
+    format!(
+        "apply: removed DefaultShellArguments ({value}) from HKLM\\{key}, since sshd would pass it to ssh-broker \
+         ahead of -c; put it in {} if the shell needs it",
+        config.display()
+    )
+}
+
+/// The notice for a `DefaultShellArguments` `apply` could not remove, with the `cause`.
+pub fn arguments_not_removed(key: &str, value: &str, cause: &str) -> String {
+    format!(
+        "apply: could not remove DefaultShellArguments ({value}) under HKLM\\{key}, and sshd passes it to \
+         ssh-broker ahead of -c; the next apply tries again: {cause}"
+    )
 }
 
 /// The directories sshd's `CreateProcess` searches for a bare `DefaultShell` before `PATH`, in its

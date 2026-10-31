@@ -142,8 +142,8 @@ impl SshdShellReading {
 }
 
 /// The shell sshd uses now could not be read in full. Replacing it would lose what could not be read,
-/// so `apply` stops before it does. `apply` prints this text before and after the flip, so it says nothing
-/// about what was changed.
+/// so `apply` stops before it does. `apply` prints this text before it writes anything and adds that
+/// `DefaultShell` was not changed; the text itself says nothing about what was changed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnreadShell {
     location: String,
@@ -358,6 +358,12 @@ mod win {
         read_sshd_shell_in(HKEY_LOCAL_MACHINE, subkey).into_shell(&format!("HKLM\\{subkey}"))
     }
 
+    /// Production: `DefaultShellArguments` from `HKLM\<subkey>` on its own, as sshd reads it. Another
+    /// value that cannot be read does not make this one unreadable.
+    pub fn read_shell_arguments_under(subkey: &str) -> anyhow::Result<Option<String>> {
+        read_optional_string(HKEY_LOCAL_MACHINE, subkey, "DefaultShellArguments")
+    }
+
     /// The service key of sshd.
     const SSHD_SERVICE_KEY: &str = r"SYSTEM\CurrentControlSet\Services\sshd";
 
@@ -502,6 +508,14 @@ mod win {
         remove_shell_arguments_in(windows::Win32::System::Registry::HKEY_CURRENT_USER, subkey)
     }
     #[cfg(test)]
+    pub fn read_shell_arguments_hkcu(subkey: &str) -> anyhow::Result<Option<String>> {
+        read_optional_string(
+            windows::Win32::System::Registry::HKEY_CURRENT_USER,
+            subkey,
+            "DefaultShellArguments",
+        )
+    }
+    #[cfg(test)]
     pub fn read_string_hkcu(subkey: &str, name: &str) -> anyhow::Result<String> {
         read_value(windows::Win32::System::Registry::HKEY_CURRENT_USER, subkey, name)
     }
@@ -564,13 +578,13 @@ mod win {
 #[cfg(all(windows, test))]
 pub use win::{
     delete_hkcu, escape_arguments_from_status, escape_arguments_hkcu, read_dword_hkcu, read_hkcu, read_image_path_hkcu,
-    read_sshd_shell_hkcu, read_string_hkcu, remove_shell_arguments_hkcu, set_hkcu, set_hkcu_confirming, set_value_hkcu,
-    sshd_string_from_status,
+    read_shell_arguments_hkcu, read_sshd_shell_hkcu, read_string_hkcu, remove_shell_arguments_hkcu, set_hkcu,
+    set_hkcu_confirming, set_value_hkcu, sshd_string_from_status,
 };
 #[cfg(windows)]
 pub use win::{
-    escape_arguments_under, read_default_shell_under, read_sshd_image_path, read_sshd_shell_under,
-    remove_shell_arguments_under, set_default_shell_under,
+    escape_arguments_under, read_default_shell_under, read_shell_arguments_under, read_sshd_image_path,
+    read_sshd_shell_under, remove_shell_arguments_under, set_default_shell_under,
 };
 
 #[cfg(test)]

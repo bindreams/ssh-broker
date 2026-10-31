@@ -4,8 +4,8 @@
 use std::path::{Path, PathBuf};
 
 use super::{
-    Decision, Skip, SshdClass, carried_block, classify, create_once_at, decide, image_dir, not_written, remove_temp,
-    render, skip_notice, sshd_search_dirs,
+    Decision, Skip, SshdClass, arguments_left, arguments_not_removed, arguments_removed, carried_block, classify,
+    create_once_at, decide, image_dir, not_written, remove_temp, render, skip_notice, sshd_search_dirs,
 };
 use crate::provision::registry::SshdShell;
 use crate::shell::Escaping;
@@ -384,7 +384,7 @@ fn every_skip_that_replaces_a_shell_without_carrying_it_holds_every_previous_val
             "escape arguments = no",
             "DefaultShellCommandOption",
             "DefaultShellArguments",
-            "DefaultShell is replaced all the same",
+            "apply replaces DefaultShell next",
         ] {
             assert!(text.contains(part), "{skip:?}: {part}: {text}");
         }
@@ -392,6 +392,10 @@ fn every_skip_that_replaces_a_shell_without_carrying_it_holds_every_previous_val
         // what this `apply` does, not that the shell is nowhere.
         assert!(!text.contains("is not carried"), "{skip:?}: {text}");
         assert!(!text.contains("escape arguments = yes"), "{skip:?}: {text}");
+        // It is printed before the flip, which can still fail.
+        for past in ["replaced", "changed", "restored", "is now", "has been"] {
+            assert!(!text.contains(past), "{skip:?}: {past}: {text}");
+        }
     }
     assert_eq!(skip_notice(config, &prev, &Skip::PreviousIsSshBroker), None);
     assert_eq!(skip_notice(config, &prev, &Skip::NoPreviousShell), None);
@@ -649,4 +653,55 @@ fn a_command_option_with_several_words_is_split_like_the_arguments() {
     );
     // The default option is still not written.
     assert_eq!(with(TOOLS_PWSH, false, "-c"), None);
+}
+
+// the texts printed after the flip =====
+
+/// `apply` prints these once `DefaultShell` is ssh-broker, so none says the shell is unchanged or is
+/// still to be replaced.
+fn after_the_flip(text: &str) {
+    for before in [
+        "unchanged",
+        "not changed",
+        "not replaced",
+        "replaces DefaultShell",
+        "about to",
+    ] {
+        assert!(!text.contains(before), "{before}: {text}");
+    }
+}
+
+const CONFIG: &str = r"C:\ProgramData\ssh-broker\config.yaml";
+const KEY: &str = r"SOFTWARE\OpenSSH";
+
+#[test]
+fn the_arguments_left_text_names_the_value_the_key_and_what_to_do_and_does_not_say_the_shell_is_unchanged() {
+    let text = arguments_left(Path::new(CONFIG), KEY, "\"-NoLogo\"");
+    for part in ["-NoLogo", KEY, CONFIG, "DefaultShellArguments", "apply again"] {
+        assert!(text.contains(part), "{part}: {text}");
+    }
+    after_the_flip(&text);
+}
+
+#[test]
+fn the_arguments_removed_text_names_the_value_and_the_config_and_does_not_say_the_shell_is_unchanged() {
+    let text = arguments_removed(Path::new(CONFIG), KEY, "\"-NoLogo\"");
+    for part in ["removed DefaultShellArguments", "-NoLogo", KEY, CONFIG] {
+        assert!(text.contains(part), "{part}: {text}");
+    }
+    after_the_flip(&text);
+}
+
+#[test]
+fn the_arguments_not_removed_text_names_the_value_and_the_cause_and_does_not_say_the_shell_is_unchanged() {
+    let text = arguments_not_removed(KEY, "\"-NoLogo\"", "access denied");
+    for part in [
+        "could not remove DefaultShellArguments",
+        "-NoLogo",
+        KEY,
+        "access denied",
+    ] {
+        assert!(text.contains(part), "{part}: {text}");
+    }
+    after_the_flip(&text);
 }

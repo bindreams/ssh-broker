@@ -46,9 +46,18 @@ fn holds_every_previous_value(text: &str) {
         "-NoLogo -c",
         "-NoProfile",
         "escape arguments = no",
-        "DefaultShell is replaced all the same",
+        "apply replaces DefaultShell next",
     ] {
         assert!(text.contains(part), "{part}: {text}");
+    }
+    before_the_flip(text);
+}
+
+/// What `hand_over` prints comes before the flip, which can still fail: it may say what `apply` does
+/// next, never that `DefaultShell` was replaced or changed.
+fn before_the_flip(text: &str) {
+    for past in ["replaced", "changed", "restored", "is now", "has been"] {
+        assert!(!text.contains(past), "{past}: {text}");
     }
 }
 
@@ -71,6 +80,7 @@ fn a_written_config_says_so_on_stdout_and_prints_no_warning() {
             format!("apply: wrote {CONFIG} from the shell sshd used before ({PWSH7})")
         )]
     );
+    before_the_flip(&lines[0].1);
 }
 
 #[test]
@@ -152,6 +162,8 @@ fn an_unreadable_previous_shell_stops_before_the_flip() {
     ] {
         assert!(text.contains(part), "{part}: {text}");
     }
+    // Nothing was written, so the text may say so; it must not say the shell was replaced.
+    assert!(!text.contains("replaced"), "{text}");
 }
 
 #[test]
@@ -173,13 +185,18 @@ fn a_readable_previous_shell_is_carried_and_then_flipped() {
     assert_eq!((flipped, order.into_inner()), (7, vec!["carry", "flip"]));
 }
 
+/// The error is printed after the failed write, when `DefaultShell` is as the registry held it: the
+/// error says so, with the cause, and does not say it was replaced.
 #[test]
-fn a_failed_flip_is_the_error() {
+fn a_failed_flip_is_the_error_and_says_the_default_shell_was_not_changed() {
     let error = replace_shell(
         || reading().into_shell("location"),
         |_| Handover::nothing_to_carry(),
         |_| -> anyhow::Result<()> { anyhow::bail!("write failed") },
     )
     .unwrap_err();
-    assert_eq!(error.to_string(), "write failed");
+    assert!(error.to_string().starts_with("DefaultShell was not changed"), "{error}");
+    let text = format!("{error:#}");
+    assert!(text.contains("write failed"), "{text}");
+    assert!(!text.contains("replaced"), "{text}");
 }
