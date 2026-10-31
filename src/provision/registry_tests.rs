@@ -450,6 +450,7 @@ fn string_values_at_sshds_buffer_boundary_are_read_and_one_character_more_is_abs
 
 /// sshd's service `ImagePath` is a `REG_EXPAND_SZ` that names the variables it uses: the directory
 /// sshd runs from is the expanded value's.
+#[cfg(windows)]
 #[test]
 fn the_image_path_is_read_with_its_variables_expanded_and_is_none_when_absent() {
     use windows::Win32::System::Registry::REG_EXPAND_SZ;
