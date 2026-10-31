@@ -85,3 +85,55 @@ fn a_file_that_cannot_start_is_an_error_and_not_a_message_box() {
     let _ = std::fs::remove_dir_all(&dir);
     assert!(result.is_err(), "a file that is not a program started");
 }
+
+// MEASUREMENT (ssh-broker#55 round 8, F3): what a program the loader cannot load does after a
+// successful start. Printed always (nextest `success-output`); replaced by the real tests.
+
+fn measure_loader_failure(label: &str) {
+    let exe = crate::command_line_probe::example("missing_dll");
+    let started = ExecChild::spawn(&format!("\"{}\"", exe.display()), None);
+    let child = match started {
+        Ok(child) => child,
+        Err(e) => {
+            eprintln!("MEASURE {label}: start failed: {e}");
+            return;
+        }
+    };
+    eprintln!("MEASURE {label}: start Ok");
+    let job = child.job();
+    let out_t = drain(child.stdout_read_raw());
+    let err_t = drain(child.stderr_read_raw());
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let code = child.wait();
+        let _ = tx.send(code);
+    });
+    // A failure bound on an external event (a child that may sit in a message box).
+    let waited = rx.recv_timeout(std::time::Duration::from_secs(30)); // sleep-ok: failure bound, a hang is reported
+    match waited {
+        Ok(code) => eprintln!(
+            "MEASURE {label}: ended, exit code {:?}",
+            code.map(|c| format!("{:#010x}", c as u32))
+        ),
+        Err(_) => {
+            eprintln!("MEASURE {label}: still running after 30 s (a message box?)");
+            let _ = job.kill_tree();
+        }
+    }
+    let out = out_t.join().unwrap();
+    let err = err_t.join().unwrap();
+    eprintln!("MEASURE {label}: stdout {out:?} stderr {err:?}");
+}
+
+#[test]
+fn measure_loader_failure_default_error_mode() {
+    measure_loader_failure("pipes, default process error mode");
+}
+
+#[test]
+fn measure_loader_failure_process_fails_critical_errors() {
+    use windows::Win32::System::Diagnostics::Debug::{SEM_FAILCRITICALERRORS, SetErrorMode};
+    let previous = unsafe { SetErrorMode(SEM_FAILCRITICALERRORS) };
+    eprintln!("MEASURE the test process's own error mode was {previous:?}");
+    measure_loader_failure("pipes, process error mode FAILCRITICALERRORS");
+}

@@ -57,3 +57,28 @@ fn a_file_that_cannot_start_is_an_error_and_not_a_message_box() {
     let _ = std::fs::remove_dir_all(&dir);
     assert!(result.is_err(), "a file that is not a program started");
 }
+
+// MEASUREMENT (ssh-broker#55 round 8, F3): as in pipes_tests, for a pseudoconsole.
+#[test]
+fn measure_loader_failure_in_a_pseudoconsole() {
+    use windows::Win32::System::Diagnostics::Debug::{SEM_FAILCRITICALERRORS, SetErrorMode};
+    unsafe { SetErrorMode(SEM_FAILCRITICALERRORS) };
+    let exe = crate::command_line_probe::example("missing_dll");
+    let mut session = match PtySession::spawn(&format!("\"{}\"", exe.display()), 80, 24, None) {
+        Ok(session) => session,
+        Err(e) => {
+            eprintln!("MEASURE pty: start failed: {e}");
+            return;
+        }
+    };
+    eprintln!("MEASURE pty: start Ok");
+    let reader = drain(session.out_read_raw());
+    let code = session.wait();
+    eprintln!(
+        "MEASURE pty: ended, exit code {:?}",
+        code.map(|c| format!("{:#010x}", c as u32))
+    );
+    session.close_pty();
+    let out = reader.join().unwrap();
+    eprintln!("MEASURE pty: output {:?}", String::from_utf8_lossy(&out));
+}
