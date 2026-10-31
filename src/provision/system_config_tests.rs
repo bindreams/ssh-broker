@@ -4,14 +4,16 @@
 use std::path::{Path, PathBuf};
 
 use super::{
-    ArgumentsPlan, ConfigKind, Decision, Skip, SshdClass, arguments_left, arguments_not_removed, arguments_removed,
-    carried_block, classify, config_is_file, create_once_at, decide, image_dir, not_written, nothing_to_carry,
-    plan_arguments, remove_temp, render, skip_notice, sshd_search_dirs,
+    ArgumentsPlan, ConfigKind, CreateOutcome, Decision, Skip, SshdClass, arguments_left, arguments_not_removed,
+    arguments_removed, arguments_removing, arguments_unreadable, carried_block, classify, config_is_file,
+    create_once_at, decide, image_dir, not_written, nothing_to_carry, plan_arguments, remove_temp, render, skip_notice,
+    sshd_search_dirs,
 };
 use crate::provision::registry::SshdShell;
 use crate::shell::Escaping;
 use crate::shell::config::{ShellBlock, parse};
 use crate::shell::test_host::TestHost;
+use crate::test_support::states_facts_only;
 
 const PWSH7: &str = r"C:\Program Files\PowerShell\7\pwsh.exe";
 const TOOLS_PWSH: &str = r"C:\tools\pwsh.exe";
@@ -167,6 +169,7 @@ fn the_message_for_a_config_that_could_not_be_written_holds_every_carried_value(
         assert!(text.contains(part), "{part}: {text}");
     }
     assert!(!text.contains("escape arguments = yes"), "{text}");
+    states_facts_only(&text);
 
     // Values sshd does not have are said so, not left out.
     let text = not_written(Path::new("c.yaml"), &sshd(PWSH7), "x");
@@ -402,8 +405,8 @@ fn every_skip_that_replaces_a_shell_without_carrying_it_holds_every_previous_val
     };
     let config = Path::new(r"C:\ProgramData\ssh-broker\config.yaml");
     for (skip, cause) in [
-        (Skip::FileExists, "is already there"),
-        (Skip::NotAFile, "is not a file"),
+        (Skip::FileExists, "config.yaml exists"),
+        (Skip::NotAFile, "config.yaml is not a file"),
         (
             Skip::PreviousMissing("there is no such file".into()),
             "there is no such file",
@@ -431,6 +434,7 @@ fn every_skip_that_replaces_a_shell_without_carrying_it_holds_every_previous_val
         // what this `apply` does, not that the shell is nowhere.
         assert!(!text.contains("is not carried"), "{skip:?}: {text}");
         assert!(!text.contains("escape arguments = yes"), "{skip:?}: {text}");
+        states_facts_only(&text);
         // It is printed before the flip, which can still fail.
         for past in ["replaced", "changed", "restored", "is now", "has been"] {
             assert!(!text.contains(past), "{skip:?}: {past}: {text}");
@@ -438,23 +442,18 @@ fn every_skip_that_replaces_a_shell_without_carrying_it_holds_every_previous_val
     }
 }
 
-/// A config path that holds a directory is said to hold no file, and the advice is to replace what is there:
-/// "is never rewritten" and "put it in that config" cannot be done for it.
+/// A config path that holds a directory is said to hold no file: "exists" and "never rewritten" say
+/// something else.
 #[test]
-fn the_notice_for_a_config_path_that_is_not_a_file_says_so_and_how_to_restore() {
+fn the_notice_for_a_config_path_that_is_not_a_file_says_so() {
     let text = skip_notice(Path::new(CONFIG), &sshd(PWSH7), &Skip::NotAFile);
-    for part in [
-        &format!("{CONFIG} is not a file"),
-        "replace what is at that path with a config that holds it",
-    ] {
-        assert!(text.contains(part), "{part}: {text}");
-    }
-    for part in ["never rewritten", "already there", "put it in that config"] {
+    assert!(text.contains(&format!("{CONFIG} is not a file")), "{text}");
+    for part in ["never rewritten", "already there", "exists"] {
         assert!(!text.contains(part), "{part}: {text}");
     }
-    // The notice for a file that is there keeps its advice.
     let text = skip_notice(Path::new(CONFIG), &sshd(PWSH7), &Skip::FileExists);
-    assert!(text.contains("put it in that config"), "{text}");
+    assert!(text.contains(&format!("{CONFIG} exists")), "{text}");
+    assert!(!text.contains("is not a file"), "{text}");
 }
 
 /// A shell that is set and not ssh-broker's has something to carry: a skip that claims otherwise is wrong,
@@ -464,6 +463,7 @@ fn a_nothing_to_carry_skip_for_a_shell_that_has_something_to_carry_prints_the_va
     let prev = sshd(PWSH7);
     let text = skip_notice(Path::new(CONFIG), &prev, &Skip::NothingToCarry);
     assert!(text.contains(PWSH7) && text.contains("DefaultShellArguments"), "{text}");
+    states_facts_only(&text);
 }
 
 #[test]
@@ -634,14 +634,14 @@ fn create_once_never_replaces_an_existing_file_and_leaves_no_partial_file() {
         ..ShellBlock::default()
     };
 
-    assert_eq!(create_once_at(&target, &first).unwrap(), None);
+    assert_eq!(create_once_at(&target, &first).unwrap(), CreateOutcome::Created);
     let written = std::fs::read(&target).unwrap();
     assert_eq!(parse(&written).unwrap(), Some(first));
     assert_eq!(names(&dir.0), ["config.yaml"], "no temp file is left");
 
     assert_eq!(
         create_once_at(&target, &second).unwrap(),
-        Some(Skip::FileExists),
+        CreateOutcome::FileExists,
         "a file was there"
     );
     assert_eq!(std::fs::read(&target).unwrap(), written, "the file is untouched");
@@ -682,7 +682,7 @@ fn create_once_leaves_a_file_with_other_content_alone() {
         start: vec!["b.exe".into()],
         ..ShellBlock::default()
     };
-    assert_eq!(create_once_at(&target, &block).unwrap(), Some(Skip::FileExists));
+    assert_eq!(create_once_at(&target, &block).unwrap(), CreateOutcome::FileExists);
     assert_eq!(std::fs::read_to_string(&target).unwrap(), "# mine\nshell: pwsh.exe\n");
 }
 
@@ -709,7 +709,7 @@ fn a_directory_in_the_way_is_not_replaced() {
         start: vec!["b.exe".into()],
         ..ShellBlock::default()
     };
-    assert_eq!(create_once_at(&target, &block).unwrap(), Some(Skip::NotAFile));
+    assert_eq!(create_once_at(&target, &block).unwrap(), CreateOutcome::NotAFile);
     assert!(target.is_dir());
     assert_eq!(names(&dir.0), ["config.yaml"]);
 }
@@ -757,41 +757,56 @@ const CONFIG: &str = r"C:\ProgramData\ssh-broker\config.yaml";
 const KEY: &str = r"SOFTWARE\OpenSSH";
 
 #[test]
-fn the_arguments_left_text_names_the_value_the_key_and_what_to_do_and_does_not_say_the_shell_is_unchanged() {
-    let text = arguments_left(KEY, "\"-NoLogo\"", "there is no config to hold it", "write the config");
-    for part in [
-        "-NoLogo",
-        KEY,
-        "there is no config to hold it",
-        "write the config",
-        "DefaultShellArguments",
-        "apply again",
-    ] {
-        assert!(text.contains(part), "{part}: {text}");
-    }
+fn the_arguments_left_text_names_the_value_the_key_and_why() {
+    let text = arguments_left(KEY, "\"-NoLogo\"", "there is no config");
+    assert_eq!(
+        text,
+        r#"apply: left DefaultShellArguments ("-NoLogo") under HKLM\SOFTWARE\OpenSSH: there is no config"#
+    );
+    states_facts_only(&text);
     after_the_flip(&text);
 }
 
 #[test]
-fn the_arguments_removed_text_names_the_value_and_the_config_and_does_not_say_the_shell_is_unchanged() {
-    let text = arguments_removed(Path::new(CONFIG), KEY, "\"-NoLogo\"");
-    for part in ["removed DefaultShellArguments", "-NoLogo", KEY, CONFIG] {
-        assert!(text.contains(part), "{part}: {text}");
-    }
+fn the_arguments_unreadable_text_names_the_key_and_the_cause() {
+    let text = arguments_unreadable(KEY, "i/o error");
+    assert_eq!(
+        text,
+        r"apply: left DefaultShellArguments under HKLM\SOFTWARE\OpenSSH: it could not be read (i/o error)"
+    );
+    states_facts_only(&text);
     after_the_flip(&text);
 }
 
 #[test]
-fn the_arguments_not_removed_text_names_the_value_and_the_cause_and_does_not_say_the_shell_is_unchanged() {
+fn the_arguments_removing_text_names_the_value_and_the_key() {
+    let text = arguments_removing(KEY, "\"-NoLogo\"");
+    assert_eq!(
+        text,
+        r#"apply: removing DefaultShellArguments ("-NoLogo") from HKLM\SOFTWARE\OpenSSH"#
+    );
+    states_facts_only(&text);
+}
+
+#[test]
+fn the_arguments_removed_text_names_the_value_and_the_key() {
+    let text = arguments_removed(KEY, "\"-NoLogo\"");
+    assert_eq!(
+        text,
+        r#"apply: removed DefaultShellArguments ("-NoLogo") from HKLM\SOFTWARE\OpenSSH"#
+    );
+    states_facts_only(&text);
+    after_the_flip(&text);
+}
+
+#[test]
+fn the_arguments_not_removed_text_names_the_value_the_key_and_the_cause() {
     let text = arguments_not_removed(KEY, "\"-NoLogo\"", "access denied");
-    for part in [
-        "could not remove DefaultShellArguments",
-        "-NoLogo",
-        KEY,
-        "access denied",
-    ] {
-        assert!(text.contains(part), "{part}: {text}");
-    }
+    assert_eq!(
+        text,
+        r#"apply: could not remove DefaultShellArguments ("-NoLogo") from HKLM\SOFTWARE\OpenSSH: access denied"#
+    );
+    states_facts_only(&text);
     after_the_flip(&text);
 }
 
@@ -838,10 +853,9 @@ fn arguments_that_could_not_be_read_are_never_removed_and_the_cause_is_said() {
         for part in ["left DefaultShellArguments", "could not be read", "i/o error", KEY] {
             assert!(text.contains(part), "{config:?}: {part}: {text}");
         }
-        // It cannot say what sshd does with a value nobody could read, and it names the condition under
-        // which a later `apply` removes it.
+        // It cannot say what sshd does with a value nobody could read.
         assert!(!text.contains("passes"), "{config:?}: {text}");
-        assert!(text.contains("once the system config is a file"), "{config:?}: {text}");
+        states_facts_only(&text);
         after_the_flip(&text);
     }
 }
@@ -851,29 +865,24 @@ fn arguments_with_no_config_are_left_and_the_text_says_there_is_none() {
     let ArgumentsPlan::Leave(text) = plan(Ok(Some("-NoLogo")), Ok(ConfigKind::Missing)) else {
         panic!("removed a value with no config to hold it");
     };
-    for part in ["-NoLogo", CONFIG, NO_LONGER_THERE, "write the config", "apply again"] {
+    for part in ["-NoLogo", CONFIG, NO_LONGER_THERE] {
         assert!(text.contains(part), "{part}: {text}");
     }
     assert!(!text.contains("is not a file"), "{text}");
+    states_facts_only(&text);
 }
 
-/// Something else is at the path (a directory): the text does not say there is nothing there, and the
-/// advice is to replace what is there, which writing the config alone cannot do.
+/// Something else is at the path (a directory): the text does not say there is nothing there.
 #[test]
 fn arguments_with_something_that_is_not_a_file_at_the_config_path_are_left_and_the_text_says_so() {
     let ArgumentsPlan::Leave(text) = plan(Ok(Some("-NoLogo")), Ok(ConfigKind::Other)) else {
         panic!("removed a value although the config path holds no file");
     };
-    for part in [
-        "-NoLogo",
-        &format!("{CONFIG} is not a file"),
-        "replace what is at that path with the config",
-        "apply again",
-    ] {
+    for part in ["-NoLogo", &format!("{CONFIG} is not a file")] {
         assert!(text.contains(part), "{part}: {text}");
     }
     assert!(!text.contains(NO_LONGER_THERE), "{text}");
-    assert!(!text.contains("write the config"), "{text}");
+    states_facts_only(&text);
 }
 
 /// A check that failed does not know the config is absent: the value is left and the text says it cannot
@@ -886,18 +895,11 @@ fn arguments_with_a_config_that_could_not_be_checked_are_left_and_the_text_says_
     ) else {
         panic!("removed a value although the config could not be checked");
     };
-    for part in [
-        "-NoLogo",
-        "cannot tell whether the config exists: i/o error",
-        "apply again",
-    ] {
+    for part in ["-NoLogo", "cannot tell whether the config exists: i/o error"] {
         assert!(text.contains(part), "{part}: {text}");
     }
     assert!(!text.contains(NO_LONGER_THERE), "{text}");
-    // Writing the config does not help when the file may be there and cannot be checked: the advice is to
-    // fix what stops the check.
-    assert!(text.contains("fix what stops that check and run apply again"), "{text}");
-    assert!(!text.contains("write the config"), "{text}");
+    states_facts_only(&text);
 }
 
 // config_is_file -----
@@ -928,4 +930,73 @@ fn a_config_that_cannot_be_checked_says_it_cannot_tell() {
     let cause = config_is_file(Path::new("config\0.yaml")).unwrap_err();
     assert!(cause.starts_with("cannot tell whether config"), "{cause}");
     assert!(cause.contains(" is a file: "), "{cause}");
+}
+
+// a link at the config path -----
+
+/// A config path that is a symlink to a file that is not there. Needs symlink creation rights (an
+/// elevated administrator or Developer Mode).
+fn dangling_config(tag: &str) -> (TempDir, PathBuf) {
+    let dir = TempDir::new(tag);
+    let config = dir.0.join("config.yaml");
+    std::os::windows::fs::symlink_file(dir.0.join("gone.yaml"), &config)
+        .expect("create a file symlink: needs an elevated administrator or Developer Mode");
+    (dir, config)
+}
+
+/// The name exists and the target does not: the name is taken, so nothing can be written there, and no
+/// config is in it.
+#[test]
+fn a_dangling_link_at_the_config_path_is_not_a_config() {
+    let (_dir, config) = dangling_config("link-dangling");
+    assert_eq!(config_is_file(&config), Ok(ConfigKind::Other));
+}
+
+#[test]
+fn a_link_to_a_file_at_the_config_path_is_a_config() {
+    let dir = TempDir::new("link-file");
+    let (target, config) = (dir.0.join("real.yaml"), dir.0.join("config.yaml"));
+    std::fs::write(&target, "").unwrap();
+    std::os::windows::fs::symlink_file(&target, &config)
+        .expect("create a file symlink: needs an elevated administrator or Developer Mode");
+    assert_eq!(config_is_file(&config), Ok(ConfigKind::File));
+}
+
+#[test]
+fn create_once_over_a_dangling_link_says_the_path_is_not_a_file_and_writes_nothing() {
+    let (dir, config) = dangling_config("link-create");
+    let block = ShellBlock {
+        start: vec!["b.exe".into()],
+        ..ShellBlock::default()
+    };
+    assert_eq!(create_once_at(&config, &block).unwrap(), CreateOutcome::NotAFile);
+    assert_eq!(names(&dir.0), ["config.yaml"], "no temp file is left");
+    assert!(!dir.0.join("gone.yaml").exists());
+}
+
+/// One run asks the question once per use, and every answer is the same: for a dangling link the decision
+/// and the arguments plan both say the path is not a file, and neither says a config exists or is absent.
+#[test]
+fn one_run_over_a_dangling_link_says_the_path_is_not_a_file_everywhere() {
+    let (_dir, config) = dangling_config("link-run");
+    let kind = || config_is_file(&config);
+    let skip = match decide(
+        &sshd(PWSH7),
+        kind(),
+        &|| Ok(vec![]),
+        &|_, p| Ok(p.to_path_buf()),
+        &|_| false,
+    ) {
+        Decision::Skip(skip) => skip,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(skip, Skip::NotAFile);
+    let notice = skip_notice(&config, &sshd(PWSH7), &skip);
+    let ArgumentsPlan::Leave(left) = plan_arguments(&config, KEY, Ok(Some("-NoLogo".into())), kind) else {
+        panic!("removed a value although the config path holds no file");
+    };
+    for text in [&notice, &left] {
+        assert!(text.contains(&format!("{} is not a file", config.display())), "{text}");
+        assert!(!text.contains("exists") && !text.contains("there is no"), "{text}");
+    }
 }

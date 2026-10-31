@@ -358,3 +358,26 @@ pub fn logged<T>(f: impl FnOnce() -> T) -> (String, T) {
     let log = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
     (log, result)
 }
+
+// Printed texts -----
+
+/// A line the shell step prints states what happened and holds no advice: the how-to is in the README
+/// ("Shell configuration"), once.
+pub fn states_facts_only(text: &str) {
+    for advice in [
+        "run apply",
+        "run `apply`",
+        "apply again",
+        "next apply",
+        "put it",
+        "replace what",
+        "write the config",
+        "fix ",
+        "to restore",
+        "so it ",
+        "so this ",
+        "since ",
+    ] {
+        assert!(!text.contains(advice), "{advice}: {text}");
+    }
+}

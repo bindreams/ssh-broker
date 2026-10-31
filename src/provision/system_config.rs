@@ -99,7 +99,8 @@ pub enum Skip {
     NothingToCarry,
     /// A config is already there, and is never rewritten.
     FileExists,
-    /// A directory or other non-file is at the config's path: it holds no config, and writing one needs it gone.
+    /// A directory, or any other name that is not a regular file (a link whose target is not one, say), is at
+    /// the config's path: it holds no config, and writing one needs it gone.
     NotAFile,
     /// The previous shell is not a file that exists, found as sshd finds it (the string is why not);
     /// a config naming it would not start.
@@ -167,9 +168,8 @@ fn previous_values(previous: &SshdShell) -> String {
     let value = |value: &Option<String>| value.as_ref().map_or("not set".to_owned(), |v| format!("\"{v}\""));
     let escape = if previous.escape_arguments { "yes" } else { "no" };
     format!(
-        "HKLM\\{key}: DefaultShell = {shell}, DefaultShellCommandOption = {option}, DefaultShellArguments = \
-         {arguments}, escape arguments = {escape}",
-        key = super::registry::OPENSSH_KEY,
+        "DefaultShell = {shell}, DefaultShellCommandOption = {option}, DefaultShellArguments = {arguments}, \
+         escape arguments = {escape}",
         shell = value(&previous.shell),
         option = value(&previous.command_option),
         arguments = value(&previous.arguments),
@@ -178,18 +178,16 @@ fn previous_values(previous: &SshdShell) -> String {
 
 /// The warning for a previous shell that is not carried. `apply` prints it before it replaces
 /// `DefaultShell`, which can still fail, so it says what `apply` does next and holds every value of
-/// the shell, which nothing else keeps. `reason` says why it is not carried, `in_config` how to put the shell
-/// in the config instead.
-fn not_carried(config: &Path, previous: &SshdShell, reason: &str, in_config: &str) -> String {
+/// the shell, which nothing else keeps. `reason` says why it is not carried.
+fn not_carried(config: &Path, previous: &SshdShell, reason: &str) -> String {
     format!(
-        "apply: {reason}, so this apply does not carry the shell sshd used before into {config}; apply replaces \
-         DefaultShell next. To restore the shell, {in_config} or under {values}",
+        "apply: {reason}. This apply does not carry the shell sshd used before into {config}. apply replaces \
+         DefaultShell next. Previous values under HKLM\\{key}: {values}",
         config = config.display(),
+        key = super::registry::OPENSSH_KEY,
         values = previous_values(previous),
     )
 }
-
-const PUT_IN_CONFIG: &str = "put it in that config";
 
 /// The warning for a config that could not be written.
 pub fn not_written(config: &Path, previous: &SshdShell, cause: &str) -> String {
@@ -197,7 +195,6 @@ pub fn not_written(config: &Path, previous: &SshdShell, cause: &str) -> String {
         config,
         previous,
         &format!("could not write {}: {cause}", config.display()),
-        PUT_IN_CONFIG,
     )
 }
 
@@ -210,45 +207,52 @@ pub fn nothing_to_carry(previous: &SshdShell) -> bool {
 /// The warning for a [`Skip`] that leaves the previous shell uncarried while `apply` replaces it.
 /// [`Skip::NothingToCarry`] is no reason for a shell that has something to carry, and says so.
 pub fn skip_notice(config: &Path, previous: &SshdShell, skip: &Skip) -> String {
-    let mut in_config = PUT_IN_CONFIG;
     let reason = match skip {
         Skip::NothingToCarry => format!(
-            "the shell sshd uses now ({}) was taken for one with nothing to carry, which it is not",
+            "the shell sshd uses now ({}) was decided to have nothing to carry",
             previous.shell.as_deref().unwrap_or_default()
         ),
-        Skip::FileExists => format!("{} is already there and is never rewritten", config.display()),
-        Skip::NotAFile => {
-            in_config = "replace what is at that path with a config that holds it (README, \"Shell configuration\")";
-            format!("{} is not a file", config.display())
-        }
+        Skip::FileExists => format!("{} exists", config.display()),
+        Skip::NotAFile => format!("{} is not a file", config.display()),
         Skip::PreviousMissing(why) => format!(
             "the shell sshd uses now ({}) cannot be used: {why}",
             previous.shell.as_deref().unwrap_or_default()
         ),
         Skip::Unchecked(cause) => cause.clone(),
     };
-    not_carried(config, previous, &reason, in_config)
+    not_carried(config, previous, &reason)
 }
 
 /// What is at the system config's path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfigKind {
-    /// A regular file, which is what the loader can read.
+    /// A regular file, or a link to one, which is what the loader can read.
     File,
     /// Nothing.
     Missing,
-    /// A directory or anything else: it holds no config, and writing one there needs it gone.
+    /// The name is taken by a directory or anything else that is not a usable file, a link whose target is
+    /// not a regular file included: it holds no config, and writing one there needs it gone.
     Other,
 }
 
 /// What is at `config`, or why that is not known: a failed check is not an absent file, so the cause
-/// is kept and worded as one that cannot tell. The one answer to "is the system config there" in `apply`.
+/// is kept and worded as one that cannot tell. A name that exists is never `Missing`, whatever its
+/// target. The one answer to "is the system config there" in `apply`.
 pub fn config_is_file(config: &Path) -> Result<ConfigKind, String> {
+    let cannot_tell = |e: std::io::Error| format!("cannot tell whether {} is a file: {e}", config.display());
+    let not_found = |e: &std::io::Error| e.kind() == std::io::ErrorKind::NotFound;
+    let name = match std::fs::symlink_metadata(config) {
+        Ok(name) => name,
+        Err(e) if not_found(&e) => return Ok(ConfigKind::Missing),
+        Err(e) => return Err(cannot_tell(e)),
+    };
     match std::fs::metadata(config) {
-        Ok(metadata) if metadata.is_file() => Ok(ConfigKind::File),
+        Ok(target) if target.is_file() => Ok(ConfigKind::File),
         Ok(_) => Ok(ConfigKind::Other),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(ConfigKind::Missing),
-        Err(e) => Err(format!("cannot tell whether {} is a file: {e}", config.display())),
+        // The name was a link and its target is gone; a name that was no link and is gone was removed meanwhile.
+        Err(e) if not_found(&e) && name.file_type().is_symlink() => Ok(ConfigKind::Other),
+        Err(e) if not_found(&e) => Ok(ConfigKind::Missing),
+        Err(e) => Err(cannot_tell(e)),
     }
 }
 
@@ -279,72 +283,47 @@ pub fn plan_arguments(
         Err(cause) => return ArgumentsPlan::Leave(arguments_unreadable(key, &cause)),
     };
     let value = format!("{arguments:?}");
-    const WRITE: &str = "write the config (README, \"Shell configuration\")";
     match config_is_file() {
         Ok(ConfigKind::File) => ArgumentsPlan::Remove(value),
         Ok(ConfigKind::Missing) => ArgumentsPlan::Leave(arguments_left(
             key,
             &value,
-            &format!("there is no {} to hold it", config.display()),
-            WRITE,
+            &format!("there is no {}", config.display()),
         )),
         Ok(ConfigKind::Other) => ArgumentsPlan::Leave(arguments_left(
             key,
             &value,
-            &format!("{} is not a file, so it cannot hold it", config.display()),
-            "replace what is at that path with the config (README, \"Shell configuration\")",
+            &format!("{} is not a file", config.display()),
         )),
-        Err(cause) => ArgumentsPlan::Leave(arguments_left(
-            key,
-            &value,
-            &format!("{cause}, so it is not known whether there is a config to hold it"),
-            "fix what stops that check",
-        )),
+        Err(cause) => ArgumentsPlan::Leave(arguments_left(key, &value, &cause)),
     }
 }
 
 /// The notice for a `DefaultShellArguments` `apply` leaves: `DefaultShell` is ssh-broker by now, `why`
-/// says why there is no config to hold the value, `fix` what to do about that, and `value` is how it was read.
-pub fn arguments_left(key: &str, value: &str, why: &str, fix: &str) -> String {
-    format!(
-        "apply: left DefaultShellArguments ({value}) under HKLM\\{key}: {why}, and sshd passes it to ssh-broker \
-         ahead of -c; {fix} and run apply again, which removes it"
-    )
+/// says why the value stays, and `value` is how it was read.
+pub fn arguments_left(key: &str, value: &str, why: &str) -> String {
+    format!("apply: left DefaultShellArguments ({value}) under HKLM\\{key}: {why}")
 }
 
 /// The notice for a `DefaultShellArguments` `apply` leaves because it could not read it, with the `cause`.
 /// What sshd does with a value nobody could read is not known, so the text says none of it.
 pub fn arguments_unreadable(key: &str, cause: &str) -> String {
-    format!(
-        "apply: left DefaultShellArguments under HKLM\\{key}: it could not be read ({cause}), so it can be neither \
-         shown nor carried; fix its permissions or delete it, then run apply again: a value that can be read is \
-         removed once the system config is a file"
-    )
+    format!("apply: left DefaultShellArguments under HKLM\\{key}: it could not be read ({cause})")
 }
 
 /// The text `apply` emits before it removes `DefaultShellArguments`, with the `value` as it was read.
 pub fn arguments_removing(key: &str, value: &str) -> String {
-    format!(
-        "apply: removing DefaultShellArguments ({value}) from HKLM\\{key}, since sshd would pass it to ssh-broker \
-         ahead of -c"
-    )
+    format!("apply: removing DefaultShellArguments ({value}) from HKLM\\{key}")
 }
 
 /// The notice for a `DefaultShellArguments` `apply` removed.
-pub fn arguments_removed(config: &Path, key: &str, value: &str) -> String {
-    format!(
-        "apply: removed DefaultShellArguments ({value}) from HKLM\\{key}, since sshd would pass it to ssh-broker \
-         ahead of -c; put it in {} if the shell needs it",
-        config.display()
-    )
+pub fn arguments_removed(key: &str, value: &str) -> String {
+    format!("apply: removed DefaultShellArguments ({value}) from HKLM\\{key}")
 }
 
 /// The notice for a `DefaultShellArguments` `apply` could not remove, with the `cause`.
 pub fn arguments_not_removed(key: &str, value: &str, cause: &str) -> String {
-    format!(
-        "apply: could not remove DefaultShellArguments ({value}) under HKLM\\{key}, and sshd passes it to \
-         ssh-broker ahead of -c; the next apply tries again: {cause}"
-    )
+    format!("apply: could not remove DefaultShellArguments ({value}) from HKLM\\{key}: {cause}")
 }
 
 /// The directories sshd's `CreateProcess` searches for a bare `DefaultShell` before `PATH`, in its
@@ -394,14 +373,26 @@ pub fn render(block: &ShellBlock) -> anyhow::Result<String> {
     ))
 }
 
-/// Write the system config for `block` if there is none: `None` when it did, else why it did not
-/// ([`Skip::FileExists`], or [`Skip::NotAFile`] for a path that holds a directory or other non-file).
+/// How [`create_once`] went when it did not fail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CreateOutcome {
+    /// The config was written.
+    Created,
+    /// A config was there already, and is untouched.
+    FileExists,
+    /// A directory or other non-file holds the name: nothing was written.
+    NotAFile,
+}
+
+/// Write the system config for `block` if there is none, or say which of the other outcomes it met
+/// ([`CreateOutcome::FileExists`], [`CreateOutcome::NotAFile`] for a path that holds a directory or other
+/// non-file).
 ///
 /// The text goes to a temporary file in the same directory first and is then linked to the final
 /// name, which fails if the name is taken: the config appears whole or not at all, and a file that
 /// is there is never replaced. The new file inherits the install directory's ACL, which `base`
 /// proves was checked.
-pub fn create_once(base: &TrustedBase<'_>, block: &ShellBlock) -> anyhow::Result<Option<Skip>> {
+pub fn create_once(base: &TrustedBase<'_>, block: &ShellBlock) -> anyhow::Result<CreateOutcome> {
     create_once_at(&base.layout().system_config_path(), block)
 }
 
@@ -416,7 +407,7 @@ fn remove_temp(temp: &Path) {
 }
 
 /// [`create_once`] for a path: the part that does not depend on the install directory.
-pub(super) fn create_once_at(target: &Path, block: &ShellBlock) -> anyhow::Result<Option<Skip>> {
+pub(super) fn create_once_at(target: &Path, block: &ShellBlock) -> anyhow::Result<CreateOutcome> {
     let text = render(block)?;
     let mut temp = target.as_os_str().to_owned();
     temp.push(format!(".tmp-{}", std::process::id()));
@@ -437,11 +428,12 @@ pub(super) fn create_once_at(target: &Path, block: &ShellBlock) -> anyhow::Resul
     };
     remove_temp(&temp);
     match linked {
-        Ok(()) => Ok(None),
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(Some(match config_is_file(target) {
-            Ok(ConfigKind::Other) => Skip::NotAFile,
-            _ => Skip::FileExists,
-        })),
+        Ok(()) => Ok(CreateOutcome::Created),
+        // The name was taken: a re-check that cannot tell, or finds the name gone, leaves it a file that exists.
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(match config_is_file(target) {
+            Ok(ConfigKind::Other) => CreateOutcome::NotAFile,
+            _ => CreateOutcome::FileExists,
+        }),
         Err(e) => Err(e).with_context(|| format!("create {}", target.display())),
     }
 }

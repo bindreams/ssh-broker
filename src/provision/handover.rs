@@ -11,7 +11,7 @@
 use std::path::Path;
 
 use super::registry::{SshdShell, UnreadShell};
-use super::system_config::{self, ArgumentsPlan, ConfigKind, Decision, Skip};
+use super::system_config::{self, ArgumentsPlan, ConfigKind, CreateOutcome, Decision, Skip};
 use crate::shell::config::ShellBlock;
 
 /// Where a notice goes.
@@ -77,18 +77,13 @@ pub fn replace_shell<T>(
     carry: impl FnOnce(&SshdShell) -> Handover,
     flip: impl FnOnce(&Handover) -> anyhow::Result<T>,
 ) -> anyhow::Result<T> {
-    let previous = read().map_err(|unread| {
-        anyhow::anyhow!(
-            "{unread}. DefaultShell was not changed: fix the value or its permissions, or delete it, then run \
-             `apply` again"
-        )
-    })?;
+    let previous = read().map_err(|unread| anyhow::anyhow!("{unread}. DefaultShell was not changed"))?;
     let handover = carry(&previous);
     flip(&handover).map_err(|e| e.context("DefaultShell was not changed"))
 }
 
-/// Act on `decision` for `previous`: write the config with `create` (which says why it did not create the
-/// file, or `None` when it did, and is called only for a [`Decision::Write`]), or print what is not carried.
+/// Act on `decision` for `previous`: write the config with `create` (which says whether it created the
+/// file, and is called only for a [`Decision::Write`]), or print what is not carried.
 /// `config` is the config's path. A previous shell with nothing to carry ([`system_config::nothing_to_carry`]) is known
 /// from `previous` alone, whatever `decision` says; a decision that claims it for any other shell is
 /// printed, not believed.
@@ -96,7 +91,7 @@ pub fn hand_over(
     config: &Path,
     previous: &SshdShell,
     decision: Decision,
-    create: impl FnOnce(&ShellBlock) -> anyhow::Result<Option<Skip>>,
+    create: impl FnOnce(&ShellBlock) -> anyhow::Result<CreateOutcome>,
     say: &mut dyn FnMut(Stream, &str),
 ) -> Handover {
     if let Some(handover) = Handover::nothing_to_carry(previous) {
@@ -104,7 +99,7 @@ pub fn hand_over(
     }
     let skip = match decision {
         Decision::Write(block) => match create(&block) {
-            Ok(None) => {
+            Ok(CreateOutcome::Created) => {
                 return Handover::carried(
                     say,
                     &format!(
@@ -115,7 +110,8 @@ pub fn hand_over(
                 );
             }
             // Someone else created the config between the check and the create: it is never rewritten.
-            Ok(Some(skip)) => skip,
+            Ok(CreateOutcome::FileExists) => Skip::FileExists,
+            Ok(CreateOutcome::NotAFile) => Skip::NotAFile,
             Err(e) => {
                 return Handover::printed(say, &system_config::not_written(config, previous, &format!("{e:#}")));
             }
@@ -143,7 +139,7 @@ pub fn remove_arguments(
         ArgumentsPlan::Remove(value) => {
             let shown = ShownValue::print(say, &system_config::arguments_removing(key, &value));
             match remove(&shown) {
-                Ok(()) => say(Stream::Out, &system_config::arguments_removed(config, key, &value)),
+                Ok(()) => say(Stream::Out, &system_config::arguments_removed(key, &value)),
                 Err(e) => say(
                     Stream::Err,
                     &system_config::arguments_not_removed(key, &value, &format!("{e:#}")),

@@ -6,8 +6,9 @@ use std::path::Path;
 
 use super::{Handover, Stream, hand_over, remove_arguments, replace_shell};
 use crate::provision::registry::{SshdShell, SshdShellReading};
-use crate::provision::system_config::{ConfigKind, Decision, Skip, decide};
+use crate::provision::system_config::{ConfigKind, CreateOutcome, Decision, Skip, decide};
 use crate::shell::config::ShellBlock;
+use crate::test_support::states_facts_only;
 
 const PWSH7: &str = r"C:\Program Files\PowerShell\7\pwsh.exe";
 const CONFIG: &str = r"C:\ProgramData\ssh-broker\config.yaml";
@@ -40,7 +41,7 @@ fn block() -> ShellBlock {
 fn said_for(
     previous: &SshdShell,
     decision: Decision,
-    create: impl FnOnce(&ShellBlock) -> anyhow::Result<Option<Skip>>,
+    create: impl FnOnce(&ShellBlock) -> anyhow::Result<CreateOutcome>,
 ) -> Vec<(Stream, String)> {
     let mut lines = Vec::new();
     let _ = hand_over(Path::new(CONFIG), previous, decision, create, &mut |stream, text| {
@@ -50,7 +51,10 @@ fn said_for(
 }
 
 /// Run `hand_over` for the foreign `previous()` and return what was said.
-fn said(decision: Decision, create: impl FnOnce(&ShellBlock) -> anyhow::Result<Option<Skip>>) -> Vec<(Stream, String)> {
+fn said(
+    decision: Decision,
+    create: impl FnOnce(&ShellBlock) -> anyhow::Result<CreateOutcome>,
+) -> Vec<(Stream, String)> {
     said_for(&previous(), decision, create)
 }
 
@@ -66,6 +70,7 @@ fn holds_every_previous_value(text: &str) {
         assert!(text.contains(part), "{part}: {text}");
     }
     before_the_flip(text);
+    states_facts_only(text);
 }
 
 /// What `hand_over` prints comes before the flip, which can still fail: it may say what `apply` does
@@ -78,16 +83,16 @@ fn before_the_flip(text: &str) {
 
 #[test]
 fn a_config_created_by_someone_else_in_between_prints_the_previous_values() {
-    let lines = said(Decision::Write(block()), |_| Ok(Some(Skip::FileExists)));
+    let lines = said(Decision::Write(block()), |_| Ok(CreateOutcome::FileExists));
     assert_eq!(lines.len(), 1, "{lines:?}");
     assert_eq!(lines[0].0, Stream::Err);
     holds_every_previous_value(&lines[0].1);
-    assert!(lines[0].1.contains("is already there"), "{}", lines[0].1);
+    assert!(lines[0].1.contains(&format!("{CONFIG} exists")), "{}", lines[0].1);
 }
 
 #[test]
 fn a_written_config_says_so_on_stdout_and_prints_no_warning() {
-    let lines = said(Decision::Write(block()), |_| Ok(None));
+    let lines = said(Decision::Write(block()), |_| Ok(CreateOutcome::Created));
     assert_eq!(
         lines,
         vec![(
@@ -119,7 +124,7 @@ fn every_skip_that_loses_the_previous_shell_prints_the_previous_values_without_c
         let created = Cell::new(false);
         let lines = said(Decision::Skip(skip.clone()), |_| {
             created.set(true);
-            Ok(None)
+            Ok(CreateOutcome::Created)
         });
         assert!(!created.get(), "{skip:?}");
         assert_eq!(lines.len(), 1, "{skip:?}: {lines:?}");
@@ -142,7 +147,7 @@ fn a_config_path_that_is_not_a_file_prints_that_and_the_previous_values_without_
     let created = Cell::new(false);
     let lines = said(decision, |_| {
         created.set(true);
-        Ok(None)
+        Ok(CreateOutcome::Created)
     });
     assert!(!created.get());
     assert_eq!(lines.len(), 1, "{lines:?}");
@@ -153,13 +158,12 @@ fn a_config_path_that_is_not_a_file_prints_that_and_the_previous_values_without_
         "{}",
         lines[0].1
     );
-    assert!(!lines[0].1.contains("put it in that config"), "{}", lines[0].1);
 }
 
 /// The path turned into a non-file between the check and the create: the create says so and the line is the same.
 #[test]
 fn a_config_path_that_turns_into_a_non_file_before_the_create_prints_that() {
-    let lines = said(Decision::Write(block()), |_| Ok(Some(Skip::NotAFile)));
+    let lines = said(Decision::Write(block()), |_| Ok(CreateOutcome::NotAFile));
     assert_eq!(lines.len(), 1, "{lines:?}");
     assert_eq!(lines[0].0, Stream::Err);
     holds_every_previous_value(&lines[0].1);
@@ -188,7 +192,7 @@ fn a_previous_shell_that_is_ssh_broker_or_unset_says_nothing_whatever_the_decisi
             let created = Cell::new(false);
             let lines = said_for(&own(shell), decision, |_| {
                 created.set(true);
-                Ok(None)
+                Ok(CreateOutcome::Created)
             });
             assert_eq!((lines, created.get()), (vec![], false), "{shell:?}");
         }
@@ -199,7 +203,7 @@ fn a_previous_shell_that_is_ssh_broker_or_unset_says_nothing_whatever_the_decisi
 /// are printed.
 #[test]
 fn a_nothing_to_carry_skip_for_a_foreign_shell_prints_the_previous_values() {
-    let lines = said(Decision::Skip(Skip::NothingToCarry), |_| Ok(None));
+    let lines = said(Decision::Skip(Skip::NothingToCarry), |_| Ok(CreateOutcome::Created));
     assert_eq!(lines.len(), 1, "{lines:?}");
     assert_eq!(lines[0].0, Stream::Err);
     assert!(lines[0].1.contains(PWSH7), "{}", lines[0].1);
@@ -258,7 +262,6 @@ fn an_unreadable_previous_shell_stops_before_the_flip() {
     for part in [
         "DefaultShellCommandOption (access denied)",
         "DefaultShell was not changed",
-        "fix the value or its permissions, or delete it, then run `apply` again",
         &format!("DefaultShell = \"{PWSH7}\""),
         "DefaultShellArguments = \"-NoProfile\"",
         "DefaultShellEscapeArguments = off",
@@ -267,6 +270,7 @@ fn an_unreadable_previous_shell_stops_before_the_flip() {
     }
     // Nothing was written, so the text may say so; it must not say the shell was replaced.
     assert!(!text.contains("replaced"), "{text}");
+    states_facts_only(&text);
 }
 
 #[test]
@@ -302,6 +306,7 @@ fn a_failed_flip_is_the_error_and_says_the_default_shell_was_not_changed() {
     let text = format!("{error:#}");
     assert!(text.contains("write failed"), "{text}");
     assert!(!text.contains("replaced"), "{text}");
+    states_facts_only(&text);
 }
 
 fn unreadable_arguments(shell: &str) -> SshdShellReading {
@@ -385,21 +390,24 @@ fn the_arguments_are_printed_before_they_are_removed_and_the_removal_is_confirme
         "{before}"
     );
     assert!(
-        after.contains("removed DefaultShellArguments") && after.contains(CONFIG),
+        after.contains("removed DefaultShellArguments") && after.contains("-NoLogo"),
         "{after}"
     );
+    states_facts_only(before);
+    states_facts_only(after);
 }
 
 #[test]
-fn a_failed_removal_was_announced_first_and_says_the_cause_and_that_the_next_apply_tries_again() {
+fn a_failed_removal_was_announced_first_and_says_the_cause() {
     let events = removal(Ok(Some("-NoLogo")), Ok(ConfigKind::File), true);
     let [Event::Said(_, before), Event::Removed, Event::Said(Stream::Err, after)] = &events[..] else {
         panic!("{events:?}");
     };
     assert!(before.contains("-NoLogo"), "{before}");
-    for part in ["could not remove DefaultShellArguments", "access denied", "next apply"] {
+    for part in ["could not remove DefaultShellArguments", "access denied"] {
         assert!(after.contains(part), "{part}: {after}");
     }
+    states_facts_only(after);
 }
 
 #[test]
@@ -412,10 +420,10 @@ fn arguments_that_are_not_removed_are_never_removed_and_a_value_that_is_set_is_s
         (Ok(Some("-NoLogo")), Err("cannot tell")),
     ] {
         let events = removal(read, config_is_file, false);
-        assert!(
-            matches!(&events[..], [Event::Said(Stream::Err, _)]),
-            "{read:?} {config_is_file:?}: {events:?}"
-        );
+        let [Event::Said(Stream::Err, text)] = &events[..] else {
+            panic!("{read:?} {config_is_file:?}: {events:?}");
+        };
+        states_facts_only(text);
     }
 }
 

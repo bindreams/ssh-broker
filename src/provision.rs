@@ -219,9 +219,7 @@ mod imp {
                     |previous| carry_previous_shell(&base, previous),
                     |handover| {
                         registry::set_default_shell_under(registry::OPENSSH_KEY, &exe.to_string_lossy(), handover)
-                            .context(
-                                "write the DefaultShell values (the escape flag and the command option go first and may be set)",
-                            )
+                            .context("write DefaultShellEscapeArguments, DefaultShellCommandOption, DefaultShell (in that order)")
                     },
                 )?;
                 let (shell, opt) = registry::read_default_shell_under(registry::OPENSSH_KEY)?;
@@ -259,7 +257,7 @@ mod imp {
         // decision needs it, so that what cannot be read is not reported when it does not matter.
         let search = || {
             let image = registry::read_sshd_image_path().unwrap_or_else(|e| {
-                eprintln!("apply: cannot read where sshd runs from ({e:#}); a bare shell name is looked up without it");
+                eprintln!("apply: cannot read where sshd runs from: {e:#}");
                 None
             });
             system_config::sshd_search_dirs(&host, image.as_deref())
@@ -271,8 +269,7 @@ mod imp {
             use crate::shell::Host;
             host.is_system_cmd(found).unwrap_or_else(|e| {
                 eprintln!(
-                    "apply: cannot tell whether {} is the system cmd.exe ({e}); its settings are compared with the \
-                     defaults for another program",
+                    "apply: cannot tell whether {} is the system cmd.exe: {e}",
                     found.display()
                 );
                 false
