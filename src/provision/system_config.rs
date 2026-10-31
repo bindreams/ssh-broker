@@ -211,8 +211,9 @@ pub fn skip_notice(config: &Path, previous: &SshdShell, skip: &Skip) -> Option<S
 
 /// The directories sshd's `CreateProcess` searches for a bare `DefaultShell` before `PATH`, in its
 /// order: the directory of sshd itself (`image_path`, the service's `ImagePath`, when it is known),
-/// the working directory (a service's is the system directory, as `tests/shell_sshd_windows.rs` measures, so
-/// it is not listed apart), the system directory and the Windows directory.
+/// the system directory and the Windows directory. The working directory is not listed: sshd's is not
+/// the system directory but the drive root (the service) or the account's profile (the process running as
+/// the account), as `tests/shell_sshd_windows.rs` measures, and `apply` runs for no one account.
 pub fn sshd_search_dirs(host: &dyn Host, image_path: Option<&str>) -> anyhow::Result<Vec<PathBuf>> {
     let system_dir = host
         .system_cmd()?

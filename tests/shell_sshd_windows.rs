@@ -732,12 +732,12 @@ fn the_warning_is_on_the_screen_when_the_fallback_line_is_near_the_command_line_
     session.leave();
 }
 
-/// The working directory of sshd, which a bare `DefaultShell` is looked up in (after sshd's own directory):
-/// `provision::system_config::sshd_search_dirs` leaves it out because a service runs in the system directory.
-/// Measured on the runner with a session open, in every `sshd` process (the service, and the per-connection
-/// one that starts the shell).
+/// The working directory of every `sshd.exe` with a session open, measured on the runner (CI run 41187603188
+/// read it as: the service and one more in `C:\`, the one running as the account in the account's profile).
+/// None is the system directory, so `provision::system_config::sshd_search_dirs` must not say a service runs
+/// there. Which of them looks up a bare `DefaultShell` is not measured here.
 #[test]
-fn sshd_runs_in_the_system_directory() {
+fn sshd_runs_in_the_drive_root_or_the_accounts_profile() {
     let _machine = machine::exclusive();
     let rig = Rig::new("shd14");
     let login = rig.login();
@@ -752,26 +752,22 @@ fn sshd_runs_in_the_system_directory() {
         .collect();
     session.leave();
 
-    let system_dir = PathBuf::from(std::env::var("SystemRoot").expect("SystemRoot")).join("System32");
-    let same = |dir: &std::path::Path| {
-        dir.to_string_lossy()
-            .trim_end_matches('\\')
-            .eq_ignore_ascii_case(&system_dir.to_string_lossy())
-    };
+    let trimmed = |dir: &std::path::Path| dir.to_string_lossy().trim_end_matches('\\').to_ascii_lowercase();
+    let drive = std::env::var("SystemDrive").expect("SystemDrive").to_ascii_lowercase();
+    let profile = trimmed(rig.account.profile());
     let shown = format!("{measured:?}");
-    assert!(
-        measured.iter().any(|(_, exe, _)| exe.eq_ignore_ascii_case("sshd.exe")),
-        "no sshd.exe was running: {shown}"
-    );
+    let mut in_profile = 0;
     for (pid, exe, cwd) in &measured {
         let cwd = cwd
             .as_ref()
             .unwrap_or_else(|e| panic!("{exe} ({pid}): {e}\nmeasured: {shown}"));
+        let cwd_text = trimmed(cwd);
         assert!(
-            same(cwd),
-            "{exe} ({pid}) runs in {}, not {}\nmeasured: {shown}",
-            cwd.display(),
-            system_dir.display()
+            cwd_text == drive || cwd_text == profile,
+            "{exe} ({pid}) runs in {}, neither the drive root nor the profile\nmeasured: {shown}",
+            cwd.display()
         );
+        in_profile += usize::from(cwd_text == profile);
     }
+    assert!(in_profile > 0, "no sshd runs in the profile\nmeasured: {shown}");
 }
