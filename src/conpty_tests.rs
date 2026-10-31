@@ -58,29 +58,22 @@ fn a_file_that_cannot_start_is_an_error_and_not_a_message_box() {
     assert!(result.is_err(), "a file that is not a program started");
 }
 
-// MEASUREMENT (ssh-broker#55 round 8, F3): as in pipes_tests, for a pseudoconsole.
+/// As in `pipes_tests`, for a pseudoconsole: the program starts, and ends with the loader status. What it
+/// wrote is conhost's own setup and the window title, nothing of the program's.
 #[test]
-fn measure_loader_failure_in_a_pseudoconsole() {
+fn a_program_with_a_missing_dll_starts_and_ends_with_the_loader_status() {
     use windows::Win32::System::Diagnostics::Debug::{SEM_FAILCRITICALERRORS, SetErrorMode};
+    const STATUS_DLL_NOT_FOUND: u32 = 0xC000_0135;
+    // SAFETY: no pointers. This process's own mode, so that the loader ends the program instead of raising a box.
     unsafe { SetErrorMode(SEM_FAILCRITICALERRORS) };
     let exe = crate::command_line_probe::example("missing_dll");
-    let mut session = match PtySession::spawn(&format!("\"{}\"", exe.display()), 80, 24, None, None) {
-        Ok(session) => session,
-        Err(e) => {
-            eprintln!("MEASURE pty: start failed: {e}");
-            return;
-        }
-    };
-    eprintln!("MEASURE pty: start Ok");
+    let mut session =
+        PtySession::spawn(&format!("\"{}\"", exe.display()), 80, 24, None, None).expect("the program starts");
     let reader = drain(session.out_read_raw());
-    let code = session.wait();
-    eprintln!(
-        "MEASURE pty: ended, exit code {:?}",
-        code.map(|c| format!("{:#010x}", c as u32))
-    );
+    let code = session.wait().unwrap();
     session.close_pty();
-    let out = reader.join().unwrap();
-    eprintln!("MEASURE pty: output {:?}", String::from_utf8_lossy(&out));
+    reader.join().unwrap();
+    assert_eq!(code as u32, STATUS_DLL_NOT_FOUND, "{code:#x}");
 }
 
 /// As in `pipes_tests`: the working directory is not the program's fault.

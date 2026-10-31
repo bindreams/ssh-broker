@@ -86,56 +86,31 @@ fn a_file_that_cannot_start_is_an_error_and_not_a_message_box() {
     assert!(result.is_err(), "a file that is not a program started");
 }
 
-// MEASUREMENT (ssh-broker#55 round 8, F3): what a program the loader cannot load does after a
-// successful start. Printed always (nextest `success-output`); replaced by the real tests.
+// A program the loader cannot load =====
 
-fn measure_loader_failure(label: &str) {
+/// Make a program that cannot load end with its status instead of a message box on a desktop nobody
+/// watches. The setting is this test process's, which nextest gives to this test alone.
+fn loader_failures_end_the_program() {
+    use windows::Win32::System::Diagnostics::Debug::{SEM_FAILCRITICALERRORS, SetErrorMode};
+    // SAFETY: no pointers.
+    unsafe { SetErrorMode(SEM_FAILCRITICALERRORS) };
+}
+
+/// Measured in CI (ssh-broker#55): a program whose import is missing is STARTED. `CreateProcessW` succeeds, the
+/// loader ends the process with `STATUS_DLL_NOT_FOUND` before `main`, and nothing was written to either stream. So
+/// `spawn` cannot tell it from a healthy program; the status is known only when the process ends.
+#[test]
+fn a_program_with_a_missing_dll_starts_and_ends_with_the_loader_status_and_no_output() {
+    const STATUS_DLL_NOT_FOUND: u32 = 0xC000_0135;
+    loader_failures_end_the_program();
     let exe = crate::command_line_probe::example("missing_dll");
-    let started = ExecChild::spawn(&format!("\"{}\"", exe.display()), None);
-    let child = match started {
-        Ok(child) => child,
-        Err(e) => {
-            eprintln!("MEASURE {label}: start failed: {e}");
-            return;
-        }
-    };
-    eprintln!("MEASURE {label}: start Ok");
-    let job = child.job();
+    let child = ExecChild::spawn(&format!("\"{}\"", exe.display()), None).expect("the program starts");
     let out_t = drain(child.stdout_read_raw());
     let err_t = drain(child.stderr_read_raw());
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let code = child.wait();
-        let _ = tx.send(code);
-    });
-    // A failure bound on an external event (a child that may sit in a message box).
-    let waited = rx.recv_timeout(std::time::Duration::from_secs(30)); // sleep-ok: failure bound, a hang is reported
-    match waited {
-        Ok(code) => eprintln!(
-            "MEASURE {label}: ended, exit code {:?}",
-            code.map(|c| format!("{:#010x}", c as u32))
-        ),
-        Err(_) => {
-            eprintln!("MEASURE {label}: still running after 30 s (a message box?)");
-            let _ = job.kill_tree();
-        }
-    }
-    let out = out_t.join().unwrap();
-    let err = err_t.join().unwrap();
-    eprintln!("MEASURE {label}: stdout {out:?} stderr {err:?}");
-}
-
-#[test]
-fn measure_loader_failure_default_error_mode() {
-    measure_loader_failure("pipes, default process error mode");
-}
-
-#[test]
-fn measure_loader_failure_process_fails_critical_errors() {
-    use windows::Win32::System::Diagnostics::Debug::{SEM_FAILCRITICALERRORS, SetErrorMode};
-    let previous = unsafe { SetErrorMode(SEM_FAILCRITICALERRORS) };
-    eprintln!("MEASURE the test process's own error mode was {previous:?}");
-    measure_loader_failure("pipes, process error mode FAILCRITICALERRORS");
+    // UNBOUNDED on purpose: the loader ends the process, or nextest's bound names this test.
+    let code = child.wait().unwrap();
+    assert_eq!(code as u32, STATUS_DLL_NOT_FOUND, "{code:#x}");
+    assert!(out_t.join().unwrap().is_empty() && err_t.join().unwrap().is_empty());
 }
 
 /// A working directory that is not one is the session's failure, not the program's: the shell would be

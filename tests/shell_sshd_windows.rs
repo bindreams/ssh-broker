@@ -751,7 +751,7 @@ fn ctrl_c_in_a_terminal_session_whose_shell_fell_back_reaches_the_shell_and_the_
     // A program in the shell, interrupted by Ctrl+C: cmd.exe stays and shows the next prompt.
     conn.type_line("ping -n 60 127.0.0.1");
     conn.read_until_pty_shows("Reply from");
-    conn.ctrl_c();
+    conn.send_pty_bytes(&ctrl_c_keys());
     conn.read_until_pty_shows("^C");
     // `^i` is `i` to cmd.exe, so the text appears only as output, not as the echo of what was typed.
     conn.type_line("echo the-sess^ion-lives");
@@ -760,5 +760,86 @@ fn ctrl_c_in_a_terminal_session_whose_shell_fell_back_reaches_the_shell_and_the_
     conn.type_line("exit");
     let finished = conn.read_to_end();
     assert_eq!(finished.exit, Some(0), "{}", finished.pty);
+    session.leave();
+}
+
+/// Ctrl+C as the shim sends it for a real keystroke: the Ctrl key, then C with the character 0x03 and the
+/// scan codes, then both released.
+fn ctrl_c_keys() -> Vec<u8> {
+    const LEFT_CTRL: u32 = 0x0008;
+    let key = |vk: u16, sc: u16, uc: u16, down: bool, cs: u32| {
+        ssh_broker::vtinput::encode_key_event(&ssh_broker::vtinput::KeyEvent {
+            virtual_key_code: vk,
+            virtual_scan_code: sc,
+            unicode_char: uc,
+            key_down: down,
+            control_key_state: cs,
+            repeat_count: 1,
+        })
+    };
+    [
+        key(0x11, 0x1D, 0, true, LEFT_CTRL),
+        key(0x43, 0x2E, 3, true, LEFT_CTRL),
+        key(0x43, 0x2E, 3, false, LEFT_CTRL),
+        key(0x11, 0x1D, 0, false, 0),
+    ]
+    .concat()
+}
+
+// MEASUREMENT (ssh-broker#55 round 8, F1): which input interrupts a program through the agent's pseudoconsole.
+// Printed always; replaced by the real test.
+#[test]
+fn measure_ctrl_c_variants() {
+    let _machine = machine::exclusive();
+    let rig = Rig::new("shd15");
+    let login = rig.login();
+    rig.broker_is_default_shell();
+    let session = rig.start_session(&login);
+    let location = socket_loc::for_profile(rig.account.profile()).unwrap();
+
+    let simple: Vec<u8> = {
+        let key = |down: bool| {
+            ssh_broker::vtinput::encode_key_event(&ssh_broker::vtinput::KeyEvent {
+                virtual_key_code: 0x43,
+                virtual_scan_code: 0,
+                unicode_char: 3,
+                key_down: down,
+                control_key_state: 0x0008,
+                repeat_count: 1,
+            })
+        };
+        [key(true), key(false)].concat()
+    };
+    let variants: Vec<(&str, Vec<u8>)> = vec![
+        ("win32 key C with ctrl, no scan code", simple),
+        ("win32 keys: ctrl, C with scan codes, releases", ctrl_c_keys()),
+        ("the byte 0x03", vec![3]),
+    ];
+    for (session_kind, broken_config) in [("direct cmd.exe", false), ("fallback verb", true)] {
+        rig.account.write_user_config(if broken_config {
+            "shell: {strt: pwsh.exe}\n"
+        } else {
+            "shell: pwsh.exe\n"
+        });
+        for (name, bytes) in &variants {
+            let mut conn = agent_conn::AgentConn::connect(&location);
+            if broken_config {
+                conn.start_shell_pty(None);
+            } else {
+                conn.start_pty("cmd.exe");
+            }
+            conn.read_until_pty_shows("Microsoft Windows");
+            conn.type_line("ping -n 12 127.0.0.1");
+            conn.read_until_pty_shows("Reply from");
+            conn.send_pty_bytes(bytes);
+            let shown = conn.read_until_pty_shows("Ping statistics");
+            eprintln!(
+                "MEASURE ctrl+c, {session_kind}, {name}: interrupted = {}",
+                shown.contains("^C")
+            );
+            conn.type_line("exit");
+            let _ = conn.read_to_end();
+        }
+    }
     session.leave();
 }
