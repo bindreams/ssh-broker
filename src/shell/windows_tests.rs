@@ -171,7 +171,7 @@ fn the_current_directory_and_the_exe_directory_are_not_searched() {
 
 #[test]
 fn relative_entries_on_the_list_are_skipped() {
-    // A relative entry means "the current directory", which D7 excludes.
+    // A relative entry means "the current directory", which the search excludes.
     let here = std::env::current_dir().unwrap();
     let file = std::fs::read_dir(&here)
         .unwrap()

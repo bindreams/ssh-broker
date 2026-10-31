@@ -445,8 +445,8 @@ impl LocalChild {
                 // would be indistinguishable from the command having succeeded — the exact confusion
                 // `shim::map_outcome` exists to prevent. Reporting it as an error routes it to the
                 // caller's 255, this crate's "the broker failed" code, which is what the relay reports
-                // for the same class of failure. Erroring rather than exiting here is also what lets
-                // the caller LOG it: exiting inside this function is why that diagnostic was lost.
+                // for the same class of failure. Erroring rather than exiting here lets the caller
+                // log it.
                 anyhow::bail!("GetExitCodeProcess failed for the fail-open child");
             }
             Ok(code as i32)

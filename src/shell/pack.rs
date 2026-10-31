@@ -32,7 +32,7 @@ pub struct Defaults {
 }
 
 /// The defaults for the system `cmd.exe` (`cmd` escaping, `/c`) or for any other program (`msvc`,
-/// `-c`). The commands `without-command` defaults to nothing for both.
+/// `-c`). `without-command` defaults to nothing for both.
 pub fn defaults(is_system_cmd: bool) -> Defaults {
     if is_system_cmd {
         Defaults {

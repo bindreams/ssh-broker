@@ -96,7 +96,7 @@ fn loader_failures_end_the_program() {
     unsafe { SetErrorMode(SEM_FAILCRITICALERRORS) };
 }
 
-/// Measured in CI (ssh-broker#55): a program whose import is missing is STARTED. `CreateProcessW` succeeds, the
+/// A program whose import is missing is STARTED. `CreateProcessW` succeeds, the
 /// loader ends the process with `STATUS_DLL_NOT_FOUND` before `main`, and nothing was written to either stream. So
 /// `spawn` cannot tell it from a healthy program; the status is known only when the process ends.
 #[test]

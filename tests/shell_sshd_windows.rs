@@ -625,7 +625,7 @@ fn the_warning_survives_on_the_screen_of_a_terminal_session_through_the_shim_alo
 
 /// The same through the agent, for a command and for a login. ConPTY opens the agent's pseudoconsole with a clear of
 /// the screen that reaches the client after anything written ahead of it; the warning has to be on the screen after
-/// that clear (measured, ssh-broker#55).
+/// that clear.
 #[test]
 fn the_warning_survives_on_the_screen_of_a_terminal_session_through_the_agent() {
     let _machine = machine::exclusive();

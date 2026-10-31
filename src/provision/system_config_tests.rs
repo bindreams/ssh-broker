@@ -88,11 +88,15 @@ fn only_values_that_differ_from_the_default_are_carried() {
     let system = carried_block(&sshd(r"C:\Windows\System32\cmd.exe"), true);
     assert_eq!((system.with_command, system.escaping), (None, None));
 
-    // Empty values count as absent.
-    let mut prev = sshd(TOOLS_PWSH);
-    prev.command_option = None;
-    prev.arguments = None;
-    assert_eq!(carried(&prev).without_command, None);
+    // Empty and blank values: no arguments, and an option of no words is carried as no words, as sshd pastes nothing.
+    for blank in ["", "   "] {
+        let mut prev = sshd(TOOLS_PWSH);
+        prev.command_option = Some(blank.into());
+        prev.arguments = Some(blank.into());
+        let block = carried(&prev);
+        assert_eq!(block.without_command, None, "{blank:?}");
+        assert_eq!(block.with_command, Some(vec![]), "{blank:?}");
+    }
 }
 
 #[test]

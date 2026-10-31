@@ -73,7 +73,7 @@ fn append_values_are_lists_of_arguments() {
     assert_eq!(b.with_command, Some(vec!["-Command".to_string(), "-".to_string()]));
 }
 
-/// Each of these is a broken config (D5): the reason must say what was wrong, so the one
+/// Each of these is a broken config: the reason must say what was wrong, so the one
 /// warning the user gets is enough to fix the file.
 #[test]
 fn unknown_keys_and_bad_values_are_errors_naming_the_value() {

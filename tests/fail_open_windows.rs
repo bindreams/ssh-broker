@@ -378,13 +378,10 @@ fn read_console_until(output: isize, seen: &mut String, needle: &str) {
 /// The fallback shell of a terminal session runs under the verb, which is the console's root process, so a
 /// Ctrl+C raised on the console reaches the verb as well as the shell. The shell answers it (here a probe that
 /// reports the event it gets), and the verb must stay: with the default handler it would end on the Ctrl+C, and
-/// take the shell and the session with it (ssh-broker#55).
+/// take the shell and the session with it.
 ///
-/// The test clears the "ignore Ctrl+C" setting its own process may have inherited, which the verb and the
-/// probe then inherit, as they would from a process that never had it. (Measured in CI: an agent started
-/// through the password prompt, which goes through `CreateProcessWithLogonW`, has it set, and nothing in
-/// its sessions gets a Ctrl+C until a program clears it for itself. An agent started by a scheduled task
-/// does not have it set.)
+/// The test clears the inherited "ignore Ctrl+C" setting (an agent started through the password prompt has it
+/// set) so the verb and probe start as from a clean process.
 #[test]
 fn console_fallback_stays_through_a_ctrl_c_that_the_shell_answers() {
     use ssh_broker::conpty::{PtySession, write_all_handle};

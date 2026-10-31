@@ -285,7 +285,7 @@ fn exec_out_sink_flushes_each_frame() {
 }
 
 #[test]
-fn an_unreachable_agent_decides_for_the_local_shell_and_a_reachable_one_for_the_relay() {
+fn fail_open_when_agent_unreachable() {
     assert_eq!(decide_fallback(true), Fallback::LocalShellWithWarning);
     assert_eq!(decide_fallback(false), Fallback::Relay);
 }
@@ -356,17 +356,17 @@ fn fail_open_runs_the_planned_line_for_commands_and_for_the_interactive_session(
 }
 
 #[test]
-fn the_fallback_warning_precedes_the_child_on_stderr() {
+fn the_fallback_warning_is_said_once_and_the_child_runs_once() {
     let host = TestHost::new().with_user_config("shell: {strt: x}\n");
     for exec in [exec("echo hi", false), None] {
-        let mut events = Vec::new();
+        let mut children = 0;
         let mut stderr = Vec::new();
         fail_open(
             &host,
             &exec,
             &mut stderr,
             |_line| {
-                events.push("child");
+                children += 1;
                 Ok(0)
             },
             Ok,
@@ -378,7 +378,7 @@ fn the_fallback_warning_precedes_the_child_on_stderr() {
             "{text:?}"
         );
         assert_eq!(text.matches("cannot use the shell").count(), 1);
-        assert_eq!(events, ["child"]);
+        assert_eq!(children, 1);
     }
 }
 
