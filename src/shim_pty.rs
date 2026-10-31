@@ -54,6 +54,7 @@ const EVT_FOCUS: u16 = 0x0010;
 /// A `-c` session resolves its command first, once the log is open: `detect` says how sshd
 /// encoded it (see [`resolve_exec`]), and a blank command ends the run there, exit 0.
 pub fn run_on(exec: Option<RawExec>, detect: impl FnOnce() -> Encoding) -> anyhow::Result<()> {
+    crate::ctrl_flag_spike::record("shim at start");
     // A log that cannot be set up never stops the shim. The cause is kept, to be said where the
     // shim already explains a fallback to the user.
     let (log, log_failure) = match crate::filelog::init_for_current_user("shim.log") {

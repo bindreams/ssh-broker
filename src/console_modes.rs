@@ -116,6 +116,13 @@ impl<Ops: ConsoleOps> ConsoleModesState<Ops> {
 
 impl ConsoleModesState<Win32ConsoleOps> {
     pub(crate) fn enter() -> windows::core::Result<ConsoleModes> {
+        crate::ctrl_flag_spike::record("shim, before ConsoleModes::enter");
+        let entered = Self::enter_inner();
+        crate::ctrl_flag_spike::record("shim, after ConsoleModes::enter");
+        entered
+    }
+
+    fn enter_inner() -> windows::core::Result<ConsoleModes> {
         unsafe {
             let stdin = GetStdHandle(STD_INPUT_HANDLE)?;
             let stdout = GetStdHandle(STD_OUTPUT_HANDLE)?;

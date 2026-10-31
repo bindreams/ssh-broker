@@ -78,6 +78,20 @@ jobs:
         if: success() || failure()
         run: cargo nextest run --locked --profile ci --no-fail-fast -E 'binary(prompt_path_windows) & test(=prompt_then_password_relays_into_a_background_session)'
 
+      # The same, with the stand-in that hosts the shim clearing its own setting first, to see what the shim
+      # and the logon add on their own.
+      - name: L5b prompt path, the harness's helper clears the setting before it starts the shim
+        if: success() || failure()
+        run: |
+          New-Item -ItemType File C:\ProgramData\sb-ctrl-spike-clear-helper | Out-Null
+          "=== L5b starts here ===" | Out-File C:\ProgramData\sb-ctrl-spike-zzz-marker.log
+          cargo nextest run --locked --profile ci --no-fail-fast -E 'binary(prompt_path_windows) & test(=prompt_then_password_relays_into_a_background_session)'
+      - name: L6 the prompt path through the real sshd
+        if: success() || failure()
+        run: |
+          Remove-Item C:\ProgramData\sb-ctrl-spike-clear-helper -ErrorAction SilentlyContinue
+          cargo nextest run --locked --profile ci --no-fail-fast -E 'binary(real_sshd_windows) & test(=prompt_path_through_real_sshd)'
+
       - name: Everything the processes recorded
         if: success() || failure()
         run: |

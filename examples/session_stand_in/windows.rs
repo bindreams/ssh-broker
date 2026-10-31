@@ -20,6 +20,12 @@ mod password;
 pub fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let dir = std::env::current_exe().unwrap().parent().unwrap().to_path_buf();
+    ssh_broker::ctrl_flag_spike::record(&format!("stand_in role {:?} at start", args.first()));
+    if args.first().map(String::as_str) == Some("pty") && Path::new(r"C:\ProgramData\sb-ctrl-spike-clear-helper").exists() {
+        // SAFETY: no pointers.
+        unsafe { windows::Win32::System::Console::SetConsoleCtrlHandler(None, false) }.unwrap();
+        ssh_broker::ctrl_flag_spike::record("stand_in pty role, after clearing its own setting");
+    }
     match args.first().map(String::as_str) {
         Some("agent") => agent(&dir, &args),
         Some("shim") => shim(Path::new(&args[1])),

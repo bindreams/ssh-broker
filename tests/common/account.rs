@@ -436,6 +436,7 @@ impl Account {
         environment: Option<&[u16]>,
         stdio: Option<[HANDLE; 3]>,
     ) -> Spawned {
+        ssh_broker::ctrl_flag_spike::record(&format!("test process, before spawning {}", exe.display()));
         // The account's SID and the administrator's: the child runs as the first and is started by
         // the second.
         let starter = Sid::current_user().unwrap().to_sddl().unwrap();
