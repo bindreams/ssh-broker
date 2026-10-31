@@ -13,6 +13,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use ssh_broker::cmdline::split_args;
+use ssh_broker::provision::handover::Handover;
 use ssh_broker::provision::registry::{OPENSSH_KEY, set_default_shell_under};
 use ssh_broker::shim::spawn_line;
 use ssh_broker::socket_loc;
@@ -103,7 +104,12 @@ impl Rig {
     }
 
     fn broker_is_default_shell(&self) {
-        set_default_shell_under(OPENSSH_KEY, &self.kit.exe.to_string_lossy()).expect("set the shim as DefaultShell");
+        set_default_shell_under(
+            OPENSSH_KEY,
+            &self.kit.exe.to_string_lossy(),
+            &Handover::nothing_to_carry(),
+        )
+        .expect("set the shim as DefaultShell");
     }
 
     /// `ssh host -- command` with (`tty`) or without a terminal.

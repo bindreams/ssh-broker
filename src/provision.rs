@@ -14,6 +14,8 @@ pub mod bounded;
 #[cfg(windows)]
 mod flow;
 #[cfg(windows)]
+pub mod handover;
+#[cfg(windows)]
 pub(crate) mod layout;
 #[cfg(windows)]
 pub mod password_variant;
@@ -140,6 +142,7 @@ mod provision_tests;
 
 #[cfg(windows)]
 mod imp {
+    use super::handover::{Handover, hand_over, hand_over_unreadable, say_to_console};
     use super::layout::{self, Layout};
     use super::{
         apply_lock, flow, probe, procwait, registry, report, schtasks, session_task, sessions, system_config,
@@ -202,8 +205,8 @@ mod imp {
                 //    DefaultShell pair LAST and only to the validated canonical path; read that back
                 //    too. sshd reads these once per session, so the shim cannot ask later which form
                 //    sshd used: `apply` owns the flag (see `registry::desired_values`).
-                carry_previous_shell(&base);
-                registry::set_default_shell_under(registry::OPENSSH_KEY, &exe.to_string_lossy())
+                let handover = carry_previous_shell(&base);
+                registry::set_default_shell_under(registry::OPENSSH_KEY, &exe.to_string_lossy(), &handover)
                     .context("write the DefaultShell values")?;
                 let (shell, opt) = registry::read_default_shell_under(registry::OPENSSH_KEY)?;
                 anyhow::ensure!(
@@ -227,16 +230,13 @@ mod imp {
 
     /// Write the system config from the shell sshd runs now, if it is not ssh-broker and there is no
     /// config yet (see [`system_config`]). Must run before the registry is overwritten. The install is
-    /// complete without the config, so a failure is said on stderr and `apply` goes on.
-    fn carry_previous_shell(base: &layout::TrustedBase<'_>) {
+    /// complete without the config, so a failure is said on stderr and `apply` goes on; the
+    /// [`Handover`] it returns is what the flip takes.
+    fn carry_previous_shell(base: &layout::TrustedBase<'_>) -> Handover {
+        let mut say = say_to_console;
         let previous = match registry::read_sshd_shell_under(registry::OPENSSH_KEY) {
             Ok(previous) => previous,
-            Err(e) => {
-                eprintln!(
-                    "apply: could not read the shell sshd uses now, so it is not carried into config.yaml: {e:#}"
-                );
-                return;
-            }
+            Err(e) => return hand_over_unreadable(&e, &mut say),
         };
         let config = base.layout().system_config_path();
         let config_exists = config
@@ -269,24 +269,13 @@ mod imp {
             })
         };
         let decision = system_config::decide(&previous, config_exists, &search, &find, &is_system_cmd);
-        match decision {
-            system_config::Decision::Write(block) => match system_config::create_once(base, &block) {
-                Ok(true) => {
-                    println!(
-                        "apply: wrote {} from the shell sshd used before ({})",
-                        config.display(),
-                        previous.shell.as_deref().unwrap_or_default()
-                    );
-                }
-                Ok(false) => {}
-                Err(e) => eprintln!("{}", system_config::not_written(&config, &previous, &format!("{e:#}"))),
-            },
-            system_config::Decision::Skip(skip) => {
-                if let Some(notice) = system_config::skip_notice(&config, &previous, &skip) {
-                    eprintln!("{notice}");
-                }
-            }
-        }
+        hand_over(
+            &config,
+            &previous,
+            decision,
+            |block| system_config::create_once(base, block),
+            &mut say,
+        )
     }
 
     /// Remove `DefaultShellArguments` once `DefaultShell` is ssh-broker and `config` is a file:

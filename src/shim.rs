@@ -424,9 +424,16 @@ pub fn fail_open<T>(
             tell(&mut *stderr, &notice);
         }
     })
-    .and_then(finish);
+    .and_then(|(started, configured)| finish(started).map(|code| (code, configured)));
     match started {
-        Ok(code) => code,
+        Ok((code, configured)) => {
+            // A configured shell that ends with the loader's "DLL not found" status has said nothing.
+            if let Some(notice) = configured.and_then(|shell| shell.exit_notice(code)) {
+                tracing::warn!("{notice}");
+                tell(stderr, &notice);
+            }
+            code
+        }
         Err(e) => {
             tracing::error!("fail-open spawn of {:?} failed: {e:?}", plan.command_line);
             tell(stderr, &format!("ssh-broker: could not run the command locally: {e}"));

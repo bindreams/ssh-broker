@@ -96,6 +96,7 @@ pub const OPENSSH_KEY: &str = r"SOFTWARE\OpenSSH";
 #[cfg(windows)]
 mod win {
     use super::{ESCAPE_ARGUMENTS, RegValue, SSHD_VALUE_BYTES, SshdShell, desired_values};
+    use crate::provision::handover::Handover;
     use anyhow::Context;
     use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_MORE_DATA, ERROR_PATH_NOT_FOUND, WIN32_ERROR};
     use windows::Win32::System::Registry::{
@@ -311,8 +312,9 @@ mod win {
         read_image_path_in(windows::Win32::System::Registry::HKEY_CURRENT_USER, subkey)
     }
 
-    /// Production: write [`desired_values`] under `HKLM\<subkey>`.
-    pub fn set_default_shell_under(subkey: &str, exe: &str) -> anyhow::Result<()> {
+    /// Production: write [`desired_values`] under `HKLM\<subkey>`. The `handover` is the proof that the
+    /// shell this replaces was carried into the config, printed, or absent.
+    pub fn set_default_shell_under(subkey: &str, exe: &str, _handover: &Handover) -> anyhow::Result<()> {
         set_under(HKEY_LOCAL_MACHINE, subkey, exe, || {
             escape_arguments_in(HKEY_LOCAL_MACHINE, subkey)
         })

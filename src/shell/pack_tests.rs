@@ -3,8 +3,8 @@
 use std::path::PathBuf;
 
 use super::{
-    Session, Source, StartError, built_in_plan, defaults, effective, plan, render, resolve_program, resolve_program_in,
-    start_or_fall_back,
+    ConfiguredShell, Session, Source, StartError, built_in_plan, defaults, effective, plan, render, resolve_program,
+    resolve_program_in, start_or_fall_back,
 };
 use crate::cmdline::split_args;
 use crate::shell::test_host::{SYSTEM_CMD, TestHost};
@@ -862,4 +862,69 @@ fn the_given_directories_are_searched_in_order_before_path() {
         resolve_program_in(&host, &dirs, r"C:\first\sh.exe"),
         Ok(PathBuf::from(r"C:\first\sh.exe"))
     );
+}
+
+// the configured shell that ran =====
+
+const DLL_NOT_FOUND: i32 = 0xC000_0135_u32 as i32;
+
+/// The shell `start_or_fall_back` reports as having started, for a spawn that refuses `refused`.
+fn started_shell(host: &TestHost, refused: &str) -> Option<ConfiguredShell> {
+    let first = plan(host, &Session::Interactive).unwrap();
+    let tried = std::cell::RefCell::new(Vec::new());
+    start_or_fall_back(host, &Session::Interactive, &first, spawner(refused, &tried), |_| {})
+        .unwrap()
+        .1
+}
+
+#[test]
+fn a_configured_shell_that_starts_is_reported_as_the_one_that_ran() {
+    let shell = started_shell(&pwsh_host(), "never").expect("the configured shell ran");
+    let notice = shell
+        .exit_notice(DLL_NOT_FOUND)
+        .expect("a notice for the loader status");
+    for part in [
+        crate::shell::test_host::USER_CONFIG,
+        "`shell.start`",
+        "pwsh.exe",
+        "0xC0000135",
+        "STATUS_DLL_NOT_FOUND",
+    ] {
+        assert!(notice.contains(part), "{part}: {notice}");
+    }
+}
+
+#[test]
+fn a_system_config_shell_is_named_with_the_system_file() {
+    let host = TestHost::new().with_program("pwsh.exe", PWSH).with_system_config(
+        "shell: pwsh.exe
+",
+    );
+    let shell = started_shell(&host, "never").expect("the configured shell ran");
+    let notice = shell.exit_notice(DLL_NOT_FOUND).unwrap();
+    assert!(notice.contains(crate::shell::test_host::SYSTEM_CONFIG), "{notice}");
+}
+
+#[test]
+fn the_built_in_cmd_exe_and_a_replacement_for_a_shell_that_could_not_start_are_not_configured_shells() {
+    assert_eq!(started_shell(&TestHost::new(), "never"), None);
+    assert_eq!(started_shell(&pwsh_host(), "pwsh.exe"), None);
+}
+
+#[test]
+fn only_the_loader_status_gets_a_notice() {
+    let shell = started_shell(&pwsh_host(), "never").unwrap();
+    for code in [
+        0,
+        1,
+        2,
+        255,
+        0xC000_0142_u32 as i32,
+        0xC000_0005_u32 as i32,
+        -1,
+        i32::MIN,
+        0x135,
+    ] {
+        assert_eq!(shell.exit_notice(code), None, "{code:#x}");
+    }
 }

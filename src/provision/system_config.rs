@@ -123,7 +123,8 @@ pub type SearchDirs<'a> = dyn Fn() -> Result<Vec<PathBuf>, String> + 'a;
 /// Whether `apply` writes the config, and what. `config_exists` is whether the config is there, or
 /// why that is not known. `search_dirs` is called only once the decision needs the directories, so
 /// a failure to find them is not reported when nothing depends on it. `find` finds the file the
-/// previous shell names in them, as sshd finds it ([`sshd_search_dirs`]), or says why there is none; `is_system_cmd` says whether that file is the system `cmd.exe`. A bare name is carried as
+/// previous shell names in them, as sshd finds it ([`sshd_search_dirs`]), or says why there is none;
+/// `is_system_cmd` says whether that file is the system `cmd.exe`. A bare name is carried as
 /// the file found, because a session searches `PATH` alone and sshd searched more. Nothing that
 /// could not be found out is reported while it does not matter: with no previous shell, or ssh-broker's
 /// own, nothing is replaced, and a config that is there is never rewritten.

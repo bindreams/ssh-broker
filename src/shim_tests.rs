@@ -886,6 +886,33 @@ fn fail_open_runs_cmd_exe_and_warns_when_the_shell_exists_and_cannot_start() {
     }
 }
 
+const DLL_NOT_FOUND: i32 = 0xC000_0135_u32 as i32;
+
+/// A configured shell that ends with the loader's "DLL not found" status has said nothing, so `fail_open`
+/// says it on stderr, naming the setting; any other code, and a shell no setting names, get nothing.
+#[test]
+fn fail_open_warns_when_the_configured_shell_ends_with_dll_not_found_and_only_then() {
+    for exec in [exec("echo hi", false), exec("echo hi", true), None] {
+        let (code, _, stderr) = failed_open(&pwsh_host(), &exec, Ok(DLL_NOT_FOUND));
+        assert_eq!(code, DLL_NOT_FOUND, "{exec:?}");
+        assert!(
+            stderr.contains(USER_CONFIG)
+                && stderr.contains("`shell.start`")
+                && stderr.contains("pwsh.exe")
+                && stderr.contains("STATUS_DLL_NOT_FOUND"),
+            "{exec:?}: {stderr:?}"
+        );
+        assert_eq!(stderr.matches("STATUS_DLL_NOT_FOUND").count(), 1, "{stderr:?}");
+        for other in [0, 1, 255, 0xC000_0142_u32 as i32] {
+            let (code, _, stderr) = failed_open(&pwsh_host(), &exec, Ok(other));
+            assert_eq!((code, stderr.as_str()), (other, ""), "{exec:?}");
+        }
+        // No setting names the built-in cmd.exe.
+        let (_, _, stderr) = failed_open(&TestHost::new(), &exec, Ok(DLL_NOT_FOUND));
+        assert_eq!(stderr, "", "{exec:?}");
+    }
+}
+
 /// A shell that started and then failed on the broker's side (its exit code could not be read) has run the
 /// command; running the command again through cmd.exe would run it twice.
 #[test]

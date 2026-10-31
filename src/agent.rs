@@ -722,6 +722,16 @@ fn show_notice(tx: &mut ConnTx, mode: Mode, text: &str) {
     }
 }
 
+/// Warn that the session's shell ended with the loader's "DLL not found" status, as the last data of
+/// the session: before the exit code, after everything the shell wrote. Nothing for any other code.
+#[cfg(windows)]
+fn show_exit_notice(tx: &mut ConnTx, mode: Mode, shell: Option<&crate::shell::ConfiguredShell>, code: i32) {
+    if let Some(text) = shell.and_then(|shell| shell.exit_notice(code)) {
+        tracing::warn!("{text}");
+        show_notice(tx, mode, &text);
+    }
+}
+
 /// The handshake that opens a connection. `None` if the client closed the connection before it sent
 /// a byte: the wake that ends the accept loop does, and a client that gave up does; neither is a fault.
 #[cfg(windows)]
@@ -821,8 +831,8 @@ fn handle_pty(
         },
         |text| show_notice(&mut tx, Mode::Pty, text),
     );
-    let mut session = match started {
-        Ok(session) => session,
+    let (mut session, configured) = match started {
+        Ok(started) => started,
         Err(cause) => {
             return Err(logout::fail_connection(
                 &mut rx,
@@ -928,6 +938,7 @@ fn handle_pty(
         // The shell is gone and the output is drained, so the code is final and nothing else
         // can still be writing frames.
         let mut g = tx_arc.lock().unwrap();
+        show_exit_notice(&mut g, Mode::Pty, configured.as_ref(), code);
         // FIN the write half only: the input pump keeps reading until the client closes, so for a
         // conforming client the socket never closes with unread input, which would reset it and
         // lose the EXIT frame.
@@ -1089,8 +1100,8 @@ fn handle_exec(
         },
         |text| show_notice(&mut tx, Mode::Exec, text),
     );
-    let mut child = match started {
-        Ok(child) => child,
+    let (mut child, configured) = match started {
+        Ok(started) => started,
         Err(cause) => {
             return Err(logout::fail_connection(
                 &mut rx,
@@ -1153,6 +1164,7 @@ fn handle_exec(
     let _ = t_err.join();
     {
         let mut g = tx_arc.lock().unwrap();
+        show_exit_notice(&mut g, Mode::Exec, configured.as_ref(), code);
         // FIN the write half only: the stdin pump keeps reading until the client closes, so for a
         // conforming client the socket never closes with unread input, which would reset it and
         // lose the EXIT frame.

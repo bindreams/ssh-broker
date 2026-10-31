@@ -85,6 +85,42 @@ pub struct Effective {
     pub problem: Option<Problem>,
 }
 
+/// `STATUS_DLL_NOT_FOUND`: the loader ends a program with it when one of its imports is missing.
+const STATUS_DLL_NOT_FOUND: u32 = 0xC000_0135;
+
+/// A shell that a config file names, for the warning when it ends with the loader's "DLL not found"
+/// status. A program whose import is missing starts, then ends at once with no output, so there is no
+/// start error to show and no fallback: the user is told which setting names it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfiguredShell {
+    file: PathBuf,
+    value: String,
+}
+
+impl ConfiguredShell {
+    /// The configured shell `plan` starts; `None` for the built-in `cmd.exe`, which no setting names.
+    fn of(plan: &Plan) -> Option<Self> {
+        let (Origin::User(file) | Origin::System(file)) = &plan.effective.origin else {
+            return None;
+        };
+        Some(Self {
+            file: file.clone(),
+            value: plan.effective.start.first().cloned().unwrap_or_default(),
+        })
+    }
+
+    /// The warning for a session whose shell ended with `code`: only for `STATUS_DLL_NOT_FOUND`.
+    pub fn exit_notice(&self, code: i32) -> Option<String> {
+        (code as u32 == STATUS_DLL_NOT_FOUND).then(|| {
+            format!(
+                "ssh-broker: the shell from {} (`shell.start`: {}) ended with 0xC0000135 (STATUS_DLL_NOT_FOUND): a                  DLL that the shell, or a program it ran last, needs was not found",
+                self.file.display(),
+                self.value
+            )
+        })
+    }
+}
+
 /// The line to start for a session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Plan {
@@ -371,16 +407,17 @@ pub fn built_in_plan(host: &dyn Host, session: &Session<'_>, problem: Option<Pro
 /// that names the file, the value and the OS error. `warn` gets that replacement plan
 /// ([`Plan::notice`]) just before it is started, so the warning precedes the shell. Any other
 /// failure, a failure of the built-in itself and a failure of the replacement are the error: there
-/// is nothing left to fall to, and one try is all each gets.
+/// is nothing left to fall to, and one try is all each gets. Alongside what started comes the
+/// configured shell it is, when it is one (not the built-in, and not a replacement for one).
 pub fn start_or_fall_back<T>(
     host: &dyn Host,
     session: &Session<'_>,
     plan: &Plan,
     mut spawn: impl FnMut(&str) -> Result<T, StartError>,
     warn: impl FnOnce(&Plan),
-) -> anyhow::Result<T> {
+) -> anyhow::Result<(T, Option<ConfiguredShell>)> {
     let error = match spawn(&plan.command_line) {
-        Ok(started) => return Ok(started),
+        Ok(started) => return Ok((started, ConfiguredShell::of(plan))),
         Err(StartError::Other(cause)) => return Err(cause),
         Err(StartError::Program(error)) => error,
     };
@@ -405,7 +442,9 @@ pub fn start_or_fall_back<T>(
         }
     };
     warn(&replacement);
-    spawn(&replacement.command_line).map_err(StartError::into_cause)
+    spawn(&replacement.command_line)
+        .map(|started| (started, None))
+        .map_err(StartError::into_cause)
 }
 
 #[cfg(test)]

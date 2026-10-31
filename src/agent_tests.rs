@@ -1367,3 +1367,50 @@ fn a_broken_config_sends_one_warning_then_runs_cmd_exe() {
     assert!(stderr.starts_with(&notice), "{stderr:?}");
     assert_eq!(stderr.matches("cannot use the shell").count(), 1, "{stderr:?}");
 }
+
+/// A configured shell whose import is missing starts, then ends with the loader's status and no output
+/// (`examples/missing_dll.rs`). There is no fallback: the session ends with that status, after a warning
+/// that names the setting. A shell that exits normally gets no such warning.
+#[test]
+fn a_configured_shell_that_ends_with_dll_not_found_gets_a_warning_naming_the_setting() {
+    use windows::Win32::System::Diagnostics::Debug::{SEM_FAILCRITICALERRORS, SetErrorMode};
+    const STATUS_DLL_NOT_FOUND: i32 = 0xC000_0135_u32 as i32;
+    // SAFETY: no pointers. This process's own mode, so that the loader ends the program instead of raising a box.
+    unsafe { SetErrorMode(SEM_FAILCRITICALERRORS) };
+    use crate::shell::test_host::{TestHost, USER_CONFIG};
+    let exe = crate::command_line_probe::example("missing_dll");
+    let host = || {
+        TestHost::new()
+            .with_bytes(&exe.to_string_lossy(), b"MZ")
+            .with_user_config(&format!(
+                "shell: '{}'
+",
+                exe.display()
+            ))
+    };
+    for (tag, mode, command) in [
+        ("dll-exec", Mode::Exec, Some("echo hi")),
+        ("dll-pty-command", Mode::Pty, Some("echo hi")),
+        ("dll-pty-login", Mode::Pty, None),
+    ] {
+        let (outcome, stdout, stderr) = shell_session(tag, mode, command, host());
+        assert_eq!(
+            outcome,
+            Outcome::Exited(STATUS_DLL_NOT_FOUND),
+            "{tag}: {stdout:?} {stderr:?}"
+        );
+        let seen = format!("{stdout}{stderr}");
+        for part in [USER_CONFIG, "`shell.start`", "STATUS_DLL_NOT_FOUND"] {
+            assert!(seen.contains(part), "{tag}: {part}: {seen:?}");
+        }
+        assert_eq!(seen.matches("STATUS_DLL_NOT_FOUND").count(), 1, "{tag}: {seen:?}");
+    }
+
+    let shell = ProbeShell::new("dll-none");
+    let (outcome, stdout, stderr) = shell_session("dll-none-run", Mode::Exec, Some("echo hi"), shell.host());
+    assert_eq!(outcome, Outcome::Exited(0), "{stderr}");
+    assert!(
+        !format!("{stdout}{stderr}").contains("STATUS_DLL_NOT_FOUND"),
+        "{stdout:?} {stderr:?}"
+    );
+}

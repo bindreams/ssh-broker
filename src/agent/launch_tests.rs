@@ -156,7 +156,7 @@ fn a_shell_that_cannot_start_is_replaced_by_cmd_exe_and_the_warning_names_the_er
         let first = launched(&hs, &host);
         let mut tried = Vec::new();
         let mut notice = None;
-        let started = start(
+        let (started, configured) = start(
             &host,
             &first,
             None,
@@ -174,6 +174,7 @@ fn a_shell_that_cannot_start_is_replaced_by_cmd_exe_and_the_warning_names_the_er
         )
         .unwrap();
         assert!(started.starts_with(SYSTEM_CMD), "{started}");
+        assert_eq!(configured, None, "the built-in cmd.exe is not a configured shell");
         assert_eq!(tried.len(), 2, "{tried:?}");
         let notice = notice.expect("a warning for the replacement");
         assert!(

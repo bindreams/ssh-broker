@@ -6,7 +6,7 @@ use std::cell::Cell;
 use std::path::Path;
 
 use crate::protocol::{Handshake, Launch, Mode, Stream};
-use crate::shell::{self, Session, StartError};
+use crate::shell::{self, ConfiguredShell, Session, StartError};
 
 /// The line to spawn, and a warning for the user when the configured shell could not be used.
 #[derive(Debug, PartialEq, Eq)]
@@ -87,15 +87,21 @@ pub(super) enum Spawn<'a> {
 /// inside the console. The verb is an enhancement, never a way to lose the session: if it cannot be
 /// started, or there is no `verb`, `warn` gets the warning's text just before the shell is spawned
 /// as a [`Spawn::Line`].
+///
+/// With what started comes the configured shell it is, so the caller can warn if it ends with the
+/// loader's "DLL not found" status (see [`ConfiguredShell`]); `None` for a direct launch, the
+/// built-in `cmd.exe` and a replacement for a shell that could not start.
 pub(super) fn start<T>(
     host: &dyn shell::Host,
     launched: &Launched<'_>,
     verb: Option<&Path>,
     mut spawn: impl FnMut(Spawn<'_>) -> Result<T, StartError>,
     mut warn: impl FnMut(&str),
-) -> anyhow::Result<T> {
+) -> anyhow::Result<(T, Option<ConfiguredShell>)> {
     let Some((session, plan)) = &launched.shell else {
-        return spawn(Spawn::Line(&launched.line)).map_err(StartError::into_cause);
+        return spawn(Spawn::Line(&launched.line))
+            .map(|started| (started, None))
+            .map_err(StartError::into_cause);
     };
     let login = matches!(session, Session::Interactive);
     // The warning for the line `start_or_fall_back` spawns next.
