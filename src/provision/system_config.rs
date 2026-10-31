@@ -103,7 +103,13 @@ pub enum Skip {
     /// The previous shell is not a file that exists, found as sshd finds it (the string is why not);
     /// a config naming it would not start.
     PreviousMissing(String),
+    /// What the decision needs could not be found out (whether the config is there, or the
+    /// directories to look for the shell in); the string says what.
+    Unchecked(String),
 }
+
+/// Finds the file a shell names in the directories given, or says why there is none.
+pub type Find<'a> = dyn Fn(&[PathBuf], &Path) -> Result<PathBuf, String> + 'a;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Decision {
@@ -111,14 +117,18 @@ pub enum Decision {
     Skip(Skip),
 }
 
-/// Whether `apply` writes the config, and what. `find` finds the file the previous shell names, as
-/// sshd finds it ([`sshd_search_dirs`]), or says why there is none; `is_system_cmd` says whether that
-/// file is the system `cmd.exe`. A bare name is carried as the file found, because a session searches
-/// `PATH` alone and sshd searched more.
+/// Whether `apply` writes the config, and what. `config_exists` is whether the config is there, or
+/// why that is not known. `find` finds the file the previous shell names in `search_dirs` (or says
+/// why the directories are not known), as sshd finds it ([`sshd_search_dirs`]), or says why there is
+/// none; `is_system_cmd` says whether that file is the system `cmd.exe`. A bare name is carried as
+/// the file found, because a session searches `PATH` alone and sshd searched more. Nothing that
+/// could not be found out is reported while it does not matter: with no previous shell, or ssh-broker's
+/// own, nothing is replaced, and a config that is there is never rewritten.
 pub fn decide(
     prev: &SshdShell,
-    config_exists: bool,
-    find: &dyn Fn(&Path) -> Result<PathBuf, String>,
+    config_exists: Result<bool, String>,
+    search_dirs: Result<&[PathBuf], String>,
+    find: &Find,
     is_system_cmd: &dyn Fn(&Path) -> bool,
 ) -> Decision {
     let Some(shell) = prev.shell.as_deref() else {
@@ -128,10 +138,16 @@ pub fn decide(
     if file_name.eq_ignore_ascii_case(super::EXE_NAME) {
         return Decision::Skip(Skip::PreviousIsSshBroker);
     }
-    if config_exists {
-        return Decision::Skip(Skip::FileExists);
+    match config_exists {
+        Err(cause) => return Decision::Skip(Skip::Unchecked(cause)),
+        Ok(true) => return Decision::Skip(Skip::FileExists),
+        Ok(false) => {}
     }
-    let found = match find(Path::new(shell)) {
+    let dirs = match search_dirs {
+        Ok(dirs) => dirs,
+        Err(cause) => return Decision::Skip(Skip::Unchecked(cause)),
+    };
+    let found = match find(dirs, Path::new(shell)) {
         Ok(found) => found,
         Err(why) => return Decision::Skip(Skip::PreviousMissing(why)),
     };
@@ -157,34 +173,46 @@ fn previous_values(previous: &SshdShell) -> String {
     )
 }
 
-/// The warning for a config that could not be written: `apply` still replaces `DefaultShell`, so
-/// this holds the values of the shell it replaces, which nothing else keeps.
-pub fn not_written(config: &Path, previous: &SshdShell, cause: &str) -> String {
+/// The warning for a previous shell that is not carried: `apply` still replaces `DefaultShell`, so
+/// this holds every value of the shell it replaces, which nothing else keeps. `reason` says why it is
+/// not carried.
+fn not_carried(config: &Path, previous: &SshdShell, reason: &str) -> String {
     format!(
-        "apply: could not write {config}: {cause}; DefaultShell is replaced all the same. The shell sshd used \
-         before is in no config; to restore it, put it in that config or under {values}",
+        "apply: {reason}, so the shell sshd used before is not carried into {config}; DefaultShell is replaced \
+         all the same. To restore it, put it in that config or under {values}",
         config = config.display(),
         values = previous_values(previous),
     )
 }
 
-/// The warning for a previous shell that is not carried because sshd could not have started it
-/// (`why`): `apply` still replaces `DefaultShell`, so this holds every value of the shell it
-/// replaces, as [`not_written`] does.
-pub fn previous_missing(config: &Path, previous: &SshdShell, why: &str) -> String {
-    format!(
-        "apply: the shell sshd uses now ({shell}) cannot be used: {why}, so it is not carried into {config}; \
-         DefaultShell is replaced all the same. To restore it, put it in that config or under {values}",
-        shell = previous.shell.as_deref().unwrap_or_default(),
-        config = config.display(),
-        values = previous_values(previous),
+/// The warning for a config that could not be written.
+pub fn not_written(config: &Path, previous: &SshdShell, cause: &str) -> String {
+    not_carried(
+        config,
+        previous,
+        &format!("could not write {}: {cause}", config.display()),
     )
+}
+
+/// The warning for a [`Skip`] that leaves the previous shell uncarried while `apply` replaces it;
+/// none for a skip that replaces nothing.
+pub fn skip_notice(config: &Path, previous: &SshdShell, skip: &Skip) -> Option<String> {
+    let reason = match skip {
+        Skip::PreviousIsSshBroker | Skip::NoPreviousShell => return None,
+        Skip::FileExists => format!("{} is already there and is never rewritten", config.display()),
+        Skip::PreviousMissing(why) => format!(
+            "the shell sshd uses now ({}) cannot be used: {why}",
+            previous.shell.as_deref().unwrap_or_default()
+        ),
+        Skip::Unchecked(cause) => cause.clone(),
+    };
+    Some(not_carried(config, previous, &reason))
 }
 
 /// The directories sshd's `CreateProcess` searches for a bare `DefaultShell` before `PATH`, in its
 /// order: the directory of sshd itself (`image_path`, the service's `ImagePath`, when it is known),
-/// the working directory (a service's is the system directory), the system directory and the Windows
-/// directory.
+/// the working directory (a service's is the system directory, as `tests/shell_sshd_windows.rs` measures, so
+/// it is not listed apart), the system directory and the Windows directory.
 pub fn sshd_search_dirs(host: &dyn Host, image_path: Option<&str>) -> anyhow::Result<Vec<PathBuf>> {
     let system_dir = host
         .system_cmd()?

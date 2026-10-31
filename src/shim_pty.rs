@@ -468,7 +468,12 @@ fn ignore_ctrl_c() {
         if let Err(e) = unsafe { SetConsoleCtrlHandler(Some(ctrl_handler), true) } {
             // The user can end the session with Ctrl+C from here on, so they are told, as well as the log.
             tracing::warn!("could not keep this process through Ctrl+C: {e}");
-            eprintln!("ssh-broker: could not keep this process through Ctrl+C ({e}); Ctrl+C may end the session");
+            // `eprintln!` panics on a broken stderr; the log has the failure either way.
+            use std::io::Write as _;
+            let _ = writeln!(
+                std::io::stderr(),
+                "ssh-broker: could not keep this process through Ctrl+C ({e}); Ctrl+C may end the session"
+            );
         }
     });
 }

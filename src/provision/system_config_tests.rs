@@ -4,8 +4,8 @@
 use std::path::{Path, PathBuf};
 
 use super::{
-    Decision, Skip, SshdClass, carried_block, classify, create_once_at, decide, image_dir, not_written,
-    previous_missing, remove_temp, render, sshd_search_dirs,
+    Decision, Skip, SshdClass, carried_block, classify, create_once_at, decide, image_dir, not_written, remove_temp,
+    render, skip_notice, sshd_search_dirs,
 };
 use crate::provision::registry::SshdShell;
 use crate::shell::Escaping;
@@ -181,9 +181,10 @@ fn the_message_for_a_config_that_could_not_be_written_holds_every_carried_value(
 
 #[test]
 fn decide_table() {
-    let exists = |p: &Path| Ok(p.to_path_buf());
-    let missing = |_: &Path| Err("there is no such file".to_string());
+    let exists = |_: &[PathBuf], p: &Path| Ok(p.to_path_buf());
+    let missing = |_: &[PathBuf], _: &Path| Err("there is no such file".to_string());
     let not_system = |_: &Path| false;
+    let dirs: Result<&[PathBuf], String> = Ok(&[]);
 
     for own in [
         r"C:\ProgramData\ssh-broker\ssh-broker.exe",
@@ -192,7 +193,7 @@ fn decide_table() {
         "ssh-broker.exe",
     ] {
         assert_eq!(
-            decide(&sshd(own), false, &exists, &not_system),
+            decide(&sshd(own), Ok(false), dirs.clone(), &exists, &not_system),
             Decision::Skip(Skip::PreviousIsSshBroker),
             "{own}"
         );
@@ -205,28 +206,79 @@ fn decide_table() {
         escape_arguments: false,
     };
     assert_eq!(
-        decide(&none, false, &exists, &not_system),
+        decide(&none, Ok(false), dirs.clone(), &exists, &not_system),
         Decision::Skip(Skip::NoPreviousShell)
     );
 
     assert_eq!(
-        decide(&sshd(PWSH7), true, &exists, &not_system),
+        decide(&sshd(PWSH7), Ok(true), dirs.clone(), &exists, &not_system),
         Decision::Skip(Skip::FileExists)
     );
     assert_eq!(
-        decide(&sshd(PWSH7), false, &missing, &not_system),
+        decide(&sshd(PWSH7), Ok(false), dirs.clone(), &missing, &not_system),
         Decision::Skip(Skip::PreviousMissing("there is no such file".into()))
     );
-    match decide(&sshd(PWSH7), false, &exists, &not_system) {
+    match decide(&sshd(PWSH7), Ok(false), dirs.clone(), &exists, &not_system) {
         Decision::Write(block) => assert_eq!(block.start, [PWSH7]),
         other => panic!("{other:?}"),
     }
     // The identity of the shell decides which defaults it is compared with.
     let system_cmd = |p: &Path| p == Path::new(r"C:\Windows\System32\cmd.exe");
-    match decide(&sshd(r"C:\Windows\System32\cmd.exe"), false, &exists, &system_cmd) {
+    match decide(
+        &sshd(r"C:\Windows\System32\cmd.exe"),
+        Ok(false),
+        dirs,
+        &exists,
+        &system_cmd,
+    ) {
         Decision::Write(block) => assert_eq!((block.with_command, block.escaping), (None, None)),
         other => panic!("{other:?}"),
     }
+}
+
+/// What `apply` could not find out is not a reason to say nothing: the config that may or may not be
+/// there, or the directories to look for the shell in, make the shell not carried, and the decision
+/// says so. A shell that is replaced by nothing, or a config that is there anyway, does not wait on them.
+#[test]
+fn decide_reports_what_it_could_not_find_out_unless_nothing_depends_on_it() {
+    let exists = |_: &[PathBuf], p: &Path| Ok(p.to_path_buf());
+    let not_system = |_: &Path| false;
+    let no_dirs: Result<&[PathBuf], String> = Err("no system directory".into());
+    let no_config: Result<bool, String> = Err("cannot tell whether c.yaml exists".into());
+
+    assert_eq!(
+        decide(&sshd(PWSH7), no_config.clone(), Ok(&[]), &exists, &not_system),
+        Decision::Skip(Skip::Unchecked("cannot tell whether c.yaml exists".into()))
+    );
+    assert_eq!(
+        decide(&sshd(PWSH7), Ok(false), no_dirs.clone(), &exists, &not_system),
+        Decision::Skip(Skip::Unchecked("no system directory".into()))
+    );
+    // A config that is there decides first; and with no previous shell, or ssh-broker's own, nothing is replaced.
+    assert_eq!(
+        decide(&sshd(PWSH7), Ok(true), no_dirs.clone(), &exists, &not_system),
+        Decision::Skip(Skip::FileExists)
+    );
+    assert_eq!(
+        decide(
+            &sshd(r"C:\x\ssh-broker.exe"),
+            no_config.clone(),
+            no_dirs.clone(),
+            &exists,
+            &not_system
+        ),
+        Decision::Skip(Skip::PreviousIsSshBroker)
+    );
+    let none = SshdShell {
+        shell: None,
+        command_option: None,
+        arguments: None,
+        escape_arguments: true,
+    };
+    assert_eq!(
+        decide(&none, no_config, no_dirs, &exists, &not_system),
+        Decision::Skip(Skip::NoPreviousShell)
+    );
 }
 
 /// A bare `DefaultShell` is found where sshd found it, which a session (it searches `PATH` only)
@@ -234,10 +286,10 @@ fn decide_table() {
 /// carried options are still judged by the name sshd was given.
 #[test]
 fn a_bare_shell_is_carried_as_the_file_sshd_found() {
-    let found = |_: &Path| Ok(PathBuf::from(r"C:\Program Files\OpenSSH\powershell7.exe"));
+    let found = |_: &[PathBuf], _: &Path| Ok(PathBuf::from(r"C:\Program Files\OpenSSH\powershell7.exe"));
     let mut prev = sshd("powershell7");
     prev.command_option = Some("-Command".into());
-    match decide(&prev, false, &found, &|_| false) {
+    match decide(&prev, Ok(false), Ok(&[]), &found, &|_| false) {
         Decision::Write(block) => {
             assert_eq!(block.start, [r"C:\Program Files\OpenSSH\powershell7.exe"]);
             assert_eq!(block.with_command, Some(vec!["-Command".to_string()]));
@@ -245,7 +297,7 @@ fn a_bare_shell_is_carried_as_the_file_sshd_found() {
         other => panic!("{other:?}"),
     }
     // A path is carried as written.
-    match decide(&sshd(r"C:\x\pwsh"), false, &found, &|_| false) {
+    match decide(&sshd(r"C:\x\pwsh"), Ok(false), Ok(&[]), &found, &|_| false) {
         Decision::Write(block) => assert_eq!(block.start, [r"C:\x\pwsh"]),
         other => panic!("{other:?}"),
     }
@@ -253,34 +305,47 @@ fn a_bare_shell_is_carried_as_the_file_sshd_found() {
 
 // the previous shell is missing =====
 
-/// `apply` replaces `DefaultShell` all the same, so the message for a shell it cannot carry holds
-/// every value of it, as the message for a config it cannot write does.
+/// `apply` replaces `DefaultShell` whenever it does not carry the shell, so each way of not carrying it
+/// says so with every value of the shell it replaces, as the message for a config it cannot write does.
+/// Nothing is said when nothing is replaced.
 #[test]
-fn the_message_for_a_previous_shell_that_is_missing_holds_every_previous_value() {
+fn every_skip_that_replaces_a_shell_without_carrying_it_holds_every_previous_value() {
     let prev = SshdShell {
         shell: Some(PWSH7.into()),
         command_option: Some("-NoLogo -c".into()),
         arguments: Some("-NoProfile".into()),
         escape_arguments: false,
     };
-    let text = previous_missing(
-        Path::new(r"C:\ProgramData\ssh-broker\config.yaml"),
-        &prev,
-        "there is no such file",
-    );
-    for part in [
-        r"C:\ProgramData\ssh-broker\config.yaml",
-        "there is no such file",
-        PWSH7,
-        "-NoLogo -c",
-        "-NoProfile",
-        "escape arguments = no",
-        "DefaultShellCommandOption",
-        "DefaultShellArguments",
+    let config = Path::new(r"C:\ProgramData\ssh-broker\config.yaml");
+    for (skip, cause) in [
+        (Skip::FileExists, "is already there"),
+        (
+            Skip::PreviousMissing("there is no such file".into()),
+            "there is no such file",
+        ),
+        (
+            Skip::Unchecked("cannot tell whether the config exists".into()),
+            "cannot tell whether the config exists",
+        ),
     ] {
-        assert!(text.contains(part), "{part}: {text}");
+        let text = skip_notice(config, &prev, &skip).unwrap_or_else(|| panic!("{skip:?} says nothing"));
+        for part in [
+            r"C:\ProgramData\ssh-broker\config.yaml",
+            cause,
+            PWSH7,
+            "-NoLogo -c",
+            "-NoProfile",
+            "escape arguments = no",
+            "DefaultShellCommandOption",
+            "DefaultShellArguments",
+            "DefaultShell is replaced all the same",
+        ] {
+            assert!(text.contains(part), "{skip:?}: {part}: {text}");
+        }
+        assert!(!text.contains("escape arguments = yes"), "{skip:?}: {text}");
     }
-    assert!(!text.contains("escape arguments = yes"), "{text}");
+    assert_eq!(skip_notice(config, &prev, &Skip::PreviousIsSshBroker), None);
+    assert_eq!(skip_notice(config, &prev, &Skip::NoPreviousShell), None);
 }
 
 // sshd's search =====

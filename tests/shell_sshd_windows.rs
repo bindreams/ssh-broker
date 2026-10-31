@@ -37,6 +37,8 @@ mod logon_session;
 mod machine;
 #[path = "common/password.rs"]
 mod password;
+#[path = "common/process_cwd.rs"]
+mod process_cwd;
 #[path = "common/process_list.rs"]
 mod process_list;
 #[path = "common/session_end.rs"]
@@ -728,4 +730,48 @@ fn the_warning_is_on_the_screen_when_the_fallback_line_is_near_the_command_line_
         finished.pty
     );
     session.leave();
+}
+
+/// The working directory of sshd, which a bare `DefaultShell` is looked up in (after sshd's own directory):
+/// `provision::system_config::sshd_search_dirs` leaves it out because a service runs in the system directory.
+/// Measured on the runner with a session open, in every `sshd` process (the service, and the per-connection
+/// one that starts the shell).
+#[test]
+fn sshd_runs_in_the_system_directory() {
+    let _machine = machine::exclusive();
+    let rig = Rig::new("shd14");
+    let login = rig.login();
+    rig.broker_is_default_shell();
+    let session = rig.start_session(&login);
+
+    process_cwd::enable_debug_privilege();
+    let measured: Vec<(u32, String, Result<PathBuf, String>)> = process_list::snapshot()
+        .into_iter()
+        .filter(|entry| entry.exe.to_ascii_lowercase().starts_with("sshd"))
+        .map(|entry| (entry.pid, entry.exe, process_cwd::current_directory(entry.pid)))
+        .collect();
+    session.leave();
+
+    let system_dir = PathBuf::from(std::env::var("SystemRoot").expect("SystemRoot")).join("System32");
+    let same = |dir: &std::path::Path| {
+        dir.to_string_lossy()
+            .trim_end_matches('\\')
+            .eq_ignore_ascii_case(&system_dir.to_string_lossy())
+    };
+    let shown = format!("{measured:?}");
+    assert!(
+        measured.iter().any(|(_, exe, _)| exe.eq_ignore_ascii_case("sshd.exe")),
+        "no sshd.exe was running: {shown}"
+    );
+    for (pid, exe, cwd) in &measured {
+        let cwd = cwd
+            .as_ref()
+            .unwrap_or_else(|e| panic!("{exe} ({pid}): {e}\nmeasured: {shown}"));
+        assert!(
+            same(cwd),
+            "{exe} ({pid}) runs in {}, not {}\nmeasured: {shown}",
+            cwd.display(),
+            system_dir.display()
+        );
+    }
 }

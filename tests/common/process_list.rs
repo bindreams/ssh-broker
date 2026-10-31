@@ -39,13 +39,14 @@ pub struct Descendants {
     pub unopened: Vec<String>,
 }
 
-struct Entry {
-    pid: u32,
-    parent: u32,
-    exe: String,
+/// A process the system lists.
+pub struct Entry {
+    pub pid: u32,
+    pub parent: u32,
+    pub exe: String,
 }
 
-fn snapshot() -> Vec<Entry> {
+pub fn snapshot() -> Vec<Entry> {
     // SAFETY: a snapshot of all processes; the handle is closed by `OwnedHandle`.
     let snapshot =
         OwnedHandle(unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }.expect("snapshot the process list"));

@@ -634,6 +634,7 @@ const ITEMS: &[&str] = &[
     " lead and trail ",
     "tab\there",
     "new\nline",
+    " leading space\nthen a second line",
     "carriage\rreturn",
     "del\u{7f}",
     "bell\u{7}",
@@ -726,6 +727,63 @@ fn a_program_a_warning_and_empty_lists_do_not_break_the_config() {
     );
     assert!(text.contains(r"program: C:\a #b: c\prog.exe"), "{text}");
     assert!(text.contains("warning: "), "{text}");
+}
+
+/// Characters a YAML comment cannot hold as they are: every C0 control (NUL included), DEL, every C1
+/// control (NEL included), the Unicode line and paragraph separators, and the two non-characters the
+/// YAML reader rejects.
+fn comment_hostile_chars() -> Vec<char> {
+    let mut chars: Vec<char> = (0u32..0x20)
+        .chain([0x7f])
+        .chain(0x80..0xa0)
+        .filter_map(char::from_u32)
+        .collect();
+    chars.extend(['\u{2028}', '\u{2029}', '\u{fffe}', '\u{ffff}']);
+    chars
+}
+
+/// Every comment `render` writes (the source labels, `# program:`, `# warning:`) reads back as a
+/// comment, whatever it holds: a hostile character in a path, a `start` value or an error reason
+/// leaves the whole output a config with the values shown. Each character goes through every
+/// comment alone, and all of them together go through at once.
+#[test]
+fn a_comment_holding_any_character_leaves_the_output_a_config() {
+    let hostile = comment_hostile_chars();
+    let mut texts: Vec<String> = hostile.iter().map(|c| format!("x{c}y: z # w")).collect();
+    texts.push(hostile.iter().collect());
+    texts.push(" a\nb".into());
+    for text in texts {
+        let mut effective = effective_of(&["prog", "arg"], &["-i"], &["-c"], Escaping::Msvc);
+        effective.program = PathBuf::from(format!(r"C:\{text}\prog.exe"));
+        effective.why.start = Source::User(PathBuf::from(format!(r"C:\{text}\config.yaml")));
+        effective.why.without_command = Source::System(PathBuf::from(format!(r"C:\{text}\system.yaml")));
+        effective.problem = Some(crate::shell::Problem {
+            file: PathBuf::from(format!(r"C:\{text}\bad.yaml")),
+            value: Some(text.clone()),
+            reason: text.clone(),
+        });
+        let rendered = render(&effective);
+        let parsed = crate::shell::config::parse(rendered.as_bytes())
+            .unwrap_or_else(|e| panic!("{text:?} rendered as\n{rendered:?}\ndoes not parse: {}", e.reason))
+            .unwrap_or_else(|| panic!("{rendered:?}\nhas no shell block"));
+        assert_eq!(parsed.start, effective.start, "{rendered:?}");
+        assert_eq!(
+            parsed.without_command.as_ref(),
+            Some(&effective.without_command),
+            "{rendered:?}"
+        );
+        assert_eq!(
+            parsed.with_command.as_ref(),
+            Some(&effective.with_command),
+            "{rendered:?}"
+        );
+        assert_eq!(parsed.escaping, Some(Escaping::Msvc), "{rendered:?}");
+        // Nothing is left raw that could end a comment or the stream; the line ends are the output's own.
+        assert!(
+            rendered.chars().all(|c| c == '\n' || !hostile.contains(&c)),
+            "{rendered:?}"
+        );
+    }
 }
 
 #[test]

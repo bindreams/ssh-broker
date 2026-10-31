@@ -147,7 +147,7 @@ mod imp {
     };
     use crate::{afunix, shim};
     use anyhow::Context;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     /// Case-insensitive compare of a registry path string (quotes trimmed) to a path.
     fn eq_path(a: &str, b: &Path) -> bool {
@@ -239,16 +239,9 @@ mod imp {
             }
         };
         let config = base.layout().system_config_path();
-        let config_exists = match config.try_exists() {
-            Ok(exists) => exists,
-            Err(e) => {
-                eprintln!(
-                    "apply: cannot tell whether {} exists, so the previous shell is not carried: {e}",
-                    config.display()
-                );
-                return;
-            }
-        };
+        let config_exists = config
+            .try_exists()
+            .map_err(|e| format!("cannot tell whether {} exists: {e}", config.display()));
         let host = crate::shell::WindowsHost;
         // The file the shell resolves to, found as sshd finds it (a bare name is searched in sshd's own
         // directory, the system and Windows directories, then on `PATH`), so the identity check below
@@ -257,14 +250,10 @@ mod imp {
             eprintln!("apply: cannot read where sshd runs from ({e:#}); a bare shell name is looked up without it");
             None
         });
-        let search = match system_config::sshd_search_dirs(&host, image.as_deref()) {
-            Ok(dirs) => dirs,
-            Err(e) => {
-                eprintln!("apply: cannot find the system directory, so the previous shell is not carried: {e:#}");
-                return;
-            }
-        };
-        let find = |path: &Path| crate::shell::resolve_program_in(&host, &search, &path.to_string_lossy());
+        let search = system_config::sshd_search_dirs(&host, image.as_deref())
+            .map_err(|e| format!("cannot find the system directory to look for the shell in: {e:#}"));
+        let find =
+            |dirs: &[PathBuf], path: &Path| crate::shell::resolve_program_in(&host, dirs, &path.to_string_lossy());
         let is_system_cmd = |found: &Path| {
             use crate::shell::Host;
             host.is_system_cmd(found).unwrap_or_else(|e| {
@@ -276,7 +265,14 @@ mod imp {
                 false
             })
         };
-        match system_config::decide(&previous, config_exists, &find, &is_system_cmd) {
+        let decision = system_config::decide(
+            &previous,
+            config_exists,
+            search.as_deref().map_err(Clone::clone),
+            &find,
+            &is_system_cmd,
+        );
+        match decision {
             system_config::Decision::Write(block) => match system_config::create_once(base, &block) {
                 Ok(true) => {
                     println!(
@@ -288,10 +284,11 @@ mod imp {
                 Ok(false) => {}
                 Err(e) => eprintln!("{}", system_config::not_written(&config, &previous, &format!("{e:#}"))),
             },
-            system_config::Decision::Skip(system_config::Skip::PreviousMissing(why)) => {
-                eprintln!("{}", system_config::previous_missing(&config, &previous, &why))
+            system_config::Decision::Skip(skip) => {
+                if let Some(notice) = system_config::skip_notice(&config, &previous, &skip) {
+                    eprintln!("{notice}");
+                }
             }
-            system_config::Decision::Skip(_) => {}
         }
     }
 

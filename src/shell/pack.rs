@@ -5,7 +5,7 @@
 
 use std::path::{Path, PathBuf};
 
-use super::config::{Notes, ShellBlock, render_annotated};
+use super::config::{Notes, ShellBlock, comment_text, render_annotated};
 use super::layers::{self, Origin, Problem};
 use super::{Escaping, Host, is_absolute_windows};
 use crate::cmdline::join_args;
@@ -131,11 +131,7 @@ pub fn render(effective: &Effective) -> String {
     let mut text = render_annotated(&block, &notes)
         .unwrap_or_else(|error| format!("# the shell cannot be shown as a config: {error}\n"));
     let comment = |text: &mut String, label: &str, value: &str| {
-        // YAML ends a comment at a CR as well as at an LF.
-        for (i, line) in value.split(['\r', '\n']).filter(|line| !line.is_empty()).enumerate() {
-            let label = if i == 0 { label } else { "" };
-            text.push_str(&format!("# {label}{line}\n"));
-        }
+        text.push_str(&format!("# {label}{}\n", comment_text(value)));
     };
     comment(&mut text, "program: ", &effective.program.display().to_string());
     if let Some(problem) = &effective.problem {

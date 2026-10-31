@@ -114,6 +114,21 @@ pub fn render_annotated(block: &ShellBlock, notes: &Notes<'_>) -> Result<String,
     Ok(out)
 }
 
+/// `text` as one YAML comment line: every character the YAML reader rejects or ends a comment at (a
+/// C0 or C1 control, DEL, NEL, U+2028, U+2029, U+FFFE, U+FFFF) is written as its escape, so no text
+/// leaves the file unparseable. Every comment in a rendered config goes through this.
+pub fn comment_text(text: &str) -> String {
+    text.chars()
+        .flat_map(|c| {
+            if c.is_control() || matches!(c, '\u{2028}' | '\u{2029}' | '\u{fffe}' | '\u{ffff}') {
+                c.escape_default().collect()
+            } else {
+                vec![c]
+            }
+        })
+        .collect()
+}
+
 /// One `key: value` of the block at `indent` columns. A list goes under its key, at the key's own
 /// indent, as a sequence under a mapping key may; any other value, and an empty list, follows the key.
 fn entry<T: Serialize>(
@@ -125,20 +140,7 @@ fn entry<T: Serialize>(
 ) -> Result<(), ParseError> {
     let rendered = yaml_serde::to_string(value).map_err(|e| ParseError { reason: e.to_string() })?;
     let pad = " ".repeat(indent);
-    // A control character in a note (a path can hold one) would end the comment early.
-    let note = note.map_or(String::new(), |n| {
-        let shown: String = n
-            .chars()
-            .flat_map(|c| {
-                if c.is_control() {
-                    c.escape_default().collect()
-                } else {
-                    vec![c]
-                }
-            })
-            .collect();
-        format!("  # {shown}")
-    });
+    let note = note.map_or(String::new(), |n| format!("  # {}", comment_text(n)));
     let value = rendered.trim_end_matches('\n');
     if value.contains('\n') || value.starts_with("- ") {
         out.push_str(&format!("{pad}{key}:{note}\n"));
