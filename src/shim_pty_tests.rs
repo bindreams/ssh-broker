@@ -24,14 +24,14 @@ fn exec_with_terminal(command: &str) -> Exec {
 /// The local passthrough must contain its child in a job object, exactly as the relayed path
 /// does, so that failing open can never become a way to outlive the session.
 ///
-/// `spawn_contained` is what every fail-open session funnels through (`run_local_passthrough`), a
+/// `spawn_contained` is what every fail-open session funnels through (`start_local`), a
 /// command and a login alike. So this containment is the sole thing between an unreachable agent and a
 /// process that outlives the session the README promises to reap.
 ///
 /// Read that as a statement about the PRODUCTION WIRING, not about this test's reach. This test
 /// calls `spawn_contained` directly and therefore gates the spawn, not the wiring: it would stay
 /// green if `run_on` stopped calling it. What keeps the wiring honest is the single
-/// `run_local_passthrough` call site, and `tests/fail_open_windows.rs` and
+/// `start_local` call site, and `tests/fail_open_windows.rs` and
 /// `tests/interactive_fail_open_containment.rs`, which drive both arms end to end.
 ///
 /// `cosca::Job` sets `KILL_ON_JOB_CLOSE`, so dropping the job must terminate the child. Before

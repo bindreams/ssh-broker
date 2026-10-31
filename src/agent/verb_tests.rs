@@ -62,3 +62,26 @@ fn a_start_that_fails_is_the_error_and_nothing_is_written() {
     .unwrap_err();
     assert!(matches!(error, StartError::Program(_)), "{error:?}");
 }
+
+/// The agent writes before the verb has read anything, and a verb that is slow to read (stuck in
+/// the loader) must not hold the agent's session thread: the longest line fits the pipe.
+#[test]
+fn start_returns_when_the_verb_has_not_read_the_longest_line() {
+    let line = "x".repeat(3 * 32_766);
+    let mut unread = None;
+    start(Path::new(EXE), "the notice\r\n", &line, false, |_, read| {
+        unread = Some(
+            unsafe { BorrowedHandle::borrow_raw(read.0.0 as RawHandle) }
+                .try_clone_to_owned()
+                .unwrap(),
+        );
+        Ok(())
+    })
+    .unwrap();
+    let mut bytes = Vec::new();
+    std::fs::File::from(unread.unwrap()).read_to_end(&mut bytes).unwrap();
+    assert_eq!(
+        crate::handoff::decode(&bytes).unwrap(),
+        ("the notice\r\n".to_string(), line)
+    );
+}

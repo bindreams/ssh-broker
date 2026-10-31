@@ -274,7 +274,9 @@ fn built_in_name(host: &dyn Host) -> String {
 }
 
 /// The file `start[0]` names. A bare name is searched on `PATH`; anything with a separator or a
-/// drive must be an absolute path. `Err` is the reason, for the warning.
+/// drive must be an absolute path, and one whose file name has no extension may also name the file
+/// with `.exe` appended, as `CreateProcess` (and so sshd) finds it. `Err` is the reason, for the
+/// warning.
 pub fn resolve_program(host: &dyn Host, name: &str) -> Result<PathBuf, String> {
     if name.is_empty() {
         return Err("the program name is empty".into());
@@ -284,11 +286,19 @@ pub fn resolve_program(host: &dyn Host, name: &str) -> Result<PathBuf, String> {
         if !is_absolute_windows(path) {
             return Err("a relative path; use an absolute path or a bare name to search PATH".into());
         }
-        return if host.is_file(path) {
-            Ok(path.to_path_buf())
-        } else {
-            Err("there is no such file".into())
-        };
+        if host.is_file(path) {
+            return Ok(path.to_path_buf());
+        }
+        let file_name = name.rsplit(['\\', '/']).next().unwrap_or(name);
+        if !file_name.contains('.') {
+            let mut with_exe = path.as_os_str().to_owned();
+            with_exe.push(".exe");
+            let with_exe = PathBuf::from(with_exe);
+            if host.is_file(&with_exe) {
+                return Ok(with_exe);
+            }
+        }
+        return Err("there is no such file".into());
     }
     host.find_program(name).ok_or_else(|| "not found on PATH".to_string())
 }

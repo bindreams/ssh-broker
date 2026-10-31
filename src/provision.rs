@@ -276,7 +276,7 @@ mod imp {
                     );
                 }
                 Ok(false) => {}
-                Err(e) => eprintln!("apply: could not write {}: {e:#}", config.display()),
+                Err(e) => eprintln!("{}", system_config::not_written(&config, &previous, &format!("{e:#}"))),
             },
             system_config::Decision::Skip(system_config::Skip::PreviousMissing) => eprintln!(
                 "apply: the shell sshd uses now ({}) does not exist, so it is not carried into {}",

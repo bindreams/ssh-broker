@@ -122,7 +122,7 @@ fn inherit_flag(handle: HANDLE) -> bool {
 #[test]
 fn a_hand_off_pipe_has_an_inheritable_read_end_and_a_private_write_end() {
     use std::os::windows::io::AsRawHandle;
-    let pipe = Handoff::new().unwrap();
+    let pipe = Handoff::new(0).unwrap();
     assert!(inherit_flag(pipe.read().0));
     assert!(!inherit_flag(HANDLE(pipe.write.as_raw_handle())));
 }
@@ -132,7 +132,7 @@ fn a_hand_off_pipe_has_an_inheritable_read_end_and_a_private_write_end() {
 fn a_hand_off_pipe_delivers_what_is_sent_and_then_ends() {
     use std::io::Read;
     use std::os::windows::io::{BorrowedHandle, RawHandle};
-    let pipe = Handoff::new().unwrap();
+    let pipe = Handoff::new(0).unwrap();
     // A second handle to the read end, as the child's inherited copy would be.
     let child_copy = unsafe { BorrowedHandle::borrow_raw(pipe.read().0.0 as RawHandle) }
         .try_clone_to_owned()
@@ -152,6 +152,24 @@ fn a_hand_off_pipe_delivers_what_is_sent_and_then_ends() {
 /// With no reader left, the send fails instead of waiting for one.
 #[test]
 fn sending_into_a_hand_off_pipe_nobody_reads_fails() {
-    let pipe = Handoff::new().unwrap();
+    let pipe = Handoff::new(0).unwrap();
     assert!(pipe.send(b"x").is_err());
+}
+
+/// A pipe made for its message holds all of it, so the send ends with the reader not reading: a
+/// verb that is alive but slow to read cannot hold the agent's session thread.
+#[test]
+fn a_hand_off_pipe_made_for_its_message_takes_it_with_nobody_reading() {
+    use std::io::Read;
+    use std::os::windows::io::{BorrowedHandle, RawHandle};
+    // Far more than the default buffer.
+    let bytes: Vec<u8> = (0..200_000u32).map(|n| (n % 251) as u8).collect();
+    let pipe = Handoff::new(bytes.len() as u32).unwrap();
+    let child_copy = unsafe { BorrowedHandle::borrow_raw(pipe.read().0.0 as RawHandle) }
+        .try_clone_to_owned()
+        .unwrap();
+    pipe.send(&bytes).unwrap();
+    let mut got = Vec::new();
+    std::fs::File::from(child_copy).read_to_end(&mut got).unwrap();
+    assert_eq!(got, bytes);
 }

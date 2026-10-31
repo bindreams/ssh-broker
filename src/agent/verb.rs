@@ -10,8 +10,8 @@ use crate::winutil::{Handoff, OwnedHandle};
 /// Start the verb of the program at `exe` with `start`, which gets the verb's command line and the
 /// read end of the pipe the verb inherits, and returns what it started. The verb's argument is that
 /// handle's value, the same in the child. Once the verb runs, `notice` and `line` are written into the
-/// pipe and it is closed; a write that fails is logged, and the verb reports the short read on its
-/// console.
+/// pipe, which is sized to hold them, and it is closed; a write that fails is logged, and the verb
+/// reports the short read on its console.
 ///
 /// Only a failure of `start` or of the pipe is an error, and then nothing runs.
 pub(super) fn start<T>(
@@ -22,7 +22,10 @@ pub(super) fn start<T>(
     start: impl FnOnce(&str, &OwnedHandle) -> Result<T, StartError>,
 ) -> Result<T, StartError> {
     let bytes = handoff::encode(notice, line).map_err(StartError::Other)?;
-    let pipe = Handoff::new()?;
+    // Holds the whole message, so the write below does not wait for a verb that has not read yet.
+    let capacity = u32::try_from(bytes.len())
+        .map_err(|_| StartError::Other(anyhow::anyhow!("the fallback shell's hand-off is larger than 4 GiB")))?;
+    let pipe = Handoff::new(capacity)?;
     let value = (pipe.read().0.0 as usize).to_string();
     let exe = exe.to_string_lossy();
     let mut args: Vec<&str> = vec![&exe, "console-fallback"];

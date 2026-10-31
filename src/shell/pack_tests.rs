@@ -3,7 +3,8 @@
 use std::path::PathBuf;
 
 use super::{
-    Session, Source, StartError, built_in_plan, defaults, effective, flow_list, plan, render, start_or_fall_back,
+    Session, Source, StartError, built_in_plan, defaults, effective, flow_list, plan, render, resolve_program,
+    start_or_fall_back,
 };
 use crate::cmdline::split_args;
 use crate::shell::test_host::{SYSTEM_CMD, TestHost};
@@ -170,6 +171,40 @@ fn a_program_given_by_absolute_path_is_used_as_is() {
         .with_program("unused", PWSH)
         .with_user_config(&format!("shell: '{PWSH}'\n"));
     assert_eq!(effective(&host).unwrap().program, PathBuf::from(PWSH));
+}
+
+/// `CreateProcess` appends `.exe` to a name without an extension, and sshd starts `DefaultShell` that
+/// way, so an absolute `C:\...\pwsh` is the file `C:\...\pwsh.exe`.
+#[test]
+fn an_absolute_path_without_an_extension_is_the_exe_it_names() {
+    let bare = r"C:\Program Files\PowerShell\7\pwsh";
+    let host = TestHost::new().with_bytes(PWSH, b"MZ");
+    assert_eq!(resolve_program(&host, bare), Ok(PathBuf::from(PWSH)));
+
+    // The session's check and its line go through it.
+    let host = host.with_user_config(&format!("shell: '{bare}'\n"));
+    let e = effective(&host).unwrap();
+    assert_eq!(e.program, PathBuf::from(PWSH));
+    assert!(e.problem.is_none(), "{:?}", e.problem);
+    assert_eq!(split_args(&line(&host, &command("echo hi"))), [PWSH, "-c", "echo hi"]);
+}
+
+#[test]
+fn exe_is_not_appended_to_an_absolute_path_that_has_an_extension_or_a_trailing_dot() {
+    let host = TestHost::new()
+        .with_bytes(r"C:\x\tool.7.exe", b"MZ")
+        .with_bytes(r"C:\x\tool.exe", b"MZ");
+    for name in [r"C:\x\tool.7", r"C:\x\tool."] {
+        assert_eq!(
+            resolve_program(&host, name),
+            Err("there is no such file".to_string()),
+            "{name}"
+        );
+    }
+    assert_eq!(
+        resolve_program(&host, r"C:\x\nonesuch"),
+        Err("there is no such file".to_string())
+    );
 }
 
 #[test]

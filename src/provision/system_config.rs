@@ -136,6 +136,23 @@ pub fn decide(
     Decision::Write(carried_block(prev, is_system_cmd(path)))
 }
 
+/// The warning for a config that could not be written: `apply` still replaces `DefaultShell`, so
+/// this holds the values of the shell it replaces, which nothing else keeps.
+pub fn not_written(config: &Path, previous: &SshdShell, cause: &str) -> String {
+    let value = |value: &Option<String>| value.as_ref().map_or("not set".to_owned(), |v| format!("\"{v}\""));
+    let escape = if previous.escape_arguments { "yes" } else { "no" };
+    format!(
+        "apply: could not write {config}: {cause}; DefaultShell is replaced all the same. The shell sshd used \
+         before is in no config; to restore it, put it in that config or under HKLM\\{key}: DefaultShell = {shell}, \
+         DefaultShellCommandOption = {option}, DefaultShellArguments = {arguments}, escape arguments = {escape}",
+        config = config.display(),
+        key = super::registry::OPENSSH_KEY,
+        shell = value(&previous.shell),
+        option = value(&previous.command_option),
+        arguments = value(&previous.arguments),
+    )
+}
+
 /// The file's text: a note on where it came from, then the block.
 pub fn render(block: &ShellBlock) -> anyhow::Result<String> {
     let body = render_file(block).map_err(|e| anyhow::anyhow!("{e}"))?;

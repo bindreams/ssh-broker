@@ -87,6 +87,24 @@ fn short_path(path: &Path) -> PathBuf {
     PathBuf::from(std::ffi::OsString::from_wide(&buf[..len]))
 }
 
+// resolve_program -----
+
+/// `apply` decides whether the shell sshd ran exists through `WindowsHost`: `DefaultShell = ...\pwsh`
+/// is the file `...\pwsh.exe`, as `CreateProcess` finds it.
+#[test]
+fn an_absolute_path_without_an_extension_finds_the_exe_on_disk() {
+    use crate::shell::resolve_program;
+    let temp = TempProfile::new("shell-host-bare-abs");
+    touch(&temp.0.join("pwsh.exe"));
+    let bare = temp.0.join("pwsh");
+    assert_eq!(
+        resolve_program(&WindowsHost, &bare.to_string_lossy()),
+        Ok(temp.0.join("pwsh.exe"))
+    );
+    let none = temp.0.join("nonesuch");
+    assert!(resolve_program(&WindowsHost, &none.to_string_lossy()).is_err());
+}
+
 // find_in -----
 
 #[test]

@@ -107,13 +107,15 @@ pub struct Handoff {
 }
 
 impl Handoff {
-    pub fn new() -> windows::core::Result<Handoff> {
+    /// A pipe buffered for `capacity` bytes (0: the default size), so a write of up to that many
+    /// returns without a reader.
+    pub fn new(capacity: u32) -> windows::core::Result<Handoff> {
         use std::os::windows::io::FromRawHandle;
         use windows::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
         use windows::Win32::System::Pipes::CreatePipe;
         let (mut read, mut write) = (HANDLE::default(), HANDLE::default());
         // SAFETY: both are valid out pointers.
-        unsafe { CreatePipe(&mut read, &mut write, None, 0)? };
+        unsafe { CreatePipe(&mut read, &mut write, None, capacity)? };
         let read = OwnedHandle(read);
         // SAFETY: `write` is a new handle that nothing else owns.
         let write = unsafe { std::fs::File::from_raw_handle(write.0) };

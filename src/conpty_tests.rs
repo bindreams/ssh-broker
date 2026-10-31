@@ -94,7 +94,7 @@ fn a_file_that_cannot_start_is_the_programs_fault_with_a_handle_to_inherit() {
     std::fs::create_dir_all(&dir).unwrap();
     let stub = dir.join("stub.exe");
     std::fs::write(&stub, b"MZ").unwrap();
-    let pipe = crate::winutil::Handoff::new().unwrap();
+    let pipe = crate::winutil::Handoff::new(0).unwrap();
     let error = PtySession::spawn(&format!("\"{}\"", stub.display()), 80, 24, None, Some(pipe.read()))
         .err()
         .expect("a file that is not a program started");

@@ -3,7 +3,7 @@
 
 use std::path::{Path, PathBuf};
 
-use super::{Decision, Skip, SshdClass, carried_block, classify, create_once_at, decide, render};
+use super::{Decision, Skip, SshdClass, carried_block, classify, create_once_at, decide, not_written, render};
 use crate::provision::registry::SshdShell;
 use crate::shell::Escaping;
 use crate::shell::config::{ShellBlock, parse};
@@ -128,6 +128,45 @@ fn the_escape_flag_applies_only_to_the_other_class() {
     );
     // ShellHost is never escaped, and its default (another program) is msvc.
     assert_eq!(carried(&sshd(r"C:\x\ssh-shellhost.exe")).escaping, Some(Escaping::Cmd));
+}
+
+// not_written =====
+
+/// `apply` replaces `DefaultShell` even when it cannot write the config, so the message holds every
+/// value of the shell it replaces.
+#[test]
+fn the_message_for_a_config_that_could_not_be_written_holds_every_carried_value() {
+    let prev = SshdShell {
+        shell: Some(PWSH7.into()),
+        command_option: Some("-NoLogo -c".into()),
+        arguments: Some("-NoProfile".into()),
+        escape_arguments: false,
+    };
+    let text = not_written(
+        Path::new(r"C:\ProgramData\ssh-broker\config.yaml"),
+        &prev,
+        "Access is denied.",
+    );
+    for part in [
+        r"C:\ProgramData\ssh-broker\config.yaml",
+        "Access is denied.",
+        PWSH7,
+        "-NoLogo -c",
+        "-NoProfile",
+        "escape arguments = no",
+    ] {
+        assert!(text.contains(part), "{part}: {text}");
+    }
+    assert!(!text.contains("escape arguments = yes"), "{text}");
+
+    // Values sshd does not have are said so, not left out.
+    let text = not_written(Path::new("c.yaml"), &sshd(PWSH7), "x");
+    assert!(
+        text.contains("DefaultShellCommandOption") && text.contains("DefaultShellArguments"),
+        "{text}"
+    );
+    assert!(text.contains("not set"), "{text}");
+    assert!(text.contains("escape arguments = yes"), "{text}");
 }
 
 // decide =====

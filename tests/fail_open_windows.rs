@@ -286,7 +286,7 @@ fn run_session_without_command(home: &Home) {
 /// the argument, then `send` the hand-off. The verb's stdin is empty.
 fn run_verb(login: bool, send: impl FnOnce(ssh_broker::winutil::Handoff)) -> std::process::Output {
     use std::process::Stdio;
-    let pipe = ssh_broker::winutil::Handoff::new().expect("make the hand-off pipe");
+    let pipe = ssh_broker::winutil::Handoff::new(0).expect("make the hand-off pipe");
     let mut verb = std::process::Command::new(env!("CARGO_BIN_EXE_ssh-broker"));
     verb.arg("console-fallback");
     if login {
@@ -381,8 +381,10 @@ fn read_console_until(output: isize, seen: &mut String, needle: &str) {
 /// take the shell and the session with it (ssh-broker#55).
 ///
 /// The test clears the "ignore Ctrl+C" setting its own process may have inherited, which the verb and the
-/// probe then inherit, as they would from a process that never had it. (Measured in CI: the agent's sessions
-/// start with it set, and nothing there gets a Ctrl+C until a program clears it for itself; see the report.)
+/// probe then inherit, as they would from a process that never had it. (Measured in CI: an agent started
+/// through the password prompt, which goes through `CreateProcessWithLogonW`, has it set, and nothing in
+/// its sessions gets a Ctrl+C until a program clears it for itself. An agent started by a scheduled task
+/// does not have it set.)
 #[test]
 fn console_fallback_stays_through_a_ctrl_c_that_the_shell_answers() {
     use ssh_broker::conpty::{PtySession, write_all_handle};
@@ -392,7 +394,7 @@ fn console_fallback_stays_through_a_ctrl_c_that_the_shell_answers() {
     // SAFETY: no pointers. This process's own setting, which nextest gives to this test alone.
     unsafe { SetConsoleCtrlHandler(None, false) }.expect("clear the inherited ignore of Ctrl+C");
     let probe = command_line_probe::example("ctrl_probe");
-    let pipe = ssh_broker::winutil::Handoff::new().expect("make the hand-off pipe");
+    let pipe = ssh_broker::winutil::Handoff::new(0).expect("make the hand-off pipe");
     let verb_line = join_args(&[
         env!("CARGO_BIN_EXE_ssh-broker"),
         "console-fallback",

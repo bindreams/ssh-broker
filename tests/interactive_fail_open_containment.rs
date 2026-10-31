@@ -6,7 +6,7 @@
 //!
 //! Why an integration test rather than a unit test: `shim_pty::run_on` ends in `process::exit`,
 //! so nothing in-process can observe whether it actually routed through
-//! `run_local_passthrough` -> `spawn_contained`. The existing unit test
+//! `start_local` -> `spawn_contained`. The existing unit test
 //! `the_local_passthrough_child_is_contained_in_a_job` (`src/shim_pty_tests.rs`) calls
 //! `spawn_contained` DIRECTLY, so it gates the spawn helper's own containment but says nothing
 //! about whether `run_on`'s fail-open still calls it — reverting that to an uncontained
@@ -56,7 +56,7 @@ fn interactive_fail_open_reaps_a_grandchild_when_the_shim_exits() {
     // pwsh (not nothing, not some other path) is on the other end of this pipe.
     //
     // The grandchild's own stdio is explicitly redirected away from inheriting pwsh's (i.e. the
-    // shim's, i.e. THIS pipe): `run_local_passthrough` marks the shim's std handles inheritable
+    // shim's, i.e. THIS pipe): `start_local` marks the shim's std handles inheritable
     // before spawning pwsh (so pwsh can talk to this test at all), and a bare
     // `[Process]::Start('ping.exe', ...)` would let ping inherit those same handles and become a
     // second, unsynchronized writer into the very pipe the loop below parses — exactly the hazard
@@ -123,7 +123,7 @@ fn interactive_fail_open_reaps_a_grandchild_when_the_shim_exits() {
         .unwrap_or_else(|e| panic!("OpenProcess({pid}) failed while the grandchild should still be alive: {e}"));
     let handle = ssh_broker::winutil::OwnedHandle(handle); // RAII CloseHandle, mirroring spawn_contained's callers
 
-    // Close the shim's stdin: pwsh sees EOF on its next read and exits, `run_local_passthrough`
+    // Close the shim's stdin: pwsh sees EOF on its next read and exits, `LocalChild::finish`
     // observes pwsh's exit, `spawn_contained`'s job object is dropped, and `KILL_ON_JOB_CLOSE`
     // reaps every member of the job — including the grandchild, which was never a DIRECT child
     // of the job-assigned process.
