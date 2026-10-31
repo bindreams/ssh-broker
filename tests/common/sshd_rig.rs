@@ -12,6 +12,9 @@ use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
 use std::time::Duration;
 
+use ssh_broker::provision::handover::Handover;
+use ssh_broker::provision::registry::SshdShell;
+
 use crate::account_fixture::Account;
 use crate::stand_in::Kit;
 
@@ -555,6 +558,12 @@ pub fn run_client(mut command: Command, hold_stdin: bool, scratch: &Path) -> Out
     let _ = std::fs::remove_file(&out_path);
     let _ = std::fs::remove_file(&err_path);
     Outcome { code, stdout, stderr }
+}
+
+/// The proof `set_default_shell_under` takes, for a rig that replaces a shell it set up itself: there is no previous
+/// shell to carry.
+pub fn no_shell_to_carry() -> Handover {
+    Handover::nothing_to_carry(&SshdShell::none()).expect("no shell has nothing to carry")
 }
 
 /// Make `shell` sshd's `DefaultShell` the way stock sshd has it: no command option, no arguments, no escape

@@ -12,7 +12,6 @@
 
 use std::process::Stdio;
 
-use ssh_broker::provision::handover::Handover;
 use ssh_broker::provision::registry::{OPENSSH_KEY, set_default_shell_under};
 
 #[path = "common/account.rs"]
@@ -41,7 +40,7 @@ mod sshd_rig;
 mod stand_in;
 
 use account_fixture::{Account, ServiceLogon};
-use sshd_rig::{Login, PROMPT, SHELL_PROMPT};
+use sshd_rig::{Login, PROMPT, SHELL_PROMPT, no_shell_to_carry};
 use stand_in::Kit;
 
 /// Elevated (CI only). M8: the shim as sshd's `DefaultShell`, for an account with no session. Beyond
@@ -62,12 +61,8 @@ fn prompt_path_through_real_sshd() {
     let login = Login::new(&kit, &account);
 
     // 1. What the shim runs in under sshd: the probe is the DefaultShell for one command.
-    set_default_shell_under(
-        OPENSSH_KEY,
-        &kit.helper.to_string_lossy(),
-        &Handover::nothing_to_carry(),
-    )
-    .expect("set the probe as DefaultShell");
+    set_default_shell_under(OPENSSH_KEY, &kit.helper.to_string_lossy(), &no_shell_to_carry())
+        .expect("set the probe as DefaultShell");
     let mut probe = login.command();
     let out = probe.arg("probe").stdin(Stdio::null()).output().expect("run ssh");
     let facts = String::from_utf8_lossy(&out.stdout).into_owned();
@@ -80,7 +75,7 @@ fn prompt_path_through_real_sshd() {
     eprintln!("M8 the shim's environment under sshd (session, logon type, job):\n{facts}");
 
     // 2. The product's path: the shim is the DefaultShell, the account has no session.
-    set_default_shell_under(OPENSSH_KEY, &kit.exe.to_string_lossy(), &Handover::nothing_to_carry())
+    set_default_shell_under(OPENSSH_KEY, &kit.exe.to_string_lossy(), &no_shell_to_carry())
         .expect("set the shim as DefaultShell");
     let mut first = login.start();
     first.log_in(&account.password);

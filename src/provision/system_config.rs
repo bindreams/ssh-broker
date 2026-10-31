@@ -119,7 +119,7 @@ pub enum Decision {
 /// Finds the directories sshd searches for a bare shell name, or says why they are not known.
 pub type SearchDirs<'a> = dyn Fn() -> Result<Vec<PathBuf>, String> + 'a;
 
-/// Whether `apply` writes the config, and what. `config_is_file` is whether the config is a file (see
+/// Whether `apply` writes the config, and what. `config_is_file` is what is at its path (see
 /// [`config_is_file`]), or why that is not known. `search_dirs` is called only once the decision needs the directories, so
 /// a failure to find them is not reported when nothing depends on it. `find` finds the file the
 /// previous shell names in them, as sshd finds it ([`sshd_search_dirs`]), or says why there is none;
@@ -129,7 +129,7 @@ pub type SearchDirs<'a> = dyn Fn() -> Result<Vec<PathBuf>, String> + 'a;
 /// own, nothing is replaced, and a config that is there is never rewritten.
 pub fn decide(
     prev: &SshdShell,
-    config_is_file: Result<bool, String>,
+    config_is_file: Result<ConfigKind, String>,
     search_dirs: &SearchDirs,
     find: &Find,
     is_system_cmd: &dyn Fn(&Path) -> bool,
@@ -140,8 +140,9 @@ pub fn decide(
     let shell = prev.shell.as_deref().unwrap_or_default();
     match config_is_file {
         Err(cause) => return Decision::Skip(Skip::Unchecked(cause)),
-        Ok(true) => return Decision::Skip(Skip::FileExists),
-        Ok(false) => {}
+        Ok(ConfigKind::File) => return Decision::Skip(Skip::FileExists),
+        // Something else at the path is no config either; writing is tried and its failure is printed.
+        Ok(ConfigKind::Missing | ConfigKind::Other) => {}
     }
     let dirs = match search_dirs() {
         Ok(dirs) => dirs,
@@ -218,14 +219,24 @@ pub fn skip_notice(config: &Path, previous: &SshdShell, skip: &Skip) -> String {
     not_carried(config, previous, &reason)
 }
 
-/// Whether `config` is a regular file, which is what the loader can read, or why that is not known: a
-/// failed check is not an absent file, so the cause is kept and worded as one that cannot tell. A
-/// directory or anything else at the path holds no config. The one answer to "is the system config
-/// there" in `apply`.
-pub fn config_is_file(config: &Path) -> Result<bool, String> {
+/// What is at the system config's path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigKind {
+    /// A regular file, which is what the loader can read.
+    File,
+    /// Nothing.
+    Missing,
+    /// A directory or anything else: it holds no config, and writing one there needs it gone.
+    Other,
+}
+
+/// What is at `config`, or why that is not known: a failed check is not an absent file, so the cause
+/// is kept and worded as one that cannot tell. The one answer to "is the system config there" in `apply`.
+pub fn config_is_file(config: &Path) -> Result<ConfigKind, String> {
     match std::fs::metadata(config) {
-        Ok(metadata) => Ok(metadata.is_file()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Ok(metadata) if metadata.is_file() => Ok(ConfigKind::File),
+        Ok(_) => Ok(ConfigKind::Other),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(ConfigKind::Missing),
         Err(e) => Err(format!("cannot tell whether {} is a file: {e}", config.display())),
     }
 }
@@ -249,7 +260,7 @@ pub fn plan_arguments(
     config: &Path,
     key: &str,
     arguments: Result<Option<String>, String>,
-    config_is_file: impl FnOnce() -> Result<bool, String>,
+    config_is_file: impl FnOnce() -> Result<ConfigKind, String>,
 ) -> ArgumentsPlan {
     let arguments = match arguments {
         Ok(Some(arguments)) => arguments,
@@ -257,27 +268,36 @@ pub fn plan_arguments(
         Err(cause) => return ArgumentsPlan::Leave(arguments_unreadable(key, &cause)),
     };
     let value = format!("{arguments:?}");
+    const WRITE: &str = "write the config (README, \"Shell configuration\")";
     match config_is_file() {
-        Ok(true) => ArgumentsPlan::Remove(value),
-        Ok(false) => ArgumentsPlan::Leave(arguments_left(
+        Ok(ConfigKind::File) => ArgumentsPlan::Remove(value),
+        Ok(ConfigKind::Missing) => ArgumentsPlan::Leave(arguments_left(
             key,
             &value,
             &format!("there is no {} to hold it", config.display()),
+            WRITE,
+        )),
+        Ok(ConfigKind::Other) => ArgumentsPlan::Leave(arguments_left(
+            key,
+            &value,
+            &format!("{} is not a file, so it cannot hold it", config.display()),
+            "replace what is at that path with the config (README, \"Shell configuration\")",
         )),
         Err(cause) => ArgumentsPlan::Leave(arguments_left(
             key,
             &value,
             &format!("{cause}, so it is not known whether there is a config to hold it"),
+            WRITE,
         )),
     }
 }
 
 /// The notice for a `DefaultShellArguments` `apply` leaves: `DefaultShell` is ssh-broker by now, `why`
-/// says why there is no config to hold the value, and `value` is how it was read.
-pub fn arguments_left(key: &str, value: &str, why: &str) -> String {
+/// says why there is no config to hold the value, `fix` what to do about that, and `value` is how it was read.
+pub fn arguments_left(key: &str, value: &str, why: &str, fix: &str) -> String {
     format!(
         "apply: left DefaultShellArguments ({value}) under HKLM\\{key}: {why}, and sshd passes it to ssh-broker \
-         ahead of -c; write the config (README, \"Shell configuration\") and run apply again, which removes it"
+         ahead of -c; {fix} and run apply again, which removes it"
     )
 }
 

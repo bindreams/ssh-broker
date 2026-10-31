@@ -6,7 +6,7 @@ use std::path::Path;
 
 use super::{Handover, Stream, hand_over, remove_arguments, replace_shell};
 use crate::provision::registry::{SshdShell, SshdShellReading};
-use crate::provision::system_config::{Decision, Skip};
+use crate::provision::system_config::{ConfigKind, Decision, Skip};
 use crate::shell::config::ShellBlock;
 
 const PWSH7: &str = r"C:\Program Files\PowerShell\7\pwsh.exe";
@@ -19,6 +19,12 @@ fn previous() -> SshdShell {
         arguments: Some("-NoProfile".into()),
         escape_arguments: false,
     }
+}
+
+/// A handover for the tests that stand in for `carry` and look at its order, not at what it proves. The
+/// field is private to `handover`, which this module is inside.
+fn a_handover() -> Handover {
+    Handover(())
 }
 
 fn block() -> ShellBlock {
@@ -160,6 +166,23 @@ fn a_nothing_to_carry_skip_for_a_foreign_shell_prints_the_previous_values() {
     assert!(lines[0].1.contains(PWSH7), "{}", lines[0].1);
 }
 
+/// The proof is only given for a shell that has nothing to carry: a foreign one gets none, whoever asks.
+#[test]
+fn nothing_to_carry_is_proven_only_for_ssh_broker_or_no_shell() {
+    assert!(Handover::nothing_to_carry(&previous()).is_none());
+    assert!(Handover::nothing_to_carry(&SshdShell::none()).is_some());
+    for own in [
+        r"C:\ProgramData\ssh-broker\ssh-broker.exe",
+        r"C:\ProgramData\ssh-broker\ssh-broker",
+    ] {
+        let shell = SshdShell {
+            shell: Some(own.into()),
+            ..previous()
+        };
+        assert!(Handover::nothing_to_carry(&shell).is_some(), "{own}");
+    }
+}
+
 fn reading() -> SshdShellReading {
     SshdShellReading {
         shell: Ok(Some(PWSH7.into())),
@@ -181,7 +204,7 @@ fn an_unreadable_previous_shell_stops_before_the_flip() {
         || unreadable.into_shell(r"HKLM\SOFTWARE\OpenSSH"),
         |_| {
             carried.set(true);
-            Handover::nothing_to_carry()
+            a_handover()
         },
         |_| {
             flipped.set(true);
@@ -215,7 +238,7 @@ fn a_readable_previous_shell_is_carried_and_then_flipped() {
         |previous| {
             assert_eq!(previous.shell.as_deref(), Some(PWSH7));
             order.borrow_mut().push("carry");
-            Handover::nothing_to_carry()
+            a_handover()
         },
         |_| {
             order.borrow_mut().push("flip");
@@ -232,7 +255,7 @@ fn a_readable_previous_shell_is_carried_and_then_flipped() {
 fn a_failed_flip_is_the_error_and_says_the_default_shell_was_not_changed() {
     let error = replace_shell(
         || reading().into_shell("location"),
-        |_| Handover::nothing_to_carry(),
+        |_| a_handover(),
         |_| -> anyhow::Result<()> { anyhow::bail!("write failed") },
     )
     .unwrap_err();
@@ -263,7 +286,7 @@ fn an_unreadable_value_stops_the_flip_only_for_a_shell_that_is_not_ssh_broker() 
             || unreadable_arguments(shell).into_shell("location"),
             |_| {
                 carried.set(true);
-                Handover::nothing_to_carry()
+                a_handover()
             },
             |_| {
                 flipped.set(true);
@@ -286,7 +309,11 @@ enum Event {
 }
 
 /// Run `remove_arguments` and return what happened, in order. `remove_fails` makes the removal fail.
-fn removal(read: Result<Option<&str>, &str>, config_is_file: Result<bool, &str>, remove_fails: bool) -> Vec<Event> {
+fn removal(
+    read: Result<Option<&str>, &str>,
+    config_is_file: Result<ConfigKind, &str>,
+    remove_fails: bool,
+) -> Vec<Event> {
     let events = std::cell::RefCell::new(Vec::new());
     remove_arguments(
         Path::new(CONFIG),
@@ -309,7 +336,7 @@ fn removal(read: Result<Option<&str>, &str>, config_is_file: Result<bool, &str>,
 /// before the delete runs, and the delete is confirmed after it.
 #[test]
 fn the_arguments_are_printed_before_they_are_removed_and_the_removal_is_confirmed_after() {
-    let events = removal(Ok(Some("-NoLogo")), Ok(true), false);
+    let events = removal(Ok(Some("-NoLogo")), Ok(ConfigKind::File), false);
     let [Event::Said(first, before), Event::Removed, Event::Said(second, after)] = &events[..] else {
         panic!("{events:?}");
     };
@@ -326,7 +353,7 @@ fn the_arguments_are_printed_before_they_are_removed_and_the_removal_is_confirme
 
 #[test]
 fn a_failed_removal_was_announced_first_and_says_the_cause_and_that_the_next_apply_tries_again() {
-    let events = removal(Ok(Some("-NoLogo")), Ok(true), true);
+    let events = removal(Ok(Some("-NoLogo")), Ok(ConfigKind::File), true);
     let [Event::Said(_, before), Event::Removed, Event::Said(Stream::Err, after)] = &events[..] else {
         panic!("{events:?}");
     };
@@ -339,9 +366,10 @@ fn a_failed_removal_was_announced_first_and_says_the_cause_and_that_the_next_app
 #[test]
 fn arguments_that_are_not_removed_are_never_removed_and_a_value_that_is_set_is_said() {
     for (read, config_is_file) in [
-        (Err("i/o error"), Ok(true)),
-        (Err("i/o error"), Ok(false)),
-        (Ok(Some("-NoLogo")), Ok(false)),
+        (Err("i/o error"), Ok(ConfigKind::File)),
+        (Err("i/o error"), Ok(ConfigKind::Missing)),
+        (Ok(Some("-NoLogo")), Ok(ConfigKind::Missing)),
+        (Ok(Some("-NoLogo")), Ok(ConfigKind::Other)),
         (Ok(Some("-NoLogo")), Err("cannot tell")),
     ] {
         let events = removal(read, config_is_file, false);
@@ -354,5 +382,5 @@ fn arguments_that_are_not_removed_are_never_removed_and_a_value_that_is_set_is_s
 
 #[test]
 fn no_arguments_say_nothing_and_remove_nothing() {
-    assert_eq!(removal(Ok(None), Ok(true), false), vec![]);
+    assert_eq!(removal(Ok(None), Ok(ConfigKind::File), false), vec![]);
 }

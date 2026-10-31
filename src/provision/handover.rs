@@ -11,7 +11,7 @@
 use std::path::Path;
 
 use super::registry::{SshdShell, UnreadShell};
-use super::system_config::{self, ArgumentsPlan, Decision};
+use super::system_config::{self, ArgumentsPlan, ConfigKind, Decision};
 use crate::shell::config::ShellBlock;
 
 /// Where a notice goes.
@@ -35,12 +35,10 @@ pub fn say_to_console(stream: Stream, text: &str) {
 pub struct Handover(());
 
 impl Handover {
-    /// The previous shell is ssh-broker's own, or there is none (sshd ran the built-in `cmd.exe`):
-    /// no value is lost by replacing it. [`hand_over`] decides that from the shell itself; this is `pub`
-    /// only for the integration tests, which have no way into the crate's `cfg(test)` code, and no
-    /// production code calls it.
-    pub fn nothing_to_carry() -> Self {
-        Self(())
+    /// The proof for a previous shell that is ssh-broker's own, or none (sshd ran the built-in `cmd.exe`):
+    /// no value is lost by replacing it ([`system_config::nothing_to_carry`]). Any other shell gets `None`.
+    pub fn nothing_to_carry(previous: &SshdShell) -> Option<Self> {
+        system_config::nothing_to_carry(previous).then_some(Self(()))
     }
 
     /// The config now holds the previous shell; `text` says so.
@@ -101,8 +99,8 @@ pub fn hand_over(
     create: impl FnOnce(&ShellBlock) -> anyhow::Result<bool>,
     say: &mut dyn FnMut(Stream, &str),
 ) -> Handover {
-    if system_config::nothing_to_carry(previous) {
-        return Handover::nothing_to_carry();
+    if let Some(handover) = Handover::nothing_to_carry(previous) {
+        return handover;
     }
     let skip = match decision {
         Decision::Write(block) => match create(&block) {
@@ -135,7 +133,7 @@ pub fn remove_arguments(
     config: &Path,
     key: &str,
     read: Result<Option<String>, String>,
-    config_is_file: impl FnOnce() -> Result<bool, String>,
+    config_is_file: impl FnOnce() -> Result<ConfigKind, String>,
     remove: impl FnOnce(&ShownValue) -> anyhow::Result<()>,
     say: &mut dyn FnMut(Stream, &str),
 ) {

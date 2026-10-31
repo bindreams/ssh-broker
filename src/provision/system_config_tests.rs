@@ -4,9 +4,9 @@
 use std::path::{Path, PathBuf};
 
 use super::{
-    ArgumentsPlan, Decision, Skip, SshdClass, arguments_left, arguments_not_removed, arguments_removed, carried_block,
-    classify, config_is_file, create_once_at, decide, image_dir, not_written, nothing_to_carry, plan_arguments,
-    remove_temp, render, skip_notice, sshd_search_dirs,
+    ArgumentsPlan, ConfigKind, Decision, Skip, SshdClass, arguments_left, arguments_not_removed, arguments_removed,
+    carried_block, classify, config_is_file, create_once_at, decide, image_dir, not_written, nothing_to_carry,
+    plan_arguments, remove_temp, render, skip_notice, sshd_search_dirs,
 };
 use crate::provision::registry::SshdShell;
 use crate::shell::Escaping;
@@ -198,7 +198,7 @@ fn decide_table() {
         "ssh-broker",
     ] {
         assert_eq!(
-            decide(&sshd(own), Ok(false), &dirs, &exists, &not_system),
+            decide(&sshd(own), Ok(ConfigKind::Missing), &dirs, &exists, &not_system),
             Decision::Skip(Skip::NothingToCarry),
             "{own}"
         );
@@ -210,7 +210,7 @@ fn decide_table() {
         r"C:\x\ssh-broker.exe.bak",
     ] {
         assert_ne!(
-            decide(&sshd(other), Ok(false), &dirs, &exists, &not_system),
+            decide(&sshd(other), Ok(ConfigKind::Missing), &dirs, &exists, &not_system),
             Decision::Skip(Skip::NothingToCarry),
             "{other}"
         );
@@ -223,19 +223,19 @@ fn decide_table() {
         escape_arguments: false,
     };
     assert_eq!(
-        decide(&none, Ok(false), &dirs, &exists, &not_system),
+        decide(&none, Ok(ConfigKind::Missing), &dirs, &exists, &not_system),
         Decision::Skip(Skip::NothingToCarry)
     );
 
     assert_eq!(
-        decide(&sshd(PWSH7), Ok(true), &dirs, &exists, &not_system),
+        decide(&sshd(PWSH7), Ok(ConfigKind::File), &dirs, &exists, &not_system),
         Decision::Skip(Skip::FileExists)
     );
     assert_eq!(
-        decide(&sshd(PWSH7), Ok(false), &dirs, &missing, &not_system),
+        decide(&sshd(PWSH7), Ok(ConfigKind::Missing), &dirs, &missing, &not_system),
         Decision::Skip(Skip::PreviousMissing("there is no such file".into()))
     );
-    match decide(&sshd(PWSH7), Ok(false), &dirs, &exists, &not_system) {
+    match decide(&sshd(PWSH7), Ok(ConfigKind::Missing), &dirs, &exists, &not_system) {
         Decision::Write(block) => assert_eq!(block.start, [PWSH7]),
         other => panic!("{other:?}"),
     }
@@ -243,7 +243,7 @@ fn decide_table() {
     let system_cmd = |p: &Path| p == Path::new(r"C:\Windows\System32\cmd.exe");
     match decide(
         &sshd(r"C:\Windows\System32\cmd.exe"),
-        Ok(false),
+        Ok(ConfigKind::Missing),
         &dirs,
         &exists,
         &system_cmd,
@@ -261,19 +261,19 @@ fn decide_reports_what_it_could_not_find_out_unless_nothing_depends_on_it() {
     let exists = |_: &[PathBuf], p: &Path| Ok(p.to_path_buf());
     let not_system = |_: &Path| false;
     let no_dirs = || Err::<Vec<PathBuf>, String>("no system directory".into());
-    let no_config: Result<bool, String> = Err("cannot tell whether c.yaml exists".into());
+    let no_config: Result<ConfigKind, String> = Err("cannot tell whether c.yaml exists".into());
 
     assert_eq!(
         decide(&sshd(PWSH7), no_config.clone(), &|| Ok(vec![]), &exists, &not_system),
         Decision::Skip(Skip::Unchecked("cannot tell whether c.yaml exists".into()))
     );
     assert_eq!(
-        decide(&sshd(PWSH7), Ok(false), &no_dirs, &exists, &not_system),
+        decide(&sshd(PWSH7), Ok(ConfigKind::Missing), &no_dirs, &exists, &not_system),
         Decision::Skip(Skip::Unchecked("no system directory".into()))
     );
     // A config that is there decides first; and with no previous shell, or ssh-broker's own, nothing is replaced.
     assert_eq!(
-        decide(&sshd(PWSH7), Ok(true), &no_dirs, &exists, &not_system),
+        decide(&sshd(PWSH7), Ok(ConfigKind::File), &no_dirs, &exists, &not_system),
         Decision::Skip(Skip::FileExists)
     );
     assert_eq!(
@@ -315,16 +315,22 @@ fn decide_looks_up_the_directories_only_when_it_needs_them() {
         arguments: None,
         escape_arguments: false,
     };
-    decide(&none, Ok(false), &dirs, &exists, &|_| false);
-    decide(&sshd(r"C:\x\ssh-broker.exe"), Ok(false), &dirs, &exists, &|_| false);
-    decide(&sshd(PWSH7), Ok(true), &dirs, &exists, &|_| false);
+    decide(&none, Ok(ConfigKind::Missing), &dirs, &exists, &|_| false);
+    decide(
+        &sshd(r"C:\x\ssh-broker.exe"),
+        Ok(ConfigKind::Missing),
+        &dirs,
+        &exists,
+        &|_| false,
+    );
+    decide(&sshd(PWSH7), Ok(ConfigKind::File), &dirs, &exists, &|_| false);
     decide(&sshd(PWSH7), Err("cannot tell".into()), &dirs, &exists, &|_| false);
     assert_eq!(
         calls.get(),
         0,
         "looked the directories up for a decision that does not use them"
     );
-    decide(&sshd(PWSH7), Ok(false), &dirs, &exists, &|_| false);
+    decide(&sshd(PWSH7), Ok(ConfigKind::Missing), &dirs, &exists, &|_| false);
     assert_eq!(calls.get(), 1);
 }
 
@@ -336,7 +342,7 @@ fn a_bare_shell_is_carried_as_the_file_sshd_found() {
     let found = |_: &[PathBuf], _: &Path| Ok(PathBuf::from(r"C:\Program Files\OpenSSH\powershell7.exe"));
     let mut prev = sshd("powershell7");
     prev.command_option = Some("-Command".into());
-    match decide(&prev, Ok(false), &|| Ok(vec![]), &found, &|_| false) {
+    match decide(&prev, Ok(ConfigKind::Missing), &|| Ok(vec![]), &found, &|_| false) {
         Decision::Write(block) => {
             assert_eq!(block.start, [r"C:\Program Files\OpenSSH\powershell7.exe"]);
             assert_eq!(block.with_command, Some(vec!["-Command".to_string()]));
@@ -344,7 +350,13 @@ fn a_bare_shell_is_carried_as_the_file_sshd_found() {
         other => panic!("{other:?}"),
     }
     // A path is carried as written.
-    match decide(&sshd(r"C:\x\pwsh"), Ok(false), &|| Ok(vec![]), &found, &|_| false) {
+    match decide(
+        &sshd(r"C:\x\pwsh"),
+        Ok(ConfigKind::Missing),
+        &|| Ok(vec![]),
+        &found,
+        &|_| false,
+    ) {
         Decision::Write(block) => assert_eq!(block.start, [r"C:\x\pwsh"]),
         other => panic!("{other:?}"),
     }
@@ -697,11 +709,12 @@ const KEY: &str = r"SOFTWARE\OpenSSH";
 
 #[test]
 fn the_arguments_left_text_names_the_value_the_key_and_what_to_do_and_does_not_say_the_shell_is_unchanged() {
-    let text = arguments_left(KEY, "\"-NoLogo\"", "there is no config to hold it");
+    let text = arguments_left(KEY, "\"-NoLogo\"", "there is no config to hold it", "write the config");
     for part in [
         "-NoLogo",
         KEY,
         "there is no config to hold it",
+        "write the config",
         "DefaultShellArguments",
         "apply again",
     ] {
@@ -737,7 +750,7 @@ fn the_arguments_not_removed_text_names_the_value_and_the_cause_and_does_not_say
 
 const NO_LONGER_THERE: &str = "there is no";
 
-fn plan(arguments: Result<Option<&str>, &str>, config: Result<bool, &str>) -> ArgumentsPlan {
+fn plan(arguments: Result<Option<&str>, &str>, config: Result<ConfigKind, &str>) -> ArgumentsPlan {
     plan_arguments(
         Path::new(CONFIG),
         KEY,
@@ -755,7 +768,7 @@ fn no_arguments_to_pass_on_is_nothing_to_do_and_the_config_is_not_looked_at() {
 #[test]
 fn arguments_that_are_read_and_have_a_config_to_go_to_are_removed_with_the_value_shown() {
     assert_eq!(
-        plan(Ok(Some("-NoLogo")), Ok(true)),
+        plan(Ok(Some("-NoLogo")), Ok(ConfigKind::File)),
         ArgumentsPlan::Remove("\"-NoLogo\"".to_owned())
     );
 }
@@ -764,7 +777,12 @@ fn arguments_that_are_read_and_have_a_config_to_go_to_are_removed_with_the_value
 /// is, it is left, and the text gives the cause.
 #[test]
 fn arguments_that_could_not_be_read_are_never_removed_and_the_cause_is_said() {
-    for config in [Ok(true), Ok(false), Err("cannot tell")] {
+    for config in [
+        Ok(ConfigKind::File),
+        Ok(ConfigKind::Missing),
+        Ok(ConfigKind::Other),
+        Err("cannot tell"),
+    ] {
         let ArgumentsPlan::Leave(text) = plan(Err("i/o error"), config) else {
             panic!("{config:?}: removed or ignored a value it could not read");
         };
@@ -781,12 +799,32 @@ fn arguments_that_could_not_be_read_are_never_removed_and_the_cause_is_said() {
 
 #[test]
 fn arguments_with_no_config_are_left_and_the_text_says_there_is_none() {
-    let ArgumentsPlan::Leave(text) = plan(Ok(Some("-NoLogo")), Ok(false)) else {
+    let ArgumentsPlan::Leave(text) = plan(Ok(Some("-NoLogo")), Ok(ConfigKind::Missing)) else {
         panic!("removed a value with no config to hold it");
     };
-    for part in ["-NoLogo", CONFIG, NO_LONGER_THERE, "apply again"] {
+    for part in ["-NoLogo", CONFIG, NO_LONGER_THERE, "write the config", "apply again"] {
         assert!(text.contains(part), "{part}: {text}");
     }
+    assert!(!text.contains("is not a file"), "{text}");
+}
+
+/// Something else is at the path (a directory): the text does not say there is nothing there, and the
+/// advice is to replace what is there, which writing the config alone cannot do.
+#[test]
+fn arguments_with_something_that_is_not_a_file_at_the_config_path_are_left_and_the_text_says_so() {
+    let ArgumentsPlan::Leave(text) = plan(Ok(Some("-NoLogo")), Ok(ConfigKind::Other)) else {
+        panic!("removed a value although the config path holds no file");
+    };
+    for part in [
+        "-NoLogo",
+        &format!("{CONFIG} is not a file"),
+        "replace what is at that path with the config",
+        "apply again",
+    ] {
+        assert!(text.contains(part), "{part}: {text}");
+    }
+    assert!(!text.contains(NO_LONGER_THERE), "{text}");
+    assert!(!text.contains("write the config"), "{text}");
 }
 
 /// A check that failed does not know the config is absent: the value is left and the text says it cannot
@@ -815,18 +853,19 @@ fn arguments_with_a_config_that_could_not_be_checked_are_left_and_the_text_says_
 fn a_config_that_is_a_file_is_known_to_be_one_and_one_that_is_not_there_is_known_to_be_absent() {
     let dir = TempDir::new("is_file");
     let config = dir.0.join("config.yaml");
-    assert_eq!(config_is_file(&config), Ok(false));
+    assert_eq!(config_is_file(&config), Ok(ConfigKind::Missing));
     std::fs::write(&config, "").unwrap();
-    assert_eq!(config_is_file(&config), Ok(true));
+    assert_eq!(config_is_file(&config), Ok(ConfigKind::File));
 }
 
-/// A directory at the path holds no config: the loader cannot read it, so nothing is carried into it.
+/// A directory at the path holds no config, and is not "absent" either: the loader cannot read it, so nothing
+/// is carried into it, and the notice must not say there is nothing there.
 #[test]
 fn a_directory_at_the_config_path_is_not_a_config() {
     let dir = TempDir::new("is_file_dir");
     let config = dir.0.join("config.yaml");
     std::fs::create_dir(&config).unwrap();
-    assert_eq!(config_is_file(&config), Ok(false));
+    assert_eq!(config_is_file(&config), Ok(ConfigKind::Other));
 }
 
 /// A path the file system cannot answer for is an error that is not "absent": a NUL in the name is refused

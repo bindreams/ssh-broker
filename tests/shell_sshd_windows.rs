@@ -13,7 +13,6 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use ssh_broker::cmdline::split_args;
-use ssh_broker::provision::handover::Handover;
 use ssh_broker::provision::registry::{OPENSSH_KEY, set_default_shell_under};
 use ssh_broker::shim::spawn_line;
 use ssh_broker::socket_loc;
@@ -52,7 +51,7 @@ mod sshd_rig;
 mod stand_in;
 
 use account_fixture::{Account, ServiceLogon};
-use sshd_rig::{ConsoleClient, Login, Outcome, SshSession, run_client, set_stock_shell};
+use sshd_rig::{ConsoleClient, Login, Outcome, SshSession, no_shell_to_carry, run_client, set_stock_shell};
 use stand_in::Kit;
 
 /// A throwaway account sshd admits, a probe shell it can run, and (on request) its running session.
@@ -104,12 +103,8 @@ impl Rig {
     }
 
     fn broker_is_default_shell(&self) {
-        set_default_shell_under(
-            OPENSSH_KEY,
-            &self.kit.exe.to_string_lossy(),
-            &Handover::nothing_to_carry(),
-        )
-        .expect("set the shim as DefaultShell");
+        set_default_shell_under(OPENSSH_KEY, &self.kit.exe.to_string_lossy(), &no_shell_to_carry())
+            .expect("set the shim as DefaultShell");
     }
 
     /// `ssh host -- command` with (`tty`) or without a terminal.
