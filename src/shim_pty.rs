@@ -419,7 +419,7 @@ pub struct LocalChild {
 fn start_local(command_line: &str) -> Result<LocalChild, StartError> {
     use windows::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
     use windows::Win32::System::Console::STD_ERROR_HANDLE;
-    // ignore_ctrl_c();
+    ignore_ctrl_c();
     unsafe {
         let stdin = GetStdHandle(STD_INPUT_HANDLE)?;
         let stdout = GetStdHandle(STD_OUTPUT_HANDLE)?;
