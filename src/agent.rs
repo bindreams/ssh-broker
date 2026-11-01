@@ -89,14 +89,9 @@ fn start(args: AgentArgs) -> anyhow::Result<()> {
         args.background.as_ref(),
         crate::provision::probe::current_session_id(),
         &current_sid,
+        reset,
         crate::userdir::current_socket_location,
-        |logs| {
-            let guard = crate::filelog::init_in(logs, "agent.log")?;
-            if let Err(e) = &reset {
-                tracing::warn!("could not clear the inherited ignore of Ctrl+C: {e}");
-            }
-            Ok(guard)
-        },
+        |logs| crate::filelog::init_in(logs, "agent.log"),
         |location, session| serve(location, session, background),
     )
 }
@@ -122,6 +117,7 @@ fn start_with(
     background: Option<&BackgroundArgs>,
     session: u32,
     current_sid: &str,
+    reset: windows::core::Result<()>,
     locate: impl FnOnce() -> anyhow::Result<SocketLocation>,
     init_log: impl FnOnce(&Path) -> anyhow::Result<tracing_appender::non_blocking::WorkerGuard>,
     serve: impl FnOnce(&SocketLocation, u32) -> anyhow::Result<()>,
@@ -134,7 +130,7 @@ fn start_with(
     // Held to the end of the process and flushed by `end_process`, from whichever thread ends it:
     // dropping the guard stops the writer and later lines are lost. Until the log opens an error goes
     // to stderr, which a logon task discards; a hand-run agent shows it.
-    if let Some(log) = keep_log_or_report(init_log(&location.logs_dir()), &mut std::io::stderr()) {
+    if let Some(log) = keep_log_or_report(init_log(&location.logs_dir()), reset, &mut std::io::stderr()) {
         keep_log(log);
     }
     let result = serve(&location, session);
@@ -145,15 +141,28 @@ fn start_with(
 }
 
 /// Keep the log if it opened. If not, say why on `stderr` and go on: serving does not need a log.
+/// A failed `reset` (see [`reset_inherited_start_state`]) goes to the same place as the log.
 #[cfg(windows)]
 fn keep_log_or_report(
     log: anyhow::Result<tracing_appender::non_blocking::WorkerGuard>,
+    reset: Result<(), impl std::fmt::Display>,
     stderr: &mut dyn std::io::Write,
 ) -> Option<tracing_appender::non_blocking::WorkerGuard> {
     match log {
-        Ok(guard) => Some(guard),
+        Ok(guard) => {
+            if let Err(e) = reset {
+                tracing::warn!("could not clear the inherited ignore of Ctrl+C: {e}");
+            }
+            Some(guard)
+        }
         Err(e) => {
             let _ = writeln!(stderr, "ssh-broker agent: serving without a log: {e:#}");
+            if let Err(e) = reset {
+                let _ = writeln!(
+                    stderr,
+                    "ssh-broker agent: could not clear the inherited ignore of Ctrl+C: {e}"
+                );
+            }
             None
         }
     }

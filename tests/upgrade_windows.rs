@@ -102,15 +102,18 @@ impl Drop for Install {
             let _ = reg(&["import", &file.to_string_lossy()]);
             let _ = std::fs::remove_file(file);
         }
-        // A delete still pending leaves `Ok` and a directory behind, which counts as a failure too.
+        // A delete still pending leaves `Ok` and a directory behind, and `NotFound` can come from an entry
+        // inside a tree that stays; either counts as a failure while the directory exists.
         let left = match std::fs::remove_dir_all(provision::BASE_DIR) {
-            Ok(()) => match Path::new(provision::BASE_DIR).try_exists() {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Some(e.to_string()),
+            removed => match Path::new(provision::BASE_DIR).try_exists() {
                 Ok(false) => None,
-                Ok(true) => Some("it still exists after the removal returned".to_owned()),
+                Ok(true) => Some(match removed {
+                    Ok(()) => "it still exists after the removal returned".to_owned(),
+                    Err(e) => format!("it still exists after the removal failed: {e}"),
+                }),
                 Err(e) => Some(format!("cannot tell whether it is gone: {e}")),
             },
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-            Err(e) => Some(e.to_string()),
         };
         if let Some(cause) = left {
             let message = format!(

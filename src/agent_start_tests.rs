@@ -41,6 +41,7 @@ fn start_refuses_session_zero_before_it_touches_anything() {
         None,
         0,
         ME,
+        Ok(()),
         || -> anyhow::Result<SocketLocation> { panic!("must not look for the profile in session 0") },
         |_| -> anyhow::Result<_> { panic!("must not open a log in session 0") },
         |_, _| panic!("must not serve in session 0"),
@@ -55,6 +56,7 @@ fn desktop_agent_still_refuses_session_zero_with_65() {
         None,
         0,
         ME,
+        Ok(()),
         || -> anyhow::Result<SocketLocation> { panic!("must not look for the profile") },
         |_| -> anyhow::Result<_> { panic!("must not open a log") },
         |_, _| panic!("must not serve"),
@@ -71,6 +73,7 @@ fn expect_user_mismatch_exits_64_before_touching_the_folder() {
         Some(&args),
         2,
         ME,
+        Ok(()),
         || -> anyhow::Result<SocketLocation> { panic!("must not look for the profile for another user") },
         |_| -> anyhow::Result<_> { panic!("must not open a log for another user") },
         |_, _| panic!("must not serve another user"),
@@ -87,6 +90,7 @@ fn locate_failure_exits_66() {
         Some(&args),
         2,
         ME,
+        Ok(()),
         || anyhow::bail!("the account has no profile directory"),
         |_| -> anyhow::Result<_> { panic!("must not open a log without a folder") },
         |_, _| panic!("must not serve without a folder"),
@@ -111,6 +115,7 @@ fn folder_refusal_exits_67() {
         Some(&args),
         2,
         ME,
+        Ok(()),
         || Ok(loc.clone()),
         |_| -> anyhow::Result<_> { panic!("must not open a log in a refused folder") },
         |_, _| panic!("must not serve from a refused folder"),
@@ -130,6 +135,7 @@ fn background_agent_is_allowed_in_session_zero() {
         Some(&args),
         0,
         ME,
+        Ok(()),
         || Ok(loc.clone()),
         |_| Ok(guard()),
         |_, session| {
@@ -151,6 +157,7 @@ fn start_makes_the_private_folder_then_serves_that_session_from_it() {
         None,
         3,
         ME,
+        Ok(()),
         || Ok(loc.clone()),
         |logs| {
             assert_eq!(logs, loc.logs_dir());
@@ -180,6 +187,7 @@ fn start_serves_without_a_log_when_the_log_cannot_be_opened() {
         None,
         3,
         ME,
+        Ok(()),
         || Ok(loc.clone()),
         |_| anyhow::bail!("the disk is full"),
         |_, _| {
@@ -193,6 +201,58 @@ fn start_serves_without_a_log_when_the_log_cannot_be_opened() {
 }
 
 #[test]
+fn a_failed_reset_goes_to_stderr_beside_the_log_failure_when_the_log_does_not_open() {
+    let mut stderr = Vec::new();
+    let kept = keep_log_or_report(
+        Err(anyhow::anyhow!("the disk is full")),
+        Err("access denied"),
+        &mut stderr,
+    );
+    assert!(kept.is_none());
+    let stderr = String::from_utf8(stderr).unwrap();
+    assert!(stderr.contains("serving without a log: the disk is full"), "{stderr}");
+    assert!(
+        stderr.contains("could not clear the inherited ignore of Ctrl+C: access denied"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn a_failed_reset_goes_to_the_log_when_it_opens() {
+    let captured = Captured::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer({
+            let captured = captured.clone();
+            move || captured.clone()
+        })
+        .with_ansi(false)
+        .finish();
+    let mut stderr = Vec::new();
+    let kept = tracing::subscriber::with_default(subscriber, || {
+        keep_log_or_report(Ok(guard()), Err("access denied"), &mut stderr)
+    });
+    assert!(kept.is_some());
+    assert!(stderr.is_empty(), "{}", String::from_utf8_lossy(&stderr));
+    let logged = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+    assert!(
+        logged.contains("could not clear the inherited ignore of Ctrl+C: access denied"),
+        "{logged}"
+    );
+}
+
+#[test]
+fn a_reset_that_worked_says_nothing_either_way() {
+    let mut stderr = Vec::new();
+    keep_log_or_report(
+        Err(anyhow::anyhow!("the disk is full")),
+        Ok::<(), &str>(()),
+        &mut stderr,
+    );
+    let stderr = String::from_utf8(stderr).unwrap();
+    assert!(!stderr.contains("Ctrl+C"), "{stderr}");
+}
+
+#[test]
 fn start_returns_the_error_serving_stopped_with() {
     let profile = TempProfile::new("start-err");
     let loc = profile.location();
@@ -200,6 +260,7 @@ fn start_returns_the_error_serving_stopped_with() {
         None,
         3,
         ME,
+        Ok(()),
         || Ok(loc.clone()),
         |_| Ok(guard()),
         |_, _| anyhow::bail!("listener broke"),
@@ -240,6 +301,7 @@ fn failure_after_the_log_opens_exits_1_and_logs_the_cause() {
             None,
             3,
             ME,
+            Ok(()),
             || Ok(loc.clone()),
             |_| Ok(guard()),
             |_, _| anyhow::bail!("the listener broke"),
@@ -261,6 +323,7 @@ fn a_background_agent_opens_its_log_then_serves_and_signals_nothing_else() {
         Some(&args),
         2,
         ME,
+        Ok(()),
         || Ok(loc.clone()),
         |_| {
             events.borrow_mut().push("log");
