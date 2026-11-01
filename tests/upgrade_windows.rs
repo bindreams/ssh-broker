@@ -102,44 +102,53 @@ impl Drop for Install {
             let _ = reg(&["import", &file.to_string_lossy()]);
             let _ = std::fs::remove_file(file);
         }
-        match std::fs::remove_dir_all(provision::BASE_DIR) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => {
-                let message = format!(
-                    "cannot remove {}: {e}
-processes whose image is under it:
-{}",
-                    provision::BASE_DIR,
-                    install_holders()
-                );
-                // A panic during an unwind aborts the test binary.
-                if std::thread::panicking() {
-                    eprintln!("{message}");
-                } else {
-                    panic!("{message}");
-                }
+        // A delete still pending leaves `Ok` and a directory behind, which counts as a failure too.
+        let left = match std::fs::remove_dir_all(provision::BASE_DIR) {
+            Ok(()) => match Path::new(provision::BASE_DIR).try_exists() {
+                Ok(false) => None,
+                Ok(true) => Some("it still exists after the removal returned".to_owned()),
+                Err(e) => Some(format!("cannot tell whether it is gone: {e}")),
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => Some(e.to_string()),
+        };
+        if let Some(cause) = left {
+            let message = format!(
+                "cannot remove {}: {cause}\nprocesses whose image or command line contains it:\n{}",
+                provision::BASE_DIR,
+                install_holders()
+            );
+            // A panic during an unwind aborts the test binary, and so does `eprintln!` on a closed stderr.
+            if std::thread::panicking() {
+                use std::io::Write as _;
+                let _ = writeln!(std::io::stderr(), "{message}");
+            } else {
+                panic!("{message}");
             }
         }
     }
 }
 
-/// The processes whose image is under the install directory, one `pid image` per line.
+/// The processes whose image path or command line contains the install directory, one per line as
+/// `pid image: path` or `pid command line: text`. Says so when there are none, and when the listing
+/// itself failed.
 fn install_holders() -> String {
+    let dir = provision::BASE_DIR;
     let script = format!(
-        "Get-CimInstance Win32_Process | Where-Object {{ $_.ExecutablePath -like '{}*' }} |          ForEach-Object {{ \"$($_.ProcessId) $($_.ExecutablePath)\" }}",
-        provision::BASE_DIR
+        "$ErrorActionPreference = 'Stop'; \
+         Get-CimInstance Win32_Process | Where-Object {{ $_.ProcessId -ne $PID }} | ForEach-Object {{ \
+         if ($_.ExecutablePath -like '{dir}*') {{ \"$($_.ProcessId) image: $($_.ExecutablePath)\" }}; \
+         if ($_.CommandLine -like '*{dir}*') {{ \"$($_.ProcessId) command line: $($_.CommandLine)\" }} }}"
     );
     match desktop::output(Command::new("powershell").args(["-NoProfile", "-NonInteractive", "-Command", &script])) {
-        Ok(out) => {
-            let listing = String::from_utf8_lossy(&out.stdout);
-            if listing.trim().is_empty() {
-                format!("(none) {}", String::from_utf8_lossy(&out.stderr).trim())
-            } else {
-                listing.into_owned()
-            }
-        }
-        Err(e) => format!("cannot list processes: {e}"),
+        Ok(out) if !out.status.success() => format!(
+            "the listing failed ({}): {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        ),
+        Ok(out) if out.stdout.iter().all(u8::is_ascii_whitespace) => "no process found".to_owned(),
+        Ok(out) => String::from_utf8_lossy(&out.stdout).into_owned(),
+        Err(e) => format!("the listing failed: cannot start powershell: {e}"),
     }
 }
 
