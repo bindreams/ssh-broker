@@ -376,7 +376,7 @@ fn a_command_written_with_the_password_runs_in_the_session() {
 /// Elevated (CI only). The prompt path starts the agent through the logon call from a shim that ignores
 /// Ctrl+C, and the agent starts with that setting. A program the session runs still gets a Ctrl+C: the
 /// probe says `event` for the first one it receives, and prints nothing more if it never comes. The
-/// session then takes input still.
+/// session then takes input still, typed once cmd shows its prompt again.
 ///
 /// The session's shell is `cmd.exe`. PowerShell empties its console input when a Ctrl+C reaches it, on a
 /// thread of its own that can run after its prompt is back (`ConsoleHost.HandleBreak`), so a line typed
@@ -399,12 +399,16 @@ fn a_program_in_the_session_gets_ctrl_c() {
         "the login fell back to a plain shell instead of starting a session:\n{shown}"
     );
 
-    run.type_line(&format!("\"{}\"", probe.display()));
+    // `no-stdin`: the probe reads no input, so nothing typed later can go to it.
+    run.type_line(&format!("\"{}\" no-stdin", probe.display()));
     run.read_until("ready");
+    // The prompts shown so far; the next one is cmd's, back from the probe.
+    let prompts = run.text().matches('>').count();
     run.ctrl_c();
     run.read_until("finished.");
     let shown = run.text();
     assert!(shown.contains("event "), "the probe got no Ctrl+C:\n{shown}");
+    run.read_until_count(">", prompts + 1);
     // `^` keeps the marker out of the echo of the typed line.
     run.type_line("echo session-^up");
     run.read_until("session-up");
