@@ -1,10 +1,9 @@
 //! Test stand-in for a program that answers console control events: prints `ready`, then one
 //! `event <n>` line for the first Ctrl+C or Ctrl+Break that reaches it, or `stdin` for the first line
-//! read from its input, and ends with `finished.`. With the argument `reenable` it first clears the
-//! "ignore Ctrl+C" setting a parent can leave (inherited by its children), and prints `cleared`. With
-//! `no-stdin` it reads nothing, so it never takes input meant for a program that runs after it. With
-//! `raise-ctrl-c` or `raise-ctrl-break` it raises that event on every process of its console, after
-//! `ready`. Only Windows has console control events.
+//! read from its input, and ends with `finished.`. With the argument `no-stdin` it reads nothing, so it
+//! never takes input meant for a program that runs after it. With `raise-ctrl-c` or `raise-ctrl-break` it
+//! raises that event on every process of its console, after `ready`. Only Windows has console control
+//! events.
 
 #[cfg(windows)]
 fn main() {
@@ -26,11 +25,6 @@ fn main() {
     let (sender, receiver) = mpsc::channel();
     EVENTS.set(Mutex::new(sender)).unwrap();
     let has_arg = |name| std::env::args().skip(1).any(|arg| arg == name);
-    if has_arg("reenable") {
-        // SAFETY: no pointers.
-        unsafe { SetConsoleCtrlHandler(None, false) }.unwrap();
-        println!("cleared");
-    }
     // SAFETY: `handler` has the signature the call needs and lives as long as the process.
     unsafe { SetConsoleCtrlHandler(Some(handler), true) }.unwrap();
     if !has_arg("no-stdin") {
