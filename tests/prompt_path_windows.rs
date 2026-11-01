@@ -375,27 +375,39 @@ fn a_command_written_with_the_password_runs_in_the_session() {
 
 /// Elevated (CI only). The prompt path starts the agent through the logon call from a shim that ignores
 /// Ctrl+C, and the agent starts with that setting. A program the session runs still gets a Ctrl+C: the
-/// probe says `event` for the first one it receives, and prints nothing more if it never comes.
+/// probe says `event` for the first one it receives, and prints nothing more if it never comes. The
+/// session then takes input still.
+///
+/// The session's shell is `cmd.exe`. PowerShell empties its console input when a Ctrl+C reaches it, on a
+/// thread of its own that can run after its prompt is back (`ConsoleHost.HandleBreak`), so a line typed
+/// at once after the probe ends can be lost to PowerShell, and the next wait never ends.
 #[test]
 fn a_program_in_the_session_gets_ctrl_c() {
     let _machine = machine::shared();
     let kit = kit("pp17");
     let account = Account::create("pp17", true);
+    account.write_user_config("shell: cmd.exe\n");
     let probe = kit.path("ctrl_probe.exe");
     std::fs::copy(command_line_probe::example("ctrl_probe"), &probe).unwrap();
     let mut run = start_run(&kit, &account);
     run.read_until(PROMPT);
     run.type_line(&account.password);
-    expect_session(&mut run);
-    assert_relayed(&mut run);
+    run.read_until("Microsoft Windows [Version");
+    let shown = run.text();
+    assert!(
+        !shown.contains(COST),
+        "the login fell back to a plain shell instead of starting a session:\n{shown}"
+    );
 
-    run.type_line(&format!("& '{}'", probe.display()));
+    run.type_line(&format!("\"{}\"", probe.display()));
     run.read_until("ready");
     run.ctrl_c();
     run.read_until("finished.");
     let shown = run.text();
     assert!(shown.contains("event "), "the probe got no Ctrl+C:\n{shown}");
-    say(&mut run, "session-up");
+    // `^` keeps the marker out of the echo of the typed line.
+    run.type_line("echo session-^up");
+    run.read_until("session-up");
     leave(&mut run);
 }
 
