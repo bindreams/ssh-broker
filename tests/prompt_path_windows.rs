@@ -51,6 +51,8 @@ const WAY_OUT: &str = "Press Ctrl+C for a plain shell.";
 const COST: &str = "starting a plain shell, without DPAPI";
 /// The start of a PowerShell prompt, which both the relayed shell and the plain shell show.
 const SHELL_PROMPT: &str = "PS C:\\";
+/// The text of the prompt `a_program_in_the_session_gets_ctrl_c` sets in cmd.
+const SESSION_PROMPT: &str = "SBPROMPT";
 
 fn kit(tag: &str) -> Kit {
     Kit::broker_with_helper(tag)
@@ -399,33 +401,24 @@ fn a_program_in_the_session_gets_ctrl_c() {
         "the login fell back to a plain shell instead of starting a session:\n{shown}"
     );
 
+    // A prompt no other output contains: the echo of this line has `$G`, not the `>` it prints.
+    run.type_line(&format!("prompt {SESSION_PROMPT}$G"));
+    let prompt = format!("{SESSION_PROMPT}>");
+    run.read_until(&prompt);
     // `no-stdin`: the probe reads no input, so nothing typed later can go to it.
     run.type_line(&format!("\"{}\" no-stdin", probe.display()));
     run.read_until("ready");
-    // cmd's own prompt, as it printed it where the probe command was typed. It is shown once more
-    // when the probe has ended and cmd reads again; a bare `>` also occurs in VT sequences.
-    let shown = run.text();
-    let prompt = prompt_of_typed_line(&shown);
-    let prompts = shown.matches(prompt.as_str()).count();
+    let prompts = run.text().matches(prompt.as_str()).count();
     run.ctrl_c();
     run.read_until("finished.");
     let shown = run.text();
     assert!(shown.contains("event "), "the probe got no Ctrl+C:\n{shown}");
+    // cmd shows its prompt once more when the probe has ended and it reads again.
     run.read_until_count(&prompt, prompts + 1);
     // `^` keeps the marker out of the echo of the typed line.
     run.type_line("echo session-^up");
     run.read_until("session-up");
     leave(&mut run);
-}
-
-/// The prompt cmd printed on the line where a quoted command was typed: the text from the start of that
-/// line up to and including its `>`.
-fn prompt_of_typed_line(shown: &str) -> String {
-    let typed = shown
-        .find(">\"")
-        .unwrap_or_else(|| panic!("no typed command after a prompt in the transcript:\n{shown}"));
-    let line_start = shown[..typed].rfind('\n').map_or(0, |newline| newline + 1);
-    shown[line_start..=typed].to_string()
 }
 
 /// Elevated (CI only). A password with a character outside the BMP, typed as UTF-8
