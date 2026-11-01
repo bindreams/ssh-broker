@@ -149,7 +149,9 @@ fn install_holders() -> String {
             out.status,
             String::from_utf8_lossy(&out.stderr).trim()
         ),
-        Ok(out) if out.stdout.iter().all(u8::is_ascii_whitespace) => "no process found".to_owned(),
+        Ok(out) if out.stdout.iter().all(u8::is_ascii_whitespace) => {
+            "no process with that image or command line".to_owned()
+        }
         Ok(out) => String::from_utf8_lossy(&out.stdout).into_owned(),
         Err(e) => format!("the listing failed: cannot start powershell: {e}"),
     }

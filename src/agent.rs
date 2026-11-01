@@ -90,6 +90,7 @@ fn start(args: AgentArgs) -> anyhow::Result<()> {
         crate::provision::probe::current_session_id(),
         &current_sid,
         reset,
+        &mut std::io::stderr(),
         crate::userdir::current_socket_location,
         |logs| crate::filelog::init_in(logs, "agent.log"),
         |location, session| serve(location, session, background),
@@ -99,8 +100,8 @@ fn start(args: AgentArgs) -> anyhow::Result<()> {
 /// Clear what the process that started this agent can leave in it, so every route (the logon task, the
 /// boot task, the secondary-logon call of the prompt path) gives the same agent: the "ignore Ctrl+C"
 /// setting, which the secondary-logon call sets on its child and which the shells and commands of every
-/// session would inherit. Best effort: the agent serves without it, and [`start`] logs the failure once
-/// the log is open.
+/// session would inherit. Best effort: the agent serves without it, and [`keep_log_or_report`] reports a
+/// failure: in the log, or on stderr when the log does not open.
 #[cfg(windows)]
 fn reset_inherited_start_state() -> windows::core::Result<()> {
     use windows::Win32::System::Console::SetConsoleCtrlHandler;
@@ -113,11 +114,13 @@ fn reset_inherited_start_state() -> windows::core::Result<()> {
 /// `background` is `Some` for `agent --background`. The refusals before the log opens leave their
 /// exit code as the only record (see [`Refusal`]).
 #[cfg(windows)]
+#[allow(clippy::too_many_arguments)] // every input is a seam a test fills
 fn start_with(
     background: Option<&BackgroundArgs>,
     session: u32,
     current_sid: &str,
     reset: windows::core::Result<()>,
+    stderr: &mut dyn std::io::Write,
     locate: impl FnOnce() -> anyhow::Result<SocketLocation>,
     init_log: impl FnOnce(&Path) -> anyhow::Result<tracing_appender::non_blocking::WorkerGuard>,
     serve: impl FnOnce(&SocketLocation, u32) -> anyhow::Result<()>,
@@ -130,7 +133,7 @@ fn start_with(
     // Held to the end of the process and flushed by `end_process`, from whichever thread ends it:
     // dropping the guard stops the writer and later lines are lost. Until the log opens an error goes
     // to stderr, which a logon task discards; a hand-run agent shows it.
-    if let Some(log) = keep_log_or_report(init_log(&location.logs_dir()), reset, &mut std::io::stderr()) {
+    if let Some(log) = keep_log_or_report(init_log(&location.logs_dir()), reset, stderr) {
         keep_log(log);
     }
     let result = serve(&location, session);
