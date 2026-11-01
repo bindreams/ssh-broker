@@ -70,8 +70,10 @@ impl Install {
     fn capture() -> Install {
         assert!(
             !Path::new(provision::BASE_DIR).exists(),
-            "{} exists: this test installs there and would remove it",
-            provision::BASE_DIR
+            "{} exists: this test installs there and would remove it
+{}",
+            provision::BASE_DIR,
+            spike_state("capture refuses")
         );
         let file = std::env::temp_dir().join(format!("sb-openssh-{}.reg", std::process::id()));
         let _ = std::fs::remove_file(&file);
@@ -84,8 +86,73 @@ impl Install {
     }
 }
 
+/// SPIKE, NOT FOR MERGE: what is in the install directory and which processes belong to it.
+fn spike_state(label: &str) -> String {
+    fn walk(dir: &Path, depth: usize, out: &mut String) {
+        match std::fs::read_dir(dir) {
+            Ok(entries) => {
+                for entry in entries.flatten() {
+                    let meta = entry.metadata().ok();
+                    out.push_str(&format!(
+                        "{}{} {:?} {} bytes
+",
+                        "  ".repeat(depth),
+                        entry.path().display(),
+                        meta.as_ref().map(|m| m.file_type()),
+                        meta.as_ref().map(|m| m.len()).unwrap_or(0)
+                    ));
+                    if meta.is_some_and(|m| m.is_dir()) {
+                        walk(&entry.path(), depth + 1, out);
+                    }
+                }
+            }
+            Err(e) => out.push_str(&format!(
+                "{}cannot list {}: {e}
+",
+                "  ".repeat(depth),
+                dir.display()
+            )),
+        }
+    }
+    let mut text = format!(
+        "SPIKE {label} (pid {}):
+",
+        std::process::id()
+    );
+    if Path::new(provision::BASE_DIR).exists() {
+        walk(Path::new(provision::BASE_DIR), 1, &mut text);
+    } else {
+        text.push_str(
+            "  the install directory is absent
+",
+        );
+    }
+    for script in [
+        "Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'ssh-broker.exe' -or $_.ExecutablePath -like 'C:\\ProgramData\\ssh-broker*' -or $_.CommandLine -like '*ProgramData*ssh-broker*' } | ForEach-Object { \"proc $($_.ProcessId) parent=$($_.ParentProcessId) session=$($_.SessionId) created=$($_.CreationDate) $($_.CommandLine)\" }",
+        "(Get-ScheduledTask | Where-Object { $_.TaskName -like '*ssh-broker*' } | ForEach-Object { \"task $($_.TaskName) $($_.State)\" })",
+        "qwinsta",
+    ] {
+        let out =
+            desktop::output(Command::new("powershell").args(["-NoProfile", "-NonInteractive", "-Command", script]));
+        match out {
+            Ok(out) => text.push_str(&format!(
+                "{}{}
+",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            )),
+            Err(e) => text.push_str(&format!(
+                "powershell failed: {e}
+"
+            )),
+        }
+    }
+    text
+}
+
 impl Drop for Install {
     fn drop(&mut self) {
+        eprintln!("{}", spike_state("drop begins"));
         let canonical = provision::canonical_exe();
         let _ = taskscheduler::stop_instances(schtasks::AGENT_TASK, &canonical);
         let _ = desktop::output(Command::new("schtasks").args(["/Delete", "/TN", schtasks::AGENT_TASK, "/F"]));
@@ -102,7 +169,12 @@ impl Drop for Install {
             let _ = reg(&["import", &file.to_string_lossy()]);
             let _ = std::fs::remove_file(file);
         }
-        let _ = std::fs::remove_dir_all(provision::BASE_DIR);
+        let removed = std::fs::remove_dir_all(provision::BASE_DIR);
+        eprintln!("SPIKE remove_dir_all: {removed:?}");
+        eprintln!("{}", spike_state("drop ends"));
+        if (removed.is_err() || Path::new(provision::BASE_DIR).exists()) && !std::thread::panicking() {
+            panic!("SPIKE the install directory is left behind: {removed:?}");
+        }
     }
 }
 
@@ -125,7 +197,16 @@ fn agent_pids(sid: &str) -> Vec<u32> {
 
 /// Run `exe apply` and return its output.
 fn apply(exe: &Path) -> std::process::Output {
-    desktop::output(Command::new(exe).arg("apply")).expect("run apply")
+    let out = desktop::output(Command::new(exe).arg("apply")).expect("run apply");
+    eprintln!(
+        "SPIKE apply {} -> {:?}
+{}{}",
+        exe.display(),
+        out.status,
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    out
 }
 
 /// What the upgrade tests start from: the old build installed, an auto-login session running it from a
