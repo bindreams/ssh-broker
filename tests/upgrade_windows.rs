@@ -102,7 +102,44 @@ impl Drop for Install {
             let _ = reg(&["import", &file.to_string_lossy()]);
             let _ = std::fs::remove_file(file);
         }
-        let _ = std::fs::remove_dir_all(provision::BASE_DIR);
+        match std::fs::remove_dir_all(provision::BASE_DIR) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                let message = format!(
+                    "cannot remove {}: {e}
+processes whose image is under it:
+{}",
+                    provision::BASE_DIR,
+                    install_holders()
+                );
+                // A panic during an unwind aborts the test binary.
+                if std::thread::panicking() {
+                    eprintln!("{message}");
+                } else {
+                    panic!("{message}");
+                }
+            }
+        }
+    }
+}
+
+/// The processes whose image is under the install directory, one `pid image` per line.
+fn install_holders() -> String {
+    let script = format!(
+        "Get-CimInstance Win32_Process | Where-Object {{ $_.ExecutablePath -like '{}*' }} |          ForEach-Object {{ \"$($_.ProcessId) $($_.ExecutablePath)\" }}",
+        provision::BASE_DIR
+    );
+    match desktop::output(Command::new("powershell").args(["-NoProfile", "-NonInteractive", "-Command", &script])) {
+        Ok(out) => {
+            let listing = String::from_utf8_lossy(&out.stdout);
+            if listing.trim().is_empty() {
+                format!("(none) {}", String::from_utf8_lossy(&out.stderr).trim())
+            } else {
+                listing.into_owned()
+            }
+        }
+        Err(e) => format!("cannot list processes: {e}"),
     }
 }
 
