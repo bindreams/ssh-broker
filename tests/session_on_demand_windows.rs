@@ -22,6 +22,8 @@ mod account_fixture;
 mod agent_conn;
 #[path = "common/bounded_wait.rs"]
 mod bounded_wait;
+#[path = "common/command_line_probe.rs"]
+mod command_line_probe;
 #[path = "common/desktop.rs"]
 mod desktop;
 #[path = "common/hard_errors.rs"]
@@ -633,6 +635,44 @@ fn logout_exit_code_reaches_an_exec_client_inside_the_agent() {
         done.stdout
     );
     assert_eq!(done.exit, Some(0), "the shim exits with logout's code");
+}
+
+/// Elevated (CI only). The agent has the default Ctrl+C handler, and an exec command that raises Ctrl+C or
+/// Ctrl+Break on every process of its console must not reach it: the probe says `event` for the one it got
+/// itself, so the raise did happen, and the agent still serves afterwards.
+#[test]
+fn an_exec_command_raising_a_ctrl_event_on_its_console_does_not_end_the_agent() {
+    let _machine = machine::shared();
+    let kit = Kit::copy_of_broker("exctrl");
+    let account = Account::create("exctrl", true);
+    let probe = kit.path("ctrl_probe.exe");
+    std::fs::copy(command_line_probe::example("ctrl_probe"), &probe).unwrap();
+    let agent = BackgroundAgent::start(&kit, &account);
+
+    for (raise, event) in [("raise-ctrl-c", "event 0"), ("raise-ctrl-break", "event 1")] {
+        let mut session = AgentConn::connect(&agent.location);
+        session.start_exec(&format!("\"{}\" no-stdin {raise}", probe.display()));
+        session.end_stdin();
+        let done = session.read_to_end();
+        assert!(
+            done.stdout.contains(event),
+            "{raise}: the probe got no event; stdout: {:?}, stderr: {:?}",
+            done.stdout,
+            done.stderr
+        );
+        assert_eq!(done.exit, Some(0), "{raise}: the agent ended the session early");
+    }
+
+    let mut after = AgentConn::connect(&agent.location);
+    after.start_exec("cmd.exe /c echo still-serving");
+    after.end_stdin();
+    let done = after.read_to_end();
+    assert!(
+        done.stdout.contains("still-serving"),
+        "stdout: {:?}, stderr: {:?}",
+        done.stdout,
+        done.stderr
+    );
 }
 
 /// Ask the agent to end from inside it, over a second connection.

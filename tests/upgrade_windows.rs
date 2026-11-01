@@ -102,7 +102,58 @@ impl Drop for Install {
             let _ = reg(&["import", &file.to_string_lossy()]);
             let _ = std::fs::remove_file(file);
         }
-        let _ = std::fs::remove_dir_all(provision::BASE_DIR);
+        // `Ok` with a pending delete and `NotFound` from an entry inside a surviving tree both leave the
+        // directory; check that it is gone.
+        let left = match std::fs::remove_dir_all(provision::BASE_DIR) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Some(e.to_string()),
+            removed => match Path::new(provision::BASE_DIR).try_exists() {
+                Ok(false) => None,
+                Ok(true) => Some(match removed {
+                    Ok(()) => "it still exists after the removal returned".to_owned(),
+                    Err(e) => format!("it still exists after the removal failed: {e}"),
+                }),
+                Err(e) => Some(format!("cannot tell whether it is gone: {e}")),
+            },
+        };
+        if let Some(cause) = left {
+            let message = format!(
+                "cannot remove {}: {cause}\nprocesses whose image or command line contains it:\n{}",
+                provision::BASE_DIR,
+                install_holders()
+            );
+            // A panic during an unwind aborts the test binary, and so does `eprintln!` on a closed stderr.
+            if std::thread::panicking() {
+                use std::io::Write as _;
+                let _ = writeln!(std::io::stderr(), "{message}");
+            } else {
+                panic!("{message}");
+            }
+        }
+    }
+}
+
+/// The processes whose image path or command line contains the install directory, one per line as
+/// `pid image: path` or `pid command line: text`. Says so when there are none, and when the listing
+/// itself failed.
+fn install_holders() -> String {
+    let dir = provision::BASE_DIR;
+    let script = format!(
+        "$ErrorActionPreference = 'Stop'; \
+         Get-CimInstance Win32_Process | Where-Object {{ $_.ProcessId -ne $PID }} | ForEach-Object {{ \
+         if ($_.ExecutablePath -like '{dir}*') {{ \"$($_.ProcessId) image: $($_.ExecutablePath)\" }}; \
+         if ($_.CommandLine -like '*{dir}*') {{ \"$($_.ProcessId) command line: $($_.CommandLine)\" }} }}"
+    );
+    match desktop::output(Command::new("powershell").args(["-NoProfile", "-NonInteractive", "-Command", &script])) {
+        Ok(out) if !out.status.success() => format!(
+            "the listing failed ({}): {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        ),
+        Ok(out) if out.stdout.iter().all(u8::is_ascii_whitespace) => {
+            "no process with that image or command line".to_owned()
+        }
+        Ok(out) => String::from_utf8_lossy(&out.stdout).into_owned(),
+        Err(e) => format!("the listing failed: cannot start powershell: {e}"),
     }
 }
 

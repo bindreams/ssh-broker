@@ -88,25 +88,47 @@ fn start(args: AgentArgs) -> anyhow::Result<()> {
         args.background.as_ref(),
         crate::provision::probe::current_session_id(),
         &current_sid,
+        &mut std::io::stderr(),
+        reset_inherited_start_state,
         crate::userdir::current_socket_location,
         |logs| crate::filelog::init_in(logs, "agent.log"),
         |location, session| serve(location, session, background),
     )
 }
 
+/// Clear the "ignore Ctrl+C" setting that the secondary-logon call of the prompt path sets on its child;
+/// every shell and command in every session would inherit it. The same on every start route. Best
+/// effort: a failure is reported by [`start_with`].
+#[cfg(windows)]
+fn reset_inherited_start_state() -> windows::core::Result<()> {
+    use windows::Win32::System::Console::SetConsoleCtrlHandler;
+    // SAFETY: no pointers; this process's own setting.
+    unsafe { SetConsoleCtrlHandler(None, false) }
+}
+
 /// [`start`] with its inputs as parameters, so a test can pick the session and see what runs.
 ///
 /// `background` is `Some` for `agent --background`. The refusals before the log opens leave their
-/// exit code as the only record (see [`Refusal`]).
+/// exit code as the only record (see [`Refusal`]). `reset` runs first, before any check; a failure goes
+/// to `stderr` at once, and to the log once it opens.
 #[cfg(windows)]
+#[allow(clippy::too_many_arguments)] // every input is a seam a test fills
 fn start_with(
     background: Option<&BackgroundArgs>,
     session: u32,
     current_sid: &str,
+    stderr: &mut dyn std::io::Write,
+    reset: impl FnOnce() -> windows::core::Result<()>,
     locate: impl FnOnce() -> anyhow::Result<SocketLocation>,
     init_log: impl FnOnce(&Path) -> anyhow::Result<tracing_appender::non_blocking::WorkerGuard>,
     serve: impl FnOnce(&SocketLocation, u32) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
+    let reset_failure = reset()
+        .err()
+        .map(|e| format!("could not clear the inherited ignore of Ctrl+C: {e}"));
+    if let Some(message) = &reset_failure {
+        let _ = writeln!(stderr, "ssh-broker agent: {message}");
+    }
     check_start(background, session, current_sid)?;
     let refused = |refusal: Refusal, cause: anyhow::Error| anyhow::Error::new(refusal).context(format!("{cause:#}"));
     let location = locate().map_err(|e| refused(Refusal::NoSocketLocation, e))?;
@@ -115,8 +137,11 @@ fn start_with(
     // Held to the end of the process and flushed by `end_process`, from whichever thread ends it:
     // dropping the guard stops the writer and later lines are lost. Until the log opens an error goes
     // to stderr, which a logon task discards; a hand-run agent shows it.
-    if let Some(log) = keep_log_or_report(init_log(&location.logs_dir()), &mut std::io::stderr()) {
+    if let Some(log) = keep_log_or_report(init_log(&location.logs_dir()), stderr) {
         keep_log(log);
+        if let Some(message) = &reset_failure {
+            tracing::warn!("{message}");
+        }
     }
     let result = serve(&location, session);
     if let Err(e) = &result {

@@ -16,6 +16,8 @@ mod account_fixture;
 mod agent_conn;
 #[path = "common/bounded_wait.rs"]
 mod bounded_wait;
+#[path = "common/command_line_probe.rs"]
+mod command_line_probe;
 #[path = "common/desktop.rs"]
 mod desktop;
 #[path = "common/hard_errors.rs"]
@@ -49,6 +51,8 @@ const WAY_OUT: &str = "Press Ctrl+C for a plain shell.";
 const COST: &str = "starting a plain shell, without DPAPI";
 /// The start of a PowerShell prompt, which both the relayed shell and the plain shell show.
 const SHELL_PROMPT: &str = "PS C:\\";
+/// The text of the prompt `a_program_in_the_session_gets_ctrl_c` sets in cmd.
+const SESSION_PROMPT: &str = "SBPROMPT";
 
 fn kit(tag: &str) -> Kit {
     Kit::broker_with_helper(tag)
@@ -368,6 +372,52 @@ fn a_command_written_with_the_password_runs_in_the_session() {
     run.read_until("typedahead-ok");
     expect_session(&mut run);
     assert_relayed(&mut run);
+    leave(&mut run);
+}
+
+/// Elevated (CI only). The prompt path starts the agent through the logon call from a shim that ignores
+/// Ctrl+C, and the agent starts with that setting. A program the session runs still gets a Ctrl+C: the
+/// probe says `event` for the first one it receives, and prints nothing more if it never comes. The
+/// session then takes input still, typed once cmd shows its prompt again.
+///
+/// The session's shell is `cmd.exe`. PowerShell empties its console input when a Ctrl+C reaches it, on a
+/// thread of its own that can run after its prompt is back (`ConsoleHost.HandleBreak`), so a line typed
+/// at once after the probe ends can be lost to PowerShell, and the next wait never ends.
+#[test]
+fn a_program_in_the_session_gets_ctrl_c() {
+    let _machine = machine::shared();
+    let kit = kit("pp17");
+    let account = Account::create("pp17", true);
+    account.write_user_config("shell: cmd.exe\n");
+    let probe = kit.path("ctrl_probe.exe");
+    std::fs::copy(command_line_probe::example("ctrl_probe"), &probe).unwrap();
+    let mut run = start_run(&kit, &account);
+    run.read_until(PROMPT);
+    run.type_line(&account.password);
+    run.read_until("Microsoft Windows [Version");
+    let shown = run.text();
+    assert!(
+        !shown.contains(COST),
+        "the login fell back to a plain shell instead of starting a session:\n{shown}"
+    );
+
+    // A prompt no other output contains: the echo of this line has `$G`, not the `>` it prints.
+    run.type_line(&format!("prompt {SESSION_PROMPT}$G"));
+    let prompt = format!("{SESSION_PROMPT}>");
+    run.read_until(&prompt);
+    // `no-stdin`: the probe reads no input, so nothing typed later can go to it.
+    run.type_line(&format!("\"{}\" no-stdin", probe.display()));
+    run.read_until("ready");
+    let prompts = run.text().matches(prompt.as_str()).count();
+    run.ctrl_c();
+    run.read_until("finished.");
+    let shown = run.text();
+    assert!(shown.contains("event "), "the probe got no Ctrl+C:\n{shown}");
+    // cmd shows its prompt once more when the probe has ended and it reads again.
+    run.read_until_count(&prompt, prompts + 1);
+    // `^` keeps the marker out of the echo of the typed line.
+    run.type_line("echo session-^up");
+    run.read_until("session-up");
     leave(&mut run);
 }
 
