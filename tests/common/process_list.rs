@@ -39,13 +39,14 @@ pub struct Descendants {
     pub unopened: Vec<String>,
 }
 
-struct Entry {
-    pid: u32,
-    parent: u32,
-    exe: String,
+/// A process the system lists.
+pub struct Entry {
+    pub pid: u32,
+    pub parent: u32,
+    pub exe: String,
 }
 
-fn snapshot() -> Vec<Entry> {
+pub fn snapshot() -> Vec<Entry> {
     // SAFETY: a snapshot of all processes; the handle is closed by `OwnedHandle`.
     let snapshot =
         OwnedHandle(unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }.expect("snapshot the process list"));
@@ -197,6 +198,11 @@ pub fn terminate_tree(root: HANDLE, root_pid: u32) -> BTreeSet<String> {
     }
 }
 
+/// The user `process` runs as, in SDDL form, or `None` when that cannot be read.
+pub fn owner_sddl(process: HANDLE) -> Option<String> {
+    ssh_broker::acl::Sid::of_process(process).ok()?.to_sddl().ok()
+}
+
 /// Terminate every process that runs as the user `sid_text` (SDDL form) and wait for each to exit,
 /// pass after pass until a pass finds none: a process ended in one pass can have started another.
 /// A process that cannot be ended is reported and is not looked at again.
@@ -224,10 +230,7 @@ pub fn terminate_processes_of(sid_text: &str) -> BTreeSet<String> {
                 continue;
             };
             let process = OwnedHandle(handle);
-            let Ok(owner) = ssh_broker::acl::Sid::of_process(process.0) else {
-                continue;
-            };
-            if owner.to_sddl().is_ok_and(|owner| owner == sid_text) {
+            if owner_sddl(process.0).is_some_and(|owner| owner == sid_text) {
                 found.push((entry, process));
             }
         }
@@ -276,7 +279,7 @@ fn end(process: HANDLE, name: &str, problems: &mut BTreeSet<String>) {
     }
 }
 
-fn has_exited(process: HANDLE) -> bool {
+pub fn has_exited(process: HANDLE) -> bool {
     /// `STILL_ACTIVE`: the exit code of a process that has not exited.
     const STILL_ACTIVE: u32 = 259;
     let mut code = 0u32;

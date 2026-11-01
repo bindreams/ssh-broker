@@ -6,7 +6,8 @@
 //! handles are never leaked into the child — even under concurrent EXEC spawns, where a
 //! global inheritable-flag approach would race.
 
-use crate::winutil::{AttrList, OwnedHandle};
+use crate::shell::StartError;
+use crate::winutil::{AttrList, OwnedHandle, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, start_error_of_create};
 use std::path::Path;
 use windows::Win32::Foundation::{HANDLE, HANDLE_FLAG_INHERIT, SetHandleInformation};
 use windows::Win32::System::Pipes::CreatePipe;
@@ -15,11 +16,6 @@ use windows::Win32::System::Threading::{
     STARTF_USESTDHANDLES, STARTUPINFOEXW, WaitForSingleObject,
 };
 use windows::core::{PCWSTR, PWSTR};
-
-/// `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` (processthreadsapi.h) — restrict the child's
-/// inherited handles to exactly those listed. (windows-rs 0.62 doesn't export it as a
-/// usable `usize` FFI value; named here with its documented value.)
-const PROC_THREAD_ATTRIBUTE_HANDLE_LIST: usize = 0x0002_0002;
 
 /// A child process with redirected stdin/stdout/stderr (the EXEC path).
 pub struct ExecChild {
@@ -50,7 +46,7 @@ unsafe fn set_inheritable(h: HANDLE) -> windows::core::Result<()> {
 impl ExecChild {
     /// Spawn `command` with redirected std streams, optionally in `cwd`. `CreateProcessW` cannot run
     /// leading whitespace, which [`crate::shim::spawn_line`] trims.
-    pub fn spawn(command: &str, cwd: Option<&Path>) -> windows::core::Result<ExecChild> {
+    pub fn spawn(command: &str, cwd: Option<&Path>) -> Result<ExecChild, StartError> {
         unsafe {
             let (stdin_read, stdin_write) = create_pipe()?;
             let (stdout_read, stdout_write) = create_pipe()?;
@@ -92,6 +88,7 @@ impl ExecChild {
             // containment permanently. Sequence fixed by `cosca::Job`: create suspended,
             // assign, and only then resume.
             let mut pi = PROCESS_INFORMATION::default();
+            let _no_boxes = crate::winutil::FailCriticalErrors::enter();
             CreateProcessW(
                 PCWSTR::null(),
                 Some(PWSTR(cmd.as_mut_ptr())),
@@ -103,7 +100,8 @@ impl ExecChild {
                 cwd_ptr,
                 &si.StartupInfo,
                 &mut pi,
-            )?;
+            )
+            .map_err(|e| start_error_of_create(e, cwd))?;
             drop(attr);
             // The parent keeps stdin_write/stdout_read/stderr_read; close the child-side ends
             // so the parent's reads see EOF when the child exits.

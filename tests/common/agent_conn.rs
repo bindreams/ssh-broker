@@ -10,7 +10,7 @@
 use ssh_broker::account::LocalAccount;
 use ssh_broker::afunix::{self, ConnRx, ConnTx};
 use ssh_broker::logon;
-use ssh_broker::protocol::{FrameKind, FrameReader, Handshake, Mode, Stream, write_frame};
+use ssh_broker::protocol::{FrameKind, FrameReader, Handshake, Launch, Mode, Stream, write_frame};
 use ssh_broker::relay::{FrameSink, Outcome, PumpError, pump_decode, write_data};
 use ssh_broker::socket_loc::{self, SocketLocation};
 use ssh_broker::vtinput::{KeyEvent, encode_key_event};
@@ -133,10 +133,11 @@ impl AgentConn {
         }
     }
 
-    fn handshake(&mut self, mode: Mode, command: Option<&str>) {
+    fn handshake(&mut self, mode: Mode, command: Option<&str>, launch: Launch) {
         let hs = Handshake {
             mode,
             command: command.map(str::to_string),
+            launch,
             ..Handshake::pty_default()
         };
         write_frame(&mut self.tx, FrameKind::Handshake, &hs.encode().unwrap()).unwrap();
@@ -144,12 +145,18 @@ impl AgentConn {
 
     /// Start an interactive session running `command`.
     pub fn start_pty(&mut self, command: &str) {
-        self.handshake(Mode::Pty, Some(command));
+        self.handshake(Mode::Pty, Some(command), Launch::Direct);
+    }
+
+    /// Start a session with a terminal the way the shim asks for one: through the account's configured
+    /// shell, running `command` or, with `None`, a login.
+    pub fn start_shell_pty(&mut self, command: Option<&str>) {
+        self.handshake(Mode::Pty, command, Launch::Shell);
     }
 
     /// Start a session that runs `command` on redirected pipes.
     pub fn start_exec(&mut self, command: &str) {
-        self.handshake(Mode::Exec, Some(command));
+        self.handshake(Mode::Exec, Some(command), Launch::Direct);
     }
 
     /// Type `line` and Enter into a PTY session, as win32-input-mode key events.

@@ -25,6 +25,7 @@ pub fn main() {
         Some("shim") => shim(Path::new(&args[1])),
         Some("pty") => pty(Path::new(&args[1]), &args[2]),
         Some("connect") => connect(Path::new(&args[1]), Path::new(&args[2])),
+        Some("console-size") => console_size(),
         // `<DefaultShell> -c <command>`: what sshd runs when this is the DefaultShell.
         Some("-c") => probe(),
         _ => std::process::exit(2),
@@ -218,6 +219,63 @@ fn pty(cwd: &Path, command: &str) {
     // Process exit closes the job, which ends what is still in it; a logon child that broke away stays.
     drop(job);
     std::process::exit(code);
+}
+
+/// Print `size=<columns>x<rows>` for the console this runs on, then wait for the console to be resized
+/// and print it again. Waiting is on the console's own resize event, so a test that resizes the console
+/// the command's client runs on needs no time to pass.
+fn console_size() {
+    use std::io::Write as _;
+    use std::os::windows::io::AsRawHandle as _;
+    use windows::Win32::System::Console::{
+        CONSOLE_MODE, CONSOLE_SCREEN_BUFFER_INFO, ENABLE_WINDOW_INPUT, GetConsoleMode, GetConsoleScreenBufferInfo,
+        INPUT_RECORD, ReadConsoleInputW, SetConsoleMode, WINDOW_BUFFER_SIZE_EVENT,
+    };
+
+    let open = |name: &str| {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(name)
+            .unwrap_or_else(|e| panic!("open {name}: {e}"))
+    };
+    // The console itself, not the standard handles, which a host may leave null.
+    let (input_file, mut output_file) = (open("CONIN$"), open("CONOUT$"));
+    let (input, output) = (HANDLE(input_file.as_raw_handle()), HANDLE(output_file.as_raw_handle()));
+    let size = || {
+        let mut info = CONSOLE_SCREEN_BUFFER_INFO::default();
+        // SAFETY: a console output handle and an out-pointer.
+        unsafe { GetConsoleScreenBufferInfo(output, &mut info) }.expect("GetConsoleScreenBufferInfo");
+        let window = info.srWindow;
+        format!(
+            "size={}x{}",
+            window.Right - window.Left + 1,
+            window.Bottom - window.Top + 1
+        )
+    };
+
+    // The event is queued only while the mode asks for it, so this comes before the first line the
+    // test waits for.
+    let mut mode = CONSOLE_MODE::default();
+    // SAFETY: a console input handle and an out-pointer.
+    unsafe { GetConsoleMode(input, &mut mode) }.expect("GetConsoleMode");
+    // SAFETY: as above.
+    unsafe { SetConsoleMode(input, mode | ENABLE_WINDOW_INPUT) }.expect("SetConsoleMode");
+    writeln!(output_file, "{}", size()).expect("write the size");
+
+    let mut records = [INPUT_RECORD::default(); 16];
+    loop {
+        let mut read = 0u32;
+        // SAFETY: a console input handle, a buffer of the length passed, an out-pointer.
+        unsafe { ReadConsoleInputW(input, &mut records, &mut read) }.expect("ReadConsoleInputW");
+        if records[..read as usize]
+            .iter()
+            .any(|record| u32::from(record.EventType) == WINDOW_BUFFER_SIZE_EVENT)
+        {
+            writeln!(output_file, "{}", size()).expect("write the size");
+            return;
+        }
+    }
 }
 
 /// Connect to the socket at `socket` and write what happened to `result`: `connected`, `os error <n>`

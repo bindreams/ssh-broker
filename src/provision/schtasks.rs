@@ -12,12 +12,9 @@
 //! `RunLevel=LeastPrivilege` (not Highest) keeps the plain token: elevation would re-arm
 //! RedirectionGuard (breaking symlink-traversal parity) and not match the folder ACL.
 
-use anyhow::Context;
-
 use super::report::Check;
 
 pub const AGENT_TASK: &str = "ssh-broker-agent";
-pub const SELFHEAL_TASK: &str = "ssh-broker-apply";
 
 /// `BUILTIN\Users`: every account that can log on interactively, administrators included.
 pub const USERS_GROUP_SID: &str = "S-1-5-32-545";
@@ -45,8 +42,8 @@ pub(super) fn settings_xml(multiple_instances: &str) -> String {
     <!-- The project forbids arbitrary retry caps; this is a documented numeric bound that is
          not one (see CONTRIBUTING.md's invariants). The Task Scheduler schema requires a Count
          with RestartOnFailure and has no unbounded form.
-         A failure outlasting these attempts is covered at the next boot or logon, by the
-         ONSTART self-heal task and the agent task's own logon trigger — not before. -->
+         A failure outlasting these attempts is covered at the next logon, by the agent task's own
+         logon trigger — not before. -->
     <RestartOnFailure><Interval>PT1M</Interval><Count>3</Count></RestartOnFailure>
     <Enabled>true</Enabled>
   </Settings>"#
@@ -100,42 +97,14 @@ pub fn create_from_xml_argv(name: &str, xml_path: &str) -> Vec<String> {
     ]
 }
 
-/// The ONSTART self-heal task argv: re-runs `apply` as SYSTEM on boot. `apply` knows no user, so
-/// nothing is baked in. It runs `apply`, never `agent` (an agent here would bind in session 0).
-pub fn selfheal_task_argv(exe: &str) -> Vec<String> {
-    vec![
-        "/Create".into(),
-        "/TN".into(),
-        SELFHEAL_TASK.into(),
-        "/TR".into(),
-        // Quote the exe: a path with a space would otherwise truncate when CommandLineToArgvW
-        // re-parses this on the SYSTEM boot run.
-        format!("\"{exe}\" apply"),
-        "/SC".into(),
-        "ONSTART".into(),
-        "/RU".into(),
-        "SYSTEM".into(),
-        "/RL".into(),
-        "HIGHEST".into(),
-        "/F".into(),
-    ]
-}
-
 /// `schtasks /Query /TN <name> /XML` — dump a task's definition (for the verify checks).
 pub fn query_task_argv(name: &str) -> Vec<String> {
     vec!["/Query".into(), "/TN".into(), name.into(), "/XML".into()]
 }
 
-/// What `apply` takes from the query of the agent task: its XML, or `None` if there is no such
-/// task. A query that could not be answered (access denied, the service down) is an error: taking
-/// it for "not registered" would skip the migration and the restart after a failed apply.
-pub fn registered_xml(query: anyhow::Result<Option<String>>) -> anyhow::Result<Option<String>> {
-    query.with_context(|| format!("could not tell whether the {AGENT_TASK} task is registered"))
-}
-
 /// Whether a queried task XML is the group logon task [`agent_task_xml`] makes: a principal in
 /// [`USERS_GROUP_SID`] and a logon trigger. Case- and whitespace-insensitive, since the service
-/// re-serialises what it is given. The older per-user task has no `GroupId`.
+/// re-serialises what it is given.
 pub fn xml_is_group_logon_task(query_xml: &str) -> bool {
     let squeezed: String = query_xml
         .chars()
@@ -176,7 +145,7 @@ pub fn agent_task_row(query: &anyhow::Result<Option<String>>) -> Check {
     let group = xml.is_some_and(xml_is_group_logon_task);
     let disabled = xml.is_some_and(xml_is_disabled);
     let detail = if registered && !group {
-        "registered=true group_logon_task=false: a per-user task from an earlier install; run `apply` elevated to \
+        "registered=true group_logon_task=false: the task is not the group logon task; run `apply` elevated to \
          replace it"
             .to_string()
     } else if disabled {

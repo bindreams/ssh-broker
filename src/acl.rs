@@ -18,8 +18,8 @@
 //! token is the grantee.
 //!
 //! The install directory (`C:\ProgramData\ssh-broker`) is the other half of the boundary: the
-//! agent runs the exe in it as the user and the self-heal task runs it as SYSTEM, so a directory
-//! a standard user can write to is a local privilege escalation.
+//! agent runs the exe in it as the user, so a directory a standard user can write to is a local
+//! privilege escalation.
 //!
 //! This module is Windows-only (`#[cfg(windows)] mod acl;`). API signatures were
 //! source-verified against windows-0.62.2 (see verify-windows-acl-apis workflow).

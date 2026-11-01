@@ -108,7 +108,7 @@ pub fn on(env: &mut dyn AutoLoginEnv, account: &LocalAccount) -> anyhow::Result<
     // Read-only and before the prompt: with no install there is nothing to register the task for, and
     // the password would be typed for nothing. Checked again under the lock, as it may change meanwhile.
     env.check_install()?;
-    // Not under the lock: a prompt left open must not hold up `apply` or the boot self-heal.
+    // Not under the lock: a prompt left open must not hold up `apply`.
     let password = env
         .ask_password(account)?
         .ok_or_else(|| anyhow::anyhow!("ssh-broker: cancelled; nothing was changed."))?;

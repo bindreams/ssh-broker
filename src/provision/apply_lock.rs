@@ -1,10 +1,9 @@
 //! provision::apply_lock — one `apply` at a time on a machine, and no `auto-login on|off` during one.
 //!
 //! `apply` stops agents and sessions, waits for them, replaces the exe and starts them again, and
-//! the boot self-heal task runs `apply` by itself, so two can overlap; an `auto-login` command that
-//! registers a task, or deletes one, in the middle of an `apply` would have it stop or start a
-//! session that command is changing. The lock is held for the whole run of each; the system
-//! releases it with its process.
+//! two can be run at once; an `auto-login` command that registers a task, or deletes one, in the
+//! middle of an `apply` would have it stop or start a session that command is changing. The lock
+//! is held for the whole run of each; the system releases it with its process.
 
 use std::path::Path;
 
@@ -20,7 +19,7 @@ pub struct ApplyLock {
 ///
 /// The lock file is private to SYSTEM and Administrators ([`crate::acl::ensure_admin_only_file`]),
 /// made so or checked to be so before the lock is asked for: a lock any local user could open could
-/// be held by one for ever, and `apply` and the boot self-heal would wait on it without end.
+/// be held by one for ever, and `apply` would wait on it without end.
 ///
 /// `on_wait` runs once, after the lock was found held and before the wait begins. The wait has no
 /// limit: the holder is a command that exists, and the system ends the lock if it dies.

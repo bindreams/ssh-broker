@@ -8,7 +8,7 @@
 
 use std::io::{Read, Write};
 
-use crate::protocol::{FrameKind, FrameReader, Mode, Stream, write_frame};
+use crate::protocol::{FrameKind, FrameReader, Launch, Mode, Stream, write_frame};
 use crate::relay::{FrameSink, Outcome};
 use crate::shim::{PROTOCOL_VIOLATION_CODE, closed_twice_message, make_handshake, peer_gone, pump_heard};
 
@@ -43,7 +43,7 @@ pub enum Asked {
 /// Send the `Logout` handshake over a connected transport and relay the reply to `err`. The transport
 /// is borrowed, not consumed: the caller keeps it open until the process exits.
 pub fn logout_on<R: Read, W: Write>(rx: &mut R, tx: &mut W, err: &mut dyn Write) -> Asked {
-    let mut handshake = make_handshake(&None, String::new(), 0, 0);
+    let mut handshake = make_handshake(&None, false, Launch::Direct, String::new(), 0, 0);
     handshake.mode = Mode::Logout;
     let sent = handshake
         .encode()

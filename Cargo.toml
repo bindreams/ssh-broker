@@ -15,21 +15,23 @@ socket2 = "0.6"                                         # AF_UNIX on Windows (Do
 tracing = "0.1"              # structured logging
 tracing-subscriber = "0.3"  # file/stderr log sink (Phase 6 routes off the PTY)
 zeroize = "1"                # volatile wipe of password buffers (secret.rs)
+# cosca: `cosca::quote::windows` builds and splits command lines (`cmdline`, `shell`), and is
+# cross-platform, so the pure code builds on every host; Job Objects containment is Windows-only inside it.
+cosca = "0.6"
+yaml_serde = { version = "0.10.7", default-features = false } # YAML 1.2 for config.yaml (shell.rs): the official yaml/yaml-serde library; no `std`, so its Mapping hashes with FNV, not RandomState, whose bcryptprimitives.dll import check-imports.sh rejects
+encoding_rs = "0.8"            # BOM-sniffing decode of config.yaml (UTF-8, UTF-16LE/BE)
 
 [dev-dependencies]
 fd-lock = "4.0.4"
+vt100 = "0.18"               # renders the VT stream a terminal session delivers to a screen, to check what a user sees (tests/common/sshd_rig.rs; 0.18.1)
 pipe = "0.4"                 # two unidirectional pipes compose the splittable relay test transport, EOF-on-writer-drop (Phase 2; 0.4.0)
 
 # Windows-only dependencies. Not compiled on the macOS host, so the pure-logic
 # protocol/relay phases unit-test natively here.
 [target.'cfg(windows)'.dependencies]
-# cosca: kernel-enforced process-tree containment (Windows Job Objects) for the agent and for
-# the shim's fail-open passthrough. Windows-gated again now that transfer detection is gone —
-# its `CommandLineToArgvW` splitter was the only cross-platform user.
-cosca = "0.5"
-
 windows = { version = "0.62.2", features = [
     "Win32_System_Console",
+    "Win32_System_SystemInformation", # GetSystemDirectoryW: where the built-in cmd.exe is (src/shell/windows.rs)
     "Win32_System_Environment",    # GetCommandLineW: the shim recovers sshd's exact `-c` text
     "Win32_Foundation",
     "Win32_System_Pipes",
@@ -50,6 +52,7 @@ windows = { version = "0.62.2", features = [
     "Win32_System_Ole",            # ITaskService::Connect takes VARIANTs
     "Win32_System_Variant",
     "Win32_System_WindowsProgramming", # GetComputerNameW: is an account local to this PC
+    "Win32_System_Diagnostics_Debug", # SetThreadErrorMode: a shell that cannot start is an error, not a message box (src/winutil.rs)
     "Win32_System_JobObjects",     # IsProcessInJob/QueryInformationJobObject: the logon asks for breakaway only where the caller's job allows it
     "Wdk_Foundation",
     "Win32_System_Diagnostics_ToolHelp", # CreateToolhelp32Snapshot: apply lists the processes to find background agents; tests/common/process_list.rs finds a process's descendants

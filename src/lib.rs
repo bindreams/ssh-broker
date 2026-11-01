@@ -24,6 +24,12 @@ pub mod agent_lock;
 #[cfg(windows)]
 pub mod autologin;
 pub mod cmdline;
+#[cfg(test)]
+#[path = "../tests/common/command_corpus.rs"]
+mod command_corpus;
+#[cfg(all(windows, test))]
+#[path = "../tests/common/command_line_probe.rs"]
+mod command_line_probe;
 #[cfg(windows)]
 pub mod conpty;
 #[cfg(windows)]
@@ -32,6 +38,7 @@ pub mod console_modes;
 pub mod console_prompt;
 #[cfg(windows)]
 pub mod filelog;
+pub mod handoff;
 #[cfg(windows)]
 pub mod hangup;
 #[cfg(windows)]
@@ -47,6 +54,7 @@ pub mod provision;
 pub mod relay;
 pub mod route;
 pub mod secret;
+pub mod shell;
 pub mod shim;
 #[cfg(windows)]
 pub mod shim_offer;

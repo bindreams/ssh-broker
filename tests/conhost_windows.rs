@@ -20,70 +20,54 @@ mod pty;
 #[path = "common/sshd_encoder.rs"]
 mod sshd_encoder;
 
-/// Commands the model must get right: the shapes that make conhost change the text, and the ones
-/// that must pass through untouched.
-const COMMANDS: &[&str] = &[
-    "whoami",
-    "echo hi",
-    r#"echo  "a  b"   x"#,
-    "cmd /c echo a   b",
-    r#"echo "a"b"#,
-    r#"x""y"#,
-    "a\tb",
-    "trailing   ",
-    "  leading",
-    "",
-    " ",
-    r#"echo "a b""#,
-    r#"a"b"#,
-    r#""quoted""#,
-    r#"--opt="a b""#,
-    r#"git commit -m "a b""#,
-    r#"""#,
-    r#"""x"#,
-    "'single quoted start' x",
-    r#"'a "b" c'"#,
-    r#"echo \"a b\""#,
-    r#"echo a\\"b c"#,
-    r#"echo "a b"\"#,
-    r"echo C:\dir\",
-    r"echo C:\a b\",
-    r"echo C:\a b\\",
-    r"echo \\server\share\x y",
-    r"\",
-    r#""C:\a b\p.exe" "x y""#,
-    r#"p.exe "" end"#,
-    r#""C:\a b\p.exe" "x y" "" end  of  line"#,
-    r"C:\Program Files\OpenSSH\sftp-server.exe -l INFO",
-    r#""C:\Program Files\OpenSSH\sftp-server.exe" -l INFO"#,
-    "echo héllo wörld ✓",
-    "echo 日本語 \"x y\"",
-    // A doubled quote inside quotes.
-    r#"echo "a""b" c"#,
-    r#"echo "a"" b" c"#,
-    r#"echo """ x"#,
-    r#"echo "x""""#,
-    r#"echo "a b""c d" e"#,
-    "x\ny",
-    "-c x",
-    "--width 5",
-    "-- x",
-];
+#[path = "common/command_corpus.rs"]
+mod command_corpus;
+#[path = "common/command_line_probe.rs"]
+mod command_line_probe;
+use command_corpus::CORPUS as COMMANDS;
+
+/// What `CommandLineToArgvW` makes of `line`.
+fn api(line: &str) -> Vec<String> {
+    let wide: Vec<u16> = line.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut count = 0;
+    unsafe {
+        let argv = CommandLineToArgvW(PCWSTR(wide.as_ptr()), &mut count);
+        assert!(!argv.is_null(), "CommandLineToArgvW failed for {line:?}");
+        let args = (0..count as usize)
+            .map(|i| String::from_utf16_lossy((*argv.add(i)).as_wide()))
+            .collect();
+        LocalFree(Some(HLOCAL(argv.cast())));
+        args
+    }
+}
+
+/// `text` with the `%NAME%` of every variable that is set replaced by its value, as conhost does to the
+/// line it is given (measured: the shell is started with `echo %PATH%` expanded). A name that is not set
+/// stays as written.
+fn expand_environment(text: &str) -> String {
+    use windows::Win32::System::Environment::ExpandEnvironmentStringsW;
+    let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+    // SAFETY: `wide` is NUL-terminated; the buffer holds the length the call reports, terminator included.
+    unsafe {
+        let needed = ExpandEnvironmentStringsW(PCWSTR(wide.as_ptr()), None);
+        assert!(
+            needed != 0,
+            "ExpandEnvironmentStringsW sized {text:?}: {}",
+            std::io::Error::last_os_error()
+        );
+        let mut buffer = vec![0u16; needed as usize];
+        let written = ExpandEnvironmentStringsW(PCWSTR(wide.as_ptr()), Some(&mut buffer));
+        assert!(
+            written != 0,
+            "ExpandEnvironmentStringsW on {text:?}: {}",
+            std::io::Error::last_os_error()
+        );
+        String::from_utf16_lossy(&buffer[..written as usize - 1])
+    }
+}
 
 fn probe() -> PathBuf {
-    let exe = std::env::current_exe().unwrap();
-    let probe = exe
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .join("examples")
-        .join("command_line_probe.exe");
-    assert!(
-        probe.is_file(),
-        "the probe {probe:?} is not built: run `cargo build --examples` (`cargo test` builds it)"
-    );
-    probe
+    command_line_probe::path()
 }
 
 /// The command line the probe received when conhost ran `"<probe>" -c <command>`.
@@ -113,7 +97,7 @@ fn conhost_rebuilds_the_command_line_as_the_model_says() {
     let out = dir.join("line.txt");
     let mut failures = Vec::new();
     for command in COMMANDS {
-        let want = sshd_encoder::verbatim_line(&probe.display().to_string(), command);
+        let want = expand_environment(&sshd_encoder::verbatim_line(&probe.display().to_string(), command));
         let got = received_under_conhost(&probe, command, &out);
         if got != want {
             failures.push(format!("{command:?}\n  want: {want:?}\n  got:  {got:?}"));
@@ -127,20 +111,6 @@ fn conhost_rebuilds_the_command_line_as_the_model_says() {
 /// agree with it on everything conhost can be handed.
 #[test]
 fn the_models_tokenizer_matches_command_line_to_argv_w() {
-    fn api(line: &str) -> Vec<String> {
-        let wide: Vec<u16> = line.encode_utf16().chain(std::iter::once(0)).collect();
-        let mut count = 0;
-        unsafe {
-            let argv = CommandLineToArgvW(PCWSTR(wide.as_ptr()), &mut count);
-            assert!(!argv.is_null(), "CommandLineToArgvW failed for {line:?}");
-            let args = (0..count as usize)
-                .map(|i| String::from_utf16_lossy((*argv.add(i)).as_wide()))
-                .collect();
-            LocalFree(Some(HLOCAL(argv.cast())));
-            args
-        }
-    }
-
     let alphabet = ['a', ' ', '\t', '"', '\\', '\n'];
     let mut lines: Vec<String> = COMMANDS.iter().map(|c| format!("p {c}")).collect();
     let mut layer = vec![String::new()];
@@ -172,6 +142,40 @@ fn the_models_escaping_round_trips_through_command_line_to_argv_w() {
     for arg in args {
         let line = format!("p {}", sshd_encoder::conhost_escape(&arg));
         assert_eq!(sshd_encoder::tokenize(&line), ["p", arg.as_str()], "{arg:?}");
+    }
+}
+
+/// `ssh_broker::cmdline::join_args` builds the line the shell is started with; the real splitter
+/// must read back exactly the arguments, for every command in the corpus and every short string.
+#[test]
+fn join_args_agrees_with_command_line_to_argv_w() {
+    let alphabet = ['a', ' ', '\t', '"', '\\', '\''];
+    let mut layer = vec![String::new()];
+    let mut args: Vec<String> = COMMANDS.iter().map(|c| c.to_string()).collect();
+    args.push(String::new());
+    for _ in 0..4 {
+        layer = layer
+            .iter()
+            .flat_map(|prefix| alphabet.iter().map(move |c| format!("{prefix}{c}")))
+            .collect();
+        args.extend(layer.iter().cloned());
+    }
+    for arg in args {
+        let line = format!("p {}", ssh_broker::cmdline::join_args(&["-c", &arg]));
+        assert_eq!(api(&line), ["p", "-c", arg.as_str()], "{arg:?}");
+    }
+}
+
+/// A resolved program path is `argv[0]` of the line; its quoting must survive the real splitter.
+#[test]
+fn a_resolved_program_path_survives_as_argv0() {
+    for program in [
+        r"C:\Program Files (x86)\x\pwsh.exe",
+        r"D:\Profiles\Ünï cödé\bin\pwsh.exe",
+        r"C:\Windows\System32\cmd.exe",
+    ] {
+        let line = ssh_broker::cmdline::join_args(&[program, "-c", "echo hi"]);
+        assert_eq!(api(&line), [program, "-c", "echo hi"], "{line:?}");
     }
 }
 

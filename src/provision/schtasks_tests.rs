@@ -3,8 +3,8 @@
 //! ways this task can silently stop working: naming one user again, or landing in session 0.
 use super::*;
 
-/// The agent task as an older build registered it: one account, InteractiveToken.
-fn legacy_task_xml(user: &str) -> String {
+/// A per-user agent task: one account, InteractiveToken, no group.
+fn per_user_task_xml(user: &str) -> String {
     format!(
         r#"<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
@@ -81,18 +81,6 @@ fn agent_xml_keeps_a_path_with_spaces_whole() {
 }
 
 #[test]
-fn selfheal_argv_is_system_onstart_and_takes_no_user() {
-    let argv = selfheal_task_argv(r"C:\x\ssh-broker.exe");
-    assert!(argv.contains(&"ONSTART".to_string()));
-    assert!(argv.contains(&"SYSTEM".to_string()));
-    assert!(argv.contains(&"HIGHEST".to_string()));
-    // /TR quotes the exe and carries `apply` alone; never `agent`, never a user.
-    let tr = argv.iter().position(|a| a == "/TR").map(|i| &argv[i + 1]).unwrap();
-    assert_eq!(tr, "\"C:\\x\\ssh-broker.exe\" apply");
-    assert!(!tr.contains(" agent") && !tr.contains("--user"));
-}
-
-#[test]
 fn create_and_query_argv_shapes() {
     assert_eq!(
         create_from_xml_argv(AGENT_TASK, r"C:\t\task.xml"),
@@ -105,28 +93,11 @@ fn create_and_query_argv_shapes() {
 }
 
 #[test]
-fn apply_takes_the_queried_xml_and_treats_an_absent_task_as_none() {
-    let xml = agent_task_xml(r"C:\x.exe");
-    assert_eq!(registered_xml(Ok(Some(xml.clone()))).unwrap(), Some(xml));
-    assert_eq!(registered_xml(Ok(None)).unwrap(), None);
-}
-
-#[test]
-fn apply_refuses_to_guess_when_the_query_was_inconclusive() {
-    // "Could not ask" is not "not registered": taking it for absent skips the migration and the
-    // restart after a failed apply.
-    let err = registered_xml(Err(anyhow::anyhow!("access is denied"))).unwrap_err();
-    let text = format!("{err:#}");
-    assert!(text.contains("access is denied"), "{text}");
-    assert!(text.contains(AGENT_TASK), "{text}");
-}
-
-#[test]
-fn xml_is_group_logon_task_accepts_the_new_xml_and_rejects_the_legacy_one() {
+fn xml_is_group_logon_task_accepts_the_group_xml_and_rejects_a_per_user_one() {
     assert!(xml_is_group_logon_task(&agent_task_xml(r"C:\x.exe")));
     assert!(
-        !xml_is_group_logon_task(&legacy_task_xml("DOMAIN\\someone")),
-        "a per-user InteractiveToken task is the legacy form"
+        !xml_is_group_logon_task(&per_user_task_xml("DOMAIN\\someone")),
+        "a per-user InteractiveToken task is not the group form"
     );
     assert!(!xml_is_group_logon_task(""), "no task");
 }
@@ -157,8 +128,8 @@ fn agent_task_row_passes_for_the_group_task() {
 }
 
 #[test]
-fn agent_task_row_fails_for_a_legacy_per_user_task() {
-    let row = agent_task_row(&Ok(Some(legacy_task_xml("DOMAIN\\someone"))));
+fn agent_task_row_fails_for_a_per_user_task() {
+    let row = agent_task_row(&Ok(Some(per_user_task_xml("DOMAIN\\someone"))));
     assert!(!row.pass);
     assert!(row.detail.contains("apply"), "it says what to do: {}", row.detail);
 }
@@ -237,28 +208,6 @@ mod service {
         assert!(
             xml_is_group_logon_task(&xml),
             "the service must keep the group principal and the logon trigger:\n{xml}"
-        );
-    }
-
-    /// Elevated (CI only).
-    #[test]
-    fn reapplying_replaces_a_legacy_per_user_task() {
-        let task = Throwaway::new("legacy");
-        let me = format!(
-            "{}\\{}",
-            std::env::var("USERDOMAIN").unwrap(),
-            std::env::var("USERNAME").unwrap()
-        );
-        task.register(&legacy_task_xml(&me));
-        assert!(
-            !xml_is_group_logon_task(&task.queried_xml()),
-            "control: the legacy form"
-        );
-
-        task.register(&agent_task_xml(r"C:\Windows\System32\cmd.exe"));
-        assert!(
-            xml_is_group_logon_task(&task.queried_xml()),
-            "`/F` replaced it in place"
         );
     }
 }

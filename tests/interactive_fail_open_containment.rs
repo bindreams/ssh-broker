@@ -1,18 +1,18 @@
-//! End-to-end test that the INTERACTIVE fail-open arm (`FailOpen::LocalShell`) contains its
-//! WHOLE process tree — not just its immediate `pwsh` child — in a job object, through the REAL
-//! binary.
+//! End-to-end test that the INTERACTIVE fail-open session contains its WHOLE process tree — not
+//! just its immediate shell (`pwsh`, from a user config the test writes) — in a job object,
+//! through the REAL binary.
 //!
 //! Windows-only: the shim is `#[cfg(windows)]`. This runs in CI's `Test (windows/amd64)` job.
 //!
 //! Why an integration test rather than a unit test: `shim_pty::run_on` ends in `process::exit`,
 //! so nothing in-process can observe whether it actually routed through
-//! `run_local_passthrough` -> `spawn_contained`. The existing unit test
+//! `start_local` -> `spawn_contained`. The existing unit test
 //! `the_local_passthrough_child_is_contained_in_a_job` (`src/shim_pty_tests.rs`) calls
 //! `spawn_contained` DIRECTLY, so it gates the spawn helper's own containment but says nothing
-//! about whether `run_on`'s `FailOpen::LocalShell` arm still calls it — reverting that arm back
-//! to an uncontained `std::process::Command` (its pre-containment shape) leaves that unit test
-//! green, since the unit test never goes near `run_on`. Only running the actual binary and
-//! driving it into the LocalShell arm traverses the real path and can catch that regression.
+//! about whether `run_on`'s fail-open still calls it — reverting that to an uncontained
+//! `std::process::Command` (its pre-containment shape) leaves that unit test green, since the
+//! unit test never goes near `run_on`. Only running the actual binary and driving it into the
+//! interactive fail-open traverses the real path and can catch that regression.
 #![cfg(windows)]
 
 use std::io::{BufRead, BufReader, Write};
@@ -30,8 +30,14 @@ fn interactive_fail_open_reaps_a_grandchild_when_the_shim_exits() {
     // No `apply` has run on a CI runner, so there is no agent socket to connect to.
     // `try_relay` fails open (`Ok(None)`) the moment the connect fails, before it ever looks at
     // whether stdio is a real console — so the unreachable agent alone is what routes this run
-    // to fail open with `exec = None`, i.e. the INTERACTIVE arm, `FailOpen::LocalShell`.
+    // to fail open with `exec = None`, i.e. the INTERACTIVE session. The shell it runs is the
+    // user's configured one: `pwsh`, named by a config the test writes under `XDG_CONFIG_HOME`.
+    let config_home = std::env::temp_dir().join(format!("sb-interactive-failopen-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&config_home);
+    std::fs::create_dir_all(config_home.join("ssh-broker")).unwrap();
+    std::fs::write(config_home.join("ssh-broker").join("config.yaml"), "shell: pwsh.exe\n").unwrap();
     let mut child = Command::new(env!("CARGO_BIN_EXE_ssh-broker"))
+        .env("XDG_CONFIG_HOME", &config_home)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -42,16 +48,15 @@ fn interactive_fail_open_reaps_a_grandchild_when_the_shim_exits() {
     let stdout = child.stdout.take().expect("stdout was piped");
     let mut reader = BufReader::new(stdout);
 
-    // This command is also the test's PRECONDITION CHECK, not just a fixture: `decide_fail_open`
-    // only reaches `FailOpen::Passthrough` when an EXEC command was given, and this spawn passed
-    // none, so the ONLY way anything can be reading commands off this pipe at all is the
-    // interactive arm's `pwsh -NoLogo` REPL. A pwsh REPL responding on stdin is therefore itself
-    // proof the LocalShell arm ran — do not skip reading the PID line below on the theory that
-    // spawning the grandchild is enough; the READ is what proves pwsh (not nothing, not some
-    // other path) is on the other end of this pipe.
+    // This command is also the test's PRECONDITION CHECK, not just a fixture: this spawn passed
+    // no command, so the ONLY way anything can be reading commands off this pipe at all is the
+    // interactive session's `pwsh` REPL. A pwsh REPL responding on stdin is therefore itself
+    // proof the interactive fail-open ran with the configured shell — do not skip reading the PID
+    // line below on the theory that spawning the grandchild is enough; the READ is what proves
+    // pwsh (not nothing, not some other path) is on the other end of this pipe.
     //
     // The grandchild's own stdio is explicitly redirected away from inheriting pwsh's (i.e. the
-    // shim's, i.e. THIS pipe): `run_local_passthrough` marks the shim's std handles inheritable
+    // shim's, i.e. THIS pipe): `start_local` marks the shim's std handles inheritable
     // before spawning pwsh (so pwsh can talk to this test at all), and a bare
     // `[Process]::Start('ping.exe', ...)` would let ping inherit those same handles and become a
     // second, unsynchronized writer into the very pipe the loop below parses — exactly the hazard
@@ -118,14 +123,14 @@ fn interactive_fail_open_reaps_a_grandchild_when_the_shim_exits() {
         .unwrap_or_else(|e| panic!("OpenProcess({pid}) failed while the grandchild should still be alive: {e}"));
     let handle = ssh_broker::winutil::OwnedHandle(handle); // RAII CloseHandle, mirroring spawn_contained's callers
 
-    // Close the shim's stdin: pwsh sees EOF on its next read and exits, `run_local_passthrough`
+    // Close the shim's stdin: pwsh sees EOF on its next read and exits, `LocalChild::finish`
     // observes pwsh's exit, `spawn_contained`'s job object is dropped, and `KILL_ON_JOB_CLOSE`
     // reaps every member of the job — including the grandchild, which was never a DIRECT child
     // of the job-assigned process.
     drop(stdin);
 
     // UNBOUNDED on purpose, mirroring `the_local_passthrough_child_is_contained_in_a_job`'s own
-    // discipline: if containment regressed (the LocalShell arm reverting to an uncontained
+    // discipline: if containment regressed (the fail-open reverting to an uncontained
     // spawn, or the grandchild breaking away from the job), this wait never returns and the CI
     // job's own `timeout-minutes` budget is what surfaces the failure — loudly, not silently. A
     // numeric timeout here would be exactly the duration-I-picked hazard `no-sleep-sync` exists
@@ -140,4 +145,5 @@ fn interactive_fail_open_reaps_a_grandchild_when_the_shim_exits() {
     // Let the shim itself finish exiting; its exit code carries no signal for this test (the
     // interactive arm exits however pwsh exited on EOF) — the assertion above is the whole test.
     let _ = child.wait();
+    let _ = std::fs::remove_dir_all(&config_home);
 }

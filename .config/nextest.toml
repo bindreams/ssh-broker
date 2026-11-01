@@ -9,6 +9,10 @@
 # This split only keeps them from waiting out the whole parallel run (the lock is not fair to a
 # writer): `ci` leaves them out and `ci-exclusive` runs them alone. Keep the two filters
 # complementary; a test missing from them is still correct, only slow.
+#
+# `shell_sshd_windows` takes the machine alone too, but runs in `ci`: its logons start the agent from the
+# installed exe (`provision::canonical_exe()`), which the workflow puts in place for `ci` and takes away
+# before `ci-exclusive` (`upgrade_windows` asserts the directory is absent).
 
 # The `m3_` tests of `session_on_demand_windows` measure what a caller's jobs do to the logon child, so
 # the test process must be in no job. nextest puts every test in one, so `ci` leaves them out and the
@@ -28,13 +32,19 @@ slow-timeout = { period = "120s", terminate-after = 5, grace-period = "1s" }
 # ends three sessions in its body. The default 600 s could end such a test in the middle of its teardown,
 # lose the message and leave the account and its profile. These binaries get 10 x 120 s.
 [[profile.ci.overrides]]
-filter = 'binary(auto_login_windows) | binary(prompt_path_windows) | binary(real_sshd_windows) | binary(session_on_demand_windows) | binary(upgrade_windows) | binary(user_isolation_windows)'
+filter = 'binary(auto_login_windows) | binary(prompt_path_windows) | binary(real_sshd_windows) | binary(shell_sshd_windows) | binary(session_on_demand_windows) | binary(upgrade_windows) | binary(user_isolation_windows)'
 slow-timeout = { period = "120s", terminate-after = 10, grace-period = "1s" }
 
 # The real-sshd test measures things the plan has never seen (the shim's session, logon type and job under
 # sshd): its output is the result, so a passing run prints it too.
 [[profile.ci.overrides]]
 filter = 'binary(real_sshd_windows)'
+success-output = "immediate"
+
+# `a_command_with_a_terminal_has_a_terminal` prints the exit code stock sshd gives `ssh -tt host "exit 7"`, which the
+# broker's is held to: a passing run prints it too.
+[[profile.ci.overrides]]
+filter = 'binary(shell_sshd_windows) & test(=a_command_with_a_terminal_has_a_terminal)'
 success-output = "immediate"
 
 [profile.ci-exclusive]

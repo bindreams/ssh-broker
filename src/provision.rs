@@ -1,18 +1,19 @@
 //! provision: self-install (`apply`) and self-check (`verify`) — the DefaultShell values, the
-//! agent logon task (one agent per logged-on user), the ONSTART self-heal task, and parity
-//! probes (DPAPI/symlink/session) run THROUGH the invoking user's agent.
+//! agent logon task (one agent per logged-on user), and parity probes (DPAPI/symlink/session) run
+//! THROUGH the invoking user's agent.
 //!
 //! The pure, host-tested logic lives in the submodules (registry/schtasks/probe/report); this root
 //! holds the Windows orchestration. `apply` is ordered so a partial run never bricks SSH (the
 //! DefaultShell registry flip is LAST, after the exe is proven present). It knows no user: each
-//! agent makes and hardens its own socket directory in its own profile, so a SYSTEM-run
-//! self-heal has nothing to resolve.
+//! agent makes and hardens its own socket directory in its own profile.
 
 #[cfg(windows)]
 pub(crate) mod apply_lock;
 pub mod bounded;
 #[cfg(windows)]
 mod flow;
+#[cfg(windows)]
+pub mod handover;
 #[cfg(windows)]
 pub(crate) mod layout;
 #[cfg(windows)]
@@ -26,6 +27,8 @@ pub mod schtasks;
 pub mod session_task;
 #[cfg(windows)]
 pub mod sessions;
+#[cfg(windows)]
+pub(crate) mod system_config;
 #[cfg(windows)]
 pub mod taskscheduler;
 #[cfg(windows)]
@@ -56,30 +59,52 @@ pub fn verify_probe() -> anyhow::Result<()> {
     anyhow::bail!("verify-probe runs only on Windows");
 }
 
-/// Check the arguments after `apply`, returning the warnings to print.
+/// Check the arguments after `apply`.
 ///
-/// `apply` takes none. The one exception is the removed `--user <name>`: an earlier build baked
-/// it into the boot-time self-heal task, and during a half-done migration that task runs the new
-/// exe with it. Refusing would leave the install unrepaired by the very task that exists to
-/// repair it, so it is accepted, ignored, and reported.
-pub fn check_apply_args(args: &[String]) -> anyhow::Result<Vec<String>> {
-    let mut warnings = Vec::new();
-    let mut rest = args.iter().peekable();
-    while let Some(arg) = rest.next() {
-        if arg == "--user" {
-            // Its value is part of the flag, not an argument of its own.
-            if rest.peek().is_some_and(|value| !value.starts_with('-')) {
-                rest.next();
-            }
-            warnings.push(
-                "apply: --user is ignored: ssh-broker runs one agent per logged-on user and has no target account"
-                    .to_string(),
-            );
-        } else {
-            anyhow::bail!("apply takes no arguments, got {arg:?}");
-        }
+/// `apply` takes none.
+pub fn check_apply_args(args: &[String]) -> anyhow::Result<()> {
+    match args.first() {
+        Some(arg) => anyhow::bail!("apply takes no arguments, got {arg:?}"),
+        None => Ok(()),
     }
-    Ok(warnings)
+}
+
+/// The `verify` row for the shell configuration: it passes when the configured (or built-in) shell is
+/// in use, and fails when a fallback is, naming the file and the value.
+pub fn shell_config_row(effective: &anyhow::Result<crate::shell::Effective>) -> report::Check {
+    match effective {
+        Ok(effective) => match &effective.problem {
+            None => report::Check::new(
+                "shell config",
+                true,
+                format!(
+                    "{} ({})",
+                    effective.program.display(),
+                    match &effective.why.start {
+                        crate::shell::Source::User(file) => format!("user: {}", file.display()),
+                        crate::shell::Source::System(file) => format!("system: {}", file.display()),
+                        _ => "built-in".to_string(),
+                    }
+                ),
+            ),
+            Some(problem) => report::Check::new("shell config", false, problem.describe()),
+        },
+        Err(e) => report::Check::new("shell config", false, format!("{e:#}")),
+    }
+}
+
+/// The handshake `verify` sends to run its probe through the agent: ssh-broker's own command, run as
+/// it stands and not through the user's shell.
+pub fn probe_handshake(exe: &std::path::Path) -> crate::protocol::Handshake {
+    let command = format!("\"{}\" verify-probe", exe.display());
+    crate::shim::make_handshake(
+        &Some(command),
+        false,
+        crate::protocol::Launch::Direct,
+        "xterm".into(),
+        80,
+        24,
+    )
 }
 
 /// The directory `apply` installs into. The one place the path is written; [`layout::Layout`]
@@ -88,6 +113,13 @@ pub const BASE_DIR: &str = r"C:\ProgramData\ssh-broker";
 
 /// The installed exe's file name.
 pub const EXE_NAME: &str = "ssh-broker.exe";
+
+/// Whether sshd, given `shell` as the `DefaultShell`, runs ssh-broker's own exe: it compares the file
+/// name as sshd's `CreateProcess` resolves it (`.exe` is appended to a name with no extension), so
+/// `...\ssh-broker` is ssh-broker too. The one place `apply` asks this.
+pub fn is_ssh_broker(shell: &str) -> bool {
+    crate::shell::program_file_name(shell).eq_ignore_ascii_case(EXE_NAME)
+}
 
 /// The path `apply` installs the shim to and registers as `DefaultShell`.
 pub fn canonical_exe() -> std::path::PathBuf {
@@ -100,13 +132,16 @@ mod provision_tests;
 
 #[cfg(windows)]
 mod imp {
+    use super::handover::{Handover, hand_over, remove_arguments, replace_shell, say_to_console};
     use super::layout::{self, Layout};
+    use super::registry::SshdShell;
     use super::{
-        apply_lock, flow, probe, procwait, registry, report, schtasks, session_task, sessions, taskscheduler, user_rows,
+        apply_lock, flow, probe, procwait, registry, report, schtasks, session_task, sessions, system_config,
+        taskscheduler, user_rows,
     };
     use crate::{afunix, shim};
     use anyhow::Context;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     /// Case-insensitive compare of a registry path string (quotes trimmed) to a path.
     fn eq_path(a: &str, b: &Path) -> bool {
@@ -116,20 +151,17 @@ mod imp {
     pub fn apply() -> anyhow::Result<()> {
         let layout = Layout::production();
 
-        // 0. `apply` takes no arguments. A removed `--user` (still in an old self-heal task) is
-        //    warned about and ignored.
+        // 0. `apply` takes no arguments.
         let args: Vec<String> = std::env::args().skip(2).collect();
-        for warning in super::check_apply_args(&args)? {
-            eprintln!("{warning}");
-        }
+        super::check_apply_args(&args)?;
 
         // 1. Install this exe to a STABLE path (see layout::prepare). Everything registers the
         //    canonical path: a temp path would brick SSH the instant it is deleted; the shim's
         //    fail-open can't help if sshd execs a missing binary. The install directory is gated
-        //    first, so a planted one is never adopted, and a single-user install is replaced. A
-        //    different build over an installed one stops every agent first (they hold the exe
-        //    open) and waits for them to exit, with the logon task and the auto-login tasks
-        //    disabled so that nothing starts one from the old exe meanwhile. Every run from here
+        //    first, so a planted one is never adopted. A different build over an installed one stops
+        //    every agent first (they hold the exe open) and waits for them to exit, with the logon
+        //    task and the auto-login tasks disabled so that nothing starts one from the old exe
+        //    meanwhile. Every run from here
         //    ends by enabling those tasks and starting the auto-login ones that have no session
         //    (see `flow::repair_sessions`), which also heals what an earlier, killed `apply` left;
         //    the agents start again afterwards, even if a later step fails, except in a session
@@ -137,48 +169,114 @@ mod imp {
         let current = std::env::current_exe().context("current_exe")?;
         // The install directory first: the lock file lives in it, and nothing is read from it or
         // written into it before it is proved ours. One `apply` runs at a time, for its whole run,
-        // and no `auto-login on|off` runs during it: a second `apply` (the boot self-heal is one)
-        // waits here, so it never stops or starts what the first is working on.
+        // and no `auto-login on|off` runs during it: a second `apply` waits here, so it never stops
+        // or starts what the first is working on.
         let base = layout::ensure_base(&layout)?;
         let _apply_lock = apply_lock::acquire(&layout.apply_lock_path(), || {
             eprintln!("apply: another apply or an auto-login command is running; waiting for it to finish")
         })?;
-        let registered_xml = schtasks::registered_xml(taskscheduler::task_xml(schtasks::AGENT_TASK))?;
         let exe = flow::run(
             || {
                 taskscheduler::stop_instances(schtasks::AGENT_TASK, &layout.canonical_exe())?;
                 stop_background_sessions(&layout.canonical_exe())
             },
             |stop_agents| {
-                let exe = layout::prepare_in(&base, &current, registered_xml.as_deref(), stop_agents)?;
+                let exe = layout::prepare_in(&base, &current, stop_agents)?;
 
-                // 2. Register both tasks (idempotent /F).
+                // 2. Register the agent task (idempotent /F).
                 register_agent_task(&layout, &exe)?;
-                register_selfheal_task(&exe)?;
 
-                // 3. Write the escape flag and read it back at once, then flip the DefaultShell
-                //    pair LAST and only to the validated canonical path; read that back too. sshd
-                //    reads these once per session, so the shim cannot ask later which form sshd
-                //    used: `apply` owns the flag (see `registry::desired_values`).
-                registry::set_default_shell_under(registry::OPENSSH_KEY, &exe.to_string_lossy())
-                    .context("write the DefaultShell values")?;
+                // 3. Carry the previous sshd shell into the system config, while the registry still
+                //    holds it. Then write the escape flag and read it back at once, then flip the
+                //    DefaultShell pair LAST and only to the validated canonical path; read that back
+                //    too. sshd reads these once per session, so the shim cannot ask later which form
+                //    sshd used: `apply` owns the flag (see `registry::desired_values`). A shell that
+                //    cannot be read in full stops `apply` here, before any of it is written.
+                replace_shell(
+                    || registry::read_sshd_shell_under(registry::OPENSSH_KEY),
+                    |previous| carry_previous_shell(&base, previous),
+                    |handover| {
+                        registry::set_default_shell_under(registry::OPENSSH_KEY, &exe.to_string_lossy(), handover)
+                            .context("write DefaultShellEscapeArguments, DefaultShellCommandOption, DefaultShell (in that order)")
+                    },
+                )?;
                 let (shell, opt) = registry::read_default_shell_under(registry::OPENSSH_KEY)?;
                 anyhow::ensure!(
                     eq_path(&shell, &exe) && opt == "-c",
                     "DefaultShell read-back mismatch (shell={shell:?}, opt={opt:?})"
                 );
+                remove_shell_arguments(&base.layout().system_config_path());
                 Ok(exe)
             },
-            agent_task_is_group_form,
             enable_agent_task,
             repair_session_tasks,
             start_agents,
         )?;
-        println!(
-            "apply: ok — DefaultShell -> {}, agent + self-heal tasks installed",
-            exe.display()
-        );
+        println!("apply: ok — DefaultShell -> {}, agent task installed", exe.display());
         Ok(())
+    }
+
+    /// Write the system config from the shell sshd runs now, if it is not ssh-broker and there is no
+    /// config yet (see [`system_config`]). Must run before the registry is overwritten. The install is
+    /// complete without the config, so a failure is said on stderr and `apply` goes on; the
+    /// [`Handover`] it returns is what the flip takes. `previous` is what the registry holds now.
+    fn carry_previous_shell(base: &layout::TrustedBase<'_>, previous: &SshdShell) -> Handover {
+        let mut say = say_to_console;
+        let config = base.layout().system_config_path();
+        let config_is_file = system_config::config_is_file(&config);
+        let host = crate::shell::WindowsHost;
+        // The file the shell resolves to, found as sshd finds it (a bare name is searched in sshd's own
+        // directory, the system and Windows directories, then on `PATH`), so the identity check below
+        // looks at that file and not at one of that name beside `apply`. Looked up only when the
+        // decision needs it, so that what cannot be read is not reported when it does not matter.
+        let search = || {
+            let image = registry::read_sshd_image_path().unwrap_or_else(|e| {
+                eprintln!("apply: cannot read where sshd runs from: {e:#}");
+                None
+            });
+            system_config::sshd_search_dirs(&host, image.as_deref())
+                .map_err(|e| format!("cannot find the system directory to look for the shell in: {e:#}"))
+        };
+        let find =
+            |dirs: &[PathBuf], path: &Path| crate::shell::resolve_program_in(&host, dirs, &path.to_string_lossy());
+        let is_system_cmd = |found: &Path| {
+            use crate::shell::Host;
+            host.is_system_cmd(found).unwrap_or_else(|e| {
+                eprintln!(
+                    "apply: cannot tell whether {} is the system cmd.exe: {e}",
+                    found.display()
+                );
+                false
+            })
+        };
+        let decision = system_config::decide(previous, config_is_file, &search, &find, &is_system_cmd);
+        hand_over(
+            &config,
+            previous,
+            decision,
+            |block| system_config::create_once(base, block),
+            &mut say,
+        )
+    }
+
+    /// Remove `DefaultShellArguments` once `DefaultShell` is ssh-broker and `config` is a file: sshd would
+    /// hand the arguments to ssh-broker ahead of `-c`, and the config is where they were carried (by the
+    /// `apply` that replaced the shell) or are not wanted. A value that cannot be read, or with no file known
+    /// to hold it, is the only copy of the old setup: it is left, and said, for the next `apply` (see
+    /// [`system_config::plan_arguments`]). A removal prints the value before it deletes it
+    /// ([`remove_arguments`]), and a failed one says so with the cause and `apply` goes on.
+    fn remove_shell_arguments(config: &Path) {
+        let key = registry::OPENSSH_KEY;
+        // Read on its own: another value that cannot be read does not make this one unreadable.
+        let read = registry::read_shell_arguments_under(key).map_err(|e| format!("{e:#}"));
+        remove_arguments(
+            config,
+            key,
+            read,
+            || system_config::config_is_file(config),
+            |shown| registry::remove_shell_arguments_under(key, shown),
+            &mut say_to_console,
+        );
     }
 
     /// The background sessions' part of the stop that precedes replacing the exe: the auto-login
@@ -195,22 +293,6 @@ mod imp {
             |agents| procwait::wait_all_exited(&agents, procwait::EXIT_BOUND),
         )
         .context("stop the background sessions")
-    }
-
-    /// Whether the registered agent task is the group logon task, the form that can start an agent
-    /// in any session. An older single-user task cannot, so a failed `apply` that stopped agents
-    /// does not run it.
-    ///
-    /// A query that cannot be answered counts as "no": starting through a task of unknown form
-    /// could start the single-user agent this migration is replacing.
-    fn agent_task_is_group_form() -> bool {
-        match taskscheduler::task_xml(schtasks::AGENT_TASK) {
-            Ok(xml) => xml.is_some_and(|xml| schtasks::xml_is_group_logon_task(&xml)),
-            Err(e) => {
-                eprintln!("apply: not restarting the agents: {e:#}");
-                false
-            }
-        }
     }
 
     /// Enable the agent task: undo the stop's disabling of it, and heal a task that an earlier
@@ -287,11 +369,6 @@ mod imp {
         Ok(())
     }
 
-    fn register_selfheal_task(exe: &Path) -> anyhow::Result<()> {
-        run_schtasks(&schtasks::selfheal_task_argv(&exe.to_string_lossy())).context("register self-heal task")?;
-        Ok(())
-    }
-
     /// Decode schtasks output, handling the UTF-16LE it can emit to a redirected pipe (BOM, or
     /// pervasive NUL bytes). Otherwise treat it as UTF-8/ASCII. The markers verify scans for
     /// (`<Task`, `InteractiveToken`) are ASCII either way, but decoding correctly avoids a
@@ -349,6 +426,11 @@ mod imp {
             Err(e) => rows.push(report::Check::new("DefaultShell pair", false, e.to_string())),
         }
 
+        // Local: the shell sessions start. A fallback to the built-in cmd.exe is a failure here: the
+        // user's config says something that is not true.
+        let effective = crate::shell::effective(&crate::shell::WindowsHost);
+        rows.push(super::shell_config_row(&effective));
+
         // Local: the install directory is exactly the hardened one (only SYSTEM and Administrators
         // can write to it).
         let base = layout::check_base(&layout);
@@ -376,18 +458,6 @@ mod imp {
                 format!("could not tell who this is: {e:#}"),
             )),
         }
-        // Informational: verify runs via the LeastPrivilege agent (non-elevated) and cannot
-        // reliably query a SYSTEM-owned task, so this never gates verify (apply errors loudly
-        // if registration fails, and the reboot self-heal is exercised in the Phase-8 test).
-        rows.push(report::Check::new(
-            "self-heal task (info)",
-            true,
-            match taskscheduler::task_xml(schtasks::SELFHEAL_TASK) {
-                Ok(Some(_)) => "registered".to_string(),
-                Ok(None) => "not registered".to_string(),
-                Err(e) => format!("not queryable (needs elevation?): {e:#}"),
-            },
-        ));
 
         // Per user: this account's socket, its folder and file ACLs, and whether its agent
         // answers. `verify` reports on the account that runs it.
@@ -482,6 +552,9 @@ mod imp {
         }
 
         println!("{}", report::format_report(&rows));
+        if let Ok(effective) = &effective {
+            println!("\n{}", crate::shell::render(effective));
+        }
         let code = report::verify_exit_code(&rows);
         if code != 0 {
             std::process::exit(code);
@@ -524,8 +597,7 @@ mod imp {
     fn drive_probe(exe: &Path) -> anyhow::Result<(probe::ProbeResult, bool)> {
         let sock = afunix::connect(&crate::userdir::current_socket_location()?.path).context("connect to agent")?;
         let (rx, tx) = afunix::split(sock)?;
-        let cmd = format!("\"{}\" verify-probe", exe.display());
-        let hs = shim::make_handshake(&Some(cmd), "xterm".into(), 80, 24);
+        let hs = super::probe_handshake(exe);
         let mut out = Vec::new();
         let mut err = Vec::new();
         // Feed the SAME payload upstream that the child echoes downstream. Passing `io::empty()`

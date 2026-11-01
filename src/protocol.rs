@@ -122,7 +122,8 @@ impl ExitCode {
     }
 }
 
-pub const PROTOCOL_VERSION: u16 = 1;
+/// The wire version. 2 added [`Handshake::launch`].
+pub const PROTOCOL_VERSION: u16 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Mode {
@@ -133,11 +134,21 @@ pub enum Mode {
     Logout,
 }
 
+/// Whether the agent starts the user's configured shell for the session, or the command as given.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Launch {
+    /// The shell from `config.yaml` (see [`crate::shell`]), with the command packed for it.
+    Shell,
+    /// The line in [`Handshake::command`] is spawned as it stands, with no shell in between.
+    /// For ssh-broker's own callers (`verify`'s probe) and tests; `command` is required.
+    Direct,
+}
+
 /// The first frame on a connection (a HANDSHAKE-kind frame whose payload is this
 /// struct, `postcard`-serialized). The shim fills `term`/`cwd` and the allow-listed
-/// `env`. The agent currently applies the working directory; `%TERM%`/`env` propagation
-/// into the child lands alongside the config-driven shell (Phase 7). Raw DATA frames are
-/// NOT routed through serde — only this header.
+/// `env`. The agent applies the working directory; `TERM` and the rest of the SSH session's
+/// environment are not propagated yet. Raw DATA frames are NOT routed through serde — only
+/// this header.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Handshake {
     pub version: u16,
@@ -148,6 +159,7 @@ pub struct Handshake {
     pub cwd: String,
     pub command: Option<String>,
     pub env: Vec<(String, String)>,
+    pub launch: Launch,
 }
 
 impl Handshake {
@@ -155,17 +167,18 @@ impl Handshake {
         Ok(postcard::to_stdvec(self)?)
     }
     pub fn decode(b: &[u8]) -> anyhow::Result<Self> {
-        let h: Handshake = postcard::from_bytes(b)?;
+        // `version` is the first field: read it alone, so a peer of another version is refused
+        // by name instead of failing on a field it does not have.
+        let (version, _) = postcard::take_from_bytes::<u16>(b)?;
         anyhow::ensure!(
-            h.version == PROTOCOL_VERSION,
-            "protocol version mismatch: peer {} != ours {PROTOCOL_VERSION}",
-            h.version
+            version == PROTOCOL_VERSION,
+            "protocol version mismatch: peer {version} != ours {PROTOCOL_VERSION}"
         );
-        Ok(h)
+        Ok(postcard::from_bytes(b)?)
     }
 
-    /// A minimal interactive-PTY handshake, used as a `..Handshake::pty_default()`
-    /// base in tests and as the shim's starting point.
+    /// A minimal interactive-PTY handshake, used as a `..Handshake::pty_default()` base in tests
+    /// and by `make_handshake`. Its launch is [`Launch::Direct`]: the base for a raw spawn.
     pub fn pty_default() -> Self {
         Self {
             version: PROTOCOL_VERSION,
@@ -176,6 +189,7 @@ impl Handshake {
             cwd: String::new(),
             command: None,
             env: Vec::new(),
+            launch: Launch::Direct,
         }
     }
 }

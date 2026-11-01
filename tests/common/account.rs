@@ -209,8 +209,19 @@ impl Account {
             .expect("CreateProfile");
             let len = buf.iter().position(|&u| u == 0).unwrap();
             account.profile = Some(PathBuf::from(std::ffi::OsString::from_wide(&buf[..len])));
+            // The tests type PowerShell into the shell, and ssh-broker's default shell is cmd.exe: the
+            // account's user config names `pwsh`. A test that wants another shell writes its own.
+            account.write_user_config("shell: pwsh.exe\n");
         }
         account
+    }
+
+    /// Replace the account's `.config\ssh-broker\config.yaml` (what the shim and the agent read for
+    /// this account) with `yaml`. The account must have a profile.
+    pub fn write_user_config(&self, yaml: &str) {
+        let dir = self.profile().join(".config").join("ssh-broker");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config.yaml"), yaml).unwrap();
     }
 
     /// Grant the account "Log on as a batch job" (`SeBatchLogonRight`), which Task Scheduler needs

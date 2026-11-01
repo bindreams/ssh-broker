@@ -2,9 +2,9 @@
 //!
 //! Two guards, because there are two questions:
 //!
-//! - [`SessionSlot`]: is there already an agent in *this session*? `apply` and the boot
-//!   self-heal start an agent per logged-on session each time they run; the logon task starts
-//!   one per logon. A second agent in a session that has one has nothing to add, so it exits.
+//! - [`SessionSlot`]: is there already an agent in *this session*? `apply` starts an agent per
+//!   logged-on session each time it runs; the logon task starts one per logon. A second agent in
+//!   a session that has one has nothing to add, so it exits.
 //!   The slot is a byte-range lock on a file in the user's verified private folder, not a named
 //!   kernel object: any process in the session could create such an object first, whatever
 //!   account it runs as, and only the user, SYSTEM and Administrators can create a file here.

@@ -30,7 +30,8 @@
 
 use std::path::Path;
 
-use crate::winutil::{AttrList, OwnedHandle};
+use crate::shell::StartError;
+use crate::winutil::{Attr, AttrList, OwnedHandle, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, start_error_of_create};
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Storage::FileSystem::{ReadFile, WriteFile};
 use windows::Win32::System::Console::{COORD, ClosePseudoConsole, CreatePseudoConsole, HPCON, ResizePseudoConsole};
@@ -159,8 +160,16 @@ pub struct PtySession {
 
 impl PtySession {
     /// Spawn `command` in a fresh pseudoconsole of `cols`x`rows`, optionally in `cwd`. The
-    /// child inherits the agent's (session-1) token and environment.
-    pub fn spawn(command: &str, cols: u16, rows: u16, cwd: Option<&Path>) -> windows::core::Result<PtySession> {
+    /// child inherits the agent's (session-1) token and environment, and exactly one handle besides
+    /// the pseudoconsole's when `inherit` names it (an inheritable handle of this process, such as
+    /// [`crate::winutil::Handoff::read`]).
+    pub fn spawn(
+        command: &str,
+        cols: u16,
+        rows: u16,
+        cwd: Option<&Path>,
+        inherit: Option<&OwnedHandle>,
+    ) -> Result<PtySession, StartError> {
         let size = COORD {
             X: cols.max(1) as i16,
             Y: rows.max(1) as i16,
@@ -176,11 +185,20 @@ impl PtySession {
 
             // lpValue for PSEUDOCONSOLE is the HPCON VALUE itself, not a pointer to it —
             // the root cause of the 0xC0000142 DLL-init failure in the spike.
-            let attr = AttrList::single(
-                PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
-                hpc.0.0 as *const core::ffi::c_void,
-                std::mem::size_of::<HPCON>(),
-            )?;
+            // The array must outlive CreateProcessW: the attribute list stores a pointer to it.
+            let inherited: Option<[HANDLE; 1]> = inherit.map(|handle| [handle.0]);
+            let console = Attr {
+                attribute: PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
+                value: hpc.0.0 as *const core::ffi::c_void,
+                size: std::mem::size_of::<HPCON>(),
+            };
+            let listed = inherited.as_ref().map(|handles| Attr {
+                attribute: PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+                value: handles.as_ptr() as *const core::ffi::c_void,
+                size: std::mem::size_of_val(handles),
+            });
+            let attributes: Vec<Attr> = std::iter::once(console).chain(listed).collect();
+            let attr = AttrList::new(&attributes)?;
 
             let mut si = STARTUPINFOEXW::default();
             si.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
@@ -202,18 +220,21 @@ impl PtySession {
             // containment permanently. Sequence fixed by `cosca::Job`: create suspended,
             // assign, and only then resume.
             let mut pi = PROCESS_INFORMATION::default();
+            let _no_boxes = crate::winutil::FailCriticalErrors::enter();
             CreateProcessW(
                 PCWSTR::null(),
                 Some(PWSTR(cmd.as_mut_ptr())),
                 None,
                 None,
-                false,
+                // Inherit only what the handle list names; with none, nothing.
+                inherited.is_some(),
                 EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED,
                 None,
                 cwd_ptr,
                 &si.StartupInfo,
                 &mut pi,
-            )?;
+            )
+            .map_err(|e| start_error_of_create(e, cwd))?;
             // `attr` drops here (DeleteProcThreadAttributeList) — the child is created.
             drop(attr);
 

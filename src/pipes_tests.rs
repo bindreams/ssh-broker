@@ -71,3 +71,69 @@ fn exec_keeps_the_trailing_spaces_of_a_command() {
 
     assert_eq!(String::from_utf8_lossy(&out), "a   \r\n");
 }
+
+/// A file that exists and cannot be started (here, not a program at all) is an error from `spawn`.
+/// Without the thread's hard-error boxes switched off, `CreateProcessW` raises a message box on the
+/// interactive desktop and waits for an answer; in a session nobody watches, that is a hang.
+#[test]
+fn a_file_that_cannot_start_is_an_error_and_not_a_message_box() {
+    let dir = std::env::temp_dir().join(format!("sb-pipes-stub-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let stub = dir.join("stub.exe");
+    std::fs::write(&stub, b"MZ").unwrap();
+    let result = ExecChild::spawn(&format!("\"{}\" -c x", stub.display()), None);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(result.is_err(), "a file that is not a program started");
+}
+
+// A program the loader cannot load =====
+
+/// Make a program that cannot load end with its status instead of a message box on a desktop nobody
+/// watches. The setting is this test process's, which nextest gives to this test alone.
+fn loader_failures_end_the_program() {
+    use windows::Win32::System::Diagnostics::Debug::{SEM_FAILCRITICALERRORS, SetErrorMode};
+    // SAFETY: no pointers.
+    unsafe { SetErrorMode(SEM_FAILCRITICALERRORS) };
+}
+
+/// A program whose import is missing is STARTED. `CreateProcessW` succeeds, the
+/// loader ends the process with `STATUS_DLL_NOT_FOUND` before `main`, and nothing was written to either stream. So
+/// `spawn` cannot tell it from a healthy program; the status is known only when the process ends.
+#[test]
+fn a_program_with_a_missing_dll_starts_and_ends_with_the_loader_status_and_no_output() {
+    const STATUS_DLL_NOT_FOUND: u32 = 0xC000_0135;
+    loader_failures_end_the_program();
+    let exe = crate::command_line_probe::example("missing_dll");
+    let child = ExecChild::spawn(&format!("\"{}\"", exe.display()), None).expect("the program starts");
+    let out_t = drain(child.stdout_read_raw());
+    let err_t = drain(child.stderr_read_raw());
+    // UNBOUNDED on purpose: the loader ends the process, or nextest's bound names this test.
+    let code = child.wait().unwrap();
+    assert_eq!(code as u32, STATUS_DLL_NOT_FOUND, "{code:#x}");
+    assert!(out_t.join().unwrap().is_empty() && err_t.join().unwrap().is_empty());
+}
+
+/// A working directory that is not one is the session's failure, not the program's: the shell would be
+/// blamed, and cmd.exe would meet the same failure.
+#[test]
+fn a_missing_working_directory_is_not_the_programs_fault() {
+    let missing = std::env::temp_dir().join(format!("sb-pipes-no-such-dir-{}", std::process::id()));
+    let error = ExecChild::spawn("cmd.exe /c exit", Some(&missing))
+        .err()
+        .expect("a missing working directory started a program");
+    assert!(matches!(error, StartError::Other(_)), "{error:?}");
+}
+
+/// A file that is not a program is the program's fault, whatever the working directory.
+#[test]
+fn a_file_that_cannot_start_is_the_programs_fault() {
+    let dir = std::env::temp_dir().join(format!("sb-pipes-fault-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let stub = dir.join("stub.exe");
+    std::fs::write(&stub, b"MZ").unwrap();
+    let error = ExecChild::spawn(&format!("\"{}\"", stub.display()), Some(&dir))
+        .err()
+        .expect("a file that is not a program started");
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(matches!(error, StartError::Program(_)), "{error:?}");
+}
