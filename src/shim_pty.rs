@@ -472,7 +472,7 @@ fn ignore_ctrl_c() {
             use std::io::Write as _;
             let _ = writeln!(
                 std::io::stderr(),
-                "ssh-broker: could not keep this process through Ctrl+C ({e}); Ctrl+C may end the session"
+                "ssh-broker: could not keep this process through Ctrl+C ({e})"
             );
         }
     });
