@@ -124,7 +124,8 @@ fn would_replace_installed_exe(layout: &Layout, current: &Path) -> bool {
 ///
 /// A copy that fails is an error. By now every agent the logon task started has been stopped and
 /// has exited, so a sharing violation means something else holds the exe open (an agent started
-/// by hand, or the shim of an open SSH session: the exe is sshd's DefaultShell). Keeping the old exe under the new tasks would report an install that did not happen.
+/// by hand, or the shim of an open SSH session: the exe is sshd's DefaultShell). Keeping the old
+/// exe under the new tasks would report an install that did not happen.
 fn install_self(layout: &Layout, current: &Path) -> anyhow::Result<PathBuf> {
     let canonical = layout.canonical_exe();
     if current != canonical && !files_identical(current, &canonical) {
