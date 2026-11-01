@@ -88,9 +88,7 @@ impl Drop for Install {
     fn drop(&mut self) {
         let canonical = provision::canonical_exe();
         let _ = taskscheduler::stop_instances(schtasks::AGENT_TASK, &canonical);
-        for task in [schtasks::AGENT_TASK, schtasks::SELFHEAL_TASK] {
-            let _ = desktop::output(Command::new("schtasks").args(["/Delete", "/TN", task, "/F"]));
-        }
+        let _ = desktop::output(Command::new("schtasks").args(["/Delete", "/TN", schtasks::AGENT_TASK, "/F"]));
         if let Ok(agents) = procwait::background_agents(&canonical) {
             for agent in &agents {
                 let _ = agent.terminate();

@@ -8,14 +8,13 @@ use super::procwait::{StillRunning, Survivor};
 /// `install` receives the function that stops every agent and must call it at most once, before
 /// it replaces the exe. If `install` fails after that call (or inside it, since a stop that
 /// failed part-way has still stopped some agents), `start` still runs, best-effort, so a failed
-/// `apply` does not leave every logged-on user without an agent. `restart_is_safe` says whether
-/// the registered agent task can start one: an older single-user task cannot.
+/// `apply` does not leave every logged-on user without an agent.
 ///
 /// `resume_agent_task` enables the agent task and runs on every call, whatever came before: a stop
 /// disables the task, and an earlier `apply` that was killed before it got here may have left it
 /// so. `repair_sessions` does the same for the auto-login tasks and starts the ones with no
 /// session (see [`repair_sessions`]); it too runs on every call, including a failed install and an
-/// install that stopped nothing, and does not depend on the agent task or on `restart_is_safe`. If
+/// install that stopped nothing, and does not depend on the agent task. If
 /// the agent task cannot be enabled, no agent is started (a disabled task starts nothing); a
 /// failure of `repair_sessions` does not hold the start back. Either failure is the result unless
 /// `install` had already failed, in which case that error is returned as it was and the other is
@@ -27,7 +26,6 @@ use super::procwait::{StillRunning, Survivor};
 pub fn run<T>(
     stop: impl FnOnce() -> anyhow::Result<()>,
     install: impl FnOnce(&mut dyn FnMut() -> anyhow::Result<()>) -> anyhow::Result<T>,
-    restart_is_safe: impl FnOnce() -> bool,
     resume_agent_task: impl FnOnce() -> anyhow::Result<()>,
     repair_sessions: impl FnOnce() -> anyhow::Result<()>,
     start: impl FnOnce(&[Survivor]),
@@ -51,7 +49,7 @@ pub fn run<T>(
             (false, Some(e))
         }
     };
-    if agents_can_start && (result.is_ok() || (attempted && restart_is_safe())) {
+    if agents_can_start && (result.is_ok() || attempted) {
         let survivors = match &result {
             Err(e) => e.downcast_ref::<StillRunning>().map(|s| s.survivors.as_slice()),
             Ok(_) => None,

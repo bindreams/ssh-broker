@@ -4,8 +4,8 @@
 //! has no session or user argument. `IRegisteredTask::RunEx` with `TASK_RUN_USE_SESSION_ID`
 //! starts the task "interactively as the user who is logged on to the specified session", which
 //! is what `apply` needs to give each logged-on user an agent without waiting for their next
-//! logon. And `schtasks /End` is the only CLI way to stop instances, which a migration needs
-//! before it replaces the exe a running legacy agent holds open; COM does it without parsing text.
+//! logon. And `schtasks /End` is the only CLI way to stop instances, which `apply` needs before it
+//! replaces the exe a running agent holds open; COM does it without parsing text.
 //!
 //! Stopping is more than `Stop`: the call returns before the processes are gone, so it also waits
 //! for them (see [`procwait`]), looks again for an instance that was still starting, and disables

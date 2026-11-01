@@ -1,12 +1,11 @@
 //! provision: self-install (`apply`) and self-check (`verify`) — the DefaultShell values, the
-//! agent logon task (one agent per logged-on user), the ONSTART self-heal task, and parity
-//! probes (DPAPI/symlink/session) run THROUGH the invoking user's agent.
+//! agent logon task (one agent per logged-on user), and parity probes (DPAPI/symlink/session) run
+//! THROUGH the invoking user's agent.
 //!
 //! The pure, host-tested logic lives in the submodules (registry/schtasks/probe/report); this root
 //! holds the Windows orchestration. `apply` is ordered so a partial run never bricks SSH (the
 //! DefaultShell registry flip is LAST, after the exe is proven present). It knows no user: each
-//! agent makes and hardens its own socket directory in its own profile, so a SYSTEM-run
-//! self-heal has nothing to resolve.
+//! agent makes and hardens its own socket directory in its own profile.
 
 #[cfg(windows)]
 pub(crate) mod apply_lock;
@@ -60,30 +59,14 @@ pub fn verify_probe() -> anyhow::Result<()> {
     anyhow::bail!("verify-probe runs only on Windows");
 }
 
-/// Check the arguments after `apply`, returning the warnings to print.
+/// Check the arguments after `apply`.
 ///
-/// `apply` takes none. The one exception is the removed `--user <name>`: an earlier build baked
-/// it into the boot-time self-heal task, and during a half-done migration that task runs the new
-/// exe with it. Refusing would leave the install unrepaired by the very task that exists to
-/// repair it, so it is accepted, ignored, and reported.
-pub fn check_apply_args(args: &[String]) -> anyhow::Result<Vec<String>> {
-    let mut warnings = Vec::new();
-    let mut rest = args.iter().peekable();
-    while let Some(arg) = rest.next() {
-        if arg == "--user" {
-            // Its value is part of the flag, not an argument of its own.
-            if rest.peek().is_some_and(|value| !value.starts_with('-')) {
-                rest.next();
-            }
-            warnings.push(
-                "apply: --user is ignored: ssh-broker runs one agent per logged-on user and has no target account"
-                    .to_string(),
-            );
-        } else {
-            anyhow::bail!("apply takes no arguments, got {arg:?}");
-        }
+/// `apply` takes none.
+pub fn check_apply_args(args: &[String]) -> anyhow::Result<()> {
+    match args.first() {
+        Some(arg) => anyhow::bail!("apply takes no arguments, got {arg:?}"),
+        None => Ok(()),
     }
-    Ok(warnings)
 }
 
 /// The `verify` row for the shell configuration: it passes when the configured (or built-in) shell is
@@ -168,20 +151,17 @@ mod imp {
     pub fn apply() -> anyhow::Result<()> {
         let layout = Layout::production();
 
-        // 0. `apply` takes no arguments. A removed `--user` (still in an old self-heal task) is
-        //    warned about and ignored.
+        // 0. `apply` takes no arguments.
         let args: Vec<String> = std::env::args().skip(2).collect();
-        for warning in super::check_apply_args(&args)? {
-            eprintln!("{warning}");
-        }
+        super::check_apply_args(&args)?;
 
         // 1. Install this exe to a STABLE path (see layout::prepare). Everything registers the
         //    canonical path: a temp path would brick SSH the instant it is deleted; the shim's
         //    fail-open can't help if sshd execs a missing binary. The install directory is gated
-        //    first, so a planted one is never adopted, and a single-user install is replaced. A
-        //    different build over an installed one stops every agent first (they hold the exe
-        //    open) and waits for them to exit, with the logon task and the auto-login tasks
-        //    disabled so that nothing starts one from the old exe meanwhile. Every run from here
+        //    first, so a planted one is never adopted. A different build over an installed one stops
+        //    every agent first (they hold the exe open) and waits for them to exit, with the logon
+        //    task and the auto-login tasks disabled so that nothing starts one from the old exe
+        //    meanwhile. Every run from here
         //    ends by enabling those tasks and starting the auto-login ones that have no session
         //    (see `flow::repair_sessions`), which also heals what an earlier, killed `apply` left;
         //    the agents start again afterwards, even if a later step fails, except in a session
@@ -189,24 +169,22 @@ mod imp {
         let current = std::env::current_exe().context("current_exe")?;
         // The install directory first: the lock file lives in it, and nothing is read from it or
         // written into it before it is proved ours. One `apply` runs at a time, for its whole run,
-        // and no `auto-login on|off` runs during it: a second `apply` (the boot self-heal is one)
-        // waits here, so it never stops or starts what the first is working on.
+        // and no `auto-login on|off` runs during it: a second `apply` waits here, so it never stops
+        // or starts what the first is working on.
         let base = layout::ensure_base(&layout)?;
         let _apply_lock = apply_lock::acquire(&layout.apply_lock_path(), || {
             eprintln!("apply: another apply or an auto-login command is running; waiting for it to finish")
         })?;
-        let registered_xml = schtasks::registered_xml(taskscheduler::task_xml(schtasks::AGENT_TASK))?;
         let exe = flow::run(
             || {
                 taskscheduler::stop_instances(schtasks::AGENT_TASK, &layout.canonical_exe())?;
                 stop_background_sessions(&layout.canonical_exe())
             },
             |stop_agents| {
-                let exe = layout::prepare_in(&base, &current, registered_xml.as_deref(), stop_agents)?;
+                let exe = layout::prepare_in(&base, &current, stop_agents)?;
 
-                // 2. Register both tasks (idempotent /F).
+                // 2. Register the agent task (idempotent /F).
                 register_agent_task(&layout, &exe)?;
-                register_selfheal_task(&exe)?;
 
                 // 3. Carry the previous sshd shell into the system config, while the registry still
                 //    holds it. Then write the escape flag and read it back at once, then flip the
@@ -230,15 +208,11 @@ mod imp {
                 remove_shell_arguments(&base.layout().system_config_path());
                 Ok(exe)
             },
-            agent_task_is_group_form,
             enable_agent_task,
             repair_session_tasks,
             start_agents,
         )?;
-        println!(
-            "apply: ok — DefaultShell -> {}, agent + self-heal tasks installed",
-            exe.display()
-        );
+        println!("apply: ok — DefaultShell -> {}, agent task installed", exe.display());
         Ok(())
     }
 
@@ -321,22 +295,6 @@ mod imp {
         .context("stop the background sessions")
     }
 
-    /// Whether the registered agent task is the group logon task, the form that can start an agent
-    /// in any session. An older single-user task cannot, so a failed `apply` that stopped agents
-    /// does not run it.
-    ///
-    /// A query that cannot be answered counts as "no": starting through a task of unknown form
-    /// could start the single-user agent this migration is replacing.
-    fn agent_task_is_group_form() -> bool {
-        match taskscheduler::task_xml(schtasks::AGENT_TASK) {
-            Ok(xml) => xml.is_some_and(|xml| schtasks::xml_is_group_logon_task(&xml)),
-            Err(e) => {
-                eprintln!("apply: not restarting the agents: {e:#}");
-                false
-            }
-        }
-    }
-
     /// Enable the agent task: undo the stop's disabling of it, and heal a task that an earlier
     /// `apply` left disabled by being killed. Registering the task afresh enables it too, but a
     /// failed `apply` may not have got that far.
@@ -408,11 +366,6 @@ mod imp {
             &xml_path.to_string_lossy(),
         ))
         .context("register agent task")?;
-        Ok(())
-    }
-
-    fn register_selfheal_task(exe: &Path) -> anyhow::Result<()> {
-        run_schtasks(&schtasks::selfheal_task_argv(&exe.to_string_lossy())).context("register self-heal task")?;
         Ok(())
     }
 
@@ -505,18 +458,6 @@ mod imp {
                 format!("could not tell who this is: {e:#}"),
             )),
         }
-        // Informational: verify runs via the LeastPrivilege agent (non-elevated) and cannot
-        // reliably query a SYSTEM-owned task, so this never gates verify (apply errors loudly
-        // if registration fails, and the reboot self-heal is exercised in the Phase-8 test).
-        rows.push(report::Check::new(
-            "self-heal task (info)",
-            true,
-            match taskscheduler::task_xml(schtasks::SELFHEAL_TASK) {
-                Ok(Some(_)) => "registered".to_string(),
-                Ok(None) => "not registered".to_string(),
-                Err(e) => format!("not queryable (needs elevation?): {e:#}"),
-            },
-        ));
 
         // Per user: this account's socket, its folder and file ACLs, and whether its agent
         // answers. `verify` reports on the account that runs it.

@@ -8,9 +8,8 @@ fn flow(
     stops: bool,
     stop_result: fn() -> anyhow::Result<()>,
     install_ok: bool,
-    safe: bool,
 ) -> (Vec<&'static str>, anyhow::Result<()>) {
-    flow_resuming(stops, stop_result, install_ok, safe, || Ok(()), || Ok(()))
+    flow_resuming(stops, stop_result, install_ok, || Ok(()), || Ok(()))
 }
 
 /// [`flow`] with the outcome of enabling the agent task again and of repairing the auto-login
@@ -19,7 +18,6 @@ fn flow_resuming(
     stops: bool,
     stop_result: fn() -> anyhow::Result<()>,
     install_ok: bool,
-    safe: bool,
     resume_result: fn() -> anyhow::Result<()>,
     repair_result: fn() -> anyhow::Result<()>,
 ) -> (Vec<&'static str>, anyhow::Result<()>) {
@@ -36,10 +34,6 @@ fn flow_resuming(
             events.borrow_mut().push("install");
             anyhow::ensure!(install_ok, "register failed");
             Ok(())
-        },
-        || {
-            events.borrow_mut().push("safe?");
-            safe
         },
         || {
             events.borrow_mut().push("resume");
@@ -59,19 +53,16 @@ fn flow_resuming(
 
 #[test]
 fn agents_start_after_a_successful_install() {
-    let (events, result) = flow(true, || Ok(()), true, true);
+    let (events, result) = flow(true, || Ok(()), true);
     result.unwrap();
     assert_eq!(events, ["stop", "install", "resume", "repair sessions", "start"]);
 }
 
 #[test]
 fn agents_that_were_stopped_start_again_when_a_later_step_fails() {
-    let (events, result) = flow(true, || Ok(()), false, true);
+    let (events, result) = flow(true, || Ok(()), false);
     assert_eq!(format!("{:#}", result.unwrap_err()), "register failed");
-    assert_eq!(
-        events,
-        ["stop", "install", "resume", "repair sessions", "safe?", "start"]
-    );
+    assert_eq!(events, ["stop", "install", "resume", "repair sessions", "start"]);
 }
 
 #[test]
@@ -89,7 +80,6 @@ fn agents_survive_a_failed_stop_in_the_sessions_the_start_is_told_to_leave_alone
             stop().context("stop the running agents")?;
             Ok(())
         },
-        || true,
         || Ok(()),
         || Ok(()),
         |survivors| told.borrow_mut().extend_from_slice(survivors),
@@ -106,14 +96,14 @@ fn agents_survive_a_failed_stop_in_the_sessions_the_start_is_told_to_leave_alone
 
 #[test]
 fn agents_start_again_when_the_stop_failed_part_way() {
-    let (events, result) = flow(true, || anyhow::bail!("access denied"), true, true);
+    let (events, result) = flow(true, || anyhow::bail!("access denied"), true);
     assert_eq!(format!("{:#}", result.unwrap_err()), "access denied");
-    assert_eq!(events, ["stop", "resume", "repair sessions", "safe?", "start"]);
+    assert_eq!(events, ["stop", "resume", "repair sessions", "start"]);
 }
 
 #[test]
 fn no_agent_starts_when_none_was_stopped() {
-    let (events, result) = flow(false, || Ok(()), false, true);
+    let (events, result) = flow(false, || Ok(()), false);
     assert!(result.is_err());
     assert_eq!(events, ["install", "resume", "repair sessions"]);
 }
@@ -122,7 +112,7 @@ fn no_agent_starts_when_none_was_stopped() {
 fn the_task_is_enabled_again_even_when_no_agent_was_stopped() {
     // The exe may be unchanged and nothing stopped, and the task still disabled by an earlier
     // `apply` that was killed between its disable and its enable.
-    let (events, result) = flow(false, || Ok(()), true, true);
+    let (events, result) = flow(false, || Ok(()), true);
     result.unwrap();
     assert_eq!(events, ["install", "resume", "repair sessions", "start"]);
 }
@@ -130,14 +120,7 @@ fn the_task_is_enabled_again_even_when_no_agent_was_stopped() {
 #[test]
 fn an_apply_that_could_not_enable_the_task_fails_and_starts_no_agent() {
     // A disabled task starts no agent at any logon, so the install did not take.
-    let (events, result) = flow_resuming(
-        true,
-        || Ok(()),
-        true,
-        true,
-        || anyhow::bail!("access denied"),
-        || Ok(()),
-    );
+    let (events, result) = flow_resuming(true, || Ok(()), true, || anyhow::bail!("access denied"), || Ok(()));
     assert!(format!("{:#}", result.unwrap_err()).contains("access denied"));
     assert_eq!(
         events,
@@ -148,14 +131,7 @@ fn an_apply_that_could_not_enable_the_task_fails_and_starts_no_agent() {
 
 #[test]
 fn a_failed_install_is_reported_as_it_was_when_the_task_could_not_be_enabled_either() {
-    let (events, result) = flow_resuming(
-        true,
-        || Ok(()),
-        false,
-        true,
-        || anyhow::bail!("access denied"),
-        || Ok(()),
-    );
+    let (events, result) = flow_resuming(true, || Ok(()), false, || anyhow::bail!("access denied"), || Ok(()));
     assert_eq!(format!("{:#}", result.unwrap_err()), "register failed");
     assert_eq!(
         events,
@@ -168,18 +144,18 @@ fn a_failed_install_is_reported_as_it_was_when_the_task_could_not_be_enabled_eit
 fn an_apply_that_could_not_enable_a_session_task_fails_but_still_starts_the_agents() {
     // A disabled auto-login task starts no session at boot, so the install did not take; the desktop
     // agent is a different task and its start does not wait on that.
-    let (events, result) = flow_resuming(true, || Ok(()), true, true, || Ok(()), || anyhow::bail!("task denied"));
+    let (events, result) = flow_resuming(true, || Ok(()), true, || Ok(()), || anyhow::bail!("task denied"));
     assert!(format!("{:#}", result.unwrap_err()).contains("task denied"));
     assert_eq!(events, ["stop", "install", "resume", "repair sessions", "start"]);
 }
 
 #[test]
 fn a_failed_install_is_reported_as_it_was_when_a_session_task_could_not_be_enabled_either() {
-    let (events, result) = flow_resuming(true, || Ok(()), false, true, || Ok(()), || anyhow::bail!("task denied"));
+    let (events, result) = flow_resuming(true, || Ok(()), false, || Ok(()), || anyhow::bail!("task denied"));
     assert_eq!(format!("{:#}", result.unwrap_err()), "register failed");
     assert_eq!(
         events,
-        ["stop", "install", "resume", "repair sessions", "safe?", "start"],
+        ["stop", "install", "resume", "repair sessions", "start"],
         "the agents that were stopped start again, as after any failed install"
     );
 }
@@ -190,27 +166,11 @@ fn the_agent_task_failure_is_the_result_when_a_session_task_could_not_be_enabled
         true,
         || Ok(()),
         true,
-        true,
         || anyhow::bail!("agent denied"),
         || anyhow::bail!("task denied"),
     );
     assert!(format!("{:#}", result.unwrap_err()).contains("agent denied"));
     assert_eq!(events, ["stop", "install", "resume", "repair sessions"]);
-}
-
-#[test]
-fn no_agent_starts_when_the_registered_task_cannot_start_one() {
-    let (events, result) = flow(true, || Ok(()), false, false);
-    assert!(result.is_err());
-    assert_eq!(events, ["stop", "install", "resume", "repair sessions", "safe?"]);
-}
-
-#[test]
-fn the_task_is_enabled_again_even_when_no_agent_can_be_restarted() {
-    // The stop left the logon task disabled. Leaving it so after a failed apply would mean no
-    // agent at the next logon, whatever the registered form.
-    let (events, _) = flow(true, || Ok(()), false, false);
-    assert!(events.contains(&"resume"), "{events:?}");
 }
 
 #[test]
@@ -494,35 +454,4 @@ fn a_listing_of_the_tasks_that_fails_is_the_result() {
         |_| Ok(()),
     );
     assert!(format!("{:#}", result.unwrap_err()).contains("service unreachable"));
-}
-
-#[test]
-fn session_tasks_are_repaired_after_a_failed_install_whatever_the_agent_task_is() {
-    // The agent task's form decides whether the desktop agents restart; the session tasks do not
-    // depend on it, so a failed query of it (`restart_is_safe` false) must not leave them stopped
-    // or disabled.
-    let world = World::new(vec![task("a", true), task("b", false)], vec![]);
-    let machine = Machine::new(vec![("a", false, false), ("b", false, false)]);
-    let agents_started = RefCell::new(false);
-    let result: anyhow::Result<()> = run(
-        || world.stop(),
-        |stop| {
-            stop()?;
-            anyhow::bail!("register failed")
-        },
-        || false,
-        || Ok(()),
-        || machine.repair(),
-        |_| *agents_started.borrow_mut() = true,
-    );
-    assert_eq!(format!("{:#}", result.unwrap_err()), "register failed");
-    assert_eq!(
-        *machine.events.borrow(),
-        ["enable a", "running? a", "run a", "enable b", "running? b", "run b"],
-        "both are enabled and started again, including the one that was off"
-    );
-    assert!(
-        !agents_started.into_inner(),
-        "the desktop agents are not, by their own rule"
-    );
 }

@@ -1,6 +1,5 @@
 use super::*;
 use crate::acl;
-use crate::provision::schtasks::agent_task_xml;
 use crate::test_support::{FILE_READ_EXECUTE, aces};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -28,11 +27,10 @@ impl TempBase {
 fn prepare(
     layout: &Layout,
     current_exe: &Path,
-    agent_task_xml: Option<&str>,
     stop_agents: impl FnOnce() -> anyhow::Result<()>,
 ) -> anyhow::Result<PathBuf> {
     let base = ensure_base(layout)?;
-    prepare_in(&base, current_exe, agent_task_xml, stop_agents)
+    prepare_in(&base, current_exe, stop_agents)
 }
 
 impl Drop for TempBase {
@@ -54,21 +52,6 @@ fn names_in(dir: &Path) -> Vec<String> {
         .collect();
     names.sort();
     names
-}
-
-/// The queried XML of an agent task an earlier build registered: one account, no group.
-const LEGACY_TASK_XML: &str = r#"<Task><Principals><Principal id="Author"><UserId>DOM\someone</UserId>
-<LogonType>InteractiveToken</LogonType></Principal></Principals></Task>"#;
-
-/// What a single-user install left in the install directory.
-fn plant_legacy(base: &TempBase) {
-    std::fs::write(base.0.join("config.toml"), "target_user = \"someone\"\n").unwrap();
-    let socket_dir = base.0.join("s");
-    std::fs::create_dir(&socket_dir).unwrap();
-    // A real AF_UNIX socket file, which is a reparse point, as the old agent left it.
-    let sock = socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None).unwrap();
-    sock.bind(&socket2::SockAddr::unix(socket_dir.join("a.sock")).unwrap())
-        .unwrap();
 }
 
 // The trust gate ------------------------------------------------------------------------
@@ -128,106 +111,6 @@ fn trusted_base_gate_does_not_run_the_action_on_an_untrusted_base() {
     assert!(ran.get());
 }
 
-// Legacy detection ------------------------------------------------------------------------
-
-#[test]
-fn a_clean_base_has_no_legacy_artifacts() {
-    let base = TempBase::existing("legacy-clean");
-    let layout = base.layout();
-    let found = legacy_artifacts(&forged(&layout), None).unwrap();
-    assert!(!found.any());
-    let found = legacy_artifacts(&forged(&layout), Some(&agent_task_xml(r"C:\x.exe"))).unwrap();
-    assert!(!found.any(), "the group-form task is the current one, not a legacy one");
-}
-
-#[test]
-fn legacy_is_detected_from_the_config_alone() {
-    let base = TempBase::existing("legacy-config");
-    std::fs::write(base.0.join("config.toml"), "x").unwrap();
-    let found = legacy_artifacts(&forged(&base.layout()), None).unwrap();
-    assert!(found.any() && found.config && !found.socket_dir && !found.task);
-}
-
-#[test]
-fn legacy_is_detected_from_the_socket_dir_alone() {
-    let base = TempBase::existing("legacy-sdir");
-    std::fs::create_dir(base.0.join("s")).unwrap();
-    let found = legacy_artifacts(&forged(&base.layout()), None).unwrap();
-    assert!(found.any() && found.socket_dir && !found.config && !found.task);
-}
-
-#[test]
-fn legacy_is_detected_from_a_per_user_task_alone() {
-    // A half-finished earlier migration or a manual cleanup can leave only the old task, and with
-    // it a running legacy agent. No config and no `s\`: the task is what says so.
-    let base = TempBase::existing("legacy-task");
-    let found = legacy_artifacts(&forged(&base.layout()), Some(LEGACY_TASK_XML)).unwrap();
-    assert!(found.any() && found.task && !found.config && !found.socket_dir);
-}
-
-#[test]
-fn a_legacy_path_that_cannot_be_inspected_is_an_error_naming_it_not_an_absent_one() {
-    // Only NotFound means absent. Any other failure (here an invalid path, in life an access
-    // error) leaves the question open, and a migration that guesses "absent" skips the cleanup.
-    let layout = Layout {
-        base: PathBuf::from("C:\\ssh-broker\0unusable"),
-    };
-    let err = format!("{:#}", legacy_artifacts(&forged(&layout), None).unwrap_err());
-    assert!(err.contains("config.toml"), "{err}");
-}
-
-#[test]
-fn only_not_found_counts_as_absent() {
-    let base = TempBase::existing("present");
-    std::fs::write(base.0.join("here"), "x").unwrap();
-    assert!(present(&base.0.join("here")).unwrap());
-    assert!(!present(&base.0.join("missing")).unwrap());
-    // A NUL in the path is a different failure from NotFound.
-    assert!(present(&base.0.join("bad\0name")).is_err());
-}
-
-// Removing the legacy artifacts ----------------------------------------------------------
-
-#[test]
-fn remove_legacy_deletes_the_old_socket_dir_and_config() {
-    let base = TempBase::existing("remove");
-    plant_legacy(&base);
-    let layout = base.layout();
-    let base_ref = forged(&layout);
-    let found = legacy_artifacts(&base_ref, None).unwrap();
-    assert!(found.config && found.socket_dir, "control");
-
-    remove_legacy(&base_ref, &found).unwrap();
-
-    assert!(names_in(&base.0).is_empty(), "{:?}", names_in(&base.0));
-    assert!(!legacy_artifacts(&base_ref, None).unwrap().any());
-}
-
-#[test]
-fn remove_legacy_is_a_noop_on_a_clean_base() {
-    let base = TempBase::existing("remove-clean");
-    std::fs::write(base.0.join("keep.txt"), "x").unwrap();
-    let layout = base.layout();
-    remove_legacy(&forged(&layout), &Legacy::default()).unwrap();
-    assert_eq!(names_in(&base.0), ["keep.txt"]);
-}
-
-#[test]
-fn remove_legacy_leaves_exe_logs_and_other_files() {
-    let base = TempBase::existing("remove-others");
-    plant_legacy(&base);
-    std::fs::write(base.0.join("ssh-broker.exe"), "exe").unwrap();
-    std::fs::create_dir(base.0.join("logs")).unwrap();
-    std::fs::write(base.0.join("logs").join("shim.log"), "old log").unwrap();
-    let layout = base.layout();
-    let base_ref = forged(&layout);
-
-    remove_legacy(&base_ref, &legacy_artifacts(&base_ref, None).unwrap()).unwrap();
-
-    assert_eq!(names_in(&base.0), ["logs", "ssh-broker.exe"]);
-    assert_eq!(names_in(&base.0.join("logs")), ["shim.log"]);
-}
-
 // The apply sequence ----------------------------------------------------------------------
 
 /// A stand-in for the running exe: any file, since `prepare` only copies it.
@@ -240,82 +123,34 @@ fn new_exe(base: &TempBase, bytes: &str) -> PathBuf {
 #[test]
 fn prepare_refuses_a_hostile_base_before_it_reads_or_stops_anything() {
     let base = TempBase::existing("prepare-hostile");
-    std::fs::write(base.0.join("config.toml"), "planted").unwrap();
+    std::fs::write(base.0.join("planted.txt"), "x").unwrap();
     let stopped = std::cell::Cell::new(false);
 
     let err = format!(
         "{:#}",
-        prepare(
-            &base.layout(),
-            &std::env::current_exe().unwrap(),
-            Some(LEGACY_TASK_XML),
-            || {
-                stopped.set(true);
-                Ok(())
-            }
-        )
+        prepare(&base.layout(), &std::env::current_exe().unwrap(), || {
+            stopped.set(true);
+            Ok(())
+        })
         .expect_err("hostile base")
     );
 
     assert!(err.contains("cannot be trusted"), "{err}");
-    assert_eq!(names_in(&base.0), ["config.toml"], "nothing may be written into it");
+    assert_eq!(names_in(&base.0), ["planted.txt"], "nothing may be written into it");
     assert!(!stopped.get(), "no agent is stopped on the word of an untrusted base");
 }
 
 #[test]
-fn prepare_in_stops_the_legacy_agent_before_replacing_the_exe() {
-    // A live agent holds its exe open, so the copy would fail with a sharing violation and the
-    // old exe would stay under the new tasks. The stop has to come first.
-    let base = TempBase::existing("prepare-order");
-    plant_legacy(&base);
-    std::fs::write(base.0.join("ssh-broker.exe"), "old build").unwrap();
-    let source = new_exe(&base, "new build");
-    let layout = base.layout();
-    let seen = std::cell::RefCell::new(None);
-
-    let exe = prepare_in(&forged(&layout), &source, None, || {
-        *seen.borrow_mut() = Some(std::fs::read_to_string(layout.canonical_exe()).unwrap());
-        Ok(())
-    })
-    .unwrap();
-
-    assert_eq!(
-        seen.borrow().as_deref(),
-        Some("old build"),
-        "the old exe was still in place"
-    );
-    assert_eq!(std::fs::read_to_string(exe).unwrap(), "new build");
-    assert!(!base.0.join("config.toml").exists() && !base.0.join("s").exists());
-}
-
-#[test]
-fn prepare_in_stops_the_agent_for_a_legacy_task_with_no_files() {
-    let base = TempBase::existing("prepare-task");
-    let source = new_exe(&base, "new build");
-    let layout = base.layout();
-    let stopped = std::cell::Cell::new(false);
-
-    prepare_in(&forged(&layout), &source, Some(LEGACY_TASK_XML), || {
-        stopped.set(true);
-        Ok(())
-    })
-    .unwrap();
-
-    assert!(stopped.get());
-}
-
-#[test]
 fn prepare_in_stops_the_agents_before_it_replaces_a_changed_exe() {
-    // Not a migration: a newer build over an installed one. Every running agent holds the old exe
-    // open, so without the stop the copy fails and the old exe stays under the new tasks.
+    // A newer build over an installed one. Every running agent holds the old exe open, so without
+    // the stop the copy fails and the old exe stays under the new task.
     let base = TempBase::existing("prepare-update");
     std::fs::write(base.0.join("ssh-broker.exe"), "old build").unwrap();
     let source = new_exe(&base, "new build");
     let layout = base.layout();
-    let group = agent_task_xml(r"C:\x.exe");
     let seen = std::cell::RefCell::new(None);
 
-    let exe = prepare_in(&forged(&layout), &source, Some(&group), || {
+    let exe = prepare_in(&forged(&layout), &source, || {
         *seen.borrow_mut() = Some(std::fs::read_to_string(layout.canonical_exe()).unwrap());
         Ok(())
     })
@@ -331,14 +166,13 @@ fn prepare_in_stops_the_agents_before_it_replaces_a_changed_exe() {
 
 #[test]
 fn prepare_in_does_not_stop_agents_when_the_exe_is_unchanged() {
-    // Re-running `apply`, and the boot self-heal, with the build that is installed.
+    // Re-running `apply` with the build that is installed.
     let base = TempBase::existing("prepare-same");
     std::fs::write(base.0.join("ssh-broker.exe"), "same build").unwrap();
     let source = new_exe(&base, "same build");
     let layout = base.layout();
-    let group = agent_task_xml(r"C:\x.exe");
 
-    prepare_in(&forged(&layout), &source, Some(&group), || {
+    prepare_in(&forged(&layout), &source, || {
         panic!("the exe is not replaced, so no agent needs to leave")
     })
     .unwrap();
@@ -350,14 +184,10 @@ fn prepare_in_changes_nothing_when_agents_cannot_be_stopped_for_an_update() {
     std::fs::write(base.0.join("ssh-broker.exe"), "old build").unwrap();
     let source = new_exe(&base, "new build");
     let layout = base.layout();
-    let group = agent_task_xml(r"C:\x.exe");
 
     let err = format!(
         "{:#}",
-        prepare_in(&forged(&layout), &source, Some(&group), || anyhow::bail!(
-            "access denied"
-        ))
-        .unwrap_err()
+        prepare_in(&forged(&layout), &source, || anyhow::bail!("access denied")).unwrap_err()
     );
 
     assert!(err.contains("access denied"), "{err}");
@@ -373,7 +203,6 @@ fn prepare_in_fails_when_the_exe_is_still_in_use_after_the_stop() {
     std::fs::write(base.0.join("ssh-broker.exe"), "old build").unwrap();
     let source = new_exe(&base, "new build");
     let layout = base.layout();
-    let group = agent_task_xml(r"C:\x.exe");
     // Exclusive: no sharing, so the copy over it fails as it does over a running exe.
     let _held = std::fs::OpenOptions::new()
         .read(true)
@@ -381,10 +210,7 @@ fn prepare_in_fails_when_the_exe_is_still_in_use_after_the_stop() {
         .open(layout.canonical_exe())
         .unwrap();
 
-    let err = format!(
-        "{:#}",
-        prepare_in(&forged(&layout), &source, Some(&group), || Ok(())).unwrap_err()
-    );
+    let err = format!("{:#}", prepare_in(&forged(&layout), &source, || Ok(())).unwrap_err());
 
     assert!(err.contains("in use"), "{err}");
     assert!(err.contains("started by hand"), "{err}");
@@ -443,10 +269,7 @@ fn prepare_in_reports_a_failed_copy_by_its_cause() {
     let layout = base.layout();
     std::fs::create_dir(layout.canonical_exe()).unwrap();
 
-    let err = format!(
-        "{:#}",
-        prepare_in(&forged(&layout), &source, None, || Ok(())).unwrap_err()
-    );
+    let err = format!("{:#}", prepare_in(&forged(&layout), &source, || Ok(())).unwrap_err());
 
     assert!(err.contains("ssh-broker.exe"), "{err}");
     assert!(err.contains("os error"), "{err}");
@@ -454,38 +277,15 @@ fn prepare_in_reports_a_failed_copy_by_its_cause() {
 }
 
 #[test]
-fn prepare_in_does_not_stop_agents_when_nothing_is_legacy() {
-    // Re-running `apply`, and the boot self-heal, must leave live agents alone.
+fn prepare_in_does_not_stop_agents_when_no_exe_is_installed() {
     let base = TempBase::existing("prepare-clean");
     let source = new_exe(&base, "new build");
     let layout = base.layout();
-    let group = agent_task_xml(r"C:\x.exe");
 
-    prepare_in(&forged(&layout), &source, Some(&group), || {
-        panic!("a clean install has no legacy agent to stop")
+    prepare_in(&forged(&layout), &source, || {
+        panic!("there is no installed exe, so no agent holds it")
     })
     .unwrap();
-}
-
-#[test]
-fn prepare_in_fails_and_changes_nothing_when_the_agent_cannot_be_stopped() {
-    let base = TempBase::existing("prepare-stuck");
-    plant_legacy(&base);
-    std::fs::write(base.0.join("ssh-broker.exe"), "old build").unwrap();
-    let source = new_exe(&base, "new build");
-    let layout = base.layout();
-
-    let err = format!(
-        "{:#}",
-        prepare_in(&forged(&layout), &source, None, || anyhow::bail!("access denied")).unwrap_err()
-    );
-
-    assert!(err.contains("access denied"), "{err}");
-    assert!(
-        base.0.join("config.toml").exists() && base.0.join("s").exists(),
-        "nothing removed"
-    );
-    assert_eq!(std::fs::read_to_string(layout.canonical_exe()).unwrap(), "old build");
 }
 
 /// Elevated (CI only): `prepare` creates the base.
@@ -494,7 +294,7 @@ fn populate_builds_a_verified_layout() {
     let base = TempBase::new("populate");
     let layout = base.layout();
 
-    let exe = prepare(&layout, &std::env::current_exe().unwrap(), None, || Ok(())).unwrap();
+    let exe = prepare(&layout, &std::env::current_exe().unwrap(), || Ok(())).unwrap();
 
     assert_eq!(exe, layout.canonical_exe());
     assert!(exe.is_file());
