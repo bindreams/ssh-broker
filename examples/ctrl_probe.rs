@@ -2,14 +2,17 @@
 //! `event <n>` line for the first Ctrl+C or Ctrl+Break that reaches it, or `stdin` for the first line
 //! read from its input, and ends with `finished.`. With the argument `reenable` it first clears the
 //! "ignore Ctrl+C" setting a parent can leave (inherited by its children), and prints `cleared`. With
-//! `no-stdin` it reads nothing, so it never takes input meant for a program that runs after it. Only
-//! Windows has console control events.
+//! `no-stdin` it reads nothing, so it never takes input meant for a program that runs after it. With
+//! `raise-ctrl-c` or `raise-ctrl-break` it raises that event on every process of its console, after
+//! `ready`. Only Windows has console control events.
 
 #[cfg(windows)]
 fn main() {
     use std::io::Write;
     use std::sync::{Mutex, OnceLock, mpsc};
-    use windows::Win32::System::Console::SetConsoleCtrlHandler;
+    use windows::Win32::System::Console::{
+        CTRL_BREAK_EVENT, CTRL_C_EVENT, GenerateConsoleCtrlEvent, SetConsoleCtrlHandler,
+    };
 
     static EVENTS: OnceLock<Mutex<mpsc::Sender<u32>>> = OnceLock::new();
 
@@ -40,6 +43,12 @@ fn main() {
     }
     println!("ready");
     std::io::stdout().flush().unwrap();
+    for (name, event) in [("raise-ctrl-c", CTRL_C_EVENT), ("raise-ctrl-break", CTRL_BREAK_EVENT)] {
+        if has_arg(name) {
+            // SAFETY: no pointers; group 0 is every process on this console.
+            unsafe { GenerateConsoleCtrlEvent(event, 0) }.unwrap();
+        }
+    }
     match receiver.recv().unwrap() {
         u32::MAX => println!("stdin"),
         event => println!("event {event}"),
