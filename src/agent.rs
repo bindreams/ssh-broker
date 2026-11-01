@@ -82,26 +82,23 @@ use std::sync::{Arc, Condvar, Mutex};
 /// private folder, and become the one agent that serves this user.
 #[cfg(windows)]
 fn start(args: AgentArgs) -> anyhow::Result<()> {
-    let reset = reset_inherited_start_state();
     let current_sid = crate::acl::Sid::current_user()?.to_sddl()?;
     let background = args.background.is_some();
     start_with(
         args.background.as_ref(),
         crate::provision::probe::current_session_id(),
         &current_sid,
-        reset,
         &mut std::io::stderr(),
+        reset_inherited_start_state,
         crate::userdir::current_socket_location,
         |logs| crate::filelog::init_in(logs, "agent.log"),
         |location, session| serve(location, session, background),
     )
 }
 
-/// Clear what the process that started this agent can leave in it, so every route (the logon task, the
-/// boot task, the secondary-logon call of the prompt path) gives the same agent: the "ignore Ctrl+C"
-/// setting, which the secondary-logon call sets on its child and which the shells and commands of every
-/// session would inherit. Best effort: the agent serves without it, and [`keep_log_or_report`] reports a
-/// failure: in the log, or on stderr when the log does not open.
+/// Clear the "ignore Ctrl+C" setting that the secondary-logon call of the prompt path sets on its child;
+/// every shell and command in every session would inherit it. The same on every start route. Best
+/// effort: a failure is reported by [`start_with`].
 #[cfg(windows)]
 fn reset_inherited_start_state() -> windows::core::Result<()> {
     use windows::Win32::System::Console::SetConsoleCtrlHandler;
@@ -112,19 +109,26 @@ fn reset_inherited_start_state() -> windows::core::Result<()> {
 /// [`start`] with its inputs as parameters, so a test can pick the session and see what runs.
 ///
 /// `background` is `Some` for `agent --background`. The refusals before the log opens leave their
-/// exit code as the only record (see [`Refusal`]).
+/// exit code as the only record (see [`Refusal`]). `reset` runs first, before any check; a failure goes
+/// to `stderr` at once, and to the log once it opens.
 #[cfg(windows)]
 #[allow(clippy::too_many_arguments)] // every input is a seam a test fills
 fn start_with(
     background: Option<&BackgroundArgs>,
     session: u32,
     current_sid: &str,
-    reset: windows::core::Result<()>,
     stderr: &mut dyn std::io::Write,
+    reset: impl FnOnce() -> windows::core::Result<()>,
     locate: impl FnOnce() -> anyhow::Result<SocketLocation>,
     init_log: impl FnOnce(&Path) -> anyhow::Result<tracing_appender::non_blocking::WorkerGuard>,
     serve: impl FnOnce(&SocketLocation, u32) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
+    let reset_failure = reset()
+        .err()
+        .map(|e| format!("could not clear the inherited ignore of Ctrl+C: {e}"));
+    if let Some(message) = &reset_failure {
+        let _ = writeln!(stderr, "ssh-broker agent: {message}");
+    }
     check_start(background, session, current_sid)?;
     let refused = |refusal: Refusal, cause: anyhow::Error| anyhow::Error::new(refusal).context(format!("{cause:#}"));
     let location = locate().map_err(|e| refused(Refusal::NoSocketLocation, e))?;
@@ -133,8 +137,11 @@ fn start_with(
     // Held to the end of the process and flushed by `end_process`, from whichever thread ends it:
     // dropping the guard stops the writer and later lines are lost. Until the log opens an error goes
     // to stderr, which a logon task discards; a hand-run agent shows it.
-    if let Some(log) = keep_log_or_report(init_log(&location.logs_dir()), reset, stderr) {
+    if let Some(log) = keep_log_or_report(init_log(&location.logs_dir()), stderr) {
         keep_log(log);
+        if let Some(message) = &reset_failure {
+            tracing::warn!("{message}");
+        }
     }
     let result = serve(&location, session);
     if let Err(e) = &result {
@@ -144,28 +151,15 @@ fn start_with(
 }
 
 /// Keep the log if it opened. If not, say why on `stderr` and go on: serving does not need a log.
-/// A failed `reset` (see [`reset_inherited_start_state`]) goes to the same place as the log.
 #[cfg(windows)]
 fn keep_log_or_report(
     log: anyhow::Result<tracing_appender::non_blocking::WorkerGuard>,
-    reset: Result<(), impl std::fmt::Display>,
     stderr: &mut dyn std::io::Write,
 ) -> Option<tracing_appender::non_blocking::WorkerGuard> {
     match log {
-        Ok(guard) => {
-            if let Err(e) = reset {
-                tracing::warn!("could not clear the inherited ignore of Ctrl+C: {e}");
-            }
-            Some(guard)
-        }
+        Ok(guard) => Some(guard),
         Err(e) => {
             let _ = writeln!(stderr, "ssh-broker agent: serving without a log: {e:#}");
-            if let Err(e) = reset {
-                let _ = writeln!(
-                    stderr,
-                    "ssh-broker agent: could not clear the inherited ignore of Ctrl+C: {e}"
-                );
-            }
             None
         }
     }

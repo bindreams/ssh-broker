@@ -41,8 +41,8 @@ fn start_refuses_session_zero_before_it_touches_anything() {
         None,
         0,
         ME,
-        Ok(()),
         &mut std::io::sink(),
+        || Ok(()),
         || -> anyhow::Result<SocketLocation> { panic!("must not look for the profile in session 0") },
         |_| -> anyhow::Result<_> { panic!("must not open a log in session 0") },
         |_, _| panic!("must not serve in session 0"),
@@ -57,8 +57,8 @@ fn desktop_agent_still_refuses_session_zero_with_65() {
         None,
         0,
         ME,
-        Ok(()),
         &mut std::io::sink(),
+        || Ok(()),
         || -> anyhow::Result<SocketLocation> { panic!("must not look for the profile") },
         |_| -> anyhow::Result<_> { panic!("must not open a log") },
         |_, _| panic!("must not serve"),
@@ -75,8 +75,8 @@ fn expect_user_mismatch_exits_64_before_touching_the_folder() {
         Some(&args),
         2,
         ME,
-        Ok(()),
         &mut std::io::sink(),
+        || Ok(()),
         || -> anyhow::Result<SocketLocation> { panic!("must not look for the profile for another user") },
         |_| -> anyhow::Result<_> { panic!("must not open a log for another user") },
         |_, _| panic!("must not serve another user"),
@@ -93,8 +93,8 @@ fn locate_failure_exits_66() {
         Some(&args),
         2,
         ME,
-        Ok(()),
         &mut std::io::sink(),
+        || Ok(()),
         || anyhow::bail!("the account has no profile directory"),
         |_| -> anyhow::Result<_> { panic!("must not open a log without a folder") },
         |_, _| panic!("must not serve without a folder"),
@@ -119,8 +119,8 @@ fn folder_refusal_exits_67() {
         Some(&args),
         2,
         ME,
-        Ok(()),
         &mut std::io::sink(),
+        || Ok(()),
         || Ok(loc.clone()),
         |_| -> anyhow::Result<_> { panic!("must not open a log in a refused folder") },
         |_, _| panic!("must not serve from a refused folder"),
@@ -140,8 +140,8 @@ fn background_agent_is_allowed_in_session_zero() {
         Some(&args),
         0,
         ME,
-        Ok(()),
         &mut std::io::sink(),
+        || Ok(()),
         || Ok(loc.clone()),
         |_| Ok(guard()),
         |_, session| {
@@ -163,8 +163,8 @@ fn start_makes_the_private_folder_then_serves_that_session_from_it() {
         None,
         3,
         ME,
-        Ok(()),
         &mut std::io::sink(),
+        || Ok(()),
         || Ok(loc.clone()),
         |logs| {
             assert_eq!(logs, loc.logs_dir());
@@ -194,8 +194,8 @@ fn start_serves_without_a_log_when_the_log_cannot_be_opened() {
         None,
         3,
         ME,
-        Ok(()),
         &mut std::io::sink(),
+        || Ok(()),
         || Ok(loc.clone()),
         |_| anyhow::bail!("the disk is full"),
         |_, _| {
@@ -209,58 +209,6 @@ fn start_serves_without_a_log_when_the_log_cannot_be_opened() {
 }
 
 #[test]
-fn a_failed_reset_goes_to_stderr_beside_the_log_failure_when_the_log_does_not_open() {
-    let mut stderr = Vec::new();
-    let kept = keep_log_or_report(
-        Err(anyhow::anyhow!("the disk is full")),
-        Err("access denied"),
-        &mut stderr,
-    );
-    assert!(kept.is_none());
-    let stderr = String::from_utf8(stderr).unwrap();
-    assert!(stderr.contains("serving without a log: the disk is full"), "{stderr}");
-    assert!(
-        stderr.contains("could not clear the inherited ignore of Ctrl+C: access denied"),
-        "{stderr}"
-    );
-}
-
-#[test]
-fn a_failed_reset_goes_to_the_log_when_it_opens() {
-    let captured = Captured::default();
-    let subscriber = tracing_subscriber::fmt()
-        .with_writer({
-            let captured = captured.clone();
-            move || captured.clone()
-        })
-        .with_ansi(false)
-        .finish();
-    let mut stderr = Vec::new();
-    let kept = tracing::subscriber::with_default(subscriber, || {
-        keep_log_or_report(Ok(guard()), Err("access denied"), &mut stderr)
-    });
-    assert!(kept.is_some());
-    assert!(stderr.is_empty(), "{}", String::from_utf8_lossy(&stderr));
-    let logged = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
-    assert!(
-        logged.contains("could not clear the inherited ignore of Ctrl+C: access denied"),
-        "{logged}"
-    );
-}
-
-#[test]
-fn a_reset_that_worked_says_nothing_either_way() {
-    let mut stderr = Vec::new();
-    keep_log_or_report(
-        Err(anyhow::anyhow!("the disk is full")),
-        Ok::<(), &str>(()),
-        &mut stderr,
-    );
-    let stderr = String::from_utf8(stderr).unwrap();
-    assert!(!stderr.contains("Ctrl+C"), "{stderr}");
-}
-
-#[test]
 fn start_returns_the_error_serving_stopped_with() {
     let profile = TempProfile::new("start-err");
     let loc = profile.location();
@@ -268,8 +216,8 @@ fn start_returns_the_error_serving_stopped_with() {
         None,
         3,
         ME,
-        Ok(()),
         &mut std::io::sink(),
+        || Ok(()),
         || Ok(loc.clone()),
         |_| Ok(guard()),
         |_, _| anyhow::bail!("listener broke"),
@@ -310,8 +258,8 @@ fn failure_after_the_log_opens_exits_1_and_logs_the_cause() {
             None,
             3,
             ME,
-            Ok(()),
             &mut std::io::sink(),
+            || Ok(()),
             || Ok(loc.clone()),
             |_| Ok(guard()),
             |_, _| anyhow::bail!("the listener broke"),
@@ -323,8 +271,36 @@ fn failure_after_the_log_opens_exits_1_and_logs_the_cause() {
     assert!(logged.contains("the listener broke"), "{logged}");
 }
 
+/// A reset that fails the way a refused call does.
+fn failed_reset() -> windows::core::Result<()> {
+    Err(windows::core::Error::from_hresult(windows::core::HRESULT(
+        0x8007_0005_u32 as i32,
+    )))
+}
+
+const RESET_FAILED: &str = "could not clear the inherited ignore of Ctrl+C: ";
+
 #[test]
-fn start_reports_a_failed_reset_in_the_log_when_it_opens() {
+fn a_failed_reset_is_reported_on_stderr_when_the_start_is_refused() {
+    let mut stderr = Vec::new();
+    let err = start_with(
+        None,
+        0,
+        ME,
+        &mut stderr,
+        failed_reset,
+        || -> anyhow::Result<SocketLocation> { panic!("must not look for the profile in session 0") },
+        |_| -> anyhow::Result<_> { panic!("must not open a log in session 0") },
+        |_, _| panic!("must not serve in session 0"),
+    )
+    .unwrap_err();
+    assert_eq!(refusal(&err), Some(Refusal::SessionRefused));
+    let stderr = String::from_utf8(stderr).unwrap();
+    assert!(stderr.contains(RESET_FAILED), "{stderr}");
+}
+
+#[test]
+fn a_failed_reset_goes_to_stderr_and_to_the_log_when_it_opens() {
     let profile = TempProfile::new("start-reset-log");
     let loc = profile.location();
     let captured = Captured::default();
@@ -341,26 +317,22 @@ fn start_reports_a_failed_reset_in_the_log_when_it_opens() {
             None,
             3,
             ME,
-            Err(windows::core::Error::from_hresult(windows::core::HRESULT(
-                0x8007_0005_u32 as i32,
-            ))),
             &mut stderr,
+            failed_reset,
             || Ok(loc.clone()),
             |_| Ok(guard()),
             |_, _| Ok(()),
         )
     })
     .unwrap();
-    assert!(stderr.is_empty(), "{}", String::from_utf8_lossy(&stderr));
+    let stderr = String::from_utf8(stderr).unwrap();
+    assert!(stderr.contains(RESET_FAILED), "{stderr}");
     let logged = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
-    assert!(
-        logged.contains("could not clear the inherited ignore of Ctrl+C"),
-        "{logged}"
-    );
+    assert!(logged.contains(RESET_FAILED), "{logged}");
 }
 
 #[test]
-fn start_reports_a_failed_reset_on_stderr_when_the_log_does_not_open() {
+fn a_failed_reset_is_reported_once_on_stderr_when_the_log_does_not_open() {
     let profile = TempProfile::new("start-reset-stderr");
     let loc = profile.location();
     let mut stderr = Vec::new();
@@ -368,10 +340,8 @@ fn start_reports_a_failed_reset_on_stderr_when_the_log_does_not_open() {
         None,
         3,
         ME,
-        Err(windows::core::Error::from_hresult(windows::core::HRESULT(
-            0x8007_0005_u32 as i32,
-        ))),
         &mut stderr,
+        failed_reset,
         || Ok(loc.clone()),
         |_| anyhow::bail!("the disk is full"),
         |_, _| Ok(()),
@@ -379,14 +349,31 @@ fn start_reports_a_failed_reset_on_stderr_when_the_log_does_not_open() {
     .unwrap();
     let stderr = String::from_utf8(stderr).unwrap();
     assert!(stderr.contains("serving without a log: the disk is full"), "{stderr}");
-    assert!(
-        stderr.contains("could not clear the inherited ignore of Ctrl+C"),
-        "{stderr}"
-    );
+    assert_eq!(stderr.matches(RESET_FAILED).count(), 1, "{stderr}");
 }
 
 #[test]
-fn a_background_agent_opens_its_log_then_serves_and_signals_nothing_else() {
+fn a_reset_that_worked_says_nothing() {
+    let profile = TempProfile::new("start-reset-ok");
+    let loc = profile.location();
+    let mut stderr = Vec::new();
+    start_with(
+        None,
+        3,
+        ME,
+        &mut stderr,
+        || Ok(()),
+        || Ok(loc.clone()),
+        |_| anyhow::bail!("the disk is full"),
+        |_, _| Ok(()),
+    )
+    .unwrap();
+    let stderr = String::from_utf8(stderr).unwrap();
+    assert!(!stderr.contains("Ctrl+C"), "{stderr}");
+}
+
+#[test]
+fn a_background_agent_resets_then_opens_its_log_then_serves_and_signals_nothing_else() {
     let profile = TempProfile::new("start-order");
     let loc = profile.location();
     let events = RefCell::new(Vec::new());
@@ -395,8 +382,11 @@ fn a_background_agent_opens_its_log_then_serves_and_signals_nothing_else() {
         Some(&args),
         2,
         ME,
-        Ok(()),
         &mut std::io::sink(),
+        || {
+            events.borrow_mut().push("reset");
+            Ok(())
+        },
         || Ok(loc.clone()),
         |_| {
             events.borrow_mut().push("log");
@@ -408,7 +398,7 @@ fn a_background_agent_opens_its_log_then_serves_and_signals_nothing_else() {
         },
     )
     .unwrap();
-    assert_eq!(events.into_inner(), ["log", "serve"]);
+    assert_eq!(events.into_inner(), ["reset", "log", "serve"]);
 }
 
 // the serving marker -----
