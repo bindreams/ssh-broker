@@ -50,9 +50,3 @@ success-output = "immediate"
 [profile.ci-exclusive]
 inherits = "ci"
 default-filter = '(binary(session_on_demand_windows) & test(/^logon_with_seclogon_(stopped|disabled)_returns_windows_reason$/)) | (binary(upgrade_windows) & test(/^apply_/))'
-
-# SPIKE, NOT FOR MERGE: the upgrade tests print their diagnostics on a pass too.
-[[profile.ci-exclusive.overrides]]
-filter = 'binary(upgrade_windows)'
-success-output = "immediate"
-failure-output = "immediate-final"
