@@ -82,6 +82,7 @@ use std::sync::{Arc, Condvar, Mutex};
 /// private folder, and become the one agent that serves this user.
 #[cfg(windows)]
 fn start(args: AgentArgs) -> anyhow::Result<()> {
+    reset_inherited_start_state();
     let current_sid = crate::acl::Sid::current_user()?.to_sddl()?;
     let background = args.background.is_some();
     start_with(
@@ -92,6 +93,25 @@ fn start(args: AgentArgs) -> anyhow::Result<()> {
         |logs| crate::filelog::init_in(logs, "agent.log"),
         |location, session| serve(location, session, background),
     )
+}
+
+/// Clear what the process that started this agent can leave in it, so every route (the logon task, the
+/// boot task, the secondary-logon call of the prompt path) gives the same agent: the "ignore Ctrl+C"
+/// setting, which the secondary-logon call sets on its child and which the shells and commands of every
+/// session would inherit. Best effort: the agent serves without it, and says so on `stderr` (the log is
+/// not open yet).
+#[cfg(windows)]
+fn reset_inherited_start_state() {
+    use windows::Win32::System::Console::SetConsoleCtrlHandler;
+    // SAFETY: no pointers; this process's own setting.
+    if let Err(e) = unsafe { SetConsoleCtrlHandler(None, false) } {
+        use std::io::Write as _;
+        // `eprintln!` panics on a broken stderr.
+        let _ = writeln!(
+            std::io::stderr(),
+            "ssh-broker: could not clear the inherited ignore of Ctrl+C ({e}); Ctrl+C may not reach programs in a session"
+        );
+    }
 }
 
 /// [`start`] with its inputs as parameters, so a test can pick the session and see what runs.

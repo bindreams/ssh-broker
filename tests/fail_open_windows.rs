@@ -380,8 +380,8 @@ fn read_console_until(output: isize, seen: &mut String, needle: &str) {
 /// reports the event it gets), and the verb must stay: with the default handler it would end on the Ctrl+C, and
 /// take the shell and the session with it.
 ///
-/// The test clears the inherited "ignore Ctrl+C" setting (an agent started through the password prompt has it
-/// set) so the verb and probe start as from a clean process.
+/// The test clears the "ignore Ctrl+C" setting it may have inherited from whatever ran it, so the verb and
+/// probe start as from a clean process.
 #[test]
 fn console_fallback_stays_through_a_ctrl_c_that_the_shell_answers() {
     use ssh_broker::conpty::{PtySession, write_all_handle};
