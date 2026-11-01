@@ -12,8 +12,8 @@ use std::path::Path;
 use windows::Win32::Foundation::{HANDLE, HANDLE_FLAG_INHERIT, SetHandleInformation};
 use windows::Win32::System::Pipes::CreatePipe;
 use windows::Win32::System::Threading::{
-    CREATE_SUSPENDED, CreateProcessW, EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess, INFINITE, PROCESS_INFORMATION,
-    STARTF_USESTDHANDLES, STARTUPINFOEXW, WaitForSingleObject,
+    CREATE_NO_WINDOW, CREATE_SUSPENDED, CreateProcessW, EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess, INFINITE,
+    PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOEXW, WaitForSingleObject,
 };
 use windows::core::{PCWSTR, PWSTR};
 
@@ -87,6 +87,9 @@ impl ExecChild {
             // the job before it runs a single instruction, or anything it forks first escapes
             // containment permanently. Sequence fixed by `cosca::Job`: create suspended,
             // assign, and only then resume.
+            // CREATE_NO_WINDOW gives the command a console of its own: a Ctrl+C or Ctrl+Break it raises
+            // for every process on its console (`GenerateConsoleCtrlEvent` with group 0) must not reach
+            // the agent or the commands of other sessions, which share the agent's console otherwise.
             let mut pi = PROCESS_INFORMATION::default();
             let _no_boxes = crate::winutil::FailCriticalErrors::enter();
             CreateProcessW(
@@ -95,7 +98,7 @@ impl ExecChild {
                 None,
                 None,
                 true, // bInheritHandles — restricted to the 3 handles above
-                EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED,
+                EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED | CREATE_NO_WINDOW,
                 None,
                 cwd_ptr,
                 &si.StartupInfo,
