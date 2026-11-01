@@ -16,6 +16,8 @@ mod account_fixture;
 mod agent_conn;
 #[path = "common/bounded_wait.rs"]
 mod bounded_wait;
+#[path = "common/command_line_probe.rs"]
+mod command_line_probe;
 #[path = "common/desktop.rs"]
 mod desktop;
 #[path = "common/hard_errors.rs"]
@@ -368,6 +370,32 @@ fn a_command_written_with_the_password_runs_in_the_session() {
     run.read_until("typedahead-ok");
     expect_session(&mut run);
     assert_relayed(&mut run);
+    leave(&mut run);
+}
+
+/// Elevated (CI only). The prompt path starts the agent through the logon call from a shim that ignores
+/// Ctrl+C, and the agent starts with that setting. A program the session runs still gets a Ctrl+C: the
+/// probe says `event` for the first one it receives, and prints nothing more if it never comes.
+#[test]
+fn a_program_in_the_session_gets_ctrl_c() {
+    let _machine = machine::shared();
+    let kit = kit("pp17");
+    let account = Account::create("pp17", true);
+    let probe = kit.path("ctrl_probe.exe");
+    std::fs::copy(command_line_probe::example("ctrl_probe"), &probe).unwrap();
+    let mut run = start_run(&kit, &account);
+    run.read_until(PROMPT);
+    run.type_line(&account.password);
+    expect_session(&mut run);
+    assert_relayed(&mut run);
+
+    run.type_line(&format!("& '{}'", probe.display()));
+    run.read_until("ready");
+    run.ctrl_c();
+    run.read_until("finished.");
+    let shown = run.text();
+    assert!(shown.contains("event "), "the probe got no Ctrl+C:\n{shown}");
+    say(&mut run, "session-up");
     leave(&mut run);
 }
 
