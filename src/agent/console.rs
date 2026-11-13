@@ -5,9 +5,6 @@
 //! console: it reads nothing from it and writes nothing to it. [`detach_if_alone`] frees it first
 //! thing, which closes the window once the console host sees its last client go.
 //!
-//! The standard handles that refer to it are then set to null (see [`detach_if_alone`]), so that a write to stderr (a
-//! refusal's text) is harmless.
-//!
 //! **Only when the agent is the console's one process.** A console that other processes use (the
 //! shell an operator ran `ssh-broker agent` from) is theirs, and freeing it from the agent would
 //! not close it but would cut the agent off from it. Those keep it.
@@ -19,20 +16,15 @@
 //! - a command on pipes starts with `CREATE_NO_WINDOW` (`pipes`), which gives it a console with no
 //!   window, and also keeps a Ctrl+C it raises from reaching the agent.
 //!
-//! A new way to start a process in the agent takes one of the two.
+//! Both start through [`crate::winutil::spawn_suspended`], which takes the console as an argument, so
+//! no start can omit it.
 //!
-//! **Windows Terminal as the default terminal.** The console is then a tab or window of the terminal,
-//! handed over before the agent's first line runs. It is open until [`detach_if_alone`] runs, a
-//! moment, and Windows Terminal's connection code closes it when the last client leaves the console
-//! with `FreeConsole` (read in its source, not measured here: CI has no Windows Terminal). The CI test
-//! looks at a desktop with the system's console host.
+//! **Windows Terminal as the default terminal.** The console is then a tab handed over before the
+//! agent's first line runs; `FreeConsole` closes it when the last client leaves (from its source, not
+//! measured: CI has no Windows Terminal).
 //!
-//! **Not the manifest's `consoleAllocationPolicy=detached`.** It would remove that moment, and is
-//! ruled out for three reasons. It needs Windows 11 24H2 (build 26100) and earlier builds ignore it
-//! (Microsoft, "Console Allocation Policy"). It is a property of the exe, and this exe is also the
-//! shim, `apply`, `verify` and `console-fallback`, which run from a console and use one; their
-//! behaviour under it is unmeasured, and the Windows Terminal specification for the policy says the
-//! console APIs fail until a console is allocated. And `FreeConsole` does the same on every build.
+//! **Not `consoleAllocationPolicy=detached`.** It needs build 26100, and this exe is also the shim,
+//! `apply` and `verify`, which use a console; `FreeConsole` works on every build.
 
 use std::num::NonZeroU32;
 
@@ -52,18 +44,17 @@ pub enum DetachOutcome {
     /// Other processes use the console. The agent kept it.
     Shared { processes: u32 },
     /// The agent has no console to free: the count of its console's processes came back zero, with
-    /// the system error `error` (not measured which one a process without a console gets).
+    /// the system error `error`.
     NoConsole { error: u32 },
 }
 
 /// Free the console of this process if no other process uses it, and set the standard handles that refer to it to null.
 /// The error is the failure of `FreeConsole`, with the console, and its window, still there.
 ///
-/// **The count and the free are two calls, and no call does both.** A process that attaches to this
-/// console by id (`AttachConsole`) between them keeps the console, and its window, open: the agent
-/// frees its side either way, and the window closes when that process leaves. A process that leaves
-/// between them leaves the agent holding a console it counted as shared: the window stays and the
-/// agent has no second look.
+/// **Contract.** The agent frees a console it is alone on when it starts. A console shared at that
+/// moment is kept for the agent's life, and its window stays even if the others then leave. No call
+/// counts and frees in one step: a process that attaches by id (`AttachConsole`) in between keeps the
+/// console open, and its window closes when that process leaves.
 ///
 /// **Null standard handles.** After `FreeConsole` the standard handles keep their numbers, which may
 /// name nothing or, once reused, a file or a socket; a null standard handle is one Rust's stdio treats
@@ -92,9 +83,7 @@ fn count_processes() -> Result<NonZeroU32, u32> {
     NonZeroU32::new(counted).ok_or_else(|| unsafe { windows::Win32::Foundation::GetLastError() }.0)
 }
 
-/// [`detach_if_alone`] over the count of processes on the console and the call that frees it (and
-/// answers whether the standard handles could be set to null), so a test can see what is called for each
-/// count without a console of its own.
+/// The decision of [`detach_if_alone`] over injected inputs, so a test needs no console.
 fn detach_with(
     attached: Result<NonZeroU32, u32>,
     free: impl FnOnce() -> windows::core::Result<Option<HRESULT>>,
@@ -129,13 +118,27 @@ fn is_console_handle(which: STD_HANDLE) -> bool {
     }
 }
 
-/// Set the standard handles `which` to the null handle.
 fn null_std_handles(which: &[STD_HANDLE]) -> windows::core::Result<()> {
-    for &which in which {
+    null_with(which, |which| {
         // SAFETY: no pointers; this process's own standard handle.
-        unsafe { SetStdHandle(which, HANDLE(std::ptr::null_mut())) }?;
+        unsafe { SetStdHandle(which, HANDLE(std::ptr::null_mut())) }
+    })
+}
+
+/// Call `set` for every handle in `which`, whatever an earlier one answered: a handle left alone is stale
+/// once the console is freed. Reports the first error.
+fn null_with(
+    which: &[STD_HANDLE],
+    mut set: impl FnMut(STD_HANDLE) -> windows::core::Result<()>,
+) -> windows::core::Result<()> {
+    let mut first = Ok(());
+    for &which in which {
+        let set = set(which);
+        if first.is_ok() {
+            first = set;
+        }
     }
-    Ok(())
+    first
 }
 
 #[cfg(test)]

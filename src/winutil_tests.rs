@@ -247,3 +247,15 @@ fn a_hand_off_pipe_made_for_its_message_takes_it_with_nobody_reading() {
     std::fs::File::from(child_copy).read_to_end(&mut got).unwrap();
     assert_eq!(got, bytes);
 }
+
+/// Every child the agent starts begins suspended with an extended startup block; the console choice adds
+/// no window flag for a pseudoconsole (whose host shows none) and `CREATE_NO_WINDOW` for a command on pipes.
+#[test]
+fn a_child_started_without_a_pseudoconsole_gets_a_console_with_no_window() {
+    use windows::Win32::System::Threading::{CREATE_NO_WINDOW, CREATE_SUSPENDED, EXTENDED_STARTUPINFO_PRESENT};
+    let always = CREATE_SUSPENDED.0 | EXTENDED_STARTUPINFO_PRESENT.0;
+    let pseudo = creation_flags(&ChildConsole::Pseudo(windows::Win32::System::Console::HPCON(1)));
+    let none = creation_flags(&ChildConsole::NoWindow);
+    assert_eq!(pseudo.0, always);
+    assert_eq!(none.0, always | CREATE_NO_WINDOW.0);
+}

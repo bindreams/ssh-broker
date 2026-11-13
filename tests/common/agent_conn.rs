@@ -82,7 +82,6 @@ struct Transcript {
 }
 
 impl Transcript {
-    /// What `stream` carried.
     fn buffer(&self, stream: Stream) -> &[u8] {
         &self.buffers[stream as usize]
     }

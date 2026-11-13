@@ -6,13 +6,16 @@
 
 use crate::shell::StartError;
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
+use windows::Win32::System::Console::HPCON;
 use windows::Win32::System::Diagnostics::Debug::{
     GetThreadErrorMode, SEM_FAILCRITICALERRORS, SetThreadErrorMode, THREAD_ERROR_MODE,
 };
 use windows::Win32::System::Threading::{
-    DeleteProcThreadAttributeList, InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
-    UpdateProcThreadAttribute,
+    CREATE_NO_WINDOW, CREATE_SUSPENDED, CreateProcessW, DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT,
+    InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_CREATION_FLAGS, PROCESS_INFORMATION,
+    STARTF_USESTDHANDLES, STARTUPINFOEXW, UpdateProcThreadAttribute,
 };
+use windows::core::{PCWSTR, PWSTR};
 
 /// Owns a `HANDLE`, calling `CloseHandle` on drop (no-op on an invalid handle).
 pub struct OwnedHandle(pub HANDLE);
@@ -258,6 +261,98 @@ impl Drop for AttrList {
             DeleteProcThreadAttributeList(self.list);
         }
     }
+}
+
+/// `PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE` (processthreadsapi.h): binds a pseudoconsole to a process being
+/// created. Named here with its documented value, like [`PROC_THREAD_ATTRIBUTE_HANDLE_LIST`].
+const PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE: usize = 0x0002_0016;
+
+/// The console a child the agent starts runs on. The agent has no console of its own (`agent::console`), and a
+/// console program started from a process with none gets a new console with a window, so every start names one
+/// that shows no window.
+pub enum ChildConsole {
+    /// A pseudoconsole: its host shows no window.
+    Pseudo(HPCON),
+    /// A console of its own with no window (`CREATE_NO_WINDOW`).
+    NoWindow,
+}
+
+/// The creation flags of [`spawn_suspended`]: suspended (so the child can be put in a job before it runs),
+/// an extended startup block, and the window policy of `console`.
+fn creation_flags(console: &ChildConsole) -> PROCESS_CREATION_FLAGS {
+    let window = match console {
+        ChildConsole::Pseudo(_) => PROCESS_CREATION_FLAGS(0),
+        ChildConsole::NoWindow => CREATE_NO_WINDOW,
+    };
+    CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT | window
+}
+
+/// Start `command` suspended on `console`, optionally in `cwd`, and return its process and primary thread. The
+/// only way the agent starts a child, so that none can omit the console policy.
+///
+/// The child's standard handles are `std_handles` (input, output, error; null ones for a pseudoconsole). It
+/// inherits exactly the handles in `inherit`, and none when that is empty.
+///
+/// # Safety
+/// Every handle in `std_handles` and `inherit` is valid and inheritable, and `console`'s pseudoconsole is open.
+pub unsafe fn spawn_suspended(
+    command: &str,
+    cwd: Option<&std::path::Path>,
+    console: ChildConsole,
+    std_handles: [HANDLE; 3],
+    inherit: &[HANDLE],
+) -> Result<(OwnedHandle, OwnedHandle), StartError> {
+    use std::os::windows::ffi::OsStrExt;
+    // The pseudoconsole attribute's value is the HPCON itself, never a pointer to it (that was the cause of
+    // a 0xC0000142 DLL-init failure). `inherit` outlives `CreateProcessW`: the list stores its address.
+    let pseudo = match &console {
+        ChildConsole::Pseudo(hpc) => Some(Attr {
+            attribute: PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
+            value: hpc.0 as *const core::ffi::c_void,
+            size: std::mem::size_of::<HPCON>(),
+        }),
+        ChildConsole::NoWindow => None,
+    };
+    let listed = (!inherit.is_empty()).then(|| Attr {
+        attribute: PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+        value: inherit.as_ptr() as *const core::ffi::c_void,
+        size: std::mem::size_of_val(inherit),
+    });
+    let attributes: Vec<Attr> = pseudo.into_iter().chain(listed).collect();
+    let attr = unsafe { AttrList::new(&attributes) }?;
+
+    let mut si = STARTUPINFOEXW::default();
+    si.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
+    si.StartupInfo.dwFlags |= STARTF_USESTDHANDLES;
+    [
+        si.StartupInfo.hStdInput,
+        si.StartupInfo.hStdOutput,
+        si.StartupInfo.hStdError,
+    ] = std_handles;
+    si.lpAttributeList = attr.as_ptr();
+
+    let mut line: Vec<u16> = command.encode_utf16().chain(std::iter::once(0)).collect();
+    let cwd_wide: Option<Vec<u16>> = cwd.map(|c| c.as_os_str().encode_wide().chain(std::iter::once(0)).collect());
+    let cwd_ptr = cwd_wide.as_ref().map(|w| PCWSTR(w.as_ptr())).unwrap_or(PCWSTR::null());
+
+    let mut pi = PROCESS_INFORMATION::default();
+    let _no_boxes = FailCriticalErrors::enter();
+    unsafe {
+        CreateProcessW(
+            PCWSTR::null(),
+            Some(PWSTR(line.as_mut_ptr())),
+            None,
+            None,
+            !inherit.is_empty(),
+            creation_flags(&console),
+            None,
+            cwd_ptr,
+            &si.StartupInfo,
+            &mut pi,
+        )
+    }
+    .map_err(|e| start_error_of_create(e, cwd))?;
+    Ok((OwnedHandle(pi.hProcess), OwnedHandle(pi.hThread)))
 }
 
 /// Turn a `cosca` failure into a Win32 error, keeping the real OS code when there is one.

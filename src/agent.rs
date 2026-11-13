@@ -87,8 +87,8 @@ use std::sync::{Arc, Condvar, Mutex};
 /// private folder, and become the one agent that serves this user.
 #[cfg(windows)]
 fn start(args: AgentArgs) -> anyhow::Result<()> {
-    // First, so that the window the system opened for the logon task's console is open for as short a
-    // time as can be. Nothing before the log opens could report it, so it is reported once serving begins.
+    // First, to keep the console window open as briefly as possible. The log is not open yet, so the
+    // outcome is reported once serving begins.
     let console = console::detach_if_alone();
     let current_sid = crate::acl::Sid::current_user()?.to_sddl()?;
     let background = args.background.is_some();

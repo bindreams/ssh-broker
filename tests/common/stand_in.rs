@@ -251,8 +251,8 @@ impl RealAgent {
         Self::start_in_new_console_expecting(kit, account, &account.sid_text, None)
     }
 
-    /// [`RealAgent::start_in_new_console`] for an agent told to expect the user `expect_sid`, which refuses to
-    /// start when that is not the account it runs as. `stdio` is as for [`Account::spawn_with_stdio`].
+    /// For an agent told to expect `expect_sid`: it refuses to start when that is not its account. `stdio` is
+    /// as for [`Account::spawn_with_stdio`].
     pub fn start_in_new_console_expecting(
         kit: &Kit,
         account: &Account,

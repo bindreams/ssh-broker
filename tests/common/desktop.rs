@@ -16,7 +16,9 @@ use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{OnceLock, PoisonError, RwLock, RwLockReadGuard};
 
-use windows::Win32::Foundation::{GetLastError, HLOCAL, HWND, LPARAM, LocalFree, SetLastError, WIN32_ERROR};
+use windows::Win32::Foundation::{
+    ERROR_INVALID_WINDOW_HANDLE, GetLastError, HLOCAL, HWND, LPARAM, LocalFree, SetLastError, WIN32_ERROR,
+};
 use windows::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
 use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
 use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
@@ -261,24 +263,44 @@ impl PrivateDesktop {
     /// The class names of the top-level windows on the desktop, visible or not. A console program started
     /// on this desktop with a console of its own puts its window here (`ConsoleWindowClass`), as do the
     /// helper windows of the console host.
+    ///
+    /// A window destroyed during the listing is skipped. Any other failure to read a class panics naming
+    /// the window: an empty class would let a console window pass for none.
     pub fn window_classes(&self) -> Vec<String> {
-        unsafe extern "system" fn collect(window: HWND, found: LPARAM) -> BOOL {
-            // SAFETY: `found` is the address of the vector `window_classes` passed, alive for the call.
-            let found = unsafe { &mut *(found.0 as *mut Vec<String>) };
+        #[derive(Default)]
+        struct Listing {
+            classes: Vec<String>,
+            failures: Vec<String>,
+        }
+        unsafe extern "system" fn collect(window: HWND, listing: LPARAM) -> BOOL {
+            // SAFETY: `listing` is the address of the `Listing` `window_classes` passed, alive for the call.
+            let listing = unsafe { &mut *(listing.0 as *mut Listing) };
             let mut name = [0u16; 256];
+            // SAFETY: no pointers; clears the error so that one read after a zero length is this call's.
+            unsafe { SetLastError(WIN32_ERROR(0)) };
             // SAFETY: the buffer is valid for its length.
             let length = unsafe { (user32().get_class_name)(window, name.as_mut_ptr(), name.len() as i32) };
-            found.push(String::from_utf16_lossy(&name[..usize::try_from(length).unwrap_or(0)]));
+            if length > 0 {
+                listing.classes.push(String::from_utf16_lossy(&name[..length as usize]));
+                return BOOL(1);
+            }
+            // SAFETY: no pointers.
+            let error = unsafe { GetLastError() };
+            if error != ERROR_INVALID_WINDOW_HANDLE {
+                listing
+                    .failures
+                    .push(format!("window {:#x}: error {}", window.0 as usize, error.0));
+            }
             BOOL(1)
         }
         let api = user32();
-        let mut found: Vec<String> = Vec::new();
+        let mut listing = Listing::default();
         // SAFETY: the desktop is open for the life of `self`; the callback only reads its arguments and
-        // writes `found`. An empty desktop may answer FALSE with no error, so the error is cleared first
+        // writes `listing`. An empty desktop may answer FALSE with no error, so the error is cleared first
         // and read only after a FALSE.
         unsafe {
             SetLastError(WIN32_ERROR(0));
-            let listed = (api.enum_desktop_windows)(self.desktop, collect, LPARAM(&mut found as *mut _ as isize));
+            let listed = (api.enum_desktop_windows)(self.desktop, collect, LPARAM(&mut listing as *mut _ as isize));
             if !listed.as_bool() && GetLastError() != WIN32_ERROR(0) {
                 panic!(
                     "list the windows of {}: {}",
@@ -287,7 +309,13 @@ impl PrivateDesktop {
                 );
             }
         }
-        found
+        assert!(
+            listing.failures.is_empty(),
+            "read the class of a window of {}: {:?}",
+            self.name,
+            listing.failures
+        );
+        listing.classes
     }
 
     /// `station\desktop`, for `STARTUPINFO.lpDesktop`.

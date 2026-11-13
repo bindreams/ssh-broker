@@ -16,8 +16,8 @@ fn main() -> anyhow::Result<()> {
         Route::Agent(args) => match agent::run(args) {
             Ok(()) => agent::end_process(0),
             Err(e) => {
-                // An operator's console shows it. An agent that freed its console has null standard handles in place of the console's, which drop the write,
-                // and the exit code is the record.
+                // Reaches an operator's console or redirect; after FreeConsole it is dropped and the exit code is the
+                // record.
                 eprintln!("ssh-broker agent: {e:#}");
                 agent::end_process(agent::exit_code_of(&e))
             }

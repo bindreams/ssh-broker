@@ -50,7 +50,7 @@ use stand_in::{Kit, RealAgent};
 /// The class of the window a console of its own has. A pseudoconsole's host makes no window of this class.
 const CONSOLE_WINDOW: &str = "ConsoleWindowClass";
 
-/// Elevated (CI only). The control: a console program started with a console of its own shows a window
+/// The control: a console program started with a console of its own shows a window
 /// on its desktop, which is what the looks below depend on.
 ///
 /// The program writes a file once it runs, and the window is looked at after that. The window is the console
@@ -81,7 +81,7 @@ fn a_console_program_with_its_own_console_shows_a_window_to_the_look() {
     );
 }
 
-/// Elevated (CI only). The agent, started as the logon task starts it (a console of its own), frees
+/// The agent, started as the logon task starts it (a console of its own), frees
 /// the console once it runs and no window is left on the desktop; a terminal session and a command on
 /// pipes then run with none either, and the agent still runs. It is the `--background` form because a CI
 /// runner's session is 0, where a desktop agent refuses to start; the console is freed before the two
@@ -93,45 +93,45 @@ fn the_agent_leaves_no_window_on_the_desktop() {
     let account = Account::create("nowin", true);
     let agent = RealAgent::start_in_new_console(&kit, &account);
 
-    // Serving comes after the console is freed, so the wait is for the agent that has done everything
-    // it does to start.
+    // Serving begins after the console is freed.
     let location = socket_loc::for_profile(account.profile()).unwrap();
     stand_in::wait_for_serving_marker(&location, agent.process.process.0);
     wait_until_the_console_is_gone(&agent.process);
     assert_serving(&agent, &location, "it freed its console");
 
-    // A terminal session: the shell runs in a pseudoconsole, which makes no window of its own.
+    // A terminal session: the shell runs in a pseudoconsole.
     let mut terminal = AgentConn::connect(&location);
     terminal.start_pty("cmd.exe");
     terminal.type_line("echo pty-%OS%");
     terminal.read_until_pty_shows("pty-Windows_NT");
     assert_no_console_window(&agent.process, "a terminal session runs");
-    let terminal_hosts = console_hosts(&agent.process);
+    let terminal_hosts = live_console_hosts(&agent.process, "a terminal session runs");
     terminal.type_line("exit");
     terminal.read_to_end();
-    wait_until_the_hosts_are_gone(terminal_hosts);
+    wait_until_the_hosts_are_gone(&terminal_hosts);
     assert_no_console_window(&agent.process, "a terminal session ended");
     assert_serving(&agent, &location, "a terminal session ended");
 
-    // A command on pipes: it has a console of its own, made with no window.
+    // A command on pipes.
     let mut command = AgentConn::connect(&location);
     command.start_exec("cmd.exe /c echo exec-ready & more");
     command.read_until_stdout_shows("exec-ready");
     assert_no_console_window(&agent.process, "a command on pipes runs");
-    let command_hosts = console_hosts(&agent.process);
+    let command_hosts = live_console_hosts(&agent.process, "a command on pipes runs");
     command.end_stdin();
     let finished = command.read_to_end();
     assert_eq!(finished.exit, Some(0), "the command ended with {:?}", finished.exit);
-    wait_until_the_hosts_are_gone(command_hosts);
+    wait_until_the_hosts_are_gone(&command_hosts);
     assert_no_console_window(&agent.process, "a command on pipes ended");
     assert_serving(&agent, &location, "a command on pipes ended");
 }
 
-/// Elevated (CI only). An agent that freed its console and then refuses to start still ends with its
-/// refusal's exit code, which the shim reads as the reason. Its standard handles are those of the console it
-/// freed, which then name nothing: the text it would write must not end the process any other way.
+/// An agent that freed its console and then refuses to start still exits with its refusal code, which the
+/// shim reads as the reason: writing the refusal to the now-null handles must not change it. No window is
+/// left once it has ended.
 ///
-/// The refusal comes before the agent's log opens, so the log cannot show that the console was freed.
+/// The refusal comes before the agent's log opens, and the agent's exit ends its console whether or not it
+/// freed it first, so this does not show that the free ran; it pins the exit code and the desktop.
 #[test]
 fn an_agent_that_freed_its_console_and_then_refuses_exits_with_its_refusal_code() {
     let _machine = machine::shared();
@@ -145,10 +145,13 @@ fn an_agent_that_freed_its_console_and_then_refuses_exits_with_its_refusal_code(
         Refusal::WrongUser.code() as u32,
         "the agent that refused ended with {code:#x}"
     );
+    wait_until_the_console_is_gone(&agent.process);
 }
 
-/// Elevated (CI only). An agent that freed its console keeps a standard error an operator redirected to a
-/// file: only the handles that referred to the console are set to null. The refusal text reaches the file.
+/// An agent that freed its console keeps a standard error an operator redirected to a file, and the
+/// refusal text reaches it. That only the handles that referred to the console are nulled is checked on real
+/// handles by `agent::console::console_tests`: a start here cannot give a child a console handle for one
+/// standard stream and a file for another.
 #[test]
 fn an_agent_that_freed_its_console_keeps_a_redirected_standard_error() {
     let _machine = machine::shared();
@@ -184,6 +187,7 @@ fn an_agent_that_freed_its_console_keeps_a_redirected_standard_error() {
         Refusal::WrongUser.code() as u32,
         "the agent that refused ended with {code:#x}"
     );
+    wait_until_the_console_is_gone(&agent.process);
     let text = std::fs::read_to_string(&written).expect("read what the agent wrote");
     assert!(
         text.contains(&Refusal::WrongUser.to_string()),
@@ -192,19 +196,42 @@ fn an_agent_that_freed_its_console_keeps_a_redirected_standard_error() {
 }
 
 /// The console hosts under the agent now, held open. The host of a console ends when its last client leaves,
-/// and its window goes with it.
+/// and its window goes with it. A process that could not be opened may be a host, so it fails the test
+/// instead of going unwaited.
 fn console_hosts(agent: &Spawned) -> Descendants {
     let mut tree = process_list::descendants(agent.process.0, agent.pid);
+    assert!(
+        tree.unopened.is_empty(),
+        "processes under the agent could not be opened to tell whether they are console hosts: {:?}",
+        tree.unopened
+    );
     tree.members
         .retain(|member| member.exe.eq_ignore_ascii_case("conhost.exe"));
     tree
+}
+
+/// [`console_hosts`] while `what` keeps a console alive, so that at least one host must be there. None found
+/// means the host is not a descendant of the agent as the wait assumes (unmeasured), and fails the test
+/// instead of letting the wait pass with nothing to wait for.
+fn live_console_hosts(agent: &Spawned, what: &str) -> Descendants {
+    let hosts = console_hosts(agent);
+    assert!(
+        !hosts.members.is_empty(),
+        "no console host is under the agent while {what}; the processes under it are {:?}",
+        process_list::descendants(agent.process.0, agent.pid)
+            .members
+            .iter()
+            .map(|member| (member.pid, member.exe.clone()))
+            .collect::<Vec<_>>()
+    );
+    hosts
 }
 
 /// Wait until every console host in `hosts` has ended. A host already gone has taken its window with it.
 ///
 /// The wait has no bound: the host's exit is the real condition, and a host that never ends is a hang that
 /// the runner's time limit for this binary ends and reports.
-fn wait_until_the_hosts_are_gone(hosts: Descendants) {
+fn wait_until_the_hosts_are_gone(hosts: &Descendants) {
     for host in &hosts.members {
         // SAFETY: a valid process handle, held open by the member.
         let woke = unsafe { WaitForSingleObject(host.handle(), INFINITE) }; // sleep-ok: an unbounded wait on the real condition, the console host's exit
@@ -216,19 +243,18 @@ fn wait_until_the_hosts_are_gone(hosts: Descendants) {
     }
 }
 
-/// Wait until the console host of the agent's own console has ended, and fail if a window is then left. The
-/// host ends when the agent, its last client, frees the console. A window left with no host to wait for is
-/// a failure, naming what the desktop shows.
+/// Wait until the console host of the agent's own console, if it is still there, has ended, and fail if a
+/// window is then left. The host ends when the agent, its last client, frees the console or ends. The agent
+/// frees it as its first act, so by the time of this look the host has usually ended already and taken its
+/// window with it: none found is the normal case here, unlike for a session's console.
 fn wait_until_the_console_is_gone(agent: &Spawned) {
     let hosts = console_hosts(agent);
     let found: Vec<_> = hosts.members.iter().map(|m| (m.pid, m.exe.clone())).collect();
-    let unopened = hosts.unopened.clone();
-    wait_until_the_hosts_are_gone(hosts);
+    wait_until_the_hosts_are_gone(&hosts);
     let classes = agent.window_classes();
     assert!(
         classes.is_empty(),
-        "a window is left on the agent's desktop after its console host ended: {classes:?}; the console hosts \
-         found were {found:?}, not examined: {unopened:?}"
+        "a window is left on the agent's desktop after its console host ended: {classes:?}; the console hosts          found were {found:?}"
     );
 }
 

@@ -7,15 +7,11 @@
 //! global inheritable-flag approach would race.
 
 use crate::shell::StartError;
-use crate::winutil::{AttrList, OwnedHandle, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, start_error_of_create};
+use crate::winutil::{ChildConsole, OwnedHandle, spawn_suspended};
 use std::path::Path;
 use windows::Win32::Foundation::{HANDLE, HANDLE_FLAG_INHERIT, SetHandleInformation};
 use windows::Win32::System::Pipes::CreatePipe;
-use windows::Win32::System::Threading::{
-    CREATE_NO_WINDOW, CREATE_SUSPENDED, CreateProcessW, EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess, INFINITE,
-    PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOEXW, WaitForSingleObject,
-};
-use windows::core::{PCWSTR, PWSTR};
+use windows::Win32::System::Threading::{GetExitCodeProcess, INFINITE, WaitForSingleObject};
 
 /// A child process with redirected stdin/stdout/stderr (the EXEC path).
 pub struct ExecChild {
@@ -56,67 +52,24 @@ impl ExecChild {
             set_inheritable(stdout_write.0)?;
             set_inheritable(stderr_write.0)?;
 
-            // Inherit EXACTLY these three handles (the array must outlive CreateProcessW —
-            // the attribute list stores a pointer to it, not a copy).
+            // Inherit EXACTLY these three handles, so the listening socket and other connections'
+            // handles never reach the command.
             let handles: [HANDLE; 3] = [stdin_read.0, stdout_write.0, stderr_write.0];
-            let attr = AttrList::single(
-                PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
-                handles.as_ptr() as *const core::ffi::c_void,
-                std::mem::size_of_val(&handles),
+            // The command has a console of its own with no window (see `agent::console`), which also keeps a
+            // Ctrl+C it raises for its console (`GenerateConsoleCtrlEvent`, group 0) from reaching the agent
+            // or other sessions' commands.
+            let (process, thread) = spawn_suspended(
+                crate::shim::spawn_line(command),
+                cwd,
+                ChildConsole::NoWindow,
+                handles,
+                &handles,
             )?;
-
-            let mut si = STARTUPINFOEXW::default();
-            si.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
-            si.StartupInfo.dwFlags |= STARTF_USESTDHANDLES;
-            si.StartupInfo.hStdInput = stdin_read.0;
-            si.StartupInfo.hStdOutput = stdout_write.0;
-            si.StartupInfo.hStdError = stderr_write.0;
-            si.lpAttributeList = attr.as_ptr();
-
-            let mut cmd: Vec<u16> = crate::shim::spawn_line(command)
-                .encode_utf16()
-                .chain(std::iter::once(0))
-                .collect();
-            let cwd_wide: Option<Vec<u16>> = cwd.map(|c| {
-                use std::os::windows::ffi::OsStrExt;
-                c.as_os_str().encode_wide().chain(std::iter::once(0)).collect()
-            });
-            let cwd_ptr = cwd_wide.as_ref().map(|w| PCWSTR(w.as_ptr())).unwrap_or(PCWSTR::null());
-
-            // CREATE_SUSPENDED is required, not an optimisation: the command must be inside
-            // the job before it runs a single instruction, or anything it forks first escapes
-            // containment permanently. Sequence fixed by `cosca::Job`: create suspended,
-            // assign, and only then resume.
-            // CREATE_NO_WINDOW gives the command a console of its own that shows no window. The agent has freed
-            // its console (`agent::console`), and a console program started from a process with none gets a new
-            // console with a visible window: without the flag every EXEC command would open one on the desktop.
-            // The own console also isolates Ctrl+C: one a command raises for every process on its console
-            // (`GenerateConsoleCtrlEvent` with group 0) must not reach the agent or the commands of other
-            // sessions, which share the console of an agent an operator ran by hand.
-            let mut pi = PROCESS_INFORMATION::default();
-            let _no_boxes = crate::winutil::FailCriticalErrors::enter();
-            CreateProcessW(
-                PCWSTR::null(),
-                Some(PWSTR(cmd.as_mut_ptr())),
-                None,
-                None,
-                true, // bInheritHandles — restricted to the 3 handles above
-                EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED | CREATE_NO_WINDOW,
-                None,
-                cwd_ptr,
-                &si.StartupInfo,
-                &mut pi,
-            )
-            .map_err(|e| start_error_of_create(e, cwd))?;
-            drop(attr);
             // The parent keeps stdin_write/stdout_read/stderr_read; close the child-side ends
             // so the parent's reads see EOF when the child exits.
             drop(stdin_read);
             drop(stdout_write);
             drop(stderr_write);
-
-            let process = OwnedHandle(pi.hProcess);
-            let thread = OwnedHandle(pi.hThread);
 
             let job = crate::winutil::contain_and_resume(process.0, thread.0, "command")?;
 
