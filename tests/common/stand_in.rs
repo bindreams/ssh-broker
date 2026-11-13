@@ -248,13 +248,19 @@ impl RealAgent {
     /// [`RealAgent::start`] with a console of its own that has a window, as the logon task gives the agent
     /// (see [`Account::spawn_in_new_console`]).
     pub fn start_in_new_console(kit: &Kit, account: &Account) -> RealAgent {
-        Self::start_in_new_console_expecting(kit, account, &account.sid_text)
+        Self::start_in_new_console_expecting(kit, account, &account.sid_text, None)
     }
 
     /// [`RealAgent::start_in_new_console`] for an agent told to expect the user `expect_sid`, which refuses to
-    /// start when that is not the account it runs as.
-    pub fn start_in_new_console_expecting(kit: &Kit, account: &Account, expect_sid: &str) -> RealAgent {
-        let process = account.spawn_in_new_console(&kit.exe, &Self::command_line(kit, expect_sid), kit.dir(), &[]);
+    /// start when that is not the account it runs as. `stdio` is as for [`Account::spawn_with_stdio`].
+    pub fn start_in_new_console_expecting(
+        kit: &Kit,
+        account: &Account,
+        expect_sid: &str,
+        stdio: Option<[HANDLE; 3]>,
+    ) -> RealAgent {
+        let process =
+            account.spawn_in_new_console(&kit.exe, &Self::command_line(kit, expect_sid), kit.dir(), &[], stdio);
         process.resume();
         RealAgent { process }
     }

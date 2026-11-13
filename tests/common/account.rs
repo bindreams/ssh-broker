@@ -420,8 +420,15 @@ impl Account {
     /// [`Account::spawn_with`] with a console of its own that has a window, as the logon task gives the
     /// agent (a console program started by a process with no console), instead of the windowless one
     /// every other start here asks for. The window is on this child's own desktop, see
-    /// [`Spawned::window_classes`].
-    pub fn spawn_in_new_console(&self, exe: &Path, command_line: &str, cwd: &Path, evidence: &[PathBuf]) -> Spawned {
+    /// [`Spawned::window_classes`]. `stdio` is as for [`Account::spawn_with_stdio`].
+    pub fn spawn_in_new_console(
+        &self,
+        exe: &Path,
+        command_line: &str,
+        cwd: &Path,
+        evidence: &[PathBuf],
+        stdio: Option<[HANDLE; 3]>,
+    ) -> Spawned {
         self.spawn_inner(
             Starter::SecondaryLogon(CREATE_PROCESS_LOGON_FLAGS(0)),
             exe,
@@ -429,7 +436,7 @@ impl Account {
             cwd,
             evidence,
             None,
-            None,
+            stdio,
             CREATE_NEW_CONSOLE,
         )
     }

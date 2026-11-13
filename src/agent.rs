@@ -102,7 +102,18 @@ fn start(args: AgentArgs) -> anyhow::Result<()> {
         |logs| crate::filelog::init_in(logs, "agent.log"),
         |location, session| {
             match console {
-                Ok(outcome) => tracing::info!("console: {outcome:?}"),
+                Ok(outcome) => {
+                    tracing::info!("console: {outcome:?}");
+                    if let console::DetachOutcome::Detached {
+                        std_handles_error: Some(e),
+                    } = outcome
+                    {
+                        tracing::warn!(
+                            "could not set the standard handles to null: {}",
+                            windows::core::Error::from(e)
+                        );
+                    }
+                }
                 Err(e) => tracing::warn!("could not detach from the console: {e}"),
             }
             serve(location, session, background)

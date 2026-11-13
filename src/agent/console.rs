@@ -5,8 +5,8 @@
 //! console: it reads nothing from it and writes nothing to it. [`detach_if_alone`] frees it first
 //! thing, which closes the window once the console host sees its last client go.
 //!
-//! The standard handles then point at NUL, so that a write to stderr (a refusal's text) is harmless: the
-//! freed console's handle numbers may be reused by a file or a socket.
+//! The standard handles are then set to null (see [`detach_if_alone`]), so that a write to stderr (a
+//! refusal's text) is harmless.
 //!
 //! **Only when the agent is the console's one process.** A console that other processes use (the
 //! shell an operator ran `ssh-broker agent` from) is theirs, and freeing it from the agent would
@@ -34,84 +34,81 @@
 //! behaviour under it is unmeasured, and the Windows Terminal specification for the policy says the
 //! console APIs fail until a console is allocated. And `FreeConsole` does the same on every build.
 
-use std::os::windows::io::IntoRawHandle as _;
+use std::num::NonZeroU32;
 
-use windows::Win32::Foundation::{ERROR_INVALID_HANDLE, HANDLE};
+use windows::Win32::Foundation::HANDLE;
 use windows::Win32::System::Console::{
     FreeConsole, GetConsoleProcessList, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, SetStdHandle,
 };
+use windows::core::HRESULT;
 
 /// What [`detach_if_alone`] did with the agent's console.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DetachOutcome {
-    /// The agent was alone on its console and freed it.
-    Detached,
+    /// The agent was alone on its console and freed it. `std_handles_error` is why its standard handles
+    /// could not be set to null, if they could not: the console is freed all the same.
+    Detached { std_handles_error: Option<HRESULT> },
     /// Other processes use the console. The agent kept it.
     Shared { processes: u32 },
-    /// The agent has no console to free.
-    NoConsole,
+    /// The agent has no console to free: the count of its console's processes came back zero, with
+    /// the system error `error` (not measured which one a process without a console gets).
+    NoConsole { error: u32 },
 }
 
-/// Free the console of this process if no other process uses it, and point the standard handles at NUL.
-/// The error is the failure of the count, of `FreeConsole` or of the redirection: the console, and its
-/// window, stay unless `FreeConsole` itself succeeded.
+/// Free the console of this process if no other process uses it, and set the standard handles to null.
+/// The error is the failure of `FreeConsole`, with the console, and its window, still there.
 ///
 /// **The count and the free are two calls, and no call does both.** A process that attaches to this
 /// console by id (`AttachConsole`) between them keeps the console, and its window, open: the agent
 /// frees its side either way, and the window closes when that process leaves. A process that leaves
 /// between them leaves the agent holding a console it counted as shared: the window stays and the
 /// agent has no second look.
+///
+/// **Null standard handles.** After `FreeConsole` the standard handles keep their numbers, which may
+/// name nothing or, once reused, a file or a socket; a null standard handle is one Rust's stdio treats
+/// as absent, and a write to it is dropped (a refusal's text, which `main` prints, must not end the
+/// process, or land in a file). No handle is opened for it.
 pub fn detach_if_alone() -> windows::core::Result<DetachOutcome> {
-    detach_with(count_processes, || {
+    detach_with(count_processes(), || {
         // SAFETY: no pointers; this process's own console.
         unsafe { FreeConsole() }?;
-        std_handles_to_nul()
+        Ok(null_std_handles().err().map(|e| e.code()))
     })
 }
 
-/// The number of processes on this process's console. An error is the failure of the call, which
-/// answers zero.
-fn count_processes() -> windows::core::Result<u32> {
+/// The number of processes on this process's console, or the system error of the call, which answers
+/// zero.
+fn count_processes() -> Result<NonZeroU32, u32> {
     // Room for two: more than one process is all that matters, and a longer list than the buffer is
     // answered with the count it would need.
     let mut list = [0u32; 2];
     // SAFETY: the buffer is valid for its length.
-    match unsafe { GetConsoleProcessList(&mut list) } {
-        0 => Err(windows::core::Error::from_thread()),
-        processes => Ok(processes),
-    }
+    let counted = unsafe { GetConsoleProcessList(&mut list) };
+    // SAFETY: no pointers; this thread's last error.
+    NonZeroU32::new(counted).ok_or_else(|| unsafe { windows::Win32::Foundation::GetLastError() }.0)
 }
 
-/// [`detach_if_alone`] over the count of processes on the console and the call that frees it, so a
-/// test can see what is called for each count without a console of its own.
+/// [`detach_if_alone`] over the count of processes on the console and the call that frees it (and
+/// answers whether the standard handles could be set to null), so a test can see what is called for each
+/// count without a console of its own.
 fn detach_with(
-    attached: impl FnOnce() -> windows::core::Result<u32>,
-    free: impl FnOnce() -> windows::core::Result<()>,
+    attached: Result<NonZeroU32, u32>,
+    free: impl FnOnce() -> windows::core::Result<Option<HRESULT>>,
 ) -> windows::core::Result<DetachOutcome> {
-    match attached() {
-        Ok(1) => free().map(|()| DetachOutcome::Detached),
-        Ok(processes) => Ok(DetachOutcome::Shared { processes }),
-        // A process without a console has no connection to ask: the call fails with an invalid handle.
-        Err(e) if e.code() == ERROR_INVALID_HANDLE.to_hresult() => Ok(DetachOutcome::NoConsole),
-        Err(e) => Err(e),
+    match attached {
+        Ok(one) if one.get() == 1 => free().map(|std_handles_error| DetachOutcome::Detached { std_handles_error }),
+        Ok(processes) => Ok(DetachOutcome::Shared {
+            processes: processes.get(),
+        }),
+        Err(error) => Ok(DetachOutcome::NoConsole { error }),
     }
 }
 
-/// Point stdin, stdout and stderr at one NUL handle, kept open for the life of the process.
-///
-/// `FreeConsole` closes the console's handles but leaves their numbers in the standard handle slots,
-/// and the system may give those numbers to a file or a socket opened later: a write meant for stderr
-/// (the refusal text `main` prints) would land in it.
-fn std_handles_to_nul() -> windows::core::Result<()> {
-    let nul = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open("NUL")
-        .map_err(windows::core::Error::from)?;
-    let nul = HANDLE(nul.into_raw_handle());
+/// Set stdin, stdout and stderr to the null handle.
+fn null_std_handles() -> windows::core::Result<()> {
     for which in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
-        // SAFETY: a handle opened here and never closed.
-        unsafe { SetStdHandle(which, nul) }?;
+        // SAFETY: no pointers; this process's own standard handle.
+        unsafe { SetStdHandle(which, HANDLE(std::ptr::null_mut())) }?;
     }
     Ok(())
 }
