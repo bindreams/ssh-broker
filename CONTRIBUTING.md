@@ -185,7 +185,7 @@ A release is two manual workflows, both taking the version (the `Cargo.toml` ver
 1. **Draft Release**, dispatched from `main`: tests the commit, builds and attests the Windows zip, creates draft `v<version>` with the zip and `.sha256`.
 2. **Publish Release**, behind the `Deploy` environment: re-verifies the draft against its commit on `main`, publishes it, and re-verifies the published zip.
 
-`release-asset.yaml` also runs on pull requests that touch what goes into the asset, so packaging, the import check and the attestation are exercised before a release. `.github/scripts/check-imports.sh` fails the build if the exe imports a DLL outside its allowlist of OS-shipped ones; a new dependency that imports another system DLL is added to that allowlist.
+`release-asset.yaml` also runs on pull requests that touch what goes into the asset, so packaging, the import check and the attestation are exercised before a release. `.cargo/config.toml` links the C runtime in for the Windows target (`+crt-static`), so a clean guest needs no VC++ redistributable, and `.github/scripts/check-imports.sh` fails the build if the exe imports a DLL outside its allowlist of OS-shipped ones; a new dependency that imports another system DLL is added to that allowlist.
 
 Before the first publish, enable immutable releases on the repository and create the `Deploy` environment with a required reviewer. Without immutable releases the final re-verification detects, but does not prevent, a draft asset being swapped in the moments before publishing.
 

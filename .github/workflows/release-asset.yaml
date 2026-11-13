@@ -17,6 +17,7 @@ on:
     paths:
       - .github/workflows/release-asset.yaml
       - .github/scripts/**
+      - .cargo/**
       - src/**
       - Cargo.toml
       - Cargo.lock
@@ -78,11 +79,9 @@ jobs:
           echo "version=$manifest" >> "$GITHUB_OUTPUT"
           echo "zip=$(bash .github/scripts/asset-name.sh "$manifest")" >> "$GITHUB_OUTPUT"
 
-      # `+crt-static`: the exe is sshd's DefaultShell, and a fresh guest has no VC++
-      # redistributable. `--target` keeps the flag off build scripts and proc macros.
+      # `.cargo/config.toml` links the C runtime in (`+crt-static`) for this target; the import check
+      # below fails the build if it did not.
       - name: Build
-        env:
-          RUSTFLAGS: -C target-feature=+crt-static
         shell: bash
         run: cargo build --release --locked --target "$TRIPLE"
 
