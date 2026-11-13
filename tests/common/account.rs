@@ -27,9 +27,9 @@ use windows::Win32::Security::{
     SecurityImpersonation, TOKEN_ALL_ACCESS, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation, TokenPrimary,
 };
 use windows::Win32::System::Threading::{
-    CREATE_NO_WINDOW, CREATE_PROCESS_LOGON_FLAGS, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW,
-    CreateProcessWithTokenW, GetCurrentProcess, OpenProcessToken, PROCESS_INFORMATION, ResumeThread,
-    STARTF_USESTDHANDLES, STARTUPINFOW, TerminateProcess,
+    CREATE_NEW_CONSOLE, CREATE_NO_WINDOW, CREATE_PROCESS_LOGON_FLAGS, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT,
+    CreateProcessAsUserW, CreateProcessWithTokenW, GetCurrentProcess, OpenProcessToken, PROCESS_CREATION_FLAGS,
+    PROCESS_INFORMATION, ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOW, TerminateProcess,
 };
 use windows::Win32::UI::Shell::CreateProfile;
 use windows::core::{PCWSTR, PWSTR};
@@ -413,6 +413,31 @@ impl Account {
             evidence,
             environment,
             stdio,
+            CREATE_NO_WINDOW,
+        )
+    }
+
+    /// [`Account::spawn_with`] with a console of its own that has a window, as the logon task gives the
+    /// agent (a console program started by a process with no console), instead of the windowless one
+    /// every other start here asks for. The window is on this child's own desktop, see
+    /// [`Spawned::window_classes`]. `stdio` is as for [`Account::spawn_with_stdio`].
+    pub fn spawn_in_new_console(
+        &self,
+        exe: &Path,
+        command_line: &str,
+        cwd: &Path,
+        evidence: &[PathBuf],
+        stdio: Option<[HANDLE; 3]>,
+    ) -> Spawned {
+        self.spawn_inner(
+            Starter::SecondaryLogon(CREATE_PROCESS_LOGON_FLAGS(0)),
+            exe,
+            command_line,
+            cwd,
+            evidence,
+            None,
+            stdio,
+            CREATE_NEW_CONSOLE,
         )
     }
 
@@ -422,7 +447,16 @@ impl Account {
     /// (the M3 cases run as one, see [`Starter::AsUser`]); anything else fails the test at the call.
     /// The child gets this process's environment.
     pub fn spawn_as_service(&self, exe: &Path, command_line: &str, cwd: &Path, evidence: &[PathBuf]) -> Spawned {
-        self.spawn_inner(Starter::AsUser, exe, command_line, cwd, evidence, None, None)
+        self.spawn_inner(
+            Starter::AsUser,
+            exe,
+            command_line,
+            cwd,
+            evidence,
+            None,
+            None,
+            CREATE_NO_WINDOW,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -435,6 +469,7 @@ impl Account {
         evidence: &[PathBuf],
         environment: Option<&[u16]>,
         stdio: Option<[HANDLE; 3]>,
+        console: PROCESS_CREATION_FLAGS,
     ) -> Spawned {
         // The account's SID and the administrator's: the child runs as the first and is started by
         // the second.
@@ -471,7 +506,7 @@ impl Account {
             startup.hStdOutput = output;
             startup.hStdError = error;
         }
-        let mut flags = CREATE_SUSPENDED | CREATE_NO_WINDOW;
+        let mut flags = CREATE_SUSPENDED | console;
         if environment.is_some() {
             flags |= CREATE_UNICODE_ENVIRONMENT;
         }
@@ -566,6 +601,11 @@ impl Spawned {
             let _ = unsafe { TerminateProcess(self.process.0, 1) };
             panic!("resume {}: {}", self.what, windows::core::Error::from_thread());
         }
+    }
+
+    /// The class names of the top-level windows on this child's desktop, which no other child shares.
+    pub fn window_classes(&self) -> Vec<String> {
+        self._desktop.window_classes()
     }
 
     /// Wait for the child to exit and return its exit code. A child still running after

@@ -16,7 +16,9 @@ use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{OnceLock, PoisonError, RwLock, RwLockReadGuard};
 
-use windows::Win32::Foundation::{HLOCAL, LocalFree};
+use windows::Win32::Foundation::{
+    ERROR_INVALID_WINDOW_HANDLE, GetLastError, HLOCAL, HWND, LPARAM, LocalFree, SetLastError, WIN32_ERROR,
+};
 use windows::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
 use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
 use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
@@ -88,6 +90,9 @@ type CreateDesktopW =
     unsafe extern "system" fn(PCWSTR, PCWSTR, *const c_void, u32, u32, *const SECURITY_ATTRIBUTES) -> HDESK;
 type CloseWindowStation = unsafe extern "system" fn(HWINSTA) -> BOOL;
 type CloseDesktop = unsafe extern "system" fn(HDESK) -> BOOL;
+type EnumWindowsProc = unsafe extern "system" fn(HWND, LPARAM) -> BOOL;
+type EnumDesktopWindows = unsafe extern "system" fn(HDESK, EnumWindowsProc, LPARAM) -> BOOL;
+type GetClassNameW = unsafe extern "system" fn(HWND, *mut u16, i32) -> i32;
 
 struct User32 {
     get_process_window_station: GetProcessWindowStation,
@@ -96,6 +101,8 @@ struct User32 {
     create_desktop: CreateDesktopW,
     close_window_station: CloseWindowStation,
     close_desktop: CloseDesktop,
+    enum_desktop_windows: EnumDesktopWindows,
+    get_class_name: GetClassNameW,
 }
 
 /// The address of the NUL-terminated export `name` of `module`; panics naming it if absent.
@@ -120,6 +127,8 @@ fn user32() -> &'static User32 {
             let create_desktop: CreateDesktopW = std::mem::transmute(export(module, b"CreateDesktopW\0"));
             let close_station: CloseWindowStation = std::mem::transmute(export(module, b"CloseWindowStation\0"));
             let close_desktop: CloseDesktop = std::mem::transmute(export(module, b"CloseDesktop\0"));
+            let enum_desktop_windows: EnumDesktopWindows = std::mem::transmute(export(module, b"EnumDesktopWindows\0"));
+            let get_class_name: GetClassNameW = std::mem::transmute(export(module, b"GetClassNameW\0"));
             User32 {
                 get_process_window_station: get,
                 set_process_window_station: set,
@@ -127,6 +136,8 @@ fn user32() -> &'static User32 {
                 create_desktop,
                 close_window_station: close_station,
                 close_desktop,
+                enum_desktop_windows,
+                get_class_name,
             }
         }
     })
@@ -247,6 +258,64 @@ impl PrivateDesktop {
                 name: format!("{station_name}\\Default"),
             })
         }
+    }
+
+    /// The class names of the top-level windows on the desktop, visible or not. A console program started
+    /// on this desktop with a console of its own puts its window here (`ConsoleWindowClass`), as do the
+    /// helper windows of the console host.
+    ///
+    /// A window destroyed during the listing is skipped. Any other failure to read a class panics naming
+    /// the window: an empty class would let a console window pass for none.
+    pub fn window_classes(&self) -> Vec<String> {
+        #[derive(Default)]
+        struct Listing {
+            classes: Vec<String>,
+            failures: Vec<String>,
+        }
+        unsafe extern "system" fn collect(window: HWND, listing: LPARAM) -> BOOL {
+            // SAFETY: `listing` is the address of the `Listing` `window_classes` passed, alive for the call.
+            let listing = unsafe { &mut *(listing.0 as *mut Listing) };
+            let mut name = [0u16; 256];
+            // SAFETY: no pointers; clears the error so that one read after a zero length is this call's.
+            unsafe { SetLastError(WIN32_ERROR(0)) };
+            // SAFETY: the buffer is valid for its length.
+            let length = unsafe { (user32().get_class_name)(window, name.as_mut_ptr(), name.len() as i32) };
+            if length > 0 {
+                listing.classes.push(String::from_utf16_lossy(&name[..length as usize]));
+                return BOOL(1);
+            }
+            // SAFETY: no pointers.
+            let error = unsafe { GetLastError() };
+            if error != ERROR_INVALID_WINDOW_HANDLE {
+                listing
+                    .failures
+                    .push(format!("window {:#x}: error {}", window.0 as usize, error.0));
+            }
+            BOOL(1)
+        }
+        let api = user32();
+        let mut listing = Listing::default();
+        // SAFETY: the desktop is open for the life of `self`; the callback only reads its arguments and
+        // writes `listing`. An empty desktop may answer FALSE with no error, so the error is cleared first
+        // and read only after a FALSE.
+        unsafe {
+            SetLastError(WIN32_ERROR(0));
+            let listed = (api.enum_desktop_windows)(self.desktop, collect, LPARAM(&mut listing as *mut _ as isize));
+            if !listed.as_bool() && GetLastError() != WIN32_ERROR(0) {
+                panic!(
+                    "list the windows of {}: {}",
+                    self.name,
+                    windows::core::Error::from_thread()
+                );
+            }
+        }
+        assert!(
+            listing.failures.is_empty(),
+            "read the class of a window of {}: {:?}",
+            self.name,
+            listing.failures
+        );
+        listing.classes
     }
 
     /// `station\desktop`, for `STARTUPINFO.lpDesktop`.

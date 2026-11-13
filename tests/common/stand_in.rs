@@ -233,14 +233,9 @@ pub struct RealAgent {
 
 impl RealAgent {
     pub fn start(kit: &Kit, account: &Account) -> RealAgent {
-        let command_line = format!(
-            "\"{}\" agent --background --expect-user {}",
-            kit.exe.display(),
-            account.sid_text
-        );
         let process = account.spawn_with(
             &kit.exe,
-            &command_line,
+            &Self::command_line(kit, &account.sid_text),
             kit.dir(),
             &[],
             CREATE_PROCESS_LOGON_FLAGS(0),
@@ -248,6 +243,33 @@ impl RealAgent {
         );
         process.resume();
         RealAgent { process }
+    }
+
+    /// [`RealAgent::start`] with a console of its own that has a window, as the logon task gives the agent
+    /// (see [`Account::spawn_in_new_console`]).
+    pub fn start_in_new_console(kit: &Kit, account: &Account) -> RealAgent {
+        Self::start_in_new_console_expecting(kit, account, &account.sid_text, None)
+    }
+
+    /// For an agent told to expect `expect_sid`: it refuses to start when that is not its account. `stdio` is
+    /// as for [`Account::spawn_with_stdio`].
+    pub fn start_in_new_console_expecting(
+        kit: &Kit,
+        account: &Account,
+        expect_sid: &str,
+        stdio: Option<[HANDLE; 3]>,
+    ) -> RealAgent {
+        let process =
+            account.spawn_in_new_console(&kit.exe, &Self::command_line(kit, expect_sid), kit.dir(), &[], stdio);
+        process.resume();
+        RealAgent { process }
+    }
+
+    fn command_line(kit: &Kit, expect_sid: &str) -> String {
+        format!(
+            "\"{}\" agent --background --expect-user {expect_sid}",
+            kit.exe.display()
+        )
     }
 
     /// Whether the agent process has not ended: a state check, not a wait.

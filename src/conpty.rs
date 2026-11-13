@@ -31,22 +31,15 @@
 use std::path::Path;
 
 use crate::shell::StartError;
-use crate::winutil::{Attr, AttrList, OwnedHandle, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, start_error_of_create};
+use crate::winutil::{ChildConsole, OwnedHandle, spawn_suspended};
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Storage::FileSystem::{ReadFile, WriteFile};
 use windows::Win32::System::Console::{COORD, ClosePseudoConsole, CreatePseudoConsole, HPCON, ResizePseudoConsole};
 use windows::Win32::System::Pipes::CreatePipe;
-use windows::Win32::System::Threading::{
-    CREATE_SUSPENDED, CreateProcessW, EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess, INFINITE, PROCESS_INFORMATION,
-    STARTF_USESTDHANDLES, STARTUPINFOEXW, WaitForSingleObject,
-};
-use windows::core::{PCWSTR, PWSTR};
+use windows::Win32::System::Threading::{GetExitCodeProcess, INFINITE, WaitForSingleObject};
 
 // windows-rs 0.62 does not export these as plain flag values usable with the `u32`/`usize`
 // FFI parameters, so they are named here with their documented winnt/consoleapi values.
-/// `PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE` (processthreadsapi.h) — the attribute key that
-/// binds a pseudoconsole to a process being created.
-const PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE: usize = 0x0002_0016;
 /// `PSEUDOCONSOLE_RESIZE_QUIRK` (consoleapi.h) — fixes resize-reflow artifacts.
 const PSEUDOCONSOLE_RESIZE_QUIRK: u32 = 0x0002;
 /// `PSEUDOCONSOLE_WIN32_INPUT_MODE` — accept win32-input-mode CSI input sequences.
@@ -183,63 +176,20 @@ impl PtySession {
             drop(in_read);
             drop(out_write);
 
-            // lpValue for PSEUDOCONSOLE is the HPCON VALUE itself, not a pointer to it —
-            // the root cause of the 0xC0000142 DLL-init failure in the spike.
-            // The array must outlive CreateProcessW: the attribute list stores a pointer to it.
+            // A handle besides the pseudoconsole's, when `inherit` names one.
             let inherited: Option<[HANDLE; 1]> = inherit.map(|handle| [handle.0]);
-            let console = Attr {
-                attribute: PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
-                value: hpc.0.0 as *const core::ffi::c_void,
-                size: std::mem::size_of::<HPCON>(),
-            };
-            let listed = inherited.as_ref().map(|handles| Attr {
-                attribute: PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
-                value: handles.as_ptr() as *const core::ffi::c_void,
-                size: std::mem::size_of_val(handles),
-            });
-            let attributes: Vec<Attr> = std::iter::once(console).chain(listed).collect();
-            let attr = AttrList::new(&attributes)?;
-
-            let mut si = STARTUPINFOEXW::default();
-            si.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
-            si.StartupInfo.hStdInput = HANDLE::default();
-            si.StartupInfo.hStdOutput = HANDLE::default();
-            si.StartupInfo.hStdError = HANDLE::default();
-            si.StartupInfo.dwFlags |= STARTF_USESTDHANDLES;
-            si.lpAttributeList = attr.as_ptr();
-
-            let mut cmd: Vec<u16> = command.encode_utf16().chain(std::iter::once(0)).collect();
-            let cwd_wide: Option<Vec<u16>> = cwd.map(|c| {
-                use std::os::windows::ffi::OsStrExt;
-                c.as_os_str().encode_wide().chain(std::iter::once(0)).collect()
-            });
-            let cwd_ptr = cwd_wide.as_ref().map(|w| PCWSTR(w.as_ptr())).unwrap_or(PCWSTR::null());
-
-            // CREATE_SUSPENDED is required, not an optimisation: the shell must be inside the
-            // job before it runs a single instruction, or anything it forks first escapes
-            // containment permanently. Sequence fixed by `cosca::Job`: create suspended,
-            // assign, and only then resume.
-            let mut pi = PROCESS_INFORMATION::default();
-            let _no_boxes = crate::winutil::FailCriticalErrors::enter();
-            CreateProcessW(
-                PCWSTR::null(),
-                Some(PWSTR(cmd.as_mut_ptr())),
-                None,
-                None,
-                // Inherit only what the handle list names; with none, nothing.
-                inherited.is_some(),
-                EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED,
-                None,
-                cwd_ptr,
-                &si.StartupInfo,
-                &mut pi,
-            )
-            .map_err(|e| start_error_of_create(e, cwd))?;
-            // `attr` drops here (DeleteProcThreadAttributeList) — the child is created.
-            drop(attr);
-
-            let process = OwnedHandle(pi.hProcess);
-            let thread = OwnedHandle(pi.hThread);
+            // Null standard handles: over SSH the agent's own are pipes that must not bleed into the child
+            // (microsoft/terminal#4380).
+            let null = HANDLE::default();
+            // The shell is inside a job before it runs (`contain_and_resume`), or anything it forks first
+            // escapes containment.
+            let (process, thread) = spawn_suspended(
+                command,
+                cwd,
+                ChildConsole::Pseudo(hpc.0),
+                [null; 3],
+                inherited.as_ref().map_or(&[], |handles| handles.as_slice()),
+            )?;
 
             let job = crate::winutil::contain_and_resume(process.0, thread.0, "shell")?;
 

@@ -5,6 +5,9 @@
 //!
 //! The socket is inside the user's own profile (see `socket_loc`), so an agent serves exactly
 //! one account: the one whose token it runs under.
+//!
+//! The agent frees the console the logon task gives it, so it shows no window; what that asks of
+//! every child it starts is in `console`.
 
 /// `agent` subcommand entrypoint. Windows-only: the agent must run in the user's interactive
 /// session to confer RDP parity, or as a background session (`--background`).
@@ -36,6 +39,8 @@ mod ending;
 pub use ending::{end_process, hold_until_end, keep_log};
 #[cfg(windows)]
 mod connections;
+#[cfg(windows)]
+mod console;
 #[cfg(windows)]
 mod launch;
 #[cfg(windows)]
@@ -82,6 +87,9 @@ use std::sync::{Arc, Condvar, Mutex};
 /// private folder, and become the one agent that serves this user.
 #[cfg(windows)]
 fn start(args: AgentArgs) -> anyhow::Result<()> {
+    // First, to keep the console window open as briefly as possible. The log is not open yet, so the
+    // outcome is reported once serving begins.
+    let console = console::detach_if_alone();
     let current_sid = crate::acl::Sid::current_user()?.to_sddl()?;
     let background = args.background.is_some();
     start_with(
@@ -92,7 +100,24 @@ fn start(args: AgentArgs) -> anyhow::Result<()> {
         reset_inherited_start_state,
         crate::userdir::current_socket_location,
         |logs| crate::filelog::init_in(logs, "agent.log"),
-        |location, session| serve(location, session, background),
+        |location, session| {
+            match console {
+                Ok(outcome) => {
+                    tracing::info!("console: {outcome:?}");
+                    if let console::DetachOutcome::Detached {
+                        std_handles_error: Some(e),
+                    } = outcome
+                    {
+                        tracing::warn!(
+                            "could not set the standard handles to null: {}",
+                            windows::core::Error::from(e)
+                        );
+                    }
+                }
+                Err(e) => tracing::warn!("could not detach from the console: {e}"),
+            }
+            serve(location, session, background)
+        },
     )
 }
 

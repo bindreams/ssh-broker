@@ -72,13 +72,23 @@ pub struct AgentConn {
     transcript: Transcript,
 }
 
-/// Collects the agent's output, and stops the pump once the PTY text contains `until`.
+/// Collects the agent's output, and stops the pump once the text of the stream `until` names contains
+/// the needle.
 #[derive(Default)]
 struct Transcript {
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
-    pty: Vec<u8>,
-    until: Option<String>,
+    /// What each stream carried, indexed by the stream's number: see [`Transcript::buffer`].
+    buffers: [Vec<u8>; 4],
+    until: Option<(Stream, String)>,
+}
+
+impl Transcript {
+    fn buffer(&self, stream: Stream) -> &[u8] {
+        &self.buffers[stream as usize]
+    }
+
+    fn text(&self, stream: Stream) -> String {
+        String::from_utf8_lossy(self.buffer(stream)).into_owned()
+    }
 }
 
 /// Why a pump stopped early on purpose.
@@ -95,13 +105,9 @@ impl std::error::Error for Found {}
 
 impl FrameSink for Transcript {
     fn on_data(&mut self, stream: Stream, bytes: &[u8]) -> anyhow::Result<()> {
-        match stream {
-            Stream::Stderr => self.stderr.extend_from_slice(bytes),
-            Stream::Pty => self.pty.extend_from_slice(bytes),
-            _ => self.stdout.extend_from_slice(bytes),
-        }
-        if let Some(needle) = &self.until
-            && String::from_utf8_lossy(&self.pty).contains(needle.as_str())
+        self.buffers[stream as usize].extend_from_slice(bytes);
+        if let Some((awaited, needle)) = &self.until
+            && self.text(*awaited).contains(needle.as_str())
         {
             return Err(Found.into());
         }
@@ -187,10 +193,19 @@ impl AgentConn {
     /// Read until the PTY text contains `needle`; returns the text so far. The wait is on the shell
     /// producing it. A session that ends first is a failure.
     pub fn read_until_pty_shows(&mut self, needle: &str) -> String {
-        self.transcript.until = Some(needle.to_string());
+        self.read_until_shows(Stream::Pty, needle)
+    }
+
+    /// [`AgentConn::read_until_pty_shows`] for the standard output of an exec session.
+    pub fn read_until_stdout_shows(&mut self, needle: &str) -> String {
+        self.read_until_shows(Stream::Stdout, needle)
+    }
+
+    fn read_until_shows(&mut self, stream: Stream, needle: &str) -> String {
+        self.transcript.until = Some((stream, needle.to_string()));
         let outcome = pump_decode(&mut self.rx, &mut self.fr, &mut self.transcript);
         self.transcript.until = None;
-        let text = String::from_utf8_lossy(&self.transcript.pty).into_owned();
+        let text = self.transcript.text(stream);
         match outcome {
             Err(PumpError::Sink(e)) if e.is::<Found>() => text,
             other => panic!(
@@ -212,15 +227,15 @@ impl AgentConn {
 stdout: {:?}
 stderr: {:?}
 pty: {:?}",
-                String::from_utf8_lossy(&self.transcript.stdout),
-                String::from_utf8_lossy(&self.transcript.stderr),
-                String::from_utf8_lossy(&self.transcript.pty)
+                self.transcript.text(Stream::Stdout),
+                self.transcript.text(Stream::Stderr),
+                self.transcript.text(Stream::Pty)
             ),
         };
         Finished {
-            stdout: String::from_utf8_lossy(&self.transcript.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&self.transcript.stderr).into_owned(),
-            pty: String::from_utf8_lossy(&self.transcript.pty).into_owned(),
+            stdout: self.transcript.text(Stream::Stdout),
+            stderr: self.transcript.text(Stream::Stderr),
+            pty: self.transcript.text(Stream::Pty),
             exit,
         }
     }
