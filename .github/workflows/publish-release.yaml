@@ -20,7 +20,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     # The preflight (version, CI, packaging, attestation) ran in draft-release.yaml before a
-    # draft could exist; this environment is the human gate in front of the irreversible step.
+    # draft could exist; dispatching this workflow is the decision to publish.
     environment: Deploy
     permissions:
       # `write`, not `read`: the releases API only returns drafts to a caller with push access.

@@ -189,7 +189,7 @@ A release is two manual workflows, both taking the version (the `Cargo.toml` ver
 
 `.cargo/config.toml` links the C runtime in (`+crt-static`) for every Windows MSVC target, so guests need no VC++ redistributable. Cargo reads it only from the working directory's ancestors (not via `--manifest-path`, a dependency or `cargo install`), and any `RUSTFLAGS` or `CARGO_ENCODED_RUSTFLAGS`, even empty, replaces it. Only the release exe is checked.
 
-Before the first publish, enable immutable releases on the repository and create the `Deploy` environment with a required reviewer. Without immutable releases the final re-verification detects, but does not prevent, a draft asset being swapped in the moments before publishing.
+Before the first publish, enable immutable releases on the repository and create the `Deploy` environment. It has no required reviewer: dispatching Publish Release is the decision to publish. Without immutable releases the final re-verification detects, but does not prevent, a draft asset being swapped in the moments before publishing.
 
 ## Pull requests
 
