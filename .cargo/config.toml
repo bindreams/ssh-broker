@@ -1,4 +1,4 @@
-# Links the C runtime in. Why, and the check that enforces it: `.github/scripts/check-imports.sh`.
+# Links the C runtime in. Why: `.github/scripts/check-imports.sh`, which checks the release exe only.
 # Without `--target` the flag also reaches build scripts and proc macros; the release build passes `--target`.
 [target.'cfg(all(windows, target_env = "msvc"))']
 rustflags = ["-C", "target-feature=+crt-static"]
