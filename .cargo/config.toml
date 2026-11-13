@@ -1,4 +1,4 @@
-# The exe is sshd's DefaultShell, and a fresh Windows guest has no VC++ redistributable: link the C
-# runtime in. `.github/scripts/check-imports.sh` fails the release build if a runtime DLL is still imported.
-[target.x86_64-pc-windows-msvc]
+# Links the C runtime in. Why, and the check that enforces it: `.github/scripts/check-imports.sh`.
+# Without `--target` the flag also reaches build scripts and proc macros; the release build passes `--target`.
+[target.'cfg(all(windows, target_env = "msvc"))']
 rustflags = ["-C", "target-feature=+crt-static"]

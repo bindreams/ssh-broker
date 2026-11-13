@@ -79,8 +79,6 @@ jobs:
           echo "version=$manifest" >> "$GITHUB_OUTPUT"
           echo "zip=$(bash .github/scripts/asset-name.sh "$manifest")" >> "$GITHUB_OUTPUT"
 
-      # `.cargo/config.toml` links the C runtime in (`+crt-static`) for this target; the import check
-      # below fails the build if it did not.
       - name: Build
         shell: bash
         run: cargo build --release --locked --target "$TRIPLE"

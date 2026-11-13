@@ -180,7 +180,7 @@ gh attestation verify ssh-broker-<version>-x86_64-pc-windows-msvc.zip -R bindrea
 sha256sum -c ssh-broker-<version>-x86_64-pc-windows-msvc.zip.sha256
 ```
 
-Then extract it and, from an elevated prompt, run `ssh-broker.exe apply`. It installs the broker for every user: each user who logs on gets their own agent. `ssh-broker.exe verify` checks the result for the user who runs it. The executable is statically linked, so it needs no Visual C++ redistributable.
+Then extract it and, from an elevated prompt, run `ssh-broker.exe apply`. It installs the broker for every user: each user who logs on gets their own agent. `ssh-broker.exe verify` checks the result for the user who runs it. The release executable is statically linked, so it needs no Visual C++ redistributable.
 
 ## Upgrading
 
