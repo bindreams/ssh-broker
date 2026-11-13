@@ -20,7 +20,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     # The preflight ran in draft-release.yaml before a draft could exist; dispatching this workflow
-    # is the decision to publish.
+    # is the decision to publish. `Deploy` limits the job to `main`.
     environment: Deploy
     permissions:
       # `write`, not `read`: the releases API only returns drafts to a caller with push access.
