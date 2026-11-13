@@ -1,12 +1,13 @@
-//! Tests for [`super::detach_with`]: no console is touched.
+//! Tests for [`super::detach_with`] and [`super::console_std_handles`]: no console is touched.
 
 use std::cell::Cell;
 use std::num::NonZeroU32;
 
 use windows::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_INVALID_HANDLE};
+use windows::Win32::System::Console::{STD_ERROR_HANDLE, STD_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE};
 use windows::core::HRESULT;
 
-use super::{DetachOutcome, detach_with};
+use super::{DetachOutcome, console_std_handles, detach_with};
 
 /// What `detach_with` answers when the console count is `counted`, and whether it freed the console.
 fn run(counted: Result<NonZeroU32, u32>) -> (windows::core::Result<DetachOutcome>, bool) {
@@ -68,5 +69,25 @@ fn standard_handles_that_could_not_be_reset_leave_the_agent_detached() {
         DetachOutcome::Detached {
             std_handles_error: Some(HRESULT(-2))
         }
+    );
+}
+
+/// Which of the three standard handles are chosen for nulling when `consoles` are the console ones.
+fn chosen(consoles: &[STD_HANDLE]) -> Vec<STD_HANDLE> {
+    console_std_handles(|which| consoles.contains(&which))
+}
+
+/// An operator who redirected a standard handle to a file or a pipe keeps it: only the handles that refer to
+/// the console are nulled.
+#[test]
+fn only_the_standard_handles_that_refer_to_the_console_are_chosen() {
+    let all = [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE];
+    assert_eq!(chosen(&all), all);
+    assert_eq!(chosen(&[]), []);
+    assert_eq!(chosen(&[STD_INPUT_HANDLE]), [STD_INPUT_HANDLE]);
+    // Output redirected to a file, the rest on the console.
+    assert_eq!(
+        chosen(&[STD_INPUT_HANDLE, STD_ERROR_HANDLE]),
+        [STD_INPUT_HANDLE, STD_ERROR_HANDLE]
     );
 }

@@ -5,7 +5,7 @@
 //! console: it reads nothing from it and writes nothing to it. [`detach_if_alone`] frees it first
 //! thing, which closes the window once the console host sees its last client go.
 //!
-//! The standard handles are then set to null (see [`detach_if_alone`]), so that a write to stderr (a
+//! The standard handles that refer to it are then set to null (see [`detach_if_alone`]), so that a write to stderr (a
 //! refusal's text) is harmless.
 //!
 //! **Only when the agent is the console's one process.** A console that other processes use (the
@@ -38,7 +38,8 @@ use std::num::NonZeroU32;
 
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::System::Console::{
-    FreeConsole, GetConsoleProcessList, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, SetStdHandle,
+    CONSOLE_MODE, FreeConsole, GetConsoleMode, GetConsoleProcessList, GetStdHandle, STD_ERROR_HANDLE, STD_HANDLE,
+    STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, SetStdHandle,
 };
 use windows::core::HRESULT;
 
@@ -55,7 +56,7 @@ pub enum DetachOutcome {
     NoConsole { error: u32 },
 }
 
-/// Free the console of this process if no other process uses it, and set the standard handles to null.
+/// Free the console of this process if no other process uses it, and set the standard handles that refer to it to null.
 /// The error is the failure of `FreeConsole`, with the console, and its window, still there.
 ///
 /// **The count and the free are two calls, and no call does both.** A process that attaches to this
@@ -67,12 +68,15 @@ pub enum DetachOutcome {
 /// **Null standard handles.** After `FreeConsole` the standard handles keep their numbers, which may
 /// name nothing or, once reused, a file or a socket; a null standard handle is one Rust's stdio treats
 /// as absent, and a write to it is dropped (a refusal's text, which `main` prints, must not end the
-/// process, or land in a file). No handle is opened for it.
+/// process, or land in a file). No handle is opened for it. Only the handles that refer to the console
+/// are set: one an operator redirected to a file or a pipe is kept.
 pub fn detach_if_alone() -> windows::core::Result<DetachOutcome> {
     detach_with(count_processes(), || {
+        // Before the free: afterwards no handle answers as a console's.
+        let console_handles = console_std_handles(is_console_handle);
         // SAFETY: no pointers; this process's own console.
         unsafe { FreeConsole() }?;
-        Ok(null_std_handles().err().map(|e| e.code()))
+        Ok(null_std_handles(&console_handles).err().map(|e| e.code()))
     })
 }
 
@@ -104,9 +108,30 @@ fn detach_with(
     }
 }
 
-/// Set stdin, stdout and stderr to the null handle.
-fn null_std_handles() -> windows::core::Result<()> {
-    for which in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+/// The standard handles for which `is_console` is true, in the order input, output, error.
+fn console_std_handles(is_console: impl Fn(STD_HANDLE) -> bool) -> Vec<STD_HANDLE> {
+    [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE]
+        .into_iter()
+        .filter(|&which| is_console(which))
+        .collect()
+}
+
+/// Whether the standard handle `which` refers to a console: `GetConsoleMode` succeeds on one and fails on a
+/// file, a pipe or no handle at all.
+fn is_console_handle(which: STD_HANDLE) -> bool {
+    // SAFETY: no pointers beyond the out-parameter, which is valid for the call.
+    unsafe {
+        let Ok(handle) = GetStdHandle(which) else {
+            return false;
+        };
+        let mut mode = CONSOLE_MODE(0);
+        GetConsoleMode(handle, &mut mode).is_ok()
+    }
+}
+
+/// Set the standard handles `which` to the null handle.
+fn null_std_handles(which: &[STD_HANDLE]) -> windows::core::Result<()> {
+    for &which in which {
         // SAFETY: no pointers; this process's own standard handle.
         unsafe { SetStdHandle(which, HANDLE(std::ptr::null_mut())) }?;
     }

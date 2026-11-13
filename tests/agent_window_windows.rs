@@ -128,18 +128,33 @@ fn the_agent_leaves_no_window_on_the_desktop() {
 }
 
 /// Elevated (CI only). An agent that freed its console and then refuses to start still ends with its
-/// refusal's exit code, which the shim reads as the reason; the text it would write goes nowhere.
+/// refusal's exit code, which the shim reads as the reason. Its standard handles are those of the console it
+/// freed, which then name nothing: the text it would write must not end the process any other way.
 ///
-/// The refusal comes before the agent's log opens, so the log cannot show that the console was freed. The
-/// agent's standard output and error are a file instead: an agent that kept its console, or freed it and left
-/// its standard handles where they were, writes the refusal text into it. Only one that freed the console and
-/// then dropped its writes leaves the file empty.
+/// The refusal comes before the agent's log opens, so the log cannot show that the console was freed.
 #[test]
 fn an_agent_that_freed_its_console_and_then_refuses_exits_with_its_refusal_code() {
     let _machine = machine::shared();
     let kit = Kit::copy_of_broker("nowinref");
     let account = Account::create("nowinref", true);
-    let shared = SharedDir::new("nowinref");
+    // Not this account's SID, so the agent refuses once the console is freed.
+    let agent = RealAgent::start_in_new_console_expecting(&kit, &account, "S-1-5-32-544", None);
+    let code = agent.process.wait();
+    assert_eq!(
+        code,
+        Refusal::WrongUser.code() as u32,
+        "the agent that refused ended with {code:#x}"
+    );
+}
+
+/// Elevated (CI only). An agent that freed its console keeps a standard error an operator redirected to a
+/// file: only the handles that referred to the console are set to null. The refusal text reaches the file.
+#[test]
+fn an_agent_that_freed_its_console_keeps_a_redirected_standard_error() {
+    let _machine = machine::shared();
+    let kit = Kit::copy_of_broker("nowinredir");
+    let account = Account::create("nowinredir", true);
+    let shared = SharedDir::new("nowinredir");
     let written = shared.0.join("agent-stderr.txt");
     let output = OpenOptions::new()
         .write(true)
@@ -159,7 +174,8 @@ fn an_agent_that_freed_its_console_and_then_refuses_exits_with_its_refusal_code(
             .expect("make a standard handle of the agent inheritable");
         handle
     });
-    // Not this account's SID, so the agent refuses once the console is freed.
+    // Not this account's SID, so the agent refuses once the console is freed. It is alone on its console, so
+    // it frees it.
     let agent =
         RealAgent::start_in_new_console_expecting(&kit, &account, "S-1-5-32-544", Some([input, output, output]));
     let code = agent.process.wait();
@@ -169,9 +185,9 @@ fn an_agent_that_freed_its_console_and_then_refuses_exits_with_its_refusal_code(
         "the agent that refused ended with {code:#x}"
     );
     let text = std::fs::read_to_string(&written).expect("read what the agent wrote");
-    assert_eq!(
-        text, "",
-        "the agent that freed its console wrote to its standard handles"
+    assert!(
+        text.contains(&Refusal::WrongUser.to_string()),
+        "the refusal did not reach the redirected standard error: {text:?}"
     );
 }
 
