@@ -195,3 +195,51 @@ fn the_probe_reports_its_raw_command_line() {
     let _ = std::fs::remove_dir_all(&dir);
     assert!(line.contains("command_line_probe"), "{line:?}");
 }
+
+// Console input closed before the client starts =====
+
+/// Whether the probe ran (it writes `out` first thing) when conhost started it on an input that was
+/// `input`, with `env` added to its environment. conhost's own exit code is not the client's.
+fn probe_ran(input: pty::Input, env: &[(&str, &OsStr)], tag: &str) -> bool {
+    let probe = probe();
+    let dir = temp_dir(tag);
+    let out = dir.join("line.txt");
+    let mut vars: Vec<(&str, &OsStr)> = vec![("PROBE_OUT", out.as_os_str())];
+    vars.extend_from_slice(env);
+    let line = sshd_encoder::pty_line(&probe.display().to_string(), "x");
+    let run = pty::run_under_conhost_with(&line, &vars, input);
+    eprintln!("{tag}: conhost exit {:?}, console {:?}", run.code, run.console);
+    let ran = out.is_file();
+    let _ = std::fs::remove_dir_all(&dir);
+    ran
+}
+
+/// Control: with the input open the probe runs.
+#[test]
+fn a_client_runs_when_the_console_input_is_open() {
+    assert!(probe_ran(pty::Input::Held, &[], "sb-input-held"));
+}
+
+/// B1.3: sshd closes conhost's stdin when the SSH client sends end-of-input; conhost then sends
+/// CTRL_CLOSE_EVENT to its clients (`VtIo::SendCloseEvent`), and a client with no handler ends with
+/// STATUS_CONTROL_C_EXIT. This asks whether any client, here the probe, is ended before it runs.
+#[test]
+fn a_client_is_ended_when_the_console_input_closed_before_it_started() {
+    assert!(
+        !probe_ran(pty::Input::Closed, &[], "sb-input-closed"),
+        "the probe ran although the console input was closed first"
+    );
+}
+
+/// Whether a handler installed first thing in `main` is in time for the close event.
+#[test]
+fn a_handler_installed_first_survives_the_closed_console_input() {
+    assert!(
+        probe_ran(
+            pty::Input::Closed,
+            &[("PROBE_HANDLE_CLOSE", OsStr::new("1"))],
+            "sb-input-handled"
+        ),
+        "the probe did not run although it handles console events first"
+    );
+}

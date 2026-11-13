@@ -27,6 +27,21 @@ pub struct ConhostRun {
 /// starts the client with them escaped again. Returns when conhost exits, which it does when the
 /// client has.
 pub fn run_under_conhost(client_line: &str, env: &[(&str, &OsStr)]) -> ConhostRun {
+    run_under_conhost_with(client_line, env, Input::Held)
+}
+
+/// What sshd does with conhost's stdin pipe, the console's input.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Input {
+    /// Open until conhost exits, as for a client that is still typing.
+    Held,
+    /// Closed as soon as conhost has started, before its client runs: sshd closes the pipe when the SSH
+    /// client sends end-of-input (`ssh -tt host cmd < NUL`, a paramiko `exec_command` after `shutdown_write`).
+    Closed,
+}
+
+/// [`run_under_conhost`], with the console's input as `input`.
+pub fn run_under_conhost_with(client_line: &str, env: &[(&str, &OsStr)], input: Input) -> ConhostRun {
     // conhost reads its control messages from this pipe and does not run the client without it.
     let (mut read, mut write) = (HANDLE::default(), HANDLE::default());
     let inheritable = SECURITY_ATTRIBUTES {
@@ -57,7 +72,7 @@ pub fn run_under_conhost(client_line: &str, env: &[(&str, &OsStr)]) -> ConhostRu
     let mut child = command.spawn().expect("start conhost.exe");
     drop(signal_read);
     // Both stay open until conhost exits, as sshd keeps them open for the session.
-    let stdin = child.stdin.take();
+    let stdin = child.stdin.take().filter(|_| input == Input::Held);
     let output = child.wait_with_output().expect("wait for conhost.exe");
     drop(stdin);
     drop(signal_write);
