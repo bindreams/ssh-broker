@@ -157,8 +157,8 @@ fn an_agent_that_freed_its_console_keeps_a_redirected_standard_error() {
     let _machine = machine::shared();
     let kit = Kit::copy_of_broker("nowinredir");
     let account = Account::create("nowinredir", true);
-    let shared = SharedDir::new("nowinredir");
-    let written = shared.0.join("agent-stderr.txt");
+    // In the kit's directory: a `SharedDir` of the same tag is the same path, and making it removes the kit.
+    let written = kit.path("agent-stderr.txt");
     let output = OpenOptions::new()
         .write(true)
         .create(true)
