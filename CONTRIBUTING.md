@@ -183,13 +183,13 @@ as machine-independent Windows paths.
 A release is two manual workflows, both taking the version (the `Cargo.toml` version, without `v`):
 
 1. **Draft Release**, dispatched from `main`: tests the commit, builds and attests the Windows zip, creates draft `v<version>` with the zip and `.sha256`.
-2. **Publish Release**, behind the `Deploy` environment: re-verifies the draft against its commit on `main`, publishes it, and re-verifies the published zip.
+2. **Publish Release**, in the `Deploy` environment: re-verifies the draft against its commit on `main`, publishes it, and re-verifies the published zip.
 
 `release-asset.yaml` also runs on pull requests that touch what goes into the asset, so packaging, the import check and the attestation are exercised before a release. `.github/scripts/check-imports.sh` fails the build if the exe imports a DLL outside its allowlist of OS-shipped ones; a new dependency that imports another system DLL is added to that allowlist.
 
 `.cargo/config.toml` links the C runtime in (`+crt-static`) for every Windows MSVC target, so guests need no VC++ redistributable. Cargo reads it only from the working directory's ancestors (not via `--manifest-path`, a dependency or `cargo install`), and any `RUSTFLAGS` or `CARGO_ENCODED_RUSTFLAGS`, even empty, replaces it. Only the release exe is checked.
 
-Before the first publish, enable immutable releases on the repository and create the `Deploy` environment. It has no required reviewer: dispatching Publish Release is the decision to publish. Without immutable releases the final re-verification detects, but does not prevent, a draft asset being swapped in the moments before publishing.
+Before the first publish, enable immutable releases on the repository and create the `Deploy` environment. The environment has no required reviewer; dispatching Publish Release is the decision to publish. Without immutable releases the final re-verification detects, but does not prevent, a draft asset being swapped in the moments before publishing.
 
 ## Pull requests
 

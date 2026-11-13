@@ -19,8 +19,8 @@ jobs:
     name: Verify and publish
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    # The preflight (version, CI, packaging, attestation) ran in draft-release.yaml before a
-    # draft could exist; dispatching this workflow is the decision to publish.
+    # The preflight ran in draft-release.yaml before a draft could exist; dispatching this workflow
+    # is the decision to publish.
     environment: Deploy
     permissions:
       # `write`, not `read`: the releases API only returns drafts to a caller with push access.
