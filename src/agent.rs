@@ -103,7 +103,7 @@ fn start(args: AgentArgs) -> anyhow::Result<()> {
         |location, session| {
             match console {
                 Ok(outcome) => tracing::info!("console: {outcome:?}"),
-                Err(e) => tracing::warn!("could not free the console, so its window stays: {e}"),
+                Err(e) => tracing::warn!("could not detach from the console: {e}"),
             }
             serve(location, session, background)
         },

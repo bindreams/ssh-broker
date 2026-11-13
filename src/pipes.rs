@@ -87,9 +87,12 @@ impl ExecChild {
             // the job before it runs a single instruction, or anything it forks first escapes
             // containment permanently. Sequence fixed by `cosca::Job`: create suspended,
             // assign, and only then resume.
-            // CREATE_NO_WINDOW gives the command a console of its own: a Ctrl+C or Ctrl+Break it raises
-            // for every process on its console (`GenerateConsoleCtrlEvent` with group 0) must not reach
-            // the agent or the commands of other sessions, which share the agent's console otherwise.
+            // CREATE_NO_WINDOW gives the command a console of its own that shows no window. The agent has freed
+            // its console (`agent::console`), and a console program started from a process with none gets a new
+            // console with a visible window: without the flag every EXEC command would open one on the desktop.
+            // The own console also isolates Ctrl+C: one a command raises for every process on its console
+            // (`GenerateConsoleCtrlEvent` with group 0) must not reach the agent or the commands of other
+            // sessions, which share the console of an agent an operator ran by hand.
             let mut pi = PROCESS_INFORMATION::default();
             let _no_boxes = crate::winutil::FailCriticalErrors::enter();
             CreateProcessW(

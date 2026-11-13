@@ -31,6 +31,13 @@ pub struct Member {
     process: OwnedHandle,
 }
 
+impl Member {
+    /// The process, held open by this member.
+    pub fn handle(&self) -> HANDLE {
+        self.process.0
+    }
+}
+
 /// What [`descendants`] found.
 pub struct Descendants {
     pub members: Vec<Member>,

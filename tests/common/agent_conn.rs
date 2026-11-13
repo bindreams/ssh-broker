@@ -72,13 +72,14 @@ pub struct AgentConn {
     transcript: Transcript,
 }
 
-/// Collects the agent's output, and stops the pump once the PTY text contains `until`.
+/// Collects the agent's output, and stops the pump once the text of the stream `until` names contains
+/// the needle.
 #[derive(Default)]
 struct Transcript {
     stdout: Vec<u8>,
     stderr: Vec<u8>,
     pty: Vec<u8>,
-    until: Option<String>,
+    until: Option<(Stream, String)>,
 }
 
 /// Why a pump stopped early on purpose.
@@ -100,10 +101,14 @@ impl FrameSink for Transcript {
             Stream::Pty => self.pty.extend_from_slice(bytes),
             _ => self.stdout.extend_from_slice(bytes),
         }
-        if let Some(needle) = &self.until
-            && String::from_utf8_lossy(&self.pty).contains(needle.as_str())
-        {
-            return Err(Found.into());
+        if let Some((awaited, needle)) = &self.until {
+            let text = match awaited {
+                Stream::Pty => &self.pty,
+                _ => &self.stdout,
+            };
+            if String::from_utf8_lossy(text).contains(needle.as_str()) {
+                return Err(Found.into());
+            }
         }
         Ok(())
     }
@@ -187,10 +192,23 @@ impl AgentConn {
     /// Read until the PTY text contains `needle`; returns the text so far. The wait is on the shell
     /// producing it. A session that ends first is a failure.
     pub fn read_until_pty_shows(&mut self, needle: &str) -> String {
-        self.transcript.until = Some(needle.to_string());
+        self.read_until_shows(Stream::Pty, needle)
+    }
+
+    /// [`AgentConn::read_until_pty_shows`] for the standard output of an exec session.
+    pub fn read_until_stdout_shows(&mut self, needle: &str) -> String {
+        self.read_until_shows(Stream::Stdout, needle)
+    }
+
+    fn read_until_shows(&mut self, stream: Stream, needle: &str) -> String {
+        self.transcript.until = Some((stream, needle.to_string()));
         let outcome = pump_decode(&mut self.rx, &mut self.fr, &mut self.transcript);
         self.transcript.until = None;
-        let text = String::from_utf8_lossy(&self.transcript.pty).into_owned();
+        let text = String::from_utf8_lossy(match stream {
+            Stream::Pty => &self.transcript.pty,
+            _ => &self.transcript.stdout,
+        })
+        .into_owned();
         match outcome {
             Err(PumpError::Sink(e)) if e.is::<Found>() => text,
             other => panic!(
