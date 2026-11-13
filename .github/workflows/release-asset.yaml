@@ -81,7 +81,7 @@ jobs:
 
       - name: Build
         shell: bash
-        # +crt-static comes from .cargo/config.toml; any RUSTFLAGS here would drop it (the import check below catches that).
+        # +crt-static comes from .cargo/config.toml; setting RUSTFLAGS here would drop it.
         run: cargo build --release --locked --target "$TRIPLE"
 
       - name: Check the exe imports only system DLLs
