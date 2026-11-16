@@ -18,6 +18,10 @@
 //! - M4: what an elevated administrator process gets when it starts children with a reduced copy of its
 //!   own token (integrity lowered, a `LUA_TOKEN` restricted token, a Safer normal-user token, the linked
 //!   token), and whether such a child is kept from climbing back: what it can create, open and connect to.
+//! - M5: what sshd's `DefaultShell` is given when a login has a forced command (on the key, or in a
+//!   `Match` block of `sshd_config`), with and without a terminal, and whether a client can pass an
+//!   environment variable (`SetEnv`, `SendEnv`, with and without `AcceptEnv`). These tests rewrite
+//!   `sshd_config` (restored afterwards) and restart `sshd`.
 //!
 //! Not exercised: the auto-login task of the product's design has a *logon trigger* and a group
 //! principal (it starts when a user logs on interactively). A CI service context has no interactive
@@ -32,6 +36,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use ssh_broker::acl::{self, Sid};
 use ssh_broker::afunix::{self, Listener};
+use ssh_broker::cmdline::split_args;
 use ssh_broker::provision::probe;
 use ssh_broker::provision::session_task::{requested_sddl, task_xml};
 use ssh_broker::provision::taskscheduler;
@@ -77,6 +82,8 @@ mod account_fixture;
 mod bounded_wait;
 #[path = "common/child_entry.rs"]
 mod child_entry;
+#[path = "common/command_line_probe.rs"]
+mod command_line_probe;
 #[path = "common/desktop.rs"]
 mod desktop;
 #[path = "common/fs_state.rs"]
@@ -1821,4 +1828,371 @@ fn m4d_linked_token_of_the_process_token() {
         }
     }
     finish(&failures);
+}
+
+// M5: what sshd's default shell is given =====
+
+/// The client's own command: a word, a phrase with a space, and a word with a quote in it, to see how each
+/// path carries them. One argument of `ssh`, so the text sshd gets is exactly this.
+const M5_CLIENT_COMMAND: &str = r#"word "two words" a"b"#;
+
+/// What the reserved phrase of the proposal would be.
+const M5_FORCED: &str = "ssh-broker --unelevated";
+
+/// A standard account sshd admits, with `examples/command_line_probe` (a copy beside the test's files) as
+/// sshd's `DefaultShell`. The probe records its raw command line, `cmdline::detect` and the SSH variables.
+struct ProbeRig {
+    kit: Kit,
+    account: Account,
+    probe: PathBuf,
+}
+
+impl ProbeRig {
+    fn new(tag: &str) -> ProbeRig {
+        account_fixture::assert_elevated();
+        let kit = Kit::new(tag);
+        let account = Account::create(tag, true);
+        account.started_by(ServiceLogon::Sshd);
+        let probe = kit.path("probe.exe");
+        std::fs::copy(command_line_probe::path(), &probe).expect("copy the probe");
+        ProbeRig { kit, account, probe }
+    }
+
+    /// The account's login through sshd, with the probe made the `DefaultShell`.
+    fn login(&self) -> Login<'_> {
+        let login = Login::new(&self.kit, &self.account);
+        set_stock_shell(&self.probe);
+        login
+    }
+
+    /// The probe's output file with `extension` (`.line`, `.env`).
+    fn report_file(&self, extension: &str) -> PathBuf {
+        let mut file = self.probe.clone().into_os_string();
+        file.push(extension);
+        PathBuf::from(file)
+    }
+}
+
+/// What `sshd -T` says for this account about the keywords M5 is about, as `key=value` lines.
+fn sshd_effective(account: &Account) -> String {
+    const KEYWORDS: [&str; 6] = [
+        "acceptenv",
+        "setenv",
+        "forcecommand",
+        "permituserenvironment",
+        "authorizedkeysfile",
+        "allowgroups",
+    ];
+    let query = format!("user={},host=localhost,addr=127.0.0.1", account.name);
+    let (ok, text) = sshd_rig::run("sshd", &["-T", "-C", &query]);
+    if !ok {
+        return format!("sshd_T=failed: {}\n", text.trim().replace('\n', " | "));
+    }
+    let mut out = String::new();
+    for keyword in KEYWORDS {
+        let found: Vec<&str> = text
+            .lines()
+            .filter_map(|line| line.strip_prefix(keyword)?.strip_prefix(' '))
+            .collect();
+        let shown = if found.is_empty() {
+            "(none)".to_owned()
+        } else {
+            found.join(" ; ")
+        };
+        out.push_str(&format!("sshd_T.{keyword}={shown}\n"));
+    }
+    out
+}
+
+/// One login to make: how the client is run and what it sends.
+struct Attempt<'a> {
+    tty: bool,
+    /// Extra `ssh` options, after the host.
+    options: &'a [&'a str],
+    /// A variable set in the client's own environment (for `SendEnv`).
+    client_env: Option<(&'a str, &'a str)>,
+    /// The client's command; none is a login for the shell.
+    command: Option<&'a str>,
+}
+
+/// Make the login with the probe as the shell and record what the probe saw under `heading`. Whether the
+/// shell ran is an answer, not a failure; the return value says it.
+fn attempt(rig: &ProbeRig, login: &Login<'_>, heading: &str, attempt: &Attempt<'_>) -> bool {
+    let (line_file, env_file) = (rig.report_file(".line"), rig.report_file(".env"));
+    let _ = std::fs::remove_file(&line_file);
+    let _ = std::fs::remove_file(&env_file);
+    let mut ssh = login.command();
+    ssh.arg(if attempt.tty { "-tt" } else { "-T" }).args(attempt.options);
+    if let Some((name, value)) = attempt.client_env {
+        ssh.env(name, value);
+    }
+    if let Some(command) = attempt.command {
+        ssh.arg("--").arg(command);
+    }
+    let outcome = run_client(ssh, attempt.tty, rig.kit.dir());
+    // The probe writes `.line` last, so a line means the environment report is complete.
+    let line = std::fs::read_to_string(&line_file).ok();
+    let mut facts = format!(
+        "terminal_requested={}\nclient_options={:?}\nclient_env={:?}\nclient_command={}\nssh_exit={:?}\n",
+        attempt.tty,
+        attempt.options,
+        attempt.client_env,
+        attempt.command.unwrap_or("(none)"),
+        outcome.code,
+    );
+    match &line {
+        Some(line) => {
+            facts.push_str(&format!(
+                "shell_ran=true\nshell_line={line}\nshell_args={:?}\n{}",
+                split_args(line),
+                std::fs::read_to_string(&env_file).unwrap_or_else(|e| format!("(no environment report: {e})\n")),
+            ));
+        }
+        None => {
+            let stderr: Vec<&str> = outcome.stderr.lines().rev().take(12).collect();
+            facts.push_str(&format!(
+                "shell_ran=false\nssh_stderr_tail={}\n",
+                stderr.into_iter().rev().collect::<Vec<_>>().join(" | ")
+            ));
+        }
+    }
+    record(heading, &facts);
+    line.is_some()
+}
+
+/// The two logins of M5: no client command, then [`M5_CLIENT_COMMAND`]. `true` when the shell ran in both.
+fn matrix(
+    rig: &ProbeRig,
+    login: &Login<'_>,
+    heading: &str,
+    tty: bool,
+    options: &[&str],
+    client_env: Option<(&str, &str)>,
+) -> bool {
+    let mut all_ran = true;
+    for (what, command) in [("no client command", None), ("client command", Some(M5_CLIENT_COMMAND))] {
+        let ran = attempt(
+            rig,
+            login,
+            &format!("{heading}, {what}"),
+            &Attempt {
+                tty,
+                options,
+                client_env,
+                command,
+            },
+        );
+        all_ran &= ran;
+    }
+    all_ran
+}
+
+/// Give the account's key a forced command: `command="..." <key>` in its authorized-keys file.
+fn force_command_on_key(login: &Login<'_>, account: &Account, forced: &str) -> String {
+    let public = std::fs::read_to_string(login.keys.private.with_file_name("id.pub")).expect("read the public key");
+    let options = format!("command=\"{forced}\"");
+    std::fs::write(&login.keys.authorized_keys, format!("{options} {public}")).expect("write authorized_keys");
+    // A rewrite keeps the file's ACL, which sshd checks; setting it again costs nothing.
+    sshd_rig::icacls(&login.keys.authorized_keys, &account.sid_text);
+    format!("authorized_keys_options={options}\n")
+}
+
+/// `sshd_config` replaced for a test and put back when it ends. The service is restarted by [`restart`]
+/// (sshd reads the file once, at start) and again on drop if it was.
+///
+/// [`restart`]: SshdConfig::restart
+struct SshdConfig {
+    path: PathBuf,
+    original: Vec<u8>,
+    restarted: bool,
+}
+
+impl SshdConfig {
+    /// Replace the file with `edit` of its text.
+    fn replace(edit: impl FnOnce(&str) -> String) -> SshdConfig {
+        let path = PathBuf::from(std::env::var("ProgramData").expect("ProgramData is set"))
+            .join("ssh")
+            .join("sshd_config");
+        let original = std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        let edited = edit(&String::from_utf8_lossy(&original));
+        let config = SshdConfig {
+            path,
+            original,
+            restarted: false,
+        };
+        std::fs::write(&config.path, edited).unwrap_or_else(|e| panic!("write {}: {e}", config.path.display()));
+        config
+    }
+
+    /// `sshd -t` on the file in place: whether sshd accepts it, and what it said.
+    fn check(&self) -> (bool, String) {
+        sshd_rig::run("sshd", &["-t"])
+    }
+
+    /// Stop and start the service so that it reads the file.
+    fn restart(&mut self) -> Result<(), String> {
+        self.restarted = true;
+        restart_sshd()
+    }
+}
+
+impl Drop for SshdConfig {
+    fn drop(&mut self) {
+        let _ = std::fs::write(&self.path, &self.original);
+        if self.restarted {
+            let _ = restart_sshd();
+        }
+    }
+}
+
+fn restart_sshd() -> Result<(), String> {
+    let _ = sshd_rig::run("net", &["stop", "sshd"]);
+    let (_, started) = sshd_rig::run("net", &["start", "sshd"]);
+    let (_, state) = sshd_rig::run("sc", &["query", "sshd"]);
+    if state.contains("RUNNING") {
+        Ok(())
+    } else {
+        Err(format!("sshd is not running after a restart:\n{started}\n{state}"))
+    }
+}
+
+/// Fail unless every shell of a baseline ran: without it the rig, not the question, is what failed.
+fn assert_ran(all_ran: bool, heading: &str, login: &Login<'_>) {
+    assert!(
+        all_ran,
+        "{heading}: the probe shell did not run for a login that must work\n{}",
+        (login.diagnostics())()
+    );
+}
+
+/// Elevated (CI only). M5a: what the default shell gets when the login has no forced command: no client
+/// command and a client command.
+#[test]
+fn m5a_default_shell_with_no_forced_command() {
+    let _machine = machine::exclusive();
+    let rig = ProbeRig::new("m5a");
+    let login = rig.login();
+    let heading = "M5a default shell, no forced command";
+    record(heading, &sshd_effective(&rig.account));
+    let ran = matrix(&rig, &login, heading, false, &[], None);
+    assert_ran(ran, heading, &login);
+}
+
+/// Elevated (CI only). M5b: the account's key carries `command="ssh-broker --unelevated"`: what the shell's
+/// command is, and whether the client's own command is in `SSH_ORIGINAL_COMMAND`, with what quoting.
+#[test]
+fn m5b_forced_command_on_the_key() {
+    let _machine = machine::exclusive();
+    let rig = ProbeRig::new("m5b");
+    let login = rig.login();
+    let heading = "M5b forced command on the key";
+    let options = force_command_on_key(&login, &rig.account, M5_FORCED);
+    record(heading, &format!("{options}{}", sshd_effective(&rig.account)));
+    let _ = matrix(&rig, &login, heading, false, &[], None);
+}
+
+/// Elevated (CI only). M5c: the same forced command given by `ForceCommand` in a `Match User` block of
+/// `sshd_config` (appended after the file's own blocks, so that the block is its own).
+#[test]
+fn m5c_forced_command_in_a_match_block() {
+    let _machine = machine::exclusive();
+    let rig = ProbeRig::new("m5c");
+    let login = rig.login();
+    let heading = "M5c ForceCommand in a Match User block";
+    let block = format!("\nMatch User {}\n    ForceCommand {M5_FORCED}\n", rig.account.name);
+    let mut config = SshdConfig::replace(|original| format!("{original}{block}"));
+    let (accepted, said) = config.check();
+    record(
+        heading,
+        &format!(
+            "config_added={block:?}\nsshd_t_accepts={accepted}\nsshd_t_output={}\n{}",
+            said.trim().replace('\n', " | "),
+            sshd_effective(&rig.account)
+        ),
+    );
+    if !accepted {
+        record(heading, "logins=not made: sshd refuses the config");
+        return;
+    }
+    config.restart().unwrap_or_else(|e| panic!("{heading}: {e}"));
+    let _ = matrix(&rig, &login, heading, false, &[], None);
+}
+
+/// One client mechanism for passing a variable, against one config. The facts are what the shell saw.
+fn variable_logins(tag: &str, heading: &str, accept: bool) {
+    let _machine = machine::exclusive();
+    let rig = ProbeRig::new(tag);
+    let login = rig.login();
+    let mut config = SshdConfig::replace(|original| {
+        if accept {
+            // Before the first `Match`: a line at the end would belong to the file's last block.
+            format!("AcceptEnv SB_SPIKE\n{original}")
+        } else {
+            original.to_owned()
+        }
+    });
+    let (accepted, said) = config.check();
+    record(
+        heading,
+        &format!(
+            "accept_env_added={accept}\nsshd_t_accepts={accepted}\nsshd_t_output={}\n{}",
+            said.trim().replace('\n', " | "),
+            sshd_effective(&rig.account)
+        ),
+    );
+    if !accepted {
+        record(heading, "logins=not made: sshd refuses the config");
+        return;
+    }
+    config.restart().unwrap_or_else(|e| panic!("{heading}: {e}"));
+    let by_set_env = matrix(
+        &rig,
+        &login,
+        &format!("{heading}, ssh -o SetEnv=SB_SPIKE=1"),
+        false,
+        &["-o", "SetEnv=SB_SPIKE=1"],
+        None,
+    );
+    let by_send_env = matrix(
+        &rig,
+        &login,
+        &format!("{heading}, SB_SPIKE=1 in the client's environment, ssh -o SendEnv=SB_SPIKE"),
+        false,
+        &["-o", "SendEnv=SB_SPIKE"],
+        Some(("SB_SPIKE", "1")),
+    );
+    record(
+        heading,
+        &format!("every_shell_ran_with_SetEnv={by_set_env}\nevery_shell_ran_with_SendEnv={by_send_env}"),
+    );
+}
+
+/// Elevated (CI only). M5d with the machine's own `sshd_config`: does `SetEnv` or `SendEnv` bring a variable
+/// to the shell, and does the login still work.
+#[test]
+fn m5d_client_variable_with_the_stock_config() {
+    variable_logins("m5ds", "M5d client variable, stock sshd_config", false);
+}
+
+/// Elevated (CI only). M5d with `AcceptEnv SB_SPIKE` added at the top of `sshd_config`: does sshd start with
+/// it (`sshd -t`), does the login work, is the variable there.
+#[test]
+fn m5d_client_variable_with_accept_env() {
+    variable_logins("m5da", "M5d client variable, AcceptEnv SB_SPIKE added", true);
+}
+
+/// Elevated (CI only). M5e: with a pseudo-terminal (`ssh -tt`): the baseline of M5a, then M5b's forced
+/// command, to see whether a terminal changes what the shell gets.
+#[test]
+fn m5e_forced_command_on_the_key_with_a_terminal() {
+    let _machine = machine::exclusive();
+    let rig = ProbeRig::new("m5e");
+    let login = rig.login();
+    let baseline = "M5e no forced command, with a terminal";
+    let ran = matrix(&rig, &login, baseline, true, &[], None);
+    assert_ran(ran, baseline, &login);
+    let heading = "M5e forced command on the key, with a terminal";
+    let options = force_command_on_key(&login, &rig.account, M5_FORCED);
+    record(heading, &options);
+    let _ = matrix(&rig, &login, heading, true, &[], None);
 }
