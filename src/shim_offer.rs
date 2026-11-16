@@ -298,10 +298,7 @@ impl Rescue for Prompting {
             {
                 Ok(Starting::Served(socket)) => return Rescued::Connected { socket, modes: None },
                 Ok(Starting::No | Starting::Gone) => {}
-                Err(e) => {
-                    tracing::warn!("cannot tell whether an agent is starting, so no session is offered: {e:#}");
-                    return Rescued::Plain;
-                }
+                Err(e) => return starting_failed(&e, absent.exec, stderr),
             }
         }
         let console = !absent.exec && console_available();
@@ -315,6 +312,20 @@ impl Rescue for Prompting {
             Plan::Offer { account, absence } => run_offer(account, absence),
         }
     }
+}
+
+/// The rescue when looking for a starting agent failed: no session is offered, and the login goes on
+/// in a plain shell.
+///
+/// A refused folder (a link on the way to it, a foreign owner) is the user's to fix, and the log that
+/// would say so was refused with it, so a login without a command is told on its stderr, as the
+/// notice is. A login with a command gets the line of the fail-open, which carries the log's failure.
+fn starting_failed(e: &anyhow::Error, exec: bool, stderr: &mut dyn Write) -> Rescued {
+    tracing::warn!("cannot tell whether an agent is starting, so no session is offered: {e:#}");
+    if !exec && e.is::<crate::acl::Refused>() {
+        let _ = writeln!(stderr, "{}", text::folder_refused(&format!("{e:#}")));
+    }
+    Rescued::Plain
 }
 
 /// A started background session, until its socket answers.

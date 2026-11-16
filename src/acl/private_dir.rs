@@ -53,6 +53,13 @@ pub struct Missing {
     path: PathBuf,
 }
 
+/// The folder or file is there and may not be used: a link, not a directory, an owner or ACL that is
+/// not the private one. Downcastable from the error of every function here that refuses one, for a
+/// caller that tells the user why. The text names the object and the remedy.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct Refused(String);
+
 /// A directory opened by handle, never reached through a link.
 pub struct DirHandle {
     handle: OwnedHandle,
@@ -143,14 +150,15 @@ pub fn ensure_private_dir(parent: &DirHandle, name: &str, user: &Sid) -> anyhow:
 
     let security = Security::from_handle(handle.0).with_context(|| format!("read the ACL of {}", path.display()))?;
     if !dir_policy_holds(&security, user)? {
-        anyhow::bail!(
+        return Err(Refused(format!(
             "{} cannot be used {purpose}: its owner is {}, or its ACL is not exactly Full Control \
              for {}, SYSTEM and Administrators, protected and inherited by what is made inside. It is left \
              as it is: inspect it, remove it, and it is created again",
             path.display(),
             describe_sid(security.owner),
             user.describe()
-        );
+        ))
+        .into());
     }
     Ok(DirHandle { handle, path })
 }
@@ -262,7 +270,11 @@ fn opened(status: NTSTATUS, handle: HANDLE, path: &Path, purpose: &str) -> anyho
         return Ok(OwnedHandle(handle));
     }
     if status == STATUS_NOT_A_DIRECTORY {
-        anyhow::bail!("{} cannot be used {purpose}: it is not a directory", path.display());
+        return Err(Refused(format!(
+            "{} cannot be used {purpose}: it is not a directory. Remove it, and a folder is made there",
+            path.display()
+        ))
+        .into());
     }
     if status == STATUS_OBJECT_NAME_NOT_FOUND || status == STATUS_OBJECT_PATH_NOT_FOUND {
         return Err(Missing {
@@ -277,12 +289,14 @@ fn opened(status: NTSTATUS, handle: HANDLE, path: &Path, purpose: &str) -> anyho
 /// is the object at the name and not what the name leads to.
 fn refuse_link(handle: &OwnedHandle, path: &Path, purpose: &str) -> anyhow::Result<()> {
     let attributes = file_attributes(handle.0).with_context(|| format!("read the attributes of {}", path.display()))?;
-    anyhow::ensure!(
-        attributes & FILE_ATTRIBUTE_REPARSE_POINT.0 == 0,
-        "{} cannot be used {purpose}: it is a reparse point (junction or symlink). Nothing is read or written \
-         through it; remove the link so that the name is a real folder",
-        path.display()
-    );
+    if attributes & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
+        return Err(Refused(format!(
+            "{} cannot be used {purpose}: it is a reparse point (junction or symlink). Nothing is read or written \
+             through it; remove the link so that the name is a real folder",
+            path.display()
+        ))
+        .into());
+    }
     Ok(())
 }
 

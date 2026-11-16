@@ -304,6 +304,65 @@ fn a_connect_that_fails_for_a_reason_that_waiting_does_not_clear_ends_the_wait_a
     assert!(format!("{failed:#}").contains("access denied"), "{failed:#}");
 }
 
+// a folder that is refused -----
+
+/// The error a refused private folder gives the shim's look at it: a junction at `Local`.
+fn refusal_of_a_junction_at_local(tag: &str) -> (crate::test_support::TempProfile, anyhow::Error) {
+    let profile = crate::test_support::TempProfile::new(tag);
+    let local = profile.0.join(r"AppData\Local");
+    let elsewhere = profile.0.join("elsewhere");
+    std::fs::create_dir(&elsewhere).unwrap();
+    std::fs::remove_dir(&local).unwrap();
+    crate::test_support::junction(&local, &elsewhere);
+    let err = Evidence::default()
+        .look(
+            &profile.location(),
+            Path::new(r"C:\no\such\dir\ssh-broker.exe"),
+            &Sid::current_user().unwrap(),
+        )
+        .unwrap_err();
+    (profile, err)
+}
+
+#[test]
+fn an_interactive_login_whose_folder_is_refused_is_told_on_the_terminal_and_gets_the_plain_shell() {
+    let (profile, err) = refusal_of_a_junction_at_local("refused-pty");
+    let mut shown = Vec::new();
+
+    let rescued = starting_failed(&err, false, &mut shown);
+
+    assert!(matches!(rescued, Rescued::Plain));
+    let shown = String::from_utf8(shown).unwrap();
+    assert!(shown.starts_with("ssh-broker: "), "{shown:?} for {err:#}");
+    assert!(
+        shown.contains(&profile.0.join(r"AppData\Local").display().to_string()),
+        "the link is named: {shown}"
+    );
+    assert!(shown.contains("remove"), "the remedy: {shown}");
+}
+
+#[test]
+fn a_login_with_a_command_gets_no_second_line_from_the_rescue_for_a_refused_folder() {
+    // The fail-open prints its own line for a command, with the log's failure in it.
+    let (_profile, err) = refusal_of_a_junction_at_local("refused-exec");
+    let mut shown = Vec::new();
+
+    let rescued = starting_failed(&err, true, &mut shown);
+
+    assert!(matches!(rescued, Rescued::Plain));
+    assert!(shown.is_empty(), "{}", String::from_utf8_lossy(&shown));
+}
+
+#[test]
+fn a_failure_that_is_not_a_refusal_is_logged_and_not_shown_to_an_interactive_login() {
+    let mut shown = Vec::new();
+    let (log, rescued) =
+        crate::test_support::logged(|| starting_failed(&anyhow::anyhow!("the process list failed"), false, &mut shown));
+    assert!(matches!(rescued, Rescued::Plain));
+    assert!(shown.is_empty());
+    assert!(log.contains("the process list failed"), "{log}");
+}
+
 // logs_dir -----
 
 #[test]
