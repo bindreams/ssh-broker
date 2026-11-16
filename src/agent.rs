@@ -71,8 +71,6 @@ use crate::shell::StartError;
 #[cfg(windows)]
 use crate::socket_loc::SocketLocation;
 #[cfg(windows)]
-use crate::userdir::SocketDir;
-#[cfg(windows)]
 use crate::winutil::OwnedHandle;
 #[cfg(windows)]
 use connections::{Connections, Drained, Live};
@@ -101,7 +99,7 @@ fn start(args: AgentArgs) -> anyhow::Result<()> {
         &mut std::io::stderr(),
         reset_inherited_start_state,
         crate::userdir::current_socket_location,
-        |folder| crate::filelog::init_in(&folder.logs, "agent.log"),
+        |logs| crate::filelog::init_in(logs, "agent.log"),
         |location, session| {
             match console {
                 Ok(outcome) => {
@@ -147,7 +145,7 @@ fn start_with(
     stderr: &mut dyn std::io::Write,
     reset: impl FnOnce() -> windows::core::Result<()>,
     locate: impl FnOnce() -> anyhow::Result<SocketLocation>,
-    init_log: impl FnOnce(&SocketDir) -> anyhow::Result<tracing_appender::non_blocking::WorkerGuard>,
+    init_log: impl FnOnce(&crate::acl::DirHandle) -> anyhow::Result<tracing_appender::non_blocking::WorkerGuard>,
     serve: impl FnOnce(&SocketLocation, u32) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     let reset_failure = reset()
@@ -165,7 +163,11 @@ fn start_with(
     // Held to the end of the process and flushed by `end_process`, from whichever thread ends it:
     // dropping the guard stops the writer and later lines are lost. Until the log opens an error goes
     // to stderr, which a logon task discards; a hand-run agent shows it.
-    if let Some(log) = keep_log_or_report(init_log(&folder), stderr) {
+    let log = match &folder.logs {
+        Ok(logs) => init_log(logs),
+        Err(e) => Err(anyhow::anyhow!("{e:#}")),
+    };
+    if let Some(log) = keep_log_or_report(log, stderr) {
         keep_log(log);
         if let Some(message) = &reset_failure {
             tracing::warn!("{message}");

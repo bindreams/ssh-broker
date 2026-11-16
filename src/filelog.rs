@@ -46,7 +46,7 @@ pub fn init_in(dir: &DirHandle, prefix: &str) -> anyhow::Result<WorkerGuard> {
 }
 
 fn open_for_location(loc: &SocketLocation, user: &Sid, prefix: &str) -> anyhow::Result<Sink> {
-    open_in(&crate::userdir::open_socket_dir(loc, user)?.logs, prefix)
+    open_in(&crate::userdir::open_socket_dir(loc, user)?.logs?, prefix)
 }
 
 /// Log into the logs folder of `loc`, making the private folder first if it is missing. The error

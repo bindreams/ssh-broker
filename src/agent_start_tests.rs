@@ -166,8 +166,8 @@ fn start_makes_the_private_folder_then_serves_that_session_from_it() {
         &mut std::io::sink(),
         || Ok(()),
         || Ok(loc.clone()),
-        |folder| {
-            assert_eq!(folder.logs.path(), loc.logs_dir());
+        |logs| {
+            assert_eq!(logs.path(), loc.logs_dir());
             Ok(guard())
         },
         |at, session| {
@@ -206,6 +206,41 @@ fn start_serves_without_a_log_when_the_log_cannot_be_opened() {
     .unwrap();
 
     assert!(served.get(), "a missing log is not a reason to stop serving");
+}
+
+#[test]
+fn start_serves_without_a_log_when_the_logs_folder_is_refused() {
+    let profile = TempProfile::new("start-nologs");
+    let loc = profile.location();
+    crate::userdir::ensure_socket_dir(&loc, &Sid::current_user().unwrap()).unwrap();
+    let status = std::process::Command::new("icacls")
+        .arg(loc.logs_dir())
+        .args(["/grant", "*S-1-1-0:(OI)(CI)F"])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let served = Cell::new(false);
+    let mut stderr = Vec::new();
+
+    start_with(
+        None,
+        3,
+        ME,
+        &mut stderr,
+        || Ok(()),
+        || Ok(loc.clone()),
+        |_| -> anyhow::Result<_> { panic!("there is no logs folder to log into") },
+        |_, _| {
+            served.set(true);
+            Ok(())
+        },
+    )
+    .unwrap();
+
+    assert!(served.get(), "a refused logs folder is not a reason to stop serving");
+    let stderr = String::from_utf8(stderr).unwrap();
+    assert!(stderr.contains("serving without a log"), "{stderr}");
+    assert!(stderr.contains(&loc.logs_dir().display().to_string()), "{stderr}");
 }
 
 #[test]

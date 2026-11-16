@@ -84,10 +84,11 @@ pub fn current_socket_location() -> anyhow::Result<SocketLocation> {
     socket_location_of_token(own_token()?.0)
 }
 
-/// The user's private folder and its `logs` folder, open by handle.
+/// The user's private folder and its `logs` folder, open by handle. They fail separately: serving
+/// needs the folder and not a log, so a `logs` that is refused or broken costs the log only.
 pub struct SocketDir {
     pub dir: DirHandle,
-    pub logs: DirHandle,
+    pub logs: anyhow::Result<DirHandle>,
 }
 
 /// Make `loc.dir` and its `logs` folder if they are missing, leave both exactly
@@ -102,14 +103,18 @@ pub struct SocketDir {
 /// {user, SYSTEM, Administrators} and exactly the private ACL is refused and left as it is, and
 /// removing it makes it be created again. A folder this accepts is not thereby trusted:
 /// `Listener::bind` verifies it again before it binds.
+///
+/// A refusal of the socket folder (or of the way to it) is this function's error. A refusal of
+/// `logs` alone is in [`SocketDir::logs`], with the socket folder still open.
 pub fn open_socket_dir(loc: &SocketLocation, user: &Sid) -> anyhow::Result<SocketDir> {
-    let make = || -> anyhow::Result<SocketDir> {
+    let make = || -> anyhow::Result<DirHandle> {
         let local = open_local(loc)?;
-        let dir = acl::ensure_private_dir(&local, socket_loc::SOCKET_DIR_NAME, user)?;
-        let logs = acl::ensure_private_dir(&dir, socket_loc::LOGS_DIR_NAME, user)?;
-        Ok(SocketDir { dir, logs })
+        acl::ensure_private_dir(&local, socket_loc::SOCKET_DIR_NAME, user)
     };
-    make().with_context(|| format!("make the private folder {}", loc.dir.display()))
+    let dir = make().with_context(|| format!("make the private folder {}", loc.dir.display()))?;
+    let logs = acl::ensure_private_dir(&dir, socket_loc::LOGS_DIR_NAME, user)
+        .with_context(|| format!("make the log folder {}", loc.logs_dir().display()));
+    Ok(SocketDir { dir, logs })
 }
 
 /// The folder `Local` of the profile `loc` is in, by the walk of [`open_socket_dir`]: the profile

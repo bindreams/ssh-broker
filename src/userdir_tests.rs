@@ -298,6 +298,37 @@ fn ensure_socket_dir_gives_what_it_makes_inside_exactly_the_three_aces() {
     assert_eq!(trustees(&loc.lock_path()), trustees(&loc.dir));
 }
 
+/// An ACL change on `logs` alone (a user, a backup tool) costs the log and nothing else.
+#[test]
+fn a_refused_logs_folder_leaves_the_socket_folder_serving() {
+    let profile = TempProfile::new("logs-ref");
+    let loc = profile.location();
+    ensure_socket_dir(&loc, &me()).unwrap();
+    let status = std::process::Command::new("icacls")
+        .arg(loc.logs_dir())
+        .args(["/grant", "*S-1-1-0:(OI)(CI)F"])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let before = tree_state(&profile.0);
+
+    let folder = open_socket_dir(&loc, &me()).expect("the socket folder is exact");
+
+    let err = format!("{:#}", folder.logs.as_ref().err().expect("logs is refused"));
+    assert!(err.contains(&loc.logs_dir().display().to_string()), "{err}");
+    assert!(err.contains("remove"), "{err}");
+    assert_eq!(folder.dir.path(), loc.dir);
+    assert_eq!(tree_state(&profile.0), before, "left as it was");
+}
+
+#[test]
+fn a_refused_socket_folder_is_still_refused_as_a_whole() {
+    let profile = TempProfile::new("dir-refused");
+    let loc = profile.location();
+    std::fs::write(&loc.dir, "x").unwrap();
+    assert!(open_socket_dir(&loc, &me()).is_err());
+}
+
 // A link above the folder ----------------------------------------------------------------
 
 use crate::test_support::{junction, tree_state};
