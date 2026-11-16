@@ -39,8 +39,8 @@ use windows::Win32::Storage::FileSystem::{
 use windows::Win32::System::Threading::GetCurrentProcess;
 
 use super::{
-    Made, OpenOutcome, Security, Sid, classify_open, denied_problem, describe_sid, descriptor_from_sddl, dir_policy,
-    file_attributes, nt_create, nt_path, owner_acl_problem, private_dir_dacl_sddl, status_error,
+    Made, OpenOutcome, OwnerAclWords, Security, Sid, classify_open, denied_problem, describe_sid, descriptor_from_sddl,
+    dir_policy, file_attributes, nt_create, nt_path, owner_acl_problem, private_dir_dacl_sddl, status_error,
 };
 use crate::winutil::OwnedHandle;
 
@@ -220,17 +220,15 @@ fn private_dir(parent: &DirHandle, name: &str, user: &Sid, create: bool) -> anyh
 
     let security = Security::from_handle(handle.0).with_context(|| format!("read the ACL of {}", path.display()))?;
     let (owner_ok, acl_ok) = dir_policy(&security, user)?;
-    if let Some(problem) = owner_acl_problem(
-        &describe_sid(security.owner),
-        owner_ok,
-        acl_ok,
-        &format!("{}, SYSTEM or Administrators", user.describe()),
-        &format!(
+    if let Some(problem) = owner_acl_problem(owner_ok, acl_ok, || OwnerAclWords {
+        owner: describe_sid(security.owner),
+        owner_set: format!("{}, SYSTEM or Administrators", user.describe()),
+        acl_is: format!(
             "exactly Full Control for {}, SYSTEM and Administrators, protected and inherited by what is made \
              inside",
             user.describe()
         ),
-    ) {
+    }) {
         return Err(Refused(format!(
             "{} cannot be used {}: {problem}. {LEFT_AS_IT_IS}",
             path.display(),

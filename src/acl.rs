@@ -752,18 +752,34 @@ fn nt_path(dir: &Path) -> anyhow::Result<Vec<u16>> {
     Ok([units(prefix).as_slice(), rest].concat())
 }
 
+/// What the sentence of a refusal of an owner or an ACL says. Naming an account is a lookup that can
+/// block, so these are built only for an object that is refused (see [`owner_acl_problem`]).
+struct OwnerAclWords {
+    /// The owner as the object has it.
+    owner: String,
+    /// The owners that would do.
+    owner_set: String,
+    /// What its ACL must be.
+    acl_is: String,
+}
+
 /// Which of the owner and the ACL of a folder or file is wrong, or `None` if neither: the one
-/// sentence every refusal of such an object is built from. `owner` is the owner as the object has it,
-/// `owner_set` the owners that would do, `acl_is` what its ACL must be.
-fn owner_acl_problem(owner: &str, owner_ok: bool, acl_ok: bool, owner_set: &str, acl_is: &str) -> Option<String> {
-    match (owner_ok, acl_ok) {
-        (true, true) => None,
-        (false, true) => Some(format!("its owner is {owner}, not {owner_set}")),
-        (true, false) => Some(format!("its ACL is not {acl_is} (its owner, {owner}, is fine)")),
-        (false, false) => Some(format!(
-            "its owner is {owner}, not {owner_set}, and its ACL is not {acl_is}"
-        )),
+/// sentence every refusal of such an object is built from. `words` is called only when there is a
+/// refusal.
+fn owner_acl_problem(owner_ok: bool, acl_ok: bool, words: impl FnOnce() -> OwnerAclWords) -> Option<String> {
+    if owner_ok && acl_ok {
+        return None;
     }
+    let OwnerAclWords {
+        owner,
+        owner_set,
+        acl_is,
+    } = words();
+    Some(match (owner_ok, acl_ok) {
+        (false, true) => format!("its owner is {owner}, not {owner_set}"),
+        (true, false) => format!("its ACL is not {acl_is} (its owner, {owner}, is fine)"),
+        _ => format!("its owner is {owner}, not {owner_set}, and its ACL is not {acl_is}"),
+    })
 }
 
 /// The sentence for an object whose ACL this process may not read, so that it cannot be shown to be
@@ -799,16 +815,19 @@ fn problem_from_open(dir: &Path, handle: Option<OwnedHandle>) -> anyhow::Result<
     };
 
     let security = Security::from_handle(handle.0).with_context(|| format!("read the ACL of {}", dir.display()))?;
-    let owner = describe_sid(security.owner);
 
     let attributes = file_attributes(handle.0).with_context(|| format!("read the attributes of {}", dir.display()))?;
     if attributes & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
         return Ok(Some(format!(
-            "it is a reparse point (junction or symlink); owner {owner}"
+            "it is a reparse point (junction or symlink); owner {}",
+            describe_sid(security.owner)
         )));
     }
     if attributes & FILE_ATTRIBUTE_DIRECTORY.0 == 0 {
-        return Ok(Some(format!("it is not a directory; owner {owner}")));
+        return Ok(Some(format!(
+            "it is not a directory; owner {}",
+            describe_sid(security.owner)
+        )));
     }
 
     let system = Sid::well_known(WellKnown::System)?;
@@ -818,13 +837,11 @@ fn problem_from_open(dir: &Path, handle: Option<OwnedHandle>) -> anyhow::Result<
     // `INSTALL_DIR_SDDL` makes Administrators the owner, so nothing else is accepted.
     let owner_ok = security.owner_in(&[&admins])?;
     let acl_ok = security.dacl_matches(&grants)?;
-    Ok(owner_acl_problem(
-        &owner,
-        owner_ok,
-        acl_ok,
-        "the Administrators group",
-        "the hardened one",
-    ))
+    Ok(owner_acl_problem(owner_ok, acl_ok, || OwnerAclWords {
+        owner: describe_sid(security.owner),
+        owner_set: "the Administrators group".into(),
+        acl_is: "the hardened one".into(),
+    }))
 }
 
 /// Create `dir` with the install-directory DACL, or accept it if this build made it already.

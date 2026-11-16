@@ -18,8 +18,8 @@ use windows::Win32::Storage::FileSystem::{
 use windows::core::{BOOL, HRESULT, PCWSTR};
 
 use super::{
-    Grant, Security, Sid, WellKnown, denied_problem, describe_sid, descriptor_from_sddl, file_attributes,
-    open_for_inspection, owner_acl_problem, wide,
+    Grant, OwnerAclWords, Security, Sid, WellKnown, denied_problem, describe_sid, descriptor_from_sddl,
+    file_attributes, open_for_inspection, owner_acl_problem, wide,
 };
 use crate::winutil::OwnedHandle;
 
@@ -123,14 +123,11 @@ fn problem_from_security(security: &Security) -> Option<String> {
     // The owner can rewrite the DACL whatever it says, so it has to be as trusted as the grantees.
     let owner_ok = security.owner_in(&[&system, &admins]).unwrap_or(false);
     let acl_ok = security.dacl_matches(&[full(&system), full(&admins)]).unwrap_or(false);
-    let owner = describe_sid(security.owner);
-    owner_acl_problem(
-        &owner,
-        owner_ok,
-        acl_ok,
-        "SYSTEM or Administrators",
-        "exactly SYSTEM and Administrators",
-    )
+    owner_acl_problem(owner_ok, acl_ok, || OwnerAclWords {
+        owner: describe_sid(security.owner),
+        owner_set: "SYSTEM or Administrators".into(),
+        acl_is: "exactly SYSTEM and Administrators".into(),
+    })
 }
 
 #[cfg(test)]

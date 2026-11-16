@@ -785,7 +785,13 @@ fn the_owner_and_the_acl_are_blamed_separately_with_the_wording_of_each_kind_of_
         ("the Administrators group", "the hardened one"),
         ("SYSTEM or Administrators", "exactly SYSTEM and Administrators"),
     ] {
-        let problem = |owner_ok, acl_ok| owner_acl_problem("X", owner_ok, acl_ok, owner_set, acl_is);
+        let problem = |owner_ok, acl_ok| {
+            owner_acl_problem(owner_ok, acl_ok, || OwnerAclWords {
+                owner: "X".into(),
+                owner_set: owner_set.into(),
+                acl_is: acl_is.into(),
+            })
+        };
         assert_eq!(problem(true, true), None);
         let owner = problem(false, true).unwrap();
         assert_eq!(owner, format!("its owner is X, not {owner_set}"));
@@ -797,6 +803,14 @@ fn the_owner_and_the_acl_are_blamed_separately_with_the_wording_of_each_kind_of_
             format!("its owner is X, not {owner_set}, and its ACL is not {acl_is}")
         );
     }
+}
+
+#[test]
+fn nothing_is_looked_up_to_judge_an_owner_and_an_acl_that_are_right() {
+    // Naming an owner or a user is an account lookup, which can block on a domain controller; only a
+    // refusal needs the names.
+    let words = || -> OwnerAclWords { panic!("the words of a refusal were built for an object that is fine") };
+    assert_eq!(owner_acl_problem(true, true, words), None);
 }
 
 #[test]
