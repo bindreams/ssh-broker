@@ -110,3 +110,23 @@ fn different_profiles_never_share_a_socket() {
     assert_ne!(a.dir, b.dir);
     assert_ne!(a.path, b.path);
 }
+
+#[test]
+fn profile_dir_is_three_levels_above_the_socket_folder_and_none_for_another_shape() {
+    let profile = profile("a");
+    assert_eq!(for_profile(&profile).unwrap().profile_dir(), Some(profile.as_path()));
+
+    let at = |dir: &str| SocketLocation {
+        dir: PathBuf::from(dir),
+        path: PathBuf::from(dir).join(SOCKET_FILE_NAME),
+    };
+    for dir in [
+        r"C:\Users\a\AppData\Local\other",
+        r"C:\Users\a\AppData\Roaming\ssh-broker",
+        r"C:\Users\a\Data\Local\ssh-broker",
+        r"C:\Local\ssh-broker",
+        r"ssh-broker",
+    ] {
+        assert_eq!(at(dir).profile_dir(), None, "{dir}");
+    }
+}

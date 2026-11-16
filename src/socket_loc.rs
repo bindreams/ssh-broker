@@ -44,6 +44,16 @@ impl SocketLocation {
         self.dir.join(SERVING_MARKER_NAME)
     }
 
+    /// The profile directory this location is inside: three levels above `dir`, if `dir` is
+    /// `<profile>\AppData\Local\ssh-broker` as [`for_profile`] makes it, and `None` for any other
+    /// shape. Names compare without case, as the file system does.
+    pub fn profile_dir(&self) -> Option<&Path> {
+        let named = |path: &Path, name: &str| path.file_name().is_some_and(|n| n.eq_ignore_ascii_case(name));
+        let local = self.dir.parent().filter(|_| named(&self.dir, SOCKET_DIR_NAME))?;
+        let app_data = local.parent().filter(|_| named(local, "Local"))?;
+        app_data.parent().filter(|_| named(app_data, "AppData"))
+    }
+
     /// The folder the shim and the agent log into.
     pub fn logs_dir(&self) -> PathBuf {
         self.dir.join(LOGS_DIR_NAME)

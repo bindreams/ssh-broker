@@ -17,7 +17,7 @@ use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 use windows::Win32::UI::Shell::GetUserProfileDirectoryW;
 use windows::core::{HRESULT, PWSTR};
 
-use crate::acl::{self, Sid};
+use crate::acl::{self, DirHandle, Sid};
 use crate::socket_loc::{self, SocketLocation};
 use crate::winutil::OwnedHandle;
 
@@ -84,41 +84,42 @@ pub fn current_socket_location() -> anyhow::Result<SocketLocation> {
     socket_location_of_token(own_token()?.0)
 }
 
-/// Create `loc.dir` and its `logs` folder if they are missing, and leave both exactly
-/// `{user, SYSTEM, Administrators}`, with ACEs the files made inside inherit.
-///
-/// Only the leaves are created: the parent (`AppData\Local`) must already exist, because a
-/// missing parent means there is no profile and inventing one would put a socket where no
-/// logon ever looks. An existing leaf is repaired only if it is a real directory (not a junction
-/// or symlink: hardening follows the path and would re-own whatever it points to) whose owner is
-/// the user, SYSTEM or Administrators; anything else is refused and left untouched. A directory
-/// this accepts is not thereby trusted: `Listener::bind` verifies it again before it binds.
-pub fn ensure_socket_dir(loc: &SocketLocation, user: &Sid) -> anyhow::Result<()> {
-    ensure_private_dir(&loc.dir, user)?;
-    ensure_private_dir(&loc.logs_dir(), user)
+/// The user's private folder and its `logs` folder, open by handle.
+pub struct SocketDir {
+    pub dir: DirHandle,
+    pub logs: DirHandle,
 }
 
-fn ensure_private_dir(dir: &std::path::Path, user: &Sid) -> anyhow::Result<()> {
-    match std::fs::create_dir(dir) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(e) => return Err(e).with_context(|| format!("create {}", dir.display())),
-    }
-    if let Some(problem) = acl::private_dir_problem(dir, user)? {
-        anyhow::bail!("{} cannot be used as the private folder: {problem}", dir.display());
-    }
-    // Already exactly right: leave it. Re-applying the DACL re-propagates it to the socket file,
-    // and the shim runs this on every connection while an agent serves.
-    if acl::verify_dir_acl(dir, user)? {
-        return Ok(());
-    }
-    acl::harden_dir(dir, user).with_context(|| format!("harden {}", dir.display()))?;
-    anyhow::ensure!(
-        acl::verify_dir_acl(dir, user).with_context(|| format!("verify the ACL of {}", dir.display()))?,
-        "the ACL of {} did not verify after hardening it",
-        dir.display()
-    );
-    Ok(())
+/// Make `loc.dir` and its `logs` folder if they are missing, leave both exactly
+/// `{user, SYSTEM, Administrators}` with ACEs the files made inside inherit, and return them open.
+///
+/// The folders are reached by handle from the profile directory (the administrator's: links in it
+/// are followed), each name opened relative to the handle above it, so a link at `AppData`,
+/// `Local`, `ssh-broker` or `logs` is refused instead of followed (see [`acl::open_dir`]). Only the
+/// two private folders are created: `AppData` and `Local` must already exist, because a missing one
+/// means there is no profile and inventing one would put a socket where no logon ever looks. A
+/// folder that exists is verified, never changed: one that is not a real directory with an owner in
+/// {user, SYSTEM, Administrators} and exactly the private ACL is refused and left as it is, and
+/// removing it makes it be created again. A folder this accepts is not thereby trusted:
+/// `Listener::bind` verifies it again before it binds.
+pub fn open_socket_dir(loc: &SocketLocation, user: &Sid) -> anyhow::Result<SocketDir> {
+    let profile = loc
+        .profile_dir()
+        .with_context(|| format!(r"{} is not <profile>\AppData\Local\ssh-broker", loc.dir.display()))?;
+    let make = || -> anyhow::Result<SocketDir> {
+        let root = acl::open_root(profile)?;
+        let app_data = acl::open_dir(&root, "AppData")?;
+        let local = acl::open_dir(&app_data, "Local")?;
+        let dir = acl::ensure_private_dir(&local, socket_loc::SOCKET_DIR_NAME, user)?;
+        let logs = acl::ensure_private_dir(&dir, socket_loc::LOGS_DIR_NAME, user)?;
+        Ok(SocketDir { dir, logs })
+    };
+    make().with_context(|| format!("make the private folder {}", loc.dir.display()))
+}
+
+/// [`open_socket_dir`] for a caller that only needs the folders to be there.
+pub fn ensure_socket_dir(loc: &SocketLocation, user: &Sid) -> anyhow::Result<()> {
+    open_socket_dir(loc, user).map(drop)
 }
 
 #[cfg(test)]

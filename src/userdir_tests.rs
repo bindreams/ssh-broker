@@ -183,8 +183,8 @@ fn ensure_socket_dir_is_idempotent() {
 }
 
 #[test]
-fn ensure_socket_dir_repairs_a_dir_widened_with_an_everyone_ace() {
-    let profile = TempProfile::new("repair");
+fn ensure_socket_dir_refuses_a_dir_widened_with_an_everyone_ace_and_leaves_it() {
+    let profile = TempProfile::new("widened");
     let loc = profile.location();
     ensure_socket_dir(&loc, &me()).unwrap();
     let status = std::process::Command::new("icacls")
@@ -194,9 +194,13 @@ fn ensure_socket_dir_repairs_a_dir_widened_with_an_everyone_ace() {
         .unwrap();
     assert!(status.success());
     assert!(!acl::verify_dir_acl(&loc.dir, &me()).unwrap(), "control: widened");
+    let before = crate::test_support::tree_state(&profile.0);
 
-    ensure_socket_dir(&loc, &me()).unwrap();
-    assert!(acl::verify_dir_acl(&loc.dir, &me()).unwrap());
+    let err = format!("{:#}", ensure_socket_dir(&loc, &me()).unwrap_err());
+
+    assert!(err.contains(&loc.dir.display().to_string()), "{err}");
+    assert!(err.contains("remove"), "{err}");
+    assert_eq!(crate::test_support::tree_state(&profile.0), before, "left as it was");
 }
 
 #[test]
@@ -300,8 +304,7 @@ use crate::test_support::{junction, tree_state};
 
 /// A stand-in for a folder the elevated token could re-own (the install directory is one): a real
 /// `ssh-broker` folder the user owns, not hardened, with a file inside, under `outside`'s
-/// `AppData\Local`. It passes `private_dir_problem`, which asks only for a real directory and an
-/// owner in {user, SYSTEM, Administrators}.
+/// `AppData\Local`.
 fn outside_folder(tag: &str) -> TempProfile {
     let outside = TempProfile::new(tag);
     let folder = outside.location().dir;
