@@ -203,15 +203,42 @@ fn a_name_that_is_not_one_component_is_refused() {
 }
 
 #[test]
-fn the_root_may_be_reached_through_a_link_and_the_walk_below_it_works() {
-    // The profile directory is the administrator's, opened following links; only what is below it
-    // is refused.
+fn a_link_above_the_profile_directory_is_followed_and_the_walk_below_it_works() {
+    // The folder of all profiles moved to another drive with a link is the administrator's doing.
+    let holder = TempProfile::new("above");
+    let profile = holder.0.join(r"users\p");
+    std::fs::create_dir_all(profile.join(r"AppData\Local")).unwrap();
+    let via = TempProfile::new("above-via");
+    let link = via.0.join("up");
+    junction(&link, &holder.0.join("users"));
+
+    walk(&link.join("p"), &me()).unwrap();
+
+    assert!(acl::verify_dir_acl(&profile.join(r"AppData\Local\ssh-broker"), &me()).unwrap());
+}
+
+#[test]
+fn the_profile_directory_being_a_link_itself_is_refused_with_it_named() {
+    // The user holds Full Control on their own profile directory, so a link there is theirs.
     let profile = TempProfile::new("root");
     let via = TempProfile::new("root-via");
-    let link = via.0.join("p");
-    junction(&link, &profile.0);
-    walk(&link, &me()).unwrap();
-    assert!(acl::verify_dir_acl(&profile.0.join(r"AppData\Local\ssh-broker"), &me()).unwrap());
+    let before = tree_state(&profile.0);
+    for symlinked in [false, true] {
+        let link = via.0.join(if symlinked { "s" } else { "j" });
+        if symlinked {
+            symlink_dir(&link, &profile.0);
+        } else {
+            junction(&link, &profile.0);
+        }
+
+        let err = format!("{:#}", walk(&link, &me()).err().expect("refused"));
+
+        assert!(err.contains(&link.display().to_string()), "{err}");
+        assert!(err.contains("profile directory"), "{err}");
+        assert!(err.contains("reparse point"), "{err}");
+        assert!(err.contains("ProfileImagePath"), "{err}");
+    }
+    assert_eq!(tree_state(&profile.0), before, "nothing was made behind the link");
 }
 
 #[test]

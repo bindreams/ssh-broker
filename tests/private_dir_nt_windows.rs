@@ -489,9 +489,11 @@ fn a_component_walk_with_open_reparse_point_finds_a_link_at_every_level_without_
 }
 
 #[test]
-fn a_root_handle_may_be_reached_through_a_junction_and_the_walk_below_it_still_works() {
-    // A profile directory the administrator relocated with a junction (`C:\Users\x` -> elsewhere) is
-    // the root of the walk and is opened following links; only what is below it is refused.
+fn a_root_opened_without_the_reparse_flag_follows_a_link_at_the_profile_directory_itself() {
+    // What the raw call does when the profile directory itself is a junction and the open does not
+    // ask for the link as itself: it follows it. `acl::open_root` therefore asks (`FILE_OPEN_REPARSE_POINT`)
+    // and refuses a link there; only links ABOVE the profile directory are followed, which the unit
+    // tests of `acl::private_dir` pin.
     let (profile, _outside) = profile_and_outside("rootlink");
     let via = Tree::new("rootlink-via");
     junction(&via.0.join("p"), &profile.profile());

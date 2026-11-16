@@ -101,11 +101,20 @@ impl DirHandle {
     }
 }
 
-/// Open `dir` (the administrator's: links in it are followed) as the root of a walk.
+/// Open the profile directory `dir` as the root of a walk. Links above it (the folder of all
+/// profiles moved to another drive) are the administrator's and are followed; `dir` itself is the
+/// user's, who holds Full Control on it, so a link there is refused like every component below it.
 pub fn open_root(dir: &Path) -> anyhow::Result<DirHandle> {
     let name = nt_path(dir)?;
-    let (status, handle) = open_nt(None, &name, DIR_ACCESS, FILE_DIRECTORY_FILE.0)?;
-    let handle = opened(status, handle, dir, "as the profile directory")?;
+    let purpose = "as the profile directory";
+    let (status, handle) = open_nt(
+        None,
+        &name,
+        DIR_ACCESS,
+        FILE_DIRECTORY_FILE.0 | FILE_OPEN_REPARSE_POINT.0,
+    )?;
+    let handle = opened(status, handle, dir, purpose)?;
+    refuse_link(&handle, dir, purpose, SET_THE_PROFILE_PATH)?;
     Ok(DirHandle {
         handle,
         path: dir.to_path_buf(),
@@ -124,7 +133,7 @@ pub fn open_dir(parent: &DirHandle, name: &str) -> anyhow::Result<DirHandle> {
         FILE_DIRECTORY_FILE.0 | FILE_OPEN_REPARSE_POINT.0,
     )?;
     let handle = opened(status, handle, &path, "on the way to the private folder")?;
-    refuse_link(&handle, &path, "on the way to the private folder")?;
+    refuse_link(&handle, &path, "on the way to the private folder", REMOVE_THE_LINK)?;
     Ok(DirHandle { handle, path })
 }
 
@@ -160,7 +169,7 @@ fn private_dir(parent: &DirHandle, name: &str, user: &Sid, create: bool) -> anyh
         descriptor.as_ref().map(|descriptor| descriptor.0),
     )?;
     let handle = opened(made.status, made.handle, &path, purpose)?;
-    refuse_link(&handle, &path, purpose)?;
+    refuse_link(&handle, &path, purpose, REMOVE_THE_LINK)?;
 
     let security = Security::from_handle(handle.0).with_context(|| format!("read the ACL of {}", path.display()))?;
     if !dir_policy_holds(&security, user)? {
@@ -198,7 +207,7 @@ pub fn open_existing_file(
         Err(e) if e.is::<Missing>() => return Ok(None),
         Err(e) => return Err(e),
     };
-    refuse_link(&handle, &path, "as a file of the private folder")?;
+    refuse_link(&handle, &path, "as a file of the private folder", REMOVE_THE_LINK)?;
     Ok(Some(into_file(handle)))
 }
 
@@ -216,7 +225,7 @@ pub fn open_log_file(dir: &DirHandle, name: &str) -> anyhow::Result<std::fs::Fil
         None,
     )?;
     let handle = opened(made.status, made.handle, &path, "as a log file")?;
-    refuse_link(&handle, &path, "as a log file")?;
+    refuse_link(&handle, &path, "as a log file", REMOVE_THE_LINK)?;
     Ok(into_file(handle))
 }
 
@@ -299,14 +308,21 @@ fn opened(status: NTSTATUS, handle: HANDLE, path: &Path, purpose: &str) -> anyho
     Err(status_error(status)).with_context(|| format!("open {}", path.display()))
 }
 
-/// Refuse `handle` if it is a link. It was opened as itself (`FILE_OPEN_REPARSE_POINT`), so this
-/// is the object at the name and not what the name leads to.
-fn refuse_link(handle: &OwnedHandle, path: &Path, purpose: &str) -> anyhow::Result<()> {
+/// What a refused link says to do, for a name below the profile directory.
+const REMOVE_THE_LINK: &str = "remove the link so that the name is a real folder";
+
+/// What a refused link says to do, for the profile directory itself.
+const SET_THE_PROFILE_PATH: &str =
+    "give the account its real profile directory (set ProfileImagePath to it) instead of a link";
+
+/// Refuse `handle` if it is a link; `remedy` says what to do about it. It was opened as itself
+/// (`FILE_OPEN_REPARSE_POINT`), so this is the object at the name and not what the name leads to.
+fn refuse_link(handle: &OwnedHandle, path: &Path, purpose: &str, remedy: &str) -> anyhow::Result<()> {
     let attributes = file_attributes(handle.0).with_context(|| format!("read the attributes of {}", path.display()))?;
     if attributes & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
         return Err(Refused(format!(
             "{} cannot be used {purpose}: it is a reparse point (junction or symlink). Nothing is read or written \
-             through it; remove the link so that the name is a real folder",
+             through it; {remedy}",
             path.display()
         ))
         .into());
