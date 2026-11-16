@@ -333,6 +333,54 @@ fn a_symlink_named_like_the_log_is_refused_and_its_target_is_untouched() {
 }
 
 #[test]
+fn a_hard_link_named_like_the_log_is_refused_and_the_other_file_is_untouched() {
+    let profile = TempProfile::new("loghard");
+    let (_, logs) = made(&profile);
+    let victim = profile.0.join("victim.txt");
+    std::fs::write(&victim, "keep").unwrap();
+    let name = logs.path().join("shim.log.2026-01-04");
+    std::fs::hard_link(&victim, &name).unwrap();
+
+    let err = open_log_file(&logs, "shim.log.2026-01-04").err().unwrap();
+
+    assert!(err.is::<Refused>(), "{err:#}");
+    let text = format!("{err:#}");
+    assert!(text.contains(&name.display().to_string()), "{text}");
+    assert!(text.contains("hard link"), "{text}");
+    assert!(text.contains("remove"), "the remedy: {text}");
+    assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep");
+}
+
+#[test]
+fn a_log_file_that_is_there_with_one_name_is_appended_to_and_one_made_by_the_call_is_the_folders_own() {
+    let profile = TempProfile::new("logone");
+    let (_, logs) = made(&profile);
+    let name = logs.path().join("shim.log.2026-01-05");
+    std::fs::write(
+        &name, "old
+",
+    )
+    .unwrap();
+
+    open_log_file(&logs, "shim.log.2026-01-05")
+        .unwrap()
+        .write_all(
+            b"new
+",
+        )
+        .unwrap();
+    open_log_file(&logs, "shim.log.2026-01-06").unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(&name).unwrap(),
+        "old
+new
+"
+    );
+    assert!(logs.path().join("shim.log.2026-01-06").is_file());
+}
+
+#[test]
 fn a_directory_named_like_the_log_is_refused() {
     let profile = TempProfile::new("logdir");
     let (_, logs) = made(&profile);
@@ -382,6 +430,22 @@ fn a_symlink_named_like_an_existing_file_is_refused_and_its_target_is_untouched(
 
     assert!(err.contains(&name.display().to_string()), "{err}");
     assert!(err.contains("reparse point"), "{err}");
+    assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep");
+}
+
+#[test]
+fn a_hard_link_named_like_an_existing_file_is_refused_and_the_other_file_is_untouched() {
+    let profile = TempProfile::new("exfhard");
+    let (broker, _) = made(&profile);
+    let victim = profile.0.join("victim.txt");
+    std::fs::write(&victim, "keep").unwrap();
+    let name = broker.path().join("agent.lock");
+    std::fs::hard_link(&victim, &name).unwrap();
+
+    let err = open_existing_file(&broker, "agent.lock", READ_WRITE).err().unwrap();
+
+    assert!(err.is::<Refused>(), "{err:#}");
+    assert!(format!("{err:#}").contains("hard link"), "{err:#}");
     assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep");
 }
 

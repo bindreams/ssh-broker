@@ -40,7 +40,8 @@ use windows::Win32::System::Threading::GetCurrentProcess;
 
 use super::{
     Made, OpenOutcome, OwnerAclWords, Security, Sid, classify_open, denied_problem, describe_sid, descriptor_from_sddl,
-    dir_policy, file_attributes, nt_create, nt_path, owner_acl_problem, private_dir_dacl_sddl, status_error,
+    dir_policy, file_attributes, file_information, nt_create, nt_path, owner_acl_problem, private_dir_dacl_sddl,
+    status_error,
 };
 use crate::winutil::OwnedHandle;
 
@@ -117,6 +118,9 @@ struct Request<'a> {
     disposition: NTCREATEFILE_CREATE_DISPOSITION,
     options: u32,
     descriptor: Option<PSECURITY_DESCRIPTOR>,
+    /// A file that was there must have this name only: another name for it elsewhere would make
+    /// what is written through this one land in a file that is not the folder's own.
+    sole_name: bool,
 }
 
 impl<'a> Request<'a> {
@@ -130,6 +134,7 @@ impl<'a> Request<'a> {
             disposition: FILE_OPEN,
             options: FILE_DIRECTORY_FILE.0 | FILE_OPEN_REPARSE_POINT.0,
             descriptor: None,
+            sole_name: false,
         }
     }
 
@@ -140,6 +145,7 @@ impl<'a> Request<'a> {
             access: access | SYNCHRONIZE.0 | FILE_READ_ATTRIBUTES.0,
             disposition,
             options: FILE_NON_DIRECTORY_FILE.0 | FILE_SYNCHRONOUS_IO_NONALERT.0 | FILE_OPEN_REPARSE_POINT.0,
+            sole_name: true,
             ..Request::directory(purpose, MADE_AGAIN)
         }
     }
@@ -240,7 +246,8 @@ fn private_dir(parent: &DirHandle, name: &str, user: &Sid, create: bool) -> anyh
 }
 
 /// Open the file `name` under `dir` if it exists, with `access`. Looking never creates: a missing
-/// name is `None`. A link is refused, so the file is this folder's own.
+/// name is `None`. A link, or a file with another name elsewhere, is refused, so the file is this
+/// folder's own.
 pub fn open_existing_file(
     dir: &DirHandle,
     name: &str,
@@ -254,8 +261,8 @@ pub fn open_existing_file(
     }
 }
 
-/// Open or create the file `name` under `dir` for appending. A link is refused, so the file written
-/// is this folder's own.
+/// Open or create the file `name` under `dir` for appending. A link, or a file that was there with
+/// another name elsewhere, is refused, so the file written is this folder's own.
 pub fn open_log_file(dir: &DirHandle, name: &str) -> anyhow::Result<std::fs::File> {
     let request = Request::file("as a log file", FILE_APPEND_DATA.0, FILE_OPEN_IF);
     let (handle, _) = open_child(dir, name, &request)?;
@@ -293,8 +300,12 @@ fn open_child(parent: &DirHandle, name: &str, request: &Request) -> anyhow::Resu
         request.options,
         request.descriptor,
     )?;
+    let created = made.created;
     let handle = judge(made, &path, request)?;
     refuse_link(&handle, &path, request.purpose)?;
+    if request.sole_name && !created {
+        refuse_other_names(&handle, &path, request.purpose)?;
+    }
     Ok((handle, path))
 }
 
@@ -345,6 +356,22 @@ fn refuse_link(handle: &OwnedHandle, path: &Path, purpose: &str) -> anyhow::Resu
         return Err(Refused(format!(
             "{} cannot be used {purpose}: it is a reparse point (junction or symlink). Nothing is read or written \
              through it; {REMOVE_THE_LINK}",
+            path.display()
+        ))
+        .into());
+    }
+    Ok(())
+}
+
+/// Refuse `handle` if the file has another name: a hard link. A file this call made has one, and
+/// whoever adds a name to it afterwards has only reached the folder's own file.
+fn refuse_other_names(handle: &OwnedHandle, path: &Path, purpose: &str) -> anyhow::Result<()> {
+    let links = file_information(handle.0)
+        .with_context(|| format!("read the attributes of {}", path.display()))?
+        .nNumberOfLinks;
+    if links > 1 {
+        return Err(Refused(format!(
+            "{} cannot be used {purpose}: it has {links} names, so it is a hard link to a file that is not this              folder's own. Nothing is read or written through it; remove it so that the name is a file of this              folder",
             path.display()
         ))
         .into());

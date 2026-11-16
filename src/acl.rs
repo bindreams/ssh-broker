@@ -58,6 +58,7 @@ use windows::Win32::Storage::FileSystem::{
 };
 use windows::Win32::System::IO::IO_STATUS_BLOCK;
 use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+use windows::Win32::System::WindowsProgramming::FILE_CREATED;
 use windows::core::{BOOL, HRESULT, PCWSTR, PWSTR};
 
 use crate::winutil::OwnedHandle;
@@ -612,6 +613,8 @@ fn open_for_inspection(dir: &Path) -> anyhow::Result<Option<OwnedHandle>> {
 struct Made {
     status: NTSTATUS,
     handle: HANDLE,
+    /// The call made the object: it did not exist.
+    created: bool,
 }
 
 /// `NtCreateFile` of `name` (UTF-16, no terminator): an NT path when `root` is `None`, else one name
@@ -646,7 +649,11 @@ fn nt_create(
             )
         }
     })?;
-    Ok(Made { status, handle })
+    Ok(Made {
+        status,
+        handle,
+        created: io.Information == FILE_CREATED as usize,
+    })
 }
 
 /// Run `call` with the `OBJECT_ATTRIBUTES` that name `name` (UTF-16, no terminator) under `root`, or
@@ -687,13 +694,17 @@ fn descriptor_from_sddl(sddl: &str) -> anyhow::Result<LocalSd> {
     Ok(LocalSd(psd))
 }
 
-/// The file attributes of the object `handle` names (`FILE_ATTRIBUTE_*`), which needs
-/// `FILE_READ_ATTRIBUTES`.
-fn file_attributes(handle: HANDLE) -> anyhow::Result<u32> {
+/// What the object `handle` names says about itself, which needs `FILE_READ_ATTRIBUTES`.
+fn file_information(handle: HANDLE) -> anyhow::Result<BY_HANDLE_FILE_INFORMATION> {
     let mut info = BY_HANDLE_FILE_INFORMATION::default();
     // SAFETY: a valid handle and an out-pointer to a local.
     unsafe { GetFileInformationByHandle(handle, &mut info) }.context("read the attributes")?;
-    Ok(info.dwFileAttributes)
+    Ok(info)
+}
+
+/// The file attributes of the object `handle` names (`FILE_ATTRIBUTE_*`).
+fn file_attributes(handle: HANDLE) -> anyhow::Result<u32> {
+    Ok(file_information(handle)?.dwFileAttributes)
 }
 
 /// The Windows error an NT status stands for.
