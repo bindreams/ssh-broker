@@ -158,10 +158,7 @@ fn connect_failure_in_the_callers_own_dir_fails_open_without_a_reason_on_stderr(
     // A location that resolves but has no agent behind it: the old behaviour, message unchanged.
     let dir = std::env::temp_dir().join(format!("sb-shim-noagent-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    let location = SocketLocation {
-        path: dir.join("agent.sock"),
-        dir: dir.clone(),
-    };
+    let location = crate::test_support::location_in(&dir);
     let mut stderr = Vec::new();
     let relayed = super::try_relay_at(
         Ok(location),
@@ -187,10 +184,7 @@ fn connect_failure_in_pty_mode_writes_nothing_to_stderr() {
     // relay may yet use, so the reason goes to the log only.
     let dir = std::env::temp_dir().join(format!("sb-shim-noagent-pty-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    let location = SocketLocation {
-        path: dir.join("agent.sock"),
-        dir: dir.clone(),
-    };
+    let location = crate::test_support::location_in(&dir);
     let mut stderr = Vec::new();
     let relayed = super::try_relay_at(Ok(location), &None, &mut stderr, None, std::io::empty(), &mut NoRescue).unwrap();
 
@@ -233,7 +227,7 @@ fn try_relay_connects_to_the_location_its_provider_names() {
     let profile = crate::test_support::TempProfile::new("shim-wiring");
     let location = profile.location();
     crate::userdir::ensure_socket_dir(&location, &crate::acl::Sid::current_user().unwrap()).unwrap();
-    let listener = Listener::bind(&location.path).unwrap();
+    let listener = Listener::bind(location.path()).unwrap();
     let agent = fake_agent_exiting_with(listener, 7);
 
     let relayed = super::try_relay(
@@ -259,10 +253,7 @@ fn try_relay_connects_to_the_location_its_provider_names() {
 fn a_failed_log_is_named_where_the_shim_already_explains_a_fallback_for_a_command() {
     let dir = std::env::temp_dir().join(format!("sb-shim-nolog-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    let location = SocketLocation {
-        path: dir.join("agent.sock"),
-        dir: dir.clone(),
-    };
+    let location = crate::test_support::location_in(&dir);
     let mut stderr = Vec::new();
     let cause = "the folder belongs to someone else";
     let relayed = super::try_relay_at(
@@ -288,10 +279,7 @@ fn a_failed_log_adds_nothing_to_an_interactive_fallback_that_prints_nothing_toda
     // may yet use); a missing log does not change that.
     let dir = std::env::temp_dir().join(format!("sb-shim-nolog-pty-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    let location = SocketLocation {
-        path: dir.join("agent.sock"),
-        dir: dir.clone(),
-    };
+    let location = crate::test_support::location_in(&dir);
     let mut stderr = Vec::new();
     let relayed = super::try_relay_at(
         Ok(location),
@@ -315,7 +303,7 @@ fn a_failed_log_does_not_touch_the_stderr_of_a_relayed_command() {
     let profile = crate::test_support::TempProfile::new("shim-nolog-relay");
     let location = profile.location();
     crate::userdir::ensure_socket_dir(&location, &crate::acl::Sid::current_user().unwrap()).unwrap();
-    let agent = fake_agent_exiting_with(Listener::bind(&location.path).unwrap(), 0);
+    let agent = fake_agent_exiting_with(Listener::bind(location.path()).unwrap(), 0);
     let mut stderr = Vec::new();
 
     let relayed = super::try_relay_at(
@@ -430,7 +418,7 @@ fn a_rescue_is_not_asked_when_the_connect_succeeds() {
     let profile = crate::test_support::TempProfile::new("rescue-never");
     let location = profile.location();
     crate::userdir::ensure_socket_dir(&location, &crate::acl::Sid::current_user().unwrap()).unwrap();
-    let agent = fake_agent_exiting_with(Listener::bind(&location.path).unwrap(), 5);
+    let agent = fake_agent_exiting_with(Listener::bind(location.path()).unwrap(), 5);
 
     let relayed = super::try_relay_at(
         Ok(location),
@@ -454,8 +442,8 @@ fn a_rescue_that_connects_gets_the_session_relayed_through_its_connection() {
     let served = crate::test_support::TempProfile::new("rescue-served");
     let at = served.location();
     crate::userdir::ensure_socket_dir(&at, &crate::acl::Sid::current_user().unwrap()).unwrap();
-    let agent = fake_agent_exiting_with(Listener::bind(&at.path).unwrap(), 9);
-    let socket = crate::afunix::connect(&at.path).unwrap();
+    let agent = fake_agent_exiting_with(Listener::bind(at.path()).unwrap(), 9);
+    let socket = crate::afunix::connect(at.path()).unwrap();
     let mut rescue = Scripted::answering(Rescued::Connected { socket, modes: None });
 
     let relayed = super::try_relay_at(
@@ -511,7 +499,7 @@ fn location_with_listener(
     let profile = crate::test_support::TempProfile::new(tag);
     let location = profile.location();
     crate::userdir::ensure_socket_dir(&location, &crate::acl::Sid::current_user().unwrap()).unwrap();
-    let listener = crate::afunix::Listener::bind(&location.path).unwrap();
+    let listener = crate::afunix::Listener::bind(location.path()).unwrap();
     (profile, location, listener)
 }
 
@@ -563,7 +551,7 @@ fn a_command_is_never_sent_to_an_agent_a_second_time() {
     use crate::protocol::{ExitCode, FrameKind, FrameReader, read_one_frame, write_frame};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     let (_profile, location, listener) = location_with_listener("never-twice");
-    let socket = location.path.clone();
+    let socket = location.path().to_path_buf();
     let stop = std::sync::Arc::new(AtomicBool::new(false));
     let connections = std::sync::Arc::new(AtomicUsize::new(0));
     let agent = std::thread::spawn({
@@ -711,7 +699,7 @@ fn a_second_connection_that_ends_without_a_byte_is_a_protocol_violation_not_a_re
     // closes, so the connect after that fails or reaches an agent that answers. This one is still
     // there and hangs up again.
     let (_profile, location, listener) = location_with_listener("hangup-twice");
-    let socket = location.path.clone();
+    let socket = location.path().to_path_buf();
     let (finished, agent) = agent_that_always_hangs_up(listener, 2);
     let mut stderr = Vec::new();
     let mut attempts = 0;
@@ -769,8 +757,8 @@ fn a_no_byte_close_before_and_after_a_connect_that_failed_are_not_consecutive() 
     let served = crate::test_support::TempProfile::new("hu-served");
     let at = served.location();
     crate::userdir::ensure_socket_dir(&at, &crate::acl::Sid::current_user().unwrap()).unwrap();
-    let (finished, second) = agent_that_always_hangs_up(Listener::bind(&at.path).unwrap(), 1);
-    let socket = crate::afunix::connect(&at.path).unwrap();
+    let (finished, second) = agent_that_always_hangs_up(Listener::bind(at.path()).unwrap(), 1);
+    let socket = crate::afunix::connect(at.path()).unwrap();
     let mut rescue = Answers([Rescued::Connected { socket, modes: None }, Rescued::Plain].into());
     let mut attempts = 0;
 

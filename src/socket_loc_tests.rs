@@ -22,6 +22,16 @@ fn for_profile_puts_the_socket_in_appdata_local_ssh_broker() {
 }
 
 #[test]
+fn the_folder_is_the_profile_walked_through_the_named_folders_and_the_private_one() {
+    let loc = for_profile(&profile("a")).unwrap();
+    let mut walked = loc.profile_dir().to_path_buf();
+    for name in FOLDERS_IN_PROFILE.iter().chain(&[SOCKET_DIR_NAME]) {
+        walked.push(name);
+    }
+    assert_eq!(loc.dir(), walked);
+}
+
+#[test]
 fn lock_and_logs_live_inside_the_socket_dir() {
     let loc = for_profile(&profile("a")).unwrap();
     assert_eq!(loc.lock_path(), loc.dir.join("agent.lock"));
@@ -109,4 +119,10 @@ fn different_profiles_never_share_a_socket() {
     let b = for_profile(&profile("b")).unwrap();
     assert_ne!(a.dir, b.dir);
     assert_ne!(a.path, b.path);
+}
+
+#[test]
+fn the_location_keeps_the_profile_it_was_made_from() {
+    let profile = profile("a");
+    assert_eq!(for_profile(&profile).unwrap().profile_dir(), profile.as_path());
 }

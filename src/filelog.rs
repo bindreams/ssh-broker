@@ -1,4 +1,4 @@
-//! filelog: the rolling log file the shim and the agent write into the user's own folder.
+//! filelog: the daily log file the shim and the agent write into the user's own folder.
 //!
 //! The folder is `<profile>\AppData\Local\ssh-broker\logs`, inside the same private directory as
 //! the socket, so a log is readable and writable by exactly the account that produced it (and
@@ -8,28 +8,23 @@
 //! a full disk). Every setup function returns the cause; whether the caller can say it, and where,
 //! is the caller's to decide, because a PTY stream must not be written to.
 
-use std::path::Path;
-
 use anyhow::Context;
 use tracing_appender::non_blocking::{NonBlocking, WorkerGuard};
 
-use crate::acl::Sid;
+use crate::acl::{DirHandle, Sid};
 use crate::socket_loc::SocketLocation;
+
+mod daily;
 
 /// A log file writer and the guard that flushes it.
 type Sink = (NonBlocking, WorkerGuard);
 
-/// Open the rolling file log in `dir`, named `<prefix>.<date>`, without installing it.
-fn open_in(dir: &Path, prefix: &str) -> anyhow::Result<Sink> {
-    std::fs::create_dir_all(dir).with_context(|| format!("create the log folder {}", dir.display()))?;
-    // `rolling::daily` panics when the first log file cannot be created; the builder returns the
-    // error instead.
-    let appender = tracing_appender::rolling::RollingFileAppender::builder()
-        .rotation(tracing_appender::rolling::Rotation::DAILY)
-        .filename_prefix(prefix)
-        .build(dir)
-        .with_context(|| format!("create the log file {prefix} in {}", dir.display()))?;
-    Ok(tracing_appender::non_blocking(appender))
+/// Open the daily file log in `dir`, named `<prefix>.<date>`, without installing it. The folder
+/// is the handle's: the files are opened under it and never by a path.
+fn open_in(dir: &DirHandle, prefix: &str) -> anyhow::Result<Sink> {
+    let log = daily::daily(dir.try_clone()?, prefix)
+        .with_context(|| format!("create the log file {prefix} in {}", dir.path().display()))?;
+    Ok(tracing_appender::non_blocking(log))
 }
 
 /// Make `sink` the process's log.
@@ -42,27 +37,40 @@ fn install((writer, guard): Sink) -> anyhow::Result<WorkerGuard> {
     Ok(guard)
 }
 
-/// Initialise a rolling file log in `dir`, named `<prefix>.<date>`. NEVER logs to stdout/stderr,
+/// Initialise a daily file log in `dir`, named `<prefix>.<date>`. NEVER logs to stdout/stderr,
 /// which would corrupt a PTY stream. Keep the guard alive until the process exits: dropping it
 /// shuts the writer down and later lines are discarded. The error says why there is no log; the
 /// caller carries on without one.
-pub fn init_in(dir: &Path, prefix: &str) -> anyhow::Result<WorkerGuard> {
+pub fn init_in(dir: &DirHandle, prefix: &str) -> anyhow::Result<WorkerGuard> {
     install(open_in(dir, prefix)?)
 }
 
-fn open_for_location(loc: &SocketLocation, user: &Sid, prefix: &str) -> anyhow::Result<Sink> {
-    crate::userdir::ensure_socket_dir(loc, user)?;
-    open_in(&loc.logs_dir(), prefix)
+/// Why a log could not be set up. Its text is the cause's, whole.
+#[derive(Debug, thiserror::Error)]
+#[error("{cause:#}")]
+pub struct NoLog {
+    pub cause: anyhow::Error,
+}
+
+impl From<anyhow::Error> for NoLog {
+    fn from(cause: anyhow::Error) -> NoLog {
+        NoLog { cause }
+    }
+}
+
+fn open_for_location(loc: &SocketLocation, user: &Sid, prefix: &str) -> Result<Sink, NoLog> {
+    let folders = crate::userdir::open_socket_dir(loc, user)?;
+    Ok(open_in(&folders.logs?, prefix)?)
 }
 
 /// Log into the logs folder of `loc`, making the private folder first if it is missing. The error
 /// says why not: no profile, a link in the way, a foreign owner.
-pub fn init_for_location(loc: &SocketLocation, user: &Sid, prefix: &str) -> anyhow::Result<WorkerGuard> {
-    install(open_for_location(loc, user, prefix)?)
+pub fn init_for_location(loc: &SocketLocation, user: &Sid, prefix: &str) -> Result<WorkerGuard, NoLog> {
+    Ok(install(open_for_location(loc, user, prefix)?)?)
 }
 
 /// [`init_for_location`] for the account this process runs as.
-pub fn init_for_current_user(prefix: &str) -> anyhow::Result<WorkerGuard> {
+pub fn init_for_current_user(prefix: &str) -> Result<WorkerGuard, NoLog> {
     let loc = crate::userdir::current_socket_location()?;
     init_for_location(&loc, &Sid::current_user()?, prefix)
 }

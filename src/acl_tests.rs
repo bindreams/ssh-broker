@@ -2,6 +2,10 @@
 //! they run on a real Windows host via the cross-compile -> scp -> run loop and fail loudly if the
 //! ACL primitives are broken (no skip-on-missing).
 use super::*;
+use windows::Win32::Security::Authorization::SetNamedSecurityInfoW;
+use windows::Win32::Security::{
+    GetSecurityDescriptorDacl, GetSecurityDescriptorOwner, PROTECTED_DACL_SECURITY_INFORMATION,
+};
 
 #[test]
 fn current_user_sid_is_the_one_whoami_reports() {
@@ -141,8 +145,8 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use windows::Win32::Foundation::{
-    ERROR_SUCCESS, GetLastError, LUID, STATUS_OBJECT_NAME_NOT_FOUND, STATUS_OBJECT_PATH_NOT_FOUND,
-    STATUS_SHARING_VIOLATION, STATUS_SUCCESS,
+    ERROR_SUCCESS, GetLastError, LUID, STATUS_NOT_A_DIRECTORY, STATUS_OBJECT_NAME_NOT_FOUND,
+    STATUS_OBJECT_PATH_NOT_FOUND, STATUS_SHARING_VIOLATION, STATUS_SUCCESS,
 };
 use windows::Win32::Security::{
     AdjustTokenPrivileges, DuplicateTokenEx, LUID_AND_ATTRIBUTES, LookupPrivilegeValueW, SE_PRIVILEGE_ENABLED,
@@ -665,16 +669,17 @@ fn install_dir_problem_is_reported_for_a_dir_denying_everyone_write() {
 }
 
 #[test]
-fn an_inspection_open_maps_each_status_to_one_outcome() {
+fn an_open_maps_each_status_to_one_outcome() {
     assert_eq!(classify_open(STATUS_SUCCESS), OpenOutcome::Opened);
     assert_eq!(classify_open(STATUS_ACCESS_DENIED), OpenOutcome::Denied);
-    for status in [
-        STATUS_OBJECT_NAME_NOT_FOUND,
-        STATUS_SHARING_VIOLATION,
-        STATUS_OBJECT_PATH_NOT_FOUND,
-    ] {
-        assert_eq!(classify_open(status), OpenOutcome::Failed(status));
+    assert_eq!(classify_open(STATUS_NOT_A_DIRECTORY), OpenOutcome::NotADirectory);
+    for status in [STATUS_OBJECT_NAME_NOT_FOUND, STATUS_OBJECT_PATH_NOT_FOUND] {
+        assert_eq!(classify_open(status), OpenOutcome::Missing);
     }
+    assert_eq!(
+        classify_open(STATUS_SHARING_VIOLATION),
+        OpenOutcome::Failed(STATUS_SHARING_VIOLATION)
+    );
 }
 
 #[test]
@@ -740,6 +745,94 @@ fn install_dir_problem_says_so_when_the_acl_cannot_be_read() {
     let problem = problem.unwrap().expect("an unreadable ACL is a problem");
     assert!(problem.contains("denied access to read its ACL"), "{problem}");
     assert!(ensured.is_err());
+}
+
+/// The same folder as above, as the private folder of a user: the refusal says that this process may
+/// not read its security, not that the owner or the ACL is wrong, and ends with the remedy.
+#[test]
+fn ensure_private_dir_says_so_when_the_folders_security_cannot_be_read() {
+    let parent = TempPath::new("priv-no-read");
+    let me_sid = Sid::current_user().unwrap();
+    let me = me_sid.to_sddl().unwrap();
+    std::fs::create_dir_all(parent.0.join("ssh-broker")).unwrap();
+    set_security(
+        &parent.0.join("ssh-broker"),
+        &format!("O:{me}D:P(D;;RC;;;WD)(A;;;;;OW)(A;;0x10001;;;{me})"),
+    );
+    let root = open_root(&parent.0).unwrap();
+
+    let err = without_privileges(|| ensure_private_dir(&root, "ssh-broker", &me_sid).err().expect("refused"));
+
+    assert!(err.is::<Refused>(), "{err:#}");
+    let text = format!("{err:#}");
+    assert!(text.contains("denied access to read its ACL"), "{text}");
+    assert!(text.contains("remove"), "{text}");
+    assert!(!text.contains("its owner is"), "{text}");
+    assert!(
+        text.contains("may not make it"),
+        "the creating path says what else may be wrong: {text}"
+    );
+
+    let err = without_privileges(|| open_private_dir(&root, "ssh-broker", &me_sid).err().expect("refused"));
+    let text = format!("{err:#}");
+    assert!(text.contains("denied access to read its ACL"), "{text}");
+    assert!(!text.contains("make"), "a look never makes anything: {text}");
+}
+
+/// A component of the profile that this process may not open is a system error of the walk, not a
+/// refusal and not a missing name: the shim shows every one of them (`shim_offer::refusal_of`).
+#[test]
+fn a_profile_folder_that_cannot_be_opened_is_a_system_error_naming_it() {
+    let parent = TempPath::new("walk-denied");
+    let me_sid = Sid::current_user().unwrap();
+    let me = me_sid.to_sddl().unwrap();
+    std::fs::create_dir_all(parent.0.join("Local")).unwrap();
+    set_security(
+        &parent.0.join("Local"),
+        &format!("O:{me}D:P(D;;RC;;;WD)(A;;;;;OW)(A;;0x10001;;;{me})"),
+    );
+    let root = open_root(&parent.0).unwrap();
+
+    let err = without_privileges(|| open_dir(&root, "Local").err().expect("denied"));
+
+    assert!(!err.is::<Refused>() && !err.is::<Missing>(), "{err:#}");
+    let text = format!("{err:#}");
+    assert!(text.contains(&parent.0.join("Local").display().to_string()), "{text}");
+    assert!(text.to_lowercase().contains("denied"), "{text}");
+}
+
+#[test]
+fn the_owner_and_the_acl_are_blamed_separately_with_the_wording_of_each_kind_of_object() {
+    for (owner_set, acl_is) in [
+        ("the Administrators group", "the hardened one"),
+        ("SYSTEM or Administrators", "exactly SYSTEM and Administrators"),
+    ] {
+        let problem = |owner_ok, acl_ok| {
+            owner_acl_problem(owner_ok, acl_ok, || OwnerAclWords {
+                owner: "X".into(),
+                owner_set: owner_set.into(),
+                acl_is: acl_is.into(),
+            })
+        };
+        assert_eq!(problem(true, true), None);
+        let owner = problem(false, true).unwrap();
+        assert_eq!(owner, format!("its owner is X, not {owner_set}"));
+        let acl = problem(true, false).unwrap();
+        assert_eq!(acl, format!("its ACL is not {acl_is} (its owner, X, is fine)"));
+        let both = problem(false, false).unwrap();
+        assert_eq!(
+            both,
+            format!("its owner is X, not {owner_set}, and its ACL is not {acl_is}")
+        );
+    }
+}
+
+#[test]
+fn nothing_is_looked_up_to_judge_an_owner_and_an_acl_that_are_right() {
+    // Naming an owner or a user is an account lookup, which can block on a domain controller; only a
+    // refusal needs the names.
+    let words = || -> OwnerAclWords { panic!("the words of a refusal were built for an object that is fine") };
+    assert_eq!(owner_acl_problem(true, true, words), None);
 }
 
 #[test]
@@ -886,66 +979,38 @@ fn the_file_policy_accepts_the_inherited_set_and_rejects_every_deviation() {
     );
 }
 
-// The leaf of a per-user directory is inspected without being followed ---------------------
-
+/// Elevated (CI only): a folder whose ACL is exactly the private one but whose owner is outside
+/// {user, SYSTEM, Administrators} is refused and left as it is.
 #[test]
-fn private_dir_problem_is_none_for_a_real_directory_this_user_owns() {
-    let dir = TempPath::new("problem-none");
-    std::fs::create_dir(&dir.0).unwrap();
-    let me = Sid::current_user().unwrap();
-    assert_eq!(private_dir_problem(&dir.0, &me).unwrap(), None);
-}
-
-#[test]
-fn private_dir_problem_refuses_a_junction_and_names_it() {
-    let target = TempPath::new("problem-junction-target");
-    std::fs::create_dir(&target.0).unwrap();
-    let link = TempPath::new("problem-junction");
-    let out = Command::new("cmd")
-        .args(["/C", "mklink", "/J"])
-        .arg(&link.0)
-        .arg(&target.0)
-        .output()
-        .expect("run mklink");
-    assert!(
-        out.status.success(),
-        "mklink /J failed: {}",
-        String::from_utf8_lossy(&out.stdout)
-    );
-
-    let me = Sid::current_user().unwrap();
-    let problem = private_dir_problem(&link.0, &me)
-        .unwrap()
-        .expect("a junction is refused");
-    assert!(problem.contains("reparse point"), "{problem}");
-
-    std::fs::remove_dir(&link.0).unwrap();
-}
-
-#[test]
-fn private_dir_problem_refuses_a_regular_file() {
-    let path = TempPath::new("problem-file");
-    std::fs::write(&path.0, "x").unwrap();
-    let me = Sid::current_user().unwrap();
-    let problem = private_dir_problem(&path.0, &me).unwrap().expect("a file is refused");
-    assert!(problem.contains("not a directory"), "{problem}");
-    std::fs::remove_file(&path.0).unwrap();
-}
-
-/// Elevated (CI only): setting an owner other than the caller's needs SeRestorePrivilege.
-#[test]
-fn private_dir_problem_refuses_an_owner_outside_user_system_administrators() {
-    let dir = TempPath::new("problem-owner");
-    std::fs::create_dir(&dir.0).unwrap();
+fn ensure_private_dir_refuses_a_foreign_owner_and_leaves_the_folder() {
+    let parent = TempPath::new("ensure-owner");
+    std::fs::create_dir(&parent.0).unwrap();
+    let dir = parent.0.join("d");
+    std::fs::create_dir(&dir).unwrap();
     enable_restore_privilege();
     let me = Sid::current_user().unwrap();
+    let private_with_owner =
+        |owner: &Sid| format!("O:{}{}", owner.to_sddl().unwrap(), private_dir_dacl_sddl(&me).unwrap());
+    let handle = open_root(&parent.0).unwrap();
 
-    set_install_policy(&dir.0, &Sid::well_known(WellKnown::Users).unwrap());
-    let problem = private_dir_problem(&dir.0, &me)
-        .unwrap()
-        .expect("a Users owner is refused");
-    assert!(problem.contains("owner"), "{problem}");
+    set_security(&dir, &private_with_owner(&Sid::well_known(WellKnown::Users).unwrap()));
+    let owner_of = |path: &Path| {
+        let security = Security::from_path(path).unwrap();
+        describe_sid(security.owner)
+    };
+    let before = owner_of(&dir);
+    let err = format!(
+        "{:#}",
+        ensure_private_dir(&handle, "d", &me)
+            .err()
+            .expect("a Users owner is refused")
+    );
+    assert!(err.contains("owner"), "{err}");
+    assert_eq!(owner_of(&dir), before, "left as it was");
 
-    set_install_policy(&dir.0, &Sid::well_known(WellKnown::Administrators).unwrap());
-    assert_eq!(private_dir_problem(&dir.0, &me).unwrap(), None, "control");
+    set_security(
+        &dir,
+        &private_with_owner(&Sid::well_known(WellKnown::Administrators).unwrap()),
+    );
+    ensure_private_dir(&handle, "d", &me).expect("control: an Administrators owner is accepted");
 }

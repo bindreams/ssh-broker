@@ -40,6 +40,10 @@ pub enum Plan {
     Notice { user: String },
     /// A terminal and no command: run the offer.
     Offer { account: LocalAccount, absence: Absence },
+    /// The user's folder cannot be used (`cause` says what failed and, for a refusal, what to do), so
+    /// no agent can serve it: `cause` on stderr (unless the log's failure already says it), no
+    /// prompt, no agent started.
+    FolderRefused { cause: String },
 }
 
 /// Decide. `exec` is whether the session carries a command; `console` whether stdin and stdout are a
@@ -48,7 +52,22 @@ pub enum Plan {
 /// `Absence::Other` (an agent that exists but cannot be reached, a path that is too long, ...) keeps
 /// today's message alone, because the notice's first sentence would be false for it. A non-local
 /// account is not told to run a command it cannot use.
-pub fn plan(exec: bool, console: bool, absence: Absence, account: Option<LocalAccount>) -> Plan {
+///
+/// `folder_refusal` is why the user's folder cannot be used, if it cannot (see [`folder_refusal`]). It
+/// decides before anything else: the account, the absence and the console do not change that an
+/// offer, a prompt or a started agent would only end in the same failure.
+pub fn plan(
+    exec: bool,
+    console: bool,
+    absence: Absence,
+    account: Option<LocalAccount>,
+    folder_refusal: Option<&str>,
+) -> Plan {
+    if let Some(cause) = folder_refusal {
+        return Plan::FolderRefused {
+            cause: cause.to_owned(),
+        };
+    }
     let Some(account) = account else {
         return Plan::Nothing;
     };
@@ -243,6 +262,8 @@ pub(crate) struct Absent<'a> {
     pub exec: bool,
     pub location: &'a anyhow::Result<SocketLocation>,
     pub connect: &'a anyhow::Result<Socket>,
+    /// Why the shim has no log, if it has none: the fail-open of a command says it.
+    pub log_failure: Option<&'a str>,
 }
 
 /// How the shim goes on.
@@ -279,6 +300,50 @@ impl Rescue for NoRescue {
 /// The real thing: the notice on stderr, or the prompt at the console.
 pub(crate) struct Prompting;
 
+/// Why the user's private folder cannot be used, or `None` if it can or is not there yet (a first
+/// login: no profile, no `AppData`, no folder). It is the walk the agent makes, without making
+/// anything, and the same judgement of each folder: a refusal (a link, an owner, an ACL, a file where
+/// a folder is wanted) and equally a system error on the way (access denied, an untrusted mount
+/// point), since neither lets an agent serve. A `logs` folder that is refused costs the log only.
+fn folder_refusal(location: &SocketLocation, user: &Sid) -> Option<anyhow::Error> {
+    refusal_of(crate::userdir::inspect_socket_dir(location, user).map(drop))
+}
+
+/// [`folder_refusal`] for the outcome of the walk.
+fn refusal_of(looked: anyhow::Result<()>) -> Option<anyhow::Error> {
+    match looked {
+        Err(e) if !e.is::<crate::acl::Missing>() => Some(e),
+        Ok(()) | Err(_) => None,
+    }
+}
+
+/// [`folder_refusal`] for what the shim knows of itself. An account that cannot be told leaves the
+/// folder unjudged, and is logged.
+fn refusal_for(location: &anyhow::Result<SocketLocation>, user: &anyhow::Result<Sid>) -> Option<anyhow::Error> {
+    if let Err(e) = user {
+        tracing::warn!("cannot tell which account this is, so its folder is not judged: {e:#}");
+    }
+    match (location, user) {
+        (Ok(location), Ok(user)) => folder_refusal(location, user),
+        _ => None,
+    }
+}
+
+/// Whether the failure `log_failure` of the log already says `cause`: the two walks found the same
+/// thing, so a login with a command, which is told the log's failure, is not told twice. What is
+/// compared is what is wrong (the refusal, or the system error and what it was opening), not the
+/// words of the walk that found it.
+fn restated_by(log_failure: Option<&str>, cause: &anyhow::Error) -> bool {
+    let layers: Vec<String> = cause.chain().map(ToString::to_string).collect();
+    let wanted = if cause.root_cause().is::<crate::acl::Refused>() {
+        1
+    } else {
+        2
+    };
+    let what = layers[layers.len().saturating_sub(wanted)..].join(": ");
+    log_failure.is_some_and(|said| said.contains(&what))
+}
+
 impl Rescue for Prompting {
     fn rescue(&mut self, absent: &Absent<'_>, stderr: &mut dyn Write) -> Rescued {
         let account = match account::current_account() {
@@ -289,24 +354,29 @@ impl Rescue for Prompting {
             }
         };
         let kind_of_absence = absence(absent.connect, absent.location);
+        let user = Sid::current_user();
+        let refusal = refusal_for(absent.location, &user);
         // An agent that has made its socket and not yet called `listen()`, or that has started and not
         // yet made its socket, refuses the connect like no agent at all. It is waited for, never
         // prompted over.
-        if let (Absence::NoAgent, Ok(location)) = (kind_of_absence, absent.location) {
-            match crate::acl::Sid::current_user()
-                .and_then(|user| await_starting_agent(location, &provision::canonical_exe(), &user))
-            {
+        if let (Absence::NoAgent, Ok(location), None) = (kind_of_absence, absent.location, &refusal) {
+            match user.and_then(|user| await_starting_agent(location, &provision::canonical_exe(), &user)) {
                 Ok(Starting::Served(socket)) => return Rescued::Connected { socket, modes: None },
                 Ok(Starting::No | Starting::Gone) => {}
-                Err(e) => {
-                    tracing::warn!("cannot tell whether an agent is starting, so no session is offered: {e:#}");
-                    return Rescued::Plain;
-                }
+                Err(e) => return starting_failed(&e, absent.exec, absent.log_failure, stderr),
             }
         }
         let console = !absent.exec && console_available();
-        match plan(absent.exec, console, kind_of_absence, account) {
+        let cause = refusal.as_ref().map(|e| format!("{e:#}"));
+        match plan(absent.exec, console, kind_of_absence, account, cause.as_deref()) {
             Plan::Nothing => Rescued::Plain,
+            Plan::FolderRefused { cause } => {
+                let said = absent.exec && refusal.as_ref().is_some_and(|e| restated_by(absent.log_failure, e));
+                if !said {
+                    let _ = writeln!(stderr, "{}", text::folder_refused(&cause));
+                }
+                Rescued::Plain
+            }
             Plan::Notice { user } => {
                 let exe = provision::canonical_exe();
                 let _ = writeln!(stderr, "{}", non_interactive_notice(&user, &exe.to_string_lossy()));
@@ -315,6 +385,21 @@ impl Rescue for Prompting {
             Plan::Offer { account, absence } => run_offer(account, absence),
         }
     }
+}
+
+/// The rescue when looking for a starting agent failed: no session is offered, and the login goes on
+/// in a plain shell.
+///
+/// What this can say is a failure of the user's folder found after [`folder_refusal`] judged it (a
+/// link put there since): the same line on stderr, as the notice is told, unless the log's failure
+/// (`log_failure`, which the fail-open of a command says) already says it. Any other failure is
+/// logged.
+fn starting_failed(e: &anyhow::Error, exec: bool, log_failure: Option<&str>, stderr: &mut dyn Write) -> Rescued {
+    tracing::warn!("cannot tell whether an agent is starting, so no session is offered: {e:#}");
+    if e.is::<FolderFailed>() && !(exec && restated_by(log_failure, e)) {
+        let _ = writeln!(stderr, "{}", text::folder_refused(&format!("{e:#}")));
+    }
+    Rescued::Plain
 }
 
 /// A started background session, until its socket answers.
@@ -430,7 +515,7 @@ fn settle(started: Started) -> Result<Socket, String> {
     let failed = |e: anyhow::Error| text::start_failed(&format!("{e:#}"));
     let watch = SocketWatch::for_current_user().map_err(failed)?;
     let served =
-        wait_for_agent(watch, agent.process.0, |location| connect_if_listening(&location.path)).map_err(failed)?;
+        wait_for_agent(watch, agent.process.0, |location| connect_if_listening(location.path())).map_err(failed)?;
     let served = serve_after_own_agent(served, || {
         let location = crate::userdir::current_socket_location()?;
         let user = Sid::current_user()?;
@@ -470,6 +555,22 @@ fn connect_if_listening(path: &Path) -> anyhow::Result<Option<Socket>> {
     }
 }
 
+/// The user's folder, or the lock file in it, was refused (or could not be opened on the way) while
+/// the shim looked for a starting agent. Its text is the cause's.
+#[derive(Debug, thiserror::Error)]
+#[error(transparent)]
+struct FolderFailed(anyhow::Error);
+
+/// `e` as [`FolderFailed`] if it is a refusal of the object looked at (a link, a name that is not
+/// the folder's own). What the lock, the event or the thread says nothing of the folder.
+fn folder_failure(e: anyhow::Error) -> anyhow::Error {
+    if e.is::<crate::acl::Refused>() {
+        FolderFailed(e).into()
+    } else {
+        e
+    }
+}
+
 /// What there is to wait for while an agent starts: the holder of the user's lock, and the running
 /// agent processes of the user. Either one may be there without the other: an agent takes the lock
 /// some time after its process starts.
@@ -485,13 +586,23 @@ const MAX_EVIDENCE_HANDLES: usize = 63;
 
 impl Evidence {
     /// Look again: who holds the lock, and which agent processes run. True if any agent exists.
-    fn look(&mut self, lock: &Path, image: &Path, user: &Sid) -> anyhow::Result<bool> {
+    /// The lock is looked at through the handle of the user's folder, opened afresh each time
+    /// because the agent may not have made the folder yet; a folder that is not there holds no lock.
+    fn look(&mut self, location: &SocketLocation, image: &Path, user: &Sid) -> anyhow::Result<bool> {
         self.agents = procwait::user_agents(image, user).context("look for the user's agent processes")?;
-        let held = starting_agent::is_held(lock).context("tell whether an agent holds the user's lock")?;
-        if !held {
-            self.holder = None;
-        } else if self.holder.is_none() {
-            self.holder = Some(starting_agent::HolderWatch::start(lock)?);
+        let folder = crate::userdir::open_existing_socket_dir(location).map_err(FolderFailed)?;
+        let held = match &folder {
+            Some(folder) => starting_agent::is_held(folder)
+                .context("tell whether an agent holds the user's lock")
+                .map_err(folder_failure)?,
+            None => false,
+        };
+        match (&folder, held) {
+            (Some(folder), true) if self.holder.is_none() => {
+                self.holder = Some(starting_agent::HolderWatch::start(folder).map_err(folder_failure)?);
+            }
+            (_, true) => {}
+            (_, false) => self.holder = None,
         }
         Ok(held || !self.agents.is_empty())
     }
@@ -532,12 +643,11 @@ impl Evidence {
 /// writes after `listen()` is seen by that connect or by the watch. The wait is on the folder, the
 /// lock's holder and the agent processes; all are real conditions, so it has no time limit.
 fn await_starting_agent(location: &SocketLocation, image: &Path, user: &Sid) -> anyhow::Result<Starting<Socket>> {
-    let lock = location.lock_path();
     let watch = RefCell::new(SocketWatch::for_location(location)?);
     let evidence = RefCell::new(Evidence::default());
     wait_while_starting(
-        || connect_if_listening(&location.path),
-        || evidence.borrow_mut().look(&lock, image, user),
+        || connect_if_listening(location.path()),
+        || evidence.borrow_mut().look(location, image, user),
         || evidence.borrow_mut().wait(&watch.borrow()),
         || watch.borrow_mut().rearm(),
     )

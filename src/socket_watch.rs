@@ -284,12 +284,12 @@ impl SocketWatch {
             return Ok(());
         };
         loop {
-            let target = deepest_existing(&location.dir)?;
+            let target = deepest_existing(location.dir())?;
             match &self.folder {
                 Some((watched, watch)) if *watched == target => watch.rearm()?,
                 _ => self.folder = Some((target.clone(), DirWatch::arm(&target)?)),
             }
-            if deepest_existing(&location.dir)? == target {
+            if deepest_existing(location.dir())? == target {
                 return Ok(());
             }
         }

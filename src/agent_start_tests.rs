@@ -113,7 +113,7 @@ fn folder_refusal_exits_67() {
     let profile = TempProfile::new("start-refused");
     let loc = profile.location();
     // A file where the private folder belongs: nothing can be made safe there.
-    std::fs::write(&loc.dir, b"planted").unwrap();
+    std::fs::write(loc.dir(), b"planted").unwrap();
     let args = background(Some(ME));
     let err = start_with(
         Some(&args),
@@ -167,21 +167,21 @@ fn start_makes_the_private_folder_then_serves_that_session_from_it() {
         || Ok(()),
         || Ok(loc.clone()),
         |logs| {
-            assert_eq!(logs, loc.logs_dir());
+            assert_eq!(logs.path(), loc.logs_dir());
             Ok(guard())
         },
         |at, session| {
             assert!(
-                acl::verify_dir_acl(&at.dir, &Sid::current_user().unwrap()).unwrap(),
+                acl::verify_dir_acl(at.dir(), &Sid::current_user().unwrap()).unwrap(),
                 "the folder is hardened before anything is served from it"
             );
-            served.set(Some((at.path.clone(), session)));
+            served.set(Some((at.path().to_path_buf(), session)));
             Ok(())
         },
     )
     .unwrap();
 
-    assert_eq!(served.take(), Some((loc.path.clone(), 3)));
+    assert_eq!(served.take(), Some((loc.path().to_path_buf(), 3)));
 }
 
 #[test]
@@ -206,6 +206,36 @@ fn start_serves_without_a_log_when_the_log_cannot_be_opened() {
     .unwrap();
 
     assert!(served.get(), "a missing log is not a reason to stop serving");
+}
+
+#[test]
+fn start_serves_without_a_log_when_the_logs_folder_is_refused() {
+    let profile = TempProfile::new("start-nologs");
+    let loc = profile.location();
+    crate::userdir::ensure_socket_dir(&loc, &Sid::current_user().unwrap()).unwrap();
+    crate::test_support::widen(&loc.logs_dir());
+    let served = Cell::new(false);
+    let mut stderr = Vec::new();
+
+    start_with(
+        None,
+        3,
+        ME,
+        &mut stderr,
+        || Ok(()),
+        || Ok(loc.clone()),
+        |_| -> anyhow::Result<_> { panic!("there is no logs folder to log into") },
+        |_, _| {
+            served.set(true);
+            Ok(())
+        },
+    )
+    .unwrap();
+
+    assert!(served.get(), "a refused logs folder is not a reason to stop serving");
+    let stderr = String::from_utf8(stderr).unwrap();
+    assert!(stderr.contains("serving without a log"), "{stderr}");
+    assert!(stderr.contains(&loc.logs_dir().display().to_string()), "{stderr}");
 }
 
 #[test]
@@ -447,8 +477,8 @@ impl Drop for Watch {
 fn mark_listening_changes_the_folder() {
     let profile = TempProfile::new("marker");
     let loc = profile.location();
-    std::fs::create_dir_all(&loc.dir).unwrap();
-    let watch = Watch::arm(&loc.dir);
+    std::fs::create_dir_all(loc.dir()).unwrap();
+    let watch = Watch::arm(loc.dir());
     // The folder's own creation may have signalled the watch: consume that, so only the marker can.
     watch.rearm();
     assert!(!watch.signalled(), "nothing has changed since the watch was re-armed");
@@ -469,7 +499,7 @@ fn every_agent_marks_after_bind() {
     let err = run_on_with(
         &loc,
         |path| {
-            assert_eq!(path, loc.path);
+            assert_eq!(path, loc.path());
             events.borrow_mut().push("bind");
             Ok(())
         },
@@ -522,7 +552,7 @@ fn a_failed_marker_write_ends_the_agent_before_it_accepts() {
 fn location_with_dir(tag: &str) -> (TempProfile, SocketLocation) {
     let profile = TempProfile::new(tag);
     let loc = profile.location();
-    std::fs::create_dir_all(&loc.dir).unwrap();
+    std::fs::create_dir_all(loc.dir()).unwrap();
     (profile, loc)
 }
 

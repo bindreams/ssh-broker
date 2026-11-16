@@ -32,10 +32,10 @@ checked.
 | `protocol` | frame codec, handshake, `FrameReader` |
 | `relay` | transport-agnostic pumping; `PumpError` names which side failed |
 | `winutil` | Windows RAII (`OwnedHandle`, `AttrList`), job containment, cosca→Win32 errors |
-| `afunix`, `acl` | the socket, and the file and folder ACLs that are the security boundary |
+| `afunix`, `acl` | the socket, and the file and folder ACLs that are the security boundary; the private folder reached by handle, never through a link (`acl/private_dir`) |
 | `socket_loc`, `userdir` | where a user's socket lives (from the token's profile, length-checked), and creating its private folder |
 | `agent_lock` | one agent per session, one serving agent per user |
-| `filelog` | the rolling log in the user's own folder |
+| `filelog` | the daily log in the user's own folder, written under the folder's handle |
 | `handoff` | the notice and the line the agent writes into the inherited pipe it hands the hidden `console-fallback` verb |
 | `vtinput` | Win32 `INPUT_RECORD` → VT sequences (pure, host-testable) |
 | `provision` | `apply`/`verify`: DefaultShell, logon task, per-user socket rows, parity probes |

@@ -18,7 +18,7 @@ fn account(kind: AccountKind) -> Option<LocalAccount> {
 fn exec_session_notice_is_one_line_on_stderr() {
     for absence in [Absence::NoAgent, Absence::NoProfileYet] {
         assert_eq!(
-            plan(true, true, absence, account(AccountKind::Local)),
+            plan(true, true, absence, account(AccountKind::Local), None),
             Plan::Notice { user: "alice".into() }
         );
     }
@@ -28,7 +28,7 @@ fn exec_session_notice_is_one_line_on_stderr() {
 fn no_terminal_login_gets_the_notice_and_never_enters_raw_mode() {
     // `plan` is all that runs before the console is touched: a plan that is not `Offer` never reaches
     // `ConsolePrompt::enter`.
-    let plan = plan(false, false, Absence::NoAgent, account(AccountKind::Local));
+    let plan = plan(false, false, Absence::NoAgent, account(AccountKind::Local), None);
     assert_eq!(plan, Plan::Notice { user: "alice".into() });
 }
 
@@ -37,7 +37,7 @@ fn a_terminal_login_without_a_command_is_offered_the_session() {
     for absence in [Absence::NoAgent, Absence::NoProfileYet] {
         let local = account(AccountKind::Local).unwrap();
         assert_eq!(
-            plan(false, true, absence, Some(local.clone())),
+            plan(false, true, absence, Some(local.clone()), None),
             Plan::Offer {
                 account: local,
                 absence
@@ -50,7 +50,7 @@ fn a_terminal_login_without_a_command_is_offered_the_session() {
 fn a_non_local_account_is_still_told_why_at_the_terminal() {
     let other = account(AccountKind::NotLocal).unwrap();
     assert_eq!(
-        plan(false, true, Absence::NoAgent, Some(other.clone())),
+        plan(false, true, Absence::NoAgent, Some(other.clone()), None),
         Plan::Offer {
             account: other,
             absence: Absence::NoAgent
@@ -61,7 +61,7 @@ fn a_non_local_account_is_still_told_why_at_the_terminal() {
 #[test]
 fn a_non_local_account_gets_no_notice_that_names_a_command_it_cannot_use() {
     assert_eq!(
-        plan(true, true, Absence::NoAgent, account(AccountKind::NotLocal)),
+        plan(true, true, Absence::NoAgent, account(AccountKind::NotLocal), None),
         Plan::Nothing
     );
 }
@@ -70,7 +70,7 @@ fn a_non_local_account_gets_no_notice_that_names_a_command_it_cannot_use() {
 fn other_absence_changes_nothing_today() {
     for (exec, console) in [(true, true), (false, true), (false, false)] {
         assert_eq!(
-            plan(exec, console, Absence::Other, account(AccountKind::Local)),
+            plan(exec, console, Absence::Other, account(AccountKind::Local), None),
             Plan::Nothing,
             "exec={exec} console={console}"
         );
@@ -79,8 +79,141 @@ fn other_absence_changes_nothing_today() {
 
 #[test]
 fn an_unreadable_account_changes_nothing() {
-    assert_eq!(plan(false, true, Absence::NoAgent, None), Plan::Nothing);
-    assert_eq!(plan(true, true, Absence::NoAgent, None), Plan::Nothing);
+    assert_eq!(plan(false, true, Absence::NoAgent, None, None), Plan::Nothing);
+    assert_eq!(plan(true, true, Absence::NoAgent, None, None), Plan::Nothing);
+}
+
+const REFUSAL: &str = "make the private folder p/ssh-broker: p/ssh-broker cannot be used as the private folder: its ACL is not exactly Full Control for me. It is left as it is: inspect it, remove it, and it is created again";
+
+#[test]
+fn a_refused_private_folder_is_shown_and_no_session_is_offered() {
+    for exec in [false, true] {
+        for console in [true, false] {
+            for absence in [Absence::NoAgent, Absence::NoProfileYet, Absence::Other] {
+                for account in [account(AccountKind::Local), account(AccountKind::NotLocal), None] {
+                    assert_eq!(
+                        plan(exec, console, absence, account, Some(REFUSAL)),
+                        Plan::FolderRefused { cause: REFUSAL.into() },
+                        "exec={exec} console={console} absence={absence:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+// the judgement of the folder -----
+
+use crate::test_support::{TempProfile, junction, widen};
+
+fn me() -> Sid {
+    Sid::current_user().unwrap()
+}
+
+#[test]
+fn a_folder_that_is_usable_or_not_there_yet_is_not_a_refusal() {
+    // A first login: nothing is made yet, at any depth.
+    let profile = TempProfile::new("fr-first");
+    assert!(folder_refusal(&profile.location(), &me()).is_none(), "no folder yet");
+    std::fs::remove_dir_all(profile.0.join("AppData")).unwrap();
+    assert!(folder_refusal(&profile.location(), &me()).is_none(), "no AppData yet");
+    let none = crate::test_support::location_in(&profile.0.join("none"));
+    assert!(folder_refusal(&none, &me()).is_none(), "no profile directory yet");
+
+    let usable = TempProfile::new("fr-ok");
+    crate::userdir::ensure_socket_dir(&usable.location(), &me()).unwrap();
+    assert!(folder_refusal(&usable.location(), &me()).is_none(), "an exact folder");
+}
+
+#[test]
+fn a_refused_logs_folder_alone_does_not_make_the_private_folder_refused() {
+    let profile = TempProfile::new("fr-logs");
+    let location = profile.location();
+    crate::userdir::ensure_socket_dir(&location, &me()).unwrap();
+    widen(&location.logs_dir());
+
+    assert!(folder_refusal(&location, &me()).is_none());
+}
+
+#[test]
+fn every_failure_of_the_walk_but_a_missing_name_is_a_refusal_with_its_own_text() {
+    let missing = {
+        let profile = TempProfile::new("fr-miss");
+        let root = crate::acl::open_root(&profile.0).unwrap();
+        crate::acl::open_dir(&root, "Nothing").err().unwrap()
+    };
+    assert!(refusal_of(Err(missing)).is_none());
+    assert!(refusal_of(Ok(())).is_none());
+
+    // A system error of the walk (access denied at `Local`, an untrusted mount point at a followed
+    // link) is not a `Refused`, and is shown all the same.
+    for code in [
+        windows::Win32::Foundation::ERROR_ACCESS_DENIED,
+        windows::Win32::Foundation::ERROR_UNTRUSTED_MOUNT_POINT,
+    ] {
+        let system = anyhow::Error::from(windows::core::Error::from(windows::core::HRESULT::from_win32(code.0)))
+            .context("open p/AppData/Local");
+        assert!(!system.is::<crate::acl::Refused>());
+        let shown = format!("{:#}", refusal_of(Err(system)).expect("a system error is shown"));
+        assert!(shown.starts_with("open p/AppData/Local: "), "{shown}");
+    }
+}
+
+/// What the rescue of a login for `location` shows, and how it goes on. `log_failure` is why the
+/// shim has no log.
+fn rescued(location: SocketLocation, exec: bool, log_failure: Option<&str>) -> (Rescued, String) {
+    let location = Ok(location);
+    let connect = Err(anyhow::anyhow!("a connect that failed for no OS reason"));
+    let mut shown = Vec::new();
+    let rescued = Prompting.rescue(
+        &Absent {
+            exec,
+            location: &location,
+            connect: &connect,
+            log_failure,
+        },
+        &mut shown,
+    );
+    (rescued, String::from_utf8(shown).unwrap())
+}
+
+fn rescued_interactively(location: SocketLocation) -> (Rescued, String) {
+    rescued(location, false, None)
+}
+
+#[test]
+fn a_login_whose_folder_has_the_wrong_acl_is_told_why_and_gets_the_plain_shell_without_a_prompt() {
+    let profile = TempProfile::new("rs-acl");
+    let location = profile.location();
+    crate::userdir::ensure_socket_dir(&location, &me()).unwrap();
+    widen(location.dir());
+
+    let (rescued, shown) = rescued_interactively(location.clone());
+
+    assert!(matches!(rescued, Rescued::Plain));
+    assert!(shown.starts_with("ssh-broker: no session is offered"), "{shown:?}");
+    assert!(shown.contains("its ACL is not exactly"), "{shown:?}");
+    assert!(shown.contains(&location.dir().display().to_string()), "{shown:?}");
+    assert!(shown.contains("remove"), "the remedy: {shown:?}");
+}
+
+#[test]
+fn a_login_whose_way_to_the_folder_has_a_link_is_told_why_and_gets_the_plain_shell_without_a_prompt() {
+    let profile = TempProfile::new("rs-link");
+    let local = profile.0.join(r"AppData\Local");
+    let elsewhere = profile.0.join("elsewhere");
+    std::fs::create_dir(&elsewhere).unwrap();
+    std::fs::remove_dir(&local).unwrap();
+    junction(&local, &elsewhere);
+
+    let (rescued, shown) = rescued_interactively(profile.location());
+
+    assert!(matches!(rescued, Rescued::Plain));
+    assert!(shown.contains("reparse point"), "{shown:?}");
+    assert!(
+        shown.contains(&local.display().to_string()),
+        "the link is named: {shown:?}"
+    );
 }
 
 // wait_until_serving -----
@@ -304,6 +437,192 @@ fn a_connect_that_fails_for_a_reason_that_waiting_does_not_clear_ends_the_wait_a
     assert!(format!("{failed:#}").contains("access denied"), "{failed:#}");
 }
 
+// a folder that is refused -----
+
+/// The error a refused private folder gives the shim's look at it: a junction at `Local`.
+fn refusal_of_a_junction_at_local(tag: &str) -> (crate::test_support::TempProfile, anyhow::Error) {
+    let profile = crate::test_support::TempProfile::new(tag);
+    let local = profile.0.join(r"AppData\Local");
+    let elsewhere = profile.0.join("elsewhere");
+    std::fs::create_dir(&elsewhere).unwrap();
+    std::fs::remove_dir(&local).unwrap();
+    crate::test_support::junction(&local, &elsewhere);
+    let err = Evidence::default()
+        .look(
+            &profile.location(),
+            Path::new(r"C:\no\such\dir\ssh-broker.exe"),
+            &Sid::current_user().unwrap(),
+        )
+        .unwrap_err();
+    (profile, err)
+}
+
+#[test]
+fn an_interactive_login_whose_folder_is_refused_is_told_on_the_terminal_and_gets_the_plain_shell() {
+    let (profile, err) = refusal_of_a_junction_at_local("refused-pty");
+    let mut shown = Vec::new();
+
+    let rescued = starting_failed(&err, false, None, &mut shown);
+
+    assert!(matches!(rescued, Rescued::Plain));
+    let shown = String::from_utf8(shown).unwrap();
+    assert!(shown.starts_with("ssh-broker: "), "{shown:?} for {err:#}");
+    assert!(
+        shown.contains(&profile.0.join(r"AppData\Local").display().to_string()),
+        "the link is named: {shown}"
+    );
+    assert!(shown.contains("remove"), "the remedy: {shown}");
+}
+
+#[test]
+fn a_folder_that_fails_with_a_system_error_after_it_was_judged_is_told_in_the_same_line() {
+    let denied = windows::core::Error::from(windows::core::HRESULT::from_win32(
+        windows::Win32::Foundation::ERROR_ACCESS_DENIED.0,
+    ));
+    let err = anyhow::Error::new(FolderFailed(anyhow::Error::new(denied).context("open p/AppData/Local")));
+    let mut shown = Vec::new();
+
+    let rescued = starting_failed(&err, false, None, &mut shown);
+
+    assert!(matches!(rescued, Rescued::Plain));
+    let shown = String::from_utf8(shown).unwrap();
+    assert!(shown.starts_with("ssh-broker: no session is offered"), "{shown:?}");
+    assert!(shown.contains("open p/AppData/Local"), "{shown:?}");
+}
+
+/// Why the log of a login cannot be set up in the state of `profile`: what the shim keeps as its
+/// `log_failure`.
+fn log_failure_of(profile: &crate::test_support::TempProfile) -> String {
+    let err = crate::filelog::init_for_location(&profile.location(), &me(), "shim.log").unwrap_err();
+    err.to_string()
+}
+
+#[test]
+fn a_login_with_a_command_is_told_of_a_refused_folder_the_log_did_not_find() {
+    // The folder became unusable after the log was set up (or the log failed for another reason).
+    let (_profile, err) = refusal_of_a_junction_at_local("refused-exec");
+    for log_failure in [None, Some("the disk is full")] {
+        let mut shown = Vec::new();
+
+        let rescued = starting_failed(&err, true, log_failure, &mut shown);
+
+        assert!(matches!(rescued, Rescued::Plain));
+        assert!(
+            String::from_utf8(shown).unwrap().contains("no session is offered"),
+            "{log_failure:?}"
+        );
+    }
+}
+
+#[test]
+fn a_login_with_a_command_is_not_told_twice_what_the_log_already_says() {
+    let (profile, err) = refusal_of_a_junction_at_local("refused-twice");
+    let log_failure = log_failure_of(&profile);
+    let mut shown = Vec::new();
+
+    starting_failed(&err, true, Some(&log_failure), &mut shown);
+
+    assert!(shown.is_empty(), "{}", String::from_utf8_lossy(&shown));
+}
+
+#[test]
+fn the_rescue_tells_a_login_with_a_command_of_the_refusal_its_own_walk_found() {
+    // Set up the log while the folder is fine; the rescue's walk is the one that finds the link.
+    let profile = TempProfile::new("rs-exec");
+    let local = profile.0.join(r"AppData\Local");
+    let elsewhere = profile.0.join("elsewhere");
+    std::fs::create_dir(&elsewhere).unwrap();
+    std::fs::remove_dir(&local).unwrap();
+    junction(&local, &elsewhere);
+
+    for log_failure in [None, Some("the disk is full")] {
+        let (rescued, shown) = rescued(profile.location(), true, log_failure);
+
+        assert!(matches!(rescued, Rescued::Plain));
+        assert!(shown.contains("no session is offered"), "{log_failure:?}: {shown:?}");
+        assert!(shown.contains(&local.display().to_string()), "{shown:?}");
+    }
+}
+
+#[test]
+fn the_rescue_does_not_repeat_to_a_login_with_a_command_what_the_log_already_says() {
+    let profile = TempProfile::new("rs-twice");
+    let local = profile.0.join(r"AppData\Local");
+    let elsewhere = profile.0.join("elsewhere");
+    std::fs::create_dir(&elsewhere).unwrap();
+    std::fs::remove_dir(&local).unwrap();
+    junction(&local, &elsewhere);
+    let log_failure = log_failure_of(&profile);
+
+    let (rescued, shown) = rescued(profile.location(), true, Some(&log_failure));
+
+    assert!(matches!(rescued, Rescued::Plain));
+    assert!(shown.is_empty(), "{shown:?}");
+}
+
+#[test]
+fn an_account_that_cannot_be_told_is_logged_and_the_folder_is_not_judged() {
+    let profile = TempProfile::new("rs-nosid");
+    let location = Ok(profile.location());
+    let (log, refusal) =
+        crate::test_support::logged(|| refusal_for(&location, &Err(anyhow::anyhow!("the token cannot be read"))));
+    assert!(refusal.is_none());
+    assert!(log.contains("the token cannot be read"), "{log}");
+}
+
+/// What `Evidence::look` says about a folder whose lock file `prepare` has made: `prepare` gets the
+/// file's path and returns what must stay alive while the look is made.
+fn look_at_lock<T>(tag: &str, prepare: impl FnOnce(&Path) -> T) -> anyhow::Error {
+    let profile = crate::test_support::TempProfile::new(tag);
+    let location = profile.location();
+    let user = Sid::current_user().unwrap();
+    crate::userdir::ensure_socket_dir(&location, &user).unwrap();
+    let _kept = prepare(&location.dir().join(crate::socket_loc::LOCK_FILE_NAME));
+    Evidence::default()
+        .look(&location, Path::new(r"C:\no\such\dir\ssh-broker.exe"), &user)
+        .unwrap_err()
+}
+
+#[test]
+fn a_lock_file_held_without_sharing_is_not_a_failure_of_the_folder() {
+    use std::os::windows::fs::OpenOptionsExt;
+    // A scanner holding the file open without sharing: nothing is wrong with the folder.
+    let err = look_at_lock("lk-share", |lock| {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .share_mode(0)
+            .open(lock)
+            .unwrap()
+    });
+    assert!(!err.is::<FolderFailed>(), "{err:#}");
+    let mut shown = Vec::new();
+
+    starting_failed(&err, false, None, &mut shown);
+
+    assert!(shown.is_empty(), "{}", String::from_utf8_lossy(&shown));
+}
+
+#[test]
+fn a_lock_file_with_another_name_is_a_failure_of_the_folder() {
+    let err = look_at_lock("lk-link", |lock| {
+        std::fs::write(lock, b"").unwrap();
+        std::fs::hard_link(lock, lock.with_file_name("elsewhere")).unwrap();
+    });
+    assert!(err.is::<FolderFailed>(), "{err:#}");
+}
+
+#[test]
+fn a_failure_that_is_not_a_refusal_is_logged_and_not_shown_to_an_interactive_login() {
+    let mut shown = Vec::new();
+    let (log, rescued) = crate::test_support::logged(|| {
+        starting_failed(&anyhow::anyhow!("the process list failed"), false, None, &mut shown)
+    });
+    assert!(matches!(rescued, Rescued::Plain));
+    assert!(shown.is_empty());
+    assert!(log.contains("the process list failed"), "{log}");
+}
+
 // logs_dir -----
 
 #[test]
@@ -324,10 +643,10 @@ fn a_socket_that_is_not_there_is_nobody_listening() {
     let profile = crate::test_support::TempProfile::new("connect-missing");
     let location = profile.location();
     // The folder is missing.
-    assert!(connect_if_listening(&location.path).unwrap().is_none());
+    assert!(connect_if_listening(location.path()).unwrap().is_none());
     // The folder is there and the socket file is not.
-    std::fs::create_dir_all(&location.dir).unwrap();
-    assert!(connect_if_listening(&location.path).unwrap().is_none());
+    std::fs::create_dir_all(location.dir()).unwrap();
+    assert!(connect_if_listening(location.path()).unwrap().is_none());
 }
 
 #[test]
@@ -335,11 +654,11 @@ fn a_socket_with_nobody_listening_on_it_is_nobody_listening() {
     use socket2::{Domain, SockAddr, Socket, Type};
     let profile = crate::test_support::TempProfile::new("connect-unlistened");
     let location = profile.location();
-    std::fs::create_dir_all(&location.dir).unwrap();
+    std::fs::create_dir_all(location.dir()).unwrap();
     // The file exists and `listen()` has not run, as in the agent's start.
     let socket = Socket::new(Domain::UNIX, Type::STREAM, None).unwrap();
-    socket.bind(&SockAddr::unix(&location.path).unwrap()).unwrap();
-    assert!(connect_if_listening(&location.path).unwrap().is_none());
+    socket.bind(&SockAddr::unix(location.path()).unwrap()).unwrap();
+    assert!(connect_if_listening(location.path()).unwrap().is_none());
 }
 
 #[test]

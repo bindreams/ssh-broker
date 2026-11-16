@@ -595,7 +595,7 @@ mod imp {
     /// very property being measured. This is the end-to-end half of byte-transparency — a real
     /// child, real pipes, a real socket — which the in-memory relay tests cannot reach.
     fn drive_probe(exe: &Path) -> anyhow::Result<(probe::ProbeResult, bool)> {
-        let sock = afunix::connect(&crate::userdir::current_socket_location()?.path).context("connect to agent")?;
+        let sock = afunix::connect(crate::userdir::current_socket_location()?.path()).context("connect to agent")?;
         let (rx, tx) = afunix::split(sock)?;
         let hs = super::probe_handshake(exe);
         let mut out = Vec::new();

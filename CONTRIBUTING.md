@@ -60,10 +60,42 @@ SACL unprotected). Only the user at Medium or above, an administrator or SYSTEM 
 each of them can connect anyway; the product does not check for one.
 `tests/user_isolation_windows.rs` pins the refusal and, with the file labelled Low, the connect.
 
-`userdir::ensure_socket_dir` repairs the folder's ACL only for a real directory (not a junction or
-symlink) owned by the user, SYSTEM or Administrators, and refuses anything else untouched. A profile
+`userdir::open_socket_dir` (and `ensure_socket_dir` over it) reaches the folder by handle: it opens
+the profile directory (opened following a link, see below), then `AppData`, `Local`,
+`ssh-broker` and `logs`, each by name relative to the handle above it, with `FILE_OPEN_REPARSE_POINT`,
+and refuses any whose handle is a reparse point. A process of the same account at lower integrity can
+replace one of those names with a junction or symlink, and a path walk would follow it out of the
+profile. Nothing below the profile directory is named by path (`acl::private_dir`), and the log is
+opened under the `logs` handle for the same reason (`filelog::daily`). A missing private folder is
+created with its security descriptor given at creation. One that exists is verified through the
+handle and never modified: if it is not a real directory with an owner in {user, SYSTEM,
+Administrators} and exactly the private ACL, it is refused and left untouched, and removing it makes
+it be created again. That is not a repair because a repair would re-ACL whatever a hard link inside
+the folder names, and a handle opened before it stays open after it. The shim's opens of a log file
+and of `agent.lock` refuse one that already existed with more than one name (a hard link to a file
+elsewhere), as they refuse a link. A link at `AppData`,
+`AppData\Local`, `ssh-broker` or `logs` is refused for every caller, a deliberate one included. A link at
+the profile directory itself, or above it, is followed: its path is `ProfileImagePath`, and Windows
+loads the profile through that same path, links included, so the broker uses the profile where the
+operating system does and a layout that works today (a junction made for one profile, a profile that
+is a mounted volume) keeps working. What that leaves: an account that replaces its own profile
+directory with a link can make an elevated shim create, and never modify, an `ssh-broker` folder
+(with `logs` and a log file) under another `AppData\Local`. That folder is then refused by its owner's
+agent, with the folder named, and removing it restores them. A profile
 path that would push the socket past the 107-byte AF_UNIX limit is an error, not a reason to use
 another location (`socket_loc::SocketLocationError::TooLong`).
+
+The agent's own operations in the folder (`Listener::bind`, the `agent_lock` locks, the `serving`
+marker) still name it by path. That gains a process of the same account nothing as long as the agent
+runs with the plain, non-elevated token: a link then redirects it only to what the same account can
+already change. The on-demand start gives it that token (pinned by
+`an_administrators_shim_sees_the_agent_it_starts`), and so does the logon task at a desktop logon.
+The `auto-login` task does not: its batch logon gives an administrator the full token. That agent,
+and one started by hand from an elevated prompt, are not covered.
+The elevated shim is different. It looks at `agent.lock` through the
+folder's handle and never creates it (`starting_agent`, `userdir::open_existing_socket_dir`); the
+connect to the socket and the folder watch (`socket_watch`) stay by path, and neither creates or
+writes anything.
 
 The install directory is the other half of the boundary: the agent runs the exe in it, so a directory a standard user can write to is a privilege escalation. `apply` verifies it exactly and reads and writes nothing in it until that passes. Users can read what is in it, so a file in it that a user must not open (`apply.lock`: a byte-range lock needs only a read handle) gets its own protected DACL of SYSTEM and Administrators at creation, verified exactly (`acl::ensure_admin_only_file`).
 

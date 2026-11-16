@@ -281,10 +281,10 @@ fn network_logon_token_resolves_its_own_profile_socket() {
 
     let expected = bob.profile().join("AppData").join("Local").join("ssh-broker");
     assert_eq!(
-        loc.dir.to_string_lossy().to_lowercase(),
+        loc.dir().to_string_lossy().to_lowercase(),
         expected.to_string_lossy().to_lowercase()
     );
-    assert!(loc.path.ends_with("agent.sock"));
+    assert!(loc.path().ends_with("agent.sock"));
 }
 
 #[test]
@@ -299,7 +299,7 @@ fn an_admin_ssh_session_as_bob_resolves_bobs_socket_not_the_admins() {
     // Nothing in the call takes a path or an account name: the token is the only input.
     assert_ne!(from_bob, admin, "bob's session must not use the administrator's socket");
     assert_ne!(from_bob, from_alice, "bob's session must not use alice's socket");
-    assert!(from_bob.path.starts_with(bob.profile()));
+    assert!(from_bob.path().starts_with(bob.profile()));
 }
 
 #[test]
@@ -362,9 +362,9 @@ fn a_creator_whose_default_dacl_is_world_accessible_still_gets_an_exact_socket_a
         userdir::ensure_socket_dir(&loc, &me).unwrap();
         let _lock = UserLock::try_acquire(&loc.lock_path()).unwrap().unwrap();
         let _slot = SessionSlot::try_acquire(&loc.sessions_lock_path(), 1).unwrap().unwrap();
-        let _listener = Listener::bind(&loc.path).unwrap();
+        let _listener = Listener::bind(loc.path()).unwrap();
 
-        assert!(acl::verify_file_acl(&loc.path, &me).unwrap(), "agent.sock");
+        assert!(acl::verify_file_acl(loc.path(), &me).unwrap(), "agent.sock");
         assert!(acl::verify_file_acl(&loc.lock_path(), &me).unwrap(), "agent.lock");
         assert!(
             acl::verify_file_acl(&loc.sessions_lock_path(), &me).unwrap(),
@@ -385,21 +385,21 @@ fn each_users_socket_dir_acl_is_exact() {
         userdir::ensure_socket_dir(&loc, &admin).unwrap();
         let _lock = UserLock::try_acquire(&loc.lock_path()).unwrap().unwrap();
         let _slot = SessionSlot::try_acquire(&loc.sessions_lock_path(), 1).unwrap().unwrap();
-        let _listener = Listener::bind(&loc.path).unwrap();
+        let _listener = Listener::bind(loc.path()).unwrap();
 
-        assert!(acl::verify_dir_acl(&loc.dir, &admin).unwrap());
+        assert!(acl::verify_dir_acl(loc.dir(), &admin).unwrap());
         assert!(
-            !acl::verify_dir_acl(&loc.dir, &bob.sid).unwrap(),
+            !acl::verify_dir_acl(loc.dir(), &bob.sid).unwrap(),
             "the dir is not bob's"
         );
         // Born with exactly the three, although the creating token would have let everyone in.
-        assert!(acl::verify_file_acl(&loc.path, &admin).unwrap(), "agent.sock");
+        assert!(acl::verify_file_acl(loc.path(), &admin).unwrap(), "agent.sock");
         assert!(acl::verify_file_acl(&loc.lock_path(), &admin).unwrap(), "agent.lock");
         assert!(
             acl::verify_file_acl(&loc.sessions_lock_path(), &admin).unwrap(),
             "session slot"
         );
-        assert!(!acl::verify_file_acl(&loc.path, &bob.sid).unwrap());
+        assert!(!acl::verify_file_acl(loc.path(), &bob.sid).unwrap());
         assert!(
             !acl::verify_file_acl(&loc.sessions_lock_path(), &bob.sid).unwrap(),
             "the session slot is not bob's"
@@ -413,10 +413,10 @@ fn ensure_socket_dir_refuses_a_dir_owned_by_another_user() {
     let admin = Sid::current_user().unwrap();
     let profile = StandInProfile::new("foreign");
     let loc = profile.location();
-    std::fs::create_dir(&loc.dir).unwrap();
+    std::fs::create_dir(loc.dir()).unwrap();
     let status = desktop::status(
         Command::new("icacls")
-            .arg(&loc.dir)
+            .arg(loc.dir())
             .args(["/setowner", &format!("*{}", bob.sid_text)]),
     )
     .unwrap();
@@ -479,16 +479,16 @@ fn bob_cannot_connect_to_a_socket_in_another_users_dir() {
         for loc in [&denied, &control] {
             userdir::ensure_socket_dir(loc, &admin).unwrap();
             locks.push(UserLock::try_acquire(&loc.lock_path()).unwrap().unwrap());
-            listeners.push(Listener::bind(&loc.path).unwrap());
+            listeners.push(Listener::bind(loc.path()).unwrap());
         }
         (listeners, locks)
     });
-    assert!(acl::verify_file_acl(&denied.path, &admin).unwrap(), "control: exact");
+    assert!(acl::verify_file_acl(denied.path(), &admin).unwrap(), "control: exact");
     // The control socket additionally grants bob, so a refusal elsewhere is the ACL's doing and
     // not an unreachable path or a missing right.
     let status = desktop::status(
         Command::new("icacls")
-            .arg(&control.path)
+            .arg(control.path())
             .args(["/grant", &format!("*{}:(F)", bob.sid_text)]),
     )
     .unwrap();
@@ -498,7 +498,11 @@ fn bob_cannot_connect_to_a_socket_in_another_users_dir() {
     std::fs::copy(std::env::current_exe().unwrap(), &exe).unwrap();
     child_entry::write_input(
         &shared.0,
-        &format!("allowed={}\ndenied={}\n", control.path.display(), denied.path.display()),
+        &format!(
+            "allowed={}\ndenied={}\n",
+            control.path().display(),
+            denied.path().display()
+        ),
     );
     let command = child_entry::command_line(&exe, "child_connects_only_where_it_was_granted", &shared.0);
 
@@ -592,21 +596,21 @@ fn a_low_integrity_process_of_the_same_user_cannot_connect_to_the_agent_socket()
     let profile = StandInProfile::new("low");
     let loc = profile.location();
     userdir::ensure_socket_dir(&loc, &me).unwrap();
-    let _listener = Listener::bind(&loc.path).unwrap();
+    let _listener = Listener::bind(loc.path()).unwrap();
     let security_of_file = |context: &str| {
         let info = DACL_SECURITY_INFORMATION | LABEL_SECURITY_INFORMATION;
-        read_sddl(&loc.path, info).unwrap_or_else(|e| panic!("read the socket file's security {context}: {e}"))
+        read_sddl(loc.path(), info).unwrap_or_else(|e| panic!("read the socket file's security {context}: {e}"))
     };
     let file_security = security_of_file("before any child runs");
     let measured = format!(
         "the socket file: {}\n  {file_security}\nits folder: {}\n  {}",
-        loc.path.display(),
-        loc.dir.display(),
-        dacl_and_label_sddl(&loc.dir),
+        loc.path().display(),
+        loc.dir().display(),
+        dacl_and_label_sddl(loc.dir()),
     );
     println!("{measured}");
     assert!(
-        acl::verify_file_acl(&loc.path, &me).unwrap(),
+        acl::verify_file_acl(loc.path(), &me).unwrap(),
         "the socket is exact\n{measured}"
     );
     // The refusal below rests on the file having no integrity label, which makes it Medium with
@@ -623,7 +627,7 @@ fn a_low_integrity_process_of_the_same_user_cannot_connect_to_the_agent_socket()
         let dir = profile.0.join(format!("pair-{tag}"));
         std::fs::create_dir(&dir).unwrap();
         set_low_label(&dir, "OICI");
-        child_entry::write_input(&dir, &format!("socket={}\nintegrity={level}\n", loc.path.display()));
+        child_entry::write_input(&dir, &format!("socket={}\nintegrity={level}\n", loc.path().display()));
         let name = "child_connects_at_its_integrity_level";
         let code = integrity::run_at(
             level,
@@ -659,10 +663,10 @@ fn a_low_integrity_process_of_the_same_user_cannot_connect_to_the_agent_socket()
 
     // The label is the cause: with only the socket file's label lowered to Low, the same Low child
     // connects.
-    set_low_label(&loc.path, "");
+    set_low_label(loc.path(), "");
     let labelled = security_of_file("after it was labelled Low");
     assert!(
-        labelled.contains(&low_label_ace("")) && acl::verify_file_acl(&loc.path, &me).unwrap(),
+        labelled.contains(&low_label_ace("")) && acl::verify_file_acl(loc.path(), &me).unwrap(),
         "the socket file must carry a Low label and keep its exact DACL\n{measured}\nnow: {labelled}"
     );
     let low_labelled = run("low-labelled", integrity::LOW);
@@ -795,13 +799,13 @@ fn shim_as_bob_never_reaches_another_users_listener() {
     let _lock = UserLock::try_acquire(&admin_loc.lock_path())
         .unwrap()
         .expect("no agent runs on the CI host");
-    let listener = Recorder::listen(&admin_loc.path);
+    let listener = Recorder::listen(admin_loc.path());
     // The file DACL would turn bob away on its own, which would hide a shim that looked in the
     // wrong profile. Grant bob the socket, so that only the path decides: a shim that followed
     // the administrator's environment would connect here and fail the sentinel check below.
     let status = desktop::status(
         Command::new("icacls")
-            .arg(&admin_loc.path)
+            .arg(admin_loc.path())
             .args(["/grant", &format!("*{}:(F)", bob.sid_text)]),
     )
     .unwrap();
@@ -854,7 +858,7 @@ fn child_makes_its_own_socket_dir() {
     let me = Sid::current_user().unwrap();
     userdir::ensure_socket_dir(&loc, &me).unwrap_or_else(|e| panic!("make the private folder: {e:#}"));
 
-    child_entry::write_result(&dir, &format!("{}\n", loc.path.display()));
+    child_entry::write_result(&dir, &format!("{}\n", loc.path().display()));
 }
 
 /// The control for the test above: the same shim, run the same way, does connect when a listener
@@ -877,11 +881,11 @@ fn shim_as_bob_reaches_a_listener_in_bobs_own_location() {
     );
     assert_eq!(
         PathBuf::from(child_entry::result(&shared.0).trim_end()),
-        bob_loc.path,
+        bob_loc.path(),
         "the child resolved a different location than his token gives the administrator"
     );
 
-    let listener = Recorder::listen(&bob_loc.path);
+    let listener = Recorder::listen(bob_loc.path());
 
     let run = run_shim_as(&bob, &shared);
 
@@ -890,7 +894,7 @@ fn shim_as_bob_reaches_a_listener_in_bobs_own_location() {
         first,
         SENTINEL,
         "the shim run as bob did not connect to bob's own socket {}\nits stderr: {}\nits exit: {}",
-        bob_loc.path.display(),
+        bob_loc.path().display(),
         run.stderr,
         hard_errors::describe_exit(run.code)
     );

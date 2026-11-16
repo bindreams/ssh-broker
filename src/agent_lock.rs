@@ -66,18 +66,28 @@ impl UserLock {
         Ok(try_lock(path, 0)?.map(|_file| UserLock { _file }))
     }
 
+    /// [`UserLock::try_acquire`] on a lock file the caller opened (by handle, so as to never create
+    /// it). `name` is for messages only.
+    pub fn try_acquire_open(file: File, name: &Path) -> anyhow::Result<Option<UserLock>> {
+        Ok(try_lock_open(file, name, 0)?.map(|_file| UserLock { _file }))
+    }
+
     /// Take the lock, waiting for it if another handle holds it. `on_wait` runs once, after the
     /// lock was found held and before the wait begins, so a caller can say it is waiting and a
     /// test can tell "held, about to block" from "free". The wait has no limit: the holder is
     /// another agent that exists, so there is nothing to time out on; it ends when the holder dies.
     pub fn acquire(path: &Path, on_wait: impl FnOnce()) -> anyhow::Result<UserLock> {
-        let file = open(path)?;
+        UserLock::acquire_open(open(path)?, path, on_wait)
+    }
+
+    /// [`UserLock::acquire`] on a lock file the caller opened. `name` is for messages only.
+    pub fn acquire_open(file: File, name: &Path, on_wait: impl FnOnce()) -> anyhow::Result<UserLock> {
         match lock(&file, LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY, 0) {
             Ok(()) => return Ok(UserLock { _file: file }),
             Err(e) if e.code() == HRESULT::from_win32(ERROR_LOCK_VIOLATION.0) => on_wait(),
-            Err(e) => return Err(e).with_context(|| format!("lock {}", path.display())),
+            Err(e) => return Err(e).with_context(|| format!("lock {}", name.display())),
         }
-        lock(&file, LOCKFILE_EXCLUSIVE_LOCK, 0).with_context(|| format!("lock {}", path.display()))?;
+        lock(&file, LOCKFILE_EXCLUSIVE_LOCK, 0).with_context(|| format!("lock {}", name.display()))?;
         Ok(UserLock { _file: file })
     }
 }
@@ -98,11 +108,15 @@ fn open(path: &Path) -> anyhow::Result<File> {
 /// if another handle holds it. Any other failure, including a sharing violation from a handle that
 /// does not hold it (a scanner, the indexer), is an error, not proof that someone else serves.
 fn try_lock(path: &Path, offset: u64) -> anyhow::Result<Option<File>> {
-    let file = open(path)?;
+    try_lock_open(open(path)?, path, offset)
+}
+
+/// [`try_lock`] on a file that is already open.
+fn try_lock_open(file: File, name: &Path, offset: u64) -> anyhow::Result<Option<File>> {
     match lock(&file, LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY, offset) {
         Ok(()) => Ok(Some(file)),
         Err(e) if e.code() == HRESULT::from_win32(ERROR_LOCK_VIOLATION.0) => Ok(None),
-        Err(e) => Err(e).with_context(|| format!("lock {}", path.display())),
+        Err(e) => Err(e).with_context(|| format!("lock {}", name.display())),
     }
 }
 

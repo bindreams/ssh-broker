@@ -19,14 +19,45 @@ pub const SESSIONS_LOCK_FILE_NAME: &str = "sessions.lock";
 pub const LOGS_DIR_NAME: &str = "logs";
 pub const SERVING_MARKER_NAME: &str = "serving";
 
-/// A user's socket directory and the socket inside it.
+/// The folders between the profile directory and the private folder, in the order a walk opens them.
+/// [`SocketLocation::dir`] is built from these, so a walk over them reaches that folder and no other.
+pub const FOLDERS_IN_PROFILE: [&str; 2] = ["AppData", "Local"];
+
+/// A user's socket directory and the socket inside it. Made from a profile directory and nothing
+/// else, so `dir` and `path` are always inside `profile`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SocketLocation {
-    pub dir: PathBuf,
-    pub path: PathBuf,
+    /// The profile directory `dir` is in.
+    profile: PathBuf,
+    /// `<profile>\AppData\Local\ssh-broker`.
+    dir: PathBuf,
+    path: PathBuf,
 }
 
 impl SocketLocation {
+    fn in_profile(profile: &Path) -> SocketLocation {
+        let dir = FOLDERS_IN_PROFILE
+            .iter()
+            .fold(profile.to_path_buf(), |path, name| path.join(name))
+            .join(SOCKET_DIR_NAME);
+        let path = dir.join(SOCKET_FILE_NAME);
+        SocketLocation {
+            profile: profile.to_path_buf(),
+            dir,
+            path,
+        }
+    }
+
+    /// The private folder: the one the agent makes, the shim looks in and the socket is inside.
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// The socket the agent listens on.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
     /// The lock file the agent holds while it serves.
     pub fn lock_path(&self) -> PathBuf {
         self.dir.join(LOCK_FILE_NAME)
@@ -42,6 +73,11 @@ impl SocketLocation {
     /// never read: the change in the folder is the signal a waiting shim watches for.
     pub fn serving_marker_path(&self) -> PathBuf {
         self.dir.join(SERVING_MARKER_NAME)
+    }
+
+    /// The profile directory this location was made from: where a walk to the folder starts.
+    pub fn profile_dir(&self) -> &Path {
+        &self.profile
     }
 
     /// The folder the shim and the agent log into.
@@ -62,17 +98,16 @@ pub enum SocketLocationError {
 
 /// The socket location inside `profile`, or why it cannot be used.
 pub fn for_profile(profile: &Path) -> Result<SocketLocation, SocketLocationError> {
-    let dir = profile.join("AppData").join("Local").join(SOCKET_DIR_NAME);
-    let path = dir.join(SOCKET_FILE_NAME);
-    let bytes = path.as_os_str().len();
+    let location = SocketLocation::in_profile(profile);
+    let bytes = location.path.as_os_str().len();
     if bytes > MAX_SOCKET_PATH_BYTES {
         return Err(SocketLocationError::TooLong {
-            path,
+            path: location.path,
             bytes,
             max: MAX_SOCKET_PATH_BYTES,
         });
     }
-    Ok(SocketLocation { dir, path })
+    Ok(location)
 }
 
 #[cfg(test)]
