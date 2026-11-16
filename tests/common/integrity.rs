@@ -20,7 +20,8 @@ use windows::core::PCWSTR;
 use crate::account::{Starter, is_elevated, spawn_with_token, wide};
 use crate::desktop::PrivateDesktop;
 
-/// `SE_GROUP_INTEGRITY`: the attribute of a token's integrity label (the `windows` crate has no constant).
+/// `SE_GROUP_INTEGRITY`: the attribute of a token's integrity label. The `windows` crate has it, with
+/// the label RIDs, in `Win32::System::SystemServices`, a feature this crate does not enable.
 const SE_GROUP_INTEGRITY: u32 = 0x20;
 
 /// The relative id of the Low mandatory label, `S-1-16-4096`.
@@ -47,7 +48,8 @@ pub fn current_rid() -> u32 {
             &mut len,
         )
         .expect("read the token's integrity level");
-        let label = &*(buf.as_ptr() as *const TOKEN_MANDATORY_LABEL);
+        // The buffer is bytes, so the structure in it may be unaligned.
+        let label = std::ptr::read_unaligned(buf.as_ptr().cast::<TOKEN_MANDATORY_LABEL>());
         let sid = label.Label.Sid;
         let count = *GetSidSubAuthorityCount(sid);
         *GetSidSubAuthority(sid, u32::from(count) - 1)
@@ -106,7 +108,9 @@ fn token_at(rid: u32) -> OwnedHandle {
 /// An elevated process gives the child a window station and desktop of its own, labelled at `rid`: a
 /// pair without a label is Medium, and a Low child cannot write to it. An unelevated process may not
 /// name a window station, so the child takes this process's own, which an interactive user's Low
-/// processes use anyway.
+/// processes use anyway. The two supported contexts are therefore an elevated administrator (CI) and
+/// an unelevated user on an interactive desktop (a workstation); an unelevated process with no
+/// interactive desktop gives a Low child nothing it may use.
 pub fn run_at(rid: u32, exe: &Path, command_line: &str, cwd: &Path, evidence: &[PathBuf]) -> u32 {
     let private = is_elevated().then(|| {
         let user = Sid::current_user().unwrap().to_sddl().unwrap();

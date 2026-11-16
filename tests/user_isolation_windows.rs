@@ -1,10 +1,12 @@
-//! One account cannot reach another account's agent. Windows only; **Elevated (CI only)**.
+//! One account cannot reach another account's agent. Windows only; **Elevated (CI only)**, except
+//! the tests that create no account.
 //!
-//! These tests create throwaway local accounts and profiles, log them on the way sshd does (a
-//! network logon, which has no loaded profile), and start processes under those tokens. They need
-//! an elevated administrator and refuse to run anywhere else, before they touch anything: run
-//! them in CI, never on a workstation. The acceptance procedure repeats the central cases through
-//! a real sshd.
+//! The tests that create accounts make throwaway local accounts and profiles, log them on the way
+//! sshd does (a network logon, which has no loaded profile), and start processes under those
+//! tokens. They need an elevated administrator and refuse to run anywhere else, before they touch
+//! anything: run them in CI, never on a workstation. The tests that create no account (the ones on
+//! a creator's default DACL and on the integrity level) also run unelevated. The acceptance
+//! procedure repeats the central cases through a real sshd.
 //!
 //! The central property: the shim derives its socket from its own token's profile and from
 //! nothing else, and the socket file grants connect access to exactly its user, SYSTEM and
@@ -28,10 +30,10 @@ use windows::Win32::Security::Authorization::{
     GetNamedSecurityInfoW, SE_FILE_OBJECT, SetNamedSecurityInfoW,
 };
 use windows::Win32::Security::{
-    ACL, DACL_SECURITY_INFORMATION, DuplicateTokenEx, GetSecurityDescriptorDacl, LABEL_SECURITY_INFORMATION,
-    OBJECT_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, SecurityImpersonation,
-    SetTokenInformation, TOKEN_ALL_ACCESS, TOKEN_DEFAULT_DACL, TOKEN_DUPLICATE, TOKEN_QUERY, TokenDefaultDacl,
-    TokenImpersonation,
+    ACL, DACL_SECURITY_INFORMATION, DuplicateTokenEx, GetSecurityDescriptorDacl, GetSecurityDescriptorSacl,
+    LABEL_SECURITY_INFORMATION, OBJECT_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
+    SecurityImpersonation, SetTokenInformation, TOKEN_ALL_ACCESS, TOKEN_DEFAULT_DACL, TOKEN_DUPLICATE, TOKEN_QUERY,
+    TokenDefaultDacl, TokenImpersonation,
 };
 use windows::Win32::System::Threading::{GetCurrentProcess, LOGON_WITH_PROFILE, OpenProcessToken, SetThreadToken};
 use windows::core::{BOOL, PCWSTR, PWSTR};
@@ -65,18 +67,26 @@ fn icacls_report(path: &Path) -> String {
 
 /// The DACL of `path` as SDDL, read through the security API (an inherited ACE carries `ID`, an
 /// ACE that passes access down `OI` or `CI`), for an assertion message and for the precondition
-/// of the control test.
+/// of the control test. A descriptor that cannot be read gives a placeholder text, which has no
+/// `D:` prefix.
 fn dacl_sddl(path: &Path) -> String {
     sddl_of(path, DACL_SECURITY_INFORMATION)
 }
 
-/// The DACL and the mandatory integrity label of `path` as SDDL (`S:(ML;...)` when it has a label).
+/// The DACL and the mandatory integrity label of `path` as SDDL (`S:(ML;...)` when it has a label),
+/// for an assertion message. A descriptor that cannot be read gives a placeholder text; an assertion
+/// on the contents uses [`read_sddl`].
 fn dacl_and_label_sddl(path: &Path) -> String {
     sddl_of(path, DACL_SECURITY_INFORMATION | LABEL_SECURITY_INFORMATION)
 }
 
-/// The parts of `path`'s security descriptor named by `info`, as SDDL.
+/// [`read_sddl`], with a placeholder text for a descriptor that cannot be read.
 fn sddl_of(path: &Path, info: OBJECT_SECURITY_INFORMATION) -> String {
+    read_sddl(path, info).unwrap_or_else(|e| format!("(cannot read the security descriptor: {e})"))
+}
+
+/// The parts of `path`'s security descriptor named by `info`, as SDDL, or why they could not be read.
+fn read_sddl(path: &Path, info: OBJECT_SECURITY_INFORMATION) -> Result<String, String> {
     let path_w = wide(&path.to_string_lossy());
     let mut sd = PSECURITY_DESCRIPTOR::default();
     // SAFETY: NUL-terminated path, valid out-pointers; both allocations are freed below.
@@ -92,17 +102,45 @@ fn sddl_of(path: &Path, info: OBJECT_SECURITY_INFORMATION) -> String {
             &mut sd,
         );
         if let Err(e) = rc.ok() {
-            return format!("(cannot read the DACL: {e})");
+            return Err(format!("read: {e}"));
         }
         let mut text = PWSTR::null();
         let converted = ConvertSecurityDescriptorToStringSecurityDescriptorW(sd, 1, info, &mut text, None);
         let out = match converted {
-            Ok(()) => text.to_string().unwrap_or_else(|e| format!("(not UTF-16: {e})")),
-            Err(e) => format!("(cannot convert the DACL: {e})"),
+            Ok(()) => text.to_string().map_err(|e| format!("not UTF-16: {e}")),
+            Err(e) => Err(format!("convert: {e}")),
         };
         let _ = LocalFree(Some(HLOCAL(text.0.cast())));
         let _ = LocalFree(Some(HLOCAL(sd.0)));
         out
+    }
+}
+
+/// Set `path`'s mandatory integrity label to Low, with the ACE flags `ace_flags` (`OICI` to pass it to
+/// children of a directory, empty for a file), so that a Low-integrity process of the user may write
+/// to it. Lowering the label of one's own object needs no privilege. Set through the security API:
+/// `icacls /setintegritylevel` reports success on a socket file and leaves it unlabelled.
+fn set_low_label(path: &Path, ace_flags: &str) {
+    let sddl = wide(&format!("S:(ML;{ace_flags};NW;;;LW)"));
+    let path_w = wide(&path.to_string_lossy());
+    // SAFETY: NUL-terminated inputs; the descriptor outlives the call and is freed after it.
+    unsafe {
+        let mut sd = PSECURITY_DESCRIPTOR::default();
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(PCWSTR(sddl.as_ptr()), 1, &mut sd, None).unwrap();
+        let (mut present, mut defaulted) = (BOOL(0), BOOL(0));
+        let mut sacl: *mut ACL = std::ptr::null_mut();
+        GetSecurityDescriptorSacl(sd, &mut present, &mut sacl, &mut defaulted).unwrap();
+        let rc = SetNamedSecurityInfoW(
+            PCWSTR(path_w.as_ptr()),
+            SE_FILE_OBJECT,
+            LABEL_SECURITY_INFORMATION,
+            None,
+            None,
+            None,
+            Some(sacl as *const ACL),
+        );
+        let _ = LocalFree(Some(HLOCAL(sd.0)));
+        rc.ok().unwrap_or_else(|e| panic!("label {path:?} Low: {e}"));
     }
 }
 
@@ -479,14 +517,7 @@ const WSAEACCES: i32 = 10013;
 /// What [`child_connects_at_its_integrity_level`] observed, one `key=value` line per fact.
 fn child_facts(level: u32, stat: &str, create: &str, connect: &str, os_error: Option<i32>) -> String {
     let os_error = os_error.map_or("none".to_owned(), |code| code.to_string());
-    format!(
-        "integrity={level}
-stat={stat}
-create={create}
-connect={connect}
-connect_os_error={os_error}
-"
-    )
+    format!("integrity={level}\nstat={stat}\ncreate={create}\nconnect={connect}\nconnect_os_error={os_error}\n")
 }
 
 /// The value of `key` in a child's result.
@@ -494,12 +525,7 @@ fn fact<'a>(result: &'a str, key: &str) -> &'a str {
     result
         .lines()
         .find_map(|line| line.strip_prefix(key)?.strip_prefix('='))
-        .unwrap_or_else(|| {
-            panic!(
-                "the child's result has no {key}:
-{result}"
-            )
-        })
+        .unwrap_or_else(|| panic!("the child's result has no {key}:\n{result}"))
 }
 
 /// Child half of [`a_low_integrity_process_of_the_same_user_cannot_connect_to_the_agent_socket`].
@@ -548,16 +574,17 @@ fn a_low_integrity_process_of_the_same_user_cannot_connect_to_the_agent_socket()
     // A sandboxed process (a renderer, a protected-mode viewer) runs as the user at Low
     // integrity. The socket file's ACL admits the user, so only the integrity check can refuse it.
     let me = Sid::current_user().unwrap();
-    let profile = StandInProfile::new("low-integrity");
+    let profile = StandInProfile::new("low");
     let loc = profile.location();
     userdir::ensure_socket_dir(&loc, &me).unwrap();
     let _listener = Listener::bind(&loc.path).unwrap();
-    let file_security = dacl_and_label_sddl(&loc.path);
+    let security_of_file = |context: &str| {
+        let info = DACL_SECURITY_INFORMATION | LABEL_SECURITY_INFORMATION;
+        read_sddl(&loc.path, info).unwrap_or_else(|e| panic!("read the socket file's security {context}: {e}"))
+    };
+    let file_security = security_of_file("before any child runs");
     let measured = format!(
-        "the socket file: {}
-  {file_security}
-its folder: {}
-  {}",
+        "the socket file: {}\n  {file_security}\nits folder: {}\n  {}",
         loc.path.display(),
         loc.dir.display(),
         dacl_and_label_sddl(&loc.dir),
@@ -565,15 +592,13 @@ its folder: {}
     println!("{measured}");
     assert!(
         acl::verify_file_acl(&loc.path, &me).unwrap(),
-        "the socket is exact
-{measured}"
+        "the socket is exact\n{measured}"
     );
     // The refusal below rests on the file having no integrity label, which makes it Medium with
     // the default no-write-up policy.
     assert!(
         !file_security.contains("(ML;"),
-        "the socket file carries a mandatory label
-{measured}"
+        "the socket file carries a mandatory label\n{measured}"
     );
 
     // Each child writes its result into a directory of its own, labelled Low so that the Low
@@ -582,22 +607,8 @@ its folder: {}
     let run = |tag: &str, level: u32| {
         let dir = profile.0.join(format!("pair-{tag}"));
         std::fs::create_dir(&dir).unwrap();
-        let status = desktop::status(
-            Command::new("icacls")
-                .arg(&dir)
-                .args(["/setintegritylevel", "(OI)(CI)L"]),
-        )
-        .unwrap();
-        assert!(status.success(), "icacls /setintegritylevel on {dir:?}");
-        child_entry::write_input(
-            &dir,
-            &format!(
-                "socket={}
-integrity={level}
-",
-                loc.path.display()
-            ),
-        );
+        set_low_label(&dir, "OICI");
+        child_entry::write_input(&dir, &format!("socket={}\nintegrity={level}\n", loc.path.display()));
         let name = "child_connects_at_its_integrity_level";
         let code = integrity::run_at(
             level,
@@ -608,10 +619,7 @@ integrity={level}
         );
         assert_eq!(code, 0, "the {tag} child failed: {}", hard_errors::describe_exit(code));
         let result = child_entry::result(&dir);
-        println!(
-            "{tag}-integrity child:
-{result}"
-        );
+        println!("{tag}-integrity child:\n{result}");
         result
     };
 
@@ -619,19 +627,28 @@ integrity={level}
     // socket, so a refusal below is the integrity check's doing and not an unreachable path.
     let medium = run("medium", integrity::MEDIUM);
     let expected_medium = child_facts(integrity::MEDIUM, "ok", "ok", "connected", None);
-    assert_eq!(
-        medium, expected_medium,
-        "the control child must connect
-{measured}"
-    );
+    assert_eq!(medium, expected_medium, "the control child must connect\n{measured}");
 
     let low = run("low", integrity::LOW);
     assert_eq!(
         (fact(&low, "stat"), fact(&low, "create"), fact(&low, "connect_os_error")),
         ("ok", "ok", WSAEACCES.to_string().as_str()),
-        "a Low-integrity process of the same user must reach the file and be refused by connect
-{measured}
-{low}"
+        "a Low-integrity process of the same user must reach the file and be refused by connect\n{measured}\n{low}"
+    );
+
+    // The label is the cause: with only the socket file's label lowered to Low, the same Low child
+    // connects.
+    set_low_label(&loc.path, "");
+    let labelled = security_of_file("after it was labelled Low");
+    assert!(
+        labelled.contains("(ML;") && acl::verify_file_acl(&loc.path, &me).unwrap(),
+        "the socket file must carry a Low label and keep its exact DACL\n{measured}\nnow: {labelled}"
+    );
+    let low_labelled = run("low-labelled", integrity::LOW);
+    let expected_low_labelled = child_facts(integrity::LOW, "ok", "ok", "connected", None);
+    assert_eq!(
+        low_labelled, expected_low_labelled,
+        "a Low-integrity process must connect once the socket file is labelled Low\n{measured}\nnow: {labelled}"
     );
 }
 

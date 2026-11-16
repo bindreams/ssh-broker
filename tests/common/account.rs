@@ -519,9 +519,10 @@ impl Account {
 
 /// Start `exe` suspended with the primary `token`, on the window station and desktop `private`, which
 /// the child keeps alive; without one the child takes this process's own (naming a window station
-/// needs an administrator, see [`desktop::PrivateDesktop`]). `who` names the token's owner in messages. The step every start here ends
-/// in: the child is created suspended, its hard-error boxes are switched off before its first
-/// instruction, and `evidence` is printed if it outlives [`crate::bounded_wait::CHILD_EXIT_BOUND`].
+/// needs an administrator, see [`crate::desktop::PrivateDesktop`]). `who` names the token's owner in
+/// messages. The step every start here ends in: the child is created suspended, its hard-error boxes
+/// are switched off before its first instruction, and `evidence` is printed if it outlives
+/// [`crate::bounded_wait::CHILD_EXIT_BOUND`].
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_with_token(
     starter_kind: Starter,
@@ -625,8 +626,8 @@ pub enum Starter {
     AsUser,
 }
 
-/// A child started suspended by [`Account::spawn_with`]. Its window station and desktop live as long
-/// as this does.
+/// A child started suspended by [`spawn_with_token`]. A window station and desktop made for it, if
+/// any, live as long as this does.
 pub struct Spawned {
     pub process: OwnedHandle,
     thread: OwnedHandle,
