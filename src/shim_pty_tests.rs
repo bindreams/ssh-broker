@@ -158,10 +158,7 @@ fn connect_failure_in_the_callers_own_dir_fails_open_without_a_reason_on_stderr(
     // A location that resolves but has no agent behind it: the old behaviour, message unchanged.
     let dir = std::env::temp_dir().join(format!("sb-shim-noagent-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    let location = SocketLocation {
-        path: dir.join("agent.sock"),
-        dir: dir.clone(),
-    };
+    let location = crate::test_support::location_in(&dir);
     let mut stderr = Vec::new();
     let relayed = super::try_relay_at(
         Ok(location),
@@ -187,10 +184,7 @@ fn connect_failure_in_pty_mode_writes_nothing_to_stderr() {
     // relay may yet use, so the reason goes to the log only.
     let dir = std::env::temp_dir().join(format!("sb-shim-noagent-pty-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    let location = SocketLocation {
-        path: dir.join("agent.sock"),
-        dir: dir.clone(),
-    };
+    let location = crate::test_support::location_in(&dir);
     let mut stderr = Vec::new();
     let relayed = super::try_relay_at(Ok(location), &None, &mut stderr, None, std::io::empty(), &mut NoRescue).unwrap();
 
@@ -259,10 +253,7 @@ fn try_relay_connects_to_the_location_its_provider_names() {
 fn a_failed_log_is_named_where_the_shim_already_explains_a_fallback_for_a_command() {
     let dir = std::env::temp_dir().join(format!("sb-shim-nolog-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    let location = SocketLocation {
-        path: dir.join("agent.sock"),
-        dir: dir.clone(),
-    };
+    let location = crate::test_support::location_in(&dir);
     let mut stderr = Vec::new();
     let cause = "the folder belongs to someone else";
     let relayed = super::try_relay_at(
@@ -288,10 +279,7 @@ fn a_failed_log_adds_nothing_to_an_interactive_fallback_that_prints_nothing_toda
     // may yet use); a missing log does not change that.
     let dir = std::env::temp_dir().join(format!("sb-shim-nolog-pty-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    let location = SocketLocation {
-        path: dir.join("agent.sock"),
-        dir: dir.clone(),
-    };
+    let location = crate::test_support::location_in(&dir);
     let mut stderr = Vec::new();
     let relayed = super::try_relay_at(
         Ok(location),

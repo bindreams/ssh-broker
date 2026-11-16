@@ -57,6 +57,16 @@ impl TempProfile {
     }
 }
 
+/// A location whose folder is `dir`, which is not in a profile: for a test that only connects to a
+/// socket there and never walks to the folder. The profile is `dir` itself and is never opened.
+pub fn location_in(dir: &std::path::Path) -> SocketLocation {
+    SocketLocation {
+        profile: dir.to_path_buf(),
+        dir: dir.to_path_buf(),
+        path: dir.join(crate::socket_loc::SOCKET_FILE_NAME),
+    }
+}
+
 impl Drop for TempProfile {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);

@@ -5,11 +5,7 @@ use crate::test_support::TempProfile;
 use crate::userdir::NoProfile;
 
 fn some_location() -> anyhow::Result<SocketLocation> {
-    let dir = std::path::PathBuf::from(r"C:\nowhere");
-    Ok(SocketLocation {
-        path: dir.join("agent.sock"),
-        dir,
-    })
+    Ok(crate::test_support::location_in(std::path::Path::new(r"C:\nowhere")))
 }
 
 fn refused() -> anyhow::Result<socket2::Socket> {

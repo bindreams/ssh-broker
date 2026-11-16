@@ -135,10 +135,7 @@ fn walk(
 /// The folder `Local` of the profile `loc` is in, by the walk of [`open_socket_dir`]: the profile
 /// directory, then `AppData` and `Local` as real directories, a link refused.
 fn open_local(loc: &SocketLocation) -> anyhow::Result<DirHandle> {
-    let profile = loc
-        .profile_dir()
-        .with_context(|| format!(r"{} is not <profile>\AppData\Local\ssh-broker", loc.dir.display()))?;
-    let root = acl::open_root(profile)?;
+    let root = acl::open_root(loc.profile_dir())?;
     let app_data = acl::open_dir(&root, "AppData")?;
     acl::open_dir(&app_data, "Local")
 }

@@ -22,6 +22,8 @@ pub const SERVING_MARKER_NAME: &str = "serving";
 /// A user's socket directory and the socket inside it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SocketLocation {
+    /// The profile directory `dir` is in (`<profile>\AppData\Local\ssh-broker`).
+    pub profile: PathBuf,
     pub dir: PathBuf,
     pub path: PathBuf,
 }
@@ -44,14 +46,9 @@ impl SocketLocation {
         self.dir.join(SERVING_MARKER_NAME)
     }
 
-    /// The profile directory this location is inside: three levels above `dir`, if `dir` is
-    /// `<profile>\AppData\Local\ssh-broker` as [`for_profile`] makes it, and `None` for any other
-    /// shape. Names compare without case, as the file system does.
-    pub fn profile_dir(&self) -> Option<&Path> {
-        let named = |path: &Path, name: &str| path.file_name().is_some_and(|n| n.eq_ignore_ascii_case(name));
-        let local = self.dir.parent().filter(|_| named(&self.dir, SOCKET_DIR_NAME))?;
-        let app_data = local.parent().filter(|_| named(local, "Local"))?;
-        app_data.parent().filter(|_| named(app_data, "AppData"))
+    /// The profile directory this location was made from: where a walk to the folder starts.
+    pub fn profile_dir(&self) -> &Path {
+        &self.profile
     }
 
     /// The folder the shim and the agent log into.
@@ -82,7 +79,11 @@ pub fn for_profile(profile: &Path) -> Result<SocketLocation, SocketLocationError
             max: MAX_SOCKET_PATH_BYTES,
         });
     }
-    Ok(SocketLocation { dir, path })
+    Ok(SocketLocation {
+        profile: profile.to_path_buf(),
+        dir,
+        path,
+    })
 }
 
 #[cfg(test)]
