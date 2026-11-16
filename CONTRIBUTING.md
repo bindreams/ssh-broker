@@ -53,7 +53,7 @@ verifies the folder, binds, verifies the socket file, and only then listens; it 
 cannot prove. If it cannot prove the folder is safe, the agent refuses to bind.
 
 `userdir::open_socket_dir` (and `ensure_socket_dir` over it) reaches the folder by handle: it opens
-the profile directory (the administrator's, opened following links), then `AppData`, `Local`,
+the profile directory (opened following a link, see below), then `AppData`, `Local`,
 `ssh-broker` and `logs`, each by name relative to the handle above it, with `FILE_OPEN_REPARSE_POINT`,
 and refuses any whose handle is a reparse point. A process of the same account at lower integrity can
 replace one of those names with a junction or symlink, and a path walk would follow it out of the
@@ -64,7 +64,14 @@ handle and never modified: if it is not a real directory with an owner in {user,
 Administrators} and exactly the private ACL, it is refused and left untouched, and removing it makes
 it be created again. That is not a repair because a repair would re-ACL whatever a hard link inside
 the folder names, and a handle opened before it stays open after it. A link at `AppData`,
-`AppData\Local`, `ssh-broker` or `logs` is refused for every caller, a deliberate one included. A profile
+`AppData\Local`, `ssh-broker` or `logs` is refused for every caller, a deliberate one included. A link at
+the profile directory itself, or above it, is followed: its path is `ProfileImagePath`, and Windows
+loads the profile through that same path, links included, so the broker uses the profile where the
+operating system does and a layout that works today (a junction made for one profile, a profile that
+is a mounted volume) keeps working. What that leaves: an account that replaces its own profile
+directory with a link can make an elevated shim create, and never modify, an `ssh-broker` folder
+(with `logs` and a log file) under another `AppData\Local`. That folder is then refused by its owner's
+agent, with the folder named, and removing it restores them. A profile
 path that would push the socket past the 107-byte AF_UNIX limit is an error, not a reason to use
 another location (`socket_loc::SocketLocationError::TooLong`).
 
