@@ -19,7 +19,10 @@ use windows::Win32::Storage::FileSystem::{
 };
 use windows::core::{BOOL, HRESULT, PCWSTR};
 
-use super::{Grant, LocalSd, Security, Sid, WellKnown, describe_sid, open_for_inspection, wide};
+use super::{
+    Grant, LocalSd, Security, Sid, WellKnown, denied_problem, describe_sid, open_for_inspection, owner_acl_problem,
+    wide,
+};
 use crate::winutil::OwnedHandle;
 
 /// Owner Administrators; protected DACL; SYSTEM and Administrators Full Control, no inheritable ACE.
@@ -96,9 +99,7 @@ fn create_failure(error: windows::core::Error, path: &Path) -> anyhow::Error {
 /// link.
 pub fn admin_only_file_problem(path: &Path) -> anyhow::Result<Option<String>> {
     let Some(handle) = open_for_inspection(path)? else {
-        return Ok(Some(
-            "this process is denied access to read its ACL, so it cannot be shown to be private".to_owned(),
-        ));
+        return Ok(Some(denied_problem("private")));
     };
     let security = Security::from_handle(handle.0).with_context(|| format!("read the ACL of {}", path.display()))?;
     let mut info = BY_HANDLE_FILE_INFORMATION::default();
@@ -131,16 +132,13 @@ fn problem_from_security(security: &Security) -> Option<String> {
     let owner_ok = security.owner_in(&[&system, &admins]).unwrap_or(false);
     let acl_ok = security.dacl_matches(&[full(&system), full(&admins)]).unwrap_or(false);
     let owner = describe_sid(security.owner);
-    match (owner_ok, acl_ok) {
-        (true, true) => None,
-        (false, true) => Some(format!("its owner is {owner}, not SYSTEM or Administrators")),
-        (true, false) => Some(format!(
-            "its ACL is not exactly SYSTEM and Administrators (owner {owner} is fine)"
-        )),
-        (false, false) => Some(format!(
-            "its owner is {owner}, not SYSTEM or Administrators, and its ACL is not exactly SYSTEM and Administrators"
-        )),
-    }
+    owner_acl_problem(
+        &owner,
+        owner_ok,
+        acl_ok,
+        "SYSTEM or Administrators",
+        "exactly SYSTEM and Administrators",
+    )
 }
 
 #[cfg(test)]

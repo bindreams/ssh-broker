@@ -535,10 +535,19 @@ pub fn verify_dir_acl(dir: &Path, target_user: &Sid) -> anyhow::Result<bool> {
 
 /// [`verify_dir_acl`] on an already-read security descriptor.
 fn dir_policy_holds(security: &Security, user: &Sid) -> anyhow::Result<bool> {
+    let (owner_ok, acl_ok) = dir_policy(security, user)?;
+    Ok(owner_ok && acl_ok)
+}
+
+/// Whether the owner and the ACL of a private directory are each what they must be, for a caller
+/// that says which one is not.
+fn dir_policy(security: &Security, user: &Sid) -> anyhow::Result<(bool, bool)> {
     let system = Sid::well_known(WellKnown::System)?;
     let admins = Sid::well_known(WellKnown::Administrators)?;
-    Ok(security.owner_in(&[user, &system, &admins])?
-        && security.dacl_matches(&private_grants(user, &system, &admins, Some(PRIVATE_DIR_ACE_FLAGS)))?)
+    Ok((
+        security.owner_in(&[user, &system, &admins])?,
+        security.dacl_matches(&private_grants(user, &system, &admins, Some(PRIVATE_DIR_ACE_FLAGS)))?,
+    ))
 }
 
 /// `true` iff `file` (the socket, the lock, a folder made inside a hardened directory) grants
@@ -706,6 +715,26 @@ fn nt_path(dir: &Path) -> anyhow::Result<Vec<u16>> {
     Ok([units(prefix).as_slice(), rest].concat())
 }
 
+/// Which of the owner and the ACL of a folder or file is wrong, or `None` if neither: the one
+/// sentence every refusal of such an object is built from. `owner` is the owner as the object has it,
+/// `owner_set` the owners that would do, `acl_is` what its ACL must be.
+fn owner_acl_problem(owner: &str, owner_ok: bool, acl_ok: bool, owner_set: &str, acl_is: &str) -> Option<String> {
+    match (owner_ok, acl_ok) {
+        (true, true) => None,
+        (false, true) => Some(format!("its owner is {owner}, not {owner_set}")),
+        (true, false) => Some(format!("its ACL is not {acl_is} (its owner, {owner}, is fine)")),
+        (false, false) => Some(format!(
+            "its owner is {owner}, not {owner_set}, and its ACL is not {acl_is}"
+        )),
+    }
+}
+
+/// The sentence for an object whose ACL this process may not read, so that it cannot be shown to be
+/// `shown_to_be`.
+fn denied_problem(shown_to_be: &str) -> String {
+    format!("this process is denied access to read its ACL, so it cannot be shown to be {shown_to_be}")
+}
+
 /// The ACEs of [`INSTALL_DIR_SDDL`], as [`Security::dacl_matches`] takes them.
 fn install_grants<'a>(system: &'a Sid, admins: &'a Sid, users: &'a Sid) -> [Grant<'a>; 3] {
     let grant = |sid, mask| Grant {
@@ -729,9 +758,7 @@ pub fn install_dir_problem(dir: &Path) -> anyhow::Result<Option<String>> {
 /// open was denied.
 fn problem_from_open(dir: &Path, handle: Option<OwnedHandle>) -> anyhow::Result<Option<String>> {
     let Some(handle) = handle else {
-        return Ok(Some(
-            "this process is denied access to read its ACL, so it cannot be shown to be the hardened one".to_owned(),
-        ));
+        return Ok(Some(denied_problem("the hardened one")));
     };
 
     let security = Security::from_handle(handle.0).with_context(|| format!("read the ACL of {}", dir.display()))?;
@@ -756,14 +783,13 @@ fn problem_from_open(dir: &Path, handle: Option<OwnedHandle>) -> anyhow::Result<
     // `INSTALL_DIR_SDDL` makes Administrators the owner, so nothing else is accepted.
     let owner_ok = security.owner_in(&[&admins])?;
     let acl_ok = security.dacl_matches(&grants)?;
-    Ok(match (owner_ok, acl_ok) {
-        (true, true) => None,
-        (false, true) => Some(format!("its owner is {owner}, not the Administrators group")),
-        (true, false) => Some(format!("its ACL is not the hardened one (its owner, {owner}, is fine)")),
-        (false, false) => Some(format!(
-            "its owner is {owner}, not the Administrators group, and its ACL is not the hardened one"
-        )),
-    })
+    Ok(owner_acl_problem(
+        &owner,
+        owner_ok,
+        acl_ok,
+        "the Administrators group",
+        "the hardened one",
+    ))
 }
 
 /// Create `dir` with the install-directory DACL, or accept it if this build made it already.

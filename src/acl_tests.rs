@@ -746,6 +746,49 @@ fn install_dir_problem_says_so_when_the_acl_cannot_be_read() {
     assert!(ensured.is_err());
 }
 
+/// The same folder as above, as the private folder of a user: the refusal says that this process may
+/// not read its security, not that the owner or the ACL is wrong, and ends with the remedy.
+#[test]
+fn ensure_private_dir_says_so_when_the_folders_security_cannot_be_read() {
+    let parent = TempPath::new("priv-no-read");
+    let me_sid = Sid::current_user().unwrap();
+    let me = me_sid.to_sddl().unwrap();
+    std::fs::create_dir_all(parent.0.join("ssh-broker")).unwrap();
+    set_security(
+        &parent.0.join("ssh-broker"),
+        &format!("O:{me}D:P(D;;RC;;;WD)(A;;;;;OW)(A;;0x10001;;;{me})"),
+    );
+    let root = open_root(&parent.0).unwrap();
+
+    let err = without_privileges(|| ensure_private_dir(&root, "ssh-broker", &me_sid).err().expect("refused"));
+
+    assert!(err.is::<Refused>(), "{err:#}");
+    let text = format!("{err:#}");
+    assert!(text.contains("denied access to read its ACL"), "{text}");
+    assert!(text.contains("remove"), "{text}");
+    assert!(!text.contains("its owner is"), "{text}");
+}
+
+#[test]
+fn the_owner_and_the_acl_are_blamed_separately_with_the_wording_of_each_kind_of_object() {
+    for (owner_set, acl_is) in [
+        ("the Administrators group", "the hardened one"),
+        ("SYSTEM or Administrators", "exactly SYSTEM and Administrators"),
+    ] {
+        let problem = |owner_ok, acl_ok| owner_acl_problem("X", owner_ok, acl_ok, owner_set, acl_is);
+        assert_eq!(problem(true, true), None);
+        let owner = problem(false, true).unwrap();
+        assert_eq!(owner, format!("its owner is X, not {owner_set}"));
+        let acl = problem(true, false).unwrap();
+        assert_eq!(acl, format!("its ACL is not {acl_is} (its owner, X, is fine)"));
+        let both = problem(false, false).unwrap();
+        assert_eq!(
+            both,
+            format!("its owner is X, not {owner_set}, and its ACL is not {acl_is}")
+        );
+    }
+}
+
 #[test]
 fn nt_path_prefixes_each_win32_path_form() {
     let nt = |p: &str| String::from_utf16(&nt_path(Path::new(p)).unwrap()).unwrap();

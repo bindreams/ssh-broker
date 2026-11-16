@@ -130,6 +130,26 @@ fn a_widened_folder_is_refused_and_left_untouched() {
     );
 }
 
+#[test]
+fn a_folder_owned_by_the_user_with_an_extra_ace_is_blamed_on_the_acl_not_the_owner() {
+    let profile = TempProfile::new("extra");
+    let (broker, _) = made(&profile);
+    icacls(broker.path(), &["/grant", "*S-1-1-0:(OI)(CI)F"]);
+
+    let err = format!(
+        "{:#}",
+        ensure_private_dir(&local_of(&profile), "ssh-broker", &me())
+            .err()
+            .unwrap()
+    );
+
+    assert!(err.contains("its ACL is not exactly"), "{err}");
+    assert!(err.contains("owner"), "the owner is said to be fine: {err}");
+    assert!(err.contains("is fine"), "{err}");
+    assert!(!err.contains("its owner is"), "the owner is not the problem: {err}");
+    assert!(err.contains("remove"), "{err}");
+}
+
 /// `Local` of a stand-in profile, opened by the walk.
 fn local_of(profile: &TempProfile) -> DirHandle {
     open_dir(&open_dir(&open_root(&profile.0).unwrap(), "AppData").unwrap(), "Local").unwrap()

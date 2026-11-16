@@ -23,8 +23,8 @@ use windows::Wdk::Storage::FileSystem::{
     FILE_SYNCHRONOUS_IO_NONALERT, NTCREATEFILE_CREATE_DISPOSITION, NTCREATEFILE_CREATE_OPTIONS, NtCreateFile,
 };
 use windows::Win32::Foundation::{
-    DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE, NTSTATUS, STATUS_NOT_A_DIRECTORY, STATUS_OBJECT_NAME_NOT_FOUND,
-    STATUS_OBJECT_PATH_NOT_FOUND,
+    DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE, NTSTATUS, STATUS_ACCESS_DENIED, STATUS_NOT_A_DIRECTORY,
+    STATUS_OBJECT_NAME_NOT_FOUND, STATUS_OBJECT_PATH_NOT_FOUND,
 };
 use windows::Win32::Security::PSECURITY_DESCRIPTOR;
 use windows::Win32::Storage::FileSystem::{
@@ -36,8 +36,8 @@ use windows::Win32::System::IO::IO_STATUS_BLOCK;
 use windows::Win32::System::Threading::GetCurrentProcess;
 
 use super::{
-    Security, Sid, describe_sid, descriptor_from_sddl, dir_policy_holds, file_attributes, nt_path, open_nt,
-    private_dir_dacl_sddl, status_error, with_attributes,
+    Security, Sid, denied_problem, describe_sid, descriptor_from_sddl, dir_policy, file_attributes, nt_path, open_nt,
+    owner_acl_problem, private_dir_dacl_sddl, status_error, with_attributes,
 };
 use crate::winutil::OwnedHandle;
 
@@ -168,18 +168,35 @@ fn private_dir(parent: &DirHandle, name: &str, user: &Sid, create: bool) -> anyh
         FILE_DIRECTORY_FILE.0 | FILE_OPEN_REPARSE_POINT.0,
         descriptor.as_ref().map(|descriptor| descriptor.0),
     )?;
+    if made.status == STATUS_ACCESS_DENIED {
+        return Err(Refused(format!(
+            "{} cannot be used {purpose}: {} (or, if it is not there, this process may not make it in {}). \
+             {LEFT_AS_IT_IS}",
+            path.display(),
+            denied_problem("the private one"),
+            parent.path.display()
+        ))
+        .into());
+    }
     let handle = opened(made.status, made.handle, &path, purpose)?;
     refuse_link(&handle, &path, purpose, REMOVE_THE_LINK)?;
 
     let security = Security::from_handle(handle.0).with_context(|| format!("read the ACL of {}", path.display()))?;
-    if !dir_policy_holds(&security, user)? {
-        return Err(Refused(format!(
-            "{} cannot be used {purpose}: its owner is {}, or its ACL is not exactly Full Control \
-             for {}, SYSTEM and Administrators, protected and inherited by what is made inside. It is left \
-             as it is: inspect it, remove it, and it is created again",
-            path.display(),
-            describe_sid(security.owner),
+    let (owner_ok, acl_ok) = dir_policy(&security, user)?;
+    if let Some(problem) = owner_acl_problem(
+        &describe_sid(security.owner),
+        owner_ok,
+        acl_ok,
+        &format!("{}, SYSTEM or Administrators", user.describe()),
+        &format!(
+            "exactly Full Control for {}, SYSTEM and Administrators, protected and inherited by what is made \
+             inside",
             user.describe()
+        ),
+    ) {
+        return Err(Refused(format!(
+            "{} cannot be used {purpose}: {problem}. {LEFT_AS_IT_IS}",
+            path.display()
         ))
         .into());
     }
@@ -307,6 +324,9 @@ fn opened(status: NTSTATUS, handle: HANDLE, path: &Path, purpose: &str) -> anyho
     }
     Err(status_error(status)).with_context(|| format!("open {}", path.display()))
 }
+
+/// What a refused private folder says about itself and about what to do.
+const LEFT_AS_IT_IS: &str = "It is left as it is: inspect it, remove it, and it is created again";
 
 /// What a refused link says to do, for a name below the profile directory.
 const REMOVE_THE_LINK: &str = "remove the link so that the name is a real folder";
