@@ -94,9 +94,10 @@ pub struct SocketDir {
 /// Make `loc.dir` and its `logs` folder if they are missing, leave both exactly
 /// `{user, SYSTEM, Administrators}` with ACEs the files made inside inherit, and return them open.
 ///
-/// The folders are reached by handle from the profile directory (the administrator's: links in it
-/// are followed), each name opened relative to the handle above it, so a link at `AppData`,
-/// `Local`, `ssh-broker` or `logs` is refused instead of followed (see [`acl::open_dir`]). Only the
+/// The folders are reached by handle from the profile directory (a link at it or above it is
+/// followed, as Windows does for the profile: see `acl::private_dir`), each name opened relative to
+/// the handle above it, so a link at `AppData`, `Local`, `ssh-broker` or `logs` is refused instead
+/// of followed (see [`acl::open_dir`]). Only the
 /// two private folders are created: `AppData` and `Local` must already exist, because a missing one
 /// means there is no profile and inventing one would put a socket where no logon ever looks. A
 /// folder that exists is verified, never changed: one that is not a real directory with an owner in
@@ -145,7 +146,7 @@ fn open_local(loc: &SocketLocation) -> anyhow::Result<DirHandle> {
 /// when the folder or a folder above it is missing; a link on the way is an error, as in
 /// [`open_socket_dir`].
 pub fn open_existing_socket_dir(loc: &SocketLocation) -> anyhow::Result<Option<DirHandle>> {
-    let found = open_local(loc).and_then(|local| acl::open_dir(&local, socket_loc::SOCKET_DIR_NAME));
+    let found = open_local(loc).and_then(|local| acl::open_existing_private_dir(&local, socket_loc::SOCKET_DIR_NAME));
     match found {
         Ok(dir) => Ok(Some(dir)),
         Err(e) if e.is::<acl::Missing>() => Ok(None),

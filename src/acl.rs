@@ -35,7 +35,8 @@ use windows::Wdk::Storage::FileSystem::{
 };
 use windows::Win32::Foundation::{
     CloseHandle, ERROR_ALREADY_EXISTS, HANDLE, HLOCAL, LocalFree, NTSTATUS, OBJ_CASE_INSENSITIVE,
-    RtlNtStatusToDosError, STATUS_ACCESS_DENIED, UNICODE_STRING,
+    RtlNtStatusToDosError, STATUS_ACCESS_DENIED, STATUS_NOT_A_DIRECTORY, STATUS_OBJECT_NAME_NOT_FOUND,
+    STATUS_OBJECT_PATH_NOT_FOUND, UNICODE_STRING,
 };
 use windows::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, GetNamedSecurityInfoW,
@@ -65,8 +66,8 @@ mod admin_file;
 pub use admin_file::{admin_only_file_problem, ensure_admin_only_file};
 mod private_dir;
 pub use private_dir::{
-    DirHandle, Missing, Refused, ensure_private_dir, open_dir, open_existing_file, open_log_file, open_private_dir,
-    open_root,
+    DirHandle, Missing, Refused, ensure_private_dir, open_dir, open_existing_file, open_existing_private_dir,
+    open_log_file, open_private_dir, open_root,
 };
 
 /// ACCESS_ALLOWED_ACE_TYPE (winnt.h) — stored raw in `ACE_HEADER.AceType` (a `u8`).
@@ -600,7 +601,9 @@ fn open_for_inspection(dir: &Path) -> anyhow::Result<Option<OwnedHandle>> {
     match classify_open(made.status) {
         OpenOutcome::Opened => Ok(Some(OwnedHandle(made.handle))),
         OpenOutcome::Denied => Ok(None),
-        OpenOutcome::Failed(status) => Err(status_error(status)).with_context(|| format!("open {}", dir.display())),
+        OpenOutcome::Missing | OpenOutcome::NotADirectory | OpenOutcome::Failed(_) => {
+            Err(status_error(made.status)).with_context(|| format!("open {}", dir.display()))
+        }
     }
 }
 
@@ -699,12 +702,16 @@ fn status_error(status: NTSTATUS) -> windows::core::Error {
     windows::core::Error::from(HRESULT::from_win32(unsafe { RtlNtStatusToDosError(status) }))
 }
 
-/// What the status of an [`nt_create`] means.
+/// What the status of an [`nt_create`] means: the one place a status becomes an outcome.
 #[derive(Debug, PartialEq, Eq)]
 enum OpenOutcome {
     Opened,
-    /// The object refuses even the inspection rights; not an error of the inspection.
+    /// The object refuses even the rights asked for; for an inspection, not an error of it.
     Denied,
+    /// Nothing is at the name, or at a name on the way to it.
+    Missing,
+    /// A file is at the name of a directory that was asked for.
+    NotADirectory,
     Failed(NTSTATUS),
 }
 
@@ -713,6 +720,10 @@ fn classify_open(status: NTSTATUS) -> OpenOutcome {
         OpenOutcome::Opened
     } else if status == STATUS_ACCESS_DENIED {
         OpenOutcome::Denied
+    } else if status == STATUS_OBJECT_NAME_NOT_FOUND || status == STATUS_OBJECT_PATH_NOT_FOUND {
+        OpenOutcome::Missing
+    } else if status == STATUS_NOT_A_DIRECTORY {
+        OpenOutcome::NotADirectory
     } else {
         OpenOutcome::Failed(status)
     }

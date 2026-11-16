@@ -22,7 +22,7 @@ pub fn socket_location_row(location: &anyhow::Result<SocketLocation>) -> Check {
 }
 
 /// `socket dir ACL`: the socket folder is reached the way the agent reaches it (by handle from the
-/// profile directory, no link on the way) and grants exactly this account, SYSTEM and Administrators.
+/// profile directory, no link below it) and grants exactly this account, SYSTEM and Administrators.
 /// Nothing is made or changed: a folder that is not right is for the user to remove.
 pub fn socket_dir_row(location: &anyhow::Result<SocketLocation>, user: &Sid) -> Check {
     let Ok(loc) = location else {

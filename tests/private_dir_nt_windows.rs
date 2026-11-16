@@ -444,9 +444,9 @@ fn a_component_walk_with_open_reparse_point_finds_a_link_at_every_level_without_
 #[test]
 fn a_root_opened_without_the_reparse_flag_follows_a_link_at_the_profile_directory_itself() {
     // What the raw call does when the profile directory itself is a junction and the open does not
-    // ask for the link as itself: it follows it. `acl::open_root` therefore asks (`FILE_OPEN_REPARSE_POINT`)
-    // and refuses a link there; only links ABOVE the profile directory are followed, which the unit
-    // tests of `acl::private_dir` pin.
+    // ask for the link as itself: it follows it. `acl::open_root` relies on this: Windows loads the
+    // profile through `ProfileImagePath`, links included, so the broker opens the profile directory the
+    // same way. Only the names below it are opened as themselves and refused when they are links.
     let (profile, _outside) = profile_and_outside("rootlink");
     let via = Tree::new("rootlink-via");
     junction(&via.0.join("p"), &profile.profile());

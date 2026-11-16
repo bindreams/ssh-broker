@@ -1,12 +1,21 @@
-//! The user's private folder, reached by handle and never through a link.
+//! The user's private folder, reached by handle and never through a link below the profile.
 //!
 //! Anything a process of the same account can do to the tree under the profile (replace
 //! `AppData`, `Local`, `ssh-broker` or `logs` with a junction or symlink) must not lead this code to
-//! check, create or write anywhere else. So the walk starts at one handle on the profile directory,
-//! which is the administrator's and is opened following links, and every name below it is opened
-//! as a single component relative to the handle above, with `FILE_OPEN_REPARSE_POINT`, and refused
-//! when the handle it gave is itself a reparse point. The open and the check are on the same
-//! handle, so nothing can be swapped in between. No call below the root names a path.
+//! check, create or write anywhere else. So the walk starts at one handle on the profile directory
+//! and every name below it is opened as a single component relative to the handle above, with
+//! `FILE_OPEN_REPARSE_POINT`, and refused when the handle it gave is itself a reparse point. The open
+//! and the check are on the same handle, so nothing can be swapped in between. No call below the
+//! root names a path.
+//!
+//! The profile directory itself is opened following a link. Its path is `ProfileImagePath`, and
+//! Windows loads the user's profile through that same path, links included: the broker uses the
+//! profile where the operating system does, and refusing would stop profile layouts that work
+//! today (a junction made by an administrator for one profile, a profile that is a mounted volume).
+//! What this leaves is stated, not closed: an account that replaces its own profile directory with
+//! a link can make an elevated shim create, and never modify, an `ssh-broker` folder (with `logs`
+//! and a log file) under another `AppData\Local`. The owner of that folder refuses it from its
+//! agent, with the folder named, and removing it restores them.
 //!
 //! Like [`super::ensure_admin_only_file`], a folder is created with its security descriptor given
 //! at creation and an existing one is verified and never modified: one that is not exactly right
@@ -20,12 +29,10 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 use windows::Wdk::Storage::FileSystem::{
     FILE_DIRECTORY_FILE, FILE_NON_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_IF, FILE_OPEN_REPARSE_POINT,
-    FILE_SYNCHRONOUS_IO_NONALERT,
+    FILE_SYNCHRONOUS_IO_NONALERT, NTCREATEFILE_CREATE_DISPOSITION,
 };
-use windows::Win32::Foundation::{
-    DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE, STATUS_ACCESS_DENIED, STATUS_NOT_A_DIRECTORY,
-    STATUS_OBJECT_NAME_NOT_FOUND, STATUS_OBJECT_PATH_NOT_FOUND,
-};
+use windows::Win32::Foundation::{DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE};
+use windows::Win32::Security::PSECURITY_DESCRIPTOR;
 use windows::Win32::Storage::FileSystem::{
     FILE_ACCESS_RIGHTS, FILE_APPEND_DATA, FILE_ATTRIBUTE_REPARSE_POINT, FILE_READ_ATTRIBUTES, READ_CONTROL, SYNCHRONIZE,
 };
@@ -97,43 +104,77 @@ impl DirHandle {
     }
 }
 
-/// Open the profile directory `dir` as the root of a walk. Links above it (the folder of all
-/// profiles moved to another drive) are the administrator's and are followed; `dir` itself is the
-/// user's, who holds Full Control on it, so a link there is refused like every component below it.
+/// How one name is opened and what a refusal of it says.
+struct Request<'a> {
+    /// What the object is for, in a refusal: "as the private folder".
+    purpose: &'a str,
+    /// What a refusal says to do when a file is where a directory is wanted.
+    not_a_directory: &'a str,
+    /// Everything after the colon of a refusal when the open is denied, or `None` to report the
+    /// system's error. Only a caller that can say what the denial means gives one.
+    denied: Option<String>,
+    access: u32,
+    disposition: NTCREATEFILE_CREATE_DISPOSITION,
+    options: u32,
+    descriptor: Option<PSECURITY_DESCRIPTOR>,
+}
+
+impl<'a> Request<'a> {
+    /// An existing directory, opened as itself.
+    fn directory(purpose: &'a str, not_a_directory: &'a str) -> Self {
+        Request {
+            purpose,
+            not_a_directory,
+            denied: None,
+            access: DIR_ACCESS,
+            disposition: FILE_OPEN,
+            options: FILE_DIRECTORY_FILE.0 | FILE_OPEN_REPARSE_POINT.0,
+            descriptor: None,
+        }
+    }
+
+    /// A file of the private folder, opened as itself and for `access` (and the right to wait on the
+    /// handle, which a blocking lock needs).
+    fn file(purpose: &'a str, access: u32, disposition: NTCREATEFILE_CREATE_DISPOSITION) -> Self {
+        Request {
+            access: access | SYNCHRONIZE.0 | FILE_READ_ATTRIBUTES.0,
+            disposition,
+            options: FILE_NON_DIRECTORY_FILE.0 | FILE_SYNCHRONOUS_IO_NONALERT.0 | FILE_OPEN_REPARSE_POINT.0,
+            ..Request::directory(purpose, MADE_AGAIN)
+        }
+    }
+}
+
+/// Open the profile directory `dir` as the root of a walk. A link at `dir` or above it is followed
+/// (see the module doc for why); every name below it is not.
 pub fn open_root(dir: &Path) -> anyhow::Result<DirHandle> {
     let name = nt_path(dir)?;
-    let purpose = "as the profile directory";
-    let made = nt_create(
-        None,
-        &name,
-        DIR_ACCESS,
-        FILE_OPEN,
-        FILE_DIRECTORY_FILE.0 | FILE_OPEN_REPARSE_POINT.0,
-        None,
-    )?;
-    let handle = opened(made, dir, purpose)?;
-    refuse_link(&handle, dir, purpose, SET_THE_PROFILE_PATH)?;
+    let request = Request {
+        options: FILE_DIRECTORY_FILE.0,
+        ..Request::directory("as the profile directory", PROFILE_AS_IT_IS)
+    };
+    let made = nt_create(None, &name, request.access, request.disposition, request.options, None)?;
+    let handle = judge(made, dir, &request)?;
     Ok(DirHandle {
         handle,
         path: dir.to_path_buf(),
     })
 }
 
-/// Open the existing directory `name` under `parent`, which is not made if it is missing. A link
-/// is refused: this is how the folders between the profile and the private folder are entered.
+/// Open the existing directory `name` under `parent` that the profile has, which is not made if it is
+/// missing: `AppData` and `Local`. A link is refused. A file there makes the profile unusable.
 pub fn open_dir(parent: &DirHandle, name: &str) -> anyhow::Result<DirHandle> {
-    let units = single_name(name)?;
-    let path = parent.path.join(name);
-    let made = nt_create(
-        Some(parent.raw()),
-        &units,
-        DIR_ACCESS,
-        FILE_OPEN,
-        FILE_DIRECTORY_FILE.0 | FILE_OPEN_REPARSE_POINT.0,
-        None,
-    )?;
-    let handle = opened(made, &path, "on the way to the private folder")?;
-    refuse_link(&handle, &path, "on the way to the private folder", REMOVE_THE_LINK)?;
+    let request = Request::directory("on the way to the private folder", PROFILE_AS_IT_IS);
+    let (handle, path) = open_child(parent, name, &request)?;
+    Ok(DirHandle { handle, path })
+}
+
+/// [`open_dir`] for a folder this code makes (`ssh-broker`), when only what is in it matters: it is
+/// not made if missing and its owner and ACL are not judged. A file there is removed and a folder is
+/// made again.
+pub fn open_existing_private_dir(parent: &DirHandle, name: &str) -> anyhow::Result<DirHandle> {
+    let request = Request::directory("as the private folder", MADE_AGAIN);
+    let (handle, path) = open_child(parent, name, &request)?;
     Ok(DirHandle { handle, path })
 }
 
@@ -152,34 +193,30 @@ pub fn open_private_dir(parent: &DirHandle, name: &str, user: &Sid) -> anyhow::R
 }
 
 fn private_dir(parent: &DirHandle, name: &str, user: &Sid, create: bool) -> anyhow::Result<DirHandle> {
-    let units = single_name(name)?;
-    let path = parent.path.join(name);
-    let purpose = "as the private folder";
     let descriptor = if create {
         Some(descriptor_from_sddl(&private_dir_dacl_sddl(user)?)?)
     } else {
         None
     };
-    let made = nt_create(
-        Some(parent.raw()),
-        &units,
-        DIR_ACCESS,
-        if create { FILE_OPEN_IF } else { FILE_OPEN },
-        FILE_DIRECTORY_FILE.0 | FILE_OPEN_REPARSE_POINT.0,
-        descriptor.as_ref().map(|descriptor| descriptor.0),
-    )?;
-    if made.status == STATUS_ACCESS_DENIED {
-        return Err(Refused(format!(
-            "{} cannot be used {purpose}: {} (or, if it is not there, this process may not make it in {}). \
-             {LEFT_AS_IT_IS}",
-            path.display(),
-            denied_problem("the private one"),
+    // Only a creating open can be refused for lack of the right to make the folder.
+    let may_not_make = if create {
+        format!(
+            " (or, if it is not there, this process may not make it in {})",
             parent.path.display()
-        ))
-        .into());
-    }
-    let handle = opened(made, &path, purpose)?;
-    refuse_link(&handle, &path, purpose, REMOVE_THE_LINK)?;
+        )
+    } else {
+        String::new()
+    };
+    let request = Request {
+        denied: Some(format!(
+            "{}{may_not_make}. {LEFT_AS_IT_IS}",
+            denied_problem("the private one")
+        )),
+        disposition: if create { FILE_OPEN_IF } else { FILE_OPEN },
+        descriptor: descriptor.as_ref().map(|descriptor| descriptor.0),
+        ..Request::directory("as the private folder", MADE_AGAIN)
+    };
+    let (handle, path) = open_child(parent, name, &request)?;
 
     let security = Security::from_handle(handle.0).with_context(|| format!("read the ACL of {}", path.display()))?;
     let (owner_ok, acl_ok) = dir_policy(&security, user)?;
@@ -195,56 +232,35 @@ fn private_dir(parent: &DirHandle, name: &str, user: &Sid, create: bool) -> anyh
         ),
     ) {
         return Err(Refused(format!(
-            "{} cannot be used {purpose}: {problem}. {LEFT_AS_IT_IS}",
-            path.display()
+            "{} cannot be used {}: {problem}. {LEFT_AS_IT_IS}",
+            path.display(),
+            request.purpose
         ))
         .into());
     }
     Ok(DirHandle { handle, path })
 }
 
-/// Open the file `name` under `dir` if it exists, with `access` (and the right to wait on the
-/// handle, which a blocking lock needs). Looking never creates: a missing name is `None`. A link is
-/// refused, so the file is this folder's own.
+/// Open the file `name` under `dir` if it exists, with `access`. Looking never creates: a missing
+/// name is `None`. A link is refused, so the file is this folder's own.
 pub fn open_existing_file(
     dir: &DirHandle,
     name: &str,
     access: FILE_ACCESS_RIGHTS,
 ) -> anyhow::Result<Option<std::fs::File>> {
-    let units = single_name(name)?;
-    let path = dir.path.join(name);
-    let made = nt_create(
-        Some(dir.raw()),
-        &units,
-        access.0 | SYNCHRONIZE.0 | FILE_READ_ATTRIBUTES.0,
-        FILE_OPEN,
-        FILE_NON_DIRECTORY_FILE.0 | FILE_SYNCHRONOUS_IO_NONALERT.0 | FILE_OPEN_REPARSE_POINT.0,
-        None,
-    )?;
-    let handle = match opened(made, &path, "as a file of the private folder") {
-        Ok(handle) => handle,
-        Err(e) if e.is::<Missing>() => return Ok(None),
-        Err(e) => return Err(e),
-    };
-    refuse_link(&handle, &path, "as a file of the private folder", REMOVE_THE_LINK)?;
-    Ok(Some(into_file(handle)))
+    let request = Request::file("as a file of the private folder", access.0, FILE_OPEN);
+    match open_child(dir, name, &request) {
+        Ok((handle, _)) => Ok(Some(into_file(handle))),
+        Err(e) if e.is::<Missing>() => Ok(None),
+        Err(e) => Err(e),
+    }
 }
 
 /// Open or create the file `name` under `dir` for appending. A link is refused, so the file written
 /// is this folder's own.
 pub fn open_log_file(dir: &DirHandle, name: &str) -> anyhow::Result<std::fs::File> {
-    let units = single_name(name)?;
-    let path = dir.path.join(name);
-    let made = nt_create(
-        Some(dir.raw()),
-        &units,
-        FILE_APPEND_DATA.0 | SYNCHRONIZE.0 | FILE_READ_ATTRIBUTES.0,
-        FILE_OPEN_IF,
-        FILE_NON_DIRECTORY_FILE.0 | FILE_SYNCHRONOUS_IO_NONALERT.0 | FILE_OPEN_REPARSE_POINT.0,
-        None,
-    )?;
-    let handle = opened(made, &path, "as a log file")?;
-    refuse_link(&handle, &path, "as a log file", REMOVE_THE_LINK)?;
+    let request = Request::file("as a log file", FILE_APPEND_DATA.0, FILE_OPEN_IF);
+    let (handle, _) = open_child(dir, name, &request)?;
     Ok(into_file(handle))
 }
 
@@ -264,48 +280,73 @@ fn single_name(name: &str) -> anyhow::Result<Vec<u16>> {
     Ok(name.encode_utf16().collect())
 }
 
-/// The handle an open gave, or why there is none. A name that is a file where a directory is
-/// wanted is a refusal that says so, a name that is not there is [`Missing`]; everything else is
-/// the system's error, naming `path`.
-fn opened(made: Made, path: &Path, purpose: &str) -> anyhow::Result<OwnedHandle> {
-    let status = made.status;
-    if classify_open(status) == OpenOutcome::Opened {
-        return Ok(OwnedHandle(made.handle));
-    }
-    if status == STATUS_NOT_A_DIRECTORY {
-        return Err(Refused(format!(
-            "{} cannot be used {purpose}: it is not a directory. Remove it, and a folder is made there",
-            path.display()
+/// Open the one name `name` under `parent` as `request` says, and return the handle with the path it
+/// was reached by. The name is opened as itself and the handle then refused if it is a link, so the
+/// object judged is the object held. Every way into a name below the profile directory goes through
+/// here.
+fn open_child(parent: &DirHandle, name: &str, request: &Request) -> anyhow::Result<(OwnedHandle, PathBuf)> {
+    let units = single_name(name)?;
+    let path = parent.path.join(name);
+    let made = nt_create(
+        Some(parent.raw()),
+        &units,
+        request.access,
+        request.disposition,
+        request.options,
+        request.descriptor,
+    )?;
+    let handle = judge(made, &path, request)?;
+    refuse_link(&handle, &path, request.purpose)?;
+    Ok((handle, path))
+}
+
+/// The handle an open gave, or why there is none: the one place a status becomes an error here. A name
+/// that is not there is [`Missing`]; a file where a directory is wanted, and a denial the caller can
+/// explain, are [`Refused`]; everything else is the system's error, naming `path`.
+fn judge(made: Made, path: &Path, request: &Request) -> anyhow::Result<OwnedHandle> {
+    let purpose = request.purpose;
+    match (classify_open(made.status), &request.denied) {
+        (OpenOutcome::Opened, _) => Ok(OwnedHandle(made.handle)),
+        (OpenOutcome::NotADirectory, _) => Err(Refused(format!(
+            "{} cannot be used {purpose}: it is not a directory. {}",
+            path.display(),
+            request.not_a_directory
         ))
-        .into());
-    }
-    if status == STATUS_OBJECT_NAME_NOT_FOUND || status == STATUS_OBJECT_PATH_NOT_FOUND {
-        return Err(Missing {
+        .into()),
+        (OpenOutcome::Denied, Some(denied)) => {
+            Err(Refused(format!("{} cannot be used {purpose}: {denied}", path.display())).into())
+        }
+        (OpenOutcome::Missing, _) => Err(Missing {
             path: path.to_path_buf(),
         }
-        .into());
+        .into()),
+        (OpenOutcome::Denied, None) | (OpenOutcome::Failed(_), _) => {
+            Err(status_error(made.status)).with_context(|| format!("open {}", path.display()))
+        }
     }
-    Err(status_error(status)).with_context(|| format!("open {}", path.display()))
 }
 
 /// What a refused private folder says about itself and about what to do.
 const LEFT_AS_IT_IS: &str = "It is left as it is: inspect it, remove it, and it is created again";
 
-/// What a refused link says to do, for a name below the profile directory.
+/// What a refusal says to do about a link.
 const REMOVE_THE_LINK: &str = "remove the link so that the name is a real folder";
 
-/// What a refused link says to do, for the profile directory itself.
-const SET_THE_PROFILE_PATH: &str =
-    "give the account its real profile directory (set ProfileImagePath to it) instead of a link";
+/// What a refusal says when a file is where a folder this code makes should be.
+const MADE_AGAIN: &str = "Remove it, and it is made again";
 
-/// Refuse `handle` if it is a link; `remedy` says what to do about it. It was opened as itself
-/// (`FILE_OPEN_REPARSE_POINT`), so this is the object at the name and not what the name leads to.
-fn refuse_link(handle: &OwnedHandle, path: &Path, purpose: &str, remedy: &str) -> anyhow::Result<()> {
+/// What a refusal says when a file is where a folder of the profile itself should be: the folder is
+/// not this code's to make.
+const PROFILE_AS_IT_IS: &str = "The profile is not usable as it is";
+
+/// Refuse `handle` if it is a link. It was opened as itself (`FILE_OPEN_REPARSE_POINT`), so this is
+/// the object at the name and not what the name leads to.
+fn refuse_link(handle: &OwnedHandle, path: &Path, purpose: &str) -> anyhow::Result<()> {
     let attributes = file_attributes(handle.0).with_context(|| format!("read the attributes of {}", path.display()))?;
     if attributes & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
         return Err(Refused(format!(
             "{} cannot be used {purpose}: it is a reparse point (junction or symlink). Nothing is read or written \
-             through it; {remedy}",
+             through it; {REMOVE_THE_LINK}",
             path.display()
         ))
         .into());

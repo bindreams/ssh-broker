@@ -238,12 +238,11 @@ fn a_link_above_the_profile_directory_is_followed_and_the_walk_below_it_works() 
 }
 
 #[test]
-fn the_profile_directory_being_a_link_itself_is_refused_with_it_named() {
-    // The user holds Full Control on their own profile directory, so a link there is theirs.
-    let profile = TempProfile::new("root");
+fn a_profile_directory_that_is_a_link_is_followed_and_keeps_its_broker() {
+    // Windows loads the profile through `ProfileImagePath`, links included, so the broker does too.
     let via = TempProfile::new("root-via");
-    let before = tree_state(&profile.0);
     for symlinked in [false, true] {
+        let profile = TempProfile::new("root");
         let link = via.0.join(if symlinked { "s" } else { "j" });
         if symlinked {
             symlink_dir(&link, &profile.0);
@@ -251,14 +250,43 @@ fn the_profile_directory_being_a_link_itself_is_refused_with_it_named() {
             junction(&link, &profile.0);
         }
 
-        let err = format!("{:#}", walk(&link, &me()).err().expect("refused"));
+        walk(&link, &me()).unwrap_or_else(|e| panic!("walk through {}: {e:#}", link.display()));
 
-        assert!(err.contains(&link.display().to_string()), "{err}");
-        assert!(err.contains("profile directory"), "{err}");
-        assert!(err.contains("reparse point"), "{err}");
-        assert!(err.contains("ProfileImagePath"), "{err}");
+        let broker = profile.0.join(r"AppData\Local\ssh-broker");
+        assert!(acl::verify_dir_acl(&broker, &me()).unwrap(), "{}", dacl_sddl(&broker));
+        assert!(broker.join("logs").is_dir());
     }
-    assert_eq!(tree_state(&profile.0), before, "nothing was made behind the link");
+}
+
+#[test]
+fn a_file_where_a_folder_the_profile_needs_is_wanted_is_refused_without_promising_a_folder() {
+    let profile = TempProfile::new("appdata-file");
+    std::fs::remove_dir_all(profile.0.join("AppData")).unwrap();
+    std::fs::write(profile.0.join("AppData"), "x").unwrap();
+    let root = open_root(&profile.0).unwrap();
+
+    let err = open_dir(&root, "AppData").err().unwrap();
+
+    assert!(err.is::<Refused>(), "{err:#}");
+    let text = format!("{err:#}");
+    assert!(text.contains("not a directory"), "{text}");
+    assert!(text.contains("profile is not usable"), "{text}");
+    assert!(!text.contains("made"), "no folder is promised there: {text}");
+    assert_eq!(std::fs::read_to_string(profile.0.join("AppData")).unwrap(), "x");
+}
+
+#[test]
+fn a_refusal_to_make_the_folder_says_that_this_process_may_not_make_it() {
+    let profile = TempProfile::new("denied");
+    let local = local_of(&profile);
+    let grantee = format!("*{}", me().to_sddl().unwrap());
+    icacls(local.path(), &["/deny", &format!("{grantee}:(AD)")]);
+
+    let err = ensure_private_dir(&local, "ssh-broker", &me()).err().unwrap();
+    icacls(local.path(), &["/remove:d", &grantee]);
+
+    assert!(err.is::<Refused>(), "{err:#}");
+    assert!(format!("{err:#}").contains("may not make it"), "{err:#}");
 }
 
 #[test]

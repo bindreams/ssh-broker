@@ -145,8 +145,8 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use windows::Win32::Foundation::{
-    ERROR_SUCCESS, GetLastError, LUID, STATUS_OBJECT_NAME_NOT_FOUND, STATUS_OBJECT_PATH_NOT_FOUND,
-    STATUS_SHARING_VIOLATION, STATUS_SUCCESS,
+    ERROR_SUCCESS, GetLastError, LUID, STATUS_NOT_A_DIRECTORY, STATUS_OBJECT_NAME_NOT_FOUND,
+    STATUS_OBJECT_PATH_NOT_FOUND, STATUS_SHARING_VIOLATION, STATUS_SUCCESS,
 };
 use windows::Win32::Security::{
     AdjustTokenPrivileges, DuplicateTokenEx, LUID_AND_ATTRIBUTES, LookupPrivilegeValueW, SE_PRIVILEGE_ENABLED,
@@ -669,16 +669,17 @@ fn install_dir_problem_is_reported_for_a_dir_denying_everyone_write() {
 }
 
 #[test]
-fn an_inspection_open_maps_each_status_to_one_outcome() {
+fn an_open_maps_each_status_to_one_outcome() {
     assert_eq!(classify_open(STATUS_SUCCESS), OpenOutcome::Opened);
     assert_eq!(classify_open(STATUS_ACCESS_DENIED), OpenOutcome::Denied);
-    for status in [
-        STATUS_OBJECT_NAME_NOT_FOUND,
-        STATUS_SHARING_VIOLATION,
-        STATUS_OBJECT_PATH_NOT_FOUND,
-    ] {
-        assert_eq!(classify_open(status), OpenOutcome::Failed(status));
+    assert_eq!(classify_open(STATUS_NOT_A_DIRECTORY), OpenOutcome::NotADirectory);
+    for status in [STATUS_OBJECT_NAME_NOT_FOUND, STATUS_OBJECT_PATH_NOT_FOUND] {
+        assert_eq!(classify_open(status), OpenOutcome::Missing);
     }
+    assert_eq!(
+        classify_open(STATUS_SHARING_VIOLATION),
+        OpenOutcome::Failed(STATUS_SHARING_VIOLATION)
+    );
 }
 
 #[test]
@@ -767,6 +768,15 @@ fn ensure_private_dir_says_so_when_the_folders_security_cannot_be_read() {
     assert!(text.contains("denied access to read its ACL"), "{text}");
     assert!(text.contains("remove"), "{text}");
     assert!(!text.contains("its owner is"), "{text}");
+    assert!(
+        text.contains("may not make it"),
+        "the creating path says what else may be wrong: {text}"
+    );
+
+    let err = without_privileges(|| open_private_dir(&root, "ssh-broker", &me_sid).err().expect("refused"));
+    let text = format!("{err:#}");
+    assert!(text.contains("denied access to read its ACL"), "{text}");
+    assert!(!text.contains("make"), "a look never makes anything: {text}");
 }
 
 #[test]
