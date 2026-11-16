@@ -71,6 +71,8 @@ use crate::shell::StartError;
 #[cfg(windows)]
 use crate::socket_loc::SocketLocation;
 #[cfg(windows)]
+use crate::userdir::SocketDir;
+#[cfg(windows)]
 use crate::winutil::OwnedHandle;
 #[cfg(windows)]
 use connections::{Connections, Drained, Live};
@@ -99,7 +101,7 @@ fn start(args: AgentArgs) -> anyhow::Result<()> {
         &mut std::io::stderr(),
         reset_inherited_start_state,
         crate::userdir::current_socket_location,
-        |logs| crate::filelog::init_in(logs, "agent.log"),
+        |folder| crate::filelog::init_in(&folder.logs, "agent.log"),
         |location, session| {
             match console {
                 Ok(outcome) => {
@@ -145,7 +147,7 @@ fn start_with(
     stderr: &mut dyn std::io::Write,
     reset: impl FnOnce() -> windows::core::Result<()>,
     locate: impl FnOnce() -> anyhow::Result<SocketLocation>,
-    init_log: impl FnOnce(&Path) -> anyhow::Result<tracing_appender::non_blocking::WorkerGuard>,
+    init_log: impl FnOnce(&SocketDir) -> anyhow::Result<tracing_appender::non_blocking::WorkerGuard>,
     serve: impl FnOnce(&SocketLocation, u32) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     let reset_failure = reset()
@@ -158,11 +160,12 @@ fn start_with(
     let refused = |refusal: Refusal, cause: anyhow::Error| anyhow::Error::new(refusal).context(format!("{cause:#}"));
     let location = locate().map_err(|e| refused(Refusal::NoSocketLocation, e))?;
     let user = crate::acl::Sid::current_user()?;
-    crate::userdir::ensure_socket_dir(&location, &user).map_err(|e| refused(Refusal::SocketFolderRefused, e))?;
+    let folder =
+        crate::userdir::open_socket_dir(&location, &user).map_err(|e| refused(Refusal::SocketFolderRefused, e))?;
     // Held to the end of the process and flushed by `end_process`, from whichever thread ends it:
     // dropping the guard stops the writer and later lines are lost. Until the log opens an error goes
     // to stderr, which a logon task discards; a hand-run agent shows it.
-    if let Some(log) = keep_log_or_report(init_log(&location.logs_dir()), stderr) {
+    if let Some(log) = keep_log_or_report(init_log(&folder), stderr) {
         keep_log(log);
         if let Some(message) = &reset_failure {
             tracing::warn!("{message}");

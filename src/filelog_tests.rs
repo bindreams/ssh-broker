@@ -1,11 +1,17 @@
 //! Tests for the file log sink.
 use super::*;
-use crate::acl::{self, Sid};
+use crate::acl::{self, DirHandle, Sid};
 use crate::test_support::TempProfile;
 use std::os::windows::process::CommandExt;
 
 /// `CREATE_NO_WINDOW`: a child console process gets no console window.
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// `dir` (made if it is missing) as the folder a log is opened in.
+fn folder(dir: &std::path::Path) -> DirHandle {
+    std::fs::create_dir_all(dir).unwrap();
+    acl::open_root(dir).unwrap()
+}
 
 /// A directory that refuses new files, removed (deny ACE lifted first) when dropped.
 struct WriteDeniedDir(std::path::PathBuf);
@@ -41,7 +47,7 @@ impl Drop for WriteDeniedDir {
 #[test]
 fn file_logging_is_disabled_not_fatal_when_the_log_directory_is_unwritable() {
     let dir = WriteDeniedDir::new("unwritable");
-    let err = open_in(&dir.0, "shim.log").expect_err("an unwritable folder yields no sink");
+    let err = open_in(&folder(&dir.0), "shim.log").expect_err("an unwritable folder yields no sink");
     assert!(format!("{err:#}").contains(&dir.0.display().to_string()), "{err:#}");
 }
 
@@ -50,7 +56,7 @@ fn file_logging_is_enabled_for_a_writable_log_directory() {
     let dir = std::env::temp_dir().join(format!("sb-logok-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
 
-    let sink = open_in(&dir, "shim.log");
+    let sink = open_in(&folder(&dir), "shim.log");
 
     assert!(sink.is_ok(), "a writable log directory must yield a sink");
     drop(sink);
@@ -62,7 +68,7 @@ fn file_logging_names_the_prefix() {
     let dir = std::env::temp_dir().join(format!("sb-logprefix-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
 
-    let sink = open_in(&dir, "agent.log");
+    let sink = open_in(&folder(&dir), "agent.log");
 
     assert!(sink.is_ok());
     let names: Vec<String> = std::fs::read_dir(&dir)
@@ -85,7 +91,7 @@ fn a_subscriber_that_is_already_installed_is_reported_not_ignored() {
     let dir = std::env::temp_dir().join(format!("sb-logtwice-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
 
-    let err = init_in(&dir, "shim.log").expect_err("a second subscriber cannot be installed");
+    let err = init_in(&folder(&dir), "shim.log").expect_err("a second subscriber cannot be installed");
 
     assert!(format!("{err:#}").contains("already"), "{err:#}");
     let _ = std::fs::remove_dir_all(&dir);

@@ -65,6 +65,8 @@ windows = { version = "0.62.2", features = [
 # tracing-appender: rolling file sink for the shim's logs under ProgramData (the shim must
 # never log to the PTY stdout/stderr in interactive mode). Only the Windows shim uses it.
 tracing-appender = "0.2"
+# The UTC date a log file is named by (src/filelog/daily.rs), as tracing-appender names its own.
+time = { version = "0.3", default-features = false, features = ["std"] }
 
 [target.'cfg(windows)'.dev-dependencies]
 windows = { version = "0.62.2", features = [

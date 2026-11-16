@@ -166,8 +166,8 @@ fn start_makes_the_private_folder_then_serves_that_session_from_it() {
         &mut std::io::sink(),
         || Ok(()),
         || Ok(loc.clone()),
-        |logs| {
-            assert_eq!(logs, loc.logs_dir());
+        |folder| {
+            assert_eq!(folder.logs.path(), loc.logs_dir());
             Ok(guard())
         },
         |at, session| {
