@@ -293,3 +293,57 @@ fn ensure_socket_dir_gives_what_it_makes_inside_exactly_the_three_aces() {
     assert!(acl::verify_file_acl(&loc.lock_path(), &me()).unwrap());
     assert_eq!(trustees(&loc.lock_path()), trustees(&loc.dir));
 }
+
+// A link above the folder ----------------------------------------------------------------
+
+use crate::test_support::{junction, tree_state};
+
+/// A stand-in for a folder the elevated token could re-own (the install directory is one): a real
+/// `ssh-broker` folder the user owns, not hardened, with a file inside, under `outside`'s
+/// `AppData\Local`. It passes `private_dir_problem`, which asks only for a real directory and an
+/// owner in {user, SYSTEM, Administrators}.
+fn outside_folder(tag: &str) -> TempProfile {
+    let outside = TempProfile::new(tag);
+    let folder = outside.location().dir;
+    std::fs::create_dir(&folder).unwrap();
+    std::fs::write(folder.join("note.txt"), "x").unwrap();
+    outside
+}
+
+/// Replace `link_at` (below the profile) with a junction to `target`.
+fn link_in_place_of(profile: &TempProfile, link_at: &str, target: &Path) {
+    let link = profile.0.join(link_at);
+    std::fs::remove_dir_all(&link).unwrap();
+    junction(&link, target);
+}
+
+/// `ensure_socket_dir` with a junction at `link_at` (below the profile) that leads into `outside`.
+/// Nothing outside the profile may change, and the folder is refused.
+fn refuses_a_junction_above_the_folder(link_at: &str) {
+    let profile = TempProfile::new("up");
+    let outside = outside_folder("up-out");
+    let before = tree_state(&outside.0);
+    link_in_place_of(&profile, link_at, &outside.0.join(link_at));
+
+    let result = ensure_socket_dir(&profile.location(), &me());
+
+    assert_eq!(
+        tree_state(&outside.0),
+        before,
+        "a junction at {link_at}: something outside the profile was changed (result: {result:?})"
+    );
+    assert!(result.is_err(), "a junction at {link_at} must be refused");
+}
+
+/// Reproduces the by-path repair of the private folder: a junction above the folder, which a
+/// process of the same account at lower integrity can make, is followed, so the folder that is
+/// checked and re-ACLed is not in the profile. Fails until the folder is reached by handle.
+#[test]
+fn ensure_socket_dir_changes_nothing_outside_the_profile_when_local_is_a_junction() {
+    refuses_a_junction_above_the_folder(r"AppData\Local");
+}
+
+#[test]
+fn ensure_socket_dir_changes_nothing_outside_the_profile_when_appdata_is_a_junction() {
+    refuses_a_junction_above_the_folder("AppData");
+}

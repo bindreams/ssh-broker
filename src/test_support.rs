@@ -73,6 +73,38 @@ pub fn aces(sddl: &str) -> Vec<(&str, &str, u32, &str)> {
         .collect()
 }
 
+/// Every path under `root` (and `root`), relative to it, with its DACL: what a test compares before
+/// and after to see that nothing was changed, added or removed there.
+pub fn tree_state(root: &Path) -> std::collections::BTreeMap<String, String> {
+    fn visit(root: &Path, at: &Path, out: &mut std::collections::BTreeMap<String, String>) {
+        let relative = at.strip_prefix(root).unwrap().display().to_string();
+        out.insert(relative, dacl_sddl(at));
+        if at.symlink_metadata().unwrap().is_dir() {
+            for entry in std::fs::read_dir(at).unwrap() {
+                visit(root, &entry.unwrap().path(), out);
+            }
+        }
+    }
+    let mut out = std::collections::BTreeMap::new();
+    visit(root, root, &mut out);
+    out
+}
+
+/// Make `link` a junction to `target` (no privilege needed).
+pub fn junction(link: &Path, target: &Path) {
+    let out = Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(link)
+        .arg(target)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "mklink /J: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
 // A stand-in profile -----
 
 /// A stand-in profile under the temp dir, removed on drop. `AppData\Local` exists inside it, as

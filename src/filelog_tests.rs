@@ -157,3 +157,67 @@ fn a_private_folder_that_is_not_the_users_is_the_reason_logging_is_off() {
         "{err:#}"
     );
 }
+
+// A link above the log -----------------------------------------------------------------------
+
+use crate::test_support::{junction, tree_state};
+use std::io::Write;
+
+/// Reproduces the by-path creation of the log: the folder outside is a correct private folder, so
+/// every check passes, and the log is created and written there. Fails until the log is opened
+/// under the folder's handle.
+#[test]
+fn the_log_is_not_created_outside_the_profile_when_a_directory_above_the_folder_is_a_junction() {
+    let me = Sid::current_user().unwrap();
+    let profile = TempProfile::new("lg");
+    let outside = TempProfile::new("lg-out");
+    crate::userdir::ensure_socket_dir(&outside.location(), &me).unwrap();
+    let before = tree_state(&outside.0);
+    let local = profile.0.join(r"AppData\Local");
+    std::fs::remove_dir_all(&local).unwrap();
+    junction(&local, &outside.0.join(r"AppData\Local"));
+
+    let result = open_for_location(&profile.location(), &me, "shim.log");
+
+    let refused = result.is_err();
+    if let Ok((mut writer, guard)) = result {
+        writer.write_all(b"a line\n").unwrap();
+        drop(guard); // flush
+    }
+    assert_eq!(
+        tree_state(&outside.0),
+        before,
+        "a log file was made outside the profile"
+    );
+    assert!(refused, "a junction above the folder must be refused");
+}
+
+/// Reproduces the append through a link in the logs folder: the folder is the user's own and right,
+/// and the log file's name is a symlink to a file elsewhere. Fails until the log file is opened
+/// without following a link.
+#[test]
+fn the_log_does_not_append_to_a_file_that_a_symlink_in_the_logs_folder_points_to() {
+    let me = Sid::current_user().unwrap();
+    let profile = TempProfile::new("lg-sym");
+    let loc = profile.location();
+    // The first open makes the file; its name is today's, so the link can take exactly that name.
+    drop(open_for_location(&loc, &me, "shim.log").unwrap());
+    let name = std::fs::read_dir(loc.logs_dir())
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.file_name().unwrap().to_string_lossy().starts_with("shim.log"))
+        .expect("the first open made the log file");
+    let victim = profile.0.join("victim.txt");
+    std::fs::write(&victim, "keep").unwrap();
+    std::fs::remove_file(&name).unwrap();
+    std::os::windows::fs::symlink_file(&victim, &name)
+        .unwrap_or_else(|e| panic!("file symlink: {e} (needs Developer Mode or the symlink privilege)"));
+
+    let result = open_for_location(&loc, &me, "shim.log");
+
+    if let Ok((mut writer, guard)) = result {
+        writer.write_all(b"a line\n").unwrap();
+        drop(guard); // flush
+    }
+    assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep");
+}
