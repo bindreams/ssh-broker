@@ -39,7 +39,7 @@ use windows::core::{BOOL, PCWSTR, PWSTR};
 
 #[path = "common/fs_state.rs"]
 mod fs_state;
-use fs_state::{junction, sddl_of};
+use fs_state::{default_owner_sddl, junction, sddl_of};
 
 /// STATUS_REPARSE_POINT_ENCOUNTERED: what `OBJ_DONT_REPARSE` answers at a link.
 const STATUS_REPARSE_POINT_ENCOUNTERED: i32 = 0xC000_050Bu32 as i32;
@@ -485,13 +485,14 @@ fn a_directory_created_under_a_handle_with_a_descriptor_has_exactly_that_acl() {
         assert_eq!(made.information, FILE_CREATED);
         let dir = tree.local().join(name);
         assert!(ssh_broker::acl::verify_dir_acl(&dir, &me).unwrap(), "{}", sddl_of(&dir));
-        // A token's default owner is the user, so omitting it gives the same owner here (an
-        // elevated administrator's default owner is Administrators, which `verify_dir_acl` accepts).
-        assert!(
-            sddl_of(&dir).starts_with(&format!("O:{}", me.to_sddl().unwrap())),
-            "{}",
-            sddl_of(&dir)
-        );
+        // Without an owner in the descriptor the owner is the creating token's default owner: the
+        // user for a plain token, Administrators for an elevated one (which `verify_dir_acl` accepts).
+        let expected = if with_owner {
+            format!("O:{}", me_sddl())
+        } else {
+            default_owner_sddl()
+        };
+        assert!(sddl_of(&dir).starts_with(&expected), "{expected}: {}", sddl_of(&dir));
     }
 }
 

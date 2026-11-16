@@ -7,13 +7,16 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::Command;
 
-use windows::Win32::Foundation::{HLOCAL, LocalFree};
+use windows::Win32::Foundation::{HANDLE, HLOCAL, LocalFree};
 use windows::Win32::Security::Authorization::{
-    ConvertSecurityDescriptorToStringSecurityDescriptorW, GetNamedSecurityInfoW, SDDL_REVISION_1, SE_FILE_OBJECT,
+    ConvertSecurityDescriptorToStringSecurityDescriptorW, ConvertSidToStringSidW,
+    ConvertStringSecurityDescriptorToSecurityDescriptorW, GetNamedSecurityInfoW, SDDL_REVISION_1, SE_FILE_OBJECT,
 };
 use windows::Win32::Security::{
-    DACL_SECURITY_INFORMATION, OBJECT_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
+    DACL_SECURITY_INFORMATION, GetTokenInformation, OBJECT_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
+    PSECURITY_DESCRIPTOR, TOKEN_OWNER, TOKEN_QUERY, TokenOwner,
 };
+use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 use windows::core::{PCWSTR, PWSTR};
 
 /// The parts `which` of the security descriptor of `path` as SDDL, read through the path. Well-known
@@ -39,6 +42,47 @@ fn security_sddl(path: &Path, which: OBJECT_SECURITY_INFORMATION) -> String {
         .unwrap_or_else(|e| panic!("read the security of {}: {e}", path.display()));
         let mut text = PWSTR::null();
         ConvertSecurityDescriptorToStringSecurityDescriptorW(psd, SDDL_REVISION_1, which, &mut text, None).unwrap();
+        let out = text.to_string().unwrap();
+        let _ = LocalFree(Some(HLOCAL(text.0 as *mut _)));
+        let _ = LocalFree(Some(HLOCAL(psd.0)));
+        out
+    }
+}
+
+/// The owner a folder made by this process gets when its descriptor names none, as SDDL (`O:BA`): the
+/// default owner of the process token, which is the user for a plain token and Administrators for an
+/// elevated one.
+pub fn default_owner_sddl() -> String {
+    // SAFETY: valid out-pointers and a buffer as long as the call is told; every allocation and the
+    // token handle are released below.
+    unsafe {
+        let mut token = HANDLE::default();
+        OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).unwrap();
+        let mut len = 0u32;
+        let _ = GetTokenInformation(token, TokenOwner, None, 0, &mut len);
+        let mut buf = vec![0u8; len as usize];
+        GetTokenInformation(token, TokenOwner, Some(buf.as_mut_ptr().cast()), len, &mut len).unwrap();
+        let _ = windows::Win32::Foundation::CloseHandle(token);
+        let owner = (*(buf.as_ptr() as *const TOKEN_OWNER)).Owner;
+        let mut sid = PWSTR::null();
+        ConvertSidToStringSidW(owner, &mut sid).unwrap();
+        let wide: Vec<u16> = format!("O:{}", sid.to_string().unwrap())
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let _ = LocalFree(Some(HLOCAL(sid.0 as *mut _)));
+        let mut psd = PSECURITY_DESCRIPTOR::default();
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(PCWSTR(wide.as_ptr()), SDDL_REVISION_1, &mut psd, None)
+            .unwrap();
+        let mut text = PWSTR::null();
+        ConvertSecurityDescriptorToStringSecurityDescriptorW(
+            psd,
+            SDDL_REVISION_1,
+            OWNER_SECURITY_INFORMATION,
+            &mut text,
+            None,
+        )
+        .unwrap();
         let out = text.to_string().unwrap();
         let _ = LocalFree(Some(HLOCAL(text.0 as *mut _)));
         let _ = LocalFree(Some(HLOCAL(psd.0)));
