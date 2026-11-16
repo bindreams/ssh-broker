@@ -559,6 +559,9 @@ pub fn spawn_with_token(
     let exe_w = wide(&exe.to_string_lossy());
     let cwd_w = wide(&cwd.to_string_lossy());
     let environment = environment.map(|block| block.as_ptr().cast::<core::ffi::c_void>());
+    // Without a desktop of its own the child takes this process's station: hold off a switch
+    // until the child exists, as `desktop::spawn` does.
+    let _unchanged = private.is_none().then(crate::desktop::station_unchanged);
     // SAFETY: every pointer is to a local that outlives the call.
     match starter_kind {
         Starter::SecondaryLogon(logon_flags) => unsafe {

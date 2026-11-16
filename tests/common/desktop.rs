@@ -154,13 +154,14 @@ fn user32() -> &'static User32 {
 static STATION: RwLock<()> = RwLock::new(());
 
 /// Shared hold on the window station: while it lives, the process's station is the original.
-fn station_unchanged() -> RwLockReadGuard<'static, ()> {
+pub fn station_unchanged() -> RwLockReadGuard<'static, ()> {
     STATION.read().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// Start `command`. A child started without a desktop of its own takes this process's current
 /// window station, so the start waits for any switch to finish and holds it off until the child
-/// exists. Every start of a child in this binary goes through here, [`status`] or [`output`].
+/// exists. Every start of a child in this binary goes through here, [`status`] or [`output`], or
+/// holds [`station_unchanged`] itself.
 pub fn spawn(command: &mut Command) -> io::Result<Child> {
     let _unchanged = station_unchanged();
     command.spawn()
