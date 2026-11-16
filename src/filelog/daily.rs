@@ -19,6 +19,9 @@ pub struct DailyLog<C: Fn() -> Date> {
     prefix: String,
     clock: C,
     current: (Date, std::fs::File),
+    /// The cause the current file last said, in the note it holds, for the new day's file that would
+    /// not open. Cleared when a new file opens.
+    noted: Option<String>,
 }
 
 /// The name of the log file of `prefix` for `date`.
@@ -42,21 +45,57 @@ impl<C: Fn() -> Date> DailyLog<C> {
             prefix: prefix.to_owned(),
             clock,
             current: (today, file),
+            noted: None,
         })
     }
 
     /// The file for the date now, opened if the date is not the one the current file is for. When
-    /// that open fails the current file is kept and written to, as the rolling appender does; every
-    /// later write tries the new name again, with no limit, until it opens.
+    /// that open fails the current file is kept and written to, as the rolling appender does, and
+    /// says why in a line (see [`Self::note_unopened`]); every later write tries the new name again,
+    /// with no limit, until it opens.
     fn file(&mut self) -> &mut std::fs::File {
         let today = (self.clock)();
-        if self.current.0 != today
-            && let Ok(file) = acl::open_log_file(&self.dir, &file_name(&self.prefix, today))
-        {
-            self.current = (today, file);
+        if self.current.0 != today {
+            let name = file_name(&self.prefix, today);
+            match acl::open_log_file(&self.dir, &name) {
+                Ok(file) => {
+                    self.current = (today, file);
+                    self.noted = None;
+                }
+                Err(error) => self.note_unopened(&name, &error),
+            }
         }
         &mut self.current.1
     }
+
+    /// Say in the current file that `name` would not open, the first time and whenever the cause's
+    /// text changes. The retry at every write finds the same cause, and that costs no text: it is
+    /// compared as it is written, not built.
+    fn note_unopened(&mut self, name: &str, error: &anyhow::Error) {
+        if self.noted.as_deref().is_some_and(|noted| says(error, noted)) {
+            return;
+        }
+        let cause = format!("{error:#}");
+        // A file that cannot be written to fails the line that follows too, and says so to its caller.
+        let _ = writeln!(
+            self.current.1,
+            "ssh-broker: cannot open the log file {name}, so this one is still being written: {cause}"
+        );
+        self.noted = Some(cause);
+    }
+}
+
+/// Whether `error`, as `{error:#}` writes it, is exactly `text`.
+fn says(error: &anyhow::Error, text: &str) -> bool {
+    struct Expect<'a>(&'a str);
+    impl std::fmt::Write for Expect<'_> {
+        fn write_str(&mut self, piece: &str) -> std::fmt::Result {
+            self.0 = self.0.strip_prefix(piece).ok_or(std::fmt::Error)?;
+            Ok(())
+        }
+    }
+    let mut expect = Expect(text);
+    std::fmt::write(&mut expect, format_args!("{error:#}")).is_ok() && expect.0.is_empty()
 }
 
 impl<C: Fn() -> Date> Write for DailyLog<C> {

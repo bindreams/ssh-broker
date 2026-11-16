@@ -94,41 +94,50 @@ fn a_file_that_cannot_be_opened_at_the_date_change_leaves_the_lines_in_the_curre
     std::fs::create_dir(&blocker).unwrap();
     *now.lock().unwrap() = date(2026, Month::January, 2);
 
-    log.write_all(
-        b"first
-",
-    )
-    .unwrap();
-    log.write_all(
-        b"second
-",
-    )
-    .unwrap();
+    log.write_all(b"first\n").unwrap();
+    log.write_all(b"second\n").unwrap();
     std::fs::remove_dir(&blocker).unwrap();
-    log.write_all(
-        b"third
-",
-    )
-    .unwrap();
-    log.write_all(
-        b"fourth
-",
-    )
-    .unwrap();
+    log.write_all(b"third\n").unwrap();
+    log.write_all(b"fourth\n").unwrap();
 
     let read = |name: &str| std::fs::read_to_string(profile.0.join(name)).unwrap();
-    assert_eq!(
-        read("shim.log.2026-01-01"),
-        "first
-second
-",
-        "kept writing to the current file"
+    let day_one = read("shim.log.2026-01-01");
+    let lines: Vec<&str> = day_one.lines().collect();
+    assert_eq!(lines.len(), 3, "the note, once, and the two lines: {day_one:?}");
+    assert!(
+        lines[0].contains(&blocker.display().to_string()),
+        "the note names the file that would not open: {day_one:?}"
     );
+    assert_eq!(lines[1..], ["first", "second"], "kept writing to the current file");
     assert_eq!(
         read("shim.log.2026-01-02"),
-        "third
-fourth
-",
+        "third\nfourth\n",
         "the new name is tried at the next write"
     );
+}
+
+#[test]
+fn a_new_cause_for_the_same_failure_is_noted_again_and_the_same_cause_is_not() {
+    let (profile, dir, now) = folder_and_clock("cause", date(2026, Month::January, 1));
+    let mut log = DailyLog::new(dir, "shim.log", clock_of(&now)).unwrap();
+    let name = profile.0.join("shim.log.2026-01-02");
+    *now.lock().unwrap() = date(2026, Month::January, 2);
+
+    std::fs::create_dir(&name).unwrap();
+    log.write_all(b"a\n").unwrap();
+    log.write_all(b"b\n").unwrap();
+    std::fs::remove_dir(&name).unwrap();
+    let victim = profile.0.join("victim.txt");
+    std::fs::write(&victim, "keep").unwrap();
+    std::fs::hard_link(&victim, &name).unwrap();
+    log.write_all(b"c\n").unwrap();
+    log.write_all(b"d\n").unwrap();
+
+    let day_one = std::fs::read_to_string(profile.0.join("shim.log.2026-01-01")).unwrap();
+    let lines: Vec<&str> = day_one.lines().collect();
+    assert_eq!(lines.len(), 6, "two notes and four lines: {day_one:?}");
+    assert_eq!(lines[1..3], ["a", "b"], "{day_one:?}");
+    assert!(lines[3].contains("hard link"), "the second cause: {day_one:?}");
+    assert_eq!(lines[4..], ["c", "d"], "{day_one:?}");
+    assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep");
 }
