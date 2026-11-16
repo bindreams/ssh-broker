@@ -7,6 +7,7 @@
 use crate::acl::{self, Sid};
 use crate::afunix;
 use crate::socket_loc::SocketLocation;
+use crate::userdir::{self, SocketDir};
 
 use super::report::Check;
 
@@ -15,44 +16,60 @@ use super::report::Check;
 pub fn socket_location_row(location: &anyhow::Result<SocketLocation>) -> Check {
     const NAME: &str = "socket location";
     match location {
-        Ok(loc) => Check::new(NAME, true, loc.path.display().to_string()),
+        Ok(loc) => Check::new(NAME, true, loc.path().display().to_string()),
         Err(e) => Check::new(NAME, false, format!("{e:#}")),
     }
 }
 
-/// `socket dir ACL`: the socket folder grants exactly this account, SYSTEM and Administrators.
+/// `socket dir ACL`: the socket folder is reached the way the agent reaches it (by handle from the
+/// profile directory, no link below it) and grants exactly this account, SYSTEM and Administrators.
+/// Nothing is made or changed: a folder that is not right is for the user to remove.
 pub fn socket_dir_row(location: &anyhow::Result<SocketLocation>, user: &Sid) -> Check {
     let Ok(loc) = location else {
         return Check::new("socket dir ACL", false, "no socket location");
     };
-    dir_row("socket dir ACL", &loc.dir, "no agent has made it yet", user)
+    dir_row(
+        "socket dir ACL",
+        loc.dir(),
+        "no agent has made it yet",
+        user,
+        loc,
+        |folder| Ok(folder.dir),
+    )
 }
 
-/// `log folder`: the folder the shim and the agent log into grants exactly this account, SYSTEM
-/// and Administrators. If it is missing or wrong, the shim and the agent run without a log, and
-/// nothing else says so.
+/// `log folder`: the folder the shim and the agent log into is judged the same way. If it is missing
+/// or wrong, the shim and the agent run without a log, and nothing else says so.
 pub fn log_folder_row(location: &anyhow::Result<SocketLocation>, user: &Sid) -> Check {
     let Ok(loc) = location else {
         return Check::new("log folder", false, "no socket location");
     };
-    dir_row("log folder", &loc.logs_dir(), "no log is being written", user)
+    dir_row(
+        "log folder",
+        &loc.logs_dir(),
+        "no log is being written",
+        user,
+        loc,
+        |folder| folder.logs,
+    )
 }
 
-fn dir_row(name: &'static str, dir: &std::path::Path, absent_means: &str, user: &Sid) -> Check {
-    if !dir.exists() {
-        return Check::new(name, false, format!("{} does not exist: {absent_means}", dir.display()));
-    }
-    match acl::verify_dir_acl(dir, user) {
-        Ok(true) => Check::new(name, true, format!("grantee={}", user.describe())),
-        Ok(false) => Check::new(
-            name,
-            false,
-            format!(
-                "{} does not grant exactly {}, SYSTEM and Administrators",
-                dir.display(),
-                user.describe()
-            ),
-        ),
+/// The row for the folder `pick` takes out of the agent's walk: it passes when the folder is a real
+/// directory with exactly the private ACL, and fails with the folder named when it is missing
+/// (`absent_means` says what that costs) or refused (the text says why and what to do).
+fn dir_row(
+    name: &'static str,
+    dir: &std::path::Path,
+    absent_means: &str,
+    user: &Sid,
+    loc: &SocketLocation,
+    pick: impl FnOnce(SocketDir) -> anyhow::Result<acl::DirHandle>,
+) -> Check {
+    match userdir::inspect_socket_dir(loc, user).and_then(pick) {
+        Ok(_) => Check::new(name, true, format!("grantee={}", user.describe())),
+        Err(e) if e.is::<acl::Missing>() => {
+            Check::new(name, false, format!("{} does not exist: {absent_means}", dir.display()))
+        }
         Err(e) => Check::new(name, false, format!("{e:#}")),
     }
 }
@@ -63,17 +80,17 @@ pub fn socket_file_row(location: &anyhow::Result<SocketLocation>, user: &Sid) ->
     let Ok(loc) = location else {
         return Check::new(NAME, false, "no socket location");
     };
-    if loc.path.symlink_metadata().is_err() {
+    if loc.path().symlink_metadata().is_err() {
         return Check::new(NAME, false, "no socket: no agent is serving this account");
     }
-    match acl::verify_file_acl(&loc.path, user) {
+    match acl::verify_file_acl(loc.path(), user) {
         Ok(true) => Check::new(NAME, true, format!("grantee={}", user.describe())),
         Ok(false) => Check::new(
             NAME,
             false,
             format!(
                 "{} does not grant exactly {}, SYSTEM and Administrators",
-                loc.path.display(),
+                loc.path().display(),
                 user.describe()
             ),
         ),
@@ -89,7 +106,7 @@ const AGENT_HINT: &str = " (to see why, run `ssh-broker agent` in your desktop s
 pub fn socket_reachable_row(location: &anyhow::Result<SocketLocation>) -> Check {
     const NAME: &str = "socket reachable";
     match location {
-        Ok(loc) => match afunix::connect(&loc.path) {
+        Ok(loc) => match afunix::connect(loc.path()) {
             Ok(_) => Check::new(NAME, true, String::new()),
             Err(e) => Check::new(NAME, false, format!("{e:#}{AGENT_HINT}")),
         },

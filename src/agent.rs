@@ -145,7 +145,7 @@ fn start_with(
     stderr: &mut dyn std::io::Write,
     reset: impl FnOnce() -> windows::core::Result<()>,
     locate: impl FnOnce() -> anyhow::Result<SocketLocation>,
-    init_log: impl FnOnce(&Path) -> anyhow::Result<tracing_appender::non_blocking::WorkerGuard>,
+    init_log: impl FnOnce(&crate::acl::DirHandle) -> anyhow::Result<tracing_appender::non_blocking::WorkerGuard>,
     serve: impl FnOnce(&SocketLocation, u32) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     let reset_failure = reset()
@@ -158,11 +158,16 @@ fn start_with(
     let refused = |refusal: Refusal, cause: anyhow::Error| anyhow::Error::new(refusal).context(format!("{cause:#}"));
     let location = locate().map_err(|e| refused(Refusal::NoSocketLocation, e))?;
     let user = crate::acl::Sid::current_user()?;
-    crate::userdir::ensure_socket_dir(&location, &user).map_err(|e| refused(Refusal::SocketFolderRefused, e))?;
+    let folder =
+        crate::userdir::open_socket_dir(&location, &user).map_err(|e| refused(Refusal::SocketFolderRefused, e))?;
     // Held to the end of the process and flushed by `end_process`, from whichever thread ends it:
     // dropping the guard stops the writer and later lines are lost. Until the log opens an error goes
     // to stderr, which a logon task discards; a hand-run agent shows it.
-    if let Some(log) = keep_log_or_report(init_log(&location.logs_dir()), stderr) {
+    let log = match &folder.logs {
+        Ok(logs) => init_log(logs),
+        Err(e) => Err(anyhow::anyhow!("{e:#}")),
+    };
+    if let Some(log) = keep_log_or_report(log, stderr) {
         keep_log(log);
         if let Some(message) = &reset_failure {
             tracing::warn!("{message}");
@@ -254,7 +259,7 @@ fn run_on(location: &SocketLocation, background: bool) -> anyhow::Result<()> {
     let connections = Connections::new();
     // Closing the listener wakes the blocked `accept` with a connection of its own; the loop then sees
     // the flag. A wake that fails is reported to the connections, which stop waiting for the loop.
-    let socket = location.path.clone();
+    let socket = location.path().to_path_buf();
     let waking = Arc::clone(&connections);
     let control = Arc::new(Control::new(background, Arc::clone(&connections)).with_waker(move || {
         let socket = socket.clone();
@@ -411,7 +416,7 @@ fn run_on_with<L>(
     mark: impl FnOnce(&SocketLocation) -> std::io::Result<()>,
     accept_loop: impl FnOnce(L) -> anyhow::Error,
 ) -> anyhow::Result<()> {
-    let listener = bind(&location.path)?;
+    let listener = bind(location.path())?;
     mark(location).map_err(|e| anyhow::Error::new(e).context("write the serving marker"))?;
     Err(accept_loop(listener))
 }

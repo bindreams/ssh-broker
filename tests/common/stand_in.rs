@@ -345,7 +345,7 @@ fn wait_for_marker(
             panic!(
                 "no agent was serving {} after {bound:?}: it neither wrote its serving marker nor ended, \
                  or the scheduled task did not start one",
-                location.dir.display()
+                location.dir().display()
             )
         });
         let handles: Vec<HANDLE> = std::iter::once(watch.handle()).chain(agent).collect();

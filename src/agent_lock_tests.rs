@@ -126,6 +126,48 @@ fn a_sharing_violation_on_the_lock_file_is_an_error_not_a_held_lock() {
     assert!(UserLock::try_acquire(&dir.path()).is_err());
 }
 
+// UserLock on a file that is already open -----------------------------------------------
+
+#[test]
+fn an_open_file_is_locked_like_the_path_and_held_against_both_forms() {
+    let dir = TempLock::new("open-held");
+    let held = UserLock::try_acquire_open(open(&dir.path()).unwrap(), &dir.path()).unwrap();
+    assert!(held.is_some(), "an unheld lock is acquired");
+    assert!(
+        UserLock::try_acquire_open(open(&dir.path()).unwrap(), &dir.path())
+            .unwrap()
+            .is_none(),
+        "a held lock is not acquired through a second open file"
+    );
+    assert!(
+        UserLock::try_acquire(&dir.path()).unwrap().is_none(),
+        "the by-path form sees the same lock"
+    );
+}
+
+#[test]
+fn a_waiting_acquire_of_an_open_file_takes_over_when_the_holder_drops() {
+    let dir = TempLock::new("open-takeover");
+    let holder = UserLock::try_acquire(&dir.path()).unwrap().unwrap();
+
+    let (waiting, saw_it_held) = mpsc::channel();
+    let (acquired, wait_done) = mpsc::channel();
+    let path = dir.path();
+    let file = open(&path).unwrap();
+    let waiter = std::thread::spawn(move || {
+        let lock = UserLock::acquire_open(file, &path, || waiting.send(()).unwrap()).unwrap();
+        acquired.send(()).unwrap();
+        lock
+    });
+
+    saw_it_held.recv().expect("acquire never reported that it had to wait");
+    drop(holder);
+    wait_done.recv().expect("the waiter failed instead of taking over");
+    let lock = waiter.join().unwrap();
+    assert!(UserLock::try_acquire(&dir.path()).unwrap().is_none());
+    drop(lock);
+}
+
 // SessionSlot --------------------------------------------------------------------------
 
 #[test]

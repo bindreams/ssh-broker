@@ -58,7 +58,7 @@ pub fn run_on(exec: Option<RawExec>, detect: impl FnOnce() -> Encoding) -> anyho
     // shim already explains a fallback to the user.
     let (log, log_failure) = match crate::filelog::init_for_current_user("shim.log") {
         Ok(guard) => (Some(guard), None),
-        Err(e) => (None, Some(format!("{e:#}"))),
+        Err(no_log) => (None, Some(no_log.to_string())),
     };
     let exec = exec.map(|exec| resolve_exec(exec, detect));
     if exec.as_ref().is_some_and(|exec| is_blank_command(&exec.command)) {
@@ -222,7 +222,7 @@ fn try_relay_with(
                     return Ok(Some(255));
                 }
                 if closed_before {
-                    let path = location.as_ref().ok().map(|location| location.path.as_path());
+                    let path = location.as_ref().ok().map(|location| location.path());
                     let message = closed_twice_message(path);
                     tracing::error!("{message}");
                     let _ = writeln!(stderr, "{message}");
@@ -262,7 +262,7 @@ fn connect_or_rescue(
     rescue: &mut dyn Rescue,
 ) -> anyhow::Result<Connected> {
     let connection = match location {
-        Ok(location) => afunix::connect(&location.path),
+        Ok(location) => afunix::connect(location.path()),
         // The cause is shown by the fail-open below; this only says there was nothing to connect to.
         Err(e) => Err(anyhow::anyhow!("{e:#}")),
     };
@@ -280,6 +280,7 @@ fn connect_or_rescue(
         exec: is_command,
         location,
         connect: &connection,
+        log_failure,
     };
     Ok(match rescue.rescue(&absent, stderr) {
         Rescued::Connected { socket, modes } => Connected::Agent {
@@ -371,7 +372,7 @@ fn fail_open_reason(
             return Ok(None);
         }
     };
-    let path = &location.path;
+    let path = &location.path();
     if decide_fallback(connection.is_err()) == Fallback::LocalShellWithWarning {
         let msg = unavailable_message(None);
         tracing::warn!("{msg} (path={path:?}, err={:?})", connection.as_ref().err());

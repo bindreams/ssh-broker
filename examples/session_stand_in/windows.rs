@@ -49,9 +49,10 @@ fn agent(dir: &Path, args: &[String]) {
     let sid = user.to_sddl().unwrap();
     let session = ssh_broker::provision::probe::current_session_id();
     let info = format!(
-        "pid={}\nsid={sid}\nexpect_user_matches={}\nsession={session}\n",
+        "pid={}\nsid={sid}\nexpect_user_matches={}\nsession={session}\nelevated={}\n",
         std::process::id(),
-        sid == expect
+        sid == expect,
+        ssh_broker::account::is_elevated().unwrap()
     );
     std::fs::write(dir.join("agent.info"), info).unwrap();
     let made = ssh_broker::userdir::current_socket_location()

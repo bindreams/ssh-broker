@@ -5,11 +5,7 @@ use crate::test_support::TempProfile;
 use crate::userdir::NoProfile;
 
 fn some_location() -> anyhow::Result<SocketLocation> {
-    let dir = std::path::PathBuf::from(r"C:\nowhere");
-    Ok(SocketLocation {
-        path: dir.join("agent.sock"),
-        dir,
-    })
+    Ok(crate::test_support::location_in(std::path::Path::new(r"C:\nowhere")))
 }
 
 fn refused() -> anyhow::Result<socket2::Socket> {
@@ -80,8 +76,8 @@ fn absence_of_a_connect_to_a_missing_folder_is_no_agent() {
     // The profile exists and its `AppData\Local` too, but no agent has made `ssh-broker` yet.
     let profile = TempProfile::new("ab-dir");
     let location = profile.location();
-    assert!(!location.dir.exists());
-    let connect = real_connect(&location.path);
+    assert!(!location.dir().exists());
+    let connect = real_connect(location.path());
     assert_eq!(
         absence(&connect, &Ok(location)),
         Absence::NoAgent,
@@ -94,8 +90,8 @@ fn absence_of_a_connect_to_a_missing_folder_is_no_agent() {
 fn absence_of_a_connect_to_a_missing_file_in_an_existing_folder_is_no_agent() {
     let profile = TempProfile::new("ab-file");
     let location = profile.location();
-    std::fs::create_dir_all(&location.dir).unwrap();
-    let connect = real_connect(&location.path);
+    std::fs::create_dir_all(location.dir()).unwrap();
+    let connect = real_connect(location.path());
     assert_eq!(
         absence(&connect, &Ok(location)),
         Absence::NoAgent,
@@ -110,9 +106,12 @@ fn absence_of_a_connect_to_a_stale_socket_file_is_no_agent() {
     let profile = TempProfile::new("ab-stale");
     let location = profile.location();
     crate::userdir::ensure_socket_dir(&location, &crate::acl::Sid::current_user().unwrap()).unwrap();
-    drop(crate::afunix::Listener::bind(&location.path).unwrap());
-    assert!(location.path.exists(), "the stale socket file is what is being tested");
-    let connect = real_connect(&location.path);
+    drop(crate::afunix::Listener::bind(location.path()).unwrap());
+    assert!(
+        location.path().exists(),
+        "the stale socket file is what is being tested"
+    );
+    let connect = real_connect(location.path());
     assert_eq!(
         absence(&connect, &Ok(location)),
         Absence::NoAgent,

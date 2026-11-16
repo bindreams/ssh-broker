@@ -869,13 +869,13 @@ fn absence_of_a_socket_the_user_may_not_connect_to_is_other() {
     std::fs::create_dir_all(root.join("AppData").join("Local")).unwrap();
     let location = socket_loc::for_profile(&root).unwrap();
     userdir::ensure_socket_dir(&location, &ssh_broker::acl::Sid::current_user().unwrap()).unwrap();
-    let _listener = ssh_broker::afunix::Listener::bind(&location.path).unwrap();
+    let _listener = ssh_broker::afunix::Listener::bind(location.path()).unwrap();
 
     let result = kit.path("connect.result");
     let command = format!(
         "\"{helper}\" connect \"{socket}\" \"{result}\"",
         helper = kit.helper.display(),
-        socket = location.path.display(),
+        socket = location.path().display(),
         result = result.display()
     );
     let code = account.run_with(

@@ -29,37 +29,47 @@ use std::path::Path;
 
 use anyhow::Context;
 use windows::Wdk::Foundation::OBJECT_ATTRIBUTES;
-use windows::Wdk::Storage::FileSystem::{FILE_OPEN_FOR_BACKUP_INTENT, FILE_OPEN_REPARSE_POINT, NtOpenFile};
+use windows::Wdk::Storage::FileSystem::{
+    FILE_OPEN, FILE_OPEN_FOR_BACKUP_INTENT, FILE_OPEN_REPARSE_POINT, NTCREATEFILE_CREATE_DISPOSITION,
+    NTCREATEFILE_CREATE_OPTIONS, NtCreateFile,
+};
 use windows::Win32::Foundation::{
     CloseHandle, ERROR_ALREADY_EXISTS, HANDLE, HLOCAL, LocalFree, NTSTATUS, OBJ_CASE_INSENSITIVE,
-    RtlNtStatusToDosError, STATUS_ACCESS_DENIED, UNICODE_STRING,
+    RtlNtStatusToDosError, STATUS_ACCESS_DENIED, STATUS_NOT_A_DIRECTORY, STATUS_OBJECT_NAME_NOT_FOUND,
+    STATUS_OBJECT_PATH_NOT_FOUND, UNICODE_STRING,
 };
 use windows::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, GetNamedSecurityInfoW,
-    GetSecurityInfo, SDDL_REVISION_1, SE_FILE_OBJECT, SetNamedSecurityInfoW,
+    GetSecurityInfo, SDDL_REVISION_1, SE_FILE_OBJECT,
 };
 use windows::Win32::Security::{
     ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, ACL_SIZE_INFORMATION, AclSizeInformation, CONTAINER_INHERIT_ACE, CopySid,
     CreateWellKnownSid, DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetAclInformation, GetLengthSid,
-    GetSecurityDescriptorControl, GetSecurityDescriptorDacl, GetSecurityDescriptorOwner, GetTokenInformation,
-    INHERITED_ACE, IsValidSid, LookupAccountNameW, LookupAccountSidW, OBJECT_INHERIT_ACE, OWNER_SECURITY_INFORMATION,
-    PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SE_DACL_PRESENT, SE_DACL_PROTECTED,
-    SECURITY_ATTRIBUTES, SID_NAME_USE, TOKEN_QUERY, TOKEN_USER, TokenUser, WinBuiltinAdministratorsSid,
-    WinBuiltinUsersSid, WinLocalSystemSid,
+    GetSecurityDescriptorControl, GetTokenInformation, INHERITED_ACE, IsValidSid, LookupAccountNameW,
+    LookupAccountSidW, OBJECT_INHERIT_ACE, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SE_DACL_PRESENT,
+    SE_DACL_PROTECTED, SECURITY_ATTRIBUTES, SID_NAME_USE, TOKEN_QUERY, TOKEN_USER, TokenUser,
+    WinBuiltinAdministratorsSid, WinBuiltinUsersSid, WinLocalSystemSid,
 };
 use windows::Win32::Storage::FileSystem::{
-    BY_HANDLE_FILE_INFORMATION, CreateDirectoryW, FILE_ALL_ACCESS, FILE_ATTRIBUTE_DIRECTORY,
-    FILE_ATTRIBUTE_REPARSE_POINT, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
-    FILE_SHARE_READ, FILE_SHARE_WRITE, GetFileInformationByHandle, READ_CONTROL,
+    BY_HANDLE_FILE_INFORMATION, CreateDirectoryW, FILE_ACCESS_RIGHTS, FILE_ALL_ACCESS, FILE_ATTRIBUTE_DIRECTORY,
+    FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAGS_AND_ATTRIBUTES, FILE_GENERIC_EXECUTE,
+    FILE_GENERIC_READ, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_MODE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    GetFileInformationByHandle, READ_CONTROL,
 };
 use windows::Win32::System::IO::IO_STATUS_BLOCK;
 use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+use windows::Win32::System::WindowsProgramming::FILE_CREATED;
 use windows::core::{BOOL, HRESULT, PCWSTR, PWSTR};
 
 use crate::winutil::OwnedHandle;
 
 mod admin_file;
 pub use admin_file::{admin_only_file_problem, ensure_admin_only_file};
+mod private_dir;
+pub use private_dir::{
+    DirHandle, Missing, Refused, ensure_private_dir, open_dir, open_existing_file, open_existing_private_dir,
+    open_log_file, open_private_dir, open_root,
+};
 
 /// ACCESS_ALLOWED_ACE_TYPE (winnt.h) — stored raw in `ACE_HEADER.AceType` (a `u8`).
 const ACE_TYPE_ALLOWED: u8 = 0;
@@ -283,21 +293,33 @@ fn wide(path: &Path) -> Vec<u16> {
     path.as_os_str().encode_wide().chain(std::iter::once(0)).collect()
 }
 
+/// The DACL of a user's private directory in SDDL: protected (no inheritance from the parent),
+/// `{user, SYSTEM, Administrators}` Full Control, inherited by the files and folders made below
+/// (`OICI`). No owner: a creation leaves it to the creating token.
+fn private_dir_dacl_sddl(user: &Sid) -> anyhow::Result<String> {
+    let user = user.to_sddl()?;
+    Ok(format!("D:P(A;OICI;FA;;;{user})(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)"))
+}
+
 /// Apply the explicit, PROTECTED owner-only DACL (`{target_user, SYSTEM, Administrators}`
 /// Full Control, target_user as owner) to `dir`, removing any inherited or broader access. The
 /// ACEs are inheritable (`OI|CI`) so everything created inside is born with the same set.
+///
+/// A fixture for tests that need a folder of this shape.
+#[cfg(test)]
 pub fn harden_dir(dir: &Path, target_user: &Sid) -> anyhow::Result<()> {
-    let target = target_user.to_sddl()?;
-    // P = protected (no inheritance from the parent); OICI = inherited by files and folders
-    // below; FA = Full; SY = SYSTEM, BA = BUILTIN\Administrators.
-    let sddl = format!("O:{target}D:P(A;OICI;FA;;;{target})(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)");
-    let sddl_w: Vec<u16> = sddl.encode_utf16().chain(std::iter::once(0)).collect();
+    use windows::Win32::Security::Authorization::SetNamedSecurityInfoW;
+    use windows::Win32::Security::{
+        GetSecurityDescriptorDacl, GetSecurityDescriptorOwner, PROTECTED_DACL_SECURITY_INFORMATION,
+    };
+    let sd = descriptor_from_sddl(&format!(
+        "O:{}{}",
+        target_user.to_sddl()?,
+        private_dir_dacl_sddl(target_user)?
+    ))?;
+    let psd = sd.0;
     let path_w = wide(dir);
     unsafe {
-        let mut psd = PSECURITY_DESCRIPTOR::default();
-        ConvertStringSecurityDescriptorToSecurityDescriptorW(PCWSTR(sddl_w.as_ptr()), SDDL_REVISION_1, &mut psd, None)?;
-        let _sd = LocalSd(psd); // freed on every path below
-
         let mut dacl_present = BOOL(0);
         let mut dacl: *mut ACL = std::ptr::null_mut();
         let mut dacl_defaulted = BOOL(0);
@@ -512,16 +534,24 @@ fn private_grants<'a>(user: &'a Sid, system: &'a Sid, admins: &'a Sid, flags: Op
 /// `false` — fail-closed. The ACEs must be inheritable: a directory whose ACEs do not reach the
 /// socket file leaves the file with the creator's default DACL.
 pub fn verify_dir_acl(dir: &Path, target_user: &Sid) -> anyhow::Result<bool> {
+    dir_policy_holds(&Security::from_path(dir)?, target_user)
+}
+
+/// [`verify_dir_acl`] on an already-read security descriptor.
+fn dir_policy_holds(security: &Security, user: &Sid) -> anyhow::Result<bool> {
+    let (owner_ok, acl_ok) = dir_policy(security, user)?;
+    Ok(owner_ok && acl_ok)
+}
+
+/// Whether the owner and the ACL of a private directory are each what they must be, for a caller
+/// that says which one is not.
+fn dir_policy(security: &Security, user: &Sid) -> anyhow::Result<(bool, bool)> {
     let system = Sid::well_known(WellKnown::System)?;
     let admins = Sid::well_known(WellKnown::Administrators)?;
-    let security = Security::from_path(dir)?;
-    Ok(security.owner_in(&[target_user, &system, &admins])?
-        && security.dacl_matches(&private_grants(
-            target_user,
-            &system,
-            &admins,
-            Some(PRIVATE_DIR_ACE_FLAGS),
-        ))?)
+    Ok((
+        security.owner_in(&[user, &system, &admins])?,
+        security.dacl_matches(&private_grants(user, &system, &admins, Some(PRIVATE_DIR_ACE_FLAGS)))?,
+    ))
 }
 
 /// `true` iff `file` (the socket, the lock, a folder made inside a hardened directory) grants
@@ -538,42 +568,6 @@ fn file_policy_holds(security: &Security, user: &Sid) -> anyhow::Result<bool> {
     let admins = Sid::well_known(WellKnown::Administrators)?;
     Ok(security.owner_in(&[user, &system, &admins])?
         && security.dacl_matches_as(&private_grants(user, &system, &admins, None), Inheritance::Inherited)?)
-}
-
-/// Why `dir` must not be adopted as `user`'s private directory, or `None` if it may be (and
-/// [`harden_dir`] may repair it). It is read without following a link: a junction or symlink is
-/// refused, as is anything that is not a directory, and so is an owner other than `user`,
-/// SYSTEM or Administrators. Hardening re-owns and re-ACLs the object it is given, so it must not
-/// be given a link to somewhere else or a directory somebody else owns.
-pub fn private_dir_problem(dir: &Path, user: &Sid) -> anyhow::Result<Option<String>> {
-    let Some(handle) = open_for_inspection(dir)? else {
-        return Ok(Some(
-            "this process is denied access to read its ACL, so it cannot be shown to be its own".to_owned(),
-        ));
-    };
-    let security = Security::from_handle(handle.0).with_context(|| format!("read the ACL of {}", dir.display()))?;
-    let owner = describe_sid(security.owner);
-
-    let mut info = BY_HANDLE_FILE_INFORMATION::default();
-    unsafe { GetFileInformationByHandle(handle.0, &mut info) }
-        .with_context(|| format!("read the attributes of {}", dir.display()))?;
-    if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
-        return Ok(Some(format!(
-            "it is a reparse point (junction or symlink); owner {owner}"
-        )));
-    }
-    if info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY.0 == 0 {
-        return Ok(Some(format!("it is not a directory; owner {owner}")));
-    }
-    let system = Sid::well_known(WellKnown::System)?;
-    let admins = Sid::well_known(WellKnown::Administrators)?;
-    if !security.owner_in(&[user, &system, &admins])? {
-        return Ok(Some(format!(
-            "its owner is {owner}, not {}, SYSTEM or Administrators",
-            user.describe()
-        )));
-    }
-    Ok(None)
 }
 
 // install directory ====================================================================
@@ -594,49 +588,136 @@ const INSTALL_ACE_FLAGS: u8 = (OBJECT_INHERIT_ACE.0 | CONTAINER_INHERIT_ACE.0) a
 /// Not `CreateFileW`: it always adds `SYNCHRONIZE` to the request, so a deny ACE covering
 /// `SYNCHRONIZE` (`icacls /deny (W)` does) would fail the open before the ACL is read.
 fn open_for_inspection(dir: &Path) -> anyhow::Result<Option<OwnedHandle>> {
-    let mut name = nt_path(dir)?;
-    let bytes = u16::try_from(name.len() * 2).context("the path is too long")?;
-    let name = UNICODE_STRING {
-        Length: bytes,
-        MaximumLength: bytes,
-        Buffer: PWSTR(name.as_mut_ptr()),
-    };
-    let attributes = OBJECT_ATTRIBUTES {
-        Length: std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
-        ObjectName: &name,
-        Attributes: OBJ_CASE_INSENSITIVE,
-        ..Default::default()
-    };
-    let mut handle = HANDLE::default();
-    let mut io = IO_STATUS_BLOCK::default();
-    // SAFETY: every pointer is to a local that outlives the call.
-    let status = unsafe {
-        NtOpenFile(
-            &mut handle,
-            READ_CONTROL.0 | FILE_READ_ATTRIBUTES.0,
-            &attributes,
-            &mut io,
-            (FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE).0,
-            FILE_OPEN_FOR_BACKUP_INTENT.0 | FILE_OPEN_REPARSE_POINT.0,
-        )
-    };
-    match classify_open(status) {
-        OpenOutcome::Opened => Ok(Some(OwnedHandle(handle))),
+    let name = nt_path(dir)?;
+    let made = nt_create(
+        None,
+        &name,
+        READ_CONTROL.0 | FILE_READ_ATTRIBUTES.0,
+        FILE_OPEN,
+        FILE_OPEN_FOR_BACKUP_INTENT.0 | FILE_OPEN_REPARSE_POINT.0,
+        None,
+    )?;
+    match classify_open(made.status) {
+        OpenOutcome::Opened => Ok(Some(OwnedHandle(made.handle))),
         OpenOutcome::Denied => Ok(None),
-        OpenOutcome::Failed(status) => {
-            let win32 = unsafe { RtlNtStatusToDosError(status) };
-            Err(windows::core::Error::from(HRESULT::from_win32(win32)))
-                .with_context(|| format!("open {}", dir.display()))
+        OpenOutcome::Missing | OpenOutcome::NotADirectory | OpenOutcome::Failed(_) => {
+            Err(status_error(made.status)).with_context(|| format!("open {}", dir.display()))
         }
     }
 }
 
-/// What [`open_for_inspection`]'s `NtOpenFile` status means.
+/// What `NtCreateFile` made of a name: its status, and the handle, which is valid only if the status
+/// is not an error and which the caller then owns. [`classify_open`] says what the status means.
+struct Made {
+    status: NTSTATUS,
+    handle: HANDLE,
+    /// The call made the object: it did not exist.
+    created: bool,
+}
+
+/// Open or make `name` (UTF-16, no terminator), an NT path when `root` is `None` and else one name
+/// below `root`, sharing read, write and delete; a made object gets `descriptor`. `Err` is a name too
+/// long to pass.
+fn nt_create(
+    root: Option<HANDLE>,
+    name: &[u16],
+    access: u32,
+    disposition: NTCREATEFILE_CREATE_DISPOSITION,
+    options: u32,
+    descriptor: Option<PSECURITY_DESCRIPTOR>,
+) -> anyhow::Result<Made> {
+    let mut handle = HANDLE::default();
+    let mut io = IO_STATUS_BLOCK::default();
+    let status = with_attributes(root, name, descriptor, |attributes| {
+        // SAFETY: every pointer is to a local that outlives the call.
+        unsafe {
+            NtCreateFile(
+                &mut handle,
+                FILE_ACCESS_RIGHTS(access),
+                attributes,
+                &mut io,
+                None,
+                FILE_FLAGS_AND_ATTRIBUTES(FILE_ATTRIBUTE_NORMAL.0),
+                FILE_SHARE_MODE(FILE_SHARE_READ.0 | FILE_SHARE_WRITE.0 | FILE_SHARE_DELETE.0),
+                disposition,
+                NTCREATEFILE_CREATE_OPTIONS(options),
+                None,
+                0,
+            )
+        }
+    })?;
+    Ok(Made {
+        status,
+        handle,
+        created: io.Information == FILE_CREATED as usize,
+    })
+}
+
+/// Run `call` with the `OBJECT_ATTRIBUTES` that name `name` (UTF-16, no terminator) under `root`, or
+/// as an NT path without it, and carry `descriptor` into a creation. Names compare without case.
+fn with_attributes<R>(
+    root: Option<HANDLE>,
+    name: &[u16],
+    descriptor: Option<PSECURITY_DESCRIPTOR>,
+    call: impl FnOnce(&OBJECT_ATTRIBUTES) -> R,
+) -> anyhow::Result<R> {
+    let mut units = name.to_vec();
+    let bytes = u16::try_from(units.len() * 2).context("the name is too long")?;
+    let name = UNICODE_STRING {
+        Length: bytes,
+        MaximumLength: bytes,
+        Buffer: PWSTR(units.as_mut_ptr()),
+    };
+    let attributes = OBJECT_ATTRIBUTES {
+        Length: std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
+        RootDirectory: root.unwrap_or_default(),
+        ObjectName: &name,
+        Attributes: OBJ_CASE_INSENSITIVE,
+        SecurityDescriptor: descriptor.map_or(std::ptr::null(), |sd| sd.0 as *const _),
+        ..Default::default()
+    };
+    Ok(call(&attributes))
+}
+
+/// A security descriptor parsed from SDDL, freed on drop.
+fn descriptor_from_sddl(sddl: &str) -> anyhow::Result<LocalSd> {
+    let sddl_w: Vec<u16> = sddl.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut psd = PSECURITY_DESCRIPTOR::default();
+    // SAFETY: a NUL-terminated string and a valid out-pointer; `LocalSd` frees what it returns.
+    unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(PCWSTR(sddl_w.as_ptr()), SDDL_REVISION_1, &mut psd, None)
+    }
+    .context("parse a security descriptor")?;
+    Ok(LocalSd(psd))
+}
+
+/// Needs `FILE_READ_ATTRIBUTES` on `handle`.
+fn file_information(handle: HANDLE) -> anyhow::Result<BY_HANDLE_FILE_INFORMATION> {
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: a valid handle and an out-pointer to a local.
+    unsafe { GetFileInformationByHandle(handle, &mut info) }.context("read the attributes")?;
+    Ok(info)
+}
+
+fn file_attributes(handle: HANDLE) -> anyhow::Result<u32> {
+    Ok(file_information(handle)?.dwFileAttributes)
+}
+
+fn status_error(status: NTSTATUS) -> windows::core::Error {
+    // SAFETY: a pure conversion of a status code.
+    windows::core::Error::from(HRESULT::from_win32(unsafe { RtlNtStatusToDosError(status) }))
+}
+
+/// What the status of an [`nt_create`] means: the one place a status becomes an outcome.
 #[derive(Debug, PartialEq, Eq)]
 enum OpenOutcome {
     Opened,
-    /// The object refuses even the inspection rights; not an error of the inspection.
+    /// The object refuses even the rights asked for; for an inspection, not an error of it.
     Denied,
+    /// Nothing is at the name, or at a name on the way to it.
+    Missing,
+    /// A file is at the name of a directory that was asked for.
+    NotADirectory,
     Failed(NTSTATUS),
 }
 
@@ -645,6 +726,10 @@ fn classify_open(status: NTSTATUS) -> OpenOutcome {
         OpenOutcome::Opened
     } else if status == STATUS_ACCESS_DENIED {
         OpenOutcome::Denied
+    } else if status == STATUS_OBJECT_NAME_NOT_FOUND || status == STATUS_OBJECT_PATH_NOT_FOUND {
+        OpenOutcome::Missing
+    } else if status == STATUS_NOT_A_DIRECTORY {
+        OpenOutcome::NotADirectory
     } else {
         OpenOutcome::Failed(status)
     }
@@ -673,6 +758,42 @@ fn nt_path(dir: &Path) -> anyhow::Result<Vec<u16>> {
     Ok([units(prefix).as_slice(), rest].concat())
 }
 
+/// What the sentence of a refusal of an owner or an ACL says. Naming an account is a lookup that can
+/// block, so these are built only for an object that is refused (see [`owner_acl_problem`]).
+struct OwnerAclWords {
+    /// The owner as the object has it.
+    owner: String,
+    /// The owners that would do.
+    owner_set: String,
+    /// What its ACL must be.
+    acl_is: String,
+}
+
+/// Which of the owner and the ACL of a folder or file is wrong, or `None` if neither: the one
+/// sentence every refusal of such an object is built from. `words` is called only when there is a
+/// refusal.
+fn owner_acl_problem(owner_ok: bool, acl_ok: bool, words: impl FnOnce() -> OwnerAclWords) -> Option<String> {
+    if owner_ok && acl_ok {
+        return None;
+    }
+    let OwnerAclWords {
+        owner,
+        owner_set,
+        acl_is,
+    } = words();
+    Some(match (owner_ok, acl_ok) {
+        (false, true) => format!("its owner is {owner}, not {owner_set}"),
+        (true, false) => format!("its ACL is not {acl_is} (its owner, {owner}, is fine)"),
+        _ => format!("its owner is {owner}, not {owner_set}, and its ACL is not {acl_is}"),
+    })
+}
+
+/// The sentence for an object whose ACL this process may not read, so that it cannot be shown to be
+/// `shown_to_be`.
+fn denied_problem(shown_to_be: &str) -> String {
+    format!("this process is denied access to read its ACL, so it cannot be shown to be {shown_to_be}")
+}
+
 /// The ACEs of [`INSTALL_DIR_SDDL`], as [`Security::dacl_matches`] takes them.
 fn install_grants<'a>(system: &'a Sid, admins: &'a Sid, users: &'a Sid) -> [Grant<'a>; 3] {
     let grant = |sid, mask| Grant {
@@ -696,24 +817,23 @@ pub fn install_dir_problem(dir: &Path) -> anyhow::Result<Option<String>> {
 /// open was denied.
 fn problem_from_open(dir: &Path, handle: Option<OwnedHandle>) -> anyhow::Result<Option<String>> {
     let Some(handle) = handle else {
-        return Ok(Some(
-            "this process is denied access to read its ACL, so it cannot be shown to be the hardened one".to_owned(),
-        ));
+        return Ok(Some(denied_problem("the hardened one")));
     };
 
     let security = Security::from_handle(handle.0).with_context(|| format!("read the ACL of {}", dir.display()))?;
-    let owner = describe_sid(security.owner);
 
-    let mut info = BY_HANDLE_FILE_INFORMATION::default();
-    unsafe { GetFileInformationByHandle(handle.0, &mut info) }
-        .with_context(|| format!("read the attributes of {}", dir.display()))?;
-    if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
+    let attributes = file_attributes(handle.0).with_context(|| format!("read the attributes of {}", dir.display()))?;
+    if attributes & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
         return Ok(Some(format!(
-            "it is a reparse point (junction or symlink); owner {owner}"
+            "it is a reparse point (junction or symlink); owner {}",
+            describe_sid(security.owner)
         )));
     }
-    if info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY.0 == 0 {
-        return Ok(Some(format!("it is not a directory; owner {owner}")));
+    if attributes & FILE_ATTRIBUTE_DIRECTORY.0 == 0 {
+        return Ok(Some(format!(
+            "it is not a directory; owner {}",
+            describe_sid(security.owner)
+        )));
     }
 
     let system = Sid::well_known(WellKnown::System)?;
@@ -723,14 +843,11 @@ fn problem_from_open(dir: &Path, handle: Option<OwnedHandle>) -> anyhow::Result<
     // `INSTALL_DIR_SDDL` makes Administrators the owner, so nothing else is accepted.
     let owner_ok = security.owner_in(&[&admins])?;
     let acl_ok = security.dacl_matches(&grants)?;
-    Ok(match (owner_ok, acl_ok) {
-        (true, true) => None,
-        (false, true) => Some(format!("its owner is {owner}, not the Administrators group")),
-        (true, false) => Some(format!("its ACL is not the hardened one (its owner, {owner}, is fine)")),
-        (false, false) => Some(format!(
-            "its owner is {owner}, not the Administrators group, and its ACL is not the hardened one"
-        )),
-    })
+    Ok(owner_acl_problem(owner_ok, acl_ok, || OwnerAclWords {
+        owner: describe_sid(security.owner),
+        owner_set: "the Administrators group".into(),
+        acl_is: "the hardened one".into(),
+    }))
 }
 
 /// Create `dir` with the install-directory DACL, or accept it if this build made it already.
@@ -754,15 +871,12 @@ pub fn ensure_install_dir(dir: &Path) -> anyhow::Result<()> {
 /// `CreateDirectoryW` with [`INSTALL_DIR_SDDL`]. "Already exists" is not an error here: the
 /// caller decides whether what exists is acceptable.
 fn create_install_dir(dir: &Path) -> anyhow::Result<()> {
-    let sddl_w: Vec<u16> = INSTALL_DIR_SDDL.encode_utf16().chain(std::iter::once(0)).collect();
+    let sd = descriptor_from_sddl(INSTALL_DIR_SDDL)?;
     let path_w = wide(dir);
     unsafe {
-        let mut psd = PSECURITY_DESCRIPTOR::default();
-        ConvertStringSecurityDescriptorToSecurityDescriptorW(PCWSTR(sddl_w.as_ptr()), SDDL_REVISION_1, &mut psd, None)?;
-        let _sd = LocalSd(psd);
         let attributes = SECURITY_ATTRIBUTES {
             nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
-            lpSecurityDescriptor: psd.0,
+            lpSecurityDescriptor: sd.0.0,
             bInheritHandle: BOOL(0),
         };
         match CreateDirectoryW(PCWSTR(path_w.as_ptr()), Some(&attributes)) {

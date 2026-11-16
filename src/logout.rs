@@ -111,7 +111,7 @@ pub fn logout_at<R: Read, W: Write, T>(
 pub fn run() -> anyhow::Result<()> {
     let connect = || {
         let location = crate::userdir::current_socket_location()?;
-        let conn = crate::afunix::connect(&location.path)?;
+        let conn = crate::afunix::connect(location.path())?;
         crate::afunix::split(conn)
     };
     // No profile and nothing listening both mean there is no session; anything else is not that.
