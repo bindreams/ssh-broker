@@ -69,9 +69,11 @@ path that would push the socket past the 107-byte AF_UNIX limit is an error, not
 another location (`socket_loc::SocketLocationError::TooLong`).
 
 The agent's own operations in the folder (`Listener::bind`, the `agent_lock` locks, the `serving`
-marker) still name it by path: it runs with the user's plain, non-elevated token (pinned by
-`an_administrators_shim_sees_the_agent_it_starts`), so a link redirects it only to what the same
-account can already change. The elevated shim is different. It looks at `agent.lock` through the
+marker) still name it by path. That gains a process of the same account nothing as long as the agent
+runs with the plain, non-elevated token, which is what the logon task and the on-demand start give
+it (pinned by `an_administrators_shim_sees_the_agent_it_starts`): a link then redirects it only to what
+the same account can already change. An agent started by hand from an elevated prompt is not covered.
+The elevated shim is different. It looks at `agent.lock` through the
 folder's handle and never creates it (`starting_agent`, `userdir::open_existing_socket_dir`); the
 connect to the socket and the folder watch (`socket_watch`) stay by path, and neither creates or
 writes anything.
