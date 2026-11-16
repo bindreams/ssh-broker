@@ -50,10 +50,10 @@ impl<C: Fn() -> Date> DailyLog<C> {
     /// later write tries the new name again, with no limit, until it opens.
     fn file(&mut self) -> &mut std::fs::File {
         let today = (self.clock)();
-        if self.current.0 != today {
-            if let Ok(file) = acl::open_log_file(&self.dir, &file_name(&self.prefix, today)) {
-                self.current = (today, file);
-            }
+        if self.current.0 != today
+            && let Ok(file) = acl::open_log_file(&self.dir, &file_name(&self.prefix, today))
+        {
+            self.current = (today, file);
         }
         &mut self.current.1
     }
