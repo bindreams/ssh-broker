@@ -68,6 +68,14 @@ the folder names, and a handle opened before it stays open after it. A link at `
 path that would push the socket past the 107-byte AF_UNIX limit is an error, not a reason to use
 another location (`socket_loc::SocketLocationError::TooLong`).
 
+The agent's own operations in the folder (`Listener::bind`, the `agent_lock` locks, the `serving`
+marker) still name it by path: it runs with the user's plain, non-elevated token (pinned by
+`an_administrators_shim_sees_the_agent_it_starts`), so a link redirects it only to what the same
+account can already change. The elevated shim is different. It looks at `agent.lock` through the
+folder's handle and never creates it (`starting_agent`, `userdir::open_existing_socket_dir`); the
+connect to the socket and the folder watch (`socket_watch`) stay by path, and neither creates or
+writes anything.
+
 The install directory is the other half of the boundary: the agent runs the exe in it, so a directory a standard user can write to is a privilege escalation. `apply` verifies it exactly and reads and writes nothing in it until that passes. Users can read what is in it, so a file in it that a user must not open (`apply.lock`: a byte-range lock needs only a read handle) gets its own protected DACL of SYSTEM and Administrators at creation, verified exactly (`acl::ensure_admin_only_file`).
 
 ### Fail-open is deliberate, and never in the security boundary

@@ -118,8 +118,8 @@ fn a_network_token_shim_sees_the_agent_it_starts() {
     job.close();
 }
 
-/// Elevated (CI only). An administrator's shim runs at High integrity and the agent at Medium; the
-/// shim still learns that the agent serves from the files it writes.
+/// Elevated (CI only). An administrator's shim runs at High integrity and the agent at Medium (its token
+/// is not elevated); the shim still learns that the agent serves from the files it writes.
 /// Covers `logon::start_background_agent` and `SocketWatch` with the stand-in shim; the production
 /// shim's own flow is covered only by `prompt_path_windows.rs`.
 #[test]
@@ -128,11 +128,17 @@ fn an_administrators_shim_sees_the_agent_it_starts() {
     account_fixture::assert_elevated();
     let kit = Kit::new("radm");
     let account = Account::create("radm", true);
+    account.make_administrator();
     let password = password::password(&account.password);
     let started = logon::start_background_agent(&account_of(&account), &password, &kit.exe)
         .unwrap_or_else(|e| panic!("logon failed: {e:?}"));
     let location = ssh_broker::socket_loc::for_profile(account.profile()).unwrap();
     stand_in::wait_for_serving_marker(&location, started.process.0);
+    assert_eq!(
+        kit.agent_info("elevated"),
+        "false",
+        "the agent started for an administrator runs with an elevated token"
+    );
     assert_eq!(
         kit.agent_info("sid"),
         account.sid_text,
