@@ -154,13 +154,14 @@ fn user32() -> &'static User32 {
 static STATION: RwLock<()> = RwLock::new(());
 
 /// Shared hold on the window station: while it lives, the process's station is the original.
-fn station_unchanged() -> RwLockReadGuard<'static, ()> {
+pub fn station_unchanged() -> RwLockReadGuard<'static, ()> {
     STATION.read().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// Start `command`. A child started without a desktop of its own takes this process's current
 /// window station, so the start waits for any switch to finish and holds it off until the child
-/// exists. Every start of a child in this binary goes through here, [`status`] or [`output`].
+/// exists. Every start of a child in this binary goes through here, [`status`] or [`output`], or
+/// holds [`station_unchanged`] itself.
 pub fn spawn(command: &mut Command) -> io::Result<Child> {
     let _unchanged = station_unchanged();
     command.spawn()
@@ -197,9 +198,19 @@ impl PrivateDesktop {
     /// account and the one starting it); SYSTEM, which the secondary-logon service runs as, is added.
     /// Naming a window station needs an administrator (Microsoft, `CreateWindowStationW`).
     pub fn create(sids: &[&str]) -> windows::core::Result<PrivateDesktop> {
+        PrivateDesktop::create_labelled(sids, None)
+    }
+
+    /// [`PrivateDesktop::create`] with the pair labelled at mandatory integrity level `label` (the
+    /// relative id of the label SID, such as `0x1000` for Low), no-write-up. A pair without a label is
+    /// Medium: a child below Medium, such as a Low-integrity one, is refused write access to its own
+    /// window station and desktop, and cannot initialise user32 on them. The caller may label the pair
+    /// no higher than its own level.
+    pub fn create_labelled(sids: &[&str], label: Option<u32>) -> windows::core::Result<PrivateDesktop> {
         let users: Vec<&str> = sids.iter().copied().chain([SYSTEM]).collect();
-        let station_sd = Descriptor::parse(&grant_sddl(&users, STATION_ACCESS))?;
-        let desktop_sd = Descriptor::parse(&grant_sddl(&users, DESKTOP_ACCESS))?;
+        let sacl = label.map_or(String::new(), |rid| format!("S:(ML;;NW;;;S-1-16-{rid})"));
+        let station_sd = Descriptor::parse(&format!("{}{sacl}", grant_sddl(&users, STATION_ACCESS)))?;
+        let desktop_sd = Descriptor::parse(&format!("{}{sacl}", grant_sddl(&users, DESKTOP_ACCESS)))?;
         let station_name = format!("sb-iso-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed));
         let api = user32();
 
