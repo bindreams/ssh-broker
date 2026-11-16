@@ -45,21 +45,23 @@ impl<C: Fn() -> Date> DailyLog<C> {
         })
     }
 
-    /// The file for the date now, opened if the date is not the one the current file is for. A
-    /// failed open leaves the current file as it was, so the next write tries again.
-    fn file(&mut self) -> std::io::Result<&mut std::fs::File> {
+    /// The file for the date now, opened if the date is not the one the current file is for. When
+    /// that open fails the current file is kept and written to, as the rolling appender does; every
+    /// later write tries the new name again, with no limit, until it opens.
+    fn file(&mut self) -> &mut std::fs::File {
         let today = (self.clock)();
         if self.current.0 != today {
-            let file = acl::open_log_file(&self.dir, &file_name(&self.prefix, today)).map_err(std::io::Error::other)?;
-            self.current = (today, file);
+            if let Ok(file) = acl::open_log_file(&self.dir, &file_name(&self.prefix, today)) {
+                self.current = (today, file);
+            }
         }
-        Ok(&mut self.current.1)
+        &mut self.current.1
     }
 }
 
 impl<C: Fn() -> Date> Write for DailyLog<C> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.file()?.write(buf)
+        self.file().write(buf)
     }
 
     fn flush(&mut self) -> std::io::Result<()> {

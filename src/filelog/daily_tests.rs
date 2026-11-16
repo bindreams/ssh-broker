@@ -87,24 +87,48 @@ fn a_link_named_like_the_first_file_is_refused_when_the_log_is_made() {
 }
 
 #[test]
-fn a_file_that_cannot_be_opened_at_the_date_change_fails_that_write_and_the_next_write_tries_again() {
+fn a_file_that_cannot_be_opened_at_the_date_change_leaves_the_lines_in_the_current_file_until_it_can() {
     let (profile, dir, now) = folder_and_clock("fail", date(2026, Month::January, 1));
     let mut log = DailyLog::new(dir, "shim.log", clock_of(&now)).unwrap();
     let blocker = profile.0.join("shim.log.2026-01-02");
     std::fs::create_dir(&blocker).unwrap();
     *now.lock().unwrap() = date(2026, Month::January, 2);
 
-    assert!(log.write_all(b"lost\n").is_err());
+    log.write_all(
+        b"first
+",
+    )
+    .unwrap();
+    log.write_all(
+        b"second
+",
+    )
+    .unwrap();
     std::fs::remove_dir(&blocker).unwrap();
-    log.write_all(b"kept\n").unwrap();
+    log.write_all(
+        b"third
+",
+    )
+    .unwrap();
+    log.write_all(
+        b"fourth
+",
+    )
+    .unwrap();
 
+    let read = |name: &str| std::fs::read_to_string(profile.0.join(name)).unwrap();
     assert_eq!(
-        std::fs::read_to_string(profile.0.join("shim.log.2026-01-02")).unwrap(),
-        "kept\n"
+        read("shim.log.2026-01-01"),
+        "first
+second
+",
+        "kept writing to the current file"
     );
     assert_eq!(
-        std::fs::read_to_string(profile.0.join("shim.log.2026-01-01")).unwrap(),
-        "",
-        "the failed line went nowhere"
+        read("shim.log.2026-01-02"),
+        "third
+fourth
+",
+        "the new name is tried at the next write"
     );
 }
