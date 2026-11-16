@@ -37,6 +37,27 @@ pub fn aces(sddl: &str) -> Vec<(&str, &str, u32, &str)> {
         .collect()
 }
 
+// Changing a folder's ACL -----
+
+/// `icacls <path> <args>`, which must succeed.
+pub fn icacls(path: &std::path::Path, args: &[&str]) {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let status = Command::new("icacls")
+        .arg(path)
+        .args(args)
+        .creation_flags(CREATE_NO_WINDOW)
+        .status()
+        .unwrap();
+    assert!(status.success(), "icacls {} {args:?}", path.display());
+}
+
+/// Give Everyone Full Control of the folder `dir`, inherited, on top of what it has: a private folder
+/// that is no longer exactly private.
+pub fn widen(dir: &std::path::Path) {
+    icacls(dir, &["/grant", "*S-1-1-0:(OI)(CI)F"]);
+}
+
 // A stand-in profile -----
 
 /// A stand-in profile under the temp dir, removed on drop. `AppData\Local` exists inside it, as

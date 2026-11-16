@@ -174,13 +174,7 @@ fn widened(tag: &str, logs_only: bool) -> (TempProfile, SocketLocation) {
     } else {
         loc.dir().to_path_buf()
     };
-    let status = std::process::Command::new("icacls")
-        .arg(&folder)
-        .args(["/grant", "*S-1-1-0:(OI)(CI)F"])
-        .creation_flags(CREATE_NO_WINDOW)
-        .status()
-        .unwrap();
-    assert!(status.success(), "control: icacls widened {}", folder.display());
+    crate::test_support::widen(&folder);
     (profile, loc)
 }
 

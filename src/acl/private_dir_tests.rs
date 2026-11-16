@@ -2,7 +2,7 @@
 //! refused wherever it is, and nothing outside the profile may change.
 use super::*;
 use crate::acl::{self, Sid};
-use crate::test_support::{TempProfile, dacl_sddl, junction, tree_state};
+use crate::test_support::{TempProfile, dacl_sddl, icacls, junction, tree_state, widen};
 use std::io::Write;
 
 fn me() -> Sid {
@@ -32,15 +32,6 @@ fn symlink_dir(link: &Path, target: &Path) {
             target.display()
         )
     });
-}
-
-fn icacls(path: &Path, args: &[&str]) {
-    let status = std::process::Command::new("icacls")
-        .arg(path)
-        .args(args)
-        .status()
-        .unwrap();
-    assert!(status.success(), "icacls {args:?}");
 }
 
 const LINKS: [&str; 4] = [
@@ -103,8 +94,7 @@ fn an_exact_folder_is_left_untouched() {
     icacls(&child, &["/grant", "*S-1-1-0:R"]);
     let before = tree_state(&profile.0);
 
-    let local = open_dir(&open_dir(&open_root(&profile.0).unwrap(), "AppData").unwrap(), "Local").unwrap();
-    ensure_private_dir(&local, "ssh-broker", &me()).unwrap();
+    ensure_private_dir(&local_of(&profile), "ssh-broker", &me()).unwrap();
 
     assert_eq!(tree_state(&profile.0), before);
 }
@@ -114,12 +104,16 @@ fn a_widened_folder_is_refused_and_left_untouched() {
     let profile = TempProfile::new("wide");
     let (broker, _) = made(&profile);
     std::fs::write(broker.path().join("child.txt"), "x").unwrap();
-    icacls(broker.path(), &["/grant", "*S-1-1-0:(OI)(CI)F"]);
+    widen(broker.path());
     assert!(!acl::verify_dir_acl(broker.path(), &me()).unwrap(), "control: widened");
     let before = tree_state(&profile.0);
 
-    let local = open_dir(&open_dir(&open_root(&profile.0).unwrap(), "AppData").unwrap(), "Local").unwrap();
-    let err = format!("{:#}", ensure_private_dir(&local, "ssh-broker", &me()).err().unwrap());
+    let err = format!(
+        "{:#}",
+        ensure_private_dir(&local_of(&profile), "ssh-broker", &me())
+            .err()
+            .unwrap()
+    );
 
     assert!(err.contains(&broker.path().display().to_string()), "{err}");
     assert!(err.contains("remove"), "{err}");
@@ -134,7 +128,7 @@ fn a_widened_folder_is_refused_and_left_untouched() {
 fn a_folder_owned_by_the_user_with_an_extra_ace_is_blamed_on_the_acl_not_the_owner() {
     let profile = TempProfile::new("extra");
     let (broker, _) = made(&profile);
-    icacls(broker.path(), &["/grant", "*S-1-1-0:(OI)(CI)F"]);
+    widen(broker.path());
 
     let err = format!(
         "{:#}",
@@ -174,7 +168,7 @@ fn looking_at_the_private_folder_passes_an_exact_one_and_refuses_a_widened_one_a
     let (broker, _) = made(&profile);
     open_private_dir(&local_of(&profile), "ssh-broker", &me()).expect("exact");
 
-    icacls(broker.path(), &["/grant", "*S-1-1-0:(OI)(CI)F"]);
+    widen(broker.path());
     let before = tree_state(&profile.0);
     let err = open_private_dir(&local_of(&profile), "ssh-broker", &me())
         .err()
@@ -190,8 +184,7 @@ fn a_file_at_the_name_is_refused_and_left_untouched() {
     let profile = TempProfile::new("file");
     let local = profile.0.join(r"AppData\Local");
     std::fs::write(local.join("ssh-broker"), "x").unwrap();
-    let root = open_root(&profile.0).unwrap();
-    let local = open_dir(&open_dir(&root, "AppData").unwrap(), "Local").unwrap();
+    let local = local_of(&profile);
 
     let err = format!("{:#}", ensure_private_dir(&local, "ssh-broker", &me()).err().unwrap());
 

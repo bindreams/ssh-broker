@@ -213,12 +213,7 @@ fn start_serves_without_a_log_when_the_logs_folder_is_refused() {
     let profile = TempProfile::new("start-nologs");
     let loc = profile.location();
     crate::userdir::ensure_socket_dir(&loc, &Sid::current_user().unwrap()).unwrap();
-    let status = std::process::Command::new("icacls")
-        .arg(loc.logs_dir())
-        .args(["/grant", "*S-1-1-0:(OI)(CI)F"])
-        .status()
-        .unwrap();
-    assert!(status.success());
+    crate::test_support::widen(&loc.logs_dir());
     let served = Cell::new(false);
     let mut stderr = Vec::new();
 

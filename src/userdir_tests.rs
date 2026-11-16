@@ -304,12 +304,7 @@ fn a_refused_logs_folder_leaves_the_socket_folder_serving() {
     let profile = TempProfile::new("logs-ref");
     let loc = profile.location();
     ensure_socket_dir(&loc, &me()).unwrap();
-    let status = std::process::Command::new("icacls")
-        .arg(loc.logs_dir())
-        .args(["/grant", "*S-1-1-0:(OI)(CI)F"])
-        .status()
-        .unwrap();
-    assert!(status.success());
+    crate::test_support::widen(&loc.logs_dir());
     let before = tree_state(&profile.0);
 
     let folder = open_socket_dir(&loc, &me()).expect("the socket folder is exact");
