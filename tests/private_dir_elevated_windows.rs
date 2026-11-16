@@ -178,8 +178,9 @@ impl Drop for LinkAtLocal {
 /// A session through the real sshd, with the shim as `DefaultShell` and `kind` of link at the account's
 /// `AppData\Local` leading to a folder the account owns, which is not hardened: the folder an unfixed
 /// shim would check and re-ACL if it followed the link. The session runs a command and ends; the
-/// folder outside the profile, its owner, ACL and files, is as it was and holds no log. The command ran,
-/// so the shim was reached.
+/// folder outside the profile, its owner, ACL and files, is as it was and holds no log. The command
+/// runs, and the shim's own line on stderr (it has no log, because the link is refused) shows that it
+/// was the shim that ran it: `cmd.exe` would print the same output if sshd ignored `DefaultShell`.
 fn session_with_a_link_at_local(tag: &str, kind: LinkKind) {
     let _machine = machine::exclusive();
     account_fixture::assert_elevated();
@@ -235,6 +236,14 @@ fn session_with_a_link_at_local(tag: &str, kind: LinkKind) {
         outcome.code == Some(0) && shown.contains("sb-session-ran"),
         "{kind:?}: the command did not run through the shim (exit {:?}); stdout:\n{shown}\nstderr:\n{}\n{}",
         outcome.code,
+        outcome.stderr,
+        (login.diagnostics())()
+    );
+    assert!(
+        outcome.stderr.contains("agent unavailable")
+            && outcome.stderr.contains("the shim has no log")
+            && outcome.stderr.contains("reparse point"),
+        "{kind:?}: the shim did not say why it has no log, so it may not have run; stderr:\n{}\n{}",
         outcome.stderr,
         (login.diagnostics())()
     );
