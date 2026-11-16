@@ -14,7 +14,6 @@
 //! runner is discarded after the job, so it is not put back.
 #![cfg(windows)]
 
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -22,12 +21,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use ssh_broker::acl::Sid;
 use ssh_broker::provision::registry::{OPENSSH_KEY, set_default_shell_under};
 use ssh_broker::{socket_loc, userdir};
-use windows::Win32::Foundation::{HLOCAL, LocalFree};
-use windows::Win32::Security::Authorization::{
-    ConvertSecurityDescriptorToStringSecurityDescriptorW, GetNamedSecurityInfoW, SDDL_REVISION_1, SE_FILE_OBJECT,
-};
-use windows::Win32::Security::{DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR};
-use windows::core::{PCWSTR, PWSTR};
 
 #[path = "common/account.rs"]
 mod account_fixture;
@@ -37,6 +30,8 @@ mod agent_conn;
 mod bounded_wait;
 #[path = "common/desktop.rs"]
 mod desktop;
+#[path = "common/fs_state.rs"]
+mod fs_state;
 #[path = "common/hard_errors.rs"]
 mod hard_errors;
 #[path = "common/logon_session.rs"]
@@ -55,70 +50,11 @@ mod sshd_rig;
 mod stand_in;
 
 use account_fixture::{Account, ServiceLogon};
+use fs_state::{junction, sddl_of, tree_state};
 use sshd_rig::{Login, no_shell_to_carry, run_client};
 use stand_in::Kit;
 
 // What a test compares =====
-
-/// Owner and DACL of `path` as SDDL, read through the path.
-fn sddl_of(path: &Path) -> String {
-    let w: Vec<u16> = std::os::windows::ffi::OsStrExt::encode_wide(path.as_os_str())
-        .chain(std::iter::once(0))
-        .collect();
-    let mut psd = PSECURITY_DESCRIPTOR::default();
-    // SAFETY: valid out-pointers; both allocations are freed below.
-    unsafe {
-        GetNamedSecurityInfoW(
-            PCWSTR(w.as_ptr()),
-            SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION | OWNER_SECURITY_INFORMATION,
-            None,
-            None,
-            None,
-            None,
-            &mut psd,
-        )
-        .ok()
-        .unwrap_or_else(|e| panic!("read the security of {}: {e}", path.display()));
-        let mut text = PWSTR::null();
-        ConvertSecurityDescriptorToStringSecurityDescriptorW(
-            psd,
-            SDDL_REVISION_1,
-            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
-            &mut text,
-            None,
-        )
-        .unwrap();
-        let out = text.to_string().unwrap();
-        let _ = LocalFree(Some(HLOCAL(text.0 as *mut _)));
-        let _ = LocalFree(Some(HLOCAL(psd.0)));
-        out
-    }
-}
-
-/// Every path under `root` (and `root`), relative to it, with its owner and DACL and, for a file, its
-/// bytes: what a test compares before and after to see that nothing was changed, added or removed.
-/// A link is listed, not followed.
-fn tree_state(root: &Path) -> BTreeMap<String, String> {
-    fn visit(root: &Path, at: &Path, out: &mut BTreeMap<String, String>) {
-        let meta = at.symlink_metadata().unwrap();
-        let bytes = if meta.is_file() {
-            format!(" bytes={:?}", std::fs::read(at).unwrap())
-        } else {
-            String::new()
-        };
-        let relative = at.strip_prefix(root).unwrap().display().to_string();
-        out.insert(relative, format!("{}{bytes}", sddl_of(at)));
-        if meta.is_dir() {
-            for entry in std::fs::read_dir(at).unwrap() {
-                visit(root, &entry.unwrap().path(), out);
-            }
-        }
-    }
-    let mut out = BTreeMap::new();
-    visit(root, root, &mut out);
-    out
-}
 
 /// A stand-in `ssh-broker` folder as an administrator owns it (the install directory's shape): owned
 /// by Administrators, with an ACL that gives `BUILTIN\Users` read, which is not the private ACL, and
@@ -143,21 +79,6 @@ fn administrators_folder(parent: &Path) -> PathBuf {
 }
 
 // Links =====
-
-/// `link` as a junction to `target`, made by this (elevated) process.
-fn junction(link: &Path, target: &Path) {
-    let out = Command::new("cmd")
-        .args(["/C", "mklink", "/J"])
-        .arg(link)
-        .arg(target)
-        .output()
-        .unwrap();
-    assert!(
-        out.status.success(),
-        "mklink /J: {}",
-        String::from_utf8_lossy(&out.stdout)
-    );
-}
 
 /// What a link under the profile is, and who made it.
 #[derive(Clone, Copy, Debug)]

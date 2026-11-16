@@ -1,60 +1,24 @@
-//! Helpers shared by the Windows unit tests: reading a DACL by well-known SID alias, and a
-//! stand-in profile directory.
+//! Helpers shared by the Windows unit tests: reading a DACL by well-known SID alias, a snapshot of a
+//! tree to compare, and a stand-in profile directory.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use crate::socket_loc::SocketLocation;
 
-use windows::Win32::Foundation::{HLOCAL, LocalFree};
-use windows::Win32::Security::Authorization::{
-    ConvertSecurityDescriptorToStringSecurityDescriptorW, GetNamedSecurityInfoW, SDDL_REVISION_1, SE_FILE_OBJECT,
-};
-use windows::Win32::Security::{DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR};
-use windows::core::{PCWSTR, PWSTR};
+// What a test compares, and the link it puts in the way -----
+
+// One source with the integration tests of the private folder, which include it too.
+#[path = "../tests/common/fs_state.rs"]
+mod fs_state;
+pub use fs_state::{dacl_sddl, junction, tree_state};
 
 // Reading a DACL by SID -----
 
 pub const FILE_ALL: u32 = 0x1f_01ff;
 pub const FILE_READ_EXECUTE: u32 = 0x12_00a9;
-
-/// The DACL of `path` as an SDDL string (`D:AI(A;OICIID;FA;;;SY)...`). Well-known SIDs print as
-/// two-letter aliases, so this does not depend on the display language.
-pub fn dacl_sddl(path: &Path) -> String {
-    let path_w: Vec<u16> = std::os::windows::ffi::OsStrExt::encode_wide(path.as_os_str())
-        .chain(std::iter::once(0))
-        .collect();
-    unsafe {
-        let mut psd = PSECURITY_DESCRIPTOR::default();
-        GetNamedSecurityInfoW(
-            PCWSTR(path_w.as_ptr()),
-            SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION,
-            None,
-            None,
-            None,
-            None,
-            &mut psd,
-        )
-        .ok()
-        .unwrap();
-        let mut text = PWSTR::null();
-        ConvertSecurityDescriptorToStringSecurityDescriptorW(
-            psd,
-            SDDL_REVISION_1,
-            DACL_SECURITY_INFORMATION,
-            &mut text,
-            None,
-        )
-        .unwrap();
-        let sddl = text.to_string().unwrap();
-        let _ = LocalFree(Some(HLOCAL(text.0 as *mut core::ffi::c_void)));
-        let _ = LocalFree(Some(HLOCAL(psd.0)));
-        sddl
-    }
-}
 
 /// `(type, flags, access mask, trustee)` of each ACE in an SDDL DACL, in order.
 pub fn aces(sddl: &str) -> Vec<(&str, &str, u32, &str)> {
@@ -71,38 +35,6 @@ pub fn aces(sddl: &str) -> Vec<(&str, &str, u32, &str)> {
             (f[0], f[1], mask, f[5])
         })
         .collect()
-}
-
-/// Every path under `root` (and `root`), relative to it, with its DACL: what a test compares before
-/// and after to see that nothing was changed, added or removed there.
-pub fn tree_state(root: &Path) -> std::collections::BTreeMap<String, String> {
-    fn visit(root: &Path, at: &Path, out: &mut std::collections::BTreeMap<String, String>) {
-        let relative = at.strip_prefix(root).unwrap().display().to_string();
-        out.insert(relative, dacl_sddl(at));
-        if at.symlink_metadata().unwrap().is_dir() {
-            for entry in std::fs::read_dir(at).unwrap() {
-                visit(root, &entry.unwrap().path(), out);
-            }
-        }
-    }
-    let mut out = std::collections::BTreeMap::new();
-    visit(root, root, &mut out);
-    out
-}
-
-/// Make `link` a junction to `target` (no privilege needed).
-pub fn junction(link: &Path, target: &Path) {
-    let out = Command::new("cmd")
-        .args(["/C", "mklink", "/J"])
-        .arg(link)
-        .arg(target)
-        .output()
-        .unwrap();
-    assert!(
-        out.status.success(),
-        "mklink /J: {}",
-        String::from_utf8_lossy(&out.stdout)
-    );
 }
 
 // A stand-in profile -----

@@ -21,8 +21,8 @@ use windows::Win32::Foundation::{
     HANDLE, HLOCAL, LocalFree, OBJ_CASE_INSENSITIVE, OBJ_DONT_REPARSE, OBJECT_ATTRIBUTE_FLAGS, UNICODE_STRING,
 };
 use windows::Win32::Security::Authorization::{
-    ConvertSecurityDescriptorToStringSecurityDescriptorW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
-    GetNamedSecurityInfoW, SDDL_REVISION_1, SE_FILE_OBJECT, SetNamedSecurityInfoW, SetSecurityInfo,
+    ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1, SE_FILE_OBJECT, SetNamedSecurityInfoW,
+    SetSecurityInfo,
 };
 use windows::Win32::Security::{
     ACL, DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl, GetSecurityDescriptorOwner, OWNER_SECURITY_INFORMATION,
@@ -36,6 +36,10 @@ use windows::Win32::Storage::FileSystem::{
 };
 use windows::Win32::System::IO::IO_STATUS_BLOCK;
 use windows::core::{BOOL, PCWSTR, PWSTR};
+
+#[path = "common/fs_state.rs"]
+mod fs_state;
+use fs_state::{junction, sddl_of};
 
 /// STATUS_REPARSE_POINT_ENCOUNTERED: what `OBJ_DONT_REPARSE` answers at a link.
 const STATUS_REPARSE_POINT_ENCOUNTERED: i32 = 0xC000_050Bu32 as i32;
@@ -74,21 +78,6 @@ impl Drop for Tree {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
     }
-}
-
-/// `link` as a junction to `target`.
-fn junction(link: &Path, target: &Path) {
-    let out = std::process::Command::new("cmd")
-        .args(["/C", "mklink", "/J"])
-        .arg(link)
-        .arg(target)
-        .output()
-        .unwrap();
-    assert!(
-        out.status.success(),
-        "mklink /J: {}",
-        String::from_utf8_lossy(&out.stdout)
-    );
 }
 
 /// `link` as a directory symlink to `target`. Needs Developer Mode or the symlink privilege.
@@ -308,42 +297,6 @@ fn private_sd(with_owner: bool) -> Sd {
     let me = me_sddl();
     let owner = if with_owner { format!("O:{me}") } else { String::new() };
     Sd::from_sddl(&format!("{owner}D:P(A;OICI;FA;;;{me})(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)"))
-}
-
-/// Owner and DACL of `path` as SDDL, read through the path.
-fn sddl_of(path: &Path) -> String {
-    let w: Vec<u16> = std::os::windows::ffi::OsStrExt::encode_wide(path.as_os_str())
-        .chain(std::iter::once(0))
-        .collect();
-    let mut psd = PSECURITY_DESCRIPTOR::default();
-    // SAFETY: valid out-pointers; both allocations are freed below.
-    unsafe {
-        GetNamedSecurityInfoW(
-            PCWSTR(w.as_ptr()),
-            SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION | OWNER_SECURITY_INFORMATION,
-            None,
-            None,
-            None,
-            None,
-            &mut psd,
-        )
-        .ok()
-        .unwrap();
-        let mut text = PWSTR::null();
-        ConvertSecurityDescriptorToStringSecurityDescriptorW(
-            psd,
-            SDDL_REVISION_1,
-            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
-            &mut text,
-            None,
-        )
-        .unwrap();
-        let out = text.to_string().unwrap();
-        let _ = LocalFree(Some(HLOCAL(text.0 as *mut _)));
-        let _ = LocalFree(Some(HLOCAL(psd.0)));
-        out
-    }
 }
 
 // Opening without following a link -----
