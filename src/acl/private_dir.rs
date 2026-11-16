@@ -20,24 +20,20 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 use windows::Wdk::Storage::FileSystem::{
     FILE_DIRECTORY_FILE, FILE_NON_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_IF, FILE_OPEN_REPARSE_POINT,
-    FILE_SYNCHRONOUS_IO_NONALERT, NTCREATEFILE_CREATE_DISPOSITION, NTCREATEFILE_CREATE_OPTIONS, NtCreateFile,
+    FILE_SYNCHRONOUS_IO_NONALERT,
 };
 use windows::Win32::Foundation::{
-    DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE, NTSTATUS, STATUS_ACCESS_DENIED, STATUS_NOT_A_DIRECTORY,
+    DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE, STATUS_ACCESS_DENIED, STATUS_NOT_A_DIRECTORY,
     STATUS_OBJECT_NAME_NOT_FOUND, STATUS_OBJECT_PATH_NOT_FOUND,
 };
-use windows::Win32::Security::PSECURITY_DESCRIPTOR;
 use windows::Win32::Storage::FileSystem::{
-    FILE_ACCESS_RIGHTS, FILE_APPEND_DATA, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT,
-    FILE_FLAGS_AND_ATTRIBUTES, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_MODE, FILE_SHARE_READ,
-    FILE_SHARE_WRITE, READ_CONTROL, SYNCHRONIZE,
+    FILE_ACCESS_RIGHTS, FILE_APPEND_DATA, FILE_ATTRIBUTE_REPARSE_POINT, FILE_READ_ATTRIBUTES, READ_CONTROL, SYNCHRONIZE,
 };
-use windows::Win32::System::IO::IO_STATUS_BLOCK;
 use windows::Win32::System::Threading::GetCurrentProcess;
 
 use super::{
-    Security, Sid, denied_problem, describe_sid, descriptor_from_sddl, dir_policy, file_attributes, nt_path, open_nt,
-    owner_acl_problem, private_dir_dacl_sddl, status_error, with_attributes,
+    Made, OpenOutcome, Security, Sid, classify_open, denied_problem, describe_sid, descriptor_from_sddl, dir_policy,
+    file_attributes, nt_create, nt_path, owner_acl_problem, private_dir_dacl_sddl, status_error,
 };
 use crate::winutil::OwnedHandle;
 
@@ -107,13 +103,15 @@ impl DirHandle {
 pub fn open_root(dir: &Path) -> anyhow::Result<DirHandle> {
     let name = nt_path(dir)?;
     let purpose = "as the profile directory";
-    let (status, handle) = open_nt(
+    let made = nt_create(
         None,
         &name,
         DIR_ACCESS,
+        FILE_OPEN,
         FILE_DIRECTORY_FILE.0 | FILE_OPEN_REPARSE_POINT.0,
+        None,
     )?;
-    let handle = opened(status, handle, dir, purpose)?;
+    let handle = opened(made, dir, purpose)?;
     refuse_link(&handle, dir, purpose, SET_THE_PROFILE_PATH)?;
     Ok(DirHandle {
         handle,
@@ -126,13 +124,15 @@ pub fn open_root(dir: &Path) -> anyhow::Result<DirHandle> {
 pub fn open_dir(parent: &DirHandle, name: &str) -> anyhow::Result<DirHandle> {
     let units = single_name(name)?;
     let path = parent.path.join(name);
-    let (status, handle) = open_nt(
+    let made = nt_create(
         Some(parent.raw()),
         &units,
         DIR_ACCESS,
+        FILE_OPEN,
         FILE_DIRECTORY_FILE.0 | FILE_OPEN_REPARSE_POINT.0,
+        None,
     )?;
-    let handle = opened(status, handle, &path, "on the way to the private folder")?;
+    let handle = opened(made, &path, "on the way to the private folder")?;
     refuse_link(&handle, &path, "on the way to the private folder", REMOVE_THE_LINK)?;
     Ok(DirHandle { handle, path })
 }
@@ -160,7 +160,7 @@ fn private_dir(parent: &DirHandle, name: &str, user: &Sid, create: bool) -> anyh
     } else {
         None
     };
-    let made = create_nt(
+    let made = nt_create(
         Some(parent.raw()),
         &units,
         DIR_ACCESS,
@@ -178,7 +178,7 @@ fn private_dir(parent: &DirHandle, name: &str, user: &Sid, create: bool) -> anyh
         ))
         .into());
     }
-    let handle = opened(made.status, made.handle, &path, purpose)?;
+    let handle = opened(made, &path, purpose)?;
     refuse_link(&handle, &path, purpose, REMOVE_THE_LINK)?;
 
     let security = Security::from_handle(handle.0).with_context(|| format!("read the ACL of {}", path.display()))?;
@@ -213,13 +213,15 @@ pub fn open_existing_file(
 ) -> anyhow::Result<Option<std::fs::File>> {
     let units = single_name(name)?;
     let path = dir.path.join(name);
-    let (status, handle) = open_nt(
+    let made = nt_create(
         Some(dir.raw()),
         &units,
         access.0 | SYNCHRONIZE.0 | FILE_READ_ATTRIBUTES.0,
+        FILE_OPEN,
         FILE_NON_DIRECTORY_FILE.0 | FILE_SYNCHRONOUS_IO_NONALERT.0 | FILE_OPEN_REPARSE_POINT.0,
+        None,
     )?;
-    let handle = match opened(status, handle, &path, "as a file of the private folder") {
+    let handle = match opened(made, &path, "as a file of the private folder") {
         Ok(handle) => handle,
         Err(e) if e.is::<Missing>() => return Ok(None),
         Err(e) => return Err(e),
@@ -233,7 +235,7 @@ pub fn open_existing_file(
 pub fn open_log_file(dir: &DirHandle, name: &str) -> anyhow::Result<std::fs::File> {
     let units = single_name(name)?;
     let path = dir.path.join(name);
-    let made = create_nt(
+    let made = nt_create(
         Some(dir.raw()),
         &units,
         FILE_APPEND_DATA.0 | SYNCHRONIZE.0 | FILE_READ_ATTRIBUTES.0,
@@ -241,7 +243,7 @@ pub fn open_log_file(dir: &DirHandle, name: &str) -> anyhow::Result<std::fs::Fil
         FILE_NON_DIRECTORY_FILE.0 | FILE_SYNCHRONOUS_IO_NONALERT.0 | FILE_OPEN_REPARSE_POINT.0,
         None,
     )?;
-    let handle = opened(made.status, made.handle, &path, "as a log file")?;
+    let handle = opened(made, &path, "as a log file")?;
     refuse_link(&handle, &path, "as a log file", REMOVE_THE_LINK)?;
     Ok(into_file(handle))
 }
@@ -262,52 +264,13 @@ fn single_name(name: &str) -> anyhow::Result<Vec<u16>> {
     Ok(name.encode_utf16().collect())
 }
 
-/// What `NtCreateFile` made of a name.
-struct Made {
-    status: NTSTATUS,
-    handle: HANDLE,
-}
-
-/// `NtCreateFile` of `name` under `root`, sharing read, write and delete, with `descriptor` as the
-/// object's security descriptor if it is created. The caller owns `handle` when `status` is not an
-/// error.
-fn create_nt(
-    root: Option<HANDLE>,
-    name: &[u16],
-    access: u32,
-    disposition: NTCREATEFILE_CREATE_DISPOSITION,
-    options: u32,
-    descriptor: Option<PSECURITY_DESCRIPTOR>,
-) -> anyhow::Result<Made> {
-    let mut handle = HANDLE::default();
-    let mut io = IO_STATUS_BLOCK::default();
-    let status = with_attributes(root, name, descriptor, |attributes| {
-        // SAFETY: every pointer is to a local that outlives the call.
-        unsafe {
-            NtCreateFile(
-                &mut handle,
-                FILE_ACCESS_RIGHTS(access),
-                attributes,
-                &mut io,
-                None,
-                FILE_FLAGS_AND_ATTRIBUTES(FILE_ATTRIBUTE_NORMAL.0),
-                FILE_SHARE_MODE(FILE_SHARE_READ.0 | FILE_SHARE_WRITE.0 | FILE_SHARE_DELETE.0),
-                disposition,
-                NTCREATEFILE_CREATE_OPTIONS(options),
-                None,
-                0,
-            )
-        }
-    })?;
-    Ok(Made { status, handle })
-}
-
 /// The handle an open gave, or why there is none. A name that is a file where a directory is
 /// wanted is a refusal that says so, a name that is not there is [`Missing`]; everything else is
 /// the system's error, naming `path`.
-fn opened(status: NTSTATUS, handle: HANDLE, path: &Path, purpose: &str) -> anyhow::Result<OwnedHandle> {
-    if status.0 >= 0 {
-        return Ok(OwnedHandle(handle));
+fn opened(made: Made, path: &Path, purpose: &str) -> anyhow::Result<OwnedHandle> {
+    let status = made.status;
+    if classify_open(status) == OpenOutcome::Opened {
+        return Ok(OwnedHandle(made.handle));
     }
     if status == STATUS_NOT_A_DIRECTORY {
         return Err(Refused(format!(

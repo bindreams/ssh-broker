@@ -29,7 +29,10 @@ use std::path::Path;
 
 use anyhow::Context;
 use windows::Wdk::Foundation::OBJECT_ATTRIBUTES;
-use windows::Wdk::Storage::FileSystem::{FILE_OPEN_FOR_BACKUP_INTENT, FILE_OPEN_REPARSE_POINT, NtOpenFile};
+use windows::Wdk::Storage::FileSystem::{
+    FILE_OPEN, FILE_OPEN_FOR_BACKUP_INTENT, FILE_OPEN_REPARSE_POINT, NTCREATEFILE_CREATE_DISPOSITION,
+    NTCREATEFILE_CREATE_OPTIONS, NtCreateFile,
+};
 use windows::Win32::Foundation::{
     CloseHandle, ERROR_ALREADY_EXISTS, HANDLE, HLOCAL, LocalFree, NTSTATUS, OBJ_CASE_INSENSITIVE,
     RtlNtStatusToDosError, STATUS_ACCESS_DENIED, UNICODE_STRING,
@@ -47,9 +50,10 @@ use windows::Win32::Security::{
     WinBuiltinAdministratorsSid, WinBuiltinUsersSid, WinLocalSystemSid,
 };
 use windows::Win32::Storage::FileSystem::{
-    BY_HANDLE_FILE_INFORMATION, CreateDirectoryW, FILE_ALL_ACCESS, FILE_ATTRIBUTE_DIRECTORY,
-    FILE_ATTRIBUTE_REPARSE_POINT, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
-    FILE_SHARE_READ, FILE_SHARE_WRITE, GetFileInformationByHandle, READ_CONTROL,
+    BY_HANDLE_FILE_INFORMATION, CreateDirectoryW, FILE_ACCESS_RIGHTS, FILE_ALL_ACCESS, FILE_ATTRIBUTE_DIRECTORY,
+    FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAGS_AND_ATTRIBUTES, FILE_GENERIC_EXECUTE,
+    FILE_GENERIC_READ, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_MODE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    GetFileInformationByHandle, READ_CONTROL,
 };
 use windows::Win32::System::IO::IO_STATUS_BLOCK;
 use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
@@ -585,39 +589,61 @@ const INSTALL_ACE_FLAGS: u8 = (OBJECT_INHERIT_ACE.0 | CONTAINER_INHERIT_ACE.0) a
 /// `SYNCHRONIZE` (`icacls /deny (W)` does) would fail the open before the ACL is read.
 fn open_for_inspection(dir: &Path) -> anyhow::Result<Option<OwnedHandle>> {
     let name = nt_path(dir)?;
-    let (status, handle) = open_nt(
+    let made = nt_create(
         None,
         &name,
         READ_CONTROL.0 | FILE_READ_ATTRIBUTES.0,
+        FILE_OPEN,
         FILE_OPEN_FOR_BACKUP_INTENT.0 | FILE_OPEN_REPARSE_POINT.0,
+        None,
     )?;
-    match classify_open(status) {
-        OpenOutcome::Opened => Ok(Some(OwnedHandle(handle))),
+    match classify_open(made.status) {
+        OpenOutcome::Opened => Ok(Some(OwnedHandle(made.handle))),
         OpenOutcome::Denied => Ok(None),
         OpenOutcome::Failed(status) => Err(status_error(status)).with_context(|| format!("open {}", dir.display())),
     }
 }
 
-/// `NtOpenFile` of `name` (UTF-16, no terminator): an NT path when `root` is `None`, else one name
-/// below the directory `root`. Sharing is read, write and delete. Returns the status and the handle
-/// (valid only if the status is not an error); the caller owns it. `Err` is a name too long to pass.
-fn open_nt(root: Option<HANDLE>, name: &[u16], access: u32, options: u32) -> anyhow::Result<(NTSTATUS, HANDLE)> {
+/// What `NtCreateFile` made of a name: its status, and the handle, which is valid only if the status
+/// is not an error and which the caller then owns. [`classify_open`] says what the status means.
+struct Made {
+    status: NTSTATUS,
+    handle: HANDLE,
+}
+
+/// `NtCreateFile` of `name` (UTF-16, no terminator): an NT path when `root` is `None`, else one name
+/// below the directory `root`. With `FILE_OPEN` it only opens, as `NtOpenFile` does; with another
+/// disposition it makes the object, giving it `descriptor` as its security descriptor. Sharing is read,
+/// write and delete. `Err` is a name too long to pass.
+fn nt_create(
+    root: Option<HANDLE>,
+    name: &[u16],
+    access: u32,
+    disposition: NTCREATEFILE_CREATE_DISPOSITION,
+    options: u32,
+    descriptor: Option<PSECURITY_DESCRIPTOR>,
+) -> anyhow::Result<Made> {
     let mut handle = HANDLE::default();
     let mut io = IO_STATUS_BLOCK::default();
-    let status = with_attributes(root, name, None, |attributes| {
+    let status = with_attributes(root, name, descriptor, |attributes| {
         // SAFETY: every pointer is to a local that outlives the call.
         unsafe {
-            NtOpenFile(
+            NtCreateFile(
                 &mut handle,
-                access,
+                FILE_ACCESS_RIGHTS(access),
                 attributes,
                 &mut io,
-                (FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE).0,
-                options,
+                None,
+                FILE_FLAGS_AND_ATTRIBUTES(FILE_ATTRIBUTE_NORMAL.0),
+                FILE_SHARE_MODE(FILE_SHARE_READ.0 | FILE_SHARE_WRITE.0 | FILE_SHARE_DELETE.0),
+                disposition,
+                NTCREATEFILE_CREATE_OPTIONS(options),
+                None,
+                0,
             )
         }
     })?;
-    Ok((status, handle))
+    Ok(Made { status, handle })
 }
 
 /// Run `call` with the `OBJECT_ATTRIBUTES` that name `name` (UTF-16, no terminator) under `root`, or
@@ -673,7 +699,7 @@ fn status_error(status: NTSTATUS) -> windows::core::Error {
     windows::core::Error::from(HRESULT::from_win32(unsafe { RtlNtStatusToDosError(status) }))
 }
 
-/// What [`open_for_inspection`]'s `NtOpenFile` status means.
+/// What the status of an [`nt_create`] means.
 #[derive(Debug, PartialEq, Eq)]
 enum OpenOutcome {
     Opened,
