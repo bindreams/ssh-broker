@@ -229,3 +229,68 @@ fn a_directory_named_like_the_log_is_refused() {
     std::fs::create_dir(logs.path().join("shim.log.2026-01-03")).unwrap();
     assert!(open_log_file(&logs, "shim.log.2026-01-03").is_err());
 }
+
+// open_existing_file -----
+
+use windows::Win32::Storage::FileSystem::{FILE_READ_DATA, FILE_WRITE_DATA};
+
+const READ_WRITE: FILE_ACCESS_RIGHTS = FILE_ACCESS_RIGHTS(FILE_READ_DATA.0 | FILE_WRITE_DATA.0);
+
+#[test]
+fn an_existing_file_is_opened_and_a_missing_one_is_none_and_not_made() {
+    let profile = TempProfile::new("exf");
+    let (broker, _) = made(&profile);
+    let present = broker.path().join("agent.lock");
+    std::fs::write(&present, "kept").unwrap();
+
+    let file = open_existing_file(&broker, "agent.lock", READ_WRITE).unwrap();
+    assert!(file.is_some(), "an existing file is opened");
+    assert_eq!(std::fs::read_to_string(&present).unwrap(), "kept");
+
+    assert!(
+        open_existing_file(&broker, "missing.lock", READ_WRITE)
+            .unwrap()
+            .is_none()
+    );
+    assert!(!broker.path().join("missing.lock").exists(), "looking never creates");
+}
+
+#[test]
+fn a_symlink_named_like_an_existing_file_is_refused_and_its_target_is_untouched() {
+    let profile = TempProfile::new("exfsym");
+    let (broker, _) = made(&profile);
+    let victim = profile.0.join("victim.txt");
+    std::fs::write(&victim, "keep").unwrap();
+    let name = broker.path().join("agent.lock");
+    std::os::windows::fs::symlink_file(&victim, &name)
+        .unwrap_or_else(|e| panic!("file symlink: {e} (needs Developer Mode or the symlink privilege)"));
+
+    let err = format!(
+        "{:#}",
+        open_existing_file(&broker, "agent.lock", READ_WRITE).err().unwrap()
+    );
+
+    assert!(err.contains(&name.display().to_string()), "{err}");
+    assert!(err.contains("reparse point"), "{err}");
+    assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep");
+}
+
+#[test]
+fn a_directory_named_like_an_existing_file_is_refused() {
+    let profile = TempProfile::new("exfdir");
+    let (broker, _) = made(&profile);
+    std::fs::create_dir(broker.path().join("agent.lock")).unwrap();
+    assert!(open_existing_file(&broker, "agent.lock", READ_WRITE).is_err());
+}
+
+#[test]
+fn a_missing_name_is_missing_for_a_downcast_and_open_dir_does_not_create_it() {
+    let profile = TempProfile::new("missing");
+    let root = open_root(&profile.0).unwrap();
+    let err = open_dir(&root, "Nothing").err().unwrap();
+    assert!(err.downcast_ref::<Missing>().is_some(), "{err:#}");
+    let gone = profile.0.join("gone");
+    let err = open_root(&gone).err().unwrap();
+    assert!(err.downcast_ref::<Missing>().is_some(), "{err:#}");
+    assert!(!gone.exists());
+}

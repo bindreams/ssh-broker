@@ -60,7 +60,7 @@ use crate::winutil::OwnedHandle;
 mod admin_file;
 pub use admin_file::{admin_only_file_problem, ensure_admin_only_file};
 mod private_dir;
-pub use private_dir::{DirHandle, ensure_private_dir, open_dir, open_log_file, open_root};
+pub use private_dir::{DirHandle, Missing, ensure_private_dir, open_dir, open_existing_file, open_log_file, open_root};
 
 /// ACCESS_ALLOWED_ACE_TYPE (winnt.h) — stored raw in `ACE_HEADER.AceType` (a `u8`).
 const ACE_TYPE_ALLOWED: u8 = 0;

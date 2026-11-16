@@ -350,3 +350,63 @@ fn ensure_socket_dir_changes_nothing_outside_the_profile_when_local_is_a_junctio
 fn ensure_socket_dir_changes_nothing_outside_the_profile_when_appdata_is_a_junction() {
     refuses_a_junction_above_the_folder("AppData");
 }
+
+// open_existing_socket_dir -----
+
+/// What the elevated shim does to look at the folder: it must find a real folder, say "none yet"
+/// for one that is not there, refuse a link, and in no case make or change anything.
+#[test]
+fn an_existing_folder_is_opened_and_left_as_it_is() {
+    let profile = TempProfile::new("look");
+    ensure_socket_dir(&profile.location(), &me()).unwrap();
+    std::fs::write(profile.location().lock_path(), "").unwrap();
+    let before = tree_state(&profile.0);
+
+    let dir = open_existing_socket_dir(&profile.location()).unwrap().unwrap();
+
+    assert_eq!(dir.path(), profile.location().dir);
+    assert_eq!(tree_state(&profile.0), before);
+}
+
+#[test]
+fn a_folder_that_is_not_there_yet_is_none_at_every_level_and_nothing_is_made() {
+    // The stand-in profile has `AppData\Local` and no `ssh-broker`: the first case.
+    for missing in [r"AppData\Local\ssh-broker", r"AppData\Local", "AppData"] {
+        let profile = TempProfile::new("none");
+        if missing != r"AppData\Local\ssh-broker" {
+            std::fs::remove_dir_all(profile.0.join(missing)).unwrap();
+        }
+        assert!(
+            open_existing_socket_dir(&profile.location()).unwrap().is_none(),
+            "nothing at {missing}"
+        );
+        assert!(!profile.0.join(r"AppData\Local\ssh-broker").exists(), "{missing}: made");
+    }
+}
+
+#[test]
+fn a_profile_directory_that_is_not_there_is_none() {
+    let gone = TempProfile::new("none-gone");
+    let loc = gone.location();
+    drop(gone);
+    assert!(open_existing_socket_dir(&loc).unwrap().is_none());
+}
+
+#[test]
+fn a_link_at_any_level_is_refused_and_nothing_outside_is_made_or_changed() {
+    for link_at in ["AppData", r"AppData\Local", r"AppData\Local\ssh-broker"] {
+        let profile = TempProfile::new("looklink");
+        let outside = outside_folder("looklink-out");
+        std::fs::write(outside.location().lock_path(), "").unwrap();
+        let before = tree_state(&outside.0);
+        std::fs::create_dir_all(profile.0.join(r"AppData\Local\ssh-broker")).unwrap();
+        link_in_place_of(&profile, link_at, &outside.0.join(link_at));
+
+        let err = open_existing_socket_dir(&profile.location())
+            .err()
+            .unwrap_or_else(|| panic!("a junction at {link_at} was not refused"));
+
+        assert!(format!("{err:#}").contains("reparse point"), "{err:#}");
+        assert_eq!(tree_state(&outside.0), before, "a junction at {link_at}");
+    }
+}

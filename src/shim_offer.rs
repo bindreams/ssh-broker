@@ -485,13 +485,21 @@ const MAX_EVIDENCE_HANDLES: usize = 63;
 
 impl Evidence {
     /// Look again: who holds the lock, and which agent processes run. True if any agent exists.
-    fn look(&mut self, lock: &Path, image: &Path, user: &Sid) -> anyhow::Result<bool> {
+    /// The lock is looked at through the handle of the user's folder, opened afresh each time
+    /// because the agent may not have made the folder yet; a folder that is not there holds no lock.
+    fn look(&mut self, location: &SocketLocation, image: &Path, user: &Sid) -> anyhow::Result<bool> {
         self.agents = procwait::user_agents(image, user).context("look for the user's agent processes")?;
-        let held = starting_agent::is_held(lock).context("tell whether an agent holds the user's lock")?;
-        if !held {
-            self.holder = None;
-        } else if self.holder.is_none() {
-            self.holder = Some(starting_agent::HolderWatch::start(lock)?);
+        let folder = crate::userdir::open_existing_socket_dir(location)?;
+        let held = match &folder {
+            Some(folder) => starting_agent::is_held(folder).context("tell whether an agent holds the user's lock")?,
+            None => false,
+        };
+        match (&folder, held) {
+            (Some(folder), true) if self.holder.is_none() => {
+                self.holder = Some(starting_agent::HolderWatch::start(folder)?);
+            }
+            (_, true) => {}
+            (_, false) => self.holder = None,
         }
         Ok(held || !self.agents.is_empty())
     }
@@ -532,12 +540,11 @@ impl Evidence {
 /// writes after `listen()` is seen by that connect or by the watch. The wait is on the folder, the
 /// lock's holder and the agent processes; all are real conditions, so it has no time limit.
 fn await_starting_agent(location: &SocketLocation, image: &Path, user: &Sid) -> anyhow::Result<Starting<Socket>> {
-    let lock = location.lock_path();
     let watch = RefCell::new(SocketWatch::for_location(location)?);
     let evidence = RefCell::new(Evidence::default());
     wait_while_starting(
         || connect_if_listening(&location.path),
-        || evidence.borrow_mut().look(&lock, image, user),
+        || evidence.borrow_mut().look(location, image, user),
         || evidence.borrow_mut().wait(&watch.borrow()),
         || watch.borrow_mut().rearm(),
     )

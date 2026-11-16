@@ -22,7 +22,10 @@ use windows::Wdk::Storage::FileSystem::{
     FILE_DIRECTORY_FILE, FILE_NON_DIRECTORY_FILE, FILE_OPEN_IF, FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT,
     NTCREATEFILE_CREATE_DISPOSITION, NTCREATEFILE_CREATE_OPTIONS, NtCreateFile,
 };
-use windows::Win32::Foundation::{DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE, NTSTATUS, STATUS_NOT_A_DIRECTORY};
+use windows::Win32::Foundation::{
+    DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE, NTSTATUS, STATUS_NOT_A_DIRECTORY, STATUS_OBJECT_NAME_NOT_FOUND,
+    STATUS_OBJECT_PATH_NOT_FOUND,
+};
 use windows::Win32::Security::PSECURITY_DESCRIPTOR;
 use windows::Win32::Storage::FileSystem::{
     FILE_ACCESS_RIGHTS, FILE_APPEND_DATA, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT,
@@ -41,6 +44,14 @@ use crate::winutil::OwnedHandle;
 /// The rights a folder handle holds: to read its ACL and attributes, which is what verifying it takes.
 /// Creating inside it is checked against the folder's own ACL, not against the handle.
 const DIR_ACCESS: u32 = READ_CONTROL.0 | FILE_READ_ATTRIBUTES.0;
+
+/// The name opened does not exist. Downcastable from the error of [`open_root`], [`open_dir`] and
+/// [`open_existing_file`], for a caller that looks at what may not be there yet.
+#[derive(Debug, thiserror::Error)]
+#[error("{} does not exist", path.display())]
+pub struct Missing {
+    path: PathBuf,
+}
 
 /// A directory opened by handle, never reached through a link.
 pub struct DirHandle {
@@ -144,6 +155,31 @@ pub fn ensure_private_dir(parent: &DirHandle, name: &str, user: &Sid) -> anyhow:
     Ok(DirHandle { handle, path })
 }
 
+/// Open the file `name` under `dir` if it exists, with `access` (and the right to wait on the
+/// handle, which a blocking lock needs). Looking never creates: a missing name is `None`. A link is
+/// refused, so the file is this folder's own.
+pub fn open_existing_file(
+    dir: &DirHandle,
+    name: &str,
+    access: FILE_ACCESS_RIGHTS,
+) -> anyhow::Result<Option<std::fs::File>> {
+    let units = single_name(name)?;
+    let path = dir.path.join(name);
+    let (status, handle) = open_nt(
+        Some(dir.raw()),
+        &units,
+        access.0 | SYNCHRONIZE.0 | FILE_READ_ATTRIBUTES.0,
+        FILE_NON_DIRECTORY_FILE.0 | FILE_SYNCHRONOUS_IO_NONALERT.0 | FILE_OPEN_REPARSE_POINT.0,
+    )?;
+    let handle = match opened(status, handle, &path, "as a file of the private folder") {
+        Ok(handle) => handle,
+        Err(e) if e.is::<Missing>() => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    refuse_link(&handle, &path, "as a file of the private folder")?;
+    Ok(Some(into_file(handle)))
+}
+
 /// Open or create the file `name` under `dir` for appending. A link is refused, so the file written
 /// is this folder's own.
 pub fn open_log_file(dir: &DirHandle, name: &str) -> anyhow::Result<std::fs::File> {
@@ -159,10 +195,14 @@ pub fn open_log_file(dir: &DirHandle, name: &str) -> anyhow::Result<std::fs::Fil
     )?;
     let handle = opened(made.status, made.handle, &path, "as a log file")?;
     refuse_link(&handle, &path, "as a log file")?;
+    Ok(into_file(handle))
+}
+
+fn into_file(handle: OwnedHandle) -> std::fs::File {
     let handle = ManuallyDrop::new(handle);
     // SAFETY: the handle is open and owned here, ownership passes to the `File` and it is not
     // closed twice because `ManuallyDrop` keeps `OwnedHandle` from doing it.
-    Ok(unsafe { std::fs::File::from_raw_handle(handle.0.0) })
+    unsafe { std::fs::File::from_raw_handle(handle.0.0) }
 }
 
 /// `name` as UTF-16 if it is one directory-entry name: nothing that would walk to another folder.
@@ -215,13 +255,20 @@ fn create_nt(
 }
 
 /// The handle an open gave, or why there is none. A name that is a file where a directory is
-/// wanted is a refusal that says so; everything else is the system's error, naming `path`.
+/// wanted is a refusal that says so, a name that is not there is [`Missing`]; everything else is
+/// the system's error, naming `path`.
 fn opened(status: NTSTATUS, handle: HANDLE, path: &Path, purpose: &str) -> anyhow::Result<OwnedHandle> {
     if status.0 >= 0 {
         return Ok(OwnedHandle(handle));
     }
     if status == STATUS_NOT_A_DIRECTORY {
         anyhow::bail!("{} cannot be used {purpose}: it is not a directory", path.display());
+    }
+    if status == STATUS_OBJECT_NAME_NOT_FOUND || status == STATUS_OBJECT_PATH_NOT_FOUND {
+        return Err(Missing {
+            path: path.to_path_buf(),
+        }
+        .into());
     }
     Err(status_error(status)).with_context(|| format!("open {}", path.display()))
 }

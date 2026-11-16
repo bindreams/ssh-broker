@@ -103,18 +103,37 @@ pub struct SocketDir {
 /// removing it makes it be created again. A folder this accepts is not thereby trusted:
 /// `Listener::bind` verifies it again before it binds.
 pub fn open_socket_dir(loc: &SocketLocation, user: &Sid) -> anyhow::Result<SocketDir> {
-    let profile = loc
-        .profile_dir()
-        .with_context(|| format!(r"{} is not <profile>\AppData\Local\ssh-broker", loc.dir.display()))?;
     let make = || -> anyhow::Result<SocketDir> {
-        let root = acl::open_root(profile)?;
-        let app_data = acl::open_dir(&root, "AppData")?;
-        let local = acl::open_dir(&app_data, "Local")?;
+        let local = open_local(loc)?;
         let dir = acl::ensure_private_dir(&local, socket_loc::SOCKET_DIR_NAME, user)?;
         let logs = acl::ensure_private_dir(&dir, socket_loc::LOGS_DIR_NAME, user)?;
         Ok(SocketDir { dir, logs })
     };
     make().with_context(|| format!("make the private folder {}", loc.dir.display()))
+}
+
+/// The folder `Local` of the profile `loc` is in, by the walk of [`open_socket_dir`]: the profile
+/// directory, then `AppData` and `Local` as real directories, a link refused.
+fn open_local(loc: &SocketLocation) -> anyhow::Result<DirHandle> {
+    let profile = loc
+        .profile_dir()
+        .with_context(|| format!(r"{} is not <profile>\AppData\Local\ssh-broker", loc.dir.display()))?;
+    let root = acl::open_root(profile)?;
+    let app_data = acl::open_dir(&root, "AppData")?;
+    acl::open_dir(&app_data, "Local")
+}
+
+/// The user's private folder if it is there, opened by the same walk and never made, changed or
+/// verified: for a caller that only looks at what the agent keeps in it (the elevated shim). `None`
+/// when the folder or a folder above it is missing; a link on the way is an error, as in
+/// [`open_socket_dir`].
+pub fn open_existing_socket_dir(loc: &SocketLocation) -> anyhow::Result<Option<DirHandle>> {
+    let found = open_local(loc).and_then(|local| acl::open_dir(&local, socket_loc::SOCKET_DIR_NAME));
+    match found {
+        Ok(dir) => Ok(Some(dir)),
+        Err(e) if e.is::<acl::Missing>() => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("open the private folder {}", loc.dir.display())),
+    }
 }
 
 /// [`open_socket_dir`] for a caller that only needs the folders to be there.
