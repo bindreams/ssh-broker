@@ -74,9 +74,10 @@ pub fn start_failed(reason: &str) -> String {
     format!("ssh-broker: the background session did not start: {reason}\r\n")
 }
 
-/// The line for a login that finds the folder ssh-broker keeps the session's files in refused (a link,
-/// a foreign owner, a changed ACL). `cause` names the folder and what to do about it. No session is
-/// offered, and the login goes on in a plain shell.
+/// The line for a login that finds the folder ssh-broker keeps the session's files in refused (a link
+/// on the way to it, an owner that is not the user's, an ACL that is not the private one). `cause`
+/// names the folder, which check failed and what to do about it. No session is offered, and the login
+/// goes on in a plain shell.
 pub fn folder_refused(cause: &str) -> String {
     format!("ssh-broker: no session is offered, because its folder cannot be used: {cause}")
 }

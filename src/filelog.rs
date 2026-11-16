@@ -11,7 +11,7 @@
 use anyhow::Context;
 use tracing_appender::non_blocking::{NonBlocking, WorkerGuard};
 
-use crate::acl::{DirHandle, Sid};
+use crate::acl::{self, DirHandle, Sid};
 use crate::socket_loc::SocketLocation;
 
 mod daily;
@@ -45,20 +45,43 @@ pub fn init_in(dir: &DirHandle, prefix: &str) -> anyhow::Result<WorkerGuard> {
     install(open_in(dir, prefix)?)
 }
 
-fn open_for_location(loc: &SocketLocation, user: &Sid, prefix: &str) -> anyhow::Result<Sink> {
-    open_in(&crate::userdir::open_socket_dir(loc, user)?.logs?, prefix)
+/// Why a log could not be set up. Its text is the cause's, whole.
+#[derive(Debug, thiserror::Error)]
+#[error("{cause:#}")]
+pub struct NoLog {
+    pub cause: anyhow::Error,
+    /// The private folder itself (or the way to it) was refused, not only its `logs` folder: no agent
+    /// can serve it either, which a caller that offers a session needs to know.
+    pub folder_refused: bool,
+}
+
+impl NoLog {
+    fn other(cause: anyhow::Error) -> NoLog {
+        NoLog {
+            cause,
+            folder_refused: false,
+        }
+    }
+}
+
+fn open_for_location(loc: &SocketLocation, user: &Sid, prefix: &str) -> Result<Sink, NoLog> {
+    let folders = crate::userdir::open_socket_dir(loc, user).map_err(|cause| NoLog {
+        folder_refused: cause.is::<acl::Refused>(),
+        cause,
+    })?;
+    open_in(&folders.logs.map_err(NoLog::other)?, prefix).map_err(NoLog::other)
 }
 
 /// Log into the logs folder of `loc`, making the private folder first if it is missing. The error
 /// says why not: no profile, a link in the way, a foreign owner.
-pub fn init_for_location(loc: &SocketLocation, user: &Sid, prefix: &str) -> anyhow::Result<WorkerGuard> {
-    install(open_for_location(loc, user, prefix)?)
+pub fn init_for_location(loc: &SocketLocation, user: &Sid, prefix: &str) -> Result<WorkerGuard, NoLog> {
+    install(open_for_location(loc, user, prefix)?).map_err(NoLog::other)
 }
 
 /// [`init_for_location`] for the account this process runs as.
-pub fn init_for_current_user(prefix: &str) -> anyhow::Result<WorkerGuard> {
-    let loc = crate::userdir::current_socket_location()?;
-    init_for_location(&loc, &Sid::current_user()?, prefix)
+pub fn init_for_current_user(prefix: &str) -> Result<WorkerGuard, NoLog> {
+    let loc = crate::userdir::current_socket_location().map_err(NoLog::other)?;
+    init_for_location(&loc, &Sid::current_user().map_err(NoLog::other)?, prefix)
 }
 
 #[cfg(test)]

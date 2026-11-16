@@ -40,6 +40,9 @@ pub enum Plan {
     Notice { user: String },
     /// A terminal and no command: run the offer.
     Offer { account: LocalAccount, absence: Absence },
+    /// The user's folder was refused when the shim opened it (`cause` says which check failed and
+    /// what to do), so no agent can serve it: `cause` on stderr, no prompt, no agent started.
+    FolderRefused { cause: String },
 }
 
 /// Decide. `exec` is whether the session carries a command; `console` whether stdin and stdout are a
@@ -48,7 +51,27 @@ pub enum Plan {
 /// `Absence::Other` (an agent that exists but cannot be reached, a path that is too long, ...) keeps
 /// today's message alone, because the notice's first sentence would be false for it. A non-local
 /// account is not told to run a command it cannot use.
-pub fn plan(exec: bool, console: bool, absence: Absence, account: Option<LocalAccount>) -> Plan {
+///
+/// `folder_refusal` is why the shim's own open of the user's folder was refused, if it was. It decides
+/// before anything else: the account, the absence and the console do not change that an offer, a
+/// prompt or a started agent would only end in the same refusal. A login with a command gets no line
+/// from here: the fail-open prints its own, and the log's failure in it is this refusal.
+pub fn plan(
+    exec: bool,
+    console: bool,
+    absence: Absence,
+    account: Option<LocalAccount>,
+    folder_refusal: Option<&str>,
+) -> Plan {
+    if let Some(cause) = folder_refusal {
+        return if exec {
+            Plan::Nothing
+        } else {
+            Plan::FolderRefused {
+                cause: cause.to_owned(),
+            }
+        };
+    }
     let Some(account) = account else {
         return Plan::Nothing;
     };
@@ -277,7 +300,10 @@ impl Rescue for NoRescue {
 }
 
 /// The real thing: the notice on stderr, or the prompt at the console.
-pub(crate) struct Prompting;
+pub(crate) struct Prompting {
+    /// Why the shim's open of the user's folder was refused, if it was (see [`plan`]).
+    pub folder_refusal: Option<String>,
+}
 
 impl Rescue for Prompting {
     fn rescue(&mut self, absent: &Absent<'_>, stderr: &mut dyn Write) -> Rescued {
@@ -292,7 +318,8 @@ impl Rescue for Prompting {
         // An agent that has made its socket and not yet called `listen()`, or that has started and not
         // yet made its socket, refuses the connect like no agent at all. It is waited for, never
         // prompted over.
-        if let (Absence::NoAgent, Ok(location)) = (kind_of_absence, absent.location) {
+        // A folder that was refused is waited on by no one: no agent can serve it.
+        if let (Absence::NoAgent, Ok(location), None) = (kind_of_absence, absent.location, &self.folder_refusal) {
             match crate::acl::Sid::current_user()
                 .and_then(|user| await_starting_agent(location, &provision::canonical_exe(), &user))
             {
@@ -302,8 +329,18 @@ impl Rescue for Prompting {
             }
         }
         let console = !absent.exec && console_available();
-        match plan(absent.exec, console, kind_of_absence, account) {
+        match plan(
+            absent.exec,
+            console,
+            kind_of_absence,
+            account,
+            self.folder_refusal.as_deref(),
+        ) {
             Plan::Nothing => Rescued::Plain,
+            Plan::FolderRefused { cause } => {
+                let _ = writeln!(stderr, "{}", text::folder_refused(&cause));
+                Rescued::Plain
+            }
             Plan::Notice { user } => {
                 let exe = provision::canonical_exe();
                 let _ = writeln!(stderr, "{}", non_interactive_notice(&user, &exe.to_string_lossy()));
@@ -317,7 +354,8 @@ impl Rescue for Prompting {
 /// The rescue when looking for a starting agent failed: no session is offered, and the login goes on
 /// in a plain shell.
 ///
-/// A refused folder (a link on the way to it, a foreign owner) is the user's to fix, and the log that
+/// What this sees is a folder that was refused after the shim opened it (a link put there since;
+/// [`plan`] has the refusals the shim's own open found). It is the user's to fix, and the log that
 /// would say so was refused with it, so a login without a command is told on its stderr, as the
 /// notice is. A login with a command gets the line of the fail-open, which carries the log's failure.
 fn starting_failed(e: &anyhow::Error, exec: bool, stderr: &mut dyn Write) -> Rescued {
