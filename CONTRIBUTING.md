@@ -63,7 +63,8 @@ created with its security descriptor given at creation. One that exists is verif
 handle and never modified: if it is not a real directory with an owner in {user, SYSTEM,
 Administrators} and exactly the private ACL, it is refused and left untouched, and removing it makes
 it be created again. That is not a repair because a repair would re-ACL whatever a hard link inside
-the folder names, and a handle opened before it stays open after it. A link at `AppData`,
+the folder names, and a handle opened before it stays open after it. A file there that already existed
+and has more than one name (a hard link to a file elsewhere) is refused too, as a link is. A link at `AppData`,
 `AppData\Local`, `ssh-broker` or `logs` is refused for every caller, a deliberate one included. A link at
 the profile directory itself, or above it, is followed: its path is `ProfileImagePath`, and Windows
 loads the profile through that same path, links included, so the broker uses the profile where the
