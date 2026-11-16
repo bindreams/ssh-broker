@@ -86,11 +86,11 @@ fn a_file_in_the_way_is_not_a_folder_to_watch() {
 fn a_folder_made_after_the_watch_wakes_it_and_rearming_moves_the_watch_into_it() {
     let dir = TempDir::new("folder");
     let location = dir.location();
-    std::fs::create_dir_all(location.dir.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(location.dir().parent().unwrap()).unwrap();
     let mut watch = watch_of(&location);
     assert_eq!(watch.location(), Some(&location));
 
-    std::fs::create_dir(&location.dir).unwrap();
+    std::fs::create_dir(location.dir()).unwrap();
     signalled(watch.handle());
     watch.rearm().unwrap();
 
@@ -105,7 +105,7 @@ fn a_whole_chain_of_folders_made_at_once_is_found_by_one_rearm() {
     let location = dir.location();
     let mut watch = watch_of(&location);
 
-    std::fs::create_dir_all(&location.dir).unwrap();
+    std::fs::create_dir_all(location.dir()).unwrap();
     signalled(watch.handle());
     watch.rearm().unwrap();
 
@@ -133,7 +133,7 @@ fn a_chain_made_one_level_at_a_time_is_followed_down() {
 fn a_folder_that_already_exists_is_watched_from_the_start() {
     let dir = TempDir::new("exists");
     let location = dir.location();
-    std::fs::create_dir_all(&location.dir).unwrap();
+    std::fs::create_dir_all(location.dir()).unwrap();
     let watch = watch_of(&location);
     std::fs::write(location.serving_marker_path(), "1").unwrap();
     signalled(watch.handle());
@@ -221,12 +221,12 @@ fn a_missing_profile_is_waited_for_in_the_profile_list_and_then_in_the_folder() 
     exists.set(true);
     key.make("S-1-5-21-1-2-3-1001");
     signalled(watch.handle());
-    std::fs::create_dir_all(location.dir.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(location.dir().parent().unwrap()).unwrap();
     watch.rearm().unwrap();
     assert_eq!(watch.location(), Some(&location));
 
     // The handle is now the folder's.
-    std::fs::create_dir(&location.dir).unwrap();
+    std::fs::create_dir(location.dir()).unwrap();
     signalled(watch.handle());
 }
 
@@ -241,7 +241,7 @@ fn a_locate_failure_that_is_not_a_missing_profile_is_an_error() {
 fn the_profile_list_is_not_touched_while_the_profile_is_known() {
     let dir = TempDir::new("known");
     let location = dir.location();
-    std::fs::create_dir_all(&location.dir).unwrap();
+    std::fs::create_dir_all(location.dir()).unwrap();
     // A key that does not exist: opening it would fail, so a watch on it would be an error.
     let watch = SocketWatch::new(
         {

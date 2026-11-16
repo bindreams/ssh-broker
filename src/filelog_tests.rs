@@ -148,7 +148,7 @@ fn a_private_folder_that_is_not_the_users_is_the_reason_logging_is_off() {
     std::fs::create_dir(&elsewhere).unwrap();
     let status = std::process::Command::new("cmd")
         .args(["/c", "mklink", "/J"])
-        .arg(&loc.dir)
+        .arg(loc.dir())
         .arg(&elsewhere)
         .creation_flags(CREATE_NO_WINDOW)
         .status()

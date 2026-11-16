@@ -441,7 +441,7 @@ fn settle(started: Started) -> Result<Socket, String> {
     let failed = |e: anyhow::Error| text::start_failed(&format!("{e:#}"));
     let watch = SocketWatch::for_current_user().map_err(failed)?;
     let served =
-        wait_for_agent(watch, agent.process.0, |location| connect_if_listening(&location.path)).map_err(failed)?;
+        wait_for_agent(watch, agent.process.0, |location| connect_if_listening(location.path())).map_err(failed)?;
     let served = serve_after_own_agent(served, || {
         let location = crate::userdir::current_socket_location()?;
         let user = Sid::current_user()?;
@@ -554,7 +554,7 @@ fn await_starting_agent(location: &SocketLocation, image: &Path, user: &Sid) -> 
     let watch = RefCell::new(SocketWatch::for_location(location)?);
     let evidence = RefCell::new(Evidence::default());
     wait_while_starting(
-        || connect_if_listening(&location.path),
+        || connect_if_listening(location.path()),
         || evidence.borrow_mut().look(location, image, user),
         || evidence.borrow_mut().wait(&watch.borrow()),
         || watch.borrow_mut().rearm(),

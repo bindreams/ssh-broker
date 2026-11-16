@@ -259,7 +259,7 @@ fn run_on(location: &SocketLocation, background: bool) -> anyhow::Result<()> {
     let connections = Connections::new();
     // Closing the listener wakes the blocked `accept` with a connection of its own; the loop then sees
     // the flag. A wake that fails is reported to the connections, which stop waiting for the loop.
-    let socket = location.path.clone();
+    let socket = location.path().to_path_buf();
     let waking = Arc::clone(&connections);
     let control = Arc::new(Control::new(background, Arc::clone(&connections)).with_waker(move || {
         let socket = socket.clone();
@@ -416,7 +416,7 @@ fn run_on_with<L>(
     mark: impl FnOnce(&SocketLocation) -> std::io::Result<()>,
     accept_loop: impl FnOnce(L) -> anyhow::Error,
 ) -> anyhow::Result<()> {
-    let listener = bind(&location.path)?;
+    let listener = bind(location.path())?;
     mark(location).map_err(|e| anyhow::Error::new(e).context("write the serving marker"))?;
     Err(accept_loop(listener))
 }

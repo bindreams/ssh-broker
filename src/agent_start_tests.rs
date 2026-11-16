@@ -113,7 +113,7 @@ fn folder_refusal_exits_67() {
     let profile = TempProfile::new("start-refused");
     let loc = profile.location();
     // A file where the private folder belongs: nothing can be made safe there.
-    std::fs::write(&loc.dir, b"planted").unwrap();
+    std::fs::write(loc.dir(), b"planted").unwrap();
     let args = background(Some(ME));
     let err = start_with(
         Some(&args),
@@ -172,16 +172,16 @@ fn start_makes_the_private_folder_then_serves_that_session_from_it() {
         },
         |at, session| {
             assert!(
-                acl::verify_dir_acl(&at.dir, &Sid::current_user().unwrap()).unwrap(),
+                acl::verify_dir_acl(at.dir(), &Sid::current_user().unwrap()).unwrap(),
                 "the folder is hardened before anything is served from it"
             );
-            served.set(Some((at.path.clone(), session)));
+            served.set(Some((at.path().to_path_buf(), session)));
             Ok(())
         },
     )
     .unwrap();
 
-    assert_eq!(served.take(), Some((loc.path.clone(), 3)));
+    assert_eq!(served.take(), Some((loc.path().to_path_buf(), 3)));
 }
 
 #[test]
@@ -482,8 +482,8 @@ impl Drop for Watch {
 fn mark_listening_changes_the_folder() {
     let profile = TempProfile::new("marker");
     let loc = profile.location();
-    std::fs::create_dir_all(&loc.dir).unwrap();
-    let watch = Watch::arm(&loc.dir);
+    std::fs::create_dir_all(loc.dir()).unwrap();
+    let watch = Watch::arm(loc.dir());
     // The folder's own creation may have signalled the watch: consume that, so only the marker can.
     watch.rearm();
     assert!(!watch.signalled(), "nothing has changed since the watch was re-armed");
@@ -504,7 +504,7 @@ fn every_agent_marks_after_bind() {
     let err = run_on_with(
         &loc,
         |path| {
-            assert_eq!(path, loc.path);
+            assert_eq!(path, loc.path());
             events.borrow_mut().push("bind");
             Ok(())
         },
@@ -557,7 +557,7 @@ fn a_failed_marker_write_ends_the_agent_before_it_accepts() {
 fn location_with_dir(tag: &str) -> (TempProfile, SocketLocation) {
     let profile = TempProfile::new(tag);
     let loc = profile.location();
-    std::fs::create_dir_all(&loc.dir).unwrap();
+    std::fs::create_dir_all(loc.dir()).unwrap();
     (profile, loc)
 }
 

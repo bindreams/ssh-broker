@@ -38,7 +38,7 @@ fn socket_location_row_shows_the_path_it_resolved() {
     let profile = TempProfile::new("row-loc");
     let row = socket_location_row(&Ok(profile.location()));
     assert!(row.pass);
-    assert_eq!(row.detail, profile.location().path.display().to_string());
+    assert_eq!(row.detail, profile.location().path().display().to_string());
 }
 
 // socket dir ACL ----------------------------------------------------------------------------
@@ -64,7 +64,7 @@ fn socket_dir_row_fails_for_a_widened_dir() {
     let loc = profile.location();
     ensure_socket_dir(&loc, &me()).unwrap();
     let status = std::process::Command::new("icacls")
-        .arg(&loc.dir)
+        .arg(loc.dir())
         .args(["/grant", "*S-1-1-0:(OI)(CI)F"])
         .status()
         .unwrap();
@@ -73,7 +73,7 @@ fn socket_dir_row_fails_for_a_widened_dir() {
     let row = socket_dir_row(&Ok(loc.clone()), &me());
 
     assert!(!row.pass);
-    assert!(row.detail.contains(&loc.dir.display().to_string()), "{}", row.detail);
+    assert!(row.detail.contains(&loc.dir().display().to_string()), "{}", row.detail);
     assert!(row.detail.contains("remove"), "{}", row.detail);
 }
 
@@ -166,7 +166,7 @@ fn profile_with_local_linked_to_an_exact_folder(tag: &str) -> (TempProfile, Temp
     std::fs::remove_dir(&local).unwrap();
     crate::test_support::junction(&local, &outside.0.join(r"AppData\Local"));
     assert!(
-        acl::verify_dir_acl(&profile.location().dir, &me()).unwrap(),
+        acl::verify_dir_acl(profile.location().dir(), &me()).unwrap(),
         "control: judged by path, the folder behind the link is exact"
     );
     (profile, outside)
@@ -204,7 +204,7 @@ fn socket_file_row_passes_for_a_socket_bound_by_this_user() {
     let profile = TempProfile::new("row-file-ok");
     let loc = profile.location();
     ensure_socket_dir(&loc, &me()).unwrap();
-    let _listener = crate::afunix::Listener::bind(&loc.path).unwrap();
+    let _listener = crate::afunix::Listener::bind(loc.path()).unwrap();
 
     let row = socket_file_row(&Ok(loc), &me());
 
@@ -228,14 +228,14 @@ fn socket_file_row_fails_for_a_file_that_grants_someone_else() {
     let profile = TempProfile::new("row-file-wide");
     let loc = profile.location();
     ensure_socket_dir(&loc, &me()).unwrap();
-    std::fs::write(&loc.path, "").unwrap();
+    std::fs::write(loc.path(), "").unwrap();
     let status = std::process::Command::new("icacls")
-        .arg(&loc.path)
+        .arg(loc.path())
         .args(["/grant", "*S-1-1-0:(R)"])
         .status()
         .unwrap();
     assert!(status.success());
-    assert!(!acl::verify_file_acl(&loc.path, &me()).unwrap(), "control");
+    assert!(!acl::verify_file_acl(loc.path(), &me()).unwrap(), "control");
 
     let row = socket_file_row(&Ok(loc), &me());
 
@@ -251,7 +251,7 @@ fn socket_reachable_row_follows_the_connection() {
     ensure_socket_dir(&loc, &me()).unwrap();
     assert!(!socket_reachable_row(&Ok(loc.clone())).pass, "nothing listens yet");
 
-    let _listener = crate::afunix::Listener::bind(&loc.path).unwrap();
+    let _listener = crate::afunix::Listener::bind(loc.path()).unwrap();
     assert!(socket_reachable_row(&Ok(loc)).pass);
 }
 

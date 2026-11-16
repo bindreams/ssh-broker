@@ -61,7 +61,7 @@ fn the_expected_user_is_compared_exactly() {
 fn mark_listening_writes_the_marker_in_the_socket_folder() {
     let profile = TempProfile::new("mark");
     let loc = profile.location();
-    std::fs::create_dir_all(&loc.dir).unwrap();
+    std::fs::create_dir_all(loc.dir()).unwrap();
     mark_listening(&loc).unwrap();
     assert!(loc.serving_marker_path().is_file());
     // Every call is a write, so a watch on the folder wakes each time.

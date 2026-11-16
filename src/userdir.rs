@@ -127,18 +127,23 @@ fn walk(
 ) -> anyhow::Result<SocketDir> {
     let dir = open_local(loc)
         .and_then(|local| step(&local, socket_loc::SOCKET_DIR_NAME))
-        .with_context(|| format!("{verb} the private folder {}", loc.dir.display()))?;
+        .with_context(|| format!("{verb} the private folder {}", loc.dir().display()))?;
     let logs = step(&dir, socket_loc::LOGS_DIR_NAME)
         .with_context(|| format!("{verb} the log folder {}", loc.logs_dir().display()));
     Ok(SocketDir { dir, logs })
 }
 
 /// The folder `Local` of the profile `loc` is in, by the walk of [`open_socket_dir`]: the profile
-/// directory, then `AppData` and `Local` as real directories, a link refused.
+/// directory, then the folders of [`socket_loc::FOLDERS_IN_PROFILE`] as real directories, a link
+/// refused. [`SocketLocation::dir`] is made from the same names, so the walk ends where it says.
 fn open_local(loc: &SocketLocation) -> anyhow::Result<DirHandle> {
-    let root = acl::open_root(loc.profile_dir())?;
-    let app_data = acl::open_dir(&root, "AppData")?;
-    acl::open_dir(&app_data, "Local")
+    let local = socket_loc::FOLDERS_IN_PROFILE
+        .iter()
+        .try_fold(acl::open_root(loc.profile_dir())?, |parent, name| {
+            acl::open_dir(&parent, name)
+        })?;
+    debug_assert_eq!(local.path(), loc.dir().parent().unwrap());
+    Ok(local)
 }
 
 /// The user's private folder if it is there, opened by the same walk and never made, changed or
@@ -150,7 +155,7 @@ pub fn open_existing_socket_dir(loc: &SocketLocation) -> anyhow::Result<Option<D
     match found {
         Ok(dir) => Ok(Some(dir)),
         Err(e) if e.is::<acl::Missing>() => Ok(None),
-        Err(e) => Err(e).with_context(|| format!("open the private folder {}", loc.dir.display())),
+        Err(e) => Err(e).with_context(|| format!("open the private folder {}", loc.dir().display())),
     }
 }
 

@@ -383,10 +383,10 @@ fn a_socket_that_is_not_there_is_nobody_listening() {
     let profile = crate::test_support::TempProfile::new("connect-missing");
     let location = profile.location();
     // The folder is missing.
-    assert!(connect_if_listening(&location.path).unwrap().is_none());
+    assert!(connect_if_listening(location.path()).unwrap().is_none());
     // The folder is there and the socket file is not.
-    std::fs::create_dir_all(&location.dir).unwrap();
-    assert!(connect_if_listening(&location.path).unwrap().is_none());
+    std::fs::create_dir_all(location.dir()).unwrap();
+    assert!(connect_if_listening(location.path()).unwrap().is_none());
 }
 
 #[test]
@@ -394,11 +394,11 @@ fn a_socket_with_nobody_listening_on_it_is_nobody_listening() {
     use socket2::{Domain, SockAddr, Socket, Type};
     let profile = crate::test_support::TempProfile::new("connect-unlistened");
     let location = profile.location();
-    std::fs::create_dir_all(&location.dir).unwrap();
+    std::fs::create_dir_all(location.dir()).unwrap();
     // The file exists and `listen()` has not run, as in the agent's start.
     let socket = Socket::new(Domain::UNIX, Type::STREAM, None).unwrap();
-    socket.bind(&SockAddr::unix(&location.path).unwrap()).unwrap();
-    assert!(connect_if_listening(&location.path).unwrap().is_none());
+    socket.bind(&SockAddr::unix(location.path()).unwrap()).unwrap();
+    assert!(connect_if_listening(location.path()).unwrap().is_none());
 }
 
 #[test]

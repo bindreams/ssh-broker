@@ -57,14 +57,10 @@ impl TempProfile {
     }
 }
 
-/// A location whose folder is `dir`, which is not in a profile: for a test that only connects to a
-/// socket there and never walks to the folder. The profile is `dir` itself and is never opened.
-pub fn location_in(dir: &std::path::Path) -> SocketLocation {
-    SocketLocation {
-        profile: dir.to_path_buf(),
-        dir: dir.to_path_buf(),
-        path: dir.join(crate::socket_loc::SOCKET_FILE_NAME),
-    }
+/// The location in the profile `profile`, which need not exist: for a test that only connects to
+/// the socket and never walks to the folder.
+pub fn location_in(profile: &std::path::Path) -> SocketLocation {
+    crate::socket_loc::for_profile(profile).expect("the stand-in profile path is short enough")
 }
 
 impl Drop for TempProfile {

@@ -16,7 +16,7 @@ use super::report::Check;
 pub fn socket_location_row(location: &anyhow::Result<SocketLocation>) -> Check {
     const NAME: &str = "socket location";
     match location {
-        Ok(loc) => Check::new(NAME, true, loc.path.display().to_string()),
+        Ok(loc) => Check::new(NAME, true, loc.path().display().to_string()),
         Err(e) => Check::new(NAME, false, format!("{e:#}")),
     }
 }
@@ -30,7 +30,7 @@ pub fn socket_dir_row(location: &anyhow::Result<SocketLocation>, user: &Sid) -> 
     };
     dir_row(
         "socket dir ACL",
-        &loc.dir,
+        loc.dir(),
         "no agent has made it yet",
         user,
         loc,
@@ -78,17 +78,17 @@ pub fn socket_file_row(location: &anyhow::Result<SocketLocation>, user: &Sid) ->
     let Ok(loc) = location else {
         return Check::new(NAME, false, "no socket location");
     };
-    if loc.path.symlink_metadata().is_err() {
+    if loc.path().symlink_metadata().is_err() {
         return Check::new(NAME, false, "no socket: no agent is serving this account");
     }
-    match acl::verify_file_acl(&loc.path, user) {
+    match acl::verify_file_acl(loc.path(), user) {
         Ok(true) => Check::new(NAME, true, format!("grantee={}", user.describe())),
         Ok(false) => Check::new(
             NAME,
             false,
             format!(
                 "{} does not grant exactly {}, SYSTEM and Administrators",
-                loc.path.display(),
+                loc.path().display(),
                 user.describe()
             ),
         ),
@@ -104,7 +104,7 @@ const AGENT_HINT: &str = " (to see why, run `ssh-broker agent` in your desktop s
 pub fn socket_reachable_row(location: &anyhow::Result<SocketLocation>) -> Check {
     const NAME: &str = "socket reachable";
     match location {
-        Ok(loc) => match afunix::connect(&loc.path) {
+        Ok(loc) => match afunix::connect(loc.path()) {
             Ok(_) => Check::new(NAME, true, String::new()),
             Err(e) => Check::new(NAME, false, format!("{e:#}{AGENT_HINT}")),
         },

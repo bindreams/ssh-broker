@@ -28,14 +28,14 @@ fn current_profile_matches_userprofile_of_this_process() {
 fn current_socket_location_lies_inside_the_profile() {
     let profile = profile_dir_of_token(own_token().0).unwrap();
     let loc = current_socket_location().unwrap();
-    assert!(loc.path.starts_with(&profile));
-    assert!(loc.path.ends_with(r"AppData\Local\ssh-broker\agent.sock"));
+    assert!(loc.path().starts_with(&profile));
+    assert!(loc.path().ends_with(r"AppData\Local\ssh-broker\agent.sock"));
 }
 
 #[test]
 fn current_socket_location_fits_sockaddr_un() {
     let loc = current_socket_location().unwrap();
-    assert!(crate::afunix::unix_addr(&loc.path).is_ok());
+    assert!(crate::afunix::unix_addr(loc.path()).is_ok());
 }
 
 #[test]
@@ -76,7 +76,7 @@ fn for_profile_limit_agrees_with_unix_addr() {
     let profile_named = |name: &str| PathBuf::from(format!(r"C:\Users\{name}"));
     let fixed = crate::socket_loc::for_profile(&profile_named("x"))
         .unwrap()
-        .path
+        .path()
         .as_os_str()
         .len();
     for bytes in 105..=109 {
@@ -117,14 +117,14 @@ fn child_prints_its_socket_location() {
         "the decoy environment did not reach the child"
     );
     let loc = current_socket_location().unwrap();
-    println!("LOCATION={}", loc.path.display());
+    println!("LOCATION={}", loc.path().display());
 }
 
 #[test]
 fn current_socket_location_ignores_decoy_environment() {
     // The environment is the caller's to set; the token is not. A resolver that read
     // %USERPROFILE% or %LOCALAPPDATA% would follow the decoy into another account's folder.
-    let expected = current_socket_location().unwrap().path;
+    let expected = current_socket_location().unwrap().path().to_path_buf();
     let out = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
@@ -168,7 +168,7 @@ fn ensure_socket_dir_creates_a_dir_that_verifies() {
     let profile = TempProfile::new("create");
     let loc = profile.location();
     ensure_socket_dir(&loc, &me()).unwrap();
-    assert!(acl::verify_dir_acl(&loc.dir, &me()).unwrap());
+    assert!(acl::verify_dir_acl(loc.dir(), &me()).unwrap());
 }
 
 #[test]
@@ -178,7 +178,7 @@ fn ensure_socket_dir_is_idempotent() {
     ensure_socket_dir(&loc, &me()).unwrap();
     std::fs::write(loc.lock_path(), "").unwrap();
     ensure_socket_dir(&loc, &me()).unwrap();
-    assert!(acl::verify_dir_acl(&loc.dir, &me()).unwrap());
+    assert!(acl::verify_dir_acl(loc.dir(), &me()).unwrap());
     assert!(loc.lock_path().is_file(), "what was inside is left alone");
 }
 
@@ -188,17 +188,17 @@ fn ensure_socket_dir_refuses_a_dir_widened_with_an_everyone_ace_and_leaves_it() 
     let loc = profile.location();
     ensure_socket_dir(&loc, &me()).unwrap();
     let status = std::process::Command::new("icacls")
-        .arg(&loc.dir)
+        .arg(loc.dir())
         .args(["/grant", "*S-1-1-0:(OI)(CI)F"])
         .status()
         .unwrap();
     assert!(status.success());
-    assert!(!acl::verify_dir_acl(&loc.dir, &me()).unwrap(), "control: widened");
+    assert!(!acl::verify_dir_acl(loc.dir(), &me()).unwrap(), "control: widened");
     let before = crate::test_support::tree_state(&profile.0);
 
     let err = format!("{:#}", ensure_socket_dir(&loc, &me()).unwrap_err());
 
-    assert!(err.contains(&loc.dir.display().to_string()), "{err}");
+    assert!(err.contains(&loc.dir().display().to_string()), "{err}");
     assert!(err.contains("remove"), "{err}");
     assert_eq!(crate::test_support::tree_state(&profile.0), before, "left as it was");
 }
@@ -221,7 +221,7 @@ fn ensure_socket_dir_refuses_a_junction_at_the_dir() {
     let before = dacl_sddl(&target);
     let out = std::process::Command::new("cmd")
         .args(["/C", "mklink", "/J"])
-        .arg(&loc.dir)
+        .arg(loc.dir())
         .arg(&target)
         .output()
         .unwrap();
@@ -235,17 +235,17 @@ fn ensure_socket_dir_refuses_a_junction_at_the_dir() {
     assert!(err.contains("reparse point"), "{err}");
     assert_eq!(dacl_sddl(&target), before, "the junction target was not touched");
 
-    std::fs::remove_dir(&loc.dir).unwrap();
+    std::fs::remove_dir(loc.dir()).unwrap();
 }
 
 #[test]
 fn ensure_socket_dir_refuses_a_file_at_the_dir() {
     let profile = TempProfile::new("file");
     let loc = profile.location();
-    std::fs::write(&loc.dir, "x").unwrap();
+    std::fs::write(loc.dir(), "x").unwrap();
     let err = format!("{:#}", ensure_socket_dir(&loc, &me()).unwrap_err());
     assert!(err.contains("not a directory"), "{err}");
-    assert_eq!(std::fs::read_to_string(&loc.dir).unwrap(), "x");
+    assert_eq!(std::fs::read_to_string(loc.dir()).unwrap(), "x");
 }
 
 /// The three ACEs a private directory carries, by SDDL alias, as `(type, mask, trustee)`.
@@ -264,9 +264,9 @@ fn ensure_socket_dir_acl_is_exactly_user_system_administrators() {
     let profile = TempProfile::new("exact");
     let loc = profile.location();
     ensure_socket_dir(&loc, &me()).unwrap();
-    let sddl = dacl_sddl(&loc.dir);
+    let sddl = dacl_sddl(loc.dir());
     assert!(sddl.starts_with("D:P"), "protected: {sddl}");
-    let list = trustees(&loc.dir);
+    let list = trustees(loc.dir());
     assert_eq!(list.len(), 3, "{sddl}");
     assert!(
         list.iter().all(|(kind, mask, _)| kind == "A" && *mask == FILE_ALL),
@@ -285,7 +285,7 @@ fn ensure_socket_dir_creates_a_logs_dir_with_the_same_exact_acl() {
     ensure_socket_dir(&loc, &me()).unwrap();
     assert!(loc.logs_dir().is_dir());
     assert!(acl::verify_file_acl(&loc.logs_dir(), &me()).unwrap());
-    assert_eq!(trustees(&loc.logs_dir()), trustees(&loc.dir));
+    assert_eq!(trustees(&loc.logs_dir()), trustees(loc.dir()));
 }
 
 #[test]
@@ -295,7 +295,7 @@ fn ensure_socket_dir_gives_what_it_makes_inside_exactly_the_three_aces() {
     ensure_socket_dir(&loc, &me()).unwrap();
     std::fs::write(loc.lock_path(), "").unwrap();
     assert!(acl::verify_file_acl(&loc.lock_path(), &me()).unwrap());
-    assert_eq!(trustees(&loc.lock_path()), trustees(&loc.dir));
+    assert_eq!(trustees(&loc.lock_path()), trustees(loc.dir()));
 }
 
 /// An ACL change on `logs` alone (a user, a backup tool) costs the log and nothing else.
@@ -317,7 +317,7 @@ fn a_refused_logs_folder_leaves_the_socket_folder_serving() {
     let err = format!("{:#}", folder.logs.as_ref().err().expect("logs is refused"));
     assert!(err.contains(&loc.logs_dir().display().to_string()), "{err}");
     assert!(err.contains("remove"), "{err}");
-    assert_eq!(folder.dir.path(), loc.dir);
+    assert_eq!(folder.dir.path(), loc.dir());
     assert_eq!(tree_state(&profile.0), before, "left as it was");
 }
 
@@ -325,7 +325,7 @@ fn a_refused_logs_folder_leaves_the_socket_folder_serving() {
 fn a_refused_socket_folder_is_still_refused_as_a_whole() {
     let profile = TempProfile::new("dir-refused");
     let loc = profile.location();
-    std::fs::write(&loc.dir, "x").unwrap();
+    std::fs::write(loc.dir(), "x").unwrap();
     assert!(open_socket_dir(&loc, &me()).is_err());
 }
 
@@ -338,7 +338,7 @@ use crate::test_support::{junction, tree_state};
 /// `AppData\Local`.
 fn outside_folder(tag: &str) -> TempProfile {
     let outside = TempProfile::new(tag);
-    let folder = outside.location().dir;
+    let folder = outside.location().dir().to_path_buf();
     std::fs::create_dir(&folder).unwrap();
     std::fs::write(folder.join("note.txt"), "x").unwrap();
     outside
@@ -395,7 +395,7 @@ fn an_existing_folder_is_opened_and_left_as_it_is() {
 
     let dir = open_existing_socket_dir(&profile.location()).unwrap().unwrap();
 
-    assert_eq!(dir.path(), profile.location().dir);
+    assert_eq!(dir.path(), profile.location().dir());
     assert_eq!(tree_state(&profile.0), before);
 }
 

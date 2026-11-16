@@ -222,7 +222,7 @@ fn try_relay_with(
                     return Ok(Some(255));
                 }
                 if closed_before {
-                    let path = location.as_ref().ok().map(|location| location.path.as_path());
+                    let path = location.as_ref().ok().map(|location| location.path());
                     let message = closed_twice_message(path);
                     tracing::error!("{message}");
                     let _ = writeln!(stderr, "{message}");
@@ -262,7 +262,7 @@ fn connect_or_rescue(
     rescue: &mut dyn Rescue,
 ) -> anyhow::Result<Connected> {
     let connection = match location {
-        Ok(location) => afunix::connect(&location.path),
+        Ok(location) => afunix::connect(location.path()),
         // The cause is shown by the fail-open below; this only says there was nothing to connect to.
         Err(e) => Err(anyhow::anyhow!("{e:#}")),
     };
@@ -371,7 +371,7 @@ fn fail_open_reason(
             return Ok(None);
         }
     };
-    let path = &location.path;
+    let path = &location.path();
     if decide_fallback(connection.is_err()) == Fallback::LocalShellWithWarning {
         let msg = unavailable_message(None);
         tracing::warn!("{msg} (path={path:?}, err={:?})", connection.as_ref().err());
