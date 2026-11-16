@@ -785,8 +785,9 @@ fn a_dacl_set_through_a_handle_stays_in_the_tree_the_handle_was_opened_on() {
 #[test]
 fn named_security_calls_act_on_a_last_component_link_itself_but_follow_one_above_it() {
     // The path forms read and set the descriptor of a junction or symlink *itself* when it is the
-    // last component, and of the far side when it is anywhere above. So `harden_dir` on a swapped
-    // last component re-ACLs only the link; a link at `AppData` or `Local` is what redirects it.
+    // last component, and of the far side when it is anywhere above. So setting the private
+    // descriptor by path on a swapped last component re-ACLs only the link; a link at `AppData` or
+    // `Local` is what redirects it.
     let me = Sid::current_user().unwrap();
     for (what, symlinked, middle) in [
         ("last junction", false, false),
@@ -810,7 +811,7 @@ fn named_security_calls_act_on_a_last_component_link_itself_but_follow_one_above
         };
         let target = x.join("ssh-broker");
         let before = sddl_of(&target);
-        ssh_broker::acl::harden_dir(&path, &me).unwrap();
+        set_private_on_path(&path);
         if middle {
             assert_ne!(before, sddl_of(&target), "{what}: the far side was re-ACLed");
             assert!(ssh_broker::acl::verify_dir_acl(&target, &me).unwrap(), "{what}");

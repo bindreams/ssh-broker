@@ -2,6 +2,10 @@
 //! they run on a real Windows host via the cross-compile -> scp -> run loop and fail loudly if the
 //! ACL primitives are broken (no skip-on-missing).
 use super::*;
+use windows::Win32::Security::Authorization::SetNamedSecurityInfoW;
+use windows::Win32::Security::{
+    GetSecurityDescriptorDacl, GetSecurityDescriptorOwner, PROTECTED_DACL_SECURITY_INFORMATION,
+};
 
 #[test]
 fn current_user_sid_is_the_one_whoami_reports() {
@@ -884,70 +888,6 @@ fn the_file_policy_accepts_the_inherited_set_and_rejects_every_deviation() {
         .unwrap(),
         "the set is for one user only"
     );
-}
-
-// The leaf of a per-user directory is inspected without being followed ---------------------
-
-#[test]
-fn private_dir_problem_is_none_for_a_real_directory_this_user_owns() {
-    let dir = TempPath::new("problem-none");
-    std::fs::create_dir(&dir.0).unwrap();
-    let me = Sid::current_user().unwrap();
-    assert_eq!(private_dir_problem(&dir.0, &me).unwrap(), None);
-}
-
-#[test]
-fn private_dir_problem_refuses_a_junction_and_names_it() {
-    let target = TempPath::new("problem-junction-target");
-    std::fs::create_dir(&target.0).unwrap();
-    let link = TempPath::new("problem-junction");
-    let out = Command::new("cmd")
-        .args(["/C", "mklink", "/J"])
-        .arg(&link.0)
-        .arg(&target.0)
-        .output()
-        .expect("run mklink");
-    assert!(
-        out.status.success(),
-        "mklink /J failed: {}",
-        String::from_utf8_lossy(&out.stdout)
-    );
-
-    let me = Sid::current_user().unwrap();
-    let problem = private_dir_problem(&link.0, &me)
-        .unwrap()
-        .expect("a junction is refused");
-    assert!(problem.contains("reparse point"), "{problem}");
-
-    std::fs::remove_dir(&link.0).unwrap();
-}
-
-#[test]
-fn private_dir_problem_refuses_a_regular_file() {
-    let path = TempPath::new("problem-file");
-    std::fs::write(&path.0, "x").unwrap();
-    let me = Sid::current_user().unwrap();
-    let problem = private_dir_problem(&path.0, &me).unwrap().expect("a file is refused");
-    assert!(problem.contains("not a directory"), "{problem}");
-    std::fs::remove_file(&path.0).unwrap();
-}
-
-/// Elevated (CI only): setting an owner other than the caller's needs SeRestorePrivilege.
-#[test]
-fn private_dir_problem_refuses_an_owner_outside_user_system_administrators() {
-    let dir = TempPath::new("problem-owner");
-    std::fs::create_dir(&dir.0).unwrap();
-    enable_restore_privilege();
-    let me = Sid::current_user().unwrap();
-
-    set_install_policy(&dir.0, &Sid::well_known(WellKnown::Users).unwrap());
-    let problem = private_dir_problem(&dir.0, &me)
-        .unwrap()
-        .expect("a Users owner is refused");
-    assert!(problem.contains("owner"), "{problem}");
-
-    set_install_policy(&dir.0, &Sid::well_known(WellKnown::Administrators).unwrap());
-    assert_eq!(private_dir_problem(&dir.0, &me).unwrap(), None, "control");
 }
 
 /// Elevated (CI only): a folder whose ACL is exactly the private one but whose owner is outside

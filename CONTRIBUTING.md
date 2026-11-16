@@ -52,8 +52,19 @@ non-FullControl grants, extra grantees, and an owner outside the allowed set. `L
 verifies the folder, binds, verifies the socket file, and only then listens; it removes a socket it
 cannot prove. If it cannot prove the folder is safe, the agent refuses to bind.
 
-`userdir::ensure_socket_dir` repairs the folder's ACL only for a real directory (not a junction or
-symlink) owned by the user, SYSTEM or Administrators, and refuses anything else untouched. A profile
+`userdir::open_socket_dir` (and `ensure_socket_dir` over it) reaches the folder by handle: it opens
+the profile directory (the administrator's, opened following links), then `AppData`, `Local`,
+`ssh-broker` and `logs`, each by name relative to the handle above it, with `FILE_OPEN_REPARSE_POINT`,
+and refuses any whose handle is a reparse point. A process of the same account at lower integrity can
+replace one of those names with a junction or symlink, and a path walk would follow it out of the
+profile. Nothing below the profile directory is named by path (`acl::private_dir`), and the log is
+opened under the `logs` handle for the same reason (`filelog::daily`). A missing private folder is
+created with its security descriptor given at creation. One that exists is verified through the
+handle and never modified: if it is not a real directory with an owner in {user, SYSTEM,
+Administrators} and exactly the private ACL, it is refused and left untouched, and removing it makes
+it be created again. That is not a repair because a repair would re-ACL whatever a hard link inside
+the folder names, and a handle opened before it stays open after it. A link at `AppData`,
+`AppData\Local`, `ssh-broker` or `logs` is refused for every caller, a deliberate one included. A profile
 path that would push the socket past the 107-byte AF_UNIX limit is an error, not a reason to use
 another location (`socket_loc::SocketLocationError::TooLong`).
 

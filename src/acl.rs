@@ -36,16 +36,15 @@ use windows::Win32::Foundation::{
 };
 use windows::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, GetNamedSecurityInfoW,
-    GetSecurityInfo, SDDL_REVISION_1, SE_FILE_OBJECT, SetNamedSecurityInfoW,
+    GetSecurityInfo, SDDL_REVISION_1, SE_FILE_OBJECT,
 };
 use windows::Win32::Security::{
     ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, ACL_SIZE_INFORMATION, AclSizeInformation, CONTAINER_INHERIT_ACE, CopySid,
     CreateWellKnownSid, DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetAclInformation, GetLengthSid,
-    GetSecurityDescriptorControl, GetSecurityDescriptorDacl, GetSecurityDescriptorOwner, GetTokenInformation,
-    INHERITED_ACE, IsValidSid, LookupAccountNameW, LookupAccountSidW, OBJECT_INHERIT_ACE, OWNER_SECURITY_INFORMATION,
-    PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SE_DACL_PRESENT, SE_DACL_PROTECTED,
-    SECURITY_ATTRIBUTES, SID_NAME_USE, TOKEN_QUERY, TOKEN_USER, TokenUser, WinBuiltinAdministratorsSid,
-    WinBuiltinUsersSid, WinLocalSystemSid,
+    GetSecurityDescriptorControl, GetTokenInformation, INHERITED_ACE, IsValidSid, LookupAccountNameW,
+    LookupAccountSidW, OBJECT_INHERIT_ACE, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SE_DACL_PRESENT,
+    SE_DACL_PROTECTED, SECURITY_ATTRIBUTES, SID_NAME_USE, TOKEN_QUERY, TOKEN_USER, TokenUser,
+    WinBuiltinAdministratorsSid, WinBuiltinUsersSid, WinLocalSystemSid,
 };
 use windows::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, CreateDirectoryW, FILE_ALL_ACCESS, FILE_ATTRIBUTE_DIRECTORY,
@@ -287,7 +286,7 @@ fn wide(path: &Path) -> Vec<u16> {
 
 /// The DACL of a user's private directory in SDDL: protected (no inheritance from the parent),
 /// `{user, SYSTEM, Administrators}` Full Control, inherited by the files and folders made below
-/// (`OICI`). No owner: [`harden_dir`] adds the user, a creation leaves it to the creating token.
+/// (`OICI`). No owner: a creation leaves it to the creating token.
 fn private_dir_dacl_sddl(user: &Sid) -> anyhow::Result<String> {
     let user = user.to_sddl()?;
     Ok(format!("D:P(A;OICI;FA;;;{user})(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)"))
@@ -296,7 +295,16 @@ fn private_dir_dacl_sddl(user: &Sid) -> anyhow::Result<String> {
 /// Apply the explicit, PROTECTED owner-only DACL (`{target_user, SYSTEM, Administrators}`
 /// Full Control, target_user as owner) to `dir`, removing any inherited or broader access. The
 /// ACEs are inheritable (`OI|CI`) so everything created inside is born with the same set.
+///
+/// A fixture for tests that need a folder of this shape. The product never changes the owner or ACL
+/// of a folder that exists: [`ensure_private_dir`] creates it with the descriptor and refuses one
+/// that is not exactly right.
+#[cfg(test)]
 pub fn harden_dir(dir: &Path, target_user: &Sid) -> anyhow::Result<()> {
+    use windows::Win32::Security::Authorization::SetNamedSecurityInfoW;
+    use windows::Win32::Security::{
+        GetSecurityDescriptorDacl, GetSecurityDescriptorOwner, PROTECTED_DACL_SECURITY_INFORMATION,
+    };
     let sddl = format!("O:{}{}", target_user.to_sddl()?, private_dir_dacl_sddl(target_user)?);
     let sddl_w: Vec<u16> = sddl.encode_utf16().chain(std::iter::once(0)).collect();
     let path_w = wide(dir);
@@ -544,42 +552,6 @@ fn file_policy_holds(security: &Security, user: &Sid) -> anyhow::Result<bool> {
     let admins = Sid::well_known(WellKnown::Administrators)?;
     Ok(security.owner_in(&[user, &system, &admins])?
         && security.dacl_matches_as(&private_grants(user, &system, &admins, None), Inheritance::Inherited)?)
-}
-
-/// Why `dir` must not be adopted as `user`'s private directory, or `None` if it may be (and
-/// [`harden_dir`] may repair it). It is read without following a link: a junction or symlink is
-/// refused, as is anything that is not a directory, and so is an owner other than `user`,
-/// SYSTEM or Administrators. Hardening re-owns and re-ACLs the object it is given, so it must not
-/// be given a link to somewhere else or a directory somebody else owns.
-pub fn private_dir_problem(dir: &Path, user: &Sid) -> anyhow::Result<Option<String>> {
-    let Some(handle) = open_for_inspection(dir)? else {
-        return Ok(Some(
-            "this process is denied access to read its ACL, so it cannot be shown to be its own".to_owned(),
-        ));
-    };
-    let security = Security::from_handle(handle.0).with_context(|| format!("read the ACL of {}", dir.display()))?;
-    let owner = describe_sid(security.owner);
-
-    let mut info = BY_HANDLE_FILE_INFORMATION::default();
-    unsafe { GetFileInformationByHandle(handle.0, &mut info) }
-        .with_context(|| format!("read the attributes of {}", dir.display()))?;
-    if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
-        return Ok(Some(format!(
-            "it is a reparse point (junction or symlink); owner {owner}"
-        )));
-    }
-    if info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY.0 == 0 {
-        return Ok(Some(format!("it is not a directory; owner {owner}")));
-    }
-    let system = Sid::well_known(WellKnown::System)?;
-    let admins = Sid::well_known(WellKnown::Administrators)?;
-    if !security.owner_in(&[user, &system, &admins])? {
-        return Ok(Some(format!(
-            "its owner is {owner}, not {}, SYSTEM or Administrators",
-            user.describe()
-        )));
-    }
-    Ok(None)
 }
 
 // install directory ====================================================================

@@ -101,7 +101,7 @@ A login the agent cannot serve for another reason also gets a line saying why, a
 
 ## Requirements
 
-None beyond Windows with OpenSSH. The default shell is the system `cmd.exe`, which every Windows has. To use PowerShell Core (`pwsh`), install it and name it in the [shell configuration](#shell-configuration); stock Windows ships `powershell.exe` 5.1, which is a different binary.
+None beyond Windows with OpenSSH. In your profile, `AppData`, `AppData\Local` and `ssh-broker` (with its `logs` folder) must be real folders, not junctions or symlinks: a link there is refused, with the folder named. So is an `ssh-broker` or `logs` folder whose owner or permissions are not exactly its own: remove it, and it is made again. The default shell is the system `cmd.exe`, which every Windows has. To use PowerShell Core (`pwsh`), install it and name it in the [shell configuration](#shell-configuration); stock Windows ships `powershell.exe` 5.1, which is a different binary.
 
 ## Shell configuration
 
