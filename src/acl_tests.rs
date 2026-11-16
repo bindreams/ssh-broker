@@ -949,3 +949,39 @@ fn private_dir_problem_refuses_an_owner_outside_user_system_administrators() {
     set_install_policy(&dir.0, &Sid::well_known(WellKnown::Administrators).unwrap());
     assert_eq!(private_dir_problem(&dir.0, &me).unwrap(), None, "control");
 }
+
+/// Elevated (CI only): a folder whose ACL is exactly the private one but whose owner is outside
+/// {user, SYSTEM, Administrators} is refused and left as it is.
+#[test]
+fn ensure_private_dir_refuses_a_foreign_owner_and_leaves_the_folder() {
+    let parent = TempPath::new("ensure-owner");
+    std::fs::create_dir(&parent.0).unwrap();
+    let dir = parent.0.join("d");
+    std::fs::create_dir(&dir).unwrap();
+    enable_restore_privilege();
+    let me = Sid::current_user().unwrap();
+    let private_with_owner =
+        |owner: &Sid| format!("O:{}{}", owner.to_sddl().unwrap(), private_dir_dacl_sddl(&me).unwrap());
+    let handle = open_root(&parent.0).unwrap();
+
+    set_security(&dir, &private_with_owner(&Sid::well_known(WellKnown::Users).unwrap()));
+    let owner_of = |path: &Path| {
+        let security = Security::from_path(path).unwrap();
+        describe_sid(security.owner)
+    };
+    let before = owner_of(&dir);
+    let err = format!(
+        "{:#}",
+        ensure_private_dir(&handle, "d", &me)
+            .err()
+            .expect("a Users owner is refused")
+    );
+    assert!(err.contains("owner"), "{err}");
+    assert_eq!(owner_of(&dir), before, "left as it was");
+
+    set_security(
+        &dir,
+        &private_with_owner(&Sid::well_known(WellKnown::Administrators).unwrap()),
+    );
+    ensure_private_dir(&handle, "d", &me).expect("control: an Administrators owner is accepted");
+}

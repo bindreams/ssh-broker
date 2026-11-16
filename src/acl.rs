@@ -60,6 +60,8 @@ use crate::winutil::OwnedHandle;
 
 mod admin_file;
 pub use admin_file::{admin_only_file_problem, ensure_admin_only_file};
+mod private_dir;
+pub use private_dir::{DirHandle, ensure_private_dir, open_dir, open_log_file, open_root};
 
 /// ACCESS_ALLOWED_ACE_TYPE (winnt.h) — stored raw in `ACE_HEADER.AceType` (a `u8`).
 const ACE_TYPE_ALLOWED: u8 = 0;
@@ -283,14 +285,19 @@ fn wide(path: &Path) -> Vec<u16> {
     path.as_os_str().encode_wide().chain(std::iter::once(0)).collect()
 }
 
+/// The DACL of a user's private directory in SDDL: protected (no inheritance from the parent),
+/// `{user, SYSTEM, Administrators}` Full Control, inherited by the files and folders made below
+/// (`OICI`). No owner: [`harden_dir`] adds the user, a creation leaves it to the creating token.
+fn private_dir_dacl_sddl(user: &Sid) -> anyhow::Result<String> {
+    let user = user.to_sddl()?;
+    Ok(format!("D:P(A;OICI;FA;;;{user})(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)"))
+}
+
 /// Apply the explicit, PROTECTED owner-only DACL (`{target_user, SYSTEM, Administrators}`
 /// Full Control, target_user as owner) to `dir`, removing any inherited or broader access. The
 /// ACEs are inheritable (`OI|CI`) so everything created inside is born with the same set.
 pub fn harden_dir(dir: &Path, target_user: &Sid) -> anyhow::Result<()> {
-    let target = target_user.to_sddl()?;
-    // P = protected (no inheritance from the parent); OICI = inherited by files and folders
-    // below; FA = Full; SY = SYSTEM, BA = BUILTIN\Administrators.
-    let sddl = format!("O:{target}D:P(A;OICI;FA;;;{target})(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)");
+    let sddl = format!("O:{}{}", target_user.to_sddl()?, private_dir_dacl_sddl(target_user)?);
     let sddl_w: Vec<u16> = sddl.encode_utf16().chain(std::iter::once(0)).collect();
     let path_w = wide(dir);
     unsafe {
@@ -512,16 +519,15 @@ fn private_grants<'a>(user: &'a Sid, system: &'a Sid, admins: &'a Sid, flags: Op
 /// `false` — fail-closed. The ACEs must be inheritable: a directory whose ACEs do not reach the
 /// socket file leaves the file with the creator's default DACL.
 pub fn verify_dir_acl(dir: &Path, target_user: &Sid) -> anyhow::Result<bool> {
+    dir_policy_holds(&Security::from_path(dir)?, target_user)
+}
+
+/// [`verify_dir_acl`] on an already-read security descriptor.
+fn dir_policy_holds(security: &Security, user: &Sid) -> anyhow::Result<bool> {
     let system = Sid::well_known(WellKnown::System)?;
     let admins = Sid::well_known(WellKnown::Administrators)?;
-    let security = Security::from_path(dir)?;
-    Ok(security.owner_in(&[target_user, &system, &admins])?
-        && security.dacl_matches(&private_grants(
-            target_user,
-            &system,
-            &admins,
-            Some(PRIVATE_DIR_ACE_FLAGS),
-        ))?)
+    Ok(security.owner_in(&[user, &system, &admins])?
+        && security.dacl_matches(&private_grants(user, &system, &admins, Some(PRIVATE_DIR_ACE_FLAGS)))?)
 }
 
 /// `true` iff `file` (the socket, the lock, a folder made inside a hardened directory) grants
@@ -594,41 +600,93 @@ const INSTALL_ACE_FLAGS: u8 = (OBJECT_INHERIT_ACE.0 | CONTAINER_INHERIT_ACE.0) a
 /// Not `CreateFileW`: it always adds `SYNCHRONIZE` to the request, so a deny ACE covering
 /// `SYNCHRONIZE` (`icacls /deny (W)` does) would fail the open before the ACL is read.
 fn open_for_inspection(dir: &Path) -> anyhow::Result<Option<OwnedHandle>> {
-    let mut name = nt_path(dir)?;
-    let bytes = u16::try_from(name.len() * 2).context("the path is too long")?;
-    let name = UNICODE_STRING {
-        Length: bytes,
-        MaximumLength: bytes,
-        Buffer: PWSTR(name.as_mut_ptr()),
-    };
-    let attributes = OBJECT_ATTRIBUTES {
-        Length: std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
-        ObjectName: &name,
-        Attributes: OBJ_CASE_INSENSITIVE,
-        ..Default::default()
-    };
-    let mut handle = HANDLE::default();
-    let mut io = IO_STATUS_BLOCK::default();
-    // SAFETY: every pointer is to a local that outlives the call.
-    let status = unsafe {
-        NtOpenFile(
-            &mut handle,
-            READ_CONTROL.0 | FILE_READ_ATTRIBUTES.0,
-            &attributes,
-            &mut io,
-            (FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE).0,
-            FILE_OPEN_FOR_BACKUP_INTENT.0 | FILE_OPEN_REPARSE_POINT.0,
-        )
-    };
+    let name = nt_path(dir)?;
+    let (status, handle) = open_nt(
+        None,
+        &name,
+        READ_CONTROL.0 | FILE_READ_ATTRIBUTES.0,
+        FILE_OPEN_FOR_BACKUP_INTENT.0 | FILE_OPEN_REPARSE_POINT.0,
+    )?;
     match classify_open(status) {
         OpenOutcome::Opened => Ok(Some(OwnedHandle(handle))),
         OpenOutcome::Denied => Ok(None),
-        OpenOutcome::Failed(status) => {
-            let win32 = unsafe { RtlNtStatusToDosError(status) };
-            Err(windows::core::Error::from(HRESULT::from_win32(win32)))
-                .with_context(|| format!("open {}", dir.display()))
-        }
+        OpenOutcome::Failed(status) => Err(status_error(status)).with_context(|| format!("open {}", dir.display())),
     }
+}
+
+/// `NtOpenFile` of `name` (UTF-16, no terminator): an NT path when `root` is `None`, else one name
+/// below the directory `root`. Sharing is read, write and delete. Returns the status and the handle
+/// (valid only if the status is not an error); the caller owns it. `Err` is a name too long to pass.
+fn open_nt(root: Option<HANDLE>, name: &[u16], access: u32, options: u32) -> anyhow::Result<(NTSTATUS, HANDLE)> {
+    let mut handle = HANDLE::default();
+    let mut io = IO_STATUS_BLOCK::default();
+    let status = with_attributes(root, name, None, |attributes| {
+        // SAFETY: every pointer is to a local that outlives the call.
+        unsafe {
+            NtOpenFile(
+                &mut handle,
+                access,
+                attributes,
+                &mut io,
+                (FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE).0,
+                options,
+            )
+        }
+    })?;
+    Ok((status, handle))
+}
+
+/// Run `call` with the `OBJECT_ATTRIBUTES` that name `name` (UTF-16, no terminator) under `root`, or
+/// as an NT path without it, and carry `descriptor` into a creation. Names compare without case.
+fn with_attributes<R>(
+    root: Option<HANDLE>,
+    name: &[u16],
+    descriptor: Option<PSECURITY_DESCRIPTOR>,
+    call: impl FnOnce(&OBJECT_ATTRIBUTES) -> R,
+) -> anyhow::Result<R> {
+    let mut units = name.to_vec();
+    let bytes = u16::try_from(units.len() * 2).context("the name is too long")?;
+    let name = UNICODE_STRING {
+        Length: bytes,
+        MaximumLength: bytes,
+        Buffer: PWSTR(units.as_mut_ptr()),
+    };
+    let attributes = OBJECT_ATTRIBUTES {
+        Length: std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
+        RootDirectory: root.unwrap_or_default(),
+        ObjectName: &name,
+        Attributes: OBJ_CASE_INSENSITIVE,
+        SecurityDescriptor: descriptor.map_or(std::ptr::null(), |sd| sd.0 as *const _),
+        ..Default::default()
+    };
+    Ok(call(&attributes))
+}
+
+/// A security descriptor parsed from SDDL, freed on drop.
+fn descriptor_from_sddl(sddl: &str) -> anyhow::Result<LocalSd> {
+    let sddl_w: Vec<u16> = sddl.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut psd = PSECURITY_DESCRIPTOR::default();
+    // SAFETY: a NUL-terminated string and a valid out-pointer; `LocalSd` frees what it returns.
+    unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(PCWSTR(sddl_w.as_ptr()), SDDL_REVISION_1, &mut psd, None)
+    }
+    .context("parse a security descriptor")?;
+    Ok(LocalSd(psd))
+}
+
+/// The file attributes of the object `handle` names (`FILE_ATTRIBUTE_*`), which needs
+/// `FILE_READ_ATTRIBUTES`.
+fn file_attributes(handle: HANDLE) -> anyhow::Result<u32> {
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: a valid handle and an out-pointer to a local.
+    unsafe { GetFileInformationByHandle(handle, &mut info) }.context("read the attributes")?;
+    Ok(info.dwFileAttributes)
+}
+
+/// The Windows error an NT status stands for.
+fn status_error(status: NTSTATUS) -> windows::core::Error {
+    // SAFETY: a pure conversion of a status code.
+    windows::core::Error::from(HRESULT::from_win32(unsafe { RtlNtStatusToDosError(status) }))
 }
 
 /// What [`open_for_inspection`]'s `NtOpenFile` status means.
