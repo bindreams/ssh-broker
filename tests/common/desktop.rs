@@ -205,7 +205,7 @@ impl PrivateDesktop {
     /// relative id of the label SID, such as `0x1000` for Low), no-write-up. A pair without a label is
     /// Medium: a child below Medium, such as a Low-integrity one, is refused write access to its own
     /// window station and desktop, and cannot initialise user32 on them. The caller may label the pair
-    /// no higher than its own level, which a child it starts at that level or above can use.
+    /// no higher than its own level.
     pub fn create_labelled(sids: &[&str], label: Option<u32>) -> windows::core::Result<PrivateDesktop> {
         let users: Vec<&str> = sids.iter().copied().chain([SYSTEM]).collect();
         let sacl = label.map_or(String::new(), |rid| format!("S:(ML;;NW;;;S-1-16-{rid})"));

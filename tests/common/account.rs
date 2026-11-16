@@ -520,9 +520,7 @@ impl Account {
 /// Start `exe` suspended with the primary `token`, on the window station and desktop `private`, which
 /// the child keeps alive; without one the child takes this process's own (naming a window station
 /// needs an administrator, see [`crate::desktop::PrivateDesktop`]). `who` names the token's owner in
-/// messages. The step every start here ends in: the child is created suspended, its hard-error boxes
-/// are switched off before its first instruction, and `evidence` is printed if it outlives
-/// [`crate::bounded_wait::CHILD_EXIT_BOUND`].
+/// messages; `evidence` is printed if the child outlives [`crate::bounded_wait::CHILD_EXIT_BOUND`].
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_with_token(
     starter_kind: Starter,
@@ -560,8 +558,7 @@ pub fn spawn_with_token(
     let exe_w = wide(&exe.to_string_lossy());
     let cwd_w = wide(&cwd.to_string_lossy());
     let environment = environment.map(|block| block.as_ptr().cast::<core::ffi::c_void>());
-    // Without a desktop of its own the child takes this process's station: hold off a switch
-    // until the child exists, as `desktop::spawn` does.
+    // Hold off a station switch until the child exists, as `desktop::spawn` does.
     let _unchanged = private.is_none().then(crate::desktop::station_unchanged);
     // SAFETY: every pointer is to a local that outlives the call.
     match starter_kind {

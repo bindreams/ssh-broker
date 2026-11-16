@@ -55,8 +55,9 @@ cannot prove. If it cannot prove the folder is safe, the agent refuses to bind.
 `connect()` asks for write access to the socket file. That is why a process of the same user at
 Low integrity (a sandboxed renderer) is refused although the DACL admits it: a file without an
 integrity label is Medium, and the default no-write-up policy refuses a Low writer. The file has
-no label unless the user labels it or its folder, which only a process of the user at Medium or
-above can do, and such a process can connect anyway; the product does not check for one.
+no label unless one is set on it or inherited from any ancestor folder (the product leaves the
+SACL unprotected). Only the user at Medium or above, an administrator or SYSTEM can set one, and
+each of them can connect anyway; the product does not check for one.
 `tests/user_isolation_windows.rs` pins the refusal and, with the file labelled Low, the connect.
 
 `userdir::ensure_socket_dir` repairs the folder's ACL only for a real directory (not a junction or

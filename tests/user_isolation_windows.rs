@@ -4,9 +4,8 @@
 //! The tests that create accounts make throwaway local accounts and profiles, log them on the way
 //! sshd does (a network logon, which has no loaded profile), and start processes under those
 //! tokens. They need an elevated administrator and refuse to run anywhere else, before they touch
-//! anything: run them in CI, never on a workstation. The tests that create no account (the ones on
-//! a creator's default DACL and on the integrity level) also run unelevated. The acceptance
-//! procedure repeats the central cases through a real sshd.
+//! anything: run them in CI, never on a workstation. The tests that create no account also run
+//! unelevated. The acceptance procedure repeats the central cases through a real sshd.
 //!
 //! The central property: the shim derives its socket from its own token's profile and from
 //! nothing else, and the socket file grants connect access to exactly its user, SYSTEM and
@@ -67,20 +66,18 @@ fn icacls_report(path: &Path) -> String {
 
 /// The DACL of `path` as SDDL, read through the security API (an inherited ACE carries `ID`, an
 /// ACE that passes access down `OI` or `CI`), for an assertion message and for the precondition
-/// of the control test. A descriptor that cannot be read gives a placeholder text, which has no
-/// `D:` prefix.
+/// of the control test.
 fn dacl_sddl(path: &Path) -> String {
     sddl_of(path, DACL_SECURITY_INFORMATION)
 }
 
 /// The DACL and the mandatory integrity label of `path` as SDDL (`S:(ML;...)` when it has a label),
-/// for an assertion message. A descriptor that cannot be read gives a placeholder text; an assertion
-/// on the contents uses [`read_sddl`].
+/// for an assertion message; assertions on contents use [`read_sddl`].
 fn dacl_and_label_sddl(path: &Path) -> String {
     sddl_of(path, DACL_SECURITY_INFORMATION | LABEL_SECURITY_INFORMATION)
 }
 
-/// [`read_sddl`], with a placeholder text for a descriptor that cannot be read.
+/// [`read_sddl`], with a placeholder text (no `D:` prefix) for a descriptor that cannot be read.
 fn sddl_of(path: &Path, info: OBJECT_SECURITY_INFORMATION) -> String {
     read_sddl(path, info).unwrap_or_else(|e| format!("(cannot read the security descriptor: {e})"))
 }
@@ -116,12 +113,17 @@ fn read_sddl(path: &Path, info: OBJECT_SECURITY_INFORMATION) -> Result<String, S
     }
 }
 
+/// The mandatory-label ACE that makes an object Low with the ACE flags `ace_flags`, as SDDL.
+fn low_label_ace(ace_flags: &str) -> String {
+    format!("(ML;{ace_flags};NW;;;LW)")
+}
+
 /// Set `path`'s mandatory integrity label to Low, with the ACE flags `ace_flags` (`OICI` to pass it to
 /// children of a directory, empty for a file), so that a Low-integrity process of the user may write
-/// to it. Lowering the label of one's own object needs no privilege. Set through the security API:
-/// `icacls /setintegritylevel` reports success on a socket file and leaves it unlabelled.
+/// to it. Set through the security API: `icacls /setintegritylevel` reports success on a socket file
+/// and leaves it unlabelled.
 fn set_low_label(path: &Path, ace_flags: &str) {
-    let sddl = wide(&format!("S:(ML;{ace_flags};NW;;;LW)"));
+    let sddl = wide(&format!("S:{}", low_label_ace(ace_flags)));
     let path_w = wide(&path.to_string_lossy());
     // SAFETY: NUL-terminated inputs; the descriptor outlives the call and is freed after it.
     unsafe {
@@ -528,9 +530,15 @@ fn fact<'a>(result: &'a str, key: &str) -> &'a str {
         .unwrap_or_else(|| panic!("the child's result has no {key}:\n{result}"))
 }
 
+/// Child: fail with `why`, which is also written as the result: the child has no stdio, so the
+/// parent prints the result to name the cause.
+fn child_fails(dir: &Path, why: &str) -> ! {
+    child_entry::write_result(dir, &format!("error={why}\n"));
+    panic!("{why}")
+}
+
 /// Child half of [`a_low_integrity_process_of_the_same_user_cannot_connect_to_the_agent_socket`].
-/// Checks that it runs at the integrity level its parent meant, connects with the product's own
-/// client the way the shim does, and records what happened.
+/// Connects with the product's own client, as the shim does.
 #[test]
 #[ignore = "run as a child of a_low_integrity_process_of_the_same_user_cannot_connect_to_the_agent_socket"]
 fn child_connects_at_its_integrity_level() {
@@ -539,13 +547,20 @@ fn child_connects_at_its_integrity_level() {
     let value_after = |key: &str| {
         text.lines()
             .find_map(|l| l.strip_prefix(key))
-            .unwrap_or_else(|| panic!("the child's input has no {key}"))
+            .unwrap_or_else(|| child_fails(&dir, &format!("the child's input has no {key}")))
             .to_owned()
     };
     let socket = PathBuf::from(value_after("socket="));
-    let expected: u32 = value_after("integrity=").parse().unwrap();
+    let expected: u32 = value_after("integrity=")
+        .parse()
+        .unwrap_or_else(|e| child_fails(&dir, &format!("the child's integrity is not a number: {e}")));
     let level = integrity::current_rid();
-    assert_eq!(level, expected, "the child runs at the wrong integrity level");
+    if level != expected {
+        child_fails(
+            &dir,
+            &format!("the child runs at integrity {level:#x}, its parent meant {expected:#x}"),
+        );
+    }
 
     // The path itself is reachable at this level, and a socket can be made at it: only the
     // connect is in question.
@@ -601,8 +616,8 @@ fn a_low_integrity_process_of_the_same_user_cannot_connect_to_the_agent_socket()
         "the socket file carries a mandatory label\n{measured}"
     );
 
-    // Each child writes its result into a directory of its own, labelled Low so that the Low
-    // child may write there: lowering a label on one's own directory needs no privilege.
+    // Each child writes its result into a directory of its own, labelled Low so the Low child may
+    // write there.
     let exe = std::env::current_exe().unwrap();
     let run = |tag: &str, level: u32| {
         let dir = profile.0.join(format!("pair-{tag}"));
@@ -617,7 +632,13 @@ fn a_low_integrity_process_of_the_same_user_cannot_connect_to_the_agent_socket()
             &dir,
             std::slice::from_ref(&dir),
         );
-        assert_eq!(code, 0, "the {tag} child failed: {}", hard_errors::describe_exit(code));
+        assert_eq!(
+            code,
+            0,
+            "the {tag} child failed: {}\nits result: {}",
+            hard_errors::describe_exit(code),
+            std::fs::read_to_string(child_entry::result_path(&dir)).unwrap_or_else(|e| format!("none ({e})")),
+        );
         let result = child_entry::result(&dir);
         println!("{tag}-integrity child:\n{result}");
         result
@@ -641,7 +662,7 @@ fn a_low_integrity_process_of_the_same_user_cannot_connect_to_the_agent_socket()
     set_low_label(&loc.path, "");
     let labelled = security_of_file("after it was labelled Low");
     assert!(
-        labelled.contains("(ML;") && acl::verify_file_acl(&loc.path, &me).unwrap(),
+        labelled.contains(&low_label_ace("")) && acl::verify_file_acl(&loc.path, &me).unwrap(),
         "the socket file must carry a Low label and keep its exact DACL\n{measured}\nnow: {labelled}"
     );
     let low_labelled = run("low-labelled", integrity::LOW);

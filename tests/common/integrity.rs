@@ -1,6 +1,5 @@
 //! Running a child of this process's own user at a chosen mandatory integrity level, and reading a
-//! process's own level. Lowering one's own integrity needs no privilege and no elevation; the start
-//! itself is [`account::spawn_with_token`](crate::account::spawn_with_token).
+//! process's own level. Lowering one's own integrity needs no privilege and no elevation.
 #![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
@@ -57,7 +56,6 @@ pub fn current_rid() -> u32 {
 }
 
 /// A primary token that is a copy of this process's, with its mandatory integrity label set to `rid`.
-/// Lowering the label (or keeping it) needs no privilege.
 fn token_at(rid: u32) -> OwnedHandle {
     let mut own = HANDLE::default();
     let mut primary = HANDLE::default();
@@ -108,9 +106,8 @@ fn token_at(rid: u32) -> OwnedHandle {
 /// An elevated process gives the child a window station and desktop of its own, labelled at `rid`: a
 /// pair without a label is Medium, and a Low child cannot write to it. An unelevated process may not
 /// name a window station, so the child takes this process's own, which an interactive user's Low
-/// processes use anyway. The two supported contexts are therefore an elevated administrator (CI) and
-/// an unelevated user on an interactive desktop (a workstation); an unelevated process with no
-/// interactive desktop gives a Low child nothing it may use.
+/// processes use anyway. An unelevated process with no interactive desktop gives a Low child nothing
+/// it may use.
 pub fn run_at(rid: u32, exe: &Path, command_line: &str, cwd: &Path, evidence: &[PathBuf]) -> u32 {
     let private = is_elevated().then(|| {
         let user = Sid::current_user().unwrap().to_sddl().unwrap();
