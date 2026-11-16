@@ -7,20 +7,21 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::Command;
 
-use windows::Win32::Foundation::{HANDLE, HLOCAL, LocalFree};
+use windows::Win32::Foundation::{CloseHandle, HANDLE, HLOCAL, LocalFree};
 use windows::Win32::Security::Authorization::{
-    ConvertSecurityDescriptorToStringSecurityDescriptorW, ConvertSidToStringSidW,
-    ConvertStringSecurityDescriptorToSecurityDescriptorW, GetNamedSecurityInfoW, SDDL_REVISION_1, SE_FILE_OBJECT,
+    ConvertSecurityDescriptorToStringSecurityDescriptorW, ConvertSidToStringSidW, GetNamedSecurityInfoW,
+    SDDL_REVISION_1, SE_FILE_OBJECT,
 };
 use windows::Win32::Security::{
     DACL_SECURITY_INFORMATION, GetTokenInformation, OBJECT_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
-    PSECURITY_DESCRIPTOR, TOKEN_OWNER, TOKEN_QUERY, TokenOwner,
+    PSECURITY_DESCRIPTOR, PSID, TOKEN_OWNER, TOKEN_QUERY, TokenOwner,
 };
 use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 use windows::core::{PCWSTR, PWSTR};
 
 /// The parts `which` of the security descriptor of `path` as SDDL, read through the path. Well-known
-/// SIDs print as two-letter aliases, so this does not depend on the display language.
+/// SIDs print as two-letter aliases, so this does not depend on the display language. Compare two
+/// such strings with each other, never one with SDDL a test wrote; for an owner use `owner_sid_of`.
 fn security_sddl(path: &Path, which: OBJECT_SECURITY_INFORMATION) -> String {
     let w: Vec<u16> = std::os::windows::ffi::OsStrExt::encode_wide(path.as_os_str())
         .chain(std::iter::once(0))
@@ -49,12 +50,56 @@ fn security_sddl(path: &Path, which: OBJECT_SECURITY_INFORMATION) -> String {
     }
 }
 
-/// The owner a folder made by this process gets when its descriptor names none, as SDDL (`O:BA`): the
-/// default owner of the process token, which is the user for a plain token and Administrators for an
-/// elevated one.
-pub fn default_owner_sddl() -> String {
-    // SAFETY: valid out-pointers and a buffer as long as the call is told; every allocation and the
-    // token handle are released below.
+/// The SID `sid` as `S-1-5-...` text, always numeric. SDDL text prints some SIDs as aliases (the
+/// built-in Administrator account, RID 500, as `LA`), so a SID is compared in this form, never as a
+/// substring of SDDL.
+///
+/// # Safety
+/// `sid` is a valid SID.
+unsafe fn sid_text(sid: PSID) -> String {
+    // SAFETY: the caller's valid SID; the string is freed below.
+    unsafe {
+        let mut text = PWSTR::null();
+        ConvertSidToStringSidW(sid, &mut text).unwrap();
+        let out = text.to_string().unwrap();
+        let _ = LocalFree(Some(HLOCAL(text.0 as *mut _)));
+        out
+    }
+}
+
+/// The owner of `path` as `S-1-5-...` text, read through the path.
+pub fn owner_sid_of(path: &Path) -> String {
+    let w: Vec<u16> = std::os::windows::ffi::OsStrExt::encode_wide(path.as_os_str())
+        .chain(std::iter::once(0))
+        .collect();
+    let mut owner = PSID::default();
+    let mut psd = PSECURITY_DESCRIPTOR::default();
+    // SAFETY: valid out-pointers; the owner points into `psd`, which is freed after it is printed.
+    unsafe {
+        GetNamedSecurityInfoW(
+            PCWSTR(w.as_ptr()),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            Some(&mut owner),
+            None,
+            None,
+            None,
+            &mut psd,
+        )
+        .ok()
+        .unwrap_or_else(|e| panic!("read the owner of {}: {e}", path.display()));
+        let out = sid_text(owner);
+        let _ = LocalFree(Some(HLOCAL(psd.0)));
+        out
+    }
+}
+
+/// The owner a folder made by this process gets when its descriptor names none, as `S-1-5-...` text:
+/// the default owner of the process token, which is the user for a plain token and Administrators for
+/// an elevated one.
+pub fn default_owner_sid() -> String {
+    // SAFETY: valid out-pointers and a buffer as long as the call is told; the token handle is closed
+    // after the owner is printed, and the owner points into the buffer.
     unsafe {
         let mut token = HANDLE::default();
         OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).unwrap();
@@ -62,31 +107,8 @@ pub fn default_owner_sddl() -> String {
         let _ = GetTokenInformation(token, TokenOwner, None, 0, &mut len);
         let mut buf = vec![0u8; len as usize];
         GetTokenInformation(token, TokenOwner, Some(buf.as_mut_ptr().cast()), len, &mut len).unwrap();
-        let _ = windows::Win32::Foundation::CloseHandle(token);
-        let owner = (*(buf.as_ptr() as *const TOKEN_OWNER)).Owner;
-        let mut sid = PWSTR::null();
-        ConvertSidToStringSidW(owner, &mut sid).unwrap();
-        let wide: Vec<u16> = format!("O:{}", sid.to_string().unwrap())
-            .encode_utf16()
-            .chain(std::iter::once(0))
-            .collect();
-        let _ = LocalFree(Some(HLOCAL(sid.0 as *mut _)));
-        let mut psd = PSECURITY_DESCRIPTOR::default();
-        ConvertStringSecurityDescriptorToSecurityDescriptorW(PCWSTR(wide.as_ptr()), SDDL_REVISION_1, &mut psd, None)
-            .unwrap();
-        let mut text = PWSTR::null();
-        ConvertSecurityDescriptorToStringSecurityDescriptorW(
-            psd,
-            SDDL_REVISION_1,
-            OWNER_SECURITY_INFORMATION,
-            &mut text,
-            None,
-        )
-        .unwrap();
-        let out = text.to_string().unwrap();
-        let _ = LocalFree(Some(HLOCAL(text.0 as *mut _)));
-        let _ = LocalFree(Some(HLOCAL(psd.0)));
-        out
+        let _ = CloseHandle(token);
+        sid_text((*(buf.as_ptr() as *const TOKEN_OWNER)).Owner)
     }
 }
 

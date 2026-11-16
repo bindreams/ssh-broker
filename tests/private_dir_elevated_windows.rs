@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use ssh_broker::acl::Sid;
+use ssh_broker::acl::{Sid, WellKnown};
 use ssh_broker::provision::registry::{OPENSSH_KEY, set_default_shell_under};
 use ssh_broker::{socket_loc, userdir};
 
@@ -50,7 +50,7 @@ mod sshd_rig;
 mod stand_in;
 
 use account_fixture::{Account, ServiceLogon};
-use fs_state::{junction, sddl_of, tree_state};
+use fs_state::{junction, owner_sid_of, sddl_of, tree_state};
 use sshd_rig::{Login, no_shell_to_carry, run_client};
 use stand_in::Kit;
 
@@ -70,10 +70,12 @@ fn administrators_folder(parent: &Path) -> PathBuf {
     assert!(status.success(), "icacls on {}", folder.display());
     std::fs::write(folder.join(socket_loc::LOCK_FILE_NAME), "kept").unwrap();
     std::fs::write(folder.join("note.txt"), "kept").unwrap();
-    let sddl = sddl_of(&folder);
-    assert!(
-        sddl.starts_with("O:BA"),
-        "the elevated token's default owner is not Administrators, so this folder is not the shape under test: {sddl}"
+    let administrators = Sid::well_known(WellKnown::Administrators).unwrap().to_sddl().unwrap();
+    assert_eq!(
+        owner_sid_of(&folder),
+        administrators,
+        "the elevated token's default owner is not Administrators, so this folder is not the shape under test: {}",
+        sddl_of(&folder)
     );
     folder
 }
