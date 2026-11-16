@@ -177,8 +177,9 @@ impl Drop for LinkAtLocal {
 
 /// A session through the real sshd, with the shim as `DefaultShell` and `kind` of link at the account's
 /// `AppData\Local` leading to a folder the account owns, which is not hardened: the folder an unfixed
-/// shim would check and re-ACL if it followed the link. The session runs a command and ends; nothing
-/// outside the profile is changed, added or removed. The command ran, so the shim was reached.
+/// shim would check and re-ACL if it followed the link. The session runs a command and ends; the
+/// folder outside the profile, its owner, ACL and files, is as it was and holds no log. The command ran,
+/// so the shim was reached.
 fn session_with_a_link_at_local(tag: &str, kind: LinkKind) {
     let _machine = machine::exclusive();
     account_fixture::assert_elevated();
@@ -188,16 +189,13 @@ fn session_with_a_link_at_local(tag: &str, kind: LinkKind) {
 
     let outside = kit.path("outside");
     let folder = outside.join(socket_loc::SOCKET_DIR_NAME);
-    let (folder, lock, note) = (
-        folder.display(),
-        folder.join(socket_loc::LOCK_FILE_NAME),
-        folder.join("note.txt"),
-    );
+    let (lock, note) = (folder.join(socket_loc::LOCK_FILE_NAME), folder.join("note.txt"));
     cmd_as(
         &account,
         &kit,
         &format!(
-            "mkdir {folder}&echo kept>{}&echo kept>{}",
+            "mkdir {}&echo kept>{}&echo kept>{}",
+            folder.display(),
             lock.display(),
             note.display()
         ),
@@ -221,7 +219,10 @@ fn session_with_a_link_at_local(tag: &str, kind: LinkKind) {
         LinkKind::DirectorySymlink => std::os::windows::fs::symlink_dir(&outside, &local)
             .unwrap_or_else(|e| panic!("symlink {} -> {}: {e}", local.display(), outside.display())),
     }
-    let before = tree_state(&outside);
+    // Only the folder the test made is walked. The logon loads the account's hives, and with a link at
+    // `Local` Windows puts its own files beside it in `outside` (`Microsoft\Windows\UsrClass.dat` and
+    // its logs) and keeps them open, so they cannot be read; they are not the product's.
+    let before = tree_state(&folder);
 
     set_default_shell_under(OPENSSH_KEY, &kit.exe.to_string_lossy(), &no_shell_to_carry())
         .expect("set the shim as DefaultShell");
@@ -239,9 +240,14 @@ fn session_with_a_link_at_local(tag: &str, kind: LinkKind) {
     );
 
     assert_eq!(
-        tree_state(&outside),
+        tree_state(&folder),
         before,
-        "{kind:?}: something outside the profile was changed"
+        "{kind:?}: the folder outside the profile was changed, or something was added to it"
+    );
+    assert!(
+        !folder.join(socket_loc::LOGS_DIR_NAME).exists(),
+        "{kind:?}: a `{}` folder was made outside the profile",
+        socket_loc::LOGS_DIR_NAME
     );
 }
 

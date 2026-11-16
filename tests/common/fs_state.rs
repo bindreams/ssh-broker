@@ -127,17 +127,24 @@ pub fn sddl_of(path: &Path) -> String {
 /// A link is listed, not followed.
 pub fn tree_state(root: &Path) -> BTreeMap<String, String> {
     fn visit(root: &Path, at: &Path, out: &mut BTreeMap<String, String>) {
-        let meta = at.symlink_metadata().unwrap();
+        let meta = at
+            .symlink_metadata()
+            .unwrap_or_else(|e| panic!("stat {}: {e}", at.display()));
         let bytes = if meta.is_file() {
-            format!(" bytes={:?}", std::fs::read(at).unwrap())
+            let read = std::fs::read(at).unwrap_or_else(|e| panic!("read {}: {e}", at.display()));
+            format!(" bytes={read:?}")
         } else {
             String::new()
         };
         let relative = at.strip_prefix(root).unwrap().display().to_string();
         out.insert(relative, format!("{}{bytes}", sddl_of(at)));
         if meta.is_dir() {
-            for entry in std::fs::read_dir(at).unwrap() {
-                visit(root, &entry.unwrap().path(), out);
+            for entry in std::fs::read_dir(at).unwrap_or_else(|e| panic!("list {}: {e}", at.display())) {
+                visit(
+                    root,
+                    &entry.unwrap_or_else(|e| panic!("list {}: {e}", at.display())).path(),
+                    out,
+                );
             }
         }
     }
