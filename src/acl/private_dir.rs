@@ -4,18 +4,10 @@
 //! `AppData`, `Local`, `ssh-broker` or `logs` with a junction or symlink) must not lead this code to
 //! check, create or write anywhere else. So the walk starts at one handle on the profile directory
 //! and every name below it is opened as a single component relative to the handle above, with
-//! `FILE_OPEN_REPARSE_POINT`, and refused when the handle it gave is itself a reparse point. The open
-//! and the check are on the same handle, so nothing can be swapped in between. No call below the
-//! root names a path.
+//! `FILE_OPEN_REPARSE_POINT`, and refused when the handle it gave is itself a reparse point.
 //!
-//! The profile directory itself is opened following a link. Its path is `ProfileImagePath`, and
-//! Windows loads the user's profile through that same path, links included: the broker uses the
-//! profile where the operating system does, and refusing would stop profile layouts that work
-//! today (a junction made by an administrator for one profile, a profile that is a mounted volume).
-//! What this leaves is stated, not closed: an account that replaces its own profile directory with
-//! a link can make an elevated shim create, and never modify, an `ssh-broker` folder (with `logs`
-//! and a log file) under another `AppData\Local`. The owner of that folder refuses it from its
-//! agent, with the folder named, and removing it restores them.
+//! The profile directory is opened following a link, because Windows loads the profile through
+//! ProfileImagePath, links included. The residual case is the contract in CONTRIBUTING.
 //!
 //! Like [`super::ensure_admin_only_file`], a folder is created with its security descriptor given
 //! at creation and an existing one is verified and never modified: one that is not exactly right
@@ -67,7 +59,7 @@ pub struct Refused(String);
 /// A directory opened by handle, never reached through a link.
 pub struct DirHandle {
     handle: OwnedHandle,
-    /// Where the handle was reached from, for messages only. It is never opened.
+    /// Where the handle was reached from, for messages only; never opened.
     path: PathBuf,
 }
 
@@ -76,13 +68,11 @@ impl DirHandle {
         self.handle.0
     }
 
-    /// The path the folder was reached by, for messages and for tests that read it back. The
-    /// folder may have been moved since: nothing here opens it.
     pub fn path(&self) -> &Path {
         &self.path
     }
 
-    /// Another handle on the same folder, for a holder that outlives the borrow (a writer thread).
+    /// Another handle on the same folder.
     pub fn try_clone(&self) -> anyhow::Result<DirHandle> {
         let mut copy = HANDLE::default();
         // SAFETY: both processes are this one; `copy` is a valid out-pointer and is owned below.
@@ -204,7 +194,6 @@ fn private_dir(parent: &DirHandle, name: &str, user: &Sid, create: bool) -> anyh
     } else {
         None
     };
-    // Only a creating open can be refused for lack of the right to make the folder.
     let may_not_make = if create {
         format!(
             " (or, if it is not there, this process may not make it in {})",

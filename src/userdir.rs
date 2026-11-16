@@ -94,19 +94,13 @@ pub struct SocketDir {
 /// Make `loc.dir` and its `logs` folder if they are missing, leave both exactly
 /// `{user, SYSTEM, Administrators}` with ACEs the files made inside inherit, and return them open.
 ///
-/// The folders are reached by handle from the profile directory (a link at it or above it is
-/// followed, as Windows does for the profile: see `acl::private_dir`), each name opened relative to
-/// the handle above it, so a link at `AppData`, `Local`, `ssh-broker` or `logs` is refused instead
-/// of followed (see [`acl::open_dir`]). Only the
-/// two private folders are created: `AppData` and `Local` must already exist, because a missing one
-/// means there is no profile and inventing one would put a socket where no logon ever looks. A
-/// folder that exists is verified, never changed: one that is not a real directory with an owner in
-/// {user, SYSTEM, Administrators} and exactly the private ACL is refused and left as it is, and
-/// removing it makes it be created again. A folder this accepts is not thereby trusted:
-/// `Listener::bind` verifies it again before it binds.
+/// Reached by handle from the profile directory (see `acl::private_dir`). `AppData` and `Local`
+/// must already exist: a missing one means no profile, and inventing one would put a socket where no
+/// logon looks. Only `ssh-broker` and `logs` are created; an existing one is verified, never changed.
+/// `Listener::bind` verifies it again before binding.
 ///
 /// A refusal of the socket folder (or of the way to it) is this function's error. A refusal of
-/// `logs` alone is in [`SocketDir::logs`], with the socket folder still open.
+/// `logs` alone is in [`SocketDir::logs`], with the socket folder still open: it costs only the log.
 pub fn open_socket_dir(loc: &SocketLocation, user: &Sid) -> anyhow::Result<SocketDir> {
     walk(loc, "make", |parent, name| acl::ensure_private_dir(parent, name, user))
 }

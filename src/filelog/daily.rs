@@ -76,7 +76,6 @@ impl<C: Fn() -> Date> DailyLog<C> {
             return;
         }
         let cause = format!("{error:#}");
-        // A file that cannot be written to fails the line that follows too, and says so to its caller.
         let _ = writeln!(
             self.current.1,
             "ssh-broker: cannot open the log file {name}, so this one is still being written: {cause}"

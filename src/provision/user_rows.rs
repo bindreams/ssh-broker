@@ -54,7 +54,9 @@ pub fn log_folder_row(location: &anyhow::Result<SocketLocation>, user: &Sid) -> 
     )
 }
 
-/// The row for the folder `pick` takes out of what the agent's walk finds.
+/// The row for the folder `pick` takes out of the agent's walk: it passes when the folder is a real
+/// directory with exactly the private ACL, and fails with the folder named when it is missing
+/// (`absent_means` says what that costs) or refused (the text says why and what to do).
 fn dir_row(
     name: &'static str,
     dir: &std::path::Path,

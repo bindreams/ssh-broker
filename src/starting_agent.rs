@@ -55,7 +55,6 @@ impl HolderWatch {
     /// signals, so whoever sees the signal finds the lock free. A lock file that is gone is no
     /// holder: the signal is set at once. If the thread cannot take the lock it signals too: the
     /// holder can no longer be told apart from none, and the waiter would otherwise sleep forever.
-    /// The thread outlives the watch if the holder does; it ends with the process.
     pub fn start(dir: &DirHandle) -> anyhow::Result<HolderWatch> {
         let file = open_lock(dir)?;
         let name = dir.path().join(LOCK_FILE_NAME);

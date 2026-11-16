@@ -305,9 +305,7 @@ fn private_dir_dacl_sddl(user: &Sid) -> anyhow::Result<String> {
 /// Full Control, target_user as owner) to `dir`, removing any inherited or broader access. The
 /// ACEs are inheritable (`OI|CI`) so everything created inside is born with the same set.
 ///
-/// A fixture for tests that need a folder of this shape. The product never changes the owner or ACL
-/// of a folder that exists: [`ensure_private_dir`] creates it with the descriptor and refuses one
-/// that is not exactly right.
+/// A fixture for tests that need a folder of this shape.
 #[cfg(test)]
 pub fn harden_dir(dir: &Path, target_user: &Sid) -> anyhow::Result<()> {
     use windows::Win32::Security::Authorization::SetNamedSecurityInfoW;
@@ -617,10 +615,9 @@ struct Made {
     created: bool,
 }
 
-/// `NtCreateFile` of `name` (UTF-16, no terminator): an NT path when `root` is `None`, else one name
-/// below the directory `root`. With `FILE_OPEN` it only opens, as `NtOpenFile` does; with another
-/// disposition it makes the object, giving it `descriptor` as its security descriptor. Sharing is read,
-/// write and delete. `Err` is a name too long to pass.
+/// Open or make `name` (UTF-16, no terminator), an NT path when `root` is `None` and else one name
+/// below `root`, sharing read, write and delete; a made object gets `descriptor`. `Err` is a name too
+/// long to pass.
 fn nt_create(
     root: Option<HANDLE>,
     name: &[u16],
@@ -694,7 +691,7 @@ fn descriptor_from_sddl(sddl: &str) -> anyhow::Result<LocalSd> {
     Ok(LocalSd(psd))
 }
 
-/// What the object `handle` names says about itself, which needs `FILE_READ_ATTRIBUTES`.
+/// Needs `FILE_READ_ATTRIBUTES` on `handle`.
 fn file_information(handle: HANDLE) -> anyhow::Result<BY_HANDLE_FILE_INFORMATION> {
     let mut info = BY_HANDLE_FILE_INFORMATION::default();
     // SAFETY: a valid handle and an out-pointer to a local.
@@ -702,12 +699,10 @@ fn file_information(handle: HANDLE) -> anyhow::Result<BY_HANDLE_FILE_INFORMATION
     Ok(info)
 }
 
-/// The file attributes of the object `handle` names (`FILE_ATTRIBUTE_*`).
 fn file_attributes(handle: HANDLE) -> anyhow::Result<u32> {
     Ok(file_information(handle)?.dwFileAttributes)
 }
 
-/// The Windows error an NT status stands for.
 fn status_error(status: NTSTATUS) -> windows::core::Error {
     // SAFETY: a pure conversion of a status code.
     windows::core::Error::from(HRESULT::from_win32(unsafe { RtlNtStatusToDosError(status) }))
