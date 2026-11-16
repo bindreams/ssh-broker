@@ -197,9 +197,19 @@ impl PrivateDesktop {
     /// account and the one starting it); SYSTEM, which the secondary-logon service runs as, is added.
     /// Naming a window station needs an administrator (Microsoft, `CreateWindowStationW`).
     pub fn create(sids: &[&str]) -> windows::core::Result<PrivateDesktop> {
+        PrivateDesktop::create_labelled(sids, None)
+    }
+
+    /// [`PrivateDesktop::create`] with the pair labelled at mandatory integrity level `label` (the
+    /// relative id of the label SID, such as `0x1000` for Low), no-write-up. A pair without a label is
+    /// Medium: a child below Medium, such as a Low-integrity one, is refused write access to its own
+    /// window station and desktop, and cannot initialise user32 on them. The caller may label the pair
+    /// no higher than its own level, which a child it starts at that level or above can use.
+    pub fn create_labelled(sids: &[&str], label: Option<u32>) -> windows::core::Result<PrivateDesktop> {
         let users: Vec<&str> = sids.iter().copied().chain([SYSTEM]).collect();
-        let station_sd = Descriptor::parse(&grant_sddl(&users, STATION_ACCESS))?;
-        let desktop_sd = Descriptor::parse(&grant_sddl(&users, DESKTOP_ACCESS))?;
+        let sacl = label.map_or(String::new(), |rid| format!("S:(ML;;NW;;;S-1-16-{rid})"));
+        let station_sd = Descriptor::parse(&format!("{}{sacl}", grant_sddl(&users, STATION_ACCESS)))?;
+        let desktop_sd = Descriptor::parse(&format!("{}{sacl}", grant_sddl(&users, DESKTOP_ACCESS)))?;
         let station_name = format!("sb-iso-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed));
         let api = user32();
 

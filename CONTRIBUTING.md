@@ -43,11 +43,6 @@ this code:
   knows the path reaches the file itself.
 - The socket **folder's** DACL decides who can create, replace or delete the socket.
 
-`connect()` asks for write access to the socket file. That is why a process of the same user at
-Low integrity (a sandboxed renderer) is refused although the DACL admits it: the file has no
-integrity label, so it is Medium with the default no-write-up policy.
-`tests/user_isolation_windows.rs` pins this.
-
 Both must grant Full Control to exactly the user, SYSTEM and Administrators. The folder's ACEs are
 inheritable so the socket, `agent.lock`, `sessions.lock` and `logs` are born with that set instead of the creating
 token's default DACL; `tests/user_isolation_windows.rs` pins this with a creator whose default DACL
@@ -56,6 +51,11 @@ fail-closed**: they reject an absent DACL, a non-protected folder DACL, DENY ent
 non-FullControl grants, extra grantees, and an owner outside the allowed set. `Listener::bind`
 verifies the folder, binds, verifies the socket file, and only then listens; it removes a socket it
 cannot prove. If it cannot prove the folder is safe, the agent refuses to bind.
+
+`connect()` asks for write access to the socket file. That is why a process of the same user at
+Low integrity (a sandboxed renderer) is refused although the DACL admits it: the file has no
+integrity label, so it is Medium with the default no-write-up policy.
+`tests/user_isolation_windows.rs` pins this.
 
 `userdir::ensure_socket_dir` repairs the folder's ACL only for a real directory (not a junction or
 symlink) owned by the user, SYSTEM or Administrators, and refuses anything else untouched. A profile

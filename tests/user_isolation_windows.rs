@@ -473,6 +473,35 @@ fn bob_cannot_connect_to_a_socket_in_another_users_dir() {
 
 // Who can connect: the integrity level --------------------------------------------------------
 
+/// `WSAEACCES`, what `connect` fails with when the socket file refuses the caller's access.
+const WSAEACCES: i32 = 10013;
+
+/// What [`child_connects_at_its_integrity_level`] observed, one `key=value` line per fact.
+fn child_facts(level: u32, stat: &str, create: &str, connect: &str, os_error: Option<i32>) -> String {
+    let os_error = os_error.map_or("none".to_owned(), |code| code.to_string());
+    format!(
+        "integrity={level}
+stat={stat}
+create={create}
+connect={connect}
+connect_os_error={os_error}
+"
+    )
+}
+
+/// The value of `key` in a child's result.
+fn fact<'a>(result: &'a str, key: &str) -> &'a str {
+    result
+        .lines()
+        .find_map(|line| line.strip_prefix(key)?.strip_prefix('='))
+        .unwrap_or_else(|| {
+            panic!(
+                "the child's result has no {key}:
+{result}"
+            )
+        })
+}
+
 /// Child half of [`a_low_integrity_process_of_the_same_user_cannot_connect_to_the_agent_socket`].
 /// Checks that it runs at the integrity level its parent meant, connects with the product's own
 /// client the way the shim does, and records what happened.
@@ -492,26 +521,26 @@ fn child_connects_at_its_integrity_level() {
     let level = integrity::current_rid();
     assert_eq!(level, expected, "the child runs at the wrong integrity level");
 
-    // The path itself is reachable at this level: only the connect is in question.
-    let reach = match std::fs::symlink_metadata(&socket) {
-        Ok(_) => "the socket file can be stat'ed".to_owned(),
-        Err(e) => format!("the socket file cannot be stat'ed: {e}"),
+    // The path itself is reachable at this level, and a socket can be made at it: only the
+    // connect is in question.
+    let stat = match std::fs::symlink_metadata(&socket) {
+        Ok(_) => "ok".to_owned(),
+        Err(e) => format!("failed: {e}"),
     };
-    let outcome = match afunix::connect(&socket) {
-        Ok(_) => "connected".to_owned(),
+    let create = match socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None) {
+        Ok(_) => "ok".to_owned(),
+        Err(e) => format!("failed: {e}"),
+    };
+    let (connect, os_error) = match afunix::connect(&socket) {
+        Ok(_) => ("connected".to_owned(), None),
         Err(e) => {
-            let io = e.downcast_ref::<std::io::Error>();
-            format!(
-                "refused: kind={:?} os_error={:?} text={e:#}",
-                io.map(std::io::Error::kind),
-                io.and_then(std::io::Error::raw_os_error)
-            )
+            let os_error = e
+                .downcast_ref::<std::io::Error>()
+                .and_then(std::io::Error::raw_os_error);
+            (format!("failed: {e:#}"), os_error)
         }
     };
-    child_entry::write_result(
-        &dir,
-        &format!("integrity={level:#x}\nreach={reach}\nconnect={outcome}\n"),
-    );
+    child_entry::write_result(&dir, &child_facts(level, &stat, &create, &connect, os_error));
 }
 
 #[test]
@@ -523,17 +552,28 @@ fn a_low_integrity_process_of_the_same_user_cannot_connect_to_the_agent_socket()
     let loc = profile.location();
     userdir::ensure_socket_dir(&loc, &me).unwrap();
     let _listener = Listener::bind(&loc.path).unwrap();
+    let file_security = dacl_and_label_sddl(&loc.path);
     let measured = format!(
-        "the socket file: {}\n  {}\nits folder: {}\n  {}",
+        "the socket file: {}
+  {file_security}
+its folder: {}
+  {}",
         loc.path.display(),
-        dacl_and_label_sddl(&loc.path),
         loc.dir.display(),
         dacl_and_label_sddl(&loc.dir),
     );
     println!("{measured}");
     assert!(
         acl::verify_file_acl(&loc.path, &me).unwrap(),
-        "the socket is exact\n{measured}"
+        "the socket is exact
+{measured}"
+    );
+    // The refusal below rests on the file having no integrity label, which makes it Medium with
+    // the default no-write-up policy.
+    assert!(
+        !file_security.contains("(ML;"),
+        "the socket file carries a mandatory label
+{measured}"
     );
 
     // Each child writes its result into a directory of its own, labelled Low so that the Low
@@ -549,34 +589,49 @@ fn a_low_integrity_process_of_the_same_user_cannot_connect_to_the_agent_socket()
         )
         .unwrap();
         assert!(status.success(), "icacls /setintegritylevel on {dir:?}");
-        child_entry::write_input(&dir, &format!("socket={}\nintegrity={level}\n", loc.path.display()));
+        child_entry::write_input(
+            &dir,
+            &format!(
+                "socket={}
+integrity={level}
+",
+                loc.path.display()
+            ),
+        );
         let name = "child_connects_at_its_integrity_level";
-        let code = if level == integrity::LOW {
-            integrity::run_at_low(&exe, &child_entry::command_line(&exe, name, &dir), &dir)
-        } else {
-            desktop::status(Command::new(&exe).args(child_entry::args(name, &dir)).current_dir(&dir))
-                .unwrap()
-                .code()
-                .unwrap_or(u32::MAX as i32) as u32
-        };
+        let code = integrity::run_at(
+            level,
+            &exe,
+            &child_entry::command_line(&exe, name, &dir),
+            &dir,
+            std::slice::from_ref(&dir),
+        );
         assert_eq!(code, 0, "the {tag} child failed: {}", hard_errors::describe_exit(code));
         let result = child_entry::result(&dir);
-        println!("{tag}-integrity child:\n{result}");
+        println!(
+            "{tag}-integrity child:
+{result}"
+        );
         result
     };
 
-    // Control: the same child at the user's own level reaches the socket, so a refusal below is
-    // the integrity check's doing and not an unreachable path.
+    // Control: the same child, started the same way at Medium, the user's usual level, reaches the
+    // socket, so a refusal below is the integrity check's doing and not an unreachable path.
     let medium = run("medium", integrity::MEDIUM);
-    assert!(
-        medium.contains("connect=connected"),
-        "the control child must connect\n{measured}\n{medium}"
+    let expected_medium = child_facts(integrity::MEDIUM, "ok", "ok", "connected", None);
+    assert_eq!(
+        medium, expected_medium,
+        "the control child must connect
+{measured}"
     );
 
     let low = run("low", integrity::LOW);
-    assert!(
-        low.contains("connect=refused"),
-        "a Low-integrity process of the same user connected to the agent socket\n{measured}\n{low}"
+    assert_eq!(
+        (fact(&low, "stat"), fact(&low, "create"), fact(&low, "connect_os_error")),
+        ("ok", "ok", WSAEACCES.to_string().as_str()),
+        "a Low-integrity process of the same user must reach the file and be refused by connect
+{measured}
+{low}"
     );
 }
 

@@ -38,11 +38,11 @@ pub fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
-/// Fail loudly unless this process is an elevated administrator.
-pub fn assert_elevated() {
+/// Whether this process is an elevated administrator.
+pub fn is_elevated() -> bool {
     let mut token = HANDLE::default();
     // SAFETY: valid out-pointers; the token is closed by `OwnedHandle`.
-    let elevated = unsafe {
+    unsafe {
         OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).unwrap();
         let token = OwnedHandle(token);
         let mut info = TOKEN_ELEVATION::default();
@@ -56,9 +56,13 @@ pub fn assert_elevated() {
         )
         .is_ok()
             && info.TokenIsElevated != 0
-    };
+    }
+}
+
+/// Fail loudly unless this process is an elevated administrator.
+pub fn assert_elevated() {
     assert!(
-        elevated,
+        is_elevated(),
         "this test needs an elevated administrator (CI runs it); not running it here"
     );
 }
@@ -493,80 +497,116 @@ impl Account {
         .expect("duplicate the token as a primary token");
         let primary = OwnedHandle(primary);
 
-        let mut command = wide(command_line);
-        let mut station_and_desktop = wide(private.name());
-        let mut startup = STARTUPINFOW {
-            cb: std::mem::size_of::<STARTUPINFOW>() as u32,
-            lpDesktop: PWSTR(station_and_desktop.as_mut_ptr()),
-            ..Default::default()
-        };
-        if let Some([input, output, error]) = stdio {
-            startup.dwFlags = STARTF_USESTDHANDLES;
-            startup.hStdInput = input;
-            startup.hStdOutput = output;
-            startup.hStdError = error;
-        }
-        let mut flags = CREATE_SUSPENDED | console;
-        if environment.is_some() {
-            flags |= CREATE_UNICODE_ENVIRONMENT;
-        }
-        let mut info = PROCESS_INFORMATION::default();
-        let exe_w = wide(&exe.to_string_lossy());
-        let cwd_w = wide(&cwd.to_string_lossy());
-        let environment = environment.map(|block| block.as_ptr().cast::<core::ffi::c_void>());
-        // SAFETY: every pointer is to a local that outlives the call.
-        match starter_kind {
-            Starter::SecondaryLogon(logon_flags) => unsafe {
-                CreateProcessWithTokenW(
-                    primary.0,
-                    logon_flags,
-                    PCWSTR(exe_w.as_ptr()),
-                    Some(PWSTR(command.as_mut_ptr())),
-                    flags,
-                    environment,
-                    PCWSTR(cwd_w.as_ptr()),
-                    &startup,
-                    &mut info,
-                )
-            },
-            Starter::AsUser => unsafe {
-                CreateProcessAsUserW(
-                    Some(primary.0),
-                    PCWSTR(exe_w.as_ptr()),
-                    Some(PWSTR(command.as_mut_ptr())),
-                    None,
-                    None,
-                    stdio.is_some(),
-                    flags,
-                    environment,
-                    PCWSTR(cwd_w.as_ptr()),
-                    &startup,
-                    &mut info,
-                )
-            },
-        }
-        .unwrap_or_else(|e| panic!("start {exe:?} as {} ({starter_kind:?}): {e}", self.name));
-        let process = OwnedHandle(info.hProcess);
-        let thread = OwnedHandle(info.hThread);
-        // Before its first instruction: a loader failure then ends the process, with the failing
-        // status as its exit code, instead of waiting on a message box that nobody can answer.
-        if let Err(e) = crate::hard_errors::suppress_hard_error_boxes(process.0) {
-            // SAFETY: the handle is the live process this function just created.
-            let _ = unsafe { TerminateProcess(process.0, 1) };
-            panic!("switch off the hard-error boxes of {exe:?} as {}: {e}", self.name);
-        }
         let mut evidence = evidence.to_vec();
         if let Some(profile) = &self.profile {
             evidence.push(profile.join("AppData").join("Local").join("ssh-broker"));
         }
-        Spawned {
-            process,
-            thread,
-            pid: info.dwProcessId,
-            what: format!("{exe:?} as {}", self.name),
-            evidence,
-            _desktop: private,
-        }
+        spawn_with_token(
+            starter_kind,
+            primary.0,
+            &self.name,
+            Some(private),
+            exe,
+            command_line,
+            cwd,
+            &evidence,
+            environment,
+            stdio,
+            console,
+        )
+    }
+}
+
+/// Start `exe` suspended with the primary `token`, on the window station and desktop `private`, which
+/// the child keeps alive; without one the child takes this process's own (naming a window station
+/// needs an administrator, see [`desktop::PrivateDesktop`]). `who` names the token's owner in messages. The step every start here ends
+/// in: the child is created suspended, its hard-error boxes are switched off before its first
+/// instruction, and `evidence` is printed if it outlives [`crate::bounded_wait::CHILD_EXIT_BOUND`].
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_with_token(
+    starter_kind: Starter,
+    token: HANDLE,
+    who: &str,
+    private: Option<crate::desktop::PrivateDesktop>,
+    exe: &Path,
+    command_line: &str,
+    cwd: &Path,
+    evidence: &[PathBuf],
+    environment: Option<&[u16]>,
+    stdio: Option<[HANDLE; 3]>,
+    console: PROCESS_CREATION_FLAGS,
+) -> Spawned {
+    let mut command = wide(command_line);
+    let mut station_and_desktop = private.as_ref().map(|private| wide(private.name()));
+    let mut startup = STARTUPINFOW {
+        cb: std::mem::size_of::<STARTUPINFOW>() as u32,
+        lpDesktop: station_and_desktop
+            .as_mut()
+            .map_or(PWSTR::null(), |name| PWSTR(name.as_mut_ptr())),
+        ..Default::default()
+    };
+    if let Some([input, output, error]) = stdio {
+        startup.dwFlags = STARTF_USESTDHANDLES;
+        startup.hStdInput = input;
+        startup.hStdOutput = output;
+        startup.hStdError = error;
+    }
+    let mut flags = CREATE_SUSPENDED | console;
+    if environment.is_some() {
+        flags |= CREATE_UNICODE_ENVIRONMENT;
+    }
+    let mut info = PROCESS_INFORMATION::default();
+    let exe_w = wide(&exe.to_string_lossy());
+    let cwd_w = wide(&cwd.to_string_lossy());
+    let environment = environment.map(|block| block.as_ptr().cast::<core::ffi::c_void>());
+    // SAFETY: every pointer is to a local that outlives the call.
+    match starter_kind {
+        Starter::SecondaryLogon(logon_flags) => unsafe {
+            CreateProcessWithTokenW(
+                token,
+                logon_flags,
+                PCWSTR(exe_w.as_ptr()),
+                Some(PWSTR(command.as_mut_ptr())),
+                flags,
+                environment,
+                PCWSTR(cwd_w.as_ptr()),
+                &startup,
+                &mut info,
+            )
+        },
+        Starter::AsUser => unsafe {
+            CreateProcessAsUserW(
+                Some(token),
+                PCWSTR(exe_w.as_ptr()),
+                Some(PWSTR(command.as_mut_ptr())),
+                None,
+                None,
+                stdio.is_some(),
+                flags,
+                environment,
+                PCWSTR(cwd_w.as_ptr()),
+                &startup,
+                &mut info,
+            )
+        },
+    }
+    .unwrap_or_else(|e| panic!("start {exe:?} as {who} ({starter_kind:?}): {e}"));
+    let process = OwnedHandle(info.hProcess);
+    let thread = OwnedHandle(info.hThread);
+    // Before its first instruction: a loader failure then ends the process, with the failing
+    // status as its exit code, instead of waiting on a message box that nobody can answer.
+    if let Err(e) = crate::hard_errors::suppress_hard_error_boxes(process.0) {
+        // SAFETY: the handle is the live process this function just created.
+        let _ = unsafe { TerminateProcess(process.0, 1) };
+        panic!("switch off the hard-error boxes of {exe:?} as {who}: {e}");
+    }
+    Spawned {
+        process,
+        thread,
+        pid: info.dwProcessId,
+        what: format!("{exe:?} as {who}"),
+        evidence: evidence.to_vec(),
+        _desktop: private,
     }
 }
 
@@ -577,7 +617,8 @@ pub enum Starter {
     /// and puts it in a job of its own besides the caller's.
     SecondaryLogon(CREATE_PROCESS_LOGON_FLAGS),
     /// `CreateProcessAsUserW` from this process, which must hold `SeAssignPrimaryTokenPrivilege` (a SYSTEM
-    /// process does): what sshd, a service, does.
+    /// process does): what sshd, a service, does. A token that is this process's own with only its
+    /// integrity level lowered needs no privilege.
     AsUser,
 }
 
@@ -589,7 +630,7 @@ pub struct Spawned {
     pub pid: u32,
     what: String,
     evidence: Vec<PathBuf>,
-    _desktop: crate::desktop::PrivateDesktop,
+    _desktop: Option<crate::desktop::PrivateDesktop>,
 }
 
 impl Spawned {
@@ -605,7 +646,10 @@ impl Spawned {
 
     /// The class names of the top-level windows on this child's desktop, which no other child shares.
     pub fn window_classes(&self) -> Vec<String> {
-        self._desktop.window_classes()
+        self._desktop
+            .as_ref()
+            .expect("this child has no desktop of its own")
+            .window_classes()
     }
 
     /// Wait for the child to exit and return its exit code. A child still running after

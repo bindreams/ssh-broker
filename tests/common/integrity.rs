@@ -1,25 +1,24 @@
-//! Running a child of this process's own user at a lower mandatory integrity level, and reading a
-//! process's own level. Lowering one's own integrity needs no privilege and no elevation.
+//! Running a child of this process's own user at a chosen mandatory integrity level, and reading a
+//! process's own level. Lowering one's own integrity needs no privilege and no elevation; the start
+//! itself is [`account::spawn_with_token`](crate::account::spawn_with_token).
 #![allow(dead_code)]
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
+use ssh_broker::acl::Sid;
 use ssh_broker::winutil::OwnedHandle;
 use windows::Win32::Foundation::{HANDLE, HLOCAL, LocalFree};
 use windows::Win32::Security::Authorization::ConvertStringSidToSidW;
 use windows::Win32::Security::{
-    DuplicateTokenEx, GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, PSID, SID_AND_ATTRIBUTES,
-    SecurityImpersonation, SetTokenInformation, TOKEN_ALL_ACCESS, TOKEN_DUPLICATE, TOKEN_MANDATORY_LABEL, TOKEN_QUERY,
-    TokenIntegrityLevel, TokenPrimary,
+    DuplicateTokenEx, GetLengthSid, GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, PSID,
+    SID_AND_ATTRIBUTES, SecurityImpersonation, SetTokenInformation, TOKEN_ALL_ACCESS, TOKEN_DUPLICATE,
+    TOKEN_MANDATORY_LABEL, TOKEN_QUERY, TokenIntegrityLevel, TokenPrimary,
 };
-use windows::Win32::System::Threading::{
-    CREATE_NO_WINDOW, CreateProcessAsUserW, GetCurrentProcess, OpenProcessToken, PROCESS_INFORMATION, STARTUPINFOW,
-    TerminateProcess,
-};
-use windows::core::{PCWSTR, PWSTR};
+use windows::Win32::System::Threading::{CREATE_NO_WINDOW, GetCurrentProcess, OpenProcessToken};
+use windows::core::PCWSTR;
 
-use crate::account::wide;
-use crate::{bounded_wait, hard_errors};
+use crate::account::{Starter, is_elevated, spawn_with_token, wide};
+use crate::desktop::PrivateDesktop;
 
 /// `SE_GROUP_INTEGRITY`: the attribute of a token's integrity label (the `windows` crate has no constant).
 const SE_GROUP_INTEGRITY: u32 = 0x20;
@@ -55,17 +54,15 @@ pub fn current_rid() -> u32 {
     }
 }
 
-/// Start `exe` with `command_line` as this process's user at the Low integrity level and return its
-/// exit code. The child is a copy of this process's token with only its label lowered, so what
-/// separates it from a Medium child is the integrity check and nothing else. A child that does not
-/// exit fails the test through [`bounded_wait`].
-pub fn run_at_low(exe: &Path, command_line: &str, cwd: &Path) -> u32 {
+/// A primary token that is a copy of this process's, with its mandatory integrity label set to `rid`.
+/// Lowering the label (or keeping it) needs no privilege.
+fn token_at(rid: u32) -> OwnedHandle {
     let mut own = HANDLE::default();
     let mut primary = HANDLE::default();
-    let mut low_sid = PSID::default();
+    let mut label_sid = PSID::default();
     // SAFETY: valid in/out handles and pointers; every handle is closed by `OwnedHandle`, the SID
     // allocation is freed below, and every buffer outlives the call that reads it.
-    let (process, pid) = unsafe {
+    unsafe {
         OpenProcessToken(GetCurrentProcess(), TOKEN_DUPLICATE | TOKEN_QUERY, &mut own).expect("open the process token");
         let own = OwnedHandle(own);
         DuplicateTokenEx(
@@ -79,59 +76,57 @@ pub fn run_at_low(exe: &Path, command_line: &str, cwd: &Path) -> u32 {
         .expect("duplicate the token as a primary token");
         let primary = OwnedHandle(primary);
 
-        ConvertStringSidToSidW(PCWSTR(wide("S-1-16-4096").as_ptr()), &mut low_sid).expect("parse the Low label SID");
+        ConvertStringSidToSidW(PCWSTR(wide(&format!("S-1-16-{rid}")).as_ptr()), &mut label_sid)
+            .expect("parse the label SID");
         let label = TOKEN_MANDATORY_LABEL {
             Label: SID_AND_ATTRIBUTES {
-                Sid: low_sid,
+                Sid: label_sid,
                 Attributes: SE_GROUP_INTEGRITY,
             },
         };
         // The size is the structure and the SID it points at, as the API documents.
-        let sid_len = windows::Win32::Security::GetLengthSid(low_sid);
-        SetTokenInformation(
+        let sid_len = GetLengthSid(label_sid);
+        let set = SetTokenInformation(
             primary.0,
             TokenIntegrityLevel,
             &label as *const _ as *const core::ffi::c_void,
             std::mem::size_of::<TOKEN_MANDATORY_LABEL>() as u32 + sid_len,
-        )
-        .expect("lower the token's integrity level to Low");
-
-        let mut command = wide(command_line);
-        let exe_w = wide(&exe.to_string_lossy());
-        let cwd_w = wide(&cwd.to_string_lossy());
-        let startup = STARTUPINFOW {
-            cb: std::mem::size_of::<STARTUPINFOW>() as u32,
-            ..Default::default()
-        };
-        let mut info = PROCESS_INFORMATION::default();
-        let created = CreateProcessAsUserW(
-            Some(primary.0),
-            PCWSTR(exe_w.as_ptr()),
-            Some(PWSTR(command.as_mut_ptr())),
-            None,
-            None,
-            false,
-            CREATE_NO_WINDOW,
-            None,
-            PCWSTR(cwd_w.as_ptr()),
-            &startup,
-            &mut info,
         );
-        let _ = LocalFree(Some(HLOCAL(low_sid.0)));
-        created.unwrap_or_else(|e| panic!("start {exe:?} at Low integrity: {e}"));
-        let _ = OwnedHandle(info.hThread);
-        (OwnedHandle(info.hProcess), info.dwProcessId)
-    };
-    if let Err(e) = hard_errors::suppress_hard_error_boxes(process.0) {
-        // SAFETY: the handle is the live process created above.
-        let _ = unsafe { TerminateProcess(process.0, 1) };
-        panic!("switch off the hard-error boxes of {exe:?}: {e}");
+        let _ = LocalFree(Some(HLOCAL(label_sid.0)));
+        set.unwrap_or_else(|e| panic!("set the token's integrity level to {rid:#x}: {e}"));
+        primary
     }
-    bounded_wait::wait_for_exit(
-        process.0,
-        pid,
-        &format!("{exe:?} at Low integrity"),
-        bounded_wait::CHILD_EXIT_BOUND,
-        &[],
-    )
+}
+
+/// Run `exe` with `command_line` as this process's user at mandatory integrity level `rid` ([`LOW`],
+/// [`MEDIUM`]) and return its exit code. The child's token is a copy of this process's with only its
+/// label set, so two levels differ in the integrity check and nothing else. It starts through
+/// [`spawn_with_token`]; a child that does not exit fails the test with `evidence` printed.
+///
+/// An elevated process gives the child a window station and desktop of its own, labelled at `rid`: a
+/// pair without a label is Medium, and a Low child cannot write to it. An unelevated process may not
+/// name a window station, so the child takes this process's own, which an interactive user's Low
+/// processes use anyway.
+pub fn run_at(rid: u32, exe: &Path, command_line: &str, cwd: &Path, evidence: &[PathBuf]) -> u32 {
+    let private = is_elevated().then(|| {
+        let user = Sid::current_user().unwrap().to_sddl().unwrap();
+        PrivateDesktop::create_labelled(&[&user], Some(rid))
+            .unwrap_or_else(|e| panic!("create a window station and desktop at integrity {rid:#x}: {e}"))
+    });
+    let token = token_at(rid);
+    let child = spawn_with_token(
+        Starter::AsUser,
+        token.0,
+        &format!("this user at integrity {rid:#x}"),
+        private,
+        exe,
+        command_line,
+        cwd,
+        evidence,
+        None,
+        None,
+        CREATE_NO_WINDOW,
+    );
+    child.resume();
+    child.wait()
 }
