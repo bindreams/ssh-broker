@@ -184,7 +184,6 @@ fn a_refused_private_folder_is_said_to_be_the_reason_there_is_no_log() {
 
     let no_log = open_for_location(&loc, &Sid::current_user().unwrap(), "shim.log").expect_err("a widened folder");
 
-    assert!(no_log.folder_refused, "{no_log}");
     assert!(no_log.cause.is::<acl::Refused>(), "{no_log}");
     assert!(
         no_log.to_string().contains(&loc.dir().display().to_string()),
@@ -193,28 +192,16 @@ fn a_refused_private_folder_is_said_to_be_the_reason_there_is_no_log() {
 }
 
 #[test]
-fn a_refused_logs_folder_alone_costs_the_log_and_is_not_the_private_folders_refusal() {
+fn a_refused_logs_folder_alone_costs_the_log() {
     let (_profile, loc) = widened("log-wide-logs", true);
 
     let no_log = open_for_location(&loc, &Sid::current_user().unwrap(), "shim.log").expect_err("a widened logs folder");
 
-    assert!(!no_log.folder_refused, "{no_log}");
     assert!(no_log.cause.is::<acl::Refused>(), "{no_log}");
     assert!(
         no_log.to_string().contains(&loc.logs_dir().display().to_string()),
         "{no_log}"
     );
-}
-
-#[test]
-fn a_failure_that_is_not_a_refusal_is_not_said_to_be_one() {
-    let profile = TempProfile::new("log-noprofile-flag");
-    std::fs::remove_dir_all(profile.0.join("AppData")).unwrap();
-
-    let no_log = open_for_location(&profile.location(), &Sid::current_user().unwrap(), "shim.log")
-        .expect_err("no profile, no log");
-
-    assert!(!no_log.folder_refused, "{no_log}");
 }
 
 // A link above the log -----------------------------------------------------------------------

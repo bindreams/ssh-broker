@@ -371,7 +371,9 @@ fn refuse_other_names(handle: &OwnedHandle, path: &Path, purpose: &str) -> anyho
         .nNumberOfLinks;
     if links > 1 {
         return Err(Refused(format!(
-            "{} cannot be used {purpose}: it has {links} names, so it is a hard link to a file that is not this              folder's own. Nothing is read or written through it; remove it so that the name is a file of this              folder",
+            "{} cannot be used {purpose}: it has {links} names, so it is a hard link to a file that is not this \
+             folder's own. Nothing is read or written through it; remove it so that the name is a file of this \
+             folder",
             path.display()
         ))
         .into());

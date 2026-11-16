@@ -56,14 +56,9 @@ const EVT_FOCUS: u16 = 0x0010;
 pub fn run_on(exec: Option<RawExec>, detect: impl FnOnce() -> Encoding) -> anyhow::Result<()> {
     // A log that cannot be set up never stops the shim. The cause is kept, to be said where the
     // shim already explains a fallback to the user.
-    let (log, log_failure, folder_refusal) = match crate::filelog::init_for_current_user("shim.log") {
-        Ok(guard) => (Some(guard), None, None),
-        Err(no_log) => {
-            let why = no_log.to_string();
-            // The private folder refused for the log is refused for the agent too: the offer is told.
-            let refusal = no_log.folder_refused.then(|| why.clone());
-            (None, Some(why), refusal)
-        }
+    let (log, log_failure) = match crate::filelog::init_for_current_user("shim.log") {
+        Ok(guard) => (Some(guard), None),
+        Err(no_log) => (None, Some(no_log.to_string())),
     };
     let exec = exec.map(|exec| resolve_exec(exec, detect));
     if exec.as_ref().is_some_and(|exec| is_blank_command(&exec.command)) {
@@ -85,7 +80,7 @@ pub fn run_on(exec: Option<RawExec>, detect: impl FnOnce() -> Encoding) -> anyho
         crate::userdir::current_socket_location,
         log_failure.as_deref(),
         std::io::stdin(),
-        &mut Prompting { folder_refusal },
+        &mut Prompting,
     ) {
         Ok(Some(code)) => {
             drop(log); // flush the appender before process::exit

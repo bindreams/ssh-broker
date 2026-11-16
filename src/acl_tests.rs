@@ -779,6 +779,28 @@ fn ensure_private_dir_says_so_when_the_folders_security_cannot_be_read() {
     assert!(!text.contains("make"), "a look never makes anything: {text}");
 }
 
+/// A component of the profile that this process may not open is a system error of the walk, not a
+/// refusal and not a missing name: the shim shows every one of them (`shim_offer::refusal_of`).
+#[test]
+fn a_profile_folder_that_cannot_be_opened_is_a_system_error_naming_it() {
+    let parent = TempPath::new("walk-denied");
+    let me_sid = Sid::current_user().unwrap();
+    let me = me_sid.to_sddl().unwrap();
+    std::fs::create_dir_all(parent.0.join("Local")).unwrap();
+    set_security(
+        &parent.0.join("Local"),
+        &format!("O:{me}D:P(D;;RC;;;WD)(A;;;;;OW)(A;;0x10001;;;{me})"),
+    );
+    let root = open_root(&parent.0).unwrap();
+
+    let err = without_privileges(|| open_dir(&root, "Local").err().expect("denied"));
+
+    assert!(!err.is::<Refused>() && !err.is::<Missing>(), "{err:#}");
+    let text = format!("{err:#}");
+    assert!(text.contains(&parent.0.join("Local").display().to_string()), "{text}");
+    assert!(text.to_lowercase().contains("denied"), "{text}");
+}
+
 #[test]
 fn the_owner_and_the_acl_are_blamed_separately_with_the_wording_of_each_kind_of_object() {
     for (owner_set, acl_is) in [

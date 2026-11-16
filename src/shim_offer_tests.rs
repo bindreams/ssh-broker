@@ -116,17 +116,69 @@ fn a_refused_private_folder_adds_no_line_for_a_command_whose_fail_open_line_carr
     }
 }
 
+// the judgement of the folder -----
+
+use crate::test_support::{TempProfile, junction, widen};
+
+fn me() -> Sid {
+    Sid::current_user().unwrap()
+}
+
 #[test]
-fn the_rescue_shows_a_refused_folder_on_stderr_and_offers_no_password_prompt() {
-    let profile = crate::test_support::TempProfile::new("rescue-refused");
-    let location = Ok(profile.location());
+fn a_folder_that_is_usable_or_not_there_yet_is_not_a_refusal() {
+    // A first login: nothing is made yet, at any depth.
+    let profile = TempProfile::new("fr-first");
+    assert_eq!(folder_refusal(&profile.location(), &me()), None, "no folder yet");
+    std::fs::remove_dir_all(profile.0.join("AppData")).unwrap();
+    assert_eq!(folder_refusal(&profile.location(), &me()), None, "no AppData yet");
+    let none = crate::test_support::location_in(&profile.0.join("none"));
+    assert_eq!(folder_refusal(&none, &me()), None, "no profile directory yet");
+
+    let usable = TempProfile::new("fr-ok");
+    crate::userdir::ensure_socket_dir(&usable.location(), &me()).unwrap();
+    assert_eq!(folder_refusal(&usable.location(), &me()), None, "an exact folder");
+}
+
+#[test]
+fn a_refused_logs_folder_alone_does_not_make_the_private_folder_refused() {
+    let profile = TempProfile::new("fr-logs");
+    let location = profile.location();
+    crate::userdir::ensure_socket_dir(&location, &me()).unwrap();
+    widen(&location.logs_dir());
+
+    assert_eq!(folder_refusal(&location, &me()), None);
+}
+
+#[test]
+fn every_failure_of_the_walk_but_a_missing_name_is_a_refusal_with_its_own_text() {
+    let missing = {
+        let profile = TempProfile::new("fr-miss");
+        let root = crate::acl::open_root(&profile.0).unwrap();
+        crate::acl::open_dir(&root, "Nothing").err().unwrap()
+    };
+    assert_eq!(refusal_of(Err(missing)), None);
+    assert_eq!(refusal_of(Ok(())), None);
+
+    // A system error of the walk (access denied at `Local`, an untrusted mount point at a followed
+    // link) is not a `Refused`, and is shown all the same.
+    for code in [
+        windows::Win32::Foundation::ERROR_ACCESS_DENIED,
+        windows::Win32::Foundation::ERROR_UNTRUSTED_MOUNT_POINT,
+    ] {
+        let system = anyhow::Error::from(windows::core::Error::from(windows::core::HRESULT::from_win32(code.0)))
+            .context("open p/AppData/Local");
+        assert!(!system.is::<crate::acl::Refused>());
+        let shown = refusal_of(Err(system)).expect("a system error is shown");
+        assert!(shown.starts_with("open p/AppData/Local: "), "{shown}");
+    }
+}
+
+/// What the rescue of an interactive login for `location` shows, and how it goes on.
+fn rescued_interactively(location: SocketLocation) -> (Rescued, String) {
+    let location = Ok(location);
     let connect = Err(anyhow::anyhow!("a connect that failed for no OS reason"));
     let mut shown = Vec::new();
-    let mut rescue = Prompting {
-        folder_refusal: Some(REFUSAL.into()),
-    };
-
-    let rescued = rescue.rescue(
+    let rescued = Prompting.rescue(
         &Absent {
             exec: false,
             location: &location,
@@ -134,11 +186,41 @@ fn the_rescue_shows_a_refused_folder_on_stderr_and_offers_no_password_prompt() {
         },
         &mut shown,
     );
+    (rescued, String::from_utf8(shown).unwrap())
+}
+
+#[test]
+fn a_login_whose_folder_has_the_wrong_acl_is_told_why_and_gets_the_plain_shell_without_a_prompt() {
+    let profile = TempProfile::new("rs-acl");
+    let location = profile.location();
+    crate::userdir::ensure_socket_dir(&location, &me()).unwrap();
+    widen(location.dir());
+
+    let (rescued, shown) = rescued_interactively(location.clone());
 
     assert!(matches!(rescued, Rescued::Plain));
-    assert_eq!(
-        String::from_utf8(shown).unwrap(),
-        format!("{}\n", text::folder_refused(REFUSAL))
+    assert!(shown.starts_with("ssh-broker: no session is offered"), "{shown:?}");
+    assert!(shown.contains("its ACL is not exactly"), "{shown:?}");
+    assert!(shown.contains(&location.dir().display().to_string()), "{shown:?}");
+    assert!(shown.contains("remove"), "the remedy: {shown:?}");
+}
+
+#[test]
+fn a_login_whose_way_to_the_folder_has_a_link_is_told_why_and_gets_the_plain_shell_without_a_prompt() {
+    let profile = TempProfile::new("rs-link");
+    let local = profile.0.join(r"AppData\Local");
+    let elsewhere = profile.0.join("elsewhere");
+    std::fs::create_dir(&elsewhere).unwrap();
+    std::fs::remove_dir(&local).unwrap();
+    junction(&local, &elsewhere);
+
+    let (rescued, shown) = rescued_interactively(profile.location());
+
+    assert!(matches!(rescued, Rescued::Plain));
+    assert!(shown.contains("reparse point"), "{shown:?}");
+    assert!(
+        shown.contains(&local.display().to_string()),
+        "the link is named: {shown:?}"
     );
 }
 
@@ -398,6 +480,22 @@ fn an_interactive_login_whose_folder_is_refused_is_told_on_the_terminal_and_gets
         "the link is named: {shown}"
     );
     assert!(shown.contains("remove"), "the remedy: {shown}");
+}
+
+#[test]
+fn a_folder_that_fails_with_a_system_error_after_it_was_judged_is_told_in_the_same_line() {
+    let denied = windows::core::Error::from(windows::core::HRESULT::from_win32(
+        windows::Win32::Foundation::ERROR_ACCESS_DENIED.0,
+    ));
+    let err = anyhow::Error::new(FolderFailed(anyhow::Error::new(denied).context("open p/AppData/Local")));
+    let mut shown = Vec::new();
+
+    let rescued = starting_failed(&err, false, &mut shown);
+
+    assert!(matches!(rescued, Rescued::Plain));
+    let shown = String::from_utf8(shown).unwrap();
+    assert!(shown.starts_with("ssh-broker: no session is offered"), "{shown:?}");
+    assert!(shown.contains("open p/AppData/Local"), "{shown:?}");
 }
 
 #[test]
