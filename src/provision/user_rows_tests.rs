@@ -70,10 +70,11 @@ fn socket_dir_row_fails_for_a_widened_dir() {
         .unwrap();
     assert!(status.success());
 
-    let row = socket_dir_row(&Ok(loc), &me());
+    let row = socket_dir_row(&Ok(loc.clone()), &me());
 
     assert!(!row.pass);
-    assert!(row.detail.contains("does not grant exactly"), "{}", row.detail);
+    assert!(row.detail.contains(&loc.dir.display().to_string()), "{}", row.detail);
+    assert!(row.detail.contains("remove"), "{}", row.detail);
 }
 
 #[test]
@@ -135,10 +136,15 @@ fn log_folder_row_fails_for_a_widened_logs_folder() {
         .unwrap();
     assert!(status.success());
 
-    let row = log_folder_row(&Ok(loc), &me());
+    let row = log_folder_row(&Ok(loc.clone()), &me());
 
     assert!(!row.pass);
-    assert!(row.detail.contains("does not grant exactly"), "{}", row.detail);
+    assert!(
+        row.detail.contains(&loc.logs_dir().display().to_string()),
+        "{}",
+        row.detail
+    );
+    assert!(row.detail.contains("remove"), "{}", row.detail);
 }
 
 #[test]
@@ -146,6 +152,49 @@ fn log_folder_row_fails_when_there_is_no_location() {
     let row = log_folder_row(&too_long_location(), &me());
     assert!(!row.pass);
     assert!(row.detail.contains("no socket location"), "{}", row.detail);
+}
+
+// links and what the rows leave alone ----------------------------------------------------------
+
+/// A stand-in profile whose `Local` is a junction to the `Local` of a profile with an exact folder: the
+/// by-path judgement of the folder passes, the by-handle walk of the agent refuses.
+fn profile_with_local_linked_to_an_exact_folder(tag: &str) -> (TempProfile, TempProfile) {
+    let profile = TempProfile::new(tag);
+    let outside = TempProfile::new(&format!("{tag}-o"));
+    ensure_socket_dir(&outside.location(), &me()).unwrap();
+    let local = profile.0.join(r"AppData\Local");
+    std::fs::remove_dir(&local).unwrap();
+    crate::test_support::junction(&local, &outside.0.join(r"AppData\Local"));
+    assert!(
+        acl::verify_dir_acl(&profile.location().dir, &me()).unwrap(),
+        "control: judged by path, the folder behind the link is exact"
+    );
+    (profile, outside)
+}
+
+#[test]
+fn the_folder_rows_fail_for_a_link_on_the_way_and_name_it() {
+    let (profile, _outside) = profile_with_local_linked_to_an_exact_folder("row-link");
+    let loc = profile.location();
+    let local = profile.0.join(r"AppData\Local").display().to_string();
+
+    for row in [socket_dir_row(&Ok(loc.clone()), &me()), log_folder_row(&Ok(loc), &me())] {
+        assert!(!row.pass, "{}: {}", row.name, row.detail);
+        assert!(row.detail.contains(&local), "{}: {}", row.name, row.detail);
+        assert!(row.detail.contains("reparse point"), "{}: {}", row.name, row.detail);
+    }
+    std::fs::remove_dir(profile.0.join(r"AppData\Local")).unwrap();
+}
+
+#[test]
+fn the_folder_rows_create_and_change_nothing() {
+    let profile = TempProfile::new("row-nothing");
+    let before = crate::test_support::tree_state(&profile.0);
+
+    let _ = socket_dir_row(&Ok(profile.location()), &me());
+    let _ = log_folder_row(&Ok(profile.location()), &me());
+
+    assert_eq!(crate::test_support::tree_state(&profile.0), before);
 }
 
 // socket file ACL ---------------------------------------------------------------------------

@@ -130,6 +130,41 @@ fn a_widened_folder_is_refused_and_left_untouched() {
     );
 }
 
+/// `Local` of a stand-in profile, opened by the walk.
+fn local_of(profile: &TempProfile) -> DirHandle {
+    open_dir(&open_dir(&open_root(&profile.0).unwrap(), "AppData").unwrap(), "Local").unwrap()
+}
+
+#[test]
+fn looking_at_the_private_folder_makes_nothing_and_a_missing_one_is_missing() {
+    let profile = TempProfile::new("look-miss");
+    let before = tree_state(&profile.0);
+
+    let err = open_private_dir(&local_of(&profile), "ssh-broker", &me())
+        .err()
+        .unwrap();
+
+    assert!(err.is::<Missing>(), "{err:#}");
+    assert_eq!(tree_state(&profile.0), before);
+}
+
+#[test]
+fn looking_at_the_private_folder_passes_an_exact_one_and_refuses_a_widened_one_as_ensure_does() {
+    let profile = TempProfile::new("look-wide");
+    let (broker, _) = made(&profile);
+    open_private_dir(&local_of(&profile), "ssh-broker", &me()).expect("exact");
+
+    icacls(broker.path(), &["/grant", "*S-1-1-0:(OI)(CI)F"]);
+    let before = tree_state(&profile.0);
+    let err = open_private_dir(&local_of(&profile), "ssh-broker", &me())
+        .err()
+        .unwrap();
+
+    assert!(err.is::<Refused>(), "{err:#}");
+    assert!(format!("{err:#}").contains("remove"), "{err:#}");
+    assert_eq!(tree_state(&profile.0), before);
+}
+
 #[test]
 fn a_file_at_the_name_is_refused_and_left_untouched() {
     let profile = TempProfile::new("file");

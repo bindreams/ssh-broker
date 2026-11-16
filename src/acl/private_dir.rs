@@ -19,8 +19,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use windows::Wdk::Storage::FileSystem::{
-    FILE_DIRECTORY_FILE, FILE_NON_DIRECTORY_FILE, FILE_OPEN_IF, FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT,
-    NTCREATEFILE_CREATE_DISPOSITION, NTCREATEFILE_CREATE_OPTIONS, NtCreateFile,
+    FILE_DIRECTORY_FILE, FILE_NON_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_IF, FILE_OPEN_REPARSE_POINT,
+    FILE_SYNCHRONOUS_IO_NONALERT, NTCREATEFILE_CREATE_DISPOSITION, NTCREATEFILE_CREATE_OPTIONS, NtCreateFile,
 };
 use windows::Win32::Foundation::{
     DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE, NTSTATUS, STATUS_NOT_A_DIRECTORY, STATUS_OBJECT_NAME_NOT_FOUND,
@@ -133,17 +133,31 @@ pub fn open_dir(parent: &DirHandle, name: &str) -> anyhow::Result<DirHandle> {
 /// Administrators} and whose ACL is exactly the private one. One that is not is refused and left
 /// untouched. Nothing existing is modified.
 pub fn ensure_private_dir(parent: &DirHandle, name: &str, user: &Sid) -> anyhow::Result<DirHandle> {
+    private_dir(parent, name, user, true)
+}
+
+/// [`ensure_private_dir`] for a caller that only looks (`verify`): the same open and the same
+/// judgement, and a folder that is not there is [`Missing`] and is not made.
+pub fn open_private_dir(parent: &DirHandle, name: &str, user: &Sid) -> anyhow::Result<DirHandle> {
+    private_dir(parent, name, user, false)
+}
+
+fn private_dir(parent: &DirHandle, name: &str, user: &Sid, create: bool) -> anyhow::Result<DirHandle> {
     let units = single_name(name)?;
     let path = parent.path.join(name);
     let purpose = "as the private folder";
-    let descriptor = descriptor_from_sddl(&private_dir_dacl_sddl(user)?)?;
+    let descriptor = if create {
+        Some(descriptor_from_sddl(&private_dir_dacl_sddl(user)?)?)
+    } else {
+        None
+    };
     let made = create_nt(
         Some(parent.raw()),
         &units,
         DIR_ACCESS,
-        FILE_OPEN_IF,
+        if create { FILE_OPEN_IF } else { FILE_OPEN },
         FILE_DIRECTORY_FILE.0 | FILE_OPEN_REPARSE_POINT.0,
-        Some(descriptor.0),
+        descriptor.as_ref().map(|descriptor| descriptor.0),
     )?;
     let handle = opened(made.status, made.handle, &path, purpose)?;
     refuse_link(&handle, &path, purpose)?;

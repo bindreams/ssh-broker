@@ -107,13 +107,28 @@ pub struct SocketDir {
 /// A refusal of the socket folder (or of the way to it) is this function's error. A refusal of
 /// `logs` alone is in [`SocketDir::logs`], with the socket folder still open.
 pub fn open_socket_dir(loc: &SocketLocation, user: &Sid) -> anyhow::Result<SocketDir> {
-    let make = || -> anyhow::Result<DirHandle> {
-        let local = open_local(loc)?;
-        acl::ensure_private_dir(&local, socket_loc::SOCKET_DIR_NAME, user)
-    };
-    let dir = make().with_context(|| format!("make the private folder {}", loc.dir.display()))?;
-    let logs = acl::ensure_private_dir(&dir, socket_loc::LOGS_DIR_NAME, user)
-        .with_context(|| format!("make the log folder {}", loc.logs_dir().display()));
+    walk(loc, "make", |parent, name| acl::ensure_private_dir(parent, name, user))
+}
+
+/// [`open_socket_dir`] for a caller that only looks (`verify`): the same walk, and the same judgement
+/// of each folder, and nothing is made. A folder that is not there is [`acl::Missing`], in the error
+/// for the socket folder and in [`SocketDir::logs`] for `logs`.
+pub fn inspect_socket_dir(loc: &SocketLocation, user: &Sid) -> anyhow::Result<SocketDir> {
+    walk(loc, "look at", |parent, name| acl::open_private_dir(parent, name, user))
+}
+
+/// The walk of [`open_socket_dir`] and [`inspect_socket_dir`]; `step` makes or opens the private
+/// folder `name` under `parent`.
+fn walk(
+    loc: &SocketLocation,
+    verb: &str,
+    step: impl Fn(&DirHandle, &str) -> anyhow::Result<DirHandle>,
+) -> anyhow::Result<SocketDir> {
+    let dir = open_local(loc)
+        .and_then(|local| step(&local, socket_loc::SOCKET_DIR_NAME))
+        .with_context(|| format!("{verb} the private folder {}", loc.dir.display()))?;
+    let logs = step(&dir, socket_loc::LOGS_DIR_NAME)
+        .with_context(|| format!("{verb} the log folder {}", loc.logs_dir().display()));
     Ok(SocketDir { dir, logs })
 }
 
