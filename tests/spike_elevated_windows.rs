@@ -15,6 +15,9 @@
 //!   do a standard account's child and a child under the runner's real sshd (the baseline).
 //! - M3: whether a mandatory integrity label keeps lower-integrity processes of the same user off the
 //!   socket and out of its folder.
+//! - M4: what an elevated administrator process gets when it starts children with a reduced copy of its
+//!   own token (integrity lowered, a `LUA_TOKEN` restricted token, a Safer normal-user token, the linked
+//!   token), and whether such a child is kept from climbing back: what it can create, open and connect to.
 //!
 //! Not exercised: the auto-login task of the product's design has a *logon trigger* and a group
 //! principal (it starts when a user logs on interactively). A CI service context has no interactive
@@ -36,25 +39,34 @@ use ssh_broker::socket_loc::{self, SocketLocation};
 use ssh_broker::userdir;
 use ssh_broker::winutil::OwnedHandle;
 use windows::Win32::Foundation::{ERROR_SUCCESS, HANDLE, HLOCAL, LocalFree};
+use windows::Win32::Security::AppLocker::{
+    SAFER_COMPUTE_TOKEN_FROM_LEVEL_FLAGS, SAFER_LEVEL_OPEN, SAFER_LEVELID_NORMALUSER, SAFER_SCOPEID_USER,
+    SaferCloseLevel, SaferComputeTokenFromLevel, SaferCreateLevel,
+};
 use windows::Win32::Security::Authorization::{
     ConvertSecurityDescriptorToStringSecurityDescriptorW, ConvertSidToStringSidW,
-    ConvertStringSecurityDescriptorToSecurityDescriptorW, GetNamedSecurityInfoW, SDDL_REVISION_1, SE_FILE_OBJECT,
-    SetNamedSecurityInfoW,
+    ConvertStringSecurityDescriptorToSecurityDescriptorW, ConvertStringSidToSidW, GetNamedSecurityInfoW,
+    SDDL_REVISION_1, SE_FILE_OBJECT, SetNamedSecurityInfoW,
 };
 use windows::Win32::Security::{
-    ACL, DuplicateTokenEx, GetSecurityDescriptorSacl, GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation,
-    LABEL_SECURITY_INFORMATION, LOGON32_LOGON, LOGON32_LOGON_BATCH, LOGON32_LOGON_INTERACTIVE,
-    LOGON32_PROVIDER_DEFAULT, LogonUserW, PSECURITY_DESCRIPTOR, SecurityImpersonation, TOKEN_ALL_ACCESS, TOKEN_GROUPS,
-    TOKEN_INFORMATION_CLASS, TOKEN_LINKED_TOKEN, TOKEN_MANDATORY_LABEL, TOKEN_QUERY, TokenElevation,
+    ACL, CreateRestrictedToken, DuplicateTokenEx, GetLengthSid, GetSecurityDescriptorSacl, GetSidSubAuthority,
+    GetSidSubAuthorityCount, GetTokenInformation, LABEL_SECURITY_INFORMATION, LOGON32_LOGON, LOGON32_LOGON_BATCH,
+    LOGON32_LOGON_INTERACTIVE, LOGON32_PROVIDER_DEFAULT, LUA_TOKEN, LogonUserW, LookupPrivilegeNameW,
+    PSECURITY_DESCRIPTOR, PSID, SAFER_LEVEL_HANDLE, SECURITY_ATTRIBUTES, SID_AND_ATTRIBUTES, SecurityImpersonation,
+    SetTokenInformation, TOKEN_ALL_ACCESS, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_GROUPS,
+    TOKEN_INFORMATION_CLASS, TOKEN_LINKED_TOKEN, TOKEN_MANDATORY_LABEL, TOKEN_PRIVILEGES, TOKEN_QUERY, TokenElevation,
     TokenElevationType, TokenGroups, TokenImpersonationLevel, TokenIntegrityLevel, TokenLinkedToken, TokenPrimary,
-    TokenType,
+    TokenPrivileges, TokenType,
 };
+use windows::Win32::Storage::FileSystem::CreateDirectoryW;
 use windows::Win32::System::Registry::{
-    HKEY, HKEY_CURRENT_USER, HKEY_USERS, KEY_QUERY_VALUE, RegCloseKey, RegOpenKeyExW,
+    HKEY, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, HKEY_USERS, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_SAM_FLAGS,
+    RegCloseKey, RegOpenKeyExW,
 };
 use windows::Win32::System::Threading::{
     CREATE_NO_WINDOW, CREATE_PROCESS_LOGON_FLAGS, CreateProcessWithLogonW, GetCurrentProcess,
-    GetProcessMitigationPolicy, LOGON_WITH_PROFILE, OpenProcessToken, PROCESS_INFORMATION,
+    GetProcessMitigationPolicy, LOGON_WITH_PROFILE, OpenProcess, OpenProcessToken, PROCESS_ACCESS_RIGHTS,
+    PROCESS_CREATE_THREAD, PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_VM_WRITE,
     ProcessRedirectionTrustPolicy, STARTUPINFOW,
 };
 use windows::core::{BOOL, PCWSTR, PWSTR};
@@ -257,10 +269,10 @@ fn redirection_trust() -> String {
     }
 }
 
-fn registry_open(root: HKEY, subkey: &str) -> String {
+fn registry_open(root: HKEY, subkey: &str, access: REG_SAM_FLAGS) -> String {
     let mut key = HKEY::default();
     // SAFETY: a NUL-terminated name and a valid out-pointer; the key is closed below.
-    let rc = unsafe { RegOpenKeyExW(root, PCWSTR(wide(subkey).as_ptr()), None, KEY_QUERY_VALUE, &mut key) };
+    let rc = unsafe { RegOpenKeyExW(root, PCWSTR(wide(subkey).as_ptr()), None, access, &mut key) };
     if rc == ERROR_SUCCESS {
         // SAFETY: the key just opened.
         let _ = unsafe { RegCloseKey(key) };
@@ -305,9 +317,9 @@ fn uac_policy() -> String {
 
 // The child halves =====
 
-/// What this process is, as `key=value` lines: the facts every start of M1 is judged by, then M2's three
-/// link reads. Never panics: a fact that cannot be read says why.
-fn self_report(input: &str) -> String {
+/// What this process is, as `key=value` lines: the facts every start of M1 and M4 is judged by. Never
+/// panics: a fact that cannot be read says why.
+fn identity_report() -> String {
     let token = own_token();
     let mut out = token_facts(token.0);
     let mut put = |key: &str, text: String| out.push_str(&format!("{key}={text}\n"));
@@ -322,8 +334,11 @@ fn self_report(input: &str) -> String {
         .and_then(|sid| sid.to_sddl())
         .unwrap_or_else(|e| format!("unreadable: {e:#}"));
     put("user_sid", user_sid.clone());
-    put("hkcu_opens", registry_open(HKEY_CURRENT_USER, ""));
-    put("hku_user_hive_opens", registry_open(HKEY_USERS, &user_sid));
+    put("hkcu_opens", registry_open(HKEY_CURRENT_USER, "", KEY_QUERY_VALUE));
+    put(
+        "hku_user_hive_opens",
+        registry_open(HKEY_USERS, &user_sid, KEY_QUERY_VALUE),
+    );
     let userprofile = std::env::var("USERPROFILE").unwrap_or_else(|e| format!("unreadable: {e}"));
     let token_profile = userdir::profile_dir_of_token(token.0).map(|p| p.display().to_string());
     put("env_userprofile", userprofile.clone());
@@ -341,7 +356,13 @@ fn self_report(input: &str) -> String {
     );
     put("dpapi_round_trips", probe::dpapi_roundtrip(b"spike").to_string());
     put("redirection_trust_policy", redirection_trust());
+    out
+}
 
+/// [`identity_report`], then M2's three link reads.
+fn self_report(input: &str) -> String {
+    let mut out = identity_report();
+    let mut put = |key: &str, text: String| out.push_str(&format!("{key}={text}\n"));
     for key in ["junction_unelevated", "junction_elevated", "symlink_elevated"] {
         let link = PathBuf::from(value(input, key));
         let read = match std::fs::read_to_string(link.join("probe.txt")) {
@@ -1280,4 +1301,524 @@ fn m3b_socket_labelled_high() {
 #[test]
 fn m3c_folder_labelled_high_before_the_bind() {
     m3(Labelled::FolderHigh, "m3c");
+}
+
+// M4: children started with a reduced copy of the elevated token =====
+
+/// A directory only Administrators and SYSTEM may use: the shape of the install directory (without its
+/// read grant to Users, which only widens it).
+const ADMIN_ONLY_DIR_SDDL: &str = "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)";
+
+/// `CreateDirectoryW` with the descriptor in `sddl`.
+fn make_dir_with_sddl(path: &Path, sddl: &str) {
+    let mut sd = PSECURITY_DESCRIPTOR::default();
+    // SAFETY: NUL-terminated inputs; the descriptor outlives the call and is freed after it.
+    unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(PCWSTR(wide(sddl).as_ptr()), 1, &mut sd, None)
+            .unwrap_or_else(|e| panic!("parse {sddl}: {e}"));
+        let attributes = SECURITY_ATTRIBUTES {
+            nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: sd.0,
+            bInheritHandle: BOOL(0),
+        };
+        let made = CreateDirectoryW(PCWSTR(wide(&path.to_string_lossy()).as_ptr()), Some(&attributes));
+        let _ = LocalFree(Some(HLOCAL(sd.0)));
+        made.unwrap_or_else(|e| panic!("create {}: {e}", path.display()));
+    }
+}
+
+/// The process token as a base for deriving others: the access `CreateRestrictedToken` and the Safer
+/// calls need, and `CreateProcessAsUserW` on a copy.
+fn own_token_to_derive_from() -> OwnedHandle {
+    let mut token = HANDLE::default();
+    // SAFETY: valid out-pointer; the token is closed by `OwnedHandle`.
+    unsafe {
+        OpenProcessToken(
+            GetCurrentProcess(),
+            TOKEN_DUPLICATE | TOKEN_QUERY | TOKEN_ASSIGN_PRIMARY,
+            &mut token,
+        )
+    }
+    .expect("open the process token to derive from");
+    OwnedHandle(token)
+}
+
+/// A primary copy of `token` with every access, which a start can use.
+fn as_primary(token: HANDLE) -> Result<OwnedHandle, String> {
+    let mut copy = HANDLE::default();
+    // SAFETY: valid in/out handles; the copy is closed by `OwnedHandle`.
+    unsafe {
+        DuplicateTokenEx(
+            token,
+            TOKEN_ALL_ACCESS,
+            None,
+            SecurityImpersonation,
+            TokenPrimary,
+            &mut copy,
+        )
+    }
+    .map_err(|e| e.to_string())?;
+    Ok(OwnedHandle(copy))
+}
+
+/// Set the integrity label of `token` to `rid` (lowering needs no privilege).
+fn set_integrity(token: HANDLE, rid: u32) -> Result<(), String> {
+    let mut label_sid = PSID::default();
+    // SAFETY: NUL-terminated input; the SID allocation is freed after the call that reads it.
+    unsafe {
+        ConvertStringSidToSidW(PCWSTR(wide(&format!("S-1-16-{rid}")).as_ptr()), &mut label_sid)
+            .map_err(|e| format!("parse the label SID: {e}"))?;
+        let label = TOKEN_MANDATORY_LABEL {
+            Label: SID_AND_ATTRIBUTES {
+                Sid: label_sid,
+                Attributes: 0x20, // SE_GROUP_INTEGRITY
+            },
+        };
+        let set = SetTokenInformation(
+            token,
+            TokenIntegrityLevel,
+            (&raw const label).cast::<c_void>(),
+            size_of::<TOKEN_MANDATORY_LABEL>() as u32 + GetLengthSid(label_sid),
+        );
+        let _ = LocalFree(Some(HLOCAL(label_sid.0)));
+        set.map_err(|e| e.to_string())
+    }
+}
+
+/// `CreateRestrictedToken(LUA_TOKEN)` on `token`: what the UAC filter does to an administrator's token.
+fn lua_token(token: HANDLE) -> Result<OwnedHandle, String> {
+    let mut made = HANDLE::default();
+    // SAFETY: valid in/out handles; the new token is closed by `OwnedHandle`.
+    unsafe { CreateRestrictedToken(token, LUA_TOKEN, None, None, None, &mut made) }.map_err(|e| e.to_string())?;
+    Ok(OwnedHandle(made))
+}
+
+/// `SaferCreateLevel(USER, NORMALUSER)` and `SaferComputeTokenFromLevel` on `token`, no flags.
+fn safer_normal_user_token(token: HANDLE) -> Result<OwnedHandle, String> {
+    let mut level = SAFER_LEVEL_HANDLE::default();
+    // SAFETY: valid out-pointer; the level is closed below.
+    unsafe {
+        SaferCreateLevel(
+            SAFER_SCOPEID_USER,
+            SAFER_LEVELID_NORMALUSER,
+            SAFER_LEVEL_OPEN,
+            &mut level,
+            None,
+        )
+    }
+    .map_err(|e| format!("SaferCreateLevel: {e}"))?;
+    let mut made = HANDLE::default();
+    // SAFETY: the level just opened and valid handles; the new token is closed by `OwnedHandle`.
+    let computed = unsafe {
+        SaferComputeTokenFromLevel(
+            level,
+            Some(token),
+            &mut made,
+            SAFER_COMPUTE_TOKEN_FROM_LEVEL_FLAGS(0),
+            None,
+        )
+    };
+    // SAFETY: the level opened above.
+    let _ = unsafe { SaferCloseLevel(level) };
+    computed.map_err(|e| format!("SaferComputeTokenFromLevel: {e}"))?;
+    Ok(OwnedHandle(made))
+}
+
+/// The linked token of `token`, if it has one.
+fn linked_token(token: HANDLE) -> Result<OwnedHandle, String> {
+    let mut linked = TOKEN_LINKED_TOKEN::default();
+    let mut len = 0u32;
+    // SAFETY: a `TOKEN_LINKED_TOKEN` and its size; the handle is closed by `OwnedHandle`.
+    unsafe {
+        GetTokenInformation(
+            token,
+            TokenLinkedToken,
+            Some((&raw mut linked).cast::<c_void>()),
+            size_of::<TOKEN_LINKED_TOKEN>() as u32,
+            &mut len,
+        )
+    }
+    .map_err(|e| e.to_string())?;
+    Ok(OwnedHandle(linked.LinkedToken))
+}
+
+/// Whether the token has a linked token (a way back up), and what that is.
+fn linked_facts(token: HANDLE) -> String {
+    match linked_token(token) {
+        Ok(linked) => {
+            let facts: String = token_facts(linked.0)
+                .lines()
+                .map(|line| format!("linked_{line}\n"))
+                .collect();
+            format!("has_linked_token=true\n{facts}")
+        }
+        Err(e) => format!("has_linked_token=false ({e})\n"),
+    }
+}
+
+/// The privileges of the token: how many are enabled, and whether the two that would let a process
+/// climb back (`SeDebugPrivilege`, `SeImpersonatePrivilege`) are there.
+fn privilege_facts(token: HANDLE) -> String {
+    let buf = match token_info(token, TokenPrivileges) {
+        Ok(buf) => buf,
+        Err(e) => return format!("privileges=unreadable: {e}\n"),
+    };
+    let mut present: Vec<(String, bool)> = Vec::new();
+    // SAFETY: the buffer is a `TOKEN_PRIVILEGES` with `PrivilegeCount` entries after its header, 8-aligned.
+    unsafe {
+        let privileges = &*buf.as_ptr().cast::<TOKEN_PRIVILEGES>();
+        let first = privileges.Privileges.as_ptr();
+        for index in 0..privileges.PrivilegeCount as usize {
+            let entry = &*first.add(index);
+            let mut name = [0u16; 128];
+            let mut len = name.len() as u32;
+            let named = LookupPrivilegeNameW(PCWSTR::null(), &entry.Luid, Some(PWSTR(name.as_mut_ptr())), &mut len);
+            let text = if named.is_ok() {
+                String::from_utf16_lossy(&name[..len as usize])
+            } else {
+                format!("luid {}:{}", entry.Luid.HighPart, entry.Luid.LowPart)
+            };
+            present.push((text, entry.Attributes.0 & 0x2 != 0)); // SE_PRIVILEGE_ENABLED
+        }
+    }
+    let state = |name: &str| {
+        present
+            .iter()
+            .find(|(n, _)| n == name)
+            .map_or("absent".to_owned(), |(_, enabled)| {
+                format!("present ({})", if *enabled { "enabled" } else { "disabled" })
+            })
+    };
+    let enabled: Vec<&str> = present
+        .iter()
+        .filter(|(_, enabled)| *enabled)
+        .map(|(name, _)| name.as_str())
+        .collect();
+    let all: Vec<&str> = present.iter().map(|(name, _)| name.as_str()).collect();
+    format!(
+        "privileges_present_count={}\nprivileges_enabled_count={}\nSeDebugPrivilege={}\nSeImpersonatePrivilege={}\nprivileges_enabled={enabled:?}\nprivileges_present={all:?}\n",
+        present.len(),
+        enabled.len(),
+        state("SeDebugPrivilege"),
+        state("SeImpersonatePrivilege"),
+    )
+}
+
+fn create_file_answer(dir: &Path) -> String {
+    let path = dir.join(format!("by-{}.txt", std::process::id()));
+    match std::fs::File::create_new(&path) {
+        Ok(_) => "ok".to_owned(),
+        Err(e) => format!("failed: os_error={:?}: {e}", e.raw_os_error()),
+    }
+}
+
+fn open_process_answer(pid: u32, access: PROCESS_ACCESS_RIGHTS) -> String {
+    // SAFETY: a plain open; the handle is closed by `OwnedHandle`.
+    match unsafe { OpenProcess(access, false, pid) } {
+        Ok(process) => {
+            drop(OwnedHandle(process));
+            "ok".to_owned()
+        }
+        Err(e) => format!("failed: {e}"),
+    }
+}
+
+fn connect_answer(socket: &Path) -> String {
+    match afunix::connect(socket) {
+        Ok(_) => "connected".to_owned(),
+        Err(e) => {
+            let os_error = e
+                .downcast_ref::<std::io::Error>()
+                .and_then(std::io::Error::raw_os_error);
+            format!("failed: os_error={os_error:?}: {e:#}")
+        }
+    }
+}
+
+/// Child half of M4: what the identity report says, and what the reduced token can reach.
+#[test]
+#[ignore = "run as the child of the M4 measurements"]
+fn child_stepdown() {
+    let dir = child_entry::dir();
+    let input = child_entry::input(&dir);
+    let parent: u32 = value(&input, "parent_pid").parse().expect("parent_pid is a number");
+    let token = own_token();
+    let mut out = identity_report();
+    out.push_str(&privilege_facts(token.0));
+    out.push_str(&linked_facts(token.0));
+    let mut put = |key: &str, text: String| out.push_str(&format!("{key}={text}\n"));
+    put(
+        "create_file_in_admin_only_dir",
+        create_file_answer(Path::new(value(&input, "admin_only_dir"))),
+    );
+    put(
+        "create_file_in_dir_granting_the_user",
+        create_file_answer(Path::new(value(&input, "user_dir"))),
+    );
+    put(
+        "hklm_software_opens_for_set_value",
+        registry_open(HKEY_LOCAL_MACHINE, "SOFTWARE", KEY_SET_VALUE),
+    );
+    put(
+        "open_parent_vm_write_and_create_thread",
+        open_process_answer(parent, PROCESS_VM_WRITE | PROCESS_CREATE_THREAD),
+    );
+    put(
+        "open_parent_query_limited_information",
+        open_process_answer(parent, PROCESS_QUERY_LIMITED_INFORMATION),
+    );
+    put(
+        "connect_to_the_high_labelled_socket",
+        connect_answer(Path::new(value(&input, "socket_high"))),
+    );
+    put(
+        "connect_to_the_unlabelled_socket",
+        connect_answer(Path::new(value(&input, "socket_plain"))),
+    );
+    child_entry::write_result(&dir, &out);
+}
+
+/// What M4's children are given: the two directories, the two sockets and the binary.
+struct StepDown {
+    scratch: TempTree,
+    exe: PathBuf,
+    input: String,
+    _high: Arrangement,
+    _plain: Arrangement,
+}
+
+impl StepDown {
+    /// Check the test process is the elevated administrator M4 is about, make the scene and record it.
+    fn new(tag: &str, heading: &str) -> StepDown {
+        account_fixture::assert_elevated();
+        assert_eq!(
+            integrity::current_rid(),
+            HIGH,
+            "the elevated test process is not at High integrity"
+        );
+        let own = own_token();
+        let administrators = administrators_state(own.0);
+        assert!(
+            administrators.starts_with("enabled"),
+            "BUILTIN\\Administrators is not enabled in the test process's token: {administrators}"
+        );
+        record_context(heading);
+
+        let scratch = TempTree::new(&format!("{tag}p"));
+        let admin_only = scratch.0.join("admin_only");
+        make_dir_with_sddl(&admin_only, ADMIN_ONLY_DIR_SDDL);
+        let user = Sid::current_user().unwrap().to_sddl().unwrap();
+        let user_dir = scratch.0.join("user");
+        make_dir_with_sddl(&user_dir, &format!("{ADMIN_ONLY_DIR_SDDL}(A;OICI;FA;;;{user})"));
+        let (high, high_facts) = arrange(Labelled::SocketHigh, &format!("{tag}h"))
+            .unwrap_or_else(|why| panic!("the High-labelled socket: {why}"));
+        let (plain, plain_facts) =
+            arrange(Labelled::Nothing, &format!("{tag}u")).unwrap_or_else(|why| panic!("the unlabelled socket: {why}"));
+        record(
+            &format!("{heading}: the scene"),
+            &format!(
+                "user_sid={user}\nadmin_only_dir_sddl={ADMIN_ONLY_DIR_SDDL}\n--- the High-labelled socket\n{high_facts}--- the unlabelled socket\n{plain_facts}"
+            ),
+        );
+        let input = format!(
+            "parent_pid={}\nadmin_only_dir={}\nuser_dir={}\nsocket_high={}\nsocket_plain={}\n",
+            std::process::id(),
+            admin_only.display(),
+            user_dir.display(),
+            high.loc.path().display(),
+            plain.loc.path().display(),
+        );
+        StepDown {
+            scratch,
+            exe: std::env::current_exe().unwrap(),
+            input,
+            _high: high,
+            _plain: plain,
+        }
+    }
+
+    /// A directory for the child `label`, with its input written.
+    fn child(&self, label: &str) -> ChildDir {
+        let dir = self.scratch.0.join(format!("child-{label}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        child_entry::write_input(&dir, &self.input);
+        ChildDir {
+            command_line: child_entry::command_line(&self.exe, "child_stepdown", &dir),
+            arguments: String::new(),
+            dir,
+        }
+    }
+
+    /// Record the token, then start a child with it and record the child's report.
+    fn run_token(&self, heading: &str, label: &str, token: HANDLE, failures: &mut Vec<String>) {
+        record(
+            &format!("{heading}: the token before the start"),
+            &format!(
+                "{}{}{}",
+                token_facts(token),
+                privilege_facts(token),
+                linked_facts(token)
+            ),
+        );
+        let child = self.child(label);
+        let start = start_with_primary_token(token, &self.exe, &child);
+        report_child(heading, &child, start, failures);
+    }
+
+    /// The token as returned, then, when it is above Medium, with its integrity set to Medium.
+    fn run_derived(&self, heading: &str, label: &str, made: Result<OwnedHandle, String>, failures: &mut Vec<String>) {
+        let token = match made.and_then(|token| as_primary(token.0)) {
+            Ok(token) => token,
+            Err(e) => {
+                record(heading, &format!("token=refused: {e}"));
+                return;
+            }
+        };
+        self.run_token(
+            &format!("{heading}, as returned"),
+            &format!("{label}-returned"),
+            token.0,
+            failures,
+        );
+        let second = format!("{heading}, integrity then set to Medium");
+        match token_integrity(token.0) {
+            Ok(rid) if rid == integrity::MEDIUM => record(&second, "not made: the returned token is already Medium"),
+            Ok(rid) if rid < integrity::MEDIUM => record(
+                &second,
+                &format!("not made: the returned token is below Medium ({rid:#x}); raising needs SeTcbPrivilege"),
+            ),
+            Ok(_) => match set_integrity(token.0, integrity::MEDIUM) {
+                Ok(()) => self.run_token(&second, &format!("{label}-medium"), token.0, failures),
+                Err(e) => record(&second, &format!("set_integrity=refused: {e}")),
+            },
+            Err(e) => record(&second, &format!("not made: the integrity is unreadable: {e}")),
+        }
+    }
+}
+
+/// Start the child with `token`, a primary token: `CreateProcessAsUserW` first (a token that is this
+/// process's own, reduced, needs no privilege), then `CreateProcessWithTokenW`, which an elevated
+/// administrator may call. Which call worked is part of the answer.
+fn start_with_primary_token(token: HANDLE, exe: &Path, child: &ChildDir) -> Start {
+    let user = Sid::current_user().unwrap().to_sddl().unwrap();
+    // The pair is labelled at the token's own level (no higher than this process's, as the helper needs).
+    let label = token_integrity(token).ok().map(|rid| rid.min(HIGH));
+    let calls = [
+        ("CreateProcessAsUserW", Starter::AsUser),
+        (
+            "CreateProcessWithTokenW(LOGON_WITH_PROFILE)",
+            Starter::SecondaryLogon(LOGON_WITH_PROFILE),
+        ),
+    ];
+    let mut refusals = Vec::new();
+    for (name, starter) in calls {
+        let spawned = catch_panic(|| {
+            let private = desktop::PrivateDesktop::create_labelled(&[&user], label)
+                .unwrap_or_else(|e| panic!("create a window station and desktop: {e}"));
+            account_fixture::spawn_with_token(
+                starter,
+                token,
+                "a reduced copy of the elevated token",
+                Some(private),
+                exe,
+                &child.command_line,
+                &child.dir,
+                std::slice::from_ref(&child.dir),
+                None,
+                None,
+                CREATE_NO_WINDOW,
+            )
+        });
+        match spawned {
+            Ok(process) => {
+                process.resume();
+                return Start::Ran(format!(
+                    "started_by={name}\nexit_code={}",
+                    hard_errors::describe_exit(process.wait())
+                ));
+            }
+            Err(why) => refusals.push(format!("{name}: {why}")),
+        }
+    }
+    Start::Refused(refusals.join("\n"))
+}
+
+/// Elevated (CI only). M4a: a copy of the process token with only its integrity level lowered to Medium,
+/// started by the suite's `integrity::run_at`.
+#[test]
+fn m4a_process_token_copy_lowered_to_medium() {
+    let heading = "M4a copy of the process token, integrity lowered to Medium (integrity::run_at)";
+    let scene = StepDown::new("m4a", heading);
+    let child = scene.child("medium");
+    let code = integrity::run_at(
+        integrity::MEDIUM,
+        &scene.exe,
+        &child.command_line,
+        &child.dir,
+        std::slice::from_ref(&child.dir),
+    );
+    let mut failures = Vec::new();
+    report_child(
+        heading,
+        &child,
+        Start::Ran(format!(
+            "started_by=CreateProcessAsUserW (integrity::run_at)\nexit_code={}",
+            hard_errors::describe_exit(code)
+        )),
+        &mut failures,
+    );
+    finish(&failures);
+}
+
+/// Elevated (CI only). M4b: `CreateRestrictedToken(LUA_TOKEN)` on the process token, as returned and
+/// with Medium set explicitly if it is not already Medium.
+#[test]
+fn m4b_lua_restricted_token() {
+    let heading = "M4b CreateRestrictedToken(LUA_TOKEN) on the process token";
+    let scene = StepDown::new("m4b", heading);
+    let own = own_token_to_derive_from();
+    let mut failures = Vec::new();
+    scene.run_derived(heading, "lua", lua_token(own.0), &mut failures);
+    finish(&failures);
+}
+
+/// Elevated (CI only). M4c: `SaferCreateLevel(USER, NORMALUSER)` and `SaferComputeTokenFromLevel` on the
+/// process token, as returned and with Medium set explicitly if it is not already Medium.
+#[test]
+fn m4c_safer_normal_user_token() {
+    let heading = "M4c SaferComputeTokenFromLevel(NORMALUSER) on the process token";
+    let scene = StepDown::new("m4c", heading);
+    let own = own_token_to_derive_from();
+    let mut failures = Vec::new();
+    scene.run_derived(heading, "safer", safer_normal_user_token(own.0), &mut failures);
+    finish(&failures);
+}
+
+/// Elevated (CI only). M4d: the process token's linked token, if it has one: as returned (an
+/// impersonation token, which a process cannot be started with) and as a primary copy.
+#[test]
+fn m4d_linked_token_of_the_process_token() {
+    let heading = "M4d TokenLinkedToken of the process token";
+    let scene = StepDown::new("m4d", heading);
+    let own = own_token();
+    let mut failures = Vec::new();
+    match linked_token(own.0) {
+        Err(e) => record(heading, &format!("linked_token=none: {e}")),
+        Ok(linked) => {
+            scene.run_token(&format!("{heading}, as returned"), "linked", linked.0, &mut failures);
+            match as_primary(linked.0) {
+                Err(e) => record(
+                    &format!("{heading}, duplicated as a primary token"),
+                    &format!("duplicate=refused: {e}"),
+                ),
+                Ok(copy) => scene.run_token(
+                    &format!("{heading}, duplicated as a primary token"),
+                    "linked-primary",
+                    copy.0,
+                    &mut failures,
+                ),
+            }
+        }
+    }
+    finish(&failures);
 }
