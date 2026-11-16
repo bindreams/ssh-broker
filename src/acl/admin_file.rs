@@ -10,8 +10,7 @@ use std::path::Path;
 
 use anyhow::Context;
 use windows::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_FILE_EXISTS, ERROR_INVALID_OWNER};
-use windows::Win32::Security::Authorization::{ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1};
-use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
+use windows::Win32::Security::SECURITY_ATTRIBUTES;
 use windows::Win32::Storage::FileSystem::{
     CREATE_NEW, CreateFileW, FILE_ALL_ACCESS, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL,
     FILE_ATTRIBUTE_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
@@ -19,8 +18,8 @@ use windows::Win32::Storage::FileSystem::{
 use windows::core::{BOOL, HRESULT, PCWSTR};
 
 use super::{
-    Grant, LocalSd, Security, Sid, WellKnown, denied_problem, describe_sid, file_attributes, open_for_inspection,
-    owner_acl_problem, wide,
+    Grant, Security, Sid, WellKnown, denied_problem, describe_sid, descriptor_from_sddl, file_attributes,
+    open_for_inspection, owner_acl_problem, wide,
 };
 use crate::winutil::OwnedHandle;
 
@@ -47,16 +46,13 @@ pub fn ensure_admin_only_file(path: &Path) -> anyhow::Result<()> {
 /// `CreateFileW` with `CREATE_NEW` and [`ADMIN_FILE_SDDL`]. "Already exists" is not an error here:
 /// the caller decides whether what exists is acceptable.
 fn create_admin_only_file(path: &Path) -> anyhow::Result<()> {
-    let sddl_w: Vec<u16> = ADMIN_FILE_SDDL.encode_utf16().chain(std::iter::once(0)).collect();
+    let sd = descriptor_from_sddl(ADMIN_FILE_SDDL)?;
     let path_w = wide(path);
-    // SAFETY: NUL-terminated strings; the descriptor outlives the call and is freed by `LocalSd`.
+    // SAFETY: a NUL-terminated string; the descriptor outlives the call and is freed by `LocalSd`.
     unsafe {
-        let mut psd = PSECURITY_DESCRIPTOR::default();
-        ConvertStringSecurityDescriptorToSecurityDescriptorW(PCWSTR(sddl_w.as_ptr()), SDDL_REVISION_1, &mut psd, None)?;
-        let _sd = LocalSd(psd);
         let attributes = SECURITY_ATTRIBUTES {
             nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
-            lpSecurityDescriptor: psd.0,
+            lpSecurityDescriptor: sd.0.0,
             bInheritHandle: BOOL(0),
         };
         match CreateFileW(

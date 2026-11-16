@@ -313,14 +313,14 @@ pub fn harden_dir(dir: &Path, target_user: &Sid) -> anyhow::Result<()> {
     use windows::Win32::Security::{
         GetSecurityDescriptorDacl, GetSecurityDescriptorOwner, PROTECTED_DACL_SECURITY_INFORMATION,
     };
-    let sddl = format!("O:{}{}", target_user.to_sddl()?, private_dir_dacl_sddl(target_user)?);
-    let sddl_w: Vec<u16> = sddl.encode_utf16().chain(std::iter::once(0)).collect();
+    let sd = descriptor_from_sddl(&format!(
+        "O:{}{}",
+        target_user.to_sddl()?,
+        private_dir_dacl_sddl(target_user)?
+    ))?;
+    let psd = sd.0;
     let path_w = wide(dir);
     unsafe {
-        let mut psd = PSECURITY_DESCRIPTOR::default();
-        ConvertStringSecurityDescriptorToSecurityDescriptorW(PCWSTR(sddl_w.as_ptr()), SDDL_REVISION_1, &mut psd, None)?;
-        let _sd = LocalSd(psd); // freed on every path below
-
         let mut dacl_present = BOOL(0);
         let mut dacl: *mut ACL = std::ptr::null_mut();
         let mut dacl_defaulted = BOOL(0);
@@ -848,15 +848,12 @@ pub fn ensure_install_dir(dir: &Path) -> anyhow::Result<()> {
 /// `CreateDirectoryW` with [`INSTALL_DIR_SDDL`]. "Already exists" is not an error here: the
 /// caller decides whether what exists is acceptable.
 fn create_install_dir(dir: &Path) -> anyhow::Result<()> {
-    let sddl_w: Vec<u16> = INSTALL_DIR_SDDL.encode_utf16().chain(std::iter::once(0)).collect();
+    let sd = descriptor_from_sddl(INSTALL_DIR_SDDL)?;
     let path_w = wide(dir);
     unsafe {
-        let mut psd = PSECURITY_DESCRIPTOR::default();
-        ConvertStringSecurityDescriptorToSecurityDescriptorW(PCWSTR(sddl_w.as_ptr()), SDDL_REVISION_1, &mut psd, None)?;
-        let _sd = LocalSd(psd);
         let attributes = SECURITY_ATTRIBUTES {
             nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
-            lpSecurityDescriptor: psd.0,
+            lpSecurityDescriptor: sd.0.0,
             bInheritHandle: BOOL(0),
         };
         match CreateDirectoryW(PCWSTR(path_w.as_ptr()), Some(&attributes)) {
