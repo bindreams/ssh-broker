@@ -790,15 +790,13 @@ fn problem_from_open(dir: &Path, handle: Option<OwnedHandle>) -> anyhow::Result<
     let security = Security::from_handle(handle.0).with_context(|| format!("read the ACL of {}", dir.display()))?;
     let owner = describe_sid(security.owner);
 
-    let mut info = BY_HANDLE_FILE_INFORMATION::default();
-    unsafe { GetFileInformationByHandle(handle.0, &mut info) }
-        .with_context(|| format!("read the attributes of {}", dir.display()))?;
-    if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
+    let attributes = file_attributes(handle.0).with_context(|| format!("read the attributes of {}", dir.display()))?;
+    if attributes & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
         return Ok(Some(format!(
             "it is a reparse point (junction or symlink); owner {owner}"
         )));
     }
-    if info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY.0 == 0 {
+    if attributes & FILE_ATTRIBUTE_DIRECTORY.0 == 0 {
         return Ok(Some(format!("it is not a directory; owner {owner}")));
     }
 

@@ -13,15 +13,14 @@ use windows::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_FILE_EXISTS, ERROR_I
 use windows::Win32::Security::Authorization::{ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1};
 use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
 use windows::Win32::Storage::FileSystem::{
-    BY_HANDLE_FILE_INFORMATION, CREATE_NEW, CreateFileW, FILE_ALL_ACCESS, FILE_ATTRIBUTE_DIRECTORY,
-    FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    GetFileInformationByHandle,
+    CREATE_NEW, CreateFileW, FILE_ALL_ACCESS, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL,
+    FILE_ATTRIBUTE_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
 };
 use windows::core::{BOOL, HRESULT, PCWSTR};
 
 use super::{
-    Grant, LocalSd, Security, Sid, WellKnown, denied_problem, describe_sid, open_for_inspection, owner_acl_problem,
-    wide,
+    Grant, LocalSd, Security, Sid, WellKnown, denied_problem, describe_sid, file_attributes, open_for_inspection,
+    owner_acl_problem, wide,
 };
 use crate::winutil::OwnedHandle;
 
@@ -102,14 +101,11 @@ pub fn admin_only_file_problem(path: &Path) -> anyhow::Result<Option<String>> {
         return Ok(Some(denied_problem("private")));
     };
     let security = Security::from_handle(handle.0).with_context(|| format!("read the ACL of {}", path.display()))?;
-    let mut info = BY_HANDLE_FILE_INFORMATION::default();
-    // SAFETY: a valid handle and an out-pointer to a local.
-    unsafe { GetFileInformationByHandle(handle.0, &mut info) }
-        .with_context(|| format!("read the attributes of {}", path.display()))?;
-    if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
+    let attributes = file_attributes(handle.0).with_context(|| format!("read the attributes of {}", path.display()))?;
+    if attributes & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
         return Ok(Some("it is a reparse point (a link)".to_owned()));
     }
-    if info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY.0 != 0 {
+    if attributes & FILE_ATTRIBUTE_DIRECTORY.0 != 0 {
         return Ok(Some("it is a directory".to_owned()));
     }
     Ok(problem_from_security(&security))
