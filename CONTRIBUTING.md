@@ -52,6 +52,14 @@ non-FullControl grants, extra grantees, and an owner outside the allowed set. `L
 verifies the folder, binds, verifies the socket file, and only then listens; it removes a socket it
 cannot prove. If it cannot prove the folder is safe, the agent refuses to bind.
 
+`connect()` asks for write access to the socket file. That is why a process of the same user at
+Low integrity (a sandboxed renderer) is refused although the DACL admits it: a file without an
+integrity label is Medium, and the default no-write-up policy refuses a Low writer. The file has
+no label unless one is set on it or inherited from any ancestor folder (the product leaves the
+SACL unprotected). Only the user at Medium or above, an administrator or SYSTEM can set one, and
+each of them can connect anyway; the product does not check for one.
+`tests/user_isolation_windows.rs` pins the refusal and, with the file labelled Low, the connect.
+
 `userdir::open_socket_dir` (and `ensure_socket_dir` over it) reaches the folder by handle: it opens
 the profile directory (opened following a link, see below), then `AppData`, `Local`,
 `ssh-broker` and `logs`, each by name relative to the handle above it, with `FILE_OPEN_REPARSE_POINT`,
