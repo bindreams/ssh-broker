@@ -596,21 +596,21 @@ fn a_low_integrity_process_of_the_same_user_cannot_connect_to_the_agent_socket()
     let profile = StandInProfile::new("low");
     let loc = profile.location();
     userdir::ensure_socket_dir(&loc, &me).unwrap();
-    let _listener = Listener::bind(&loc.path).unwrap();
+    let _listener = Listener::bind(loc.path()).unwrap();
     let security_of_file = |context: &str| {
         let info = DACL_SECURITY_INFORMATION | LABEL_SECURITY_INFORMATION;
-        read_sddl(&loc.path, info).unwrap_or_else(|e| panic!("read the socket file's security {context}: {e}"))
+        read_sddl(loc.path(), info).unwrap_or_else(|e| panic!("read the socket file's security {context}: {e}"))
     };
     let file_security = security_of_file("before any child runs");
     let measured = format!(
         "the socket file: {}\n  {file_security}\nits folder: {}\n  {}",
-        loc.path.display(),
-        loc.dir.display(),
-        dacl_and_label_sddl(&loc.dir),
+        loc.path().display(),
+        loc.dir().display(),
+        dacl_and_label_sddl(loc.dir()),
     );
     println!("{measured}");
     assert!(
-        acl::verify_file_acl(&loc.path, &me).unwrap(),
+        acl::verify_file_acl(loc.path(), &me).unwrap(),
         "the socket is exact\n{measured}"
     );
     // The refusal below rests on the file having no integrity label, which makes it Medium with
@@ -627,7 +627,7 @@ fn a_low_integrity_process_of_the_same_user_cannot_connect_to_the_agent_socket()
         let dir = profile.0.join(format!("pair-{tag}"));
         std::fs::create_dir(&dir).unwrap();
         set_low_label(&dir, "OICI");
-        child_entry::write_input(&dir, &format!("socket={}\nintegrity={level}\n", loc.path.display()));
+        child_entry::write_input(&dir, &format!("socket={}\nintegrity={level}\n", loc.path().display()));
         let name = "child_connects_at_its_integrity_level";
         let code = integrity::run_at(
             level,
@@ -663,10 +663,10 @@ fn a_low_integrity_process_of_the_same_user_cannot_connect_to_the_agent_socket()
 
     // The label is the cause: with only the socket file's label lowered to Low, the same Low child
     // connects.
-    set_low_label(&loc.path, "");
+    set_low_label(loc.path(), "");
     let labelled = security_of_file("after it was labelled Low");
     assert!(
-        labelled.contains(&low_label_ace("")) && acl::verify_file_acl(&loc.path, &me).unwrap(),
+        labelled.contains(&low_label_ace("")) && acl::verify_file_acl(loc.path(), &me).unwrap(),
         "the socket file must carry a Low label and keep its exact DACL\n{measured}\nnow: {labelled}"
     );
     let low_labelled = run("low-labelled", integrity::LOW);
