@@ -1,12 +1,5 @@
-//! What a held walk to the private folder holds, against a process of the same administrator that is
-//! not elevated. Windows only; **Elevated (CI only)**.
-//!
-//! The walk holds the private folder without `FILE_SHARE_DELETE`, and with it open `Local` and
-//! `AppData` cannot be renamed either (an open descendant). An unelevated process of the same account
-//! (the child of this test, started with `winutil::UnelevatedToken`: Medium integrity, Administrators
-//! deny-only) has every right on the stand-in profile that the account has, so what keeps it from
-//! renaming a folder aside and putting another in its place is the hold and nothing else. Once the
-//! hold is dropped it can.
+//! Against an unelevated process of the same administrator, the held walk keeps the private folder,
+//! `Local` and `AppData` from being renamed; after drop it can. Elevated (CI only).
 #![cfg(windows)]
 
 use std::path::{Path, PathBuf};
@@ -94,8 +87,6 @@ fn aside(folder: &Path) -> PathBuf {
     folder.with_file_name(name)
 }
 
-/// While the walk is held an unelevated process of the same account cannot rename `AppData`, `Local` or
-/// the private folder, and is refused with the codes of the hold; after it is dropped it can.
 #[test]
 fn an_unelevated_process_of_the_same_account_cannot_rename_a_folder_of_a_held_walk() {
     let scene = Scene::new("held");

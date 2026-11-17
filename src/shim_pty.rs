@@ -55,8 +55,8 @@ const EVT_FOCUS: u16 = 0x0010;
 /// A `-c` session resolves its command first, once the log is open: `detect` says how sshd
 /// encoded it (see [`resolve_exec`]), and a blank command ends the run there, exit 0.
 pub fn run_on(exec: Option<RawExec>, detect: impl FnOnce() -> Encoding) -> anyhow::Result<()> {
-    // The shim's first act is the walk to its folder, which it keeps for the run: the folders it holds
-    // cannot be swapped, so the log and the connect below reach them and no others.
+    // Walk first and keep the result: the folders it holds cannot be swapped, so the log and connect reach
+    // them and no others.
     let folder = Folder::of_current_user();
     // A log that cannot be set up never stops the shim. The cause is kept, to be said where the
     // shim already explains a fallback to the user.
@@ -251,8 +251,6 @@ fn connect_or_rescue(
     rescue: &mut dyn Rescue,
 ) -> anyhow::Result<Connected> {
     let location = folder.location();
-    // The cause of a failure is shown by the fail-open below; a folder that was not accepted says
-    // only that there was nothing to connect through.
     let connection: anyhow::Result<Socket> = match folder.connect() {
         Ok(socket) => {
             return Ok(Connected::Agent {
@@ -276,8 +274,7 @@ fn connect_or_rescue(
         },
         Rescued::Gone => Connected::Done(Some(255)),
         Rescued::Plain => {
-            // A refusal that a connect found by looking again is not what the log's failure says (the
-            // log was set up at the first act, before it): the latest one is.
+            // The latest refusal, not the log's failure, which predates the connect's look.
             let refusal = folder.refusal();
             Connected::Done(fail_open_reason(
                 location,

@@ -83,8 +83,7 @@ pub fn current_socket_location() -> anyhow::Result<SocketLocation> {
 /// an open descendant). The walk confirmed that the path of [`SocketLocation`] leads to the folder held
 /// before it returned, so what is done by that path (the lock files, the marker, `bind`,
 /// [`SocketDir::connect`]) reaches this folder and no other. What may be written inside the folder, or
-/// to its attributes, is decided by its ACL (and, for the elevated agent's folder, by the label a later
-/// change adds), not by the hold. `logs` is held by nothing: it is used through its handle only.
+/// to its attributes, is decided by its ACL, not by the hold. `logs` is held by nothing: it is used through its handle only.
 pub struct SocketDir {
     location: SocketLocation,
     pub dir: DirHandle,
@@ -180,16 +179,9 @@ fn open_parents(loc: &SocketLocation) -> anyhow::Result<[DirHandle; 2]> {
     Ok([app_data, local])
 }
 
-/// The second half of the walk: `open` the private folder under the `Local` handle, and with it held
-/// confirm the path to it, top-down, in two steps. First `Local` is opened as one name relative to the
-/// `AppData` handle and must be the `Local` the walk went through (`acl::confirm_child`): so `Local` is,
-/// now, a child of that `AppData`, and with the private folder open inside it cannot leave. Then
-/// `<profile>\AppData` is opened by its path, the one `bind` and `connect` resolve, and must be the
-/// `AppData` the walk went through (`acl::confirm_dir`): the only name below the profile directory that is
-/// opened by path, and only to confirm it. A parent that was swapped for a link or another folder while
-/// the walk was opening it, or `Local` moved out of `AppData`, is caught here; once this passes the
-/// private folder's open descendant keeps every name on the path from being renamed. The parents' handles
-/// are closed on return. Never retried.
+/// Open the private folder under `Local`, then, holding it, confirm `Local` is a child of the walked
+/// `AppData` (`acl::confirm_child`) and `<profile>\AppData` by path is that `AppData`
+/// (`acl::confirm_dir`). A swapped parent is refused; never retried.
 fn hold_and_confirm(
     loc: &SocketLocation,
     parents: [DirHandle; 2],

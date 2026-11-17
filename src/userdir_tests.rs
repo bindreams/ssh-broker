@@ -495,19 +495,7 @@ fn a_held_looking_walk_holds_the_private_folder_and_through_it_its_parents() {
     a_held_walk_holds_the_private_folder_and_through_it_its_parents("hold-look", inspect_socket_dir);
 }
 
-/// Open `dir` with delete access, as a program that is about to delete or rename it does, and
-/// share everything.
-fn hold_for_deletion(dir: &Path) -> std::fs::File {
-    use std::os::windows::fs::OpenOptionsExt;
-    const DELETE: u32 = 0x0001_0000;
-    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
-    std::fs::OpenOptions::new()
-        .access_mode(DELETE)
-        .share_mode(7)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-        .open(dir)
-        .unwrap_or_else(|e| panic!("hold {} for deletion: {e}", dir.display()))
-}
+use crate::test_support::{hold_for_deletion, hold_without_sharing_read};
 
 /// The walk's opens of `AppData` and `Local` take no part in sharing checks, so a program that holds
 /// either one open with the right to delete it does not stop the walk (and the walk does not stop it).
@@ -532,9 +520,55 @@ fn a_parent_held_open_for_deletion_does_not_stop_the_walk() {
     }
 }
 
-/// The confirmation catches a parent swapped while the walk was between its two halves: the folders
-/// are opened, `Local` is renamed aside and a junction to it put in its place, and the walk is finished.
-/// It refuses, naming `Local`.
+/// `logs` is held by nothing: a program that holds it open with the right to delete it, or without
+/// sharing read, stops no walk.
+#[test]
+fn a_logs_folder_held_open_by_another_program_does_not_stop_any_walk() {
+    for kind in ["with the right to delete", "without sharing read"] {
+        let profile = TempProfile::new("held-logs");
+        let loc = profile.location();
+        ensure_socket_dir(&loc, &me()).unwrap();
+        let holder = match kind {
+            "with the right to delete" => hold_for_deletion(&loc.logs_dir()),
+            _ => hold_without_sharing_read(&loc.logs_dir()),
+        };
+        for (name, walk) in every_walk() {
+            let walked = walk(&loc, &me());
+            assert!(
+                walked.is_ok(),
+                "{name}: logs was held open {kind} and the walk failed: {:#}",
+                walked.err().unwrap()
+            );
+        }
+        drop(holder);
+    }
+}
+
+/// The walk's handle on `logs` shares everything, so `logs` can be renamed while a `SocketDir` is held.
+#[test]
+fn logs_can_be_renamed_while_a_walk_is_held() {
+    for (tag, walk) in [
+        (
+            "rename-logs-make",
+            open_socket_dir as fn(&SocketLocation, &Sid) -> anyhow::Result<SocketDir>,
+        ),
+        ("rename-logs-look", inspect_socket_dir),
+    ] {
+        let profile = TempProfile::new(tag);
+        let loc = profile.location();
+        ensure_socket_dir(&loc, &me()).unwrap();
+        let folders = walk(&loc, &me()).unwrap();
+        assert!(folders.logs.is_ok());
+        let aside = loc.logs_dir().with_file_name("aside");
+
+        let error = rename_error(&loc.logs_dir(), &aside);
+
+        assert_eq!(error, None, "{tag}: logs was held by the walk");
+        drop(folders);
+    }
+}
+
+/// A parent swapped between the walk's halves is refused, naming `Local`.
 #[test]
 fn a_parent_swapped_for_a_link_while_the_walk_is_open_is_refused_naming_it() {
     let profile = TempProfile::new("swap");
@@ -606,16 +640,11 @@ fn a_local_renamed_aside_while_the_walk_is_open_is_refused_and_not_missing() {
     assert!(!err.is::<acl::Missing>(), "reported as no folder yet: {err:#}");
 }
 
-/// Another program that holds the private folder open in a way that keeps the broker from holding it:
-/// with the right to delete it, or without sharing read. Every walk refuses at once with the stated
-/// limit, naming the folder.
-#[test]
-fn a_private_folder_held_by_another_program_is_refused_at_once_by_every_walk() {
-    use std::os::windows::fs::OpenOptionsExt;
-    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
-    const SHARE_WRITE_DELETE: u32 = 2 | 4;
-    type WalkFn = fn(&SocketLocation, &Sid) -> anyhow::Result<()>;
-    let walks: [(&str, WalkFn); 3] = [
+type WalkFn = fn(&SocketLocation, &Sid) -> anyhow::Result<()>;
+
+/// The three walks to the private folder, by name, each reduced to whether it got there.
+fn every_walk() -> [(&'static str, WalkFn); 3] {
+    [
         ("open_socket_dir", |loc, user| open_socket_dir(loc, user).map(drop)),
         ("inspect_socket_dir", |loc, user| {
             inspect_socket_dir(loc, user).map(drop)
@@ -623,21 +652,23 @@ fn a_private_folder_held_by_another_program_is_refused_at_once_by_every_walk() {
         ("open_existing_socket_dir", |loc, _| {
             open_existing_socket_dir(loc).map(drop)
         }),
-    ];
+    ]
+}
+
+/// Another program that holds the private folder open in a way that keeps the broker from holding it:
+/// with the right to delete it, or without sharing read. Every walk refuses at once with the stated
+/// limit, naming the folder.
+#[test]
+fn a_private_folder_held_by_another_program_is_refused_at_once_by_every_walk() {
     for kind in ["with the right to delete", "without sharing read"] {
         let profile = TempProfile::new("held-other");
         let loc = profile.location();
         ensure_socket_dir(&loc, &me()).unwrap();
         let holder = match kind {
             "with the right to delete" => hold_for_deletion(loc.dir()),
-            _ => std::fs::OpenOptions::new()
-                .read(true)
-                .share_mode(SHARE_WRITE_DELETE)
-                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-                .open(loc.dir())
-                .unwrap(),
+            _ => hold_without_sharing_read(loc.dir()),
         };
-        for (name, walk) in walks {
+        for (name, walk) in every_walk() {
             let err = walk(&loc, &me()).expect_err(&format!("{name} {kind}: the walk held a folder it cannot hold"));
             assert!(err.root_cause().is::<acl::Refused>(), "{name} {kind}: {err:#}");
             let text = format!("{err:#}");
@@ -647,5 +678,32 @@ fn a_private_folder_held_by_another_program_is_refused_at_once_by_every_walk() {
             );
         }
         drop(holder);
+    }
+}
+
+/// A private folder with a deny entry for the right to traverse it cannot be held (holding takes that
+/// right; the privilege to bypass traverse checking does not override a deny entry). Every walk refuses it
+/// for what is wrong with it, its ACL, and not for a denial it cannot explain.
+#[test]
+fn a_private_folder_that_denies_traversing_is_refused_for_its_acl_by_every_walk() {
+    let profile = TempProfile::new("no-traverse");
+    let loc = profile.location();
+    ensure_socket_dir(&loc, &me()).unwrap();
+    let user = format!("*{}", me().to_sddl().unwrap());
+    crate::test_support::icacls(loc.dir(), &["/deny", &format!("{user}:(X)")]);
+
+    let walked: Vec<_> = every_walk()
+        .into_iter()
+        .map(|(name, walk)| (name, walk(&loc, &me())))
+        .collect();
+    crate::test_support::icacls(loc.dir(), &["/remove:d", &user]);
+
+    for (name, walked) in walked {
+        let err = walked.expect_err(&format!("{name}: a folder that cannot be traversed was accepted"));
+        assert!(err.root_cause().is::<acl::Refused>(), "{name}: {err:#}");
+        let text = format!("{err:#}");
+        assert!(text.contains(&loc.dir().display().to_string()), "{name}: {text}");
+        assert!(text.contains("its ACL is not exactly"), "{name}: {text}");
+        assert!(!text.contains("denied access to read its ACL"), "{name}: {text}");
     }
 }

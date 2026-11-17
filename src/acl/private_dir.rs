@@ -45,13 +45,9 @@ use crate::winutil::{FileId, OwnedHandle};
 /// Creating inside it is checked against the folder's own ACL, not against the handle.
 const DIR_ACCESS: u32 = READ_CONTROL.0 | FILE_READ_ATTRIBUTES.0;
 
-/// Whether the folder opened is held: nobody can rename or remove it while the handle lives. The
-/// caller says so here and the open follows from it in one place: a held folder is opened without
-/// `FILE_SHARE_DELETE` and with the right to traverse. Sharing is judged only for an open that asks for
-/// data, execute or delete access, so a handle with [`DIR_ACCESS`] alone leaves the folder free to be
-/// renamed whatever it shares (measured); traversing is the one right that asks for nothing a folder of
-/// the user's own does not give. A handle that is not held shares everything and takes no part in a
-/// sharing check.
+/// Held: opened without `FILE_SHARE_DELETE`, with traverse access, so nobody can rename or remove the
+/// folder while the handle lives. Sharing is judged only for opens asking data, execute or delete access,
+/// so [`DIR_ACCESS`] alone would not hold it. Shared: shares everything, takes no part in sharing checks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Hold {
     Held,
@@ -76,8 +72,7 @@ impl Hold {
 }
 
 /// The name opened does not exist. Downcastable from the error of [`open_root`], [`open_dir`] and
-/// [`open_existing_file`], for a caller that looks at what may not be there yet. Never from
-/// [`confirm_dir`] or [`confirm_child`]: what they confirm was there when the walk went through it.
+/// [`open_existing_file`], for a caller that looks at what may not be there yet.
 #[derive(Debug, Clone, thiserror::Error)]
 #[error("{} does not exist", path.display())]
 pub struct Missing {
@@ -92,6 +87,12 @@ pub struct Missing {
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]
 pub struct Refused(String);
+
+/// The open that holds a folder was denied. Never leaves this file: [`open_private_child`] opens the
+/// folder again, unheld, to say what is wrong with it.
+#[derive(Debug, thiserror::Error)]
+#[error("the open that holds the folder was denied")]
+struct HoldDenied;
 
 /// A directory opened by handle, never reached through a link.
 pub struct DirHandle {
@@ -184,6 +185,15 @@ impl<'a> Request<'a> {
         }
     }
 
+    /// The same open, shared: it asks for nothing but [`DIR_ACCESS`] and takes no part in sharing checks.
+    fn unheld(&self) -> Self {
+        Request {
+            denied: self.denied.clone(),
+            hold: Hold::Shared,
+            ..*self
+        }
+    }
+
     /// The rights the open asks for, and how it shares: one place, from what the request says it is.
     fn rights(&self) -> u32 {
         self.access | self.hold.extra_access()
@@ -239,21 +249,15 @@ fn open_by_path(path: &Path, request: &Request) -> anyhow::Result<OwnedHandle> {
 
 /// Confirm that `path`, resolved as a bind or a connect by a path through it resolves it, leads to
 /// `held`. The folder is opened by `path`, its last name not followed if it is a link, and refused if
-/// it is a link or is not the folder `held` is open on (not the same volume and 128-bit file id): a
-/// folder swapped for a link or another one while `held` was being opened is caught here. A path that
+/// it is not the folder `held` is open on (not the same volume and 128-bit file id; a link is another
+/// object, so it is refused): a folder swapped for a link or another one while `held` was being opened is caught here. A path that
 /// is gone is a [`Refused`] too, not [`Missing`]: the walk went through that folder, so a caller must not
 /// read it as "nothing made yet". The handle takes no part in a sharing check
 /// (`FILE_READ_ATTRIBUTES`, sharing everything) and is closed on return.
-///
-/// This is the one place a path below the profile directory is opened by more than one name, and only
-/// to confirm: what is done through it is done by handle.
 pub fn confirm_dir(path: &Path, held: &DirHandle) -> anyhow::Result<()> {
     let request = confirming();
     let seen = open_by_path(path, &request).map_err(|e| gone_is_refused(e, request.purpose))?;
-    let is_link = file_attributes(seen.0).with_context(|| format!("read the attributes of {}", path.display()))?
-        & FILE_ATTRIBUTE_REPARSE_POINT.0
-        != 0;
-    if is_link || !is_held(&seen, held, path)? {
+    if !is_held(&seen, held, path)? {
         return Err(replaced(path, request.purpose));
     }
     Ok(())
@@ -293,7 +297,8 @@ fn is_held(seen: &OwnedHandle, held: &DirHandle, path: &Path) -> anyhow::Result<
 /// The refusal of a folder that is not the one the walk went through.
 fn replaced(path: &Path, purpose: &str) -> anyhow::Error {
     Refused(format!(
-        "{} cannot be used {purpose}: it was replaced by a link or another folder while it was being opened.          Nothing is read or written through it",
+        "{} cannot be used {purpose}: it was replaced by a link or another folder while it was being opened. \
+         Nothing is read or written through it",
         path.display()
     ))
     .into()
@@ -304,7 +309,8 @@ fn replaced(path: &Path, purpose: &str) -> anyhow::Error {
 fn gone_is_refused(error: anyhow::Error, purpose: &str) -> anyhow::Error {
     match error.downcast_ref::<Missing>() {
         Some(missing) => Refused(format!(
-            "{} cannot be used {purpose}: it was moved or removed after the walk went through it. Nothing is              read or written through it",
+            "{} cannot be used {purpose}: it was moved or removed after the walk went through it. Nothing is \
+             read or written through it",
             missing.path.display()
         ))
         .into(),
@@ -322,11 +328,15 @@ pub fn open_dir(parent: &DirHandle, name: &str) -> anyhow::Result<DirHandle> {
 }
 
 /// [`open_dir`] for the private folder (`ssh-broker`), when only what is in it matters: it is not made
-/// if missing and its owner and ACL are not judged. A file there is removed and a folder is made
-/// again. The folder is held (see [`ensure_private_dir`]).
+/// if missing and its owner and ACL are not judged, unless its ACL denies the access that holding it
+/// takes: then they are, as [`ensure_private_dir`] does, to say why. A file there is removed and a
+/// folder is made again. The folder is held (see [`ensure_private_dir`]).
 pub fn open_existing_private_dir(parent: &DirHandle, name: &str) -> anyhow::Result<DirHandle> {
-    let request = Request::directory("as the private folder", MADE_AGAIN).held();
-    let (handle, path) = open_child(parent, name, &request)?;
+    let request = Request {
+        denied: Some(denied_text("")),
+        ..Request::directory("as the private folder", MADE_AGAIN).held()
+    };
+    let (handle, path) = open_private_child(parent, name, &request, None)?;
     Ok(DirHandle { handle, path })
 }
 
@@ -363,17 +373,25 @@ fn private_dir(parent: &DirHandle, name: &str, user: &Sid, create: bool, hold: H
         String::new()
     };
     let request = Request {
-        denied: Some(format!(
-            "{}{may_not_make}. {LEFT_AS_IT_IS}",
-            denied_problem("the private one")
-        )),
+        denied: Some(denied_text(&may_not_make)),
         disposition: if create { FILE_OPEN_IF } else { FILE_OPEN },
         descriptor: descriptor.as_ref().map(|descriptor| descriptor.0),
         hold,
         ..Request::directory("as the private folder", MADE_AGAIN)
     };
-    let (handle, path) = open_child(parent, name, &request)?;
+    let (handle, path) = open_private_child(parent, name, &request, Some(user))?;
+    refuse_unless_private(&handle, &path, user, request.purpose)?;
+    Ok(DirHandle { handle, path })
+}
 
+/// What a refusal says after the colon when the open of the private folder is denied: this process may
+/// not read its ACL, and `may_not_make` is what else the denial can mean.
+fn denied_text(may_not_make: &str) -> String {
+    format!("{}{may_not_make}. {LEFT_AS_IT_IS}", denied_problem("the private one"))
+}
+
+/// Refuse the folder `handle` is open on, at `path`, if its owner or its ACL is not the private one.
+fn refuse_unless_private(handle: &OwnedHandle, path: &Path, user: &Sid, purpose: &str) -> anyhow::Result<()> {
     let security = Security::from_handle(handle.0).with_context(|| format!("read the ACL of {}", path.display()))?;
     let (owner_ok, acl_ok) = dir_policy(&security, user)?;
     if let Some(problem) = owner_acl_problem(owner_ok, acl_ok, || OwnerAclWords {
@@ -386,13 +404,46 @@ fn private_dir(parent: &DirHandle, name: &str, user: &Sid, create: bool, hold: H
         ),
     }) {
         return Err(Refused(format!(
-            "{} cannot be used {}: {problem}. {LEFT_AS_IT_IS}",
-            path.display(),
-            request.purpose
+            "{} cannot be used {purpose}: {problem}. {LEFT_AS_IT_IS}",
+            path.display()
         ))
         .into());
     }
-    Ok(DirHandle { handle, path })
+    Ok(())
+}
+
+/// [`open_child`] for the private folder. Holding it asks for the right to traverse, which a folder whose
+/// ACL denies it refuses, and a denial says nothing of why. So when the held open is denied the folder is
+/// opened again, unheld, and judged as an open one is (as `user`, or as the account this process runs as
+/// when there is none): it is refused for what is wrong with it. The error is always the refusal, never
+/// a handle: a folder with the right owner and ACL grants its owner the access.
+fn open_private_child(
+    parent: &DirHandle,
+    name: &str,
+    request: &Request,
+    user: Option<&Sid>,
+) -> anyhow::Result<(OwnedHandle, PathBuf)> {
+    let denied = match open_child(parent, name, request) {
+        Err(e) if e.is::<HoldDenied>() => e,
+        opened => return opened,
+    };
+    let (handle, path) = open_child(parent, name, &request.unheld())?;
+    let current;
+    let user = match user {
+        Some(user) => user,
+        None => {
+            current = Sid::current_user()?;
+            &current
+        }
+    };
+    refuse_unless_private(&handle, &path, user, request.purpose)?;
+    Err(Refused(format!(
+        "{} cannot be used {}: its owner and ACL are right, yet this process could not hold it ({denied}). \
+         {LEFT_AS_IT_IS}",
+        path.display(),
+        request.purpose
+    ))
+    .into())
 }
 
 /// Open the file `name` under `dir` if it exists, with `access`. Looking never creates: a missing
@@ -467,6 +518,7 @@ fn judge(made: Made, path: &Path, request: &Request) -> anyhow::Result<OwnedHand
     let purpose = request.purpose;
     match (classify_open(made.status), &request.denied) {
         (OpenOutcome::Opened, _) => Ok(OwnedHandle(made.handle)),
+        (OpenOutcome::Denied, _) if request.hold == Hold::Held => Err(HoldDenied.into()),
         (OpenOutcome::NotADirectory, _) => Err(Refused(format!(
             "{} cannot be used {purpose}: it is not a directory. {}",
             path.display(),

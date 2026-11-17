@@ -295,6 +295,67 @@ fn a_refusal_of_the_folder_is_shown_as_itself_when_a_connect_to_a_starting_agent
     assert_eq!(format!("{err:#}"), cause);
 }
 
+/// What `listening` says of a connect that failed for a reason that is not "no agent": it is an error that
+/// names the socket.
+#[test]
+fn a_connect_that_fails_for_another_reason_than_no_agent_is_an_error_naming_the_socket() {
+    let profile = TempProfile::new("lis-other");
+    let location = profile.location();
+
+    let err = listening(Err(anyhow::anyhow!("the socket address is not usable")), &location)
+        .err()
+        .unwrap();
+
+    assert!(!err.is::<FolderFailed>(), "{err:#}");
+    let text = format!("{err:#}");
+    assert!(text.contains(&location.path().display().to_string()), "{text}");
+    assert!(text.contains("the socket address is not usable"), "{text}");
+}
+
+/// The folder a shim found missing is looked at again at each connect: refused on one look and usable on
+/// the next, it is no longer refused and the connect goes through; and once found, it is not walked again.
+#[test]
+fn a_folder_refused_on_one_look_and_usable_on_the_next_is_connected_through_and_kept() {
+    let (_profile, location, folder) = folder_missing_at_the_first_act_and_refused_since();
+    folder.connect().expect_err("the folder is refused");
+    assert!(folder.refusal().is_some(), "control: refused on the first look");
+    crate::test_support::icacls(location.dir(), &["/remove:g", "*S-1-1-0"]);
+    let _listener = crate::afunix::Listener::bind(location.path()).unwrap();
+
+    folder.connect().expect("the folder is usable now");
+
+    assert!(folder.refusal().is_none(), "{:?}", folder.refusal());
+    let Walk::Missing(looking) = &folder.walk else {
+        panic!("the folder was not missing at the first act")
+    };
+    let found = looking.folders().unwrap();
+    widen(location.dir());
+    let again = looking.folders().expect("a folder once found is not walked again");
+    assert!(std::ptr::eq(found, again), "the folders kept are the ones used");
+    assert!(folder.refusal().is_none(), "a walk that is not made refuses nothing");
+}
+
+/// A walk that fails with a system error and not a judgement (access denied at `Local`, by a deny entry on
+/// a stand-in) is a refusal of the folder too: no agent serves a folder that cannot be walked.
+#[test]
+fn a_walk_that_fails_with_a_system_error_is_a_refusal_naming_the_folder_it_could_not_open() {
+    let profile = TempProfile::new("sys-err");
+    let location = profile.location();
+    let local = location.dir().parent().unwrap().to_path_buf();
+    let user = format!("*{}", me().to_sddl().unwrap());
+    let app_data = local.parent().unwrap().to_path_buf();
+    // Attributes of a folder are also read by the right to list its parent, so both are denied.
+    crate::test_support::icacls(&app_data, &["/deny", &format!("{user}:(RD)")]);
+    crate::test_support::icacls(&local, &["/deny", &format!("{user}:(RA)")]);
+
+    let folder = folder_at(location);
+    crate::test_support::icacls(&app_data, &["/remove:d", &user]);
+    crate::test_support::icacls(&local, &["/remove:d", &user]);
+
+    let refusal = folder.refusal().expect("a walk that failed is a refusal");
+    assert!(refusal.contains(&local.display().to_string()), "{refusal}");
+}
+
 // wait_until_serving -----
 
 /// Scripted answers for `wait_until_serving`, recording the order of its calls.

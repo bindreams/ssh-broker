@@ -471,6 +471,24 @@ fn a_missing_name_is_missing_for_a_downcast_and_open_dir_does_not_create_it() {
 
 // confirm_dir -----
 
+/// The whole refusal of a folder that is not the one the walk went through, as a person reads it.
+fn replaced_text(path: &Path) -> String {
+    format!(
+        "{} cannot be used on the way to the private folder: it was replaced by a link or another folder while it \
+         was being opened. Nothing is read or written through it",
+        path.display()
+    )
+}
+
+/// The whole refusal of a folder that was moved or removed after the walk went through it.
+fn gone_text(path: &Path) -> String {
+    format!(
+        "{} cannot be used on the way to the private folder: it was moved or removed after the walk went through \
+         it. Nothing is read or written through it",
+        path.display()
+    )
+}
+
 #[test]
 fn confirm_dir_passes_the_folder_held_and_refuses_another_folder_or_a_link_at_its_path() {
     let profile = TempProfile::new("confirm");
@@ -480,9 +498,8 @@ fn confirm_dir_passes_the_folder_held_and_refuses_another_folder_or_a_link_at_it
 
     let other = profile.0.join("other");
     std::fs::create_dir(&other).unwrap();
-    let err = format!("{:#}", confirm_dir(&other, &held).unwrap_err());
-    assert!(err.contains(&other.display().to_string()), "{err}");
-    assert!(err.contains("replaced by a link or another folder"), "{err}");
+    let err = confirm_dir(&other, &held).unwrap_err();
+    assert_eq!(err.to_string(), replaced_text(&other));
 
     // A link to the very folder held is still a link: a handle is not opened through it.
     let link = profile.0.join("link");
@@ -501,7 +518,7 @@ fn confirm_dir_refuses_a_path_that_is_gone_and_does_not_call_it_missing() {
     let err = confirm_dir(&path, &held).unwrap_err();
 
     assert!(err.is::<Refused>() && !err.is::<Missing>(), "{err:#}");
-    assert!(format!("{err:#}").contains(&path.display().to_string()), "{err:#}");
+    assert_eq!(err.to_string(), gone_text(&path));
 }
 
 // confirm_child -----
@@ -517,11 +534,7 @@ fn confirm_child_passes_the_child_and_refuses_another_folder_a_link_or_a_name_th
     let other = profile.0.join("Other");
     std::fs::create_dir(&other).unwrap();
     let err = confirm_child(&open_root(&profile.0).unwrap(), "Other", &local).unwrap_err();
-    assert!(err.is::<Refused>(), "{err:#}");
-    assert!(
-        format!("{err:#}").contains("replaced by a link or another folder"),
-        "{err:#}"
-    );
+    assert_eq!(err.to_string(), replaced_text(&other));
 
     // A link under that name, even to the folder held.
     let link = profile.0.join("AppData").join("Link");
@@ -533,7 +546,7 @@ fn confirm_child_passes_the_child_and_refuses_another_folder_a_link_or_a_name_th
     std::fs::rename(local.path(), profile.0.join("aside")).unwrap();
     let err = confirm_child(&app_data, "Local", &local).unwrap_err();
     assert!(err.is::<Refused>() && !err.is::<Missing>(), "{err:#}");
-    assert!(format!("{err:#}").contains("was moved"), "{err:#}");
+    assert_eq!(err.to_string(), gone_text(local.path()));
 }
 
 /// The case a check by path cannot see: `Local` is in another folder and a junction to that folder

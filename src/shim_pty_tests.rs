@@ -1074,14 +1074,14 @@ fn a_notice_is_written_with_a_carriage_return_and_a_failure_to_write_it_is_said(
 
 // A folder that is refused -----
 
-/// The agent's socket in a folder that is refused, and the stand-in agent behind it: what reaches it first.
-/// A shim that connected sends its handshake, and the sentinel the test connects with sends nothing.
-fn refused_folder_with_an_agent(
+/// A stand-in profile with its private folder made and a stand-in agent listening in it: the thread
+/// returns how many bytes reached the agent first. A shim that connected sends its handshake, and the
+/// sentinel the test connects with sends nothing.
+fn agent_in_private_folder(
     tag: &str,
 ) -> (
     crate::test_support::TempProfile,
     SocketLocation,
-    Folder,
     std::thread::JoinHandle<usize>,
 ) {
     use std::io::Read;
@@ -1093,6 +1093,19 @@ fn refused_folder_with_an_agent(
         let mut first = [0u8; 1];
         listener.accept().unwrap().read(&mut first).unwrap()
     });
+    (profile, location, agent)
+}
+
+/// The agent's socket in a folder that is refused, and the stand-in agent behind it.
+fn refused_folder_with_an_agent(
+    tag: &str,
+) -> (
+    crate::test_support::TempProfile,
+    SocketLocation,
+    Folder,
+    std::thread::JoinHandle<usize>,
+) {
+    let (profile, location, agent) = agent_in_private_folder(tag);
     crate::test_support::widen(location.dir());
     let folder = folder_of(Ok(location.clone()));
     (profile, location, folder, agent)
@@ -1183,4 +1196,35 @@ fn a_shim_with_a_command_whose_folder_is_refused_on_a_later_look_names_that_refu
     assert!(!text.contains("no session is offered"), "told twice: {text}");
     assert!(text.contains("its ACL is not exactly"), "{text}");
     assert!(text.contains(&location.dir().display().to_string()), "{text}");
+}
+
+/// The stated limit where the user sees it: another program holds the private folder open with the right
+/// to delete it, so the shim cannot hold it. The login is told that, relays nothing and reaches nothing.
+#[test]
+fn a_shim_whose_folder_is_held_open_by_another_program_says_so_and_does_not_connect() {
+    let (_profile, location, agent) = agent_in_private_folder("ref-held");
+    let holder = crate::test_support::hold_for_deletion(location.dir());
+    let folder = folder_of(Ok(location.clone()));
+    let mut stderr = Vec::new();
+
+    let relayed = super::try_relay_at(
+        &folder,
+        &None,
+        &mut stderr,
+        None,
+        std::io::empty(),
+        &mut crate::shim_offer::Prompting,
+    )
+    .unwrap();
+    drop(holder);
+
+    assert_eq!(relayed, None, "the shim fails open instead of reaching the socket");
+    let text = String::from_utf8(stderr).unwrap();
+    assert!(text.starts_with("ssh-broker: no session is offered"), "{text}");
+    assert!(
+        text.contains(&crate::offer::text::folder_held(location.dir())),
+        "{text}"
+    );
+    drop(crate::afunix::connect(location.path()).unwrap());
+    assert_eq!(agent.join().unwrap(), 0, "the shim sent something to the agent");
 }
