@@ -15,7 +15,12 @@
 
 use std::process::Stdio;
 
+use ssh_broker::account::{integrity_class, integrity_of};
+use ssh_broker::logon::{self, LogonKind};
+use ssh_broker::provision::procwait;
 use ssh_broker::provision::registry::{OPENSSH_KEY, set_default_shell_under};
+use ssh_broker::socket_loc::Integrity;
+use ssh_broker::winutil::process_token;
 
 #[path = "common/account.rs"]
 mod account_fixture;
@@ -326,27 +331,54 @@ fn an_administrators_fail_open_shell_is_unelevated_when_the_login_said_the_word(
     );
 }
 
-/// Elevated (CI only). One test, for an account that is in Backup Operators and not in Administrators.
-/// Windows treats such an account's full token as one it filters, so sshd may hand the shim a token above
-/// Medium that has no Administrators in it: the level, not the group, decides what the broker gives it. The
-/// test records what sshd gives the plain shell; then the brokered exec session of the account must be at that
-/// level and served, and `internal-unelevated` must give it Medium.
+/// The levels of the folders the broker keeps, High first: where an agent of an account may be looked for.
+const LEVELS: [Integrity; 2] = [Integrity::High, Integrity::Medium];
+
+/// The ids of the agents `account` has running from `kit`'s exe, at either level.
+fn agents_of(kit: &Kit, account: &Account) -> Vec<u32> {
+    LEVELS
+        .into_iter()
+        .flat_map(|level| {
+            procwait::user_agents(&kit.exe, &account.sid, level)
+                .unwrap_or_else(|e| panic!("look for the agents of {}: {e:#}", account.name))
+        })
+        .map(|agent| agent.pid)
+        .collect()
+}
+
+/// `text` without its whitespace: a sentence the console wrapped, or one that has runs of blanks in it, is found whole.
+fn squeezed(text: &str) -> String {
+    text.split_whitespace().collect()
+}
+
+/// Elevated (CI only). One test, for an account that is in Backup Operators and not in Administrators: Windows
+/// elevates such an account's logon without its being an administrator, so sshd may hand the shim a token at
+/// High that has no Administrators in it, and the level, not the group, decides what the broker gives it.
 ///
-/// It fails by assertion, before any wait: the premises (sshd's token is High, a batch logon of the account is
-/// High) are read first, so that a shim and an agent at different levels, which would wait on each other,
-/// are never started.
+/// (a) Over the real sshd, the plain shell is at High and shows no Administrators. A shell below High fails the
+/// test with a message that says to report it as a finding: the premise of everything below it is then false.
+/// (b) At the password prompt, with the account granted nothing, the shim says that this login cannot start an
+/// elevated session from a password (`SeImpersonatePrivilege`, which the login does not hold), gives the plain
+/// shell, and no agent of the account runs afterwards. An agent that started fails the test: the stated limit
+/// does not hold. (c) An agent the test starts for the account with a batch logon (the test process holds the
+/// privilege) serves an SSH login at High, and `internal-unelevated` gives that login Medium.
+///
+/// Every wait is on an event of the session. Where the outcome could be "never" the test asserts first: the
+/// started agent's level against the folder the shim looks in, before the wait for it to serve.
 #[test]
-fn a_backup_operators_account_is_served_at_the_level_sshd_gives_it_and_the_word_steps_it_down() {
+fn a_backup_operators_account_gets_the_stated_limit_at_the_prompt_and_is_served_by_its_agent() {
     let _machine = machine::exclusive();
     account_fixture::assert_elevated();
     let kit = Kit::broker_with_helper("sshb");
     let account = Account::create("sshb", true);
+    // Not an administrator, and not granted the batch-logon right or anything else: what sshd and the prompt
+    // do with it is what Windows gives its group. Its sessions are at High (see `Account::integrity`).
     account.make_backup_operator();
-    // The prompt starts an agent at High with a batch logon, which a standard account does not have the right to.
-    account.grant_batch_logon_right();
+    // The session (c) starts is ended with `logout` before the account goes, passing or failing.
+    let _end = session_end::LogOutOnDrop::new(&kit.exe, &account, ServiceLogon::Sshd);
     let login = Login::new(&kit, &account);
 
-    // 1. What the plain shell gets: stock sshd with cmd.exe as the shell.
+    // (a) What the plain shell gets: stock sshd with cmd.exe as the shell.
     let system_root = std::env::var("SystemRoot").expect("SystemRoot is set");
     set_stock_shell(&std::path::Path::new(&system_root).join(r"System32\cmd.exe"));
     let plain = token_of_command(&kit, &login, "whoami /groups");
@@ -354,39 +386,63 @@ fn a_backup_operators_account_is_served_at_the_level_sshd_gives_it_and_the_word_
     assert_eq!(
         plain,
         TokenShown::new("High", "absent"),
-        "sshd gave this account a token that is not High without Administrators: the plan's premise does not hold \
-         on this machine, which is a finding to report, not a failure of the broker"
+        "sshd gave this account a token that is not High without Administrators: the plan's premise does not hold          on this machine, which is a finding to report, not a failure of the broker"
     );
 
-    // 2. What the agent the prompt starts would run at: read from a batch logon of the account, before
-    // anything waits for it.
-    let local = ssh_broker::account::account_named(&account.name).expect("look up the account");
-    let batch = ssh_broker::logon::batch_logon(&local, &password::password(&account.password))
-        .unwrap_or_else(|e| panic!("a batch logon of the account: {e:?}"));
-    let rid = ssh_broker::account::integrity_of(batch.0).expect("read the integrity of the batch token");
-    assert_eq!(
-        ssh_broker::account::integrity_class(rid),
-        ssh_broker::socket_loc::Integrity::High,
-        "a batch logon of this account is at {rid:#x}, below High: the shim looks in the elevated folder and the \
-         agent the prompt starts would serve the other one"
-    );
-    drop(batch);
-
-    // 3. Through the broker: the account's session, then exec sessions served by it.
+    // (b) The prompt, through the broker as the DefaultShell. The wait for the plain shell ends the same way
+    // whether or not an agent started: a started agent serves a shell with the same prompt, and the sentence
+    // is what tells them apart.
     set_default_shell_under(OPENSSH_KEY, &kit.exe.to_string_lossy(), &no_shell_to_carry())
         .expect("set the shim as DefaultShell");
-    let mut first = login.start();
-    first.log_in(&account.password);
-    first.check_relayed_shell();
-    let served = token_of_command(&kit, &login, "whoami /groups");
+    let mut prompted = login.start();
+    prompted.log_in(&account.password);
+    let shown = squeezed(&screen_text(&prompted.transcript));
+    let sentence = squeezed(&ssh_broker::offer::text::impersonate_right_missing(&account.name));
+    assert!(
+        shown.contains(&sentence),
+        "the shim did not say that this login cannot start an elevated session from a password: the stated limit          does not hold (an agent was started, or the logon failed for another reason). The session showed:
+{}",
+        prompted.text()
+    );
+    prompted.type_line("exit");
+    prompted.finish();
+    let running = agents_of(&kit, &account);
+    assert!(
+        running.is_empty(),
+        "agents of the account run after the prompt said it could start none (pids {running:?}): the stated limit          does not hold"
+    );
+
+    // (c) An agent of the account, started the way the prompt does it. Its level is read before anything waits
+    // for it: an agent at another level than the folder the shim looks in would never serve the login.
+    let local = ssh_broker::account::account_named(&account.name).expect("look up the account");
+    let started = logon::start_background_agent(
+        &local,
+        &password::password(&account.password),
+        &kit.exe,
+        LogonKind::Batch,
+    )
+    .unwrap_or_else(|e| panic!("start the account's agent with a batch logon: {e:?}"));
+    let token = process_token(started.process.0).expect("open the started agent's token");
+    let rid = integrity_of(token.0).expect("read the started agent's integrity level");
+    drop(token);
     assert_eq!(
-        served.label, "High",
-        "the brokered exec session is not at the level sshd gave"
+        integrity_class(rid),
+        account.integrity(),
+        "the agent started for the account runs at {rid:#x}, and the shim of its SSH login looks in the folder          for {:?}: the account's batch logon is not at the level sshd gives its logins, a finding to report",
+        account.integrity()
+    );
+    stand_in::wait_for_serving_marker(&account.socket_location(), started.process.0);
+    // A handle on the agent keeps its logon session in use; the session's end waits for the logoff.
+    drop(started);
+
+    assert_eq!(
+        token_of_command(&kit, &login, "whoami /groups").label,
+        "High",
+        "the login served by the agent is not at the level sshd gave"
     );
     assert_eq!(
         token_of_command(&kit, &login, "internal-unelevated whoami /groups"),
         TokenShown::new("Medium", "absent"),
         "the word"
     );
-    first.leave();
 }

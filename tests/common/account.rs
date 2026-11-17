@@ -289,8 +289,9 @@ impl Account {
         self.administrator.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Make the account a member of the local group Backup Operators and not of Administrators: a
-    /// token with the group's privileges that Windows treats as one UAC filters.
+    /// Make the account a member of the local group Backup Operators and not of Administrators: an account
+    /// Windows gives a token above Medium without its being an administrator. [`Account::integrity`] then
+    /// says `High`; the test that uses it checks that sshd's logon really is at that level.
     pub fn make_backup_operator(&self) {
         self.add_to_local_group("Backup Operators");
         self.backup_operator.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -340,7 +341,11 @@ impl Account {
     pub fn integrity(&self) -> Integrity {
         let sessions_at_high = self.administrator.load(std::sync::atomic::Ordering::Relaxed)
             || self.backup_operator.load(std::sync::atomic::Ordering::Relaxed);
-        if sessions_at_high { Integrity::High } else { Integrity::Medium }
+        if sessions_at_high {
+            Integrity::High
+        } else {
+            Integrity::Medium
+        }
     }
 
     /// Where the account's agent keeps its socket ([`Account::integrity`]). Panics for an account made
