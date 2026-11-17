@@ -79,7 +79,13 @@ pub fn run_on(exec: Option<RawExec>, detect: impl FnOnce() -> Encoding) -> anyho
     // out to be untrue — `exec_relay_is_byte_clean_*` covers the framing in both directions, and
     // `verify`'s probe covers a real child, real pipes and a real socket in both directions too.
     // What remains is a throughput difference, which does not earn a classifier.
-    match try_relay(&exec, &folder, log_failure.as_deref(), std::io::stdin(), &mut Prompting) {
+    match try_relay(
+        &exec,
+        &folder,
+        log_failure.as_deref(),
+        std::io::stdin(),
+        &mut Prompting::new(crate::account::elevation()),
+    ) {
         Ok(Some(code)) => {
             drop(log); // flush the appender before process::exit
             // Bypass main()'s Result→0/1 collapse; the i32→u32 cast is bit-preserving.

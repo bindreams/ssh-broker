@@ -223,7 +223,11 @@ fn on_refuses_a_non_elevated_shell_with_the_way_to_an_elevated_one() {
         text.contains("auto-login on needs an elevated administrator shell"),
         "{text}"
     );
-    assert!(text.contains("A shell hosted by ssh-broker is not elevated."), "{text}");
+    assert!(
+        text.contains("session ssh-broker hosts for an administrator is elevated"),
+        "it no longer says an ssh-broker shell is never elevated: {text}"
+    );
+    assert!(!text.contains("is not elevated."), "{text}");
     assert!(text.contains(&format!("run {EXE} logout")), "the full exe path: {text}");
     assert!(text.contains("press Ctrl+C at the password prompt"), "{text}");
     assert!(env.calls.is_empty(), "nothing was asked or changed: {:?}", env.calls);
@@ -275,9 +279,36 @@ fn on_refuses_a_missing_batch_right_naming_it() {
     assert!(text.contains("Local Security Policy"), "{text}");
     assert!(text.contains("never changes machine policy"), "{text}");
     assert!(
+        text.contains("Task Scheduler needs to start the session at boot"),
+        "the purpose is the boot task's: {text}"
+    );
+    assert!(
         !env.calls.iter().any(|call| call.starts_with("register")),
         "nothing is registered without the right: {:?}",
         env.calls
+    );
+}
+
+#[test]
+fn the_batch_right_sentence_names_its_purpose_and_is_the_same_sentence_otherwise() {
+    let boot = batch_right_missing("alice", AT_BOOT);
+    let prompt = batch_right_missing("alice", FROM_PROMPT);
+    assert!(prompt.contains("alice may not log on as a batch job"), "{prompt}");
+    assert!(prompt.contains(FROM_PROMPT), "{prompt}");
+    assert!(!prompt.contains("Task Scheduler"), "{prompt}");
+    for sentence in [&boot, &prompt] {
+        assert!(sentence.starts_with("ssh-broker: "), "{sentence}");
+        assert!(sentence.contains("\"Log on as a batch job\""), "{sentence}");
+        assert!(sentence.contains("Local Security Policy"), "{sentence}");
+        assert!(
+            sentence.ends_with("ssh-broker never changes machine policy."),
+            "{sentence}"
+        );
+    }
+    assert_eq!(
+        boot.replace(AT_BOOT, FROM_PROMPT),
+        prompt,
+        "only the purpose differs between the two"
     );
 }
 

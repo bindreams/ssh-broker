@@ -283,6 +283,9 @@ fn socket_reachable_row_tells_the_user_how_to_see_why_the_agent_is_not_there() {
     assert!(!row.pass);
     assert!(row.detail.contains("ssh-broker agent"), "{}", row.detail);
     assert!(row.detail.contains("desktop session"), "{}", row.detail);
+    // An administrator's agent refuses to start unelevated (exit 68), so the hint is not enough for them.
+    assert!(row.detail.contains("administrator"), "{}", row.detail);
+    assert!(row.detail.contains("elevated prompt"), "{}", row.detail);
 }
 
 #[test]

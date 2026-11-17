@@ -2,6 +2,7 @@
 //! what it does with a failed log, the accept loop and the home directory. None needs a second
 //! session or elevation, and none runs a shell.
 use super::*;
+use crate::account::Elevation;
 use crate::acl::{self, Sid};
 use crate::afunix::AcceptError;
 use crate::protocol::{ExitCode, FrameKind, FrameReader};
@@ -41,6 +42,7 @@ fn start_refuses_session_zero_before_it_touches_anything() {
         None,
         0,
         ME,
+        Elevation::Standard,
         &mut std::io::sink(),
         || Ok(()),
         || -> anyhow::Result<SocketLocation> { panic!("must not look for the profile in session 0") },
@@ -52,11 +54,33 @@ fn start_refuses_session_zero_before_it_touches_anything() {
 }
 
 #[test]
+fn a_filtered_agent_exits_68_before_it_touches_anything() {
+    let args = background(Some(ME));
+    for background in [None, Some(&args)] {
+        let err = start_with(
+            background,
+            2,
+            ME,
+            Elevation::Filtered,
+            &mut std::io::sink(),
+            || Ok(()),
+            || -> anyhow::Result<SocketLocation> { panic!("must not look for the profile") },
+            |_| -> anyhow::Result<_> { panic!("must not open a log") },
+            |_, _| panic!("must not serve"),
+        )
+        .unwrap_err();
+        assert_eq!(refusal(&err), Some(Refusal::Filtered));
+        assert_eq!(exit_code_of(&err), 68);
+    }
+}
+
+#[test]
 fn desktop_agent_still_refuses_session_zero_with_65() {
     let err = start_with(
         None,
         0,
         ME,
+        Elevation::Standard,
         &mut std::io::sink(),
         || Ok(()),
         || -> anyhow::Result<SocketLocation> { panic!("must not look for the profile") },
@@ -75,6 +99,7 @@ fn expect_user_mismatch_exits_64_before_touching_the_folder() {
         Some(&args),
         2,
         ME,
+        Elevation::Standard,
         &mut std::io::sink(),
         || Ok(()),
         || -> anyhow::Result<SocketLocation> { panic!("must not look for the profile for another user") },
@@ -93,6 +118,7 @@ fn locate_failure_exits_66() {
         Some(&args),
         2,
         ME,
+        Elevation::Standard,
         &mut std::io::sink(),
         || Ok(()),
         || anyhow::bail!("the account has no profile directory"),
@@ -119,6 +145,7 @@ fn folder_refusal_exits_67() {
         Some(&args),
         2,
         ME,
+        Elevation::Standard,
         &mut std::io::sink(),
         || Ok(()),
         || Ok(loc.clone()),
@@ -140,6 +167,7 @@ fn background_agent_is_allowed_in_session_zero() {
         Some(&args),
         0,
         ME,
+        Elevation::Standard,
         &mut std::io::sink(),
         || Ok(()),
         || Ok(loc.clone()),
@@ -163,6 +191,7 @@ fn start_makes_the_private_folder_then_serves_that_session_from_it() {
         None,
         3,
         ME,
+        Elevation::Standard,
         &mut std::io::sink(),
         || Ok(()),
         || Ok(loc.clone()),
@@ -194,6 +223,7 @@ fn start_serves_without_a_log_when_the_log_cannot_be_opened() {
         None,
         3,
         ME,
+        Elevation::Standard,
         &mut std::io::sink(),
         || Ok(()),
         || Ok(loc.clone()),
@@ -221,6 +251,7 @@ fn start_serves_without_a_log_when_the_logs_folder_is_refused() {
         None,
         3,
         ME,
+        Elevation::Standard,
         &mut stderr,
         || Ok(()),
         || Ok(loc.clone()),
@@ -246,6 +277,7 @@ fn start_returns_the_error_serving_stopped_with() {
         None,
         3,
         ME,
+        Elevation::Standard,
         &mut std::io::sink(),
         || Ok(()),
         || Ok(loc.clone()),
@@ -288,6 +320,7 @@ fn failure_after_the_log_opens_exits_1_and_logs_the_cause() {
             None,
             3,
             ME,
+            Elevation::Standard,
             &mut std::io::sink(),
             || Ok(()),
             || Ok(loc.clone()),
@@ -317,6 +350,7 @@ fn a_failed_reset_is_reported_on_stderr_when_the_start_is_refused() {
         None,
         0,
         ME,
+        Elevation::Standard,
         &mut stderr,
         failed_reset,
         || -> anyhow::Result<SocketLocation> { panic!("must not look for the profile in session 0") },
@@ -347,6 +381,7 @@ fn a_failed_reset_goes_to_stderr_and_to_the_log_when_it_opens() {
             None,
             3,
             ME,
+            Elevation::Standard,
             &mut stderr,
             failed_reset,
             || Ok(loc.clone()),
@@ -370,6 +405,7 @@ fn a_failed_reset_is_reported_once_on_stderr_when_the_log_does_not_open() {
         None,
         3,
         ME,
+        Elevation::Standard,
         &mut stderr,
         failed_reset,
         || Ok(loc.clone()),
@@ -391,6 +427,7 @@ fn a_reset_that_worked_says_nothing() {
         None,
         3,
         ME,
+        Elevation::Standard,
         &mut stderr,
         || Ok(()),
         || Ok(loc.clone()),
@@ -412,6 +449,7 @@ fn a_background_agent_resets_then_opens_its_log_then_serves_and_signals_nothing_
         Some(&args),
         2,
         ME,
+        Elevation::Standard,
         &mut std::io::sink(),
         || {
             events.borrow_mut().push("reset");

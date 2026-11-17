@@ -6,7 +6,7 @@
 //! 1) — running them in verify's own process would false-negative on a correctly-installed box.
 
 /// Symlink-traversal probe outcome. `Skipped` means the link could not even be created (a
-/// LeastPrivilege token lacks `SeCreateSymbolicLinkPrivilege`), so traversal was untestable —
+/// unelevated token lacks `SeCreateSymbolicLinkPrivilege`), so traversal was untestable —
 /// distinct from `Blocked` (created but RedirectionGuard refused to follow it). Only `Blocked`
 /// is a parity FAILURE; `Skipped` is informational (the session-id check is the real gate).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -317,7 +317,7 @@ fn dpapi_unprotect(blob: &[u8]) -> anyhow::Result<Vec<u8>> {
 /// Create a symlink in a fresh temp dir and read through it. In a network-logon session
 /// RedirectionGuard can block following the link (`STATUS_UNTRUSTED_MOUNT_POINT`); a session-1
 /// token traverses it. Returns `Skipped` if the link could not be created (no privilege — the
-/// common case for a LeastPrivilege agent, so this must NOT fail parity), `Blocked` if created
+/// common case for an unelevated agent, so this must NOT fail parity), `Blocked` if created
 /// but not followable, `Ok` if it traversed. (A privilege-free, discriminating probe would use
 /// a pre-existing cross-context link; that refinement is a Phase-8 item. The session-id check
 /// is the primary parity proof.)

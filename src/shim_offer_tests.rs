@@ -1,7 +1,7 @@
 //! Unit tests for `shim_offer`: what the shim does about a missing agent, as decisions. No console,
 //! no logon, no account.
 use super::*;
-use crate::account::LocalAccount;
+use crate::account::{Elevation, LocalAccount};
 use std::cell::RefCell;
 
 fn account(kind: AccountKind) -> Option<LocalAccount> {
@@ -18,7 +18,14 @@ fn account(kind: AccountKind) -> Option<LocalAccount> {
 fn exec_session_notice_is_one_line_on_stderr() {
     for absence in [Absence::NoAgent, Absence::NoProfileYet] {
         assert_eq!(
-            plan(true, true, absence, account(AccountKind::Local), None),
+            plan(
+                true,
+                true,
+                absence,
+                account(AccountKind::Local),
+                None,
+                Elevation::Standard
+            ),
             Plan::Notice { user: "alice".into() }
         );
     }
@@ -28,7 +35,14 @@ fn exec_session_notice_is_one_line_on_stderr() {
 fn no_terminal_login_gets_the_notice_and_never_enters_raw_mode() {
     // `plan` is all that runs before the console is touched: a plan that is not `Offer` never reaches
     // `ConsolePrompt::enter`.
-    let plan = plan(false, false, Absence::NoAgent, account(AccountKind::Local), None);
+    let plan = plan(
+        false,
+        false,
+        Absence::NoAgent,
+        account(AccountKind::Local),
+        None,
+        Elevation::Standard,
+    );
     assert_eq!(plan, Plan::Notice { user: "alice".into() });
 }
 
@@ -37,10 +51,11 @@ fn a_terminal_login_without_a_command_is_offered_the_session() {
     for absence in [Absence::NoAgent, Absence::NoProfileYet] {
         let local = account(AccountKind::Local).unwrap();
         assert_eq!(
-            plan(false, true, absence, Some(local.clone()), None),
+            plan(false, true, absence, Some(local.clone()), None, Elevation::Standard),
             Plan::Offer {
                 account: local,
-                absence
+                absence,
+                logon: LogonKind::Interactive
             }
         );
     }
@@ -50,10 +65,18 @@ fn a_terminal_login_without_a_command_is_offered_the_session() {
 fn a_non_local_account_is_still_told_why_at_the_terminal() {
     let other = account(AccountKind::NotLocal).unwrap();
     assert_eq!(
-        plan(false, true, Absence::NoAgent, Some(other.clone()), None),
+        plan(
+            false,
+            true,
+            Absence::NoAgent,
+            Some(other.clone()),
+            None,
+            Elevation::Standard
+        ),
         Plan::Offer {
             account: other,
-            absence: Absence::NoAgent
+            absence: Absence::NoAgent,
+            logon: LogonKind::Interactive
         }
     );
 }
@@ -61,7 +84,14 @@ fn a_non_local_account_is_still_told_why_at_the_terminal() {
 #[test]
 fn a_non_local_account_gets_no_notice_that_names_a_command_it_cannot_use() {
     assert_eq!(
-        plan(true, true, Absence::NoAgent, account(AccountKind::NotLocal), None),
+        plan(
+            true,
+            true,
+            Absence::NoAgent,
+            account(AccountKind::NotLocal),
+            None,
+            Elevation::Standard
+        ),
         Plan::Nothing
     );
 }
@@ -70,7 +100,14 @@ fn a_non_local_account_gets_no_notice_that_names_a_command_it_cannot_use() {
 fn other_absence_changes_nothing_today() {
     for (exec, console) in [(true, true), (false, true), (false, false)] {
         assert_eq!(
-            plan(exec, console, Absence::Other, account(AccountKind::Local), None),
+            plan(
+                exec,
+                console,
+                Absence::Other,
+                account(AccountKind::Local),
+                None,
+                Elevation::Standard
+            ),
             Plan::Nothing,
             "exec={exec} console={console}"
         );
@@ -79,8 +116,14 @@ fn other_absence_changes_nothing_today() {
 
 #[test]
 fn an_unreadable_account_changes_nothing() {
-    assert_eq!(plan(false, true, Absence::NoAgent, None, None), Plan::Nothing);
-    assert_eq!(plan(true, true, Absence::NoAgent, None, None), Plan::Nothing);
+    assert_eq!(
+        plan(false, true, Absence::NoAgent, None, None, Elevation::Standard),
+        Plan::Nothing
+    );
+    assert_eq!(
+        plan(true, true, Absence::NoAgent, None, None, Elevation::Standard),
+        Plan::Nothing
+    );
 }
 
 const REFUSAL: &str = "make the private folder p/ssh-broker: p/ssh-broker cannot be used as the private folder: its ACL is not exactly Full Control for me. It is left as it is: inspect it, remove it, and it is created again";
@@ -92,7 +135,7 @@ fn a_refused_private_folder_is_shown_and_no_session_is_offered() {
             for absence in [Absence::NoAgent, Absence::NoProfileYet, Absence::Other] {
                 for account in [account(AccountKind::Local), account(AccountKind::NotLocal), None] {
                     assert_eq!(
-                        plan(exec, console, absence, account, Some(REFUSAL)),
+                        plan(exec, console, absence, account, Some(REFUSAL), Elevation::Standard),
                         Plan::FolderRefused { cause: REFUSAL.into() },
                         "exec={exec} console={console} absence={absence:?}"
                     );
@@ -100,6 +143,107 @@ fn a_refused_private_folder_is_shown_and_no_session_is_offered() {
             }
         }
     }
+}
+
+#[test]
+fn a_full_shim_is_offered_the_session_with_a_batch_logon() {
+    let local = account(AccountKind::Local).unwrap();
+    for absence in [Absence::NoAgent, Absence::NoProfileYet] {
+        assert_eq!(
+            plan(false, true, absence, Some(local.clone()), None, Elevation::Full),
+            Plan::Offer {
+                account: local.clone(),
+                absence,
+                logon: LogonKind::Batch
+            }
+        );
+    }
+}
+
+#[test]
+fn only_a_full_shim_logs_on_as_a_batch_job() {
+    let local = account(AccountKind::Local).unwrap();
+    let logon = |elevation| match plan(false, true, Absence::NoAgent, Some(local.clone()), None, elevation) {
+        Plan::Offer { logon, .. } => logon,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(logon(Elevation::Full), LogonKind::Batch);
+    assert_eq!(logon(Elevation::Standard), LogonKind::Interactive);
+}
+
+#[test]
+fn a_full_shim_without_a_console_gets_the_notice_as_before() {
+    assert_eq!(
+        plan(
+            true,
+            true,
+            Absence::NoAgent,
+            account(AccountKind::Local),
+            None,
+            Elevation::Full
+        ),
+        Plan::Notice { user: "alice".into() }
+    );
+}
+
+#[test]
+fn a_filtered_shim_is_told_and_gets_the_plain_shell_whatever_else_is_true() {
+    for exec in [false, true] {
+        for console in [true, false] {
+            for absence in [Absence::NoAgent, Absence::NoProfileYet, Absence::Other] {
+                for account in [account(AccountKind::Local), account(AccountKind::NotLocal), None] {
+                    assert_eq!(
+                        plan(exec, console, absence, account, None, Elevation::Filtered),
+                        Plan::Filtered,
+                        "exec={exec} console={console} absence={absence:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn a_filtered_shim_is_told_before_the_folder_is_judged() {
+    assert_eq!(
+        plan(
+            false,
+            true,
+            Absence::NoAgent,
+            account(AccountKind::Local),
+            Some(REFUSAL),
+            Elevation::Filtered
+        ),
+        Plan::Filtered
+    );
+}
+
+#[test]
+fn a_missing_batch_right_is_told_in_the_prompts_sentence_and_only_for_a_batch_logon() {
+    let right = crate::logon::LogonFailure::from_win32(1385);
+    let told = start_failure(LogonKind::Batch, "alice", right.clone());
+    let StartFailure::NoBatchRight { sentence } = told else {
+        panic!("{told:?}");
+    };
+    assert_eq!(
+        sentence,
+        crate::autologin::batch_right_missing("alice", crate::autologin::FROM_PROMPT)
+    );
+    // An interactive logon's 1385 is Windows' own to say: the sentence is about a batch job.
+    assert!(matches!(
+        start_failure(LogonKind::Interactive, "alice", right),
+        StartFailure::Windows { .. }
+    ));
+}
+
+#[test]
+fn another_failure_of_the_batch_logon_is_windows_own_text() {
+    let wrong = crate::logon::LogonFailure::from_win32(1326);
+    let reason = wrong.reason.clone();
+    let StartFailure::Windows { reason: told } = start_failure(LogonKind::Batch, "alice", wrong) else {
+        panic!("a wrong password is Windows' to say");
+    };
+    assert_eq!(told, reason);
 }
 
 // the shim's one walk -----
@@ -159,7 +303,7 @@ fn rescued(location: SocketLocation, exec: bool) -> (Rescued, String) {
     let folder = folder_at(location);
     let connect = Err(anyhow::anyhow!("a connect that failed for no OS reason"));
     let mut shown = Vec::new();
-    let rescued = Prompting.rescue(
+    let rescued = Prompting::new(Ok(Elevation::Standard)).rescue(
         &Absent {
             exec,
             folder: &folder,
@@ -168,6 +312,57 @@ fn rescued(location: SocketLocation, exec: bool) -> (Rescued, String) {
         &mut shown,
     );
     (rescued, String::from_utf8(shown).unwrap())
+}
+
+#[test]
+fn the_rescue_of_a_filtered_shim_says_why_and_goes_on_in_the_plain_shell() {
+    // No agent where the shim looks: today that is a wait for a starting agent and then an offer or a
+    // notice. A filtered shim gets neither.
+    let profile = TempProfile::new("rs-filtered");
+    let folder = folder_at(profile.location());
+    let connect = folder.connect();
+    assert!(
+        is_no_agent(connect.as_ref().expect_err("no agent serves this temporary profile")),
+        "control: nothing serves"
+    );
+    for exec in [false, true] {
+        let mut shown = Vec::new();
+        let rescued = Prompting::new(Ok(Elevation::Filtered)).rescue(
+            &Absent {
+                exec,
+                folder: &folder,
+                connect: &connect,
+            },
+            &mut shown,
+        );
+        assert!(matches!(rescued, Rescued::Plain), "exec={exec}");
+        assert_eq!(
+            String::from_utf8(shown).unwrap(),
+            format!("{}\n", text::FILTERED_SHIM_NOTICE),
+            "exec={exec}"
+        );
+    }
+}
+
+#[test]
+fn the_rescue_of_a_shim_whose_token_cannot_be_read_offers_nothing_and_says_nothing() {
+    let profile = TempProfile::new("rs-no-token");
+    let folder = folder_at(profile.location());
+    let connect = folder.connect();
+    let mut shown = Vec::new();
+    let (log, rescued) = crate::test_support::logged(|| {
+        Prompting::new(Err(anyhow::anyhow!("the token cannot be read"))).rescue(
+            &Absent {
+                exec: false,
+                folder: &folder,
+                connect: &connect,
+            },
+            &mut shown,
+        )
+    });
+    assert!(matches!(rescued, Rescued::Plain));
+    assert!(shown.is_empty());
+    assert!(log.contains("the token cannot be read"), "{log}");
 }
 
 fn rescued_interactively(location: SocketLocation) -> (Rescued, String) {
@@ -246,7 +441,7 @@ fn a_login_with_a_terminal_whose_folder_is_refused_on_a_later_look_is_told_the_f
     let connect = folder.connect();
     let mut shown = Vec::new();
 
-    let rescued = Prompting.rescue(
+    let rescued = Prompting::new(Ok(Elevation::Standard)).rescue(
         &Absent {
             exec: false,
             folder: &folder,

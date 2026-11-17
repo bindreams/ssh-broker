@@ -44,7 +44,12 @@ pub fn non_interactive_notice(user: &str, exe: &str) -> String {
     )
 }
 
-/// The sentence for a background agent that ended before it served. 64 to 67 are the agent's own
+/// The one stderr line a login whose own token is an administrator's with elevation removed gets
+/// (`account::Elevation::Filtered`): the account's session serves elevated logins only, so there is no
+/// offer and no wait, and the shell is a plain one.
+pub const FILTERED_SHIM_NOTICE: &str = "ssh-broker: this account's session serves elevated logins only, and this login is an administrator's with elevation removed, so this runs without DPAPI, a loaded profile or symlink traversal.";
+
+/// The sentence for a background agent that ended before it served. 64 to 68 are the agent's own
 /// refusals (see `agent_background::Refusal`); it has no console, so its exit code is all it can say.
 /// `logs` is the folder of its log, if it could be found: without it the sentence has no pointer.
 pub fn agent_ended(code: u32, logs: Option<&std::path::Path>) -> String {
@@ -56,6 +61,9 @@ pub fn agent_ended(code: u32, logs: Option<&std::path::Path>) -> String {
                over the 107-byte AF_UNIX limit cannot hold it."
             .to_string(),
         67 => "the background session started, but its ssh-broker folder could not be made or was not safe to use."
+            .to_string(),
+        68 => "the agent refused to run: its token is an administrator's with elevation removed, and an \
+               administrator's session runs elevated or not at all."
             .to_string(),
         other => match logs {
             Some(logs) => format!(

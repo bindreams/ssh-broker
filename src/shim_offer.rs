@@ -15,11 +15,11 @@ use socket2::Socket;
 use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
 use windows::Win32::System::Threading::{GetExitCodeProcess, INFINITE, WaitForMultipleObjects};
 
-use crate::account::{self, LocalAccount};
+use crate::account::{self, Elevation, LocalAccount};
 use crate::acl::Sid;
 use crate::console_modes::ConsoleModes;
 use crate::console_prompt::{ConsolePrompt, absence, console_available, is_no_agent};
-use crate::logon::{self, StartedAgent, Survival};
+use crate::logon::{self, LogonFailure, LogonKind, StartedAgent, Survival};
 use crate::offer::{
     Absence, AccountKind, Disconnected, OfferIo, Offered, SessionKind, StartFailure, non_interactive_notice, offer,
     text,
@@ -40,8 +40,16 @@ pub enum Plan {
     Nothing,
     /// A session without a terminal: one stderr line naming `ssh -t` and `auto-login on`.
     Notice { user: String },
-    /// A terminal and no command: run the offer.
-    Offer { account: LocalAccount, absence: Absence },
+    /// A terminal and no command: run the offer, signing the account on as `logon` says.
+    Offer {
+        account: LocalAccount,
+        absence: Absence,
+        logon: LogonKind,
+    },
+    /// The shim's own token is an administrator's with elevation removed: this account's agent serves
+    /// elevated logins only. [`text::FILTERED_SHIM_NOTICE`] on stderr, no offer (it would start an agent
+    /// that refuses), no wait for a starting agent, and the plain shell.
+    Filtered,
     /// The user's folder cannot be used (`cause` says what failed and, for a refusal, what to do), so
     /// no agent can serve it: `cause` on stderr (unless the log's failure already says it), no
     /// prompt, no agent started.
@@ -55,16 +63,23 @@ pub enum Plan {
 /// today's message alone, because the notice's first sentence would be false for it. A non-local
 /// account is not told to run a command it cannot use.
 ///
+/// `elevation` is the shim's own. A `Filtered` shim decides before anything else, [`Plan::Filtered`];
+/// a `Full` one signs on as a batch job, which keeps the token whole, and any other as today.
+///
 /// `folder_refusal` is why the user's folder cannot be used, if it cannot (see [`Folder::refusal`]). It
-/// decides before anything else: the account, the absence and the console do not change that an
-/// offer, a prompt or a started agent would only end in the same failure.
+/// decides next: the account, the absence and the console do not change that an offer, a prompt or a
+/// started agent would only end in the same failure.
 pub fn plan(
     exec: bool,
     console: bool,
     absence: Absence,
     account: Option<LocalAccount>,
     folder_refusal: Option<&str>,
+    elevation: Elevation,
 ) -> Plan {
+    if elevation == Elevation::Filtered {
+        return Plan::Filtered;
+    }
     if let Some(cause) = folder_refusal {
         return Plan::FolderRefused {
             cause: cause.to_owned(),
@@ -77,7 +92,11 @@ pub fn plan(
         return Plan::Nothing;
     }
     if !exec && console {
-        return Plan::Offer { account, absence };
+        return Plan::Offer {
+            account,
+            absence,
+            logon: LogonKind::of_shim(elevation),
+        };
     }
     match account.kind {
         AccountKind::Local => Plan::Notice { user: account.name },
@@ -423,8 +442,17 @@ impl Rescue for NoRescue {
     }
 }
 
-/// The real thing: the notice on stderr, or the prompt at the console.
-pub(crate) struct Prompting;
+/// The real thing: the notice on stderr, or the prompt at the console. `elevation` is the shim's own
+/// token's (an unreadable one is logged, and no session is offered).
+pub(crate) struct Prompting {
+    elevation: anyhow::Result<Elevation>,
+}
+
+impl Prompting {
+    pub fn new(elevation: anyhow::Result<Elevation>) -> Prompting {
+        Prompting { elevation }
+    }
+}
 
 impl Rescue for Prompting {
     fn rescue(&mut self, absent: &Absent<'_>, stderr: &mut dyn Write) -> Rescued {
@@ -435,12 +463,24 @@ impl Rescue for Prompting {
                 None
             }
         };
+        let elevation = match &self.elevation {
+            Ok(elevation) => *elevation,
+            Err(e) => {
+                tracing::warn!("cannot tell how elevated this login is, so no session is offered: {e:#}");
+                return Rescued::Plain;
+            }
+        };
         let location = absent.folder.location();
         let kind_of_absence = absence(absent.connect, location);
         // An agent that has made its socket and not yet called `listen()`, or that has started and not
         // yet made its socket, refuses the connect like no agent at all. It is waited for, never
-        // prompted over.
-        if let (Absence::NoAgent, Ok(location), None) = (kind_of_absence, location, absent.folder.refusal()) {
+        // prompted over. A `Filtered` shim does not wait: the agent it would wait for does not serve it.
+        if let (Absence::NoAgent, Ok(location), None, false) = (
+            kind_of_absence,
+            location,
+            absent.folder.refusal(),
+            elevation == Elevation::Filtered,
+        ) {
             match Sid::current_user().and_then(|user| {
                 await_starting_agent(location, &provision::canonical_exe(), &user, || {
                     listening(absent.folder.connect().map_err(folder_failure), location)
@@ -453,8 +493,19 @@ impl Rescue for Prompting {
         }
         let console = !absent.exec && console_available();
         let cause = absent.folder.refusal();
-        match plan(absent.exec, console, kind_of_absence, account, cause.as_deref()) {
+        match plan(
+            absent.exec,
+            console,
+            kind_of_absence,
+            account,
+            cause.as_deref(),
+            elevation,
+        ) {
             Plan::Nothing => Rescued::Plain,
+            Plan::Filtered => {
+                let _ = writeln!(stderr, "{}", text::FILTERED_SHIM_NOTICE);
+                Rescued::Plain
+            }
             Plan::FolderRefused { cause } => {
                 if !absent.exec {
                     let _ = writeln!(stderr, "{}", text::folder_refused(&cause));
@@ -466,7 +517,11 @@ impl Rescue for Prompting {
                 let _ = writeln!(stderr, "{}", non_interactive_notice(&user, &exe.to_string_lossy()));
                 Rescued::Plain
             }
-            Plan::Offer { account, absence } => run_offer(account, absence),
+            Plan::Offer {
+                account,
+                absence,
+                logon,
+            } => run_offer(account, absence, logon),
         }
     }
 }
@@ -505,6 +560,7 @@ struct LiveIo {
     prompt: ConsolePrompt,
     account: LocalAccount,
     exe: PathBuf,
+    logon: LogonKind,
     started: Option<Started>,
 }
 
@@ -525,7 +581,7 @@ impl OfferIo for LiveIo {
             "asking Windows to sign {} in and start the background session",
             self.account.name
         );
-        match logon::start_background_agent(&self.account, password, &self.exe) {
+        match logon::start_background_agent(&self.account, password, &self.exe, self.logon) {
             Ok(agent) => {
                 tracing::info!("Windows started the background session; waiting for it to serve");
                 self.started = Some(Started { agent });
@@ -538,13 +594,25 @@ impl OfferIo for LiveIo {
                     failure.reason,
                     failure.code
                 );
-                Err(StartFailure::Windows { reason: failure.reason })
+                Err(start_failure(self.logon, &self.account.name, failure))
             }
         }
     }
 }
 
-fn run_offer(account: LocalAccount, kind_of_absence: Absence) -> Rescued {
+/// What the offer says of a logon that Windows refused. An account that may not log on as a batch job
+/// (stated limit 5) is told so in the sentence `auto-login` uses, whatever else Windows says; any other
+/// refusal, and a refused interactive logon, is Windows' own text.
+fn start_failure(logon: LogonKind, user: &str, failure: LogonFailure) -> StartFailure {
+    if logon == LogonKind::Batch && failure.right_not_granted() {
+        return StartFailure::NoBatchRight {
+            sentence: crate::autologin::batch_right_missing(user, crate::autologin::FROM_PROMPT),
+        };
+    }
+    StartFailure::Windows { reason: failure.reason }
+}
+
+fn run_offer(account: LocalAccount, kind_of_absence: Absence, logon: LogonKind) -> Rescued {
     let prompt = match ConsolePrompt::enter() {
         Ok(Some(prompt)) => prompt,
         Ok(None) => return Rescued::Plain,
@@ -557,6 +625,7 @@ fn run_offer(account: LocalAccount, kind_of_absence: Absence) -> Rescued {
         prompt,
         account: account.clone(),
         exe: provision::canonical_exe(),
+        logon,
         started: None,
     };
     match offer(SessionKind::Pty, account.kind, kind_of_absence, &account.name, &mut io) {

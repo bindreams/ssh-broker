@@ -269,7 +269,7 @@ fn notice_names_the_full_exe_path() {
 fn agent_exit_code_sentences() {
     let logs = std::path::Path::new(r"C:\Users\me\AppData\Local\ssh-broker\logs");
     let line = |code| text::agent_ended(code, Some(logs));
-    for code in [64, 65, 66, 67] {
+    for code in [64, 65, 66, 67, 68] {
         let sentence = line(code);
         assert!(sentence.starts_with("ssh-broker: "), "{sentence}");
         assert!(sentence.ends_with("\r\n"), "{sentence:?}");
@@ -283,8 +283,10 @@ fn agent_exit_code_sentences() {
     assert!(line(67).contains("folder"));
     // 67 is any failure to set the folder up, not only an unsafe one.
     assert!(line(67).contains("could not be made or was not safe"), "{}", line(67));
+    assert!(line(68).contains("elevated"), "{}", line(68));
     assert_ne!(line(64), line(65));
     assert_ne!(line(66), line(67));
+    assert_ne!(line(67), line(68));
     assert!(line(0).contains("took your session but did not answer"));
     let other = line(1);
     assert!(other.contains("exited with code 1"), "{other}");
@@ -309,6 +311,26 @@ fn a_failed_start_line_names_the_reason_once() {
         line,
         "ssh-broker: the background session did not start: the profile cannot be loaded\r\n"
     );
+}
+
+#[test]
+fn a_missing_batch_right_is_said_in_its_own_sentence_and_the_plain_shell_follows() {
+    let mut io = Fake::with_steps(vec![Ok(Step::Submit(password("pw")))]);
+    io.start_result = Some(Err(StartFailure::NoBatchRight {
+        sentence: "ssh-broker: alice may not log on as a batch job.".into(),
+    }));
+    let out = run_pty(&mut io);
+    assert_eq!(out, Offered::Plain);
+    assert_eq!(io.started_with.len(), 1, "one attempt");
+    assert!(
+        io.written.ends_with(&format!(
+            "ssh-broker: alice may not log on as a batch job.\r\n{}",
+            text::COST_LINE
+        )),
+        "{:?}",
+        io.written
+    );
+    assert!(!io.written.contains("Windows did not sign you in"), "{}", io.written);
 }
 
 #[test]

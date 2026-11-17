@@ -52,6 +52,11 @@ pub enum StartFailure {
     Internal {
         reason: String,
     },
+    /// An administrator's account may not log on as a batch job, which the elevated session needs
+    /// (stated limit 5). `sentence` is the whole line for the user, without its line end.
+    NoBatchRight {
+        sentence: String,
+    },
     Disconnected,
 }
 
@@ -106,6 +111,11 @@ pub fn offer(kind: SessionKind, account: AccountKind, absence: Absence, user: &s
                     }
                     Err(StartFailure::Internal { reason }) => {
                         io.write(&text::start_failed(&reason));
+                        io.write(text::COST_LINE);
+                        Offered::Plain
+                    }
+                    Err(StartFailure::NoBatchRight { sentence }) => {
+                        io.write(&format!("{sentence}\r\n"));
                         io.write(text::COST_LINE);
                         Offered::Plain
                     }

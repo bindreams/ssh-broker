@@ -216,6 +216,16 @@ impl Account {
     /// to run a password task for a standard user. Machine policy: CI only, and the right goes with
     /// the account when it is deleted.
     pub fn grant_batch_logon_right(&self) {
+        self.add_account_right("SeBatchLogonRight");
+    }
+
+    /// Deny the account "Log on as a batch job" (`SeDenyBatchLogonRight`), which wins over any grant, an
+    /// administrator's included. Machine policy: CI only, and the right goes with the account.
+    pub fn deny_batch_logon_right(&self) {
+        self.add_account_right("SeDenyBatchLogonRight");
+    }
+
+    fn add_account_right(&self, name: &str) {
         use windows::Win32::Foundation::{HLOCAL, LocalFree};
         use windows::Win32::Security::Authentication::Identity::{
             LSA_OBJECT_ATTRIBUTES, LSA_UNICODE_STRING, LsaAddAccountRights, LsaClose, LsaNtStatusToWinError,
@@ -237,7 +247,7 @@ impl Account {
         // SAFETY: valid pointers for the call; the policy handle is closed below.
         let opened = unsafe { LsaOpenPolicy(None, &attributes, 16 | 2048, &mut policy) };
         assert_eq!(opened.0, 0, "LsaOpenPolicy: {opened:?}");
-        let mut right = wide("SeBatchLogonRight");
+        let mut right = wide(name);
         let units = (right.len() - 1) as u16;
         let rights = [LSA_UNICODE_STRING {
             Length: units * 2,

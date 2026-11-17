@@ -47,8 +47,13 @@ impl BackgroundAgent {
     /// the agent left (exit code, `agent.log`) if it ends first.
     pub fn start(kit: &Kit, account: &Account) -> BackgroundAgent {
         let password = crate::password::password(&account.password);
-        let started = logon::start_background_agent(&local_account(account), &password, &kit.exe)
-            .unwrap_or_else(|e| panic!("the logon for {} failed: {e:?}", account.name));
+        let started = logon::start_background_agent(
+            &local_account(account),
+            &password,
+            &kit.exe,
+            logon::LogonKind::Interactive,
+        )
+        .unwrap_or_else(|e| panic!("the logon for {} failed: {e:?}", account.name));
         let location = socket_loc::for_profile(account.profile()).unwrap();
         let agent = BackgroundAgent {
             process: started.process,

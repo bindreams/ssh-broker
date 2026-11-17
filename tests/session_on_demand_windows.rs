@@ -8,7 +8,7 @@
 #![cfg(windows)]
 
 use ssh_broker::account::{self, AccountKind, LocalAccount};
-use ssh_broker::logon;
+use ssh_broker::logon::{self, LogonKind};
 use ssh_broker::userdir::{self, NoProfile};
 use ssh_broker::winutil::OwnedHandle;
 use windows::Win32::NetworkManagement::NetManagement::UF_ACCOUNTDISABLE;
@@ -109,25 +109,25 @@ fn a_network_token_shim_sees_the_agent_it_starts() {
     job.close();
 }
 
-/// Elevated (CI only). An administrator's shim runs at High integrity and the agent at Medium (its token
-/// is not elevated); the shim still learns that the agent serves from the files it writes.
-/// Covers `logon::start_background_agent` and `SocketWatch` with the stand-in shim; the production
+/// Elevated (CI only). An administrator's shim runs at High integrity and starts the agent through a batch
+/// logon: the agent runs elevated, and the shim learns that it serves from the files it writes.
+/// Covers `logon::start_background_agent` (`Batch`) and `SocketWatch` with the stand-in shim; the production
 /// shim's own flow is covered only by `prompt_path_windows.rs`.
 #[test]
-fn an_administrators_shim_sees_the_agent_it_starts() {
+fn an_administrators_shim_sees_the_elevated_agent_it_starts() {
     let _machine = machine::shared();
     account_fixture::assert_elevated();
     let kit = Kit::new("radm");
     let account = Account::create("radm", true);
     account.make_administrator();
     let password = password::password(&account.password);
-    let started = logon::start_background_agent(&account_of(&account), &password, &kit.exe)
+    let started = logon::start_background_agent(&account_of(&account), &password, &kit.exe, LogonKind::Batch)
         .unwrap_or_else(|e| panic!("logon failed: {e:?}"));
     let location = ssh_broker::socket_loc::for_profile(account.profile()).unwrap();
     stand_in::wait_for_serving_marker(&location, started.process.0);
     assert_eq!(
         kit.agent_info("elevated"),
-        "false",
+        "true",
         "the agent started for an administrator runs with an elevated token"
     );
     assert_eq!(
@@ -136,6 +136,54 @@ fn an_administrators_shim_sees_the_agent_it_starts() {
         "agent.error: {}",
         kit.read("agent.error")
     );
+}
+
+/// Elevated (CI only). The interactive logon of an administrator is split by UAC, so the real agent
+/// it starts has a filtered token and refuses to start: exit code 68, the record the shim reads.
+/// Covers `agent_background::check_start` (`Refusal::Filtered`) through the real agent.
+#[test]
+fn an_agent_started_with_an_administrators_filtered_token_exits_68() {
+    let _machine = machine::shared();
+    account_fixture::assert_elevated();
+    let kit = Kit::copy_of_broker("rf68");
+    let account = Account::create("rf68", true);
+    account.make_administrator();
+    let password = password::password(&account.password);
+    let started = logon::start_background_agent(&account_of(&account), &password, &kit.exe, LogonKind::Interactive)
+        .unwrap_or_else(|e| panic!("logon failed: {e:?}"));
+    // SAFETY: a valid process handle.
+    let pid = unsafe { windows::Win32::System::Threading::GetProcessId(started.process.0) };
+    let code = bounded_wait::wait_for_exit(
+        started.process.0,
+        pid,
+        "the agent of an administrator's filtered token",
+        bounded_wait::CHILD_EXIT_BOUND,
+        &[],
+    );
+    assert_eq!(
+        code,
+        ssh_broker::agent_background::Refusal::Filtered.code() as u32,
+        "the agent that refused ended with {code:#x}"
+    );
+}
+
+/// Elevated (CI only). An account that may not log on as a batch job (a deny right here; an
+/// administrator lacks the right only by policy) is told so by the logon: error 1385, which
+/// `LogonFailure::right_not_granted` names, and no agent starts.
+/// Covers `logon::batch_logon` through `logon::start_background_agent`.
+#[test]
+fn an_account_that_may_not_log_on_as_a_batch_job_gets_error_1385() {
+    let _machine = machine::shared();
+    account_fixture::assert_elevated();
+    let kit = Kit::new("rbd");
+    let account = Account::create("rbd", true);
+    account.make_administrator();
+    account.deny_batch_logon_right();
+    let password = password::password(&account.password);
+    let failure = logon::start_background_agent(&account_of(&account), &password, &kit.exe, LogonKind::Batch)
+        .err()
+        .expect("a denied batch logon must fail");
+    assert!(failure.right_not_granted(), "{failure:?}");
 }
 
 /// The jobs of this test process, which every M3 case needs to be none: the case builds the caller's whole
@@ -474,7 +522,7 @@ fn logon_with_seclogon_stopped_returns_windows_reason() {
     let account = Account::create("m7s", true);
     let _seclogon = SeclogonGuard::engage(false);
     let password = password::password(&account.password);
-    match logon::start_background_agent(&account_of(&account), &password, &kit.exe) {
+    match logon::start_background_agent(&account_of(&account), &password, &kit.exe, LogonKind::Interactive) {
         Ok(started) => {
             let location = ssh_broker::socket_loc::for_profile(account.profile()).unwrap();
             stand_in::wait_for_serving_marker(&location, started.process.0);
@@ -494,7 +542,7 @@ fn logon_with_seclogon_disabled_returns_windows_reason() {
     let account = Account::create("m7d", true);
     let _seclogon = SeclogonGuard::engage(true);
     let password = password::password(&account.password);
-    let failure = logon::start_background_agent(&account_of(&account), &password, &kit.exe)
+    let failure = logon::start_background_agent(&account_of(&account), &password, &kit.exe, LogonKind::Interactive)
         .err()
         .expect("the logon must fail while seclogon is disabled");
     assert!(!failure.reason.is_empty(), "no reason for code {}", failure.code);
@@ -509,7 +557,7 @@ fn wrong_password_returns_windows_reason() {
     let kit = Kit::new("wrong");
     let account = Account::create("wrong", true);
     let password = password::password("not-the-password");
-    let failure = logon::start_background_agent(&account_of(&account), &password, &kit.exe)
+    let failure = logon::start_background_agent(&account_of(&account), &password, &kit.exe, LogonKind::Interactive)
         .err()
         .expect("a wrong password must fail");
     assert_eq!(failure.code, 1326, "{failure:?}");
@@ -525,7 +573,7 @@ fn disabled_account_returns_reason() {
     let kit = Kit::new("dis");
     let account = Account::create_with("dis", true, UF_ACCOUNTDISABLE);
     let password = password::password(&account.password);
-    let failure = logon::start_background_agent(&account_of(&account), &password, &kit.exe)
+    let failure = logon::start_background_agent(&account_of(&account), &password, &kit.exe, LogonKind::Interactive)
         .err()
         .expect("a disabled account must fail");
     assert!(matches!(failure.code, 1327 | 1331), "{failure:?}");
@@ -542,7 +590,7 @@ fn logon_as_account_with_space_in_name() {
     let name = format!("sb lg{:x}", std::process::id());
     let account = Account::create_named(&name, "Pw-Sp-Aa1!-lg", true);
     let password = password::password(&account.password);
-    let started = logon::start_background_agent(&account_of(&account), &password, &kit.exe)
+    let started = logon::start_background_agent(&account_of(&account), &password, &kit.exe, LogonKind::Interactive)
         .unwrap_or_else(|e| panic!("logon as {name:?} failed: {e:?}"));
     let location = ssh_broker::socket_loc::for_profile(account.profile()).unwrap();
     stand_in::wait_for_serving_marker(&location, started.process.0);

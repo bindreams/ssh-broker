@@ -31,8 +31,12 @@ fn agent_xml_runs_for_any_member_of_users() {
         "IgnoreNew could drop the second user's agent"
     );
     assert!(
-        xml.contains("<RunLevel>LeastPrivilege</RunLevel>"),
-        "elevation would re-arm RedirectionGuard"
+        xml.contains("<RunLevel>HighestAvailable</RunLevel>"),
+        "an administrator's agent is elevated, a standard account's has its only token"
+    );
+    assert!(
+        !xml.contains("LeastPrivilege"),
+        "the filtered token is refused by the agent"
     );
     assert!(xml.contains(r"C:\ProgramData\ssh-broker\ssh-broker.exe"));
     assert!(xml.contains("<Arguments>agent</Arguments>"));
@@ -125,6 +129,48 @@ fn xml_is_group_logon_task_tolerates_case_and_whitespace_in_the_queried_form() {
 fn agent_task_row_passes_for_the_group_task() {
     let row = agent_task_row(&Ok(Some(agent_task_xml(r"C:\x.exe"))));
     assert!(row.pass, "{}", row.detail);
+    assert!(
+        row.detail.contains("HighestAvailable"),
+        "the row names the run level: {}",
+        row.detail
+    );
+}
+
+/// The agent task as an earlier `apply` registered it.
+fn least_privilege_agent_task_xml() -> String {
+    agent_task_xml(r"C:\x.exe").replace("HighestAvailable", "LeastPrivilege")
+}
+
+#[test]
+fn xml_is_group_logon_task_requires_the_highest_available_run_level() {
+    assert!(xml_is_group_logon_task(&agent_task_xml(r"C:\x.exe")));
+    assert!(
+        !xml_is_group_logon_task(&least_privilege_agent_task_xml()),
+        "an administrator's agent from this task would be filtered, and refuse to start"
+    );
+    let omitted = agent_task_xml(r"C:\x.exe").replace("    <RunLevel>HighestAvailable</RunLevel>\n", "");
+    assert!(!omitted.contains("RunLevel"), "control: no run level");
+    assert!(
+        !xml_is_group_logon_task(&omitted),
+        "the service leaves LeastPrivilege out when it holds the default"
+    );
+}
+
+#[test]
+fn xml_is_group_logon_task_tolerates_case_and_whitespace_in_the_run_level() {
+    let queried = agent_task_xml(r"C:\x.exe").replace(
+        "<RunLevel>HighestAvailable</RunLevel>",
+        "<RunLevel>\n  highestavailable \n</RunLevel>",
+    );
+    assert!(xml_is_group_logon_task(&queried));
+}
+
+#[test]
+fn agent_task_row_fails_for_the_run_level_of_an_earlier_apply_and_says_to_run_apply() {
+    let row = agent_task_row(&Ok(Some(least_privilege_agent_task_xml())));
+    assert!(!row.pass, "{}", row.detail);
+    assert!(row.detail.contains("HighestAvailable"), "{}", row.detail);
+    assert!(row.detail.contains("apply"), "{}", row.detail);
 }
 
 #[test]

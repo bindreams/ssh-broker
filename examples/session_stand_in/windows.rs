@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use ssh_broker::account::current_account;
 use ssh_broker::acl::Sid;
-use ssh_broker::logon::start_background_agent;
+use ssh_broker::logon::{LogonKind, start_background_agent};
 use ssh_broker::route::{AgentArgs, BackgroundArgs, Route};
 use ssh_broker::shim_offer::{Served, wait_for_agent};
 use ssh_broker::socket_watch::SocketWatch;
@@ -118,7 +118,12 @@ fn run_shim(password: &str, agent_exe: &Path) -> String {
         Ok(watch) => watch,
         Err(e) => return format!("watch the socket failed: {e:#}"),
     };
-    let started = match start_background_agent(&account, &password::password(password), agent_exe) {
+    // As the real shim chooses: from its own token.
+    let kind = match ssh_broker::account::elevation() {
+        Ok(elevation) => LogonKind::of_shim(elevation),
+        Err(e) => return format!("elevation failed: {e:#}"),
+    };
+    let started = match start_background_agent(&account, &password::password(password), agent_exe, kind) {
         Ok(started) => started,
         Err(e) => return format!("logon failed: {} {}", e.code, e.reason),
     };

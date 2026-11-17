@@ -71,16 +71,27 @@ pub trait AutoLoginEnv {
 
 fn not_elevated(verb: &str, exe: &str) -> String {
     format!(
-        "ssh-broker: auto-login {verb} needs an elevated administrator shell. A shell hosted by ssh-broker is not \
-         elevated. Open an elevated prompt at the PC, or over SSH run {exe} logout, reconnect, press Ctrl+C at the \
-         password prompt for a plain shell, and run it there."
+        "ssh-broker: auto-login {verb} needs an elevated administrator shell, and this is not one. The session \
+         ssh-broker hosts for an administrator is elevated; if this one is not, open an elevated prompt at the PC, \
+         or over SSH run {exe} logout, reconnect, press Ctrl+C at the password prompt for a plain shell, and run it \
+         there."
     )
 }
 
-fn batch_right_missing(user: &str) -> String {
+/// What a batch logon is for, as [`batch_right_missing`] says it: the boot task of `auto-login`.
+pub(crate) const AT_BOOT: &str = "Task Scheduler needs to start the session at boot";
+
+/// What a batch logon is for, as [`batch_right_missing`] says it: the elevated session that the
+/// password prompt starts for an administrator.
+pub(crate) const FROM_PROMPT: &str =
+    "an elevated session started from a password needs (a logon at the desktop starts one without it)";
+
+/// The sentence for an account that may not log on as a batch job, naming what the logon is `purpose`
+/// for ([`AT_BOOT`], [`FROM_PROMPT`]). The one place that tells it, for the command and the prompt.
+pub(crate) fn batch_right_missing(user: &str, purpose: &str) -> String {
     format!(
-        "ssh-broker: {user} may not log on as a batch job, which Task Scheduler needs to start the session at boot. \
-         An administrator can grant \"Log on as a batch job\" in Local Security Policy (User Rights Assignment). \
+        "ssh-broker: {user} may not log on as a batch job, which {purpose}. An administrator can grant \
+         \"Log on as a batch job\" in Local Security Policy (User Rights Assignment). \
          ssh-broker never changes machine policy."
     )
 }
@@ -118,7 +129,7 @@ pub fn on(env: &mut dyn AutoLoginEnv, account: &LocalAccount) -> anyhow::Result<
     env.check_install()?;
     match env.batch_right(account, &password) {
         BatchRight::Granted => {}
-        BatchRight::Missing => anyhow::bail!(batch_right_missing(&account.name)),
+        BatchRight::Missing => anyhow::bail!(batch_right_missing(&account.name, AT_BOOT)),
         BatchRight::Refused(reason) => {
             anyhow::bail!(
                 "ssh-broker: Windows did not accept the password for {}: {reason}",

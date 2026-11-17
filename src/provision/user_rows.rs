@@ -98,8 +98,10 @@ pub fn socket_file_row(location: &anyhow::Result<SocketLocation>, user: &Sid) ->
 }
 
 /// What to do when the agent is not there. The logon task discards the agent's stderr, and an error
-/// before its log opens goes nowhere else; run by hand it prints that error.
-const AGENT_HINT: &str = " (to see why, run `ssh-broker agent` in your desktop session)";
+/// before its log opens goes nowhere else; run by hand it prints that error. An administrator's agent
+/// exits 68 at an ordinary prompt, so for them the hand run needs an elevated one.
+const AGENT_HINT: &str = " (to see why, run `ssh-broker agent` in your desktop session; an administrator runs it \
+                          from an elevated prompt)";
 
 /// `socket reachable`: this account's agent answers on its socket, which is connected to through
 /// the folder as the agent's own walk judges it: a folder that is refused is not connected through.
