@@ -200,3 +200,16 @@ fn a_profile_that_fits_the_plain_folder_but_not_the_elevated_one_is_told_the_ele
         }
     }
 }
+
+#[test]
+fn the_socket_file_refusal_names_the_label_only_for_the_elevated_folder() {
+    let path = Path::new("agent.sock");
+    assert_eq!(
+        file_acl_refusal(path, "alice", Integrity::Medium),
+        "agent.sock does not grant exactly alice, SYSTEM and Administrators"
+    );
+    assert_eq!(
+        file_acl_refusal(path, "alice", Integrity::High),
+        "agent.sock does not grant exactly alice, SYSTEM and Administrators, or lacks the High integrity label"
+    );
+}

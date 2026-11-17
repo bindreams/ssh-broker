@@ -240,22 +240,12 @@ fn socket_file_row_fails_for_a_file_that_grants_someone_else() {
         "control"
     );
 
-    let row = socket_file_row(&Ok(loc), &me());
+    let row = socket_file_row(&Ok(loc.clone()), &me());
 
     assert!(!row.pass);
-}
-
-#[test]
-fn the_socket_file_refusal_names_the_label_only_for_the_elevated_folder() {
-    let path = std::path::Path::new("agent.sock");
-    let plain = file_acl_refusal(path, &me(), Integrity::Medium);
-    assert!(plain.contains("does not grant exactly"), "{plain}");
-    assert!(!plain.contains("label"), "{plain}");
-    let elevated = file_acl_refusal(path, &me(), Integrity::High);
-    assert!(elevated.contains("does not grant exactly"), "{elevated}");
-    assert!(
-        elevated.ends_with("or lacks the High integrity label"),
-        "the label is what else is checked: {elevated}"
+    assert_eq!(
+        row.detail,
+        crate::socket_loc::file_acl_refusal(loc.path(), &me().describe(), crate::socket_loc::Integrity::Medium)
     );
 }
 

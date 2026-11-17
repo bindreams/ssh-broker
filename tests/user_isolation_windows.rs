@@ -119,17 +119,18 @@ fn read_sddl(path: &Path, info: OBJECT_SECURITY_INFORMATION) -> Result<String, S
     }
 }
 
-/// The mandatory-label ACE that makes an object Low with the ACE flags `ace_flags`, as SDDL.
-fn low_label_ace(ace_flags: &str) -> String {
-    format!("(ML;{ace_flags};NW;;;LW)")
+/// The mandatory-label ACE that makes an object `level` (an SDDL alias: `LW` Low, `ME` Medium) with the
+/// ACE flags `ace_flags`, as SDDL.
+fn label_ace(ace_flags: &str, level: &str) -> String {
+    format!("(ML;{ace_flags};NW;;;{level})")
 }
 
-/// Set `path`'s mandatory integrity label to Low, with the ACE flags `ace_flags` (`OICI` to pass it to
-/// children of a directory, empty for a file), so that a Low-integrity process of the user may write
-/// to it. Set through the security API: `icacls /setintegritylevel` reports success on a socket file
-/// and leaves it unlabelled.
-fn set_low_label(path: &Path, ace_flags: &str) {
-    let sddl = wide(&format!("S:{}", low_label_ace(ace_flags)));
+/// Set `path`'s mandatory integrity label to `level` (`LW`, `ME`), with the ACE flags `ace_flags` (`OICI`
+/// to pass it to children of a directory, empty for a file). Low lets a Low-integrity process of the user
+/// write to it. Set through the security API: `icacls /setintegritylevel` reports success on a socket
+/// file and leaves it unlabelled.
+fn set_label(path: &Path, ace_flags: &str, level: &str) {
+    let sddl = wide(&format!("S:{}", label_ace(ace_flags, level)));
     let path_w = wide(&path.to_string_lossy());
     // SAFETY: NUL-terminated inputs; the descriptor outlives the call and is freed after it.
     unsafe {
@@ -148,7 +149,7 @@ fn set_low_label(path: &Path, ace_flags: &str) {
             Some(sacl as *const ACL),
         );
         let _ = LocalFree(Some(HLOCAL(sd.0)));
-        rc.ok().unwrap_or_else(|e| panic!("label {path:?} Low: {e}"));
+        rc.ok().unwrap_or_else(|e| panic!("label {path:?} {level}: {e}"));
     }
 }
 
@@ -655,7 +656,7 @@ fn a_low_integrity_process_of_the_same_user_cannot_connect_to_the_agent_socket()
     let run = |tag: &str, level: u32| {
         let dir = profile.0.join(format!("pair-{tag}"));
         std::fs::create_dir(&dir).unwrap();
-        set_low_label(&dir, "OICI");
+        set_label(&dir, "OICI", "LW");
         child_entry::write_input(&dir, &format!("socket={}\nintegrity={level}\n", loc.path().display()));
         let name = "child_connects_at_its_integrity_level";
         let code = integrity::run_at(
@@ -692,10 +693,10 @@ fn a_low_integrity_process_of_the_same_user_cannot_connect_to_the_agent_socket()
 
     // The label is the cause: with only the socket file's label lowered to Low, the same Low child
     // connects.
-    set_low_label(loc.path(), "");
+    set_label(loc.path(), "", "LW");
     let labelled = security_of_file("after it was labelled Low");
     assert!(
-        labelled.contains(&low_label_ace("")) && acl::verify_file_acl(loc.path(), &me, Integrity::Medium).unwrap(),
+        labelled.contains(&label_ace("", "LW")) && acl::verify_file_acl(loc.path(), &me, Integrity::Medium).unwrap(),
         "the socket file must carry a Low label and keep its exact DACL\n{measured}\nnow: {labelled}"
     );
     let low_labelled = run("low-labelled", INTEGRITY_LOW);
@@ -805,7 +806,7 @@ fn an_unelevated_process_of_the_account_is_refused_the_elevated_folder() {
     let run = |tag: &str, level: u32| {
         let dir = profile.0.join(format!("pair-{tag}"));
         std::fs::create_dir(&dir).unwrap();
-        set_low_label(&dir, "OICI");
+        set_label(&dir, "OICI", "LW");
         child_entry::write_input(&dir, &format!("folder={}\nintegrity={level}\n", loc.dir().display()));
         let code = integrity::run_at(
             level,
@@ -874,7 +875,8 @@ fn an_unelevated_process_of_the_account_is_refused_the_elevated_folder() {
 }
 
 /// Elevated (CI only). The log folder inside the elevated folder is made with the High label, and the
-/// walk judges it with that label: it passes for the folder as the agent makes it.
+/// walk judges it with that label: it passes for the folder as the agent makes it, and refuses one with
+/// the right owner and DACL that lacks the label or carries another (here Medium), naming the log folder.
 #[test]
 fn the_log_folder_in_the_elevated_folder_carries_the_label() {
     account::assert_elevated();
@@ -884,14 +886,45 @@ fn the_log_folder_in_the_elevated_folder_carries_the_label() {
     userdir::ensure_socket_dir(&loc, &me).unwrap();
     assert!(
         acl::verify_dir_acl(&loc.logs_dir(), &me, Integrity::High).unwrap(),
-        "logs carries the label
-{}",
+        "logs carries the label\n{}",
         dacl_and_label_sddl(&loc.logs_dir())
     );
-    userdir::inspect_socket_dir(&loc, &me)
-        .unwrap()
-        .logs
-        .unwrap_or_else(|e| panic!("the walk judges logs as the agent made it: {e:#}"));
+    for walk in [userdir::open_socket_dir, userdir::inspect_socket_dir] {
+        walk(&loc, &me)
+            .unwrap()
+            .logs
+            .unwrap_or_else(|e| panic!("the walk judges logs as the agent made it: {e:#}"));
+    }
+
+    // Put in its place the `logs` the product makes for processes below High: the same owner and DACL, and
+    // no label.
+    let below = profile.location_at(Integrity::Medium);
+    userdir::ensure_socket_dir(&below, &me).unwrap();
+    std::fs::remove_dir(loc.logs_dir()).unwrap();
+    std::fs::rename(below.logs_dir(), loc.logs_dir()).unwrap();
+    assert!(
+        acl::verify_dir_acl(&loc.logs_dir(), &me, Integrity::Medium).unwrap(),
+        "the stand-in has the right owner and DACL\n{}",
+        dacl_and_label_sddl(&loc.logs_dir())
+    );
+    let refused_for_the_label = |why: &str| {
+        for walk in [userdir::open_socket_dir, userdir::inspect_socket_dir] {
+            let opened = walk(&loc, &me).expect("the private folder itself is the elevated one");
+            let err = format!(
+                "{:#}",
+                opened.logs.err().unwrap_or_else(|| panic!("logs {why} is refused"))
+            );
+            assert!(err.contains(&loc.logs_dir().display().to_string()), "{why}: {err}");
+            assert!(err.contains("mandatory label"), "{why}: {err}");
+        }
+    };
+    refused_for_the_label("without the label");
+
+    // An explicit label that is not the High one is refused too.
+    set_label(&loc.logs_dir(), "OICI", "ME");
+    let sddl = dacl_and_label_sddl(&loc.logs_dir());
+    assert!(sddl.contains(&label_ace("OICI", "ME")), "{sddl}");
+    refused_for_the_label("labelled Medium");
 }
 
 /// Child half of [`a_folder_the_account_made_in_the_elevated_ones_place_is_refused`]: make the folder the
@@ -924,7 +957,7 @@ fn a_folder_the_account_made_in_the_elevated_ones_place_is_refused() {
     let exe = std::env::current_exe().unwrap();
     let dir = profile.0.join("pair-makes");
     std::fs::create_dir(&dir).unwrap();
-    set_low_label(&dir, "OICI");
+    set_label(&dir, "OICI", "LW");
     child_entry::write_input(&dir, &format!("folder={}\n", loc.dir().display()));
     let code = integrity::run_at(
         INTEGRITY_MEDIUM,

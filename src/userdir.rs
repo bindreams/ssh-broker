@@ -111,7 +111,8 @@ impl SocketDir {
 /// Make `loc.dir` and its `logs` folder if they are missing, leave both exactly
 /// `{user, SYSTEM, Administrators}` with ACEs the files made inside inherit, and return them open. The
 /// elevated folder (`Integrity::High`) is born with the High label too, and an existing one must carry
-/// it; `logs` inside it inherits the label and is judged as any `logs` is.
+/// it. `logs` inside it is made with the folder's descriptor, label included, and judged for the same
+/// level: an existing `logs` without the label is refused, in [`SocketDir::logs`].
 ///
 /// Reached by handle from the profile directory (see `acl::private_dir`). `AppData` and `Local`
 /// must already exist: a missing one means no profile, and inventing one would put a socket where no

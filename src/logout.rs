@@ -131,9 +131,9 @@ pub fn run() -> anyhow::Result<()> {
         e.downcast_ref::<crate::userdir::NoProfile>().is_some() || crate::console_prompt::is_no_agent(e)
     };
     // An administrator's unelevated process looks in the plain folder, where its account has no agent.
-    let line = match (crate::account::elevation(), crate::account::integrity()) {
-        (Ok(elevation), Ok(level)) if crate::account::agent_is_elsewhere(elevation, level) => filtered_no_session(),
-        _ => NO_SESSION.to_owned(),
+    let line = match crate::account::elevation() {
+        Ok(crate::account::Elevation::Filtered) => filtered_no_session(),
+        Ok(_) | Err(_) => NO_SESSION.to_owned(),
     };
     logout_at(connect, no_session, &line, &mut std::io::stderr(), |code| {
         std::process::exit(code)

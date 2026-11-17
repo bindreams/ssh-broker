@@ -62,14 +62,9 @@ fn kit(tag: &str) -> Kit {
 /// The shim of `account` on a console, with the logs the shim and its agent write printed when a wait
 /// for the console fails: they say how far the shim got.
 fn start_run(kit: &Kit, account: &Account) -> PtyRun {
-    let profile = account.try_profile().map(std::path::Path::to_path_buf);
-    let integrity = account.integrity();
+    let location = account.try_socket_location();
     PtyRun::start(kit, account, &kit.exe).with_context(move || {
-        let logs = profile
-            .as_deref()
-            .and_then(|profile| socket_loc::for_profile(profile, integrity).ok())
-            .map(|location| stand_in::read_logs(&location))
-            .unwrap_or_default();
+        let logs = location.as_ref().map(stand_in::read_logs).unwrap_or_default();
         format!("logs of the account (shim.log, agent.log):\n{logs}")
     })
 }
@@ -77,8 +72,7 @@ fn start_run(kit: &Kit, account: &Account) -> PtyRun {
 /// The folder the agent of `account` logs into, as evidence for a wait that fails.
 fn logs_of(account: &Account) -> Vec<std::path::PathBuf> {
     account
-        .try_profile()
-        .and_then(|profile| socket_loc::for_profile(profile, account.integrity()).ok())
+        .try_socket_location()
         .map(|location| location.logs_dir())
         .into_iter()
         .collect()

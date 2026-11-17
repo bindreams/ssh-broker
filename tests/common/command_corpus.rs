@@ -29,7 +29,7 @@ pub const CORPUS: &[&str] = &[
     "x\r\ny z",
     r#"echo "a b""#,
     r#"echo  "a  b"   x"#,
-    "cmd /c echo a   b",
+    "cmd /c echo a   b", // spaces-ok: the run of spaces is the input under test
     r#"echo "a"b"#,
     r#"x""y"#,
     r#"a"b"#,

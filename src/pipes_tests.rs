@@ -51,7 +51,7 @@ fn exec_keeps_the_trailing_spaces_of_a_command() {
     let out = out_t.join().unwrap();
     err_t.join().unwrap();
 
-    assert_eq!(String::from_utf8_lossy(&out), "a   \r\n");
+    assert_eq!(String::from_utf8_lossy(&out), "a   \r\n"); // spaces-ok: the child writes them, and the test reads them back
 }
 
 /// A file that exists and cannot be started (here, not a program at all) is an error from `spawn`.

@@ -254,7 +254,14 @@ fn bind_removes_the_socket_and_refuses_when_the_file_acl_does_not_verify() {
     let err = super::Listener::bind_with(&p, Integrity::Medium, &|_, _| Ok(false))
         .err()
         .expect("must refuse");
-    assert!(format!("{err:#}").contains("socket file"), "{err:#}");
+    let who = crate::acl::Sid::current_user().unwrap().describe();
+    assert_eq!(
+        format!("{err:#}"),
+        format!(
+            "the socket file {}; refusing to listen (fail-closed)",
+            crate::socket_loc::file_acl_refusal(&p, &who, Integrity::Medium)
+        )
+    );
     assert!(!p.exists(), "a socket whose ACL is unproven is not left behind");
     let _ = std::fs::remove_dir_all(&dir);
 }

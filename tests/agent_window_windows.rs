@@ -254,7 +254,8 @@ fn wait_until_the_console_is_gone(agent: &Spawned) {
     let classes = agent.window_classes();
     assert!(
         classes.is_empty(),
-        "a window is left on the agent's desktop after its console host ended: {classes:?}; the console hosts          found were {found:?}"
+        "a window is left on the agent's desktop after its console host ended: {classes:?}; the console hosts \
+         found were {found:?}"
     );
 }
 

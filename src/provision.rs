@@ -464,10 +464,7 @@ mod imp {
         let location = crate::userdir::current_socket_location();
         // An administrator's unelevated prompt looks in the plain folder, where its account has no agent: the
         // rows about the agent would only say "none", so it is told why instead.
-        let filtered = match (&location, crate::account::elevation()) {
-            (Ok(loc), Ok(elevation)) => crate::account::agent_is_elsewhere(elevation, loc.integrity()),
-            _ => false,
-        };
+        let filtered = matches!(crate::account::elevation(), Ok(crate::account::Elevation::Filtered));
         match crate::acl::Sid::current_user() {
             Ok(_) if filtered => {
                 rows.push(user_rows::socket_location_row(&location));

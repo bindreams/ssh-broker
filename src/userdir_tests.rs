@@ -767,7 +767,7 @@ fn the_elevated_folder_is_born_labelled_and_so_is_what_is_made_in_it() {
     let folder = open_socket_dir(&loc, &me()).unwrap();
     assert!(acl::verify_dir_acl(loc.dir(), &me(), Integrity::High).unwrap());
     assert!(folder.logs.is_ok(), "the log folder is made inside it");
-    assert!(acl::verify_file_acl(&loc.logs_dir(), &me(), Integrity::High).unwrap());
+    assert!(acl::verify_dir_acl(&loc.logs_dir(), &me(), Integrity::High).unwrap());
     std::fs::write(loc.lock_path(), "").unwrap();
     assert!(acl::verify_file_acl(&loc.lock_path(), &me(), Integrity::High).unwrap());
     drop(folder);

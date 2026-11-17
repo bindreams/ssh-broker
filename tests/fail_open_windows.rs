@@ -124,7 +124,7 @@ fn exec_fail_open_hands_the_shell_the_command_as_one_argument() {
         r#"echo \"quoted\""#,
         "echo héllo wörld ✓",
         "echo %PATH% & echo b",
-        "cmd /c echo a   b",
+        "cmd /c echo a   b", // spaces-ok: the run of spaces is the input under test
     ] {
         let home = Home::probe_shell("sb-failopen-argument");
         let line = sshd_encoder::escaped_line(env!("CARGO_BIN_EXE_ssh-broker"), command);
@@ -238,7 +238,7 @@ fn exec_fail_open_appends_a_pty_command_as_conhost_rebuilt_it() {
     let spaced = r"C:\Spaced Dir\sftp-server.exe /c echo unquoted-ok";
     for (command, rebuilt) in [
         (spaced, spaced),
-        (r#"echo   spread    out "tight""#, "echo spread out tight"),
+        (r#"echo   spread    out "tight""#, "echo spread out tight"), // spaces-ok: the run of spaces is the input under test
         ("echo hi", "echo hi"),
     ] {
         let home = Home::probe_shell("sb-failopen-pty");

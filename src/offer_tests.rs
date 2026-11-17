@@ -352,3 +352,13 @@ fn a_failure_of_our_own_is_not_blamed_on_windows() {
     assert!(!io.written.contains("Windows did not sign you in"), "{}", io.written);
     assert!(io.written.ends_with(text::COST_LINE));
 }
+
+#[test]
+fn the_missing_impersonation_right_is_one_unbroken_sentence() {
+    assert_eq!(
+        text::impersonate_right_missing("alice"),
+        "ssh-broker: this login is elevated, and starting an elevated session for alice from a password needs the \
+         right \"Impersonate a client after authentication\", which this login does not hold (a logon at the desktop \
+         starts one without it; SSH logins use it while it runs)."
+    );
+}

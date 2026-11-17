@@ -15,7 +15,6 @@ use std::process::Command;
 use ssh_broker::cmdline::split_args;
 use ssh_broker::provision::registry::{OPENSSH_KEY, set_default_shell_under};
 use ssh_broker::shim::spawn_line;
-use ssh_broker::socket_loc;
 
 #[path = "common/account.rs"]
 mod account_fixture;
@@ -127,8 +126,7 @@ impl Rig {
     /// What the shim and the agent logged for the account, for the message of a failed assertion.
     fn logs(&self) -> String {
         self.account
-            .try_profile()
-            .and_then(|profile| socket_loc::for_profile(profile, self.account.integrity()).ok())
+            .try_socket_location()
             .map(|location| stand_in::read_logs(&location))
             .unwrap_or_default()
     }

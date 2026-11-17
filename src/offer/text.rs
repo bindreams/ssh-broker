@@ -67,7 +67,9 @@ pub const FILTERED_LOOKS_ELSEWHERE: &str = "this account is an administrator and
 /// gives the way out in the words of the batch-right sentence, and does not suggest granting the right.
 pub fn impersonate_right_missing(user: &str) -> String {
     format!(
-        "ssh-broker: this login is elevated, and starting an elevated session for {user} from a password needs          the right \"Impersonate a client after authentication\", which this login does not hold          (a logon at the desktop starts one without it; SSH logins use it while it runs)."
+        "ssh-broker: this login is elevated, and starting an elevated session for {user} from a password needs the \
+         right \"Impersonate a client after authentication\", which this login does not hold (a logon at the desktop \
+         starts one without it; SSH logins use it while it runs)."
     )
 }
 

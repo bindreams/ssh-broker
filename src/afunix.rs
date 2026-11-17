@@ -103,13 +103,8 @@ impl Listener {
             let _ = std::fs::remove_file(path);
             return match proven {
                 Ok(_) => Err(anyhow::anyhow!(
-                    "the socket file {} does not grant exactly the user, SYSTEM and Administrators{}; \
-                     refusing to listen (fail-closed)",
-                    path.display(),
-                    match integrity {
-                        Integrity::Medium => "",
-                        Integrity::High => " or does not carry the High label of the elevated folder",
-                    }
+                    "the socket file {}; refusing to listen (fail-closed)",
+                    crate::socket_loc::file_acl_refusal(path, &grantee()?, integrity)
                 )),
                 Err(e) => Err(e.context(format!("check the socket file {}", path.display()))),
             };
@@ -263,6 +258,17 @@ fn is_inheritable(sock: &Socket) -> anyhow::Result<bool> {
 #[cfg(windows)]
 fn socket_file_acl_ok(path: &Path, integrity: Integrity) -> anyhow::Result<bool> {
     crate::acl::verify_file_acl(path, &crate::acl::Sid::current_user()?, integrity)
+}
+
+/// Who the socket file must grant, as the refusal names them: the account this process runs as.
+#[cfg(windows)]
+fn grantee() -> anyhow::Result<String> {
+    Ok(crate::acl::Sid::current_user()?.describe())
+}
+
+#[cfg(not(windows))]
+fn grantee() -> anyhow::Result<String> {
+    Ok("the user".to_owned())
 }
 
 /// Off Windows there is no ACL to check; the directory's mode is the platform's concern.

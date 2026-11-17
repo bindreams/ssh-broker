@@ -324,6 +324,13 @@ impl Account {
         socket_loc::for_profile(self.profile(), self.integrity()).expect("the account's profile path is short enough")
     }
 
+    /// [`Account::socket_location`], or `None` for an account made without a profile or whose profile path
+    /// is too long: for evidence gathered while something else has already failed.
+    pub fn try_socket_location(&self) -> Option<SocketLocation> {
+        self.try_profile()
+            .and_then(|profile| socket_loc::for_profile(profile, self.integrity()).ok())
+    }
+
     /// The token sshd's key-authenticated logon gives: a network logon, no loaded profile.
     pub fn network_token(&self) -> OwnedHandle {
         let mut token = HANDLE::default();
@@ -515,11 +522,7 @@ impl Account {
         let primary = OwnedHandle(primary);
 
         let mut evidence = evidence.to_vec();
-        let location = self
-            .profile
-            .as_deref()
-            .and_then(|profile| socket_loc::for_profile(profile, self.integrity()).ok());
-        if let Some(location) = location {
+        if let Some(location) = self.try_socket_location() {
             evidence.push(location.dir().to_owned());
         }
         spawn_with_token(

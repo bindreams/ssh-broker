@@ -45,6 +45,20 @@ impl Integrity {
     }
 }
 
+/// What is said of a socket file at `path` that is not as the agent made it (`acl::verify_file_acl` is
+/// false): it must grant exactly `grantee`, SYSTEM and Administrators and, for [`Integrity::High`], carry
+/// the High label. One wording for the agent's refusal to bind and `verify`'s row.
+pub fn file_acl_refusal(path: &Path, grantee: &str, integrity: Integrity) -> String {
+    format!(
+        "{} does not grant exactly {grantee}, SYSTEM and Administrators{}",
+        path.display(),
+        match integrity {
+            Integrity::Medium => "",
+            Integrity::High => ", or lacks the High integrity label",
+        }
+    )
+}
+
 /// A user's socket directory and the socket inside it. Made from a profile directory and an integrity
 /// level and nothing else, so `dir` and `path` are always inside `profile`.
 #[derive(Debug, Clone, PartialEq, Eq)]

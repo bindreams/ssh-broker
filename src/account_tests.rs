@@ -246,21 +246,6 @@ fn the_folder_level_is_high_from_the_high_integrity_level_up_and_medium_below() 
     assert_eq!(integrity_class(INTEGRITY_SYSTEM), Integrity::High);
 }
 
-// where an administrator's agent is -----
-
-#[test]
-fn only_a_filtered_token_that_looks_in_the_plain_folder_is_told_the_agent_is_elsewhere() {
-    use crate::socket_loc::Integrity;
-    assert!(agent_is_elsewhere(Elevation::Filtered, Integrity::Medium));
-    // A filtered token at High looks in the elevated folder, where the agent is.
-    assert!(!agent_is_elsewhere(Elevation::Filtered, Integrity::High));
-    for elevation in [Elevation::Full, Elevation::Standard] {
-        for level in [Integrity::Medium, Integrity::High] {
-            assert!(!agent_is_elsewhere(elevation, level), "{elevation:?} at {level:?}");
-        }
-    }
-}
-
 #[test]
 fn the_token_of_a_process_handle_is_that_process_s_token() {
     use windows::Win32::System::Threading::GetCurrentProcess;
