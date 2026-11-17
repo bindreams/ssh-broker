@@ -293,19 +293,13 @@ fn token_information_of_a_handle_without_token_query_is_access_denied() {
 fn token_information_of_this_process_holds_a_header() {
     use windows::Win32::Security::{TOKEN_USER, TokenUser};
     let info = token_information(own_token().unwrap().0, TokenUser).unwrap();
-    assert!(info.len() >= size_of::<TOKEN_USER>(), "{}", info.len());
+    assert!(info.len >= size_of::<TOKEN_USER>(), "{}", info.len);
     // SAFETY: a `TOKEN_USER` is a SID pointer and an integer.
     let user = unsafe { info.header::<TOKEN_USER>() }.unwrap();
     assert!(!user.User.Sid.0.is_null());
 }
 
 // Reading token information -----
-
-/// Whether `sid` lies inside the bytes `info` holds.
-fn lies_inside(info: &TokenInformation, sid: windows::Win32::Security::PSID) -> bool {
-    let start = info.start() as usize;
-    (start..start + info.len()).contains(&(sid.0 as usize))
-}
 
 /// The pointers Windows writes into token information are absolute: they point into the very bytes
 /// the call filled, so the value must be read in place and never copied or moved afterwards.
@@ -320,12 +314,12 @@ fn the_sids_in_this_process_token_lie_inside_the_returned_value() {
     let info = token_information(token.0, TokenUser).unwrap();
     // SAFETY: a `TOKEN_USER` is a SID pointer and an integer.
     let user = unsafe { info.header::<TOKEN_USER>() }.unwrap();
-    assert!(lies_inside(&info, user.User.Sid), "TokenUser");
+    assert!(info.sid(user.User.Sid).is_ok(), "TokenUser");
 
     let info = token_information(token.0, TokenIntegrityLevel).unwrap();
     // SAFETY: a `TOKEN_MANDATORY_LABEL` is a SID pointer and an integer.
     let label = unsafe { info.header::<TOKEN_MANDATORY_LABEL>() }.unwrap();
-    assert!(lies_inside(&info, label.Label.Sid), "TokenIntegrityLevel");
+    assert!(info.sid(label.Label.Sid).is_ok(), "TokenIntegrityLevel");
 
     let info = token_information(token.0, TokenGroups).unwrap();
     // SAFETY: the group count is a `u32`.
@@ -333,7 +327,7 @@ fn the_sids_in_this_process_token_lie_inside_the_returned_value() {
     assert!(count > 0, "a token has at least one group");
     // SAFETY: a `SID_AND_ATTRIBUTES` is a SID pointer and an integer.
     let groups = unsafe { info.array::<SID_AND_ATTRIBUTES>(offset_of!(TOKEN_GROUPS, Groups), count as usize) }.unwrap();
-    assert!(lies_inside(&info, groups[0].Sid), "TokenGroups[0]");
+    assert!(info.sid(groups[0].Sid).is_ok(), "TokenGroups[0]");
 }
 
 /// A `TokenInformation` holding `bytes`. Data built this way must hold no pointers: the ones a real
@@ -362,7 +356,7 @@ fn counted(count: u32, values: &[u64]) -> TokenInformation {
 #[test]
 fn a_header_and_the_array_after_it_read_back() {
     let info = counted(2, &[7, 9]);
-    assert_eq!(info.len(), 24);
+    assert_eq!(info.len, 24);
     // SAFETY: `u32` and `u64` accept every bit pattern.
     unsafe {
         assert_eq!(info.header::<u32>().unwrap(), 2);
@@ -401,7 +395,7 @@ fn a_count_whose_size_overflows_is_an_error() {
 fn the_length_is_what_the_call_returned_not_the_rounded_storage() {
     // 12 bytes live in 16 bytes of storage; the 4 after them were never written.
     let info = from_bytes(&[0u8; 12]);
-    assert_eq!(info.len(), 12);
+    assert_eq!(info.len, 12);
     // SAFETY: `u64` accepts every bit pattern.
     assert!(unsafe { info.array::<u64>(8, 1) }.is_err());
 }
@@ -418,7 +412,7 @@ fn a_fixed_size_class_reads_through_the_same_reader() {
     use windows::Win32::Security::{TOKEN_STATISTICS, TokenPrimary, TokenStatistics};
     let token = own_token().unwrap();
     let info = token_information(token.0, TokenStatistics).unwrap();
-    assert_eq!(info.len(), size_of::<TOKEN_STATISTICS>());
+    assert_eq!(info.len, size_of::<TOKEN_STATISTICS>());
     // SAFETY: `TOKEN_STATISTICS` is plain data.
     let stats = unsafe { info.header::<TOKEN_STATISTICS>() }.unwrap();
     assert_eq!(stats.TokenType, TokenPrimary);
@@ -462,15 +456,16 @@ fn a_sid_before_the_data_is_an_error() {
 
 #[test]
 fn a_sid_one_past_the_end_of_the_data_is_an_error() {
-    // 20 bytes live in 24 bytes of storage: the end of the data is not the end of the buffer.
     let info = with_a_sid();
-    assert!(info.sid(pointer_at(&info, info.len() as isize)).is_err());
+    assert!(info.sid(pointer_at(&info, info.len as isize)).is_err());
 }
 
 #[test]
 fn a_sid_whose_header_runs_past_the_end_is_an_error() {
+    // The value is 20 bytes in 24 bytes of storage: the end of the data is not the end of the buffer,
+    // and the header at 16 would fit in the buffer.
     let info = with_a_sid();
-    assert!(info.sid(pointer_at(&info, info.len() as isize - 4)).is_err());
+    assert!(info.sid(pointer_at(&info, info.len as isize - 4)).is_err());
 }
 
 #[test]
@@ -478,4 +473,16 @@ fn a_sid_whose_sub_authorities_run_past_the_end_is_an_error() {
     // The header fits, but its count of one sub-authority needs four bytes more.
     let info = from_bytes(&[0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 5]);
     assert!(info.sid(pointer_at(&info, 8)).is_err());
+}
+
+#[test]
+fn a_sid_not_aligned_for_its_sub_authorities_is_an_error() {
+    // The same SID as `with_a_sid`, one byte later: whole and inside the data, but a `u32` read of
+    // its sub-authority would be misaligned.
+    let mut bytes = vec![0u8; 9];
+    bytes.extend([1, 1, 0, 0, 0, 0, 0, 5]);
+    bytes.extend(18u32.to_ne_bytes());
+    let info = from_bytes(&bytes);
+    let err = info.sid(pointer_at(&info, 9)).unwrap_err();
+    assert!(err.to_string().contains("aligned"), "{err:#}");
 }
