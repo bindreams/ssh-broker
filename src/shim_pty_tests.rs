@@ -28,15 +28,10 @@ fn exec_with_terminal(command: &str) -> Exec {
 /// this containment is the sole thing between an unreachable agent and a process that outlives the
 /// session the README promises to reap.
 ///
-/// Read that as a statement about the PRODUCTION WIRING, not about this test's reach. This test
-/// calls `start_local` directly and therefore gates the start, not the wiring: it would stay green
-/// if `run_on` stopped calling it. What keeps the wiring honest is the single `start_local` call
-/// site, and `tests/fail_open_windows.rs` and `tests/interactive_fail_open_containment.rs`, which
-/// drive both arms end to end.
+/// Gates the start only; `run_on`'s wiring is covered by `tests/fail_open_windows.rs` and
+/// `tests/interactive_fail_open_containment.rs`.
 ///
-/// `cosca::Job` sets `KILL_ON_JOB_CLOSE`, so dropping the job must terminate the child. Before
-/// containment was added the child was created with no job at all, and would simply keep running
-/// here, which is exactly what this test would catch.
+/// Fails if the child is not in a job: it would keep running after the job handle drops.
 #[test]
 fn the_local_passthrough_child_is_contained_in_a_job() {
     use windows::Win32::Foundation::{STILL_ACTIVE, WAIT_OBJECT_0};
@@ -84,7 +79,7 @@ fn the_local_passthrough_start_accepts_whitespace_at_the_edges_of_a_command() {
 // The standard handles of the fail-open start -----
 
 /// A handle value this process has no handle for, as a stale standard handle is (its handle closed after
-/// the value was read). Handle values are small multiples of four; no table reaches this.
+/// the value was read). No table reaches this.
 fn stale_handle() -> windows::Win32::Foundation::HANDLE {
     windows::Win32::Foundation::HANDLE(0x7fff_fff0usize as *mut core::ffi::c_void)
 }
@@ -110,9 +105,8 @@ fn a_shim_with_a_missing_and_a_stale_standard_handle_still_starts_its_shell() {
     assert_eq!(child.finish().unwrap(), 5);
 }
 
-/// The realistic broken shape: stdout is a live pipe and stderr a stale value. The shell starts and what it
-/// writes to the live handle arrives. This is the one path where the inherit list is in use while a standard
-/// handle is absent.
+/// A broken shape: stdout is a live pipe and stderr a stale value. The shell starts and what it writes to the
+/// live handle arrives.
 #[test]
 fn a_live_standard_handle_still_carries_the_output_when_another_is_stale() {
     use crate::test_support::{drain, text_of};

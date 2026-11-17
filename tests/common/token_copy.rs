@@ -53,13 +53,13 @@ pub fn own_token_at(rid: u32, se_group_integrity: u32) -> HANDLE {
                 Attributes: se_group_integrity,
             },
         };
-        // The size is the structure and the SID it points to, as the API documents.
         let set = SetTokenInformation(
             token,
             TokenIntegrityLevel,
             (&raw const label).cast(),
             size_of::<TOKEN_MANDATORY_LABEL>() as u32 + GetLengthSid(label_sid),
         );
+        // A failure only leaks the SID.
         let _ = LocalFree(Some(HLOCAL(label_sid.0)));
         set.unwrap_or_else(|e| panic!("set the token's integrity level to {rid:#x}: {e}"));
     }

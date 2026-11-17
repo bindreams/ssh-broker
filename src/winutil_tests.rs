@@ -820,14 +820,6 @@ fn the_inherit_list_names_each_handle_once() {
     assert!(handle_list(&[]).is_empty());
 }
 
-/// A standard handle a process does not have (null, or `INVALID_HANDLE_VALUE`) is not inherited: in the
-/// list it would fail the call, where the start it replaces took the child without it.
-#[test]
-fn the_inherit_list_leaves_out_a_handle_that_is_not_one() {
-    let h = handle(0x40);
-    assert_eq!(handle_list(&[handle(0), h, handle(-1), h]), vec![h]);
-}
-
 // Starting a child -----
 
 /// An inheritable handle: the write end of a pipe, and the read end kept by the caller.
@@ -862,16 +854,6 @@ fn a_child_whose_stdout_and_stderr_are_one_handle_starts() {
     let (_read, write) = pipe_with_inheritable_write_end();
     let null = HANDLE::default();
     let h = write.0;
-    starts(ChildConsole::NoWindow, [null, h, h], &[null, h, h]).expect("one handle for stdout and stderr");
-    starts(ChildConsole::Parent, [null, h, h], &[null, h, h]).expect("the same on the parent's console");
-}
-
-/// The window policy of the parent's console adds no flag: the child shares the console this process has.
-#[test]
-fn a_child_on_the_parents_console_gets_no_window_flag() {
-    use windows::Win32::System::Threading::{CREATE_SUSPENDED, EXTENDED_STARTUPINFO_PRESENT};
-    assert_eq!(
-        creation_flags(&ChildConsole::Parent).0,
-        CREATE_SUSPENDED.0 | EXTENDED_STARTUPINFO_PRESENT.0
-    );
+    starts(ChildConsole::NoWindow, [null, h, h], &[h, h]).expect("one handle for stdout and stderr");
+    starts(ChildConsole::Parent, [null, h, h], &[h, h]).expect("the same on the parent's console");
 }

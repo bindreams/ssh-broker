@@ -78,7 +78,7 @@ fn a_child_on_pipes_with_the_unelevated_token_is_filtered_and_medium() {
         drain::drain(child.stderr_read_raw()),
     );
     let waited = child.wait();
-    // Joined before anything can fail: the threads read handles that `child` closes.
+    // Join before any assert: the readers use handles `child` closes.
     let said = format!("{}{}", drain::text_of(out), drain::text_of(err));
     waited.unwrap_or_else(|e| {
         panic!(

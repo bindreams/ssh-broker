@@ -10,21 +10,18 @@ use crate::socket_loc::SocketLocation;
 
 // What a test compares, and the link it puts in the way -----
 
-// One source with the integration tests of the private folder, which include it too.
 #[path = "../tests/common/fs_state.rs"]
 mod fs_state;
 pub use fs_state::{dacl_sddl, junction, tree_state};
 
 // A child's output -----
 
-// One source with the integration tests that wait for a child, which include it too.
 #[path = "../tests/common/drain.rs"]
 mod drain;
 pub use drain::{drain, text_of};
 
 // A copy of this process's token -----
 
-// One source with the integration tests that run a child at a chosen integrity level, which include it too.
 #[path = "../tests/common/token_copy.rs"]
 mod token_copy;
 

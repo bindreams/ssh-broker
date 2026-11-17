@@ -418,9 +418,11 @@ pub struct LocalChild {
 /// would have been under the agent. The child writes raw to sshd's pipes, exactly as the original
 /// DefaultShell did.
 ///
-/// A standard handle this process does not have, or cannot make inheritable, is not inherited and does not
-/// stop the start: the child gets null in its place, the reason is logged, and the shell runs. A broken broker
-/// must not cost the user their SSH access.
+/// A standard handle this process does not have, or that the system does not accept as a handle of this
+/// process, is not inherited and does not stop the start: the child gets null in its place, the reason is
+/// logged, and the shell runs. A broken broker must not cost the user their SSH access. A stale number that
+/// this process has since reused for another handle cannot be told from the handle it was given, and that
+/// object goes to the shell.
 ///
 /// It returns when the shell is running, and [`LocalChild::finish`] waits for it: a failure of the
 /// wait is not a failure to start, and must not run the command again.
@@ -428,7 +430,12 @@ fn start_local(command_line: &str, as_user: Option<&UnelevatedToken>) -> Result<
     use windows::Win32::System::Console::STD_ERROR_HANDLE;
     // SAFETY: no pointers. A failure is a handle this process does not have: null.
     let std_handles = unsafe {
-        [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE].map(|which| GetStdHandle(which).unwrap_or_default())
+        [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE].map(|which| {
+            GetStdHandle(which).unwrap_or_else(|e| {
+                tracing::warn!("this process has no standard handle ({e}), so the shell gets none");
+                HANDLE::default()
+            })
+        })
     };
     start_with_std_handles(command_line, std_handles, as_user)
 }
@@ -457,9 +464,11 @@ fn start_with_std_handles(
 }
 
 /// The standard handles the child gets and the handles it inherits, from the standard handles of this
-/// process (input, output, error). One that is null or invalid, or cannot be made inheritable, is not
-/// inherited, and the child gets null in its place: a value off the inherit list would name nothing in the
-/// child, and later whatever the child opens under that number. Each is logged with the reason.
+/// process (input, output, error). One that is null or invalid, or that the system does not accept as a
+/// handle of this process (`SetHandleInformation` fails), is not inherited, and the child gets null in its
+/// place: a value off the inherit list would name nothing in the child, and later whatever the child opens
+/// under that number. Each is logged with the reason. A stale number that this process has reused for
+/// another handle also passes the check, and cannot be told from the handle it was given.
 fn inheritable_std_handles(std_handles: [HANDLE; 3]) -> ([HANDLE; 3], Vec<HANDLE>) {
     use windows::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
     let mut passed = [HANDLE::default(); 3];

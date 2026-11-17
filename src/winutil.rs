@@ -285,17 +285,11 @@ impl Drop for FailCriticalErrors {
     }
 }
 
-/// The error of a `CreateProcessW` (or `CreateProcessAsUserW`, with `with_token`) that failed. The program
-/// is at fault unless the failure is the machine's ([`is_not_the_programs`]): the built-in would meet those
-/// too, while any other cause (an image that is missing, malformed, quarantined, blocked by policy or
-/// unreadable) is answered by the built-in, and an unknown cause is safest answered there too, since
-/// blaming the machine ends the session where blaming the program gives a working shell and a warning. A
-/// given `cwd` that is not a directory also fails the call: then the working directory is named and the
-/// shell is not blamed. Judged after the failure, so a directory that appears in between is not blamed
-/// either.
-///
-/// With a token, `ERROR_PRIVILEGE_NOT_HELD` is the token's: this process lacks a privilege the call needs
-/// to start a child with it, and the built-in shell, started with the same token, fails the same way.
+/// The error of a `CreateProcessW` (or `CreateProcessAsUserW`, with `with_token`) that failed. Blames the
+/// program unless the failure is the machine's ([`is_not_the_programs`]); an unknown cause blames the
+/// program, since that yields a working built-in shell plus a warning. A `cwd` that is not a directory names
+/// the directory instead. With a token, `ERROR_PRIVILEGE_NOT_HELD` is the machine's: the built-in shell,
+/// started with the same token, fails the same way.
 pub fn start_error_of_create(
     error: windows::core::Error,
     cwd: Option<&std::path::Path>,
@@ -513,12 +507,12 @@ fn creation_flags(console: &ChildConsole) -> PROCESS_CREATION_FLAGS {
 
 /// The handles for `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`: `inherit` with each handle once, in order. A handle
 /// named twice fails `CreateProcessW` (measured), and a terminal session's stdout and stderr can be one
-/// console handle. A null or invalid one is left out: a process without a standard handle has nothing to
-/// pass, and the list would refuse it.
+/// console handle. A null or invalid handle in `inherit` is the caller's error: the list would refuse it.
 fn handle_list(inherit: &[HANDLE]) -> Vec<HANDLE> {
     let mut list: Vec<HANDLE> = Vec::with_capacity(inherit.len());
     for handle in inherit {
-        if !handle.is_invalid() && !list.contains(handle) {
+        debug_assert!(!handle.is_invalid(), "a null or invalid handle on the inherit list");
+        if !list.contains(handle) {
             list.push(*handle);
         }
     }
@@ -534,8 +528,8 @@ fn handle_list(inherit: &[HANDLE]) -> Vec<HANDLE> {
 /// child's token is that one (`CreateProcessAsUserW`), not this process's.
 ///
 /// # Safety
-/// Every handle in `std_handles` and `inherit` is valid and inheritable (or null or `INVALID_HANDLE_VALUE`,
-/// which `inherit` skips), and `console`'s pseudoconsole is open.
+/// Every handle in `inherit` is valid and inheritable, each handle in `std_handles` is valid and inheritable
+/// or null, and `console`'s pseudoconsole is open.
 pub unsafe fn spawn_suspended(
     command: &str,
     cwd: Option<&std::path::Path>,

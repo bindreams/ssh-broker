@@ -121,7 +121,7 @@ fn interactive_fail_open_reaps_a_grandchild_when_the_shim_exits() {
     // never valid for a live process in the first place.
     let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE, false, pid) }
         .unwrap_or_else(|e| panic!("OpenProcess({pid}) failed while the grandchild should still be alive: {e}"));
-    let handle = ssh_broker::winutil::OwnedHandle(handle); // RAII CloseHandle, mirroring `start_local`'s callers
+    let handle = ssh_broker::winutil::OwnedHandle(handle);
 
     // Close the shim's stdin: pwsh sees EOF on its next read and exits, `LocalChild::finish`
     // observes pwsh's exit, `start_local`'s job object is dropped, and `KILL_ON_JOB_CLOSE`

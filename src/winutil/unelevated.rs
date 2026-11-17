@@ -24,8 +24,6 @@ use crate::acl::{Sid, WellKnown, set_token_default_dacl};
 /// The default DACL is not optional. The elevated token's names `Administrators`, which is now deny-only,
 /// so the objects the child's console is made with have no usable ACE for the user, and a child on pipes
 /// dies at start (`0xC0000142`; measured).
-///
-/// Start a child with it through [`super::spawn_suspended`].
 pub struct UnelevatedToken(OwnedHandle);
 
 impl UnelevatedToken {
@@ -105,7 +103,7 @@ fn lower_integrity(token: HANDLE, rid: u32) -> anyhow::Result<()> {
             std::mem::size_of::<TOKEN_MANDATORY_LABEL>() as u32 + GetLengthSid(sid),
         )
     };
-    // SAFETY: the allocation made by the conversion above, freed once.
+    // SAFETY: the allocation made by the conversion above, freed once. A failure only leaks the SID.
     let _ = unsafe { LocalFree(Some(HLOCAL(sid.0))) };
     set.context("set the integrity label")
 }

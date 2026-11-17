@@ -4,13 +4,32 @@
 //! `tests/unelevated_token_windows.rs`.
 use super::*;
 use crate::account::{Elevation, INTEGRITY_LOW, INTEGRITY_MEDIUM, elevation, elevation_of, integrity_of};
+use crate::acl::{Sid, WellKnown};
 use crate::test_support::{drain, own_token_copy, text_of};
-use crate::winutil::{ChildConsole, spawn_suspended, token_information};
+use crate::winutil::{ChildConsole, own_token, spawn_suspended, token_information};
+use windows::Win32::Foundation::{HLOCAL, LocalFree};
+use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
 use windows::Win32::Security::{
-    ACCESS_ALLOWED_ACE, ACL, ACL_SIZE_INFORMATION, AclSizeInformation, GetAce, GetAclInformation, TOKEN_DEFAULT_DACL,
-    TOKEN_QUERY, TokenDefaultDacl,
+    ACCESS_ALLOWED_ACE, ACL, ACL_SIZE_INFORMATION, AclSizeInformation, GetAce, GetAclInformation, PSID,
+    TOKEN_DEFAULT_DACL, TOKEN_QUERY, TokenDefaultDacl,
 };
 use windows::Win32::System::Threading::{OpenProcessToken, TerminateProcess};
+use windows::core::PWSTR;
+
+/// The SDDL text of `sid`, which must be a valid SID.
+///
+/// # Safety
+/// `sid` points to a valid SID.
+unsafe fn sid_text(sid: PSID) -> String {
+    let mut text = PWSTR::null();
+    // SAFETY: a valid SID and out-pointer; the string is freed below.
+    unsafe { ConvertSidToStringSidW(sid, &mut text) }.expect("write the SID as text");
+    // SAFETY: the NUL-terminated string the call made.
+    let owned = unsafe { text.to_string() }.expect("the SID text is UTF-16");
+    // SAFETY: the allocation made by the call above, freed once.
+    let _ = unsafe { LocalFree(Some(HLOCAL(text.0.cast()))) };
+    owned
+}
 
 /// A suspended child that is ended when this drops, also when the test that holds it panics.
 struct Suspended(OwnedHandle);
@@ -67,7 +86,8 @@ fn a_child_started_with_the_token_is_at_medium_integrity_and_not_elevated() {
 
 /// A token below Medium stays where it is: setting Medium on it would raise it, which fails without a
 /// privilege, and the unelevated token of a process that runs at Low integrity must still be made. A token
-/// above Medium goes down to it.
+/// above Medium goes down to it. The lowering branch runs where the tests run elevated (CI); from a High
+/// process `tests/unelevated_token_windows.rs` pins it too.
 #[test]
 fn the_integrity_label_is_lowered_to_medium_and_never_raised() {
     let token = own_token_copy();
@@ -76,21 +96,45 @@ fn the_integrity_label_is_lowered_to_medium_and_never_raised() {
     lower_integrity(token.0, INTEGRITY_MEDIUM).expect("a token below Medium is not raised, and that is not an error");
     assert_eq!(integrity_of(token.0).unwrap(), INTEGRITY_LOW);
 
-    let above = own_token_copy();
-    let own = integrity_of(above.0).unwrap();
-    lower_integrity(above.0, INTEGRITY_MEDIUM).expect("lower the copy to Medium");
-    assert_eq!(integrity_of(above.0).unwrap(), own.min(INTEGRITY_MEDIUM));
+    let copy = own_token_copy();
+    let own = integrity_of(copy.0).unwrap();
+    lower_integrity(copy.0, INTEGRITY_MEDIUM).expect("set the copy to Medium");
+    if own > INTEGRITY_MEDIUM {
+        assert_eq!(
+            integrity_of(copy.0).unwrap(),
+            INTEGRITY_MEDIUM,
+            "a copy above Medium goes down to it"
+        );
+    } else {
+        assert_eq!(
+            integrity_of(copy.0).unwrap(),
+            own,
+            "a copy at or below Medium is left as it was"
+        );
+    }
 }
 
-/// The default DACL is the one UAC's filtered token has: the user, SYSTEM and the logon session, with the
-/// rights it gives them. The elevated token's names Administrators instead of the user, and a child on pipes
-/// started with that dies at once (measured, T1).
+/// The default DACL is the one UAC's filtered token has: the user of the process's token, SYSTEM and the
+/// logon session of that token, in that order, with the rights it gives them. The elevated token's names
+/// Administrators instead of the user, and a child on pipes started with that dies at once.
 #[test]
 fn the_default_dacl_of_the_token_gives_the_user_system_and_the_logon_session_their_rights() {
     const GENERIC_ALL: u32 = 0x1000_0000;
     const GENERIC_EXECUTE_READ: u32 = 0xA000_0000;
+    let parent = own_token().expect("open the process token");
+    let expected = vec![
+        (Sid::of_token(parent.0).unwrap().to_sddl().unwrap(), GENERIC_ALL),
+        (
+            Sid::well_known(WellKnown::System).unwrap().to_sddl().unwrap(),
+            GENERIC_ALL,
+        ),
+        (
+            Sid::logon_of_token(parent.0).unwrap().to_sddl().unwrap(),
+            GENERIC_EXECUTE_READ,
+        ),
+    ];
     let token = UnelevatedToken::of_this_process().expect("make the token");
-    let masks = with_child_token(&token, |child| {
+    let aces = with_child_token(&token, |child| {
         let info = token_information(child, TokenDefaultDacl).expect("read the child's default DACL");
         // SAFETY: every bit pattern is a valid `TOKEN_DEFAULT_DACL` (one pointer).
         let default = unsafe { info.header::<TOKEN_DEFAULT_DACL>() }.expect("read the default DACL's header");
@@ -116,11 +160,13 @@ fn the_default_dacl_of_the_token_gives_the_user_system_and_the_logon_session_the
                 // SAFETY: the ACEs of this ACL are all access-allowed ones, which the first check pins.
                 let ace = unsafe { &*ace.cast::<ACCESS_ALLOWED_ACE>() };
                 assert_eq!(ace.Header.AceType, 0, "an access-allowed ACE");
-                ace.Mask
+                // SAFETY: an access-allowed ACE ends in the trustee's SID, which starts at `SidStart`.
+                let trustee = unsafe { sid_text(PSID((&raw const ace.SidStart).cast_mut().cast())) };
+                (trustee, ace.Mask)
             })
             .collect::<Vec<_>>()
     });
-    assert_eq!(masks, vec![GENERIC_ALL, GENERIC_ALL, GENERIC_EXECUTE_READ]);
+    assert_eq!(aces, expected);
 }
 
 /// The session starts take the token: a command on pipes and one in a pseudoconsole run to the end with it, and
@@ -132,7 +178,7 @@ fn a_command_on_pipes_and_one_in_a_pseudoconsole_run_with_the_token() {
     let on_pipes = crate::pipes::ExecChild::spawn("cmd.exe /c exit 5", None, Some(&token)).expect("start on pipes");
     let (out, err) = (drain(on_pipes.stdout_read_raw()), drain(on_pipes.stderr_read_raw()));
     let code = on_pipes.wait();
-    // Joined before anything can fail: the threads read handles that `on_pipes` closes.
+    // Join before any assert: the readers use handles `on_pipes` closes.
     let said = format!("{}{}", text_of(out), text_of(err));
     assert_eq!(
         code.unwrap(),
