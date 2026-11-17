@@ -224,12 +224,14 @@ fn on_refuses_a_non_elevated_shell_with_the_way_to_an_elevated_one() {
         "{text}"
     );
     assert!(
-        text.contains("session ssh-broker hosts for an administrator is elevated"),
-        "it no longer says an ssh-broker shell is never elevated: {text}"
+        text.contains("from an elevated prompt at the PC, or from an SSH login of an administrator"),
+        "{text}"
     );
-    assert!(!text.contains("is not elevated."), "{text}");
-    assert!(text.contains(&format!("run {EXE} logout")), "the full exe path: {text}");
-    assert!(text.contains("press Ctrl+C at the password prompt"), "{text}");
+    assert!(
+        !text.contains("is never elevated"),
+        "the text must not say a hosted shell is never elevated: {text}"
+    );
+    assert!(!text.contains("Ctrl+C"), "no plain shell is advised: {text}");
     assert!(env.calls.is_empty(), "nothing was asked or changed: {:?}", env.calls);
 }
 

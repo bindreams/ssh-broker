@@ -253,6 +253,23 @@ fn agent_task_row_fails_for_a_disabled_task_and_says_to_run_apply() {
 }
 
 #[test]
+fn a_failing_row_says_which_run_level_it_read() {
+    let without_level = agent_task_xml(r"C:\x.exe").replace("    <RunLevel>HighestAvailable</RunLevel>\n", "");
+    let disabled_least = disabled_agent_task_xml().replace("HighestAvailable", "LeastPrivilege");
+    for (xml, said) in [
+        (least_privilege_agent_task_xml(), "run_level=LeastPrivilege"),
+        (per_user_task_xml("DOMAIN\\someone"), "run_level=LeastPrivilege"),
+        (without_level, "run_level=none: `LeastPrivilege` by default"),
+        (disabled_agent_task_xml(), "run_level=HighestAvailable"),
+        (disabled_least, "run_level=LeastPrivilege"),
+    ] {
+        let row = agent_task_row(&Ok(Some(xml)));
+        assert!(!row.pass, "{}", row.detail);
+        assert!(row.detail.contains(said), "{said}: {}", row.detail);
+    }
+}
+
+#[test]
 fn a_task_with_no_enabled_setting_is_enabled() {
     // The service leaves the element out when it holds its default, true.
     let xml = agent_task_xml(r"C:\x.exe").replace("    <Enabled>true</Enabled>\n  </Settings>", "  </Settings>");

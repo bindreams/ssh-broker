@@ -3,9 +3,8 @@
 //! The call is `CreateProcessWithLogonW(LOGON_WITH_PROFILE)`, which hands the password to the
 //! Secondary Logon service and starts `ssh-broker agent --background` as the user in a new logon
 //! session with a loaded profile, DPAPI and junction traversal (spike M1, M2). For an administrator
-//! ([`LogonKind::Batch`]) the logon is `LogonUserW(BATCH)` ([`batch_logon`]), which UAC does not split,
-//! and the process is started with that token by `CreateProcessWithTokenW(LOGON_WITH_PROFILE)`: the
-//! agent runs elevated, with the same profile and DPAPI (measured, also from under sshd). The password
+//! ([`LogonKind::Batch`]) the logon is `LogonUserW(BATCH)`, which UAC does not split, and the process
+//! starts with that token: the agent runs elevated, with the same profile and DPAPI. The password
 //! is only the call's argument, in a NUL-terminated copy that `Password::with_nul` wipes when the call
 //! returns; it is on no command line, in no environment and in no error text.
 //!
@@ -35,7 +34,7 @@ use windows::Win32::System::Threading::{
 };
 use windows::core::{BOOL, HRESULT, PCWSTR, PWSTR};
 
-use crate::account::{Elevation, LocalAccount};
+use crate::account::LocalAccount;
 use crate::autologin::BatchRight;
 use crate::password_entry::Password;
 use crate::winutil::OwnedHandle;
@@ -57,17 +56,6 @@ pub enum LogonKind {
     Interactive,
     /// `LogonUserW(BATCH)` and `CreateProcessWithTokenW`: the full token of an administrator.
     Batch,
-}
-
-impl LogonKind {
-    /// The logon for a shim whose own token has `elevation`: an elevated administrator's agent needs the
-    /// whole token, so `Full` signs on as a batch job; any other is the interactive logon of today.
-    pub fn of_shim(elevation: Elevation) -> LogonKind {
-        match elevation {
-            Elevation::Full => LogonKind::Batch,
-            Elevation::Filtered | Elevation::Standard => LogonKind::Interactive,
-        }
-    }
 }
 
 /// The background agent the logon started. Dropping it closes the handle; the agent keeps running.

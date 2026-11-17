@@ -32,13 +32,15 @@ pub enum Refusal {
     /// The private socket folder could not be made, or was found not safe to use (its owner or ACL).
     #[error("the agent's private socket folder could not be made or is not safe to use")]
     SocketFolderRefused = 67,
-    /// An administrator's token cut down (UAC's filtered half, or a session's unelevated token). An
-    /// administrator's agent is elevated or absent, so a login never meets an unelevated agent of an
-    /// administrator and `ssh-broker agent` typed in an unelevated session cannot become one.
+    /// An administrator's token cut down (UAC's filtered half, or an unelevated session's). An
+    /// administrator's agent is elevated or absent.
     #[error(
         "this agent runs with an administrator's token cut down; an administrator's agent runs elevated or not at all"
     )]
     Filtered = 68,
+    /// The agent's own token's elevation could not be read, so it cannot tell whether to serve.
+    #[error("the agent cannot read how elevated its own token is")]
+    ElevationUnreadable = 69,
 }
 
 impl Refusal {
@@ -49,8 +51,7 @@ impl Refusal {
 
 /// The checks that come before the agent touches a file or a socket. `mode` is `None` for the
 /// desktop agent (the logon task's) and `Some` for `agent --background`; `current_sid` is the SID
-/// text of the agent's own token and `elevation` its elevation. A `Filtered` token is refused first,
-/// in both modes.
+/// text of the agent's own token and `elevation` its elevation.
 ///
 /// A background agent is allowed in any session including 0, because Task Scheduler's batch logon
 /// puts the auto-login agent there (spike M5(d)); a desktop agent in session 0 is a mis-registered

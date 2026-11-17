@@ -236,8 +236,7 @@ fn an_administrators_prompt_session_is_elevated() {
     leave(&mut run);
 }
 
-/// Elevated (CI only). A standard account's session is not elevated, as before: Medium, no
-/// Administrators in the token.
+/// Elevated (CI only). A standard account's prompt session is Medium, with no Administrators in the token.
 #[test]
 fn a_standard_accounts_prompt_session_is_medium() {
     let _machine = machine::shared();

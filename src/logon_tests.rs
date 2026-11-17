@@ -42,13 +42,6 @@ fn only_error_1385_says_the_logon_right_is_not_granted() {
     }
 }
 
-#[test]
-fn a_shim_of_a_full_token_logs_on_as_a_batch_job_and_any_other_as_today() {
-    assert_eq!(LogonKind::of_shim(Elevation::Full), LogonKind::Batch);
-    assert_eq!(LogonKind::of_shim(Elevation::Standard), LogonKind::Interactive);
-    assert_eq!(LogonKind::of_shim(Elevation::Filtered), LogonKind::Interactive);
-}
-
 const BREAKAWAY_OK: u32 = 0x0800;
 const SILENT_BREAKAWAY_OK: u32 = 0x1000;
 const KILL_ON_JOB_CLOSE: u32 = 0x2000;

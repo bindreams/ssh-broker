@@ -24,7 +24,7 @@ fn exec_session_notice_is_one_line_on_stderr() {
                 absence,
                 account(AccountKind::Local),
                 None,
-                Elevation::Standard
+                LogonKind::Interactive
             ),
             Plan::Notice { user: "alice".into() }
         );
@@ -41,7 +41,7 @@ fn no_terminal_login_gets_the_notice_and_never_enters_raw_mode() {
         Absence::NoAgent,
         account(AccountKind::Local),
         None,
-        Elevation::Standard,
+        LogonKind::Interactive,
     );
     assert_eq!(plan, Plan::Notice { user: "alice".into() });
 }
@@ -51,7 +51,7 @@ fn a_terminal_login_without_a_command_is_offered_the_session() {
     for absence in [Absence::NoAgent, Absence::NoProfileYet] {
         let local = account(AccountKind::Local).unwrap();
         assert_eq!(
-            plan(false, true, absence, Some(local.clone()), None, Elevation::Standard),
+            plan(false, true, absence, Some(local.clone()), None, LogonKind::Interactive),
             Plan::Offer {
                 account: local,
                 absence,
@@ -71,7 +71,7 @@ fn a_non_local_account_is_still_told_why_at_the_terminal() {
             Absence::NoAgent,
             Some(other.clone()),
             None,
-            Elevation::Standard
+            LogonKind::Interactive
         ),
         Plan::Offer {
             account: other,
@@ -90,7 +90,7 @@ fn a_non_local_account_gets_no_notice_that_names_a_command_it_cannot_use() {
             Absence::NoAgent,
             account(AccountKind::NotLocal),
             None,
-            Elevation::Standard
+            LogonKind::Interactive
         ),
         Plan::Nothing
     );
@@ -106,7 +106,7 @@ fn other_absence_changes_nothing_today() {
                 Absence::Other,
                 account(AccountKind::Local),
                 None,
-                Elevation::Standard
+                LogonKind::Interactive
             ),
             Plan::Nothing,
             "exec={exec} console={console}"
@@ -117,12 +117,45 @@ fn other_absence_changes_nothing_today() {
 #[test]
 fn an_unreadable_account_changes_nothing() {
     assert_eq!(
-        plan(false, true, Absence::NoAgent, None, None, Elevation::Standard),
+        plan(false, true, Absence::NoAgent, None, None, LogonKind::Interactive),
         Plan::Nothing
     );
     assert_eq!(
-        plan(true, true, Absence::NoAgent, None, None, Elevation::Standard),
+        plan(true, true, Absence::NoAgent, None, None, LogonKind::Interactive),
         Plan::Nothing
+    );
+}
+
+// stance -----
+
+#[test]
+fn a_full_token_relays_with_a_batch_logon_and_a_standard_one_with_an_interactive_logon() {
+    assert_eq!(
+        stance(Ok(Elevation::Full)),
+        Stance::Relay {
+            logon: LogonKind::Batch
+        }
+    );
+    assert_eq!(
+        stance(Ok(Elevation::Standard)),
+        Stance::Relay {
+            logon: LogonKind::Interactive
+        }
+    );
+}
+
+#[test]
+fn a_filtered_token_gets_the_plain_shell_and_no_relay() {
+    assert_eq!(stance(Ok(Elevation::Filtered)), Stance::PlainShell);
+}
+
+#[test]
+fn an_unreadable_token_still_relays_but_offers_nothing_and_keeps_the_cause() {
+    assert_eq!(
+        stance(Err(anyhow::anyhow!("the token cannot be read"))),
+        Stance::RelayWithoutOffer {
+            cause: "the token cannot be read".into()
+        }
     );
 }
 
@@ -135,7 +168,7 @@ fn a_refused_private_folder_is_shown_and_no_session_is_offered() {
             for absence in [Absence::NoAgent, Absence::NoProfileYet, Absence::Other] {
                 for account in [account(AccountKind::Local), account(AccountKind::NotLocal), None] {
                     assert_eq!(
-                        plan(exec, console, absence, account, Some(REFUSAL), Elevation::Standard),
+                        plan(exec, console, absence, account, Some(REFUSAL), LogonKind::Interactive),
                         Plan::FolderRefused { cause: REFUSAL.into() },
                         "exec={exec} console={console} absence={absence:?}"
                     );
@@ -146,11 +179,11 @@ fn a_refused_private_folder_is_shown_and_no_session_is_offered() {
 }
 
 #[test]
-fn a_full_shim_is_offered_the_session_with_a_batch_logon() {
+fn an_offer_carries_the_logon_it_is_handed() {
     let local = account(AccountKind::Local).unwrap();
     for absence in [Absence::NoAgent, Absence::NoProfileYet] {
         assert_eq!(
-            plan(false, true, absence, Some(local.clone()), None, Elevation::Full),
+            plan(false, true, absence, Some(local.clone()), None, LogonKind::Batch),
             Plan::Offer {
                 account: local.clone(),
                 absence,
@@ -161,18 +194,7 @@ fn a_full_shim_is_offered_the_session_with_a_batch_logon() {
 }
 
 #[test]
-fn only_a_full_shim_logs_on_as_a_batch_job() {
-    let local = account(AccountKind::Local).unwrap();
-    let logon = |elevation| match plan(false, true, Absence::NoAgent, Some(local.clone()), None, elevation) {
-        Plan::Offer { logon, .. } => logon,
-        other => panic!("{other:?}"),
-    };
-    assert_eq!(logon(Elevation::Full), LogonKind::Batch);
-    assert_eq!(logon(Elevation::Standard), LogonKind::Interactive);
-}
-
-#[test]
-fn a_full_shim_without_a_console_gets_the_notice_as_before() {
+fn a_batch_logon_without_a_console_gets_the_notice_as_before() {
     assert_eq!(
         plan(
             true,
@@ -180,7 +202,7 @@ fn a_full_shim_without_a_console_gets_the_notice_as_before() {
             Absence::NoAgent,
             account(AccountKind::Local),
             None,
-            Elevation::Full
+            LogonKind::Batch
         ),
         Plan::Notice { user: "alice".into() }
     );
@@ -271,7 +293,7 @@ fn rescued(location: SocketLocation, exec: bool) -> (Rescued, String) {
     let folder = folder_at(location);
     let connect = Err(anyhow::anyhow!("a connect that failed for no OS reason"));
     let mut shown = Vec::new();
-    let rescued = Prompting::new(Ok(Elevation::Standard)).rescue(
+    let rescued = Prompting::new(Ok(LogonKind::Interactive)).rescue(
         &Absent {
             exec,
             folder: &folder,
@@ -283,88 +305,34 @@ fn rescued(location: SocketLocation, exec: bool) -> (Rescued, String) {
 }
 
 #[test]
-fn the_rescue_of_a_filtered_shim_says_why_and_goes_on_in_the_plain_shell() {
-    // No agent where the shim looks: today that is a wait for a starting agent and then an offer or a
-    // notice. A filtered shim gets neither.
-    let profile = TempProfile::new("rs-filtered");
+fn the_rescue_of_a_shim_whose_token_cannot_be_read_offers_nothing_and_says_why() {
+    let profile = TempProfile::new("rs-no-token");
     let folder = folder_at(profile.location());
     let connect = folder.connect();
-    assert!(
-        is_no_agent(connect.as_ref().expect_err("no agent serves this temporary profile")),
-        "control: nothing serves"
-    );
     for exec in [false, true] {
         let mut shown = Vec::new();
-        let rescued = Prompting::new(Ok(Elevation::Filtered)).rescue(
-            &Absent {
-                exec,
-                folder: &folder,
-                connect: &connect,
-            },
-            &mut shown,
-        );
-        assert!(matches!(rescued, Rescued::Plain), "exec={exec}");
-        assert_eq!(
-            String::from_utf8(shown).unwrap(),
-            format!("{}\n", text::FILTERED_SHIM_NOTICE),
-            "exec={exec}"
-        );
-    }
-}
-
-/// The shim's elevation decides before the folder is judged: a filtered shim is told its own notice and
-/// not the folder's cause, whatever the session and whatever the folder.
-#[test]
-fn the_rescue_of_a_filtered_shim_is_told_before_the_folder_is_judged() {
-    let profile = TempProfile::new("rs-filtered-acl");
-    let location = profile.location();
-    crate::userdir::ensure_socket_dir(&location, &me()).unwrap();
-    widen(location.dir());
-    let folder = folder_at(location);
-    assert!(folder.refusal().is_some(), "control: this folder is refused");
-    let connect = folder.connect();
-    for exec in [false, true] {
-        let mut shown = Vec::new();
-        let rescued = Prompting::new(Ok(Elevation::Filtered)).rescue(
-            &Absent {
-                exec,
-                folder: &folder,
-                connect: &connect,
-            },
-            &mut shown,
-        );
+        let (log, rescued) = crate::test_support::logged(|| {
+            Prompting::new(Err("the token cannot be read".into())).rescue(
+                &Absent {
+                    exec,
+                    folder: &folder,
+                    connect: &connect,
+                },
+                &mut shown,
+            )
+        });
         assert!(matches!(rescued, Rescued::Plain), "exec={exec}");
         assert_eq!(
             String::from_utf8(shown).unwrap(),
             format!(
                 "{}
 ",
-                text::FILTERED_SHIM_NOTICE
+                text::elevation_unreadable("the token cannot be read")
             ),
             "exec={exec}"
         );
+        assert!(log.contains("the token cannot be read"), "{log}");
     }
-}
-
-#[test]
-fn the_rescue_of_a_shim_whose_token_cannot_be_read_offers_nothing_and_says_nothing() {
-    let profile = TempProfile::new("rs-no-token");
-    let folder = folder_at(profile.location());
-    let connect = folder.connect();
-    let mut shown = Vec::new();
-    let (log, rescued) = crate::test_support::logged(|| {
-        Prompting::new(Err(anyhow::anyhow!("the token cannot be read"))).rescue(
-            &Absent {
-                exec: false,
-                folder: &folder,
-                connect: &connect,
-            },
-            &mut shown,
-        )
-    });
-    assert!(matches!(rescued, Rescued::Plain));
-    assert!(shown.is_empty());
-    assert!(log.contains("the token cannot be read"), "{log}");
 }
 
 fn rescued_interactively(location: SocketLocation) -> (Rescued, String) {
@@ -443,7 +411,7 @@ fn a_login_with_a_terminal_whose_folder_is_refused_on_a_later_look_is_told_the_f
     let connect = folder.connect();
     let mut shown = Vec::new();
 
-    let rescued = Prompting::new(Ok(Elevation::Standard)).rescue(
+    let rescued = Prompting::new(Ok(LogonKind::Interactive)).rescue(
         &Absent {
             exec: false,
             folder: &folder,

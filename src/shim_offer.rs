@@ -59,9 +59,7 @@ pub enum Plan {
 /// today's message alone, because the notice's first sentence would be false for it. A non-local
 /// account is not told to run a command it cannot use.
 ///
-/// `elevation` is the shim's own, and decides the logon of an offer: a `Full` one signs on as a batch
-/// job, which keeps the token whole, and any other as today. A `Filtered` shim never reaches this: its
-/// agent serves elevated logins only, so [`Prompting::rescue`] answers it before it asks what to do.
+/// `logon` is the logon an offer signs the account on with, decided by [`stance`].
 ///
 /// `folder_refusal` is why the user's folder cannot be used, if it cannot (see [`Folder::refusal`]). It
 /// decides next: the account, the absence and the console do not change that an offer, a prompt or a
@@ -72,12 +70,8 @@ pub fn plan(
     absence: Absence,
     account: Option<LocalAccount>,
     folder_refusal: Option<&str>,
-    elevation: Elevation,
+    logon: LogonKind,
 ) -> Plan {
-    debug_assert!(
-        elevation != Elevation::Filtered,
-        "a filtered shim is answered by the rescue"
-    );
     if let Some(cause) = folder_refusal {
         return Plan::FolderRefused {
             cause: cause.to_owned(),
@@ -93,12 +87,42 @@ pub fn plan(
         return Plan::Offer {
             account,
             absence,
-            logon: LogonKind::of_shim(elevation),
+            logon,
         };
     }
     match account.kind {
         AccountKind::Local => Plan::Notice { user: account.name },
         AccountKind::NotLocal => Plan::Nothing,
+    }
+}
+
+// stance -----
+
+/// What the shim does, from its own token's elevation, before anything connects.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Stance {
+    /// The token is an administrator's with elevation removed: the notice and the plain shell, no connect.
+    PlainShell,
+    /// Relay; with no agent, an offer signs the account on as `logon`.
+    Relay { logon: LogonKind },
+    /// The elevation could not be read (`cause`): relay, and with no agent say so and offer nothing.
+    RelayWithoutOffer { cause: String },
+}
+
+/// Decide the [`Stance`] for `elevation`. Only a `Full` token's account needs the whole token, so only
+/// it signs on as a batch job.
+pub fn stance(elevation: anyhow::Result<Elevation>) -> Stance {
+    match elevation {
+        Ok(Elevation::Filtered) => Stance::PlainShell,
+        Ok(Elevation::Full) => Stance::Relay {
+            logon: LogonKind::Batch,
+        },
+        Ok(Elevation::Standard) => Stance::Relay {
+            logon: LogonKind::Interactive,
+        },
+        Err(e) => Stance::RelayWithoutOffer {
+            cause: format!("{e:#}"),
+        },
     }
 }
 
@@ -440,34 +464,28 @@ impl Rescue for NoRescue {
     }
 }
 
-/// The real thing: the notice on stderr, or the prompt at the console. `elevation` is the shim's own
-/// token's (an unreadable one is logged, and no session is offered).
+/// The real thing: the notice on stderr, or the prompt at the console. `logon` is the offer's, or why
+/// there is none (see [`Stance::RelayWithoutOffer`]).
 pub(crate) struct Prompting {
-    elevation: anyhow::Result<Elevation>,
+    logon: Result<LogonKind, String>,
 }
 
 impl Prompting {
-    pub fn new(elevation: anyhow::Result<Elevation>) -> Prompting {
-        Prompting { elevation }
+    pub fn new(logon: Result<LogonKind, String>) -> Prompting {
+        Prompting { logon }
     }
 }
 
 impl Rescue for Prompting {
     fn rescue(&mut self, absent: &Absent<'_>, stderr: &mut dyn Write) -> Rescued {
-        let elevation = match &self.elevation {
-            Ok(elevation) => *elevation,
-            Err(e) => {
-                tracing::warn!("cannot tell how elevated this login is, so no session is offered: {e:#}");
+        let logon = match &self.logon {
+            Ok(logon) => *logon,
+            Err(cause) => {
+                tracing::warn!("cannot tell how elevated this login is, so no session is offered: {cause}");
+                let _ = writeln!(stderr, "{}", text::elevation_unreadable(cause));
                 return Rescued::Plain;
             }
         };
-        // The shim's token is an administrator's with elevation removed, and this account's agent serves
-        // elevated logins only: the notice and the plain shell, with no offer (it would start an agent
-        // that refuses), no wait for a starting agent and no look at the folder.
-        if elevation == Elevation::Filtered {
-            let _ = writeln!(stderr, "{}", text::FILTERED_SHIM_NOTICE);
-            return Rescued::Plain;
-        }
         let account = match account::current_account() {
             Ok(account) => Some(account),
             Err(e) => {
@@ -493,14 +511,7 @@ impl Rescue for Prompting {
         }
         let console = !absent.exec && console_available();
         let cause = absent.folder.refusal();
-        match plan(
-            absent.exec,
-            console,
-            kind_of_absence,
-            account,
-            cause.as_deref(),
-            elevation,
-        ) {
+        match plan(absent.exec, console, kind_of_absence, account, cause.as_deref(), logon) {
             Plan::Nothing => Rescued::Plain,
             Plan::FolderRefused { cause } => {
                 if !absent.exec {
@@ -596,10 +607,8 @@ impl OfferIo for LiveIo {
     }
 }
 
-/// What the offer says of a logon that Windows refused. An account that may not log on as a batch job
-/// (an administrator who may not gets no agent from the prompt) is told so in the sentence `auto-login`
-/// uses, whatever else Windows says; any other refusal, and a refused interactive logon, is Windows' own
-/// text.
+/// What the offer says of a logon that Windows refused. A refused batch logon for want of the batch right
+/// gets `auto-login`'s sentence; every other refusal is Windows' own text.
 fn start_failure(logon: LogonKind, user: &str, failure: LogonFailure) -> StartFailure {
     if logon == LogonKind::Batch && failure.right_not_granted() {
         return StartFailure::NoBatchRight {

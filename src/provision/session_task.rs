@@ -35,10 +35,9 @@ pub fn requested_sddl(sid: &str) -> String {
 /// (`LogonType Password`), `LeastPrivilege`, and `exe agent --background --expect-user <sid>`. One
 /// agent per user.
 ///
-/// The agent refuses an administrator's token below High (see `agent_background`), and `LeastPrivilege`
-/// would filter it. It does not here only because a batch logon with a stored password is not split by
-/// UAC whatever the run level (measured: such a task gave High with Administrators enabled under both
-/// run levels). If that stops holding, an administrator's agent from this task exits 68.
+/// The agent refuses an administrator's token below High (see `agent_background`). `LeastPrivilege` is
+/// safe here because a stored-password batch logon is not split by UAC under either run level (measured);
+/// if that stops holding, an administrator's agent from this task exits 68.
 pub fn task_xml(exe: &str, sid: &str) -> String {
     let exe = xml_escape(exe);
     let sid = xml_escape(sid);

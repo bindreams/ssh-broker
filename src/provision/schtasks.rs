@@ -163,18 +163,25 @@ pub fn agent_task_row(query: &anyhow::Result<Option<String>>) -> Check {
     let registered = xml.is_some();
     let group = xml.is_some_and(xml_is_group_logon_task);
     let disabled = xml.is_some_and(xml_is_disabled);
+    // The level the task states, which a failing row names: it is why a task that otherwise looks right is not.
+    let run_level = xml.map(|xml| match xml_run_level(xml) {
+        Some(level) => format!("run_level={level}"),
+        None => "run_level=none: `LeastPrivilege` by default".to_owned(),
+    });
     let detail = if registered && !group {
-        "registered=true group_logon_task=false: the task is not the group logon task with run level \
-         HighestAvailable; run `apply` elevated to replace it"
-            .to_string()
+        format!(
+            "registered=true group_logon_task=false {}: the task is not the group logon task with run level \
+             HighestAvailable; run `apply` elevated to replace it",
+            run_level.unwrap_or_default()
+        )
     } else if disabled {
-        "registered=true group_logon_task=true enabled=false: the task is disabled, so no agent starts at a logon; a \
-         killed `apply` leaves it so. Run `apply` elevated to enable it"
-            .to_string()
+        format!(
+            "registered=true group_logon_task=true enabled=false {}: the task is disabled, so no agent starts at a \
+             logon; a killed `apply` leaves it so. Run `apply` elevated to enable it",
+            run_level.unwrap_or_default()
+        )
     } else {
-        let run_level = xml
-            .and_then(xml_run_level)
-            .map_or(String::new(), |level| format!(" run_level={level}"));
+        let run_level = run_level.map_or(String::new(), |level| format!(" {level}"));
         format!("registered={registered} group_logon_task={group}{run_level}")
     };
     Check::new("agent task", registered && group && !disabled, detail)

@@ -19,6 +19,7 @@ fn the_exit_codes_are_the_record() {
     assert_eq!(Refusal::NoSocketLocation.code(), 66);
     assert_eq!(Refusal::SocketFolderRefused.code(), 67);
     assert_eq!(Refusal::Filtered.code(), 68);
+    assert_eq!(Refusal::ElevationUnreadable.code(), 69);
 }
 
 #[test]

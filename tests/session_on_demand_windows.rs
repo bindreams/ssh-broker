@@ -232,6 +232,20 @@ fn assert_test_process_is_in_no_job(case: &str) -> logon::CallerJob {
     base
 }
 
+/// Make the stand-in shim of `kit` log `account` on as `kind`: a batch logon is an administrator's, so the
+/// account becomes one. The stand-in is told the logon, since the network token of the fixture account
+/// does not say which one the real shim would pick.
+fn shim_logs_on_as(kit: &Kit, account: &Account, kind: LogonKind) {
+    if kind == LogonKind::Batch {
+        account.make_administrator();
+    }
+    let name = match kind {
+        LogonKind::Interactive => "interactive",
+        LogonKind::Batch => "batch",
+    };
+    std::fs::write(kit.path("shim.logon"), name).unwrap();
+}
+
 /// What became of the logon child when its caller's job was closed.
 enum M3Outcome {
     /// It acknowledged after the close.
@@ -242,19 +256,37 @@ enum M3Outcome {
     Ended { child: u32, shim: u32, had_waited: bool },
 }
 
+/// The logons an M3 case runs under: an administrator's agent is started by the batch logon, anyone else's by
+/// the interactive one, and each has to meet the caller's chain of jobs.
+const M3_LOGONS: [LogonKind; 2] = [LogonKind::Interactive, LogonKind::Batch];
+
+/// Run an M3 case under each of [`M3_LOGONS`] and hand each run to `check` with the label of the chain.
+/// `jobs` makes the caller's chain afresh for each run. The batch run's account is an administrator.
+fn m3_under_each_logon(tag: &str, chain: &str, jobs: impl Fn() -> Vec<KillOnCloseJob>, check: impl Fn(&M3Run, &str)) {
+    for kind in M3_LOGONS {
+        let tag = match kind {
+            LogonKind::Interactive => tag.to_owned(),
+            LogonKind::Batch => format!("{tag}b"),
+        };
+        let run = logon_child_after_the_callers_jobs_close(&tag, kind, jobs());
+        check(&run, &format!("{chain} ({kind:?} logon)"));
+    }
+}
+
 /// M3: the caller is a network-token process in `jobs`, outermost first (a chain of nested jobs when
-/// there are several); it starts the logon child through the product's `start_background_agent`. The
+/// there are several); it starts the logon child with `kind`, through the product's `start_background_agent`. The
 /// child records that it is waiting; the jobs are closed, innermost first; then the child is told to
 /// acknowledge. Both outcomes end the wait: it waits on the acknowledgement and on the child's exit.
 ///
 /// Returns what became of the child, what the logon reported about its survival (`survival=...` in the
 /// shim's report, the value the prompt path turns into a line for the user), and the child's job
 /// membership as this test reads it from outside, before the jobs close.
-fn logon_child_after_the_callers_jobs_close(tag: &str, mut jobs: Vec<KillOnCloseJob>) -> M3Run {
+fn logon_child_after_the_callers_jobs_close(tag: &str, kind: LogonKind, mut jobs: Vec<KillOnCloseJob>) -> M3Run {
     let base = assert_test_process_is_in_no_job(tag);
     let _machine = machine::shared();
     let kit = Kit::new(tag);
     let account = Account::create(tag, true);
+    shim_logs_on_as(&kit, &account, kind);
     // The stand-in agent, once it is up, waits for the file `agent.go` and then writes `agent.ack`.
     std::fs::write(kit.path("agent.plan"), "").unwrap();
 
@@ -435,8 +467,12 @@ impl M3Run {
 /// shim; what the production shim tells the user about it is not covered here.
 #[test]
 fn m3_child_in_a_job_that_forbids_breakaway_ends_with_the_job_and_the_logon_says_so() {
-    let run = logon_child_after_the_callers_jobs_close("m3a", vec![KillOnCloseJob::create()]);
-    run.assert_claim(logon::Survival::EndsWithConnection, "job without BREAKAWAY_OK");
+    m3_under_each_logon(
+        "m3a",
+        "job without BREAKAWAY_OK",
+        || vec![KillOnCloseJob::create()],
+        |run, chain| run.assert_claim(logon::Survival::EndsWithConnection, chain),
+    );
 }
 
 /// Elevated (CI only). M3: where the caller's job allows breakaway the product asks for it, and the
@@ -445,8 +481,12 @@ fn m3_child_in_a_job_that_forbids_breakaway_ends_with_the_job_and_the_logon_says
 /// shim; what the production shim tells the user about it is not covered here.
 #[test]
 fn m3_child_survives_the_callers_job_closing_where_breakaway_is_allowed() {
-    let run = logon_child_after_the_callers_jobs_close("m3b", vec![KillOnCloseJob::create_allowing_breakaway()]);
-    run.assert_claim(logon::Survival::OutlivesConnection, "job with BREAKAWAY_OK");
+    m3_under_each_logon(
+        "m3b",
+        "job with BREAKAWAY_OK",
+        || vec![KillOnCloseJob::create_allowing_breakaway()],
+        |run, chain| run.assert_claim(logon::Survival::OutlivesConnection, chain),
+    );
 }
 
 /// A chain of two nested jobs, outermost first, each allowing breakaway or not. Windows shows a process
@@ -468,8 +508,12 @@ fn nested_jobs(outer_allows: bool, inner_allows: bool) -> Vec<KillOnCloseJob> {
 /// shim; what the production shim tells the user about it is not covered here.
 #[test]
 fn m3_child_survives_nested_jobs_that_all_allow_breakaway() {
-    let run = logon_child_after_the_callers_jobs_close("m3n1", nested_jobs(true, true));
-    run.assert_claim(logon::Survival::OutlivesConnection, "all nested jobs allow");
+    m3_under_each_logon(
+        "m3n1",
+        "all nested jobs allow",
+        || nested_jobs(true, true),
+        |run, chain| run.assert_claim(logon::Survival::OutlivesConnection, chain),
+    );
 }
 
 /// Elevated (CI only). The innermost job allows breakaway and an outer one does not. Whether Windows
@@ -480,8 +524,12 @@ fn m3_child_survives_nested_jobs_that_all_allow_breakaway() {
 /// shim; what the production shim tells the user about it is not covered here.
 #[test]
 fn m3_logon_succeeds_when_an_outer_job_forbids_the_breakaway_the_inner_one_allows() {
-    let run = logon_child_after_the_callers_jobs_close("m3n2", nested_jobs(false, true));
-    run.assert_claim(logon::Survival::MayEndWithConnection, "outer forbids, inner allows");
+    m3_under_each_logon(
+        "m3n2",
+        "outer forbids, inner allows",
+        || nested_jobs(false, true),
+        |run, chain| run.assert_claim(logon::Survival::MayEndWithConnection, chain),
+    );
 }
 
 /// Elevated (CI only). The innermost job forbids breakaway and an outer one allows it: the product
@@ -490,8 +538,12 @@ fn m3_logon_succeeds_when_an_outer_job_forbids_the_breakaway_the_inner_one_allow
 /// shim; what the production shim tells the user about it is not covered here.
 #[test]
 fn m3_logon_succeeds_when_the_inner_job_forbids_breakaway_and_an_outer_one_allows_it() {
-    let run = logon_child_after_the_callers_jobs_close("m3n3", nested_jobs(true, false));
-    run.assert_claim(logon::Survival::EndsWithConnection, "outer allows, inner forbids");
+    m3_under_each_logon(
+        "m3n3",
+        "outer allows, inner forbids",
+        || nested_jobs(true, false),
+        |run, chain| run.assert_claim(logon::Survival::EndsWithConnection, chain),
+    );
 }
 
 /// Elevated (CI only). M3: the caller is in no job at all (sshd, started the way a service starts a shell,
@@ -501,13 +553,14 @@ fn m3_logon_succeeds_when_the_inner_job_forbids_breakaway_and_an_outer_one_allow
 /// shim; what the production shim tells the user about it is not covered here.
 #[test]
 fn m3_child_survives_a_caller_that_is_in_no_job() {
-    let run = logon_child_after_the_callers_jobs_close("m3o", Vec::new());
-    assert!(
-        run.logon_log.contains("caller's job NotInJob"),
-        "the shim's chain was not empty: {}",
-        run.measured()
-    );
-    run.assert_claim(logon::Survival::OutlivesConnection, "caller in no job");
+    m3_under_each_logon("m3o", "caller in no job", Vec::new, |run, chain| {
+        assert!(
+            run.logon_log.contains("caller's job NotInJob"),
+            "{chain}: the shim's chain was not empty: {}",
+            run.measured()
+        );
+        run.assert_claim(logon::Survival::OutlivesConnection, chain);
+    });
 }
 
 /// Elevated (CI only). A wrong password in a chain that refuses breakaway is answered `1326` and not
@@ -517,22 +570,26 @@ fn m3_child_survives_a_caller_that_is_in_no_job() {
 #[test]
 fn a_wrong_password_in_a_job_chain_is_answered_with_a_logon_failure() {
     let _machine = machine::shared();
-    let kit = Kit::new("m3n4");
-    let account = Account::create("m3n4", true);
-    let mut jobs = nested_jobs(false, true);
-    let shim = start_shim_typing(&kit, &account, "not-the-password", false, |shim| {
-        for job in &jobs {
-            job.assign(shim.process.0);
+    for kind in M3_LOGONS {
+        let tag = format!("m3n4{}", if kind == LogonKind::Batch { "b" } else { "" });
+        let kit = Kit::new(&tag);
+        let account = Account::create(&tag, true);
+        shim_logs_on_as(&kit, &account, kind);
+        let mut jobs = nested_jobs(false, true);
+        let shim = start_shim_typing(&kit, &account, "not-the-password", false, |shim| {
+            for job in &jobs {
+                job.assign(shim.process.0);
+            }
+        });
+        assert!(
+            shim.result.starts_with("logon failed: 1326 "),
+            "{kind:?} logon: a wrong password must be a logon failure, not a refused breakaway: {}",
+            shim.result
+        );
+        shim.process.wait();
+        for job in jobs.iter_mut().rev() {
+            job.close();
         }
-    });
-    assert!(
-        shim.result.starts_with("logon failed: 1326 "),
-        "a wrong password must be a logon failure, not a refused breakaway: {}",
-        shim.result
-    );
-    shim.process.wait();
-    for job in jobs.iter_mut().rev() {
-        job.close();
     }
 }
 

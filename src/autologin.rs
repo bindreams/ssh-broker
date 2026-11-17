@@ -69,25 +69,22 @@ pub trait AutoLoginEnv {
     fn say(&mut self, line: &str);
 }
 
-fn not_elevated(verb: &str, exe: &str) -> String {
+fn not_elevated(verb: &str) -> String {
     format!(
-        "ssh-broker: auto-login {verb} needs an elevated administrator shell, and this is not one. The session \
-         ssh-broker hosts for an administrator is elevated; if this one is not, open an elevated prompt at the PC, \
-         or over SSH run {exe} logout, reconnect, press Ctrl+C at the password prompt for a plain shell, and run it \
-         there."
+        "ssh-broker: auto-login {verb} needs an elevated administrator shell, and this is not one. Run it from an \
+         elevated prompt at the PC, or from an SSH login of an administrator (which is elevated)."
     )
 }
 
-/// What a batch logon is for, as [`batch_right_missing`] says it: the boot task of `auto-login`.
+/// The purpose of the boot task's batch logon (`auto-login`).
 pub(crate) const AT_BOOT: &str = "Task Scheduler needs to start the session at boot";
 
-/// What a batch logon is for, as [`batch_right_missing`] says it: the elevated session that the
-/// password prompt starts for an administrator.
+/// The purpose of the prompt's batch logon for an administrator.
 pub(crate) const FROM_PROMPT: &str =
     "an elevated session started from a password needs (a logon at the desktop starts one without it)";
 
 /// The sentence for an account that may not log on as a batch job, naming what the logon is `purpose`
-/// for ([`AT_BOOT`], [`FROM_PROMPT`]). The one place that tells it, for the command and the prompt.
+/// for ([`AT_BOOT`], [`FROM_PROMPT`]).
 pub(crate) fn batch_right_missing(user: &str, purpose: &str) -> String {
     format!(
         "ssh-broker: {user} may not log on as a batch job, which {purpose}. An administrator can grant \
@@ -106,7 +103,7 @@ pub fn on(env: &mut dyn AutoLoginEnv, account: &LocalAccount) -> anyhow::Result<
     let exe_text = exe.to_string_lossy().into_owned();
     anyhow::ensure!(
         env.is_elevated().context("read the token's elevation")?,
-        not_elevated("on", &exe_text)
+        not_elevated("on")
     );
     anyhow::ensure!(
         env.has_terminal(),
@@ -182,7 +179,7 @@ pub fn off(env: &mut dyn AutoLoginEnv, account: &LocalAccount) -> anyhow::Result
     let exe = env.exe().to_string_lossy().into_owned();
     anyhow::ensure!(
         env.is_elevated().context("read the token's elevation")?,
-        not_elevated("off", &exe)
+        not_elevated("off")
     );
     // The task holds a stored password, so `off` must be able to delete it where the lock cannot be
     // had: without an install directory there is nothing to lock, one that fails its check is refused

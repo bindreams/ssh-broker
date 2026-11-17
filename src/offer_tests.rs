@@ -269,7 +269,7 @@ fn notice_names_the_full_exe_path() {
 fn agent_exit_code_sentences() {
     let logs = std::path::Path::new(r"C:\Users\me\AppData\Local\ssh-broker\logs");
     let line = |code| text::agent_ended(code, Some(logs));
-    for code in [64, 65, 66, 67, 68] {
+    for code in [64, 65, 66, 67, 68, 69] {
         let sentence = line(code);
         assert!(sentence.starts_with("ssh-broker: "), "{sentence}");
         assert!(sentence.ends_with("\r\n"), "{sentence:?}");
@@ -287,6 +287,8 @@ fn agent_exit_code_sentences() {
     assert_ne!(line(64), line(65));
     assert_ne!(line(66), line(67));
     assert_ne!(line(67), line(68));
+    assert!(line(69).contains("elevat"), "{}", line(69));
+    assert_ne!(line(68), line(69));
     assert!(line(0).contains("took your session but did not answer"));
     let other = line(1);
     assert!(other.contains("exited with code 1"), "{other}");
