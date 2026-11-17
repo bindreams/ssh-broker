@@ -16,6 +16,8 @@ use ssh_broker::winutil::{UnelevatedToken, own_token};
 
 #[path = "common/child_entry.rs"]
 mod child_entry;
+#[path = "common/drain.rs"]
+mod drain;
 
 const CHILD: &str = "the_unelevated_child_reports_what_it_is";
 
@@ -56,14 +58,29 @@ fn unelevated_token() -> UnelevatedToken {
     UnelevatedToken::of_this_process().expect("make the unelevated token")
 }
 
+/// The child's result, which must be what [`expected`] says; `said` is what the child wrote, shown when it
+/// is not, or when there is none.
+fn assert_result(dir: &Dir, said: &str) {
+    let got = std::fs::read_to_string(child_entry::result_path(&dir.0))
+        .unwrap_or_else(|e| panic!("the child wrote no result ({e}); it said:\n{said}"));
+    assert_eq!(got, expected(), "the child said:\n{said}");
+}
+
 /// The EXEC path: a child on pipes, with the token, starts and is what the token says.
 #[test]
 fn a_child_on_pipes_with_the_unelevated_token_is_filtered_and_medium() {
     let token = unelevated_token();
     let dir = Dir::new("pipes");
     let child = ExecChild::spawn(&child_line(&dir), None, Some(&token)).expect("start the child on pipes");
+    // Both pipes are read from the start, so a child that fails noisily ends and says why.
+    let (out, err) = (
+        drain::drain(child.stdout_read_raw()),
+        drain::drain(child.stderr_read_raw()),
+    );
     child.wait().expect("wait for the child");
-    assert_eq!(child_entry::result(&dir.0), expected());
+    // Joined before anything can fail: the threads read handles that `child` closes.
+    let said = format!("{}{}", drain::text_of(out), drain::text_of(err));
+    assert_result(&dir, &said);
 }
 
 /// The PTY path: the same child in a pseudoconsole.
@@ -71,10 +88,13 @@ fn a_child_on_pipes_with_the_unelevated_token_is_filtered_and_medium() {
 fn a_child_in_a_pseudoconsole_with_the_unelevated_token_is_filtered_and_medium() {
     let token = unelevated_token();
     let dir = Dir::new("pty");
-    let session =
+    let mut session =
         PtySession::spawn(&child_line(&dir), 120, 30, None, None, Some(&token)).expect("start the child in a pty");
+    let output = drain::drain(session.out_read_raw());
     session.wait().expect("wait for the child");
-    assert_eq!(child_entry::result(&dir.0), expected());
+    session.close_pty(); // the output pipe ends once the pseudoconsole is closed
+    let said = drain::text_of(output);
+    assert_result(&dir, &said);
 }
 
 /// The child half. Run by the tests above with `--ignored`, never on its own.

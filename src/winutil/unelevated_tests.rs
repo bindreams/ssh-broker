@@ -3,18 +3,32 @@
 //! an ordinary one (where it is the token the process has). The elevated half is
 //! `tests/unelevated_token_windows.rs`.
 use super::*;
-use crate::account::{Elevation, INTEGRITY_MEDIUM, elevation, elevation_of, integrity_of};
+use crate::account::{Elevation, INTEGRITY_LOW, INTEGRITY_MEDIUM, elevation, elevation_of, integrity_of};
+use crate::test_support::{drain, text_of};
 use crate::winutil::{ChildConsole, spawn_suspended, token_information};
 use windows::Win32::Security::{
-    ACCESS_ALLOWED_ACE, ACL, ACL_SIZE_INFORMATION, AclSizeInformation, GetAce, GetAclInformation, TOKEN_DEFAULT_DACL,
-    TOKEN_QUERY, TokenDefaultDacl,
+    ACCESS_ALLOWED_ACE, ACL, ACL_SIZE_INFORMATION, AclSizeInformation, DuplicateTokenEx, GetAce, GetAclInformation,
+    SecurityImpersonation, TOKEN_ADJUST_DEFAULT, TOKEN_DEFAULT_DACL, TOKEN_DUPLICATE, TOKEN_QUERY, TokenDefaultDacl,
+    TokenPrimary,
 };
 use windows::Win32::System::Threading::{OpenProcessToken, TerminateProcess};
+
+/// A suspended child that is ended when this drops, also when the test that holds it panics.
+struct Suspended(OwnedHandle);
+
+impl Drop for Suspended {
+    fn drop(&mut self) {
+        // SAFETY: the suspended process this guard owns.
+        if let Err(e) = unsafe { TerminateProcess(self.0.0, 1) } {
+            eprintln!("could not end the suspended child: {e}");
+        }
+    }
+}
 
 /// Start `cmd /c exit 0` suspended with `token`, and hand its token to `read`; the child is ended after.
 fn with_child_token<R>(token: &UnelevatedToken, read: impl FnOnce(HANDLE) -> R) -> R {
     let null = HANDLE::default();
-    // SAFETY: no handles are passed; the child is suspended and ended below.
+    // SAFETY: no handles are passed; the child is suspended and ended by the guard.
     let (process, _thread) = unsafe {
         spawn_suspended(
             "cmd.exe /c exit 0",
@@ -26,14 +40,12 @@ fn with_child_token<R>(token: &UnelevatedToken, read: impl FnOnce(HANDLE) -> R) 
         )
     }
     .expect("start a child with the unelevated token");
+    let child = Suspended(process);
     let mut child_token = HANDLE::default();
     // SAFETY: the suspended process just created; the handle is closed by `OwnedHandle`.
-    unsafe { OpenProcessToken(process.0, TOKEN_QUERY, &mut child_token) }.expect("open the child's token");
+    unsafe { OpenProcessToken(child.0.0, TOKEN_QUERY, &mut child_token) }.expect("open the child's token");
     let child_token = OwnedHandle(child_token);
-    let result = read(child_token.0);
-    // SAFETY: the suspended process just created.
-    unsafe { TerminateProcess(process.0, 1) }.expect("end the suspended child");
-    result
+    read(child_token.0)
 }
 
 /// The child is at Medium integrity, and its token no longer carries the administrator's power: an
@@ -52,6 +64,45 @@ fn a_child_started_with_the_token_is_at_medium_integrity_and_not_elevated() {
         own
     };
     assert_eq!(got, expected);
+}
+
+/// A copy of this process's token that can be queried and have its label changed, closed on drop.
+fn own_token_copy() -> OwnedHandle {
+    let mut own = HANDLE::default();
+    // SAFETY: a valid out-pointer; the handle is closed by `OwnedHandle`.
+    unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_DUPLICATE, &mut own) }.expect("open the process token");
+    let own = OwnedHandle(own);
+    let mut copy = HANDLE::default();
+    // SAFETY: valid handles; the copy is closed by `OwnedHandle`.
+    unsafe {
+        DuplicateTokenEx(
+            own.0,
+            TOKEN_QUERY | TOKEN_ADJUST_DEFAULT,
+            None,
+            SecurityImpersonation,
+            TokenPrimary,
+            &mut copy,
+        )
+    }
+    .expect("copy the process token");
+    OwnedHandle(copy)
+}
+
+/// A token below Medium stays where it is: setting Medium on it would raise it, which fails without a
+/// privilege, and the unelevated token of a process that runs at Low integrity must still be made. A token
+/// above Medium goes down to it.
+#[test]
+fn the_integrity_label_is_lowered_to_medium_and_never_raised() {
+    let token = own_token_copy();
+    lower_integrity(token.0, INTEGRITY_LOW).expect("lower the copy to Low");
+    assert_eq!(integrity_of(token.0).unwrap(), INTEGRITY_LOW);
+    lower_integrity(token.0, INTEGRITY_MEDIUM).expect("a token below Medium is not raised, and that is not an error");
+    assert_eq!(integrity_of(token.0).unwrap(), INTEGRITY_LOW);
+
+    let above = own_token_copy();
+    let own = integrity_of(above.0).unwrap();
+    lower_integrity(above.0, INTEGRITY_MEDIUM).expect("lower the copy to Medium");
+    assert_eq!(integrity_of(above.0).unwrap(), own.min(INTEGRITY_MEDIUM));
 }
 
 /// The default DACL is the one UAC's filtered token has: the user, SYSTEM and the logon session, with the
@@ -102,8 +153,16 @@ fn the_default_dacl_of_the_token_gives_the_user_system_and_the_logon_session_the
 fn a_command_on_pipes_and_one_in_a_pseudoconsole_run_with_the_token() {
     let token = UnelevatedToken::of_this_process().expect("make the token");
     let on_pipes = crate::pipes::ExecChild::spawn("cmd.exe /c exit 5", None, Some(&token)).expect("start on pipes");
-    assert_eq!(on_pipes.wait().unwrap(), 5);
-    let in_pty = crate::conpty::PtySession::spawn("cmd.exe /c exit 6", 80, 24, None, None, Some(&token))
+    let (out, err) = (drain(on_pipes.stdout_read_raw()), drain(on_pipes.stderr_read_raw()));
+    let code = on_pipes.wait().unwrap();
+    // Joined before anything can fail: the threads read handles that `on_pipes` closes.
+    let said = format!("{}{}", text_of(out), text_of(err));
+    assert_eq!(code, 5, "on pipes, the child said:\n{said}");
+    let mut in_pty = crate::conpty::PtySession::spawn("cmd.exe /c exit 6", 80, 24, None, None, Some(&token))
         .expect("start in a pseudoconsole");
-    assert_eq!(in_pty.wait().unwrap(), 6);
+    let output = drain(in_pty.out_read_raw());
+    let code = in_pty.wait().unwrap();
+    in_pty.close_pty(); // the output pipe ends once the pseudoconsole is closed
+    let said = text_of(output);
+    assert_eq!(code, 6, "in a pseudoconsole, the child said:\n{said}");
 }

@@ -97,15 +97,15 @@ fn io_error(code: i32) -> windows::core::Error {
 fn a_failed_create_is_the_programs_unless_the_working_directory_is_not_one() {
     let dir = std::env::temp_dir();
     assert!(matches!(
-        start_error_of_create(io_error(193), None),
+        start_error_of_create(io_error(193), None, false),
         crate::shell::StartError::Program(_)
     ));
     assert!(matches!(
-        start_error_of_create(io_error(193), Some(&dir)),
+        start_error_of_create(io_error(193), Some(&dir), false),
         crate::shell::StartError::Program(_)
     ));
     let missing = dir.join("ssh-broker-no-such-directory-for-a-test");
-    let blamed = start_error_of_create(io_error(267), Some(&missing));
+    let blamed = start_error_of_create(io_error(267), Some(&missing), false);
     assert!(matches!(blamed, crate::shell::StartError::Other(_)), "{blamed:?}");
     assert!(
         format!("{blamed}").contains("ssh-broker-no-such-directory-for-a-test"),
@@ -169,21 +169,44 @@ fn a_failed_create_blames_the_program_unless_the_machine_is_out_of_a_resource() 
         1816, // ERROR_NOT_ENOUGH_QUOTA
     ];
     for code in program {
-        let blamed = start_error_of_create(io_error(code), None);
+        let blamed = start_error_of_create(io_error(code), None, false);
         assert!(
             matches!(blamed, crate::shell::StartError::Program(_)),
             "{code}: {blamed:?}"
         );
     }
     for code in other {
-        let blamed = start_error_of_create(io_error(code), None);
+        let blamed = start_error_of_create(io_error(code), None, false);
         assert!(
             matches!(blamed, crate::shell::StartError::Other(_)),
             "{code}: {blamed:?}"
         );
     }
     // An error that is not a Win32 code says nothing against the program either.
-    let blamed = start_error_of_create(windows::core::Error::from(windows::Win32::Foundation::E_FAIL), None);
+    let blamed = start_error_of_create(
+        windows::core::Error::from(windows::Win32::Foundation::E_FAIL),
+        None,
+        false,
+    );
+    assert!(matches!(blamed, crate::shell::StartError::Program(_)), "{blamed:?}");
+}
+
+/// `CreateProcessAsUserW` fails with `ERROR_PRIVILEGE_NOT_HELD` when the process lacks a privilege the call
+/// needs with that token: the program is not at fault, and the built-in shell would meet it too. Without a
+/// token the code is held against the program like any other.
+#[test]
+fn a_privilege_failure_with_a_token_is_not_the_programs() {
+    const ERROR_PRIVILEGE_NOT_HELD: i32 = 1314;
+    let blamed = start_error_of_create(io_error(ERROR_PRIVILEGE_NOT_HELD), None, true);
+    assert!(matches!(blamed, crate::shell::StartError::Other(_)), "{blamed:?}");
+    assert!(
+        format!("{blamed:#}").contains("token"),
+        "the token is named: {blamed:#}"
+    );
+    let blamed = start_error_of_create(io_error(ERROR_PRIVILEGE_NOT_HELD), None, false);
+    assert!(matches!(blamed, crate::shell::StartError::Program(_)), "{blamed:?}");
+    // Any other failure with a token is still judged as it is without one.
+    let blamed = start_error_of_create(io_error(193), None, true);
     assert!(matches!(blamed, crate::shell::StartError::Program(_)), "{blamed:?}");
 }
 
@@ -729,6 +752,58 @@ fn a_sid_not_aligned_for_its_sub_authorities_is_an_error() {
     assert!(err.to_string().contains("aligned"), "{err:#}");
 }
 
+// Walking a token's groups -----
+
+/// The group reader hands out each group of the token once, in the token's order, with the attributes the
+/// token holds, and a SID that lies inside the token information it was read from.
+#[test]
+fn the_group_reader_visits_each_group_of_this_process_token_once() {
+    use windows::Win32::Security::{SID_AND_ATTRIBUTES, TOKEN_GROUPS, TokenGroups};
+    let token = own_token().unwrap();
+    let info = token_information(token.0, TokenGroups).unwrap();
+    // SAFETY: the group count is a `u32`.
+    let count = unsafe { info.header::<u32>() }.unwrap();
+    // SAFETY: every bit pattern is a valid `SID_AND_ATTRIBUTES` (a pointer and an integer).
+    let expected: Vec<u32> =
+        unsafe { info.array::<SID_AND_ATTRIBUTES>(offset_of!(TOKEN_GROUPS, Groups), count as usize) }
+            .unwrap()
+            .iter()
+            .map(|group| group.Attributes)
+            .collect();
+
+    let mut seen = Vec::new();
+    let found: Option<()> = find_group(token.0, |sid, attributes| {
+        assert!(!sid.0.is_null());
+        seen.push(attributes);
+        Ok(None)
+    })
+    .unwrap();
+    assert_eq!(found, None);
+    assert_eq!(seen, expected);
+}
+
+/// The first group `pick` takes ends the walk, and what it returns is the result.
+#[test]
+fn the_group_reader_stops_at_the_group_that_is_picked() {
+    let token = own_token().unwrap();
+    let mut visited = 0;
+    let found = find_group(token.0, |_, attributes| {
+        visited += 1;
+        Ok(Some(attributes))
+    })
+    .unwrap();
+    assert!(found.is_some(), "a token has a group");
+    assert_eq!(visited, 1);
+}
+
+/// An error from `pick` ends the walk and is the result.
+#[test]
+fn the_group_reader_returns_the_error_of_pick() {
+    let token = own_token().unwrap();
+    let error = find_group::<()>(token.0, |_, _| anyhow::bail!("not this one")).unwrap_err();
+    assert!(error.to_string().contains("not this one"), "{error:#}");
+}
+
 // The inherit list -----
 
 fn handle(value: isize) -> HANDLE {
@@ -789,13 +864,6 @@ fn a_child_whose_stdout_and_stderr_are_one_handle_starts() {
     let h = write.0;
     starts(ChildConsole::NoWindow, [null, h, h], &[null, h, h]).expect("one handle for stdout and stderr");
     starts(ChildConsole::Parent, [null, h, h], &[null, h, h]).expect("the same on the parent's console");
-}
-
-/// A shim with no standard handles at all starts its shell, as it did before the handle list.
-#[test]
-fn a_child_with_no_standard_handles_starts_on_the_parents_console() {
-    let null = HANDLE::default();
-    starts(ChildConsole::Parent, [null; 3], &[null; 3]).expect("no handles to inherit");
 }
 
 /// The window policy of the parent's console adds no flag: the child shares the console this process has.

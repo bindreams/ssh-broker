@@ -6,6 +6,7 @@
 //! create/cleanup and the process start are written and reasoned about once. `own_token` and
 //! `token_information` are the one reader of a token: callers take a class from it and read the bytes
 //! through the checked `header` and `array`, and follow a SID pointer in them through the checked `sid`.
+//! `find_group` is the one walk of a token's groups.
 
 mod unelevated;
 pub use unelevated::UnelevatedToken;
@@ -14,7 +15,9 @@ use crate::shell::StartError;
 use anyhow::Context;
 use std::mem::offset_of;
 use windows::Win32::Foundation::{CloseHandle, ERROR_BAD_LENGTH, ERROR_INSUFFICIENT_BUFFER, HANDLE};
-use windows::Win32::Security::{GetTokenInformation, PSID, SID, TOKEN_INFORMATION_CLASS, TOKEN_QUERY};
+use windows::Win32::Security::{
+    GetTokenInformation, PSID, SID, SID_AND_ATTRIBUTES, TOKEN_GROUPS, TOKEN_INFORMATION_CLASS, TOKEN_QUERY, TokenGroups,
+};
 use windows::Win32::System::Console::HPCON;
 use windows::Win32::System::Diagnostics::Debug::{
     GetThreadErrorMode, SEM_FAILCRITICALERRORS, SetThreadErrorMode, THREAD_ERROR_MODE,
@@ -156,6 +159,37 @@ impl TokenInformation {
     }
 }
 
+/// The attribute bits of a token group (`SID_AND_ATTRIBUTES::Attributes`, winnt.h).
+pub const SE_GROUP_ENABLED: u32 = 0x4;
+pub const SE_GROUP_USE_FOR_DENY_ONLY: u32 = 0x10;
+/// The attribute of an integrity label.
+pub const SE_GROUP_INTEGRITY: u32 = 0x20;
+/// Both bits of the mask are set on a logon SID.
+pub const SE_GROUP_LOGON_ID: u32 = 0xC000_0000;
+
+/// The result of the first group of `token` for which `pick` answers `Some`; `None` when none does.
+/// `pick` gets each group's SID, which lies inside the token information it was read from (so it is
+/// valid only during the call: copy it to keep it), and the group's attributes (the `SE_GROUP_*`
+/// constants). An error of `pick`, or of reading the groups, ends the walk. Needs `TOKEN_QUERY`.
+pub fn find_group<T>(
+    token: HANDLE,
+    mut pick: impl FnMut(PSID, u32) -> anyhow::Result<Option<T>>,
+) -> anyhow::Result<Option<T>> {
+    let buf = token_information(token, TokenGroups).context("read the token's groups")?;
+    // SAFETY: the group count is a `u32`.
+    let count = unsafe { buf.header::<u32>() }.context("read the token's group count")?;
+    // SAFETY: every bit pattern is a valid `SID_AND_ATTRIBUTES` (a pointer and an integer).
+    let groups = unsafe { buf.array::<SID_AND_ATTRIBUTES>(offset_of!(TOKEN_GROUPS, Groups), count as usize) }
+        .context("read the token's groups")?;
+    for group in groups {
+        let sid = buf.sid(group.Sid).context("read a group of the token")?;
+        if let Some(found) = pick(sid, group.Attributes)? {
+            return Ok(Some(found));
+        }
+    }
+    Ok(None)
+}
+
 /// `class` of `token`, which needs `TOKEN_QUERY`. Every error carries Windows' reason; a handle
 /// without the access fails with it, not with a length.
 pub fn token_information(token: HANDLE, class: TOKEN_INFORMATION_CLASS) -> anyhow::Result<TokenInformation> {
@@ -251,23 +285,39 @@ impl Drop for FailCriticalErrors {
     }
 }
 
-/// The error of a `CreateProcessW` that failed. The program is at fault unless the failure is the
-/// machine's ([`is_not_the_programs`]): the built-in would meet those too, while any
-/// other cause (an image that is missing, malformed, quarantined, blocked by policy or unreadable)
-/// is answered by the built-in, and an unknown cause is safest answered there too, since blaming the
-/// machine ends the session where blaming the program gives a working shell and a warning. A given
-/// `cwd` that is not a directory also fails the call: then the working directory is named and the
-/// shell is not blamed. Judged after the failure, so a directory that appears in between is not
-/// blamed either.
-pub fn start_error_of_create(error: windows::core::Error, cwd: Option<&std::path::Path>) -> StartError {
+/// The error of a `CreateProcessW` (or `CreateProcessAsUserW`, with `with_token`) that failed. The program
+/// is at fault unless the failure is the machine's ([`is_not_the_programs`]): the built-in would meet those
+/// too, while any other cause (an image that is missing, malformed, quarantined, blocked by policy or
+/// unreadable) is answered by the built-in, and an unknown cause is safest answered there too, since
+/// blaming the machine ends the session where blaming the program gives a working shell and a warning. A
+/// given `cwd` that is not a directory also fails the call: then the working directory is named and the
+/// shell is not blamed. Judged after the failure, so a directory that appears in between is not blamed
+/// either.
+///
+/// With a token, `ERROR_PRIVILEGE_NOT_HELD` is the token's: this process lacks a privilege the call needs
+/// to start a child with it, and the built-in shell, started with the same token, fails the same way.
+pub fn start_error_of_create(
+    error: windows::core::Error,
+    cwd: Option<&std::path::Path>,
+    with_token: bool,
+) -> StartError {
     match cwd {
         Some(cwd) if !cwd.is_dir() => StartError::Other(anyhow::anyhow!(
             "the working directory {} is not a directory: {error}",
             cwd.display()
         )),
+        _ if with_token && is_privilege_not_held(&error) => StartError::Other(
+            anyhow::Error::new(error)
+                .context("this process lacks a privilege to start a child with the token it was given"),
+        ),
         _ if is_not_the_programs(&error) => StartError::Other(error.into()),
         _ => StartError::Program(error.into()),
     }
+}
+
+/// Whether `error` is `ERROR_PRIVILEGE_NOT_HELD`, as a Win32 code made into an HRESULT.
+fn is_privilege_not_held(error: &windows::core::Error) -> bool {
+    error.code() == windows::core::HRESULT::from_win32(windows::Win32::Foundation::ERROR_PRIVILEGE_NOT_HELD.0)
 }
 
 /// Whether `error` is a Win32 code for a cause that is not the program: the machine ran out of
@@ -561,7 +611,7 @@ pub unsafe fn spawn_suspended(
             ),
         }
     }
-    .map_err(|e| start_error_of_create(e, cwd))?;
+    .map_err(|e| start_error_of_create(e, cwd, as_user.is_some()))?;
     Ok((OwnedHandle(pi.hProcess), OwnedHandle(pi.hThread)))
 }
 

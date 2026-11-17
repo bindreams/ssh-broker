@@ -15,6 +15,13 @@ use crate::socket_loc::SocketLocation;
 mod fs_state;
 pub use fs_state::{dacl_sddl, junction, tree_state};
 
+// A child's output -----
+
+// One source with the integration tests that wait for a child, which include it too.
+#[path = "../tests/common/drain.rs"]
+mod drain;
+pub use drain::{drain, text_of};
+
 // Reading a DACL by SID -----
 
 pub const FILE_ALL: u32 = 0x1f_01ff;

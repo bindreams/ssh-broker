@@ -418,32 +418,50 @@ pub struct LocalChild {
 /// would have been under the agent. The child writes raw to sshd's pipes, exactly as the original
 /// DefaultShell did.
 ///
+/// A standard handle this process does not have, or cannot make inheritable, is not inherited and does not
+/// stop the start: the child gets the value (null where there is none) and the shell runs. A broken broker
+/// must not cost the user their SSH access.
+///
 /// It returns when the shell is running, and [`LocalChild::finish`] waits for it: a failure of the
 /// wait is not a failure to start, and must not run the command again.
 fn start_local(command_line: &str, as_user: Option<&UnelevatedToken>) -> Result<LocalChild, StartError> {
-    use windows::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
     use windows::Win32::System::Console::STD_ERROR_HANDLE;
-    unsafe {
-        let std_handles = [
-            GetStdHandle(STD_INPUT_HANDLE)?,
-            GetStdHandle(STD_OUTPUT_HANDLE)?,
-            GetStdHandle(STD_ERROR_HANDLE)?,
-        ];
-        // A handle on the inherit list has to be inheritable; make sure the standard ones are.
-        for h in std_handles {
-            let _ = SetHandleInformation(h, HANDLE_FLAG_INHERIT.0, HANDLE_FLAG_INHERIT);
-        }
-        let (process, thread) = spawn_suspended(
+    // SAFETY: no pointers. A failure is a handle this process does not have: null.
+    let std_handles = unsafe {
+        [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE].map(|which| GetStdHandle(which).unwrap_or_default())
+    };
+    start_with_std_handles(command_line, std_handles, as_user)
+}
+
+/// [`start_local`] with the standard handles it is given instead of this process's.
+fn start_with_std_handles(
+    command_line: &str,
+    std_handles: [HANDLE; 3],
+    as_user: Option<&UnelevatedToken>,
+) -> Result<LocalChild, StartError> {
+    use windows::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
+    // A handle on the inherit list has to be inheritable: the list has the standard handles that are, or
+    // can be made so.
+    let inheritable: Vec<HANDLE> = std_handles
+        .into_iter()
+        // SAFETY: no pointers; a handle that is not one fails the call.
+        .filter(|&h| unsafe { SetHandleInformation(h, HANDLE_FLAG_INHERIT.0, HANDLE_FLAG_INHERIT) }.is_ok())
+        .collect();
+    // SAFETY: the handles on the list are inheritable ones of this process; the standard handles are the
+    // values this process has (or null), which the call passes to the child without reading.
+    let (process, thread) = unsafe {
+        spawn_suspended(
             crate::shim::spawn_line(command_line),
             None,
             ChildConsole::Parent,
             std_handles,
-            &std_handles,
+            &inheritable,
             as_user,
-        )?;
-        let job = contain_and_resume(process.0, thread.0, "shim fail-open")?;
-        Ok(LocalChild { process, _job: job })
-    }
+        )
+    }?;
+    // SAFETY: the live handles from the successful start above.
+    let job = unsafe { contain_and_resume(process.0, thread.0, "shim fail-open") }?;
+    Ok(LocalChild { process, _job: job })
 }
 
 impl LocalChild {

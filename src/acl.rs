@@ -24,7 +24,6 @@
 //! This module is Windows-only (`#[cfg(windows)] mod acl;`). API signatures were
 //! source-verified against windows-0.62.2 (see verify-windows-acl-apis workflow).
 
-use std::mem::offset_of;
 use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
 
@@ -48,9 +47,8 @@ use windows::Win32::Security::{
     CreateWellKnownSid, DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetAclInformation, GetLengthSid,
     GetSecurityDescriptorControl, GetSecurityDescriptorDacl, INHERITED_ACE, IsValidSid, LookupAccountNameW,
     LookupAccountSidW, OBJECT_INHERIT_ACE, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SE_DACL_PRESENT,
-    SE_DACL_PROTECTED, SECURITY_ATTRIBUTES, SID_AND_ATTRIBUTES, SID_NAME_USE, SetTokenInformation, TOKEN_DEFAULT_DACL,
-    TOKEN_GROUPS, TOKEN_QUERY, TOKEN_USER, TokenDefaultDacl, TokenGroups, TokenUser, WinBuiltinAdministratorsSid,
-    WinBuiltinUsersSid, WinLocalSystemSid,
+    SE_DACL_PROTECTED, SECURITY_ATTRIBUTES, SID_NAME_USE, SetTokenInformation, TOKEN_DEFAULT_DACL, TOKEN_QUERY,
+    TOKEN_USER, TokenDefaultDacl, TokenUser, WinBuiltinAdministratorsSid, WinBuiltinUsersSid, WinLocalSystemSid,
 };
 use windows::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, CreateDirectoryW, FILE_ACCESS_RIGHTS, FILE_ALL_ACCESS, FILE_ATTRIBUTE_DIRECTORY,
@@ -135,21 +133,13 @@ impl Sid {
     /// SID of the logon session `token` belongs to (the group marked `SE_GROUP_LOGON_ID`), which needs
     /// `TOKEN_QUERY`.
     pub fn logon_of_token(token: HANDLE) -> anyhow::Result<Sid> {
-        /// `SE_GROUP_LOGON_ID` (winnt.h): both bits of the mask are set on a logon SID.
-        const SE_GROUP_LOGON_ID: u32 = 0xC000_0000;
-        let buf = crate::winutil::token_information(token, TokenGroups).context("read the token's groups")?;
-        // SAFETY: the group count is a `u32`.
-        let count = unsafe { buf.header::<u32>() }.context("read the token's group count")?;
-        // SAFETY: every bit pattern is a valid `SID_AND_ATTRIBUTES` (a pointer and an integer).
-        let groups = unsafe { buf.array::<SID_AND_ATTRIBUTES>(offset_of!(TOKEN_GROUPS, Groups), count as usize) }
-            .context("read the token's groups")?;
-        for group in groups {
-            if group.Attributes & SE_GROUP_LOGON_ID == SE_GROUP_LOGON_ID {
-                let sid = buf.sid(group.Sid).context("read the logon SID of the token")?;
-                return Sid::from_psid(sid);
-            }
-        }
-        anyhow::bail!("the token has no logon SID")
+        use crate::winutil::{SE_GROUP_LOGON_ID, find_group};
+        find_group(token, |sid, attributes| {
+            (attributes & SE_GROUP_LOGON_ID == SE_GROUP_LOGON_ID)
+                .then(|| Sid::from_psid(sid).context("read the logon SID of the token"))
+                .transpose()
+        })?
+        .context("the token has no logon SID")
     }
 
     /// A well-known SID (SYSTEM / BUILTIN\\Administrators / BUILTIN\\Users).

@@ -1,7 +1,7 @@
 //! Unit tests for the `shim_pty` module. Windows-only (the module is `#[cfg(windows)]`), so
 //! these compile and run only on a Windows host — in CI, the `Test (windows/amd64)` job.
 
-use super::{LocalChild, start_local};
+use super::{LocalChild, start_local, start_with_std_handles};
 use crate::cmdline::Exec;
 use crate::shim_offer::NoRescue;
 
@@ -79,6 +79,36 @@ fn the_local_passthrough_start_accepts_whitespace_at_the_edges_of_a_command() {
         let child = start_local(command, None).unwrap_or_else(|e| panic!("{command:?}: {e:?}"));
         assert_eq!(child.finish().unwrap(), 3, "{command:?}");
     }
+}
+
+// The standard handles of the fail-open start -----
+
+/// A handle value this process has no handle for, as a stale standard handle is (its handle closed after
+/// the value was read). Handle values are small multiples of four; no table reaches this.
+fn stale_handle() -> windows::Win32::Foundation::HANDLE {
+    windows::Win32::Foundation::HANDLE(0x7fff_fff0usize as *mut core::ffi::c_void)
+}
+
+/// A shim with no standard handles at all starts its shell. Before the inherit list the start took the child
+/// without them, and a broken broker must not cost the user their SSH access.
+#[test]
+fn a_shim_with_no_standard_handles_starts_its_shell() {
+    let null = windows::Win32::Foundation::HANDLE::default();
+    let child = start_with_std_handles("cmd.exe /c exit 3", [null; 3], None).expect("start with no handles");
+    assert_eq!(child.finish().unwrap(), 3);
+}
+
+/// One standard handle null and another stale: neither can go on the inherit list, and neither stops the
+/// shell, as neither did before the list.
+#[test]
+fn a_shim_with_a_missing_and_a_stale_standard_handle_still_starts_its_shell() {
+    let null = windows::Win32::Foundation::HANDLE::default();
+    let child = start_with_std_handles("cmd.exe /c exit 4", [null, stale_handle(), null], None)
+        .expect("start with a null and a stale handle");
+    assert_eq!(child.finish().unwrap(), 4);
+    let child = start_with_std_handles("cmd.exe /c exit 5", [stale_handle(), null, stale_handle()], None)
+        .expect("start with the stale handle twice");
+    assert_eq!(child.finish().unwrap(), 5);
 }
 
 // Where the shim connects, and what it says when it cannot ------------------------------
