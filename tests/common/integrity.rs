@@ -71,10 +71,10 @@ fn token_at(rid: u32) -> OwnedHandle {
 }
 
 /// Run `exe` with `command_line` as this process's user at mandatory integrity level `rid`
-/// (`ssh_broker::account::INTEGRITY_LOW` or `INTEGRITY_MEDIUM`) and return its exit code. The child's
-/// token is a copy of this process's with only its
-/// label set, so two levels differ in the integrity check and nothing else. It starts through
-/// [`spawn_with_token`]; a child that does not exit fails the test with `evidence` printed.
+/// ([`INTEGRITY_LOW`], [`INTEGRITY_MEDIUM`] of `ssh_broker::account`) and return its exit code. The
+/// child's token is a copy of this process's with only its label set, so two levels differ in the
+/// integrity check and nothing else. It starts through [`spawn_with_token`]; a child that does not
+/// exit fails the test with `evidence` printed.
 ///
 /// An elevated process gives the child a window station and desktop of its own, labelled at `rid`: a
 /// pair without a label is Medium, and a Low child cannot write to it. An unelevated process may not

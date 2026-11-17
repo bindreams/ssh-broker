@@ -124,7 +124,7 @@ impl Sid {
     /// SID of the user `token` belongs to, which needs `TOKEN_QUERY`.
     pub fn of_token(token: HANDLE) -> anyhow::Result<Sid> {
         let buf = crate::winutil::token_information(token, TokenUser).context("read the token's user")?;
-        // SAFETY: a `TOKEN_USER` is a SID pointer and an integer.
+        // SAFETY: every bit pattern is a valid `TOKEN_USER` (a pointer and an integer).
         let user = unsafe { buf.header::<TOKEN_USER>() }.context("read the token's user")?;
         let sid = buf.sid(user.User.Sid).context("read the token's user")?;
         Sid::from_psid(sid)

@@ -117,10 +117,10 @@ pub fn classify_elevation(administrators: AdministratorsSid, integrity_rid: u32)
 /// needs `TOKEN_QUERY`.
 pub fn integrity_of(token: HANDLE) -> anyhow::Result<u32> {
     let buf = token_information(token, TokenIntegrityLevel).context("read the token's integrity level")?;
-    // SAFETY: a `TOKEN_MANDATORY_LABEL` is a SID pointer and an integer.
+    // SAFETY: every bit pattern is a valid `TOKEN_MANDATORY_LABEL` (a pointer and an integer).
     let label = unsafe { buf.header::<TOKEN_MANDATORY_LABEL>() }.context("read the token's integrity label")?;
     let sid = buf.sid(label.Label.Sid).context("read the token's integrity label")?;
-    // SAFETY: `sid` is a SID `buf` holds whole, and `buf` lives to the end of this function.
+    // SAFETY: `sid` is a SID `buf` holds whole.
     unsafe { rid_of_label(sid) }
 }
 
@@ -130,7 +130,7 @@ pub fn integrity_of(token: HANDLE) -> anyhow::Result<u32> {
 /// # Safety
 /// `sid` points to a whole, readable SID, such as [`crate::winutil::TokenInformation::sid`] returns.
 unsafe fn rid_of_label(sid: PSID) -> anyhow::Result<u32> {
-    // SAFETY: `sid` is, by the caller's promise, a whole SID.
+    // SAFETY: the caller's promise.
     unsafe {
         let count = *GetSidSubAuthorityCount(sid);
         anyhow::ensure!(count > 0, "the integrity label has no sub-authority");
@@ -143,12 +143,12 @@ fn administrators_of(token: HANDLE) -> anyhow::Result<AdministratorsSid> {
     let buf = token_information(token, TokenGroups).context("read the token's groups")?;
     // SAFETY: the group count is a `u32`.
     let count = unsafe { buf.header::<u32>() }.context("read the token's group count")?;
-    // SAFETY: a `SID_AND_ATTRIBUTES` is a SID pointer and an integer.
+    // SAFETY: every bit pattern is a valid `SID_AND_ATTRIBUTES` (a pointer and an integer).
     let groups = unsafe { buf.array::<SID_AND_ATTRIBUTES>(offset_of!(TOKEN_GROUPS, Groups), count as usize) }
         .context("read the token's groups")?;
     for group in groups {
         let sid = buf.sid(group.Sid).context("read a group of the token")?;
-        // SAFETY: `sid` is a SID `buf` holds whole, and `buf` lives to the end of this function.
+        // SAFETY: `sid` is a SID `buf` holds whole.
         if unsafe { IsWellKnownSid(sid, WinBuiltinAdministratorsSid) }.as_bool() {
             let attributes = group.Attributes;
             return Ok(

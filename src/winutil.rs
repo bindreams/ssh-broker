@@ -10,7 +10,7 @@
 use crate::shell::StartError;
 use anyhow::Context;
 use std::mem::offset_of;
-use windows::Win32::Foundation::{CloseHandle, HANDLE};
+use windows::Win32::Foundation::{CloseHandle, ERROR_BAD_LENGTH, ERROR_INSUFFICIENT_BUFFER, HANDLE};
 use windows::Win32::Security::{GetTokenInformation, PSID, SID, TOKEN_INFORMATION_CLASS, TOKEN_QUERY};
 use windows::Win32::System::Console::HPCON;
 use windows::Win32::System::Diagnostics::Debug::{
@@ -51,7 +51,7 @@ impl Drop for OwnedHandle {
 
 /// A `TOKEN_QUERY` handle on this process's token. Read the token through this handle (`userdir`,
 /// `account::elevation`, [`token_information`]); a read that needs more access than `TOKEN_QUERY`
-/// opens its own. `tests/common/fs_state.rs` still opens its own: both crates include it by path.
+/// opens its own.
 pub fn own_token() -> anyhow::Result<OwnedHandle> {
     let mut token = HANDLE::default();
     // SAFETY: `token` is a valid out-pointer; the handle is closed by `OwnedHandle`.
@@ -75,7 +75,6 @@ impl TokenInformation {
     }
 
     /// The structure at the start of the data, copied out. An error when the data is shorter than `T`.
-    /// A SID pointer inside it is followed only through [`sid`](Self::sid).
     ///
     /// # Safety
     /// Every bit pattern of `size_of::<T>()` bytes must be a valid `T`: plain integers, and raw
@@ -95,8 +94,7 @@ impl TokenInformation {
 
     /// `count` elements of `T` that start `offset` bytes into the data (for a `TOKEN_GROUPS`, the
     /// `offset_of!` its `Groups`). An error when `offset` does not suit `T` or the elements run
-    /// past the data. The slice lives as long as `self`. A SID pointer in an element is followed only
-    /// through [`sid`](Self::sid).
+    /// past the data.
     ///
     /// # Safety
     /// As for [`header`](Self::header): every bit pattern of `T` must be valid.
@@ -120,12 +118,9 @@ impl TokenInformation {
         Ok(unsafe { std::slice::from_raw_parts(self.start().add(offset).cast::<T>(), count) })
     }
 
-    /// `sid`, a SID pointer found in the data, once it is known to lie wholly inside the data: an
-    /// error unless it is non-null, aligned for its sub-authorities, its header fits before the end,
-    /// and so do all of its sub-authorities. The given pointer is only compared, never read: the
-    /// result and the sub-authority count come from the value's own storage. The result is valid
-    /// while `self` lives, and is the only SID pointer from the data that may be handed to a
-    /// Windows call or read.
+    /// `sid` once it is known to lie wholly inside the data; an error if it is null, outside the
+    /// data, misaligned, or its header or sub-authorities run past the end. The pointer is only
+    /// compared, never read; the result is the one to hand to Windows.
     pub fn sid(&self, sid: PSID) -> anyhow::Result<PSID> {
         /// Everything in a SID before its sub-authorities.
         const HEADER: usize = offset_of!(SID, SubAuthority);
@@ -146,7 +141,7 @@ impl TokenInformation {
             room >= HEADER,
             "the token information holds a SID whose header runs past its end"
         );
-        // SAFETY: the header lies inside the initialised bytes (checked above); this reads one byte of it.
+        // SAFETY: the header lies inside the initialised bytes (checked above).
         let count = usize::from(unsafe { self.start().add(offset + COUNT_AT).read() });
         anyhow::ensure!(
             HEADER + count * SUB_AUTHORITY <= room,
@@ -160,31 +155,59 @@ impl TokenInformation {
 /// `class` of `token`, which needs `TOKEN_QUERY`. Every error carries Windows' reason; a handle
 /// without the access fails with it, not with a length.
 pub fn token_information(token: HANDLE, class: TOKEN_INFORMATION_CLASS) -> anyhow::Result<TokenInformation> {
-    let mut needed = 0u32;
-    // SAFETY: a null buffer is the documented size probe; it sets the length needed.
-    let probe = unsafe { GetTokenInformation(token, class, None, 0, &mut needed) };
+    read_information(|storage, told, returned| {
+        // An empty storage is the documented size probe: a null buffer.
+        let buffer = (!storage.is_empty()).then(|| storage.as_mut_ptr().cast());
+        // SAFETY: `storage` holds at least `told` bytes, which is what the call is told, and is 8-aligned.
+        unsafe { GetTokenInformation(token, class, buffer, told, returned) }
+    })
+}
+
+/// Reads through `read`, a call with the shape of `GetTokenInformation`: it gets storage, the length it
+/// may write and where to put the length it returned or needs. It is called first with no storage, as
+/// the size probe, then with new zeroed storage of the length it reported, again and with new storage
+/// of the length it reports each time it fails with `ERROR_INSUFFICIENT_BUFFER` or `ERROR_BAD_LENGTH`
+/// and a length larger than it was given (the data grew since the last call). Storage is never
+/// carried over: Windows writes absolute pointers into it. Any other failure is returned with Windows'
+/// reason, as is one that reports no larger length.
+fn read_information(
+    mut read: impl FnMut(&mut [u64], u32, &mut u32) -> windows::core::Result<()>,
+) -> anyhow::Result<TokenInformation> {
+    let mut told = 0u32;
+    let probe = read(&mut [], 0, &mut told);
     // A probe that set a length is fine whatever it returned (`ERROR_INSUFFICIENT_BUFFER` is the
     // usual); one that set none has nothing to size the read by.
-    if needed == 0 {
+    if told == 0 {
         return Err(match probe {
             Err(e) => anyhow::Error::new(e).context("GetTokenInformation (size probe)"),
             Ok(()) => anyhow::anyhow!("the token information size probe returned no length"),
         });
     }
-    // Read straight into the storage the value keeps: Windows writes pointers into the buffer it is handed.
-    let mut storage = vec![0u64; (needed as usize).div_ceil(size_of::<u64>())];
-    let mut returned = needed;
-    // SAFETY: the storage holds at least `needed` bytes, which is what the call is told, and is 8-aligned.
-    unsafe { GetTokenInformation(token, class, Some(storage.as_mut_ptr().cast()), needed, &mut returned) }
-        .context("GetTokenInformation")?;
-    anyhow::ensure!(
-        returned <= needed,
-        "GetTokenInformation returned {returned} bytes into a buffer of {needed}"
-    );
-    Ok(TokenInformation {
-        storage,
-        len: returned as usize,
-    })
+    loop {
+        let mut storage = vec![0u64; (told as usize).div_ceil(size_of::<u64>())];
+        let mut returned = told;
+        match read(&mut storage, told, &mut returned) {
+            Ok(()) => {
+                anyhow::ensure!(
+                    returned <= told,
+                    "GetTokenInformation returned {returned} bytes into a buffer of {told}"
+                );
+                return Ok(TokenInformation {
+                    storage,
+                    len: returned as usize,
+                });
+            }
+            Err(e) if returned > told && is_too_small(&e) => told = returned,
+            Err(e) => return Err(anyhow::Error::new(e).context("GetTokenInformation")),
+        }
+    }
+}
+
+/// Whether `error` says the buffer given was too small or of the wrong length.
+fn is_too_small(error: &windows::core::Error) -> bool {
+    [ERROR_INSUFFICIENT_BUFFER, ERROR_BAD_LENGTH]
+        .iter()
+        .any(|code| error.code() == windows::core::HRESULT::from_win32(code.0))
 }
 
 /// While alive, a program that `CreateProcessW` cannot start (the wrong architecture, a file that is not

@@ -1,6 +1,7 @@
 //! Unit tests for `winutil` (sibling-file style per project conventions).
 use super::*;
 use std::mem::offset_of;
+use windows::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_BAD_LENGTH, ERROR_INSUFFICIENT_BUFFER, WIN32_ERROR};
 
 /// A real OS error code must survive the conversion.
 ///
@@ -294,15 +295,13 @@ fn token_information_of_this_process_holds_a_header() {
     use windows::Win32::Security::{TOKEN_USER, TokenUser};
     let info = token_information(own_token().unwrap().0, TokenUser).unwrap();
     assert!(info.len >= size_of::<TOKEN_USER>(), "{}", info.len);
-    // SAFETY: a `TOKEN_USER` is a SID pointer and an integer.
+    // SAFETY: every bit pattern is a valid `TOKEN_USER` (a pointer and an integer).
     let user = unsafe { info.header::<TOKEN_USER>() }.unwrap();
     assert!(!user.User.Sid.0.is_null());
 }
 
 // Reading token information -----
 
-/// The pointers Windows writes into token information are absolute: they point into the very bytes
-/// the call filled, so the value must be read in place and never copied or moved afterwards.
 #[test]
 fn the_sids_in_this_process_token_lie_inside_the_returned_value() {
     use windows::Win32::Security::{
@@ -312,12 +311,12 @@ fn the_sids_in_this_process_token_lie_inside_the_returned_value() {
     let token = own_token().unwrap();
 
     let info = token_information(token.0, TokenUser).unwrap();
-    // SAFETY: a `TOKEN_USER` is a SID pointer and an integer.
+    // SAFETY: every bit pattern is a valid `TOKEN_USER` (a pointer and an integer).
     let user = unsafe { info.header::<TOKEN_USER>() }.unwrap();
     assert!(info.sid(user.User.Sid).is_ok(), "TokenUser");
 
     let info = token_information(token.0, TokenIntegrityLevel).unwrap();
-    // SAFETY: a `TOKEN_MANDATORY_LABEL` is a SID pointer and an integer.
+    // SAFETY: every bit pattern is a valid `TOKEN_MANDATORY_LABEL` (a pointer and an integer).
     let label = unsafe { info.header::<TOKEN_MANDATORY_LABEL>() }.unwrap();
     assert!(info.sid(label.Label.Sid).is_ok(), "TokenIntegrityLevel");
 
@@ -325,9 +324,11 @@ fn the_sids_in_this_process_token_lie_inside_the_returned_value() {
     // SAFETY: the group count is a `u32`.
     let count = unsafe { info.header::<u32>() }.unwrap();
     assert!(count > 0, "a token has at least one group");
-    // SAFETY: a `SID_AND_ATTRIBUTES` is a SID pointer and an integer.
+    // SAFETY: every bit pattern is a valid `SID_AND_ATTRIBUTES` (a pointer and an integer).
     let groups = unsafe { info.array::<SID_AND_ATTRIBUTES>(offset_of!(TOKEN_GROUPS, Groups), count as usize) }.unwrap();
-    assert!(info.sid(groups[0].Sid).is_ok(), "TokenGroups[0]");
+    for (n, group) in groups.iter().enumerate() {
+        assert!(info.sid(group.Sid).is_ok(), "TokenGroups[{n}]");
+    }
 }
 
 /// A `TokenInformation` holding `bytes`. Data built this way must hold no pointers: the ones a real
@@ -418,6 +419,219 @@ fn a_fixed_size_class_reads_through_the_same_reader() {
     assert_eq!(stats.TokenType, TokenPrimary);
 }
 
+// Sizing and growing the read -----
+
+/// What a fake read step does on one call.
+enum Answer {
+    /// Fails with `code`; reports `length` when it is `Some`, and leaves the length alone when not.
+    Fail { code: WIN32_ERROR, length: Option<u32> },
+    /// Succeeds, reporting `length` when it is `Some`, and writes `MARKER` into storage it is given.
+    Done { length: Option<u32> },
+}
+use Answer::{Done, Fail};
+
+const MARKER: u64 = 0x5eed;
+
+/// Runs `read_information` with a step that answers from `answers`, one per call (a call past them
+/// fails the test). Returns the outcome and the length each call was told. Every call must get new,
+/// zeroed storage that holds the told length: a step that failed has dirtied the one before.
+fn run(answers: &[Answer]) -> (anyhow::Result<TokenInformation>, Vec<u32>) {
+    let mut told_by_call = Vec::new();
+    let mut answers = answers.iter();
+    let outcome = read_information(|storage, told, returned| {
+        told_by_call.push(told);
+        assert_eq!(storage.len(), (told as usize).div_ceil(8), "storage for {told} bytes");
+        assert!(storage.iter().all(|&word| word == 0), "storage that was not new");
+        let answer = answers.next().expect("the loop called the step again");
+        let (outcome, length) = match answer {
+            Fail { code, length } => (Err(win32(*code)), *length),
+            Done { length } => (Ok(()), *length),
+        };
+        if let Some(first) = storage.first_mut() {
+            *first = if outcome.is_ok() { MARKER } else { u64::MAX };
+        }
+        if let Some(length) = length {
+            *returned = length;
+        }
+        outcome
+    });
+    (outcome, told_by_call)
+}
+
+fn win32(code: WIN32_ERROR) -> windows::core::Error {
+    windows::core::HRESULT::from_win32(code.0).into()
+}
+
+fn code_of(err: &anyhow::Error) -> windows::core::HRESULT {
+    err.downcast_ref::<windows::core::Error>()
+        .expect("Windows' error is kept")
+        .code()
+}
+
+#[test]
+fn a_read_that_fits_the_probed_length_succeeds_at_once() {
+    let (info, told) = run(&[
+        Fail {
+            code: ERROR_INSUFFICIENT_BUFFER,
+            length: Some(16),
+        },
+        Done { length: None },
+    ]);
+    let info = info.unwrap();
+    assert_eq!(told, [0, 16]);
+    assert_eq!(info.len, 16);
+    // SAFETY: `u64` accepts every bit pattern.
+    assert_eq!(unsafe { info.header::<u64>() }.unwrap(), MARKER);
+}
+
+#[test]
+fn a_read_that_returns_less_than_it_was_told_keeps_what_it_returned() {
+    let (info, _) = run(&[
+        Fail {
+            code: ERROR_INSUFFICIENT_BUFFER,
+            length: Some(16),
+        },
+        Done { length: Some(10) },
+    ]);
+    assert_eq!(info.unwrap().len, 10);
+}
+
+#[test]
+fn a_probe_that_succeeds_with_a_length_is_read_from_that_length() {
+    let (info, told) = run(&[Done { length: Some(16) }, Done { length: None }]);
+    assert_eq!(info.unwrap().len, 16);
+    assert_eq!(told, [0, 16]);
+}
+
+#[test]
+fn a_probe_that_failed_with_another_error_and_set_a_length_is_read() {
+    let (info, told) = run(&[
+        Fail {
+            code: ERROR_BAD_LENGTH,
+            length: Some(16),
+        },
+        Done { length: None },
+    ]);
+    assert_eq!(info.unwrap().len, 16);
+    assert_eq!(told, [0, 16]);
+}
+
+#[test]
+fn a_probe_that_set_no_length_and_failed_is_that_error() {
+    let (info, told) = run(&[Fail {
+        code: ERROR_ACCESS_DENIED,
+        length: None,
+    }]);
+    let err = info.err().expect("nothing to size the read by");
+    assert_eq!(code_of(&err), windows::core::HRESULT::from_win32(ERROR_ACCESS_DENIED.0));
+    assert!(format!("{err:#}").contains("size probe"), "{err:#}");
+    assert_eq!(told, [0]);
+}
+
+#[test]
+fn a_probe_that_set_no_length_and_succeeded_is_an_error() {
+    let (info, told) = run(&[Done { length: None }]);
+    let err = info.err().expect("nothing to size the read by");
+    assert!(err.to_string().contains("no length"), "{err:#}");
+    assert_eq!(told, [0]);
+}
+
+/// The token grew between the probe and the read: the read reports the length it needs, and is made
+/// again with new storage of that size. Both codes Windows uses for it count.
+#[test]
+fn a_read_that_reports_a_larger_length_is_made_again_with_new_storage() {
+    for code in [ERROR_INSUFFICIENT_BUFFER, ERROR_BAD_LENGTH] {
+        let (info, told) = run(&[
+            Fail {
+                code: ERROR_INSUFFICIENT_BUFFER,
+                length: Some(16),
+            },
+            Fail { code, length: Some(24) },
+            Done { length: Some(24) },
+        ]);
+        let info = info.unwrap_or_else(|e| panic!("{code:?}: {e:#}"));
+        assert_eq!(told, [0, 16, 24], "{code:?}");
+        assert_eq!(info.len, 24, "{code:?}");
+        // SAFETY: `u64` accepts every bit pattern.
+        assert_eq!(unsafe { info.header::<u64>() }.unwrap(), MARKER, "{code:?}");
+    }
+}
+
+#[test]
+fn a_read_that_grows_again_is_made_again() {
+    let (info, told) = run(&[
+        Fail {
+            code: ERROR_INSUFFICIENT_BUFFER,
+            length: Some(16),
+        },
+        Fail {
+            code: ERROR_INSUFFICIENT_BUFFER,
+            length: Some(24),
+        },
+        Fail {
+            code: ERROR_BAD_LENGTH,
+            length: Some(40),
+        },
+        Done { length: Some(40) },
+    ]);
+    assert_eq!(info.unwrap().len, 40);
+    assert_eq!(told, [0, 16, 24, 40]);
+}
+
+#[test]
+fn a_read_that_fails_with_another_error_is_that_error_even_with_a_larger_length() {
+    let (info, told) = run(&[
+        Fail {
+            code: ERROR_INSUFFICIENT_BUFFER,
+            length: Some(16),
+        },
+        Fail {
+            code: ERROR_ACCESS_DENIED,
+            length: Some(100),
+        },
+    ]);
+    let err = info.err().expect("access denied is not a size");
+    assert_eq!(code_of(&err), windows::core::HRESULT::from_win32(ERROR_ACCESS_DENIED.0));
+    assert_eq!(told, [0, 16]);
+}
+
+/// A failure that names no larger length is not a condition that clears by trying again.
+#[test]
+fn a_read_that_is_too_small_and_reports_no_larger_length_is_an_error() {
+    for length in [None, Some(16), Some(8)] {
+        let (info, told) = run(&[
+            Fail {
+                code: ERROR_INSUFFICIENT_BUFFER,
+                length: Some(16),
+            },
+            Fail {
+                code: ERROR_INSUFFICIENT_BUFFER,
+                length,
+            },
+        ]);
+        let err = info.err().expect("nothing to grow to");
+        assert_eq!(
+            code_of(&err),
+            windows::core::HRESULT::from_win32(ERROR_INSUFFICIENT_BUFFER.0),
+            "{length:?}"
+        );
+        assert_eq!(told, [0, 16], "{length:?}");
+    }
+}
+
+#[test]
+fn a_read_that_returns_more_than_it_was_told_is_an_error() {
+    let (info, _) = run(&[
+        Fail {
+            code: ERROR_INSUFFICIENT_BUFFER,
+            length: Some(16),
+        },
+        Done { length: Some(17) },
+    ]);
+    let err = info.err().expect("more bytes than the storage holds");
+    assert!(err.to_string().contains("17 bytes"), "{err:#}");
+}
+
 // Following a pointer found in the data -----
 
 /// Eight bytes of padding, then the SID `S-1-5-18` (a revision, a count of one, a six-byte authority
@@ -462,8 +676,7 @@ fn a_sid_one_past_the_end_of_the_data_is_an_error() {
 
 #[test]
 fn a_sid_whose_header_runs_past_the_end_is_an_error() {
-    // The value is 20 bytes in 24 bytes of storage: the end of the data is not the end of the buffer,
-    // and the header at 16 would fit in the buffer.
+    // The data ends before the buffer does: the header at 16 fits the buffer but not the data.
     let info = with_a_sid();
     assert!(info.sid(pointer_at(&info, info.len as isize - 4)).is_err());
 }
@@ -473,6 +686,35 @@ fn a_sid_whose_sub_authorities_run_past_the_end_is_an_error() {
     // The header fits, but its count of one sub-authority needs four bytes more.
     let info = from_bytes(&[0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 5]);
     assert!(info.sid(pointer_at(&info, 8)).is_err());
+}
+
+#[test]
+fn a_sid_with_no_sub_authority_is_returned() {
+    // A header of eight bytes, ending at the last byte of the data.
+    let info = from_bytes(&[0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 5]);
+    let sid = pointer_at(&info, 8);
+    assert_eq!(info.sid(sid).unwrap(), sid);
+}
+
+#[test]
+fn a_sid_whose_sub_authorities_end_at_the_last_byte_is_returned() {
+    // Two sub-authorities: the SID is 16 bytes, from 8 to the 24 the data holds.
+    let mut bytes = vec![0u8; 8];
+    bytes.extend([1, 2, 0, 0, 0, 0, 0, 5]);
+    bytes.extend(21u32.to_ne_bytes());
+    bytes.extend(544u32.to_ne_bytes());
+    let info = from_bytes(&bytes);
+    assert_eq!(info.len, 24);
+    let sid = pointer_at(&info, 8);
+    assert_eq!(info.sid(sid).unwrap(), sid);
+}
+
+#[test]
+fn a_sid_claiming_the_most_sub_authorities_in_a_short_buffer_is_an_error() {
+    // A count of 255 needs 1,028 bytes from the start of the SID; the data has 16.
+    let info = from_bytes(&[0, 0, 0, 0, 0, 0, 0, 0, 1, 255, 0, 0, 0, 0, 0, 5]);
+    let err = info.sid(pointer_at(&info, 8)).unwrap_err();
+    assert!(err.to_string().contains("255 sub-authorities"), "{err:#}");
 }
 
 #[test]

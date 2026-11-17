@@ -109,8 +109,6 @@ pub fn raw_socket_pair(tag: &str) -> (socket2::Socket, socket2::Socket, PathBuf)
     (server, client, dir)
 }
 
-// Reading a token the way `whoami` does -----
-
 /// The stdout of `whoami <switch> /fo csv /nh`, which reads this process's token through another path
 /// than the library and so is an independent source for a test.
 pub fn whoami_csv(switch: &str) -> String {

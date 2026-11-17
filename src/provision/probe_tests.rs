@@ -252,12 +252,15 @@ fn session_zero_unreadable_is_not() {
     assert!(!is_genuine_session(0, Some(0)));
 }
 
-/// The logon type is read from LSA by the logon id of this process's own token, which needs no privilege.
+/// The logon type is read from LSA by the logon id of this process's own token, which needs no
+/// privilege. Whatever the host, the type is one `SECURITY_LOGON_TYPE` names: Interactive (2) to
+/// CachedUnlock (13).
 #[cfg(windows)]
 #[test]
 fn this_process_has_a_logon_type() {
+    let logon_type = super::current_logon_type().expect("LSA gave no logon session data for this token");
     assert!(
-        super::current_logon_type().is_some(),
-        "LSA gave no logon session data for this token"
+        (2..=13).contains(&logon_type),
+        "{logon_type} is not a SECURITY_LOGON_TYPE"
     );
 }
