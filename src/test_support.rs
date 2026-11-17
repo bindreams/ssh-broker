@@ -78,6 +78,35 @@ pub fn widen(dir: &std::path::Path) {
     icacls(dir, &["/grant", "*S-1-1-0:(OI)(CI)F"]);
 }
 
+// Another program's hold on a folder -----
+
+/// Open `dir` with delete access, as a program that is about to delete or rename it does, and share
+/// everything.
+pub fn hold_for_deletion(dir: &std::path::Path) -> std::fs::File {
+    use std::os::windows::fs::OpenOptionsExt;
+    const DELETE: u32 = 0x0001_0000;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    std::fs::OpenOptions::new()
+        .access_mode(DELETE)
+        .share_mode(7)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(dir)
+        .unwrap_or_else(|e| panic!("hold {} for deletion: {e}", dir.display()))
+}
+
+/// Open `dir` for reading and let others write and delete it but not read it.
+pub fn hold_without_sharing_read(dir: &std::path::Path) -> std::fs::File {
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    const SHARE_WRITE_DELETE: u32 = 2 | 4;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(SHARE_WRITE_DELETE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(dir)
+        .unwrap_or_else(|e| panic!("hold {} without sharing read: {e}", dir.display()))
+}
+
 // A stand-in profile -----
 
 /// A stand-in profile under the temp dir, removed on drop. `AppData\Local` exists inside it, as

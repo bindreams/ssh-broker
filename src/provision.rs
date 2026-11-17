@@ -468,10 +468,13 @@ mod imp {
                 rows.push(user_rows::socket_dir_row(&location, &user));
                 rows.push(user_rows::socket_file_row(&location, &user));
                 rows.push(user_rows::log_folder_row(&location, &user));
+                rows.push(user_rows::socket_reachable_row(&location, &user));
             }
-            Err(e) => rows.push(report::Check::new("socket location", false, format!("{e:#}"))),
+            Err(e) => {
+                rows.push(report::Check::new("socket location", false, format!("{e:#}")));
+                rows.push(report::Check::new("socket reachable", false, format!("{e:#}")));
+            }
         }
-        rows.push(user_rows::socket_reachable_row(&location));
         rows.push(user_rows::other_users_row());
 
         // Through the agent: the real parity proof (run in session 1 by verify-probe). Bounded,
@@ -595,7 +598,9 @@ mod imp {
     /// very property being measured. This is the end-to-end half of byte-transparency — a real
     /// child, real pipes, a real socket — which the in-memory relay tests cannot reach.
     fn drive_probe(exe: &Path) -> anyhow::Result<(probe::ProbeResult, bool)> {
-        let sock = afunix::connect(crate::userdir::current_socket_location()?.path()).context("connect to agent")?;
+        let sock = crate::userdir::inspect_current_socket_dir()
+            .and_then(|folder| folder.connect())
+            .context("connect to agent")?;
         let (rx, tx) = afunix::split(sock)?;
         let hs = super::probe_handshake(exe);
         let mut out = Vec::new();

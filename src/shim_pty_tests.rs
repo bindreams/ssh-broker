@@ -2,6 +2,7 @@
 //! these compile and run only on a Windows host — in CI, the `Test (windows/amd64)` job.
 
 use super::{LocalChild, start_local, start_with_std_handles};
+use crate::acl::Sid;
 use crate::cmdline::Exec;
 use crate::shim_offer::NoRescue;
 
@@ -159,7 +160,13 @@ fn a_standard_handle_that_cannot_be_inherited_is_passed_as_null() {
 
 // Where the shim connects, and what it says when it cannot ------------------------------
 
+use crate::shim_offer::Folder;
 use crate::socket_loc::{SocketLocation, SocketLocationError};
+
+/// The shim's folder at `location`, walked as this account: what `run_on` holds from its first act.
+fn folder_of(location: anyhow::Result<SocketLocation>) -> Folder {
+    Folder::in_location(location, Sid::current_user())
+}
 
 fn too_long() -> anyhow::Error {
     SocketLocationError::TooLong {
@@ -174,7 +181,7 @@ fn too_long() -> anyhow::Error {
 fn unresolvable_socket_location_fails_open_with_the_reason() {
     let mut stderr = Vec::new();
     let relayed = super::try_relay_at(
-        Err(too_long()),
+        &folder_of(Err(too_long())),
         &Some(exec("echo hi")),
         &mut stderr,
         None,
@@ -199,7 +206,7 @@ fn location_error_reaches_stderr_in_pty_mode() {
     // the only other place the reason goes, and the user does not read it.
     let mut stderr = Vec::new();
     let relayed = super::try_relay_at(
-        Err(too_long()),
+        &folder_of(Err(too_long())),
         &None,
         &mut stderr,
         None,
@@ -229,7 +236,7 @@ fn connect_failure_in_the_callers_own_dir_fails_open_without_a_reason_on_stderr(
     let location = crate::test_support::location_in(&dir);
     let mut stderr = Vec::new();
     let relayed = super::try_relay_at(
-        Ok(location),
+        &folder_of(Ok(location)),
         &Some(exec("echo hi")),
         &mut stderr,
         None,
@@ -254,7 +261,15 @@ fn connect_failure_in_pty_mode_writes_nothing_to_stderr() {
     std::fs::create_dir_all(&dir).unwrap();
     let location = crate::test_support::location_in(&dir);
     let mut stderr = Vec::new();
-    let relayed = super::try_relay_at(Ok(location), &None, &mut stderr, None, std::io::empty(), &mut NoRescue).unwrap();
+    let relayed = super::try_relay_at(
+        &folder_of(Ok(location)),
+        &None,
+        &mut stderr,
+        None,
+        std::io::empty(),
+        &mut NoRescue,
+    )
+    .unwrap();
 
     assert_eq!(relayed, None);
     assert!(stderr.is_empty());
@@ -300,7 +315,7 @@ fn try_relay_connects_to_the_location_its_provider_names() {
 
     let relayed = super::try_relay(
         &Some(exec("echo hi")),
-        || Ok(location),
+        &folder_of(Ok(location)),
         None,
         std::io::empty(),
         &mut NoRescue,
@@ -325,7 +340,7 @@ fn a_failed_log_is_named_where_the_shim_already_explains_a_fallback_for_a_comman
     let mut stderr = Vec::new();
     let cause = "the folder belongs to someone else";
     let relayed = super::try_relay_at(
-        Ok(location),
+        &folder_of(Ok(location)),
         &Some(exec("echo hi")),
         &mut stderr,
         Some(cause),
@@ -350,7 +365,7 @@ fn a_failed_log_adds_nothing_to_an_interactive_fallback_that_prints_nothing_toda
     let location = crate::test_support::location_in(&dir);
     let mut stderr = Vec::new();
     let relayed = super::try_relay_at(
-        Ok(location),
+        &folder_of(Ok(location)),
         &None,
         &mut stderr,
         Some("no log"),
@@ -368,14 +383,14 @@ fn a_failed_log_adds_nothing_to_an_interactive_fallback_that_prints_nothing_toda
 fn a_failed_log_does_not_touch_the_stderr_of_a_relayed_command() {
     // The diagnostics buffer is the shim's own; a relayed command's stderr is the command's.
     use crate::afunix::Listener;
-    let profile = crate::test_support::TempProfile::new("shim-nolog-relay");
+    let profile = crate::test_support::TempProfile::new("nolog-relay");
     let location = profile.location();
     crate::userdir::ensure_socket_dir(&location, &crate::acl::Sid::current_user().unwrap()).unwrap();
     let agent = fake_agent_exiting_with(Listener::bind(location.path()).unwrap(), 0);
     let mut stderr = Vec::new();
 
     let relayed = super::try_relay_at(
-        Ok(location),
+        &folder_of(Ok(location)),
         &Some(exec("echo hi")),
         &mut stderr,
         Some("no log"),
@@ -415,7 +430,7 @@ impl Scripted {
 impl Rescue for Scripted {
     fn rescue(&mut self, absent: &Absent<'_>, stderr: &mut dyn std::io::Write) -> Rescued {
         self.seen
-            .push((absent.exec, absent.location.is_ok(), absent.connect.is_err()));
+            .push((absent.exec, absent.folder.location().is_ok(), absent.connect.is_err()));
         if let Some(line) = self.line {
             writeln!(stderr, "{line}").unwrap();
         }
@@ -436,7 +451,7 @@ fn a_rescue_is_asked_when_the_connect_fails_and_its_line_comes_before_the_fallba
     rescue.line = Some("NOTICE");
     let mut stderr = Vec::new();
     let relayed = super::try_relay_at(
-        Ok(location),
+        &folder_of(Ok(location)),
         &Some(exec("echo hi")),
         &mut stderr,
         None,
@@ -458,7 +473,7 @@ fn a_rescue_is_shown_a_location_error_and_the_fallback_message_stays() {
     let mut rescue = Scripted::answering(Rescued::Plain);
     let mut stderr = Vec::new();
     let relayed = super::try_relay_at(
-        Err(crate::userdir::NoProfile.into()),
+        &folder_of(Err(crate::userdir::NoProfile.into())),
         &None,
         &mut stderr,
         None,
@@ -489,7 +504,7 @@ fn a_rescue_is_not_asked_when_the_connect_succeeds() {
     let agent = fake_agent_exiting_with(Listener::bind(location.path()).unwrap(), 5);
 
     let relayed = super::try_relay_at(
-        Ok(location),
+        &folder_of(Ok(location)),
         &Some(exec("echo hi")),
         &mut Vec::new(),
         None,
@@ -515,7 +530,7 @@ fn a_rescue_that_connects_gets_the_session_relayed_through_its_connection() {
     let mut rescue = Scripted::answering(Rescued::Connected { socket, modes: None });
 
     let relayed = super::try_relay_at(
-        Ok(nowhere),
+        &folder_of(Ok(nowhere)),
         &Some(exec("echo hi")),
         &mut Vec::new(),
         None,
@@ -533,7 +548,15 @@ fn a_rescue_that_finds_the_input_gone_ends_the_shim_with_255_and_runs_nothing() 
     let (_profile, location) = no_agent_location("rescue-gone");
     let mut rescue = Scripted::answering(Rescued::Gone);
     let mut stderr = Vec::new();
-    let relayed = super::try_relay_at(Ok(location), &None, &mut stderr, None, std::io::empty(), &mut rescue).unwrap();
+    let relayed = super::try_relay_at(
+        &folder_of(Ok(location)),
+        &None,
+        &mut stderr,
+        None,
+        std::io::empty(),
+        &mut rescue,
+    )
+    .unwrap();
 
     assert_eq!(relayed, Some(255));
     assert!(stderr.is_empty(), "no fallback message: nothing runs");
@@ -590,7 +613,7 @@ fn a_command_whose_connection_ends_before_the_agent_answers_says_it_may_have_run
         let mut stderr = Vec::new();
 
         let relayed = super::try_relay_at(
-            Ok(location),
+            &folder_of(Ok(location)),
             &Some(exec("echo hi")),
             &mut stderr,
             None,
@@ -644,7 +667,7 @@ fn a_command_is_never_sent_to_an_agent_a_second_time() {
     });
 
     let relayed = super::try_relay_at(
-        Ok(location),
+        &folder_of(Ok(location)),
         &Some(exec("echo hi")),
         &mut Vec::new(),
         None,
@@ -672,7 +695,7 @@ fn an_interactive_session_whose_connection_ends_before_the_agent_answers_takes_t
     let mut attempts = 0;
 
     let relayed = super::try_relay_with(
-        Ok(location),
+        &folder_of(Ok(location)),
         &None,
         &mut stderr,
         None,
@@ -700,7 +723,7 @@ fn an_interactive_session_goes_round_again_to_an_agent_that_answers_the_second_t
     use super::Interactive;
     use crate::relay::Outcome;
     use crate::shim::Pumped;
-    let (_profile, location, listener) = location_with_listener("hangup-then-serve");
+    let (_profile, location, listener) = location_with_listener("hangup-serve");
     let (finished, wait_finished) = std::sync::mpsc::channel::<()>();
     let agent = std::thread::spawn(move || {
         drop(listener.accept().unwrap());
@@ -711,7 +734,7 @@ fn an_interactive_session_goes_round_again_to_an_agent_that_answers_the_second_t
     let mut attempts = 0;
 
     let relayed = super::try_relay_with(
-        Ok(location),
+        &folder_of(Ok(location)),
         &None,
         &mut Vec::new(),
         None,
@@ -773,7 +796,7 @@ fn a_second_connection_that_ends_without_a_byte_is_a_protocol_violation_not_a_re
     let mut attempts = 0;
 
     let relayed = super::try_relay_with(
-        Ok(location),
+        &folder_of(Ok(location)),
         &None,
         &mut stderr,
         None,
@@ -805,6 +828,46 @@ fn a_second_connection_that_ends_without_a_byte_is_a_protocol_violation_not_a_re
     );
 }
 
+#[test]
+fn a_folder_that_was_missing_at_the_first_act_is_connected_through_when_it_appears_and_counts_the_closes() {
+    // The shim's walk found no `AppData` and held nothing. The folders appear, and an agent that keeps
+    // hanging up without a byte listens in them: the connect looks again and goes through them, so the
+    // second close is a protocol violation and not a reason to connect again.
+    let profile = crate::test_support::TempProfile::new("hangup-late");
+    let location = profile.location();
+    std::fs::remove_dir_all(profile.0.join("AppData")).unwrap();
+    let folder = folder_of(Ok(location.clone()));
+    assert!(folder.refusal().is_none(), "no folder is not a refused one");
+    std::fs::create_dir_all(profile.0.join(r"AppData\Local")).unwrap();
+    crate::userdir::ensure_socket_dir(&location, &Sid::current_user().unwrap()).unwrap();
+    let (finished, agent) = agent_that_always_hangs_up(crate::afunix::Listener::bind(location.path()).unwrap(), 2);
+    let mut stderr = Vec::new();
+    let mut attempts = 0;
+
+    let relayed = super::try_relay_with(
+        &folder,
+        &None,
+        &mut stderr,
+        None,
+        std::io::empty(),
+        &mut Never,
+        &mut |_conn, _modes, _command| {
+            attempts += 1;
+            assert!(
+                attempts <= 2,
+                "the shim connected a third time to an agent that hung up twice"
+            );
+            Ok(hung_up())
+        },
+    )
+    .unwrap();
+    finished.send(()).unwrap();
+    agent.join().unwrap();
+
+    assert_eq!(attempts, 2);
+    assert_eq!(relayed, Some(254));
+}
+
 /// A rescue that answers from a list.
 struct Answers(std::collections::VecDeque<Rescued>);
 
@@ -831,7 +894,7 @@ fn a_no_byte_close_before_and_after_a_connect_that_failed_are_not_consecutive() 
     let mut attempts = 0;
 
     let relayed = super::try_relay_with(
-        Ok(location),
+        &folder_of(Ok(location)),
         &None,
         &mut Vec::new(),
         None,
@@ -862,11 +925,11 @@ fn a_command_with_a_console_relays_as_a_pty_session_with_the_command() {
     use super::Interactive;
     use crate::relay::Outcome;
     use crate::shim::Pumped;
-    let (_profile, location, _listener) = location_with_listener("terminal-command");
+    let (_profile, location, _listener) = location_with_listener("term-command");
     let mut asked = Vec::new();
 
     let relayed = super::try_relay_with(
-        Ok(location),
+        &folder_of(Ok(location)),
         &Some(exec_with_terminal("echo  hi")),
         &mut Vec::new(),
         None,
@@ -896,7 +959,7 @@ fn a_command_without_a_terminal_does_not_take_the_console_relay() {
     let agent = fake_agent_exiting_with(listener, 4);
 
     let relayed = super::try_relay_with(
-        Ok(location),
+        &folder_of(Ok(location)),
         &Some(exec("echo hi")),
         &mut Vec::new(),
         None,
@@ -920,7 +983,7 @@ fn an_unanswered_terminal_command_is_not_sent_again() {
     let mut attempts = 0;
 
     let relayed = super::try_relay_with(
-        Ok(location),
+        &folder_of(Ok(location)),
         &Some(exec_with_terminal("echo hi")),
         &mut stderr,
         None,
@@ -1007,4 +1070,161 @@ fn a_notice_is_written_with_a_carriage_return_and_a_failure_to_write_it_is_said(
         said.starts_with("ssh-broker: could not show the notice") && said.contains("the pipe is being closed"),
         "{said:?}"
     );
+}
+
+// A folder that is refused -----
+
+/// A stand-in profile with its private folder made and a stand-in agent listening in it: the thread
+/// returns how many bytes reached the agent first. A shim that connected sends its handshake, and the
+/// sentinel the test connects with sends nothing.
+fn agent_in_private_folder(
+    tag: &str,
+) -> (
+    crate::test_support::TempProfile,
+    SocketLocation,
+    std::thread::JoinHandle<usize>,
+) {
+    use std::io::Read;
+    let profile = crate::test_support::TempProfile::new(tag);
+    let location = profile.location();
+    crate::userdir::ensure_socket_dir(&location, &Sid::current_user().unwrap()).unwrap();
+    let listener = crate::afunix::Listener::bind(location.path()).unwrap();
+    let agent = std::thread::spawn(move || {
+        let mut first = [0u8; 1];
+        listener.accept().unwrap().read(&mut first).unwrap()
+    });
+    (profile, location, agent)
+}
+
+/// The agent's socket in a folder that is refused, and the stand-in agent behind it.
+fn refused_folder_with_an_agent(
+    tag: &str,
+) -> (
+    crate::test_support::TempProfile,
+    SocketLocation,
+    Folder,
+    std::thread::JoinHandle<usize>,
+) {
+    let (profile, location, agent) = agent_in_private_folder(tag);
+    crate::test_support::widen(location.dir());
+    let folder = folder_of(Ok(location.clone()));
+    (profile, location, folder, agent)
+}
+
+/// A shim whose private folder is refused does not connect, even though an agent's socket sits in it. A
+/// login with a terminal is told why before it falls back to the plain shell.
+#[test]
+fn a_shim_with_a_terminal_whose_folder_is_refused_does_not_connect_and_prints_the_folder_refused_line() {
+    let (_profile, location, folder, agent) = refused_folder_with_an_agent("ref-pty");
+    let mut stderr = Vec::new();
+
+    let relayed = super::try_relay_at(
+        &folder,
+        &None,
+        &mut stderr,
+        None,
+        std::io::empty(),
+        &mut crate::shim_offer::Prompting,
+    )
+    .unwrap();
+
+    assert_eq!(relayed, None, "the shim fails open instead of reaching the socket");
+    let text = String::from_utf8(stderr).unwrap();
+    assert!(text.starts_with("ssh-broker: no session is offered"), "{text}");
+    assert!(text.contains(&location.dir().display().to_string()), "{text}");
+    drop(crate::afunix::connect(location.path()).unwrap());
+    assert_eq!(agent.join().unwrap(), 0, "the shim sent something to the agent");
+}
+
+/// A login with a command is told the cause once: by the fail-open line, which carries why the shim has
+/// no log. The log and the folder come from the same walk, so that is the folder's refusal.
+#[test]
+fn a_shim_with_a_command_whose_folder_is_refused_does_not_connect_and_says_why_once_in_the_fail_open_line() {
+    let (_profile, location, folder, agent) = refused_folder_with_an_agent("ref-exec");
+    let log_failure = format!(
+        "{:#}",
+        folder.logs().err().expect("the folder is refused, so there is no log")
+    );
+    let mut stderr = Vec::new();
+
+    let relayed = super::try_relay_at(
+        &folder,
+        &Some(exec("echo hi")),
+        &mut stderr,
+        Some(&log_failure),
+        std::io::empty(),
+        &mut crate::shim_offer::Prompting,
+    )
+    .unwrap();
+
+    assert_eq!(relayed, None, "the shim fails open instead of reaching the socket");
+    let text = String::from_utf8(stderr).unwrap();
+    assert!(text.starts_with("ssh-broker: agent unavailable"), "{text}");
+    assert!(!text.contains("no session is offered"), "told twice: {text}");
+    assert!(text.contains(&location.dir().display().to_string()), "{text}");
+    drop(crate::afunix::connect(location.path()).unwrap());
+    assert_eq!(agent.join().unwrap(), 0, "the shim sent something to the agent");
+}
+
+/// The log's failure is the first act's: there was no folder then. A folder that is refused when the
+/// connect looks again is what the fail-open line of a login with a command names.
+#[test]
+fn a_shim_with_a_command_whose_folder_is_refused_on_a_later_look_names_that_refusal_in_the_fail_open_line() {
+    let profile = crate::test_support::TempProfile::new("ref-later");
+    let location = profile.location();
+    std::fs::remove_dir_all(profile.0.join("AppData")).unwrap();
+    let folder = folder_of(Ok(location.clone()));
+    let log_failure = format!("{:#}", folder.logs().err().expect("no folder, so no log"));
+    std::fs::create_dir_all(profile.0.join(r"AppData\Local")).unwrap();
+    crate::userdir::ensure_socket_dir(&location, &Sid::current_user().unwrap()).unwrap();
+    crate::test_support::widen(location.dir());
+    let mut stderr = Vec::new();
+
+    let relayed = super::try_relay_at(
+        &folder,
+        &Some(exec("echo hi")),
+        &mut stderr,
+        Some(&log_failure),
+        std::io::empty(),
+        &mut crate::shim_offer::Prompting,
+    )
+    .unwrap();
+
+    assert_eq!(relayed, None);
+    let text = String::from_utf8(stderr).unwrap();
+    assert!(text.starts_with("ssh-broker: agent unavailable"), "{text}");
+    assert!(!text.contains("no session is offered"), "told twice: {text}");
+    assert!(text.contains("its ACL is not exactly"), "{text}");
+    assert!(text.contains(&location.dir().display().to_string()), "{text}");
+}
+
+/// The stated limit where the user sees it: another program holds the private folder open with the right
+/// to delete it, so the shim cannot hold it. The login is told that, relays nothing and reaches nothing.
+#[test]
+fn a_shim_whose_folder_is_held_open_by_another_program_says_so_and_does_not_connect() {
+    let (_profile, location, agent) = agent_in_private_folder("ref-held");
+    let holder = crate::test_support::hold_for_deletion(location.dir());
+    let folder = folder_of(Ok(location.clone()));
+    let mut stderr = Vec::new();
+
+    let relayed = super::try_relay_at(
+        &folder,
+        &None,
+        &mut stderr,
+        None,
+        std::io::empty(),
+        &mut crate::shim_offer::Prompting,
+    )
+    .unwrap();
+    drop(holder);
+
+    assert_eq!(relayed, None, "the shim fails open instead of reaching the socket");
+    let text = String::from_utf8(stderr).unwrap();
+    assert!(text.starts_with("ssh-broker: no session is offered"), "{text}");
+    assert!(
+        text.contains(&crate::offer::text::folder_held(location.dir())),
+        "{text}"
+    );
+    drop(crate::afunix::connect(location.path()).unwrap());
+    assert_eq!(agent.join().unwrap(), 0, "the shim sent something to the agent");
 }

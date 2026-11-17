@@ -692,10 +692,7 @@ fn an_open_maps_each_status_to_one_outcome() {
     for status in [STATUS_OBJECT_NAME_NOT_FOUND, STATUS_OBJECT_PATH_NOT_FOUND] {
         assert_eq!(classify_open(status), OpenOutcome::Missing);
     }
-    assert_eq!(
-        classify_open(STATUS_SHARING_VIOLATION),
-        OpenOutcome::Failed(STATUS_SHARING_VIOLATION)
-    );
+    assert_eq!(classify_open(STATUS_SHARING_VIOLATION), OpenOutcome::SharingViolation);
 }
 
 #[test]
@@ -777,7 +774,11 @@ fn ensure_private_dir_says_so_when_the_folders_security_cannot_be_read() {
     );
     let root = open_root(&parent.0).unwrap();
 
-    let err = without_privileges(|| ensure_private_dir(&root, "ssh-broker", &me_sid).err().expect("refused"));
+    let err = without_privileges(|| {
+        ensure_private_dir(&root, "ssh-broker", &me_sid, Hold::Held)
+            .err()
+            .expect("refused")
+    });
 
     assert!(err.is::<Refused>(), "{err:#}");
     let text = format!("{err:#}");
@@ -789,14 +790,18 @@ fn ensure_private_dir_says_so_when_the_folders_security_cannot_be_read() {
         "the creating path says what else may be wrong: {text}"
     );
 
-    let err = without_privileges(|| open_private_dir(&root, "ssh-broker", &me_sid).err().expect("refused"));
+    let err = without_privileges(|| {
+        open_private_dir(&root, "ssh-broker", &me_sid, Hold::Held)
+            .err()
+            .expect("refused")
+    });
     let text = format!("{err:#}");
     assert!(text.contains("denied access to read its ACL"), "{text}");
     assert!(!text.contains("make"), "a look never makes anything: {text}");
 }
 
 /// A component of the profile that this process may not open is a system error of the walk, not a
-/// refusal and not a missing name: the shim shows every one of them (`shim_offer::refusal_of`).
+/// refusal and not a missing name: the shim shows every one of them (`shim_offer::Folder::refusal`).
 #[test]
 fn a_profile_folder_that_cannot_be_opened_is_a_system_error_naming_it() {
     let parent = TempPath::new("walk-denied");
@@ -1017,7 +1022,7 @@ fn ensure_private_dir_refuses_a_foreign_owner_and_leaves_the_folder() {
     let before = owner_of(&dir);
     let err = format!(
         "{:#}",
-        ensure_private_dir(&handle, "d", &me)
+        ensure_private_dir(&handle, "d", &me, Hold::Held)
             .err()
             .expect("a Users owner is refused")
     );
@@ -1028,5 +1033,5 @@ fn ensure_private_dir_refuses_a_foreign_owner_and_leaves_the_folder() {
         &dir,
         &private_with_owner(&Sid::well_known(WellKnown::Administrators).unwrap()),
     );
-    ensure_private_dir(&handle, "d", &me).expect("control: an Administrators owner is accepted");
+    ensure_private_dir(&handle, "d", &me, Hold::Held).expect("control: an Administrators owner is accepted");
 }

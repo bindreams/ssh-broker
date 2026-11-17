@@ -24,7 +24,7 @@ use crate::shim::{
     decide_fallback, fail_open, is_blank_command, make_handshake, peer_gone, pump_exec, pump_heard, size_to_resize,
     start_exec_input,
 };
-use crate::shim_offer::{Absent, Prompting, Rescue, Rescued};
+use crate::shim_offer::{Absent, Folder, Prompting, Rescue, Rescued};
 use crate::socket_loc::SocketLocation;
 use crate::winutil::{ChildConsole, UnelevatedToken, contain_and_resume, spawn_suspended};
 use crate::{afunix, conpty, vtinput};
@@ -55,11 +55,14 @@ const EVT_FOCUS: u16 = 0x0010;
 /// A `-c` session resolves its command first, once the log is open: `detect` says how sshd
 /// encoded it (see [`resolve_exec`]), and a blank command ends the run there, exit 0.
 pub fn run_on(exec: Option<RawExec>, detect: impl FnOnce() -> Encoding) -> anyhow::Result<()> {
+    // Walk first and keep the result: the folders it holds cannot be swapped, so the log and connect reach
+    // them and no others.
+    let folder = Folder::of_current_user();
     // A log that cannot be set up never stops the shim. The cause is kept, to be said where the
     // shim already explains a fallback to the user.
-    let (log, log_failure) = match crate::filelog::init_for_current_user("shim.log") {
+    let (log, log_failure) = match folder.logs().and_then(|logs| crate::filelog::init_in(logs, "shim.log")) {
         Ok(guard) => (Some(guard), None),
-        Err(no_log) => (None, Some(no_log.to_string())),
+        Err(e) => (None, Some(format!("{e:#}"))),
     };
     let exec = exec.map(|exec| resolve_exec(exec, detect));
     if exec.as_ref().is_some_and(|exec| is_blank_command(&exec.command)) {
@@ -76,13 +79,7 @@ pub fn run_on(exec: Option<RawExec>, detect: impl FnOnce() -> Encoding) -> anyho
     // out to be untrue — `exec_relay_is_byte_clean_*` covers the framing in both directions, and
     // `verify`'s probe covers a real child, real pipes and a real socket in both directions too.
     // What remains is a throughput difference, which does not earn a classifier.
-    match try_relay(
-        &exec,
-        crate::userdir::current_socket_location,
-        log_failure.as_deref(),
-        std::io::stdin(),
-        &mut Prompting,
-    ) {
+    match try_relay(&exec, &folder, log_failure.as_deref(), std::io::stdin(), &mut Prompting) {
         Ok(Some(code)) => {
             drop(log); // flush the appender before process::exit
             // Bypass main()'s Result→0/1 collapse; the i32→u32 cast is bit-preserving.
@@ -117,19 +114,19 @@ pub fn run_on(exec: Option<RawExec>, detect: impl FnOnce() -> Encoding) -> anyho
 /// pre-spawn setup failure (connect/split/handshake/console) — the agent spawned nothing, so
 /// the caller can safely fail open without a double-execution or an orphaned shell.
 ///
-/// `locate` says where the socket is. `run_on` passes [`crate::userdir::current_socket_location`],
-/// the profile of the account this process runs as and no other; it is a parameter so a test can
-/// pin that this function connects only to what it is given. `log_failure` is why the shim has no
-/// log, if it has none (see [`try_relay_at`]). `stdin` is what an EXEC session forwards to the
-/// child (the process's own stdin in `run_on`).
+/// `folder` is where the socket is and the folders held on the way to it. `run_on` passes the
+/// folder of the account this process runs as and no other; it is a parameter so a test can pin that
+/// this function connects only through what it is given. `log_failure` is why the shim has no log, if
+/// it has none (see [`try_relay_at`]). `stdin` is what an EXEC session forwards to the child (the
+/// process's own stdin in `run_on`).
 fn try_relay(
     exec: &Option<Exec>,
-    locate: impl FnOnce() -> anyhow::Result<SocketLocation>,
+    folder: &Folder,
     log_failure: Option<&str>,
     stdin: impl std::io::Read + Send + 'static,
     rescue: &mut dyn Rescue,
 ) -> anyhow::Result<Option<i32>> {
-    try_relay_at(locate(), exec, &mut std::io::stderr(), log_failure, stdin, rescue)
+    try_relay_at(folder, exec, &mut std::io::stderr(), log_failure, stdin, rescue)
 }
 
 /// The phrase `tests/fail_open_windows.rs` greps for; every fail-open message begins with it.
@@ -141,8 +138,7 @@ fn unavailable_message(reason: Option<&dyn std::fmt::Display>) -> String {
     }
 }
 
-/// [`try_relay`] for a given socket location (or the reason there is none), writing a user
-/// message to `stderr` where one is safe.
+/// [`try_relay`] writing a user message to `stderr` where one is safe.
 ///
 /// `log_failure`, why there is no log, is added to the message of a fallback for a command: the
 /// log is where that fallback's reason would otherwise go, and it is gone. Nothing is written for
@@ -150,22 +146,14 @@ fn unavailable_message(reason: Option<&dyn std::fmt::Display>) -> String {
 /// could corrupt the stream. A location that cannot be resolved already prints its own cause,
 /// which is the cause of the missing log too.
 fn try_relay_at(
-    location: anyhow::Result<SocketLocation>,
+    folder: &Folder,
     exec: &Option<Exec>,
     stderr: &mut dyn std::io::Write,
     log_failure: Option<&str>,
     stdin: impl std::io::Read + Send + 'static,
     rescue: &mut dyn Rescue,
 ) -> anyhow::Result<Option<i32>> {
-    try_relay_with(
-        location,
-        exec,
-        stderr,
-        log_failure,
-        stdin,
-        rescue,
-        &mut relay_interactive,
-    )
+    try_relay_with(folder, exec, stderr, log_failure, stdin, rescue, &mut relay_interactive)
 }
 
 /// What an interactive attempt came to.
@@ -184,7 +172,7 @@ type InteractiveRelay<'a> = dyn FnMut(Socket, Option<ConsoleModes>, Option<&str>
 /// console. `interactive` gets the command of a session that has a terminal (`ssh -t host cmd`),
 /// which it sends in the handshake.
 fn try_relay_with(
-    location: anyhow::Result<SocketLocation>,
+    folder: &Folder,
     exec: &Option<Exec>,
     stderr: &mut dyn std::io::Write,
     log_failure: Option<&str>,
@@ -193,7 +181,7 @@ fn try_relay_with(
     interactive: &mut InteractiveRelay<'_>,
 ) -> anyhow::Result<Option<i32>> {
     if let Some(exec) = exec.as_ref().filter(|exec| !exec.terminal) {
-        return match connect_or_rescue(&location, true, stderr, log_failure, rescue)? {
+        return match connect_or_rescue(folder, true, stderr, log_failure, rescue)? {
             Connected::Agent { socket, .. } => relay_exec(socket, &exec.command, stdin, stderr),
             Connected::Done(code) => Ok(code),
         };
@@ -209,8 +197,7 @@ fn try_relay_with(
     // that follows it) starts the count again: that agent is gone.
     let mut closed_before = false;
     loop {
-        let (conn, rescued_modes) = match connect_or_rescue(&location, command.is_some(), stderr, log_failure, rescue)?
-        {
+        let (conn, rescued_modes) = match connect_or_rescue(folder, command.is_some(), stderr, log_failure, rescue)? {
             Connected::Agent { socket, modes, rescued } => {
                 closed_before &= !rescued;
                 (socket, modes)
@@ -224,7 +211,7 @@ fn try_relay_with(
                     return Ok(Some(255));
                 }
                 if closed_before {
-                    let path = location.as_ref().ok().map(|location| location.path());
+                    let path = folder.location().as_ref().ok().map(|location| location.path());
                     let message = closed_twice_message(path);
                     tracing::error!("{message}");
                     let _ = writeln!(stderr, "{message}");
@@ -257,18 +244,14 @@ enum Connected {
 /// A user with no agent may be offered a session (or told how to get one). What the rescue does not
 /// use, the fail-open handles exactly as it did before.
 fn connect_or_rescue(
-    location: &anyhow::Result<SocketLocation>,
+    folder: &Folder,
     is_command: bool,
     stderr: &mut dyn std::io::Write,
     log_failure: Option<&str>,
     rescue: &mut dyn Rescue,
 ) -> anyhow::Result<Connected> {
-    let connection = match location {
-        Ok(location) => afunix::connect(location.path()),
-        // The cause is shown by the fail-open below; this only says there was nothing to connect to.
-        Err(e) => Err(anyhow::anyhow!("{e:#}")),
-    };
-    let connection: anyhow::Result<Socket> = match connection {
+    let location = folder.location();
+    let connection: anyhow::Result<Socket> = match folder.connect() {
         Ok(socket) => {
             return Ok(Connected::Agent {
                 socket,
@@ -280,9 +263,8 @@ fn connect_or_rescue(
     };
     let absent = Absent {
         exec: is_command,
-        location,
+        folder,
         connect: &connection,
-        log_failure,
     };
     Ok(match rescue.rescue(&absent, stderr) {
         Rescued::Connected { socket, modes } => Connected::Agent {
@@ -291,13 +273,17 @@ fn connect_or_rescue(
             rescued: true,
         },
         Rescued::Gone => Connected::Done(Some(255)),
-        Rescued::Plain => Connected::Done(fail_open_reason(
-            location,
-            &connection,
-            is_command,
-            stderr,
-            log_failure,
-        )?),
+        Rescued::Plain => {
+            // The latest refusal, not the log's failure, which predates the connect's look.
+            let refusal = folder.refusal();
+            Connected::Done(fail_open_reason(
+                location,
+                &connection,
+                is_command,
+                stderr,
+                refusal.as_deref().or(log_failure),
+            )?)
+        }
     })
 }
 

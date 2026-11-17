@@ -193,7 +193,7 @@ fn try_end(
 
     let location = socket_loc::for_profile(profile).map_err(|e| e.to_string())?;
     let finished = attempt("ask the agent to log out", || {
-        let mut asker = AgentConn::connect(&location);
+        let mut asker = AgentConn::connect(&location, sid);
         asker.start_exec(&format!("\"{}\" logout", exe.display()));
         asker.end_stdin();
         asker.read_to_end()

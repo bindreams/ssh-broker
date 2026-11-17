@@ -100,7 +100,7 @@ fn the_agent_leaves_no_window_on_the_desktop() {
     assert_serving(&agent, &location, "it freed its console");
 
     // A terminal session: the shell runs in a pseudoconsole.
-    let mut terminal = AgentConn::connect(&location);
+    let mut terminal = AgentConn::connect(&location, &account.sid);
     terminal.start_pty("cmd.exe");
     terminal.type_line("echo pty-%OS%");
     terminal.read_until_pty_shows("pty-Windows_NT");
@@ -113,7 +113,7 @@ fn the_agent_leaves_no_window_on_the_desktop() {
     assert_serving(&agent, &location, "a terminal session ended");
 
     // A command on pipes.
-    let mut command = AgentConn::connect(&location);
+    let mut command = AgentConn::connect(&location, &account.sid);
     command.start_exec("cmd.exe /c echo exec-ready & more");
     command.read_until_stdout_shows("exec-ready");
     assert_no_console_window(&agent.process, "a command on pipes runs");

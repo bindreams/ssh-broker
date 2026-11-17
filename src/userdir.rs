@@ -15,7 +15,7 @@ use windows::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, HANDLE};
 use windows::Win32::UI::Shell::GetUserProfileDirectoryW;
 use windows::core::{HRESULT, PWSTR};
 
-use crate::acl::{self, DirHandle, Sid};
+use crate::acl::{self, DirHandle, Hold, Sid};
 use crate::socket_loc::{self, SocketLocation};
 use crate::winutil;
 
@@ -74,11 +74,33 @@ pub fn current_socket_location() -> anyhow::Result<SocketLocation> {
     socket_location_of_token(winutil::own_token()?.0)
 }
 
-/// The user's private folder and its `logs` folder, open by handle. They fail separately: serving
-/// needs the folder and not a log, so a `logs` that is refused or broken costs the log only.
+/// The user's private folder and its `logs` folder, open by handle after a walk from the profile
+/// directory. They fail separately: serving needs the folder and not a log, so a `logs` that is
+/// refused or broken costs the log only.
+///
+/// The private folder is opened without `FILE_SHARE_DELETE`, so while this is held it cannot be
+/// renamed or removed, and neither can `Local` or `AppData` (Windows does not rename a directory with
+/// an open descendant). The walk confirmed that the path of [`SocketLocation`] leads to the folder held
+/// before it returned, so what is done by that path (the lock files, the marker, `bind`,
+/// [`SocketDir::connect`]) reaches this folder and no other. What may be written inside the folder, or
+/// to its attributes, is decided by its ACL, not by the hold. `logs` is held by nothing: it is used through its handle only.
 pub struct SocketDir {
+    location: SocketLocation,
     pub dir: DirHandle,
     pub logs: anyhow::Result<DirHandle>,
+}
+
+impl SocketDir {
+    /// Where the folders are.
+    pub fn location(&self) -> &SocketLocation {
+        &self.location
+    }
+
+    /// Connect to the agent's socket in the folder held. The only way to connect to an agent: the
+    /// path it connects to names the folders this holds.
+    pub fn connect(&self) -> anyhow::Result<socket2::Socket> {
+        crate::afunix::connect(self.location.path())
+    }
 }
 
 /// Make `loc.dir` and its `logs` folder if they are missing, leave both exactly
@@ -92,42 +114,84 @@ pub struct SocketDir {
 /// A refusal of the socket folder (or of the way to it) is this function's error. A refusal of
 /// `logs` alone is in [`SocketDir::logs`], with the socket folder still open: it costs only the log.
 pub fn open_socket_dir(loc: &SocketLocation, user: &Sid) -> anyhow::Result<SocketDir> {
-    walk(loc, "make", |parent, name| acl::ensure_private_dir(parent, name, user))
+    walk(loc, "make", |parent, name, hold| {
+        acl::ensure_private_dir(parent, name, user, hold)
+    })
 }
 
 /// [`open_socket_dir`] for a caller that only looks (`verify`): the same walk, and the same judgement
 /// of each folder, and nothing is made. A folder that is not there is [`acl::Missing`], in the error
 /// for the socket folder and in [`SocketDir::logs`] for `logs`.
 pub fn inspect_socket_dir(loc: &SocketLocation, user: &Sid) -> anyhow::Result<SocketDir> {
-    walk(loc, "look at", |parent, name| acl::open_private_dir(parent, name, user))
+    walk(loc, "look at", |parent, name, hold| {
+        acl::open_private_dir(parent, name, user, hold)
+    })
 }
 
-/// The walk of [`open_socket_dir`] and [`inspect_socket_dir`]; `step` makes or opens the private
-/// folder `name` under `parent`.
+/// [`inspect_socket_dir`] for the account this process runs as, whose location is the one its token
+/// gives: for a caller that connects to its own agent without making anything (`verify`, `logout`).
+/// An account without a profile fails with [`NoProfile`].
+pub fn inspect_current_socket_dir() -> anyhow::Result<SocketDir> {
+    inspect_socket_dir(&current_socket_location()?, &Sid::current_user()?)
+}
+
+/// The walk of [`open_socket_dir`] and [`inspect_socket_dir`]; `step` makes or opens the folder `name`
+/// under `parent`, held (the private folder) or not (`logs`) as `hold` says. This and
+/// [`walk_to_private_folder`] are the only places that ask for the held form.
 fn walk(
     loc: &SocketLocation,
     verb: &str,
-    step: impl Fn(&DirHandle, &str) -> anyhow::Result<DirHandle>,
+    step: impl Fn(&DirHandle, &str, Hold) -> anyhow::Result<DirHandle>,
 ) -> anyhow::Result<SocketDir> {
-    let dir = open_local(loc)
-        .and_then(|local| step(&local, socket_loc::SOCKET_DIR_NAME))
-        .with_context(|| format!("{verb} the private folder {}", loc.dir().display()))?;
-    let logs = step(&dir, socket_loc::LOGS_DIR_NAME)
+    let dir = walk_to_private_folder(loc, verb, |local| step(local, socket_loc::SOCKET_DIR_NAME, Hold::Held))?;
+    let logs = step(&dir, socket_loc::LOGS_DIR_NAME, Hold::Shared)
         .with_context(|| format!("{verb} the log folder {}", loc.logs_dir().display()));
-    Ok(SocketDir { dir, logs })
+    Ok(SocketDir {
+        location: loc.clone(),
+        dir,
+        logs,
+    })
 }
 
-/// The folder `Local` of the profile `loc` is in, by the walk of [`open_socket_dir`]: the profile
+/// The one walk to the private folder, for every caller: [`open_parents`], then [`hold_and_confirm`].
+/// `open` makes or opens the private folder under the `Local` handle and must hold it.
+fn walk_to_private_folder(
+    loc: &SocketLocation,
+    verb: &str,
+    open: impl FnOnce(&DirHandle) -> anyhow::Result<DirHandle>,
+) -> anyhow::Result<DirHandle> {
+    open_parents(loc)
+        .and_then(|parents| hold_and_confirm(loc, parents, open))
+        .with_context(|| format!("{verb} the private folder {}", loc.dir().display()))
+}
+
+/// `AppData` and `Local` of the profile `loc` is in, from the first half of the walk: the profile
 /// directory, then the folders of [`socket_loc::FOLDERS_IN_PROFILE`] as real directories, a link
-/// refused. [`SocketLocation::dir`] is made from the same names, so the walk ends where it says.
-fn open_local(loc: &SocketLocation) -> anyhow::Result<DirHandle> {
-    let local = socket_loc::FOLDERS_IN_PROFILE
-        .iter()
-        .try_fold(acl::open_root(loc.profile_dir())?, |parent, name| {
-            acl::open_dir(&parent, name)
-        })?;
+/// refused. They are opened only to read their ACL and attributes, sharing everything: such a handle
+/// takes no part in a sharing check, so it neither stops another program from using the folder nor is
+/// stopped by one. [`SocketLocation::dir`] is made from the same names, so the walk ends where it says.
+fn open_parents(loc: &SocketLocation) -> anyhow::Result<[DirHandle; 2]> {
+    let root = acl::open_root(loc.profile_dir())?;
+    let [app_data, local] = socket_loc::FOLDERS_IN_PROFILE;
+    let app_data = acl::open_dir(&root, app_data)?;
+    let local = acl::open_dir(&app_data, local)?;
     debug_assert_eq!(local.path(), loc.dir().parent().unwrap());
-    Ok(local)
+    Ok([app_data, local])
+}
+
+/// Open the private folder under `Local`, then, holding it, confirm `Local` is a child of the walked
+/// `AppData` (`acl::confirm_child`) and `<profile>\AppData` by path is that `AppData`
+/// (`acl::confirm_dir`). A swapped parent is refused; never retried.
+fn hold_and_confirm(
+    loc: &SocketLocation,
+    parents: [DirHandle; 2],
+    open: impl FnOnce(&DirHandle) -> anyhow::Result<DirHandle>,
+) -> anyhow::Result<DirHandle> {
+    let dir = open(&parents[1])?;
+    let [app_data, local] = socket_loc::FOLDERS_IN_PROFILE;
+    acl::confirm_child(&parents[0], local, &parents[1])?;
+    acl::confirm_dir(&loc.profile_dir().join(app_data), &parents[0])?;
+    Ok(dir)
 }
 
 /// The user's private folder if it is there, opened by the same walk and never made, changed or
@@ -135,11 +199,13 @@ fn open_local(loc: &SocketLocation) -> anyhow::Result<DirHandle> {
 /// when the folder or a folder above it is missing; a link on the way is an error, as in
 /// [`open_socket_dir`].
 pub fn open_existing_socket_dir(loc: &SocketLocation) -> anyhow::Result<Option<DirHandle>> {
-    let found = open_local(loc).and_then(|local| acl::open_existing_private_dir(&local, socket_loc::SOCKET_DIR_NAME));
+    let found = walk_to_private_folder(loc, "open", |local| {
+        acl::open_existing_private_dir(local, socket_loc::SOCKET_DIR_NAME)
+    });
     match found {
         Ok(dir) => Ok(Some(dir)),
         Err(e) if e.is::<acl::Missing>() => Ok(None),
-        Err(e) => Err(e).with_context(|| format!("open the private folder {}", loc.dir().display())),
+        Err(e) => Err(e),
     }
 }
 

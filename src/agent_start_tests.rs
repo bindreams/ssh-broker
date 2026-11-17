@@ -172,10 +172,10 @@ fn start_makes_the_private_folder_then_serves_that_session_from_it() {
         },
         |at, session| {
             assert!(
-                acl::verify_dir_acl(at.dir(), &Sid::current_user().unwrap()).unwrap(),
+                acl::verify_dir_acl(at.location().dir(), &Sid::current_user().unwrap()).unwrap(),
                 "the folder is hardened before anything is served from it"
             );
-            served.set(Some((at.path().to_path_buf(), session)));
+            served.set(Some((at.location().path().to_path_buf(), session)));
             Ok(())
         },
     )
@@ -363,7 +363,7 @@ fn a_failed_reset_goes_to_stderr_and_to_the_log_when_it_opens() {
 
 #[test]
 fn a_failed_reset_is_reported_once_on_stderr_when_the_log_does_not_open() {
-    let profile = TempProfile::new("start-reset-stderr");
+    let profile = TempProfile::new("reset-stderr");
     let loc = profile.location();
     let mut stderr = Vec::new();
     start_with(
@@ -657,9 +657,11 @@ fn serve_hands_the_slot_and_the_lock_to_the_process_end_and_does_not_drop_them()
     // `serve` is the one place that passes `hold_until_end`; `serve_with` is tested with its own
     // `hold`. The hold is process-wide and never released, so the locks stay taken in this test
     // process: a session number and folder of their own keep other tests clear of them.
-    let (_profile, loc) = location_with_dir("serve-held-to-end");
+    let profile = TempProfile::new("serve-held-end");
+    let loc = profile.location();
+    let folder = std::sync::Arc::new(crate::userdir::open_socket_dir(&loc, &Sid::current_user().unwrap()).unwrap());
 
-    serve_in(&loc, 4242, |_| Ok(())).unwrap();
+    serve_in(&folder, 4242, |_| Ok(())).unwrap();
 
     assert!(
         SessionSlot::try_acquire(&loc.sessions_lock_path(), 4242)

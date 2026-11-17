@@ -845,7 +845,7 @@ fn second_agent_in_the_same_session_leaves_and_the_session_keeps_serving() {
     let second = RealAgent::start(&kit, &account);
     second.process.wait();
     let location = socket_loc::for_profile(account.profile()).unwrap();
-    let mut conn = AgentConn::connect(&location);
+    let mut conn = AgentConn::connect(&location, &account.sid);
     conn.start_exec("cmd.exe /c echo still-serving");
     conn.end_stdin();
     let done = conn.read_to_end();

@@ -14,8 +14,8 @@ fn walk(profile: &Path, user: &Sid) -> anyhow::Result<(DirHandle, DirHandle)> {
     let root = open_root(profile)?;
     let app_data = open_dir(&root, "AppData")?;
     let local = open_dir(&app_data, "Local")?;
-    let broker = ensure_private_dir(&local, "ssh-broker", user)?;
-    let logs = ensure_private_dir(&broker, "logs", user)?;
+    let broker = ensure_private_dir(&local, "ssh-broker", user, Hold::Held)?;
+    let logs = ensure_private_dir(&broker, "logs", user, Hold::Shared)?;
     Ok((broker, logs))
 }
 
@@ -94,7 +94,7 @@ fn an_exact_folder_is_left_untouched() {
     icacls(&child, &["/grant", "*S-1-1-0:R"]);
     let before = tree_state(&profile.0);
 
-    ensure_private_dir(&local_of(&profile), "ssh-broker", &me()).unwrap();
+    ensure_private_dir(&local_of(&profile), "ssh-broker", &me(), Hold::Held).unwrap();
 
     assert_eq!(tree_state(&profile.0), before);
 }
@@ -110,7 +110,7 @@ fn a_widened_folder_is_refused_and_left_untouched() {
 
     let err = format!(
         "{:#}",
-        ensure_private_dir(&local_of(&profile), "ssh-broker", &me())
+        ensure_private_dir(&local_of(&profile), "ssh-broker", &me(), Hold::Held)
             .err()
             .unwrap()
     );
@@ -132,7 +132,7 @@ fn a_folder_owned_by_the_user_with_an_extra_ace_is_blamed_on_the_acl_not_the_own
 
     let err = format!(
         "{:#}",
-        ensure_private_dir(&local_of(&profile), "ssh-broker", &me())
+        ensure_private_dir(&local_of(&profile), "ssh-broker", &me(), Hold::Held)
             .err()
             .unwrap()
     );
@@ -154,7 +154,7 @@ fn looking_at_the_private_folder_makes_nothing_and_a_missing_one_is_missing() {
     let profile = TempProfile::new("look-miss");
     let before = tree_state(&profile.0);
 
-    let err = open_private_dir(&local_of(&profile), "ssh-broker", &me())
+    let err = open_private_dir(&local_of(&profile), "ssh-broker", &me(), Hold::Held)
         .err()
         .unwrap();
 
@@ -166,11 +166,11 @@ fn looking_at_the_private_folder_makes_nothing_and_a_missing_one_is_missing() {
 fn looking_at_the_private_folder_passes_an_exact_one_and_refuses_a_widened_one_as_ensure_does() {
     let profile = TempProfile::new("look-wide");
     let (broker, _) = made(&profile);
-    open_private_dir(&local_of(&profile), "ssh-broker", &me()).expect("exact");
+    open_private_dir(&local_of(&profile), "ssh-broker", &me(), Hold::Held).expect("exact");
 
     widen(broker.path());
     let before = tree_state(&profile.0);
-    let err = open_private_dir(&local_of(&profile), "ssh-broker", &me())
+    let err = open_private_dir(&local_of(&profile), "ssh-broker", &me(), Hold::Held)
         .err()
         .unwrap();
 
@@ -186,7 +186,12 @@ fn a_file_at_the_name_is_refused_and_left_untouched() {
     std::fs::write(local.join("ssh-broker"), "x").unwrap();
     let local = local_of(&profile);
 
-    let err = format!("{:#}", ensure_private_dir(&local, "ssh-broker", &me()).err().unwrap());
+    let err = format!(
+        "{:#}",
+        ensure_private_dir(&local, "ssh-broker", &me(), Hold::Held)
+            .err()
+            .unwrap()
+    );
 
     assert!(err.contains("not a directory"), "{err}");
     assert_eq!(std::fs::read_to_string(local.path().join("ssh-broker")).unwrap(), "x");
@@ -208,7 +213,7 @@ fn a_name_that_is_not_one_component_is_refused() {
     for name in ["", ".", "..", r"AppData\Local", "AppData/Local", "C:", "a\0b"] {
         assert!(open_dir(&root, name).is_err(), "open_dir {name:?}");
         assert!(
-            ensure_private_dir(&root, name, &me()).is_err(),
+            ensure_private_dir(&root, name, &me(), Hold::Held).is_err(),
             "ensure_private_dir {name:?}"
         );
         assert!(open_log_file(&root, name).is_err(), "open_log_file {name:?}");
@@ -275,7 +280,9 @@ fn a_refusal_to_make_the_folder_says_that_this_process_may_not_make_it() {
     let grantee = format!("*{}", me().to_sddl().unwrap());
     icacls(local.path(), &["/deny", &format!("{grantee}:(AD)")]);
 
-    let err = ensure_private_dir(&local, "ssh-broker", &me()).err().unwrap();
+    let err = ensure_private_dir(&local, "ssh-broker", &me(), Hold::Held)
+        .err()
+        .unwrap();
     icacls(local.path(), &["/remove:d", &grantee]);
 
     assert!(err.is::<Refused>(), "{err:#}");
@@ -460,4 +467,105 @@ fn a_missing_name_is_missing_for_a_downcast_and_open_dir_does_not_create_it() {
     let err = open_root(&gone).err().unwrap();
     assert!(err.downcast_ref::<Missing>().is_some(), "{err:#}");
     assert!(!gone.exists());
+}
+
+// confirm_dir -----
+
+/// The whole refusal of a folder that is not the one the walk went through, as a person reads it.
+fn replaced_text(path: &Path) -> String {
+    format!(
+        "{} cannot be used on the way to the private folder: it was replaced by a link or another folder while it \
+         was being opened. Nothing is read or written through it",
+        path.display()
+    )
+}
+
+/// The whole refusal of a folder that was moved or removed after the walk went through it.
+fn gone_text(path: &Path) -> String {
+    format!(
+        "{} cannot be used on the way to the private folder: it was moved or removed after the walk went through \
+         it. Nothing is read or written through it",
+        path.display()
+    )
+}
+
+#[test]
+fn confirm_dir_passes_the_folder_held_and_refuses_another_folder_or_a_link_at_its_path() {
+    let profile = TempProfile::new("confirm");
+    let held = local_of(&profile);
+    let path = held.path().to_path_buf();
+    confirm_dir(&path, &held).expect("the path leads to the folder held");
+
+    let other = profile.0.join("other");
+    std::fs::create_dir(&other).unwrap();
+    let err = confirm_dir(&other, &held).unwrap_err();
+    assert_eq!(err.to_string(), replaced_text(&other));
+
+    // A link to the very folder held is still a link: a handle is not opened through it.
+    let link = profile.0.join("link");
+    junction(&link, &path);
+    let err = confirm_dir(&link, &held).unwrap_err();
+    assert!(err.root_cause().is::<Refused>(), "{err:#}");
+}
+
+#[test]
+fn confirm_dir_refuses_a_path_that_is_gone_and_does_not_call_it_missing() {
+    let profile = TempProfile::new("confirm-gone");
+    let held = local_of(&profile);
+    let path = held.path().to_path_buf();
+    std::fs::rename(&path, profile.0.join("aside")).unwrap();
+
+    let err = confirm_dir(&path, &held).unwrap_err();
+
+    assert!(err.is::<Refused>() && !err.is::<Missing>(), "{err:#}");
+    assert_eq!(err.to_string(), gone_text(&path));
+}
+
+// confirm_child -----
+
+#[test]
+fn confirm_child_passes_the_child_and_refuses_another_folder_a_link_or_a_name_that_is_gone() {
+    let profile = TempProfile::new("child");
+    let app_data = open_dir(&open_root(&profile.0).unwrap(), "AppData").unwrap();
+    let local = open_dir(&app_data, "Local").unwrap();
+    confirm_child(&app_data, "Local", &local).expect("Local is a child of AppData");
+
+    // Another folder under that name.
+    let other = profile.0.join("Other");
+    std::fs::create_dir(&other).unwrap();
+    let err = confirm_child(&open_root(&profile.0).unwrap(), "Other", &local).unwrap_err();
+    assert_eq!(err.to_string(), replaced_text(&other));
+
+    // A link under that name, even to the folder held.
+    let link = profile.0.join("AppData").join("Link");
+    junction(&link, local.path());
+    let err = confirm_child(&app_data, "Link", &local).unwrap_err();
+    assert!(err.root_cause().is::<Refused>(), "{err:#}");
+
+    // A name that is gone.
+    std::fs::rename(local.path(), profile.0.join("aside")).unwrap();
+    let err = confirm_child(&app_data, "Local", &local).unwrap_err();
+    assert!(err.is::<Refused>() && !err.is::<Missing>(), "{err:#}");
+    assert_eq!(err.to_string(), gone_text(local.path()));
+}
+
+/// The case a check by path cannot see: `Local` is in another folder and a junction to that folder
+/// stands where `AppData` was, so `AppData\Local` still reaches the `Local` held. Asked of the handle
+/// on the `AppData` the walk went through, `Local` is not its child.
+#[test]
+fn confirm_child_sees_what_the_path_through_a_replaced_parent_hides() {
+    let profile = TempProfile::new("child-path");
+    let app_data = open_dir(&open_root(&profile.0).unwrap(), "AppData").unwrap();
+    let local = open_dir(&app_data, "Local").unwrap();
+    let local_path = local.path().to_path_buf();
+    let other = profile.0.join("Other");
+    std::fs::create_dir(&other).unwrap();
+    std::fs::rename(&local_path, other.join("Local")).unwrap();
+    std::fs::rename(app_data.path(), profile.0.join("AppData.aside")).unwrap();
+    junction(app_data.path(), &other);
+
+    confirm_dir(&local_path, &local).expect("control: by its path Local is where it was");
+    let err = confirm_child(&app_data, "Local", &local).unwrap_err();
+
+    assert!(err.is::<Refused>(), "{err:#}");
 }

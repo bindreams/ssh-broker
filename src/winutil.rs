@@ -8,6 +8,8 @@
 //! through the checked `header` and `array`, and follow a SID pointer in them through the checked `sid`.
 //! `find_group` is the one walk of a token's groups.
 
+mod file_id;
+pub use file_id::FileId;
 mod unelevated;
 pub use unelevated::UnelevatedToken;
 

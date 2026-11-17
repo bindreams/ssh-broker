@@ -134,3 +134,16 @@ fn only_the_observed_codes_for_nothing_listening_are_no_agent() {
     }
     assert!(!is_no_agent(&anyhow::anyhow!("not an OS error")));
 }
+
+/// A walk that finds a folder of the way to the socket missing has found no agent, as a connect to a
+/// path in a missing folder did.
+#[test]
+fn a_folder_of_the_walk_that_is_not_there_is_no_agent() {
+    let profile = TempProfile::new("no-folder");
+    std::fs::remove_dir_all(profile.0.join("AppData")).unwrap();
+    let missing = crate::userdir::inspect_socket_dir(&profile.location(), &crate::acl::Sid::current_user().unwrap())
+        .err()
+        .expect("AppData is not there");
+
+    assert!(is_no_agent(&missing), "{missing:#}");
+}

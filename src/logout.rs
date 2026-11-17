@@ -110,11 +110,11 @@ pub fn logout_at<R: Read, W: Write, T>(
 /// profile of this process's token), to end its background session.
 pub fn run() -> anyhow::Result<()> {
     let connect = || {
-        let location = crate::userdir::current_socket_location()?;
-        let conn = crate::afunix::connect(location.path())?;
+        let conn = crate::userdir::inspect_current_socket_dir()?.connect()?;
         crate::afunix::split(conn)
     };
-    // No profile and nothing listening both mean there is no session; anything else is not that.
+    // No profile, no folder and nothing listening all mean there is no session; anything else is not
+    // that.
     let no_session = |e: &anyhow::Error| {
         e.downcast_ref::<crate::userdir::NoProfile>().is_some() || crate::console_prompt::is_no_agent(e)
     };

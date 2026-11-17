@@ -36,7 +36,7 @@ use windows::Wdk::Storage::FileSystem::{
 use windows::Win32::Foundation::{
     ERROR_ALREADY_EXISTS, HANDLE, HLOCAL, LocalFree, NTSTATUS, OBJ_CASE_INSENSITIVE, RtlNtStatusToDosError,
     STATUS_ACCESS_DENIED, STATUS_NOT_A_DIRECTORY, STATUS_OBJECT_NAME_NOT_FOUND, STATUS_OBJECT_PATH_NOT_FOUND,
-    UNICODE_STRING,
+    STATUS_SHARING_VIOLATION, UNICODE_STRING,
 };
 use windows::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, GetNamedSecurityInfoW,
@@ -67,8 +67,8 @@ mod admin_file;
 pub use admin_file::{admin_only_file_problem, ensure_admin_only_file};
 mod private_dir;
 pub use private_dir::{
-    DirHandle, Missing, Refused, ensure_private_dir, open_dir, open_existing_file, open_existing_private_dir,
-    open_log_file, open_private_dir, open_root,
+    DirHandle, Hold, Missing, Refused, confirm_child, confirm_dir, ensure_private_dir, open_dir, open_existing_file,
+    open_existing_private_dir, open_log_file, open_private_dir, open_root,
 };
 
 /// ACCESS_ALLOWED_ACE_TYPE (winnt.h) — stored raw in `ACE_HEADER.AceType` (a `u8`).
@@ -599,6 +599,7 @@ fn open_for_inspection(dir: &Path) -> anyhow::Result<Option<OwnedHandle>> {
         None,
         &name,
         READ_CONTROL.0 | FILE_READ_ATTRIBUTES.0,
+        Sharing::All,
         FILE_OPEN,
         FILE_OPEN_FOR_BACKUP_INTENT.0 | FILE_OPEN_REPARSE_POINT.0,
         None,
@@ -606,7 +607,7 @@ fn open_for_inspection(dir: &Path) -> anyhow::Result<Option<OwnedHandle>> {
     match classify_open(made.status) {
         OpenOutcome::Opened => Ok(Some(OwnedHandle(made.handle))),
         OpenOutcome::Denied => Ok(None),
-        OpenOutcome::Missing | OpenOutcome::NotADirectory | OpenOutcome::Failed(_) => {
+        OpenOutcome::Missing | OpenOutcome::NotADirectory | OpenOutcome::SharingViolation | OpenOutcome::Failed(_) => {
             Err(status_error(made.status)).with_context(|| format!("open {}", dir.display()))
         }
     }
@@ -621,13 +622,32 @@ struct Made {
     created: bool,
 }
 
+/// What a handle lets others do to the object while it is open: everything, or everything but
+/// deleting and renaming it. A folder held without `FILE_SHARE_DELETE` cannot be renamed or removed
+/// by anyone, so its name stays the folder's. Callers outside this module ask for [`Hold`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Sharing {
+    All,
+    NotDelete,
+}
+
+impl Sharing {
+    fn mode(self) -> FILE_SHARE_MODE {
+        match self {
+            Sharing::All => FILE_SHARE_MODE(FILE_SHARE_READ.0 | FILE_SHARE_WRITE.0 | FILE_SHARE_DELETE.0),
+            Sharing::NotDelete => FILE_SHARE_MODE(FILE_SHARE_READ.0 | FILE_SHARE_WRITE.0),
+        }
+    }
+}
+
 /// Open or make `name` (UTF-16, no terminator), an NT path when `root` is `None` and else one name
-/// below `root`, sharing read, write and delete; a made object gets `descriptor`. `Err` is a name too
+/// below `root`, sharing as `sharing` says; a made object gets `descriptor`. `Err` is a name too
 /// long to pass.
 fn nt_create(
     root: Option<HANDLE>,
     name: &[u16],
     access: u32,
+    sharing: Sharing,
     disposition: NTCREATEFILE_CREATE_DISPOSITION,
     options: u32,
     descriptor: Option<PSECURITY_DESCRIPTOR>,
@@ -644,7 +664,7 @@ fn nt_create(
                 &mut io,
                 None,
                 FILE_FLAGS_AND_ATTRIBUTES(FILE_ATTRIBUTE_NORMAL.0),
-                FILE_SHARE_MODE(FILE_SHARE_READ.0 | FILE_SHARE_WRITE.0 | FILE_SHARE_DELETE.0),
+                sharing.mode(),
                 disposition,
                 NTCREATEFILE_CREATE_OPTIONS(options),
                 None,
@@ -747,6 +767,10 @@ enum OpenOutcome {
     Missing,
     /// A file is at the name of a directory that was asked for.
     NotADirectory,
+    /// Another handle on the object has an access that the sharing of this open does not allow: for a
+    /// folder held (opened without `FILE_SHARE_DELETE`), another program holds it with the right to delete
+    /// or rename it, or without letting others read it.
+    SharingViolation,
     Failed(NTSTATUS),
 }
 
@@ -759,6 +783,8 @@ fn classify_open(status: NTSTATUS) -> OpenOutcome {
         OpenOutcome::Missing
     } else if status == STATUS_NOT_A_DIRECTORY {
         OpenOutcome::NotADirectory
+    } else if status == STATUS_SHARING_VIOLATION {
+        OpenOutcome::SharingViolation
     } else {
         OpenOutcome::Failed(status)
     }

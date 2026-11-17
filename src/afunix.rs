@@ -258,8 +258,9 @@ fn socket_file_acl_ok(_path: &Path) -> anyhow::Result<bool> {
     Ok(true)
 }
 
-/// Connect to an AF_UNIX stream socket at `path`.
-pub fn connect(path: &Path) -> anyhow::Result<Socket> {
+/// Connect to an AF_UNIX stream socket at `path`. A bare path names whatever is there when the call runs;
+/// prefer `userdir::SocketDir::connect`.
+pub(crate) fn connect(path: &Path) -> anyhow::Result<Socket> {
     let sock = Socket::new(Domain::UNIX, Type::STREAM, None)?;
     sock.connect(&unix_addr(path)?)?;
     #[cfg(windows)]

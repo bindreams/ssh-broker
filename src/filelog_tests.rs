@@ -1,8 +1,16 @@
 //! Tests for the file log sink.
 use super::*;
 use crate::acl::{self, DirHandle, Sid};
+use crate::socket_loc::SocketLocation;
 use crate::test_support::TempProfile;
 use std::os::windows::process::CommandExt;
+
+/// The log of `user` in the folder `loc`, made if it is missing: the walk the shim and the agent make,
+/// then the log in its `logs` folder.
+fn open_for_location(loc: &SocketLocation, user: &Sid, prefix: &str) -> anyhow::Result<Sink> {
+    let folders = crate::userdir::open_socket_dir(loc, user)?;
+    open_in(&folders.logs?, prefix)
+}
 
 /// `CREATE_NO_WINDOW`: a child console process gets no console window.
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -184,10 +192,10 @@ fn a_refused_private_folder_is_said_to_be_the_reason_there_is_no_log() {
 
     let no_log = open_for_location(&loc, &Sid::current_user().unwrap(), "shim.log").expect_err("a widened folder");
 
-    assert!(no_log.cause.is::<acl::Refused>(), "{no_log}");
+    assert!(no_log.root_cause().is::<acl::Refused>(), "{no_log:#}");
     assert!(
-        no_log.to_string().contains(&loc.dir().display().to_string()),
-        "{no_log}"
+        format!("{no_log:#}").contains(&loc.dir().display().to_string()),
+        "{no_log:#}"
     );
 }
 
@@ -197,10 +205,10 @@ fn a_refused_logs_folder_alone_costs_the_log() {
 
     let no_log = open_for_location(&loc, &Sid::current_user().unwrap(), "shim.log").expect_err("a widened logs folder");
 
-    assert!(no_log.cause.is::<acl::Refused>(), "{no_log}");
+    assert!(no_log.root_cause().is::<acl::Refused>(), "{no_log:#}");
     assert!(
-        no_log.to_string().contains(&loc.logs_dir().display().to_string()),
-        "{no_log}"
+        format!("{no_log:#}").contains(&loc.logs_dir().display().to_string()),
+        "{no_log:#}"
     );
 }
 
