@@ -23,13 +23,13 @@ use windows::Win32::NetworkManagement::NetManagement::{
     USER_INFO_1003, USER_PRIV_USER,
 };
 use windows::Win32::Security::{
-    DuplicateTokenEx, GetTokenInformation, LOGON32_LOGON_NETWORK, LOGON32_PROVIDER_DEFAULT, LogonUserW,
-    SecurityImpersonation, TOKEN_ALL_ACCESS, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation, TokenPrimary,
+    DuplicateTokenEx, LOGON32_LOGON_NETWORK, LOGON32_PROVIDER_DEFAULT, LogonUserW, SecurityImpersonation,
+    TOKEN_ALL_ACCESS, TokenPrimary,
 };
 use windows::Win32::System::Threading::{
     CREATE_NEW_CONSOLE, CREATE_NO_WINDOW, CREATE_PROCESS_LOGON_FLAGS, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT,
-    CreateProcessAsUserW, CreateProcessWithTokenW, GetCurrentProcess, OpenProcessToken, PROCESS_CREATION_FLAGS,
-    PROCESS_INFORMATION, ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOW, TerminateProcess,
+    CreateProcessAsUserW, CreateProcessWithTokenW, PROCESS_CREATION_FLAGS, PROCESS_INFORMATION, ResumeThread,
+    STARTF_USESTDHANDLES, STARTUPINFOW, TerminateProcess,
 };
 use windows::Win32::UI::Shell::CreateProfile;
 use windows::core::{PCWSTR, PWSTR};
@@ -40,23 +40,7 @@ pub fn wide(text: &str) -> Vec<u16> {
 
 /// Whether this process is an elevated administrator.
 pub fn is_elevated() -> bool {
-    let mut token = HANDLE::default();
-    // SAFETY: valid out-pointers; the token is closed by `OwnedHandle`.
-    unsafe {
-        OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).unwrap();
-        let token = OwnedHandle(token);
-        let mut info = TOKEN_ELEVATION::default();
-        let mut len = 0u32;
-        GetTokenInformation(
-            token.0,
-            TokenElevation,
-            Some(&mut info as *mut _ as *mut core::ffi::c_void),
-            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
-            &mut len,
-        )
-        .is_ok()
-            && info.TokenIsElevated != 0
-    }
+    ssh_broker::account::elevation().unwrap() == ssh_broker::account::Elevation::Full
 }
 
 /// Fail loudly unless this process is an elevated administrator.

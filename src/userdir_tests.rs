@@ -2,21 +2,12 @@
 //!
 //! Anything that needs a second account or elevation lives in `tests/user_isolation_windows.rs`.
 use super::*;
-use crate::winutil::OwnedHandle;
+use crate::account::own_token;
 use std::path::PathBuf;
-use windows::Win32::Foundation::HANDLE;
-use windows::Win32::Security::TOKEN_QUERY;
-use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
-
-fn own_token() -> OwnedHandle {
-    let mut token = HANDLE::default();
-    unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) }.unwrap();
-    OwnedHandle(token)
-}
 
 #[test]
 fn current_profile_matches_userprofile_of_this_process() {
-    let profile = profile_dir_of_token(own_token().0).unwrap();
+    let profile = profile_dir_of_token(own_token().unwrap().0).unwrap();
     let env = PathBuf::from(std::env::var_os("USERPROFILE").expect("USERPROFILE is set for a test run"));
     assert_eq!(
         profile.to_string_lossy().to_lowercase(),
@@ -26,7 +17,7 @@ fn current_profile_matches_userprofile_of_this_process() {
 
 #[test]
 fn current_socket_location_lies_inside_the_profile() {
-    let profile = profile_dir_of_token(own_token().0).unwrap();
+    let profile = profile_dir_of_token(own_token().unwrap().0).unwrap();
     let loc = current_socket_location().unwrap();
     assert!(loc.path().starts_with(&profile));
     assert!(loc.path().ends_with(r"AppData\Local\ssh-broker\agent.sock"));

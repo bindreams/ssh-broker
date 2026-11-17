@@ -9,9 +9,8 @@ use ssh_broker::winutil::OwnedHandle;
 use windows::Win32::Foundation::{HANDLE, HLOCAL, LocalFree};
 use windows::Win32::Security::Authorization::ConvertStringSidToSidW;
 use windows::Win32::Security::{
-    DuplicateTokenEx, GetLengthSid, GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, PSID,
-    SID_AND_ATTRIBUTES, SecurityImpersonation, SetTokenInformation, TOKEN_ALL_ACCESS, TOKEN_DUPLICATE,
-    TOKEN_MANDATORY_LABEL, TOKEN_QUERY, TokenIntegrityLevel, TokenPrimary,
+    DuplicateTokenEx, GetLengthSid, PSID, SID_AND_ATTRIBUTES, SecurityImpersonation, SetTokenInformation,
+    TOKEN_ALL_ACCESS, TOKEN_DUPLICATE, TOKEN_MANDATORY_LABEL, TOKEN_QUERY, TokenIntegrityLevel, TokenPrimary,
 };
 use windows::Win32::System::Threading::{CREATE_NO_WINDOW, GetCurrentProcess, OpenProcessToken};
 use windows::core::PCWSTR;
@@ -30,29 +29,7 @@ pub const MEDIUM: u32 = 0x2000;
 
 /// This process's mandatory integrity level, as the relative id of its label SID.
 pub fn current_rid() -> u32 {
-    let mut token = HANDLE::default();
-    // SAFETY: valid out-pointers; the token is closed by `OwnedHandle`. The label SID is read out
-    // of a buffer that outlives the reads.
-    unsafe {
-        OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).expect("open the process token");
-        let token = OwnedHandle(token);
-        let mut len = 0u32;
-        let _ = GetTokenInformation(token.0, TokenIntegrityLevel, None, 0, &mut len);
-        let mut buf = vec![0u8; len as usize];
-        GetTokenInformation(
-            token.0,
-            TokenIntegrityLevel,
-            Some(buf.as_mut_ptr().cast()),
-            len,
-            &mut len,
-        )
-        .expect("read the token's integrity level");
-        // The buffer is bytes, so the structure in it may be unaligned.
-        let label = std::ptr::read_unaligned(buf.as_ptr().cast::<TOKEN_MANDATORY_LABEL>());
-        let sid = label.Label.Sid;
-        let count = *GetSidSubAuthorityCount(sid);
-        *GetSidSubAuthority(sid, u32::from(count) - 1)
-    }
+    ssh_broker::account::integrity_of(ssh_broker::account::own_token().unwrap().0).unwrap()
 }
 
 /// A primary token that is a copy of this process's, with its mandatory integrity label set to `rid`.

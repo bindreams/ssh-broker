@@ -52,7 +52,7 @@ fn agent(dir: &Path, args: &[String]) {
         "pid={}\nsid={sid}\nexpect_user_matches={}\nsession={session}\nelevated={}\n",
         std::process::id(),
         sid == expect,
-        ssh_broker::account::is_elevated().unwrap()
+        ssh_broker::account::elevation().unwrap() == ssh_broker::account::Elevation::Full
     );
     std::fs::write(dir.join("agent.info"), info).unwrap();
     let made = ssh_broker::userdir::current_socket_location()

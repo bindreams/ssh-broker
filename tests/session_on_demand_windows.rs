@@ -88,12 +88,12 @@ fn account_named_resolves_a_fixture_account_with_a_space_in_its_name() {
 }
 
 /// Elevated (CI only).
-/// Covers `account::is_elevated`.
+/// Covers `account::elevation`.
 #[test]
-fn is_elevated_is_true_for_the_ci_token() {
+fn the_ci_token_is_full() {
     let _machine = machine::shared();
     account_fixture::assert_elevated();
-    assert!(account::is_elevated().unwrap());
+    assert_eq!(account::elevation().unwrap(), account::Elevation::Full);
 }
 
 // The logon call and what the shim sees of the agent it starts ---------------------------------

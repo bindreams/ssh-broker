@@ -241,17 +241,12 @@ pub fn current_session_id() -> u32 {
 /// when any step fails: the caller treats "unknown" as "not proven".
 #[cfg(windows)]
 pub fn current_logon_type() -> Option<u32> {
-    use windows::Win32::Foundation::HANDLE;
     use windows::Win32::Security::Authentication::Identity::{
         LsaFreeReturnBuffer, LsaGetLogonSessionData, SECURITY_LOGON_SESSION_DATA,
     };
-    use windows::Win32::Security::{GetTokenInformation, TOKEN_QUERY, TOKEN_STATISTICS, TokenStatistics};
-    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    use windows::Win32::Security::{GetTokenInformation, TOKEN_STATISTICS, TokenStatistics};
 
-    let mut token = HANDLE::default();
-    // SAFETY: a valid out-pointer; the handle is closed by `OwnedHandle`.
-    unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) }.ok()?;
-    let token = crate::winutil::OwnedHandle(token);
+    let token = crate::account::own_token().ok()?;
     let mut stats = TOKEN_STATISTICS::default();
     let mut len = 0u32;
     // SAFETY: `stats` is a `TOKEN_STATISTICS` and the length passed is its size.

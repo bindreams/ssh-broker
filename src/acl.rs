@@ -34,9 +34,9 @@ use windows::Wdk::Storage::FileSystem::{
     NTCREATEFILE_CREATE_OPTIONS, NtCreateFile,
 };
 use windows::Win32::Foundation::{
-    CloseHandle, ERROR_ALREADY_EXISTS, HANDLE, HLOCAL, LocalFree, NTSTATUS, OBJ_CASE_INSENSITIVE,
-    RtlNtStatusToDosError, STATUS_ACCESS_DENIED, STATUS_NOT_A_DIRECTORY, STATUS_OBJECT_NAME_NOT_FOUND,
-    STATUS_OBJECT_PATH_NOT_FOUND, UNICODE_STRING,
+    ERROR_ALREADY_EXISTS, HANDLE, HLOCAL, LocalFree, NTSTATUS, OBJ_CASE_INSENSITIVE, RtlNtStatusToDosError,
+    STATUS_ACCESS_DENIED, STATUS_NOT_A_DIRECTORY, STATUS_OBJECT_NAME_NOT_FOUND, STATUS_OBJECT_PATH_NOT_FOUND,
+    UNICODE_STRING,
 };
 use windows::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, GetNamedSecurityInfoW,
@@ -57,7 +57,7 @@ use windows::Win32::Storage::FileSystem::{
     GetFileInformationByHandle, READ_CONTROL,
 };
 use windows::Win32::System::IO::IO_STATUS_BLOCK;
-use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+use windows::Win32::System::Threading::OpenProcessToken;
 use windows::Win32::System::WindowsProgramming::FILE_CREATED;
 use windows::core::{BOOL, HRESULT, PCWSTR, PWSTR};
 
@@ -109,28 +109,32 @@ impl Sid {
     /// SID of the user owning the current process token. Used by tests and by the
     /// interactive `apply` path; production provisioning resolves the grantee by name.
     pub fn current_user() -> anyhow::Result<Sid> {
-        // SAFETY: the pseudo-handle of the current process needs no closing.
-        Sid::of_process(unsafe { GetCurrentProcess() })
+        Sid::of_token(crate::account::own_token()?.0)
     }
 
     /// SID of the user owning the token of `process`, which needs `PROCESS_QUERY_LIMITED_INFORMATION`.
     pub fn of_process(process: HANDLE) -> anyhow::Result<Sid> {
+        let mut token = HANDLE::default();
+        // SAFETY: a valid out-pointer; the handle is closed by `OwnedHandle`.
+        unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut token)? };
+        let token = OwnedHandle(token);
+        Sid::of_token(token.0)
+    }
+
+    /// SID of the user `token` belongs to, which needs `TOKEN_QUERY`.
+    pub fn of_token(token: HANDLE) -> anyhow::Result<Sid> {
         unsafe {
-            let mut token = HANDLE::default();
-            OpenProcessToken(process, TOKEN_QUERY, &mut token)?;
             // Size probe: the first call is expected to fail with the needed length.
             let mut len = 0u32;
             let _ = GetTokenInformation(token, TokenUser, None, 0, &mut len);
             let mut buf = vec![0u8; len as usize];
-            let info = GetTokenInformation(
+            GetTokenInformation(
                 token,
                 TokenUser,
                 Some(buf.as_mut_ptr() as *mut core::ffi::c_void),
                 len,
                 &mut len,
-            );
-            let _ = CloseHandle(token);
-            info?;
+            )?;
             let token_user = &*(buf.as_ptr() as *const TOKEN_USER);
             Sid::from_psid(token_user.User.Sid)
         }

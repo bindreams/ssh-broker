@@ -12,14 +12,12 @@ use std::path::PathBuf;
 
 use anyhow::Context;
 use windows::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, HANDLE};
-use windows::Win32::Security::TOKEN_QUERY;
-use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 use windows::Win32::UI::Shell::GetUserProfileDirectoryW;
 use windows::core::{HRESULT, PWSTR};
 
+use crate::account;
 use crate::acl::{self, DirHandle, Sid};
 use crate::socket_loc::{self, SocketLocation};
-use crate::winutil::OwnedHandle;
 
 /// The account has no profile directory yet: it has never been signed on. Downcastable from the
 /// error of [`profile_dir_of_token`].
@@ -65,23 +63,15 @@ pub fn socket_location_of_token(token: HANDLE) -> anyhow::Result<SocketLocation>
     Ok(socket_loc::for_profile(&profile)?)
 }
 
-/// A `TOKEN_QUERY` handle on this process's token.
-fn own_token() -> anyhow::Result<OwnedHandle> {
-    let mut token = HANDLE::default();
-    // SAFETY: `token` is a valid out-pointer; the handle is closed by `OwnedHandle`.
-    unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) }.context("open the process token")?;
-    Ok(OwnedHandle(token))
-}
-
 /// The profile directory of the account this process runs as, from its token and not from the
 /// environment.
 pub fn current_profile_dir() -> anyhow::Result<PathBuf> {
-    profile_dir_of_token(own_token()?.0)
+    profile_dir_of_token(account::own_token()?.0)
 }
 
 /// The socket location of the account this process runs as.
 pub fn current_socket_location() -> anyhow::Result<SocketLocation> {
-    socket_location_of_token(own_token()?.0)
+    socket_location_of_token(account::own_token()?.0)
 }
 
 /// The user's private folder and its `logs` folder, open by handle. They fail separately: serving

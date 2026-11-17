@@ -6,6 +6,7 @@ use windows::Win32::Security::Authorization::SetNamedSecurityInfoW;
 use windows::Win32::Security::{
     GetSecurityDescriptorDacl, GetSecurityDescriptorOwner, PROTECTED_DACL_SECURITY_INFORMATION,
 };
+use windows::Win32::System::Threading::GetCurrentProcess;
 
 #[test]
 fn current_user_sid_is_the_one_whoami_reports() {
