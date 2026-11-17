@@ -4,20 +4,18 @@
 //! never read from the environment, a typed name or an argument: `USERNAME` is whatever the
 //! caller set, and a password prompt for a name the caller chose would sign a different account on.
 
-use std::mem::offset_of;
-
 use anyhow::Context;
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Security::{
-    GetSidSubAuthority, GetSidSubAuthorityCount, IsWellKnownSid, PSID, SID_AND_ATTRIBUTES, TOKEN_GROUPS,
-    TOKEN_MANDATORY_LABEL, TokenGroups, TokenIntegrityLevel, WinBuiltinAdministratorsSid,
+    GetSidSubAuthority, GetSidSubAuthorityCount, IsWellKnownSid, PSID, TOKEN_MANDATORY_LABEL, TokenIntegrityLevel,
+    WinBuiltinAdministratorsSid,
 };
 use windows::Win32::System::WindowsProgramming::GetComputerNameW;
 use windows::core::PWSTR;
 
 use crate::acl::Sid;
 pub use crate::offer::AccountKind;
-use crate::winutil::{own_token, token_information};
+use crate::winutil::{SE_GROUP_ENABLED, SE_GROUP_USE_FOR_DENY_ONLY, find_group, own_token, token_information};
 
 /// An account of this PC, as ssh-broker names it in prompts, logon calls and tasks.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -76,9 +74,6 @@ pub const INTEGRITY_LOW: u32 = 0x1000;
 pub const INTEGRITY_MEDIUM: u32 = 0x2000;
 pub const INTEGRITY_HIGH: u32 = 0x3000;
 pub const INTEGRITY_SYSTEM: u32 = 0x4000;
-/// `TOKEN_GROUPS` attribute bits (winnt.h).
-const SE_GROUP_ENABLED: u32 = 0x4;
-const SE_GROUP_USE_FOR_DENY_ONLY: u32 = 0x10;
 
 /// How much of an administrator's power a token carries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -140,27 +135,19 @@ unsafe fn rid_of_label(sid: PSID) -> anyhow::Result<u32> {
 
 /// Whether, and how, `BUILTIN\Administrators` is in `token`, which needs `TOKEN_QUERY`.
 fn administrators_of(token: HANDLE) -> anyhow::Result<AdministratorsSid> {
-    let buf = token_information(token, TokenGroups).context("read the token's groups")?;
-    // SAFETY: the group count is a `u32`.
-    let count = unsafe { buf.header::<u32>() }.context("read the token's group count")?;
-    // SAFETY: every bit pattern is a valid `SID_AND_ATTRIBUTES` (a pointer and an integer).
-    let groups = unsafe { buf.array::<SID_AND_ATTRIBUTES>(offset_of!(TOKEN_GROUPS, Groups), count as usize) }
-        .context("read the token's groups")?;
-    for group in groups {
-        let sid = buf.sid(group.Sid).context("read a group of the token")?;
-        // SAFETY: `sid` is a SID `buf` holds whole.
-        if unsafe { IsWellKnownSid(sid, WinBuiltinAdministratorsSid) }.as_bool() {
-            let attributes = group.Attributes;
-            return Ok(
-                if attributes & SE_GROUP_USE_FOR_DENY_ONLY != 0 || attributes & SE_GROUP_ENABLED == 0 {
-                    AdministratorsSid::DenyOnly
-                } else {
-                    AdministratorsSid::Enabled
-                },
-            );
+    let attributes = find_group(token, |sid, attributes| {
+        // SAFETY: `sid` is a SID the token information holds whole.
+        Ok(unsafe { IsWellKnownSid(sid, WinBuiltinAdministratorsSid) }
+            .as_bool()
+            .then_some(attributes))
+    })?;
+    Ok(match attributes {
+        None => AdministratorsSid::Absent,
+        Some(attributes) if attributes & SE_GROUP_USE_FOR_DENY_ONLY != 0 || attributes & SE_GROUP_ENABLED == 0 => {
+            AdministratorsSid::DenyOnly
         }
-    }
-    Ok(AdministratorsSid::Absent)
+        Some(_) => AdministratorsSid::Enabled,
+    })
 }
 
 /// The elevation of `token`, which needs `TOKEN_QUERY`.

@@ -1,25 +1,32 @@
 //! winutil: shared Windows RAII guards, the process-thread attribute-list helper, and the process
 //! token with its information (Windows-only).
 //!
-//! The attribute list is used by both `conpty` (the PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE list) and
-//! `pipes` (the PROC_THREAD_ATTRIBUTE_HANDLE_LIST list), so its create/cleanup is written and
-//! reasoned about once. `own_token` and `token_information` are the one reader of a token: callers
-//! take a class from it and read the bytes through the checked `header` and `array`, and follow a
-//! SID pointer in them through the checked `sid`.
+//! Used by `conpty` (the PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE list), `pipes` and the shim's fail-open start
+//! (`shim_pty::start_local`) (the PROC_THREAD_ATTRIBUTE_HANDLE_LIST list), so the attribute-list
+//! create/cleanup and the process start are written and reasoned about once. `own_token` and
+//! `token_information` are the one reader of a token: callers take a class from it and read the bytes
+//! through the checked `header` and `array`, and follow a SID pointer in them through the checked `sid`.
+//! `find_group` is the one walk of a token's groups.
+
+mod unelevated;
+pub use unelevated::UnelevatedToken;
 
 use crate::shell::StartError;
 use anyhow::Context;
 use std::mem::offset_of;
 use windows::Win32::Foundation::{CloseHandle, ERROR_BAD_LENGTH, ERROR_INSUFFICIENT_BUFFER, HANDLE};
-use windows::Win32::Security::{GetTokenInformation, PSID, SID, TOKEN_INFORMATION_CLASS, TOKEN_QUERY};
+use windows::Win32::Security::{
+    GetTokenInformation, PSID, SID, SID_AND_ATTRIBUTES, TOKEN_GROUPS, TOKEN_INFORMATION_CLASS, TOKEN_QUERY, TokenGroups,
+};
 use windows::Win32::System::Console::HPCON;
 use windows::Win32::System::Diagnostics::Debug::{
     GetThreadErrorMode, SEM_FAILCRITICALERRORS, SetThreadErrorMode, THREAD_ERROR_MODE,
 };
 use windows::Win32::System::Threading::{
-    CREATE_NO_WINDOW, CREATE_SUSPENDED, CreateProcessW, DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT,
-    GetCurrentProcess, InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST, OpenProcessToken,
-    PROCESS_CREATION_FLAGS, PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOEXW, UpdateProcThreadAttribute,
+    CREATE_NO_WINDOW, CREATE_SUSPENDED, CreateProcessAsUserW, CreateProcessW, DeleteProcThreadAttributeList,
+    EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess, InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
+    OpenProcessToken, PROCESS_CREATION_FLAGS, PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOEXW,
+    UpdateProcThreadAttribute,
 };
 use windows::core::{PCWSTR, PWSTR};
 
@@ -152,6 +159,37 @@ impl TokenInformation {
     }
 }
 
+/// The attribute bits of a token group (`SID_AND_ATTRIBUTES::Attributes`, winnt.h).
+pub const SE_GROUP_ENABLED: u32 = 0x4;
+pub const SE_GROUP_USE_FOR_DENY_ONLY: u32 = 0x10;
+/// The attribute of an integrity label.
+pub const SE_GROUP_INTEGRITY: u32 = 0x20;
+/// Both bits of the mask are set on a logon SID.
+pub const SE_GROUP_LOGON_ID: u32 = 0xC000_0000;
+
+/// The result of the first group of `token` for which `pick` answers `Some`; `None` when none does.
+/// `pick` gets each group's SID, which lies inside the token information it was read from (so it is
+/// valid only during the call: copy it to keep it), and the group's attributes (the `SE_GROUP_*`
+/// constants). An error of `pick`, or of reading the groups, ends the walk. Needs `TOKEN_QUERY`.
+pub fn find_group<T>(
+    token: HANDLE,
+    mut pick: impl FnMut(PSID, u32) -> anyhow::Result<Option<T>>,
+) -> anyhow::Result<Option<T>> {
+    let buf = token_information(token, TokenGroups).context("read the token's groups")?;
+    // SAFETY: the group count is a `u32`.
+    let count = unsafe { buf.header::<u32>() }.context("read the token's group count")?;
+    // SAFETY: every bit pattern is a valid `SID_AND_ATTRIBUTES` (a pointer and an integer).
+    let groups = unsafe { buf.array::<SID_AND_ATTRIBUTES>(offset_of!(TOKEN_GROUPS, Groups), count as usize) }
+        .context("read the token's groups")?;
+    for group in groups {
+        let sid = buf.sid(group.Sid).context("read a group of the token")?;
+        if let Some(found) = pick(sid, group.Attributes)? {
+            return Ok(Some(found));
+        }
+    }
+    Ok(None)
+}
+
 /// `class` of `token`, which needs `TOKEN_QUERY`. Every error carries Windows' reason; a handle
 /// without the access fails with it, not with a length.
 pub fn token_information(token: HANDLE, class: TOKEN_INFORMATION_CLASS) -> anyhow::Result<TokenInformation> {
@@ -247,23 +285,33 @@ impl Drop for FailCriticalErrors {
     }
 }
 
-/// The error of a `CreateProcessW` that failed. The program is at fault unless the failure is the
-/// machine's ([`is_not_the_programs`]): the built-in would meet those too, while any
-/// other cause (an image that is missing, malformed, quarantined, blocked by policy or unreadable)
-/// is answered by the built-in, and an unknown cause is safest answered there too, since blaming the
-/// machine ends the session where blaming the program gives a working shell and a warning. A given
-/// `cwd` that is not a directory also fails the call: then the working directory is named and the
-/// shell is not blamed. Judged after the failure, so a directory that appears in between is not
-/// blamed either.
-pub fn start_error_of_create(error: windows::core::Error, cwd: Option<&std::path::Path>) -> StartError {
+/// The error of a `CreateProcessW` (or `CreateProcessAsUserW`, with `with_token`) that failed. Blames the
+/// program unless the failure is the machine's ([`is_not_the_programs`]); an unknown cause blames the
+/// program, since that yields a working built-in shell plus a warning. A `cwd` that is not a directory names
+/// the directory instead. With a token, `ERROR_PRIVILEGE_NOT_HELD` is the machine's: the built-in shell,
+/// started with the same token, fails the same way.
+pub fn start_error_of_create(
+    error: windows::core::Error,
+    cwd: Option<&std::path::Path>,
+    with_token: bool,
+) -> StartError {
     match cwd {
         Some(cwd) if !cwd.is_dir() => StartError::Other(anyhow::anyhow!(
             "the working directory {} is not a directory: {error}",
             cwd.display()
         )),
+        _ if with_token && is_privilege_not_held(&error) => StartError::Other(
+            anyhow::Error::new(error)
+                .context("this process lacks a privilege to start a child with the token it was given"),
+        ),
         _ if is_not_the_programs(&error) => StartError::Other(error.into()),
         _ => StartError::Program(error.into()),
     }
+}
+
+/// Whether `error` is `ERROR_PRIVILEGE_NOT_HELD`, as a Win32 code made into an HRESULT.
+fn is_privilege_not_held(error: &windows::core::Error) -> bool {
+    error.code() == windows::core::HRESULT::from_win32(windows::Win32::Foundation::ERROR_PRIVILEGE_NOT_HELD.0)
 }
 
 /// Whether `error` is a Win32 code for a cause that is not the program: the machine ran out of
@@ -434,56 +482,78 @@ impl Drop for AttrList {
 /// created. Named here with its documented value, like [`PROC_THREAD_ATTRIBUTE_HANDLE_LIST`].
 const PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE: usize = 0x0002_0016;
 
-/// The console a child the agent starts runs on. The agent has no console of its own (`agent::console`), and a
-/// console program started from a process with none gets a new console with a window, so every start names one
-/// that shows no window.
+/// The console a child that ssh-broker starts runs on. Neither the agent (`agent::console`) nor a shim whose
+/// stdio is sshd's pipes has a console that shows anything, and a console program started from a process
+/// with none gets a new console with a window, so every start names the console it wants.
 pub enum ChildConsole {
     /// A pseudoconsole: its host shows no window.
     Pseudo(HPCON),
     /// A console of its own with no window (`CREATE_NO_WINDOW`).
     NoWindow,
+    /// The console this process has: no window flag. The shim's shell, which shares the terminal sshd gave
+    /// the shim.
+    Parent,
 }
 
 /// The creation flags of [`spawn_suspended`]: suspended (so the child can be put in a job before it runs),
 /// an extended startup block, and the window policy of `console`.
 fn creation_flags(console: &ChildConsole) -> PROCESS_CREATION_FLAGS {
     let window = match console {
-        ChildConsole::Pseudo(_) => PROCESS_CREATION_FLAGS(0),
+        ChildConsole::Pseudo(_) | ChildConsole::Parent => PROCESS_CREATION_FLAGS(0),
         ChildConsole::NoWindow => CREATE_NO_WINDOW,
     };
     CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT | window
 }
 
+/// The handles for `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`: `inherit` with each handle once, in order. A handle
+/// named twice fails `CreateProcessW` (measured), and a terminal session's stdout and stderr can be one
+/// console handle. A null or invalid handle in `inherit` is the caller's error: the list would refuse it.
+fn handle_list(inherit: &[HANDLE]) -> Vec<HANDLE> {
+    let mut list: Vec<HANDLE> = Vec::with_capacity(inherit.len());
+    for handle in inherit {
+        debug_assert!(!handle.is_invalid(), "a null or invalid handle on the inherit list");
+        if !list.contains(handle) {
+            list.push(*handle);
+        }
+    }
+    list
+}
+
 /// Start `command` suspended on `console`, optionally in `cwd`, and return its process and primary thread. The
-/// only way the agent starts a child, so that none can omit the console policy.
+/// only way ssh-broker starts a session's program, so that none can omit the console policy, the handle list
+/// or the message-box guard.
 ///
 /// The child's standard handles are `std_handles` (input, output, error; null ones for a pseudoconsole). It
-/// inherits exactly the handles in `inherit`, and none when that is empty.
+/// inherits exactly the handles in `inherit`, each once, and none when that is empty. With `as_user` the
+/// child's token is that one (`CreateProcessAsUserW`), not this process's.
 ///
 /// # Safety
-/// Every handle in `std_handles` and `inherit` is valid and inheritable, and `console`'s pseudoconsole is open.
+/// Every handle in `inherit` is valid and inheritable, each handle in `std_handles` is valid and inheritable
+/// or null, and `console`'s pseudoconsole is open.
 pub unsafe fn spawn_suspended(
     command: &str,
     cwd: Option<&std::path::Path>,
     console: ChildConsole,
     std_handles: [HANDLE; 3],
     inherit: &[HANDLE],
+    as_user: Option<&UnelevatedToken>,
 ) -> Result<(OwnedHandle, OwnedHandle), StartError> {
     use std::os::windows::ffi::OsStrExt;
     // The pseudoconsole attribute's value is the HPCON itself, never a pointer to it (that was the cause of
-    // a 0xC0000142 DLL-init failure). `inherit` outlives `CreateProcessW`: the list stores its address.
+    // a 0xC0000142 DLL-init failure). `inherited` outlives the create call: the list stores its address.
     let pseudo = match &console {
         ChildConsole::Pseudo(hpc) => Some(Attr {
             attribute: PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
             value: hpc.0 as *const core::ffi::c_void,
             size: std::mem::size_of::<HPCON>(),
         }),
-        ChildConsole::NoWindow => None,
+        ChildConsole::NoWindow | ChildConsole::Parent => None,
     };
-    let listed = (!inherit.is_empty()).then(|| Attr {
+    let inherited = handle_list(inherit);
+    let listed = (!inherited.is_empty()).then(|| Attr {
         attribute: PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
-        value: inherit.as_ptr() as *const core::ffi::c_void,
-        size: std::mem::size_of_val(inherit),
+        value: inherited.as_ptr() as *const core::ffi::c_void,
+        size: std::mem::size_of_val(inherited.as_slice()),
     });
     let attributes: Vec<Attr> = pseudo.into_iter().chain(listed).collect();
     let attr = unsafe { AttrList::new(&attributes) }?;
@@ -504,21 +574,38 @@ pub unsafe fn spawn_suspended(
 
     let mut pi = PROCESS_INFORMATION::default();
     let _no_boxes = FailCriticalErrors::enter();
+    let inherits = !inherited.is_empty();
+    let flags = creation_flags(&console);
     unsafe {
-        CreateProcessW(
-            PCWSTR::null(),
-            Some(PWSTR(line.as_mut_ptr())),
-            None,
-            None,
-            !inherit.is_empty(),
-            creation_flags(&console),
-            None,
-            cwd_ptr,
-            &si.StartupInfo,
-            &mut pi,
-        )
+        match as_user {
+            Some(token) => CreateProcessAsUserW(
+                Some(token.handle()),
+                PCWSTR::null(),
+                Some(PWSTR(line.as_mut_ptr())),
+                None,
+                None,
+                inherits,
+                flags,
+                None,
+                cwd_ptr,
+                &si.StartupInfo,
+                &mut pi,
+            ),
+            None => CreateProcessW(
+                PCWSTR::null(),
+                Some(PWSTR(line.as_mut_ptr())),
+                None,
+                None,
+                inherits,
+                flags,
+                None,
+                cwd_ptr,
+                &si.StartupInfo,
+                &mut pi,
+            ),
+        }
     }
-    .map_err(|e| start_error_of_create(e, cwd))?;
+    .map_err(|e| start_error_of_create(e, cwd, as_user.is_some()))?;
     Ok((OwnedHandle(pi.hProcess), OwnedHandle(pi.hThread)))
 }
 

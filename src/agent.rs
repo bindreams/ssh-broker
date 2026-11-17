@@ -71,7 +71,7 @@ use crate::shell::StartError;
 #[cfg(windows)]
 use crate::socket_loc::SocketLocation;
 #[cfg(windows)]
-use crate::winutil::OwnedHandle;
+use crate::winutil::{OwnedHandle, UnelevatedToken};
 #[cfg(windows)]
 use connections::{Connections, Drained, Live};
 #[cfg(windows)]
@@ -623,14 +623,17 @@ struct Env<'a> {
 type WatchFactory = fn(&ConnTx) -> std::io::Result<(HangupWatcher, Waker)>;
 
 /// How a session starts its shell in a pseudoconsole (`command`, `cols`, `rows`, `cwd`, and the one
-/// handle besides the pseudoconsole's that the shell inherits, if any); a parameter so a test can
-/// force a failure without starting a process.
+/// handle besides the pseudoconsole's that the shell inherits, if any, and the token the shell runs
+/// with in place of the agent's, if any); a parameter so a test can force a failure without starting a
+/// process.
 #[cfg(windows)]
-type PtyStarter = fn(&str, u16, u16, Option<&Path>, Option<&OwnedHandle>) -> Result<PtySession, StartError>;
+type PtyStarter =
+    fn(&str, u16, u16, Option<&Path>, Option<&OwnedHandle>, Option<&UnelevatedToken>) -> Result<PtySession, StartError>;
 
-/// How a session starts its command on pipes (`command`, `cwd`); a parameter like [`PtyStarter`].
+/// How a session starts its command on pipes (`command`, `cwd`, and the token it runs with in place of
+/// the agent's, if any); a parameter like [`PtyStarter`].
 #[cfg(windows)]
-type ExecStarter = fn(&str, Option<&Path>) -> Result<ExecChild, StartError>;
+type ExecStarter = fn(&str, Option<&Path>, Option<&UnelevatedToken>) -> Result<ExecChild, StartError>;
 
 /// How a connection is split into halves; a parameter so a test can force a failure.
 #[cfg(windows)]
@@ -874,14 +877,14 @@ fn handle_pty(
         launched,
         broker_exe(),
         |spawn| match spawn {
-            launch::Spawn::Line(line) => (hooks.start_pty)(line, cols, rows, cwd, None),
+            launch::Spawn::Line(line) => (hooks.start_pty)(line, cols, rows, cwd, None, None),
             launch::Spawn::Verb {
                 exe,
                 notice,
                 line,
                 login,
             } => verb::start(exe, notice, line, login, |verb_line, read| {
-                (hooks.start_pty)(verb_line, cols, rows, cwd, Some(read))
+                (hooks.start_pty)(verb_line, cols, rows, cwd, Some(read), None)
             }),
         },
         |text| show_notice(&mut tx, Mode::Pty, text),
@@ -1148,7 +1151,7 @@ fn handle_exec(
         launched,
         None,
         |spawn| match spawn {
-            launch::Spawn::Line(line) => (hooks.start_exec)(line, cwd),
+            launch::Spawn::Line(line) => (hooks.start_exec)(line, cwd, None),
             launch::Spawn::Verb { .. } => Err(StartError::Other(anyhow::anyhow!(
                 "a session without a pseudoconsole is given no verb"
             ))),

@@ -1,28 +1,10 @@
 //! Windows-only tests for the EXEC child (run on a real Windows host).
 use super::*;
-use crate::conpty::read_handle;
-use std::thread;
-
-/// Drain a raw read handle to EOF on a thread (concurrent draining avoids a full-pipe
-/// deadlock when the child writes a lot to one stream).
-fn drain(raw: isize) -> thread::JoinHandle<Vec<u8>> {
-    thread::spawn(move || {
-        let mut out = Vec::new();
-        let mut buf = [0u8; 4096];
-        loop {
-            let n = read_handle(raw, &mut buf);
-            if n == 0 {
-                break;
-            }
-            out.extend_from_slice(&buf[..n]);
-        }
-        out
-    })
-}
+use crate::test_support::drain;
 
 #[test]
 fn exec_separates_stdout_stderr_and_returns_code() {
-    let child = ExecChild::spawn("cmd.exe /c echo OUT& echo ERR 1>&2& exit /b 5", None).unwrap();
+    let child = ExecChild::spawn("cmd.exe /c echo OUT& echo ERR 1>&2& exit /b 5", None, None).unwrap();
     let out_t = drain(child.stdout_read_raw());
     let err_t = drain(child.stderr_read_raw());
 
@@ -53,7 +35,7 @@ fn exec_runs_a_command_with_whitespace_at_its_edges() {
         "\tcmd.exe /c exit /b 3\r\n",
         "\r\ncmd.exe /c exit /b 3",
     ] {
-        let child = ExecChild::spawn(command, None).unwrap_or_else(|e| panic!("{command:?}: {e}"));
+        let child = ExecChild::spawn(command, None, None).unwrap_or_else(|e| panic!("{command:?}: {e}"));
         assert_eq!(child.wait().unwrap(), 3, "{command:?}");
     }
 }
@@ -62,7 +44,7 @@ fn exec_runs_a_command_with_whitespace_at_its_edges() {
 /// spaces after the arguments are printed.
 #[test]
 fn exec_keeps_the_trailing_spaces_of_a_command() {
-    let child = ExecChild::spawn("  cmd.exe /c echo a   ", None).unwrap();
+    let child = ExecChild::spawn("  cmd.exe /c echo a   ", None, None).unwrap();
     let out_t = drain(child.stdout_read_raw());
     let err_t = drain(child.stderr_read_raw());
     assert_eq!(child.wait().unwrap(), 0);
@@ -81,7 +63,7 @@ fn a_file_that_cannot_start_is_an_error_and_not_a_message_box() {
     std::fs::create_dir_all(&dir).unwrap();
     let stub = dir.join("stub.exe");
     std::fs::write(&stub, b"MZ").unwrap();
-    let result = ExecChild::spawn(&format!("\"{}\" -c x", stub.display()), None);
+    let result = ExecChild::spawn(&format!("\"{}\" -c x", stub.display()), None, None);
     let _ = std::fs::remove_dir_all(&dir);
     assert!(result.is_err(), "a file that is not a program started");
 }
@@ -104,7 +86,7 @@ fn a_program_with_a_missing_dll_starts_and_ends_with_the_loader_status_and_no_ou
     const STATUS_DLL_NOT_FOUND: u32 = 0xC000_0135;
     loader_failures_end_the_program();
     let exe = crate::command_line_probe::example("missing_dll");
-    let child = ExecChild::spawn(&format!("\"{}\"", exe.display()), None).expect("the program starts");
+    let child = ExecChild::spawn(&format!("\"{}\"", exe.display()), None, None).expect("the program starts");
     let out_t = drain(child.stdout_read_raw());
     let err_t = drain(child.stderr_read_raw());
     // UNBOUNDED on purpose: the loader ends the process, or nextest's bound names this test.
@@ -118,7 +100,7 @@ fn a_program_with_a_missing_dll_starts_and_ends_with_the_loader_status_and_no_ou
 #[test]
 fn a_missing_working_directory_is_not_the_programs_fault() {
     let missing = std::env::temp_dir().join(format!("sb-pipes-no-such-dir-{}", std::process::id()));
-    let error = ExecChild::spawn("cmd.exe /c exit", Some(&missing))
+    let error = ExecChild::spawn("cmd.exe /c exit", Some(&missing), None)
         .err()
         .expect("a missing working directory started a program");
     assert!(matches!(error, StartError::Other(_)), "{error:?}");
@@ -131,7 +113,7 @@ fn a_file_that_cannot_start_is_the_programs_fault() {
     std::fs::create_dir_all(&dir).unwrap();
     let stub = dir.join("stub.exe");
     std::fs::write(&stub, b"MZ").unwrap();
-    let error = ExecChild::spawn(&format!("\"{}\"", stub.display()), Some(&dir))
+    let error = ExecChild::spawn(&format!("\"{}\"", stub.display()), Some(&dir), None)
         .err()
         .expect("a file that is not a program started");
     let _ = std::fs::remove_dir_all(&dir);

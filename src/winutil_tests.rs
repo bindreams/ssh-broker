@@ -97,15 +97,15 @@ fn io_error(code: i32) -> windows::core::Error {
 fn a_failed_create_is_the_programs_unless_the_working_directory_is_not_one() {
     let dir = std::env::temp_dir();
     assert!(matches!(
-        start_error_of_create(io_error(193), None),
+        start_error_of_create(io_error(193), None, false),
         crate::shell::StartError::Program(_)
     ));
     assert!(matches!(
-        start_error_of_create(io_error(193), Some(&dir)),
+        start_error_of_create(io_error(193), Some(&dir), false),
         crate::shell::StartError::Program(_)
     ));
     let missing = dir.join("ssh-broker-no-such-directory-for-a-test");
-    let blamed = start_error_of_create(io_error(267), Some(&missing));
+    let blamed = start_error_of_create(io_error(267), Some(&missing), false);
     assert!(matches!(blamed, crate::shell::StartError::Other(_)), "{blamed:?}");
     assert!(
         format!("{blamed}").contains("ssh-broker-no-such-directory-for-a-test"),
@@ -169,21 +169,44 @@ fn a_failed_create_blames_the_program_unless_the_machine_is_out_of_a_resource() 
         1816, // ERROR_NOT_ENOUGH_QUOTA
     ];
     for code in program {
-        let blamed = start_error_of_create(io_error(code), None);
+        let blamed = start_error_of_create(io_error(code), None, false);
         assert!(
             matches!(blamed, crate::shell::StartError::Program(_)),
             "{code}: {blamed:?}"
         );
     }
     for code in other {
-        let blamed = start_error_of_create(io_error(code), None);
+        let blamed = start_error_of_create(io_error(code), None, false);
         assert!(
             matches!(blamed, crate::shell::StartError::Other(_)),
             "{code}: {blamed:?}"
         );
     }
     // An error that is not a Win32 code says nothing against the program either.
-    let blamed = start_error_of_create(windows::core::Error::from(windows::Win32::Foundation::E_FAIL), None);
+    let blamed = start_error_of_create(
+        windows::core::Error::from(windows::Win32::Foundation::E_FAIL),
+        None,
+        false,
+    );
+    assert!(matches!(blamed, crate::shell::StartError::Program(_)), "{blamed:?}");
+}
+
+/// `CreateProcessAsUserW` fails with `ERROR_PRIVILEGE_NOT_HELD` when the process lacks a privilege the call
+/// needs with that token: the program is not at fault, and the built-in shell would meet it too. Without a
+/// token the code is held against the program like any other.
+#[test]
+fn a_privilege_failure_with_a_token_is_not_the_programs() {
+    const ERROR_PRIVILEGE_NOT_HELD: i32 = 1314;
+    let blamed = start_error_of_create(io_error(ERROR_PRIVILEGE_NOT_HELD), None, true);
+    assert!(matches!(blamed, crate::shell::StartError::Other(_)), "{blamed:?}");
+    assert!(
+        format!("{blamed:#}").contains("token"),
+        "the token is named: {blamed:#}"
+    );
+    let blamed = start_error_of_create(io_error(ERROR_PRIVILEGE_NOT_HELD), None, false);
+    assert!(matches!(blamed, crate::shell::StartError::Program(_)), "{blamed:?}");
+    // Any other failure with a token is still judged as it is without one.
+    let blamed = start_error_of_create(io_error(193), None, true);
     assert!(matches!(blamed, crate::shell::StartError::Program(_)), "{blamed:?}");
 }
 
@@ -727,4 +750,110 @@ fn a_sid_not_aligned_for_its_sub_authorities_is_an_error() {
     let info = from_bytes(&bytes);
     let err = info.sid(pointer_at(&info, 9)).unwrap_err();
     assert!(err.to_string().contains("aligned"), "{err:#}");
+}
+
+// Walking a token's groups -----
+
+/// The group reader hands out each group of the token once, in the token's order, with the attributes the
+/// token holds, and a SID that lies inside the token information it was read from.
+#[test]
+fn the_group_reader_visits_each_group_of_this_process_token_once() {
+    use windows::Win32::Security::{SID_AND_ATTRIBUTES, TOKEN_GROUPS, TokenGroups};
+    let token = own_token().unwrap();
+    let info = token_information(token.0, TokenGroups).unwrap();
+    // SAFETY: the group count is a `u32`.
+    let count = unsafe { info.header::<u32>() }.unwrap();
+    // SAFETY: every bit pattern is a valid `SID_AND_ATTRIBUTES` (a pointer and an integer).
+    let expected: Vec<u32> =
+        unsafe { info.array::<SID_AND_ATTRIBUTES>(offset_of!(TOKEN_GROUPS, Groups), count as usize) }
+            .unwrap()
+            .iter()
+            .map(|group| group.Attributes)
+            .collect();
+
+    let mut seen = Vec::new();
+    let found: Option<()> = find_group(token.0, |sid, attributes| {
+        assert!(!sid.0.is_null());
+        seen.push(attributes);
+        Ok(None)
+    })
+    .unwrap();
+    assert_eq!(found, None);
+    assert_eq!(seen, expected);
+}
+
+/// The first group `pick` takes ends the walk, and what it returns is the result.
+#[test]
+fn the_group_reader_stops_at_the_group_that_is_picked() {
+    let token = own_token().unwrap();
+    let mut visited = 0;
+    let found = find_group(token.0, |_, attributes| {
+        visited += 1;
+        Ok(Some(attributes))
+    })
+    .unwrap();
+    assert!(found.is_some(), "a token has a group");
+    assert_eq!(visited, 1);
+}
+
+/// An error from `pick` ends the walk and is the result.
+#[test]
+fn the_group_reader_returns_the_error_of_pick() {
+    let token = own_token().unwrap();
+    let error = find_group::<()>(token.0, |_, _| anyhow::bail!("not this one")).unwrap_err();
+    assert!(error.to_string().contains("not this one"), "{error:#}");
+}
+
+// The inherit list -----
+
+fn handle(value: isize) -> HANDLE {
+    HANDLE(value as *mut core::ffi::c_void)
+}
+
+/// A handle named twice makes `CreateProcessW` fail (measured), and a terminal session's stdout and stderr can
+/// be one console handle, so the list the call gets has each handle once, in the order given.
+#[test]
+fn the_inherit_list_names_each_handle_once() {
+    let (h, other) = (handle(0x40), handle(0x44));
+    assert_eq!(handle_list(&[h, h, other]), vec![h, other]);
+    assert_eq!(handle_list(&[other, h, other, h]), vec![other, h]);
+    assert!(handle_list(&[]).is_empty());
+}
+
+// Starting a child -----
+
+/// An inheritable handle: the write end of a pipe, and the read end kept by the caller.
+fn pipe_with_inheritable_write_end() -> (OwnedHandle, OwnedHandle) {
+    use windows::Win32::Foundation::HANDLE_FLAG_INHERIT;
+    use windows::Win32::Foundation::SetHandleInformation;
+    use windows::Win32::System::Pipes::CreatePipe;
+    let (mut read, mut write) = (HANDLE::default(), HANDLE::default());
+    // SAFETY: valid out-pointers; the handles are closed by `OwnedHandle`.
+    unsafe { CreatePipe(&mut read, &mut write, None, 0) }.expect("make a pipe");
+    let (read, write) = (OwnedHandle(read), OwnedHandle(write));
+    // SAFETY: a handle this test owns.
+    unsafe { SetHandleInformation(write.0, HANDLE_FLAG_INHERIT.0, HANDLE_FLAG_INHERIT) }.expect("mark it inheritable");
+    (read, write)
+}
+
+/// Start `cmd /c exit 0` suspended and end it: whether the call accepted what it was given.
+fn starts(console: ChildConsole, std_handles: [HANDLE; 3], inherit: &[HANDLE]) -> Result<(), StartError> {
+    use windows::Win32::System::Threading::TerminateProcess;
+    // SAFETY: the handles are live and inheritable; the child is suspended and ended here.
+    let (process, _thread) =
+        unsafe { spawn_suspended("cmd.exe /c exit 0", None, console, std_handles, inherit, None) }?;
+    // SAFETY: the suspended process just created.
+    unsafe { TerminateProcess(process.0, 1) }.expect("end the suspended child");
+    Ok(())
+}
+
+/// A terminal session's stdout and stderr can be one console handle. Named in the inherit list twice it fails
+/// the call, so a start with the same handle for both starts.
+#[test]
+fn a_child_whose_stdout_and_stderr_are_one_handle_starts() {
+    let (_read, write) = pipe_with_inheritable_write_end();
+    let null = HANDLE::default();
+    let h = write.0;
+    starts(ChildConsole::NoWindow, [null, h, h], &[h, h]).expect("one handle for stdout and stderr");
+    starts(ChildConsole::Parent, [null, h, h], &[h, h]).expect("the same on the parent's console");
 }

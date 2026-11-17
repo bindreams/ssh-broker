@@ -22,6 +22,29 @@ fn current_user_sid_is_the_one_whoami_reports() {
     assert_eq!(Sid::current_user().unwrap().to_sddl().unwrap(), reported);
 }
 
+/// A logon SID is `S-1-5-5-<high>-<low>`, and is the one Windows gives for the class `TokenLogonSid`, a
+/// different read from the group walk under test.
+#[test]
+fn the_logon_sid_of_this_process_is_a_logon_session_sid() {
+    use crate::winutil::token_information;
+    use windows::Win32::Security::{SID_AND_ATTRIBUTES, TOKEN_GROUPS, TokenLogonSid};
+    let token = crate::winutil::own_token().unwrap();
+    let logon = Sid::logon_of_token(token.0).unwrap().to_sddl().unwrap();
+    let parts: Vec<&str> = logon.split('-').collect();
+    assert_eq!(parts.len(), 6, "{logon}");
+    assert_eq!(&parts[..4], ["S", "1", "5", "5"], "{logon}");
+
+    let info = token_information(token.0, TokenLogonSid).expect("read the logon SID class");
+    // SAFETY: the group count is a `u32`.
+    let count = unsafe { info.header::<u32>() }.expect("read the group count");
+    assert_eq!(count, 1, "the class names one group");
+    // SAFETY: every bit pattern is a valid `SID_AND_ATTRIBUTES` (a pointer and an integer).
+    let groups = unsafe { info.array::<SID_AND_ATTRIBUTES>(std::mem::offset_of!(TOKEN_GROUPS, Groups), 1) }
+        .expect("read the group");
+    let given = info.sid(groups[0].Sid).expect("read the group's SID");
+    assert_eq!(sid_to_string(given).unwrap(), logon);
+}
+
 #[test]
 fn well_known_sids_are_the_documented_ones() {
     assert_eq!(

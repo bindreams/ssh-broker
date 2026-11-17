@@ -26,6 +26,7 @@ use crate::shim::{
 };
 use crate::shim_offer::{Absent, Prompting, Rescue, Rescued};
 use crate::socket_loc::SocketLocation;
+use crate::winutil::{ChildConsole, UnelevatedToken, contain_and_resume, spawn_suspended};
 use crate::{afunix, conpty, vtinput};
 use socket2::Socket;
 use std::sync::Arc;
@@ -98,11 +99,12 @@ pub fn run_on(exec: Option<RawExec>, detect: impl FnOnce() -> Encoding) -> anyho
     // packed the same way (`shim::fail_open`), in a job so the child dies with the session
     // (`start_local`). The log guard stays alive until the exit: dropping it stops the
     // `tracing-appender` worker, whose lossy writer then discards every later line.
+    ignore_ctrl_c();
     let code = fail_open(
         &crate::shell::WindowsHost,
         &exec,
         &mut std::io::stderr(),
-        start_local,
+        |line| start_local(line, None),
         LocalChild::finish,
     );
     drop(log); // flush: `process::exit` runs no destructors
@@ -407,31 +409,89 @@ pub struct LocalChild {
     _job: cosca::Job,
 }
 
-/// Start `command_line` locally, inheriting our stdio directly, in a job so the child dies with the
-/// session.
+/// Start `command_line` locally on our console, with our standard handles and nothing else inherited, in a
+/// job so the child dies with the session. With `as_user` the child has that token, not ours. Callers
+/// [`ignore_ctrl_c`] first: the child shares the console.
 ///
 /// This is the fail-open path for every session. The line is already the shell's: `shim::fail_open`
 /// built it with the same planner the agent uses, so the command reaches the shell packed as it
 /// would have been under the agent. The child writes raw to sshd's pipes, exactly as the original
 /// DefaultShell did.
 ///
+/// A standard handle this process does not have, or that the system does not accept as a handle of this
+/// process, is not inherited and does not stop the start: the child gets null in its place, the reason is
+/// logged, and the shell runs. A broken broker must not cost the user their SSH access. A stale number that
+/// this process has since reused for another handle cannot be told from the handle it was given, and that
+/// object goes to the shell.
+///
 /// It returns when the shell is running, and [`LocalChild::finish`] waits for it: a failure of the
 /// wait is not a failure to start, and must not run the command again.
-fn start_local(command_line: &str) -> Result<LocalChild, StartError> {
-    use windows::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
+fn start_local(command_line: &str, as_user: Option<&UnelevatedToken>) -> Result<LocalChild, StartError> {
     use windows::Win32::System::Console::STD_ERROR_HANDLE;
-    ignore_ctrl_c();
-    unsafe {
-        let stdin = GetStdHandle(STD_INPUT_HANDLE)?;
-        let stdout = GetStdHandle(STD_OUTPUT_HANDLE)?;
-        let stderr = GetStdHandle(STD_ERROR_HANDLE)?;
-        // STARTF_USESTDHANDLES only passes handles the child can inherit; make sure they are.
-        for h in [stdin, stdout, stderr] {
-            let _ = SetHandleInformation(h, HANDLE_FLAG_INHERIT.0, HANDLE_FLAG_INHERIT);
+    // SAFETY: no pointers. A failure is a handle this process does not have: null.
+    let std_handles = unsafe {
+        [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE].map(|which| {
+            GetStdHandle(which).unwrap_or_else(|e| {
+                tracing::warn!("this process has no standard handle ({e}), so the shell gets none");
+                HANDLE::default()
+            })
+        })
+    };
+    start_with_std_handles(command_line, std_handles, as_user)
+}
+
+/// [`start_local`] with the standard handles it is given instead of this process's.
+fn start_with_std_handles(
+    command_line: &str,
+    std_handles: [HANDLE; 3],
+    as_user: Option<&UnelevatedToken>,
+) -> Result<LocalChild, StartError> {
+    let (std_handles, inheritable) = inheritable_std_handles(std_handles);
+    // SAFETY: every handle in `std_handles` and `inheritable` is an inheritable one of this process or null.
+    let (process, thread) = unsafe {
+        spawn_suspended(
+            crate::shim::spawn_line(command_line),
+            None,
+            ChildConsole::Parent,
+            std_handles,
+            &inheritable,
+            as_user,
+        )
+    }?;
+    // SAFETY: the live handles from the successful start above.
+    let job = unsafe { contain_and_resume(process.0, thread.0, "shim fail-open") }?;
+    Ok(LocalChild { process, _job: job })
+}
+
+/// The standard handles the child gets and the handles it inherits, from the standard handles of this
+/// process (input, output, error). One that is null or invalid, or that the system does not accept as a
+/// handle of this process (`SetHandleInformation` fails), is not inherited, and the child gets null in its
+/// place: a value off the inherit list would name nothing in the child, and later whatever the child opens
+/// under that number. Each is logged with the reason. A stale number that this process has reused for
+/// another handle also passes the check, and cannot be told from the handle it was given.
+fn inheritable_std_handles(std_handles: [HANDLE; 3]) -> ([HANDLE; 3], Vec<HANDLE>) {
+    use windows::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
+    let mut passed = [HANDLE::default(); 3];
+    let mut inheritable = Vec::with_capacity(3);
+    for ((name, handle), slot) in ["input", "output", "error"]
+        .into_iter()
+        .zip(std_handles)
+        .zip(&mut passed)
+    {
+        if handle.is_invalid() {
+            tracing::warn!("this process has no standard {name} handle, so the shell gets none");
+            continue;
         }
-        let (process, job) = spawn_contained(command_line, Some([stdin, stdout, stderr]))?;
-        Ok(LocalChild { process, _job: job })
+        // SAFETY: no pointers; a handle that is not one fails the call.
+        match unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT.0, HANDLE_FLAG_INHERIT) } {
+            Ok(()) => {
+                *slot = handle;
+                inheritable.push(handle);
+            }
+            Err(e) => tracing::warn!("the standard {name} handle cannot be inherited ({e}), so the shell gets none"),
+        }
     }
+    (passed, inheritable)
 }
 
 impl LocalChild {
@@ -520,7 +580,7 @@ pub fn console_fallback(handle: usize, login: bool) -> i32 {
         }
     };
     show_notice(&mut std::io::stdout(), &mut std::io::stderr(), &notice);
-    match start_local(&command_line)
+    match start_local(&command_line, None)
         .map_err(StartError::into_cause)
         .and_then(LocalChild::finish)
     {
@@ -559,68 +619,6 @@ fn read_handoff(handle: usize) -> anyhow::Result<(String, String)> {
     pipe.read_to_end(&mut bytes).context("read the pipe")?;
     drop(pipe);
     crate::handoff::decode(&bytes)
-}
-
-/// Spawn `command` suspended and contain it in a job object before it runs a single instruction.
-///
-/// This exists as its own function so the containment is *testable* in isolation. `run_on` still
-/// ends in `process::exit` (so nothing in-process can observe its wiring — that is gated end to
-/// end by `tests/fail_open_windows.rs`), but the spawn itself can be asserted against here.
-///
-/// Containment is the point. A child spawned here must die with the session exactly as a relayed
-/// one does (`pipes.rs`, `conpty.rs` both contain theirs) — otherwise reaching the fail-open path
-/// would be a way to leave a process running after disconnect, and the README promises the
-/// opposite. `CREATE_SUSPENDED` is load-bearing: assignment has to win the race against the child
-/// spawning anything, or a descendant is born outside the job. `contain_and_resume` kills rather
-/// than resumes if assignment fails, so a failure here never yields an uncontained process.
-///
-/// The caller MUST keep the returned `Job` alive for as long as the child should live.
-///
-/// # Safety
-/// Any handles named in `stdio` must be valid and inheritable.
-unsafe fn spawn_contained(
-    command: &str,
-    stdio: Option<[windows::Win32::Foundation::HANDLE; 3]>,
-) -> Result<(crate::winutil::OwnedHandle, cosca::Job), StartError> {
-    use windows::Win32::System::Threading::{
-        CREATE_SUSPENDED, CreateProcessW, PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOW,
-    };
-    use windows::core::PWSTR;
-
-    let mut si = STARTUPINFOW {
-        cb: std::mem::size_of::<STARTUPINFOW>() as u32,
-        ..Default::default()
-    };
-    if let Some([i, o, e]) = stdio {
-        si.dwFlags = STARTF_USESTDHANDLES;
-        si.hStdInput = i;
-        si.hStdOutput = o;
-        si.hStdError = e;
-    }
-    let mut cmd: Vec<u16> = crate::shim::spawn_line(command)
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect();
-    let mut pi = PROCESS_INFORMATION::default();
-    unsafe {
-        CreateProcessW(
-            None,
-            Some(PWSTR(cmd.as_mut_ptr())),
-            None,
-            None,
-            stdio.is_some(), // inherit → the child gets sshd's stdio directly (binary-clean)
-            CREATE_SUSPENDED,
-            None,
-            None,
-            &si,
-            &mut pi,
-        )
-        .map_err(|e| crate::winutil::start_error_of_create(e, None))?;
-        let process = crate::winutil::OwnedHandle(pi.hProcess);
-        let thread = crate::winutil::OwnedHandle(pi.hThread);
-        let job = crate::winutil::contain_and_resume(process.0, thread.0, "shim fail-open")?;
-        Ok((process, job))
-    }
 }
 
 // ── PTY relay ──────────────────────────────────────────────────────────────────────
