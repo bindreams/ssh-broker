@@ -3,7 +3,7 @@
 //! Each case is a whole command line, as sshd's `DefaultShell` launch produces it; the argv
 //! `route` receives is derived from it the way the C runtime would.
 
-use super::{AgentArgs, AutoLoginArgs, BackgroundArgs, Route, Toggle, Verb, route};
+use super::{AgentArgs, AutoLoginArgs, BackgroundArgs, ProbeLink, Route, Toggle, Verb, route};
 use crate::cmdline::{Encoding, RawExec, resolve_exec, split_args};
 
 fn route_line(line: &str) -> Route {
@@ -169,7 +169,41 @@ fn a_c_flag_after_a_verb_is_still_exec() {
 fn apply_and_verify_verbs() {
     assert_eq!(route_line("ssh-broker.exe apply"), Route::Apply);
     assert_eq!(route_line("ssh-broker.exe verify"), Route::Verify);
-    assert_eq!(route_line("ssh-broker.exe verify-probe"), Route::VerifyProbe);
+    assert_eq!(
+        route_line("ssh-broker.exe verify-probe"),
+        Route::VerifyProbe(ProbeLink::Own)
+    );
+}
+
+/// The hidden probe takes the directory of a junction to follow, or the flag that says it makes one and
+/// leaves it: `verify` runs the two probes of an administrator's session with them. Any other shape is a
+/// usage error, never the shim and never a probe that ignored what it was told.
+#[test]
+fn verify_probe_takes_a_junction_flag_or_a_directory_to_follow() {
+    let args = |args: &[&str]| args.iter().map(|a| (*a).to_owned()).collect::<Vec<_>>();
+    let dir = r"C:\Users\me\AppData\Local\Temp\sb-junction-1";
+    assert_eq!(
+        route(&args(&["verify-probe", "--make-junction"]), "ignored"),
+        Route::VerifyProbe(ProbeLink::Make)
+    );
+    assert_eq!(
+        route(&args(&["verify-probe", "--follow", dir]), "ignored"),
+        Route::VerifyProbe(ProbeLink::Follow(dir.into()))
+    );
+    for bad in [
+        vec!["verify-probe", "--follow"],
+        vec!["verify-probe", "--follow", "--make-junction"],
+        vec!["verify-probe", "--follow", "a", "b"],
+        vec!["verify-probe", "--make-junction", "a"],
+        vec!["verify-probe", "--make-junction", "--follow", "a"],
+        vec!["verify-probe", "now"],
+    ] {
+        assert_eq!(
+            route(&args(&bad), "ignored"),
+            Route::Usage(Verb::VerifyProbe),
+            "{bad:?}"
+        );
+    }
 }
 
 /// The hidden verb of a terminal session's fallback shell takes the value of the pipe handle it

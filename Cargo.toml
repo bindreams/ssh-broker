@@ -40,6 +40,8 @@ windows = { version = "0.62.2", features = [
     "Win32_Security",
     "Win32_Security_Authorization",
     "Win32_System_IO",
+    "Win32_System_Ioctl",          # FSCTL_SET_REPARSE_POINT: the junction `verify`'s link row follows (src/provision/probe/link.rs)
+    "Win32_System_SystemServices", # IO_REPARSE_TAG_MOUNT_POINT, the tag of that junction
     "Win32_System_Memory",
     "Win32_System_RemoteDesktop",
     "Win32_System_Registry",       # DefaultShell registry pair (Reg* APIs)

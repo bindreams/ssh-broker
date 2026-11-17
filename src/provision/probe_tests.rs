@@ -1,22 +1,90 @@
 //! Host tests for the pure probe-line format/parse.
+use std::path::PathBuf;
+
 use super::{
     ProbeResult, SymlinkState, UpstreamState, binary_probe_ok, binary_probe_payload, emit_binary_probe,
     format_probe_line, is_genuine_session, parse_probe_line, upstream_payload_ok,
 };
+use crate::socket_loc::Elevation;
+
+/// A result with every optional field absent: what a probe child too old to report them gives.
+fn bare(session_id: u32, symlink: SymlinkState, upstream: UpstreamState) -> ProbeResult {
+    ProbeResult {
+        session_id,
+        dpapi_ok: true,
+        symlink,
+        upstream,
+        logon_type: None,
+        elevation: None,
+        integrity: None,
+        junction: None,
+    }
+}
 
 #[test]
 fn probe_line_round_trips() {
-    let line = format_probe_line(1, true, SymlinkState::Blocked, true, None);
+    let result = bare(1, SymlinkState::Blocked, UpstreamState::Ok);
+    let line = format_probe_line(&result);
     assert_eq!(line, "PROBE session_id=1 dpapi=ok symlink=blocked upstream=ok");
-    assert_eq!(
-        parse_probe_line(&line).unwrap(),
-        ProbeResult {
-            session_id: 1,
-            dpapi_ok: true,
-            symlink: SymlinkState::Blocked,
-            upstream: UpstreamState::Ok,
-            logon_type: None,
+    assert_eq!(parse_probe_line(&line).unwrap(), result);
+}
+
+/// The probe's own token, as the parent reads it: how much of an administrator's power it has and the
+/// relative id of its integrity label, in hex as the label SID's sub-authority is written.
+#[test]
+fn probe_line_carries_the_elevation_and_the_integrity_level() {
+    for (elevation, word) in [
+        (Elevation::Full, "full"),
+        (Elevation::Filtered, "filtered"),
+        (Elevation::Standard, "standard"),
+    ] {
+        for rid in [0x2000, 0x3000] {
+            let result = ProbeResult {
+                elevation: Some(elevation),
+                integrity: Some(rid),
+                ..bare(1, SymlinkState::Ok, UpstreamState::Ok)
+            };
+            let line = format_probe_line(&result);
+            assert!(
+                line.ends_with(&format!(" elevation={word} integrity={rid:#x}")),
+                "{line}"
+            );
+            assert_eq!(parse_probe_line(&line).unwrap(), result);
         }
+    }
+}
+
+/// A probe that cannot read its own token, or an exe older than the field, says nothing. That must
+/// read as "not proven", never as an elevation: the `elevated session` row is what rests on it.
+#[test]
+fn a_missing_or_unknown_elevation_or_integrity_is_not_proven() {
+    let old = parse_probe_line("PROBE session_id=1 dpapi=ok symlink=ok upstream=ok").unwrap();
+    assert_eq!((old.elevation, old.integrity), (None, None));
+    let garbled =
+        parse_probe_line("PROBE session_id=1 dpapi=ok symlink=ok upstream=ok elevation=root integrity=high").unwrap();
+    assert_eq!((garbled.elevation, garbled.integrity), (None, None));
+}
+
+/// The junction a probe made is named on the PROBE line, for `verify` to hand to the next probe and then
+/// to remove. It is the last field, and everything after `junction=` is the path, so a profile with a
+/// blank in its name survives.
+#[test]
+fn probe_line_carries_the_junction_directory_whole() {
+    let dir = PathBuf::from(r"C:\Users\example user\AppData\Local\Temp\sb-junction-42");
+    let result = ProbeResult {
+        junction: Some(dir.clone()),
+        ..bare(1, SymlinkState::Ok, UpstreamState::Ok)
+    };
+    let line = format_probe_line(&result);
+    assert!(line.ends_with(&format!(" junction={}", dir.display())), "{line}");
+    assert_eq!(parse_probe_line(&line).unwrap().junction, Some(dir));
+    assert_eq!(parse_probe_line(&line).unwrap(), result);
+    // A line with no junction has none: an empty value is not a path.
+    assert_eq!(
+        parse_probe_line("PROBE session_id=1 dpapi=ok symlink=ok upstream=ok junction=")
+            .unwrap()
+            .junction,
+        None
     );
 }
 
@@ -50,7 +118,7 @@ fn a_missing_upstream_token_is_absent_not_a_reported_failure() {
         old.detail()
     );
 
-    let failed = format_probe_line(1, true, SymlinkState::Ok, false, None);
+    let failed = format_probe_line(&bare(1, SymlinkState::Ok, UpstreamState::Fail));
     assert!(failed.contains("upstream=fail"));
     let got = parse_probe_line(&failed).unwrap().upstream;
     assert_eq!(got, UpstreamState::Fail);
@@ -118,14 +186,15 @@ fn upstream_payload_propagates_a_read_error() {
 
 #[test]
 fn symlink_states_round_trip() {
-    for st in [SymlinkState::Ok, SymlinkState::Blocked, SymlinkState::Skipped] {
-        let line = format_probe_line(2, false, st, true, None);
+    for st in [SymlinkState::Ok, SymlinkState::Blocked, SymlinkState::Failed] {
+        let line = format_probe_line(&bare(2, st, UpstreamState::Ok));
         assert_eq!(parse_probe_line(&line).unwrap().symlink, st);
     }
-    // Only a confirmed block is a parity failure.
+    // Only a followed junction passes: one that was refused, and one that could not be made or read,
+    // fail.
     assert!(SymlinkState::Blocked.is_failure());
+    assert!(SymlinkState::Failed.is_failure());
     assert!(!SymlinkState::Ok.is_failure());
-    assert!(!SymlinkState::Skipped.is_failure());
 }
 
 /// The payload must survive an exact round trip, and the check must be sensitive to a SINGLE
@@ -173,18 +242,18 @@ fn binary_probe_markers_cannot_collide_with_the_payload() {
 
 #[test]
 fn parse_is_default_deny_on_gating_keys() {
-    // Missing dpapi and upstream → fail; missing session_id → 0; missing symlink → Skipped
-    // (informational). Only symlink may default to a non-failing value.
+    // Missing dpapi, symlink and upstream → fail; missing session_id → 0. Nothing defaults to a pass.
     let r = parse_probe_line("PROBE session_id=2").unwrap();
     assert_eq!(
         r,
         ProbeResult {
-            session_id: 2,
             dpapi_ok: false,
-            symlink: SymlinkState::Skipped,
-            upstream: UpstreamState::Absent,
-            logon_type: None,
+            ..bare(2, SymlinkState::Failed, UpstreamState::Absent)
         }
+    );
+    assert!(
+        r.symlink.is_failure(),
+        "a probe that reported no link outcome did not prove one"
     );
 }
 
@@ -193,13 +262,7 @@ fn parse_tolerates_surrounding_noise() {
     let out = "starting...\nPROBE session_id=7 dpapi=ok symlink=ok upstream=ok\nbye\n";
     assert_eq!(
         parse_probe_line(out).unwrap(),
-        ProbeResult {
-            session_id: 7,
-            dpapi_ok: true,
-            symlink: SymlinkState::Ok,
-            upstream: UpstreamState::Ok,
-            logon_type: None,
-        }
+        bare(7, SymlinkState::Ok, UpstreamState::Ok)
     );
 }
 
@@ -210,7 +273,10 @@ fn parse_errors_when_no_probe_line() {
 
 #[test]
 fn probe_line_round_trips_with_logon_type() {
-    let line = format_probe_line(0, true, SymlinkState::Ok, true, Some(4));
+    let line = format_probe_line(&ProbeResult {
+        logon_type: Some(4),
+        ..bare(0, SymlinkState::Ok, UpstreamState::Ok)
+    });
     assert_eq!(line, "PROBE session_id=0 dpapi=ok symlink=ok upstream=ok logon=4");
     assert_eq!(parse_probe_line(&line).unwrap().logon_type, Some(4));
 }

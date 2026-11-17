@@ -1,5 +1,6 @@
 //! Host tests for `apply`'s argument handling.
 use super::*;
+use crate::route::ProbeLink;
 
 fn args(list: &[&str]) -> Vec<String> {
     list.iter().map(|s| s.to_string()).collect()
@@ -68,7 +69,11 @@ fn the_shell_config_row_fails_only_when_a_fallback_is_in_effect() {
 #[test]
 fn the_probe_handshake_is_direct() {
     use crate::protocol::{Launch, Mode};
-    let hs = probe_handshake(std::path::Path::new(r"C:\Program Files\ssh-broker\ssh-broker.exe"));
+    let hs = probe_handshake(
+        std::path::Path::new(r"C:\Program Files\ssh-broker\ssh-broker.exe"),
+        crate::protocol::Privilege::Account,
+        &ProbeLink::Own,
+    );
     assert_eq!(
         hs.launch,
         Launch::Direct,
@@ -78,5 +83,34 @@ fn the_probe_handshake_is_direct() {
     assert_eq!(
         hs.command.as_deref(),
         Some(r#""C:\Program Files\ssh-broker\ssh-broker.exe" verify-probe"#)
+    );
+}
+
+/// The probe that asks for an unelevated session says so in the handshake, which is the only thing
+/// that makes the agent step its child down; the command is the same one the other probes run.
+#[test]
+fn the_probe_handshake_carries_the_privilege_it_asks_for() {
+    use crate::protocol::Privilege;
+    let exe = std::path::Path::new(r"C:\Program Files\ssh-broker\ssh-broker.exe");
+    for privilege in [Privilege::Account, Privilege::Unelevated] {
+        assert_eq!(probe_handshake(exe, privilege, &ProbeLink::Own).privilege, privilege);
+    }
+}
+
+/// Each probe's command line names what it does about the junction. The directory to follow is quoted, so
+/// a profile with a blank in its name reaches the probe as one argument.
+#[test]
+fn the_probe_handshake_names_the_junction_work() {
+    use crate::protocol::Privilege;
+    let exe = std::path::Path::new(r"C:\Program Files\ssh-broker\ssh-broker.exe");
+    let command = |link: &ProbeLink| probe_handshake(exe, Privilege::Account, link).command.unwrap();
+    let base = r#""C:\Program Files\ssh-broker\ssh-broker.exe" verify-probe"#;
+
+    assert_eq!(command(&ProbeLink::Own), base);
+    assert_eq!(command(&ProbeLink::Make), format!("{base} --make-junction"));
+    let dir = r"C:\Users\example user\AppData\Local\Temp\sb-junction-9";
+    assert_eq!(
+        command(&ProbeLink::Follow(dir.into())),
+        format!(r#"{base} --follow "{dir}""#)
     );
 }

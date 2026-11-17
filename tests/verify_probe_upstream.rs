@@ -26,13 +26,22 @@
 #![cfg(windows)]
 
 use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 /// Run `verify-probe`, feed it `input` on stdin, close stdin, and return everything it wrote to
 /// stdout.
 fn run_verify_probe(input: &[u8]) -> String {
+    run_verify_probe_with(&[], &std::env::temp_dir(), input)
+}
+
+/// [`run_verify_probe`] with `args` after the verb and `temp` as the probe's temp directory.
+fn run_verify_probe_with(args: &[&str], temp: &Path, input: &[u8]) -> String {
     let mut child = Command::new(env!("CARGO_BIN_EXE_ssh-broker"))
         .arg("verify-probe")
+        .args(args)
+        .env("TEMP", temp)
+        .env("TMP", temp)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -91,4 +100,83 @@ fn empty_stdin_reports_upstream_fail() {
     let stdout = run_verify_probe(&[]);
     let line = probe_line(&stdout);
     assert!(line.contains("upstream=fail"), "expected upstream=fail, got: {line}");
+}
+
+/// A temp directory of one test's own, removed on drop (`remove_dir_all` removes a junction itself and does
+/// not follow it).
+struct Temp(PathBuf);
+
+impl Temp {
+    fn new(tag: &str) -> Temp {
+        let path = std::env::temp_dir().join(format!("sb-probe-junction-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).unwrap();
+        Temp(path)
+    }
+}
+
+impl Drop for Temp {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// The one probe of a standard account's agent makes a junction, follows it and removes it: the link
+/// outcome is on the PROBE line and nothing is left in the temp directory.
+#[test]
+fn a_probe_with_no_flag_follows_its_own_junction_and_leaves_nothing() {
+    let temp = Temp::new("own");
+    let stdout = run_verify_probe_with(&[], &temp.0, &(0..=255u8).collect::<Vec<_>>());
+    let line = probe_line(&stdout);
+    assert!(line.contains("symlink=ok"), "expected symlink=ok, got: {line}");
+    assert!(!line.contains("junction="), "no directory is left to name: {line}");
+    assert_eq!(std::fs::read_dir(&temp.0).unwrap().count(), 0, "nothing is left behind");
+}
+
+/// The unelevated probe of an administrator's agent makes a junction and names its directory; the other
+/// probe follows it by that name. Both read it, neither removes it.
+#[test]
+fn a_probe_that_makes_a_junction_names_it_and_another_follows_it() {
+    let temp = Temp::new("make");
+    let made = run_verify_probe_with(&["--make-junction"], &temp.0, b"");
+    let made_line = probe_line(&made);
+    assert!(made_line.contains("symlink=ok"), "{made_line}");
+    let dir = made_line
+        .split_once(" junction=")
+        .unwrap_or_else(|| panic!("no junction= in: {made_line}"))
+        .1;
+    assert!(
+        Path::new(dir).starts_with(&temp.0),
+        "{dir} is made in the probe's temp directory"
+    );
+
+    let followed = run_verify_probe_with(&["--follow", dir], &temp.0, b"");
+    let followed_line = probe_line(&followed);
+    assert!(followed_line.contains("symlink=ok"), "{followed_line}");
+    assert!(!followed_line.contains("junction="), "{followed_line}");
+    assert!(Path::new(dir).exists(), "the follower leaves the junction to `verify`");
+}
+
+/// A directory with no junction in it is a failed link check, not a pass and not a block.
+#[test]
+fn a_probe_that_follows_a_directory_with_no_junction_reports_a_failure() {
+    let temp = Temp::new("none");
+    let stdout = run_verify_probe_with(&["--follow", &temp.0.to_string_lossy()], &temp.0, b"");
+    let line = probe_line(&stdout);
+    assert!(line.contains("symlink=fail"), "expected symlink=fail, got: {line}");
+}
+
+/// The probe reports its own token: the line names an elevation and an integrity level, which `verify`
+/// reads to say whether the session is elevated.
+#[test]
+fn the_probe_line_names_the_probes_own_elevation_and_integrity() {
+    let stdout = run_verify_probe(b"");
+    let line = probe_line(&stdout);
+    assert!(
+        ["elevation=full", "elevation=filtered", "elevation=standard"]
+            .iter()
+            .any(|word| line.contains(word)),
+        "no elevation in: {line}"
+    );
+    assert!(line.contains(" integrity=0x"), "no integrity level in: {line}");
 }
