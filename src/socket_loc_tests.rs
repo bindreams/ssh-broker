@@ -196,7 +196,8 @@ fn a_profile_that_fits_the_plain_folder_but_not_the_elevated_one_is_told_the_ele
         SocketLocationError::TooLong { path, bytes, max } => {
             assert_eq!(bytes, MAX_SOCKET_PATH_BYTES + 9);
             assert_eq!(max, MAX_SOCKET_PATH_BYTES);
-            assert!(path.ends_with(r"ssh-broker-elevated\agent.sock"), "{}", path.display());
+            let tail = Path::new(ELEVATED_SOCKET_DIR_NAME).join(SOCKET_FILE_NAME);
+            assert!(path.ends_with(&tail), "{}", path.display());
         }
     }
 }
