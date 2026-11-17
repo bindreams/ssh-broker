@@ -6,7 +6,7 @@ use super::{
     make_handshake, map_outcome, size_to_resize, spawn_line,
 };
 use crate::protocol::{
-    ExitCode, FrameKind, FrameReader, Handshake, Launch, Mode, Resize, Stream, read_one_frame, write_frame,
+    ExitCode, FrameKind, FrameReader, Handshake, Launch, Mode, Privilege, Resize, Stream, read_one_frame, write_frame,
 };
 use crate::relay::{FrameSink, Outcome, TestSink, duplex, write_data};
 use std::io::Write;
@@ -292,7 +292,7 @@ fn fail_open_when_agent_unreachable() {
 
 // ── fail_open (the line it runs, and what it says first) ───────────────────────────
 
-use crate::cmdline::Exec;
+use crate::cmdline::{Exec, Login};
 use crate::shell::StartError;
 use crate::shell::test_host::{SYSTEM_CMD, TestHost, USER_CONFIG};
 
@@ -311,15 +311,28 @@ fn exec(command: &str, terminal: bool) -> Option<Exec> {
     })
 }
 
+fn account(exec: Option<Exec>) -> Login {
+    Login {
+        exec,
+        privilege: Privilege::Account,
+    }
+}
+
+/// The maker of the unelevated token of a process that has none to make; the type is a stand-in.
+fn no_token() -> anyhow::Result<Option<()>> {
+    Ok(None)
+}
+
 /// Run `fail_open` with a `run` that records the line and returns `code`; returns what it saw.
 fn failed_open(host: &TestHost, exec: &Option<Exec>, code: Result<i32, &str>) -> (i32, Option<String>, String) {
     let mut stderr = Vec::new();
     let mut line = None;
     let got = fail_open(
         host,
-        exec,
+        &account(exec.clone()),
         &mut stderr,
-        |l| {
+        no_token,
+        |l, _| {
             line = Some(l.to_owned());
             code.map_err(|e| StartError::Program(anyhow::anyhow!("{e}")))
         },
@@ -363,9 +376,10 @@ fn the_fallback_warning_is_said_once_and_the_child_runs_once() {
         let mut stderr = Vec::new();
         fail_open(
             &host,
-            &exec,
+            &account(exec),
             &mut stderr,
-            |_line| {
+            no_token,
+            |_line, _| {
                 children += 1;
                 Ok(0)
             },
@@ -401,9 +415,10 @@ fn a_warning_is_written_before_the_run_closure_is_called() {
     let host = TestHost::new().with_user_config("shell: nonesuch.exe\n");
     fail_open(
         &host,
-        &None,
+        &account(None),
         &mut Spy(&events),
-        |_| {
+        no_token,
+        |_, _| {
             events.borrow_mut().push("run".into());
             Ok(0)
         },
@@ -502,7 +517,15 @@ fn map_outcome_exit_code_policy() {
 
 #[test]
 fn no_command_is_pty_without_a_command() {
-    let hs = make_handshake(&None, false, Launch::Shell, "screen-256color".into(), 100, 30);
+    let hs = make_handshake(
+        &None,
+        false,
+        Launch::Shell,
+        "screen-256color".into(),
+        100,
+        30,
+        Privilege::Account,
+    );
     assert_eq!(hs.mode, Mode::Pty);
     assert_eq!(hs.command, None);
     assert_eq!(hs.launch, Launch::Shell);
@@ -515,14 +538,30 @@ fn no_command_is_pty_without_a_command() {
 
 #[test]
 fn a_command_without_a_terminal_is_exec() {
-    let hs = make_handshake(&Some("git status".into()), false, Launch::Shell, "xterm".into(), 80, 24);
+    let hs = make_handshake(
+        &Some("git status".into()),
+        false,
+        Launch::Shell,
+        "xterm".into(),
+        80,
+        24,
+        Privilege::Account,
+    );
     assert_eq!(hs.mode, Mode::Exec);
     assert_eq!(hs.command.as_deref(), Some("git status"));
 }
 
 #[test]
 fn a_command_with_a_terminal_is_a_pty_handshake_with_the_command() {
-    let hs = make_handshake(&Some("git status".into()), true, Launch::Shell, "xterm".into(), 120, 40);
+    let hs = make_handshake(
+        &Some("git status".into()),
+        true,
+        Launch::Shell,
+        "xterm".into(),
+        120,
+        40,
+        Privilege::Account,
+    );
     assert_eq!(hs.mode, Mode::Pty);
     assert_eq!(hs.command.as_deref(), Some("git status"));
     assert_eq!((hs.cols, hs.rows), (120, 40));
@@ -531,7 +570,24 @@ fn a_command_with_a_terminal_is_a_pty_handshake_with_the_command() {
 #[test]
 fn the_launch_is_carried_as_given() {
     for launch in [Launch::Shell, Launch::Direct] {
-        assert_eq!(make_handshake(&None, false, launch, String::new(), 0, 0).launch, launch);
+        assert_eq!(
+            make_handshake(&None, false, launch, String::new(), 0, 0, Privilege::Account).launch,
+            launch
+        );
+    }
+}
+
+#[test]
+fn the_privilege_is_carried_as_given() {
+    for privilege in [Privilege::Account, Privilege::Unelevated] {
+        for (exec, terminal) in [
+            (None, false),
+            (Some("whoami".to_owned()), false),
+            (Some("whoami".to_owned()), true),
+        ] {
+            let hs = make_handshake(&exec, terminal, Launch::Shell, String::new(), 80, 24, privilege);
+            assert_eq!(hs.privilege, privilege);
+        }
     }
 }
 
@@ -691,7 +747,15 @@ fn frames(from: &mpsc::Receiver<Vec<u8>>, n: usize) -> Vec<(FrameKind, Vec<u8>)>
 }
 
 fn exec_handshake() -> Handshake {
-    make_handshake(&Some("sort".into()), false, Launch::Shell, "xterm".into(), 80, 24)
+    make_handshake(
+        &Some("sort".into()),
+        false,
+        Launch::Shell,
+        "xterm".into(),
+        80,
+        24,
+        Privilege::Account,
+    )
 }
 
 fn stdin_data(payload: &[u8]) -> (FrameKind, Vec<u8>) {
@@ -858,9 +922,10 @@ fn fail_open_runs_cmd_exe_and_warns_when_the_shell_exists_and_cannot_start() {
         let mut tried = Vec::new();
         let code = fail_open(
             &host,
-            &exec,
+            &account(exec.clone()),
             &mut stderr,
-            |line| {
+            no_token,
+            |line, _| {
                 tried.push(line.to_owned());
                 if line.contains("pwsh.exe") {
                     return Err(StartError::Program(anyhow::anyhow!(
@@ -923,9 +988,10 @@ fn fail_open_does_not_run_a_command_again_when_the_run_failed_after_the_shell_st
         let mut started = Vec::new();
         let code = fail_open(
             &host,
-            &exec,
+            &account(exec.clone()),
             &mut stderr,
-            |line| {
+            no_token,
+            |line, _| {
                 started.push(line.to_owned());
                 Ok(())
             },
@@ -948,4 +1014,99 @@ fn fail_open_exits_255_and_says_why_when_the_system_directory_is_missing() {
         assert_eq!((code, line), (255, None));
         assert!(stderr.contains("GetSystemDirectoryW"), "{stderr}");
     }
+}
+
+// ── fail_open and the word ────────────────────────────────────────────────────────
+
+fn unelevated(exec: Option<Exec>) -> Login {
+    Login {
+        exec,
+        privilege: Privilege::Unelevated,
+    }
+}
+
+#[test]
+fn an_unelevated_login_that_cannot_be_stepped_down_gets_a_message_and_255_and_no_shell() {
+    let host = pwsh_host();
+    for exec in [exec("whoami", false), exec("whoami", true), None] {
+        let mut stderr = Vec::new();
+        let code = fail_open(
+            &host,
+            &unelevated(exec.clone()),
+            &mut stderr,
+            || -> anyhow::Result<Option<()>> { Err(anyhow::anyhow!("the token cannot be made")) },
+            |_, _| -> Result<(), StartError> { panic!("a shell was started for a login that asked to be unelevated") },
+            |()| panic!("nothing was started, so nothing is waited for"),
+        );
+        assert_eq!(code, 255, "{exec:?}");
+        let text = String::from_utf8(stderr).unwrap();
+        assert!(
+            text.starts_with("ssh-broker: ")
+                && text.contains("unelevated")
+                && text.contains("the token cannot be made"),
+            "{text:?}"
+        );
+    }
+}
+
+#[test]
+fn an_unelevated_login_starts_every_line_it_tries_with_the_token() {
+    let host = pwsh_host();
+    let mut stderr = Vec::new();
+    let mut seen = Vec::new();
+    let code = fail_open(
+        &host,
+        &unelevated(exec("echo hi", false)),
+        &mut stderr,
+        || Ok(Some(7u32)),
+        |line, token| {
+            seen.push((line.contains("pwsh.exe"), token.copied()));
+            if line.contains("pwsh.exe") {
+                return Err(StartError::Program(anyhow::anyhow!("not a valid Win32 application")));
+            }
+            Ok(())
+        },
+        |()| Ok(0),
+    );
+    assert_eq!(code, 0);
+    // The configured shell and the replacement both get it: a fallback is no way round the word.
+    assert_eq!(seen, [(true, Some(7)), (false, Some(7))]);
+}
+
+#[test]
+fn an_unelevated_login_of_a_process_below_high_starts_as_any_login_does() {
+    let host = pwsh_host();
+    let mut seen = Vec::new();
+    let code = fail_open(
+        &host,
+        &unelevated(exec("echo hi", false)),
+        &mut Vec::new(),
+        || Ok(None::<u32>),
+        |_, token| {
+            seen.push(token.copied());
+            Ok(())
+        },
+        |()| Ok(0),
+    );
+    assert_eq!(code, 0);
+    assert_eq!(seen, [None]);
+}
+
+#[test]
+fn an_account_login_never_asks_for_a_token() {
+    let host = pwsh_host();
+    let mut seen = Vec::new();
+    let code = fail_open(
+        &host,
+        &account(exec("echo hi", false)),
+        &mut Vec::new(),
+        || -> anyhow::Result<Option<u32>> { panic!("an account login made a token") },
+        |_, token| {
+            seen.push(token.copied());
+            Ok(())
+        },
+        |()| Ok(0),
+    );
+    assert_eq!(code, 0);
+    assert_eq!(seen, [None]);
 }

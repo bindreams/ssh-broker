@@ -248,3 +248,51 @@ fn the_token_of_a_process_handle_is_that_process_s_token() {
         integrity_of(crate::winutil::own_token().unwrap().0).unwrap()
     );
 }
+
+// the token an unelevated session runs with -----
+
+#[test]
+fn a_process_at_high_makes_the_token() {
+    use crate::socket_loc::Integrity;
+    let made = unelevated_if_high(|| Ok(Integrity::High), || Ok("token"));
+    assert_eq!(made.unwrap(), Some("token"));
+}
+
+#[test]
+fn a_process_below_high_makes_none_and_does_not_try() {
+    use crate::socket_loc::Integrity;
+    let made = unelevated_if_high(
+        || Ok(Integrity::Medium),
+        || -> anyhow::Result<&str> { panic!("a token was made below High") },
+    );
+    assert_eq!(made.unwrap(), None);
+}
+
+#[test]
+fn a_token_that_cannot_be_made_at_high_is_an_error() {
+    use crate::socket_loc::Integrity;
+    let err = unelevated_if_high(
+        || Ok(Integrity::High),
+        || -> anyhow::Result<&str> { anyhow::bail!("no token") },
+    )
+    .unwrap_err();
+    assert!(format!("{err:#}").contains("no token"), "{err:#}");
+}
+
+/// A level that cannot be read is not Medium: the login asked for an unelevated session, and a guess
+/// would hand an elevated process the shell.
+#[test]
+fn an_unreadable_level_is_an_error_and_makes_nothing() {
+    let err = unelevated_if_high(
+        || anyhow::bail!("the level cannot be read"),
+        || -> anyhow::Result<&str> { panic!("a token was made without the level") },
+    )
+    .unwrap_err();
+    assert!(format!("{err:#}").contains("the level cannot be read"), "{err:#}");
+}
+
+#[test]
+fn this_process_makes_a_token_exactly_when_it_is_at_high() {
+    let at_high = integrity().unwrap() == crate::socket_loc::Integrity::High;
+    assert_eq!(unelevated_token().unwrap().is_some(), at_high);
+}

@@ -104,6 +104,7 @@ pub fn probe_handshake(exe: &std::path::Path) -> crate::protocol::Handshake {
         "xterm".into(),
         80,
         24,
+        crate::protocol::Privilege::Account,
     )
 }
 

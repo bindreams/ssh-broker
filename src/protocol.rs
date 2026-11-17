@@ -122,8 +122,8 @@ impl ExitCode {
     }
 }
 
-/// The wire version. 2 added [`Handshake::launch`].
-pub const PROTOCOL_VERSION: u16 = 2;
+/// The wire version. 2 added [`Handshake::launch`], 3 [`Handshake::privilege`].
+pub const PROTOCOL_VERSION: u16 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Mode {
@@ -144,6 +144,15 @@ pub enum Launch {
     Direct,
 }
 
+/// Whose privilege the session's program runs with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Privilege {
+    /// The agent's own: elevated for an administrator whose agent is elevated.
+    Account,
+    /// Stepped down: the login said `internal-unelevated`. An agent below High gives what it has anyway.
+    Unelevated,
+}
+
 /// The first frame on a connection (a HANDSHAKE-kind frame whose payload is this
 /// struct, `postcard`-serialized). The shim fills `term`/`cwd` and the allow-listed
 /// `env`. The agent applies the working directory; `TERM` and the rest of the SSH session's
@@ -160,6 +169,9 @@ pub struct Handshake {
     pub command: Option<String>,
     pub env: Vec<(String, String)>,
     pub launch: Launch,
+    /// Appended last: the version check reads `version` alone, so a peer of another version is refused
+    /// by name before this field is looked for.
+    pub privilege: Privilege,
 }
 
 impl Handshake {
@@ -190,6 +202,7 @@ impl Handshake {
             command: None,
             env: Vec::new(),
             launch: Launch::Direct,
+            privilege: Privilege::Account,
         }
     }
 }

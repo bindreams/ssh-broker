@@ -3,7 +3,9 @@
 //! `std::env::args` has already split and unquoted the command line, which loses the exact
 //! command sshd sent: see [`decode_command`] for the two forms it arrives in, and
 //! [`detect`] for how the shim tells them apart. [`resolve_exec`] is the step from what
-//! `route` finds to the command.
+//! `route` finds to the command, and [`read_login`] the step after it: the reserved word.
+
+use crate::protocol::Privilege;
 
 #[cfg(not(windows))]
 mod other;
@@ -49,6 +51,58 @@ pub fn resolve_exec(exec: RawExec, detect: impl FnOnce() -> Encoding) -> Exec {
     Exec {
         command,
         terminal: encoding == Encoding::Verbatim,
+    }
+}
+
+/// The command that asks for an unelevated session (`ssh host internal-unelevated cmd`). It is a convenience
+/// for programs that must run unelevated, not a restriction on what the account can do: a client may leave
+/// it out, and a key may force it.
+pub const RESERVED_UNELEVATED: &str = "internal-unelevated";
+
+/// A login as the shim reads it: the command it runs, if any, and the privilege it asked for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Login {
+    pub exec: Option<Exec>,
+    pub privilege: Privilege,
+}
+
+/// The login `exec` is, once the reserved word has been looked for. `original_command` is
+/// `SSH_ORIGINAL_COMMAND` when sshd set it: the client's own command, byte for byte, when the word was forced
+/// on a key or in a `Match` block, so that the client sent none of the word.
+///
+/// The word is matched exactly and case-sensitively, at the start of the command:
+///
+/// - the whole command is the word: [`Privilege::Unelevated`], and the command is `original_command`, with
+///   `exec`'s terminal, or none (a login);
+/// - the word, then one space or tab: [`Privilege::Unelevated`], and the command is the rest as written. If
+///   that is blank it is a blank command (exit 0, [`crate::shim::is_blank_command`]), not a login;
+/// - anything else, a longer word, a leading blank or another case included: [`Privilege::Account`], and
+///   the command is untouched.
+pub fn read_login(exec: Option<Exec>, original_command: Option<String>) -> Login {
+    let Some(exec) = exec else {
+        return Login {
+            exec: None,
+            privilege: Privilege::Account,
+        };
+    };
+    let terminal = exec.terminal;
+    let unelevated = |command: Option<String>| Login {
+        exec: command.map(|command| Exec { command, terminal }),
+        privilege: Privilege::Unelevated,
+    };
+    if exec.command == RESERVED_UNELEVATED {
+        return unelevated(original_command);
+    }
+    match exec
+        .command
+        .strip_prefix(RESERVED_UNELEVATED)
+        .and_then(|rest| rest.strip_prefix(SEPARATORS))
+    {
+        Some(rest) => unelevated(Some(rest.to_owned())),
+        None => Login {
+            exec: Some(exec),
+            privilege: Privilege::Account,
+        },
     }
 }
 

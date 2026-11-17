@@ -3,7 +3,7 @@
 //! hooks fail on purpose, and the connections are AF_UNIX pairs in a temp dir.
 use super::*;
 use crate::afunix::{ConnTx, Whole};
-use crate::protocol::{FrameKind, Handshake, Launch, Mode, Stream, write_frame};
+use crate::protocol::{FrameKind, Handshake, Launch, Mode, Privilege, Stream, write_frame};
 use crate::relay::{Outcome, TestSink, pump_decode, write_data};
 use crate::shell::test_host::{TestHost, USER_CONFIG};
 
@@ -349,4 +349,123 @@ fn a_working_config_shows_no_warning() {
     let host = TestHost::new();
     let (answer, _result) = answered("no-warn", with_host(host), shell_request(Mode::Exec, Some("echo hi")));
     assert!(!answer.stderr.contains("cannot use the shell"), "{}", answer.stderr);
+}
+
+// Unelevated logins -----
+
+/// A `Launch::Shell` request in `mode` that asked for `privilege`.
+fn request_for(mode: Mode, command: Option<&str>, privilege: Privilege) -> impl FnOnce(&mut ConnTx) + Send + 'static {
+    let hs = Handshake {
+        mode,
+        command: command.map(str::to_owned),
+        launch: Launch::Shell,
+        privilege,
+        ..Handshake::pty_default()
+    };
+    move |tx| {
+        write_frame(tx, FrameKind::Handshake, &hs.encode().unwrap()).unwrap();
+        write_data(tx, Stream::Stdin, b"").unwrap();
+    }
+}
+
+#[test]
+fn an_unelevated_login_whose_token_cannot_be_made_is_answered_and_starts_nothing() {
+    for (tag, mode, command) in [
+        ("unelevated-exec", Mode::Exec, Some("whoami")),
+        ("unelevated-pty", Mode::Pty, None),
+        ("unelevated-pty-command", Mode::Pty, Some("whoami")),
+    ] {
+        let hooks = Hooks {
+            make_unelevated: || Err(anyhow::anyhow!("the token cannot be made")),
+            start_exec: |_, _, _| panic!("a command was started for an unelevated login with no token"),
+            start_pty: |_, _, _, _, _, _| panic!("a shell was started for an unelevated login with no token"),
+            ..Hooks::production()
+        };
+        let (answer, result) = answered(tag, hooks, request_for(mode, command, Privilege::Unelevated));
+        assert_eq!(answer.outcome, Outcome::Exited(255), "{tag}");
+        assert_eq!(
+            answer.stderr,
+            "ssh-broker: the agent could not prepare an unelevated session: the token cannot be made\r\n",
+            "{tag}"
+        );
+        assert!(result.is_err(), "{tag}");
+    }
+}
+
+#[test]
+fn an_account_login_makes_no_token() {
+    let hooks = Hooks {
+        make_unelevated: || panic!("an account login made a token"),
+        ..failing_starters()
+    };
+    let (answer, _result) = answered(
+        "account-no-token",
+        hooks,
+        request_for(Mode::Exec, Some("whoami"), Privilege::Account),
+    );
+    assert!(
+        answer.stderr.contains("could not start the command"),
+        "{}",
+        answer.stderr
+    );
+}
+
+/// The starts of `an_unelevated_login_gives_its_token_to_every_start`: `(starter, the shell inherits a handle from
+/// the verb, it was given a token)`. Only that test uses it.
+static STARTS: std::sync::Mutex<Vec<(&'static str, bool, bool)>> = std::sync::Mutex::new(Vec::new());
+
+#[test]
+fn an_unelevated_login_gives_its_token_to_every_start() {
+    let recording = |host: TestHost| Hooks {
+        shell_host: Box::new(host),
+        make_unelevated: || crate::winutil::UnelevatedToken::of_this_process().map(Some),
+        start_exec: |_, _, token| {
+            STARTS.lock().unwrap().push(("exec", false, token.is_some()));
+            Err(StartError::Program(anyhow::anyhow!("recorded")))
+        },
+        start_pty: |_, _, _, _, read, token| {
+            STARTS.lock().unwrap().push(("pty", read.is_some(), token.is_some()));
+            Err(StartError::Program(anyhow::anyhow!("recorded")))
+        },
+        ..Hooks::production()
+    };
+    let broken = || TestHost::new().with_user_config("shell: {strt: x}\n");
+
+    let _ = answered(
+        "starts-exec",
+        recording(TestHost::new()),
+        request_for(Mode::Exec, Some("whoami"), Privilege::Unelevated),
+    );
+    let _ = answered(
+        "starts-pty",
+        recording(TestHost::new()),
+        request_for(Mode::Pty, None, Privilege::Unelevated),
+    );
+    // A shell that cannot be used is started through the `console-fallback` verb first, and that start is
+    // given the token too.
+    let _ = answered(
+        "starts-verb",
+        recording(broken()),
+        request_for(Mode::Pty, None, Privilege::Unelevated),
+    );
+    // An account login is given none.
+    let _ = answered(
+        "starts-account",
+        recording(TestHost::new()),
+        request_for(Mode::Exec, Some("whoami"), Privilege::Account),
+    );
+
+    let starts = std::mem::take(&mut *STARTS.lock().unwrap());
+    assert_eq!(
+        starts,
+        [
+            ("exec", false, true),
+            ("pty", false, true),
+            // The verb's start, then the line the agent falls back to when the verb cannot be started.
+            ("pty", true, true),
+            ("pty", false, true),
+            ("exec", false, false),
+        ],
+        "{starts:?}"
+    );
 }

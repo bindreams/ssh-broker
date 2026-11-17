@@ -106,8 +106,11 @@ pub struct Account {
     pub profile: Option<PathBuf>,
     /// Set by the test that has a service log the account on, see [`Account::started_by`].
     service_logon: std::sync::OnceLock<ServiceLogon>,
-    /// Set by [`Account::make_administrator`]: the level of the account's sessions follows from it.
+    /// Set by [`Account::make_administrator`]: sshd reads an administrator's keys from another file, and
+    /// the level of the account's sessions follows from it.
     administrator: std::sync::atomic::AtomicBool,
+    /// Set by [`Account::make_backup_operator`]; read only by [`Account::integrity`].
+    backup_operator: std::sync::atomic::AtomicBool,
 }
 
 impl Account {
@@ -187,6 +190,7 @@ impl Account {
             profile: None,
             service_logon: std::sync::OnceLock::new(),
             administrator: std::sync::atomic::AtomicBool::new(false),
+            backup_operator: std::sync::atomic::AtomicBool::new(false),
         };
         if with_profile {
             let mut buf = [0u16; 260];
@@ -275,9 +279,27 @@ impl Account {
     }
 
     /// Make the account a member of the local Administrators group. It is removed with the account.
+    pub fn make_administrator(&self) {
+        self.add_to_local_group("Administrators");
+        self.administrator.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether [`Account::make_administrator`] was called.
+    pub fn is_administrator(&self) -> bool {
+        self.administrator.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Make the account a member of the local group Backup Operators and not of Administrators: a
+    /// token with the group's privileges that Windows treats as one UAC filters.
+    pub fn make_backup_operator(&self) {
+        self.add_to_local_group("Backup Operators");
+        self.backup_operator.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Make the account a member of the local group `group`, by its name. It is removed with the account.
     /// The member is given by SID (level 0): a name needs the machine's own name as its domain, and
     /// `.` there is answered with `ERROR_NO_SUCH_MEMBER` (1387).
-    pub fn make_administrator(&self) {
+    fn add_to_local_group(&self, group: &str) {
         use windows::Win32::Foundation::{HLOCAL, LocalFree};
         use windows::Win32::NetworkManagement::NetManagement::{LOCALGROUP_MEMBERS_INFO_0, NetLocalGroupAddMembers};
         use windows::Win32::Security::Authorization::ConvertStringSidToSidW;
@@ -292,7 +314,7 @@ impl Account {
         let rc = unsafe {
             NetLocalGroupAddMembers(
                 PCWSTR::null(),
-                PCWSTR(wide("Administrators").as_ptr()),
+                PCWSTR(wide(group).as_ptr()),
                 0,
                 &info as *const _ as *const u8,
                 1,
@@ -302,20 +324,23 @@ impl Account {
         unsafe {
             let _ = LocalFree(Some(HLOCAL(sid.0)));
         }
-        assert_eq!(rc, 0, "NetLocalGroupAddMembers({}) failed with {rc}", self.name);
-        self.administrator.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            rc, 0,
+            "NetLocalGroupAddMembers({}, {group}) failed with {rc}",
+            self.name
+        );
     }
 
     /// The integrity level the account's sessions run at, and so the folder its agent keeps its socket
     /// in: an administrator's agent and shim are elevated (`High`), a standard account's are `Medium`.
+    /// A member of Backup Operators is no administrator, but Windows gives its logon a High token
+    /// (see [`Account::make_backup_operator`]), so its sessions are `High` too.
     /// Read as of now: call it after [`Account::make_administrator`], and make a guard that keeps the
     /// answer (`session_end::LogOutOnDrop`) after it too.
     pub fn integrity(&self) -> Integrity {
-        if self.administrator.load(std::sync::atomic::Ordering::Relaxed) {
-            Integrity::High
-        } else {
-            Integrity::Medium
-        }
+        let sessions_at_high = self.administrator.load(std::sync::atomic::Ordering::Relaxed)
+            || self.backup_operator.load(std::sync::atomic::Ordering::Relaxed);
+        if sessions_at_high { Integrity::High } else { Integrity::Medium }
     }
 
     /// Where the account's agent keeps its socket ([`Account::integrity`]). Panics for an account made

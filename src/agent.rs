@@ -61,7 +61,9 @@ use crate::hangup::{HangupWatcher, Waker};
 #[cfg(windows)]
 use crate::pipes::ExecChild;
 #[cfg(windows)]
-use crate::protocol::{ExitCode, FrameKind, FrameReader, Handshake, Mode, Resize, Stream, read_one_frame, write_frame};
+use crate::protocol::{
+    ExitCode, FrameKind, FrameReader, Handshake, Mode, Privilege, Resize, Stream, read_one_frame, write_frame,
+};
 #[cfg(windows)]
 use crate::relay::{FrameSink, pump_until_peer_gone, write_data};
 #[cfg(windows)]
@@ -625,11 +627,13 @@ fn handle_connection_with(conn: socket2::Socket, hooks: Hooks) -> anyhow::Result
     handle_connection_in(conn, hooks, &Control::standalone())
 }
 
-/// What a session runs with: the hooks a test can replace, and the agent's shared control.
+/// What a session runs with: the hooks a test can replace, the agent's shared control, and the token its
+/// shell runs with in place of the agent's, if the login asked to be unelevated and the agent is elevated.
 #[cfg(windows)]
 struct Env<'a> {
     hooks: Hooks,
     control: &'a Control,
+    unelevated: Option<UnelevatedToken>,
 }
 
 /// How a session obtains its [`HangupWatcher`]; a parameter so a test can force a failure.
@@ -653,10 +657,17 @@ type ExecStarter = fn(&str, Option<&Path>, Option<&UnelevatedToken>) -> Result<E
 #[cfg(windows)]
 type Splitter = fn(socket2::Socket) -> Result<(ConnRx, ConnTx), (afunix::Whole, anyhow::Error)>;
 
+/// How a session that asked to be unelevated gets the token its shell runs with: `None` when the agent is
+/// below High, where the session is unelevated anyway (see [`crate::account::unelevated_if_high`]); a
+/// parameter so a test can force a failure.
+#[cfg(windows)]
+type UnelevatedMaker = fn() -> anyhow::Result<Option<UnelevatedToken>>;
+
 /// What a test can replace or observe in a session; production uses [`Hooks::production`].
 #[cfg(windows)]
 struct Hooks {
     make_watcher: WatchFactory,
+    make_unelevated: UnelevatedMaker,
     start_pty: PtyStarter,
     start_exec: ExecStarter,
     /// What the shell configuration is resolved against: the machine, in production.
@@ -687,6 +698,7 @@ impl Hooks {
     fn production() -> Self {
         Self {
             make_watcher: HangupWatcher::new,
+            make_unelevated: crate::account::unelevated_token,
             start_pty: PtySession::spawn,
             start_exec: ExecChild::spawn,
             shell_host: Box::new(crate::shell::WindowsHost),
@@ -774,11 +786,35 @@ fn handle_connection_in(conn: socket2::Socket, hooks: Hooks, control: &Control) 
             ));
         }
     };
+    // Once, before anything is started, and given to every start of the session: the line, and the
+    // `console-fallback` verb, whose child inherits it. A session that asked for it and cannot have it is
+    // refused, not given the agent's own token.
+    let unelevated = match hs.privilege {
+        Privilege::Account => None,
+        Privilege::Unelevated => match (hooks.make_unelevated)() {
+            Ok(token) => token,
+            Err(cause) => {
+                return Err(logout::fail_connection(
+                    &mut rx,
+                    &mut tx,
+                    control,
+                    "the agent could not prepare an unelevated session",
+                    cause,
+                    logout::FAILED_EXIT_CODE,
+                ));
+            }
+        },
+    };
     let cwd_buf = child_cwd(&hs.cwd, home_dir());
     let cwd = cwd_buf.as_deref();
+    let env = Env {
+        hooks,
+        control,
+        unelevated,
+    };
     match hs.mode {
-        Mode::Pty => handle_pty(rx, fr, tx, &launched, (hs.cols, hs.rows), cwd, Env { hooks, control }),
-        Mode::Exec => handle_exec(rx, fr, tx, &launched, cwd, Env { hooks, control }),
+        Mode::Pty => handle_pty(rx, fr, tx, &launched, (hs.cols, hs.rows), cwd, env),
+        Mode::Exec => handle_exec(rx, fr, tx, &launched, cwd, env),
         Mode::Logout => unreachable!("answered above"),
     }
 }
@@ -882,7 +918,11 @@ fn handle_pty(
     cwd: Option<&Path>,
     env: Env<'_>,
 ) -> anyhow::Result<()> {
-    let Env { hooks, control } = env;
+    let Env {
+        hooks,
+        control,
+        unelevated,
+    } = env;
     // The warning for a shell that could not be used is printed by `console-fallback` inside the
     // pseudoconsole, which clears the screen after anything written ahead of it. Without this
     // program's path it goes out here, before the output threads exist.
@@ -891,14 +931,14 @@ fn handle_pty(
         launched,
         broker_exe(),
         |spawn| match spawn {
-            launch::Spawn::Line(line) => (hooks.start_pty)(line, cols, rows, cwd, None, None),
+            launch::Spawn::Line(line) => (hooks.start_pty)(line, cols, rows, cwd, None, unelevated.as_ref()),
             launch::Spawn::Verb {
                 exe,
                 notice,
                 line,
                 login,
             } => verb::start(exe, notice, line, login, |verb_line, read| {
-                (hooks.start_pty)(verb_line, cols, rows, cwd, Some(read), None)
+                (hooks.start_pty)(verb_line, cols, rows, cwd, Some(read), unelevated.as_ref())
             }),
         },
         |text| show_notice(&mut tx, Mode::Pty, text),
@@ -1159,13 +1199,17 @@ fn handle_exec(
     cwd: Option<&Path>,
     env: Env<'_>,
 ) -> anyhow::Result<()> {
-    let Env { hooks, control } = env;
+    let Env {
+        hooks,
+        control,
+        unelevated,
+    } = env;
     let started = launch::start(
         &*hooks.shell_host,
         launched,
         None,
         |spawn| match spawn {
-            launch::Spawn::Line(line) => (hooks.start_exec)(line, cwd, None),
+            launch::Spawn::Line(line) => (hooks.start_exec)(line, cwd, unelevated.as_ref()),
             launch::Spawn::Verb { .. } => Err(StartError::Other(anyhow::anyhow!(
                 "a session without a pseudoconsole is given no verb"
             ))),

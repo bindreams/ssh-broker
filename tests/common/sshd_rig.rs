@@ -120,8 +120,21 @@ pub struct Keys {
     pub _dir: TempDir,
 }
 
-pub fn install_key(account: &Account) -> Keys {
-    let dir = TempDir(std::env::temp_dir().join(format!("sb-sshkey-{}-{}", account.name, std::process::id())));
+/// Where sshd reads an administrator's keys: one file for all of them, which only SYSTEM and Administrators
+/// may hold (`Match Group administrators` in the stock `sshd_config`).
+fn administrators_authorized_keys() -> PathBuf {
+    Path::new(&std::env::var("ProgramData").expect("ProgramData is set"))
+        .join("ssh")
+        .join("administrators_authorized_keys")
+}
+
+/// A key pair for `account`, the public half installed where sshd reads it: the account's profile, or for an
+/// administrator ([`Account::make_administrator`] first) the administrators' file, appended to. With
+/// `forced_command` the key carries `command="..."`, as a key that forces a command does.
+pub fn install_key(account: &Account, forced_command: Option<&str>) -> Keys {
+    static KEYS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let n = KEYS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = TempDir(std::env::temp_dir().join(format!("sb-sshkey-{}-{}-{n}", account.name, std::process::id())));
     let _ = std::fs::remove_dir_all(&dir.0);
     std::fs::create_dir_all(&dir.0).unwrap();
     let private = dir.0.join("id");
@@ -132,13 +145,37 @@ pub fn install_key(account: &Account) -> Keys {
     assert!(ok, "ssh-keygen: {text}");
     // The ssh client refuses a private key other accounts can read.
     icacls(&dir.0, "S-1-5-18");
-    // A standard user's keys are in the profile; only SYSTEM, Administrators and the user may hold them.
-    let dot_ssh = account.profile().join(".ssh");
-    std::fs::create_dir_all(&dot_ssh).unwrap();
-    let authorized_keys = dot_ssh.join("authorized_keys");
-    std::fs::copy(dir.0.join("id.pub"), &authorized_keys).unwrap();
-    icacls(&dot_ssh, &account.sid_text);
-    icacls(&authorized_keys, &account.sid_text);
+    let public = std::fs::read_to_string(dir.0.join("id.pub")).unwrap();
+    let line = match forced_command {
+        Some(command) => format!("command=\"{command}\" {}\n", public.trim_end()),
+        None => format!("{}\n", public.trim_end()),
+    };
+    // Each login of an account adds its own key: a second login of the same account keeps the first one's.
+    let (authorized_keys, readers) = if account.is_administrator() {
+        // Only SYSTEM and Administrators: the account's own entry would make sshd refuse the file.
+        (administrators_authorized_keys(), "S-1-5-32-544")
+    } else {
+        // A standard user's keys are in the profile; only SYSTEM, Administrators and the user may hold them.
+        (
+            account.profile().join(".ssh").join("authorized_keys"),
+            account.sid_text.as_str(),
+        )
+    };
+    let folder = authorized_keys.parent().unwrap();
+    std::fs::create_dir_all(folder).unwrap();
+    {
+        use std::io::Write as _;
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&authorized_keys)
+            .and_then(|mut file| file.write_all(line.as_bytes()))
+            .unwrap_or_else(|e| panic!("append the key to {}: {e}", authorized_keys.display()));
+    }
+    if !account.is_administrator() {
+        icacls(folder, readers);
+    }
+    icacls(&authorized_keys, readers);
     Keys {
         private,
         authorized_keys,
@@ -194,7 +231,14 @@ pub struct SshSession {
 
 impl SshSession {
     pub fn start(mut command: Command, diagnostics: impl Fn() -> String + 'static) -> SshSession {
-        command.arg("-tt").stdin(Stdio::piped()).stdout(Stdio::piped());
+        command.arg("-tt");
+        SshSession::start_as_given(command, diagnostics)
+    }
+
+    /// [`SshSession::start`] for a command that already has its terminal and its remote command (`-tt -- command`
+    /// after the host).
+    pub fn start_as_given(mut command: Command, diagnostics: impl Fn() -> String + 'static) -> SshSession {
+        command.stdin(Stdio::piped()).stdout(Stdio::piped());
         let mut child = command.spawn().expect("run ssh");
         let stdin = child.stdin.take().unwrap();
         let mut stdout = child.stdout.take().unwrap();
@@ -313,10 +357,20 @@ pub struct Login<'a> {
 
 impl<'a> Login<'a> {
     pub fn new(kit: &Kit, account: &'a Account) -> Login<'a> {
+        Login::with_key(kit, account, None)
+    }
+
+    /// A login whose key forces `command` (`command="..."` in `authorized_keys`): sshd runs it whatever the
+    /// client asked for, and gives the client's own command in `SSH_ORIGINAL_COMMAND`.
+    pub fn forcing(kit: &Kit, account: &'a Account, command: &str) -> Login<'a> {
+        Login::with_key(kit, account, Some(command))
+    }
+
+    fn with_key(kit: &Kit, account: &'a Account, forced_command: Option<&str>) -> Login<'a> {
         admit(account);
         Login {
             account,
-            keys: install_key(account),
+            keys: install_key(account, forced_command),
             stderr_path: kit.path(&format!("ssh-stderr-{}.txt", account.name)),
         }
     }
