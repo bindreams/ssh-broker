@@ -125,7 +125,7 @@ pub fn run_on(exec: Option<RawExec>, detect: impl FnOnce() -> Encoding) -> anyho
         &crate::shell::WindowsHost,
         &login,
         &mut std::io::stderr(),
-        crate::account::unelevated_token,
+        UnelevatedToken::for_privilege,
         start_local,
         LocalChild::finish,
     );

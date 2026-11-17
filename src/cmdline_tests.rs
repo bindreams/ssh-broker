@@ -308,9 +308,10 @@ fn exec(command: &str, terminal: bool) -> Option<Exec> {
 }
 
 fn login(command: Option<&str>, terminal: bool, privilege: Privilege) -> Login {
-    Login {
-        exec: command.and_then(|command| exec(command, terminal)),
-        privilege,
+    let exec = command.and_then(|command| exec(command, terminal));
+    match privilege {
+        Privilege::Account => Login::account(exec),
+        Privilege::Unelevated => Login::unelevated(exec),
     }
 }
 
@@ -346,6 +347,71 @@ fn the_original_command_is_kept_byte_for_byte_utf8_and_blanks_included() {
         read_login(exec(RESERVED_UNELEVATED, false), Some(original.into())),
         login(Some(original), false, Privilege::Unelevated)
     );
+}
+
+/// A key (or `ForceCommand`) that forces the word hands the client's own command over in
+/// `SSH_ORIGINAL_COMMAND`, and a client that also says the word (as it does on a host without the forced
+/// key) must get the same session as one that does not.
+#[test]
+fn a_forced_word_and_a_client_that_says_it_too_is_a_login() {
+    for terminal in [false, true] {
+        assert_eq!(
+            read_login(exec(RESERVED_UNELEVATED, terminal), Some(RESERVED_UNELEVATED.into())),
+            login(None, terminal, Privilege::Unelevated)
+        );
+    }
+}
+
+#[test]
+fn a_forced_word_and_a_client_that_says_it_and_a_command_runs_the_command() {
+    for separator in [" ", "\t"] {
+        for terminal in [false, true] {
+            let original = format!("{RESERVED_UNELEVATED}{separator}whoami /groups");
+            assert_eq!(
+                read_login(exec(RESERVED_UNELEVATED, terminal), Some(original.clone())),
+                login(Some("whoami /groups"), terminal, Privilege::Unelevated),
+                "{original:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_forced_word_and_a_client_that_says_it_and_only_blanks_is_a_blank_command() {
+    for original in [
+        "internal-unelevated ",
+        "internal-unelevated \t",
+        "internal-unelevated   ",
+    ] {
+        let got = read_login(exec(RESERVED_UNELEVATED, false), Some(original.into()));
+        assert_eq!(got.privilege, Privilege::Unelevated, "{original:?}");
+        let command = got
+            .exec
+            .unwrap_or_else(|| panic!("{original:?} became a login"))
+            .command;
+        assert!(crate::shim::is_blank_command(&command), "{original:?} -> {command:?}");
+    }
+}
+
+/// The client's command is read once: a rest that again starts with the word is an ordinary command, and
+/// so is an original command that merely resembles the word.
+#[test]
+fn the_original_command_is_read_one_step_and_no_further() {
+    for (original, expected) in [
+        (
+            "internal-unelevated internal-unelevated whoami",
+            "internal-unelevated whoami",
+        ),
+        ("internal-unelevatedx", "internal-unelevatedx"),
+        (" internal-unelevated", " internal-unelevated"),
+        ("Internal-Unelevated whoami", "Internal-Unelevated whoami"),
+    ] {
+        assert_eq!(
+            read_login(exec(RESERVED_UNELEVATED, false), Some(original.into())),
+            login(Some(expected), false, Privilege::Unelevated),
+            "{original:?}"
+        );
+    }
 }
 
 #[test]

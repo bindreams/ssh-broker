@@ -381,10 +381,11 @@ pub fn decide_fallback(connect_err: bool) -> Fallback {
 /// the shell runs, a failure of `finish` is reported and nothing is run again.
 ///
 /// A login that asked to be unelevated would otherwise get sshd's own token, which an administrator's is
-/// elevated. `unelevate` makes the token the session's lines are started with (`None`: this process is below
-/// High, and what it starts is unelevated anyway). It is called once, first, and only for such a login. If
-/// it fails, the login gets a message and 255 and no shell: the command asked not to run elevated, and an
-/// elevated shell is the one thing it must not get. A replacement line is started with the token too.
+/// elevated. `unelevate` is given the login's privilege and returns the token the session's lines are started
+/// with, or none (an account's own login, or a process below High, where what it starts is unelevated anyway).
+/// It is called once, first. If it fails, the login gets a message and 255 and no shell: the command asked not
+/// to run elevated, and an elevated shell is the one thing it must not get. A replacement line is started
+/// with the token too.
 ///
 /// The shell is resolved here, in the shim's own environment (`host`), by the one function the agent
 /// uses ([`shell::plan`]). When the configured shell cannot be used, the built-in `cmd.exe` runs
@@ -395,7 +396,7 @@ pub fn fail_open<T, K>(
     host: &dyn shell::Host,
     login: &Login,
     stderr: &mut dyn Write,
-    unelevate: impl FnOnce() -> anyhow::Result<Option<K>>,
+    unelevate: impl FnOnce(Privilege) -> anyhow::Result<Option<K>>,
     mut start: impl FnMut(&str, Option<&K>) -> Result<T, shell::StartError>,
     finish: impl FnOnce(T) -> anyhow::Result<i32>,
 ) -> i32 {
@@ -412,19 +413,16 @@ pub fn fail_open<T, K>(
     let tell = |stderr: &mut dyn Write, text: &str| {
         let _ = writeln!(stderr, "{text}");
     };
-    let token = match login.privilege {
-        Privilege::Account => None,
-        Privilege::Unelevated => match unelevate() {
-            Ok(token) => token,
-            Err(e) => {
-                tracing::error!("fail-open could not prepare an unelevated session: {e:#}");
-                tell(
-                    stderr,
-                    &format!("ssh-broker: could not prepare an unelevated session, so nothing was run: {e:#}"),
-                );
-                return 255;
-            }
-        },
+    let token = match unelevate(login.privilege) {
+        Ok(token) => token,
+        Err(e) => {
+            tracing::error!("fail-open could not prepare an unelevated session: {e:#}");
+            tell(
+                stderr,
+                &format!("ssh-broker: could not prepare an unelevated session, so nothing was run: {e:#}"),
+            );
+            return 255;
+        }
     };
     let plan = match shell::plan(host, &session) {
         Ok(plan) => plan,

@@ -307,7 +307,7 @@ fn has_exited(process: HANDLE) -> bool {
 }
 
 /// Run `step`, turning a panic into an error that names `what`.
-fn attempt<T>(what: &str, step: impl FnOnce() -> T) -> Result<T, String> {
+pub fn attempt<T>(what: &str, step: impl FnOnce() -> T) -> Result<T, String> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(step)).map_err(|payload| {
         let text = payload
             .downcast_ref::<String>()

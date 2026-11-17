@@ -171,6 +171,8 @@ fn token_of_command(kit: &Kit, login: &Login<'_>, remote: &str) -> TokenShown {
         outcome.stderr,
         (login.diagnostics())()
     );
+    // Kept in the log of a test that fails on what the token was: the raw output and the shim's own words.
+    eprintln!("`{remote}` showed:\n{shown}\nstderr of the client:\n{}", outcome.stderr);
     token_shown(&shown)
 }
 
@@ -188,6 +190,10 @@ fn token_of_command_with_terminal(kit: &Kit, login: &Login<'_>, remote: &str) ->
         outcome.stderr,
         (login.diagnostics())()
     );
+    eprintln!(
+        "`{remote}` with a terminal showed:\n{shown}\nstderr of the client:\n{}",
+        outcome.stderr
+    );
     token_shown(&shown)
 }
 
@@ -199,6 +205,7 @@ fn token_of_shell(session: &mut SshSession) -> TokenShown {
     );
     session.read_until_any(&["wg-admin=enabled;", "wg-admin=deny-only;", "wg-admin=absent;"]);
     let text = session.text();
+    eprintln!("the shell said of its token:\n{text}");
     let at = text.rfind("wg-label=").expect("the label was printed");
     let line = text[at..].split(';').next().unwrap();
     let (label, administrators) = line.split_once(" wg-admin=").expect("the line has both parts");
@@ -224,6 +231,8 @@ fn an_administrators_session_through_real_sshd_is_elevated_and_the_word_gives_an
     let kit = Kit::broker_with_helper("sshw");
     let account = Account::create("sshw", true);
     account.make_administrator();
+    // The session started at the password prompt is ended with `logout` before the account goes.
+    let _end = session_end::LogOutOnDrop::new(&kit.exe, &account, ServiceLogon::Sshd);
     let login = Login::new(&kit, &account);
     let forcing = Login::forcing(&kit, &account, "internal-unelevated");
 
@@ -253,6 +262,13 @@ fn an_administrators_session_through_real_sshd_is_elevated_and_the_word_gives_an
         token_of_command(&kit, &forcing, "whoami /groups"),
         unelevated,
         "the word forced on the key, the client's command after it"
+    );
+    // The client says the word too, as it does on a host without the forced key: the same session, not the word
+    // handed to the shell as a program name.
+    assert_eq!(
+        token_of_command(&kit, &forcing, "internal-unelevated whoami /groups"),
+        unelevated,
+        "the word forced on the key and said by the client, then its command"
     );
     // 3. With a terminal: a command, and the bare word (a login).
     assert_eq!(
@@ -284,6 +300,22 @@ fn an_administrators_session_through_real_sshd_is_elevated_and_the_word_gives_an
         "the word forced, no command"
     );
     forced_login.leave();
+    // ... and the client that says the word with nothing after it, on that key: also a login.
+    let mut said_login = SshSession::start_as_given(
+        {
+            let mut ssh = forcing.command();
+            ssh.arg("-tt").arg("--").arg("internal-unelevated");
+            ssh
+        },
+        forcing.diagnostics(),
+    );
+    said_login.read_until(SHELL_PROMPT);
+    assert_eq!(
+        token_of_shell(&mut said_login),
+        unelevated,
+        "the word forced and said by the client, nothing after it"
+    );
+    said_login.leave();
 
     // 5. A terminal session whose configured shell cannot start is replaced by the `console-fallback` verb, and
     // that shell is unelevated too.
@@ -315,6 +347,9 @@ fn an_administrators_fail_open_shell_is_unelevated_when_the_login_said_the_word(
     account.make_administrator();
     // A shell that is there and not the broker's: with no agent, a command session is not offered one.
     account.write_user_config("shell: cmd.exe\n");
+    // sshd's logon keeps the account's hive loaded, so the account is declared as logged on by sshd, which is how
+    // `Account::drop` deletes the profile; there is no agent to end (see `session_end`).
+    let _end = session_end::LogOutOnDrop::new(&kit.exe, &account, ServiceLogon::Sshd);
     let login = Login::new(&kit, &account);
     set_default_shell_under(OPENSSH_KEY, &kit.exe.to_string_lossy(), &no_shell_to_carry())
         .expect("set the shim as DefaultShell");
@@ -431,7 +466,28 @@ fn a_backup_operators_account_gets_the_stated_limit_at_the_prompt_and_is_served_
         "the agent started for the account runs at {rid:#x}, and the shim of its SSH login looks in the folder for {:?}: the account's batch logon is not at the level sshd gives its logins, a finding to report",
         account.integrity()
     );
-    stand_in::wait_for_serving_marker(&account.socket_location(), started.process.0);
+    // The wait fails when the agent neither listens nor ends; the message then carries what the agent logged, in
+    // the folder it should have used and in the other one.
+    let location = account.socket_location();
+    if let Err(failed) = session_end::attempt("wait for the account's agent to serve", || {
+        stand_in::wait_for_serving_marker(&location, started.process.0)
+    }) {
+        let logs_of = |level| {
+            let location = ssh_broker::socket_loc::for_profile(account.profile(), level)
+                .expect("the account's profile path is short enough");
+            format!(
+                "{level:?} folder {}:\n{}",
+                location.dir().display(),
+                stand_in::read_logs(&location)
+            )
+        };
+        panic!(
+            "{failed}\nthe agent runs at {rid:#x}; the shim looks in {:?}.\n{}\n{}",
+            account.integrity(),
+            logs_of(Integrity::High),
+            logs_of(Integrity::Medium)
+        );
+    }
     // A handle on the agent keeps its logon session in use; the session's end waits for the logoff.
     drop(started);
 

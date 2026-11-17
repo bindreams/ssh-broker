@@ -7,6 +7,7 @@ use windows::Win32::Security::{
 };
 use windows::core::PCWSTR;
 
+use crate::protocol::Privilege;
 use crate::test_support::{own_token_at, own_token_copy};
 use crate::winutil::OwnedHandle;
 
@@ -252,16 +253,17 @@ fn the_token_of_a_process_handle_is_that_process_s_token() {
 // the token an unelevated session runs with -----
 
 #[test]
-fn a_process_at_high_makes_the_token() {
+fn an_unelevated_login_at_high_gets_the_token() {
     use crate::socket_loc::Integrity;
-    let made = unelevated_if_high(|| Ok(Integrity::High), || Ok("token"));
+    let made = step_down(Privilege::Unelevated, || Ok(Integrity::High), || Ok("token"));
     assert_eq!(made.unwrap(), Some("token"));
 }
 
 #[test]
-fn a_process_below_high_makes_none_and_does_not_try() {
+fn an_unelevated_login_below_high_gets_none_and_the_token_is_not_tried() {
     use crate::socket_loc::Integrity;
-    let made = unelevated_if_high(
+    let made = step_down(
+        Privilege::Unelevated,
         || Ok(Integrity::Medium),
         || -> anyhow::Result<&str> { panic!("a token was made below High") },
     );
@@ -271,7 +273,8 @@ fn a_process_below_high_makes_none_and_does_not_try() {
 #[test]
 fn a_token_that_cannot_be_made_at_high_is_an_error() {
     use crate::socket_loc::Integrity;
-    let err = unelevated_if_high(
+    let err = step_down(
+        Privilege::Unelevated,
         || Ok(Integrity::High),
         || -> anyhow::Result<&str> { anyhow::bail!("no token") },
     )
@@ -283,7 +286,8 @@ fn a_token_that_cannot_be_made_at_high_is_an_error() {
 /// would hand an elevated process the shell.
 #[test]
 fn an_unreadable_level_is_an_error_and_makes_nothing() {
-    let err = unelevated_if_high(
+    let err = step_down(
+        Privilege::Unelevated,
         || anyhow::bail!("the level cannot be read"),
         || -> anyhow::Result<&str> { panic!("a token was made without the level") },
     )
@@ -291,8 +295,13 @@ fn an_unreadable_level_is_an_error_and_makes_nothing() {
     assert!(format!("{err:#}").contains("the level cannot be read"), "{err:#}");
 }
 
+/// An account login is not stepped down at any level: neither the level nor the maker is consulted.
 #[test]
-fn this_process_makes_a_token_exactly_when_it_is_at_high() {
-    let at_high = integrity().unwrap() == crate::socket_loc::Integrity::High;
-    assert_eq!(unelevated_token().unwrap().is_some(), at_high);
+fn an_account_login_gets_none_and_asks_for_nothing() {
+    let made = step_down(
+        Privilege::Account,
+        || -> anyhow::Result<crate::socket_loc::Integrity> { panic!("the level was read for an account login") },
+        || -> anyhow::Result<&str> { panic!("a token was made for an account login") },
+    );
+    assert_eq!(made.unwrap(), None);
 }

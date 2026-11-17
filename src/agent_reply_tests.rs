@@ -376,7 +376,7 @@ fn an_unelevated_login_whose_token_cannot_be_made_is_answered_and_starts_nothing
         ("unelevated-pty-command", Mode::Pty, Some("whoami")),
     ] {
         let hooks = Hooks {
-            make_unelevated: || Err(anyhow::anyhow!("the token cannot be made")),
+            make_unelevated: |_| Err(anyhow::anyhow!("the token cannot be made")),
             start_exec: |_, _, _| panic!("a command was started for an unelevated login with no token"),
             start_pty: |_, _, _, _, _, _| panic!("a shell was started for an unelevated login with no token"),
             ..Hooks::production()
@@ -392,10 +392,14 @@ fn an_unelevated_login_whose_token_cannot_be_made_is_answered_and_starts_nothing
     }
 }
 
+/// The agent hands the login's privilege to the maker, and starts with no token when it answers none.
 #[test]
 fn an_account_login_makes_no_token() {
     let hooks = Hooks {
-        make_unelevated: || panic!("an account login made a token"),
+        make_unelevated: |privilege| {
+            assert_eq!(privilege, Privilege::Account);
+            Ok(None)
+        },
         ..failing_starters()
     };
     let (answer, _result) = answered(
@@ -418,7 +422,14 @@ static STARTS: std::sync::Mutex<Vec<(&'static str, bool, bool)>> = std::sync::Mu
 fn an_unelevated_login_gives_its_token_to_every_start() {
     let recording = |host: TestHost| Hooks {
         shell_host: Box::new(host),
-        make_unelevated: || crate::winutil::UnelevatedToken::of_this_process().map(Some),
+        // A real token whatever the level of the test process: the rule, with the level fixed at High.
+        make_unelevated: |privilege| {
+            crate::account::step_down(
+                privilege,
+                || Ok(crate::socket_loc::Integrity::High),
+                crate::winutil::UnelevatedToken::of_this_process,
+            )
+        },
         start_exec: |_, _, token| {
             STARTS.lock().unwrap().push(("exec", false, token.is_some()));
             Err(StartError::Program(anyhow::anyhow!("recorded")))

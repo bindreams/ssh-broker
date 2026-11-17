@@ -15,10 +15,9 @@ use windows::core::PWSTR;
 
 use crate::acl::Sid;
 pub use crate::offer::AccountKind;
+use crate::protocol::Privilege;
 use crate::socket_loc::Integrity;
-use crate::winutil::{
-    SE_GROUP_ENABLED, SE_GROUP_USE_FOR_DENY_ONLY, UnelevatedToken, find_group, own_token, token_information,
-};
+use crate::winutil::{SE_GROUP_ENABLED, SE_GROUP_USE_FOR_DENY_ONLY, find_group, own_token, token_information};
 
 /// An account of this PC, as ssh-broker names it in prompts, logon calls and tasks.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -179,24 +178,26 @@ pub fn integrity() -> anyhow::Result<Integrity> {
     Ok(integrity_class(integrity_of(own_token()?.0)?))
 }
 
-/// The token a session that asked to be unelevated runs with, when this process is at High: the one rule that
-/// says when the agent, and the shim failing open, step a session down. `None` below High, where what a
-/// process starts is unelevated anyway (by the level, not by [`Elevation::Full`]: the folder level is what
-/// the agent serves). A level that cannot be read is an error: the session asked not to be elevated, and a
-/// guess would run it as it is. `integrity` and `make` are parameters so that a test can make either fail.
-pub fn unelevated_if_high<K>(
+/// The token a session of a login with `privilege` runs with in place of this process's own: the one rule
+/// that says when the agent, and the shim failing open, step a session down. An [`Privilege::Account`] login
+/// gets `None` and neither `integrity` nor `make` is consulted. An [`Privilege::Unelevated`] one gets the token
+/// when this process is at High, and `None` below it, where what a process starts is unelevated anyway (by the
+/// level, not by [`Elevation::Full`]: the folder level is what the agent serves). A level that cannot be read,
+/// or a token that cannot be made, is an error: the session asked not to be elevated, and a guess would run it
+/// as it is. `integrity` and `make` are parameters so that a test can make either fail; production passes
+/// them in `UnelevatedToken::for_privilege`.
+pub fn step_down<K>(
+    privilege: Privilege,
     integrity: impl FnOnce() -> anyhow::Result<Integrity>,
     make: impl FnOnce() -> anyhow::Result<K>,
 ) -> anyhow::Result<Option<K>> {
-    match integrity().context("read this process's integrity level")? {
-        Integrity::High => make().map(Some),
-        Integrity::Medium => Ok(None),
+    match privilege {
+        Privilege::Account => Ok(None),
+        Privilege::Unelevated => match integrity().context("read this process's integrity level")? {
+            Integrity::High => make().map(Some),
+            Integrity::Medium => Ok(None),
+        },
     }
-}
-
-/// [`unelevated_if_high`] for this process: the production maker of both the agent and the shim.
-pub fn unelevated_token() -> anyhow::Result<Option<UnelevatedToken>> {
-    unelevated_if_high(integrity, UnelevatedToken::of_this_process)
 }
 
 #[cfg(test)]

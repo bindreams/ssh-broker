@@ -657,11 +657,11 @@ type ExecStarter = fn(&str, Option<&Path>, Option<&UnelevatedToken>) -> Result<E
 #[cfg(windows)]
 type Splitter = fn(socket2::Socket) -> Result<(ConnRx, ConnTx), (afunix::Whole, anyhow::Error)>;
 
-/// How a session that asked to be unelevated gets the token its shell runs with: `None` when the agent is
-/// below High, where the session is unelevated anyway (see [`crate::account::unelevated_if_high`]); a
-/// parameter so a test can force a failure.
+/// How a session gets the token its shell runs with, given the login's privilege: `None` for an account's
+/// own login, and for one that asked to be unelevated when the agent is below High, where the session is
+/// unelevated anyway (see [`crate::account::step_down`]); a parameter so a test can force a failure.
 #[cfg(windows)]
-type UnelevatedMaker = fn() -> anyhow::Result<Option<UnelevatedToken>>;
+type UnelevatedMaker = fn(Privilege) -> anyhow::Result<Option<UnelevatedToken>>;
 
 /// What a test can replace or observe in a session; production uses [`Hooks::production`].
 #[cfg(windows)]
@@ -698,7 +698,7 @@ impl Hooks {
     fn production() -> Self {
         Self {
             make_watcher: HangupWatcher::new,
-            make_unelevated: crate::account::unelevated_token,
+            make_unelevated: UnelevatedToken::for_privilege,
             start_pty: PtySession::spawn,
             start_exec: ExecChild::spawn,
             shell_host: Box::new(crate::shell::WindowsHost),
@@ -789,21 +789,18 @@ fn handle_connection_in(conn: socket2::Socket, hooks: Hooks, control: &Control) 
     // Once, before anything is started, and given to every start of the session: the line, and the
     // `console-fallback` verb, whose child inherits it. A session that asked for it and cannot have it is
     // refused, not given the agent's own token.
-    let unelevated = match hs.privilege {
-        Privilege::Account => None,
-        Privilege::Unelevated => match (hooks.make_unelevated)() {
-            Ok(token) => token,
-            Err(cause) => {
-                return Err(logout::fail_connection(
-                    &mut rx,
-                    &mut tx,
-                    control,
-                    "the agent could not prepare an unelevated session",
-                    cause,
-                    logout::FAILED_EXIT_CODE,
-                ));
-            }
-        },
+    let unelevated = match (hooks.make_unelevated)(hs.privilege) {
+        Ok(token) => token,
+        Err(cause) => {
+            return Err(logout::fail_connection(
+                &mut rx,
+                &mut tx,
+                control,
+                "the agent could not prepare an unelevated session",
+                cause,
+                logout::FAILED_EXIT_CODE,
+            ));
+        }
     };
     let cwd_buf = child_cwd(&hs.cwd, home_dir());
     let cwd = cwd_buf.as_deref();

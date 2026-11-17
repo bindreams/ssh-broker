@@ -311,15 +311,8 @@ fn exec(command: &str, terminal: bool) -> Option<Exec> {
     })
 }
 
-fn account(exec: Option<Exec>) -> Login {
-    Login {
-        exec,
-        privilege: Privilege::Account,
-    }
-}
-
 /// The maker of the unelevated token of a process that has none to make; the type is a stand-in.
-fn no_token() -> anyhow::Result<Option<()>> {
+fn no_token(_: Privilege) -> anyhow::Result<Option<()>> {
     Ok(None)
 }
 
@@ -329,7 +322,7 @@ fn failed_open(host: &TestHost, exec: &Option<Exec>, code: Result<i32, &str>) ->
     let mut line = None;
     let got = fail_open(
         host,
-        &account(exec.clone()),
+        &Login::account(exec.clone()),
         &mut stderr,
         no_token,
         |l, _| {
@@ -376,7 +369,7 @@ fn the_fallback_warning_is_said_once_and_the_child_runs_once() {
         let mut stderr = Vec::new();
         fail_open(
             &host,
-            &account(exec),
+            &Login::account(exec),
             &mut stderr,
             no_token,
             |_line, _| {
@@ -415,7 +408,7 @@ fn a_warning_is_written_before_the_run_closure_is_called() {
     let host = TestHost::new().with_user_config("shell: nonesuch.exe\n");
     fail_open(
         &host,
-        &account(None),
+        &Login::account(None),
         &mut Spy(&events),
         no_token,
         |_, _| {
@@ -922,7 +915,7 @@ fn fail_open_runs_cmd_exe_and_warns_when_the_shell_exists_and_cannot_start() {
         let mut tried = Vec::new();
         let code = fail_open(
             &host,
-            &account(exec.clone()),
+            &Login::account(exec.clone()),
             &mut stderr,
             no_token,
             |line, _| {
@@ -988,7 +981,7 @@ fn fail_open_does_not_run_a_command_again_when_the_run_failed_after_the_shell_st
         let mut started = Vec::new();
         let code = fail_open(
             &host,
-            &account(exec.clone()),
+            &Login::account(exec.clone()),
             &mut stderr,
             no_token,
             |line, _| {
@@ -1018,13 +1011,6 @@ fn fail_open_exits_255_and_says_why_when_the_system_directory_is_missing() {
 
 // ── fail_open and the word ────────────────────────────────────────────────────────
 
-fn unelevated(exec: Option<Exec>) -> Login {
-    Login {
-        exec,
-        privilege: Privilege::Unelevated,
-    }
-}
-
 #[test]
 fn an_unelevated_login_that_cannot_be_stepped_down_gets_a_message_and_255_and_no_shell() {
     let host = pwsh_host();
@@ -1032,9 +1018,9 @@ fn an_unelevated_login_that_cannot_be_stepped_down_gets_a_message_and_255_and_no
         let mut stderr = Vec::new();
         let code = fail_open(
             &host,
-            &unelevated(exec.clone()),
+            &Login::unelevated(exec.clone()),
             &mut stderr,
-            || -> anyhow::Result<Option<()>> { Err(anyhow::anyhow!("the token cannot be made")) },
+            |_| -> anyhow::Result<Option<()>> { Err(anyhow::anyhow!("the token cannot be made")) },
             |_, _| -> Result<(), StartError> { panic!("a shell was started for a login that asked to be unelevated") },
             |()| panic!("nothing was started, so nothing is waited for"),
         );
@@ -1056,9 +1042,9 @@ fn an_unelevated_login_starts_every_line_it_tries_with_the_token() {
     let mut seen = Vec::new();
     let code = fail_open(
         &host,
-        &unelevated(exec("echo hi", false)),
+        &Login::unelevated(exec("echo hi", false)),
         &mut stderr,
-        || Ok(Some(7u32)),
+        |_| Ok(Some(7u32)),
         |line, token| {
             seen.push((line.contains("pwsh.exe"), token.copied()));
             if line.contains("pwsh.exe") {
@@ -1079,9 +1065,9 @@ fn an_unelevated_login_of_a_process_below_high_starts_as_any_login_does() {
     let mut seen = Vec::new();
     let code = fail_open(
         &host,
-        &unelevated(exec("echo hi", false)),
+        &Login::unelevated(exec("echo hi", false)),
         &mut Vec::new(),
-        || Ok(None::<u32>),
+        |_| Ok(None::<u32>),
         |_, token| {
             seen.push(token.copied());
             Ok(())
@@ -1092,21 +1078,28 @@ fn an_unelevated_login_of_a_process_below_high_starts_as_any_login_does() {
     assert_eq!(seen, [None]);
 }
 
+/// The shim does not decide who is stepped down: it hands the login's privilege to the one rule
+/// ([`crate::account::step_down`]) and starts with what comes back.
 #[test]
-fn an_account_login_never_asks_for_a_token() {
+fn fail_open_asks_for_the_token_once_with_the_privilege_of_the_login() {
     let host = pwsh_host();
-    let mut seen = Vec::new();
-    let code = fail_open(
-        &host,
-        &account(exec("echo hi", false)),
-        &mut Vec::new(),
-        || -> anyhow::Result<Option<u32>> { panic!("an account login made a token") },
-        |_, token| {
-            seen.push(token.copied());
-            Ok(())
-        },
-        |()| Ok(0),
-    );
-    assert_eq!(code, 0);
-    assert_eq!(seen, [None]);
+    for (login, privilege) in [
+        (Login::account(exec("echo hi", false)), Privilege::Account),
+        (Login::unelevated(exec("echo hi", false)), Privilege::Unelevated),
+    ] {
+        let mut asked = Vec::new();
+        let code = fail_open(
+            &host,
+            &login,
+            &mut Vec::new(),
+            |privilege| {
+                asked.push(privilege);
+                Ok(None::<u32>)
+            },
+            |_, _| Ok(()),
+            |()| Ok(0),
+        );
+        assert_eq!(code, 0);
+        assert_eq!(asked, [privilege]);
+    }
 }

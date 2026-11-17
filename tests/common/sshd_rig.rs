@@ -128,12 +128,17 @@ fn administrators_authorized_keys() -> PathBuf {
         .join("administrators_authorized_keys")
 }
 
+/// A number no other login of this test process has: what keeps the files of two logins of one account apart.
+fn next_login_number() -> u32 {
+    static LOGINS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    LOGINS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// A key pair for `account`, the public half installed where sshd reads it: the account's profile, or for an
 /// administrator ([`Account::make_administrator`] first) the administrators' file, appended to. With
 /// `forced_command` the key carries `command="..."`, as a key that forces a command does.
 pub fn install_key(account: &Account, forced_command: Option<&str>) -> Keys {
-    static KEYS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-    let n = KEYS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let n = next_login_number();
     let dir = TempDir(std::env::temp_dir().join(format!("sb-sshkey-{}-{}-{n}", account.name, std::process::id())));
     let _ = std::fs::remove_dir_all(&dir.0);
     std::fs::create_dir_all(&dir.0).unwrap();
@@ -189,8 +194,14 @@ pub fn admit(account: &Account) {
         let (ok, text) = run("net", &["localgroup", SSH_GROUP, "/add"]);
         assert!(ok, "create the group {SSH_GROUP}: {text}");
     }
+    // A second login of the same account finds it a member already (system error 1378), which is what
+    // this step is for.
     let (ok, text) = run("net", &["localgroup", SSH_GROUP, &account.name, "/add"]);
-    assert!(ok, "add {} to {SSH_GROUP}: {text}", account.name);
+    assert!(
+        ok || text.contains("1378"),
+        "add {} to {SSH_GROUP}: {text}",
+        account.name
+    );
     // "already been started" (2182) is fine; whether it runs is what `sc query` says.
     let _ = run("net", &["start", "sshd"]);
     let (_, state) = run("sc", &["query", "sshd"]);
@@ -371,7 +382,7 @@ impl<'a> Login<'a> {
         Login {
             account,
             keys: install_key(account, forced_command),
-            stderr_path: kit.path(&format!("ssh-stderr-{}.txt", account.name)),
+            stderr_path: kit.path(&format!("ssh-stderr-{}-{}.txt", account.name, next_login_number())),
         }
     }
 

@@ -15,22 +15,6 @@ fn exec(command: &str) -> Exec {
     }
 }
 
-/// The login of an account's own session, with `exec` as its command.
-fn account(exec: Option<Exec>) -> Login {
-    Login {
-        exec,
-        privilege: Privilege::Account,
-    }
-}
-
-/// A login that said `internal-unelevated`, with `exec` as its command.
-fn unelevated(exec: Option<Exec>) -> Login {
-    Login {
-        exec,
-        privilege: Privilege::Unelevated,
-    }
-}
-
 /// A command with a terminal: what `ssh -t host cmd` sends.
 fn exec_with_terminal(command: &str) -> Exec {
     Exec {
@@ -199,7 +183,7 @@ fn unresolvable_socket_location_fails_open_with_the_reason() {
     let mut stderr = Vec::new();
     let relayed = super::try_relay_at(
         &folder_of(Err(too_long())),
-        &account(Some(exec("echo hi"))),
+        &Login::account(Some(exec("echo hi"))),
         &mut stderr,
         None,
         std::io::empty(),
@@ -224,7 +208,7 @@ fn location_error_reaches_stderr_in_pty_mode() {
     let mut stderr = Vec::new();
     let relayed = super::try_relay_at(
         &folder_of(Err(too_long())),
-        &account(None),
+        &Login::account(None),
         &mut stderr,
         None,
         std::io::empty(),
@@ -254,7 +238,7 @@ fn connect_failure_in_the_callers_own_dir_fails_open_without_a_reason_on_stderr(
     let mut stderr = Vec::new();
     let relayed = super::try_relay_at(
         &folder_of(Ok(location)),
-        &account(Some(exec("echo hi"))),
+        &Login::account(Some(exec("echo hi"))),
         &mut stderr,
         None,
         std::io::empty(),
@@ -280,7 +264,7 @@ fn connect_failure_in_pty_mode_writes_nothing_to_stderr() {
     let mut stderr = Vec::new();
     let relayed = super::try_relay_at(
         &folder_of(Ok(location)),
-        &account(None),
+        &Login::account(None),
         &mut stderr,
         None,
         std::io::empty(),
@@ -331,7 +315,7 @@ fn try_relay_connects_to_the_location_its_provider_names() {
     let agent = fake_agent_exiting_with(listener, 7);
 
     let relayed = super::try_relay(
-        &account(Some(exec("echo hi"))),
+        &Login::account(Some(exec("echo hi"))),
         &folder_of(Ok(location)),
         None,
         std::io::empty(),
@@ -358,7 +342,7 @@ fn a_failed_log_is_named_where_the_shim_already_explains_a_fallback_for_a_comman
     let cause = "the folder belongs to someone else";
     let relayed = super::try_relay_at(
         &folder_of(Ok(location)),
-        &account(Some(exec("echo hi"))),
+        &Login::account(Some(exec("echo hi"))),
         &mut stderr,
         Some(cause),
         std::io::empty(),
@@ -383,7 +367,7 @@ fn a_failed_log_adds_nothing_to_an_interactive_fallback_that_prints_nothing_toda
     let mut stderr = Vec::new();
     let relayed = super::try_relay_at(
         &folder_of(Ok(location)),
-        &account(None),
+        &Login::account(None),
         &mut stderr,
         Some("no log"),
         std::io::empty(),
@@ -411,7 +395,7 @@ fn a_failed_log_does_not_touch_the_stderr_of_a_relayed_command() {
 
     let relayed = super::try_relay_at(
         &folder_of(Ok(location)),
-        &account(Some(exec("echo hi"))),
+        &Login::account(Some(exec("echo hi"))),
         &mut stderr,
         Some("no log"),
         std::io::empty(),
@@ -472,7 +456,7 @@ fn a_rescue_is_asked_when_the_connect_fails_and_its_line_comes_before_the_fallba
     let mut stderr = Vec::new();
     let relayed = super::try_relay_at(
         &folder_of(Ok(location)),
-        &account(Some(exec("echo hi"))),
+        &Login::account(Some(exec("echo hi"))),
         &mut stderr,
         None,
         std::io::empty(),
@@ -494,7 +478,7 @@ fn a_rescue_is_shown_a_location_error_and_the_fallback_message_stays() {
     let mut stderr = Vec::new();
     let relayed = super::try_relay_at(
         &folder_of(Err(crate::userdir::NoProfile.into())),
-        &account(None),
+        &Login::account(None),
         &mut stderr,
         None,
         std::io::empty(),
@@ -528,7 +512,7 @@ fn a_rescue_is_not_asked_when_the_connect_succeeds() {
 
     let relayed = super::try_relay_at(
         &folder_of(Ok(location)),
-        &account(Some(exec("echo hi"))),
+        &Login::account(Some(exec("echo hi"))),
         &mut Vec::new(),
         None,
         std::io::empty(),
@@ -557,7 +541,7 @@ fn a_rescue_that_connects_gets_the_session_relayed_through_its_connection() {
 
     let relayed = super::try_relay_at(
         &folder_of(Ok(nowhere)),
-        &account(Some(exec("echo hi"))),
+        &Login::account(Some(exec("echo hi"))),
         &mut Vec::new(),
         None,
         std::io::empty(),
@@ -576,7 +560,7 @@ fn a_rescue_that_finds_the_input_gone_ends_the_shim_with_255_and_runs_nothing() 
     let mut stderr = Vec::new();
     let relayed = super::try_relay_at(
         &folder_of(Ok(location)),
-        &account(None),
+        &Login::account(None),
         &mut stderr,
         None,
         std::io::empty(),
@@ -640,7 +624,7 @@ fn a_command_whose_connection_ends_before_the_agent_answers_says_it_may_have_run
 
         let relayed = super::try_relay_at(
             &folder_of(Ok(location)),
-            &account(Some(exec("echo hi"))),
+            &Login::account(Some(exec("echo hi"))),
             &mut stderr,
             None,
             std::io::empty(),
@@ -694,7 +678,7 @@ fn a_command_is_never_sent_to_an_agent_a_second_time() {
 
     let relayed = super::try_relay_at(
         &folder_of(Ok(location)),
-        &account(Some(exec("echo hi"))),
+        &Login::account(Some(exec("echo hi"))),
         &mut Vec::new(),
         None,
         std::io::empty(),
@@ -722,7 +706,7 @@ fn an_interactive_session_whose_connection_ends_before_the_agent_answers_takes_t
 
     let relayed = super::try_relay_with(
         &folder_of(Ok(location)),
-        &account(None),
+        &Login::account(None),
         &mut stderr,
         None,
         std::io::empty(),
@@ -761,7 +745,7 @@ fn an_interactive_session_goes_round_again_to_an_agent_that_answers_the_second_t
 
     let relayed = super::try_relay_with(
         &folder_of(Ok(location)),
-        &account(None),
+        &Login::account(None),
         &mut Vec::new(),
         None,
         std::io::empty(),
@@ -823,7 +807,7 @@ fn a_second_connection_that_ends_without_a_byte_is_a_protocol_violation_not_a_re
 
     let relayed = super::try_relay_with(
         &folder_of(Ok(location)),
-        &account(None),
+        &Login::account(None),
         &mut stderr,
         None,
         std::io::empty(),
@@ -875,7 +859,7 @@ fn a_folder_that_was_missing_at_the_first_act_is_connected_through_when_it_appea
 
     let relayed = super::try_relay_with(
         &folder,
-        &account(None),
+        &Login::account(None),
         &mut stderr,
         None,
         std::io::empty(),
@@ -927,7 +911,7 @@ fn a_no_byte_close_before_and_after_a_connect_that_failed_are_not_consecutive() 
 
     let relayed = super::try_relay_with(
         &folder_of(Ok(location)),
-        &account(None),
+        &Login::account(None),
         &mut Vec::new(),
         None,
         std::io::empty(),
@@ -962,7 +946,7 @@ fn a_command_with_a_console_relays_as_a_pty_session_with_the_command() {
 
     let relayed = super::try_relay_with(
         &folder_of(Ok(location)),
-        &account(Some(exec_with_terminal("echo  hi"))),
+        &Login::account(Some(exec_with_terminal("echo  hi"))),
         &mut Vec::new(),
         None,
         std::io::empty(),
@@ -992,7 +976,7 @@ fn a_command_without_a_terminal_does_not_take_the_console_relay() {
 
     let relayed = super::try_relay_with(
         &folder_of(Ok(location)),
-        &account(Some(exec("echo hi"))),
+        &Login::account(Some(exec("echo hi"))),
         &mut Vec::new(),
         None,
         std::io::empty(),
@@ -1008,8 +992,8 @@ fn a_command_without_a_terminal_does_not_take_the_console_relay() {
 #[test]
 fn a_command_that_said_the_word_asks_the_agent_for_an_unelevated_session() {
     for (tag, login, privilege) in [
-        ("wx", unelevated(Some(exec("whoami"))), Privilege::Unelevated),
-        ("nwx", account(Some(exec("whoami"))), Privilege::Account),
+        ("wx", Login::unelevated(Some(exec("whoami"))), Privilege::Unelevated),
+        ("nwx", Login::account(Some(exec("whoami"))), Privilege::Account),
     ] {
         let (_profile, location, listener) = location_with_listener(tag);
         let agent = fake_agent_exiting_with(listener, 0);
@@ -1036,8 +1020,8 @@ fn a_login_that_said_the_word_reaches_the_console_relay_as_unelevated() {
     use crate::relay::Outcome;
     use crate::shim::Pumped;
     for (tag, login) in [
-        ("wl", unelevated(None)),
-        ("wtc", unelevated(Some(exec_with_terminal("whoami")))),
+        ("wl", Login::unelevated(None)),
+        ("wtc", Login::unelevated(Some(exec_with_terminal("whoami")))),
     ] {
         let (_profile, location, _listener) = location_with_listener(tag);
         let mut asked = Vec::new();
@@ -1073,7 +1057,7 @@ fn an_unanswered_terminal_command_is_not_sent_again() {
 
     let relayed = super::try_relay_with(
         &folder_of(Ok(location)),
-        &account(Some(exec_with_terminal("echo hi"))),
+        &Login::account(Some(exec_with_terminal("echo hi"))),
         &mut stderr,
         None,
         std::io::empty(),
@@ -1209,7 +1193,7 @@ fn a_shim_with_a_terminal_whose_folder_is_refused_does_not_connect_and_prints_th
 
     let relayed = super::try_relay_at(
         &folder,
-        &account(None),
+        &Login::account(None),
         &mut stderr,
         None,
         std::io::empty(),
@@ -1238,7 +1222,7 @@ fn a_shim_with_a_command_whose_folder_is_refused_does_not_connect_and_says_why_o
 
     let relayed = super::try_relay_at(
         &folder,
-        &account(Some(exec("echo hi"))),
+        &Login::account(Some(exec("echo hi"))),
         &mut stderr,
         Some(&log_failure),
         std::io::empty(),
@@ -1271,7 +1255,7 @@ fn a_shim_with_a_command_whose_folder_is_refused_on_a_later_look_names_that_refu
 
     let relayed = super::try_relay_at(
         &folder,
-        &account(Some(exec("echo hi"))),
+        &Login::account(Some(exec("echo hi"))),
         &mut stderr,
         Some(&log_failure),
         std::io::empty(),
@@ -1298,7 +1282,7 @@ fn a_shim_whose_folder_is_held_open_by_another_program_says_so_and_does_not_conn
 
     let relayed = super::try_relay_at(
         &folder,
-        &account(None),
+        &Login::account(None),
         &mut stderr,
         None,
         std::io::empty(),

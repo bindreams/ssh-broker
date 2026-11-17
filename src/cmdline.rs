@@ -66,42 +66,73 @@ pub struct Login {
     pub privilege: Privilege,
 }
 
+impl Login {
+    /// The login of the account's own session, with `exec` as its command.
+    pub fn account(exec: Option<Exec>) -> Self {
+        Self {
+            exec,
+            privilege: Privilege::Account,
+        }
+    }
+
+    /// A login that said [`RESERVED_UNELEVATED`], with `exec` as its command.
+    pub fn unelevated(exec: Option<Exec>) -> Self {
+        Self {
+            exec,
+            privilege: Privilege::Unelevated,
+        }
+    }
+}
+
+/// What a command says about [`RESERVED_UNELEVATED`], by the one rule: the exact, case-sensitive word at the
+/// start, then the end, or one space or tab and the rest as written.
+enum Reserved<'a> {
+    /// The command is the word and nothing else.
+    Alone,
+    /// The word, one separator, and the rest (which may be blank).
+    Then(&'a str),
+}
+
+fn reserved(command: &str) -> Option<Reserved<'_>> {
+    let rest = command.strip_prefix(RESERVED_UNELEVATED)?;
+    if rest.is_empty() {
+        return Some(Reserved::Alone);
+    }
+    rest.strip_prefix(SEPARATORS).map(Reserved::Then)
+}
+
 /// The login `exec` is, once the reserved word has been looked for. `original_command` is
 /// `SSH_ORIGINAL_COMMAND` when sshd set it: the client's own command, byte for byte, when the word was forced
-/// on a key or in a `Match` block, so that the client sent none of the word.
+/// on a key or in a `Match` block. That command is the client's own, so it may itself say the word.
 ///
-/// The word is matched exactly and case-sensitively, at the start of the command:
+/// The word is matched exactly and case-sensitively, at the start of the command, on the command as the shim
+/// received it. With a terminal (`ssh -t`) that is the console host's rewriting of what the client sent
+/// (measured: quotes dropped, a tab become a space), so blanks around the word may not survive it.
 ///
-/// - the whole command is the word: [`Privilege::Unelevated`], and the command is `original_command`, with
-///   `exec`'s terminal, or none (a login);
+/// - the whole command is the word: [`Privilege::Unelevated`], and the command is `original_command` read by
+///   this same rule once (the word alone is a login; the word and a rest is the rest; anything else is as
+///   written), with `exec`'s terminal, or none (a login). A rest that again starts with the word is an
+///   ordinary command;
 /// - the word, then one space or tab: [`Privilege::Unelevated`], and the command is the rest as written. If
 ///   that is blank it is a blank command (exit 0, [`crate::shim::is_blank_command`]), not a login;
 /// - anything else, a longer word, a leading blank or another case included: [`Privilege::Account`], and
 ///   the command is untouched.
 pub fn read_login(exec: Option<Exec>, original_command: Option<String>) -> Login {
     let Some(exec) = exec else {
-        return Login {
-            exec: None,
-            privilege: Privilege::Account,
-        };
+        return Login::account(None);
     };
     let terminal = exec.terminal;
-    let unelevated = |command: Option<String>| Login {
-        exec: command.map(|command| Exec { command, terminal }),
-        privilege: Privilege::Unelevated,
-    };
-    if exec.command == RESERVED_UNELEVATED {
-        return unelevated(original_command);
-    }
-    match exec
-        .command
-        .strip_prefix(RESERVED_UNELEVATED)
-        .and_then(|rest| rest.strip_prefix(SEPARATORS))
-    {
-        Some(rest) => unelevated(Some(rest.to_owned())),
-        None => Login {
-            exec: Some(exec),
-            privilege: Privilege::Account,
+    let unelevated = |command: Option<String>| Login::unelevated(command.map(|command| Exec { command, terminal }));
+    match reserved(&exec.command) {
+        None => Login::account(Some(exec)),
+        Some(Reserved::Then(rest)) => unelevated(Some(rest.to_owned())),
+        Some(Reserved::Alone) => match original_command {
+            None => unelevated(None),
+            Some(original) => match reserved(&original) {
+                Some(Reserved::Alone) => unelevated(None),
+                Some(Reserved::Then(rest)) => unelevated(Some(rest.to_owned())),
+                None => unelevated(Some(original)),
+            },
         },
     }
 }

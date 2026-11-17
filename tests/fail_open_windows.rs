@@ -240,27 +240,44 @@ fn word_line(command: &str) -> String {
     sshd_encoder::escaped_line(env!("CARGO_BIN_EXE_ssh-broker"), command)
 }
 
-/// The word and a command fail open with the command after the word, as written, and not the word:
-/// the shell never sees it. The probe records the line it was started with. A leading blank, a longer word
-/// and another case are not the word: the whole command goes to the shell.
+/// The line the probe is started with when the shim fail-opens on `sent` (with the word or without), and the
+/// probe's path. The path is the same in every run of one test, so the lines of two runs compare.
+fn probe_line_for(sent: &str) -> (String, String) {
+    let home = Home::probe_shell("sb-failopen-word");
+    let out = run_shim_child(&word_line(sent), &home);
+    assert_failed_open(&String::from_utf8_lossy(&out.stderr));
+    assert_eq!(out.status.code(), Some(0), "{sent:?}");
+    (home.recorded_line(), home.probe().to_str().unwrap().to_owned())
+}
+
+/// The word then a command runs exactly what the command alone runs: the shell never sees the word, and
+/// whatever the shell line does with the rest (it drops a command's leading blanks, as for any command)
+/// it does with this one.
 #[test]
-fn the_word_is_taken_off_the_front_of_a_command_and_only_the_word() {
+fn the_word_then_a_command_runs_what_the_command_alone_runs() {
+    for rest in ["echo  two  spaces", "\t echo hi", "  echo hi", "echo héllo ✓"] {
+        for separator in [" ", "\t"] {
+            let with_word = format!("internal-unelevated{separator}{rest}");
+            assert_eq!(
+                probe_line_for(&with_word).0,
+                probe_line_for(rest).0,
+                "{with_word:?} against {rest:?}"
+            );
+        }
+    }
+}
+
+/// A longer word, another case and a leading blank are not the word: the whole command goes to the shell
+/// (a leading blank goes, as for any command).
+#[test]
+fn what_is_not_the_word_is_run_whole() {
     for (sent, run) in [
-        ("internal-unelevated echo  two  spaces", "echo  two  spaces"),
-        ("internal-unelevated \t echo hi", "\t echo hi"),
         ("internal-unelevatedx echo hi", "internal-unelevatedx echo hi"),
         ("Internal-Unelevated echo hi", "Internal-Unelevated echo hi"),
-        (" internal-unelevated echo hi", " internal-unelevated echo hi"),
+        (" internal-unelevated echo hi", "internal-unelevated echo hi"),
     ] {
-        let home = Home::probe_shell("sb-failopen-word");
-        let out = run_shim_child(&word_line(sent), &home);
-        assert_failed_open(&String::from_utf8_lossy(&out.stderr));
-        assert_eq!(
-            home.recorded_line(),
-            join_args(&[home.probe().to_str().unwrap(), "-c", run]),
-            "{sent:?}"
-        );
-        assert_eq!(out.status.code(), Some(0), "{sent:?}");
+        let (line, probe) = probe_line_for(sent);
+        assert_eq!(line, join_args(&[probe.as_str(), "-c", run]), "{sent:?}");
     }
 }
 
@@ -284,7 +301,8 @@ fn the_bare_word_runs_the_command_sshd_kept_in_ssh_original_command() {
     }
 }
 
-/// The word and only blanks is a blank command: nothing runs and the shim exits 0, with no shell.
+/// The word and only blanks is a blank command: nothing runs and the shim exits 0, with no shell and no word on
+/// stderr. (The child is a libtest binary, so its stdout is not empty: it holds the harness's own banner.)
 #[test]
 fn the_word_then_blanks_runs_nothing_and_exits_zero() {
     for sent in [
@@ -296,7 +314,7 @@ fn the_word_then_blanks_runs_nothing_and_exits_zero() {
         let out = run_shim_child(&word_line(sent), &home);
         assert_eq!(out.status.code(), Some(0), "{sent:?}");
         assert!(
-            out.stdout.is_empty() && !home.ran(),
+            out.stderr.is_empty() && !home.ran(),
             "{sent:?} ran a shell.\nstdout: {}\nstderr: {}",
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr)
