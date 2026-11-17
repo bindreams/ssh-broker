@@ -386,7 +386,7 @@ fn a_backup_operators_account_gets_the_stated_limit_at_the_prompt_and_is_served_
     assert_eq!(
         plain,
         TokenShown::new("High", "absent"),
-        "sshd gave this account a token that is not High without Administrators: the plan's premise does not hold          on this machine, which is a finding to report, not a failure of the broker"
+        "sshd gave this account a token that is not High without Administrators: the plan's premise does not hold on this machine, which is a finding to report, not a failure of the broker"
     );
 
     // (b) The prompt, through the broker as the DefaultShell. The wait for the plain shell ends the same way
@@ -400,7 +400,7 @@ fn a_backup_operators_account_gets_the_stated_limit_at_the_prompt_and_is_served_
     let sentence = squeezed(&ssh_broker::offer::text::impersonate_right_missing(&account.name));
     assert!(
         shown.contains(&sentence),
-        "the shim did not say that this login cannot start an elevated session from a password: the stated limit          does not hold (an agent was started, or the logon failed for another reason). The session showed:
+        "the shim did not say that this login cannot start an elevated session from a password: the stated limit does not hold (an agent was started, or the logon failed for another reason). The session showed:
 {}",
         prompted.text()
     );
@@ -409,7 +409,7 @@ fn a_backup_operators_account_gets_the_stated_limit_at_the_prompt_and_is_served_
     let running = agents_of(&kit, &account);
     assert!(
         running.is_empty(),
-        "agents of the account run after the prompt said it could start none (pids {running:?}): the stated limit          does not hold"
+        "agents of the account run after the prompt said it could start none (pids {running:?}): the stated limit does not hold"
     );
 
     // (c) An agent of the account, started the way the prompt does it. Its level is read before anything waits
@@ -428,7 +428,7 @@ fn a_backup_operators_account_gets_the_stated_limit_at_the_prompt_and_is_served_
     assert_eq!(
         integrity_class(rid),
         account.integrity(),
-        "the agent started for the account runs at {rid:#x}, and the shim of its SSH login looks in the folder          for {:?}: the account's batch logon is not at the level sshd gives its logins, a finding to report",
+        "the agent started for the account runs at {rid:#x}, and the shim of its SSH login looks in the folder for {:?}: the account's batch logon is not at the level sshd gives its logins, a finding to report",
         account.integrity()
     );
     stand_in::wait_for_serving_marker(&account.socket_location(), started.process.0);
