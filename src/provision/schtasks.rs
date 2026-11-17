@@ -143,6 +143,16 @@ pub fn xml_is_disabled(query_xml: &str) -> bool {
         .any(|value| settings.contains(&format!("<enabled>{value}</enabled>")))
 }
 
+/// The run level a queried task XML states, as written (trimmed); `None` when it states none (the
+/// service leaves out `LeastPrivilege`, its default).
+pub fn xml_run_level(query_xml: &str) -> Option<String> {
+    // ASCII lowercasing keeps every byte offset, so the text is cut from the original.
+    let lower = query_xml.to_ascii_lowercase();
+    let start = lower.find("<runlevel>")? + "<runlevel>".len();
+    let end = start + lower[start..].find("</runlevel>")?;
+    Some(query_xml[start..end].trim().to_owned())
+}
+
 /// The `agent task` row of `verify`, from the query of the task's XML: `Ok(None)` if there is no
 /// such task, and the cause if the query could not be answered.
 pub fn agent_task_row(query: &anyhow::Result<Option<String>>) -> Check {
@@ -162,7 +172,10 @@ pub fn agent_task_row(query: &anyhow::Result<Option<String>>) -> Check {
          killed `apply` leaves it so. Run `apply` elevated to enable it"
             .to_string()
     } else {
-        format!("registered={registered} group_logon_task={group} run_level={RUN_LEVEL}")
+        let run_level = xml
+            .and_then(xml_run_level)
+            .map_or(String::new(), |level| format!(" run_level={level}"));
+        format!("registered={registered} group_logon_task={group}{run_level}")
     };
     Check::new("agent task", registered && group && !disabled, detail)
 }

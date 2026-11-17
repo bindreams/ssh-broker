@@ -33,8 +33,12 @@ pub fn requested_sddl(sid: &str) -> String {
 
 /// The task definition: a boot trigger, the account by SID with a stored password
 /// (`LogonType Password`), `LeastPrivilege`, and `exe agent --background --expect-user <sid>`. One
-/// agent per user. An administrator's agent that this logon leaves filtered refuses to start (see
-/// `agent_background`).
+/// agent per user.
+///
+/// The agent refuses an administrator's token below High (see `agent_background`), and `LeastPrivilege`
+/// would filter it. It does not here only because a batch logon with a stored password is not split by
+/// UAC whatever the run level (measured: such a task gave High with Administrators enabled under both
+/// run levels). If that stops holding, an administrator's agent from this task exits 68.
 pub fn task_xml(exe: &str, sid: &str) -> String {
     let exe = xml_escape(exe);
     let sid = xml_escape(sid);

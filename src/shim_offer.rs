@@ -46,10 +46,6 @@ pub enum Plan {
         absence: Absence,
         logon: LogonKind,
     },
-    /// The shim's own token is an administrator's with elevation removed: this account's agent serves
-    /// elevated logins only. [`text::FILTERED_SHIM_NOTICE`] on stderr, no offer (it would start an agent
-    /// that refuses), no wait for a starting agent, and the plain shell.
-    Filtered,
     /// The user's folder cannot be used (`cause` says what failed and, for a refusal, what to do), so
     /// no agent can serve it: `cause` on stderr (unless the log's failure already says it), no
     /// prompt, no agent started.
@@ -63,8 +59,9 @@ pub enum Plan {
 /// today's message alone, because the notice's first sentence would be false for it. A non-local
 /// account is not told to run a command it cannot use.
 ///
-/// `elevation` is the shim's own. A `Filtered` shim decides before anything else, [`Plan::Filtered`];
-/// a `Full` one signs on as a batch job, which keeps the token whole, and any other as today.
+/// `elevation` is the shim's own, and decides the logon of an offer: a `Full` one signs on as a batch
+/// job, which keeps the token whole, and any other as today. A `Filtered` shim never reaches this: its
+/// agent serves elevated logins only, so [`Prompting::rescue`] answers it before it asks what to do.
 ///
 /// `folder_refusal` is why the user's folder cannot be used, if it cannot (see [`Folder::refusal`]). It
 /// decides next: the account, the absence and the console do not change that an offer, a prompt or a
@@ -77,9 +74,10 @@ pub fn plan(
     folder_refusal: Option<&str>,
     elevation: Elevation,
 ) -> Plan {
-    if elevation == Elevation::Filtered {
-        return Plan::Filtered;
-    }
+    debug_assert!(
+        elevation != Elevation::Filtered,
+        "a filtered shim is answered by the rescue"
+    );
     if let Some(cause) = folder_refusal {
         return Plan::FolderRefused {
             cause: cause.to_owned(),
@@ -456,13 +454,6 @@ impl Prompting {
 
 impl Rescue for Prompting {
     fn rescue(&mut self, absent: &Absent<'_>, stderr: &mut dyn Write) -> Rescued {
-        let account = match account::current_account() {
-            Ok(account) => Some(account),
-            Err(e) => {
-                tracing::warn!("cannot tell who this is, so no session is offered: {e:#}");
-                None
-            }
-        };
         let elevation = match &self.elevation {
             Ok(elevation) => *elevation,
             Err(e) => {
@@ -470,17 +461,26 @@ impl Rescue for Prompting {
                 return Rescued::Plain;
             }
         };
+        // The shim's token is an administrator's with elevation removed, and this account's agent serves
+        // elevated logins only: the notice and the plain shell, with no offer (it would start an agent
+        // that refuses), no wait for a starting agent and no look at the folder.
+        if elevation == Elevation::Filtered {
+            let _ = writeln!(stderr, "{}", text::FILTERED_SHIM_NOTICE);
+            return Rescued::Plain;
+        }
+        let account = match account::current_account() {
+            Ok(account) => Some(account),
+            Err(e) => {
+                tracing::warn!("cannot tell who this is, so no session is offered: {e:#}");
+                None
+            }
+        };
         let location = absent.folder.location();
         let kind_of_absence = absence(absent.connect, location);
         // An agent that has made its socket and not yet called `listen()`, or that has started and not
         // yet made its socket, refuses the connect like no agent at all. It is waited for, never
-        // prompted over. A `Filtered` shim does not wait: the agent it would wait for does not serve it.
-        if let (Absence::NoAgent, Ok(location), None, false) = (
-            kind_of_absence,
-            location,
-            absent.folder.refusal(),
-            elevation == Elevation::Filtered,
-        ) {
+        // prompted over.
+        if let (Absence::NoAgent, Ok(location), None) = (kind_of_absence, location, absent.folder.refusal()) {
             match Sid::current_user().and_then(|user| {
                 await_starting_agent(location, &provision::canonical_exe(), &user, || {
                     listening(absent.folder.connect().map_err(folder_failure), location)
@@ -502,10 +502,6 @@ impl Rescue for Prompting {
             elevation,
         ) {
             Plan::Nothing => Rescued::Plain,
-            Plan::Filtered => {
-                let _ = writeln!(stderr, "{}", text::FILTERED_SHIM_NOTICE);
-                Rescued::Plain
-            }
             Plan::FolderRefused { cause } => {
                 if !absent.exec {
                     let _ = writeln!(stderr, "{}", text::folder_refused(&cause));
@@ -601,8 +597,9 @@ impl OfferIo for LiveIo {
 }
 
 /// What the offer says of a logon that Windows refused. An account that may not log on as a batch job
-/// (stated limit 5) is told so in the sentence `auto-login` uses, whatever else Windows says; any other
-/// refusal, and a refused interactive logon, is Windows' own text.
+/// (an administrator who may not gets no agent from the prompt) is told so in the sentence `auto-login`
+/// uses, whatever else Windows says; any other refusal, and a refused interactive logon, is Windows' own
+/// text.
 fn start_failure(logon: LogonKind, user: &str, failure: LogonFailure) -> StartFailure {
     if logon == LogonKind::Batch && failure.right_not_granted() {
         return StartFailure::NoBatchRight {

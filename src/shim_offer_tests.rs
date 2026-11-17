@@ -187,38 +187,6 @@ fn a_full_shim_without_a_console_gets_the_notice_as_before() {
 }
 
 #[test]
-fn a_filtered_shim_is_told_and_gets_the_plain_shell_whatever_else_is_true() {
-    for exec in [false, true] {
-        for console in [true, false] {
-            for absence in [Absence::NoAgent, Absence::NoProfileYet, Absence::Other] {
-                for account in [account(AccountKind::Local), account(AccountKind::NotLocal), None] {
-                    assert_eq!(
-                        plan(exec, console, absence, account, None, Elevation::Filtered),
-                        Plan::Filtered,
-                        "exec={exec} console={console} absence={absence:?}"
-                    );
-                }
-            }
-        }
-    }
-}
-
-#[test]
-fn a_filtered_shim_is_told_before_the_folder_is_judged() {
-    assert_eq!(
-        plan(
-            false,
-            true,
-            Absence::NoAgent,
-            account(AccountKind::Local),
-            Some(REFUSAL),
-            Elevation::Filtered
-        ),
-        Plan::Filtered
-    );
-}
-
-#[test]
 fn a_missing_batch_right_is_told_in_the_prompts_sentence_and_only_for_a_batch_logon() {
     let right = crate::logon::LogonFailure::from_win32(1385);
     let told = start_failure(LogonKind::Batch, "alice", right.clone());
@@ -339,6 +307,40 @@ fn the_rescue_of_a_filtered_shim_says_why_and_goes_on_in_the_plain_shell() {
         assert_eq!(
             String::from_utf8(shown).unwrap(),
             format!("{}\n", text::FILTERED_SHIM_NOTICE),
+            "exec={exec}"
+        );
+    }
+}
+
+/// The shim's elevation decides before the folder is judged: a filtered shim is told its own notice and
+/// not the folder's cause, whatever the session and whatever the folder.
+#[test]
+fn the_rescue_of_a_filtered_shim_is_told_before_the_folder_is_judged() {
+    let profile = TempProfile::new("rs-filtered-acl");
+    let location = profile.location();
+    crate::userdir::ensure_socket_dir(&location, &me()).unwrap();
+    widen(location.dir());
+    let folder = folder_at(location);
+    assert!(folder.refusal().is_some(), "control: this folder is refused");
+    let connect = folder.connect();
+    for exec in [false, true] {
+        let mut shown = Vec::new();
+        let rescued = Prompting::new(Ok(Elevation::Filtered)).rescue(
+            &Absent {
+                exec,
+                folder: &folder,
+                connect: &connect,
+            },
+            &mut shown,
+        );
+        assert!(matches!(rescued, Rescued::Plain), "exec={exec}");
+        assert_eq!(
+            String::from_utf8(shown).unwrap(),
+            format!(
+                "{}
+",
+                text::FILTERED_SHIM_NOTICE
+            ),
             "exec={exec}"
         );
     }

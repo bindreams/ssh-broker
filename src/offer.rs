@@ -52,8 +52,8 @@ pub enum StartFailure {
     Internal {
         reason: String,
     },
-    /// An administrator's account may not log on as a batch job, which the elevated session needs
-    /// (stated limit 5). `sentence` is the whole line for the user, without its line end.
+    /// An administrator's account may not log on as a batch job, which the elevated session needs, so
+    /// the prompt starts no agent for it. `sentence` is the whole line for the user, without its line end.
     NoBatchRight {
         sentence: String,
     },

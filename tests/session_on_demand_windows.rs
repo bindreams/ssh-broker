@@ -186,6 +186,32 @@ fn an_account_that_may_not_log_on_as_a_batch_job_gets_error_1385() {
     assert!(failure.right_not_granted(), "{failure:?}");
 }
 
+/// An over-long password is refused by the batch logon, before it looks up the account, with the same
+/// sentence `CreateProcessWithLogonW`'s refusal gets. Measured on `LogonUserW`: 257 units and up are
+/// answered 206, 256 is read as a wrong password (1326). It names an account that does not exist, so it
+/// changes nothing on the machine and runs anywhere.
+/// Covers `logon::batch_logon` and `LogonFailure::from_win32` (206).
+#[test]
+fn an_over_long_password_on_the_batch_logon_is_told_it_is_too_long() {
+    let nobody = LocalAccount {
+        name: "no-such-account-for-a-long-password".into(),
+        sid: "S-1-5-21-1-2-3-1".into(),
+        kind: AccountKind::Local,
+    };
+    let at_the_limit = logon::batch_logon(&nobody, &password::password(&"a".repeat(256)))
+        .err()
+        .expect("an unknown account cannot be logged on");
+    assert_eq!(
+        at_the_limit.code, 1326,
+        "control: 256 units are not too long: {at_the_limit:?}"
+    );
+    let failure = logon::batch_logon(&nobody, &password::password(&"a".repeat(257)))
+        .err()
+        .expect("an over-long password cannot be logged on");
+    assert_eq!(failure.code, 206, "{failure:?}");
+    assert_eq!(failure.reason, "the password is too long for Windows.");
+}
+
 /// The jobs of this test process, which every M3 case needs to be none: the case builds the caller's whole
 /// chain of jobs itself, and a job the runner put the test in (nextest puts each test in one without
 /// BREAKAWAY_OK, `cargo` puts what it runs in another, and the runner puts a step's processes in a third,

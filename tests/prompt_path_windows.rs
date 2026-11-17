@@ -250,7 +250,7 @@ fn a_standard_accounts_prompt_session_is_medium() {
 }
 
 /// Elevated (CI only). An administrator who may not log on as a batch job is told so, in the sentence
-/// `auto-login` uses, and gets the plain shell: stated limit 5.
+/// `auto-login` uses, and gets the plain shell: the prompt starts no agent for such an administrator.
 #[test]
 fn an_administrator_without_the_batch_right_is_told_and_gets_the_plain_shell() {
     let _machine = machine::shared();

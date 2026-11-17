@@ -130,10 +130,35 @@ fn agent_task_row_passes_for_the_group_task() {
     let row = agent_task_row(&Ok(Some(agent_task_xml(r"C:\x.exe"))));
     assert!(row.pass, "{}", row.detail);
     assert!(
-        row.detail.contains("HighestAvailable"),
-        "the row names the run level: {}",
+        row.detail.contains("run_level=HighestAvailable"),
+        "the row names the run level it read: {}",
         row.detail
     );
+}
+
+#[test]
+fn agent_task_row_prints_the_run_level_as_the_queried_xml_spells_it() {
+    let queried = agent_task_xml(r"C:\x.exe").replace(
+        "<RunLevel>HighestAvailable</RunLevel>",
+        "<RunLevel>\n  highestavailable \n</RunLevel>",
+    );
+    let row = agent_task_row(&Ok(Some(queried)));
+    assert!(row.pass, "{}", row.detail);
+    assert!(row.detail.contains("run_level=highestavailable"), "{}", row.detail);
+}
+
+#[test]
+fn xml_run_level_reads_the_level_and_finds_none_when_it_is_left_out() {
+    assert_eq!(
+        xml_run_level(&agent_task_xml(r"C:\x.exe")).as_deref(),
+        Some("HighestAvailable")
+    );
+    assert_eq!(
+        xml_run_level(&least_privilege_agent_task_xml()).as_deref(),
+        Some("LeastPrivilege")
+    );
+    let omitted = agent_task_xml(r"C:\x.exe").replace("    <RunLevel>HighestAvailable</RunLevel>\n", "");
+    assert_eq!(xml_run_level(&omitted), None);
 }
 
 /// The agent task as an earlier `apply` registered it.
@@ -185,6 +210,11 @@ fn agent_task_row_fails_when_the_task_is_not_registered() {
     let row = agent_task_row(&Ok(None));
     assert!(!row.pass);
     assert!(row.detail.contains("registered=false"), "{}", row.detail);
+    assert!(
+        !row.detail.contains("run_level"),
+        "there is no task to have a run level: {}",
+        row.detail
+    );
 }
 
 #[test]
