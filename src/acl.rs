@@ -126,8 +126,7 @@ impl Sid {
         let buf = crate::winutil::token_information(token, TokenUser).context("read the token's user")?;
         // SAFETY: a `TOKEN_USER` is a SID pointer and an integer.
         let user = unsafe { buf.header::<TOKEN_USER>() }.context("read the token's user")?;
-        // SAFETY: the SID is one the system put inside `buf`, which lives to the end of this function.
-        let sid = user.User.Sid;
+        let sid = buf.sid(user.User.Sid).context("read the token's user")?;
         Sid::from_psid(sid)
     }
 

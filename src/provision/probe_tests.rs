@@ -253,6 +253,7 @@ fn session_zero_unreadable_is_not() {
 }
 
 /// The logon type is read from LSA by the logon id of this process's own token, which needs no privilege.
+#[cfg(windows)]
 #[test]
 fn this_process_has_a_logon_type() {
     assert!(

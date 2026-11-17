@@ -9,7 +9,7 @@
 use crate::shell::StartError;
 use anyhow::Context;
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
-use windows::Win32::Security::{GetTokenInformation, TOKEN_INFORMATION_CLASS, TOKEN_QUERY};
+use windows::Win32::Security::{GetTokenInformation, PSID, TOKEN_INFORMATION_CLASS, TOKEN_QUERY};
 use windows::Win32::System::Console::HPCON;
 use windows::Win32::System::Diagnostics::Debug::{
     GetThreadErrorMode, SEM_FAILCRITICALERRORS, SetThreadErrorMode, THREAD_ERROR_MODE,
@@ -57,36 +57,21 @@ pub fn own_token() -> anyhow::Result<OwnedHandle> {
     Ok(OwnedHandle(token))
 }
 
-/// What `GetTokenInformation` returned: exactly those bytes, in storage aligned for the structures
-/// that hold pointers. The structure at the start often points into the same bytes, so read it
-/// through [`header`](Self::header) and [`array`](Self::array), which bound every read by
-/// [`len`](Self::len).
+/// What `GetTokenInformation` returned: exactly those bytes, in the storage the call filled, aligned
+/// for the structures that hold pointers. The pointers Windows writes into the data are absolute
+/// addresses of its own buffer, so the data is never copied or moved: the value owns the buffer and
+/// hands out reads of it. Read the structure at the start with [`header`](Self::header) and
+/// [`array`](Self::array), and follow a SID pointer in it only through [`sid`](Self::sid).
 pub struct TokenInformation {
     storage: Vec<u64>,
     len: usize,
 }
 
 impl TokenInformation {
-    fn from_bytes(bytes: &[u8]) -> TokenInformation {
-        let mut storage = vec![0u64; bytes.len().div_ceil(size_of::<u64>())];
-        for (word, chunk) in storage.iter_mut().zip(bytes.chunks(size_of::<u64>())) {
-            let mut padded = [0u8; size_of::<u64>()];
-            padded[..chunk.len()].copy_from_slice(chunk);
-            *word = u64::from_ne_bytes(padded);
-        }
-        TokenInformation {
-            storage,
-            len: bytes.len(),
-        }
-    }
-
     /// The bytes the call returned.
-    pub fn len(&self) -> usize {
+    #[cfg(test)]
+    fn len(&self) -> usize {
         self.len
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
     }
 
     fn start(&self) -> *const u8 {
@@ -94,7 +79,7 @@ impl TokenInformation {
     }
 
     /// The structure at the start of the data, copied out. An error when the data is shorter than `T`.
-    /// Pointers inside it point into `self`'s buffer and are valid while `self` lives.
+    /// A SID pointer inside it is followed only through [`sid`](Self::sid).
     ///
     /// # Safety
     /// Every bit pattern of `size_of::<T>()` bytes must be a valid `T`: plain integers, and raw
@@ -114,7 +99,8 @@ impl TokenInformation {
 
     /// `count` elements of `T` that start `offset` bytes into the data (for a `TOKEN_GROUPS`, the
     /// `offset_of!` its `Groups`). An error when `offset` does not suit `T` or the elements run
-    /// past [`len`](Self::len). The slice lives as long as `self`.
+    /// past the data. The slice lives as long as `self`. A SID pointer in an element is followed only
+    /// through [`sid`](Self::sid).
     ///
     /// # Safety
     /// As for [`header`](Self::header): every bit pattern of `T` must be valid.
@@ -137,6 +123,35 @@ impl TokenInformation {
         // and the caller promises every bit pattern is a `T`.
         Ok(unsafe { std::slice::from_raw_parts(self.start().add(offset).cast::<T>(), count) })
     }
+
+    /// `sid`, a SID pointer found in the data, once it is known to lie wholly inside the data: an
+    /// error unless it is non-null, its eight-byte header fits before the end, and so do all of its
+    /// sub-authorities. The result is valid while `self` lives, and is the only SID pointer from the
+    /// data that may be handed to a Windows call or read.
+    pub fn sid(&self, sid: PSID) -> anyhow::Result<PSID> {
+        /// The revision, the sub-authority count and the six-byte authority.
+        const SID_HEADER: usize = 8;
+        const SUB_AUTHORITY: usize = size_of::<u32>();
+        const COUNT_AT: usize = 1;
+
+        anyhow::ensure!(!sid.0.is_null(), "the token information holds a null SID");
+        let start = self.start() as usize;
+        let at = sid.0 as usize;
+        let room = (at >= start && at - start <= self.len)
+            .then(|| self.len - (at - start))
+            .context("the token information holds a SID outside itself")?;
+        anyhow::ensure!(
+            room >= SID_HEADER,
+            "the token information holds a SID whose header runs past its end"
+        );
+        // SAFETY: the header lies inside the initialised bytes (checked above); this reads one byte of it.
+        let count = usize::from(unsafe { sid.0.cast::<u8>().add(COUNT_AT).read() });
+        anyhow::ensure!(
+            SID_HEADER + count * SUB_AUTHORITY <= room,
+            "the token information holds a SID whose {count} sub-authorities run past its end"
+        );
+        Ok(sid)
+    }
 }
 
 /// `class` of `token`, which needs `TOKEN_QUERY`. Every error carries Windows' reason; a handle
@@ -153,12 +168,20 @@ pub fn token_information(token: HANDLE, class: TOKEN_INFORMATION_CLASS) -> anyho
             Ok(()) => anyhow::anyhow!("the token information size probe returned no length"),
         });
     }
-    let mut bytes = vec![0u8; len as usize];
-    // SAFETY: `bytes` holds `len` bytes, which is what the call is told.
-    unsafe { GetTokenInformation(token, class, Some(bytes.as_mut_ptr().cast()), len, &mut len) }
+    // Read straight into the storage the value keeps: Windows writes pointers into the buffer it is handed.
+    let mut storage = vec![0u64; (len as usize).div_ceil(size_of::<u64>())];
+    // SAFETY: the storage holds at least `len` bytes, which is what the call is told, and is 8-aligned.
+    unsafe { GetTokenInformation(token, class, Some(storage.as_mut_ptr().cast()), len, &mut len) }
         .context("GetTokenInformation")?;
-    bytes.truncate(len as usize);
-    Ok(TokenInformation::from_bytes(&bytes))
+    anyhow::ensure!(
+        len as usize <= storage.len() * size_of::<u64>(),
+        "GetTokenInformation returned {len} bytes into a buffer of {}",
+        storage.len() * size_of::<u64>()
+    );
+    Ok(TokenInformation {
+        storage,
+        len: len as usize,
+    })
 }
 
 /// While alive, a program that `CreateProcessW` cannot start (the wrong architecture, a file that is not

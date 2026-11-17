@@ -150,13 +150,6 @@ impl Drop for TextSid {
 }
 
 #[test]
-fn a_label_without_a_sid_is_an_error() {
-    // SAFETY: a null SID is the case the function refuses before it reads.
-    let err = unsafe { rid_of_label(windows::Win32::Security::PSID::default()) }.unwrap_err();
-    assert!(err.to_string().contains("no SID"), "{err:#}");
-}
-
-#[test]
 fn the_level_of_a_label_is_its_last_sub_authority() {
     let medium = TextSid::new("S-1-16-8192");
     // SAFETY: `medium` is a valid SID for the length of the call.
