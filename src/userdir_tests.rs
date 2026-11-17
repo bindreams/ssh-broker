@@ -427,3 +427,116 @@ fn a_link_at_any_level_is_refused_and_nothing_outside_is_made_or_changed() {
         assert_eq!(tree_state(&outside.0), before, "a junction at {link_at}");
     }
 }
+
+// The pin -----
+
+/// The OS error of renaming `from` to `to` in this process, or `None` if it worked.
+fn rename_error(from: &Path, to: &Path) -> Option<i32> {
+    std::fs::rename(from, to).err().map(|e| e.raw_os_error().unwrap_or(-1))
+}
+
+/// The folders of the walk, from the one nearest the profile directory.
+fn walked_folders(loc: &SocketLocation) -> [PathBuf; 4] {
+    let local = loc.dir().parent().unwrap().to_path_buf();
+    [
+        local.parent().unwrap().to_path_buf(),
+        local,
+        loc.dir().to_path_buf(),
+        loc.logs_dir(),
+    ]
+}
+
+/// While a walk's folders are held, none of them can be renamed or removed by anyone else: the path
+/// then names the folders held. Once they are dropped, they can.
+fn a_held_walk_pins_every_folder_of_it(tag: &str, walk: impl Fn(&SocketLocation, &Sid) -> anyhow::Result<SocketDir>) {
+    const SHARING_VIOLATION: i32 = 32;
+    let profile = TempProfile::new(tag);
+    let loc = profile.location();
+    ensure_socket_dir(&loc, &me()).unwrap();
+    let folders = walk(&loc, &me()).unwrap();
+
+    for folder in walked_folders(&loc) {
+        let aside = folder.with_file_name("aside");
+        let error = rename_error(&folder, &aside);
+        assert!(
+            error.is_some(),
+            "{} was renamed while the walk held it",
+            folder.display()
+        );
+        assert!(!aside.exists(), "{} moved", folder.display());
+    }
+    // The ones the walk opened itself are refused for sharing, which is what stops a swap.
+    for folder in &walked_folders(&loc)[1..] {
+        let aside = folder.with_file_name("aside");
+        assert_eq!(
+            rename_error(folder, &aside),
+            Some(SHARING_VIOLATION),
+            "{}",
+            folder.display()
+        );
+    }
+
+    drop(folders);
+    for folder in walked_folders(&loc).iter().rev() {
+        let aside = folder.with_file_name("aside");
+        assert_eq!(
+            rename_error(folder, &aside),
+            None,
+            "{} cannot be renamed once the walk lets go",
+            folder.display()
+        );
+        std::fs::rename(&aside, folder).unwrap();
+    }
+}
+
+#[test]
+fn a_held_making_walk_pins_every_folder_of_it() {
+    a_held_walk_pins_every_folder_of_it("pin-make", open_socket_dir);
+}
+
+#[test]
+fn a_held_looking_walk_pins_every_folder_of_it() {
+    a_held_walk_pins_every_folder_of_it("pin-look", inspect_socket_dir);
+}
+
+/// Open `dir` with delete access, as a program that is about to delete or rename it does, and
+/// share everything.
+fn hold_for_deletion(dir: &Path) -> std::fs::File {
+    use std::os::windows::fs::OpenOptionsExt;
+    const DELETE: u32 = 0x0001_0000;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    std::fs::OpenOptions::new()
+        .access_mode(DELETE)
+        .share_mode(7)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(dir)
+        .unwrap_or_else(|e| panic!("hold {} for deletion: {e}", dir.display()))
+}
+
+/// Stated limit 6: another program that holds `AppData` or `Local` open for deletion or renaming
+/// makes the walk refuse, in the words of the limit and with the folder named. It does not wait for
+/// the holder: the call returns while the holder still holds.
+#[test]
+fn a_folder_held_open_for_deletion_refuses_the_walk_with_the_limit_s_sentence() {
+    for (held, which) in [(0, "AppData"), (1, "Local")] {
+        for walk in [open_socket_dir, inspect_socket_dir] {
+            let profile = TempProfile::new("held");
+            let loc = profile.location();
+            let folder = walked_folders(&loc)[held].clone();
+            let holder = hold_for_deletion(&folder);
+
+            let err = walk(&loc, &me())
+                .err()
+                .unwrap_or_else(|| panic!("{which} was held and the walk went on"));
+
+            let text = format!("{err:#}");
+            assert!(err.root_cause().is::<acl::Refused>(), "{which}: {text}");
+            assert!(text.contains(&folder.display().to_string()), "{which}: {text}");
+            assert!(
+                text.contains("another program is deleting or renaming it"),
+                "{which}: {text}"
+            );
+            drop(holder);
+        }
+    }
+}

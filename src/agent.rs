@@ -70,6 +70,7 @@ use crate::route::{AgentArgs, BackgroundArgs};
 use crate::shell::StartError;
 #[cfg(windows)]
 use crate::socket_loc::SocketLocation;
+use crate::userdir::SocketDir;
 #[cfg(windows)]
 use crate::winutil::{OwnedHandle, UnelevatedToken};
 #[cfg(windows)]
@@ -146,7 +147,7 @@ fn start_with(
     reset: impl FnOnce() -> windows::core::Result<()>,
     locate: impl FnOnce() -> anyhow::Result<SocketLocation>,
     init_log: impl FnOnce(&crate::acl::DirHandle) -> anyhow::Result<tracing_appender::non_blocking::WorkerGuard>,
-    serve: impl FnOnce(&SocketLocation, u32) -> anyhow::Result<()>,
+    serve: impl FnOnce(&Arc<SocketDir>, u32) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     let reset_failure = reset()
         .err()
@@ -158,8 +159,12 @@ fn start_with(
     let refused = |refusal: Refusal, cause: anyhow::Error| anyhow::Error::new(refusal).context(format!("{cause:#}"));
     let location = locate().map_err(|e| refused(Refusal::NoSocketLocation, e))?;
     let user = crate::acl::Sid::current_user()?;
-    let folder =
-        crate::userdir::open_socket_dir(&location, &user).map_err(|e| refused(Refusal::SocketFolderRefused, e))?;
+    // Held to the end of the process: the folders it keeps cannot be renamed or removed meanwhile, so
+    // the paths the agent binds and is woken at name them. Shared with the waker, which connects
+    // through it.
+    let folder = Arc::new(
+        crate::userdir::open_socket_dir(&location, &user).map_err(|e| refused(Refusal::SocketFolderRefused, e))?,
+    );
     // Held to the end of the process and flushed by `end_process`, from whichever thread ends it:
     // dropping the guard stops the writer and later lines are lost. Until the log opens an error goes
     // to stderr, which a logon task discards; a hand-run agent shows it.
@@ -173,7 +178,7 @@ fn start_with(
             tracing::warn!("{message}");
         }
     }
-    let result = serve(&location, session);
+    let result = serve(&folder, session);
     if let Err(e) = &result {
         tracing::error!("the agent stopped: {e:#}");
     }
@@ -197,20 +202,20 @@ fn keep_log_or_report(
 
 /// Become the one agent that serves this user, then serve.
 #[cfg(windows)]
-fn serve(location: &SocketLocation, session: u32, background: bool) -> anyhow::Result<()> {
-    serve_in(location, session, |location| run_on(location, background))
+fn serve(folder: &Arc<SocketDir>, session: u32, background: bool) -> anyhow::Result<()> {
+    serve_in(folder, session, |folder| run_on(folder, background))
 }
 
 /// [`serve`] with the serving as a parameter, so a test can see that what the agent holds goes to
 /// [`hold_until_end`].
 #[cfg(windows)]
 fn serve_in(
-    location: &SocketLocation,
+    folder: &Arc<SocketDir>,
     session: u32,
-    run: impl FnOnce(&SocketLocation) -> anyhow::Result<()>,
+    run: impl FnOnce(&Arc<SocketDir>) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     serve_with(
-        location,
+        folder.location(),
         session,
         |path| {
             // One serving agent per user. A second session of the same user waits instead of
@@ -220,7 +225,7 @@ fn serve_in(
                 tracing::info!("waiting for the agent of another session of this user to end");
             })
         },
-        run,
+        |_| run(folder),
         hold_until_end,
     )
 }
@@ -255,17 +260,17 @@ fn serve_with(
 /// Bind the hardened socket and serve connections, one handler thread each. The caller holds
 /// the user's lock, so no other agent of this user binds meanwhile.
 #[cfg(windows)]
-fn run_on(location: &SocketLocation, background: bool) -> anyhow::Result<()> {
+fn run_on(folder: &Arc<SocketDir>, background: bool) -> anyhow::Result<()> {
     let connections = Connections::new();
     // Closing the listener wakes the blocked `accept` with a connection of its own; the loop then sees
     // the flag. A wake that fails is reported to the connections, which stop waiting for the loop.
-    let socket = location.path().to_path_buf();
+    let waker_folder = Arc::clone(folder);
     let waking = Arc::clone(&connections);
     let control = Arc::new(Control::new(background, Arc::clone(&connections)).with_waker(move || {
-        let socket = socket.clone();
-        wake_without_blocking(&waking, move || afunix::connect(&socket).map(drop))
+        let folder = Arc::clone(&waker_folder);
+        wake_without_blocking(&waking, move || folder.connect().map(drop))
     }));
-    run_on_with(location, Listener::bind, mark_listening, |listener| {
+    run_on_with(folder.location(), Listener::bind, mark_listening, |listener| {
         serve_until_drained(listener, &connections, &control)
     })
     .or_else(|err| match err.downcast_ref::<Stopped>() {

@@ -81,3 +81,14 @@ pub fn start_failed(reason: &str) -> String {
 pub fn folder_refused(cause: &str) -> String {
     format!("ssh-broker: no session is offered, because its folder cannot be used: {cause}")
 }
+
+/// Stated limit 6: another program holds a folder on the way to the user's private folder open for
+/// deleting or renaming it, and a walk that cannot hold the folder does not go on. It does not wait
+/// for the holder; the next login, once that program has let go, is brokered again.
+pub fn folder_held(folder: &std::path::Path) -> String {
+    format!(
+        "{} is held open: another program is deleting or renaming it, so ssh-broker cannot use it while that lasts. \
+         The next login, once that program has let go, is brokered again",
+        folder.display()
+    )
+}

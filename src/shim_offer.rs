@@ -27,7 +27,8 @@ use crate::password_entry::{Password, Step};
 use crate::provision::procwait;
 use crate::socket_loc::SocketLocation;
 use crate::socket_watch::SocketWatch;
-use crate::{afunix, provision, starting_agent};
+use crate::userdir::SocketDir;
+use crate::{provision, starting_agent};
 
 // plan -----
 
@@ -252,6 +253,82 @@ pub fn serve_after_own_agent<C>(
         Starting::Served(connected) => Served::Connected(connected),
         Starting::No | Starting::Gone => own,
     })
+}
+
+// the shim's folder -----
+
+/// What the shim's first walk to its folder found.
+enum Walk {
+    /// The folders, held: the shim connects through them and logs into them.
+    Open(Box<SocketDir>),
+    /// `AppData` or `Local` is not there, which a connect by path called no agent.
+    Missing(crate::acl::Missing),
+    /// The walk refused a folder, or could not go on (a sharing violation, a system error): no agent
+    /// serves a folder that check refuses, so the shim does not connect.
+    Refused(anyhow::Error),
+    /// There was no location or no account to walk with; the cause is the error.
+    Unwalked(anyhow::Error),
+}
+
+/// The shim's folder, from its first act to the end of the run: the location its token gives and the
+/// folders of the walk to it, held (so the location's path names them for as long as the shim runs).
+/// The shim connects to its agent only through this, and only when the private folder was accepted.
+pub(crate) struct Folder {
+    location: anyhow::Result<SocketLocation>,
+    walk: Walk,
+}
+
+impl Folder {
+    /// The folder of the account this process runs as.
+    pub fn of_current_user() -> Folder {
+        Folder::in_location(crate::userdir::current_socket_location(), Sid::current_user())
+    }
+
+    /// The folder at `location`, walked as `user`, with the private folder made if it is missing. An
+    /// account that cannot be told is logged, and nothing is walked.
+    pub fn in_location(location: anyhow::Result<SocketLocation>, user: anyhow::Result<Sid>) -> Folder {
+        let walk = match (&location, user) {
+            (Ok(location), Ok(user)) => match crate::userdir::open_socket_dir(location, &user) {
+                Ok(folders) => Walk::Open(Box::new(folders)),
+                Err(e) => match e.downcast_ref::<crate::acl::Missing>() {
+                    Some(missing) => Walk::Missing(missing.clone()),
+                    None => Walk::Refused(e),
+                },
+            },
+            (Err(e), _) => Walk::Unwalked(anyhow::anyhow!("{e:#}")),
+            (Ok(_), Err(e)) => {
+                tracing::warn!("cannot tell which account this is, so its folder is not walked: {e:#}");
+                Walk::Unwalked(e)
+            }
+        };
+        Folder { location, walk }
+    }
+
+    pub fn location(&self) -> &anyhow::Result<SocketLocation> {
+        &self.location
+    }
+
+    /// The folder the log goes into, or why there is none. A refused `logs` folder costs the log only.
+    pub fn logs(&self) -> anyhow::Result<&crate::acl::DirHandle> {
+        match &self.walk {
+            Walk::Open(folders) => folders.logs.as_ref().map_err(|e| anyhow::anyhow!("{e:#}")),
+            Walk::Missing(missing) => Err(missing.clone().into()),
+            Walk::Refused(e) | Walk::Unwalked(e) => Err(anyhow::anyhow!("{e:#}")),
+        }
+    }
+
+    /// Connect to the agent through the folders held. With no folder accepted there is nothing to
+    /// connect through: the error is the walk's, and for a missing folder it is [`is_no_agent`].
+    pub fn connect(&self) -> anyhow::Result<Socket> {
+        match &self.walk {
+            Walk::Open(folders) => folders.connect(),
+            Walk::Missing(missing) => Err(missing.clone().into()),
+            Walk::Refused(e) => Err(anyhow::anyhow!(
+                "not connecting through a folder that cannot be used: {e:#}"
+            )),
+            Walk::Unwalked(e) => Err(anyhow::anyhow!("nothing to connect through: {e:#}")),
+        }
+    }
 }
 
 // the shim's hook -----
@@ -513,9 +590,12 @@ fn settle(started: Started) -> Result<Socket, String> {
     let Started { agent } = started;
     let logs = || logs_dir(crate::userdir::current_socket_location());
     let failed = |e: anyhow::Error| text::start_failed(&format!("{e:#}"));
+    let user = Sid::current_user().map_err(failed)?;
     let watch = SocketWatch::for_current_user().map_err(failed)?;
+    // Each connect walks to the folder and holds it first: the profile may not have existed when the
+    // wait began, and the folders the agent makes are not the ones that were looked at before.
     let served =
-        wait_for_agent(watch, agent.process.0, |location| connect_if_listening(location.path())).map_err(failed)?;
+        wait_for_agent(watch, agent.process.0, |location| connect_if_listening(location, &user)).map_err(failed)?;
     let served = serve_after_own_agent(served, || {
         let location = crate::userdir::current_socket_location()?;
         let user = Sid::current_user()?;
@@ -543,15 +623,21 @@ fn logs_dir(location: anyhow::Result<SocketLocation>) -> Option<PathBuf> {
 
 // a starting agent -----
 
-/// Connect to the agent's socket. `Ok(None)` is "nobody listens there": the folder or the socket file
-/// is missing, or the file is there and `listen()` has not run (see [`is_no_agent`]). Any other
-/// failure (access denied, a path too long, a protocol error) is not a sign that an agent is starting
-/// and does not clear by waiting, so it is an error.
-fn connect_if_listening(path: &Path) -> anyhow::Result<Option<Socket>> {
-    match afunix::connect(path) {
+/// Walk to the user's folder as the agent does, making nothing, and connect through the folders held.
+/// `Ok(None)` is "nobody listens there": the folder or the socket file is missing, or the file is
+/// there and `listen()` has not run (see [`is_no_agent`]). Any other failure (a folder refused,
+/// access denied, a path too long, a protocol error) is not a sign that an agent is starting and
+/// does not clear by waiting, so it is an error. A refusal is a [`FolderFailed`].
+fn connect_if_listening(location: &SocketLocation, user: &Sid) -> anyhow::Result<Option<Socket>> {
+    let folders = match crate::userdir::inspect_socket_dir(location, user) {
+        Ok(folders) => folders,
+        Err(e) if e.is::<crate::acl::Missing>() => return Ok(None),
+        Err(e) => return Err(folder_failure(e)),
+    };
+    match folders.connect() {
         Ok(socket) => Ok(Some(socket)),
         Err(e) if is_no_agent(&e) => Ok(None),
-        Err(e) => Err(e.context(format!("connect to the agent's socket {}", path.display()))),
+        Err(e) => Err(e.context(format!("connect to the agent's socket {}", location.path().display()))),
     }
 }
 
@@ -646,7 +732,7 @@ fn await_starting_agent(location: &SocketLocation, image: &Path, user: &Sid) -> 
     let watch = RefCell::new(SocketWatch::for_location(location)?);
     let evidence = RefCell::new(Evidence::default());
     wait_while_starting(
-        || connect_if_listening(location.path()),
+        || connect_if_listening(location, user),
         || evidence.borrow_mut().look(location, image, user),
         || evidence.borrow_mut().wait(&watch.borrow()),
         || watch.borrow_mut().rearm(),

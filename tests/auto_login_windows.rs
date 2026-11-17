@@ -71,7 +71,7 @@ fn location(account: &Account) -> socket_loc::SocketLocation {
 fn with_session(kit: &Kit, account: &Account, check: impl FnOnce(&mut dyn FnMut() -> AgentConn)) {
     let location = location(account);
     stand_in::wait_for_serving_marker_of_a_task(&location, TASK_START_BOUND);
-    let connect = &mut || AgentConn::connect(&location);
+    let connect = &mut || AgentConn::connect(&location, &account.sid);
     check(connect);
     logout_with(kit, account);
 }
@@ -201,7 +201,7 @@ fn stored_task_for_an_administrator_starts_a_session() {
 
     autologin::on(&mut env(&kit, &account.password), &local).unwrap();
     stand_in::wait_for_serving_marker_of_a_task(&location(&account), TASK_START_BOUND);
-    let mut exec = AgentConn::connect(&location(&account));
+    let mut exec = AgentConn::connect(&location(&account), &account.sid);
     exec.start_exec("cmd.exe /c echo admin-session-up");
     exec.end_stdin();
     assert!(exec.read_to_end().stdout.contains("admin-session-up"));

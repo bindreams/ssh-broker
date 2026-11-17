@@ -493,8 +493,8 @@ fn a_folder_that_fails_with_a_system_error_after_it_was_judged_is_told_in_the_sa
 /// Why the log of a login cannot be set up in the state of `profile`: what the shim keeps as its
 /// `log_failure`.
 fn log_failure_of(profile: &crate::test_support::TempProfile) -> String {
-    let err = crate::filelog::init_for_location(&profile.location(), &me(), "shim.log").unwrap_err();
-    err.to_string()
+    let folder = Folder::in_location(Ok(profile.location()), Ok(me()));
+    format!("{:#}", folder.logs().err().expect("the log cannot be set up"))
 }
 
 #[test]
@@ -643,29 +643,55 @@ fn a_socket_that_is_not_there_is_nobody_listening() {
     let profile = crate::test_support::TempProfile::new("connect-missing");
     let location = profile.location();
     // The folder is missing.
-    assert!(connect_if_listening(location.path()).unwrap().is_none());
+    assert!(connect_if_listening(&location, &me()).unwrap().is_none());
     // The folder is there and the socket file is not.
-    std::fs::create_dir_all(location.dir()).unwrap();
-    assert!(connect_if_listening(location.path()).unwrap().is_none());
+    crate::userdir::ensure_socket_dir(&location, &me()).unwrap();
+    assert!(connect_if_listening(&location, &me()).unwrap().is_none());
+    // A folder above it is missing too.
+    std::fs::remove_dir_all(profile.0.join("AppData")).unwrap();
+    assert!(connect_if_listening(&location, &me()).unwrap().is_none());
 }
 
 #[test]
 fn a_socket_with_nobody_listening_on_it_is_nobody_listening() {
     use socket2::{Domain, SockAddr, Socket, Type};
-    let profile = crate::test_support::TempProfile::new("connect-unlistened");
+    let profile = crate::test_support::TempProfile::new("unlistened");
     let location = profile.location();
-    std::fs::create_dir_all(location.dir()).unwrap();
+    crate::userdir::ensure_socket_dir(&location, &me()).unwrap();
     // The file exists and `listen()` has not run, as in the agent's start.
     let socket = Socket::new(Domain::UNIX, Type::STREAM, None).unwrap();
     socket.bind(&SockAddr::unix(location.path()).unwrap()).unwrap();
-    assert!(connect_if_listening(location.path()).unwrap().is_none());
+    assert!(connect_if_listening(&location, &me()).unwrap().is_none());
 }
 
 #[test]
-fn a_connect_that_fails_for_any_other_reason_is_an_error_naming_the_path() {
-    let long = std::path::PathBuf::from(format!(r"C:\{}\agent.sock", "x".repeat(120)));
-    let failed = connect_if_listening(&long).unwrap_err();
-    assert!(format!("{failed:#}").contains("too long"), "{failed:#}");
+fn a_listening_socket_in_the_folder_is_connected_to() {
+    let profile = crate::test_support::TempProfile::new("connect-listening");
+    let location = profile.location();
+    crate::userdir::ensure_socket_dir(&location, &me()).unwrap();
+    let _listener = crate::afunix::Listener::bind(location.path()).unwrap();
+
+    assert!(connect_if_listening(&location, &me()).unwrap().is_some());
+}
+
+/// The wait through the profile-list watch walks before it connects: a listener in a folder that is
+/// refused is not connected to, and the refusal is an error that names the folder, not a reason to
+/// wait.
+#[test]
+fn a_listener_in_a_refused_folder_is_not_connected_to_and_the_folder_is_named() {
+    let profile = crate::test_support::TempProfile::new("connect-refused");
+    let location = profile.location();
+    crate::userdir::ensure_socket_dir(&location, &me()).unwrap();
+    let _listener = crate::afunix::Listener::bind(location.path()).unwrap();
+    crate::test_support::widen(location.dir());
+
+    let failed = connect_if_listening(&location, &me()).expect_err("connected through a folder that is not private");
+
+    assert!(failed.is::<FolderFailed>(), "{failed:#}");
+    assert!(
+        format!("{failed:#}").contains(&location.dir().display().to_string()),
+        "{failed:#}"
+    );
 }
 
 // wait_for_agent: the shim's own token and a temporary profile; no account, no logon -----

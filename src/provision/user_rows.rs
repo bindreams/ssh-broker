@@ -5,7 +5,6 @@
 //! check should do, and each user can run `verify` for themselves.
 
 use crate::acl::{self, Sid};
-use crate::afunix;
 use crate::socket_loc::SocketLocation;
 use crate::userdir::{self, SocketDir};
 
@@ -102,11 +101,12 @@ pub fn socket_file_row(location: &anyhow::Result<SocketLocation>, user: &Sid) ->
 /// before its log opens goes nowhere else; run by hand it prints that error.
 const AGENT_HINT: &str = " (to see why, run `ssh-broker agent` in your desktop session)";
 
-/// `socket reachable`: this account's agent answers on its socket.
-pub fn socket_reachable_row(location: &anyhow::Result<SocketLocation>) -> Check {
+/// `socket reachable`: this account's agent answers on its socket, which is connected to through
+/// the folder as the agent's own walk judges it: a folder that is refused is not connected through.
+pub fn socket_reachable_row(location: &anyhow::Result<SocketLocation>, user: &Sid) -> Check {
     const NAME: &str = "socket reachable";
     match location {
-        Ok(loc) => match afunix::connect(loc.path()) {
+        Ok(loc) => match userdir::inspect_socket_dir(loc, user).and_then(|folder| folder.connect()) {
             Ok(_) => Check::new(NAME, true, String::new()),
             Err(e) => Check::new(NAME, false, format!("{e:#}{AGENT_HINT}")),
         },

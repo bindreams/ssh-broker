@@ -132,12 +132,14 @@ pub fn absence(connect: &anyhow::Result<socket2::Socket>, location: &anyhow::Res
     }
 }
 
-/// Whether a failed `connect` to the user's socket means nothing serves it, by the OS code.
+/// Whether a failed walk to the user's socket and connect to it means nothing serves it: a folder of
+/// the way is not there, or the OS code of the connect says so.
 pub fn is_no_agent(error: &anyhow::Error) -> bool {
-    error
-        .downcast_ref::<std::io::Error>()
-        .and_then(std::io::Error::raw_os_error)
-        .is_some_and(|code| NO_AGENT_CODES.contains(&code))
+    error.is::<crate::acl::Missing>()
+        || error
+            .downcast_ref::<std::io::Error>()
+            .and_then(std::io::Error::raw_os_error)
+            .is_some_and(|code| NO_AGENT_CODES.contains(&code))
 }
 
 #[cfg(test)]

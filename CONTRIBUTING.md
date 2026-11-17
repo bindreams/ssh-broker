@@ -85,6 +85,21 @@ agent, with the folder named, and removing it restores them. A profile
 path that would push the socket past the 107-byte AF_UNIX limit is an error, not a reason to use
 another location (`socket_loc::SocketLocationError::TooLong`).
 
+The walk also pins what it opens. `AppData`, `Local`, `ssh-broker` and `logs` are opened without
+`FILE_SHARE_DELETE` (with `FILE_TRAVERSE`: sharing is judged only for an open that asks for data,
+execute or delete access, so a handle with read-control and read-attributes alone pins nothing), and
+`userdir::SocketDir` keeps all of them for as long as it is held. While it is held nobody can rename
+or remove them, so the location's path names the folders held and the by-path uses of the folder
+below reach them and no others. A process of the same account can otherwise rename the folder aside
+and put one of its own in its place. If another program holds a folder of the walk open for deleting
+or renaming when a walk opens it, the walk is refused with that said (`offer::text::folder_held`): no
+retry, since a holder that never lets go would hang the login. The next login is brokered again.
+There is one way to connect to an agent: `SocketDir::connect`, through the folders held
+(`afunix::connect` is crate-private). A caller that connects walks first and keeps the `SocketDir`
+over the connect; a shim connects only if its private folder was accepted. A test whose subject is
+the connect itself by a bare path (an account the socket's ACL refuses, a stand-in socket) makes it
+in `tests/common/raw_connect.rs`.
+
 The agent's own operations in the folder (`Listener::bind`, the `agent_lock` locks, the `serving`
 marker) still name it by path. That gains a process of the same account nothing as long as the agent
 runs with the plain, non-elevated token: a link then redirects it only to what the same account can
@@ -94,8 +109,8 @@ The `auto-login` task does not: its batch logon gives an administrator the full 
 and one started by hand from an elevated prompt, are not covered.
 The elevated shim is different. It looks at `agent.lock` through the
 folder's handle and never creates it (`starting_agent`, `userdir::open_existing_socket_dir`); the
-connect to the socket and the folder watch (`socket_watch`) stay by path, and neither creates or
-writes anything.
+folder watch (`socket_watch`) stays by path, and neither it nor the connect, which goes through the
+folders held, creates or writes anything.
 
 The install directory is the other half of the boundary: the agent runs the exe in it, so a directory a standard user can write to is a privilege escalation. `apply` verifies it exactly and reads and writes nothing in it until that passes. Users can read what is in it, so a file in it that a user must not open (`apply.lock`: a byte-range lock needs only a read handle) gets its own protected DACL of SYSTEM and Administrators at creation, verified exactly (`acl::ensure_admin_only_file`).
 

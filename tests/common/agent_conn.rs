@@ -8,11 +8,13 @@
 #![allow(dead_code)]
 
 use ssh_broker::account::LocalAccount;
+use ssh_broker::acl::Sid;
 use ssh_broker::afunix::{self, ConnRx, ConnTx};
 use ssh_broker::logon;
 use ssh_broker::protocol::{FrameKind, FrameReader, Handshake, Launch, Mode, Stream, write_frame};
 use ssh_broker::relay::{FrameSink, Outcome, PumpError, pump_decode, write_data};
 use ssh_broker::socket_loc::{self, SocketLocation};
+use ssh_broker::userdir;
 use ssh_broker::vtinput::{KeyEvent, encode_key_event};
 use ssh_broker::winutil::OwnedHandle;
 use windows::Win32::System::Threading::TerminateProcess;
@@ -125,8 +127,11 @@ pub struct Finished {
 }
 
 impl AgentConn {
-    pub fn connect(location: &SocketLocation) -> AgentConn {
-        let conn = afunix::connect(location.path())
+    /// Connect to the agent of `user` at `location`, as the product does: walk to the folder as `user`'s
+    /// agent made it, hold it, and connect through it.
+    pub fn connect(location: &SocketLocation, user: &Sid) -> AgentConn {
+        let conn = userdir::inspect_socket_dir(location, user)
+            .and_then(|folders| folders.connect())
             .unwrap_or_else(|e| panic!("connect to the agent at {}: {e:#}", location.path().display()));
         // A failure bound on the agent's output, an external event that may never come.
         conn.set_read_timeout(Some(SILENCE_BOUND)).unwrap();

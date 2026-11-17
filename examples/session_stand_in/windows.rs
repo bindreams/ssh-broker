@@ -16,6 +16,8 @@ mod file_signal;
 mod hosted_console;
 #[path = "../../tests/common/password.rs"]
 mod password;
+#[path = "../../tests/common/raw_connect.rs"]
+mod raw_connect;
 
 pub fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -282,7 +284,7 @@ fn console_size() {
 /// Connect to the socket at `socket` and write what happened to `result`: `connected`, `os error <n>`
 /// or the error's text.
 fn connect(socket: &Path, result: &Path) {
-    let text = match ssh_broker::afunix::connect(socket) {
+    let text = match raw_connect::raw_connect(socket) {
         Ok(_) => "connected".to_string(),
         Err(e) => match e
             .downcast_ref::<std::io::Error>()

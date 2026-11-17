@@ -11,8 +11,7 @@
 use anyhow::Context;
 use tracing_appender::non_blocking::{NonBlocking, WorkerGuard};
 
-use crate::acl::{DirHandle, Sid};
-use crate::socket_loc::SocketLocation;
+use crate::acl::DirHandle;
 
 mod daily;
 
@@ -43,36 +42,6 @@ fn install((writer, guard): Sink) -> anyhow::Result<WorkerGuard> {
 /// caller carries on without one.
 pub fn init_in(dir: &DirHandle, prefix: &str) -> anyhow::Result<WorkerGuard> {
     install(open_in(dir, prefix)?)
-}
-
-/// Why a log could not be set up. Its text is the cause's, whole.
-#[derive(Debug, thiserror::Error)]
-#[error("{cause:#}")]
-pub struct NoLog {
-    pub cause: anyhow::Error,
-}
-
-impl From<anyhow::Error> for NoLog {
-    fn from(cause: anyhow::Error) -> NoLog {
-        NoLog { cause }
-    }
-}
-
-fn open_for_location(loc: &SocketLocation, user: &Sid, prefix: &str) -> Result<Sink, NoLog> {
-    let folders = crate::userdir::open_socket_dir(loc, user)?;
-    Ok(open_in(&folders.logs?, prefix)?)
-}
-
-/// Log into the logs folder of `loc`, making the private folder first if it is missing. The error
-/// says why not: no profile, a link in the way, a foreign owner.
-pub fn init_for_location(loc: &SocketLocation, user: &Sid, prefix: &str) -> Result<WorkerGuard, NoLog> {
-    Ok(install(open_for_location(loc, user, prefix)?)?)
-}
-
-/// [`init_for_location`] for the account this process runs as.
-pub fn init_for_current_user(prefix: &str) -> Result<WorkerGuard, NoLog> {
-    let loc = crate::userdir::current_socket_location()?;
-    init_for_location(&loc, &Sid::current_user()?, prefix)
 }
 
 #[cfg(test)]

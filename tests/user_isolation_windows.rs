@@ -19,7 +19,7 @@ use std::sync::mpsc;
 
 use ssh_broker::account::{INTEGRITY_LOW, INTEGRITY_MEDIUM};
 use ssh_broker::acl::{self, Sid};
-use ssh_broker::afunix::{self, Listener};
+use ssh_broker::afunix::Listener;
 use ssh_broker::agent_lock::{SessionSlot, UserLock};
 use ssh_broker::socket_loc::SocketLocation;
 use ssh_broker::userdir;
@@ -54,6 +54,8 @@ mod hard_errors;
 mod integrity;
 #[path = "common/process_list.rs"]
 mod process_list;
+#[path = "common/raw_connect.rs"]
+mod raw_connect;
 #[path = "common/token_copy.rs"]
 mod token_copy;
 
@@ -455,8 +457,8 @@ fn child_connects_only_where_it_was_granted() {
     let allowed = path_after("allowed=");
     let denied = path_after("denied=");
 
-    afunix::connect(&allowed).unwrap_or_else(|e| panic!("the control socket must be reachable: {e:#}"));
-    let err = afunix::connect(&denied).expect_err("connected to a socket that grants bob nothing");
+    raw_connect::raw_connect(&allowed).unwrap_or_else(|e| panic!("the control socket must be reachable: {e:#}"));
+    let err = raw_connect::raw_connect(&denied).expect_err("connected to a socket that grants bob nothing");
     let denied_by_acl = err
         .downcast_ref::<std::io::Error>()
         .is_some_and(|e| e.kind() == std::io::ErrorKind::PermissionDenied);
@@ -579,7 +581,7 @@ fn child_connects_at_its_integrity_level() {
         Ok(_) => "ok".to_owned(),
         Err(e) => format!("failed: {e}"),
     };
-    let (connect, os_error) = match afunix::connect(&socket) {
+    let (connect, os_error) = match raw_connect::raw_connect(&socket) {
         Ok(_) => ("connected".to_owned(), None),
         Err(e) => {
             let os_error = e
@@ -779,7 +781,7 @@ impl Recorder {
     /// every connection up to ours, so a connection made earlier is not turned away. Removes the
     /// socket file.
     fn first_sender(self) -> Vec<u8> {
-        let mut ours = afunix::connect(&self.path).unwrap();
+        let mut ours = raw_connect::raw_connect(&self.path).unwrap();
         std::io::Write::write_all(&mut ours, SENTINEL).unwrap();
         let first = self.seen.recv().unwrap();
         self.thread.join().unwrap();

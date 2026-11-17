@@ -720,7 +720,7 @@ fn the_warning_is_on_the_screen_when_the_fallback_line_is_near_the_command_line_
     // `<system directory>\cmd.exe /c ` is under 60 units and the warning and the verb's own name are over 300,
     // so the line fits and the verb's line would not if it carried the line.
     let command = "x".repeat(32_700);
-    let mut conn = agent_conn::AgentConn::connect(&location);
+    let mut conn = agent_conn::AgentConn::connect(&location, &rig.account.sid);
     conn.start_shell_pty(Some(&command));
     let finished = conn.read_to_end();
     let screen = sshd_rig::screen_text(finished.pty.as_bytes());

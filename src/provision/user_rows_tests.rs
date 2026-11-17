@@ -249,10 +249,28 @@ fn socket_reachable_row_follows_the_connection() {
     let profile = TempProfile::new("row-reach");
     let loc = profile.location();
     ensure_socket_dir(&loc, &me()).unwrap();
-    assert!(!socket_reachable_row(&Ok(loc.clone())).pass, "nothing listens yet");
+    assert!(
+        !socket_reachable_row(&Ok(loc.clone()), &me()).pass,
+        "nothing listens yet"
+    );
 
     let _listener = crate::afunix::Listener::bind(loc.path()).unwrap();
-    assert!(socket_reachable_row(&Ok(loc)).pass);
+    assert!(socket_reachable_row(&Ok(loc), &me()).pass);
+}
+
+/// A socket in a folder that is refused is not reached: the row says why, and does not connect.
+#[test]
+fn socket_reachable_row_does_not_connect_through_a_refused_folder() {
+    let profile = TempProfile::new("row-reach-refused");
+    let loc = profile.location();
+    ensure_socket_dir(&loc, &me()).unwrap();
+    let _listener = crate::afunix::Listener::bind(loc.path()).unwrap();
+    crate::test_support::widen(loc.dir());
+
+    let row = socket_reachable_row(&Ok(loc.clone()), &me());
+
+    assert!(!row.pass, "the listener sits in a folder that is not private any more");
+    assert!(row.detail.contains(&loc.dir().display().to_string()), "{}", row.detail);
 }
 
 #[test]
@@ -260,7 +278,7 @@ fn socket_reachable_row_tells_the_user_how_to_see_why_the_agent_is_not_there() {
     // An agent the logon task starts has its stderr discarded, and a start-up error before its log
     // opens goes nowhere else. Run by hand in a desktop session, it prints the error.
     let profile = TempProfile::new("row-reach-hint");
-    let row = socket_reachable_row(&Ok(profile.location()));
+    let row = socket_reachable_row(&Ok(profile.location()), &me());
 
     assert!(!row.pass);
     assert!(row.detail.contains("ssh-broker agent"), "{}", row.detail);
@@ -269,7 +287,7 @@ fn socket_reachable_row_tells_the_user_how_to_see_why_the_agent_is_not_there() {
 
 #[test]
 fn socket_reachable_row_fails_without_a_location() {
-    assert!(!socket_reachable_row(&too_long_location()).pass);
+    assert!(!socket_reachable_row(&too_long_location(), &me()).pass);
 }
 
 #[test]

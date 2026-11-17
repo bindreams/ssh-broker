@@ -692,10 +692,7 @@ fn an_open_maps_each_status_to_one_outcome() {
     for status in [STATUS_OBJECT_NAME_NOT_FOUND, STATUS_OBJECT_PATH_NOT_FOUND] {
         assert_eq!(classify_open(status), OpenOutcome::Missing);
     }
-    assert_eq!(
-        classify_open(STATUS_SHARING_VIOLATION),
-        OpenOutcome::Failed(STATUS_SHARING_VIOLATION)
-    );
+    assert_eq!(classify_open(STATUS_SHARING_VIOLATION), OpenOutcome::SharingViolation);
 }
 
 #[test]

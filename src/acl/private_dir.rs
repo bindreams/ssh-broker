@@ -26,14 +26,15 @@ use windows::Wdk::Storage::FileSystem::{
 use windows::Win32::Foundation::{DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE};
 use windows::Win32::Security::PSECURITY_DESCRIPTOR;
 use windows::Win32::Storage::FileSystem::{
-    FILE_ACCESS_RIGHTS, FILE_APPEND_DATA, FILE_ATTRIBUTE_REPARSE_POINT, FILE_READ_ATTRIBUTES, READ_CONTROL, SYNCHRONIZE,
+    FILE_ACCESS_RIGHTS, FILE_APPEND_DATA, FILE_ATTRIBUTE_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_TRAVERSE,
+    READ_CONTROL, SYNCHRONIZE,
 };
 use windows::Win32::System::Threading::GetCurrentProcess;
 
 use super::{
-    Made, OpenOutcome, OwnerAclWords, Security, Sid, classify_open, denied_problem, describe_sid, descriptor_from_sddl,
-    dir_policy, file_attributes, file_information, nt_create, nt_path, owner_acl_problem, private_dir_dacl_sddl,
-    status_error,
+    Made, OpenOutcome, OwnerAclWords, Security, Sharing, Sid, classify_open, denied_problem, describe_sid,
+    descriptor_from_sddl, dir_policy, file_attributes, file_information, nt_create, nt_path, owner_acl_problem,
+    private_dir_dacl_sddl, status_error,
 };
 use crate::winutil::OwnedHandle;
 
@@ -41,9 +42,15 @@ use crate::winutil::OwnedHandle;
 /// Creating inside it is checked against the folder's own ACL, not against the handle.
 const DIR_ACCESS: u32 = READ_CONTROL.0 | FILE_READ_ATTRIBUTES.0;
 
+/// [`DIR_ACCESS`] and the right to traverse, for a folder that is held. Sharing is judged only for an
+/// open that asks for data, execute or delete access, so a handle with the rights above alone leaves
+/// the folder free to be renamed whatever it shares (measured); traversing is the one that asks for
+/// nothing a folder of the user's own does not give.
+const HELD_DIR_ACCESS: u32 = DIR_ACCESS | FILE_TRAVERSE.0;
+
 /// The name opened does not exist. Downcastable from the error of [`open_root`], [`open_dir`] and
 /// [`open_existing_file`], for a caller that looks at what may not be there yet.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 #[error("{} does not exist", path.display())]
 pub struct Missing {
     path: PathBuf,
@@ -62,6 +69,12 @@ pub struct DirHandle {
     /// Where the handle was reached from, for messages only; never opened.
     path: PathBuf,
 }
+
+// SAFETY: a `DirHandle` is moved between threads like its `OwnedHandle`, and shared by reference
+// only for what is thread-safe: `raw` copies the handle value, `path` reads a field nothing changes,
+// and `try_clone` is `DuplicateHandle`, which the kernel serialises. Closing is `drop`, which needs
+// the only reference.
+unsafe impl Sync for DirHandle {}
 
 impl DirHandle {
     pub fn raw(&self) -> HANDLE {
@@ -105,6 +118,9 @@ struct Request<'a> {
     /// system's error. Only a caller that can say what the denial means gives one.
     denied: Option<String>,
     access: u32,
+    /// A folder is held without `FILE_SHARE_DELETE`, so that it cannot be renamed or removed for as
+    /// long as it is held; a file shares everything.
+    sharing: Sharing,
     disposition: NTCREATEFILE_CREATE_DISPOSITION,
     options: u32,
     descriptor: Option<PSECURITY_DESCRIPTOR>,
@@ -120,7 +136,8 @@ impl<'a> Request<'a> {
             purpose,
             not_a_directory,
             denied: None,
-            access: DIR_ACCESS,
+            access: HELD_DIR_ACCESS,
+            sharing: Sharing::NotDelete,
             disposition: FILE_OPEN,
             options: FILE_DIRECTORY_FILE.0 | FILE_OPEN_REPARSE_POINT.0,
             descriptor: None,
@@ -133,6 +150,7 @@ impl<'a> Request<'a> {
     fn file(purpose: &'a str, access: u32, disposition: NTCREATEFILE_CREATE_DISPOSITION) -> Self {
         Request {
             access: access | SYNCHRONIZE.0 | FILE_READ_ATTRIBUTES.0,
+            sharing: Sharing::All,
             disposition,
             options: FILE_NON_DIRECTORY_FILE.0 | FILE_SYNCHRONOUS_IO_NONALERT.0 | FILE_OPEN_REPARSE_POINT.0,
             sole_name: true,
@@ -142,14 +160,26 @@ impl<'a> Request<'a> {
 }
 
 /// Open the profile directory `dir` as the root of a walk. A link at `dir` or above it is followed
-/// (see the module doc for why); every name below it is not.
+/// (see the module doc for why); every name below it is not. The profile directory is not pinned:
+/// Windows owns it (see the module doc), and every folder below it is held without
+/// `FILE_SHARE_DELETE`.
 pub fn open_root(dir: &Path) -> anyhow::Result<DirHandle> {
     let name = nt_path(dir)?;
     let request = Request {
         options: FILE_DIRECTORY_FILE.0,
+        access: DIR_ACCESS,
+        sharing: Sharing::All,
         ..Request::directory("as the profile directory", PROFILE_AS_IT_IS)
     };
-    let made = nt_create(None, &name, request.access, request.disposition, request.options, None)?;
+    let made = nt_create(
+        None,
+        &name,
+        request.access,
+        request.sharing,
+        request.disposition,
+        request.options,
+        None,
+    )?;
     let handle = judge(made, dir, &request)?;
     Ok(DirHandle {
         handle,
@@ -285,6 +315,7 @@ fn open_child(parent: &DirHandle, name: &str, request: &Request) -> anyhow::Resu
         Some(parent.raw()),
         &units,
         request.access,
+        request.sharing,
         request.disposition,
         request.options,
         request.descriptor,
@@ -314,11 +345,14 @@ fn judge(made: Made, path: &Path, request: &Request) -> anyhow::Result<OwnedHand
         (OpenOutcome::Denied, Some(denied)) => {
             Err(Refused(format!("{} cannot be used {purpose}: {denied}", path.display())).into())
         }
+        (OpenOutcome::SharingViolation, _) if request.sharing == Sharing::NotDelete => {
+            Err(Refused(crate::offer::text::folder_held(path)).into())
+        }
         (OpenOutcome::Missing, _) => Err(Missing {
             path: path.to_path_buf(),
         }
         .into()),
-        (OpenOutcome::Denied, None) | (OpenOutcome::Failed(_), _) => {
+        (OpenOutcome::Denied, None) | (OpenOutcome::SharingViolation, _) | (OpenOutcome::Failed(_), _) => {
             Err(status_error(made.status)).with_context(|| format!("open {}", path.display()))
         }
     }

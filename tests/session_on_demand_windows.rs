@@ -599,7 +599,7 @@ fn logout_message_reaches_a_pty_client_running_inside_the_agent() {
     let account = Account::create("lopty", true);
     let agent = BackgroundAgent::start(&kit, &account);
 
-    let mut session = AgentConn::connect(&agent.location);
+    let mut session = AgentConn::connect(&agent.location, &account.sid);
     session.start_pty("cmd.exe");
     session.type_line(&logout_command(&kit));
     let done = session.read_to_end();
@@ -621,7 +621,7 @@ fn logout_exit_code_reaches_an_exec_client_inside_the_agent() {
     let account = Account::create("loexec", true);
     let agent = BackgroundAgent::start(&kit, &account);
 
-    let mut session = AgentConn::connect(&agent.location);
+    let mut session = AgentConn::connect(&agent.location, &account.sid);
     session.start_exec(&logout_command(&kit));
     session.end_stdin();
     let done = session.read_to_end();
@@ -647,7 +647,7 @@ fn an_exec_command_raising_a_ctrl_event_on_its_console_does_not_end_the_agent() 
     let agent = BackgroundAgent::start(&kit, &account);
 
     for (raise, event) in [("raise-ctrl-c", "event 0"), ("raise-ctrl-break", "event 1")] {
-        let mut session = AgentConn::connect(&agent.location);
+        let mut session = AgentConn::connect(&agent.location, &account.sid);
         session.start_exec(&format!("\"{}\" no-stdin {raise}", probe.display()));
         session.end_stdin();
         let done = session.read_to_end();
@@ -660,7 +660,7 @@ fn an_exec_command_raising_a_ctrl_event_on_its_console_does_not_end_the_agent() 
         assert_eq!(done.exit, Some(0), "{raise}: the agent ended the session early");
     }
 
-    let mut after = AgentConn::connect(&agent.location);
+    let mut after = AgentConn::connect(&agent.location, &account.sid);
     after.start_exec("cmd.exe /c echo still-serving");
     after.end_stdin();
     let done = after.read_to_end();
@@ -673,8 +673,8 @@ fn an_exec_command_raising_a_ctrl_event_on_its_console_does_not_end_the_agent() 
 }
 
 /// Ask the agent to end from inside it, over a second connection.
-fn logout_from_inside(kit: &Kit, agent: &BackgroundAgent) -> agent_conn::Finished {
-    let mut asker = AgentConn::connect(&agent.location);
+fn logout_from_inside(kit: &Kit, agent: &BackgroundAgent, account: &Account) -> agent_conn::Finished {
+    let mut asker = AgentConn::connect(&agent.location, &account.sid);
     asker.start_exec(&logout_command(kit));
     asker.end_stdin();
     asker.read_to_end()
@@ -693,7 +693,7 @@ fn logout_ends_every_process_of_the_logon_session() {
     let id = logon_session::logon_id(agent.process.0);
 
     // A shell is running in the session when the end comes.
-    let mut shell = AgentConn::connect(&agent.location);
+    let mut shell = AgentConn::connect(&agent.location, &account.sid);
     shell.start_pty("cmd.exe");
     shell.type_line("echo shell-is-up");
     shell.read_until_pty_shows("shell-is-up");
@@ -709,7 +709,7 @@ fn logout_ends_every_process_of_the_logon_session() {
         held.iter().map(|(pid, _)| pid).collect::<Vec<_>>()
     );
 
-    let reply = logout_from_inside(&kit, &agent);
+    let reply = logout_from_inside(&kit, &agent, &account);
     assert_eq!(reply.exit, Some(0), "stderr: {}", reply.stderr);
     // The agent ends after every connection has finished, and a connection finishes when its client
     // closes it. The shim does that on the exit code; this client must too.
@@ -748,7 +748,7 @@ fn logon_session_is_logged_off_after_logout() {
         .into_iter()
         .filter(|(pid, _)| *pid != own)
         .collect();
-    let reply = logout_from_inside(&kit, &agent);
+    let reply = logout_from_inside(&kit, &agent, &account);
     assert_eq!(reply.exit, Some(0), "stderr: {}", reply.stderr);
     for (pid, process) in &held {
         bounded_wait::wait_for_exit(
