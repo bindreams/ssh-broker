@@ -70,6 +70,7 @@ use crate::route::{AgentArgs, BackgroundArgs};
 use crate::shell::StartError;
 #[cfg(windows)]
 use crate::socket_loc::SocketLocation;
+#[cfg(windows)]
 use crate::userdir::SocketDir;
 #[cfg(windows)]
 use crate::winutil::{OwnedHandle, UnelevatedToken};
