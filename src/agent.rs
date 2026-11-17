@@ -275,9 +275,13 @@ fn run_on(folder: &Arc<SocketDir>, background: bool) -> anyhow::Result<()> {
         let folder = Arc::clone(&waker_folder);
         wake_without_blocking(&waking, move || folder.connect().map(drop))
     }));
-    run_on_with(folder.location(), Listener::bind, mark_listening, |listener| {
-        serve_until_drained(listener, &connections, &control)
-    })
+    let integrity = folder.location().integrity();
+    run_on_with(
+        folder.location(),
+        |path| Listener::bind(path, integrity),
+        mark_listening,
+        |listener| serve_until_drained(listener, &connections, &control),
+    )
     .or_else(|err| match err.downcast_ref::<Stopped>() {
         Some(Stopped) => Ok(()),
         None => Err(err),

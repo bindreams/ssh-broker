@@ -14,8 +14,8 @@ fn walk(profile: &Path, user: &Sid) -> anyhow::Result<(DirHandle, DirHandle)> {
     let root = open_root(profile)?;
     let app_data = open_dir(&root, "AppData")?;
     let local = open_dir(&app_data, "Local")?;
-    let broker = ensure_private_dir(&local, "ssh-broker", user, Hold::Held)?;
-    let logs = ensure_private_dir(&broker, "logs", user, Hold::Shared)?;
+    let broker = ensure_private_dir(&local, "ssh-broker", user, Hold::Held, Integrity::Medium)?;
+    let logs = ensure_private_dir(&broker, "logs", user, Hold::Shared, Integrity::Medium)?;
     Ok((broker, logs))
 }
 
@@ -78,7 +78,11 @@ fn a_missing_folder_is_created_with_exactly_the_private_acl_and_owner_in_the_set
     let profile = TempProfile::new("mk");
     let (broker, logs) = made(&profile);
     for dir in [broker.path(), logs.path()] {
-        assert!(acl::verify_dir_acl(dir, &me()).unwrap(), "{}", dacl_sddl(dir));
+        assert!(
+            acl::verify_dir_acl(dir, &me(), Integrity::Medium).unwrap(),
+            "{}",
+            dacl_sddl(dir)
+        );
         let sddl = dacl_sddl(dir);
         assert!(sddl.starts_with("D:P"), "protected: {sddl}");
         assert!(!sddl.contains("ID"), "no inherited ACE: {sddl}");
@@ -94,7 +98,7 @@ fn an_exact_folder_is_left_untouched() {
     icacls(&child, &["/grant", "*S-1-1-0:R"]);
     let before = tree_state(&profile.0);
 
-    ensure_private_dir(&local_of(&profile), "ssh-broker", &me(), Hold::Held).unwrap();
+    ensure_private_dir(&local_of(&profile), "ssh-broker", &me(), Hold::Held, Integrity::Medium).unwrap();
 
     assert_eq!(tree_state(&profile.0), before);
 }
@@ -105,12 +109,15 @@ fn a_widened_folder_is_refused_and_left_untouched() {
     let (broker, _) = made(&profile);
     std::fs::write(broker.path().join("child.txt"), "x").unwrap();
     widen(broker.path());
-    assert!(!acl::verify_dir_acl(broker.path(), &me()).unwrap(), "control: widened");
+    assert!(
+        !acl::verify_dir_acl(broker.path(), &me(), Integrity::Medium).unwrap(),
+        "control: widened"
+    );
     let before = tree_state(&profile.0);
 
     let err = format!(
         "{:#}",
-        ensure_private_dir(&local_of(&profile), "ssh-broker", &me(), Hold::Held)
+        ensure_private_dir(&local_of(&profile), "ssh-broker", &me(), Hold::Held, Integrity::Medium)
             .err()
             .unwrap()
     );
@@ -132,7 +139,7 @@ fn a_folder_owned_by_the_user_with_an_extra_ace_is_blamed_on_the_acl_not_the_own
 
     let err = format!(
         "{:#}",
-        ensure_private_dir(&local_of(&profile), "ssh-broker", &me(), Hold::Held)
+        ensure_private_dir(&local_of(&profile), "ssh-broker", &me(), Hold::Held, Integrity::Medium)
             .err()
             .unwrap()
     );
@@ -154,7 +161,7 @@ fn looking_at_the_private_folder_makes_nothing_and_a_missing_one_is_missing() {
     let profile = TempProfile::new("look-miss");
     let before = tree_state(&profile.0);
 
-    let err = open_private_dir(&local_of(&profile), "ssh-broker", &me(), Hold::Held)
+    let err = open_private_dir(&local_of(&profile), "ssh-broker", &me(), Hold::Held, Integrity::Medium)
         .err()
         .unwrap();
 
@@ -166,11 +173,11 @@ fn looking_at_the_private_folder_makes_nothing_and_a_missing_one_is_missing() {
 fn looking_at_the_private_folder_passes_an_exact_one_and_refuses_a_widened_one_as_ensure_does() {
     let profile = TempProfile::new("look-wide");
     let (broker, _) = made(&profile);
-    open_private_dir(&local_of(&profile), "ssh-broker", &me(), Hold::Held).expect("exact");
+    open_private_dir(&local_of(&profile), "ssh-broker", &me(), Hold::Held, Integrity::Medium).expect("exact");
 
     widen(broker.path());
     let before = tree_state(&profile.0);
-    let err = open_private_dir(&local_of(&profile), "ssh-broker", &me(), Hold::Held)
+    let err = open_private_dir(&local_of(&profile), "ssh-broker", &me(), Hold::Held, Integrity::Medium)
         .err()
         .unwrap();
 
@@ -188,7 +195,7 @@ fn a_file_at_the_name_is_refused_and_left_untouched() {
 
     let err = format!(
         "{:#}",
-        ensure_private_dir(&local, "ssh-broker", &me(), Hold::Held)
+        ensure_private_dir(&local, "ssh-broker", &me(), Hold::Held, Integrity::Medium)
             .err()
             .unwrap()
     );
@@ -213,7 +220,7 @@ fn a_name_that_is_not_one_component_is_refused() {
     for name in ["", ".", "..", r"AppData\Local", "AppData/Local", "C:", "a\0b"] {
         assert!(open_dir(&root, name).is_err(), "open_dir {name:?}");
         assert!(
-            ensure_private_dir(&root, name, &me(), Hold::Held).is_err(),
+            ensure_private_dir(&root, name, &me(), Hold::Held, Integrity::Medium).is_err(),
             "ensure_private_dir {name:?}"
         );
         assert!(open_log_file(&root, name).is_err(), "open_log_file {name:?}");
@@ -232,7 +239,7 @@ fn a_link_above_the_profile_directory_is_followed_and_the_walk_below_it_works() 
 
     walk(&link.join("p"), &me()).unwrap();
 
-    assert!(acl::verify_dir_acl(&profile.join(r"AppData\Local\ssh-broker"), &me()).unwrap());
+    assert!(acl::verify_dir_acl(&profile.join(r"AppData\Local\ssh-broker"), &me(), Integrity::Medium).unwrap());
 }
 
 #[test]
@@ -251,7 +258,11 @@ fn a_profile_directory_that_is_a_link_is_followed_and_keeps_its_broker() {
         walk(&link, &me()).unwrap_or_else(|e| panic!("walk through {}: {e:#}", link.display()));
 
         let broker = profile.0.join(r"AppData\Local\ssh-broker");
-        assert!(acl::verify_dir_acl(&broker, &me()).unwrap(), "{}", dacl_sddl(&broker));
+        assert!(
+            acl::verify_dir_acl(&broker, &me(), Integrity::Medium).unwrap(),
+            "{}",
+            dacl_sddl(&broker)
+        );
         assert!(broker.join("logs").is_dir());
     }
 }
@@ -280,7 +291,7 @@ fn a_refusal_to_make_the_folder_says_that_this_process_may_not_make_it() {
     let grantee = format!("*{}", me().to_sddl().unwrap());
     icacls(local.path(), &["/deny", &format!("{grantee}:(AD)")]);
 
-    let err = ensure_private_dir(&local, "ssh-broker", &me(), Hold::Held)
+    let err = ensure_private_dir(&local, "ssh-broker", &me(), Hold::Held, Integrity::Medium)
         .err()
         .unwrap();
     icacls(local.path(), &["/remove:d", &grantee]);
@@ -312,7 +323,7 @@ fn the_log_file_is_made_with_the_inherited_acl_and_appended_to() {
     }
     let file = logs.path().join("shim.log.2026-01-01");
     assert_eq!(std::fs::read_to_string(&file).unwrap(), "one\ntwo\n");
-    assert!(acl::verify_file_acl(&file, &me()).unwrap());
+    assert!(acl::verify_file_acl(&file, &me(), Integrity::Medium).unwrap());
 }
 
 #[test]
@@ -568,4 +579,71 @@ fn confirm_child_sees_what_the_path_through_a_replaced_parent_hides() {
     let err = confirm_child(&app_data, "Local", &local).unwrap_err();
 
     assert!(err.is::<Refused>(), "{err:#}");
+}
+
+// the elevated folder -----
+
+const ELEVATED: &str = "ssh-broker-elevated";
+
+/// Elevated (CI only): a folder made for `High` is born with the label, and so is what is made in it.
+#[test]
+fn a_high_folder_is_born_with_the_label_and_passes_its_own_judgement() {
+    crate::test_support::assert_elevated();
+    let profile = TempProfile::new("hb");
+    let local = local_of(&profile);
+
+    let folder = ensure_private_dir(&local, ELEVATED, &me(), Hold::Held, Integrity::High).unwrap();
+
+    assert!(acl::verify_dir_acl(folder.path(), &me(), Integrity::High).unwrap());
+    std::fs::write(folder.path().join("child"), "").unwrap();
+    assert!(acl::verify_file_acl(&folder.path().join("child"), &me(), Integrity::High).unwrap());
+    drop(folder);
+    open_private_dir(&local, ELEVATED, &me(), Hold::Held, Integrity::High).expect("an existing labelled folder");
+    ensure_private_dir(&local, ELEVATED, &me(), Hold::Held, Integrity::High).expect("and again");
+}
+
+/// An unlabelled folder in the elevated folder's place is refused with the words
+/// every refusal uses, by the making walk and by the looking one, and nothing in it changes: the label
+/// is in the creation descriptor and never put on a folder that exists.
+#[test]
+fn an_unlabelled_folder_where_the_elevated_one_belongs_is_refused_and_left_untouched() {
+    let profile = TempProfile::new("hu");
+    let local = local_of(&profile);
+    ensure_private_dir(&local, ELEVATED, &me(), Hold::Shared, Integrity::Medium).unwrap();
+    let folder = profile.0.join(r"AppData\Local").join(ELEVATED);
+    std::fs::write(folder.join("child.txt"), "x").unwrap();
+    let before = tree_state(&profile.0);
+    let sddl_before = dacl_sddl(&folder);
+
+    for result in [
+        ensure_private_dir(&local, ELEVATED, &me(), Hold::Held, Integrity::High),
+        open_private_dir(&local, ELEVATED, &me(), Hold::Held, Integrity::High),
+        ensure_private_dir(&local, ELEVATED, &me(), Hold::Shared, Integrity::High),
+    ] {
+        let err = format!("{:#}", result.err().expect("an unlabelled folder is refused"));
+        assert!(err.contains(&folder.display().to_string()), "{err}");
+        assert!(err.contains("its ACL is not"), "{err}");
+        assert!(err.contains("High mandatory label"), "{err}");
+        assert!(
+            err.contains("It is left as it is: inspect it, remove it, and it is created again"),
+            "{err}"
+        );
+    }
+    assert_eq!(tree_state(&profile.0), before, "left as it was");
+    assert_eq!(dacl_sddl(&folder), sddl_before);
+    assert!(
+        !crate::acl::verify_dir_acl(&folder, &me(), Integrity::High).unwrap(),
+        "and still without the label"
+    );
+}
+
+/// What the plain folder is judged by is unchanged: no label asked for, none refused.
+#[test]
+fn the_plain_folder_is_judged_without_a_label() {
+    let profile = TempProfile::new("md-nolabel");
+    let local = local_of(&profile);
+    ensure_private_dir(&local, "ssh-broker", &me(), Hold::Held, Integrity::Medium).unwrap();
+    let folder = profile.0.join(r"AppData\Local\ssh-broker");
+    icacls(&folder, &["/setintegritylevel", "(OI)(CI)L"]);
+    open_private_dir(&local, "ssh-broker", &me(), Hold::Held, Integrity::Medium).expect("a label is not judged");
 }

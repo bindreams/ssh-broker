@@ -231,7 +231,7 @@ fn scene() -> Scene {
     )
     .unwrap();
     let before = {
-        let location = ssh_broker::socket_loc::for_profile(auto.profile()).unwrap();
+        let location = auto.socket_location();
         stand_in::wait_for_serving_marker_of_a_task(&location, TASK_START_BOUND);
         agent_pids(&auto.sid_text)
     };

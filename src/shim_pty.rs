@@ -82,7 +82,7 @@ pub fn run_on(exec: Option<RawExec>, detect: impl FnOnce() -> Encoding) -> anyho
     // `verify`'s probe covers a real child, real pipes and a real socket in both directions too.
     // What remains is a throughput difference, which does not earn a classifier.
     // What this login's own token allows is decided once, before anything connects.
-    let relayed = match stance(crate::account::elevation()) {
+    let relayed = match stance(crate::account::elevation(), crate::account::integrity()) {
         Stance::PlainShell => {
             tracing::info!("the token is an administrator's with elevation removed; running the plain shell");
             let _ = writeln!(std::io::stderr(), "{}", text::FILTERED_SHIM_NOTICE);

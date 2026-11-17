@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use ssh_broker::acl::Sid;
+use ssh_broker::socket_loc::Integrity;
 use ssh_broker::winutil::OwnedHandle;
 use windows::Wdk::Foundation::OBJECT_ATTRIBUTES;
 use windows::Wdk::Storage::FileSystem::{
@@ -484,7 +485,11 @@ fn a_directory_created_under_a_handle_with_a_descriptor_has_exactly_that_acl() {
         .unwrap_or_else(|s| panic!("create {name}: {}", hex(s)));
         assert_eq!(made.information, FILE_CREATED);
         let dir = tree.local().join(name);
-        assert!(ssh_broker::acl::verify_dir_acl(&dir, &me).unwrap(), "{}", sddl_of(&dir));
+        assert!(
+            ssh_broker::acl::verify_dir_acl(&dir, &me, Integrity::Medium).unwrap(),
+            "{}",
+            sddl_of(&dir)
+        );
         // Without an owner in the descriptor the owner is the creating token's default owner: the
         // user for a plain token, Administrators for an elevated one (which `verify_dir_acl` accepts).
         let expected = if with_owner { me_sddl() } else { default_owner_sid() };
@@ -551,8 +556,8 @@ fn what_is_created_inside_such_a_directory_inherits_exactly_the_three_aces() {
     )
     .unwrap();
     let base = tree.local().join("new");
-    assert!(ssh_broker::acl::verify_file_acl(&base.join("logs"), &me).unwrap());
-    assert!(ssh_broker::acl::verify_file_acl(&base.join("logs").join(name), &me).unwrap());
+    assert!(ssh_broker::acl::verify_file_acl(&base.join("logs"), &me, Integrity::Medium).unwrap());
+    assert!(ssh_broker::acl::verify_file_acl(&base.join("logs").join(name), &me, Integrity::Medium).unwrap());
 }
 
 // Setting the descriptor of an open directory -----
@@ -583,7 +588,7 @@ fn set_through_handle(access: u32, with_owner: bool) -> (u32, bool) {
     };
     (
         rc.0,
-        ssh_broker::acl::verify_dir_acl(&d, &Sid::current_user().unwrap()).unwrap(),
+        ssh_broker::acl::verify_dir_acl(&d, &Sid::current_user().unwrap(), Integrity::Medium).unwrap(),
     )
 }
 
@@ -766,12 +771,18 @@ fn named_security_calls_act_on_a_last_component_link_itself_but_follow_one_above
         set_private_on_path(&path);
         if middle {
             assert_ne!(before, sddl_of(&target), "{what}: the far side was re-ACLed");
-            assert!(ssh_broker::acl::verify_dir_acl(&target, &me).unwrap(), "{what}");
+            assert!(
+                ssh_broker::acl::verify_dir_acl(&target, &me, Integrity::Medium).unwrap(),
+                "{what}"
+            );
         } else {
             assert_eq!(before, sddl_of(&target), "{what}: only the link was re-ACLed");
-            assert!(!ssh_broker::acl::verify_dir_acl(&target, &me).unwrap(), "{what}");
             assert!(
-                ssh_broker::acl::verify_dir_acl(&path, &me).unwrap(),
+                !ssh_broker::acl::verify_dir_acl(&target, &me, Integrity::Medium).unwrap(),
+                "{what}"
+            );
+            assert!(
+                ssh_broker::acl::verify_dir_acl(&path, &me, Integrity::Medium).unwrap(),
                 "{what}: verify read the link's own descriptor"
             );
         }

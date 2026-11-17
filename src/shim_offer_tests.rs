@@ -2,6 +2,7 @@
 //! no logon, no account.
 use super::*;
 use crate::account::{Elevation, LocalAccount};
+use crate::socket_loc::Integrity;
 use std::cell::RefCell;
 
 fn account(kind: AccountKind) -> Option<LocalAccount> {
@@ -128,35 +129,76 @@ fn an_unreadable_account_changes_nothing() {
 
 // stance -----
 
+const AT_HIGH: anyhow::Result<Integrity> = Ok(Integrity::High);
+const AT_MEDIUM: anyhow::Result<Integrity> = Ok(Integrity::Medium);
+
 #[test]
-fn a_full_token_relays_with_a_batch_logon_and_a_standard_one_with_an_interactive_logon() {
+fn a_full_token_relays_with_a_batch_logon() {
     assert_eq!(
-        stance(Ok(Elevation::Full)),
+        stance(Ok(Elevation::Full), AT_HIGH),
         Stance::Relay {
             logon: LogonKind::Batch
         }
     );
+}
+
+#[test]
+fn a_standard_token_at_medium_relays_with_an_interactive_logon() {
     assert_eq!(
-        stance(Ok(Elevation::Standard)),
+        stance(Ok(Elevation::Standard), AT_MEDIUM),
         Stance::Relay {
             logon: LogonKind::Interactive
         }
     );
 }
 
+/// An account that is not an administrator can still hold a full token, and its shim then waits on the
+/// elevated folder; the agent the prompt starts has to serve that one, which only a batch logon does.
 #[test]
-fn a_filtered_token_gets_the_plain_shell_and_no_relay() {
-    assert_eq!(stance(Ok(Elevation::Filtered)), Stance::PlainShell);
+fn a_standard_token_at_high_relays_with_a_batch_logon() {
+    assert_eq!(
+        stance(Ok(Elevation::Standard), AT_HIGH),
+        Stance::Relay {
+            logon: LogonKind::Batch
+        }
+    );
 }
 
 #[test]
-fn an_unreadable_token_still_relays_but_offers_nothing_and_keeps_the_cause() {
+fn a_filtered_token_gets_the_plain_shell_and_no_relay() {
+    assert_eq!(stance(Ok(Elevation::Filtered), AT_MEDIUM), Stance::PlainShell);
+    assert_eq!(stance(Ok(Elevation::Filtered), AT_HIGH), Stance::PlainShell);
+    // Whatever its level: one that cannot be read does not turn the plain shell into a relay.
     assert_eq!(
-        stance(Err(anyhow::anyhow!("the token cannot be read"))),
+        stance(
+            Ok(Elevation::Filtered),
+            Err(anyhow::anyhow!("the level cannot be read"))
+        ),
+        Stance::PlainShell
+    );
+}
+
+#[test]
+fn an_unreadable_elevation_still_relays_but_offers_nothing_and_keeps_the_cause() {
+    assert_eq!(
+        stance(Err(anyhow::anyhow!("the token cannot be read")), AT_HIGH),
         Stance::RelayWithoutOffer {
             cause: "the token cannot be read".into()
         }
     );
+}
+
+/// The logon kind comes from the integrity level, so a level that cannot be read leaves no kind to offer.
+#[test]
+fn an_unreadable_integrity_level_still_relays_but_offers_nothing_and_keeps_the_cause() {
+    for elevation in [Elevation::Full, Elevation::Standard] {
+        assert_eq!(
+            stance(Ok(elevation), Err(anyhow::anyhow!("the level cannot be read"))),
+            Stance::RelayWithoutOffer {
+                cause: "the level cannot be read".into()
+            }
+        );
+    }
 }
 
 const REFUSAL: &str = "make the private folder p/ssh-broker: p/ssh-broker cannot be used as the private folder: its ACL is not exactly Full Control for me. It is left as it is: inspect it, remove it, and it is created again";
@@ -212,7 +254,7 @@ fn a_batch_logon_without_a_console_gets_the_notice_as_before() {
 fn a_missing_batch_right_is_told_in_the_prompts_sentence_and_only_for_a_batch_logon() {
     let right = crate::logon::LogonFailure::from_win32(1385);
     let told = start_failure(LogonKind::Batch, "alice", right.clone());
-    let StartFailure::NoBatchRight { sentence } = told else {
+    let StartFailure::Limit { sentence } = told else {
         panic!("{told:?}");
     };
     assert_eq!(
@@ -222,6 +264,34 @@ fn a_missing_batch_right_is_told_in_the_prompts_sentence_and_only_for_a_batch_lo
     // An interactive logon's 1385 is Windows' own to say: the sentence is about a batch job.
     assert!(matches!(
         start_failure(LogonKind::Interactive, "alice", right),
+        StartFailure::Windows { .. }
+    ));
+}
+
+#[test]
+fn a_missing_impersonation_right_is_told_for_a_batch_logon_only() {
+    let held_by_administrators = crate::logon::LogonFailure::from_win32(1314);
+    assert!(held_by_administrators.privilege_not_held());
+    let told = start_failure(LogonKind::Batch, "alice", held_by_administrators.clone());
+    let StartFailure::Limit { sentence } = told else {
+        panic!("{told:?}");
+    };
+    assert_eq!(sentence, crate::offer::text::impersonate_right_missing("alice"));
+    assert!(
+        sentence.contains("Impersonate a client after authentication"),
+        "{sentence}"
+    );
+    assert!(
+        sentence.contains("a logon at the desktop starts one without it"),
+        "the way out is the batch sentence's: {sentence}"
+    );
+    assert!(
+        !sentence.contains("grant"),
+        "it does not tell the account to widen its rights"
+    );
+    // An interactive logon takes no such right: its 1314 is Windows' own to say.
+    assert!(matches!(
+        start_failure(LogonKind::Interactive, "alice", held_by_administrators),
         StartFailure::Windows { .. }
     ));
 }
@@ -485,7 +555,7 @@ fn a_folder_refused_on_one_look_and_usable_on_the_next_is_connected_through_and_
     folder.connect().expect_err("the folder is refused");
     assert!(folder.refusal().is_some(), "control: refused on the first look");
     crate::test_support::icacls(location.dir(), &["/remove:g", "*S-1-1-0"]);
-    let _listener = crate::afunix::Listener::bind(location.path()).unwrap();
+    let _listener = crate::afunix::Listener::bind(location.path(), crate::socket_loc::Integrity::Medium).unwrap();
 
     folder.connect().expect("the folder is usable now");
 
@@ -922,7 +992,7 @@ fn a_listening_socket_in_the_folder_is_connected_to() {
     let profile = crate::test_support::TempProfile::new("connect-listen");
     let location = profile.location();
     crate::userdir::ensure_socket_dir(&location, &me()).unwrap();
-    let _listener = crate::afunix::Listener::bind(location.path()).unwrap();
+    let _listener = crate::afunix::Listener::bind(location.path(), crate::socket_loc::Integrity::Medium).unwrap();
 
     assert!(connect_if_listening(&location, &me()).unwrap().is_some());
 }
@@ -935,7 +1005,7 @@ fn a_listener_in_a_refused_folder_is_not_connected_to_and_the_folder_is_named() 
     let profile = crate::test_support::TempProfile::new("connect-refused");
     let location = profile.location();
     crate::userdir::ensure_socket_dir(&location, &me()).unwrap();
-    let _listener = crate::afunix::Listener::bind(location.path()).unwrap();
+    let _listener = crate::afunix::Listener::bind(location.path(), crate::socket_loc::Integrity::Medium).unwrap();
     crate::test_support::widen(location.dir());
 
     let failed = connect_if_listening(&location, &me()).expect_err("connected through a folder that is not private");
@@ -1085,4 +1155,43 @@ fn a_session_that_may_end_with_its_connection_says_so_in_one_line() {
 fn a_session_that_outlives_its_connection_says_nothing() {
     use crate::logon::Survival;
     assert_eq!(survival_notice(Survival::OutlivesConnection), None);
+}
+
+// the agents a shim waits for -----
+
+/// The folder level of this process, which the agents the test starts inherit, and the other one.
+fn own_and_other_level() -> (crate::socket_loc::Integrity, crate::socket_loc::Integrity) {
+    use crate::socket_loc::Integrity::{High, Medium};
+    let own =
+        crate::account::integrity_class(crate::account::integrity_of(crate::winutil::own_token().unwrap().0).unwrap());
+    (own, if own == High { Medium } else { High })
+}
+
+/// An agent that serves the other folder is no reason to wait: the account's High agent keeps running
+/// after the account is taken out of Administrators, and the shim of its next login (Medium) looks in the
+/// plain folder, where that agent never serves. In CI the test process is High, so this is that case;
+/// on an unelevated host it is the reverse, which is the same rule.
+#[test]
+fn a_login_does_not_wait_for_an_agent_that_serves_the_folder_of_the_other_level() {
+    let (own, other) = own_and_other_level();
+    let copy = crate::test_support::NamedCopy::new("wait-level");
+    let mut agent = copy.spawn(&["agent", "--background"]);
+    let profile = TempProfile::new("wl");
+    let user = me();
+
+    let at_other = profile.location_at(other);
+    let outcome = await_starting_agent(&at_other, &copy.exe(), &user, || Ok(None)).unwrap();
+    assert!(
+        matches!(outcome, Starting::No),
+        "an agent of the other level is none of this folder's"
+    );
+
+    assert!(
+        Evidence::default()
+            .look(&profile.location_at(own), &copy.exe(), &user)
+            .unwrap(),
+        "control: the same agent is evidence for the folder of its own level"
+    );
+    drop(agent.stdin.take());
+    agent.wait().unwrap();
 }

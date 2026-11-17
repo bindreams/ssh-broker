@@ -221,3 +221,30 @@ fn a_label_with_no_sub_authority_is_an_error() {
     let err = unsafe { rid_of_label(PSID(sid.as_ptr().cast_mut().cast())) }.unwrap_err();
     assert!(err.to_string().contains("no sub-authority"), "{err:#}");
 }
+
+// the folder level of an integrity level -----
+
+#[test]
+fn the_folder_level_is_high_from_the_high_integrity_level_up_and_medium_below() {
+    use crate::socket_loc::Integrity;
+    assert_eq!(integrity_class(INTEGRITY_LOW), Integrity::Medium);
+    assert_eq!(integrity_class(INTEGRITY_MEDIUM), Integrity::Medium);
+    assert_eq!(
+        integrity_class(INTEGRITY_MEDIUM + 0xfff),
+        Integrity::Medium,
+        "just below High"
+    );
+    assert_eq!(integrity_class(INTEGRITY_HIGH), Integrity::High);
+    assert_eq!(integrity_class(INTEGRITY_SYSTEM), Integrity::High);
+}
+
+#[test]
+fn the_token_of_a_process_handle_is_that_process_s_token() {
+    use windows::Win32::System::Threading::GetCurrentProcess;
+    // SAFETY: the pseudo-handle of this process is valid for the call.
+    let token = crate::winutil::process_token(unsafe { GetCurrentProcess() }).unwrap();
+    assert_eq!(
+        integrity_of(token.0).unwrap(),
+        integrity_of(crate::winutil::own_token().unwrap().0).unwrap()
+    );
+}

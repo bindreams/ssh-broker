@@ -37,8 +37,9 @@ use windows::Win32::System::Threading::GetCurrentProcess;
 use super::{
     Made, OpenOutcome, OwnerAclWords, Security, Sharing, Sid, classify_open, denied_problem, describe_sid,
     descriptor_from_sddl, dir_policy, file_attributes, file_information, nt_create, nt_path, owner_acl_problem,
-    private_dir_dacl_sddl, status_error,
+    private_dir_sddl, status_error,
 };
+use crate::socket_loc::Integrity;
 use crate::winutil::{FileId, OwnedHandle};
 
 /// The rights a folder handle holds: to read its ACL and attributes, which is what verifying it takes.
@@ -329,14 +330,14 @@ pub fn open_dir(parent: &DirHandle, name: &str) -> anyhow::Result<DirHandle> {
 
 /// [`open_dir`] for the private folder (`ssh-broker`), when only what is in it matters: it is not made
 /// if missing and its owner and ACL are not judged, unless its ACL denies the access that holding it
-/// takes: then they are, as [`ensure_private_dir`] does, to say why. A file there is removed and a
-/// folder is made again. The folder is held (see [`ensure_private_dir`]).
-pub fn open_existing_private_dir(parent: &DirHandle, name: &str) -> anyhow::Result<DirHandle> {
+/// takes: then they are, as [`ensure_private_dir`] does for `integrity`, to say why. A file there is removed
+/// and a folder is made again. The folder is held (see [`ensure_private_dir`]).
+pub fn open_existing_private_dir(parent: &DirHandle, name: &str, integrity: Integrity) -> anyhow::Result<DirHandle> {
     let request = Request {
         denied: Some(denied_text("")),
         ..Request::directory("as the private folder", MADE_AGAIN).held()
     };
-    let (handle, path) = open_private_child(parent, name, &request, None)?;
+    let (handle, path) = open_private_child(parent, name, &request, None, integrity)?;
     Ok(DirHandle { handle, path })
 }
 
@@ -345,22 +346,46 @@ pub fn open_existing_private_dir(parent: &DirHandle, name: &str) -> anyhow::Resu
 /// Administrators} and whose ACL is exactly the private one. One that is not is refused and left
 /// untouched. Nothing existing is modified.
 ///
+/// For `Integrity::High` (the elevated agent's folder) the creation descriptor carries the High
+/// mandatory label, and an existing folder must carry exactly that label too: the label is born with
+/// the folder and never set after, so an unlabelled one is refused like any other that is not exactly
+/// right. `Medium` asks for none.
+///
 /// With [`Hold::Held`] nobody can rename or remove the folder while the handle lives, and a sharing
 /// violation on the open is a [`Refused`] that says another program holds the folder open. With
 /// [`Hold::Shared`] the handle takes no part in sharing checks.
-pub fn ensure_private_dir(parent: &DirHandle, name: &str, user: &Sid, hold: Hold) -> anyhow::Result<DirHandle> {
-    private_dir(parent, name, user, true, hold)
+pub fn ensure_private_dir(
+    parent: &DirHandle,
+    name: &str,
+    user: &Sid,
+    hold: Hold,
+    integrity: Integrity,
+) -> anyhow::Result<DirHandle> {
+    private_dir(parent, name, user, true, hold, integrity)
 }
 
 /// [`ensure_private_dir`] for a caller that only looks (`verify`): the same open and the same
 /// judgement, and a folder that is not there is [`Missing`] and is not made.
-pub fn open_private_dir(parent: &DirHandle, name: &str, user: &Sid, hold: Hold) -> anyhow::Result<DirHandle> {
-    private_dir(parent, name, user, false, hold)
+pub fn open_private_dir(
+    parent: &DirHandle,
+    name: &str,
+    user: &Sid,
+    hold: Hold,
+    integrity: Integrity,
+) -> anyhow::Result<DirHandle> {
+    private_dir(parent, name, user, false, hold, integrity)
 }
 
-fn private_dir(parent: &DirHandle, name: &str, user: &Sid, create: bool, hold: Hold) -> anyhow::Result<DirHandle> {
+fn private_dir(
+    parent: &DirHandle,
+    name: &str,
+    user: &Sid,
+    create: bool,
+    hold: Hold,
+    integrity: Integrity,
+) -> anyhow::Result<DirHandle> {
     let descriptor = if create {
-        Some(descriptor_from_sddl(&private_dir_dacl_sddl(user)?)?)
+        Some(descriptor_from_sddl(&private_dir_sddl(user, integrity)?)?)
     } else {
         None
     };
@@ -379,8 +404,8 @@ fn private_dir(parent: &DirHandle, name: &str, user: &Sid, create: bool, hold: H
         hold,
         ..Request::directory("as the private folder", MADE_AGAIN)
     };
-    let (handle, path) = open_private_child(parent, name, &request, Some(user))?;
-    refuse_unless_private(&handle, &path, user, request.purpose)?;
+    let (handle, path) = open_private_child(parent, name, &request, Some(user), integrity)?;
+    refuse_unless_private(&handle, &path, user, request.purpose, integrity)?;
     Ok(DirHandle { handle, path })
 }
 
@@ -390,17 +415,29 @@ fn denied_text(may_not_make: &str) -> String {
     format!("{}{may_not_make}. {LEFT_AS_IT_IS}", denied_problem("the private one"))
 }
 
-/// Refuse the folder `handle` is open on, at `path`, if its owner or its ACL is not the private one.
-fn refuse_unless_private(handle: &OwnedHandle, path: &Path, user: &Sid, purpose: &str) -> anyhow::Result<()> {
-    let security = Security::from_handle(handle.0).with_context(|| format!("read the ACL of {}", path.display()))?;
-    let (owner_ok, acl_ok) = dir_policy(&security, user)?;
+/// Refuse the folder `handle` is open on, at `path`, if its owner or its ACL is not the private one for
+/// `integrity` (for `High`, the label too).
+fn refuse_unless_private(
+    handle: &OwnedHandle,
+    path: &Path,
+    user: &Sid,
+    purpose: &str,
+    integrity: Integrity,
+) -> anyhow::Result<()> {
+    let security =
+        Security::from_handle(handle.0, integrity).with_context(|| format!("read the ACL of {}", path.display()))?;
+    let (owner_ok, acl_ok) = dir_policy(&security, user, integrity)?;
     if let Some(problem) = owner_acl_problem(owner_ok, acl_ok, || OwnerAclWords {
         owner: describe_sid(security.owner),
         owner_set: format!("{}, SYSTEM or Administrators", user.describe()),
         acl_is: format!(
             "exactly Full Control for {}, SYSTEM and Administrators, protected and inherited by what is made \
-             inside",
-            user.describe()
+             inside{}",
+            user.describe(),
+            match integrity {
+                Integrity::Medium => "",
+                Integrity::High => ", with the High mandatory label (no write up) that what is made inside inherits",
+            }
         ),
     }) {
         return Err(Refused(format!(
@@ -422,6 +459,7 @@ fn open_private_child(
     name: &str,
     request: &Request,
     user: Option<&Sid>,
+    integrity: Integrity,
 ) -> anyhow::Result<(OwnedHandle, PathBuf)> {
     let denied = match open_child(parent, name, request) {
         Err(e) if e.is::<HoldDenied>() => e,
@@ -436,7 +474,7 @@ fn open_private_child(
             &current
         }
     };
-    refuse_unless_private(&handle, &path, user, request.purpose)?;
+    refuse_unless_private(&handle, &path, user, request.purpose, integrity)?;
     Err(Refused(format!(
         "{} cannot be used {}: its owner and ACL are right, yet this process could not hold it ({denied}). \
          {LEFT_AS_IT_IS}",

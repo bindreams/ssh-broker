@@ -101,6 +101,47 @@ CASES: dict[str, tuple[list[str], list[str]]] = {
             "    // #[test] in prose",
         ],
     ),
+    "no-space-runs-in-literals": (
+        [
+            '        "this login is elevated, and starting a session for {user} needs          the right",',
+            '        "refused: the folder is not the private one          so no session is offered",',
+            '    let s = "ssh-broker: cannot connect           (the agent did not answer)";',
+            '    let s = format!("a   b");',
+            '    let s = f("a", "b   c");',
+            '    let s = "say \\"hi\\" and   go";',
+            # A char literal holding a quote does not open a literal, so the run after it is code; but a
+            # literal that follows it still counts.
+            "    let s = '\"'; let t = \"a   b\";",
+            '    let s = "a   b"; // spaces-ok:',
+            # An ordinary literal after a raw string still counts.
+            '    let p = r"C:\\"; let s = "a   b";',
+            '    let p = r#"a "quoted" b"#; let s = "a   b";',
+        ],
+        [
+            '        "a sentence on its own line",',
+            "    let x   = 1;",
+            "    let x = f(a,     b);",
+            '    foo();      // aligned "comment"',
+            '    f("a"),    g("b")',
+            '    let t = ("ab");    let u = ("cd");',
+            "    let c = '\"'; foo(     x);",
+            "    fn f<'a>(x: &'a str,     y: u8) {}",
+            '    let s = "a   ";',
+            '    let s = "   a";',
+            '    let s = "a\\n    b";',
+            '    let s = "a  b";',
+            '    let s = "a   b"; // spaces-ok: a table column',
+            # A raw string is skipped whole: a trailing `\` does not escape its closing quote, so the code
+            # after it is not inside a literal. A run in its text is not matched either.
+            '    let p = r"C:\\"; let x   = 1;',
+            '    let p = r#"a "quoted" b"#; let x   = 1;',
+            '    let p = br"C:\\"; let x   = 1;',
+            '    let p = r"a   b";',
+            # Known limit: only the line with the opening quote is read, so a run typed into a later line
+            # of a sentence continued with `\` is not seen.
+            '        so a run   here is not seen",',
+        ],
+    ),
 }
 
 
@@ -115,6 +156,14 @@ FILTERS: dict[str, dict[str, object]] = {
     "tests-in-separate-files": {
         "types": ["rust"],
         "exclude": r"^tests/|_tests\.rs$",
+        "files": None,
+        "types_or": None,
+        "exclude_types": None,
+        "args": None,
+    },
+    "no-space-runs-in-literals": {
+        "types": ["rust"],
+        "exclude": None,
         "files": None,
         "types_or": None,
         "exclude_types": None,

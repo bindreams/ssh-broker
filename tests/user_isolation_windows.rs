@@ -21,6 +21,7 @@ use ssh_broker::account::{INTEGRITY_LOW, INTEGRITY_MEDIUM};
 use ssh_broker::acl::{self, Sid};
 use ssh_broker::afunix::Listener;
 use ssh_broker::agent_lock::{SessionSlot, UserLock};
+use ssh_broker::socket_loc::Integrity;
 use ssh_broker::socket_loc::SocketLocation;
 use ssh_broker::userdir;
 use ssh_broker::winutil::OwnedHandle;
@@ -118,17 +119,18 @@ fn read_sddl(path: &Path, info: OBJECT_SECURITY_INFORMATION) -> Result<String, S
     }
 }
 
-/// The mandatory-label ACE that makes an object Low with the ACE flags `ace_flags`, as SDDL.
-fn low_label_ace(ace_flags: &str) -> String {
-    format!("(ML;{ace_flags};NW;;;LW)")
+/// The mandatory-label ACE that makes an object `level` (an SDDL alias: `LW` Low, `ME` Medium) with the
+/// ACE flags `ace_flags`, as SDDL.
+fn label_ace(ace_flags: &str, level: &str) -> String {
+    format!("(ML;{ace_flags};NW;;;{level})")
 }
 
-/// Set `path`'s mandatory integrity label to Low, with the ACE flags `ace_flags` (`OICI` to pass it to
-/// children of a directory, empty for a file), so that a Low-integrity process of the user may write
-/// to it. Set through the security API: `icacls /setintegritylevel` reports success on a socket file
-/// and leaves it unlabelled.
-fn set_low_label(path: &Path, ace_flags: &str) {
-    let sddl = wide(&format!("S:{}", low_label_ace(ace_flags)));
+/// Set `path`'s mandatory integrity label to `level` (`LW`, `ME`), with the ACE flags `ace_flags` (`OICI`
+/// to pass it to children of a directory, empty for a file). Low lets a Low-integrity process of the user
+/// write to it. Set through the security API: `icacls /setintegritylevel` reports success on a socket
+/// file and leaves it unlabelled.
+fn set_label(path: &Path, ace_flags: &str, level: &str) {
+    let sddl = wide(&format!("S:{}", label_ace(ace_flags, level)));
     let path_w = wide(&path.to_string_lossy());
     // SAFETY: NUL-terminated inputs; the descriptor outlives the call and is freed after it.
     unsafe {
@@ -147,7 +149,7 @@ fn set_low_label(path: &Path, ace_flags: &str) {
             Some(sacl as *const ACL),
         );
         let _ = LocalFree(Some(HLOCAL(sd.0)));
-        rc.ok().unwrap_or_else(|e| panic!("label {path:?} Low: {e}"));
+        rc.ok().unwrap_or_else(|e| panic!("label {path:?} {level}: {e}"));
     }
 }
 
@@ -212,9 +214,14 @@ impl StandInProfile {
         StandInProfile(root)
     }
 
-    /// The socket location the product derives for this profile.
+    /// The socket location the product derives for this profile, for an agent below High.
     fn location(&self) -> SocketLocation {
-        ssh_broker::socket_loc::for_profile(&self.0).expect("the stand-in profile path is short enough")
+        self.location_at(Integrity::Medium)
+    }
+
+    /// The location for processes at `integrity`.
+    fn location_at(&self, integrity: Integrity) -> SocketLocation {
+        ssh_broker::socket_loc::for_profile(&self.0, integrity).expect("the stand-in profile path is short enough")
     }
 }
 
@@ -341,7 +348,7 @@ fn a_permissive_default_dacl_is_in_effect_where_nothing_is_inherited() {
     let file = plain.join("born.txt");
     with_permissive_default_dacl(|| std::fs::write(&file, "x").unwrap());
 
-    let exact = acl::verify_file_acl(&file, &me).unwrap();
+    let exact = acl::verify_file_acl(&file, &me, Integrity::Medium).unwrap();
     let report = format!(
         "the file: {}\nits DACL: {}\nits directory: {}\nits DACL: {}",
         icacls_report(&file),
@@ -367,15 +374,24 @@ fn a_creator_whose_default_dacl_is_world_accessible_still_gets_an_exact_socket_a
         userdir::ensure_socket_dir(&loc, &me).unwrap();
         let _lock = UserLock::try_acquire(&loc.lock_path()).unwrap().unwrap();
         let _slot = SessionSlot::try_acquire(&loc.sessions_lock_path(), 1).unwrap().unwrap();
-        let _listener = Listener::bind(loc.path()).unwrap();
+        let _listener = Listener::bind(loc.path(), Integrity::Medium).unwrap();
 
-        assert!(acl::verify_file_acl(loc.path(), &me).unwrap(), "agent.sock");
-        assert!(acl::verify_file_acl(&loc.lock_path(), &me).unwrap(), "agent.lock");
         assert!(
-            acl::verify_file_acl(&loc.sessions_lock_path(), &me).unwrap(),
+            acl::verify_file_acl(loc.path(), &me, Integrity::Medium).unwrap(),
+            "agent.sock"
+        );
+        assert!(
+            acl::verify_file_acl(&loc.lock_path(), &me, Integrity::Medium).unwrap(),
+            "agent.lock"
+        );
+        assert!(
+            acl::verify_file_acl(&loc.sessions_lock_path(), &me, Integrity::Medium).unwrap(),
             "session slot"
         );
-        assert!(acl::verify_file_acl(&loc.logs_dir(), &me).unwrap(), "logs");
+        assert!(
+            acl::verify_file_acl(&loc.logs_dir(), &me, Integrity::Medium).unwrap(),
+            "logs"
+        );
     });
 }
 
@@ -390,23 +406,29 @@ fn each_users_socket_dir_acl_is_exact() {
         userdir::ensure_socket_dir(&loc, &admin).unwrap();
         let _lock = UserLock::try_acquire(&loc.lock_path()).unwrap().unwrap();
         let _slot = SessionSlot::try_acquire(&loc.sessions_lock_path(), 1).unwrap().unwrap();
-        let _listener = Listener::bind(loc.path()).unwrap();
+        let _listener = Listener::bind(loc.path(), Integrity::Medium).unwrap();
 
-        assert!(acl::verify_dir_acl(loc.dir(), &admin).unwrap());
+        assert!(acl::verify_dir_acl(loc.dir(), &admin, Integrity::Medium).unwrap());
         assert!(
-            !acl::verify_dir_acl(loc.dir(), &bob.sid).unwrap(),
+            !acl::verify_dir_acl(loc.dir(), &bob.sid, Integrity::Medium).unwrap(),
             "the dir is not bob's"
         );
         // Born with exactly the three, although the creating token would have let everyone in.
-        assert!(acl::verify_file_acl(loc.path(), &admin).unwrap(), "agent.sock");
-        assert!(acl::verify_file_acl(&loc.lock_path(), &admin).unwrap(), "agent.lock");
         assert!(
-            acl::verify_file_acl(&loc.sessions_lock_path(), &admin).unwrap(),
+            acl::verify_file_acl(loc.path(), &admin, Integrity::Medium).unwrap(),
+            "agent.sock"
+        );
+        assert!(
+            acl::verify_file_acl(&loc.lock_path(), &admin, Integrity::Medium).unwrap(),
+            "agent.lock"
+        );
+        assert!(
+            acl::verify_file_acl(&loc.sessions_lock_path(), &admin, Integrity::Medium).unwrap(),
             "session slot"
         );
-        assert!(!acl::verify_file_acl(loc.path(), &bob.sid).unwrap());
+        assert!(!acl::verify_file_acl(loc.path(), &bob.sid, Integrity::Medium).unwrap());
         assert!(
-            !acl::verify_file_acl(&loc.sessions_lock_path(), &bob.sid).unwrap(),
+            !acl::verify_file_acl(&loc.sessions_lock_path(), &bob.sid, Integrity::Medium).unwrap(),
             "the session slot is not bob's"
         );
     });
@@ -484,11 +506,14 @@ fn bob_cannot_connect_to_a_socket_in_another_users_dir() {
         for loc in [&denied, &control] {
             userdir::ensure_socket_dir(loc, &admin).unwrap();
             locks.push(UserLock::try_acquire(&loc.lock_path()).unwrap().unwrap());
-            listeners.push(Listener::bind(loc.path()).unwrap());
+            listeners.push(Listener::bind(loc.path(), Integrity::Medium).unwrap());
         }
         (listeners, locks)
     });
-    assert!(acl::verify_file_acl(denied.path(), &admin).unwrap(), "control: exact");
+    assert!(
+        acl::verify_file_acl(denied.path(), &admin, Integrity::Medium).unwrap(),
+        "control: exact"
+    );
     // The control socket additionally grants bob, so a refusal elsewhere is the ACL's doing and
     // not an unreachable path or a missing right.
     let status = desktop::status(
@@ -601,7 +626,7 @@ fn a_low_integrity_process_of_the_same_user_cannot_connect_to_the_agent_socket()
     let profile = StandInProfile::new("low");
     let loc = profile.location();
     userdir::ensure_socket_dir(&loc, &me).unwrap();
-    let _listener = Listener::bind(loc.path()).unwrap();
+    let _listener = Listener::bind(loc.path(), Integrity::Medium).unwrap();
     let security_of_file = |context: &str| {
         let info = DACL_SECURITY_INFORMATION | LABEL_SECURITY_INFORMATION;
         read_sddl(loc.path(), info).unwrap_or_else(|e| panic!("read the socket file's security {context}: {e}"))
@@ -615,7 +640,7 @@ fn a_low_integrity_process_of_the_same_user_cannot_connect_to_the_agent_socket()
     );
     println!("{measured}");
     assert!(
-        acl::verify_file_acl(loc.path(), &me).unwrap(),
+        acl::verify_file_acl(loc.path(), &me, Integrity::Medium).unwrap(),
         "the socket is exact\n{measured}"
     );
     // The refusal below rests on the file having no integrity label, which makes it Medium with
@@ -631,7 +656,7 @@ fn a_low_integrity_process_of_the_same_user_cannot_connect_to_the_agent_socket()
     let run = |tag: &str, level: u32| {
         let dir = profile.0.join(format!("pair-{tag}"));
         std::fs::create_dir(&dir).unwrap();
-        set_low_label(&dir, "OICI");
+        set_label(&dir, "OICI", "LW");
         child_entry::write_input(&dir, &format!("socket={}\nintegrity={level}\n", loc.path().display()));
         let name = "child_connects_at_its_integrity_level";
         let code = integrity::run_at(
@@ -668,10 +693,10 @@ fn a_low_integrity_process_of_the_same_user_cannot_connect_to_the_agent_socket()
 
     // The label is the cause: with only the socket file's label lowered to Low, the same Low child
     // connects.
-    set_low_label(loc.path(), "");
+    set_label(loc.path(), "", "LW");
     let labelled = security_of_file("after it was labelled Low");
     assert!(
-        labelled.contains(&low_label_ace("")) && acl::verify_file_acl(loc.path(), &me).unwrap(),
+        labelled.contains(&label_ace("", "LW")) && acl::verify_file_acl(loc.path(), &me, Integrity::Medium).unwrap(),
         "the socket file must carry a Low label and keep its exact DACL\n{measured}\nnow: {labelled}"
     );
     let low_labelled = run("low-labelled", INTEGRITY_LOW);
@@ -680,6 +705,290 @@ fn a_low_integrity_process_of_the_same_user_cannot_connect_to_the_agent_socket()
         low_labelled, expected_low_labelled,
         "a Low-integrity process must connect once the socket file is labelled Low\n{measured}\nnow: {labelled}"
     );
+}
+
+// Who can connect: the elevated folder --------------------------------------------------------
+
+/// `key=ok`, or `key=failed:<OS error>`, for the outcome of one act of a child on the elevated folder.
+fn act_fact<T>(key: &str, outcome: std::io::Result<T>) -> String {
+    match outcome {
+        Ok(_) => format!("{key}=ok\n"),
+        Err(e) => format!(
+            "{key}=failed:{}\n",
+            e.raw_os_error().map_or("none".to_owned(), |code| code.to_string())
+        ),
+    }
+}
+
+/// Child half of [`an_unelevated_process_of_the_account_is_refused_the_elevated_folder`]: connect to the
+/// socket in the folder, create a file in it, rename and delete a file in it, and ask for the right to
+/// write the folder's attributes, each with the plain file calls of the standard library and the
+/// product's own client, and record what each said.
+#[test]
+#[ignore = "run as a child of an_unelevated_process_of_the_account_is_refused_the_elevated_folder"]
+fn child_acts_in_the_elevated_folder() {
+    use std::os::windows::fs::OpenOptionsExt;
+    /// `FILE_WRITE_ATTRIBUTES`: what changing a folder's attributes asks for.
+    const FILE_WRITE_ATTRIBUTES: u32 = 0x100;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+
+    let dir = child_entry::dir();
+    let text = child_entry::input(&dir);
+    let value_after = |key: &str| {
+        text.lines()
+            .find_map(|l| l.strip_prefix(key))
+            .unwrap_or_else(|| child_fails(&dir, &format!("the child's input has no {key}")))
+            .to_owned()
+    };
+    let folder = PathBuf::from(value_after("folder="));
+    let expected: u32 = value_after("integrity=")
+        .parse()
+        .unwrap_or_else(|e| child_fails(&dir, &format!("the child's integrity is not a number: {e}")));
+    let level = integrity::current_rid();
+    if level != expected {
+        child_fails(
+            &dir,
+            &format!("the child runs at integrity {level:#x}, its parent meant {expected:#x}"),
+        );
+    }
+
+    let mut facts = format!("integrity={level}\n");
+    facts += &act_fact(
+        "connect",
+        raw_connect::raw_connect(&folder.join("agent.sock")).map_err(|e| {
+            e.downcast::<std::io::Error>()
+                .unwrap_or_else(|e| std::io::Error::other(format!("{e:#}")))
+        }),
+    );
+    facts += &act_fact("create", std::fs::File::create_new(folder.join("made-by-the-child")));
+    facts += &act_fact(
+        "rename",
+        std::fs::rename(folder.join("kept-for-rename"), folder.join("renamed-by-the-child")),
+    );
+    facts += &act_fact("delete", std::fs::remove_file(folder.join("kept-for-delete")));
+    facts += &act_fact(
+        "attributes",
+        std::fs::OpenOptions::new()
+            .access_mode(FILE_WRITE_ATTRIBUTES)
+            .share_mode(7)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(&folder),
+    );
+    child_entry::write_result(&dir, &facts);
+}
+
+/// Elevated (CI only). The elevated folder is born labelled High: a process of the same account below High
+/// (an unelevated prompt, an `internal-unelevated` session) is refused the connect and every change to the
+/// folder, and a High process of the account (the control) does all of them. Each is an act the child asks
+/// for through the ordinary calls; none tries to get round the refusal.
+#[test]
+fn an_unelevated_process_of_the_account_is_refused_the_elevated_folder() {
+    account::assert_elevated();
+    let me = Sid::current_user().unwrap();
+    let profile = StandInProfile::new("hi");
+    let loc = profile.location_at(Integrity::High);
+    userdir::ensure_socket_dir(&loc, &me).unwrap();
+    let _listener = Listener::bind(loc.path(), Integrity::High).unwrap();
+    assert!(
+        acl::verify_dir_acl(loc.dir(), &me, Integrity::High).unwrap()
+            && acl::verify_file_acl(loc.path(), &me, Integrity::High).unwrap(),
+        "the folder and the socket carry the label\n{}",
+        dacl_and_label_sddl(loc.dir())
+    );
+    let make_files = || {
+        for name in ["kept-for-rename", "kept-for-delete"] {
+            std::fs::write(loc.dir().join(name), "kept").unwrap();
+        }
+    };
+    make_files();
+
+    let exe = std::env::current_exe().unwrap();
+    let run = |tag: &str, level: u32| {
+        let dir = profile.0.join(format!("pair-{tag}"));
+        std::fs::create_dir(&dir).unwrap();
+        set_label(&dir, "OICI", "LW");
+        child_entry::write_input(&dir, &format!("folder={}\nintegrity={level}\n", loc.dir().display()));
+        let code = integrity::run_at(
+            level,
+            &exe,
+            &child_entry::command_line(&exe, "child_acts_in_the_elevated_folder", &dir),
+            &dir,
+            std::slice::from_ref(&dir),
+        );
+        assert_eq!(
+            code,
+            0,
+            "the {tag} child failed: {}\nits result: {}",
+            hard_errors::describe_exit(code),
+            std::fs::read_to_string(child_entry::result_path(&dir)).unwrap_or_else(|e| format!("none ({e})")),
+        );
+        let result = child_entry::result(&dir);
+        println!("{tag}-integrity child:\n{result}");
+        result
+    };
+    let measured = || {
+        format!(
+            "the folder: {}\n  {}",
+            loc.dir().display(),
+            dacl_and_label_sddl(loc.dir())
+        )
+    };
+
+    let medium = run("medium", INTEGRITY_MEDIUM);
+    assert_eq!(
+        fact(&medium, "connect"),
+        format!("failed:{WSAEACCES}"),
+        "the connect is refused\n{}\n{medium}",
+        measured()
+    );
+    for act in ["create", "rename", "delete", "attributes"] {
+        assert!(
+            fact(&medium, act).starts_with("failed:"),
+            "a process below High must be refused: {act}\n{}\n{medium}",
+            measured()
+        );
+    }
+    for name in ["kept-for-rename", "kept-for-delete"] {
+        assert!(loc.dir().join(name).is_file(), "{name} is still there\n{}", measured());
+    }
+    assert!(
+        !loc.dir().join("made-by-the-child").exists(),
+        "nothing was made\n{}",
+        measured()
+    );
+    assert!(
+        acl::verify_dir_acl(loc.dir(), &me, Integrity::High).unwrap(),
+        "the folder is as it was\n{}",
+        measured()
+    );
+
+    // The control: the same child at High, the account's elevated level, does each of them.
+    let high = run("high", ssh_broker::account::INTEGRITY_HIGH);
+    for act in ["connect", "create", "rename", "delete", "attributes"] {
+        assert_eq!(
+            fact(&high, act),
+            "ok",
+            "a High process of the account does {act}: the refusals above are the label's\n{}\n{high}",
+            measured()
+        );
+    }
+}
+
+/// Elevated (CI only). The log folder inside the elevated folder is made with the High label, and the
+/// walk judges it with that label: it passes for the folder as the agent makes it, and refuses one with
+/// the right owner and DACL that lacks the label or carries another (here Medium), naming the log folder.
+#[test]
+fn the_log_folder_in_the_elevated_folder_carries_the_label() {
+    account::assert_elevated();
+    let me = Sid::current_user().unwrap();
+    let profile = StandInProfile::new("hl");
+    let loc = profile.location_at(Integrity::High);
+    userdir::ensure_socket_dir(&loc, &me).unwrap();
+    assert!(
+        acl::verify_dir_acl(&loc.logs_dir(), &me, Integrity::High).unwrap(),
+        "logs carries the label\n{}",
+        dacl_and_label_sddl(&loc.logs_dir())
+    );
+    for walk in [userdir::open_socket_dir, userdir::inspect_socket_dir] {
+        walk(&loc, &me)
+            .unwrap()
+            .logs
+            .unwrap_or_else(|e| panic!("the walk judges logs as the agent made it: {e:#}"));
+    }
+
+    // Put in its place the `logs` the product makes for processes below High: the same owner and DACL, and
+    // no label.
+    let below = profile.location_at(Integrity::Medium);
+    userdir::ensure_socket_dir(&below, &me).unwrap();
+    std::fs::remove_dir(loc.logs_dir()).unwrap();
+    std::fs::rename(below.logs_dir(), loc.logs_dir()).unwrap();
+    assert!(
+        acl::verify_dir_acl(&loc.logs_dir(), &me, Integrity::Medium).unwrap(),
+        "the stand-in has the right owner and DACL\n{}",
+        dacl_and_label_sddl(&loc.logs_dir())
+    );
+    let refused_for_the_label = |why: &str| {
+        for walk in [userdir::open_socket_dir, userdir::inspect_socket_dir] {
+            let opened = walk(&loc, &me).expect("the private folder itself is the elevated one");
+            let err = format!(
+                "{:#}",
+                opened.logs.err().unwrap_or_else(|| panic!("logs {why} is refused"))
+            );
+            assert!(err.contains(&loc.logs_dir().display().to_string()), "{why}: {err}");
+            assert!(err.contains("mandatory label"), "{why}: {err}");
+        }
+    };
+    refused_for_the_label("without the label");
+
+    // An explicit label that is not the High one is refused too.
+    set_label(&loc.logs_dir(), "OICI", "ME");
+    let sddl = dacl_and_label_sddl(&loc.logs_dir());
+    assert!(sddl.contains(&label_ace("OICI", "ME")), "{sddl}");
+    refused_for_the_label("labelled Medium");
+}
+
+/// Child half of [`a_folder_the_account_made_in_the_elevated_ones_place_is_refused`]: make the folder the
+/// way any process of the account can, with the plain call.
+#[test]
+#[ignore = "run as a child of a_folder_the_account_made_in_the_elevated_ones_place_is_refused"]
+fn child_makes_a_folder_in_the_elevated_ones_place() {
+    let dir = child_entry::dir();
+    let text = child_entry::input(&dir);
+    let folder = text
+        .lines()
+        .find_map(|l| l.strip_prefix("folder="))
+        .unwrap_or_else(|| child_fails(&dir, "the child's input has no folder="));
+    if let Err(e) = std::fs::create_dir(folder) {
+        child_fails(&dir, &format!("create {folder}: {e}"));
+    }
+    child_entry::write_result(&dir, "made\n");
+}
+
+/// Elevated (CI only), stated limit 4. A folder named `ssh-broker-elevated` that a process of the account
+/// below High made, while no agent or shim held the place, is refused by the elevated walk like any folder
+/// that is not exactly right: told where it is and what to do, and left as it is. The account does this to
+/// itself and can undo it, since it owns what it made.
+#[test]
+fn a_folder_the_account_made_in_the_elevated_ones_place_is_refused() {
+    account::assert_elevated();
+    let me = Sid::current_user().unwrap();
+    let profile = StandInProfile::new("hm");
+    let loc = profile.location_at(Integrity::High);
+    let exe = std::env::current_exe().unwrap();
+    let dir = profile.0.join("pair-makes");
+    std::fs::create_dir(&dir).unwrap();
+    set_label(&dir, "OICI", "LW");
+    child_entry::write_input(&dir, &format!("folder={}\n", loc.dir().display()));
+    let code = integrity::run_at(
+        INTEGRITY_MEDIUM,
+        &exe,
+        &child_entry::command_line(&exe, "child_makes_a_folder_in_the_elevated_ones_place", &dir),
+        &dir,
+        std::slice::from_ref(&dir),
+    );
+    assert_eq!(code, 0, "the child failed: {}", hard_errors::describe_exit(code));
+    assert_eq!(child_entry::result(&dir), "made\n");
+    let before = dacl_and_label_sddl(loc.dir());
+
+    for walk in [userdir::open_socket_dir, userdir::inspect_socket_dir] {
+        let err = format!(
+            "{:#}",
+            walk(&loc, &me).err().expect("the account's own folder is refused")
+        );
+        assert!(err.contains(&loc.dir().display().to_string()), "{err}");
+        assert!(
+            err.contains("It is left as it is: inspect it, remove it, and it is created again"),
+            "{err}"
+        );
+    }
+    assert_eq!(dacl_and_label_sddl(loc.dir()), before, "left as it was");
+    assert!(
+        !acl::verify_dir_acl(loc.dir(), &me, Integrity::High).unwrap(),
+        "and still not the elevated folder"
+    );
+    std::fs::remove_dir(loc.dir()).expect("the account can remove what it made");
+    userdir::ensure_socket_dir(&loc, &me).expect("and the folder is made again, born labelled");
+    assert!(acl::verify_dir_acl(loc.dir(), &me, Integrity::High).unwrap());
 }
 
 /// What the shim prints on stderr when it finds no agent behind the location it resolved and

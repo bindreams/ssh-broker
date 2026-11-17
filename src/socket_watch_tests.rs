@@ -34,7 +34,7 @@ impl TempDir {
 
     /// The location of a socket inside a profile at this folder.
     fn location(&self) -> SocketLocation {
-        socket_loc::for_profile(&self.0).unwrap()
+        socket_loc::for_profile(&self.0, crate::socket_loc::Integrity::Medium).unwrap()
     }
 }
 

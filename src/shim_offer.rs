@@ -26,7 +26,7 @@ use crate::offer::{
 };
 use crate::password_entry::{Password, Step};
 use crate::provision::procwait;
-use crate::socket_loc::SocketLocation;
+use crate::socket_loc::{Integrity, SocketLocation};
 use crate::socket_watch::SocketWatch;
 use crate::userdir::SocketDir;
 use crate::{provision, starting_agent};
@@ -105,23 +105,25 @@ pub enum Stance {
     PlainShell,
     /// Relay; with no agent, an offer signs the account on as `logon`.
     Relay { logon: LogonKind },
-    /// The elevation could not be read (`cause`): relay, and with no agent say so and offer nothing.
+    /// The elevation or the level could not be read (`cause`): relay, and with no agent say so and offer nothing.
     RelayWithoutOffer { cause: String },
 }
 
-/// Decide the [`Stance`] for `elevation`. Only a `Full` token's account needs the whole token, so only
-/// it signs on as a batch job.
-pub fn stance(elevation: anyhow::Result<Elevation>) -> Stance {
-    match elevation {
-        Ok(Elevation::Filtered) => Stance::PlainShell,
-        Ok(Elevation::Full) => Stance::Relay {
+/// Decide the [`Stance`] for a token with `elevation` at the folder level `integrity`. The logon kind
+/// follows `integrity`, as the folder does, so the agent the offer starts serves the folder the shim waits
+/// on (High: batch, which UAC does not split; below: interactive). A filtered token gets the plain shell
+/// at any level.
+pub fn stance(elevation: anyhow::Result<Elevation>, integrity: anyhow::Result<Integrity>) -> Stance {
+    match (elevation, integrity) {
+        (Ok(Elevation::Filtered), _) => Stance::PlainShell,
+        (Err(e), _) | (Ok(_), Err(e)) => Stance::RelayWithoutOffer {
+            cause: format!("{e:#}"),
+        },
+        (Ok(_), Ok(Integrity::High)) => Stance::Relay {
             logon: LogonKind::Batch,
         },
-        Ok(Elevation::Standard) => Stance::Relay {
+        (Ok(_), Ok(Integrity::Medium)) => Stance::Relay {
             logon: LogonKind::Interactive,
-        },
-        Err(e) => Stance::RelayWithoutOffer {
-            cause: format!("{e:#}"),
         },
     }
 }
@@ -607,13 +609,20 @@ impl OfferIo for LiveIo {
     }
 }
 
-/// What the offer says of a logon that Windows refused. A refused batch logon for want of the batch right
-/// gets `auto-login`'s sentence; every other refusal is Windows' own text.
+/// The batch-right and `SeImpersonatePrivilege` refusals get the broker's own sentence
+/// (`StartFailure::Limit`); any other refusal is Windows' text.
 fn start_failure(logon: LogonKind, user: &str, failure: LogonFailure) -> StartFailure {
-    if logon == LogonKind::Batch && failure.right_not_granted() {
-        return StartFailure::NoBatchRight {
-            sentence: crate::autologin::batch_right_missing(user, crate::autologin::FROM_PROMPT),
-        };
+    if logon == LogonKind::Batch {
+        if failure.right_not_granted() {
+            return StartFailure::Limit {
+                sentence: crate::autologin::batch_right_missing(user, crate::autologin::FROM_PROMPT),
+            };
+        }
+        if failure.privilege_not_held() {
+            return StartFailure::Limit {
+                sentence: text::impersonate_right_missing(user),
+            };
+        }
     }
     StartFailure::Windows { reason: failure.reason }
 }
@@ -763,11 +772,13 @@ struct Evidence {
 const MAX_EVIDENCE_HANDLES: usize = 63;
 
 impl Evidence {
-    /// Look again: who holds the lock, and which agent processes run. True if any agent exists.
+    /// Look again: who holds the lock, and which agent processes at the location's level run. True if any
+    /// agent exists. An agent at the other level serves the other folder and is no reason to wait.
     /// The lock is looked at through the handle of the user's folder, opened afresh each time
     /// because the agent may not have made the folder yet; a folder that is not there holds no lock.
     fn look(&mut self, location: &SocketLocation, image: &Path, user: &Sid) -> anyhow::Result<bool> {
-        self.agents = procwait::user_agents(image, user).context("look for the user's agent processes")?;
+        self.agents =
+            procwait::user_agents(image, user, location.integrity()).context("look for the user's agent processes")?;
         let folder = crate::userdir::open_existing_socket_dir(location).map_err(folder_failure)?;
         let held = match &folder {
             Some(folder) => starting_agent::is_held(folder)

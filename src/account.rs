@@ -15,6 +15,7 @@ use windows::core::PWSTR;
 
 use crate::acl::Sid;
 pub use crate::offer::AccountKind;
+use crate::socket_loc::Integrity;
 use crate::winutil::{SE_GROUP_ENABLED, SE_GROUP_USE_FOR_DENY_ONLY, find_group, own_token, token_information};
 
 /// An account of this PC, as ssh-broker names it in prompts, logon calls and tasks.
@@ -74,6 +75,17 @@ pub const INTEGRITY_LOW: u32 = 0x1000;
 pub const INTEGRITY_MEDIUM: u32 = 0x2000;
 pub const INTEGRITY_HIGH: u32 = 0x3000;
 pub const INTEGRITY_SYSTEM: u32 = 0x4000;
+
+/// The folder level of a process whose token has the integrity level `rid` ([`integrity_of`]): High at
+/// [`INTEGRITY_HIGH`] and above, Medium below. The one rule that says which of the two folders (and which
+/// agents) a process belongs to.
+pub fn integrity_class(rid: u32) -> Integrity {
+    if rid >= INTEGRITY_HIGH {
+        Integrity::High
+    } else {
+        Integrity::Medium
+    }
+}
 
 /// How much of an administrator's power a token carries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -158,6 +170,11 @@ pub fn elevation_of(token: HANDLE) -> anyhow::Result<Elevation> {
 /// The elevation of this process's token.
 pub fn elevation() -> anyhow::Result<Elevation> {
     elevation_of(own_token()?.0)
+}
+
+/// The folder level of this process's token ([`integrity_class`] of [`integrity_of`]).
+pub fn integrity() -> anyhow::Result<Integrity> {
+    Ok(integrity_class(integrity_of(own_token()?.0)?))
 }
 
 #[cfg(test)]

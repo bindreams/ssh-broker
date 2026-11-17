@@ -104,3 +104,16 @@ entry = '^\s*#\[(?:[\w:]+::)?test\b'
 exclude = '^tests/|_tests\.rs$'
 language = "pygrep"
 types = ["rust"]
+
+[[repos.hooks]]
+id = "no-space-runs-in-literals"
+name = "no run of spaces inside a string literal"
+# A run of 3+ spaces between non-space characters inside a string literal is almost always
+# indentation lost when a sentence is joined across lines. Runs next to a quote or after an escape are
+# allowed; a literal that needs one opts out with `spaces-ok: <reason>` on the same line (a bare marker
+# does not suppress). Raw strings are skipped whole, runs in their text included. Only the line with the
+# literal's opening quote is read: a run typed into a later line of a sentence continued with `\` is not
+# checked.
+entry = '''^(?!.*spaces-ok:\s*\S)(?:(?<!\w)[bc]?r(#*)".*?"\1|(?!(?<!\w)[bc]?r#*")[^"']|'(?:\\.|[^'\\])'|'(?!(?:\\.|[^'\\])')|"(?:[^"\\]|\\.)*")*"(?:[^"\\]|\\.)*?[^\s"\\] {3,}[^\s"]'''
+language = "pygrep"
+types = ["rust"]

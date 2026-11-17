@@ -140,7 +140,7 @@ fn conhost_keeps_the_arguments_of_a_pty_command() {
 fn a_pty_command_is_relayed_as_conhost_rebuilt_it() {
     for (sent, relayed) in [
         (r#"echo  "a  b"   x"#, r#"echo "a  b" x"#),
-        ("cmd /c echo a   b", "cmd /c echo a b"),
+        ("cmd /c echo a   b", "cmd /c echo a b"), // spaces-ok: the run of spaces is the input under test
         (r#"echo "a"b"#, "echo ab"),
         (r#"x""y"#, "xy"),
         ("a\tb", "a b"),

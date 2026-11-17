@@ -6,7 +6,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use crate::socket_loc::SocketLocation;
+use crate::socket_loc::{Integrity, SocketLocation};
 
 // What a test compares, and the link it puts in the way -----
 
@@ -122,20 +122,68 @@ impl TempProfile {
         TempProfile(root)
     }
 
+    /// The plain folder's location, which most tests walk and bind in.
     pub fn location(&self) -> SocketLocation {
-        crate::socket_loc::for_profile(&self.0).expect("the stand-in profile path is short enough")
+        self.location_at(Integrity::Medium)
+    }
+
+    /// The location for processes at `integrity`: for `High` the elevated folder, which only an
+    /// elevated process can make (born labelled).
+    pub fn location_at(&self, integrity: Integrity) -> SocketLocation {
+        crate::socket_loc::for_profile(&self.0, integrity).expect("the stand-in profile path is short enough")
     }
 }
 
 /// The location in the profile `profile`, which need not exist: for a test that only connects to
 /// the socket and never walks to the folder.
 pub fn location_in(profile: &std::path::Path) -> SocketLocation {
-    crate::socket_loc::for_profile(profile).expect("the stand-in profile path is short enough")
+    crate::socket_loc::for_profile(profile, Integrity::Medium).expect("the stand-in profile path is short enough")
 }
 
 impl Drop for TempProfile {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// A temp directory holding a copy of `cmd.exe` named like the installed exe, so that the process
+/// snapshot lists what runs from it as an ssh-broker process. Removed on drop.
+pub struct NamedCopy {
+    dir: PathBuf,
+}
+
+impl NamedCopy {
+    pub fn new(tag: &str) -> NamedCopy {
+        let dir = std::env::temp_dir().join(format!("sb-named-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cmd = PathBuf::from(std::env::var_os("SystemRoot").expect("SystemRoot is set")).join(r"System32\cmd.exe");
+        std::fs::copy(cmd, dir.join(crate::provision::EXE_NAME)).unwrap();
+        NamedCopy { dir }
+    }
+
+    pub fn exe(&self) -> PathBuf {
+        self.dir.join(crate::provision::EXE_NAME)
+    }
+
+    /// Spawn the copy; cmd ignores `args` and exits when its stdin closes.
+    pub fn spawn(&self, args: &[&str]) -> std::process::Child {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        Command::new(self.exe())
+            .args(args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+            .unwrap()
+    }
+}
+
+impl Drop for NamedCopy {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
 

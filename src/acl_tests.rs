@@ -4,9 +4,10 @@
 use super::*;
 use windows::Win32::Security::Authorization::SetNamedSecurityInfoW;
 use windows::Win32::Security::{
-    GetSecurityDescriptorDacl, GetSecurityDescriptorOwner, PROTECTED_DACL_SECURITY_INFORMATION,
+    GetSecurityDescriptorDacl, GetSecurityDescriptorOwner, GetSecurityDescriptorSacl,
+    PROTECTED_DACL_SECURITY_INFORMATION,
 };
-use windows::Win32::System::Threading::GetCurrentProcess;
+use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
 #[test]
 fn current_user_sid_is_the_one_whoami_reports() {
@@ -63,7 +64,10 @@ fn harden_then_verify_roundtrips() {
     std::fs::create_dir_all(&dir).unwrap();
     let me = Sid::current_user().unwrap();
     harden_dir(&dir, &me).unwrap();
-    assert!(verify_dir_acl(&dir, &me).unwrap(), "a freshly hardened dir must verify");
+    assert!(
+        verify_dir_acl(&dir, &me, crate::socket_loc::Integrity::Medium).unwrap(),
+        "a freshly hardened dir must verify"
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -75,7 +79,7 @@ fn unhardened_dir_does_not_verify() {
     std::fs::create_dir_all(&dir).unwrap();
     let me = Sid::current_user().unwrap();
     assert!(
-        !verify_dir_acl(&dir, &me).unwrap(),
+        !verify_dir_acl(&dir, &me, crate::socket_loc::Integrity::Medium).unwrap(),
         "an un-hardened dir must NOT verify"
     );
     std::fs::remove_dir_all(&dir).ok();
@@ -91,7 +95,7 @@ fn hardened_dir_with_extra_everyone_ace_does_not_verify() {
     let me = Sid::current_user().unwrap();
     harden_dir(&dir, &me).unwrap();
     assert!(
-        verify_dir_acl(&dir, &me).unwrap(),
+        verify_dir_acl(&dir, &me, crate::socket_loc::Integrity::Medium).unwrap(),
         "sanity: a freshly hardened dir must verify before we corrupt it"
     );
 
@@ -105,7 +109,7 @@ fn hardened_dir_with_extra_everyone_ace_does_not_verify() {
     assert!(status.success(), "icacls /grant should succeed");
 
     assert!(
-        !verify_dir_acl(&dir, &me).unwrap(),
+        !verify_dir_acl(&dir, &me, crate::socket_loc::Integrity::Medium).unwrap(),
         "a dir granting Everyone must NOT verify"
     );
     std::fs::remove_dir_all(&dir).ok();
@@ -127,7 +131,7 @@ fn hardened_dir_with_deny_ace_does_not_verify() {
         .expect("run icacls");
     assert!(status.success(), "icacls /deny should succeed");
     assert!(
-        !verify_dir_acl(&dir, &me).unwrap(),
+        !verify_dir_acl(&dir, &me, crate::socket_loc::Integrity::Medium).unwrap(),
         "a DENY ACE must break verification"
     );
     std::fs::remove_dir_all(&dir).ok();
@@ -149,7 +153,7 @@ fn hardened_dir_with_inheritance_enabled_does_not_verify() {
         .expect("run icacls");
     assert!(status.success(), "icacls /inheritance:e should succeed");
     assert!(
-        !verify_dir_acl(&dir, &me).unwrap(),
+        !verify_dir_acl(&dir, &me, crate::socket_loc::Integrity::Medium).unwrap(),
         "a non-protected (inheritance-enabled) DACL must NOT verify"
     );
     std::fs::remove_dir_all(&dir).ok();
@@ -167,7 +171,7 @@ use windows::Win32::Foundation::{
 use windows::Win32::Security::{
     AdjustTokenPrivileges, DuplicateTokenEx, LUID_AND_ATTRIBUTES, LookupPrivilegeValueW, SE_PRIVILEGE_ENABLED,
     SE_RESTORE_NAME, SecurityImpersonation, TOKEN_ADJUST_PRIVILEGES, TOKEN_ALL_ACCESS, TOKEN_DUPLICATE,
-    TOKEN_PRIVILEGES, TokenImpersonation,
+    TOKEN_PRIVILEGES, TOKEN_QUERY, TokenImpersonation,
 };
 use windows::Win32::System::Threading::SetThreadToken;
 
@@ -536,7 +540,7 @@ fn a_system_owned_directory_with_the_exact_acl_is_refused() {
 }
 
 fn ace_count(dir: &Path) -> u32 {
-    let security = Security::from_path(dir).unwrap();
+    let security = Security::from_path(dir, Integrity::Medium).unwrap();
     let mut info = ACL_SIZE_INFORMATION::default();
     unsafe {
         GetAclInformation(
@@ -601,7 +605,9 @@ pub(super) fn in_memory(sddl: &str) -> Security {
         GetSecurityDescriptorDacl(psd, &mut present, &mut dacl, &mut defaulted).unwrap();
         let mut owner = PSID::default();
         GetSecurityDescriptorOwner(psd, &mut owner, &mut defaulted).unwrap();
-        Security { sd, dacl, owner }
+        let mut label: *mut ACL = std::ptr::null_mut();
+        GetSecurityDescriptorSacl(psd, &mut present, &mut label, &mut defaulted).unwrap();
+        Security { sd, dacl, label, owner }
     }
 }
 
@@ -775,7 +781,7 @@ fn ensure_private_dir_says_so_when_the_folders_security_cannot_be_read() {
     let root = open_root(&parent.0).unwrap();
 
     let err = without_privileges(|| {
-        ensure_private_dir(&root, "ssh-broker", &me_sid, Hold::Held)
+        ensure_private_dir(&root, "ssh-broker", &me_sid, Hold::Held, Integrity::Medium)
             .err()
             .expect("refused")
     });
@@ -791,7 +797,7 @@ fn ensure_private_dir_says_so_when_the_folders_security_cannot_be_read() {
     );
 
     let err = without_privileges(|| {
-        open_private_dir(&root, "ssh-broker", &me_sid, Hold::Held)
+        open_private_dir(&root, "ssh-broker", &me_sid, Hold::Held, Integrity::Medium)
             .err()
             .expect("refused")
     });
@@ -890,7 +896,7 @@ fn a_file_created_in_a_hardened_dir_is_born_with_exactly_the_three_aces() {
     let file = dir.0.join("agent.lock");
     std::fs::write(&file, "").unwrap();
     let me = Sid::current_user().unwrap();
-    assert!(verify_file_acl(&file, &me).unwrap());
+    assert!(verify_file_acl(&file, &me, crate::socket_loc::Integrity::Medium).unwrap());
 }
 
 #[test]
@@ -901,7 +907,7 @@ fn a_subdirectory_created_in_a_hardened_dir_inherits_the_three_aces() {
     let me = Sid::current_user().unwrap();
     // Inherited ACEs are not a protected, uninherited set, so the dir verifier is the wrong test:
     // the file verifier accepts inherited ACEs, and a directory carries the same three.
-    assert!(verify_file_acl(&sub, &me).unwrap());
+    assert!(verify_file_acl(&sub, &me, crate::socket_loc::Integrity::Medium).unwrap());
 }
 
 #[test]
@@ -913,15 +919,25 @@ fn dir_with_non_inheritable_aces_does_not_verify() {
     let me = Sid::current_user().unwrap();
     let sid = me.to_sddl().unwrap();
     set_security(&dir.0, &format!("O:{sid}D:P(A;;FA;;;{sid})(A;;FA;;;SY)(A;;FA;;;BA)"));
-    assert!(!verify_dir_acl(&dir.0, &me).unwrap());
+    assert!(!verify_dir_acl(&dir.0, &me, crate::socket_loc::Integrity::Medium).unwrap());
 }
 
 #[test]
 fn dir_hardened_for_one_user_does_not_verify_for_another() {
     let dir = hardened_user_dir("other-user");
     let me = Sid::current_user().unwrap();
-    assert!(verify_dir_acl(&dir.0, &me).unwrap(), "control");
-    assert!(!verify_dir_acl(&dir.0, &Sid::well_known(WellKnown::Users).unwrap()).unwrap());
+    assert!(
+        verify_dir_acl(&dir.0, &me, crate::socket_loc::Integrity::Medium).unwrap(),
+        "control"
+    );
+    assert!(
+        !verify_dir_acl(
+            &dir.0,
+            &Sid::well_known(WellKnown::Users).unwrap(),
+            crate::socket_loc::Integrity::Medium
+        )
+        .unwrap()
+    );
 }
 
 #[test]
@@ -936,9 +952,12 @@ fn verify_file_acl_rejects_a_file_widened_after_the_fact() {
     let file = dir.0.join("agent.sock");
     std::fs::write(&file, "").unwrap();
     let me = Sid::current_user().unwrap();
-    assert!(verify_file_acl(&file, &me).unwrap(), "control");
+    assert!(
+        verify_file_acl(&file, &me, crate::socket_loc::Integrity::Medium).unwrap(),
+        "control"
+    );
     icacls_str(&file, &["/grant", "*S-1-1-0:(R)"]);
-    assert!(!verify_file_acl(&file, &me).unwrap());
+    assert!(!verify_file_acl(&file, &me, crate::socket_loc::Integrity::Medium).unwrap());
 }
 
 /// `sddl` for a file that inherited its three ACEs, owned by `owner`.
@@ -950,7 +969,7 @@ fn inherited_file_sddl(owner: &str, user: &str) -> String {
 fn the_file_policy_accepts_the_inherited_set_and_rejects_every_deviation() {
     let me = Sid::current_user().unwrap();
     let user = me.to_sddl().unwrap();
-    let holds = |sddl: &str| file_policy_holds(&in_memory(sddl), &me).unwrap();
+    let holds = |sddl: &str| file_policy_holds(&in_memory(sddl), &me, Integrity::Medium).unwrap();
 
     assert!(
         holds(&inherited_file_sddl(&user, &user)),
@@ -993,7 +1012,8 @@ fn the_file_policy_accepts_the_inherited_set_and_rejects_every_deviation() {
     assert!(
         !file_policy_holds(
             &in_memory(&inherited_file_sddl(&user, &user)),
-            &Sid::well_known(WellKnown::Users).unwrap()
+            &Sid::well_known(WellKnown::Users).unwrap(),
+            Integrity::Medium
         )
         .unwrap(),
         "the set is for one user only"
@@ -1016,13 +1036,13 @@ fn ensure_private_dir_refuses_a_foreign_owner_and_leaves_the_folder() {
 
     set_security(&dir, &private_with_owner(&Sid::well_known(WellKnown::Users).unwrap()));
     let owner_of = |path: &Path| {
-        let security = Security::from_path(path).unwrap();
+        let security = Security::from_path(path, Integrity::Medium).unwrap();
         describe_sid(security.owner)
     };
     let before = owner_of(&dir);
     let err = format!(
         "{:#}",
-        ensure_private_dir(&handle, "d", &me, Hold::Held)
+        ensure_private_dir(&handle, "d", &me, Hold::Held, Integrity::Medium)
             .err()
             .expect("a Users owner is refused")
     );
@@ -1033,5 +1053,164 @@ fn ensure_private_dir_refuses_a_foreign_owner_and_leaves_the_folder() {
         &dir,
         &private_with_owner(&Sid::well_known(WellKnown::Administrators).unwrap()),
     );
-    ensure_private_dir(&handle, "d", &me, Hold::Held).expect("control: an Administrators owner is accepted");
+    ensure_private_dir(&handle, "d", &me, Hold::Held, Integrity::Medium)
+        .expect("control: an Administrators owner is accepted");
+}
+
+// the label of the elevated folder -----
+
+/// The label the elevated folder is born with: High, no write up, inherited by what is made inside.
+const HIGH_LABEL: &str = "S:(ML;OICI;NW;;;HI)";
+
+/// `sddl` of a private folder owned by `user` with `label` as its SACL.
+fn private_dir_sddl_with(user: &str, label: &str) -> String {
+    format!("O:{user}D:P(A;OICI;FA;;;{user})(A;OICI;FA;;;SY)(A;OICI;FA;;;BA){label}")
+}
+
+#[test]
+fn a_high_folder_must_carry_the_high_no_write_up_label_that_what_is_made_inside_inherits() {
+    let me = Sid::current_user().unwrap();
+    let user = me.to_sddl().unwrap();
+    let holds = |label: &str| {
+        let (owner_ok, acl_ok) =
+            dir_policy(&in_memory(&private_dir_sddl_with(&user, label)), &me, Integrity::High).unwrap();
+        owner_ok && acl_ok
+    };
+
+    assert!(holds(HIGH_LABEL), "control: the label the folder is made with");
+    assert!(holds("S:AI(ML;OICI;NW;;;HI)"), "as Windows reads it back");
+    assert!(!holds(""), "no label");
+    assert!(!holds("S:(ML;OICI;NW;;;ME)"), "Medium is no label at all");
+    assert!(!holds("S:(ML;OICI;NW;;;LW)"), "Low");
+    assert!(
+        !holds("S:(ML;OICI;NW;;;SI)"),
+        "System is a label no process below System writes up to"
+    );
+    assert!(!holds("S:(ML;OICI;NR;;;HI)"), "no read up refuses reads, not writes");
+    assert!(!holds("S:(ML;OICI;NWNR;;;HI)"), "more than no write up");
+    assert!(!holds("S:(ML;;NW;;;HI)"), "not inherited by what is made inside");
+    assert!(!holds("S:(ML;OI;NW;;;HI)"), "inherited by files and not by folders");
+    assert!(!holds("S:(ML;CI;NW;;;HI)"), "inherited by folders and not by files");
+    assert!(!holds("S:(ML;OICI;NW;;;HI)(ML;OICI;NW;;;HI)"), "two labels");
+}
+
+#[test]
+fn the_label_is_judged_with_the_owner_and_the_dacl_and_is_part_of_the_dacl_s_refusal() {
+    let me = Sid::current_user().unwrap();
+    let user = me.to_sddl().unwrap();
+    let unlabelled = in_memory(&private_dir_sddl_with(&user, ""));
+    assert_eq!(
+        dir_policy(&unlabelled, &me, Integrity::High).unwrap(),
+        (true, false),
+        "the owner is right, the folder is not"
+    );
+    assert_eq!(dir_policy(&unlabelled, &me, Integrity::Medium).unwrap(), (true, true));
+}
+
+#[test]
+fn a_medium_folder_asks_for_no_label_and_takes_one() {
+    let me = Sid::current_user().unwrap();
+    let user = me.to_sddl().unwrap();
+    for label in ["", HIGH_LABEL, "S:(ML;OICI;NW;;;LW)"] {
+        let security = in_memory(&private_dir_sddl_with(&user, label));
+        assert_eq!(
+            dir_policy(&security, &me, Integrity::Medium).unwrap(),
+            (true, true),
+            "label {label:?}"
+        );
+    }
+}
+
+#[test]
+fn a_high_file_must_carry_the_high_label_it_inherited() {
+    let me = Sid::current_user().unwrap();
+    let user = me.to_sddl().unwrap();
+    let inherited = inherited_file_sddl(&user, &user);
+    let holds =
+        |label: &str, integrity| file_policy_holds(&in_memory(&format!("{inherited}{label}")), &me, integrity).unwrap();
+
+    assert!(
+        holds("S:AI(ML;ID;NW;;;HI)", Integrity::High),
+        "control: as a file made in the folder reads"
+    );
+    assert!(
+        holds("S:(ML;;NW;;;HI)", Integrity::High),
+        "a label of its own is as good"
+    );
+    assert!(!holds("", Integrity::High), "no label");
+    assert!(!holds("S:AI(ML;ID;NW;;;ME)", Integrity::High), "Medium");
+    assert!(!holds("S:AI(ML;ID;NW;;;LW)", Integrity::High), "Low");
+    assert!(!holds("S:AI(ML;ID;NR;;;HI)", Integrity::High), "no read up");
+    assert!(
+        !holds("S:AI(ML;OICIID;NW;;;HI)", Integrity::High),
+        "a file does not carry inheritance flags"
+    );
+    assert!(holds("", Integrity::Medium), "a Medium file asks for no label");
+    assert!(holds("S:AI(ML;ID;NW;;;HI)", Integrity::Medium), "and takes one");
+}
+
+#[test]
+fn the_elevated_folder_is_made_with_the_label_in_its_descriptor_and_the_plain_one_without() {
+    let me = Sid::current_user().unwrap();
+    let dacl = private_dir_dacl_sddl(&me).unwrap();
+    assert_eq!(private_dir_sddl(&me, Integrity::Medium).unwrap(), dacl);
+    assert_eq!(
+        private_dir_sddl(&me, Integrity::High).unwrap(),
+        format!("{dacl}{HIGH_LABEL}")
+    );
+}
+
+#[test]
+fn the_label_of_an_ordinary_file_is_read_without_any_privilege_and_is_not_high() {
+    let dir = hardened_user_dir("label-read");
+    let file = dir.0.join("plain");
+    std::fs::write(&file, "").unwrap();
+    let me = Sid::current_user().unwrap();
+    assert!(verify_file_acl(&file, &me, Integrity::Medium).unwrap(), "control");
+    assert!(
+        !verify_file_acl(&file, &me, Integrity::High).unwrap(),
+        "a file with no label is not a file of the elevated folder"
+    );
+    assert!(
+        !verify_dir_acl(&dir.0, &me, Integrity::High).unwrap(),
+        "a hardened folder with no label is not the elevated folder"
+    );
+    assert!(
+        verify_dir_acl(&dir.0, &me, Integrity::Medium).unwrap(),
+        "and is the plain one"
+    );
+}
+
+#[test]
+fn the_high_label_is_the_well_known_sid_of_the_high_level() {
+    assert_eq!(
+        Sid::well_known(WellKnown::HighLabel).unwrap().to_sddl().unwrap(),
+        "S-1-16-12288"
+    );
+}
+
+#[test]
+fn a_label_set_on_a_real_folder_is_read_back_by_the_check_and_is_not_the_high_one() {
+    let dir = hardened_user_dir("low-label");
+    icacls_str(&dir.0, &["/setintegritylevel", "(OI)(CI)L"]);
+    let me = Sid::current_user().unwrap();
+
+    let security = Security::from_path(&dir.0, Integrity::High).unwrap();
+    assert!(!security.label.is_null(), "the label is read with READ_CONTROL");
+    assert!(
+        !verify_dir_acl(&dir.0, &me, Integrity::High).unwrap(),
+        "a Low label is not the High one"
+    );
+    assert!(
+        verify_dir_acl(&dir.0, &me, Integrity::Medium).unwrap(),
+        "and the plain folder takes any label"
+    );
+
+    let file = dir.0.join("inherits");
+    std::fs::write(&file, "").unwrap();
+    assert!(
+        !verify_file_acl(&file, &me, Integrity::High).unwrap(),
+        "what it holds inherits the Low label"
+    );
+    assert!(verify_file_acl(&file, &me, Integrity::Medium).unwrap());
 }

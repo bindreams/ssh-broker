@@ -4,8 +4,9 @@
 //! not enumerate other profiles: reading another user's folder is not something an unprivileged
 //! check should do, and each user can run `verify` for themselves.
 
+use crate::account::Elevation;
 use crate::acl::{self, Sid};
-use crate::socket_loc::SocketLocation;
+use crate::socket_loc::{self, SocketLocation};
 use crate::userdir::{self, SocketDir};
 
 use super::report::Check;
@@ -82,16 +83,12 @@ pub fn socket_file_row(location: &anyhow::Result<SocketLocation>, user: &Sid) ->
     if loc.path().symlink_metadata().is_err() {
         return Check::new(NAME, false, "no socket: no agent is serving this account");
     }
-    match acl::verify_file_acl(loc.path(), user) {
+    match acl::verify_file_acl(loc.path(), user, loc.integrity()) {
         Ok(true) => Check::new(NAME, true, format!("grantee={}", user.describe())),
         Ok(false) => Check::new(
             NAME,
             false,
-            format!(
-                "{} does not grant exactly {}, SYSTEM and Administrators",
-                loc.path().display(),
-                user.describe()
-            ),
+            socket_loc::file_acl_refusal(loc.path(), &user.describe(), loc.integrity()),
         ),
         Err(e) => Check::new(NAME, false, format!("{e:#}")),
     }
@@ -113,6 +110,36 @@ pub fn socket_reachable_row(location: &anyhow::Result<SocketLocation>, user: &Si
             Err(e) => Check::new(NAME, false, format!("{e:#}{AGENT_HINT}")),
         },
         Err(_) => Check::new(NAME, false, "no socket location"),
+    }
+}
+
+/// What `verify` shows an administrator's unelevated process in place of the rows about the agent
+/// (the explanation is `offer::text::FILTERED_LOOKS_ELSEWHERE`). Fails, because nothing was proven.
+pub fn filtered_row() -> Check {
+    Check::new("socket reachable", false, crate::offer::text::FILTERED_LOOKS_ELSEWHERE)
+}
+
+/// What `verify` shows for the account, chosen by the elevation of this process's token.
+pub enum AccountRows {
+    /// The rows about the agent.
+    Agent,
+    /// [`filtered_row`] in place of them.
+    Filtered,
+    /// The rows about the agent, after this failing row: the elevation could not be read, so they may be
+    /// about the wrong folder.
+    AgentAfter(Check),
+}
+
+/// Which rows the account gets, given the elevation of this process's token.
+pub fn account_rows(elevation: &anyhow::Result<Elevation>) -> AccountRows {
+    match elevation {
+        Ok(Elevation::Filtered) => AccountRows::Filtered,
+        Ok(Elevation::Full | Elevation::Standard) => AccountRows::Agent,
+        Err(e) => AccountRows::AgentAfter(Check::new(
+            "elevation",
+            false,
+            crate::offer::text::elevation_unreadable_clause(&format!("{e:#}")),
+        )),
     }
 }
 

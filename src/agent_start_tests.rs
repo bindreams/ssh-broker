@@ -226,7 +226,12 @@ fn start_makes_the_private_folder_then_serves_that_session_from_it() {
         },
         |at, session| {
             assert!(
-                acl::verify_dir_acl(at.location().dir(), &Sid::current_user().unwrap()).unwrap(),
+                acl::verify_dir_acl(
+                    at.location().dir(),
+                    &Sid::current_user().unwrap(),
+                    crate::socket_loc::Integrity::Medium
+                )
+                .unwrap(),
                 "the folder is hardened before anything is served from it"
             );
             served.set(Some((at.location().path().to_path_buf(), session)));

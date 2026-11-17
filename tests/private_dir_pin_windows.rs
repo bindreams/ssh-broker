@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use ssh_broker::account::{Elevation, elevation};
 use ssh_broker::acl::Sid;
 use ssh_broker::pipes::ExecChild;
+use ssh_broker::socket_loc::Integrity;
 use ssh_broker::winutil::UnelevatedToken;
 use ssh_broker::{socket_loc, userdir};
 
@@ -36,7 +37,7 @@ impl Scene {
     }
 
     fn location(&self) -> socket_loc::SocketLocation {
-        socket_loc::for_profile(&self.profile).expect("the stand-in profile path is short enough")
+        socket_loc::for_profile(&self.profile, Integrity::Medium).expect("the stand-in profile path is short enough")
     }
 
     /// Run the child, which tries to rename each of `folders` to a name beside it, in the order given,

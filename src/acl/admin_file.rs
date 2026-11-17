@@ -21,6 +21,7 @@ use super::{
     Grant, OwnerAclWords, Security, Sid, WellKnown, denied_problem, describe_sid, descriptor_from_sddl,
     file_attributes, open_for_inspection, owner_acl_problem, wide,
 };
+use crate::socket_loc::Integrity;
 use crate::winutil::OwnedHandle;
 
 /// Owner Administrators; protected DACL; SYSTEM and Administrators Full Control, no inheritable ACE.
@@ -96,7 +97,8 @@ pub fn admin_only_file_problem(path: &Path) -> anyhow::Result<Option<String>> {
     let Some(handle) = open_for_inspection(path)? else {
         return Ok(Some(denied_problem("private")));
     };
-    let security = Security::from_handle(handle.0).with_context(|| format!("read the ACL of {}", path.display()))?;
+    let security = Security::from_handle(handle.0, Integrity::Medium)
+        .with_context(|| format!("read the ACL of {}", path.display()))?;
     let attributes = file_attributes(handle.0).with_context(|| format!("read the attributes of {}", path.display()))?;
     if attributes & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
         return Ok(Some("it is a reparse point (a link)".to_owned()));

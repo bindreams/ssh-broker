@@ -11,8 +11,11 @@ use std::path::{Path, PathBuf};
 /// `OsStr::len` returns, so non-ASCII profile names count for what they cost.
 pub const MAX_SOCKET_PATH_BYTES: usize = 107;
 
-/// The per-user folder under `AppData\Local`. The only place the name is written.
+/// The per-user folder under `AppData\Local` of an agent below High. The only place the name is written.
 pub const SOCKET_DIR_NAME: &str = "ssh-broker";
+/// The per-user folder of an agent at High or above: born with the High mandatory label, so that a process
+/// of the account below High cannot connect to what is in it. The only place the name is written.
+pub const ELEVATED_SOCKET_DIR_NAME: &str = "ssh-broker-elevated";
 pub const SOCKET_FILE_NAME: &str = "agent.sock";
 pub const LOCK_FILE_NAME: &str = "agent.lock";
 pub const SESSIONS_LOCK_FILE_NAME: &str = "sessions.lock";
@@ -23,29 +26,66 @@ pub const SERVING_MARKER_NAME: &str = "serving";
 /// [`SocketLocation::dir`] is built from these, so a walk over them reaches that folder and no other.
 pub const FOLDERS_IN_PROFILE: [&str; 2] = ["AppData", "Local"];
 
-/// A user's socket directory and the socket inside it. Made from a profile directory and nothing
-/// else, so `dir` and `path` are always inside `profile`.
+/// The integrity level of the processes a location serves: the agent that keeps its socket there, and the
+/// processes that connect to it. An agent at High or above (an administrator's elevated session) keeps
+/// its socket in a folder of its own, labelled High.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Integrity {
+    Medium,
+    High,
+}
+
+impl Integrity {
+    pub fn dir_name(self) -> &'static str {
+        match self {
+            Integrity::Medium => SOCKET_DIR_NAME,
+            Integrity::High => ELEVATED_SOCKET_DIR_NAME,
+        }
+    }
+}
+
+/// What is said of a socket file at `path` that is not as the agent made it (`acl::verify_file_acl` is
+/// false): it must grant exactly `grantee`, SYSTEM and Administrators and, for [`Integrity::High`], carry
+/// the High label. One wording for the agent's refusal to bind and `verify`'s row.
+pub fn file_acl_refusal(path: &Path, grantee: &str, integrity: Integrity) -> String {
+    format!(
+        "{} does not grant exactly {grantee}, SYSTEM and Administrators{}",
+        path.display(),
+        match integrity {
+            Integrity::Medium => "",
+            Integrity::High => ", or lacks the High integrity label",
+        }
+    )
+}
+
+/// A user's socket directory and the socket inside it. Made from a profile directory and an integrity
+/// level and nothing else, so `dir` and `path` are always inside `profile`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SocketLocation {
     /// The profile directory `dir` is in.
     profile: PathBuf,
-    /// `<profile>\AppData\Local\ssh-broker`.
+    integrity: Integrity,
     dir: PathBuf,
     path: PathBuf,
 }
 
 impl SocketLocation {
-    fn in_profile(profile: &Path) -> SocketLocation {
+    fn in_profile(profile: &Path, integrity: Integrity) -> SocketLocation {
         let dir = FOLDERS_IN_PROFILE
             .iter()
             .fold(profile.to_path_buf(), |path, name| path.join(name))
-            .join(SOCKET_DIR_NAME);
+            .join(integrity.dir_name());
         let path = dir.join(SOCKET_FILE_NAME);
         SocketLocation {
             profile: profile.to_path_buf(),
+            integrity,
             dir,
             path,
         }
+    }
+
+    pub fn integrity(&self) -> Integrity {
+        self.integrity
     }
 
     /// The private folder: the one the agent makes, the shim looks in and the socket is inside.
@@ -96,9 +136,9 @@ pub enum SocketLocationError {
     TooLong { path: PathBuf, bytes: usize, max: usize },
 }
 
-/// The socket location inside `profile`, or why it cannot be used.
-pub fn for_profile(profile: &Path) -> Result<SocketLocation, SocketLocationError> {
-    let location = SocketLocation::in_profile(profile);
+/// The socket location inside `profile` for processes at `integrity`, or why it cannot be used.
+pub fn for_profile(profile: &Path, integrity: Integrity) -> Result<SocketLocation, SocketLocationError> {
+    let location = SocketLocation::in_profile(profile, integrity);
     let bytes = location.path.as_os_str().len();
     if bytes > MAX_SOCKET_PATH_BYTES {
         return Err(SocketLocationError::TooLong {

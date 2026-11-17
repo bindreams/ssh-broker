@@ -106,7 +106,7 @@ fn absence_of_a_connect_to_a_stale_socket_file_is_no_agent() {
     let profile = TempProfile::new("ab-stale");
     let location = profile.location();
     crate::userdir::ensure_socket_dir(&location, &crate::acl::Sid::current_user().unwrap()).unwrap();
-    drop(crate::afunix::Listener::bind(location.path()).unwrap());
+    drop(crate::afunix::Listener::bind(location.path(), crate::socket_loc::Integrity::Medium).unwrap());
     assert!(
         location.path().exists(),
         "the stale socket file is what is being tested"

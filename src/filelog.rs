@@ -1,8 +1,7 @@
 //! filelog: the daily log file the shim and the agent write into the user's own folder.
 //!
-//! The folder is `<profile>\AppData\Local\ssh-broker\logs`, inside the same private directory as
-//! the socket, so a log is readable and writable by exactly the account that produced it (and
-//! SYSTEM and Administrators), and an ordinary user can log at all.
+//! The folder is `logs` inside the socket's private directory ([`socket_loc`]), so a log is readable and
+//! writable by exactly the account that produced it (and SYSTEM and Administrators).
 //!
 //! Setting the log up can fail (no profile, a link or a foreign owner where the folder should be,
 //! a full disk). Every setup function returns the cause; whether the caller can say it, and where,

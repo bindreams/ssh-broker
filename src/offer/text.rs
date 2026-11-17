@@ -48,12 +48,33 @@ pub fn non_interactive_notice(user: &str, exe: &str) -> String {
 /// (`account::Elevation::Filtered`): this account's session serves elevated logins only.
 pub const FILTERED_SHIM_NOTICE: &str = "ssh-broker: this account's session serves elevated logins only, and this login is an administrator's with elevation removed, so this runs without DPAPI, a loaded profile or symlink traversal.";
 
-/// The stderr line for a login whose token's elevation cannot be read, where `cause` is why: no session
-/// is offered, since its logon depends on that elevation.
+/// The clause every line uses to say a token's elevation could not be read; `cause` is why.
+pub fn elevation_unreadable_clause(cause: &str) -> String {
+    format!("cannot tell how elevated this login is ({cause})")
+}
+
+/// The stderr line for a login whose token's elevation cannot be read: no session is offered, since its
+/// logon depends on that elevation.
 pub fn elevation_unreadable(cause: &str) -> String {
     format!(
-        "ssh-broker: cannot tell how elevated this login is ({cause}), so no session is offered and this runs \
-         without DPAPI, a loaded profile or symlink traversal."
+        "ssh-broker: {}, so no session is offered and this runs without DPAPI, a loaded profile or symlink \
+         traversal.",
+        elevation_unreadable_clause(cause)
+    )
+}
+
+/// What an administrator's unelevated process (`account::Elevation::Filtered`) is told when it asks for the
+/// agent that serves its folder and finds none: the account's agent runs elevated and serves the elevated
+/// folder, so the plain one it looks in has nothing. A clause, for `verify`'s row and `logout`'s line.
+pub const FILTERED_LOOKS_ELSEWHERE: &str = "this account is an administrator and its agent serves elevated processes: run this from an elevated prompt or an ordinary SSH login";
+
+/// Told when a High login lacks `SeImpersonatePrivilege`, which `CreateProcessWithTokenW` needs; the way
+/// out is worded as in the batch-right sentence, and granting the right is not suggested.
+pub fn impersonate_right_missing(user: &str) -> String {
+    format!(
+        "ssh-broker: this login is elevated, and starting an elevated session for {user} from a password needs the \
+         right \"Impersonate a client after authentication\", which this login does not hold (a logon at the desktop \
+         starts one without it; SSH logins use it while it runs)."
     )
 }
 

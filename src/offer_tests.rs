@@ -316,9 +316,9 @@ fn a_failed_start_line_names_the_reason_once() {
 }
 
 #[test]
-fn a_missing_batch_right_is_said_in_its_own_sentence_and_the_plain_shell_follows() {
+fn a_stated_limit_is_said_in_its_own_sentence_and_the_plain_shell_follows() {
     let mut io = Fake::with_steps(vec![Ok(Step::Submit(password("pw")))]);
-    io.start_result = Some(Err(StartFailure::NoBatchRight {
+    io.start_result = Some(Err(StartFailure::Limit {
         sentence: "ssh-broker: alice may not log on as a batch job.".into(),
     }));
     let out = run_pty(&mut io);
@@ -351,4 +351,14 @@ fn a_failure_of_our_own_is_not_blamed_on_windows() {
     );
     assert!(!io.written.contains("Windows did not sign you in"), "{}", io.written);
     assert!(io.written.ends_with(text::COST_LINE));
+}
+
+#[test]
+fn the_missing_impersonation_right_is_one_unbroken_sentence() {
+    assert_eq!(
+        text::impersonate_right_missing("alice"),
+        "ssh-broker: this login is elevated, and starting an elevated session for alice from a password needs the \
+         right \"Impersonate a client after authentication\", which this login does not hold (a logon at the desktop \
+         starts one without it; SSH logins use it while it runs)."
+    );
 }
