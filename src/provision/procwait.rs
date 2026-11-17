@@ -494,16 +494,15 @@ fn runs_image(
 
 /// Every agent (desktop or background) of `user` that is running `image` right now, other than this
 /// process, each held by a handle: the agents that exist, whether or not they serve yet. A process
-/// that has ended, or is ending, is not one. Only the agents that serve the folder of `integrity` are:
-/// the ones whose token's integrity level puts them at it (High or above for `High`, below for
-/// `Medium`, as `account::integrity_class` says), because an agent at the other level serves a folder
-/// that the caller does not look in and so will never serve the caller. Only processes whose snapshot name is the file name of
+/// that has ended, or is ending, is not one. Only agents at `integrity`'s folder level count (High or
+/// above for `High`, below for `Medium`, per `account::integrity_class`): an agent at the other level
+/// serves a folder the caller does not look in. Only processes whose snapshot name is the file name of
 /// `image` are looked at (the installed exe is `ssh-broker.exe`; a copy run under another name is found
 /// by that name); the file's identity decides the rest.
 ///
 /// A process that cannot be opened, or whose token cannot be read, is refused to this user, and a
 /// process of the user is not (it is made with a default access list that names the user): it is
-/// none of this user's and is skipped, whichever level is asked for. A process of `user` whose image cannot be identified or whose
+/// none of this user's and is skipped. A process of `user` whose image cannot be identified or whose
 /// command line cannot be read, and which is not ending, is an error naming it: it might be the agent.
 pub fn user_agents(image: &Path, user: &Sid, integrity: Integrity) -> anyhow::Result<Vec<Process>> {
     let wanted_user = user.to_sddl()?;

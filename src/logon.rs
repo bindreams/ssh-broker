@@ -2,7 +2,7 @@
 //!
 //! The call is `CreateProcessWithLogonW(LOGON_WITH_PROFILE)`, which hands the password to the
 //! Secondary Logon service and starts `ssh-broker agent --background` as the user in a new logon
-//! session with a loaded profile, DPAPI and junction traversal (spike M1, M2). For a shim at High integrity
+//! session with a loaded profile, DPAPI and junction traversal. For a shim at High integrity
 //! ([`LogonKind::Batch`]) the logon is `LogonUserW(BATCH)`, which UAC does not split, and the process
 //! starts with that token: the agent runs elevated, with the same profile and DPAPI. The password
 //! is only the call's argument, in a NUL-terminated copy that `Password::with_nul` wipes when the call
@@ -45,7 +45,7 @@ use probe::{probe_for, start_probe};
 const ERROR_FILENAME_EXCED_RANGE: u32 = 206;
 /// `ERROR_LOGON_TYPE_NOT_GRANTED`: the account does not hold the right for this logon type.
 const ERROR_LOGON_TYPE_NOT_GRANTED: u32 = 1385;
-/// `ERROR_PRIVILEGE_NOT_HELD`: the caller lacks a privilege the call needs.
+// winerror.h 1314
 const ERROR_PRIVILEGE_NOT_HELD: u32 = 1314;
 /// `ERROR_ACCESS_DENIED`: what a refused `CREATE_BREAKAWAY_FROM_JOB` is answered with.
 const ERROR_ACCESS_DENIED: u32 = 5;
@@ -169,8 +169,7 @@ impl LogonFailure {
         self.code == ERROR_LOGON_TYPE_NOT_GRANTED
     }
 
-    /// Whether the caller lacks a privilege the call needs (`ERROR_PRIVILEGE_NOT_HELD`). `LogonUserW` takes
-    /// no privilege, so for a [`LogonKind::Batch`] start it is the process start that failed.
+    /// `LogonUserW` takes no privilege, so for `Batch` it is the process start that failed.
     pub fn privilege_not_held(&self) -> bool {
         self.code == ERROR_PRIVILEGE_NOT_HELD
     }

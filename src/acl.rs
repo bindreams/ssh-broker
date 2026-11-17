@@ -14,11 +14,10 @@
 //! default DACL. [`verify_dir_acl`] and [`verify_file_acl`] read the DACLs back and refuse
 //! anything but an exact match (fail-closed).
 //!
-//! An elevated agent keeps its socket in a folder of its own that is born with the High mandatory
-//! label (no write up, inherited by what is made inside), given in the creation descriptor and never
-//! put on a folder that exists. The label is what keeps a process of the account below High from
-//! connecting, creating, renaming or deleting there. The same two checks take the [`Integrity`] of the
-//! folder's processes and for `High` require exactly that label; for `Medium` they ask for none.
+//! An elevated agent keeps its socket in a folder of its own with the High mandatory label (no write up,
+//! inherited by what is made inside; see [`ensure_private_dir`]). It keeps a process of the account below
+//! High from connecting, creating, renaming or deleting there. The same two checks take the [`Integrity`]
+//! of the folder's processes and for `High` require exactly that label.
 //!
 //! The user is the account the agent runs as: the agent lives in that user's profile, so its own
 //! token is the grantee.
@@ -81,10 +80,8 @@ pub use private_dir::{
 /// ACCESS_ALLOWED_ACE_TYPE (winnt.h) — stored raw in `ACE_HEADER.AceType` (a `u8`).
 const ACE_TYPE_ALLOWED: u8 = 0;
 
-/// SYSTEM_MANDATORY_LABEL_ACE_TYPE (winnt.h): the type of the one ACE of an object's label.
+// winnt.h: SYSTEM_MANDATORY_LABEL_ACE_TYPE and SYSTEM_MANDATORY_LABEL_NO_WRITE_UP.
 const ACE_TYPE_LABEL: u8 = 0x11;
-
-/// SYSTEM_MANDATORY_LABEL_NO_WRITE_UP (winnt.h): a process below the label's level cannot write.
 const LABEL_NO_WRITE_UP: u32 = 1;
 
 /// Well-known SIDs in the allow-set besides the target user.
@@ -93,7 +90,7 @@ pub enum WellKnown {
     System,
     Administrators,
     Users,
-    /// The High mandatory integrity level, as the SID of a label (`S-1-16-12288`).
+    /// `S-1-16-12288`.
     HighLabel,
 }
 
@@ -320,7 +317,7 @@ fn private_dir_dacl_sddl(user: &Sid) -> anyhow::Result<String> {
 }
 
 /// The label of a folder for `Integrity::High`: High, no write up, inherited by the files and folders made
-/// inside. Given in the descriptor a folder is created with and never set on one that exists.
+/// inside.
 const HIGH_LABEL_SDDL: &str = "S:(ML;OICI;NW;;;HI)";
 
 /// The descriptor a private folder is created with for processes at `integrity`: [`private_dir_dacl_sddl`],
@@ -394,7 +391,7 @@ enum Inheritance {
     Inherited,
 }
 
-/// A security descriptor read back from an object: the DACL, the label and the owner point into `sd`.
+/// A security descriptor read back from an object.
 struct Security {
     sd: LocalSd,
     dacl: *mut ACL,
@@ -404,8 +401,7 @@ struct Security {
     owner: PSID,
 }
 
-/// What to read of an object that is checked for processes at `integrity`: the DACL and the owner, and
-/// for `High` the label. The label is read with `READ_CONTROL`, which every open here asks for.
+/// The label is read with `READ_CONTROL`, which every open here asks for.
 fn information_for(integrity: Integrity) -> OBJECT_SECURITY_INFORMATION {
     let always = DACL_SECURITY_INFORMATION | OWNER_SECURITY_INFORMATION;
     match integrity {
@@ -601,8 +597,7 @@ impl Security {
     }
 }
 
-/// `AceFlags` of the directory's ACEs: `OI|CI`, and not `INHERITED_ACE`. The elevated folder's label has
-/// the same.
+/// Not `INHERITED_ACE`: these ACEs are explicit. The label uses the same flags.
 const PRIVATE_DIR_ACE_FLAGS: u8 = (OBJECT_INHERIT_ACE.0 | CONTAINER_INHERIT_ACE.0) as u8;
 
 /// The three Full-Control grants of a user's private directory. `flags` is what the directory
@@ -622,8 +617,7 @@ fn private_grants<'a>(user: &'a Sid, system: &'a Sid, admins: &'a Sid, flags: Op
 /// allow-set, and no inherited or DENY ACEs. Anything else (incl. a NULL/absent DACL) returns
 /// `false` — fail-closed. The ACEs must be inheritable: a directory whose ACEs do not reach the
 /// socket file leaves the file with the creator's default DACL. For `Integrity::High` the directory
-/// must also carry the High label that what is made inside inherits (the elevated folder); for
-/// `Medium` no label is asked for.
+/// must also carry the High label that what is made inside inherits (the elevated folder).
 pub fn verify_dir_acl(dir: &Path, target_user: &Sid, integrity: Integrity) -> anyhow::Result<bool> {
     dir_policy_holds(&Security::from_path(dir, integrity)?, target_user, integrity)
 }
@@ -651,7 +645,7 @@ fn dir_policy(security: &Security, user: &Sid, integrity: Integrity) -> anyhow::
 /// that set. The ACEs may be inherited, which is how such a file is born. Anything else is
 /// `false`: fail-closed. For the socket this is the check that decides who can connect. For
 /// `Integrity::High` the file must also carry the High label it inherits from the elevated folder: a
-/// process below High cannot connect to it. For `Medium` no label is asked for.
+/// process below High cannot connect to it.
 pub fn verify_file_acl(file: &Path, user: &Sid, integrity: Integrity) -> anyhow::Result<bool> {
     file_policy_holds(&Security::from_path(file, integrity)?, user, integrity)
 }

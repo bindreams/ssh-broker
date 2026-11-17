@@ -467,6 +467,22 @@ fn bind_in_the_elevated_folder_leaves_a_socket_file_that_carries_the_label() {
     let _ = std::fs::remove_dir_all(dir.parent().unwrap());
 }
 
+/// Elevated (CI only): a High bind asks the socket file check for High, as the Medium one asks for Medium.
+#[cfg(windows)]
+#[test]
+fn bind_checks_the_socket_file_for_high_when_it_binds_for_high() {
+    let dir = labelled_socket_dir("file-integrity-high");
+    let p = dir.join("agent.sock");
+    let asked = std::cell::Cell::new(None);
+    let listener = super::Listener::bind_with(&p, Integrity::High, &|_, integrity| {
+        asked.set(Some(integrity));
+        Ok(true)
+    });
+    assert!(listener.is_ok());
+    assert_eq!(asked.get(), Some(Integrity::High));
+    let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+}
+
 /// Elevated (CI only): a socket file that does not carry the label is refused and removed, though the
 /// folder is the elevated one. The label is taken off the file from inside the check, which is the
 /// moment between `bind` and `listen`.

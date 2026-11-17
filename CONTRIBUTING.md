@@ -211,7 +211,9 @@ debugging such a deadlock. Nothing else may take a bound on this argument.
 trailing `\`, which also drops the next line's indentation; joined any other way, the indentation
 lands in the sentence. The hook rejects three or more spaces between two non-space characters inside
 a literal on one line. A literal that needs the run (a table column, a command line under test) opts
-out with a same-line `spaces-ok:` marker **and a reason**; a bare marker does not suppress.
+out with a same-line `spaces-ok:` marker **and a reason**; a bare marker does not suppress. Raw
+strings are skipped, and only the line with the literal's opening quote is read, so a run typed into
+a later line of a sentence continued with `\` is not checked.
 
 **No arbitrary retry caps** *(review-enforced)*. Numeric bounds that are not retry caps are fine
 and are explained where they occur — the agent task's `RestartOnFailure` `Count`, which the Task

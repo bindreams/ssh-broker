@@ -34,8 +34,7 @@ pub struct AlreadyListening(pub PathBuf);
 /// socket), and it removes the socket again unless the socket **file's** own DACL verifies (it
 /// decides who can connect: Windows AF_UNIX has no `SO_PEERCRED`, and traverse checks on the
 /// folders above are bypassed by `SeChangeNotifyPrivilege`). Both must also carry the High mandatory
-/// label when the socket is bound for `Integrity::High` (the elevated agent's folder): the label is what
-/// keeps a process of the account below High from connecting.
+/// label when the socket is bound for `Integrity::High` (see `acl::ensure_private_dir`).
 pub struct Listener {
     sock: Socket,
 }

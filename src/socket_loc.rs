@@ -36,7 +36,6 @@ pub enum Integrity {
 }
 
 impl Integrity {
-    /// The name of the folder under `AppData\Local` that holds what an agent of this level keeps.
     pub fn dir_name(self) -> &'static str {
         match self {
             Integrity::Medium => SOCKET_DIR_NAME,
@@ -66,7 +65,6 @@ pub struct SocketLocation {
     /// The profile directory `dir` is in.
     profile: PathBuf,
     integrity: Integrity,
-    /// `<profile>\AppData\Local\ssh-broker`, or `ssh-broker-elevated` for [`Integrity::High`].
     dir: PathBuf,
     path: PathBuf,
 }
@@ -86,7 +84,6 @@ impl SocketLocation {
         }
     }
 
-    /// The integrity level of the processes this location serves.
     pub fn integrity(&self) -> Integrity {
         self.integrity
     }

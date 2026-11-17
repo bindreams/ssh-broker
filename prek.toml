@@ -108,16 +108,12 @@ types = ["rust"]
 [[repos.hooks]]
 id = "no-space-runs-in-literals"
 name = "no run of spaces inside a string literal"
-# A user-facing sentence written over several lines is joined with a trailing `\`, which also eats the
-# next line's indentation. Join the lines any other way and the indentation lands inside the sentence
-# as a run of spaces; that was written three times, and each time it read as a typo to the user.
-#
-# Matches a run of three or more spaces between two non-space characters inside a string literal on
-# one line. The prefix walks the line from its start, skipping complete string literals and char
-# literals (`'"'` does not open one), so a run in code or in an aligned comment is not inside a
-# literal. A run next to a quote or after an escape (`\n` then indentation, which a message may mean)
-# is not matched. A literal that needs the run (a table column) opts out with a same-line
-# `spaces-ok:` marker followed by a reason; a bare marker does not suppress.
-entry = '''^(?!.*spaces-ok:\s*\S)(?:[^"']|'(?:\\.|[^'\\])'|'(?!(?:\\.|[^'\\])')|"(?:[^"\\]|\\.)*")*"(?:[^"\\]|\\.)*?[^\s"\\] {3,}[^\s"]'''
+# A run of 3+ spaces between non-space characters inside a string literal is almost always
+# indentation lost when a sentence is joined across lines. Runs next to a quote or after an escape are
+# allowed; a literal that needs one opts out with `spaces-ok: <reason>` on the same line (a bare marker
+# does not suppress). Raw strings are skipped whole, runs in their text included. Only the line with the
+# literal's opening quote is read: a run typed into a later line of a sentence continued with `\` is not
+# checked.
+entry = '''^(?!.*spaces-ok:\s*\S)(?:(?<!\w)[bc]?r(#*)".*?"\1|(?!(?<!\w)[bc]?r#*")[^"']|'(?:\\.|[^'\\])'|'(?!(?:\\.|[^'\\])')|"(?:[^"\\]|\\.)*")*"(?:[^"\\]|\\.)*?[^\s"\\] {3,}[^\s"]'''
 language = "pygrep"
 types = ["rust"]

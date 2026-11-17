@@ -347,9 +347,9 @@ pub fn open_existing_private_dir(parent: &DirHandle, name: &str, integrity: Inte
 /// untouched. Nothing existing is modified.
 ///
 /// For `Integrity::High` (the elevated agent's folder) the creation descriptor carries the High
-/// mandatory label, and an existing folder must carry exactly that label too: it is never put on a
-/// folder that exists, so an unlabelled one is refused like any other that is not exactly right. For
-/// `Medium` no label is given or asked for.
+/// mandatory label, and an existing folder must carry exactly that label too: the label is born with
+/// the folder and never set after, so an unlabelled one is refused like any other that is not exactly
+/// right. `Medium` asks for none.
 ///
 /// With [`Hold::Held`] nobody can rename or remove the folder while the handle lives, and a sharing
 /// violation on the open is a [`Refused`] that says another program holds the folder open. With

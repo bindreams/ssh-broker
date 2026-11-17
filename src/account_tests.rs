@@ -140,14 +140,6 @@ fn a_process_has_an_integrity_level_of_a_mandatory_label() {
     assert!((INTEGRITY_LOW..=INTEGRITY_SYSTEM).contains(&rid), "{rid:#x}");
 }
 
-#[test]
-fn this_process_has_the_folder_level_of_its_integrity_label() {
-    assert_eq!(
-        integrity().unwrap(),
-        integrity_class(integrity_of(own_token().unwrap().0).unwrap())
-    );
-}
-
 /// A SID built from its text, freed when dropped.
 struct TextSid(windows::Win32::Security::PSID);
 

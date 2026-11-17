@@ -109,10 +109,10 @@ pub enum Stance {
     RelayWithoutOffer { cause: String },
 }
 
-/// Decide the [`Stance`] for a token with `elevation` at the folder level `integrity`. The logon follows
-/// the level, the same reading as the folder the shim waits on, so the agent the offer starts serves that
-/// folder: High is a batch logon (which UAC does not split), Medium an interactive one. An administrator's
-/// filtered token gets the plain shell whatever its level.
+/// Decide the [`Stance`] for a token with `elevation` at the folder level `integrity`. The logon kind
+/// follows `integrity`, as the folder does, so the agent the offer starts serves the folder the shim waits
+/// on (High: batch, which UAC does not split; below: interactive). A filtered token gets the plain shell
+/// at any level.
 pub fn stance(elevation: anyhow::Result<Elevation>, integrity: anyhow::Result<Integrity>) -> Stance {
     match (elevation, integrity) {
         (Ok(Elevation::Filtered), _) => Stance::PlainShell,
@@ -609,10 +609,8 @@ impl OfferIo for LiveIo {
     }
 }
 
-/// What the offer says of a logon that Windows refused. A batch start refused for want of the batch right
-/// gets `auto-login`'s sentence, and one refused for want of `SeImpersonatePrivilege` (the caller's, which
-/// `CreateProcessWithTokenW` needs) gets its own; both are stated limits. Every other refusal is Windows' own
-/// text.
+/// The batch-right and `SeImpersonatePrivilege` refusals get the broker's own sentence
+/// (`StartFailure::Limit`); any other refusal is Windows' text.
 fn start_failure(logon: LogonKind, user: &str, failure: LogonFailure) -> StartFailure {
     if logon == LogonKind::Batch {
         if failure.right_not_granted() {

@@ -57,10 +57,8 @@ fn probe_failure(error: &windows::core::Error, len: u32) -> anyhow::Result<u32> 
     Err(anyhow::Error::new(error.clone()).context("GetUserProfileDirectoryW (size probe)"))
 }
 
-/// The socket location of the account `token` belongs to, in the folder of the token's own integrity
-/// level: a token at High or above (an administrator's elevated process) uses the elevated folder, any
-/// other the plain one. Only the level decides: not the account, a group, a setting or an argument.
-/// `token` needs `TOKEN_QUERY`.
+/// Location in the folder of `token`'s integrity level ([`account::integrity_class`]). `token` needs
+/// `TOKEN_QUERY`.
 pub fn socket_location_of_token(token: HANDLE) -> anyhow::Result<SocketLocation> {
     let profile = profile_dir_of_token(token)?;
     let integrity = integrity_class(integrity_of(token)?);
@@ -110,9 +108,9 @@ impl SocketDir {
 
 /// Make `loc.dir` and its `logs` folder if they are missing, leave both exactly
 /// `{user, SYSTEM, Administrators}` with ACEs the files made inside inherit, and return them open. The
-/// elevated folder (`Integrity::High`) is born with the High label too, and an existing one must carry
-/// it. `logs` inside it is made with the folder's descriptor, label included, and judged for the same
-/// level: an existing `logs` without the label is refused, in [`SocketDir::logs`].
+/// elevated folder (`Integrity::High`) has the High label too (see `acl::ensure_private_dir`). `logs`
+/// inside it is made with the folder's descriptor, label included, and judged for the same level: an
+/// existing `logs` without the label is refused, in [`SocketDir::logs`].
 ///
 /// Reached by handle from the profile directory (see `acl::private_dir`). `AppData` and `Local`
 /// must already exist: a missing one means no profile, and inventing one would put a socket where no
@@ -145,8 +143,7 @@ pub fn inspect_current_socket_dir() -> anyhow::Result<SocketDir> {
 
 /// The walk of [`open_socket_dir`] and [`inspect_socket_dir`]; `step` makes or opens the folder `name`
 /// under `parent`, held (the private folder) or not (`logs`) as `hold` says, judged for `integrity`. Both are
-/// judged for the location's level: `logs` in the elevated folder is made with the label and refused
-/// without it. This and [`walk_to_private_folder`] are the only places that ask for the held form.
+/// judged for the location's level. This and [`walk_to_private_folder`] are the only places that ask for the held form.
 fn walk(
     loc: &SocketLocation,
     verb: &str,

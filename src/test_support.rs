@@ -146,8 +146,6 @@ impl Drop for TempProfile {
     }
 }
 
-// A process the snapshot lists as an ssh-broker one -----
-
 /// A temp directory holding a copy of `cmd.exe` named like the installed exe, so that the process
 /// snapshot lists what runs from it as an ssh-broker process. Removed on drop.
 pub struct NamedCopy {
@@ -168,8 +166,7 @@ impl NamedCopy {
         self.dir.join(crate::provision::EXE_NAME)
     }
 
-    /// The copy with `args` after the program (cmd ignores them and reads its stdin), until its
-    /// stdin closes.
+    /// Spawn the copy; cmd ignores `args` and exits when its stdin closes.
     pub fn spawn(&self, args: &[&str]) -> std::process::Child {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;

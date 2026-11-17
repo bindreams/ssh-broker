@@ -8,6 +8,7 @@
 
 use std::io::{Read, Write};
 
+use crate::account::Elevation;
 use crate::protocol::{FrameKind, FrameReader, Launch, Mode, Stream, write_frame};
 use crate::relay::{FrameSink, Outcome};
 use crate::shim::{PROTOCOL_VIOLATION_CODE, closed_twice_message, make_handshake, peer_gone, pump_heard};
@@ -15,13 +16,27 @@ use crate::shim::{PROTOCOL_VIOLATION_CODE, closed_twice_message, make_handshake,
 /// What `logout` says when there is no agent to ask.
 pub const NO_SESSION: &str = "ssh-broker: no session to end.";
 
-/// What `logout` says to an administrator's unelevated process when there is no agent to ask: the agent
-/// is there, for elevated processes, and this one cannot reach it.
+/// What `logout` says to an administrator's unelevated process when there is no agent to ask (the
+/// explanation is `offer::text::FILTERED_LOOKS_ELSEWHERE`).
 pub fn filtered_no_session() -> String {
     format!(
         "ssh-broker: no session to end here: {}.",
         crate::offer::text::FILTERED_LOOKS_ELSEWHERE
     )
+}
+
+/// The line for "there is no agent to ask", chosen by the elevation of this process's token. An
+/// elevation that cannot be read gets the plain line with the cause after it, since the token may be a
+/// filtered one.
+pub fn no_session_line(elevation: &anyhow::Result<Elevation>) -> String {
+    match elevation {
+        Ok(Elevation::Filtered) => filtered_no_session(),
+        Ok(Elevation::Full | Elevation::Standard) => NO_SESSION.to_owned(),
+        Err(e) => format!(
+            "{NO_SESSION} Note: {}, so the session may be elsewhere.",
+            crate::offer::text::elevation_unreadable_clause(&format!("{e:#}"))
+        ),
+    }
 }
 /// The exit code when the agent could not be reached for a reason other than not being there.
 pub const UNREACHABLE_CODE: i32 = 4;
@@ -130,11 +145,7 @@ pub fn run() -> anyhow::Result<()> {
     let no_session = |e: &anyhow::Error| {
         e.downcast_ref::<crate::userdir::NoProfile>().is_some() || crate::console_prompt::is_no_agent(e)
     };
-    // An administrator's unelevated process looks in the plain folder, where its account has no agent.
-    let line = match crate::account::elevation() {
-        Ok(crate::account::Elevation::Filtered) => filtered_no_session(),
-        Ok(_) | Err(_) => NO_SESSION.to_owned(),
-    };
+    let line = no_session_line(&crate::account::elevation());
     logout_at(connect, no_session, &line, &mut std::io::stderr(), |code| {
         std::process::exit(code)
     })

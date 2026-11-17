@@ -265,3 +265,29 @@ fn an_administrators_unelevated_logout_with_no_agent_in_its_folder_is_told_why_i
 fn the_line_for_a_filtered_prompt_is_the_one_the_verify_row_gives() {
     assert!(filtered_no_session().contains(crate::offer::text::FILTERED_LOOKS_ELSEWHERE));
 }
+
+// the line when there is no agent -------------------------------------------------------------
+
+#[test]
+fn a_filtered_token_gets_the_line_that_says_where_its_agent_is() {
+    assert_eq!(no_session_line(&Ok(Elevation::Filtered)), filtered_no_session());
+}
+
+#[test]
+fn a_full_or_standard_token_gets_the_plain_line() {
+    assert_eq!(no_session_line(&Ok(Elevation::Full)), NO_SESSION);
+    assert_eq!(no_session_line(&Ok(Elevation::Standard)), NO_SESSION);
+}
+
+#[test]
+fn a_token_whose_elevation_cannot_be_read_gets_the_plain_line_and_the_cause() {
+    let line = no_session_line(&Err(anyhow::anyhow!("the token cannot be read")));
+    assert!(line.starts_with(NO_SESSION), "{line}");
+    assert!(
+        line.contains(&crate::offer::text::elevation_unreadable_clause(
+            "the token cannot be read"
+        )),
+        "{line}"
+    );
+    assert_eq!(line.lines().count(), 1, "{line}");
+}

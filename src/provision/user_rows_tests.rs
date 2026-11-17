@@ -324,3 +324,31 @@ fn the_row_for_an_unelevated_administrator_says_why_nothing_can_be_checked_here(
         row.detail
     );
 }
+
+// which rows an account gets ------------------------------------------------------------------
+
+#[test]
+fn a_full_or_standard_token_gets_the_agents_rows() {
+    assert!(matches!(account_rows(&Ok(Elevation::Full)), AccountRows::Agent));
+    assert!(matches!(account_rows(&Ok(Elevation::Standard)), AccountRows::Agent));
+}
+
+#[test]
+fn a_filtered_token_gets_the_explanation_in_place_of_the_agents_rows() {
+    assert!(matches!(account_rows(&Ok(Elevation::Filtered)), AccountRows::Filtered));
+}
+
+#[test]
+fn a_token_whose_elevation_cannot_be_read_gets_a_failing_row_with_the_cause_before_the_agents_rows() {
+    let AccountRows::AgentAfter(row) = account_rows(&Err(anyhow::anyhow!("the token cannot be read"))) else {
+        panic!("the agent's rows follow, since nothing says they are the wrong ones");
+    };
+    assert!(!row.pass, "nothing was proven");
+    assert!(
+        row.detail.contains(&crate::offer::text::elevation_unreadable_clause(
+            "the token cannot be read"
+        )),
+        "{}",
+        row.detail
+    );
+}

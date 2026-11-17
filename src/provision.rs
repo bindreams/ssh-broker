@@ -462,22 +462,25 @@ mod imp {
         // Per user: this account's socket, its folder and file ACLs, and whether its agent
         // answers. `verify` reports on the account that runs it.
         let location = crate::userdir::current_socket_location();
-        // An administrator's unelevated prompt looks in the plain folder, where its account has no agent: the
-        // rows about the agent would only say "none", so it is told why instead.
-        let filtered = matches!(crate::account::elevation(), Ok(crate::account::Elevation::Filtered));
-        match crate::acl::Sid::current_user() {
-            Ok(_) if filtered => {
+        match (
+            crate::acl::Sid::current_user(),
+            user_rows::account_rows(&crate::account::elevation()),
+        ) {
+            (Ok(_), user_rows::AccountRows::Filtered) => {
                 rows.push(user_rows::socket_location_row(&location));
                 rows.push(user_rows::filtered_row());
             }
-            Ok(user) => {
+            (Ok(user), account_rows) => {
+                if let user_rows::AccountRows::AgentAfter(unreadable) = account_rows {
+                    rows.push(unreadable);
+                }
                 rows.push(user_rows::socket_location_row(&location));
                 rows.push(user_rows::socket_dir_row(&location, &user));
                 rows.push(user_rows::socket_file_row(&location, &user));
                 rows.push(user_rows::log_folder_row(&location, &user));
                 rows.push(user_rows::socket_reachable_row(&location, &user));
             }
-            Err(e) => {
+            (Err(e), _) => {
                 rows.push(report::Check::new("socket location", false, format!("{e:#}")));
                 rows.push(report::Check::new("socket reachable", false, format!("{e:#}")));
             }

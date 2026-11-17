@@ -103,39 +103,43 @@ CASES: dict[str, tuple[list[str], list[str]]] = {
     ),
     "no-space-runs-in-literals": (
         [
-            # The three that were written: a line joined with no `\`, leaving the next line's indentation.
             '        "this login is elevated, and starting a session for {user} needs          the right",',
             '        "refused: the folder is not the private one          so no session is offered",',
             '    let s = "ssh-broker: cannot connect           (the agent did not answer)";',
             '    let s = format!("a   b");',
-            # After an earlier literal, and after an escaped quote.
             '    let s = f("a", "b   c");',
             '    let s = "say \\"hi\\" and   go";',
             # A char literal holding a quote does not open a literal, so the run after it is code; but a
             # literal that follows it still counts.
             "    let s = '\"'; let t = \"a   b\";",
             '    let s = "a   b"; // spaces-ok:',
+            # An ordinary literal after a raw string still counts.
+            '    let p = r"C:\\"; let s = "a   b";',
+            '    let p = r#"a "quoted" b"#; let s = "a   b";',
         ],
         [
-            # Indentation, code spacing, aligned comments.
             '        "a sentence on its own line",',
             "    let x   = 1;",
             "    let x = f(a,     b);",
             '    foo();      // aligned "comment"',
-            # Two short literals separated by code.
             '    f("a"),    g("b")',
             '    let t = ("ab");    let u = ("cd");',
-            # A char literal with a quote; a lifetime.
             "    let c = '\"'; foo(     x);",
             "    fn f<'a>(x: &'a str,     y: u8) {}",
-            # A run next to a quote, or after an escape (indentation a message means).
             '    let s = "a   ";',
             '    let s = "   a";',
             '    let s = "a\\n    b";',
-            # A single or double space.
             '    let s = "a  b";',
-            # Opt-out with a reason.
             '    let s = "a   b"; // spaces-ok: a table column',
+            # A raw string is skipped whole: a trailing `\` does not escape its closing quote, so the code
+            # after it is not inside a literal. A run in its text is not matched either.
+            '    let p = r"C:\\"; let x   = 1;',
+            '    let p = r#"a "quoted" b"#; let x   = 1;',
+            '    let p = br"C:\\"; let x   = 1;',
+            '    let p = r"a   b";',
+            # Known limit: only the line with the opening quote is read, so a run typed into a later line
+            # of a sentence continued with `\` is not seen.
+            '        so a run   here is not seen",',
         ],
     ),
 }
