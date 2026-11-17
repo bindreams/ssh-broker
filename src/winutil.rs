@@ -5,15 +5,17 @@
 //! and reasoned about once.
 
 use crate::shell::StartError;
-use windows::Win32::Foundation::{CloseHandle, HANDLE};
+use anyhow::Context;
+use windows::Win32::Foundation::{CloseHandle, ERROR_INSUFFICIENT_BUFFER, HANDLE};
+use windows::Win32::Security::{GetTokenInformation, TOKEN_INFORMATION_CLASS, TOKEN_QUERY};
 use windows::Win32::System::Console::HPCON;
 use windows::Win32::System::Diagnostics::Debug::{
     GetThreadErrorMode, SEM_FAILCRITICALERRORS, SetThreadErrorMode, THREAD_ERROR_MODE,
 };
 use windows::Win32::System::Threading::{
     CREATE_NO_WINDOW, CREATE_SUSPENDED, CreateProcessW, DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT,
-    InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_CREATION_FLAGS, PROCESS_INFORMATION,
-    STARTF_USESTDHANDLES, STARTUPINFOEXW, UpdateProcThreadAttribute,
+    GetCurrentProcess, InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST, OpenProcessToken,
+    PROCESS_CREATION_FLAGS, PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOEXW, UpdateProcThreadAttribute,
 };
 use windows::core::{PCWSTR, PWSTR};
 
@@ -41,6 +43,56 @@ impl Drop for OwnedHandle {
             }
         }
     }
+}
+
+/// A `TOKEN_QUERY` handle on this process's token. Read the token through this handle (`userdir`,
+/// `account::elevation`, [`token_information`]); a read that needs more access than `TOKEN_QUERY`
+/// opens its own. One file still opens the token itself, `tests/common/fs_state.rs`: both the library
+/// and the integration tests include it by path, so it can name neither crate.
+pub fn own_token() -> anyhow::Result<OwnedHandle> {
+    let mut token = HANDLE::default();
+    // SAFETY: `token` is a valid out-pointer; the handle is closed by `OwnedHandle`.
+    unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) }.context("open the process token")?;
+    Ok(OwnedHandle(token))
+}
+
+/// What `GetTokenInformation` returned for a variable-length class: the bytes, in storage aligned
+/// for the structures that hold pointers. The structure at the start points into the same bytes, so
+/// read it through [`TokenInformation::as_ptr`] and bound every offset by [`TokenInformation::size`].
+pub struct TokenInformation {
+    storage: Vec<u64>,
+}
+
+impl TokenInformation {
+    /// The start of the data, 8-aligned, valid for [`size`](Self::size) bytes while `self` lives.
+    /// Not a reference: a structure that ends in a one-element array must not be read through one.
+    pub fn as_ptr<T>(&self) -> *const T {
+        debug_assert!(align_of::<T>() <= align_of::<u64>());
+        self.storage.as_ptr().cast()
+    }
+
+    /// The bytes the buffer holds: at least what the call returned, rounded up to 8.
+    pub fn size(&self) -> usize {
+        self.storage.len() * size_of::<u64>()
+    }
+}
+
+/// `class` of `token`, which needs `TOKEN_QUERY`. Every error carries Windows' reason; a handle
+/// without the access fails with it, not with a length.
+pub fn token_information(token: HANDLE, class: TOKEN_INFORMATION_CLASS) -> anyhow::Result<TokenInformation> {
+    let mut len = 0u32;
+    // SAFETY: a null buffer is the documented size probe; it fails with the length needed.
+    if let Err(e) = unsafe { GetTokenInformation(token, class, None, 0, &mut len) }
+        && e.code() != windows::core::HRESULT::from_win32(ERROR_INSUFFICIENT_BUFFER.0)
+    {
+        return Err(anyhow::Error::new(e).context("GetTokenInformation (size probe)"));
+    }
+    anyhow::ensure!(len > 0, "the token information size probe returned no length");
+    let mut storage = vec![0u64; (len as usize).div_ceil(size_of::<u64>())];
+    // SAFETY: `storage` holds at least `len` bytes, which is what the call is told.
+    unsafe { GetTokenInformation(token, class, Some(storage.as_mut_ptr().cast()), len, &mut len) }
+        .context("GetTokenInformation")?;
+    Ok(TokenInformation { storage })
 }
 
 /// While alive, a program that `CreateProcessW` cannot start (the wrong architecture, a file that is not

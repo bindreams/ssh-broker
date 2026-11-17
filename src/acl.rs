@@ -45,10 +45,10 @@ use windows::Win32::Security::Authorization::{
 use windows::Win32::Security::{
     ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, ACL_SIZE_INFORMATION, AclSizeInformation, CONTAINER_INHERIT_ACE, CopySid,
     CreateWellKnownSid, DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetAclInformation, GetLengthSid,
-    GetSecurityDescriptorControl, GetTokenInformation, INHERITED_ACE, IsValidSid, LookupAccountNameW,
-    LookupAccountSidW, OBJECT_INHERIT_ACE, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SE_DACL_PRESENT,
-    SE_DACL_PROTECTED, SECURITY_ATTRIBUTES, SID_NAME_USE, TOKEN_QUERY, TOKEN_USER, TokenUser,
-    WinBuiltinAdministratorsSid, WinBuiltinUsersSid, WinLocalSystemSid,
+    GetSecurityDescriptorControl, INHERITED_ACE, IsValidSid, LookupAccountNameW, LookupAccountSidW, OBJECT_INHERIT_ACE,
+    OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SE_DACL_PRESENT, SE_DACL_PROTECTED, SECURITY_ATTRIBUTES,
+    SID_NAME_USE, TOKEN_QUERY, TOKEN_USER, TokenUser, WinBuiltinAdministratorsSid, WinBuiltinUsersSid,
+    WinLocalSystemSid,
 };
 use windows::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, CreateDirectoryW, FILE_ACCESS_RIGHTS, FILE_ALL_ACCESS, FILE_ATTRIBUTE_DIRECTORY,
@@ -109,7 +109,7 @@ impl Sid {
     /// SID of the user owning the current process token. Used by tests and by the
     /// interactive `apply` path; production provisioning resolves the grantee by name.
     pub fn current_user() -> anyhow::Result<Sid> {
-        Sid::of_token(crate::account::own_token()?.0)
+        Sid::of_token(crate::winutil::own_token()?.0)
     }
 
     /// SID of the user owning the token of `process`, which needs `PROCESS_QUERY_LIMITED_INFORMATION`.
@@ -123,21 +123,15 @@ impl Sid {
 
     /// SID of the user `token` belongs to, which needs `TOKEN_QUERY`.
     pub fn of_token(token: HANDLE) -> anyhow::Result<Sid> {
-        unsafe {
-            // Size probe: the first call is expected to fail with the needed length.
-            let mut len = 0u32;
-            let _ = GetTokenInformation(token, TokenUser, None, 0, &mut len);
-            let mut buf = vec![0u8; len as usize];
-            GetTokenInformation(
-                token,
-                TokenUser,
-                Some(buf.as_mut_ptr() as *mut core::ffi::c_void),
-                len,
-                &mut len,
-            )?;
-            let token_user = &*(buf.as_ptr() as *const TOKEN_USER);
-            Sid::from_psid(token_user.User.Sid)
-        }
+        let buf = crate::winutil::token_information(token, TokenUser).context("read the token's user")?;
+        anyhow::ensure!(
+            buf.size() >= size_of::<TOKEN_USER>(),
+            "the token's user is {} bytes, shorter than its header",
+            buf.size()
+        );
+        // SAFETY: the buffer holds a `TOKEN_USER` (checked above), 8-aligned, whose SID lies inside it.
+        let sid = unsafe { buf.as_ptr::<TOKEN_USER>().read() }.User.Sid;
+        Sid::from_psid(sid)
     }
 
     /// A well-known SID (SYSTEM / BUILTIN\\Administrators / BUILTIN\\Users).

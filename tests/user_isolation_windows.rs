@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::mpsc;
 
+use ssh_broker::account::{INTEGRITY_LOW, INTEGRITY_MEDIUM};
 use ssh_broker::acl::{self, Sid};
 use ssh_broker::afunix::{self, Listener};
 use ssh_broker::agent_lock::{SessionSlot, UserLock};
@@ -650,11 +651,11 @@ fn a_low_integrity_process_of_the_same_user_cannot_connect_to_the_agent_socket()
 
     // Control: the same child, started the same way at Medium, the user's usual level, reaches the
     // socket, so a refusal below is the integrity check's doing and not an unreachable path.
-    let medium = run("medium", integrity::MEDIUM);
-    let expected_medium = child_facts(integrity::MEDIUM, "ok", "ok", "connected", None);
+    let medium = run("medium", INTEGRITY_MEDIUM);
+    let expected_medium = child_facts(INTEGRITY_MEDIUM, "ok", "ok", "connected", None);
     assert_eq!(medium, expected_medium, "the control child must connect\n{measured}");
 
-    let low = run("low", integrity::LOW);
+    let low = run("low", INTEGRITY_LOW);
     assert_eq!(
         (fact(&low, "stat"), fact(&low, "create"), fact(&low, "connect_os_error")),
         ("ok", "ok", WSAEACCES.to_string().as_str()),
@@ -669,8 +670,8 @@ fn a_low_integrity_process_of_the_same_user_cannot_connect_to_the_agent_socket()
         labelled.contains(&low_label_ace("")) && acl::verify_file_acl(loc.path(), &me).unwrap(),
         "the socket file must carry a Low label and keep its exact DACL\n{measured}\nnow: {labelled}"
     );
-    let low_labelled = run("low-labelled", integrity::LOW);
-    let expected_low_labelled = child_facts(integrity::LOW, "ok", "ok", "connected", None);
+    let low_labelled = run("low-labelled", INTEGRITY_LOW);
+    let expected_low_labelled = child_facts(INTEGRITY_LOW, "ok", "ok", "connected", None);
     assert_eq!(
         low_labelled, expected_low_labelled,
         "a Low-integrity process must connect once the socket file is labelled Low\n{measured}\nnow: {labelled}"

@@ -4,20 +4,21 @@
 //! never read from the environment, a typed name or an argument: `USERNAME` is whatever the
 //! caller set, and a password prompt for a name the caller chose would sign a different account on.
 
+use std::mem::{offset_of, size_of};
+use std::ptr::addr_of;
+
 use anyhow::Context;
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Security::{
-    GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, IsWellKnownSid, TOKEN_GROUPS,
-    TOKEN_INFORMATION_CLASS, TOKEN_MANDATORY_LABEL, TOKEN_QUERY, TokenGroups, TokenIntegrityLevel,
-    WinBuiltinAdministratorsSid,
+    GetSidSubAuthority, GetSidSubAuthorityCount, IsWellKnownSid, PSID, SID_AND_ATTRIBUTES, TOKEN_GROUPS,
+    TOKEN_MANDATORY_LABEL, TokenGroups, TokenIntegrityLevel, WinBuiltinAdministratorsSid,
 };
-use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 use windows::Win32::System::WindowsProgramming::GetComputerNameW;
 use windows::core::PWSTR;
 
 use crate::acl::Sid;
 pub use crate::offer::AccountKind;
-use crate::winutil::OwnedHandle;
+use crate::winutil::{own_token, token_information};
 
 /// An account of this PC, as ssh-broker names it in prompts, logon calls and tasks.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,8 +72,11 @@ pub fn computer_name() -> anyhow::Result<String> {
     Ok(String::from_utf16_lossy(&buf[..len as usize]))
 }
 
-/// The relative id of the High mandatory label, `S-1-16-12288`.
-const SECURITY_MANDATORY_HIGH_RID: u32 = 0x3000;
+/// The relative ids of the mandatory integrity labels (`S-1-16-<rid>`), as [`integrity_of`] gives them.
+pub const INTEGRITY_LOW: u32 = 0x1000;
+pub const INTEGRITY_MEDIUM: u32 = 0x2000;
+pub const INTEGRITY_HIGH: u32 = 0x3000;
+pub const INTEGRITY_SYSTEM: u32 = 0x4000;
 /// `TOKEN_GROUPS` attribute bits (winnt.h).
 const SE_GROUP_ENABLED: u32 = 0x4;
 const SE_GROUP_USE_FOR_DENY_ONLY: u32 = 0x10;
@@ -101,34 +105,36 @@ pub enum AdministratorsSid {
 }
 
 /// The elevation of a token with `administrators` and the relative id `integrity_rid` of its
-/// integrity label (`0x2000` Medium, `0x3000` High).
+/// integrity label ([`INTEGRITY_MEDIUM`], [`INTEGRITY_HIGH`]).
 pub fn classify_elevation(administrators: AdministratorsSid, integrity_rid: u32) -> Elevation {
     match administrators {
         AdministratorsSid::Absent => Elevation::Standard,
-        AdministratorsSid::Enabled if integrity_rid >= SECURITY_MANDATORY_HIGH_RID => Elevation::Full,
+        AdministratorsSid::Enabled if integrity_rid >= INTEGRITY_HIGH => Elevation::Full,
         AdministratorsSid::Enabled | AdministratorsSid::DenyOnly => Elevation::Filtered,
     }
 }
 
-/// A `TOKEN_QUERY` handle on this process's token: the only place that opens it. Read the token
-/// through this handle (`userdir`, `elevation`); a read that needs more access than `TOKEN_QUERY`
-/// opens its own.
-pub fn own_token() -> anyhow::Result<OwnedHandle> {
-    let mut token = HANDLE::default();
-    // SAFETY: `token` is a valid out-pointer; the handle is closed by `OwnedHandle`.
-    unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) }.context("open the process token")?;
-    Ok(OwnedHandle(token))
-}
-
-/// The relative id of the integrity label of `token` (`0x2000` Medium, `0x3000` High), which needs
-/// `TOKEN_QUERY`.
+/// The relative id of the integrity label of `token` ([`INTEGRITY_MEDIUM`], [`INTEGRITY_HIGH`]), which
+/// needs `TOKEN_QUERY`.
 pub fn integrity_of(token: HANDLE) -> anyhow::Result<u32> {
     let buf = token_information(token, TokenIntegrityLevel).context("read the token's integrity level")?;
-    // SAFETY: the buffer holds a `TOKEN_MANDATORY_LABEL` whose SID lies inside it, and `u64`
-    // storage is aligned for both.
+    anyhow::ensure!(
+        buf.size() >= size_of::<TOKEN_MANDATORY_LABEL>(),
+        "the token's integrity level is {} bytes, shorter than its header",
+        buf.size()
+    );
+    // SAFETY: the buffer holds a `TOKEN_MANDATORY_LABEL` (checked above), 8-aligned; the SID it
+    // names lies inside the buffer, and `rid_of_label` rejects a null one.
+    let sid = unsafe { buf.as_ptr::<TOKEN_MANDATORY_LABEL>().read() }.Label.Sid;
+    rid_of_label(sid)
+}
+
+/// The last sub-authority of the label SID `sid`, which is the relative id of the level. A null SID,
+/// or one without a sub-authority, is an error.
+fn rid_of_label(sid: PSID) -> anyhow::Result<u32> {
+    anyhow::ensure!(!sid.0.is_null(), "the integrity label has no SID");
+    // SAFETY: `sid` is non-null and names a SID, which the token information put inside its buffer.
     unsafe {
-        let label = &*buf.as_ptr().cast::<TOKEN_MANDATORY_LABEL>();
-        let sid = label.Label.Sid;
         let count = *GetSidSubAuthorityCount(sid);
         anyhow::ensure!(count > 0, "the integrity label has no sub-authority");
         Ok(*GetSidSubAuthority(sid, u32::from(count) - 1))
@@ -138,23 +144,40 @@ pub fn integrity_of(token: HANDLE) -> anyhow::Result<u32> {
 /// Whether, and how, `BUILTIN\Administrators` is in `token`, which needs `TOKEN_QUERY`.
 fn administrators_of(token: HANDLE) -> anyhow::Result<AdministratorsSid> {
     let buf = token_information(token, TokenGroups).context("read the token's groups")?;
-    // SAFETY: the buffer holds a `TOKEN_GROUPS` with `GroupCount` entries after its header,
-    // `u64` storage being aligned for it; each entry's SID lies inside the buffer.
-    unsafe {
-        let groups = &*buf.as_ptr().cast::<TOKEN_GROUPS>();
-        let first = groups.Groups.as_ptr();
-        for index in 0..groups.GroupCount as usize {
-            let group = &*first.add(index);
-            if IsWellKnownSid(group.Sid, WinBuiltinAdministratorsSid).as_bool() {
-                let attributes = group.Attributes;
-                return Ok(
-                    if attributes & SE_GROUP_USE_FOR_DENY_ONLY != 0 || attributes & SE_GROUP_ENABLED == 0 {
-                        AdministratorsSid::DenyOnly
-                    } else {
-                        AdministratorsSid::Enabled
-                    },
-                );
-            }
+    let header = offset_of!(TOKEN_GROUPS, Groups);
+    anyhow::ensure!(
+        buf.size() >= header,
+        "the token's groups are {} bytes, shorter than their header",
+        buf.size()
+    );
+    let groups = buf.as_ptr::<TOKEN_GROUPS>();
+    // SAFETY: the buffer is 8-aligned and holds at least the header (checked above). Only raw
+    // pointers are formed: `Groups` is declared with one element and a reference to the structure
+    // would cover no more.
+    let count = unsafe { addr_of!((*groups).GroupCount).read() } as usize;
+    let needed = count
+        .checked_mul(size_of::<SID_AND_ATTRIBUTES>())
+        .and_then(|entries| entries.checked_add(header));
+    anyhow::ensure!(
+        needed.is_some_and(|needed| needed <= buf.size()),
+        "the token claims {count} groups in {} bytes",
+        buf.size()
+    );
+    // SAFETY: `count` entries after the header lie inside the buffer (checked above), each an
+    // aligned `SID_AND_ATTRIBUTES` whose SID the system put inside the buffer too.
+    let first = unsafe { addr_of!((*groups).Groups) }.cast::<SID_AND_ATTRIBUTES>();
+    for index in 0..count {
+        let group = unsafe { first.add(index).read() };
+        // SAFETY: `group.Sid` is a SID inside the buffer.
+        if unsafe { IsWellKnownSid(group.Sid, WinBuiltinAdministratorsSid) }.as_bool() {
+            let attributes = group.Attributes;
+            return Ok(
+                if attributes & SE_GROUP_USE_FOR_DENY_ONLY != 0 || attributes & SE_GROUP_ENABLED == 0 {
+                    AdministratorsSid::DenyOnly
+                } else {
+                    AdministratorsSid::Enabled
+                },
+            );
         }
     }
     Ok(AdministratorsSid::Absent)
@@ -168,18 +191,6 @@ pub fn elevation_of(token: HANDLE) -> anyhow::Result<Elevation> {
 /// The elevation of this process's token.
 pub fn elevation() -> anyhow::Result<Elevation> {
     elevation_of(own_token()?.0)
-}
-
-/// `class` of `token`, as bytes in 8-aligned storage (the structures in it hold pointers).
-fn token_information(token: HANDLE, class: TOKEN_INFORMATION_CLASS) -> anyhow::Result<Vec<u64>> {
-    let mut len = 0u32;
-    // SAFETY: a null buffer is the documented size probe; it fails with the length needed.
-    let _ = unsafe { GetTokenInformation(token, class, None, 0, &mut len) };
-    anyhow::ensure!(len > 0, "the token information size probe returned 0");
-    let mut buf = vec![0u64; (len as usize).div_ceil(8)];
-    // SAFETY: `buf` holds at least `len` bytes, which is what the call is told.
-    unsafe { GetTokenInformation(token, class, Some(buf.as_mut_ptr().cast()), len, &mut len) }?;
-    Ok(buf)
 }
 
 #[cfg(test)]

@@ -259,3 +259,39 @@ fn a_child_started_without_a_pseudoconsole_gets_a_console_with_no_window() {
     assert_eq!(pseudo.0, always);
     assert_eq!(none.0, always | CREATE_NO_WINDOW.0);
 }
+
+#[test]
+fn token_information_of_an_invalid_handle_carries_the_windows_error() {
+    use windows::Win32::Security::TokenUser;
+    let err = token_information(HANDLE::default(), TokenUser)
+        .err()
+        .expect("an invalid handle reads nothing");
+    let os = err
+        .downcast_ref::<windows::core::Error>()
+        .expect("Windows' error is kept");
+    assert_eq!(os.code(), windows::core::HRESULT::from_win32(6), "{err:#}"); // ERROR_INVALID_HANDLE
+}
+
+#[test]
+fn token_information_of_a_handle_without_token_query_is_access_denied() {
+    use windows::Win32::Security::{TOKEN_DUPLICATE, TokenUser};
+    let mut token = HANDLE::default();
+    // SAFETY: a valid out-pointer; the handle is closed by `OwnedHandle`.
+    unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_DUPLICATE, &mut token) }.unwrap();
+    let token = OwnedHandle(token);
+    let err = token_information(token.0, TokenUser)
+        .err()
+        .expect("no TOKEN_QUERY reads nothing");
+    let os = err
+        .downcast_ref::<windows::core::Error>()
+        .expect("Windows' error is kept");
+    assert_eq!(os.code(), windows::core::HRESULT::from_win32(5), "{err:#}"); // ERROR_ACCESS_DENIED
+}
+
+#[test]
+fn token_information_of_this_process_is_aligned_and_at_least_a_header() {
+    use windows::Win32::Security::{TOKEN_USER, TokenUser};
+    let info = token_information(own_token().unwrap().0, TokenUser).unwrap();
+    assert!(info.size() >= size_of::<TOKEN_USER>(), "{}", info.size());
+    assert_eq!(info.as_ptr::<u8>() as usize % 8, 0);
+}

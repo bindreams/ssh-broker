@@ -22,14 +22,9 @@ use crate::desktop::PrivateDesktop;
 /// the label RIDs, in `Win32::System::SystemServices`, a feature this crate does not enable.
 const SE_GROUP_INTEGRITY: u32 = 0x20;
 
-/// The relative id of the Low mandatory label, `S-1-16-4096`.
-pub const LOW: u32 = 0x1000;
-/// The relative id of the Medium mandatory label, `S-1-16-8192`.
-pub const MEDIUM: u32 = 0x2000;
-
 /// This process's mandatory integrity level, as the relative id of its label SID.
 pub fn current_rid() -> u32 {
-    ssh_broker::account::integrity_of(ssh_broker::account::own_token().unwrap().0).unwrap()
+    ssh_broker::account::integrity_of(ssh_broker::winutil::own_token().unwrap().0).unwrap()
 }
 
 /// A primary token that is a copy of this process's, with its mandatory integrity label set to `rid`.
@@ -75,8 +70,9 @@ fn token_at(rid: u32) -> OwnedHandle {
     }
 }
 
-/// Run `exe` with `command_line` as this process's user at mandatory integrity level `rid` ([`LOW`],
-/// [`MEDIUM`]) and return its exit code. The child's token is a copy of this process's with only its
+/// Run `exe` with `command_line` as this process's user at mandatory integrity level `rid`
+/// (`ssh_broker::account::INTEGRITY_LOW` or `INTEGRITY_MEDIUM`) and return its exit code. The child's
+/// token is a copy of this process's with only its
 /// label set, so two levels differ in the integrity check and nothing else. It starts through
 /// [`spawn_with_token`]; a child that does not exit fails the test with `evidence` printed.
 ///

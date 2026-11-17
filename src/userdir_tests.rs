@@ -2,7 +2,7 @@
 //!
 //! Anything that needs a second account or elevation lives in `tests/user_isolation_windows.rs`.
 use super::*;
-use crate::account::own_token;
+use crate::winutil::own_token;
 use std::path::PathBuf;
 
 #[test]

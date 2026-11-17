@@ -246,7 +246,7 @@ pub fn current_logon_type() -> Option<u32> {
     };
     use windows::Win32::Security::{GetTokenInformation, TOKEN_STATISTICS, TokenStatistics};
 
-    let token = crate::account::own_token().ok()?;
+    let token = crate::winutil::own_token().ok()?;
     let mut stats = TOKEN_STATISTICS::default();
     let mut len = 0u32;
     // SAFETY: `stats` is a `TOKEN_STATISTICS` and the length passed is its size.
