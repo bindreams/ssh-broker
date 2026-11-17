@@ -16,7 +16,6 @@ use ssh_broker::cmdline::split_args;
 use ssh_broker::provision::registry::{OPENSSH_KEY, set_default_shell_under};
 use ssh_broker::shim::spawn_line;
 use ssh_broker::socket_loc;
-use ssh_broker::socket_loc::Integrity;
 
 #[path = "common/account.rs"]
 mod account_fixture;
@@ -129,7 +128,7 @@ impl Rig {
     fn logs(&self) -> String {
         self.account
             .try_profile()
-            .and_then(|profile| socket_loc::for_profile(profile, Integrity::Medium).ok())
+            .and_then(|profile| socket_loc::for_profile(profile, self.account.integrity()).ok())
             .map(|location| stand_in::read_logs(&location))
             .unwrap_or_default()
     }
@@ -716,7 +715,7 @@ fn the_warning_is_on_the_screen_when_the_fallback_line_is_near_the_command_line_
     rig.broker_is_default_shell();
     let session = rig.start_session(&login);
     rig.account.write_user_config("shell: {strt: pwsh.exe}\n");
-    let location = socket_loc::for_profile(rig.account.profile(), Integrity::Medium).unwrap();
+    let location = rig.account.socket_location();
 
     // `<system directory>\cmd.exe /c ` is under 60 units and the warning and the verb's own name are over 300,
     // so the line fits and the verb's line would not if it carried the line.

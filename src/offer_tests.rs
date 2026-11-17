@@ -316,9 +316,9 @@ fn a_failed_start_line_names_the_reason_once() {
 }
 
 #[test]
-fn a_missing_batch_right_is_said_in_its_own_sentence_and_the_plain_shell_follows() {
+fn a_stated_limit_is_said_in_its_own_sentence_and_the_plain_shell_follows() {
     let mut io = Fake::with_steps(vec![Ok(Step::Submit(password("pw")))]);
-    io.start_result = Some(Err(StartFailure::NoBatchRight {
+    io.start_result = Some(Err(StartFailure::Limit {
         sentence: "ssh-broker: alice may not log on as a batch job.".into(),
     }));
     let out = run_pty(&mut io);

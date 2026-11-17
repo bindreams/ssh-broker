@@ -45,6 +45,8 @@ use probe::{probe_for, start_probe};
 const ERROR_FILENAME_EXCED_RANGE: u32 = 206;
 /// `ERROR_LOGON_TYPE_NOT_GRANTED`: the account does not hold the right for this logon type.
 const ERROR_LOGON_TYPE_NOT_GRANTED: u32 = 1385;
+/// `ERROR_PRIVILEGE_NOT_HELD`: the caller lacks a privilege the call needs.
+const ERROR_PRIVILEGE_NOT_HELD: u32 = 1314;
 /// `ERROR_ACCESS_DENIED`: what a refused `CREATE_BREAKAWAY_FROM_JOB` is answered with.
 const ERROR_ACCESS_DENIED: u32 = 5;
 const PASSWORD_TOO_LONG: &str = "the password is too long for Windows.";
@@ -56,6 +58,10 @@ pub enum LogonKind {
     Interactive,
     /// `LogonUserW(BATCH)` and `CreateProcessWithTokenW`: the full token, for a shim at High integrity, whose
     /// folder only an agent with a full token serves.
+    ///
+    /// The caller must hold `SeImpersonatePrivilege` ("Impersonate a client after authentication"), which
+    /// `CreateProcessWithTokenW` needs: administrators hold it, the other accounts Windows splits do not
+    /// by default. Without it the start is refused with [`LogonFailure::privilege_not_held`].
     Batch,
 }
 
@@ -161,6 +167,12 @@ impl LogonFailure {
     /// Whether the account does not hold the right for the logon type (`ERROR_LOGON_TYPE_NOT_GRANTED`).
     pub fn right_not_granted(&self) -> bool {
         self.code == ERROR_LOGON_TYPE_NOT_GRANTED
+    }
+
+    /// Whether the caller lacks a privilege the call needs (`ERROR_PRIVILEGE_NOT_HELD`). `LogonUserW` takes
+    /// no privilege, so for a [`LogonKind::Batch`] start it is the process start that failed.
+    pub fn privilege_not_held(&self) -> bool {
+        self.code == ERROR_PRIVILEGE_NOT_HELD
     }
 
     fn from_error(error: &windows::core::Error) -> LogonFailure {

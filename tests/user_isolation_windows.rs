@@ -873,6 +873,27 @@ fn an_unelevated_process_of_the_account_is_refused_the_elevated_folder() {
     }
 }
 
+/// Elevated (CI only). The log folder inside the elevated folder is made with the High label, and the
+/// walk judges it with that label: it passes for the folder as the agent makes it.
+#[test]
+fn the_log_folder_in_the_elevated_folder_carries_the_label() {
+    account::assert_elevated();
+    let me = Sid::current_user().unwrap();
+    let profile = StandInProfile::new("hl");
+    let loc = profile.location_at(Integrity::High);
+    userdir::ensure_socket_dir(&loc, &me).unwrap();
+    assert!(
+        acl::verify_dir_acl(&loc.logs_dir(), &me, Integrity::High).unwrap(),
+        "logs carries the label
+{}",
+        dacl_and_label_sddl(&loc.logs_dir())
+    );
+    userdir::inspect_socket_dir(&loc, &me)
+        .unwrap()
+        .logs
+        .unwrap_or_else(|e| panic!("the walk judges logs as the agent made it: {e:#}"));
+}
+
 /// Child half of [`a_folder_the_account_made_in_the_elevated_ones_place_is_refused`]: make the folder the
 /// way any process of the account can, with the plain call.
 #[test]

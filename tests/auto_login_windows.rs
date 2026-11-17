@@ -14,8 +14,6 @@ use ssh_broker::account::LocalAccount;
 use ssh_broker::autologin::{self, PasswordSource, WindowsEnv};
 use ssh_broker::provision::session_task::{task_name, task_problem};
 use ssh_broker::provision::taskscheduler;
-use ssh_broker::socket_loc;
-use ssh_broker::socket_loc::Integrity;
 
 #[path = "common/account.rs"]
 mod account_fixture;
@@ -63,14 +61,10 @@ fn env(kit: &Kit, password: &str) -> WindowsEnv {
     )
 }
 
-fn location(account: &Account) -> socket_loc::SocketLocation {
-    socket_loc::for_profile(account.profile(), Integrity::Medium).unwrap()
-}
-
 /// Wait for the agent the task started, then run `check` with a way to connect to it, then end the
 /// session, so that no agent outlives the test.
 fn with_session(kit: &Kit, account: &Account, check: impl FnOnce(&mut dyn FnMut() -> AgentConn)) {
-    let location = location(account);
+    let location = account.socket_location();
     stand_in::wait_for_serving_marker_of_a_task(&location, TASK_START_BOUND);
     let connect = &mut || AgentConn::connect(&location, &account.sid);
     check(connect);
@@ -110,7 +104,7 @@ fn on_registers_a_verified_task_and_off_deletes_it() {
     let state = state_of(&account).expect("the task is registered");
     let exe = kit.exe.to_string_lossy().into_owned();
     assert_eq!(task_problem(&state, &exe, &account.sid_text), None);
-    stand_in::wait_for_serving_marker_of_a_task(&location(&account), TASK_START_BOUND);
+    stand_in::wait_for_serving_marker_of_a_task(&account.socket_location(), TASK_START_BOUND);
     logout_with(&kit, &account);
 
     autologin::off(&mut env(&kit, &account.password), &local).unwrap();
@@ -127,7 +121,7 @@ fn off_twice_is_ok() {
     let local = local_account(&account);
 
     autologin::on(&mut env(&kit, &account.password), &local).unwrap();
-    stand_in::wait_for_serving_marker_of_a_task(&location(&account), TASK_START_BOUND);
+    stand_in::wait_for_serving_marker_of_a_task(&account.socket_location(), TASK_START_BOUND);
     logout_with(&kit, &account);
     autologin::off(&mut env(&kit, &account.password), &local).unwrap();
     autologin::off(&mut env(&kit, &account.password), &local).unwrap();
@@ -196,13 +190,13 @@ fn stored_task_for_an_administrator_starts_a_session() {
     let _machine = machine::shared();
     let kit = kit("al5");
     let account = Account::create("al5", true);
-    let _end = session_end::LogOutOnDrop::new(&kit.exe, &account, ServiceLogon::TaskScheduler);
     account.make_administrator();
+    let _end = session_end::LogOutOnDrop::new(&kit.exe, &account, ServiceLogon::TaskScheduler);
     let local = local_account(&account);
 
     autologin::on(&mut env(&kit, &account.password), &local).unwrap();
-    stand_in::wait_for_serving_marker_of_a_task(&location(&account), TASK_START_BOUND);
-    let mut exec = AgentConn::connect(&location(&account), &account.sid);
+    stand_in::wait_for_serving_marker_of_a_task(&account.socket_location(), TASK_START_BOUND);
+    let mut exec = AgentConn::connect(&account.socket_location(), &account.sid);
     exec.start_exec("cmd.exe /c echo admin-session-up");
     exec.end_stdin();
     assert!(exec.read_to_end().stdout.contains("admin-session-up"));
@@ -241,7 +235,7 @@ fn credential_is_gone_after_off() {
     let local = local_account(&account);
 
     autologin::on(&mut env(&kit, &account.password), &local).unwrap();
-    stand_in::wait_for_serving_marker_of_a_task(&location(&account), TASK_START_BOUND);
+    stand_in::wait_for_serving_marker_of_a_task(&account.socket_location(), TASK_START_BOUND);
     logout_with(&kit, &account);
     assert_eq!(
         stored_entries(&account),
@@ -267,7 +261,7 @@ fn on_twice_then_off_leaves_no_credential() {
     let local = local_account(&account);
 
     autologin::on(&mut env(&kit, &account.password), &local).unwrap();
-    stand_in::wait_for_serving_marker_of_a_task(&location(&account), TASK_START_BOUND);
+    stand_in::wait_for_serving_marker_of_a_task(&account.socket_location(), TASK_START_BOUND);
     autologin::on(&mut env(&kit, &account.password), &local).unwrap();
     assert_eq!(stored_entries(&account), 1, "registering twice stores one credential");
     logout_with(&kit, &account);
@@ -291,7 +285,7 @@ fn a_stale_password_is_not_visible_in_the_last_result() {
     let exe = kit.exe.to_string_lossy().into_owned();
 
     autologin::on(&mut env(&kit, &account.password), &local).unwrap();
-    stand_in::wait_for_serving_marker_of_a_task(&location(&account), TASK_START_BOUND);
+    stand_in::wait_for_serving_marker_of_a_task(&account.socket_location(), TASK_START_BOUND);
     logout_with(&kit, &account);
 
     // The stored password goes stale; the next run cannot log on. The task ignores a start while an
@@ -349,7 +343,7 @@ fn logon_sessions_with_no_process_do_not_pile_up() {
     let account = account_with_batch_right("alcyc");
     let _end = session_end::LogOutOnDrop::new(&kit.exe, &account, ServiceLogon::TaskScheduler);
     let local = local_account(&account);
-    let location = location(&account);
+    let location = account.socket_location();
     let task = task_name(&account.sid_text);
 
     let mut left_after: Vec<Vec<holders::LogonSession>> = Vec::new();

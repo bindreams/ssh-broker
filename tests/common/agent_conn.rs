@@ -13,8 +13,7 @@ use ssh_broker::afunix::{self, ConnRx, ConnTx};
 use ssh_broker::logon;
 use ssh_broker::protocol::{FrameKind, FrameReader, Handshake, Launch, Mode, Stream, write_frame};
 use ssh_broker::relay::{FrameSink, Outcome, PumpError, pump_decode, write_data};
-use ssh_broker::socket_loc::Integrity;
-use ssh_broker::socket_loc::{self, SocketLocation};
+use ssh_broker::socket_loc::SocketLocation;
 use ssh_broker::userdir;
 use ssh_broker::vtinput::{KeyEvent, encode_key_event};
 use ssh_broker::winutil::OwnedHandle;
@@ -55,7 +54,7 @@ impl BackgroundAgent {
             logon::LogonKind::Interactive,
         )
         .unwrap_or_else(|e| panic!("the logon for {} failed: {e:?}", account.name));
-        let location = socket_loc::for_profile(account.profile(), Integrity::Medium).unwrap();
+        let location = account.socket_location();
         let agent = BackgroundAgent {
             process: started.process,
             location,

@@ -62,6 +62,15 @@ pub fn elevation_unreadable(cause: &str) -> String {
 /// folder, so the plain one it looks in has nothing. A clause, for `verify`'s row and `logout`'s line.
 pub const FILTERED_LOOKS_ELSEWHERE: &str = "this account is an administrator and its agent serves elevated processes: run this from an elevated prompt or an ordinary SSH login";
 
+/// The sentence for a login that is elevated and whose account cannot be given an elevated session from a
+/// password: the start is refused for want of `SeImpersonatePrivilege`, which this login does not hold. It
+/// gives the way out in the words of the batch-right sentence, and does not suggest granting the right.
+pub fn impersonate_right_missing(user: &str) -> String {
+    format!(
+        "ssh-broker: this login is elevated, and starting an elevated session for {user} from a password needs          the right \"Impersonate a client after authentication\", which this login does not hold          (a logon at the desktop starts one without it; SSH logins use it while it runs)."
+    )
+}
+
 /// The sentence for a background agent that ended before it served. 64 to 69 are the agent's own
 /// refusals (see `agent_background::Refusal`); it has no console, so its exit code is all it can say.
 /// `logs` is the folder of its log, if it could be found: without it the sentence has no pointer.

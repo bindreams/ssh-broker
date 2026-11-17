@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use ssh_broker::acl::Sid;
+use ssh_broker::socket_loc::{self, Integrity, SocketLocation};
 use ssh_broker::winutil::OwnedHandle;
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::NetworkManagement::NetManagement::{
@@ -105,6 +106,8 @@ pub struct Account {
     pub profile: Option<PathBuf>,
     /// Set by the test that has a service log the account on, see [`Account::started_by`].
     service_logon: std::sync::OnceLock<ServiceLogon>,
+    /// Set by [`Account::make_administrator`]: the level of the account's sessions follows from it.
+    administrator: std::sync::atomic::AtomicBool,
 }
 
 impl Account {
@@ -183,6 +186,7 @@ impl Account {
             sid_text,
             profile: None,
             service_logon: std::sync::OnceLock::new(),
+            administrator: std::sync::atomic::AtomicBool::new(false),
         };
         if with_profile {
             let mut buf = [0u16; 260];
@@ -299,6 +303,25 @@ impl Account {
             let _ = LocalFree(Some(HLOCAL(sid.0)));
         }
         assert_eq!(rc, 0, "NetLocalGroupAddMembers({}) failed with {rc}", self.name);
+        self.administrator.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The integrity level the account's sessions run at, and so the folder its agent keeps its socket
+    /// in: an administrator's agent and shim are elevated (`High`), a standard account's are `Medium`.
+    /// Read as of now: call it after [`Account::make_administrator`], and make a guard that keeps the
+    /// answer (`session_end::LogOutOnDrop`) after it too.
+    pub fn integrity(&self) -> Integrity {
+        if self.administrator.load(std::sync::atomic::Ordering::Relaxed) {
+            Integrity::High
+        } else {
+            Integrity::Medium
+        }
+    }
+
+    /// Where the account's agent keeps its socket ([`Account::integrity`]). Panics for an account made
+    /// without a profile.
+    pub fn socket_location(&self) -> SocketLocation {
+        socket_loc::for_profile(self.profile(), self.integrity()).expect("the account's profile path is short enough")
     }
 
     /// The token sshd's key-authenticated logon gives: a network logon, no loaded profile.
@@ -492,8 +515,12 @@ impl Account {
         let primary = OwnedHandle(primary);
 
         let mut evidence = evidence.to_vec();
-        if let Some(profile) = &self.profile {
-            evidence.push(profile.join("AppData").join("Local").join("ssh-broker"));
+        let location = self
+            .profile
+            .as_deref()
+            .and_then(|profile| socket_loc::for_profile(profile, self.integrity()).ok());
+        if let Some(location) = location {
+            evidence.push(location.dir().to_owned());
         }
         spawn_with_token(
             starter_kind,

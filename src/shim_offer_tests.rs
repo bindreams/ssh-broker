@@ -167,6 +167,15 @@ fn a_standard_token_at_high_relays_with_a_batch_logon() {
 #[test]
 fn a_filtered_token_gets_the_plain_shell_and_no_relay() {
     assert_eq!(stance(Ok(Elevation::Filtered), AT_MEDIUM), Stance::PlainShell);
+    assert_eq!(stance(Ok(Elevation::Filtered), AT_HIGH), Stance::PlainShell);
+    // Whatever its level: one that cannot be read does not turn the plain shell into a relay.
+    assert_eq!(
+        stance(
+            Ok(Elevation::Filtered),
+            Err(anyhow::anyhow!("the level cannot be read"))
+        ),
+        Stance::PlainShell
+    );
 }
 
 #[test]
@@ -245,7 +254,7 @@ fn a_batch_logon_without_a_console_gets_the_notice_as_before() {
 fn a_missing_batch_right_is_told_in_the_prompts_sentence_and_only_for_a_batch_logon() {
     let right = crate::logon::LogonFailure::from_win32(1385);
     let told = start_failure(LogonKind::Batch, "alice", right.clone());
-    let StartFailure::NoBatchRight { sentence } = told else {
+    let StartFailure::Limit { sentence } = told else {
         panic!("{told:?}");
     };
     assert_eq!(
@@ -255,6 +264,34 @@ fn a_missing_batch_right_is_told_in_the_prompts_sentence_and_only_for_a_batch_lo
     // An interactive logon's 1385 is Windows' own to say: the sentence is about a batch job.
     assert!(matches!(
         start_failure(LogonKind::Interactive, "alice", right),
+        StartFailure::Windows { .. }
+    ));
+}
+
+#[test]
+fn a_missing_impersonation_right_is_told_for_a_batch_logon_only() {
+    let held_by_administrators = crate::logon::LogonFailure::from_win32(1314);
+    assert!(held_by_administrators.privilege_not_held());
+    let told = start_failure(LogonKind::Batch, "alice", held_by_administrators.clone());
+    let StartFailure::Limit { sentence } = told else {
+        panic!("{told:?}");
+    };
+    assert_eq!(sentence, crate::offer::text::impersonate_right_missing("alice"));
+    assert!(
+        sentence.contains("Impersonate a client after authentication"),
+        "{sentence}"
+    );
+    assert!(
+        sentence.contains("a logon at the desktop starts one without it"),
+        "the way out is the batch sentence's: {sentence}"
+    );
+    assert!(
+        !sentence.contains("grant"),
+        "it does not tell the account to widen its rights"
+    );
+    // An interactive logon takes no such right: its 1314 is Windows' own to say.
+    assert!(matches!(
+        start_failure(LogonKind::Interactive, "alice", held_by_administrators),
         StartFailure::Windows { .. }
     ));
 }

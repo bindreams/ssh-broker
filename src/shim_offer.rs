@@ -115,10 +115,10 @@ pub enum Stance {
 /// filtered token gets the plain shell whatever its level.
 pub fn stance(elevation: anyhow::Result<Elevation>, integrity: anyhow::Result<Integrity>) -> Stance {
     match (elevation, integrity) {
+        (Ok(Elevation::Filtered), _) => Stance::PlainShell,
         (Err(e), _) | (Ok(_), Err(e)) => Stance::RelayWithoutOffer {
             cause: format!("{e:#}"),
         },
-        (Ok(Elevation::Filtered), _) => Stance::PlainShell,
         (Ok(_), Ok(Integrity::High)) => Stance::Relay {
             logon: LogonKind::Batch,
         },
@@ -609,13 +609,22 @@ impl OfferIo for LiveIo {
     }
 }
 
-/// What the offer says of a logon that Windows refused. A refused batch logon for want of the batch right
-/// gets `auto-login`'s sentence; every other refusal is Windows' own text.
+/// What the offer says of a logon that Windows refused. A batch start refused for want of the batch right
+/// gets `auto-login`'s sentence, and one refused for want of `SeImpersonatePrivilege` (the caller's, which
+/// `CreateProcessWithTokenW` needs) gets its own; both are stated limits. Every other refusal is Windows' own
+/// text.
 fn start_failure(logon: LogonKind, user: &str, failure: LogonFailure) -> StartFailure {
-    if logon == LogonKind::Batch && failure.right_not_granted() {
-        return StartFailure::NoBatchRight {
-            sentence: crate::autologin::batch_right_missing(user, crate::autologin::FROM_PROMPT),
-        };
+    if logon == LogonKind::Batch {
+        if failure.right_not_granted() {
+            return StartFailure::Limit {
+                sentence: crate::autologin::batch_right_missing(user, crate::autologin::FROM_PROMPT),
+            };
+        }
+        if failure.privilege_not_held() {
+            return StartFailure::Limit {
+                sentence: text::impersonate_right_missing(user),
+            };
+        }
     }
     StartFailure::Windows { reason: failure.reason }
 }

@@ -5,7 +5,7 @@
 //! check should do, and each user can run `verify` for themselves.
 
 use crate::acl::{self, Sid};
-use crate::socket_loc::SocketLocation;
+use crate::socket_loc::{Integrity, SocketLocation};
 use crate::userdir::{self, SocketDir};
 
 use super::report::Check;
@@ -84,17 +84,23 @@ pub fn socket_file_row(location: &anyhow::Result<SocketLocation>, user: &Sid) ->
     }
     match acl::verify_file_acl(loc.path(), user, loc.integrity()) {
         Ok(true) => Check::new(NAME, true, format!("grantee={}", user.describe())),
-        Ok(false) => Check::new(
-            NAME,
-            false,
-            format!(
-                "{} does not grant exactly {}, SYSTEM and Administrators",
-                loc.path().display(),
-                user.describe()
-            ),
-        ),
+        Ok(false) => Check::new(NAME, false, file_acl_refusal(loc.path(), user, loc.integrity())),
         Err(e) => Check::new(NAME, false, format!("{e:#}")),
     }
+}
+
+/// What `socket file ACL` says of a file that is not as the agent made it: what is checked, which for the
+/// elevated folder includes the label.
+fn file_acl_refusal(path: &std::path::Path, user: &Sid, integrity: Integrity) -> String {
+    format!(
+        "{} does not grant exactly {}, SYSTEM and Administrators{}",
+        path.display(),
+        user.describe(),
+        match integrity {
+            Integrity::Medium => "",
+            Integrity::High => ", or lacks the High integrity label",
+        }
+    )
 }
 
 /// What to do when the agent is not there. The logon task discards the agent's stderr, and an error

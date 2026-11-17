@@ -822,3 +822,33 @@ fn looking_for_the_elevated_folder_that_is_not_there_finds_it_missing() {
     assert!(open_existing_socket_dir(&loc).unwrap().is_none());
     assert!(!loc.dir().exists(), "nothing was made");
 }
+
+/// What `walk` asks of each folder it makes or opens, for a location at `integrity`: the name and the
+/// level. The folders are plain directories opened as they are, so this runs at any level.
+fn walked_at(integrity: Integrity) -> Vec<(String, Integrity)> {
+    let profile = crate::test_support::TempProfile::new("wl");
+    let loc = profile.location_at(integrity);
+    std::fs::create_dir_all(loc.logs_dir()).unwrap();
+    let asked = std::cell::RefCell::new(Vec::new());
+    let walked = walk(&loc, "look at", |parent, name, _hold, level| {
+        asked.borrow_mut().push((name.to_owned(), level));
+        acl::open_dir(parent, name)
+    })
+    .unwrap();
+    assert!(walked.logs.is_ok());
+    asked.into_inner()
+}
+
+#[test]
+fn the_walk_judges_the_log_folder_at_the_level_of_the_folder_it_is_in() {
+    for (integrity, folder) in [
+        (Integrity::Medium, "ssh-broker"),
+        (Integrity::High, "ssh-broker-elevated"),
+    ] {
+        assert_eq!(
+            walked_at(integrity),
+            [(folder.to_owned(), integrity), ("logs".to_owned(), integrity)],
+            "the private folder and its logs are judged at {integrity:?}"
+        );
+    }
+}

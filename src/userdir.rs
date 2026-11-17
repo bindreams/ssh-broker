@@ -143,9 +143,9 @@ pub fn inspect_current_socket_dir() -> anyhow::Result<SocketDir> {
 }
 
 /// The walk of [`open_socket_dir`] and [`inspect_socket_dir`]; `step` makes or opens the folder `name`
-/// under `parent`, held (the private folder) or not (`logs`) as `hold` says, judged for `integrity`. The
-/// private folder is judged for the location's; `logs` is not asked for a label of its own. This and
-/// [`walk_to_private_folder`] are the only places that ask for the held form.
+/// under `parent`, held (the private folder) or not (`logs`) as `hold` says, judged for `integrity`. Both are
+/// judged for the location's level: `logs` in the elevated folder is made with the label and refused
+/// without it. This and [`walk_to_private_folder`] are the only places that ask for the held form.
 fn walk(
     loc: &SocketLocation,
     verb: &str,
@@ -155,7 +155,7 @@ fn walk(
     let dir = walk_to_private_folder(loc, verb, |local| {
         step(local, integrity.dir_name(), Hold::Held, integrity)
     })?;
-    let logs = step(&dir, socket_loc::LOGS_DIR_NAME, Hold::Shared, Integrity::Medium)
+    let logs = step(&dir, socket_loc::LOGS_DIR_NAME, Hold::Shared, integrity)
         .with_context(|| format!("{verb} the log folder {}", loc.logs_dir().display()));
     Ok(SocketDir {
         location: loc.clone(),

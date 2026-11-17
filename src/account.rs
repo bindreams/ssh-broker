@@ -120,6 +120,14 @@ pub fn classify_elevation(administrators: AdministratorsSid, integrity_rid: u32)
     }
 }
 
+/// Whether a process with `elevation` that looks for the agent in the folder of `level` is looking
+/// elsewhere than where its account's agent serves: an administrator's agent runs elevated, so it serves
+/// the elevated folder, and a token with elevation removed that looks in the plain one finds nothing.
+/// A filtered token at High looks in the elevated folder, so it is not told so.
+pub fn agent_is_elsewhere(elevation: Elevation, level: Integrity) -> bool {
+    elevation == Elevation::Filtered && level == Integrity::Medium
+}
+
 /// The relative id of the integrity label of `token` ([`INTEGRITY_MEDIUM`], [`INTEGRITY_HIGH`]), which
 /// needs `TOKEN_QUERY`.
 pub fn integrity_of(token: HANDLE) -> anyhow::Result<u32> {

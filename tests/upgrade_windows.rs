@@ -13,7 +13,6 @@ use std::time::{Duration, Instant};
 
 use ssh_broker::autologin::{self, PasswordSource, WindowsEnv};
 use ssh_broker::provision::{self, procwait, schtasks, taskscheduler};
-use ssh_broker::socket_loc::Integrity;
 use windows::Win32::Foundation::{HANDLE, HANDLE_FLAG_INHERIT, SetHandleInformation, WAIT_TIMEOUT};
 use windows::Win32::System::Threading::{
     CREATE_PROCESS_LOGON_FLAGS, GetExitCodeProcess, TerminateProcess, WaitForSingleObject,
@@ -232,7 +231,7 @@ fn scene() -> Scene {
     )
     .unwrap();
     let before = {
-        let location = ssh_broker::socket_loc::for_profile(auto.profile(), Integrity::Medium).unwrap();
+        let location = auto.socket_location();
         stand_in::wait_for_serving_marker_of_a_task(&location, TASK_START_BOUND);
         agent_pids(&auto.sid_text)
     };

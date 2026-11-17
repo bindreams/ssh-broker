@@ -18,8 +18,7 @@ use std::os::windows::io::AsRawHandle as _;
 use std::path::Path;
 
 use ssh_broker::agent_background::Refusal;
-use ssh_broker::socket_loc::Integrity;
-use ssh_broker::socket_loc::{self, SocketLocation};
+use ssh_broker::socket_loc::SocketLocation;
 use windows::Win32::Foundation::{HANDLE, HANDLE_FLAG_INHERIT, SetHandleInformation, WAIT_OBJECT_0};
 use windows::Win32::System::Threading::{INFINITE, TerminateProcess, WaitForSingleObject};
 
@@ -95,7 +94,7 @@ fn the_agent_leaves_no_window_on_the_desktop() {
     let agent = RealAgent::start_in_new_console(&kit, &account);
 
     // Serving begins after the console is freed.
-    let location = socket_loc::for_profile(account.profile(), Integrity::Medium).unwrap();
+    let location = account.socket_location();
     stand_in::wait_for_serving_marker(&location, agent.process.process.0);
     wait_until_the_console_is_gone(&agent.process);
     assert_serving(&agent, &location, "it freed its console");

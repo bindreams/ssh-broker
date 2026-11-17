@@ -21,8 +21,7 @@ use std::time::Duration;
 
 use ssh_broker::acl::Sid;
 use ssh_broker::provision::procwait;
-use ssh_broker::socket_loc;
-use ssh_broker::socket_loc::Integrity;
+use ssh_broker::socket_loc::SocketLocation;
 use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
 use windows::Win32::System::Threading::WaitForSingleObject;
 
@@ -52,13 +51,13 @@ pub struct Ended {
 pub fn log_out(exe: &Path, account: &Account, how: ServiceLogon) -> Result<Option<Ended>, String> {
     account.started_by(how);
     match account.try_profile() {
-        Some(profile) => end(
+        Some(_) => end(
             "log_out",
             exe,
             &account.name,
             &account.sid,
             &account.sid_text,
-            profile,
+            &account.socket_location(),
             how,
         ),
         None => {
@@ -75,14 +74,15 @@ pub fn log_out(exe: &Path, account: &Account, how: ServiceLogon) -> Result<Optio
 /// account, so that it drops first. If the logout fails the failure is recorded, the account's
 /// processes are killed by the account's own drop, and the test fails (a test that is already failing
 /// keeps its own panic). Creating it declares how the test starts the
-/// account's session (`how`, see [`Account::started_by`]).
+/// account's session (`how`, see [`Account::started_by`]). It keeps the folder the account's sessions use as of
+/// creation ([`Account::socket_location`]): make the account an administrator first.
 pub struct LogOutOnDrop {
     exe: PathBuf,
     how: ServiceLogon,
     name: String,
     sid: Sid,
     sid_text: String,
-    profile: Option<PathBuf>,
+    location: Option<SocketLocation>,
 }
 
 impl LogOutOnDrop {
@@ -94,14 +94,14 @@ impl LogOutOnDrop {
             name: account.name.clone(),
             sid: Sid::lookup(&account.name).expect("look up the account's SID"),
             sid_text: account.sid_text.clone(),
-            profile: account.try_profile().map(Path::to_owned),
+            location: account.try_profile().map(|_| account.socket_location()),
         }
     }
 }
 
 impl Drop for LogOutOnDrop {
     fn drop(&mut self) {
-        let Some(profile) = &self.profile else {
+        let Some(location) = &self.location else {
             hive::record(&format!(
                 "session end [drop] {} ({}): the account has no profile, so no agent to end",
                 self.name, self.sid_text
@@ -114,7 +114,7 @@ impl Drop for LogOutOnDrop {
             &self.name,
             &self.sid,
             &self.sid_text,
-            profile,
+            location,
             self.how,
         ) {
             let failure = format!("the logout of {} failed: {why}", self.name);
@@ -134,11 +134,11 @@ fn end(
     name: &str,
     sid: &Sid,
     sid_text: &str,
-    profile: &Path,
+    location: &SocketLocation,
     how: ServiceLogon,
 ) -> Result<Option<Ended>, String> {
     let mut steps = Vec::new();
-    let outcome = attempt("end the session", || try_end(exe, name, sid, profile, how, &mut steps)).and_then(|r| r);
+    let outcome = attempt("end the session", || try_end(exe, name, sid, location, how, &mut steps)).and_then(|r| r);
     hive::record(&format!(
         "session end [{who}] {name} ({sid_text}), logged on by {how}: {}; hive now (not required to unload after a \
          {how} logon): {}; result: {}",
@@ -159,12 +159,13 @@ fn try_end(
     exe: &Path,
     name: &str,
     sid: &Sid,
-    profile: &Path,
+    location: &SocketLocation,
     how: ServiceLogon,
     steps: &mut Vec<String>,
 ) -> Result<Option<Ended>, String> {
-    let agents = procwait::user_agents(exe, sid, Integrity::Medium)
-        .map_err(|e| format!("look for the agents of {name}: {e:#}"))?;
+    let integrity = location.integrity();
+    let agents =
+        procwait::user_agents(exe, sid, integrity).map_err(|e| format!("look for the agents of {name}: {e:#}"))?;
     steps.push(format!(
         "agents running {}: {} (pids {:?})",
         exe.display(),
@@ -193,9 +194,8 @@ fn try_end(
         held.len()
     ));
 
-    let location = socket_loc::for_profile(profile, Integrity::Medium).map_err(|e| e.to_string())?;
     let finished = attempt("ask the agent to log out", || {
-        let mut asker = AgentConn::connect(&location, sid);
+        let mut asker = AgentConn::connect(location, sid);
         asker.start_exec(&format!("\"{}\" logout", exe.display()));
         asker.end_stdin();
         asker.read_to_end()
@@ -214,7 +214,7 @@ fn try_end(
     // A handle on a process keeps its token, and so the logon session, alive.
     drop(held);
     drop(agents);
-    let left = procwait::user_agents(exe, sid, Integrity::Medium)
+    let left = procwait::user_agents(exe, sid, integrity)
         .map_err(|e| format!("look again for the agents of {name}: {e:#}"))?;
     if !left.is_empty() {
         return Err(format!(

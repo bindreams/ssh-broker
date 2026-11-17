@@ -63,10 +63,11 @@ fn kit(tag: &str) -> Kit {
 /// for the console fails: they say how far the shim got.
 fn start_run(kit: &Kit, account: &Account) -> PtyRun {
     let profile = account.try_profile().map(std::path::Path::to_path_buf);
+    let integrity = account.integrity();
     PtyRun::start(kit, account, &kit.exe).with_context(move || {
         let logs = profile
             .as_deref()
-            .and_then(|profile| socket_loc::for_profile(profile, Integrity::Medium).ok())
+            .and_then(|profile| socket_loc::for_profile(profile, integrity).ok())
             .map(|location| stand_in::read_logs(&location))
             .unwrap_or_default();
         format!("logs of the account (shim.log, agent.log):\n{logs}")
@@ -77,7 +78,7 @@ fn start_run(kit: &Kit, account: &Account) -> PtyRun {
 fn logs_of(account: &Account) -> Vec<std::path::PathBuf> {
     account
         .try_profile()
-        .and_then(|profile| socket_loc::for_profile(profile, Integrity::Medium).ok())
+        .and_then(|profile| socket_loc::for_profile(profile, account.integrity()).ok())
         .map(|location| location.logs_dir())
         .into_iter()
         .collect()
@@ -169,7 +170,7 @@ fn leave(run: &mut PtyRun) {
 /// does to the agent is what a session's end does under sshd. Read from the shim's own log, so call it
 /// once the consoles have left.
 fn assert_shim_ran_in_sshds_job(account: &Account) {
-    let location = socket_loc::for_profile(account.profile(), Integrity::Medium).unwrap();
+    let location = account.socket_location();
     let logs = stand_in::read_logs(&location);
     assert!(
         logs.contains("logon call: caller's job Limits(10240)"),
@@ -713,7 +714,7 @@ fn two_simultaneous_first_connections_end_with_one_agent_and_no_hang() {
 
 /// The failure report of the two-consoles test: what happened, and what each console showed.
 fn report(why: &str, runs: &[PtyRun; 2], account: &Account) -> String {
-    let location = socket_loc::for_profile(account.profile(), Integrity::Medium).unwrap();
+    let location = account.socket_location();
     let lines = command_lines();
     let ours: Vec<&str> = lines.lines().filter(|line| line.contains("ssh-broker")).collect();
     format!(
@@ -890,7 +891,7 @@ fn password_never_appears_in_logs_or_command_lines() {
     log_in(&mut run, secret);
     say(&mut run, "session-up");
 
-    let location = socket_loc::for_profile(account.profile(), Integrity::Medium).unwrap();
+    let location = account.socket_location();
     let logs = stand_in::read_logs(&location);
     assert!(!logs.contains(secret), "a log holds the password:\n{logs}");
     let lines = command_lines();
@@ -910,7 +911,7 @@ fn second_agent_in_the_same_session_leaves_and_the_session_keeps_serving() {
 
     let second = RealAgent::start(&kit, &account);
     second.process.wait();
-    let location = socket_loc::for_profile(account.profile(), Integrity::Medium).unwrap();
+    let location = account.socket_location();
     let mut conn = AgentConn::connect(&location, &account.sid);
     conn.start_exec("cmd.exe /c echo still-serving");
     conn.end_stdin();
