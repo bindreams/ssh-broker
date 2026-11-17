@@ -77,9 +77,16 @@ fn a_child_on_pipes_with_the_unelevated_token_is_filtered_and_medium() {
         drain::drain(child.stdout_read_raw()),
         drain::drain(child.stderr_read_raw()),
     );
-    child.wait().expect("wait for the child");
+    let waited = child.wait();
     // Joined before anything can fail: the threads read handles that `child` closes.
     let said = format!("{}{}", drain::text_of(out), drain::text_of(err));
+    waited.unwrap_or_else(|e| {
+        panic!(
+            "wait for the child: {e}
+it said:
+{said}"
+        )
+    });
     assert_result(&dir, &said);
 }
 
@@ -91,9 +98,16 @@ fn a_child_in_a_pseudoconsole_with_the_unelevated_token_is_filtered_and_medium()
     let mut session =
         PtySession::spawn(&child_line(&dir), 120, 30, None, None, Some(&token)).expect("start the child in a pty");
     let output = drain::drain(session.out_read_raw());
-    session.wait().expect("wait for the child");
+    let waited = session.wait();
     session.close_pty(); // the output pipe ends once the pseudoconsole is closed
     let said = drain::text_of(output);
+    waited.unwrap_or_else(|e| {
+        panic!(
+            "wait for the child: {e}
+it said:
+{said}"
+        )
+    });
     assert_result(&dir, &said);
 }
 

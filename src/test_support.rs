@@ -22,6 +22,22 @@ pub use fs_state::{dacl_sddl, junction, tree_state};
 mod drain;
 pub use drain::{drain, text_of};
 
+// A copy of this process's token -----
+
+// One source with the integration tests that run a child at a chosen integrity level, which include it too.
+#[path = "../tests/common/token_copy.rs"]
+mod token_copy;
+
+/// A primary token with all access that is a copy of this process's.
+pub fn own_token_copy() -> crate::winutil::OwnedHandle {
+    crate::winutil::OwnedHandle(token_copy::own_token_copy())
+}
+
+/// [`own_token_copy`] with its integrity label set to `rid`, which is at or below the process's own.
+pub fn own_token_at(rid: u32) -> crate::winutil::OwnedHandle {
+    crate::winutil::OwnedHandle(token_copy::own_token_at(rid, crate::winutil::SE_GROUP_INTEGRITY))
+}
+
 // Reading a DACL by SID -----
 
 pub const FILE_ALL: u32 = 0x1f_01ff;

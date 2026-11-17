@@ -5,76 +5,23 @@
 use std::path::{Path, PathBuf};
 
 use ssh_broker::acl::Sid;
-use ssh_broker::winutil::OwnedHandle;
-use windows::Win32::Foundation::{HANDLE, HLOCAL, LocalFree};
-use windows::Win32::Security::Authorization::ConvertStringSidToSidW;
-use windows::Win32::Security::{
-    DuplicateTokenEx, GetLengthSid, PSID, SID_AND_ATTRIBUTES, SecurityImpersonation, SetTokenInformation,
-    TOKEN_ALL_ACCESS, TOKEN_DUPLICATE, TOKEN_MANDATORY_LABEL, TOKEN_QUERY, TokenIntegrityLevel, TokenPrimary,
-};
-use windows::Win32::System::Threading::{CREATE_NO_WINDOW, GetCurrentProcess, OpenProcessToken};
-use windows::core::PCWSTR;
+use ssh_broker::winutil::{OwnedHandle, SE_GROUP_INTEGRITY};
+use windows::Win32::System::Threading::CREATE_NO_WINDOW;
 
-use crate::account::{Starter, is_elevated, spawn_with_token, wide};
+use crate::account::{Starter, is_elevated, spawn_with_token};
 use crate::desktop::PrivateDesktop;
-
-/// `SE_GROUP_INTEGRITY`: the attribute of a token's integrity label. The `windows` crate has it, with
-/// the label RIDs, in `Win32::System::SystemServices`, a feature this crate does not enable.
-const SE_GROUP_INTEGRITY: u32 = 0x20;
+use crate::token_copy::own_token_at;
 
 /// This process's mandatory integrity level, as the relative id of its label SID.
 pub fn current_rid() -> u32 {
     ssh_broker::account::integrity_of(ssh_broker::winutil::own_token().unwrap().0).unwrap()
 }
 
-/// A primary token that is a copy of this process's, with its mandatory integrity label set to `rid`.
-fn token_at(rid: u32) -> OwnedHandle {
-    let mut own = HANDLE::default();
-    let mut primary = HANDLE::default();
-    let mut label_sid = PSID::default();
-    // SAFETY: valid in/out handles and pointers; every handle is closed by `OwnedHandle`, the SID
-    // allocation is freed below, and every buffer outlives the call that reads it.
-    unsafe {
-        OpenProcessToken(GetCurrentProcess(), TOKEN_DUPLICATE | TOKEN_QUERY, &mut own).expect("open the process token");
-        let own = OwnedHandle(own);
-        DuplicateTokenEx(
-            own.0,
-            TOKEN_ALL_ACCESS,
-            None,
-            SecurityImpersonation,
-            TokenPrimary,
-            &mut primary,
-        )
-        .expect("duplicate the token as a primary token");
-        let primary = OwnedHandle(primary);
-
-        ConvertStringSidToSidW(PCWSTR(wide(&format!("S-1-16-{rid}")).as_ptr()), &mut label_sid)
-            .expect("parse the label SID");
-        let label = TOKEN_MANDATORY_LABEL {
-            Label: SID_AND_ATTRIBUTES {
-                Sid: label_sid,
-                Attributes: SE_GROUP_INTEGRITY,
-            },
-        };
-        // The size is the structure and the SID it points at, as the API documents.
-        let sid_len = GetLengthSid(label_sid);
-        let set = SetTokenInformation(
-            primary.0,
-            TokenIntegrityLevel,
-            &label as *const _ as *const core::ffi::c_void,
-            std::mem::size_of::<TOKEN_MANDATORY_LABEL>() as u32 + sid_len,
-        );
-        let _ = LocalFree(Some(HLOCAL(label_sid.0)));
-        set.unwrap_or_else(|e| panic!("set the token's integrity level to {rid:#x}: {e}"));
-        primary
-    }
-}
-
 /// Run `exe` with `command_line` as this process's user at mandatory integrity level `rid`
 /// ([`INTEGRITY_LOW`], [`INTEGRITY_MEDIUM`] of `ssh_broker::account`) and return its exit code. The
-/// child's token is a copy of this process's with only its label set, so two levels differ in the
-/// integrity check and nothing else. It starts through [`spawn_with_token`]; a child that does not
-/// exit fails the test with `evidence` printed.
+/// child's token is a copy of this process's with only its label set ([`own_token_at`]), so two levels
+/// differ in the integrity check and nothing else. It starts through [`spawn_with_token`]; a child that
+/// does not exit fails the test with `evidence` printed.
 ///
 /// An elevated process gives the child a window station and desktop of its own, labelled at `rid`: a
 /// pair without a label is Medium, and a Low child cannot write to it. An unelevated process may not
@@ -87,7 +34,7 @@ pub fn run_at(rid: u32, exe: &Path, command_line: &str, cwd: &Path, evidence: &[
         PrivateDesktop::create_labelled(&[&user], Some(rid))
             .unwrap_or_else(|e| panic!("create a window station and desktop at integrity {rid:#x}: {e}"))
     });
-    let token = token_at(rid);
+    let token = OwnedHandle(own_token_at(rid, SE_GROUP_INTEGRITY));
     let child = spawn_with_token(
         Starter::AsUser,
         token.0,

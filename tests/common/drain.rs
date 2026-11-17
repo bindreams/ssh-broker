@@ -2,7 +2,8 @@
 //! holds blocks until someone reads, so a test that waits for the child before it reads waits forever; with
 //! the pipe drained from the start, the wait ends and the test can show what the child said. One source for
 //! both homes: the integration tests include it with `#[path]`, and so does the unit tests'
-//! `src/test_support.rs`. It needs only `std` and `windows`.
+//! `src/test_support.rs`. It needs only `std` and `windows`, so it reads with `ReadFile` itself: the library
+//! cannot name itself as `ssh_broker`, so one file cannot call `conpty::read_handle` from both homes.
 #![allow(dead_code)]
 
 use std::thread::JoinHandle;

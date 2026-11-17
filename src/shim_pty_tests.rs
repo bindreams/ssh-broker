@@ -89,8 +89,8 @@ fn stale_handle() -> windows::Win32::Foundation::HANDLE {
     windows::Win32::Foundation::HANDLE(0x7fff_fff0usize as *mut core::ffi::c_void)
 }
 
-/// A shim with no standard handles at all starts its shell. Before the inherit list the start took the child
-/// without them, and a broken broker must not cost the user their SSH access.
+/// A shim with no standard handles at all starts its shell: a broken broker must not cost the user their
+/// SSH access.
 #[test]
 fn a_shim_with_no_standard_handles_starts_its_shell() {
     let null = windows::Win32::Foundation::HANDLE::default();
@@ -98,8 +98,7 @@ fn a_shim_with_no_standard_handles_starts_its_shell() {
     assert_eq!(child.finish().unwrap(), 3);
 }
 
-/// One standard handle null and another stale: neither can go on the inherit list, and neither stops the
-/// shell, as neither did before the list.
+/// A null and a stale standard handle cannot go on the inherit list, and neither stops the shell.
 #[test]
 fn a_shim_with_a_missing_and_a_stale_standard_handle_still_starts_its_shell() {
     let null = windows::Win32::Foundation::HANDLE::default();
@@ -109,6 +108,59 @@ fn a_shim_with_a_missing_and_a_stale_standard_handle_still_starts_its_shell() {
     let child = start_with_std_handles("cmd.exe /c exit 5", [stale_handle(), null, stale_handle()], None)
         .expect("start with the stale handle twice");
     assert_eq!(child.finish().unwrap(), 5);
+}
+
+/// The realistic broken shape: stdout is a live pipe and stderr a stale value. The shell starts and what it
+/// writes to the live handle arrives. This is the one path where the inherit list is in use while a standard
+/// handle is absent.
+#[test]
+fn a_live_standard_handle_still_carries_the_output_when_another_is_stale() {
+    use crate::test_support::{drain, text_of};
+    use crate::winutil::OwnedHandle;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::System::Pipes::CreatePipe;
+
+    let (mut read, mut write) = (HANDLE::default(), HANDLE::default());
+    // SAFETY: valid out-pointers; both ends are closed by `OwnedHandle`.
+    unsafe { CreatePipe(&mut read, &mut write, None, 0) }.expect("create a pipe");
+    let (read, write) = (OwnedHandle(read), OwnedHandle(write));
+    let null = HANDLE::default();
+
+    let child = start_with_std_handles("cmd.exe /c echo live-stdout", [null, write.0, stale_handle()], None);
+    // The child holds its own copy of the write end; this one closes so the pipe ends with the child.
+    drop(write);
+    let output = drain(read.0.0 as isize);
+    let exit = child.map(|child| child.finish());
+    let said = text_of(output);
+    assert_eq!(
+        exit.expect("start with a live stdout and a stale stderr").unwrap(),
+        0,
+        "it said:
+{said}"
+    );
+    assert!(
+        said.contains("live-stdout"),
+        "it said:
+{said:?}"
+    );
+}
+
+/// A standard handle that is not on the inherit list is passed to the child as null, and the list has the
+/// others: every value the start is handed is valid and inheritable, or null.
+#[test]
+fn a_standard_handle_that_cannot_be_inherited_is_passed_as_null() {
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::System::Pipes::CreatePipe;
+
+    let (mut read, mut write) = (HANDLE::default(), HANDLE::default());
+    // SAFETY: valid out-pointers; both ends are closed by `OwnedHandle`.
+    unsafe { CreatePipe(&mut read, &mut write, None, 0) }.expect("create a pipe");
+    let (_read, write) = (crate::winutil::OwnedHandle(read), crate::winutil::OwnedHandle(write));
+    let null = HANDLE::default();
+
+    let (passed, inherit) = super::inheritable_std_handles([null, write.0, stale_handle()]);
+    assert_eq!(passed, [null, write.0, null]);
+    assert_eq!(inherit, vec![write.0]);
 }
 
 // Where the shim connects, and what it says when it cannot ------------------------------

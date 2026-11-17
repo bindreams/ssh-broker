@@ -17,8 +17,9 @@ use crate::acl::{Sid, WellKnown, set_token_default_dacl};
 
 /// A primary token for a session's program when the session is unelevated: this process's token with what
 /// UAC takes from an administrator's (`LUA_TOKEN`: `Administrators` becomes deny-only, and the privileges
-/// but the five a standard user has go), at Medium integrity, and with the default DACL UAC's filtered token
-/// has. Same logon session, so the profile, HKCU and DPAPI are the process's own.
+/// but the five a standard user has go), at Medium integrity or the process's own level when that is lower,
+/// and with the default DACL UAC's filtered token has. Same logon session, so the profile, HKCU and DPAPI
+/// are the process's own.
 ///
 /// The default DACL is not optional. The elevated token's names `Administrators`, which is now deny-only,
 /// so the objects the child's console is made with have no usable ACE for the user, and a child on pipes

@@ -54,6 +54,8 @@ mod hard_errors;
 mod integrity;
 #[path = "common/process_list.rs"]
 mod process_list;
+#[path = "common/token_copy.rs"]
+mod token_copy;
 
 use account::{Account, SharedDir, wide};
 

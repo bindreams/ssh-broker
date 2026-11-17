@@ -419,7 +419,7 @@ pub struct LocalChild {
 /// DefaultShell did.
 ///
 /// A standard handle this process does not have, or cannot make inheritable, is not inherited and does not
-/// stop the start: the child gets the value (null where there is none) and the shell runs. A broken broker
+/// stop the start: the child gets null in its place, the reason is logged, and the shell runs. A broken broker
 /// must not cost the user their SSH access.
 ///
 /// It returns when the shell is running, and [`LocalChild::finish`] waits for it: a failure of the
@@ -439,16 +439,8 @@ fn start_with_std_handles(
     std_handles: [HANDLE; 3],
     as_user: Option<&UnelevatedToken>,
 ) -> Result<LocalChild, StartError> {
-    use windows::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
-    // A handle on the inherit list has to be inheritable: the list has the standard handles that are, or
-    // can be made so.
-    let inheritable: Vec<HANDLE> = std_handles
-        .into_iter()
-        // SAFETY: no pointers; a handle that is not one fails the call.
-        .filter(|&h| unsafe { SetHandleInformation(h, HANDLE_FLAG_INHERIT.0, HANDLE_FLAG_INHERIT) }.is_ok())
-        .collect();
-    // SAFETY: the handles on the list are inheritable ones of this process; the standard handles are the
-    // values this process has (or null), which the call passes to the child without reading.
+    let (std_handles, inheritable) = inheritable_std_handles(std_handles);
+    // SAFETY: every handle in `std_handles` and `inheritable` is an inheritable one of this process or null.
     let (process, thread) = unsafe {
         spawn_suspended(
             crate::shim::spawn_line(command_line),
@@ -462,6 +454,35 @@ fn start_with_std_handles(
     // SAFETY: the live handles from the successful start above.
     let job = unsafe { contain_and_resume(process.0, thread.0, "shim fail-open") }?;
     Ok(LocalChild { process, _job: job })
+}
+
+/// The standard handles the child gets and the handles it inherits, from the standard handles of this
+/// process (input, output, error). One that is null or invalid, or cannot be made inheritable, is not
+/// inherited, and the child gets null in its place: a value off the inherit list would name nothing in the
+/// child, and later whatever the child opens under that number. Each is logged with the reason.
+fn inheritable_std_handles(std_handles: [HANDLE; 3]) -> ([HANDLE; 3], Vec<HANDLE>) {
+    use windows::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
+    let mut passed = [HANDLE::default(); 3];
+    let mut inheritable = Vec::with_capacity(3);
+    for ((name, handle), slot) in ["input", "output", "error"]
+        .into_iter()
+        .zip(std_handles)
+        .zip(&mut passed)
+    {
+        if handle.is_invalid() {
+            tracing::warn!("this process has no standard {name} handle, so the shell gets none");
+            continue;
+        }
+        // SAFETY: no pointers; a handle that is not one fails the call.
+        match unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT.0, HANDLE_FLAG_INHERIT) } {
+            Ok(()) => {
+                *slot = handle;
+                inheritable.push(handle);
+            }
+            Err(e) => tracing::warn!("the standard {name} handle cannot be inherited ({e}), so the shell gets none"),
+        }
+    }
+    (passed, inheritable)
 }
 
 impl LocalChild {

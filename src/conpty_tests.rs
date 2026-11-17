@@ -1,22 +1,7 @@
 //! Unit tests for the `conpty` module. Windows-only (the module is `#[cfg(windows)]`);
 //! they run on a real Windows host via the cross-compile -> scp -> run loop.
 use super::*;
-
-/// Drain a raw output handle to EOF on a thread (EOF arrives after `close_pty`).
-fn drain(out_raw: isize) -> std::thread::JoinHandle<Vec<u8>> {
-    std::thread::spawn(move || {
-        let mut out = Vec::new();
-        let mut buf = [0u8; 4096];
-        loop {
-            let n = read_handle(out_raw, &mut buf);
-            if n == 0 {
-                break;
-            }
-            out.extend_from_slice(&buf[..n]);
-        }
-        out
-    })
-}
+use crate::test_support::drain;
 
 #[test]
 fn conpty_runs_child_and_captures_output() {

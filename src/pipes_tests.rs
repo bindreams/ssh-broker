@@ -1,24 +1,6 @@
 //! Windows-only tests for the EXEC child (run on a real Windows host).
 use super::*;
-use crate::conpty::read_handle;
-use std::thread;
-
-/// Drain a raw read handle to EOF on a thread (concurrent draining avoids a full-pipe
-/// deadlock when the child writes a lot to one stream).
-fn drain(raw: isize) -> thread::JoinHandle<Vec<u8>> {
-    thread::spawn(move || {
-        let mut out = Vec::new();
-        let mut buf = [0u8; 4096];
-        loop {
-            let n = read_handle(raw, &mut buf);
-            if n == 0 {
-                break;
-            }
-            out.extend_from_slice(&buf[..n]);
-        }
-        out
-    })
-}
+use crate::test_support::drain;
 
 #[test]
 fn exec_separates_stdout_stderr_and_returns_code() {

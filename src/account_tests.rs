@@ -3,13 +3,11 @@ use super::*;
 use windows::Win32::Foundation::{HLOCAL, LocalFree};
 use windows::Win32::Security::Authorization::ConvertStringSidToSidW;
 use windows::Win32::Security::{
-    CREATE_RESTRICTED_TOKEN_FLAGS, CheckTokenMembership, CreateRestrictedToken, DuplicateTokenEx, GetLengthSid,
-    SID_AND_ATTRIBUTES, SecurityImpersonation, SetTokenInformation, TOKEN_ALL_ACCESS, TOKEN_DUPLICATE, TOKEN_QUERY,
-    TokenPrimary,
+    CREATE_RESTRICTED_TOKEN_FLAGS, CheckTokenMembership, CreateRestrictedToken, SID_AND_ATTRIBUTES,
 };
-use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 use windows::core::PCWSTR;
 
+use crate::test_support::{own_token_at, own_token_copy};
 use crate::winutil::OwnedHandle;
 
 const ADMINISTRATORS: &str = "S-1-5-32-544";
@@ -162,14 +160,6 @@ impl Drop for TextSid {
     }
 }
 
-/// A token with `TOKEN_DUPLICATE | TOKEN_QUERY` on this process's, to make a copy of.
-fn own_token_to_copy() -> OwnedHandle {
-    let mut token = HANDLE::default();
-    // SAFETY: a valid out-pointer; the handle is closed by `OwnedHandle`.
-    unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_DUPLICATE | TOKEN_QUERY, &mut token) }.unwrap();
-    OwnedHandle(token)
-}
-
 /// The elevation of a token that is a copy of this process's with at most its label lowered, from
 /// whether this process's token lists `Administrators` at all (whoami's SID column, independent of
 /// the library): an account that does not is `Standard`, one that does is cut down to `Filtered`.
@@ -186,7 +176,7 @@ fn elevation_of_a_cut_down_copy() -> (AdministratorsSid, Elevation) {
 /// on a standard account's host the group is not there, stays absent, and the level is `Standard`.
 #[test]
 fn a_copy_with_administrators_disabled_reads_as_deny_only_or_stays_absent() {
-    let own = own_token_to_copy();
+    let own = own_token_copy();
     let administrators = TextSid::new(ADMINISTRATORS);
     let disable = [SID_AND_ATTRIBUTES {
         Sid: administrators.0,
@@ -210,39 +200,7 @@ fn a_copy_with_administrators_disabled_reads_as_deny_only_or_stays_absent() {
 /// fails there.
 #[test]
 fn a_copy_at_medium_integrity_reads_medium_and_is_never_full() {
-    let own = own_token_to_copy();
-    let mut copy = HANDLE::default();
-    // SAFETY: `own` is a valid token and `copy` a valid out-pointer.
-    unsafe {
-        DuplicateTokenEx(
-            own.0,
-            TOKEN_ALL_ACCESS,
-            None,
-            SecurityImpersonation,
-            TokenPrimary,
-            &mut copy,
-        )
-    }
-    .unwrap();
-    let copy = OwnedHandle(copy);
-    let medium = TextSid::new(&format!("S-1-16-{INTEGRITY_MEDIUM}"));
-    let label = TOKEN_MANDATORY_LABEL {
-        Label: SID_AND_ATTRIBUTES {
-            Sid: medium.0,
-            Attributes: 0x20, // SE_GROUP_INTEGRITY
-        },
-    };
-    // SAFETY: the size is the structure and the SID it points to, as the API documents; both outlive the call.
-    unsafe {
-        SetTokenInformation(
-            copy.0,
-            TokenIntegrityLevel,
-            (&raw const label).cast(),
-            size_of::<TOKEN_MANDATORY_LABEL>() as u32 + GetLengthSid(medium.0),
-        )
-    }
-    .unwrap();
-
+    let copy = own_token_at(INTEGRITY_MEDIUM);
     assert_eq!(integrity_of(copy.0).unwrap(), INTEGRITY_MEDIUM);
     let (_, level) = elevation_of_a_cut_down_copy();
     assert_eq!(elevation_of(copy.0).unwrap(), level);

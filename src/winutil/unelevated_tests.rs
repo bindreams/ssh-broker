@@ -4,12 +4,11 @@
 //! `tests/unelevated_token_windows.rs`.
 use super::*;
 use crate::account::{Elevation, INTEGRITY_LOW, INTEGRITY_MEDIUM, elevation, elevation_of, integrity_of};
-use crate::test_support::{drain, text_of};
+use crate::test_support::{drain, own_token_copy, text_of};
 use crate::winutil::{ChildConsole, spawn_suspended, token_information};
 use windows::Win32::Security::{
-    ACCESS_ALLOWED_ACE, ACL, ACL_SIZE_INFORMATION, AclSizeInformation, DuplicateTokenEx, GetAce, GetAclInformation,
-    SecurityImpersonation, TOKEN_ADJUST_DEFAULT, TOKEN_DEFAULT_DACL, TOKEN_DUPLICATE, TOKEN_QUERY, TokenDefaultDacl,
-    TokenPrimary,
+    ACCESS_ALLOWED_ACE, ACL, ACL_SIZE_INFORMATION, AclSizeInformation, GetAce, GetAclInformation, TOKEN_DEFAULT_DACL,
+    TOKEN_QUERY, TokenDefaultDacl,
 };
 use windows::Win32::System::Threading::{OpenProcessToken, TerminateProcess};
 
@@ -64,28 +63,6 @@ fn a_child_started_with_the_token_is_at_medium_integrity_and_not_elevated() {
         own
     };
     assert_eq!(got, expected);
-}
-
-/// A copy of this process's token that can be queried and have its label changed, closed on drop.
-fn own_token_copy() -> OwnedHandle {
-    let mut own = HANDLE::default();
-    // SAFETY: a valid out-pointer; the handle is closed by `OwnedHandle`.
-    unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_DUPLICATE, &mut own) }.expect("open the process token");
-    let own = OwnedHandle(own);
-    let mut copy = HANDLE::default();
-    // SAFETY: valid handles; the copy is closed by `OwnedHandle`.
-    unsafe {
-        DuplicateTokenEx(
-            own.0,
-            TOKEN_QUERY | TOKEN_ADJUST_DEFAULT,
-            None,
-            SecurityImpersonation,
-            TokenPrimary,
-            &mut copy,
-        )
-    }
-    .expect("copy the process token");
-    OwnedHandle(copy)
 }
 
 /// A token below Medium stays where it is: setting Medium on it would raise it, which fails without a
@@ -154,15 +131,25 @@ fn a_command_on_pipes_and_one_in_a_pseudoconsole_run_with_the_token() {
     let token = UnelevatedToken::of_this_process().expect("make the token");
     let on_pipes = crate::pipes::ExecChild::spawn("cmd.exe /c exit 5", None, Some(&token)).expect("start on pipes");
     let (out, err) = (drain(on_pipes.stdout_read_raw()), drain(on_pipes.stderr_read_raw()));
-    let code = on_pipes.wait().unwrap();
+    let code = on_pipes.wait();
     // Joined before anything can fail: the threads read handles that `on_pipes` closes.
     let said = format!("{}{}", text_of(out), text_of(err));
-    assert_eq!(code, 5, "on pipes, the child said:\n{said}");
+    assert_eq!(
+        code.unwrap(),
+        5,
+        "on pipes, the child said:
+{said}"
+    );
     let mut in_pty = crate::conpty::PtySession::spawn("cmd.exe /c exit 6", 80, 24, None, None, Some(&token))
         .expect("start in a pseudoconsole");
     let output = drain(in_pty.out_read_raw());
-    let code = in_pty.wait().unwrap();
+    let code = in_pty.wait();
     in_pty.close_pty(); // the output pipe ends once the pseudoconsole is closed
     let said = text_of(output);
-    assert_eq!(code, 6, "in a pseudoconsole, the child said:\n{said}");
+    assert_eq!(
+        code.unwrap(),
+        6,
+        "in a pseudoconsole, the child said:
+{said}"
+    );
 }
