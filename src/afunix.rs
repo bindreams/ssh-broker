@@ -8,6 +8,8 @@ use socket2::{Domain, SockAddr, Socket, Type};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
+use crate::socket_loc::Integrity;
+
 /// Build a `SockAddr` for an AF_UNIX pathname socket, surfacing an over-long path
 /// (`sockaddr_un` overflow) as a clear error instead of a cryptic OS failure.
 pub fn unix_addr(path: &Path) -> anyhow::Result<SockAddr> {
@@ -31,19 +33,25 @@ pub struct AlreadyListening(pub PathBuf);
 /// socket directory's DACL verifies as locked down (it decides who can create or replace the
 /// socket), and it removes the socket again unless the socket **file's** own DACL verifies (it
 /// decides who can connect: Windows AF_UNIX has no `SO_PEERCRED`, and traverse checks on the
-/// folders above are bypassed by `SeChangeNotifyPrivilege`).
+/// folders above are bypassed by `SeChangeNotifyPrivilege`). Both must also carry the High mandatory
+/// label when the socket is bound for `Integrity::High` (the elevated agent's folder): the label is what
+/// keeps a process of the account below High from connecting.
 pub struct Listener {
     sock: Socket,
 }
 
 impl Listener {
-    pub fn bind(path: &Path) -> anyhow::Result<Self> {
-        Self::bind_with(path, &socket_file_acl_ok)
+    pub fn bind(path: &Path, integrity: Integrity) -> anyhow::Result<Self> {
+        Self::bind_with(path, integrity, &socket_file_acl_ok)
     }
 
     /// [`Self::bind`] with the check of the bound socket file as a parameter, so a test can make
     /// it refuse. Production passes the real one.
-    fn bind_with(path: &Path, socket_file_ok: &dyn Fn(&Path) -> anyhow::Result<bool>) -> anyhow::Result<Self> {
+    fn bind_with(
+        path: &Path,
+        integrity: Integrity,
+        socket_file_ok: &dyn Fn(&Path, Integrity) -> anyhow::Result<bool>,
+    ) -> anyhow::Result<Self> {
         // Fail-closed: never bind in a directory that isn't locked down. The grantee is
         // `current_user` because the AGENT (which calls bind) runs as the user whose profile
         // holds the directory. If bind ever ran under a different identity, a directory
@@ -55,7 +63,7 @@ impl Listener {
                 .ok_or_else(|| anyhow::anyhow!("socket path has no parent directory"))?;
             let me = crate::acl::Sid::current_user()?;
             anyhow::ensure!(
-                crate::acl::verify_dir_acl(dir, &me)?,
+                crate::acl::verify_dir_acl(dir, &me, integrity)?,
                 "socket directory {} is not locked down; refusing to bind (fail-closed)",
                 dir.display()
             );
@@ -89,15 +97,19 @@ impl Listener {
         sock.bind(&unix_addr(path)?)?;
         // The file exists now but nothing listens, so nobody can queue a connection: prove who
         // may connect before anyone can. A socket whose ACL cannot be proven is not left behind.
-        let proven = socket_file_ok(path);
+        let proven = socket_file_ok(path, integrity);
         if !matches!(proven, Ok(true)) {
             drop(sock);
             let _ = std::fs::remove_file(path);
             return match proven {
                 Ok(_) => Err(anyhow::anyhow!(
-                    "the socket file {} does not grant exactly the user, SYSTEM and Administrators; \
+                    "the socket file {} does not grant exactly the user, SYSTEM and Administrators{}; \
                      refusing to listen (fail-closed)",
-                    path.display()
+                    path.display(),
+                    match integrity {
+                        Integrity::Medium => "",
+                        Integrity::High => " or does not carry the High label of the elevated folder",
+                    }
                 )),
                 Err(e) => Err(e.context(format!("check the socket file {}", path.display()))),
             };
@@ -246,15 +258,16 @@ fn is_inheritable(sock: &Socket) -> anyhow::Result<bool> {
     Ok(flags & HANDLE_FLAG_INHERIT.0 != 0)
 }
 
-/// Does the socket file at `path` grant exactly the current user, SYSTEM and Administrators?
+/// Does the socket file at `path` grant exactly the current user, SYSTEM and Administrators, and for
+/// `Integrity::High` carry the High label?
 #[cfg(windows)]
-fn socket_file_acl_ok(path: &Path) -> anyhow::Result<bool> {
-    crate::acl::verify_file_acl(path, &crate::acl::Sid::current_user()?)
+fn socket_file_acl_ok(path: &Path, integrity: Integrity) -> anyhow::Result<bool> {
+    crate::acl::verify_file_acl(path, &crate::acl::Sid::current_user()?, integrity)
 }
 
 /// Off Windows there is no ACL to check; the directory's mode is the platform's concern.
 #[cfg(not(windows))]
-fn socket_file_acl_ok(_path: &Path) -> anyhow::Result<bool> {
+fn socket_file_acl_ok(_path: &Path, _integrity: Integrity) -> anyhow::Result<bool> {
     Ok(true)
 }
 

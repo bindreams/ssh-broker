@@ -22,6 +22,7 @@ use std::time::Duration;
 use ssh_broker::acl::Sid;
 use ssh_broker::provision::procwait;
 use ssh_broker::socket_loc;
+use ssh_broker::socket_loc::Integrity;
 use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
 use windows::Win32::System::Threading::WaitForSingleObject;
 
@@ -162,7 +163,8 @@ fn try_end(
     how: ServiceLogon,
     steps: &mut Vec<String>,
 ) -> Result<Option<Ended>, String> {
-    let agents = procwait::user_agents(exe, sid).map_err(|e| format!("look for the agents of {name}: {e:#}"))?;
+    let agents = procwait::user_agents(exe, sid, Integrity::Medium)
+        .map_err(|e| format!("look for the agents of {name}: {e:#}"))?;
     steps.push(format!(
         "agents running {}: {} (pids {:?})",
         exe.display(),
@@ -191,7 +193,7 @@ fn try_end(
         held.len()
     ));
 
-    let location = socket_loc::for_profile(profile).map_err(|e| e.to_string())?;
+    let location = socket_loc::for_profile(profile, Integrity::Medium).map_err(|e| e.to_string())?;
     let finished = attempt("ask the agent to log out", || {
         let mut asker = AgentConn::connect(&location, sid);
         asker.start_exec(&format!("\"{}\" logout", exe.display()));
@@ -212,7 +214,8 @@ fn try_end(
     // A handle on a process keeps its token, and so the logon session, alive.
     drop(held);
     drop(agents);
-    let left = procwait::user_agents(exe, sid).map_err(|e| format!("look again for the agents of {name}: {e:#}"))?;
+    let left = procwait::user_agents(exe, sid, Integrity::Medium)
+        .map_err(|e| format!("look again for the agents of {name}: {e:#}"))?;
     if !left.is_empty() {
         return Err(format!(
             "{} agent(s) of {name} running {} after logout (pids {:?})",

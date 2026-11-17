@@ -30,6 +30,7 @@ use windows::Win32::System::Threading::{
 use windows::core::{HRESULT, PWSTR};
 
 use crate::acl::Sid;
+use crate::socket_loc::Integrity;
 use crate::winutil::{FileId, OwnedHandle};
 
 /// How long a stopped agent may take to exit before the stop is reported as failed. The exit is
@@ -493,15 +494,18 @@ fn runs_image(
 
 /// Every agent (desktop or background) of `user` that is running `image` right now, other than this
 /// process, each held by a handle: the agents that exist, whether or not they serve yet. A process
-/// that has ended, or is ending, is not one. Only processes whose snapshot name is the file name of
+/// that has ended, or is ending, is not one. Only the agents that serve the folder of `integrity` are:
+/// the ones whose token's integrity level puts them at it (High or above for `High`, below for
+/// `Medium`, as `account::integrity_class` says), because an agent at the other level serves a folder
+/// that the caller does not look in and so will never serve the caller. Only processes whose snapshot name is the file name of
 /// `image` are looked at (the installed exe is `ssh-broker.exe`; a copy run under another name is found
 /// by that name); the file's identity decides the rest.
 ///
 /// A process that cannot be opened, or whose token cannot be read, is refused to this user, and a
 /// process of the user is not (it is made with a default access list that names the user): it is
-/// none of this user's and is skipped. A process of `user` whose image cannot be identified or whose
+/// none of this user's and is skipped, whichever level is asked for. A process of `user` whose image cannot be identified or whose
 /// command line cannot be read, and which is not ending, is an error naming it: it might be the agent.
-pub fn user_agents(image: &Path, user: &Sid) -> anyhow::Result<Vec<Process>> {
+pub fn user_agents(image: &Path, user: &Sid, integrity: Integrity) -> anyhow::Result<Vec<Process>> {
     let wanted_user = user.to_sddl()?;
     let wanted = match file_id(image) {
         Ok(id) => id,
@@ -517,6 +521,7 @@ pub fn user_agents(image: &Path, user: &Sid) -> anyhow::Result<Vec<Process>> {
         std::process::id(),
         name,
         &wanted_user,
+        integrity,
         &wanted,
         &|pid| match open_for_waiting(pid) {
             Ok(opened) => Ok(opened.map(|handle| Process { pid, handle })),
@@ -530,6 +535,8 @@ pub fn user_agents(image: &Path, user: &Sid) -> anyhow::Result<Vec<Process>> {
 trait Inspect {
     /// The SID of the process's owner, in SDDL form.
     fn owner(&self) -> anyhow::Result<String>;
+    /// The folder level the integrity level of the process's token puts it at.
+    fn integrity(&self) -> anyhow::Result<Integrity>;
     /// Whether the process runs the file `wanted`.
     fn runs_image(&self, wanted: &FileId) -> anyhow::Result<bool>;
     fn has_exited(&self) -> bool;
@@ -543,6 +550,13 @@ impl Inspect for Process {
         Sid::of_process(self.handle.0)
             .and_then(|owner| owner.to_sddl())
             .with_context(|| format!("read the owner of process {}", self.pid))
+    }
+
+    fn integrity(&self) -> anyhow::Result<Integrity> {
+        crate::winutil::process_token(self.handle.0)
+            .and_then(|token| crate::account::integrity_of(token.0))
+            .map(crate::account::integrity_class)
+            .with_context(|| format!("read the integrity level of process {}", self.pid))
     }
 
     fn runs_image(&self, wanted: &FileId) -> anyhow::Result<bool> {
@@ -569,6 +583,7 @@ fn scan_user_agents<P: Inspect>(
     own: u32,
     name: &str,
     user: &str,
+    integrity: Integrity,
     image: &FileId,
     open: &dyn Fn(u32) -> anyhow::Result<Option<P>>,
 ) -> anyhow::Result<Vec<P>> {
@@ -580,22 +595,29 @@ fn scan_user_agents<P: Inspect>(
         let Some(process) = open(*pid)? else {
             continue;
         };
-        if is_agent_of(&process, user, image)? {
+        if is_agent_of(&process, user, integrity, image)? {
             agents.push(process);
         }
     }
     Ok(agents)
 }
 
-/// Whether `process` is an agent of the user `user` running `image`. A process that has exited or is
-/// ending, or exits or begins to end while it is read, is none; any other failure to read it is the error.
-fn is_agent_of(process: &impl Inspect, user: &str, image: &FileId) -> anyhow::Result<bool> {
+/// Whether `process` is an agent of the user `user` at the folder level `integrity` running `image`. A
+/// process that has exited or is ending, or exits or begins to end while it is read, is none; any other
+/// failure to read it is the error, except that a token this process may not read is none of the user's.
+fn is_agent_of(process: &impl Inspect, user: &str, integrity: Integrity, image: &FileId) -> anyhow::Result<bool> {
     if process.has_exited() || process.is_ending() {
         return Ok(false);
     }
     let verdict = (|| {
         match process.owner() {
             Ok(owner) if owner == user => {}
+            Ok(_) => return Ok(false),
+            Err(e) if is_denied(&e) => return Ok(false),
+            Err(e) => return Err(e),
+        }
+        match process.integrity() {
+            Ok(level) if level == integrity => {}
             Ok(_) => return Ok(false),
             Err(e) if is_denied(&e) => return Ok(false),
             Err(e) => return Err(e),

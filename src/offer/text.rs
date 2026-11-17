@@ -57,6 +57,11 @@ pub fn elevation_unreadable(cause: &str) -> String {
     )
 }
 
+/// What an administrator's unelevated process (`account::Elevation::Filtered`) is told when it asks for the
+/// agent that serves its folder and finds none: the account's agent runs elevated and serves the elevated
+/// folder, so the plain one it looks in has nothing. A clause, for `verify`'s row and `logout`'s line.
+pub const FILTERED_LOOKS_ELSEWHERE: &str = "this account is an administrator and its agent serves elevated processes: run this from an elevated prompt or an ordinary SSH login";
+
 /// The sentence for a background agent that ended before it served. 64 to 69 are the agent's own
 /// refusals (see `agent_background::Refusal`); it has no console, so its exit code is all it can say.
 /// `logs` is the folder of its log, if it could be found: without it the sentence has no pointer.

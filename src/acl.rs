@@ -14,6 +14,12 @@
 //! default DACL. [`verify_dir_acl`] and [`verify_file_acl`] read the DACLs back and refuse
 //! anything but an exact match (fail-closed).
 //!
+//! An elevated agent keeps its socket in a folder of its own that is born with the High mandatory
+//! label (no write up, inherited by what is made inside), given in the creation descriptor and never
+//! put on a folder that exists. The label is what keeps a process of the account below High from
+//! connecting, creating, renaming or deleting there. The same two checks take the [`Integrity`] of the
+//! folder's processes and for `High` require exactly that label; for `Medium` they ask for none.
+//!
 //! The user is the account the agent runs as: the agent lives in that user's profile, so its own
 //! token is the grantee.
 //!
@@ -45,10 +51,11 @@ use windows::Win32::Security::Authorization::{
 use windows::Win32::Security::{
     ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, ACL_SIZE_INFORMATION, AclSizeInformation, CONTAINER_INHERIT_ACE, CopySid,
     CreateWellKnownSid, DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetAclInformation, GetLengthSid,
-    GetSecurityDescriptorControl, GetSecurityDescriptorDacl, INHERITED_ACE, IsValidSid, LookupAccountNameW,
-    LookupAccountSidW, OBJECT_INHERIT_ACE, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SE_DACL_PRESENT,
-    SE_DACL_PROTECTED, SECURITY_ATTRIBUTES, SID_NAME_USE, SetTokenInformation, TOKEN_DEFAULT_DACL, TOKEN_QUERY,
-    TOKEN_USER, TokenDefaultDacl, TokenUser, WinBuiltinAdministratorsSid, WinBuiltinUsersSid, WinLocalSystemSid,
+    GetSecurityDescriptorControl, GetSecurityDescriptorDacl, INHERITED_ACE, IsValidSid, LABEL_SECURITY_INFORMATION,
+    LookupAccountNameW, LookupAccountSidW, OBJECT_INHERIT_ACE, OBJECT_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
+    PSECURITY_DESCRIPTOR, PSID, SE_DACL_PRESENT, SE_DACL_PROTECTED, SECURITY_ATTRIBUTES, SID_NAME_USE,
+    SYSTEM_MANDATORY_LABEL_ACE, SetTokenInformation, TOKEN_DEFAULT_DACL, TOKEN_USER, TokenDefaultDacl, TokenUser,
+    WinBuiltinAdministratorsSid, WinBuiltinUsersSid, WinHighLabelSid, WinLocalSystemSid,
 };
 use windows::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, CreateDirectoryW, FILE_ACCESS_RIGHTS, FILE_ALL_ACCESS, FILE_ATTRIBUTE_DIRECTORY,
@@ -57,10 +64,10 @@ use windows::Win32::Storage::FileSystem::{
     GetFileInformationByHandle, READ_CONTROL,
 };
 use windows::Win32::System::IO::IO_STATUS_BLOCK;
-use windows::Win32::System::Threading::OpenProcessToken;
 use windows::Win32::System::WindowsProgramming::FILE_CREATED;
 use windows::core::{BOOL, HRESULT, PCWSTR, PWSTR};
 
+use crate::socket_loc::Integrity;
 use crate::winutil::OwnedHandle;
 
 mod admin_file;
@@ -74,12 +81,20 @@ pub use private_dir::{
 /// ACCESS_ALLOWED_ACE_TYPE (winnt.h) — stored raw in `ACE_HEADER.AceType` (a `u8`).
 const ACE_TYPE_ALLOWED: u8 = 0;
 
+/// SYSTEM_MANDATORY_LABEL_ACE_TYPE (winnt.h): the type of the one ACE of an object's label.
+const ACE_TYPE_LABEL: u8 = 0x11;
+
+/// SYSTEM_MANDATORY_LABEL_NO_WRITE_UP (winnt.h): a process below the label's level cannot write.
+const LABEL_NO_WRITE_UP: u32 = 1;
+
 /// Well-known SIDs in the allow-set besides the target user.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WellKnown {
     System,
     Administrators,
     Users,
+    /// The High mandatory integrity level, as the SID of a label (`S-1-16-12288`).
+    HighLabel,
 }
 
 /// An owned Windows security identifier (a copy of the raw SID bytes, so it outlives any
@@ -114,11 +129,7 @@ impl Sid {
 
     /// SID of the user owning the token of `process`, which needs `PROCESS_QUERY_LIMITED_INFORMATION`.
     pub fn of_process(process: HANDLE) -> anyhow::Result<Sid> {
-        let mut token = HANDLE::default();
-        // SAFETY: a valid out-pointer; the handle is closed by `OwnedHandle`.
-        unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut token)? };
-        let token = OwnedHandle(token);
-        Sid::of_token(token.0)
+        Sid::of_token(crate::winutil::process_token(process)?.0)
     }
 
     /// SID of the user `token` belongs to, which needs `TOKEN_QUERY`.
@@ -148,6 +159,7 @@ impl Sid {
             WellKnown::System => WinLocalSystemSid,
             WellKnown::Administrators => WinBuiltinAdministratorsSid,
             WellKnown::Users => WinBuiltinUsersSid,
+            WellKnown::HighLabel => WinHighLabelSid,
         };
         unsafe {
             let mut cb = 0u32;
@@ -307,6 +319,20 @@ fn private_dir_dacl_sddl(user: &Sid) -> anyhow::Result<String> {
     Ok(format!("D:P(A;OICI;FA;;;{user})(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)"))
 }
 
+/// The label of a folder for `Integrity::High`: High, no write up, inherited by the files and folders made
+/// inside. Given in the descriptor a folder is created with and never set on one that exists.
+const HIGH_LABEL_SDDL: &str = "S:(ML;OICI;NW;;;HI)";
+
+/// The descriptor a private folder is created with for processes at `integrity`: [`private_dir_dacl_sddl`],
+/// and for `High` the label too.
+fn private_dir_sddl(user: &Sid, integrity: Integrity) -> anyhow::Result<String> {
+    let dacl = private_dir_dacl_sddl(user)?;
+    Ok(match integrity {
+        Integrity::Medium => dacl,
+        Integrity::High => format!("{dacl}{HIGH_LABEL_SDDL}"),
+    })
+}
+
 /// Apply the explicit, PROTECTED owner-only DACL (`{target_user, SYSTEM, Administrators}`
 /// Full Control, target_user as owner) to `dir`, removing any inherited or broader access. The
 /// ACEs are inheritable (`OI|CI`) so everything created inside is born with the same set.
@@ -368,55 +394,111 @@ enum Inheritance {
     Inherited,
 }
 
-/// A security descriptor read back from an object: the DACL and owner point into `sd`.
+/// A security descriptor read back from an object: the DACL, the label and the owner point into `sd`.
 struct Security {
     sd: LocalSd,
     dacl: *mut ACL,
+    /// The label's ACL (the SACL as far as `READ_CONTROL` shows it), read only when the check is for
+    /// `Integrity::High`; null when it was not read or the object has none.
+    label: *mut ACL,
     owner: PSID,
 }
 
+/// What to read of an object that is checked for processes at `integrity`: the DACL and the owner, and
+/// for `High` the label. The label is read with `READ_CONTROL`, which every open here asks for.
+fn information_for(integrity: Integrity) -> OBJECT_SECURITY_INFORMATION {
+    let always = DACL_SECURITY_INFORMATION | OWNER_SECURITY_INFORMATION;
+    match integrity {
+        Integrity::Medium => always,
+        Integrity::High => always | LABEL_SECURITY_INFORMATION,
+    }
+}
+
 impl Security {
-    fn from_path(path: &Path) -> anyhow::Result<Security> {
+    fn from_path(path: &Path, integrity: Integrity) -> anyhow::Result<Security> {
         let path_w = wide(path);
         unsafe {
             let mut psd = PSECURITY_DESCRIPTOR::default();
             let mut dacl: *mut ACL = std::ptr::null_mut();
+            let mut label: *mut ACL = std::ptr::null_mut();
             let mut owner = PSID::default();
             let rc = GetNamedSecurityInfoW(
                 PCWSTR(path_w.as_ptr()),
                 SE_FILE_OBJECT,
-                DACL_SECURITY_INFORMATION | OWNER_SECURITY_INFORMATION,
+                information_for(integrity),
                 Some(&mut owner),
                 None,
                 Some(&mut dacl),
-                None,
+                Some(&mut label),
                 &mut psd,
             );
             let sd = LocalSd(psd);
             rc.ok()?;
-            Ok(Security { sd, dacl, owner })
+            Ok(Security { sd, dacl, label, owner })
         }
     }
 
     /// Read from an open handle.
-    fn from_handle(handle: HANDLE) -> anyhow::Result<Security> {
+    fn from_handle(handle: HANDLE, integrity: Integrity) -> anyhow::Result<Security> {
         unsafe {
             let mut psd = PSECURITY_DESCRIPTOR::default();
             let mut dacl: *mut ACL = std::ptr::null_mut();
+            let mut label: *mut ACL = std::ptr::null_mut();
             let mut owner = PSID::default();
             let rc = GetSecurityInfo(
                 handle,
                 SE_FILE_OBJECT,
-                DACL_SECURITY_INFORMATION | OWNER_SECURITY_INFORMATION,
+                information_for(integrity),
                 Some(&mut owner),
                 None,
                 Some(&mut dacl),
-                None,
+                Some(&mut label),
                 Some(&mut psd),
             );
             let sd = LocalSd(psd);
             rc.ok()?;
-            Ok(Security { sd, dacl, owner })
+            Ok(Security { sd, dacl, label, owner })
+        }
+    }
+
+    /// Whether the object carries what a check for `integrity` asks of its label: for `Medium` nothing,
+    /// for `High` exactly one ACE, the High mandatory label with no write up and with `flags` (and not
+    /// `INHERITED_ACE`, which only says where it came from). Anything else, including no label, is
+    /// `false`: fail-closed.
+    fn label_holds(&self, integrity: Integrity, flags: u8) -> anyhow::Result<bool> {
+        if integrity == Integrity::Medium {
+            return Ok(true);
+        }
+        if self.label.is_null() {
+            return Ok(false);
+        }
+        // SAFETY: `label` is the ACL `sd` holds; its ACE is read only after its size is checked.
+        unsafe {
+            let mut size_info = ACL_SIZE_INFORMATION::default();
+            GetAclInformation(
+                self.label,
+                &mut size_info as *mut _ as *mut core::ffi::c_void,
+                std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
+                AclSizeInformation,
+            )?;
+            if size_info.AceCount != 1 {
+                return Ok(false);
+            }
+            let mut ace: *mut core::ffi::c_void = std::ptr::null_mut();
+            GetAce(self.label, 0, &mut ace)?;
+            let header = &*(ace as *const ACE_HEADER);
+            if header.AceType != ACE_TYPE_LABEL
+                || (header.AceSize as usize) < std::mem::size_of::<SYSTEM_MANDATORY_LABEL_ACE>()
+            {
+                return Ok(false);
+            }
+            let label = &*(ace as *const SYSTEM_MANDATORY_LABEL_ACE);
+            let level = PSID(&label.SidStart as *const u32 as *mut core::ffi::c_void);
+            let high = Sid::well_known(WellKnown::HighLabel)?;
+            Ok(label.Mask == LABEL_NO_WRITE_UP
+                && header.AceFlags & !(INHERITED_ACE.0 as u8) == flags
+                && IsValidSid(level).as_bool()
+                && EqualSid(level, high.as_psid()).is_ok())
         }
     }
 
@@ -519,7 +601,8 @@ impl Security {
     }
 }
 
-/// `AceFlags` of the directory's ACEs: `OI|CI`, and not `INHERITED_ACE`.
+/// `AceFlags` of the directory's ACEs: `OI|CI`, and not `INHERITED_ACE`. The elevated folder's label has
+/// the same.
 const PRIVATE_DIR_ACE_FLAGS: u8 = (OBJECT_INHERIT_ACE.0 | CONTAINER_INHERIT_ACE.0) as u8;
 
 /// The three Full-Control grants of a user's private directory. `flags` is what the directory
@@ -538,42 +621,48 @@ fn private_grants<'a>(user: &'a Sid, system: &'a Sid, admins: &'a Sid, flags: Op
 /// Full-Control ALLOWs for `{target_user, SYSTEM, Administrators}` (each once), owner within the
 /// allow-set, and no inherited or DENY ACEs. Anything else (incl. a NULL/absent DACL) returns
 /// `false` — fail-closed. The ACEs must be inheritable: a directory whose ACEs do not reach the
-/// socket file leaves the file with the creator's default DACL.
-pub fn verify_dir_acl(dir: &Path, target_user: &Sid) -> anyhow::Result<bool> {
-    dir_policy_holds(&Security::from_path(dir)?, target_user)
+/// socket file leaves the file with the creator's default DACL. For `Integrity::High` the directory
+/// must also carry the High label that what is made inside inherits (the elevated folder); for
+/// `Medium` no label is asked for.
+pub fn verify_dir_acl(dir: &Path, target_user: &Sid, integrity: Integrity) -> anyhow::Result<bool> {
+    dir_policy_holds(&Security::from_path(dir, integrity)?, target_user, integrity)
 }
 
 /// [`verify_dir_acl`] on an already-read security descriptor.
-fn dir_policy_holds(security: &Security, user: &Sid) -> anyhow::Result<bool> {
-    let (owner_ok, acl_ok) = dir_policy(security, user)?;
+fn dir_policy_holds(security: &Security, user: &Sid, integrity: Integrity) -> anyhow::Result<bool> {
+    let (owner_ok, acl_ok) = dir_policy(security, user, integrity)?;
     Ok(owner_ok && acl_ok)
 }
 
 /// Whether the owner and the ACL of a private directory are each what they must be, for a caller
-/// that says which one is not.
-fn dir_policy(security: &Security, user: &Sid) -> anyhow::Result<(bool, bool)> {
+/// that says which one is not. The label of a `High` directory is part of its ACL here.
+fn dir_policy(security: &Security, user: &Sid, integrity: Integrity) -> anyhow::Result<(bool, bool)> {
     let system = Sid::well_known(WellKnown::System)?;
     let admins = Sid::well_known(WellKnown::Administrators)?;
     Ok((
         security.owner_in(&[user, &system, &admins])?,
-        security.dacl_matches(&private_grants(user, &system, &admins, Some(PRIVATE_DIR_ACE_FLAGS)))?,
+        security.dacl_matches(&private_grants(user, &system, &admins, Some(PRIVATE_DIR_ACE_FLAGS)))?
+            && security.label_holds(integrity, PRIVATE_DIR_ACE_FLAGS)?,
     ))
 }
 
 /// `true` iff `file` (the socket, the lock, a folder made inside a hardened directory) grants
 /// Full Control to exactly `{user, SYSTEM, Administrators}` and to no one else, with an owner in
 /// that set. The ACEs may be inherited, which is how such a file is born. Anything else is
-/// `false`: fail-closed. For the socket this is the check that decides who can connect.
-pub fn verify_file_acl(file: &Path, user: &Sid) -> anyhow::Result<bool> {
-    file_policy_holds(&Security::from_path(file)?, user)
+/// `false`: fail-closed. For the socket this is the check that decides who can connect. For
+/// `Integrity::High` the file must also carry the High label it inherits from the elevated folder: a
+/// process below High cannot connect to it. For `Medium` no label is asked for.
+pub fn verify_file_acl(file: &Path, user: &Sid, integrity: Integrity) -> anyhow::Result<bool> {
+    file_policy_holds(&Security::from_path(file, integrity)?, user, integrity)
 }
 
 /// [`verify_file_acl`] on an already-read security descriptor.
-fn file_policy_holds(security: &Security, user: &Sid) -> anyhow::Result<bool> {
+fn file_policy_holds(security: &Security, user: &Sid, integrity: Integrity) -> anyhow::Result<bool> {
     let system = Sid::well_known(WellKnown::System)?;
     let admins = Sid::well_known(WellKnown::Administrators)?;
     Ok(security.owner_in(&[user, &system, &admins])?
-        && security.dacl_matches_as(&private_grants(user, &system, &admins, None), Inheritance::Inherited)?)
+        && security.dacl_matches_as(&private_grants(user, &system, &admins, None), Inheritance::Inherited)?
+        && security.label_holds(integrity, 0)?)
 }
 
 // install directory ====================================================================
@@ -875,7 +964,8 @@ fn problem_from_open(dir: &Path, handle: Option<OwnedHandle>) -> anyhow::Result<
         return Ok(Some(denied_problem("the hardened one")));
     };
 
-    let security = Security::from_handle(handle.0).with_context(|| format!("read the ACL of {}", dir.display()))?;
+    let security = Security::from_handle(handle.0, Integrity::Medium)
+        .with_context(|| format!("read the ACL of {}", dir.display()))?;
 
     let attributes = file_attributes(handle.0).with_context(|| format!("read the attributes of {}", dir.display()))?;
     if attributes & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {

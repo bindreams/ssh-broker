@@ -11,7 +11,7 @@ fn me() -> Sid {
 
 fn too_long_location() -> anyhow::Result<SocketLocation> {
     let profile = std::path::PathBuf::from(format!(r"C:\Users\{}", "x".repeat(120)));
-    Ok(for_profile(&profile)?)
+    Ok(for_profile(&profile, crate::socket_loc::Integrity::Medium)?)
 }
 
 // socket location ---------------------------------------------------------------------------
@@ -166,7 +166,7 @@ fn profile_with_local_linked_to_an_exact_folder(tag: &str) -> (TempProfile, Temp
     std::fs::remove_dir(&local).unwrap();
     crate::test_support::junction(&local, &outside.0.join(r"AppData\Local"));
     assert!(
-        acl::verify_dir_acl(profile.location().dir(), &me()).unwrap(),
+        acl::verify_dir_acl(profile.location().dir(), &me(), crate::socket_loc::Integrity::Medium).unwrap(),
         "control: judged by path, the folder behind the link is exact"
     );
     (profile, outside)
@@ -204,7 +204,7 @@ fn socket_file_row_passes_for_a_socket_bound_by_this_user() {
     let profile = TempProfile::new("row-file-ok");
     let loc = profile.location();
     ensure_socket_dir(&loc, &me()).unwrap();
-    let _listener = crate::afunix::Listener::bind(loc.path()).unwrap();
+    let _listener = crate::afunix::Listener::bind(loc.path(), crate::socket_loc::Integrity::Medium).unwrap();
 
     let row = socket_file_row(&Ok(loc), &me());
 
@@ -235,7 +235,10 @@ fn socket_file_row_fails_for_a_file_that_grants_someone_else() {
         .status()
         .unwrap();
     assert!(status.success());
-    assert!(!acl::verify_file_acl(loc.path(), &me()).unwrap(), "control");
+    assert!(
+        !acl::verify_file_acl(loc.path(), &me(), crate::socket_loc::Integrity::Medium).unwrap(),
+        "control"
+    );
 
     let row = socket_file_row(&Ok(loc), &me());
 
@@ -254,7 +257,7 @@ fn socket_reachable_row_follows_the_connection() {
         "nothing listens yet"
     );
 
-    let _listener = crate::afunix::Listener::bind(loc.path()).unwrap();
+    let _listener = crate::afunix::Listener::bind(loc.path(), crate::socket_loc::Integrity::Medium).unwrap();
     assert!(socket_reachable_row(&Ok(loc), &me()).pass);
 }
 
@@ -264,7 +267,7 @@ fn socket_reachable_row_does_not_connect_through_a_refused_folder() {
     let profile = TempProfile::new("row-refused");
     let loc = profile.location();
     ensure_socket_dir(&loc, &me()).unwrap();
-    let _listener = crate::afunix::Listener::bind(loc.path()).unwrap();
+    let _listener = crate::afunix::Listener::bind(loc.path(), crate::socket_loc::Integrity::Medium).unwrap();
     crate::test_support::widen(loc.dir());
 
     let row = socket_reachable_row(&Ok(loc.clone()), &me());
@@ -298,4 +301,22 @@ fn other_users_row_always_passes_and_says_each_user_runs_their_own_agent() {
     let row = other_users_row();
     assert!(row.pass);
     assert!(row.detail.contains("run verify as that user"), "{}", row.detail);
+}
+
+// an administrator's unelevated prompt -------------------------------------------------------
+
+#[test]
+fn the_row_for_an_unelevated_administrator_says_why_nothing_can_be_checked_here() {
+    let row = filtered_row();
+
+    assert!(!row.pass, "nothing was proven");
+    assert_eq!(row.name, "socket reachable");
+    assert!(row.detail.contains("administrator"), "{}", row.detail);
+    assert!(row.detail.contains("elevated prompt"), "{}", row.detail);
+    assert!(row.detail.contains("ordinary SSH login"), "{}", row.detail);
+    assert!(
+        !row.detail.contains("to see why, run"),
+        "no hint to run the agent: {}",
+        row.detail
+    );
 }

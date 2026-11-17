@@ -115,7 +115,7 @@ fn logging_for_a_user_goes_into_a_folder_that_is_exactly_theirs() {
 
     assert!(sink.is_ok());
     assert!(loc.logs_dir().is_dir());
-    assert!(acl::verify_file_acl(&loc.logs_dir(), &me).unwrap());
+    assert!(acl::verify_file_acl(&loc.logs_dir(), &me, crate::socket_loc::Integrity::Medium).unwrap());
     assert!(
         std::fs::read_dir(loc.logs_dir()).unwrap().any(|e| e
             .unwrap()
@@ -132,7 +132,7 @@ fn logging_for_a_user_goes_into_a_folder_that_is_exactly_theirs() {
         .unwrap()
         .unwrap()
         .path();
-    assert!(acl::verify_file_acl(&file, &me).unwrap());
+    assert!(acl::verify_file_acl(&file, &me, crate::socket_loc::Integrity::Medium).unwrap());
     drop(sink);
 }
 

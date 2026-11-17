@@ -310,7 +310,7 @@ fn try_relay_connects_to_the_location_its_provider_names() {
     let profile = crate::test_support::TempProfile::new("shim-wiring");
     let location = profile.location();
     crate::userdir::ensure_socket_dir(&location, &crate::acl::Sid::current_user().unwrap()).unwrap();
-    let listener = Listener::bind(location.path()).unwrap();
+    let listener = Listener::bind(location.path(), crate::socket_loc::Integrity::Medium).unwrap();
     let agent = fake_agent_exiting_with(listener, 7);
 
     let relayed = super::try_relay(
@@ -386,7 +386,10 @@ fn a_failed_log_does_not_touch_the_stderr_of_a_relayed_command() {
     let profile = crate::test_support::TempProfile::new("nolog-relay");
     let location = profile.location();
     crate::userdir::ensure_socket_dir(&location, &crate::acl::Sid::current_user().unwrap()).unwrap();
-    let agent = fake_agent_exiting_with(Listener::bind(location.path()).unwrap(), 0);
+    let agent = fake_agent_exiting_with(
+        Listener::bind(location.path(), crate::socket_loc::Integrity::Medium).unwrap(),
+        0,
+    );
     let mut stderr = Vec::new();
 
     let relayed = super::try_relay_at(
@@ -501,7 +504,10 @@ fn a_rescue_is_not_asked_when_the_connect_succeeds() {
     let profile = crate::test_support::TempProfile::new("rescue-never");
     let location = profile.location();
     crate::userdir::ensure_socket_dir(&location, &crate::acl::Sid::current_user().unwrap()).unwrap();
-    let agent = fake_agent_exiting_with(Listener::bind(location.path()).unwrap(), 5);
+    let agent = fake_agent_exiting_with(
+        Listener::bind(location.path(), crate::socket_loc::Integrity::Medium).unwrap(),
+        5,
+    );
 
     let relayed = super::try_relay_at(
         &folder_of(Ok(location)),
@@ -525,7 +531,10 @@ fn a_rescue_that_connects_gets_the_session_relayed_through_its_connection() {
     let served = crate::test_support::TempProfile::new("rescue-served");
     let at = served.location();
     crate::userdir::ensure_socket_dir(&at, &crate::acl::Sid::current_user().unwrap()).unwrap();
-    let agent = fake_agent_exiting_with(Listener::bind(at.path()).unwrap(), 9);
+    let agent = fake_agent_exiting_with(
+        Listener::bind(at.path(), crate::socket_loc::Integrity::Medium).unwrap(),
+        9,
+    );
     let socket = crate::afunix::connect(at.path()).unwrap();
     let mut rescue = Scripted::answering(Rescued::Connected { socket, modes: None });
 
@@ -590,7 +599,7 @@ fn location_with_listener(
     let profile = crate::test_support::TempProfile::new(tag);
     let location = profile.location();
     crate::userdir::ensure_socket_dir(&location, &crate::acl::Sid::current_user().unwrap()).unwrap();
-    let listener = crate::afunix::Listener::bind(location.path()).unwrap();
+    let listener = crate::afunix::Listener::bind(location.path(), crate::socket_loc::Integrity::Medium).unwrap();
     (profile, location, listener)
 }
 
@@ -840,7 +849,10 @@ fn a_folder_that_was_missing_at_the_first_act_is_connected_through_when_it_appea
     assert!(folder.refusal().is_none(), "no folder is not a refused one");
     std::fs::create_dir_all(profile.0.join(r"AppData\Local")).unwrap();
     crate::userdir::ensure_socket_dir(&location, &Sid::current_user().unwrap()).unwrap();
-    let (finished, agent) = agent_that_always_hangs_up(crate::afunix::Listener::bind(location.path()).unwrap(), 2);
+    let (finished, agent) = agent_that_always_hangs_up(
+        crate::afunix::Listener::bind(location.path(), crate::socket_loc::Integrity::Medium).unwrap(),
+        2,
+    );
     let mut stderr = Vec::new();
     let mut attempts = 0;
 
@@ -888,7 +900,10 @@ fn a_no_byte_close_before_and_after_a_connect_that_failed_are_not_consecutive() 
     let served = crate::test_support::TempProfile::new("hu-served");
     let at = served.location();
     crate::userdir::ensure_socket_dir(&at, &crate::acl::Sid::current_user().unwrap()).unwrap();
-    let (finished, second) = agent_that_always_hangs_up(Listener::bind(at.path()).unwrap(), 1);
+    let (finished, second) = agent_that_always_hangs_up(
+        Listener::bind(at.path(), crate::socket_loc::Integrity::Medium).unwrap(),
+        1,
+    );
     let socket = crate::afunix::connect(at.path()).unwrap();
     let mut rescue = Answers([Rescued::Connected { socket, modes: None }, Rescued::Plain].into());
     let mut attempts = 0;
@@ -1088,7 +1103,7 @@ fn agent_in_private_folder(
     let profile = crate::test_support::TempProfile::new(tag);
     let location = profile.location();
     crate::userdir::ensure_socket_dir(&location, &Sid::current_user().unwrap()).unwrap();
-    let listener = crate::afunix::Listener::bind(location.path()).unwrap();
+    let listener = crate::afunix::Listener::bind(location.path(), crate::socket_loc::Integrity::Medium).unwrap();
     let agent = std::thread::spawn(move || {
         let mut first = [0u8; 1];
         listener.accept().unwrap().read(&mut first).unwrap()

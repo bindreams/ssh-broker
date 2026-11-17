@@ -485,7 +485,7 @@ fn a_folder_refused_on_one_look_and_usable_on_the_next_is_connected_through_and_
     folder.connect().expect_err("the folder is refused");
     assert!(folder.refusal().is_some(), "control: refused on the first look");
     crate::test_support::icacls(location.dir(), &["/remove:g", "*S-1-1-0"]);
-    let _listener = crate::afunix::Listener::bind(location.path()).unwrap();
+    let _listener = crate::afunix::Listener::bind(location.path(), crate::socket_loc::Integrity::Medium).unwrap();
 
     folder.connect().expect("the folder is usable now");
 
@@ -922,7 +922,7 @@ fn a_listening_socket_in_the_folder_is_connected_to() {
     let profile = crate::test_support::TempProfile::new("connect-listen");
     let location = profile.location();
     crate::userdir::ensure_socket_dir(&location, &me()).unwrap();
-    let _listener = crate::afunix::Listener::bind(location.path()).unwrap();
+    let _listener = crate::afunix::Listener::bind(location.path(), crate::socket_loc::Integrity::Medium).unwrap();
 
     assert!(connect_if_listening(&location, &me()).unwrap().is_some());
 }
@@ -935,7 +935,7 @@ fn a_listener_in_a_refused_folder_is_not_connected_to_and_the_folder_is_named() 
     let profile = crate::test_support::TempProfile::new("connect-refused");
     let location = profile.location();
     crate::userdir::ensure_socket_dir(&location, &me()).unwrap();
-    let _listener = crate::afunix::Listener::bind(location.path()).unwrap();
+    let _listener = crate::afunix::Listener::bind(location.path(), crate::socket_loc::Integrity::Medium).unwrap();
     crate::test_support::widen(location.dir());
 
     let failed = connect_if_listening(&location, &me()).expect_err("connected through a folder that is not private");
@@ -1085,4 +1085,43 @@ fn a_session_that_may_end_with_its_connection_says_so_in_one_line() {
 fn a_session_that_outlives_its_connection_says_nothing() {
     use crate::logon::Survival;
     assert_eq!(survival_notice(Survival::OutlivesConnection), None);
+}
+
+// the agents a shim waits for -----
+
+/// The folder level of this process, which the agents the test starts inherit, and the other one.
+fn own_and_other_level() -> (crate::socket_loc::Integrity, crate::socket_loc::Integrity) {
+    use crate::socket_loc::Integrity::{High, Medium};
+    let own =
+        crate::account::integrity_class(crate::account::integrity_of(crate::winutil::own_token().unwrap().0).unwrap());
+    (own, if own == High { Medium } else { High })
+}
+
+/// An agent that serves the other folder is no reason to wait: the account's High agent keeps running
+/// after the account is taken out of Administrators, and the shim of its next login (Medium) looks in the
+/// plain folder, where that agent never serves. In CI the test process is High, so this is that case;
+/// on an unelevated host it is the reverse, which is the same rule.
+#[test]
+fn a_login_does_not_wait_for_an_agent_that_serves_the_folder_of_the_other_level() {
+    let (own, other) = own_and_other_level();
+    let copy = crate::test_support::NamedCopy::new("wait-level");
+    let mut agent = copy.spawn(&["agent", "--background"]);
+    let profile = TempProfile::new("wl");
+    let user = me();
+
+    let at_other = profile.location_at(other);
+    let outcome = await_starting_agent(&at_other, &copy.exe(), &user, || Ok(None)).unwrap();
+    assert!(
+        matches!(outcome, Starting::No),
+        "an agent of the other level is none of this folder's"
+    );
+
+    assert!(
+        Evidence::default()
+            .look(&profile.location_at(own), &copy.exe(), &user)
+            .unwrap(),
+        "control: the same agent is evidence for the folder of its own level"
+    );
+    drop(agent.stdin.take());
+    agent.wait().unwrap();
 }

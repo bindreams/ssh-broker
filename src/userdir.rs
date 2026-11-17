@@ -15,8 +15,9 @@ use windows::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, HANDLE};
 use windows::Win32::UI::Shell::GetUserProfileDirectoryW;
 use windows::core::{HRESULT, PWSTR};
 
+use crate::account::{integrity_class, integrity_of};
 use crate::acl::{self, DirHandle, Hold, Sid};
-use crate::socket_loc::{self, SocketLocation};
+use crate::socket_loc::{self, Integrity, SocketLocation};
 use crate::winutil;
 
 /// The account has no profile directory yet: it has never been signed on. Downcastable from the
@@ -56,11 +57,15 @@ fn probe_failure(error: &windows::core::Error, len: u32) -> anyhow::Result<u32> 
     Err(anyhow::Error::new(error.clone()).context("GetUserProfileDirectoryW (size probe)"))
 }
 
-/// The socket location of the account `token` belongs to.
+/// The socket location of the account `token` belongs to, in the folder of the token's own integrity
+/// level: a token at High or above (an administrator's elevated process) uses the elevated folder, any
+/// other the plain one. Only the level decides: not the account, a group, a setting or an argument.
+/// `token` needs `TOKEN_QUERY`.
 pub fn socket_location_of_token(token: HANDLE) -> anyhow::Result<SocketLocation> {
     let profile = profile_dir_of_token(token)?;
+    let integrity = integrity_class(integrity_of(token)?);
     // `TooLong` stays downcastable for a caller that wants to name the cause.
-    Ok(socket_loc::for_profile(&profile)?)
+    Ok(socket_loc::for_profile(&profile, integrity)?)
 }
 
 /// The profile directory of the account this process runs as, from its token and not from the
@@ -74,8 +79,8 @@ pub fn current_socket_location() -> anyhow::Result<SocketLocation> {
     socket_location_of_token(winutil::own_token()?.0)
 }
 
-/// The user's private folder and its `logs` folder, open by handle after a walk from the profile
-/// directory. They fail separately: serving needs the folder and not a log, so a `logs` that is
+/// The user's private folder (the one of [`SocketLocation::integrity`]) and its `logs` folder, open by
+/// handle after a walk from the profile directory. They fail separately: serving needs the folder and not a log, so a `logs` that is
 /// refused or broken costs the log only.
 ///
 /// The private folder is opened without `FILE_SHARE_DELETE`, so while this is held it cannot be
@@ -104,18 +109,20 @@ impl SocketDir {
 }
 
 /// Make `loc.dir` and its `logs` folder if they are missing, leave both exactly
-/// `{user, SYSTEM, Administrators}` with ACEs the files made inside inherit, and return them open.
+/// `{user, SYSTEM, Administrators}` with ACEs the files made inside inherit, and return them open. The
+/// elevated folder (`Integrity::High`) is born with the High label too, and an existing one must carry
+/// it; `logs` inside it inherits the label and is judged as any `logs` is.
 ///
 /// Reached by handle from the profile directory (see `acl::private_dir`). `AppData` and `Local`
 /// must already exist: a missing one means no profile, and inventing one would put a socket where no
-/// logon looks. Only `ssh-broker` and `logs` are created; an existing one is verified, never changed.
+/// logon looks. Only the private folder and `logs` are created; an existing one is verified, never changed.
 /// `Listener::bind` verifies it again before binding.
 ///
 /// A refusal of the socket folder (or of the way to it) is this function's error. A refusal of
 /// `logs` alone is in [`SocketDir::logs`], with the socket folder still open: it costs only the log.
 pub fn open_socket_dir(loc: &SocketLocation, user: &Sid) -> anyhow::Result<SocketDir> {
-    walk(loc, "make", |parent, name, hold| {
-        acl::ensure_private_dir(parent, name, user, hold)
+    walk(loc, "make", |parent, name, hold, integrity| {
+        acl::ensure_private_dir(parent, name, user, hold, integrity)
     })
 }
 
@@ -123,8 +130,8 @@ pub fn open_socket_dir(loc: &SocketLocation, user: &Sid) -> anyhow::Result<Socke
 /// of each folder, and nothing is made. A folder that is not there is [`acl::Missing`], in the error
 /// for the socket folder and in [`SocketDir::logs`] for `logs`.
 pub fn inspect_socket_dir(loc: &SocketLocation, user: &Sid) -> anyhow::Result<SocketDir> {
-    walk(loc, "look at", |parent, name, hold| {
-        acl::open_private_dir(parent, name, user, hold)
+    walk(loc, "look at", |parent, name, hold, integrity| {
+        acl::open_private_dir(parent, name, user, hold, integrity)
     })
 }
 
@@ -136,15 +143,19 @@ pub fn inspect_current_socket_dir() -> anyhow::Result<SocketDir> {
 }
 
 /// The walk of [`open_socket_dir`] and [`inspect_socket_dir`]; `step` makes or opens the folder `name`
-/// under `parent`, held (the private folder) or not (`logs`) as `hold` says. This and
+/// under `parent`, held (the private folder) or not (`logs`) as `hold` says, judged for `integrity`. The
+/// private folder is judged for the location's; `logs` is not asked for a label of its own. This and
 /// [`walk_to_private_folder`] are the only places that ask for the held form.
 fn walk(
     loc: &SocketLocation,
     verb: &str,
-    step: impl Fn(&DirHandle, &str, Hold) -> anyhow::Result<DirHandle>,
+    step: impl Fn(&DirHandle, &str, Hold, Integrity) -> anyhow::Result<DirHandle>,
 ) -> anyhow::Result<SocketDir> {
-    let dir = walk_to_private_folder(loc, verb, |local| step(local, socket_loc::SOCKET_DIR_NAME, Hold::Held))?;
-    let logs = step(&dir, socket_loc::LOGS_DIR_NAME, Hold::Shared)
+    let integrity = loc.integrity();
+    let dir = walk_to_private_folder(loc, verb, |local| {
+        step(local, integrity.dir_name(), Hold::Held, integrity)
+    })?;
+    let logs = step(&dir, socket_loc::LOGS_DIR_NAME, Hold::Shared, Integrity::Medium)
         .with_context(|| format!("{verb} the log folder {}", loc.logs_dir().display()));
     Ok(SocketDir {
         location: loc.clone(),
@@ -200,7 +211,7 @@ fn hold_and_confirm(
 /// [`open_socket_dir`].
 pub fn open_existing_socket_dir(loc: &SocketLocation) -> anyhow::Result<Option<DirHandle>> {
     let found = walk_to_private_folder(loc, "open", |local| {
-        acl::open_existing_private_dir(local, socket_loc::SOCKET_DIR_NAME)
+        acl::open_existing_private_dir(local, loc.integrity().dir_name(), loc.integrity())
     });
     match found {
         Ok(dir) => Ok(Some(dir)),

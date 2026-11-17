@@ -7,6 +7,8 @@ use std::process::{Child, Command, Stdio};
 use windows::Win32::Foundation::{STATUS_ACCESS_DENIED, STATUS_INFO_LENGTH_MISMATCH, STILL_ACTIVE};
 
 use crate::acl::Sid;
+use crate::socket_loc::Integrity;
+use crate::test_support::NamedCopy;
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
@@ -290,38 +292,21 @@ fn processes_that_outlive_the_bound_are_all_named_with_their_sessions() {
 
 // the agents of one user -----
 
-/// A copy of `cmd.exe` named like the installed exe, so that the process snapshot lists it as an
-/// ssh-broker process.
-struct NamedCopy(CmdCopy);
-
-impl NamedCopy {
-    fn new(tag: &str) -> NamedCopy {
-        let copy = CmdCopy::new(tag);
-        std::fs::rename(copy.exe(), copy.dir.join(crate::provision::EXE_NAME)).unwrap();
-        NamedCopy(copy)
-    }
-
-    fn exe(&self) -> PathBuf {
-        self.0.dir.join(crate::provision::EXE_NAME)
-    }
-
-    /// The copy with `args` after the program (cmd ignores them and reads its stdin), until its
-    /// stdin closes.
-    fn spawn(&self, args: &[&str]) -> Child {
-        Command::new(self.exe())
-            .args(args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .creation_flags(CREATE_NO_WINDOW)
-            .spawn()
-            .unwrap()
-    }
-}
-
 fn end(mut child: Child) {
     drop(child.stdin.take());
     child.wait().unwrap();
+}
+
+/// The folder level of this process, which the children it starts inherit.
+fn own_level() -> Integrity {
+    crate::account::integrity_class(crate::account::integrity_of(crate::winutil::own_token().unwrap().0).unwrap())
+}
+
+fn other_level() -> Integrity {
+    match own_level() {
+        Integrity::Medium => Integrity::High,
+        Integrity::High => Integrity::Medium,
+    }
 }
 
 fn pids(agents: &[Process]) -> Vec<u32> {
@@ -338,7 +323,7 @@ fn a_running_agent_of_the_user_is_found_before_it_has_taken_any_lock() {
     let shim = copy.spawn(&["-c", "agent --background"]);
     let me = Sid::current_user().unwrap();
 
-    let found = user_agents(&copy.exe(), &me).unwrap();
+    let found = user_agents(&copy.exe(), &me, own_level()).unwrap();
     let mut expected = vec![background.id(), desktop.id()];
     expected.sort();
     assert_eq!(pids(&found), expected, "both agents, and not the shim");
@@ -350,11 +335,30 @@ fn a_running_agent_of_the_user_is_found_before_it_has_taken_any_lock() {
 }
 
 #[test]
+fn an_agent_at_the_other_level_is_none_of_the_folder_looked_for() {
+    let copy = NamedCopy::new("level");
+    let agent = copy.spawn(&["agent", "--background"]);
+    let me = Sid::current_user().unwrap();
+    assert!(
+        user_agents(&copy.exe(), &me, other_level()).unwrap().is_empty(),
+        "an agent at {:?} does not serve the {:?} folder",
+        own_level(),
+        other_level()
+    );
+    assert_eq!(
+        pids(&user_agents(&copy.exe(), &me, own_level()).unwrap()),
+        [agent.id()],
+        "control"
+    );
+    end(agent);
+}
+
+#[test]
 fn another_users_agent_is_none_of_this_users() {
     let copy = NamedCopy::new("other");
     let agent = copy.spawn(&["agent", "--background"]);
     let someone_else = Sid::well_known(crate::acl::WellKnown::System).unwrap();
-    assert!(user_agents(&copy.exe(), &someone_else).unwrap().is_empty());
+    assert!(user_agents(&copy.exe(), &someone_else, own_level()).unwrap().is_empty());
     end(agent);
 }
 
@@ -364,14 +368,18 @@ fn an_agent_of_another_image_is_not_taken_for_this_one() {
     let agent = copy.spawn(&["agent", "--background"]);
     let elsewhere = NamedCopy::new("elsewhere");
     let me = Sid::current_user().unwrap();
-    assert!(user_agents(&elsewhere.exe(), &me).unwrap().is_empty());
+    assert!(user_agents(&elsewhere.exe(), &me, own_level()).unwrap().is_empty());
     end(agent);
 }
 
 #[test]
 fn an_image_that_does_not_exist_has_no_agents() {
     let absent = std::env::temp_dir().join(format!("sb-procwait-absent-{}.exe", std::process::id()));
-    assert!(user_agents(&absent, &Sid::current_user().unwrap()).unwrap().is_empty());
+    assert!(
+        user_agents(&absent, &Sid::current_user().unwrap(), own_level())
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]
@@ -379,13 +387,13 @@ fn an_agent_that_has_ended_is_not_found_while_a_handle_keeps_it_listed() {
     let copy = NamedCopy::new("ended");
     let mut agent = copy.spawn(&["agent", "--background"]);
     let me = Sid::current_user().unwrap();
-    let held = user_agents(&copy.exe(), &me).unwrap();
+    let held = user_agents(&copy.exe(), &me, own_level()).unwrap();
     assert_eq!(pids(&held), vec![agent.id()], "control: it is found while it runs");
 
     drop(agent.stdin.take());
     wait_all_exited(&held, Duration::from_secs(60)).unwrap();
     // `held` and `agent` keep the ended process in the system's list; waiting on it would return at once.
-    assert!(user_agents(&copy.exe(), &me).unwrap().is_empty());
+    assert!(user_agents(&copy.exe(), &me, own_level()).unwrap().is_empty());
     agent.wait().unwrap();
 }
 
@@ -395,7 +403,7 @@ fn a_process_that_has_ended_but_is_still_held_is_nothing_to_wait_for_not_an_erro
     // read, and `background_agents` would fail the whole `apply` on it.
     let copy = NamedCopy::new("held-ended");
     let mut agent = copy.spawn(&["agent", "--background"]);
-    let held = user_agents(&copy.exe(), &Sid::current_user().unwrap()).unwrap();
+    let held = user_agents(&copy.exe(), &Sid::current_user().unwrap(), own_level()).unwrap();
     drop(agent.stdin.take());
     wait_all_exited(&held, Duration::from_secs(60)).unwrap();
     assert!(open_if_image(agent.id(), &copy.exe()).unwrap().is_none());
@@ -534,6 +542,8 @@ struct Made {
     pid: u32,
     owner: Result<&'static str, Fail>,
     image: Result<bool, Fail>,
+    /// The folder level its token's integrity level puts it at.
+    integrity: Result<Integrity, Fail>,
     exited: bool,
     /// The kernel says it is ending while every read of it still succeeds (a process held in its exit).
     ending: bool,
@@ -547,6 +557,7 @@ fn made(pid: u32) -> Made {
         pid,
         owner: Ok(ME),
         image: Ok(true),
+        integrity: Ok(Integrity::Medium),
         exited: false,
         ending: false,
         command_line: Ok(r"C:\x\ssh-broker.exe agent --background"),
@@ -556,6 +567,9 @@ fn made(pid: u32) -> Made {
 impl Inspect for Made {
     fn owner(&self) -> anyhow::Result<String> {
         self.owner.map(str::to_owned).map_err(|f| f.error(self.pid))
+    }
+    fn integrity(&self) -> anyhow::Result<Integrity> {
+        self.integrity.map_err(|f| f.error(self.pid))
     }
     fn runs_image(&self, _wanted: &FileId) -> anyhow::Result<bool> {
         self.image.map_err(|f| f.error(self.pid))
@@ -571,15 +585,27 @@ impl Inspect for Made {
     }
 }
 
-/// The pids the scan returns for `processes`, which all carry the installed exe's name.
+/// The pids the scan for the plain folder's agents returns for `processes`, which all carry the
+/// installed exe's name.
 fn scanned(processes: &[Made]) -> anyhow::Result<Vec<u32>> {
+    scanned_at(processes, Integrity::Medium)
+}
+
+/// [`scanned`] for the agents that serve the folder of `integrity`.
+fn scanned_at(processes: &[Made], integrity: Integrity) -> anyhow::Result<Vec<u32>> {
     let names: Vec<(u32, String)> = processes
         .iter()
         .map(|p| (p.pid, crate::provision::EXE_NAME.to_owned()))
         .collect();
-    let found = scan_user_agents(&names, 1, crate::provision::EXE_NAME, ME, &FileId::default(), &|pid| {
-        Ok(processes.iter().find(|p| p.pid == pid).cloned())
-    })?;
+    let found = scan_user_agents(
+        &names,
+        1,
+        crate::provision::EXE_NAME,
+        ME,
+        integrity,
+        &FileId::default(),
+        &|pid| Ok(processes.iter().find(|p| p.pid == pid).cloned()),
+    )?;
     Ok(found.iter().map(|p| p.pid).collect())
 }
 
@@ -663,6 +689,9 @@ impl Inspect for ExitsWhenAsked {
     fn owner(&self) -> anyhow::Result<String> {
         self.made.owner()
     }
+    fn integrity(&self) -> anyhow::Result<Integrity> {
+        self.made.integrity()
+    }
     fn runs_image(&self, wanted: &FileId) -> anyhow::Result<bool> {
         self.made.runs_image(wanted)
     }
@@ -681,15 +710,23 @@ impl Inspect for ExitsWhenAsked {
 #[test]
 fn a_process_that_exits_while_its_command_line_is_read_is_skipped() {
     let names = vec![(20, crate::provision::EXE_NAME.to_owned())];
-    let found = scan_user_agents(&names, 1, crate::provision::EXE_NAME, ME, &FileId::default(), &|pid| {
-        Ok(Some(ExitsWhenAsked {
-            made: Made {
-                command_line: Err(Fail::Denied),
-                ..made(pid)
-            },
-            asked: std::cell::Cell::new(false),
-        }))
-    })
+    let found = scan_user_agents(
+        &names,
+        1,
+        crate::provision::EXE_NAME,
+        ME,
+        Integrity::Medium,
+        &FileId::default(),
+        &|pid| {
+            Ok(Some(ExitsWhenAsked {
+                made: Made {
+                    command_line: Err(Fail::Denied),
+                    ..made(pid)
+                },
+                asked: std::cell::Cell::new(false),
+            }))
+        },
+    )
     .unwrap();
     assert!(found.is_empty());
 }
@@ -721,9 +758,15 @@ fn a_process_of_the_user_whose_command_line_is_refused_for_no_known_reason_fails
 #[test]
 fn this_process_and_processes_of_other_names_are_not_looked_at() {
     let names = vec![(1, crate::provision::EXE_NAME.to_owned()), (2, "other.exe".to_owned())];
-    let found = scan_user_agents::<Made>(&names, 1, crate::provision::EXE_NAME, ME, &FileId::default(), &|pid| {
-        panic!("process {pid} was opened")
-    })
+    let found = scan_user_agents::<Made>(
+        &names,
+        1,
+        crate::provision::EXE_NAME,
+        ME,
+        Integrity::Medium,
+        &FileId::default(),
+        &|pid| panic!("process {pid} was opened"),
+    )
     .unwrap();
     assert!(found.is_empty());
 }
@@ -737,10 +780,18 @@ fn the_scan_looks_for_the_file_name_of_the_image_it_is_given_not_for_the_install
         (20, crate::provision::EXE_NAME.to_owned()),
     ];
     let opened = std::cell::RefCell::new(Vec::new());
-    let found = scan_user_agents(&names, 1, "stand_in.exe", ME, &FileId::default(), &|pid| {
-        opened.borrow_mut().push(pid);
-        Ok(Some(made(pid)))
-    })
+    let found = scan_user_agents(
+        &names,
+        1,
+        "stand_in.exe",
+        ME,
+        Integrity::Medium,
+        &FileId::default(),
+        &|pid| {
+            opened.borrow_mut().push(pid);
+            Ok(Some(made(pid)))
+        },
+    )
     .unwrap();
     assert_eq!(found.iter().map(|p| p.pid).collect::<Vec<_>>(), [10]);
     assert_eq!(*opened.borrow(), [10], "a process of another name is not opened");
@@ -749,9 +800,15 @@ fn the_scan_looks_for_the_file_name_of_the_image_it_is_given_not_for_the_install
 #[test]
 fn the_scan_compares_file_names_without_regard_to_case() {
     let names = vec![(10, "Stand_In.EXE".to_owned())];
-    let found = scan_user_agents(&names, 1, "stand_in.exe", ME, &FileId::default(), &|pid| {
-        Ok(Some(made(pid)))
-    })
+    let found = scan_user_agents(
+        &names,
+        1,
+        "stand_in.exe",
+        ME,
+        Integrity::Medium,
+        &FileId::default(),
+        &|pid| Ok(Some(made(pid))),
+    )
     .unwrap();
     assert_eq!(found.len(), 1);
 }
@@ -759,9 +816,15 @@ fn the_scan_compares_file_names_without_regard_to_case() {
 #[test]
 fn a_process_that_cannot_be_opened_is_none_of_the_users() {
     let names = vec![(5, crate::provision::EXE_NAME.to_owned())];
-    let found = scan_user_agents::<Made>(&names, 1, crate::provision::EXE_NAME, ME, &FileId::default(), &|_| {
-        Ok(None)
-    })
+    let found = scan_user_agents::<Made>(
+        &names,
+        1,
+        crate::provision::EXE_NAME,
+        ME,
+        Integrity::Medium,
+        &FileId::default(),
+        &|_| Ok(None),
+    )
     .unwrap();
     assert!(found.is_empty());
 }
@@ -927,4 +990,59 @@ fn the_signs_print_every_answer_for_a_test_that_measures_them() {
     assert!(text.contains("0xc0000004"), "{text}");
     assert!(text.contains("exit status 0x00000103"), "{text}");
     assert!(text.contains("deleting false"), "{text}");
+}
+
+// the scan's filter by integrity -----
+
+#[test]
+fn the_scan_for_the_elevated_folder_takes_the_agents_at_high_and_not_those_below() {
+    let high = |pid| Made {
+        integrity: Ok(Integrity::High),
+        ..made(pid)
+    };
+    let processes = [made(10), high(20), made(30), high(40)];
+    assert_eq!(scanned_at(&processes, Integrity::High).unwrap(), [20, 40]);
+    assert_eq!(scanned_at(&processes, Integrity::Medium).unwrap(), [10, 30]);
+}
+
+#[test]
+fn an_agent_whose_token_cannot_be_read_is_not_counted_for_either_folder() {
+    let unreadable = Made {
+        integrity: Err(Fail::Denied),
+        ..made(10)
+    };
+    for level in [Integrity::Medium, Integrity::High] {
+        assert_eq!(
+            scanned_at(std::slice::from_ref(&unreadable), level).unwrap(),
+            Vec::<u32>::new()
+        );
+    }
+}
+
+#[test]
+fn a_process_whose_level_is_read_as_it_ends_is_skipped_not_fatal() {
+    let ending = Made {
+        integrity: Err(Fail::Ending),
+        ..made(10)
+    };
+    assert_eq!(scanned(&[ending, made(20)]).unwrap(), [20]);
+}
+
+#[test]
+fn a_shim_and_a_process_of_another_user_are_none_of_the_folder_at_any_level() {
+    let high_shim = Made {
+        integrity: Ok(Integrity::High),
+        command_line: Ok(r"C:\x\ssh-broker.exe"),
+        ..made(10)
+    };
+    let high_other_user = Made {
+        integrity: Ok(Integrity::High),
+        owner: Ok("S-1-5-18"),
+        ..made(20)
+    };
+    assert!(
+        scanned_at(&[high_shim, high_other_user], Integrity::High)
+            .unwrap()
+            .is_empty()
+    );
 }

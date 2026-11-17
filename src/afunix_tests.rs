@@ -1,6 +1,8 @@
 //! Unit tests for the `afunix` module.
 use std::path::Path;
 
+use crate::socket_loc::Integrity;
+
 #[test]
 fn unix_addr_accepts_a_normal_short_path() {
     assert!(super::unix_addr(Path::new("/tmp/ssh-broker/a.sock")).is_ok());
@@ -56,7 +58,7 @@ fn listen_connect_echo() {
     let dir = setup_socket_dir("echo");
     let sock_path = dir.join("s");
 
-    let listener = super::Listener::bind(&sock_path).unwrap();
+    let listener = super::Listener::bind(&sock_path, Integrity::Medium).unwrap();
     let client = std::thread::spawn({
         let p = sock_path.clone();
         move || {
@@ -79,7 +81,7 @@ fn split_halves_are_independent_and_shutdown_signals_eof() {
     use std::io::{Read, Write};
     let dir = setup_socket_dir("split");
     let sock_path = dir.join("s");
-    let listener = super::Listener::bind(&sock_path).unwrap();
+    let listener = super::Listener::bind(&sock_path, Integrity::Medium).unwrap();
 
     let client = std::thread::spawn({
         let p = sock_path.clone();
@@ -114,9 +116,9 @@ fn split_halves_are_independent_and_shutdown_signals_eof() {
 fn bind_refuses_when_a_live_listener_holds_the_path() {
     let dir = setup_socket_dir("live");
     let p = dir.join("s");
-    let _first = super::Listener::bind(&p).unwrap();
+    let _first = super::Listener::bind(&p, Integrity::Medium).unwrap();
     assert!(
-        super::Listener::bind(&p).is_err(),
+        super::Listener::bind(&p, Integrity::Medium).is_err(),
         "binding over a live listener must fail (no hijack)"
     );
     let _ = std::fs::remove_dir_all(&dir);
@@ -126,9 +128,9 @@ fn bind_refuses_when_a_live_listener_holds_the_path() {
 fn bind_reclaims_a_stale_socket_file() {
     let dir = setup_socket_dir("stale");
     let p = dir.join("s");
-    drop(super::Listener::bind(&p).unwrap()); // listener closed; the socket file may linger
+    drop(super::Listener::bind(&p, Integrity::Medium).unwrap()); // listener closed; the socket file may linger
     // A fresh bind must reclaim the dead path rather than fail.
-    let _second = super::Listener::bind(&p).unwrap();
+    let _second = super::Listener::bind(&p, Integrity::Medium).unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -141,7 +143,7 @@ fn bind_refuses_an_unhardened_directory() {
     std::fs::create_dir_all(&dir).unwrap();
     let p = dir.join("s");
     assert!(
-        super::Listener::bind(&p).is_err(),
+        super::Listener::bind(&p, Integrity::Medium).is_err(),
         "bind must refuse a directory that is not locked down"
     );
     let _ = std::fs::remove_dir_all(&dir);
@@ -152,7 +154,7 @@ fn bind_refuses_an_unhardened_directory() {
 fn bound_listener_socket_is_not_inheritable() {
     let dir = setup_socket_dir("noinherit");
     let p = dir.join("s");
-    let listener = super::Listener::bind(&p).unwrap();
+    let listener = super::Listener::bind(&p, Integrity::Medium).unwrap();
     assert!(
         listener.inherit_flag_is_clear(),
         "the listening socket must not be inheritable (else children leak the ACL boundary)"
@@ -168,7 +170,7 @@ fn a_connection_is_born_non_inheritable() {
     // child spawned by another thread can inherit one between `accept` and any later fix-up.
     let dir = setup_socket_dir("born");
     let p = dir.join("s");
-    let listener = super::Listener::bind(&p).unwrap();
+    let listener = super::Listener::bind(&p, Integrity::Medium).unwrap();
     let client = super::connect(&p).unwrap();
     let (accepted, _) = listener.sock.accept_raw().unwrap();
     assert!(
@@ -184,7 +186,7 @@ fn a_connection_is_born_non_inheritable() {
 fn an_accepted_connection_is_not_inheritable() {
     let dir = setup_socket_dir("accepted");
     let p = dir.join("s");
-    let listener = super::Listener::bind(&p).unwrap();
+    let listener = super::Listener::bind(&p, Integrity::Medium).unwrap();
     let _client = super::connect(&p).unwrap();
     let accepted = listener.accept().unwrap();
     assert!(!super::is_inheritable(&accepted).unwrap());
@@ -215,10 +217,10 @@ fn a_connection_that_arrives_inheritable_is_refused_not_fixed_up() {
 fn bind_creates_a_socket_file_with_exactly_the_three_aces() {
     let dir = setup_socket_dir("file-acl");
     let p = dir.join("agent.sock");
-    let _listener = super::Listener::bind(&p).unwrap();
+    let _listener = super::Listener::bind(&p, Integrity::Medium).unwrap();
     let me = crate::acl::Sid::current_user().unwrap();
     assert!(
-        crate::acl::verify_file_acl(&p, &me).unwrap(),
+        crate::acl::verify_file_acl(&p, &me, Integrity::Medium).unwrap(),
         "the file is born with the directory's inheritable ACEs and nothing else"
     );
     let _ = std::fs::remove_dir_all(&dir);
@@ -235,7 +237,10 @@ fn bind_refuses_a_dir_that_is_widened_after_it_was_hardened() {
         .unwrap();
     assert!(status.success());
     let p = dir.join("agent.sock");
-    let err = format!("{:#}", super::Listener::bind(&p).err().expect("must refuse"));
+    let err = format!(
+        "{:#}",
+        super::Listener::bind(&p, Integrity::Medium).err().expect("must refuse")
+    );
     assert!(err.contains("not locked down"), "{err}");
     assert!(!p.exists(), "nothing was bound");
     let _ = std::fs::remove_dir_all(&dir);
@@ -246,7 +251,7 @@ fn bind_refuses_a_dir_that_is_widened_after_it_was_hardened() {
 fn bind_removes_the_socket_and_refuses_when_the_file_acl_does_not_verify() {
     let dir = setup_socket_dir("bad-file");
     let p = dir.join("agent.sock");
-    let err = super::Listener::bind_with(&p, &|_| Ok(false))
+    let err = super::Listener::bind_with(&p, Integrity::Medium, &|_, _| Ok(false))
         .err()
         .expect("must refuse");
     assert!(format!("{err:#}").contains("socket file"), "{err:#}");
@@ -259,7 +264,7 @@ fn bind_removes_the_socket_and_refuses_when_the_file_acl_does_not_verify() {
 fn bind_removes_the_socket_when_the_file_acl_cannot_be_read() {
     let dir = setup_socket_dir("unreadable-file");
     let p = dir.join("agent.sock");
-    let result = super::Listener::bind_with(&p, &|_| anyhow::bail!("cannot read it"));
+    let result = super::Listener::bind_with(&p, Integrity::Medium, &|_, _| anyhow::bail!("cannot read it"));
     assert!(result.is_err());
     assert!(!p.exists());
     let _ = std::fs::remove_dir_all(&dir);
@@ -269,8 +274,10 @@ fn bind_removes_the_socket_when_the_file_acl_cannot_be_read() {
 fn bind_reports_a_live_listener_as_already_listening() {
     let dir = setup_socket_dir("already");
     let p = dir.join("s");
-    let _first = super::Listener::bind(&p).unwrap();
-    let err = super::Listener::bind(&p).err().expect("a live listener holds the path");
+    let _first = super::Listener::bind(&p, Integrity::Medium).unwrap();
+    let err = super::Listener::bind(&p, Integrity::Medium)
+        .err()
+        .expect("a live listener holds the path");
     assert!(
         err.downcast_ref::<super::AlreadyListening>().is_some(),
         "the caller must be able to tell this from a real failure: {err:#}"
@@ -288,13 +295,13 @@ fn an_agent_that_takes_over_the_lock_reclaims_the_dead_agents_socket() {
 
     // The first agent serves under the lock and dies: lock released, socket file left behind.
     let first_lock = UserLock::try_acquire(&lock).unwrap().unwrap();
-    drop(super::Listener::bind(&sock).unwrap());
+    drop(super::Listener::bind(&sock, Integrity::Medium).unwrap());
     assert!(sock.exists(), "control: the dead agent left its socket file");
     drop(first_lock);
 
     // The second takes the lock, then binds over the stale file.
     let _second_lock = UserLock::acquire(&lock, || panic!("the lock was free")).unwrap();
-    let _second = super::Listener::bind(&sock).unwrap();
+    let _second = super::Listener::bind(&sock, Integrity::Medium).unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -393,4 +400,105 @@ fn an_accepted_connection_that_cannot_be_hardened_is_refused_not_fatal() {
 fn an_accepted_connection_that_hardens_is_handed_out() {
     let sock = socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None).unwrap();
     assert!(super::finish_accept(Ok(sock), |_| Ok(())).is_ok());
+}
+
+// the elevated folder -----
+
+#[cfg(windows)]
+#[test]
+fn bind_for_the_elevated_folder_refuses_a_directory_without_the_label() {
+    let dir = setup_socket_dir("no-label");
+    let p = dir.join("agent.sock");
+    let err = format!(
+        "{:#}",
+        super::Listener::bind(&p, Integrity::High).err().expect("must refuse")
+    );
+    assert!(err.contains("not locked down"), "{err}");
+    assert!(!p.exists(), "nothing was bound");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(windows)]
+#[test]
+fn bind_checks_the_socket_file_for_the_integrity_it_binds_for() {
+    let dir = setup_socket_dir("file-integrity");
+    let p = dir.join("agent.sock");
+    let asked = std::cell::Cell::new(None);
+    let listener = super::Listener::bind_with(&p, Integrity::Medium, &|_, integrity| {
+        asked.set(Some(integrity));
+        Ok(true)
+    });
+    assert!(listener.is_ok());
+    assert_eq!(asked.get(), Some(Integrity::Medium));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A folder made the way the elevated agent's is, in the temp dir: born labelled. Elevated (CI only).
+#[cfg(windows)]
+fn labelled_socket_dir(tag: &str) -> std::path::PathBuf {
+    crate::test_support::assert_elevated();
+    let parent = std::env::temp_dir().join(format!("sb-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&parent);
+    std::fs::create_dir_all(&parent).unwrap();
+    let root = crate::acl::open_root(&parent).unwrap();
+    let me = crate::acl::Sid::current_user().unwrap();
+    crate::acl::ensure_private_dir(&root, "d", &me, crate::acl::Hold::Shared, Integrity::High)
+        .expect("an elevated process makes the labelled folder");
+    parent.join("d")
+}
+
+/// Elevated (CI only): in the folder born labelled a High bind succeeds, and the socket file carries
+/// the label it inherited.
+#[cfg(windows)]
+#[test]
+fn bind_in_the_elevated_folder_leaves_a_socket_file_that_carries_the_label() {
+    let dir = labelled_socket_dir("bind-high");
+    let p = dir.join("agent.sock");
+    let me = crate::acl::Sid::current_user().unwrap();
+    let _listener = super::Listener::bind(&p, Integrity::High).expect("the folder carries the label");
+    assert!(crate::acl::verify_file_acl(&p, &me, Integrity::High).unwrap());
+    let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+}
+
+/// Elevated (CI only): a socket file that does not carry the label is refused and removed, though the
+/// folder is the elevated one. The label is taken off the file from inside the check, which is the
+/// moment between `bind` and `listen`.
+#[cfg(windows)]
+#[test]
+fn bind_removes_a_socket_file_without_the_label_and_refuses_to_listen() {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::Security::Authorization::{SE_FILE_OBJECT, SetNamedSecurityInfoW};
+    use windows::Win32::Security::LABEL_SECURITY_INFORMATION;
+    use windows::core::PCWSTR;
+
+    let dir = labelled_socket_dir("bind-unlabelled");
+    let p = dir.join("agent.sock");
+    let me = crate::acl::Sid::current_user().unwrap();
+    let err = super::Listener::bind_with(&p, Integrity::High, &|path, integrity| {
+        assert!(
+            crate::acl::verify_file_acl(path, &me, integrity).unwrap(),
+            "control: the file was born with the label"
+        );
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+        // SAFETY: a NUL-terminated path; a null SACL with the label requested removes the label.
+        unsafe {
+            SetNamedSecurityInfoW(
+                PCWSTR(wide.as_ptr()),
+                SE_FILE_OBJECT,
+                LABEL_SECURITY_INFORMATION,
+                None,
+                None,
+                None,
+                Some(std::ptr::null()),
+            )
+        }
+        .ok()
+        .expect("take the label off the socket file");
+        crate::acl::verify_file_acl(path, &me, integrity)
+    })
+    .err()
+    .expect("must refuse");
+    assert!(format!("{err:#}").contains("socket file"), "{err:#}");
+    assert!(!p.exists(), "a socket whose label is unproven is not left behind");
+    let _ = std::fs::remove_dir_all(dir.parent().unwrap());
 }

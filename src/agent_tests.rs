@@ -20,7 +20,7 @@ fn hardened_dir(tag: &str) -> std::path::PathBuf {
 fn agent_pty_handler_runs_command_and_returns_exit() {
     let dir = hardened_dir("pty");
     let sock = dir.join("s");
-    let listener = Listener::bind(&sock).unwrap();
+    let listener = Listener::bind(&sock, crate::socket_loc::Integrity::Medium).unwrap();
 
     let client_path = sock.clone();
     let client = thread::spawn(move || {
@@ -52,7 +52,7 @@ fn agent_pty_handler_runs_command_and_returns_exit() {
 fn run_pty_echo_session(tag: &str, hooks: Hooks) -> (Outcome, String) {
     let dir = hardened_dir(tag);
     let sock = dir.join("s");
-    let listener = Listener::bind(&sock).unwrap();
+    let listener = Listener::bind(&sock, crate::socket_loc::Integrity::Medium).unwrap();
     let client_path = sock.clone();
     let client = thread::spawn(move || {
         let conn = afunix::connect(&client_path).unwrap();
@@ -122,7 +122,7 @@ fn refused_login_of(tag: &str, mode: Mode, command: &str, agent: impl FnOnce(soc
     let command = command.to_owned();
     let dir = hardened_dir(tag);
     let sock = dir.join("s");
-    let listener = Listener::bind(&sock).unwrap();
+    let listener = Listener::bind(&sock, crate::socket_loc::Integrity::Medium).unwrap();
     let client_path = sock.clone();
     let client = thread::spawn(move || {
         let conn = afunix::connect(&client_path).unwrap();
@@ -340,7 +340,7 @@ fn a_login_that_arrives_while_the_agent_drains_gets_the_refusal_at_once() {
 
     let dir = hardened_dir("drain-login");
     let sock = dir.join("s");
-    let listener = Listener::bind(&sock).unwrap();
+    let listener = Listener::bind(&sock, crate::socket_loc::Integrity::Medium).unwrap();
     let (events, on_event) = mpsc::channel();
     let connections = super::Connections::observing_drain({
         let events = events.clone();
@@ -409,7 +409,7 @@ fn a_login_accepted_while_the_end_is_decided_is_refused_not_reset() {
 
     let dir = hardened_dir("accepted-uncounted");
     let sock = dir.join("s");
-    let listener = Listener::bind(&sock).unwrap();
+    let listener = Listener::bind(&sock, crate::socket_loc::Integrity::Medium).unwrap();
     let (events, on_event) = mpsc::channel::<&'static str>();
     let connections = super::Connections::observing_drain({
         let events = events.clone();
@@ -504,7 +504,7 @@ fn agent_tears_down_when_ssh_side_disconnects_first() {
     // by the test runner), not pass it.
     let dir = hardened_dir("disconnect");
     let sock = dir.join("s");
-    let listener = Listener::bind(&sock).unwrap();
+    let listener = Listener::bind(&sock, crate::socket_loc::Integrity::Medium).unwrap();
 
     let client_path = sock.clone();
     let client = thread::spawn(move || {
@@ -539,7 +539,7 @@ fn agent_tears_down_when_ssh_side_disconnects_first() {
 fn agent_exec_handler_separates_streams_and_returns_code() {
     let dir = hardened_dir("exec");
     let sock = dir.join("s");
-    let listener = Listener::bind(&sock).unwrap();
+    let listener = Listener::bind(&sock, crate::socket_loc::Integrity::Medium).unwrap();
 
     let client_path = sock.clone();
     let client = thread::spawn(move || {
@@ -594,7 +594,7 @@ fn assert_input_after_exit_is_still_read(tag: &str, mode: Mode) {
 
     let dir = hardened_dir(tag);
     let sock = dir.join("s");
-    let listener = Listener::bind(&sock).unwrap();
+    let listener = Listener::bind(&sock, crate::socket_loc::Integrity::Medium).unwrap();
 
     let client_path = sock.clone();
     let client = thread::spawn(move || {
@@ -645,7 +645,7 @@ fn agent_pty_keeps_reading_input_after_exit_until_the_client_closes() {
 fn agent_exec_runs_the_command_when_the_hangup_watcher_cannot_be_created() {
     let dir = hardened_dir("exec-no-watcher");
     let sock = dir.join("s");
-    let listener = Listener::bind(&sock).unwrap();
+    let listener = Listener::bind(&sock, crate::socket_loc::Integrity::Medium).unwrap();
 
     let client_path = sock.clone();
     let client = thread::spawn(move || {
@@ -687,7 +687,7 @@ fn agent_exec_relays_stdin_and_returns_sorted_output() {
     // sorted it. This is the regression guard for the stdin-EOF-marker timing.
     let dir = hardened_dir("exec-stdin");
     let sock = dir.join("s");
-    let listener = Listener::bind(&sock).unwrap();
+    let listener = Listener::bind(&sock, crate::socket_loc::Integrity::Medium).unwrap();
 
     let client_path = sock.clone();
     let client = thread::spawn(move || {
@@ -732,7 +732,7 @@ fn agent_exec_tears_down_when_ssh_disconnects_first() {
     // which is exactly the bug it guards against.
     let dir = hardened_dir("exec-disc");
     let sock = dir.join("s");
-    let listener = Listener::bind(&sock).unwrap();
+    let listener = Listener::bind(&sock, crate::socket_loc::Integrity::Medium).unwrap();
 
     let client_path = sock.clone();
     let client = thread::spawn(move || {
@@ -762,7 +762,7 @@ fn agent_exec_tears_down_when_ssh_disconnects_first() {
 fn agent_rejects_non_handshake_first_frame() {
     let dir = hardened_dir("badfirst");
     let sock = dir.join("s");
-    let listener = Listener::bind(&sock).unwrap();
+    let listener = Listener::bind(&sock, crate::socket_loc::Integrity::Medium).unwrap();
 
     let client_path = sock.clone();
     let client = thread::spawn(move || {
@@ -795,7 +795,7 @@ fn agent_rejects_non_handshake_first_frame() {
 fn exec_disconnect_is_noticed_while_the_input_pump_is_blocked_on_stdin() {
     let dir = hardened_dir("exec-stdin-blocked");
     let sock = dir.join("s");
-    let listener = Listener::bind(&sock).unwrap();
+    let listener = Listener::bind(&sock, crate::socket_loc::Integrity::Medium).unwrap();
 
     let client_path = sock.clone();
     let client = thread::spawn(move || {
@@ -980,7 +980,7 @@ fn run_tree_session(tag: &str, mode: Mode, inherit_stdio: bool, ending: Ending, 
     let dir = hardened_dir(tag);
     let sock = dir.join("s");
     let pidfile = dir.join("grandchild.pid");
-    let listener = Listener::bind(&sock).unwrap();
+    let listener = Listener::bind(&sock, crate::socket_loc::Integrity::Medium).unwrap();
     // Created before the handshake, so the command can never reach its wait first.
     let go = GoEvent::create(tag);
     let tail = match ending {
@@ -1179,7 +1179,7 @@ fn a_failed_hangup_wait_does_not_reap_and_a_finished_one_does() {
 fn session_halves(tag: &str) -> (afunix::ConnTx, afunix::ConnRx, socket2::Socket, std::path::PathBuf) {
     let dir = hardened_dir(tag);
     let sock = dir.join("s");
-    let listener = Listener::bind(&sock).unwrap();
+    let listener = Listener::bind(&sock, crate::socket_loc::Integrity::Medium).unwrap();
     let client = afunix::connect(&sock).unwrap();
     let conn = listener.accept().unwrap();
     let (rx, tx) = afunix::split(conn).unwrap();
@@ -1293,7 +1293,7 @@ fn shell_session(
 ) -> (Outcome, String, String) {
     let dir = hardened_dir(tag);
     let sock = dir.join("s");
-    let listener = Listener::bind(&sock).unwrap();
+    let listener = Listener::bind(&sock, crate::socket_loc::Integrity::Medium).unwrap();
     let client_path = sock.clone();
     let command = command.map(str::to_owned);
     let client = thread::spawn(move || {

@@ -82,7 +82,7 @@ pub fn socket_file_row(location: &anyhow::Result<SocketLocation>, user: &Sid) ->
     if loc.path().symlink_metadata().is_err() {
         return Check::new(NAME, false, "no socket: no agent is serving this account");
     }
-    match acl::verify_file_acl(loc.path(), user) {
+    match acl::verify_file_acl(loc.path(), user, loc.integrity()) {
         Ok(true) => Check::new(NAME, true, format!("grantee={}", user.describe())),
         Ok(false) => Check::new(
             NAME,
@@ -114,6 +114,13 @@ pub fn socket_reachable_row(location: &anyhow::Result<SocketLocation>, user: &Si
         },
         Err(_) => Check::new(NAME, false, "no socket location"),
     }
+}
+
+/// What `verify` shows an administrator's unelevated process in place of the rows about the agent: the
+/// folder it would look in is the plain one, and the account's agent serves the elevated folder, so
+/// nothing about the agent can be proven from here. Fails, because nothing was.
+pub fn filtered_row() -> Check {
+    Check::new("socket reachable", false, crate::offer::text::FILTERED_LOOKS_ELSEWHERE)
 }
 
 /// `other users (info)`: says what `verify` covers. Never fails.

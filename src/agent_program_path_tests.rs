@@ -38,7 +38,7 @@ impl Fixture {
     /// Run `command` through `handle_connection` and return what the client saw.
     fn relay(&self, command: String) -> (Outcome, Vec<u8>) {
         let sock = self.sockets.join("a");
-        let listener = Listener::bind(&sock).unwrap();
+        let listener = Listener::bind(&sock, crate::socket_loc::Integrity::Medium).unwrap();
         let client = thread::spawn(move || {
             let conn = afunix::connect(&sock).unwrap();
             let (mut crx, mut ctx) = afunix::split(conn).unwrap();

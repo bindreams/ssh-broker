@@ -62,9 +62,17 @@ impl Drop for OwnedHandle {
 /// `account::elevation`, [`token_information`]); a read that needs more access than `TOKEN_QUERY`
 /// opens its own.
 pub fn own_token() -> anyhow::Result<OwnedHandle> {
+    // SAFETY: the pseudo-handle of this process is valid for the call.
+    process_token(unsafe { GetCurrentProcess() })
+}
+
+/// A `TOKEN_QUERY` handle on the token of `process`, a handle with `PROCESS_QUERY_LIMITED_INFORMATION`.
+/// The one place a process's token is opened; a process whose token this one may not query is
+/// `ERROR_ACCESS_DENIED`.
+pub fn process_token(process: HANDLE) -> anyhow::Result<OwnedHandle> {
     let mut token = HANDLE::default();
     // SAFETY: `token` is a valid out-pointer; the handle is closed by `OwnedHandle`.
-    unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) }.context("open the process token")?;
+    unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut token) }.context("open the process token")?;
     Ok(OwnedHandle(token))
 }
 

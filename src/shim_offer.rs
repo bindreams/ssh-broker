@@ -763,11 +763,13 @@ struct Evidence {
 const MAX_EVIDENCE_HANDLES: usize = 63;
 
 impl Evidence {
-    /// Look again: who holds the lock, and which agent processes run. True if any agent exists.
+    /// Look again: who holds the lock, and which agent processes at the location's level run. True if any
+    /// agent exists. An agent at the other level serves the other folder and is no reason to wait.
     /// The lock is looked at through the handle of the user's folder, opened afresh each time
     /// because the agent may not have made the folder yet; a folder that is not there holds no lock.
     fn look(&mut self, location: &SocketLocation, image: &Path, user: &Sid) -> anyhow::Result<bool> {
-        self.agents = procwait::user_agents(image, user).context("look for the user's agent processes")?;
+        self.agents =
+            procwait::user_agents(image, user, location.integrity()).context("look for the user's agent processes")?;
         let folder = crate::userdir::open_existing_socket_dir(location).map_err(folder_failure)?;
         let held = match &folder {
             Some(folder) => starting_agent::is_held(folder)

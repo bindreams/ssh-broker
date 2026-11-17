@@ -15,6 +15,7 @@ use ssh_broker::autologin::{self, PasswordSource, WindowsEnv};
 use ssh_broker::provision::session_task::{task_name, task_problem};
 use ssh_broker::provision::taskscheduler;
 use ssh_broker::socket_loc;
+use ssh_broker::socket_loc::Integrity;
 
 #[path = "common/account.rs"]
 mod account_fixture;
@@ -63,7 +64,7 @@ fn env(kit: &Kit, password: &str) -> WindowsEnv {
 }
 
 fn location(account: &Account) -> socket_loc::SocketLocation {
-    socket_loc::for_profile(account.profile()).unwrap()
+    socket_loc::for_profile(account.profile(), Integrity::Medium).unwrap()
 }
 
 /// Wait for the agent the task started, then run `check` with a way to connect to it, then end the

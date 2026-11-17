@@ -9,6 +9,7 @@
 
 use ssh_broker::account::{self, AccountKind, LocalAccount};
 use ssh_broker::logon::{self, LogonKind};
+use ssh_broker::socket_loc::Integrity;
 use ssh_broker::userdir::{self, NoProfile};
 use ssh_broker::winutil::OwnedHandle;
 use windows::Win32::NetworkManagement::NetManagement::UF_ACCOUNTDISABLE;
@@ -123,7 +124,7 @@ fn an_administrators_shim_sees_the_elevated_agent_it_starts() {
     let password = password::password(&account.password);
     let started = logon::start_background_agent(&account_of(&account), &password, &kit.exe, LogonKind::Batch)
         .unwrap_or_else(|e| panic!("logon failed: {e:?}"));
-    let location = ssh_broker::socket_loc::for_profile(account.profile()).unwrap();
+    let location = ssh_broker::socket_loc::for_profile(account.profile(), Integrity::Medium).unwrap();
     stand_in::wait_for_serving_marker(&location, started.process.0);
     assert_eq!(
         kit.agent_info("elevated"),
@@ -607,7 +608,7 @@ fn logon_with_seclogon_stopped_returns_windows_reason() {
     let password = password::password(&account.password);
     match logon::start_background_agent(&account_of(&account), &password, &kit.exe, LogonKind::Interactive) {
         Ok(started) => {
-            let location = ssh_broker::socket_loc::for_profile(account.profile()).unwrap();
+            let location = ssh_broker::socket_loc::for_profile(account.profile(), Integrity::Medium).unwrap();
             stand_in::wait_for_serving_marker(&location, started.process.0);
         }
         Err(failure) => assert!(!failure.reason.is_empty(), "no reason for code {}", failure.code),
@@ -675,7 +676,7 @@ fn logon_as_account_with_space_in_name() {
     let password = password::password(&account.password);
     let started = logon::start_background_agent(&account_of(&account), &password, &kit.exe, LogonKind::Interactive)
         .unwrap_or_else(|e| panic!("logon as {name:?} failed: {e:?}"));
-    let location = ssh_broker::socket_loc::for_profile(account.profile()).unwrap();
+    let location = ssh_broker::socket_loc::for_profile(account.profile(), Integrity::Medium).unwrap();
     stand_in::wait_for_serving_marker(&location, started.process.0);
     assert_eq!(
         kit.agent_info("sid"),
@@ -696,7 +697,7 @@ fn second_agent_in_the_same_session_leaves_without_binding() {
     let _machine = machine::shared();
     let kit = Kit::copy_of_broker("m4");
     let account = Account::create("m4", true);
-    let location = ssh_broker::socket_loc::for_profile(account.profile()).unwrap();
+    let location = ssh_broker::socket_loc::for_profile(account.profile(), Integrity::Medium).unwrap();
 
     let first = RealAgent::start(&kit, &account);
     stand_in::wait_for_serving_marker(&location, first.process.process.0);

@@ -20,6 +20,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use ssh_broker::acl::{Sid, WellKnown};
 use ssh_broker::provision::registry::{OPENSSH_KEY, set_default_shell_under};
+use ssh_broker::socket_loc::Integrity;
 use ssh_broker::{socket_loc, userdir};
 
 #[path = "common/account.rs"]
@@ -56,11 +57,11 @@ use stand_in::Kit;
 
 // What a test compares =====
 
-/// A stand-in `ssh-broker` folder as an administrator owns it (the install directory's shape): owned
-/// by Administrators, with an ACL that gives `BUILTIN\Users` read, which is not the private ACL, and
+/// A stand-in private folder of `integrity` as an administrator owns it (the install directory's shape):
+/// owned by Administrators, with an ACL that gives `BUILTIN\Users` read, which is not the private ACL, and
 /// two files in it.
-fn administrators_folder(parent: &Path) -> PathBuf {
-    let folder = parent.join(socket_loc::SOCKET_DIR_NAME);
+fn administrators_folder(parent: &Path, integrity: Integrity) -> PathBuf {
+    let folder = parent.join(integrity.dir_name());
     std::fs::create_dir_all(&folder).unwrap();
     let status = Command::new("icacls")
         .arg(&folder)
@@ -114,21 +115,28 @@ impl Drop for LinkedTree {
 
 /// The folder behind `AppData\Local` belongs to an administrator, and the
 /// token that calls `ensure_socket_dir` is elevated and so could re-own it. The call refuses, and
-/// the folder, its ACL and its files are what they were.
+/// the folder, its ACL and its files are what they were, for the elevated agent's folder and the plain one.
 #[test]
 fn a_junction_at_local_does_not_let_an_elevated_ensure_reown_an_administrators_folder() {
     account_fixture::assert_elevated();
+    for integrity in [Integrity::High, Integrity::Medium] {
+        a_junction_at_local_is_refused_for(integrity);
+    }
+}
+
+fn a_junction_at_local_is_refused_for(integrity: Integrity) {
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     let tree = LinkedTree(std::env::temp_dir().join(format!("sb-pe-{}-{n}", std::process::id())));
     let _ = std::fs::remove_dir_all(&tree.0);
     let outside = tree.0.join("outside");
     std::fs::create_dir_all(&outside).unwrap();
-    administrators_folder(&outside);
+    administrators_folder(&outside, integrity);
     std::fs::create_dir_all(tree.profile().join("AppData")).unwrap();
     junction(&tree.profile().join(r"AppData\Local"), &outside);
     let before = tree_state(&outside);
-    let location = socket_loc::for_profile(&tree.profile()).expect("the stand-in profile path is short enough");
+    let location =
+        socket_loc::for_profile(&tree.profile(), integrity).expect("the stand-in profile path is short enough");
     let user = Sid::current_user().unwrap();
 
     let made = userdir::ensure_socket_dir(&location, &user);

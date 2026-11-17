@@ -14,6 +14,15 @@ use crate::shim::{PROTOCOL_VIOLATION_CODE, closed_twice_message, make_handshake,
 
 /// What `logout` says when there is no agent to ask.
 pub const NO_SESSION: &str = "ssh-broker: no session to end.";
+
+/// What `logout` says to an administrator's unelevated process when there is no agent to ask: the agent
+/// is there, for elevated processes, and this one cannot reach it.
+pub fn filtered_no_session() -> String {
+    format!(
+        "ssh-broker: no session to end here: {}.",
+        crate::offer::text::FILTERED_LOOKS_ELSEWHERE
+    )
+}
 /// The exit code when the agent could not be reached for a reason other than not being there.
 pub const UNREACHABLE_CODE: i32 = 4;
 
@@ -67,7 +76,9 @@ pub fn logout_on<R: Read, W: Write>(rx: &mut R, tx: &mut W, err: &mut dyn Write)
 /// Connect with `connect`, run [`logout_on`], and hand its exit code to `exit` **while the
 /// connection is still open**. A connect that fails because there is no agent (`no_session` says
 /// so) is `NO_SESSION` and exit code 1; any other failure is reported with its cause and exits
-/// with [`UNREACHABLE_CODE`], since an agent may well serve this user.
+/// with [`UNREACHABLE_CODE`], since an agent may well serve this user. `no_session_line` is what the
+/// first says: [`NO_SESSION`], or [`filtered_no_session`] where the process cannot reach the agent that
+/// serves this account.
 ///
 /// A connection that ends before the agent's first byte means the agent is ending (its listener closed
 /// with this request queued) or gone: the session the user asked to end is ending already. It connects
@@ -79,6 +90,7 @@ pub fn logout_on<R: Read, W: Write>(rx: &mut R, tx: &mut W, err: &mut dyn Write)
 pub fn logout_at<R: Read, W: Write, T>(
     mut connect: impl FnMut() -> anyhow::Result<(R, W)>,
     no_session: impl Fn(&anyhow::Error) -> bool,
+    no_session_line: &str,
     err: &mut dyn Write,
     exit: impl FnOnce(i32) -> T,
 ) -> T {
@@ -87,7 +99,7 @@ pub fn logout_at<R: Read, W: Write, T>(
         let (mut rx, mut tx) = match connect() {
             Ok(connection) => connection,
             Err(e) if no_session(&e) => {
-                let _ = writeln!(err, "{NO_SESSION}");
+                let _ = writeln!(err, "{no_session_line}");
                 return exit(1);
             }
             Err(e) => {
@@ -118,7 +130,12 @@ pub fn run() -> anyhow::Result<()> {
     let no_session = |e: &anyhow::Error| {
         e.downcast_ref::<crate::userdir::NoProfile>().is_some() || crate::console_prompt::is_no_agent(e)
     };
-    logout_at(connect, no_session, &mut std::io::stderr(), |code| {
+    // An administrator's unelevated process looks in the plain folder, where its account has no agent.
+    let line = match crate::account::elevation() {
+        Ok(crate::account::Elevation::Filtered) => filtered_no_session(),
+        Ok(_) | Err(_) => NO_SESSION.to_owned(),
+    };
+    logout_at(connect, no_session, &line, &mut std::io::stderr(), |code| {
         std::process::exit(code)
     })
 }

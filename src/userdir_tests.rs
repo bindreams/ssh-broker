@@ -2,8 +2,21 @@
 //!
 //! Anything that needs a second account or elevation lives in `tests/user_isolation_windows.rs`.
 use super::*;
+use crate::account::{INTEGRITY_HIGH, INTEGRITY_LOW, INTEGRITY_MEDIUM, integrity_of};
+use crate::socket_loc::Integrity;
+use crate::test_support::{assert_elevated, own_token_at};
 use crate::winutil::own_token;
 use std::path::PathBuf;
+
+/// The integrity level of this process by the same rule the product uses, read here through the token's
+/// integrity level and not through `userdir`.
+fn integrity_of_this_process() -> Integrity {
+    if integrity_of(own_token().unwrap().0).unwrap() >= INTEGRITY_HIGH {
+        Integrity::High
+    } else {
+        Integrity::Medium
+    }
+}
 
 #[test]
 fn current_profile_matches_userprofile_of_this_process() {
@@ -20,7 +33,11 @@ fn current_socket_location_lies_inside_the_profile() {
     let profile = profile_dir_of_token(own_token().unwrap().0).unwrap();
     let loc = current_socket_location().unwrap();
     assert!(loc.path().starts_with(&profile));
-    assert!(loc.path().ends_with(r"AppData\Local\ssh-broker\agent.sock"));
+    let folder = match integrity_of_this_process() {
+        Integrity::Medium => "ssh-broker",
+        Integrity::High => "ssh-broker-elevated",
+    };
+    assert!(loc.path().ends_with(format!(r"AppData\Local\{folder}\agent.sock")));
 }
 
 #[test]
@@ -65,24 +82,27 @@ fn only_an_insufficient_buffer_with_no_length_is_no_profile() {
 fn for_profile_limit_agrees_with_unix_addr() {
     // Pins `MAX_SOCKET_PATH_BYTES` to what `socket2` accepts on this platform.
     let profile_named = |name: &str| PathBuf::from(format!(r"C:\Users\{name}"));
-    let fixed = crate::socket_loc::for_profile(&profile_named("x"))
-        .unwrap()
-        .path()
-        .as_os_str()
-        .len();
-    for bytes in 105..=109 {
-        let profile = profile_named(&"x".repeat(1 + bytes - fixed));
-        let location = crate::socket_loc::for_profile(&profile);
-        let path = profile
-            .join("AppData")
-            .join("Local")
-            .join(crate::socket_loc::SOCKET_DIR_NAME)
-            .join(crate::socket_loc::SOCKET_FILE_NAME);
-        assert_eq!(
-            location.is_ok(),
-            crate::afunix::unix_addr(&path).is_ok(),
-            "at {bytes} bytes"
-        );
+    let profile_named = &profile_named;
+    for integrity in [Integrity::Medium, Integrity::High] {
+        let fixed = crate::socket_loc::for_profile(&profile_named("x"), integrity)
+            .unwrap()
+            .path()
+            .as_os_str()
+            .len();
+        for bytes in 105..=109 {
+            let profile = profile_named(&"x".repeat(1 + bytes - fixed));
+            let location = crate::socket_loc::for_profile(&profile, integrity);
+            let path = profile
+                .join("AppData")
+                .join("Local")
+                .join(integrity.dir_name())
+                .join(crate::socket_loc::SOCKET_FILE_NAME);
+            assert_eq!(
+                location.is_ok(),
+                crate::afunix::unix_addr(&path).is_ok(),
+                "{integrity:?} at {bytes} bytes"
+            );
+        }
     }
 }
 
@@ -159,7 +179,7 @@ fn ensure_socket_dir_creates_a_dir_that_verifies() {
     let profile = TempProfile::new("create");
     let loc = profile.location();
     ensure_socket_dir(&loc, &me()).unwrap();
-    assert!(acl::verify_dir_acl(loc.dir(), &me()).unwrap());
+    assert!(acl::verify_dir_acl(loc.dir(), &me(), Integrity::Medium).unwrap());
 }
 
 #[test]
@@ -169,7 +189,7 @@ fn ensure_socket_dir_is_idempotent() {
     ensure_socket_dir(&loc, &me()).unwrap();
     std::fs::write(loc.lock_path(), "").unwrap();
     ensure_socket_dir(&loc, &me()).unwrap();
-    assert!(acl::verify_dir_acl(loc.dir(), &me()).unwrap());
+    assert!(acl::verify_dir_acl(loc.dir(), &me(), Integrity::Medium).unwrap());
     assert!(loc.lock_path().is_file(), "what was inside is left alone");
 }
 
@@ -184,7 +204,10 @@ fn ensure_socket_dir_refuses_a_dir_widened_with_an_everyone_ace_and_leaves_it() 
         .status()
         .unwrap();
     assert!(status.success());
-    assert!(!acl::verify_dir_acl(loc.dir(), &me()).unwrap(), "control: widened");
+    assert!(
+        !acl::verify_dir_acl(loc.dir(), &me(), Integrity::Medium).unwrap(),
+        "control: widened"
+    );
     let before = crate::test_support::tree_state(&profile.0);
 
     let err = format!("{:#}", ensure_socket_dir(&loc, &me()).unwrap_err());
@@ -275,7 +298,7 @@ fn ensure_socket_dir_creates_a_logs_dir_with_the_same_exact_acl() {
     let loc = profile.location();
     ensure_socket_dir(&loc, &me()).unwrap();
     assert!(loc.logs_dir().is_dir());
-    assert!(acl::verify_file_acl(&loc.logs_dir(), &me()).unwrap());
+    assert!(acl::verify_file_acl(&loc.logs_dir(), &me(), Integrity::Medium).unwrap());
     assert_eq!(trustees(&loc.logs_dir()), trustees(loc.dir()));
 }
 
@@ -285,7 +308,7 @@ fn ensure_socket_dir_gives_what_it_makes_inside_exactly_the_three_aces() {
     let loc = profile.location();
     ensure_socket_dir(&loc, &me()).unwrap();
     std::fs::write(loc.lock_path(), "").unwrap();
-    assert!(acl::verify_file_acl(&loc.lock_path(), &me()).unwrap());
+    assert!(acl::verify_file_acl(&loc.lock_path(), &me(), Integrity::Medium).unwrap());
     assert_eq!(trustees(&loc.lock_path()), trustees(loc.dir()));
 }
 
@@ -581,7 +604,7 @@ fn a_parent_swapped_for_a_link_while_the_walk_is_open_is_refused_naming_it() {
     junction(&local, &aside);
 
     let err = hold_and_confirm(&loc, parents, |local| {
-        acl::open_existing_private_dir(local, socket_loc::SOCKET_DIR_NAME)
+        acl::open_existing_private_dir(local, socket_loc::SOCKET_DIR_NAME, Integrity::Medium)
     })
     .err()
     .expect("the swapped Local was accepted");
@@ -601,7 +624,7 @@ fn confirm_after(tag: &str, disturb: impl FnOnce(&Path)) -> anyhow::Error {
     let parents = open_parents(&loc).unwrap();
     disturb(&profile.0);
     hold_and_confirm(&loc, parents, |local| {
-        acl::open_existing_private_dir(local, socket_loc::SOCKET_DIR_NAME)
+        acl::open_existing_private_dir(local, socket_loc::SOCKET_DIR_NAME, Integrity::Medium)
     })
     .err()
     .expect("the disturbed walk was accepted")
@@ -706,4 +729,96 @@ fn a_private_folder_that_denies_traversing_is_refused_for_its_acl_by_every_walk(
         assert!(text.contains("its ACL is not exactly"), "{name}: {text}");
         assert!(!text.contains("denied access to read its ACL"), "{name}: {text}");
     }
+}
+
+// the elevated folder -----
+
+#[test]
+fn a_token_below_high_gets_the_plain_folder() {
+    for level in [INTEGRITY_LOW, INTEGRITY_MEDIUM] {
+        let token = own_token_at(level);
+        let loc = socket_location_of_token(token.0).unwrap();
+        assert_eq!(loc.integrity(), Integrity::Medium, "level {level:#x}");
+        assert!(loc.dir().ends_with("ssh-broker"), "level {level:#x}");
+    }
+}
+
+/// Elevated (CI only): the level of the token alone chooses the folder.
+#[test]
+fn a_token_at_high_gets_the_elevated_folder() {
+    assert_elevated();
+    let token = own_token_at(INTEGRITY_HIGH);
+    let loc = socket_location_of_token(token.0).unwrap();
+    assert_eq!(loc.integrity(), Integrity::High);
+    assert!(loc.dir().ends_with("ssh-broker-elevated"));
+    assert_eq!(
+        current_socket_location().unwrap(),
+        loc,
+        "the process's own location is its token's"
+    );
+}
+
+/// Elevated (CI only): the folder is born labelled, and what is made inside it carries the label.
+#[test]
+fn the_elevated_folder_is_born_labelled_and_so_is_what_is_made_in_it() {
+    assert_elevated();
+    let profile = TempProfile::new("hb");
+    let loc = profile.location_at(Integrity::High);
+    let folder = open_socket_dir(&loc, &me()).unwrap();
+    assert!(acl::verify_dir_acl(loc.dir(), &me(), Integrity::High).unwrap());
+    assert!(folder.logs.is_ok(), "the log folder is made inside it");
+    assert!(acl::verify_file_acl(&loc.logs_dir(), &me(), Integrity::High).unwrap());
+    std::fs::write(loc.lock_path(), "").unwrap();
+    assert!(acl::verify_file_acl(&loc.lock_path(), &me(), Integrity::High).unwrap());
+    drop(folder);
+    open_socket_dir(&loc, &me()).expect("an existing labelled folder is accepted");
+    inspect_socket_dir(&loc, &me()).expect("and looked at");
+}
+
+/// An `ssh-broker-elevated` without the label is refused with the words every
+/// refusal uses, and left as it is: the label is never put on a folder that exists.
+#[test]
+fn an_elevated_folder_without_the_label_is_refused_and_left_as_it_is() {
+    let profile = TempProfile::new("hp");
+    let loc = profile.location_at(Integrity::High);
+    // The plain folder's own walk makes exactly the folder in question, except for its name and label.
+    let plain = profile.location_at(Integrity::Medium);
+    ensure_socket_dir(&plain, &me()).unwrap();
+    std::fs::rename(plain.dir(), loc.dir()).unwrap();
+    let before = crate::test_support::tree_state(&profile.0);
+
+    for walk in [open_socket_dir, inspect_socket_dir] {
+        let err = format!("{:#}", walk(&loc, &me()).err().expect("refused"));
+        assert!(err.contains(&loc.dir().display().to_string()), "{err}");
+        assert!(err.contains("High mandatory label"), "{err}");
+        assert!(
+            err.contains("left as it is: inspect it, remove it, and it is created again"),
+            "{err}"
+        );
+    }
+    assert_eq!(crate::test_support::tree_state(&profile.0), before, "left as it was");
+    assert!(
+        crate::test_support::dacl_sddl(loc.dir()).contains("D:P"),
+        "and still the DACL it had"
+    );
+}
+
+#[test]
+fn a_plain_folder_is_judged_as_it_was_and_asks_for_no_label() {
+    let profile = TempProfile::new("md-plain");
+    let loc = profile.location_at(Integrity::Medium);
+    ensure_socket_dir(&loc, &me()).unwrap();
+    inspect_socket_dir(&loc, &me()).unwrap();
+}
+
+/// The one walk serves both: a High location's walk goes through `AppData` and `Local` to the folder
+/// named for it, and a missing folder is the same `Missing` for the look-only caller.
+#[test]
+fn looking_for_the_elevated_folder_that_is_not_there_finds_it_missing() {
+    let profile = TempProfile::new("hn");
+    let loc = profile.location_at(Integrity::High);
+    let err = inspect_socket_dir(&loc, &me()).err().expect("nothing is there");
+    assert!(err.is::<acl::Missing>(), "{err:#}");
+    assert!(open_existing_socket_dir(&loc).unwrap().is_none());
+    assert!(!loc.dir().exists(), "nothing was made");
 }

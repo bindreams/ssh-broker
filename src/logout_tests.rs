@@ -53,6 +53,7 @@ fn logout_failing_to_connect(error: anyhow::Error) -> (i32, String) {
     let code = logout_at(
         || Err::<(Cursor<Vec<u8>>, Vec<u8>), _>(error.take().expect("asked to connect once")),
         |e| e.to_string() == "nothing listens",
+        NO_SESSION,
         &mut err,
         |code| code,
     );
@@ -93,6 +94,7 @@ fn logout_over(script: impl IntoIterator<Item = Result<Vec<u8>, &'static str>>) 
             }
         },
         |e| e.to_string() == "nothing listens",
+        NO_SESSION,
         &mut err,
         |code| code,
     );
@@ -233,9 +235,33 @@ fn the_connection_is_still_open_when_the_exit_code_is_handed_over() {
             Ok((rx, tx))
         },
         |_| false,
+        NO_SESSION,
         &mut err,
         |_code| !dropped.get(),
     );
     assert!(was_open, "the exit must happen while the socket is held");
     assert!(dropped.get(), "and the socket is released only afterwards");
+}
+
+#[test]
+fn an_administrators_unelevated_logout_with_no_agent_in_its_folder_is_told_why_in_one_sentence() {
+    let mut err = Vec::new();
+    let code = logout_at(
+        || Err::<(Cursor<Vec<u8>>, Vec<u8>), _>(anyhow::anyhow!("nothing listens")),
+        |e| e.to_string() == "nothing listens",
+        &filtered_no_session(),
+        &mut err,
+        |code| code,
+    );
+    let err = String::from_utf8(err).unwrap();
+    assert_eq!(code, 1, "still no session to end");
+    assert_eq!(err.trim_end().lines().count(), 1, "{err}");
+    assert!(err.contains("administrator"), "{err}");
+    assert!(err.contains("elevated"), "{err}");
+    assert!(err.contains("ordinary SSH login"), "{err}");
+}
+
+#[test]
+fn the_line_for_a_filtered_prompt_is_the_one_the_verify_row_gives() {
+    assert!(filtered_no_session().contains(crate::offer::text::FILTERED_LOOKS_ELSEWHERE));
 }
