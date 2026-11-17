@@ -72,7 +72,6 @@ C:\ProgramData\ssh-broker\ssh-broker.exe auto-login off [<account>]
 Both need **an elevated administrator shell**, and take the account to act on (the account running the command by default). Task Scheduler refuses a boot trigger to any token that is not an elevated administrator's, for a standard user and for a non-elevated administrator alike. The shell that ssh-broker hosts for an administrator is elevated, so over SSH as an administrator it can run there. Where a shell is not elevated (`whoami /groups` shows Medium integrity):
 
 - at the PC, open an elevated prompt (one UAC prompt);
-- over SSH as an administrator, run `ssh-broker.exe logout`, reconnect and press Ctrl+C at the password prompt for a plain shell: that shell runs under sshd's own token, which for an administrator is elevated (High integrity with `BUILTIN\Administrators` enabled; measured with key authentication on Windows 11 25H2 and the in-box OpenSSH 9.5p2);
 - a standard user cannot run it alone: an administrator runs it for them and types their password.
 
 `on` asks for the account's password, checks that Windows accepts it for a batch logon, registers the task, reads the registered task back and compares it with what it asked for (a mismatch deletes the task and fails), and starts the task once so the session begins now. The task runs the installed exe, in the administrator-only install directory, and its permissions let only SYSTEM and Administrators change it.
