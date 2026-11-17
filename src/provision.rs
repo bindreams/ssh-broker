@@ -480,10 +480,9 @@ mod imp {
         // Per user: this account's socket, its folder and file ACLs, and whether its agent
         // answers. `verify` reports on the account that runs it.
         let location = crate::userdir::current_socket_location();
-        match (
-            crate::acl::Sid::current_user(),
-            user_rows::account_rows(&crate::account::elevation()),
-        ) {
+        let account_rows = user_rows::account_rows(&crate::account::elevation());
+        let filtered = matches!(account_rows, user_rows::AccountRows::Filtered);
+        match (crate::acl::Sid::current_user(), account_rows) {
             (Ok(_), user_rows::AccountRows::Filtered) => {
                 rows.push(user_rows::socket_location_row(&location));
                 rows.push(user_rows::filtered_row());
