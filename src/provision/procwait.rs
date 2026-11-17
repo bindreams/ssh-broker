@@ -19,7 +19,6 @@ use windows::Win32::Foundation::{
     ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER, HANDLE, NTSTATUS, STATUS_PROCESS_IS_TERMINATING, STILL_ACTIVE,
     UNICODE_STRING, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
-use windows::Win32::Storage::FileSystem::{FILE_ID_INFO, FileIdInfo, GetFileInformationByHandleEx};
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
 };
@@ -31,7 +30,7 @@ use windows::Win32::System::Threading::{
 use windows::core::{HRESULT, PWSTR};
 
 use crate::acl::Sid;
-use crate::winutil::OwnedHandle;
+use crate::winutil::{FileId, OwnedHandle};
 
 /// How long a stopped agent may take to exit before the stop is reported as failed. The exit is
 /// the kernel's to finish and nothing here can hurry it, so this only bounds a process that never
@@ -384,13 +383,6 @@ fn process_names() -> anyhow::Result<Vec<(u32, String)>> {
     Ok(names)
 }
 
-/// What names a file whatever path it is reached by: the volume and the file's id on it.
-#[derive(Debug, Default, PartialEq, Eq)]
-pub struct FileId {
-    volume: u64,
-    file: [u8; 16],
-}
-
 /// The identity of the file at `path`.
 pub(crate) fn file_id(path: &Path) -> std::io::Result<FileId> {
     /// `FILE_READ_ATTRIBUTES`: enough to ask for the id, and needs no read access to the file.
@@ -401,21 +393,7 @@ pub(crate) fn file_id(path: &Path) -> std::io::Result<FileId> {
         .access_mode(FILE_READ_ATTRIBUTES)
         .share_mode(SHARE_ALL)
         .open(path)?;
-    let mut info = FILE_ID_INFO::default();
-    // SAFETY: the handle is open for the call; `info` is the size the call is told.
-    unsafe {
-        GetFileInformationByHandleEx(
-            HANDLE(file.as_raw_handle()),
-            FileIdInfo,
-            (&raw mut info).cast(),
-            size_of::<FILE_ID_INFO>() as u32,
-        )
-    }
-    .map_err(std::io::Error::from)?;
-    Ok(FileId {
-        volume: info.VolumeSerialNumber,
-        file: info.FileId.Identifier,
-    })
+    FileId::of_handle(HANDLE(file.as_raw_handle()))
 }
 
 /// Open the process `pid` for waiting, if it is running `image`.

@@ -85,15 +85,25 @@ agent, with the folder named, and removing it restores them. A profile
 path that would push the socket past the 107-byte AF_UNIX limit is an error, not a reason to use
 another location (`socket_loc::SocketLocationError::TooLong`).
 
-The walk also pins what it opens. `AppData`, `Local`, `ssh-broker` and `logs` are opened without
+The walk holds the private folder, and confirms the path to it. `ssh-broker` is opened without
 `FILE_SHARE_DELETE` (with `FILE_TRAVERSE`: sharing is judged only for an open that asks for data,
-execute or delete access, so a handle with read-control and read-attributes alone pins nothing), and
-`userdir::SocketDir` keeps all of them for as long as it is held. While it is held nobody can rename
-or remove them, so the location's path names the folders held and the by-path uses of the folder
-below reach them and no others. A process of the same account can otherwise rename the folder aside
-and put one of its own in its place. If another program holds a folder of the walk open for deleting
-or renaming when a walk opens it, the walk is refused with that said (`offer::text::folder_held`): no
-retry, since a holder that never lets go would hang the login. The next login is brokered again.
+execute or delete access, so a handle with read-control and read-attributes alone holds nothing), and
+`userdir::SocketDir` keeps it, and `logs`, for as long as it is held. While it is held nobody can
+rename or remove it, and nobody can rename or remove `Local` or `AppData` either: Windows does not
+rename a directory with an open descendant. `AppData` and `Local` are opened only to read their ACL
+and attributes, sharing everything, which takes no part in a sharing check, so other programs use them
+as usual. With the private folder held, the walk opens `<profile>\AppData` and
+`<profile>\AppData\Local` once more, each by its full path, the path `bind` and `connect` resolve,
+without following a link, and refuses unless each is the folder the walk went through (the same
+volume and 128-bit file id): a process of the same account that renamed `Local` aside and put a link
+or a folder of its own in its place while the walk was opening it is caught there, and after the
+check the location's path names the folders held. What may be written inside the folder, or to its
+attributes, is decided by its ACL (and, for the elevated agent's folder, by the label a later change
+adds), not by the hold. This is a stated limit: if another program holds
+the broker's own folder open in a way that keeps the broker from using it (with the right to delete
+or rename it, or without letting others read it) when a walk opens it, the walk is refused with that
+said (`offer::text::folder_held`): no retry, since a holder that never lets go would hang the login.
+The next login, once the holder has let go, is brokered again.
 There is one way to connect to an agent: `SocketDir::connect`, through the folders held
 (`afunix::connect` is crate-private). A caller that connects walks first and keeps the `SocketDir`
 over the connect; a shim connects only if its private folder was accepted. A test whose subject is

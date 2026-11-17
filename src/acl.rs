@@ -67,8 +67,8 @@ mod admin_file;
 pub use admin_file::{admin_only_file_problem, ensure_admin_only_file};
 mod private_dir;
 pub use private_dir::{
-    DirHandle, Missing, Refused, ensure_private_dir, open_dir, open_existing_file, open_existing_private_dir,
-    open_log_file, open_private_dir, open_root,
+    DirHandle, Missing, Refused, confirm_dir, ensure_private_dir, open_dir, open_existing_file,
+    open_existing_private_dir, open_log_file, open_private_dir, open_root,
 };
 
 /// ACCESS_ALLOWED_ACE_TYPE (winnt.h) — stored raw in `ACE_HEADER.AceType` (a `u8`).
@@ -626,7 +626,7 @@ struct Made {
 /// deleting and renaming it. A folder held without `FILE_SHARE_DELETE` cannot be renamed or removed
 /// by anyone, so its name stays the folder's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Sharing {
+pub enum Sharing {
     All,
     NotDelete,
 }
@@ -768,7 +768,8 @@ enum OpenOutcome {
     /// A file is at the name of a directory that was asked for.
     NotADirectory,
     /// Another handle on the object has an access that the sharing of this open does not allow: for a
-    /// folder opened without `FILE_SHARE_DELETE`, another program holds it for deleting or renaming.
+    /// folder held (opened without `FILE_SHARE_DELETE`), another program holds it with the right to delete
+    /// or rename it, or without letting others read it.
     SharingViolation,
     Failed(NTSTATUS),
 }

@@ -774,7 +774,11 @@ fn ensure_private_dir_says_so_when_the_folders_security_cannot_be_read() {
     );
     let root = open_root(&parent.0).unwrap();
 
-    let err = without_privileges(|| ensure_private_dir(&root, "ssh-broker", &me_sid).err().expect("refused"));
+    let err = without_privileges(|| {
+        ensure_private_dir(&root, "ssh-broker", &me_sid, Sharing::NotDelete)
+            .err()
+            .expect("refused")
+    });
 
     assert!(err.is::<Refused>(), "{err:#}");
     let text = format!("{err:#}");
@@ -786,7 +790,11 @@ fn ensure_private_dir_says_so_when_the_folders_security_cannot_be_read() {
         "the creating path says what else may be wrong: {text}"
     );
 
-    let err = without_privileges(|| open_private_dir(&root, "ssh-broker", &me_sid).err().expect("refused"));
+    let err = without_privileges(|| {
+        open_private_dir(&root, "ssh-broker", &me_sid, Sharing::NotDelete)
+            .err()
+            .expect("refused")
+    });
     let text = format!("{err:#}");
     assert!(text.contains("denied access to read its ACL"), "{text}");
     assert!(!text.contains("make"), "a look never makes anything: {text}");
@@ -1014,7 +1022,7 @@ fn ensure_private_dir_refuses_a_foreign_owner_and_leaves_the_folder() {
     let before = owner_of(&dir);
     let err = format!(
         "{:#}",
-        ensure_private_dir(&handle, "d", &me)
+        ensure_private_dir(&handle, "d", &me, Sharing::NotDelete)
             .err()
             .expect("a Users owner is refused")
     );
@@ -1025,5 +1033,5 @@ fn ensure_private_dir_refuses_a_foreign_owner_and_leaves_the_folder() {
         &dir,
         &private_with_owner(&Sid::well_known(WellKnown::Administrators).unwrap()),
     );
-    ensure_private_dir(&handle, "d", &me).expect("control: an Administrators owner is accepted");
+    ensure_private_dir(&handle, "d", &me, Sharing::NotDelete).expect("control: an Administrators owner is accepted");
 }

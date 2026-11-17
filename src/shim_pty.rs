@@ -267,7 +267,6 @@ fn connect_or_rescue(
         exec: is_command,
         folder,
         connect: &connection,
-        log_failure,
     };
     Ok(match rescue.rescue(&absent, stderr) {
         Rescued::Connected { socket, modes } => Connected::Agent {

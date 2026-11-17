@@ -36,13 +36,13 @@ use super::{
     descriptor_from_sddl, dir_policy, file_attributes, file_information, nt_create, nt_path, owner_acl_problem,
     private_dir_dacl_sddl, status_error,
 };
-use crate::winutil::OwnedHandle;
+use crate::winutil::{FileId, OwnedHandle};
 
 /// The rights a folder handle holds: to read its ACL and attributes, which is what verifying it takes.
 /// Creating inside it is checked against the folder's own ACL, not against the handle.
 const DIR_ACCESS: u32 = READ_CONTROL.0 | FILE_READ_ATTRIBUTES.0;
 
-/// [`DIR_ACCESS`] and the right to traverse, for a folder that is held. Sharing is judged only for an
+/// [`DIR_ACCESS`] and the right to traverse, for the one folder that is held. Sharing is judged only for an
 /// open that asks for data, execute or delete access, so a handle with the rights above alone leaves
 /// the folder free to be renamed whatever it shares (measured); traversing is the one that asks for
 /// nothing a folder of the user's own does not give.
@@ -118,8 +118,8 @@ struct Request<'a> {
     /// system's error. Only a caller that can say what the denial means gives one.
     denied: Option<String>,
     access: u32,
-    /// A folder is held without `FILE_SHARE_DELETE`, so that it cannot be renamed or removed for as
-    /// long as it is held; a file shares everything.
+    /// Everything, except for the folder that is held (see [`Request::held`]): a handle that shares
+    /// everything takes no part in a sharing check.
     sharing: Sharing,
     disposition: NTCREATEFILE_CREATE_DISPOSITION,
     options: u32,
@@ -130,18 +130,28 @@ struct Request<'a> {
 }
 
 impl<'a> Request<'a> {
-    /// An existing directory, opened as itself.
+    /// An existing directory, opened as itself to read its ACL and attributes, sharing everything.
     fn directory(purpose: &'a str, not_a_directory: &'a str) -> Self {
         Request {
             purpose,
             not_a_directory,
             denied: None,
-            access: HELD_DIR_ACCESS,
-            sharing: Sharing::NotDelete,
+            access: DIR_ACCESS,
+            sharing: Sharing::All,
             disposition: FILE_OPEN,
             options: FILE_DIRECTORY_FILE.0 | FILE_OPEN_REPARSE_POINT.0,
             descriptor: None,
             sole_name: false,
+        }
+    }
+
+    /// The folder is held: opened without `FILE_SHARE_DELETE`, so that it cannot be renamed or removed
+    /// for as long as the handle lives.
+    fn held(self) -> Self {
+        Request {
+            access: HELD_DIR_ACCESS,
+            sharing: Sharing::NotDelete,
+            ..self
         }
     }
 
@@ -160,17 +170,23 @@ impl<'a> Request<'a> {
 }
 
 /// Open the profile directory `dir` as the root of a walk. A link at `dir` or above it is followed
-/// (see the module doc for why); every name below it is not. The profile directory is not pinned:
-/// Windows owns it (see the module doc), and every folder below it is held without
-/// `FILE_SHARE_DELETE`.
+/// (see the module doc for why); every name below it is not. The profile directory is not held:
+/// Windows owns it (see the module doc).
 pub fn open_root(dir: &Path) -> anyhow::Result<DirHandle> {
-    let name = nt_path(dir)?;
     let request = Request {
         options: FILE_DIRECTORY_FILE.0,
-        access: DIR_ACCESS,
-        sharing: Sharing::All,
         ..Request::directory("as the profile directory", PROFILE_AS_IT_IS)
     };
+    let handle = open_by_path(dir, &request)?;
+    Ok(DirHandle {
+        handle,
+        path: dir.to_path_buf(),
+    })
+}
+
+/// Open `path` by the whole of it, as `request` says, and judge the result.
+fn open_by_path(path: &Path, request: &Request) -> anyhow::Result<OwnedHandle> {
+    let name = nt_path(path)?;
     let made = nt_create(
         None,
         &name,
@@ -180,26 +196,52 @@ pub fn open_root(dir: &Path) -> anyhow::Result<DirHandle> {
         request.options,
         None,
     )?;
-    let handle = judge(made, dir, &request)?;
-    Ok(DirHandle {
-        handle,
-        path: dir.to_path_buf(),
-    })
+    judge(made, path, request)
+}
+
+/// Confirm that `path`, resolved as a bind or a connect by a path through it resolves it, leads to
+/// `held`. The folder is opened by `path`, its last name not followed if it is a link, and refused if
+/// it is a link or is not the folder `held` is open on (not the same volume and 128-bit file id): a
+/// folder swapped for a link or another one while `held` was being opened is caught here. The handle
+/// takes no part in a sharing check (`FILE_READ_ATTRIBUTES`, sharing everything) and is closed on
+/// return.
+pub fn confirm_dir(path: &Path, held: &DirHandle) -> anyhow::Result<()> {
+    let request = Request {
+        access: FILE_READ_ATTRIBUTES.0,
+        ..Request::directory("on the way to the private folder", PROFILE_AS_IT_IS)
+    };
+    let seen = open_by_path(path, &request)?;
+    let is_link = file_attributes(seen.0).with_context(|| format!("read the attributes of {}", path.display()))?
+        & FILE_ATTRIBUTE_REPARSE_POINT.0
+        != 0;
+    let identity =
+        |handle: HANDLE| FileId::of_handle(handle).with_context(|| format!("read the identity of {}", path.display()));
+    if is_link || identity(seen.0)? != identity(held.raw())? {
+        return Err(Refused(format!(
+            "{} cannot be used {}: it was replaced by a link or another folder while it was being opened. \
+             Nothing is read or written through it",
+            path.display(),
+            request.purpose
+        ))
+        .into());
+    }
+    Ok(())
 }
 
 /// Open the existing directory `name` under `parent` that the profile has, which is not made if it is
-/// missing: `AppData` and `Local`. A link is refused. A file there makes the profile unusable.
+/// missing: `AppData` and `Local`. A link is refused. A file there makes the profile unusable. The
+/// handle shares everything and takes part in no sharing check.
 pub fn open_dir(parent: &DirHandle, name: &str) -> anyhow::Result<DirHandle> {
     let request = Request::directory("on the way to the private folder", PROFILE_AS_IT_IS);
     let (handle, path) = open_child(parent, name, &request)?;
     Ok(DirHandle { handle, path })
 }
 
-/// [`open_dir`] for a folder this code makes (`ssh-broker`), when only what is in it matters: it is
-/// not made if missing and its owner and ACL are not judged. A file there is removed and a folder is
-/// made again.
+/// [`open_dir`] for the private folder (`ssh-broker`), when only what is in it matters: it is not made
+/// if missing and its owner and ACL are not judged. A file there is removed and a folder is made
+/// again. The folder is held (see [`ensure_private_dir`]).
 pub fn open_existing_private_dir(parent: &DirHandle, name: &str) -> anyhow::Result<DirHandle> {
-    let request = Request::directory("as the private folder", MADE_AGAIN);
+    let request = Request::directory("as the private folder", MADE_AGAIN).held();
     let (handle, path) = open_child(parent, name, &request)?;
     Ok(DirHandle { handle, path })
 }
@@ -208,17 +250,27 @@ pub fn open_existing_private_dir(parent: &DirHandle, name: &str) -> anyhow::Resu
 /// descriptor; an existing one must be a real directory whose owner is in {user, SYSTEM,
 /// Administrators} and whose ACL is exactly the private one. One that is not is refused and left
 /// untouched. Nothing existing is modified.
-pub fn ensure_private_dir(parent: &DirHandle, name: &str, user: &Sid) -> anyhow::Result<DirHandle> {
-    private_dir(parent, name, user, true)
+///
+/// With [`Sharing::NotDelete`] the folder is held: nobody can rename or remove it while the handle
+/// lives, and a sharing violation on the open is a [`Refused`] that says another program holds the
+/// folder open. With [`Sharing::All`] the handle takes no part in sharing checks.
+pub fn ensure_private_dir(parent: &DirHandle, name: &str, user: &Sid, sharing: Sharing) -> anyhow::Result<DirHandle> {
+    private_dir(parent, name, user, true, sharing)
 }
 
 /// [`ensure_private_dir`] for a caller that only looks (`verify`): the same open and the same
 /// judgement, and a folder that is not there is [`Missing`] and is not made.
-pub fn open_private_dir(parent: &DirHandle, name: &str, user: &Sid) -> anyhow::Result<DirHandle> {
-    private_dir(parent, name, user, false)
+pub fn open_private_dir(parent: &DirHandle, name: &str, user: &Sid, sharing: Sharing) -> anyhow::Result<DirHandle> {
+    private_dir(parent, name, user, false, sharing)
 }
 
-fn private_dir(parent: &DirHandle, name: &str, user: &Sid, create: bool) -> anyhow::Result<DirHandle> {
+fn private_dir(
+    parent: &DirHandle,
+    name: &str,
+    user: &Sid,
+    create: bool,
+    sharing: Sharing,
+) -> anyhow::Result<DirHandle> {
     let descriptor = if create {
         Some(descriptor_from_sddl(&private_dir_dacl_sddl(user)?)?)
     } else {
@@ -240,6 +292,10 @@ fn private_dir(parent: &DirHandle, name: &str, user: &Sid, create: bool) -> anyh
         disposition: if create { FILE_OPEN_IF } else { FILE_OPEN },
         descriptor: descriptor.as_ref().map(|descriptor| descriptor.0),
         ..Request::directory("as the private folder", MADE_AGAIN)
+    };
+    let request = match sharing {
+        Sharing::All => request,
+        Sharing::NotDelete => request.held(),
     };
     let (handle, path) = open_child(parent, name, &request)?;
 

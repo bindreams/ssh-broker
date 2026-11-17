@@ -428,56 +428,52 @@ fn a_link_at_any_level_is_refused_and_nothing_outside_is_made_or_changed() {
     }
 }
 
-// The pin -----
+// The hold -----
 
 /// The OS error of renaming `from` to `to` in this process, or `None` if it worked.
 fn rename_error(from: &Path, to: &Path) -> Option<i32> {
     std::fs::rename(from, to).err().map(|e| e.raw_os_error().unwrap_or(-1))
 }
 
-/// The folders of the walk, from the one nearest the profile directory.
-fn walked_folders(loc: &SocketLocation) -> [PathBuf; 4] {
+/// The folders of the walk that are held, or whose open descendant holds them, from the one nearest
+/// the profile directory: `AppData`, `Local` and the private folder.
+fn held_folders(loc: &SocketLocation) -> [PathBuf; 3] {
     let local = loc.dir().parent().unwrap().to_path_buf();
-    [
-        local.parent().unwrap().to_path_buf(),
-        local,
-        loc.dir().to_path_buf(),
-        loc.logs_dir(),
-    ]
+    [local.parent().unwrap().to_path_buf(), local, loc.dir().to_path_buf()]
 }
 
-/// While a walk's folders are held, none of them can be renamed or removed by anyone else: the path
-/// then names the folders held. Once they are dropped, they can.
-fn a_held_walk_pins_every_folder_of_it(tag: &str, walk: impl Fn(&SocketLocation, &Sid) -> anyhow::Result<SocketDir>) {
+/// While a walk's `SocketDir` is held the private folder cannot be renamed (a sharing violation) and
+/// neither can `Local` or `AppData` (access denied: Windows does not rename a directory with an open
+/// descendant), so the path names the folders held. Once it is dropped they can be.
+fn a_held_walk_holds_the_private_folder_and_through_it_its_parents(
+    tag: &str,
+    walk: impl Fn(&SocketLocation, &Sid) -> anyhow::Result<SocketDir>,
+) {
+    const ACCESS_DENIED: i32 = 5;
     const SHARING_VIOLATION: i32 = 32;
     let profile = TempProfile::new(tag);
     let loc = profile.location();
     ensure_socket_dir(&loc, &me()).unwrap();
     let folders = walk(&loc, &me()).unwrap();
 
-    for folder in walked_folders(&loc) {
+    let [app_data, local, private] = held_folders(&loc);
+    for (folder, code) in [
+        (&private, SHARING_VIOLATION),
+        (&local, ACCESS_DENIED),
+        (&app_data, ACCESS_DENIED),
+    ] {
         let aside = folder.with_file_name("aside");
-        let error = rename_error(&folder, &aside);
-        assert!(
-            error.is_some(),
-            "{} was renamed while the walk held it",
+        assert_eq!(
+            rename_error(folder, &aside),
+            Some(code),
+            "{} while the walk holds the private folder",
             folder.display()
         );
         assert!(!aside.exists(), "{} moved", folder.display());
     }
-    // The ones the walk opened itself are refused for sharing, which is what stops a swap.
-    for folder in &walked_folders(&loc)[1..] {
-        let aside = folder.with_file_name("aside");
-        assert_eq!(
-            rename_error(folder, &aside),
-            Some(SHARING_VIOLATION),
-            "{}",
-            folder.display()
-        );
-    }
 
     drop(folders);
-    for folder in walked_folders(&loc).iter().rev() {
+    for folder in [&private, &local, &app_data] {
         let aside = folder.with_file_name("aside");
         assert_eq!(
             rename_error(folder, &aside),
@@ -490,13 +486,13 @@ fn a_held_walk_pins_every_folder_of_it(tag: &str, walk: impl Fn(&SocketLocation,
 }
 
 #[test]
-fn a_held_making_walk_pins_every_folder_of_it() {
-    a_held_walk_pins_every_folder_of_it("pin-make", open_socket_dir);
+fn a_held_making_walk_holds_the_private_folder_and_through_it_its_parents() {
+    a_held_walk_holds_the_private_folder_and_through_it_its_parents("hold-make", open_socket_dir);
 }
 
 #[test]
-fn a_held_looking_walk_pins_every_folder_of_it() {
-    a_held_walk_pins_every_folder_of_it("pin-look", inspect_socket_dir);
+fn a_held_looking_walk_holds_the_private_folder_and_through_it_its_parents() {
+    a_held_walk_holds_the_private_folder_and_through_it_its_parents("hold-look", inspect_socket_dir);
 }
 
 /// Open `dir` with delete access, as a program that is about to delete or rename it does, and
@@ -513,30 +509,51 @@ fn hold_for_deletion(dir: &Path) -> std::fs::File {
         .unwrap_or_else(|e| panic!("hold {} for deletion: {e}", dir.display()))
 }
 
-/// Stated limit 6: another program that holds `AppData` or `Local` open for deletion or renaming
-/// makes the walk refuse, in the words of the limit and with the folder named. It does not wait for
-/// the holder: the call returns while the holder still holds.
+/// The walk's opens of `AppData` and `Local` take no part in sharing checks, so a program that holds
+/// either one open with the right to delete it does not stop the walk (and the walk does not stop it).
 #[test]
-fn a_folder_held_open_for_deletion_refuses_the_walk_with_the_limit_s_sentence() {
+fn a_parent_held_open_for_deletion_does_not_stop_the_walk() {
     for (held, which) in [(0, "AppData"), (1, "Local")] {
         for walk in [open_socket_dir, inspect_socket_dir] {
-            let profile = TempProfile::new("held");
+            let profile = TempProfile::new("held-parent");
             let loc = profile.location();
-            let folder = walked_folders(&loc)[held].clone();
-            let holder = hold_for_deletion(&folder);
+            ensure_socket_dir(&loc, &me()).unwrap();
+            let holder = hold_for_deletion(&held_folders(&loc)[held]);
 
-            let err = walk(&loc, &me())
-                .err()
-                .unwrap_or_else(|| panic!("{which} was held and the walk went on"));
+            let walked = walk(&loc, &me());
 
-            let text = format!("{err:#}");
-            assert!(err.root_cause().is::<acl::Refused>(), "{which}: {text}");
-            assert!(text.contains(&folder.display().to_string()), "{which}: {text}");
             assert!(
-                text.contains("another program is deleting or renaming it"),
-                "{which}: {text}"
+                walked.is_ok(),
+                "{which} was held open for deletion and the walk failed: {:#}",
+                walked.err().unwrap()
             );
             drop(holder);
         }
     }
+}
+
+/// The confirmation catches a parent swapped while the walk was between its two halves: the folders
+/// are opened, `Local` is renamed aside and a junction to it put in its place, and the walk is finished.
+/// It refuses, naming `Local`.
+#[test]
+fn a_parent_swapped_for_a_link_while_the_walk_is_open_is_refused_naming_it() {
+    let profile = TempProfile::new("swap");
+    let loc = profile.location();
+    ensure_socket_dir(&loc, &me()).unwrap();
+    let parents = open_parents(&loc).unwrap();
+    let local = held_folders(&loc)[1].clone();
+    let aside = local.with_file_name("Local.aside");
+    std::fs::rename(&local, &aside).unwrap();
+    junction(&local, &aside);
+
+    let err = hold_and_confirm(&loc, parents, |local| {
+        acl::open_existing_private_dir(local, socket_loc::SOCKET_DIR_NAME)
+    })
+    .err()
+    .expect("the swapped Local was accepted");
+
+    assert!(err.root_cause().is::<acl::Refused>(), "{err:#}");
+    let text = format!("{err:#}");
+    assert!(text.contains(&local.display().to_string()), "{text}");
+    assert!(text.contains("replaced by a link or another folder"), "{text}");
 }

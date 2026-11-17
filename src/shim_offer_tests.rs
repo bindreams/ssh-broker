@@ -144,18 +144,18 @@ fn a_refused_logs_folder_alone_does_not_make_the_private_folder_refused() {
 }
 
 #[test]
-fn an_account_that_cannot_be_told_is_logged_and_the_folder_is_not_walked() {
+fn an_account_that_cannot_be_told_is_not_walked_and_the_cause_is_the_logs_failure() {
     let profile = TempProfile::new("rs-nosid");
-    let (log, folder) = crate::test_support::logged(|| {
-        Folder::in_location(Ok(profile.location()), Err(anyhow::anyhow!("the token cannot be read")))
-    });
+    let folder = Folder::in_location(Ok(profile.location()), Err(anyhow::anyhow!("the token cannot be read")));
     assert!(folder.refusal().is_none());
-    assert!(log.contains("the token cannot be read"), "{log}");
+    let why = format!("{:#}", folder.logs().err().expect("nothing was walked"));
+    assert!(why.contains("the token cannot be read"), "{why}");
+    assert!(folder.connect().is_err(), "nothing to connect through");
 }
 
 /// What the rescue of a login for `location` shows, and how it goes on. The rescue is handed the
-/// folder the shim's one walk found. `log_failure` is why the shim has no log.
-fn rescued(location: SocketLocation, exec: bool, log_failure: Option<&str>) -> (Rescued, String) {
+/// folder the shim's one walk found.
+fn rescued(location: SocketLocation, exec: bool) -> (Rescued, String) {
     let folder = folder_at(location);
     let connect = Err(anyhow::anyhow!("a connect that failed for no OS reason"));
     let mut shown = Vec::new();
@@ -164,7 +164,6 @@ fn rescued(location: SocketLocation, exec: bool, log_failure: Option<&str>) -> (
             exec,
             folder: &folder,
             connect: &connect,
-            log_failure,
         },
         &mut shown,
     );
@@ -172,7 +171,7 @@ fn rescued(location: SocketLocation, exec: bool, log_failure: Option<&str>) -> (
 }
 
 fn rescued_interactively(location: SocketLocation) -> (Rescued, String) {
-    rescued(location, false, None)
+    rescued(location, false)
 }
 
 #[test]
@@ -456,7 +455,7 @@ fn an_interactive_login_whose_folder_is_refused_is_told_on_the_terminal_and_gets
     let (profile, err) = refusal_of_a_junction_at_local("refused-pty");
     let mut shown = Vec::new();
 
-    let rescued = starting_failed(&err, false, None, &mut shown);
+    let rescued = starting_failed(&err, &mut shown);
 
     assert!(matches!(rescued, Rescued::Plain));
     let shown = String::from_utf8(shown).unwrap();
@@ -476,7 +475,7 @@ fn a_folder_that_fails_with_a_system_error_after_it_was_judged_is_told_in_the_sa
     let err = anyhow::Error::new(FolderFailed(anyhow::Error::new(denied).context("open p/AppData/Local")));
     let mut shown = Vec::new();
 
-    let rescued = starting_failed(&err, false, None, &mut shown);
+    let rescued = starting_failed(&err, &mut shown);
 
     assert!(matches!(rescued, Rescued::Plain));
     let shown = String::from_utf8(shown).unwrap();
@@ -484,44 +483,22 @@ fn a_folder_that_fails_with_a_system_error_after_it_was_judged_is_told_in_the_sa
     assert!(shown.contains("open p/AppData/Local"), "{shown:?}");
 }
 
-/// Why the log of a login cannot be set up in the state of `profile`: what the shim keeps as its
-/// `log_failure`.
-fn log_failure_of(profile: &crate::test_support::TempProfile) -> String {
-    let folder = Folder::in_location(Ok(profile.location()), Ok(me()));
-    format!("{:#}", folder.logs().err().expect("the log cannot be set up"))
-}
-
 #[test]
-fn a_login_with_a_command_is_told_of_a_refused_folder_the_log_did_not_find() {
-    // The folder became unusable after the log was set up (or the log failed for another reason).
+fn a_login_with_a_command_is_told_of_a_folder_refused_after_the_log_was_set_up() {
+    // The log's walk accepted the folder, so no line of the fail-open says what a later look found.
     let (_profile, err) = refusal_of_a_junction_at_local("refused-exec");
-    for log_failure in [None, Some("the disk is full")] {
-        let mut shown = Vec::new();
-
-        let rescued = starting_failed(&err, true, log_failure, &mut shown);
-
-        assert!(matches!(rescued, Rescued::Plain));
-        assert!(
-            String::from_utf8(shown).unwrap().contains("no session is offered"),
-            "{log_failure:?}"
-        );
-    }
-}
-
-#[test]
-fn a_login_with_a_command_is_not_told_twice_what_the_log_already_says() {
-    let (profile, err) = refusal_of_a_junction_at_local("refused-twice");
-    let log_failure = log_failure_of(&profile);
     let mut shown = Vec::new();
 
-    starting_failed(&err, true, Some(&log_failure), &mut shown);
+    let rescued = starting_failed(&err, &mut shown);
 
-    assert!(shown.is_empty(), "{}", String::from_utf8_lossy(&shown));
+    assert!(matches!(rescued, Rescued::Plain));
+    assert!(String::from_utf8(shown).unwrap().contains("no session is offered"));
 }
 
 #[test]
-fn the_rescue_tells_a_login_with_a_command_of_the_refusal_the_shims_walk_found() {
-    // The shim walks once, at the link: the rescue is told what that walk found.
+fn the_rescue_leaves_a_login_with_a_command_to_the_fail_open_line_that_carries_the_log_s_failure() {
+    // The shim walks once, at the link: the log and the folder have the same cause, and the fail-open
+    // line says it (`shim_pty`), so the rescue says nothing.
     let profile = TempProfile::new("rs-exec");
     let local = profile.0.join(r"AppData\Local");
     let elsewhere = profile.0.join("elsewhere");
@@ -529,26 +506,7 @@ fn the_rescue_tells_a_login_with_a_command_of_the_refusal_the_shims_walk_found()
     std::fs::remove_dir(&local).unwrap();
     junction(&local, &elsewhere);
 
-    for log_failure in [None, Some("the disk is full")] {
-        let (rescued, shown) = rescued(profile.location(), true, log_failure);
-
-        assert!(matches!(rescued, Rescued::Plain));
-        assert!(shown.contains("no session is offered"), "{log_failure:?}: {shown:?}");
-        assert!(shown.contains(&local.display().to_string()), "{shown:?}");
-    }
-}
-
-#[test]
-fn the_rescue_does_not_repeat_to_a_login_with_a_command_what_the_log_already_says() {
-    let profile = TempProfile::new("rs-twice");
-    let local = profile.0.join(r"AppData\Local");
-    let elsewhere = profile.0.join("elsewhere");
-    std::fs::create_dir(&elsewhere).unwrap();
-    std::fs::remove_dir(&local).unwrap();
-    junction(&local, &elsewhere);
-    let log_failure = log_failure_of(&profile);
-
-    let (rescued, shown) = rescued(profile.location(), true, Some(&log_failure));
+    let (rescued, shown) = rescued(profile.location(), true);
 
     assert!(matches!(rescued, Rescued::Plain));
     assert!(shown.is_empty(), "{shown:?}");
@@ -582,7 +540,7 @@ fn a_lock_file_held_without_sharing_is_not_a_failure_of_the_folder() {
     assert!(!err.is::<FolderFailed>(), "{err:#}");
     let mut shown = Vec::new();
 
-    starting_failed(&err, false, None, &mut shown);
+    starting_failed(&err, &mut shown);
 
     assert!(shown.is_empty(), "{}", String::from_utf8_lossy(&shown));
 }
@@ -599,9 +557,8 @@ fn a_lock_file_with_another_name_is_a_failure_of_the_folder() {
 #[test]
 fn a_failure_that_is_not_a_refusal_is_logged_and_not_shown_to_an_interactive_login() {
     let mut shown = Vec::new();
-    let (log, rescued) = crate::test_support::logged(|| {
-        starting_failed(&anyhow::anyhow!("the process list failed"), false, None, &mut shown)
-    });
+    let (log, rescued) =
+        crate::test_support::logged(|| starting_failed(&anyhow::anyhow!("the process list failed"), &mut shown));
     assert!(matches!(rescued, Rescued::Plain));
     assert!(shown.is_empty());
     assert!(log.contains("the process list failed"), "{log}");

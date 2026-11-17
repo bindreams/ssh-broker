@@ -828,6 +828,46 @@ fn a_second_connection_that_ends_without_a_byte_is_a_protocol_violation_not_a_re
     );
 }
 
+#[test]
+fn a_folder_that_was_missing_at_the_first_act_is_connected_through_when_it_appears_and_counts_the_closes() {
+    // The shim's walk found no `AppData` and held nothing. The folders appear, and an agent that keeps
+    // hanging up without a byte listens in them: the connect looks again and goes through them, so the
+    // second close is a protocol violation and not a reason to connect again.
+    let profile = crate::test_support::TempProfile::new("hangup-late");
+    let location = profile.location();
+    std::fs::remove_dir_all(profile.0.join("AppData")).unwrap();
+    let folder = folder_of(Ok(location.clone()));
+    assert!(folder.refusal().is_none(), "no folder is not a refused one");
+    std::fs::create_dir_all(profile.0.join(r"AppData\Local")).unwrap();
+    crate::userdir::ensure_socket_dir(&location, &Sid::current_user().unwrap()).unwrap();
+    let (finished, agent) = agent_that_always_hangs_up(crate::afunix::Listener::bind(location.path()).unwrap(), 2);
+    let mut stderr = Vec::new();
+    let mut attempts = 0;
+
+    let relayed = super::try_relay_with(
+        &folder,
+        &None,
+        &mut stderr,
+        None,
+        std::io::empty(),
+        &mut Never,
+        &mut |_conn, _modes, _command| {
+            attempts += 1;
+            assert!(
+                attempts <= 2,
+                "the shim connected a third time to an agent that hung up twice"
+            );
+            Ok(hung_up())
+        },
+    )
+    .unwrap();
+    finished.send(()).unwrap();
+    agent.join().unwrap();
+
+    assert_eq!(attempts, 2);
+    assert_eq!(relayed, Some(254));
+}
+
 /// A rescue that answers from a list.
 struct Answers(std::collections::VecDeque<Rescued>);
 
@@ -1034,28 +1074,40 @@ fn a_notice_is_written_with_a_carriage_return_and_a_failure_to_write_it_is_said(
 
 // A folder that is refused -----
 
-/// A shim whose private folder is refused does not connect, even though an agent's socket sits in it,
-/// and says why before it falls back to the plain shell.
-#[test]
-fn a_shim_whose_folder_is_refused_does_not_connect_and_prints_the_folder_refused_line() {
+/// The agent's socket in a folder that is refused, and the stand-in agent behind it: what reaches it first.
+/// A shim that connected sends its handshake, and the sentinel the test connects with sends nothing.
+fn refused_folder_with_an_agent(
+    tag: &str,
+) -> (
+    crate::test_support::TempProfile,
+    SocketLocation,
+    Folder,
+    std::thread::JoinHandle<usize>,
+) {
     use std::io::Read;
-    let profile = crate::test_support::TempProfile::new("refused-shim");
+    let profile = crate::test_support::TempProfile::new(tag);
     let location = profile.location();
     crate::userdir::ensure_socket_dir(&location, &Sid::current_user().unwrap()).unwrap();
     let listener = crate::afunix::Listener::bind(location.path()).unwrap();
-    // What reaches the stand-in agent first: a shim that connected sends its handshake, and the
-    // sentinel below sends nothing.
     let agent = std::thread::spawn(move || {
         let mut first = [0u8; 1];
         listener.accept().unwrap().read(&mut first).unwrap()
     });
     crate::test_support::widen(location.dir());
     let folder = folder_of(Ok(location.clone()));
+    (profile, location, folder, agent)
+}
+
+/// A shim whose private folder is refused does not connect, even though an agent's socket sits in it. A
+/// login with a terminal is told why before it falls back to the plain shell.
+#[test]
+fn a_shim_with_a_terminal_whose_folder_is_refused_does_not_connect_and_prints_the_folder_refused_line() {
+    let (_profile, location, folder, agent) = refused_folder_with_an_agent("ref-pty");
     let mut stderr = Vec::new();
 
     let relayed = super::try_relay_at(
         &folder,
-        &Some(exec("echo hi")),
+        &None,
         &mut stderr,
         None,
         std::io::empty(),
@@ -1066,6 +1118,36 @@ fn a_shim_whose_folder_is_refused_does_not_connect_and_prints_the_folder_refused
     assert_eq!(relayed, None, "the shim fails open instead of reaching the socket");
     let text = String::from_utf8(stderr).unwrap();
     assert!(text.starts_with("ssh-broker: no session is offered"), "{text}");
+    assert!(text.contains(&location.dir().display().to_string()), "{text}");
+    drop(crate::afunix::connect(location.path()).unwrap());
+    assert_eq!(agent.join().unwrap(), 0, "the shim sent something to the agent");
+}
+
+/// A login with a command is told the cause once: by the fail-open line, which carries why the shim has
+/// no log. The log and the folder come from the same walk, so that is the folder's refusal.
+#[test]
+fn a_shim_with_a_command_whose_folder_is_refused_does_not_connect_and_says_why_once_in_the_fail_open_line() {
+    let (_profile, location, folder, agent) = refused_folder_with_an_agent("ref-exec");
+    let log_failure = format!(
+        "{:#}",
+        folder.logs().err().expect("the folder is refused, so there is no log")
+    );
+    let mut stderr = Vec::new();
+
+    let relayed = super::try_relay_at(
+        &folder,
+        &Some(exec("echo hi")),
+        &mut stderr,
+        Some(&log_failure),
+        std::io::empty(),
+        &mut crate::shim_offer::Prompting,
+    )
+    .unwrap();
+
+    assert_eq!(relayed, None, "the shim fails open instead of reaching the socket");
+    let text = String::from_utf8(stderr).unwrap();
+    assert!(text.starts_with("ssh-broker: agent unavailable"), "{text}");
+    assert!(!text.contains("no session is offered"), "told twice: {text}");
     assert!(text.contains(&location.dir().display().to_string()), "{text}");
     drop(crate::afunix::connect(location.path()).unwrap());
     assert_eq!(agent.join().unwrap(), 0, "the shim sent something to the agent");

@@ -8,6 +8,7 @@
 use std::cell::RefCell;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use anyhow::Context;
 use socket2::Socket;
@@ -261,8 +262,8 @@ pub fn serve_after_own_agent<C>(
 enum Walk {
     /// The folders, held: the shim connects through them and logs into them.
     Open(Box<SocketDir>),
-    /// `AppData` or `Local` is not there, which a connect by path called no agent.
-    Missing(crate::acl::Missing),
+    /// `AppData`, `Local` or the private folder is not there, which a connect by path called no agent.
+    Missing(Looking),
     /// The walk refused a folder, or could not go on (a sharing violation, a system error): no agent
     /// serves a folder that check refuses, so the shim does not connect.
     Refused(anyhow::Error),
@@ -270,9 +271,33 @@ enum Walk {
     Unwalked(anyhow::Error),
 }
 
+/// A folder the shim's walk did not find. It looks again when asked to connect, and keeps what it finds:
+/// it goes from missing to found at most once and never back.
+struct Looking {
+    missing: crate::acl::Missing,
+    location: SocketLocation,
+    user: Sid,
+    found: OnceLock<Box<SocketDir>>,
+}
+
+impl Looking {
+    /// The folders, found now or earlier. The walk that looks again makes nothing.
+    fn folders(&self) -> anyhow::Result<&SocketDir> {
+        if let Some(found) = self.found.get() {
+            return Ok(found);
+        }
+        match crate::userdir::inspect_socket_dir(&self.location, &self.user) {
+            Ok(folders) => Ok(self.found.get_or_init(|| Box::new(folders))),
+            Err(e) if e.is::<crate::acl::Missing>() => Err(self.missing.clone().into()),
+            Err(e) => Err(e.context("not connecting through a folder that cannot be used")),
+        }
+    }
+}
+
 /// The shim's folder, from its first act to the end of the run: the location its token gives and the
 /// folders of the walk to it, held (so the location's path names them for as long as the shim runs).
-/// The shim connects to its agent only through this, and only when the private folder was accepted.
+/// The shim connects to its agent only through this, and only when the private folder was accepted. A folder
+/// that was not there at the first act is looked for again at each connect.
 pub(crate) struct Folder {
     location: anyhow::Result<SocketLocation>,
     walk: Walk,
@@ -285,21 +310,24 @@ impl Folder {
     }
 
     /// The folder at `location`, walked as `user`, with the private folder made if it is missing. An
-    /// account that cannot be told is logged, and nothing is walked.
+    /// account that cannot be told is not walked.
     pub fn in_location(location: anyhow::Result<SocketLocation>, user: anyhow::Result<Sid>) -> Folder {
         let walk = match (&location, user) {
             (Ok(location), Ok(user)) => match crate::userdir::open_socket_dir(location, &user) {
                 Ok(folders) => Walk::Open(Box::new(folders)),
                 Err(e) => match e.downcast_ref::<crate::acl::Missing>() {
-                    Some(missing) => Walk::Missing(missing.clone()),
+                    Some(missing) => Walk::Missing(Looking {
+                        missing: missing.clone(),
+                        location: location.clone(),
+                        user,
+                        found: OnceLock::new(),
+                    }),
                     None => Walk::Refused(e),
                 },
             },
             (Err(e), _) => Walk::Unwalked(anyhow::anyhow!("{e:#}")),
-            (Ok(_), Err(e)) => {
-                tracing::warn!("cannot tell which account this is, so its folder is not walked: {e:#}");
-                Walk::Unwalked(e)
-            }
+            // The cause reaches a login with a command through the log's failure.
+            (Ok(_), Err(e)) => Walk::Unwalked(e),
         };
         Folder { location, walk }
     }
@@ -324,17 +352,21 @@ impl Folder {
     pub fn logs(&self) -> anyhow::Result<&crate::acl::DirHandle> {
         match &self.walk {
             Walk::Open(folders) => folders.logs.as_ref().map_err(|e| anyhow::anyhow!("{e:#}")),
-            Walk::Missing(missing) => Err(missing.clone().into()),
+            Walk::Missing(looking) => match looking.found.get() {
+                Some(found) => found.logs.as_ref().map_err(|e| anyhow::anyhow!("{e:#}")),
+                None => Err(looking.missing.clone().into()),
+            },
             Walk::Refused(e) | Walk::Unwalked(e) => Err(anyhow::anyhow!("{e:#}")),
         }
     }
 
     /// Connect to the agent through the folders held. With no folder accepted there is nothing to
-    /// connect through: the error is the walk's, and for a missing folder it is [`is_no_agent`].
+    /// connect through: the error is the walk's, and for a missing folder it is [`is_no_agent`] unless
+    /// the folder is there by now, when the connect goes through it.
     pub fn connect(&self) -> anyhow::Result<Socket> {
         match &self.walk {
             Walk::Open(folders) => folders.connect(),
-            Walk::Missing(missing) => Err(missing.clone().into()),
+            Walk::Missing(looking) => looking.folders()?.connect(),
             Walk::Refused(e) => Err(anyhow::anyhow!(
                 "not connecting through a folder that cannot be used: {e:#}"
             )),
@@ -352,8 +384,6 @@ pub(crate) struct Absent<'a> {
     /// What the shim's first walk found: where the socket is, and whether the folder was refused.
     pub folder: &'a Folder,
     pub connect: &'a anyhow::Result<Socket>,
-    /// Why the shim has no log, if it has none: the fail-open of a command says it.
-    pub log_failure: Option<&'a str>,
 }
 
 /// How the shim goes on.
@@ -390,21 +420,6 @@ impl Rescue for NoRescue {
 /// The real thing: the notice on stderr, or the prompt at the console.
 pub(crate) struct Prompting;
 
-/// Whether the failure `log_failure` of the log already says `cause`: the log and the folder found the same
-/// thing, so a login with a command, which is told the log's failure, is not told twice. What is
-/// compared is what is wrong (the refusal, or the system error and what it was opening), not the
-/// words of the walk that found it.
-fn restated_by(log_failure: Option<&str>, cause: &anyhow::Error) -> bool {
-    let layers: Vec<String> = cause.chain().map(ToString::to_string).collect();
-    let wanted = if cause.root_cause().is::<crate::acl::Refused>() {
-        1
-    } else {
-        2
-    };
-    let what = layers[layers.len().saturating_sub(wanted)..].join(": ");
-    log_failure.is_some_and(|said| said.contains(&what))
-}
-
 impl Rescue for Prompting {
     fn rescue(&mut self, absent: &Absent<'_>, stderr: &mut dyn Write) -> Rescued {
         let account = match account::current_account() {
@@ -421,12 +436,14 @@ impl Rescue for Prompting {
         // yet made its socket, refuses the connect like no agent at all. It is waited for, never
         // prompted over.
         if let (Absence::NoAgent, Ok(location), None) = (kind_of_absence, location, refusal) {
-            match Sid::current_user()
-                .and_then(|user| await_starting_agent(location, &provision::canonical_exe(), &user))
-            {
+            match Sid::current_user().and_then(|user| {
+                await_starting_agent(location, &provision::canonical_exe(), &user, || {
+                    listening(absent.folder.connect().map_err(folder_failure), location)
+                })
+            }) {
                 Ok(Starting::Served(socket)) => return Rescued::Connected { socket, modes: None },
                 Ok(Starting::No | Starting::Gone) => {}
-                Err(e) => return starting_failed(&e, absent.exec, absent.log_failure, stderr),
+                Err(e) => return starting_failed(&e, stderr),
             }
         }
         let console = !absent.exec && console_available();
@@ -434,8 +451,9 @@ impl Rescue for Prompting {
         match plan(absent.exec, console, kind_of_absence, account, cause.as_deref()) {
             Plan::Nothing => Rescued::Plain,
             Plan::FolderRefused { cause } => {
-                let said = absent.exec && refusal.is_some_and(|e| restated_by(absent.log_failure, e));
-                if !said {
+                // A login with a command is told the cause once, by the fail-open line, which carries the
+                // log's failure: the log and the folder come from the same walk.
+                if !absent.exec {
                     let _ = writeln!(stderr, "{}", text::folder_refused(&cause));
                 }
                 Rescued::Plain
@@ -454,12 +472,12 @@ impl Rescue for Prompting {
 /// in a plain shell.
 ///
 /// What this can say is a failure of the user's folder found after the shim's walk accepted it (a
-/// link put there since): the same line on stderr, as the notice is told, unless the log's failure
-/// (`log_failure`, which the fail-open of a command says) already says it. Any other failure is
-/// logged.
-fn starting_failed(e: &anyhow::Error, exec: bool, log_failure: Option<&str>, stderr: &mut dyn Write) -> Rescued {
+/// link put there since): the same line on stderr, as the notice is told. The log did not find it
+/// (the walk that set the log up accepted the folder), so no line of the fail-open says it. Any other
+/// failure is logged.
+fn starting_failed(e: &anyhow::Error, stderr: &mut dyn Write) -> Rescued {
     tracing::warn!("cannot tell whether an agent is starting, so no session is offered: {e:#}");
-    if e.is::<FolderFailed>() && !(exec && restated_by(log_failure, e)) {
+    if e.is::<FolderFailed>() {
         let _ = writeln!(stderr, "{}", text::folder_refused(&format!("{e:#}")));
     }
     Rescued::Plain
@@ -585,7 +603,9 @@ fn settle(started: Started) -> Result<Socket, String> {
     let served = serve_after_own_agent(served, || {
         let location = crate::userdir::current_socket_location()?;
         let user = Sid::current_user()?;
-        await_starting_agent(&location, &provision::canonical_exe(), &user)
+        await_starting_agent(&location, &provision::canonical_exe(), &user, || {
+            connect_if_listening(&location, &user)
+        })
     })
     .map_err(failed)?;
     match served {
@@ -620,7 +640,13 @@ fn connect_if_listening(location: &SocketLocation, user: &Sid) -> anyhow::Result
         Err(e) if e.is::<crate::acl::Missing>() => return Ok(None),
         Err(e) => return Err(folder_failure(e)),
     };
-    match folders.connect() {
+    listening(folders.connect(), location)
+}
+
+/// The outcome of a connect to the socket at `location` as [`connect_if_listening`] gives it: `Ok(None)`
+/// when nobody listens there.
+fn listening(connected: anyhow::Result<Socket>, location: &SocketLocation) -> anyhow::Result<Option<Socket>> {
+    match connected {
         Ok(socket) => Ok(Some(socket)),
         Err(e) if is_no_agent(&e) => Ok(None),
         Err(e) => Err(e.context(format!("connect to the agent's socket {}", location.path().display()))),
@@ -714,11 +740,19 @@ impl Evidence {
 /// The folder watch is armed before the connect that follows each look, so the marker the agent
 /// writes after `listen()` is seen by that connect or by the watch. The wait is on the folder, the
 /// lock's holder and the agent processes; all are real conditions, so it has no time limit.
-fn await_starting_agent(location: &SocketLocation, image: &Path, user: &Sid) -> anyhow::Result<Starting<Socket>> {
+///
+/// `connect` is [`connect_if_listening`] by a walk of its own, or the shim's own [`Folder`] where the shim
+/// has one that was walked from its token (the rescue of a login).
+fn await_starting_agent(
+    location: &SocketLocation,
+    image: &Path,
+    user: &Sid,
+    mut connect: impl FnMut() -> anyhow::Result<Option<Socket>>,
+) -> anyhow::Result<Starting<Socket>> {
     let watch = RefCell::new(SocketWatch::for_location(location)?);
     let evidence = RefCell::new(Evidence::default());
     wait_while_starting(
-        || connect_if_listening(location, user),
+        &mut connect,
         || evidence.borrow_mut().look(location, image, user),
         || evidence.borrow_mut().wait(&watch.borrow()),
         || watch.borrow_mut().rearm(),
