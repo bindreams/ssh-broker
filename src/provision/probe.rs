@@ -244,22 +244,12 @@ pub fn current_logon_type() -> Option<u32> {
     use windows::Win32::Security::Authentication::Identity::{
         LsaFreeReturnBuffer, LsaGetLogonSessionData, SECURITY_LOGON_SESSION_DATA,
     };
-    use windows::Win32::Security::{GetTokenInformation, TOKEN_STATISTICS, TokenStatistics};
+    use windows::Win32::Security::{TOKEN_STATISTICS, TokenStatistics};
 
     let token = crate::winutil::own_token().ok()?;
-    let mut stats = TOKEN_STATISTICS::default();
-    let mut len = 0u32;
-    // SAFETY: `stats` is a `TOKEN_STATISTICS` and the length passed is its size.
-    unsafe {
-        GetTokenInformation(
-            token.0,
-            TokenStatistics,
-            Some(&mut stats as *mut _ as *mut core::ffi::c_void),
-            std::mem::size_of::<TOKEN_STATISTICS>() as u32,
-            &mut len,
-        )
-    }
-    .ok()?;
+    let info = crate::winutil::token_information(token.0, TokenStatistics).ok()?;
+    // SAFETY: `TOKEN_STATISTICS` is plain data.
+    let stats = unsafe { info.header::<TOKEN_STATISTICS>() }.ok()?;
     let mut data: *mut SECURITY_LOGON_SESSION_DATA = std::ptr::null_mut();
     // SAFETY: a valid logon id and out-pointer; the buffer LSA allocates is freed below.
     let status = unsafe { LsaGetLogonSessionData(&stats.AuthenticationId, &mut data) };

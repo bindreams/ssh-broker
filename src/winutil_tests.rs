@@ -289,9 +289,89 @@ fn token_information_of_a_handle_without_token_query_is_access_denied() {
 }
 
 #[test]
-fn token_information_of_this_process_is_aligned_and_at_least_a_header() {
+fn token_information_of_this_process_holds_a_header() {
     use windows::Win32::Security::{TOKEN_USER, TokenUser};
     let info = token_information(own_token().unwrap().0, TokenUser).unwrap();
-    assert!(info.size() >= size_of::<TOKEN_USER>(), "{}", info.size());
-    assert_eq!(info.as_ptr::<u8>() as usize % 8, 0);
+    assert!(info.len() >= size_of::<TOKEN_USER>(), "{}", info.len());
+    // SAFETY: a `TOKEN_USER` is a SID pointer and an integer.
+    let user = unsafe { info.header::<TOKEN_USER>() }.unwrap();
+    assert!(!user.User.Sid.0.is_null());
+}
+
+// Reading token information -----
+
+/// A buffer of a `u32` count, four bytes of padding, then the `u64`s `values`: the shape of a
+/// `TOKEN_GROUPS`, with plain data in place of SIDs.
+fn counted(count: u32, values: &[u64]) -> TokenInformation {
+    let mut bytes = count.to_ne_bytes().to_vec();
+    bytes.extend([0u8; 4]);
+    for value in values {
+        bytes.extend(value.to_ne_bytes());
+    }
+    TokenInformation::from_bytes(&bytes)
+}
+
+#[test]
+fn a_header_and_the_array_after_it_read_back() {
+    let info = counted(2, &[7, 9]);
+    assert_eq!(info.len(), 24);
+    // SAFETY: `u32` and `u64` accept every bit pattern.
+    unsafe {
+        assert_eq!(info.header::<u32>().unwrap(), 2);
+        assert_eq!(info.array::<u64>(8, 2).unwrap(), [7, 9]);
+        assert_eq!(info.array::<u64>(8, 0).unwrap(), [] as [u64; 0]);
+    }
+}
+
+#[test]
+fn a_buffer_shorter_than_the_header_is_an_error() {
+    let info = TokenInformation::from_bytes(&[1, 2, 3]);
+    // SAFETY: `u32` accepts every bit pattern.
+    let err = unsafe { info.header::<u32>() }.unwrap_err();
+    assert!(err.to_string().contains("3 bytes"), "{err:#}");
+}
+
+#[test]
+fn a_count_that_runs_past_the_buffer_is_an_error() {
+    let info = counted(3, &[7, 9]);
+    // SAFETY: `u64` accepts every bit pattern.
+    let err = unsafe { info.array::<u64>(8, 3) }.unwrap_err();
+    assert!(err.to_string().contains("24 bytes"), "{err:#}");
+}
+
+#[test]
+fn a_count_whose_size_overflows_is_an_error() {
+    let info = counted(2, &[7, 9]);
+    // SAFETY: `u64` accepts every bit pattern.
+    unsafe {
+        assert!(info.array::<u64>(8, usize::MAX).is_err());
+        assert!(info.array::<u64>(usize::MAX - 7, 1).is_err());
+    }
+}
+
+#[test]
+fn the_length_is_what_the_call_returned_not_the_rounded_storage() {
+    // 12 bytes live in 16 bytes of storage; the 4 after them were never written.
+    let info = TokenInformation::from_bytes(&[0u8; 12]);
+    assert_eq!(info.len(), 12);
+    // SAFETY: `u64` accepts every bit pattern.
+    assert!(unsafe { info.array::<u64>(8, 1) }.is_err());
+}
+
+#[test]
+fn an_offset_that_does_not_suit_the_element_is_an_error() {
+    let info = counted(1, &[7]);
+    // SAFETY: `u64` accepts every bit pattern.
+    assert!(unsafe { info.array::<u64>(4, 1) }.is_err());
+}
+
+#[test]
+fn a_fixed_size_class_reads_through_the_same_reader() {
+    use windows::Win32::Security::{TOKEN_STATISTICS, TokenPrimary, TokenStatistics};
+    let token = own_token().unwrap();
+    let info = token_information(token.0, TokenStatistics).unwrap();
+    assert_eq!(info.len(), size_of::<TOKEN_STATISTICS>());
+    // SAFETY: `TOKEN_STATISTICS` is plain data.
+    let stats = unsafe { info.header::<TOKEN_STATISTICS>() }.unwrap();
+    assert_eq!(stats.TokenType, TokenPrimary);
 }

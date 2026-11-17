@@ -1,12 +1,14 @@
-//! winutil: shared Windows RAII guards + process-thread attribute-list helper (Windows-only).
+//! winutil: shared Windows RAII guards, the process-thread attribute-list helper, and the process
+//! token with its information (Windows-only).
 //!
-//! Used by both `conpty` (the PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE list) and `pipes` (the
-//! PROC_THREAD_ATTRIBUTE_HANDLE_LIST list), so the attribute-list create/cleanup is written
-//! and reasoned about once.
+//! The attribute list is used by both `conpty` (the PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE list) and
+//! `pipes` (the PROC_THREAD_ATTRIBUTE_HANDLE_LIST list), so its create/cleanup is written and
+//! reasoned about once. `own_token` and `token_information` are the one reader of a token: callers
+//! take a class from it and read the bytes through the checked `header` and `array`.
 
 use crate::shell::StartError;
 use anyhow::Context;
-use windows::Win32::Foundation::{CloseHandle, ERROR_INSUFFICIENT_BUFFER, HANDLE};
+use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::Security::{GetTokenInformation, TOKEN_INFORMATION_CLASS, TOKEN_QUERY};
 use windows::Win32::System::Console::HPCON;
 use windows::Win32::System::Diagnostics::Debug::{
@@ -47,8 +49,7 @@ impl Drop for OwnedHandle {
 
 /// A `TOKEN_QUERY` handle on this process's token. Read the token through this handle (`userdir`,
 /// `account::elevation`, [`token_information`]); a read that needs more access than `TOKEN_QUERY`
-/// opens its own. One file still opens the token itself, `tests/common/fs_state.rs`: both the library
-/// and the integration tests include it by path, so it can name neither crate.
+/// opens its own. `tests/common/fs_state.rs` still opens its own: both crates include it by path.
 pub fn own_token() -> anyhow::Result<OwnedHandle> {
     let mut token = HANDLE::default();
     // SAFETY: `token` is a valid out-pointer; the handle is closed by `OwnedHandle`.
@@ -56,24 +57,85 @@ pub fn own_token() -> anyhow::Result<OwnedHandle> {
     Ok(OwnedHandle(token))
 }
 
-/// What `GetTokenInformation` returned for a variable-length class: the bytes, in storage aligned
-/// for the structures that hold pointers. The structure at the start points into the same bytes, so
-/// read it through [`TokenInformation::as_ptr`] and bound every offset by [`TokenInformation::size`].
+/// What `GetTokenInformation` returned: exactly those bytes, in storage aligned for the structures
+/// that hold pointers. The structure at the start often points into the same bytes, so read it
+/// through [`header`](Self::header) and [`array`](Self::array), which bound every read by
+/// [`len`](Self::len).
 pub struct TokenInformation {
     storage: Vec<u64>,
+    len: usize,
 }
 
 impl TokenInformation {
-    /// The start of the data, 8-aligned, valid for [`size`](Self::size) bytes while `self` lives.
-    /// Not a reference: a structure that ends in a one-element array must not be read through one.
-    pub fn as_ptr<T>(&self) -> *const T {
-        debug_assert!(align_of::<T>() <= align_of::<u64>());
+    fn from_bytes(bytes: &[u8]) -> TokenInformation {
+        let mut storage = vec![0u64; bytes.len().div_ceil(size_of::<u64>())];
+        for (word, chunk) in storage.iter_mut().zip(bytes.chunks(size_of::<u64>())) {
+            let mut padded = [0u8; size_of::<u64>()];
+            padded[..chunk.len()].copy_from_slice(chunk);
+            *word = u64::from_ne_bytes(padded);
+        }
+        TokenInformation {
+            storage,
+            len: bytes.len(),
+        }
+    }
+
+    /// The bytes the call returned.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    fn start(&self) -> *const u8 {
         self.storage.as_ptr().cast()
     }
 
-    /// The bytes the buffer holds: at least what the call returned, rounded up to 8.
-    pub fn size(&self) -> usize {
-        self.storage.len() * size_of::<u64>()
+    /// The structure at the start of the data, copied out. An error when the data is shorter than `T`.
+    /// Pointers inside it point into `self`'s buffer and are valid while `self` lives.
+    ///
+    /// # Safety
+    /// Every bit pattern of `size_of::<T>()` bytes must be a valid `T`: plain integers, and raw
+    /// pointers (never dereferenced here), not `bool`, enums or references.
+    pub unsafe fn header<T: Copy>(&self) -> anyhow::Result<T> {
+        const { assert!(align_of::<T>() <= align_of::<u64>()) };
+        anyhow::ensure!(
+            size_of::<T>() <= self.len,
+            "the token information is {} bytes, shorter than its {}-byte header",
+            self.len,
+            size_of::<T>()
+        );
+        // SAFETY: the storage is 8-aligned, holds at least `size_of::<T>()` initialised bytes
+        // (checked above), and the caller promises every bit pattern is a `T`.
+        Ok(unsafe { self.start().cast::<T>().read() })
+    }
+
+    /// `count` elements of `T` that start `offset` bytes into the data (for a `TOKEN_GROUPS`, the
+    /// `offset_of!` its `Groups`). An error when `offset` does not suit `T` or the elements run
+    /// past [`len`](Self::len). The slice lives as long as `self`.
+    ///
+    /// # Safety
+    /// As for [`header`](Self::header): every bit pattern of `T` must be valid.
+    pub unsafe fn array<T: Copy>(&self, offset: usize, count: usize) -> anyhow::Result<&[T]> {
+        const { assert!(align_of::<T>() <= align_of::<u64>()) };
+        anyhow::ensure!(
+            offset.is_multiple_of(align_of::<T>()),
+            "the token information's array starts at {offset}, which does not suit its elements"
+        );
+        let end = count
+            .checked_mul(size_of::<T>())
+            .and_then(|bytes| bytes.checked_add(offset));
+        anyhow::ensure!(
+            end.is_some_and(|end| end <= self.len),
+            "the token information claims {count} elements at {offset} in {} bytes",
+            self.len
+        );
+        // SAFETY: the elements lie inside the initialised bytes (checked above), the start is
+        // aligned for `T` (the storage is 8-aligned and `offset` a multiple of `align_of::<T>()`),
+        // and the caller promises every bit pattern is a `T`.
+        Ok(unsafe { std::slice::from_raw_parts(self.start().add(offset).cast::<T>(), count) })
     }
 }
 
@@ -81,18 +143,22 @@ impl TokenInformation {
 /// without the access fails with it, not with a length.
 pub fn token_information(token: HANDLE, class: TOKEN_INFORMATION_CLASS) -> anyhow::Result<TokenInformation> {
     let mut len = 0u32;
-    // SAFETY: a null buffer is the documented size probe; it fails with the length needed.
-    if let Err(e) = unsafe { GetTokenInformation(token, class, None, 0, &mut len) }
-        && e.code() != windows::core::HRESULT::from_win32(ERROR_INSUFFICIENT_BUFFER.0)
-    {
-        return Err(anyhow::Error::new(e).context("GetTokenInformation (size probe)"));
+    // SAFETY: a null buffer is the documented size probe; it sets the length needed.
+    let probe = unsafe { GetTokenInformation(token, class, None, 0, &mut len) };
+    // A probe that set a length is fine whatever it returned (`ERROR_INSUFFICIENT_BUFFER` is the
+    // usual); one that set none has nothing to size the read by.
+    if len == 0 {
+        return Err(match probe {
+            Err(e) => anyhow::Error::new(e).context("GetTokenInformation (size probe)"),
+            Ok(()) => anyhow::anyhow!("the token information size probe returned no length"),
+        });
     }
-    anyhow::ensure!(len > 0, "the token information size probe returned no length");
-    let mut storage = vec![0u64; (len as usize).div_ceil(size_of::<u64>())];
-    // SAFETY: `storage` holds at least `len` bytes, which is what the call is told.
-    unsafe { GetTokenInformation(token, class, Some(storage.as_mut_ptr().cast()), len, &mut len) }
+    let mut bytes = vec![0u8; len as usize];
+    // SAFETY: `bytes` holds `len` bytes, which is what the call is told.
+    unsafe { GetTokenInformation(token, class, Some(bytes.as_mut_ptr().cast()), len, &mut len) }
         .context("GetTokenInformation")?;
-    Ok(TokenInformation { storage })
+    bytes.truncate(len as usize);
+    Ok(TokenInformation::from_bytes(&bytes))
 }
 
 /// While alive, a program that `CreateProcessW` cannot start (the wrong architecture, a file that is not

@@ -2,6 +2,7 @@
 use super::*;
 use windows::Win32::Foundation::{HLOCAL, LocalFree};
 use windows::Win32::Security::Authorization::ConvertStringSidToSidW;
+use windows::Win32::Security::CheckTokenMembership;
 use windows::core::PCWSTR;
 
 #[test]
@@ -68,17 +69,10 @@ fn deny_only_administrators_is_filtered_at_every_level() {
     }
 }
 
-/// The rows of `whoami /groups`, which reads the token through another path and so is an
-/// independent source: group name, type, SID and attributes, each a quoted field.
+/// The rows of `whoami /groups`: group name, type, SID and attributes, each a quoted field. Only the
+/// SID column is read: the attribute text is localised.
 fn whoami_groups() -> Vec<Vec<String>> {
-    use std::os::windows::process::CommandExt;
-    let out = std::process::Command::new("whoami")
-        .args(["/groups", "/fo", "csv", "/nh"])
-        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
-        .output()
-        .unwrap();
-    assert!(out.status.success(), "whoami failed: {out:?}");
-    String::from_utf8_lossy(&out.stdout)
+    crate::test_support::whoami_csv("/groups")
         .lines()
         .filter(|line| !line.trim().is_empty())
         .map(|line| {
@@ -93,32 +87,27 @@ fn whoami_groups() -> Vec<Vec<String>> {
         .collect()
 }
 
+/// Whether `CheckTokenMembership` finds `sid` in the calling process's token: true only when it is
+/// present and enabled, which whoami's SID column cannot say.
+fn is_enabled_member(sid: &TextSid) -> bool {
+    let mut member = windows::core::BOOL::default();
+    // SAFETY: `sid` is a valid SID and `member` a valid out-pointer.
+    unsafe { CheckTokenMembership(None, sid.0, &mut member) }.unwrap();
+    member.as_bool()
+}
+
 #[test]
 fn this_process_reads_as_whoami_reports_it() {
+    const ADMINISTRATORS: &str = "S-1-5-32-544";
     let rows = whoami_groups();
     let sid_of = |row: &Vec<String>| row.get(2).cloned().unwrap_or_default();
-    // The attributes are comma-separated phrases; a localised host spells them differently.
-    let attributes_of = |row: &Vec<String>| -> Vec<String> {
-        row.get(3)
-            .map(|text| text.split(", ").map(str::to_owned).collect())
-            .unwrap_or_default()
-    };
 
-    let administrators = match rows.iter().find(|row| sid_of(row) == "S-1-5-32-544") {
-        None => AdministratorsSid::Absent,
-        Some(row) => {
-            let attributes = attributes_of(row);
-            let has = |phrase: &str| attributes.iter().any(|attribute| attribute == phrase);
-            if has("Group used for deny only") {
-                AdministratorsSid::DenyOnly
-            } else if has("Enabled group") {
-                AdministratorsSid::Enabled
-            } else {
-                panic!(
-                    "whoami's attributes of Administrators are neither enabled nor deny-only, or are localised: {row:?}"
-                )
-            }
-        }
+    // Present or not from whoami's SID column; enabled or not from the system's own check.
+    let present = rows.iter().any(|row| sid_of(row) == ADMINISTRATORS);
+    let administrators = match (present, is_enabled_member(&TextSid::new(ADMINISTRATORS))) {
+        (false, _) => AdministratorsSid::Absent,
+        (true, true) => AdministratorsSid::Enabled,
+        (true, false) => AdministratorsSid::DenyOnly,
     };
     let label = rows
         .iter()
@@ -162,12 +151,14 @@ impl Drop for TextSid {
 
 #[test]
 fn a_label_without_a_sid_is_an_error() {
-    let err = rid_of_label(windows::Win32::Security::PSID::default()).unwrap_err();
+    // SAFETY: a null SID is the case the function refuses before it reads.
+    let err = unsafe { rid_of_label(windows::Win32::Security::PSID::default()) }.unwrap_err();
     assert!(err.to_string().contains("no SID"), "{err:#}");
 }
 
 #[test]
 fn the_level_of_a_label_is_its_last_sub_authority() {
     let medium = TextSid::new("S-1-16-8192");
-    assert_eq!(rid_of_label(medium.0).unwrap(), INTEGRITY_MEDIUM);
+    // SAFETY: `medium` is a valid SID for the length of the call.
+    assert_eq!(unsafe { rid_of_label(medium.0) }.unwrap(), INTEGRITY_MEDIUM);
 }

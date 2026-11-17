@@ -10,15 +10,7 @@ use windows::Win32::System::Threading::GetCurrentProcess;
 
 #[test]
 fn current_user_sid_is_the_one_whoami_reports() {
-    // `whoami` reads the same token through another path, so it is the independent source.
-    use std::os::windows::process::CommandExt;
-    let out = std::process::Command::new("whoami")
-        .args(["/user", "/fo", "csv", "/nh"])
-        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
-        .output()
-        .unwrap();
-    assert!(out.status.success(), "whoami failed: {out:?}");
-    let text = String::from_utf8_lossy(&out.stdout);
+    let text = crate::test_support::whoami_csv("/user");
     let reported = text
         .trim()
         .rsplit(',')

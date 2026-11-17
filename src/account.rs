@@ -4,8 +4,7 @@
 //! never read from the environment, a typed name or an argument: `USERNAME` is whatever the
 //! caller set, and a password prompt for a name the caller chose would sign a different account on.
 
-use std::mem::{offset_of, size_of};
-use std::ptr::addr_of;
+use std::mem::offset_of;
 
 use anyhow::Context;
 use windows::Win32::Foundation::HANDLE;
@@ -118,22 +117,20 @@ pub fn classify_elevation(administrators: AdministratorsSid, integrity_rid: u32)
 /// needs `TOKEN_QUERY`.
 pub fn integrity_of(token: HANDLE) -> anyhow::Result<u32> {
     let buf = token_information(token, TokenIntegrityLevel).context("read the token's integrity level")?;
-    anyhow::ensure!(
-        buf.size() >= size_of::<TOKEN_MANDATORY_LABEL>(),
-        "the token's integrity level is {} bytes, shorter than its header",
-        buf.size()
-    );
-    // SAFETY: the buffer holds a `TOKEN_MANDATORY_LABEL` (checked above), 8-aligned; the SID it
-    // names lies inside the buffer, and `rid_of_label` rejects a null one.
-    let sid = unsafe { buf.as_ptr::<TOKEN_MANDATORY_LABEL>().read() }.Label.Sid;
-    rid_of_label(sid)
+    // SAFETY: a `TOKEN_MANDATORY_LABEL` is a SID pointer and an integer.
+    let label = unsafe { buf.header::<TOKEN_MANDATORY_LABEL>() }.context("read the token's integrity label")?;
+    // SAFETY: the SID is one the system put inside `buf`, which lives to the end of this function.
+    unsafe { rid_of_label(label.Label.Sid) }
 }
 
 /// The last sub-authority of the label SID `sid`, which is the relative id of the level. A null SID,
 /// or one without a sub-authority, is an error.
-fn rid_of_label(sid: PSID) -> anyhow::Result<u32> {
+///
+/// # Safety
+/// A non-null `sid` points to a readable SID.
+unsafe fn rid_of_label(sid: PSID) -> anyhow::Result<u32> {
     anyhow::ensure!(!sid.0.is_null(), "the integrity label has no SID");
-    // SAFETY: `sid` is non-null and names a SID, which the token information put inside its buffer.
+    // SAFETY: `sid` is non-null and, by the caller's promise, a SID.
     unsafe {
         let count = *GetSidSubAuthorityCount(sid);
         anyhow::ensure!(count > 0, "the integrity label has no sub-authority");
@@ -144,31 +141,14 @@ fn rid_of_label(sid: PSID) -> anyhow::Result<u32> {
 /// Whether, and how, `BUILTIN\Administrators` is in `token`, which needs `TOKEN_QUERY`.
 fn administrators_of(token: HANDLE) -> anyhow::Result<AdministratorsSid> {
     let buf = token_information(token, TokenGroups).context("read the token's groups")?;
-    let header = offset_of!(TOKEN_GROUPS, Groups);
-    anyhow::ensure!(
-        buf.size() >= header,
-        "the token's groups are {} bytes, shorter than their header",
-        buf.size()
-    );
-    let groups = buf.as_ptr::<TOKEN_GROUPS>();
-    // SAFETY: the buffer is 8-aligned and holds at least the header (checked above). Only raw
-    // pointers are formed: `Groups` is declared with one element and a reference to the structure
-    // would cover no more.
-    let count = unsafe { addr_of!((*groups).GroupCount).read() } as usize;
-    let needed = count
-        .checked_mul(size_of::<SID_AND_ATTRIBUTES>())
-        .and_then(|entries| entries.checked_add(header));
-    anyhow::ensure!(
-        needed.is_some_and(|needed| needed <= buf.size()),
-        "the token claims {count} groups in {} bytes",
-        buf.size()
-    );
-    // SAFETY: `count` entries after the header lie inside the buffer (checked above), each an
-    // aligned `SID_AND_ATTRIBUTES` whose SID the system put inside the buffer too.
-    let first = unsafe { addr_of!((*groups).Groups) }.cast::<SID_AND_ATTRIBUTES>();
-    for index in 0..count {
-        let group = unsafe { first.add(index).read() };
-        // SAFETY: `group.Sid` is a SID inside the buffer.
+    // SAFETY: the group count is a `u32`.
+    let count = unsafe { buf.header::<u32>() }.context("read the token's group count")?;
+    // SAFETY: a `SID_AND_ATTRIBUTES` is a SID pointer and an integer.
+    let groups = unsafe { buf.array::<SID_AND_ATTRIBUTES>(offset_of!(TOKEN_GROUPS, Groups), count as usize) }
+        .context("read the token's groups")?;
+    for group in groups {
+        anyhow::ensure!(!group.Sid.0.is_null(), "the token has a group without a SID");
+        // SAFETY: `group.Sid` is non-null and a SID the system put inside `buf`.
         if unsafe { IsWellKnownSid(group.Sid, WinBuiltinAdministratorsSid) }.as_bool() {
             let attributes = group.Attributes;
             return Ok(

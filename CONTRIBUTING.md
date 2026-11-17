@@ -25,7 +25,7 @@ pumping), `afunix` + `acl` (the socket and its security boundary), `socket_loc` 
 user's socket lives, derived from the profile of the token), `agent_lock` (one agent per session, one
 serving agent per user), `filelog` (the per-user log folder), `conpty` (the pseudoconsole
 host), `pipes` (the redirected-pipe EXEC child), `vtinput` (Win32 input records → VT),
-`winutil` (Windows RAII guards, job containment, cosca→Win32 error conversion).
+`winutil` (Windows RAII guards, job containment, cosca→Win32 error conversion, the process token and its checked information).
 
 The functionality lives in the library rather than the binary so it is reachable from tests on
 every host platform; `main.rs` is a thin dispatcher.

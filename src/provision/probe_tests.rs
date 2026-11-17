@@ -251,3 +251,12 @@ fn session_zero_unreadable_is_not() {
     assert!(!is_genuine_session(0, None));
     assert!(!is_genuine_session(0, Some(0)));
 }
+
+/// The logon type is read from LSA by the logon id of this process's own token, which needs no privilege.
+#[test]
+fn this_process_has_a_logon_type() {
+    assert!(
+        super::current_logon_type().is_some(),
+        "LSA gave no logon session data for this token"
+    );
+}

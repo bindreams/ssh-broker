@@ -109,6 +109,22 @@ pub fn raw_socket_pair(tag: &str) -> (socket2::Socket, socket2::Socket, PathBuf)
     (server, client, dir)
 }
 
+// Reading a token the way `whoami` does -----
+
+/// The stdout of `whoami <switch> /fo csv /nh`, which reads this process's token through another path
+/// than the library and so is an independent source for a test.
+pub fn whoami_csv(switch: &str) -> String {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let out = Command::new("whoami")
+        .args([switch, "/fo", "csv", "/nh"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "whoami failed: {out:?}");
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
 // Elevation -----
 
 /// Fail loudly unless this process is an elevated administrator. For the tests that need it, so

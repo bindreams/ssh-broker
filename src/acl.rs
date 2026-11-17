@@ -124,13 +124,10 @@ impl Sid {
     /// SID of the user `token` belongs to, which needs `TOKEN_QUERY`.
     pub fn of_token(token: HANDLE) -> anyhow::Result<Sid> {
         let buf = crate::winutil::token_information(token, TokenUser).context("read the token's user")?;
-        anyhow::ensure!(
-            buf.size() >= size_of::<TOKEN_USER>(),
-            "the token's user is {} bytes, shorter than its header",
-            buf.size()
-        );
-        // SAFETY: the buffer holds a `TOKEN_USER` (checked above), 8-aligned, whose SID lies inside it.
-        let sid = unsafe { buf.as_ptr::<TOKEN_USER>().read() }.User.Sid;
+        // SAFETY: a `TOKEN_USER` is a SID pointer and an integer.
+        let user = unsafe { buf.header::<TOKEN_USER>() }.context("read the token's user")?;
+        // SAFETY: the SID is one the system put inside `buf`, which lives to the end of this function.
+        let sid = user.User.Sid;
         Sid::from_psid(sid)
     }
 
