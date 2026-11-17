@@ -26,7 +26,7 @@ use crate::offer::{
 };
 use crate::password_entry::{Password, Step};
 use crate::provision::procwait;
-use crate::socket_loc::SocketLocation;
+use crate::socket_loc::{Integrity, SocketLocation};
 use crate::socket_watch::SocketWatch;
 use crate::userdir::SocketDir;
 use crate::{provision, starting_agent};
@@ -105,23 +105,25 @@ pub enum Stance {
     PlainShell,
     /// Relay; with no agent, an offer signs the account on as `logon`.
     Relay { logon: LogonKind },
-    /// The elevation could not be read (`cause`): relay, and with no agent say so and offer nothing.
+    /// The elevation or the level could not be read (`cause`): relay, and with no agent say so and offer nothing.
     RelayWithoutOffer { cause: String },
 }
 
-/// Decide the [`Stance`] for `elevation`. Only a `Full` token's account needs the whole token, so only
-/// it signs on as a batch job.
-pub fn stance(elevation: anyhow::Result<Elevation>) -> Stance {
-    match elevation {
-        Ok(Elevation::Filtered) => Stance::PlainShell,
-        Ok(Elevation::Full) => Stance::Relay {
+/// Decide the [`Stance`] for a token with `elevation` at the folder level `integrity`. The logon follows
+/// the level, the same reading as the folder the shim waits on, so the agent the offer starts serves that
+/// folder: High is a batch logon (which UAC does not split), Medium an interactive one. An administrator's
+/// filtered token gets the plain shell whatever its level.
+pub fn stance(elevation: anyhow::Result<Elevation>, integrity: anyhow::Result<Integrity>) -> Stance {
+    match (elevation, integrity) {
+        (Err(e), _) | (Ok(_), Err(e)) => Stance::RelayWithoutOffer {
+            cause: format!("{e:#}"),
+        },
+        (Ok(Elevation::Filtered), _) => Stance::PlainShell,
+        (Ok(_), Ok(Integrity::High)) => Stance::Relay {
             logon: LogonKind::Batch,
         },
-        Ok(Elevation::Standard) => Stance::Relay {
+        (Ok(_), Ok(Integrity::Medium)) => Stance::Relay {
             logon: LogonKind::Interactive,
-        },
-        Err(e) => Stance::RelayWithoutOffer {
-            cause: format!("{e:#}"),
         },
     }
 }

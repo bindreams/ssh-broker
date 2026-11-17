@@ -172,6 +172,11 @@ pub fn elevation() -> anyhow::Result<Elevation> {
     elevation_of(own_token()?.0)
 }
 
+/// The folder level of this process's token ([`integrity_class`] of [`integrity_of`]).
+pub fn integrity() -> anyhow::Result<Integrity> {
+    Ok(integrity_class(integrity_of(own_token()?.0)?))
+}
+
 #[cfg(test)]
 #[path = "account_tests.rs"]
 mod account_tests;

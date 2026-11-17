@@ -2,6 +2,7 @@
 //! no logon, no account.
 use super::*;
 use crate::account::{Elevation, LocalAccount};
+use crate::socket_loc::Integrity;
 use std::cell::RefCell;
 
 fn account(kind: AccountKind) -> Option<LocalAccount> {
@@ -128,35 +129,67 @@ fn an_unreadable_account_changes_nothing() {
 
 // stance -----
 
+const AT_HIGH: anyhow::Result<Integrity> = Ok(Integrity::High);
+const AT_MEDIUM: anyhow::Result<Integrity> = Ok(Integrity::Medium);
+
 #[test]
-fn a_full_token_relays_with_a_batch_logon_and_a_standard_one_with_an_interactive_logon() {
+fn a_full_token_relays_with_a_batch_logon() {
     assert_eq!(
-        stance(Ok(Elevation::Full)),
+        stance(Ok(Elevation::Full), AT_HIGH),
         Stance::Relay {
             logon: LogonKind::Batch
         }
     );
+}
+
+#[test]
+fn a_standard_token_at_medium_relays_with_an_interactive_logon() {
     assert_eq!(
-        stance(Ok(Elevation::Standard)),
+        stance(Ok(Elevation::Standard), AT_MEDIUM),
         Stance::Relay {
             logon: LogonKind::Interactive
         }
     );
 }
 
+/// An account that is not an administrator can still hold a full token, and its shim then waits on the
+/// elevated folder; the agent the prompt starts has to serve that one, which only a batch logon does.
 #[test]
-fn a_filtered_token_gets_the_plain_shell_and_no_relay() {
-    assert_eq!(stance(Ok(Elevation::Filtered)), Stance::PlainShell);
+fn a_standard_token_at_high_relays_with_a_batch_logon() {
+    assert_eq!(
+        stance(Ok(Elevation::Standard), AT_HIGH),
+        Stance::Relay {
+            logon: LogonKind::Batch
+        }
+    );
 }
 
 #[test]
-fn an_unreadable_token_still_relays_but_offers_nothing_and_keeps_the_cause() {
+fn a_filtered_token_gets_the_plain_shell_and_no_relay() {
+    assert_eq!(stance(Ok(Elevation::Filtered), AT_MEDIUM), Stance::PlainShell);
+}
+
+#[test]
+fn an_unreadable_elevation_still_relays_but_offers_nothing_and_keeps_the_cause() {
     assert_eq!(
-        stance(Err(anyhow::anyhow!("the token cannot be read"))),
+        stance(Err(anyhow::anyhow!("the token cannot be read")), AT_HIGH),
         Stance::RelayWithoutOffer {
             cause: "the token cannot be read".into()
         }
     );
+}
+
+/// The logon kind comes from the integrity level, so a level that cannot be read leaves no kind to offer.
+#[test]
+fn an_unreadable_integrity_level_still_relays_but_offers_nothing_and_keeps_the_cause() {
+    for elevation in [Elevation::Full, Elevation::Standard] {
+        assert_eq!(
+            stance(Ok(elevation), Err(anyhow::anyhow!("the level cannot be read"))),
+            Stance::RelayWithoutOffer {
+                cause: "the level cannot be read".into()
+            }
+        );
+    }
 }
 
 const REFUSAL: &str = "make the private folder p/ssh-broker: p/ssh-broker cannot be used as the private folder: its ACL is not exactly Full Control for me. It is left as it is: inspect it, remove it, and it is created again";

@@ -2,7 +2,7 @@
 //!
 //! The call is `CreateProcessWithLogonW(LOGON_WITH_PROFILE)`, which hands the password to the
 //! Secondary Logon service and starts `ssh-broker agent --background` as the user in a new logon
-//! session with a loaded profile, DPAPI and junction traversal (spike M1, M2). For an administrator
+//! session with a loaded profile, DPAPI and junction traversal (spike M1, M2). For a shim at High integrity
 //! ([`LogonKind::Batch`]) the logon is `LogonUserW(BATCH)`, which UAC does not split, and the process
 //! starts with that token: the agent runs elevated, with the same profile and DPAPI. The password
 //! is only the call's argument, in a NUL-terminated copy that `Password::with_nul` wipes when the call
@@ -54,7 +54,8 @@ const PASSWORD_TOO_LONG: &str = "the password is too long for Windows.";
 pub enum LogonKind {
     /// `CreateProcessWithLogonW`: an interactive logon, which UAC splits for an administrator.
     Interactive,
-    /// `LogonUserW(BATCH)` and `CreateProcessWithTokenW`: the full token of an administrator.
+    /// `LogonUserW(BATCH)` and `CreateProcessWithTokenW`: the full token, for a shim at High integrity, whose
+    /// folder only an agent with a full token serves.
     Batch,
 }
 
