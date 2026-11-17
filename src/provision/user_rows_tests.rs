@@ -261,7 +261,7 @@ fn socket_reachable_row_follows_the_connection() {
 /// A socket in a folder that is refused is not reached: the row says why, and does not connect.
 #[test]
 fn socket_reachable_row_does_not_connect_through_a_refused_folder() {
-    let profile = TempProfile::new("row-reach-refused");
+    let profile = TempProfile::new("row-refused");
     let loc = profile.location();
     ensure_socket_dir(&loc, &me()).unwrap();
     let _listener = crate::afunix::Listener::bind(loc.path()).unwrap();

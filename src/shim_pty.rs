@@ -265,7 +265,7 @@ fn connect_or_rescue(
     };
     let absent = Absent {
         exec: is_command,
-        location,
+        folder,
         connect: &connection,
         log_failure,
     };

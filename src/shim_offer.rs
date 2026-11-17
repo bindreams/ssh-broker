@@ -54,7 +54,7 @@ pub enum Plan {
 /// today's message alone, because the notice's first sentence would be false for it. A non-local
 /// account is not told to run a command it cannot use.
 ///
-/// `folder_refusal` is why the user's folder cannot be used, if it cannot (see [`folder_refusal`]). It
+/// `folder_refusal` is why the user's folder cannot be used, if it cannot (see [`Folder::refusal`]). It
 /// decides before anything else: the account, the absence and the console do not change that an
 /// offer, a prompt or a started agent would only end in the same failure.
 pub fn plan(
@@ -308,6 +308,18 @@ impl Folder {
         &self.location
     }
 
+    /// Why the private folder cannot be used, if the walk refused it (a link, an owner, an ACL, a file
+    /// where a folder is wanted) or failed on the way (access denied, an untrusted mount point):
+    /// neither lets an agent serve. `None` when it was accepted, is not there yet (a first login: no
+    /// profile, no `AppData`, no folder), or was not walked. A `logs` folder that is refused costs the
+    /// log only.
+    pub fn refusal(&self) -> Option<&anyhow::Error> {
+        match &self.walk {
+            Walk::Refused(e) => Some(e),
+            Walk::Open(_) | Walk::Missing(_) | Walk::Unwalked(_) => None,
+        }
+    }
+
     /// The folder the log goes into, or why there is none. A refused `logs` folder costs the log only.
     pub fn logs(&self) -> anyhow::Result<&crate::acl::DirHandle> {
         match &self.walk {
@@ -337,7 +349,8 @@ impl Folder {
 pub(crate) struct Absent<'a> {
     /// The session carries a command.
     pub exec: bool,
-    pub location: &'a anyhow::Result<SocketLocation>,
+    /// What the shim's first walk found: where the socket is, and whether the folder was refused.
+    pub folder: &'a Folder,
     pub connect: &'a anyhow::Result<Socket>,
     /// Why the shim has no log, if it has none: the fail-open of a command says it.
     pub log_failure: Option<&'a str>,
@@ -377,36 +390,7 @@ impl Rescue for NoRescue {
 /// The real thing: the notice on stderr, or the prompt at the console.
 pub(crate) struct Prompting;
 
-/// Why the user's private folder cannot be used, or `None` if it can or is not there yet (a first
-/// login: no profile, no `AppData`, no folder). It is the walk the agent makes, without making
-/// anything, and the same judgement of each folder: a refusal (a link, an owner, an ACL, a file where
-/// a folder is wanted) and equally a system error on the way (access denied, an untrusted mount
-/// point), since neither lets an agent serve. A `logs` folder that is refused costs the log only.
-fn folder_refusal(location: &SocketLocation, user: &Sid) -> Option<anyhow::Error> {
-    refusal_of(crate::userdir::inspect_socket_dir(location, user).map(drop))
-}
-
-/// [`folder_refusal`] for the outcome of the walk.
-fn refusal_of(looked: anyhow::Result<()>) -> Option<anyhow::Error> {
-    match looked {
-        Err(e) if !e.is::<crate::acl::Missing>() => Some(e),
-        Ok(()) | Err(_) => None,
-    }
-}
-
-/// [`folder_refusal`] for what the shim knows of itself. An account that cannot be told leaves the
-/// folder unjudged, and is logged.
-fn refusal_for(location: &anyhow::Result<SocketLocation>, user: &anyhow::Result<Sid>) -> Option<anyhow::Error> {
-    if let Err(e) = user {
-        tracing::warn!("cannot tell which account this is, so its folder is not judged: {e:#}");
-    }
-    match (location, user) {
-        (Ok(location), Ok(user)) => folder_refusal(location, user),
-        _ => None,
-    }
-}
-
-/// Whether the failure `log_failure` of the log already says `cause`: the two walks found the same
+/// Whether the failure `log_failure` of the log already says `cause`: the log and the folder found the same
 /// thing, so a login with a command, which is told the log's failure, is not told twice. What is
 /// compared is what is wrong (the refusal, or the system error and what it was opening), not the
 /// words of the walk that found it.
@@ -430,25 +414,27 @@ impl Rescue for Prompting {
                 None
             }
         };
-        let kind_of_absence = absence(absent.connect, absent.location);
-        let user = Sid::current_user();
-        let refusal = refusal_for(absent.location, &user);
+        let location = absent.folder.location();
+        let kind_of_absence = absence(absent.connect, location);
+        let refusal = absent.folder.refusal();
         // An agent that has made its socket and not yet called `listen()`, or that has started and not
         // yet made its socket, refuses the connect like no agent at all. It is waited for, never
         // prompted over.
-        if let (Absence::NoAgent, Ok(location), None) = (kind_of_absence, absent.location, &refusal) {
-            match user.and_then(|user| await_starting_agent(location, &provision::canonical_exe(), &user)) {
+        if let (Absence::NoAgent, Ok(location), None) = (kind_of_absence, location, refusal) {
+            match Sid::current_user()
+                .and_then(|user| await_starting_agent(location, &provision::canonical_exe(), &user))
+            {
                 Ok(Starting::Served(socket)) => return Rescued::Connected { socket, modes: None },
                 Ok(Starting::No | Starting::Gone) => {}
                 Err(e) => return starting_failed(&e, absent.exec, absent.log_failure, stderr),
             }
         }
         let console = !absent.exec && console_available();
-        let cause = refusal.as_ref().map(|e| format!("{e:#}"));
+        let cause = refusal.map(|e| format!("{e:#}"));
         match plan(absent.exec, console, kind_of_absence, account, cause.as_deref()) {
             Plan::Nothing => Rescued::Plain,
             Plan::FolderRefused { cause } => {
-                let said = absent.exec && refusal.as_ref().is_some_and(|e| restated_by(absent.log_failure, e));
+                let said = absent.exec && refusal.is_some_and(|e| restated_by(absent.log_failure, e));
                 if !said {
                     let _ = writeln!(stderr, "{}", text::folder_refused(&cause));
                 }
@@ -467,7 +453,7 @@ impl Rescue for Prompting {
 /// The rescue when looking for a starting agent failed: no session is offered, and the login goes on
 /// in a plain shell.
 ///
-/// What this can say is a failure of the user's folder found after [`folder_refusal`] judged it (a
+/// What this can say is a failure of the user's folder found after the shim's walk accepted it (a
 /// link put there since): the same line on stderr, as the notice is told, unless the log's failure
 /// (`log_failure`, which the fail-open of a command says) already says it. Any other failure is
 /// logged.

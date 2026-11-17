@@ -102,7 +102,7 @@ fn a_refused_private_folder_is_shown_and_no_session_is_offered() {
     }
 }
 
-// the judgement of the folder -----
+// the shim's one walk -----
 
 use crate::test_support::{TempProfile, junction, widen};
 
@@ -110,19 +110,24 @@ fn me() -> Sid {
     Sid::current_user().unwrap()
 }
 
+/// The shim's folder at `location`, walked as the current user.
+fn folder_at(location: SocketLocation) -> Folder {
+    Folder::in_location(Ok(location), Ok(me()))
+}
+
 #[test]
-fn a_folder_that_is_usable_or_not_there_yet_is_not_a_refusal() {
+fn a_folder_that_is_usable_or_not_there_yet_is_not_refused() {
     // A first login: nothing is made yet, at any depth.
     let profile = TempProfile::new("fr-first");
-    assert!(folder_refusal(&profile.location(), &me()).is_none(), "no folder yet");
+    assert!(folder_at(profile.location()).refusal().is_none(), "no folder yet");
     std::fs::remove_dir_all(profile.0.join("AppData")).unwrap();
-    assert!(folder_refusal(&profile.location(), &me()).is_none(), "no AppData yet");
+    assert!(folder_at(profile.location()).refusal().is_none(), "no AppData yet");
     let none = crate::test_support::location_in(&profile.0.join("none"));
-    assert!(folder_refusal(&none, &me()).is_none(), "no profile directory yet");
+    assert!(folder_at(none).refusal().is_none(), "no profile directory yet");
 
     let usable = TempProfile::new("fr-ok");
     crate::userdir::ensure_socket_dir(&usable.location(), &me()).unwrap();
-    assert!(folder_refusal(&usable.location(), &me()).is_none(), "an exact folder");
+    assert!(folder_at(usable.location()).refusal().is_none(), "an exact folder");
 }
 
 #[test]
@@ -132,43 +137,32 @@ fn a_refused_logs_folder_alone_does_not_make_the_private_folder_refused() {
     crate::userdir::ensure_socket_dir(&location, &me()).unwrap();
     widen(&location.logs_dir());
 
-    assert!(folder_refusal(&location, &me()).is_none());
+    let folder = folder_at(location);
+
+    assert!(folder.refusal().is_none());
+    assert!(folder.logs().is_err(), "the log is what it costs");
 }
 
 #[test]
-fn every_failure_of_the_walk_but_a_missing_name_is_a_refusal_with_its_own_text() {
-    let missing = {
-        let profile = TempProfile::new("fr-miss");
-        let root = crate::acl::open_root(&profile.0).unwrap();
-        crate::acl::open_dir(&root, "Nothing").err().unwrap()
-    };
-    assert!(refusal_of(Err(missing)).is_none());
-    assert!(refusal_of(Ok(())).is_none());
-
-    // A system error of the walk (access denied at `Local`, an untrusted mount point at a followed
-    // link) is not a `Refused`, and is shown all the same.
-    for code in [
-        windows::Win32::Foundation::ERROR_ACCESS_DENIED,
-        windows::Win32::Foundation::ERROR_UNTRUSTED_MOUNT_POINT,
-    ] {
-        let system = anyhow::Error::from(windows::core::Error::from(windows::core::HRESULT::from_win32(code.0)))
-            .context("open p/AppData/Local");
-        assert!(!system.is::<crate::acl::Refused>());
-        let shown = format!("{:#}", refusal_of(Err(system)).expect("a system error is shown"));
-        assert!(shown.starts_with("open p/AppData/Local: "), "{shown}");
-    }
+fn an_account_that_cannot_be_told_is_logged_and_the_folder_is_not_walked() {
+    let profile = TempProfile::new("rs-nosid");
+    let (log, folder) = crate::test_support::logged(|| {
+        Folder::in_location(Ok(profile.location()), Err(anyhow::anyhow!("the token cannot be read")))
+    });
+    assert!(folder.refusal().is_none());
+    assert!(log.contains("the token cannot be read"), "{log}");
 }
 
-/// What the rescue of a login for `location` shows, and how it goes on. `log_failure` is why the
-/// shim has no log.
+/// What the rescue of a login for `location` shows, and how it goes on. The rescue is handed the
+/// folder the shim's one walk found. `log_failure` is why the shim has no log.
 fn rescued(location: SocketLocation, exec: bool, log_failure: Option<&str>) -> (Rescued, String) {
-    let location = Ok(location);
+    let folder = folder_at(location);
     let connect = Err(anyhow::anyhow!("a connect that failed for no OS reason"));
     let mut shown = Vec::new();
     let rescued = Prompting.rescue(
         &Absent {
             exec,
-            location: &location,
+            folder: &folder,
             connect: &connect,
             log_failure,
         },
@@ -526,8 +520,8 @@ fn a_login_with_a_command_is_not_told_twice_what_the_log_already_says() {
 }
 
 #[test]
-fn the_rescue_tells_a_login_with_a_command_of_the_refusal_its_own_walk_found() {
-    // Set up the log while the folder is fine; the rescue's walk is the one that finds the link.
+fn the_rescue_tells_a_login_with_a_command_of_the_refusal_the_shims_walk_found() {
+    // The shim walks once, at the link: the rescue is told what that walk found.
     let profile = TempProfile::new("rs-exec");
     let local = profile.0.join(r"AppData\Local");
     let elsewhere = profile.0.join("elsewhere");
@@ -558,16 +552,6 @@ fn the_rescue_does_not_repeat_to_a_login_with_a_command_what_the_log_already_say
 
     assert!(matches!(rescued, Rescued::Plain));
     assert!(shown.is_empty(), "{shown:?}");
-}
-
-#[test]
-fn an_account_that_cannot_be_told_is_logged_and_the_folder_is_not_judged() {
-    let profile = TempProfile::new("rs-nosid");
-    let location = Ok(profile.location());
-    let (log, refusal) =
-        crate::test_support::logged(|| refusal_for(&location, &Err(anyhow::anyhow!("the token cannot be read"))));
-    assert!(refusal.is_none());
-    assert!(log.contains("the token cannot be read"), "{log}");
 }
 
 /// What `Evidence::look` says about a folder whose lock file `prepare` has made: `prepare` gets the
@@ -666,7 +650,7 @@ fn a_socket_with_nobody_listening_on_it_is_nobody_listening() {
 
 #[test]
 fn a_listening_socket_in_the_folder_is_connected_to() {
-    let profile = crate::test_support::TempProfile::new("connect-listening");
+    let profile = crate::test_support::TempProfile::new("connect-listen");
     let location = profile.location();
     crate::userdir::ensure_socket_dir(&location, &me()).unwrap();
     let _listener = crate::afunix::Listener::bind(location.path()).unwrap();

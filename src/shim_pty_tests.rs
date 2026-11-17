@@ -383,7 +383,7 @@ fn a_failed_log_adds_nothing_to_an_interactive_fallback_that_prints_nothing_toda
 fn a_failed_log_does_not_touch_the_stderr_of_a_relayed_command() {
     // The diagnostics buffer is the shim's own; a relayed command's stderr is the command's.
     use crate::afunix::Listener;
-    let profile = crate::test_support::TempProfile::new("shim-nolog-relay");
+    let profile = crate::test_support::TempProfile::new("nolog-relay");
     let location = profile.location();
     crate::userdir::ensure_socket_dir(&location, &crate::acl::Sid::current_user().unwrap()).unwrap();
     let agent = fake_agent_exiting_with(Listener::bind(location.path()).unwrap(), 0);
@@ -430,7 +430,7 @@ impl Scripted {
 impl Rescue for Scripted {
     fn rescue(&mut self, absent: &Absent<'_>, stderr: &mut dyn std::io::Write) -> Rescued {
         self.seen
-            .push((absent.exec, absent.location.is_ok(), absent.connect.is_err()));
+            .push((absent.exec, absent.folder.location().is_ok(), absent.connect.is_err()));
         if let Some(line) = self.line {
             writeln!(stderr, "{line}").unwrap();
         }
@@ -723,7 +723,7 @@ fn an_interactive_session_goes_round_again_to_an_agent_that_answers_the_second_t
     use super::Interactive;
     use crate::relay::Outcome;
     use crate::shim::Pumped;
-    let (_profile, location, listener) = location_with_listener("hangup-then-serve");
+    let (_profile, location, listener) = location_with_listener("hangup-serve");
     let (finished, wait_finished) = std::sync::mpsc::channel::<()>();
     let agent = std::thread::spawn(move || {
         drop(listener.accept().unwrap());
@@ -885,7 +885,7 @@ fn a_command_with_a_console_relays_as_a_pty_session_with_the_command() {
     use super::Interactive;
     use crate::relay::Outcome;
     use crate::shim::Pumped;
-    let (_profile, location, _listener) = location_with_listener("terminal-command");
+    let (_profile, location, _listener) = location_with_listener("term-command");
     let mut asked = Vec::new();
 
     let relayed = super::try_relay_with(

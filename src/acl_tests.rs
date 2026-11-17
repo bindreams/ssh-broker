@@ -793,7 +793,7 @@ fn ensure_private_dir_says_so_when_the_folders_security_cannot_be_read() {
 }
 
 /// A component of the profile that this process may not open is a system error of the walk, not a
-/// refusal and not a missing name: the shim shows every one of them (`shim_offer::refusal_of`).
+/// refusal and not a missing name: the shim shows every one of them (`shim_offer::Folder::refusal`).
 #[test]
 fn a_profile_folder_that_cannot_be_opened_is_a_system_error_naming_it() {
     let parent = TempPath::new("walk-denied");
