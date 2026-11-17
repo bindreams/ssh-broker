@@ -728,3 +728,82 @@ fn a_sid_not_aligned_for_its_sub_authorities_is_an_error() {
     let err = info.sid(pointer_at(&info, 9)).unwrap_err();
     assert!(err.to_string().contains("aligned"), "{err:#}");
 }
+
+// The inherit list -----
+
+fn handle(value: isize) -> HANDLE {
+    HANDLE(value as *mut core::ffi::c_void)
+}
+
+/// A handle named twice makes `CreateProcessW` fail (measured), and a terminal session's stdout and stderr can
+/// be one console handle, so the list the call gets has each handle once, in the order given.
+#[test]
+fn the_inherit_list_names_each_handle_once() {
+    let (h, other) = (handle(0x40), handle(0x44));
+    assert_eq!(handle_list(&[h, h, other]), vec![h, other]);
+    assert_eq!(handle_list(&[other, h, other, h]), vec![other, h]);
+    assert!(handle_list(&[]).is_empty());
+}
+
+/// A standard handle a process does not have (null, or `INVALID_HANDLE_VALUE`) is not inherited: in the
+/// list it would fail the call, where the start it replaces took the child without it.
+#[test]
+fn the_inherit_list_leaves_out_a_handle_that_is_not_one() {
+    let h = handle(0x40);
+    assert_eq!(handle_list(&[handle(0), h, handle(-1), h]), vec![h]);
+}
+
+// Starting a child -----
+
+/// An inheritable handle: the write end of a pipe, and the read end kept by the caller.
+fn pipe_with_inheritable_write_end() -> (OwnedHandle, OwnedHandle) {
+    use windows::Win32::Foundation::HANDLE_FLAG_INHERIT;
+    use windows::Win32::Foundation::SetHandleInformation;
+    use windows::Win32::System::Pipes::CreatePipe;
+    let (mut read, mut write) = (HANDLE::default(), HANDLE::default());
+    // SAFETY: valid out-pointers; the handles are closed by `OwnedHandle`.
+    unsafe { CreatePipe(&mut read, &mut write, None, 0) }.expect("make a pipe");
+    let (read, write) = (OwnedHandle(read), OwnedHandle(write));
+    // SAFETY: a handle this test owns.
+    unsafe { SetHandleInformation(write.0, HANDLE_FLAG_INHERIT.0, HANDLE_FLAG_INHERIT) }.expect("mark it inheritable");
+    (read, write)
+}
+
+/// Start `cmd /c exit 0` suspended and end it: whether the call accepted what it was given.
+fn starts(console: ChildConsole, std_handles: [HANDLE; 3], inherit: &[HANDLE]) -> Result<(), StartError> {
+    use windows::Win32::System::Threading::TerminateProcess;
+    // SAFETY: the handles are live and inheritable; the child is suspended and ended here.
+    let (process, _thread) =
+        unsafe { spawn_suspended("cmd.exe /c exit 0", None, console, std_handles, inherit, None) }?;
+    // SAFETY: the suspended process just created.
+    unsafe { TerminateProcess(process.0, 1) }.expect("end the suspended child");
+    Ok(())
+}
+
+/// A terminal session's stdout and stderr can be one console handle. Named in the inherit list twice it fails
+/// the call, so a start with the same handle for both starts.
+#[test]
+fn a_child_whose_stdout_and_stderr_are_one_handle_starts() {
+    let (_read, write) = pipe_with_inheritable_write_end();
+    let null = HANDLE::default();
+    let h = write.0;
+    starts(ChildConsole::NoWindow, [null, h, h], &[null, h, h]).expect("one handle for stdout and stderr");
+    starts(ChildConsole::Parent, [null, h, h], &[null, h, h]).expect("the same on the parent's console");
+}
+
+/// A shim with no standard handles at all starts its shell, as it did before the handle list.
+#[test]
+fn a_child_with_no_standard_handles_starts_on_the_parents_console() {
+    let null = HANDLE::default();
+    starts(ChildConsole::Parent, [null; 3], &[null; 3]).expect("no handles to inherit");
+}
+
+/// The window policy of the parent's console adds no flag: the child shares the console this process has.
+#[test]
+fn a_child_on_the_parents_console_gets_no_window_flag() {
+    use windows::Win32::System::Threading::{CREATE_SUSPENDED, EXTENDED_STARTUPINFO_PRESENT};
+    assert_eq!(
+        creation_flags(&ChildConsole::Parent).0,
+        CREATE_SUSPENDED.0 | EXTENDED_STARTUPINFO_PRESENT.0
+    );
+}

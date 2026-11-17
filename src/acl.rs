@@ -24,6 +24,7 @@
 //! This module is Windows-only (`#[cfg(windows)] mod acl;`). API signatures were
 //! source-verified against windows-0.62.2 (see verify-windows-acl-apis workflow).
 
+use std::mem::offset_of;
 use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
 
@@ -45,10 +46,11 @@ use windows::Win32::Security::Authorization::{
 use windows::Win32::Security::{
     ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, ACL_SIZE_INFORMATION, AclSizeInformation, CONTAINER_INHERIT_ACE, CopySid,
     CreateWellKnownSid, DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetAclInformation, GetLengthSid,
-    GetSecurityDescriptorControl, INHERITED_ACE, IsValidSid, LookupAccountNameW, LookupAccountSidW, OBJECT_INHERIT_ACE,
-    OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SE_DACL_PRESENT, SE_DACL_PROTECTED, SECURITY_ATTRIBUTES,
-    SID_NAME_USE, TOKEN_QUERY, TOKEN_USER, TokenUser, WinBuiltinAdministratorsSid, WinBuiltinUsersSid,
-    WinLocalSystemSid,
+    GetSecurityDescriptorControl, GetSecurityDescriptorDacl, INHERITED_ACE, IsValidSid, LookupAccountNameW,
+    LookupAccountSidW, OBJECT_INHERIT_ACE, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SE_DACL_PRESENT,
+    SE_DACL_PROTECTED, SECURITY_ATTRIBUTES, SID_AND_ATTRIBUTES, SID_NAME_USE, SetTokenInformation, TOKEN_DEFAULT_DACL,
+    TOKEN_GROUPS, TOKEN_QUERY, TOKEN_USER, TokenDefaultDacl, TokenGroups, TokenUser, WinBuiltinAdministratorsSid,
+    WinBuiltinUsersSid, WinLocalSystemSid,
 };
 use windows::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, CreateDirectoryW, FILE_ACCESS_RIGHTS, FILE_ALL_ACCESS, FILE_ATTRIBUTE_DIRECTORY,
@@ -128,6 +130,26 @@ impl Sid {
         let user = unsafe { buf.header::<TOKEN_USER>() }.context("read the token's user")?;
         let sid = buf.sid(user.User.Sid).context("read the token's user")?;
         Sid::from_psid(sid)
+    }
+
+    /// SID of the logon session `token` belongs to (the group marked `SE_GROUP_LOGON_ID`), which needs
+    /// `TOKEN_QUERY`.
+    pub fn logon_of_token(token: HANDLE) -> anyhow::Result<Sid> {
+        /// `SE_GROUP_LOGON_ID` (winnt.h): both bits of the mask are set on a logon SID.
+        const SE_GROUP_LOGON_ID: u32 = 0xC000_0000;
+        let buf = crate::winutil::token_information(token, TokenGroups).context("read the token's groups")?;
+        // SAFETY: the group count is a `u32`.
+        let count = unsafe { buf.header::<u32>() }.context("read the token's group count")?;
+        // SAFETY: every bit pattern is a valid `SID_AND_ATTRIBUTES` (a pointer and an integer).
+        let groups = unsafe { buf.array::<SID_AND_ATTRIBUTES>(offset_of!(TOKEN_GROUPS, Groups), count as usize) }
+            .context("read the token's groups")?;
+        for group in groups {
+            if group.Attributes & SE_GROUP_LOGON_ID == SE_GROUP_LOGON_ID {
+                let sid = buf.sid(group.Sid).context("read the logon SID of the token")?;
+                return Sid::from_psid(sid);
+            }
+        }
+        anyhow::bail!("the token has no logon SID")
     }
 
     /// A well-known SID (SYSTEM / BUILTIN\\Administrators / BUILTIN\\Users).
@@ -683,6 +705,29 @@ fn descriptor_from_sddl(sddl: &str) -> anyhow::Result<LocalSd> {
     }
     .context("parse a security descriptor")?;
     Ok(LocalSd(psd))
+}
+
+/// Make the DACL of the SDDL `sddl` the default DACL of `token`: what the objects the token's process
+/// creates without a descriptor of their own are born with. Needs `TOKEN_ADJUST_DEFAULT`.
+pub(crate) fn set_token_default_dacl(token: HANDLE, sddl: &str) -> anyhow::Result<()> {
+    let sd = descriptor_from_sddl(sddl)?;
+    let (mut present, mut defaulted) = (BOOL(0), BOOL(0));
+    let mut dacl: *mut ACL = std::ptr::null_mut();
+    // SAFETY: the descriptor is valid and outlives the call; the out-pointers are locals.
+    unsafe { GetSecurityDescriptorDacl(sd.0, &mut present, &mut dacl, &mut defaulted) }
+        .context("read the DACL of the descriptor")?;
+    anyhow::ensure!(present.as_bool() && !dacl.is_null(), "{sddl} has no DACL");
+    let default = TOKEN_DEFAULT_DACL { DefaultDacl: dacl };
+    // SAFETY: `default` points into `sd`, which lives past the call; the size is the structure's.
+    unsafe {
+        SetTokenInformation(
+            token,
+            TokenDefaultDacl,
+            (&raw const default).cast(),
+            std::mem::size_of::<TOKEN_DEFAULT_DACL>() as u32,
+        )
+    }
+    .context("set the token's default DACL")
 }
 
 /// Needs `FILE_READ_ATTRIBUTES` on `handle`.

@@ -7,7 +7,7 @@
 //! global inheritable-flag approach would race.
 
 use crate::shell::StartError;
-use crate::winutil::{ChildConsole, OwnedHandle, spawn_suspended};
+use crate::winutil::{ChildConsole, OwnedHandle, UnelevatedToken, spawn_suspended};
 use std::path::Path;
 use windows::Win32::Foundation::{HANDLE, HANDLE_FLAG_INHERIT, SetHandleInformation};
 use windows::Win32::System::Pipes::CreatePipe;
@@ -40,9 +40,14 @@ unsafe fn set_inheritable(h: HANDLE) -> windows::core::Result<()> {
 }
 
 impl ExecChild {
-    /// Spawn `command` with redirected std streams, optionally in `cwd`. `CreateProcessW` cannot run
-    /// leading whitespace, which [`crate::shim::spawn_line`] trims.
-    pub fn spawn(command: &str, cwd: Option<&Path>) -> Result<ExecChild, StartError> {
+    /// Spawn `command` with redirected std streams, optionally in `cwd`, with the agent's token or the token
+    /// `as_user` when it is given. `CreateProcessW` cannot run leading whitespace, which
+    /// [`crate::shim::spawn_line`] trims.
+    pub fn spawn(
+        command: &str,
+        cwd: Option<&Path>,
+        as_user: Option<&UnelevatedToken>,
+    ) -> Result<ExecChild, StartError> {
         unsafe {
             let (stdin_read, stdin_write) = create_pipe()?;
             let (stdout_read, stdout_write) = create_pipe()?;
@@ -64,6 +69,7 @@ impl ExecChild {
                 ChildConsole::NoWindow,
                 handles,
                 &handles,
+                as_user,
             )?;
             // The parent keeps stdin_write/stdout_read/stderr_read; close the child-side ends
             // so the parent's reads see EOF when the child exits.

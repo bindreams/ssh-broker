@@ -443,7 +443,7 @@ impl ConsoleClient {
             .chain(command.get_args().map(|arg| arg.to_string_lossy().into_owned()))
             .collect();
         let console =
-            ssh_broker::conpty::PtySession::spawn(&ssh_broker::cmdline::join_args(&args), cols, rows, None, None)
+            ssh_broker::conpty::PtySession::spawn(&ssh_broker::cmdline::join_args(&args), cols, rows, None, None, None)
                 .expect("start the client on a pseudoconsole");
         let out_read = console.out_read_raw();
         let (chunks, output) = channel();

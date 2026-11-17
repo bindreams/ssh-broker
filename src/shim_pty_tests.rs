@@ -1,7 +1,7 @@
 //! Unit tests for the `shim_pty` module. Windows-only (the module is `#[cfg(windows)]`), so
 //! these compile and run only on a Windows host — in CI, the `Test (windows/amd64)` job.
 
-use super::spawn_contained;
+use super::{LocalChild, start_local};
 use crate::cmdline::Exec;
 use crate::shim_offer::NoRescue;
 
@@ -24,28 +24,28 @@ fn exec_with_terminal(command: &str) -> Exec {
 /// The local passthrough must contain its child in a job object, exactly as the relayed path
 /// does, so that failing open can never become a way to outlive the session.
 ///
-/// `spawn_contained` is what every fail-open session funnels through (`start_local`), a
-/// command and a login alike. So this containment is the sole thing between an unreachable agent and a
-/// process that outlives the session the README promises to reap.
+/// `start_local` is what every fail-open session funnels through, a command and a login alike. So
+/// this containment is the sole thing between an unreachable agent and a process that outlives the
+/// session the README promises to reap.
 ///
 /// Read that as a statement about the PRODUCTION WIRING, not about this test's reach. This test
-/// calls `spawn_contained` directly and therefore gates the spawn, not the wiring: it would stay
-/// green if `run_on` stopped calling it. What keeps the wiring honest is the single
-/// `start_local` call site, and `tests/fail_open_windows.rs` and
-/// `tests/interactive_fail_open_containment.rs`, which drive both arms end to end.
+/// calls `start_local` directly and therefore gates the start, not the wiring: it would stay green
+/// if `run_on` stopped calling it. What keeps the wiring honest is the single `start_local` call
+/// site, and `tests/fail_open_windows.rs` and `tests/interactive_fail_open_containment.rs`, which
+/// drive both arms end to end.
 ///
 /// `cosca::Job` sets `KILL_ON_JOB_CLOSE`, so dropping the job must terminate the child. Before
-/// containment was added the child was created with `PROCESS_CREATION_FLAGS(0)` and no job at
-/// all, and would simply keep running here — which is exactly what this test would catch.
+/// containment was added the child was created with no job at all, and would simply keep running
+/// here, which is exactly what this test would catch.
 #[test]
 fn the_local_passthrough_child_is_contained_in_a_job() {
     use windows::Win32::Foundation::{STILL_ACTIVE, WAIT_OBJECT_0};
     use windows::Win32::System::Threading::{GetExitCodeProcess, INFINITE, WaitForSingleObject};
 
-    // ~30s of doing nothing, so the child is certainly alive until something kills it.
-    // `stdio: None` so it does not inherit the test harness's handles.
-    let (process, job) =
-        unsafe { spawn_contained("cmd /c ping -n 30 127.0.0.1", None) }.expect("spawn a contained child");
+    // ~30s of doing nothing, so the child is certainly alive until something kills it. Its output
+    // goes nowhere, since it shares the harness's standard handles.
+    let LocalChild { process, _job } =
+        start_local("cmd /c ping -n 30 127.0.0.1 >nul", None).expect("start a contained child");
 
     // Liveness as a state QUERY, never a timed wait. It is not decoration: without it the test
     // passes vacuously if the child failed to start or exited instantly, since the wait below
@@ -57,7 +57,7 @@ fn the_local_passthrough_child_is_contained_in_a_job() {
         "the child must still be running before the job is dropped, or this test proves nothing"
     );
 
-    drop(job); // KILL_ON_JOB_CLOSE fires as the handle closes
+    drop(_job); // KILL_ON_JOB_CLOSE fires as the handle closes
 
     // UNBOUNDED on purpose. Containment makes this exit promptly; if it is broken the test hangs
     // until the CI job's own `timeout-minutes` — a loud failure. A numeric timeout here would be
@@ -67,25 +67,17 @@ fn the_local_passthrough_child_is_contained_in_a_job() {
     assert_eq!(rc, WAIT_OBJECT_0, "dropping the job must terminate the contained child");
 }
 
-/// The fail-open spawn trims leading whitespace for `CreateProcessW`, which rejects it; the
-/// relay's spawn does the same (`pipes_tests`).
+/// The fail-open start trims leading whitespace for `CreateProcessW`, which rejects it; the
+/// relay's start does the same (`pipes_tests`).
 #[test]
-fn the_local_passthrough_spawn_accepts_whitespace_at_the_edges_of_a_command() {
-    use windows::Win32::System::Threading::{GetExitCodeProcess, INFINITE, WaitForSingleObject};
-
+fn the_local_passthrough_start_accepts_whitespace_at_the_edges_of_a_command() {
     for command in [
         "  cmd.exe /c exit /b 3",
         "\tcmd.exe /c exit /b 3\r\n",
         "\r\ncmd.exe /c exit /b 3",
     ] {
-        let (process, _job) =
-            unsafe { spawn_contained(command, None) }.unwrap_or_else(|e| panic!("{command:?}: {e:?}"));
-        let mut code = 0u32;
-        unsafe {
-            WaitForSingleObject(process.0, INFINITE);
-            GetExitCodeProcess(process.0, &mut code).unwrap();
-        }
-        assert_eq!(code, 3, "{command:?}");
+        let child = start_local(command, None).unwrap_or_else(|e| panic!("{command:?}: {e:?}"));
+        assert_eq!(child.finish().unwrap(), 3, "{command:?}");
     }
 }
 
@@ -900,7 +892,7 @@ fn ctrl_c_and_ctrl_break_are_handled_and_every_other_console_event_is_left_to_th
 /// command line, which can be 32 KB of the user's command.
 #[test]
 fn a_spawn_that_fails_does_not_put_the_command_line_in_its_error() {
-    let error = unsafe { spawn_contained(r"C:\no\such\shell.exe the-command-text-of-the-user", None) }
+    let error = start_local(r"C:\no\such\shell.exe the-command-text-of-the-user", None)
         .map(|_| ())
         .unwrap_err();
     assert!(matches!(error, crate::shell::StartError::Program(_)), "{error:?}");

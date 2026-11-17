@@ -31,7 +31,7 @@
 use std::path::Path;
 
 use crate::shell::StartError;
-use crate::winutil::{ChildConsole, OwnedHandle, spawn_suspended};
+use crate::winutil::{ChildConsole, OwnedHandle, UnelevatedToken, spawn_suspended};
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Storage::FileSystem::{ReadFile, WriteFile};
 use windows::Win32::System::Console::{COORD, ClosePseudoConsole, CreatePseudoConsole, HPCON, ResizePseudoConsole};
@@ -153,15 +153,16 @@ pub struct PtySession {
 
 impl PtySession {
     /// Spawn `command` in a fresh pseudoconsole of `cols`x`rows`, optionally in `cwd`. The
-    /// child inherits the agent's (session-1) token and environment, and exactly one handle besides
-    /// the pseudoconsole's when `inherit` names it (an inheritable handle of this process, such as
-    /// [`crate::winutil::Handoff::read`]).
+    /// child inherits the agent's (session-1) token and environment, or the token `as_user` when it is
+    /// given, and exactly one handle besides the pseudoconsole's when `inherit` names it (an inheritable
+    /// handle of this process, such as [`crate::winutil::Handoff::read`]).
     pub fn spawn(
         command: &str,
         cols: u16,
         rows: u16,
         cwd: Option<&Path>,
         inherit: Option<&OwnedHandle>,
+        as_user: Option<&UnelevatedToken>,
     ) -> Result<PtySession, StartError> {
         let size = COORD {
             X: cols.max(1) as i16,
@@ -189,6 +190,7 @@ impl PtySession {
                 ChildConsole::Pseudo(hpc.0),
                 [null; 3],
                 inherited.as_ref().map_or(&[], |handles| handles.as_slice()),
+                as_user,
             )?;
 
             let job = crate::winutil::contain_and_resume(process.0, thread.0, "shell")?;

@@ -22,6 +22,16 @@ fn current_user_sid_is_the_one_whoami_reports() {
     assert_eq!(Sid::current_user().unwrap().to_sddl().unwrap(), reported);
 }
 
+/// A logon SID is `S-1-5-5-<high>-<low>`.
+#[test]
+fn the_logon_sid_of_this_process_is_a_logon_session_sid() {
+    let token = crate::winutil::own_token().unwrap();
+    let logon = Sid::logon_of_token(token.0).unwrap().to_sddl().unwrap();
+    let parts: Vec<&str> = logon.split('-').collect();
+    assert_eq!(parts.len(), 6, "{logon}");
+    assert_eq!(&parts[..4], ["S", "1", "5", "5"], "{logon}");
+}
+
 #[test]
 fn well_known_sids_are_the_documented_ones() {
     assert_eq!(

@@ -1,11 +1,14 @@
 //! winutil: shared Windows RAII guards, the process-thread attribute-list helper, and the process
 //! token with its information (Windows-only).
 //!
-//! The attribute list is used by both `conpty` (the PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE list) and
-//! `pipes` (the PROC_THREAD_ATTRIBUTE_HANDLE_LIST list), so its create/cleanup is written and
-//! reasoned about once. `own_token` and `token_information` are the one reader of a token: callers
-//! take a class from it and read the bytes through the checked `header` and `array`, and follow a
-//! SID pointer in them through the checked `sid`.
+//! Used by `conpty` (the PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE list), `pipes` and the shim's fail-open start
+//! (`shim_pty::start_local`) (the PROC_THREAD_ATTRIBUTE_HANDLE_LIST list), so the attribute-list
+//! create/cleanup and the process start are written and reasoned about once. `own_token` and
+//! `token_information` are the one reader of a token: callers take a class from it and read the bytes
+//! through the checked `header` and `array`, and follow a SID pointer in them through the checked `sid`.
+
+mod unelevated;
+pub use unelevated::UnelevatedToken;
 
 use crate::shell::StartError;
 use anyhow::Context;
@@ -17,9 +20,10 @@ use windows::Win32::System::Diagnostics::Debug::{
     GetThreadErrorMode, SEM_FAILCRITICALERRORS, SetThreadErrorMode, THREAD_ERROR_MODE,
 };
 use windows::Win32::System::Threading::{
-    CREATE_NO_WINDOW, CREATE_SUSPENDED, CreateProcessW, DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT,
-    GetCurrentProcess, InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST, OpenProcessToken,
-    PROCESS_CREATION_FLAGS, PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOEXW, UpdateProcThreadAttribute,
+    CREATE_NO_WINDOW, CREATE_SUSPENDED, CreateProcessAsUserW, CreateProcessW, DeleteProcThreadAttributeList,
+    EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess, InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
+    OpenProcessToken, PROCESS_CREATION_FLAGS, PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOEXW,
+    UpdateProcThreadAttribute,
 };
 use windows::core::{PCWSTR, PWSTR};
 
@@ -434,56 +438,78 @@ impl Drop for AttrList {
 /// created. Named here with its documented value, like [`PROC_THREAD_ATTRIBUTE_HANDLE_LIST`].
 const PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE: usize = 0x0002_0016;
 
-/// The console a child the agent starts runs on. The agent has no console of its own (`agent::console`), and a
-/// console program started from a process with none gets a new console with a window, so every start names one
-/// that shows no window.
+/// The console a child that ssh-broker starts runs on. Neither the agent (`agent::console`) nor a shim whose
+/// stdio is sshd's pipes has a console that shows anything, and a console program started from a process
+/// with none gets a new console with a window, so every start names the console it wants.
 pub enum ChildConsole {
     /// A pseudoconsole: its host shows no window.
     Pseudo(HPCON),
     /// A console of its own with no window (`CREATE_NO_WINDOW`).
     NoWindow,
+    /// The console this process has: no window flag. The shim's shell, which shares the terminal sshd gave
+    /// the shim.
+    Parent,
 }
 
 /// The creation flags of [`spawn_suspended`]: suspended (so the child can be put in a job before it runs),
 /// an extended startup block, and the window policy of `console`.
 fn creation_flags(console: &ChildConsole) -> PROCESS_CREATION_FLAGS {
     let window = match console {
-        ChildConsole::Pseudo(_) => PROCESS_CREATION_FLAGS(0),
+        ChildConsole::Pseudo(_) | ChildConsole::Parent => PROCESS_CREATION_FLAGS(0),
         ChildConsole::NoWindow => CREATE_NO_WINDOW,
     };
     CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT | window
 }
 
+/// The handles for `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`: `inherit` with each handle once, in order. A handle
+/// named twice fails `CreateProcessW` (measured), and a terminal session's stdout and stderr can be one
+/// console handle. A null or invalid one is left out: a process without a standard handle has nothing to
+/// pass, and the list would refuse it.
+fn handle_list(inherit: &[HANDLE]) -> Vec<HANDLE> {
+    let mut list: Vec<HANDLE> = Vec::with_capacity(inherit.len());
+    for handle in inherit {
+        if !handle.is_invalid() && !list.contains(handle) {
+            list.push(*handle);
+        }
+    }
+    list
+}
+
 /// Start `command` suspended on `console`, optionally in `cwd`, and return its process and primary thread. The
-/// only way the agent starts a child, so that none can omit the console policy.
+/// only way ssh-broker starts a session's program, so that none can omit the console policy, the handle list
+/// or the message-box guard.
 ///
 /// The child's standard handles are `std_handles` (input, output, error; null ones for a pseudoconsole). It
-/// inherits exactly the handles in `inherit`, and none when that is empty.
+/// inherits exactly the handles in `inherit`, each once, and none when that is empty. With `as_user` the
+/// child's token is that one (`CreateProcessAsUserW`), not this process's.
 ///
 /// # Safety
-/// Every handle in `std_handles` and `inherit` is valid and inheritable, and `console`'s pseudoconsole is open.
+/// Every handle in `std_handles` and `inherit` is valid and inheritable (or null or `INVALID_HANDLE_VALUE`,
+/// which `inherit` skips), and `console`'s pseudoconsole is open.
 pub unsafe fn spawn_suspended(
     command: &str,
     cwd: Option<&std::path::Path>,
     console: ChildConsole,
     std_handles: [HANDLE; 3],
     inherit: &[HANDLE],
+    as_user: Option<&UnelevatedToken>,
 ) -> Result<(OwnedHandle, OwnedHandle), StartError> {
     use std::os::windows::ffi::OsStrExt;
     // The pseudoconsole attribute's value is the HPCON itself, never a pointer to it (that was the cause of
-    // a 0xC0000142 DLL-init failure). `inherit` outlives `CreateProcessW`: the list stores its address.
+    // a 0xC0000142 DLL-init failure). `inherited` outlives the create call: the list stores its address.
     let pseudo = match &console {
         ChildConsole::Pseudo(hpc) => Some(Attr {
             attribute: PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
             value: hpc.0 as *const core::ffi::c_void,
             size: std::mem::size_of::<HPCON>(),
         }),
-        ChildConsole::NoWindow => None,
+        ChildConsole::NoWindow | ChildConsole::Parent => None,
     };
-    let listed = (!inherit.is_empty()).then(|| Attr {
+    let inherited = handle_list(inherit);
+    let listed = (!inherited.is_empty()).then(|| Attr {
         attribute: PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
-        value: inherit.as_ptr() as *const core::ffi::c_void,
-        size: std::mem::size_of_val(inherit),
+        value: inherited.as_ptr() as *const core::ffi::c_void,
+        size: std::mem::size_of_val(inherited.as_slice()),
     });
     let attributes: Vec<Attr> = pseudo.into_iter().chain(listed).collect();
     let attr = unsafe { AttrList::new(&attributes) }?;
@@ -504,19 +530,36 @@ pub unsafe fn spawn_suspended(
 
     let mut pi = PROCESS_INFORMATION::default();
     let _no_boxes = FailCriticalErrors::enter();
+    let inherits = !inherited.is_empty();
+    let flags = creation_flags(&console);
     unsafe {
-        CreateProcessW(
-            PCWSTR::null(),
-            Some(PWSTR(line.as_mut_ptr())),
-            None,
-            None,
-            !inherit.is_empty(),
-            creation_flags(&console),
-            None,
-            cwd_ptr,
-            &si.StartupInfo,
-            &mut pi,
-        )
+        match as_user {
+            Some(token) => CreateProcessAsUserW(
+                Some(token.handle()),
+                PCWSTR::null(),
+                Some(PWSTR(line.as_mut_ptr())),
+                None,
+                None,
+                inherits,
+                flags,
+                None,
+                cwd_ptr,
+                &si.StartupInfo,
+                &mut pi,
+            ),
+            None => CreateProcessW(
+                PCWSTR::null(),
+                Some(PWSTR(line.as_mut_ptr())),
+                None,
+                None,
+                inherits,
+                flags,
+                None,
+                cwd_ptr,
+                &si.StartupInfo,
+                &mut pi,
+            ),
+        }
     }
     .map_err(|e| start_error_of_create(e, cwd))?;
     Ok((OwnedHandle(pi.hProcess), OwnedHandle(pi.hThread)))

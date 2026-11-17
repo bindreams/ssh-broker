@@ -30,7 +30,7 @@ pub fn run(exec: Option<RawExec>) -> anyhow::Result<()> {
 /// raw command line (`cmd /c echo a   `) see it. A trailing line break after a bare program name
 /// therefore fails like a misspelled program; no string rule can tell which shapes
 /// `CreateProcessW` would run as sent, since it depends on the files on disk. Both spawn sites
-/// (`pipes::ExecChild::spawn` and `shim_pty::spawn_contained`) call this.
+/// (`pipes::ExecChild::spawn` and `shim_pty::start_local`) call this.
 pub fn spawn_line(command: &str) -> &str {
     command.trim_start_matches(BOUNDARY)
 }

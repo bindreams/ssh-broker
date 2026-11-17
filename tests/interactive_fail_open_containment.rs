@@ -6,9 +6,9 @@
 //!
 //! Why an integration test rather than a unit test: `shim_pty::run_on` ends in `process::exit`,
 //! so nothing in-process can observe whether it actually routed through
-//! `start_local` -> `spawn_contained`. The existing unit test
+//! `start_local`. The existing unit test
 //! `the_local_passthrough_child_is_contained_in_a_job` (`src/shim_pty_tests.rs`) calls
-//! `spawn_contained` DIRECTLY, so it gates the spawn helper's own containment but says nothing
+//! `start_local` DIRECTLY, so it gates the start's own containment but says nothing
 //! about whether `run_on`'s fail-open still calls it — reverting that to an uncontained
 //! `std::process::Command` (its pre-containment shape) leaves that unit test green, since the
 //! unit test never goes near `run_on`. Only running the actual binary and driving it into the
@@ -121,10 +121,10 @@ fn interactive_fail_open_reaps_a_grandchild_when_the_shim_exits() {
     // never valid for a live process in the first place.
     let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE, false, pid) }
         .unwrap_or_else(|e| panic!("OpenProcess({pid}) failed while the grandchild should still be alive: {e}"));
-    let handle = ssh_broker::winutil::OwnedHandle(handle); // RAII CloseHandle, mirroring spawn_contained's callers
+    let handle = ssh_broker::winutil::OwnedHandle(handle); // RAII CloseHandle, mirroring `start_local`'s callers
 
     // Close the shim's stdin: pwsh sees EOF on its next read and exits, `LocalChild::finish`
-    // observes pwsh's exit, `spawn_contained`'s job object is dropped, and `KILL_ON_JOB_CLOSE`
+    // observes pwsh's exit, `start_local`'s job object is dropped, and `KILL_ON_JOB_CLOSE`
     // reaps every member of the job — including the grandchild, which was never a DIRECT child
     // of the job-assigned process.
     drop(stdin);
