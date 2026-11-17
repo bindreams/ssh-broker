@@ -87,15 +87,6 @@ fn account_named_resolves_a_fixture_account_with_a_space_in_its_name() {
     assert_eq!(resolved.kind, AccountKind::Local);
 }
 
-/// Elevated (CI only).
-/// Covers `account::is_elevated`.
-#[test]
-fn is_elevated_is_true_for_the_ci_token() {
-    let _machine = machine::shared();
-    account_fixture::assert_elevated();
-    assert!(account::is_elevated().unwrap());
-}
-
 // The logon call and what the shim sees of the agent it starts ---------------------------------
 
 /// Elevated (CI only). The sshd shape: the shim is a network-logon token of a standard account in a

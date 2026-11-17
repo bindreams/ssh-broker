@@ -109,33 +109,30 @@ pub fn raw_socket_pair(tag: &str) -> (socket2::Socket, socket2::Socket, PathBuf)
     (server, client, dir)
 }
 
+/// The stdout of `whoami <switch> /fo csv /nh`, which reads this process's token through another path
+/// than the library and so is an independent source for a test.
+pub fn whoami_csv(switch: &str) -> String {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let out = Command::new("whoami")
+        .args([switch, "/fo", "csv", "/nh"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "whoami failed: {out:?}");
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
 // Elevation -----
 
 /// Fail loudly unless this process is an elevated administrator. For the tests that need it, so
 /// they stop before they touch anything when run by hand on an ordinary host.
 pub fn assert_elevated() {
-    use windows::Win32::Foundation::{CloseHandle, HANDLE};
-    use windows::Win32::Security::{GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation};
-    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    use crate::account::{Elevation, elevation};
 
-    let mut token = HANDLE::default();
-    // SAFETY: valid out-pointers; the handle is closed below.
-    let elevated = unsafe {
-        OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).unwrap();
-        let mut info = TOKEN_ELEVATION::default();
-        let mut len = 0u32;
-        let ok = GetTokenInformation(
-            token,
-            TokenElevation,
-            Some(&mut info as *mut _ as *mut core::ffi::c_void),
-            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
-            &mut len,
-        );
-        let _ = CloseHandle(token);
-        ok.is_ok() && info.TokenIsElevated != 0
-    };
-    assert!(
-        elevated,
+    assert_eq!(
+        elevation().unwrap(),
+        Elevation::Full,
         "this test needs an elevated administrator (CI runs it); not running it here"
     );
 }

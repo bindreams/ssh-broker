@@ -273,7 +273,7 @@ const EMPTY_PASSWORD_LINE: &str = "ssh-broker: empty passwords are not supported
 
 impl AutoLoginEnv for WindowsEnv {
     fn is_elevated(&self) -> anyhow::Result<bool> {
-        crate::account::is_elevated()
+        Ok(crate::account::elevation()? == crate::account::Elevation::Full)
     }
 
     fn has_terminal(&self) -> bool {
