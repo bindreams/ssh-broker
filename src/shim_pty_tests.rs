@@ -1124,7 +1124,7 @@ fn a_shim_with_a_terminal_whose_folder_is_refused_does_not_connect_and_prints_th
         &mut stderr,
         None,
         std::io::empty(),
-        &mut crate::shim_offer::Prompting,
+        &mut crate::shim_offer::Prompting::new(Ok(crate::logon::LogonKind::Interactive)),
     )
     .unwrap();
 
@@ -1153,7 +1153,7 @@ fn a_shim_with_a_command_whose_folder_is_refused_does_not_connect_and_says_why_o
         &mut stderr,
         Some(&log_failure),
         std::io::empty(),
-        &mut crate::shim_offer::Prompting,
+        &mut crate::shim_offer::Prompting::new(Ok(crate::logon::LogonKind::Interactive)),
     )
     .unwrap();
 
@@ -1186,7 +1186,7 @@ fn a_shim_with_a_command_whose_folder_is_refused_on_a_later_look_names_that_refu
         &mut stderr,
         Some(&log_failure),
         std::io::empty(),
-        &mut crate::shim_offer::Prompting,
+        &mut crate::shim_offer::Prompting::new(Ok(crate::logon::LogonKind::Interactive)),
     )
     .unwrap();
 
@@ -1213,7 +1213,7 @@ fn a_shim_whose_folder_is_held_open_by_another_program_says_so_and_does_not_conn
         &mut stderr,
         None,
         std::io::empty(),
-        &mut crate::shim_offer::Prompting,
+        &mut crate::shim_offer::Prompting::new(Ok(crate::logon::LogonKind::Interactive)),
     )
     .unwrap();
     drop(holder);

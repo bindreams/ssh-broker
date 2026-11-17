@@ -2,9 +2,9 @@ use std::path::{Path, PathBuf};
 
 use ssh_broker::account::current_account;
 use ssh_broker::acl::Sid;
-use ssh_broker::logon::start_background_agent;
+use ssh_broker::logon::{LogonKind, start_background_agent};
 use ssh_broker::route::{AgentArgs, BackgroundArgs, Route};
-use ssh_broker::shim_offer::{Served, wait_for_agent};
+use ssh_broker::shim_offer::{Served, Stance, stance, wait_for_agent};
 use ssh_broker::socket_watch::SocketWatch;
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::System::Threading::{CreateEventW, GetProcessId, INFINITE, WaitForSingleObject};
@@ -84,6 +84,9 @@ fn shim(dir: &Path) {
     let input = std::fs::read_to_string(dir.join("shim.input")).unwrap();
     let mut lines = input.lines();
     let (password, agent_exe) = (lines.next().unwrap(), lines.next().unwrap());
+    // A test that runs a case under both logons names the one to use (`batch` or `interactive`): the
+    // network token of its fixture account does not tell which the real shim would pick.
+    let logon = std::fs::read_to_string(dir.join("shim.logon")).ok();
     // The logon's own log lines (its job, its probe, its claim) go to `shim.log`, for a test to print.
     let result = match std::fs::File::create(dir.join("shim.log")) {
         Ok(file) => {
@@ -91,7 +94,7 @@ fn shim(dir: &Path) {
                 .with_writer(std::sync::Mutex::new(file))
                 .with_ansi(false)
                 .finish();
-            tracing::subscriber::with_default(log, || run_shim(password, &PathBuf::from(agent_exe)))
+            tracing::subscriber::with_default(log, || run_shim(password, &PathBuf::from(agent_exe), logon.as_deref()))
         }
         Err(e) => format!("create shim.log failed: {e}"),
     };
@@ -109,7 +112,7 @@ fn shim(dir: &Path) {
 /// What the real shim does after the prompt, with the stand-in agent: start the agent through the
 /// logon, then wait, from this token and with the product's own watch, until the agent has made its
 /// folder and written the marker.
-fn run_shim(password: &str, agent_exe: &Path) -> String {
+fn run_shim(password: &str, agent_exe: &Path, logon: Option<&str>) -> String {
     let account = match current_account() {
         Ok(account) => account,
         Err(e) => return format!("current_account failed: {e:#}"),
@@ -118,7 +121,17 @@ fn run_shim(password: &str, agent_exe: &Path) -> String {
         Ok(watch) => watch,
         Err(e) => return format!("watch the socket failed: {e:#}"),
     };
-    let started = match start_background_agent(&account, &password::password(password), agent_exe) {
+    // As the real shim chooses, from its own token, unless the test names the logon.
+    let kind = match logon {
+        Some("batch") => LogonKind::Batch,
+        Some("interactive") => LogonKind::Interactive,
+        Some(other) => return format!("shim.logon names no logon: {other:?}"),
+        None => match stance(ssh_broker::account::elevation()) {
+            Stance::Relay { logon } => logon,
+            other => return format!("no session is offered to this token: {other:?}"),
+        },
+    };
+    let started = match start_background_agent(&account, &password::password(password), agent_exe, kind) {
         Ok(started) => started,
         Err(e) => return format!("logon failed: {} {}", e.code, e.reason),
     };

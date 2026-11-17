@@ -98,6 +98,7 @@ fn start(args: AgentArgs) -> anyhow::Result<()> {
         args.background.as_ref(),
         crate::provision::probe::current_session_id(),
         &current_sid,
+        crate::account::elevation,
         &mut std::io::stderr(),
         reset_inherited_start_state,
         crate::userdir::current_socket_location,
@@ -135,15 +136,17 @@ fn reset_inherited_start_state() -> windows::core::Result<()> {
 
 /// [`start`] with its inputs as parameters, so a test can pick the session and see what runs.
 ///
-/// `background` is `Some` for `agent --background`. The refusals before the log opens leave their
-/// exit code as the only record (see [`Refusal`]). `reset` runs first, before any check; a failure goes
-/// to `stderr` at once, and to the log once it opens.
+/// `background` is `Some` for `agent --background`; `elevation` reads the agent's own token's. The
+/// refusals before the log opens leave their exit code as the only record (see [`Refusal`]). `reset`
+/// runs first, then `elevation`, before any check; a failure of `reset` goes to `stderr` at once, and to
+/// the log once it opens.
 #[cfg(windows)]
 #[allow(clippy::too_many_arguments)] // every input is a seam a test fills
 fn start_with(
     background: Option<&BackgroundArgs>,
     session: u32,
     current_sid: &str,
+    elevation: impl FnOnce() -> anyhow::Result<crate::account::Elevation>,
     stderr: &mut dyn std::io::Write,
     reset: impl FnOnce() -> windows::core::Result<()>,
     locate: impl FnOnce() -> anyhow::Result<SocketLocation>,
@@ -156,8 +159,9 @@ fn start_with(
     if let Some(message) = &reset_failure {
         let _ = writeln!(stderr, "ssh-broker agent: {message}");
     }
-    check_start(background, session, current_sid)?;
     let refused = |refusal: Refusal, cause: anyhow::Error| anyhow::Error::new(refusal).context(format!("{cause:#}"));
+    let elevation = elevation().map_err(|e| refused(Refusal::ElevationUnreadable, e))?;
+    check_start(background, session, current_sid, elevation)?;
     let location = locate().map_err(|e| refused(Refusal::NoSocketLocation, e))?;
     let user = crate::acl::Sid::current_user()?;
     // Held to the end of the process: the folders it keeps cannot be renamed or removed meanwhile, so

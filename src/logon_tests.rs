@@ -34,6 +34,14 @@ fn a_code_windows_has_no_text_for_still_gets_a_reason() {
     assert!(!failure.reason.is_empty());
 }
 
+#[test]
+fn only_error_1385_says_the_logon_right_is_not_granted() {
+    assert!(LogonFailure::from_win32(1385).right_not_granted());
+    for code in [1326, 5, 206, 1331] {
+        assert!(!LogonFailure::from_win32(code).right_not_granted(), "{code}");
+    }
+}
+
 const BREAKAWAY_OK: u32 = 0x0800;
 const SILENT_BREAKAWAY_OK: u32 = 0x1000;
 const KILL_ON_JOB_CLOSE: u32 = 0x2000;

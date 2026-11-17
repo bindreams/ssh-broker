@@ -207,6 +207,71 @@ fn prompt_then_password_relays_into_a_background_session() {
     assert_shim_ran_in_sshds_job(&account);
 }
 
+/// What the session's shell says of its own token, from `whoami /groups`: the mandatory label it carries
+/// and whether `BUILTIN\Administrators` is enabled in it (a filtered token has it for denying only).
+fn whoami_groups(run: &mut PtyRun) -> String {
+    run.type_line(
+        r#"$g = (whoami /groups | Out-String); Write-Output ('wg' + '-label=' + [regex]::Match($g, 'Mandatory Label\\(\w+) Mandatory Level').Groups[1].Value + ' wg' + '-admin=' + [regex]::IsMatch($g, 'S-1-5-32-544\s+Mandatory group, Enabled by default, Enabled group'))"#,
+    );
+    run.read_until_any(&["wg-admin=True", "wg-admin=False"]);
+    let shown = run.text();
+    let at = shown.rfind("wg-label=").expect("the label was printed");
+    shown[at..].split(['\r', '\n']).next().unwrap().to_owned()
+}
+
+/// Elevated (CI only). An administrator who signs in at the password prompt gets an elevated session: the
+/// shell's token is High with Administrators enabled. The shim runs as the account's network token, which
+/// is what sshd gives an administrator.
+#[test]
+fn an_administrators_prompt_session_is_elevated() {
+    let _machine = machine::shared();
+    account_fixture::assert_elevated();
+    let kit = kit("ppad");
+    let account = Account::create("ppad", true);
+    account.make_administrator();
+    let mut run = start_run(&kit, &account);
+    log_in(&mut run, &account.password);
+    assert_relayed(&mut run);
+    assert_eq!(whoami_groups(&mut run), "wg-label=High wg-admin=True");
+    leave(&mut run);
+}
+
+/// Elevated (CI only). A standard account's prompt session is Medium, with no Administrators in the token.
+#[test]
+fn a_standard_accounts_prompt_session_is_medium() {
+    let _machine = machine::shared();
+    let kit = kit("ppst");
+    let account = Account::create("ppst", true);
+    let mut run = start_run(&kit, &account);
+    log_in(&mut run, &account.password);
+    assert_eq!(whoami_groups(&mut run), "wg-label=Medium wg-admin=False");
+    leave(&mut run);
+}
+
+/// Elevated (CI only). An administrator who may not log on as a batch job is told so, in the sentence
+/// `auto-login` uses, and gets the plain shell: the prompt starts no agent for such an administrator.
+#[test]
+fn an_administrator_without_the_batch_right_is_told_and_gets_the_plain_shell() {
+    let _machine = machine::shared();
+    account_fixture::assert_elevated();
+    let kit = kit("ppnb");
+    let account = Account::create("ppnb", true);
+    account.make_administrator();
+    account.deny_batch_logon_right();
+    let mut run = start_run(&kit, &account);
+    log_in_expecting_plain(&mut run, &account.password);
+    let shown = run.text();
+    assert!(shown.contains("may not log on as a batch job"), "{shown}");
+    assert!(
+        shown.contains("a logon at the desktop starts one without it"),
+        "{shown}"
+    );
+    assert!(!shown.contains("Windows did not sign you in"), "{shown}");
+    assert_eq!(shown.matches(PROMPT).count(), 1, "no second prompt:\n{shown}");
+    say(&mut run, "plain-shell-works");
+    leave(&mut run);
+}
+
 /// Elevated (CI only). No `ProfileList` entry yet, and the first logon creates one.
 #[test]
 fn new_account_without_profile_gets_a_profile_and_a_session() {

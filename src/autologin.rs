@@ -69,18 +69,26 @@ pub trait AutoLoginEnv {
     fn say(&mut self, line: &str);
 }
 
-fn not_elevated(verb: &str, exe: &str) -> String {
+fn not_elevated(verb: &str) -> String {
     format!(
-        "ssh-broker: auto-login {verb} needs an elevated administrator shell. A shell hosted by ssh-broker is not \
-         elevated. Open an elevated prompt at the PC, or over SSH run {exe} logout, reconnect, press Ctrl+C at the \
-         password prompt for a plain shell, and run it there."
+        "ssh-broker: auto-login {verb} needs an elevated administrator shell, and this is not one. Run it from an \
+         elevated prompt at the PC, or from an SSH login of an administrator (which is elevated)."
     )
 }
 
-fn batch_right_missing(user: &str) -> String {
+/// The purpose of the boot task's batch logon (`auto-login`).
+pub(crate) const AT_BOOT: &str = "Task Scheduler needs to start the session at boot";
+
+/// The purpose of the prompt's batch logon for an administrator.
+pub(crate) const FROM_PROMPT: &str =
+    "an elevated session started from a password needs (a logon at the desktop starts one without it)";
+
+/// The sentence for an account that may not log on as a batch job, naming what the logon is `purpose`
+/// for ([`AT_BOOT`], [`FROM_PROMPT`]).
+pub(crate) fn batch_right_missing(user: &str, purpose: &str) -> String {
     format!(
-        "ssh-broker: {user} may not log on as a batch job, which Task Scheduler needs to start the session at boot. \
-         An administrator can grant \"Log on as a batch job\" in Local Security Policy (User Rights Assignment). \
+        "ssh-broker: {user} may not log on as a batch job, which {purpose}. An administrator can grant \
+         \"Log on as a batch job\" in Local Security Policy (User Rights Assignment). \
          ssh-broker never changes machine policy."
     )
 }
@@ -95,7 +103,7 @@ pub fn on(env: &mut dyn AutoLoginEnv, account: &LocalAccount) -> anyhow::Result<
     let exe_text = exe.to_string_lossy().into_owned();
     anyhow::ensure!(
         env.is_elevated().context("read the token's elevation")?,
-        not_elevated("on", &exe_text)
+        not_elevated("on")
     );
     anyhow::ensure!(
         env.has_terminal(),
@@ -118,7 +126,7 @@ pub fn on(env: &mut dyn AutoLoginEnv, account: &LocalAccount) -> anyhow::Result<
     env.check_install()?;
     match env.batch_right(account, &password) {
         BatchRight::Granted => {}
-        BatchRight::Missing => anyhow::bail!(batch_right_missing(&account.name)),
+        BatchRight::Missing => anyhow::bail!(batch_right_missing(&account.name, AT_BOOT)),
         BatchRight::Refused(reason) => {
             anyhow::bail!(
                 "ssh-broker: Windows did not accept the password for {}: {reason}",
@@ -171,7 +179,7 @@ pub fn off(env: &mut dyn AutoLoginEnv, account: &LocalAccount) -> anyhow::Result
     let exe = env.exe().to_string_lossy().into_owned();
     anyhow::ensure!(
         env.is_elevated().context("read the token's elevation")?,
-        not_elevated("off", &exe)
+        not_elevated("off")
     );
     // The task holds a stored password, so `off` must be able to delete it where the lock cannot be
     // had: without an install directory there is nothing to lock, one that fails its check is refused

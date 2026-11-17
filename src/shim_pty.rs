@@ -16,6 +16,7 @@
 
 use crate::cmdline::{Encoding, Exec, RawExec, resolve_exec};
 use crate::console_modes::ConsoleModes;
+use crate::offer::text;
 use crate::protocol::{FrameKind, FrameReader, Handshake, Launch, Stream, write_frame};
 use crate::relay::{FrameSink, write_data};
 use crate::shell::{self, Session, StartError};
@@ -24,11 +25,12 @@ use crate::shim::{
     decide_fallback, fail_open, is_blank_command, make_handshake, peer_gone, pump_exec, pump_heard, size_to_resize,
     start_exec_input,
 };
-use crate::shim_offer::{Absent, Folder, Prompting, Rescue, Rescued};
+use crate::shim_offer::{Absent, Folder, Prompting, Rescue, Rescued, Stance, stance};
 use crate::socket_loc::SocketLocation;
 use crate::winutil::{ChildConsole, UnelevatedToken, contain_and_resume, spawn_suspended};
 use crate::{afunix, conpty, vtinput};
 use socket2::Socket;
+use std::io::Write as _;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use windows::Win32::Foundation::HANDLE;
@@ -79,17 +81,29 @@ pub fn run_on(exec: Option<RawExec>, detect: impl FnOnce() -> Encoding) -> anyho
     // out to be untrue — `exec_relay_is_byte_clean_*` covers the framing in both directions, and
     // `verify`'s probe covers a real child, real pipes and a real socket in both directions too.
     // What remains is a throughput difference, which does not earn a classifier.
-    match try_relay(&exec, &folder, log_failure.as_deref(), std::io::stdin(), &mut Prompting) {
-        Ok(Some(code)) => {
-            drop(log); // flush the appender before process::exit
-            // Bypass main()'s Result→0/1 collapse; the i32→u32 cast is bit-preserving.
-            std::process::exit(code)
+    // What this login's own token allows is decided once, before anything connects.
+    let relayed = match stance(crate::account::elevation()) {
+        Stance::PlainShell => {
+            tracing::info!("the token is an administrator's with elevation removed; running the plain shell");
+            let _ = writeln!(std::io::stderr(), "{}", text::FILTERED_SHIM_NOTICE);
+            None
         }
-        Ok(None) => {} // fail-open reason (unreachable / no console) already logged
-        Err(e) => {
-            // A pre-spawn setup failure: the agent ran nothing, so re-running locally is
-            // safe and far better than dying with an error to the user's terminal.
-            tracing::warn!("shim relay setup failed: {e:?}; falling back to a local shell");
+        Stance::Relay { logon } => Some(Prompting::new(Ok(logon))),
+        Stance::RelayWithoutOffer { cause } => Some(Prompting::new(Err(cause))),
+    };
+    if let Some(mut prompting) = relayed {
+        match try_relay(&exec, &folder, log_failure.as_deref(), std::io::stdin(), &mut prompting) {
+            Ok(Some(code)) => {
+                drop(log); // flush the appender before process::exit
+                // Bypass main()'s Result→0/1 collapse; the i32→u32 cast is bit-preserving.
+                std::process::exit(code)
+            }
+            Ok(None) => {} // fail-open reason (unreachable / no console) already logged
+            Err(e) => {
+                // A pre-spawn setup failure: the agent ran nothing, so re-running locally is
+                // safe and far better than dying with an error to the user's terminal.
+                tracing::warn!("shim relay setup failed: {e:?}; falling back to a local shell");
+            }
         }
     }
     // Fail open: the session runs here, through the shell the agent would have started and with the command

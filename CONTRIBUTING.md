@@ -116,11 +116,12 @@ in `tests/common/raw_connect.rs`.
 
 The agent's own operations in the folder (`Listener::bind`, the `agent_lock` locks, the `serving`
 marker) still name it by path. That gains a process of the same account nothing as long as the agent
-runs with the plain, non-elevated token: a link then redirects it only to what the same account can
-already change. The on-demand start gives it that token (pinned by
-`an_administrators_shim_sees_the_agent_it_starts`), and so does the logon task at a desktop logon.
-The `auto-login` task does not: its batch logon gives an administrator the full token. That agent,
-and one started by hand from an elevated prompt, are not covered.
+runs with a non-elevated token: a link then redirects it only to what the same account can already
+change. A standard account's agent has one. An administrator's agent is elevated, started by the logon
+task (`HighestAvailable`), by the password prompt (a batch logon, pinned by
+`an_administrators_shim_sees_the_elevated_agent_it_starts`) or by the `auto-login` task; it refuses to
+run with a filtered token (exit code 68). So the argument does not cover it, nor an agent started by
+hand from an elevated prompt.
 The elevated shim is different. It looks at `agent.lock` through the
 folder's handle and never creates it (`starting_agent`, `userdir::open_existing_socket_dir`); the
 folder watch (`socket_watch`) stays by path, and neither it nor the connect, which goes through the

@@ -9,12 +9,17 @@
 //! principal would land in session 0 — silently reproducing the limited environment this project
 //! exists to escape. `MultipleInstancesPolicy` is `Parallel`: `IgnoreNew` is documented without a
 //! per-user qualifier, so it could drop the second user's agent while the first is running.
-//! `RunLevel=LeastPrivilege` (not Highest) keeps the plain token: elevation would re-arm
-//! RedirectionGuard (breaking symlink-traversal parity) and not match the folder ACL.
+//! `RunLevel=HighestAvailable` gives an administrator the full token (an elevated agent: the agent
+//! refuses a filtered one, see `agent_background`) and a standard account its only token. Elevation does
+//! not bring RedirectionGuard back (measured: a process Task Scheduler starts elevated at the desktop has
+//! no policy).
 
 use super::report::Check;
 
 pub const AGENT_TASK: &str = "ssh-broker-agent";
+
+/// The task's run level: the full token for an administrator, the only token for anyone else.
+const RUN_LEVEL: &str = "HighestAvailable";
 
 /// `BUILTIN\Users`: every account that can log on interactively, administrators included.
 pub const USERS_GROUP_SID: &str = "S-1-5-32-545";
@@ -62,7 +67,7 @@ pub fn agent_task_xml(exe: &str) -> String {
   <Triggers><LogonTrigger><Enabled>true</Enabled></LogonTrigger></Triggers>
   <Principals><Principal id="Users">
     <GroupId>{USERS_GROUP_SID}</GroupId>
-    <RunLevel>LeastPrivilege</RunLevel>
+    <RunLevel>{RUN_LEVEL}</RunLevel>
   </Principal></Principals>
 {settings}
   <Actions Context="Users"><Exec>
@@ -103,8 +108,9 @@ pub fn query_task_argv(name: &str) -> Vec<String> {
 }
 
 /// Whether a queried task XML is the group logon task [`agent_task_xml`] makes: a principal in
-/// [`USERS_GROUP_SID`] and a logon trigger. Case- and whitespace-insensitive, since the service
-/// re-serialises what it is given.
+/// [`USERS_GROUP_SID`], a logon trigger and the run level [`RUN_LEVEL`]. The service leaves out a run
+/// level that is its default (`LeastPrivilege`), so a missing one is not the task. Case- and
+/// whitespace-insensitive, since the service re-serialises what it is given.
 pub fn xml_is_group_logon_task(query_xml: &str) -> bool {
     let squeezed: String = query_xml
         .chars()
@@ -112,7 +118,10 @@ pub fn xml_is_group_logon_task(query_xml: &str) -> bool {
         .map(|c| c.to_ascii_lowercase())
         .collect();
     let group = format!("<groupid>{}</groupid>", USERS_GROUP_SID.to_ascii_lowercase());
-    squeezed.contains(&group) && (squeezed.contains("<logontrigger>") || squeezed.contains("<logontrigger/>"))
+    let run_level = format!("<runlevel>{}</runlevel>", RUN_LEVEL.to_ascii_lowercase());
+    squeezed.contains(&group)
+        && squeezed.contains(&run_level)
+        && (squeezed.contains("<logontrigger>") || squeezed.contains("<logontrigger/>"))
 }
 
 /// Whether a queried task XML switches the task off: `<Enabled>false</Enabled>` in its `Settings`.
@@ -134,6 +143,16 @@ pub fn xml_is_disabled(query_xml: &str) -> bool {
         .any(|value| settings.contains(&format!("<enabled>{value}</enabled>")))
 }
 
+/// The run level a queried task XML states, as written (trimmed); `None` when it states none (the
+/// service leaves out `LeastPrivilege`, its default).
+pub fn xml_run_level(query_xml: &str) -> Option<String> {
+    // ASCII lowercasing keeps every byte offset, so the text is cut from the original.
+    let lower = query_xml.to_ascii_lowercase();
+    let start = lower.find("<runlevel>")? + "<runlevel>".len();
+    let end = start + lower[start..].find("</runlevel>")?;
+    Some(query_xml[start..end].trim().to_owned())
+}
+
 /// The `agent task` row of `verify`, from the query of the task's XML: `Ok(None)` if there is no
 /// such task, and the cause if the query could not be answered.
 pub fn agent_task_row(query: &anyhow::Result<Option<String>>) -> Check {
@@ -144,16 +163,26 @@ pub fn agent_task_row(query: &anyhow::Result<Option<String>>) -> Check {
     let registered = xml.is_some();
     let group = xml.is_some_and(xml_is_group_logon_task);
     let disabled = xml.is_some_and(xml_is_disabled);
+    // The level the task states, which a failing row names: it is why a task that otherwise looks right is not.
+    let run_level = xml.map(|xml| match xml_run_level(xml) {
+        Some(level) => format!("run_level={level}"),
+        None => "run_level=none: `LeastPrivilege` by default".to_owned(),
+    });
     let detail = if registered && !group {
-        "registered=true group_logon_task=false: the task is not the group logon task; run `apply` elevated to \
-         replace it"
-            .to_string()
+        format!(
+            "registered=true group_logon_task=false {}: the task is not the group logon task with run level \
+             HighestAvailable; run `apply` elevated to replace it",
+            run_level.unwrap_or_default()
+        )
     } else if disabled {
-        "registered=true group_logon_task=true enabled=false: the task is disabled, so no agent starts at a logon; a \
-         killed `apply` leaves it so. Run `apply` elevated to enable it"
-            .to_string()
+        format!(
+            "registered=true group_logon_task=true enabled=false {}: the task is disabled, so no agent starts at a \
+             logon; a killed `apply` leaves it so. Run `apply` elevated to enable it",
+            run_level.unwrap_or_default()
+        )
     } else {
-        format!("registered={registered} group_logon_task={group}")
+        let run_level = run_level.map_or(String::new(), |level| format!(" {level}"));
+        format!("registered={registered} group_logon_task={group}{run_level}")
     };
     Check::new("agent task", registered && group && !disabled, detail)
 }

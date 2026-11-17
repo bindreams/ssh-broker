@@ -15,8 +15,8 @@ The point is lineage: a shell that is a child of the agent rather than of `sshd`
 neither the session-0 network logon nor the RedirectionGuard mitigation. `verify` establishes
 the session id and DPAPI through an agent-spawned probe, and reports symlink traversal — a probe
 that cannot create a link reports `Skipped` rather than failing, which is the usual outcome for
-the unprivileged agent. The profile follows from the interactive logon and is not separately
-checked.
+the agent, which runs as the account itself (elevated for an administrator). The profile follows
+from the interactive logon and is not separately checked.
 
 ## Where things live
 

@@ -15,11 +15,11 @@ use socket2::Socket;
 use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
 use windows::Win32::System::Threading::{GetExitCodeProcess, INFINITE, WaitForMultipleObjects};
 
-use crate::account::{self, LocalAccount};
+use crate::account::{self, Elevation, LocalAccount};
 use crate::acl::Sid;
 use crate::console_modes::ConsoleModes;
 use crate::console_prompt::{ConsolePrompt, absence, console_available, is_no_agent};
-use crate::logon::{self, StartedAgent, Survival};
+use crate::logon::{self, LogonFailure, LogonKind, StartedAgent, Survival};
 use crate::offer::{
     Absence, AccountKind, Disconnected, OfferIo, Offered, SessionKind, StartFailure, non_interactive_notice, offer,
     text,
@@ -40,8 +40,12 @@ pub enum Plan {
     Nothing,
     /// A session without a terminal: one stderr line naming `ssh -t` and `auto-login on`.
     Notice { user: String },
-    /// A terminal and no command: run the offer.
-    Offer { account: LocalAccount, absence: Absence },
+    /// A terminal and no command: run the offer, signing the account on as `logon` says.
+    Offer {
+        account: LocalAccount,
+        absence: Absence,
+        logon: LogonKind,
+    },
     /// The user's folder cannot be used (`cause` says what failed and, for a refusal, what to do), so
     /// no agent can serve it: `cause` on stderr (unless the log's failure already says it), no
     /// prompt, no agent started.
@@ -55,15 +59,18 @@ pub enum Plan {
 /// today's message alone, because the notice's first sentence would be false for it. A non-local
 /// account is not told to run a command it cannot use.
 ///
+/// `logon` is the logon an offer signs the account on with, decided by [`stance`].
+///
 /// `folder_refusal` is why the user's folder cannot be used, if it cannot (see [`Folder::refusal`]). It
-/// decides before anything else: the account, the absence and the console do not change that an
-/// offer, a prompt or a started agent would only end in the same failure.
+/// decides next: the account, the absence and the console do not change that an offer, a prompt or a
+/// started agent would only end in the same failure.
 pub fn plan(
     exec: bool,
     console: bool,
     absence: Absence,
     account: Option<LocalAccount>,
     folder_refusal: Option<&str>,
+    logon: LogonKind,
 ) -> Plan {
     if let Some(cause) = folder_refusal {
         return Plan::FolderRefused {
@@ -77,11 +84,45 @@ pub fn plan(
         return Plan::Nothing;
     }
     if !exec && console {
-        return Plan::Offer { account, absence };
+        return Plan::Offer {
+            account,
+            absence,
+            logon,
+        };
     }
     match account.kind {
         AccountKind::Local => Plan::Notice { user: account.name },
         AccountKind::NotLocal => Plan::Nothing,
+    }
+}
+
+// stance -----
+
+/// What the shim does, from its own token's elevation, before anything connects.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Stance {
+    /// The token is an administrator's with elevation removed: the notice and the plain shell, no connect.
+    PlainShell,
+    /// Relay; with no agent, an offer signs the account on as `logon`.
+    Relay { logon: LogonKind },
+    /// The elevation could not be read (`cause`): relay, and with no agent say so and offer nothing.
+    RelayWithoutOffer { cause: String },
+}
+
+/// Decide the [`Stance`] for `elevation`. Only a `Full` token's account needs the whole token, so only
+/// it signs on as a batch job.
+pub fn stance(elevation: anyhow::Result<Elevation>) -> Stance {
+    match elevation {
+        Ok(Elevation::Filtered) => Stance::PlainShell,
+        Ok(Elevation::Full) => Stance::Relay {
+            logon: LogonKind::Batch,
+        },
+        Ok(Elevation::Standard) => Stance::Relay {
+            logon: LogonKind::Interactive,
+        },
+        Err(e) => Stance::RelayWithoutOffer {
+            cause: format!("{e:#}"),
+        },
     }
 }
 
@@ -423,11 +464,28 @@ impl Rescue for NoRescue {
     }
 }
 
-/// The real thing: the notice on stderr, or the prompt at the console.
-pub(crate) struct Prompting;
+/// The real thing: the notice on stderr, or the prompt at the console. `logon` is the offer's, or why
+/// there is none (see [`Stance::RelayWithoutOffer`]).
+pub(crate) struct Prompting {
+    logon: Result<LogonKind, String>,
+}
+
+impl Prompting {
+    pub fn new(logon: Result<LogonKind, String>) -> Prompting {
+        Prompting { logon }
+    }
+}
 
 impl Rescue for Prompting {
     fn rescue(&mut self, absent: &Absent<'_>, stderr: &mut dyn Write) -> Rescued {
+        let logon = match &self.logon {
+            Ok(logon) => *logon,
+            Err(cause) => {
+                tracing::warn!("cannot tell how elevated this login is, so no session is offered: {cause}");
+                let _ = writeln!(stderr, "{}", text::elevation_unreadable(cause));
+                return Rescued::Plain;
+            }
+        };
         let account = match account::current_account() {
             Ok(account) => Some(account),
             Err(e) => {
@@ -453,7 +511,7 @@ impl Rescue for Prompting {
         }
         let console = !absent.exec && console_available();
         let cause = absent.folder.refusal();
-        match plan(absent.exec, console, kind_of_absence, account, cause.as_deref()) {
+        match plan(absent.exec, console, kind_of_absence, account, cause.as_deref(), logon) {
             Plan::Nothing => Rescued::Plain,
             Plan::FolderRefused { cause } => {
                 if !absent.exec {
@@ -466,7 +524,11 @@ impl Rescue for Prompting {
                 let _ = writeln!(stderr, "{}", non_interactive_notice(&user, &exe.to_string_lossy()));
                 Rescued::Plain
             }
-            Plan::Offer { account, absence } => run_offer(account, absence),
+            Plan::Offer {
+                account,
+                absence,
+                logon,
+            } => run_offer(account, absence, logon),
         }
     }
 }
@@ -505,6 +567,7 @@ struct LiveIo {
     prompt: ConsolePrompt,
     account: LocalAccount,
     exe: PathBuf,
+    logon: LogonKind,
     started: Option<Started>,
 }
 
@@ -525,7 +588,7 @@ impl OfferIo for LiveIo {
             "asking Windows to sign {} in and start the background session",
             self.account.name
         );
-        match logon::start_background_agent(&self.account, password, &self.exe) {
+        match logon::start_background_agent(&self.account, password, &self.exe, self.logon) {
             Ok(agent) => {
                 tracing::info!("Windows started the background session; waiting for it to serve");
                 self.started = Some(Started { agent });
@@ -538,13 +601,24 @@ impl OfferIo for LiveIo {
                     failure.reason,
                     failure.code
                 );
-                Err(StartFailure::Windows { reason: failure.reason })
+                Err(start_failure(self.logon, &self.account.name, failure))
             }
         }
     }
 }
 
-fn run_offer(account: LocalAccount, kind_of_absence: Absence) -> Rescued {
+/// What the offer says of a logon that Windows refused. A refused batch logon for want of the batch right
+/// gets `auto-login`'s sentence; every other refusal is Windows' own text.
+fn start_failure(logon: LogonKind, user: &str, failure: LogonFailure) -> StartFailure {
+    if logon == LogonKind::Batch && failure.right_not_granted() {
+        return StartFailure::NoBatchRight {
+            sentence: crate::autologin::batch_right_missing(user, crate::autologin::FROM_PROMPT),
+        };
+    }
+    StartFailure::Windows { reason: failure.reason }
+}
+
+fn run_offer(account: LocalAccount, kind_of_absence: Absence, logon: LogonKind) -> Rescued {
     let prompt = match ConsolePrompt::enter() {
         Ok(Some(prompt)) => prompt,
         Ok(None) => return Rescued::Plain,
@@ -557,6 +631,7 @@ fn run_offer(account: LocalAccount, kind_of_absence: Absence) -> Rescued {
         prompt,
         account: account.clone(),
         exe: provision::canonical_exe(),
+        logon,
         started: None,
     };
     match offer(SessionKind::Pty, account.kind, kind_of_absence, &account.name, &mut io) {

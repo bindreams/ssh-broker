@@ -31,8 +31,12 @@ fn agent_xml_runs_for_any_member_of_users() {
         "IgnoreNew could drop the second user's agent"
     );
     assert!(
-        xml.contains("<RunLevel>LeastPrivilege</RunLevel>"),
-        "elevation would re-arm RedirectionGuard"
+        xml.contains("<RunLevel>HighestAvailable</RunLevel>"),
+        "an administrator's agent is elevated, a standard account's has its only token"
+    );
+    assert!(
+        !xml.contains("LeastPrivilege"),
+        "the filtered token is refused by the agent"
     );
     assert!(xml.contains(r"C:\ProgramData\ssh-broker\ssh-broker.exe"));
     assert!(xml.contains("<Arguments>agent</Arguments>"));
@@ -125,6 +129,73 @@ fn xml_is_group_logon_task_tolerates_case_and_whitespace_in_the_queried_form() {
 fn agent_task_row_passes_for_the_group_task() {
     let row = agent_task_row(&Ok(Some(agent_task_xml(r"C:\x.exe"))));
     assert!(row.pass, "{}", row.detail);
+    assert!(
+        row.detail.contains("run_level=HighestAvailable"),
+        "the row names the run level it read: {}",
+        row.detail
+    );
+}
+
+#[test]
+fn agent_task_row_prints_the_run_level_as_the_queried_xml_spells_it() {
+    let queried = agent_task_xml(r"C:\x.exe").replace(
+        "<RunLevel>HighestAvailable</RunLevel>",
+        "<RunLevel>\n  highestavailable \n</RunLevel>",
+    );
+    let row = agent_task_row(&Ok(Some(queried)));
+    assert!(row.pass, "{}", row.detail);
+    assert!(row.detail.contains("run_level=highestavailable"), "{}", row.detail);
+}
+
+#[test]
+fn xml_run_level_reads_the_level_and_finds_none_when_it_is_left_out() {
+    assert_eq!(
+        xml_run_level(&agent_task_xml(r"C:\x.exe")).as_deref(),
+        Some("HighestAvailable")
+    );
+    assert_eq!(
+        xml_run_level(&least_privilege_agent_task_xml()).as_deref(),
+        Some("LeastPrivilege")
+    );
+    let omitted = agent_task_xml(r"C:\x.exe").replace("    <RunLevel>HighestAvailable</RunLevel>\n", "");
+    assert_eq!(xml_run_level(&omitted), None);
+}
+
+/// The agent task as an earlier `apply` registered it.
+fn least_privilege_agent_task_xml() -> String {
+    agent_task_xml(r"C:\x.exe").replace("HighestAvailable", "LeastPrivilege")
+}
+
+#[test]
+fn xml_is_group_logon_task_requires_the_highest_available_run_level() {
+    assert!(xml_is_group_logon_task(&agent_task_xml(r"C:\x.exe")));
+    assert!(
+        !xml_is_group_logon_task(&least_privilege_agent_task_xml()),
+        "an administrator's agent from this task would be filtered, and refuse to start"
+    );
+    let omitted = agent_task_xml(r"C:\x.exe").replace("    <RunLevel>HighestAvailable</RunLevel>\n", "");
+    assert!(!omitted.contains("RunLevel"), "control: no run level");
+    assert!(
+        !xml_is_group_logon_task(&omitted),
+        "the service leaves LeastPrivilege out when it holds the default"
+    );
+}
+
+#[test]
+fn xml_is_group_logon_task_tolerates_case_and_whitespace_in_the_run_level() {
+    let queried = agent_task_xml(r"C:\x.exe").replace(
+        "<RunLevel>HighestAvailable</RunLevel>",
+        "<RunLevel>\n  highestavailable \n</RunLevel>",
+    );
+    assert!(xml_is_group_logon_task(&queried));
+}
+
+#[test]
+fn agent_task_row_fails_for_the_run_level_of_an_earlier_apply_and_says_to_run_apply() {
+    let row = agent_task_row(&Ok(Some(least_privilege_agent_task_xml())));
+    assert!(!row.pass, "{}", row.detail);
+    assert!(row.detail.contains("HighestAvailable"), "{}", row.detail);
+    assert!(row.detail.contains("apply"), "{}", row.detail);
 }
 
 #[test]
@@ -139,6 +210,11 @@ fn agent_task_row_fails_when_the_task_is_not_registered() {
     let row = agent_task_row(&Ok(None));
     assert!(!row.pass);
     assert!(row.detail.contains("registered=false"), "{}", row.detail);
+    assert!(
+        !row.detail.contains("run_level"),
+        "there is no task to have a run level: {}",
+        row.detail
+    );
 }
 
 #[test]
@@ -174,6 +250,23 @@ fn agent_task_row_fails_for_a_disabled_task_and_says_to_run_apply() {
     assert!(!row.pass, "{}", row.detail);
     assert!(row.detail.contains("disabled"), "{}", row.detail);
     assert!(row.detail.contains("apply"), "{}", row.detail);
+}
+
+#[test]
+fn a_failing_row_says_which_run_level_it_read() {
+    let without_level = agent_task_xml(r"C:\x.exe").replace("    <RunLevel>HighestAvailable</RunLevel>\n", "");
+    let disabled_least = disabled_agent_task_xml().replace("HighestAvailable", "LeastPrivilege");
+    for (xml, said) in [
+        (least_privilege_agent_task_xml(), "run_level=LeastPrivilege"),
+        (per_user_task_xml("DOMAIN\\someone"), "run_level=LeastPrivilege"),
+        (without_level, "run_level=none: `LeastPrivilege` by default"),
+        (disabled_agent_task_xml(), "run_level=HighestAvailable"),
+        (disabled_least, "run_level=LeastPrivilege"),
+    ] {
+        let row = agent_task_row(&Ok(Some(xml)));
+        assert!(!row.pass, "{}", row.detail);
+        assert!(row.detail.contains(said), "{said}: {}", row.detail);
+    }
 }
 
 #[test]

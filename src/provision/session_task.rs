@@ -32,8 +32,12 @@ pub fn requested_sddl(sid: &str) -> String {
 }
 
 /// The task definition: a boot trigger, the account by SID with a stored password
-/// (`LogonType Password`), the plain token (`LeastPrivilege`: elevation would re-arm
-/// RedirectionGuard), and `exe agent --background --expect-user <sid>`. One agent per user.
+/// (`LogonType Password`), `LeastPrivilege`, and `exe agent --background --expect-user <sid>`. One
+/// agent per user.
+///
+/// The agent refuses an administrator's token below High (see `agent_background`). `LeastPrivilege` is
+/// safe here because a stored-password batch logon is not split by UAC under either run level (measured);
+/// if that stops holding, an administrator's agent from this task exits 68.
 pub fn task_xml(exe: &str, sid: &str) -> String {
     let exe = xml_escape(exe);
     let sid = xml_escape(sid);
@@ -220,7 +224,7 @@ pub fn task_problem(state: &TaskState, exe: &str, sid: &str) -> Option<String> {
         .iter()
         .any(|level| *level != "leastprivilege")
     {
-        return Some("run level: expected the plain token (LeastPrivilege)".to_string());
+        return Some("run level: expected LeastPrivilege".to_string());
     }
     let triggers = trigger_names(&xml);
     if triggers != ["boottrigger"] {

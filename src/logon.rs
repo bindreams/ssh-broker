@@ -2,8 +2,10 @@
 //!
 //! The call is `CreateProcessWithLogonW(LOGON_WITH_PROFILE)`, which hands the password to the
 //! Secondary Logon service and starts `ssh-broker agent --background` as the user in a new logon
-//! session with a loaded profile, DPAPI and junction traversal (spike M1, M2). The password is only
-//! the call's argument, in a NUL-terminated copy that `Password::with_nul` wipes when the call
+//! session with a loaded profile, DPAPI and junction traversal (spike M1, M2). For an administrator
+//! ([`LogonKind::Batch`]) the logon is `LogonUserW(BATCH)`, which UAC does not split, and the process
+//! starts with that token: the agent runs elevated, with the same profile and DPAPI. The password
+//! is only the call's argument, in a NUL-terminated copy that `Password::with_nul` wipes when the call
 //! returns; it is on no command line, in no environment and in no error text.
 //!
 //! The service puts the child in the caller's job (CI, M3: the child of a caller in a kill-on-close job
@@ -27,8 +29,8 @@ use windows::Win32::System::JobObjects::{
     IsProcessInJob, JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation, QueryInformationJobObject,
 };
 use windows::Win32::System::Threading::{
-    CREATE_BREAKAWAY_FROM_JOB, CREATE_NO_WINDOW, CreateProcessWithLogonW, GetCurrentProcess, LOGON_WITH_PROFILE,
-    PROCESS_CREATION_FLAGS, PROCESS_INFORMATION, STARTUPINFOW,
+    CREATE_BREAKAWAY_FROM_JOB, CREATE_NO_WINDOW, CreateProcessWithLogonW, CreateProcessWithTokenW, GetCurrentProcess,
+    LOGON_WITH_PROFILE, PROCESS_CREATION_FLAGS, PROCESS_INFORMATION, STARTUPINFOW,
 };
 use windows::core::{BOOL, HRESULT, PCWSTR, PWSTR};
 
@@ -46,6 +48,15 @@ const ERROR_LOGON_TYPE_NOT_GRANTED: u32 = 1385;
 /// `ERROR_ACCESS_DENIED`: what a refused `CREATE_BREAKAWAY_FROM_JOB` is answered with.
 const ERROR_ACCESS_DENIED: u32 = 5;
 const PASSWORD_TOO_LONG: &str = "the password is too long for Windows.";
+
+/// Which logon starts the agent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogonKind {
+    /// `CreateProcessWithLogonW`: an interactive logon, which UAC splits for an administrator.
+    Interactive,
+    /// `LogonUserW(BATCH)` and `CreateProcessWithTokenW`: the full token of an administrator.
+    Batch,
+}
 
 /// The background agent the logon started. Dropping it closes the handle; the agent keeps running.
 pub struct StartedAgent {
@@ -144,6 +155,11 @@ impl LogonFailure {
             text.to_owned()
         };
         LogonFailure { code, reason }
+    }
+
+    /// Whether the account does not hold the right for the logon type (`ERROR_LOGON_TYPE_NOT_GRANTED`).
+    pub fn right_not_granted(&self) -> bool {
+        self.code == ERROR_LOGON_TYPE_NOT_GRANTED
     }
 
     fn from_error(error: &windows::core::Error) -> LogonFailure {
@@ -251,19 +267,53 @@ fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
-/// Sign `account` on with `password` and start `exe agent --background` as that account. Returns
-/// once the call has. The caller learns that the agent serves from the files it writes (see
-/// `socket_watch`), and that it ended from the process handle in [`StartedAgent`].
+/// The one `LogonUserW(BATCH)` call: a primary token of `account`, signed on as a batch job with no
+/// network credentials. [`start_background_agent`] starts the administrator's agent with it, and
+/// [`check_batch_logon`] asks only whether it can be made.
+pub fn batch_logon(account: &LocalAccount, password: &Password) -> Result<OwnedHandle, LogonFailure> {
+    use windows::Win32::Security::{LOGON32_LOGON_BATCH, LOGON32_PROVIDER_DEFAULT, LogonUserW};
+    let user = wide(&account.name);
+    let mut token = HANDLE::default();
+    let logged_on = password.with_nul(|password| {
+        // SAFETY: NUL-terminated inputs and a valid out-pointer; `password` is the wiped copy.
+        unsafe {
+            LogonUserW(
+                PCWSTR(user.as_ptr()),
+                PCWSTR(wide(".").as_ptr()),
+                PCWSTR(password.as_ptr()),
+                LOGON32_LOGON_BATCH,
+                LOGON32_PROVIDER_DEFAULT,
+                &mut token,
+            )
+        }
+    });
+    logged_on.map_err(|e| LogonFailure::from_error(&e))?;
+    Ok(OwnedHandle(token))
+}
+
+/// Sign `account` on with `password` as `kind` says and start `exe agent --background` as that
+/// account. Returns once the call has. The caller learns that the agent serves from the files it
+/// writes (see `socket_watch`), and that it ended from the process handle in [`StartedAgent`].
+///
+/// Both kinds go through the same job probe, breakaway fallback and survival claim; only the call that
+/// makes the process differs. A [`LogonKind::Batch`] logon is made once, first: a refused breakaway
+/// repeats the process's creation and not the logon.
 pub fn start_background_agent(
     account: &LocalAccount,
     password: &Password,
     exe: &Path,
+    kind: LogonKind,
 ) -> Result<StartedAgent, LogonFailure> {
+    let token = match kind {
+        LogonKind::Interactive => None,
+        LogonKind::Batch => Some(batch_logon(account, password)?),
+    };
     let mut command = wide(&command_line(exe, &account.sid));
     let exe_w = wide(&exe.to_string_lossy());
     // The caller's directory may be one the account cannot enter; the install directory is
     // readable by every user.
     let directory = exe.parent().map(|dir| wide(&dir.to_string_lossy()));
+    let directory = directory.as_ref().map_or(PCWSTR::null(), |dir| PCWSTR(dir.as_ptr()));
     let startup = STARTUPINFOW {
         cb: std::mem::size_of::<STARTUPINFOW>() as u32,
         ..Default::default()
@@ -272,16 +322,16 @@ pub fn start_background_agent(
     let user = wide(&account.name);
     let job = CallerJob::of_this_process();
     let flags = creation_flags(&job);
-    // Before the logon, so that what it finds is what the call is about to meet.
+    // Before the call that makes the process, so that what it finds is what the call is about to meet.
     let probe = probe_for(&job, start_probe);
     tracing::info!(
-        "logon call: caller's job {job:?}, creation flags {:#x}, survival probe {probe:?}",
+        "logon call: caller's job {job:?}, creation flags {:#x}, survival probe {probe:?}, kind {kind:?}",
         flags.0
     );
-    let result = password.with_nul(|password| {
-        with_breakaway_fallback(flags, |flags| {
+    let result = with_breakaway_fallback(flags, |flags| {
+        let started = match &token {
             // SAFETY: every pointer is to a local that outlives the call; `password` is the wiped copy.
-            unsafe {
+            None => password.with_nul(|password| unsafe {
                 CreateProcessWithLogonW(
                     PCWSTR(user.as_ptr()),
                     PCWSTR(wide(".").as_ptr()),
@@ -291,13 +341,28 @@ pub fn start_background_agent(
                     Some(PWSTR(command.as_mut_ptr())),
                     flags,
                     None,
-                    directory.as_ref().map_or(PCWSTR::null(), |dir| PCWSTR(dir.as_ptr())),
+                    directory,
                     &startup,
                     &mut info,
                 )
-            }
-            .map_err(|e| LogonFailure::from_error(&e))
-        })
+            }),
+            // SAFETY: every pointer is to a local that outlives the call, and `token` is a primary
+            // token that this function holds for the call.
+            Some(token) => unsafe {
+                CreateProcessWithTokenW(
+                    token.0,
+                    LOGON_WITH_PROFILE,
+                    PCWSTR(exe_w.as_ptr()),
+                    Some(PWSTR(command.as_mut_ptr())),
+                    flags,
+                    None,
+                    directory,
+                    &startup,
+                    &mut info,
+                )
+            },
+        };
+        started.map_err(|e| LogonFailure::from_error(&e))
     });
     match result {
         Ok(((), kept_breakaway)) => {
@@ -317,39 +382,17 @@ pub fn start_background_agent(
     }
 }
 
-/// Whether `account` may log on as a batch job, which a boot task needs. A network-less logon of the
-/// batch type, closed at once: with the password in hand, Windows says `ERROR_LOGON_TYPE_NOT_GRANTED`
+/// Whether `account` may log on as a batch job, which a boot task needs. [`batch_logon`] with the
+/// token closed at once: with the password in hand, Windows says `ERROR_LOGON_TYPE_NOT_GRANTED`
 /// (1385) when the right is missing (spike M5(d)).
 pub fn check_batch_logon(account: &LocalAccount, password: &Password) -> BatchRight {
-    use windows::Win32::Security::{LOGON32_LOGON_BATCH, LOGON32_PROVIDER_DEFAULT, LogonUserW};
-    let user = wide(&account.name);
-    let mut token = HANDLE::default();
-    let logged_on = password.with_nul(|password| {
-        // SAFETY: NUL-terminated inputs and a valid out-pointer; `password` is the wiped copy.
-        unsafe {
-            LogonUserW(
-                PCWSTR(user.as_ptr()),
-                PCWSTR(wide(".").as_ptr()),
-                PCWSTR(password.as_ptr()),
-                LOGON32_LOGON_BATCH,
-                LOGON32_PROVIDER_DEFAULT,
-                &mut token,
-            )
-        }
-    });
-    match logged_on {
-        Ok(()) => {
-            drop(OwnedHandle(token));
+    match batch_logon(account, password) {
+        Ok(token) => {
+            drop(token);
             BatchRight::Granted
         }
-        Err(e) => {
-            let failure = LogonFailure::from_error(&e);
-            if failure.code == ERROR_LOGON_TYPE_NOT_GRANTED {
-                BatchRight::Missing
-            } else {
-                BatchRight::Refused(failure.reason)
-            }
-        }
+        Err(failure) if failure.right_not_granted() => BatchRight::Missing,
+        Err(failure) => BatchRight::Refused(failure.reason),
     }
 }
 

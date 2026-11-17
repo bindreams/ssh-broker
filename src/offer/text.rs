@@ -44,7 +44,20 @@ pub fn non_interactive_notice(user: &str, exe: &str) -> String {
     )
 }
 
-/// The sentence for a background agent that ended before it served. 64 to 67 are the agent's own
+/// The stderr line for a login whose own token is an administrator's with elevation removed
+/// (`account::Elevation::Filtered`): this account's session serves elevated logins only.
+pub const FILTERED_SHIM_NOTICE: &str = "ssh-broker: this account's session serves elevated logins only, and this login is an administrator's with elevation removed, so this runs without DPAPI, a loaded profile or symlink traversal.";
+
+/// The stderr line for a login whose token's elevation cannot be read, where `cause` is why: no session
+/// is offered, since its logon depends on that elevation.
+pub fn elevation_unreadable(cause: &str) -> String {
+    format!(
+        "ssh-broker: cannot tell how elevated this login is ({cause}), so no session is offered and this runs \
+         without DPAPI, a loaded profile or symlink traversal."
+    )
+}
+
+/// The sentence for a background agent that ended before it served. 64 to 69 are the agent's own
 /// refusals (see `agent_background::Refusal`); it has no console, so its exit code is all it can say.
 /// `logs` is the folder of its log, if it could be found: without it the sentence has no pointer.
 pub fn agent_ended(code: u32, logs: Option<&std::path::Path>) -> String {
@@ -57,6 +70,10 @@ pub fn agent_ended(code: u32, logs: Option<&std::path::Path>) -> String {
             .to_string(),
         67 => "the background session started, but its ssh-broker folder could not be made or was not safe to use."
             .to_string(),
+        68 => "the agent refused to run: its token is an administrator's with elevation removed, and an \
+               administrator's session runs elevated or not at all."
+            .to_string(),
+        69 => "the agent could not read how elevated its own token is, so it refused to serve.".to_string(),
         other => match logs {
             Some(logs) => format!(
                 "the agent exited with code {other}; see the agent.log files in {}",
