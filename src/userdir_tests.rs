@@ -555,5 +555,97 @@ fn a_parent_swapped_for_a_link_while_the_walk_is_open_is_refused_naming_it() {
     assert!(err.root_cause().is::<acl::Refused>(), "{err:#}");
     let text = format!("{err:#}");
     assert!(text.contains(&local.display().to_string()), "{text}");
-    assert!(text.contains("replaced by a link or another folder"), "{text}");
+    assert!(text.contains("reparse point"), "{text}");
+}
+
+/// What `hold_and_confirm` says of a stand-in profile whose folders `disturb` has moved after the
+/// walk opened `AppData` and `Local` and before it held the private folder.
+fn confirm_after(tag: &str, disturb: impl FnOnce(&Path)) -> anyhow::Error {
+    let profile = TempProfile::new(tag);
+    let loc = profile.location();
+    ensure_socket_dir(&loc, &me()).unwrap();
+    let parents = open_parents(&loc).unwrap();
+    disturb(&profile.0);
+    hold_and_confirm(&loc, parents, |local| {
+        acl::open_existing_private_dir(local, socket_loc::SOCKET_DIR_NAME)
+    })
+    .err()
+    .expect("the disturbed walk was accepted")
+}
+
+/// `Local` leaves `AppData` for another folder of the profile, and a junction to that folder takes
+/// `AppData`'s place: by its path `AppData\Local` still leads to the `Local` the walk went through, but
+/// `Local` is no longer in the `AppData` the walk went through. The walk says so.
+#[test]
+fn a_local_that_left_the_appdata_the_walk_went_through_is_refused_even_if_the_path_still_reaches_it() {
+    let err = confirm_after("moved-out", |profile| {
+        let other = profile.join("Other");
+        std::fs::create_dir(&other).unwrap();
+        std::fs::rename(profile.join(r"AppData\Local"), other.join("Local")).unwrap();
+        std::fs::rename(profile.join("AppData"), profile.join("AppData.aside")).unwrap();
+        junction(&profile.join("AppData"), &other);
+    });
+
+    assert!(err.root_cause().is::<acl::Refused>(), "{err:#}");
+    let text = format!("{err:#}");
+    assert!(text.contains(r"AppData\Local"), "{text}");
+    assert!(text.contains("was moved"), "{text}");
+}
+
+/// `Local`, which the walk went through, is gone from its place when the walk confirms it: a failed
+/// confirmation, not "no folder yet", which is what every caller reads `Missing` as. (`AppData` cannot
+/// be renamed while the walk holds `Local`, so it is `acl::confirm_dir`'s own test.)
+#[test]
+fn a_local_renamed_aside_while_the_walk_is_open_is_refused_and_not_missing() {
+    let err = confirm_after("aside", |profile| {
+        let local = profile.join(r"AppData\Local");
+        std::fs::rename(&local, local.with_file_name("aside")).unwrap();
+    });
+
+    assert!(err.root_cause().is::<acl::Refused>(), "{err:#}");
+    assert!(!err.is::<acl::Missing>(), "reported as no folder yet: {err:#}");
+}
+
+/// Another program that holds the private folder open in a way that keeps the broker from holding it:
+/// with the right to delete it, or without sharing read. Every walk refuses at once with the stated
+/// limit, naming the folder.
+#[test]
+fn a_private_folder_held_by_another_program_is_refused_at_once_by_every_walk() {
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    const SHARE_WRITE_DELETE: u32 = 2 | 4;
+    type WalkFn = fn(&SocketLocation, &Sid) -> anyhow::Result<()>;
+    let walks: [(&str, WalkFn); 3] = [
+        ("open_socket_dir", |loc, user| open_socket_dir(loc, user).map(drop)),
+        ("inspect_socket_dir", |loc, user| {
+            inspect_socket_dir(loc, user).map(drop)
+        }),
+        ("open_existing_socket_dir", |loc, _| {
+            open_existing_socket_dir(loc).map(drop)
+        }),
+    ];
+    for kind in ["with the right to delete", "without sharing read"] {
+        let profile = TempProfile::new("held-other");
+        let loc = profile.location();
+        ensure_socket_dir(&loc, &me()).unwrap();
+        let holder = match kind {
+            "with the right to delete" => hold_for_deletion(loc.dir()),
+            _ => std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(SHARE_WRITE_DELETE)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+                .open(loc.dir())
+                .unwrap(),
+        };
+        for (name, walk) in walks {
+            let err = walk(&loc, &me()).expect_err(&format!("{name} {kind}: the walk held a folder it cannot hold"));
+            assert!(err.root_cause().is::<acl::Refused>(), "{name} {kind}: {err:#}");
+            let text = format!("{err:#}");
+            assert!(
+                text.contains(&crate::offer::text::folder_held(loc.dir())),
+                "{name} {kind}: {text}"
+            );
+        }
+        drop(holder);
+    }
 }

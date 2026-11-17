@@ -209,6 +209,92 @@ fn a_login_whose_way_to_the_folder_has_a_link_is_told_why_and_gets_the_plain_she
     );
 }
 
+// a folder that is looked at again -----
+
+/// The folder of a shim whose first act found no `AppData`, and which has since been made and widened:
+/// the walk that looks again refuses it.
+fn folder_missing_at_the_first_act_and_refused_since() -> (TempProfile, SocketLocation, Folder) {
+    let profile = TempProfile::new("late-ref");
+    let location = profile.location();
+    std::fs::remove_dir_all(profile.0.join("AppData")).unwrap();
+    let folder = folder_at(location.clone());
+    assert!(
+        folder.refusal().is_none(),
+        "control: nothing is refused at the first act"
+    );
+    std::fs::create_dir_all(profile.0.join(r"AppData\Local")).unwrap();
+    crate::userdir::ensure_socket_dir(&location, &me()).unwrap();
+    widen(location.dir());
+    (profile, location, folder)
+}
+
+#[test]
+fn a_refusal_found_when_the_folder_is_looked_at_again_is_the_refusal_of_the_folder() {
+    let (_profile, location, folder) = folder_missing_at_the_first_act_and_refused_since();
+
+    let err = folder.connect().expect_err("the folder is refused");
+
+    assert!(err.is::<crate::acl::Refused>(), "{err:#}");
+    let cause = format!("{:#}", folder.refusal().expect("the refusal found now is the folder's"));
+    assert!(cause.contains("its ACL is not exactly"), "{cause}");
+    assert!(cause.contains(&location.dir().display().to_string()), "{cause}");
+}
+
+#[test]
+fn a_login_with_a_terminal_whose_folder_is_refused_on_a_later_look_is_told_the_folder_refused_line() {
+    let (_profile, location, folder) = folder_missing_at_the_first_act_and_refused_since();
+    let connect = folder.connect();
+    let mut shown = Vec::new();
+
+    let rescued = Prompting.rescue(
+        &Absent {
+            exec: false,
+            folder: &folder,
+            connect: &connect,
+        },
+        &mut shown,
+    );
+
+    let shown = String::from_utf8(shown).unwrap();
+    assert!(matches!(rescued, Rescued::Plain));
+    assert!(shown.starts_with("ssh-broker: no session is offered"), "{shown:?}");
+    assert!(shown.contains("its ACL is not exactly"), "{shown:?}");
+    assert!(shown.contains(&location.dir().display().to_string()), "{shown:?}");
+}
+
+#[test]
+fn a_folder_missing_again_is_missing_at_the_folder_it_lacks_now() {
+    let profile = TempProfile::new("late-miss");
+    let location = profile.location();
+    std::fs::remove_dir_all(profile.0.join("AppData")).unwrap();
+    let folder = folder_at(location.clone());
+    std::fs::create_dir_all(profile.0.join(r"AppData\Local")).unwrap();
+
+    let err = folder.connect().expect_err("no folder yet");
+
+    assert!(is_no_agent(&err), "{err:#}");
+    assert!(
+        format!("{err:#}").contains(&location.dir().display().to_string()),
+        "the folder that exists by now is not the one named: {err:#}"
+    );
+    assert!(folder.refusal().is_none());
+}
+
+#[test]
+fn a_refusal_of_the_folder_is_shown_as_itself_when_a_connect_to_a_starting_agent_meets_it() {
+    let profile = TempProfile::new("lis-ref");
+    let location = profile.location();
+    crate::userdir::ensure_socket_dir(&location, &me()).unwrap();
+    widen(location.dir());
+    let refused = crate::userdir::inspect_socket_dir(&location, &me()).err().unwrap();
+    let cause = format!("{refused:#}");
+
+    let err = listening(Err(folder_failure(refused)), &location).err().unwrap();
+
+    assert!(err.is::<FolderFailed>(), "{err:#}");
+    assert_eq!(format!("{err:#}"), cause);
+}
+
 // wait_until_serving -----
 
 /// Scripted answers for `wait_until_serving`, recording the order of its calls.

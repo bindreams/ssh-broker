@@ -1152,3 +1152,35 @@ fn a_shim_with_a_command_whose_folder_is_refused_does_not_connect_and_says_why_o
     drop(crate::afunix::connect(location.path()).unwrap());
     assert_eq!(agent.join().unwrap(), 0, "the shim sent something to the agent");
 }
+
+/// The log's failure is the first act's: there was no folder then. A folder that is refused when the
+/// connect looks again is what the fail-open line of a login with a command names.
+#[test]
+fn a_shim_with_a_command_whose_folder_is_refused_on_a_later_look_names_that_refusal_in_the_fail_open_line() {
+    let profile = crate::test_support::TempProfile::new("ref-later");
+    let location = profile.location();
+    std::fs::remove_dir_all(profile.0.join("AppData")).unwrap();
+    let folder = folder_of(Ok(location.clone()));
+    let log_failure = format!("{:#}", folder.logs().err().expect("no folder, so no log"));
+    std::fs::create_dir_all(profile.0.join(r"AppData\Local")).unwrap();
+    crate::userdir::ensure_socket_dir(&location, &Sid::current_user().unwrap()).unwrap();
+    crate::test_support::widen(location.dir());
+    let mut stderr = Vec::new();
+
+    let relayed = super::try_relay_at(
+        &folder,
+        &Some(exec("echo hi")),
+        &mut stderr,
+        Some(&log_failure),
+        std::io::empty(),
+        &mut crate::shim_offer::Prompting,
+    )
+    .unwrap();
+
+    assert_eq!(relayed, None);
+    let text = String::from_utf8(stderr).unwrap();
+    assert!(text.starts_with("ssh-broker: agent unavailable"), "{text}");
+    assert!(!text.contains("no session is offered"), "told twice: {text}");
+    assert!(text.contains("its ACL is not exactly"), "{text}");
+    assert!(text.contains(&location.dir().display().to_string()), "{text}");
+}

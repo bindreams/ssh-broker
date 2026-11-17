@@ -15,7 +15,7 @@ use windows::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, HANDLE};
 use windows::Win32::UI::Shell::GetUserProfileDirectoryW;
 use windows::core::{HRESULT, PWSTR};
 
-use crate::acl::{self, DirHandle, Sharing, Sid};
+use crate::acl::{self, DirHandle, Hold, Sid};
 use crate::socket_loc::{self, SocketLocation};
 use crate::winutil;
 
@@ -115,8 +115,8 @@ impl SocketDir {
 /// A refusal of the socket folder (or of the way to it) is this function's error. A refusal of
 /// `logs` alone is in [`SocketDir::logs`], with the socket folder still open: it costs only the log.
 pub fn open_socket_dir(loc: &SocketLocation, user: &Sid) -> anyhow::Result<SocketDir> {
-    walk(loc, "make", |parent, name, sharing| {
-        acl::ensure_private_dir(parent, name, user, sharing)
+    walk(loc, "make", |parent, name, hold| {
+        acl::ensure_private_dir(parent, name, user, hold)
     })
 }
 
@@ -124,8 +124,8 @@ pub fn open_socket_dir(loc: &SocketLocation, user: &Sid) -> anyhow::Result<Socke
 /// of each folder, and nothing is made. A folder that is not there is [`acl::Missing`], in the error
 /// for the socket folder and in [`SocketDir::logs`] for `logs`.
 pub fn inspect_socket_dir(loc: &SocketLocation, user: &Sid) -> anyhow::Result<SocketDir> {
-    walk(loc, "look at", |parent, name, sharing| {
-        acl::open_private_dir(parent, name, user, sharing)
+    walk(loc, "look at", |parent, name, hold| {
+        acl::open_private_dir(parent, name, user, hold)
     })
 }
 
@@ -137,16 +137,15 @@ pub fn inspect_current_socket_dir() -> anyhow::Result<SocketDir> {
 }
 
 /// The walk of [`open_socket_dir`] and [`inspect_socket_dir`]; `step` makes or opens the folder `name`
-/// under `parent`, held (the private folder) or not (`logs`) as `sharing` says.
+/// under `parent`, held (the private folder) or not (`logs`) as `hold` says. This and
+/// [`walk_to_private_folder`] are the only places that ask for the held form.
 fn walk(
     loc: &SocketLocation,
     verb: &str,
-    step: impl Fn(&DirHandle, &str, Sharing) -> anyhow::Result<DirHandle>,
+    step: impl Fn(&DirHandle, &str, Hold) -> anyhow::Result<DirHandle>,
 ) -> anyhow::Result<SocketDir> {
-    let dir = walk_to_private_folder(loc, verb, |local| {
-        step(local, socket_loc::SOCKET_DIR_NAME, Sharing::NotDelete)
-    })?;
-    let logs = step(&dir, socket_loc::LOGS_DIR_NAME, Sharing::All)
+    let dir = walk_to_private_folder(loc, verb, |local| step(local, socket_loc::SOCKET_DIR_NAME, Hold::Held))?;
+    let logs = step(&dir, socket_loc::LOGS_DIR_NAME, Hold::Shared)
         .with_context(|| format!("{verb} the log folder {}", loc.logs_dir().display()));
     Ok(SocketDir {
         location: loc.clone(),
@@ -182,11 +181,15 @@ fn open_parents(loc: &SocketLocation) -> anyhow::Result<[DirHandle; 2]> {
 }
 
 /// The second half of the walk: `open` the private folder under the `Local` handle, and with it held
-/// confirm the path to it, top-down. `<profile>\AppData` and then `<profile>\AppData\Local` are opened
-/// by their full path strings, the ones `bind` and `connect` resolve, and refused unless each is the
-/// folder the walk went through. A parent that was swapped for a link or another folder while the
-/// walk was opening it is caught here; once this passes the private folder's open descendant keeps
-/// every name on the path from being renamed. The parents' handles are closed on return. Never retried.
+/// confirm the path to it, top-down, in two steps. First `Local` is opened as one name relative to the
+/// `AppData` handle and must be the `Local` the walk went through (`acl::confirm_child`): so `Local` is,
+/// now, a child of that `AppData`, and with the private folder open inside it cannot leave. Then
+/// `<profile>\AppData` is opened by its path, the one `bind` and `connect` resolve, and must be the
+/// `AppData` the walk went through (`acl::confirm_dir`): the only name below the profile directory that is
+/// opened by path, and only to confirm it. A parent that was swapped for a link or another folder while
+/// the walk was opening it, or `Local` moved out of `AppData`, is caught here; once this passes the
+/// private folder's open descendant keeps every name on the path from being renamed. The parents' handles
+/// are closed on return. Never retried.
 fn hold_and_confirm(
     loc: &SocketLocation,
     parents: [DirHandle; 2],
@@ -194,9 +197,8 @@ fn hold_and_confirm(
 ) -> anyhow::Result<DirHandle> {
     let dir = open(&parents[1])?;
     let [app_data, local] = socket_loc::FOLDERS_IN_PROFILE;
-    let app_data_path = loc.profile_dir().join(app_data);
-    acl::confirm_dir(&app_data_path, &parents[0])?;
-    acl::confirm_dir(&app_data_path.join(local), &parents[1])?;
+    acl::confirm_child(&parents[0], local, &parents[1])?;
+    acl::confirm_dir(&loc.profile_dir().join(app_data), &parents[0])?;
     Ok(dir)
 }
 

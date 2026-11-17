@@ -775,7 +775,7 @@ fn ensure_private_dir_says_so_when_the_folders_security_cannot_be_read() {
     let root = open_root(&parent.0).unwrap();
 
     let err = without_privileges(|| {
-        ensure_private_dir(&root, "ssh-broker", &me_sid, Sharing::NotDelete)
+        ensure_private_dir(&root, "ssh-broker", &me_sid, Hold::Held)
             .err()
             .expect("refused")
     });
@@ -791,7 +791,7 @@ fn ensure_private_dir_says_so_when_the_folders_security_cannot_be_read() {
     );
 
     let err = without_privileges(|| {
-        open_private_dir(&root, "ssh-broker", &me_sid, Sharing::NotDelete)
+        open_private_dir(&root, "ssh-broker", &me_sid, Hold::Held)
             .err()
             .expect("refused")
     });
@@ -1022,7 +1022,7 @@ fn ensure_private_dir_refuses_a_foreign_owner_and_leaves_the_folder() {
     let before = owner_of(&dir);
     let err = format!(
         "{:#}",
-        ensure_private_dir(&handle, "d", &me, Sharing::NotDelete)
+        ensure_private_dir(&handle, "d", &me, Hold::Held)
             .err()
             .expect("a Users owner is refused")
     );
@@ -1033,5 +1033,5 @@ fn ensure_private_dir_refuses_a_foreign_owner_and_leaves_the_folder() {
         &dir,
         &private_with_owner(&Sid::well_known(WellKnown::Administrators).unwrap()),
     );
-    ensure_private_dir(&handle, "d", &me, Sharing::NotDelete).expect("control: an Administrators owner is accepted");
+    ensure_private_dir(&handle, "d", &me, Hold::Held).expect("control: an Administrators owner is accepted");
 }

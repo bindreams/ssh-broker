@@ -275,13 +275,18 @@ fn connect_or_rescue(
             rescued: true,
         },
         Rescued::Gone => Connected::Done(Some(255)),
-        Rescued::Plain => Connected::Done(fail_open_reason(
-            location,
-            &connection,
-            is_command,
-            stderr,
-            log_failure,
-        )?),
+        Rescued::Plain => {
+            // A refusal that a connect found by looking again is not what the log's failure says (the
+            // log was set up at the first act, before it): the latest one is.
+            let refusal = folder.refusal();
+            Connected::Done(fail_open_reason(
+                location,
+                &connection,
+                is_command,
+                stderr,
+                refusal.as_deref().or(log_failure),
+            )?)
+        }
     })
 }
 

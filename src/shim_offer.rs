@@ -8,7 +8,7 @@
 use std::cell::RefCell;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock, PoisonError};
 
 use anyhow::Context;
 use socket2::Socket;
@@ -274,23 +274,28 @@ enum Walk {
 /// A folder the shim's walk did not find. It looks again when asked to connect, and keeps what it finds:
 /// it goes from missing to found at most once and never back.
 struct Looking {
+    /// What the first walk did not find: why there is no log, which is asked once, before any connect.
     missing: crate::acl::Missing,
     location: SocketLocation,
     user: Sid,
     found: OnceLock<Box<SocketDir>>,
+    /// What the latest look refused, if it did: a look that finds the folder missing, or usable, clears it.
+    refused: Mutex<Option<String>>,
 }
 
 impl Looking {
-    /// The folders, found now or earlier. The walk that looks again makes nothing.
+    /// The folders, found now or earlier. The walk that looks again makes nothing. What it does not
+    /// find is its own error: the folder missing now, or the refusal of what is there now.
     fn folders(&self) -> anyhow::Result<&SocketDir> {
         if let Some(found) = self.found.get() {
             return Ok(found);
         }
-        match crate::userdir::inspect_socket_dir(&self.location, &self.user) {
-            Ok(folders) => Ok(self.found.get_or_init(|| Box::new(folders))),
-            Err(e) if e.is::<crate::acl::Missing>() => Err(self.missing.clone().into()),
-            Err(e) => Err(e.context("not connecting through a folder that cannot be used")),
-        }
+        let looked = crate::userdir::inspect_socket_dir(&self.location, &self.user);
+        *self.refused.lock().unwrap_or_else(PoisonError::into_inner) = match &looked {
+            Err(e) if !e.is::<crate::acl::Missing>() => Some(format!("{e:#}")),
+            Ok(_) | Err(_) => None,
+        };
+        looked.map(|folders| &**self.found.get_or_init(|| Box::new(folders)))
     }
 }
 
@@ -321,6 +326,7 @@ impl Folder {
                         location: location.clone(),
                         user,
                         found: OnceLock::new(),
+                        refused: Mutex::new(None),
                     }),
                     None => Walk::Refused(e),
                 },
@@ -336,15 +342,16 @@ impl Folder {
         &self.location
     }
 
-    /// Why the private folder cannot be used, if the walk refused it (a link, an owner, an ACL, a file
-    /// where a folder is wanted) or failed on the way (access denied, an untrusted mount point):
-    /// neither lets an agent serve. `None` when it was accepted, is not there yet (a first login: no
-    /// profile, no `AppData`, no folder), or was not walked. A `logs` folder that is refused costs the
-    /// log only.
-    pub fn refusal(&self) -> Option<&anyhow::Error> {
+    /// Why the private folder cannot be used, if the latest look at it refused it (a link, an owner, an
+    /// ACL, a file where a folder is wanted) or failed on the way (access denied, an untrusted mount
+    /// point): neither lets an agent serve. The latest look is the first walk, or the last connect that
+    /// looked again. `None` when it was accepted, is not there yet (a first login: no profile, no
+    /// `AppData`, no folder), or was not walked. A `logs` folder that is refused costs the log only.
+    pub fn refusal(&self) -> Option<String> {
         match &self.walk {
-            Walk::Refused(e) => Some(e),
-            Walk::Open(_) | Walk::Missing(_) | Walk::Unwalked(_) => None,
+            Walk::Refused(e) => Some(format!("{e:#}")),
+            Walk::Missing(looking) => looking.refused.lock().unwrap_or_else(PoisonError::into_inner).clone(),
+            Walk::Open(_) | Walk::Unwalked(_) => None,
         }
     }
 
@@ -352,10 +359,7 @@ impl Folder {
     pub fn logs(&self) -> anyhow::Result<&crate::acl::DirHandle> {
         match &self.walk {
             Walk::Open(folders) => folders.logs.as_ref().map_err(|e| anyhow::anyhow!("{e:#}")),
-            Walk::Missing(looking) => match looking.found.get() {
-                Some(found) => found.logs.as_ref().map_err(|e| anyhow::anyhow!("{e:#}")),
-                None => Err(looking.missing.clone().into()),
-            },
+            Walk::Missing(looking) => Err(looking.missing.clone().into()),
             Walk::Refused(e) | Walk::Unwalked(e) => Err(anyhow::anyhow!("{e:#}")),
         }
     }
@@ -431,11 +435,10 @@ impl Rescue for Prompting {
         };
         let location = absent.folder.location();
         let kind_of_absence = absence(absent.connect, location);
-        let refusal = absent.folder.refusal();
         // An agent that has made its socket and not yet called `listen()`, or that has started and not
         // yet made its socket, refuses the connect like no agent at all. It is waited for, never
         // prompted over.
-        if let (Absence::NoAgent, Ok(location), None) = (kind_of_absence, location, refusal) {
+        if let (Absence::NoAgent, Ok(location), None) = (kind_of_absence, location, absent.folder.refusal()) {
             match Sid::current_user().and_then(|user| {
                 await_starting_agent(location, &provision::canonical_exe(), &user, || {
                     listening(absent.folder.connect().map_err(folder_failure), location)
@@ -447,12 +450,13 @@ impl Rescue for Prompting {
             }
         }
         let console = !absent.exec && console_available();
-        let cause = refusal.map(|e| format!("{e:#}"));
+        // The latest look: the connects of the wait above look at the folder again.
+        let cause = absent.folder.refusal();
         match plan(absent.exec, console, kind_of_absence, account, cause.as_deref()) {
             Plan::Nothing => Rescued::Plain,
             Plan::FolderRefused { cause } => {
-                // A login with a command is told the cause once, by the fail-open line, which carries the
-                // log's failure: the log and the folder come from the same walk.
+                // A login with a command is told the cause once, by the fail-open line, which carries
+                // `Folder::refusal` (see `shim_pty::connect_or_rescue`).
                 if !absent.exec {
                     let _ = writeln!(stderr, "{}", text::folder_refused(&cause));
                 }
@@ -649,6 +653,8 @@ fn listening(connected: anyhow::Result<Socket>, location: &SocketLocation) -> an
     match connected {
         Ok(socket) => Ok(Some(socket)),
         Err(e) if is_no_agent(&e) => Ok(None),
+        // A refusal of the folder is shown as itself.
+        Err(e) if e.is::<FolderFailed>() => Err(e),
         Err(e) => Err(e.context(format!("connect to the agent's socket {}", location.path().display()))),
     }
 }

@@ -67,7 +67,7 @@ mod admin_file;
 pub use admin_file::{admin_only_file_problem, ensure_admin_only_file};
 mod private_dir;
 pub use private_dir::{
-    DirHandle, Missing, Refused, confirm_dir, ensure_private_dir, open_dir, open_existing_file,
+    DirHandle, Hold, Missing, Refused, confirm_child, confirm_dir, ensure_private_dir, open_dir, open_existing_file,
     open_existing_private_dir, open_log_file, open_private_dir, open_root,
 };
 
@@ -624,9 +624,9 @@ struct Made {
 
 /// What a handle lets others do to the object while it is open: everything, or everything but
 /// deleting and renaming it. A folder held without `FILE_SHARE_DELETE` cannot be renamed or removed
-/// by anyone, so its name stays the folder's.
+/// by anyone, so its name stays the folder's. Callers outside this module ask for [`Hold`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Sharing {
+enum Sharing {
     All,
     NotDelete,
 }
