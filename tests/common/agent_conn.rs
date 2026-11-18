@@ -111,6 +111,10 @@ impl std::fmt::Display for Found {
 impl std::error::Error for Found {}
 
 impl FrameSink for Transcript {
+    fn on_serving(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     fn on_data(&mut self, stream: Stream, bytes: &[u8]) -> anyhow::Result<()> {
         self.buffers[stream as usize].extend_from_slice(bytes);
         if let Some((awaited, needle)) = &self.until
@@ -261,7 +265,7 @@ impl AgentConn {
         let exit = match outcome {
             Ok(Outcome::Exited(code)) => Some(code),
             Ok(Outcome::PeerClosed) => None,
-            // Every handshake of this client sets a level, and the agent hands back only a login that set none.
+            // Every handshake sets a level, so the agent never hands it back.
             Ok(Outcome::HandedBack(cause)) => panic!("the agent handed the session back: {cause}"),
             Err(e) => panic!(
                 "the agent's stream broke or stayed silent for {SILENCE_BOUND:?} while the test waited for the session to end: {e:?}

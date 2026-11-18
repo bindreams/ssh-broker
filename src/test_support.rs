@@ -20,9 +20,7 @@ pub fn asked_policies() -> impl Iterator<Item = Option<ElevationPolicy>> {
     POLICIES.map(Some).into_iter().chain([None])
 }
 
-/// Input that a test hands a command's forwarder: it ends at EOF, counts its reads, and says when it is
-/// dropped, which the forwarder does as it returns and a forwarder that was never started does when it is itself
-/// dropped. Once the drop is said, the count is final.
+/// Input for a command's forwarder: ends at EOF, counts reads, and signals when dropped (the count is final then).
 pub struct RecordedInput {
     data: std::io::Cursor<Vec<u8>>,
     dropped: std::sync::mpsc::Sender<()>,

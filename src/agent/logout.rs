@@ -191,12 +191,10 @@ pub(super) fn refuse_while_ending<R: LimitedRead, W: Write + HalfClose>(
 }
 
 /// Answer a session handshake of a login that the agent will not host: `HandBack` with `cause`, the answer
-/// after which the client runs the session itself (see [`FrameKind`]). Nothing was started, and nothing follows
-/// the frame. It is followed by a FIN and a read until the client closes, as a refusal is ([`refuse_while_ending`]),
-/// and counts as live for the drain until that read returns.
+/// after which the client runs the session itself (see [`FrameKind`]). It is followed by a FIN and a read until the client closes, as a refusal is
+/// ([`refuse_while_ending`]), and counts as live for the drain until that read returns.
 ///
-/// A client that has gone cannot be told, and is not a fault: it is logged at debug, as a failure reply that
-/// cannot be delivered is.
+/// A client that has gone cannot be told, and is not a fault: it is logged at debug.
 pub(super) fn hand_back<R: LimitedRead, W: Write + HalfClose>(
     rx: &mut R,
     tx: &mut W,

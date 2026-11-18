@@ -745,35 +745,45 @@ fn a_start_that_fails_is_never_answered_with_serving() {
     }
 }
 
-/// A session that starts and ends by itself: `Serving` first, then its output and its exit code.
+/// A session that starts and ends by itself: `Serving` first, then its output and its exit code, in both modes.
 #[test]
 fn agent_answers_serving_first_and_then_the_output_of_a_session_that_starts() {
-    let hooks = Hooks {
-        make_unelevated: |_| Ok(StepDown::Own),
-        ..Hooks::production()
-    };
-    let hs = Handshake {
-        mode: Mode::Exec,
-        command: Some("cmd.exe /c echo served & exit 7".to_owned()),
-        elevation: Some(ElevationPolicy::Prompt),
-        ..Handshake::pty_default()
-    };
-    let (answer, result) = answered("serving-runs", hooks, move |tx| {
-        write_frame(tx, FrameKind::Handshake, &hs.encode().unwrap()).unwrap();
-        write_data(tx, Stream::Stdin, b"").unwrap();
-    });
-    result.unwrap();
-    assert_eq!(answer.served, 1);
-    assert_eq!(answer.outcome, Outcome::Exited(7));
-    assert!(answer.stdout.contains("served"), "{}", answer.stdout);
+    for (tag, mode) in [("exec", Mode::Exec), ("pty", Mode::Pty)] {
+        let hooks = Hooks {
+            make_unelevated: |_| Ok(StepDown::Own),
+            ..Hooks::production()
+        };
+        let hs = Handshake {
+            mode,
+            command: Some("cmd.exe /c echo served & exit 7".to_owned()),
+            elevation: Some(ElevationPolicy::Prompt),
+            ..Handshake::pty_default()
+        };
+        let (answer, result) = answered(&format!("serving-runs-{tag}"), hooks, move |tx| {
+            write_frame(tx, FrameKind::Handshake, &hs.encode().unwrap()).unwrap();
+            if mode == Mode::Exec {
+                write_data(tx, Stream::Stdin, b"").unwrap();
+            }
+        });
+        result.unwrap();
+        // The pump takes `Serving` only as the first frame, so once is first.
+        assert_eq!(answer.served, 1, "{tag}");
+        assert_eq!(answer.outcome, Outcome::Exited(7), "{tag}");
+        assert!(answer.stdout.contains("served"), "{tag}: {}", answer.stdout);
+    }
 }
 
-/// `Serving` is written after the session's process has started, not before. The hook that runs right after the
-/// start holds the agent there until the client has looked at its connection: a write that had completed is
-/// readable at once on this socket, so a client that finds nothing proves nothing was written yet. `Serving`
-/// is then the first thing the client reads.
+/// `Serving` is written after the session's process has started, not before, in both modes. The hook that runs
+/// right after the start holds the agent there until the client has looked at its connection: a write that had
+/// completed is readable at once on this socket, so a client that finds nothing proves nothing was written yet.
 #[test]
 fn nothing_is_written_to_the_client_until_the_session_has_started() {
+    for (tag, mode) in [("exec", Mode::Exec), ("pty", Mode::Pty)] {
+        nothing_is_written_until_started(tag, mode);
+    }
+}
+
+fn nothing_is_written_until_started(tag: &str, mode: Mode) {
     use std::mem::MaybeUninit;
     use std::sync::{Mutex, mpsc};
     let (started, client_hears_of_it) = mpsc::channel::<()>();
@@ -788,10 +798,15 @@ fn nothing_is_written_to_the_client_until_the_session_has_started() {
         }),
         ..Hooks::production()
     };
-    let (server, client, dir) = crate::test_support::raw_socket_pair("serving-after-start");
+    let (server, client, dir) = crate::test_support::raw_socket_pair(&format!("serving-after-start-{tag}"));
     let agent = std::thread::spawn(move || handle_connection_in(server, hooks, &Control::standalone()));
     let (mut rx, mut tx) = afunix::split(client).unwrap();
-    handshake(Mode::Exec, "cmd.exe /c exit 0")(&mut tx);
+    let hs = Handshake {
+        mode,
+        command: Some("cmd.exe /c exit 0".to_owned()),
+        ..Handshake::pty_default()
+    };
+    write_frame(&mut tx, FrameKind::Handshake, &hs.encode().unwrap()).unwrap();
     client_hears_of_it
         .recv()
         .expect("the agent ended before it started the session");

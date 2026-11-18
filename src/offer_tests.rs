@@ -398,8 +398,7 @@ fn always_below_high_is_the_line_the_agents_reply_shares() {
 }
 
 /// The sentence for a session whose token cannot be made, for a login that asked for a level, says that a login
-/// that asked for none is not refused. It is true at the agent (which hands such a login back) and at the shim
-/// (which runs it), and says nothing of `always`, whose refusal has sentences of its own.
+/// that asked for none is not refused, and says nothing of `always`, whose refusal has sentences of its own.
 #[test]
 fn an_unavailable_unelevated_session_says_a_login_that_set_nothing_is_not_refused_and_the_cause() {
     for asked in [

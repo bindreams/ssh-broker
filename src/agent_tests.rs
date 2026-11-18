@@ -293,7 +293,7 @@ fn a_pty_login_refused_after_the_shell_wrote_a_lot_is_still_refused() {
                         process.store(shell, Ordering::SeqCst);
                         seen.note("the shell started");
                     }
-                    super::Observed::RefusedConsoleClosed { bytes } => {
+                    super::Observed::UnservedConsoleClosed { bytes } => {
                         seen.note(format!("ClosePseudoConsole returned after {bytes} bytes were read"));
                         // Before the session is dropped, which closes the handle.
                         shell_ended.store(
@@ -784,7 +784,6 @@ fn assert_a_client_gone_during_the_start_ends_the_session(tag: &str, mode: Mode,
     client_hears_of_it
         .recv()
         .expect("the agent ended before it started the session");
-    // The session is started and the agent is held before it answers: the client's end goes now.
     ctx.shutdown_both().unwrap();
     drop((crx, ctx));
     client_is_gone.send(()).unwrap();
@@ -1369,6 +1368,11 @@ fn shell_session(
     super::handle_connection_with(conn, hooks).unwrap();
     let (outcome, sink) = client.join().unwrap();
     std::fs::remove_dir_all(&dir).ok();
+    // The pump takes `Serving` only as the first frame, so once also means ahead of any warning.
+    assert_eq!(
+        sink.served, 1,
+        "{tag}: the answer `Serving` was not delivered exactly once"
+    );
     (
         outcome,
         String::from_utf8_lossy(&sink.stdout).into_owned(),

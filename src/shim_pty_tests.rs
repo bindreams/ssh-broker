@@ -1149,8 +1149,7 @@ enum After {
 }
 
 /// A stand-in agent that serves each connection with `answer(nth, rx, tx)` on a thread of its own until it
-/// retires ([`After::Retire`]) or is finished, and counts the connections. The one stand-in agent of this file:
-/// the others are constructors over it.
+/// retires ([`After::Retire`]) or is finished, and counts the connections.
 struct CountingAgent {
     stop: Arc<AtomicBool>,
     connections: Arc<std::sync::atomic::AtomicUsize>,
@@ -1332,7 +1331,7 @@ fn a_session_with_a_terminal_the_agent_hands_back_falls_open_after_the_cause_wit
     }
 }
 
-/// The agent that served and then closed without a byte of its own is still not a hand-back: a command is
+/// An agent that closes every connection without a byte, answer included, is not a hand-back: a command is
 /// not run again, and the message is the one it was.
 #[test]
 fn a_close_without_a_byte_is_not_a_hand_back() {

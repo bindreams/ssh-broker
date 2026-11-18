@@ -116,7 +116,7 @@ pub fn unelevated_unavailable(asked: Option<ElevationPolicy>, cause: &str) -> St
 /// The notice for a login that set nothing and could not be stepped down: its session has the token sshd gave it,
 /// which for an administrator is elevated, and a login that sets `SSH_BROKER_ELEVATION` to `never`, `prompt` or
 /// `auto-approve` is refused instead. `cause` is why the unelevated session could not be made. The shim says it
-/// when it runs such a session itself, which is also what the agent hands back to it. No line terminator.
+/// when it runs such a session itself. No line terminator.
 pub fn unelevated_fallback(cause: &str) -> String {
     format!(
         "ssh-broker: could not prepare an unelevated session ({cause}), so this session has the token sshd gave this \

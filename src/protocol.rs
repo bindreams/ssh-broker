@@ -10,8 +10,6 @@ pub const HEADER_LEN: usize = 5;
 /// Guard against absurd allocations from a malformed/hostile length prefix (1 MiB).
 pub const MAX_FRAME: u32 = 1 << 20;
 
-/// What a frame is.
-///
 /// The agent's answer: after a [`Mode::Pty`] or [`Mode::Exec`] handshake the agent's first frame is its answer.
 /// `Serving` (no payload) means the session's process has started. `HandBack` (payload: the cause, UTF-8) means it
 /// starts nothing and the client should run the session itself. A refusal is the other possible start: data

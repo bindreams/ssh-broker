@@ -331,7 +331,7 @@ fn a_version_1_handshake_is_refused_with_the_version_message() {
     );
 }
 
-/// The version is 5: the first frame of the agent is its answer, which version 4 did not have.
+/// The version is 5.
 #[test]
 fn the_wire_version_is_5() {
     assert_eq!(PROTOCOL_VERSION, 5);

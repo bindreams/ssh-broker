@@ -731,9 +731,8 @@ fn run_pty(
     };
     let pumped = pump_heard(&mut rx, &mut fr, &mut sink);
 
-    // Ordered teardown. A worker that was started: stop, wake the parked ReadConsoleInputW, join. One that
-    // never was has nothing to wake or join, and no record is put into the console's input: its write half is
-    // closed from here, so the agent sees the client go. Console modes are restored by `modes` dropping at
+    // Ordered teardown: a started worker is stopped, woken and joined; an unstarted one has nothing parked, so no
+    // console record is injected and the write half is closed. Console modes are restored by `modes` dropping at
     // scope end — AFTER the join, so the worker is provably done before the restore.
     sink.input.end(
         || {
@@ -752,8 +751,7 @@ fn run_pty(
 /// The input worker of a terminal session, which the agent's answer starts. `T` is the connection's write
 /// half, which the worker owns once it runs.
 ///
-/// Until then the write half is held here, in `Waiting`. The state says who holds what at each moment: the
-/// half, or the worker's handle, and never both.
+/// Until then the write half is held here, in `Waiting`. The half or the worker's handle is held, never both.
 enum Input<T> {
     /// Not started: nothing was answered yet, or the answer was not `Serving`.
     Waiting(T),
@@ -763,9 +761,8 @@ enum Input<T> {
 }
 
 impl<T> Input<T> {
-    /// Start the worker with `spawn`, which is given the write half. An error if it was started before
-    /// or is over: the pump takes `Serving` once, as the connection's first frame, so this is the total
-    /// answer and not a case it reaches.
+    /// Start the worker with `spawn`, which is given the write half. An error if already started or over
+    /// (the pump takes `Serving` once, so it does not reach this).
     fn start(&mut self, spawn: impl FnOnce(T) -> std::thread::JoinHandle<()>) -> anyhow::Result<()> {
         match std::mem::replace(self, Input::Ended) {
             Input::Waiting(tx) => {

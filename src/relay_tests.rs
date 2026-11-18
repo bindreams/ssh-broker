@@ -616,9 +616,9 @@ fn a_failing_on_serving_is_a_sink_failure() {
     assert!(!err.peer_gone());
 }
 
-/// A sink that does not care about the answer (the agent's input sinks) is told nothing it must act on.
+/// A sink that expects no answer (a logout's reply sink) refuses one: a sink failure, and nothing is delivered.
 #[test]
-fn a_sink_without_on_serving_accepts_the_answer_and_goes_on() {
+fn a_sink_with_the_default_on_serving_refuses_the_answer() {
     struct Plain(Vec<u8>);
     impl FrameSink for Plain {
         fn on_data(&mut self, _stream: Stream, bytes: &[u8]) -> anyhow::Result<()> {
@@ -629,7 +629,7 @@ fn a_sink_without_on_serving_accepts_the_answer_and_goes_on() {
     let mut wire = framed(&[(FrameKind::Serving, &[])]);
     write_data(&mut wire, Stream::Stdout, b"after").unwrap();
     let mut plain = Plain(Vec::new());
-    let outcome = pump_decode(&mut wire.as_slice(), &mut FrameReader::new(), &mut plain).unwrap();
-    assert_eq!(outcome, Outcome::PeerClosed);
-    assert_eq!(plain.0, b"after");
+    let err = pump_decode(&mut wire.as_slice(), &mut FrameReader::new(), &mut plain).expect_err("refused");
+    assert!(matches!(err, PumpError::Sink(_)), "{err:?}");
+    assert!(plain.0.is_empty());
 }

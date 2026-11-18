@@ -839,8 +839,7 @@ fn the_handshake_goes_first_and_the_input_follows_the_answer_with_the_end_marker
     assert_eq!(sent[1], stdin_data(b""), "the end of input is a marker, not a close");
 }
 
-/// The design's pin: a hand-back means stdin was never read, so the shell that finally runs gets the
-/// input; and the session falls open (the caller's business, from [`Pumped::handed_back`]).
+/// A hand-back leaves stdin unread, so the shell that finally runs gets the input.
 #[test]
 fn a_hand_back_means_stdin_was_never_read_and_the_cause_comes_back() {
     let (conn, from_conn) = wire();

@@ -235,8 +235,7 @@ impl<W: Write + Send + 'static> KeepOpen<W> {
     }
 }
 
-/// Send `hs` on `tx`. Nothing else: the agent answers it (`protocol::FrameKind`), and the input follows the
-/// answer `Serving`, from [`KeepOpen::forwarding`].
+/// Send `hs` on `tx` and nothing else: input follows only after the agent's `Serving`.
 pub fn start_exec_input<W: Write + Send + 'static>(mut tx: W, hs: &Handshake) -> anyhow::Result<Started<W>> {
     match write_frame(&mut tx, FrameKind::Handshake, &hs.encode()?) {
         Ok(()) => {}

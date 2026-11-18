@@ -64,7 +64,8 @@ impl PumpError {
 }
 
 /// A sink that accepts and drops everything, so a pump can keep watching a peer it is no
-/// longer able to deliver to.
+/// longer able to deliver to. It takes over from a sink that has failed, so the first frame is behind it
+/// and an answer is a protocol error before it is asked.
 struct DiscardSink;
 
 impl FrameSink for DiscardSink {
@@ -106,13 +107,12 @@ pub fn write_data<W: Write>(w: &mut W, stream: Stream, bytes: &[u8]) -> anyhow::
     write_frame(w, FrameKind::Data, &payload)
 }
 
-/// Write the agent's answer `Serving`: the session's process has started (see [`FrameKind`]).
+/// Write the agent's answer `Serving` (see [`FrameKind`]).
 pub fn write_serving<W: Write>(w: &mut W) -> anyhow::Result<()> {
     write_frame(w, FrameKind::Serving, &[])
 }
 
-/// Write the agent's answer `HandBack`: it starts nothing, and the client runs the session itself. `cause` is
-/// why, for the client to show.
+/// Write the agent's answer `HandBack` (see [`FrameKind`]). `cause` is why, for the client to show.
 pub fn write_hand_back<W: Write>(w: &mut W, cause: &str) -> anyhow::Result<()> {
     write_frame(w, FrameKind::HandBack, cause.as_bytes())
 }
@@ -121,9 +121,10 @@ pub fn write_hand_back<W: Write>(w: &mut W, cause: &str) -> anyhow::Result<()> {
 /// agent handlers.
 pub trait FrameSink {
     /// The agent's answer was `Serving`: called once, before anything else is delivered. An error is a
-    /// [`PumpError::Sink`].
+    /// [`PumpError::Sink`]. The default is one: a sink that serves overrides it, and the others expect no
+    /// answer.
     fn on_serving(&mut self) -> anyhow::Result<()> {
-        Ok(())
+        anyhow::bail!("an answer `Serving` where none is expected")
     }
     fn on_data(&mut self, stream: Stream, bytes: &[u8]) -> anyhow::Result<()>;
     fn on_resize(&mut self, r: Resize) -> anyhow::Result<()> {
@@ -274,7 +275,6 @@ pub struct TestSink {
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
     pub resizes: Vec<Resize>,
-    /// How many times the agent's `Serving` answer was delivered.
     pub served: usize,
 }
 
