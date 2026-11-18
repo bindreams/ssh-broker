@@ -101,9 +101,9 @@ fn reserved(command: &str) -> Option<Reserved<'_>> {
     rest.strip_prefix(SEPARATORS).map(Reserved::Then)
 }
 
-/// The login `exec` is, once the reserved word has been looked for. `original_command` is
-/// `SSH_ORIGINAL_COMMAND` when sshd set it: the client's own command, byte for byte, when the word was forced
-/// on a key or in a `Match` block. That command is the client's own, so it may itself say the word.
+/// `original_command` is `SSH_ORIGINAL_COMMAND` when sshd set it: the client's own command, byte for byte,
+/// when the word was forced on a key or in a `Match` block. That command is the client's own, so it may itself
+/// say the word.
 ///
 /// The word is matched exactly and case-sensitively, at the start of the command, on the command as the shim
 /// received it. With a terminal (`ssh -t`) that is the console host's rewriting of what the client sent
@@ -111,8 +111,7 @@ fn reserved(command: &str) -> Option<Reserved<'_>> {
 ///
 /// - the whole command is the word: [`Privilege::Unelevated`], and the command is `original_command` read by
 ///   this same rule once (the word alone is a login; the word and a rest is the rest; anything else is as
-///   written), with `exec`'s terminal, or none (a login). A rest that again starts with the word is an
-///   ordinary command;
+///   written), with `exec`'s terminal, or none (a login);
 /// - the word, then one space or tab: [`Privilege::Unelevated`], and the command is the rest as written. If
 ///   that is blank it is a blank command (exit 0, [`crate::shim::is_blank_command`]), not a login;
 /// - anything else, a longer word, a leading blank or another case included: [`Privilege::Account`], and

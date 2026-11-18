@@ -1,7 +1,7 @@
 //! Helpers around `examples/session_stand_in.rs`: a directory every account can run from, the stand-in
 //! shim started as an account's network token, and a guard that stops or disables `seclogon`.
 //!
-//! The including crate declares `account_fixture` (the account fixture), `desktop`, `machine` and `password`.
+//! The including crate declares `account_fixture`, `desktop`, `machine` and `password`.
 #![allow(dead_code)]
 
 use std::path::{Path, PathBuf};

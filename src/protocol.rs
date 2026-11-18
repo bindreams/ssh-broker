@@ -122,7 +122,7 @@ impl ExitCode {
     }
 }
 
-/// The wire version. 2 added [`Handshake::launch`], 3 [`Handshake::privilege`].
+/// The wire version; a peer of any other version is refused by name.
 pub const PROTOCOL_VERSION: u16 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

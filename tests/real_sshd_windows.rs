@@ -6,8 +6,8 @@
 //! session. Before that, the same account logs in once with a probe as the `DefaultShell`, which
 //! records the session, the logon type and the job the shim runs in under sshd.
 //!
-//! The word `internal-unelevated` is tried here too, as an administrator and as a Backup Operators account, over the
-//! same sshd (the tests at the end).
+//! The word `internal-unelevated` is tried here too, as a standard account (the first test), an administrator and a
+//! Backup Operators account, over the same sshd (the tests at the end).
 //!
 //! This machine is the runner's: the test changes sshd's `DefaultShell` and adds the account to the
 //! group `sshd_config` allows. The runner is discarded after the job, so neither is put back.
@@ -49,7 +49,9 @@ mod whoami_groups;
 
 use account_fixture::{Account, ServiceLogon};
 use agent_conn::local_account;
-use sshd_rig::{Login, PROMPT, SHELL_PROMPT, SshSession, no_shell_to_carry, run_client, screen_text, set_stock_shell};
+use sshd_rig::{
+    Login, Outcome, PROMPT, SHELL_PROMPT, SshSession, no_shell_to_carry, run_client, screen_text, set_stock_shell,
+};
 use stand_in::Kit;
 use whoami_groups::{TokenShown, token_shown};
 
@@ -57,7 +59,8 @@ use whoami_groups::{TokenShown, token_shown};
 /// the login: the relayed shell can make a named mutex and PSReadLine does not crash in it (the
 /// prompt-path tests run their shims in the runner's session, where another user's token can make
 /// none); a second connection while the first is open uses the same agent; and the session is still
-/// there for a third after every connection has gone (the agent is not in sshd's job). Last, two first
+/// there for a third after every connection has gone (the agent is not in sshd's job). The word
+/// `internal-unelevated` gives this standard account the token its own command has. Last, two first
 /// connections of another new account at once.
 #[test]
 fn prompt_path_through_real_sshd() {
@@ -95,6 +98,19 @@ fn prompt_path_through_real_sshd() {
     first.read_until("session-id=");
     let agent = first.check_relayed_shell();
     eprintln!("M8 the relayed session showed:\n{}", first.text());
+
+    // The word, for an account below High: the agent serves it, at the token the account's own command has.
+    let ordinary = token_of_command(&kit, &login, "whoami /groups", Server::Agent);
+    assert_eq!(
+        ordinary,
+        TokenShown::new("Medium", "absent"),
+        "the ordinary account's own command"
+    );
+    assert_eq!(
+        token_of_command(&kit, &login, "internal-unelevated whoami /groups", Server::Agent),
+        ordinary,
+        "the word, for an account that is not elevated"
+    );
 
     // 3. A second connection while the first is open: no prompt, the same agent.
     let mut second = login.start_into_running_session();
@@ -157,8 +173,46 @@ fn two_simultaneous_first_connections(kit: &Kit) {
 
 // What the word gives, through the real sshd =====
 
-/// `ssh -T host -- remote`, run to its end: the token `remote` (a `whoami /groups`) was started with.
-fn token_of_command(kit: &Kit, login: &Login<'_>, remote: &str) -> TokenShown {
+/// Who ran a login's session. A token shown is no proof of it: the shim's fail-open shell steps down to the same
+/// tokens the agent does.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Server {
+    /// The agent served it: the shim relayed the session.
+    Agent,
+    /// The shim ran it itself, having failed open.
+    Shim,
+    /// sshd ran the shell: the broker is not the `DefaultShell`.
+    Sshd,
+}
+
+/// The sessions the shim has run itself so far, by the log in the account's folder (flushed when the shim exits).
+/// A session with a terminal has no stderr to say it on.
+fn ran_by_shim(account: &Account) -> usize {
+    let location = account.socket_location();
+    stand_in::read_logs(&location)
+        .matches(&ssh_broker::shim_pty::unavailable_message(None))
+        .count()
+}
+
+/// Fail unless `said_unavailable` (the shim's line "agent unavailable", read from the client's stderr or, with a
+/// terminal, from the log) is true exactly when `server` is the shim.
+fn assert_served_by(server: Server, remote: &str, said_unavailable: bool, outcome: &Outcome, login: &Login<'_>) {
+    assert_eq!(
+        said_unavailable,
+        server == Server::Shim,
+        "`{remote}`: {}\nstderr:\n{}\n{}",
+        match server {
+            Server::Agent => "the shim ran the session itself, not through the agent",
+            Server::Shim => "the agent served a session that was to fail open",
+            Server::Sshd => "the shim ran a session that sshd was to run alone",
+        },
+        outcome.stderr,
+        (login.diagnostics())()
+    );
+}
+
+/// `ssh -T host -- remote`, run to its end: the token `remote` (a `whoami /groups`) was started with, by `server`.
+fn token_of_command(kit: &Kit, login: &Login<'_>, remote: &str, server: Server) -> TokenShown {
     let mut ssh = login.command();
     ssh.arg("-T").arg("--").arg(remote);
     let outcome = run_client(ssh, false, kit.dir());
@@ -172,14 +226,19 @@ fn token_of_command(kit: &Kit, login: &Login<'_>, remote: &str) -> TokenShown {
     );
     // Kept in the log of a test that fails on what the token was: the raw output and the shim's own words.
     eprintln!("`{remote}` showed:\n{shown}\nstderr of the client:\n{}", outcome.stderr);
+    let said = outcome
+        .stderr
+        .contains(&ssh_broker::shim_pty::unavailable_message(None));
+    assert_served_by(server, remote, said, &outcome, login);
     token_shown(&shown)
 }
 
-/// `ssh -tt host -- remote`, run to its end: the token `remote` (a `whoami /groups`) was started with, read
-/// from what the terminal showed.
-fn token_of_command_with_terminal(kit: &Kit, login: &Login<'_>, remote: &str) -> TokenShown {
+/// `ssh -tt host -- remote`, run to its end: the token `remote` (a `whoami /groups`) was started with, by
+/// `server`, read from what the terminal showed.
+fn token_of_command_with_terminal(kit: &Kit, login: &Login<'_>, remote: &str, server: Server) -> TokenShown {
     let mut ssh = login.command();
     ssh.arg("-tt").arg("--").arg(remote);
+    let before = ran_by_shim(login.account);
     let outcome = run_client(ssh, true, kit.dir());
     let shown = screen_text(&outcome.stdout);
     assert!(
@@ -193,12 +252,17 @@ fn token_of_command_with_terminal(kit: &Kit, login: &Login<'_>, remote: &str) ->
         "`{remote}` with a terminal showed:\n{shown}\nstderr of the client:\n{}",
         outcome.stderr
     );
+    let said = ran_by_shim(login.account) > before;
+    assert_served_by(server, remote, said, &outcome, login);
     token_shown(&shown)
 }
 
-/// What a PowerShell session says of its own token, typed as a line: `wg-label=<label> wg-admin=<state>;`. The
-/// markers are joined by the shell so that the echo of the typed line does not hold them.
+/// What a PowerShell session of the agent says of its own token, typed as a line: `wg-label=<label>
+/// wg-admin=<state>;`. The markers are joined by the shell so that the echo of the typed line does not hold them.
+/// The shell is first shown to be the agent's ([`SshSession::check_relayed_shell`]): a session of the shim's own
+/// has no DPAPI.
 fn token_of_shell(session: &mut SshSession) -> TokenShown {
+    session.check_relayed_shell();
     session.type_line(
         r#"$g = (whoami /groups | Out-String); $a = if ($g -match 'S-1-5-32-544\s+(Mandatory group, Enabled by default, Enabled group|Group used for deny only)') { if ($Matches[1] -like 'Group*') { 'deny-only' } else { 'enabled' } } else { 'absent' }; Write-Output ('wg' + '-label=' + [regex]::Match($g, 'Mandatory Label\\(\w+) Mandatory Level').Groups[1].Value + ' wg' + '-admin=' + $a + ';')"#,
     );
@@ -219,10 +283,8 @@ fn token_of_shell(session: &mut SshSession) -> TokenShown {
 }
 
 /// Elevated (CI only). An administrator's SSH session through the brokered agent is elevated, and the word
-/// `internal-unelevated` gives an unelevated one: in the three places it can be written (the client's command,
-/// a key that forces it with the client's command after it, a key that forces it with none), on pipes and with
-/// a terminal, and through the `console-fallback` verb. The administrator's key is in the administrators' file
-/// (see `sshd_rig::install_key`).
+/// `internal-unelevated` gives an unelevated one wherever it is written, with and without a terminal. The
+/// administrator's key is in the administrators' file (see `sshd_rig::install_key`).
 #[test]
 fn an_administrators_session_through_real_sshd_is_elevated_and_the_word_gives_an_unelevated_one() {
     let _machine = machine::exclusive();
@@ -240,7 +302,6 @@ fn an_administrators_session_through_real_sshd_is_elevated_and_the_word_gives_an
     // The account's session, started at the password prompt; it stays up for the sessions below.
     let mut first = login.start();
     first.log_in(&account.password);
-    first.check_relayed_shell();
     assert_eq!(
         token_of_shell(&mut first),
         TokenShown::new("High", "enabled"),
@@ -249,29 +310,33 @@ fn an_administrators_session_through_real_sshd_is_elevated_and_the_word_gives_an
 
     let elevated = TokenShown::new("High", "enabled");
     let unelevated = TokenShown::new("Medium", "deny-only");
-    // 1. The client's command: no word, the word, and a word that is only the start of another command.
-    assert_eq!(token_of_command(&kit, &login, "whoami /groups"), elevated, "no word");
+    // The word in the client's command.
     assert_eq!(
-        token_of_command(&kit, &login, "internal-unelevated whoami /groups"),
+        token_of_command(&kit, &login, "whoami /groups", Server::Agent),
+        elevated,
+        "no word"
+    );
+    assert_eq!(
+        token_of_command(&kit, &login, "internal-unelevated whoami /groups", Server::Agent),
         unelevated,
         "the word, then the command"
     );
-    // 2. A key that forces the word: the client's command arrives in SSH_ORIGINAL_COMMAND.
+    // A key that forces the word: the client's command arrives in SSH_ORIGINAL_COMMAND.
     assert_eq!(
-        token_of_command(&kit, &forcing, "whoami /groups"),
+        token_of_command(&kit, &forcing, "whoami /groups", Server::Agent),
         unelevated,
         "the word forced on the key, the client's command after it"
     );
     // The client says the word too, as it does on a host without the forced key: the same session, not the word
     // handed to the shell as a program name.
     assert_eq!(
-        token_of_command(&kit, &forcing, "internal-unelevated whoami /groups"),
+        token_of_command(&kit, &forcing, "internal-unelevated whoami /groups", Server::Agent),
         unelevated,
         "the word forced on the key and said by the client, then its command"
     );
-    // 3. With a terminal: a command, and the bare word (a login).
+    // With a terminal, the bare word is a login.
     assert_eq!(
-        token_of_command_with_terminal(&kit, &login, "internal-unelevated whoami /groups"),
+        token_of_command_with_terminal(&kit, &login, "internal-unelevated whoami /groups", Server::Agent),
         unelevated,
         "the word and a command, with a terminal"
     );
@@ -290,7 +355,7 @@ fn an_administrators_session_through_real_sshd_is_elevated_and_the_word_gives_an
         "ssh -tt host internal-unelevated"
     );
     shell.leave();
-    // 4. The word forced on the key and no client command: a login.
+    // The same for the key that forces the word, with no client command.
     let mut forced_login = forcing.start();
     forced_login.read_until(SHELL_PROMPT);
     assert_eq!(
@@ -299,7 +364,7 @@ fn an_administrators_session_through_real_sshd_is_elevated_and_the_word_gives_an
         "the word forced, no command"
     );
     forced_login.leave();
-    // ... and the client that says the word with nothing after it, on that key: also a login.
+    // ... and for a client that says the word alone on that key.
     let mut said_login = SshSession::start_as_given(
         {
             let mut ssh = forcing.command();
@@ -316,18 +381,17 @@ fn an_administrators_session_through_real_sshd_is_elevated_and_the_word_gives_an
     );
     said_login.leave();
 
-    // 5. A terminal session whose configured shell cannot start is replaced by the `console-fallback` verb, and
-    // that shell is unelevated too.
+    // A terminal session whose configured shell cannot start gets the `console-fallback` verb's shell.
     let broken = kit.path("not-a-program.exe");
     std::fs::write(&broken, "this is not a program").unwrap();
     account.write_user_config(&format!("shell: '{}'\n", broken.display()));
     assert_eq!(
-        token_of_command_with_terminal(&kit, &login, "internal-unelevated whoami /groups"),
+        token_of_command_with_terminal(&kit, &login, "internal-unelevated whoami /groups", Server::Agent),
         unelevated,
         "through the console-fallback verb"
     );
     assert_eq!(
-        token_of_command_with_terminal(&kit, &login, "whoami /groups"),
+        token_of_command_with_terminal(&kit, &login, "whoami /groups", Server::Agent),
         elevated,
         "control: the verb's shell is elevated without the word"
     );
@@ -354,12 +418,12 @@ fn an_administrators_fail_open_shell_is_unelevated_when_the_login_said_the_word(
         .expect("set the shim as DefaultShell");
 
     assert_eq!(
-        token_of_command(&kit, &login, "whoami /groups"),
+        token_of_command(&kit, &login, "whoami /groups", Server::Shim),
         TokenShown::new("High", "enabled"),
         "control: no word, no agent"
     );
     assert_eq!(
-        token_of_command(&kit, &login, "internal-unelevated whoami /groups"),
+        token_of_command(&kit, &login, "internal-unelevated whoami /groups", Server::Shim),
         TokenShown::new("Medium", "deny-only"),
         "the word, no agent"
     );
@@ -407,18 +471,10 @@ fn squeezed(text: &str) -> String {
     text.split_whitespace().collect()
 }
 
-/// Elevated (CI only). One test, for an account that is in Backup Operators and not in Administrators: Windows
-/// elevates such an account's logon without its being an administrator, so sshd may hand the shim a token at
-/// High that has no Administrators in it, and the level, not the group, decides what the broker gives it.
-///
-/// (a) Over the real sshd, the plain shell is at High and shows no Administrators. A shell below High fails the
-/// test with a message that says to report it as a finding: the premise of everything below it is then false.
-/// (b) At the password prompt, with the account granted nothing, the shim says that this login cannot start an
-/// elevated session from a password (`SeImpersonatePrivilege`, which the login does not hold), gives the plain
-/// shell, and no agent of the account runs afterwards. An agent that started fails the test: the stated limit
-/// does not hold. (c) The account's agent, started by `auto-login` (Backup Operators hold "Log on as a batch
-/// job"; the product's own start for an account with a stored password), serves an SSH login at High, and
-/// `internal-unelevated` gives that login Medium.
+/// Elevated (CI only). An account in Backup Operators and not in Administrators gets a High logon from sshd,
+/// so the level, not the group, decides what the broker gives it: the shell is High (a); the password prompt
+/// states the `SeImpersonatePrivilege` limit and starts no agent (b); the account's agent started by
+/// `auto-login` serves an SSH login at High, and `internal-unelevated` gives Medium (c).
 ///
 /// Every wait is on an event of the session. Where the outcome could be "never" the test asserts first: the
 /// started agent's level against the folder the shim looks in, before the wait for it to serve at that level.
@@ -439,7 +495,7 @@ fn a_backup_operators_account_gets_the_stated_limit_at_the_prompt_and_is_served_
     // (a) What the plain shell gets: stock sshd with cmd.exe as the shell.
     let system_root = std::env::var("SystemRoot").expect("SystemRoot is set");
     set_stock_shell(&std::path::Path::new(&system_root).join(r"System32\cmd.exe"));
-    let plain = token_of_command(&kit, &login, "whoami /groups");
+    let plain = token_of_command(&kit, &login, "whoami /groups", Server::Sshd);
     eprintln!("what sshd gives the plain shell of a Backup Operators account that is not an administrator: {plain:?}");
     assert_eq!(
         plain,
@@ -506,12 +562,12 @@ fn a_backup_operators_account_gets_the_stated_limit_at_the_prompt_and_is_served_
     }
 
     assert_eq!(
-        token_of_command(&kit, &login, "whoami /groups").label,
+        token_of_command(&kit, &login, "whoami /groups", Server::Agent).label,
         "High",
         "the login served by the agent is not at the level sshd gave"
     );
     assert_eq!(
-        token_of_command(&kit, &login, "internal-unelevated whoami /groups"),
+        token_of_command(&kit, &login, "internal-unelevated whoami /groups", Server::Agent),
         TokenShown::new("Medium", "absent"),
         "the word"
     );

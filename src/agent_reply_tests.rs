@@ -392,12 +392,15 @@ fn an_unelevated_login_whose_token_cannot_be_made_is_answered_and_starts_nothing
     }
 }
 
+/// The privileges `an_account_login_makes_no_token`'s maker was called with.
+static MADE_FOR: std::sync::Mutex<Vec<Privilege>> = std::sync::Mutex::new(Vec::new());
+
 /// The agent hands the login's privilege to the maker, and starts with no token when it answers none.
 #[test]
 fn an_account_login_makes_no_token() {
     let hooks = Hooks {
         make_unelevated: |privilege| {
-            assert_eq!(privilege, Privilege::Account);
+            MADE_FOR.lock().unwrap().push(privilege);
             Ok(None)
         },
         ..failing_starters()
@@ -407,6 +410,11 @@ fn an_account_login_makes_no_token() {
         hooks,
         request_for(Mode::Exec, Some("whoami"), Privilege::Account),
     );
+    assert_eq!(
+        *MADE_FOR.lock().unwrap(),
+        [Privilege::Account],
+        "the maker was called once, with the login's privilege"
+    );
     assert!(
         answer.stderr.contains("could not start the command"),
         "{}",
@@ -415,7 +423,7 @@ fn an_account_login_makes_no_token() {
 }
 
 /// The starts of `an_unelevated_login_gives_its_token_to_every_start`: `(starter, the shell inherits a handle from
-/// the verb, it was given a token)`. Only that test uses it.
+/// the verb, it was given a token)`.
 static STARTS: std::sync::Mutex<Vec<(&'static str, bool, bool)>> = std::sync::Mutex::new(Vec::new());
 
 #[test]

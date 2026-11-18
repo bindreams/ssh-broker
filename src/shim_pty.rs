@@ -58,7 +58,7 @@ const EVT_FOCUS: u16 = 0x0010;
 /// encoded it (see [`resolve_exec`]); [`read_login`] then looks for the reserved word, with
 /// `SSH_ORIGINAL_COMMAND` for a word that sshd was told to run; and a blank command ends the run
 /// there, exit 0. What the login asked for goes to the agent in the handshake, and to the fail-open
-/// shell, which runs unelevated when the login said so and this process is at High ([`fail_open`]).
+/// shell ([`fail_open`]).
 pub fn run_on(exec: Option<RawExec>, detect: impl FnOnce() -> Encoding) -> anyhow::Result<()> {
     // Walk first and keep the result: the folders it holds cannot be swapped, so the log and connect reach
     // them and no others.
@@ -154,9 +154,10 @@ fn try_relay(
     try_relay_at(folder, login, &mut std::io::stderr(), log_failure, stdin, rescue)
 }
 
-/// The phrase `tests/fail_open_windows.rs` greps for; every fail-open message begins with it.
+/// The phrase `tests/fail_open_windows.rs` greps for; every fail-open message begins with it. It is public
+/// so that a test can tell a session the shim ran itself from one the agent served.
 /// `reason` is why the agent cannot be reached, when the shim knows and the user can act on it.
-fn unavailable_message(reason: Option<&dyn std::fmt::Display>) -> String {
+pub fn unavailable_message(reason: Option<&dyn std::fmt::Display>) -> String {
     match reason {
         Some(reason) => format!("ssh-broker: agent unavailable — falling back to a local shell ({reason})"),
         None => "ssh-broker: agent unavailable — falling back to a local shell".to_string(),

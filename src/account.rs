@@ -181,11 +181,9 @@ pub fn integrity() -> anyhow::Result<Integrity> {
 /// The token a session of a login with `privilege` runs with in place of this process's own: the one rule
 /// that says when the agent, and the shim failing open, step a session down. An [`Privilege::Account`] login
 /// gets `None` and neither `integrity` nor `make` is consulted. An [`Privilege::Unelevated`] one gets the token
-/// when this process is at High, and `None` below it, where what a process starts is unelevated anyway (by the
-/// level, not by [`Elevation::Full`]: the folder level is what the agent serves). A level that cannot be read,
-/// or a token that cannot be made, is an error: the session asked not to be elevated, and a guess would run it
-/// as it is. `integrity` and `make` are parameters so that a test can make either fail; production passes
-/// them in `UnelevatedToken::for_privilege`.
+/// when this process is at High, and `None` below it, where what a process starts is unelevated anyway. A level
+/// that cannot be read, or a token that cannot be made, is an error: the session asked not to be elevated, and a
+/// guess would run it as it is. The level and the maker are parameters so that a test can make either fail.
 pub fn step_down<K>(
     privilege: Privilege,
     integrity: impl FnOnce() -> anyhow::Result<Integrity>,
