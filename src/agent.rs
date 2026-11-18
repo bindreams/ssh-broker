@@ -796,7 +796,6 @@ fn handle_connection_in(conn: socket2::Socket, hooks: Hooks, control: &Control) 
         Ok(StepDown::Token(token)) => Some(token),
         Ok(StepDown::Own) => None,
         Ok(StepDown::Fallback(cause)) => {
-            let cause = format!("{cause:#}");
             tracing::warn!(
                 "the agent could not prepare an unelevated session, so the session has its own token: {cause}"
             );

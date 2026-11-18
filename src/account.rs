@@ -188,7 +188,7 @@ pub fn step_down<K>(
 ) -> anyhow::Result<StepDown<K>> {
     let level = match integrity().context("read this process's integrity level") {
         Ok(level) => level,
-        Err(cause) if asked.is_none() => return Ok(StepDown::Fallback(cause)),
+        Err(cause) if asked.is_none() => return Ok(StepDown::Fallback(format!("{cause:#}"))),
         Err(cause) => return Err(cause),
     };
     Ok(match (asked, level) {
@@ -198,7 +198,7 @@ pub fn step_down<K>(
         (Some(_), Integrity::High) => StepDown::Token(make()?),
         (None, Integrity::High) => match make() {
             Ok(token) => StepDown::Token(token),
-            Err(cause) => StepDown::Fallback(cause),
+            Err(cause) => StepDown::Fallback(format!("{cause:#}")),
         },
     })
 }

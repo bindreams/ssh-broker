@@ -252,16 +252,6 @@ fn the_token_of_a_process_handle_is_that_process_s_token() {
 
 // the token an unelevated session runs with -----
 
-/// What a [`StepDown`] is, as text a test compares: `StepDown` holds an error and has no equality.
-fn shape(given: &StepDown<&str>) -> String {
-    match given {
-        StepDown::Token(token) => format!("Token({token})"),
-        StepDown::Own => "Own".to_owned(),
-        StepDown::Refused => "Refused".to_owned(),
-        StepDown::Fallback(cause) => format!("Fallback({cause:#})"),
-    }
-}
-
 /// The table of the one rule for a login that asked for a level, each cell: what it gives and how many
 /// tokens were made.
 #[test]
@@ -269,14 +259,14 @@ fn step_down_gives_the_table() {
     use crate::socket_loc::Integrity::{High, Medium};
     use std::cell::Cell;
     let cells = [
-        (ElevationPolicy::Never, High, "Token(token)", 1),
-        (ElevationPolicy::Prompt, High, "Token(token)", 1),
-        (ElevationPolicy::AutoApprove, High, "Token(token)", 1),
-        (ElevationPolicy::Always, High, "Own", 0),
-        (ElevationPolicy::Never, Medium, "Own", 0),
-        (ElevationPolicy::Prompt, Medium, "Own", 0),
-        (ElevationPolicy::AutoApprove, Medium, "Own", 0),
-        (ElevationPolicy::Always, Medium, "Refused", 0),
+        (ElevationPolicy::Never, High, StepDown::Token("token"), 1),
+        (ElevationPolicy::Prompt, High, StepDown::Token("token"), 1),
+        (ElevationPolicy::AutoApprove, High, StepDown::Token("token"), 1),
+        (ElevationPolicy::Always, High, StepDown::Own, 0),
+        (ElevationPolicy::Never, Medium, StepDown::Own, 0),
+        (ElevationPolicy::Prompt, Medium, StepDown::Own, 0),
+        (ElevationPolicy::AutoApprove, Medium, StepDown::Own, 0),
+        (ElevationPolicy::Always, Medium, StepDown::Refused, 0),
     ];
     for (policy, level, gives, made_times) in cells {
         let made = Cell::new(0);
@@ -289,7 +279,7 @@ fn step_down_gives_the_table() {
             },
         )
         .unwrap();
-        assert_eq!(shape(&given), gives, "{policy:?} at {level:?}");
+        assert_eq!(given, gives, "{policy:?} at {level:?}");
         assert_eq!(made.get(), made_times, "{policy:?} at {level:?}: tokens made");
     }
 }
@@ -300,14 +290,14 @@ fn step_down_gives_the_table() {
 fn step_down_for_a_login_that_set_nothing_gives_the_token_at_high_and_own_at_medium() {
     use crate::socket_loc::Integrity::{High, Medium};
     let at_high = step_down(None, || Ok(High), || Ok("token")).unwrap();
-    assert_eq!(shape(&at_high), "Token(token)");
+    assert_eq!(at_high, StepDown::Token("token"));
     let at_medium = step_down(
         None,
         || Ok(Medium),
         || -> anyhow::Result<&str> { panic!("a token was made below High") },
     )
     .unwrap();
-    assert_eq!(shape(&at_medium), "Own");
+    assert_eq!(at_medium, StepDown::Own);
 }
 
 /// A level that cannot be read is not Medium, and `always` is not guessed at: a login that asked for a level
@@ -343,10 +333,9 @@ fn step_down_unreadable_integrity_is_a_fallback_for_a_login_that_set_nothing() {
         || -> anyhow::Result<&str> { panic!("a token was made without the level") },
     )
     .unwrap();
-    let shape = shape(&given);
-    assert!(
-        shape.starts_with("Fallback(") && shape.contains("the level cannot be read"),
-        "{shape}"
+    assert_eq!(
+        given,
+        StepDown::Fallback("read this process's integrity level: the level cannot be read".to_owned())
     );
 }
 
@@ -377,5 +366,5 @@ fn step_down_make_failure_is_a_fallback_for_a_login_that_set_nothing() {
         || -> anyhow::Result<&str> { anyhow::bail!("no token") },
     )
     .unwrap();
-    assert_eq!(shape(&given), "Fallback(no token)");
+    assert_eq!(given, StepDown::Fallback("no token".to_owned()));
 }

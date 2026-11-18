@@ -1108,7 +1108,7 @@ fn fail_open_a_login_that_set_nothing_gets_the_shell_and_the_notice_when_it_cann
             &mut stderr,
             |asked| {
                 assert_eq!(asked, None, "the login set nothing");
-                Ok(StepDown::<u32>::Fallback(anyhow::anyhow!("the token cannot be made")))
+                Ok(StepDown::<u32>::Fallback("the token cannot be made".to_owned()))
             },
             |line, token| {
                 starts.push((line.contains("pwsh.exe"), token.copied()));

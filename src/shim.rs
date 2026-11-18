@@ -422,7 +422,6 @@ pub fn fail_open<T, K>(
         Ok(StepDown::Token(token)) => Some(token),
         Ok(StepDown::Own) => None,
         Ok(StepDown::Fallback(cause)) => {
-            let cause = format!("{cause:#}");
             tracing::warn!("fail-open could not prepare an unelevated session, so it keeps sshd's token: {cause}");
             tell(stderr, &text::unelevated_fallback(&cause, text::FallbackToken::Sshd));
             None

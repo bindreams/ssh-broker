@@ -136,7 +136,7 @@ const AT_MEDIUM: anyhow::Result<Integrity> = Ok(Integrity::Medium);
 #[test]
 fn a_full_token_relays_with_a_batch_logon() {
     assert_eq!(
-        stance(None, Ok(Elevation::Full), AT_HIGH),
+        stance(None, Ok(Elevation::Full), &AT_HIGH),
         Stance::Relay {
             logon: LogonKind::Batch
         }
@@ -146,7 +146,7 @@ fn a_full_token_relays_with_a_batch_logon() {
 #[test]
 fn a_standard_token_at_medium_relays_with_an_interactive_logon() {
     assert_eq!(
-        stance(None, Ok(Elevation::Standard), AT_MEDIUM),
+        stance(None, Ok(Elevation::Standard), &AT_MEDIUM),
         Stance::Relay {
             logon: LogonKind::Interactive
         }
@@ -158,7 +158,7 @@ fn a_standard_token_at_medium_relays_with_an_interactive_logon() {
 #[test]
 fn a_standard_token_at_high_relays_with_a_batch_logon() {
     assert_eq!(
-        stance(None, Ok(Elevation::Standard), AT_HIGH),
+        stance(None, Ok(Elevation::Standard), &AT_HIGH),
         Stance::Relay {
             logon: LogonKind::Batch
         }
@@ -167,14 +167,14 @@ fn a_standard_token_at_high_relays_with_a_batch_logon() {
 
 #[test]
 fn a_filtered_token_gets_the_plain_shell_and_no_relay() {
-    assert_eq!(stance(None, Ok(Elevation::Filtered), AT_MEDIUM), Stance::PlainShell);
-    assert_eq!(stance(None, Ok(Elevation::Filtered), AT_HIGH), Stance::PlainShell);
+    assert_eq!(stance(None, Ok(Elevation::Filtered), &AT_MEDIUM), Stance::PlainShell);
+    assert_eq!(stance(None, Ok(Elevation::Filtered), &AT_HIGH), Stance::PlainShell);
     // Whatever its level: one that cannot be read does not turn the plain shell into a relay.
     assert_eq!(
         stance(
             None,
             Ok(Elevation::Filtered),
-            Err(anyhow::anyhow!("the level cannot be read"))
+            &Err(anyhow::anyhow!("the level cannot be read"))
         ),
         Stance::PlainShell
     );
@@ -183,7 +183,7 @@ fn a_filtered_token_gets_the_plain_shell_and_no_relay() {
 #[test]
 fn an_unreadable_elevation_still_relays_but_offers_nothing_and_keeps_the_cause() {
     assert_eq!(
-        stance(None, Err(anyhow::anyhow!("the token cannot be read")), AT_HIGH),
+        stance(None, Err(anyhow::anyhow!("the token cannot be read")), &AT_HIGH),
         Stance::RelayWithoutOffer {
             cause: "the token cannot be read".into()
         }
@@ -195,7 +195,7 @@ fn an_unreadable_elevation_still_relays_but_offers_nothing_and_keeps_the_cause()
 fn an_unreadable_integrity_level_still_relays_but_offers_nothing_and_keeps_the_cause() {
     for elevation in [Elevation::Full, Elevation::Standard] {
         assert_eq!(
-            stance(None, Ok(elevation), Err(anyhow::anyhow!("the level cannot be read"))),
+            stance(None, Ok(elevation), &Err(anyhow::anyhow!("the level cannot be read"))),
             Stance::RelayWithoutOffer {
                 cause: "the level cannot be read".into()
             }
@@ -208,7 +208,7 @@ fn an_unreadable_integrity_level_still_relays_but_offers_nothing_and_keeps_the_c
 #[test]
 fn always_below_high_is_refused_before_anything_connects() {
     for elevation in [Elevation::Standard, Elevation::Filtered] {
-        let got = stance(Some(ElevationPolicy::Always), Ok(elevation), AT_MEDIUM);
+        let got = stance(Some(ElevationPolicy::Always), Ok(elevation), &AT_MEDIUM);
         let expected = match elevation {
             Elevation::Filtered => AlwaysRefusal::Filtered,
             _ => AlwaysRefusal::BelowHigh,
@@ -220,7 +220,7 @@ fn always_below_high_is_refused_before_anything_connects() {
         stance(
             Some(ElevationPolicy::Always),
             Err(anyhow::anyhow!("the token cannot be read")),
-            AT_MEDIUM
+            &AT_MEDIUM
         ),
         Stance::Refused(AlwaysRefusal::BelowHigh)
     );
@@ -230,7 +230,7 @@ fn always_below_high_is_refused_before_anything_connects() {
 fn always_at_high_relays_for_a_token_that_can_be_elevated() {
     for elevation in [Elevation::Full, Elevation::Standard] {
         assert_eq!(
-            stance(Some(ElevationPolicy::Always), Ok(elevation), AT_HIGH),
+            stance(Some(ElevationPolicy::Always), Ok(elevation), &AT_HIGH),
             Stance::Relay {
                 logon: LogonKind::Batch
             },
@@ -241,7 +241,7 @@ fn always_at_high_relays_for_a_token_that_can_be_elevated() {
         stance(
             Some(ElevationPolicy::Always),
             Err(anyhow::anyhow!("the token cannot be read")),
-            AT_HIGH
+            &AT_HIGH
         ),
         Stance::RelayWithoutOffer {
             cause: "the token cannot be read".into()
@@ -255,7 +255,7 @@ fn always_at_high_relays_for_a_token_that_can_be_elevated() {
 fn always_for_a_filtered_token_is_refused_at_every_level() {
     for integrity in [AT_MEDIUM, AT_HIGH, Err(anyhow::anyhow!("the level cannot be read"))] {
         assert_eq!(
-            stance(Some(ElevationPolicy::Always), Ok(Elevation::Filtered), integrity),
+            stance(Some(ElevationPolicy::Always), Ok(Elevation::Filtered), &integrity),
             Stance::Refused(AlwaysRefusal::Filtered)
         );
     }
@@ -270,7 +270,7 @@ fn always_with_an_unreadable_level_is_refused_with_the_cause() {
             stance(
                 Some(ElevationPolicy::Always),
                 elevation,
-                Err(anyhow::anyhow!("the level cannot be read"))
+                &Err(anyhow::anyhow!("the level cannot be read"))
             ),
             Stance::Refused(AlwaysRefusal::LevelUnreadable("the level cannot be read".into()))
         );
@@ -287,11 +287,62 @@ fn the_other_policies_are_not_refused_at_any_level() {
         Some(ElevationPolicy::AutoApprove),
     ] {
         for integrity in [AT_MEDIUM, AT_HIGH] {
-            let got = stance(asked, Ok(Elevation::Standard), integrity);
+            let got = stance(asked, Ok(Elevation::Standard), &integrity);
             assert!(matches!(got, Stance::Relay { .. }), "{asked:?}: {got:?}");
         }
-        assert_eq!(stance(asked, Ok(Elevation::Filtered), AT_MEDIUM), Stance::PlainShell);
+        assert_eq!(stance(asked, Ok(Elevation::Filtered), &AT_MEDIUM), Stance::PlainShell);
     }
+}
+
+/// A blank command ends the run with exit 0 and no output, except that a login that asked for `always` and
+/// cannot have it is refused first: the refusal is the stance's, and nothing else of the stance is acted on.
+#[test]
+fn a_blank_command_ends_the_run_quietly_unless_the_login_is_refused() {
+    let cases = [
+        (Stance::PlainShell, true),
+        (
+            Stance::Relay {
+                logon: LogonKind::Batch,
+            },
+            true,
+        ),
+        (
+            Stance::Relay {
+                logon: LogonKind::Interactive,
+            },
+            true,
+        ),
+        (Stance::RelayWithoutOffer { cause: "x".into() }, true),
+        (Stance::Refused(AlwaysRefusal::Filtered), false),
+        (Stance::Refused(AlwaysRefusal::BelowHigh), false),
+        (Stance::Refused(AlwaysRefusal::LevelUnreadable("x".into())), false),
+    ];
+    for (stance, ends) in cases {
+        assert_eq!(blank_command_ends_run(&stance, true), ends, "{stance:?}, blank");
+        assert!(!blank_command_ends_run(&stance, false), "{stance:?}, not blank");
+    }
+}
+
+/// One read of the level goes to the stance and to the rule the fail-open shell applies, so they agree on
+/// `always`: the stance refuses it exactly where the rule does not give an elevated session.
+#[test]
+fn the_stance_and_the_step_down_rule_agree_on_always_for_one_read_of_the_level() {
+    use crate::account::step_down;
+    use crate::socket_loc::StepDown;
+    for level in [AT_MEDIUM, AT_HIGH] {
+        let stance = stance(Some(ElevationPolicy::Always), Ok(Elevation::Standard), &level);
+        let rule = step_down(Some(ElevationPolicy::Always), || level, || Ok(())).unwrap();
+        assert_eq!(
+            matches!(stance, Stance::Refused(_)),
+            rule == StepDown::Refused,
+            "{stance:?} / {rule:?}"
+        );
+    }
+    let unreadable: anyhow::Result<Integrity> = Err(anyhow::anyhow!("the level cannot be read"));
+    let stance = stance(Some(ElevationPolicy::Always), Ok(Elevation::Standard), &unreadable);
+    let rule = step_down(Some(ElevationPolicy::Always), || unreadable, || Ok(())).unwrap_err();
+    assert!(matches!(stance, Stance::Refused(AlwaysRefusal::LevelUnreadable(_))));
+    assert!(format!("{rule:#}").contains("the level cannot be read"), "{rule:#}");
 }
 
 /// What the shim says for each refusal is the sentence of `offer::text` for it, with its line break.

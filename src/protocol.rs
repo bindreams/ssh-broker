@@ -214,7 +214,7 @@ pub struct Handshake {
     pub command: Option<String>,
     pub env: Vec<(String, String)>,
     pub launch: Launch,
-    /// What the login asked of elevation; `None` if it set [`ElevationPolicy::VARIABLE`] to nothing. A login
+    /// What the login asked of elevation; `None` for a login that did not set [`ElevationPolicy::VARIABLE`]. A login
     /// that asked for a level is refused when it cannot be given; one that asked for none is given
     /// [`ElevationPolicy::DEFAULT`], or, when no unelevated session can be made, the token the process has.
     /// Appended last: the version check reads `version` alone, so a peer of another version is refused

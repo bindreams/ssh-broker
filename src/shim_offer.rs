@@ -135,7 +135,8 @@ impl AlwaysRefusal {
 }
 
 /// Decide the [`Stance`] of a login that `asked` for a level (`None`: it set nothing) with a token with
-/// `elevation` at the folder level `integrity`. The shim's own level is the level of the agent it would
+/// `elevation` at the folder level `integrity`, which is read once and lent, so that the rule of the fail-open
+/// shell ([`crate::account::step_down`]) is given the same read. The shim's own level is the level of the agent it would
 /// reach, so `always` is decided here and nowhere later: an elevated session cannot be had by a filtered token
 /// at any level, nor below High, nor when the level cannot be read. The logon kind follows `integrity`, as the
 /// folder does, so the agent the offer starts serves the folder the shim waits on (High: batch, which UAC does
@@ -143,17 +144,17 @@ impl AlwaysRefusal {
 pub fn stance(
     asked: Option<ElevationPolicy>,
     elevation: anyhow::Result<Elevation>,
-    integrity: anyhow::Result<Integrity>,
+    integrity: &anyhow::Result<Integrity>,
 ) -> Stance {
     if asked == Some(ElevationPolicy::Always) {
-        match (&elevation, &integrity) {
+        match (&elevation, integrity) {
             (Ok(Elevation::Filtered), _) => return Stance::Refused(AlwaysRefusal::Filtered),
             (_, Err(cause)) => return Stance::Refused(AlwaysRefusal::LevelUnreadable(format!("{cause:#}"))),
             (_, Ok(Integrity::Medium)) => return Stance::Refused(AlwaysRefusal::BelowHigh),
             (_, Ok(Integrity::High)) => {}
         }
     }
-    match (elevation, integrity) {
+    match (&elevation, integrity) {
         (Ok(Elevation::Filtered), _) => Stance::PlainShell,
         (Err(e), _) | (Ok(_), Err(e)) => Stance::RelayWithoutOffer {
             cause: format!("{e:#}"),
@@ -165,6 +166,13 @@ pub fn stance(
             logon: LogonKind::Interactive,
         },
     }
+}
+
+/// Whether a run ends at once, quietly, with exit 0: the command is blank and the login is not refused. A
+/// refusal comes first, so a login that asked for `always` and cannot have it is refused also with a blank
+/// command; a blank command then ends the run before anything else of the stance is acted on or said.
+pub fn blank_command_ends_run(stance: &Stance, blank_command: bool) -> bool {
+    blank_command && !matches!(stance, Stance::Refused(_))
 }
 
 // wait_until_serving -----

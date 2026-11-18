@@ -25,7 +25,7 @@ use crate::shim::{
     decide_fallback, fail_open, is_blank_command, make_handshake, peer_gone, pump_exec, pump_heard, size_to_resize,
     start_exec_input,
 };
-use crate::shim_offer::{Absent, Folder, Prompting, Rescue, Rescued, Stance, stance};
+use crate::shim_offer::{Absent, Folder, Prompting, Rescue, Rescued, Stance, blank_command_ends_run, stance};
 use crate::socket_loc::SocketLocation;
 use crate::winutil::{ChildConsole, UnelevatedToken, contain_and_resume, spawn_suspended};
 use crate::{afunix, conpty, vtinput};
@@ -57,11 +57,12 @@ const EVT_FOCUS: u16 = 0x0010;
 /// What the login asked of elevation is read first, once the log is open, from [`ElevationPolicy::VARIABLE`]
 /// in the environment sshd gave the shim: a value that is not one of the four words ends the run with a
 /// sentence and exit 255, before anything else, and a variable that is not set is a login that asked nothing.
-/// A `-c` session then resolves its command: `detect` says how sshd encoded it (see [`resolve_exec`]), and a
-/// blank command ends the run there, exit 0. Nothing on the command line is interpreted. The command and what
-/// was asked make the one [`Login`] that the relay and the fail-open shell ([`fail_open`], which applies the one
-/// rule to it) are given. A login that asked for `always` and cannot have it is refused by [`stance`], before
-/// anything connects.
+/// A `-c` session then resolves its command: `detect` says how sshd encoded it (see [`resolve_exec`]). Nothing
+/// on the command line is interpreted. The command and what was asked make the one [`Login`] that the relay and
+/// the fail-open shell ([`fail_open`], which applies the one rule to it, to the level [`stance`] was given) are
+/// given. A login that asked for `always` and cannot have it is refused by [`stance`], before anything
+/// connects and also when its command is blank; any other blank command then ends the run
+/// ([`blank_command_ends_run`]), exit 0 and silent.
 pub fn run_on(exec: Option<RawExec>, detect: impl FnOnce() -> Encoding) -> anyhow::Result<()> {
     // Walk first and keep the result: the folders it holds cannot be swapped, so the log and connect reach
     // them and no others.
@@ -88,10 +89,6 @@ pub fn run_on(exec: Option<RawExec>, detect: impl FnOnce() -> Encoding) -> anyho
         exec: exec.map(|exec| resolve_exec(exec, detect)),
         elevation: asked,
     };
-    if login.exec.as_ref().is_some_and(|exec| is_blank_command(&exec.command)) {
-        drop(log); // flush: `process::exit` runs no destructors
-        std::process::exit(0)
-    }
 
     // EVERY command relays. There is deliberately no local route for file transfers.
     //
@@ -103,11 +100,16 @@ pub fn run_on(exec: Option<RawExec>, detect: impl FnOnce() -> Encoding) -> anyho
     // `verify`'s probe covers a real child, real pipes and a real socket in both directions too.
     // What remains is a throughput difference, which does not earn a classifier.
     // What this login's own token allows is decided once, before anything connects.
-    let relayed = match stance(
-        login.elevation,
-        crate::account::elevation(),
-        crate::account::integrity(),
-    ) {
+    // The level is read once: the stance and the fail-open shell's rule below are given this one result.
+    let level = crate::account::integrity();
+    let decided = stance(login.elevation, crate::account::elevation(), &level);
+    // A blank command ends the run here, after a refusal and before the rest of the stance is acted on.
+    let blank = login.exec.as_ref().is_some_and(|exec| is_blank_command(&exec.command));
+    if blank_command_ends_run(&decided, blank) {
+        drop(log); // flush: `process::exit` runs no destructors
+        std::process::exit(0)
+    }
+    let relayed = match decided {
         Stance::Refused(refusal) => {
             tracing::error!("refused a login that asked for SSH_BROKER_ELEVATION=always: {refusal:?}");
             // The sentence carries its own line break (the agent's reply shares it).
@@ -153,7 +155,7 @@ pub fn run_on(exec: Option<RawExec>, detect: impl FnOnce() -> Encoding) -> anyho
         &crate::shell::WindowsHost,
         &login,
         &mut std::io::stderr(),
-        UnelevatedToken::for_policy,
+        |asked| crate::account::step_down(asked, || level, UnelevatedToken::of_this_process),
         start_local,
         LocalChild::finish,
     );

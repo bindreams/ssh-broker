@@ -126,7 +126,11 @@ fn run_shim(password: &str, agent_exe: &Path, logon: Option<&str>) -> String {
         Some("batch") => LogonKind::Batch,
         Some("interactive") => LogonKind::Interactive,
         Some(other) => return format!("shim.logon names no logon: {other:?}"),
-        None => match stance(None, ssh_broker::account::elevation(), ssh_broker::account::integrity()) {
+        None => match stance(
+            None,
+            ssh_broker::account::elevation(),
+            &ssh_broker::account::integrity(),
+        ) {
             Stance::Relay { logon } => logon,
             other => return format!("no session is offered to this token: {other:?}"),
         },
