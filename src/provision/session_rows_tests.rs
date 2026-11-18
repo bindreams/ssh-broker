@@ -39,6 +39,14 @@ fn answered(result: ProbeResult) -> ProbeOutcome {
     ProbeOutcome::Answered(answer(result))
 }
 
+/// A probe whose relay failed.
+fn failed(cause: &str) -> ProbeOutcome {
+    ProbeOutcome::Failed {
+        cause: cause.into(),
+        may_still_run: true,
+    }
+}
+
 fn names(rows: &[Check]) -> Vec<&str> {
     rows.iter().map(|row| row.name).collect()
 }
@@ -159,6 +167,29 @@ fn what_the_probe_said_about_its_token_is_on_the_row_instead_of_the_remedy() {
     assert!(!rows[1].detail.contains("apply"), "{}", rows[1].detail);
 }
 
+/// A probe that read one of the two facts of its token and said why it could not read the other: the row
+/// has its words, whichever of the two is missing.
+#[test]
+fn what_the_probe_said_about_a_half_read_token_is_on_the_unelevated_row() {
+    let said = "reading its integrity level failed: access denied";
+    for (asked, missing) in [
+        (probe(Some(Elevation::Filtered), None), "its level"),
+        (probe(None, Some(INTEGRITY_MEDIUM)), "its token"),
+    ] {
+        let outcome = ProbeOutcome::Answered(Answer {
+            token_said: said.into(),
+            ..answer(asked.clone())
+        });
+
+        let rows = session_rows(&answer(elevated()), Some(&outcome));
+
+        assert!(!rows[1].pass, "{asked:?}");
+        assert!(rows[1].detail.contains(said), "{asked:?}: {}", rows[1].detail);
+        assert!(rows[1].detail.contains(missing), "{asked:?}: {}", rows[1].detail);
+        assert!(!rows[1].detail.contains("apply"), "{asked:?}: {}", rows[1].detail);
+    }
+}
+
 #[test]
 fn a_filtered_agent_is_named_as_not_elevated() {
     let rows = session_rows(
@@ -222,11 +253,7 @@ fn an_unelevated_probe_at_medium_without_administrators_enabled_passes_for_eithe
 #[test]
 fn an_unelevated_probe_that_did_not_answer_fails_its_row_with_the_cause() {
     for (outcome, cause, says) in [
-        (
-            ProbeOutcome::Failed("relay failed (code 254)".into()),
-            "relay failed (code 254)",
-            "failed",
-        ),
+        (failed("relay failed (code 254)"), "relay failed (code 254)", "failed"),
         (
             ProbeOutcome::TimedOut("no output within 30s".into()),
             "no output within 30s",
@@ -454,7 +481,7 @@ fn a_standard_accounts_report_has_one_session_row() {
 fn outcomes(answer: ProbeResult) -> [(&'static str, ProbeOutcome); 4] {
     [
         ("answered", answered(answer)),
-        ("failed", ProbeOutcome::Failed("relay failed".into())),
+        ("failed", failed("relay failed")),
         ("timed out", ProbeOutcome::TimedOut("no output".into())),
         ("not run", ProbeOutcome::NotRun("no agent".into())),
     ]
@@ -514,10 +541,7 @@ fn a_default_probe_that_did_not_answer_below_high_is_the_one_row() {
 /// another, and what the probes said, on the one row; a cause the row has already is not said twice.
 #[test]
 fn a_default_probe_that_did_not_answer_shows_the_junctions_cause_and_note() {
-    let mut p = probes(
-        ProbeOutcome::Failed("relay failed".into()),
-        Some(answered(unelevated())),
-    );
+    let mut p = probes(failed("relay failed"), Some(answered(unelevated())));
     p.junction = unavailable("making a junction failed", "removing D:\\t failed: in use");
 
     let rows = rows_of(&p);
@@ -527,10 +551,29 @@ fn a_default_probe_that_did_not_answer_shows_the_junctions_cause_and_note() {
         assert!(rows[0].detail.contains(said), "{said}: {}", rows[0].detail);
     }
 
-    p.junction = unavailable("relay failed", "");
+    p.junction = Junction::Unread { note: String::new() };
     let rows = rows_of(&p);
     assert_eq!(rows[0].detail.matches("relay failed").count(), 1, "{}", rows[0].detail);
     assert!(!rows[0].detail.contains("junction"), "{}", rows[0].detail);
+
+    p.junction = Junction::Unread {
+        note: "reading through the junction was slow".into(),
+    };
+    let rows = rows_of(&p);
+    assert!(rows[0].detail.contains("was slow"), "{}", rows[0].detail);
+}
+
+/// A junction whose default probe gave no answer fails its row, if it is ever asked for one.
+#[test]
+fn an_unread_junction_fails_its_row() {
+    let row = link_row(&Junction::Unread { note: "in use".into() });
+
+    assert!(!row.pass, "{}", row.detail);
+    assert!(
+        row.detail.contains("no answer") && row.detail.contains("in use"),
+        "{}",
+        row.detail
+    );
 }
 
 /// The junction row is `Probes::junction`, which `run` settles from both probes: a refusal fails it,
@@ -551,7 +594,7 @@ fn the_junction_row_is_the_junction_found() {
 fn a_junction_left_behind_is_named_on_its_own_row() {
     let leftover = r"C:\Temp\sb-junction-1 could not be removed: access denied";
 
-    for default in [answered(elevated()), ProbeOutcome::Failed("relay failed".into())] {
+    for default in [answered(elevated()), failed("relay failed")] {
         let mut p = probes(default, Some(answered(unelevated())));
         p.leftover = Some(leftover.to_string());
 

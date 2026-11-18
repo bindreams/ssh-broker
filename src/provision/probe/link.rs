@@ -143,35 +143,34 @@ fn made_and_followed(dir: &Path) -> SymlinkState {
 /// Read the file through the junction in `dir` as this process, and say what happened. Any failure
 /// but RedirectionGuard's refusal is [`SymlinkState::Failed`], with its cause on stderr.
 pub fn follow(dir: &Path) -> SymlinkState {
-    let read = std::fs::read(dir.join(LINK_NAME).join(FILE_NAME));
-    if let Some(note) = read_note(dir, &read) {
+    let (state, note) = judge_read(dir, std::fs::read(dir.join(LINK_NAME).join(FILE_NAME)));
+    if let Some(note) = note {
         eprintln!("{JUNCTION_SAID}{note}");
     }
-    state_of_read(read)
+    state
 }
 
-/// What to say of a read through the junction in `dir`: nothing for a followed one or RedirectionGuard's
-/// refusal, which is an outcome of its own, and why for any other.
-fn read_note(dir: &Path, read: &io::Result<Vec<u8>>) -> Option<String> {
+/// What a read through the junction in `dir` came to: the file's content is the probe's
+/// ([`SymlinkState::Ok`]), or the read was refused as an untrusted mount point
+/// ([`SymlinkState::Blocked`]), or it failed. The note says why for a read that failed or gave other
+/// content, and is `None` for a followed junction and for RedirectionGuard's refusal, which is an outcome
+/// of its own.
+fn judge_read(dir: &Path, read: io::Result<Vec<u8>>) -> (SymlinkState, Option<String>) {
     match read {
-        Ok(content) if content == FILE_CONTENT => None,
-        Ok(_) => Some(format!(
-            "reading through the junction in {} gave content that differs from the {:?} that was written",
-            dir.display(),
-            String::from_utf8_lossy(FILE_CONTENT)
-        )),
-        Err(e) if e.raw_os_error() == Some(UNTRUSTED_MOUNT_POINT) => None,
-        Err(e) => Some(format!("reading through the junction in {} failed: {e}", dir.display())),
-    }
-}
-
-/// What a read through the junction says: the file's content is the probe's, or the read was refused as
-/// an untrusted mount point, or it failed.
-fn state_of_read(read: io::Result<Vec<u8>>) -> SymlinkState {
-    match read {
-        Ok(content) if content == FILE_CONTENT => SymlinkState::Ok,
-        Err(e) if e.raw_os_error() == Some(UNTRUSTED_MOUNT_POINT) => SymlinkState::Blocked,
-        _ => SymlinkState::Failed,
+        Ok(content) if content == FILE_CONTENT => (SymlinkState::Ok, None),
+        Ok(_) => (
+            SymlinkState::Failed,
+            Some(format!(
+                "reading through the junction in {} gave content that differs from the {:?} that was written",
+                dir.display(),
+                String::from_utf8_lossy(FILE_CONTENT)
+            )),
+        ),
+        Err(e) if e.raw_os_error() == Some(UNTRUSTED_MOUNT_POINT) => (SymlinkState::Blocked, None),
+        Err(e) => (
+            SymlinkState::Failed,
+            Some(format!("reading through the junction in {} failed: {e}", dir.display())),
+        ),
     }
 }
 

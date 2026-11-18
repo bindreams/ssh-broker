@@ -128,7 +128,10 @@ fn a_probe_with_no_flag_makes_no_junction_and_reports_none() {
     let temp = Temp::new("none-given");
     let stdout = run_verify_probe_with(&[], &temp.0, &(0..=255u8).collect::<Vec<_>>());
     let line = probe_line(&stdout);
-    assert!(!line.contains("symlink="), "no link outcome expected, got: {line}");
+    assert!(
+        !line.contains("junction=") && !line.contains("symlink="),
+        "no link outcome expected, got: {line}"
+    );
     assert_eq!(std::fs::read_dir(&temp.0).unwrap().count(), 0, "nothing is made");
 }
 
@@ -141,14 +144,14 @@ fn a_probe_makes_a_junction_in_the_directory_it_is_given_and_another_follows_it(
     let dir = dir.to_str().unwrap();
     let made = run_verify_probe_with(&["--make-junction", dir], &temp.0, b"");
     let made_line = probe_line(&made);
-    assert!(made_line.contains("symlink=ok"), "{made_line}");
-    assert!(!made_line.contains("junction="), "no path is reported: {made_line}");
+    assert!(made_line.contains("junction=ok"), "{made_line}");
+    assert!(!made_line.contains(dir), "no path is reported: {made_line}");
     assert!(Path::new(dir).is_dir(), "the directory is made where it was named");
 
     let followed = run_verify_probe_with(&["--follow", dir], &temp.0, b"");
     let followed_line = probe_line(&followed);
-    assert!(followed_line.contains("symlink=ok"), "{followed_line}");
-    assert!(!followed_line.contains("junction="), "{followed_line}");
+    assert!(followed_line.contains("junction=ok"), "{followed_line}");
+    assert!(!followed_line.contains(dir), "no path is reported: {followed_line}");
     assert!(Path::new(dir).exists(), "the follower leaves the junction to `verify`");
 }
 
@@ -165,8 +168,8 @@ fn a_probe_given_a_path_that_exists_makes_no_junction_and_leaves_it_alone() {
 
     let line = probe_line(&stdout);
     assert!(
-        line.contains("symlink=notmade"),
-        "expected symlink=notmade, got: {line}"
+        line.contains("junction=notmade"),
+        "expected junction=notmade, got: {line}"
     );
     assert_eq!(std::fs::read(dir.join("keep.txt")).unwrap(), b"keep");
     assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1, "nothing was added");
@@ -178,7 +181,7 @@ fn a_probe_that_follows_a_directory_with_no_junction_reports_a_failure() {
     let temp = Temp::new("none");
     let stdout = run_verify_probe_with(&["--follow", &temp.0.to_string_lossy()], &temp.0, b"");
     let line = probe_line(&stdout);
-    assert!(line.contains("symlink=fail"), "expected symlink=fail, got: {line}");
+    assert!(line.contains("junction=fail"), "expected junction=fail, got: {line}");
 }
 
 /// The probe reports its own token: the line names an elevation and an integrity level, which `verify`

@@ -7,8 +7,8 @@
 //!
 //! The directory of the junction is named here, under this process's temp directory, before any probe
 //! runs, and no probe names one back, so a path a process below High wrote is never one `verify` acts on.
-//! It is removed here, through no link, whatever became of the probes: one that did not answer may still
-//! create it, and a note says so. A directory left in the temp folder does not make the installation
+//! It is removed here, through no link, whatever became of the probes: one whose child may still be
+//! running may still create it, and a note says so. A directory left in the temp folder does not make the installation
 //! wrong, so the `junction directory` row it gives passes.
 
 use std::path::Path;
@@ -63,19 +63,13 @@ fn run_at(integrity: Integrity, temp: &Path, drive: Drive) -> Probes {
 fn run_at_medium(dir: &Path, drive: Drive) -> Probes {
     let default = drive(Privilege::Account, make_link(dir));
     let note = said(&default).to_owned();
-    let junction = match (dir.to_str(), default.answer()) {
-        (None, _) => Junction::Unavailable {
+    let junction = if dir.to_str().is_some() {
+        read_by(&default, note)
+    } else {
+        Junction::Unavailable {
             cause: not_text(dir),
             note,
-        },
-        (Some(_), Ok(own)) => Junction::Read {
-            state: own.result.symlink,
-            note,
-        },
-        (Some(_), Err(cause)) => Junction::Unavailable {
-            cause: cause.to_string(),
-            note,
-        },
+        }
     };
     Probes {
         unelevated: None,
@@ -105,16 +99,7 @@ fn run_at_high(dir: &Path, drive: Drive) -> Probes {
         .collect::<Vec<_>>()
         .join("; ");
     let junction = match source {
-        Source::FromBelowHigh(_) => match default.answer() {
-            Ok(followed) => Junction::Read {
-                state: followed.result.symlink,
-                note,
-            },
-            Err(cause) => Junction::Unavailable {
-                cause: cause.to_string(),
-                note,
-            },
-        },
+        Source::FromBelowHigh(_) => read_by(&default, note),
         Source::NoJunctionsOnVolume => Junction::Read {
             state: Some(SymlinkState::Skipped),
             note,
@@ -136,6 +121,18 @@ fn make_link(dir: &Path) -> ProbeLink {
         .map_or(ProbeLink::NoJunction, |text| ProbeLink::Make(text.to_owned()))
 }
 
+/// The junction as the default probe, which follows it, found it; one that gave no answer found nothing, and
+/// its own outcome says why.
+fn read_by(default: &ProbeOutcome, note: String) -> Junction {
+    match default.answer() {
+        Ok(followed) => Junction::Read {
+            state: followed.result.symlink,
+            note,
+        },
+        Err(_) => Junction::Unread { note },
+    }
+}
+
 fn not_text(dir: &Path) -> String {
     format!("the directory {} cannot be told to a probe as text", dir.display())
 }
@@ -145,10 +142,10 @@ fn maker(probes: &Probes) -> &ProbeOutcome {
     probes.unelevated.as_ref().unwrap_or(&probes.default)
 }
 
-/// Remove `dir` and say what is left of it: why it could not be removed, and that a `maker` that did not
-/// answer (so that its end is not known) may still create it. `told` is whether `maker` was given it.
+/// Remove `dir` and say what is left of it: why it could not be removed, and that a `maker` whose child may
+/// still be running may still create it. `told` is whether `maker` was given it.
 fn leftover(dir: &Path, told: bool, maker: &ProbeOutcome) -> Option<String> {
-    let may_come = told && maker.answer().is_err();
+    let may_come = told && maker.may_still_run();
     match (probe::link::remove(dir), may_come) {
         (Err(e), may_come) => Some(format!(
             "{} could not be removed: {e}{}; it can be deleted",
@@ -201,7 +198,7 @@ fn source_of<'a>(dir: &'a Path, unelevated: &ProbeOutcome) -> Source<'a> {
         (Some(Integrity::Medium), Some(state)) if state.was_made() => Source::FromBelowHigh(text),
         (Some(Integrity::Medium), Some(SymlinkState::Skipped)) => Source::NoJunctionsOnVolume,
         (Some(Integrity::Medium), Some(_)) => {
-            Source::Unavailable("the probe that asked for an unelevated session could not make the directory".into())
+            Source::Unavailable("the probe that asked for an unelevated session could not make the junction".into())
         }
     }
 }
@@ -231,14 +228,28 @@ fn drive_bounded(exe: &Path, privilege: Privilege, link: ProbeLink, timeout: Opt
     outcome_of(super::bounded::await_bounded(&rx, timeout))
 }
 
-/// What became of a probe whose worker was waited for: a timeout is [`ProbeOutcome::TimedOut`]; a worker
-/// that stopped and a relay that failed are [`ProbeOutcome::Failed`].
-fn outcome_of(waited: Result<anyhow::Result<Answer>, WaitError>) -> ProbeOutcome {
+/// How [`drive`] stopped short of an answer, which says whether the probe's child may still be running.
+enum Stop {
+    /// Nothing reached the agent (no connection, no handshake sent): there is no child.
+    NotStarted(anyhow::Error),
+    /// The relay broke before the child's exit: whether it still runs is not known.
+    RelayBroke(anyhow::Error),
+    /// The relay ended with the child's exit, and what it printed has no PROBE line: the child is gone.
+    Exited(anyhow::Error),
+}
+
+/// What became of a probe whose worker was waited for: a probe that could not be started is
+/// [`ProbeOutcome::NotRun`]; a timeout is [`ProbeOutcome::TimedOut`]; a relay that failed and a worker that
+/// stopped are [`ProbeOutcome::Failed`], whose child is gone only when the relay ended with its exit.
+fn outcome_of(waited: Result<Result<Answer, Stop>, WaitError>) -> ProbeOutcome {
+    let failed = |cause: String, may_still_run| ProbeOutcome::Failed { cause, may_still_run };
     match waited {
         Ok(Ok(answer)) => ProbeOutcome::Answered(answer),
-        Ok(Err(cause)) => ProbeOutcome::Failed(format!("{cause:#}")),
+        Ok(Err(Stop::NotStarted(cause))) => ProbeOutcome::NotRun(format!("{cause:#}")),
+        Ok(Err(Stop::RelayBroke(cause))) => failed(format!("{cause:#}"), true),
+        Ok(Err(Stop::Exited(cause))) => failed(format!("{cause:#}"), false),
         Err(timed_out @ WaitError::TimedOut { .. }) => ProbeOutcome::TimedOut(timed_out.to_string()),
-        Err(stopped @ WaitError::WorkerStopped) => ProbeOutcome::Failed(stopped.to_string()),
+        Err(stopped @ WaitError::WorkerStopped) => failed(stopped.to_string(), true),
     }
 }
 
@@ -249,25 +260,27 @@ fn outcome_of(waited: Result<anyhow::Result<Answer>, WaitError>) -> ProbeOutcome
 /// needs: the payload is deliberately not valid UTF-8, so converting first would destroy the
 /// very property being measured. This is the end-to-end half of byte-transparency — a real
 /// child, real pipes, a real socket — which the in-memory relay tests cannot reach.
-fn drive(exe: &Path, privilege: Privilege, link: &ProbeLink) -> anyhow::Result<Answer> {
+fn drive(exe: &Path, privilege: Privilege, link: &ProbeLink) -> Result<Answer, Stop> {
     let sock = crate::userdir::inspect_current_socket_dir()
         .and_then(|folder| folder.connect())
-        .context("connect to agent")?;
-    let (rx, tx) = afunix::split(sock)?;
+        .context("connect to agent")
+        .map_err(Stop::NotStarted)?;
+    let (rx, tx) = afunix::split(sock).map_err(Stop::NotStarted)?;
     let hs = super::probe_handshake(exe, privilege, link);
     let mut out = Vec::new();
     let mut err = Vec::new();
     // Feed the same payload upstream that the child echoes downstream, so the client → child
     // (`sftp put`/`scp`) direction is checked too.
     let upstream = std::io::Cursor::new(probe::binary_probe_payload());
-    let code = shim::run_exec_on(rx, tx, &hs, &mut out, &mut err, upstream)?;
-    anyhow::ensure!(
-        code != 254 && code != 255,
-        "probe relay failed (code {code}; stderr={})",
-        String::from_utf8_lossy(&err).trim()
-    );
+    let code = shim::run_exec_on(rx, tx, &hs, &mut out, &mut err, upstream).map_err(Stop::RelayBroke)?;
+    if code == 254 || code == 255 {
+        return Err(Stop::RelayBroke(anyhow::anyhow!(
+            "probe relay failed (code {code}; stderr={})",
+            String::from_utf8_lossy(&err).trim()
+        )));
+    }
     let binary_ok = probe::binary_probe_ok(&out);
-    let result = probe::parse_probe_line(&String::from_utf8_lossy(&out))?;
+    let result = probe::parse_probe_line(&String::from_utf8_lossy(&out)).map_err(Stop::Exited)?;
     let stderr = String::from_utf8_lossy(&err);
     Ok(Answer {
         result,

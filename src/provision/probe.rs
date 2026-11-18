@@ -22,8 +22,8 @@ pub enum SymlinkState {
     Blocked,
     /// The junction was made, and the read failed for another reason.
     Failed,
-    /// The directory for the junction, or something in it before the junction, could not be made
-    /// (access, disk, a path that exists): nothing was made to follow, and that is a fault.
+    /// The junction could not be made on a volume that holds them (access, disk, a path that exists, the
+    /// directory or something in it before the junction): nothing was made to follow, and that is a fault.
     NotMade,
     /// The volume of the directory holds no junctions (a temp directory on a volume with no reparse
     /// points, say), so following one was not tested. Informational: it fails nothing.
@@ -237,7 +237,7 @@ pub fn format_probe_line(r: &ProbeResult) -> String {
         if r.dpapi_ok { "ok" } else { "fail" },
     );
     if let Some(symlink) = r.symlink {
-        line.push_str(&format!(" symlink={}", symlink.as_str()));
+        line.push_str(&format!(" junction={}", symlink.as_str()));
     }
     line.push_str(&format!(
         " upstream={}",
@@ -257,8 +257,9 @@ pub fn format_probe_line(r: &ProbeResult) -> String {
 
 /// Parse the `PROBE …` line out of the child's stdout (tolerant of surrounding noise).
 /// Default-deny on every key: a missing line errors; a missing dpapi reads as fail, a missing
-/// session_id as 0, and a missing or unknown symlink, elevation or integrity as `None`, which no row
-/// passes on.
+/// session_id as 0, and a missing or unknown junction, elevation or integrity as `None`, which no row
+/// passes on. An exe from before the junction check prints its symbolic-link outcome as `symlink=`, which
+/// is not read: it reads as a probe that reported no junction.
 pub fn parse_probe_line(stdout: &str) -> anyhow::Result<ProbeResult> {
     let line = stdout
         .lines()
@@ -282,7 +283,7 @@ pub fn parse_probe_line(stdout: &str) -> anyhow::Result<ProbeResult> {
             r.session_id = v.parse().unwrap_or(0);
         } else if let Some(v) = tok.strip_prefix("dpapi=") {
             r.dpapi_ok = v == "ok";
-        } else if let Some(v) = tok.strip_prefix("symlink=") {
+        } else if let Some(v) = tok.strip_prefix("junction=") {
             r.symlink = SymlinkState::parse(v);
         } else if let Some(v) = tok.strip_prefix("upstream=") {
             r.upstream = UpstreamState::parse(v);

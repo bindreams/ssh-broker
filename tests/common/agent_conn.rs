@@ -43,17 +43,12 @@ pub struct BackgroundAgent {
 }
 
 impl BackgroundAgent {
-    /// Start it from `kit`'s copy of the real exe and wait until it is listening. Panics with what
-    /// the agent left (exit code, `agent.log`) if it ends first.
-    pub fn start(kit: &Kit, account: &Account) -> BackgroundAgent {
+    /// Start it from `kit`'s copy of the real exe with the `kind` of logon and wait until it is listening.
+    /// Panics with what the agent left (exit code, `agent.log`) if it ends first, and ends it then.
+    pub fn start(kit: &Kit, account: &Account, kind: logon::LogonKind) -> BackgroundAgent {
         let password = crate::password::password(&account.password);
-        let started = logon::start_background_agent(
-            &local_account(account),
-            &password,
-            &kit.exe,
-            logon::LogonKind::Interactive,
-        )
-        .unwrap_or_else(|e| panic!("the logon for {} failed: {e:?}", account.name));
+        let started = logon::start_background_agent(&local_account(account), &password, &kit.exe, kind)
+            .unwrap_or_else(|e| panic!("the logon for {} failed: {e:?}", account.name));
         let location = account.socket_location();
         let agent = BackgroundAgent {
             process: started.process,

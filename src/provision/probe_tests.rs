@@ -23,8 +23,18 @@ fn bare(session_id: u32, symlink: SymlinkState, upstream: UpstreamState) -> Prob
 fn probe_line_round_trips() {
     let result = bare(1, SymlinkState::Blocked, UpstreamState::Ok);
     let line = format_probe_line(&result);
-    assert_eq!(line, "PROBE session_id=1 dpapi=ok symlink=blocked upstream=ok");
+    assert_eq!(line, "PROBE session_id=1 dpapi=ok junction=blocked upstream=ok");
     assert_eq!(parse_probe_line(&line).unwrap(), result);
+}
+
+/// An exe from before the junction check ignores `--make-junction` and prints its old symbolic-link
+/// outcome under `symlink=`: that is no junction outcome, and is not read as one.
+#[test]
+fn an_old_probes_symlink_outcome_is_not_a_junction_outcome() {
+    for word in ["ok", "skip", "blocked", "fail", "notmade"] {
+        let old = parse_probe_line(&format!("PROBE session_id=1 dpapi=ok symlink={word} upstream=ok")).unwrap();
+        assert_eq!(old.symlink, None, "symlink={word}");
+    }
 }
 
 /// The probe's own token, as the parent reads it: how much of an administrator's power it has and the
@@ -55,25 +65,25 @@ fn probe_line_carries_the_elevation_and_the_integrity_level() {
 /// A probe that says nothing about its token reads as "not proven", never as an elevation.
 #[test]
 fn a_missing_or_unknown_elevation_or_integrity_is_not_proven() {
-    let old = parse_probe_line("PROBE session_id=1 dpapi=ok symlink=ok upstream=ok").unwrap();
+    let old = parse_probe_line("PROBE session_id=1 dpapi=ok junction=ok upstream=ok").unwrap();
     assert_eq!((old.elevation, old.integrity), (None, None));
     let garbled =
-        parse_probe_line("PROBE session_id=1 dpapi=ok symlink=ok upstream=ok elevation=root integrity=high").unwrap();
+        parse_probe_line("PROBE session_id=1 dpapi=ok junction=ok upstream=ok elevation=root integrity=high").unwrap();
     assert_eq!((garbled.elevation, garbled.integrity), (None, None));
 }
 
-/// No probe reports a path, and a `junction=` key from an older exe is ignored, not read as a directory.
+/// No probe reports a path, and a path under `junction=` from an older exe is no outcome, not a directory.
 #[test]
 fn the_probe_line_names_no_directory() {
     let line = format_probe_line(&bare(1, SymlinkState::Ok, UpstreamState::Ok));
-    assert!(!line.contains("junction"), "{line}");
+    assert!(line.contains(" junction=ok "), "{line}");
+    assert!(!line.contains('\\'), "{line}");
 
-    let old =
-        parse_probe_line(r"PROBE session_id=1 dpapi=ok symlink=ok upstream=ok junction=C:\Users\me\Temp\x").unwrap();
-    assert_eq!(old, bare(1, SymlinkState::Ok, UpstreamState::Ok));
+    let old = parse_probe_line(r"PROBE session_id=1 dpapi=ok upstream=ok junction=C:\Users\me\Temp\x").unwrap();
+    assert_eq!(old.symlink, None);
 }
 
-/// A probe that was given no junction reports none: the line has no `symlink=` and reads back as not
+/// A probe that was given no junction reports none: the line has no `junction=` and reads back as not
 /// reported, which is not a failed outcome. A word it does not know is not reported either.
 #[test]
 fn a_probe_that_reports_no_junction_outcome_has_none() {
@@ -86,7 +96,7 @@ fn a_probe_that_reports_no_junction_outcome_has_none() {
 
     assert_eq!(line, "PROBE session_id=1 dpapi=ok upstream=ok");
     assert_eq!(parse_probe_line(&line).unwrap(), none);
-    let unknown = parse_probe_line("PROBE session_id=1 dpapi=ok symlink=banana upstream=ok").unwrap();
+    let unknown = parse_probe_line("PROBE session_id=1 dpapi=ok junction=banana upstream=ok").unwrap();
     assert_eq!(unknown.symlink, None);
 }
 
@@ -128,7 +138,7 @@ fn only_the_lines_of_one_kind_of_the_probes_stderr_are_kept_and_they_are_bounded
 /// fail the gate; only the second may tell the operator the payload was mangled.
 #[test]
 fn a_missing_upstream_token_is_absent_not_a_reported_failure() {
-    let old = parse_probe_line("PROBE session_id=1 dpapi=ok symlink=skip")
+    let old = parse_probe_line("PROBE session_id=1 dpapi=ok junction=skip")
         .unwrap()
         .upstream;
     assert_eq!(old, UpstreamState::Absent);
@@ -257,7 +267,7 @@ fn binary_probe_round_trips_and_detects_a_single_flipped_byte() {
     // Surrounding output is expected — the PROBE line follows, and a shell may add its own.
     let mut noisy = b"leading junk\n".to_vec();
     noisy.extend_from_slice(&buf);
-    noisy.extend_from_slice(b"PROBE session_id=1 dpapi=ok symlink=skip\n");
+    noisy.extend_from_slice(b"PROBE session_id=1 dpapi=ok junction=skip\n");
     assert!(binary_probe_ok(&noisy), "must tolerate surrounding output");
 
     let payload_start = b"BINPROBE<".len();
@@ -304,7 +314,7 @@ fn parse_is_default_deny_on_gating_keys() {
 
 #[test]
 fn parse_tolerates_surrounding_noise() {
-    let out = "starting...\nPROBE session_id=7 dpapi=ok symlink=ok upstream=ok\nbye\n";
+    let out = "starting...\nPROBE session_id=7 dpapi=ok junction=ok upstream=ok\nbye\n";
     assert_eq!(
         parse_probe_line(out).unwrap(),
         bare(7, SymlinkState::Ok, UpstreamState::Ok)
@@ -322,7 +332,7 @@ fn probe_line_round_trips_with_logon_type() {
         logon_type: Some(4),
         ..bare(0, SymlinkState::Ok, UpstreamState::Ok)
     });
-    assert_eq!(line, "PROBE session_id=0 dpapi=ok symlink=ok upstream=ok logon=4");
+    assert_eq!(line, "PROBE session_id=0 dpapi=ok junction=ok upstream=ok logon=4");
     assert_eq!(parse_probe_line(&line).unwrap().logon_type, Some(4));
 }
 
@@ -330,9 +340,9 @@ fn probe_line_round_trips_with_logon_type() {
 /// that must read as "not proven", never as a logon type.
 #[test]
 fn probe_line_without_logon_parses_to_none() {
-    let line = "PROBE session_id=1 dpapi=ok symlink=ok upstream=ok";
+    let line = "PROBE session_id=1 dpapi=ok junction=ok upstream=ok";
     assert_eq!(parse_probe_line(line).unwrap().logon_type, None);
-    let garbled = "PROBE session_id=1 dpapi=ok symlink=ok upstream=ok logon=x";
+    let garbled = "PROBE session_id=1 dpapi=ok junction=ok upstream=ok logon=x";
     assert_eq!(parse_probe_line(garbled).unwrap().logon_type, None);
 }
 

@@ -12,6 +12,7 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use ssh_broker::autologin::{self, PasswordSource, WindowsEnv};
+use ssh_broker::logon::LogonKind;
 use ssh_broker::provision::{self, procwait, schtasks, taskscheduler};
 use windows::Win32::Foundation::{HANDLE, HANDLE_FLAG_INHERIT, SetHandleInformation, WAIT_TIMEOUT};
 use windows::Win32::System::Threading::{
@@ -258,7 +259,7 @@ fn scene() -> Scene {
     let prompted = Account::create("up2", true);
     let mut installed_kit = Kit::copy_of_broker("up2");
     installed_kit.exe = installed.clone();
-    let session = BackgroundAgent::start(&installed_kit, &prompted);
+    let session = BackgroundAgent::start(&installed_kit, &prompted, LogonKind::Interactive);
     Scene {
         _auto_login_off: auto_login_off,
         broker,
@@ -798,7 +799,6 @@ fn apply_then_verify_for_an_administrator_shows_an_elevated_session_and_an_unele
 /// so the junction a token below High made is followed there as well.
 #[test]
 fn apply_then_verify_for_an_administrator_whose_agent_the_password_prompt_started() {
-    use ssh_broker::logon::{self, LogonKind};
     use ssh_broker::protocol::Privilege;
 
     let _machine = machine::exclusive();
@@ -815,20 +815,15 @@ fn apply_then_verify_for_an_administrator_whose_agent_the_password_prompt_starte
 
     let admin = Account::create("vf2", true);
     admin.make_administrator();
-    let started = logon::start_background_agent(
-        &local_account(&admin),
-        &password::password(&admin.password),
-        &installed,
-        LogonKind::Batch,
-    )
-    .unwrap_or_else(|e| panic!("the batch logon for {} failed: {e:?}", admin.name));
-    let location = admin.socket_location();
-    stand_in::wait_for_serving_marker(&location, started.process.0);
-    // Ends the agent when it goes, whether the test passed or not.
-    let _agent = BackgroundAgent {
-        process: started.process,
-        location: location.clone(),
-    };
+    let mut installed_kit = Kit::copy_of_broker("vf2");
+    installed_kit.exe = installed.clone();
+    // The guard ends the agent when it goes, whether the test passed or not, and when the wait for it fails.
+    let agent = BackgroundAgent::start(&installed_kit, &admin, LogonKind::Batch);
 
-    assert_verify_passes_for_an_elevated_agent(&verify_through(&installed, &admin, &location, Privilege::Account));
+    assert_verify_passes_for_an_elevated_agent(&verify_through(
+        &installed,
+        &admin,
+        &agent.location,
+        Privilege::Account,
+    ));
 }

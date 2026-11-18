@@ -30,11 +30,14 @@ pub struct Answer {
 pub enum ProbeOutcome {
     /// It ran and its PROBE line was read.
     Answered(Answer),
-    /// The relay or the probe failed with an answer `verify` can show (an exit code, no PROBE line): the cause.
-    Failed(String),
-    /// `--probe-timeout` passed with no answer: the cause.
+    /// The relay or the probe failed (an exit code, no PROBE line): the cause, and whether the probe's child
+    /// may still be running: not when the relay ended with the child's exit, and not known when it broke
+    /// before that.
+    Failed { cause: String, may_still_run: bool },
+    /// `--probe-timeout` passed with no answer, so the child may still be running: the cause.
     TimedOut(String),
-    /// `verify` did not start it: why.
+    /// `verify` could not start it (no connection to the agent, the handshake not sent), so there is no
+    /// child: why.
     NotRun(String),
 }
 
@@ -43,7 +46,18 @@ impl ProbeOutcome {
     pub fn answer(&self) -> Result<&Answer, &str> {
         match self {
             ProbeOutcome::Answered(answer) => Ok(answer),
-            ProbeOutcome::Failed(cause) | ProbeOutcome::TimedOut(cause) | ProbeOutcome::NotRun(cause) => Err(cause),
+            ProbeOutcome::Failed { cause, .. } | ProbeOutcome::TimedOut(cause) | ProbeOutcome::NotRun(cause) => {
+                Err(cause)
+            }
+        }
+    }
+
+    /// Whether the probe's child may still be running, and so may still do what it was told.
+    pub fn may_still_run(&self) -> bool {
+        match self {
+            ProbeOutcome::Answered(_) | ProbeOutcome::NotRun(_) => false,
+            ProbeOutcome::Failed { may_still_run, .. } => *may_still_run,
+            ProbeOutcome::TimedOut(_) => true,
         }
     }
 }
@@ -72,17 +86,20 @@ pub enum Junction {
     /// There was no junction from below High to read, so nothing about it could be tested: why, and what
     /// the probes said.
     Unavailable { cause: String, note: String },
+    /// The default probe, which reads the junction, did not answer: its own outcome says why, and this is
+    /// what the probes said.
+    Unread { note: String },
 }
 
 impl Junction {
-    /// What `verify` knows of the junction beyond a default probe's own failure `cause`: its own cause,
-    /// when it is another, and what the probes said.
-    fn said_beyond(&self, cause: &str) -> String {
-        let (own_cause, note) = match self {
-            Junction::Read { note, .. } => ("", note),
+    /// What `verify` knows of the junction besides the default probe's outcome: why there was no junction
+    /// to read, when there was none, and what the probes said.
+    fn said(&self) -> String {
+        let (cause, note) = match self {
+            Junction::Read { note, .. } | Junction::Unread { note } => ("", note),
             Junction::Unavailable { cause, note } => (cause.as_str(), note),
         };
-        [if own_cause == cause { "" } else { own_cause }, note]
+        [cause, note]
             .into_iter()
             .filter(|part| !part.is_empty())
             .collect::<Vec<_>>()
@@ -137,7 +154,7 @@ pub fn parity_rows(probes: &Probes, active_console: u32) -> Vec<Check> {
             ));
         }
         Err(cause) => {
-            let said = probes.junction.said_beyond(cause);
+            let said = probes.junction.said();
             let detail = format!("unavailable: {cause}");
             rows.push(Check::new(
                 "parity probe (via agent)",
@@ -251,7 +268,7 @@ fn unelevated_row(unelevated: Option<&ProbeOutcome>) -> Check {
     const NAME: &str = "unelevated session on request";
     let (asked, said) = match unelevated {
         None => return Check::new(NAME, false, "the probe that asks for an unelevated session was not run"),
-        Some(ProbeOutcome::Failed(cause)) => {
+        Some(ProbeOutcome::Failed { cause, .. }) => {
             return Check::new(
                 NAME,
                 false,
@@ -288,7 +305,7 @@ fn unelevated_row(unelevated: Option<&ProbeOutcome>) -> Check {
                 }
             ),
         ),
-        (Some(_), _) | (None, Some(_)) => Check::new(
+        (Some(_), Some(_)) => Check::new(
             NAME,
             false,
             format!(
@@ -297,7 +314,9 @@ fn unelevated_row(unelevated: Option<&ProbeOutcome>) -> Check {
                 level(asked.integrity)
             ),
         ),
-        (None, None) => Check::new(NAME, false, not_reported("its token", said)),
+        (Some(_), None) => Check::new(NAME, false, not_reported("its level", said)),
+        (None, Some(_)) => Check::new(NAME, false, not_reported("its token", said)),
+        (None, None) => Check::new(NAME, false, not_reported("its token or its level", said)),
     }
 }
 
@@ -325,6 +344,13 @@ pub fn link_row(junction: &Junction) -> Check {
                 NAME,
                 false,
                 with_note(&format!("no junction from below High could be tested: {cause}"), note),
+            );
+        }
+        Junction::Unread { note } => {
+            return Check::new(
+                NAME,
+                false,
+                with_note("the probe that reads the junction gave no answer", note),
             );
         }
     };

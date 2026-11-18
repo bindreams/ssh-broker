@@ -105,6 +105,22 @@ impl Probing {
     }
 }
 
+/// A probe whose relay broke before its child's exit: whether the child still runs is not known.
+fn broke(cause: &str) -> ProbeOutcome {
+    ProbeOutcome::Failed {
+        cause: cause.into(),
+        may_still_run: true,
+    }
+}
+
+/// A probe whose relay ended with its child's exit, with no PROBE line to read.
+fn exited(cause: &str) -> ProbeOutcome {
+    ProbeOutcome::Failed {
+        cause: cause.into(),
+        may_still_run: false,
+    }
+}
+
 fn unelevated_ok() -> ProbeOutcome {
     answer(Elevation::Filtered, INTEGRITY_MEDIUM, Some(SymlinkState::Ok), "")
 }
@@ -117,7 +133,7 @@ fn elevated_ok() -> ProbeOutcome {
 fn read(probes: &Probes) -> Option<(Option<SymlinkState>, &str)> {
     match &probes.junction {
         Junction::Read { state, note } => Some((*state, note)),
-        Junction::Unavailable { .. } => None,
+        Junction::Unavailable { .. } | Junction::Unread { .. } => None,
     }
 }
 
@@ -174,7 +190,7 @@ fn an_agent_at_high_gets_two_probes_with_one_directory_which_is_removed() {
 fn a_failed_unelevated_probe_gives_the_may_still_create_note_and_the_default_probe_runs_without_a_junction() {
     let scratch = Scratch::new();
     let probing = Probing::new(
-        || ProbeOutcome::Failed("probe relay failed (code 254)".into()),
+        || broke("probe relay failed (code 254)"),
         || answer(Elevation::Full, INTEGRITY_HIGH, None, "the probe was given no junction"),
     );
 
@@ -189,7 +205,7 @@ fn a_failed_unelevated_probe_gives_the_may_still_create_note_and_the_default_pro
     let leftover = probes.leftover.as_deref().expect("a note that the directory may come");
     assert!(leftover.contains(dir.as_str()), "{leftover}");
     assert!(leftover.contains("may still create"), "{leftover}");
-    assert!(matches!(&probes.unelevated, Some(ProbeOutcome::Failed(cause)) if cause.contains("code 254")));
+    assert!(matches!(&probes.unelevated, Some(ProbeOutcome::Failed { cause, .. }) if cause.contains("code 254")));
     assert!(matches!(&probes.default, ProbeOutcome::Answered(_)));
     let (cause, note) = unavailable(&probes);
     assert!(cause.contains("code 254"), "{cause}");
@@ -300,7 +316,7 @@ fn a_maker_that_reported_no_junction_outcome_gets_no_follower() {
     assert!(unavailable(&probes).0.contains("did not report its junction"));
 }
 
-/// A maker that could not make the directory gives no junction to follow.
+/// A maker that could not make the junction gives none to follow.
 #[test]
 fn a_directory_that_could_not_be_made_gives_no_junction_from_below_high() {
     let scratch = Scratch::new();
@@ -360,7 +376,7 @@ fn a_failed_default_probe_keeps_the_unelevated_row_and_the_leftover() {
     let scratch = Scratch::new();
     let probing = Probing::new(
         || ProbeOutcome::TimedOut("no output within 30s".into()),
-        || ProbeOutcome::Failed("connect to agent: refused".into()),
+        || broke("relay: refused"),
     );
     let probes = probing.run(Integrity::High, &scratch.0);
     // A timed-out first probe starts no second one, so the default probe here is the one that did not run.
@@ -378,11 +394,9 @@ fn a_failed_default_probe_keeps_the_unelevated_row_and_the_leftover() {
         ]
     );
 
-    let failing = Probing::new(unelevated_ok, || {
-        ProbeOutcome::Failed("connect to agent: refused".into())
-    });
+    let failing = Probing::new(unelevated_ok, || exited("no PROBE line in probe output: refused"));
     let probes = failing.run(Integrity::High, &scratch.0);
-    assert!(matches!(&probes.default, ProbeOutcome::Failed(_)));
+    assert!(matches!(&probes.default, ProbeOutcome::Failed { .. }));
     let rows = parity_rows(&probes, 1);
     let names: Vec<&str> = rows.iter().map(|row| row.name).collect();
     assert_eq!(names, ["parity probe (via agent)", "unelevated session on request"]);
@@ -447,7 +461,7 @@ fn an_agent_below_high_has_one_probe_with_a_directory_that_verify_removes() {
 fn an_agent_below_high_that_does_not_answer_has_its_outcome_as_the_default_and_a_note() {
     for unanswered in [
         (|| ProbeOutcome::TimedOut("no output".into())) as fn() -> ProbeOutcome,
-        || ProbeOutcome::Failed("relay failed".into()),
+        || broke("relay failed"),
     ] {
         let scratch = Scratch::new();
         let probing = Probing::new(unelevated_ok, unanswered);
@@ -456,8 +470,13 @@ fn an_agent_below_high_that_does_not_answer_has_its_outcome_as_the_default_and_a
 
         assert!(matches!(
             &probes.default,
-            ProbeOutcome::TimedOut(_) | ProbeOutcome::Failed(_)
+            ProbeOutcome::TimedOut(_) | ProbeOutcome::Failed { .. }
         ));
+        assert!(
+            matches!(&probes.junction, Junction::Unread { note } if note.is_empty()),
+            "{:?}",
+            probes.junction
+        );
         assert!(probes.unelevated.is_none());
         assert!(scratch.is_empty());
         probing.assert_outside_intact();
@@ -469,6 +488,54 @@ fn an_agent_below_high_that_does_not_answer_has_its_outcome_as_the_default_and_a
         assert!(leftover.contains(dir.as_str()), "{leftover}");
         assert!(leftover.contains("may still create"), "{leftover}");
     }
+}
+
+// a probe that cannot create the directory -------------------------------------------------
+
+/// A probe whose child is gone, or was never started, cannot create the directory: no note says it may.
+#[test]
+fn a_probe_that_ended_or_never_started_gives_no_may_still_create_note() {
+    #[allow(clippy::type_complexity)]
+    let ended: [(&str, fn() -> ProbeOutcome); 2] = [
+        ("exited", || exited("no PROBE line in probe output")),
+        ("not started", || {
+            ProbeOutcome::NotRun("connect to agent: no agent".into())
+        }),
+    ];
+    for (name, outcome) in ended {
+        for integrity in [Integrity::High, Integrity::Medium] {
+            let scratch = Scratch::new();
+            let probing = Probing::new(outcome, outcome);
+
+            let probes = probing.run(integrity, &scratch.0);
+
+            assert_eq!(probes.leftover, None, "{name} at {integrity:?}");
+            assert!(scratch.is_empty(), "{name} at {integrity:?}");
+            let rows = parity_rows(&probes, 1);
+            assert!(
+                !row_names(&rows).contains(&"junction directory"),
+                "{name} at {integrity:?}: {:?}",
+                row_names(&rows)
+            );
+        }
+    }
+}
+
+/// With no agent running, `verify` has no probe and no junction directory to name; the one row is the
+/// probe's, with the cause.
+#[test]
+fn with_no_agent_running_there_is_no_junction_directory_row() {
+    let scratch = Scratch::new();
+    let probing = Probing::new(
+        || ProbeOutcome::NotRun("connect to agent: no agent is running".into()),
+        || ProbeOutcome::NotRun("connect to agent: no agent is running".into()),
+    );
+
+    let probes = probing.run(Integrity::Medium, &scratch.0);
+
+    let rows = parity_rows(&probes, 1);
+    assert_eq!(row_names(&rows), ["parity probe (via agent)"]);
+    assert!(rows[0].detail.contains("no agent is running"), "{}", rows[0].detail);
 }
 
 // the directory cannot be removed -----------------------------------------------------------
@@ -562,7 +629,7 @@ fn each_pair_of_maker_and_follower_has_the_expected_junction_row() {
         ),
         (
             "maker failed",
-            || ProbeOutcome::Failed("relay failed".into()),
+            || broke("relay failed"),
             || follower(Some(SymlinkState::Ok)),
             false,
             "relay failed",
@@ -621,24 +688,52 @@ fn each_pair_of_maker_and_follower_has_the_expected_junction_row() {
 
 // what a bounded probe came to --------------------------------------------------------------
 
-/// A timeout is `TimedOut`; a worker that stopped and a relay that failed are `Failed`.
+/// What became of the worker decides the outcome, and with it whether the probe's child may still run: a
+/// probe that never started has none, a timeout and a relay that broke before the child's exit may have
+/// one, and a relay that ended with the child's exit has none.
 #[test]
 fn what_became_of_the_worker_decides_the_outcome() {
     let ProbeOutcome::Answered(done) = unelevated_ok() else {
         unreachable!("unelevated_ok answers")
     };
 
-    assert!(matches!(outcome_of(Ok(Ok(done))), ProbeOutcome::Answered(_)));
-    assert!(matches!(
-        outcome_of(Ok(Err(anyhow::anyhow!("probe relay failed (code 254)")))),
-        ProbeOutcome::Failed(cause) if cause.contains("code 254")
-    ));
-    assert!(matches!(
-        outcome_of(Err(WaitError::TimedOut { secs: 30 })),
-        ProbeOutcome::TimedOut(cause) if cause.contains("30s")
-    ));
-    assert!(matches!(
-        outcome_of(Err(WaitError::WorkerStopped)),
-        ProbeOutcome::Failed(cause) if cause.contains("worker stopped")
-    ));
+    let answered = outcome_of(Ok(Ok(done)));
+    assert!(matches!(answered, ProbeOutcome::Answered(_)));
+    assert!(!answered.may_still_run());
+
+    let not_started = outcome_of(Ok(Err(Stop::NotStarted(anyhow::anyhow!("connect to agent: refused")))));
+    assert!(
+        matches!(&not_started, ProbeOutcome::NotRun(cause) if cause.contains("refused")),
+        "{not_started:?}"
+    );
+    assert!(!not_started.may_still_run());
+
+    let broke = outcome_of(Ok(Err(Stop::RelayBroke(anyhow::anyhow!(
+        "probe relay failed (code 254)"
+    )))));
+    assert!(
+        matches!(&broke, ProbeOutcome::Failed { cause, may_still_run: true } if cause.contains("code 254")),
+        "{broke:?}"
+    );
+    assert!(broke.may_still_run());
+
+    let exited = outcome_of(Ok(Err(Stop::Exited(anyhow::anyhow!("no PROBE line in probe output")))));
+    assert!(
+        matches!(&exited, ProbeOutcome::Failed { cause, may_still_run: false } if cause.contains("no PROBE line")),
+        "{exited:?}"
+    );
+    assert!(!exited.may_still_run());
+
+    let timed_out = outcome_of(Err(WaitError::TimedOut { secs: 30 }));
+    assert!(
+        matches!(&timed_out, ProbeOutcome::TimedOut(cause) if cause.contains("30s")),
+        "{timed_out:?}"
+    );
+    assert!(timed_out.may_still_run());
+
+    let stopped = outcome_of(Err(WaitError::WorkerStopped));
+    assert!(
+        matches!(&stopped, ProbeOutcome::Failed { cause, may_still_run: true } if cause.contains("worker stopped")),
+        "{stopped:?}"
+    );
 }

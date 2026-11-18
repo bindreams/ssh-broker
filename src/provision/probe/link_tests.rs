@@ -55,10 +55,12 @@ fn only_an_untrusted_mount_point_error_is_a_block() {
     let untrusted = std::io::Error::from_raw_os_error(448);
     let other = std::io::Error::from_raw_os_error(5);
 
-    assert_eq!(state_of_read(Err(untrusted)), SymlinkState::Blocked);
-    assert_eq!(state_of_read(Err(other)), SymlinkState::Failed);
-    assert_eq!(state_of_read(Ok(b"parity".to_vec())), SymlinkState::Ok);
-    assert_eq!(state_of_read(Ok(b"other".to_vec())), SymlinkState::Failed);
+    let state = |read| judge_read(Path::new(r"D:\t"), read).0;
+
+    assert_eq!(state(Err(untrusted)), SymlinkState::Blocked);
+    assert_eq!(state(Err(other)), SymlinkState::Failed);
+    assert_eq!(state(Ok(b"parity".to_vec())), SymlinkState::Ok);
+    assert_eq!(state(Ok(b"other".to_vec())), SymlinkState::Failed);
 }
 
 /// Every read that is not a followed junction or RedirectionGuard's refusal says why on stderr, a read
@@ -66,7 +68,7 @@ fn only_an_untrusted_mount_point_error_is_a_block() {
 #[test]
 fn a_read_that_failed_or_gave_other_content_is_said() {
     let dir = Path::new(r"D:\t");
-    let said = |read| read_note(dir, &read);
+    let said = |read| judge_read(dir, read).1;
 
     assert_eq!(said(Ok(b"parity".to_vec())), None);
     assert_eq!(said(Err(io::Error::from_raw_os_error(UNTRUSTED_MOUNT_POINT))), None);

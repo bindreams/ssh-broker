@@ -728,7 +728,7 @@ fn logout_message_reaches_a_pty_client_running_inside_the_agent() {
     let _machine = machine::shared();
     let kit = Kit::copy_of_broker("lopty");
     let account = Account::create("lopty", true);
-    let agent = BackgroundAgent::start(&kit, &account);
+    let agent = BackgroundAgent::start(&kit, &account, LogonKind::Interactive);
 
     let mut session = AgentConn::connect(&agent.location, &account.sid);
     session.start_pty("cmd.exe");
@@ -750,7 +750,7 @@ fn logout_exit_code_reaches_an_exec_client_inside_the_agent() {
     let _machine = machine::shared();
     let kit = Kit::copy_of_broker("loexec");
     let account = Account::create("loexec", true);
-    let agent = BackgroundAgent::start(&kit, &account);
+    let agent = BackgroundAgent::start(&kit, &account, LogonKind::Interactive);
 
     let mut session = AgentConn::connect(&agent.location, &account.sid);
     session.start_exec(&logout_command(&kit));
@@ -775,7 +775,7 @@ fn an_exec_command_raising_a_ctrl_event_on_its_console_does_not_end_the_agent() 
     let account = Account::create("exctrl", true);
     let probe = kit.path("ctrl_probe.exe");
     std::fs::copy(command_line_probe::example("ctrl_probe"), &probe).unwrap();
-    let agent = BackgroundAgent::start(&kit, &account);
+    let agent = BackgroundAgent::start(&kit, &account, LogonKind::Interactive);
 
     for (raise, event) in [("raise-ctrl-c", "event 0"), ("raise-ctrl-break", "event 1")] {
         let mut session = AgentConn::connect(&agent.location, &account.sid);
@@ -820,7 +820,7 @@ fn logout_ends_every_process_of_the_logon_session() {
     let _machine = machine::shared();
     let kit = Kit::copy_of_broker("loall");
     let account = Account::create("loall", true);
-    let agent = BackgroundAgent::start(&kit, &account);
+    let agent = BackgroundAgent::start(&kit, &account, LogonKind::Interactive);
     let id = logon_session::logon_id(agent.process.0);
 
     // A shell is running in the session when the end comes.
@@ -870,7 +870,7 @@ fn logon_session_is_logged_off_after_logout() {
     logon_session::assert_logoff_auditing();
     let kit = Kit::copy_of_broker("lolog");
     let account = Account::create("lolog", true);
-    let agent = BackgroundAgent::start(&kit, &account);
+    let agent = BackgroundAgent::start(&kit, &account, LogonKind::Interactive);
     let id = logon_session::logon_id(agent.process.0);
     let watch = logon_session::LogoffWatch::new(id);
 

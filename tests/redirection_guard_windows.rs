@@ -23,8 +23,6 @@ use windows::Win32::System::Threading::{ProcessRedirectionTrustPolicy, SetProces
 mod child_entry;
 #[path = "common/drain.rs"]
 mod drain;
-#[path = "common/fs_state.rs"]
-mod fs_state;
 
 const CHILD: &str = "a_process_that_enforces_redirection_trust_reads_through_two_junctions";
 
@@ -85,7 +83,7 @@ fn an_elevated_junction_is_followed_and_an_unelevated_one_is_refused_under_redir
     child.wait().expect("wait for the unelevated probe");
     let said = format!("{}{}", drain::text_of(out), drain::text_of(err));
     assert!(
-        said.contains("symlink=ok"),
+        said.contains("junction=ok"),
         "the unelevated probe made and read its own junction:\n{said}"
     );
 
