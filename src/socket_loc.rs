@@ -56,6 +56,22 @@ pub enum Elevation {
     Standard,
 }
 
+/// What a session of a login is started with: the answer of [`crate::account::step_down`].
+#[derive(Debug, PartialEq, Eq)]
+pub enum StepDown<K> {
+    /// The stepped-down token, in place of this process's own.
+    Token(K),
+    /// This process's own token: at High the login asked for an elevated session, below High what a
+    /// process starts is unelevated anyway.
+    Own,
+    /// No session: the login asked for an elevated one and this process is below High.
+    Refused,
+    /// This process's own token, because a login that set nothing could not be stepped down; the error is
+    /// why, formatted with its context. It exists only for that: a login that asked for a level is refused
+    /// instead.
+    Fallback(String),
+}
+
 /// What is said of a socket file at `path` that is not as the agent made it (`acl::verify_file_acl` is
 /// false): it must grant exactly `grantee`, SYSTEM and Administrators and, for [`Integrity::High`], carry
 /// the High label. One wording for the agent's refusal to bind and `verify`'s row.

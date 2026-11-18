@@ -7,6 +7,7 @@
 //! what it shows. Every test creates accounts and logs them on: run them in CI, never on a workstation.
 #![cfg(windows)]
 
+use ssh_broker::protocol::ElevationPolicy;
 use ssh_broker::socket_loc;
 use ssh_broker::socket_loc::Integrity;
 use ssh_broker::userdir;
@@ -21,6 +22,8 @@ mod bounded_wait;
 mod command_line_probe;
 #[path = "common/desktop.rs"]
 mod desktop;
+#[path = "common/environment.rs"]
+mod environment;
 #[path = "common/hard_errors.rs"]
 mod hard_errors;
 #[path = "common/machine.rs"]
@@ -62,8 +65,22 @@ fn kit(tag: &str) -> Kit {
 /// The shim of `account` on a console, with the logs the shim and its agent write printed when a wait
 /// for the console fails: they say how far the shim got.
 fn start_run(kit: &Kit, account: &Account) -> PtyRun {
+    start_run_in(kit, account, None)
+}
+
+/// [`start_run`] for a login that asks for the level `asked` of elevation: the shim's environment holds
+/// `SSH_BROKER_ELEVATION`, as sshd gives it the variable a client sent.
+fn start_run_asking(kit: &Kit, account: &Account, asked: &str) -> PtyRun {
+    let mut variables: Vec<_> = std::env::vars_os()
+        .filter(|(name, _)| !name.eq_ignore_ascii_case(ElevationPolicy::VARIABLE))
+        .collect();
+    variables.push((ElevationPolicy::VARIABLE.into(), asked.into()));
+    start_run_in(kit, account, Some(&environment::block(variables)))
+}
+
+fn start_run_in(kit: &Kit, account: &Account, environment: Option<&[u16]>) -> PtyRun {
     let location = account.try_socket_location();
-    PtyRun::start(kit, account, &kit.exe).with_context(move || {
+    PtyRun::start_with_environment(kit, account, &kit.exe, environment).with_context(move || {
         let logs = location.as_ref().map(stand_in::read_logs).unwrap_or_default();
         format!("logs of the account (shim.log, agent.log):\n{logs}")
     })
@@ -215,17 +232,33 @@ fn whoami_groups(run: &mut PtyRun) -> String {
     shown[at..].split(['\r', '\n']).next().unwrap().to_owned()
 }
 
-/// Elevated (CI only). An administrator who signs in at the password prompt gets an elevated session: the
-/// shell's token is High with Administrators enabled. The shim runs as the account's network token, which
-/// is what sshd gives an administrator.
+/// Elevated (CI only). An administrator who signs in at the password prompt and set no level gets an
+/// unelevated session, though the agent is elevated: the shell's token is Medium, with Administrators
+/// denying only. The shim runs as the account's network token, which is what sshd gives an administrator.
 #[test]
-fn an_administrators_prompt_session_is_elevated() {
+fn an_administrators_prompt_session_is_unelevated_by_default() {
     let _machine = machine::shared();
     account_fixture::assert_elevated();
     let kit = kit("ppad");
     let account = Account::create("ppad", true);
     account.make_administrator();
     let mut run = start_run(&kit, &account);
+    log_in(&mut run, &account.password);
+    assert_relayed(&mut run);
+    assert_eq!(whoami_groups(&mut run), "wg-label=Medium wg-admin=False");
+    leave(&mut run);
+}
+
+/// Elevated (CI only). The same administrator, whose login asked for `always`, gets the agent's own token:
+/// High with Administrators enabled.
+#[test]
+fn an_administrators_prompt_session_is_elevated_when_the_login_asks_for_always() {
+    let _machine = machine::shared();
+    account_fixture::assert_elevated();
+    let kit = kit("ppae");
+    let account = Account::create("ppae", true);
+    account.make_administrator();
+    let mut run = start_run_asking(&kit, &account, "always");
     log_in(&mut run, &account.password);
     assert_relayed(&mut run);
     assert_eq!(whoami_groups(&mut run), "wg-label=High wg-admin=True");

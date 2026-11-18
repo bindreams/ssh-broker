@@ -14,10 +14,10 @@
 //! not), JOINS the worker, then the guard restores modes AFTER the join — so the worker can
 //! never read with a half-restored mode (the use-after-close hazard).
 
-use crate::cmdline::{Encoding, Login, RawExec, read_login, resolve_exec};
+use crate::cmdline::{Encoding, Login, RawExec, resolve_exec};
 use crate::console_modes::ConsoleModes;
 use crate::offer::text;
-use crate::protocol::{FrameKind, FrameReader, Handshake, Launch, Privilege, Stream, write_frame};
+use crate::protocol::{ElevationPolicy, FrameKind, FrameReader, Handshake, Launch, Stream, write_frame};
 use crate::relay::{FrameSink, write_data};
 use crate::shell::{self, Session, StartError};
 use crate::shim::{
@@ -25,7 +25,7 @@ use crate::shim::{
     decide_fallback, fail_open, is_blank_command, make_handshake, peer_gone, pump_exec, pump_heard, size_to_resize,
     start_exec_input,
 };
-use crate::shim_offer::{Absent, Folder, Prompting, Rescue, Rescued, Stance, stance};
+use crate::shim_offer::{Absent, Folder, Prompting, Rescue, Rescued, Stance, blank_command_ends_run, stance};
 use crate::socket_loc::SocketLocation;
 use crate::winutil::{ChildConsole, UnelevatedToken, contain_and_resume, spawn_suspended};
 use crate::{afunix, conpty, vtinput};
@@ -54,11 +54,9 @@ const EVT_FOCUS: u16 = 0x0010;
 /// corrupting an interactive PTY). The log guard is flushed before every `process::exit`,
 /// since `process::exit` runs no destructors and the log is the only PTY-mode diagnostic.
 ///
-/// A `-c` session resolves its command first, once the log is open: `detect` says how sshd
-/// encoded it (see [`resolve_exec`]); [`read_login`] then looks for the reserved word, with
-/// `SSH_ORIGINAL_COMMAND` for a word that sshd was told to run; and a blank command ends the run
-/// there, exit 0. What the login asked for goes to the agent in the handshake, and to the fail-open
-/// shell ([`fail_open`]).
+/// A refusal by [`stance`] comes before a blank command ends the run, so a login that asked for `always` and
+/// cannot have it is refused even with a blank command. A value of the variable that is not one of the four
+/// words ends the run first, exit 255.
 pub fn run_on(exec: Option<RawExec>, detect: impl FnOnce() -> Encoding) -> anyhow::Result<()> {
     // Walk first and keep the result: the folders it holds cannot be swapped, so the log and connect reach
     // them and no others.
@@ -69,12 +67,22 @@ pub fn run_on(exec: Option<RawExec>, detect: impl FnOnce() -> Encoding) -> anyho
         Ok(guard) => (Some(guard), None),
         Err(e) => (None, Some(format!("{e:#}"))),
     };
-    let original_command = std::env::var_os("SSH_ORIGINAL_COMMAND").map(|value| value.to_string_lossy().into_owned());
-    let login = read_login(exec.map(|exec| resolve_exec(exec, detect)), original_command);
-    if login.exec.as_ref().is_some_and(|exec| is_blank_command(&exec.command)) {
-        drop(log); // flush: `process::exit` runs no destructors
-        std::process::exit(0)
-    }
+    let asked = match std::env::var_os(ElevationPolicy::VARIABLE)
+        .map(|value| ElevationPolicy::parse(&value))
+        .transpose()
+    {
+        Ok(asked) => asked,
+        Err(unknown) => {
+            tracing::error!("{unknown}");
+            let _ = writeln!(std::io::stderr(), "{}", text::unknown_elevation(&unknown.value));
+            drop(log); // flush: `process::exit` runs no destructors
+            std::process::exit(255)
+        }
+    };
+    let login = Login {
+        exec: exec.map(|exec| resolve_exec(exec, detect)),
+        elevation: asked,
+    };
 
     // EVERY command relays. There is deliberately no local route for file transfers.
     //
@@ -86,7 +94,21 @@ pub fn run_on(exec: Option<RawExec>, detect: impl FnOnce() -> Encoding) -> anyho
     // `verify`'s probe covers a real child, real pipes and a real socket in both directions too.
     // What remains is a throughput difference, which does not earn a classifier.
     // What this login's own token allows is decided once, before anything connects.
-    let relayed = match stance(crate::account::elevation(), crate::account::integrity()) {
+    // The level is read once: the stance and the fail-open shell's rule below are given this one result.
+    let level = crate::account::integrity();
+    let decided = stance(login.elevation, crate::account::elevation(), &level);
+    let blank = login.exec.as_ref().is_some_and(|exec| is_blank_command(&exec.command));
+    if blank_command_ends_run(&decided, blank) {
+        drop(log); // flush: `process::exit` runs no destructors
+        std::process::exit(0)
+    }
+    let relayed = match decided {
+        Stance::Refused(refusal) => {
+            tracing::error!("refused a login that asked for SSH_BROKER_ELEVATION=always: {refusal:?}");
+            let _ = std::io::stderr().write_all(refusal.message().as_bytes());
+            drop(log); // flush: `process::exit` runs no destructors
+            std::process::exit(255)
+        }
         Stance::PlainShell => {
             tracing::info!("the token is an administrator's with elevation removed; running the plain shell");
             let _ = writeln!(std::io::stderr(), "{}", text::FILTERED_SHIM_NOTICE);
@@ -125,7 +147,7 @@ pub fn run_on(exec: Option<RawExec>, detect: impl FnOnce() -> Encoding) -> anyho
         &crate::shell::WindowsHost,
         &login,
         &mut std::io::stderr(),
-        UnelevatedToken::for_privilege,
+        |asked| crate::account::step_down(asked, || level, UnelevatedToken::of_this_process),
         start_local,
         LocalChild::finish,
     );
@@ -198,13 +220,13 @@ enum Interactive {
     NoConsole,
 }
 
-/// The interactive relay ([`relay_interactive`]): the connection, a console a rescue left raw, and the
-/// login, whose command is that of a session that has a terminal.
+/// The interactive relay ([`relay_interactive`]): the connection, a console a rescue left raw, and the login,
+/// whose command, if any, is that of a session that has a terminal.
 type InteractiveRelay<'a> = dyn FnMut(Socket, Option<ConsoleModes>, &Login) -> anyhow::Result<Interactive> + 'a;
 
 /// [`try_relay_at`] with the interactive relay as a parameter, so that a test can stand in for the
 /// console. `interactive` gets the login, whose command is that of a session that has a terminal
-/// (`ssh -t host cmd`) and which it sends in the handshake with the privilege.
+/// (`ssh -t host cmd`) and which it sends in the handshake with what the login asked of elevation.
 fn try_relay_with(
     folder: &Folder,
     login: &Login,
@@ -216,7 +238,7 @@ fn try_relay_with(
 ) -> anyhow::Result<Option<i32>> {
     if let Some(exec) = login.exec.as_ref().filter(|exec| !exec.terminal) {
         return match connect_or_rescue(folder, true, stderr, log_failure, rescue)? {
-            Connected::Agent { socket, .. } => relay_exec(socket, &exec.command, login.privilege, stdin, stderr),
+            Connected::Agent { socket, .. } => relay_exec(socket, &exec.command, login.elevation, stdin, stderr),
             Connected::Done(code) => Ok(code),
         };
     }
@@ -327,13 +349,13 @@ fn connect_or_rescue(
 fn relay_exec(
     conn: Socket,
     cmd: &str,
-    privilege: Privilege,
+    elevation: Option<ElevationPolicy>,
     stdin: impl std::io::Read + Send + 'static,
     stderr: &mut dyn std::io::Write,
 ) -> anyhow::Result<Option<i32>> {
     let (rx, tx) = afunix::split(conn)?;
     // EXEC ignores cols/rows
-    let hs = make_handshake(&Some(cmd.to_owned()), false, Launch::Shell, term(), 80, 24, privilege);
+    let hs = make_handshake(&Some(cmd.to_owned()), false, Launch::Shell, term(), 80, 24, elevation);
     // Held until the session is over: the agent takes a close for a disconnect.
     let pumped = match start_exec_input(tx, &hs, stdin)? {
         Started::Ready(_keep_open) => pump_exec(rx, std::io::stdout(), std::io::stderr()),
@@ -348,9 +370,8 @@ fn relay_exec(
 
 /// Relay an interactive session over `conn`. A real console is required to capture input. No
 /// handshake has been sent yet, so a missing console fails open without orphaning an agent shell. A
-/// prompt that signed the user on hands over the raw console it was using. `login`'s command is the
-/// command of a session that has a terminal: the agent runs it in the pseudoconsole, as OpenSSH runs it
-/// under a pty.
+/// prompt that signed the user on hands over the raw console it was using. The login's command is that of a
+/// session that has a terminal: the agent runs it in the pseudoconsole, as OpenSSH runs it under a pty.
 fn relay_interactive(conn: Socket, rescued_modes: Option<ConsoleModes>, login: &Login) -> anyhow::Result<Interactive> {
     let (rx, tx) = afunix::split(conn)?;
     let modes = match rescued_modes {
@@ -364,7 +385,7 @@ fn relay_interactive(conn: Socket, rescued_modes: Option<ConsoleModes>, login: &
     }
     let (cols, rows) = console_size(modes.stdout);
     let command = login.exec.as_ref().map(|exec| exec.command.clone());
-    let hs = make_handshake(&command, true, Launch::Shell, term(), cols, rows, login.privilege);
+    let hs = make_handshake(&command, true, Launch::Shell, term(), cols, rows, login.elevation);
     Ok(Interactive::Pumped(run_pty(modes, rx, FrameReader::new(), tx, &hs)?))
 }
 

@@ -161,9 +161,9 @@ its own.
 RedirectionGuard refuses to follow a link that a non-administrator made, and a process follows a link it
 made itself, so a row that read through a link the probe made as an elevated process would pass whether or
 not the mitigation is on. For an agent at High integrity `verify` therefore runs two probes through it
-(`provision::probe_run`): first `verify-probe --make-junction <directory>` with `Privilege::Unelevated`, which
-makes that directory with a junction in it by a token below High, then `verify-probe --follow <directory>` as
-the account, which reads through it. `verify` names the directory of every junction itself, under its own temp directory with a
+(`provision::probe_run`): first `verify-probe --make-junction <directory>` asking the agent for the default elevation policy
+(`prompt`: an unelevated session), which makes that directory with a junction in it by a token below High, then
+`verify-probe --follow <directory>` asking for `always` (the account's own token), which reads through it. `verify` names the directory of every junction itself, under its own temp directory with a
 name unique to the run, before any probe runs, and removes it, through no link, whatever became of the
 probes: no probe reports a path, because a path a process below High wrote is not one an elevated `verify`
 acts on. The make-probe fails on a path that exists and never clears one. Each probe's outcome is a value

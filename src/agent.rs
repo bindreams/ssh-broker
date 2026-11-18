@@ -59,10 +59,12 @@ use crate::conpty::{self, PtySession};
 #[cfg(windows)]
 use crate::hangup::{HangupWatcher, Waker};
 #[cfg(windows)]
+use crate::offer::text;
+#[cfg(windows)]
 use crate::pipes::ExecChild;
 #[cfg(windows)]
 use crate::protocol::{
-    ExitCode, FrameKind, FrameReader, Handshake, Mode, Privilege, Resize, Stream, read_one_frame, write_frame,
+    ElevationPolicy, ExitCode, FrameKind, FrameReader, Handshake, Mode, Resize, Stream, read_one_frame, write_frame,
 };
 #[cfg(windows)]
 use crate::relay::{FrameSink, pump_until_peer_gone, write_data};
@@ -71,7 +73,7 @@ use crate::route::{AgentArgs, BackgroundArgs};
 #[cfg(windows)]
 use crate::shell::StartError;
 #[cfg(windows)]
-use crate::socket_loc::SocketLocation;
+use crate::socket_loc::{SocketLocation, StepDown};
 #[cfg(windows)]
 use crate::userdir::SocketDir;
 #[cfg(windows)]
@@ -628,7 +630,8 @@ fn handle_connection_with(conn: socket2::Socket, hooks: Hooks) -> anyhow::Result
 }
 
 /// What a session runs with: the hooks a test can replace, the agent's shared control, and the token its
-/// shell runs with in place of the agent's, if the login asked to be unelevated and the agent is elevated.
+/// shell runs with in place of the agent's, if the login did not ask for an elevated session and the agent is
+/// elevated.
 #[cfg(windows)]
 struct Env<'a> {
     hooks: Hooks,
@@ -657,11 +660,10 @@ type ExecStarter = fn(&str, Option<&Path>, Option<&UnelevatedToken>) -> Result<E
 #[cfg(windows)]
 type Splitter = fn(socket2::Socket) -> Result<(ConnRx, ConnTx), (afunix::Whole, anyhow::Error)>;
 
-/// How a session gets the token its shell runs with, given the login's privilege: `None` for an account's
-/// own login, and for one that asked to be unelevated when the agent is below High, where the session is
-/// unelevated anyway (see [`crate::account::step_down`]); a parameter so a test can force a failure.
+/// How a session gets what its shell runs with, given what the login asked of elevation: the stepped-down token,
+/// the agent's own, or a refusal (see [`crate::account::step_down`]); a parameter so a test can force a failure.
 #[cfg(windows)]
-type UnelevatedMaker = fn(Privilege) -> anyhow::Result<Option<UnelevatedToken>>;
+type UnelevatedMaker = fn(Option<ElevationPolicy>) -> anyhow::Result<StepDown<UnelevatedToken>>;
 
 /// What a test can replace or observe in a session; production uses [`Hooks::production`].
 #[cfg(windows)]
@@ -698,7 +700,7 @@ impl Hooks {
     fn production() -> Self {
         Self {
             make_watcher: HangupWatcher::new,
-            make_unelevated: UnelevatedToken::for_privilege,
+            make_unelevated: UnelevatedToken::for_policy,
             start_pty: PtySession::spawn,
             start_exec: ExecChild::spawn,
             shell_host: Box::new(crate::shell::WindowsHost),
@@ -763,7 +765,7 @@ fn handle_connection_in(conn: socket2::Socket, hooks: Hooks, control: &Control) 
     if control.is_ending() {
         return logout::refuse_while_ending(&mut rx, &mut tx, control);
     }
-    let launched = match launch::launch_line(&hs, &*hooks.shell_host) {
+    let mut launched = match launch::launch_line(&hs, &*hooks.shell_host) {
         Ok(launched) => launched,
         Err(launch::Refusal::BadRequest(cause)) => {
             return Err(logout::fail_connection(
@@ -787,16 +789,34 @@ fn handle_connection_in(conn: socket2::Socket, hooks: Hooks, control: &Control) 
         }
     };
     // Once, before anything is started, and given to every start of the session: the line, and the
-    // `console-fallback` verb, whose child inherits it. A session that asked for it and cannot have it is
-    // refused, not given the agent's own token.
-    let unelevated = match (hooks.make_unelevated)(hs.privilege) {
-        Ok(token) => token,
+    // `console-fallback` verb, whose child inherits it. What each answer of the rule means is on
+    // `crate::account::step_down`.
+    let unelevated = match (hooks.make_unelevated)(hs.elevation) {
+        Ok(StepDown::Token(token)) => Some(token),
+        Ok(StepDown::Own) => None,
+        Ok(StepDown::Fallback(cause)) => {
+            tracing::warn!(
+                "the agent could not prepare an unelevated session, so the session has its own token: {cause}"
+            );
+            launched.add_notice(hs.mode, &text::unelevated_fallback(&cause, text::FallbackToken::Agent));
+            None
+        }
+        Ok(StepDown::Refused) => {
+            return Err(logout::fail_connection(
+                &mut rx,
+                &mut tx,
+                control,
+                text::ALWAYS_BELOW_HIGH_WHAT,
+                anyhow::anyhow!(text::ALWAYS_BELOW_HIGH_CAUSE),
+                logout::FAILED_EXIT_CODE,
+            ));
+        }
         Err(cause) => {
             return Err(logout::fail_connection(
                 &mut rx,
                 &mut tx,
                 control,
-                "the agent could not prepare an unelevated session",
+                text::unelevated_unavailable_what(hs.elevation),
                 cause,
                 logout::FAILED_EXIT_CODE,
             ));

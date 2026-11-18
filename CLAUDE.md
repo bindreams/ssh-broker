@@ -14,8 +14,9 @@ speak framed messages over an ACL-gated AF_UNIX socket in that user's profile. `
 The point is lineage: a shell that is a child of the agent rather than of `sshd` inherits
 neither the session-0 network logon nor the RedirectionGuard mitigation. `verify` establishes
 the session id and DPAPI through an agent-spawned probe, and whether a junction that a token below
-High made is followed (RedirectionGuard refuses only those, so an agent at High is probed twice: an
-`Unelevated` probe makes the junction, the default one follows it). `verify` names the junction's
+High made is followed (RedirectionGuard refuses only those, so an agent at High is probed twice: a probe
+that asks for the default policy, an unelevated session, makes the junction, and one that asks for
+`always`, an elevated one, follows it). `verify` names the junction's
 directory and removes it; not tested means the volume holds no junctions. It also shows that an
 administrator's session is elevated and that an unelevated one can be had; `provision/probe_run` has
 the rest. The profile follows from the interactive logon and is not separately checked.

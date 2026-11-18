@@ -121,12 +121,16 @@ fn run_shim(password: &str, agent_exe: &Path, logon: Option<&str>) -> String {
         Ok(watch) => watch,
         Err(e) => return format!("watch the socket failed: {e:#}"),
     };
-    // As the real shim chooses, from its own token, unless the test names the logon.
+    // As the real shim chooses, from its own token, for a login that set nothing, unless the test names the logon.
     let kind = match logon {
         Some("batch") => LogonKind::Batch,
         Some("interactive") => LogonKind::Interactive,
         Some(other) => return format!("shim.logon names no logon: {other:?}"),
-        None => match stance(ssh_broker::account::elevation(), ssh_broker::account::integrity()) {
+        None => match stance(
+            None,
+            ssh_broker::account::elevation(),
+            &ssh_broker::account::integrity(),
+        ) {
             Stance::Relay { logon } => logon,
             other => return format!("no session is offered to this token: {other:?}"),
         },

@@ -7,7 +7,7 @@ use windows::Win32::Security::{
 };
 use windows::core::PCWSTR;
 
-use crate::protocol::Privilege;
+use crate::protocol::ElevationPolicy;
 use crate::test_support::{own_token_at, own_token_copy};
 use crate::winutil::OwnedHandle;
 
@@ -252,56 +252,119 @@ fn the_token_of_a_process_handle_is_that_process_s_token() {
 
 // the token an unelevated session runs with -----
 
+/// The table of the one rule for a login that asked for a level, each cell: what it gives and how many
+/// tokens were made.
 #[test]
-fn an_unelevated_login_at_high_gets_the_token() {
-    use crate::socket_loc::Integrity;
-    let made = step_down(Privilege::Unelevated, || Ok(Integrity::High), || Ok("token"));
-    assert_eq!(made.unwrap(), Some("token"));
+fn step_down_gives_the_table() {
+    use crate::socket_loc::Integrity::{High, Medium};
+    use std::cell::Cell;
+    let cells = [
+        (ElevationPolicy::Never, High, StepDown::Token("token"), 1),
+        (ElevationPolicy::Prompt, High, StepDown::Token("token"), 1),
+        (ElevationPolicy::AutoApprove, High, StepDown::Token("token"), 1),
+        (ElevationPolicy::Always, High, StepDown::Own, 0),
+        (ElevationPolicy::Never, Medium, StepDown::Own, 0),
+        (ElevationPolicy::Prompt, Medium, StepDown::Own, 0),
+        (ElevationPolicy::AutoApprove, Medium, StepDown::Own, 0),
+        (ElevationPolicy::Always, Medium, StepDown::Refused, 0),
+    ];
+    for (policy, level, gives, made_times) in cells {
+        let made = Cell::new(0);
+        let given = step_down(
+            Some(policy),
+            || Ok(level),
+            || {
+                made.set(made.get() + 1);
+                Ok("token")
+            },
+        )
+        .unwrap();
+        assert_eq!(given, gives, "{policy:?} at {level:?}");
+        assert_eq!(made.get(), made_times, "{policy:?} at {level:?}: tokens made");
+    }
 }
 
+/// A login that set nothing is stepped down like one that asked for the default, and gets the token when it
+/// can be had.
 #[test]
-fn an_unelevated_login_below_high_gets_none_and_the_token_is_not_tried() {
-    use crate::socket_loc::Integrity;
-    let made = step_down(
-        Privilege::Unelevated,
-        || Ok(Integrity::Medium),
+fn step_down_for_a_login_that_set_nothing_gives_the_token_at_high_and_own_at_medium() {
+    use crate::socket_loc::Integrity::{High, Medium};
+    let at_high = step_down(None, || Ok(High), || Ok("token")).unwrap();
+    assert_eq!(at_high, StepDown::Token("token"));
+    let at_medium = step_down(
+        None,
+        || Ok(Medium),
         || -> anyhow::Result<&str> { panic!("a token was made below High") },
-    );
-    assert_eq!(made.unwrap(), None);
-}
-
-#[test]
-fn a_token_that_cannot_be_made_at_high_is_an_error() {
-    use crate::socket_loc::Integrity;
-    let err = step_down(
-        Privilege::Unelevated,
-        || Ok(Integrity::High),
-        || -> anyhow::Result<&str> { anyhow::bail!("no token") },
     )
-    .unwrap_err();
-    assert!(format!("{err:#}").contains("no token"), "{err:#}");
+    .unwrap();
+    assert_eq!(at_medium, StepDown::Own);
 }
 
-/// A level that cannot be read is not Medium: the login asked for an unelevated session, and a guess
-/// would hand an elevated process the shell.
+/// A level that cannot be read is not Medium, and `always` is not guessed at: a login that asked for a level
+/// is refused.
 #[test]
-fn an_unreadable_level_is_an_error_and_makes_nothing() {
-    let err = step_down(
-        Privilege::Unelevated,
+fn step_down_unreadable_integrity_is_an_error_for_a_login_that_asked_and_make_is_not_called() {
+    for policy in [
+        ElevationPolicy::Never,
+        ElevationPolicy::Prompt,
+        ElevationPolicy::AutoApprove,
+        ElevationPolicy::Always,
+    ] {
+        let err = step_down(
+            Some(policy),
+            || anyhow::bail!("the level cannot be read"),
+            || -> anyhow::Result<&str> { panic!("a token was made without the level") },
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("the level cannot be read"),
+            "{policy:?}: {err:#}"
+        );
+    }
+}
+
+/// A login that set nothing asked for nothing: when the level cannot be read it keeps this process's own
+/// token, and the cause is kept for the notice.
+#[test]
+fn step_down_unreadable_integrity_is_a_fallback_for_a_login_that_set_nothing() {
+    let given = step_down(
+        None,
         || anyhow::bail!("the level cannot be read"),
         || -> anyhow::Result<&str> { panic!("a token was made without the level") },
     )
-    .unwrap_err();
-    assert!(format!("{err:#}").contains("the level cannot be read"), "{err:#}");
+    .unwrap();
+    assert_eq!(
+        given,
+        StepDown::Fallback("read this process's integrity level: the level cannot be read".to_owned())
+    );
 }
 
-/// An account login is not stepped down at any level: neither the level nor the maker is consulted.
 #[test]
-fn an_account_login_gets_none_and_asks_for_nothing() {
-    let made = step_down(
-        Privilege::Account,
-        || -> anyhow::Result<crate::socket_loc::Integrity> { panic!("the level was read for an account login") },
-        || -> anyhow::Result<&str> { panic!("a token was made for an account login") },
-    );
-    assert_eq!(made.unwrap(), None);
+fn step_down_make_failure_is_an_error_for_a_login_that_asked() {
+    use crate::socket_loc::Integrity;
+    for policy in [
+        ElevationPolicy::Never,
+        ElevationPolicy::Prompt,
+        ElevationPolicy::AutoApprove,
+    ] {
+        let err = step_down(
+            Some(policy),
+            || Ok(Integrity::High),
+            || -> anyhow::Result<&str> { anyhow::bail!("no token") },
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("no token"), "{policy:?}: {err:#}");
+    }
+}
+
+#[test]
+fn step_down_make_failure_is_a_fallback_for_a_login_that_set_nothing() {
+    use crate::socket_loc::Integrity;
+    let given = step_down(
+        None,
+        || Ok(Integrity::High),
+        || -> anyhow::Result<&str> { anyhow::bail!("no token") },
+    )
+    .unwrap();
+    assert_eq!(given, StepDown::Fallback("no token".to_owned()));
 }

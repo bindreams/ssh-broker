@@ -258,7 +258,7 @@ fn an_administrators_unelevated_logout_with_no_agent_in_its_folder_is_told_why_i
     assert_eq!(err.trim_end().lines().count(), 1, "{err}");
     assert!(err.contains("administrator"), "{err}");
     assert!(err.contains("elevated"), "{err}");
-    assert!(err.contains("ordinary SSH login"), "{err}");
+    assert!(err.contains("SSH_BROKER_ELEVATION=always"), "{err}");
 }
 
 #[test]

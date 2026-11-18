@@ -10,9 +10,10 @@ use std::path::{Path, PathBuf};
 
 use super::*;
 use crate::account::{INTEGRITY_HIGH, INTEGRITY_MEDIUM};
+use crate::protocol::ElevationPolicy;
 use crate::provision::probe::{ProbeResult, SymlinkState, UpstreamState};
 use crate::provision::session_rows::parity_rows;
-use crate::socket_loc::Elevation;
+use crate::socket_loc::{Elevation, StepDown};
 use crate::test_support::Scratch;
 
 fn answer(elevation: Elevation, integrity: u32, symlink: Option<SymlinkState>, said: &str) -> ProbeOutcome {
@@ -34,11 +35,12 @@ fn answer(elevation: Elevation, integrity: u32, symlink: Option<SymlinkState>, s
 
 /// What each probe of a run is asked, in order, and how the stand-in answers each: a probe that is told to
 /// make a directory makes it (as the real one does, with a junction in it that leads to a folder outside
-/// it); the one that asks for an unelevated session then answers with `made`, any other with `followed`.
+/// it); the answer is `made` for a probe that `account::step_down` gives a token and `followed` for one that
+/// it gives the agent's own.
 struct Probing {
     made: fn() -> ProbeOutcome,
     followed: fn() -> ProbeOutcome,
-    asked: RefCell<Vec<(Privilege, ProbeLink)>>,
+    asked: RefCell<Vec<(ElevationPolicy, ProbeLink)>>,
     /// The folder the junctions lead to, with a file in it that nothing may touch.
     outside: Scratch,
     /// Whether the maker keeps a file of what it made open, which stops the directory from being removed.
@@ -66,14 +68,15 @@ impl Probing {
     }
 
     fn run(&self, integrity: Integrity, temp: &Path) -> Probes {
-        run_at(integrity, temp, &|privilege, link| {
-            self.asked.borrow_mut().push((privilege, link.clone()));
+        run_at(integrity, temp, &|elevation, link| {
+            self.asked.borrow_mut().push((elevation, link.clone()));
             if let ProbeLink::Make(dir) = &link {
                 self.make(Path::new(dir));
             }
-            match privilege {
-                Privilege::Unelevated => (self.made)(),
-                _ => (self.followed)(),
+            match crate::account::step_down(Some(elevation), || Ok(integrity), || Ok(())) {
+                Ok(StepDown::Token(())) => (self.made)(),
+                Ok(StepDown::Own) => (self.followed)(),
+                other => panic!("a probe asking for {elevation:?} at {integrity:?} gets {other:?}"),
             }
         })
     }
@@ -172,10 +175,6 @@ fn an_agent_at_high_gets_two_probes_with_one_directory_which_is_removed() {
     };
     assert_eq!(made, followed);
     assert_eq!(Path::new(made).parent(), Some(scratch.0.as_path()));
-    assert_eq!(
-        probing.asked.borrow().iter().map(|(p, _)| *p).collect::<Vec<_>>(),
-        [Privilege::Unelevated, Privilege::Account]
-    );
     assert!(scratch.is_empty(), "the directory and what is in it are removed");
     probing.assert_outside_intact();
     assert_eq!(probes.leftover, None);
@@ -183,6 +182,34 @@ fn an_agent_at_high_gets_two_probes_with_one_directory_which_is_removed() {
     let (state, note) = read(&probes).expect("a junction from below High was read");
     assert_eq!(state, Some(SymlinkState::Blocked));
     assert!(note.contains("made it") && note.contains("refused"), "{note}");
+}
+
+/// The junction is made by the default (unelevated) probe and followed by the `always` probe, in that order.
+#[test]
+fn an_agent_at_high_is_probed_with_prompt_then_always() {
+    let scratch = Scratch::new();
+    let probing = Probing::new(unelevated_ok, elevated_ok);
+
+    probing.run(Integrity::High, &scratch.0);
+
+    assert_eq!(
+        probing.asked.borrow().iter().map(|(p, _)| *p).collect::<Vec<_>>(),
+        [ElevationPolicy::Prompt, ElevationPolicy::Always]
+    );
+}
+
+/// An agent below High gives its own token to every policy but refuses `always`: it is asked the default.
+#[test]
+fn an_agent_below_high_is_probed_once_with_prompt() {
+    let scratch = Scratch::new();
+    let probing = Probing::new(unelevated_ok, elevated_ok);
+
+    probing.run(Integrity::Medium, &scratch.0);
+
+    assert_eq!(
+        probing.asked.borrow().iter().map(|(p, _)| *p).collect::<Vec<_>>(),
+        [ElevationPolicy::Prompt]
+    );
 }
 
 /// A probe that failed may still create the directory, so `verify` says so; the default probe runs on.

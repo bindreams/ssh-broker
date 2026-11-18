@@ -67,7 +67,7 @@ fn handshake_roundtrips() {
         command: None,
         env: vec![("LANG".into(), "C".into())],
         launch: Launch::Shell,
-        privilege: Privilege::Unelevated,
+        elevation: Some(ElevationPolicy::AutoApprove),
     };
     let bytes = h.encode().unwrap();
     assert_eq!(Handshake::decode(&bytes).unwrap(), h);
@@ -299,40 +299,121 @@ fn a_version_1_handshake_is_refused_with_the_version_message() {
     );
 }
 
+/// The version is 4: the elevation field's wire layout differs from version 3.
 #[test]
-fn the_wire_version_is_3() {
-    assert_eq!(PROTOCOL_VERSION, 3);
-    assert_eq!(Handshake::pty_default().version, 3);
+fn the_wire_version_is_4() {
+    assert_eq!(PROTOCOL_VERSION, 4);
+    assert_eq!(Handshake::pty_default().version, 4);
 }
 
 #[test]
-fn privilege_round_trips_and_defaults_to_the_account() {
-    for privilege in [Privilege::Account, Privilege::Unelevated] {
+fn handshake_round_trips_each_policy() {
+    for elevation in crate::test_support::asked_policies() {
         let h = Handshake {
-            privilege,
+            elevation,
             command: Some("x".into()),
             ..Handshake::pty_default()
         };
-        assert_eq!(Handshake::decode(&h.encode().unwrap()).unwrap().privilege, privilege);
+        assert_eq!(Handshake::decode(&h.encode().unwrap()).unwrap().elevation, elevation);
     }
-    assert_eq!(Handshake::pty_default().privilege, Privilege::Account);
+    assert_eq!(Handshake::pty_default().elevation, Some(ElevationPolicy::DEFAULT));
 }
 
-/// The new field is the last on the wire: the handshake of version 3 is the version 2 bytes with the
-/// version and one more byte (the variant index).
+/// The field is the last on the wire: it ends with whether the login asked (`1`) or set nothing (`0`),
+/// and the variant index of what it asked.
 #[test]
-fn privilege_is_the_last_field() {
-    let h = Handshake {
-        privilege: Privilege::Unelevated,
+fn the_policy_is_the_last_field() {
+    let always = Handshake {
+        elevation: Some(ElevationPolicy::Always),
         ..Handshake::pty_default()
     };
-    let bytes = h.encode().unwrap();
-    assert_eq!(bytes.last(), Some(&1));
-    let account = Handshake::pty_default().encode().unwrap();
-    assert_eq!(account.last(), Some(&0));
+    assert_eq!(always.encode().unwrap().last_chunk(), Some(&[1, 3]));
+    assert_eq!(
+        Handshake::pty_default().encode().unwrap().last_chunk(),
+        Some(&[1, ElevationPolicy::DEFAULT as u8])
+    );
+    let nothing = Handshake {
+        elevation: None,
+        ..Handshake::pty_default()
+    };
+    assert_eq!(nothing.encode().unwrap().last(), Some(&0));
 }
 
-/// A shim or agent of version 2 is refused by name: its handshake has no `privilege`.
+/// The default is the one level a login that asked for none is given where a level is needed.
+#[test]
+fn the_default_is_prompt() {
+    assert_eq!(ElevationPolicy::DEFAULT, ElevationPolicy::Prompt);
+}
+
+#[test]
+fn elevation_policy_parses_the_four_words_exactly() {
+    for (word, policy) in [
+        ("never", ElevationPolicy::Never),
+        ("prompt", ElevationPolicy::Prompt),
+        ("auto-approve", ElevationPolicy::AutoApprove),
+        ("always", ElevationPolicy::Always),
+    ] {
+        assert_eq!(ElevationPolicy::parse(std::ffi::OsStr::new(word)), Ok(policy), "{word}");
+    }
+    assert_eq!(ElevationPolicy::VARIABLE, "SSH_BROKER_ELEVATION");
+}
+
+#[test]
+fn elevation_policy_rejects_other_case_padding_empty_and_unknown_naming_the_value() {
+    for value in [
+        "Always",
+        " always",
+        "always ",
+        "",
+        "sometimes",
+        "auto_approve",
+        "ALWAYS\n",
+    ] {
+        let error = ElevationPolicy::parse(std::ffi::OsStr::new(value)).unwrap_err();
+        assert_eq!(error.value, value);
+        assert!(error.to_string().contains(&format!("{value:?}")), "{error}");
+    }
+}
+
+/// A value that is not Unicode is refused too, and named by its lossy text.
+#[cfg(windows)]
+#[test]
+fn elevation_policy_rejects_a_value_that_is_not_unicode() {
+    use std::os::windows::ffi::OsStringExt;
+    let value = std::ffi::OsString::from_wide(&[0x61, 0xd800, 0x62]);
+    let error = ElevationPolicy::parse(&value).unwrap_err();
+    assert_eq!(error.value, "a\u{fffd}b");
+}
+
+#[cfg(unix)]
+#[test]
+fn elevation_policy_rejects_a_value_that_is_not_unicode() {
+    use std::os::unix::ffi::OsStrExt;
+    let value = std::ffi::OsStr::from_bytes(&[0x61, 0xff, 0x62]);
+    let error = ElevationPolicy::parse(value).unwrap_err();
+    assert_eq!(error.value, "a\u{fffd}b");
+}
+
+/// The version is read alone, before the policy: a peer of a later version, whose handshake has fields
+/// this build does not know, is refused by its version and not by a decoding failure.
+#[test]
+fn a_peer_of_another_version_is_still_refused_by_name() {
+    let mut bytes = Handshake {
+        version: PROTOCOL_VERSION + 1,
+        ..Handshake::pty_default()
+    }
+    .encode()
+    .unwrap();
+    bytes.extend_from_slice(&[9, 9, 9]);
+    let error = Handshake::decode(&bytes).unwrap_err().to_string();
+    assert!(
+        error.contains(&format!("peer {}", PROTOCOL_VERSION + 1))
+            && error.contains(&format!("ours {PROTOCOL_VERSION}")),
+        "{error}"
+    );
+}
+
+/// A peer of another version is refused by its number.
 #[test]
 fn a_version_2_handshake_is_refused_with_the_version_message() {
     #[derive(serde::Serialize)]
@@ -360,5 +441,38 @@ fn a_version_2_handshake_is_refused_with_the_version_message() {
     })
     .unwrap();
     let error = Handshake::decode(&bytes).unwrap_err().to_string();
-    assert!(error.contains("peer 2") && error.contains("ours 3"), "{error}");
+    assert!(error.contains("peer 2") && error.contains("ours 4"), "{error}");
+}
+
+/// A peer of another version is refused by its number.
+#[test]
+fn a_version_3_handshake_is_refused_with_the_version_message() {
+    #[derive(serde::Serialize)]
+    struct V3 {
+        version: u16,
+        mode: Mode,
+        cols: u16,
+        rows: u16,
+        term: String,
+        cwd: String,
+        command: Option<String>,
+        env: Vec<(String, String)>,
+        launch: Launch,
+        elevation: ElevationPolicy,
+    }
+    let bytes = postcard::to_stdvec(&V3 {
+        version: 3,
+        mode: Mode::Exec,
+        cols: 80,
+        rows: 24,
+        term: "xterm".into(),
+        cwd: String::new(),
+        command: Some("whoami".into()),
+        env: Vec::new(),
+        launch: Launch::Shell,
+        elevation: ElevationPolicy::Never,
+    })
+    .unwrap();
+    let error = Handshake::decode(&bytes).unwrap_err().to_string();
+    assert!(error.contains("peer 3") && error.contains("ours 4"), "{error}");
 }

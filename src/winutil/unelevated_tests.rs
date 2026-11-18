@@ -5,7 +5,8 @@
 use super::*;
 use crate::account::{Elevation, INTEGRITY_LOW, INTEGRITY_MEDIUM, elevation, elevation_of, integrity_of};
 use crate::acl::{Sid, WellKnown};
-use crate::protocol::Privilege;
+use crate::protocol::ElevationPolicy;
+use crate::socket_loc::StepDown;
 use crate::test_support::{drain, own_token_copy, text_of};
 use crate::winutil::{ChildConsole, own_token, spawn_suspended, token_information};
 use windows::Win32::Foundation::{HLOCAL, LocalFree};
@@ -170,15 +171,33 @@ fn the_default_dacl_of_the_token_gives_the_user_system_and_the_logon_session_the
     assert_eq!(aces, expected);
 }
 
-/// The production maker of the step-down: an account login gets none, and an unelevated one gets a token
-/// exactly when this process is at High.
+/// The production maker of the step-down follows the table of [`crate::account::step_down`] for this process's
+/// own level: a token for the three policies that start unelevated, exactly when this process is at High; for
+/// `always`, the process's own token at High and a refusal below it.
 #[test]
-fn the_production_step_down_gives_a_token_exactly_to_an_unelevated_login_at_high() {
+fn the_production_step_down_follows_the_table_at_this_process_s_level() {
     let at_high = crate::account::integrity().unwrap() == crate::socket_loc::Integrity::High;
-    assert!(UnelevatedToken::for_privilege(Privilege::Account).unwrap().is_none());
-    assert_eq!(
-        UnelevatedToken::for_privilege(Privilege::Unelevated).unwrap().is_some(),
-        at_high
+    for policy in [
+        ElevationPolicy::Never,
+        ElevationPolicy::Prompt,
+        ElevationPolicy::AutoApprove,
+    ] {
+        let given = UnelevatedToken::for_policy(Some(policy)).unwrap();
+        assert!(
+            matches!((at_high, &given), (true, StepDown::Token(_)) | (false, StepDown::Own)),
+            "{policy:?}"
+        );
+    }
+    // A login that set nothing is stepped down the same way when the token can be made, as it can here.
+    let nothing = UnelevatedToken::for_policy(None).unwrap();
+    assert!(
+        matches!((at_high, &nothing), (true, StepDown::Token(_)) | (false, StepDown::Own)),
+        "nothing"
+    );
+    let always = UnelevatedToken::for_policy(Some(ElevationPolicy::Always)).unwrap();
+    assert!(
+        matches!((at_high, &always), (true, StepDown::Own) | (false, StepDown::Refused)),
+        "always"
     );
 }
 

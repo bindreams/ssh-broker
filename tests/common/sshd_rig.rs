@@ -128,6 +128,50 @@ fn administrators_authorized_keys() -> PathBuf {
         .join("administrators_authorized_keys")
 }
 
+/// Make the runner's sshd accept `SSH_BROKER_ELEVATION` from a client: put `AcceptEnv SSH_BROKER_ELEVATION` above
+/// the first `Match` of `%ProgramData%\ssh\sshd_config` (after one, a line applies to that block's accounts only)
+/// and restart the `sshd` service. Once per test process, and not at all when the line is there. Machine-wide:
+/// CI only, where the runner is discarded after the job. A test that reaches it (every [`Login`] constructor
+/// does) changes what the other tests depend on, so it holds `machine::exclusive()`. `apply` makes this
+/// arrangement itself in a later change, which replaces this function's body.
+pub fn accept_elevation_variable() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        const LINE: &str = "AcceptEnv SSH_BROKER_ELEVATION";
+        let config = Path::new(&std::env::var("ProgramData").expect("ProgramData is set"))
+            .join("ssh")
+            .join("sshd_config");
+        let text = std::fs::read_to_string(&config).unwrap_or_else(|e| panic!("read {}: {e}", config.display()));
+        if text.lines().any(|line| line.trim() == LINE) {
+            return;
+        }
+        let eol = if text.contains("\r\n") { "\r\n" } else { "\n" };
+        let mut at = text.len();
+        let mut offset = 0;
+        for line in text.split_inclusive('\n') {
+            if line.trim_start().to_ascii_lowercase().starts_with("match ") {
+                at = offset;
+                break;
+            }
+            offset += line.len();
+        }
+        let mut changed = String::with_capacity(text.len() + LINE.len() + 2);
+        changed.push_str(&text[..at]);
+        if at == text.len() && !text.is_empty() && !text.ends_with('\n') {
+            changed.push_str(eol);
+        }
+        changed.push_str(LINE);
+        changed.push_str(eol);
+        changed.push_str(&text[at..]);
+        std::fs::write(&config, changed).unwrap_or_else(|e| panic!("write {}: {e}", config.display()));
+        // `net stop` returns once the service has stopped, and `net start` once it runs.
+        let (ok, said) = run("net", &["stop", "sshd"]);
+        assert!(ok, "stop the sshd service: {said}");
+        let (ok, said) = run("net", &["start", "sshd"]);
+        assert!(ok, "start the sshd service: {said}");
+    });
+}
+
 /// A number no other login of this test process has: what keeps the files of two logins of one account apart.
 fn next_login_number() -> u32 {
     static LOGINS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -135,9 +179,8 @@ fn next_login_number() -> u32 {
 }
 
 /// A key pair for `account`, the public half installed where sshd reads it: the account's profile, or for an
-/// administrator ([`Account::make_administrator`] first) the administrators' file, appended to. With
-/// `forced_command` the key carries `command="..."`, as a key that forces a command does.
-pub fn install_key(account: &Account, forced_command: Option<&str>) -> Keys {
+/// administrator ([`Account::make_administrator`] first) the administrators' file, appended to.
+pub fn install_key(account: &Account) -> Keys {
     let n = next_login_number();
     let dir = TempDir(std::env::temp_dir().join(format!("sb-sshkey-{}-{}-{n}", account.name, std::process::id())));
     let _ = std::fs::remove_dir_all(&dir.0);
@@ -151,10 +194,7 @@ pub fn install_key(account: &Account, forced_command: Option<&str>) -> Keys {
     // The ssh client refuses a private key other accounts can read.
     icacls(&dir.0, "S-1-5-18");
     let public = std::fs::read_to_string(dir.0.join("id.pub")).unwrap();
-    let line = match forced_command {
-        Some(command) => format!("command=\"{command}\" {}\n", public.trim_end()),
-        None => format!("{}\n", public.trim_end()),
-    };
+    let line = format!("{}\n", public.trim_end());
     // Each login of an account adds its own key: a second login of the same account keeps the first one's.
     let (authorized_keys, readers) = if account.is_administrator() {
         // Only SYSTEM and Administrators: the account's own entry would make sshd refuse the file.
@@ -368,20 +408,11 @@ pub struct Login<'a> {
 
 impl<'a> Login<'a> {
     pub fn new(kit: &Kit, account: &'a Account) -> Login<'a> {
-        Login::with_key(kit, account, None)
-    }
-
-    /// A login whose key forces `command` (`command="..."` in `authorized_keys`): sshd runs it whatever the
-    /// client asked for, and gives the client's own command in `SSH_ORIGINAL_COMMAND`.
-    pub fn forcing(kit: &Kit, account: &'a Account, command: &str) -> Login<'a> {
-        Login::with_key(kit, account, Some(command))
-    }
-
-    fn with_key(kit: &Kit, account: &'a Account, forced_command: Option<&str>) -> Login<'a> {
+        accept_elevation_variable();
         admit(account);
         Login {
             account,
-            keys: install_key(account, forced_command),
+            keys: install_key(account),
             stderr_path: kit.path(&format!("ssh-stderr-{}-{}.txt", account.name, next_login_number())),
         }
     }
@@ -392,6 +423,26 @@ impl<'a> Login<'a> {
             self.account,
             std::fs::File::create(&self.stderr_path).unwrap(),
         )
+    }
+
+    /// [`Login::command`] with the client's `SetEnv` of `SSH_BROKER_ELEVATION` set to `value` as it stands: the
+    /// way a login asks for a level. The option follows the destination, where `ssh` reads options again until the
+    /// remote command starts, as the callers add `-tt` and `--` after it.
+    pub fn command_asking(&self, value: &str) -> Command {
+        let mut command = self.command();
+        command.arg("-o").arg(format!(
+            "SetEnv={}={value}",
+            ssh_broker::protocol::ElevationPolicy::VARIABLE
+        ));
+        command
+    }
+
+    /// [`Login::command_asking`] with `value`, or [`Login::command`] with none.
+    pub fn command_with(&self, asking: Option<&str>) -> Command {
+        match asking {
+            Some(value) => self.command_asking(value),
+            None => self.command(),
+        }
     }
 
     pub fn diagnostics(&self) -> impl Fn() -> String + 'static {

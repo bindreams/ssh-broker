@@ -317,7 +317,7 @@ fn the_row_for_an_unelevated_administrator_says_why_nothing_can_be_checked_here(
     assert_eq!(row.name, "socket reachable");
     assert!(row.detail.contains("administrator"), "{}", row.detail);
     assert!(row.detail.contains("elevated prompt"), "{}", row.detail);
-    assert!(row.detail.contains("ordinary SSH login"), "{}", row.detail);
+    assert!(row.detail.contains("SSH_BROKER_ELEVATION=always"), "{}", row.detail);
     assert!(
         !row.detail.contains("to see why, run"),
         "no hint to run the agent: {}",

@@ -15,9 +15,9 @@ use windows::core::PWSTR;
 
 use crate::acl::Sid;
 pub use crate::offer::AccountKind;
-use crate::protocol::Privilege;
-pub use crate::socket_loc::Elevation;
+use crate::protocol::ElevationPolicy;
 use crate::socket_loc::Integrity;
+pub use crate::socket_loc::{Elevation, StepDown};
 use crate::winutil::{SE_GROUP_ENABLED, SE_GROUP_USE_FOR_DENY_ONLY, find_group, own_token, token_information};
 
 /// An account of this PC, as ssh-broker names it in prompts, logon calls and tasks.
@@ -167,24 +167,40 @@ pub fn integrity() -> anyhow::Result<Integrity> {
     Ok(integrity_class(integrity_of(own_token()?.0)?))
 }
 
-/// The token a session of a login with `privilege` runs with in place of this process's own: the one rule
-/// that says when the agent, and the shim failing open, step a session down. An [`Privilege::Account`] login
-/// gets `None` and neither `integrity` nor `make` is consulted. An [`Privilege::Unelevated`] one gets the token
-/// when this process is at High, and `None` below it, where what a process starts is unelevated anyway. A level
-/// that cannot be read, or a token that cannot be made, is an error: the session asked not to be elevated, and a
-/// guess would run it as it is. The level and the maker are parameters so that a test can make either fail.
+/// What a session of a login that `asked` for a level is started with in this process: the one rule. `None` is a
+/// login that set nothing.
+///
+/// | asked | at High | below High |
+/// |---|---|---|
+/// | `Never`, `Prompt`, `AutoApprove` | [`StepDown::Token`] | [`StepDown::Own`] |
+/// | `Always` | [`StepDown::Own`] | [`StepDown::Refused`] |
+/// | nothing | [`StepDown::Token`] | [`StepDown::Own`] |
+///
+/// A login that asked for a level is refused when it cannot be given: a level that cannot be read, or a token
+/// that cannot be made, is an error, since a guess would run the session as it is. A login that asked for
+/// nothing gets [`StepDown::Fallback`] in the same two cases: this process's own token, and the cause for the
+/// notice. `integrity` is read once, and `make` only for a [`StepDown::Token`]; both are parameters so that a
+/// test can make either fail.
 pub fn step_down<K>(
-    privilege: Privilege,
+    asked: Option<ElevationPolicy>,
     integrity: impl FnOnce() -> anyhow::Result<Integrity>,
     make: impl FnOnce() -> anyhow::Result<K>,
-) -> anyhow::Result<Option<K>> {
-    match privilege {
-        Privilege::Account => Ok(None),
-        Privilege::Unelevated => match integrity().context("read this process's integrity level")? {
-            Integrity::High => make().map(Some),
-            Integrity::Medium => Ok(None),
+) -> anyhow::Result<StepDown<K>> {
+    let level = match integrity().context("read this process's integrity level") {
+        Ok(level) => level,
+        Err(cause) if asked.is_none() => return Ok(StepDown::Fallback(format!("{cause:#}"))),
+        Err(cause) => return Err(cause),
+    };
+    Ok(match (asked, level) {
+        (Some(ElevationPolicy::Always), Integrity::High) => StepDown::Own,
+        (Some(ElevationPolicy::Always), Integrity::Medium) => StepDown::Refused,
+        (_, Integrity::Medium) => StepDown::Own,
+        (Some(_), Integrity::High) => StepDown::Token(make()?),
+        (None, Integrity::High) => match make() {
+            Ok(token) => StepDown::Token(token),
+            Err(cause) => StepDown::Fallback(format!("{cause:#}")),
         },
-    }
+    })
 }
 
 #[cfg(test)]
