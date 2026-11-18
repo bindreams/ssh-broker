@@ -633,15 +633,3 @@ fn a_sink_without_on_serving_accepts_the_answer_and_goes_on() {
     assert_eq!(outcome, Outcome::PeerClosed);
     assert_eq!(plain.0, b"after");
 }
-
-/// The agent's own pump reads a client's frames: a hand-back from a client is a protocol error to it, and it
-/// stops reading as it does for any peer that broke the protocol.
-#[test]
-fn pump_until_peer_gone_stops_at_a_hand_back_from_its_peer() {
-    let mut wire = Vec::new();
-    write_hand_back(&mut wire, "not from a client").unwrap();
-    write_data(&mut wire, Stream::Stdin, b"never delivered").unwrap();
-    let mut sink = TestSink::default();
-    pump_until_peer_gone(&mut wire.as_slice(), &mut FrameReader::new(), &mut sink);
-    assert!(sink.stdout.is_empty());
-}

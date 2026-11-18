@@ -849,15 +849,15 @@ fn show_notice(tx: &mut ConnTx, mode: Mode, text: &str) {
 
 /// The answer `Serving` (see [`FrameKind`]): the session's process has started. Written by the handler of each
 /// mode, once, right after the start and before any of the session's output, so that it is the first frame
-/// of a session that was served. `false` when the client is gone: nothing is left to serve, and the caller
-/// ends the session it started.
+/// of a session that was served. A failed write is logged and the session goes on: a client that has gone is
+/// found by the relay, which owns that case.
 #[cfg(windows)]
-fn answer_serving(tx: &mut ConnTx) -> bool {
-    match write_serving(tx) {
-        Ok(()) => true,
-        Err(e) => {
-            tracing::debug!("the client is gone before the answer; its session is ended: {e:#}");
-            false
+fn answer_serving(tx: &mut ConnTx) {
+    if let Err(e) = write_serving(tx) {
+        if crate::shim::peer_gone(&e).is_some() {
+            tracing::debug!("the client is gone; could not send the answer: {e:#}");
+        } else {
+            tracing::warn!("could not send the answer: {e:#}");
         }
     }
 }
@@ -1009,11 +1009,7 @@ fn handle_pty(
     let Some(_registration) = register_session(control, &job) else {
         return refuse_unserved_pty(session, &mut rx, &mut tx, control, &*hooks.observe);
     };
-    if !answer_serving(&mut tx) {
-        reap_tree(&job);
-        close_ended_pty(session, &*hooks.observe);
-        return Ok(());
-    }
+    answer_serving(&mut tx);
     show_notices(&mut tx, Mode::Pty, &notices);
     // Before `tx` moves into the shared mutex.
     let hangup = start_hangup_watch(&tx, &job, hooks.make_watcher);
@@ -1153,25 +1149,17 @@ fn send_exit(tx: &mut impl HalfClose, code: i32) {
     }
 }
 
-/// Answer a login whose shell has been ended before it was served with the refusal, after the session is
-/// closed ([`close_ended_pty`]).
+/// Answer a login whose shell has been ended before it was served with the refusal. The pseudoconsole
+/// is closed first, with its output read as the regular teardown reads it: the shell has been running
+/// since `spawn`, and closing flushes whatever it wrote into a pipe that nothing else reads.
 #[cfg(windows)]
 fn refuse_unserved_pty(
-    session: PtySession,
+    mut session: PtySession,
     rx: &mut ConnRx,
     tx: &mut ConnTx,
     control: &Control,
     observe: &(dyn Fn(Observed) + Send + Sync),
 ) -> anyhow::Result<()> {
-    close_ended_pty(session, observe);
-    logout::refuse_while_ending(rx, tx, control)
-}
-
-/// Close the session of a shell that has been ended and will not be served. The pseudoconsole is closed
-/// with its output read as the regular teardown reads it: the shell has been running since `spawn`, and
-/// closing flushes whatever it wrote into a pipe that nothing else reads.
-#[cfg(windows)]
-fn close_ended_pty(mut session: PtySession, observe: &(dyn Fn(Observed) + Send + Sync)) {
     let out_raw = session.out_read_raw();
     let hpc = session.take_hpc_raw();
     let mut buf = [0u8; 32 * 1024];
@@ -1190,6 +1178,7 @@ fn close_ended_pty(mut session: PtySession, observe: &(dyn Fn(Observed) + Send +
     }
     observe(Observed::RefusedConsoleClosed { bytes });
     drop(session); // the pipe ends go after the reader has finished with them
+    logout::refuse_while_ending(rx, tx, control)
 }
 
 /// Run `close`, which flushes into a pipe `read_chunk` reads (it returns 0 at the end), with a
@@ -1295,11 +1284,7 @@ fn handle_exec(
     let Some(_registration) = register_session(control, &job) else {
         return logout::refuse_while_ending(&mut rx, &mut tx, control);
     };
-    if !answer_serving(&mut tx) {
-        // Dropping `child` closes the pipes it holds; the tree is ended first, as a refused login's is.
-        reap_tree(&job);
-        return Ok(());
-    }
+    answer_serving(&mut tx);
     show_notices(&mut tx, Mode::Exec, &notices);
     // Before `tx` moves into the shared mutex.
     let hangup = start_hangup_watch(&tx, &job, hooks.make_watcher);

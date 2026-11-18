@@ -178,8 +178,9 @@ pub fn integrity() -> anyhow::Result<Integrity> {
 ///
 /// A login that asked for a level is refused when it cannot be given: a level that cannot be read, or a token
 /// that cannot be made, is an error, since a guess would run the session as it is. A login that asked for
-/// nothing gets [`StepDown::Fallback`] in the same two cases, with the cause. The agent hosts no such session
-/// and hands it back to the shim; the shim's fail-open shell runs it with sshd's token, after a notice.
+/// nothing gets [`StepDown::Fallback`] in the same two cases, with the cause. At the agent, which hosts no such
+/// session, it is handed back to the shim, which applies this rule itself; in the shim's fail-open shell it runs
+/// with sshd's token, after a notice.
 /// `integrity` is read once, and `make` only for a [`StepDown::Token`]; both are parameters so that a test can
 /// make either fail.
 pub fn step_down<K>(

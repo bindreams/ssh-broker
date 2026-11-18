@@ -710,9 +710,9 @@ fn agent_does_not_hand_back_a_login_that_set_a_level() {
 // The answer -----
 
 /// `Serving` means the session's process has started: a start that fails is answered with the ordinary failure
-/// reply as the first frame, and `Serving` was never sent. A working maker, `Own` and a `Token` alike.
+/// reply, and `Serving` was never sent. A working maker, `Own` and a `Token` alike.
 #[test]
-fn a_start_that_fails_is_answered_with_the_failure_reply_alone_and_never_with_serving() {
+fn a_start_that_fails_is_never_answered_with_serving() {
     fn own(_: Option<ElevationPolicy>) -> anyhow::Result<StepDown<UnelevatedToken>> {
         Ok(StepDown::Own)
     }
@@ -768,46 +768,54 @@ fn agent_answers_serving_first_and_then_the_output_of_a_session_that_starts() {
     assert!(answer.stdout.contains("served"), "{}", answer.stdout);
 }
 
-static START_RAN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-/// `Serving` is written after the start hook has run, not before: what the client sees `Serving` for has started.
+/// `Serving` is written after the session's process has started, not before. The hook that runs right after the
+/// start holds the agent there until the client has looked at its connection: a write that had completed is
+/// readable at once on this socket, so a client that finds nothing proves nothing was written yet. `Serving`
+/// is then the first thing the client reads.
 #[test]
-fn the_start_hook_has_run_before_serving_is_written() {
-    use std::sync::atomic::Ordering;
-    /// Whether the start hook had run when the client heard `Serving`.
-    struct Hears(Option<bool>);
-    impl FrameSink for Hears {
-        fn on_serving(&mut self) -> anyhow::Result<()> {
-            self.0 = Some(START_RAN.load(Ordering::SeqCst));
-            Ok(())
-        }
-        fn on_data(&mut self, _stream: Stream, _bytes: &[u8]) -> anyhow::Result<()> {
-            Ok(())
-        }
-    }
-    START_RAN.store(false, Ordering::SeqCst);
+fn nothing_is_written_to_the_client_until_the_session_has_started() {
+    use std::mem::MaybeUninit;
+    use std::sync::{Mutex, mpsc};
+    let (started, client_hears_of_it) = mpsc::channel::<()>();
+    let (client_has_looked, agent_waits_for_it) = mpsc::channel::<()>();
+    let agent_waits_for_it = Mutex::new(agent_waits_for_it);
     let hooks = Hooks {
         make_unelevated: |_| Ok(StepDown::Own),
-        start_exec: |line, cwd, token| {
-            START_RAN.store(true, Ordering::SeqCst);
-            ExecChild::spawn(line, cwd, token)
-        },
+        after_spawn: Box::new(move || {
+            started.send(()).unwrap();
+            // An error is the test having failed before it looked; the agent goes on and ends.
+            let _ = agent_waits_for_it.lock().unwrap().recv();
+        }),
         ..Hooks::production()
     };
     let (server, client, dir) = crate::test_support::raw_socket_pair("serving-after-start");
     let agent = std::thread::spawn(move || handle_connection_in(server, hooks, &Control::standalone()));
     let (mut rx, mut tx) = afunix::split(client).unwrap();
     handshake(Mode::Exec, "cmd.exe /c exit 0")(&mut tx);
-    let mut hears = Hears(None);
-    let outcome = pump_decode(&mut rx, &mut FrameReader::new(), &mut hears).expect("the reply was lost");
+    client_hears_of_it
+        .recv()
+        .expect("the agent ended before it started the session");
+
+    // The agent is held in the hook: the session has started, and nothing has been written to this connection.
+    let looking = tx.try_clone_socket().unwrap();
+    looking.set_nonblocking(true).unwrap();
+    let mut first_byte = [MaybeUninit::<u8>::uninit()];
+    let found = looking.peek(&mut first_byte);
+    looking.set_nonblocking(false).unwrap();
+    // The agent waits for the client to close, and a copy of the connection held open would keep it waiting.
+    drop(looking);
+    client_has_looked.send(()).unwrap();
+    assert!(
+        matches!(&found, Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
+        "something was written before the session had started: {found:?}"
+    );
+
+    let mut sink = TestSink::default();
+    let outcome = pump_decode(&mut rx, &mut FrameReader::new(), &mut sink).expect("the reply was lost");
     drop((rx, tx));
     agent.join().unwrap().unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 
+    assert_eq!(sink.served, 1);
     assert_eq!(outcome, Outcome::Exited(0));
-    assert_eq!(
-        hears.0,
-        Some(true),
-        "Serving was written before the session's process had started"
-    );
 }

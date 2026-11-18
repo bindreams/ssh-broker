@@ -756,6 +756,53 @@ fn agent_exec_tears_down_when_ssh_disconnects_first() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// A client that closes its end while its session is being started: the handler goes into the relay as for any
+/// session, finds the client gone there, ends the session's process and returns. `command` never ends by itself,
+/// so a handler that returns has ended it (a hang is the failure, as for the disconnects above).
+fn assert_a_client_gone_during_the_start_ends_the_session(tag: &str, mode: Mode, command: &str) {
+    use std::sync::{Mutex, mpsc};
+    let (started, client_hears_of_it) = mpsc::channel::<()>();
+    let (client_is_gone, agent_waits_for_it) = mpsc::channel::<()>();
+    let agent_waits_for_it = Mutex::new(agent_waits_for_it);
+    let hooks = Hooks {
+        after_spawn: Box::new(move || {
+            started.send(()).unwrap();
+            // An error is the test having failed before it closed; the agent goes on and ends.
+            let _ = agent_waits_for_it.lock().unwrap().recv();
+        }),
+        ..Hooks::production()
+    };
+    let (server, client, dir) = crate::test_support::raw_socket_pair(tag);
+    let agent = thread::spawn(move || super::handle_connection_with(server, hooks));
+    let (crx, mut ctx) = afunix::split(client).unwrap();
+    let hs = Handshake {
+        mode,
+        command: Some(command.to_owned()),
+        ..Handshake::pty_default()
+    };
+    write_frame(&mut ctx, FrameKind::Handshake, &hs.encode().unwrap()).unwrap();
+    client_hears_of_it
+        .recv()
+        .expect("the agent ended before it started the session");
+    // The session is started and the agent is held before it answers: the client's end goes now.
+    ctx.shutdown_both().unwrap();
+    drop((crx, ctx));
+    client_is_gone.send(()).unwrap();
+    agent.join().unwrap().unwrap();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn an_exec_client_gone_during_the_start_ends_the_session() {
+    let never_exits = format!("pwsh.exe -NoLogo -NoProfile -Command {SLEEP_FOREVER}");
+    assert_a_client_gone_during_the_start_ends_the_session("gone-exec", Mode::Exec, &never_exits);
+}
+
+#[test]
+fn a_pty_client_gone_during_the_start_ends_the_session() {
+    assert_a_client_gone_during_the_start_ends_the_session("gone-pty", Mode::Pty, "cmd.exe /k");
+}
+
 /// `read_one_frame` is exercised indirectly above; `handle_connection` also reads the
 /// handshake via it. This asserts the handler rejects a non-handshake first frame.
 #[test]

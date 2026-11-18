@@ -87,11 +87,6 @@ impl FrameSink for DiscardSink {
 pub fn pump_until_peer_gone<R: Read>(r: &mut R, fr: &mut FrameReader, sink: &mut impl FrameSink) {
     let e = match pump_decode(r, fr, sink) {
         Err(e) => e,
-        // A client has no answer to give: it broke the protocol, and the pump stops reading it.
-        Ok(Outcome::HandedBack(_)) => {
-            tracing::debug!("input pump stopped: the peer sent a hand-back, which only an agent does");
-            return;
-        }
         Ok(_) => return, // clean end of stream: the peer is finished
     };
     tracing::debug!("input pump stopped delivering: {e}");
