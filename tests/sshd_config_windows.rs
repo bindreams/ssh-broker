@@ -11,14 +11,14 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
 
-use ssh_broker::acl::{admin_only_dir_problem, admin_only_file_problem};
+use ssh_broker::acl::{admin_only_file_problem, copy_file_security, create_install_dir, install_dir_problem};
 use ssh_broker::pipes::ExecChild;
 use ssh_broker::provision::path_env::{self, PathPlan};
 use ssh_broker::provision::registry;
-use ssh_broker::provision::sshd_config::configure::Outcome;
-use ssh_broker::provision::sshd_config::machine::{configure_this_machine, sshd_t_this_machine};
+use ssh_broker::provision::sshd_config::configure::{Service, ServiceOutcome, net_outcome};
+use ssh_broker::provision::sshd_config::machine::{configure_this_machine, sshd_reading_this_machine};
 use ssh_broker::provision::sshd_config::{
-    DROP_IN_NAME, DROP_IN_TEXT, INCLUDE_LINE, accepts, accepts_row, with_include,
+    ACCEPT_LINE, DROP_IN_NAME, INCLUDE_LINE, SshdReading, accepts, accepts_row, drop_in_text, with_line,
 };
 use ssh_broker::provision::{BASE_DIR, canonical_exe};
 use ssh_broker::socket_loc::Integrity;
@@ -82,7 +82,8 @@ fn candidate_path() -> PathBuf {
 static STOCK: OnceLock<Vec<u8>> = OnceLock::new();
 
 /// Put sshd's files as the runner has them: the stock `sshd_config`, no drop-in and no folder for one. The
-/// running service is not restarted: `apply` decides from what `sshd -T` reads from the files.
+/// running service is not restarted: `apply` decides from what `sshd -T` reads from the files, and from whether the
+/// service started before they were written.
 fn reset() -> &'static [u8] {
     let stock = STOCK.get_or_init(|| std::fs::read(config_path()).expect("read the stock sshd_config"));
     std::fs::write(config_path(), stock).expect("put the stock sshd_config back");
@@ -91,11 +92,11 @@ fn reset() -> &'static [u8] {
     stock
 }
 
-/// What `apply`'s sshd step did and said.
-fn configure() -> (Outcome, Vec<String>) {
+/// What `apply`'s sshd step did and said: whether the running sshd takes the variable, and its lines.
+fn configure() -> (bool, Vec<String>) {
     let mut said = Vec::new();
-    let outcome = configure_this_machine(&mut |line| said.push(line.to_owned()));
-    (outcome, said)
+    let accepted = configure_this_machine(&mut |line| said.push(line.to_owned()));
+    (accepted, said)
 }
 
 /// The owner, group and DACL of `path` as SDDL, which is what `apply` must carry onto a file it replaces.
@@ -112,8 +113,12 @@ fn sddl_of(path: &Path) -> String {
     text.trim().to_owned()
 }
 
+/// What plain `sshd -T` prints, as the `verify` row reads it.
 fn sshd_t() -> String {
-    sshd_t_this_machine().expect("sshd -T")
+    match sshd_reading_this_machine().expect("sshd -T") {
+        SshdReading::Read { listing, .. } => listing,
+        other => panic!("the sshd service was read as {other:?}"),
+    }
 }
 
 /// `exe apply`, run by the test process (an elevated administrator): installs the build as the product does.
@@ -144,22 +149,15 @@ fn apply_s_sshd_step_adds_the_drop_in_and_the_include_above_the_first_match_and_
     let stock = reset();
     let security_before = sddl_of(&config_path());
 
-    let (outcome, said) = configure();
-    assert_eq!(
-        outcome,
-        Outcome {
-            accepts: true,
-            restarted: true
-        },
-        "{said:#?}"
-    );
+    let (accepted, said) = configure();
+    assert!(accepted, "{said:#?}");
     assert_eq!(
         std::fs::read(config_path()).unwrap(),
-        with_include(stock).unwrap(),
+        with_line(stock, INCLUDE_LINE).unwrap(),
         "the file is the stock one with the one line above its first Match"
     );
-    assert_eq!(std::fs::read(drop_in_path()).unwrap(), DROP_IN_TEXT.as_bytes());
-    assert_eq!(admin_only_dir_problem(&drop_in_dir()).unwrap(), None);
+    assert_eq!(std::fs::read(drop_in_path()).unwrap(), drop_in_text().as_bytes());
+    assert_eq!(install_dir_problem(&drop_in_dir()).unwrap(), None);
     assert_eq!(admin_only_file_problem(&drop_in_path()).unwrap(), None);
     assert_eq!(
         sddl_of(&config_path()),
@@ -174,33 +172,28 @@ fn apply_s_sshd_step_adds_the_drop_in_and_the_include_above_the_first_match_and_
         accepts(&sshd_t(), ssh_broker::protocol::ElevationPolicy::VARIABLE),
         "plain `sshd -T` shows the variable"
     );
-    let row = accepts_row(Integrity::High, sshd_t_this_machine);
+    let row = accepts_row(Integrity::High, sshd_reading_this_machine);
     assert!(row.pass, "{}", row.detail);
 
-    // A second run changes nothing and restarts nothing.
+    // A second run changes nothing and restarts nothing: sshd started after every file was written, so the
+    // step has nothing to say (a restart says so).
     let (again, said) = configure();
-    assert_eq!(
-        again,
-        Outcome {
-            accepts: true,
-            restarted: false
-        },
-        "{said:#?}"
-    );
+    assert!(again && said.is_empty(), "{said:#?}");
 }
 
-/// An `Include` that covers the drop-in is already there: the file is not touched and the variable is accepted.
+/// An `Include` that covers the drop-in is already there: the file is not touched and the variable is accepted
+/// (the drop-in that the `Include` reads is written).
 #[test]
 fn a_config_with_an_include_already_present_is_left_alone_and_accepts() {
     let _machine = machine::exclusive();
     account_fixture::assert_elevated();
-    let edited = with_include(reset()).unwrap();
+    let edited = with_line(reset(), INCLUDE_LINE).unwrap();
     std::fs::write(config_path(), &edited).unwrap();
 
-    let (outcome, said) = configure();
-    assert!(outcome.accepts, "{said:#?}");
+    let (accepted, said) = configure();
+    assert!(accepted, "{said:#?}");
     assert_eq!(std::fs::read(config_path()).unwrap(), edited);
-    assert_eq!(std::fs::read(drop_in_path()).unwrap(), DROP_IN_TEXT.as_bytes());
+    assert_eq!(std::fs::read(drop_in_path()).unwrap(), drop_in_text().as_bytes());
     assert!(accepts(&sshd_t(), ssh_broker::protocol::ElevationPolicy::VARIABLE));
 }
 
@@ -211,11 +204,11 @@ fn an_unparseable_candidate_leaves_the_original_untouched() {
     let _machine = machine::exclusive();
     account_fixture::assert_elevated();
     let stock = reset();
-    ssh_broker::acl::ensure_admin_only_dir(&drop_in_dir()).expect("make the drop-in folder");
+    create_install_dir(&drop_in_dir()).expect("make the drop-in folder");
     std::fs::write(drop_in_dir().join("99-broken.conf"), "ThisIsNotAnSshdOption yes\r\n").unwrap();
 
-    let (outcome, said) = configure();
-    assert!(!outcome.accepts && !outcome.restarted, "{said:#?}");
+    let (accepted, said) = configure();
+    assert!(!accepted, "{said:#?}");
     assert_eq!(
         std::fs::read(config_path()).unwrap(),
         stock,
@@ -224,9 +217,168 @@ fn an_unparseable_candidate_leaves_the_original_untouched() {
     assert!(!candidate_path().exists(), "the candidate is removed");
     assert!(
         said.iter()
-            .any(|line| line.contains(INCLUDE_LINE) && line.contains("above the first `Match`")),
+            .any(|line| line.contains(ACCEPT_LINE) && line.contains("above the first `Match`")),
         "{said:#?}"
     );
+}
+
+/// A folder an administrator made by hand inherits `ProgramData\ssh`'s permissions, which are not the ones
+/// `apply` makes it with: the premise is measured first. The folder is left as it is, no drop-in is written, and
+/// the `AcceptEnv` line goes into `sshd_config` above its first `Match`.
+#[test]
+fn a_hand_made_sshd_config_d_gets_no_drop_in_and_sshd_config_gets_the_acceptenv_line() {
+    let _machine = machine::exclusive();
+    account_fixture::assert_elevated();
+    let stock = reset();
+    std::fs::create_dir(drop_in_dir()).expect("make the folder by hand");
+    let problem = install_dir_problem(&drop_in_dir()).expect("judge the folder");
+    assert!(
+        problem.is_some(),
+        "premise: a folder made by hand is not the folder apply makes"
+    );
+
+    let (accepted, said) = configure();
+    assert!(accepted, "{said:#?}");
+    assert!(!drop_in_path().exists(), "no drop-in was written");
+    assert_eq!(
+        std::fs::read_dir(drop_in_dir()).unwrap().count(),
+        0,
+        "the folder is as it was"
+    );
+    assert_eq!(
+        install_dir_problem(&drop_in_dir()).unwrap(),
+        problem,
+        "its permissions are as they were"
+    );
+    assert_eq!(
+        std::fs::read(config_path()).unwrap(),
+        with_line(stock, ACCEPT_LINE).unwrap()
+    );
+    assert!(
+        said.iter()
+            .any(|line| line.contains("is left as it is") && line.contains("accepted by a line in sshd_config")),
+        "{said:#?}"
+    );
+    assert!(
+        said.iter().all(|line| !line.to_ascii_lowercase().contains("remove")),
+        "{said:#?}"
+    );
+    assert!(accepts(&sshd_t(), ssh_broker::protocol::ElevationPolicy::VARIABLE));
+    let row = accepts_row(Integrity::High, sshd_reading_this_machine);
+    assert!(row.pass, "{}", row.detail);
+}
+
+/// sshd reads its configuration when it starts, so a file written after that may not have been read: the `verify`
+/// row fails for it and the next `apply` restarts sshd. This also measures that an elevated administrator can read
+/// when sshd's process, which runs as SYSTEM, was created.
+#[test]
+fn a_configuration_written_after_sshd_started_fails_the_row_until_apply_restarts_sshd() {
+    let _machine = machine::exclusive();
+    account_fixture::assert_elevated();
+    reset();
+
+    // The step restarts sshd, so that it starts after both files were written.
+    let (accepted, said) = configure();
+    assert!(accepted, "{said:#?}");
+    match sshd_reading_this_machine().expect("an elevated administrator can read when sshd's SYSTEM process started") {
+        SshdReading::Read { unread, .. } => assert_eq!(unread, None, "sshd started after the files were written"),
+        other => panic!("the sshd service was read as {other:?}"),
+    }
+    let row = accepts_row(Integrity::High, sshd_reading_this_machine);
+    assert!(row.pass, "{}", row.detail);
+
+    // The file is written again, with the same text: sshd cannot have read this write.
+    std::fs::write(config_path(), std::fs::read(config_path()).unwrap()).unwrap();
+    let row = accepts_row(Integrity::High, sshd_reading_this_machine);
+    assert!(!row.pass, "{}", row.detail);
+    assert!(
+        row.detail.contains("started before") && row.detail.contains(&config_path().display().to_string()),
+        "{}",
+        row.detail
+    );
+
+    // `apply` restarts it, and the row passes again.
+    let (accepted, said) = configure();
+    assert!(accepted, "{said:#?}");
+    assert!(said.iter().any(|line| line.contains("restarting sshd")), "{said:#?}");
+    let row = accepts_row(Integrity::High, sshd_reading_this_machine);
+    assert!(row.pass, "{}", row.detail);
+}
+
+/// Starts `sshd` when it goes, whether the test passed or not.
+struct SshdRunningAtTheEnd;
+
+impl Drop for SshdRunningAtTheEnd {
+    fn drop(&mut self) {
+        let _ = Command::new(net_exe()).args(["start", "sshd"]).output();
+    }
+}
+
+fn net_exe() -> PathBuf {
+    system_cmd().with_file_name("net.exe")
+}
+
+/// What `net <verb> sshd` meant, read from the real `net.exe`'s exit code and words.
+fn net(verb: &str, service: Service) -> ServiceOutcome {
+    let out = Command::new(net_exe())
+        .args([verb, "sshd"])
+        .output()
+        .expect("run net.exe");
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    net_outcome(service, out.status.code().unwrap_or(-1), &said)
+}
+
+/// The two message numbers `net_outcome` takes for "already in the state asked for" come from the real `net.exe`:
+/// a start of a running service and a stop of one that is not running are `Unchanged`, and the real ones are
+/// `Done`.
+#[test]
+fn net_calls_a_start_of_a_running_sshd_and_a_stop_of_a_stopped_one_unchanged() {
+    let _machine = machine::exclusive();
+    account_fixture::assert_elevated();
+    let _running = SshdRunningAtTheEnd;
+
+    assert!(
+        matches!(
+            net("start", Service::Start),
+            ServiceOutcome::Done | ServiceOutcome::Unchanged
+        ),
+        "sshd runs"
+    );
+    assert_eq!(net("start", Service::Start), ServiceOutcome::Unchanged);
+    assert_eq!(net("stop", Service::Stop), ServiceOutcome::Done);
+    assert_eq!(net("stop", Service::Stop), ServiceOutcome::Unchanged);
+    assert_eq!(net("start", Service::Start), ServiceOutcome::Done);
+}
+
+/// `SeRestorePrivilege` is enabled for the copy of a file's security and put back after it: an elevated
+/// administrator's token holds it disabled, and the process is left as it was found.
+#[test]
+fn copying_security_leaves_the_restore_privilege_as_it_found_it() {
+    account_fixture::assert_elevated();
+    let state = || {
+        let (ok, text) = run("whoami", &["/priv", "/fo", "csv", "/nh"]);
+        assert!(ok, "whoami /priv: {text}");
+        text.lines()
+            .find(|line| line.contains("SeRestorePrivilege"))
+            .unwrap_or_else(|| panic!("the token has no SeRestorePrivilege:\n{text}"))
+            .to_owned()
+    };
+    let dir = std::env::temp_dir().join(format!("sb-copy-security-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (from, to) = (dir.join("from"), dir.join("to"));
+    std::fs::write(&from, "a").unwrap();
+    std::fs::write(&to, "b").unwrap();
+
+    let before = state();
+    let copied = copy_file_security(&from, &to);
+    let after = state();
+    let _ = std::fs::remove_dir_all(&dir);
+    copied.expect("copy the security");
+    assert_eq!(after, before, "the privilege was left as the copy made it");
 }
 
 /// A login that sets the variable through `SetEnv` gets it in its shell after `apply`, over the real sshd: the

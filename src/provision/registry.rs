@@ -197,7 +197,7 @@ mod win {
         ESCAPE_ARGUMENTS, RegValue, SSHD_VALUE_BYTES, SshdShell, SshdShellReading, UnreadShell, desired_values,
     };
     use crate::provision::handover::{Handover, ShownValue};
-    use crate::provision::path_env::{Reading, Stored};
+    use crate::provision::path_env::{Reading, Stored, decode_string};
     use anyhow::Context;
     use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_MORE_DATA, ERROR_PATH_NOT_FOUND, WIN32_ERROR};
     use windows::Win32::System::Registry::{
@@ -481,14 +481,14 @@ mod win {
             if kind != REG_SZ && kind != REG_EXPAND_SZ {
                 return Ok(Some(Stored::Other(kind.0)));
             }
-            let units = &buffer[..(size as usize / 2).min(buffer.len())];
-            let text =
-                String::from_utf16_lossy(&units[..units.iter().position(|&unit| unit == 0).unwrap_or(units.len())]);
-            return Ok(Some(if kind == REG_EXPAND_SZ {
-                Stored::ExpandSz(text)
-            } else {
-                Stored::Sz(text)
-            }));
+            let data: Vec<u8> = buffer
+                .iter()
+                .flat_map(|unit| unit.to_le_bytes())
+                .take(size as usize)
+                .collect();
+            return decode_string(&data, kind == REG_EXPAND_SZ)
+                .map(Some)
+                .map_err(|why| format!("the Path value cannot be written back as it is read: {why}"));
         }
     }
 
@@ -514,27 +514,21 @@ mod win {
 
     /// Tell the windows of the machine that the environment changed, as the System dialog does. The
     /// programs that read it (Explorer, and what it starts) then take the new `Path`; a process that is
-    /// already running keeps its own. `SendMessageTimeoutW` has a time limit for each window that does not
-    /// answer, which only keeps a hung window from holding this up: its expiry says nothing and nothing
-    /// depends on it. Run over SSH, `apply` has no desktop and the message reaches no window of that
-    /// session; sessions that sshd and the agent start read the registry themselves.
+    /// already running keeps its own. The message is queued to each window and this does not wait for any of
+    /// them: a window that is hung holds nothing up, and nothing depends on one having answered. Run over SSH,
+    /// `apply` has no desktop and the message reaches no window of that session; sessions that sshd and the
+    /// agent start read the registry themselves.
     pub fn broadcast_environment_change() {
         use windows::Win32::Foundation::{LPARAM, WPARAM};
-        use windows::Win32::UI::WindowsAndMessaging::{
-            HWND_BROADCAST, SMTO_ABORTIFHUNG, SendMessageTimeoutW, WM_SETTINGCHANGE,
-        };
-        let environment = wide("Environment");
-        // SAFETY: `environment` is NUL-terminated and outlives the call, which does not return until every
-        // window has taken the message or given up on it.
+        use windows::Win32::UI::WindowsAndMessaging::{HWND_BROADCAST, SendNotifyMessageW, WM_SETTINGCHANGE};
+        // SAFETY: the string is a NUL-terminated literal that lives as long as the program, so a window that
+        // reads it after this returns still finds it.
         let _ = unsafe {
-            SendMessageTimeoutW(
+            SendNotifyMessageW(
                 HWND_BROADCAST,
                 WM_SETTINGCHANGE,
                 WPARAM(0),
-                LPARAM(environment.as_ptr() as isize),
-                SMTO_ABORTIFHUNG,
-                5000,
-                None,
+                LPARAM(windows::core::w!("Environment").as_ptr() as isize),
             )
         };
     }

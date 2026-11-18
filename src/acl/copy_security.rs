@@ -20,9 +20,10 @@ use crate::winutil::OwnedHandle;
 
 /// Give `to` the owner, the group and the DACL of `from`, the DACL protected or not as it is there. An owner
 /// other than the caller's can be set only with `SeRestorePrivilege`, which an elevated administrator holds
-/// and has disabled, so it is enabled for this process first; a caller that does not hold it gets the error.
+/// and has disabled, so it is enabled for this process for the copy and put back as it was after it; a caller
+/// that does not hold it gets the error.
 pub fn copy_file_security(from: &Path, to: &Path) -> anyhow::Result<()> {
-    enable_restore_privilege().context("enable SeRestorePrivilege to set the owner")?;
+    let _privilege = RestorePrivilege::enable().context("enable SeRestorePrivilege to set the owner")?;
     let (from_w, to_w) = (wide(from), wide(to));
     let mut descriptor = PSECURITY_DESCRIPTOR::default();
     let mut dacl: *mut ACL = std::ptr::null_mut();
@@ -69,30 +70,65 @@ pub fn copy_file_security(from: &Path, to: &Path) -> anyhow::Result<()> {
     .with_context(|| format!("set the security of {}", to.display()))
 }
 
-/// Enable `SeRestorePrivilege` on this process's token. `AdjustTokenPrivileges` succeeds when it assigns
-/// nothing, so `ERROR_NOT_ALL_ASSIGNED` (the token does not hold the privilege) is read back and is the error.
-fn enable_restore_privilege() -> anyhow::Result<()> {
-    let mut token = HANDLE::default();
-    // SAFETY: the pseudo-handle of this process is valid for the call; the token is closed by `OwnedHandle`.
-    unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &mut token) }
-        .context("open the process token")?;
-    let token = OwnedHandle(token);
-    let mut luid = LUID::default();
-    // SAFETY: a null system name means this machine; `luid` is a local.
-    unsafe { LookupPrivilegeValueW(PCWSTR::null(), SE_RESTORE_NAME, &mut luid) }.context("look up the privilege")?;
-    let privileges = TOKEN_PRIVILEGES {
-        PrivilegeCount: 1,
-        Privileges: [LUID_AND_ATTRIBUTES {
-            Luid: luid,
-            Attributes: SE_PRIVILEGE_ENABLED,
-        }],
-    };
-    // SAFETY: the token has `TOKEN_ADJUST_PRIVILEGES`; `privileges` is one entry as its count says.
-    unsafe { AdjustTokenPrivileges(token.0, false, Some(&privileges), 0, None, None) }.context("adjust the token")?;
-    // SAFETY: reads the thread's last error, set by the call above.
-    anyhow::ensure!(
-        unsafe { GetLastError() } != ERROR_NOT_ALL_ASSIGNED,
-        "this token does not hold the privilege: run elevated"
-    );
-    Ok(())
+/// `SeRestorePrivilege` enabled on this process's token for as long as the guard lives. Dropping it puts the
+/// privilege back as `AdjustTokenPrivileges` reported it: a privilege that was enabled already stays so.
+struct RestorePrivilege {
+    token: OwnedHandle,
+    /// What the call changed, as it was before; empty when it changed nothing.
+    previous: TOKEN_PRIVILEGES,
+}
+
+impl RestorePrivilege {
+    /// Enable the privilege. `AdjustTokenPrivileges` succeeds when it assigns nothing, so
+    /// `ERROR_NOT_ALL_ASSIGNED` (the token does not hold the privilege) is read back and is the error.
+    fn enable() -> anyhow::Result<RestorePrivilege> {
+        let mut token = HANDLE::default();
+        // SAFETY: the pseudo-handle of this process is valid for the call; the token is closed by `OwnedHandle`.
+        unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &mut token) }
+            .context("open the process token")?;
+        let token = OwnedHandle(token);
+        let mut luid = LUID::default();
+        // SAFETY: a null system name means this machine; `luid` is a local.
+        unsafe { LookupPrivilegeValueW(PCWSTR::null(), SE_RESTORE_NAME, &mut luid) }
+            .context("look up the privilege")?;
+        let privileges = TOKEN_PRIVILEGES {
+            PrivilegeCount: 1,
+            Privileges: [LUID_AND_ATTRIBUTES {
+                Luid: luid,
+                Attributes: SE_PRIVILEGE_ENABLED,
+            }],
+        };
+        let mut previous = TOKEN_PRIVILEGES::default();
+        let mut returned = 0u32;
+        // SAFETY: the token has `TOKEN_ADJUST_PRIVILEGES`; `privileges` is one entry as its count says;
+        // `previous` has room for the one entry the call can report.
+        unsafe {
+            AdjustTokenPrivileges(
+                token.0,
+                false,
+                Some(&privileges),
+                std::mem::size_of::<TOKEN_PRIVILEGES>() as u32,
+                Some(&mut previous),
+                Some(&mut returned),
+            )
+        }
+        .context("adjust the token")?;
+        // SAFETY: reads the thread's last error, set by the call above.
+        anyhow::ensure!(
+            unsafe { GetLastError() } != ERROR_NOT_ALL_ASSIGNED,
+            "this token does not hold the privilege: run elevated"
+        );
+        Ok(RestorePrivilege { token, previous })
+    }
+}
+
+impl Drop for RestorePrivilege {
+    fn drop(&mut self) {
+        if self.previous.PrivilegeCount == 0 {
+            return;
+        }
+        // SAFETY: the token is open with `TOKEN_ADJUST_PRIVILEGES`; `previous` is what the call that enabled the
+        // privilege reported. There is nobody to tell if this fails: the privilege stays enabled.
+        let _ = unsafe { AdjustTokenPrivileges(self.token.0, false, Some(&self.previous), 0, None, None) };
+    }
 }

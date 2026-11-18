@@ -491,11 +491,12 @@ mod imp {
         // Local: the install directory is on the system PATH, so a session finds `ssh-broker` by name.
         rows.push(path_env::row(&registry::read_system_path(), super::BASE_DIR));
 
-        // Local: sshd accepts SSH_BROKER_ELEVATION from clients. `sshd -T` reads sshd's host keys, so the
-        // row is judged only by an elevated `verify` (see `sshd_config::accepts_row`).
+        // Local: sshd accepts SSH_BROKER_ELEVATION from clients, and has read the files that say so. `sshd -T`
+        // reads sshd's host keys, so the row is judged only by an elevated `verify` (see
+        // `sshd_config::accepts_row`).
         rows.push(sshd_config::accepts_row(
             crate::account::integrity().unwrap_or(crate::socket_loc::Integrity::Medium),
-            sshd_config::machine::sshd_t_this_machine,
+            sshd_config::machine::sshd_reading_this_machine,
         ));
 
         // Local: sshd escapes the command, the only non-PTY form the shim decodes. sshd reads the

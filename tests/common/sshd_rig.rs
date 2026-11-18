@@ -137,10 +137,10 @@ pub fn accept_elevation_variable() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         let mut said = Vec::new();
-        let outcome =
+        let accepted =
             ssh_broker::provision::sshd_config::machine::configure_this_machine(&mut |line| said.push(line.to_owned()));
         assert!(
-            outcome.accepts,
+            accepted,
             "apply's sshd step did not make sshd accept SSH_BROKER_ELEVATION: {said:#?}"
         );
     });

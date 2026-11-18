@@ -346,20 +346,31 @@ pub fn sshd_search_dirs(host: &dyn Host, image_path: Option<&str>) -> anyhow::Re
     Ok(dirs)
 }
 
-/// The program a service's `ImagePath` starts. The value is a command line: the program is quoted, or
-/// runs up to its `.exe`, and arguments may follow.
-pub(super) fn image_program(image_path: &str) -> Option<&str> {
+/// A service's `ImagePath` as the program it starts and the text after it. The value is a command line: the
+/// program is quoted, or runs up to its `.exe`, and arguments may follow.
+fn split_image(image_path: &str) -> (&str, &str) {
     let image_path = image_path.trim();
     match image_path.strip_prefix('"') {
-        Some(quoted) => quoted.split('"').next(),
+        Some(quoted) => quoted.split_once('"').unwrap_or((quoted, "")),
         None => {
             let end = image_path
                 .to_ascii_lowercase()
                 .find(".exe")
                 .map_or(image_path.len(), |at| at + ".exe".len());
-            Some(&image_path[..end])
+            image_path.split_at(end)
         }
     }
+}
+
+/// The program a service's `ImagePath` starts.
+pub(super) fn image_program(image_path: &str) -> Option<&str> {
+    Some(split_image(image_path).0)
+}
+
+/// The arguments after the program of a service's `ImagePath`, trimmed; `None` when there are none.
+pub(super) fn image_arguments(image_path: &str) -> Option<&str> {
+    let arguments = split_image(image_path).1.trim();
+    (!arguments.is_empty()).then_some(arguments)
 }
 
 /// The directory of [`image_program`].

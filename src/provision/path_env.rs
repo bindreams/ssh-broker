@@ -19,6 +19,30 @@ pub enum Stored {
 /// What reading the system `Path` gave: the value, `None` when there is none, or why it could not be read.
 pub type Reading = Result<Option<Stored>, String>;
 
+/// The data of a `REG_SZ` or (`expand`) `REG_EXPAND_SZ` value as [`Stored`]: UTF-16, little-endian, with the
+/// terminator the registry keeps (or none, or several). A value that would not be written back as it was read
+/// is `Err` with the reason: one that is not whole code units, one with an unpaired surrogate (a lossy decode
+/// would write U+FFFD in its place), one with a NUL before its terminators (the data after it would be cut
+/// off). Writing the system `PATH` back after any of those would change it machine-wide.
+pub fn decode_string(data: &[u8], expand: bool) -> Result<Stored, String> {
+    let (pairs, rest) = data.as_chunks::<2>();
+    if !rest.is_empty() {
+        return Err("its data is not a whole number of UTF-16 code units".into());
+    }
+    let units: Vec<u16> = pairs.iter().map(|pair| u16::from_le_bytes(*pair)).collect();
+    let end = units.iter().rposition(|&unit| unit != 0).map_or(0, |last| last + 1);
+    let units = &units[..end];
+    if units.contains(&0) {
+        return Err("it holds a NUL before its end, so the data after it would be lost".into());
+    }
+    let text = String::from_utf16(units).map_err(|_| "it is not valid UTF-16 (it has an unpaired surrogate)")?;
+    Ok(if expand {
+        Stored::ExpandSz(text)
+    } else {
+        Stored::Sz(text)
+    })
+}
+
 /// What `apply` does about the `PATH`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PathPlan {

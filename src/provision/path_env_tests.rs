@@ -123,3 +123,61 @@ fn the_path_row_passes_when_the_directory_is_on_the_path_and_says_what_to_do_whe
     assert!(!strange.pass);
     assert!(strange.detail.contains("type 7"), "{}", strange.detail);
 }
+
+// the stored value =====
+
+/// A registry string's data: UTF-16 little-endian, as stored.
+fn data(units: &[u16]) -> Vec<u8> {
+    units.iter().flat_map(|unit| unit.to_le_bytes()).collect()
+}
+
+fn units(text: &str) -> Vec<u16> {
+    text.encode_utf16().collect()
+}
+
+#[test]
+fn a_stored_string_is_decoded_with_or_without_its_terminators_and_keeps_its_type() {
+    let text = r"C:\Windows;D:\Ünï";
+    let bare = units(text);
+    let one = [bare.clone(), vec![0]].concat();
+    let two = [bare.clone(), vec![0, 0]].concat();
+    for stored in [&bare, &one, &two] {
+        assert_eq!(decode_string(&data(stored), false), Ok(Stored::Sz(text.into())));
+        assert_eq!(decode_string(&data(stored), true), Ok(Stored::ExpandSz(text.into())));
+    }
+    assert_eq!(decode_string(&[], false), Ok(Stored::Sz(String::new())));
+    assert_eq!(decode_string(&data(&[0]), true), Ok(Stored::ExpandSz(String::new())));
+}
+
+#[test]
+fn a_stored_string_that_would_not_survive_a_write_back_is_refused_with_the_reason() {
+    // An unpaired surrogate is not text: a lossy decode would write U+FFFD in its place.
+    let unpaired = [units(r"C:\a;"), vec![0xD800], units(r";C:\b")].concat();
+    let why = decode_string(&data(&unpaired), false).unwrap_err();
+    assert!(why.contains("UTF-16"), "{why}");
+    // Data after an embedded NUL would be cut off.
+    let embedded = [units(r"C:\a;"), vec![0], units(r"C:\b"), vec![0]].concat();
+    let why = decode_string(&data(&embedded), true).unwrap_err();
+    assert!(why.contains("NUL"), "{why}");
+    // Half a code unit.
+    let mut odd = data(&units(r"C:\a"));
+    odd.push(0x41);
+    let why = decode_string(&odd, false).unwrap_err();
+    assert!(why.contains("whole"), "{why}");
+    // Each of them leaves the system PATH alone.
+    assert!(matches!(
+        plan(&decode_string(&data(&embedded), true).map(Some), DIR),
+        PathPlan::Refuse(why) if why.contains("NUL")
+    ));
+}
+
+#[test]
+fn a_decoded_string_is_written_back_as_it_was_read() {
+    for text in [r"C:\Windows;%SystemRoot%\System32;", "", r"D:\ü\𝄞;E:\x"] {
+        let read = decode_string(&data(&[units(text), vec![0]].concat()), true).unwrap();
+        let (Stored::Sz(back) | Stored::ExpandSz(back)) = read else {
+            panic!("a string")
+        };
+        assert_eq!(back, text);
+    }
+}

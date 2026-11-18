@@ -13,6 +13,9 @@
 # `shell_sshd_windows` takes the machine alone too, but runs in `ci`: its logons start the agent from the
 # installed exe (`provision::canonical_exe()`), which the workflow puts in place for `ci` and takes away
 # before `ci-exclusive` (`upgrade_windows` asserts the directory is absent).
+# `sshd_config_windows` takes the machine alone and runs `apply` as well, but it stays in `ci` for the same
+# reason: its `apply` leaves the install directory, which that step takes away, and in `ci-exclusive` it could
+# run before `upgrade_windows` and leave the directory for it.
 
 # The `m3_` tests of `session_on_demand_windows` measure what a caller's jobs do to the logon child, so
 # the test process must be in no job. nextest puts every test in one, so `ci` leaves them out and the
@@ -32,7 +35,7 @@ slow-timeout = { period = "120s", terminate-after = 5, grace-period = "1s" }
 # ends three sessions in its body. The default 600 s could end such a test in the middle of its teardown,
 # lose the message and leave the account and its profile. These binaries get 10 x 120 s.
 [[profile.ci.overrides]]
-filter = 'binary(agent_window_windows) | binary(auto_login_windows) | binary(private_dir_elevated_windows) | binary(prompt_path_windows) | binary(real_sshd_windows) | binary(shell_sshd_windows) | binary(session_on_demand_windows) | binary(upgrade_windows) | binary(user_isolation_windows)'
+filter = 'binary(agent_window_windows) | binary(auto_login_windows) | binary(private_dir_elevated_windows) | binary(prompt_path_windows) | binary(real_sshd_windows) | binary(shell_sshd_windows) | binary(session_on_demand_windows) | binary(sshd_config_windows) | binary(upgrade_windows) | binary(user_isolation_windows)'
 slow-timeout = { period = "120s", terminate-after = 10, grace-period = "1s" }
 
 # The real-sshd test measures things the plan has never seen (the shim's session, logon type and job under

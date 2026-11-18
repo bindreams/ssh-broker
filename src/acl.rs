@@ -72,7 +72,7 @@ use crate::winutil::OwnedHandle;
 mod copy_security;
 pub use copy_security::copy_file_security;
 mod admin_file;
-pub use admin_file::{admin_only_dir_problem, admin_only_file_problem, ensure_admin_only_dir, ensure_admin_only_file};
+pub use admin_file::{admin_only_file_problem, ensure_admin_only_file};
 mod private_dir;
 pub use private_dir::{
     DirHandle, Hold, Missing, Refused, confirm_child, confirm_dir, ensure_private_dir, open_dir, open_existing_file,
@@ -948,52 +948,6 @@ fn install_grants<'a>(system: &'a Sid, admins: &'a Sid, users: &'a Sid) -> [Gran
     ]
 }
 
-/// The directories this build makes with a descriptor of its own: the install directory, and one that only
-/// administrators can open at all (the one the sshd drop-in lives in, [`admin_file`]'s folder). The second is
-/// the first without the grant to `BUILTIN\Users`; it has no descriptor of its own.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DirKind {
-    Install,
-    AdminOnly,
-}
-
-impl DirKind {
-    /// What an error calls the directory.
-    fn name(self) -> &'static str {
-        match self {
-            DirKind::Install => "the install directory",
-            DirKind::AdminOnly => "the administrator-only directory",
-        }
-    }
-
-    /// The descriptor handed to `CreateDirectoryW`.
-    fn sddl(self) -> String {
-        match self {
-            DirKind::Install => INSTALL_DIR_SDDL.to_owned(),
-            DirKind::AdminOnly => {
-                let sddl = INSTALL_DIR_SDDL.replace(USERS_ACE, "");
-                debug_assert_ne!(sddl, INSTALL_DIR_SDDL, "the install descriptor has the grant to Users");
-                sddl
-            }
-        }
-    }
-
-    /// The grants the DACL of such a directory holds, and nothing else.
-    fn grants<'a>(self, system: &'a Sid, admins: &'a Sid, users: &'a Sid) -> Vec<Grant<'a>> {
-        let all = install_grants(system, admins, users);
-        match self {
-            DirKind::Install => all.into_iter().collect(),
-            DirKind::AdminOnly => all
-                .into_iter()
-                .filter(|grant| !std::ptr::eq(grant.sid, users))
-                .collect(),
-        }
-    }
-}
-
-/// The ACE of [`INSTALL_DIR_SDDL`] that lets `BUILTIN\Users` read what is in the install directory.
-const USERS_ACE: &str = "(A;OICI;FRFX;;;BU)";
-
 /// Why `dir` is not an install directory this build made, or `None` if it is one.
 pub fn install_dir_problem(dir: &Path) -> anyhow::Result<Option<String>> {
     problem_from_open(dir, open_for_inspection(dir)?)
@@ -1002,11 +956,6 @@ pub fn install_dir_problem(dir: &Path) -> anyhow::Result<Option<String>> {
 /// [`install_dir_problem`] given the outcome of opening `dir` for inspection: `None` means the
 /// open was denied.
 fn problem_from_open(dir: &Path, handle: Option<OwnedHandle>) -> anyhow::Result<Option<String>> {
-    dir_problem_from_open(dir, handle, DirKind::Install)
-}
-
-/// [`problem_from_open`] for a directory of `kind`.
-fn dir_problem_from_open(dir: &Path, handle: Option<OwnedHandle>, kind: DirKind) -> anyhow::Result<Option<String>> {
     let Some(handle) = handle else {
         return Ok(Some(denied_problem("the hardened one")));
     };
@@ -1031,7 +980,7 @@ fn dir_problem_from_open(dir: &Path, handle: Option<OwnedHandle>, kind: DirKind)
     let system = Sid::well_known(WellKnown::System)?;
     let admins = Sid::well_known(WellKnown::Administrators)?;
     let users = Sid::well_known(WellKnown::Users)?;
-    let grants = kind.grants(&system, &admins, &users);
+    let grants = install_grants(&system, &admins, &users);
     // `INSTALL_DIR_SDDL` makes Administrators the owner, so nothing else is accepted.
     let owner_ok = security.owner_in(&[&admins])?;
     let acl_ok = security.dacl_matches(&grants)?;
@@ -1061,14 +1010,9 @@ pub fn ensure_install_dir(dir: &Path) -> anyhow::Result<()> {
 }
 
 /// `CreateDirectoryW` with [`INSTALL_DIR_SDDL`]. "Already exists" is not an error here: the
-/// caller decides whether what exists is acceptable.
-fn create_install_dir(dir: &Path) -> anyhow::Result<()> {
-    create_dir_of(dir, DirKind::Install)
-}
-
-/// [`create_install_dir`] for a directory of `kind`.
-fn create_dir_of(dir: &Path, kind: DirKind) -> anyhow::Result<()> {
-    let sd = descriptor_from_sddl(&kind.sddl())?;
+/// caller decides whether what exists is acceptable (see [`install_dir_problem`]).
+pub fn create_install_dir(dir: &Path) -> anyhow::Result<()> {
+    let sd = descriptor_from_sddl(INSTALL_DIR_SDDL)?;
     let path_w = wide(dir);
     unsafe {
         let attributes = SECURITY_ATTRIBUTES {
@@ -1080,8 +1024,7 @@ fn create_dir_of(dir: &Path, kind: DirKind) -> anyhow::Result<()> {
             Ok(()) => Ok(()),
             Err(e) if e.code() == HRESULT::from_win32(ERROR_ALREADY_EXISTS.0) => Ok(()),
             Err(e) => Err(anyhow::Error::new(e).context(format!(
-                "create {} {} (this needs an elevated administrator)",
-                kind.name(),
+                "create the install directory {} (this needs an elevated administrator)",
                 dir.display()
             ))),
         }
