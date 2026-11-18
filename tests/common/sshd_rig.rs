@@ -93,15 +93,21 @@ pub fn diagnostics(ssh_stderr: &Path, authorized_keys: &Path) -> String {
         tail.len(),
         tail.into_iter().rev().collect::<Vec<_>>().join("\n")
     );
-    report += &format!(
-        "--- OpenSSH/Operational ---\n{}\n",
-        run(
-            "wevtutil",
-            &["qe", "OpenSSH/Operational", "/c:60", "/rd:true", "/f:text"]
-        )
-        .1
-    );
+    report += &sshd_event_logs(60);
     report
+}
+
+/// The newest `count` entries of each of sshd's own event logs, newest first, headed by the log's name. A plain
+/// program reads them: PowerShell's `Get-WinEvent` does not load in the tests' environment.
+pub fn sshd_event_logs(count: u32) -> String {
+    let count = format!("/c:{count}");
+    ["OpenSSH/Operational", "OpenSSH/Admin"]
+        .into_iter()
+        .map(|log| {
+            let (_, entries) = run("wevtutil.exe", &["qe", log, &count, "/rd:true", "/f:text"]);
+            format!("--- {log} ---\n{entries}\n")
+        })
+        .collect()
 }
 
 /// A folder removed on drop.
@@ -131,10 +137,23 @@ fn administrators_authorized_keys() -> PathBuf {
 /// Restart the runner's `sshd` service, as an administrator does after `apply` says to: `apply` itself does not.
 /// `net stop` returns once the service has stopped, and `net start` once it runs. Machine-wide: CI only.
 pub fn restart_sshd() {
+    if let Err(why) = try_restart_sshd() {
+        panic!("{why}");
+    }
+}
+
+/// [`restart_sshd`] that says why it failed instead of panicking: for a guard that restarts the service while a
+/// test unwinds.
+pub fn try_restart_sshd() -> Result<(), String> {
     let (ok, said) = run("net", &["stop", "sshd"]);
-    assert!(ok, "stop the sshd service: {said}");
+    if !ok {
+        return Err(format!("stop the sshd service: {said}"));
+    }
     let (ok, said) = run("net", &["start", "sshd"]);
-    assert!(ok, "start the sshd service: {said}");
+    if !ok {
+        return Err(format!("start the sshd service: {said}"));
+    }
+    Ok(())
 }
 
 /// Make the runner's sshd accept `SSH_BROKER_ELEVATION` from a client, with the step `apply` takes (the drop-in

@@ -129,7 +129,8 @@ jobs:
 
       # The prompt path starts the background agent from the installed exe (`provision::canonical_exe()`),
       # and no test installs it, so a logon in a prompt test has no file to start the agent from.
-      # It is taken away again below, because `upgrade_windows` asserts the directory is absent.
+      # It is taken away again below, because the tests of `ci-exclusive` that run `apply` (`upgrade_windows`,
+      # `sshd_config_windows`) need the directory absent.
       - name: Put the exe where the prompt path starts agents from
         if: runner.os == 'Windows'
         run: |
@@ -146,6 +147,14 @@ jobs:
       - name: Start Secondary Logon
         if: runner.os == 'Windows'
         run: Start-Service seclogon
+
+      # After `apply`'s sshd step has run, sshd resets every connection, and why is not known. This one test
+      # (profile `measure`) prints which part of the step does it, and it must run before any other test has
+      # changed sshd's files. It asserts nothing about the outcome, so its failure does not stop the run.
+      - name: Measure what makes sshd reset connections
+        if: runner.os == 'Windows'
+        continue-on-error: true
+        run: cargo nextest run --locked --profile measure
 
       - name: cargo nextest
         run: cargo nextest run --locked --profile ci

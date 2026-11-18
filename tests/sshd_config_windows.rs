@@ -2,14 +2,16 @@
 //! **Elevated (CI only)**.
 //!
 //! Each test starts from the runner's stock `sshd_config` (saved the first time any test of this file looks, and
-//! put back by [`reset`]), takes the machine alone (`machine::exclusive()`), and changes machine-wide state:
-//! sshd's configuration and its service, the `DefaultShell` values, the install directory, the system `PATH`.
-//! The runner is discarded after the job, so none of it is put back at the end.
+//! put back by `install::reset`), takes the machine alone (`machine::exclusive()`), and changes machine-wide
+//! state: sshd's configuration and its service, the `DefaultShell` values, the install directory, the system
+//! `PATH`. A test that runs `apply` holds `install::Install`, which puts the install directory, the tasks, the
+//! `DefaultShell` values and sshd's files back as `upgrade_windows` does, so that the directory is absent when the
+//! test ends whichever binary runs first. The whole binary runs in nextest's `ci-exclusive` profile, where no
+//! workflow step has put the exe in the install directory.
 #![cfg(windows)]
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::OnceLock;
 
 use ssh_broker::acl::{
     admin_only_file_problem, copy_file_security, create_install_dir, ensure_admin_only_file, install_dir_problem,
@@ -18,7 +20,9 @@ use ssh_broker::pipes::ExecChild;
 use ssh_broker::provision::path_env::{self, PathPlan};
 use ssh_broker::provision::registry;
 use ssh_broker::provision::sshd_config::configure::ConfigRead;
-use ssh_broker::provision::sshd_config::machine::{configure_this_machine, sshd_reading_this_machine};
+use ssh_broker::provision::sshd_config::machine::{
+    configure_this_machine, replace_file, sshd_reading_this_machine, write_flushed,
+};
 use ssh_broker::provision::sshd_config::{
     ACCEPT_LINE, DROP_IN_NAME, INCLUDE_LINE, SshdReading, accepts, accepts_row, drop_in_text, in_force, with_line,
 };
@@ -36,8 +40,12 @@ mod bounded_wait;
 mod desktop;
 #[path = "common/drain.rs"]
 mod drain;
+#[path = "common/fs_state.rs"]
+mod fs_state;
 #[path = "common/hard_errors.rs"]
 mod hard_errors;
+#[path = "common/install.rs"]
+mod install;
 #[path = "common/logon_session.rs"]
 mod logon_session;
 #[path = "common/machine.rs"]
@@ -54,63 +62,10 @@ mod sshd_rig;
 mod stand_in;
 
 use account_fixture::{Account, ServiceLogon};
-use sshd_rig::{Login, SshSession, restart_sshd, run, run_client, set_stock_shell};
+use fs_state::sddl_of;
+use install::{Install, ResetAtTheEnd, candidate_path, config_path, drop_in_dir, drop_in_path, reset};
+use sshd_rig::{Login, SshSession, restart_sshd, run, run_client, set_stock_shell, sshd_event_logs, try_restart_sshd};
 use stand_in::Kit;
-
-// The machine's files =====
-
-fn ssh_dir() -> PathBuf {
-    Path::new(&std::env::var("ProgramData").expect("ProgramData is set")).join("ssh")
-}
-
-fn config_path() -> PathBuf {
-    ssh_dir().join("sshd_config")
-}
-
-fn drop_in_dir() -> PathBuf {
-    ssh_dir().join("sshd_config.d")
-}
-
-fn drop_in_path() -> PathBuf {
-    drop_in_dir().join(DROP_IN_NAME)
-}
-
-/// The candidate file `apply` makes beside the original.
-fn candidate_path() -> PathBuf {
-    ssh_dir().join("sshd_config.ssh-broker-new")
-}
-
-/// The runner's `sshd_config` as it was before any test of this file changed it.
-static STOCK: OnceLock<Vec<u8>> = OnceLock::new();
-
-/// Put sshd's files as the runner has them: the stock `sshd_config`, no drop-in and no folder for one. The
-/// running service is not restarted: `apply` decides from what `sshd -T` reads from the files, and says whether the
-/// service started before they were written.
-fn reset() -> &'static [u8] {
-    let stock = STOCK.get_or_init(|| std::fs::read(config_path()).expect("read the stock sshd_config"));
-    put_back(stock).expect("put the stock sshd_config back");
-    stock
-}
-
-fn put_back(stock: &[u8]) -> std::io::Result<()> {
-    let written = std::fs::write(config_path(), stock);
-    let _ = std::fs::remove_dir_all(drop_in_dir());
-    let _ = std::fs::remove_file(candidate_path());
-    written
-}
-
-/// Puts sshd's files as [`reset`] makes them when the test ends, also when it fails: what a test leaves in
-/// `sshd_config.d` is read by the other test binaries that share the machine, and a drop-in sshd rejects keeps
-/// them from configuring it. Made after `reset()`, so the stock file is known.
-struct ResetAtTheEnd;
-
-impl Drop for ResetAtTheEnd {
-    fn drop(&mut self) {
-        if let Some(stock) = STOCK.get() {
-            let _ = put_back(stock);
-        }
-    }
-}
 
 /// What `apply`'s sshd step did and said: whether the running sshd takes the variable, and its lines.
 fn configure() -> (bool, Vec<String>) {
@@ -143,20 +98,6 @@ fn assert_in_force_and_read() {
     }
     let row = accepts_row(Integrity::High, sshd_reading_this_machine);
     assert!(row.pass, "{}", row.detail);
-}
-
-/// The owner, group and DACL of `path` as SDDL, which is what `apply` must carry onto a file it replaces.
-fn sddl_of(path: &Path) -> String {
-    let (ok, text) = run(
-        "powershell",
-        &[
-            "-NoProfile",
-            "-Command",
-            &format!("(Get-Acl -LiteralPath '{}').Sddl", path.display()),
-        ],
-    );
-    assert!(ok, "read the security of {}: {text}", path.display());
-    text.trim().to_owned()
 }
 
 /// What plain `sshd -T` prints, as the `verify` row reads it.
@@ -210,7 +151,7 @@ fn apply_s_sshd_step_adds_the_drop_in_and_the_include_above_the_first_match_and_
     assert_eq!(
         sddl_of(&config_path()),
         security_before,
-        "the replacement has the original's owner, group and ACL"
+        "the replacement has the original's owner and ACL"
     );
     assert!(
         !candidate_path().exists(),
@@ -418,8 +359,8 @@ fn copying_security_leaves_the_restore_privilege_as_it_found_it() {
 fn a_login_with_set_env_always_gets_the_variable_after_apply() {
     let _machine = machine::exclusive();
     account_fixture::assert_elevated();
+    let _install = Install::capture();
     reset();
-    let _reset = ResetAtTheEnd;
     let kit = Kit::broker_with_helper("sshe");
     apply(&kit);
     let account = Account::create("sshe", true);
@@ -502,8 +443,8 @@ fn install_dir_is_on_path() -> bool {
 fn apply_puts_the_install_directory_on_the_system_path_and_verify_says_so() {
     let _machine = machine::exclusive();
     account_fixture::assert_elevated();
+    let _install = Install::capture();
     reset();
-    let _reset = ResetAtTheEnd;
     let kit = Kit::broker_with_helper("sshp");
     apply(&kit);
     remove_install_dir_from_path();
@@ -547,8 +488,8 @@ fn type_where_ssh_broker_is(session: &mut SshSession) -> String {
 fn after_apply_a_new_session_runs_ssh_broker_by_name() {
     let _machine = machine::exclusive();
     account_fixture::assert_elevated();
+    let _install = Install::capture();
     reset();
-    let _reset = ResetAtTheEnd;
     let kit = Kit::broker_with_helper("sshn");
     apply(&kit);
     remove_install_dir_from_path();
@@ -575,8 +516,8 @@ fn after_apply_a_new_session_runs_ssh_broker_by_name() {
 fn an_agent_that_apply_did_not_restart_keeps_its_old_path_until_it_restarts() {
     let _machine = machine::exclusive();
     account_fixture::assert_elevated();
+    let _install = Install::capture();
     reset();
-    let _reset = ResetAtTheEnd;
     let kit = Kit::broker_with_helper("sshk");
     apply(&kit);
     remove_install_dir_from_path();
@@ -630,8 +571,8 @@ fn an_agent_that_apply_did_not_restart_keeps_its_old_path_until_it_restarts() {
 fn after_apply_verify_passes_through_a_session_the_password_prompt_started() {
     let _machine = machine::exclusive();
     account_fixture::assert_elevated();
+    let _install = Install::capture();
     reset();
-    let _reset = ResetAtTheEnd;
     let kit = Kit::broker_with_helper("sshv");
     apply(&kit);
     let installed = canonical_exe();
@@ -660,4 +601,172 @@ fn after_apply_verify_passes_through_a_session_the_password_prompt_started() {
     );
     agent_conn::assert_verify_session_rows(&shown);
     prompted.leave();
+}
+
+// What makes sshd reset connections =====
+
+/// Which parts of the sshd step a measurement makes the product's way (`true`) and which by hand, with plain
+/// `std::fs` calls (`false`).
+struct Product {
+    folder: bool,
+    drop_in: bool,
+    config: bool,
+}
+
+/// Make the folder, the drop-in and the `Include` line over the stock files, as `apply` does, each part the
+/// way `product` says.
+fn make_files(stock: &[u8], product: Product) {
+    let folder = drop_in_dir();
+    if product.folder {
+        create_install_dir(&folder).expect("make the folder the product's way");
+    } else {
+        std::fs::create_dir(&folder).expect("make the folder by hand");
+    }
+    let text = drop_in_text();
+    if product.drop_in {
+        let new = folder.join(format!("{DROP_IN_NAME}.ssh-broker-new"));
+        ensure_admin_only_file(&new).expect("make the new drop-in the product's way");
+        write_flushed(&new, text.as_bytes()).expect("write the new drop-in");
+        replace_file(&new, &drop_in_path()).expect("rename the new drop-in over the drop-in");
+    } else {
+        std::fs::write(drop_in_path(), text).expect("write the drop-in by hand");
+    }
+    let edited = with_line(stock, INCLUDE_LINE).expect("edit sshd_config");
+    if product.config {
+        let candidate = candidate_path();
+        write_flushed(&candidate, &edited).expect("write the candidate");
+        copy_file_security(&config_path(), &candidate).expect("copy the original's security to the candidate");
+        replace_file(&candidate, &config_path()).expect("rename the candidate over sshd_config");
+    } else {
+        std::fs::write(config_path(), edited).expect("write sshd_config by hand");
+    }
+}
+
+/// What a login that no account can complete shows of sshd: its class and the last ten lines of the client's
+/// output. A healthy sshd does the key exchange and ends with "Permission denied"; a broken one resets the
+/// connection.
+fn probe() -> (String, String) {
+    let mut ssh = Command::new("ssh");
+    ssh.args([
+        "-v",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "StrictHostKeyChecking=no",
+        "-o",
+        "UserKnownHostsFile=NUL",
+        "-o",
+        "ConnectTimeout=20",
+        "nobody-such-user@localhost",
+        "true",
+    ]);
+    let outcome = run_client(ssh, false, &std::env::temp_dir());
+    let text = format!("{}{}", String::from_utf8_lossy(&outcome.stdout), outcome.stderr);
+    let mut class = if text.contains("Permission denied") {
+        "HEALTHY"
+    } else if text.contains("Connection reset") {
+        "RESET"
+    } else {
+        "OTHER"
+    }
+    .to_owned();
+    match outcome.code {
+        Some(code) => class += &format!(" (ssh exit {code})"),
+        None => class += " (ssh did not end within the bound and was ended)",
+    }
+    let mut last: Vec<&str> = text.lines().rev().take(10).collect();
+    last.reverse();
+    (class, last.join("\n"))
+}
+
+/// One step of the measurement: sshd's files as `reset` leaves them, then `change`, then a restart of the
+/// service, then what the files look like, whether `sshd -t` passes, the probe, and sshd's own event logs.
+fn measure_step(label: &str, change: impl FnOnce(&[u8])) {
+    let stock = reset();
+    eprintln!("\n=== {label} ===");
+    change(stock);
+    restart_sshd();
+    for path in [config_path(), drop_in_dir(), drop_in_path()] {
+        let (_, shown) = run("icacls.exe", &[path.to_str().expect("a path of text")]);
+        eprintln!("--- icacls {} ---\n{shown}", path.display());
+    }
+    let (passes, said) = run("sshd", &["-t"]);
+    eprintln!("--- sshd -t {} ---\n{said}", if passes { "passes" } else { "FAILS" });
+    let (class, last) = probe();
+    eprintln!("--- probe: {class} ---\n{last}");
+    eprintln!("{}", sshd_event_logs(25));
+}
+
+/// Starts the sshd service again when the measurement ends, also when it fails: the tests after it need a
+/// running sshd.
+struct RunningAtTheEnd;
+
+impl Drop for RunningAtTheEnd {
+    fn drop(&mut self) {
+        if let Err(why) = try_restart_sshd() {
+            // A panic during an unwind aborts the test binary, and so does `eprintln!` on a closed stderr.
+            if std::thread::panicking() {
+                use std::io::Write as _;
+                let _ = writeln!(std::io::stderr(), "sshd was not started again: {why}");
+            } else {
+                panic!("sshd was not started again: {why}");
+            }
+        }
+    }
+}
+
+/// Measures, asserting nothing about the outcome: after the product's sshd step has run, sshd resets every
+/// connection right after the client's version line, and the cause is not known. Each step starts from the
+/// stock files and makes some parts of the step the product's way and the others by hand, restarts sshd and
+/// probes it; the output tells which part the resets follow. It runs alone, before any other test has changed
+/// sshd's files (the workflow's "Measure what makes sshd reset connections" step). Ends with the stock files
+/// and a running sshd.
+#[test]
+fn measure_which_part_of_the_sshd_step_makes_sshd_reset_connections() {
+    let _machine = machine::exclusive();
+    account_fixture::assert_elevated();
+    let _running = RunningAtTheEnd;
+    reset();
+    let _reset = ResetAtTheEnd;
+
+    let by_hand = || Product {
+        folder: false,
+        drop_in: false,
+        config: false,
+    };
+    measure_step("0: stock, untouched (the control)", |_| {});
+    measure_step("1: every part by hand, as the spike did it", |stock| {
+        make_files(stock, by_hand())
+    });
+    measure_step("2: the folder the product's way", |stock| {
+        make_files(
+            stock,
+            Product {
+                folder: true,
+                ..by_hand()
+            },
+        )
+    });
+    measure_step("3: the drop-in the product's way", |stock| {
+        make_files(
+            stock,
+            Product {
+                drop_in: true,
+                ..by_hand()
+            },
+        )
+    });
+    measure_step("4: sshd_config replaced the product's way", |stock| {
+        make_files(
+            stock,
+            Product {
+                config: true,
+                ..by_hand()
+            },
+        )
+    });
+    measure_step("5: the product's whole step", |_| {
+        let (accepted, said) = configure();
+        eprintln!("the step said (takes the variable: {accepted}):\n{said:#?}");
+    });
 }

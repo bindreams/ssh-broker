@@ -242,8 +242,8 @@ impl SshdHost for Machine {
 // files =====
 
 /// The file `path` holds `text`, and the text is on disk when this returns. A file that is there is truncated
-/// and keeps its security descriptor.
-fn write_flushed(path: &Path, text: &[u8]) -> anyhow::Result<()> {
+/// and keeps its security descriptor. Public for the sshd tests, which make the product's files its way.
+pub fn write_flushed(path: &Path, text: &[u8]) -> anyhow::Result<()> {
     let mut file = std::fs::File::create(path).with_context(|| format!("create {}", path.display()))?;
     file.write_all(text)
         .with_context(|| format!("write {}", path.display()))?;
@@ -252,8 +252,8 @@ fn write_flushed(path: &Path, text: &[u8]) -> anyhow::Result<()> {
 }
 
 /// Rename `from` over `to`, which is replaced, and return when the rename is on disk: a power loss after it
-/// cannot leave `to` empty.
-fn replace_file(from: &Path, to: &Path) -> anyhow::Result<()> {
+/// cannot leave `to` empty. Public for the sshd tests, as [`write_flushed`] is.
+pub fn replace_file(from: &Path, to: &Path) -> anyhow::Result<()> {
     let wide = |path: &Path| -> Vec<u16> { path.as_os_str().encode_wide().chain(Some(0)).collect() };
     let (from, to) = (wide(from), wide(to));
     // SAFETY: both strings are NUL-terminated and outlive the call.
