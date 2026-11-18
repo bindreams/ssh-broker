@@ -27,7 +27,7 @@ use crate::offer::{
 use crate::password_entry::{Password, Step};
 use crate::protocol::ElevationPolicy;
 use crate::provision::procwait;
-use crate::socket_loc::{Integrity, SocketLocation};
+use crate::socket_loc::{Integrity, SocketLocation, StepDown};
 use crate::socket_watch::SocketWatch;
 use crate::userdir::SocketDir;
 use crate::{provision, starting_agent};
@@ -135,10 +135,10 @@ impl AlwaysRefusal {
 }
 
 /// Decide the [`Stance`] of a login that `asked` for a level (`None`: it set nothing) with a token with
-/// `elevation` at the folder level `integrity`, which is read once and lent, so that the rule of the fail-open
-/// shell ([`crate::account::step_down`]) is given the same read. The shim's own level is the level of the agent it would
-/// reach, so `always` is decided here and nowhere later: an elevated session cannot be had by a filtered token
-/// at any level, nor below High, nor when the level cannot be read. The logon kind follows `integrity`, as the
+/// `elevation` at the folder level `integrity`, which is read once and lent. The shim's own level is the level
+/// of the agent it would reach, so `always` is decided here, before anything connects: a filtered token is
+/// refused at any level, and at the others [`account::step_down`], the one rule that decides the level cases and
+/// that the fail-open shell applies to the same read, answers. The logon kind follows `integrity`, as the
 /// folder does, so the agent the offer starts serves the folder the shim waits on (High: batch, which UAC does
 /// not split; below: interactive). A filtered token gets the plain shell at any level.
 pub fn stance(
@@ -147,11 +147,21 @@ pub fn stance(
     integrity: &anyhow::Result<Integrity>,
 ) -> Stance {
     if asked == Some(ElevationPolicy::Always) {
-        match (&elevation, integrity) {
-            (Ok(Elevation::Filtered), _) => return Stance::Refused(AlwaysRefusal::Filtered),
-            (_, Err(cause)) => return Stance::Refused(AlwaysRefusal::LevelUnreadable(format!("{cause:#}"))),
-            (_, Ok(Integrity::Medium)) => return Stance::Refused(AlwaysRefusal::BelowHigh),
-            (_, Ok(Integrity::High)) => {}
+        if matches!(elevation, Ok(Elevation::Filtered)) {
+            return Stance::Refused(AlwaysRefusal::Filtered);
+        }
+        // `step_down` takes the level by value; the copy carries the cause as it reads, so that the root cause
+        // of the error the rule returns is the sentence the user is shown.
+        let level = integrity.as_ref().copied().map_err(|cause| format!("{cause:#}"));
+        let rule = account::step_down(
+            asked,
+            || level.map_err(anyhow::Error::msg),
+            || -> anyhow::Result<()> { unreachable!("step_down makes no token for `always`") },
+        );
+        match rule {
+            Ok(StepDown::Refused) => return Stance::Refused(AlwaysRefusal::BelowHigh),
+            Err(cause) => return Stance::Refused(AlwaysRefusal::LevelUnreadable(cause.root_cause().to_string())),
+            Ok(_) => {}
         }
     }
     match (&elevation, integrity) {
@@ -168,9 +178,7 @@ pub fn stance(
     }
 }
 
-/// Whether a run ends at once, quietly, with exit 0: the command is blank and the login is not refused. A
-/// refusal comes first, so a login that asked for `always` and cannot have it is refused also with a blank
-/// command; a blank command then ends the run before anything else of the stance is acted on or said.
+/// Whether the run ends at once with exit 0 and no output: the command is blank and the login is not refused.
 pub fn blank_command_ends_run(stance: &Stance, blank_command: bool) -> bool {
     blank_command && !matches!(stance, Stance::Refused(_))
 }

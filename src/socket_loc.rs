@@ -56,12 +56,10 @@ pub enum Elevation {
     Standard,
 }
 
-/// What a session of a login is started with ([`crate::account::step_down`], which the shim, a host-testable
-/// module, takes the answer of): it sits here, beside [`Integrity`] and [`Elevation`], so that it exists on
-/// every host.
+/// What a session of a login is started with: the answer of [`crate::account::step_down`].
 #[derive(Debug, PartialEq, Eq)]
 pub enum StepDown<K> {
-    /// The stepped-down token `K` in place of this process's own.
+    /// The stepped-down token, in place of this process's own.
     Token(K),
     /// This process's own token: at High the login asked for an elevated session, below High what a
     /// process starts is unelevated anyway.

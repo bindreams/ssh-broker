@@ -104,8 +104,8 @@ pub(super) enum Spawn<'a> {
 /// started, or there is no `verb`, `warn` gets the warning's text just before the shell is spawned
 /// as a [`Spawn::Line`].
 ///
-/// A [`Launched`] that is not a shell has no warning of its own, and shows one that was added
-/// ([`Launched::add_notice`]) through `warn`, just before it is spawned.
+/// A notice added with [`Launched::add_notice`] is shown through `warn` before the spawn, even when the launch
+/// is not a shell.
 ///
 /// With what started comes the configured shell it is, so the caller can warn if it ends with the
 /// loader's "DLL not found" status (see [`ConfiguredShell`]); `None` for a direct launch, the

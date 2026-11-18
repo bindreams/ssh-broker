@@ -179,9 +179,8 @@ fn next_login_number() -> u32 {
 }
 
 /// A key pair for `account`, the public half installed where sshd reads it: the account's profile, or for an
-/// administrator ([`Account::make_administrator`] first) the administrators' file, appended to. With
-/// `forced_command` the key carries `command="..."`, as a key that forces a command does.
-pub fn install_key(account: &Account, forced_command: Option<&str>) -> Keys {
+/// administrator ([`Account::make_administrator`] first) the administrators' file, appended to.
+pub fn install_key(account: &Account) -> Keys {
     let n = next_login_number();
     let dir = TempDir(std::env::temp_dir().join(format!("sb-sshkey-{}-{}-{n}", account.name, std::process::id())));
     let _ = std::fs::remove_dir_all(&dir.0);
@@ -195,10 +194,7 @@ pub fn install_key(account: &Account, forced_command: Option<&str>) -> Keys {
     // The ssh client refuses a private key other accounts can read.
     icacls(&dir.0, "S-1-5-18");
     let public = std::fs::read_to_string(dir.0.join("id.pub")).unwrap();
-    let line = match forced_command {
-        Some(command) => format!("command=\"{command}\" {}\n", public.trim_end()),
-        None => format!("{}\n", public.trim_end()),
-    };
+    let line = format!("{}\n", public.trim_end());
     // Each login of an account adds its own key: a second login of the same account keeps the first one's.
     let (authorized_keys, readers) = if account.is_administrator() {
         // Only SYSTEM and Administrators: the account's own entry would make sshd refuse the file.
@@ -412,21 +408,11 @@ pub struct Login<'a> {
 
 impl<'a> Login<'a> {
     pub fn new(kit: &Kit, account: &'a Account) -> Login<'a> {
-        Login::with_key(kit, account, None)
-    }
-
-    /// A login whose key forces `command` (`command="..."` in `authorized_keys`): sshd runs it whatever the
-    /// client asked for, and gives the client's own command in `SSH_ORIGINAL_COMMAND`.
-    pub fn forcing(kit: &Kit, account: &'a Account, command: &str) -> Login<'a> {
-        Login::with_key(kit, account, Some(command))
-    }
-
-    fn with_key(kit: &Kit, account: &'a Account, forced_command: Option<&str>) -> Login<'a> {
         accept_elevation_variable();
         admit(account);
         Login {
             account,
-            keys: install_key(account, forced_command),
+            keys: install_key(account),
             stderr_path: kit.path(&format!("ssh-stderr-{}-{}.txt", account.name, next_login_number())),
         }
     }

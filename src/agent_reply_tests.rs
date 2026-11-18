@@ -357,7 +357,7 @@ fn a_working_config_shows_no_warning() {
 
 // The elevation policy of a login -----
 
-/// A `Launch::Shell` request in `mode` that asked for `elevation`.
+/// [`request_asking`] for a login that did set the variable.
 fn request_for(
     mode: Mode,
     command: Option<&str>,
@@ -456,7 +456,6 @@ fn agent_refuses_always_with_an_unreadable_level_and_does_not_tell_it_to_ask_for
 fn agent_refuses_always_below_high_with_the_sentence_and_starts_nothing() {
     for (tag, mode, command) in REQUESTS {
         let hooks = Hooks {
-            // The rule with the level fixed below High.
             make_unelevated: |policy| {
                 crate::account::step_down(
                     policy,
@@ -483,7 +482,6 @@ fn agent_refuses_always_below_high_with_the_sentence_and_starts_nothing() {
     }
 }
 
-/// The policies the maker of `an_account_login_makes_no_token` was called with.
 static MADE_FOR: std::sync::Mutex<Vec<Option<ElevationPolicy>>> = std::sync::Mutex::new(Vec::new());
 
 /// The agent hands the login's policy to the maker, once, and starts with no token when it answers `Own`.
@@ -540,11 +538,9 @@ fn at_high(tag: &str, policy: ElevationPolicy, host: TestHost, mode: Mode, comma
     let _ = answered(tag, recording, request_for(mode, command, policy));
 }
 
-/// The tests that read [`STARTS`] hold this for their whole run: the starters are plain function pointers and
-/// record into the one list.
+/// Serialises the tests that read [`STARTS`]: the starters are plain function pointers recording into one list.
 static STARTS_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// The starts recorded since the last call.
 fn taken_starts() -> Vec<(&'static str, bool, bool)> {
     std::mem::take(&mut *STARTS.lock().unwrap())
 }

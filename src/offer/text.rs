@@ -64,7 +64,7 @@ pub fn unknown_elevation(value: &str) -> String {
 /// own line break, and the shim ([`always_below_high`]) say one sentence.
 pub const ALWAYS_BELOW_HIGH_WHAT: &str =
     "this login asked for SSH_BROKER_ELEVATION=always, and this account's sessions cannot be elevated here";
-/// See [`ALWAYS_BELOW_HIGH_WHAT`].
+/// The cause half of [`ALWAYS_BELOW_HIGH_WHAT`].
 pub const ALWAYS_BELOW_HIGH_CAUSE: &str = "its agent does not run at High. Nothing was run.";
 
 /// The whole line the shim prints when it refuses a login that asked for `always` below High.
@@ -74,7 +74,7 @@ pub fn always_below_high() -> String {
 
 /// What a login that asked for `always` is told when the level of this process cannot be read, so whether it can
 /// be given an elevated session is not known: the one thing it must not be told is to ask for `always`.
-/// The agent's reply writes `ssh-broker: {what}: {cause}` and its own line break.
+/// Split into what and cause as [`ALWAYS_BELOW_HIGH_WHAT`] is.
 pub const ALWAYS_LEVEL_UNREADABLE_WHAT: &str = "this login asked for SSH_BROKER_ELEVATION=always, and it cannot be told whether an elevated session can be given, so nothing was run";
 
 /// The whole line the shim prints when it refuses a login that asked for `always`, because the level of its own
@@ -93,8 +93,8 @@ pub fn always_filtered() -> String {
 }
 
 /// What a login that asked for a level is told when its unelevated session cannot be made: nothing was run, and
-/// the two ways out are to ask for nothing or for `always`. The agent's failure reply writes
-/// `ssh-broker: {what}: {cause}` and its own line break, so it takes this as the `what`.
+/// the two ways out are to ask for nothing or for `always`. Split into what and cause as
+/// [`ALWAYS_BELOW_HIGH_WHAT`] is.
 pub const UNELEVATED_UNAVAILABLE_WHAT: &str = "could not prepare an unelevated session, so nothing was run (a login that leaves SSH_BROKER_ELEVATION unset gets the token it was given, with a notice, and one that sets it to always gets the session as it is)";
 
 /// The `what` of a login that `asked` for a level and cannot be stepped down: for `always` the level of the process
@@ -115,9 +115,7 @@ pub fn unelevated_unavailable(asked: Option<ElevationPolicy>, cause: &str) -> St
 /// Whose token a session has when a login that set nothing could not be stepped down ([`unelevated_fallback`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FallbackToken {
-    /// The shim's: what sshd gave the login.
     Sshd,
-    /// The agent's own.
     Agent,
 }
 

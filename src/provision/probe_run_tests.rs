@@ -13,7 +13,7 @@ use crate::account::{INTEGRITY_HIGH, INTEGRITY_MEDIUM};
 use crate::protocol::ElevationPolicy;
 use crate::provision::probe::{ProbeResult, SymlinkState, UpstreamState};
 use crate::provision::session_rows::parity_rows;
-use crate::socket_loc::Elevation;
+use crate::socket_loc::{Elevation, StepDown};
 use crate::test_support::Scratch;
 
 fn answer(elevation: Elevation, integrity: u32, symlink: Option<SymlinkState>, said: &str) -> ProbeOutcome {
@@ -35,7 +35,8 @@ fn answer(elevation: Elevation, integrity: u32, symlink: Option<SymlinkState>, s
 
 /// What each probe of a run is asked, in order, and how the stand-in answers each: a probe that is told to
 /// make a directory makes it (as the real one does, with a junction in it that leads to a folder outside
-/// it); the one that asks for an unelevated session then answers with `made`, any other with `followed`.
+/// it); the answer is `made` for a probe that `account::step_down` gives a token and `followed` for one that
+/// it gives the agent's own.
 struct Probing {
     made: fn() -> ProbeOutcome,
     followed: fn() -> ProbeOutcome,
@@ -72,11 +73,10 @@ impl Probing {
             if let ProbeLink::Make(dir) = &link {
                 self.make(Path::new(dir));
             }
-            // Below High the one probe is the account's own and answers as the default probe does.
-            match elevation {
-                ElevationPolicy::Always => (self.followed)(),
-                _ if integrity == Integrity::High => (self.made)(),
-                _ => (self.followed)(),
+            match crate::account::step_down(Some(elevation), || Ok(integrity), || Ok(())) {
+                Ok(StepDown::Token(())) => (self.made)(),
+                Ok(StepDown::Own) => (self.followed)(),
+                other => panic!("a probe asking for {elevation:?} at {integrity:?} gets {other:?}"),
             }
         })
     }
@@ -184,8 +184,7 @@ fn an_agent_at_high_gets_two_probes_with_one_directory_which_is_removed() {
     assert!(note.contains("made it") && note.contains("refused"), "{note}");
 }
 
-/// The probe that makes the junction asks for an unelevated session (the default), and the one that follows it
-/// for an elevated one: the order of the two is what makes RedirectionGuard's refusal visible.
+/// The junction is made by the default (unelevated) probe and followed by the `always` probe, in that order.
 #[test]
 fn an_agent_at_high_is_probed_with_prompt_then_always() {
     let scratch = Scratch::new();

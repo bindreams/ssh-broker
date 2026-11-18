@@ -467,8 +467,8 @@ fn the_fallback_notice_says_whose_token_the_session_has_and_that_a_login_that_se
     assert!(!text::unelevated_fallback("c", text::FallbackToken::Sshd).contains('\n'));
 }
 
-/// An ordinary SSH login is unelevated now, so the sentences about the filtered login and the agent that
-/// serves elevated processes no longer send anyone to one.
+/// The sentences about the filtered login and the elevated agent do not send anyone to an elevated prompt for
+/// an ordinary SSH login.
 #[test]
 fn the_filtered_sentences_do_not_call_an_ordinary_ssh_login_the_way_to_an_elevated_agent() {
     assert_eq!(

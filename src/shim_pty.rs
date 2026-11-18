@@ -54,15 +54,9 @@ const EVT_FOCUS: u16 = 0x0010;
 /// corrupting an interactive PTY). The log guard is flushed before every `process::exit`,
 /// since `process::exit` runs no destructors and the log is the only PTY-mode diagnostic.
 ///
-/// What the login asked of elevation is read first, once the log is open, from [`ElevationPolicy::VARIABLE`]
-/// in the environment sshd gave the shim: a value that is not one of the four words ends the run with a
-/// sentence and exit 255, before anything else, and a variable that is not set is a login that asked nothing.
-/// A `-c` session then resolves its command: `detect` says how sshd encoded it (see [`resolve_exec`]). Nothing
-/// on the command line is interpreted. The command and what was asked make the one [`Login`] that the relay and
-/// the fail-open shell ([`fail_open`], which applies the one rule to it, to the level [`stance`] was given) are
-/// given. A login that asked for `always` and cannot have it is refused by [`stance`], before anything
-/// connects and also when its command is blank; any other blank command then ends the run
-/// ([`blank_command_ends_run`]), exit 0 and silent.
+/// A refusal by [`stance`] comes before a blank command ends the run, so a login that asked for `always` and
+/// cannot have it is refused even with a blank command. A value of the variable that is not one of the four
+/// words ends the run first, exit 255.
 pub fn run_on(exec: Option<RawExec>, detect: impl FnOnce() -> Encoding) -> anyhow::Result<()> {
     // Walk first and keep the result: the folders it holds cannot be swapped, so the log and connect reach
     // them and no others.
@@ -103,7 +97,6 @@ pub fn run_on(exec: Option<RawExec>, detect: impl FnOnce() -> Encoding) -> anyho
     // The level is read once: the stance and the fail-open shell's rule below are given this one result.
     let level = crate::account::integrity();
     let decided = stance(login.elevation, crate::account::elevation(), &level);
-    // A blank command ends the run here, after a refusal and before the rest of the stance is acted on.
     let blank = login.exec.as_ref().is_some_and(|exec| is_blank_command(&exec.command));
     if blank_command_ends_run(&decided, blank) {
         drop(log); // flush: `process::exit` runs no destructors
@@ -112,7 +105,6 @@ pub fn run_on(exec: Option<RawExec>, detect: impl FnOnce() -> Encoding) -> anyho
     let relayed = match decided {
         Stance::Refused(refusal) => {
             tracing::error!("refused a login that asked for SSH_BROKER_ELEVATION=always: {refusal:?}");
-            // The sentence carries its own line break (the agent's reply shares it).
             let _ = std::io::stderr().write_all(refusal.message().as_bytes());
             drop(log); // flush: `process::exit` runs no destructors
             std::process::exit(255)

@@ -167,8 +167,8 @@ pub fn integrity() -> anyhow::Result<Integrity> {
     Ok(integrity_class(integrity_of(own_token()?.0)?))
 }
 
-/// What a session of a login that `asked` for a level is started with in this process: the one rule that the
-/// agent, the shim failing open and the filtered shim all use. `None` is a login that set nothing.
+/// What a session of a login that `asked` for a level is started with in this process: the one rule. `None` is a
+/// login that set nothing.
 ///
 /// | asked | at High | below High |
 /// |---|---|---|

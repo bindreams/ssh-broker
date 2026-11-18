@@ -202,9 +202,8 @@ fn try_end(
         held.len()
     ));
 
-    // A session is unelevated by default, and an unelevated process cannot connect to an agent at High, so
-    // `logout` run in such a session cannot reach it. It asks for the agent's own token there until the
-    // request socket lets the default session end an elevated agent.
+    // An unelevated session cannot connect to an agent at High, so `logout` there cannot reach it: ask for the
+    // agent's own token.
     let elevation = match integrity {
         Integrity::High => ElevationPolicy::Always,
         Integrity::Medium => ElevationPolicy::DEFAULT,

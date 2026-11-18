@@ -203,8 +203,7 @@ fn an_unreadable_integrity_level_still_relays_but_offers_nothing_and_keeps_the_c
     }
 }
 
-/// The shim's own level is the level of the agent it would reach, so `always` is decided before anything
-/// connects or is offered: below High it cannot be given, at any elevation of the token.
+/// `always` below High is refused at any elevation of the token.
 #[test]
 fn always_below_high_is_refused_before_anything_connects() {
     for elevation in [Elevation::Standard, Elevation::Filtered] {
@@ -215,7 +214,6 @@ fn always_below_high_is_refused_before_anything_connects() {
         };
         assert_eq!(got, Stance::Refused(expected), "{elevation:?}");
     }
-    // The elevation that cannot be read does not make it a relay: the level alone says it cannot be given.
     assert_eq!(
         stance(
             Some(ElevationPolicy::Always),
@@ -249,8 +247,7 @@ fn always_at_high_relays_for_a_token_that_can_be_elevated() {
     );
 }
 
-/// An administrator's token with elevation removed can never be given an elevated session, at any level, and
-/// the level that cannot be read does not matter to that.
+/// `always` for a filtered token is refused at every level, readable or not.
 #[test]
 fn always_for_a_filtered_token_is_refused_at_every_level() {
     for integrity in [AT_MEDIUM, AT_HIGH, Err(anyhow::anyhow!("the level cannot be read"))] {
@@ -261,8 +258,7 @@ fn always_for_a_filtered_token_is_refused_at_every_level() {
     }
 }
 
-/// A login that asked for `always` is refused when the level cannot be read, with the cause, and is never
-/// relayed on a guess.
+/// `always` with an unreadable level is refused with the cause.
 #[test]
 fn always_with_an_unreadable_level_is_refused_with_the_cause() {
     for elevation in [Ok(Elevation::Full), Ok(Elevation::Standard), Err(anyhow::anyhow!("x"))] {
@@ -294,8 +290,7 @@ fn the_other_policies_are_not_refused_at_any_level() {
     }
 }
 
-/// A blank command ends the run with exit 0 and no output, except that a login that asked for `always` and
-/// cannot have it is refused first: the refusal is the stance's, and nothing else of the stance is acted on.
+/// A blank command ends the run, unless the stance is a refusal.
 #[test]
 fn a_blank_command_ends_the_run_quietly_unless_the_login_is_refused() {
     let cases = [
@@ -323,29 +318,7 @@ fn a_blank_command_ends_the_run_quietly_unless_the_login_is_refused() {
     }
 }
 
-/// One read of the level goes to the stance and to the rule the fail-open shell applies, so they agree on
-/// `always`: the stance refuses it exactly where the rule does not give an elevated session.
-#[test]
-fn the_stance_and_the_step_down_rule_agree_on_always_for_one_read_of_the_level() {
-    use crate::account::step_down;
-    use crate::socket_loc::StepDown;
-    for level in [AT_MEDIUM, AT_HIGH] {
-        let stance = stance(Some(ElevationPolicy::Always), Ok(Elevation::Standard), &level);
-        let rule = step_down(Some(ElevationPolicy::Always), || level, || Ok(())).unwrap();
-        assert_eq!(
-            matches!(stance, Stance::Refused(_)),
-            rule == StepDown::Refused,
-            "{stance:?} / {rule:?}"
-        );
-    }
-    let unreadable: anyhow::Result<Integrity> = Err(anyhow::anyhow!("the level cannot be read"));
-    let stance = stance(Some(ElevationPolicy::Always), Ok(Elevation::Standard), &unreadable);
-    let rule = step_down(Some(ElevationPolicy::Always), || unreadable, || Ok(())).unwrap_err();
-    assert!(matches!(stance, Stance::Refused(AlwaysRefusal::LevelUnreadable(_))));
-    assert!(format!("{rule:#}").contains("the level cannot be read"), "{rule:#}");
-}
-
-/// What the shim says for each refusal is the sentence of `offer::text` for it, with its line break.
+/// Each refusal says the sentence of `offer::text` for it.
 #[test]
 fn each_refusal_says_its_own_sentence() {
     assert_eq!(AlwaysRefusal::BelowHigh.message(), text::always_below_high());

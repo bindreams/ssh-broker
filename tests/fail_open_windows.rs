@@ -117,8 +117,7 @@ fn run_shim_child(line: &str, home: &Home) -> std::process::Output {
 }
 
 /// [`run_shim_child`] with more environment: what sshd sets for a session, `SSH_ORIGINAL_COMMAND` for one and
-/// `SSH_BROKER_ELEVATION` for a login that asks for a level. Both are otherwise unset, whatever the test's own
-/// environment holds.
+/// `SSH_BROKER_ELEVATION` for a login that asks for a level.
 fn run_shim_child_with_env(line: &str, home: &Home, env: &[(&str, &str)]) -> std::process::Output {
     std::process::Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "shim_child", "--ignored", "--nocapture"])
@@ -292,9 +291,7 @@ fn an_unknown_value_fails_the_login_and_runs_nothing() {
 
 /// Elevated (CI only). The process here is at High, as sshd's token for an administrator is. The fail-open shell of
 /// a login that sets no variable, or `never`, `prompt` or `auto-approve`, is unelevated (Medium, Administrators
-/// deny-only); one that asks for `always` has this process's own token. A level this process is below High for,
-/// where `always` is refused, is the CI test `an_administrators_fail_open_shell_follows_the_same_rule` and the
-/// unit tests of `shim::fail_open`.
+/// deny-only); one that asks for `always` has this process's own token.
 #[test]
 fn the_failopen_shell_follows_the_same_rule() {
     assert_eq!(

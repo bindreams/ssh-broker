@@ -382,16 +382,10 @@ pub fn decide_fallback(connect_err: bool) -> Fallback {
 /// it started and returns its exit code. Only a failed `start` falls back to another line: once
 /// the shell runs, a failure of `finish` is reported and nothing is run again.
 ///
-/// A login that did not ask for `always` would otherwise get sshd's own token, which an administrator's is
-/// elevated. `unelevate` is given what the login asked of elevation and returns what the session's lines are
-/// started with: the stepped-down token, or this process's own ([`StepDown::Own`]: `always` at High, or a
-/// process below High, where what it starts is unelevated anyway). It is called once, first. A
-/// [`StepDown::Refused`] (`always` below High) prints [`text::always_below_high`] and exits 255 with nothing
-/// started. If it fails, the login asked for a level and is refused with a message that names both ways out
-/// ([`text::unelevated_unavailable`]) and 255 and no shell: an elevated shell is the one thing a session that
-/// asked for less must not get. A login that set nothing is not refused: on [`StepDown::Fallback`] it gets the
-/// shell with the token sshd gave it, after the notice [`text::unelevated_fallback`]. A replacement line is
-/// started with the token too.
+/// Starts the session's lines with what [`crate::account::step_down`] returns for `unelevate(asked)`, called
+/// once and first: `Refused` prints [`text::always_below_high`] and exits 255; an error is refused with
+/// [`text::unelevated_unavailable`] when the login asked for a level; `Fallback` runs the shell with sshd's
+/// token after [`text::unelevated_fallback`]. A replacement line is started with the same token.
 ///
 /// The shell is resolved here, in the shim's own environment (`host`), by the one function the agent
 /// uses ([`shell::plan`]). When the configured shell cannot be used, the built-in `cmd.exe` runs
@@ -428,7 +422,6 @@ pub fn fail_open<T, K>(
         }
         Ok(StepDown::Refused) => {
             tracing::error!("fail-open refused a login that asked for SSH_BROKER_ELEVATION=always below High");
-            // The sentence carries its own line break (it is the agent's reply too).
             let _ = stderr.write_all(text::always_below_high().as_bytes());
             return 255;
         }

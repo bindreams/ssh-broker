@@ -61,7 +61,7 @@ use whoami_groups::{TokenShown, token_shown};
 /// none); a second connection while the first is open uses the same agent; and the session is still
 /// there for a third after every connection has gone (the agent is not in sshd's job). A login that sets no
 /// variable gets this standard account the token its own command has, `always` is refused naming the variable
-/// (the account's agent is below High), and the old reserved word is an ordinary command. Last, two first
+/// (the account's agent is below High), also with a blank command, and `internal-unelevated` is an ordinary command. Last, two first
 /// connections of another new account at once.
 #[test]
 fn prompt_path_through_real_sshd() {
@@ -102,20 +102,23 @@ fn prompt_path_through_real_sshd() {
     eprintln!("M8 the relayed session showed:\n{}", first.text());
 
     // A login that sets no variable, for an account below High: the agent serves it, at the token the account's
-    // own command has. `always` cannot be given there and is refused, naming the variable. The old word is a
+    // own command has. `always` cannot be given there and is refused, naming the variable. The word is a
     // program like any other.
     assert_eq!(
         token_of_command(&kit, &login, None, "whoami /groups", Server::Agent),
         TokenShown::new("Medium", "absent"),
         "the ordinary account's own command"
     );
-    assert_refused_naming_the_variable(
-        &kit,
-        &login,
-        "always",
-        "whoami /groups",
-        ssh_broker::offer::text::ALWAYS_BELOW_HIGH_WHAT,
-    );
+    // A blank command (one space, as `fail_open_windows` sends it) is refused too, not ended with exit 0.
+    for remote in ["whoami /groups", " "] {
+        assert_refused_naming_the_variable(
+            &kit,
+            &login,
+            "always",
+            remote,
+            ssh_broker::offer::text::ALWAYS_BELOW_HIGH_WHAT,
+        );
+    }
     assert_the_old_word_is_an_ordinary_command(&kit, &login);
 
     // 3. A second connection while the first is open: no prompt, the same agent.
@@ -326,7 +329,7 @@ fn assert_refused_naming_the_variable(kit: &Kit, login: &Login<'_>, asking: &str
     );
 }
 
-/// `ssh host internal-unelevated whoami /groups`: the word is a program like any other now. The shell runs a
+/// `ssh host internal-unelevated whoami /groups`: the word is a program like any other. The shell runs a
 /// program of that name and fails as it does for one that is not there, and no token is shown.
 fn assert_the_old_word_is_an_ordinary_command(kit: &Kit, login: &Login<'_>) {
     let (outcome, shown) =
@@ -406,7 +409,6 @@ fn an_administrators_session_through_real_sshd_is_unelevated_unless_the_login_as
         unelevated,
         "the login's own shell is not unelevated"
     );
-    // No variable, and the three levels that start unelevated.
     for asking in [None, Some("never"), Some("prompt"), Some("auto-approve")] {
         assert_eq!(
             token_of_command(&kit, &login, asking, "whoami /groups", Server::Agent),
@@ -419,7 +421,6 @@ fn an_administrators_session_through_real_sshd_is_unelevated_unless_the_login_as
         unelevated,
         "no variable, with a terminal"
     );
-    // `always`: the agent's own token, with and without a terminal, and for a shell.
     assert_eq!(
         token_of_command(&kit, &login, Some("always"), "whoami /groups", Server::Agent),
         elevated,
@@ -439,7 +440,6 @@ fn an_administrators_session_through_real_sshd_is_unelevated_unless_the_login_as
     );
     shell.leave();
 
-    // A value that is not one of the four words, as sshd hands it over.
     for value in ["Always", "sometimes"] {
         assert_unknown_value_runs_nothing(&kit, &login, value);
     }

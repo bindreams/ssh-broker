@@ -299,8 +299,7 @@ fn a_version_1_handshake_is_refused_with_the_version_message() {
     );
 }
 
-/// The last field changed its meaning when a login that set nothing was told apart from one that set
-/// `prompt`: a peer that says 3 reads the byte as the old four-word value.
+/// The version is 4: the elevation field's wire layout differs from version 3.
 #[test]
 fn the_wire_version_is_4() {
     assert_eq!(PROTOCOL_VERSION, 4);
@@ -414,7 +413,7 @@ fn a_peer_of_another_version_is_still_refused_by_name() {
     );
 }
 
-/// A shim or agent of version 2 is refused by name: its handshake has no `elevation`.
+/// A peer of another version is refused by its number.
 #[test]
 fn a_version_2_handshake_is_refused_with_the_version_message() {
     #[derive(serde::Serialize)]
@@ -445,8 +444,7 @@ fn a_version_2_handshake_is_refused_with_the_version_message() {
     assert!(error.contains("peer 2") && error.contains("ours 4"), "{error}");
 }
 
-/// A shim or agent of version 3 is refused by name: its last field is one of four words, which this
-/// build would read as "asked" or "set nothing".
+/// A peer of another version is refused by its number.
 #[test]
 fn a_version_3_handshake_is_refused_with_the_version_message() {
     #[derive(serde::Serialize)]

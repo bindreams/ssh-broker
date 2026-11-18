@@ -80,8 +80,7 @@ fn run_at_medium(dir: &Path, drive: Drive) -> Probes {
     }
 }
 
-/// The two probes of an agent at High, in order: the unelevated probe (`prompt`) makes the junction in `dir`,
-/// and the default probe, which asks for `always`, follows it.
+/// The two probes of an agent at High, in the order [`run`] gives.
 fn run_at_high(dir: &Path, drive: Drive) -> Probes {
     let unelevated = drive(ElevationPolicy::DEFAULT, make_link(dir));
     let source = source_of(dir, &unelevated);

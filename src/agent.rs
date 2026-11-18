@@ -789,9 +789,8 @@ fn handle_connection_in(conn: socket2::Socket, hooks: Hooks, control: &Control) 
         }
     };
     // Once, before anything is started, and given to every start of the session: the line, and the
-    // `console-fallback` verb, whose child inherits it. A login that asked for a level it cannot have is
-    // refused, not given the agent's own token or another level; one that asked for nothing and cannot be
-    // stepped down is given the agent's own token, and told so as the first data of the session.
+    // `console-fallback` verb, whose child inherits it. What each answer of the rule means is on
+    // `crate::account::step_down`.
     let unelevated = match (hooks.make_unelevated)(hs.elevation) {
         Ok(StepDown::Token(token)) => Some(token),
         Ok(StepDown::Own) => None,

@@ -3,8 +3,7 @@
 //! `std::env::args` has already split and unquoted the command line, which loses the exact
 //! command sshd sent: see [`decode_command`] for the two forms it arrives in, and
 //! [`detect`] for how the shim tells them apart. [`resolve_exec`] is the step from what
-//! `route` finds to the command. Nothing on the command line is interpreted: the command goes to the
-//! shell as the client sent it.
+//! `route` finds to the command, which goes to the shell as the client sent it.
 
 use crate::protocol::ElevationPolicy;
 
