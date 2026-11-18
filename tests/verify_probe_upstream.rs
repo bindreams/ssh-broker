@@ -165,7 +165,10 @@ fn a_probe_given_a_path_that_exists_makes_no_junction_and_leaves_it_alone() {
     let stdout = run_verify_probe_with(&["--make-junction", dir.to_str().unwrap()], &temp.0, b"");
 
     let line = probe_line(&stdout);
-    assert!(line.contains("symlink=skip"), "expected symlink=skip, got: {line}");
+    assert!(
+        line.contains("symlink=notmade"),
+        "expected symlink=notmade, got: {line}"
+    );
     assert_eq!(std::fs::read(dir.join("keep.txt")).unwrap(), b"keep");
     assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1, "nothing was added");
 }

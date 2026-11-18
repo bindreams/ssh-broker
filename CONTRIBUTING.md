@@ -167,13 +167,18 @@ makes that directory with a junction in it by a token below High, then `verify-p
 the account, which reads through it. `verify` names the directory itself, under its own temp directory with a
 name unique to the run, before any probe runs, and removes it, through no link, whatever became of either
 probe: no probe reports a path, because a path a process below High wrote is not one an elevated `verify`
-acts on. The make-probe fails on a path that exists and never clears one. A probe that fails is data, not an
-early return: the default probe still runs (with a junction of its own, which proves nothing and is not
-judged), so only the rows about the failed probe fail. A junction needs no privilege, but it needs a volume
-that holds reparse points: one that could not be *made* is `SymlinkState::Skipped`, which fails nothing and
-says on the row that it was not tested and why; one that was made and refused with error 448 is `Blocked`,
-and one that was made and not read is `Failed`, and both fail. The probe's stderr lines about the junction
-(`probe::JUNCTION_SAID`) reach the row. For an agent below High there is one probe, which makes and follows
+acts on. The make-probe fails on a path that exists and never clears one. Each probe's outcome is a value
+(`session_rows::ProbeOutcome`: answered, failed, timed out, not run) and `probe_run::run_at` returns them
+all, so the rows are a pure function of what it found. A probe that fails is data, not an early return: the
+default probe still runs (with a junction of its own, which proves nothing and is not judged), so only the
+rows about the failed probe fail; a first probe that times out starts no second, and `verify` says that it
+may still create the directory. A junction counts as made from below High only when the make-probe reports an
+integrity below High and made the junction; otherwise the junction row fails with why. A junction needs no
+privilege, but it needs a volume that holds reparse points: where the directory was made and the volume
+refused the reparse point the state is `SymlinkState::Skipped`, which fails nothing and says on the row that
+it was not tested and why; a directory that could not be made at all is `NotMade`, a junction refused with
+error 448 is `Blocked`, and one that was made and not read is `Failed`, and all three fail. The probe's
+stderr lines about the junction (`probe::JUNCTION_SAID`) reach the row. For an agent below High there is one probe, which makes and follows
 its own. The probe's PROBE line also carries its own `elevation` and `integrity` (read by
 `account::elevation_of` and `integrity_of`), which the `elevated session` and `unelevated session on request`
 rows judge. The two probes and the two rows are keyed on the agent being at High (the level of the process

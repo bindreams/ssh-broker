@@ -201,17 +201,30 @@ fn symlink_states_round_trip() {
         SymlinkState::Ok,
         SymlinkState::Blocked,
         SymlinkState::Failed,
+        SymlinkState::NotMade,
         SymlinkState::Skipped,
     ] {
         let line = format_probe_line(&bare(2, st, UpstreamState::Ok));
         assert_eq!(parse_probe_line(&line).unwrap().symlink, st);
     }
-    // A junction that was refused, and one that was made and not read, fail. One that could not be made
-    // was not tested, which fails nothing.
+    // A junction that was refused, one that was made and not read, and a directory that could not be made
+    // fail. A volume that refused the junction was not tested, which fails nothing.
     assert!(SymlinkState::Blocked.is_failure());
     assert!(SymlinkState::Failed.is_failure());
+    assert!(SymlinkState::NotMade.is_failure());
     assert!(!SymlinkState::Skipped.is_failure());
     assert!(!SymlinkState::Ok.is_failure());
+}
+
+/// The one rule for whether a probe made a junction: it did when it went on to read through it, and
+/// not when it stopped at the directory or at the volume.
+#[test]
+fn only_a_probe_that_read_through_its_junction_made_one() {
+    assert!(SymlinkState::Ok.was_made());
+    assert!(SymlinkState::Blocked.was_made());
+    assert!(SymlinkState::Failed.was_made());
+    assert!(!SymlinkState::NotMade.was_made());
+    assert!(!SymlinkState::Skipped.was_made());
 }
 
 /// The payload must survive an exact round trip, and the check must be sensitive to a SINGLE

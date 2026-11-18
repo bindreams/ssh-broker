@@ -26,7 +26,7 @@ use windows::Win32::System::SystemServices::IO_REPARSE_TAG_MOUNT_POINT;
 use super::{JUNCTION_SAID, SymlinkState};
 use crate::route::ProbeLink;
 
-/// The junction, and the folder and file it leads to, inside the directory [`make`] returns.
+/// The junction, and the folder and file it leads to, inside the directory [`make`] is given.
 const LINK_NAME: &str = "link";
 const TARGET_NAME: &str = "target";
 const FILE_NAME: &str = "parity.txt";
@@ -50,27 +50,66 @@ pub fn unique_dir(parent: &Path) -> PathBuf {
     ))
 }
 
+/// Where [`make`] failed, which decides what the failure means: the junction was never there to test, or
+/// the volume would not hold it.
+#[derive(Debug)]
+pub enum MakeError {
+    /// The directory, or the folder, file or link directory in it, could not be made, or the junction's
+    /// target could not be told to the volume: a fault ([`SymlinkState::NotMade`]).
+    Directory(io::Error),
+    /// The directory was made and the volume refused to make a junction of it: the volume cannot hold one,
+    /// so it was not tested ([`SymlinkState::Skipped`]).
+    ReparsePoint(io::Error),
+}
+
+impl MakeError {
+    pub fn state(&self) -> SymlinkState {
+        match self {
+            MakeError::Directory(_) => SymlinkState::NotMade,
+            MakeError::ReparsePoint(_) => SymlinkState::Skipped,
+        }
+    }
+
+    /// What the probe says about it, for the row.
+    pub fn said(&self, dir: &Path) -> String {
+        match self {
+            MakeError::Directory(e) => format!("making the directory {} for a junction failed: {e}", dir.display()),
+            MakeError::ReparsePoint(e) => format!("the volume of {} refused to make a junction: {e}", dir.display()),
+        }
+    }
+}
+
 /// Make `dir`, which must not exist, with the folder, the file and the junction in it. A path that
-/// exists is an error and is left as it is. A directory this made and could not finish is removed again.
-pub fn make(dir: &Path) -> io::Result<()> {
-    std::fs::create_dir(dir)?;
+/// exists is an error and is left as it is. A directory this made and could not finish is removed again,
+/// and one that cannot be removed is said on stderr.
+pub fn make(dir: &Path) -> Result<(), MakeError> {
+    std::fs::create_dir(dir).map_err(MakeError::Directory)?;
     make_in(dir).inspect_err(|_| {
-        let _ = remove(dir);
+        if let Err(e) = remove(dir) {
+            eprintln!(
+                "{JUNCTION_SAID}removing the half-made directory {} failed: {e}",
+                dir.display()
+            );
+        }
     })
 }
 
-fn make_in(dir: &Path) -> io::Result<()> {
+fn make_in(dir: &Path) -> Result<(), MakeError> {
+    let directory = MakeError::Directory;
     let target = dir.join(TARGET_NAME);
-    std::fs::create_dir(&target)?;
-    std::fs::write(target.join(FILE_NAME), FILE_CONTENT)?;
+    std::fs::create_dir(&target).map_err(directory)?;
+    std::fs::write(target.join(FILE_NAME), FILE_CONTENT).map_err(directory)?;
     let link = dir.join(LINK_NAME);
-    std::fs::create_dir(&link)?;
-    set_mount_point(&link, &std::path::absolute(&target)?)
+    std::fs::create_dir(&link).map_err(directory)?;
+    let buffer = mount_point_buffer(&std::path::absolute(&target).map_err(directory)?).map_err(directory)?;
+    let handle = open_directory(&link).map_err(directory)?;
+    set_reparse_point(&handle, &buffer).map_err(MakeError::ReparsePoint)
 }
 
 /// What a probe does about the junction of the link row ([`ProbeLink`]): the outcome of reading through
-/// it. A junction that could not be made was not tested ([`SymlinkState::Skipped`]). Whatever it could
-/// not do is on stderr, each line after [`JUNCTION_SAID`], for `verify` to show.
+/// it. A directory that could not be made is [`SymlinkState::NotMade`]; one the volume would not make a
+/// junction of was not tested ([`SymlinkState::Skipped`]). Whatever it could not do is on stderr, each
+/// line after [`JUNCTION_SAID`], for `verify` to show.
 pub fn run(link: &ProbeLink) -> SymlinkState {
     run_in(link, &std::env::temp_dir())
 }
@@ -78,11 +117,13 @@ pub fn run(link: &ProbeLink) -> SymlinkState {
 fn run_in(link: &ProbeLink, temp: &Path) -> SymlinkState {
     match link {
         ProbeLink::Follow(dir) => follow(Path::new(dir)),
-        ProbeLink::Make(dir) => made_and_followed(Path::new(dir)).0,
+        ProbeLink::Make(dir) => made_and_followed(Path::new(dir)),
         ProbeLink::Own => {
             let dir = unique_dir(temp);
-            let (state, made) = made_and_followed(&dir);
-            if made && let Err(e) = remove(&dir) {
+            let state = made_and_followed(&dir);
+            if state.was_made()
+                && let Err(e) = remove(&dir)
+            {
                 eprintln!("{JUNCTION_SAID}removing {} failed: {e}", dir.display());
             }
             state
@@ -90,14 +131,14 @@ fn run_in(link: &ProbeLink, temp: &Path) -> SymlinkState {
     }
 }
 
-/// Make the junction in `dir` and read through it, and say whether it was made.
-fn made_and_followed(dir: &Path) -> (SymlinkState, bool) {
+/// Make the junction in `dir` and read through it.
+fn made_and_followed(dir: &Path) -> SymlinkState {
     match make(dir) {
         Err(e) => {
-            eprintln!("{JUNCTION_SAID}making a junction in {} failed: {e}", dir.display());
-            (SymlinkState::Skipped, false)
+            eprintln!("{JUNCTION_SAID}{}", e.said(dir));
+            e.state()
         }
-        Ok(()) => (follow(dir), true),
+        Ok(()) => follow(dir),
     }
 }
 
@@ -135,13 +176,17 @@ pub fn remove(dir: &Path) -> io::Result<()> {
     }
 }
 
-/// Make the empty directory `link` a junction to `target`, an absolute path.
-fn set_mount_point(link: &Path, target: &Path) -> io::Result<()> {
-    let buffer = mount_point_buffer(target)?;
-    let handle = std::fs::OpenOptions::new()
+/// Open the directory `link` itself, not what it may point at, to make it a junction.
+fn open_directory(link: &Path) -> io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
         .write(true)
         .custom_flags((FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT).0)
-        .open(link)?;
+        .open(link)
+}
+
+/// Make the empty directory `handle` is open on a junction, with `buffer` from [`mount_point_buffer`]:
+/// the one step that the volume can refuse.
+fn set_reparse_point(handle: &std::fs::File, buffer: &[u8]) -> io::Result<()> {
     let length = u32::try_from(buffer.len()).map_err(|_| io::Error::other("the junction's target path is too long"))?;
     // With no `OVERLAPPED` the call needs somewhere to put the byte count, though there is no output.
     let mut returned = 0u32;

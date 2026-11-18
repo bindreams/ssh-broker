@@ -23,8 +23,11 @@ pub enum SymlinkState {
     /// The junction was made, and the read failed for another reason. Also what a probe that reported
     /// no outcome gets.
     Failed,
-    /// The junction could not be made (a temp directory on a volume with no reparse points, say), so
-    /// following it was not tested. Informational: it fails nothing.
+    /// The directory for the junction, or something in it before the junction, could not be made
+    /// (access, disk, a path that exists): nothing was made to follow, and that is a fault.
+    NotMade,
+    /// The directory was made and the volume refused to make a junction of it (a temp directory on a volume
+    /// with no reparse points, say), so following it was not tested. Informational: it fails nothing.
     Skipped,
 }
 
@@ -34,6 +37,7 @@ impl SymlinkState {
             SymlinkState::Ok => "ok",
             SymlinkState::Blocked => "blocked",
             SymlinkState::Failed => "fail",
+            SymlinkState::NotMade => "notmade",
             SymlinkState::Skipped => "skip",
         }
     }
@@ -41,13 +45,22 @@ impl SymlinkState {
         match s {
             "ok" => SymlinkState::Ok,
             "blocked" => SymlinkState::Blocked,
+            "notmade" => SymlinkState::NotMade,
             "skip" => SymlinkState::Skipped,
             _ => SymlinkState::Failed, // missing or unknown: nothing was proven
         }
     }
-    /// Whether this outcome fails parity: a junction that was made and not followed.
+    /// Whether this outcome fails parity: a junction that was refused or not read, or a directory that could
+    /// not be made.
     pub fn is_failure(self) -> bool {
-        matches!(self, SymlinkState::Blocked | SymlinkState::Failed)
+        matches!(
+            self,
+            SymlinkState::Blocked | SymlinkState::Failed | SymlinkState::NotMade
+        )
+    }
+    /// Whether the probe made a junction: it did when it went on to read through it.
+    pub fn was_made(self) -> bool {
+        matches!(self, SymlinkState::Ok | SymlinkState::Blocked | SymlinkState::Failed)
     }
 }
 

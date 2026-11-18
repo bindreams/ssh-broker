@@ -24,9 +24,13 @@ fn unelevated() -> ProbeResult {
     probe(Some(Elevation::Filtered), Some(INTEGRITY_MEDIUM))
 }
 
-/// The unelevated probe's answer as `Probes` carries it: its result, or the cause it failed with.
-fn answered(result: ProbeResult) -> Result<ProbeResult, String> {
-    Ok(result)
+/// A probe that ran and was read.
+fn answered(result: ProbeResult) -> ProbeOutcome {
+    ProbeOutcome::Answered(Answer {
+        result,
+        binary_ok: true,
+        said: String::new(),
+    })
 }
 
 fn names(rows: &[Check]) -> Vec<&str> {
@@ -52,9 +56,10 @@ fn an_elevated_agent_that_steps_down_on_request_passes_both_rows() {
     assert!(rows[0].detail.contains("High (0x3000)"), "{}", rows[0].detail);
 }
 
-/// An account at High that is not an administrator (a Backup Operator: Windows does not split its
-/// token) gets the same two probes and the same two rows, which pass: its session is at High, and
-/// `internal-unelevated` gives Medium, with no Administrators entry to be deny-only.
+/// An account at High that is not an administrator (a Backup Operator: Windows splits its token, but
+/// there is no Administrators entry in it) gets the same two probes and the same two rows, which pass: its
+/// session is at High, and `internal-unelevated` gives Medium, with no Administrators entry to be
+/// deny-only.
 #[test]
 fn a_standard_account_at_high_passes_both_rows_and_its_unelevated_probe_is_judged() {
     let default = probe(Some(Elevation::Standard), Some(INTEGRITY_HIGH));
@@ -97,12 +102,28 @@ fn a_default_probe_that_is_not_at_high_fails_the_elevated_row() {
     }
 }
 
+/// A probe that said nothing about its token or its level is named for that, with the remedy, and not
+/// blamed on the session.
 #[test]
-fn a_probe_that_did_not_report_its_token_says_so_and_does_not_blame_the_session() {
+fn a_probe_that_did_not_report_its_token_or_level_says_so_and_does_not_blame_the_session() {
     let rows = session_rows(&probe(None, None), Some(&answered(unelevated())));
-
     assert!(rows[0].detail.contains("did not report"), "{}", rows[0].detail);
     assert!(rows[0].detail.contains("apply"), "{}", rows[0].detail);
+
+    let rows = session_rows(&probe(Some(Elevation::Full), None), Some(&answered(unelevated())));
+    assert!(
+        rows[0].detail.contains("did not report its level"),
+        "{}",
+        rows[0].detail
+    );
+    assert!(!rows[0].detail.contains("not elevated"), "{}", rows[0].detail);
+
+    let rows = session_rows(&probe(None, Some(INTEGRITY_HIGH)), Some(&answered(unelevated())));
+    assert!(
+        rows[0].detail.contains("did not report its token"),
+        "{}",
+        rows[0].detail
+    );
 }
 
 #[test]
@@ -113,6 +134,20 @@ fn a_filtered_agent_is_named_as_not_elevated() {
     );
 
     assert!(rows[0].detail.contains("not elevated"), "{}", rows[0].detail);
+    assert!(rows[0].detail.contains("administrator's agent"), "{}", rows[0].detail);
+}
+
+/// An account that is not an administrator is not told that an administrator's agent must be elevated.
+#[test]
+fn a_standard_account_is_not_told_an_administrators_agent_must_be_elevated() {
+    let rows = session_rows(
+        &probe(Some(Elevation::Standard), Some(INTEGRITY_MEDIUM)),
+        Some(&answered(unelevated())),
+    );
+
+    assert!(!rows[0].pass);
+    assert!(rows[0].detail.contains("not elevated"), "{}", rows[0].detail);
+    assert!(!rows[0].detail.contains("administrator"), "{}", rows[0].detail);
 }
 
 /// The `unelevated session on request` row passes only for a token at Medium (`0x2000`) with
@@ -152,18 +187,33 @@ fn an_unelevated_probe_at_medium_without_administrators_enabled_passes_for_eithe
     }
 }
 
-/// A probe that asked for an unelevated session and failed is named with its cause on its row: the row
-/// is about that session, and the cause is why it cannot say.
+/// A probe that asked for an unelevated session and did not answer is named on its row with the cause,
+/// whichever way it did not: it failed, it timed out, it was not run.
 #[test]
-fn an_unelevated_probe_that_failed_fails_its_row_with_the_cause() {
-    let rows = session_rows(&elevated(), Some(&Err("probe relay failed (code 254)".to_string())));
+fn an_unelevated_probe_that_did_not_answer_fails_its_row_with_the_cause() {
+    for (outcome, cause, says) in [
+        (
+            ProbeOutcome::Failed("relay failed (code 254)".into()),
+            "relay failed (code 254)",
+            "failed",
+        ),
+        (
+            ProbeOutcome::TimedOut("no output within 30s".into()),
+            "no output within 30s",
+            "did not answer",
+        ),
+        (
+            ProbeOutcome::NotRun("the agent is gone".into()),
+            "the agent is gone",
+            "not run",
+        ),
+    ] {
+        let rows = session_rows(&elevated(), Some(&outcome));
 
-    assert_eq!(passes(&rows), [true, false]);
-    assert!(
-        rows[1].detail.contains("probe relay failed (code 254)"),
-        "{}",
-        rows[1].detail
-    );
+        assert_eq!(passes(&rows), [true, false], "{outcome:?}");
+        assert!(rows[1].detail.contains(cause), "{}", rows[1].detail);
+        assert!(rows[1].detail.contains(says), "{}", rows[1].detail);
+    }
 }
 
 #[test]
@@ -205,16 +255,23 @@ fn an_administrators_agent_below_high_fails_the_elevated_row() {
 
 // the junction -----------------------------------------------------------------------------
 
-fn junction(state: SymlinkState, note: &str) -> Junction {
-    Junction {
+fn read(state: SymlinkState, note: &str) -> Junction {
+    Junction::Read {
         state,
+        note: note.to_string(),
+    }
+}
+
+fn unavailable(cause: &str, note: &str) -> Junction {
+    Junction::Unavailable {
+        cause: cause.to_string(),
         note: note.to_string(),
     }
 }
 
 #[test]
 fn the_junction_row_fails_on_a_junction_that_was_made_and_not_followed() {
-    let row = |state| link_row(&junction(state, ""));
+    let row = |state| link_row(&read(state, ""));
 
     assert!(row(SymlinkState::Ok).pass);
     assert!(!row(SymlinkState::Blocked).pass);
@@ -227,23 +284,51 @@ fn the_junction_row_fails_on_a_junction_that_was_made_and_not_followed() {
     );
 }
 
-/// A junction that could not be made was not tested: the row does not fail `verify`, says in so many
+/// A directory that could not be made is a failure, with the cause the probe gave; it is not the volume
+/// that cannot hold a junction.
+#[test]
+fn a_directory_that_could_not_be_made_fails_the_junction_row_with_the_cause() {
+    let row = link_row(&read(
+        SymlinkState::NotMade,
+        "making the directory D:\\t failed: access denied",
+    ));
+
+    assert!(!row.pass, "{}", row.detail);
+    assert!(row.detail.contains("access denied"), "{}", row.detail);
+    assert!(!row.detail.contains("NOT tested"), "{}", row.detail);
+}
+
+/// A volume that refused the junction was not tested: the row does not fail `verify`, says in so many
 /// words that the property was not tested, and gives the probe's reason.
 #[test]
-fn a_junction_that_could_not_be_made_is_not_tested_and_fails_nothing() {
-    let row = link_row(&junction(
+fn a_junction_the_volume_refused_is_not_tested_and_fails_nothing() {
+    let row = link_row(&read(
         SymlinkState::Skipped,
-        "making a junction in D:\\t failed: not supported",
+        "the volume of D:\\t does not hold a junction: not supported",
     ));
 
     assert!(row.pass, "{}", row.detail);
     assert!(row.detail.contains("NOT tested"), "{}", row.detail);
     assert!(row.detail.contains("not supported"), "{}", row.detail);
+    assert!(link_row(&read(SymlinkState::Skipped, "")).detail.contains("NOT tested"));
+}
+
+/// No junction from below High to read is a failure, whatever the reason, and the reason is on the row.
+#[test]
+fn no_junction_from_below_high_fails_the_row_with_the_cause_and_the_notes() {
+    let row = link_row(&unavailable(
+        "the probe timed out",
+        "making the directory failed: in use",
+    ));
+
+    assert!(!row.pass, "{}", row.detail);
     assert!(
-        link_row(&junction(SymlinkState::Skipped, ""))
-            .detail
-            .contains("NOT tested")
+        row.detail.contains("no junction from below High could be tested"),
+        "{}",
+        row.detail
     );
+    assert!(row.detail.contains("the probe timed out"), "{}", row.detail);
+    assert!(row.detail.contains("in use"), "{}", row.detail);
 }
 
 /// The probe's own words are on every row that does not pass, and on a passing one that has something to
@@ -253,29 +338,28 @@ fn the_probes_words_reach_the_junction_row() {
     let said = "reading through the junction in D:\\t failed: access denied";
 
     assert!(
-        link_row(&junction(SymlinkState::Failed, said))
+        link_row(&read(SymlinkState::Failed, said))
             .detail
             .contains("access denied")
     );
     assert!(
-        link_row(&junction(SymlinkState::Blocked, said))
+        link_row(&read(SymlinkState::Blocked, said))
             .detail
             .contains("access denied")
     );
-    let passing = link_row(&junction(SymlinkState::Ok, "removing D:\\t failed: in use"));
+    let passing = link_row(&read(SymlinkState::Ok, "removing D:\\t failed: in use"));
     assert!(passing.pass);
     assert!(passing.detail.contains("in use"), "{}", passing.detail);
-    assert_eq!(link_row(&junction(SymlinkState::Ok, "")).detail, "followed");
+    assert_eq!(link_row(&read(SymlinkState::Ok, "")).detail, "followed");
 }
 
 // the whole report of the probes -----------------------------------------------------------
 
-fn probes(default: ProbeResult, unelevated: Option<Result<ProbeResult, String>>) -> Probes {
+fn probes(default: ProbeOutcome, unelevated: Option<ProbeOutcome>) -> Probes {
     Probes {
-        default,
-        binary_ok: true,
         unelevated,
-        junction: junction(SymlinkState::Ok, ""),
+        default,
+        junction: read(SymlinkState::Ok, ""),
         leftover: None,
     }
 }
@@ -284,30 +368,32 @@ fn rows_of(probes: &Probes) -> Vec<Check> {
     parity_rows(probes, 1)
 }
 
+const ALL_ROWS: [&str; 7] = [
+    "interactive session (via agent)",
+    "DPAPI (via agent)",
+    "elevated session",
+    "unelevated session on request",
+    "junction (via agent)",
+    "binary download (via agent)",
+    "binary upload (via agent)",
+];
+
 /// An administrator's whole report: the session, DPAPI, the two session rows, the junction and the two
 /// byte-transparency rows, all passing for a healthy elevated agent.
 #[test]
 fn a_healthy_administrators_agent_passes_every_row() {
-    let rows = rows_of(&probes(elevated(), Some(answered(unelevated()))));
+    let rows = rows_of(&probes(answered(elevated()), Some(answered(unelevated()))));
 
-    assert_eq!(
-        names(&rows),
-        [
-            "interactive session (via agent)",
-            "DPAPI (via agent)",
-            "elevated session",
-            "unelevated session on request",
-            "junction (via agent)",
-            "binary download (via agent)",
-            "binary upload (via agent)",
-        ]
-    );
+    assert_eq!(names(&rows), ALL_ROWS);
     assert!(rows.iter().all(|row| row.pass), "{:?}", details(&rows));
 }
 
 #[test]
 fn a_standard_accounts_report_has_one_session_row() {
-    let rows = rows_of(&probes(probe(Some(Elevation::Standard), Some(INTEGRITY_MEDIUM)), None));
+    let rows = rows_of(&probes(
+        answered(probe(Some(Elevation::Standard), Some(INTEGRITY_MEDIUM))),
+        None,
+    ));
 
     assert_eq!(
         names(&rows),
@@ -323,31 +409,75 @@ fn a_standard_accounts_report_has_one_session_row() {
     assert!(rows.iter().all(|row| row.pass), "{:?}", details(&rows));
 }
 
-/// A failed unelevated probe takes only its own rows with it: every other row still comes from the
-/// default probe, which ran.
+/// One outcome of each kind, the one that answered being `answer`.
+fn outcomes(answer: ProbeResult) -> [(&'static str, ProbeOutcome); 4] {
+    [
+        ("answered", answered(answer)),
+        ("failed", ProbeOutcome::Failed("relay failed".into())),
+        ("timed out", ProbeOutcome::TimedOut("no output".into())),
+        ("not run", ProbeOutcome::NotRun("no agent".into())),
+    ]
+}
+
+/// Every outcome of the default probe against every outcome of the unelevated one gives rows: a default
+/// probe that answered gives all seven rows, whatever became of the unelevated one (its row alone fails);
+/// one that did not gives the one `parity probe (via agent)` row with the cause and the unelevated row,
+/// which is still judged.
 #[test]
-fn a_failed_unelevated_probe_leaves_the_other_rows_to_the_default_probe() {
-    let mut p = probes(elevated(), Some(Err("connect to agent: refused".to_string())));
-    p.junction = junction(
-        SymlinkState::Failed,
-        "no junction from an unelevated session could be tested: connect to agent: refused",
-    );
+fn every_pair_of_outcomes_has_its_rows() {
+    for (default_name, default) in outcomes(elevated()) {
+        for (unelevated_name, unelevated) in outcomes(unelevated()) {
+            let unelevated_passes = matches!(unelevated, ProbeOutcome::Answered(_));
+            let rows = rows_of(&probes(default.clone(), Some(unelevated)));
+            let case = format!(
+                "default {default_name}, unelevated {unelevated_name}: {:?}",
+                details(&rows)
+            );
 
-    let rows = rows_of(&p);
+            if default_name == "answered" {
+                assert_eq!(names(&rows), ALL_ROWS, "{case}");
+                let failing: Vec<&str> = rows.iter().filter(|row| !row.pass).map(|row| row.name).collect();
+                let expected: &[&str] = if unelevated_passes {
+                    &[]
+                } else {
+                    &["unelevated session on request"]
+                };
+                assert_eq!(failing, expected, "{case}");
+            } else {
+                assert_eq!(
+                    names(&rows),
+                    ["parity probe (via agent)", "unelevated session on request"],
+                    "{case}"
+                );
+                assert_eq!(passes(&rows), [false, unelevated_passes], "{case}");
+                let cause = match default_name {
+                    "failed" => "relay failed",
+                    "timed out" => "no output",
+                    _ => "no agent",
+                };
+                assert!(rows[0].detail.starts_with("unavailable"), "{case}");
+                assert!(rows[0].detail.contains(cause), "{case}");
+            }
+        }
+    }
+}
 
-    assert_eq!(rows.len(), 7, "{:?}", names(&rows));
-    let failing: Vec<&str> = rows.iter().filter(|row| !row.pass).map(|row| row.name).collect();
-    assert_eq!(failing, ["unelevated session on request", "junction (via agent)"]);
-    let junction = rows.iter().find(|row| row.name == "junction (via agent)").unwrap();
-    assert!(junction.detail.contains("could be tested"), "{}", junction.detail);
+/// Below High there is no unelevated probe: a default probe that did not answer is the one row.
+#[test]
+fn a_default_probe_that_did_not_answer_below_high_is_the_one_row() {
+    let rows = rows_of(&probes(ProbeOutcome::TimedOut("no output within 30s".into()), None));
+
+    assert_eq!(names(&rows), ["parity probe (via agent)"]);
+    assert!(!rows[0].pass);
+    assert!(rows[0].detail.contains("no output within 30s"), "{}", rows[0].detail);
 }
 
 /// The junction row is `Probes::junction`, which `run` settles from both probes: a refusal fails it,
 /// whatever the unelevated probe saw of its own.
 #[test]
 fn the_junction_row_is_the_junction_found() {
-    let mut p = probes(elevated(), Some(answered(unelevated())));
-    p.junction = junction(SymlinkState::Blocked, "");
+    let mut p = probes(answered(elevated()), Some(answered(unelevated())));
+    p.junction = read(SymlinkState::Blocked, "");
 
     let rows = rows_of(&p);
 
@@ -355,30 +485,39 @@ fn the_junction_row_is_the_junction_found() {
     assert!(!row.pass);
 }
 
-/// A junction `verify` could not remove is said on the row, so the person can remove it; the row still
-/// says what the probe proved.
+/// A junction `verify` could not remove, or that a probe that did not answer may still make, is named on
+/// a row of its own so the person can remove it; the other rows say what the probes proved. It is shown
+/// whether or not the default probe answered.
 #[test]
-fn a_junction_left_behind_is_named_on_its_row() {
-    let mut p = probes(elevated(), Some(answered(unelevated())));
-    p.leftover = Some(r"C:\Temp\sb-junction-1: access denied".to_string());
+fn a_junction_left_behind_is_named_on_its_own_row() {
+    let leftover = r"C:\Temp\sb-junction-1 could not be removed: access denied";
 
-    let rows = rows_of(&p);
+    for default in [answered(elevated()), ProbeOutcome::Failed("relay failed".into())] {
+        let mut p = probes(default, Some(answered(unelevated())));
+        p.leftover = Some(leftover.to_string());
 
-    let junction = rows.iter().find(|row| row.name == "junction (via agent)").unwrap();
-    assert!(junction.pass, "{}", junction.detail);
-    assert!(
-        junction.detail.contains(r"C:\Temp\sb-junction-1"),
-        "{}",
-        junction.detail
-    );
-    assert!(junction.detail.contains("could not be removed"), "{}", junction.detail);
+        let rows = rows_of(&p);
+
+        let row = rows.last().unwrap();
+        assert_eq!(row.name, "junction directory");
+        assert!(row.pass, "{}", row.detail);
+        assert!(row.detail.contains(r"C:\Temp\sb-junction-1"), "{}", row.detail);
+        assert!(row.detail.contains("access denied"), "{}", row.detail);
+    }
+    let junction = rows_of(&probes(answered(elevated()), Some(answered(unelevated()))));
+    assert!(!names(&junction).contains(&"junction directory"));
 }
 
 #[test]
 fn the_byte_rows_fail_as_they_did_before() {
-    let mut p = probes(elevated(), Some(answered(unelevated())));
-    p.binary_ok = false;
-    p.default.upstream = UpstreamState::Fail;
+    let mut result = elevated();
+    result.upstream = UpstreamState::Fail;
+    let default = ProbeOutcome::Answered(Answer {
+        result,
+        binary_ok: false,
+        said: String::new(),
+    });
+    let p = probes(default, Some(answered(unelevated())));
 
     let rows = rows_of(&p);
 
@@ -388,9 +527,10 @@ fn the_byte_rows_fail_as_they_did_before() {
 
 #[test]
 fn a_session_zero_network_logon_fails_the_session_row_and_names_the_console() {
-    let mut p = probes(elevated(), Some(answered(unelevated())));
-    p.default.session_id = 0;
-    p.default.logon_type = Some(3);
+    let mut result = elevated();
+    result.session_id = 0;
+    result.logon_type = Some(3);
+    let p = probes(answered(result), Some(answered(unelevated())));
 
     let rows = parity_rows(&p, 7);
 

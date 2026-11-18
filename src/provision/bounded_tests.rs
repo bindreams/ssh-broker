@@ -1,7 +1,7 @@
 //! Host tests for the bounded wait. The `verify` path that uses it is `#[cfg(windows)]` with no
 //! test module, which is precisely how an earlier check in this file's neighbourhood ended up
 //! measurable only in production — so the logic lives here, where every platform runs it.
-use super::{DEFAULT_PROBE_TIMEOUT, await_bounded, probe_timeout_from_args};
+use super::{DEFAULT_PROBE_TIMEOUT, WaitError, await_bounded, probe_timeout_from_args};
 use std::time::Duration;
 
 fn args(items: &[&str]) -> Vec<String> {
@@ -62,6 +62,24 @@ fn a_dead_worker_is_an_error_not_a_default() {
         await_bounded(&rx, None).is_err(),
         "an unbounded wait must not hang on a dead sender"
     );
+}
+
+/// `verify` treats a probe that did not answer in time differently from one that stopped without
+/// answering (it starts no probe after the first), so the two are not told apart by their text.
+#[test]
+fn expiry_and_a_dead_worker_are_different_errors() {
+    let (_tx, rx) = std::sync::mpsc::channel::<u8>();
+    assert!(matches!(
+        await_bounded(&rx, Some(Duration::from_millis(1))).unwrap_err(),
+        WaitError::TimedOut { .. }
+    ));
+
+    let (tx, rx) = std::sync::mpsc::channel::<u8>();
+    drop(tx);
+    assert!(matches!(
+        await_bounded(&rx, Some(Duration::from_secs(30))).unwrap_err(),
+        WaitError::WorkerStopped
+    ));
 }
 
 /// `--probe-timeout 0` means WAIT INDEFINITELY. That contract is documented in three places
