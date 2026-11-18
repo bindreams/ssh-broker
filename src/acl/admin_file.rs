@@ -1,4 +1,4 @@
-//! A file only SYSTEM and Administrators can open: the machine-wide `apply` lock, and sshd's drop-in.
+//! A file only SYSTEM and Administrators can open: the machine-wide `apply` lock.
 //!
 //! A byte-range lock needs only a handle with read or write access, so whoever can open the file
 //! for reading can hold the lock for ever and stall every `apply`. The install directory lets

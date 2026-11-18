@@ -13,16 +13,12 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use ssh_broker::acl::{
-    admin_only_file_problem, copy_file_security, create_install_dir, ensure_admin_only_file, install_dir_problem,
-};
+use ssh_broker::acl::{copy_file_security, create_install_dir, install_dir_file_problem, install_dir_problem};
 use ssh_broker::pipes::ExecChild;
 use ssh_broker::provision::path_env::{self, PathPlan};
 use ssh_broker::provision::registry;
 use ssh_broker::provision::sshd_config::configure::ConfigRead;
-use ssh_broker::provision::sshd_config::machine::{
-    configure_this_machine, replace_file, sshd_reading_this_machine, write_flushed,
-};
+use ssh_broker::provision::sshd_config::machine::{configure_this_machine, sshd_reading_this_machine};
 use ssh_broker::provision::sshd_config::{
     ACCEPT_LINE, DROP_IN_NAME, INCLUDE_LINE, SshdReading, accepts, accepts_row, drop_in_text, in_force, with_line,
 };
@@ -64,7 +60,7 @@ mod stand_in;
 use account_fixture::{Account, ServiceLogon};
 use fs_state::sddl_of;
 use install::{Install, ResetAtTheEnd, candidate_path, config_path, drop_in_dir, drop_in_path, reset};
-use sshd_rig::{Login, SshSession, restart_sshd, run, run_client, set_stock_shell, sshd_event_logs, try_restart_sshd};
+use sshd_rig::{Login, SshSession, restart_sshd, run, run_client, set_stock_shell, sshd_event_logs};
 use stand_in::Kit;
 
 /// What `apply`'s sshd step did and said: whether the running sshd takes the variable, and its lines.
@@ -147,7 +143,7 @@ fn apply_s_sshd_step_adds_the_drop_in_and_the_include_above_the_first_match_and_
     );
     assert_eq!(std::fs::read(drop_in_path()).unwrap(), drop_in_text().as_bytes());
     assert_eq!(install_dir_problem(&drop_in_dir()).unwrap(), None);
-    assert_eq!(admin_only_file_problem(&drop_in_path()).unwrap(), None);
+    assert_eq!(install_dir_file_problem(&drop_in_path()).unwrap(), None);
     assert_eq!(
         sddl_of(&config_path()),
         security_before,
@@ -225,8 +221,9 @@ fn a_drop_in_that_cannot_be_replaced_keeps_the_text_it_had() {
     let stock = reset();
     let _reset = ResetAtTheEnd;
     create_install_dir(&drop_in_dir()).expect("make the drop-in folder");
-    ensure_admin_only_file(&drop_in_path()).expect("make the drop-in");
+    // Made in the folder `apply` made, the file inherits what the folder gives it, as the step's own does.
     std::fs::write(drop_in_path(), "AcceptEnv OTHER\r\n").unwrap();
+    assert_eq!(install_dir_file_problem(&drop_in_path()).unwrap(), None);
     std::fs::create_dir(drop_in_dir().join(format!("{DROP_IN_NAME}.ssh-broker-new")))
         .expect("take the new file's name");
 
@@ -603,49 +600,22 @@ fn after_apply_verify_passes_through_a_session_the_password_prompt_started() {
     prompted.leave();
 }
 
-// What makes sshd reset connections =====
+// A connection after the step =====
 
-/// Which parts of the sshd step a measurement makes the product's way (`true`) and which by hand, with plain
-/// `std::fs` calls (`false`).
-struct Product {
-    folder: bool,
-    drop_in: bool,
-    config: bool,
-}
+/// After the step and a restart, sshd answers a connection: a login for a user that does not exist does the key
+/// exchange and ends with "Permission denied". An sshd that cannot read what its configuration includes resets
+/// the connection right after the client's version line instead.
+#[test]
+fn sshd_answers_a_connection_after_the_step_and_a_restart() {
+    let _machine = machine::exclusive();
+    account_fixture::assert_elevated();
+    reset();
+    let _reset = ResetAtTheEnd;
 
-/// Make the folder, the drop-in and the `Include` line over the stock files, as `apply` does, each part the
-/// way `product` says.
-fn make_files(stock: &[u8], product: Product) {
-    let folder = drop_in_dir();
-    if product.folder {
-        create_install_dir(&folder).expect("make the folder the product's way");
-    } else {
-        std::fs::create_dir(&folder).expect("make the folder by hand");
-    }
-    let text = drop_in_text();
-    if product.drop_in {
-        let new = folder.join(format!("{DROP_IN_NAME}.ssh-broker-new"));
-        ensure_admin_only_file(&new).expect("make the new drop-in the product's way");
-        write_flushed(&new, text.as_bytes()).expect("write the new drop-in");
-        replace_file(&new, &drop_in_path()).expect("rename the new drop-in over the drop-in");
-    } else {
-        std::fs::write(drop_in_path(), text).expect("write the drop-in by hand");
-    }
-    let edited = with_line(stock, INCLUDE_LINE).expect("edit sshd_config");
-    if product.config {
-        let candidate = candidate_path();
-        write_flushed(&candidate, &edited).expect("write the candidate");
-        copy_file_security(&config_path(), &candidate).expect("copy the original's security to the candidate");
-        replace_file(&candidate, &config_path()).expect("rename the candidate over sshd_config");
-    } else {
-        std::fs::write(config_path(), edited).expect("write sshd_config by hand");
-    }
-}
+    let (accepted, said) = configure();
+    assert_says_to_restart(accepted, &said);
+    restart_sshd();
 
-/// What a login that no account can complete shows of sshd: its class and the last ten lines of the client's
-/// output. A healthy sshd does the key exchange and ends with "Permission denied"; a broken one resets the
-/// connection.
-fn probe() -> (String, String) {
     let mut ssh = Command::new("ssh");
     ssh.args([
         "-v",
@@ -662,111 +632,13 @@ fn probe() -> (String, String) {
     ]);
     let outcome = run_client(ssh, false, &std::env::temp_dir());
     let text = format!("{}{}", String::from_utf8_lossy(&outcome.stdout), outcome.stderr);
-    let mut class = if text.contains("Permission denied") {
-        "HEALTHY"
-    } else if text.contains("Connection reset") {
-        "RESET"
-    } else {
-        "OTHER"
-    }
-    .to_owned();
-    match outcome.code {
-        Some(code) => class += &format!(" (ssh exit {code})"),
-        None => class += " (ssh did not end within the bound and was ended)",
-    }
     let mut last: Vec<&str> = text.lines().rev().take(10).collect();
     last.reverse();
-    (class, last.join("\n"))
-}
-
-/// One step of the measurement: sshd's files as `reset` leaves them, then `change`, then a restart of the
-/// service, then what the files look like, whether `sshd -t` passes, the probe, and sshd's own event logs.
-fn measure_step(label: &str, change: impl FnOnce(&[u8])) {
-    let stock = reset();
-    eprintln!("\n=== {label} ===");
-    change(stock);
-    restart_sshd();
-    for path in [config_path(), drop_in_dir(), drop_in_path()] {
-        let (_, shown) = run("icacls.exe", &[path.to_str().expect("a path of text")]);
-        eprintln!("--- icacls {} ---\n{shown}", path.display());
-    }
-    let (passes, said) = run("sshd", &["-t"]);
-    eprintln!("--- sshd -t {} ---\n{said}", if passes { "passes" } else { "FAILS" });
-    let (class, last) = probe();
-    eprintln!("--- probe: {class} ---\n{last}");
-    eprintln!("{}", sshd_event_logs(25));
-}
-
-/// Starts the sshd service again when the measurement ends, also when it fails: the tests after it need a
-/// running sshd.
-struct RunningAtTheEnd;
-
-impl Drop for RunningAtTheEnd {
-    fn drop(&mut self) {
-        if let Err(why) = try_restart_sshd() {
-            // A panic during an unwind aborts the test binary, and so does `eprintln!` on a closed stderr.
-            if std::thread::panicking() {
-                use std::io::Write as _;
-                let _ = writeln!(std::io::stderr(), "sshd was not started again: {why}");
-            } else {
-                panic!("sshd was not started again: {why}");
-            }
-        }
-    }
-}
-
-/// Measures, asserting nothing about the outcome: after the product's sshd step has run, sshd resets every
-/// connection right after the client's version line, and the cause is not known. Each step starts from the
-/// stock files and makes some parts of the step the product's way and the others by hand, restarts sshd and
-/// probes it; the output tells which part the resets follow. It runs alone, before any other test has changed
-/// sshd's files (the workflow's "Measure what makes sshd reset connections" step). Ends with the stock files
-/// and a running sshd.
-#[test]
-fn measure_which_part_of_the_sshd_step_makes_sshd_reset_connections() {
-    let _machine = machine::exclusive();
-    account_fixture::assert_elevated();
-    let _running = RunningAtTheEnd;
-    reset();
-    let _reset = ResetAtTheEnd;
-
-    let by_hand = || Product {
-        folder: false,
-        drop_in: false,
-        config: false,
-    };
-    measure_step("0: stock, untouched (the control)", |_| {});
-    measure_step("1: every part by hand, as the spike did it", |stock| {
-        make_files(stock, by_hand())
-    });
-    measure_step("2: the folder the product's way", |stock| {
-        make_files(
-            stock,
-            Product {
-                folder: true,
-                ..by_hand()
-            },
-        )
-    });
-    measure_step("3: the drop-in the product's way", |stock| {
-        make_files(
-            stock,
-            Product {
-                drop_in: true,
-                ..by_hand()
-            },
-        )
-    });
-    measure_step("4: sshd_config replaced the product's way", |stock| {
-        make_files(
-            stock,
-            Product {
-                config: true,
-                ..by_hand()
-            },
-        )
-    });
-    measure_step("5: the product's whole step", |_| {
-        let (accepted, said) = configure();
-        eprintln!("the step said (takes the variable: {accepted}):\n{said:#?}");
-    });
+    assert!(
+        text.contains("Permission denied") && !text.contains("Connection reset"),
+        "sshd did not answer the connection (ssh exit {:?}); the client's last lines:\n{}\n{}",
+        outcome.code,
+        last.join("\n"),
+        sshd_event_logs(25)
+    );
 }

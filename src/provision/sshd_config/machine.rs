@@ -81,11 +81,11 @@ impl Machine {
     }
 }
 
-/// Why `path` is not private to SYSTEM and Administrators. The step never advises removing it: what is in
-/// `sshd_config.d` may be an administrator's own.
+/// Why `path` is not a file only SYSTEM and Administrators can write. The step never advises removing it: what
+/// is in `sshd_config.d` may be an administrator's own.
 fn untrusted(path: &Path, problem: &str) -> anyhow::Error {
     anyhow::anyhow!(
-        "{} cannot be trusted as private to SYSTEM and Administrators: {problem}",
+        "{} cannot be trusted as writable only by SYSTEM and Administrators: {problem}",
         path.display()
     )
 }
@@ -168,7 +168,7 @@ impl SshdHost for Machine {
             };
         }
         // A file others can write would let them configure sshd, and a copy with the right text would pass.
-        if let Some(problem) = acl::admin_only_file_problem(&path)? {
+        if let Some(problem) = acl::install_dir_file_problem(&path)? {
             return Err(untrusted(&path, &problem));
         }
         Ok(Some(
@@ -176,17 +176,21 @@ impl SshdHost for Machine {
         ))
     }
 
+    /// The drop-in, and the file beside it that replaces it, get no descriptor of their own and inherit their
+    /// folder's permissions, because the process that serves a connection before authentication reads the
+    /// included file and is not an administrator. An administrator-only drop-in makes sshd reset every
+    /// connection (measured in CI on Windows Server 2025, OpenSSH 9.5).
     fn write_drop_in(&mut self, text: &[u8]) -> anyhow::Result<()> {
         let path = self.drop_in();
         // A drop-in that is there must already be what `apply` makes: it is replaced, never written into.
         if std::fs::symlink_metadata(&path).is_ok()
-            && let Some(problem) = acl::admin_only_file_problem(&path)?
+            && let Some(problem) = acl::install_dir_file_problem(&path)?
         {
             return Err(untrusted(&path, &problem));
         }
-        // The text goes into a new file beside the drop-in, made with the descriptor the drop-in gets and
-        // flushed, and the new file replaces the drop-in in one rename: a write that fails leaves the drop-in as
-        // it was. The name does not end in `.conf`, so sshd's `Include` never reads it.
+        // The text goes into a new file beside the drop-in, flushed, and the new file replaces the drop-in in
+        // one rename: a write that fails leaves the drop-in as it was. The name does not end in `.conf`, so
+        // sshd's `Include` never reads it.
         let new = self.drop_in_dir().join(format!("{DROP_IN_NAME}.ssh-broker-new"));
         match std::fs::remove_file(&new) {
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
@@ -195,15 +199,10 @@ impl SshdHost for Machine {
             _ => {}
         }
         let replaced = (|| {
-            if let Err(e) = acl::ensure_admin_only_file(&new) {
-                // Its own sentence advises removing the file, which this step never does.
-                match acl::admin_only_file_problem(&new) {
-                    Ok(Some(problem)) => return Err(untrusted(&new, &problem)),
-                    Ok(None) => {}
-                    Err(_) => return Err(e),
-                }
-            }
             write_flushed(&new, text)?;
+            if let Some(problem) = acl::install_dir_file_problem(&new)? {
+                return Err(untrusted(&new, &problem));
+            }
             replace_file(&new, &path).with_context(|| format!("rename {} over {}", new.display(), path.display()))
         })();
         if replaced.is_err() {
@@ -242,8 +241,8 @@ impl SshdHost for Machine {
 // files =====
 
 /// The file `path` holds `text`, and the text is on disk when this returns. A file that is there is truncated
-/// and keeps its security descriptor. Public for the sshd tests, which make the product's files its way.
-pub fn write_flushed(path: &Path, text: &[u8]) -> anyhow::Result<()> {
+/// and keeps its security descriptor.
+fn write_flushed(path: &Path, text: &[u8]) -> anyhow::Result<()> {
     let mut file = std::fs::File::create(path).with_context(|| format!("create {}", path.display()))?;
     file.write_all(text)
         .with_context(|| format!("write {}", path.display()))?;
@@ -252,8 +251,8 @@ pub fn write_flushed(path: &Path, text: &[u8]) -> anyhow::Result<()> {
 }
 
 /// Rename `from` over `to`, which is replaced, and return when the rename is on disk: a power loss after it
-/// cannot leave `to` empty. Public for the sshd tests, as [`write_flushed`] is.
-pub fn replace_file(from: &Path, to: &Path) -> anyhow::Result<()> {
+/// cannot leave `to` empty.
+fn replace_file(from: &Path, to: &Path) -> anyhow::Result<()> {
     let wide = |path: &Path| -> Vec<u16> { path.as_os_str().encode_wide().chain(Some(0)).collect() };
     let (from, to) = (wide(from), wide(to));
     // SAFETY: both strings are NUL-terminated and outlive the call.

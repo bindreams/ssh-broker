@@ -47,7 +47,7 @@ pub trait SshdHost {
     fn ensure_drop_in_dir(&mut self) -> Result<(), DropInProblem>;
     /// The drop-in's bytes, `None` when there is no such file.
     fn read_drop_in(&mut self) -> anyhow::Result<Option<Vec<u8>>>;
-    /// Write the drop-in whole, administrator-only.
+    /// Write the drop-in whole, with the permissions its folder gives a file.
     fn write_drop_in(&mut self, text: &[u8]) -> anyhow::Result<()>;
     /// `sshd_config`'s bytes.
     fn read_config(&mut self) -> anyhow::Result<Vec<u8>>;

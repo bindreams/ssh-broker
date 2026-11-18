@@ -629,6 +629,60 @@ fn the_install_policy_rejects_a_duplicate_ace_and_accepts_the_exact_acl() {
     );
 }
 
+/// What a file inherits from a folder that has [`INSTALL_DIR_SDDL`]: the same ACEs, marked inherited, not
+/// protected. `owner` replaces the owner (`BA` in the policy).
+fn install_file_sddl(owner: &str) -> String {
+    INSTALL_DIR_SDDL
+        .replace("OICI", "ID")
+        .replace("D:P", "D:")
+        .replace("O:BA", &format!("O:{owner}"))
+}
+
+fn installed_file_problem(sddl: &str) -> Option<String> {
+    problem_from_install_dir_file(&in_memory(sddl))
+}
+
+#[test]
+fn the_file_policy_accepts_what_a_file_inherits_from_the_install_directory() {
+    assert_eq!(installed_file_problem(&install_file_sddl("BA")), None);
+    assert_eq!(installed_file_problem(&install_file_sddl("SY")), None);
+}
+
+#[test]
+fn the_file_policy_refuses_one_more_ace() {
+    let sddl = install_file_sddl("BA").replace("(A;ID;FRFX;;;BU)", "(A;ID;FRFX;;;BU)(A;ID;FRFX;;;WD)");
+    assert!(installed_file_problem(&sddl).is_some_and(|p| p.contains("ACL")));
+}
+
+#[test]
+fn the_file_policy_refuses_one_less_ace_or_a_changed_mask() {
+    let without_users = install_file_sddl("BA").replace("(A;ID;FRFX;;;BU)", "");
+    assert!(installed_file_problem(&without_users).is_some(), "no Users");
+    let widened = install_file_sddl("BA").replace("(A;ID;FRFX;;;BU)", "(A;ID;FA;;;BU)");
+    assert!(installed_file_problem(&widened).is_some(), "Users full control");
+}
+
+#[test]
+fn the_file_policy_refuses_a_dacl_that_is_not_inherited() {
+    // The same ACEs, set on the file itself: a copy of the folder's, not what the folder gives.
+    let explicit = install_file_sddl("BA").replace(";ID;", ";;");
+    assert!(
+        installed_file_problem(&explicit).is_some_and(|p| p.contains("ACL")),
+        "explicit"
+    );
+    let protected = install_file_sddl("BA").replace("D:", "D:P");
+    assert!(installed_file_problem(&protected).is_some(), "protected");
+    let one_explicit = install_file_sddl("BA").replace("(A;ID;FRFX;;;BU)", "(A;;FRFX;;;BU)");
+    assert!(installed_file_problem(&one_explicit).is_some(), "one ACE not inherited");
+}
+
+#[test]
+fn the_file_policy_refuses_an_owner_that_is_not_system_or_administrators() {
+    let problem = installed_file_problem(&install_file_sddl("BU")).expect("a Users-owned file");
+    assert!(problem.contains("owner"), "{problem}");
+    assert!(!problem.contains("ACL"), "the ACL is fine: {problem}");
+}
+
 #[test]
 fn ensure_install_dir_rejects_a_regular_file() {
     let path = TempPath::new("file");

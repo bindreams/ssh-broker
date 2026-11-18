@@ -148,14 +148,6 @@ jobs:
         if: runner.os == 'Windows'
         run: Start-Service seclogon
 
-      # After `apply`'s sshd step has run, sshd resets every connection, and why is not known. This one test
-      # (profile `measure`) prints which part of the step does it, and it must run before any other test has
-      # changed sshd's files. It asserts nothing about the outcome, so its failure does not stop the run.
-      - name: Measure what makes sshd reset connections
-        if: runner.os == 'Windows'
-        continue-on-error: true
-        run: cargo nextest run --locked --profile measure
-
       - name: cargo nextest
         run: cargo nextest run --locked --profile ci
 

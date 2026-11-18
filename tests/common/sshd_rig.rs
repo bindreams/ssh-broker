@@ -137,23 +137,10 @@ fn administrators_authorized_keys() -> PathBuf {
 /// Restart the runner's `sshd` service, as an administrator does after `apply` says to: `apply` itself does not.
 /// `net stop` returns once the service has stopped, and `net start` once it runs. Machine-wide: CI only.
 pub fn restart_sshd() {
-    if let Err(why) = try_restart_sshd() {
-        panic!("{why}");
-    }
-}
-
-/// [`restart_sshd`] that says why it failed instead of panicking: for a guard that restarts the service while a
-/// test unwinds.
-pub fn try_restart_sshd() -> Result<(), String> {
     let (ok, said) = run("net", &["stop", "sshd"]);
-    if !ok {
-        return Err(format!("stop the sshd service: {said}"));
-    }
+    assert!(ok, "stop the sshd service: {said}");
     let (ok, said) = run("net", &["start", "sshd"]);
-    if !ok {
-        return Err(format!("start the sshd service: {said}"));
-    }
-    Ok(())
+    assert!(ok, "start the sshd service: {said}");
 }
 
 /// Make the runner's sshd accept `SSH_BROKER_ELEVATION` from a client, with the step `apply` takes (the drop-in
