@@ -24,6 +24,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "backon"
+version = "1.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cffb0e931875b666fc4fcb20fee52e9bbd1ef836fd9e9e04ec21555f9f85f7ef"
+dependencies = [
+ "fastrand",
+]
+
+[[package]]
 name = "bitflags"
 version = "2.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -70,10 +79,11 @@ checksum = "7f8f80099a98041a3d1622845c271458a2d73e688351bf3cb999266764b81d48"
 
 [[package]]
 name = "cosca"
-version = "0.6.0"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4ba63ea6bb20dd28d6337e203f75fee133435ee858e7822f19496fce57e6a44e"
+checksum = "ad6e5e034d75a52394c10d83ed4a7266e5fa03a0111ab1d3f3f5893a914b8e2b"
 dependencies = [
+ "backon",
  "event-listener",
  "exacl",
  "getrandom",
@@ -177,6 +187,12 @@ dependencies = [
  "scopeguard",
  "uuid",
 ]
+
+[[package]]
+name = "fastrand"
+version = "2.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
 
 [[package]]
 name = "fd-lock"
