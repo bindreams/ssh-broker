@@ -575,3 +575,252 @@ fn a_backup_operators_account_gets_the_stated_limit_at_the_prompt_and_is_served_
     session_end::log_out_running(&kit.exe, &account, ServiceLogon::TaskScheduler);
     autologin::off(&mut kit.autologin_env(&account.password), &local_account(&account)).unwrap();
 }
+
+// Spike 5: console attachment across the level (throwaway) =====
+
+/// The ids of the processes of `account` that run `kit`'s broker exe and are not agents: the shims sshd started.
+fn shims_of(kit: &Kit, account: &Account) -> std::collections::BTreeSet<u32> {
+    let agents = agents_of(kit, account);
+    let name = kit.exe.file_name().unwrap().to_string_lossy().into_owned();
+    process_list::snapshot()
+        .into_iter()
+        .filter(|entry| entry.exe.eq_ignore_ascii_case(&name) && !agents.contains(&entry.pid))
+        .filter(|entry| owner_of(entry.pid).as_deref() == Some(account.sid_text.as_str()))
+        .map(|entry| entry.pid)
+        .collect()
+}
+
+/// The user process `pid` runs as, in SDDL form.
+fn owner_of(pid: u32) -> Option<String> {
+    use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+    // SAFETY: a plain open by id; the handle is closed by `OwnedHandle`.
+    let process =
+        ssh_broker::winutil::OwnedHandle(unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.ok()?);
+    process_list::owner_sddl(process.0)
+}
+
+/// The integrity level and elevation of the token of process `pid`, as text.
+fn token_facts_of(pid: u32) -> String {
+    use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+    // SAFETY: a plain open by id; the handle is closed by `OwnedHandle`.
+    let opened = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) };
+    let process = match opened {
+        Ok(handle) => ssh_broker::winutil::OwnedHandle(handle),
+        Err(e) => return format!("could not open process {pid}: {e}"),
+    };
+    match ssh_broker::winutil::process_token(process.0) {
+        Ok(token) => format!(
+            "integrity {:?}, elevation {:?}",
+            ssh_broker::account::integrity_of(token.0),
+            ssh_broker::account::elevation_of(token.0)
+        ),
+        Err(e) => format!("could not open the token of process {pid}: {e:#}"),
+    }
+}
+
+/// The id of the shim a login started: the one process of [`shims_of`] that was not there `before`.
+fn the_new_shim(kit: &Kit, login: &Login<'_>, before: &std::collections::BTreeSet<u32>) -> u32 {
+    let now = shims_of(kit, login.account);
+    let new: Vec<u32> = now.difference(before).copied().collect();
+    match new.as_slice() {
+        [pid] => *pid,
+        _ => panic!(
+            "expected one new shim of {}, found {new:?} (all: {now:?})\n{}",
+            login.account.name,
+            (login.diagnostics())()
+        ),
+    }
+}
+
+/// A process the probe is to try `AttachConsole` on.
+struct ConsoleCandidate {
+    pid: u32,
+    exe: String,
+    role: String,
+}
+
+/// The shim, its ancestors up to and including `sshd.exe`, its descendants, and the console hosts those started:
+/// the processes that can share the console sshd gave the shim, from the process tree as the system lists it.
+fn console_candidates(shim: u32) -> Vec<ConsoleCandidate> {
+    let entries = process_list::snapshot();
+    let exe_of = |pid: u32| {
+        entries
+            .iter()
+            .find(|entry| entry.pid == pid)
+            .map_or_else(|| "(gone)".to_owned(), |entry| entry.exe.clone())
+    };
+    let mut found: Vec<ConsoleCandidate> = Vec::new();
+    let mut add = |pid: u32, role: String| {
+        if !found.iter().any(|c| c.pid == pid) {
+            found.push(ConsoleCandidate {
+                pid,
+                exe: exe_of(pid),
+                role,
+            });
+        }
+    };
+    add(shim, "the shim".to_owned());
+    // Up: the recorded parents, until the chain ends or `sshd.exe` has been added.
+    let mut seen = std::collections::BTreeSet::from([shim]);
+    let mut at = shim;
+    while let Some(parent) = entries.iter().find(|entry| entry.pid == at).map(|entry| entry.parent) {
+        let Some(above) = entries.iter().find(|entry| entry.pid == parent) else {
+            break;
+        };
+        if parent == 0 || !seen.insert(parent) {
+            break;
+        }
+        add(parent, format!("an ancestor of the shim (the parent of {at})"));
+        if above.exe.eq_ignore_ascii_case("sshd.exe") {
+            break;
+        }
+        at = parent;
+    }
+    // Down: everything the system lists under the shim.
+    let mut below = vec![shim];
+    while let Some(parent) = below.pop() {
+        for entry in entries.iter().filter(|entry| entry.parent == parent && entry.pid != 0) {
+            if seen.insert(entry.pid) {
+                add(entry.pid, format!("a descendant of the shim (a child of {parent})"));
+                below.push(entry.pid);
+            }
+        }
+    }
+    // The console hosts started by any of those.
+    let family: Vec<u32> = seen.iter().copied().collect();
+    for entry in &entries {
+        let host = entry.exe.eq_ignore_ascii_case("conhost.exe") || entry.exe.eq_ignore_ascii_case("OpenConsole.exe");
+        if host && family.contains(&entry.parent) {
+            add(
+                entry.pid,
+                format!("a console host started by {} ({})", entry.parent, exe_of(entry.parent)),
+            );
+        }
+    }
+    found
+}
+
+/// Q1 for the shim `shim` of one login, `case` naming it (`tt`, `t`): the candidates are written for the probe, which
+/// `ssh -T host internal-unelevated <helper> console-attach` runs in an unelevated session of the account; what
+/// it recorded goes to the measurement file. Returns the probe's lines.
+fn spike5_q1_probe(kit: &Kit, login: &Login<'_>, case: &str, shim: u32) -> String {
+    let record = |text: String| account_fixture::hive::record(&format!("SPIKE5 Q1: case {case}: {text}"));
+    let candidates = console_candidates(shim);
+    record(format!("the shim is process {shim}: {}", token_facts_of(shim)));
+    let mut text = String::new();
+    for candidate in &candidates {
+        record(format!(
+            "candidate {} {} ({}): {}",
+            candidate.pid,
+            candidate.exe,
+            candidate.role,
+            token_facts_of(candidate.pid)
+        ));
+        text += &format!("{}\t{}\t{}\n", candidate.pid, candidate.exe, candidate.role);
+    }
+    std::fs::write(kit.path(&format!("{case}.candidates")), text).unwrap();
+
+    let mut ssh = login.command();
+    ssh.arg("-T").arg("--").arg(format!(
+        "internal-unelevated {} console-attach {case}",
+        kit.helper.display()
+    ));
+    let outcome = run_client(ssh, false, kit.dir());
+    let said_unavailable = outcome
+        .stderr
+        .contains(&ssh_broker::shim_pty::unavailable_message(None));
+    record(format!(
+        "the probe's client ended with {:?}; the shim ran it itself, with no agent: {said_unavailable}",
+        outcome.code
+    ));
+    let result = std::fs::read_to_string(kit.path(&format!("{case}.result"))).unwrap_or_else(|e| {
+        panic!(
+            "case {case}: the probe wrote no result ({e}); stdout:\n{}\nstderr:\n{}\n{}",
+            String::from_utf8_lossy(&outcome.stdout),
+            outcome.stderr,
+            (login.diagnostics())()
+        )
+    });
+    for line in result.lines() {
+        record(line.to_owned());
+    }
+    result
+}
+
+/// Elevated (CI only). Spike 5, Q1: a process of an administrator's account below High asks to attach to the
+/// console of the shim sshd started (and of the processes that can share it), for a login with a terminal and
+/// one without. The answers are the data: each `AttachConsole` call and its `GetLastError` go to the measurement
+/// file; the test asserts only that both probes ran as unelevated processes.
+#[test]
+fn spike5_q1_console_attachment_from_below_high() {
+    use std::os::windows::io::AsRawHandle as _;
+
+    let _machine = machine::exclusive();
+    account_fixture::assert_elevated();
+    let kit = Kit::broker_with_helper("spk5");
+    let account = Account::create("spk5", true);
+    account.make_administrator();
+    let _end = session_end::LogOutOnDrop::new(&kit.exe, &account, ServiceLogon::Sshd);
+    let login = Login::new(&kit, &account);
+    set_default_shell_under(OPENSSH_KEY, &kit.exe.to_string_lossy(), &no_shell_to_carry())
+        .expect("set the shim as DefaultShell");
+
+    // With a terminal: the first login starts the account's session at the password prompt and keeps the shim.
+    let before = shims_of(&kit, &account);
+    let mut first = login.start();
+    first.log_in(&account.password);
+    let agent = first.check_relayed_shell();
+    account_fixture::hive::record(&format!(
+        "SPIKE5 Q1: case tt: a login with a terminal (ssh -tt host); the agent is process {agent}"
+    ));
+    let shim = the_new_shim(&kit, &login, &before);
+    let with_terminal = spike5_q1_probe(&kit, &login, "tt", shim);
+    first.leave();
+
+    // Without a terminal: a command held open by the agent keeps the shim.
+    let before = shims_of(&kit, &account);
+    let (ready, release) = (kit.path("t.hold.ready"), kit.path("t.hold.release"));
+    let mut ssh = login.command();
+    ssh.arg("-T")
+        .arg("--")
+        .arg(format!(
+            "{} console-hold {} {}",
+            kit.helper.display(),
+            ready.display(),
+            release.display()
+        ))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null());
+    let mut holder = ssh.spawn().expect("run the ssh client that holds the shim");
+    let handle = windows::Win32::Foundation::HANDLE(holder.as_raw_handle());
+    match stand_in::file_signal::wait_for_file(&ready, Some(handle), None, "the held command's ready signal") {
+        stand_in::file_signal::FileWaited::Appeared => {}
+        stand_in::file_signal::FileWaited::ProcessEnded(code) => panic!(
+            "the ssh client that holds the shim ended with {code:#x} before the command was up\n{}",
+            (login.diagnostics())()
+        ),
+    }
+    account_fixture::hive::record("SPIKE5 Q1: case t: a login without a terminal (ssh -T host <command>), held open");
+    let shim = the_new_shim(&kit, &login, &before);
+    let without_terminal = spike5_q1_probe(&kit, &login, "t", shim);
+    stand_in::file_signal::publish(&release, "go");
+    let code = bounded_wait::wait_for_exit(
+        handle,
+        holder.id(),
+        "the ssh client that held the shim",
+        bounded_wait::CHILD_EXIT_BOUND,
+        &[],
+    );
+    account_fixture::hive::record(&format!("SPIKE5 Q1: case t: the held ssh client ended with {code}"));
+    let _ = holder.wait();
+
+    for (case, result) in [("tt", &with_terminal), ("t", &without_terminal)] {
+        assert!(
+            result.contains(&format!(
+                "the probe runs at integrity {:#x}",
+                ssh_broker::account::INTEGRITY_MEDIUM
+            )),
+            "case {case}: the probe did not run below High:\n{result}"
+        );
+    }
+}

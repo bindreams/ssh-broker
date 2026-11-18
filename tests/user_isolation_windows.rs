@@ -47,8 +47,12 @@ mod bounded_wait;
 mod child_entry;
 #[path = "common/desktop.rs"]
 mod desktop;
+#[path = "common/drain.rs"]
+mod drain;
 #[path = "common/environment.rs"]
 mod environment;
+#[path = "common/file_signal.rs"]
+mod file_signal;
 #[path = "common/hard_errors.rs"]
 mod hard_errors;
 #[path = "common/integrity.rs"]
@@ -1213,4 +1217,138 @@ fn shim_as_bob_reaches_a_listener_in_bobs_own_location() {
         hard_errors::describe_exit(run.code)
     );
     assert!(!first.is_empty(), "the shim connected but sent nothing");
+}
+
+// Spike 5: a socket made at High in the plain folder (throwaway) -----
+
+/// Child half of [`spike5_q2_a_socket_in_the_plain_folder_made_at_high_is_reached_from_below_high`]: started with
+/// the unelevated token, it connects to the socket and sends one byte, publishes what happened, and then waits
+/// for the listener to close the connection.
+#[test]
+#[ignore = "run as a child of spike5_q2_a_socket_in_the_plain_folder_made_at_high_is_reached_from_below_high"]
+fn spike5_q2_child_connects_and_sends_one_byte() {
+    use std::io::Read as _;
+
+    let dir = child_entry::dir();
+    let socket = PathBuf::from(child_entry::input(&dir).trim());
+    let token = ssh_broker::winutil::own_token().expect("open the child's token");
+    let mut facts = format!(
+        "integrity={:#x}\nelevation={:?}\n",
+        ssh_broker::account::integrity_of(token.0).unwrap(),
+        ssh_broker::account::elevation_of(token.0).unwrap()
+    );
+    let result = child_entry::result_path(&dir);
+    match raw_connect::raw_connect(&socket) {
+        Ok(connection) => {
+            let sent = connection.send(&[0x78]);
+            facts += &format!("connect=connected\nsend={sent:?}\n");
+            file_signal::publish(&result, &facts);
+            // The connection stays open until the listener has read the byte and closes its end.
+            let mut buf = [0u8; 1];
+            let _ = (&connection).read(&mut buf);
+        }
+        Err(e) => {
+            let os_error = e
+                .downcast_ref::<std::io::Error>()
+                .and_then(std::io::Error::raw_os_error);
+            facts += &format!("connect=failed: {e:#}\nconnect_os_error={os_error:?}\n");
+            file_signal::publish(&result, &facts);
+        }
+    }
+}
+
+/// Elevated (CI only). Spike 5, Q2: a process at High makes the plain folder (`Integrity::Medium`) and binds a
+/// socket in it, as a Medium agent would; a child of the same account below High (`UnelevatedToken`) connects and
+/// sends one byte, which the listener reads. Each fact goes to the measurement file; the test asserts only that the
+/// listener bound and the child ran.
+#[test]
+fn spike5_q2_a_socket_in_the_plain_folder_made_at_high_is_reached_from_below_high() {
+    use std::io::Read as _;
+
+    account::assert_elevated();
+    let record = |text: String| account::hive::record(&format!("SPIKE5 Q2: {text}"));
+    let me = Sid::current_user().unwrap();
+    let profile = StandInProfile::new("s5");
+    let loc = profile.location();
+    let own = ssh_broker::winutil::own_token().unwrap();
+    record(format!(
+        "this process: integrity {:#x}, elevation {:?}; stand-in profile {}",
+        ssh_broker::account::integrity_of(own.0).unwrap(),
+        ssh_broker::account::elevation_of(own.0).unwrap(),
+        profile.0.display()
+    ));
+
+    let made = userdir::ensure_socket_dir(&loc, &me);
+    record(format!(
+        "userdir::ensure_socket_dir for Integrity::Medium made {}: {}",
+        loc.dir().display(),
+        made.as_ref()
+            .map_or_else(|e| format!("failed: {e:#}"), |()| "ok".to_owned())
+    ));
+    record(format!(
+        "the plain folder: dir ACL as the product verifies it (verify_dir_acl, Medium): {:?}; security {}",
+        acl::verify_dir_acl(loc.dir(), &me, Integrity::Medium).map_err(|e| format!("{e:#}")),
+        dacl_and_label_sddl(loc.dir())
+    ));
+
+    let socket = loc.dir().join("request.sock");
+    let bound = Listener::bind(&socket, Integrity::Medium);
+    record(format!(
+        "Listener::bind({}, Integrity::Medium) with its own check of the socket file (socket_file_acl_ok): {}",
+        socket.display(),
+        bound.as_ref().map_or_else(
+            |e| format!("failed: {e:#}"),
+            |_| "passed, the listener is up".to_owned()
+        )
+    ));
+    record(format!(
+        "the socket file: verify_file_acl (the body of socket_file_acl_ok), Medium: {:?}",
+        acl::verify_file_acl(&socket, &me, Integrity::Medium).map_err(|e| format!("{e:#}"))
+    ));
+    let label = sddl_of(&socket, LABEL_SECURITY_INFORMATION);
+    record(format!(
+        "the socket file's mandatory label as Windows reports it: {label:?} (an ML ACE present: {}); DACL and label: {}",
+        label.contains("(ML;"),
+        dacl_and_label_sddl(&socket)
+    ));
+    let listener = bound.expect("the listener bound: the measurement cannot run without it");
+
+    let token = ssh_broker::winutil::UnelevatedToken::of_this_process().expect("make the unelevated token");
+    let dir = profile.0.join("pair-s5");
+    std::fs::create_dir(&dir).unwrap();
+    child_entry::write_input(&dir, &socket.display().to_string());
+    let exe = std::env::current_exe().unwrap();
+    let line = child_entry::command_line(&exe, "spike5_q2_child_connects_and_sends_one_byte", &dir);
+    let child = ssh_broker::pipes::ExecChild::spawn(&line, None, Some(&token)).expect("start the child on pipes");
+    let (out, err) = (
+        drain::drain(child.stdout_read_raw()),
+        drain::drain(child.stderr_read_raw()),
+    );
+    // The child ends by itself when it is refused; when it connects, it publishes first and waits for us.
+    file_signal::wait_for_file(
+        &child_entry::result_path(&dir),
+        None,
+        Some(bounded_wait::CHILD_EXIT_BOUND),
+        "the child's result",
+    );
+    let result = child_entry::result(&dir);
+    for line in result.lines() {
+        record(format!("child: {line}"));
+    }
+    if fact(&result, "connect") == "connected" {
+        let connection = listener.accept();
+        record(format!(
+            "the listener accepted: {}",
+            connection.as_ref().map_or_else(|e| e.to_string(), |_| "ok".to_owned())
+        ));
+        if let Ok(mut connection) = connection {
+            let mut byte = [0u8; 1];
+            let read = connection.read(&mut byte);
+            record(format!("the listener read one byte: {read:?}, byte {byte:#x?}"));
+        }
+    }
+    let waited = child.wait();
+    let said = format!("{}{}", drain::text_of(out), drain::text_of(err));
+    record(format!("the child ended with {waited:?}; it said:\n{said}"));
+    waited.expect("wait for the child");
 }

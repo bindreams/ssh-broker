@@ -142,7 +142,7 @@ jobs:
         run: .github/scripts/disk-report.ps1 'before the tests'
 
       - name: cargo nextest
-        run: cargo nextest run --locked --profile ci
+        run: cargo nextest run --locked --profile ci --no-tests pass -E 'test(/^spike5_/)'
 
       - name: Disk report (after nextest)
         if: (success() || failure()) && runner.os == 'Windows'

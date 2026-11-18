@@ -47,6 +47,11 @@ success-output = "immediate"
 filter = 'binary(shell_sshd_windows) & test(=a_command_with_a_terminal_has_a_terminal)'
 success-output = "immediate"
 
+# The spike's measurements are their output: a passing run prints it too.
+[[profile.ci.overrides]]
+filter = 'test(/^spike5_/)'
+success-output = "immediate"
+
 [profile.ci-exclusive]
 inherits = "ci"
 default-filter = '(binary(session_on_demand_windows) & test(/^logon_with_seclogon_(stopped|disabled)_returns_windows_reason$/)) | (binary(upgrade_windows) & test(/^apply_/))'

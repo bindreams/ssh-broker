@@ -28,6 +28,8 @@ pub fn main() {
         Some("pty") => pty(Path::new(&args[1]), &args[2]),
         Some("connect") => connect(Path::new(&args[1]), Path::new(&args[2])),
         Some("console-size") => console_size(),
+        Some("console-hold") => console_hold(Path::new(&args[1]), Path::new(&args[2])),
+        Some("console-attach") => console_attach(&dir, &args[1]),
         // `<DefaultShell> -c <command>`: what sshd runs when this is the DefaultShell.
         Some("-c") => probe(),
         _ => std::process::exit(2),
@@ -292,6 +294,106 @@ fn console_size() {
             return;
         }
     }
+}
+
+/// Spike 5: publish `ready`, then stay until `release` exists. A process on a console of its own that a
+/// test holds open.
+fn console_hold(ready: &Path, release: &Path) {
+    file_signal::publish(ready, &std::process::id().to_string());
+    file_signal::wait_for_file(release, None, None, "the test's release signal");
+}
+
+/// Spike 5: `FreeConsole()` and then `AttachConsole(pid)` for each process of `<tag>.candidates` (lines
+/// `pid<TAB>exe<TAB>role`) and for a control, a process of this session on a console of its own. The
+/// return value and `GetLastError` of each go to `<tag>.result`. An attachment that is granted is freed at once
+/// and used for nothing.
+fn console_attach(dir: &Path, tag: &str) {
+    use std::os::windows::io::AsRawHandle as _;
+    use std::os::windows::process::CommandExt as _;
+    use std::process::Stdio;
+    use windows::Win32::System::Console::{AttachConsole, FreeConsole};
+
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    // `GetLastError` as the call's error carries it: the Win32 code inside an HRESULT, and the HRESULT itself.
+    let described = |e: &windows::core::Error| {
+        format!(
+            "GetLastError={} hresult={:#x} ({})",
+            e.code().0 as u32 & 0xFFFF,
+            e.code().0 as u32,
+            e.message().trim_end()
+        )
+    };
+
+    let mut lines = Vec::new();
+    let token = ssh_broker::winutil::own_token().expect("open the probe's token");
+    lines.push(format!(
+        "the probe runs at integrity {:#x}, elevation {:?}",
+        ssh_broker::account::integrity_of(token.0).expect("the probe's integrity"),
+        ssh_broker::account::elevation_of(token.0).expect("the probe's elevation")
+    ));
+
+    // The control: a process of this session on a console of its own, up before anything is attached to.
+    let (ready, release) = (
+        dir.join(format!("{tag}.control.ready")),
+        dir.join(format!("{tag}.control.release")),
+    );
+    let mut control = std::process::Command::new(std::env::current_exe().unwrap())
+        .arg("console-hold")
+        .arg(&ready)
+        .arg(&release)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn()
+        .expect("start the control process");
+    match file_signal::wait_for_file(
+        &ready,
+        Some(HANDLE(control.as_raw_handle())),
+        None,
+        "the control process's ready signal",
+    ) {
+        file_signal::FileWaited::Appeared => {}
+        file_signal::FileWaited::ProcessEnded(code) => panic!("the control process ended with {code:#x}"),
+    }
+    let mut targets = vec![(
+        control.id(),
+        "helper.exe".to_owned(),
+        "control: a process of this session on a console of its own".to_owned(),
+    )];
+    let candidates = std::fs::read_to_string(dir.join(format!("{tag}.candidates"))).expect("read the candidates");
+    for line in candidates.lines() {
+        let mut parts = line.splitn(3, '\t');
+        let pid: u32 = parts.next().unwrap().parse().expect("a process id");
+        targets.push((pid, parts.next().unwrap().to_owned(), parts.next().unwrap().to_owned()));
+    }
+
+    // SAFETY: no arguments; this process holds no console handle it still uses.
+    let freed = unsafe { FreeConsole() };
+    lines.push(format!(
+        "FreeConsole: {}",
+        freed.map_or_else(|e| described(&e), |()| "ok".to_owned())
+    ));
+    for (pid, exe, role) in targets {
+        // SAFETY: a plain call by process id.
+        let attached = unsafe { AttachConsole(pid) };
+        let said = match attached {
+            Ok(()) => {
+                // SAFETY: as above. Granted: given back at once, nothing is done on it.
+                let after = unsafe { FreeConsole() };
+                format!(
+                    "GRANTED (FreeConsole after it: {})",
+                    after.map_or_else(|e| described(&e), |()| "ok".to_owned())
+                )
+            }
+            Err(e) => format!("REFUSED {}", described(&e)),
+        };
+        lines.push(format!("AttachConsole({pid}) [{exe}; {role}]: {said}"));
+    }
+
+    file_signal::publish(&release, "go");
+    let _ = control.wait();
+    file_signal::publish(&dir.join(format!("{tag}.result")), &lines.join("\n"));
 }
 
 /// Connect to the socket at `socket` and write what happened to `result`: `connected`, `os error <n>`
