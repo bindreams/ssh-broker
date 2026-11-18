@@ -560,6 +560,44 @@ fn a_second_answer_is_a_protocol_error() {
     assert_eq!(sink.served, 1);
 }
 
+/// "First" is the connection's first frame, not the first of a call: a reader that has yielded a frame
+/// already, in an earlier `pump_decode` call, takes an answer as a protocol error.
+#[test]
+fn an_answer_in_a_later_pump_call_on_the_same_reader_is_a_protocol_error() {
+    for (name, answer) in [
+        ("Serving", framed(&[(FrameKind::Serving, &[])])),
+        ("HandBack", framed(&[(FrameKind::HandBack, b"late")])),
+    ] {
+        let mut fr = FrameReader::new();
+        let mut sink = TestSink::default();
+        let first = framed(&[(FrameKind::Data, &[Stream::Pty as u8, b'x'])]);
+        let outcome = pump_decode(&mut first.as_slice(), &mut fr, &mut sink).unwrap();
+        assert_eq!(outcome, Outcome::PeerClosed);
+        let err = pump_decode(&mut answer.as_slice(), &mut fr, &mut sink).expect_err("a late answer");
+        assert!(matches!(err, PumpError::Protocol(_)), "{name}: {err:?}");
+        assert_eq!(sink.served, 0, "{name}");
+    }
+}
+
+/// On the agent's side the handshake is frame one, so an answer kind from a client is a protocol error.
+#[test]
+fn a_client_that_sends_an_answer_after_its_handshake_is_a_protocol_error() {
+    use crate::protocol::{Handshake, read_one_frame};
+    for (name, answer) in [("Serving", FrameKind::Serving), ("HandBack", FrameKind::HandBack)] {
+        let wire = framed(&[
+            (FrameKind::Handshake, &Handshake::pty_default().encode().unwrap()),
+            (answer, b"not from a client"),
+        ]);
+        let mut rx = wire.as_slice();
+        let mut fr = FrameReader::new();
+        assert_eq!(read_one_frame(&mut rx, &mut fr).unwrap().kind, FrameKind::Handshake);
+        let mut sink = TestSink::default();
+        let err = pump_decode(&mut rx, &mut fr, &mut sink).expect_err("a client has no answer to give");
+        assert!(matches!(err, PumpError::Protocol(_)), "{name}: {err:?}");
+        assert_eq!(sink.served, 0, "{name}");
+    }
+}
+
 /// A failing `on_serving` is a sink failure, which says nothing about the peer.
 #[test]
 fn a_failing_on_serving_is_a_sink_failure() {

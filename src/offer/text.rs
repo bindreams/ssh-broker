@@ -93,10 +93,10 @@ pub fn always_filtered() -> String {
 }
 
 /// What a login that asked for a level is told when its unelevated session cannot be made: nothing was run, and
-/// what a login that asked for none is given instead. Said by the agent and by the shim, so it is worded for
-/// both: neither gives a fallback session the agent's token. Split into what and cause as
+/// that a login that asked for none is not refused. Said by the agent and by the shim, so it is worded for
+/// both: the agent hands such a login back, and the shim runs it. Split into what and cause as
 /// [`ALWAYS_BELOW_HIGH_WHAT`] is.
-pub const UNELEVATED_UNAVAILABLE_WHAT: &str = "could not prepare an unelevated session, so nothing was run (a login that leaves SSH_BROKER_ELEVATION unset is given a session that is not stepped down, with a notice)";
+pub const UNELEVATED_UNAVAILABLE_WHAT: &str = "could not prepare an unelevated session, so nothing was run (a login that leaves SSH_BROKER_ELEVATION unset is not refused)";
 
 /// The `what` of a login that `asked` for a level and cannot be stepped down: for `always` the level of the process
 /// could not be read ([`ALWAYS_LEVEL_UNREADABLE_WHAT`]), which is the only way it fails; for any other level the

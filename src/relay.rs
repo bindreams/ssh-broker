@@ -111,7 +111,7 @@ pub fn write_data<W: Write>(w: &mut W, stream: Stream, bytes: &[u8]) -> anyhow::
     write_frame(w, FrameKind::Data, &payload)
 }
 
-/// Write the agent's answer `Serving`: it will serve the session (see [`FrameKind`]).
+/// Write the agent's answer `Serving`: the session's process has started (see [`FrameKind`]).
 pub fn write_serving<W: Write>(w: &mut W) -> anyhow::Result<()> {
     write_frame(w, FrameKind::Serving, &[])
 }
@@ -142,15 +142,15 @@ pub trait FrameSink {
 /// handshake read via `protocol::read_one_frame`. A `HANDSHAKE` frame mid-stream is a
 /// protocol violation (error).
 ///
-/// The agent's answer is recognised only as the first frame: `Serving` calls [`FrameSink::on_serving`] and
-/// the pump goes on; `HandBack` ends it as [`Outcome::HandedBack`]. Either one anywhere else is a
-/// [`PumpError::Protocol`].
+/// The agent's answer is recognised only as the connection's first frame (`fr` counts across calls):
+/// `Serving` calls [`FrameSink::on_serving`] and the pump goes on; `HandBack` ends it as
+/// [`Outcome::HandedBack`]. Either one anywhere else is a [`PumpError::Protocol`]; so on the agent's side,
+/// where the handshake was frame one, an answer kind from a client is.
 pub fn pump_decode<R: Read>(r: &mut R, fr: &mut FrameReader, sink: &mut impl FrameSink) -> Result<Outcome, PumpError> {
     let mut buf = [0u8; 32 * 1024];
-    let mut first = true;
     loop {
         while let Some(frame) = fr.next_frame().map_err(PumpError::Protocol)? {
-            let is_first = std::mem::take(&mut first);
+            let is_first = fr.frames_read() == 1;
             match frame.kind {
                 FrameKind::Serving | FrameKind::HandBack if !is_first => {
                     return Err(PumpError::Protocol(anyhow::anyhow!(

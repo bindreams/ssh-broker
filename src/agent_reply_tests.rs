@@ -656,12 +656,21 @@ fn agent_hands_back_a_login_that_set_nothing_when_it_cannot_step_it_down_and_sta
     }
 }
 
-/// A broken shell configuration changes nothing about it: the shell is the shim's business after a hand-back.
+/// A shell configuration the agent cannot plan changes nothing about a hand-back: the shell is the shim's business
+/// after it, and the agent reads the configuration only for a session it hosts. Here the configured shell is
+/// broken and the built-in `cmd.exe` cannot be found, so planning fails.
 #[test]
 fn agent_hands_back_before_it_reads_a_broken_shell_into_a_warning() {
     let _serial = STARTS_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     taken_starts();
-    let host = TestHost::new().with_user_config("shell: {strt: x}\n");
+    let host = TestHost {
+        no_system_dir: true,
+        ..TestHost::new().with_user_config("shell: {strt: x}\n")
+    };
+    assert!(
+        crate::shell::plan(&host, &crate::shell::Session::Interactive).is_err(),
+        "the host must fail the planning, or this test says nothing"
+    );
     let answer = at_high_without_a_token("handback-broken", host, Mode::Exec, Some("whoami"));
     assert_eq!(
         answer.outcome,
@@ -700,10 +709,10 @@ fn agent_does_not_hand_back_a_login_that_set_a_level() {
 
 // The answer -----
 
-/// An agent that serves a session says so first: `Serving`, then whatever the session does, here the failure
-/// reply of a start that fails after it. A working maker, `Own` and a `Token` alike.
+/// `Serving` means the session's process has started: a start that fails is answered with the ordinary failure
+/// reply as the first frame, and `Serving` was never sent. A working maker, `Own` and a `Token` alike.
 #[test]
-fn agent_answers_serving_first_and_a_start_that_fails_after_it_gets_the_ordinary_failure_reply() {
+fn a_start_that_fails_is_answered_with_the_failure_reply_alone_and_never_with_serving() {
     fn own(_: Option<ElevationPolicy>) -> anyhow::Result<StepDown<UnelevatedToken>> {
         Ok(StepDown::Own)
     }
@@ -721,7 +730,10 @@ fn agent_answers_serving_first_and_a_start_that_fails_after_it_gets_the_ordinary
                 hooks,
                 request_for(mode, command, ElevationPolicy::Prompt),
             );
-            assert_eq!(answer.served, 1, "{tag} {which}: Serving was not the first frame");
+            assert_eq!(
+                answer.served, 0,
+                "{tag} {which}: Serving was sent for a start that failed"
+            );
             assert_eq!(answer.outcome, Outcome::Exited(255), "{tag} {which}");
             assert!(
                 answer.stderr.contains("could not start the"),
@@ -754,4 +766,48 @@ fn agent_answers_serving_first_and_then_the_output_of_a_session_that_starts() {
     assert_eq!(answer.served, 1);
     assert_eq!(answer.outcome, Outcome::Exited(7));
     assert!(answer.stdout.contains("served"), "{}", answer.stdout);
+}
+
+static START_RAN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// `Serving` is written after the start hook has run, not before: what the client sees `Serving` for has started.
+#[test]
+fn the_start_hook_has_run_before_serving_is_written() {
+    use std::sync::atomic::Ordering;
+    /// Whether the start hook had run when the client heard `Serving`.
+    struct Hears(Option<bool>);
+    impl FrameSink for Hears {
+        fn on_serving(&mut self) -> anyhow::Result<()> {
+            self.0 = Some(START_RAN.load(Ordering::SeqCst));
+            Ok(())
+        }
+        fn on_data(&mut self, _stream: Stream, _bytes: &[u8]) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+    START_RAN.store(false, Ordering::SeqCst);
+    let hooks = Hooks {
+        make_unelevated: |_| Ok(StepDown::Own),
+        start_exec: |line, cwd, token| {
+            START_RAN.store(true, Ordering::SeqCst);
+            ExecChild::spawn(line, cwd, token)
+        },
+        ..Hooks::production()
+    };
+    let (server, client, dir) = crate::test_support::raw_socket_pair("serving-after-start");
+    let agent = std::thread::spawn(move || handle_connection_in(server, hooks, &Control::standalone()));
+    let (mut rx, mut tx) = afunix::split(client).unwrap();
+    handshake(Mode::Exec, "cmd.exe /c exit 0")(&mut tx);
+    let mut hears = Hears(None);
+    let outcome = pump_decode(&mut rx, &mut FrameReader::new(), &mut hears).expect("the reply was lost");
+    drop((rx, tx));
+    agent.join().unwrap().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert_eq!(outcome, Outcome::Exited(0));
+    assert_eq!(
+        hears.0,
+        Some(true),
+        "Serving was written before the session's process had started"
+    );
 }

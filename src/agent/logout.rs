@@ -172,10 +172,10 @@ pub(super) fn handle_logout<R: LimitedRead, W: std::io::Write>(
 /// [`ENDING_REFUSED_EXIT_CODE`], instead of being dropped without a word.
 ///
 /// The reply is followed by a FIN and a read until the client closes, as every reply that must
-/// arrive is: the client has sent its handshake and goes on sending input (an exec shim always ends
-/// with the stdin EOF marker), and closing with that unread would reset the connection and lose the
-/// reply. The read has the drain's bound ([`wait_for_client`]). The connection stays live for the
-/// drain until the read returns, so the process does not end under it.
+/// arrive is: a client sends no input before it has heard the agent's first frame, so nothing is unread
+/// when the reply goes, but one that sent some anyway would have the connection reset by a plain close,
+/// and the reply lost. The read has the drain's bound ([`wait_for_client`]). The connection stays live for
+/// the drain until the read returns, so the process does not end under it.
 pub(super) fn refuse_while_ending<R: LimitedRead, W: Write + HalfClose>(
     rx: &mut R,
     tx: &mut W,

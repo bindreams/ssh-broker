@@ -289,16 +289,16 @@ fn connect_failure_in_pty_mode_writes_nothing_to_stderr() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A fake agent that answers the first connection's handshake with `Serving`, reads the stdin-EOF marker
-/// that follows, and ends with `Exit(code)`. It returns the handshake it was sent.
+/// A stand-in agent (a [`CountingAgent`]) that answers each connection's handshake with `Serving`, reads the
+/// stdin-EOF marker that follows, and ends with `Exit(code)`. The handshakes it was sent come on the receiver.
 fn fake_agent_exiting_with(
     listener: crate::afunix::Listener,
+    socket: &std::path::Path,
     code: i32,
-) -> std::thread::JoinHandle<crate::protocol::Handshake> {
-    use crate::afunix;
+) -> (CountingAgent, mpsc::Receiver<crate::protocol::Handshake>) {
     use crate::protocol::{ExitCode, FrameKind, FrameReader, Handshake, Stream, read_one_frame, write_frame};
-    std::thread::spawn(move || {
-        let (mut rx, mut tx) = afunix::split(listener.accept().unwrap()).unwrap();
+    let (handshakes, received) = mpsc::channel();
+    let agent = CountingAgent::start(listener, socket, move |_, mut rx, mut tx| {
         let mut frames = FrameReader::new();
         let frame = read_one_frame(&mut rx, &mut frames).unwrap();
         assert_eq!(frame.kind, FrameKind::Handshake);
@@ -312,8 +312,11 @@ fn fake_agent_exiting_with(
             (FrameKind::Data, &[Stream::Stdin as u8][..])
         );
         write_frame(&mut tx, FrameKind::Exit, &ExitCode(code).encode()).unwrap();
-        Handshake::decode(&frame.payload).unwrap()
-    })
+        // The receiver is dropped by a test that does not look at the handshake.
+        let _ = handshakes.send(Handshake::decode(&frame.payload).unwrap());
+        After::Keep
+    });
+    (agent, received)
 }
 
 #[test]
@@ -326,7 +329,7 @@ fn try_relay_connects_to_the_location_its_provider_names() {
     let location = profile.location();
     crate::userdir::ensure_socket_dir(&location, &crate::acl::Sid::current_user().unwrap()).unwrap();
     let listener = Listener::bind(location.path(), crate::socket_loc::Integrity::Medium).unwrap();
-    let agent = fake_agent_exiting_with(listener, 7);
+    let (agent, handshakes) = fake_agent_exiting_with(listener, location.path(), 7);
 
     let relayed = super::try_relay(
         &Login {
@@ -345,7 +348,8 @@ fn try_relay_connects_to_the_location_its_provider_names() {
         Some(7),
         "the shim reached the listener at the provided location"
     );
-    assert_eq!(agent.join().unwrap().command.as_deref(), Some("echo hi"));
+    assert_eq!(agent.finish(), 1);
+    assert_eq!(handshakes.recv().unwrap().command.as_deref(), Some("echo hi"));
 }
 
 // A log that could not be set up -----
@@ -410,8 +414,9 @@ fn a_failed_log_does_not_touch_the_stderr_of_a_relayed_command() {
     let profile = crate::test_support::TempProfile::new("nolog-relay");
     let location = profile.location();
     crate::userdir::ensure_socket_dir(&location, &crate::acl::Sid::current_user().unwrap()).unwrap();
-    let agent = fake_agent_exiting_with(
+    let (agent, _) = fake_agent_exiting_with(
         Listener::bind(location.path(), crate::socket_loc::Integrity::Medium).unwrap(),
+        location.path(),
         0,
     );
     let mut stderr = Vec::new();
@@ -431,7 +436,7 @@ fn a_failed_log_does_not_touch_the_stderr_of_a_relayed_command() {
 
     assert_eq!(relayed, Some(0));
     assert!(stderr.is_empty(), "{}", String::from_utf8_lossy(&stderr));
-    agent.join().unwrap();
+    assert_eq!(agent.finish(), 1);
 }
 
 // The rescue: a user with no agent -----
@@ -537,8 +542,9 @@ fn a_rescue_is_not_asked_when_the_connect_succeeds() {
     let profile = crate::test_support::TempProfile::new("rescue-never");
     let location = profile.location();
     crate::userdir::ensure_socket_dir(&location, &crate::acl::Sid::current_user().unwrap()).unwrap();
-    let agent = fake_agent_exiting_with(
+    let (agent, _) = fake_agent_exiting_with(
         Listener::bind(location.path(), crate::socket_loc::Integrity::Medium).unwrap(),
+        location.path(),
         5,
     );
 
@@ -556,7 +562,7 @@ fn a_rescue_is_not_asked_when_the_connect_succeeds() {
     .unwrap();
 
     assert_eq!(relayed, Some(5));
-    agent.join().unwrap();
+    assert_eq!(agent.finish(), 1);
 }
 
 #[test]
@@ -567,8 +573,9 @@ fn a_rescue_that_connects_gets_the_session_relayed_through_its_connection() {
     let served = crate::test_support::TempProfile::new("rescue-served");
     let at = served.location();
     crate::userdir::ensure_socket_dir(&at, &crate::acl::Sid::current_user().unwrap()).unwrap();
-    let agent = fake_agent_exiting_with(
+    let (agent, handshakes) = fake_agent_exiting_with(
         Listener::bind(at.path(), crate::socket_loc::Integrity::Medium).unwrap(),
+        at.path(),
         9,
     );
     let socket = crate::afunix::connect(at.path()).unwrap();
@@ -588,7 +595,8 @@ fn a_rescue_that_connects_gets_the_session_relayed_through_its_connection() {
     .unwrap();
 
     assert_eq!(relayed, Some(9));
-    assert_eq!(agent.join().unwrap().command.as_deref(), Some("echo hi"));
+    assert_eq!(agent.finish(), 1);
+    assert_eq!(handshakes.recv().unwrap().command.as_deref(), Some("echo hi"));
 }
 
 #[test]
@@ -615,19 +623,16 @@ fn a_rescue_that_finds_the_input_gone_ends_the_shim_with_255_and_runs_nothing() 
 
 // An agent that ends the connection before it says anything -----
 
-/// A fake agent that takes one connection, reads `frames` frames from it, closes its listener and
-/// then the connection, so that the next connect finds nobody: it is an agent that is ending.
-fn agent_that_hangs_up(listener: crate::afunix::Listener, frames: usize) -> std::thread::JoinHandle<()> {
-    use crate::afunix;
+/// A stand-in agent (a [`CountingAgent`]) that takes one connection, reads `frames` frames from it, closes its
+/// listener and then the connection, so that the next connect finds nobody: it is an agent that is ending.
+fn agent_that_hangs_up(listener: crate::afunix::Listener, socket: &std::path::Path, frames: usize) -> CountingAgent {
     use crate::protocol::{FrameReader, read_one_frame};
-    std::thread::spawn(move || {
-        let (mut rx, tx) = afunix::split(listener.accept().unwrap()).unwrap();
+    CountingAgent::start(listener, socket, move |_, mut rx, tx| {
         let mut reader = FrameReader::new();
         for _ in 0..frames {
             read_one_frame(&mut rx, &mut reader).unwrap();
         }
-        drop(listener);
-        drop((rx, tx));
+        After::Retire(rx, tx)
     })
 }
 
@@ -660,7 +665,7 @@ fn a_command_whose_connection_ends_before_the_agent_answers_says_it_may_have_run
     // all an exec shim sends until the agent answers.
     for (tag, frames) in [("hangup-unread", 0), ("hangup-read", 1)] {
         let (_profile, location, listener) = location_with_listener(tag);
-        let agent = agent_that_hangs_up(listener, frames);
+        let agent = agent_that_hangs_up(listener, location.path(), frames);
         let mut stderr = Vec::new();
 
         let relayed = super::try_relay_at(
@@ -675,7 +680,7 @@ fn a_command_whose_connection_ends_before_the_agent_answers_says_it_may_have_run
             &mut Never,
         )
         .unwrap();
-        agent.join().unwrap();
+        assert_eq!(agent.finish(), 1, "{tag}");
 
         assert_eq!(relayed, Some(255), "{tag}");
         let text = String::from_utf8(stderr).unwrap();
@@ -701,6 +706,7 @@ fn a_command_is_never_sent_to_an_agent_a_second_time() {
             write_frame(&mut tx, FrameKind::Exit, &ExitCode(0).encode()).unwrap();
             let _ = tx.shutdown_write();
         }
+        After::Keep
     });
 
     let relayed = super::try_relay_at(
@@ -725,7 +731,7 @@ fn an_interactive_session_whose_connection_ends_before_the_agent_answers_takes_t
     use super::Interactive;
     use crate::shim::Pumped;
     let (_profile, location, listener) = location_with_listener("hangup-pty");
-    let mut agent = Some(agent_that_hangs_up(listener, 0));
+    let mut agent = Some(agent_that_hangs_up(listener, location.path(), 0));
     let mut rescue = Scripted::answering(Rescued::Plain);
     let mut stderr = Vec::new();
     let mut attempts = 0;
@@ -743,7 +749,9 @@ fn an_interactive_session_whose_connection_ends_before_the_agent_answers_takes_t
         &mut |_conn, _modes, _login| {
             attempts += 1;
             // The pump ends when the agent closes the connection, which it does after its listener.
-            agent.take().expect("one attempt").join().unwrap();
+            let agent = agent.take().expect("one attempt");
+            agent.wait_retired();
+            assert_eq!(agent.finish(), 1);
             Ok(Interactive::Pumped(Pumped::closed(anyhow::Error::new(
                 std::io::Error::from(std::io::ErrorKind::ConnectionReset),
             ))))
@@ -763,12 +771,13 @@ fn an_interactive_session_goes_round_again_to_an_agent_that_answers_the_second_t
     use crate::relay::Outcome;
     use crate::shim::Pumped;
     let (_profile, location, listener) = location_with_listener("hangup-serve");
-    let (finished, wait_finished) = std::sync::mpsc::channel::<()>();
-    let agent = std::thread::spawn(move || {
-        drop(listener.accept().unwrap());
-        let second = listener.accept().unwrap();
-        wait_finished.recv().ok();
-        drop(second);
+    // The first connection is closed without a byte, and the second is held until the agent is finished.
+    let mut held = Vec::new();
+    let agent = CountingAgent::start(listener, location.path(), move |nth, rx, tx| {
+        if nth > 1 {
+            held.push((rx, tx));
+        }
+        After::Keep
     });
     let mut attempts = 0;
 
@@ -797,27 +806,19 @@ fn an_interactive_session_goes_round_again_to_an_agent_that_answers_the_second_t
         },
     )
     .unwrap();
-    finished.send(()).unwrap();
-    agent.join().unwrap();
+    agent.finish();
 
     assert_eq!(attempts, 2);
     assert_eq!(relayed, Some(7));
 }
 
-/// The agent at `location` takes `connections` connections, closes each without a byte, and keeps its
-/// listener until `finished` is sent.
-fn agent_that_always_hangs_up(
-    listener: crate::afunix::Listener,
-    connections: usize,
-) -> (std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>) {
-    let (finished, wait_finished) = std::sync::mpsc::channel::<()>();
-    let agent = std::thread::spawn(move || {
-        for _ in 0..connections {
-            drop(listener.accept().unwrap());
-        }
-        wait_finished.recv().ok();
-    });
-    (finished, agent)
+/// A stand-in agent (a [`CountingAgent`]) that closes each connection without a byte and keeps its listener
+/// until it is finished.
+fn agent_that_always_hangs_up(listener: crate::afunix::Listener, socket: &std::path::Path) -> CountingAgent {
+    CountingAgent::start(listener, socket, |_, rx, tx| {
+        drop((rx, tx));
+        After::Keep
+    })
 }
 
 fn hung_up() -> super::Interactive {
@@ -833,7 +834,7 @@ fn a_second_connection_that_ends_without_a_byte_is_a_protocol_violation_not_a_re
     // there and hangs up again.
     let (_profile, location, listener) = location_with_listener("hangup-twice");
     let socket = location.path().to_path_buf();
-    let (finished, agent) = agent_that_always_hangs_up(listener, 2);
+    let agent = agent_that_always_hangs_up(listener, location.path());
     let mut stderr = Vec::new();
     let mut attempts = 0;
 
@@ -858,8 +859,7 @@ fn a_second_connection_that_ends_without_a_byte_is_a_protocol_violation_not_a_re
         },
     )
     .unwrap();
-    finished.send(()).unwrap();
-    agent.join().unwrap();
+    agent.finish();
 
     assert_eq!(attempts, 2);
     assert_eq!(relayed, Some(254));
@@ -885,9 +885,9 @@ fn a_folder_that_was_missing_at_the_first_act_is_connected_through_when_it_appea
     assert!(folder.refusal().is_none(), "no folder is not a refused one");
     std::fs::create_dir_all(profile.0.join(r"AppData\Local")).unwrap();
     crate::userdir::ensure_socket_dir(&location, &Sid::current_user().unwrap()).unwrap();
-    let (finished, agent) = agent_that_always_hangs_up(
+    let agent = agent_that_always_hangs_up(
         crate::afunix::Listener::bind(location.path(), crate::socket_loc::Integrity::Medium).unwrap(),
-        2,
+        location.path(),
     );
     let mut stderr = Vec::new();
     let mut attempts = 0;
@@ -912,8 +912,7 @@ fn a_folder_that_was_missing_at_the_first_act_is_connected_through_when_it_appea
         },
     )
     .unwrap();
-    finished.send(()).unwrap();
-    agent.join().unwrap();
+    agent.finish();
 
     assert_eq!(attempts, 2);
     assert_eq!(relayed, Some(254));
@@ -935,13 +934,13 @@ fn a_no_byte_close_before_and_after_a_connect_that_failed_are_not_consecutive() 
     // a different agent, not the same one twice.
     use crate::afunix::Listener;
     let (_profile, location, listener) = location_with_listener("hu-first");
-    let mut first = Some(agent_that_hangs_up(listener, 0));
+    let mut first = Some(agent_that_hangs_up(listener, location.path(), 0));
     let served = crate::test_support::TempProfile::new("hu-served");
     let at = served.location();
     crate::userdir::ensure_socket_dir(&at, &crate::acl::Sid::current_user().unwrap()).unwrap();
-    let (finished, second) = agent_that_always_hangs_up(
+    let second = agent_that_always_hangs_up(
         Listener::bind(at.path(), crate::socket_loc::Integrity::Medium).unwrap(),
-        1,
+        at.path(),
     );
     let socket = crate::afunix::connect(at.path()).unwrap();
     let mut rescue = Answers([Rescued::Connected { socket, modes: None }, Rescued::Plain].into());
@@ -961,14 +960,14 @@ fn a_no_byte_close_before_and_after_a_connect_that_failed_are_not_consecutive() 
             attempts += 1;
             // The pump of the first connection ends when the agent closes it, after its listener.
             if let Some(first) = first.take() {
-                first.join().unwrap();
+                first.wait_retired();
+                assert_eq!(first.finish(), 1);
             }
             Ok(hung_up())
         },
     )
     .unwrap();
-    finished.send(()).unwrap();
-    second.join().unwrap();
+    second.finish();
 
     assert_eq!(attempts, 2);
     assert_eq!(relayed, None, "the last rescue gave up: the shim fails open");
@@ -1016,7 +1015,7 @@ fn a_command_with_a_console_relays_as_a_pty_session_with_the_command() {
 #[test]
 fn a_command_without_a_terminal_does_not_take_the_console_relay() {
     let (_profile, location, listener) = location_with_listener("exec-not-pty");
-    let agent = fake_agent_exiting_with(listener, 4);
+    let (agent, handshakes) = fake_agent_exiting_with(listener, location.path(), 4);
 
     let relayed = super::try_relay_with(
         &folder_of(Ok(location)),
@@ -1033,14 +1032,15 @@ fn a_command_without_a_terminal_does_not_take_the_console_relay() {
     .unwrap();
 
     assert_eq!(relayed, Some(4));
-    assert_eq!(agent.join().unwrap().command.as_deref(), Some("echo hi"));
+    assert_eq!(agent.finish(), 1);
+    assert_eq!(handshakes.recv().unwrap().command.as_deref(), Some("echo hi"));
 }
 
 #[test]
 fn a_command_asks_the_agent_for_the_policy_of_its_login() {
     for (n, elevation) in asked_policies().enumerate() {
         let (_profile, location, listener) = location_with_listener(&format!("pol-exec-{n}"));
-        let agent = fake_agent_exiting_with(listener, 0);
+        let (agent, handshakes) = fake_agent_exiting_with(listener, location.path(), 0);
         let relayed = super::try_relay_with(
             &folder_of(Ok(location)),
             &Login {
@@ -1055,7 +1055,8 @@ fn a_command_asks_the_agent_for_the_policy_of_its_login() {
         )
         .unwrap();
         assert_eq!(relayed, Some(0), "{elevation:?}");
-        let handshake = agent.join().unwrap();
+        assert_eq!(agent.finish(), 1, "{elevation:?}");
+        let handshake = handshakes.recv().unwrap();
         assert_eq!(handshake.elevation, elevation);
         assert_eq!(handshake.command.as_deref(), Some("whoami"), "{elevation:?}");
     }
@@ -1097,7 +1098,7 @@ fn an_unanswered_terminal_command_is_not_sent_again() {
     // The agent may have started the command before it ended the connection. This agent is still
     // listening and would take a second one.
     let (_profile, location, listener) = location_with_listener("terminal-twice");
-    let (finished, agent) = agent_that_always_hangs_up(listener, 1);
+    let agent = agent_that_always_hangs_up(listener, location.path());
     let mut stderr = Vec::new();
     let mut attempts = 0;
 
@@ -1118,8 +1119,7 @@ fn an_unanswered_terminal_command_is_not_sent_again() {
         },
     )
     .unwrap();
-    finished.send(()).unwrap();
-    agent.join().unwrap();
+    agent.finish();
 
     assert_eq!(attempts, 1);
     assert_eq!(relayed, Some(255));
@@ -1139,11 +1139,25 @@ fn hand_back_line(cause: &str) -> String {
     )
 }
 
-/// A stand-in agent that serves each connection with `answer(rx, tx)` on its own thread of control until it is
-/// finished, and counts the connections.
+/// What a stand-in agent does once it has served a connection.
+enum After {
+    /// Take the next connection.
+    Keep,
+    /// End. The listener closes first, so that a connect made once this connection is seen to close finds nobody,
+    /// and then the connection's halves close.
+    Retire(crate::afunix::ConnRx, crate::afunix::ConnTx),
+}
+
+/// A stand-in agent that serves each connection with `answer(nth, rx, tx)` on a thread of its own until it
+/// retires ([`After::Retire`]) or is finished, and counts the connections. The one stand-in agent of this file:
+/// the others are constructors over it.
 struct CountingAgent {
-    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    connections: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    stop: Arc<AtomicBool>,
+    connections: Arc<std::sync::atomic::AtomicUsize>,
+    /// Set before the listener closes, on a retirement or a stop: a connect refused after it is no fault.
+    ending: Arc<AtomicBool>,
+    /// Sent once the listener and the connection of a retirement have closed.
+    retired: mpsc::Receiver<()>,
     socket: std::path::PathBuf,
     thread: std::thread::JoinHandle<()>,
 }
@@ -1152,14 +1166,16 @@ impl CountingAgent {
     fn start(
         listener: crate::afunix::Listener,
         socket: &std::path::Path,
-        mut answer: impl FnMut(usize, crate::afunix::ConnRx, crate::afunix::ConnTx) + Send + 'static,
+        mut answer: impl FnMut(usize, crate::afunix::ConnRx, crate::afunix::ConnTx) -> After + Send + 'static,
     ) -> CountingAgent {
         use crate::afunix::AcceptError;
-        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-        let stop = std::sync::Arc::new(AtomicBool::new(false));
-        let connections = std::sync::Arc::new(AtomicUsize::new(0));
+        use std::sync::atomic::AtomicUsize;
+        let stop = Arc::new(AtomicBool::new(false));
+        let connections = Arc::new(AtomicUsize::new(0));
+        let ending = Arc::new(AtomicBool::new(false));
+        let (retired_tx, retired) = mpsc::channel();
         let thread = std::thread::spawn({
-            let (stop, connections) = (std::sync::Arc::clone(&stop), std::sync::Arc::clone(&connections));
+            let (stop, connections, ending) = (Arc::clone(&stop), Arc::clone(&connections), Arc::clone(&ending));
             move || {
                 loop {
                     let conn = match listener.accept() {
@@ -1168,35 +1184,66 @@ impl CountingAgent {
                         // interrupted call serves nobody: the next accept, or the end.
                         Err(AcceptError::Connection(_) | AcceptError::Interrupted(_)) => {
                             if stop.load(Ordering::SeqCst) {
-                                return;
+                                break;
                             }
                             continue;
                         }
                         Err(e) => panic!("the stand-in agent could not accept: {e:?}"),
                     };
                     if stop.load(Ordering::SeqCst) {
-                        return;
+                        break;
                     }
                     let nth = connections.fetch_add(1, Ordering::SeqCst) + 1;
                     let (rx, tx) = crate::afunix::split(conn).unwrap();
-                    answer(nth, rx, tx);
+                    match answer(nth, rx, tx) {
+                        After::Keep => {}
+                        After::Retire(rx, tx) => {
+                            ending.store(true, Ordering::SeqCst);
+                            drop(listener);
+                            drop((rx, tx));
+                            let _ = retired_tx.send(());
+                            return;
+                        }
+                    }
                 }
+                // Stopped: the listener closes as this returns, and a connection queued after it is refused.
+                ending.store(true, Ordering::SeqCst);
             }
         });
         CountingAgent {
             stop,
             connections,
+            ending,
+            retired,
             socket: socket.to_path_buf(),
             thread,
         }
     }
 
-    /// Stop the agent, which takes the connection this makes as its last, and return how many it served.
+    /// Wait until the agent has retired: its listener and the connection that retired it are closed.
+    fn wait_retired(&self) {
+        self.retired.recv().expect("the stand-in agent ended without retiring");
+    }
+
+    /// Stop the agent, which takes the connection this makes as its last, and return how many it served. One
+    /// that is queued and not yet accepted when this is called is not served or counted.
     fn finish(self) -> usize {
-        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
-        drop(crate::afunix::connect(&self.socket).unwrap());
+        self.stop.store(true, Ordering::SeqCst);
+        match crate::afunix::connect(&self.socket) {
+            Ok(sentinel) => drop(sentinel),
+            // An agent that is ending closed its listener first (it retired, or took a connection queued
+            // before this one as the last): nothing is waiting to be woken.
+            Err(_) if self.ending.load(Ordering::SeqCst) => {}
+            Err(e) => {
+                // An answer that panicked has closed the listener on its way out; its panic is the cause.
+                if self.thread.is_finished() {
+                    self.thread.join().unwrap();
+                }
+                panic!("the stand-in agent's listener refused the connection that stops it: {e:#}");
+            }
+        }
         self.thread.join().unwrap();
-        self.connections.load(std::sync::atomic::Ordering::SeqCst)
+        self.connections.load(Ordering::SeqCst)
     }
 }
 
@@ -1213,8 +1260,9 @@ fn a_command_the_agent_hands_back_falls_open_after_the_cause_with_its_stdin_unre
         assert_eq!(frame.kind, crate::protocol::FrameKind::Handshake);
         crate::relay::write_hand_back(&mut tx, "the token cannot be made").unwrap();
         // Nothing the shim sent is unread (it sent the handshake and, until the answer, nothing else), so
-        // closing at once cannot lose the answer.
-        tx.shutdown_write().unwrap();
+        // closing at once cannot lose the answer. The shim may have gone first.
+        let _ = tx.shutdown_write();
+        After::Keep
     });
     let (stdin, input_dropped, reads) = RecordedInput::new(b"for the shell that runs the command");
     let mut stderr = Vec::new();
@@ -1289,7 +1337,7 @@ fn a_session_with_a_terminal_the_agent_hands_back_falls_open_after_the_cause_wit
 #[test]
 fn a_close_without_a_byte_is_not_a_hand_back() {
     let (_profile, location, listener) = location_with_listener("nobyte");
-    let (finished, agent) = agent_that_always_hangs_up(listener, 1);
+    let agent = agent_that_always_hangs_up(listener, location.path());
     let mut stderr = Vec::new();
 
     let relayed = super::try_relay_with(
@@ -1305,8 +1353,7 @@ fn a_close_without_a_byte_is_not_a_hand_back() {
         &mut |_conn, _modes, _login| panic!("a command without a terminal used the console relay"),
     )
     .unwrap();
-    finished.send(()).unwrap();
-    agent.join().unwrap();
+    agent.finish();
 
     assert_eq!(relayed, Some(255));
     let text = String::from_utf8(stderr).unwrap();
@@ -1323,7 +1370,7 @@ use std::sync::{Arc, mpsc};
 /// The worker is started by the answer: before it the write half is held and no thread exists.
 #[test]
 fn the_input_worker_is_not_started_until_the_answer_and_then_gets_the_write_half() {
-    let mut input = Input::waiting("the write half");
+    let mut input = Input::Waiting("the write half");
     let mut spawned = Vec::new();
     input
         .start(|tx| {
@@ -1342,7 +1389,7 @@ fn the_input_worker_is_not_started_until_the_answer_and_then_gets_the_write_half
 fn a_started_input_worker_is_stopped_then_joined() {
     let (release, wait_for_stop) = mpsc::channel::<()>();
     let finished = Arc::new(AtomicBool::new(false));
-    let mut input = Input::waiting(());
+    let mut input = Input::Waiting(());
     input
         .start(|()| {
             let finished = Arc::clone(&finished);
@@ -1371,7 +1418,7 @@ fn a_started_input_worker_is_stopped_then_joined() {
 /// write half is closed from here, so the agent sees the client go.
 #[test]
 fn an_input_worker_that_was_never_started_is_not_stopped_or_joined_and_its_write_half_is_closed() {
-    let mut input = Input::waiting("the write half");
+    let mut input = Input::Waiting("the write half");
     let mut closed = Vec::new();
     input.end(|| panic!("stopped a worker that never started"), |tx| closed.push(tx));
     assert_eq!(closed, ["the write half"]);

@@ -13,7 +13,7 @@ fn header_roundtrips() {
     assert_eq!(FrameHeader::decode(&bytes).unwrap(), h);
 }
 
-/// The answer's two kinds have the numbers the contract gives them, and a version-4 peer reads them.
+/// The answer's two kinds have the numbers the contract gives them, and a version-5 peer reads them.
 #[test]
 fn the_answer_kinds_have_their_numbers_and_decode() {
     assert_eq!(FrameKind::Serving as u8, 4);
@@ -154,6 +154,23 @@ fn reader_returns_none_when_incomplete() {
     assert!(reader.next_frame().unwrap().is_none());
     reader.push(b"bc");
     assert_eq!(reader.next_frame().unwrap().unwrap().payload, b"abc");
+}
+
+/// The reader counts the frames it has yielded over the whole connection: a frame still incomplete and a
+/// malformed one are not counted.
+#[test]
+fn the_reader_counts_the_frames_it_has_yielded() {
+    let mut reader = FrameReader::new();
+    assert_eq!(reader.frames_read(), 0);
+    reader.push(&[FrameKind::Data as u8, 3, 0, 0, 0, b'a']);
+    assert!(reader.next_frame().unwrap().is_none());
+    assert_eq!(reader.frames_read(), 0);
+    reader.push(b"bc");
+    reader.next_frame().unwrap().unwrap();
+    assert_eq!(reader.frames_read(), 1);
+    reader.push(&[9, 0, 0, 0, 0]);
+    assert!(reader.next_frame().is_err());
+    assert_eq!(reader.frames_read(), 1);
 }
 
 #[test]
@@ -314,11 +331,11 @@ fn a_version_1_handshake_is_refused_with_the_version_message() {
     );
 }
 
-/// The version is 4: the elevation field's wire layout differs from version 3.
+/// The version is 5: the first frame of the agent is its answer, which version 4 did not have.
 #[test]
-fn the_wire_version_is_4() {
-    assert_eq!(PROTOCOL_VERSION, 4);
-    assert_eq!(Handshake::pty_default().version, 4);
+fn the_wire_version_is_5() {
+    assert_eq!(PROTOCOL_VERSION, 5);
+    assert_eq!(Handshake::pty_default().version, 5);
 }
 
 #[test]
@@ -456,7 +473,7 @@ fn a_version_2_handshake_is_refused_with_the_version_message() {
     })
     .unwrap();
     let error = Handshake::decode(&bytes).unwrap_err().to_string();
-    assert!(error.contains("peer 2") && error.contains("ours 4"), "{error}");
+    assert!(error.contains("peer 2") && error.contains("ours 5"), "{error}");
 }
 
 /// A peer of another version is refused by its number.
@@ -489,5 +506,19 @@ fn a_version_3_handshake_is_refused_with_the_version_message() {
     })
     .unwrap();
     let error = Handshake::decode(&bytes).unwrap_err().to_string();
-    assert!(error.contains("peer 3") && error.contains("ours 4"), "{error}");
+    assert!(error.contains("peer 3") && error.contains("ours 5"), "{error}");
+}
+
+/// A peer of version 4 has the layout of this one and not its first frame (an answer, then no input before it):
+/// it is refused by its number, not let through to misbehave.
+#[test]
+fn a_version_4_handshake_is_refused_with_the_version_message() {
+    let bytes = Handshake {
+        version: 4,
+        ..Handshake::pty_default()
+    }
+    .encode()
+    .unwrap();
+    let error = Handshake::decode(&bytes).unwrap_err().to_string();
+    assert!(error.contains("peer 4") && error.contains("ours 5"), "{error}");
 }

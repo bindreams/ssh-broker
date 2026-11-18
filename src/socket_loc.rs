@@ -67,8 +67,8 @@ pub enum StepDown<K> {
     /// No session: the login asked for an elevated one and this process is below High.
     Refused,
     /// A login that set nothing could not be stepped down; the error is why, formatted with its context. The
-    /// agent hosts no such session and hands it back (`FrameKind::HandBack`); the shim, which runs it, gives
-    /// it its own token with a notice. A login that asked for a level is refused instead.
+    /// agent hosts no such session and hands it back (`FrameKind::HandBack`); in the shim's fail-open shell it
+    /// runs with sshd's token, after a notice. A login that asked for a level is refused instead.
     Fallback(String),
 }
 

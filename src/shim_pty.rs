@@ -701,8 +701,9 @@ fn run_pty(
     let stdin_raw = modes.stdin.0 as isize;
     let stdout_raw = modes.stdout.0 as isize;
 
-    // Handshake first (MAIN owns tx until the worker spawn consumes it), so the agent has
-    // spawned + sized the shell before the first keystroke/resize frame arrives.
+    // Handshake first (MAIN owns tx until the agent's `Serving` hands it to the input worker): the
+    // worker, which sends the first keystroke and resize frame, starts only after the agent has started
+    // and sized the shell.
     if let Err(e) = write_frame(&mut tx, FrameKind::Handshake, &hs.encode()?) {
         return if peer_gone(&e).is_some() {
             Ok(Pumped::closed(e))
@@ -724,7 +725,7 @@ fn run_pty(
         filter: XtwinopsFilter::new(),
         sniffer: MouseModeSniffer::new(),
         gate,
-        input: Input::waiting(tx),
+        input: Input::Waiting(tx),
         stdin_raw,
         stopping: Arc::clone(&stopping),
     };
@@ -762,12 +763,9 @@ enum Input<T> {
 }
 
 impl<T> Input<T> {
-    fn waiting(tx: T) -> Input<T> {
-        Input::Waiting(tx)
-    }
-
     /// Start the worker with `spawn`, which is given the write half. An error if it was started before
-    /// or is over: the answer comes once.
+    /// or is over: the pump takes `Serving` once, as the connection's first frame, so this is the total
+    /// answer and not a case it reaches.
     fn start(&mut self, spawn: impl FnOnce(T) -> std::thread::JoinHandle<()>) -> anyhow::Result<()> {
         match std::mem::replace(self, Input::Ended) {
             Input::Waiting(tx) => {

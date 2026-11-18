@@ -397,11 +397,11 @@ fn always_below_high_is_the_line_the_agents_reply_shares() {
     assert!(!text::always_below_high().contains("administrator"));
 }
 
-/// The sentence for a session whose token cannot be made, for a login that asked for a level, says what a login
-/// that asked for none is given. It is true at the agent and at the shim, and says nothing of `always`, whose
-/// refusal has sentences of its own.
+/// The sentence for a session whose token cannot be made, for a login that asked for a level, says that a login
+/// that asked for none is not refused. It is true at the agent (which hands such a login back) and at the shim
+/// (which runs it), and says nothing of `always`, whose refusal has sentences of its own.
 #[test]
-fn an_unavailable_unelevated_session_says_what_a_login_that_set_nothing_is_given_and_the_cause() {
+fn an_unavailable_unelevated_session_says_a_login_that_set_nothing_is_not_refused_and_the_cause() {
     for asked in [
         ElevationPolicy::Never,
         ElevationPolicy::Prompt,
@@ -410,8 +410,7 @@ fn an_unavailable_unelevated_session_says_what_a_login_that_set_nothing_is_given
         assert_eq!(
             text::unelevated_unavailable(Some(asked), "the token cannot be made"),
             "ssh-broker: could not prepare an unelevated session, so nothing was run (a login that leaves \
-             SSH_BROKER_ELEVATION unset is given a session that is not stepped down, with a notice): the token \
-             cannot be made",
+             SSH_BROKER_ELEVATION unset is not refused): the token cannot be made",
             "{asked:?}"
         );
         assert_eq!(
