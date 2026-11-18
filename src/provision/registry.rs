@@ -197,11 +197,12 @@ mod win {
         ESCAPE_ARGUMENTS, RegValue, SSHD_VALUE_BYTES, SshdShell, SshdShellReading, UnreadShell, desired_values,
     };
     use crate::provision::handover::{Handover, ShownValue};
+    use crate::provision::path_env::{Reading, Stored};
     use anyhow::Context;
     use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_MORE_DATA, ERROR_PATH_NOT_FOUND, WIN32_ERROR};
     use windows::Win32::System::Registry::{
-        HKEY, HKEY_LOCAL_MACHINE, KEY_QUERY_VALUE, KEY_WOW64_64KEY, REG_DWORD, REG_SZ, REG_VALUE_TYPE, RRF_RT_REG_SZ,
-        RegCloseKey, RegDeleteKeyValueW, RegGetValueW, RegOpenKeyExW, RegQueryValueExW, RegSetKeyValueW,
+        HKEY, HKEY_LOCAL_MACHINE, KEY_QUERY_VALUE, KEY_WOW64_64KEY, REG_DWORD, REG_EXPAND_SZ, REG_SZ, REG_VALUE_TYPE,
+        RRF_RT_REG_SZ, RegCloseKey, RegDeleteKeyValueW, RegGetValueW, RegOpenKeyExW, RegQueryValueExW, RegSetKeyValueW,
     };
     use windows::core::PCWSTR;
 
@@ -411,6 +412,133 @@ mod win {
         read_image_path_in(HKEY_LOCAL_MACHINE, SSHD_SERVICE_KEY)
     }
 
+    /// The key that holds the machine's environment variables.
+    const ENVIRONMENT_KEY: &str = r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment";
+
+    /// The machine's `Path` value, as stored: unexpanded, with its type. `None` when there is no such value.
+    pub fn read_system_path() -> Reading {
+        let (sub, name) = (wide(ENVIRONMENT_KEY), wide("Path"));
+        let mut key = HKEY::default();
+        // SAFETY: `sub` is NUL-terminated and `key` receives the opened handle.
+        let opened = unsafe {
+            RegOpenKeyExW(
+                HKEY_LOCAL_MACHINE,
+                PCWSTR(sub.as_ptr()),
+                None,
+                KEY_QUERY_VALUE | KEY_WOW64_64KEY,
+                &mut key,
+            )
+        };
+        if is_absent(opened) {
+            return Ok(None);
+        }
+        opened.ok().map_err(|e| format!("open the Environment key: {e}"))?;
+        let read = read_open_value(key, &name);
+        // SAFETY: `key` was opened above and is closed once.
+        let _ = unsafe { RegCloseKey(key) };
+        read
+    }
+
+    /// The value `name` of the open `key`, whatever its size: the size is asked, the value read, and both
+    /// repeated if the value grew in between.
+    fn read_open_value(key: HKEY, name: &[u16]) -> Reading {
+        let mut bytes = 0u32;
+        loop {
+            let mut kind = REG_VALUE_TYPE(0);
+            // SAFETY: `name` is NUL-terminated; with no buffer the call returns the size it needs.
+            let status = unsafe {
+                RegQueryValueExW(
+                    key,
+                    PCWSTR(name.as_ptr()),
+                    None,
+                    Some(&mut kind),
+                    None,
+                    Some(&mut bytes),
+                )
+            };
+            if is_absent(status) {
+                return Ok(None);
+            }
+            status.ok().map_err(|e| format!("read the Path value: {e}"))?;
+            let mut buffer = vec![0u16; (bytes as usize).div_ceil(2)];
+            let mut size = (buffer.len() * 2) as u32;
+            // SAFETY: the buffer holds `size` bytes.
+            let status = unsafe {
+                RegQueryValueExW(
+                    key,
+                    PCWSTR(name.as_ptr()),
+                    None,
+                    Some(&mut kind),
+                    Some(buffer.as_mut_ptr().cast()),
+                    Some(&mut size),
+                )
+            };
+            if status == ERROR_MORE_DATA {
+                bytes = size;
+                continue;
+            }
+            status.ok().map_err(|e| format!("read the Path value: {e}"))?;
+            if kind != REG_SZ && kind != REG_EXPAND_SZ {
+                return Ok(Some(Stored::Other(kind.0)));
+            }
+            let units = &buffer[..(size as usize / 2).min(buffer.len())];
+            let text =
+                String::from_utf16_lossy(&units[..units.iter().position(|&unit| unit == 0).unwrap_or(units.len())]);
+            return Ok(Some(if kind == REG_EXPAND_SZ {
+                Stored::ExpandSz(text)
+            } else {
+                Stored::Sz(text)
+            }));
+        }
+    }
+
+    /// Write the machine's `Path` value, as `REG_EXPAND_SZ` when `expand` and as `REG_SZ` when not.
+    pub fn write_system_path(value: &str, expand: bool) -> anyhow::Result<()> {
+        let (sub, name) = (wide(ENVIRONMENT_KEY), wide("Path"));
+        let bytes: Vec<u8> = wide(value).into_iter().flat_map(u16::to_le_bytes).collect();
+        let kind = if expand { REG_EXPAND_SZ } else { REG_SZ };
+        // SAFETY: the strings are NUL-terminated and `bytes` is the value's data, with its terminator.
+        unsafe {
+            RegSetKeyValueW(
+                HKEY_LOCAL_MACHINE,
+                PCWSTR(sub.as_ptr()),
+                PCWSTR(name.as_ptr()),
+                kind.0,
+                Some(bytes.as_ptr().cast()),
+                bytes.len() as u32,
+            )
+            .ok()
+            .context("write the system PATH")
+        }
+    }
+
+    /// Tell the windows of the machine that the environment changed, as the System dialog does. The
+    /// programs that read it (Explorer, and what it starts) then take the new `Path`; a process that is
+    /// already running keeps its own. `SendMessageTimeoutW` has a time limit for each window that does not
+    /// answer, which only keeps a hung window from holding this up: its expiry says nothing and nothing
+    /// depends on it. Run over SSH, `apply` has no desktop and the message reaches no window of that
+    /// session; sessions that sshd and the agent start read the registry themselves.
+    pub fn broadcast_environment_change() {
+        use windows::Win32::Foundation::{LPARAM, WPARAM};
+        use windows::Win32::UI::WindowsAndMessaging::{
+            HWND_BROADCAST, SMTO_ABORTIFHUNG, SendMessageTimeoutW, WM_SETTINGCHANGE,
+        };
+        let environment = wide("Environment");
+        // SAFETY: `environment` is NUL-terminated and outlives the call, which does not return until every
+        // window has taken the message or given up on it.
+        let _ = unsafe {
+            SendMessageTimeoutW(
+                HWND_BROADCAST,
+                WM_SETTINGCHANGE,
+                WPARAM(0),
+                LPARAM(environment.as_ptr() as isize),
+                SMTO_ABORTIFHUNG,
+                5000,
+                None,
+            )
+        };
+    }
+
     #[cfg(test)]
     pub fn read_image_path_hkcu(subkey: &str) -> anyhow::Result<Option<String>> {
         read_image_path_in(windows::Win32::System::Registry::HKEY_CURRENT_USER, subkey)
@@ -588,16 +716,17 @@ mod win {
     }
 }
 
+#[cfg(windows)]
+pub use win::{
+    broadcast_environment_change, escape_arguments_under, read_default_shell_under, read_shell_arguments_under,
+    read_sshd_image_path, read_sshd_shell_under, read_system_path, remove_shell_arguments_under,
+    set_default_shell_under, write_system_path,
+};
 #[cfg(all(windows, test))]
 pub use win::{
     delete_hkcu, escape_arguments_from_status, escape_arguments_hkcu, read_dword_hkcu, read_hkcu, read_image_path_hkcu,
     read_shell_arguments_hkcu, read_sshd_shell_hkcu, read_string_hkcu, remove_shell_arguments_hkcu, set_hkcu,
     set_hkcu_confirming, set_value_hkcu, sshd_string_from_status,
-};
-#[cfg(windows)]
-pub use win::{
-    escape_arguments_under, read_default_shell_under, read_shell_arguments_under, read_sshd_image_path,
-    read_sshd_shell_under, remove_shell_arguments_under, set_default_shell_under,
 };
 
 #[cfg(test)]

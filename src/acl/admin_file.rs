@@ -1,4 +1,5 @@
-//! A file only SYSTEM and Administrators can open: the machine-wide `apply` lock.
+//! A file only SYSTEM and Administrators can open: the machine-wide `apply` lock. And a directory only they
+//! can open, which holds sshd's drop-in (the install directory's policy without the grant to Users).
 //!
 //! A byte-range lock needs only a handle with read or write access, so whoever can open the file
 //! for reading can hold the lock for ever and stall every `apply`. The install directory lets
@@ -18,8 +19,8 @@ use windows::Win32::Storage::FileSystem::{
 use windows::core::{BOOL, HRESULT, PCWSTR};
 
 use super::{
-    Grant, OwnerAclWords, Security, Sid, WellKnown, denied_problem, describe_sid, descriptor_from_sddl,
-    file_attributes, open_for_inspection, owner_acl_problem, wide,
+    DirKind, Grant, OwnerAclWords, Security, Sid, WellKnown, denied_problem, describe_sid, descriptor_from_sddl,
+    dir_problem_from_open, file_attributes, open_for_inspection, owner_acl_problem, wide,
 };
 use crate::socket_loc::Integrity;
 use crate::winutil::OwnedHandle;
@@ -42,6 +43,27 @@ pub fn ensure_admin_only_file(path: &Path) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+/// Create `path`, a directory only SYSTEM and Administrators can open, or accept it if it already is
+/// exactly that (the install directory's policy without the grant to Users). Its parent must exist. What
+/// is there and is not (a file, a link, other permissions) is an error naming it and is never modified.
+pub fn ensure_admin_only_dir(path: &Path) -> anyhow::Result<()> {
+    super::create_dir_of(path, DirKind::AdminOnly)?;
+    if let Some(problem) = admin_only_dir_problem(path)? {
+        anyhow::bail!(
+            "{} exists but cannot be trusted as private to SYSTEM and Administrators: {problem}. \
+             Inspect it, remove it, and run `apply` again",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+/// Why `path` is not a directory [`ensure_admin_only_dir`] made, or `None` if it is one. It is read without
+/// following a link.
+pub fn admin_only_dir_problem(path: &Path) -> anyhow::Result<Option<String>> {
+    dir_problem_from_open(path, open_for_inspection(path)?, DirKind::AdminOnly)
 }
 
 /// `CreateFileW` with `CREATE_NEW` and [`ADMIN_FILE_SDDL`]. "Already exists" is not an error here:

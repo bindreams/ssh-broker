@@ -346,21 +346,25 @@ pub fn sshd_search_dirs(host: &dyn Host, image_path: Option<&str>) -> anyhow::Re
     Ok(dirs)
 }
 
-/// The directory of the program a service's `ImagePath` starts. The value is a command line:
-/// the program is quoted, or runs up to its `.exe`, and arguments may follow.
-pub(super) fn image_dir(image_path: &str) -> Option<PathBuf> {
+/// The program a service's `ImagePath` starts. The value is a command line: the program is quoted, or
+/// runs up to its `.exe`, and arguments may follow.
+pub(super) fn image_program(image_path: &str) -> Option<&str> {
     let image_path = image_path.trim();
-    let program = match image_path.strip_prefix('"') {
-        Some(quoted) => quoted.split('"').next()?,
+    match image_path.strip_prefix('"') {
+        Some(quoted) => quoted.split('"').next(),
         None => {
             let end = image_path
                 .to_ascii_lowercase()
                 .find(".exe")
                 .map_or(image_path.len(), |at| at + ".exe".len());
-            &image_path[..end]
+            Some(&image_path[..end])
         }
-    };
-    let (dir, _) = program.rsplit_once(['\\', '/'])?;
+    }
+}
+
+/// The directory of [`image_program`].
+pub(super) fn image_dir(image_path: &str) -> Option<PathBuf> {
+    let (dir, _) = image_program(image_path)?.rsplit_once(['\\', '/'])?;
     (!dir.is_empty()).then(|| PathBuf::from(dir))
 }
 

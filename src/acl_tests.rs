@@ -613,6 +613,30 @@ pub(super) fn in_memory(sddl: &str) -> Security {
 
 /// The ACL helper APIs and the file system merge identical ACEs when a DACL is applied to an
 /// object, so a duplicate cannot be put on a directory; the check is exercised in memory.
+/// The administrator-only directory is the install directory without the grant to Users, and each policy
+/// refuses the other's DACL.
+#[test]
+fn the_admin_only_directory_policy_is_the_install_policy_without_users() {
+    let system = Sid::well_known(WellKnown::System).unwrap();
+    let admins = Sid::well_known(WellKnown::Administrators).unwrap();
+    let users = Sid::well_known(WellKnown::Users).unwrap();
+    let install = in_memory(&DirKind::Install.sddl());
+    let admin_only = in_memory(&DirKind::AdminOnly.sddl());
+    assert_eq!(DirKind::AdminOnly.sddl(), "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)");
+    assert_eq!(DirKind::Install.grants(&system, &admins, &users).len(), 3);
+    assert_eq!(DirKind::AdminOnly.grants(&system, &admins, &users).len(), 2);
+
+    let install_grants = DirKind::Install.grants(&system, &admins, &users);
+    let admin_grants = DirKind::AdminOnly.grants(&system, &admins, &users);
+    assert!(install.dacl_matches(&install_grants).unwrap());
+    assert!(admin_only.dacl_matches(&admin_grants).unwrap());
+    assert!(
+        !install.dacl_matches(&admin_grants).unwrap(),
+        "Users can read the install directory"
+    );
+    assert!(!admin_only.dacl_matches(&install_grants).unwrap());
+}
+
 #[test]
 fn the_install_policy_rejects_a_duplicate_ace_and_accepts_the_exact_acl() {
     let system = Sid::well_known(WellKnown::System).unwrap();

@@ -128,47 +128,21 @@ fn administrators_authorized_keys() -> PathBuf {
         .join("administrators_authorized_keys")
 }
 
-/// Make the runner's sshd accept `SSH_BROKER_ELEVATION` from a client: put `AcceptEnv SSH_BROKER_ELEVATION` above
-/// the first `Match` of `%ProgramData%\ssh\sshd_config` (after one, a line applies to that block's accounts only)
-/// and restart the `sshd` service. Once per test process, and not at all when the line is there. Machine-wide:
-/// CI only, where the runner is discarded after the job. A test that reaches it (every [`Login`] constructor
-/// does) changes what the other tests depend on, so it holds `machine::exclusive()`. `apply` makes this
-/// arrangement itself in a later change, which replaces this function's body.
+/// Make the runner's sshd accept `SSH_BROKER_ELEVATION` from a client, with the step `apply` takes (the drop-in,
+/// the `Include` line, a restart of the `sshd` service), and fail loudly when it does not. Once per test process,
+/// and a configuration that accepts the variable already is left as it is. Machine-wide: CI only, where the
+/// runner is discarded after the job. A test that reaches it (every [`Login`] constructor does) changes what the
+/// other tests depend on, so it holds `machine::exclusive()`.
 pub fn accept_elevation_variable() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
-        const LINE: &str = "AcceptEnv SSH_BROKER_ELEVATION";
-        let config = Path::new(&std::env::var("ProgramData").expect("ProgramData is set"))
-            .join("ssh")
-            .join("sshd_config");
-        let text = std::fs::read_to_string(&config).unwrap_or_else(|e| panic!("read {}: {e}", config.display()));
-        if text.lines().any(|line| line.trim() == LINE) {
-            return;
-        }
-        let eol = if text.contains("\r\n") { "\r\n" } else { "\n" };
-        let mut at = text.len();
-        let mut offset = 0;
-        for line in text.split_inclusive('\n') {
-            if line.trim_start().to_ascii_lowercase().starts_with("match ") {
-                at = offset;
-                break;
-            }
-            offset += line.len();
-        }
-        let mut changed = String::with_capacity(text.len() + LINE.len() + 2);
-        changed.push_str(&text[..at]);
-        if at == text.len() && !text.is_empty() && !text.ends_with('\n') {
-            changed.push_str(eol);
-        }
-        changed.push_str(LINE);
-        changed.push_str(eol);
-        changed.push_str(&text[at..]);
-        std::fs::write(&config, changed).unwrap_or_else(|e| panic!("write {}: {e}", config.display()));
-        // `net stop` returns once the service has stopped, and `net start` once it runs.
-        let (ok, said) = run("net", &["stop", "sshd"]);
-        assert!(ok, "stop the sshd service: {said}");
-        let (ok, said) = run("net", &["start", "sshd"]);
-        assert!(ok, "start the sshd service: {said}");
+        let mut said = Vec::new();
+        let outcome =
+            ssh_broker::provision::sshd_config::machine::configure_this_machine(&mut |line| said.push(line.to_owned()));
+        assert!(
+            outcome.accepts,
+            "apply's sshd step did not make sshd accept SSH_BROKER_ELEVATION: {said:#?}"
+        );
     });
 }
 

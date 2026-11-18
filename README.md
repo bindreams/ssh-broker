@@ -114,7 +114,7 @@ Windows' own auto-logon is a different, documented option: signing the user in a
 
 ### Ending one
 
-`ssh-broker logout` ends your background session: the agent, every shell it hosts and the processes they started. Run it with the installed exe's full path, `C:\ProgramData\ssh-broker\ssh-broker.exe logout`, because `apply` does not put the install directory on `PATH`. The usual place to type it is a shell the session itself gave you; the agent waits for the command to finish and print its reply before it ends anything, and your SSH connection then closes.
+`ssh-broker logout` ends your background session: the agent, every shell it hosts and the processes they started. `apply` puts the install directory on the system `PATH`, so `ssh-broker logout` finds the exe by name in a session that started afterwards; an agent that `apply` did not restart keeps the `PATH` it started with, and its sessions need the full path, `C:\ProgramData\ssh-broker\ssh-broker.exe logout`, until it restarts. The usual place to type it is a shell the session itself gave you; the agent waits for the command to finish and print its reply before it ends anything, and your SSH connection then closes.
 
 | Exit code | Meaning |
 |---|---|
