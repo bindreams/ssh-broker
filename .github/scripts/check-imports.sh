@@ -16,7 +16,7 @@ set -euo pipefail
 # one by one. The `ext-ms-*` extension sets are not guaranteed on every Windows edition, so none
 # is allowed. `ucrtbase`, `api-ms-win-crt-*` and the VC runtime are absent on purpose:
 # `+crt-static` removes them.
-allowed_names='api-ms-win-core-synch-l1-2-0|api-ms-win-core-winrt-error-l1-1-0|kernel32|kernelbase|ntdll|advapi32|ws2_32|crypt32|oleaut32|user32|ole32|shell32|bcrypt|secur32|userenv|wtsapi32|netapi32|shlwapi|rpcrt4|sspicli|ncrypt|iphlpapi|gdi32'
+allowed_names='api-ms-win-core-synch-l1-2-0|api-ms-win-core-winrt-error-l1-1-0|kernel32|kernelbase|ntdll|advapi32|ws2_32|crypt32|oleaut32|user32|ole32|combase|shell32|bcrypt|secur32|userenv|wtsapi32|netapi32|shlwapi|rpcrt4|sspicli|ncrypt|iphlpapi|gdi32'
 
 # Print the names on stdin that are not allowed. `grep` exits 1 when it selects nothing,
 # which is the good case; any other non-zero exit is a failure.
