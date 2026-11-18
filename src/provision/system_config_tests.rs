@@ -504,6 +504,10 @@ fn the_image_directory_is_read_from_a_service_image_path_in_any_form() {
             Some(r"C:\Windows\System32\OpenSSH"),
         ),
         (r"D:/ssh/sshd.exe", Some("D:/ssh")),
+        // The program ends at the first `.exe` that ends a word, not at one inside a folder's name.
+        (r"C:\my.executables\sshd.exe", Some(r"C:\my.executables")),
+        (r"C:\my.executables\sshd.exe -f D:\x", Some(r"C:\my.executables")),
+        (r"C:\OpenSSH\sshd -f D:\x", Some(r"C:\OpenSSH")),
         ("sshd.exe", None),
         ("", None),
         ("  ", None),
@@ -527,7 +531,11 @@ fn the_arguments_of_a_service_image_path_are_the_trimmed_text_after_the_program(
             r"C:\Program Files\OpenSSH\sshd.exe   -f D:\conf\sshd_config  ",
             Some(r"-f D:\conf\sshd_config"),
         ),
-        (r"sshd -d", None),
+        // An unquoted program ends at the first `.exe` that ends a word, or else at the first white space.
+        (r"C:\my.executables\sshd.exe", None),
+        (r"C:\my.executables\sshd.exe -f D:\x", Some(r"-f D:\x")),
+        (r"C:\OpenSSH\sshd -f D:\x", Some(r"-f D:\x")),
+        (r"sshd -d", Some("-d")),
         (r#""C:\unterminated\sshd.exe -d"#, None),
         ("", None),
         ("  ", None),

@@ -1,6 +1,7 @@
 //! Host tests for the pure parts of `provision::sshd_config`: the text edit, the `sshd -T` reader, the
 //! `verify` row. The flow is in `configure_tests`.
 use super::*;
+use std::path::PathBuf;
 
 const BOM: &[u8] = b"\xEF\xBB\xBF";
 
@@ -262,7 +263,7 @@ const ROW_NAME: &str = "sshd accepts SSH_BROKER_ELEVATION";
 fn read(listing: &str) -> anyhow::Result<SshdReading> {
     Ok(SshdReading::Read {
         listing: listing.into(),
-        unread: None,
+        read: ConfigRead::Read,
     })
 }
 
@@ -313,7 +314,7 @@ fn the_sshd_row_fails_when_sshd_started_before_its_configuration_was_written() {
         let row = accepts_row(Integrity::High, || {
             Ok(SshdReading::Read {
                 listing: listing.into(),
-                unread: Some(PathBuf::from("sshd_config.d").join("10-ssh-broker.conf")),
+                read: ConfigRead::Unread(PathBuf::from("sshd_config.d").join("10-ssh-broker.conf")),
             })
         });
         assert!(!row.pass);
@@ -329,7 +330,37 @@ fn the_sshd_row_fails_when_sshd_started_before_its_configuration_was_written() {
     let row = accepts_row(Integrity::High, || {
         Ok(SshdReading::Read {
             listing: "port 22\n".into(),
-            unread: Some(PathBuf::from("sshd_config")),
+            read: ConfigRead::Unread(PathBuf::from("sshd_config")),
+        })
+    });
+    assert!(!row.pass);
+    assert!(row.detail.contains("does not accept"), "{}", row.detail);
+}
+
+#[test]
+fn the_sshd_row_passes_and_says_so_when_a_files_time_is_ahead_of_the_clock() {
+    for listing in [
+        "acceptenv SSH_BROKER_ELEVATION\n",
+        "setenv SSH_BROKER_ELEVATION=never\n",
+    ] {
+        let row = accepts_row(Integrity::High, || {
+            Ok(SshdReading::Read {
+                listing: listing.into(),
+                read: ConfigRead::Unknowable(PathBuf::from("sshd_config")),
+            })
+        });
+        assert!(row.pass, "{}", row.detail);
+        assert_eq!(
+            row.detail,
+            "accepted; sshd_config's last-write time is ahead of the clock, so whether the running sshd has read \
+             it cannot be told (`ssh-broker apply` restarts sshd)"
+        );
+    }
+    // A configuration sshd does not accept fails for that.
+    let row = accepts_row(Integrity::High, || {
+        Ok(SshdReading::Read {
+            listing: "port 22\n".into(),
+            read: ConfigRead::Unknowable(PathBuf::from("sshd_config")),
         })
     });
     assert!(!row.pass);

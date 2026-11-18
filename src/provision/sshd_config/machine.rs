@@ -16,21 +16,22 @@ use windows::Win32::Storage::FileSystem::{MOVEFILE_REPLACE_EXISTING, MOVEFILE_WR
 use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::System::Services::{
     CloseServiceHandle, OpenSCManagerW, OpenServiceW, QueryServiceStatusEx, SC_HANDLE, SC_MANAGER_CONNECT,
-    SC_STATUS_PROCESS_INFO, SERVICE_QUERY_STATUS, SERVICE_STATUS_PROCESS, SERVICE_STOPPED,
+    SC_STATUS_PROCESS_INFO, SERVICE_CONTINUE_PENDING, SERVICE_PAUSE_PENDING, SERVICE_PAUSED, SERVICE_QUERY_STATUS,
+    SERVICE_RUNNING, SERVICE_START_PENDING, SERVICE_STATUS_CURRENT_STATE, SERVICE_STATUS_PROCESS, SERVICE_STOP_PENDING,
+    SERVICE_STOPPED,
 };
-use windows::Win32::System::Threading::{GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+use windows::Win32::System::Threading::GetProcessTimes;
 use windows::Win32::UI::Shell::{FOLDERID_ProgramData, KF_FLAG_DEFAULT, SHGetKnownFolderPath};
 use windows::core::{PCWSTR, w};
 
-use super::configure::{Service, ServiceOutcome, SshdHost, configure, net_outcome, unread_file};
+use super::configure::{DropInProblem, Service, ServiceState, SshdHost, config_read, configure};
 use super::{DROP_IN_DIR_NAME, DROP_IN_NAME, SshdReading};
 use crate::acl;
+use crate::provision::procwait::{self, Process};
 use crate::provision::{registry, system_config};
-use crate::winutil::OwnedHandle;
 
 /// The candidate `sshd_config`, beside the original so that the rename that replaces it stays on one volume.
 const CANDIDATE_NAME: &str = "sshd_config.ssh-broker-new";
-
 /// The files of sshd, and the programs `apply` runs to check and restart it.
 struct Machine {
     ssh_dir: PathBuf,
@@ -124,7 +125,11 @@ impl SshdHost for Machine {
             .map_err(|e| format!("{e:#}"))
     }
 
-    fn service(&mut self, verb: Service) -> ServiceOutcome {
+    fn service_state(&mut self) -> anyhow::Result<ServiceState> {
+        Ok(state_of(query_sshd()?.dwCurrentState))
+    }
+
+    fn net(&mut self, verb: Service) -> Result<(), String> {
         let word = match verb {
             Service::Stop => "stop",
             Service::Start => "start",
@@ -135,23 +140,40 @@ impl SshdHost for Machine {
             .stdin(Stdio::null())
             .output()
         {
+            Ok(out) if out.status.success() => Ok(()),
             Ok(out) => {
                 let said = format!(
                     "{}{}",
                     String::from_utf8_lossy(&out.stdout),
                     String::from_utf8_lossy(&out.stderr)
                 );
-                net_outcome(verb, out.status.code().unwrap_or(-1), &said)
+                let said = said.split_whitespace().collect::<Vec<_>>().join(" ");
+                Err(if said.is_empty() {
+                    format!("net exited with exit code {}", out.status.code().unwrap_or(-1))
+                } else {
+                    said
+                })
             }
-            Err(e) => ServiceOutcome::Failed(format!("run {}: {e}", self.net.display())),
+            Err(e) => Err(format!("run {}: {e}", self.net.display())),
         }
     }
 
+    fn wait_while_stopping(&mut self) -> anyhow::Result<()> {
+        let Some(process) = service_process()? else {
+            return Ok(());
+        };
+        procwait::wait_all_exited(&[process], procwait::EXIT_BOUND).context("the sshd service is still stopping")
+    }
+
     fn service_started(&mut self) -> anyhow::Result<Option<SystemTime>> {
-        match sshd_process_id()? {
+        match service_process()? {
             None => Ok(None),
-            Some(id) => process_started(id).map(Some),
+            Some(process) => process_started(&process).map(Some),
         }
+    }
+
+    fn now(&self) -> SystemTime {
+        SystemTime::now()
     }
 
     fn config_written(&mut self) -> anyhow::Result<(PathBuf, SystemTime)> {
@@ -175,15 +197,18 @@ impl SshdHost for Machine {
         })
     }
 
-    fn ensure_drop_in_dir(&mut self) -> anyhow::Result<()> {
+    fn ensure_drop_in_dir(&mut self) -> Result<(), DropInProblem> {
         let dir = self.drop_in_dir();
         // The folder is made as the install directory is, with its descriptor and its judgement: what must hold
         // is that only administrators can write it. One that is there and is not exactly that is left alone.
-        acl::create_install_dir(&dir).with_context(|| format!("cannot make {}", dir.display()))?;
-        if let Some(problem) = acl::install_dir_problem(&dir)? {
-            anyhow::bail!("it is not the folder apply makes: {problem}");
+        acl::create_install_dir(&dir).map_err(|e| DropInProblem::NotMade(e.root_cause().to_string()))?;
+        match acl::install_dir_problem(&dir) {
+            Ok(None) => Ok(()),
+            Ok(Some(problem)) => Err(DropInProblem::Refused(format!(
+                "it is not the folder apply makes: {problem}"
+            ))),
+            Err(e) => Err(DropInProblem::Refused(format!("{e:#}"))),
         }
-        Ok(())
     }
 
     fn read_drop_in(&mut self) -> anyhow::Result<Option<Vec<u8>>> {
@@ -206,17 +231,38 @@ impl SshdHost for Machine {
 
     fn write_drop_in(&mut self, text: &[u8]) -> anyhow::Result<()> {
         let path = self.drop_in();
-        // The file is made with its descriptor, and a file that is there must already be exactly that: the
-        // write below keeps the descriptor.
-        if let Err(e) = acl::ensure_admin_only_file(&path) {
-            // Its own sentence advises removing the file, which this step never does.
-            match acl::admin_only_file_problem(&path) {
-                Ok(Some(problem)) => return Err(untrusted(&path, &problem)),
-                Ok(None) => {}
-                Err(_) => return Err(e),
-            }
+        // A drop-in that is there must already be what `apply` makes: it is replaced, never written into.
+        if std::fs::symlink_metadata(&path).is_ok()
+            && let Some(problem) = acl::admin_only_file_problem(&path)?
+        {
+            return Err(untrusted(&path, &problem));
         }
-        write_flushed(&path, text)
+        // The text goes into a new file beside the drop-in, made with the descriptor the drop-in gets and
+        // flushed, and the new file replaces the drop-in in one rename: a write that fails leaves the drop-in as
+        // it was. The name does not end in `.conf`, so sshd's `Include` never reads it.
+        let new = self.drop_in_dir().join(format!("{DROP_IN_NAME}.ssh-broker-new"));
+        match std::fs::remove_file(&new) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                return Err(e).with_context(|| format!("remove the leftover {}", new.display()));
+            }
+            _ => {}
+        }
+        let replaced = (|| {
+            if let Err(e) = acl::ensure_admin_only_file(&new) {
+                // Its own sentence advises removing the file, which this step never does.
+                match acl::admin_only_file_problem(&new) {
+                    Ok(Some(problem)) => return Err(untrusted(&new, &problem)),
+                    Ok(None) => {}
+                    Err(_) => return Err(e),
+                }
+            }
+            write_flushed(&new, text)?;
+            replace_file(&new, &path).with_context(|| format!("rename {} over {}", new.display(), path.display()))
+        })();
+        if replaced.is_err() {
+            let _ = std::fs::remove_file(&new);
+        }
+        replaced
     }
 
     fn remove_drop_in(&mut self) -> anyhow::Result<()> {
@@ -303,8 +349,8 @@ impl Drop for ScHandle {
     }
 }
 
-/// The id of the process the sshd service runs in; `None` when the service is not running.
-fn sshd_process_id() -> anyhow::Result<Option<u32>> {
+/// What the service manager says about the sshd service: its state and the id of its process.
+fn query_sshd() -> anyhow::Result<SERVICE_STATUS_PROCESS> {
     // SAFETY: null names mean this machine and the active database; the handles are closed by their guards.
     let manager = ScHandle(
         unsafe { OpenSCManagerW(PCWSTR::null(), PCWSTR::null(), SC_MANAGER_CONNECT) }
@@ -325,16 +371,52 @@ fn sshd_process_id() -> anyhow::Result<Option<u32>> {
         QueryServiceStatusEx(service.0, SC_STATUS_PROCESS_INFO, Some(buffer), &mut needed)
     };
     queried.context("ask the service manager about sshd")?;
+    Ok(status)
+}
+
+/// The service manager's state, as [`ServiceState`].
+fn state_of(current: SERVICE_STATUS_CURRENT_STATE) -> ServiceState {
+    let name = match current {
+        SERVICE_RUNNING => return ServiceState::Running,
+        SERVICE_STOPPED => return ServiceState::Stopped,
+        SERVICE_START_PENDING => "starting".to_owned(),
+        SERVICE_STOP_PENDING => "stopping".to_owned(),
+        SERVICE_CONTINUE_PENDING => "continuing".to_owned(),
+        SERVICE_PAUSE_PENDING => "pausing".to_owned(),
+        SERVICE_PAUSED => "paused".to_owned(),
+        SERVICE_STATUS_CURRENT_STATE(other) => format!("in state {other}"),
+    };
+    ServiceState::Changing(name)
+}
+
+/// The id of the process the sshd service runs in; `None` when the service has none.
+fn sshd_process_id() -> anyhow::Result<Option<u32>> {
+    let status = query_sshd()?;
     Ok((status.dwCurrentState != SERVICE_STOPPED && status.dwProcessId != 0).then_some(status.dwProcessId))
 }
 
-/// When the process `id` was created.
-fn process_started(id: u32) -> anyhow::Result<SystemTime> {
-    // SAFETY: the handle is closed by `OwnedHandle`.
-    let process = OwnedHandle(
-        unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, id) }
-            .with_context(|| format!("open the process of the sshd service ({id})"))?,
-    );
+/// The service's process, held by an open handle; `None` when the service has no process. The id is read from the
+/// service manager, the process opened, and the id read again: when it is the same, the handle is the service's
+/// process, for an id is not given to another process while a handle to it is open. Any other answer starts
+/// over: there is no count, for it settles when the service does.
+fn service_process() -> anyhow::Result<Option<Process>> {
+    loop {
+        let Some(id) = sshd_process_id()? else {
+            return Ok(None);
+        };
+        let Some(process) =
+            Process::open(id).with_context(|| format!("open the process of the sshd service ({id})"))?
+        else {
+            continue;
+        };
+        if sshd_process_id()? == Some(id) {
+            return Ok(Some(process));
+        }
+    }
+}
+
+/// When the process held by `process` was created.
+fn process_started(process: &Process) -> anyhow::Result<SystemTime> {
     let (mut created, mut exited, mut kernel, mut user) = (
         FILETIME::default(),
         FILETIME::default(),
@@ -342,8 +424,8 @@ fn process_started(id: u32) -> anyhow::Result<SystemTime> {
         FILETIME::default(),
     );
     // SAFETY: the handle is open with the right to query; the out-pointers are locals.
-    unsafe { GetProcessTimes(process.0, &mut created, &mut exited, &mut kernel, &mut user) }
-        .with_context(|| format!("read when the process of the sshd service ({id}) started"))?;
+    unsafe { GetProcessTimes(process.handle(), &mut created, &mut exited, &mut kernel, &mut user) }
+        .with_context(|| format!("read when the process of the sshd service ({}) started", process.pid))?;
     system_time(created)
 }
 
@@ -373,6 +455,11 @@ pub fn configure_this_machine(say: &mut dyn FnMut(&str)) -> bool {
     }
 }
 
+/// This machine as the host of the flow, for the CI test of its service calls.
+pub fn sshd_host_of_this_machine() -> anyhow::Result<impl SshdHost> {
+    Machine::find().context("cannot find sshd")
+}
+
 /// What the `verify` row is given about sshd on this machine: `sshd -T` (which needs the rights to read sshd's
 /// host keys) and whether sshd started before a file of its configuration was written, or that the service runs
 /// with arguments. An error says which question could not be answered.
@@ -382,6 +469,10 @@ pub fn sshd_reading_this_machine() -> anyhow::Result<SshdReading> {
         return Ok(SshdReading::WithArguments(arguments));
     }
     let listing = machine.sshd_t(None).context("cannot ask sshd for its configuration")?;
-    let unread = unread_file(&mut machine).context("cannot tell whether sshd has read its configuration")?;
-    Ok(SshdReading::Read { listing, unread })
+    let read = config_read(&mut machine).context("cannot tell whether sshd has read its configuration")?;
+    Ok(SshdReading::Read { listing, read })
 }
+
+#[cfg(test)]
+#[path = "machine_tests.rs"]
+mod machine_tests;

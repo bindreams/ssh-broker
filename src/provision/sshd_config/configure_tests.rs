@@ -1,6 +1,7 @@
 //! Host tests for the flow of `apply`'s sshd step, over a stand-in for the machine: files in memory, the
-//! answers of `sshd` and `net` scripted, and a clock that ticks at every write and every start. The real
-//! files, the real `sshd` and the service are measured by `tests/sshd_config_windows.rs`, which CI runs.
+//! answers of `sshd` scripted, a service whose state follows a script of what `net` says and does, and a clock
+//! that ticks at every write and every start. The real files, the real `sshd` and the service are measured by
+//! `tests/sshd_config_windows.rs`, which CI runs.
 use super::super::{ACCEPT_LINE, DROP_IN_NAME, INCLUDE_LINE, drop_in_text, with_line};
 use super::*;
 use std::cell::RefCell;
@@ -8,6 +9,23 @@ use std::collections::VecDeque;
 use std::time::{Duration, UNIX_EPOCH};
 
 const STOCK: &str = "#Port 22\r\n#AcceptEnv LANG LC_*\r\nSubsystem sftp sftp-server.exe\r\n\r\nMatch Group administrators\r\n       AuthorizedKeysFile __PROGRAMDATA__/ssh/administrators_authorized_keys\r\n";
+
+/// What one `net` command says, and the state the service manager shows after it.
+struct NetStep {
+    said: Result<(), String>,
+    state: ServiceState,
+}
+
+fn step(said: Result<(), &str>, state: ServiceState) -> NetStep {
+    NetStep {
+        said: said.map_err(str::to_owned),
+        state,
+    }
+}
+
+fn changing(name: &str) -> ServiceState {
+    ServiceState::Changing(name.to_owned())
+}
 
 /// The machine: what the host's methods read and write, what was done in which order, and what goes wrong.
 #[derive(Default)]
@@ -25,15 +43,28 @@ struct Fake {
     check_error: Option<String>,
     /// `sshd -T -f <candidate>` does not show the variable.
     candidate_hides_variable: bool,
-    /// What the service answers to each stop and start, in order; `Done` when it runs out.
-    answers: VecDeque<ServiceOutcome>,
+    /// What the service manager says; `Fake::with_config` makes it `Running`.
+    state: Option<ServiceState>,
+    /// What each `net stop` and `net start` says and leaves the service in, in order; when it runs out, success
+    /// and stopped, or success and running.
+    net_script: VecDeque<NetStep>,
+    /// What each wait for the service's process leaves the service in; stopped when it runs out.
+    wait_script: VecDeque<ServiceState>,
+    /// The wait's failure bound expires, with this cause.
+    wait_error: Option<String>,
+    waits: usize,
+    /// How many times the state was read, and which of those reads (counted from 0) fail.
+    state_reads: usize,
+    unreadable_reads: Vec<usize>,
     /// The method that fails.
     fail: Option<&'static str>,
     /// The call of `sshd -T` (counted from 0, candidate or not) from which it fails.
     sshd_t_fails_from: Option<usize>,
     sshd_t_calls: usize,
-    /// Why the drop-in folder is refused.
+    /// Why the drop-in folder is refused: it is there and cannot be used.
     folder_problem: Option<String>,
+    /// Why the drop-in folder cannot be made.
+    folder_not_made: Option<String>,
     /// The arguments the service's command line has.
     arguments: Option<String>,
     /// The server sets the variable itself, whatever the file says.
@@ -53,11 +84,19 @@ impl Fake {
     fn with_config(config: &str) -> Fake {
         Fake {
             config: config.as_bytes().to_vec(),
-            clock: 10,
+            clock: 100,
             service_started_at: Some(2),
+            state: Some(ServiceState::Running),
             config_time: 1,
             ..Fake::default()
         }
+    }
+
+    /// The service is not running.
+    fn stopped(mut self) -> Fake {
+        self.state = Some(ServiceState::Stopped);
+        self.service_started_at = None;
+        self
     }
 
     /// `with_config` with the drop-in that `apply` writes, and an `Include` that reads it.
@@ -156,25 +195,60 @@ impl SshdHost for Fake {
         self.check_error.clone().map_or(Ok(()), Err)
     }
 
-    fn service(&mut self, verb: Service) -> ServiceOutcome {
-        self.call("service");
+    fn service_state(&mut self) -> anyhow::Result<ServiceState> {
+        self.call("service_state");
+        let read = self.state_reads;
+        self.state_reads += 1;
+        anyhow::ensure!(!self.unreadable_reads.contains(&read), "state read {read} failed");
+        Ok(self.state.clone().expect("the stand-in has a state"))
+    }
+
+    fn net(&mut self, verb: Service) -> Result<(), String> {
+        self.call("net");
         self.event(match verb {
             Service::Stop => "stop",
             Service::Start => "start",
         });
-        let answer = self.answers.pop_front().unwrap_or(ServiceOutcome::Done);
-        match (verb, &answer) {
-            (Service::Stop, ServiceOutcome::Done | ServiceOutcome::Unchanged) => self.service_started_at = None,
-            (Service::Start, ServiceOutcome::Done) => self.service_started_at = Some(self.tick()),
+        let step = self.net_script.pop_front().unwrap_or(NetStep {
+            said: Ok(()),
+            state: match verb {
+                Service::Stop => ServiceState::Stopped,
+                Service::Start => ServiceState::Running,
+            },
+        });
+        match (verb, &step.state) {
+            (_, ServiceState::Stopped) => self.service_started_at = None,
+            (Service::Start, ServiceState::Running) => self.service_started_at = Some(self.tick()),
             _ => {}
         }
-        answer
+        self.state = Some(step.state);
+        step.said
+    }
+
+    fn wait_while_stopping(&mut self) -> anyhow::Result<()> {
+        self.call("wait_while_stopping");
+        self.event("wait");
+        self.waits += 1;
+        if let Some(cause) = &self.wait_error {
+            anyhow::bail!("{cause}");
+        }
+        let state = self.wait_script.pop_front().unwrap_or(ServiceState::Stopped);
+        if state == ServiceState::Stopped {
+            self.service_started_at = None;
+        }
+        self.state = Some(state);
+        Ok(())
     }
 
     fn service_started(&mut self) -> anyhow::Result<Option<SystemTime>> {
         self.call("service_started");
         self.fails("service_started")?;
         Ok(self.service_started_at.map(at))
+    }
+
+    fn now(&self) -> SystemTime {
+        self.call("now");
+        at(self.clock)
     }
 
     fn config_written(&mut self) -> anyhow::Result<(PathBuf, SystemTime)> {
@@ -186,11 +260,15 @@ impl SshdHost for Fake {
         })
     }
 
-    fn ensure_drop_in_dir(&mut self) -> anyhow::Result<()> {
+    fn ensure_drop_in_dir(&mut self) -> Result<(), DropInProblem> {
         self.call("ensure_drop_in_dir");
-        self.fails("ensure_drop_in_dir")?;
+        self.fails("ensure_drop_in_dir")
+            .map_err(|e| DropInProblem::Refused(format!("{e:#}")))?;
+        if let Some(cause) = &self.folder_not_made {
+            return Err(DropInProblem::NotMade(cause.clone()));
+        }
         match &self.folder_problem {
-            Some(problem) => anyhow::bail!("{problem}"),
+            Some(problem) => Err(DropInProblem::Refused(problem.clone())),
             None => Ok(()),
         }
     }
@@ -284,6 +362,16 @@ fn said_advice(said: &[String]) -> bool {
     said.contains(&advice())
 }
 
+/// What `apply` says when it cannot ask sshd for its configuration: the next `apply` stops at the same place,
+/// so the advice is to add the line by hand.
+fn ask_failed(cause: &str, left: &str) -> String {
+    format!(
+        "apply: could not ask sshd for its configuration ({cause}), so {left}. To have sshd accept \
+         SSH_BROKER_ELEVATION, add `{ACCEPT_LINE}` above the first `Match` in sshd_config and restart sshd; \
+         `ssh-broker elevate` works without it."
+    )
+}
+
 /// No sentence of the step tells anyone to remove a file or a folder.
 fn assert_nothing_to_remove(said: &[String]) {
     for line in said {
@@ -305,8 +393,7 @@ fn sshd_is_asked_before_anything_is_written_and_a_failure_writes_nothing() {
     assert!(host.events.is_empty(), "{:?}", host.events);
     assert_eq!(host.drop_in, None);
     assert_eq!(host.config, STOCK.as_bytes());
-    assert!(said_advice(&said), "{said:?}");
-    assert!(said.iter().any(|line| line.contains("could not ask sshd")), "{said:?}");
+    assert_eq!(said, [ask_failed("sshd_t failed", "nothing of sshd's was changed")]);
     assert_eq!(*host.calls.borrow(), ["service_arguments", "sshd_t", "config_path"]);
 }
 
@@ -402,6 +489,49 @@ fn a_change_sshd_has_not_read_gets_a_restart_and_nothing_written() {
 }
 
 #[test]
+fn a_file_written_in_the_tick_sshd_started_in_is_judged_unread() {
+    let mut host = Fake::configured();
+    host.service_started_at = Some(5);
+    host.config_time = 5;
+    let (accepted, said) = run(&mut host);
+    assert!(accepted, "{said:?}");
+    assert_eq!(host.events, ["stop", "start"]);
+    assert_eq!(
+        said[0],
+        "apply: sshd was started before sshd_config was last written, so it may not have read it; restarting sshd"
+    );
+}
+
+#[test]
+fn a_file_whose_time_is_ahead_of_the_clock_cannot_be_judged_and_sshd_is_restarted_each_time() {
+    let mut host = Fake::configured();
+    host.config_time = host.clock + 1000;
+    let (accepted, said) = run(&mut host);
+    assert!(accepted, "{said:?}");
+    assert_eq!(host.events, ["stop", "start"]);
+    assert_eq!(
+        said[0],
+        "apply: sshd_config's last-write time is ahead of this machine's clock, so it cannot be told whether sshd \
+         has read it; restarting sshd"
+    );
+    assert_eq!(
+        said.last().unwrap(),
+        "apply: sshd restarted; it accepts SSH_BROKER_ELEVATION"
+    );
+
+    // The restart did not settle it: the next run restarts sshd again.
+    let (accepted, said) = run(&mut host);
+    assert!(accepted, "{said:?}");
+    assert_eq!(host.events, ["stop", "start", "stop", "start"]);
+
+    // A service that is not running reads what is there when it starts, whatever the time.
+    let mut host = Fake::configured().stopped();
+    host.config_time = host.clock + 1000;
+    let (accepted, said) = run(&mut host);
+    assert!(accepted && host.events.is_empty() && said.is_empty(), "{said:?}");
+}
+
+#[test]
 fn a_time_that_cannot_be_read_says_so_and_restarts_nothing() {
     for method in ["service_started", "config_written"] {
         let mut host = Fake::configured();
@@ -421,24 +551,23 @@ fn a_time_that_cannot_be_read_says_so_and_restarts_nothing() {
 }
 
 #[test]
-fn a_restart_of_an_unread_configuration_that_fails_to_start_says_nothing_was_put_back() {
+fn a_restart_of_an_unread_configuration_whose_first_start_fails_has_nothing_to_put_back_and_the_second_start_runs() {
     let mut host = Fake::configured();
     host.config_time = 20;
-    host.answers = VecDeque::from([
-        ServiceOutcome::Done,
-        ServiceOutcome::Failed("The service did not respond".into()),
-        ServiceOutcome::Done,
+    host.net_script = VecDeque::from([
+        step(Ok(()), ServiceState::Stopped),
+        step(Err("The service did not respond"), ServiceState::Stopped),
+        step(Ok(()), ServiceState::Running),
     ]);
     let (accepted, said) = run(&mut host);
-    assert!(!accepted);
+    assert!(accepted, "sshd runs and has read the files: {said:?}");
     assert_eq!(host.starts(), 2);
     assert_eq!(host.config_replacements + host.drop_in_writes, 0, "no file was touched");
-    let last = said.last().unwrap();
-    assert!(
-        last.contains("The service did not respond") && last.contains("running again"),
-        "{said:?}"
+    assert_eq!(
+        said.last().unwrap(),
+        "apply: sshd failed to start once (The service did not respond); a second start worked and sshd is \
+         running. It accepts SSH_BROKER_ELEVATION."
     );
-    assert!(!last.contains("put back"), "{last}");
 }
 
 // the include =====
@@ -547,7 +676,7 @@ fn a_question_to_sshd_that_fails_after_the_drop_in_was_written_changes_nothing_m
     assert!(!accepted);
     assert_eq!(host.events, ["write drop-in"]);
     assert_eq!(host.config, STOCK.as_bytes());
-    assert!(said_advice(&said), "{said:?}");
+    assert_eq!(said, [ask_failed("sshd_t failed", "sshd_config was left as it is")]);
 }
 
 // a folder that cannot be used =====
@@ -579,6 +708,28 @@ fn a_drop_in_folder_that_is_not_administrator_only_gets_the_acceptenv_line_in_ss
     assert!(order("write candidate") < order("sshd -t") && order("sshd -t") < order("replace config"));
     assert!(order("replace config") < order("stop") && order("stop") < order("start"));
     assert_nothing_to_remove(&said);
+}
+
+#[test]
+fn a_drop_in_folder_that_cannot_be_made_is_said_not_to_be_made_and_the_line_goes_into_sshd_config() {
+    let mut host = Fake::with_config(STOCK);
+    host.folder_not_made = Some("Access is denied".into());
+    let (accepted, said) = run(&mut host);
+    assert!(accepted, "{said:?}");
+    assert_eq!(host.config, with_line(STOCK.as_bytes(), ACCEPT_LINE).unwrap());
+    assert_eq!(host.drop_in, None);
+    assert!(
+        said.contains(&format!(
+            "apply: {} could not be made (Access is denied); SSH_BROKER_ELEVATION is accepted by a line in \
+             sshd_config instead",
+            Fake::folder().display()
+        )),
+        "{said:?}"
+    );
+    assert!(
+        said.iter().all(|line| !line.contains("is left as it is")),
+        "a folder that is not there is not left as it is: {said:?}"
+    );
 }
 
 #[test]
@@ -627,83 +778,180 @@ fn sshd_is_restarted_only_after_a_change_and_not_when_it_is_stopped() {
     assert_eq!(&host.events[host.events.len() - 2..], ["stop", "start"]);
 
     // A service that is not running stays stopped: it reads the change when it is started.
-    let mut host = Fake::with_config(STOCK);
-    host.answers = VecDeque::from([ServiceOutcome::Unchanged]);
+    let mut host = Fake::with_config(STOCK).stopped();
     let (accepted, said) = run(&mut host);
     assert!(accepted, "{said:?}");
-    assert_eq!(host.starts(), 0, "{:?}", host.events);
+    assert_eq!((host.stops(), host.starts()), (0, 0), "{:?}", host.events);
     assert_eq!(
         host.config,
         with_line(STOCK.as_bytes(), INCLUDE_LINE).unwrap(),
         "the change stays"
     );
-    assert!(said.last().unwrap().contains("not running"), "{said:?}");
+    assert_eq!(
+        said.last().unwrap(),
+        "apply: sshd is not running, so it was not started; it reads the change when it is"
+    );
 }
 
-#[test]
-fn a_stop_that_fails_is_followed_by_a_start_and_what_that_says_decides() {
-    let stop_failed = || ServiceOutcome::Failed("Access is denied".into());
+const COULD_NOT_STOP_TAIL: &str = "and is running with its earlier configuration, so it does not accept \
+     SSH_BROKER_ELEVATION yet; run `ssh-broker apply` again to restart it";
 
-    // It still runs: not restarted, and the next apply will.
+#[test]
+fn a_stop_that_fails_while_sshd_still_runs_issues_no_start() {
     let mut host = Fake::with_config(STOCK);
-    host.answers = VecDeque::from([stop_failed(), ServiceOutcome::Unchanged]);
+    host.net_script = VecDeque::from([step(Err("Access is denied"), ServiceState::Running)]);
     let (accepted, said) = run(&mut host);
     assert!(!accepted, "{said:?}");
-    assert_eq!(host.starts(), 1, "a start is issued after a stop that failed");
+    assert_eq!(
+        host.starts(),
+        0,
+        "it runs by the service manager's own word: {:?}",
+        host.events
+    );
+    assert_eq!(host.waits, 0);
     assert_eq!(host.config, with_line(STOCK.as_bytes(), INCLUDE_LINE).unwrap());
     assert_eq!(
         said.last().unwrap(),
-        "apply: sshd could not be stopped (Access is denied) and is running with its earlier configuration, so it \
-         does not accept SSH_BROKER_ELEVATION yet; run `ssh-broker apply` again to restart it"
+        &format!("apply: sshd could not be stopped (Access is denied) {COULD_NOT_STOP_TAIL}")
     );
 
     // And the next apply does restart it: sshd started before the files were written.
-    host.answers.clear();
+    host.net_script.clear();
     let before = host.events.len();
     let (accepted, said) = run(&mut host);
     assert!(accepted, "{said:?}");
     assert_eq!(host.events[before..], ["stop", "start"]);
+}
 
-    // It had stopped after all: the start brought it up with the change.
+#[test]
+fn a_stop_that_reports_success_while_the_state_stays_running_is_a_stop_that_could_not_be_done() {
     let mut host = Fake::with_config(STOCK);
-    host.answers = VecDeque::from([stop_failed(), ServiceOutcome::Done]);
+    host.net_script = VecDeque::from([step(Ok(()), ServiceState::Running)]);
+    let (accepted, said) = run(&mut host);
+    assert!(!accepted, "{said:?}");
+    assert_eq!(host.starts(), 0, "{:?}", host.events);
+    assert_eq!(
+        said.last().unwrap(),
+        &format!("apply: sshd could not be stopped (net reported success) {COULD_NOT_STOP_TAIL}")
+    );
+}
+
+#[test]
+fn a_stop_that_fails_while_sshd_is_stopping_waits_for_it_and_then_starts_it() {
+    let mut host = Fake::with_config(STOCK);
+    host.net_script = VecDeque::from([step(Err("The sshd service could not be stopped"), changing("stopping"))]);
     let (accepted, said) = run(&mut host);
     assert!(accepted, "{said:?}");
-    assert_eq!(host.starts(), 1);
+    assert_eq!(host.waits, 1);
+    assert_eq!(host.events[host.events.len() - 3..], ["stop", "wait", "start"]);
     assert_eq!(host.config, with_line(STOCK.as_bytes(), INCLUDE_LINE).unwrap());
-    let last = said.last().unwrap();
-    assert!(
-        last.contains("Access is denied") && last.contains("restarted"),
-        "{said:?}"
+    assert_eq!(
+        said.last().unwrap(),
+        "apply: sshd restarted (net stop had said: The sshd service could not be stopped); it accepts \
+         SSH_BROKER_ELEVATION"
     );
     assert!(
         host.service_started_at
             .is_some_and(|started| started > host.config_time)
     );
+}
 
-    // Neither worked: the original files go back and sshd is started again.
+#[test]
+fn a_service_that_is_running_again_after_the_wait_is_a_stop_that_could_not_be_done() {
     let mut host = Fake::with_config(STOCK);
-    host.answers = VecDeque::from([stop_failed(), ServiceOutcome::Failed("no".into()), ServiceOutcome::Done]);
+    host.net_script = VecDeque::from([step(Err("Access is denied"), changing("stopping"))]);
+    host.wait_script = VecDeque::from([ServiceState::Running]);
     let (accepted, said) = run(&mut host);
-    assert!(!accepted);
-    assert_eq!(host.config, STOCK.as_bytes());
-    assert_eq!(host.drop_in, None);
-    assert_eq!(host.starts(), 2);
-    assert!(said.last().unwrap().contains("running again"), "{said:?}");
+    assert!(!accepted, "{said:?}");
+    assert_eq!((host.waits, host.starts()), (1, 0), "{:?}", host.events);
+    assert_eq!(
+        said.last().unwrap(),
+        &format!("apply: sshd could not be stopped (Access is denied) {COULD_NOT_STOP_TAIL}")
+    );
+}
 
-    // And the starts fail too: after a stop that failed it is not known that sshd is down.
+#[test]
+fn a_wait_whose_bound_expires_is_said_and_the_start_is_issued_anyway() {
     let mut host = Fake::with_config(STOCK);
-    host.answers = VecDeque::from([
-        stop_failed(),
-        ServiceOutcome::Failed("no".into()),
-        ServiceOutcome::Failed("still no".into()),
+    host.net_script = VecDeque::from([step(Err("x"), changing("stopping"))]);
+    host.wait_error = Some("the sshd service is still stopping".into());
+    let (accepted, said) = run(&mut host);
+    assert!(accepted, "{said:?}");
+    assert_eq!(host.events[host.events.len() - 3..], ["stop", "wait", "start"]);
+    assert!(
+        said.contains(&"apply: the sshd service is still stopping; starting sshd anyway".to_owned()),
+        "{said:?}"
+    );
+    assert_eq!(
+        said.last().unwrap(),
+        "apply: sshd restarted (net stop had said: x); it accepts SSH_BROKER_ELEVATION"
+    );
+}
+
+#[test]
+fn a_start_that_net_calls_a_failure_and_the_service_manager_calls_running_is_a_restart() {
+    let mut host = Fake::with_config(STOCK);
+    host.net_script = VecDeque::from([
+        step(Ok(()), ServiceState::Stopped),
+        step(
+            Err("The requested service has already been started"),
+            ServiceState::Running,
+        ),
     ]);
     let (accepted, said) = run(&mut host);
-    assert!(!accepted);
-    let last = said.last().unwrap();
-    assert!(
-        last.contains("may not be running") && last.contains("still no") && !last.contains("NOT running"),
-        "{said:?}"
+    assert!(accepted, "{said:?}");
+    assert_eq!(host.config, with_line(STOCK.as_bytes(), INCLUDE_LINE).unwrap());
+    assert_eq!(
+        said.last().unwrap(),
+        "apply: sshd restarted; it accepts SSH_BROKER_ELEVATION"
+    );
+}
+
+#[test]
+fn a_state_that_cannot_be_read_is_never_a_sentence_that_says_sshd_runs_or_does_not() {
+    let as_fact = |said: &[String]| {
+        said.iter()
+            .any(|line| line.contains("is running") || line.contains("NOT running") || line.contains("running again"))
+    };
+
+    // The first read (before the stop): not known to be stopped, so the stop is issued.
+    let mut host = Fake::with_config(STOCK);
+    host.unreadable_reads = vec![0];
+    let (accepted, said) = run(&mut host);
+    assert!(accepted, "{said:?}");
+    assert_eq!(host.events[host.events.len() - 2..], ["stop", "start"]);
+    assert_eq!(
+        said.last().unwrap(),
+        "apply: sshd restarted; it accepts SSH_BROKER_ELEVATION"
+    );
+
+    // The reads after the stop and after the wait: not known to be running or stopped, so the start is issued.
+    let mut host = Fake::with_config(STOCK);
+    host.net_script = VecDeque::from([step(Err("Access is denied"), ServiceState::Running)]);
+    host.unreadable_reads = vec![1, 2];
+    let (accepted, said) = run(&mut host);
+    assert!(accepted, "{said:?}");
+    assert_eq!((host.waits, host.starts()), (1, 1), "{:?}", host.events);
+    assert!(!as_fact(&said), "{said:?}");
+    assert_eq!(
+        said.last().unwrap(),
+        "apply: sshd restarted (net stop had said: Access is denied); it accepts SSH_BROKER_ELEVATION"
+    );
+
+    // The reads after both starts: the files are put back, and what is said is that it is not known.
+    let mut host = Fake::with_config(STOCK);
+    host.unreadable_reads = vec![2, 3];
+    let (accepted, said) = run(&mut host);
+    assert!(!accepted, "{said:?}");
+    assert_eq!(host.starts(), 2);
+    assert_eq!(host.config, STOCK.as_bytes());
+    assert!(!as_fact(&said), "{said:?}");
+    assert_eq!(
+        said.last().unwrap(),
+        "apply: sshd may not be running (its state could not be read: state read 3 failed): it failed to start \
+         with SSH_BROKER_ELEVATION accepted (net start sshd reported success, and its state could not be read: \
+         state read 2 failed), and again with the original configuration put back (net start sshd reported \
+         success, and its state could not be read: state read 3 failed). Start it at this PC: `net start sshd`."
     );
 }
 
@@ -711,31 +959,30 @@ fn a_stop_that_fails_is_followed_by_a_start_and_what_that_says_decides() {
 fn a_start_that_fails_after_the_stop_puts_the_original_config_and_drop_in_back_and_starts_again_and_says_so() {
     // The drop-in did not exist before: it is removed.
     let mut host = Fake::with_config(STOCK);
-    host.answers = VecDeque::from([
-        ServiceOutcome::Done,
-        ServiceOutcome::Failed("The service did not respond".into()),
-        ServiceOutcome::Done,
+    host.net_script = VecDeque::from([
+        step(Ok(()), ServiceState::Stopped),
+        step(Err("The service did not respond"), ServiceState::Stopped),
+        step(Ok(()), ServiceState::Running),
     ]);
     let (accepted, said) = run(&mut host);
     assert!(!accepted);
     assert_eq!(host.config, STOCK.as_bytes(), "the original, byte for byte");
     assert_eq!(host.drop_in, None);
-    assert_eq!(host.events.iter().filter(|e| *e == "start").count(), 2);
-    let last = said.last().unwrap();
-    assert!(
-        last.contains("The service did not respond") && last.contains("running again"),
-        "{said:?}"
+    assert_eq!(host.starts(), 2);
+    assert_eq!(
+        said.last().unwrap(),
+        "apply: sshd failed to start with SSH_BROKER_ELEVATION accepted (The service did not respond); the \
+         original configuration was put back and sshd is running again. It does not accept SSH_BROKER_ELEVATION."
     );
-    assert!(!last.contains("NOT running"), "{last}");
 
     // A drop-in that was there with other text comes back as it was.
     let mut host = Fake::with_config(STOCK);
     host.drop_in = Some(b"AcceptEnv OTHER\r\n".to_vec());
     host.drop_in_time = Some(1);
-    host.answers = VecDeque::from([
-        ServiceOutcome::Done,
-        ServiceOutcome::Failed("no".into()),
-        ServiceOutcome::Done,
+    host.net_script = VecDeque::from([
+        step(Ok(()), ServiceState::Stopped),
+        step(Err("no"), ServiceState::Stopped),
+        step(Ok(()), ServiceState::Running),
     ]);
     run(&mut host);
     assert_eq!(host.config, STOCK.as_bytes());
@@ -743,30 +990,41 @@ fn a_start_that_fails_after_the_stop_puts_the_original_config_and_drop_in_back_a
 }
 
 #[test]
-fn a_second_failed_start_says_sshd_is_not_running_and_how_to_start_it() {
+fn two_failed_starts_say_sshd_is_not_running_with_the_state_and_how_to_start_it() {
     let mut host = Fake::with_config(STOCK);
-    host.answers = VecDeque::from([
-        ServiceOutcome::Done,
-        ServiceOutcome::Failed("first".into()),
-        ServiceOutcome::Failed("second".into()),
+    host.net_script = VecDeque::from([
+        step(Ok(()), ServiceState::Stopped),
+        step(Err("first"), ServiceState::Stopped),
+        step(Err("second"), ServiceState::Stopped),
     ]);
     let (accepted, said) = run(&mut host);
     assert!(!accepted);
     assert_eq!(host.config, STOCK.as_bytes(), "the original is back even so");
-    let last = said.last().unwrap();
-    assert!(
-        last.contains("NOT running") && last.contains("net start sshd") && last.contains("second"),
-        "{last}"
+    assert_eq!(
+        said.last().unwrap(),
+        "apply: sshd is NOT running (the service manager says: stopped): it failed to start with \
+         SSH_BROKER_ELEVATION accepted (first), and again with the original configuration put back (second). \
+         Start it at this PC: `net start sshd`."
     );
-}
 
-#[test]
-fn a_start_that_says_it_is_already_started_is_a_start() {
+    // A start that net calls a success and the service manager does not show running is quoted as that.
     let mut host = Fake::with_config(STOCK);
-    host.answers = VecDeque::from([ServiceOutcome::Done, ServiceOutcome::Unchanged]);
-    let (accepted, _) = run(&mut host);
-    assert!(accepted);
-    assert_eq!(host.config, with_line(STOCK.as_bytes(), INCLUDE_LINE).unwrap());
+    host.net_script = VecDeque::from([
+        step(Ok(()), ServiceState::Stopped),
+        step(Ok(()), changing("starting")),
+        step(Ok(()), changing("starting")),
+    ]);
+    let (accepted, said) = run(&mut host);
+    assert!(!accepted);
+    let seen = "net start sshd reported success, and the service manager says: starting";
+    assert_eq!(
+        said.last().unwrap(),
+        &format!(
+            "apply: sshd is NOT running (the service manager says: starting): it failed to start with \
+             SSH_BROKER_ELEVATION accepted ({seen}), and again with the original configuration put back ({seen}). \
+             Start it at this PC: `net start sshd`."
+        )
+    );
 }
 
 // a second run and failures =====
@@ -825,58 +1083,10 @@ fn a_failure_of_any_step_does_not_fail_apply() {
     // `remove_drop_in` is reached only by a rollback.
     let mut host = Fake::with_config(STOCK);
     host.fail = Some("remove_drop_in");
-    host.answers = VecDeque::from([ServiceOutcome::Done, ServiceOutcome::Failed("x".into())]);
+    host.net_script = VecDeque::from([
+        step(Ok(()), ServiceState::Stopped),
+        step(Err("x"), ServiceState::Stopped),
+    ]);
     let (accepted, said) = run(&mut host);
     assert!(!accepted && !said.is_empty());
-}
-
-// net.exe =====
-
-#[test]
-fn net_says_done_for_a_zero_exit_and_names_a_state_it_was_already_in() {
-    assert_eq!(
-        net_outcome(Service::Stop, 0, "The sshd service was stopped successfully.\r\n"),
-        ServiceOutcome::Done
-    );
-    assert_eq!(
-        net_outcome(
-            Service::Stop,
-            2,
-            "The sshd service is not started.\r\n\r\nMore help is available by typing NET HELPMSG 3521.\r\n"
-        ),
-        ServiceOutcome::Unchanged
-    );
-    assert_eq!(
-        net_outcome(
-            Service::Start,
-            2,
-            "The requested service has already been started.\r\n\r\nMore help is available by typing NET HELPMSG 2182.\r\n"
-        ),
-        ServiceOutcome::Unchanged
-    );
-    // The code is the same in any language; the other service's code is a failure.
-    assert!(matches!(
-        net_outcome(Service::Start, 2, "NET HELPMSG 3521"),
-        ServiceOutcome::Failed(_)
-    ));
-    assert!(matches!(
-        net_outcome(Service::Stop, 2, "NET HELPMSG 2182"),
-        ServiceOutcome::Failed(_)
-    ));
-}
-
-#[test]
-fn net_failure_carries_the_output_in_one_line() {
-    let ServiceOutcome::Failed(said) = net_outcome(
-        Service::Start,
-        2,
-        "System error 5 has occurred.\r\n\r\nAccess is denied.\r\n",
-    ) else {
-        panic!("a failure")
-    };
-    assert_eq!(said, "System error 5 has occurred. Access is denied.");
-    let ServiceOutcome::Failed(empty) = net_outcome(Service::Stop, 1, "") else {
-        panic!("a failure")
-    };
-    assert!(empty.contains("exit code 1"), "{empty}");
 }

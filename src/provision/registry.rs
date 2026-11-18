@@ -514,21 +514,29 @@ mod win {
 
     /// Tell the windows of the machine that the environment changed, as the System dialog does. The
     /// programs that read it (Explorer, and what it starts) then take the new `Path`; a process that is
-    /// already running keeps its own. The message is queued to each window and this does not wait for any of
-    /// them: a window that is hung holds nothing up, and nothing depends on one having answered. Run over SSH,
-    /// `apply` has no desktop and the message reaches no window of that session; sessions that sshd and the
-    /// agent start read the registry themselves.
+    /// already running keeps its own. A window that is hung is given up on; nothing depends on one having
+    /// answered. Run over SSH, `apply` has no desktop and the message reaches no window of that session;
+    /// sessions that sshd and the agent start read the registry themselves.
     pub fn broadcast_environment_change() {
         use windows::Win32::Foundation::{LPARAM, WPARAM};
-        use windows::Win32::UI::WindowsAndMessaging::{HWND_BROADCAST, SendNotifyMessageW, WM_SETTINGCHANGE};
-        // SAFETY: the string is a NUL-terminated literal that lives as long as the program, so a window that
-        // reads it after this returns still finds it.
+        use windows::Win32::UI::WindowsAndMessaging::{
+            HWND_BROADCAST, SMTO_ABORTIFHUNG, SendMessageTimeoutW, WM_SETTINGCHANGE,
+        };
+        // The 5000 ms is the bound for another program's window that may never answer, which Windows requires of
+        // this call (the asynchronous message functions cannot carry a pointer for a message below `WM_USER`);
+        // nothing here waits on or reads the result.
+        const WINDOW_ANSWER_BOUND_MS: u32 = 5000;
+        // SAFETY: the string is a NUL-terminated literal that lives as long as the program, and the call returns
+        // only after each window has answered or been given up on.
         let _ = unsafe {
-            SendNotifyMessageW(
+            SendMessageTimeoutW(
                 HWND_BROADCAST,
                 WM_SETTINGCHANGE,
                 WPARAM(0),
                 LPARAM(windows::core::w!("Environment").as_ptr() as isize),
+                SMTO_ABORTIFHUNG,
+                WINDOW_ANSWER_BOUND_MS,
+                None,
             )
         };
     }

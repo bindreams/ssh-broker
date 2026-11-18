@@ -49,7 +49,7 @@ windows = { version = "0.62.2", features = [
     "Win32_Security_Authentication_Identity", # LsaGetLogonSessionData: the logon type of the probe's session
     "Win32_Security_Cryptography", # DPAPI parity probe (CryptProtectData/CryptUnprotectData)
     "Win32_UI_Shell",              # GetUserProfileDirectoryW: the profile of a token
-    "Win32_UI_WindowsAndMessaging", # SendNotifyMessageW: apply tells the machine's windows that the system PATH changed (src/provision/registry.rs)
+    "Win32_UI_WindowsAndMessaging", # SendMessageTimeoutW: apply tells the machine's windows that the system PATH changed (src/provision/registry.rs)
     "Win32_System_Services",       # QueryServiceStatusEx: the process of the sshd service, whose start time says whether sshd has read its configuration (src/provision/sshd_config/machine.rs)
     "Win32_System_TaskScheduler",  # stop/start the agent task per session (COM)
     "Win32_System_Com",            # CoInitializeEx / CoCreateInstance for the Task Scheduler

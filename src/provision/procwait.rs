@@ -45,6 +45,12 @@ pub struct Process {
 }
 
 impl Process {
+    /// Open the process `pid` for waiting and reading; `None` if it has exited. What the handle holds is
+    /// the process that had `pid` when it was opened, whatever `pid` names later.
+    pub fn open(pid: u32) -> anyhow::Result<Option<Process>> {
+        Ok(open_for_waiting(pid)?.map(|handle| Process { pid, handle }))
+    }
+
     /// The process handle, for waiting on it. Owned by `self`.
     pub fn handle(&self) -> HANDLE {
         self.handle.0
@@ -522,8 +528,8 @@ pub fn user_agents(image: &Path, user: &Sid, integrity: Integrity) -> anyhow::Re
         &wanted_user,
         integrity,
         &wanted,
-        &|pid| match open_for_waiting(pid) {
-            Ok(opened) => Ok(opened.map(|handle| Process { pid, handle })),
+        &|pid| match Process::open(pid) {
+            Ok(opened) => Ok(opened),
             Err(e) if is_denied(&e) => Ok(None),
             Err(e) => Err(e),
         },

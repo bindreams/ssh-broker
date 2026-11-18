@@ -12,7 +12,7 @@
 //! Windows, so the effective configuration is asked globally; a server's own `SetEnv` beats the client's
 //! value; and a change needs a restart of the service.
 
-use std::path::PathBuf;
+use configure::ConfigRead;
 
 use super::report::Check;
 use crate::socket_loc::Integrity;
@@ -203,16 +203,16 @@ const ROW_NAME: &str = "sshd accepts SSH_BROKER_ELEVATION";
 pub enum SshdReading {
     /// The sshd service runs with arguments, which can name another configuration file: nothing else was read.
     WithArguments(String),
-    /// `sshd -T`'s output, and the file written after the sshd service started, if there is one (sshd reads its
-    /// configuration only when it starts).
-    Read { listing: String, unread: Option<PathBuf> },
+    /// `sshd -T`'s output, and whether the running sshd has read the files (it reads them only when it starts).
+    Read { listing: String, read: ConfigRead },
 }
 
 /// The `verify` row for sshd's configuration. `sshd -T` reads sshd's host keys, which only administrators and
 /// SYSTEM can read, so the row is judged only at [`Integrity::High`] and `reading` is asked only there; below
 /// it the row is informational and passes. At High it passes when the variable is in force ([`in_force`]) and
-/// sshd has read what was written; it fails when sshd started before a file was written, when the variable is
-/// not in force, and, with the cause, when `reading` fails. A service that runs with arguments is not checked:
+/// sshd has read what was written; it fails when sshd started before a file was written (or at that moment),
+/// when the variable is not in force, and, with the cause, when `reading` fails. A file whose time is ahead of
+/// the clock cannot be judged: the row passes and says so. A service that runs with arguments is not checked:
 /// the row passes and says so.
 pub fn accepts_row(integrity: Integrity, reading: impl FnOnce() -> anyhow::Result<SshdReading>) -> Check {
     if integrity != Integrity::High {
@@ -222,7 +222,7 @@ pub fn accepts_row(integrity: Integrity, reading: impl FnOnce() -> anyhow::Resul
             "not checked here: sshd's configuration is read by an elevated `verify`",
         );
     }
-    let (listing, unread) = match reading() {
+    let (listing, read) = match reading() {
         Err(e) => return Check::new(ROW_NAME, false, format!("{e:#}")),
         Ok(SshdReading::WithArguments(arguments)) => {
             return Check::new(
@@ -234,7 +234,7 @@ pub fn accepts_row(integrity: Integrity, reading: impl FnOnce() -> anyhow::Resul
                 ),
             );
         }
-        Ok(SshdReading::Read { listing, unread }) => (listing, unread),
+        Ok(SshdReading::Read { listing, read }) => (listing, read),
     };
     if !in_force(&listing) {
         return Check::new(
@@ -246,15 +246,30 @@ pub fn accepts_row(integrity: Integrity, reading: impl FnOnce() -> anyhow::Resul
             ),
         );
     }
-    if let Some(file) = unread {
-        return Check::new(
-            ROW_NAME,
-            false,
-            format!(
-                "sshd was started before {} was last written and may not have read it; `ssh-broker apply` restarts it",
-                file.display()
-            ),
-        );
+    match read {
+        ConfigRead::Read => {}
+        ConfigRead::Unread(file) => {
+            return Check::new(
+                ROW_NAME,
+                false,
+                format!(
+                    "sshd was started before {} was last written and may not have read it; `ssh-broker apply` \
+                     restarts it",
+                    file.display()
+                ),
+            );
+        }
+        ConfigRead::Unknowable(file) => {
+            return Check::new(
+                ROW_NAME,
+                true,
+                format!(
+                    "accepted; {}'s last-write time is ahead of the clock, so whether the running sshd has read it \
+                     cannot be told (`ssh-broker apply` restarts sshd)",
+                    file.display()
+                ),
+            );
+        }
     }
     match pinned(&listing, VARIABLE) {
         Some(value) if !accepts(&listing, VARIABLE) => {

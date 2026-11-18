@@ -346,20 +346,24 @@ pub fn sshd_search_dirs(host: &dyn Host, image_path: Option<&str>) -> anyhow::Re
     Ok(dirs)
 }
 
-/// A service's `ImagePath` as the program it starts and the text after it. The value is a command line: the
-/// program is quoted, or runs up to its `.exe`, and arguments may follow.
+/// A service's `ImagePath` as the program it starts and the text after it. The value is a command line: a
+/// quoted program ends at the closing quote. An unquoted one ends at the first `.exe` (any case) that is
+/// followed by the end of the value or by white space, so a folder named `my.executables` does not end it; when
+/// there is none, at the first white space. Arguments may follow.
 fn split_image(image_path: &str) -> (&str, &str) {
     let image_path = image_path.trim();
-    match image_path.strip_prefix('"') {
-        Some(quoted) => quoted.split_once('"').unwrap_or((quoted, "")),
-        None => {
-            let end = image_path
-                .to_ascii_lowercase()
-                .find(".exe")
-                .map_or(image_path.len(), |at| at + ".exe".len());
-            image_path.split_at(end)
-        }
+    if let Some(quoted) = image_path.strip_prefix('"') {
+        return quoted.split_once('"').unwrap_or((quoted, ""));
     }
+    let lower = image_path.to_ascii_lowercase();
+    let word_end = |at: usize| image_path[at..].chars().next().is_none_or(char::is_whitespace);
+    let end = lower
+        .match_indices(".exe")
+        .map(|(at, exe)| at + exe.len())
+        .find(|&end| word_end(end))
+        .or_else(|| image_path.find(char::is_whitespace))
+        .unwrap_or(image_path.len());
+    image_path.split_at(end)
 }
 
 /// The program a service's `ImagePath` starts.
