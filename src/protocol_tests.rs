@@ -307,16 +307,9 @@ fn the_wire_version_is_4() {
     assert_eq!(Handshake::pty_default().version, 4);
 }
 
-const POLICIES: [ElevationPolicy; 4] = [
-    ElevationPolicy::Never,
-    ElevationPolicy::Prompt,
-    ElevationPolicy::AutoApprove,
-    ElevationPolicy::Always,
-];
-
 #[test]
 fn handshake_round_trips_each_policy() {
-    for elevation in POLICIES.map(Some).into_iter().chain([None]) {
+    for elevation in crate::test_support::asked_policies() {
         let h = Handshake {
             elevation,
             command: Some("x".into()),

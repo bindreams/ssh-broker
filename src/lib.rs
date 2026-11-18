@@ -65,7 +65,7 @@ pub mod socket_loc;
 pub mod socket_watch;
 #[cfg(windows)]
 pub mod starting_agent;
-#[cfg(all(windows, test))]
+#[cfg(test)]
 mod test_support;
 #[cfg(windows)]
 pub mod userdir;
