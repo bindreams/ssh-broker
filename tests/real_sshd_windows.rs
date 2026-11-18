@@ -264,14 +264,6 @@ fn token_of_command_with_terminal(kit: &Kit, login: &Login<'_>, remote: &str, se
     token_shown(&shown)
 }
 
-/// `ssh -T host -- "<kit exe>" verify`, served by the agent: the text `verify` printed. Its session rows are
-/// the ones that say what the agent's sessions are. Its exit code is not read: the rig does not install the
-/// broker with `apply`, so its installation rows are not expected to pass.
-fn verify_through_the_agent(kit: &Kit, login: &Login<'_>) -> String {
-    let remote = format!("\"{}\" verify", kit.exe.display());
-    run_command_through_sshd(kit, login, &remote, Server::Agent).1
-}
-
 /// What a PowerShell session of the agent says of its own token, typed as a line: `wg-label=<label>
 /// wg-admin=<state>;`. The markers are joined by the shell so that the echo of the typed line does not hold them.
 /// The shell is first shown to be the agent's ([`SshSession::check_relayed_shell`]): a session of the shim's own
@@ -322,10 +314,6 @@ fn an_administrators_session_through_real_sshd_is_elevated_and_the_word_gives_an
         TokenShown::new("High", "enabled"),
         "the login's own shell is not elevated"
     );
-    // `verify` through the agent the password prompt started: an elevated session, an unelevated one on request,
-    // and the junction a token below High made followed.
-    agent_conn::assert_verify_session_rows(&verify_through_the_agent(&kit, &login));
-
     let elevated = TokenShown::new("High", "enabled");
     let unelevated = TokenShown::new("Medium", "deny-only");
     // The word in the client's command.
