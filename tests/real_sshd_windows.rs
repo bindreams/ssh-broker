@@ -430,7 +430,7 @@ fn an_administrators_session_through_real_sshd_is_unelevated_unless_the_login_as
         elevated,
         "always, with a terminal"
     );
-    let mut shell = SshSession::start_as_given(login.command_asking("always"), login.diagnostics());
+    let mut shell = SshSession::start(login.command_asking("always"), login.diagnostics());
     shell.read_until(SHELL_PROMPT);
     assert_eq!(
         token_of_shell(&mut shell),

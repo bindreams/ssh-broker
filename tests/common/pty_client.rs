@@ -78,6 +78,17 @@ pub struct PtyRun {
 impl PtyRun {
     /// Start the shim (`shim_exe`, no arguments: an interactive login) as `account`.
     pub fn start(kit: &Kit, account: &Account, shim_exe: &Path) -> PtyRun {
+        PtyRun::start_with_environment(kit, account, shim_exe, None)
+    }
+
+    /// [`PtyRun::start`] with the shim's environment given (a block from `environment`), as sshd gives it the
+    /// variables a client sent: how a login asks for a level of elevation. `None` is this process's own.
+    pub fn start_with_environment(
+        kit: &Kit,
+        account: &Account,
+        shim_exe: &Path,
+        environment: Option<&[u16]>,
+    ) -> PtyRun {
         let (child_in, my_in) = pipe(true);
         let (my_out, child_out) = pipe(false);
         let command_line = format!(
@@ -92,7 +103,7 @@ impl PtyRun {
             kit.dir(),
             &[kit.dir().to_path_buf()],
             CREATE_PROCESS_LOGON_FLAGS(0),
-            None,
+            environment,
             Some([child_in.0, child_out.0, child_out.0]),
         );
         helper.resume();

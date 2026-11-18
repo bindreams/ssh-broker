@@ -20,8 +20,9 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use ssh_broker::acl::Sid;
+use ssh_broker::protocol::ElevationPolicy;
 use ssh_broker::provision::procwait;
-use ssh_broker::socket_loc::SocketLocation;
+use ssh_broker::socket_loc::{Integrity, SocketLocation};
 use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
 use windows::Win32::System::Threading::WaitForSingleObject;
 
@@ -201,9 +202,16 @@ fn try_end(
         held.len()
     ));
 
+    // A session is unelevated by default, and an unelevated process cannot connect to an agent at High, so
+    // `logout` run in such a session cannot reach it. It asks for the agent's own token there until the
+    // request socket lets the default session end an elevated agent.
+    let elevation = match integrity {
+        Integrity::High => ElevationPolicy::Always,
+        Integrity::Medium => ElevationPolicy::DEFAULT,
+    };
     let finished = attempt("ask the agent to log out", || {
         let mut asker = AgentConn::connect(location, sid);
-        asker.start_exec(&format!("\"{}\" logout", exe.display()));
+        asker.start_exec_as(&format!("\"{}\" logout", exe.display()), elevation);
         asker.end_stdin();
         asker.read_to_end()
     })?;
