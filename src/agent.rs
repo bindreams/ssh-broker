@@ -660,10 +660,10 @@ type ExecStarter = fn(&str, Option<&Path>, Option<&UnelevatedToken>) -> Result<E
 #[cfg(windows)]
 type Splitter = fn(socket2::Socket) -> Result<(ConnRx, ConnTx), (afunix::Whole, anyhow::Error)>;
 
-/// How a session gets what its shell runs with, given the login's elevation policy: the stepped-down token,
+/// How a session gets what its shell runs with, given what the login asked of elevation: the stepped-down token,
 /// the agent's own, or a refusal (see [`crate::account::step_down`]); a parameter so a test can force a failure.
 #[cfg(windows)]
-type UnelevatedMaker = fn(ElevationPolicy) -> anyhow::Result<StepDown<UnelevatedToken>>;
+type UnelevatedMaker = fn(Option<ElevationPolicy>) -> anyhow::Result<StepDown<UnelevatedToken>>;
 
 /// What a test can replace or observe in a session; production uses [`Hooks::production`].
 #[cfg(windows)]
@@ -765,7 +765,7 @@ fn handle_connection_in(conn: socket2::Socket, hooks: Hooks, control: &Control) 
     if control.is_ending() {
         return logout::refuse_while_ending(&mut rx, &mut tx, control);
     }
-    let launched = match launch::launch_line(&hs, &*hooks.shell_host) {
+    let mut launched = match launch::launch_line(&hs, &*hooks.shell_host) {
         Ok(launched) => launched,
         Err(launch::Refusal::BadRequest(cause)) => {
             return Err(logout::fail_connection(
@@ -789,11 +789,20 @@ fn handle_connection_in(conn: socket2::Socket, hooks: Hooks, control: &Control) 
         }
     };
     // Once, before anything is started, and given to every start of the session: the line, and the
-    // `console-fallback` verb, whose child inherits it. A session that cannot have what it asked for is
-    // refused, not given the agent's own token or another level.
+    // `console-fallback` verb, whose child inherits it. A login that asked for a level it cannot have is
+    // refused, not given the agent's own token or another level; one that asked for nothing and cannot be
+    // stepped down is given the agent's own token, and told so as the first data of the session.
     let unelevated = match (hooks.make_unelevated)(hs.elevation) {
         Ok(StepDown::Token(token)) => Some(token),
         Ok(StepDown::Own) => None,
+        Ok(StepDown::Fallback(cause)) => {
+            let cause = format!("{cause:#}");
+            tracing::warn!(
+                "the agent could not prepare an unelevated session, so the session has its own token: {cause}"
+            );
+            launched.add_notice(hs.mode, &text::unelevated_fallback(&cause, text::FallbackToken::Agent));
+            None
+        }
         Ok(StepDown::Refused) => {
             return Err(logout::fail_connection(
                 &mut rx,
@@ -809,7 +818,7 @@ fn handle_connection_in(conn: socket2::Socket, hooks: Hooks, control: &Control) 
                 &mut rx,
                 &mut tx,
                 control,
-                text::UNELEVATED_UNAVAILABLE_WHAT,
+                text::unelevated_unavailable_what(hs.elevation),
                 cause,
                 logout::FAILED_EXIT_CODE,
             ));

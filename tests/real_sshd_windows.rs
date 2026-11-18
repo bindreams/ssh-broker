@@ -65,7 +65,8 @@ use whoami_groups::{TokenShown, token_shown};
 /// connections of another new account at once.
 #[test]
 fn prompt_path_through_real_sshd() {
-    let _machine = machine::shared();
+    // Exclusive: `Login::new` rewrites sshd's configuration and restarts it ([`accept_elevation_variable`]).
+    let _machine = machine::exclusive();
     account_fixture::assert_elevated();
     let kit = Kit::broker_with_helper("sshd");
     let account = Account::create("sshd", true);

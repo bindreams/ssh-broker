@@ -182,13 +182,19 @@ fn the_production_step_down_follows_the_table_at_this_process_s_level() {
         ElevationPolicy::Prompt,
         ElevationPolicy::AutoApprove,
     ] {
-        let given = UnelevatedToken::for_policy(policy).unwrap();
+        let given = UnelevatedToken::for_policy(Some(policy)).unwrap();
         assert!(
             matches!((at_high, &given), (true, StepDown::Token(_)) | (false, StepDown::Own)),
             "{policy:?}"
         );
     }
-    let always = UnelevatedToken::for_policy(ElevationPolicy::Always).unwrap();
+    // A login that set nothing is stepped down the same way when the token can be made, as it can here.
+    let nothing = UnelevatedToken::for_policy(None).unwrap();
+    assert!(
+        matches!((at_high, &nothing), (true, StepDown::Token(_)) | (false, StepDown::Own)),
+        "nothing"
+    );
+    let always = UnelevatedToken::for_policy(Some(ElevationPolicy::Always)).unwrap();
     assert!(
         matches!((at_high, &always), (true, StepDown::Own) | (false, StepDown::Refused)),
         "always"

@@ -72,7 +72,7 @@ pub trait AutoLoginEnv {
 fn not_elevated(verb: &str) -> String {
     format!(
         "ssh-broker: auto-login {verb} needs an elevated administrator shell, and this is not one. Run it from an \
-         elevated prompt at the PC, or from an SSH login of an administrator (which is elevated)."
+         elevated prompt at the PC, or from an SSH login that asked for SSH_BROKER_ELEVATION=always."
     )
 }
 

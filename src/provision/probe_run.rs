@@ -62,7 +62,7 @@ fn run_at(integrity: Integrity, temp: &Path, drive: Drive) -> Probes {
 
 /// The probe of an agent below High: it makes the junction in `dir` and follows it.
 fn run_at_medium(dir: &Path, drive: Drive) -> Probes {
-    let default = drive(ElevationPolicy::Prompt, make_link(dir));
+    let default = drive(ElevationPolicy::DEFAULT, make_link(dir));
     let note = said(&default).to_owned();
     let junction = if dir.to_str().is_some() {
         read_by(&default, note)
@@ -83,7 +83,7 @@ fn run_at_medium(dir: &Path, drive: Drive) -> Probes {
 /// The two probes of an agent at High, in order: the unelevated probe (`prompt`) makes the junction in `dir`,
 /// and the default probe, which asks for `always`, follows it.
 fn run_at_high(dir: &Path, drive: Drive) -> Probes {
-    let unelevated = drive(ElevationPolicy::Prompt, make_link(dir));
+    let unelevated = drive(ElevationPolicy::DEFAULT, make_link(dir));
     let source = source_of(dir, &unelevated);
     let default = match (&source, &unelevated) {
         (Source::FromBelowHigh(text), _) => drive(ElevationPolicy::Always, ProbeLink::Follow((*text).to_owned())),

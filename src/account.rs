@@ -167,28 +167,39 @@ pub fn integrity() -> anyhow::Result<Integrity> {
     Ok(integrity_class(integrity_of(own_token()?.0)?))
 }
 
-/// What a session of a login with `policy` is started with in this process: the one rule that the agent, the
-/// shim failing open and the filtered shim all use.
+/// What a session of a login that `asked` for a level is started with in this process: the one rule that the
+/// agent, the shim failing open and the filtered shim all use. `None` is a login that set nothing.
 ///
-/// | policy | at High | below High |
+/// | asked | at High | below High |
 /// |---|---|---|
 /// | `Never`, `Prompt`, `AutoApprove` | [`StepDown::Token`] | [`StepDown::Own`] |
 /// | `Always` | [`StepDown::Own`] | [`StepDown::Refused`] |
+/// | nothing | [`StepDown::Token`] | [`StepDown::Own`] |
 ///
-/// A level that cannot be read, or a token that cannot be made, is an error: a guess would run the session
-/// as it is. `integrity` is read once, and `make` only for a [`StepDown::Token`]; both are parameters so
-/// that a test can make either fail.
+/// A login that asked for a level is refused when it cannot be given: a level that cannot be read, or a token
+/// that cannot be made, is an error, since a guess would run the session as it is. A login that asked for
+/// nothing gets [`StepDown::Fallback`] in the same two cases: this process's own token, and the cause for the
+/// notice. `integrity` is read once, and `make` only for a [`StepDown::Token`]; both are parameters so that a
+/// test can make either fail.
 pub fn step_down<K>(
-    policy: ElevationPolicy,
+    asked: Option<ElevationPolicy>,
     integrity: impl FnOnce() -> anyhow::Result<Integrity>,
     make: impl FnOnce() -> anyhow::Result<K>,
 ) -> anyhow::Result<StepDown<K>> {
-    let level = integrity().context("read this process's integrity level")?;
-    Ok(match (policy, level) {
-        (ElevationPolicy::Always, Integrity::High) => StepDown::Own,
-        (ElevationPolicy::Always, Integrity::Medium) => StepDown::Refused,
-        (_, Integrity::High) => StepDown::Token(make()?),
+    let level = match integrity().context("read this process's integrity level") {
+        Ok(level) => level,
+        Err(cause) if asked.is_none() => return Ok(StepDown::Fallback(cause)),
+        Err(cause) => return Err(cause),
+    };
+    Ok(match (asked, level) {
+        (Some(ElevationPolicy::Always), Integrity::High) => StepDown::Own,
+        (Some(ElevationPolicy::Always), Integrity::Medium) => StepDown::Refused,
         (_, Integrity::Medium) => StepDown::Own,
+        (Some(_), Integrity::High) => StepDown::Token(make()?),
+        (None, Integrity::High) => match make() {
+            Ok(token) => StepDown::Token(token),
+            Err(cause) => StepDown::Fallback(cause),
+        },
     })
 }
 

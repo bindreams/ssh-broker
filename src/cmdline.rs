@@ -6,6 +6,8 @@
 //! `route` finds to the command. Nothing on the command line is interpreted: the command goes to the
 //! shell as the client sent it.
 
+use crate::protocol::ElevationPolicy;
+
 #[cfg(not(windows))]
 mod other;
 #[cfg(windows)]
@@ -31,6 +33,15 @@ pub struct Exec {
     pub command: String,
     /// The session has a console ([`Encoding::Verbatim`]): the command gets a terminal.
     pub terminal: bool,
+}
+
+/// What a login asked for, built once by the shim and passed on as it is: the command it runs, if any, and
+/// the level of elevation it set [`ElevationPolicy::VARIABLE`] to, if it set one. A login that set nothing
+/// asked nothing, which is not the same as asking for [`ElevationPolicy::DEFAULT`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Login {
+    pub exec: Option<Exec>,
+    pub elevation: Option<ElevationPolicy>,
 }
 
 /// The command `exec` carries. A tail is decoded by the form `detect` reports, called here rather

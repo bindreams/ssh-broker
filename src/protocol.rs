@@ -123,7 +123,7 @@ impl ExitCode {
 }
 
 /// The wire version; a peer of any other version is refused by name.
-pub const PROTOCOL_VERSION: u16 = 3;
+pub const PROTOCOL_VERSION: u16 = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Mode {
@@ -150,7 +150,8 @@ pub enum Launch {
 pub enum ElevationPolicy {
     /// An unelevated session, and `ssh-broker elevate` in it is refused.
     Never,
-    /// An unelevated session, and `ssh-broker elevate` asks the person at the terminal. The default.
+    /// An unelevated session, and `ssh-broker elevate` asks the person at the terminal. The default
+    /// ([`ElevationPolicy::DEFAULT`]).
     Prompt,
     /// An unelevated session, and `ssh-broker elevate` in it is granted without asking.
     AutoApprove,
@@ -162,13 +163,14 @@ impl ElevationPolicy {
     /// The environment variable sshd hands the shim when the login set it.
     pub const VARIABLE: &'static str = "SSH_BROKER_ELEVATION";
 
-    /// The policy `value` of [`Self::VARIABLE`] names; `None` (unset) is [`ElevationPolicy::Prompt`]. Exactly
-    /// the four words, in lower case: anything else, a different case, padding or an empty value included,
-    /// is an error, since a guess would give the login a level it did not ask for.
-    pub fn parse(value: Option<&std::ffi::OsStr>) -> Result<Self, UnknownPolicy> {
-        let Some(value) = value else {
-            return Ok(Self::Prompt);
-        };
+    /// The level a login that asked for none is given, wherever one is needed: `asked.unwrap_or(DEFAULT)`.
+    /// A login that asked for none is not one that asked for this ([`Handshake::elevation`]).
+    pub const DEFAULT: ElevationPolicy = ElevationPolicy::Prompt;
+
+    /// The policy `value` of [`Self::VARIABLE`] names. Exactly the four words, in lower case: anything else,
+    /// a different case, padding or an empty value included, is an error, since a guess would give the login
+    /// a level it did not ask for. A login that set nothing has no value to parse.
+    pub fn parse(value: &std::ffi::OsStr) -> Result<Self, UnknownPolicy> {
         match value.to_str() {
             Some("never") => Ok(Self::Never),
             Some("prompt") => Ok(Self::Prompt),
@@ -212,9 +214,12 @@ pub struct Handshake {
     pub command: Option<String>,
     pub env: Vec<(String, String)>,
     pub launch: Launch,
+    /// What the login asked of elevation; `None` if it set [`ElevationPolicy::VARIABLE`] to nothing. A login
+    /// that asked for a level is refused when it cannot be given; one that asked for none is given
+    /// [`ElevationPolicy::DEFAULT`], or, when no unelevated session can be made, the token the process has.
     /// Appended last: the version check reads `version` alone, so a peer of another version is refused
     /// by name before this field is looked for.
-    pub elevation: ElevationPolicy,
+    pub elevation: Option<ElevationPolicy>,
 }
 
 impl Handshake {
@@ -233,9 +238,9 @@ impl Handshake {
     }
 
     /// A minimal interactive-PTY handshake, used as a `..Handshake::pty_default()` base in tests
-    /// and by `make_handshake`. Its launch is [`Launch::Direct`]: the base for a raw spawn. Its policy is
-    /// the default, [`ElevationPolicy::Prompt`]: an agent at High gives it the unelevated token, one below
-    /// High its own; a test that needs the agent's own token at High passes [`ElevationPolicy::Always`].
+    /// and by `make_handshake`. Its launch is [`Launch::Direct`]: the base for a raw spawn. It asks for
+    /// [`ElevationPolicy::DEFAULT`] by name: an agent at High gives it the unelevated token or refuses, one
+    /// below High its own; a test that needs the agent's own token at High passes [`ElevationPolicy::Always`].
     pub fn pty_default() -> Self {
         Self {
             version: PROTOCOL_VERSION,
@@ -247,7 +252,7 @@ impl Handshake {
             command: None,
             env: Vec::new(),
             launch: Launch::Direct,
-            elevation: ElevationPolicy::Prompt,
+            elevation: Some(ElevationPolicy::DEFAULT),
         }
     }
 }

@@ -67,7 +67,7 @@ fn handshake_roundtrips() {
         command: None,
         env: vec![("LANG".into(), "C".into())],
         launch: Launch::Shell,
-        elevation: ElevationPolicy::AutoApprove,
+        elevation: Some(ElevationPolicy::AutoApprove),
     };
     let bytes = h.encode().unwrap();
     assert_eq!(Handshake::decode(&bytes).unwrap(), h);
@@ -299,10 +299,12 @@ fn a_version_1_handshake_is_refused_with_the_version_message() {
     );
 }
 
+/// The last field changed its meaning when a login that set nothing was told apart from one that set
+/// `prompt`: a peer that says 3 reads the byte as the old four-word value.
 #[test]
-fn the_wire_version_is_3() {
-    assert_eq!(PROTOCOL_VERSION, 3);
-    assert_eq!(Handshake::pty_default().version, 3);
+fn the_wire_version_is_4() {
+    assert_eq!(PROTOCOL_VERSION, 4);
+    assert_eq!(Handshake::pty_default().version, 4);
 }
 
 const POLICIES: [ElevationPolicy; 4] = [
@@ -314,7 +316,7 @@ const POLICIES: [ElevationPolicy; 4] = [
 
 #[test]
 fn handshake_round_trips_each_policy() {
-    for elevation in POLICIES {
+    for elevation in POLICIES.map(Some).into_iter().chain([None]) {
         let h = Handshake {
             elevation,
             command: Some("x".into()),
@@ -322,23 +324,33 @@ fn handshake_round_trips_each_policy() {
         };
         assert_eq!(Handshake::decode(&h.encode().unwrap()).unwrap().elevation, elevation);
     }
-    assert_eq!(Handshake::pty_default().elevation, ElevationPolicy::Prompt);
+    assert_eq!(Handshake::pty_default().elevation, Some(ElevationPolicy::DEFAULT));
 }
 
-/// The field is the last on the wire: a handshake of version 3 ends with the variant index.
+/// The field is the last on the wire: it ends with whether the login asked (`1`) or set nothing (`0`),
+/// and the variant index of what it asked.
 #[test]
 fn the_policy_is_the_last_field() {
     let always = Handshake {
-        elevation: ElevationPolicy::Always,
+        elevation: Some(ElevationPolicy::Always),
         ..Handshake::pty_default()
     };
-    assert_eq!(always.encode().unwrap().last(), Some(&3));
-    assert_eq!(Handshake::pty_default().encode().unwrap().last(), Some(&1));
+    assert_eq!(always.encode().unwrap().last_chunk(), Some(&[1, 3]));
+    assert_eq!(
+        Handshake::pty_default().encode().unwrap().last_chunk(),
+        Some(&[1, ElevationPolicy::DEFAULT as u8])
+    );
+    let nothing = Handshake {
+        elevation: None,
+        ..Handshake::pty_default()
+    };
+    assert_eq!(nothing.encode().unwrap().last(), Some(&0));
 }
 
+/// The default is the one level a login that asked for none is given where a level is needed.
 #[test]
-fn elevation_policy_absent_is_prompt() {
-    assert_eq!(ElevationPolicy::parse(None), Ok(ElevationPolicy::Prompt));
+fn the_default_is_prompt() {
+    assert_eq!(ElevationPolicy::DEFAULT, ElevationPolicy::Prompt);
 }
 
 #[test]
@@ -349,11 +361,7 @@ fn elevation_policy_parses_the_four_words_exactly() {
         ("auto-approve", ElevationPolicy::AutoApprove),
         ("always", ElevationPolicy::Always),
     ] {
-        assert_eq!(
-            ElevationPolicy::parse(Some(std::ffi::OsStr::new(word))),
-            Ok(policy),
-            "{word}"
-        );
+        assert_eq!(ElevationPolicy::parse(std::ffi::OsStr::new(word)), Ok(policy), "{word}");
     }
     assert_eq!(ElevationPolicy::VARIABLE, "SSH_BROKER_ELEVATION");
 }
@@ -369,7 +377,7 @@ fn elevation_policy_rejects_other_case_padding_empty_and_unknown_naming_the_valu
         "auto_approve",
         "ALWAYS\n",
     ] {
-        let error = ElevationPolicy::parse(Some(std::ffi::OsStr::new(value))).unwrap_err();
+        let error = ElevationPolicy::parse(std::ffi::OsStr::new(value)).unwrap_err();
         assert_eq!(error.value, value);
         assert!(error.to_string().contains(&format!("{value:?}")), "{error}");
     }
@@ -381,7 +389,7 @@ fn elevation_policy_rejects_other_case_padding_empty_and_unknown_naming_the_valu
 fn elevation_policy_rejects_a_value_that_is_not_unicode() {
     use std::os::windows::ffi::OsStringExt;
     let value = std::ffi::OsString::from_wide(&[0x61, 0xd800, 0x62]);
-    let error = ElevationPolicy::parse(Some(&value)).unwrap_err();
+    let error = ElevationPolicy::parse(&value).unwrap_err();
     assert_eq!(error.value, "a\u{fffd}b");
 }
 
@@ -390,7 +398,7 @@ fn elevation_policy_rejects_a_value_that_is_not_unicode() {
 fn elevation_policy_rejects_a_value_that_is_not_unicode() {
     use std::os::unix::ffi::OsStrExt;
     let value = std::ffi::OsStr::from_bytes(&[0x61, 0xff, 0x62]);
-    let error = ElevationPolicy::parse(Some(value)).unwrap_err();
+    let error = ElevationPolicy::parse(value).unwrap_err();
     assert_eq!(error.value, "a\u{fffd}b");
 }
 
@@ -441,5 +449,39 @@ fn a_version_2_handshake_is_refused_with_the_version_message() {
     })
     .unwrap();
     let error = Handshake::decode(&bytes).unwrap_err().to_string();
-    assert!(error.contains("peer 2") && error.contains("ours 3"), "{error}");
+    assert!(error.contains("peer 2") && error.contains("ours 4"), "{error}");
+}
+
+/// A shim or agent of version 3 is refused by name: its last field is one of four words, which this
+/// build would read as "asked" or "set nothing".
+#[test]
+fn a_version_3_handshake_is_refused_with_the_version_message() {
+    #[derive(serde::Serialize)]
+    struct V3 {
+        version: u16,
+        mode: Mode,
+        cols: u16,
+        rows: u16,
+        term: String,
+        cwd: String,
+        command: Option<String>,
+        env: Vec<(String, String)>,
+        launch: Launch,
+        elevation: ElevationPolicy,
+    }
+    let bytes = postcard::to_stdvec(&V3 {
+        version: 3,
+        mode: Mode::Exec,
+        cols: 80,
+        rows: 24,
+        term: "xterm".into(),
+        cwd: String::new(),
+        command: Some("whoami".into()),
+        env: Vec::new(),
+        launch: Launch::Shell,
+        elevation: ElevationPolicy::Never,
+    })
+    .unwrap();
+    let error = Handshake::decode(&bytes).unwrap_err().to_string();
+    assert!(error.contains("peer 3") && error.contains("ours 4"), "{error}");
 }

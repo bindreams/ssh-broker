@@ -176,7 +176,7 @@ impl AgentConn {
             mode,
             command: command.map(str::to_string),
             launch,
-            elevation,
+            elevation: Some(elevation),
             ..Handshake::pty_default()
         };
         write_frame(&mut self.tx, FrameKind::Handshake, &hs.encode().unwrap()).unwrap();
@@ -184,18 +184,18 @@ impl AgentConn {
 
     /// Start an interactive session running `command`, with the default policy (an unelevated session).
     pub fn start_pty(&mut self, command: &str) {
-        self.handshake(Mode::Pty, Some(command), Launch::Direct, ElevationPolicy::Prompt);
+        self.handshake(Mode::Pty, Some(command), Launch::Direct, ElevationPolicy::DEFAULT);
     }
 
     /// Start a session with a terminal the way the shim asks for one: through the account's configured
     /// shell, running `command` or, with `None`, a login.
     pub fn start_shell_pty(&mut self, command: Option<&str>) {
-        self.handshake(Mode::Pty, command, Launch::Shell, ElevationPolicy::Prompt);
+        self.handshake(Mode::Pty, command, Launch::Shell, ElevationPolicy::DEFAULT);
     }
 
     /// Start a session that runs `command` on redirected pipes, with the default policy.
     pub fn start_exec(&mut self, command: &str) {
-        self.start_exec_as(command, ElevationPolicy::Prompt);
+        self.start_exec_as(command, ElevationPolicy::DEFAULT);
     }
 
     /// [`AgentConn::start_exec`] asking for `elevation`: `Always` is the agent's own token, which an agent

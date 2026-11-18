@@ -1,6 +1,7 @@
 //! Unit tests for `offer` (pure; runs on the host). The fake records every call.
 use super::*;
 use crate::password_entry::{Password, PasswordEntry, Step};
+use crate::protocol::ElevationPolicy;
 use crate::vtinput::KeyEvent;
 use std::collections::VecDeque;
 
@@ -396,18 +397,74 @@ fn always_below_high_is_the_line_the_agents_reply_shares() {
     assert!(!text::always_below_high().contains("administrator"));
 }
 
-/// The sentence for a session whose token cannot be made names the one way to run it as it is.
+/// The sentence for a session whose token cannot be made, for a login that asked for a level, names both ways
+/// out: set nothing, or ask for `always`.
 #[test]
-fn an_unavailable_unelevated_session_names_always_and_the_cause() {
+fn an_unavailable_unelevated_session_names_both_ways_out_and_the_cause() {
+    for asked in [
+        ElevationPolicy::Never,
+        ElevationPolicy::Prompt,
+        ElevationPolicy::AutoApprove,
+    ] {
+        assert_eq!(
+            text::unelevated_unavailable(Some(asked), "the token cannot be made"),
+            "ssh-broker: could not prepare an unelevated session, so nothing was run (a login that leaves \
+             SSH_BROKER_ELEVATION unset gets the token it was given, with a notice, and one that sets it to always \
+             gets the session as it is): the token cannot be made",
+            "{asked:?}"
+        );
+        assert_eq!(
+            text::unelevated_unavailable(Some(asked), "c"),
+            format!("ssh-broker: {}: c", text::UNELEVATED_UNAVAILABLE_WHAT)
+        );
+    }
+}
+
+/// A login that asked for `always` is never told to ask for `always`: what cannot be read is whether it
+/// can be given.
+#[test]
+fn an_unreadable_level_for_always_says_so_and_never_tells_it_to_ask_for_always() {
+    let sentence = text::unelevated_unavailable(Some(ElevationPolicy::Always), "the level cannot be read");
     assert_eq!(
-        text::unelevated_unavailable("the token cannot be made"),
-        "ssh-broker: could not prepare an unelevated session, so nothing was run (a login with \
-         SSH_BROKER_ELEVATION=always starts the session as it is): the token cannot be made"
+        sentence,
+        "ssh-broker: this login asked for SSH_BROKER_ELEVATION=always, and it cannot be told whether an elevated \
+         session can be given, so nothing was run: the level cannot be read"
     );
     assert_eq!(
-        text::unelevated_unavailable("c"),
-        format!("ssh-broker: {}: c", text::UNELEVATED_UNAVAILABLE_WHAT)
+        text::always_level_unreadable("the level cannot be read"),
+        format!("{sentence}\r\n")
     );
+    assert!(!sentence.contains("set it to always"), "{sentence}");
+}
+
+/// A login whose own token is an administrator's with elevation removed cannot be given an elevated session,
+/// whatever level its shim has.
+#[test]
+fn always_for_a_filtered_login_says_why_it_cannot_be_given() {
+    assert_eq!(
+        text::always_filtered(),
+        "ssh-broker: this login asked for SSH_BROKER_ELEVATION=always, and its own token is an administrator's with \
+         elevation removed, so it cannot be given an elevated session. Nothing was run.\r\n"
+    );
+}
+
+/// A login that set nothing and could not be stepped down is told what it has, and why, in one sentence for the
+/// shim and the agent, which differ in whose token it is.
+#[test]
+fn the_fallback_notice_says_whose_token_the_session_has_and_that_a_login_that_sets_the_variable_is_refused() {
+    assert_eq!(
+        text::unelevated_fallback("the token cannot be made", text::FallbackToken::Sshd),
+        "ssh-broker: could not prepare an unelevated session (the token cannot be made), so this session has the \
+         token sshd gave this login, which for an administrator is elevated. A login that sets \
+         SSH_BROKER_ELEVATION is refused instead."
+    );
+    assert_eq!(
+        text::unelevated_fallback("the token cannot be made", text::FallbackToken::Agent),
+        "ssh-broker: could not prepare an unelevated session (the token cannot be made), so this session has the \
+         agent's own token, which for an administrator is elevated. A login that sets SSH_BROKER_ELEVATION is \
+         refused instead."
+    );
+    assert!(!text::unelevated_fallback("c", text::FallbackToken::Sshd).contains('\n'));
 }
 
 /// An ordinary SSH login is unelevated now, so the sentences about the filtered login and the agent that

@@ -224,7 +224,9 @@ fn on_refuses_a_non_elevated_shell_with_the_way_to_an_elevated_one() {
         "{text}"
     );
     assert!(
-        text.contains("from an elevated prompt at the PC, or from an SSH login of an administrator"),
+        text.contains(
+            "from an elevated prompt at the PC, or from an SSH login that asked for SSH_BROKER_ELEVATION=always"
+        ),
         "{text}"
     );
     assert!(

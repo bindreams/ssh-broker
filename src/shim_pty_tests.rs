@@ -3,7 +3,7 @@
 
 use super::{LocalChild, start_local, start_with_std_handles};
 use crate::acl::Sid;
-use crate::cmdline::Exec;
+use crate::cmdline::{Exec, Login};
 use crate::protocol::ElevationPolicy;
 use crate::shim_offer::NoRescue;
 
@@ -21,6 +21,16 @@ fn exec_with_terminal(command: &str) -> Exec {
         command: command.into(),
         terminal: true,
     }
+}
+
+/// A login that runs `exec` and asked for `elevation` (`None`: it set nothing).
+fn login(exec: Option<Exec>, elevation: Option<ElevationPolicy>) -> Login {
+    Login { exec, elevation }
+}
+
+/// Every answer a login can give: each of the four policies, and none.
+fn asked_policies() -> impl Iterator<Item = Option<ElevationPolicy>> {
+    POLICIES.map(Some).into_iter().chain([None])
 }
 
 /// The local passthrough must contain its child in a job object, exactly as the relayed path
@@ -183,8 +193,7 @@ fn unresolvable_socket_location_fails_open_with_the_reason() {
     let mut stderr = Vec::new();
     let relayed = super::try_relay_at(
         &folder_of(Err(too_long())),
-        Some(&exec("echo hi")),
-        ElevationPolicy::Prompt,
+        &login(Some(exec("echo hi")), None),
         &mut stderr,
         None,
         std::io::empty(),
@@ -209,8 +218,7 @@ fn location_error_reaches_stderr_in_pty_mode() {
     let mut stderr = Vec::new();
     let relayed = super::try_relay_at(
         &folder_of(Err(too_long())),
-        None,
-        ElevationPolicy::Prompt,
+        &login(None, None),
         &mut stderr,
         None,
         std::io::empty(),
@@ -240,8 +248,7 @@ fn connect_failure_in_the_callers_own_dir_fails_open_without_a_reason_on_stderr(
     let mut stderr = Vec::new();
     let relayed = super::try_relay_at(
         &folder_of(Ok(location)),
-        Some(&exec("echo hi")),
-        ElevationPolicy::Prompt,
+        &login(Some(exec("echo hi")), None),
         &mut stderr,
         None,
         std::io::empty(),
@@ -267,8 +274,7 @@ fn connect_failure_in_pty_mode_writes_nothing_to_stderr() {
     let mut stderr = Vec::new();
     let relayed = super::try_relay_at(
         &folder_of(Ok(location)),
-        None,
-        ElevationPolicy::Prompt,
+        &login(None, None),
         &mut stderr,
         None,
         std::io::empty(),
@@ -319,8 +325,7 @@ fn try_relay_connects_to_the_location_its_provider_names() {
     let agent = fake_agent_exiting_with(listener, 7);
 
     let relayed = super::try_relay(
-        Some(&exec("echo hi")),
-        ElevationPolicy::Prompt,
+        &login(Some(exec("echo hi")), None),
         &folder_of(Ok(location)),
         None,
         std::io::empty(),
@@ -347,8 +352,7 @@ fn a_failed_log_is_named_where_the_shim_already_explains_a_fallback_for_a_comman
     let cause = "the folder belongs to someone else";
     let relayed = super::try_relay_at(
         &folder_of(Ok(location)),
-        Some(&exec("echo hi")),
-        ElevationPolicy::Prompt,
+        &login(Some(exec("echo hi")), None),
         &mut stderr,
         Some(cause),
         std::io::empty(),
@@ -373,8 +377,7 @@ fn a_failed_log_adds_nothing_to_an_interactive_fallback_that_prints_nothing_toda
     let mut stderr = Vec::new();
     let relayed = super::try_relay_at(
         &folder_of(Ok(location)),
-        None,
-        ElevationPolicy::Prompt,
+        &login(None, None),
         &mut stderr,
         Some("no log"),
         std::io::empty(),
@@ -402,8 +405,7 @@ fn a_failed_log_does_not_touch_the_stderr_of_a_relayed_command() {
 
     let relayed = super::try_relay_at(
         &folder_of(Ok(location)),
-        Some(&exec("echo hi")),
-        ElevationPolicy::Prompt,
+        &login(Some(exec("echo hi")), None),
         &mut stderr,
         Some("no log"),
         std::io::empty(),
@@ -464,8 +466,7 @@ fn a_rescue_is_asked_when_the_connect_fails_and_its_line_comes_before_the_fallba
     let mut stderr = Vec::new();
     let relayed = super::try_relay_at(
         &folder_of(Ok(location)),
-        Some(&exec("echo hi")),
-        ElevationPolicy::Prompt,
+        &login(Some(exec("echo hi")), None),
         &mut stderr,
         None,
         std::io::empty(),
@@ -487,8 +488,7 @@ fn a_rescue_is_shown_a_location_error_and_the_fallback_message_stays() {
     let mut stderr = Vec::new();
     let relayed = super::try_relay_at(
         &folder_of(Err(crate::userdir::NoProfile.into())),
-        None,
-        ElevationPolicy::Prompt,
+        &login(None, None),
         &mut stderr,
         None,
         std::io::empty(),
@@ -522,8 +522,7 @@ fn a_rescue_is_not_asked_when_the_connect_succeeds() {
 
     let relayed = super::try_relay_at(
         &folder_of(Ok(location)),
-        Some(&exec("echo hi")),
-        ElevationPolicy::Prompt,
+        &login(Some(exec("echo hi")), None),
         &mut Vec::new(),
         None,
         std::io::empty(),
@@ -552,8 +551,7 @@ fn a_rescue_that_connects_gets_the_session_relayed_through_its_connection() {
 
     let relayed = super::try_relay_at(
         &folder_of(Ok(nowhere)),
-        Some(&exec("echo hi")),
-        ElevationPolicy::Prompt,
+        &login(Some(exec("echo hi")), None),
         &mut Vec::new(),
         None,
         std::io::empty(),
@@ -572,8 +570,7 @@ fn a_rescue_that_finds_the_input_gone_ends_the_shim_with_255_and_runs_nothing() 
     let mut stderr = Vec::new();
     let relayed = super::try_relay_at(
         &folder_of(Ok(location)),
-        None,
-        ElevationPolicy::Prompt,
+        &login(None, None),
         &mut stderr,
         None,
         std::io::empty(),
@@ -637,8 +634,7 @@ fn a_command_whose_connection_ends_before_the_agent_answers_says_it_may_have_run
 
         let relayed = super::try_relay_at(
             &folder_of(Ok(location)),
-            Some(&exec("echo hi")),
-            ElevationPolicy::Prompt,
+            &login(Some(exec("echo hi")), None),
             &mut stderr,
             None,
             std::io::empty(),
@@ -692,8 +688,7 @@ fn a_command_is_never_sent_to_an_agent_a_second_time() {
 
     let relayed = super::try_relay_at(
         &folder_of(Ok(location)),
-        Some(&exec("echo hi")),
-        ElevationPolicy::Prompt,
+        &login(Some(exec("echo hi")), None),
         &mut Vec::new(),
         None,
         std::io::empty(),
@@ -721,13 +716,12 @@ fn an_interactive_session_whose_connection_ends_before_the_agent_answers_takes_t
 
     let relayed = super::try_relay_with(
         &folder_of(Ok(location)),
-        None,
-        ElevationPolicy::Prompt,
+        &login(None, None),
         &mut stderr,
         None,
         std::io::empty(),
         &mut rescue,
-        &mut |_conn, _modes, _exec, _elevation| {
+        &mut |_conn, _modes, _login| {
             attempts += 1;
             // The pump ends when the agent closes the connection, which it does after its listener.
             agent.take().expect("one attempt").join().unwrap();
@@ -761,13 +755,12 @@ fn an_interactive_session_goes_round_again_to_an_agent_that_answers_the_second_t
 
     let relayed = super::try_relay_with(
         &folder_of(Ok(location)),
-        None,
-        ElevationPolicy::Prompt,
+        &login(None, None),
         &mut Vec::new(),
         None,
         std::io::empty(),
         &mut Never,
-        &mut |_conn, _modes, _exec, _elevation| {
+        &mut |_conn, _modes, _login| {
             attempts += 1;
             Ok(Interactive::Pumped(if attempts == 1 {
                 Pumped::closed(anyhow::Error::new(std::io::Error::from(
@@ -824,13 +817,12 @@ fn a_second_connection_that_ends_without_a_byte_is_a_protocol_violation_not_a_re
 
     let relayed = super::try_relay_with(
         &folder_of(Ok(location)),
-        None,
-        ElevationPolicy::Prompt,
+        &login(None, None),
         &mut stderr,
         None,
         std::io::empty(),
         &mut Never,
-        &mut |_conn, _modes, _exec, _elevation| {
+        &mut |_conn, _modes, _login| {
             attempts += 1;
             // Not a loop limit of the shim: the test fails instead of hanging if the shim never stops.
             assert!(
@@ -877,13 +869,12 @@ fn a_folder_that_was_missing_at_the_first_act_is_connected_through_when_it_appea
 
     let relayed = super::try_relay_with(
         &folder,
-        None,
-        ElevationPolicy::Prompt,
+        &login(None, None),
         &mut stderr,
         None,
         std::io::empty(),
         &mut Never,
-        &mut |_conn, _modes, _exec, _elevation| {
+        &mut |_conn, _modes, _login| {
             attempts += 1;
             assert!(
                 attempts <= 2,
@@ -930,13 +921,12 @@ fn a_no_byte_close_before_and_after_a_connect_that_failed_are_not_consecutive() 
 
     let relayed = super::try_relay_with(
         &folder_of(Ok(location)),
-        None,
-        ElevationPolicy::Prompt,
+        &login(None, None),
         &mut Vec::new(),
         None,
         std::io::empty(),
         &mut rescue,
-        &mut |_conn, _modes, _exec, _elevation| {
+        &mut |_conn, _modes, _login| {
             attempts += 1;
             // The pump of the first connection ends when the agent closes it, after its listener.
             if let Some(first) = first.take() {
@@ -966,14 +956,13 @@ fn a_command_with_a_console_relays_as_a_pty_session_with_the_command() {
 
     let relayed = super::try_relay_with(
         &folder_of(Ok(location)),
-        Some(&exec_with_terminal("echo  hi")),
-        ElevationPolicy::Prompt,
+        &login(Some(exec_with_terminal("echo  hi")), None),
         &mut Vec::new(),
         None,
         std::io::empty(),
         &mut Never,
-        &mut |_conn, _modes, exec, _elevation| {
-            asked.push(exec.map(|exec| exec.command.clone()));
+        &mut |_conn, _modes, login| {
+            asked.push(login.exec.as_ref().map(|exec| exec.command.clone()));
             Ok(Interactive::Pumped(Pumped {
                 outcome: Ok(Outcome::Exited(3)),
                 heard: true,
@@ -997,13 +986,12 @@ fn a_command_without_a_terminal_does_not_take_the_console_relay() {
 
     let relayed = super::try_relay_with(
         &folder_of(Ok(location)),
-        Some(&exec("echo hi")),
-        ElevationPolicy::Prompt,
+        &login(Some(exec("echo hi")), None),
         &mut Vec::new(),
         None,
         std::io::empty(),
         &mut Never,
-        &mut |_conn, _modes, _exec, _elevation| panic!("a command without a terminal used the console relay"),
+        &mut |_conn, _modes, _login| panic!("a command without a terminal used the console relay"),
     )
     .unwrap();
 
@@ -1013,18 +1001,17 @@ fn a_command_without_a_terminal_does_not_take_the_console_relay() {
 
 #[test]
 fn a_command_asks_the_agent_for_the_policy_of_its_login() {
-    for (n, elevation) in POLICIES.into_iter().enumerate() {
+    for (n, elevation) in asked_policies().enumerate() {
         let (_profile, location, listener) = location_with_listener(&format!("pol-exec-{n}"));
         let agent = fake_agent_exiting_with(listener, 0);
         let relayed = super::try_relay_with(
             &folder_of(Ok(location)),
-            Some(&exec("whoami")),
-            elevation,
+            &login(Some(exec("whoami")), elevation),
             &mut Vec::new(),
             None,
             std::io::empty(),
             &mut Never,
-            &mut |_conn, _modes, _exec, _elevation| panic!("a command without a terminal used the console relay"),
+            &mut |_conn, _modes, _login| panic!("a command without a terminal used the console relay"),
         )
         .unwrap();
         assert_eq!(relayed, Some(0), "{elevation:?}");
@@ -1039,20 +1026,19 @@ fn a_login_with_a_console_reaches_the_console_relay_with_its_policy() {
     use super::Interactive;
     use crate::relay::Outcome;
     use crate::shim::Pumped;
-    for (n, elevation) in POLICIES.into_iter().enumerate() {
+    for (n, elevation) in asked_policies().enumerate() {
         for (tag, exec) in [("login", None), ("term", Some(exec_with_terminal("whoami")))] {
             let (_profile, location, _listener) = location_with_listener(&format!("pol-{tag}-{n}"));
             let mut asked = Vec::new();
             let relayed = super::try_relay_with(
                 &folder_of(Ok(location)),
-                exec.as_ref(),
-                elevation,
+                &login(exec, elevation),
                 &mut Vec::new(),
                 None,
                 std::io::empty(),
                 &mut Never,
-                &mut |_conn, _modes, _exec, elevation| {
-                    asked.push(elevation);
+                &mut |_conn, _modes, login| {
+                    asked.push(login.elevation);
                     Ok(Interactive::Pumped(Pumped {
                         outcome: Ok(Outcome::Exited(3)),
                         heard: true,
@@ -1084,13 +1070,12 @@ fn an_unanswered_terminal_command_is_not_sent_again() {
 
     let relayed = super::try_relay_with(
         &folder_of(Ok(location)),
-        Some(&exec_with_terminal("echo hi")),
-        ElevationPolicy::Prompt,
+        &login(Some(exec_with_terminal("echo hi")), None),
         &mut stderr,
         None,
         std::io::empty(),
         &mut Never,
-        &mut |_conn, _modes, _exec, _elevation| {
+        &mut |_conn, _modes, _login| {
             attempts += 1;
             assert!(attempts <= 1, "the command was sent again");
             Ok(hung_up())
@@ -1221,8 +1206,7 @@ fn a_shim_with_a_terminal_whose_folder_is_refused_does_not_connect_and_prints_th
 
     let relayed = super::try_relay_at(
         &folder,
-        None,
-        ElevationPolicy::Prompt,
+        &login(None, None),
         &mut stderr,
         None,
         std::io::empty(),
@@ -1251,8 +1235,7 @@ fn a_shim_with_a_command_whose_folder_is_refused_does_not_connect_and_says_why_o
 
     let relayed = super::try_relay_at(
         &folder,
-        Some(&exec("echo hi")),
-        ElevationPolicy::Prompt,
+        &login(Some(exec("echo hi")), None),
         &mut stderr,
         Some(&log_failure),
         std::io::empty(),
@@ -1285,8 +1268,7 @@ fn a_shim_with_a_command_whose_folder_is_refused_on_a_later_look_names_that_refu
 
     let relayed = super::try_relay_at(
         &folder,
-        Some(&exec("echo hi")),
-        ElevationPolicy::Prompt,
+        &login(Some(exec("echo hi")), None),
         &mut stderr,
         Some(&log_failure),
         std::io::empty(),
@@ -1313,8 +1295,7 @@ fn a_shim_whose_folder_is_held_open_by_another_program_says_so_and_does_not_conn
 
     let relayed = super::try_relay_at(
         &folder,
-        None,
-        ElevationPolicy::Prompt,
+        &login(None, None),
         &mut stderr,
         None,
         std::io::empty(),

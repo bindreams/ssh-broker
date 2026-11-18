@@ -9,10 +9,11 @@ use crate::shell::test_host::{TestHost, USER_CONFIG};
 use crate::socket_loc::StepDown;
 use crate::winutil::UnelevatedToken;
 
-/// What a client saw: how the session ended and what the agent wrote to its stderr.
+/// What a client saw: how the session ended and what the agent wrote to its stderr and to its terminal.
 struct Answer {
     outcome: Outcome,
     stderr: String,
+    stdout: String,
 }
 
 /// Connect a client that runs `send`, let the agent handle the server side with `hooks`, and return
@@ -32,6 +33,7 @@ fn answered(tag: &str, hooks: Hooks, send: impl FnOnce(&mut ConnTx) + Send + 'st
         Answer {
             outcome,
             stderr: String::from_utf8(sink.stderr).unwrap(),
+            stdout: String::from_utf8(sink.stdout).unwrap(),
         },
         result,
     )
@@ -361,6 +363,15 @@ fn request_for(
     command: Option<&str>,
     elevation: ElevationPolicy,
 ) -> impl FnOnce(&mut ConnTx) + Send + 'static {
+    request_asking(mode, command, Some(elevation))
+}
+
+/// A `Launch::Shell` request in `mode` from a login that asked for `elevation` (`None`: it set nothing).
+fn request_asking(
+    mode: Mode,
+    command: Option<&str>,
+    elevation: Option<ElevationPolicy>,
+) -> impl FnOnce(&mut ConnTx) + Send + 'static {
     let hs = Handshake {
         mode,
         command: command.map(str::to_owned),
@@ -382,8 +393,9 @@ const REQUESTS: [(&str, Mode, Option<&str>); 3] = [
     ("pty-command", Mode::Pty, Some("whoami")),
 ];
 
+/// A login that asked for a level the agent cannot prepare is refused, and the refusal names both ways out.
 #[test]
-fn agent_refuses_when_the_token_cannot_be_made_and_names_always() {
+fn agent_refuses_a_login_that_asked_when_the_token_cannot_be_made_and_names_both_ways_out() {
     for (tag, mode, command) in REQUESTS {
         let hooks = Hooks {
             make_unelevated: |_| Err(anyhow::anyhow!("the token cannot be made")),
@@ -401,13 +413,42 @@ fn agent_refuses_when_the_token_cannot_be_made_and_names_always() {
             answer.stderr,
             format!(
                 "{}\r\n",
-                crate::offer::text::unelevated_unavailable("the token cannot be made")
+                crate::offer::text::unelevated_unavailable(Some(ElevationPolicy::Prompt), "the token cannot be made")
             ),
             "{tag}"
         );
-        assert!(answer.stderr.contains("SSH_BROKER_ELEVATION=always"), "{tag}");
+        assert!(
+            answer.stderr.contains("leaves SSH_BROKER_ELEVATION unset") && answer.stderr.contains("sets it to always"),
+            "{tag}"
+        );
         assert!(result.is_err(), "{tag}");
     }
+}
+
+/// A login that asked for `always` whose level the agent cannot read is told that, and never to ask for `always`.
+#[test]
+fn agent_refuses_always_with_an_unreadable_level_and_does_not_tell_it_to_ask_for_always() {
+    let hooks = Hooks {
+        make_unelevated: |_| Err(anyhow::anyhow!("the level cannot be read")),
+        start_exec: |_, _, _| panic!("a command was started for a refused login"),
+        start_pty: |_, _, _, _, _, _| panic!("a shell was started for a refused login"),
+        ..Hooks::production()
+    };
+    let (answer, result) = answered(
+        "unreadable-always",
+        hooks,
+        request_for(Mode::Exec, Some("whoami"), ElevationPolicy::Always),
+    );
+    assert_eq!(answer.outcome, Outcome::Exited(255));
+    assert_eq!(
+        answer.stderr,
+        format!(
+            "{}\r\n",
+            crate::offer::text::unelevated_unavailable(Some(ElevationPolicy::Always), "the level cannot be read")
+        )
+    );
+    assert!(!answer.stderr.contains("sets it to always"), "{}", answer.stderr);
+    assert!(result.is_err());
 }
 
 /// An agent below High cannot give `always`: it answers with the one sentence, exit 255, and starts nothing.
@@ -443,7 +484,7 @@ fn agent_refuses_always_below_high_with_the_sentence_and_starts_nothing() {
 }
 
 /// The policies the maker of `an_account_login_makes_no_token` was called with.
-static MADE_FOR: std::sync::Mutex<Vec<ElevationPolicy>> = std::sync::Mutex::new(Vec::new());
+static MADE_FOR: std::sync::Mutex<Vec<Option<ElevationPolicy>>> = std::sync::Mutex::new(Vec::new());
 
 /// The agent hands the login's policy to the maker, once, and starts with no token when it answers `Own`.
 #[test]
@@ -462,7 +503,7 @@ fn the_agent_asks_for_the_token_once_with_the_policy_of_the_login() {
     );
     assert_eq!(
         *MADE_FOR.lock().unwrap(),
-        [ElevationPolicy::AutoApprove],
+        [Some(ElevationPolicy::AutoApprove)],
         "the maker was called once, with the login's policy"
     );
     assert!(
@@ -568,5 +609,94 @@ fn agent_gives_always_its_own_token_at_high() {
             ("pty", true, false),
             ("pty", false, false),
         ]
+    );
+}
+
+// A login that set nothing and cannot be stepped down -----
+
+/// The agent at High whose unelevated token cannot be made: the one rule, with a maker that fails.
+fn at_high_without_a_token(tag: &str, host: TestHost, mode: Mode, command: Option<&str>) -> Answer {
+    let recording = Hooks {
+        shell_host: Box::new(host),
+        make_unelevated: |asked| {
+            crate::account::step_down(
+                asked,
+                || Ok(crate::socket_loc::Integrity::High),
+                || -> anyhow::Result<UnelevatedToken> { Err(anyhow::anyhow!("the token cannot be made")) },
+            )
+        },
+        start_exec: |_, _, token| {
+            STARTS.lock().unwrap().push(("exec", false, token.is_some()));
+            Err(StartError::Program(anyhow::anyhow!("recorded")))
+        },
+        start_pty: |_, _, _, _, read, token| {
+            STARTS.lock().unwrap().push(("pty", read.is_some(), token.is_some()));
+            Err(StartError::Program(anyhow::anyhow!("recorded")))
+        },
+        ..Hooks::production()
+    };
+    answered(tag, recording, request_asking(mode, command, None)).0
+}
+
+/// The notice of a login that set nothing, as the agent says it.
+fn the_fallback_notice() -> String {
+    crate::offer::text::unelevated_fallback("the token cannot be made", crate::offer::text::FallbackToken::Agent)
+}
+
+/// A login that set nothing is not refused when its session cannot be stepped down: it is served with the
+/// agent's own token, and the notice is the first thing it sees, on stderr.
+#[test]
+fn agent_serves_a_command_that_set_nothing_with_its_own_token_and_the_notice_first() {
+    let _serial = STARTS_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    taken_starts();
+    let answer = at_high_without_a_token("fallback-exec", TestHost::new(), Mode::Exec, Some("whoami"));
+    assert_eq!(taken_starts(), [("exec", false, false)], "started once, with no token");
+    assert!(
+        answer.stderr.starts_with(&format!("{}\n", the_fallback_notice())),
+        "{}",
+        answer.stderr
+    );
+    assert_eq!(
+        answer.stderr.matches("could not prepare an unelevated session").count(),
+        1
+    );
+}
+
+/// The same for a terminal: the notice is printed from inside the pseudoconsole by the `console-fallback` verb,
+/// which clears nothing after it, and when the verb cannot start it is the first data on the terminal.
+#[test]
+fn agent_serves_a_terminal_that_set_nothing_with_its_own_token_and_the_notice_first() {
+    let _serial = STARTS_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    for (tag, command) in [("fallback-pty", None), ("fallback-pty-command", Some("whoami"))] {
+        taken_starts();
+        let answer = at_high_without_a_token(tag, TestHost::new(), Mode::Pty, command);
+        assert_eq!(
+            taken_starts(),
+            // The verb's start, then the line the agent falls back to when the verb cannot be started.
+            [("pty", true, false), ("pty", false, false)],
+            "{tag}"
+        );
+        assert!(
+            answer.stdout.starts_with(&format!("{}\r\n", the_fallback_notice())),
+            "{tag}: {}",
+            answer.stdout
+        );
+    }
+}
+
+/// The notice comes before the warning for a shell that cannot be used, once each.
+#[test]
+fn agent_says_the_fallback_notice_before_the_warning_for_a_broken_shell() {
+    let _serial = STARTS_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    taken_starts();
+    let host = TestHost::new().with_user_config("shell: {strt: x}\n");
+    let answer = at_high_without_a_token("fallback-broken", host, Mode::Exec, Some("whoami"));
+    taken_starts();
+    let notice = format!("{}\n", the_fallback_notice());
+    assert!(answer.stderr.starts_with(&notice), "{}", answer.stderr);
+    assert!(
+        answer.stderr[notice.len()..].starts_with(&format!("ssh-broker: cannot use the shell from {USER_CONFIG}")),
+        "{}",
+        answer.stderr
     );
 }

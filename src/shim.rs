@@ -1,7 +1,7 @@
 //! shim: the SSH `DefaultShell` (default action). Relays the terminal/streams to
 //! the agent over AF_UNIX; fails open to a local shell if the agent is unreachable.
 
-use crate::cmdline::{Exec, RawExec};
+use crate::cmdline::{Login, RawExec};
 use crate::offer::text;
 use crate::protocol::{ElevationPolicy, FrameKind, FrameReader, Handshake, Launch, Mode, Resize, Stream, write_frame};
 use crate::relay::{FrameSink, Outcome, PumpError, pump_decode, write_data};
@@ -383,12 +383,14 @@ pub fn decide_fallback(connect_err: bool) -> Fallback {
 /// the shell runs, a failure of `finish` is reported and nothing is run again.
 ///
 /// A login that did not ask for `always` would otherwise get sshd's own token, which an administrator's is
-/// elevated. `unelevate` is given the login's `elevation` and returns what the session's lines are started
-/// with: the stepped-down token, or this process's own ([`StepDown::Own`]: `always` at High, or a process
-/// below High, where what it starts is unelevated anyway). It is called once, first. A
+/// elevated. `unelevate` is given what the login asked of elevation and returns what the session's lines are
+/// started with: the stepped-down token, or this process's own ([`StepDown::Own`]: `always` at High, or a
+/// process below High, where what it starts is unelevated anyway). It is called once, first. A
 /// [`StepDown::Refused`] (`always` below High) prints [`text::always_below_high`] and exits 255 with nothing
-/// started. If it fails, the login gets a message that names `SSH_BROKER_ELEVATION=always` and 255 and no
-/// shell: an elevated shell is the one thing a session that asked for less must not get. A replacement line is
+/// started. If it fails, the login asked for a level and is refused with a message that names both ways out
+/// ([`text::unelevated_unavailable`]) and 255 and no shell: an elevated shell is the one thing a session that
+/// asked for less must not get. A login that set nothing is not refused: on [`StepDown::Fallback`] it gets the
+/// shell with the token sshd gave it, after the notice [`text::unelevated_fallback`]. A replacement line is
 /// started with the token too.
 ///
 /// The shell is resolved here, in the shim's own environment (`host`), by the one function the agent
@@ -398,14 +400,13 @@ pub fn decide_fallback(connect_err: bool) -> Fallback {
 /// command's own failures.
 pub fn fail_open<T, K>(
     host: &dyn shell::Host,
-    exec: Option<&Exec>,
-    elevation: ElevationPolicy,
+    login: &Login,
     stderr: &mut dyn Write,
-    unelevate: impl FnOnce(ElevationPolicy) -> anyhow::Result<StepDown<K>>,
+    unelevate: impl FnOnce(Option<ElevationPolicy>) -> anyhow::Result<StepDown<K>>,
     mut start: impl FnMut(&str, Option<&K>) -> Result<T, shell::StartError>,
     finish: impl FnOnce(T) -> anyhow::Result<i32>,
 ) -> i32 {
-    let session = match exec {
+    let session = match &login.exec {
         Some(exec) => Session::Command {
             text: &exec.command,
             terminal: exec.terminal,
@@ -417,9 +418,15 @@ pub fn fail_open<T, K>(
     let tell = |stderr: &mut dyn Write, text: &str| {
         let _ = writeln!(stderr, "{text}");
     };
-    let token = match unelevate(elevation) {
+    let token = match unelevate(login.elevation) {
         Ok(StepDown::Token(token)) => Some(token),
         Ok(StepDown::Own) => None,
+        Ok(StepDown::Fallback(cause)) => {
+            let cause = format!("{cause:#}");
+            tracing::warn!("fail-open could not prepare an unelevated session, so it keeps sshd's token: {cause}");
+            tell(stderr, &text::unelevated_fallback(&cause, text::FallbackToken::Sshd));
+            None
+        }
         Ok(StepDown::Refused) => {
             tracing::error!("fail-open refused a login that asked for SSH_BROKER_ELEVATION=always below High");
             // The sentence carries its own line break (it is the agent's reply too).
@@ -428,7 +435,10 @@ pub fn fail_open<T, K>(
         }
         Err(e) => {
             tracing::error!("fail-open could not prepare an unelevated session: {e:#}");
-            tell(stderr, &text::unelevated_unavailable(&format!("{e:#}")));
+            tell(
+                stderr,
+                &text::unelevated_unavailable(login.elevation, &format!("{e:#}")),
+            );
             return 255;
         }
     };
@@ -503,7 +513,7 @@ pub fn map_outcome(outcome: Result<Outcome, crate::relay::PumpError>) -> i32 {
 /// `$TERM` and `cols`/`rows` from the live console). A command without a terminal is an EXEC
 /// session; a command with one (`ssh -t host cmd`) is a PTY session that carries the command.
 /// `cwd` and `env` are empty: the agent supplies the session-1 working dir and profile env. `elevation` is
-/// what the login asked for ([`ElevationPolicy::VARIABLE`]).
+/// what the login asked for ([`ElevationPolicy::VARIABLE`]); `None`, that it set nothing.
 pub fn make_handshake(
     exec: &Option<String>,
     terminal: bool,
@@ -511,7 +521,7 @@ pub fn make_handshake(
     term: String,
     cols: u16,
     rows: u16,
-    elevation: ElevationPolicy,
+    elevation: Option<ElevationPolicy>,
 ) -> Handshake {
     Handshake {
         mode: if exec.is_some() && !terminal {

@@ -59,10 +59,10 @@ impl UnelevatedToken {
         Ok(UnelevatedToken(token))
     }
 
-    /// What a login with `policy` runs its session with in this process: the production maker of
-    /// [`crate::account::step_down`], for the agent and the shim alike.
-    pub fn for_policy(policy: ElevationPolicy) -> anyhow::Result<StepDown<UnelevatedToken>> {
-        step_down(policy, integrity, UnelevatedToken::of_this_process)
+    /// What a login that `asked` for a level (`None`: set nothing) runs its session with in this process: the
+    /// production maker of [`crate::account::step_down`], for the agent and the shim alike.
+    pub fn for_policy(asked: Option<ElevationPolicy>) -> anyhow::Result<StepDown<UnelevatedToken>> {
+        step_down(asked, integrity, UnelevatedToken::of_this_process)
     }
 
     /// The token, for `CreateProcessAsUserW`.

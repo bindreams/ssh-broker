@@ -122,7 +122,7 @@ pub fn probe_handshake(
         "xterm".into(),
         80,
         24,
-        elevation,
+        Some(elevation),
     )
 }
 

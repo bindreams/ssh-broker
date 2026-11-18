@@ -25,6 +25,7 @@ use crate::offer::{
     text,
 };
 use crate::password_entry::{Password, Step};
+use crate::protocol::ElevationPolicy;
 use crate::provision::procwait;
 use crate::socket_loc::{Integrity, SocketLocation};
 use crate::socket_watch::SocketWatch;
@@ -107,13 +108,51 @@ pub enum Stance {
     Relay { logon: LogonKind },
     /// The elevation or the level could not be read (`cause`): relay, and with no agent say so and offer nothing.
     RelayWithoutOffer { cause: String },
+    /// The login asked for `always` and cannot be given it: nothing connects and nothing is offered.
+    Refused(AlwaysRefusal),
 }
 
-/// Decide the [`Stance`] for a token with `elevation` at the folder level `integrity`. The logon kind
-/// follows `integrity`, as the folder does, so the agent the offer starts serves the folder the shim waits
-/// on (High: batch, which UAC does not split; below: interactive). A filtered token gets the plain shell
-/// at any level.
-pub fn stance(elevation: anyhow::Result<Elevation>, integrity: anyhow::Result<Integrity>) -> Stance {
+/// Why a login that asked for `always` is refused by its own shim, before anything connects.
+#[derive(Debug, PartialEq, Eq)]
+pub enum AlwaysRefusal {
+    /// The token is an administrator's with elevation removed: it can be given no elevated session, at any level.
+    Filtered,
+    /// The shim is below High, and so is the agent it would reach.
+    BelowHigh,
+    /// The level could not be read (`cause`), so whether an elevated session can be given is not known.
+    LevelUnreadable(String),
+}
+
+impl AlwaysRefusal {
+    /// What the shim prints for it: the sentence of [`text`] for the case, with its line break.
+    pub fn message(&self) -> String {
+        match self {
+            AlwaysRefusal::Filtered => text::always_filtered(),
+            AlwaysRefusal::BelowHigh => text::always_below_high(),
+            AlwaysRefusal::LevelUnreadable(cause) => text::always_level_unreadable(cause),
+        }
+    }
+}
+
+/// Decide the [`Stance`] of a login that `asked` for a level (`None`: it set nothing) with a token with
+/// `elevation` at the folder level `integrity`. The shim's own level is the level of the agent it would
+/// reach, so `always` is decided here and nowhere later: an elevated session cannot be had by a filtered token
+/// at any level, nor below High, nor when the level cannot be read. The logon kind follows `integrity`, as the
+/// folder does, so the agent the offer starts serves the folder the shim waits on (High: batch, which UAC does
+/// not split; below: interactive). A filtered token gets the plain shell at any level.
+pub fn stance(
+    asked: Option<ElevationPolicy>,
+    elevation: anyhow::Result<Elevation>,
+    integrity: anyhow::Result<Integrity>,
+) -> Stance {
+    if asked == Some(ElevationPolicy::Always) {
+        match (&elevation, &integrity) {
+            (Ok(Elevation::Filtered), _) => return Stance::Refused(AlwaysRefusal::Filtered),
+            (_, Err(cause)) => return Stance::Refused(AlwaysRefusal::LevelUnreadable(format!("{cause:#}"))),
+            (_, Ok(Integrity::Medium)) => return Stance::Refused(AlwaysRefusal::BelowHigh),
+            (_, Ok(Integrity::High)) => {}
+        }
+    }
     match (elevation, integrity) {
         (Ok(Elevation::Filtered), _) => Stance::PlainShell,
         (Err(e), _) | (Ok(_), Err(e)) => Stance::RelayWithoutOffer {

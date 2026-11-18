@@ -131,8 +131,9 @@ fn administrators_authorized_keys() -> PathBuf {
 /// Make the runner's sshd accept `SSH_BROKER_ELEVATION` from a client: put `AcceptEnv SSH_BROKER_ELEVATION` above
 /// the first `Match` of `%ProgramData%\ssh\sshd_config` (after one, a line applies to that block's accounts only)
 /// and restart the `sshd` service. Once per test process, and not at all when the line is there. Machine-wide:
-/// CI only, where the runner is discarded after the job. `apply` makes this arrangement itself in a later change,
-/// which replaces this function's body.
+/// CI only, where the runner is discarded after the job. A test that reaches it (every [`Login`] constructor
+/// does) changes what the other tests depend on, so it holds `machine::exclusive()`. `apply` makes this
+/// arrangement itself in a later change, which replaces this function's body.
 pub fn accept_elevation_variable() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {

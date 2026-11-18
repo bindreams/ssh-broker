@@ -100,7 +100,7 @@ fn probe_handshake_carries_the_policy_it_is_given() {
     ] {
         assert_eq!(
             probe_handshake(exe, elevation, &ProbeLink::NoJunction).elevation,
-            elevation
+            Some(elevation)
         );
     }
 }

@@ -293,7 +293,7 @@ fn fail_open_when_agent_unreachable() {
 
 // ── fail_open (the line it runs, and what it says first) ───────────────────────────
 
-use crate::cmdline::Exec;
+use crate::cmdline::{Exec, Login};
 use crate::shell::StartError;
 use crate::shell::test_host::{SYSTEM_CMD, TestHost, USER_CONFIG};
 use crate::socket_loc::StepDown;
@@ -306,6 +306,11 @@ fn pwsh_host() -> TestHost {
         .with_user_config("shell: pwsh.exe\n")
 }
 
+/// A login that runs `exec` and asked for `elevation` (`None`: it set nothing).
+fn login(exec: Option<Exec>, elevation: Option<ElevationPolicy>) -> Login {
+    Login { exec, elevation }
+}
+
 fn exec(command: &str, terminal: bool) -> Option<Exec> {
     Some(Exec {
         command: command.into(),
@@ -315,7 +320,7 @@ fn exec(command: &str, terminal: bool) -> Option<Exec> {
 
 /// The maker of the token of a process that has none to make: the session runs as the shim does. The type
 /// is a stand-in.
-fn no_token(_: ElevationPolicy) -> anyhow::Result<StepDown<()>> {
+fn no_token(_: Option<ElevationPolicy>) -> anyhow::Result<StepDown<()>> {
     Ok(StepDown::Own)
 }
 
@@ -325,8 +330,7 @@ fn failed_open(host: &TestHost, exec: &Option<Exec>, code: Result<i32, &str>) ->
     let mut line = None;
     let got = fail_open(
         host,
-        exec.as_ref(),
-        ElevationPolicy::Prompt,
+        &login(exec.clone(), None),
         &mut stderr,
         no_token,
         |l, _| {
@@ -373,8 +377,7 @@ fn the_fallback_warning_is_said_once_and_the_child_runs_once() {
         let mut stderr = Vec::new();
         fail_open(
             &host,
-            exec.as_ref(),
-            ElevationPolicy::Prompt,
+            &login(exec.clone(), None),
             &mut stderr,
             no_token,
             |_line, _| {
@@ -413,8 +416,7 @@ fn a_warning_is_written_before_the_run_closure_is_called() {
     let host = TestHost::new().with_user_config("shell: nonesuch.exe\n");
     fail_open(
         &host,
-        None,
-        ElevationPolicy::Prompt,
+        &login(None, None),
         &mut Spy(&events),
         no_token,
         |_, _| {
@@ -523,7 +525,7 @@ fn no_command_is_pty_without_a_command() {
         "screen-256color".into(),
         100,
         30,
-        ElevationPolicy::Prompt,
+        Some(ElevationPolicy::Prompt),
     );
     assert_eq!(hs.mode, Mode::Pty);
     assert_eq!(hs.command, None);
@@ -544,7 +546,7 @@ fn a_command_without_a_terminal_is_exec() {
         "xterm".into(),
         80,
         24,
-        ElevationPolicy::Prompt,
+        Some(ElevationPolicy::Prompt),
     );
     assert_eq!(hs.mode, Mode::Exec);
     assert_eq!(hs.command.as_deref(), Some("git status"));
@@ -559,7 +561,7 @@ fn a_command_with_a_terminal_is_a_pty_handshake_with_the_command() {
         "xterm".into(),
         120,
         40,
-        ElevationPolicy::Prompt,
+        Some(ElevationPolicy::Prompt),
     );
     assert_eq!(hs.mode, Mode::Pty);
     assert_eq!(hs.command.as_deref(), Some("git status"));
@@ -570,7 +572,7 @@ fn a_command_with_a_terminal_is_a_pty_handshake_with_the_command() {
 fn the_launch_is_carried_as_given() {
     for launch in [Launch::Shell, Launch::Direct] {
         assert_eq!(
-            make_handshake(&None, false, launch, String::new(), 0, 0, ElevationPolicy::Prompt).launch,
+            make_handshake(&None, false, launch, String::new(), 0, 0, Some(ElevationPolicy::Prompt)).launch,
             launch
         );
     }
@@ -578,7 +580,7 @@ fn the_launch_is_carried_as_given() {
 
 #[test]
 fn the_elevation_policy_is_carried_as_given() {
-    for elevation in POLICIES {
+    for elevation in asked_policies() {
         for (exec, terminal) in [
             (None, false),
             (Some("whoami".to_owned()), false),
@@ -596,6 +598,11 @@ const POLICIES: [ElevationPolicy; 4] = [
     ElevationPolicy::AutoApprove,
     ElevationPolicy::Always,
 ];
+
+/// Every answer a login can give: each of the four policies, and none.
+fn asked_policies() -> impl Iterator<Item = Option<ElevationPolicy>> {
+    POLICIES.map(Some).into_iter().chain([None])
+}
 
 // ── MouseModeSniffer (pure; gates mouse forwarding) ────────────────────────────────
 
@@ -760,7 +767,7 @@ fn exec_handshake() -> Handshake {
         "xterm".into(),
         80,
         24,
-        ElevationPolicy::Prompt,
+        Some(ElevationPolicy::Prompt),
     )
 }
 
@@ -928,8 +935,7 @@ fn fail_open_runs_cmd_exe_and_warns_when_the_shell_exists_and_cannot_start() {
         let mut tried = Vec::new();
         let code = fail_open(
             &host,
-            exec.as_ref(),
-            ElevationPolicy::Prompt,
+            &login(exec.clone(), None),
             &mut stderr,
             no_token,
             |line, _| {
@@ -995,8 +1001,7 @@ fn fail_open_does_not_run_a_command_again_when_the_run_failed_after_the_shell_st
         let mut started = Vec::new();
         let code = fail_open(
             &host,
-            exec.as_ref(),
-            ElevationPolicy::Prompt,
+            &login(exec.clone(), None),
             &mut stderr,
             no_token,
             |line, _| {
@@ -1026,33 +1031,104 @@ fn fail_open_exits_255_and_says_why_when_the_system_directory_is_missing() {
 
 // ── fail_open and the elevation policy ─────────────────────────────────────────────
 
-/// A token that cannot be made is a login that gets a message and 255 and no shell, and the message names
-/// the one way to run the session as it is.
+/// A login that asked for a level and whose token cannot be made gets a message and 255 and no shell, and the
+/// message names both ways out: set nothing, or ask for `always`.
 #[test]
-fn fail_open_token_failure_names_always_and_runs_nothing() {
+fn fail_open_token_failure_of_a_login_that_asked_is_refused_and_names_both_ways_out() {
+    let host = pwsh_host();
+    for asked in [
+        ElevationPolicy::Never,
+        ElevationPolicy::Prompt,
+        ElevationPolicy::AutoApprove,
+    ] {
+        for exec in [exec("whoami", false), exec("whoami", true), None] {
+            let mut stderr = Vec::new();
+            let code = fail_open(
+                &host,
+                &login(exec.clone(), Some(asked)),
+                &mut stderr,
+                |_| -> anyhow::Result<StepDown<()>> { Err(anyhow::anyhow!("the token cannot be made")) },
+                |_, _| -> Result<(), StartError> { panic!("a shell was started for a session with no token") },
+                |()| panic!("nothing was started, so nothing is waited for"),
+            );
+            assert_eq!(code, 255, "{asked:?} {exec:?}");
+            let text = String::from_utf8(stderr).unwrap();
+            assert_eq!(
+                text,
+                format!(
+                    "{}\n",
+                    crate::offer::text::unelevated_unavailable(Some(asked), "the token cannot be made")
+                ),
+                "{asked:?} {exec:?}"
+            );
+            assert!(
+                text.contains("leaves SSH_BROKER_ELEVATION unset") && text.contains("sets it to always"),
+                "{text:?}"
+            );
+        }
+    }
+}
+
+/// A login that asked for `always` and whose level cannot be read is told that, and is never told to ask for
+/// `always`.
+#[test]
+fn fail_open_an_unreadable_level_for_always_is_refused_without_telling_it_to_ask_for_always() {
+    let mut stderr = Vec::new();
+    let code = fail_open(
+        &pwsh_host(),
+        &login(exec("whoami", false), Some(ElevationPolicy::Always)),
+        &mut stderr,
+        |_| -> anyhow::Result<StepDown<()>> { Err(anyhow::anyhow!("the level cannot be read")) },
+        |_, _| -> Result<(), StartError> { panic!("a shell was started for a refused login") },
+        |()| panic!("nothing was started, so nothing is waited for"),
+    );
+    assert_eq!(code, 255);
+    let text = String::from_utf8(stderr).unwrap();
+    assert_eq!(
+        text,
+        format!(
+            "{}\n",
+            crate::offer::text::unelevated_unavailable(Some(ElevationPolicy::Always), "the level cannot be read")
+        )
+    );
+    assert!(!text.contains("sets it to always"), "{text:?}");
+}
+
+/// A login that set nothing asked for nothing: when it cannot be stepped down it is not refused. The notice
+/// goes to stderr before the shell starts, once, and the shell starts with no token, as the shim has.
+#[test]
+fn fail_open_a_login_that_set_nothing_gets_the_shell_and_the_notice_when_it_cannot_be_stepped_down() {
     let host = pwsh_host();
     for exec in [exec("whoami", false), exec("whoami", true), None] {
         let mut stderr = Vec::new();
+        let mut starts = Vec::new();
         let code = fail_open(
             &host,
-            exec.as_ref(),
-            ElevationPolicy::Prompt,
+            &login(exec.clone(), None),
             &mut stderr,
-            |_| -> anyhow::Result<StepDown<()>> { Err(anyhow::anyhow!("the token cannot be made")) },
-            |_, _| -> Result<(), StartError> { panic!("a shell was started for a session with no token") },
-            |()| panic!("nothing was started, so nothing is waited for"),
+            |asked| {
+                assert_eq!(asked, None, "the login set nothing");
+                Ok(StepDown::<u32>::Fallback(anyhow::anyhow!("the token cannot be made")))
+            },
+            |line, token| {
+                starts.push((line.contains("pwsh.exe"), token.copied()));
+                Ok(())
+            },
+            |()| Ok(0),
         );
-        assert_eq!(code, 255, "{exec:?}");
-        let text = String::from_utf8(stderr).unwrap();
+        assert_eq!(code, 0, "{exec:?}");
+        assert_eq!(starts, [(true, None)], "{exec:?}: the shell starts once, with no token");
         assert_eq!(
-            text,
+            String::from_utf8(stderr).unwrap(),
             format!(
                 "{}\n",
-                crate::offer::text::unelevated_unavailable("the token cannot be made")
+                crate::offer::text::unelevated_fallback(
+                    "the token cannot be made",
+                    crate::offer::text::FallbackToken::Sshd
+                )
             ),
             "{exec:?}"
         );
-        assert!(text.contains("SSH_BROKER_ELEVATION=always"), "{text:?}");
     }
 }
 
@@ -1063,8 +1139,7 @@ fn fail_open_default_at_high_starts_with_the_stepped_down_token() {
     let mut seen = Vec::new();
     let code = fail_open(
         &host,
-        exec("echo hi", false).as_ref(),
-        ElevationPolicy::Prompt,
+        &login(exec("echo hi", false), Some(ElevationPolicy::Prompt)),
         &mut stderr,
         |_| Ok(StepDown::Token(7u32)),
         |line, token| {
@@ -1087,8 +1162,7 @@ fn fail_open_always_at_high_starts_with_the_own_token() {
     let mut seen = Vec::new();
     let code = fail_open(
         &host,
-        exec("echo hi", false).as_ref(),
-        ElevationPolicy::Always,
+        &login(exec("echo hi", false), Some(ElevationPolicy::Always)),
         &mut Vec::new(),
         |_| Ok(StepDown::<u32>::Own),
         |_, token| {
@@ -1109,8 +1183,7 @@ fn fail_open_always_below_high_refuses_255_and_never_starts() {
         let mut stderr = Vec::new();
         let code = fail_open(
             &host,
-            exec.as_ref(),
-            ElevationPolicy::Always,
+            &login(exec.clone(), Some(ElevationPolicy::Always)),
             &mut stderr,
             |_| Ok(StepDown::<()>::Refused),
             |_, _| -> Result<(), StartError> { panic!("a shell was started for a refused login") },
@@ -1130,12 +1203,11 @@ fn fail_open_always_below_high_refuses_255_and_never_starts() {
 #[test]
 fn fail_open_asks_for_the_token_once_with_the_policy_of_the_login() {
     let host = pwsh_host();
-    for elevation in POLICIES {
+    for elevation in asked_policies() {
         let mut asked = Vec::new();
         let code = fail_open(
             &host,
-            exec("echo hi", false).as_ref(),
-            elevation,
+            &login(exec("echo hi", false), elevation),
             &mut Vec::new(),
             |elevation| {
                 asked.push(elevation);
