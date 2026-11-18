@@ -1,17 +1,17 @@
 //! Host tests for the pure probe-line format/parse.
 use super::{
-    JUNCTION_NOTE_CHARS, JUNCTION_NOTE_LINES, JUNCTION_SAID, ProbeResult, SymlinkState, UpstreamState, binary_probe_ok,
-    binary_probe_payload, emit_binary_probe, format_probe_line, is_genuine_session, junction_notes, parse_probe_line,
+    JUNCTION_SAID, NOTE_CHARS, NOTE_LINES, ProbeResult, SymlinkState, TOKEN_SAID, UpstreamState, binary_probe_ok,
+    binary_probe_payload, emit_binary_probe, format_probe_line, is_genuine_session, notes, parse_probe_line,
     upstream_payload_ok,
 };
 use crate::socket_loc::Elevation;
 
-/// A result with every optional field absent: what a probe child too old to report them gives.
+/// What a probe child too old to report the new fields gives, with its junction outcome `symlink`.
 fn bare(session_id: u32, symlink: SymlinkState, upstream: UpstreamState) -> ProbeResult {
     ProbeResult {
         session_id,
         dpapi_ok: true,
-        symlink,
+        symlink: Some(symlink),
         upstream,
         logon_type: None,
         elevation: None,
@@ -52,8 +52,7 @@ fn probe_line_carries_the_elevation_and_the_integrity_level() {
     }
 }
 
-/// A probe that cannot read its own token, or an exe older than the field, says nothing. That must
-/// read as "not proven", never as an elevation: the `elevated session` row is what rests on it.
+/// A probe that says nothing about its token reads as "not proven", never as an elevation.
 #[test]
 fn a_missing_or_unknown_elevation_or_integrity_is_not_proven() {
     let old = parse_probe_line("PROBE session_id=1 dpapi=ok symlink=ok upstream=ok").unwrap();
@@ -63,9 +62,7 @@ fn a_missing_or_unknown_elevation_or_integrity_is_not_proven() {
     assert_eq!((garbled.elevation, garbled.integrity), (None, None));
 }
 
-/// No probe reports a path: `verify` names the junction's directory itself, and a path a process below
-/// High wrote is never one `verify` acts on. The line has no `junction=` field, and a key it does not
-/// know (an exe from before this change wrote one) is ignored like any other, not read as a directory.
+/// No probe reports a path, and a `junction=` key from an older exe is ignored, not read as a directory.
 #[test]
 fn the_probe_line_names_no_directory() {
     let line = format_probe_line(&bare(1, SymlinkState::Ok, UpstreamState::Ok));
@@ -76,27 +73,48 @@ fn the_probe_line_names_no_directory() {
     assert_eq!(old, bare(1, SymlinkState::Ok, UpstreamState::Ok));
 }
 
-/// What `verify` shows of a probe's stderr on the junction row: only the junction's own lines, a few of
-/// them, so another message of the probe (a failed upstream read) is not put on that row.
+/// A probe that was given no junction reports none: the line has no `symlink=` and reads back as not
+/// reported, which is not a failed outcome. A word it does not know is not reported either.
 #[test]
-fn only_the_junction_lines_of_the_probes_stderr_are_kept_and_they_are_bounded() {
-    let said = |line: &str| format!("{JUNCTION_SAID}{line}\n");
+fn a_probe_that_reports_no_junction_outcome_has_none() {
+    let none = ProbeResult {
+        symlink: None,
+        ..bare(1, SymlinkState::Ok, UpstreamState::Ok)
+    };
+
+    let line = format_probe_line(&none);
+
+    assert_eq!(line, "PROBE session_id=1 dpapi=ok upstream=ok");
+    assert_eq!(parse_probe_line(&line).unwrap(), none);
+    let unknown = parse_probe_line("PROBE session_id=1 dpapi=ok symlink=banana upstream=ok").unwrap();
+    assert_eq!(unknown.symlink, None);
+}
+
+/// What `verify` shows of a probe's stderr on a row: only the lines of that row's own kind, a few of them,
+/// so another message of the probe (a failed upstream read, or the token's words on the junction row) is
+/// not put there.
+#[test]
+fn only_the_lines_of_one_kind_of_the_probes_stderr_are_kept_and_they_are_bounded() {
+    let said = |prefix: &str, line: &str| format!("{prefix}{line}\n");
+    let junction = |line: &str| said(JUNCTION_SAID, line);
     let stderr = format!(
-        "ssh-broker: reading the upstream probe payload failed: broken pipe\n{}{}",
-        said("making a junction in C:\\Temp failed: access denied"),
-        said("removing C:\\Temp\\x failed: in use"),
+        "ssh-broker: reading the upstream probe payload failed: broken pipe\n{}{}{}",
+        junction("making a junction in C:\\Temp failed: access denied"),
+        junction("removing C:\\Temp\\x failed: in use"),
+        said(TOKEN_SAID, "reading its integrity level failed: denied"),
     );
     assert_eq!(
-        junction_notes(&stderr),
+        notes(&stderr, JUNCTION_SAID),
         "making a junction in C:\\Temp failed: access denied; removing C:\\Temp\\x failed: in use"
     );
-    assert_eq!(junction_notes(""), "");
-    assert_eq!(junction_notes("ssh-broker: something else\n"), "");
+    assert_eq!(notes(&stderr, TOKEN_SAID), "reading its integrity level failed: denied");
+    assert_eq!(notes("", JUNCTION_SAID), "");
+    assert_eq!(notes("ssh-broker: something else\n", JUNCTION_SAID), "");
 
-    let many: String = (0..9).map(|i| said(&format!("line {i}"))).collect();
-    assert_eq!(junction_notes(&many).split("; ").count(), JUNCTION_NOTE_LINES);
-    let long = said(&"x".repeat(1000));
-    assert!(junction_notes(&long).chars().count() <= JUNCTION_NOTE_CHARS);
+    let many: String = (0..9).map(|i| junction(&format!("line {i}"))).collect();
+    assert_eq!(notes(&many, JUNCTION_SAID).split("; ").count(), NOTE_LINES);
+    let long = junction(&"x".repeat(1000));
+    assert!(notes(&long, JUNCTION_SAID).chars().count() <= NOTE_CHARS);
 }
 
 /// `upstream` is default-deny, like `dpapi`: a probe child too old to report it must read as "not
@@ -205,7 +223,7 @@ fn symlink_states_round_trip() {
         SymlinkState::Skipped,
     ] {
         let line = format_probe_line(&bare(2, st, UpstreamState::Ok));
-        assert_eq!(parse_probe_line(&line).unwrap().symlink, st);
+        assert_eq!(parse_probe_line(&line).unwrap().symlink, Some(st));
     }
     // A junction that was refused, one that was made and not read, and a directory that could not be made
     // fail. A volume that refused the junction was not tested, which fails nothing.
@@ -272,18 +290,15 @@ fn binary_probe_markers_cannot_collide_with_the_payload() {
 
 #[test]
 fn parse_is_default_deny_on_gating_keys() {
-    // Missing dpapi, symlink and upstream → fail; missing session_id → 0. Nothing defaults to a pass.
+    // Nothing defaults to a pass: a probe that reported no link outcome did not prove one.
     let r = parse_probe_line("PROBE session_id=2").unwrap();
     assert_eq!(
         r,
         ProbeResult {
             dpapi_ok: false,
-            ..bare(2, SymlinkState::Failed, UpstreamState::Absent)
+            symlink: None,
+            ..bare(2, SymlinkState::Ok, UpstreamState::Absent)
         }
-    );
-    assert!(
-        r.symlink.is_failure(),
-        "a probe that reported no link outcome did not prove one"
     );
 }
 

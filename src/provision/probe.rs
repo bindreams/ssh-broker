@@ -20,14 +20,13 @@ pub enum SymlinkState {
     /// The junction exists and the read was refused as an untrusted mount point (error 448):
     /// RedirectionGuard is on in this session.
     Blocked,
-    /// The junction was made, and the read failed for another reason. Also what a probe that reported
-    /// no outcome gets.
+    /// The junction was made, and the read failed for another reason.
     Failed,
     /// The directory for the junction, or something in it before the junction, could not be made
     /// (access, disk, a path that exists): nothing was made to follow, and that is a fault.
     NotMade,
-    /// The directory was made and the volume refused to make a junction of it (a temp directory on a volume
-    /// with no reparse points, say), so following it was not tested. Informational: it fails nothing.
+    /// The volume of the directory holds no junctions (a temp directory on a volume with no reparse
+    /// points, say), so following one was not tested. Informational: it fails nothing.
     Skipped,
 }
 
@@ -41,13 +40,14 @@ impl SymlinkState {
             SymlinkState::Skipped => "skip",
         }
     }
-    fn parse(s: &str) -> SymlinkState {
+    fn parse(s: &str) -> Option<SymlinkState> {
         match s {
-            "ok" => SymlinkState::Ok,
-            "blocked" => SymlinkState::Blocked,
-            "notmade" => SymlinkState::NotMade,
-            "skip" => SymlinkState::Skipped,
-            _ => SymlinkState::Failed, // missing or unknown: nothing was proven
+            "ok" => Some(SymlinkState::Ok),
+            "blocked" => Some(SymlinkState::Blocked),
+            "fail" => Some(SymlinkState::Failed),
+            "notmade" => Some(SymlinkState::NotMade),
+            "skip" => Some(SymlinkState::Skipped),
+            _ => None,
         }
     }
     /// Whether this outcome fails parity: a junction that was refused or not read, or a directory that could
@@ -68,7 +68,9 @@ impl SymlinkState {
 pub struct ProbeResult {
     pub session_id: u32,
     pub dpapi_ok: bool,
-    pub symlink: SymlinkState,
+    /// What the probe found about its junction. `None` is "not reported": a probe that was given no junction,
+    /// an exe older than the field, an unknown word.
+    pub symlink: Option<SymlinkState>,
     /// Whether the payload `verify` sent UPSTREAM reached the child unchanged. Only the child can
     /// see what arrived, so the PROBE line is the only way to learn the client → child direction;
     /// the downstream half is checked by comparing the child's stdout directly.
@@ -230,12 +232,17 @@ fn parse_integrity(text: &str) -> Option<u32> {
 /// The single line `verify-probe` prints to stdout.
 pub fn format_probe_line(r: &ProbeResult) -> String {
     let mut line = format!(
-        "PROBE session_id={} dpapi={} symlink={} upstream={}",
+        "PROBE session_id={} dpapi={}",
         r.session_id,
         if r.dpapi_ok { "ok" } else { "fail" },
-        r.symlink.as_str(),
-        if r.upstream.proven() { "ok" } else { "fail" }
     );
+    if let Some(symlink) = r.symlink {
+        line.push_str(&format!(" symlink={}", symlink.as_str()));
+    }
+    line.push_str(&format!(
+        " upstream={}",
+        if r.upstream.proven() { "ok" } else { "fail" }
+    ));
     if let Some(logon_type) = r.logon_type {
         line.push_str(&format!(" logon={logon_type}"));
     }
@@ -250,8 +257,8 @@ pub fn format_probe_line(r: &ProbeResult) -> String {
 
 /// Parse the `PROBE …` line out of the child's stdout (tolerant of surrounding noise).
 /// Default-deny on every key: a missing line errors; a missing dpapi reads as fail, a missing
-/// session_id as 0, a missing or unknown symlink as `Failed`, and a missing elevation or integrity
-/// as `None`, which no row passes on.
+/// session_id as 0, and a missing or unknown symlink, elevation or integrity as `None`, which no row
+/// passes on.
 pub fn parse_probe_line(stdout: &str) -> anyhow::Result<ProbeResult> {
     let line = stdout
         .lines()
@@ -260,7 +267,7 @@ pub fn parse_probe_line(stdout: &str) -> anyhow::Result<ProbeResult> {
     let mut r = ProbeResult {
         session_id: 0,
         dpapi_ok: false,
-        symlink: SymlinkState::Failed,
+        symlink: None,
         // Default-deny, like `dpapi`: a probe child too old to report it must read as "not
         // proven", never as proven. This one gates a claim the README makes, so a silent
         // default of "ok" would restore exactly the unverified assertion it exists to replace.
@@ -290,26 +297,28 @@ pub fn parse_probe_line(stdout: &str) -> anyhow::Result<ProbeResult> {
     Ok(r)
 }
 
-// ── what a probe says about its junction ───────────────────────────────────────────────
+// ── what a probe says about itself ─────────────────────────────────────────────────────
 
 /// What the probe writes before each line of its stderr about the junction (why it could not make one,
 /// why it could not read through it, what it could not remove), so `verify` can show those lines and no
 /// others.
 pub const JUNCTION_SAID: &str = "ssh-broker: junction: ";
-/// How much of that `verify` shows on a row.
-pub const JUNCTION_NOTE_LINES: usize = 4;
-pub const JUNCTION_NOTE_CHARS: usize = 400;
+/// The same for each line about its own token (why its elevation or its level could not be read).
+pub const TOKEN_SAID: &str = "ssh-broker: token: ";
+/// How much of one kind of line `verify` shows on a row.
+pub const NOTE_LINES: usize = 4;
+pub const NOTE_CHARS: usize = 400;
 
-/// The junction lines of a probe's `stderr`, a few of them and joined with `; `: the probe's own words
-/// about what it could not do, for the row of the junction.
-pub fn junction_notes(stderr: &str) -> String {
+/// The lines of a probe's `stderr` that begin with `prefix` ([`JUNCTION_SAID`], [`TOKEN_SAID`]), a few of
+/// them and joined with `; `: the probe's own words about what it could not do, for the row they explain.
+pub fn notes(stderr: &str, prefix: &str) -> String {
     let lines: Vec<&str> = stderr
         .lines()
-        .filter_map(|line| line.strip_prefix(JUNCTION_SAID))
+        .filter_map(|line| line.strip_prefix(prefix))
         .map(str::trim)
-        .take(JUNCTION_NOTE_LINES)
+        .take(NOTE_LINES)
         .collect();
-    lines.join("; ").chars().take(JUNCTION_NOTE_CHARS).collect()
+    lines.join("; ").chars().take(NOTE_CHARS).collect()
 }
 
 // ── Windows parity checks (run in the session-1 probe child) ───────────────────────
@@ -350,15 +359,20 @@ pub fn current_logon_type() -> Option<u32> {
 }
 
 /// This process's own elevation and integrity level, read from its token by the one reader `account`
-/// has. Each is `None` when it could not be read: the caller treats "unknown" as "not proven".
+/// has. Each is `None` when it could not be read, and why is on stderr after [`TOKEN_SAID`]: the caller
+/// treats "unknown" as "not proven".
 #[cfg(windows)]
 pub fn current_token_facts() -> (Option<Elevation>, Option<u32>) {
-    let Ok(token) = crate::winutil::own_token() else {
+    fn said<T>(what: &str, read: anyhow::Result<T>) -> Option<T> {
+        read.inspect_err(|e| eprintln!("{TOKEN_SAID}reading {what} failed: {e:#}"))
+            .ok()
+    }
+    let Some(token) = said("the probe's own token", crate::winutil::own_token()) else {
         return (None, None);
     };
     (
-        crate::account::elevation_of(token.0).ok(),
-        crate::account::integrity_of(token.0).ok(),
+        said("its elevation", crate::account::elevation_of(token.0)),
+        said("its integrity level", crate::account::integrity_of(token.0)),
     )
 }
 

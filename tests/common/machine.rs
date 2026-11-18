@@ -34,9 +34,44 @@ fn lock() -> &'static mut RwLock<std::fs::File> {
 pub struct MachineShared(#[allow(dead_code)] RwLockReadGuard<'static, std::fs::File>);
 pub struct MachineExclusive(#[allow(dead_code)] RwLockWriteGuard<'static, std::fs::File>);
 
-/// Hold the machine alongside other shared holders.
+/// Hold the machine alongside other shared holders, with `seclogon` running.
+///
+/// The shared holders start processes through Secondary Logon at the same moment, as they are released
+/// together by an exclusive holder that ends. Against a stopped service each call starts it, and one of
+/// two that start it at once is answered "An instance of the service is already running" (0x80070420) and
+/// fails its test. So the service is made running here, before any holder uses it, by a wait on its real
+/// state. No exclusive holder stops it while a shared one lives.
 pub fn shared() -> MachineShared {
-    MachineShared(lock().read().expect("take the machine lock shared"))
+    let held = lock().read().expect("take the machine lock shared");
+    seclogon_running();
+    MachineShared(held)
+}
+
+/// Return when the `seclogon` service is running: start it if it is stopped, take another caller's start
+/// that wins as ours, and wait out a start or a stop in progress. Each wait is on the service's own state,
+/// with no bound of ours; a start that fails for a reason of its own (a disabled service) fails here.
+fn seclogon_running() {
+    const SCRIPT: &str = "$s = Get-Service -Name seclogon; \
+        while ($s.Status -ne 'Running') { \
+            if ($s.Status -eq 'Stopped') { \
+                try { $s.Start() } catch { $s.Refresh(); if ($s.Status -eq 'Stopped') { throw } } \
+            } elseif ($s.Status -eq 'StopPending') { $s.WaitForStatus('Stopped') } \
+            else { $s.WaitForStatus('Running') }; \
+            $s.Refresh() \
+        }";
+    let out = crate::desktop::output(std::process::Command::new("powershell").args([
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        SCRIPT,
+    ]))
+    .unwrap_or_else(|e| panic!("powershell did not run: {e}"));
+    assert!(
+        out.status.success(),
+        "making sure seclogon is running failed: {}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 /// Hold the machine alone: no shared holder, in any process, runs while this lives.

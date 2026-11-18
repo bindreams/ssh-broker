@@ -121,20 +121,19 @@ impl Drop for Temp {
     }
 }
 
-/// The one probe of a standard account's agent makes a junction, follows it and removes it: the link
-/// outcome is on the PROBE line and nothing is left in the temp directory.
+/// A probe told nothing about a junction makes none and picks no directory of its own: the PROBE line
+/// has no link outcome and nothing is made in the temp directory.
 #[test]
-fn a_probe_with_no_flag_follows_its_own_junction_and_leaves_nothing() {
-    let temp = Temp::new("own");
+fn a_probe_with_no_flag_makes_no_junction_and_reports_none() {
+    let temp = Temp::new("none-given");
     let stdout = run_verify_probe_with(&[], &temp.0, &(0..=255u8).collect::<Vec<_>>());
     let line = probe_line(&stdout);
-    assert!(line.contains("symlink=ok"), "expected symlink=ok, got: {line}");
-    assert!(!line.contains("junction="), "no directory is left to name: {line}");
-    assert_eq!(std::fs::read_dir(&temp.0).unwrap().count(), 0, "nothing is left behind");
+    assert!(!line.contains("symlink="), "no link outcome expected, got: {line}");
+    assert_eq!(std::fs::read_dir(&temp.0).unwrap().count(), 0, "nothing is made");
 }
 
-/// The unelevated probe of an administrator's agent makes the junction in the directory it is given and
-/// reports no path; the other probe follows it by the same directory. Both read it, neither removes it.
+/// A probe makes the junction in the directory it is given and reports no path; the other probe follows it
+/// by the same directory. Both read it, neither removes it.
 #[test]
 fn a_probe_makes_a_junction_in_the_directory_it_is_given_and_another_follows_it() {
     let temp = Temp::new("make");

@@ -688,6 +688,53 @@ fn apply_keeps_default_shell_arguments_until_a_config_holds_them() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `<installed> verify` run through the agent of `admin` at `location`, as a session that asks for
+/// `privilege`.
+fn verify_through(
+    installed: &Path,
+    admin: &Account,
+    location: &ssh_broker::socket_loc::SocketLocation,
+    privilege: ssh_broker::protocol::Privilege,
+) -> agent_conn::Finished {
+    let mut conn = agent_conn::AgentConn::connect(location, &admin.sid);
+    conn.start_exec_as(&format!("\"{}\" verify", installed.display()), privilege);
+    conn.end_stdin();
+    conn.read_to_end()
+}
+
+/// What `verify` shows through an administrator's elevated agent, however the agent was started: it exits
+/// 0, the session is elevated, an unelevated one can be had, and the junction was followed, not skipped.
+fn assert_verify_passes_for_an_elevated_agent(verified: &agent_conn::Finished) {
+    assert_eq!(
+        verified.exit,
+        Some(0),
+        "verify:\n{}{}",
+        verified.stdout,
+        verified.stderr
+    );
+    for row in [
+        "[PASS] elevated session",
+        "[PASS] unelevated session on request",
+        "[PASS] junction (via agent)",
+    ] {
+        assert!(verified.stdout.contains(row), "no {row:?} in:\n{}", verified.stdout);
+    }
+    let junction = verified
+        .stdout
+        .lines()
+        .find(|line| line.contains("junction (via agent)"))
+        .unwrap_or_else(|| panic!("no junction row in:\n{}", verified.stdout));
+    assert!(
+        junction.contains("followed"),
+        "the junction was not followed: {junction}"
+    );
+    assert!(
+        !verified.stdout.contains("NOT tested"),
+        "something was not tested:\n{}",
+        verified.stdout
+    );
+}
+
 /// Elevated (CI only). `verify`, run in an administrator's session through the account's elevated agent,
 /// passes after `apply`: the session is elevated, an unelevated one can be had, and the junction that a
 /// token below High made is followed. The same `verify` run in an unelevated session of the account is
@@ -722,28 +769,9 @@ fn apply_then_verify_for_an_administrator_shows_an_elevated_session_and_an_unele
     let location = admin.socket_location();
     stand_in::wait_for_serving_marker_of_a_task(&location, TASK_START_BOUND);
 
-    let verify = |privilege: Privilege| {
-        let mut conn = agent_conn::AgentConn::connect(&location, &admin.sid);
-        conn.start_exec_as(&format!("\"{}\" verify", installed.display()), privilege);
-        conn.end_stdin();
-        conn.read_to_end()
-    };
+    let verify = |privilege: Privilege| verify_through(&installed, &admin, &location, privilege);
 
-    let elevated = verify(Privilege::Account);
-    assert_eq!(
-        elevated.exit,
-        Some(0),
-        "verify:\n{}{}",
-        elevated.stdout,
-        elevated.stderr
-    );
-    for row in [
-        "[PASS] elevated session",
-        "[PASS] unelevated session on request",
-        "[PASS] junction (via agent)",
-    ] {
-        assert!(elevated.stdout.contains(row), "no {row:?} in:\n{}", elevated.stdout);
-    }
+    assert_verify_passes_for_an_elevated_agent(&verify(Privilege::Account));
 
     let unelevated = verify(Privilege::Unelevated);
     assert_eq!(
@@ -763,4 +791,44 @@ fn apply_then_verify_for_an_administrator_shows_an_elevated_session_and_an_unele
         "an unelevated session ran a probe:\n{}",
         unelevated.stdout
     );
+}
+
+/// Elevated (CI only). The same `verify`, through the elevated agent that the password prompt started for an
+/// administrator: the batch logon the shim makes, by the installed exe. The agent is the one the shim gets,
+/// so the junction a token below High made is followed there as well.
+#[test]
+fn apply_then_verify_for_an_administrator_whose_agent_the_password_prompt_started() {
+    use ssh_broker::logon::{self, LogonKind};
+    use ssh_broker::protocol::Privilege;
+
+    let _machine = machine::exclusive();
+    let _install = Install::capture();
+    let broker = Path::new(env!("CARGO_BIN_EXE_ssh-broker"));
+    let installed = provision::canonical_exe();
+    let applied = apply(broker);
+    assert!(
+        applied.status.success(),
+        "apply failed:\n{}{}",
+        String::from_utf8_lossy(&applied.stdout),
+        String::from_utf8_lossy(&applied.stderr)
+    );
+
+    let admin = Account::create("vf2", true);
+    admin.make_administrator();
+    let started = logon::start_background_agent(
+        &local_account(&admin),
+        &password::password(&admin.password),
+        &installed,
+        LogonKind::Batch,
+    )
+    .unwrap_or_else(|e| panic!("the batch logon for {} failed: {e:?}", admin.name));
+    let location = admin.socket_location();
+    stand_in::wait_for_serving_marker(&location, started.process.0);
+    // Ends the agent when it goes, whether the test passed or not.
+    let _agent = BackgroundAgent {
+        process: started.process,
+        location: location.clone(),
+    };
+
+    assert_verify_passes_for_an_elevated_agent(&verify_through(&installed, &admin, &location, Privilege::Account));
 }

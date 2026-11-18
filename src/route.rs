@@ -49,12 +49,12 @@ pub enum Verb {
 /// What a `verify-probe` does with the junction its link check reads through (`provision::probe::link`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProbeLink {
-    /// Make a junction in a directory of its own in the temp directory, read through it and remove it:
-    /// the one probe of an agent below High.
-    Own,
+    /// Make no junction and read none: the probe reports no link outcome. What `verify` runs when it cannot
+    /// name a directory.
+    NoJunction,
     /// Make this directory, which must not exist yet, with a junction in it, read through it, and leave
-    /// it for `verify` to remove: the unelevated probe of an administrator's agent, whose junction the
-    /// elevated probe then follows.
+    /// it for `verify` to remove: the one probe of an agent below High, and the unelevated probe of an
+    /// administrator's agent, whose junction the elevated probe then follows.
     Make(String),
     /// Read through the junction in this directory, which another probe made.
     Follow(String),
@@ -129,7 +129,7 @@ pub fn route(args: &[String], command_line: &str) -> Route {
 /// `[]`, `--make-junction <directory>` or `--follow <directory>`.
 fn probe_link(rest: &[String]) -> Option<ProbeLink> {
     match rest {
-        [] => Some(ProbeLink::Own),
+        [] => Some(ProbeLink::NoJunction),
         [flag, dir] if flag == "--make-junction" && !dir.starts_with("--") => Some(ProbeLink::Make(dir.clone())),
         [flag, dir] if flag == "--follow" && !dir.starts_with("--") => Some(ProbeLink::Follow(dir.clone())),
         _ => None,

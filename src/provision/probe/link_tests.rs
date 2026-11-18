@@ -61,6 +61,21 @@ fn only_an_untrusted_mount_point_error_is_a_block() {
     assert_eq!(state_of_read(Ok(b"other".to_vec())), SymlinkState::Failed);
 }
 
+/// Every read that is not a followed junction or RedirectionGuard's refusal says why on stderr, a read
+/// that gave the wrong content too.
+#[test]
+fn a_read_that_failed_or_gave_other_content_is_said() {
+    let dir = Path::new(r"D:\t");
+    let said = |read| read_note(dir, &read);
+
+    assert_eq!(said(Ok(b"parity".to_vec())), None);
+    assert_eq!(said(Err(io::Error::from_raw_os_error(UNTRUSTED_MOUNT_POINT))), None);
+    let denied = said(Err(io::Error::from_raw_os_error(5))).expect("a failed read is said");
+    assert!(denied.contains(r"D:\t") && denied.contains("denied"), "{denied}");
+    let other = said(Ok(b"other".to_vec())).expect("other content is said");
+    assert!(other.contains("parity") && other.contains("differ"), "{other}");
+}
+
 /// A path that exists is never made over or cleared: the probe fails and leaves what is there alone,
 /// whether it is a stale directory of an earlier run or something that was put there.
 #[test]
@@ -73,7 +88,7 @@ fn making_in_a_path_that_exists_fails_and_leaves_it_alone() {
     let made = make(&dir);
 
     assert!(
-        matches!(&made, Err(MakeError::Directory(e)) if e.kind() == io::ErrorKind::AlreadyExists),
+        matches!(&made, Err(MakeError::NotMade(e)) if e.kind() == io::ErrorKind::AlreadyExists),
         "{made:?}"
     );
     assert_eq!(std::fs::read(dir.join("keep.txt")).unwrap(), b"keep");
@@ -132,35 +147,19 @@ fn removing_a_directory_that_is_gone_is_not_an_error() {
 
 // what a probe does with its junction ---------------------------------------------------------
 
-/// `Own`: the one probe of an agent below High makes a junction in a directory of its own, follows it and
-/// removes it.
-#[test]
-fn an_own_junction_is_followed_and_removed_by_the_probe_that_made_it() {
-    let scratch = Scratch::new();
-
-    let state = run_in(&ProbeLink::Own, &scratch.0);
-
-    assert_eq!(state, SymlinkState::Ok);
-    assert_eq!(
-        std::fs::read_dir(&scratch.0).unwrap().count(),
-        0,
-        "nothing is left behind"
-    );
-}
-
-/// `Make`: the unelevated probe of an administrator's agent makes the junction in the directory `verify`
-/// named and leaves it; a second probe follows it by that name and leaves it for `verify` to remove.
+/// `Make`: a probe makes the junction in the directory `verify` named and leaves it; a second probe
+/// follows it by that name and leaves it for `verify` to remove.
 #[test]
 fn a_made_junction_is_left_for_the_next_probe_to_follow() {
     let scratch = Scratch::new();
     let dir = scratch.0.join("named");
     let text = dir.to_str().unwrap().to_owned();
 
-    let made = run_in(&ProbeLink::Make(text.clone()), &scratch.0);
-    let followed = run_in(&ProbeLink::Follow(text), &scratch.0);
+    let made = run(&ProbeLink::Make(text.clone()));
+    let followed = run(&ProbeLink::Follow(text));
 
-    assert_eq!(made, SymlinkState::Ok);
-    assert_eq!(followed, SymlinkState::Ok);
+    assert_eq!(made, Some(SymlinkState::Ok));
+    assert_eq!(followed, Some(SymlinkState::Ok));
     assert!(dir.exists(), "following leaves what it follows to `verify`");
     remove(&dir).unwrap();
     assert_eq!(
@@ -170,8 +169,14 @@ fn a_made_junction_is_left_for_the_next_probe_to_follow() {
     );
 }
 
+/// A probe told nothing about a junction makes and reads none, and reports no outcome.
+#[test]
+fn a_probe_given_no_junction_reports_none() {
+    assert_eq!(run(&ProbeLink::NoJunction), None);
+}
+
 /// A directory that cannot be made is `NotMade`, which fails: it is not the volume refusing a junction. A
-/// path that exists is such a case, and is left as it is, by `Make` and by `Own` alike.
+/// path that exists is such a case, and is left as it is.
 #[test]
 fn a_directory_that_cannot_be_made_is_not_made_and_is_left_alone() {
     let scratch = Scratch::new();
@@ -181,32 +186,110 @@ fn a_directory_that_cannot_be_made_is_not_made_and_is_left_alone() {
     std::fs::create_dir(&existing).unwrap();
 
     assert_eq!(
-        run_in(
-            &ProbeLink::Make(not_a_directory.join("d").to_str().unwrap().to_owned()),
-            &scratch.0
-        ),
-        SymlinkState::NotMade
+        run(&ProbeLink::Make(not_a_directory.join("d").to_str().unwrap().to_owned())),
+        Some(SymlinkState::NotMade)
     );
-    assert_eq!(run_in(&ProbeLink::Own, &not_a_directory), SymlinkState::NotMade);
     assert_eq!(
-        run_in(&ProbeLink::Make(existing.to_str().unwrap().to_owned()), &scratch.0),
-        SymlinkState::NotMade
+        run(&ProbeLink::Make(existing.to_str().unwrap().to_owned())),
+        Some(SymlinkState::NotMade)
     );
     assert_eq!(std::fs::read_dir(&existing).unwrap().count(), 0, "it was not touched");
     assert_eq!(std::fs::read(&not_a_directory).unwrap(), b"x");
 }
 
-/// Only a refusal at the reparse point, where the directory is there and the volume will not make it a
-/// junction, is `Skipped`; anything before it is `NotMade`. Each says its cause for the row.
+// the volume --------------------------------------------------------------------------------
+
+/// Whether a volume holds junctions is read off its flags and nothing else.
+#[test]
+fn a_volume_holds_junctions_exactly_when_it_says_it_supports_reparse_points() {
+    assert!(holds_reparse_points(FILE_SUPPORTS_REPARSE_POINTS));
+    assert!(holds_reparse_points(!0));
+    assert!(!holds_reparse_points(0));
+    assert!(!holds_reparse_points(!FILE_SUPPORTS_REPARSE_POINTS));
+}
+
+/// Once the volume has said it holds junctions, a later failure is `NotMade` with its cause and fails the
+/// row: here the folder the junction leads to is already in the directory. The half-made directory is
+/// removed.
+#[test]
+fn a_failure_after_the_directory_was_made_is_not_made_and_removes_the_directory() {
+    let scratch = Scratch::new();
+    let dir = scratch.0.join("d");
+    std::fs::create_dir_all(dir.join(TARGET_NAME)).unwrap();
+
+    let made = complete(&dir);
+
+    assert!(
+        matches!(&made, Err(MakeError::NotMade(e)) if e.kind() == io::ErrorKind::AlreadyExists),
+        "{made:?}"
+    );
+    assert_eq!(made.unwrap_err().state(), SymlinkState::NotMade);
+    assert!(!dir.exists(), "the half-made directory is removed");
+}
+
+/// Each way a junction is not made says its cause for the row: a fault names the directory and the error, and a
+/// volume without junctions says that it holds none and is not tested.
 #[test]
 fn where_the_junction_failed_decides_not_tested_or_failed() {
     let dir = Path::new(r"D:\t");
-    let directory = MakeError::Directory(io::Error::from_raw_os_error(5));
-    let volume = MakeError::ReparsePoint(io::Error::from_raw_os_error(50));
+    let fault = MakeError::NotMade(io::Error::from_raw_os_error(5));
+    let volume = MakeError::NoJunctions;
 
-    assert_eq!(directory.state(), SymlinkState::NotMade);
+    assert_eq!(fault.state(), SymlinkState::NotMade);
     assert_eq!(volume.state(), SymlinkState::Skipped);
-    assert!(directory.said(dir).contains(r"D:\t"), "{}", directory.said(dir));
-    assert!(directory.said(dir).contains("directory"), "{}", directory.said(dir));
-    assert!(volume.said(dir).contains("volume"), "{}", volume.said(dir));
+    assert!(fault.said(dir).contains(r"D:\t"), "{}", fault.said(dir));
+    assert!(fault.said(dir).contains("denied"), "{}", fault.said(dir));
+    assert!(volume.said(dir).contains("holds no junctions"), "{}", volume.said(dir));
+}
+
+// the target path ----------------------------------------------------------------------------
+
+/// What `buffer` holds as the substitute name and the print name, decoded back out.
+fn names_of(buffer: &[u8]) -> (String, String) {
+    let u16_at = |at: usize| usize::from(u16::from_le_bytes([buffer[at], buffer[at + 1]]));
+    let (sub_at, sub_len, print_at, print_len) = (u16_at(8), u16_at(10), u16_at(12), u16_at(14));
+    let path = &buffer[16..];
+    let text = |at: usize, len: usize| {
+        let wide: Vec<u16> = path[at..at + len]
+            .chunks(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect();
+        assert_eq!(path[at + len..at + len + 2], [0, 0], "a name ends in a NUL");
+        String::from_utf16(&wide).unwrap()
+    };
+    assert_eq!(
+        u16_at(4),
+        buffer.len() - 8,
+        "the data length is what follows the 8 byte header"
+    );
+    (text(sub_at, sub_len), text(print_at, print_len))
+}
+
+/// The kernel follows `\??\...`: every form of the target gets it, in the one order of prefixes, and the
+/// print name is the path as it was given.
+#[test]
+fn every_form_of_a_target_path_gets_the_name_the_kernel_follows() {
+    for (target, substitute) in [
+        (r"C:\a\b", r"\??\C:\a\b"),
+        (r"\\?\C:\a\b", r"\??\C:\a\b"),
+        (r"\\.\C:\a\b", r"\??\C:\a\b"),
+        (r"\\?\UNC\srv\share\a", r"\??\UNC\srv\share\a"),
+        (r"\\.\UNC\srv\share\a", r"\??\UNC\srv\share\a"),
+        (r"\\srv\share\a", r"\??\UNC\srv\share\a"),
+    ] {
+        let buffer = mount_point_buffer(Path::new(target)).unwrap();
+
+        assert_eq!(
+            names_of(&buffer),
+            (substitute.to_owned(), target.to_owned()),
+            "{target}"
+        );
+    }
+}
+
+#[test]
+fn a_target_path_too_long_for_a_reparse_buffer_is_an_error() {
+    let long = format!(r"C:\{}", "a".repeat(40_000));
+
+    assert!(mount_point_buffer(Path::new(&long)).is_err());
 }

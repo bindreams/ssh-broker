@@ -73,9 +73,7 @@ pub fn probe_timeout_from_args(args: &[String]) -> anyhow::Result<Option<Duratio
 ///
 /// On expiry the sender is left running. That is deliberate: it is blocked inside the relay
 /// conversation with no portable way to interrupt it. `verify` goes on without it (it starts no
-/// further probe, removes the directory it named, says that the stuck probe may still create it, and
-/// prints its report) and exits afterwards, so process teardown collects the thread. Leaking a blocked
-/// thread in a short-lived diagnostic beats an unkillable wait that reports nothing.
+/// further probe and prints its report) and exits afterwards, so process teardown collects the thread.
 pub fn await_bounded<T>(rx: &Receiver<T>, timeout: Option<Duration>) -> Result<T, WaitError> {
     let Some(d) = timeout else {
         return rx.recv().map_err(|_| WaitError::WorkerStopped);
@@ -95,8 +93,7 @@ pub fn await_bounded<T>(rx: &Receiver<T>, timeout: Option<Duration>) -> Result<T
     }
 }
 
-/// Why [`await_bounded`] gave no value. The two are told apart by the variant, not by the text: a worker
-/// that stopped answered nothing for want of an answer, and one that timed out may still be running.
+/// Why [`await_bounded`] gave no value. A timed-out worker may still be running; a dropped one is not.
 #[derive(Debug)]
 pub enum WaitError {
     /// The bound passed with no value.

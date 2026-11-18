@@ -14,6 +14,7 @@ use std::process::Command;
 
 use ssh_broker::account::{Elevation, elevation};
 use ssh_broker::pipes::ExecChild;
+use ssh_broker::provision::probe::link;
 use ssh_broker::winutil::UnelevatedToken;
 use windows::Win32::System::SystemServices::PROCESS_MITIGATION_REDIRECTION_TRUST_POLICY;
 use windows::Win32::System::Threading::{ProcessRedirectionTrustPolicy, SetProcessMitigationPolicy};
@@ -26,9 +27,6 @@ mod drain;
 mod fs_state;
 
 const CHILD: &str = "a_process_that_enforces_redirection_trust_reads_through_two_junctions";
-const FILE: &str = "parity.txt";
-/// `ERROR_UNTRUSTED_MOUNT_POINT`.
-const UNTRUSTED_MOUNT_POINT: i32 = 448;
 
 /// The pair's directory, removed on drop. `remove_dir_all` removes a junction itself and does not follow it.
 struct Dir(PathBuf);
@@ -66,30 +64,29 @@ fn an_elevated_junction_is_followed_and_an_unelevated_one_is_refused_under_redir
         "this test needs an elevated administrator (CI runs it); not running it here"
     );
     let dir = Dir::new();
-    let target = dir.0.join("target");
-    std::fs::create_dir(&target).unwrap();
-    std::fs::write(target.join(FILE), b"parity").unwrap();
 
-    fs_state::junction(&by_admin(&dir.0), &target);
+    // This elevated process makes one junction with the product's own maker, in a directory of its own.
+    link::make(&by_admin(&dir.0)).expect("make the junction as this elevated process");
 
-    // The unelevated process of this account makes the other: `mklink /J` needs no privilege.
+    // The unelevated process of this account makes the other with the same maker, as the probe `verify`
+    // runs under the unelevated token does. The probe reads its stdin to the end, which closing it gives.
     let token = UnelevatedToken::of_this_process().expect("make the unelevated token");
     let line = format!(
-        "cmd.exe /C mklink /J \"{}\" \"{}\"",
-        by_unelevated(&dir.0).display(),
-        target.display()
+        "\"{}\" verify-probe --make-junction \"{}\"",
+        env!("CARGO_BIN_EXE_ssh-broker"),
+        by_unelevated(&dir.0).display()
     );
-    let child = ExecChild::spawn(&line, None, Some(&token)).expect("start the unelevated mklink");
+    let mut child = ExecChild::spawn(&line, None, Some(&token)).expect("start the unelevated probe");
+    drop(child.take_stdin_write());
     let (out, err) = (
         drain::drain(child.stdout_read_raw()),
         drain::drain(child.stderr_read_raw()),
     );
-    let code = child.wait();
+    child.wait().expect("wait for the unelevated probe");
     let said = format!("{}{}", drain::text_of(out), drain::text_of(err));
-    assert_eq!(code.unwrap(), 0, "the unelevated mklink said:\n{said}");
     assert!(
-        std::fs::symlink_metadata(by_unelevated(&dir.0)).is_ok(),
-        "control: the unelevated junction exists"
+        said.contains("symlink=ok"),
+        "the unelevated probe made and read its own junction:\n{said}"
     );
 
     let exe = std::env::current_exe().unwrap();
@@ -104,7 +101,7 @@ fn an_elevated_junction_is_followed_and_an_unelevated_one_is_refused_under_redir
     );
     assert_eq!(
         child_entry::result(&dir.0),
-        format!("by_admin=followed\nby_unelevated=refused {UNTRUSTED_MOUNT_POINT}\n"),
+        "by_admin=Ok\nby_unelevated=Blocked\n",
         "the reader said:\n{said}"
     );
 }
@@ -127,20 +124,13 @@ fn a_process_that_enforces_redirection_trust_reads_through_two_junctions() {
     }
     .expect("enforce redirection trust on this process");
 
-    let read = |link: PathBuf| match std::fs::read(link.join(FILE)) {
-        Ok(content) if content == b"parity" => "followed".to_owned(),
-        Ok(content) => format!("read {content:?}"),
-        Err(e) => format!(
-            "refused {}",
-            e.raw_os_error().map_or("none".to_owned(), |code| code.to_string())
-        ),
-    };
+    // The product's own reader: `Blocked` is error 448, `Ok` a followed junction.
     child_entry::write_result(
         &dir,
         &format!(
-            "by_admin={}\nby_unelevated={}\n",
-            read(by_admin(&dir)),
-            read(by_unelevated(&dir))
+            "by_admin={:?}\nby_unelevated={:?}\n",
+            link::follow(&by_admin(&dir)),
+            link::follow(&by_unelevated(&dir))
         ),
     );
 }

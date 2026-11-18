@@ -72,7 +72,7 @@ fn the_probe_handshake_is_direct() {
     let hs = probe_handshake(
         std::path::Path::new(r"C:\Program Files\ssh-broker\ssh-broker.exe"),
         crate::protocol::Privilege::Account,
-        &ProbeLink::Own,
+        &ProbeLink::NoJunction,
     );
     assert_eq!(
         hs.launch,
@@ -93,7 +93,10 @@ fn the_probe_handshake_carries_the_privilege_it_asks_for() {
     use crate::protocol::Privilege;
     let exe = std::path::Path::new(r"C:\Program Files\ssh-broker\ssh-broker.exe");
     for privilege in [Privilege::Account, Privilege::Unelevated] {
-        assert_eq!(probe_handshake(exe, privilege, &ProbeLink::Own).privilege, privilege);
+        assert_eq!(
+            probe_handshake(exe, privilege, &ProbeLink::NoJunction).privilege,
+            privilege
+        );
     }
 }
 
@@ -106,7 +109,7 @@ fn the_probe_handshake_names_the_junction_work() {
     let command = |link: &ProbeLink| probe_handshake(exe, Privilege::Account, link).command.unwrap();
     let base = r#""C:\Program Files\ssh-broker\ssh-broker.exe" verify-probe"#;
 
-    assert_eq!(command(&ProbeLink::Own), base);
+    assert_eq!(command(&ProbeLink::NoJunction), base);
     let dir = r"C:\Users\example user\AppData\Local\Temp\sb-junction-9-1";
     assert_eq!(
         command(&ProbeLink::Make(dir.into())),

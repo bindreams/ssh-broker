@@ -111,7 +111,7 @@ pub fn probe_handshake(
     use crate::route::ProbeLink;
     let command = format!("\"{}\" verify-probe", exe.display());
     let command = match link {
-        ProbeLink::Own => command,
+        ProbeLink::NoJunction => command,
         ProbeLink::Make(dir) => format!("{command} --make-junction \"{dir}\""),
         ProbeLink::Follow(dir) => format!("{command} --follow \"{dir}\""),
     };
@@ -599,7 +599,9 @@ mod imp {
         // and this child is the wrong place to judge it — exiting non-zero would report a
         // transport fault as a parity failure, and the parent could not tell the two apart. It
         // rides up in the PROBE line instead, where `verify` gates it as a row of its own.
-        let pass = probe::is_genuine_session(sid, logon_type) && dpapi && !symlink.is_failure();
+        let pass = probe::is_genuine_session(sid, logon_type)
+            && dpapi
+            && !symlink.is_some_and(probe::SymlinkState::is_failure);
         if !pass {
             std::process::exit(1);
         }

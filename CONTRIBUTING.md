@@ -69,8 +69,7 @@ locks and `logs` are born labelled, and a process of the account below High can 
 delete, rename or create beside the socket whatever the DACL says. `acl::verify_dir_acl` and
 `acl::verify_file_acl` take the location's `Integrity` and for `High` require exactly that label as
 part of "exactly private"; a folder without it is refused with the words of every other refusal and
-is never labelled afterwards. An account that joins or leaves Administrators moves to the other
-folder, each of which is created right and never repaired. `tests/user_isolation_windows.rs` pins
+is never labelled afterwards. `tests/user_isolation_windows.rs` pins
 what a process below High is refused, and `tests/redirection_guard_windows.rs` pins the premise of
 `verify`'s junction row (see the next section).
 
@@ -164,22 +163,23 @@ made itself, so a row that read through a link the probe made as an elevated pro
 not the mitigation is on. For an agent at High integrity `verify` therefore runs two probes through it
 (`provision::probe_run`): first `verify-probe --make-junction <directory>` with `Privilege::Unelevated`, which
 makes that directory with a junction in it by a token below High, then `verify-probe --follow <directory>` as
-the account, which reads through it. `verify` names the directory itself, under its own temp directory with a
-name unique to the run, before any probe runs, and removes it, through no link, whatever became of either
-probe: no probe reports a path, because a path a process below High wrote is not one an elevated `verify`
+the account, which reads through it. `verify` names the directory of every junction itself, under its own temp directory with a
+name unique to the run, before any probe runs, and removes it, through no link, whatever became of the
+probes: no probe reports a path, because a path a process below High wrote is not one an elevated `verify`
 acts on. The make-probe fails on a path that exists and never clears one. Each probe's outcome is a value
 (`session_rows::ProbeOutcome`: answered, failed, timed out, not run) and `probe_run::run_at` returns them
 all, so the rows are a pure function of what it found. A probe that fails is data, not an early return: the
-default probe still runs (with a junction of its own, which proves nothing and is not judged), so only the
-rows about the failed probe fail; a first probe that times out starts no second, and `verify` says that it
-may still create the directory. A junction counts as made from below High only when the make-probe reports an
-integrity below High and made the junction; otherwise the junction row fails with why. A junction needs no
-privilege, but it needs a volume that holds reparse points: where the directory was made and the volume
-refused the reparse point the state is `SymlinkState::Skipped`, which fails nothing and says on the row that
-it was not tested and why; a directory that could not be made at all is `NotMade`, a junction refused with
-error 448 is `Blocked`, and one that was made and not read is `Failed`, and all three fail. The probe's
-stderr lines about the junction (`probe::JUNCTION_SAID`) reach the row. For an agent below High there is one probe, which makes and follows
-its own. The probe's PROBE line also carries its own `elevation` and `integrity` (read by
+default probe still runs (given no junction), so only the rows about the failed probe fail. A junction
+counts as made from below High only when the make-probe reports an integrity below High and a junction
+that was made; otherwise the junction row fails with why, and a probe that reported no outcome is never read
+as one that made a junction. A junction needs no privilege, but it needs a volume that holds reparse points,
+which `link::make` asks the volume once the directory is made: a volume that holds none is
+`SymlinkState::Skipped`, which fails nothing and says on the row that it was not tested; on a volume that
+holds them every later failure is `NotMade` with its cause, a junction refused with error 448 is `Blocked`,
+and one that was made and not read is `Failed`, and all three fail. The stderr lines of a probe about its
+junction and about its own token (`probe::JUNCTION_SAID`, `probe::TOKEN_SAID`) reach the rows they explain.
+For an agent below High there is one probe, which makes and follows the junction in the directory it is
+given. The probe's PROBE line also carries its own `elevation` and `integrity` (read by
 `account::elevation_of` and `integrity_of`), which the `elevated session` and `unelevated session on request`
 rows judge. The two probes and the two rows are keyed on the agent being at High (the level of the process
 that runs `verify`, which is the level of the folder it asks; the default probe's own level for the rows),

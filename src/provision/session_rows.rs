@@ -15,13 +15,14 @@ use super::report::Check;
 const APPLY_HINT: &str = "usually an installed exe older than this check: re-run `apply`";
 
 /// A probe that ran and whose PROBE line was read: the line, whether its binary payload survived, and what
-/// it said about its junction on stderr ([`super::probe::junction_notes`]).
+/// it said on stderr about its junction and about its own token ([`super::probe::notes`]).
 #[derive(Debug, Clone)]
 pub struct Answer {
     pub result: ProbeResult,
     /// Whether the payload the child sent downstream arrived byte for byte.
     pub binary_ok: bool,
-    pub said: String,
+    pub junction_said: String,
+    pub token_said: String,
 }
 
 /// What became of one probe `verify` asked the agent for.
@@ -38,11 +39,11 @@ pub enum ProbeOutcome {
 }
 
 impl ProbeOutcome {
-    /// Why the probe did not answer, or `None` for one that did.
-    pub fn cause(&self) -> Option<&str> {
+    /// What the probe said, or why it did not answer.
+    pub fn answer(&self) -> Result<&Answer, &str> {
         match self {
-            ProbeOutcome::Answered(_) => None,
-            ProbeOutcome::Failed(cause) | ProbeOutcome::TimedOut(cause) | ProbeOutcome::NotRun(cause) => Some(cause),
+            ProbeOutcome::Answered(answer) => Ok(answer),
+            ProbeOutcome::Failed(cause) | ProbeOutcome::TimedOut(cause) | ProbeOutcome::NotRun(cause) => Err(cause),
         }
     }
 }
@@ -65,26 +66,43 @@ pub struct Probes {
 #[derive(Debug)]
 pub enum Junction {
     /// The default probe read through a junction, which for an agent at High one below High made: the
-    /// outcome, and what the probes said about it (empty when there is nothing to say).
-    Read { state: SymlinkState, note: String },
+    /// outcome (`None` for a probe that reported none), and what the probes said about it (empty when there
+    /// is nothing to say).
+    Read { state: Option<SymlinkState>, note: String },
     /// There was no junction from below High to read, so nothing about it could be tested: why, and what
     /// the probes said.
     Unavailable { cause: String, note: String },
 }
 
+impl Junction {
+    /// What `verify` knows of the junction beyond a default probe's own failure `cause`: its own cause,
+    /// when it is another, and what the probes said.
+    fn said_beyond(&self, cause: &str) -> String {
+        let (own_cause, note) = match self {
+            Junction::Read { note, .. } => ("", note),
+            Junction::Unavailable { cause, note } => (cause.as_str(), note),
+        };
+        [if own_cause == cause { "" } else { own_cause }, note]
+            .into_iter()
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+}
+
 /// Every row the probes give, in the order `verify` shows them. `active_console` is the id of the
 /// physical console's session, which the session row names.
 ///
-/// A default probe that did not answer is the one row `parity probe (via agent)`, with the cause; the
-/// unelevated probe's row, which does not depend on it, and the directory left behind are shown still.
+/// A default probe that did not answer is the one row `parity probe (via agent)`, with the cause and what
+/// the junction found; the unelevated probe's row, which does not depend on it, and the directory left
+/// behind are shown still.
 pub fn parity_rows(probes: &Probes, active_console: u32) -> Vec<Check> {
     let mut rows = Vec::new();
-    match &probes.default {
-        ProbeOutcome::Answered(answer) => {
+    match probes.default.answer() {
+        Ok(answer) => {
             let p = &answer.result;
-            // Parity = escaped session 0 (the limited network-logon session). The agent need not be in THE
-            // active-console session — a box can have several interactive sessions — and DPAPI and the
-            // junction confirm it is a genuine one.
+            // Parity = escaped session 0. The agent need not be in the active-console session (a box can
+            // have several); DPAPI and the junction confirm it is a genuine one.
             rows.push(Check::new(
                 "interactive session (via agent)",
                 is_genuine_session(p.session_id, p.logon_type),
@@ -95,7 +113,7 @@ pub fn parity_rows(probes: &Probes, active_console: u32) -> Vec<Check> {
                 ),
             ));
             rows.push(Check::new("DPAPI (via agent)", p.dpapi_ok, String::new()));
-            rows.extend(session_rows(p, probes.unelevated.as_ref()));
+            rows.extend(session_rows(answer, probes.unelevated.as_ref()));
             rows.push(link_row(&probes.junction));
             // Byte-transparency on the real path, in BOTH directions: "the relay carries arbitrary bytes
             // unchanged" is what makes scp and sftp work at all, and these rows hold that claim honest end
@@ -110,21 +128,25 @@ pub fn parity_rows(probes: &Probes, active_console: u32) -> Vec<Check> {
                     "the payload the child sent did not survive the relay byte for byte".into()
                 },
             ));
-            // `detail()` distinguishes "the child reported a mismatch" from "the child never reported at
-            // all" (an installed exe older than this check). Both FAIL — default-deny — but they have
-            // different remedies, and claiming the payload was mangled when nothing ever looked at it
-            // would be a diagnosis the code cannot support.
+            // Both fail (default-deny) but with different remedies: a mismatch vs a probe too old to check
+            // at all; do not claim the payload was mangled when nothing looked.
             rows.push(Check::new(
                 "binary upload (via agent)",
                 p.upstream.proven(),
                 p.upstream.detail(),
             ));
         }
-        unanswered => {
+        Err(cause) => {
+            let said = probes.junction.said_beyond(cause);
+            let detail = format!("unavailable: {cause}");
             rows.push(Check::new(
                 "parity probe (via agent)",
                 false,
-                format!("unavailable: {}", unanswered.cause().unwrap_or_default()),
+                if said.is_empty() {
+                    detail
+                } else {
+                    format!("{detail} (junction: {said})")
+                },
             ));
             if let Some(unelevated) = &probes.unelevated {
                 rows.push(unelevated_row(Some(unelevated)));
@@ -142,20 +164,16 @@ pub fn parity_rows(probes: &Probes, active_console: u32) -> Vec<Check> {
 /// (`unelevated`).
 ///
 /// The level that decides the rows is worked out once, here: an agent at High has two rows, and one below
-/// it has one. The first of the two passes when the session is at High with Administrators enabled (an
-/// administrator's agent is elevated or absent) or not there (an account Windows does not split). The
-/// second passes when the session that asked for less is at Medium with Administrators not enabled:
-/// `Filtered` for an administrator, `Standard` for an account that is not one. The one row below High
-/// passes for a standard account; an administrator's agent below High is not elevated, and the one row
-/// says so.
-pub fn session_rows(default: &ProbeResult, unelevated: Option<&ProbeOutcome>) -> Vec<Check> {
-    let token_level = default.integrity.map(integrity_class);
+/// it has one. The one row below High passes for a standard account; an administrator's agent below High
+/// is not elevated, and the one row says so.
+pub fn session_rows(default: &Answer, unelevated: Option<&ProbeOutcome>) -> Vec<Check> {
+    let token_level = default.result.integrity.map(integrity_class);
     // A probe that asked for an unelevated session was run because the agent is at High, whatever the
     // default probe says of itself: its outcome is judged, never thrown away.
     let at_high = unelevated.is_some() || token_level == Some(Integrity::High);
     if at_high {
         vec![elevated_row(default, token_level), unelevated_row(unelevated)]
-    } else if default.elevation == Some(Elevation::Standard) {
+    } else if default.result.elevation == Some(Elevation::Standard) {
         vec![Check::new(
             "session privilege",
             true,
@@ -167,26 +185,27 @@ pub fn session_rows(default: &ProbeResult, unelevated: Option<&ProbeOutcome>) ->
     }
 }
 
-/// `elevated session`: `token_level` is the class of the default probe's own integrity, which is what the
-/// row judges.
-fn elevated_row(default: &ProbeResult, token_level: Option<Integrity>) -> Check {
+/// What a row says of a probe that did not report `what` about its token: its own words when it said
+/// any, and otherwise the likeliest reason.
+fn not_reported(what: &str, token_said: &str) -> String {
+    if token_said.is_empty() {
+        format!("the probe did not report {what} ({APPLY_HINT})")
+    } else {
+        format!("the probe did not report {what}: {token_said}")
+    }
+}
+
+/// `elevated session`: passes when the default probe's session is at High with Administrators enabled (an
+/// administrator's agent is elevated or absent) or not there (an account Windows does not split).
+/// `token_level` is the class of the default probe's own integrity, which is what the row judges.
+fn elevated_row(default: &Answer, token_level: Option<Integrity>) -> Check {
     const NAME: &str = "elevated session";
+    let said = default.token_said.as_str();
+    let default = &default.result;
     match (default.elevation, default.integrity) {
-        (None, None) => Check::new(
-            NAME,
-            false,
-            format!("the probe did not report its token or its level ({APPLY_HINT})"),
-        ),
-        (Some(_), None) => Check::new(
-            NAME,
-            false,
-            format!("the probe did not report its level ({APPLY_HINT})"),
-        ),
-        (None, Some(_)) => Check::new(
-            NAME,
-            false,
-            format!("the probe did not report its token ({APPLY_HINT})"),
-        ),
+        (None, None) => Check::new(NAME, false, not_reported("its token or its level", said)),
+        (Some(_), None) => Check::new(NAME, false, not_reported("its level", said)),
+        (None, Some(_)) => Check::new(NAME, false, not_reported("its token", said)),
         (Some(elevation @ (Elevation::Full | Elevation::Standard)), integrity)
             if token_level == Some(Integrity::High) =>
         {
@@ -226,9 +245,11 @@ fn elevated_row(default: &ProbeResult, token_level: Option<Integrity>) -> Check 
     }
 }
 
+/// `unelevated session on request`: passes when the session that asked for less is at Medium with
+/// Administrators not enabled: `Filtered` for an administrator, `Standard` for an account that is not one.
 fn unelevated_row(unelevated: Option<&ProbeOutcome>) -> Check {
     const NAME: &str = "unelevated session on request";
-    let asked = match unelevated {
+    let (asked, said) = match unelevated {
         None => return Check::new(NAME, false, "the probe that asks for an unelevated session was not run"),
         Some(ProbeOutcome::Failed(cause)) => {
             return Check::new(
@@ -251,7 +272,7 @@ fn unelevated_row(unelevated: Option<&ProbeOutcome>) -> Check {
                 format!("the probe that asks for an unelevated session was not run: {cause}"),
             );
         }
-        Some(ProbeOutcome::Answered(answer)) => &answer.result,
+        Some(ProbeOutcome::Answered(answer)) => (&answer.result, answer.token_said.as_str()),
     };
     match (asked.elevation, asked.integrity) {
         (Some(elevation @ (Elevation::Filtered | Elevation::Standard)), Some(INTEGRITY_MEDIUM)) => Check::new(
@@ -276,23 +297,29 @@ fn unelevated_row(unelevated: Option<&ProbeOutcome>) -> Check {
                 level(asked.integrity)
             ),
         ),
-        (None, None) => Check::new(
-            NAME,
-            false,
-            format!("the probe did not report its token ({APPLY_HINT})"),
-        ),
+        (None, None) => Check::new(NAME, false, not_reported("its token", said)),
     }
 }
 
 /// `junction (via agent)`: a junction that a token below High made is followed by the session. A followed
 /// one passes; a refusal means RedirectionGuard is on in the agent's session; one that was made and not
-/// read, or that could not be made for a reason of the directory's, fails. One that a volume refused to make
-/// was not tested, which fails nothing and says so. So does having no junction from below High to read:
-/// that fails, with why. What the probes said is on the row.
+/// read, one that could not be made, and a probe that reported no outcome fail. A volume that holds no
+/// junctions was not tested, which fails nothing and says so. Having no junction from below High to read
+/// fails, with why. What the probes said is on the row.
 pub fn link_row(junction: &Junction) -> Check {
     const NAME: &str = "junction (via agent)";
     let (state, note) = match junction {
-        Junction::Read { state, note } => (*state, note.as_str()),
+        Junction::Read {
+            state: Some(state),
+            note,
+        } => (*state, note.as_str()),
+        Junction::Read { state: None, note } => {
+            return Check::new(
+                NAME,
+                false,
+                with_note(&format!("the probe did not report its junction ({APPLY_HINT})"), note),
+            );
+        }
         Junction::Unavailable { cause, note } => {
             return Check::new(
                 NAME,
@@ -320,7 +347,7 @@ pub fn link_row(junction: &Junction) -> Check {
             format!(
                 "NOT tested: {}",
                 if note.is_empty() {
-                    "the volume would not make a junction"
+                    "this volume holds no junctions"
                 } else {
                     note
                 }

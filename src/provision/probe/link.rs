@@ -4,10 +4,8 @@
 //! something only when a token below High made it and the token under test follows it. A junction
 //! needs no privilege, unlike a symbolic link, so the row is never untestable for want of one.
 //!
-//! `verify` names a directory ([`unique_dir`]); a probe makes it, with the junction in it ([`make`]); the
-//! probe that tests the session reads through it ([`follow`]); `verify` removes it ([`remove`]). No probe
-//! tells `verify` a path. The directory holds the junction, the folder it points at and the file read
-//! through it, so removing the directory removes all three.
+//! A directory holds the junction, the folder it points at and the file read through it, so removing the
+//! directory removes all three. Who names it and removes it is in `provision::probe_run`.
 
 use std::io;
 use std::os::windows::ffi::OsStrExt;
@@ -18,10 +16,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use windows::Win32::Foundation::HANDLE;
-use windows::Win32::Storage::FileSystem::{FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT};
+use windows::Win32::Storage::FileSystem::{
+    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, GetVolumeInformationByHandleW,
+};
 use windows::Win32::System::IO::DeviceIoControl;
 use windows::Win32::System::Ioctl::FSCTL_SET_REPARSE_POINT;
-use windows::Win32::System::SystemServices::IO_REPARSE_TAG_MOUNT_POINT;
+use windows::Win32::System::SystemServices::{FILE_SUPPORTS_REPARSE_POINTS, IO_REPARSE_TAG_MOUNT_POINT};
 
 use super::{JUNCTION_SAID, SymlinkState};
 use crate::route::ProbeLink;
@@ -37,7 +37,7 @@ const FILE_CONTENT: &[u8] = b"parity";
 const UNTRUSTED_MOUNT_POINT: i32 = 448;
 
 /// A directory under `parent` for one run's junction, with a name no other run has: the process id, the
-/// time and a count, so neither a process with the same id nor two calls of one meet a name in use.
+/// time and a count.
 pub fn unique_dir(parent: &Path) -> PathBuf {
     static COUNT: AtomicU64 = AtomicU64::new(0);
     let nanos = SystemTime::now()
@@ -50,40 +50,45 @@ pub fn unique_dir(parent: &Path) -> PathBuf {
     ))
 }
 
-/// Where [`make`] failed, which decides what the failure means: the junction was never there to test, or
-/// the volume would not hold it.
+/// Where [`make`] failed, which decides what the failure means: the volume holds no junctions, or the
+/// junction could not be made on one that does.
 #[derive(Debug)]
 pub enum MakeError {
-    /// The directory, or the folder, file or link directory in it, could not be made, or the junction's
-    /// target could not be told to the volume: a fault ([`SymlinkState::NotMade`]).
-    Directory(io::Error),
-    /// The directory was made and the volume refused to make a junction of it: the volume cannot hold one,
-    /// so it was not tested ([`SymlinkState::Skipped`]).
-    ReparsePoint(io::Error),
+    /// The volume says it holds no reparse points, so no junction was tried: it was not tested
+    /// ([`SymlinkState::Skipped`]).
+    NoJunctions,
+    /// Anything else that went wrong, on a volume that holds junctions or when it could not be asked: a
+    /// fault ([`SymlinkState::NotMade`]).
+    NotMade(io::Error),
 }
 
 impl MakeError {
     pub fn state(&self) -> SymlinkState {
         match self {
-            MakeError::Directory(_) => SymlinkState::NotMade,
-            MakeError::ReparsePoint(_) => SymlinkState::Skipped,
+            MakeError::NoJunctions => SymlinkState::Skipped,
+            MakeError::NotMade(_) => SymlinkState::NotMade,
         }
     }
 
     /// What the probe says about it, for the row.
     pub fn said(&self, dir: &Path) -> String {
         match self {
-            MakeError::Directory(e) => format!("making the directory {} for a junction failed: {e}", dir.display()),
-            MakeError::ReparsePoint(e) => format!("the volume of {} refused to make a junction: {e}", dir.display()),
+            MakeError::NoJunctions => format!("the volume of {} holds no junctions", dir.display()),
+            MakeError::NotMade(e) => format!("making a junction in {} failed: {e}", dir.display()),
         }
     }
 }
 
 /// Make `dir`, which must not exist, with the folder, the file and the junction in it. A path that
-/// exists is an error and is left as it is. A directory this made and could not finish is removed again,
-/// and one that cannot be removed is said on stderr.
+/// exists is an error and is left as it is.
 pub fn make(dir: &Path) -> Result<(), MakeError> {
-    std::fs::create_dir(dir).map_err(MakeError::Directory)?;
+    std::fs::create_dir(dir).map_err(MakeError::NotMade)?;
+    complete(dir)
+}
+
+/// Finish the directory [`make`] created. One that cannot be finished is removed again, and one that
+/// cannot be removed is said on stderr.
+fn complete(dir: &Path) -> Result<(), MakeError> {
     make_in(dir).inspect_err(|_| {
         if let Err(e) = remove(dir) {
             eprintln!(
@@ -95,39 +100,32 @@ pub fn make(dir: &Path) -> Result<(), MakeError> {
 }
 
 fn make_in(dir: &Path) -> Result<(), MakeError> {
-    let directory = MakeError::Directory;
+    let not_made = MakeError::NotMade;
     let target = dir.join(TARGET_NAME);
-    std::fs::create_dir(&target).map_err(directory)?;
-    std::fs::write(target.join(FILE_NAME), FILE_CONTENT).map_err(directory)?;
+    std::fs::create_dir(&target).map_err(not_made)?;
+    std::fs::write(target.join(FILE_NAME), FILE_CONTENT).map_err(not_made)?;
     let link = dir.join(LINK_NAME);
-    std::fs::create_dir(&link).map_err(directory)?;
-    let buffer = mount_point_buffer(&std::path::absolute(&target).map_err(directory)?).map_err(directory)?;
-    let handle = open_directory(&link).map_err(directory)?;
-    set_reparse_point(&handle, &buffer).map_err(MakeError::ReparsePoint)
+    std::fs::create_dir(&link).map_err(not_made)?;
+    let handle = open_directory(&link).map_err(not_made)?;
+    // The one question to the volume: what it says it cannot hold is not tested, and every failure after
+    // it is a fault.
+    if !holds_reparse_points(volume_flags(&handle).map_err(not_made)?) {
+        return Err(MakeError::NoJunctions);
+    }
+    let buffer = mount_point_buffer(&std::path::absolute(&target).map_err(not_made)?).map_err(not_made)?;
+    set_reparse_point(&handle, &buffer).map_err(not_made)
 }
 
 /// What a probe does about the junction of the link row ([`ProbeLink`]): the outcome of reading through
-/// it. A directory that could not be made is [`SymlinkState::NotMade`]; one the volume would not make a
-/// junction of was not tested ([`SymlinkState::Skipped`]). Whatever it could not do is on stderr, each
-/// line after [`JUNCTION_SAID`], for `verify` to show.
-pub fn run(link: &ProbeLink) -> SymlinkState {
-    run_in(link, &std::env::temp_dir())
-}
-
-fn run_in(link: &ProbeLink, temp: &Path) -> SymlinkState {
+/// it, or `None` for a probe that was given no junction to make or follow. A directory that could not be
+/// made is [`SymlinkState::NotMade`]; a volume that holds no junctions was not tested
+/// ([`SymlinkState::Skipped`]). Whatever it could not do is on stderr, each line after [`JUNCTION_SAID`],
+/// for `verify` to show.
+pub fn run(link: &ProbeLink) -> Option<SymlinkState> {
     match link {
-        ProbeLink::Follow(dir) => follow(Path::new(dir)),
-        ProbeLink::Make(dir) => made_and_followed(Path::new(dir)),
-        ProbeLink::Own => {
-            let dir = unique_dir(temp);
-            let state = made_and_followed(&dir);
-            if state.was_made()
-                && let Err(e) = remove(&dir)
-            {
-                eprintln!("{JUNCTION_SAID}removing {} failed: {e}", dir.display());
-            }
-            state
-        }
+        ProbeLink::NoJunction => None,
+        ProbeLink::Follow(dir) => Some(follow(Path::new(dir))),
+        ProbeLink::Make(dir) => Some(made_and_followed(Path::new(dir))),
     }
 }
 
@@ -146,15 +144,25 @@ fn made_and_followed(dir: &Path) -> SymlinkState {
 /// but RedirectionGuard's refusal is [`SymlinkState::Failed`], with its cause on stderr.
 pub fn follow(dir: &Path) -> SymlinkState {
     let read = std::fs::read(dir.join(LINK_NAME).join(FILE_NAME));
-    if let Err(e) = &read
-        && e.raw_os_error() != Some(UNTRUSTED_MOUNT_POINT)
-    {
-        eprintln!(
-            "{JUNCTION_SAID}reading through the junction in {} failed: {e}",
-            dir.display()
-        );
+    if let Some(note) = read_note(dir, &read) {
+        eprintln!("{JUNCTION_SAID}{note}");
     }
     state_of_read(read)
+}
+
+/// What to say of a read through the junction in `dir`: nothing for a followed one or RedirectionGuard's
+/// refusal, which is an outcome of its own, and why for any other.
+fn read_note(dir: &Path, read: &io::Result<Vec<u8>>) -> Option<String> {
+    match read {
+        Ok(content) if content == FILE_CONTENT => None,
+        Ok(_) => Some(format!(
+            "reading through the junction in {} gave content that differs from the {:?} that was written",
+            dir.display(),
+            String::from_utf8_lossy(FILE_CONTENT)
+        )),
+        Err(e) if e.raw_os_error() == Some(UNTRUSTED_MOUNT_POINT) => None,
+        Err(e) => Some(format!("reading through the junction in {} failed: {e}", dir.display())),
+    }
 }
 
 /// What a read through the junction says: the file's content is the probe's, or the read was refused as
@@ -184,8 +192,21 @@ fn open_directory(link: &Path) -> io::Result<std::fs::File> {
         .open(link)
 }
 
-/// Make the empty directory `handle` is open on a junction, with `buffer` from [`mount_point_buffer`]:
-/// the one step that the volume can refuse.
+/// The file system flags of the volume `handle` is open on.
+fn volume_flags(handle: &std::fs::File) -> io::Result<u32> {
+    let mut flags = 0u32;
+    // SAFETY: `handle` is an open directory; `flags` is a live `u32` and the other outputs are not asked for.
+    unsafe { GetVolumeInformationByHandleW(HANDLE(handle.as_raw_handle()), None, None, None, Some(&mut flags), None) }
+        .map_err(io::Error::from)?;
+    Ok(flags)
+}
+
+/// Whether a volume with these file system flags holds reparse points, and so junctions.
+fn holds_reparse_points(flags: u32) -> bool {
+    flags & FILE_SUPPORTS_REPARSE_POINTS != 0
+}
+
+/// Make the empty directory `handle` is open on a junction, with `buffer` from [`mount_point_buffer`].
 fn set_reparse_point(handle: &std::fs::File, buffer: &[u8]) -> io::Result<()> {
     let length = u32::try_from(buffer.len()).map_err(|_| io::Error::other("the junction's target path is too long"))?;
     // With no `OVERLAPPED` the call needs somewhere to put the byte count, though there is no output.
@@ -207,19 +228,30 @@ fn set_reparse_point(handle: &std::fs::File, buffer: &[u8]) -> io::Result<()> {
     .map_err(io::Error::from)
 }
 
+/// How each form of a path starts and what the kernel's name for it starts with, in the order they are
+/// tried: the longer form of a prefix before the shorter, a UNC share (`\\server\share`) before a drive path,
+/// which is what is left.
+const KERNEL_PREFIXES: [(&str, &str); 6] = [
+    (r"\\?\UNC\", r"\??\UNC\"),
+    (r"\\.\UNC\", r"\??\UNC\"),
+    (r"\\?\", r"\??\"),
+    (r"\\.\", r"\??\"),
+    (r"\\", r"\??\UNC\"),
+    ("", r"\??\"),
+];
+
 /// The `REPARSE_DATA_BUFFER` of a mount point to `target`: the header, the substitute name
 /// (`\??\C:\target`, the form the kernel follows) and the print name, each followed by a NUL.
 fn mount_point_buffer(target: &Path) -> io::Result<Vec<u8>> {
     let print: Vec<u16> = target.as_os_str().encode_wide().collect();
     let utf16 = |text: &str| text.encode_utf16().collect::<Vec<u16>>();
-    let joined = |prefix: &str, rest: &[u16]| [utf16(prefix).as_slice(), rest].concat();
-    let substitute = if let Some(rest) = print.strip_prefix(utf16(r"\\?\").as_slice()) {
-        joined(r"\??\", rest)
-    } else if let Some(rest) = print.strip_prefix(utf16(r"\\").as_slice()) {
-        joined(r"\??\UNC\", rest)
-    } else {
-        joined(r"\??\", &print)
-    };
+    let substitute = KERNEL_PREFIXES
+        .iter()
+        .find_map(|(prefix, kernel)| {
+            let rest = print.strip_prefix(utf16(prefix).as_slice())?;
+            Some([utf16(kernel).as_slice(), rest].concat())
+        })
+        .expect("the last prefix is empty and matches any path");
     let names = |wide: &[u16]| {
         wide.iter()
             .flat_map(|unit| unit.to_le_bytes())

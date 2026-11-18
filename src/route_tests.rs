@@ -171,7 +171,7 @@ fn apply_and_verify_verbs() {
     assert_eq!(route_line("ssh-broker.exe verify"), Route::Verify);
     assert_eq!(
         route_line("ssh-broker.exe verify-probe"),
-        Route::VerifyProbe(ProbeLink::Own)
+        Route::VerifyProbe(ProbeLink::NoJunction)
     );
 }
 

@@ -4,6 +4,12 @@
 //! The probes run in the agent's session (see [`super::probe`]); this is the parent's side, which
 //! connects to the agent, sends the handshake and reads the PROBE line back. What it found, whatever
 //! became of each probe, is a [`Probes`] for [`super::session_rows`] to turn into rows.
+//!
+//! The directory of the junction is named here, under this process's temp directory, before any probe
+//! runs, and no probe names one back, so a path a process below High wrote is never one `verify` acts on.
+//! It is removed here, through no link, whatever became of the probes: one that did not answer may still
+//! create it, and a note says so. A directory left in the temp folder does not make the installation
+//! wrong, so the `junction directory` row it gives passes.
 
 use std::path::Path;
 use std::time::Duration;
@@ -30,10 +36,7 @@ type Drive<'a> = &'a dyn Fn(Privilege, ProbeLink) -> ProbeOutcome;
 /// privilege, which makes a junction that a token below High made, and then as the account, which follows
 /// it. RedirectionGuard refuses only a link a non-administrator made, so a junction the elevated probe
 /// made itself would be followed always and prove nothing. Any other agent is probed once, and its
-/// probe makes and follows a junction of its own.
-///
-/// The directory of the junction is named here, under this process's temp directory, before any probe
-/// runs, and no probe names one back. It is removed here whatever became of the probes.
+/// probe makes and follows a junction.
 ///
 /// Each probe is bounded by `timeout` ([`super::bounded`]), so an agent at High takes up to twice it, except
 /// that a first probe that does not answer is not followed by a second.
@@ -47,44 +50,53 @@ pub fn run(exe: &Path, timeout: Option<Duration>) -> anyhow::Result<Probes> {
 /// [`run`] for an agent at `integrity`, with `temp` as the place to name a directory in and `drive` to
 /// run a probe. It has an answer for every outcome of every probe: nothing in it returns early.
 fn run_at(integrity: Integrity, temp: &Path, drive: Drive) -> Probes {
-    match integrity {
-        Integrity::Medium => {
-            let default = drive(Privilege::Account, ProbeLink::Own);
-            let junction = match &default {
-                ProbeOutcome::Answered(own) => Junction::Read {
-                    state: own.result.symlink,
-                    note: own.said.clone(),
-                },
-                unanswered => no_junction(unanswered, String::new()),
-            };
-            Probes {
-                unelevated: None,
-                default,
-                junction,
-                leftover: None,
-            }
-        }
-        Integrity::High => run_at_high(temp, drive),
+    let dir = probe::link::unique_dir(temp);
+    let mut probes = match integrity {
+        Integrity::Medium => run_at_medium(&dir, drive),
+        Integrity::High => run_at_high(&dir, drive),
+    };
+    probes.leftover = leftover(&dir, dir.to_str().is_some(), maker(&probes));
+    probes
+}
+
+/// The probe of an agent below High: it makes the junction in `dir` and follows it.
+fn run_at_medium(dir: &Path, drive: Drive) -> Probes {
+    let default = drive(Privilege::Account, make_link(dir));
+    let note = said(&default).to_owned();
+    let junction = match (dir.to_str(), default.answer()) {
+        (None, _) => Junction::Unavailable {
+            cause: not_text(dir),
+            note,
+        },
+        (Some(_), Ok(own)) => Junction::Read {
+            state: own.result.symlink,
+            note,
+        },
+        (Some(_), Err(cause)) => Junction::Unavailable {
+            cause: cause.to_string(),
+            note,
+        },
+    };
+    Probes {
+        unelevated: None,
+        default,
+        junction,
+        leftover: None,
     }
 }
 
-/// The two probes of an agent at High, in order. The directory is named, the unelevated probe makes the
-/// junction in it, the default probe follows it, and the directory is removed.
-fn run_at_high(temp: &Path, drive: Drive) -> Probes {
-    let dir = probe::link::unique_dir(temp);
-    let text = dir.to_str();
-    let unelevated = drive(
-        Privilege::Unelevated,
-        text.map_or(ProbeLink::Own, |text| ProbeLink::Make(text.to_owned())),
-    );
-    let source = source_of(&dir, text, &unelevated);
+/// The two probes of an agent at High, in order: the unelevated probe makes the junction in `dir`, and
+/// the default probe follows it.
+fn run_at_high(dir: &Path, drive: Drive) -> Probes {
+    let unelevated = drive(Privilege::Unelevated, make_link(dir));
+    let source = source_of(dir, &unelevated);
     let default = match (&source, &unelevated) {
         (Source::FromBelowHigh(text), _) => drive(Privilege::Account, ProbeLink::Follow((*text).to_owned())),
         // An agent that did not answer is not waited on a second time.
         (_, ProbeOutcome::TimedOut(_)) => ProbeOutcome::NotRun("the agent did not answer the first probe".into()),
-        // No junction from below High to follow: the probe makes one of its own, which tells nothing about
-        // the first's token, and the junction is not judged from it.
-        _ => drive(Privilege::Account, ProbeLink::Own),
+        // No junction from below High to follow, and one that the probe made itself tells nothing about
+        // the first's token: the probe is given none.
+        _ => drive(Privilege::Account, ProbeLink::NoJunction),
     };
 
     let note = [said(&unelevated), said(&default)]
@@ -93,23 +105,51 @@ fn run_at_high(temp: &Path, drive: Drive) -> Probes {
         .collect::<Vec<_>>()
         .join("; ");
     let junction = match source {
-        Source::FromBelowHigh(_) => match &default {
-            ProbeOutcome::Answered(followed) => Junction::Read {
+        Source::FromBelowHigh(_) => match default.answer() {
+            Ok(followed) => Junction::Read {
                 state: followed.result.symlink,
                 note,
             },
-            unanswered => no_junction(unanswered, note),
+            Err(cause) => Junction::Unavailable {
+                cause: cause.to_string(),
+                note,
+            },
         },
-        Source::VolumeRefused => Junction::Read {
-            state: SymlinkState::Skipped,
+        Source::NoJunctionsOnVolume => Junction::Read {
+            state: Some(SymlinkState::Skipped),
             note,
         },
         Source::Unavailable(cause) => Junction::Unavailable { cause, note },
     };
+    Probes {
+        unelevated: Some(unelevated),
+        default,
+        junction,
+        leftover: None,
+    }
+}
 
-    // The one place the directory goes, whatever the probes did, through no link.
-    let may_come = text.is_some() && matches!(unelevated, ProbeOutcome::TimedOut(_));
-    let leftover = match (probe::link::remove(&dir), may_come) {
+/// What a probe is told to do about the directory `dir` that `verify` named: make a junction in it, or
+/// nothing when it cannot be told to a probe as text.
+fn make_link(dir: &Path) -> ProbeLink {
+    dir.to_str()
+        .map_or(ProbeLink::NoJunction, |text| ProbeLink::Make(text.to_owned()))
+}
+
+fn not_text(dir: &Path) -> String {
+    format!("the directory {} cannot be told to a probe as text", dir.display())
+}
+
+/// The probe that was to make the directory: the unelevated one of an agent at High, the only one below it.
+fn maker(probes: &Probes) -> &ProbeOutcome {
+    probes.unelevated.as_ref().unwrap_or(&probes.default)
+}
+
+/// Remove `dir` and say what is left of it: why it could not be removed, and that a `maker` that did not
+/// answer (so that its end is not known) may still create it. `told` is whether `maker` was given it.
+fn leftover(dir: &Path, told: bool, maker: &ProbeOutcome) -> Option<String> {
+    let may_come = told && maker.answer().is_err();
+    match (probe::link::remove(dir), may_come) {
         (Err(e), may_come) => Some(format!(
             "{} could not be removed: {e}{}; it can be deleted",
             dir.display(),
@@ -124,79 +164,62 @@ fn run_at_high(temp: &Path, drive: Drive) -> Probes {
             dir.display()
         )),
         (Ok(()), false) => None,
-    };
-    Probes {
-        unelevated: Some(unelevated),
-        default,
-        junction,
-        leftover,
     }
 }
 
-/// Where the junction the default probe is judged on comes from.
+/// Where the junction the default probe at High is judged on comes from.
 enum Source<'a> {
     /// A token below High made it, in this directory: the default probe follows it.
     FromBelowHigh(&'a str),
-    /// The volume refused to make one: nothing was tested, and that fails nothing.
-    VolumeRefused,
+    /// The volume holds no junctions: nothing was tested, and that fails nothing.
+    NoJunctionsOnVolume,
     /// There is none from below High, and why.
     Unavailable(String),
 }
 
-/// Whether the unelevated probe made a junction from below High in `dir`, which was told to it as `text`.
-/// It did only when it answered, reports its integrity as below High, and its junction was made.
-fn source_of<'a>(dir: &Path, text: Option<&'a str>, unelevated: &ProbeOutcome) -> Source<'a> {
-    let Some(text) = text else {
-        return Source::Unavailable(format!(
-            "the directory {} cannot be told to a probe as text",
-            dir.display()
-        ));
+/// Whether the unelevated probe made a junction from below High in `dir`. It did only when it answered,
+/// reports its integrity as below High, and its junction was made.
+fn source_of<'a>(dir: &'a Path, unelevated: &ProbeOutcome) -> Source<'a> {
+    let Some(text) = dir.to_str() else {
+        return Source::Unavailable(not_text(dir));
     };
-    let asked = match unelevated {
-        ProbeOutcome::Answered(answer) => &answer.result,
-        unanswered => return Source::Unavailable(unanswered.cause().unwrap_or_default().to_string()),
+    let asked = match unelevated.answer() {
+        Ok(answer) => &answer.result,
+        Err(cause) => return Source::Unavailable(cause.to_string()),
     };
-    match asked.integrity.map(integrity_class) {
-        None => Source::Unavailable("the probe that asked for an unelevated session did not report its level".into()),
-        Some(Integrity::High) => Source::Unavailable(format!(
+    match (asked.integrity.map(integrity_class), asked.symlink) {
+        (None, _) => {
+            Source::Unavailable("the probe that asked for an unelevated session did not report its level".into())
+        }
+        (Some(Integrity::High), _) => Source::Unavailable(format!(
             "the probe that asked for an unelevated session ran at integrity {}, not below High",
             level(asked.integrity)
         )),
-        Some(Integrity::Medium) if asked.symlink.was_made() => Source::FromBelowHigh(text),
-        Some(Integrity::Medium) if asked.symlink == SymlinkState::Skipped => Source::VolumeRefused,
-        Some(Integrity::Medium) => {
+        (Some(Integrity::Medium), None) => {
+            Source::Unavailable("the probe that asked for an unelevated session did not report its junction".into())
+        }
+        (Some(Integrity::Medium), Some(state)) if state.was_made() => Source::FromBelowHigh(text),
+        (Some(Integrity::Medium), Some(SymlinkState::Skipped)) => Source::NoJunctionsOnVolume,
+        (Some(Integrity::Medium), Some(_)) => {
             Source::Unavailable("the probe that asked for an unelevated session could not make the directory".into())
         }
     }
 }
 
-/// What the probes said about their junctions: nothing, for one that did not answer.
+/// What a probe said about its junction: nothing, for one that did not answer.
 fn said(outcome: &ProbeOutcome) -> &str {
-    match outcome {
-        ProbeOutcome::Answered(answer) => &answer.said,
-        _ => "",
-    }
-}
-
-/// The junction of a default probe that did not answer: there is none to judge.
-fn no_junction(unanswered: &ProbeOutcome, note: String) -> Junction {
-    Junction::Unavailable {
-        cause: unanswered.cause().unwrap_or_default().to_string(),
-        note,
-    }
+    outcome.answer().map_or("", |answer| answer.junction_said.as_str())
 }
 
 /// Drive the probe on a worker thread, giving up after `timeout`.
 ///
-/// The bound is here rather than around the child's stdin read for two reasons. It covers
-/// EVERY way the probe can fail to answer — a lost stdin-EOF marker, an agent that accepts the
-/// connection and then never replies, a child that dies mid-write — where bounding the read
-/// would cover only the first. And bounding a blocking `ReadFile` on a Windows pipe means
-/// overlapped I/O inside the child, where this is a thread and a channel.
+/// The bound covers every way the probe can fail to answer (lost stdin-EOF marker, an agent that never
+/// replies, a child that dies mid-write); bounding the read would cover one, and needs overlapped I/O in
+/// the child.
 ///
 /// On expiry the outcome is [`ProbeOutcome::TimedOut`], which becomes the `parity probe (via agent)` row
-/// that an unreachable agent produces, so `verify` still prints every local check and exits non-zero —
-/// instead of hanging with nothing on stdout, which is what it did before.
+/// that an unreachable agent produces, so `verify` still prints every local check and exits non-zero
+/// instead of hanging with nothing on stdout.
 fn drive_bounded(exe: &Path, privilege: Privilege, link: ProbeLink, timeout: Option<Duration>) -> ProbeOutcome {
     let (tx, rx) = std::sync::mpsc::channel();
     let exe = exe.to_path_buf();
@@ -205,7 +228,13 @@ fn drive_bounded(exe: &Path, privilege: Privilege, link: ProbeLink, timeout: Opt
     std::thread::spawn(move || {
         let _ = tx.send(drive(&exe, privilege, &link));
     });
-    match super::bounded::await_bounded(&rx, timeout) {
+    outcome_of(super::bounded::await_bounded(&rx, timeout))
+}
+
+/// What became of a probe whose worker was waited for: a timeout is [`ProbeOutcome::TimedOut`]; a worker
+/// that stopped and a relay that failed are [`ProbeOutcome::Failed`].
+fn outcome_of(waited: Result<anyhow::Result<Answer>, WaitError>) -> ProbeOutcome {
+    match waited {
         Ok(Ok(answer)) => ProbeOutcome::Answered(answer),
         Ok(Err(cause)) => ProbeOutcome::Failed(format!("{cause:#}")),
         Err(timed_out @ WaitError::TimedOut { .. }) => ProbeOutcome::TimedOut(timed_out.to_string()),
@@ -228,9 +257,8 @@ fn drive(exe: &Path, privilege: Privilege, link: &ProbeLink) -> anyhow::Result<A
     let hs = super::probe_handshake(exe, privilege, link);
     let mut out = Vec::new();
     let mut err = Vec::new();
-    // Feed the SAME payload upstream that the child echoes downstream. Passing `io::empty()`
-    // here left the client → child direction — the `sftp put` / `scp` upload direction —
-    // completely unchecked, while the docs claimed `verify` covered both.
+    // Feed the same payload upstream that the child echoes downstream, so the client → child
+    // (`sftp put`/`scp`) direction is checked too.
     let upstream = std::io::Cursor::new(probe::binary_probe_payload());
     let code = shim::run_exec_on(rx, tx, &hs, &mut out, &mut err, upstream)?;
     anyhow::ensure!(
@@ -240,10 +268,12 @@ fn drive(exe: &Path, privilege: Privilege, link: &ProbeLink) -> anyhow::Result<A
     );
     let binary_ok = probe::binary_probe_ok(&out);
     let result = probe::parse_probe_line(&String::from_utf8_lossy(&out))?;
+    let stderr = String::from_utf8_lossy(&err);
     Ok(Answer {
         result,
         binary_ok,
-        said: probe::junction_notes(&String::from_utf8_lossy(&err)),
+        junction_said: probe::notes(&stderr, probe::JUNCTION_SAID),
+        token_said: probe::notes(&stderr, probe::TOKEN_SAID),
     })
 }
 

@@ -1,9 +1,11 @@
 //! Tests for which probes `verify` runs, how it asks each, what it makes of the answers and what it cleans
 //! up after them, with the probes driven by a stand-in that answers as a probe would and makes the
-//! directory a make-probe makes.
+//! directory a make-probe makes, with the product's own maker, and a junction in it that leads outside.
 use std::cell::RefCell;
 use std::ffi::OsString;
+use std::fs::File;
 use std::os::windows::ffi::OsStringExt;
+use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use super::*;
@@ -13,7 +15,7 @@ use crate::provision::session_rows::parity_rows;
 use crate::socket_loc::Elevation;
 use crate::test_support::Scratch;
 
-fn answer(elevation: Elevation, integrity: u32, symlink: SymlinkState, said: &str) -> ProbeOutcome {
+fn answer(elevation: Elevation, integrity: u32, symlink: Option<SymlinkState>, said: &str) -> ProbeOutcome {
     ProbeOutcome::Answered(Answer {
         result: ProbeResult {
             session_id: 1,
@@ -25,58 +27,94 @@ fn answer(elevation: Elevation, integrity: u32, symlink: SymlinkState, said: &st
             integrity: Some(integrity),
         },
         binary_ok: true,
-        said: said.to_string(),
+        junction_said: said.to_string(),
+        token_said: String::new(),
     })
 }
 
-/// What each probe of a run is asked, in order, and how the stand-in answers each: the one that asks for
-/// an unelevated session makes the directory it is given (as the real one does) and then answers with
-/// `made`; the other answers with `followed`.
+/// What each probe of a run is asked, in order, and how the stand-in answers each: a probe that is told to
+/// make a directory makes it (as the real one does, with a junction in it that leads to a folder outside
+/// it); the one that asks for an unelevated session then answers with `made`, any other with `followed`.
 struct Probing {
     made: fn() -> ProbeOutcome,
     followed: fn() -> ProbeOutcome,
     asked: RefCell<Vec<(Privilege, ProbeLink)>>,
+    /// The folder the junctions lead to, with a file in it that nothing may touch.
+    outside: Scratch,
+    /// Whether the maker keeps a file of what it made open, which stops the directory from being removed.
+    hold: bool,
+    held: RefCell<Vec<File>>,
 }
 
 impl Probing {
     fn new(made: fn() -> ProbeOutcome, followed: fn() -> ProbeOutcome) -> Probing {
+        let outside = Scratch::new();
+        std::fs::write(outside.0.join("keep.txt"), b"keep").unwrap();
         Probing {
             made,
             followed,
             asked: RefCell::default(),
+            outside,
+            hold: false,
+            held: RefCell::default(),
         }
+    }
+
+    fn holding(mut self) -> Probing {
+        self.hold = true;
+        self
     }
 
     fn run(&self, integrity: Integrity, temp: &Path) -> Probes {
         run_at(integrity, temp, &|privilege, link| {
             self.asked.borrow_mut().push((privilege, link.clone()));
-            match (privilege, &link) {
-                (Privilege::Unelevated, ProbeLink::Make(dir)) => {
-                    std::fs::create_dir(dir).unwrap();
-                    std::fs::write(Path::new(dir).join("left.txt"), b"x").unwrap();
-                    (self.made)()
-                }
-                (Privilege::Unelevated, _) => (self.made)(),
+            if let ProbeLink::Make(dir) = &link {
+                self.make(Path::new(dir));
+            }
+            match privilege {
+                Privilege::Unelevated => (self.made)(),
                 _ => (self.followed)(),
             }
         })
     }
 
+    /// Make the directory as a probe does, and point its junction at the folder outside.
+    fn make(&self, dir: &Path) {
+        probe::link::make(dir).unwrap();
+        let link = dir.join("link");
+        std::fs::remove_dir(&link).unwrap();
+        crate::test_support::junction(&link, &self.outside.0);
+        if self.hold {
+            // No sharing at all: the file cannot be deleted while it is open.
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(0)
+                .open(dir.join("target").join("parity.txt"))
+                .unwrap();
+            self.held.borrow_mut().push(file);
+        }
+    }
+
     fn links(&self) -> Vec<ProbeLink> {
         self.asked.borrow().iter().map(|(_, link)| link.clone()).collect()
+    }
+
+    /// What was behind the junction is still there, whole.
+    fn assert_outside_intact(&self) {
+        assert_eq!(std::fs::read(self.outside.0.join("keep.txt")).unwrap(), b"keep");
     }
 }
 
 fn unelevated_ok() -> ProbeOutcome {
-    answer(Elevation::Filtered, INTEGRITY_MEDIUM, SymlinkState::Ok, "")
+    answer(Elevation::Filtered, INTEGRITY_MEDIUM, Some(SymlinkState::Ok), "")
 }
 
 fn elevated_ok() -> ProbeOutcome {
-    answer(Elevation::Full, INTEGRITY_HIGH, SymlinkState::Ok, "")
+    answer(Elevation::Full, INTEGRITY_HIGH, Some(SymlinkState::Ok), "")
 }
 
 /// The junction the run found, as its state and note, or `None` for no junction from below High.
-fn read(probes: &Probes) -> Option<(SymlinkState, &str)> {
+fn read(probes: &Probes) -> Option<(Option<SymlinkState>, &str)> {
     match &probes.junction {
         Junction::Read { state, note } => Some((*state, note)),
         Junction::Unavailable { .. } => None,
@@ -91,21 +129,23 @@ fn unavailable(probes: &Probes) -> (&str, &str) {
     }
 }
 
+fn row_names(rows: &[crate::provision::report::Check]) -> Vec<&str> {
+    rows.iter().map(|row| row.name).collect()
+}
+
 fn is_answered(outcome: &Option<ProbeOutcome>) -> bool {
     matches!(outcome, Some(ProbeOutcome::Answered(_)))
 }
 
 // the agent is at High ---------------------------------------------------------------------
 
-/// The directory `verify` names is under its own temp directory and goes to both probes, the one that
-/// makes the junction and the one that follows it; the junction row is the follower's, with what both
-/// said; and the directory is gone afterwards.
+/// One directory goes to both probes, and `verify` removes it without following the junction in it.
 #[test]
 fn an_agent_at_high_gets_two_probes_with_one_directory_which_is_removed() {
     let scratch = Scratch::new();
     let probing = Probing::new(
-        || answer(Elevation::Filtered, INTEGRITY_MEDIUM, SymlinkState::Ok, "made it"),
-        || answer(Elevation::Full, INTEGRITY_HIGH, SymlinkState::Blocked, "refused"),
+        || answer(Elevation::Filtered, INTEGRITY_MEDIUM, Some(SymlinkState::Ok), "made it"),
+        || answer(Elevation::Full, INTEGRITY_HIGH, Some(SymlinkState::Blocked), "refused"),
     );
 
     let probes = probing.run(Integrity::High, &scratch.0);
@@ -120,48 +160,46 @@ fn an_agent_at_high_gets_two_probes_with_one_directory_which_is_removed() {
         probing.asked.borrow().iter().map(|(p, _)| *p).collect::<Vec<_>>(),
         [Privilege::Unelevated, Privilege::Account]
     );
-    assert!(
-        scratch.is_empty(),
-        "the directory and what the probe left in it are removed"
-    );
+    assert!(scratch.is_empty(), "the directory and what is in it are removed");
+    probing.assert_outside_intact();
     assert_eq!(probes.leftover, None);
     assert!(is_answered(&probes.unelevated));
     let (state, note) = read(&probes).expect("a junction from below High was read");
-    assert_eq!(state, SymlinkState::Blocked);
+    assert_eq!(state, Some(SymlinkState::Blocked));
     assert!(note.contains("made it") && note.contains("refused"), "{note}");
 }
 
-/// A probe that fails leaves nothing behind: `verify` removes the directory it named whatever became of the
-/// probes. The default probe still runs, as itself and with a junction of its own, since there is none
-/// from below High to follow, and the junction cannot be tested.
+/// A probe that failed may still create the directory, so `verify` says so; the default probe runs on.
 #[test]
-fn a_failed_unelevated_probe_removes_the_directory_and_the_default_probe_runs_on_its_own() {
+fn a_failed_unelevated_probe_gives_the_may_still_create_note_and_the_default_probe_runs_without_a_junction() {
     let scratch = Scratch::new();
     let probing = Probing::new(
         || ProbeOutcome::Failed("probe relay failed (code 254)".into()),
-        || answer(Elevation::Full, INTEGRITY_HIGH, SymlinkState::Ok, "own junction"),
+        || answer(Elevation::Full, INTEGRITY_HIGH, None, "the probe was given no junction"),
     );
 
     let probes = probing.run(Integrity::High, &scratch.0);
 
     assert!(scratch.is_empty(), "the directory the first probe made is removed");
-    assert_eq!(probes.leftover, None);
-    assert!(matches!(
-        probing.links().as_slice(),
-        [ProbeLink::Make(_), ProbeLink::Own]
-    ));
+    probing.assert_outside_intact();
+    let links = probing.links();
+    let [ProbeLink::Make(dir), ProbeLink::NoJunction] = links.as_slice() else {
+        panic!("expected a make and a probe with no junction, got {links:?}");
+    };
+    let leftover = probes.leftover.as_deref().expect("a note that the directory may come");
+    assert!(leftover.contains(dir.as_str()), "{leftover}");
+    assert!(leftover.contains("may still create"), "{leftover}");
     assert!(matches!(&probes.unelevated, Some(ProbeOutcome::Failed(cause)) if cause.contains("code 254")));
     assert!(matches!(&probes.default, ProbeOutcome::Answered(_)));
     let (cause, note) = unavailable(&probes);
     assert!(cause.contains("code 254"), "{cause}");
     assert!(
-        note.contains("own junction"),
-        "the fallback probe's words are kept: {note}"
+        note.contains("no junction"),
+        "the default probe's words are kept: {note}"
     );
 }
 
-/// A first probe that did not answer in time is not followed by a second: an agent that is not answering
-/// is not waited on again. `verify` still removes the directory, and says that the probe may yet create it.
+/// An agent that is not answering is not waited on a second time.
 #[test]
 fn a_timed_out_first_probe_starts_no_second_probe_and_leaves_a_warning() {
     let scratch = Scratch::new();
@@ -194,8 +232,7 @@ fn a_timed_out_first_probe_starts_no_second_probe_and_leaves_a_warning() {
     assert!(unavailable(&probes).0.contains("no output within 30s"));
 }
 
-/// A maker that reports High made its junction as an elevated process, which proves nothing: the default
-/// probe gets a junction of its own, and the junction row fails, saying so.
+/// A junction made as an elevated process proves nothing about RedirectionGuard.
 #[test]
 fn a_maker_at_high_gets_no_follower_and_a_failing_junction() {
     let scratch = Scratch::new();
@@ -204,7 +241,7 @@ fn a_maker_at_high_gets_no_follower_and_a_failing_junction() {
             answer(
                 Elevation::Full,
                 INTEGRITY_HIGH,
-                SymlinkState::Ok,
+                Some(SymlinkState::Ok),
                 "made by the elevated one",
             )
         },
@@ -215,12 +252,13 @@ fn a_maker_at_high_gets_no_follower_and_a_failing_junction() {
 
     assert!(matches!(
         probing.links().as_slice(),
-        [ProbeLink::Make(_), ProbeLink::Own]
+        [ProbeLink::Make(_), ProbeLink::NoJunction]
     ));
     let (cause, note) = unavailable(&probes);
     assert!(cause.contains("below High"), "{cause}");
     assert!(note.contains("made by the elevated one"), "{note}");
     assert!(scratch.is_empty());
+    assert_eq!(probes.leftover, None, "the maker answered");
 }
 
 /// A maker that did not report its level is not known to be below High.
@@ -242,13 +280,27 @@ fn a_maker_that_did_not_report_its_level_gets_no_follower() {
 
     assert!(matches!(
         probing.links().as_slice(),
-        [ProbeLink::Make(_), ProbeLink::Own]
+        [ProbeLink::Make(_), ProbeLink::NoJunction]
     ));
     assert!(unavailable(&probes).0.contains("did not report"));
 }
 
-/// A maker that could not make the directory made no junction: the junction row fails with what the
-/// probe said, and the default probe has a junction of its own.
+/// A maker that reported no link outcome did not make a junction: it is not taken for one that was made.
+#[test]
+fn a_maker_that_reported_no_junction_outcome_gets_no_follower() {
+    let scratch = Scratch::new();
+    let probing = Probing::new(|| answer(Elevation::Filtered, INTEGRITY_MEDIUM, None, ""), elevated_ok);
+
+    let probes = probing.run(Integrity::High, &scratch.0);
+
+    assert!(matches!(
+        probing.links().as_slice(),
+        [ProbeLink::Make(_), ProbeLink::NoJunction]
+    ));
+    assert!(unavailable(&probes).0.contains("did not report its junction"));
+}
+
+/// A maker that could not make the directory gives no junction to follow.
 #[test]
 fn a_directory_that_could_not_be_made_gives_no_junction_from_below_high() {
     let scratch = Scratch::new();
@@ -257,8 +309,8 @@ fn a_directory_that_could_not_be_made_gives_no_junction_from_below_high() {
             answer(
                 Elevation::Filtered,
                 INTEGRITY_MEDIUM,
-                SymlinkState::NotMade,
-                "making the directory failed: access denied",
+                Some(SymlinkState::NotMade),
+                "making a junction failed: access denied",
             )
         },
         elevated_ok,
@@ -268,24 +320,23 @@ fn a_directory_that_could_not_be_made_gives_no_junction_from_below_high() {
 
     assert!(matches!(
         probing.links().as_slice(),
-        [ProbeLink::Make(_), ProbeLink::Own]
+        [ProbeLink::Make(_), ProbeLink::NoJunction]
     ));
     let (_, note) = unavailable(&probes);
     assert!(note.contains("access denied"), "{note}");
 }
 
-/// A volume that refused the junction was not tested, which fails nothing: the follower is not asked to
-/// follow what is not there, and what the probes said is the note.
+/// A volume that holds no junctions was not tested, which fails nothing.
 #[test]
-fn a_junction_the_volume_refused_is_not_tested() {
+fn a_volume_without_junctions_is_not_tested() {
     let scratch = Scratch::new();
     let probing = Probing::new(
         || {
             answer(
                 Elevation::Filtered,
                 INTEGRITY_MEDIUM,
-                SymlinkState::Skipped,
-                "the volume does not hold a junction",
+                Some(SymlinkState::Skipped),
+                "the volume holds no junctions",
             )
         },
         elevated_ok,
@@ -295,16 +346,15 @@ fn a_junction_the_volume_refused_is_not_tested() {
 
     assert!(matches!(
         probing.links().as_slice(),
-        [ProbeLink::Make(_), ProbeLink::Own]
+        [ProbeLink::Make(_), ProbeLink::NoJunction]
     ));
     let (state, note) = read(&probes).expect("the junction is judged");
-    assert_eq!(state, SymlinkState::Skipped);
-    assert!(note.contains("does not hold a junction"), "{note}");
+    assert_eq!(state, Some(SymlinkState::Skipped));
+    assert!(note.contains("holds no junctions"), "{note}");
     assert!(scratch.is_empty());
 }
 
-/// A failed default probe takes its own rows with it and no others: the unelevated probe's row and the
-/// directory that is left are still shown.
+/// A failed default probe takes its own rows with it and no others.
 #[test]
 fn a_failed_default_probe_keeps_the_unelevated_row_and_the_leftover() {
     let scratch = Scratch::new();
@@ -340,8 +390,7 @@ fn a_failed_default_probe_keeps_the_unelevated_row_and_the_leftover() {
     assert!(rows[1].pass, "{}", rows[1].detail);
 }
 
-/// A temp directory that cannot be written as text cannot be given to a probe: `verify` says so on the
-/// junction row, which fails, and runs both probes with no directory to name.
+/// A directory that cannot be told to a probe as text is not given to one.
 #[test]
 fn a_temp_directory_that_is_not_text_gives_no_junction_and_runs_the_probes() {
     let not_text = PathBuf::from(OsString::from_wide(&[u16::from(b'C'), u16::from(b':'), 0xD800]));
@@ -350,45 +399,246 @@ fn a_temp_directory_that_is_not_text_gives_no_junction_and_runs_the_probes() {
 
     let probes = probing.run(Integrity::High, &not_text);
 
-    assert_eq!(probing.links(), [ProbeLink::Own, ProbeLink::Own]);
+    assert_eq!(probing.links(), [ProbeLink::NoJunction, ProbeLink::NoJunction]);
     assert!(unavailable(&probes).0.contains("text"));
     assert!(is_answered(&probes.unelevated));
+    assert_eq!(probes.leftover, None, "no probe was told the directory");
+
+    let probing = Probing::new(unelevated_ok, elevated_ok);
+    let probes = probing.run(Integrity::Medium, &not_text);
+
+    assert_eq!(probing.links(), [ProbeLink::NoJunction]);
+    assert!(unavailable(&probes).0.contains("text"));
 }
 
 // the agent is below High ------------------------------------------------------------------
 
-/// An agent below High has one probe, which makes and follows a junction of its own; the junction row is
-/// its result and what it said.
+/// The one probe below High makes and follows a junction in the directory `verify` named, and `verify` removes it.
 #[test]
-fn an_agent_below_high_has_one_probe_with_a_junction_of_its_own() {
+fn an_agent_below_high_has_one_probe_with_a_directory_that_verify_removes() {
     let scratch = Scratch::new();
     let probing = Probing::new(unelevated_ok, || {
         answer(
             Elevation::Standard,
             INTEGRITY_MEDIUM,
-            SymlinkState::Ok,
-            "removing the directory failed: in use",
+            Some(SymlinkState::Ok),
+            "reading through the junction was slow",
         )
     });
 
     let probes = probing.run(Integrity::Medium, &scratch.0);
 
-    assert_eq!(probing.links(), [ProbeLink::Own]);
+    let links = probing.links();
+    let [ProbeLink::Make(dir)] = links.as_slice() else {
+        panic!("expected one make, got {links:?}");
+    };
+    assert_eq!(Path::new(dir).parent(), Some(scratch.0.as_path()));
     assert!(probes.unelevated.is_none());
     let (state, note) = read(&probes).expect("its own junction");
-    assert_eq!(state, SymlinkState::Ok);
-    assert!(note.contains("in use"), "{note}");
+    assert_eq!(state, Some(SymlinkState::Ok));
+    assert!(note.contains("slow"), "{note}");
+    assert!(scratch.is_empty(), "the directory and what is in it are removed");
+    probing.assert_outside_intact();
+    assert_eq!(probes.leftover, None);
 }
 
-/// A probe below High that did not answer is the default probe's outcome, whichever way it did not.
+/// A probe below High that did not answer may still create the directory it was told.
 #[test]
-fn an_agent_below_high_that_does_not_answer_has_its_outcome_as_the_default() {
-    let scratch = Scratch::new();
-    let probing = Probing::new(unelevated_ok, || ProbeOutcome::TimedOut("no output".into()));
+fn an_agent_below_high_that_does_not_answer_has_its_outcome_as_the_default_and_a_note() {
+    for unanswered in [
+        (|| ProbeOutcome::TimedOut("no output".into())) as fn() -> ProbeOutcome,
+        || ProbeOutcome::Failed("relay failed".into()),
+    ] {
+        let scratch = Scratch::new();
+        let probing = Probing::new(unelevated_ok, unanswered);
 
-    let probes = probing.run(Integrity::Medium, &scratch.0);
+        let probes = probing.run(Integrity::Medium, &scratch.0);
 
-    assert!(matches!(&probes.default, ProbeOutcome::TimedOut(_)));
-    assert!(probes.unelevated.is_none());
-    assert_eq!(probes.leftover, None);
+        assert!(matches!(
+            &probes.default,
+            ProbeOutcome::TimedOut(_) | ProbeOutcome::Failed(_)
+        ));
+        assert!(probes.unelevated.is_none());
+        assert!(scratch.is_empty());
+        probing.assert_outside_intact();
+        let links = probing.links();
+        let [ProbeLink::Make(dir)] = links.as_slice() else {
+            panic!("expected one make, got {links:?}");
+        };
+        let leftover = probes.leftover.as_deref().expect("a note that the directory may come");
+        assert!(leftover.contains(dir.as_str()), "{leftover}");
+        assert!(leftover.contains("may still create"), "{leftover}");
+    }
+}
+
+// the directory cannot be removed -----------------------------------------------------------
+
+/// A removal that fails is said with the directory and the error, at either level.
+#[test]
+fn a_directory_that_cannot_be_removed_is_named_with_the_error() {
+    for integrity in [Integrity::High, Integrity::Medium] {
+        let scratch = Scratch::new();
+        let probing = Probing::new(unelevated_ok, elevated_ok).holding();
+
+        let probes = probing.run(integrity, &scratch.0);
+
+        let links = probing.links();
+        let Some(ProbeLink::Make(dir)) = links.first() else {
+            panic!("expected a make first, got {links:?}");
+        };
+        let leftover = probes.leftover.as_deref().expect("the directory is left behind");
+        assert!(leftover.contains(dir.as_str()), "{integrity:?}: {leftover}");
+        assert!(leftover.contains("could not be removed"), "{integrity:?}: {leftover}");
+        assert!(
+            leftover.contains("(os error"),
+            "the error is named: {integrity:?}: {leftover}"
+        );
+        assert!(!leftover.contains("may still create"), "{integrity:?}: {leftover}");
+        probing.assert_outside_intact();
+    }
+}
+
+// the rows -----------------------------------------------------------------------------------
+
+/// Each maker and follower pair, through `run_at` and `parity_rows`, has the junction row it should.
+#[test]
+fn each_pair_of_maker_and_follower_has_the_expected_junction_row() {
+    fn maker(symlink: Option<SymlinkState>) -> ProbeOutcome {
+        answer(Elevation::Filtered, INTEGRITY_MEDIUM, symlink, "")
+    }
+    fn follower(symlink: Option<SymlinkState>) -> ProbeOutcome {
+        answer(Elevation::Full, INTEGRITY_HIGH, symlink, "")
+    }
+    #[allow(clippy::type_complexity)]
+    let table: [(&str, fn() -> ProbeOutcome, fn() -> ProbeOutcome, bool, &str); 8] = [
+        (
+            "followed",
+            || maker(Some(SymlinkState::Ok)),
+            || follower(Some(SymlinkState::Ok)),
+            true,
+            "followed",
+        ),
+        (
+            "refused",
+            || maker(Some(SymlinkState::Ok)),
+            || follower(Some(SymlinkState::Blocked)),
+            false,
+            "RedirectionGuard",
+        ),
+        (
+            "made and not read",
+            || maker(Some(SymlinkState::Ok)),
+            || follower(Some(SymlinkState::Failed)),
+            false,
+            "not followed",
+        ),
+        (
+            "follower reports none",
+            || maker(Some(SymlinkState::Ok)),
+            || follower(None),
+            false,
+            "did not report its junction",
+        ),
+        (
+            "no junctions on the volume",
+            || maker(Some(SymlinkState::Skipped)),
+            || follower(None),
+            true,
+            "NOT tested",
+        ),
+        (
+            "not made",
+            || maker(Some(SymlinkState::NotMade)),
+            || follower(Some(SymlinkState::Ok)),
+            false,
+            "no junction from below High could be tested",
+        ),
+        (
+            "maker reports none",
+            || maker(None),
+            || follower(Some(SymlinkState::Ok)),
+            false,
+            "did not report its junction",
+        ),
+        (
+            "maker failed",
+            || ProbeOutcome::Failed("relay failed".into()),
+            || follower(Some(SymlinkState::Ok)),
+            false,
+            "relay failed",
+        ),
+    ];
+    for (name, made, followed, passes, says) in table {
+        let scratch = Scratch::new();
+        let probing = Probing::new(made, followed);
+
+        let probes = probing.run(Integrity::High, &scratch.0);
+
+        let rows = parity_rows(&probes, 1);
+        let row = rows
+            .iter()
+            .find(|row| row.name == "junction (via agent)")
+            .unwrap_or_else(|| panic!("{name}: no junction row in {:?}", row_names(&rows)));
+        assert_eq!(row.pass, passes, "{name}: {}", row.detail);
+        assert!(row.detail.contains(says), "{name}: {}", row.detail);
+    }
+
+    fn sole(symlink: Option<SymlinkState>) -> ProbeOutcome {
+        answer(Elevation::Standard, INTEGRITY_MEDIUM, symlink, "")
+    }
+    #[allow(clippy::type_complexity)]
+    let below: [(&str, fn() -> ProbeOutcome, bool, &str); 4] = [
+        ("followed", || sole(Some(SymlinkState::Ok)), true, "followed"),
+        (
+            "no junctions on the volume",
+            || sole(Some(SymlinkState::Skipped)),
+            true,
+            "NOT tested",
+        ),
+        (
+            "not made",
+            || sole(Some(SymlinkState::NotMade)),
+            false,
+            "no junction could be made",
+        ),
+        ("reports none", || sole(None), false, "did not report its junction"),
+    ];
+    for (name, only, passes, says) in below {
+        let scratch = Scratch::new();
+        let probing = Probing::new(unelevated_ok, only);
+
+        let probes = probing.run(Integrity::Medium, &scratch.0);
+
+        let rows = parity_rows(&probes, 1);
+        let row = rows
+            .iter()
+            .find(|row| row.name == "junction (via agent)")
+            .unwrap_or_else(|| panic!("below High, {name}: no junction row in {:?}", row_names(&rows)));
+        assert_eq!(row.pass, passes, "below High, {name}: {}", row.detail);
+        assert!(row.detail.contains(says), "below High, {name}: {}", row.detail);
+    }
+}
+
+// what a bounded probe came to --------------------------------------------------------------
+
+/// A timeout is `TimedOut`; a worker that stopped and a relay that failed are `Failed`.
+#[test]
+fn what_became_of_the_worker_decides_the_outcome() {
+    let ProbeOutcome::Answered(done) = unelevated_ok() else {
+        unreachable!("unelevated_ok answers")
+    };
+
+    assert!(matches!(outcome_of(Ok(Ok(done))), ProbeOutcome::Answered(_)));
+    assert!(matches!(
+        outcome_of(Ok(Err(anyhow::anyhow!("probe relay failed (code 254)")))),
+        ProbeOutcome::Failed(cause) if cause.contains("code 254")
+    ));
+    assert!(matches!(
+        outcome_of(Err(WaitError::TimedOut { secs: 30 })),
+        ProbeOutcome::TimedOut(cause) if cause.contains("30s")
+    ));
+    assert!(matches!(
+        outcome_of(Err(WaitError::WorkerStopped)),
+        ProbeOutcome::Failed(cause) if cause.contains("worker stopped")
+    ));
 }
