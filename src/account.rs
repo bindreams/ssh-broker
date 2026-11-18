@@ -16,6 +16,7 @@ use windows::core::PWSTR;
 use crate::acl::Sid;
 pub use crate::offer::AccountKind;
 use crate::protocol::Privilege;
+pub use crate::socket_loc::Elevation;
 use crate::socket_loc::Integrity;
 use crate::winutil::{SE_GROUP_ENABLED, SE_GROUP_USE_FOR_DENY_ONLY, find_group, own_token, token_information};
 
@@ -86,18 +87,6 @@ pub fn integrity_class(rid: u32) -> Integrity {
     } else {
         Integrity::Medium
     }
-}
-
-/// How much of an administrator's power a token carries.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Elevation {
-    /// An administrator's full token: `Administrators` enabled, integrity High or above.
-    Full,
-    /// An administrator account's token cut down, as UAC gives a non-elevated process: the
-    /// `Administrators` group is deny-only or disabled, or the integrity level is below High.
-    Filtered,
-    /// A token of an account that is not an administrator.
-    Standard,
 }
 
 /// What a token's `BUILTIN\Administrators` entry says.

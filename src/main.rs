@@ -37,7 +37,7 @@ fn main() -> anyhow::Result<()> {
         }),
         Route::Apply => provision::apply(),
         Route::Verify => provision::verify(),
-        Route::VerifyProbe => provision::verify_probe(),
+        Route::VerifyProbe(link) => provision::verify_probe(link),
         Route::ConsoleFallback { handle, login } => console_fallback_command(handle, login),
     }
 }
@@ -47,6 +47,9 @@ fn usage(verb: Verb) -> &'static str {
         Verb::Agent => "usage: ssh-broker agent [--background [--expect-user <sid>]]",
         Verb::Logout => "usage: ssh-broker logout",
         Verb::ConsoleFallback => "usage: ssh-broker console-fallback [--login] <handle> (internal)",
+        Verb::VerifyProbe => {
+            "usage: ssh-broker verify-probe [--make-junction <directory> | --follow <directory>] (internal)"
+        }
     }
 }
 

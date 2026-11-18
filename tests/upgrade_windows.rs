@@ -179,9 +179,21 @@ fn apply(exe: &Path) -> std::process::Output {
     desktop::output(Command::new(exe).arg("apply")).expect("run apply")
 }
 
+/// Removes an account's auto-login task when it goes, whether the test passed or not: a task left behind
+/// starts the agent again as the account, and its session holds the profile. Declared before the account
+/// and its session guards, so that it is the first to go.
+struct AutoLoginOff(ssh_broker::account::LocalAccount);
+
+impl Drop for AutoLoginOff {
+    fn drop(&mut self) {
+        let _ = autologin::off(&mut WindowsEnv::new(PasswordSource::Given(None)), &self.0);
+    }
+}
+
 /// What the upgrade tests start from: the old build installed, an auto-login session running it from a
 /// task, and a session the prompt started (no task behind it).
 struct Scene {
+    _auto_login_off: AutoLoginOff,
     broker: &'static Path,
     /// The build that is installed, as a file outside the install directory: `apply` of it is an
     /// `apply` of the installed build.
@@ -230,6 +242,7 @@ fn scene() -> Scene {
         &local_account(&auto),
     )
     .unwrap();
+    let auto_login_off = AutoLoginOff(local_account(&auto));
     let before = {
         let location = auto.socket_location();
         stand_in::wait_for_serving_marker_of_a_task(&location, TASK_START_BOUND);
@@ -247,6 +260,7 @@ fn scene() -> Scene {
     installed_kit.exe = installed.clone();
     let session = BackgroundAgent::start(&installed_kit, &prompted);
     Scene {
+        _auto_login_off: auto_login_off,
         broker,
         old,
         installed,
@@ -288,17 +302,6 @@ impl Scene {
             );
             std::thread::yield_now();
         }
-    }
-}
-
-impl Drop for Scene {
-    /// The auto-login task is removed before the account goes, whether the test passed or not: a task left
-    /// behind starts the agent again as the account, and its session holds the profile.
-    fn drop(&mut self) {
-        let _ = autologin::off(
-            &mut WindowsEnv::new(PasswordSource::Given(None)),
-            &local_account(&self.auto),
-        );
     }
 }
 
@@ -683,4 +686,89 @@ fn apply_keeps_default_shell_arguments_until_a_config_holds_them() {
     );
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `<installed> verify` run through the agent of `admin` at `location`, as a session that asks for
+/// `privilege`.
+fn verify_through(
+    installed: &Path,
+    admin: &Account,
+    location: &ssh_broker::socket_loc::SocketLocation,
+    privilege: ssh_broker::protocol::Privilege,
+) -> agent_conn::Finished {
+    let mut conn = agent_conn::AgentConn::connect(location, &admin.sid);
+    conn.start_exec_as(&format!("\"{}\" verify", installed.display()), privilege);
+    conn.end_stdin();
+    conn.read_to_end()
+}
+
+/// What `verify` shows through an administrator's elevated agent: it exits 0, the session is elevated, an
+/// unelevated one can be had, and the junction was followed, not skipped.
+fn assert_verify_passes_for_an_elevated_agent(verified: &agent_conn::Finished) {
+    assert_eq!(
+        verified.exit,
+        Some(0),
+        "verify:\n{}{}",
+        verified.stdout,
+        verified.stderr
+    );
+    agent_conn::assert_verify_session_rows(&verified.stdout);
+}
+
+/// Elevated (CI only). `verify`, run in an administrator's session through the account's elevated agent,
+/// passes after `apply`: the session is elevated, an unelevated one can be had, and the junction that a
+/// token below High made is followed. The same `verify` run in an unelevated session of the account is
+/// told why nothing can be checked there, and runs no probe.
+#[test]
+fn apply_then_verify_for_an_administrator_shows_an_elevated_session_and_an_unelevated_one_on_request() {
+    use ssh_broker::offer::text::FILTERED_LOOKS_ELSEWHERE;
+    use ssh_broker::protocol::Privilege;
+
+    let _machine = machine::exclusive();
+    let _install = Install::capture();
+    let broker = Path::new(env!("CARGO_BIN_EXE_ssh-broker"));
+    let installed = provision::canonical_exe();
+    let applied = apply(broker);
+    assert!(
+        applied.status.success(),
+        "apply failed:\n{}{}",
+        String::from_utf8_lossy(&applied.stdout),
+        String::from_utf8_lossy(&applied.stderr)
+    );
+
+    // An administrator whose task starts the agent: a batch logon, which gives the full token.
+    let admin = Account::create("vf1", true);
+    admin.make_administrator();
+    let _end = session_end::LogOutOnDrop::new(&installed, &admin, ServiceLogon::TaskScheduler);
+    autologin::on(
+        &mut WindowsEnv::new(PasswordSource::Given(Some(password::password(&admin.password)))),
+        &local_account(&admin),
+    )
+    .unwrap();
+    let _off = AutoLoginOff(local_account(&admin));
+    let location = admin.socket_location();
+    stand_in::wait_for_serving_marker_of_a_task(&location, TASK_START_BOUND);
+
+    let verify = |privilege: Privilege| verify_through(&installed, &admin, &location, privilege);
+
+    assert_verify_passes_for_an_elevated_agent(&verify(Privilege::Account));
+
+    let unelevated = verify(Privilege::Unelevated);
+    assert_eq!(
+        unelevated.exit,
+        Some(1),
+        "verify:\n{}{}",
+        unelevated.stdout,
+        unelevated.stderr
+    );
+    assert!(
+        unelevated.stdout.contains(FILTERED_LOOKS_ELSEWHERE),
+        "the explanation is missing from:\n{}",
+        unelevated.stdout
+    );
+    assert!(
+        !unelevated.stdout.contains("(via agent)") && !unelevated.stdout.contains("parity probe"),
+        "an unelevated session ran a probe:\n{}",
+        unelevated.stdout
+    );
 }

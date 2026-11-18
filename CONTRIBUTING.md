@@ -16,7 +16,7 @@ known verb in first position selects a subcommand, anything else is the shim.
 | *(none)* or `-c "cmd"` | `shim`, `shim_pty` | the SSH session, as sshd's `DefaultShell` |
 | `agent` | `agent` | a user's interactive session, one per logged-on user, started by a logon task for any member of `BUILTIN\Users` |
 | `apply` | `provision` | wherever an admin runs it; needs elevation |
-| `verify` | `provision` | on the host itself, unelevated by design |
+| `verify` | `provision` | on the host itself, as the account whose agent it asks: an administrator runs it elevated, and an unelevated one finds no agent and says why |
 | `verify-probe` | `provision` | the child the **agent** spawns in its interactive session, driven through the relay by `verify` |
 | `console-fallback [--login] <handle>` | `shim`, `shim_pty`, `handoff` | the fallback shell of a terminal session through the agent: reads a notice and a line from the pipe handle the agent gave it alone (`PROC_THREAD_ATTRIBUTE_HANDLE_LIST`) until the agent closes its end, prints the notice on its pseudoconsole (which clears anything written ahead of it), starts the line there, exits with its code; it keeps through Ctrl+C for the shell, and when it cannot read the pipe it starts the built-in `cmd.exe` for a login (`--login`) and exits 255 for a command |
 
@@ -32,8 +32,11 @@ every host platform; `main.rs` is a thin dispatcher.
 
 ### The security boundary is the socket file and its folder
 
-There is one agent per user, and its socket is `<profile>\AppData\Local\ssh-broker\agent.sock`.
-The shim runs as the authenticated SSH user and derives that path from its own token's profile
+There is one agent per user, and its socket is `<profile>\AppData\Local\ssh-broker\agent.sock`;
+for an agent at High integrity (an administrator's elevated one) it is
+`<profile>\AppData\Local\ssh-broker-elevated\agent.sock`, a folder of its own (`socket_loc::Integrity`
+says which: the shim and the agent each derive it from their own token's integrity level). The
+shim runs as the authenticated SSH user and derives that path from its own token's profile
 (`userdir`), never from the environment or an argument, so it cannot be pointed at another
 account's agent. What keeps one user out of another's session is then two ACLs, not anything in
 this code:
@@ -59,6 +62,16 @@ no label unless one is set on it or inherited from any ancestor folder (the prod
 SACL unprotected). Only the user at Medium or above, an administrator or SYSTEM can set one, and
 each of them can connect anyway; the product does not check for one.
 `tests/user_isolation_windows.rs` pins the refusal and, with the file labelled Low, the connect.
+
+The elevated folder uses that rule as its gate. It is created with the mandatory label
+`S:(ML;OICI;NW;;;HI)` (High, no-write-up, inherited) in its creation descriptor, so the socket, the
+locks and `logs` are born labelled, and a process of the account below High can neither connect nor
+delete, rename or create beside the socket whatever the DACL says. `acl::verify_dir_acl` and
+`acl::verify_file_acl` take the location's `Integrity` and for `High` require exactly that label as
+part of "exactly private"; a folder without it is refused with the words of every other refusal and
+is never labelled afterwards. `tests/user_isolation_windows.rs` pins
+what a process below High is refused, and `tests/redirection_guard_windows.rs` pins the premise of
+`verify`'s junction row (see the next section).
 
 `userdir::open_socket_dir` (and `ensure_socket_dir` over it) reaches the folder by handle: it opens
 the profile directory (opened following a link, see below), then `AppData`, `Local`,
@@ -102,8 +115,8 @@ the `AppData` the walk went through. A process of the same account that renamed 
 it out of `AppData`, and put a link or a folder of its own in its place while the walk was opening it
 is caught there, and after the check the location's path names the folders held. A folder that is gone
 when it is confirmed is a refusal too, never "no folder yet". What may be written inside the folder, or to its
-attributes, is decided by its ACL (and, for the elevated agent's folder, by the label a later change
-adds), not by the hold. This is a stated limit: if another program holds
+attributes, is decided by its ACL (and, for the elevated agent's folder, by its label), not by the hold.
+This is a stated limit: if another program holds
 the broker's own folder open in a way that keeps the broker from using it (with the right to delete
 or rename it, or without letting others read it) when a walk opens it, the walk is refused with that
 said (`offer::text::folder_held`): no retry, since a holder that never lets go would hang the login.
@@ -115,14 +128,15 @@ the connect itself by a bare path (an account the socket's ACL refuses, a stand-
 in `tests/common/raw_connect.rs`.
 
 The agent's own operations in the folder (`Listener::bind`, the `agent_lock` locks, the `serving`
-marker) still name it by path. That gains a process of the same account nothing as long as the agent
-runs with a non-elevated token: a link then redirects it only to what the same account can already
-change. A standard account's agent has one. An administrator's agent is elevated, started by the logon
-task (`HighestAvailable`), by the password prompt (a batch logon, pinned by
-`an_administrators_shim_sees_the_elevated_agent_it_starts`) or by the `auto-login` task; it refuses to
-run with a filtered token (exit code 68). So the argument does not cover it, nor an agent started by
-hand from an elevated prompt.
-The elevated shim is different. It looks at `agent.lock` through the
+marker) name it by path, and the by-path contract rests on the hold above: the agent keeps its
+`SocketDir` for its whole run, so while any of these runs nobody can rename, replace or remove the
+folder, or `Local` or `AppData` above it, and the path names the folder held. That matters most for an
+elevated agent, whose writes a redirection would otherwise pay. An administrator's agent is elevated,
+started by the logon task (`HighestAvailable`), by the password prompt (a batch logon, pinned by
+`an_administrators_shim_sees_the_elevated_agent_it_starts`) or by the `auto-login` task, and it refuses
+to run with a filtered token (exit code 68). Inside its folder the label keeps a process of the account
+below High from creating or changing anything; the hold keeps it from moving the folder itself.
+The elevated shim looks at `agent.lock` through the
 folder's handle and never creates it (`starting_agent`, `userdir::open_existing_socket_dir`); the
 folder watch (`socket_watch`) stays by path, and neither it nor the connect, which goes through the
 folders held, creates or writes anything.
@@ -141,6 +155,36 @@ deliberate degradation, and the security boundary never degrades — the ACL che
 bind both fail closed. Elsewhere the shim also prefers working over failing in smaller ways
 (logging disables itself rather than aborting, for one), and provisioning has best-effort steps of
 its own.
+
+### What `verify`'s junction row proves
+
+RedirectionGuard refuses to follow a link that a non-administrator made, and a process follows a link it
+made itself, so a row that read through a link the probe made as an elevated process would pass whether or
+not the mitigation is on. For an agent at High integrity `verify` therefore runs two probes through it
+(`provision::probe_run`): first `verify-probe --make-junction <directory>` with `Privilege::Unelevated`, which
+makes that directory with a junction in it by a token below High, then `verify-probe --follow <directory>` as
+the account, which reads through it. `verify` names the directory of every junction itself, under its own temp directory with a
+name unique to the run, before any probe runs, and removes it, through no link, whatever became of the
+probes: no probe reports a path, because a path a process below High wrote is not one an elevated `verify`
+acts on. The make-probe fails on a path that exists and never clears one. Each probe's outcome is a value
+(`session_rows::ProbeOutcome`: answered, failed, timed out, not run) and `probe_run::run_at` returns them
+all, so the rows are a pure function of what it found. A probe that fails is data, not an early return: the
+default probe still runs (given no junction), so only the rows about the failed probe fail. A junction
+counts as made from below High only when the make-probe reports an integrity below High and a junction
+that was made; otherwise the junction row fails with why, and a probe that reported no outcome is never read
+as one that made a junction. A junction needs no privilege, but it needs a volume that holds reparse points,
+which `link::make` asks the volume once the directory is made: a volume that holds none is
+`SymlinkState::Skipped`, which fails nothing and says on the row that it was not tested; on a volume that
+holds them every later failure is `NotMade` with its cause, a junction refused with error 448 is `Blocked`,
+and one that was made and not read is `Failed`, and all three fail. The stderr lines of a probe about its
+junction and about its own token (`probe::JUNCTION_SAID`, `probe::TOKEN_SAID`) reach the rows they explain.
+For an agent below High there is one probe, which makes and follows the junction in the directory it is
+given. The probe's PROBE line also carries its own `elevation` and `integrity` (read by
+`account::elevation_of` and `integrity_of`), which the `elevated session` and `unelevated session on request`
+rows judge. The two probes and the two rows are keyed on the agent being at High (the level of the process
+that runs `verify`, which is the level of the folder it asks; the default probe's own level for the rows),
+not on `Elevation::Full`.
+`tests/redirection_guard_windows.rs` measures the premise.
 
 ## Building and testing
 
@@ -238,10 +282,13 @@ macOS build.
 growth frees the old store); the console's record buffer is wiped after every read. From there it goes only to
 Windows, in these places:
 
-- `CreateProcessWithLogonW`, to start a background session (`logon::start_background_agent`), in a
-  NUL-terminated copy that `Password::with_nul` wipes when the call returns;
-- `LogonUserW`, to ask whether the account may log on as a batch job (`logon::check_batch_logon`), in the same
-  kind of wiped copy;
+- `CreateProcessWithLogonW`, to start a background session below High (`logon::start_background_agent`
+  with `LogonKind::Interactive`), in a NUL-terminated copy that `Password::with_nul` wipes when the call
+  returns;
+- `LogonUserW(BATCH)`, the one call `logon::batch_logon` makes, in the same kind of wiped copy: to ask
+  whether the account may log on as a batch job (`logon::check_batch_logon`, which drops the token) and, for
+  a login at High, to make the token the elevated agent is started with (`LogonKind::Batch`, over
+  `CreateProcessWithTokenW`, which takes that token and never the password);
 - Task Scheduler's `RegisterTask`, which **stores** it in its credential store for `auto-login on`
   (`provision::password_variant`): a BSTR copy that is zeroed before it is freed. Task Scheduler's own copy
   and the RPC buffers that carry it are outside this process.

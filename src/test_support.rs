@@ -107,6 +107,30 @@ pub fn hold_without_sharing_read(dir: &std::path::Path) -> std::fs::File {
         .unwrap_or_else(|e| panic!("hold {} without sharing read: {e}", dir.display()))
 }
 
+// A directory of a test's own -----
+
+/// A new, empty directory under the temp dir, named as `verify` names the directory of its junction
+/// ([`crate::provision::probe::link::unique_dir`]), removed with what is in it on drop.
+pub struct Scratch(pub PathBuf);
+
+impl Scratch {
+    pub fn new() -> Scratch {
+        let path = crate::provision::probe::link::unique_dir(&std::env::temp_dir());
+        std::fs::create_dir(&path).unwrap();
+        Scratch(path)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        std::fs::read_dir(&self.0).unwrap().next().is_none()
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 // A stand-in profile -----
 
 /// A stand-in profile under the temp dir, removed on drop. `AppData\Local` exists inside it, as

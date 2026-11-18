@@ -13,10 +13,12 @@ speak framed messages over an ACL-gated AF_UNIX socket in that user's profile. `
 
 The point is lineage: a shell that is a child of the agent rather than of `sshd` inherits
 neither the session-0 network logon nor the RedirectionGuard mitigation. `verify` establishes
-the session id and DPAPI through an agent-spawned probe, and reports symlink traversal — a probe
-that cannot create a link reports `Skipped` rather than failing, which is the usual outcome for
-the agent, which runs as the account itself (elevated for an administrator). The profile follows
-from the interactive logon and is not separately checked.
+the session id and DPAPI through an agent-spawned probe, and whether a junction that a token below
+High made is followed (RedirectionGuard refuses only those, so an agent at High is probed twice: an
+`Unelevated` probe makes the junction, the default one follows it). `verify` names the junction's
+directory and removes it; not tested means the volume holds no junctions. It also shows that an
+administrator's session is elevated and that an unelevated one can be had; `provision/probe_run` has
+the rest. The profile follows from the interactive logon and is not separately checked.
 
 ## Where things live
 
@@ -38,12 +40,12 @@ from the interactive logon and is not separately checked.
 | `filelog` | the daily log in the user's own folder, written under the folder's handle |
 | `handoff` | the notice and the line the agent writes into the inherited pipe it hands the hidden `console-fallback` verb |
 | `vtinput` | Win32 `INPUT_RECORD` → VT sequences (pure, host-testable) |
-| `provision` | `apply`/`verify`: DefaultShell, logon task, per-user socket rows, parity probes |
+| `provision`, `provision/{probe,probe_run,session_rows}` | `apply`/`verify`: DefaultShell, logon task, per-user socket rows, parity probes (the PROBE line, the junction they follow, the two probes of an elevated agent) and the rows they give |
 | `offer`, `offer/text` | the session offer as a pure state machine over injected I/O, and every line it shows |
 | `secret`, `password_entry` | wiped password buffers, and the key-event state machine that fills one |
 | `console_modes`, `console_prompt` | the console's raw mode as a guard; the password prompt on it, and why the shim has no agent |
 | `shim_offer` | the shim's hook for a missing agent: the notice, or the prompt, the logon and the wait for the agent |
-| `account`, `logon`, `socket_watch` | who the token is, the secondary-logon call that starts a background agent, and the folder and profile-list watch with which the shim learns the agent serves (no named kernel object) |
+| `account`, `logon`, `socket_watch` | who the token is and how elevated (`Elevation`), the secondary-logon call that starts a background agent, and the folder and profile-list watch with which the shim learns the agent serves (no named kernel object) |
 | `agent_background`, `agent/logout`, `logout` | the background agent's start checks and exit codes; ending a session, both sides |
 
 ## Invariants you must not break
@@ -60,7 +62,10 @@ diff. (No lint enforces any of these — `clippy.toml` is deliberately empty.) F
 - **No personal home paths** in tracked files; usernames and machine names *(review)*.
 - **`acl::verify_dir_acl` and `acl::verify_file_acl` are exact-match and fail-closed.** Together they
   are the security boundary: the socket file's ACL decides who can connect, the folder's decides who
-  can replace the socket. If either cannot be proven, refuse to bind.
+  can replace the socket. If either cannot be proven, refuse to bind. One folder and two ACLs for an
+  agent below High (`ssh-broker`); an agent at High (an administrator's elevated one) uses
+  `ssh-broker-elevated`, and its folder and socket checks also require the High integrity label,
+  which is what keeps a process of the account below High from connecting.
 - **The shim fails open on the relay path** *(review)*, through the configured shell (the built-in `cmd.exe` if that is unusable). A broken broker must
   not cost you SSH access. The security boundary never degrades — the ACL gate and the bind
   fail closed. Provisioning has best-effort steps of its own, marked where they occur.

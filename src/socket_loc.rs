@@ -44,6 +44,18 @@ impl Integrity {
     }
 }
 
+/// How much of an administrator's power a token carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Elevation {
+    /// An administrator's full token: `Administrators` enabled, integrity High or above.
+    Full,
+    /// An administrator account's token cut down, as UAC gives a non-elevated process: the
+    /// `Administrators` group is deny-only or disabled, or the integrity level is below High.
+    Filtered,
+    /// A token of an account that is not an administrator.
+    Standard,
+}
+
 /// What is said of a socket file at `path` that is not as the agent made it (`acl::verify_file_acl` is
 /// false): it must grant exactly `grantee`, SYSTEM and Administrators and, for [`Integrity::High`], carry
 /// the High label. One wording for the agent's refusal to bind and `verify`'s row.

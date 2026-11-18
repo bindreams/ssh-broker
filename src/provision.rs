@@ -20,10 +20,14 @@ pub(crate) mod layout;
 pub mod password_variant;
 pub mod probe;
 #[cfg(windows)]
+mod probe_run;
+#[cfg(windows)]
 pub mod procwait;
 pub mod registry;
 pub mod report;
 pub mod schtasks;
+#[cfg(windows)]
+pub(crate) mod session_rows;
 pub mod session_task;
 #[cfg(windows)]
 pub mod sessions;
@@ -52,11 +56,14 @@ pub fn verify() -> anyhow::Result<()> {
 
 /// `verify-probe`: the hidden child the agent spawns in session 1. Prints one PROBE line and
 /// exits 0 (parity) / 1 (not). Never invoked directly by users.
-pub fn verify_probe() -> anyhow::Result<()> {
+pub fn verify_probe(link: crate::route::ProbeLink) -> anyhow::Result<()> {
     #[cfg(windows)]
-    return imp::verify_probe();
+    return imp::verify_probe(link);
     #[cfg(not(windows))]
-    anyhow::bail!("verify-probe runs only on Windows");
+    {
+        let _ = link;
+        anyhow::bail!("verify-probe runs only on Windows");
+    }
 }
 
 /// Check the arguments after `apply`.
@@ -94,9 +101,20 @@ pub fn shell_config_row(effective: &anyhow::Result<crate::shell::Effective>) -> 
 }
 
 /// The handshake `verify` sends to run its probe through the agent: ssh-broker's own command, run as
-/// it stands and not through the user's shell.
-pub fn probe_handshake(exe: &std::path::Path) -> crate::protocol::Handshake {
+/// it stands and not through the user's shell. `privilege` is what the probe asks the agent for, and
+/// `link` what it does about the junction of the link row.
+pub fn probe_handshake(
+    exe: &std::path::Path,
+    privilege: crate::protocol::Privilege,
+    link: &crate::route::ProbeLink,
+) -> crate::protocol::Handshake {
+    use crate::route::ProbeLink;
     let command = format!("\"{}\" verify-probe", exe.display());
+    let command = match link {
+        ProbeLink::NoJunction => command,
+        ProbeLink::Make(dir) => format!("{command} --make-junction \"{dir}\""),
+        ProbeLink::Follow(dir) => format!("{command} --follow \"{dir}\""),
+    };
     crate::shim::make_handshake(
         &Some(command),
         false,
@@ -104,7 +122,7 @@ pub fn probe_handshake(exe: &std::path::Path) -> crate::protocol::Handshake {
         "xterm".into(),
         80,
         24,
-        crate::protocol::Privilege::Account,
+        privilege,
     )
 }
 
@@ -137,10 +155,9 @@ mod imp {
     use super::layout::{self, Layout};
     use super::registry::SshdShell;
     use super::{
-        apply_lock, flow, probe, procwait, registry, report, schtasks, session_task, sessions, system_config,
-        taskscheduler, user_rows,
+        apply_lock, flow, probe, probe_run, procwait, registry, report, schtasks, session_rows, session_task, sessions,
+        system_config, taskscheduler, user_rows,
     };
-    use crate::{afunix, shim};
     use anyhow::Context;
     use std::path::{Path, PathBuf};
 
@@ -463,10 +480,9 @@ mod imp {
         // Per user: this account's socket, its folder and file ACLs, and whether its agent
         // answers. `verify` reports on the account that runs it.
         let location = crate::userdir::current_socket_location();
-        match (
-            crate::acl::Sid::current_user(),
-            user_rows::account_rows(&crate::account::elevation()),
-        ) {
+        let account_rows = user_rows::account_rows(&crate::account::elevation());
+        let filtered = matches!(account_rows, user_rows::AccountRows::Filtered);
+        match (crate::acl::Sid::current_user(), account_rows) {
             (Ok(_), user_rows::AccountRows::Filtered) => {
                 rows.push(user_rows::socket_location_row(&location));
                 rows.push(user_rows::filtered_row());
@@ -500,68 +516,19 @@ mod imp {
         // A malformed `--probe-timeout` errors rather than quietly applying the default, so the
         // operator who asked to wait indefinitely never silently gets 30s and a wrong diagnosis.
         let probe_timeout = super::bounded::probe_timeout_from_args(&std::env::args().collect::<Vec<_>>())?;
-        // The probe runs the exe in the install directory, so an untrusted one never gets that far.
-        match layout::run_if_trusted_base(&base, |trusted| {
-            drive_probe_bounded(&trusted.layout().canonical_exe(), probe_timeout)
-        }) {
-            Ok((p, binary_ok)) => {
-                // Parity = escaped session 0 (the limited network-logon session). The agent
-                // need not be in THE active-console session — a box can have several
-                // interactive sessions — and DPAPI/symlink below confirm it is a genuine one.
-                rows.push(report::Check::new(
-                    "interactive session (via agent)",
-                    probe::is_genuine_session(p.session_id, p.logon_type),
-                    format!(
-                        "session_id={} (active console={}, logon type={})",
-                        p.session_id,
-                        probe::active_console_session(),
-                        p.logon_type.map_or("unknown".to_string(), |t| t.to_string())
-                    ),
-                ));
-                rows.push(report::Check::new("DPAPI (via agent)", p.dpapi_ok, String::new()));
-                // Only a confirmed Blocked is a parity failure; Skipped (unprivileged,
-                // untestable) does not fail verify.
-                rows.push(report::Check::new(
-                    "symlink (via agent)",
-                    !p.symlink.is_failure(),
-                    format!("{:?}", p.symlink),
-                ));
-                // Byte-transparency on the real path, in BOTH directions. Nothing is routed
-                // around the relay any more, so "the relay carries arbitrary bytes unchanged" is
-                // what makes scp/sftp work at all rather than a nicety — and the README says so.
-                // These rows are what hold that claim honest end to end rather than in prose.
-                // They are separate because a one-directional failure must name its direction:
-                // client → child is the `scp`/`sftp put` upload, child → client the download.
-                // Named for the transfer each direction carries. The previous names differed only
-                // by two transposed words ("child to client" / "client to child") and read as
-                // near-identical in the one place they appear side by side. (The formatter pads to
-                // a MINIMUM width and truncates nothing — a sibling row already runs longer — so
-                // length was never the problem; legibility was.)
-                rows.push(report::Check::new(
-                    "binary download (via agent)",
-                    binary_ok,
-                    if binary_ok {
-                        String::new()
-                    } else {
-                        "the payload the child sent did not survive the relay byte for byte".into()
-                    },
-                ));
-                // `detail()` distinguishes "the child reported a mismatch" from "the child never
-                // reported at all" (an installed exe older than this check). Both FAIL — default-deny — but
-                // they have different remedies, and claiming the payload was mangled when nothing
-                // ever looked at it would be a diagnosis the code cannot support.
-                rows.push(report::Check::new(
-                    "binary upload (via agent)",
-                    p.upstream.proven(),
-                    p.upstream.detail(),
-                ));
-            }
-            Err(e) => {
-                rows.push(report::Check::new(
+        // An administrator's unelevated prompt has no agent in the folder it looks in, and says why above;
+        // a probe would only add a raw "connect to agent" failure beside that, so none is run.
+        if !filtered {
+            // The probe runs the exe in the install directory, so an untrusted one never gets that far.
+            match layout::run_if_trusted_base(&base, |trusted| {
+                probe_run::run(&trusted.layout().canonical_exe(), probe_timeout)
+            }) {
+                Ok(probes) => rows.extend(session_rows::parity_rows(&probes, probe::active_console_session())),
+                Err(e) => rows.push(report::Check::new(
                     "parity probe (via agent)",
                     false,
-                    format!("unavailable: {e}"),
-                ));
+                    format!("unavailable: {e:#}"),
+                )),
             }
         }
 
@@ -576,68 +543,14 @@ mod imp {
         Ok(())
     }
 
-    /// Drive the probe on a worker thread, giving up after `timeout`.
-    ///
-    /// The bound is here rather than around the child's stdin read for two reasons. It covers
-    /// EVERY way the probe can fail to answer — a lost stdin-EOF marker, an agent that accepts the
-    /// connection and then never replies, a child that dies mid-write — where bounding the read
-    /// would cover only the first. And bounding a blocking `ReadFile` on a Windows pipe means
-    /// overlapped I/O inside the child, where this is a thread and a channel.
-    ///
-    /// On expiry the error flows into the same `parity probe (via agent)` row that an unreachable
-    /// agent produces, so `verify` still prints every local check and exits non-zero — instead of
-    /// hanging with nothing on stdout, which is what it did before.
-    fn drive_probe_bounded(
-        exe: &Path,
-        timeout: Option<std::time::Duration>,
-    ) -> anyhow::Result<(probe::ProbeResult, bool)> {
-        let (tx, rx) = std::sync::mpsc::channel();
-        let exe = exe.to_path_buf();
-        // The worker owns the whole relay conversation; on expiry it is left blocked on a socket
-        // that is not delivering, and `verify` exits immediately after printing, which collects it.
-        std::thread::spawn(move || {
-            let _ = tx.send(drive_probe(&exe));
-        });
-        super::bounded::await_bounded(&rx, timeout)?
-    }
-
-    /// Drive `<exe> verify-probe` as an EXEC command THROUGH the agent (so it runs in session 1),
-    /// parse the PROBE line it prints, and check whether its binary payload survived intact.
-    ///
-    /// The byte check reads the RAW stdout, before the lossy UTF-8 conversion the line parse
-    /// needs: the payload is deliberately not valid UTF-8, so converting first would destroy the
-    /// very property being measured. This is the end-to-end half of byte-transparency — a real
-    /// child, real pipes, a real socket — which the in-memory relay tests cannot reach.
-    fn drive_probe(exe: &Path) -> anyhow::Result<(probe::ProbeResult, bool)> {
-        let sock = crate::userdir::inspect_current_socket_dir()
-            .and_then(|folder| folder.connect())
-            .context("connect to agent")?;
-        let (rx, tx) = afunix::split(sock)?;
-        let hs = super::probe_handshake(exe);
-        let mut out = Vec::new();
-        let mut err = Vec::new();
-        // Feed the SAME payload upstream that the child echoes downstream. Passing `io::empty()`
-        // here left the client → child direction — the `sftp put` / `scp` upload direction —
-        // completely unchecked, while the docs claimed `verify` covered both.
-        let upstream = std::io::Cursor::new(probe::binary_probe_payload());
-        let code = shim::run_exec_on(rx, tx, &hs, &mut out, &mut err, upstream)?;
-        anyhow::ensure!(
-            code != 254 && code != 255,
-            "probe relay failed (code {code}; stderr={})",
-            String::from_utf8_lossy(&err).trim()
-        );
-        let binary_ok = probe::binary_probe_ok(&out);
-        let parsed = probe::parse_probe_line(&String::from_utf8_lossy(&out))?;
-        Ok((parsed, binary_ok))
-    }
-
     // ── verify-probe (runs in session 1, spawned by the agent) ───────────────────────
 
-    pub fn verify_probe() -> anyhow::Result<()> {
+    pub fn verify_probe(link: crate::route::ProbeLink) -> anyhow::Result<()> {
         let sid = probe::current_session_id();
         let logon_type = probe::current_logon_type();
         let dpapi = probe::dpapi_roundtrip(b"ssh-broker-parity-probe");
-        let symlink = probe::symlink_probe();
+        let symlink = probe::link::run(&link);
+        let (elevation, integrity) = probe::current_token_facts();
         // Read the UPSTREAM payload first. This direction — client → child — is the one an
         // `sftp put` / `scp` upload rides. The two directions are measured INDEPENDENTLY: the
         // downstream payload emitted below is a fixed write that carries nothing back about what
@@ -662,24 +575,33 @@ mod imp {
             use std::io::Write;
             let mut stdout = std::io::stdout().lock();
             probe::emit_binary_probe(&mut stdout).context("emit the binary-transparency payload")?;
-            writeln!(
-                stdout,
-                "{}",
-                probe::format_probe_line(sid, dpapi, symlink, upstream_ok, logon_type)
-            )
-            .context("write the PROBE line")?;
+            let result = probe::ProbeResult {
+                session_id: sid,
+                dpapi_ok: dpapi,
+                symlink,
+                upstream: if upstream_ok {
+                    probe::UpstreamState::Ok
+                } else {
+                    probe::UpstreamState::Fail
+                },
+                logon_type,
+                elevation,
+                integrity,
+            };
+            writeln!(stdout, "{}", probe::format_probe_line(&result)).context("write the PROBE line")?;
             stdout.flush().context("flush probe output")?;
         }
         // Parity gates: escaped session 0 AND a working DPAPI (proves a real user profile, the
-        // thing session 0 lacks). A CONFIRMED symlink block also fails; a Skipped (unprivileged,
-        // untestable) symlink does not. The active-console id is NOT required to match — a host
+        // thing session 0 lacks). A junction that was not followed also fails. The active-console id is NOT required to match — a host
         // can have several interactive sessions; any non-0 one with DPAPI is parity.
         //
         // `upstream_ok` is deliberately NOT a gate here: it measures the RELAY, not the session,
         // and this child is the wrong place to judge it — exiting non-zero would report a
         // transport fault as a parity failure, and the parent could not tell the two apart. It
         // rides up in the PROBE line instead, where `verify` gates it as a row of its own.
-        let pass = probe::is_genuine_session(sid, logon_type) && dpapi && !symlink.is_failure();
+        let pass = probe::is_genuine_session(sid, logon_type)
+            && dpapi
+            && !symlink.is_some_and(probe::SymlinkState::is_failure);
         if !pass {
             std::process::exit(1);
         }

@@ -27,7 +27,7 @@ pub enum Route {
     Apply,
     Verify,
     /// Hidden: the parity-probe child the agent spawns in session 1 (used by `verify`).
-    VerifyProbe,
+    VerifyProbe(ProbeLink),
     /// Hidden: the fallback shell of a terminal session through the agent. `handle` is the value of
     /// an inherited pipe that holds a notice and a line (see `handoff`); the verb prints the notice
     /// on its console, starts the line on that console and exits with the code of the line. `login`:
@@ -43,6 +43,21 @@ pub enum Verb {
     Agent,
     Logout,
     ConsoleFallback,
+    VerifyProbe,
+}
+
+/// What a `verify-probe` does with the junction its link check reads through (`provision::probe::link`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProbeLink {
+    /// Make no junction and read none: the probe reports no link outcome. What `verify` runs when it cannot
+    /// name a directory.
+    NoJunction,
+    /// Make this directory, which must not exist yet, with a junction in it, read through it, and leave
+    /// it for `verify` to remove: the one probe of an agent below High, and the unelevated probe of an
+    /// administrator's agent, whose junction the elevated probe then follows.
+    Make(String),
+    /// Read through the junction in this directory, which another probe made.
+    Follow(String),
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -88,7 +103,7 @@ pub fn route(args: &[String], command_line: &str) -> Route {
         Some("auto-login") => Route::AutoLogin(auto_login_args(&args[1..])),
         Some("apply") => Route::Apply,
         Some("verify") => Route::Verify,
-        Some("verify-probe") => Route::VerifyProbe,
+        Some("verify-probe") => probe_link(&args[1..]).map_or(Route::Usage(Verb::VerifyProbe), Route::VerifyProbe),
         Some("console-fallback") => console_fallback_args(&args[1..])
             .map_or(Route::Usage(Verb::ConsoleFallback), |(handle, login)| {
                 Route::ConsoleFallback { handle, login }
@@ -108,6 +123,16 @@ pub fn route(args: &[String], command_line: &str) -> Route {
             Route::Shim { exec: Some(exec) }
         }
         _ => Route::Shim { exec: None },
+    }
+}
+
+/// `[]`, `--make-junction <directory>` or `--follow <directory>`.
+fn probe_link(rest: &[String]) -> Option<ProbeLink> {
+    match rest {
+        [] => Some(ProbeLink::NoJunction),
+        [flag, dir] if flag == "--make-junction" && !dir.starts_with("--") => Some(ProbeLink::Make(dir.clone())),
+        [flag, dir] if flag == "--follow" && !dir.starts_with("--") => Some(ProbeLink::Follow(dir.clone())),
+        _ => None,
     }
 }
 

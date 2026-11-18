@@ -27,7 +27,8 @@ use std::time::Duration;
 /// would be worse than no bound at all.
 pub const DEFAULT_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Parse `--probe-timeout` out of `args`; `0` selects an indefinite wait.
+/// Parse `--probe-timeout` out of `args`; `0` selects an indefinite wait. The bound is for each probe,
+/// and an agent at High is probed twice.
 ///
 /// Accepts both `--probe-timeout 30` and `--probe-timeout=30`. The `=` spelling is what many
 /// operators reach for first, and silently ignoring it would apply the default while the operator
@@ -71,14 +72,11 @@ pub fn probe_timeout_from_args(args: &[String]) -> anyhow::Result<Option<Duratio
 /// selects for someone debugging a genuine deadlock.
 ///
 /// On expiry the sender is left running. That is deliberate: it is blocked inside the relay
-/// conversation with no portable way to interrupt it, and `verify` prints its report and exits
-/// immediately afterwards, so process teardown collects it. Leaking a blocked thread in a
-/// short-lived diagnostic beats an unkillable wait that reports nothing.
-pub fn await_bounded<T>(rx: &Receiver<T>, timeout: Option<Duration>) -> anyhow::Result<T> {
+/// conversation with no portable way to interrupt it. `verify` goes on without it (it starts no
+/// further probe and prints its report) and exits afterwards, so process teardown collects the thread.
+pub fn await_bounded<T>(rx: &Receiver<T>, timeout: Option<Duration>) -> Result<T, WaitError> {
     let Some(d) = timeout else {
-        return rx
-            .recv()
-            .map_err(|_| anyhow::anyhow!("the probe worker stopped without reporting"));
+        return rx.recv().map_err(|_| WaitError::WorkerStopped);
     };
     // The `sleep-ok:` marker must sit on the SAME line as the call, because `no-sleep-sync` keys
     // per line. Bound to a `let` first rather than inlined into `match`: `cargo fmt` relocates a
@@ -90,17 +88,35 @@ pub fn await_bounded<T>(rx: &Receiver<T>, timeout: Option<Duration>) -> anyhow::
         // Name what is actually known. The agent answered the connect, so the relay itself is not
         // the suspect — what has not happened is any output from the agent's handler or the
         // session-1 child it spawned.
-        Err(RecvTimeoutError::Timeout) => anyhow::bail!(
-            "the agent accepted the connection but the probe produced no output within {}s — the \
-             agent or the session-1 child may be wedged. Raise the bound with \
-             `--probe-timeout <seconds>`, or `--probe-timeout 0` to wait indefinitely",
-            d.as_secs()
-        ),
-        Err(RecvTimeoutError::Disconnected) => {
-            anyhow::bail!("the probe worker stopped without reporting")
+        Err(RecvTimeoutError::Timeout) => Err(WaitError::TimedOut { secs: d.as_secs() }),
+        Err(RecvTimeoutError::Disconnected) => Err(WaitError::WorkerStopped),
+    }
+}
+
+/// Why [`await_bounded`] gave no value. A timed-out worker may still be running; a dropped one is not.
+#[derive(Debug)]
+pub enum WaitError {
+    /// The bound passed with no value.
+    TimedOut { secs: u64 },
+    /// The sender was dropped before it sent one.
+    WorkerStopped,
+}
+
+impl std::fmt::Display for WaitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WaitError::TimedOut { secs } => write!(
+                f,
+                "the agent accepted the connection but the probe produced no output within {secs}s — the \
+                 agent or the session-1 child may be wedged. Raise the bound with \
+                 `--probe-timeout <seconds>`, or `--probe-timeout 0` to wait indefinitely"
+            ),
+            WaitError::WorkerStopped => write!(f, "the probe worker stopped without reporting"),
         }
     }
 }
+
+impl std::error::Error for WaitError {}
 
 #[cfg(test)]
 #[path = "bounded_tests.rs"]

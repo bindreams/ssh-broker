@@ -5,14 +5,28 @@
 //! so the DPAPI/symlink/session checks MUST run in an agent-spawned child (which is in session
 //! 1) — running them in verify's own process would false-negative on a correctly-installed box.
 
-/// Symlink-traversal probe outcome. `Skipped` means the link could not even be created (a
-/// unelevated token lacks `SeCreateSymbolicLinkPrivilege`), so traversal was untestable —
-/// distinct from `Blocked` (created but RedirectionGuard refused to follow it). Only `Blocked`
-/// is a parity FAILURE; `Skipped` is informational (the session-id check is the real gate).
+use crate::socket_loc::Elevation;
+
+#[cfg(windows)]
+pub mod link;
+
+/// Outcome of reading through a junction in the probe's temp directory. The junction is one that a
+/// token below High made: RedirectionGuard refuses to follow a link a non-administrator made, and a
+/// process that made the link itself always follows it, so only a followed junction proves anything.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SymlinkState {
+    /// The junction was followed.
     Ok,
+    /// The junction exists and the read was refused as an untrusted mount point (error 448):
+    /// RedirectionGuard is on in this session.
     Blocked,
+    /// The junction was made, and the read failed for another reason.
+    Failed,
+    /// The junction could not be made on a volume that holds them (access, disk, a path that exists, the
+    /// directory or something in it before the junction): nothing was made to follow, and that is a fault.
+    NotMade,
+    /// The volume of the directory holds no junctions (a temp directory on a volume with no reparse
+    /// points, say), so following one was not tested. Informational: it fails nothing.
     Skipped,
 }
 
@@ -21,27 +35,42 @@ impl SymlinkState {
         match self {
             SymlinkState::Ok => "ok",
             SymlinkState::Blocked => "blocked",
+            SymlinkState::Failed => "fail",
+            SymlinkState::NotMade => "notmade",
             SymlinkState::Skipped => "skip",
         }
     }
-    fn parse(s: &str) -> SymlinkState {
+    fn parse(s: &str) -> Option<SymlinkState> {
         match s {
-            "ok" => SymlinkState::Ok,
-            "blocked" => SymlinkState::Blocked,
-            _ => SymlinkState::Skipped, // missing/unknown → untestable, not a failure
+            "ok" => Some(SymlinkState::Ok),
+            "blocked" => Some(SymlinkState::Blocked),
+            "fail" => Some(SymlinkState::Failed),
+            "notmade" => Some(SymlinkState::NotMade),
+            "skip" => Some(SymlinkState::Skipped),
+            _ => None,
         }
     }
-    /// Whether this outcome should fail parity (only a confirmed block does).
+    /// Whether this outcome fails parity: a junction that was refused or not read, or a directory that could
+    /// not be made.
     pub fn is_failure(self) -> bool {
-        matches!(self, SymlinkState::Blocked)
+        matches!(
+            self,
+            SymlinkState::Blocked | SymlinkState::Failed | SymlinkState::NotMade
+        )
+    }
+    /// Whether the probe made a junction: it did when it went on to read through it.
+    pub fn was_made(self) -> bool {
+        matches!(self, SymlinkState::Ok | SymlinkState::Blocked | SymlinkState::Failed)
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProbeResult {
     pub session_id: u32,
     pub dpapi_ok: bool,
-    pub symlink: SymlinkState,
+    /// What the probe found about its junction. `None` is "not reported": a probe that was given no junction,
+    /// an exe older than the field, an unknown word.
+    pub symlink: Option<SymlinkState>,
     /// Whether the payload `verify` sent UPSTREAM reached the child unchanged. Only the child can
     /// see what arrived, so the PROBE line is the only way to learn the client → child direction;
     /// the downstream half is checked by comparing the child's stdout directly.
@@ -49,6 +78,12 @@ pub struct ProbeResult {
     /// The logon type of the probe's logon session (`SECURITY_LOGON_TYPE`), when it could be read.
     /// `None` is "not proven", like a missing `dpapi`.
     pub logon_type: Option<u32>,
+    /// How much of an administrator's power the probe's own token has, when it could say. `None` is
+    /// "not proven": a row about the session being elevated never passes on it.
+    pub elevation: Option<Elevation>,
+    /// The relative id of the probe's integrity label (`0x2000` Medium, `0x3000` High), when it could
+    /// be read. `None` is "not proven".
+    pub integrity: Option<u32>,
 }
 
 /// `SECURITY_LOGON_TYPE` Interactive.
@@ -174,26 +209,57 @@ fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
 }
 
+/// The word of an [`Elevation`] on the PROBE line.
+fn elevation_word(elevation: Elevation) -> &'static str {
+    match elevation {
+        Elevation::Full => "full",
+        Elevation::Filtered => "filtered",
+        Elevation::Standard => "standard",
+    }
+}
+
+fn parse_elevation(word: &str) -> Option<Elevation> {
+    [Elevation::Full, Elevation::Filtered, Elevation::Standard]
+        .into_iter()
+        .find(|&elevation| elevation_word(elevation) == word)
+}
+
+/// A relative id as the line writes it (`0x2000`), and back.
+fn parse_integrity(text: &str) -> Option<u32> {
+    u32::from_str_radix(text.strip_prefix("0x")?, 16).ok()
+}
+
 /// The single line `verify-probe` prints to stdout.
-pub fn format_probe_line(
-    session_id: u32,
-    dpapi_ok: bool,
-    symlink: SymlinkState,
-    upstream_ok: bool,
-    logon_type: Option<u32>,
-) -> String {
-    let logon = logon_type.map_or(String::new(), |t| format!(" logon={t}"));
-    format!(
-        "PROBE session_id={session_id} dpapi={} symlink={} upstream={}{logon}",
-        if dpapi_ok { "ok" } else { "fail" },
-        symlink.as_str(),
-        if upstream_ok { "ok" } else { "fail" }
-    )
+pub fn format_probe_line(r: &ProbeResult) -> String {
+    let mut line = format!(
+        "PROBE session_id={} dpapi={}",
+        r.session_id,
+        if r.dpapi_ok { "ok" } else { "fail" },
+    );
+    if let Some(symlink) = r.symlink {
+        line.push_str(&format!(" junction={}", symlink.as_str()));
+    }
+    line.push_str(&format!(
+        " upstream={}",
+        if r.upstream.proven() { "ok" } else { "fail" }
+    ));
+    if let Some(logon_type) = r.logon_type {
+        line.push_str(&format!(" logon={logon_type}"));
+    }
+    if let Some(elevation) = r.elevation {
+        line.push_str(&format!(" elevation={}", elevation_word(elevation)));
+    }
+    if let Some(rid) = r.integrity {
+        line.push_str(&format!(" integrity={rid:#x}"));
+    }
+    line
 }
 
 /// Parse the `PROBE …` line out of the child's stdout (tolerant of surrounding noise).
-/// Default-deny on the gating keys: a missing line errors; missing dpapi reads as fail and a
-/// missing session_id as 0. Symlink defaults to `Skipped` (informational, never a false fail).
+/// Default-deny on every key: a missing line errors; a missing dpapi reads as fail, a missing
+/// session_id as 0, and a missing or unknown junction, elevation or integrity as `None`, which no row
+/// passes on. An exe from before the junction check prints its symbolic-link outcome as `symlink=`, which
+/// is not read: it reads as a probe that reported no junction.
 pub fn parse_probe_line(stdout: &str) -> anyhow::Result<ProbeResult> {
     let line = stdout
         .lines()
@@ -202,28 +268,58 @@ pub fn parse_probe_line(stdout: &str) -> anyhow::Result<ProbeResult> {
     let mut r = ProbeResult {
         session_id: 0,
         dpapi_ok: false,
-        symlink: SymlinkState::Skipped,
+        symlink: None,
         // Default-deny, like `dpapi`: a probe child too old to report it must read as "not
         // proven", never as proven. This one gates a claim the README makes, so a silent
         // default of "ok" would restore exactly the unverified assertion it exists to replace.
         // `Absent` rather than `Fail` so the row can say WHICH of the two happened.
         upstream: UpstreamState::Absent,
         logon_type: None,
+        elevation: None,
+        integrity: None,
     };
     for tok in line.split_whitespace() {
         if let Some(v) = tok.strip_prefix("session_id=") {
             r.session_id = v.parse().unwrap_or(0);
         } else if let Some(v) = tok.strip_prefix("dpapi=") {
             r.dpapi_ok = v == "ok";
-        } else if let Some(v) = tok.strip_prefix("symlink=") {
+        } else if let Some(v) = tok.strip_prefix("junction=") {
             r.symlink = SymlinkState::parse(v);
         } else if let Some(v) = tok.strip_prefix("upstream=") {
             r.upstream = UpstreamState::parse(v);
         } else if let Some(v) = tok.strip_prefix("logon=") {
             r.logon_type = v.parse().ok();
+        } else if let Some(v) = tok.strip_prefix("elevation=") {
+            r.elevation = parse_elevation(v);
+        } else if let Some(v) = tok.strip_prefix("integrity=") {
+            r.integrity = parse_integrity(v);
         }
     }
     Ok(r)
+}
+
+// ── what a probe says about itself ─────────────────────────────────────────────────────
+
+/// What the probe writes before each line of its stderr about the junction (why it could not make one,
+/// why it could not read through it, what it could not remove), so `verify` can show those lines and no
+/// others.
+pub const JUNCTION_SAID: &str = "ssh-broker: junction: ";
+/// The same for each line about its own token (why its elevation or its level could not be read).
+pub const TOKEN_SAID: &str = "ssh-broker: token: ";
+/// How much of one kind of line `verify` shows on a row.
+pub const NOTE_LINES: usize = 4;
+pub const NOTE_CHARS: usize = 400;
+
+/// The lines of a probe's `stderr` that begin with `prefix` ([`JUNCTION_SAID`], [`TOKEN_SAID`]), a few of
+/// them and joined with `; `: the probe's own words about what it could not do, for the row they explain.
+pub fn notes(stderr: &str, prefix: &str) -> String {
+    let lines: Vec<&str> = stderr
+        .lines()
+        .filter_map(|line| line.strip_prefix(prefix))
+        .map(str::trim)
+        .take(NOTE_LINES)
+        .collect();
+    lines.join("; ").chars().take(NOTE_CHARS).collect()
 }
 
 // ── Windows parity checks (run in the session-1 probe child) ───────────────────────
@@ -261,6 +357,24 @@ pub fn current_logon_type() -> Option<u32> {
     // SAFETY: the buffer came from LSA.
     let _ = unsafe { LsaFreeReturnBuffer(data.cast()) };
     Some(logon_type)
+}
+
+/// This process's own elevation and integrity level, read from its token by the one reader `account`
+/// has. Each is `None` when it could not be read, and why is on stderr after [`TOKEN_SAID`]: the caller
+/// treats "unknown" as "not proven".
+#[cfg(windows)]
+pub fn current_token_facts() -> (Option<Elevation>, Option<u32>) {
+    fn said<T>(what: &str, read: anyhow::Result<T>) -> Option<T> {
+        read.inspect_err(|e| eprintln!("{TOKEN_SAID}reading {what} failed: {e:#}"))
+            .ok()
+    }
+    let Some(token) = said("the probe's own token", crate::winutil::own_token()) else {
+        return (None, None);
+    };
+    (
+        said("its elevation", crate::account::elevation_of(token.0)),
+        said("its integrity level", crate::account::integrity_of(token.0)),
+    )
 }
 
 /// The active physical console session id (`WTSGetActiveConsoleSessionId`); `0xFFFF_FFFF` if
@@ -312,42 +426,6 @@ fn dpapi_unprotect(blob: &[u8]) -> anyhow::Result<Vec<u8>> {
         let _ = LocalFree(Some(HLOCAL(out.pbData as *mut core::ffi::c_void)));
         Ok(bytes)
     }
-}
-
-/// Create a symlink in a fresh temp dir and read through it. In a network-logon session
-/// RedirectionGuard can block following the link (`STATUS_UNTRUSTED_MOUNT_POINT`); a session-1
-/// token traverses it. Returns `Skipped` if the link could not be created (no privilege — the
-/// common case for an unelevated agent, so this must NOT fail parity), `Blocked` if created
-/// but not followable, `Ok` if it traversed. (A privilege-free, discriminating probe would use
-/// a pre-existing cross-context link; that refinement is a Phase-8 item. The session-id check
-/// is the primary parity proof.)
-#[cfg(windows)]
-pub fn symlink_probe() -> SymlinkState {
-    use std::io::Write;
-    let dir = std::env::temp_dir().join(format!("sb-symprobe-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    let state = (|| -> SymlinkState {
-        if std::fs::create_dir_all(&dir).is_err() {
-            return SymlinkState::Skipped;
-        }
-        let target = dir.join("target.txt");
-        let link = dir.join("link.txt");
-        if std::fs::File::create(&target)
-            .and_then(|mut f| f.write_all(b"parity"))
-            .is_err()
-        {
-            return SymlinkState::Skipped;
-        }
-        if std::os::windows::fs::symlink_file(&target, &link).is_err() {
-            return SymlinkState::Skipped; // no SeCreateSymbolicLinkPrivilege — untestable
-        }
-        match std::fs::read(&link) {
-            Ok(c) if c == b"parity" => SymlinkState::Ok,
-            _ => SymlinkState::Blocked, // created but the read was refused (RedirectionGuard)
-        }
-    })();
-    let _ = std::fs::remove_dir_all(&dir);
-    state
 }
 
 #[cfg(test)]

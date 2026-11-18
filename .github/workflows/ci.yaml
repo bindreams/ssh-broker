@@ -141,6 +141,12 @@ jobs:
         if: (success() || failure()) && runner.os == 'Windows'
         run: .github/scripts/disk-report.ps1 'before the tests'
 
+      # Two tests that start Secondary Logon on demand at the same instant: one is answered "already running"
+      # (0x80070420). Nothing in `ci` stops it afterwards; `ci-exclusive` runs later and puts it back as found.
+      - name: Start Secondary Logon
+        if: runner.os == 'Windows'
+        run: Start-Service seclogon
+
       - name: cargo nextest
         run: cargo nextest run --locked --profile ci
 
