@@ -508,6 +508,12 @@ fn the_image_directory_is_read_from_a_service_image_path_in_any_form() {
         (r"C:\my.executables\sshd.exe", Some(r"C:\my.executables")),
         (r"C:\my.executables\sshd.exe -f D:\x", Some(r"C:\my.executables")),
         (r"C:\OpenSSH\sshd -f D:\x", Some(r"C:\OpenSSH")),
+        // No `.exe` and a space in the path: the whole value is the program, unless an option follows.
+        (r"C:\Program Files\OpenSSH\sshd", Some(r"C:\Program Files\OpenSSH")),
+        (
+            r"C:\Program Files\OpenSSH\sshd -f D:\x",
+            Some(r"C:\Program Files\OpenSSH"),
+        ),
         ("sshd.exe", None),
         ("", None),
         ("  ", None),
@@ -531,10 +537,14 @@ fn the_arguments_of_a_service_image_path_are_the_trimmed_text_after_the_program(
             r"C:\Program Files\OpenSSH\sshd.exe   -f D:\conf\sshd_config  ",
             Some(r"-f D:\conf\sshd_config"),
         ),
-        // An unquoted program ends at the first `.exe` that ends a word, or else at the first white space.
+        // An unquoted program ends at the first `.exe` that ends a word, or else at the first white space that
+        // an option follows, or else it is the whole value.
         (r"C:\my.executables\sshd.exe", None),
         (r"C:\my.executables\sshd.exe -f D:\x", Some(r"-f D:\x")),
         (r"C:\OpenSSH\sshd -f D:\x", Some(r"-f D:\x")),
+        (r"C:\Program Files\OpenSSH\sshd", None),
+        (r"C:\Program Files\OpenSSH\sshd -f D:\x", Some(r"-f D:\x")),
+        (r"C:\Program Files\OpenSSH\sshd   -d  ", Some("-d")),
         (r"sshd -d", Some("-d")),
         (r#""C:\unterminated\sshd.exe -d"#, None),
         ("", None),

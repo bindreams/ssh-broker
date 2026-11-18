@@ -349,7 +349,9 @@ pub fn sshd_search_dirs(host: &dyn Host, image_path: Option<&str>) -> anyhow::Re
 /// A service's `ImagePath` as the program it starts and the text after it. The value is a command line: a
 /// quoted program ends at the closing quote. An unquoted one ends at the first `.exe` (any case) that is
 /// followed by the end of the value or by white space, so a folder named `my.executables` does not end it; when
-/// there is none, at the first white space. Arguments may follow.
+/// there is none, at the first white space that is followed by `-` (sshd takes options only, so the white space
+/// in `C:\Program Files\OpenSSH\sshd` is not the end); when there is none of that either, the whole value is the
+/// program. Arguments may follow.
 fn split_image(image_path: &str) -> (&str, &str) {
     let image_path = image_path.trim();
     if let Some(quoted) = image_path.strip_prefix('"') {
@@ -357,11 +359,18 @@ fn split_image(image_path: &str) -> (&str, &str) {
     }
     let lower = image_path.to_ascii_lowercase();
     let word_end = |at: usize| image_path[at..].chars().next().is_none_or(char::is_whitespace);
+    let before_option = || {
+        image_path
+            .char_indices()
+            .filter(|&(at, c)| c.is_whitespace() && !image_path[..at].ends_with(char::is_whitespace))
+            .map(|(at, _)| at)
+            .find(|&at| image_path[at..].trim_start().starts_with('-'))
+    };
     let end = lower
         .match_indices(".exe")
         .map(|(at, exe)| at + exe.len())
         .find(|&end| word_end(end))
-        .or_else(|| image_path.find(char::is_whitespace))
+        .or_else(before_option)
         .unwrap_or(image_path.len());
     image_path.split_at(end)
 }

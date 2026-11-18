@@ -321,7 +321,7 @@ fn the_sshd_row_fails_when_sshd_started_before_its_configuration_was_written() {
         assert_eq!(
             row.detail,
             format!(
-                "sshd was started before {} was last written and may not have read it; `ssh-broker apply` restarts it",
+                "sshd was started before {} was last written and has not read it; restart the sshd service",
                 PathBuf::from("sshd_config.d").join("10-ssh-broker.conf").display()
             )
         );
@@ -339,9 +339,13 @@ fn the_sshd_row_fails_when_sshd_started_before_its_configuration_was_written() {
 
 #[test]
 fn the_sshd_row_passes_and_says_so_when_a_files_time_is_ahead_of_the_clock() {
-    for listing in [
-        "acceptenv SSH_BROKER_ELEVATION\n",
-        "setenv SSH_BROKER_ELEVATION=never\n",
+    // What the row says of the variable, then the clause about the clock.
+    for (listing, said) in [
+        (
+            "acceptenv SSH_BROKER_ELEVATION\n",
+            "sshd accepts SSH_BROKER_ELEVATION from clients",
+        ),
+        ("setenv SSH_BROKER_ELEVATION=never\n", "pinned by the server to never"),
     ] {
         let row = accepts_row(Integrity::High, || {
             Ok(SshdReading::Read {
@@ -352,8 +356,10 @@ fn the_sshd_row_passes_and_says_so_when_a_files_time_is_ahead_of_the_clock() {
         assert!(row.pass, "{}", row.detail);
         assert_eq!(
             row.detail,
-            "accepted; sshd_config's last-write time is ahead of the clock, so whether the running sshd has read \
-             it cannot be told (`ssh-broker apply` restarts sshd)"
+            format!(
+                "{said}; sshd_config's last-write time is ahead of the clock, so whether the running sshd has \
+                 read it cannot be told (restart the sshd service to be sure)"
+            )
         );
     }
     // A configuration sshd does not accept fails for that.
@@ -365,6 +371,18 @@ fn the_sshd_row_passes_and_says_so_when_a_files_time_is_ahead_of_the_clock() {
     });
     assert!(!row.pass);
     assert!(row.detail.contains("does not accept"), "{}", row.detail);
+}
+
+#[test]
+fn the_sshd_row_passes_as_it_does_for_a_read_configuration_when_sshd_is_not_running() {
+    let row = accepts_row(Integrity::High, || {
+        Ok(SshdReading::Read {
+            listing: "acceptenv SSH_BROKER_ELEVATION\n".into(),
+            read: ConfigRead::NotRunning,
+        })
+    });
+    assert!(row.pass, "{}", row.detail);
+    assert_eq!(row.detail, "sshd accepts SSH_BROKER_ELEVATION from clients");
 }
 
 #[test]

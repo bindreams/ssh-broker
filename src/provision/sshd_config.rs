@@ -246,36 +246,29 @@ pub fn accepts_row(integrity: Integrity, reading: impl FnOnce() -> anyhow::Resul
             ),
         );
     }
+    let in_force_as = match pinned(&listing, VARIABLE) {
+        Some(value) if !accepts(&listing, VARIABLE) => format!("pinned by the server to {value}"),
+        _ => format!("sshd accepts {VARIABLE} from clients"),
+    };
     match read {
-        ConfigRead::Read => {}
-        ConfigRead::Unread(file) => {
-            return Check::new(
-                ROW_NAME,
-                false,
-                format!(
-                    "sshd was started before {} was last written and may not have read it; `ssh-broker apply` \
-                     restarts it",
-                    file.display()
-                ),
-            );
-        }
-        ConfigRead::Unknowable(file) => {
-            return Check::new(
-                ROW_NAME,
-                true,
-                format!(
-                    "accepted; {}'s last-write time is ahead of the clock, so whether the running sshd has read it \
-                     cannot be told (`ssh-broker apply` restarts sshd)",
-                    file.display()
-                ),
-            );
-        }
-    }
-    match pinned(&listing, VARIABLE) {
-        Some(value) if !accepts(&listing, VARIABLE) => {
-            Check::new(ROW_NAME, true, format!("pinned by the server to {value}"))
-        }
-        _ => Check::new(ROW_NAME, true, format!("sshd accepts {VARIABLE} from clients")),
+        ConfigRead::Read | ConfigRead::NotRunning => Check::new(ROW_NAME, true, in_force_as),
+        ConfigRead::Unread(file) => Check::new(
+            ROW_NAME,
+            false,
+            format!(
+                "sshd was started before {} was last written and has not read it; restart the sshd service",
+                file.display()
+            ),
+        ),
+        ConfigRead::Unknowable(file) => Check::new(
+            ROW_NAME,
+            true,
+            format!(
+                "{in_force_as}; {}'s last-write time is ahead of the clock, so whether the running sshd has read \
+                 it cannot be told (restart the sshd service to be sure)",
+                file.display()
+            ),
+        ),
     }
 }
 

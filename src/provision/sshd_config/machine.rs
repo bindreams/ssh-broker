@@ -1,5 +1,5 @@
 //! provision::sshd_config::machine — the machine behind [`SshdHost`]: the `ssh` folder of ProgramData, the
-//! `sshd.exe` the service runs, the service itself, and `net.exe`. Nothing here is decided; the flow is
+//! `sshd.exe` the service runs, and the service's process. Nothing here is decided; the flow is
 //! [`configure`], which is tested against a stand-in. `tests/sshd_config_windows.rs` runs this against a real
 //! sshd in CI.
 
@@ -16,31 +16,27 @@ use windows::Win32::Storage::FileSystem::{MOVEFILE_REPLACE_EXISTING, MOVEFILE_WR
 use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::System::Services::{
     CloseServiceHandle, OpenSCManagerW, OpenServiceW, QueryServiceStatusEx, SC_HANDLE, SC_MANAGER_CONNECT,
-    SC_STATUS_PROCESS_INFO, SERVICE_CONTINUE_PENDING, SERVICE_PAUSE_PENDING, SERVICE_PAUSED, SERVICE_QUERY_STATUS,
-    SERVICE_RUNNING, SERVICE_START_PENDING, SERVICE_STATUS_CURRENT_STATE, SERVICE_STATUS_PROCESS, SERVICE_STOP_PENDING,
-    SERVICE_STOPPED,
+    SC_STATUS_PROCESS_INFO, SERVICE_QUERY_STATUS, SERVICE_STATUS_PROCESS, SERVICE_STOPPED,
 };
 use windows::Win32::System::Threading::GetProcessTimes;
 use windows::Win32::UI::Shell::{FOLDERID_ProgramData, KF_FLAG_DEFAULT, SHGetKnownFolderPath};
 use windows::core::{PCWSTR, w};
 
-use super::configure::{DropInProblem, Service, ServiceState, SshdHost, config_read, configure};
+use super::configure::{DropInProblem, SshdHost, config_read, configure};
 use super::{DROP_IN_DIR_NAME, DROP_IN_NAME, SshdReading};
 use crate::acl;
-use crate::provision::procwait::{self, Process};
+use crate::provision::procwait::Process;
 use crate::provision::{registry, system_config};
 
 /// The candidate `sshd_config`, beside the original so that the rename that replaces it stays on one volume.
 const CANDIDATE_NAME: &str = "sshd_config.ssh-broker-new";
-/// The files of sshd, and the programs `apply` runs to check and restart it.
+/// The files of sshd, and the program `apply` runs to check them.
 struct Machine {
     ssh_dir: PathBuf,
     /// The `sshd.exe` the service runs, found from the service's own `ImagePath`.
     sshd: PathBuf,
     /// The text after the program in that `ImagePath`, when there is some.
     arguments: Option<String>,
-    /// `net.exe` in the system directory.
-    net: PathBuf,
 }
 
 impl Machine {
@@ -49,19 +45,10 @@ impl Machine {
             .context("read where the sshd service runs from")?
             .context("there is no sshd service")?;
         let sshd = system_config::image_program(&image).context("the sshd service's ImagePath names no program")?;
-        let system_cmd = {
-            use crate::shell::Host;
-            crate::shell::WindowsHost.system_cmd()?
-        };
-        let net = system_cmd
-            .parent()
-            .context("the system directory has no name")?
-            .join("net.exe");
         Ok(Machine {
             ssh_dir: program_data_dir()?.join("ssh"),
             sshd: PathBuf::from(sshd),
             arguments: system_config::image_arguments(&image).map(str::to_owned),
-            net,
         })
     }
 
@@ -123,46 +110,6 @@ impl SshdHost for Machine {
         self.run_sshd(&[OsStr::new("-t"), OsStr::new("-f"), config.as_os_str()])
             .map(drop)
             .map_err(|e| format!("{e:#}"))
-    }
-
-    fn service_state(&mut self) -> anyhow::Result<ServiceState> {
-        Ok(state_of(query_sshd()?.dwCurrentState))
-    }
-
-    fn net(&mut self, verb: Service) -> Result<(), String> {
-        let word = match verb {
-            Service::Stop => "stop",
-            Service::Start => "start",
-        };
-        // `net` returns once the service has stopped, or once it runs.
-        match Command::new(&self.net)
-            .args([word, "sshd"])
-            .stdin(Stdio::null())
-            .output()
-        {
-            Ok(out) if out.status.success() => Ok(()),
-            Ok(out) => {
-                let said = format!(
-                    "{}{}",
-                    String::from_utf8_lossy(&out.stdout),
-                    String::from_utf8_lossy(&out.stderr)
-                );
-                let said = said.split_whitespace().collect::<Vec<_>>().join(" ");
-                Err(if said.is_empty() {
-                    format!("net exited with exit code {}", out.status.code().unwrap_or(-1))
-                } else {
-                    said
-                })
-            }
-            Err(e) => Err(format!("run {}: {e}", self.net.display())),
-        }
-    }
-
-    fn wait_while_stopping(&mut self) -> anyhow::Result<()> {
-        let Some(process) = service_process()? else {
-            return Ok(());
-        };
-        procwait::wait_all_exited(&[process], procwait::EXIT_BOUND).context("the sshd service is still stopping")
     }
 
     fn service_started(&mut self) -> anyhow::Result<Option<SystemTime>> {
@@ -263,11 +210,6 @@ impl SshdHost for Machine {
             let _ = std::fs::remove_file(&new);
         }
         replaced
-    }
-
-    fn remove_drop_in(&mut self) -> anyhow::Result<()> {
-        let path = self.drop_in();
-        std::fs::remove_file(&path).with_context(|| format!("remove {}", path.display()))
     }
 
     fn read_config(&mut self) -> anyhow::Result<Vec<u8>> {
@@ -374,21 +316,6 @@ fn query_sshd() -> anyhow::Result<SERVICE_STATUS_PROCESS> {
     Ok(status)
 }
 
-/// The service manager's state, as [`ServiceState`].
-fn state_of(current: SERVICE_STATUS_CURRENT_STATE) -> ServiceState {
-    let name = match current {
-        SERVICE_RUNNING => return ServiceState::Running,
-        SERVICE_STOPPED => return ServiceState::Stopped,
-        SERVICE_START_PENDING => "starting".to_owned(),
-        SERVICE_STOP_PENDING => "stopping".to_owned(),
-        SERVICE_CONTINUE_PENDING => "continuing".to_owned(),
-        SERVICE_PAUSE_PENDING => "pausing".to_owned(),
-        SERVICE_PAUSED => "paused".to_owned(),
-        SERVICE_STATUS_CURRENT_STATE(other) => format!("in state {other}"),
-    };
-    ServiceState::Changing(name)
-}
-
 /// The id of the process the sshd service runs in; `None` when the service has none.
 fn sshd_process_id() -> anyhow::Result<Option<u32>> {
     let status = query_sshd()?;
@@ -440,8 +367,9 @@ fn system_time(filetime: FILETIME) -> anyhow::Result<SystemTime> {
 
 // this machine =====
 
-/// `apply`'s sshd step on this machine: see [`configure`]. It never fails: what it could not do is said on
-/// `say`. Whether the running sshd takes the variable (or reads it when it next starts) is returned.
+/// `apply`'s sshd step on this machine: see [`configure`]. It never fails and never restarts sshd: what it
+/// could not do is said on `say`. Whether the running sshd takes the variable (or reads it when it next
+/// starts) is returned.
 pub fn configure_this_machine(say: &mut dyn FnMut(&str)) -> bool {
     match Machine::find() {
         Ok(mut machine) => configure(&mut machine, say),
@@ -453,11 +381,6 @@ pub fn configure_this_machine(say: &mut dyn FnMut(&str)) -> bool {
             false
         }
     }
-}
-
-/// This machine as the host of the flow, for the CI test of its service calls.
-pub fn sshd_host_of_this_machine() -> anyhow::Result<impl SshdHost> {
-    Machine::find().context("cannot find sshd")
 }
 
 /// What the `verify` row is given about sshd on this machine: `sshd -T` (which needs the rights to read sshd's
@@ -472,7 +395,3 @@ pub fn sshd_reading_this_machine() -> anyhow::Result<SshdReading> {
     let read = config_read(&mut machine).context("cannot tell whether sshd has read its configuration")?;
     Ok(SshdReading::Read { listing, read })
 }
-
-#[cfg(test)]
-#[path = "machine_tests.rs"]
-mod machine_tests;

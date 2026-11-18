@@ -528,11 +528,7 @@ pub fn user_agents(image: &Path, user: &Sid, integrity: Integrity) -> anyhow::Re
         &wanted_user,
         integrity,
         &wanted,
-        &|pid| match Process::open(pid) {
-            Ok(opened) => Ok(opened),
-            Err(e) if is_denied(&e) => Ok(None),
-            Err(e) => Err(e),
-        },
+        &|pid| Process::open(pid).or_else(|e| if is_denied(&e) { Ok(None) } else { Err(e) }),
     )
 }
 
