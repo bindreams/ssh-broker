@@ -67,6 +67,7 @@ fn handshake_roundtrips() {
         command: None,
         env: vec![("LANG".into(), "C".into())],
         launch: Launch::Shell,
+        privilege: Privilege::Unelevated,
     };
     let bytes = h.encode().unwrap();
     assert_eq!(Handshake::decode(&bytes).unwrap(), h);
@@ -296,4 +297,68 @@ fn a_version_1_handshake_is_refused_with_the_version_message() {
         error.contains("peer 1") && error.contains(&format!("ours {PROTOCOL_VERSION}")),
         "{error}"
     );
+}
+
+#[test]
+fn the_wire_version_is_3() {
+    assert_eq!(PROTOCOL_VERSION, 3);
+    assert_eq!(Handshake::pty_default().version, 3);
+}
+
+#[test]
+fn privilege_round_trips_and_defaults_to_the_account() {
+    for privilege in [Privilege::Account, Privilege::Unelevated] {
+        let h = Handshake {
+            privilege,
+            command: Some("x".into()),
+            ..Handshake::pty_default()
+        };
+        assert_eq!(Handshake::decode(&h.encode().unwrap()).unwrap().privilege, privilege);
+    }
+    assert_eq!(Handshake::pty_default().privilege, Privilege::Account);
+}
+
+/// The new field is the last on the wire: the handshake of version 3 is the version 2 bytes with the
+/// version and one more byte (the variant index).
+#[test]
+fn privilege_is_the_last_field() {
+    let h = Handshake {
+        privilege: Privilege::Unelevated,
+        ..Handshake::pty_default()
+    };
+    let bytes = h.encode().unwrap();
+    assert_eq!(bytes.last(), Some(&1));
+    let account = Handshake::pty_default().encode().unwrap();
+    assert_eq!(account.last(), Some(&0));
+}
+
+/// A shim or agent of version 2 is refused by name: its handshake has no `privilege`.
+#[test]
+fn a_version_2_handshake_is_refused_with_the_version_message() {
+    #[derive(serde::Serialize)]
+    struct V2 {
+        version: u16,
+        mode: Mode,
+        cols: u16,
+        rows: u16,
+        term: String,
+        cwd: String,
+        command: Option<String>,
+        env: Vec<(String, String)>,
+        launch: Launch,
+    }
+    let bytes = postcard::to_stdvec(&V2 {
+        version: 2,
+        mode: Mode::Exec,
+        cols: 80,
+        rows: 24,
+        term: "xterm".into(),
+        cwd: String::new(),
+        command: Some("whoami".into()),
+        env: Vec::new(),
+        launch: Launch::Shell,
+    })
+    .unwrap();
+    let error = Handshake::decode(&bytes).unwrap_err().to_string();
+    assert!(error.contains("peer 2") && error.contains("ours 3"), "{error}");
 }

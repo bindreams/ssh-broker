@@ -1,12 +1,13 @@
 //! Helpers around `examples/session_stand_in.rs`: a directory every account can run from, the stand-in
 //! shim started as an account's network token, and a guard that stops or disables `seclogon`.
 //!
-//! The including crate declares `account_fixture` (the account fixture), `desktop` and `machine`.
+//! The including crate declares `account_fixture`, `desktop`, `machine` and `password`.
 #![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use ssh_broker::autologin::{PasswordSource, WindowsEnv};
 use ssh_broker::socket_loc::SocketLocation;
 use ssh_broker::socket_watch::SocketWatch;
 use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
@@ -77,6 +78,16 @@ impl Kit {
 
     pub fn dir(&self) -> &Path {
         &self.dir.0
+    }
+
+    /// What `auto-login` runs against for this kit's copy of the broker: the task runs `exe`, which sits in a
+    /// directory every account can read (the install check is skipped, see `WindowsEnv::with_exe_unchecked`),
+    /// and the password is the one given.
+    pub fn autologin_env(&self, password: &str) -> WindowsEnv {
+        WindowsEnv::with_exe_unchecked(
+            PasswordSource::Given(Some(crate::password::password(password))),
+            self.exe.clone(),
+        )
     }
 
     pub fn path(&self, name: &str) -> PathBuf {
@@ -296,7 +307,7 @@ pub const SERVING_BOUND: std::time::Duration = std::time::Duration::from_secs(18
 /// an agent that neither listens nor ends fails it after [`SERVING_BOUND`], an external event that
 /// may never come.
 pub fn wait_for_serving_marker(location: &SocketLocation, agent: HANDLE) {
-    wait_for_marker(location, Some(agent), SERVING_BOUND, &|| {
+    wait_for_marker(&[location], Some(agent), SERVING_BOUND, &|| {
         location.serving_marker_path().is_file()
     })
 }
@@ -305,7 +316,18 @@ pub fn wait_for_serving_marker(location: &SocketLocation, agent: HANDLE) {
 /// the start is an external event that may never come, so the wait has a failure bound and its
 /// expiry fails the test saying so.
 pub fn wait_for_serving_marker_of_a_task(location: &SocketLocation, bound: std::time::Duration) {
-    wait_for_marker(location, None, bound, &|| location.serving_marker_path().is_file())
+    wait_for_marker(&[location], None, bound, &|| location.serving_marker_path().is_file())
+}
+
+/// [`wait_for_serving_marker_of_a_task`] for an agent whose level is not known: it waits until the `serving`
+/// marker exists in any of `locations` (one per level), so that a test can read the level of the agent that
+/// came up, rather than wait for a marker in the folder of a level it may not be at.
+pub fn wait_for_serving_marker_in_any_of(locations: &[&SocketLocation], bound: std::time::Duration) {
+    wait_for_marker(locations, None, bound, &|| {
+        locations
+            .iter()
+            .any(|location| location.serving_marker_path().is_file())
+    })
 }
 
 /// The text of the `serving` marker (`<pid> <time>\n`), if it exists.
@@ -322,19 +344,27 @@ pub fn wait_for_new_serving_marker_of_a_task(
     previous: Option<&str>,
     bound: std::time::Duration,
 ) {
-    wait_for_marker(location, None, bound, &|| {
+    wait_for_marker(&[location], None, bound, &|| {
         serving_marker_text(location).is_some_and(|text| text.ends_with('\n') && Some(text.as_str()) != previous)
     })
 }
 
 fn wait_for_marker(
-    location: &SocketLocation,
+    locations: &[&SocketLocation],
     agent: Option<HANDLE>,
     bound: std::time::Duration,
     is_ready: &dyn Fn() -> bool,
 ) {
-    // The socket folder, and the profile above it, may not exist yet: the watch follows the path down.
-    let mut watch = SocketWatch::for_location(location).unwrap_or_else(|e| panic!("{e:#}"));
+    // The socket folder, and the profile above it, may not exist yet: each watch follows its path down.
+    let mut watches: Vec<SocketWatch> = locations
+        .iter()
+        .map(|location| SocketWatch::for_location(location).unwrap_or_else(|e| panic!("{e:#}")))
+        .collect();
+    let folders = locations
+        .iter()
+        .map(|location| location.dir().display().to_string())
+        .collect::<Vec<_>>()
+        .join(" or ");
     // One deadline for the whole wait: every change in the folder wakes it, and none restarts the bound.
     let deadline = std::time::Instant::now() + bound;
     loop {
@@ -343,15 +373,15 @@ fn wait_for_marker(
         }
         let millis = file_signal::time_left(Some(deadline)).unwrap_or_else(|| {
             panic!(
-                "no agent was serving {} after {bound:?}: it neither wrote its serving marker nor ended, \
-                 or the scheduled task did not start one",
-                location.dir().display()
+                "no agent was serving {folders} after {bound:?}: it neither wrote its serving marker nor ended, \
+                 or the scheduled task did not start one"
             )
         });
-        let handles: Vec<HANDLE> = std::iter::once(watch.handle()).chain(agent).collect();
+        let handles: Vec<HANDLE> = watches.iter().map(SocketWatch::handle).chain(agent).collect();
         // SAFETY: every handle is valid.
         let woke = unsafe { WaitForMultipleObjects(&handles, false, millis) }; // sleep-ok: failure bound on an agent start that may never come; expiry fails the test
-        if woke == WAIT_OBJECT_0 {
+        let woken_watch = woke.0.checked_sub(WAIT_OBJECT_0.0).map(|index| index as usize);
+        if let Some(watch) = woken_watch.and_then(|index| watches.get_mut(index)) {
             watch.rearm().unwrap_or_else(|e| panic!("{e:#}"));
         } else if woke == WAIT_TIMEOUT {
             // The loop looks once more and then reports the expiry.

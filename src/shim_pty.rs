@@ -14,10 +14,10 @@
 //! not), JOINS the worker, then the guard restores modes AFTER the join — so the worker can
 //! never read with a half-restored mode (the use-after-close hazard).
 
-use crate::cmdline::{Encoding, Exec, RawExec, resolve_exec};
+use crate::cmdline::{Encoding, Login, RawExec, read_login, resolve_exec};
 use crate::console_modes::ConsoleModes;
 use crate::offer::text;
-use crate::protocol::{FrameKind, FrameReader, Handshake, Launch, Stream, write_frame};
+use crate::protocol::{FrameKind, FrameReader, Handshake, Launch, Privilege, Stream, write_frame};
 use crate::relay::{FrameSink, write_data};
 use crate::shell::{self, Session, StartError};
 use crate::shim::{
@@ -55,7 +55,10 @@ const EVT_FOCUS: u16 = 0x0010;
 /// since `process::exit` runs no destructors and the log is the only PTY-mode diagnostic.
 ///
 /// A `-c` session resolves its command first, once the log is open: `detect` says how sshd
-/// encoded it (see [`resolve_exec`]), and a blank command ends the run there, exit 0.
+/// encoded it (see [`resolve_exec`]); [`read_login`] then looks for the reserved word, with
+/// `SSH_ORIGINAL_COMMAND` for a word that sshd was told to run; and a blank command ends the run
+/// there, exit 0. What the login asked for goes to the agent in the handshake, and to the fail-open
+/// shell ([`fail_open`]).
 pub fn run_on(exec: Option<RawExec>, detect: impl FnOnce() -> Encoding) -> anyhow::Result<()> {
     // Walk first and keep the result: the folders it holds cannot be swapped, so the log and connect reach
     // them and no others.
@@ -66,8 +69,9 @@ pub fn run_on(exec: Option<RawExec>, detect: impl FnOnce() -> Encoding) -> anyho
         Ok(guard) => (Some(guard), None),
         Err(e) => (None, Some(format!("{e:#}"))),
     };
-    let exec = exec.map(|exec| resolve_exec(exec, detect));
-    if exec.as_ref().is_some_and(|exec| is_blank_command(&exec.command)) {
+    let original_command = std::env::var_os("SSH_ORIGINAL_COMMAND").map(|value| value.to_string_lossy().into_owned());
+    let login = read_login(exec.map(|exec| resolve_exec(exec, detect)), original_command);
+    if login.exec.as_ref().is_some_and(|exec| is_blank_command(&exec.command)) {
         drop(log); // flush: `process::exit` runs no destructors
         std::process::exit(0)
     }
@@ -92,7 +96,13 @@ pub fn run_on(exec: Option<RawExec>, detect: impl FnOnce() -> Encoding) -> anyho
         Stance::RelayWithoutOffer { cause } => Some(Prompting::new(Err(cause))),
     };
     if let Some(mut prompting) = relayed {
-        match try_relay(&exec, &folder, log_failure.as_deref(), std::io::stdin(), &mut prompting) {
+        match try_relay(
+            &login,
+            &folder,
+            log_failure.as_deref(),
+            std::io::stdin(),
+            &mut prompting,
+        ) {
             Ok(Some(code)) => {
                 drop(log); // flush the appender before process::exit
                 // Bypass main()'s Result→0/1 collapse; the i32→u32 cast is bit-preserving.
@@ -113,9 +123,10 @@ pub fn run_on(exec: Option<RawExec>, detect: impl FnOnce() -> Encoding) -> anyho
     ignore_ctrl_c();
     let code = fail_open(
         &crate::shell::WindowsHost,
-        &exec,
+        &login,
         &mut std::io::stderr(),
-        |line| start_local(line, None),
+        UnelevatedToken::for_privilege,
+        start_local,
         LocalChild::finish,
     );
     drop(log); // flush: `process::exit` runs no destructors
@@ -134,18 +145,19 @@ pub fn run_on(exec: Option<RawExec>, detect: impl FnOnce() -> Encoding) -> anyho
 /// it has none (see [`try_relay_at`]). `stdin` is what an EXEC session forwards to the child (the
 /// process's own stdin in `run_on`).
 fn try_relay(
-    exec: &Option<Exec>,
+    login: &Login,
     folder: &Folder,
     log_failure: Option<&str>,
     stdin: impl std::io::Read + Send + 'static,
     rescue: &mut dyn Rescue,
 ) -> anyhow::Result<Option<i32>> {
-    try_relay_at(folder, exec, &mut std::io::stderr(), log_failure, stdin, rescue)
+    try_relay_at(folder, login, &mut std::io::stderr(), log_failure, stdin, rescue)
 }
 
-/// The phrase `tests/fail_open_windows.rs` greps for; every fail-open message begins with it.
+/// The phrase `tests/fail_open_windows.rs` greps for; every fail-open message begins with it. It is public
+/// so that a test can tell a session the shim ran itself from one the agent served.
 /// `reason` is why the agent cannot be reached, when the shim knows and the user can act on it.
-fn unavailable_message(reason: Option<&dyn std::fmt::Display>) -> String {
+pub fn unavailable_message(reason: Option<&dyn std::fmt::Display>) -> String {
     match reason {
         Some(reason) => format!("ssh-broker: agent unavailable — falling back to a local shell ({reason})"),
         None => "ssh-broker: agent unavailable — falling back to a local shell".to_string(),
@@ -161,13 +173,21 @@ fn unavailable_message(reason: Option<&dyn std::fmt::Display>) -> String {
 /// which is the cause of the missing log too.
 fn try_relay_at(
     folder: &Folder,
-    exec: &Option<Exec>,
+    login: &Login,
     stderr: &mut dyn std::io::Write,
     log_failure: Option<&str>,
     stdin: impl std::io::Read + Send + 'static,
     rescue: &mut dyn Rescue,
 ) -> anyhow::Result<Option<i32>> {
-    try_relay_with(folder, exec, stderr, log_failure, stdin, rescue, &mut relay_interactive)
+    try_relay_with(
+        folder,
+        login,
+        stderr,
+        log_failure,
+        stdin,
+        rescue,
+        &mut relay_interactive,
+    )
 }
 
 /// What an interactive attempt came to.
@@ -179,30 +199,30 @@ enum Interactive {
 }
 
 /// The interactive relay ([`relay_interactive`]): the connection, a console a rescue left raw, and the
-/// command of a session that has a terminal.
-type InteractiveRelay<'a> = dyn FnMut(Socket, Option<ConsoleModes>, Option<&str>) -> anyhow::Result<Interactive> + 'a;
+/// login, whose command is that of a session that has a terminal.
+type InteractiveRelay<'a> = dyn FnMut(Socket, Option<ConsoleModes>, &Login) -> anyhow::Result<Interactive> + 'a;
 
 /// [`try_relay_at`] with the interactive relay as a parameter, so that a test can stand in for the
-/// console. `interactive` gets the command of a session that has a terminal (`ssh -t host cmd`),
-/// which it sends in the handshake.
+/// console. `interactive` gets the login, whose command is that of a session that has a terminal
+/// (`ssh -t host cmd`) and which it sends in the handshake with the privilege.
 fn try_relay_with(
     folder: &Folder,
-    exec: &Option<Exec>,
+    login: &Login,
     stderr: &mut dyn std::io::Write,
     log_failure: Option<&str>,
     stdin: impl std::io::Read + Send + 'static,
     rescue: &mut dyn Rescue,
     interactive: &mut InteractiveRelay<'_>,
 ) -> anyhow::Result<Option<i32>> {
-    if let Some(exec) = exec.as_ref().filter(|exec| !exec.terminal) {
+    if let Some(exec) = login.exec.as_ref().filter(|exec| !exec.terminal) {
         return match connect_or_rescue(folder, true, stderr, log_failure, rescue)? {
-            Connected::Agent { socket, .. } => relay_exec(socket, &exec.command, stdin, stderr),
+            Connected::Agent { socket, .. } => relay_exec(socket, &exec.command, login.privilege, stdin, stderr),
             Connected::Done(code) => Ok(code),
         };
     }
     // A command with a terminal goes round the same loop as a login, except that it is never sent
     // again: the agent may have started it before it ended the connection.
-    let command = exec.as_ref().map(|exec| exec.command.as_str());
+    let command = login.exec.as_ref().map(|exec| exec.command.as_str());
     // An interactive session whose connection the agent ends before it says anything goes round again:
     // the agent is ending, because an agent that follows the protocol closes a connection without a
     // byte only while its listener closes. The next connect then finds no listener or an agent that
@@ -218,7 +238,7 @@ fn try_relay_with(
             }
             Connected::Done(code) => return Ok(code),
         };
-        match interactive(conn, rescued_modes, command)? {
+        match interactive(conn, rescued_modes, login)? {
             Interactive::Pumped(pumped) if pumped.no_answer() => {
                 if command.is_some() {
                     let _ = writeln!(stderr, "{AGENT_ENDED_UNANSWERED}");
@@ -307,11 +327,13 @@ fn connect_or_rescue(
 fn relay_exec(
     conn: Socket,
     cmd: &str,
+    privilege: Privilege,
     stdin: impl std::io::Read + Send + 'static,
     stderr: &mut dyn std::io::Write,
 ) -> anyhow::Result<Option<i32>> {
     let (rx, tx) = afunix::split(conn)?;
-    let hs = make_handshake(&Some(cmd.to_owned()), false, Launch::Shell, term(), 80, 24); // EXEC ignores cols/rows
+    // EXEC ignores cols/rows
+    let hs = make_handshake(&Some(cmd.to_owned()), false, Launch::Shell, term(), 80, 24, privilege);
     // Held until the session is over: the agent takes a close for a disconnect.
     let pumped = match start_exec_input(tx, &hs, stdin)? {
         Started::Ready(_keep_open) => pump_exec(rx, std::io::stdout(), std::io::stderr()),
@@ -326,14 +348,10 @@ fn relay_exec(
 
 /// Relay an interactive session over `conn`. A real console is required to capture input. No
 /// handshake has been sent yet, so a missing console fails open without orphaning an agent shell. A
-/// prompt that signed the user on hands over the raw console it was using. `command` is the command of
-/// a session that has a terminal: the agent runs it in the pseudoconsole, as OpenSSH runs it under a
-/// pty.
-fn relay_interactive(
-    conn: Socket,
-    rescued_modes: Option<ConsoleModes>,
-    command: Option<&str>,
-) -> anyhow::Result<Interactive> {
+/// prompt that signed the user on hands over the raw console it was using. `login`'s command is the
+/// command of a session that has a terminal: the agent runs it in the pseudoconsole, as OpenSSH runs it
+/// under a pty.
+fn relay_interactive(conn: Socket, rescued_modes: Option<ConsoleModes>, login: &Login) -> anyhow::Result<Interactive> {
     let (rx, tx) = afunix::split(conn)?;
     let modes = match rescued_modes {
         Some(modes) => modes,
@@ -345,7 +363,8 @@ fn relay_interactive(
         return Ok(Interactive::NoConsole);
     }
     let (cols, rows) = console_size(modes.stdout);
-    let hs = make_handshake(&command.map(str::to_owned), true, Launch::Shell, term(), cols, rows);
+    let command = login.exec.as_ref().map(|exec| exec.command.clone());
+    let hs = make_handshake(&command, true, Launch::Shell, term(), cols, rows, login.privilege);
     Ok(Interactive::Pumped(run_pty(modes, rx, FrameReader::new(), tx, &hs)?))
 }
 

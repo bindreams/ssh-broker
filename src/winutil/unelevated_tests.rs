@@ -5,6 +5,7 @@
 use super::*;
 use crate::account::{Elevation, INTEGRITY_LOW, INTEGRITY_MEDIUM, elevation, elevation_of, integrity_of};
 use crate::acl::{Sid, WellKnown};
+use crate::protocol::Privilege;
 use crate::test_support::{drain, own_token_copy, text_of};
 use crate::winutil::{ChildConsole, own_token, spawn_suspended, token_information};
 use windows::Win32::Foundation::{HLOCAL, LocalFree};
@@ -167,6 +168,18 @@ fn the_default_dacl_of_the_token_gives_the_user_system_and_the_logon_session_the
             .collect::<Vec<_>>()
     });
     assert_eq!(aces, expected);
+}
+
+/// The production maker of the step-down: an account login gets none, and an unelevated one gets a token
+/// exactly when this process is at High.
+#[test]
+fn the_production_step_down_gives_a_token_exactly_to_an_unelevated_login_at_high() {
+    let at_high = crate::account::integrity().unwrap() == crate::socket_loc::Integrity::High;
+    assert!(UnelevatedToken::for_privilege(Privilege::Account).unwrap().is_none());
+    assert_eq!(
+        UnelevatedToken::for_privilege(Privilege::Unelevated).unwrap().is_some(),
+        at_high
+    );
 }
 
 /// The session starts take the token: a command on pipes and one in a pseudoconsole run to the end with it, and

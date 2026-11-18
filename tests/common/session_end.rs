@@ -70,6 +70,13 @@ pub fn log_out(exe: &Path, account: &Account, how: ServiceLogon) -> Result<Optio
     }
 }
 
+/// [`log_out`] for a test that knows the account has an agent: a failure, or no agent to end, panics.
+pub fn log_out_running(exe: &Path, account: &Account, how: ServiceLogon) -> Ended {
+    log_out(exe, account, how)
+        .unwrap_or_else(|why| panic!("logout of {}: {why}", account.name))
+        .unwrap_or_else(|| panic!("no agent of {} was running to log out", account.name))
+}
+
 /// Ends the background session of an account when dropped, passing or failing. Declare it after the
 /// account, so that it drops first. If the logout fails the failure is recorded, the account's
 /// processes are killed by the account's own drop, and the test fails (a test that is already failing
@@ -307,7 +314,7 @@ fn has_exited(process: HANDLE) -> bool {
 }
 
 /// Run `step`, turning a panic into an error that names `what`.
-fn attempt<T>(what: &str, step: impl FnOnce() -> T) -> Result<T, String> {
+pub fn attempt<T>(what: &str, step: impl FnOnce() -> T) -> Result<T, String> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(step)).map_err(|payload| {
         let text = payload
             .downcast_ref::<String>()

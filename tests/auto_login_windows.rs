@@ -11,7 +11,7 @@
 use std::collections::BTreeSet;
 
 use ssh_broker::account::LocalAccount;
-use ssh_broker::autologin::{self, PasswordSource, WindowsEnv};
+use ssh_broker::autologin;
 use ssh_broker::provision::session_task::{task_name, task_problem};
 use ssh_broker::provision::taskscheduler;
 
@@ -54,13 +54,6 @@ fn kit(tag: &str) -> Kit {
     Kit::copy_of_broker(tag)
 }
 
-fn env(kit: &Kit, password: &str) -> WindowsEnv {
-    WindowsEnv::with_exe_unchecked(
-        PasswordSource::Given(Some(password::password(password))),
-        kit.exe.clone(),
-    )
-}
-
 /// Wait for the agent the task started, then run `check` with a way to connect to it, then end the
 /// session, so that no agent outlives the test.
 fn with_session(kit: &Kit, account: &Account, check: impl FnOnce(&mut dyn FnMut() -> AgentConn)) {
@@ -75,9 +68,7 @@ fn with_session(kit: &Kit, account: &Account, check: impl FnOnce(&mut dyn FnMut(
 /// agent) and wait for its logoff. It checks what ssh-broker controls (see `session_end`), not that Windows
 /// unloads the hive of a Task Scheduler logon.
 fn logout_with(kit: &Kit, account: &Account) -> session_end::Ended {
-    session_end::log_out(&kit.exe, account, ServiceLogon::TaskScheduler)
-        .unwrap_or_else(|why| panic!("logout of {}: {why}", account.name))
-        .unwrap_or_else(|| panic!("no agent of {} was running to log out", account.name))
+    session_end::log_out_running(&kit.exe, account, ServiceLogon::TaskScheduler)
 }
 
 fn state_of(account: &Account) -> Option<ssh_broker::provision::session_task::TaskState> {
@@ -100,14 +91,14 @@ fn on_registers_a_verified_task_and_off_deletes_it() {
     let _end = session_end::LogOutOnDrop::new(&kit.exe, &account, ServiceLogon::TaskScheduler);
     let local = local_account(&account);
 
-    autologin::on(&mut env(&kit, &account.password), &local).unwrap();
+    autologin::on(&mut kit.autologin_env(&account.password), &local).unwrap();
     let state = state_of(&account).expect("the task is registered");
     let exe = kit.exe.to_string_lossy().into_owned();
     assert_eq!(task_problem(&state, &exe, &account.sid_text), None);
     stand_in::wait_for_serving_marker_of_a_task(&account.socket_location(), TASK_START_BOUND);
     logout_with(&kit, &account);
 
-    autologin::off(&mut env(&kit, &account.password), &local).unwrap();
+    autologin::off(&mut kit.autologin_env(&account.password), &local).unwrap();
     assert!(state_of(&account).is_none(), "off deletes the task");
 }
 
@@ -120,11 +111,11 @@ fn off_twice_is_ok() {
     let _end = session_end::LogOutOnDrop::new(&kit.exe, &account, ServiceLogon::TaskScheduler);
     let local = local_account(&account);
 
-    autologin::on(&mut env(&kit, &account.password), &local).unwrap();
+    autologin::on(&mut kit.autologin_env(&account.password), &local).unwrap();
     stand_in::wait_for_serving_marker_of_a_task(&account.socket_location(), TASK_START_BOUND);
     logout_with(&kit, &account);
-    autologin::off(&mut env(&kit, &account.password), &local).unwrap();
-    autologin::off(&mut env(&kit, &account.password), &local).unwrap();
+    autologin::off(&mut kit.autologin_env(&account.password), &local).unwrap();
+    autologin::off(&mut kit.autologin_env(&account.password), &local).unwrap();
 }
 
 /// Elevated (CI only).
@@ -134,7 +125,7 @@ fn on_with_a_wrong_password_leaves_no_task() {
     let kit = kit("al3");
     let account = account_with_batch_right("al3");
 
-    let err = autologin::on(&mut env(&kit, "not-the-password"), &local_account(&account)).unwrap_err();
+    let err = autologin::on(&mut kit.autologin_env("not-the-password"), &local_account(&account)).unwrap_err();
     assert!(format!("{err:#}").contains("password"), "{err:#}");
     assert!(state_of(&account).is_none(), "a refused password leaves no task");
 }
@@ -149,7 +140,7 @@ fn stored_task_starts_a_working_session_with_dpapi() {
     let _end = session_end::LogOutOnDrop::new(&kit.exe, &account, ServiceLogon::TaskScheduler);
     let local = local_account(&account);
 
-    autologin::on(&mut env(&kit, &account.password), &local).unwrap();
+    autologin::on(&mut kit.autologin_env(&account.password), &local).unwrap();
     with_session(&kit, &account, |connect| {
         // An exec session through the agent.
         let mut exec = connect();
@@ -180,7 +171,7 @@ fn stored_task_starts_a_working_session_with_dpapi() {
         assert!(done.stdout.contains("logon=4"), "a batch logon: {}", done.stdout);
         assert!(done.stdout.contains("dpapi=ok"), "{}", done.stdout);
     });
-    autologin::off(&mut env(&kit, &account.password), &local).unwrap();
+    autologin::off(&mut kit.autologin_env(&account.password), &local).unwrap();
 }
 
 /// Elevated (CI only). Not measured by the spike: an administrator's task. Administrators hold the
@@ -194,14 +185,14 @@ fn stored_task_for_an_administrator_starts_a_session() {
     let _end = session_end::LogOutOnDrop::new(&kit.exe, &account, ServiceLogon::TaskScheduler);
     let local = local_account(&account);
 
-    autologin::on(&mut env(&kit, &account.password), &local).unwrap();
+    autologin::on(&mut kit.autologin_env(&account.password), &local).unwrap();
     stand_in::wait_for_serving_marker_of_a_task(&account.socket_location(), TASK_START_BOUND);
     let mut exec = AgentConn::connect(&account.socket_location(), &account.sid);
     exec.start_exec("cmd.exe /c echo admin-session-up");
     exec.end_stdin();
     assert!(exec.read_to_end().stdout.contains("admin-session-up"));
     logout_with(&kit, &account);
-    autologin::off(&mut env(&kit, &account.password), &local).unwrap();
+    autologin::off(&mut kit.autologin_env(&account.password), &local).unwrap();
 }
 
 /// Elevated (CI only). M5(d), the OQ1 recommendation: without the batch right `on` refuses, naming it,
@@ -212,7 +203,7 @@ fn standard_account_without_the_batch_right_is_refused_before_registering() {
     let kit = kit("al6");
     let account = Account::create("al6", true);
 
-    let err = autologin::on(&mut env(&kit, &account.password), &local_account(&account)).unwrap_err();
+    let err = autologin::on(&mut kit.autologin_env(&account.password), &local_account(&account)).unwrap_err();
     let text = format!("{err:#}");
     assert!(text.contains("Log on as a batch job"), "{text}");
     assert!(state_of(&account).is_none(), "nothing is registered without the right");
@@ -234,7 +225,7 @@ fn credential_is_gone_after_off() {
     let _end = session_end::LogOutOnDrop::new(&kit.exe, &account, ServiceLogon::TaskScheduler);
     let local = local_account(&account);
 
-    autologin::on(&mut env(&kit, &account.password), &local).unwrap();
+    autologin::on(&mut kit.autologin_env(&account.password), &local).unwrap();
     stand_in::wait_for_serving_marker_of_a_task(&account.socket_location(), TASK_START_BOUND);
     logout_with(&kit, &account);
     assert_eq!(
@@ -243,7 +234,7 @@ fn credential_is_gone_after_off() {
         "after on, the store holds the account's credential"
     );
 
-    autologin::off(&mut env(&kit, &account.password), &local).unwrap();
+    autologin::off(&mut kit.autologin_env(&account.password), &local).unwrap();
     assert_eq!(
         stored_entries(&account),
         0,
@@ -260,13 +251,13 @@ fn on_twice_then_off_leaves_no_credential() {
     let _end = session_end::LogOutOnDrop::new(&kit.exe, &account, ServiceLogon::TaskScheduler);
     let local = local_account(&account);
 
-    autologin::on(&mut env(&kit, &account.password), &local).unwrap();
+    autologin::on(&mut kit.autologin_env(&account.password), &local).unwrap();
     stand_in::wait_for_serving_marker_of_a_task(&account.socket_location(), TASK_START_BOUND);
-    autologin::on(&mut env(&kit, &account.password), &local).unwrap();
+    autologin::on(&mut kit.autologin_env(&account.password), &local).unwrap();
     assert_eq!(stored_entries(&account), 1, "registering twice stores one credential");
     logout_with(&kit, &account);
 
-    autologin::off(&mut env(&kit, &account.password), &local).unwrap();
+    autologin::off(&mut kit.autologin_env(&account.password), &local).unwrap();
     assert_eq!(stored_entries(&account), 0);
 }
 
@@ -284,7 +275,7 @@ fn a_stale_password_is_not_visible_in_the_last_result() {
     let local: LocalAccount = local_account(&account);
     let exe = kit.exe.to_string_lossy().into_owned();
 
-    autologin::on(&mut env(&kit, &account.password), &local).unwrap();
+    autologin::on(&mut kit.autologin_env(&account.password), &local).unwrap();
     stand_in::wait_for_serving_marker_of_a_task(&account.socket_location(), TASK_START_BOUND);
     logout_with(&kit, &account);
 
@@ -308,7 +299,7 @@ fn a_stale_password_is_not_visible_in_the_last_result() {
         "the row must say it cannot see this: {}",
         row.detail
     );
-    autologin::off(&mut env(&kit, &account.password), &local).unwrap();
+    autologin::off(&mut kit.autologin_env(&account.password), &local).unwrap();
 }
 
 /// How many times the session is started and ended in `logon_sessions_with_no_process_do_not_pile_up`.
@@ -350,7 +341,7 @@ fn logon_sessions_with_no_process_do_not_pile_up() {
     let mut previous_marker: Option<String> = None;
     for cycle in 1..=CYCLES {
         if cycle == 1 {
-            autologin::on(&mut env(&kit, &account.password), &local).unwrap();
+            autologin::on(&mut kit.autologin_env(&account.password), &local).unwrap();
         } else {
             // The task ignores a start while an instance is listed.
             task_instances::wait_until_none(&task, TASK_START_BOUND);
@@ -362,7 +353,7 @@ fn logon_sessions_with_no_process_do_not_pile_up() {
         previous_marker = stand_in::serving_marker_text(&location);
         left_after.push(sessions_without_a_process(&account, &ended.logged_off));
     }
-    autologin::off(&mut env(&kit, &account.password), &local).unwrap();
+    autologin::off(&mut kit.autologin_env(&account.password), &local).unwrap();
 
     let first = left_after.first().map_or(0, Vec::len);
     let last = left_after.last().map_or(0, Vec::len);

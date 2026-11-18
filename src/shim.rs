@@ -1,8 +1,8 @@
 //! shim: the SSH `DefaultShell` (default action). Relays the terminal/streams to
 //! the agent over AF_UNIX; fails open to a local shell if the agent is unreachable.
 
-use crate::cmdline::{Exec, RawExec};
-use crate::protocol::{FrameKind, FrameReader, Handshake, Launch, Mode, Resize, Stream, write_frame};
+use crate::cmdline::{Login, RawExec};
+use crate::protocol::{FrameKind, FrameReader, Handshake, Launch, Mode, Privilege, Resize, Stream, write_frame};
 use crate::relay::{FrameSink, Outcome, PumpError, pump_decode, write_data};
 use crate::shell::{self, Session};
 use std::io::{Read, Write};
@@ -380,18 +380,27 @@ pub fn decide_fallback(connect_err: bool) -> Fallback {
 /// it started and returns its exit code. Only a failed `start` falls back to another line: once
 /// the shell runs, a failure of `finish` is reported and nothing is run again.
 ///
+/// A login that asked to be unelevated would otherwise get sshd's own token, which an administrator's is
+/// elevated. `unelevate` is given the login's privilege and returns the token the session's lines are started
+/// with, or none (an account's own login, or a process below High, where what it starts is unelevated anyway).
+/// It is called once, first. If it fails, the login gets a message and 255 and no shell: the command asked not
+/// to run elevated, and an elevated shell is the one thing it must not get. A replacement line is started
+/// with the token too.
+///
 /// The shell is resolved here, in the shim's own environment (`host`), by the one function the agent
 /// uses ([`shell::plan`]). When the configured shell cannot be used, the built-in `cmd.exe` runs
 /// instead and the reason goes to `stderr` first. A line that cannot be made, or a spawn that
 /// fails, exits 255: this crate's code for a broker-side failure, which 1 would hide among a
 /// command's own failures.
-pub fn fail_open<T>(
+pub fn fail_open<T, K>(
     host: &dyn shell::Host,
-    exec: &Option<Exec>,
+    login: &Login,
     stderr: &mut dyn Write,
-    start: impl FnMut(&str) -> Result<T, shell::StartError>,
+    unelevate: impl FnOnce(Privilege) -> anyhow::Result<Option<K>>,
+    mut start: impl FnMut(&str, Option<&K>) -> Result<T, shell::StartError>,
     finish: impl FnOnce(T) -> anyhow::Result<i32>,
 ) -> i32 {
+    let exec = &login.exec;
     let session = match exec {
         Some(exec) => Session::Command {
             text: &exec.command,
@@ -403,6 +412,17 @@ pub fn fail_open<T>(
     // goes to stderr, in every mode: with no message, a session that ends at once says nothing.
     let tell = |stderr: &mut dyn Write, text: &str| {
         let _ = writeln!(stderr, "{text}");
+    };
+    let token = match unelevate(login.privilege) {
+        Ok(token) => token,
+        Err(e) => {
+            tracing::error!("fail-open could not prepare an unelevated session: {e:#}");
+            tell(
+                stderr,
+                &format!("ssh-broker: could not prepare an unelevated session, so nothing was run: {e:#}"),
+            );
+            return 255;
+        }
     };
     let plan = match shell::plan(host, &session) {
         Ok(plan) => plan,
@@ -418,12 +438,18 @@ pub fn fail_open<T>(
     }
     // A replacement for a shell that cannot start is warned about by `start_or_fall_back` just before
     // it starts.
-    let started = shell::start_or_fall_back(host, &session, &plan, start, |replacement| {
-        if let Some(notice) = replacement.notice() {
-            tracing::warn!("{notice}");
-            tell(&mut *stderr, &notice);
-        }
-    })
+    let started = shell::start_or_fall_back(
+        host,
+        &session,
+        &plan,
+        |line| start(line, token.as_ref()),
+        |replacement| {
+            if let Some(notice) = replacement.notice() {
+                tracing::warn!("{notice}");
+                tell(&mut *stderr, &notice);
+            }
+        },
+    )
     .and_then(|(started, configured)| finish(started).map(|code| (code, configured)));
     match started {
         Ok((code, configured)) => {
@@ -468,7 +494,8 @@ pub fn map_outcome(outcome: Result<Outcome, crate::relay::PumpError>) -> i32 {
 /// Build the handshake from the shim's inputs (pure; the Windows caller supplies `term` from
 /// `$TERM` and `cols`/`rows` from the live console). A command without a terminal is an EXEC
 /// session; a command with one (`ssh -t host cmd`) is a PTY session that carries the command.
-/// `cwd` and `env` are empty: the agent supplies the session-1 working dir and profile env.
+/// `cwd` and `env` are empty: the agent supplies the session-1 working dir and profile env. `privilege` is
+/// what the login asked for ([`Login::privilege`]).
 pub fn make_handshake(
     exec: &Option<String>,
     terminal: bool,
@@ -476,6 +503,7 @@ pub fn make_handshake(
     term: String,
     cols: u16,
     rows: u16,
+    privilege: Privilege,
 ) -> Handshake {
     Handshake {
         mode: if exec.is_some() && !terminal {
@@ -490,6 +518,7 @@ pub fn make_handshake(
         command: exec.clone(),
         env: Vec::new(),
         launch,
+        privilege,
         ..Handshake::pty_default()
     }
 }
