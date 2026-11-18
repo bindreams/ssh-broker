@@ -436,6 +436,92 @@ fn a_connection_that_arrives_while_ending_is_told_so_and_exits_255() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The agent's hand-back is the answer and nothing else: one `HandBack` frame with the cause, a FIN of the
+/// write half, and then the agent waits for the client to close, as it does after a refusal.
+#[test]
+fn a_hand_back_is_one_frame_with_the_cause_then_a_fin_and_the_agent_waits_for_the_client() {
+    /// The writes of the agent and the reads of its client wait, in the order they happened.
+    type Events = Arc<Mutex<Vec<&'static str>>>;
+    struct Server {
+        sent: Vec<u8>,
+        events: Events,
+    }
+    impl Write for Server {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.sent.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.events.lock().unwrap().push("flushed");
+            Ok(())
+        }
+    }
+    impl HalfClose for Server {
+        fn shutdown_write(&self) -> anyhow::Result<()> {
+            self.events.lock().unwrap().push("fin");
+            Ok(())
+        }
+    }
+    struct Client(Events);
+    impl Read for Client {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().push("waited for the client");
+            Ok(0)
+        }
+    }
+    impl LimitedRead for Client {
+        fn limit_reads(&mut self, _: Duration) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let events = Events::default();
+    let mut server = Server {
+        sent: Vec::new(),
+        events: Arc::clone(&events),
+    };
+    hand_back(
+        &mut Client(Arc::clone(&events)),
+        &mut server,
+        &Control::standalone(),
+        "the token cannot be made",
+    )
+    .unwrap();
+
+    // One frame, the answer, and nothing after it.
+    let mut fr = FrameReader::new();
+    fr.push(&server.sent);
+    let frame = fr.next_frame().unwrap().expect("the answer was written");
+    assert_eq!(frame.kind, FrameKind::HandBack);
+    assert_eq!(frame.payload, b"the token cannot be made");
+    assert!(
+        fr.next_frame().unwrap().is_none() && fr.buffered_len() == 0,
+        "bytes after the answer"
+    );
+    // Flushed, then the FIN, and only then the wait for the client to close.
+    assert_eq!(*events.lock().unwrap(), ["flushed", "fin", "waited for the client"]);
+}
+
+/// A client that has gone cannot be told, which is not a fault.
+#[test]
+fn a_hand_back_to_a_client_that_has_gone_is_not_an_error() {
+    struct Gone;
+    impl Write for Gone {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::ErrorKind::BrokenPipe.into())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::ErrorKind::BrokenPipe.into())
+        }
+    }
+    impl HalfClose for Gone {
+        fn shutdown_write(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+    hand_back(&mut Closed, &mut Gone, &Control::standalone(), "why").unwrap();
+}
+
 #[test]
 fn the_refusal_is_one_line_that_says_the_session_is_ending_and_to_reconnect() {
     assert_eq!(ENDING_REFUSAL.matches('\n').count(), 1);
@@ -514,6 +600,20 @@ fn a_logout_whose_client_is_gone_before_the_reply_still_ends_the_agent() {
 }
 
 // a login refused while the agent ends -----
+
+#[test]
+fn a_hand_back_whose_client_never_closes_is_let_go_after_the_bound_and_the_log_says_so() {
+    let ((_srx, mut stx), (_crx, _ctx), dir) = socket_pair("hand-back-silent");
+    let control = Control::new(true, Connections::with_drain_bound(SHORT_BOUND));
+    let (_silent, closed) = mpsc::channel::<()>();
+
+    let (log, result) = logged(|| hand_back(&mut Gate::new(closed), &mut stx, &control, "why"));
+
+    result.unwrap();
+    assert!(log.contains("had not closed its connection"), "{log}");
+    assert!(log.contains("a handed-back login"), "{log}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
 
 #[test]
 fn a_refused_login_whose_client_never_closes_is_let_go_after_the_bound_and_the_log_says_so() {

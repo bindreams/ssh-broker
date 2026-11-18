@@ -12,26 +12,10 @@ use crate::shell::{self, ConfiguredShell, Session, StartError};
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct Launched<'a> {
     pub line: String,
-    /// The warning's text, without its line end (see [`notice_frame`]).
+    /// The warning for a shell that could not be used, without its line end (see [`notice_frame`]).
     pub notice: Option<String>,
     /// What [`start`] needs to replace a shell that cannot start; `None` for a direct launch.
     shell: Option<(Session<'a>, shell::Plan)>,
-}
-
-impl Launched<'_> {
-    /// Show `text` ahead of the warning for the shell, if there is one, as the first data of the session:
-    /// the two are joined with the line end of the stream the session shows ([`notice_frame`]), so the
-    /// terminal of a session in `mode` gets them from inside the console, where [`start`] prints the notice.
-    pub(super) fn add_notice(&mut self, mode: Mode, text: &str) {
-        let line_end = match mode {
-            Mode::Pty => "\r\n",
-            _ => "\n",
-        };
-        self.notice = Some(match self.notice.take() {
-            Some(shells) => format!("{text}{line_end}{shells}"),
-            None => text.to_owned(),
-        });
-    }
 }
 
 /// Why a handshake cannot be carried out.
@@ -104,9 +88,6 @@ pub(super) enum Spawn<'a> {
 /// started, or there is no `verb`, `warn` gets the warning's text just before the shell is spawned
 /// as a [`Spawn::Line`].
 ///
-/// A notice added with [`Launched::add_notice`] is shown through `warn` before the spawn, even when the launch
-/// is not a shell.
-///
 /// With what started comes the configured shell it is, so the caller can warn if it ends with the
 /// loader's "DLL not found" status (see [`ConfiguredShell`]); `None` for a direct launch, the
 /// built-in `cmd.exe` and a replacement for a shell that could not start.
@@ -118,10 +99,6 @@ pub(super) fn start<T>(
     mut warn: impl FnMut(&str),
 ) -> anyhow::Result<(T, Option<ConfiguredShell>)> {
     let Some((session, plan)) = &launched.shell else {
-        if let Some(text) = &launched.notice {
-            tracing::warn!("{text}");
-            warn(text);
-        }
         return spawn(Spawn::Line(&launched.line))
             .map(|started| (started, None))
             .map_err(StartError::into_cause);

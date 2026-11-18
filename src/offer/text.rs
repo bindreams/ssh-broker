@@ -93,9 +93,10 @@ pub fn always_filtered() -> String {
 }
 
 /// What a login that asked for a level is told when its unelevated session cannot be made: nothing was run, and
-/// the two ways out are to ask for nothing or for `always`. Split into what and cause as
+/// what a login that asked for none is given instead. Said by the agent and by the shim, so it is worded for
+/// both: neither gives a fallback session the agent's token. Split into what and cause as
 /// [`ALWAYS_BELOW_HIGH_WHAT`] is.
-pub const UNELEVATED_UNAVAILABLE_WHAT: &str = "could not prepare an unelevated session, so nothing was run (a login that leaves SSH_BROKER_ELEVATION unset gets the token it was given, with a notice, and one that sets it to always gets the session as it is)";
+pub const UNELEVATED_UNAVAILABLE_WHAT: &str = "could not prepare an unelevated session, so nothing was run (a login that leaves SSH_BROKER_ELEVATION unset is given a session that is not stepped down, with a notice)";
 
 /// The `what` of a login that `asked` for a level and cannot be stepped down: for `always` the level of the process
 /// could not be read ([`ALWAYS_LEVEL_UNREADABLE_WHAT`]), which is the only way it fails; for any other level the
@@ -112,24 +113,15 @@ pub fn unelevated_unavailable(asked: Option<ElevationPolicy>, cause: &str) -> St
     format!("ssh-broker: {}: {cause}", unelevated_unavailable_what(asked))
 }
 
-/// Whose token a session has when a login that set nothing could not be stepped down ([`unelevated_fallback`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FallbackToken {
-    Sshd,
-    Agent,
-}
-
-/// The notice for a login that set nothing and could not be stepped down: its session has `token`, which for an
-/// administrator is elevated, and a login that sets `SSH_BROKER_ELEVATION` is refused instead. `cause` is why
-/// the unelevated session could not be made. No line terminator.
-pub fn unelevated_fallback(cause: &str, token: FallbackToken) -> String {
-    let token = match token {
-        FallbackToken::Sshd => "the token sshd gave this login",
-        FallbackToken::Agent => "the agent's own token",
-    };
+/// The notice for a login that set nothing and could not be stepped down: its session has the token sshd gave it,
+/// which for an administrator is elevated, and a login that sets `SSH_BROKER_ELEVATION` to `never`, `prompt` or
+/// `auto-approve` is refused instead. `cause` is why the unelevated session could not be made. The shim says it
+/// when it runs such a session itself, which is also what the agent hands back to it. No line terminator.
+pub fn unelevated_fallback(cause: &str) -> String {
     format!(
-        "ssh-broker: could not prepare an unelevated session ({cause}), so this session has {token}, which for an \
-         administrator is elevated. A login that sets SSH_BROKER_ELEVATION is refused instead."
+        "ssh-broker: could not prepare an unelevated session ({cause}), so this session has the token sshd gave this \
+         login, which for an administrator is elevated. A login that sets SSH_BROKER_ELEVATION to never, prompt or \
+         auto-approve is refused instead."
     )
 }
 

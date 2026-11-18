@@ -289,8 +289,8 @@ fn connect_failure_in_pty_mode_writes_nothing_to_stderr() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A fake agent that answers the first connection's handshake and stdin-EOF marker with `Exit(code)`
-/// and returns the handshake it was sent.
+/// A fake agent that answers the first connection's handshake with `Serving`, reads the stdin-EOF marker
+/// that follows, and ends with `Exit(code)`. It returns the handshake it was sent.
 fn fake_agent_exiting_with(
     listener: crate::afunix::Listener,
     code: i32,
@@ -302,6 +302,8 @@ fn fake_agent_exiting_with(
         let mut frames = FrameReader::new();
         let frame = read_one_frame(&mut rx, &mut frames).unwrap();
         assert_eq!(frame.kind, FrameKind::Handshake);
+        // The shim sends no input before this.
+        crate::relay::write_serving(&mut tx).unwrap();
         // Read the stdin-EOF marker before answering, so nothing the shim sent is unread when
         // this side closes: an unread byte at close can make the peer lose the Exit.
         let eof = read_one_frame(&mut rx, &mut frames).unwrap();
@@ -654,9 +656,9 @@ impl Rescue for Never {
 
 #[test]
 fn a_command_whose_connection_ends_before_the_agent_answers_says_it_may_have_run_and_is_not_run_locally() {
-    // The frames read are none (the connection closes with the handshake unread), or the handshake and
-    // the stdin-EOF marker an exec shim sends at once.
-    for (tag, frames) in [("hangup-unread", 0), ("hangup-read", 2)] {
+    // The frames read are none (the connection closes with the handshake unread), or the handshake, which is
+    // all an exec shim sends until the agent answers.
+    for (tag, frames) in [("hangup-unread", 0), ("hangup-read", 1)] {
         let (_profile, location, listener) = location_with_listener(tag);
         let agent = agent_that_hangs_up(listener, frames);
         let mut stderr = Vec::new();
@@ -690,31 +692,14 @@ fn a_command_whose_connection_ends_before_the_agent_answers_says_it_may_have_run
 fn a_command_is_never_sent_to_an_agent_a_second_time() {
     // The agent may have started the command before it closed the connection, and the agent that
     // answers next could run it again. This agent is still there and would answer.
-    use crate::afunix;
     use crate::protocol::{ExitCode, FrameKind, FrameReader, read_one_frame, write_frame};
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     let (_profile, location, listener) = location_with_listener("never-twice");
-    let socket = location.path().to_path_buf();
-    let stop = std::sync::Arc::new(AtomicBool::new(false));
-    let connections = std::sync::Arc::new(AtomicUsize::new(0));
-    let agent = std::thread::spawn({
-        let (stop, connections) = (std::sync::Arc::clone(&stop), std::sync::Arc::clone(&connections));
-        move || {
-            loop {
-                let conn = listener.accept().unwrap();
-                if stop.load(Ordering::SeqCst) {
-                    return;
-                }
-                let nth = connections.fetch_add(1, Ordering::SeqCst) + 1;
-                let (mut rx, mut tx) = afunix::split(conn).unwrap();
-                read_one_frame(&mut rx, &mut FrameReader::new()).unwrap();
-                if nth > 1 {
-                    // A second connection would be served: the command would run twice.
-                    write_frame(&mut tx, FrameKind::Exit, &ExitCode(0).encode()).unwrap();
-                    let _ = tx.shutdown_write();
-                }
-                drop((rx, tx));
-            }
+    let agent = CountingAgent::start(listener, location.path(), |nth, mut rx, mut tx| {
+        read_one_frame(&mut rx, &mut FrameReader::new()).unwrap();
+        if nth > 1 {
+            // A second connection would be served: the command would run twice.
+            write_frame(&mut tx, FrameKind::Exit, &ExitCode(0).encode()).unwrap();
+            let _ = tx.shutdown_write();
         }
     });
 
@@ -731,12 +716,8 @@ fn a_command_is_never_sent_to_an_agent_a_second_time() {
     )
     .unwrap();
 
-    // Only now is the agent told to stop; its next accept is this connection.
-    stop.store(true, Ordering::SeqCst);
-    drop(afunix::connect(&socket).unwrap());
-    agent.join().unwrap();
     assert_eq!(relayed, Some(255));
-    assert_eq!(connections.load(Ordering::SeqCst), 1, "the command was sent again");
+    assert_eq!(agent.finish(), 1, "the command was sent again");
 }
 
 #[test]
@@ -1146,6 +1127,256 @@ fn an_unanswered_terminal_command_is_not_sent_again() {
         String::from_utf8(stderr).unwrap(),
         "ssh-broker: the agent ended before it answered; the command may or may not have run\n"
     );
+}
+
+// An agent that hands the session back -----
+
+/// What a login sees when the agent hands its session back for `cause`.
+fn hand_back_line(cause: &str) -> String {
+    format!(
+        "ssh-broker: agent unavailable — falling back to a local shell (the agent could not prepare an unelevated \
+         session: {cause})\n"
+    )
+}
+
+/// A stand-in agent that serves each connection with `answer(rx, tx)` on its own thread of control until it is
+/// finished, and counts the connections.
+struct CountingAgent {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    connections: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    socket: std::path::PathBuf,
+    thread: std::thread::JoinHandle<()>,
+}
+
+impl CountingAgent {
+    fn start(
+        listener: crate::afunix::Listener,
+        socket: &std::path::Path,
+        mut answer: impl FnMut(usize, crate::afunix::ConnRx, crate::afunix::ConnTx) + Send + 'static,
+    ) -> CountingAgent {
+        use crate::afunix::AcceptError;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let connections = std::sync::Arc::new(AtomicUsize::new(0));
+        let thread = std::thread::spawn({
+            let (stop, connections) = (std::sync::Arc::clone(&stop), std::sync::Arc::clone(&connections));
+            move || {
+                loop {
+                    let conn = match listener.accept() {
+                        Ok(conn) => conn,
+                        // A connection lost while it queued (the sentinel of `finish` may be one) or an
+                        // interrupted call serves nobody: the next accept, or the end.
+                        Err(AcceptError::Connection(_) | AcceptError::Interrupted(_)) => {
+                            if stop.load(Ordering::SeqCst) {
+                                return;
+                            }
+                            continue;
+                        }
+                        Err(e) => panic!("the stand-in agent could not accept: {e:?}"),
+                    };
+                    if stop.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    let nth = connections.fetch_add(1, Ordering::SeqCst) + 1;
+                    let (rx, tx) = crate::afunix::split(conn).unwrap();
+                    answer(nth, rx, tx);
+                }
+            }
+        });
+        CountingAgent {
+            stop,
+            connections,
+            socket: socket.to_path_buf(),
+            thread,
+        }
+    }
+
+    /// Stop the agent, which takes the connection this makes as its last, and return how many it served.
+    fn finish(self) -> usize {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        drop(crate::afunix::connect(&self.socket).unwrap());
+        self.thread.join().unwrap();
+        self.connections.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// A command without a terminal that the agent hands back is not run by the agent and is not sent again; the
+/// shim says why on stderr, falls open (`Ok(None)`), and has read none of its stdin: the shell that runs
+/// the command gets it.
+#[test]
+fn a_command_the_agent_hands_back_falls_open_after_the_cause_with_its_stdin_unread_and_one_connect() {
+    use crate::protocol::{FrameReader, read_one_frame};
+    use crate::test_support::RecordedInput;
+    let (_profile, location, listener) = location_with_listener("handback-exec");
+    let agent = CountingAgent::start(listener, location.path(), |_, mut rx, mut tx| {
+        let frame = read_one_frame(&mut rx, &mut FrameReader::new()).unwrap();
+        assert_eq!(frame.kind, crate::protocol::FrameKind::Handshake);
+        crate::relay::write_hand_back(&mut tx, "the token cannot be made").unwrap();
+        // Nothing the shim sent is unread (it sent the handshake and, until the answer, nothing else), so
+        // closing at once cannot lose the answer.
+        tx.shutdown_write().unwrap();
+    });
+    let (stdin, input_dropped, reads) = RecordedInput::new(b"for the shell that runs the command");
+    let mut stderr = Vec::new();
+
+    let relayed = super::try_relay_with(
+        &folder_of(Ok(location)),
+        &Login {
+            exec: Some(exec("echo hi")),
+            elevation: None,
+        },
+        &mut stderr,
+        None,
+        stdin,
+        &mut Never,
+        &mut |_conn, _modes, _login| panic!("a command without a terminal used the console relay"),
+    )
+    .unwrap();
+
+    assert_eq!(relayed, None, "the command falls open");
+    assert_eq!(
+        String::from_utf8(stderr).unwrap(),
+        hand_back_line("the token cannot be made")
+    );
+    input_dropped.recv().expect("the input is dropped when the relay ends");
+    assert_eq!(reads.load(Ordering::SeqCst), 0, "stdin was read");
+    assert_eq!(agent.finish(), 1, "the command was sent again");
+}
+
+/// The same for a session with a terminal, with and without a command: the relay's answer is the hand-back, so
+/// the console has been given back, and nothing connects a second time (a second connect is a second call of the
+/// relay).
+#[test]
+fn a_session_with_a_terminal_the_agent_hands_back_falls_open_after_the_cause_with_one_connect() {
+    use super::Interactive;
+    use crate::relay::Outcome;
+    use crate::shim::Pumped;
+    for (n, exec) in [(0, None), (1, Some(exec_with_terminal("whoami")))] {
+        // The stand-in console relay does not use the connection, so the listener only has to exist.
+        let (_profile, location, _listener) = location_with_listener(&format!("handback-pty-{n}"));
+        let mut stderr = Vec::new();
+        let mut attempts = 0;
+
+        let relayed = super::try_relay_with(
+            &folder_of(Ok(location)),
+            &Login { exec, elevation: None },
+            &mut stderr,
+            None,
+            std::io::empty(),
+            &mut Never,
+            &mut |_conn, _modes, _login| {
+                attempts += 1;
+                Ok(Interactive::Pumped(Pumped {
+                    outcome: Ok(Outcome::HandedBack("the token cannot be made".into())),
+                    heard: true,
+                }))
+            },
+        )
+        .unwrap();
+
+        assert_eq!(relayed, None, "{n}: falls open");
+        assert_eq!(attempts, 1, "{n}");
+        assert_eq!(
+            String::from_utf8(stderr).unwrap(),
+            hand_back_line("the token cannot be made"),
+            "{n}"
+        );
+    }
+}
+
+/// The agent that served and then closed without a byte of its own is still not a hand-back: a command is
+/// not run again, and the message is the one it was.
+#[test]
+fn a_close_without_a_byte_is_not_a_hand_back() {
+    let (_profile, location, listener) = location_with_listener("nobyte");
+    let (finished, agent) = agent_that_always_hangs_up(listener, 1);
+    let mut stderr = Vec::new();
+
+    let relayed = super::try_relay_with(
+        &folder_of(Ok(location)),
+        &Login {
+            exec: Some(exec("echo hi")),
+            elevation: None,
+        },
+        &mut stderr,
+        None,
+        std::io::empty(),
+        &mut Never,
+        &mut |_conn, _modes, _login| panic!("a command without a terminal used the console relay"),
+    )
+    .unwrap();
+    finished.send(()).unwrap();
+    agent.join().unwrap();
+
+    assert_eq!(relayed, Some(255));
+    let text = String::from_utf8(stderr).unwrap();
+    assert!(text.contains("the agent ended before it answered"), "{text}");
+    assert!(!text.contains("falling back"), "{text}");
+}
+
+// The input worker of a terminal session -----
+
+use super::Input;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, mpsc};
+
+/// The worker is started by the answer: before it the write half is held and no thread exists.
+#[test]
+fn the_input_worker_is_not_started_until_the_answer_and_then_gets_the_write_half() {
+    let mut input = Input::waiting("the write half");
+    let mut spawned = Vec::new();
+    input
+        .start(|tx| {
+            spawned.push(tx);
+            std::thread::spawn(|| {})
+        })
+        .unwrap();
+    assert_eq!(spawned, ["the write half"]);
+    // Started once: a second answer is refused and spawns nothing.
+    assert!(input.start(|_| panic!("started twice")).is_err());
+    input.end(|| {}, |_| panic!("a started worker is joined, not closed unstarted"));
+}
+
+/// Teardown of a worker that was started stops it, then joins it.
+#[test]
+fn a_started_input_worker_is_stopped_then_joined() {
+    let (release, wait_for_stop) = mpsc::channel::<()>();
+    let finished = Arc::new(AtomicBool::new(false));
+    let mut input = Input::waiting(());
+    input
+        .start(|()| {
+            let finished = Arc::clone(&finished);
+            std::thread::spawn(move || {
+                // Ends only when told to stop, as the console read does when woken.
+                wait_for_stop.recv().unwrap();
+                finished.store(true, Ordering::SeqCst);
+            })
+        })
+        .unwrap();
+    let mut stopped = 0;
+    input.end(
+        || {
+            stopped += 1;
+            release.send(()).unwrap();
+        },
+        |()| panic!("a started worker is not closed unstarted"),
+    );
+    assert_eq!(stopped, 1);
+    assert!(finished.load(Ordering::SeqCst), "the worker was not joined");
+    // Ended is ended: nothing more happens.
+    input.end(|| panic!("stopped twice"), |()| panic!("closed twice"));
+}
+
+/// A worker that was never started (a hand-back, a refusal, a failed read) has nothing to stop or join: its
+/// write half is closed from here, so the agent sees the client go.
+#[test]
+fn an_input_worker_that_was_never_started_is_not_stopped_or_joined_and_its_write_half_is_closed() {
+    let mut input = Input::waiting("the write half");
+    let mut closed = Vec::new();
+    input.end(|| panic!("stopped a worker that never started"), |tx| closed.push(tx));
+    assert_eq!(closed, ["the write half"]);
+    input.end(|| panic!("stopped twice"), |tx| closed.push(tx));
+    assert_eq!(closed.len(), 1, "closed twice");
 }
 
 // The root process of a console keeps running through Ctrl+C -----------------------------

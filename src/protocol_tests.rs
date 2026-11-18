@@ -13,6 +13,21 @@ fn header_roundtrips() {
     assert_eq!(FrameHeader::decode(&bytes).unwrap(), h);
 }
 
+/// The answer's two kinds have the numbers the contract gives them, and a version-4 peer reads them.
+#[test]
+fn the_answer_kinds_have_their_numbers_and_decode() {
+    assert_eq!(FrameKind::Serving as u8, 4);
+    assert_eq!(FrameKind::HandBack as u8, 5);
+    for kind in [FrameKind::Serving, FrameKind::HandBack] {
+        let header = FrameHeader { kind, len: 3 };
+        assert_eq!(FrameHeader::decode(&header.encode()).unwrap(), header);
+    }
+    assert!(
+        FrameHeader::decode(&[6, 0, 0, 0, 0]).is_err(),
+        "the next number is still unknown"
+    );
+}
+
 #[test]
 fn stream_tag_roundtrips() {
     for s in [Stream::Pty, Stream::Stdin, Stream::Stdout, Stream::Stderr] {

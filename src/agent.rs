@@ -67,7 +67,7 @@ use crate::protocol::{
     ElevationPolicy, ExitCode, FrameKind, FrameReader, Handshake, Mode, Resize, Stream, read_one_frame, write_frame,
 };
 #[cfg(windows)]
-use crate::relay::{FrameSink, pump_until_peer_gone, write_data};
+use crate::relay::{FrameSink, pump_until_peer_gone, write_data, write_serving};
 #[cfg(windows)]
 use crate::route::{AgentArgs, BackgroundArgs};
 #[cfg(windows)]
@@ -765,7 +765,7 @@ fn handle_connection_in(conn: socket2::Socket, hooks: Hooks, control: &Control) 
     if control.is_ending() {
         return logout::refuse_while_ending(&mut rx, &mut tx, control);
     }
-    let mut launched = match launch::launch_line(&hs, &*hooks.shell_host) {
+    let launched = match launch::launch_line(&hs, &*hooks.shell_host) {
         Ok(launched) => launched,
         Err(launch::Refusal::BadRequest(cause)) => {
             return Err(logout::fail_connection(
@@ -794,12 +794,10 @@ fn handle_connection_in(conn: socket2::Socket, hooks: Hooks, control: &Control) 
     let unelevated = match (hooks.make_unelevated)(hs.elevation) {
         Ok(StepDown::Token(token)) => Some(token),
         Ok(StepDown::Own) => None,
+        // The agent hosts no session it could not step down: the shim runs it, in either mode.
         Ok(StepDown::Fallback(cause)) => {
-            tracing::warn!(
-                "the agent could not prepare an unelevated session, so the session has its own token: {cause}"
-            );
-            launched.add_notice(hs.mode, &text::unelevated_fallback(&cause, text::FallbackToken::Agent));
-            None
+            tracing::warn!("the agent could not prepare an unelevated session, so it hands the session back: {cause}");
+            return logout::hand_back(&mut rx, &mut tx, control, &cause);
         }
         Ok(StepDown::Refused) => {
             return Err(logout::fail_connection(
@@ -822,6 +820,12 @@ fn handle_connection_in(conn: socket2::Socket, hooks: Hooks, control: &Control) 
             ));
         }
     };
+    // The answer: this connection will be served. The client sends no input before it. A client that has
+    // gone (the write fails) has nothing started for it.
+    if let Err(e) = write_serving(&mut tx) {
+        tracing::debug!("the client is gone before the answer; nothing was started: {e:#}");
+        return Ok(());
+    }
     let cwd_buf = child_cwd(&hs.cwd, home_dir());
     let cwd = cwd_buf.as_deref();
     let env = Env {

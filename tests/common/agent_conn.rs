@@ -261,6 +261,8 @@ impl AgentConn {
         let exit = match outcome {
             Ok(Outcome::Exited(code)) => Some(code),
             Ok(Outcome::PeerClosed) => None,
+            // Every handshake of this client sets a level, and the agent hands back only a login that set none.
+            Ok(Outcome::HandedBack(cause)) => panic!("the agent handed the session back: {cause}"),
             Err(e) => panic!(
                 "the agent's stream broke or stayed silent for {SILENCE_BOUND:?} while the test waited for the session to end: {e:?}
 stdout: {:?}

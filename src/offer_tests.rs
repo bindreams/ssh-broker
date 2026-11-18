@@ -397,10 +397,11 @@ fn always_below_high_is_the_line_the_agents_reply_shares() {
     assert!(!text::always_below_high().contains("administrator"));
 }
 
-/// The sentence for a session whose token cannot be made, for a login that asked for a level, names both ways
-/// out: set nothing, or ask for `always`.
+/// The sentence for a session whose token cannot be made, for a login that asked for a level, says what a login
+/// that asked for none is given. It is true at the agent and at the shim, and says nothing of `always`, whose
+/// refusal has sentences of its own.
 #[test]
-fn an_unavailable_unelevated_session_names_both_ways_out_and_the_cause() {
+fn an_unavailable_unelevated_session_says_what_a_login_that_set_nothing_is_given_and_the_cause() {
     for asked in [
         ElevationPolicy::Never,
         ElevationPolicy::Prompt,
@@ -409,8 +410,8 @@ fn an_unavailable_unelevated_session_names_both_ways_out_and_the_cause() {
         assert_eq!(
             text::unelevated_unavailable(Some(asked), "the token cannot be made"),
             "ssh-broker: could not prepare an unelevated session, so nothing was run (a login that leaves \
-             SSH_BROKER_ELEVATION unset gets the token it was given, with a notice, and one that sets it to always \
-             gets the session as it is): the token cannot be made",
+             SSH_BROKER_ELEVATION unset is given a session that is not stepped down, with a notice): the token \
+             cannot be made",
             "{asked:?}"
         );
         assert_eq!(
@@ -448,23 +449,18 @@ fn always_for_a_filtered_login_says_why_it_cannot_be_given() {
     );
 }
 
-/// A login that set nothing and could not be stepped down is told what it has, and why, in one sentence for the
-/// shim and the agent, which differ in whose token it is.
+/// A login that set nothing and could not be stepped down is told what it has, and why. Only the shim says it: the
+/// agent hands such a login back. `always` is not among the levels that are refused instead, since at High it
+/// runs elevated as asked.
 #[test]
-fn the_fallback_notice_says_whose_token_the_session_has_and_that_a_login_that_sets_the_variable_is_refused() {
+fn the_fallback_notice_says_the_session_has_sshds_token_and_which_values_are_refused_instead() {
     assert_eq!(
-        text::unelevated_fallback("the token cannot be made", text::FallbackToken::Sshd),
+        text::unelevated_fallback("the token cannot be made"),
         "ssh-broker: could not prepare an unelevated session (the token cannot be made), so this session has the \
          token sshd gave this login, which for an administrator is elevated. A login that sets \
-         SSH_BROKER_ELEVATION is refused instead."
+         SSH_BROKER_ELEVATION to never, prompt or auto-approve is refused instead."
     );
-    assert_eq!(
-        text::unelevated_fallback("the token cannot be made", text::FallbackToken::Agent),
-        "ssh-broker: could not prepare an unelevated session (the token cannot be made), so this session has the \
-         agent's own token, which for an administrator is elevated. A login that sets SSH_BROKER_ELEVATION is \
-         refused instead."
-    );
-    assert!(!text::unelevated_fallback("c", text::FallbackToken::Sshd).contains('\n'));
+    assert!(!text::unelevated_fallback("c").contains('\n'));
 }
 
 /// The sentences about the filtered login and the elevated agent do not send anyone to an elevated prompt for

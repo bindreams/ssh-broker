@@ -7,7 +7,7 @@
 //! every session's shell tree, waits until every other connection has finished relaying (so each
 //! shell's last output reaches its client the way it does when a shell exits by itself), stops
 //! accepting and closes the listener, and only then ends the process. Every wait on a client (the
-//! logout request's, a refused login's, the drain's) is on a client that may never read or close, so
+//! logout request's, a refused or handed-back login's, the drain's) is on a client that may never read or close, so
 //! each has the bound `DRAIN_BOUND`: past it the process goes on without the client, and the log says
 //! so. A refused login counts as live for the drain until its wait on the client returns, so the
 //! process does not end with the client's input unread, which would reset the connection and lose
@@ -29,7 +29,7 @@ use std::time::{Duration, Instant};
 use super::{Connections, Drained, HalfClose};
 use crate::afunix::{ConnRx, Whole};
 use crate::protocol::{ExitCode, FrameKind, Stream, write_frame};
-use crate::relay::write_data;
+use crate::relay::{write_data, write_hand_back};
 
 /// The reply of a background agent, before it ends.
 pub const ENDING_REPLY: &str = "ssh-broker: ending your background session.\r\n";
@@ -185,10 +185,39 @@ pub(super) fn refuse_while_ending<R: LimitedRead, W: Write + HalfClose>(
         rx,
         tx,
         control,
-        ENDING_REFUSAL,
-        ENDING_REFUSED_EXIT_CODE,
+        |tx| reply(tx, ENDING_REFUSAL, ENDING_REFUSED_EXIT_CODE),
         "a refused login",
     )
+}
+
+/// Answer a session handshake of a login that the agent will not host: `HandBack` with `cause`, the answer
+/// after which the client runs the session itself (see [`FrameKind`]). Nothing was started, and nothing follows
+/// the frame. It is followed by a FIN and a read until the client closes, as a refusal is ([`refuse_while_ending`]),
+/// and counts as live for the drain until that read returns.
+///
+/// A client that has gone cannot be told, and is not a fault: it is logged at debug, as a failure reply that
+/// cannot be delivered is.
+pub(super) fn hand_back<R: LimitedRead, W: Write + HalfClose>(
+    rx: &mut R,
+    tx: &mut W,
+    control: &Control,
+    cause: &str,
+) -> anyhow::Result<()> {
+    let answered = answer_and_wait(
+        rx,
+        tx,
+        control,
+        |tx| {
+            write_hand_back(tx, cause)?;
+            tx.flush()?;
+            Ok(())
+        },
+        "a handed-back login",
+    );
+    if let Err(e) = answered {
+        tracing::debug!("could not hand the session back to its client: {e:#}");
+    }
+    Ok(())
 }
 
 /// What the shim exits with when the agent could not read the request.
@@ -211,7 +240,7 @@ pub(super) fn fail_connection<R: LimitedRead, W: Write + HalfClose>(
 ) -> anyhow::Error {
     let text = format!("ssh-broker: {what}: {cause:#}\r\n");
     // A client that has gone cannot be told; the caller logs the cause either way.
-    if let Err(e) = answer_and_wait(rx, tx, control, &text, code, "a failed connection") {
+    if let Err(e) = answer_and_wait(rx, tx, control, |tx| reply(tx, &text, code), "a failed connection") {
         tracing::debug!("could not tell the client why its connection failed: {e:#}");
     }
     cause.context(what.to_owned())
@@ -268,17 +297,16 @@ pub(super) fn fail_socket(conn: socket2::Socket, control: &Control, what: &str, 
     }
 }
 
-/// Send `text` and `code`, FIN the write half and wait for the client to close (see
+/// Send what `answer` writes (a reply, or a hand-back), FIN the write half and wait for the client to close (see
 /// [`wait_for_client`]).
 fn answer_and_wait<R: LimitedRead, W: Write + HalfClose>(
     rx: &mut R,
     tx: &mut W,
     control: &Control,
-    text: &str,
-    code: i32,
+    answer: impl FnOnce(&mut W) -> anyhow::Result<()>,
     who: &str,
 ) -> anyhow::Result<()> {
-    reply(tx, text, code)?;
+    answer(tx)?;
     tx.shutdown_write()?;
     wait_for_client(rx, control, who);
     Ok(())

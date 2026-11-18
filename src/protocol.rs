@@ -10,6 +10,14 @@ pub const HEADER_LEN: usize = 5;
 /// Guard against absurd allocations from a malformed/hostile length prefix (1 MiB).
 pub const MAX_FRAME: u32 = 1 << 20;
 
+/// What a frame is.
+///
+/// The agent's answer: after a [`Mode::Pty`] or [`Mode::Exec`] handshake the agent's first frame is its answer.
+/// `Serving` (no payload) means it will serve the session. `HandBack` (payload: the cause, UTF-8) means it
+/// starts nothing and the client should run the session itself. A refusal is the other possible first frame:
+/// `Data(Stderr)`, then `Exit`. Any first frame ends the client's wait, and a client sends no input before
+/// it. `Serving` and `HandBack` anywhere but first are protocol errors. [`Mode::Logout`] is not answered this
+/// way.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrameKind {
@@ -17,6 +25,8 @@ pub enum FrameKind {
     Data = 1,
     Resize = 2,
     Exit = 3,
+    Serving = 4,
+    HandBack = 5,
 }
 
 impl FrameKind {
@@ -26,6 +36,8 @@ impl FrameKind {
             1 => Some(Self::Data),
             2 => Some(Self::Resize),
             3 => Some(Self::Exit),
+            4 => Some(Self::Serving),
+            5 => Some(Self::HandBack),
             _ => None,
         }
     }
