@@ -211,12 +211,25 @@ fn assert_served_by(server: Server, remote: &str, said_unavailable: bool, outcom
     );
 }
 
-/// `ssh -T host -- remote`, run to its end: the token `remote` (a `whoami /groups`) was started with, by `server`.
-fn token_of_command(kit: &Kit, login: &Login<'_>, remote: &str, server: Server) -> TokenShown {
+/// `ssh -T host -- remote`, run to its end: the outcome and its stdout, once `server` is shown to be what served it.
+/// The exit code is the caller's to judge.
+fn run_command_through_sshd(kit: &Kit, login: &Login<'_>, remote: &str, server: Server) -> (Outcome, String) {
     let mut ssh = login.command();
     ssh.arg("-T").arg("--").arg(remote);
     let outcome = run_client(ssh, false, kit.dir());
     let shown = String::from_utf8_lossy(&outcome.stdout).into_owned();
+    // Kept in the log of a test that fails on what it showed: the raw output and the shim's own words.
+    eprintln!("`{remote}` showed:\n{shown}\nstderr of the client:\n{}", outcome.stderr);
+    let said = outcome
+        .stderr
+        .contains(&ssh_broker::shim_pty::unavailable_message(None));
+    assert_served_by(server, remote, said, &outcome, login);
+    (outcome, shown)
+}
+
+/// `ssh -T host -- remote`, run to its end: the token `remote` (a `whoami /groups`) was started with, by `server`.
+fn token_of_command(kit: &Kit, login: &Login<'_>, remote: &str, server: Server) -> TokenShown {
+    let (outcome, shown) = run_command_through_sshd(kit, login, remote, server);
     assert!(
         outcome.code == Some(0),
         "`{remote}` did not run through sshd (exit {:?}); stdout:\n{shown}\nstderr:\n{}\n{}",
@@ -224,12 +237,6 @@ fn token_of_command(kit: &Kit, login: &Login<'_>, remote: &str, server: Server) 
         outcome.stderr,
         (login.diagnostics())()
     );
-    // Kept in the log of a test that fails on what the token was: the raw output and the shim's own words.
-    eprintln!("`{remote}` showed:\n{shown}\nstderr of the client:\n{}", outcome.stderr);
-    let said = outcome
-        .stderr
-        .contains(&ssh_broker::shim_pty::unavailable_message(None));
-    assert_served_by(server, remote, said, &outcome, login);
     token_shown(&shown)
 }
 
@@ -255,6 +262,14 @@ fn token_of_command_with_terminal(kit: &Kit, login: &Login<'_>, remote: &str, se
     let said = ran_by_shim(login.account) > before;
     assert_served_by(server, remote, said, &outcome, login);
     token_shown(&shown)
+}
+
+/// `ssh -T host -- "<kit exe>" verify`, served by the agent: the text `verify` printed. Its session rows are
+/// the ones that say what the agent's sessions are. Its exit code is not read: the rig does not install the
+/// broker with `apply`, so its installation rows are not expected to pass.
+fn verify_through_the_agent(kit: &Kit, login: &Login<'_>) -> String {
+    let remote = format!("\"{}\" verify", kit.exe.display());
+    run_command_through_sshd(kit, login, &remote, Server::Agent).1
 }
 
 /// What a PowerShell session of the agent says of its own token, typed as a line: `wg-label=<label>
@@ -307,6 +322,9 @@ fn an_administrators_session_through_real_sshd_is_elevated_and_the_word_gives_an
         TokenShown::new("High", "enabled"),
         "the login's own shell is not elevated"
     );
+    // `verify` through the agent the password prompt started: an elevated session, an unelevated one on request,
+    // and the junction a token below High made followed.
+    agent_conn::assert_verify_session_rows(&verify_through_the_agent(&kit, &login));
 
     let elevated = TokenShown::new("High", "enabled");
     let unelevated = TokenShown::new("Medium", "deny-only");

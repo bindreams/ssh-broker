@@ -43,12 +43,17 @@ pub struct BackgroundAgent {
 }
 
 impl BackgroundAgent {
-    /// Start it from `kit`'s copy of the real exe with the `kind` of logon and wait until it is listening.
-    /// Panics with what the agent left (exit code, `agent.log`) if it ends first, and ends it then.
-    pub fn start(kit: &Kit, account: &Account, kind: logon::LogonKind) -> BackgroundAgent {
+    /// Start it from `kit`'s copy of the real exe and wait until it is listening. Panics with what
+    /// the agent left (exit code, `agent.log`) if it ends first.
+    pub fn start(kit: &Kit, account: &Account) -> BackgroundAgent {
         let password = crate::password::password(&account.password);
-        let started = logon::start_background_agent(&local_account(account), &password, &kit.exe, kind)
-            .unwrap_or_else(|e| panic!("the logon for {} failed: {e:?}", account.name));
+        let started = logon::start_background_agent(
+            &local_account(account),
+            &password,
+            &kit.exe,
+            logon::LogonKind::Interactive,
+        )
+        .unwrap_or_else(|e| panic!("the logon for {} failed: {e:?}", account.name));
         let location = account.socket_location();
         let agent = BackgroundAgent {
             process: started.process,
@@ -124,6 +129,28 @@ pub struct Finished {
     pub pty: String,
     /// `None` when the agent closed the connection without an exit code.
     pub exit: Option<i32>,
+}
+
+/// The session rows `verify` shows through an administrator's elevated agent, in its `stdout`: the session is
+/// elevated, an unelevated one can be had, and the junction was followed, not skipped. Not its exit code, which
+/// also depends on the installation rows.
+pub fn assert_verify_session_rows(stdout: &str) {
+    for row in [
+        "[PASS] elevated session",
+        "[PASS] unelevated session on request",
+        "[PASS] junction (via agent)",
+    ] {
+        assert!(stdout.contains(row), "no {row:?} in:\n{stdout}");
+    }
+    let junction = stdout
+        .lines()
+        .find(|line| line.contains("junction (via agent)"))
+        .unwrap_or_else(|| panic!("no junction row in:\n{stdout}"));
+    assert!(
+        junction.contains("followed"),
+        "the junction was not followed: {junction}"
+    );
+    assert!(!stdout.contains("NOT tested"), "something was not tested:\n{stdout}");
 }
 
 impl AgentConn {

@@ -12,7 +12,6 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use ssh_broker::autologin::{self, PasswordSource, WindowsEnv};
-use ssh_broker::logon::LogonKind;
 use ssh_broker::provision::{self, procwait, schtasks, taskscheduler};
 use windows::Win32::Foundation::{HANDLE, HANDLE_FLAG_INHERIT, SetHandleInformation, WAIT_TIMEOUT};
 use windows::Win32::System::Threading::{
@@ -259,7 +258,7 @@ fn scene() -> Scene {
     let prompted = Account::create("up2", true);
     let mut installed_kit = Kit::copy_of_broker("up2");
     installed_kit.exe = installed.clone();
-    let session = BackgroundAgent::start(&installed_kit, &prompted, LogonKind::Interactive);
+    let session = BackgroundAgent::start(&installed_kit, &prompted);
     Scene {
         _auto_login_off: auto_login_off,
         broker,
@@ -703,8 +702,8 @@ fn verify_through(
     conn.read_to_end()
 }
 
-/// What `verify` shows through an administrator's elevated agent, however the agent was started: it exits
-/// 0, the session is elevated, an unelevated one can be had, and the junction was followed, not skipped.
+/// What `verify` shows through an administrator's elevated agent: it exits 0, the session is elevated, an
+/// unelevated one can be had, and the junction was followed, not skipped.
 fn assert_verify_passes_for_an_elevated_agent(verified: &agent_conn::Finished) {
     assert_eq!(
         verified.exit,
@@ -713,27 +712,7 @@ fn assert_verify_passes_for_an_elevated_agent(verified: &agent_conn::Finished) {
         verified.stdout,
         verified.stderr
     );
-    for row in [
-        "[PASS] elevated session",
-        "[PASS] unelevated session on request",
-        "[PASS] junction (via agent)",
-    ] {
-        assert!(verified.stdout.contains(row), "no {row:?} in:\n{}", verified.stdout);
-    }
-    let junction = verified
-        .stdout
-        .lines()
-        .find(|line| line.contains("junction (via agent)"))
-        .unwrap_or_else(|| panic!("no junction row in:\n{}", verified.stdout));
-    assert!(
-        junction.contains("followed"),
-        "the junction was not followed: {junction}"
-    );
-    assert!(
-        !verified.stdout.contains("NOT tested"),
-        "something was not tested:\n{}",
-        verified.stdout
-    );
+    agent_conn::assert_verify_session_rows(&verified.stdout);
 }
 
 /// Elevated (CI only). `verify`, run in an administrator's session through the account's elevated agent,
@@ -792,38 +771,4 @@ fn apply_then_verify_for_an_administrator_shows_an_elevated_session_and_an_unele
         "an unelevated session ran a probe:\n{}",
         unelevated.stdout
     );
-}
-
-/// Elevated (CI only). The same `verify`, through the elevated agent that the password prompt started for an
-/// administrator: the batch logon the shim makes, by the installed exe. The agent is the one the shim gets,
-/// so the junction a token below High made is followed there as well.
-#[test]
-fn apply_then_verify_for_an_administrator_whose_agent_the_password_prompt_started() {
-    use ssh_broker::protocol::Privilege;
-
-    let _machine = machine::exclusive();
-    let _install = Install::capture();
-    let broker = Path::new(env!("CARGO_BIN_EXE_ssh-broker"));
-    let installed = provision::canonical_exe();
-    let applied = apply(broker);
-    assert!(
-        applied.status.success(),
-        "apply failed:\n{}{}",
-        String::from_utf8_lossy(&applied.stdout),
-        String::from_utf8_lossy(&applied.stderr)
-    );
-
-    let admin = Account::create("vf2", true);
-    admin.make_administrator();
-    let mut installed_kit = Kit::copy_of_broker("vf2");
-    installed_kit.exe = installed.clone();
-    // The guard ends the agent when it goes, whether the test passed or not, and when the wait for it fails.
-    let agent = BackgroundAgent::start(&installed_kit, &admin, LogonKind::Batch);
-
-    assert_verify_passes_for_an_elevated_agent(&verify_through(
-        &installed,
-        &admin,
-        &agent.location,
-        Privilege::Account,
-    ));
 }
