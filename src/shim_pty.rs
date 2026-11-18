@@ -357,7 +357,7 @@ fn connect_or_rescue(
 /// connection without a byte, and an agent that answers next could run it again, so the command is
 /// neither sent again nor run anywhere else. The one exception is an agent that says, in its first frame,
 /// that it started nothing (`HandBack`): `Ok(None)`, and the caller runs the command, with `stdin` unread.
-fn relay_exec(
+pub(crate) fn relay_exec(
     conn: Socket,
     cmd: &str,
     elevation: Option<ElevationPolicy>,

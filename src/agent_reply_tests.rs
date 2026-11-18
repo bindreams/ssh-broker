@@ -613,9 +613,10 @@ fn agent_gives_always_its_own_token_at_high() {
 
 // A login that set nothing and cannot be stepped down -----
 
-/// The agent at High whose unelevated token cannot be made: the one rule, with a maker that fails.
-fn at_high_without_a_token(tag: &str, host: TestHost, mode: Mode, command: Option<&str>) -> Answer {
-    let recording = Hooks {
+/// The hooks of an agent at High whose unelevated token cannot be made: the one rule, with a maker that fails, and
+/// starters that record into [`STARTS`].
+fn hooks_at_high_without_a_token(host: TestHost) -> Hooks {
+    Hooks {
         shell_host: Box::new(host),
         make_unelevated: |asked| {
             crate::account::step_down(
@@ -633,8 +634,46 @@ fn at_high_without_a_token(tag: &str, host: TestHost, mode: Mode, command: Optio
             Err(StartError::Program(anyhow::anyhow!("recorded")))
         },
         ..Hooks::production()
-    };
-    answered(tag, recording, request_asking(mode, command, None)).0
+    }
+}
+
+/// The agent at High whose unelevated token cannot be made, asked by a login that set nothing.
+fn at_high_without_a_token(tag: &str, host: TestHost, mode: Mode, command: Option<&str>) -> Answer {
+    answered(
+        tag,
+        hooks_at_high_without_a_token(host),
+        request_asking(mode, command, None),
+    )
+    .0
+}
+
+/// The real agent handler hands a command back to the real command relay of the shim, over one connection:
+/// the shim says why, runs nothing and reads none of its stdin, and the agent's handler returns once the shim's
+/// side has closed (the agent waits for that after it ends its own).
+#[test]
+fn a_real_agent_that_cannot_step_a_command_down_hands_it_back_to_the_real_relay_with_stdin_unread() {
+    use crate::test_support::RecordedInput;
+    let _serial = STARTS_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    taken_starts();
+    let (server, client, dir) = crate::test_support::raw_socket_pair("handback-relay");
+    let agent =
+        std::thread::spawn(move || handle_connection_with(server, hooks_at_high_without_a_token(TestHost::new())));
+    let (stdin, input_dropped, reads) = RecordedInput::new(b"for the shell that runs the command");
+    let mut stderr = Vec::new();
+
+    let relayed = crate::shim_pty::relay_exec(client, "whoami", None, stdin, &mut stderr).unwrap();
+    let handler = agent.join().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert_eq!(relayed, None, "the command falls open");
+    let stderr = String::from_utf8(stderr).unwrap();
+    let prefix = crate::shim_pty::unavailable_message(None);
+    assert!(stderr.starts_with(&prefix), "{stderr}");
+    assert!(stderr.contains("the token cannot be made"), "{stderr}");
+    input_dropped.recv().expect("the input is dropped when the relay ends");
+    assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 0, "stdin was read");
+    assert!(taken_starts().is_empty(), "a start hook was called");
+    assert!(handler.is_ok(), "{:#}", handler.unwrap_err());
 }
 
 /// A login that set nothing is not refused when its session cannot be stepped down, and the agent hosts no session
