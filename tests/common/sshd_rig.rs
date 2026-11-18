@@ -198,7 +198,7 @@ pub fn admit(account: &Account) {
     // this step is for.
     let (ok, text) = run("net", &["localgroup", SSH_GROUP, &account.name, "/add"]);
     assert!(
-        ok || text.contains("1378"),
+        ok || text.contains("System error 1378"),
         "add {} to {SSH_GROUP}: {text}",
         account.name
     );

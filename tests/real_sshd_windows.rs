@@ -15,12 +15,10 @@
 
 use std::process::Stdio;
 
-use ssh_broker::account::{integrity_class, integrity_of};
-use ssh_broker::logon::{self, LogonKind};
+use ssh_broker::autologin;
 use ssh_broker::provision::procwait;
 use ssh_broker::provision::registry::{OPENSSH_KEY, set_default_shell_under};
-use ssh_broker::socket_loc::Integrity;
-use ssh_broker::winutil::process_token;
+use ssh_broker::socket_loc::{self, Integrity};
 
 #[path = "common/account.rs"]
 mod account_fixture;
@@ -50,6 +48,7 @@ mod stand_in;
 mod whoami_groups;
 
 use account_fixture::{Account, ServiceLogon};
+use agent_conn::local_account;
 use sshd_rig::{Login, PROMPT, SHELL_PROMPT, SshSession, no_shell_to_carry, run_client, screen_text, set_stock_shell};
 use stand_in::Kit;
 use whoami_groups::{TokenShown, token_shown};
@@ -349,7 +348,7 @@ fn an_administrators_fail_open_shell_is_unelevated_when_the_login_said_the_word(
     account.write_user_config("shell: cmd.exe\n");
     // sshd's logon keeps the account's hive loaded, so the account is declared as logged on by sshd, which is how
     // `Account::drop` deletes the profile; there is no agent to end (see `session_end`).
-    let _end = session_end::LogOutOnDrop::new(&kit.exe, &account, ServiceLogon::Sshd);
+    account.started_by(ServiceLogon::Sshd);
     let login = Login::new(&kit, &account);
     set_default_shell_under(OPENSSH_KEY, &kit.exe.to_string_lossy(), &no_shell_to_carry())
         .expect("set the shim as DefaultShell");
@@ -369,16 +368,38 @@ fn an_administrators_fail_open_shell_is_unelevated_when_the_login_said_the_word(
 /// The levels of the folders the broker keeps, High first: where an agent of an account may be looked for.
 const LEVELS: [Integrity; 2] = [Integrity::High, Integrity::Medium];
 
+/// The ids of the agents `account` has running from `kit`'s exe at `level`.
+fn agents_at(kit: &Kit, account: &Account, level: Integrity) -> Vec<u32> {
+    procwait::user_agents(&kit.exe, &account.sid, level)
+        .unwrap_or_else(|e| panic!("look for the agents of {}: {e:#}", account.name))
+        .into_iter()
+        .map(|agent| agent.pid)
+        .collect()
+}
+
 /// The ids of the agents `account` has running from `kit`'s exe, at either level.
 fn agents_of(kit: &Kit, account: &Account) -> Vec<u32> {
     LEVELS
         .into_iter()
-        .flat_map(|level| {
-            procwait::user_agents(&kit.exe, &account.sid, level)
-                .unwrap_or_else(|e| panic!("look for the agents of {}: {e:#}", account.name))
-        })
-        .map(|agent| agent.pid)
+        .flat_map(|level| agents_at(kit, account, level))
         .collect()
+}
+
+/// What the agent of `account` logged in the folder of each level: for a failure message.
+fn logs_of_both_levels(account: &Account) -> String {
+    LEVELS
+        .into_iter()
+        .map(|level| {
+            let location =
+                socket_loc::for_profile(account.profile(), level).expect("the account's profile path is short enough");
+            format!(
+                "{level:?} folder {}:\n{}",
+                location.dir().display(),
+                stand_in::read_logs(&location)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// `text` without its whitespace: a sentence the console wrapped, or one that has runs of blanks in it, is found whole.
@@ -395,11 +416,12 @@ fn squeezed(text: &str) -> String {
 /// (b) At the password prompt, with the account granted nothing, the shim says that this login cannot start an
 /// elevated session from a password (`SeImpersonatePrivilege`, which the login does not hold), gives the plain
 /// shell, and no agent of the account runs afterwards. An agent that started fails the test: the stated limit
-/// does not hold. (c) An agent the test starts for the account with a batch logon (the test process holds the
-/// privilege) serves an SSH login at High, and `internal-unelevated` gives that login Medium.
+/// does not hold. (c) The account's agent, started by `auto-login` (Backup Operators hold "Log on as a batch
+/// job"; the product's own start for an account with a stored password), serves an SSH login at High, and
+/// `internal-unelevated` gives that login Medium.
 ///
 /// Every wait is on an event of the session. Where the outcome could be "never" the test asserts first: the
-/// started agent's level against the folder the shim looks in, before the wait for it to serve.
+/// started agent's level against the folder the shim looks in, before the wait for it to serve at that level.
 #[test]
 fn a_backup_operators_account_gets_the_stated_limit_at_the_prompt_and_is_served_by_its_agent() {
     let _machine = machine::exclusive();
@@ -409,8 +431,9 @@ fn a_backup_operators_account_gets_the_stated_limit_at_the_prompt_and_is_served_
     // Not an administrator, and not granted the batch-logon right or anything else: what sshd and the prompt
     // do with it is what Windows gives its group. Its sessions are at High (see `Account::integrity`).
     account.make_backup_operator();
-    // The session (c) starts is ended with `logout` before the account goes, passing or failing.
-    let _end = session_end::LogOutOnDrop::new(&kit.exe, &account, ServiceLogon::Sshd);
+    // The session (c) starts, a Task Scheduler logon, is ended with `logout` before the account goes, passing or
+    // failing.
+    let _end = session_end::LogOutOnDrop::new(&kit.exe, &account, ServiceLogon::TaskScheduler);
     let login = Login::new(&kit, &account);
 
     // (a) What the plain shell gets: stock sshd with cmd.exe as the shell.
@@ -447,49 +470,40 @@ fn a_backup_operators_account_gets_the_stated_limit_at_the_prompt_and_is_served_
         "agents of the account run after the prompt said it could start none (pids {running:?}): the stated limit does not hold"
     );
 
-    // (c) An agent of the account, started the way the prompt does it. Its level is read before anything waits
-    // for it: an agent at another level than the folder the shim looks in would never serve the login.
-    let local = ssh_broker::account::account_named(&account.name).expect("look up the account");
-    let started = logon::start_background_agent(
-        &local,
-        &password::password(&account.password),
-        &kit.exe,
-        LogonKind::Batch,
-    )
-    .unwrap_or_else(|e| panic!("start the account's agent with a batch logon: {e:?}"));
-    let token = process_token(started.process.0).expect("open the started agent's token");
-    let rid = integrity_of(token.0).expect("read the started agent's integrity level");
-    drop(token);
-    assert_eq!(
-        integrity_class(rid),
-        account.integrity(),
-        "the agent started for the account runs at {rid:#x}, and the shim of its SSH login looks in the folder for {:?}: the account's batch logon is not at the level sshd gives its logins, a finding to report",
-        account.integrity()
-    );
-    // The wait fails when the agent neither listens nor ends; the message then carries what the agent logged, in
-    // the folder it should have used and in the other one.
-    let location = account.socket_location();
+    // (c) The account's agent, started the way the product starts one for an account with a stored password:
+    // the boot task of `auto-login` (a start by this test process, as another account, is one the product never
+    // makes). Backup Operators hold "Log on as a batch job" by default, so the account is granted nothing.
+    autologin::on(&mut kit.autologin_env(&account.password), &local_account(&account)).unwrap_or_else(|e| {
+        panic!(
+            "`auto-login on` for the Backup Operators account failed: {e:#}\nBackup Operators hold \"Log on as a batch \
+             job\" by default: if this says the right is missing, that is a finding to report"
+        )
+    });
+    // The agent's level is read before anything waits for it to serve at the level the shim looks in: an agent
+    // at the other level never serves the login. The wait for the first marker, in either folder, fails after its
+    // bound both when the agent never listens and when it ends before it listens (no handle is held on a task's
+    // agent, so its exit does not end the wait); the message then carries what the agent logged, in both folders.
+    let expected = account.integrity();
+    let locations = LEVELS.map(|level| {
+        socket_loc::for_profile(account.profile(), level).expect("the account's profile path is short enough")
+    });
     if let Err(failed) = session_end::attempt("wait for the account's agent to serve", || {
-        stand_in::wait_for_serving_marker(&location, started.process.0)
+        stand_in::wait_for_serving_marker_in_any_of(&[&locations[0], &locations[1]], stand_in::SERVING_BOUND)
     }) {
-        let logs_of = |level| {
-            let location = ssh_broker::socket_loc::for_profile(account.profile(), level)
-                .expect("the account's profile path is short enough");
+        panic!("{failed}\n{}", logs_of_both_levels(&account));
+    }
+    if agents_at(&kit, &account, expected).is_empty() {
+        let other = LEVELS.into_iter().find(|level| *level != expected).unwrap();
+        let why = if agents_at(&kit, &account, other).is_empty() {
+            "the account's agent wrote its serving marker and is not running at either level".to_owned()
+        } else {
             format!(
-                "{level:?} folder {}:\n{}",
-                location.dir().display(),
-                stand_in::read_logs(&location)
+                "the boot task's agent of such an account is not at the level sshd gives its logins ({expected:?}; \
+                 it runs at {other:?}), so `auto-login` does not serve them: a finding to report"
             )
         };
-        panic!(
-            "{failed}\nthe agent runs at {rid:#x}; the shim looks in {:?}.\n{}\n{}",
-            account.integrity(),
-            logs_of(Integrity::High),
-            logs_of(Integrity::Medium)
-        );
+        panic!("{why}\n{}", logs_of_both_levels(&account));
     }
-    // A handle on the agent keeps its logon session in use; the session's end waits for the logoff.
-    drop(started);
 
     assert_eq!(
         token_of_command(&kit, &login, "whoami /groups").label,
@@ -501,4 +515,7 @@ fn a_backup_operators_account_gets_the_stated_limit_at_the_prompt_and_is_served_
         TokenShown::new("Medium", "absent"),
         "the word"
     );
+
+    session_end::log_out_running(&kit.exe, &account, ServiceLogon::TaskScheduler);
+    autologin::off(&mut kit.autologin_env(&account.password), &local_account(&account)).unwrap();
 }

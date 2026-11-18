@@ -241,9 +241,9 @@ fn word_line(command: &str) -> String {
 }
 
 /// The line the probe is started with when the shim fail-opens on `sent` (with the word or without), and the
-/// probe's path. The path is the same in every run of one test, so the lines of two runs compare.
-fn probe_line_for(sent: &str) -> (String, String) {
-    let home = Home::probe_shell("sb-failopen-word");
+/// probe's path. The path follows from `tag` (one per test), so the lines of two runs of one test compare.
+fn probe_line_for(tag: &str, sent: &str) -> (String, String) {
+    let home = Home::probe_shell(tag);
     let out = run_shim_child(&word_line(sent), &home);
     assert_failed_open(&String::from_utf8_lossy(&out.stderr));
     assert_eq!(out.status.code(), Some(0), "{sent:?}");
@@ -256,11 +256,12 @@ fn probe_line_for(sent: &str) -> (String, String) {
 #[test]
 fn the_word_then_a_command_runs_what_the_command_alone_runs() {
     for rest in ["echo  two  spaces", "\t echo hi", "  echo hi", "echo héllo ✓"] {
+        let alone = probe_line_for("sb-failopen-word", rest).0;
         for separator in [" ", "\t"] {
             let with_word = format!("internal-unelevated{separator}{rest}");
             assert_eq!(
-                probe_line_for(&with_word).0,
-                probe_line_for(rest).0,
+                probe_line_for("sb-failopen-word", &with_word).0,
+                alone,
                 "{with_word:?} against {rest:?}"
             );
         }
@@ -276,7 +277,7 @@ fn what_is_not_the_word_is_run_whole() {
         ("Internal-Unelevated echo hi", "Internal-Unelevated echo hi"),
         (" internal-unelevated echo hi", "internal-unelevated echo hi"),
     ] {
-        let (line, probe) = probe_line_for(sent);
+        let (line, probe) = probe_line_for("sb-failopen-notword", sent);
         assert_eq!(line, join_args(&[probe.as_str(), "-c", run]), "{sent:?}");
     }
 }
