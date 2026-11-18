@@ -71,7 +71,7 @@ fn the_probe_handshake_is_direct() {
     use crate::protocol::{Launch, Mode};
     let hs = probe_handshake(
         std::path::Path::new(r"C:\Program Files\ssh-broker\ssh-broker.exe"),
-        crate::protocol::Privilege::Account,
+        crate::protocol::ElevationPolicy::Prompt,
         &ProbeLink::NoJunction,
     );
     assert_eq!(
@@ -86,16 +86,21 @@ fn the_probe_handshake_is_direct() {
     );
 }
 
-/// The probe that asks for an unelevated session says so in the handshake, which is the only thing
-/// that makes the agent step its child down; the command is the same one the other probes run.
+/// The policy a probe asks for is in the handshake, which is all the agent goes by when it gives the probe's
+/// child its token; the command is the same one the other probes run.
 #[test]
-fn the_probe_handshake_carries_the_privilege_it_asks_for() {
-    use crate::protocol::Privilege;
+fn probe_handshake_carries_the_policy_it_is_given() {
+    use crate::protocol::ElevationPolicy;
     let exe = std::path::Path::new(r"C:\Program Files\ssh-broker\ssh-broker.exe");
-    for privilege in [Privilege::Account, Privilege::Unelevated] {
+    for elevation in [
+        ElevationPolicy::Never,
+        ElevationPolicy::Prompt,
+        ElevationPolicy::AutoApprove,
+        ElevationPolicy::Always,
+    ] {
         assert_eq!(
-            probe_handshake(exe, privilege, &ProbeLink::NoJunction).privilege,
-            privilege
+            probe_handshake(exe, elevation, &ProbeLink::NoJunction).elevation,
+            elevation
         );
     }
 }
@@ -104,9 +109,9 @@ fn the_probe_handshake_carries_the_privilege_it_asks_for() {
 /// a profile with a blank in its name reaches the probe as one argument.
 #[test]
 fn the_probe_handshake_names_the_junction_work() {
-    use crate::protocol::Privilege;
+    use crate::protocol::ElevationPolicy;
     let exe = std::path::Path::new(r"C:\Program Files\ssh-broker\ssh-broker.exe");
-    let command = |link: &ProbeLink| probe_handshake(exe, Privilege::Account, link).command.unwrap();
+    let command = |link: &ProbeLink| probe_handshake(exe, ElevationPolicy::Prompt, link).command.unwrap();
     let base = r#""C:\Program Files\ssh-broker\ssh-broker.exe" verify-probe"#;
 
     assert_eq!(command(&ProbeLink::NoJunction), base);

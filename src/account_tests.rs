@@ -7,7 +7,7 @@ use windows::Win32::Security::{
 };
 use windows::core::PCWSTR;
 
-use crate::protocol::Privilege;
+use crate::protocol::ElevationPolicy;
 use crate::test_support::{own_token_at, own_token_copy};
 use crate::winutil::OwnedHandle;
 
@@ -252,56 +252,67 @@ fn the_token_of_a_process_handle_is_that_process_s_token() {
 
 // the token an unelevated session runs with -----
 
+/// The table of the one rule, each cell: what it gives and how many tokens were made.
 #[test]
-fn an_unelevated_login_at_high_gets_the_token() {
-    use crate::socket_loc::Integrity;
-    let made = step_down(Privilege::Unelevated, || Ok(Integrity::High), || Ok("token"));
-    assert_eq!(made.unwrap(), Some("token"));
+fn step_down_gives_the_table() {
+    use crate::socket_loc::Integrity::{High, Medium};
+    use std::cell::Cell;
+    let cells = [
+        (ElevationPolicy::Never, High, StepDown::Token("token"), 1),
+        (ElevationPolicy::Prompt, High, StepDown::Token("token"), 1),
+        (ElevationPolicy::AutoApprove, High, StepDown::Token("token"), 1),
+        (ElevationPolicy::Always, High, StepDown::Own, 0),
+        (ElevationPolicy::Never, Medium, StepDown::Own, 0),
+        (ElevationPolicy::Prompt, Medium, StepDown::Own, 0),
+        (ElevationPolicy::AutoApprove, Medium, StepDown::Own, 0),
+        (ElevationPolicy::Always, Medium, StepDown::Refused, 0),
+    ];
+    for (policy, level, gives, made_times) in cells {
+        let made = Cell::new(0);
+        let given = step_down(
+            policy,
+            || Ok(level),
+            || {
+                made.set(made.get() + 1);
+                Ok("token")
+            },
+        )
+        .unwrap();
+        assert_eq!(given, gives, "{policy:?} at {level:?}");
+        assert_eq!(made.get(), made_times, "{policy:?} at {level:?}: tokens made");
+    }
+}
+
+/// A level that cannot be read is not Medium: a guess would run the session as it is.
+#[test]
+fn step_down_unreadable_integrity_is_an_error_and_make_is_not_called() {
+    for policy in [
+        ElevationPolicy::Never,
+        ElevationPolicy::Prompt,
+        ElevationPolicy::AutoApprove,
+        ElevationPolicy::Always,
+    ] {
+        let err = step_down(
+            policy,
+            || anyhow::bail!("the level cannot be read"),
+            || -> anyhow::Result<&str> { panic!("a token was made without the level") },
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("the level cannot be read"),
+            "{policy:?}: {err:#}"
+        );
+    }
 }
 
 #[test]
-fn an_unelevated_login_below_high_gets_none_and_the_token_is_not_tried() {
-    use crate::socket_loc::Integrity;
-    let made = step_down(
-        Privilege::Unelevated,
-        || Ok(Integrity::Medium),
-        || -> anyhow::Result<&str> { panic!("a token was made below High") },
-    );
-    assert_eq!(made.unwrap(), None);
-}
-
-#[test]
-fn a_token_that_cannot_be_made_at_high_is_an_error() {
+fn step_down_make_failure_is_an_error() {
     use crate::socket_loc::Integrity;
     let err = step_down(
-        Privilege::Unelevated,
+        ElevationPolicy::Prompt,
         || Ok(Integrity::High),
         || -> anyhow::Result<&str> { anyhow::bail!("no token") },
     )
     .unwrap_err();
     assert!(format!("{err:#}").contains("no token"), "{err:#}");
-}
-
-/// A level that cannot be read is not Medium: the login asked for an unelevated session, and a guess
-/// would hand an elevated process the shell.
-#[test]
-fn an_unreadable_level_is_an_error_and_makes_nothing() {
-    let err = step_down(
-        Privilege::Unelevated,
-        || anyhow::bail!("the level cannot be read"),
-        || -> anyhow::Result<&str> { panic!("a token was made without the level") },
-    )
-    .unwrap_err();
-    assert!(format!("{err:#}").contains("the level cannot be read"), "{err:#}");
-}
-
-/// An account login is not stepped down at any level: neither the level nor the maker is consulted.
-#[test]
-fn an_account_login_gets_none_and_asks_for_nothing() {
-    let made = step_down(
-        Privilege::Account,
-        || -> anyhow::Result<crate::socket_loc::Integrity> { panic!("the level was read for an account login") },
-        || -> anyhow::Result<&str> { panic!("a token was made for an account login") },
-    );
-    assert_eq!(made.unwrap(), None);
 }

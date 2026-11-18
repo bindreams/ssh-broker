@@ -101,11 +101,11 @@ pub fn shell_config_row(effective: &anyhow::Result<crate::shell::Effective>) -> 
 }
 
 /// The handshake `verify` sends to run its probe through the agent: ssh-broker's own command, run as
-/// it stands and not through the user's shell. `privilege` is what the probe asks the agent for, and
+/// it stands and not through the user's shell. `elevation` is what the probe asks the agent for, and
 /// `link` what it does about the junction of the link row.
 pub fn probe_handshake(
     exe: &std::path::Path,
-    privilege: crate::protocol::Privilege,
+    elevation: crate::protocol::ElevationPolicy,
     link: &crate::route::ProbeLink,
 ) -> crate::protocol::Handshake {
     use crate::route::ProbeLink;
@@ -122,7 +122,7 @@ pub fn probe_handshake(
         "xterm".into(),
         80,
         24,
-        privilege,
+        elevation,
     )
 }
 

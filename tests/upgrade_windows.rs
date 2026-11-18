@@ -689,15 +689,15 @@ fn apply_keeps_default_shell_arguments_until_a_config_holds_them() {
 }
 
 /// `<installed> verify` run through the agent of `admin` at `location`, as a session that asks for
-/// `privilege`.
+/// `elevation`.
 fn verify_through(
     installed: &Path,
     admin: &Account,
     location: &ssh_broker::socket_loc::SocketLocation,
-    privilege: ssh_broker::protocol::Privilege,
+    elevation: ssh_broker::protocol::ElevationPolicy,
 ) -> agent_conn::Finished {
     let mut conn = agent_conn::AgentConn::connect(location, &admin.sid);
-    conn.start_exec_as(&format!("\"{}\" verify", installed.display()), privilege);
+    conn.start_exec_as(&format!("\"{}\" verify", installed.display()), elevation);
     conn.end_stdin();
     conn.read_to_end()
 }
@@ -722,7 +722,7 @@ fn assert_verify_passes_for_an_elevated_agent(verified: &agent_conn::Finished) {
 #[test]
 fn apply_then_verify_for_an_administrator_shows_an_elevated_session_and_an_unelevated_one_on_request() {
     use ssh_broker::offer::text::FILTERED_LOOKS_ELSEWHERE;
-    use ssh_broker::protocol::Privilege;
+    use ssh_broker::protocol::ElevationPolicy;
 
     let _machine = machine::exclusive();
     let _install = Install::capture();
@@ -749,11 +749,11 @@ fn apply_then_verify_for_an_administrator_shows_an_elevated_session_and_an_unele
     let location = admin.socket_location();
     stand_in::wait_for_serving_marker_of_a_task(&location, TASK_START_BOUND);
 
-    let verify = |privilege: Privilege| verify_through(&installed, &admin, &location, privilege);
+    let verify = |elevation: ElevationPolicy| verify_through(&installed, &admin, &location, elevation);
 
-    assert_verify_passes_for_an_elevated_agent(&verify(Privilege::Account));
+    assert_verify_passes_for_an_elevated_agent(&verify(ElevationPolicy::Always));
 
-    let unelevated = verify(Privilege::Unelevated);
+    let unelevated = verify(ElevationPolicy::Prompt);
     assert_eq!(
         unelevated.exit,
         Some(1),

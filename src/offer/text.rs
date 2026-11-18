@@ -45,8 +45,40 @@ pub fn non_interactive_notice(user: &str, exe: &str) -> String {
 }
 
 /// The stderr line for a login whose own token is an administrator's with elevation removed
-/// (`account::Elevation::Filtered`): this account's session serves elevated logins only.
-pub const FILTERED_SHIM_NOTICE: &str = "ssh-broker: this account's session serves elevated logins only, and this login is an administrator's with elevation removed, so this runs without DPAPI, a loaded profile or symlink traversal.";
+/// (`account::Elevation::Filtered`): it cannot reach the account's agent, which runs elevated.
+pub const FILTERED_SHIM_NOTICE: &str = "ssh-broker: this login is an administrator's with elevation removed and cannot reach the account's agent, which runs elevated, so this runs without DPAPI, a loaded profile or symlink traversal.";
+
+/// What a login with an unrecognised `SSH_BROKER_ELEVATION` is told on stderr before anything runs. No line
+/// terminator: the shim ends the line.
+pub fn unknown_elevation(value: &str) -> String {
+    format!(
+        "ssh-broker: SSH_BROKER_ELEVATION is {value:?}, which is none of never, prompt, auto-approve or always \
+         (lower case, nothing around it). Nothing was run."
+    )
+}
+
+/// What a login that asked for `SSH_BROKER_ELEVATION=always` where this account's sessions cannot be elevated
+/// is told, in two parts so that the agent, whose failure reply writes `ssh-broker: {what}: {cause}` and its
+/// own line break, and the shim ([`always_below_high`]) say one sentence.
+pub const ALWAYS_BELOW_HIGH_WHAT: &str =
+    "this login asked for SSH_BROKER_ELEVATION=always, and this account's sessions cannot be elevated here";
+/// See [`ALWAYS_BELOW_HIGH_WHAT`].
+pub const ALWAYS_BELOW_HIGH_CAUSE: &str = "its agent does not run at High. Nothing was run.";
+
+/// The whole line the shim prints when it refuses a login that asked for `always` below High.
+pub fn always_below_high() -> String {
+    format!("ssh-broker: {ALWAYS_BELOW_HIGH_WHAT}: {ALWAYS_BELOW_HIGH_CAUSE}\r\n")
+}
+
+/// What a session whose unelevated token cannot be made is told: nothing was run, and `always` is the way
+/// to run it as it is. The agent's failure reply writes `ssh-broker: {what}: {cause}` and its own line break,
+/// so it takes this as the `what`.
+pub const UNELEVATED_UNAVAILABLE_WHAT: &str = "could not prepare an unelevated session, so nothing was run (a login with SSH_BROKER_ELEVATION=always starts the session as it is)";
+
+/// The line the shim prints when it cannot make the session's unelevated token; `cause` is why.
+pub fn unelevated_unavailable(cause: &str) -> String {
+    format!("ssh-broker: {UNELEVATED_UNAVAILABLE_WHAT}: {cause}")
+}
 
 /// The clause every line uses to say a token's elevation could not be read; `cause` is why.
 pub fn elevation_unreadable_clause(cause: &str) -> String {
@@ -66,7 +98,7 @@ pub fn elevation_unreadable(cause: &str) -> String {
 /// What an administrator's unelevated process (`account::Elevation::Filtered`) is told when it asks for the
 /// agent that serves its folder and finds none: the account's agent runs elevated and serves the elevated
 /// folder, so the plain one it looks in has nothing. A clause, for `verify`'s row and `logout`'s line.
-pub const FILTERED_LOOKS_ELSEWHERE: &str = "this account is an administrator and its agent serves elevated processes: run this from an elevated prompt or an ordinary SSH login";
+pub const FILTERED_LOOKS_ELSEWHERE: &str = "this account is an administrator and its agent serves elevated processes: run this from an elevated prompt or from an SSH login that asked for SSH_BROKER_ELEVATION=always";
 
 /// Told when a High login lacks `SeImpersonatePrivilege`, which `CreateProcessWithTokenW` needs; the way
 /// out is worded as in the batch-right sentence, and granting the right is not suggested.
@@ -92,7 +124,7 @@ pub fn agent_ended(code: u32, logs: Option<&std::path::Path>) -> String {
         67 => "the background session started, but its ssh-broker folder could not be made or was not safe to use."
             .to_string(),
         68 => "the agent refused to run: its token is an administrator's with elevation removed, and an \
-               administrator's session runs elevated or not at all."
+               administrator's agent runs elevated or not at all."
             .to_string(),
         69 => "the agent could not read how elevated its own token is, so it refused to serve.".to_string(),
         other => match logs {

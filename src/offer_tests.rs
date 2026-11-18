@@ -362,3 +362,72 @@ fn the_missing_impersonation_right_is_one_unbroken_sentence() {
          starts one without it; SSH logins use it while it runs)."
     );
 }
+
+// The sentences of the elevation policy -----
+
+#[test]
+fn an_unknown_elevation_value_is_named_with_the_four_words_and_nothing_was_run() {
+    assert_eq!(
+        text::unknown_elevation("Always"),
+        "ssh-broker: SSH_BROKER_ELEVATION is \"Always\", which is none of never, prompt, auto-approve or always \
+         (lower case, nothing around it). Nothing was run."
+    );
+    assert!(!text::unknown_elevation("x").contains('\n'), "the shim ends the line");
+}
+
+/// One sentence for the shim's fail-open and for the agent's reply (`fail_connection` writes
+/// `ssh-broker: {what}: {cause}` and a line break itself), so that it is never prefixed twice.
+#[test]
+fn always_below_high_is_the_line_the_agents_reply_shares() {
+    assert_eq!(
+        text::always_below_high(),
+        "ssh-broker: this login asked for SSH_BROKER_ELEVATION=always, and this account's sessions cannot be elevated \
+         here: its agent does not run at High. Nothing was run.\r\n"
+    );
+    assert_eq!(
+        text::always_below_high(),
+        format!(
+            "ssh-broker: {}: {}\r\n",
+            text::ALWAYS_BELOW_HIGH_WHAT,
+            text::ALWAYS_BELOW_HIGH_CAUSE
+        )
+    );
+    assert_eq!(text::always_below_high().matches("ssh-broker: ").count(), 1);
+    assert!(!text::always_below_high().contains("administrator"));
+}
+
+/// The sentence for a session whose token cannot be made names the one way to run it as it is.
+#[test]
+fn an_unavailable_unelevated_session_names_always_and_the_cause() {
+    assert_eq!(
+        text::unelevated_unavailable("the token cannot be made"),
+        "ssh-broker: could not prepare an unelevated session, so nothing was run (a login with \
+         SSH_BROKER_ELEVATION=always starts the session as it is): the token cannot be made"
+    );
+    assert_eq!(
+        text::unelevated_unavailable("c"),
+        format!("ssh-broker: {}: c", text::UNELEVATED_UNAVAILABLE_WHAT)
+    );
+}
+
+/// An ordinary SSH login is unelevated now, so the sentences about the filtered login and the agent that
+/// serves elevated processes no longer send anyone to one.
+#[test]
+fn the_filtered_sentences_do_not_call_an_ordinary_ssh_login_the_way_to_an_elevated_agent() {
+    assert_eq!(
+        text::FILTERED_SHIM_NOTICE,
+        "ssh-broker: this login is an administrator's with elevation removed and cannot reach the account's agent, \
+         which runs elevated, so this runs without DPAPI, a loaded profile or symlink traversal."
+    );
+    assert_eq!(
+        text::FILTERED_LOOKS_ELSEWHERE,
+        "this account is an administrator and its agent serves elevated processes: run this from an elevated prompt \
+         or from an SSH login that asked for SSH_BROKER_ELEVATION=always"
+    );
+    assert!(!text::FILTERED_LOOKS_ELSEWHERE.contains("ordinary SSH login"));
+    assert_eq!(
+        text::agent_ended(68, None),
+        "ssh-broker: the agent refused to run: its token is an administrator's with elevation removed, and an \
+         administrator's agent runs elevated or not at all.\r\n"
+    );
+}

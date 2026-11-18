@@ -195,7 +195,7 @@ pub fn session_rows(default: &Answer, unelevated: Option<&ProbeOutcome>) -> Vec<
             "session privilege",
             true,
             "this account is not an administrator: its session is a standard account's, and \
-             `internal-unelevated` changes nothing",
+             `SSH_BROKER_ELEVATION` cannot elevate it",
         )]
     } else {
         vec![elevated_row(default, token_level)]
@@ -296,7 +296,7 @@ fn unelevated_row(unelevated: Option<&ProbeOutcome>) -> Check {
             NAME,
             true,
             format!(
-                "`internal-unelevated` gives integrity {} {}",
+                "an unelevated login gives integrity {} {}",
                 level(Some(INTEGRITY_MEDIUM)),
                 if elevation == Elevation::Filtered {
                     "with Administrators deny-only"
@@ -309,7 +309,7 @@ fn unelevated_row(unelevated: Option<&ProbeOutcome>) -> Check {
             NAME,
             false,
             format!(
-                "`internal-unelevated` gave {} at integrity {}, not integrity Medium with Administrators not enabled",
+                "an unelevated login gave {} at integrity {}, not integrity Medium with Administrators not enabled",
                 asked.elevation.map_or("an unknown token", elevation_name),
                 level(asked.integrity)
             ),

@@ -116,12 +116,14 @@ fn run_shim_child(line: &str, home: &Home) -> std::process::Output {
     run_shim_child_with_env(line, home, &[])
 }
 
-/// [`run_shim_child`] with more environment: what sshd sets for a session, `SSH_ORIGINAL_COMMAND` for one. It
-/// is otherwise unset, whatever the test's own environment holds.
+/// [`run_shim_child`] with more environment: what sshd sets for a session, `SSH_ORIGINAL_COMMAND` for one and
+/// `SSH_BROKER_ELEVATION` for a login that asks for a level. Both are otherwise unset, whatever the test's own
+/// environment holds.
 fn run_shim_child_with_env(line: &str, home: &Home, env: &[(&str, &str)]) -> std::process::Output {
     std::process::Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "shim_child", "--ignored", "--nocapture"])
         .env_remove("SSH_ORIGINAL_COMMAND")
+        .env_remove(ssh_broker::protocol::ElevationPolicy::VARIABLE)
         .envs(env.iter().copied())
         .env("SB_TEST_LINE", line)
         .env("XDG_CONFIG_HOME", home.xdg())
@@ -233,101 +235,68 @@ fn exec_of_a_blank_command_runs_nothing_and_exits_zero() {
     }
 }
 
-// The word `internal-unelevated` =====
+// The level a login asks for (`SSH_BROKER_ELEVATION`) =====
 
 /// The line the shim of `command` is started with, as sshd builds it for a session without a terminal.
-fn word_line(command: &str) -> String {
+fn shim_line(command: &str) -> String {
     sshd_encoder::escaped_line(env!("CARGO_BIN_EXE_ssh-broker"), command)
 }
 
-/// The line the probe is started with when the shim fail-opens on `sent` (with the word or without), and the
-/// probe's path. The path follows from `tag` (one per test), so the lines of two runs of one test compare.
-fn probe_line_for(tag: &str, sent: &str) -> (String, String) {
-    let home = Home::probe_shell(tag);
-    let out = run_shim_child(&word_line(sent), &home);
-    assert_failed_open(&String::from_utf8_lossy(&out.stderr));
-    assert_eq!(out.status.code(), Some(0), "{sent:?}");
-    (home.recorded_line(), home.probe().to_str().unwrap().to_owned())
+/// What `SSH_BROKER_ELEVATION` is in the shim's environment for a login that asks for `value`.
+fn asking(value: &str) -> [(&str, &str); 1] {
+    [(ssh_broker::protocol::ElevationPolicy::VARIABLE, value)]
 }
 
-/// The word then a command runs exactly what the command alone runs: the shell never sees the word, and
-/// whatever the shell line does with the rest (it drops a command's leading blanks, as for any command)
-/// it does with this one.
+/// The word `internal-unelevated` is a command like any other: the shell gets it whole, whatever sshd kept in
+/// `SSH_ORIGINAL_COMMAND`.
 #[test]
-fn the_word_then_a_command_runs_what_the_command_alone_runs() {
-    for rest in ["echo  two  spaces", "\t echo hi", "  echo hi", "echo héllo ✓"] {
-        let alone = probe_line_for("sb-failopen-word", rest).0;
-        for separator in [" ", "\t"] {
-            let with_word = format!("internal-unelevated{separator}{rest}");
-            assert_eq!(
-                probe_line_for("sb-failopen-word", &with_word).0,
-                alone,
-                "{with_word:?} against {rest:?}"
+fn the_old_word_is_an_ordinary_command() {
+    for (sent, original) in [
+        ("internal-unelevated echo hi", None),
+        ("internal-unelevated whoami /groups", None),
+        ("internal-unelevated", Some("echo from the client")),
+    ] {
+        let home = Home::probe_shell("sb-failopen-word");
+        let env: Vec<(&str, &str)> = original
+            .map(|original| ("SSH_ORIGINAL_COMMAND", original))
+            .into_iter()
+            .collect();
+        let out = run_shim_child_with_env(&shim_line(sent), &home, &env);
+        assert_failed_open(&String::from_utf8_lossy(&out.stderr));
+        assert_eq!(
+            home.recorded_line(),
+            join_args(&[home.probe().to_str().unwrap(), "-c", sent]),
+            "{sent:?}"
+        );
+    }
+}
+
+/// A value that is not one of the four words fails the login with the sentence that names it, exit 255, before
+/// anything runs: not the shell, and not a blank command's silent exit 0.
+#[test]
+fn an_unknown_value_fails_the_login_and_runs_nothing() {
+    for value in ["Always", " always", "always ", "", "sometimes"] {
+        for command in ["echo hi", " "] {
+            let home = Home::probe_shell("sb-failopen-unknown");
+            let out = run_shim_child_with_env(&shim_line(command), &home, &asking(value));
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert_eq!(out.status.code(), Some(255), "{value:?}, {command:?}: {stderr}");
+            assert!(
+                stderr.contains(&ssh_broker::offer::text::unknown_elevation(value)),
+                "{value:?}, {command:?}: the sentence is missing from:\n{stderr}"
             );
+            assert!(!home.ran(), "{value:?}, {command:?}: the shell ran");
         }
     }
 }
 
-/// A longer word, another case and a leading blank are not the word: the whole command goes to the shell
-/// (a leading blank goes, as for any command).
-#[test]
-fn what_is_not_the_word_is_run_whole() {
-    for (sent, run) in [
-        ("internal-unelevatedx echo hi", "internal-unelevatedx echo hi"),
-        ("Internal-Unelevated echo hi", "Internal-Unelevated echo hi"),
-        (" internal-unelevated echo hi", "internal-unelevated echo hi"),
-    ] {
-        let (line, probe) = probe_line_for("sb-failopen-notword", sent);
-        assert_eq!(line, join_args(&[probe.as_str(), "-c", run]), "{sent:?}");
-    }
-}
-
-/// The bare word is the client's own command when sshd set `SSH_ORIGINAL_COMMAND` (the word was forced on a key),
-/// byte for byte.
-#[test]
-fn the_bare_word_runs_the_command_sshd_kept_in_ssh_original_command() {
-    for original in ["echo from the client", "echo  two  spaces  ", "echo héllo ✓"] {
-        let home = Home::probe_shell("sb-failopen-original");
-        let out = run_shim_child_with_env(
-            &word_line("internal-unelevated"),
-            &home,
-            &[("SSH_ORIGINAL_COMMAND", original)],
-        );
-        assert_failed_open(&String::from_utf8_lossy(&out.stderr));
-        assert_eq!(
-            home.recorded_line(),
-            join_args(&[home.probe().to_str().unwrap(), "-c", original]),
-            "{original:?}"
-        );
-    }
-}
-
-/// The word and only blanks is a blank command: nothing runs and the shim exits 0, with no shell and no word on
-/// stderr. (The child is a libtest binary, so its stdout is not empty: it holds the harness's own banner.)
-#[test]
-fn the_word_then_blanks_runs_nothing_and_exits_zero() {
-    for sent in [
-        "internal-unelevated ",
-        "internal-unelevated \t",
-        "internal-unelevated    ",
-    ] {
-        let home = Home::probe_shell("sb-failopen-blank");
-        let out = run_shim_child(&word_line(sent), &home);
-        assert_eq!(out.status.code(), Some(0), "{sent:?}");
-        assert!(
-            out.stderr.is_empty() && !home.ran(),
-            "{sent:?} ran a shell.\nstdout: {}\nstderr: {}",
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
-}
-
 /// Elevated (CI only). The process here is at High, as sshd's token for an administrator is. The fail-open shell of
-/// a login that said the word is unelevated (Medium, Administrators deny-only), also when the word is forced
-/// and the command is `SSH_ORIGINAL_COMMAND`; without the word it has this process's token.
+/// a login that sets no variable, or `never`, `prompt` or `auto-approve`, is unelevated (Medium, Administrators
+/// deny-only); one that asks for `always` has this process's own token. A level this process is below High for,
+/// where `always` is refused, is the CI test `an_administrators_fail_open_shell_follows_the_same_rule` and the
+/// unit tests of `shim::fail_open`.
 #[test]
-fn the_fail_open_shell_of_the_word_is_unelevated_and_without_it_is_not() {
+fn the_failopen_shell_follows_the_same_rule() {
     assert_eq!(
         ssh_broker::account::integrity().expect("read this process's integrity level"),
         ssh_broker::socket_loc::Integrity::High,
@@ -338,29 +307,19 @@ fn the_fail_open_shell_of_the_word_is_unelevated_and_without_it_is_not() {
     let home = Home::with_config("sb-failopen-token", &format!("shell: '{}'\n", cmd.display()));
     let shown = |out: &std::process::Output| token_shown(&String::from_utf8_lossy(&out.stdout));
 
-    let out = run_shim_child(&word_line("whoami /groups"), &home);
+    let out = run_shim_child(&shim_line("whoami /groups"), &home);
     assert_failed_open(&String::from_utf8_lossy(&out.stderr));
-    assert_eq!(shown(&out), TokenShown::new("High", "enabled"), "no word");
+    assert_eq!(shown(&out), TokenShown::new("Medium", "deny-only"), "no variable");
 
-    let out = run_shim_child(&word_line("internal-unelevated whoami /groups"), &home);
-    assert_failed_open(&String::from_utf8_lossy(&out.stderr));
-    assert_eq!(
-        shown(&out),
-        TokenShown::new("Medium", "deny-only"),
-        "the word, then the command"
-    );
+    for value in ["never", "prompt", "auto-approve"] {
+        let out = run_shim_child_with_env(&shim_line("whoami /groups"), &home, &asking(value));
+        assert_failed_open(&String::from_utf8_lossy(&out.stderr));
+        assert_eq!(shown(&out), TokenShown::new("Medium", "deny-only"), "{value}");
+    }
 
-    let out = run_shim_child_with_env(
-        &word_line("internal-unelevated"),
-        &home,
-        &[("SSH_ORIGINAL_COMMAND", "whoami /groups")],
-    );
+    let out = run_shim_child_with_env(&shim_line("whoami /groups"), &home, &asking("always"));
     assert_failed_open(&String::from_utf8_lossy(&out.stderr));
-    assert_eq!(
-        shown(&out),
-        TokenShown::new("Medium", "deny-only"),
-        "the word forced on a key"
-    );
+    assert_eq!(shown(&out), TokenShown::new("High", "enabled"), "always");
 }
 
 // A session with a PTY =====

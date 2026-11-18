@@ -778,7 +778,7 @@ fn child_acts_in_the_elevated_folder() {
 }
 
 /// Elevated (CI only). The elevated folder is born labelled High: a process of the same account below High
-/// (an unelevated prompt, an `internal-unelevated` session) is refused the connect and every change to the
+/// (an unelevated prompt, a session a login did not ask to be elevated) is refused the connect and every change to the
 /// folder, and a High process of the account (the control) does all of them. Each is an act the child asks
 /// for through the ordinary calls; none tries to get round the refusal.
 #[test]

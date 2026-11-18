@@ -12,9 +12,9 @@ use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 use windows::core::PCWSTR;
 
 use super::{OwnedHandle, SE_GROUP_INTEGRITY};
-use crate::account::{INTEGRITY_MEDIUM, integrity, integrity_of, step_down};
+use crate::account::{INTEGRITY_MEDIUM, StepDown, integrity, integrity_of, step_down};
 use crate::acl::{Sid, WellKnown, set_token_default_dacl};
-use crate::protocol::Privilege;
+use crate::protocol::ElevationPolicy;
 
 /// A primary token for a session's program when the session is unelevated: this process's token with what
 /// UAC takes from an administrator's (`LUA_TOKEN`: `Administrators` becomes deny-only, and the privileges
@@ -59,10 +59,10 @@ impl UnelevatedToken {
         Ok(UnelevatedToken(token))
     }
 
-    /// The token a login with `privilege` runs its session with in this process, or none: the production
-    /// maker of [`crate::account::step_down`], for the agent and the shim alike.
-    pub fn for_privilege(privilege: Privilege) -> anyhow::Result<Option<UnelevatedToken>> {
-        step_down(privilege, integrity, UnelevatedToken::of_this_process)
+    /// What a login with `policy` runs its session with in this process: the production maker of
+    /// [`crate::account::step_down`], for the agent and the shim alike.
+    pub fn for_policy(policy: ElevationPolicy) -> anyhow::Result<StepDown<UnelevatedToken>> {
+        step_down(policy, integrity, UnelevatedToken::of_this_process)
     }
 
     /// The token, for `CreateProcessAsUserW`.

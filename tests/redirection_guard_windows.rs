@@ -4,7 +4,7 @@
 //! The reader is the child half of a test of this binary (`common/child_entry.rs`), which sets
 //! `ProcessRedirectionTrustPolicy` (enforce) on itself and reads through two junctions to the same file:
 //! one this elevated process made, and one that a child of this process made with the unelevated token
-//! (`winutil::UnelevatedToken`, the token an `internal-unelevated` session runs with). The junction row of
+//! (`winutil::UnelevatedToken`, the token a session runs with unless its login asks for `always`). The junction row of
 //! `verify` rests on the second being refused with error 448 while the first is followed, so that a
 //! junction an elevated probe made itself, which is always followed, is not what the row reads through.
 #![cfg(windows)]

@@ -56,6 +56,20 @@ pub enum Elevation {
     Standard,
 }
 
+/// What a session of a login is started with ([`crate::account::step_down`], which the shim, a host-testable
+/// module, takes the answer of): it sits here, beside [`Integrity`] and [`Elevation`], so that it exists on
+/// every host.
+#[derive(Debug, PartialEq, Eq)]
+pub enum StepDown<K> {
+    /// The stepped-down token `K` in place of this process's own.
+    Token(K),
+    /// This process's own token: at High the login asked for an elevated session, below High what a
+    /// process starts is unelevated anyway.
+    Own,
+    /// No session: the login asked for an elevated one and this process is below High.
+    Refused,
+}
+
 /// What is said of a socket file at `path` that is not as the agent made it (`acl::verify_file_acl` is
 /// false): it must grant exactly `grantee`, SYSTEM and Administrators and, for [`Integrity::High`], carry
 /// the High label. One wording for the agent's refusal to bind and `verify`'s row.

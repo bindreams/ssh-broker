@@ -20,30 +20,31 @@ use super::bounded::WaitError;
 use super::probe::{self, SymlinkState};
 use super::session_rows::{Answer, Junction, ProbeOutcome, Probes, level};
 use crate::account::integrity_class;
-use crate::protocol::Privilege;
+use crate::protocol::ElevationPolicy;
 use crate::route::ProbeLink;
 use crate::socket_loc::Integrity;
 use crate::{afunix, shim};
 
-/// How a probe is driven: asked for `Privilege`, told what to do about the junction, and what became of
+/// How a probe is driven: asked for an `ElevationPolicy`, told what to do about the junction, and what became of
 /// it. The one thing [`run_at`] is given in place of the agent.
-type Drive<'a> = &'a dyn Fn(Privilege, ProbeLink) -> ProbeOutcome;
+type Drive<'a> = &'a dyn Fn(ElevationPolicy, ProbeLink) -> ProbeOutcome;
 
 /// Run the probes through this account's agent and read what they found.
 ///
 /// An agent at High integrity (an administrator's elevated one) is probed twice, and keyed on the
-/// level of this process, which is the level of the folder the agent serves: first with the unelevated
-/// privilege, which makes a junction that a token below High made, and then as the account, which follows
-/// it. RedirectionGuard refuses only a link a non-administrator made, so a junction the elevated probe
-/// made itself would be followed always and prove nothing. Any other agent is probed once, and its
-/// probe makes and follows a junction.
+/// level of this process, which is the level of the folder the agent serves: first with the default
+/// policy (`prompt`: an unelevated session), which makes a junction that a token below High made, and then
+/// with `always` (an elevated one), which follows it. RedirectionGuard refuses only a link a
+/// non-administrator made, so a junction the elevated probe made itself would be followed always and prove
+/// nothing. Any other agent is probed once, and its probe, which asks for the default policy (`always` is
+/// refused below High), makes and follows a junction.
 ///
 /// Each probe is bounded by `timeout` ([`super::bounded`]), so an agent at High takes up to twice it, except
 /// that a first probe that does not answer is not followed by a second.
 pub fn run(exe: &Path, timeout: Option<Duration>) -> anyhow::Result<Probes> {
     let integrity = crate::account::integrity().context("read this process's integrity level")?;
-    Ok(run_at(integrity, &std::env::temp_dir(), &|privilege, link| {
-        drive_bounded(exe, privilege, link, timeout)
+    Ok(run_at(integrity, &std::env::temp_dir(), &|elevation, link| {
+        drive_bounded(exe, elevation, link, timeout)
     }))
 }
 
@@ -61,7 +62,7 @@ fn run_at(integrity: Integrity, temp: &Path, drive: Drive) -> Probes {
 
 /// The probe of an agent below High: it makes the junction in `dir` and follows it.
 fn run_at_medium(dir: &Path, drive: Drive) -> Probes {
-    let default = drive(Privilege::Account, make_link(dir));
+    let default = drive(ElevationPolicy::Prompt, make_link(dir));
     let note = said(&default).to_owned();
     let junction = if dir.to_str().is_some() {
         read_by(&default, note)
@@ -79,18 +80,18 @@ fn run_at_medium(dir: &Path, drive: Drive) -> Probes {
     }
 }
 
-/// The two probes of an agent at High, in order: the unelevated probe makes the junction in `dir`, and
-/// the default probe follows it.
+/// The two probes of an agent at High, in order: the unelevated probe (`prompt`) makes the junction in `dir`,
+/// and the default probe, which asks for `always`, follows it.
 fn run_at_high(dir: &Path, drive: Drive) -> Probes {
-    let unelevated = drive(Privilege::Unelevated, make_link(dir));
+    let unelevated = drive(ElevationPolicy::Prompt, make_link(dir));
     let source = source_of(dir, &unelevated);
     let default = match (&source, &unelevated) {
-        (Source::FromBelowHigh(text), _) => drive(Privilege::Account, ProbeLink::Follow((*text).to_owned())),
+        (Source::FromBelowHigh(text), _) => drive(ElevationPolicy::Always, ProbeLink::Follow((*text).to_owned())),
         // An agent that did not answer is not waited on a second time.
         (_, ProbeOutcome::TimedOut(_)) => ProbeOutcome::NotRun("the agent did not answer the first probe".into()),
         // No junction from below High to follow, and one that the probe made itself tells nothing about
         // the first's token: the probe is given none.
-        _ => drive(Privilege::Account, ProbeLink::NoJunction),
+        _ => drive(ElevationPolicy::Always, ProbeLink::NoJunction),
     };
 
     let note = [said(&unelevated), said(&default)]
@@ -217,13 +218,13 @@ fn said(outcome: &ProbeOutcome) -> &str {
 /// On expiry the outcome is [`ProbeOutcome::TimedOut`], which becomes the `parity probe (via agent)` row
 /// that an unreachable agent produces, so `verify` still prints every local check and exits non-zero
 /// instead of hanging with nothing on stdout.
-fn drive_bounded(exe: &Path, privilege: Privilege, link: ProbeLink, timeout: Option<Duration>) -> ProbeOutcome {
+fn drive_bounded(exe: &Path, elevation: ElevationPolicy, link: ProbeLink, timeout: Option<Duration>) -> ProbeOutcome {
     let (tx, rx) = std::sync::mpsc::channel();
     let exe = exe.to_path_buf();
     // The worker owns the whole relay conversation; on expiry it is left blocked on a socket that is not
     // delivering. `verify` goes on without it and exits after printing, which collects it.
     std::thread::spawn(move || {
-        let _ = tx.send(drive(&exe, privilege, &link));
+        let _ = tx.send(drive(&exe, elevation, &link));
     });
     outcome_of(super::bounded::await_bounded(&rx, timeout))
 }
@@ -254,19 +255,19 @@ fn outcome_of(waited: Result<Result<Answer, Stop>, WaitError>) -> ProbeOutcome {
 }
 
 /// Drive `<exe> verify-probe` as an EXEC command THROUGH the agent (so it runs in session 1), asking for
-/// `privilege`, parse the PROBE line it prints, and check whether its binary payload survived intact.
+/// `elevation`, parse the PROBE line it prints, and check whether its binary payload survived intact.
 ///
 /// The byte check reads the RAW stdout, before the lossy UTF-8 conversion the line parse
 /// needs: the payload is deliberately not valid UTF-8, so converting first would destroy the
 /// very property being measured. This is the end-to-end half of byte-transparency — a real
 /// child, real pipes, a real socket — which the in-memory relay tests cannot reach.
-fn drive(exe: &Path, privilege: Privilege, link: &ProbeLink) -> Result<Answer, Stop> {
+fn drive(exe: &Path, elevation: ElevationPolicy, link: &ProbeLink) -> Result<Answer, Stop> {
     let sock = crate::userdir::inspect_current_socket_dir()
         .and_then(|folder| folder.connect())
         .context("connect to agent")
         .map_err(Stop::NotStarted)?;
     let (rx, tx) = afunix::split(sock).map_err(Stop::NotStarted)?;
-    let hs = super::probe_handshake(exe, privilege, link);
+    let hs = super::probe_handshake(exe, elevation, link);
     let mut out = Vec::new();
     let mut err = Vec::new();
     // Feed the same payload upstream that the child echoes downstream, so the client → child

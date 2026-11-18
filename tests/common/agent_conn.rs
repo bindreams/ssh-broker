@@ -11,7 +11,7 @@ use ssh_broker::account::LocalAccount;
 use ssh_broker::acl::Sid;
 use ssh_broker::afunix::{self, ConnRx, ConnTx};
 use ssh_broker::logon;
-use ssh_broker::protocol::{FrameKind, FrameReader, Handshake, Launch, Mode, Privilege, Stream, write_frame};
+use ssh_broker::protocol::{ElevationPolicy, FrameKind, FrameReader, Handshake, Launch, Mode, Stream, write_frame};
 use ssh_broker::relay::{FrameSink, Outcome, PumpError, pump_decode, write_data};
 use ssh_broker::socket_loc::SocketLocation;
 use ssh_broker::userdir;
@@ -171,36 +171,37 @@ impl AgentConn {
         }
     }
 
-    fn handshake(&mut self, mode: Mode, command: Option<&str>, launch: Launch, privilege: Privilege) {
+    fn handshake(&mut self, mode: Mode, command: Option<&str>, launch: Launch, elevation: ElevationPolicy) {
         let hs = Handshake {
             mode,
             command: command.map(str::to_string),
             launch,
-            privilege,
+            elevation,
             ..Handshake::pty_default()
         };
         write_frame(&mut self.tx, FrameKind::Handshake, &hs.encode().unwrap()).unwrap();
     }
 
-    /// Start an interactive session running `command`.
+    /// Start an interactive session running `command`, with the default policy (an unelevated session).
     pub fn start_pty(&mut self, command: &str) {
-        self.handshake(Mode::Pty, Some(command), Launch::Direct, Privilege::Account);
+        self.handshake(Mode::Pty, Some(command), Launch::Direct, ElevationPolicy::Prompt);
     }
 
     /// Start a session with a terminal the way the shim asks for one: through the account's configured
     /// shell, running `command` or, with `None`, a login.
     pub fn start_shell_pty(&mut self, command: Option<&str>) {
-        self.handshake(Mode::Pty, command, Launch::Shell, Privilege::Account);
+        self.handshake(Mode::Pty, command, Launch::Shell, ElevationPolicy::Prompt);
     }
 
-    /// Start a session that runs `command` on redirected pipes.
+    /// Start a session that runs `command` on redirected pipes, with the default policy.
     pub fn start_exec(&mut self, command: &str) {
-        self.start_exec_as(command, Privilege::Account);
+        self.start_exec_as(command, ElevationPolicy::Prompt);
     }
 
-    /// [`AgentConn::start_exec`] asking for `privilege`: `Unelevated` is what `internal-unelevated` asks.
-    pub fn start_exec_as(&mut self, command: &str, privilege: Privilege) {
-        self.handshake(Mode::Exec, Some(command), Launch::Direct, privilege);
+    /// [`AgentConn::start_exec`] asking for `elevation`: `Always` is the agent's own token, which an agent
+    /// below High refuses.
+    pub fn start_exec_as(&mut self, command: &str, elevation: ElevationPolicy) {
+        self.handshake(Mode::Exec, Some(command), Launch::Direct, elevation);
     }
 
     /// Type `line` and Enter into a PTY session, as win32-input-mode key events.

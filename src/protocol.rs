@@ -144,14 +144,57 @@ pub enum Launch {
     Direct,
 }
 
-/// Whose privilege the session's program runs with.
+/// What a login asked of elevation, in order of privilege: its variable [`ElevationPolicy::VARIABLE`].
+/// Whether a token is elevated is [`crate::socket_loc::Elevation`]; this is what the login wants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Privilege {
-    /// The agent's own: elevated for an administrator whose agent is elevated.
-    Account,
-    /// Stepped down: the login said `internal-unelevated`. An agent below High gives what it has anyway.
-    Unelevated,
+pub enum ElevationPolicy {
+    /// An unelevated session, and `ssh-broker elevate` in it is refused.
+    Never,
+    /// An unelevated session, and `ssh-broker elevate` asks the person at the terminal. The default.
+    Prompt,
+    /// An unelevated session, and `ssh-broker elevate` in it is granted without asking.
+    AutoApprove,
+    /// An elevated session: the agent's own token. Refused where the agent is below High.
+    Always,
 }
+
+impl ElevationPolicy {
+    /// The environment variable sshd hands the shim when the login set it.
+    pub const VARIABLE: &'static str = "SSH_BROKER_ELEVATION";
+
+    /// The policy `value` of [`Self::VARIABLE`] names; `None` (unset) is [`ElevationPolicy::Prompt`]. Exactly
+    /// the four words, in lower case: anything else, a different case, padding or an empty value included,
+    /// is an error, since a guess would give the login a level it did not ask for.
+    pub fn parse(value: Option<&std::ffi::OsStr>) -> Result<Self, UnknownPolicy> {
+        let Some(value) = value else {
+            return Ok(Self::Prompt);
+        };
+        match value.to_str() {
+            Some("never") => Ok(Self::Never),
+            Some("prompt") => Ok(Self::Prompt),
+            Some("auto-approve") => Ok(Self::AutoApprove),
+            Some("always") => Ok(Self::Always),
+            _ => Err(UnknownPolicy {
+                value: value.to_string_lossy().into_owned(),
+            }),
+        }
+    }
+}
+
+/// A value of [`ElevationPolicy::VARIABLE`] that is none of the four words.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnknownPolicy {
+    /// The value's text, with any byte that is not Unicode replaced.
+    pub value: String,
+}
+
+impl std::fmt::Display for UnknownPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?} is not an elevation policy", self.value)
+    }
+}
+
+impl std::error::Error for UnknownPolicy {}
 
 /// The first frame on a connection (a HANDSHAKE-kind frame whose payload is this
 /// struct, `postcard`-serialized). The shim fills `term`/`cwd` and the allow-listed
@@ -171,7 +214,7 @@ pub struct Handshake {
     pub launch: Launch,
     /// Appended last: the version check reads `version` alone, so a peer of another version is refused
     /// by name before this field is looked for.
-    pub privilege: Privilege,
+    pub elevation: ElevationPolicy,
 }
 
 impl Handshake {
@@ -190,7 +233,9 @@ impl Handshake {
     }
 
     /// A minimal interactive-PTY handshake, used as a `..Handshake::pty_default()` base in tests
-    /// and by `make_handshake`. Its launch is [`Launch::Direct`]: the base for a raw spawn.
+    /// and by `make_handshake`. Its launch is [`Launch::Direct`]: the base for a raw spawn. Its policy is
+    /// the default, [`ElevationPolicy::Prompt`]: an agent at High gives it the unelevated token, one below
+    /// High its own; a test that needs the agent's own token at High passes [`ElevationPolicy::Always`].
     pub fn pty_default() -> Self {
         Self {
             version: PROTOCOL_VERSION,
@@ -202,7 +247,7 @@ impl Handshake {
             command: None,
             env: Vec::new(),
             launch: Launch::Direct,
-            privilege: Privilege::Account,
+            elevation: ElevationPolicy::Prompt,
         }
     }
 }
