@@ -27,7 +27,8 @@ use std::time::Duration;
 /// would be worse than no bound at all.
 pub const DEFAULT_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Parse `--probe-timeout` out of `args`; `0` selects an indefinite wait.
+/// Parse `--probe-timeout` out of `args`; `0` selects an indefinite wait. The bound is for each probe,
+/// and an agent at High is probed twice.
 ///
 /// Accepts both `--probe-timeout 30` and `--probe-timeout=30`. The `=` spelling is what many
 /// operators reach for first, and silently ignoring it would apply the default while the operator

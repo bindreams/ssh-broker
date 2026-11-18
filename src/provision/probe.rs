@@ -5,8 +5,6 @@
 //! so the DPAPI/symlink/session checks MUST run in an agent-spawned child (which is in session
 //! 1) — running them in verify's own process would false-negative on a correctly-installed box.
 
-use std::path::PathBuf;
-
 use crate::socket_loc::Elevation;
 
 #[cfg(windows)]
@@ -15,7 +13,6 @@ pub mod link;
 /// Outcome of reading through a junction in the probe's temp directory. The junction is one that a
 /// token below High made: RedirectionGuard refuses to follow a link a non-administrator made, and a
 /// process that made the link itself always follows it, so only a followed junction proves anything.
-/// A junction needs no privilege, so there is no "untestable" outcome: every other result fails.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SymlinkState {
     /// The junction was followed.
@@ -23,9 +20,12 @@ pub enum SymlinkState {
     /// The junction exists and the read was refused as an untrusted mount point (error 448):
     /// RedirectionGuard is on in this session.
     Blocked,
-    /// The junction could not be made or found, or the read failed for another reason. Also what a
-    /// probe that reported no outcome gets.
+    /// The junction was made, and the read failed for another reason. Also what a probe that reported
+    /// no outcome gets.
     Failed,
+    /// The junction could not be made (a temp directory on a volume with no reparse points, say), so
+    /// following it was not tested. Informational: it fails nothing.
+    Skipped,
 }
 
 impl SymlinkState {
@@ -34,18 +34,20 @@ impl SymlinkState {
             SymlinkState::Ok => "ok",
             SymlinkState::Blocked => "blocked",
             SymlinkState::Failed => "fail",
+            SymlinkState::Skipped => "skip",
         }
     }
     fn parse(s: &str) -> SymlinkState {
         match s {
             "ok" => SymlinkState::Ok,
             "blocked" => SymlinkState::Blocked,
+            "skip" => SymlinkState::Skipped,
             _ => SymlinkState::Failed, // missing or unknown: nothing was proven
         }
     }
-    /// Whether this outcome fails parity: anything but a followed junction.
+    /// Whether this outcome fails parity: a junction that was made and not followed.
     pub fn is_failure(self) -> bool {
-        !matches!(self, SymlinkState::Ok)
+        matches!(self, SymlinkState::Blocked | SymlinkState::Failed)
     }
 }
 
@@ -67,9 +69,6 @@ pub struct ProbeResult {
     /// The relative id of the probe's integrity label (`0x2000` Medium, `0x3000` High), when it could
     /// be read. `None` is "not proven".
     pub integrity: Option<u32>,
-    /// The directory of the junction this probe made and left (`verify-probe --make-junction`), for
-    /// `verify` to give to the next probe and then remove. `None` when the probe made none.
-    pub junction: Option<PathBuf>,
 }
 
 /// `SECURITY_LOGON_TYPE` Interactive.
@@ -215,8 +214,7 @@ fn parse_integrity(text: &str) -> Option<u32> {
     u32::from_str_radix(text.strip_prefix("0x")?, 16).ok()
 }
 
-/// The single line `verify-probe` prints to stdout. `junction`, when there is one, comes last and is
-/// the rest of the line, so a path with blanks in it needs no quoting.
+/// The single line `verify-probe` prints to stdout.
 pub fn format_probe_line(r: &ProbeResult) -> String {
     let mut line = format!(
         "PROBE session_id={} dpapi={} symlink={} upstream={}",
@@ -233,9 +231,6 @@ pub fn format_probe_line(r: &ProbeResult) -> String {
     }
     if let Some(rid) = r.integrity {
         line.push_str(&format!(" integrity={rid:#x}"));
-    }
-    if let Some(junction) = &r.junction {
-        line.push_str(&format!(" junction={}", junction.display()));
     }
     line
 }
@@ -261,15 +256,8 @@ pub fn parse_probe_line(stdout: &str) -> anyhow::Result<ProbeResult> {
         logon_type: None,
         elevation: None,
         integrity: None,
-        junction: None,
     };
-    // The junction is the rest of the line: split it off before the line is cut at blanks.
-    let (fields, junction) = match line.split_once(" junction=") {
-        Some((fields, junction)) => (fields, Some(junction.trim_end())),
-        None => (line, None),
-    };
-    r.junction = junction.filter(|j| !j.is_empty()).map(PathBuf::from);
-    for tok in fields.split_whitespace() {
+    for tok in line.split_whitespace() {
         if let Some(v) = tok.strip_prefix("session_id=") {
             r.session_id = v.parse().unwrap_or(0);
         } else if let Some(v) = tok.strip_prefix("dpapi=") {
@@ -287,6 +275,28 @@ pub fn parse_probe_line(stdout: &str) -> anyhow::Result<ProbeResult> {
         }
     }
     Ok(r)
+}
+
+// ── what a probe says about its junction ───────────────────────────────────────────────
+
+/// What the probe writes before each line of its stderr about the junction (why it could not make one,
+/// why it could not read through it, what it could not remove), so `verify` can show those lines and no
+/// others.
+pub const JUNCTION_SAID: &str = "ssh-broker: junction: ";
+/// How much of that `verify` shows on a row.
+pub const JUNCTION_NOTE_LINES: usize = 4;
+pub const JUNCTION_NOTE_CHARS: usize = 400;
+
+/// The junction lines of a probe's `stderr`, a few of them and joined with `; `: the probe's own words
+/// about what it could not do, for the row of the junction.
+pub fn junction_notes(stderr: &str) -> String {
+    let lines: Vec<&str> = stderr
+        .lines()
+        .filter_map(|line| line.strip_prefix(JUNCTION_SAID))
+        .map(str::trim)
+        .take(JUNCTION_NOTE_LINES)
+        .collect();
+    lines.join("; ").chars().take(JUNCTION_NOTE_CHARS).collect()
 }
 
 // ── Windows parity checks (run in the session-1 probe child) ───────────────────────

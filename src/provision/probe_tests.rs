@@ -1,9 +1,8 @@
 //! Host tests for the pure probe-line format/parse.
-use std::path::PathBuf;
-
 use super::{
-    ProbeResult, SymlinkState, UpstreamState, binary_probe_ok, binary_probe_payload, emit_binary_probe,
-    format_probe_line, is_genuine_session, parse_probe_line, upstream_payload_ok,
+    JUNCTION_NOTE_CHARS, JUNCTION_NOTE_LINES, JUNCTION_SAID, ProbeResult, SymlinkState, UpstreamState, binary_probe_ok,
+    binary_probe_payload, emit_binary_probe, format_probe_line, is_genuine_session, junction_notes, parse_probe_line,
+    upstream_payload_ok,
 };
 use crate::socket_loc::Elevation;
 
@@ -17,7 +16,6 @@ fn bare(session_id: u32, symlink: SymlinkState, upstream: UpstreamState) -> Prob
         logon_type: None,
         elevation: None,
         integrity: None,
-        junction: None,
     }
 }
 
@@ -65,27 +63,40 @@ fn a_missing_or_unknown_elevation_or_integrity_is_not_proven() {
     assert_eq!((garbled.elevation, garbled.integrity), (None, None));
 }
 
-/// The junction a probe made is named on the PROBE line, for `verify` to hand to the next probe and then
-/// to remove. It is the last field, and everything after `junction=` is the path, so a profile with a
-/// blank in its name survives.
+/// No probe reports a path: `verify` names the junction's directory itself, and a path a process below
+/// High wrote is never one `verify` acts on. The line has no `junction=` field, and a key it does not
+/// know (an exe from before this change wrote one) is ignored like any other, not read as a directory.
 #[test]
-fn probe_line_carries_the_junction_directory_whole() {
-    let dir = PathBuf::from(r"C:\Users\example user\AppData\Local\Temp\sb-junction-42");
-    let result = ProbeResult {
-        junction: Some(dir.clone()),
-        ..bare(1, SymlinkState::Ok, UpstreamState::Ok)
-    };
-    let line = format_probe_line(&result);
-    assert!(line.ends_with(&format!(" junction={}", dir.display())), "{line}");
-    assert_eq!(parse_probe_line(&line).unwrap().junction, Some(dir));
-    assert_eq!(parse_probe_line(&line).unwrap(), result);
-    // A line with no junction has none: an empty value is not a path.
-    assert_eq!(
-        parse_probe_line("PROBE session_id=1 dpapi=ok symlink=ok upstream=ok junction=")
-            .unwrap()
-            .junction,
-        None
+fn the_probe_line_names_no_directory() {
+    let line = format_probe_line(&bare(1, SymlinkState::Ok, UpstreamState::Ok));
+    assert!(!line.contains("junction"), "{line}");
+
+    let old =
+        parse_probe_line(r"PROBE session_id=1 dpapi=ok symlink=ok upstream=ok junction=C:\Users\me\Temp\x").unwrap();
+    assert_eq!(old, bare(1, SymlinkState::Ok, UpstreamState::Ok));
+}
+
+/// What `verify` shows of a probe's stderr on the junction row: only the junction's own lines, a few of
+/// them, so another message of the probe (a failed upstream read) is not put on that row.
+#[test]
+fn only_the_junction_lines_of_the_probes_stderr_are_kept_and_they_are_bounded() {
+    let said = |line: &str| format!("{JUNCTION_SAID}{line}\n");
+    let stderr = format!(
+        "ssh-broker: reading the upstream probe payload failed: broken pipe\n{}{}",
+        said("making a junction in C:\\Temp failed: access denied"),
+        said("removing C:\\Temp\\x failed: in use"),
     );
+    assert_eq!(
+        junction_notes(&stderr),
+        "making a junction in C:\\Temp failed: access denied; removing C:\\Temp\\x failed: in use"
+    );
+    assert_eq!(junction_notes(""), "");
+    assert_eq!(junction_notes("ssh-broker: something else\n"), "");
+
+    let many: String = (0..9).map(|i| said(&format!("line {i}"))).collect();
+    assert_eq!(junction_notes(&many).split("; ").count(), JUNCTION_NOTE_LINES);
+    let long = said(&"x".repeat(1000));
+    assert!(junction_notes(&long).chars().count() <= JUNCTION_NOTE_CHARS);
 }
 
 /// `upstream` is default-deny, like `dpapi`: a probe child too old to report it must read as "not
@@ -186,14 +197,20 @@ fn upstream_payload_propagates_a_read_error() {
 
 #[test]
 fn symlink_states_round_trip() {
-    for st in [SymlinkState::Ok, SymlinkState::Blocked, SymlinkState::Failed] {
+    for st in [
+        SymlinkState::Ok,
+        SymlinkState::Blocked,
+        SymlinkState::Failed,
+        SymlinkState::Skipped,
+    ] {
         let line = format_probe_line(&bare(2, st, UpstreamState::Ok));
         assert_eq!(parse_probe_line(&line).unwrap().symlink, st);
     }
-    // Only a followed junction passes: one that was refused, and one that could not be made or read,
-    // fail.
+    // A junction that was refused, and one that was made and not read, fail. One that could not be made
+    // was not tested, which fails nothing.
     assert!(SymlinkState::Blocked.is_failure());
     assert!(SymlinkState::Failed.is_failure());
+    assert!(!SymlinkState::Skipped.is_failure());
     assert!(!SymlinkState::Ok.is_failure());
 }
 

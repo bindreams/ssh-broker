@@ -133,28 +133,41 @@ fn a_probe_with_no_flag_follows_its_own_junction_and_leaves_nothing() {
     assert_eq!(std::fs::read_dir(&temp.0).unwrap().count(), 0, "nothing is left behind");
 }
 
-/// The unelevated probe of an administrator's agent makes a junction and names its directory; the other
-/// probe follows it by that name. Both read it, neither removes it.
+/// The unelevated probe of an administrator's agent makes the junction in the directory it is given and
+/// reports no path; the other probe follows it by the same directory. Both read it, neither removes it.
 #[test]
-fn a_probe_that_makes_a_junction_names_it_and_another_follows_it() {
+fn a_probe_makes_a_junction_in_the_directory_it_is_given_and_another_follows_it() {
     let temp = Temp::new("make");
-    let made = run_verify_probe_with(&["--make-junction"], &temp.0, b"");
+    let dir = temp.0.join("named");
+    let dir = dir.to_str().unwrap();
+    let made = run_verify_probe_with(&["--make-junction", dir], &temp.0, b"");
     let made_line = probe_line(&made);
     assert!(made_line.contains("symlink=ok"), "{made_line}");
-    let dir = made_line
-        .split_once(" junction=")
-        .unwrap_or_else(|| panic!("no junction= in: {made_line}"))
-        .1;
-    assert!(
-        Path::new(dir).starts_with(&temp.0),
-        "{dir} is made in the probe's temp directory"
-    );
+    assert!(!made_line.contains("junction="), "no path is reported: {made_line}");
+    assert!(Path::new(dir).is_dir(), "the directory is made where it was named");
 
     let followed = run_verify_probe_with(&["--follow", dir], &temp.0, b"");
     let followed_line = probe_line(&followed);
     assert!(followed_line.contains("symlink=ok"), "{followed_line}");
     assert!(!followed_line.contains("junction="), "{followed_line}");
     assert!(Path::new(dir).exists(), "the follower leaves the junction to `verify`");
+}
+
+/// A path that exists is not made over and not cleared: the probe reports the junction as not made and
+/// leaves what is there alone.
+#[test]
+fn a_probe_given_a_path_that_exists_makes_no_junction_and_leaves_it_alone() {
+    let temp = Temp::new("exists");
+    let dir = temp.0.join("exists");
+    std::fs::create_dir(&dir).unwrap();
+    std::fs::write(dir.join("keep.txt"), b"keep").unwrap();
+
+    let stdout = run_verify_probe_with(&["--make-junction", dir.to_str().unwrap()], &temp.0, b"");
+
+    let line = probe_line(&stdout);
+    assert!(line.contains("symlink=skip"), "expected symlink=skip, got: {line}");
+    assert_eq!(std::fs::read(dir.join("keep.txt")).unwrap(), b"keep");
+    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1, "nothing was added");
 }
 
 /// A directory with no junction in it is a failed link check, not a pass and not a block.

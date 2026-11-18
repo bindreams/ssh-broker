@@ -47,7 +47,9 @@ fn usage(verb: Verb) -> &'static str {
         Verb::Agent => "usage: ssh-broker agent [--background [--expect-user <sid>]]",
         Verb::Logout => "usage: ssh-broker logout",
         Verb::ConsoleFallback => "usage: ssh-broker console-fallback [--login] <handle> (internal)",
-        Verb::VerifyProbe => "usage: ssh-broker verify-probe [--make-junction | --follow <directory>] (internal)",
+        Verb::VerifyProbe => {
+            "usage: ssh-broker verify-probe [--make-junction <directory> | --follow <directory>] (internal)"
+        }
     }
 }
 

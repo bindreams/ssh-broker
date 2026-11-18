@@ -162,14 +162,23 @@ its own.
 RedirectionGuard refuses to follow a link that a non-administrator made, and a process follows a link it
 made itself, so a row that read through a link the probe made as an elevated process would pass whether or
 not the mitigation is on. For an agent at High integrity `verify` therefore runs two probes through it
-(`provision::probe_run`): first `verify-probe --make-junction` with `Privilege::Unelevated`, which makes a
-junction in its temp directory with a token below High and names the directory on the PROBE line, then
-`verify-probe --follow <directory>` as the account, which reads through it; `verify` removes the directory,
-whatever became of the second probe. A junction needs no privilege, so the row is never untestable. For an
-agent below High there is one probe, which makes and follows its own. The probe's PROBE line also carries
-its own `elevation` and `integrity` (read by `account::elevation_of` and `integrity_of`), which the
-`elevated session` and `unelevated session on request` rows judge. The two probes are keyed on the level of
-the process that runs `verify`, which is the level of the folder it asks, not on `Elevation::Full`.
+(`provision::probe_run`): first `verify-probe --make-junction <directory>` with `Privilege::Unelevated`, which
+makes that directory with a junction in it by a token below High, then `verify-probe --follow <directory>` as
+the account, which reads through it. `verify` names the directory itself, under its own temp directory with a
+name unique to the run, before any probe runs, and removes it, through no link, whatever became of either
+probe: no probe reports a path, because a path a process below High wrote is not one an elevated `verify`
+acts on. The make-probe fails on a path that exists and never clears one. A probe that fails is data, not an
+early return: the default probe still runs (with a junction of its own, which proves nothing and is not
+judged), so only the rows about the failed probe fail. A junction needs no privilege, but it needs a volume
+that holds reparse points: one that could not be *made* is `SymlinkState::Skipped`, which fails nothing and
+says on the row that it was not tested and why; one that was made and refused with error 448 is `Blocked`,
+and one that was made and not read is `Failed`, and both fail. The probe's stderr lines about the junction
+(`probe::JUNCTION_SAID`) reach the row. For an agent below High there is one probe, which makes and follows
+its own. The probe's PROBE line also carries its own `elevation` and `integrity` (read by
+`account::elevation_of` and `integrity_of`), which the `elevated session` and `unelevated session on request`
+rows judge. The two probes and the two rows are keyed on the agent being at High (the level of the process
+that runs `verify`, which is the level of the folder it asks; the default probe's own level for the rows),
+not on `Elevation::Full`.
 `tests/redirection_guard_windows.rs` measures the premise.
 
 ## Building and testing

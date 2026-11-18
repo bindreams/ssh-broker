@@ -34,13 +34,10 @@ fn is_reparse_point(path: &Path) -> bool {
 #[test]
 fn a_junction_made_in_a_directory_is_followed() {
     let scratch = Scratch::new("made");
+    let dir = scratch.0.join("d");
 
-    let dir = make(&scratch.0).unwrap();
+    make(&dir).unwrap();
 
-    assert!(
-        dir.starts_with(&scratch.0),
-        "{dir:?} is made in the directory it was given"
-    );
     assert!(is_reparse_point(&dir.join(LINK_NAME)), "the link is a reparse point");
     assert!(
         !is_reparse_point(&dir.join(TARGET_NAME)),
@@ -54,7 +51,8 @@ fn a_junction_made_in_a_directory_is_followed() {
 #[test]
 fn a_junction_to_a_folder_without_the_file_is_not_followed() {
     let scratch = Scratch::new("wrong");
-    let dir = make(&scratch.0).unwrap();
+    let dir = scratch.0.join("d");
+    make(&dir).unwrap();
     std::fs::remove_file(dir.join(TARGET_NAME).join(FILE_NAME)).unwrap();
 
     assert_eq!(follow(&dir), SymlinkState::Failed);
@@ -80,17 +78,42 @@ fn only_an_untrusted_mount_point_error_is_a_block() {
     assert_eq!(state_of_read(Ok(b"other".to_vec())), SymlinkState::Failed);
 }
 
-/// Making again in the same place replaces what an earlier run of this process left, so a stale
-/// directory never makes the new junction fail.
+/// A path that exists is never made over or cleared: the probe fails and leaves what is there alone,
+/// whether it is a stale directory of an earlier run or something that was put there.
 #[test]
-fn making_again_replaces_a_stale_directory() {
-    let scratch = Scratch::new("again");
-    let first = make(&scratch.0).unwrap();
+fn making_in_a_path_that_exists_fails_and_leaves_it_alone() {
+    let scratch = Scratch::new("exists");
+    let dir = scratch.0.join("d");
+    std::fs::create_dir(&dir).unwrap();
+    std::fs::write(dir.join("keep.txt"), b"keep").unwrap();
 
-    let second = make(&scratch.0).unwrap();
+    let made = make(&dir);
 
-    assert_eq!(first, second, "one directory per process");
-    assert_eq!(follow(&second), SymlinkState::Ok);
+    assert_eq!(made.unwrap_err().kind(), io::ErrorKind::AlreadyExists);
+    assert_eq!(std::fs::read(dir.join("keep.txt")).unwrap(), b"keep");
+    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1, "nothing was added to it");
+    let file = scratch.0.join("f");
+    std::fs::write(&file, b"keep").unwrap();
+    assert!(make(&file).is_err());
+    assert_eq!(std::fs::read(&file).unwrap(), b"keep");
+}
+
+/// Each call names a directory of its own, in the parent it was given, and the name is not the process
+/// id alone: a later process that has the same id does not meet a stale name.
+#[test]
+fn each_unique_directory_is_new_and_below_its_parent() {
+    let scratch = Scratch::new("unique");
+
+    let first = unique_dir(&scratch.0);
+    let second = unique_dir(&scratch.0);
+
+    assert_ne!(first, second);
+    assert_eq!(first.parent(), Some(scratch.0.as_path()));
+    assert_ne!(
+        first.file_name().unwrap().to_str().unwrap(),
+        format!("sb-junction-{}", std::process::id()),
+        "the process id alone is not a unique name"
+    );
 }
 
 /// Removal takes the junction, the target and the directory, and never goes through the junction: a
@@ -98,7 +121,8 @@ fn making_again_replaces_a_stale_directory() {
 #[test]
 fn removing_the_directory_does_not_go_through_the_junction() {
     let scratch = Scratch::new("remove");
-    let dir = make(&scratch.0).unwrap();
+    let dir = scratch.0.join("d");
+    make(&dir).unwrap();
     // Point the link at a folder outside the directory instead of the probe's own target.
     let outside = scratch.0.join("outside");
     std::fs::create_dir(&outside).unwrap();
@@ -122,16 +146,15 @@ fn removing_a_directory_that_is_gone_is_not_an_error() {
 
 // what a probe does with its junction ---------------------------------------------------------
 
-/// `Own`: the one probe of a standard account's agent makes a junction, follows it and removes it, and
-/// names nothing for `verify` to clean up.
+/// `Own`: the one probe of an agent below High makes a junction in a directory of its own, follows it and
+/// removes it.
 #[test]
 fn an_own_junction_is_followed_and_removed_by_the_probe_that_made_it() {
     let scratch = Scratch::new("own");
 
-    let (state, left) = run_in(&ProbeLink::Own, &scratch.0);
+    let state = run_in(&ProbeLink::Own, &scratch.0);
 
     assert_eq!(state, SymlinkState::Ok);
-    assert_eq!(left, None);
     assert_eq!(
         std::fs::read_dir(&scratch.0).unwrap().count(),
         0,
@@ -139,20 +162,20 @@ fn an_own_junction_is_followed_and_removed_by_the_probe_that_made_it() {
     );
 }
 
-/// `Make`: the unelevated probe of an administrator's agent leaves the junction and names its
-/// directory; a second probe follows it by that name and leaves it for `verify` to remove.
+/// `Make`: the unelevated probe of an administrator's agent makes the junction in the directory `verify`
+/// named and leaves it; a second probe follows it by that name and leaves it for `verify` to remove.
 #[test]
 fn a_made_junction_is_left_for_the_next_probe_to_follow() {
     let scratch = Scratch::new("make");
+    let dir = scratch.0.join("named");
+    let text = dir.to_str().unwrap().to_owned();
 
-    let (made, dir) = run_in(&ProbeLink::Make, &scratch.0);
-    let dir = dir.expect("the probe names the directory it made");
-    let (followed, left) = run_in(&ProbeLink::Follow(dir.to_str().unwrap().to_owned()), &scratch.0);
+    let made = run_in(&ProbeLink::Make(text.clone()), &scratch.0);
+    let followed = run_in(&ProbeLink::Follow(text), &scratch.0);
 
     assert_eq!(made, SymlinkState::Ok);
     assert_eq!(followed, SymlinkState::Ok);
-    assert_eq!(left, None, "following leaves what it follows to `verify`");
-    assert!(dir.exists());
+    assert!(dir.exists(), "following leaves what it follows to `verify`");
     remove(&dir).unwrap();
     assert_eq!(
         follow(&dir),
@@ -161,13 +184,27 @@ fn a_made_junction_is_left_for_the_next_probe_to_follow() {
     );
 }
 
-/// A junction that cannot be made is a failed outcome with no directory, not a panic or a pass.
+/// A junction that cannot be made was not tested: `Skipped`, which fails nothing, not a panic and not a
+/// pass. A path that exists is such a case, and is left as it is.
 #[test]
-fn a_junction_that_cannot_be_made_is_failed() {
+fn a_junction_that_cannot_be_made_is_skipped() {
     let scratch = Scratch::new("cannot");
     let not_a_directory = scratch.0.join("file");
     std::fs::write(&not_a_directory, b"x").unwrap();
+    let existing = scratch.0.join("existing");
+    std::fs::create_dir(&existing).unwrap();
 
-    assert_eq!(run_in(&ProbeLink::Make, &not_a_directory), (SymlinkState::Failed, None));
-    assert_eq!(run_in(&ProbeLink::Own, &not_a_directory), (SymlinkState::Failed, None));
+    assert_eq!(
+        run_in(
+            &ProbeLink::Make(not_a_directory.join("d").to_str().unwrap().to_owned()),
+            &scratch.0
+        ),
+        SymlinkState::Skipped
+    );
+    assert_eq!(run_in(&ProbeLink::Own, &not_a_directory), SymlinkState::Skipped);
+    assert_eq!(
+        run_in(&ProbeLink::Make(existing.to_str().unwrap().to_owned()), &scratch.0),
+        SymlinkState::Skipped
+    );
+    assert_eq!(std::fs::read_dir(&existing).unwrap().count(), 0, "it was not touched");
 }

@@ -175,16 +175,16 @@ fn apply_and_verify_verbs() {
     );
 }
 
-/// The hidden probe takes the directory of a junction to follow, or the flag that says it makes one and
-/// leaves it: `verify` runs the two probes of an administrator's session with them. Any other shape is a
-/// usage error, never the shim and never a probe that ignored what it was told.
+/// The hidden probe takes the directory of the junction it makes or the one it follows, which `verify`
+/// names: it runs the two probes of an administrator's session with them. Any other shape is a usage
+/// error, never the shim and never a probe that ignored what it was told.
 #[test]
-fn verify_probe_takes_a_junction_flag_or_a_directory_to_follow() {
+fn verify_probe_takes_the_directory_to_make_a_junction_in_or_to_follow() {
     let args = |args: &[&str]| args.iter().map(|a| (*a).to_owned()).collect::<Vec<_>>();
-    let dir = r"C:\Users\me\AppData\Local\Temp\sb-junction-1";
+    let dir = r"C:\Users\me\AppData\Local\Temp\sb-junction-1-2";
     assert_eq!(
-        route(&args(&["verify-probe", "--make-junction"]), "ignored"),
-        Route::VerifyProbe(ProbeLink::Make)
+        route(&args(&["verify-probe", "--make-junction", dir]), "ignored"),
+        Route::VerifyProbe(ProbeLink::Make(dir.into()))
     );
     assert_eq!(
         route(&args(&["verify-probe", "--follow", dir]), "ignored"),
@@ -192,9 +192,10 @@ fn verify_probe_takes_a_junction_flag_or_a_directory_to_follow() {
     );
     for bad in [
         vec!["verify-probe", "--follow"],
+        vec!["verify-probe", "--make-junction"],
         vec!["verify-probe", "--follow", "--make-junction"],
         vec!["verify-probe", "--follow", "a", "b"],
-        vec!["verify-probe", "--make-junction", "a"],
+        vec!["verify-probe", "--make-junction", "a", "b"],
         vec!["verify-probe", "--make-junction", "--follow", "a"],
         vec!["verify-probe", "now"],
     ] {

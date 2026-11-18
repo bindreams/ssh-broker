@@ -112,7 +112,7 @@ pub fn probe_handshake(
     let command = format!("\"{}\" verify-probe", exe.display());
     let command = match link {
         ProbeLink::Own => command,
-        ProbeLink::Make => format!("{command} --make-junction"),
+        ProbeLink::Make(dir) => format!("{command} --make-junction \"{dir}\""),
         ProbeLink::Follow(dir) => format!("{command} --follow \"{dir}\""),
     };
     crate::shim::make_handshake(
@@ -549,7 +549,7 @@ mod imp {
         let sid = probe::current_session_id();
         let logon_type = probe::current_logon_type();
         let dpapi = probe::dpapi_roundtrip(b"ssh-broker-parity-probe");
-        let (symlink, junction) = probe::link::run(&link);
+        let symlink = probe::link::run(&link);
         let (elevation, integrity) = probe::current_token_facts();
         // Read the UPSTREAM payload first. This direction — client → child — is the one an
         // `sftp put` / `scp` upload rides. The two directions are measured INDEPENDENTLY: the
@@ -587,7 +587,6 @@ mod imp {
                 logon_type,
                 elevation,
                 integrity,
-                junction,
             };
             writeln!(stdout, "{}", probe::format_probe_line(&result)).context("write the PROBE line")?;
             stdout.flush().context("flush probe output")?;

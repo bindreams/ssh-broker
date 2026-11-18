@@ -4,15 +4,18 @@
 //! something only when a token below High made it and the token under test follows it. A junction
 //! needs no privilege, unlike a symbolic link, so the row is never untestable for want of one.
 //!
-//! A probe makes the junction in its temp directory ([`make`]); the probe that tests the session reads
-//! through it ([`follow`]); `verify` removes it ([`remove`]). The directory holds the junction, the
-//! folder it points at and the file read through it, so removing the directory removes all three.
+//! `verify` names a directory ([`unique_dir`]); a probe makes it, with the junction in it ([`make`]); the
+//! probe that tests the session reads through it ([`follow`]); `verify` removes it ([`remove`]). No probe
+//! tells `verify` a path. The directory holds the junction, the folder it points at and the file read
+//! through it, so removing the directory removes all three.
 
 use std::io;
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::fs::OpenOptionsExt;
 use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Storage::FileSystem::{FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT};
@@ -20,7 +23,7 @@ use windows::Win32::System::IO::DeviceIoControl;
 use windows::Win32::System::Ioctl::FSCTL_SET_REPARSE_POINT;
 use windows::Win32::System::SystemServices::IO_REPARSE_TAG_MOUNT_POINT;
 
-use super::SymlinkState;
+use super::{JUNCTION_SAID, SymlinkState};
 use crate::route::ProbeLink;
 
 /// The junction, and the folder and file it leads to, inside the directory [`make`] returns.
@@ -33,54 +36,68 @@ const FILE_CONTENT: &[u8] = b"parity";
 /// junction that a non-administrator made.
 const UNTRUSTED_MOUNT_POINT: i32 = 448;
 
-/// Make the directory of this process's junction under `parent`, with the folder, the file and the
-/// junction in it, and return the directory. One directory per process: a stale one of the same name is
-/// removed first. A directory half made when a step fails is removed again.
-pub fn make(parent: &Path) -> io::Result<PathBuf> {
-    let dir = parent.join(format!("sb-junction-{}", std::process::id()));
-    remove(&dir)?;
-    make_in(&dir).inspect_err(|_| {
-        let _ = remove(&dir);
-    })?;
-    Ok(dir)
+/// A directory under `parent` for one run's junction, with a name no other run has: the process id, the
+/// time and a count, so neither a process with the same id nor two calls of one meet a name in use.
+pub fn unique_dir(parent: &Path) -> PathBuf {
+    static COUNT: AtomicU64 = AtomicU64::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| since.as_nanos());
+    parent.join(format!(
+        "sb-junction-{}-{nanos:x}-{}",
+        std::process::id(),
+        COUNT.fetch_add(1, Ordering::Relaxed)
+    ))
+}
+
+/// Make `dir`, which must not exist, with the folder, the file and the junction in it. A path that
+/// exists is an error and is left as it is. A directory this made and could not finish is removed again.
+pub fn make(dir: &Path) -> io::Result<()> {
+    std::fs::create_dir(dir)?;
+    make_in(dir).inspect_err(|_| {
+        let _ = remove(dir);
+    })
 }
 
 fn make_in(dir: &Path) -> io::Result<()> {
     let target = dir.join(TARGET_NAME);
-    std::fs::create_dir_all(&target)?;
+    std::fs::create_dir(&target)?;
     std::fs::write(target.join(FILE_NAME), FILE_CONTENT)?;
     let link = dir.join(LINK_NAME);
     std::fs::create_dir(&link)?;
     set_mount_point(&link, &std::path::absolute(&target)?)
 }
 
-/// What a probe does about the junction of the link row ([`ProbeLink`]), with its temp directory as the
-/// place to make one: the outcome of reading through it, and the directory it left for `verify` to give
-/// to the next probe and remove (only for [`ProbeLink::Make`]). A junction that cannot be made is
-/// [`SymlinkState::Failed`], its cause on stderr.
-pub fn run(link: &ProbeLink) -> (SymlinkState, Option<PathBuf>) {
+/// What a probe does about the junction of the link row ([`ProbeLink`]): the outcome of reading through
+/// it. A junction that could not be made was not tested ([`SymlinkState::Skipped`]). Whatever it could
+/// not do is on stderr, each line after [`JUNCTION_SAID`], for `verify` to show.
+pub fn run(link: &ProbeLink) -> SymlinkState {
     run_in(link, &std::env::temp_dir())
 }
 
-fn run_in(link: &ProbeLink, parent: &Path) -> (SymlinkState, Option<PathBuf>) {
+fn run_in(link: &ProbeLink, temp: &Path) -> SymlinkState {
     match link {
-        ProbeLink::Follow(dir) => (follow(Path::new(dir)), None),
-        ProbeLink::Own | ProbeLink::Make => match make(parent) {
-            Err(e) => {
-                eprintln!("ssh-broker: making a junction in {} failed: {e}", parent.display());
-                (SymlinkState::Failed, None)
+        ProbeLink::Follow(dir) => follow(Path::new(dir)),
+        ProbeLink::Make(dir) => made_and_followed(Path::new(dir)).0,
+        ProbeLink::Own => {
+            let dir = unique_dir(temp);
+            let (state, made) = made_and_followed(&dir);
+            if made && let Err(e) = remove(&dir) {
+                eprintln!("{JUNCTION_SAID}removing {} failed: {e}", dir.display());
             }
-            Ok(dir) => {
-                let state = follow(&dir);
-                if *link == ProbeLink::Make {
-                    return (state, Some(dir));
-                }
-                if let Err(e) = remove(&dir) {
-                    eprintln!("ssh-broker: removing {} failed: {e}", dir.display());
-                }
-                (state, None)
-            }
-        },
+            state
+        }
+    }
+}
+
+/// Make the junction in `dir` and read through it, and say whether it was made.
+fn made_and_followed(dir: &Path) -> (SymlinkState, bool) {
+    match make(dir) {
+        Err(e) => {
+            eprintln!("{JUNCTION_SAID}making a junction in {} failed: {e}", dir.display());
+            (SymlinkState::Skipped, false)
+        }
+        Ok(()) => (follow(dir), true),
     }
 }
 
@@ -92,7 +109,7 @@ pub fn follow(dir: &Path) -> SymlinkState {
         && e.raw_os_error() != Some(UNTRUSTED_MOUNT_POINT)
     {
         eprintln!(
-            "ssh-broker: reading through the junction in {} failed: {e}",
+            "{JUNCTION_SAID}reading through the junction in {} failed: {e}",
             dir.display()
         );
     }
@@ -126,8 +143,10 @@ fn set_mount_point(link: &Path, target: &Path) -> io::Result<()> {
         .custom_flags((FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT).0)
         .open(link)?;
     let length = u32::try_from(buffer.len()).map_err(|_| io::Error::other("the junction's target path is too long"))?;
+    // With no `OVERLAPPED` the call needs somewhere to put the byte count, though there is no output.
+    let mut returned = 0u32;
     // SAFETY: `handle` is an open directory, and `buffer` is a whole `REPARSE_DATA_BUFFER` for a mount
-    // point that outlives the call.
+    // point that outlives the call; `returned` is a live `u32`.
     unsafe {
         DeviceIoControl(
             HANDLE(handle.as_raw_handle()),
@@ -136,7 +155,7 @@ fn set_mount_point(link: &Path, target: &Path) -> io::Result<()> {
             length,
             None,
             0,
-            None,
+            Some(&mut returned),
             None,
         )
     }

@@ -107,8 +107,11 @@ fn the_probe_handshake_names_the_junction_work() {
     let base = r#""C:\Program Files\ssh-broker\ssh-broker.exe" verify-probe"#;
 
     assert_eq!(command(&ProbeLink::Own), base);
-    assert_eq!(command(&ProbeLink::Make), format!("{base} --make-junction"));
-    let dir = r"C:\Users\example user\AppData\Local\Temp\sb-junction-9";
+    let dir = r"C:\Users\example user\AppData\Local\Temp\sb-junction-9-1";
+    assert_eq!(
+        command(&ProbeLink::Make(dir.into())),
+        format!(r#"{base} --make-junction "{dir}""#)
+    );
     assert_eq!(
         command(&ProbeLink::Follow(dir.into())),
         format!(r#"{base} --follow "{dir}""#)
