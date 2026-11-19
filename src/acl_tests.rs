@@ -702,7 +702,13 @@ fn ensure_install_dir_reports_a_missing_parent_as_a_creation_error() {
 
     let err = format!("{:#}", ensure_install_dir(&dir).unwrap_err());
 
-    assert!(err.contains("create the install directory"), "{err}");
+    assert!(
+        err.contains(&format!(
+            "create {} with the install directory's permissions (this needs an elevated administrator)",
+            dir.display()
+        )),
+        "{err}"
+    );
     assert!(!parent.0.exists(), "no parent may be created on the way");
 }
 

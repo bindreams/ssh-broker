@@ -8,8 +8,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
 
+use ssh_broker::provision::path_env::Stored;
 use ssh_broker::provision::sshd_config::{ACCEPT_LINE, DROP_IN_DIR_NAME, DROP_IN_NAME, INCLUDE_LINE};
-use ssh_broker::provision::{self, procwait, schtasks, taskscheduler};
+use ssh_broker::provision::{self, procwait, registry, schtasks, taskscheduler};
 
 use crate::desktop;
 
@@ -108,6 +109,9 @@ impl Drop for ResetAtTheEnd {
 /// and sshd's configuration files.
 pub struct Install {
     exported: Option<PathBuf>,
+    /// The system `Path` value as it was, and whether its registry type expands; `None` when it was not a string
+    /// to put back.
+    system_path: Option<(String, bool)>,
 }
 
 impl Install {
@@ -123,8 +127,14 @@ impl Install {
         let exported = reg(&["export", OPENSSH_KEY, &file.to_string_lossy(), "/y"])
             .status
             .success();
+        let system_path = match registry::read_system_path() {
+            Ok(Some(Stored::Sz(value))) => Some((value, false)),
+            Ok(Some(Stored::ExpandSz(value))) => Some((value, true)),
+            _ => None,
+        };
         Install {
             exported: exported.then_some(file),
+            system_path,
         }
     }
 }
@@ -149,6 +159,9 @@ impl Drop for Install {
         }
         if let Some(stock) = STOCK.get() {
             let _ = put_back(stock);
+        }
+        if let Some((value, expand)) = &self.system_path {
+            let _ = registry::write_system_path(value, *expand);
         }
         // `Ok` with a pending delete and `NotFound` from an entry inside a surviving tree both leave the
         // directory; check that it is gone.

@@ -4,15 +4,20 @@
 //! sshd in CI.
 
 use std::ffi::{OsStr, OsString};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
+use std::os::windows::fs::OpenOptionsExt;
+use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
-use windows::Win32::Foundation::FILETIME;
-use windows::Win32::Storage::FileSystem::{MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW};
+use windows::Win32::Foundation::{FILETIME, HANDLE};
+use windows::Win32::Storage::FileSystem::{
+    FILE_BASIC_INFO, FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES, FileBasicInfo, GetFileInformationByHandleEx,
+    MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+};
 use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::System::Services::{
     CloseServiceHandle, OpenSCManagerW, OpenServiceW, QueryServiceStatusEx, SC_HANDLE, SC_MANAGER_CONNECT,
@@ -22,7 +27,7 @@ use windows::Win32::System::Threading::GetProcessTimes;
 use windows::Win32::UI::Shell::{FOLDERID_ProgramData, KF_FLAG_DEFAULT, SHGetKnownFolderPath};
 use windows::core::{PCWSTR, w};
 
-use super::configure::{DropInProblem, SshdHost, config_read, configure};
+use super::configure::{ConfigFile, ConfigFiles, DropInProblem, SshdHost, config_read, configure};
 use super::{DROP_IN_DIR_NAME, DROP_IN_NAME, SshdReading};
 use crate::acl;
 use crate::provision::procwait::Process;
@@ -123,32 +128,45 @@ impl SshdHost for Machine {
         SystemTime::now()
     }
 
-    fn config_written(&mut self) -> anyhow::Result<(PathBuf, SystemTime)> {
-        let written = |path: &Path| -> anyhow::Result<Option<SystemTime>> {
-            match std::fs::metadata(path) {
-                Ok(metadata) => {
-                    Ok(Some(metadata.modified().with_context(|| {
-                        format!("read when {} was last written", path.display())
-                    })?))
+    /// The folder's time is read after its files are listed, so a file that appears meanwhile moves it.
+    fn config_files(&mut self) -> anyhow::Result<ConfigFiles> {
+        let mut files = vec![read_with_change_time(&self.config())?];
+        let dir = self.drop_in_dir();
+        let present = match std::fs::read_dir(&dir) {
+            Ok(entries) => {
+                let mut paths = Vec::new();
+                for entry in entries {
+                    let entry = entry.with_context(|| format!("list {}", dir.display()))?;
+                    if !entry
+                        .file_type()
+                        .with_context(|| format!("look at {}", entry.path().display()))?
+                        .is_dir()
+                    {
+                        paths.push(entry.path());
+                    }
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-                Err(e) => Err(e).with_context(|| format!("look at {}", path.display())),
+                paths.sort();
+                for path in paths {
+                    files.push(read_with_change_time(&path)?);
+                }
+                true
             }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(e) => return Err(e).with_context(|| format!("list {}", dir.display())),
         };
-        let config = self.config();
-        let config_time = written(&config)?.with_context(|| format!("{} is not there", config.display()))?;
-        let drop_in = self.drop_in();
-        Ok(match written(&drop_in)? {
-            Some(drop_in_time) if drop_in_time > config_time => (drop_in, drop_in_time),
-            _ => (config, config_time),
-        })
+        let folder = if present {
+            Some(change_time(&open_directory(&dir)?).with_context(|| format!("read when {} changed", dir.display()))?)
+        } else {
+            None
+        };
+        Ok(ConfigFiles { folder, files })
     }
 
     fn ensure_drop_in_dir(&mut self) -> Result<(), DropInProblem> {
         let dir = self.drop_in_dir();
         // The folder is made as the install directory is, with its descriptor and its judgement: what must hold
         // is that only administrators can write it. One that is there and is not exactly that is left alone.
-        acl::create_install_dir(&dir).map_err(|e| DropInProblem::NotMade(e.root_cause().to_string()))?;
+        acl::create_install_dir(&dir).map_err(|e| DropInProblem::NotMade(format!("{e:#}")))?;
         match acl::install_dir_problem(&dir) {
             Ok(None) => Ok(()),
             Ok(Some(problem)) => Err(DropInProblem::Refused(format!(
@@ -183,10 +201,14 @@ impl SshdHost for Machine {
     fn write_drop_in(&mut self, text: &[u8]) -> anyhow::Result<()> {
         let path = self.drop_in();
         // A drop-in that is there must already be what `apply` makes: it is replaced, never written into.
-        if std::fs::symlink_metadata(&path).is_ok()
-            && let Some(problem) = acl::install_dir_file_problem(&path)?
-        {
-            return Err(untrusted(&path, &problem));
+        match std::fs::symlink_metadata(&path) {
+            Ok(_) => {
+                if let Some(problem) = acl::install_dir_file_problem(&path)? {
+                    return Err(untrusted(&path, &problem));
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e).with_context(|| format!("look at {}", path.display())),
         }
         // The text goes into a new file beside the drop-in, flushed, and the new file replaces the drop-in in
         // one rename: a write that fails leaves the drop-in as it was. The name does not end in `.conf`, so
@@ -232,13 +254,59 @@ impl SshdHost for Machine {
             .with_context(|| format!("rename {} over {}", candidate.display(), config.display()))
     }
 
-    fn discard_candidate(&mut self, candidate: &Path) {
+    fn discard_candidate(&mut self) {
         // A candidate that cannot be removed is overwritten by the next run, and is read by nothing.
-        let _ = std::fs::remove_file(candidate);
+        let _ = std::fs::remove_file(self.ssh_dir.join(CANDIDATE_NAME));
     }
 }
 
 // files =====
+
+/// The file at `path`: its bytes and when it last changed, both read through one handle.
+fn read_with_change_time(path: &Path) -> anyhow::Result<ConfigFile> {
+    let mut file = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let changed = change_time(&file).with_context(|| format!("read when {} changed", path.display()))?;
+    let mut text = Vec::new();
+    file.read_to_end(&mut text)
+        .with_context(|| format!("read {}", path.display()))?;
+    Ok(ConfigFile {
+        path: path.to_owned(),
+        changed,
+        text,
+    })
+}
+
+/// A handle on the folder `path` that can read its times and nothing else.
+fn open_directory(path: &Path) -> anyhow::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES.0)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS.0)
+        .open(path)
+        .with_context(|| format!("open {}", path.display()))
+}
+
+/// When the file or folder `file` is open on last changed: its `ChangeTime`, which a write, a rename and a
+/// copy that keeps the old last-write time all move.
+fn change_time(file: &std::fs::File) -> std::io::Result<SystemTime> {
+    let mut info = FILE_BASIC_INFO::default();
+    // SAFETY: the handle is open for the call and has the right to read attributes; `info` is the size the call
+    // is told.
+    unsafe {
+        GetFileInformationByHandleEx(
+            HANDLE(file.as_raw_handle()),
+            FileBasicInfo,
+            (&raw mut info).cast(),
+            size_of::<FILE_BASIC_INFO>() as u32,
+        )
+    }
+    .map_err(std::io::Error::from)?;
+    let ticks = info.ChangeTime as u64;
+    system_time(FILETIME {
+        dwLowDateTime: ticks as u32,
+        dwHighDateTime: (ticks >> 32) as u32,
+    })
+    .map_err(std::io::Error::other)
+}
 
 /// The file `path` holds `text`, and the text is on disk when this returns. A file that is there is truncated
 /// and keeps its security descriptor.
@@ -383,7 +451,7 @@ pub fn configure_this_machine(say: &mut dyn FnMut(&str)) -> bool {
 }
 
 /// What the `verify` row is given about sshd on this machine: `sshd -T` (which needs the rights to read sshd's
-/// host keys) and whether sshd started before a file of its configuration was written, or that the service runs
+/// host keys) and whether sshd started before a file of its configuration changed, or that the service runs
 /// with arguments. An error says which question could not be answered.
 pub fn sshd_reading_this_machine() -> anyhow::Result<SshdReading> {
     let mut machine = Machine::find().context("cannot find sshd")?;

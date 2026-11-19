@@ -250,7 +250,12 @@ mod imp {
     /// `apply` goes on (the install is complete without it).
     fn add_install_dir_to_path() {
         let dir = super::BASE_DIR;
-        match path_env::plan(&registry::read_system_path(), dir) {
+        let expanded_length = |text: &str| {
+            registry::expand_environment(text)
+                .map(|expanded| expanded.encode_utf16().count())
+                .map_err(|e| format!("{e:#}"))
+        };
+        match path_env::plan(&registry::read_system_path(), dir, expanded_length) {
             path_env::PathPlan::Present => {}
             path_env::PathPlan::Refuse(why) => {
                 eprintln!("apply: {dir} was not added to the system PATH: {why}");
@@ -494,7 +499,7 @@ mod imp {
         // reads sshd's host keys, so the row is judged only by an elevated `verify` (see
         // `sshd_config::accepts_row`).
         rows.push(sshd_config::accepts_row(
-            crate::account::integrity().unwrap_or(crate::socket_loc::Integrity::Medium),
+            crate::account::integrity(),
             sshd_config::machine::sshd_reading_this_machine,
         ));
 

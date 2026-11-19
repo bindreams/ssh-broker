@@ -3,16 +3,22 @@
 //!
 //! The flow is held apart from the machine ([`SshdHost`]) because `sshd -t` and the service cannot run on a
 //! workstation: tests stand in for it, and `tests/sshd_config_windows.rs` measures the real one in CI. The
-//! step never fails `apply`: the variable is a convenience, and `ssh-broker elevate` works without it. It
-//! never restarts sshd, so a machine reached only over SSH keeps its sshd, and the original `sshd_config` is
-//! untouched until a candidate has passed sshd's own checks and then replaced in one rename.
+//! step never fails `apply`: the variable is a convenience, and `ssh-broker elevate` works without it. The one
+//! judgement for a change made in this run and one made earlier ([`config_read`]); sshd is never restarted
+//! here, so a machine reached only over SSH keeps its sshd. The original `sshd_config` is untouched until a
+//! candidate has passed sshd's own checks and then replaced in one rename. The original is read once and
+//! replaced whole: an edit another program makes to it while `apply` runs is lost. That is a contract
+//! (README), not guarded: no lock other editors honour exists, and one that let the rename through would let
+//! theirs through too.
 
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use anyhow::Context;
 
-use super::{ACCEPT_LINE, DROP_IN_DIR_NAME, INCLUDE_LINE, VARIABLE, drop_in_text, in_force, with_line};
+use super::{
+    ACCEPT_LINE, DROP_IN_DIR_NAME, INCLUDE_LINE, VARIABLE, drop_in_text, in_force, include_elsewhere, with_line,
+};
 
 /// Why the drop-in folder or the drop-in cannot be used.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,8 +45,9 @@ pub trait SshdHost {
     fn service_started(&mut self) -> anyhow::Result<Option<SystemTime>>;
     /// This machine's clock.
     fn now(&self) -> SystemTime;
-    /// The later last-write time of `sshd_config` and of the drop-in (when there is one), and the file it is of.
-    fn config_written(&mut self) -> anyhow::Result<(PathBuf, SystemTime)>;
+    /// `sshd_config` and every file directly in `sshd_config.d`, whatever its extension, each with when it last
+    /// changed and its bytes, and the folder's own change time.
+    fn config_files(&mut self) -> anyhow::Result<ConfigFiles>;
     /// Make `sshd_config.d` as the install directory is made, or accept it if it is. A folder that cannot be
     /// made is [`DropInProblem::NotMade`]; a file or a link where the folder belongs, or other permissions, is
     /// [`DropInProblem::Refused`]. Nothing that is there is changed.
@@ -57,54 +64,92 @@ pub trait SshdHost {
     fn copy_security(&mut self, candidate: &Path) -> anyhow::Result<()>;
     /// Replace `sshd_config` with `candidate`, in one rename that is on disk when it returns.
     fn replace_config(&mut self, candidate: &Path) -> anyhow::Result<()>;
-    /// Remove `candidate`, if it is there.
-    fn discard_candidate(&mut self, candidate: &Path);
+    /// Remove the candidate, if it is there: whole, or whatever a write that failed left of it.
+    fn discard_candidate(&mut self);
+}
+
+/// The files sshd reads from its configuration folder, as [`SshdHost::config_files`] gives them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigFiles {
+    /// When `sshd_config.d` itself last changed; `None` when there is no such folder.
+    pub folder: Option<SystemTime>,
+    /// `sshd_config` first, then every file directly in the folder.
+    pub files: Vec<ConfigFile>,
+}
+
+/// One file of sshd's configuration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigFile {
+    pub path: PathBuf,
+    /// When the file last changed: a write, a rename and a copy all move it.
+    pub changed: SystemTime,
+    pub text: Vec<u8>,
 }
 
 /// Whether the running sshd has read the files of its configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConfigRead {
-    /// It started after the files were last written.
+    /// It started after the files last changed.
     Read,
     /// It is not running: it reads what is there when it starts.
     NotRunning,
-    /// The file was last written when sshd started or after: sshd reads its configuration only when it starts,
-    /// so it may not have been read. A tie counts: the cost is one restart that was not needed.
+    /// The file (or the folder) last changed when sshd started or after: sshd reads its configuration only when
+    /// it starts, so it may not have been read. A tie counts: the cost is one restart that was not needed.
     Unread(PathBuf),
-    /// The file's last-write time is ahead of the clock, so it cannot be compared with when sshd started.
-    Unknowable(PathBuf),
+    /// The file's (or the folder's) change time is ahead of the clock, so it cannot be compared with when sshd
+    /// started.
+    AheadOfClock(PathBuf),
+    /// A file has an `Include` of another location, which is not judged: whether sshd has read what it
+    /// includes cannot be told.
+    IncludesOther { file: PathBuf, line: String },
 }
 
-/// Whether the running sshd has read its configuration, judged on the later last-write time of its files and
-/// when the service started. `Err` when a time cannot be read, with the cause.
+/// Whether the running sshd has read its configuration, judged on when `sshd_config`, `sshd_config.d` and every
+/// file in it last changed and on when the service started. `Err` when a time cannot be read, with the cause.
 pub fn config_read(host: &mut dyn SshdHost) -> anyhow::Result<ConfigRead> {
     let Some(started) = host.service_started().context("read when the sshd service started")? else {
         return Ok(ConfigRead::NotRunning);
     };
-    let (file, written) = host
-        .config_written()
-        .context("read when sshd's configuration was last written")?;
-    Ok(if written > host.now() {
-        ConfigRead::Unknowable(file)
-    } else if started <= written {
-        ConfigRead::Unread(file)
-    } else {
-        ConfigRead::Read
-    })
+    let judged = host
+        .config_files()
+        .context("read when sshd's configuration last changed")?;
+    // The file that changed last; a tie goes to a file before the folder, and to the earlier of two files.
+    let mut latest: Option<(PathBuf, SystemTime)> = None;
+    let folder = judged
+        .folder
+        .map(|changed| (host.config_path().with_file_name(DROP_IN_DIR_NAME), changed));
+    let candidates = judged.files.iter().map(|file| (file.path.clone(), file.changed));
+    for (path, changed) in candidates.chain(folder) {
+        if latest.as_ref().is_none_or(|(_, time)| changed > *time) {
+            latest = Some((path, changed));
+        }
+    }
+    if let Some((path, changed)) = latest {
+        if changed > host.now() {
+            return Ok(ConfigRead::AheadOfClock(path));
+        }
+        if started <= changed {
+            return Ok(ConfigRead::Unread(path));
+        }
+    }
+    for file in &judged.files {
+        if let Some(line) = include_elsewhere(&file.text) {
+            return Ok(ConfigRead::IncludesOther {
+                file: file.path.clone(),
+                line,
+            });
+        }
+    }
+    Ok(ConfigRead::Read)
 }
 
-/// Make sshd accept the variable, and say what was done on `say` (a line each). Never restarts sshd. Returns
-/// whether the running sshd takes the variable, or reads it when it next starts (it is not running); false
-/// when it does not, because it has not read the files yet or the variable could not be put in force, and
-/// when that cannot be told.
+/// Make sshd accept the variable, and say what was done on `say` (a line each). Returns whether the running
+/// sshd takes the variable, or reads it when it next starts (it is not running); false when it does not,
+/// because it has not read the files yet or the variable could not be put in force, and when that cannot be
+/// told.
 ///
-/// The order: (0) a service started with arguments is not touched. (1) A question to sshd; a failure says so
-/// and writes nothing. (2) A variable in force already ([`in_force`]) writes nothing. (3) Otherwise the
-/// drop-in (written if it differs) and a second question: when no `Include` reads it, the `Include` line goes
-/// into a candidate that must pass sshd's checks before it replaces the original; when the folder or the
-/// drop-in cannot be used, the `AcceptEnv` line goes there instead. (4) With the variable in force, one
-/// judgement, the same for a change made in this run and for one made earlier: [`config_read`] says whether
-/// sshd has read the files, and when it has not, what to do is said.
+/// A failed question to sshd writes nothing, and a candidate for `sshd_config` must pass sshd's checks before
+/// it replaces the original.
 pub fn configure(host: &mut dyn SshdHost, say: &mut dyn FnMut(&str)) -> bool {
     if let Some(arguments) = host.service_arguments() {
         say(&format!(
@@ -201,8 +246,7 @@ fn write_drop_in(host: &mut dyn SshdHost) -> Result<(), DropInProblem> {
 }
 
 /// The variable is in force in what sshd would read: say whether the running sshd has read it, and return
-/// whether it takes it (or will, when it starts). The one judgement for a change made in this run and one made
-/// earlier; sshd is never restarted here.
+/// whether it takes it (or will, when it starts).
 fn say_whether_read(host: &mut dyn SshdHost, say: &mut dyn FnMut(&str)) -> bool {
     match config_read(host) {
         Ok(ConfigRead::Read) => true,
@@ -212,16 +256,24 @@ fn say_whether_read(host: &mut dyn SshdHost, say: &mut dyn FnMut(&str)) -> bool 
         }
         Ok(ConfigRead::Unread(file)) => {
             say(&format!(
-                "apply: sshd was started before {} was last written, so it has not read it; restart the sshd \
+                "apply: sshd was started before {} was last changed, so it has not read it; restart the sshd \
                  service for it to accept {VARIABLE} (`ssh-broker verify` says whether it has)",
                 file.display()
             ));
             false
         }
-        Ok(ConfigRead::Unknowable(file)) => {
+        Ok(ConfigRead::AheadOfClock(file)) => {
             say(&format!(
-                "apply: {}'s last-write time is ahead of this machine's clock, so it cannot be told whether sshd \
+                "apply: {}'s change time is ahead of this machine's clock, so it cannot be told whether sshd \
                  has read it; restart the sshd service for it to accept {VARIABLE}",
+                file.display()
+            ));
+            false
+        }
+        Ok(ConfigRead::IncludesOther { file, line }) => {
+            say(&format!(
+                "apply: {} has `{line}`; files sshd includes from elsewhere are not judged, so it cannot be told \
+                 whether sshd has read its configuration; restart the sshd service to be sure it accepts {VARIABLE}",
                 file.display()
             ));
             false
@@ -243,9 +295,13 @@ fn say_whether_read(host: &mut dyn SshdHost, say: &mut dyn FnMut(&str)) -> bool 
 fn add_line(host: &mut dyn SshdHost, line: &str) -> Result<(), String> {
     let original = host.read_config().map_err(|e| format!("cannot read it: {e:#}"))?;
     let edited = with_line(&original, line).map_err(|cannot| format!("it cannot be edited safely: {cannot}"))?;
-    let candidate = host
-        .write_candidate(&edited)
-        .map_err(|e| format!("cannot write a candidate beside it: {e:#}"))?;
+    let candidate = match host.write_candidate(&edited) {
+        Ok(candidate) => candidate,
+        Err(e) => {
+            host.discard_candidate();
+            return Err(format!("cannot write a candidate beside it: {e:#}"));
+        }
+    };
     let installed = (|| {
         host.sshd_check(&candidate)
             .map_err(|said| format!("sshd rejects the edited copy: {said}"))?;
@@ -263,7 +319,7 @@ fn add_line(host: &mut dyn SshdHost, line: &str) -> Result<(), String> {
             .map_err(|e| format!("cannot replace it with the edited copy: {e:#}"))
     })();
     if installed.is_err() {
-        host.discard_candidate(&candidate);
+        host.discard_candidate();
     }
     installed
 }

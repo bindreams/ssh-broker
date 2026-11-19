@@ -6,7 +6,7 @@
 //! part: the text edit, the reader of `sshd -T`, and the `verify` row. [`configure`] is the flow over a
 //! [`configure::SshdHost`], which tests stand in for; the Windows implementation is `machine::Machine`.
 //!
-//! What it rests on (spike 4, measured): sshd hands an accepted variable to the DefaultShell and drops
+//! What it rests on: sshd hands an accepted variable to the DefaultShell and drops
 //! another silently; an `Include` is read only above the first `Match` for every account; plain `sshd -T`
 //! prints `acceptenv` when the variable is in effect and `sshd -T -C user=` fails for a local account on
 //! Windows, so the effective configuration is asked globally; a server's own `SetEnv` beats the client's
@@ -97,7 +97,9 @@ pub fn with_line(text: &[u8], line: &str) -> Result<Vec<u8>, Cannot> {
         body.split_inclusive('\n').find_map(|line| {
             let here = offset;
             offset += line.len();
-            is_match_line(line).then_some(here)
+            keyword(line)
+                .is_some_and(|(word, _)| word.eq_ignore_ascii_case("match"))
+                .then_some(here)
         })
     };
     let mut out = Vec::with_capacity(text.len() + line.len() + 2);
@@ -120,12 +122,32 @@ pub fn with_line(text: &[u8], line: &str) -> Result<Vec<u8>, Cannot> {
     Ok(out)
 }
 
-/// Whether the first token of `line` is the keyword `Match`.
-fn is_match_line(line: &str) -> bool {
-    line.trim_start_matches([' ', '\t'])
-        .split(char::is_whitespace)
-        .next()
-        .is_some_and(|token| token.eq_ignore_ascii_case("match"))
+/// The keyword of a line of `sshd_config` and the rest of it, as sshd tokenises: it skips leading spaces, tabs,
+/// CRs and form feeds, ends the keyword at white space or an `=`, and skips the white space and one `=` that
+/// follow. The rest has no trailing white space. `None` for a line with no keyword (blank, or a comment: its
+/// first token begins with `#`).
+fn keyword(line: &str) -> Option<(&str, &str)> {
+    let line = line.trim_start_matches([' ', '\t', '\r', '\x0c']);
+    let end = line.find(|c: char| c.is_whitespace() || c == '=').unwrap_or(line.len());
+    let (word, rest) = line.split_at(end);
+    if word.is_empty() || word.starts_with('#') {
+        return None;
+    }
+    let rest = rest.trim_start();
+    let rest = rest.strip_prefix('=').unwrap_or(rest).trim();
+    Some((word, rest))
+}
+
+/// The first `Include` line of `text` (trimmed) that does not name exactly [`INCLUDE_LINE`]'s argument, and so
+/// brings in files from another location. The text is decoded lossily: an argument that does not survive it
+/// is another one. Nothing an `Include` brings in is read.
+pub fn include_elsewhere(text: &[u8]) -> Option<String> {
+    let ours = INCLUDE_LINE.split_once(' ').map(|(_, argument)| argument)?;
+    let text = String::from_utf8_lossy(text);
+    text.trim_start_matches('\u{feff}').split('\n').find_map(|line| {
+        let (word, rest) = keyword(line)?;
+        (word.eq_ignore_ascii_case("include") && rest != ours).then(|| line.trim().to_owned())
+    })
 }
 
 /// The words after `keyword` on the lines of `sshd -T` output that begin with it (the keyword compared
@@ -210,11 +232,28 @@ pub enum SshdReading {
 /// The `verify` row for sshd's configuration. `sshd -T` reads sshd's host keys, which only administrators and
 /// SYSTEM can read, so the row is judged only at [`Integrity::High`] and `reading` is asked only there; below
 /// it the row is informational and passes. At High it passes when the variable is in force ([`in_force`]) and
-/// sshd has read what was written; it fails when sshd started before a file was written (or at that moment),
-/// when the variable is not in force, and, with the cause, when `reading` fails. A file whose time is ahead of
-/// the clock cannot be judged: the row passes and says so. A service that runs with arguments is not checked:
-/// the row passes and says so.
-pub fn accepts_row(integrity: Integrity, reading: impl FnOnce() -> anyhow::Result<SshdReading>) -> Check {
+/// sshd has read what was changed; it fails when sshd started before a file of its configuration changed (or
+/// at that moment), when the variable is not in force, and, with the cause, when `reading` fails or when the
+/// integrity level `integrity` could not be read. A file whose time is ahead of the clock, or an `Include` of
+/// another location, cannot be judged: the row passes and says so. A service that runs with arguments is not
+/// checked: the row passes and says so.
+pub fn accepts_row(
+    integrity: anyhow::Result<Integrity>,
+    reading: impl FnOnce() -> anyhow::Result<SshdReading>,
+) -> Check {
+    let integrity = match integrity {
+        Ok(integrity) => integrity,
+        Err(e) => {
+            return Check::new(
+                ROW_NAME,
+                false,
+                format!(
+                    "cannot read this process's integrity level, so whether sshd accepts {VARIABLE} is not \
+                     known: {e:#}"
+                ),
+            );
+        }
+    };
     if integrity != Integrity::High {
         return Check::new(
             ROW_NAME,
@@ -256,16 +295,25 @@ pub fn accepts_row(integrity: Integrity, reading: impl FnOnce() -> anyhow::Resul
             ROW_NAME,
             false,
             format!(
-                "sshd was started before {} was last written and has not read it; restart the sshd service",
+                "sshd was started before {} was last changed and has not read it; restart the sshd service",
                 file.display()
             ),
         ),
-        ConfigRead::Unknowable(file) => Check::new(
+        ConfigRead::AheadOfClock(file) => Check::new(
             ROW_NAME,
             true,
             format!(
-                "{in_force_as}; {}'s last-write time is ahead of the clock, so whether the running sshd has read \
-                 it cannot be told (restart the sshd service to be sure)",
+                "{in_force_as}; {}'s change time is ahead of the clock, so whether the running sshd has read it \
+                 cannot be told (restart the sshd service to be sure)",
+                file.display()
+            ),
+        ),
+        ConfigRead::IncludesOther { file, line } => Check::new(
+            ROW_NAME,
+            true,
+            format!(
+                "{in_force_as}; {} has `{line}`, so whether the running sshd has read its configuration cannot be \
+                 told (restart the sshd service to be sure)",
                 file.display()
             ),
         ),

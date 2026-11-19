@@ -1032,7 +1032,7 @@ pub fn create_install_dir(dir: &Path) -> anyhow::Result<()> {
             Ok(()) => Ok(()),
             Err(e) if e.code() == HRESULT::from_win32(ERROR_ALREADY_EXISTS.0) => Ok(()),
             Err(e) => Err(anyhow::Error::new(e).context(format!(
-                "create the install directory {} (this needs an elevated administrator)",
+                "create {} with the install directory's permissions (this needs an elevated administrator)",
                 dir.display()
             ))),
         }

@@ -45,6 +45,10 @@ struct Fake {
     service_started_at: Option<u64>,
     config_time: u64,
     drop_in_time: Option<u64>,
+    /// When `sshd_config.d` itself last changed; `None` when there is no such folder.
+    folder_time: Option<u64>,
+    /// The other files in `sshd_config.d`: name, change time, text.
+    other_files: Vec<(&'static str, u64, Vec<u8>)>,
 }
 
 impl Fake {
@@ -70,6 +74,7 @@ impl Fake {
         let mut host = Fake::with_config(&format!("Port 22\r\n{INCLUDE_LINE}\r\nMatch All\r\n"));
         host.drop_in = Some(drop_in_text().into_bytes());
         host.drop_in_time = Some(1);
+        host.folder_time = Some(1);
         host
     }
 
@@ -164,12 +169,31 @@ impl SshdHost for Fake {
         at(self.clock)
     }
 
-    fn config_written(&mut self) -> anyhow::Result<(PathBuf, SystemTime)> {
-        self.call("config_written");
-        self.fails("config_written")?;
-        Ok(match self.drop_in_time {
-            Some(drop_in) if drop_in > self.config_time => (Fake::folder().join(DROP_IN_NAME), at(drop_in)),
-            _ => (PathBuf::from("sshd_config"), at(self.config_time)),
+    fn config_files(&mut self) -> anyhow::Result<ConfigFiles> {
+        self.call("config_files");
+        self.fails("config_files")?;
+        let mut files = vec![ConfigFile {
+            path: PathBuf::from("sshd_config"),
+            changed: at(self.config_time),
+            text: self.config.clone(),
+        }];
+        if let Some(text) = &self.drop_in {
+            files.push(ConfigFile {
+                path: Fake::folder().join(DROP_IN_NAME),
+                changed: at(self.drop_in_time.expect("a drop-in has a time")),
+                text: text.clone(),
+            });
+        }
+        for (name, time, text) in &self.other_files {
+            files.push(ConfigFile {
+                path: Fake::folder().join(name),
+                changed: at(*time),
+                text: text.clone(),
+            });
+        }
+        Ok(ConfigFiles {
+            folder: self.folder_time.map(at),
+            files,
         })
     }
 
@@ -198,7 +222,9 @@ impl SshdHost for Fake {
         self.event("write drop-in");
         self.drop_in_writes += 1;
         self.drop_in = Some(text.to_vec());
-        self.drop_in_time = Some(self.tick());
+        let time = self.tick();
+        self.drop_in_time = Some(time);
+        self.folder_time = Some(time);
         Ok(())
     }
 
@@ -210,6 +236,10 @@ impl SshdHost for Fake {
 
     fn write_candidate(&mut self, text: &[u8]) -> anyhow::Result<PathBuf> {
         self.call("write_candidate");
+        // A write that fails has made the file and put part of the text into it.
+        if self.fail == Some("write_candidate") {
+            self.candidate = Some(text[..text.len() / 2].to_vec());
+        }
         self.fails("write_candidate")?;
         self.event("write candidate");
         self.candidate = Some(text.to_vec());
@@ -233,7 +263,7 @@ impl SshdHost for Fake {
         Ok(())
     }
 
-    fn discard_candidate(&mut self, _candidate: &Path) {
+    fn discard_candidate(&mut self) {
         self.call("discard_candidate");
         self.event("discard candidate");
         self.candidate = None;
@@ -265,7 +295,7 @@ fn advice() -> String {
 /// What `apply` says of a variable in force that the running sshd was started too early to have read.
 fn unread(file: &str) -> String {
     format!(
-        "apply: sshd was started before {file} was last written, so it has not read it; restart the sshd service \
+        "apply: sshd was started before {file} was last changed, so it has not read it; restart the sshd service \
          for it to accept SSH_BROKER_ELEVATION (`ssh-broker verify` says whether it has)"
     )
 }
@@ -280,8 +310,7 @@ fn said_advice(said: &[String]) -> bool {
     said.contains(&advice())
 }
 
-/// What `apply` says when it cannot ask sshd for its configuration: the next `apply` stops at the same place,
-/// so the advice is to add the line by hand.
+/// What `apply` says when it cannot ask sshd for its configuration.
 fn ask_failed(cause: &str, left: &str) -> String {
     format!(
         "apply: could not ask sshd for its configuration ({cause}), so {left}. To have sshd accept \
@@ -423,7 +452,7 @@ fn a_file_written_in_the_tick_sshd_started_in_is_judged_unread() {
 fn a_file_whose_time_is_ahead_of_the_clock_cannot_be_judged_and_is_said_so_each_time() {
     let mut host = Fake::configured();
     host.config_time = host.clock + 1000;
-    let sentence = "apply: sshd_config's last-write time is ahead of this machine's clock, so it cannot be told \
+    let sentence = "apply: sshd_config's change time is ahead of this machine's clock, so it cannot be told \
                     whether sshd has read it; restart the sshd service for it to accept SSH_BROKER_ELEVATION";
     for _ in 0..2 {
         let (accepted, said) = run(&mut host);
@@ -431,11 +460,25 @@ fn a_file_whose_time_is_ahead_of_the_clock_cannot_be_judged_and_is_said_so_each_
         assert_eq!(said, [sentence]);
     }
     assert!(host.events.is_empty(), "{:?}", host.events);
+
+    // The folder's own time is judged too, and named as the folder.
+    let mut host = Fake::configured();
+    host.folder_time = Some(host.clock + 1000);
+    let (accepted, said) = run(&mut host);
+    assert!(!accepted, "{said:?}");
+    assert_eq!(
+        said,
+        [format!(
+            "apply: {}'s change time is ahead of this machine's clock, so it cannot be told whether sshd has \
+             read it; restart the sshd service for it to accept SSH_BROKER_ELEVATION",
+            Fake::folder().display()
+        )]
+    );
 }
 
 #[test]
 fn a_time_that_cannot_be_read_says_so() {
-    for method in ["service_started", "config_written"] {
+    for method in ["service_started", "config_files"] {
         let mut host = Fake::configured();
         host.config_time = 20;
         host.fail = Some(method);
@@ -451,6 +494,117 @@ fn a_time_that_cannot_be_read_says_so() {
             "{method}: {said:?}"
         );
     }
+}
+
+// every file sshd reads =====
+
+/// What `apply` says of an `Include` of another location in `file`.
+fn includes_other(file: &str, line: &str) -> String {
+    format!(
+        "apply: {file} has `{line}`; files sshd includes from elsewhere are not judged, so it cannot be told \
+         whether sshd has read its configuration; restart the sshd service to be sure it accepts \
+         SSH_BROKER_ELEVATION"
+    )
+}
+
+/// `sshd_config` with the drop-in's `Include` and then one of another location.
+fn config_with_other_include() -> String {
+    format!("Port 22\r\n{INCLUDE_LINE}\r\nInclude D:\\x\\*.conf\r\nMatch All\r\n")
+}
+
+#[test]
+fn an_include_of_another_location_cannot_be_told() {
+    // In sshd_config.
+    let mut host = Fake::with_config(&config_with_other_include());
+    host.drop_in = Some(drop_in_text().into_bytes());
+    host.drop_in_time = Some(1);
+    host.folder_time = Some(1);
+    let (accepted, said) = run(&mut host);
+    assert!(!accepted, "{said:?}");
+    assert_eq!(said, [includes_other("sshd_config", r"Include D:\x\*.conf")]);
+    assert!(host.events.is_empty(), "{:?}", host.events);
+
+    // In another file of the folder.
+    let mut host = Fake::configured();
+    host.other_files = vec![("20-other.conf", 1, b"Include D:\\y\\*.conf\r\n".to_vec())];
+    let (accepted, said) = run(&mut host);
+    assert!(!accepted, "{said:?}");
+    assert_eq!(
+        said,
+        [includes_other(
+            &Fake::folder().join("20-other.conf").display().to_string(),
+            r"Include D:\y\*.conf"
+        )]
+    );
+
+    // A file that is not named `*.conf` is judged all the same.
+    let mut host = Fake::configured();
+    host.other_files = vec![("old.conf.bak", 1, b"Include D:\\z\r\n".to_vec())];
+    let (_, said) = run(&mut host);
+    assert_eq!(
+        said,
+        [includes_other(
+            &Fake::folder().join("old.conf.bak").display().to_string(),
+            r"Include D:\z"
+        )]
+    );
+
+    // Not running: nothing to be told.
+    let mut host = Fake::with_config(&config_with_other_include()).stopped();
+    host.drop_in = Some(drop_in_text().into_bytes());
+    host.drop_in_time = Some(1);
+    host.folder_time = Some(1);
+    let (accepted, said) = run(&mut host);
+    assert!(accepted, "{said:?}");
+    assert_eq!(said, [NOT_RUNNING]);
+}
+
+#[test]
+fn a_file_written_after_sshd_started_is_unread_even_beside_an_include_of_another_location() {
+    let mut host = Fake::with_config(&config_with_other_include());
+    host.drop_in = Some(drop_in_text().into_bytes());
+    host.drop_in_time = Some(20);
+    host.folder_time = Some(1);
+    let (accepted, said) = run(&mut host);
+    assert!(!accepted, "{said:?}");
+    assert_eq!(said, [unread(&drop_in_file())]);
+}
+
+#[test]
+fn a_file_or_folder_that_changed_after_sshd_started_is_unread_and_named() {
+    // Another file of the folder, written after sshd started.
+    let mut host = Fake::configured();
+    host.other_files = vec![("20-other.conf", 20, b"Port 22\r\n".to_vec())];
+    let (accepted, said) = run(&mut host);
+    assert!(!accepted, "{said:?}");
+    assert_eq!(
+        said,
+        [unread(&Fake::folder().join("20-other.conf").display().to_string())]
+    );
+
+    // The folder alone changed (an entry went): the folder is named.
+    let mut host = Fake::configured();
+    host.folder_time = Some(20);
+    let (accepted, said) = run(&mut host);
+    assert!(!accepted, "{said:?}");
+    assert_eq!(said, [unread(&Fake::folder().display().to_string())]);
+
+    // A tie of a file and the folder names the file.
+    let mut host = Fake::configured();
+    host.folder_time = Some(20);
+    host.other_files = vec![("20-other.conf", 20, b"Port 22\r\n".to_vec())];
+    let (_, said) = run(&mut host);
+    assert_eq!(
+        said,
+        [unread(&Fake::folder().join("20-other.conf").display().to_string())]
+    );
+
+    // No folder: sshd_config alone is judged.
+    let mut host = Fake::with_config(&format!("Port 22\r\n{ACCEPT_LINE}\r\n"));
+    host.config_time = 20;
+    let (accepted, said) = run(&mut host);
+    assert!(!accepted, "{said:?}");
+    assert_eq!(said, [unread("sshd_config")]);
 }
 
 // the include =====
@@ -559,6 +713,61 @@ fn a_question_to_sshd_that_fails_after_the_drop_in_was_written_changes_nothing_m
     assert_eq!(host.events, ["write drop-in"]);
     assert_eq!(host.config, STOCK.as_bytes());
     assert_eq!(said, [ask_failed("sshd_t failed", "sshd_config was left as it is")]);
+}
+
+#[test]
+fn a_question_to_sshd_about_the_candidate_that_fails_leaves_the_original_and_removes_the_candidate() {
+    let mut host = Fake::with_config(STOCK);
+    host.sshd_t_fails_from = Some(2);
+    let (accepted, said) = run(&mut host);
+    assert!(!accepted);
+    assert_eq!(host.config, STOCK.as_bytes());
+    assert_eq!(host.config_replacements, 0);
+    assert!(host.candidate.is_none(), "{:?}", host.events);
+    assert!(
+        host.events.contains(&"discard candidate".to_owned()),
+        "{:?}",
+        host.events
+    );
+    assert!(
+        said.contains(
+            &"apply: sshd_config was not changed: cannot ask sshd about the edited copy: sshd_t failed".to_owned()
+        ),
+        "{said:?}"
+    );
+    assert!(said_advice(&said), "{said:?}");
+}
+
+#[test]
+fn a_candidate_that_fails_to_write_is_removed() {
+    let mut host = Fake::with_config(STOCK);
+    host.fail = Some("write_candidate");
+    let (accepted, said) = run(&mut host);
+    assert!(!accepted);
+    assert_eq!(host.config, STOCK.as_bytes());
+    assert!(host.candidate.is_none(), "the partial file is gone: {:?}", host.events);
+    assert!(
+        host.events.contains(&"discard candidate".to_owned()),
+        "{:?}",
+        host.events
+    );
+    assert!(
+        said.iter()
+            .any(|line| line.contains("cannot write a candidate beside it")),
+        "{said:?}"
+    );
+}
+
+#[test]
+fn a_drop_in_with_other_text_is_rewritten_once_to_the_exact_text() {
+    let mut host = Fake::configured();
+    host.drop_in = Some(b"AcceptEnv SOMETHING_ELSE\r\n".to_vec());
+    let (accepted, said) = run(&mut host);
+    assert!(!accepted, "{said:?}");
+    assert_eq!(host.drop_in_writes, 1);
+    assert_eq!(host.drop_in.as_deref(), Some(drop_in_text().as_bytes()));
+    assert_eq!(host.events, ["write drop-in"]);
+    assert_eq!(said, [unread(&drop_in_file())]);
 }
 
 // a folder that cannot be used =====

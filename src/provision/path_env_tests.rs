@@ -49,11 +49,16 @@ fn a_variable_in_the_value_is_left_as_written_and_not_expanded() {
     );
 }
 
+/// An expansion that changes nothing: the length of the text itself.
+fn unexpanded(text: &str) -> Result<usize, String> {
+    Ok(text.encode_utf16().count())
+}
+
 #[test]
 fn the_plan_keeps_the_stored_type_and_changes_nothing_it_cannot_judge() {
     let sz: Reading = Ok(Some(Stored::Sz(r"C:\Windows".into())));
     assert_eq!(
-        plan(&sz, DIR),
+        plan(&sz, DIR, unexpanded),
         PathPlan::Write {
             value: format!(r"C:\Windows;{DIR}"),
             expand: false
@@ -61,14 +66,18 @@ fn the_plan_keeps_the_stored_type_and_changes_nothing_it_cannot_judge() {
     );
     let expand: Reading = Ok(Some(Stored::ExpandSz(r"%SystemRoot%".into())));
     assert_eq!(
-        plan(&expand, DIR),
+        plan(&expand, DIR, unexpanded),
         PathPlan::Write {
             value: format!(r"%SystemRoot%;{DIR}"),
             expand: true
         }
     );
     assert_eq!(
-        plan(&Ok(Some(Stored::ExpandSz(format!("{DIR};%SystemRoot%")))), DIR),
+        plan(
+            &Ok(Some(Stored::ExpandSz(format!("{DIR};%SystemRoot%")))),
+            DIR,
+            unexpanded
+        ),
         PathPlan::Present
     );
     for (reading, said) in [
@@ -76,7 +85,7 @@ fn the_plan_keeps_the_stored_type_and_changes_nothing_it_cannot_judge() {
         (Ok(None), "no Path value"),
         (Err("access is denied".to_owned()), "access is denied"),
     ] {
-        match plan(&reading, DIR) {
+        match plan(&reading, DIR, unexpanded) {
             PathPlan::Refuse(why) => assert!(why.contains(said), "{why}"),
             other => panic!("{other:?}"),
         }
@@ -86,13 +95,52 @@ fn the_plan_keeps_the_stored_type_and_changes_nothing_it_cannot_judge() {
 #[test]
 fn the_plan_refuses_a_value_the_environment_cannot_hold() {
     let long = format!("C:\\{}", "a".repeat(32767 - 3 - DIR.len()));
-    match plan(&Ok(Some(Stored::Sz(long))), DIR) {
+    match plan(&Ok(Some(Stored::Sz(long))), DIR, unexpanded) {
         PathPlan::Refuse(why) => assert!(why.contains("32767"), "{why}"),
         other => panic!("{other:?}"),
     }
     // One character shorter fits.
     let fits = format!("C:\\{}", "a".repeat(32767 - 4 - DIR.len()));
-    assert!(matches!(plan(&Ok(Some(Stored::Sz(fits))), DIR), PathPlan::Write { .. }));
+    assert!(matches!(
+        plan(&Ok(Some(Stored::Sz(fits))), DIR, unexpanded),
+        PathPlan::Write { .. }
+    ));
+}
+
+#[test]
+fn an_expanding_value_is_measured_after_expansion_and_a_plain_one_as_stored() {
+    let stored = Ok(Some(Stored::ExpandSz(r"%SystemRoot%;%LONG%".into())));
+    // Short as stored, too long once `%LONG%` is expanded: the length is the expansion's.
+    let measured = std::cell::RefCell::new(Vec::new());
+    let plan_of = plan(&stored, DIR, |text| {
+        measured.borrow_mut().push(text.to_owned());
+        Ok(40000)
+    });
+    match plan_of {
+        PathPlan::Refuse(why) => assert!(why.contains("32767") && why.contains("expanded"), "{why}"),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(*measured.borrow(), [format!(r"%SystemRoot%;%LONG%;{DIR}")]);
+    // The same value that expands to a length that fits is written.
+    assert!(matches!(
+        plan(&stored, DIR, |_| Ok(32767)),
+        PathPlan::Write { expand: true, .. }
+    ));
+    assert!(matches!(plan(&stored, DIR, |_| Ok(32768)), PathPlan::Refuse(_)));
+    // An expansion that cannot be had refuses, with the cause.
+    match plan(&stored, DIR, |_| Err("the environment is gone".into())) {
+        PathPlan::Refuse(why) => assert!(why.contains("the environment is gone"), "{why}"),
+        other => panic!("{other:?}"),
+    }
+    // A `REG_SZ` is never expanded.
+    let plain = Ok(Some(Stored::Sz(r"%SystemRoot%".into())));
+    assert!(matches!(
+        plan(&plain, DIR, |_| panic!("a REG_SZ is not expanded")),
+        PathPlan::Write { expand: false, .. }
+    ));
+    // A directory that is on the value already is not measured.
+    let present = Ok(Some(Stored::ExpandSz(format!("%LONG%;{DIR}"))));
+    assert_eq!(plan(&present, DIR, |_| panic!("nothing is written")), PathPlan::Present);
 }
 
 #[test]
@@ -166,7 +214,7 @@ fn a_stored_string_that_would_not_survive_a_write_back_is_refused_with_the_reaso
     assert!(why.contains("whole"), "{why}");
     // Each of them leaves the system PATH alone.
     assert!(matches!(
-        plan(&decode_string(&data(&embedded), true).map(Some), DIR),
+        plan(&decode_string(&data(&embedded), true).map(Some), DIR, unexpanded),
         PathPlan::Refuse(why) if why.contains("NUL")
     ));
 }

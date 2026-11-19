@@ -3,11 +3,14 @@
 //! `apply` appends [`super::BASE_DIR`] to the machine's `Path` value so that a session finds `ssh-broker` by
 //! name (`ssh-broker elevate ...`). This module is the pure part: what to write for what is stored, and the
 //! `verify` row. Reading and writing the value is `registry`'s.
+//!
+//! The value is read, changed and written back whole, as every program that edits it does: a write another
+//! program makes between the two is lost. Nothing can guard that from one side (see the README).
 
 use super::report::Check;
 
-/// What the system `Path` value holds, as the registry stores it. Which of the two string types it is must
-/// survive a write: a `REG_EXPAND_SZ` that became a `REG_SZ` would stop its `%SystemRoot%` from expanding.
+/// Which of the two string types the system `Path` value is must survive a write: a `REG_EXPAND_SZ` that
+/// became a `REG_SZ` would stop its `%SystemRoot%` from expanding.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Stored {
     Sz(String),
@@ -85,8 +88,11 @@ pub fn with_directory(path: &str, dir: &str) -> Option<String> {
 }
 
 /// What to do about the stored value. A value of any other type, one that is not there, one that could not
-/// be read and one that would pass the longest an environment variable can be change nothing.
-pub fn plan(current: &Reading, dir: &str) -> PathPlan {
+/// be read and one that would pass the longest an environment variable can be change nothing. A process gets
+/// a `REG_EXPAND_SZ` value expanded, so that is the length checked: `expanded_length` gives the number of
+/// characters of the text once its `%VARIABLES%` are expanded, or why it cannot be had (which changes nothing
+/// either). A `REG_SZ` value is measured as stored.
+pub fn plan(current: &Reading, dir: &str, expanded_length: impl Fn(&str) -> Result<usize, String>) -> PathPlan {
     let (value, expand) = match current {
         Err(why) => return PathPlan::Refuse(format!("cannot read the system PATH: {why}")),
         Ok(None) => return PathPlan::Refuse("the system PATH has no Path value".into()),
@@ -98,13 +104,28 @@ pub fn plan(current: &Reading, dir: &str) -> PathPlan {
         Ok(Some(Stored::Sz(value))) => (value, false),
         Ok(Some(Stored::ExpandSz(value))) => (value, true),
     };
-    match with_directory(value, dir) {
-        None => PathPlan::Present,
-        Some(longer) if longer.encode_utf16().count() > LONGEST_VARIABLE => PathPlan::Refuse(format!(
-            "adding {dir} would make the system PATH longer than {LONGEST_VARIABLE} characters"
-        )),
-        Some(value) => PathPlan::Write { value, expand },
+    let Some(longer) = with_directory(value, dir) else {
+        return PathPlan::Present;
+    };
+    let length = if expand {
+        match expanded_length(&longer) {
+            Ok(length) => length,
+            Err(why) => {
+                return PathPlan::Refuse(format!(
+                    "adding {dir} would make a system PATH whose length once expanded cannot be told: {why}"
+                ));
+            }
+        }
+    } else {
+        longer.encode_utf16().count()
+    };
+    if length > LONGEST_VARIABLE {
+        let expanded = if expand { " once expanded" } else { "" };
+        return PathPlan::Refuse(format!(
+            "adding {dir} would make the system PATH longer than {LONGEST_VARIABLE} characters{expanded}"
+        ));
     }
+    PathPlan::Write { value: longer, expand }
 }
 
 /// The `verify` row: the install directory is on the system `PATH`.

@@ -14,7 +14,6 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use ssh_broker::acl::{copy_file_security, create_install_dir, install_dir_file_problem, install_dir_problem};
-use ssh_broker::pipes::ExecChild;
 use ssh_broker::provision::path_env::{self, PathPlan};
 use ssh_broker::provision::registry;
 use ssh_broker::provision::sshd_config::configure::ConfigRead;
@@ -24,7 +23,6 @@ use ssh_broker::provision::sshd_config::{
 };
 use ssh_broker::provision::{BASE_DIR, canonical_exe};
 use ssh_broker::socket_loc::Integrity;
-use ssh_broker::winutil::UnelevatedToken;
 
 #[path = "common/account.rs"]
 mod account_fixture;
@@ -34,8 +32,6 @@ mod agent_conn;
 mod bounded_wait;
 #[path = "common/desktop.rs"]
 mod desktop;
-#[path = "common/drain.rs"]
-mod drain;
 #[path = "common/fs_state.rs"]
 mod fs_state;
 #[path = "common/hard_errors.rs"]
@@ -92,8 +88,27 @@ fn assert_in_force_and_read() {
         }
         other => panic!("the sshd service was read as {other:?}"),
     }
-    let row = accepts_row(Integrity::High, sshd_reading_this_machine);
+    let row = accepts_row(Ok(Integrity::High), sshd_reading_this_machine);
     assert!(row.pass, "{}", row.detail);
+}
+
+/// `apply` itself put the variable in force in sshd's configuration, and has not restarted sshd. The rig's
+/// `accept_elevation_variable` (run by `Login::new`) would configure sshd itself if `apply` had not, so a test that
+/// logs in after `apply` cannot otherwise tell a defect in `apply`'s sshd step.
+fn assert_apply_configured_sshd() {
+    match sshd_reading_this_machine().expect("an elevated administrator can read sshd's configuration") {
+        SshdReading::Read { listing, read } => {
+            assert!(
+                in_force(&listing),
+                "apply did not put the variable in force:\n{listing}"
+            );
+            assert!(
+                matches!(read, ConfigRead::Unread(_)),
+                "apply does not restart sshd, so the files are newer than it: {read:?}"
+            );
+        }
+        other => panic!("the sshd service was read as {other:?}"),
+    }
 }
 
 /// What plain `sshd -T` prints, as the `verify` row reads it.
@@ -157,7 +172,7 @@ fn apply_s_sshd_step_adds_the_drop_in_and_the_include_above_the_first_match_and_
         accepts(&sshd_t(), ssh_broker::protocol::ElevationPolicy::VARIABLE),
         "plain `sshd -T` shows the variable"
     );
-    let row = accepts_row(Integrity::High, sshd_reading_this_machine);
+    let row = accepts_row(Ok(Integrity::High), sshd_reading_this_machine);
     assert!(!row.pass, "sshd has not read the files yet: {}", row.detail);
 
     restart_sshd();
@@ -289,8 +304,9 @@ fn a_hand_made_sshd_config_d_gets_no_drop_in_and_sshd_config_gets_the_acceptenv_
 }
 
 /// sshd reads its configuration when it starts, so a file written after that may not have been read: the `verify`
-/// row fails for it until sshd is restarted. This also measures that an elevated administrator can read when
-/// sshd's process, which runs as SYSTEM, was created.
+/// row fails for it until sshd is restarted: for `sshd_config`, for any other file in `sshd_config.d`, and for the
+/// folder itself when an entry goes. This also measures that an elevated administrator can read when sshd's
+/// process, which runs as SYSTEM, was created.
 #[test]
 fn a_configuration_written_after_sshd_started_fails_the_row_until_sshd_is_restarted() {
     let _machine = machine::exclusive();
@@ -306,7 +322,7 @@ fn a_configuration_written_after_sshd_started_fails_the_row_until_sshd_is_restar
 
     // The file is written again, with the same text: sshd cannot have read this write.
     std::fs::write(config_path(), std::fs::read(config_path()).unwrap()).unwrap();
-    let row = accepts_row(Integrity::High, sshd_reading_this_machine);
+    let row = accepts_row(Ok(Integrity::High), sshd_reading_this_machine);
     assert!(!row.pass, "{}", row.detail);
     assert!(
         row.detail.contains("started before")
@@ -321,12 +337,39 @@ fn a_configuration_written_after_sshd_started_fails_the_row_until_sshd_is_restar
     assert_says_to_restart(accepted, &said);
     restart_sshd();
     assert_in_force_and_read();
+
+    // Every file in the folder is judged, whatever its name: another one, written after sshd started, fails the row.
+    let other = drop_in_dir().join("50-other.conf");
+    std::fs::write(&other, "# nothing\r\n").unwrap();
+    let row = accepts_row(Ok(Integrity::High), sshd_reading_this_machine);
+    assert!(!row.pass, "{}", row.detail);
+    assert!(
+        row.detail
+            .contains(&format!("before {} was last changed", other.display())),
+        "{}",
+        row.detail
+    );
+    restart_sshd();
+    assert_in_force_and_read();
+
+    // So is the folder: a file that goes changes it, and the row fails for the folder (this measures that a folder's
+    // change time moves when an entry goes).
+    std::fs::remove_file(&other).unwrap();
+    let row = accepts_row(Ok(Integrity::High), sshd_reading_this_machine);
+    assert!(!row.pass, "{}", row.detail);
+    assert!(
+        row.detail
+            .contains(&format!("before {} was last changed", drop_in_dir().display())),
+        "{}",
+        row.detail
+    );
 }
 
-/// `SeRestorePrivilege` is enabled for the copy of a file's security and put back after it: an elevated
-/// administrator's token holds it disabled, and the process is left as it was found.
+/// The copy of a file's security gives the destination the source's owner and DACL, also an owner the caller does
+/// not get by default (SYSTEM), which needs `SeRestorePrivilege`; the privilege is enabled for the copy and put
+/// back after it: an elevated administrator's token holds it disabled, and the process is left as it was found.
 #[test]
-fn copying_security_leaves_the_restore_privilege_as_it_found_it() {
+fn copying_security_gives_the_owner_and_the_acl_and_leaves_the_restore_privilege_as_it_found_it() {
     account_fixture::assert_elevated();
     let state = || {
         let (ok, text) = run("whoami", &["/priv", "/fo", "csv", "/nh"]);
@@ -341,13 +384,26 @@ fn copying_security_leaves_the_restore_privilege_as_it_found_it() {
     let (from, to) = (dir.join("from"), dir.join("to"));
     std::fs::write(&from, "a").unwrap();
     std::fs::write(&to, "b").unwrap();
+    let (ok, text) = run("icacls", &[from.to_str().unwrap(), "/setowner", r"NT AUTHORITY\SYSTEM"]);
+    assert!(ok, "give the source to SYSTEM: {text}");
+    let (source_before, destination_before) = (sddl_of(&from), sddl_of(&to));
+    assert_ne!(
+        source_before, destination_before,
+        "premise: the two files differ in their owner"
+    );
 
     let before = state();
     let copied = copy_file_security(&from, &to);
     let after = state();
+    let (source_after, destination_after) = (sddl_of(&from), sddl_of(&to));
     let _ = std::fs::remove_dir_all(&dir);
     copied.expect("copy the security");
     assert_eq!(after, before, "the privilege was left as the copy made it");
+    assert_eq!(source_after, source_before, "the source is as it was");
+    assert_eq!(
+        destination_after, source_before,
+        "the destination has the source's owner and ACL"
+    );
 }
 
 /// A login that sets the variable through `SetEnv` gets it in its shell after `apply`, over the real sshd: the
@@ -360,6 +416,7 @@ fn a_login_with_set_env_always_gets_the_variable_after_apply() {
     reset();
     let kit = Kit::broker_with_helper("sshe");
     apply(&kit);
+    assert_apply_configured_sshd();
     let account = Account::create("sshe", true);
     // sshd's logon keeps the account's hive loaded, so the account is declared as logged on by sshd, which is how
     // `Account::drop` deletes the profile; no agent runs for it, so there is none to end (see `session_end`).
@@ -380,60 +437,31 @@ fn a_login_with_set_env_always_gets_the_variable_after_apply() {
     );
 }
 
-/// What `sshd -T` does for a caller that cannot read sshd's host keys, so that it is known what an unelevated
-/// `verify` would have met. Recorded, not asserted: the `verify` row is judged only at High and does not depend on
-/// it. To be filled in from the first CI run: its exit code and output for (a) a standard account and (b) an
-/// administrator's unelevated token.
-#[test]
-fn sshd_t_as_a_standard_account_and_as_an_unelevated_administrator() {
-    let _machine = machine::exclusive();
-    account_fixture::assert_elevated();
-    reset();
-    let _reset = ResetAtTheEnd;
-    let kit = Kit::broker_with_helper("sshr");
-
-    // (a) A standard account, in a command that writes what it saw to a file the test can read.
-    let account = Account::create("sshr", true);
-    let out = kit.path("sshd-t-standard.txt");
-    let line = format!("cmd.exe /c \"sshd -T > \"{}\" 2>&1\"", out.display());
-    let code = account.run(&system_cmd(), &line, kit.dir(), std::slice::from_ref(&out));
-    eprintln!(
-        "sshd -T as a standard account: exit {code}\n{}",
-        std::fs::read_to_string(&out).unwrap_or_else(|e| format!("(no output: {e})"))
-    );
-
-    // (b) This process's administrator token, filtered and at Medium, on pipes.
-    let token = UnelevatedToken::of_this_process().expect("make the unelevated token");
-    let child = ExecChild::spawn("sshd -T", None, Some(&token)).expect("start sshd -T unelevated");
-    let (stdout, stderr) = (
-        drain::drain(child.stdout_read_raw()),
-        drain::drain(child.stderr_read_raw()),
-    );
-    let waited = child.wait();
-    let said = format!("{}{}", drain::text_of(stdout), drain::text_of(stderr));
-    eprintln!("sshd -T as an unelevated administrator: {waited:?}\n{said}");
-}
-
 // The PATH =====
 
-/// Take the install directory out of the system `PATH`, as a machine that was never installed has it.
+/// Take the install directory out of the system `PATH`, as a machine that was never installed has it. The value
+/// keeps its registry type.
 fn remove_install_dir_from_path() {
     let stored = registry::read_system_path()
         .expect("read the system PATH")
         .expect("the system PATH has a value");
-    let (path_env::Stored::Sz(value) | path_env::Stored::ExpandSz(value)) = stored else {
-        panic!("the system PATH is not a string");
+    let (value, expand) = match stored {
+        path_env::Stored::Sz(value) => (value, false),
+        path_env::Stored::ExpandSz(value) => (value, true),
+        path_env::Stored::Other(kind) => panic!("the system PATH is not a string: registry type {kind}"),
     };
     let kept: Vec<&str> = value
         .split(';')
         .filter(|segment| !segment.trim_end_matches('\\').eq_ignore_ascii_case(BASE_DIR))
         .collect();
-    registry::write_system_path(&kept.join(";"), true).expect("write the system PATH");
+    registry::write_system_path(&kept.join(";"), expand).expect("write the system PATH");
 }
 
 fn install_dir_is_on_path() -> bool {
     matches!(
-        path_env::plan(&registry::read_system_path(), BASE_DIR),
+        path_env::plan(&registry::read_system_path(), BASE_DIR, |text| Ok(text
+            .encode_utf16()
+            .count())),
         PathPlan::Present
     )
 }
@@ -484,7 +512,7 @@ fn type_where_ssh_broker_is(session: &mut SshSession) -> String {
         .to_owned()
 }
 
-/// Design 12.6, measured: a session started after `apply` finds `ssh-broker` by name.
+/// A session started after `apply` finds `ssh-broker` by name.
 #[test]
 fn after_apply_a_new_session_runs_ssh_broker_by_name() {
     let _machine = machine::exclusive();
@@ -495,6 +523,7 @@ fn after_apply_a_new_session_runs_ssh_broker_by_name() {
     apply(&kit);
     remove_install_dir_from_path();
     apply(&kit);
+    assert_apply_configured_sshd();
     let account = Account::create("sshn", true);
     let _end = session_end::LogOutOnDrop::new(&canonical_exe(), &account, ServiceLogon::Sshd);
     let login = Login::new(&kit, &account);
@@ -511,8 +540,8 @@ fn after_apply_a_new_session_runs_ssh_broker_by_name() {
     session.leave();
 }
 
-/// Design 12.6, measured: an agent's environment is fixed when it starts, so the sessions of an agent that `apply`
-/// did not restart lack the install directory until it restarts. The README says so (Task 6).
+/// An agent's environment is fixed when it starts, so the sessions of an agent that `apply` did not restart lack
+/// the install directory until it restarts.
 #[test]
 fn an_agent_that_apply_did_not_restart_keeps_its_old_path_until_it_restarts() {
     let _machine = machine::exclusive();
@@ -521,6 +550,7 @@ fn an_agent_that_apply_did_not_restart_keeps_its_old_path_until_it_restarts() {
     reset();
     let kit = Kit::broker_with_helper("sshk");
     apply(&kit);
+    assert_apply_configured_sshd();
     remove_install_dir_from_path();
     let account = Account::create("sshk", true);
     let _end = session_end::LogOutOnDrop::new(&canonical_exe(), &account, ServiceLogon::Sshd);
@@ -565,9 +595,8 @@ fn an_agent_that_apply_did_not_restart_keeps_its_old_path_until_it_restarts() {
 /// The `verify` of an installed build, through a session that the password prompt started: an administrator with no
 /// agent logs in with a terminal and types the password at the product's own prompt, so the installed shim starts
 /// the installed agent by its batch logon. A login asking `always` then runs the installed exe's `verify`, whose
-/// parity probes go through that agent. Routed here from PR #84, whose two attempts could not run it. A junction
-/// row that is not "followed" is the RedirectionGuard signal for the password-prompt start path on the runner: stop
-/// and report it.
+/// parity probes go through that agent. A junction row that is not "followed" is the RedirectionGuard signal for the
+/// password-prompt start path on the runner: stop and report it.
 #[test]
 fn after_apply_verify_passes_through_a_session_the_password_prompt_started() {
     let _machine = machine::exclusive();
@@ -576,6 +605,7 @@ fn after_apply_verify_passes_through_a_session_the_password_prompt_started() {
     reset();
     let kit = Kit::broker_with_helper("sshv");
     apply(&kit);
+    assert_apply_configured_sshd();
     let installed = canonical_exe();
     let account = Account::create("sshv", true);
     account.make_administrator();

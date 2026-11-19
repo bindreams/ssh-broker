@@ -384,27 +384,25 @@ mod win {
     /// `ImagePath` under `<root>\<subkey>`, with its `%VARIABLES%` expanded as the service manager
     /// does for a `REG_EXPAND_SZ`. `None` when it is not there.
     fn read_image_path_in(root: HKEY, subkey: &str) -> anyhow::Result<Option<String>> {
-        use windows::Win32::System::Environment::ExpandEnvironmentStringsW;
         let Some(raw) = read_optional_string(root, subkey, "ImagePath")? else {
             return Ok(None);
         };
-        let raw_w = wide(&raw);
+        Ok(Some(expand_environment(&raw).context("expand the sshd ImagePath")?))
+    }
+
+    /// `raw` with its `%VARIABLES%` expanded from this process's environment, as `ExpandEnvironmentStringsW`
+    /// does it.
+    pub fn expand_environment(raw: &str) -> anyhow::Result<String> {
+        use windows::Win32::System::Environment::ExpandEnvironmentStringsW;
+        let raw_w = wide(raw);
         // SAFETY: `raw_w` is NUL-terminated. With no buffer the call returns the length it needs, NUL included.
         let needed = unsafe { ExpandEnvironmentStringsW(PCWSTR(raw_w.as_ptr()), None) } as usize;
-        anyhow::ensure!(
-            needed > 0,
-            "expand the sshd ImagePath: {}",
-            std::io::Error::last_os_error()
-        );
+        anyhow::ensure!(needed > 0, "{}", std::io::Error::last_os_error());
         let mut buffer = vec![0u16; needed];
         // SAFETY: as above; the buffer is the length the call is told.
         let len = unsafe { ExpandEnvironmentStringsW(PCWSTR(raw_w.as_ptr()), Some(&mut buffer)) } as usize;
-        anyhow::ensure!(
-            len > 0 && len <= buffer.len(),
-            "expand the sshd ImagePath: {}",
-            std::io::Error::last_os_error()
-        );
-        Ok(Some(String::from_utf16_lossy(&buffer[..len - 1])))
+        anyhow::ensure!(len > 0 && len <= buffer.len(), "{}", std::io::Error::last_os_error());
+        Ok(String::from_utf16_lossy(&buffer[..len - 1]))
     }
 
     /// Production: the `ImagePath` of the sshd service, the command line the service manager runs.
@@ -720,9 +718,9 @@ mod win {
 
 #[cfg(windows)]
 pub use win::{
-    broadcast_environment_change, escape_arguments_under, read_default_shell_under, read_shell_arguments_under,
-    read_sshd_image_path, read_sshd_shell_under, read_system_path, remove_shell_arguments_under,
-    set_default_shell_under, write_system_path,
+    broadcast_environment_change, escape_arguments_under, expand_environment, read_default_shell_under,
+    read_shell_arguments_under, read_sshd_image_path, read_sshd_shell_under, read_system_path,
+    remove_shell_arguments_under, set_default_shell_under, write_system_path,
 };
 #[cfg(all(windows, test))]
 pub use win::{

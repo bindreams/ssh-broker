@@ -134,8 +134,7 @@ fn administrators_authorized_keys() -> PathBuf {
         .join("administrators_authorized_keys")
 }
 
-/// Restart the runner's `sshd` service, as an administrator does after `apply` says to: `apply` itself does not.
-/// `net stop` returns once the service has stopped, and `net start` once it runs. Machine-wide: CI only.
+/// Restart the runner's `sshd` service, as an administrator does after `apply` says to. Machine-wide: CI only.
 pub fn restart_sshd() {
     let (ok, said) = run("net", &["stop", "sshd"]);
     assert!(ok, "stop the sshd service: {said}");
