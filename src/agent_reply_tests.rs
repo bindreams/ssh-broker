@@ -210,8 +210,7 @@ fn a_handler_that_does_not_panic_adds_nothing_to_its_reply() {
     write_frame(&mut tx, FrameKind::Handshake, &logout.encode().unwrap()).unwrap();
     let mut sink = TestSink::default();
     let outcome = pump_decode(&mut rx, &mut FrameReader::new(), &mut sink).expect("the reply was lost");
-    let mut rest = Vec::new();
-    std::io::Read::read_to_end(&mut rx, &mut rest).unwrap();
+    let rest = crate::test_support::read_until_the_peer_closes(&mut rx, afunix::ConnRx::set_read_timeout).unwrap();
     drop((rx, tx));
     let result = agent.join().unwrap();
     let _ = std::fs::remove_dir_all(&dir);

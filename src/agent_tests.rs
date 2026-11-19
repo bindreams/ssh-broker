@@ -581,8 +581,6 @@ fn agent_exec_handler_separates_streams_and_returns_code() {
 /// longer be lost. Every write after that must succeed. Had the agent shut its read side down, the first would reset the connection and a
 /// later one would fail (or block, once the socket buffers fill with data nobody reads).
 fn assert_input_after_exit_is_still_read(tag: &str, mode: Mode) {
-    use std::io::Read;
-
     /// More than the socket buffers hold, so a reader that is gone cannot hide behind them.
     const AFTER_EXIT: usize = 8 * 1024 * 1024;
 
@@ -605,8 +603,8 @@ fn assert_input_after_exit_is_still_read(tag: &str, mode: Mode) {
         let outcome = pump_decode(&mut crx, &mut fr, &mut sink).expect("the EXIT frame was lost");
         assert_eq!(outcome, Outcome::Exited(3));
         // Everything the agent will ever send has been sent once it has FINed.
-        let mut buf = [0u8; 4096];
-        while crx.read(&mut buf).expect("reading up to the agent's FIN") != 0 {}
+        crate::test_support::read_until_the_peer_closes(&mut crx, afunix::ConnRx::set_read_timeout)
+            .expect("reading up to the agent's FIN");
 
         let stream = if mode == Mode::Pty { Stream::Pty } else { Stream::Stdin };
         let chunk = [b'x'; 32 * 1024];

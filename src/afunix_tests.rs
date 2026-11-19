@@ -89,9 +89,7 @@ fn split_halves_are_independent_and_shutdown_signals_eof() {
             let mut c = super::connect(&p).unwrap();
             c.write_all(b"req").unwrap();
             // read the server's reply until EOF (server shuts down its write half)
-            let mut reply = Vec::new();
-            c.read_to_end(&mut reply).unwrap();
-            reply
+            crate::test_support::read_until_the_peer_closes(&mut c, socket2::Socket::set_read_timeout).unwrap()
         }
     });
 

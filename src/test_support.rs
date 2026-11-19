@@ -20,6 +20,30 @@ pub fn asked_policies() -> impl Iterator<Item = Option<ElevationPolicy>> {
     POLICIES.map(Some).into_iter().chain([None])
 }
 
+/// Read `stream`, an AF_UNIX connection, until its peer has closed, and return the bytes. Reads in slices
+/// (`set_read_timeout` is the stream's own, e.g. `ConnRx::set_read_timeout`) and reads again when a slice times
+/// out: each read re-checks the real condition, and a timed-out slice proves nothing. A blocking read that is
+/// already waiting when the peer closes sometimes never wakes on Windows (measured: the next read after a
+/// timeout returns end-of-stream at once), so a plain `read_to_end` can hang.
+pub fn read_until_the_peer_closes<S: std::io::Read>(
+    stream: &mut S,
+    set_read_timeout: impl Fn(&S, Option<std::time::Duration>) -> std::io::Result<()>,
+) -> std::io::Result<Vec<u8>> {
+    use std::io::ErrorKind::{Interrupted, TimedOut, WouldBlock};
+    set_read_timeout(stream, Some(std::time::Duration::from_millis(100)))?;
+    let (mut bytes, mut chunk) = (Vec::new(), [0u8; 4096]);
+    loop {
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => bytes.extend_from_slice(&chunk[..n]),
+            Err(e) if matches!(e.kind(), Interrupted | TimedOut | WouldBlock) => {}
+            Err(e) => return Err(e),
+        }
+    }
+    set_read_timeout(stream, None)?;
+    Ok(bytes)
+}
+
 /// Input for a command's forwarder: ends at EOF, counts reads, and signals when dropped (the count is final then).
 pub struct RecordedInput {
     data: std::io::Cursor<Vec<u8>>,
