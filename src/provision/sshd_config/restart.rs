@@ -109,7 +109,8 @@ impl Before {
 /// not stop are left alone. A start that the service manager accepted and that ended before sshd listened (it
 /// settled stopped, or the process exited) is the only evidence that sshd could not run the files: only then is
 /// what this run changed (`before`) put back, and sshd started again. After a stop that was not seen, a refused
-/// start after which sshd reads stopped is followed by one more start, the first sent after a state was read.
+/// start after which the service reads stopped or its process was seen to have exited is followed by one more
+/// start, the first sent after a state was read.
 pub fn restart(host: &mut dyn SshdHost, say: &mut dyn FnMut(&str), before: &Before) -> bool {
     say(
         "apply: restarting sshd; apply waits for the service manager at each step, and after a start for sshd to \
@@ -138,7 +139,8 @@ pub fn restart(host: &mut dyn SshdHost, say: &mut dyn FnMut(&str), before: &Befo
         }
     }
 
-    // What is known of the stop: `None` when `Stopped` was read, else a clause with why it was not seen.
+    // What is not known of the stop: `None` when `Stopped` was read, else a clause with why it was not seen; after
+    // the extra start below, that clause and the refused start. Every row after the starts says it.
     let mut unanswered_said = false;
     let mut unseen = match host.stop(&mut |reply| {
         unanswered_said = true;
@@ -168,27 +170,31 @@ pub fn restart(host: &mut dyn SshdHost, say: &mut dyn FnMut(&str), before: &Befo
         say(&format!("apply: {stopped}; starting sshd"));
     }
 
+    // Whether sshd is known to have stopped (seen, or read stopped after the extra start below). It decides what a
+    // start's reply means; `unseen` only says what is not known.
+    let mut state_read = unseen.is_none();
     let mut first = host.start();
     if let Some(cause) = &unseen
         && let Some(read) = refused_then_stopped(&first)
     {
         stopped = format!("{cause}; {read}");
-        unseen = None;
+        unseen = Some(stopped.clone());
+        state_read = true;
         say(&format!("apply: {stopped}; starting sshd"));
         first = host.start();
     }
     match first {
         StartOutcome::Serving(StartReply::Accepted) => {
-            say(&match &unseen {
-                None => format!("apply: sshd restarted; it accepts {VARIABLE}"),
-                Some(unseen) => format!(
+            say(&match (&unseen, state_read) {
+                (Some(unseen), false) => format!(
                     "apply: sshd restarted; it accepts {VARIABLE} ({unseen}, and the service manager accepted a \
                      start)"
                 ),
+                _ => format!("apply: sshd restarted; it accepts {VARIABLE}"),
             });
             true
         }
-        StartOutcome::Serving(StartReply::Refused(reply)) if unseen.is_none() => {
+        StartOutcome::Serving(StartReply::Refused(reply)) if state_read => {
             say(&format!(
                 "apply: sshd restarted (the service manager had started it again: {reply}); it accepts {VARIABLE}"
             ));
@@ -302,8 +308,8 @@ fn unseen_exit(cause: &str) -> String {
     format!("(whether the service manager had seen it exit could not be read: {cause})")
 }
 
-/// A start the service manager refused, after which the service reads stopped, in a clause; `None` for any other
-/// outcome.
+/// A start the service manager refused, after which the service reads stopped or its process was seen to have
+/// exited, in a clause; `None` for any other outcome.
 fn refused_then_stopped(outcome: &StartOutcome) -> Option<String> {
     match outcome {
         StartOutcome::Stopped {

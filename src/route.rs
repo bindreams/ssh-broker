@@ -1,10 +1,10 @@
 //! argv dispatch.
 //!
 //! The **shim** (the SSH `DefaultShell`) is the default action; `agent`/`apply`/
-//! `verify` are explicit verbs (and `apply-sshd`, `verify-probe` and `console-fallback` hidden ones). `DefaultShell` is a bare path and cannot carry a
-//! subcommand argument, which is exactly why the shim is the default: a known verb
-//! in first position selects a subcommand, anything else (bare, or sshd's
-//! `-c "cmd"`) is the shim.
+//! `verify` are explicit verbs (and `apply-sshd`, `verify-probe` and `console-fallback` hidden ones).
+//! `DefaultShell` is a bare path and cannot carry a subcommand argument, which is exactly why the shim is the
+//! default: a known verb in first position selects a subcommand, anything else (bare, or sshd's `-c "cmd"`) is
+//! the shim.
 
 use crate::cmdline::{self, RawExec};
 

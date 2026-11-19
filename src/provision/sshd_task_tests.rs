@@ -286,10 +286,10 @@ fn a_missing_report_is_said_and_the_task_is_still_removed() {
     assert_eq!(
         said(&log).last().unwrap(),
         &format!(
-            "apply: the task ssh-broker-apply-sshd left no report in {REPORT} (the system cannot find the file \
-             specified): it did not start, or could not create the report. Whether sshd accepts \
-             SSH_BROKER_ELEVATION and is running is not known: `ssh-broker verify` says, and `sc query sshd` shows \
-             whether sshd runs"
+            "apply: the report of the task ssh-broker-apply-sshd could not be read in {REPORT} (the system cannot \
+             find the file specified); if it is not there, the task did not start or could not create it. Whether \
+             sshd accepts SSH_BROKER_ELEVATION and is running is not known: `ssh-broker verify` says, and `sc query \
+             sshd` shows whether sshd runs"
         )
     );
     assert_eq!(calls(&log), ["register", "run", "wait", "report", "remove"]);
@@ -325,7 +325,9 @@ fn an_instance_that_was_listed_and_never_launched_is_taken_as_proof_of_nothing()
         &format!(
             "apply: the Task Scheduler lists an instance of the task {TASK} that it has not started; it may still \
              run, and nothing is known of what it does. Its report is {REPORT}. End and remove the task (`schtasks \
-             /End /TN {TASK}`, then `schtasks /Delete /TN {TASK} /F`, elevated) when it is not wanted."
+             /End /TN {TASK}`, then `schtasks /Delete /TN {TASK} /F`, elevated) when it is not wanted; if the step \
+             has started meanwhile, ending it can leave sshd stopped. Check sshd at this PC: `sc query sshd`; start \
+             it with `net start sshd` if it is stopped."
         )
     );
     assert_eq!(

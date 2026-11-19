@@ -591,6 +591,69 @@ fn a_second_refusal_after_an_unseen_stop_says_both_replies_and_starts_nothing_mo
     files_were_not_put_back(&host);
 }
 
+/// An unseen stop, a refused start that `refused_clause` says, then an accepted start that ended before sshd
+/// listened: the files are put back, a third start follows, and the sentence of that start carries the unseen
+/// cause, the refused start and `ended`.
+fn an_accepted_second_start_that_ended_after_an_unseen_stop(
+    starts: [StartOutcome; 3],
+    refused_clause: &str,
+    ended: &str,
+) {
+    let (host, taken, log) = unseen_stop_over_changed_files(starts);
+    assert!(!taken, "{log:#?}");
+    let events = events(&host);
+    let starts: Vec<usize> = (0..events.len()).filter(|i| events[*i] == "start").collect();
+    assert_eq!(starts.len(), 3, "{events:?}");
+    let put_back_config = events.iter().position(|event| *event == "replace config").unwrap();
+    let removed_drop_in = events.iter().position(|event| *event == "remove drop-in").unwrap();
+    assert!(
+        starts[1] < put_back_config && put_back_config < starts[2] && removed_drop_in < starts[2],
+        "the files are put back after the second start and before the third: {events:?}"
+    );
+    assert_eq!(host.config, b"Port 22\r\n", "sshd_config is what it was");
+    assert_eq!(host.drop_in, None, "the drop-in this run made is gone");
+    assert_eq!(
+        log.last().unwrap(),
+        &format!(
+            "apply: sshd failed to start with {ELEVATION} accepted ({UNSEEN}; {refused_clause}; {ended}); the \
+             original configuration was put back and sshd is running again. It does not accept {ELEVATION}."
+        )
+    );
+}
+
+#[test]
+fn an_accepted_second_start_that_settled_stopped_keeps_the_unseen_stop_and_the_refused_start() {
+    an_accepted_second_start_that_ended_after_an_unseen_stop(
+        [
+            StartOutcome::Stopped {
+                reply: refused("the first reply (1056)"),
+                exit: exit(1053, 0),
+            },
+            StartOutcome::Stopped {
+                reply: StartReply::Accepted,
+                exit: exit(1067, 0),
+            },
+            StartOutcome::Serving(StartReply::Accepted),
+        ],
+        &refused_then_stopped_clause("the first reply (1056)"),
+        &stopped_again(1067, 0),
+    );
+}
+
+#[test]
+fn an_accepted_second_start_whose_sshd_exited_keeps_the_unseen_stop_and_the_refused_start() {
+    an_accepted_second_start_that_ended_after_an_unseen_stop(
+        [
+            exited(refused("the first reply (1056)"), 1067),
+            exited(StartReply::Accepted, 255),
+            StartOutcome::Serving(StartReply::Accepted),
+        ],
+        "a start was refused (the first reply (1056)), and the sshd the service manager reported running exited \
+         (code 1067)",
+        &exited_before_listening(255),
+    );
+}
+
 // the start =====
 
 fn after_a_stop() -> Fake {

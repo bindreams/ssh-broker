@@ -371,10 +371,10 @@ pub fn register_system_task(name: &str, xml: &str, sddl: &str) -> anyhow::Result
 }
 
 /// Return once the task `name` has no instance: the processes of its instances (running `image` as `role`, which
-/// is the task's own verb: the exe is also the shim and the agent) have exited. The engine may still list an instance whose process has exited, and that listing is not waited for:
-/// the end is the processes', not the listing's. A task that does not exist has none. Nothing stops the task
-/// and nothing bounds the wait for a process that was launched: its exit is the kernel's and the task's to
-/// bring about.
+/// is the task's own verb: the exe is also the shim and the agent) have exited. The engine may still list an
+/// instance whose process has exited, and that listing is not waited for: the end is the processes', not the
+/// listing's. A task that does not exist has none. Nothing stops the task and nothing bounds the wait for a
+/// process that was launched: its exit is the kernel's and the task's to bring about.
 ///
 /// An instance the Task Scheduler lists and has not launched is looked at again. That is waiting for an
 /// external event that may never come, so the failure bound [`procwait::EXIT_BOUND`] counts from the first

@@ -5,6 +5,7 @@ use anyhow::Context;
 
 use super::procwait::{self, StillRunning, Survivor};
 use super::schtasks::{APPLY_SSHD_TASK, WaitOutcome, end_and_remove_apply_sshd_task};
+use super::sshd_config::CHECK_SSHD;
 
 /// The wait, at the start of `apply` and right after its lock, for the sshd step of an earlier `apply`.
 ///
@@ -30,7 +31,8 @@ pub fn wait_for_earlier_sshd_step(
         WaitOutcome::Ended => Ok(()),
         WaitOutcome::NeverLaunched { count } => anyhow::bail!(
             "the Task Scheduler lists {count} instance(s) of the task {APPLY_SSHD_TASK} that it has not started \
-             after {} s, so apply went no further. End and remove the task {} and run apply again",
+             after {} s, so apply went no further. End and remove the task {}; if the step has started meanwhile, \
+             ending it can leave sshd stopped. {CHECK_SSHD} Then run apply again",
             procwait::EXIT_BOUND.as_secs(),
             end_and_remove_apply_sshd_task()
         ),

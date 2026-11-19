@@ -793,7 +793,7 @@ pub fn wait_on(process: &Process, millis: u32) -> std::io::Result<bool> {
 }
 
 /// How long a loop that looks at something again pauses between two looks, in milliseconds. The pause's expiry
-/// proves nothing: the loop it paces has no count and no total bound, and ends on what the looks find.
+/// proves nothing; each loop's own doc says how it ends.
 pub const BETWEEN_LOOKS: u32 = 100;
 
 /// [`wait_all_exited`] with the wait on one process as a parameter, so a test can make it fail.

@@ -55,10 +55,11 @@ pub fn handed_over_line(report: &Path) -> String {
 /// Hand the sshd step to the task, wait for it, and say what it reported, on `say`.
 ///
 /// The hand-over line is said before the wait, so an `apply` ended from there on leaves the step to the task.
-/// When the instances have ended, the report is printed and the task removed. The report is believed to be whole only when it says so itself ([`REPORT_END`]
-/// is its last line); one that does not is printed as far as it goes, with both of its readings: the task's
-/// process ended before the step did, or a line could not be written. A wait that cannot say the instances ended leaves the task registered and the report unread,
-/// and says that the step may still run: nothing is concluded from it. No failure fails `apply`.
+/// When the instances have ended, the report is printed and the task removed. The report is believed to be whole
+/// only when it says so itself ([`REPORT_END`] is its last line); one that does not is printed as far as it goes,
+/// with both of its readings: the task's process ended before the step did, or a line could not be written. A
+/// wait that cannot say the instances ended leaves the task registered and the report unread, and says that the
+/// step may still run: nothing is concluded from it. No failure fails `apply`.
 pub fn hand_over(task: &mut dyn SshdTask, report: &Path, say: &mut dyn FnMut(&str)) {
     if let Err(e) = task.register() {
         say(&not_set_up("registered", &e));
@@ -77,7 +78,8 @@ pub fn hand_over(task: &mut dyn SshdTask, report: &Path, say: &mut dyn FnMut(&st
             say(&format!(
                 "apply: the Task Scheduler lists an instance of the task {APPLY_SSHD_TASK} that it has not \
                  started; it may still run, and nothing is known of what it does. Its report is {}. End and remove \
-                 the task {} when it is not wanted.",
+                 the task {} when it is not wanted; if the step has started meanwhile, ending it can leave sshd \
+                 stopped. {CHECK_SSHD}",
                 report.display(),
                 end_and_remove_apply_sshd_task()
             ));
@@ -118,9 +120,9 @@ pub fn hand_over(task: &mut dyn SshdTask, report: &Path, say: &mut dyn FnMut(&st
             }
         }
         Err(e) => say(&format!(
-            "apply: the task {APPLY_SSHD_TASK} left no report in {} ({e:#}): it did not start, or could not \
-             create the report. Whether sshd accepts SSH_BROKER_ELEVATION and is running is not known: \
-             `ssh-broker verify` says, and `sc query sshd` shows whether sshd runs",
+            "apply: the report of the task {APPLY_SSHD_TASK} could not be read in {} ({e:#}); if it is not there, \
+             the task did not start or could not create it. Whether sshd accepts SSH_BROKER_ELEVATION and is \
+             running is not known: `ssh-broker verify` says, and `sc query sshd` shows whether sshd runs",
             report.display()
         )),
     }

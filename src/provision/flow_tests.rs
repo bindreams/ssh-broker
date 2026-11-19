@@ -141,8 +141,9 @@ fn an_earlier_sshd_step_never_launched_stops_apply() {
         format!(
             "the Task Scheduler lists 2 instance(s) of the task ssh-broker-apply-sshd that it has not started \
              after {} s, so apply went no further. End and remove the task (`schtasks /End /TN \
-             ssh-broker-apply-sshd`, then `schtasks /Delete /TN ssh-broker-apply-sshd /F`, elevated) and run apply \
-             again",
+             ssh-broker-apply-sshd`, then `schtasks /Delete /TN ssh-broker-apply-sshd /F`, elevated); if the step \
+             has started meanwhile, ending it can leave sshd stopped. Check sshd at this PC: `sc query sshd`; \
+             start it with `net start sshd` if it is stopped. Then run apply again",
             procwait::EXIT_BOUND.as_secs()
         )
     );
