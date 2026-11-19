@@ -129,7 +129,8 @@ jobs:
 
       # The prompt path starts the background agent from the installed exe (`provision::canonical_exe()`),
       # and no test installs it, so a logon in a prompt test has no file to start the agent from.
-      # It is taken away again below, because `upgrade_windows` asserts the directory is absent.
+      # It is taken away again below, because the tests of `ci-exclusive` that run `apply` (`upgrade_windows`,
+      # `sshd_config_windows`) need the directory absent.
       - name: Put the exe where the prompt path starts agents from
         if: runner.os == 'Windows'
         run: |

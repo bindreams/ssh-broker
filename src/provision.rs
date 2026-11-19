@@ -18,6 +18,7 @@ pub mod handover;
 pub(crate) mod layout;
 #[cfg(windows)]
 pub mod password_variant;
+pub mod path_env;
 pub mod probe;
 #[cfg(windows)]
 mod probe_run;
@@ -31,6 +32,7 @@ pub(crate) mod session_rows;
 pub mod session_task;
 #[cfg(windows)]
 pub mod sessions;
+pub mod sshd_config;
 #[cfg(windows)]
 pub(crate) mod system_config;
 #[cfg(windows)]
@@ -155,8 +157,8 @@ mod imp {
     use super::layout::{self, Layout};
     use super::registry::SshdShell;
     use super::{
-        apply_lock, flow, probe, probe_run, procwait, registry, report, schtasks, session_rows, session_task, sessions,
-        system_config, taskscheduler, user_rows,
+        apply_lock, flow, path_env, probe, probe_run, procwait, registry, report, schtasks, session_rows, session_task,
+        sessions, sshd_config, system_config, taskscheduler, user_rows,
     };
     use anyhow::Context;
     use std::path::{Path, PathBuf};
@@ -224,6 +226,10 @@ mod imp {
                     "DefaultShell read-back mismatch (shell={shell:?}, opt={opt:?})"
                 );
                 remove_shell_arguments(&base.layout().system_config_path());
+
+                // 4. The install directory on the system PATH, before any agent starts: an agent's
+                //    environment is fixed when it starts, and its sessions inherit it.
+                add_install_dir_to_path();
                 Ok(exe)
             },
             enable_agent_task,
@@ -231,7 +237,39 @@ mod imp {
             start_agents,
         )?;
         println!("apply: ok — DefaultShell -> {}, agent task installed", exe.display());
+
+        // 5. sshd accepts SSH_BROKER_ELEVATION. LAST: it says whether the running sshd has read the
+        //    change, and an sshd that has not needs a restart, which this step does not make. It never
+        //    fails `apply`: the variable is a convenience, and `ssh-broker elevate` works without it.
+        sshd_config::machine::configure_this_machine(&mut |line| println!("{line}"));
         Ok(())
+    }
+
+    /// Append the install directory to the machine's `PATH`, so that a session finds `ssh-broker` by name.
+    /// The value keeps its registry type; one that cannot be judged or written is said and left alone, and
+    /// `apply` goes on (the install is complete without it).
+    fn add_install_dir_to_path() {
+        let dir = super::BASE_DIR;
+        let expanded_length = |text: &str| {
+            registry::expand_environment(text)
+                .map(|expanded| expanded.encode_utf16().count())
+                .map_err(|e| format!("{e:#}"))
+        };
+        match path_env::plan(&registry::read_system_path(), dir, expanded_length) {
+            path_env::PathPlan::Present => {}
+            path_env::PathPlan::Refuse(why) => {
+                eprintln!("apply: {dir} was not added to the system PATH: {why}");
+            }
+            path_env::PathPlan::Write { value, expand } => match registry::write_system_path(&value, expand) {
+                Ok(()) => {
+                    registry::broadcast_environment_change();
+                    println!(
+                        "apply: added {dir} to the system PATH; sessions started from now on find ssh-broker by name"
+                    );
+                }
+                Err(e) => eprintln!("apply: {dir} was not added to the system PATH: {e:#}"),
+            },
+        }
     }
 
     /// Write the system config from the shell sshd runs now, if it is not ssh-broker and there is no
@@ -453,6 +491,17 @@ mod imp {
         // can write to it).
         let base = layout::check_base(&layout);
         rows.push(layout::install_dir_row(&base));
+
+        // Local: the install directory is on the system PATH, so a session finds `ssh-broker` by name.
+        rows.push(path_env::row(&registry::read_system_path(), super::BASE_DIR));
+
+        // Local: sshd accepts SSH_BROKER_ELEVATION from clients, and has read the files that say so. `sshd -T`
+        // reads sshd's host keys, so the row is judged only by an elevated `verify` (see
+        // `sshd_config::accepts_row`).
+        rows.push(sshd_config::accepts_row(
+            crate::account::integrity(),
+            sshd_config::machine::sshd_reading_this_machine,
+        ));
 
         // Local: sshd escapes the command, the only non-PTY form the shim decodes. sshd reads the
         // value once per session, so this is the one place it is checked.

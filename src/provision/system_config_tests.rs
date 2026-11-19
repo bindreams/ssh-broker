@@ -6,8 +6,8 @@ use std::path::{Path, PathBuf};
 use super::{
     ArgumentsPlan, ConfigKind, CreateOutcome, Decision, Skip, SshdClass, arguments_left, arguments_not_removed,
     arguments_removed, arguments_removing, arguments_unreadable, carried_block, classify, config_is_file,
-    create_once_at, decide, image_dir, not_written, nothing_to_carry, plan_arguments, remove_temp, render, skip_notice,
-    sshd_search_dirs,
+    create_once_at, decide, image_arguments, image_dir, not_written, nothing_to_carry, plan_arguments, remove_temp,
+    render, skip_notice, sshd_search_dirs,
 };
 use crate::provision::registry::SshdShell;
 use crate::shell::Escaping;
@@ -504,11 +504,53 @@ fn the_image_directory_is_read_from_a_service_image_path_in_any_form() {
             Some(r"C:\Windows\System32\OpenSSH"),
         ),
         (r"D:/ssh/sshd.exe", Some("D:/ssh")),
+        // The program ends at the first `.exe` that ends a word, not at one inside a folder's name.
+        (r"C:\my.executables\sshd.exe", Some(r"C:\my.executables")),
+        (r"C:\my.executables\sshd.exe -f D:\x", Some(r"C:\my.executables")),
+        (r"C:\OpenSSH\sshd -f D:\x", Some(r"C:\OpenSSH")),
+        // No `.exe` and a space in the path: the whole value is the program, unless an option follows.
+        (r"C:\Program Files\OpenSSH\sshd", Some(r"C:\Program Files\OpenSSH")),
+        (
+            r"C:\Program Files\OpenSSH\sshd -f D:\x",
+            Some(r"C:\Program Files\OpenSSH"),
+        ),
         ("sshd.exe", None),
         ("", None),
         ("  ", None),
     ] {
         assert_eq!(image_dir(image), dir.map(PathBuf::from), "{image:?}");
+    }
+}
+
+#[test]
+fn the_arguments_of_a_service_image_path_are_the_trimmed_text_after_the_program() {
+    for (image, arguments) in [
+        (SSHD_IMAGE, None),
+        (r#""C:\Program Files\OpenSSH\sshd.exe""#, None),
+        (r#"  "C:\Program Files\OpenSSH\sshd.exe"   "#, None),
+        (
+            r#""C:\Program Files\OpenSSH\sshd.exe" -f "C:\x y\sshd_config""#,
+            Some(r#"-f "C:\x y\sshd_config""#),
+        ),
+        (r"C:\Program Files\OpenSSH\SSHD.EXE -d", Some("-d")),
+        (
+            r"C:\Program Files\OpenSSH\sshd.exe   -f D:\conf\sshd_config  ",
+            Some(r"-f D:\conf\sshd_config"),
+        ),
+        // An unquoted program ends at the first `.exe` that ends a word, or else at the first white space that
+        // an option follows, or else it is the whole value.
+        (r"C:\my.executables\sshd.exe", None),
+        (r"C:\my.executables\sshd.exe -f D:\x", Some(r"-f D:\x")),
+        (r"C:\OpenSSH\sshd -f D:\x", Some(r"-f D:\x")),
+        (r"C:\Program Files\OpenSSH\sshd", None),
+        (r"C:\Program Files\OpenSSH\sshd -f D:\x", Some(r"-f D:\x")),
+        (r"C:\Program Files\OpenSSH\sshd   -d  ", Some("-d")),
+        (r"sshd -d", Some("-d")),
+        (r#""C:\unterminated\sshd.exe -d"#, None),
+        ("", None),
+        ("  ", None),
+    ] {
+        assert_eq!(image_arguments(image), arguments, "{image:?}");
     }
 }
 

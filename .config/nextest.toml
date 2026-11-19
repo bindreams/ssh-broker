@@ -13,13 +13,17 @@
 # `shell_sshd_windows` takes the machine alone too, but runs in `ci`: its logons start the agent from the
 # installed exe (`provision::canonical_exe()`), which the workflow puts in place for `ci` and takes away
 # before `ci-exclusive` (`upgrade_windows` asserts the directory is absent).
+# `sshd_config_windows` takes the machine alone and runs `apply`, which refuses an install directory it cannot
+# trust, so the whole binary runs in `ci-exclusive`, where the directory is absent. Each of its tests that runs
+# `apply` puts the machine back through `install::Install`, as the `apply_` tests of `upgrade_windows` do, so
+# that the directory is absent for whichever of the two binaries runs next.
 
 # The `m3_` tests of `session_on_demand_windows` measure what a caller's jobs do to the logon child, so
 # the test process must be in no job. nextest puts every test in one, so `ci` leaves them out and the
 # workflow runs them from the test binary itself ("M3 tests outside any job" in ci.yaml).
 [profile.ci]
 fail-fast = false
-default-filter = 'not (binary(session_on_demand_windows) & test(/^logon_with_seclogon_(stopped|disabled)_returns_windows_reason$/)) & not (binary(upgrade_windows) & test(/^apply_/)) & not (binary(session_on_demand_windows) & test(/^m3_/))'
+default-filter = 'not (binary(session_on_demand_windows) & test(/^logon_with_seclogon_(stopped|disabled)_returns_windows_reason$/)) & not (binary(upgrade_windows) & test(/^apply_/)) & not binary(sshd_config_windows) & not (binary(session_on_demand_windows) & test(/^m3_/))'
 # A failure bound on our own run, never a pass: the longest test (an account that needs a profile,
 # a logon, a session) takes a few minutes, and the waits inside a test have bounds of their own
 # that fail first with a message. A test still running at this bound is ended and reported as
@@ -32,7 +36,7 @@ slow-timeout = { period = "120s", terminate-after = 5, grace-period = "1s" }
 # ends three sessions in its body. The default 600 s could end such a test in the middle of its teardown,
 # lose the message and leave the account and its profile. These binaries get 10 x 120 s.
 [[profile.ci.overrides]]
-filter = 'binary(agent_window_windows) | binary(auto_login_windows) | binary(private_dir_elevated_windows) | binary(prompt_path_windows) | binary(real_sshd_windows) | binary(shell_sshd_windows) | binary(session_on_demand_windows) | binary(upgrade_windows) | binary(user_isolation_windows)'
+filter = 'binary(agent_window_windows) | binary(auto_login_windows) | binary(private_dir_elevated_windows) | binary(prompt_path_windows) | binary(real_sshd_windows) | binary(shell_sshd_windows) | binary(session_on_demand_windows) | binary(sshd_config_windows) | binary(upgrade_windows) | binary(user_isolation_windows)'
 slow-timeout = { period = "120s", terminate-after = 10, grace-period = "1s" }
 
 # The real-sshd test measures things the plan has never seen (the shim's session, logon type and job under
@@ -49,4 +53,4 @@ success-output = "immediate"
 
 [profile.ci-exclusive]
 inherits = "ci"
-default-filter = '(binary(session_on_demand_windows) & test(/^logon_with_seclogon_(stopped|disabled)_returns_windows_reason$/)) | (binary(upgrade_windows) & test(/^apply_/))'
+default-filter = '(binary(session_on_demand_windows) & test(/^logon_with_seclogon_(stopped|disabled)_returns_windows_reason$/)) | (binary(upgrade_windows) & test(/^apply_/)) | binary(sshd_config_windows)'

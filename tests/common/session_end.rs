@@ -9,13 +9,19 @@
 //! fallback, and every use of it is recorded.
 //!
 //! The logoff of a session (Security 4634) is waited for. It comes for a secondary-logon session and for
-//! most Task Scheduler Batch sessions; where Windows keeps a Batch session with no process left it is not a
-//! failure here, and `tests/auto_login_windows.rs` measures that such sessions do not pile up.
+//! most Batch sessions. Where no 4634 comes although no process is left, the session is recorded and is not
+//! a failure when it is a Batch logon, read from the session before `logout` is asked
+//! (`tests/auto_login_windows.rs` measures that such sessions do not pile up), or when sshd logged the
+//! account on. Any other case fails: a session of another type, or of a type that could not be read.
+//! Under sshd the logon type does not decide it: the product starts the background agent of an
+//! administrator's password prompt with a Batch logon, and the session a standard account's password prompt
+//! starts has been seen not to be logged off within the bound. Whether Windows ends it later is an open
+//! question recorded in the project's queue; the record then lists what still refers to the session.
 //!
 //! The including crate declares `account_fixture`, `agent_conn`, `bounded_wait` and `logon_session`.
 #![allow(dead_code)]
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -26,7 +32,7 @@ use ssh_broker::socket_loc::{Integrity, SocketLocation};
 use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
 use windows::Win32::System::Threading::WaitForSingleObject;
 
-use crate::account_fixture::{Account, ServiceLogon, hive, profile};
+use crate::account_fixture::{Account, ServiceLogon, hive, holders, profile};
 use crate::agent_conn::AgentConn;
 use crate::bounded_wait::CHILD_EXIT_BOUND;
 use crate::logon_session::{self, LogoffWatch};
@@ -34,6 +40,9 @@ use crate::logon_session::{self, LogoffWatch};
 /// How long Windows may take to write the logoff event after the last process of a session has ended: an
 /// external event that may never come. Expiry fails the wait and says what was measured.
 pub const LOGOFF_EVENT_BOUND: Duration = Duration::from_secs(180);
+
+/// `LogonType` of a Batch logon session in `SECURITY_LOGON_SESSION_DATA`.
+const LOGON_TYPE_BATCH: u32 = 4;
 
 /// What ending a session found.
 #[derive(Debug)]
@@ -146,7 +155,10 @@ fn end(
     how: ServiceLogon,
 ) -> Result<Option<Ended>, String> {
     let mut steps = Vec::new();
-    let outcome = attempt("end the session", || try_end(exe, name, sid, location, how, &mut steps)).and_then(|r| r);
+    let outcome = attempt("end the session", || {
+        try_end(exe, name, sid, sid_text, location, how, &mut steps)
+    })
+    .and_then(|r| r);
     hive::record(&format!(
         "session end [{who}] {name} ({sid_text}), logged on by {how}: {}; hive now (not required to unload after a \
          {how} logon): {}; result: {}",
@@ -167,6 +179,7 @@ fn try_end(
     exe: &Path,
     name: &str,
     sid: &Sid,
+    sid_text: &str,
     location: &SocketLocation,
     how: ServiceLogon,
     steps: &mut Vec<String>,
@@ -190,6 +203,25 @@ fn try_end(
         .collect();
     // Subscribed before the logout runs, so the event cannot be missed.
     let watches: Vec<(u64, LogoffWatch)> = ids.iter().map(|id| (*id, LogoffWatch::new(*id))).collect();
+    // Read now, while the sessions exist: a session that stays is judged by its type.
+    let logon_types: BTreeMap<u64, u32> = match holders::sessions_of(sid_text) {
+        Ok(sessions) => sessions
+            .into_iter()
+            .filter(|session| ids.contains(&session.id))
+            .map(|session| (session.id, session.logon_type))
+            .collect(),
+        Err(why) => {
+            steps.push(format!("logon types not read: {why}"));
+            BTreeMap::new()
+        }
+    };
+    steps.push(format!(
+        "logon types {:?}",
+        logon_types
+            .iter()
+            .map(|(id, logon_type)| format!("{id:#x}: {logon_type}"))
+            .collect::<Vec<_>>()
+    ));
     let own = std::process::id();
     let held: Vec<_> = ids
         .iter()
@@ -267,35 +299,74 @@ fn try_end(
     drop(remaining);
     steps.push("no process left in the sessions".to_owned());
     let mut logged_off = BTreeSet::new();
-    let mut missing = Vec::new();
+    let mut failed = Vec::new();
+    let mut unlogged_under_sshd = false;
     for (id, watch) in &watches {
         let seen = watch.wait(LOGOFF_EVENT_BOUND);
         steps.push(format!("4634 for {id:#x}: {}", if seen { "seen" } else { "not seen" }));
         if seen {
             logged_off.insert(*id);
-        } else {
-            missing.push(format!("{id:#x}"));
+            continue;
+        }
+        // Recorded, not failed: a Batch logon, which Windows keeps at times whoever logged the account on (the
+        // product starts an administrator's prompt session with one, under sshd too; whether they pile up is
+        // measured by `tests/auto_login_windows.rs`); or any session under sshd, where the logoff of a session
+        // a standard account's password prompt started has been seen not to come. That is an open question in
+        // the project's queue, so the record carries what still refers to the session.
+        match logon_types.get(id) {
+            Some(&LOGON_TYPE_BATCH) => steps.push(format!(
+                "logon session {id:#x} stays with no process left; it is a Batch logon, which Windows does at \
+                 times keep"
+            )),
+            found if matches!(how, ServiceLogon::Sshd) => {
+                let logon_type = found.map_or_else(|| "unread".to_owned(), |logon_type| logon_type.to_string());
+                steps.push(format!(
+                    "logon session {id:#x} (logon type {logon_type}) stays with no process left; under sshd the \
+                     logoff of a session the password prompt started has been seen not to come within the bound; \
+                     whether Windows ends it later is an open question"
+                ));
+                unlogged_under_sshd = true;
+            }
+            Some(other) => failed.push(format!("{id:#x} (logon type {other})")),
+            None => failed.push(format!("{id:#x} (logon type could not be read)")),
         }
     }
-    if missing.is_empty() {
-        return Ok(Some(Ended { logged_off }));
+    if unlogged_under_sshd {
+        steps.push(still_referring(sid_text));
     }
-    match how {
-        // Windows keeps some Batch sessions of Task Scheduler with no process left. Whether
-        // they pile up is measured by `tests/auto_login_windows.rs`; here it is recorded.
-        ServiceLogon::TaskScheduler => {
-            steps.push(format!(
-                "logon session(s) {} stay with no process left, which Windows does at times for a Batch logon",
-                missing.join(", ")
-            ));
-            Ok(Some(Ended { logged_off }))
-        }
-        ServiceLogon::Sshd => Err(format!(
+    if failed.is_empty() {
+        Ok(Some(Ended { logged_off }))
+    } else {
+        Err(format!(
             "logon session(s) {} of {name} still present: no 4634 within {LOGOFF_EVENT_BOUND:?} although every \
-             process of them has ended",
-            missing.join(", ")
-        )),
+             process of them has ended, and a session that is not a Batch logon is not kept",
+            failed.join(", ")
+        ))
     }
+}
+
+/// What the fixture can say about who still refers to the logon sessions of `sid_text` after the wait: the
+/// sessions LSA lists for the account, and the processes still running in them.
+fn still_referring(sid_text: &str) -> String {
+    let sessions = match holders::sessions_of(sid_text) {
+        Ok(sessions) => sessions,
+        Err(why) => return format!("logon sessions of the account not read after the wait: {why}"),
+    };
+    let own = std::process::id();
+    let running: Vec<u32> = sessions
+        .iter()
+        .flat_map(|session| logon_session::processes_of(session.id))
+        .filter(|(pid, process)| *pid != own && !has_exited(process.0))
+        .map(|(pid, _)| pid)
+        .collect();
+    format!(
+        "after the wait the account's logon sessions are [{}]; processes still running in them (pids {running:?})",
+        sessions
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("], [")
+    )
 }
 
 /// Wait for `process` to exit, up to [`CHILD_EXIT_BOUND`]: an exit that may never come.

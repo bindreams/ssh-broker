@@ -69,6 +69,8 @@ use windows::core::{BOOL, HRESULT, PCWSTR, PWSTR};
 use crate::socket_loc::Integrity;
 use crate::winutil::OwnedHandle;
 
+mod copy_security;
+pub use copy_security::copy_file_security;
 mod admin_file;
 pub use admin_file::{admin_only_file_problem, ensure_admin_only_file};
 mod private_dir;
@@ -389,6 +391,8 @@ enum Inheritance {
     Explicit,
     /// Protected or not, inherited ACEs allowed: a file born inside such a directory.
     Inherited,
+    /// Not protected, and every ACE inherited: a file exactly as the folder it was made in gives it.
+    InheritedOnly,
 }
 
 /// A security descriptor read back from an object.
@@ -534,6 +538,9 @@ impl Security {
             if inheritance == Inheritance::Explicit && control & SE_DACL_PROTECTED.0 == 0 {
                 return Ok(false);
             }
+            if inheritance == Inheritance::InheritedOnly && control & SE_DACL_PROTECTED.0 != 0 {
+                return Ok(false);
+            }
 
             let mut size_info = ACL_SIZE_INFORMATION::default();
             GetAclInformation(
@@ -553,6 +560,9 @@ impl Security {
                 // An explicit policy takes no inherited ACE: the dir is not the locked-down set.
                 let inherited = header.AceFlags & (INHERITED_ACE.0 as u8) != 0;
                 if inherited && inheritance == Inheritance::Explicit {
+                    return Ok(false);
+                }
+                if !inherited && inheritance == Inheritance::InheritedOnly {
                     return Ok(false);
                 }
                 // Only ALLOW ACEs are permitted; a DENY (or any other type) fails closed.
@@ -1008,8 +1018,8 @@ pub fn ensure_install_dir(dir: &Path) -> anyhow::Result<()> {
 }
 
 /// `CreateDirectoryW` with [`INSTALL_DIR_SDDL`]. "Already exists" is not an error here: the
-/// caller decides whether what exists is acceptable.
-fn create_install_dir(dir: &Path) -> anyhow::Result<()> {
+/// caller decides whether what exists is acceptable (see [`install_dir_problem`]).
+pub fn create_install_dir(dir: &Path) -> anyhow::Result<()> {
     let sd = descriptor_from_sddl(INSTALL_DIR_SDDL)?;
     let path_w = wide(dir);
     unsafe {
@@ -1022,7 +1032,7 @@ fn create_install_dir(dir: &Path) -> anyhow::Result<()> {
             Ok(()) => Ok(()),
             Err(e) if e.code() == HRESULT::from_win32(ERROR_ALREADY_EXISTS.0) => Ok(()),
             Err(e) => Err(anyhow::Error::new(e).context(format!(
-                "create the install directory {} (this needs an elevated administrator)",
+                "create {} with the install directory's permissions (this needs an elevated administrator)",
                 dir.display()
             ))),
         }
@@ -1033,6 +1043,54 @@ fn create_install_dir(dir: &Path) -> anyhow::Result<()> {
 /// unexpected is `false`: fail-closed.
 pub fn verify_install_dir_acl(dir: &Path) -> anyhow::Result<bool> {
     Ok(install_dir_problem(dir)?.is_none())
+}
+
+/// `AceFlags` of the ACEs a file inherits from [`INSTALL_DIR_SDDL`]: the folder's, without the bits that
+/// pass them on (a file has nothing to pass them to); `INHERITED_ACE` is judged on its own.
+const INSTALL_FILE_ACE_FLAGS: u8 = INSTALL_ACE_FLAGS & !((OBJECT_INHERIT_ACE.0 | CONTAINER_INHERIT_ACE.0) as u8);
+
+/// Why `path` is not a file as a folder with the [`INSTALL_DIR_SDDL`] policy gives it, or `None` if it is
+/// one: a file, not a link, owned by SYSTEM or Administrators, whose DACL is exactly the ACEs of that policy,
+/// all inherited. Read without following a link.
+pub fn install_dir_file_problem(path: &Path) -> anyhow::Result<Option<String>> {
+    let Some(handle) = open_for_inspection(path)? else {
+        return Ok(Some(denied_problem("what the install directory gives its files")));
+    };
+    let security = Security::from_handle(handle.0, Integrity::Medium)
+        .with_context(|| format!("read the ACL of {}", path.display()))?;
+    let attributes = file_attributes(handle.0).with_context(|| format!("read the attributes of {}", path.display()))?;
+    if attributes & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
+        return Ok(Some("it is a reparse point (a link)".to_owned()));
+    }
+    if attributes & FILE_ATTRIBUTE_DIRECTORY.0 != 0 {
+        return Ok(Some("it is a directory".to_owned()));
+    }
+    Ok(problem_from_install_dir_file(&security))
+}
+
+/// [`install_dir_file_problem`] on a security descriptor already read.
+fn problem_from_install_dir_file(security: &Security) -> Option<String> {
+    let (Ok(system), Ok(admins), Ok(users)) = (
+        Sid::well_known(WellKnown::System),
+        Sid::well_known(WellKnown::Administrators),
+        Sid::well_known(WellKnown::Users),
+    ) else {
+        return Some("the well-known SIDs cannot be built".to_owned());
+    };
+    let mut grants = install_grants(&system, &admins, &users);
+    for grant in &mut grants {
+        grant.flags = Some(INSTALL_FILE_ACE_FLAGS);
+    }
+    // The owner can rewrite the DACL whatever it says, so it has to be as trusted as the grantees.
+    let owner_ok = security.owner_in(&[&system, &admins]).unwrap_or(false);
+    let acl_ok = security
+        .dacl_matches_as(&grants, Inheritance::InheritedOnly)
+        .unwrap_or(false);
+    owner_acl_problem(owner_ok, acl_ok, || OwnerAclWords {
+        owner: describe_sid(security.owner),
+        owner_set: "SYSTEM or Administrators".into(),
+        acl_is: "what the install directory gives its files".into(),
+    })
 }
 
 /// `true` iff `sid` is one of `set`.

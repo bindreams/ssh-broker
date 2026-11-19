@@ -2,8 +2,8 @@
 //! leaves SSH sessions alone. Windows only; **Elevated (CI only)**.
 //!
 //! This installs into the machine's real install directory, registers the real tasks and writes
-//! sshd's DefaultShell, so it takes the machine alone (`machine::exclusive()`) and puts everything
-//! back. It refuses to start where an install exists.
+//! sshd's DefaultShell and configuration files, so it takes the machine alone (`machine::exclusive()`) and
+//! puts everything back (`install::Install`). It refuses to start where an install exists.
 #![cfg(windows)]
 
 use std::os::windows::io::AsRawHandle;
@@ -12,7 +12,7 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use ssh_broker::autologin::{self, PasswordSource, WindowsEnv};
-use ssh_broker::provision::{self, procwait, schtasks, taskscheduler};
+use ssh_broker::provision::{self, taskscheduler};
 use windows::Win32::Foundation::{HANDLE, HANDLE_FLAG_INHERIT, SetHandleInformation, WAIT_TIMEOUT};
 use windows::Win32::System::Threading::{
     CREATE_PROCESS_LOGON_FLAGS, GetExitCodeProcess, TerminateProcess, WaitForSingleObject,
@@ -28,6 +28,8 @@ mod bounded_wait;
 mod desktop;
 #[path = "common/hard_errors.rs"]
 mod hard_errors;
+#[path = "common/install.rs"]
+mod install;
 #[path = "common/logon_session.rs"]
 mod logon_session;
 #[path = "common/machine.rs"]
@@ -38,124 +40,19 @@ mod password;
 mod process_list;
 #[path = "common/session_end.rs"]
 mod session_end;
+#[path = "common/sshd_rig.rs"]
+mod sshd_rig;
 #[path = "common/stand_in.rs"]
 mod stand_in;
 
 use account_fixture::{Account, ServiceLogon};
 use agent_conn::{BackgroundAgent, local_account};
+use install::{Install, OPENSSH_KEY, reg};
+use sshd_rig::restart_sshd;
 use stand_in::Kit;
 
 /// How long a scheduled start may take before the test calls it failed; the start is an external event.
 const TASK_START_BOUND: Duration = Duration::from_secs(180);
-
-const OPENSSH_KEY: &str = r"HKLM\SOFTWARE\OpenSSH";
-const SHELL_VALUES: [&str; 4] = [
-    "DefaultShell",
-    "DefaultShellCommandOption",
-    "DefaultShellArguments",
-    "DefaultShellEscapeArguments",
-];
-
-fn reg(args: &[&str]) -> std::process::Output {
-    desktop::output(Command::new("reg").args(args)).expect("run reg.exe")
-}
-
-/// Puts the machine back as `capture` found it: the real tasks, the install directory, sshd's
-/// DefaultShell values.
-struct Install {
-    exported: Option<PathBuf>,
-}
-
-impl Install {
-    fn capture() -> Install {
-        assert!(
-            !Path::new(provision::BASE_DIR).exists(),
-            "{} exists: this test installs there and would remove it",
-            provision::BASE_DIR
-        );
-        let file = std::env::temp_dir().join(format!("sb-openssh-{}.reg", std::process::id()));
-        let _ = std::fs::remove_file(&file);
-        let exported = reg(&["export", OPENSSH_KEY, &file.to_string_lossy(), "/y"])
-            .status
-            .success();
-        Install {
-            exported: exported.then_some(file),
-        }
-    }
-}
-
-impl Drop for Install {
-    fn drop(&mut self) {
-        let canonical = provision::canonical_exe();
-        let _ = taskscheduler::stop_instances(schtasks::AGENT_TASK, &canonical);
-        let _ = desktop::output(Command::new("schtasks").args(["/Delete", "/TN", schtasks::AGENT_TASK, "/F"]));
-        if let Ok(agents) = procwait::background_agents(&canonical) {
-            for agent in &agents {
-                let _ = agent.terminate();
-            }
-            let _ = procwait::wait_all_exited(&agents, procwait::EXIT_BOUND);
-        }
-        for value in SHELL_VALUES {
-            let _ = reg(&["delete", OPENSSH_KEY, "/v", value, "/f"]);
-        }
-        if let Some(file) = &self.exported {
-            let _ = reg(&["import", &file.to_string_lossy()]);
-            let _ = std::fs::remove_file(file);
-        }
-        // `Ok` with a pending delete and `NotFound` from an entry inside a surviving tree both leave the
-        // directory; check that it is gone.
-        let left = match std::fs::remove_dir_all(provision::BASE_DIR) {
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Some(e.to_string()),
-            removed => match Path::new(provision::BASE_DIR).try_exists() {
-                Ok(false) => None,
-                Ok(true) => Some(match removed {
-                    Ok(()) => "it still exists after the removal returned".to_owned(),
-                    Err(e) => format!("it still exists after the removal failed: {e}"),
-                }),
-                Err(e) => Some(format!("cannot tell whether it is gone: {e}")),
-            },
-        };
-        if let Some(cause) = left {
-            let message = format!(
-                "cannot remove {}: {cause}\nprocesses whose image or command line contains it:\n{}",
-                provision::BASE_DIR,
-                install_holders()
-            );
-            // A panic during an unwind aborts the test binary, and so does `eprintln!` on a closed stderr.
-            if std::thread::panicking() {
-                use std::io::Write as _;
-                let _ = writeln!(std::io::stderr(), "{message}");
-            } else {
-                panic!("{message}");
-            }
-        }
-    }
-}
-
-/// The processes whose image path or command line contains the install directory, one per line as
-/// `pid image: path` or `pid command line: text`. Says so when there are none, and when the listing
-/// itself failed.
-fn install_holders() -> String {
-    let dir = provision::BASE_DIR;
-    let script = format!(
-        "$ErrorActionPreference = 'Stop'; \
-         Get-CimInstance Win32_Process | Where-Object {{ $_.ProcessId -ne $PID }} | ForEach-Object {{ \
-         if ($_.ExecutablePath -like '{dir}*') {{ \"$($_.ProcessId) image: $($_.ExecutablePath)\" }}; \
-         if ($_.CommandLine -like '*{dir}*') {{ \"$($_.ProcessId) command line: $($_.CommandLine)\" }} }}"
-    );
-    match desktop::output(Command::new("powershell").args(["-NoProfile", "-NonInteractive", "-Command", &script])) {
-        Ok(out) if !out.status.success() => format!(
-            "the listing failed ({}): {}",
-            out.status,
-            String::from_utf8_lossy(&out.stderr).trim()
-        ),
-        Ok(out) if out.stdout.iter().all(u8::is_ascii_whitespace) => {
-            "no process with that image or command line".to_owned()
-        }
-        Ok(out) => String::from_utf8_lossy(&out.stdout).into_owned(),
-        Err(e) => format!("the listing failed: cannot start powershell: {e}"),
-    }
-}
 
 /// The process ids of the `agent --background --expect-user <sid>` processes of one account.
 fn agent_pids(sid: &str) -> Vec<u32> {
@@ -735,6 +632,10 @@ fn apply_then_verify_for_an_administrator_shows_an_elevated_session_and_an_unele
         String::from_utf8_lossy(&applied.stdout),
         String::from_utf8_lossy(&applied.stderr)
     );
+    // `apply` changed sshd's configuration and does not restart sshd, and `verify` fails its sshd row until the
+    // service has started after the last write. Restarting it is the administrator's step, taken here by the
+    // rig; the unit that makes `apply` restart sshd removes this line.
+    restart_sshd();
 
     // An administrator whose task starts the agent: a batch logon, which gives the full token.
     let admin = Account::create("vf1", true);

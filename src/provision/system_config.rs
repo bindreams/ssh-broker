@@ -346,21 +346,49 @@ pub fn sshd_search_dirs(host: &dyn Host, image_path: Option<&str>) -> anyhow::Re
     Ok(dirs)
 }
 
-/// The directory of the program a service's `ImagePath` starts. The value is a command line:
-/// the program is quoted, or runs up to its `.exe`, and arguments may follow.
-pub(super) fn image_dir(image_path: &str) -> Option<PathBuf> {
+/// A service's `ImagePath` as the program it starts and the text after it. The value is a command line: a
+/// quoted program ends at the closing quote. An unquoted one ends at the first `.exe` (any case) that is
+/// followed by the end of the value or by white space, so a folder named `my.executables` does not end it; when
+/// there is none, at the first white space that is followed by `-` (sshd takes options only, so the white space
+/// in `C:\Program Files\OpenSSH\sshd` is not the end); when there is none of that either, the whole value is the
+/// program. Arguments may follow.
+fn split_image(image_path: &str) -> (&str, &str) {
     let image_path = image_path.trim();
-    let program = match image_path.strip_prefix('"') {
-        Some(quoted) => quoted.split('"').next()?,
-        None => {
-            let end = image_path
-                .to_ascii_lowercase()
-                .find(".exe")
-                .map_or(image_path.len(), |at| at + ".exe".len());
-            &image_path[..end]
-        }
+    if let Some(quoted) = image_path.strip_prefix('"') {
+        return quoted.split_once('"').unwrap_or((quoted, ""));
+    }
+    let lower = image_path.to_ascii_lowercase();
+    let word_end = |at: usize| image_path[at..].chars().next().is_none_or(char::is_whitespace);
+    let before_option = || {
+        image_path
+            .char_indices()
+            .filter(|&(at, c)| c.is_whitespace() && !image_path[..at].ends_with(char::is_whitespace))
+            .map(|(at, _)| at)
+            .find(|&at| image_path[at..].trim_start().starts_with('-'))
     };
-    let (dir, _) = program.rsplit_once(['\\', '/'])?;
+    let end = lower
+        .match_indices(".exe")
+        .map(|(at, exe)| at + exe.len())
+        .find(|&end| word_end(end))
+        .or_else(before_option)
+        .unwrap_or(image_path.len());
+    image_path.split_at(end)
+}
+
+/// The program a service's `ImagePath` starts.
+pub(super) fn image_program(image_path: &str) -> Option<&str> {
+    Some(split_image(image_path).0)
+}
+
+/// The arguments after the program of a service's `ImagePath`, trimmed; `None` when there are none.
+pub(super) fn image_arguments(image_path: &str) -> Option<&str> {
+    let arguments = split_image(image_path).1.trim();
+    (!arguments.is_empty()).then_some(arguments)
+}
+
+/// The directory of [`image_program`].
+pub(super) fn image_dir(image_path: &str) -> Option<PathBuf> {
+    let (dir, _) = image_program(image_path)?.rsplit_once(['\\', '/'])?;
     (!dir.is_empty()).then(|| PathBuf::from(dir))
 }
 
