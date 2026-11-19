@@ -53,7 +53,7 @@ impl Scene {
         let list: Vec<String> = folders.iter().map(|f| f.display().to_string()).collect();
         child_entry::write_input(&self.child_dir, &list.join("\n"));
         let line = child_entry::command_line(&std::env::current_exe().unwrap(), CHILD, &self.child_dir);
-        ExecChild::spawn(&line, None, Some(&token))
+        ExecChild::spawn(&line, None, Some(&token), &[])
             .expect("start the child on pipes")
             .wait()
             .expect("wait for the child");

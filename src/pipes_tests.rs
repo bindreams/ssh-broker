@@ -4,7 +4,7 @@ use crate::test_support::drain;
 
 #[test]
 fn exec_separates_stdout_stderr_and_returns_code() {
-    let child = ExecChild::spawn("cmd.exe /c echo OUT& echo ERR 1>&2& exit /b 5", None, None).unwrap();
+    let child = ExecChild::spawn("cmd.exe /c echo OUT& echo ERR 1>&2& exit /b 5", None, None, &[]).unwrap();
     let out_t = drain(child.stdout_read_raw());
     let err_t = drain(child.stderr_read_raw());
 
@@ -35,7 +35,7 @@ fn exec_runs_a_command_with_whitespace_at_its_edges() {
         "\tcmd.exe /c exit /b 3\r\n",
         "\r\ncmd.exe /c exit /b 3",
     ] {
-        let child = ExecChild::spawn(command, None, None).unwrap_or_else(|e| panic!("{command:?}: {e}"));
+        let child = ExecChild::spawn(command, None, None, &[]).unwrap_or_else(|e| panic!("{command:?}: {e}"));
         assert_eq!(child.wait().unwrap(), 3, "{command:?}");
     }
 }
@@ -44,7 +44,7 @@ fn exec_runs_a_command_with_whitespace_at_its_edges() {
 /// spaces after the arguments are printed.
 #[test]
 fn exec_keeps_the_trailing_spaces_of_a_command() {
-    let child = ExecChild::spawn("  cmd.exe /c echo a   ", None, None).unwrap();
+    let child = ExecChild::spawn("  cmd.exe /c echo a   ", None, None, &[]).unwrap();
     let out_t = drain(child.stdout_read_raw());
     let err_t = drain(child.stderr_read_raw());
     assert_eq!(child.wait().unwrap(), 0);
@@ -52,6 +52,57 @@ fn exec_keeps_the_trailing_spaces_of_a_command() {
     err_t.join().unwrap();
 
     assert_eq!(String::from_utf8_lossy(&out), "a   \r\n"); // spaces-ok: the child writes them, and the test reads them back
+}
+
+/// What `cmd /c set` prints in a child started with `extra_env`: its environment, by upper-cased name.
+fn environment_of_a_child(extra_env: &[(&str, &str)]) -> std::collections::BTreeMap<String, String> {
+    let child = ExecChild::spawn("cmd.exe /c set", None, None, extra_env).unwrap();
+    let out_t = drain(child.stdout_read_raw());
+    let err_t = drain(child.stderr_read_raw());
+    assert_eq!(child.wait().unwrap(), 0);
+    let out = out_t.join().unwrap();
+    err_t.join().unwrap();
+    String::from_utf8_lossy(&out)
+        .lines()
+        .filter_map(|line| line.split_once('='))
+        .map(|(name, value)| (name.to_uppercase(), value.to_owned()))
+        .collect()
+}
+
+/// A start with `extra_env` gives the child the id and the variables this test put in its own environment as it
+/// has them; a start with none passes the environment on as it is, so the child's id is this process's, if it
+/// has one.
+#[test]
+fn the_session_environment_carries_its_id_and_the_inherited_variables_arrive_unchanged() {
+    const OURS: [(&str, &str); 2] = [
+        ("SSH_BROKER_TEST_INHERITED_A", "one"),
+        ("SSH_BROKER_TEST_INHERITED_B", "two words"),
+    ];
+    for (name, value) in OURS {
+        // SAFETY: Windows sets a variable through `SetEnvironmentVariableW`, which the system serialises against
+        // every other reader of the environment. The names are unique to this test.
+        unsafe { std::env::set_var(name, value) };
+    }
+    let id = "00112233445566778899aabbccddeeff";
+
+    let with = environment_of_a_child(&[(crate::protocol::SESSION_VARIABLE, id)]);
+    assert_eq!(
+        with.get(crate::protocol::SESSION_VARIABLE).map(String::as_str),
+        Some(id)
+    );
+    for (name, value) in OURS {
+        assert_eq!(with.get(name).map(String::as_str), Some(value), "{name} changed");
+    }
+
+    let without = environment_of_a_child(&[]);
+    assert_eq!(
+        without.get(crate::protocol::SESSION_VARIABLE).cloned(),
+        std::env::var(crate::protocol::SESSION_VARIABLE).ok(),
+        "a start with no extra variable changed the id"
+    );
+    for (name, value) in OURS {
+        assert_eq!(without.get(name).map(String::as_str), Some(value), "{name} changed");
+    }
 }
 
 /// A file that exists and cannot be started (here, not a program at all) is an error from `spawn`.
@@ -63,7 +114,7 @@ fn a_file_that_cannot_start_is_an_error_and_not_a_message_box() {
     std::fs::create_dir_all(&dir).unwrap();
     let stub = dir.join("stub.exe");
     std::fs::write(&stub, b"MZ").unwrap();
-    let result = ExecChild::spawn(&format!("\"{}\" -c x", stub.display()), None, None);
+    let result = ExecChild::spawn(&format!("\"{}\" -c x", stub.display()), None, None, &[]);
     let _ = std::fs::remove_dir_all(&dir);
     assert!(result.is_err(), "a file that is not a program started");
 }
@@ -86,7 +137,7 @@ fn a_program_with_a_missing_dll_starts_and_ends_with_the_loader_status_and_no_ou
     const STATUS_DLL_NOT_FOUND: u32 = 0xC000_0135;
     loader_failures_end_the_program();
     let exe = crate::command_line_probe::example("missing_dll");
-    let child = ExecChild::spawn(&format!("\"{}\"", exe.display()), None, None).expect("the program starts");
+    let child = ExecChild::spawn(&format!("\"{}\"", exe.display()), None, None, &[]).expect("the program starts");
     let out_t = drain(child.stdout_read_raw());
     let err_t = drain(child.stderr_read_raw());
     // UNBOUNDED on purpose: the loader ends the process, or nextest's bound names this test.
@@ -100,7 +151,7 @@ fn a_program_with_a_missing_dll_starts_and_ends_with_the_loader_status_and_no_ou
 #[test]
 fn a_missing_working_directory_is_not_the_programs_fault() {
     let missing = std::env::temp_dir().join(format!("sb-pipes-no-such-dir-{}", std::process::id()));
-    let error = ExecChild::spawn("cmd.exe /c exit", Some(&missing), None)
+    let error = ExecChild::spawn("cmd.exe /c exit", Some(&missing), None, &[])
         .err()
         .expect("a missing working directory started a program");
     assert!(matches!(error, StartError::Other(_)), "{error:?}");
@@ -113,7 +164,7 @@ fn a_file_that_cannot_start_is_the_programs_fault() {
     std::fs::create_dir_all(&dir).unwrap();
     let stub = dir.join("stub.exe");
     std::fs::write(&stub, b"MZ").unwrap();
-    let error = ExecChild::spawn(&format!("\"{}\"", stub.display()), Some(&dir), None)
+    let error = ExecChild::spawn(&format!("\"{}\"", stub.display()), Some(&dir), None, &[])
         .err()
         .expect("a file that is not a program started");
     let _ = std::fs::remove_dir_all(&dir);

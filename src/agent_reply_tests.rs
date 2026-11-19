@@ -56,8 +56,8 @@ fn handshake(mode: Mode, command: &str) -> impl FnOnce(&mut ConnTx) + Send + 'st
 
 fn failing_starters() -> Hooks {
     Hooks {
-        start_exec: |_, _, _| Err(StartError::Program(anyhow::anyhow!("the system cannot find the file"))),
-        start_pty: |_, _, _, _, _, _| Err(StartError::Program(anyhow::anyhow!("the system cannot find the file"))),
+        start_exec: |_, _, _, _| Err(StartError::Program(anyhow::anyhow!("the system cannot find the file"))),
+        start_pty: |_, _, _, _, _, _, _| Err(StartError::Program(anyhow::anyhow!("the system cannot find the file"))),
         ..Hooks::production()
     }
 }
@@ -174,7 +174,7 @@ fn a_client_that_leaves_in_the_middle_of_a_frame_is_still_a_bad_request() {
 #[test]
 fn a_handler_that_panics_answers_its_connection_with_255_before_it_closes() {
     let hooks = Hooks {
-        start_pty: |_, _, _, _, _, _| panic!("the starter failed"),
+        start_pty: |_, _, _, _, _, _, _| panic!("the starter failed"),
         ..Hooks::production()
     };
     let (server, client, dir) = crate::test_support::raw_socket_pair("panic-reply");
@@ -240,6 +240,7 @@ fn a_connection_refused_at_accept_is_answered_with_255_not_dropped() {
         &connections,
         &control,
         || false,
+        |conn, control| serve_connection(conn, Hooks::production(), control),
     );
     assert!(format!("{end:#}").ends_with("end of script"), "{end:#}");
 
@@ -402,8 +403,8 @@ fn agent_refuses_a_login_that_asked_when_the_token_cannot_be_made_and_names_both
     for (tag, mode, command) in REQUESTS {
         let hooks = Hooks {
             make_unelevated: |_| Err(anyhow::anyhow!("the token cannot be made")),
-            start_exec: |_, _, _| panic!("a command was started for a session with no token"),
-            start_pty: |_, _, _, _, _, _| panic!("a shell was started for a session with no token"),
+            start_exec: |_, _, _, _| panic!("a command was started for a session with no token"),
+            start_pty: |_, _, _, _, _, _, _| panic!("a shell was started for a session with no token"),
             ..Hooks::production()
         };
         let (answer, result) = answered(
@@ -433,8 +434,8 @@ fn agent_refuses_a_login_that_asked_when_the_token_cannot_be_made_and_names_both
 fn agent_refuses_always_with_an_unreadable_level_and_does_not_tell_it_to_ask_for_always() {
     let hooks = Hooks {
         make_unelevated: |_| Err(anyhow::anyhow!("the level cannot be read")),
-        start_exec: |_, _, _| panic!("a command was started for a refused login"),
-        start_pty: |_, _, _, _, _, _| panic!("a shell was started for a refused login"),
+        start_exec: |_, _, _, _| panic!("a command was started for a refused login"),
+        start_pty: |_, _, _, _, _, _, _| panic!("a shell was started for a refused login"),
         ..Hooks::production()
     };
     let (answer, result) = answered(
@@ -466,8 +467,8 @@ fn agent_refuses_always_below_high_with_the_sentence_and_starts_nothing() {
                     || -> anyhow::Result<UnelevatedToken> { panic!("a token was made below High") },
                 )
             },
-            start_exec: |_, _, _| panic!("a command was started for a refused login"),
-            start_pty: |_, _, _, _, _, _| panic!("a shell was started for a refused login"),
+            start_exec: |_, _, _, _| panic!("a command was started for a refused login"),
+            start_pty: |_, _, _, _, _, _, _| panic!("a shell was started for a refused login"),
             ..Hooks::production()
         };
         let (answer, result) = answered(
@@ -528,11 +529,11 @@ fn at_high(tag: &str, policy: ElevationPolicy, host: TestHost, mode: Mode, comma
                 crate::winutil::UnelevatedToken::of_this_process,
             )
         },
-        start_exec: |_, _, token| {
+        start_exec: |_, _, token, _| {
             STARTS.lock().unwrap().push(("exec", false, token.is_some()));
             Err(StartError::Program(anyhow::anyhow!("recorded")))
         },
-        start_pty: |_, _, _, _, read, token| {
+        start_pty: |_, _, _, _, read, token, _| {
             STARTS.lock().unwrap().push(("pty", read.is_some(), token.is_some()));
             Err(StartError::Program(anyhow::anyhow!("recorded")))
         },
@@ -625,11 +626,11 @@ fn hooks_at_high_without_a_token(host: TestHost) -> Hooks {
                 || -> anyhow::Result<UnelevatedToken> { Err(anyhow::anyhow!("the token cannot be made")) },
             )
         },
-        start_exec: |_, _, token| {
+        start_exec: |_, _, token, _| {
             STARTS.lock().unwrap().push(("exec", false, token.is_some()));
             Err(StartError::Program(anyhow::anyhow!("recorded")))
         },
-        start_pty: |_, _, _, _, read, token| {
+        start_pty: |_, _, _, _, read, token, _| {
             STARTS.lock().unwrap().push(("pty", read.is_some(), token.is_some()));
             Err(StartError::Program(anyhow::anyhow!("recorded")))
         },
@@ -731,8 +732,8 @@ fn agent_does_not_hand_back_a_login_that_set_a_level() {
                     || -> anyhow::Result<UnelevatedToken> { Err(anyhow::anyhow!("the token cannot be made")) },
                 )
             },
-            start_exec: |_, _, _| panic!("a command was started for a refused login"),
-            start_pty: |_, _, _, _, _, _| panic!("a shell was started for a refused login"),
+            start_exec: |_, _, _, _| panic!("a command was started for a refused login"),
+            start_pty: |_, _, _, _, _, _, _| panic!("a shell was started for a refused login"),
             ..Hooks::production()
         };
         let (answer, result) = answered(

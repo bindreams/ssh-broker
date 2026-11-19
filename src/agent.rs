@@ -35,6 +35,15 @@ pub fn exit_code_of(err: &anyhow::Error) -> i32 {
     1
 }
 
+/// End the process because the agent failed with `err`, as `main` does when [`run`] returns it: report it where
+/// an operator's console or redirect may show it (after the console is freed it is dropped, and the exit code is
+/// the record) and exit with [`exit_code_of`]. A thread other than the one that ran the agent ends it through here
+/// when it meets a failure that no part of the agent can serve through.
+pub fn end_on_error(err: &anyhow::Error) -> ! {
+    eprintln!("ssh-broker agent: {err:#}");
+    end_process(exit_code_of(err))
+}
+
 mod ending;
 pub use ending::{end_process, hold_until_end, keep_log};
 #[cfg(windows)]
@@ -45,6 +54,10 @@ mod console;
 mod launch;
 #[cfg(windows)]
 mod logout;
+#[cfg(windows)]
+mod requests;
+#[cfg(windows)]
+mod session;
 #[cfg(windows)]
 mod verb;
 
@@ -64,7 +77,8 @@ use crate::offer::text;
 use crate::pipes::ExecChild;
 #[cfg(windows)]
 use crate::protocol::{
-    ElevationPolicy, ExitCode, FrameKind, FrameReader, Handshake, Mode, Resize, Stream, read_one_frame, write_frame,
+    ElevationPolicy, ExitCode, FrameKind, FrameReader, Handshake, Mode, Resize, SESSION_VARIABLE, Stream,
+    read_one_frame, write_frame,
 };
 #[cfg(windows)]
 use crate::relay::{FrameSink, pump_until_peer_gone, write_data, write_serving};
@@ -73,15 +87,17 @@ use crate::route::{AgentArgs, BackgroundArgs};
 #[cfg(windows)]
 use crate::shell::StartError;
 #[cfg(windows)]
-use crate::socket_loc::{SocketLocation, StepDown};
+use crate::socket_loc::{Integrity, REQUEST_SOCKET_FILE_NAME, SOCKET_FILE_NAME, SocketLocation, StepDown};
 #[cfg(windows)]
 use crate::userdir::SocketDir;
 #[cfg(windows)]
 use crate::winutil::{OwnedHandle, UnelevatedToken};
+#[cfg(all(windows, test))]
+use connections::HeldListener;
 #[cfg(windows)]
-use connections::{Connections, Drained, Live};
+use connections::{Connections, Drained, Live, WakeConnect};
 #[cfg(windows)]
-use logout::Control;
+use logout::{Control, Reservation};
 #[cfg(windows)]
 use std::path::{Path, PathBuf};
 #[cfg(windows)]
@@ -268,28 +284,187 @@ fn serve_with(
 
 /// Bind the hardened socket and serve connections, one handler thread each. The caller holds
 /// the user's lock, so no other agent of this user binds meanwhile.
+///
+/// An agent at High also keeps `request.sock` in the plain folder, which the processes of its account below High
+/// can reach (see [`requests`]). Without it the agent serves its sessions all the same, and `logout` from an
+/// unelevated process reports which case it is (see [`crate::logout`]).
 #[cfg(windows)]
 fn run_on(folder: &Arc<SocketDir>, background: bool) -> anyhow::Result<()> {
     let connections = Connections::new();
-    // Closing the listener wakes the blocked `accept` with a connection of its own; the loop then sees
-    // the flag. A wake that fails is reported to the connections, which stop waiting for the loop.
-    let waker_folder = Arc::clone(folder);
-    let waking = Arc::clone(&connections);
-    let control = Arc::new(Control::new(background, Arc::clone(&connections)).with_waker(move || {
-        let folder = Arc::clone(&waker_folder);
-        wake_without_blocking(&waking, move || folder.connect().map(drop))
-    }));
     let integrity = folder.location().integrity();
+    // Held to the end of the function so the plain folder cannot be renamed or removed.
+    let plain = open_request_folder(folder.location(), |location| {
+        crate::userdir::open_socket_dir(location, &crate::acl::Sid::current_user()?)
+    });
+    let control = Arc::new(Control::new(background, Arc::clone(&connections)));
+    let agent_folder = Arc::clone(folder);
     run_on_with(
         folder.location(),
         |path| Listener::bind(path, integrity),
+        || plain.as_ref().and_then(bind_requests),
         mark_listening,
-        |listener| serve_until_drained(listener, &connections, &control),
+        |(listener, connect)| serve_requests(listener, connect, &connections, &control),
+        |listener| {
+            serve_until_drained(
+                listener,
+                Arc::new(move || agent_folder.connect().map(drop)),
+                &connections,
+                &control,
+            )
+        },
     )
-    .or_else(|err| match err.downcast_ref::<Stopped>() {
-        Some(Stopped) => Ok(()),
-        None => Err(err),
-    })
+    .or_else(|end| run_ended(end, &connections))
+}
+
+/// How [`run_on`] ends, given `end`, how the loop of `agent.sock` ended: a loop that stopped because the end was
+/// decided ends as that end was settled ([`settled_end`]); any other stop is its own failure.
+#[cfg(windows)]
+fn run_ended(end: anyhow::Error, connections: &Connections) -> anyhow::Result<()> {
+    match end.downcast_ref::<Stopped>() {
+        Some(Stopped) => settled_end(connections),
+        None => Err(end),
+    }
+}
+
+/// How an end that is decided and settled ([`Connections::settle`]) goes, from the tally's record and nowhere else:
+/// a clean end, unless what decided it was a shortage that no connection was live to cure
+/// ([`Connections::fatal_cause`]), on whichever loop: then it is that failure. Every thread that ends the agent with
+/// an end that was decided (the main thread through [`run_ended`], the request socket's loop, a `logout`) takes its end
+/// from here, so the process has the same exit code whichever of them ends it first. The one end that was not decided
+/// is a loop of `agent.sock` that failed on its own ([`run_ended`]): that is the loop's failure, whatever the record.
+#[cfg(windows)]
+fn settled_end(connections: &Connections) -> anyhow::Result<()> {
+    match connections.fatal_cause() {
+        None => Ok(()),
+        Some(cause) => Err(anyhow::Error::msg(cause).context(NothingLive)),
+    }
+}
+
+/// End the process as `outcome` ([`settled_end`]) says: a clean end is logged, a failed one is logged and then
+/// reported ([`end_on_error`]). A background agent has no stderr, so the log is where the cause is kept; the main
+/// path logs it as well when it is the thread that ends the process, so it can be said twice.
+#[cfg(windows)]
+fn finish_settled(outcome: anyhow::Result<()>) -> ! {
+    match outcome {
+        Ok(()) => {
+            tracing::info!("the background session has ended");
+            end_process(0)
+        }
+        Err(e) => {
+            tracing::error!("the agent stopped: {e:#}");
+            end_on_error(&e)
+        }
+    }
+}
+
+/// The plain folder in which an agent that holds `held` keeps its request socket: only an agent at High has one.
+/// It is the plain folder of the profile `held` is in, so the two cannot name different profiles. A folder that
+/// cannot be opened is logged, and the agent serves without it.
+#[cfg(windows)]
+fn open_request_folder(
+    held: &SocketLocation,
+    open: impl FnOnce(&SocketLocation) -> anyhow::Result<SocketDir>,
+) -> Option<Arc<SocketDir>> {
+    if held.integrity() != Integrity::High {
+        return None;
+    }
+    let plain = crate::socket_loc::for_profile(held.profile_dir(), Integrity::Medium).map_err(anyhow::Error::from);
+    match plain.and_then(|location| open(&location)) {
+        Ok(folder) => Some(Arc::new(folder)),
+        Err(e) => {
+            tracing::warn!("the agent serves without a request socket: the plain folder is unusable: {e:#}");
+            None
+        }
+    }
+}
+
+/// Bind `request.sock` in the plain folder `plain`, with the connect that wakes its loop. A failure is logged,
+/// and the agent serves without it.
+#[cfg(windows)]
+fn bind_requests(plain: &Arc<SocketDir>) -> Option<(Listener, WakeConnect)> {
+    let path = plain.location().request_path();
+    match Listener::bind(&path, plain.location().integrity()) {
+        Ok(listener) => {
+            let plain = Arc::clone(plain);
+            Some((listener, Arc::new(move || plain.connect_request().map(drop))))
+        }
+        Err(e) => {
+            tracing::warn!(
+                "the agent serves without a request socket: it could not bind {}: {e:#}",
+                path.display()
+            );
+            None
+        }
+    }
+}
+
+/// Serve `listener` (`request.sock`) on a thread of its own, beside the loop of `agent.sock` and counted in the
+/// same tally. `connect` wakes its loop. If no thread can be started the agent serves without it, and says so.
+#[cfg(windows)]
+fn serve_requests(listener: Listener, connect: WakeConnect, connections: &Arc<Connections>, control: &Arc<Control>) {
+    let (connections, control) = (Arc::clone(connections), Arc::clone(control));
+    let spawned = std::thread::Builder::new()
+        .name("request-socket".into())
+        .spawn(move || {
+            let end = serve_listener(REQUEST_SOCKET_FILE_NAME, listener, connect, &connections, |listener| {
+                accept_loop(
+                    listener,
+                    &connections,
+                    &control,
+                    || connections.is_closing(),
+                    requests::serve,
+                )
+            });
+            request_loop_ended(&end, &connections, |outcome| finish_settled(outcome));
+        });
+    if let Err(e) = spawned {
+        tracing::warn!("the agent serves without a request socket: no thread for it: {e}");
+    }
+}
+
+/// How the request socket's loop ended (`end`). Any stop leaves the sessions as they are, except a shortage with no
+/// connection live ([`NothingLive`]): the loop has decided the end, so settle it ([`Connections::settle`]) and end
+/// the process via `end_agent`, with how that end went ([`settled_end`]). The main thread, woken by that settle, and
+/// a `logout` served meanwhile take their ends from the same record, so the exit code is the same whichever thread
+/// ends the process first. Serving on without the request socket would leave unelevated `logout`s nothing to ask.
+/// This logs the cause when the loop ends; the thread that ends the process reports it as well, so it can be said
+/// twice.
+#[cfg(windows)]
+fn request_loop_ended(end: &anyhow::Error, connections: &Arc<Connections>, end_agent: impl FnOnce(anyhow::Result<()>)) {
+    if end.downcast_ref::<Stopped>().is_some() {
+        tracing::debug!("the request socket is closed: the agent is ending");
+    } else if end.downcast_ref::<NothingLive>().is_some() {
+        debug_assert!(
+            connections.is_closing(),
+            "the shortage with nothing live is returned only once the end is decided"
+        );
+        tracing::error!("the request socket met a shortage with no connection live; ending the agent: {end:#}");
+        connections.settle();
+        end_agent(settled_end(connections));
+    } else {
+        tracing::error!("the request socket stopped; the agent serves its sessions without it: {end:#}");
+    }
+}
+
+/// Serve `listener` of `socket` to its end: register it with the tally together with `wake`, run `accept` over
+/// it, count it closed, and only then close it. The registration comes before the loop's first look at whether
+/// the end is decided (see [`Connections::listener_opened`]). Returns the error that stopped the loop.
+///
+/// The loop has returned when it is counted closed, so a wake that is still on its way is for a loop the tally no
+/// longer holds, and its failure, if the listener has closed by then, is not reported.
+#[cfg(windows)]
+fn serve_listener<L>(
+    socket: &'static str,
+    listener: L,
+    wake: WakeConnect,
+    connections: &Arc<Connections>,
+    accept: impl FnOnce(&L) -> anyhow::Error,
+) -> anyhow::Error {
+    let open = connections.listener_opened(socket, wake);
+    let end = accept(&listener);
+    drop(open);
+    drop(listener);
+    end
 }
 
 /// Serve `listener` until the agent has decided to end, then return the error that stopped the loop.
@@ -298,14 +473,28 @@ fn run_on(folder: &Arc<SocketDir>, background: bool) -> anyhow::Result<()> {
 /// ending refusal at once, where a closed socket would have left its shim waiting for an agent it
 /// takes to be starting, for as long as the drain lasts. It stops when the drain has finished
 /// ([`Connections::settle`]), after counting the connection it was accepting, and the listener is
-/// closed here, before the drain judges again.
+/// closed here, before the drain judges again. `wake` is the connect that makes the loop return from `accept`.
 #[cfg(windows)]
-fn serve_until_drained(listener: Listener, connections: &Arc<Connections>, control: &Arc<Control>) -> anyhow::Error {
+fn serve_until_drained(
+    listener: Listener,
+    wake: WakeConnect,
+    connections: &Arc<Connections>,
+    control: &Arc<Control>,
+) -> anyhow::Error {
     serve_until_drained_in(
         listener,
+        wake,
         connections,
         || control.is_ending(),
-        |listener| accept_loop(listener, connections, control, || connections.is_closing()),
+        |listener| {
+            accept_loop(
+                listener,
+                connections,
+                control,
+                || connections.is_closing(),
+                |conn, control| serve_connection(conn, Hooks::production(), control),
+            )
+        },
     )
 }
 
@@ -315,14 +504,12 @@ fn serve_until_drained(listener: Listener, connections: &Arc<Connections>, contr
 #[cfg(windows)]
 fn serve_until_drained_in<L>(
     listener: L,
-    connections: &Connections,
+    wake: WakeConnect,
+    connections: &Arc<Connections>,
     ending: impl FnOnce() -> bool,
     accept: impl FnOnce(&L) -> anyhow::Error,
 ) -> anyhow::Error {
-    connections.listener_opened();
-    let end = accept(&listener);
-    drop(listener);
-    connections.listener_closed();
+    let end = serve_listener(SOCKET_FILE_NAME, listener, wake, connections, accept);
     finish_stopped(end, connections, ending())
 }
 
@@ -333,19 +520,23 @@ fn accept_loop(
     connections: &Arc<Connections>,
     control: &Arc<Control>,
     stopping: impl Fn() -> bool,
+    handler: impl Fn(socket2::Socket, &Control) -> anyhow::Result<()> + Send + Sync + 'static,
 ) -> anyhow::Error {
-    accept_loop_with(|| listener.accept(), connections, control, stopping)
+    accept_loop_with(|| listener.accept(), connections, control, stopping, handler)
 }
 
 /// [`accept_loop`] over an `accept` the caller supplies, so a test can stop the loop between a
-/// connection's `accept` and its count.
+/// connection's `accept` and its count. `handler` serves each connection on its thread: a session's
+/// ([`serve_connection`]) on `agent.sock`, a request's ([`requests::serve`]) on `request.sock`.
 #[cfg(windows)]
 fn accept_loop_with(
     mut accept: impl FnMut() -> Result<socket2::Socket, AcceptError>,
     connections: &Arc<Connections>,
     control: &Arc<Control>,
     stopping: impl Fn() -> bool,
+    handler: impl Fn(socket2::Socket, &Control) -> anyhow::Result<()> + Send + Sync + 'static,
 ) -> anyhow::Error {
+    let handler = Arc::new(handler);
     serve_connections_with(
         Arc::clone(connections),
         move || match accept() {
@@ -355,13 +546,14 @@ fn accept_loop_with(
         },
         |arrived, live| {
             let control = Arc::clone(control);
+            let handler = Arc::clone(&handler);
             hand_to_thread(
                 arrived,
                 live,
                 |work| std::thread::Builder::new().spawn(work).map(drop),
                 move |arrived| match arrived {
                     Arrived::Usable(conn) => {
-                        if let Err(e) = serve_connection(conn, Hooks::production(), &control) {
+                        if let Err(e) = handler(conn, &control) {
                             tracing::warn!("connection handler error: {e:?}");
                         }
                     }
@@ -385,57 +577,49 @@ enum Arrived {
     Refused(socket2::Socket, anyhow::Error),
 }
 
-/// Run `wake` on a thread of its own, so that the caller never waits for it. The wake is a connect
-/// to the agent's own listener, and a connect to a listener whose queue is full may wait for room in
-/// it; the caller may be the `logout` handler. A wake that has to wait wakes nothing that needs
-/// waking: the queue is full only if the accept loop is not blocked in `accept`, and a loop that is
-/// not blocked reads the flag before its next `accept`.
-///
-/// A wake that fails, or a thread that cannot be started, is reported to `connections` (see
-/// [`Connections::wake_failed`]).
-#[cfg(windows)]
-fn wake_without_blocking(connections: &Arc<Connections>, wake: impl FnOnce() -> anyhow::Result<()> + Send + 'static) {
-    let on_thread = Arc::clone(connections);
-    let started = std::thread::Builder::new().spawn(move || {
-        if let Err(e) = wake() {
-            on_thread.wake_failed(&format!("{e:#}"));
-        }
-    });
-    if let Err(e) = started {
-        connections.wake_failed(&format!("no thread for it: {e}"));
-    }
-}
-
 /// The accept loop stopped because the end is decided (see [`serve_connections_with`]).
 #[cfg(windows)]
 #[derive(Debug, thiserror::Error)]
 #[error("the agent stopped accepting connections because its session is ending")]
 struct Stopped;
 
+/// The context of a shortage that met no live connection: the loop has already decided the end (see
+/// [`serve_connections_with`]); the caller settles it and ends the process.
+#[cfg(windows)]
+#[derive(Debug, thiserror::Error)]
+#[error("no connection of this agent is live to free a resource")]
+struct NothingLive;
+
 /// After the loop returned `end`: if it stopped on purpose, or the agent is ending and the loop failed,
 /// wait until the end is decided (see [`Connections::settle`]) and return `end` either way. The agent's
-/// process ends when this returns.
+/// process ends when this returns. The tally wakes whichever other loop is still in `accept`.
 #[cfg(windows)]
-fn finish_stopped(end: anyhow::Error, connections: &Connections, ending: bool) -> anyhow::Error {
+fn finish_stopped(end: anyhow::Error, connections: &Arc<Connections>, ending: bool) -> anyhow::Error {
     if ending || end.downcast_ref::<Stopped>().is_some() {
-        // The listener is closed, so there is nothing to wake.
-        connections.settle(&|| {});
+        connections.settle();
     }
     end
 }
 
-/// [`run_on`] with its steps as parameters, so a test can see their order: bind, then mark, then
-/// accept. The marker comes after `bind` returns, which includes `listen`, so a shim that wakes
-/// on it can connect.
+/// [`run_on`] with its steps as parameters, so a test can see their order: bind `agent.sock`, bind `request.sock`
+/// (`bind_requests`, which says nothing when the agent keeps none), then mark, then serve the request socket,
+/// then accept. The marker comes after both binds return, which include `listen`, so a shim that wakes on it
+/// finds both sockets and can connect.
 #[cfg(windows)]
-fn run_on_with<L>(
+fn run_on_with<L, Q>(
     location: &SocketLocation,
     bind: impl FnOnce(&Path) -> anyhow::Result<L>,
+    bind_requests: impl FnOnce() -> Option<Q>,
     mark: impl FnOnce(&SocketLocation) -> std::io::Result<()>,
+    serve_requests: impl FnOnce(Q),
     accept_loop: impl FnOnce(L) -> anyhow::Error,
 ) -> anyhow::Result<()> {
     let listener = bind(location.path())?;
+    let requests = bind_requests();
     mark(location).map_err(|e| anyhow::Error::new(e).context("write the serving marker"))?;
+    if let Some(requests) = requests {
+        serve_requests(requests);
+    }
     Err(accept_loop(listener))
 }
 
@@ -486,7 +670,8 @@ type NotServed<C> = (C, std::io::Error);
 /// for its connection (it returns the connection and the error, having given up its `Live`), is
 /// waited out: the loop blocks until one of this agent's own connections ends, which is the only thing
 /// that can free any of those, and then accepts again, or serves the same connection again if it was
-/// kept. With no live connection nothing can, and the shortage is fatal.
+/// kept. With no live connection nothing can, and the shortage is fatal: the loop decides the end
+/// (see [`serve_connections_with`]).
 #[cfg(all(windows, test))]
 fn serve_connections<C>(
     accept: impl FnMut() -> Result<C, AcceptError>,
@@ -511,6 +696,13 @@ fn serve_connections_observed<C>(
 ///
 /// `stopping` is asked before every `accept`; once it says so the loop returns [`Stopped`]. The
 /// party that makes it true must also make a blocked `accept` return (a connection of its own).
+///
+/// A shortage that meets no live connection decides the end here, in one step under the tally's lock
+/// ([`Connections::decide_end_if_idle`]), while the loop still holds the connection it kept: that connection is
+/// served once more, as when `stopping` says so, and the loop returns the shortage with [`NothingLive`] as its
+/// context, and the tally keeps the cause for the main thread ([`run_ended`]). If a connection became live or ended
+/// meanwhile (it may have freed what the loop lacks) the end stays undecided and the loop goes round again, with
+/// the kept connection still held. Both loops of the agent get the rule from here.
 #[cfg(windows)]
 fn serve_connections_with<C>(
     connections: Arc<Connections>,
@@ -525,14 +717,7 @@ fn serve_connections_with<C>(
     let mut kept = None;
     loop {
         if stopping() {
-            // The end is decided while a connection waits for a thread. It is served once more, which
-            // gets it the ending refusal (see `handle_connection_in`) and counts it, so the drain waits
-            // for the refusal. If there is still no thread, its client sees the agent end.
-            if let Some(conn) = kept.take()
-                && let Err((_, e)) = serve(conn, connections.begin())
-            {
-                tracing::warn!("no thread to refuse a connection with ({e}); closing it as the agent ends");
-            }
+            refuse_kept(kept.take(), &connections, &mut serve);
             return anyhow::Error::new(Stopped);
         }
         // Read before the attempt: a connection that ends while it fails is then not missed.
@@ -570,9 +755,28 @@ fn serve_connections_with<C>(
             }
             Err(AcceptError::Fatal(e)) => return e.context("the listener failed"),
         };
-        if !connections.wait_for_an_end(ended_before, &mut blocking) {
-            return shortage.context("no connection of this agent is live to free a resource");
+        if !connections.wait_for_an_end(ended_before, &mut blocking)
+            && connections.decide_end_if_idle(ended_before, &shortage)
+        {
+            refuse_kept(kept.take(), &connections, &mut serve);
+            return shortage.context(NothingLive);
         }
+    }
+}
+
+/// Serve the connection `kept` for want of a thread once more, now that the end is decided (see
+/// [`serve_connections_with`]): it is counted, so the drain waits for its refusal. With no thread for that either,
+/// its client sees the agent end.
+#[cfg(windows)]
+fn refuse_kept<C>(
+    kept: Option<C>,
+    connections: &Arc<Connections>,
+    serve: &mut impl FnMut(C, Live) -> Result<(), NotServed<C>>,
+) {
+    if let Some(conn) = kept
+        && let Err((_, e)) = serve(conn, connections.begin())
+    {
+        tracing::warn!("no thread to refuse a connection with ({e}); closing it as the agent ends");
     }
 }
 
@@ -629,14 +833,15 @@ fn handle_connection_with(conn: socket2::Socket, hooks: Hooks) -> anyhow::Result
     handle_connection_in(conn, hooks, &Control::standalone())
 }
 
-/// What a session runs with: the hooks a test can replace, the agent's shared control, and the token its
+/// What a session runs with: the hooks a test can replace, the agent's shared control, the token its
 /// shell runs with in place of the agent's, if the login did not ask for an elevated session and the agent is
-/// elevated.
+/// elevated, and the id its environment carries.
 #[cfg(windows)]
 struct Env<'a> {
     hooks: Hooks,
     control: &'a Control,
     unelevated: Option<UnelevatedToken>,
+    reservation: Reservation<'a>,
 }
 
 /// How a session obtains its [`HangupWatcher`]; a parameter so a test can force a failure.
@@ -644,17 +849,24 @@ struct Env<'a> {
 type WatchFactory = fn(&ConnTx) -> std::io::Result<(HangupWatcher, Waker)>;
 
 /// How a session starts its shell in a pseudoconsole (`command`, `cols`, `rows`, `cwd`, and the one
-/// handle besides the pseudoconsole's that the shell inherits, if any, and the token the shell runs
-/// with in place of the agent's, if any); a parameter so a test can force a failure without starting a
-/// process.
+/// handle besides the pseudoconsole's that the shell inherits, if any, the token the shell runs
+/// with in place of the agent's, if any, and the variables put over its environment); a parameter so a
+/// test can force a failure without starting a process.
 #[cfg(windows)]
-type PtyStarter =
-    fn(&str, u16, u16, Option<&Path>, Option<&OwnedHandle>, Option<&UnelevatedToken>) -> Result<PtySession, StartError>;
+type PtyStarter = fn(
+    &str,
+    u16,
+    u16,
+    Option<&Path>,
+    Option<&OwnedHandle>,
+    Option<&UnelevatedToken>,
+    &[(&str, &str)],
+) -> Result<PtySession, StartError>;
 
-/// How a session starts its command on pipes (`command`, `cwd`, and the token it runs with in place of
-/// the agent's, if any); a parameter like [`PtyStarter`].
+/// How a session starts its command on pipes (`command`, `cwd`, the token it runs with in place of
+/// the agent's, if any, and the variables put over its environment); a parameter like [`PtyStarter`].
 #[cfg(windows)]
-type ExecStarter = fn(&str, Option<&Path>, Option<&UnelevatedToken>) -> Result<ExecChild, StartError>;
+type ExecStarter = fn(&str, Option<&Path>, Option<&UnelevatedToken>, &[(&str, &str)]) -> Result<ExecChild, StartError>;
 
 /// How a connection is split into halves; a parameter so a test can force a failure.
 #[cfg(windows)]
@@ -727,40 +939,11 @@ fn serve_connection(conn: socket2::Socket, hooks: Hooks, control: &Control) -> a
 /// it sends anything has nothing to be told, and is not an error.
 #[cfg(windows)]
 fn handle_connection_in(conn: socket2::Socket, hooks: Hooks, control: &Control) -> anyhow::Result<()> {
-    let (mut rx, mut tx) = match (hooks.split)(conn) {
-        Ok(halves) => halves,
-        Err((whole, cause)) => {
-            let (mut rx, mut tx) = (&whole, &whole);
-            return Err(logout::fail_connection(
-                &mut rx,
-                &mut tx,
-                control,
-                "the agent could not set up the connection",
-                cause,
-                logout::FAILED_EXIT_CODE,
-            ));
-        }
-    };
-    let mut fr = FrameReader::new();
-    let hs = match read_handshake(&mut rx, &mut fr) {
-        Ok(Some(hs)) => hs,
-        Ok(None) => return Ok(()),
-        Err(cause) => {
-            return Err(logout::fail_connection(
-                &mut rx,
-                &mut tx,
-                control,
-                "the agent could not read the request",
-                cause,
-                logout::BAD_REQUEST_EXIT_CODE,
-            ));
-        }
+    let Some(Opened { mut rx, fr, mut tx, hs }) = read_request(hooks.split, conn, control)? else {
+        return Ok(());
     };
     if hs.mode == Mode::Logout {
-        return logout::handle_logout(&mut rx, &mut tx, control, || {
-            tracing::info!("the background session has ended");
-            end_process(0)
-        });
+        return logout::handle_logout(&mut rx, &mut tx, control, |outcome| finish_settled(outcome));
     }
     // Before a shell is started for nothing; the registration below is what decides.
     if control.is_ending() {
@@ -820,6 +1003,22 @@ fn handle_connection_in(conn: socket2::Socket, hooks: Hooks, control: &Control) 
             ));
         }
     };
+    // The session's id, before its program starts: its environment carries it. The agent that began to
+    // end meanwhile refuses the login as it does at the top.
+    let reservation = match control.reserve() {
+        Ok(Some(reservation)) => reservation,
+        Ok(None) => return logout::refuse_while_ending(&mut rx, &mut tx, control),
+        Err(cause) => {
+            return Err(logout::fail_connection(
+                &mut rx,
+                &mut tx,
+                control,
+                "the agent could not give the session an id",
+                cause,
+                logout::FAILED_EXIT_CODE,
+            ));
+        }
+    };
     // The answer `Serving` is written by the handler, once the session's process has started.
     let cwd_buf = child_cwd(&hs.cwd, home_dir());
     let cwd = cwd_buf.as_deref();
@@ -827,11 +1026,56 @@ fn handle_connection_in(conn: socket2::Socket, hooks: Hooks, control: &Control) 
         hooks,
         control,
         unelevated,
+        reservation,
     };
     match hs.mode {
         Mode::Pty => handle_pty(rx, fr, tx, &launched, (hs.cols, hs.rows), cwd, env),
         Mode::Exec => handle_exec(rx, fr, tx, &launched, cwd, env),
         Mode::Logout => unreachable!("answered above"),
+    }
+}
+
+/// A connection split into halves, with the handshake that opened it.
+#[cfg(windows)]
+struct Opened {
+    rx: ConnRx,
+    /// The reader that read the handshake, with anything it read past it.
+    fr: FrameReader,
+    tx: ConnTx,
+    hs: Handshake,
+}
+
+/// Split a connection and read the handshake that opens it: the start of every connection, whichever socket it
+/// came on. `None` if the client left before it sent a byte. An `Err` has been answered already (see
+/// [`logout::fail_connection`]) and is for the log.
+#[cfg(windows)]
+fn read_request(split: Splitter, conn: socket2::Socket, control: &Control) -> anyhow::Result<Option<Opened>> {
+    let (mut rx, mut tx) = match split(conn) {
+        Ok(halves) => halves,
+        Err((whole, cause)) => {
+            let (mut rx, mut tx) = (&whole, &whole);
+            return Err(logout::fail_connection(
+                &mut rx,
+                &mut tx,
+                control,
+                "the agent could not set up the connection",
+                cause,
+                logout::FAILED_EXIT_CODE,
+            ));
+        }
+    };
+    let mut fr = FrameReader::new();
+    match read_handshake(&mut rx, &mut fr) {
+        Ok(Some(hs)) => Ok(Some(Opened { rx, fr, tx, hs })),
+        Ok(None) => Ok(None),
+        Err(cause) => Err(logout::fail_connection(
+            &mut rx,
+            &mut tx,
+            control,
+            "the agent could not read the request",
+            cause,
+            logout::BAD_REQUEST_EXIT_CODE,
+        )),
     }
 }
 
@@ -961,7 +1205,10 @@ fn handle_pty(
         hooks,
         control,
         unelevated,
+        reservation,
     } = env;
+    let id = reservation.id().to_string();
+    let session_env = [(SESSION_VARIABLE, id.as_str())];
     // The warning for a shell that could not be used is printed by `console-fallback` inside the
     // pseudoconsole, which clears the screen after anything written ahead of it. Without this
     // program's path it goes out here, before the output threads exist: after `Serving`.
@@ -971,14 +1218,24 @@ fn handle_pty(
         launched,
         broker_exe(),
         |spawn| match spawn {
-            launch::Spawn::Line(line) => (hooks.start_pty)(line, cols, rows, cwd, None, unelevated.as_ref()),
+            launch::Spawn::Line(line) => {
+                (hooks.start_pty)(line, cols, rows, cwd, None, unelevated.as_ref(), &session_env)
+            }
             launch::Spawn::Verb {
                 exe,
                 notice,
                 line,
                 login,
             } => verb::start(exe, notice, line, login, |verb_line, read| {
-                (hooks.start_pty)(verb_line, cols, rows, cwd, Some(read), unelevated.as_ref())
+                (hooks.start_pty)(
+                    verb_line,
+                    cols,
+                    rows,
+                    cwd,
+                    Some(read),
+                    unelevated.as_ref(),
+                    &session_env,
+                )
             }),
         },
         |text| notices.push(text.to_owned()),
@@ -1003,7 +1260,7 @@ fn handle_pty(
     });
     (hooks.after_spawn)();
     let job = session.job();
-    let Some(_registration) = register_session(control, &job) else {
+    let Some(_registration) = register_session(reservation, &job) else {
         tracing::debug!("the agent is ending; the shell warnings of a refused login are not shown: {notices:?}");
         close_unserved_pty(session, &*hooks.observe);
         return logout::refuse_while_ending(&mut rx, &mut tx, control);
@@ -1196,9 +1453,9 @@ fn close_while_draining(mut read_chunk: impl FnMut() -> usize + Send, close: imp
 /// ending: the tree is ended here, at once, and the caller answers the login with the refusal
 /// instead of relaying a shell that is gone.
 #[cfg(windows)]
-fn register_session<'a>(control: &'a Control, job: &Arc<cosca::Job>) -> Option<logout::Registration<'a>> {
+fn register_session<'a>(reservation: Reservation<'a>, job: &Arc<cosca::Job>) -> Option<logout::Registration<'a>> {
     let kill_job = Arc::clone(job);
-    let registration = control.register(Arc::new(move || {
+    let registration = reservation.register(Arc::new(move || {
         reap_tree(&kill_job);
     }));
     if registration.is_none() {
@@ -1248,7 +1505,10 @@ fn handle_exec(
         hooks,
         control,
         unelevated,
+        reservation,
     } = env;
+    let id = reservation.id().to_string();
+    let session_env = [(SESSION_VARIABLE, id.as_str())];
     // The warning for a shell that could not be used goes out after `Serving`.
     let mut notices = Vec::new();
     let started = launch::start(
@@ -1256,7 +1516,7 @@ fn handle_exec(
         launched,
         None,
         |spawn| match spawn {
-            launch::Spawn::Line(line) => (hooks.start_exec)(line, cwd, unelevated.as_ref()),
+            launch::Spawn::Line(line) => (hooks.start_exec)(line, cwd, unelevated.as_ref(), &session_env),
             launch::Spawn::Verb { .. } => Err(StartError::Other(anyhow::anyhow!(
                 "a session without a pseudoconsole is given no verb"
             ))),
@@ -1279,7 +1539,7 @@ fn handle_exec(
     };
     (hooks.after_spawn)();
     let job = child.job();
-    let Some(_registration) = register_session(control, &job) else {
+    let Some(_registration) = register_session(reservation, &job) else {
         tracing::debug!("the agent is ending; the shell warnings of a refused login are not shown: {notices:?}");
         return logout::refuse_while_ending(&mut rx, &mut tx, control);
     };

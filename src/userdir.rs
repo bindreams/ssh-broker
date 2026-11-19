@@ -104,6 +104,14 @@ impl SocketDir {
     pub fn connect(&self) -> anyhow::Result<socket2::Socket> {
         crate::afunix::connect(self.location.path())
     }
+
+    /// Connect to the request socket in the folder held. The only way to connect to it, as [`SocketDir::connect`]
+    /// is for `agent.sock`.
+    ///
+    /// A path over the limit is a [`socket_loc::RequestPathTooLong`], no connect being made.
+    pub fn connect_request(&self) -> anyhow::Result<socket2::Socket> {
+        crate::afunix::connect(&self.location.checked_request_path()?)
+    }
 }
 
 /// Make `loc.dir` and its `logs` folder if they are missing, leave both exactly

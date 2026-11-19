@@ -113,6 +113,17 @@ pub fn sshd_event_logs(count: u32) -> String {
 /// A folder removed on drop.
 pub struct TempDir(pub PathBuf);
 
+impl TempDir {
+    /// An empty folder named for `tag` and this process, under the temp directory: what an earlier run with the
+    /// same process id left there is removed first.
+    pub fn new(tag: &str) -> TempDir {
+        let path = std::env::temp_dir().join(format!("sb-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).unwrap();
+        TempDir(path)
+    }
+}
+
 impl Drop for TempDir {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
@@ -182,9 +193,7 @@ fn next_login_number() -> u32 {
 /// administrator ([`Account::make_administrator`] first) the administrators' file, appended to.
 pub fn install_key(account: &Account) -> Keys {
     let n = next_login_number();
-    let dir = TempDir(std::env::temp_dir().join(format!("sb-sshkey-{}-{}-{n}", account.name, std::process::id())));
-    let _ = std::fs::remove_dir_all(&dir.0);
-    std::fs::create_dir_all(&dir.0).unwrap();
+    let dir = TempDir::new(&format!("sshkey-{}-{n}", account.name));
     let private = dir.0.join("id");
     let (ok, text) = run(
         "ssh-keygen",
@@ -558,9 +567,16 @@ impl ConsoleClient {
         let args: Vec<String> = std::iter::once(program)
             .chain(command.get_args().map(|arg| arg.to_string_lossy().into_owned()))
             .collect();
-        let console =
-            ssh_broker::conpty::PtySession::spawn(&ssh_broker::cmdline::join_args(&args), cols, rows, None, None, None)
-                .expect("start the client on a pseudoconsole");
+        let console = ssh_broker::conpty::PtySession::spawn(
+            &ssh_broker::cmdline::join_args(&args),
+            cols,
+            rows,
+            None,
+            None,
+            None,
+            &[],
+        )
+        .expect("start the client on a pseudoconsole");
         let out_read = console.out_read_raw();
         let (chunks, output) = channel();
         let reader = std::thread::Builder::new()

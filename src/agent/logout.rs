@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 
 use super::{Connections, Drained, HalfClose};
 use crate::afunix::{ConnRx, Whole};
-use crate::protocol::{ExitCode, FrameKind, Stream, write_frame};
+use crate::protocol::{ExitCode, FrameKind, SessionId, Stream, write_frame};
 use crate::relay::{write_data, write_hand_back};
 
 /// The reply of a background agent, before it ends.
@@ -49,9 +49,6 @@ pub(super) struct Control {
     background: bool,
     state: Mutex<State>,
     connections: Arc<Connections>,
-    /// Makes the accept loop look at the flag that closes it (see [`Connections::settle`]): a loop
-    /// blocked in `accept` does not otherwise notice it.
-    waker: Box<dyn Fn() + Send + Sync>,
 }
 
 type Killer = Arc<dyn Fn() + Send + Sync>;
@@ -59,8 +56,7 @@ type Killer = Arc<dyn Fn() + Send + Sync>;
 #[derive(Default)]
 struct State {
     ending: bool,
-    next_id: u64,
-    sessions: Vec<(u64, Killer)>,
+    sessions: Vec<(SessionId, Killer)>,
 }
 
 impl Control {
@@ -69,14 +65,7 @@ impl Control {
             background,
             state: Mutex::new(State::default()),
             connections,
-            waker: Box::new(|| {}),
         }
-    }
-
-    /// Call `waker` to make the accept loop return from `accept`, once the end is decided.
-    pub(super) fn with_waker(mut self, waker: impl Fn() + Send + Sync + 'static) -> Control {
-        self.waker = Box::new(waker);
-        self
     }
 
     /// A control for a connection handled outside the accept loop: a desktop agent that nobody
@@ -90,23 +79,32 @@ impl Control {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Whether the agent has begun to end: no session may start.
+    /// Whether the agent has begun to end: no session may start. That is so from a `logout` ([`Control::end_all`])
+    /// and from the decision of the end by a shortage with nothing live ([`Connections::decide_end_if_idle`]),
+    /// which has no session to end: a login counted after it is refused, so none is lost when the process ends.
     pub(super) fn is_ending(&self) -> bool {
-        self.lock().ending
+        let ending = self.lock().ending;
+        ending || self.connections.is_closing()
     }
 
-    /// Record a running session, with the means to end its shell tree. The registration lasts
-    /// while the returned guard does. `None` means the agent is already ending: the caller must
-    /// end the session itself, at once.
-    pub(super) fn register(&self, kill: Killer) -> Option<Registration<'_>> {
-        let mut state = self.lock();
-        if state.ending {
-            return None;
+    /// Give a session about to start its id, which goes into its environment
+    /// ([`SESSION_VARIABLE`](crate::protocol::SESSION_VARIABLE)) before its program runs.
+    /// `Ok(None)` means the agent is already ending: no session may start. The id is the one
+    /// [`Reservation::register`] records, and no agent run gives out an id another has.
+    pub(super) fn reserve(&self) -> anyhow::Result<Option<Reservation<'_>>> {
+        if self.is_ending() {
+            return Ok(None);
         }
-        let id = state.next_id;
-        state.next_id += 1;
-        state.sessions.push((id, kill));
-        Some(Registration { control: self, id })
+        Ok(Some(Reservation {
+            control: self,
+            id: super::session::new_id()?,
+        }))
+    }
+
+    /// Whether a session registered under `id` is running.
+    #[cfg(test)]
+    pub(super) fn is_registered(&self, id: &SessionId) -> bool {
+        self.lock().sessions.iter().any(|(registered, _)| registered == id)
     }
 
     /// Begin to end: from now on no session registers, and every registered one is ended. A login
@@ -125,14 +123,41 @@ impl Control {
     /// Wait until the shells' output is delivered, then stop the accept loop and close the listener
     /// (see [`Connections::settle`]). The process may end when this returns.
     pub(super) fn settle(&self) -> Drained {
-        self.connections.settle(&*self.waker)
+        self.connections.settle()
     }
 }
 
-/// A session recorded by [`Control::register`]; dropped when the session is over.
+/// The id of a session that has not started: dropped unregistered, it leaves nothing behind.
+pub(super) struct Reservation<'a> {
+    control: &'a Control,
+    id: SessionId,
+}
+
+impl<'a> Reservation<'a> {
+    pub(super) fn id(&self) -> &SessionId {
+        &self.id
+    }
+
+    /// Record the running session under this id, with the means to end its shell tree. The registration
+    /// lasts while the returned guard does. `None` means the agent began to end after the reservation: the
+    /// caller must end the session itself, at once.
+    pub(super) fn register(self, kill: Killer) -> Option<Registration<'a>> {
+        let mut state = self.control.lock();
+        if state.ending {
+            return None;
+        }
+        state.sessions.push((self.id, kill));
+        Some(Registration {
+            control: self.control,
+            id: self.id,
+        })
+    }
+}
+
+/// A session recorded by [`Reservation::register`]; dropped when the session is over.
 pub(super) struct Registration<'a> {
     control: &'a Control,
-    id: u64,
+    id: SessionId,
 }
 
 impl Drop for Registration<'_> {
@@ -143,13 +168,14 @@ impl Drop for Registration<'_> {
 
 /// Answer a `Logout` handshake on a connection whose handshake has been read.
 ///
-/// `end_process` ends the process; it is a parameter so a test can see when it is called. A
-/// desktop agent answers and keeps serving.
+/// `end_process` ends the process, with how that end went: the tally's record, as for every end that is settled
+/// ([`super::settled_end`]). It is a parameter so a test can see when and how it is called; production passes
+/// [`super::finish_settled`]. A desktop agent answers and keeps serving.
 pub(super) fn handle_logout<R: LimitedRead, W: std::io::Write>(
     rx: &mut R,
     tx: &mut W,
     control: &Control,
-    end_process: impl FnOnce(),
+    end_process: impl FnOnce(anyhow::Result<()>),
 ) -> anyhow::Result<()> {
     if !control.background {
         reply(tx, DESKTOP_REPLY, DESKTOP_EXIT_CODE)?;
@@ -164,7 +190,10 @@ pub(super) fn handle_logout<R: LimitedRead, W: std::io::Write>(
     let _logout = control.connections.begin_logout();
     control.end_all();
     control.settle();
-    end_process();
+    // The record is read after the settle, and it cannot change under this: a shortage is recorded only while no
+    // connection is live, and this `logout` is live until the process ends, so a cause is recorded before the
+    // handler was counted (and is read here) or never.
+    end_process(super::settled_end(&control.connections));
     Ok(())
 }
 

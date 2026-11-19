@@ -17,6 +17,9 @@ pub const SOCKET_DIR_NAME: &str = "ssh-broker";
 /// of the account below High cannot connect to what is in it. The only place the name is written.
 pub const ELEVATED_SOCKET_DIR_NAME: &str = "ssh-broker-elevated";
 pub const SOCKET_FILE_NAME: &str = "agent.sock";
+/// The socket an agent at High keeps in the plain folder for requests (`logout`) from the processes of its
+/// account below High. The only place the name is written.
+pub const REQUEST_SOCKET_FILE_NAME: &str = "request.sock";
 pub const LOCK_FILE_NAME: &str = "agent.lock";
 pub const SESSIONS_LOCK_FILE_NAME: &str = "sessions.lock";
 pub const LOGS_DIR_NAME: &str = "logs";
@@ -126,6 +129,23 @@ impl SocketLocation {
         &self.path
     }
 
+    /// The request socket: where an agent at High takes requests from the processes of its account below High.
+    /// Inside [`SocketLocation::dir`], so it is as private as `path`; only a location at [`Integrity::Medium`]
+    /// is where it is kept.
+    pub fn request_path(&self) -> PathBuf {
+        self.dir.join(REQUEST_SOCKET_FILE_NAME)
+    }
+
+    /// [`SocketLocation::request_path`], or [`RequestPathTooLong`] when it is over the limit, so that nothing
+    /// connects to it.
+    pub fn checked_request_path(&self) -> Result<PathBuf, RequestPathTooLong> {
+        let path = self.request_path();
+        match over_limit(&path) {
+            Some(_) => Err(RequestPathTooLong { path }),
+            None => Ok(path),
+        }
+    }
+
     /// The lock file the agent holds while it serves.
     pub fn lock_path(&self) -> PathBuf {
         self.dir.join(LOCK_FILE_NAME)
@@ -164,11 +184,22 @@ pub enum SocketLocationError {
     TooLong { path: PathBuf, bytes: usize, max: usize },
 }
 
-/// The socket location inside `profile` for processes at `integrity`, or why it cannot be used.
+/// The path of `request.sock` is over the limit. [`for_profile`] measures `agent.sock` only, and where that fits and
+/// this does not, no agent at High can exist for the profile: its own `agent.sock` is 7 bytes longer than this path.
+/// Nothing is there to connect to, which is what a caller that looks for an agent takes this error for
+/// ([`crate::console_prompt::is_no_agent`]).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{} is over the socket path limit, so no agent at High can exist for this profile", path.display())]
+pub struct RequestPathTooLong {
+    pub path: PathBuf,
+}
+
+/// The socket location inside `profile` for processes at `integrity`, or why it cannot be used. Only `agent.sock`
+/// is measured: `request.sock` is bound by an agent at High in the plain folder, where its path is 7 bytes
+/// shorter than that agent's own `agent.sock`, so it fits whenever the agent can start.
 pub fn for_profile(profile: &Path, integrity: Integrity) -> Result<SocketLocation, SocketLocationError> {
     let location = SocketLocation::in_profile(profile, integrity);
-    let bytes = location.path.as_os_str().len();
-    if bytes > MAX_SOCKET_PATH_BYTES {
+    if let Some(bytes) = over_limit(&location.path) {
         return Err(SocketLocationError::TooLong {
             path: location.path,
             bytes,
@@ -176,6 +207,11 @@ pub fn for_profile(profile: &Path, integrity: Integrity) -> Result<SocketLocatio
         });
     }
     Ok(location)
+}
+
+/// The length of `path` in bytes if it is over [`MAX_SOCKET_PATH_BYTES`]: the one place a socket path is measured.
+fn over_limit(path: &Path) -> Option<usize> {
+    Some(path.as_os_str().len()).filter(|bytes| *bytes > MAX_SOCKET_PATH_BYTES)
 }
 
 #[cfg(test)]

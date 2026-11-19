@@ -213,7 +213,7 @@ fn socket_file_row_passes_for_a_socket_bound_by_this_user() {
 
 #[test]
 fn socket_file_row_fails_when_no_agent_has_bound() {
-    let profile = TempProfile::new("row-file-absent");
+    let profile = TempProfile::new("row-file-none");
     let loc = profile.location();
     ensure_socket_dir(&loc, &me()).unwrap();
 
@@ -315,7 +315,11 @@ fn the_row_for_an_unelevated_administrator_says_why_nothing_can_be_checked_here(
 
     assert!(!row.pass, "nothing was proven");
     assert_eq!(row.name, "socket reachable");
-    assert!(row.detail.contains("administrator"), "{}", row.detail);
+    assert!(
+        row.detail.contains("this account's agent serves elevated processes"),
+        "{}",
+        row.detail
+    );
     assert!(row.detail.contains("elevated prompt"), "{}", row.detail);
     assert!(row.detail.contains("SSH_BROKER_ELEVATION=always"), "{}", row.detail);
     assert!(

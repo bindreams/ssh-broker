@@ -344,17 +344,16 @@ fn a_login_that_arrives_while_the_agent_drains_gets_the_refusal_at_once() {
     let (events, on_event) = mpsc::channel();
     let connections = super::Connections::observing_drain({
         let events = events.clone();
-        move || {
+        move |_| {
             let _ = events.send("draining");
         }
     });
     // A connection that is still relaying: the drain cannot finish until the test lets it go.
     let relaying = connections.begin();
-    let control =
-        Arc::new(super::Control::new(true, Arc::clone(&connections)).with_waker(wake_through(&connections, &sock)));
+    let control = Arc::new(super::Control::new(true, Arc::clone(&connections)));
     let serving = thread::spawn({
-        let (connections, control) = (Arc::clone(&connections), Arc::clone(&control));
-        move || super::serve_until_drained(listener, &connections, &control)
+        let (connections, control, wake) = (Arc::clone(&connections), Arc::clone(&control), wake_through(&sock));
+        move || super::serve_until_drained(listener, wake, &connections, &control)
     });
     // What the `logout` handler does.
     control.end_all();
@@ -386,16 +385,10 @@ fn a_login_that_arrives_while_the_agent_drains_gets_the_refusal_at_once() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// The wake the agent uses: a connect to its own listener, on a thread of its own.
-fn wake_through(
-    connections: &std::sync::Arc<super::Connections>,
-    sock: &std::path::Path,
-) -> impl Fn() + Send + Sync + 'static {
-    let (connections, sock) = (std::sync::Arc::clone(connections), sock.to_path_buf());
-    move || {
-        let sock = sock.clone();
-        super::wake_without_blocking(&connections, move || afunix::connect(&sock).map(drop))
-    }
+/// The wake the agent uses: a connect to its own listener.
+fn wake_through(sock: &std::path::Path) -> super::WakeConnect {
+    let sock = sock.to_path_buf();
+    std::sync::Arc::new(move || afunix::connect(&sock).map(drop))
 }
 
 /// A login that the accept loop has taken from the listener and not yet counted, when the agent
@@ -413,12 +406,11 @@ fn a_login_accepted_while_the_end_is_decided_is_refused_not_reset() {
     let (events, on_event) = mpsc::channel::<&'static str>();
     let connections = super::Connections::observing_drain({
         let events = events.clone();
-        move || {
+        move |_| {
             let _ = events.send("parked");
         }
     });
-    let control =
-        Arc::new(super::Control::new(true, Arc::clone(&connections)).with_waker(wake_through(&connections, &sock)));
+    let control = Arc::new(super::Control::new(true, Arc::clone(&connections)));
     control.end_all();
 
     // The login: its handshake and the stdin end marker, then whatever the agent answers.
@@ -444,10 +436,11 @@ fn a_login_accepted_while_the_end_is_decided_is_refused_not_reset() {
     let (accepted, wait_accepted) = mpsc::channel();
     let (go_on, wait_go_on) = mpsc::channel::<()>();
     let serving = thread::spawn({
-        let (connections, control) = (Arc::clone(&connections), Arc::clone(&control));
+        let (connections, control, wake) = (Arc::clone(&connections), Arc::clone(&control), wake_through(&sock));
         move || {
             super::serve_until_drained_in(
                 listener,
+                wake,
                 &connections,
                 || control.is_ending(),
                 |listener| {
@@ -464,6 +457,7 @@ fn a_login_accepted_while_the_end_is_decided_is_refused_not_reset() {
                         &connections,
                         &control,
                         || connections.is_closing(),
+                        |conn, control| super::serve_connection(conn, Hooks::production(), control),
                     )
                 },
             )
@@ -1464,4 +1458,63 @@ fn a_configured_shell_that_ends_with_dll_not_found_gets_a_warning_naming_the_set
         !format!("{stdout}{stderr}").contains("STATUS_DLL_NOT_FOUND"),
         "{stdout:?} {stderr:?}"
     );
+}
+
+// The id of a session -----
+
+/// Run a command that prints its session id and then waits for its stdin to end, as an EXEC session of
+/// `control`. When the id is printed the session is running: it checks that `control` has registered that id,
+/// and ends the command. Returns the id the command printed.
+fn the_id_a_running_session_prints(tag: &str, control: &super::Control) -> crate::protocol::SessionId {
+    use crate::protocol::{SESSION_VARIABLE, SessionId, read_one_frame};
+    let (server, client, dir) = crate::test_support::raw_socket_pair(tag);
+    let id = thread::scope(|scope| {
+        scope.spawn(|| super::handle_connection_in(server, Hooks::production(), control).unwrap());
+        let (mut crx, mut ctx) = afunix::split(client).unwrap();
+        let hs = Handshake {
+            mode: Mode::Exec,
+            command: Some(format!("cmd.exe /c \"set {SESSION_VARIABLE} & more\"")),
+            ..Handshake::pty_default()
+        };
+        write_frame(&mut ctx, FrameKind::Handshake, &hs.encode().unwrap()).unwrap();
+        let (mut fr, mut printed, mut id) = (FrameReader::new(), String::new(), None);
+        loop {
+            let frame = read_one_frame(&mut crx, &mut fr).unwrap();
+            match frame.kind {
+                FrameKind::Serving => {}
+                FrameKind::Data => {
+                    printed.push_str(&String::from_utf8_lossy(&frame.payload[1..]));
+                    let prefix = format!("{SESSION_VARIABLE}=");
+                    // Output arrives in frames of any size: the id is read once its line has ended.
+                    let line_of_id = printed
+                        .find(&prefix)
+                        .map(|at| &printed[at + prefix.len()..])
+                        .and_then(|text| text.find(['\r', '\n']).map(|end| &text[..end]));
+                    if let (None, Some(digits)) = (id, line_of_id) {
+                        let found = SessionId::parse(digits)
+                            .unwrap_or_else(|| panic!("what the session printed is no id: {printed:?}"));
+                        assert!(control.is_registered(&found), "the id the session has is registered");
+                        id = Some(found);
+                        write_data(&mut ctx, Stream::Stdin, b"").unwrap();
+                    }
+                }
+                FrameKind::Exit => break,
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        id.expect("the session printed its id")
+    });
+    assert!(!control.is_registered(&id), "the entry ends with the session");
+    std::fs::remove_dir_all(&dir).ok();
+    id
+}
+
+/// Each session gets an id of its own before its program starts, in its environment, and the agent registers
+/// that id.
+#[test]
+fn agent_puts_one_random_id_in_each_session_and_registers_that_id() {
+    let control = super::Control::new(false, super::Connections::new());
+    let first = the_id_a_running_session_prints("id-first", &control);
+    let second = the_id_a_running_session_prints("id-second", &control);
+    assert_ne!(first, second, "an id is not given out twice");
 }

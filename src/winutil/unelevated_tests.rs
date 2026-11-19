@@ -57,6 +57,7 @@ fn with_child_token<R>(token: &UnelevatedToken, read: impl FnOnce(HANDLE) -> R) 
             [null; 3],
             &[],
             Some(token),
+            &[],
         )
     }
     .expect("start a child with the unelevated token");
@@ -207,7 +208,8 @@ fn the_production_step_down_follows_the_table_at_this_process_s_level() {
 #[test]
 fn a_command_on_pipes_and_one_in_a_pseudoconsole_run_with_the_token() {
     let token = UnelevatedToken::of_this_process().expect("make the token");
-    let on_pipes = crate::pipes::ExecChild::spawn("cmd.exe /c exit 5", None, Some(&token)).expect("start on pipes");
+    let on_pipes =
+        crate::pipes::ExecChild::spawn("cmd.exe /c exit 5", None, Some(&token), &[]).expect("start on pipes");
     let (out, err) = (drain(on_pipes.stdout_read_raw()), drain(on_pipes.stderr_read_raw()));
     let code = on_pipes.wait();
     // Join before any assert: the readers use handles `on_pipes` closes.
@@ -218,7 +220,7 @@ fn a_command_on_pipes_and_one_in_a_pseudoconsole_run_with_the_token() {
         "on pipes, the child said:
 {said}"
     );
-    let mut in_pty = crate::conpty::PtySession::spawn("cmd.exe /c exit 6", 80, 24, None, None, Some(&token))
+    let mut in_pty = crate::conpty::PtySession::spawn("cmd.exe /c exit 6", 80, 24, None, None, Some(&token), &[])
         .expect("start in a pseudoconsole");
     let output = drain(in_pty.out_read_raw());
     let code = in_pty.wait();

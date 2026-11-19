@@ -522,3 +522,45 @@ fn a_version_4_handshake_is_refused_with_the_version_message() {
     let error = Handshake::decode(&bytes).unwrap_err().to_string();
     assert!(error.contains("peer 4") && error.contains("ours 5"), "{error}");
 }
+
+// The session id -----
+
+#[test]
+fn the_session_variable_is_named_as_the_contract_gives_it() {
+    assert_eq!(SESSION_VARIABLE, "SSH_BROKER_SESSION");
+}
+
+#[test]
+fn session_id_displays_32_lower_hex_and_parses_only_that() {
+    let id = SessionId::from_bytes([
+        0x00, 0x01, 0xab, 0xcd, 0xef, 0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80, 0x90, 0xa0, 0xff,
+    ]);
+    let shown = id.to_string();
+    assert_eq!(shown, "0001abcdef102030405060708090a0ff");
+    assert_eq!(SessionId::parse(&shown), Some(id), "what is shown is read back");
+
+    let upper = shown.to_uppercase();
+    assert_eq!(SessionId::parse(&upper), None, "upper case is not the form");
+    assert_eq!(SessionId::parse(&shown[..31]), None, "31 digits");
+    assert_eq!(SessionId::parse(&format!("{shown}0")), None, "33 digits");
+    assert_eq!(SessionId::parse(&format!("g{}", &shown[1..])), None, "a non-hex digit");
+    assert_eq!(
+        SessionId::parse(&format!(" {}", &shown[1..])),
+        None,
+        "padding in place of a digit"
+    );
+    assert_eq!(SessionId::parse(&format!("{shown} ")), None, "trailing padding");
+    assert_eq!(SessionId::parse(""), None, "empty");
+    assert_eq!(
+        SessionId::parse("+0000000000000000000000000000000"),
+        None,
+        "a sign is not a digit"
+    );
+    let wide = format!("{}ab", "\u{3042}".repeat(10));
+    assert_eq!(wide.len(), 32);
+    assert_eq!(
+        SessionId::parse(&wide),
+        None,
+        "multi-byte characters of the right byte length"
+    );
+}

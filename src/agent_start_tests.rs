@@ -395,7 +395,7 @@ fn a_failed_reset_is_reported_on_stderr_when_the_start_is_refused() {
 
 #[test]
 fn a_failed_reset_goes_to_stderr_and_to_the_log_when_it_opens() {
-    let profile = TempProfile::new("start-reset-log");
+    let profile = TempProfile::new("start-rst-log");
     let loc = profile.location();
     let captured = Captured::default();
     let subscriber = tracing_subscriber::fmt()
@@ -571,11 +571,13 @@ fn every_agent_marks_after_bind() {
             events.borrow_mut().push("bind");
             Ok(())
         },
+        || None::<()>,
         |at| {
             assert_eq!(at, &loc);
             events.borrow_mut().push("mark");
             Ok(())
         },
+        |()| panic!("an agent with no request socket serves none"),
         |()| {
             events.borrow_mut().push("accept");
             anyhow::anyhow!("end of loop")
@@ -588,12 +590,14 @@ fn every_agent_marks_after_bind() {
 
 #[test]
 fn a_failed_bind_marks_nothing_and_accepts_nothing() {
-    let profile = TempProfile::new("marker-bindfail");
+    let profile = TempProfile::new("marker-nobind");
     let loc = profile.location();
     let err = run_on_with(
         &loc,
         |_| -> anyhow::Result<()> { anyhow::bail!("not safe to bind") },
+        || -> Option<()> { panic!("no request socket without a listener") },
         |_| panic!("no marker without a listener"),
+        |()| panic!("no request socket served without a listener"),
         |()| panic!("no accept without a listener"),
     )
     .unwrap_err();
@@ -607,7 +611,9 @@ fn a_failed_marker_write_ends_the_agent_before_it_accepts() {
     let err = run_on_with(
         &loc,
         |_| Ok(()),
+        || None::<()>,
         |_| Err(std::io::Error::other("disk full")),
+        |()| panic!("a shim cannot be woken, so no request socket is served"),
         |()| panic!("a shim cannot be woken, so nothing is accepted"),
     )
     .unwrap_err();
@@ -765,6 +771,7 @@ fn the_listener_is_closed_when_the_loop_stops_and_not_held_until_the_process_end
 
     let end = serve_until_drained_in(
         Closes(Arc::clone(&flag)),
+        Arc::new(|| Ok(())),
         &connections,
         || false,
         |_| anyhow::Error::new(Stopped),
@@ -782,6 +789,7 @@ fn the_listener_is_closed_when_the_loop_fails_too() {
 
     let end = serve_until_drained_in(
         Closes(Arc::clone(&flag)),
+        Arc::new(|| Ok(())),
         &connections,
         || false,
         |_| anyhow::anyhow!("the listener failed"),
@@ -791,6 +799,37 @@ fn the_listener_is_closed_when_the_loop_fails_too() {
     assert!(closed(&flag));
 }
 
+/// The loop of `agent.sock` that meets a shortage with nothing live leaves the end decided in the tally, as the loop
+/// of `request.sock` does: a request counted after it is refused, not cut when the process ends.
+#[test]
+fn a_shortage_with_nothing_live_on_the_main_loop_leaves_the_end_decided() {
+    let connections = Connections::new();
+    let control = Arc::new(Control::new(true, Arc::clone(&connections)));
+    let end = serve_until_drained_in(
+        (),
+        Arc::new(|| Ok(())),
+        &connections,
+        || control.is_ending(),
+        |()| {
+            accept_loop_with(
+                || {
+                    Err(AcceptError::Exhausted {
+                        code: 10055,
+                        source: std::io::Error::from_raw_os_error(10055),
+                    })
+                },
+                &connections,
+                &control,
+                || connections.is_closing(),
+                |_conn, _control| Ok(()),
+            )
+        },
+    );
+    assert!(end.downcast_ref::<NothingLive>().is_some(), "{end:#}");
+    assert!(connections.is_closing(), "the end is decided in the tally");
+    assert!(control.is_ending(), "a request counted now is refused");
+}
+
 // deciding the end -----
 
 /// The accept loop as the end meets it: blocked in `accept` until it is woken, it takes one more
@@ -798,6 +837,7 @@ fn the_listener_is_closed_when_the_loop_fails_too() {
 /// the test releases it. It says what it does on `events`.
 fn accepting_loop(
     connections: &Arc<Connections>,
+    listener: Arc<HeldListener>,
     woken: std::sync::mpsc::Receiver<()>,
     release: std::sync::mpsc::Receiver<()>,
     events: std::sync::mpsc::Sender<&'static str>,
@@ -810,7 +850,7 @@ fn accepting_loop(
         }
         let late = connections.begin();
         let _ = events.send("counted");
-        connections.listener_closed();
+        listener.close();
         let _ = release.recv();
         let _ = events.send("releasing");
         drop(late);
@@ -823,20 +863,21 @@ fn the_end_is_judged_only_after_the_accept_loop_has_counted_what_it_took_and_clo
     let (events, on_event) = mpsc::channel::<&'static str>();
     let connections = Connections::observing_drain({
         let events = events.clone();
-        move || {
+        move |_| {
             let _ = events.send("parked");
         }
     });
-    connections.listener_opened();
     let (wake, woken) = mpsc::channel();
+    // The loop, not the wake, closes the listener: after it has counted what it took.
+    let listener = HeldListener::open(&connections, "agent.sock", move |_| {
+        let _ = wake.send(());
+    });
     let (release, released) = mpsc::channel();
-    let accepting = accepting_loop(&connections, woken, released, events.clone());
+    let accepting = accepting_loop(&connections, listener, woken, released, events.clone());
     let settler = std::thread::spawn({
         let (connections, events) = (Arc::clone(&connections), events.clone());
         move || {
-            let drained = connections.settle(&move || {
-                let _ = wake.send(());
-            });
+            let drained = connections.settle();
             let _ = events.send("settled");
             drained
         }
@@ -874,7 +915,7 @@ fn the_end_is_judged_only_after_the_accept_loop_has_counted_what_it_took_and_clo
 #[test]
 fn an_end_with_no_accept_loop_wakes_nothing_and_waits_for_nothing() {
     let connections = Connections::new();
-    let drained = connections.settle(&|| panic!("there is no loop to wake"));
+    let drained = connections.settle();
     assert_eq!(drained, Drained::Complete);
     assert!(
         connections.is_closing(),
@@ -882,50 +923,271 @@ fn an_end_with_no_accept_loop_wakes_nothing_and_waits_for_nothing() {
     );
 }
 
+/// "No connection is live" and the flag that says so are one step under the tally's lock: a connection is either
+/// counted before it, and the end is not decided, or after, and finds the flag up.
 #[test]
-fn a_wake_that_failed_is_logged_and_the_end_does_not_wait_for_the_loop() {
+fn the_end_is_decided_only_while_no_connection_is_live() {
     let connections = Connections::new();
-    connections.listener_opened();
-    let (log, drained) =
-        crate::test_support::logged(|| connections.settle(&|| connections.wake_failed("no thread for it")));
-    assert_eq!(drained, Drained::Complete);
+    let live = connections.begin();
+    let cause = anyhow::anyhow!("accept failed with code 10055");
+    assert!(!connections.decide_end_if_idle(connections.ended(), &cause));
+    assert!(!connections.is_closing(), "a live connection keeps the end undecided");
+    assert_eq!(connections.fatal_cause(), None, "and no cause is kept");
+
+    drop(live);
+    assert!(connections.decide_end_if_idle(connections.ended(), &cause));
+    assert!(connections.is_closing());
+}
+
+/// The loop waited for an end and found none to wait for, then decides: a connection that came and went in
+/// between may have freed what the loop lacks, so the end is decided on the count the wait saw, under one lock.
+#[test]
+fn a_connection_that_ended_since_the_wait_keeps_the_end_undecided() {
+    let connections = Connections::new();
+    let since = connections.ended();
+    drop(connections.begin());
+    let cause = anyhow::anyhow!("accept failed with code 10055");
+
+    assert!(!connections.decide_end_if_idle(since, &cause));
+    assert!(!connections.is_closing());
+    assert_eq!(connections.fatal_cause(), None);
     assert!(
-        log.contains("could not wake the accept loop: no thread for it"),
-        "{log}"
+        connections.decide_end_if_idle(connections.ended(), &cause),
+        "the next attempt, on the new count, decides"
     );
-    assert!(log.contains("ending with the listener open"), "{log}");
+}
+
+/// The cause is kept in the step that raises the flag, so whoever reads the flag up finds it. The first cause is
+/// the one kept; an end that a `logout` decided has none.
+#[test]
+fn the_end_a_shortage_decides_keeps_its_cause_with_the_flag() {
+    let connections = Connections::new();
+    assert!(connections.decide_end_if_idle(connections.ended(), &anyhow::anyhow!("accept failed with code 10055")));
+    assert!(connections.decide_end_if_idle(connections.ended(), &anyhow::anyhow!("a later shortage")));
+    assert_eq!(
+        connections.fatal_cause().as_deref(),
+        Some("accept failed with code 10055")
+    );
+
+    let logout = Connections::new();
+    logout.settle();
+    assert!(logout.is_closing());
+    assert_eq!(logout.fatal_cause(), None, "an end by logout is no failure");
+}
+
+/// A logout on `request.sock` can settle before the main thread has counted `agent.sock`'s listener: that
+/// listener is neither woken nor waited for, and its loop, whose first look at the flag comes after the
+/// count, stops by itself.
+#[test]
+fn a_listener_opened_after_the_end_was_decided_is_not_woken_and_finds_the_flag_up() {
+    let connections = Connections::new();
+    let _request = HeldListener::open(&connections, "request.sock", |listener| listener.close());
+    assert_eq!(connections.settle(), Drained::Complete);
+
+    let late = connections.listener_opened(
+        "agent.sock",
+        Arc::new(|| panic!("the end was decided before it opened")),
+    );
+
+    assert!(connections.is_closing(), "its loop is to read the flag and stop");
+    assert!(connections.listener_is_open());
+    drop(late);
+    assert!(!connections.listener_is_open());
+}
+
+/// The case of a fatal `agent.sock` loop at the end: the loop that is still in `accept` is woken by the tally,
+/// whichever loop it is and whoever asked for the end.
+#[test]
+fn a_main_loop_that_fails_while_the_agent_ends_wakes_the_request_loop_and_the_end_completes() {
+    let connections = Connections::new();
+    let (woken, on_woken) = std::sync::mpsc::channel();
+    let _request = HeldListener::open(&connections, "request.sock", move |listener| {
+        woken.send("request.sock").unwrap();
+        listener.close();
+    });
+
+    let end = finish_stopped(anyhow::anyhow!("the listener failed"), &connections, true);
+
+    assert!(format!("{end:#}").contains("the listener failed"), "{end:#}");
+    assert_eq!(on_woken.try_recv(), Ok("request.sock"));
+    assert!(!connections.listener_is_open());
 }
 
 #[test]
-fn a_wake_that_fails_on_its_own_thread_ends_the_wait_for_the_loop() {
+fn a_wake_that_fails_is_logged_with_its_socket_and_the_end_does_not_wait_for_the_loop() {
     let connections = Connections::new();
-    connections.listener_opened();
-    let (log, drained) = crate::test_support::logged(|| {
-        connections.settle(&|| {
-            wake_without_blocking(&connections, || anyhow::bail!("the connect was refused"));
-        })
-    });
+    let _loop = connections.listener_opened("request.sock", Arc::new(|| anyhow::bail!("the connect was refused")));
+    let (log, drained) = crate::test_support::logged(|| connections.settle());
     assert_eq!(drained, Drained::Complete);
-    assert!(log.contains("the connect was refused"), "{log}");
+    assert!(
+        log.contains("could not wake the accept loop of request.sock: the connect was refused"),
+        "{log}"
+    );
+}
+
+/// A loop that returns by itself while the end is decided is not one that could not be woken. Its listener is
+/// closed after it has been counted closed, so that a wake that arrives meanwhile (it connects, and finds the
+/// listener gone) is for a loop the tally no longer holds, and nothing is reported.
+#[test]
+fn a_loop_that_returns_by_itself_while_the_end_is_decided_leaves_no_warning() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Mutex, mpsc};
+
+    /// A listener that records whether it was still registered when it closed, and then lets the wake go on.
+    struct Listener {
+        connections: Arc<Connections>,
+        registered_at_close: Arc<AtomicBool>,
+        closed: Arc<AtomicBool>,
+        go: mpsc::Sender<()>,
+    }
+    impl Drop for Listener {
+        fn drop(&mut self) {
+            let registered = self.connections.listener_is_open();
+            self.registered_at_close.store(registered, Ordering::SeqCst);
+            self.closed.store(true, Ordering::SeqCst);
+            let _ = self.go.send(());
+        }
+    }
+
+    // The tally says when the end is waiting for the loops, which is after the loop's wake is on its way.
+    let (waiting, on_waiting) = mpsc::channel();
+    let waiting = Mutex::new(waiting);
+    let connections = Connections::with_drain(std::time::Duration::from_secs(30), move |_| {
+        let _ = waiting.lock().unwrap().send(());
+    });
+    let (go, on_go) = mpsc::channel();
+    let on_go = Mutex::new(on_go);
+    let closed = Arc::new(AtomicBool::new(false));
+    let registered_at_close = Arc::new(AtomicBool::new(true));
+    let wake: WakeConnect = Arc::new({
+        let closed = Arc::clone(&closed);
+        move || {
+            // The connect is made once the listener has closed.
+            let _ = on_go.lock().unwrap().recv();
+            if closed.load(Ordering::SeqCst) {
+                anyhow::bail!("the connect was refused");
+            }
+            Ok(())
+        }
+    });
+    let (accepting, on_accepting) = mpsc::channel();
+    let (release, released) = mpsc::channel::<()>();
+    let loop_thread = std::thread::spawn({
+        let connections = Arc::clone(&connections);
+        let listener = Listener {
+            connections: Arc::clone(&connections),
+            registered_at_close: Arc::clone(&registered_at_close),
+            closed,
+            go,
+        };
+        move || {
+            serve_listener("request.sock", listener, wake, &connections, |_| {
+                accepting.send(()).unwrap();
+                released.recv().unwrap();
+                anyhow::anyhow!("the loop returned by itself")
+            })
+        }
+    });
+    on_accepting.recv().unwrap();
+    let settler = std::thread::spawn({
+        let connections = Arc::clone(&connections);
+        move || crate::test_support::logged(|| connections.settle())
+    });
+    on_waiting.recv().unwrap();
+
+    release.send(()).unwrap();
+    loop_thread.join().unwrap();
+    let (log, drained) = settler.join().unwrap();
+
+    assert_eq!(drained, Drained::Complete);
+    assert!(
+        !registered_at_close.load(Ordering::SeqCst),
+        "the listener closed while it was still registered"
+    );
+    assert!(!log.contains("could not wake"), "{log}");
+}
+
+#[test]
+fn the_wake_runs_on_a_thread_of_its_own_so_the_caller_never_waits_for_it() {
+    let connections = Connections::new();
+    let (ran_on, on_thread) = std::sync::mpsc::channel();
+    let _loop = connections.listener_opened(
+        "agent.sock",
+        Arc::new(move || {
+            ran_on.send(std::thread::current().id()).unwrap();
+            anyhow::bail!("nothing to wake")
+        }),
+    );
+    // The wake fails, and the warning that says so is captured here, as in every test that makes it.
+    crate::test_support::logged(|| connections.settle());
+    assert_ne!(
+        on_thread.recv().unwrap(),
+        std::thread::current().id(),
+        "the wake ran on the caller's thread"
+    );
+}
+
+/// A wake that fails for one loop gives up on that loop only: the end goes on waiting for the other.
+#[test]
+fn a_wake_that_fails_for_one_loop_does_not_stop_the_end_from_waiting_for_the_other() {
+    let connections = Connections::new();
+    let (events, on_event) = std::sync::mpsc::channel::<&'static str>();
+    let agent = HeldListener::open(&connections, "agent.sock", {
+        let events = events.clone();
+        move |_| {
+            let _ = events.send("agent.sock woken");
+        }
+    });
+    let _request = connections.listener_opened(
+        "request.sock",
+        Arc::new({
+            let events = events.clone();
+            move || {
+                let _ = events.send("request.sock woken");
+                anyhow::bail!("the connect was refused")
+            }
+        }),
+    );
+    let settler = std::thread::spawn({
+        let (connections, events) = (Arc::clone(&connections), events.clone());
+        move || {
+            let (log, drained) = crate::test_support::logged(|| connections.settle());
+            let _ = events.send("settled");
+            (log, drained)
+        }
+    });
+    let mut woken = [on_event.recv().unwrap(), on_event.recv().unwrap()];
+    woken.sort_unstable();
+    assert_eq!(woken, ["agent.sock woken", "request.sock woken"]);
+
+    // The loop of `agent.sock` returns only now, and the end is not over before it has.
+    events.send("agent.sock closes").unwrap();
+    agent.close();
+    let (log, drained) = settler.join().unwrap();
+
+    assert_eq!(drained, Drained::Complete);
+    let order: Vec<_> = on_event.try_iter().collect();
+    assert_eq!(order, ["agent.sock closes", "settled"]);
+    assert!(log.contains("could not wake the accept loop of request.sock"), "{log}");
+    assert!(!log.contains("accept loop of agent.sock"), "{log}");
 }
 
 #[test]
 fn callers_that_ask_for_the_end_together_get_one_decision() {
     let connections = Connections::new();
-    connections.listener_opened();
     let woken = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     // The wake is what closes the listener, as it makes the loop return.
-    let wake = {
-        let (connections, woken) = (Arc::clone(&connections), Arc::clone(&woken));
-        move || {
+    let _listener = HeldListener::open(&connections, "agent.sock", {
+        let woken = Arc::clone(&woken);
+        move |listener| {
             woken.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            connections.listener_closed();
+            listener.close();
         }
-    };
+    });
     let callers: Vec<_> = (0..4)
         .map(|_| {
-            let (connections, wake) = (Arc::clone(&connections), wake.clone());
-            std::thread::spawn(move || connections.settle(&wake))
+            let connections = Arc::clone(&connections);
+            std::thread::spawn(move || connections.settle())
         })
         .collect();
     for caller in callers {
@@ -938,7 +1200,7 @@ fn callers_that_ask_for_the_end_together_get_one_decision() {
 fn a_drain_that_gave_up_on_connections_does_not_wait_for_them_a_second_time() {
     let connections = Connections::with_drain_bound(std::time::Duration::from_millis(10));
     let _hung = connections.begin();
-    let (log, drained) = crate::test_support::logged(|| connections.settle(&|| {}));
+    let (log, drained) = crate::test_support::logged(|| connections.settle());
     assert_eq!(drained, Drained::Abandoned { still_live: 1 });
     assert_eq!(log.matches("had not finished").count(), 1, "{log}");
 }
@@ -948,7 +1210,7 @@ fn a_loop_that_failed_while_the_agent_ends_still_waits_for_the_drain() {
     let (events, on_event) = std::sync::mpsc::channel();
     let connections = Connections::observing_drain({
         let events = events.clone();
-        move || {
+        move |_| {
             let _ = events.send("parked");
         }
     });
@@ -1291,7 +1553,7 @@ fn a_stopped_loop_ends_ok_only_after_every_connection_has_finished() {
     let (events, on_event) = std::sync::mpsc::channel();
     let connections = Connections::observing_drain({
         let events = events.clone();
-        move || {
+        move |_| {
             let _ = events.send("parked");
         }
     });
@@ -1324,22 +1586,6 @@ fn an_error_that_is_not_a_stop_is_still_an_error() {
     assert!(
         format!("{end:#}").contains("the listener failed"),
         "returns without waiting"
-    );
-}
-
-// the wake -----
-
-#[test]
-fn the_wake_runs_on_a_thread_of_its_own_so_the_caller_never_waits_for_it() {
-    let (ran_on, on_thread) = std::sync::mpsc::channel();
-    wake_without_blocking(&Connections::new(), move || {
-        ran_on.send(std::thread::current().id()).unwrap();
-        Ok(())
-    });
-    assert_ne!(
-        on_thread.recv().unwrap(),
-        std::thread::current().id(),
-        "the wake ran on the caller's thread"
     );
 }
 
@@ -1459,6 +1705,99 @@ fn a_kept_connection_is_served_once_more_when_the_end_is_decided_not_closed_bare
     );
     assert_eq!(handled, [1, 2]);
     assert!(end.downcast_ref::<Stopped>().is_some(), "{end:#}");
+}
+
+/// A shortage with nothing live decides the end in the loop, with the kept connection still held: it is served once
+/// more, now that the end is decided, which gets it the ending refusal.
+#[test]
+fn a_kept_connection_gets_the_ending_refusal_when_a_shortage_decides_the_end() {
+    let connections = Connections::new();
+    let mut tried = Vec::new();
+    let mut closing_at_each_try = Vec::new();
+    let end = serve_connections_with(
+        Arc::clone(&connections),
+        || Ok(1),
+        |conn, live| {
+            tried.push(conn);
+            closing_at_each_try.push(connections.is_closing());
+            if tried.len() == 1 {
+                live.abandon();
+                return Err((conn, std::io::Error::other("no thread")));
+            }
+            Ok(())
+        },
+        || {},
+        || false,
+    );
+    assert_eq!(tried, [1, 1], "the kept connection was closed without a byte");
+    assert_eq!(
+        closing_at_each_try,
+        [false, true],
+        "it is served once the end is decided"
+    );
+    assert!(end.downcast_ref::<NothingLive>().is_some(), "{end:#}");
+    assert!(connections.is_closing());
+}
+
+/// Another connection may become live before, during or after the loop's wait for one to end: the loop then waits
+/// (it is a shortage with something live) or decides the end. Whichever way it falls, the kept connection is served
+/// again: never closed without a byte by an agent that goes on.
+#[test]
+fn a_kept_connection_is_served_again_whichever_way_another_becomes_live_around_the_shortage() {
+    use std::sync::mpsc;
+    let connections = Connections::new();
+    let (go, going) = mpsc::channel::<()>();
+    let (release, released) = mpsc::channel::<()>();
+    let other = std::thread::spawn({
+        let connections = Arc::clone(&connections);
+        move || {
+            going.recv().unwrap();
+            let live = connections.begin();
+            // A loop that never serves the kept connection again drops its senders: nothing more comes.
+            let _ = released.recv();
+            drop(live);
+        }
+    });
+    let mut accepted = 0;
+    let mut tried = Vec::new();
+    let end = serve_connections_with(
+        Arc::clone(&connections),
+        || {
+            accepted += 1;
+            match accepted {
+                1 => Ok(1),
+                _ => Err(AcceptError::Fatal(anyhow::anyhow!("end of script"))),
+            }
+        },
+        |conn, live| {
+            tried.push(conn);
+            if tried.len() == 1 {
+                live.abandon();
+                go.send(()).unwrap();
+                return Err((conn, std::io::Error::other("no thread")));
+            }
+            // The other connection ends once the kept one is being served again.
+            let _ = release.send(());
+            Ok(())
+        },
+        {
+            let release = release.clone();
+            move || {
+                let _ = release.send(());
+            }
+        },
+        || false,
+    );
+    drop(release);
+    other.join().unwrap();
+    assert_eq!(tried, [1, 1], "the kept connection was closed without a byte");
+    let decided = end.downcast_ref::<NothingLive>().is_some();
+    assert!(decided || format!("{end:#}").ends_with("end of script"), "{end:#}");
+    assert_eq!(
+        decided,
+        connections.is_closing(),
+        "NothingLive is returned once the end is decided"
+    );
 }
 
 #[test]

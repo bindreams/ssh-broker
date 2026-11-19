@@ -116,9 +116,11 @@ const NO_AGENT_CODES: &[i32] = &[10050, 10061];
 /// `ErrorKind`: a connect to a missing path fails with `WSAENETDOWN`, which `NotFound` and
 /// `ConnectionRefused` would both miss, and no user would ever see the prompt.
 ///
-/// A user without a profile can be offered a session (the logon creates the profile). A path that
-/// is too long, an access denial, a protocol error and any code not observed for a missing folder, a
-/// missing file or a stale file are not "no agent": they keep today's message and fallback.
+/// A user without a profile can be offered a session (the logon creates the profile). A location whose
+/// `agent.sock` is too long is refused before any connect ([`crate::socket_loc::SocketLocationError::TooLong`]); an
+/// access denial, a protocol error and any code not observed for a missing folder, a missing file or a stale file
+/// are not "no agent" either: they keep today's message and fallback. A `request.sock` over the limit is "no agent":
+/// no agent at High can exist for that profile ([`crate::socket_loc::RequestPathTooLong`]).
 pub fn absence(connect: &anyhow::Result<socket2::Socket>, location: &anyhow::Result<SocketLocation>) -> Absence {
     let location = match location {
         Ok(location) => location,
@@ -133,9 +135,11 @@ pub fn absence(connect: &anyhow::Result<socket2::Socket>, location: &anyhow::Res
 }
 
 /// Whether a failed walk to the user's socket and connect to it means nothing serves it: a folder of
-/// the way is not there, or the OS code of the connect says so.
+/// the way is not there, no agent at High can exist for the profile (`request.sock`'s path is over the limit), or the
+/// OS code of the connect says so. See [`absence`].
 pub fn is_no_agent(error: &anyhow::Error) -> bool {
     error.is::<crate::acl::Missing>()
+        || error.is::<crate::socket_loc::RequestPathTooLong>()
         || error
             .downcast_ref::<std::io::Error>()
             .and_then(std::io::Error::raw_os_error)

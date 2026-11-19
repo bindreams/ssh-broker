@@ -572,10 +572,10 @@ fn a_logs_folder_held_open_by_another_program_does_not_stop_any_walk() {
 fn logs_can_be_renamed_while_a_walk_is_held() {
     for (tag, walk) in [
         (
-            "rename-logs-make",
+            "rn-logs-make",
             open_socket_dir as fn(&SocketLocation, &Sid) -> anyhow::Result<SocketDir>,
         ),
-        ("rename-logs-look", inspect_socket_dir),
+        ("rn-logs-look", inspect_socket_dir),
     ] {
         let profile = TempProfile::new(tag);
         let loc = profile.location();
@@ -800,6 +800,66 @@ fn an_elevated_folder_without_the_label_is_refused_and_left_as_it_is() {
     assert!(
         crate::test_support::dacl_sddl(loc.dir()).contains("D:P"),
         "and still the DACL it had"
+    );
+}
+
+/// `connect` and `connect_request` name the two sockets of the held folder, and each reaches only its own.
+#[test]
+fn connect_request_reaches_request_sock_and_connect_reaches_agent_sock() {
+    let profile = TempProfile::new("rq");
+    let loc = profile.location_at(Integrity::Medium);
+    let folder = open_socket_dir(&loc, &me()).unwrap();
+    let requests = crate::afunix::Listener::bind(&loc.request_path(), Integrity::Medium).unwrap();
+    assert!(
+        folder.connect().is_err(),
+        "nothing listens on agent.sock, and connect does not reach request.sock"
+    );
+    let _client = folder.connect_request().expect("request.sock has a listener");
+    requests.accept().expect("the connection came to request.sock");
+
+    drop(requests);
+    let agent = crate::afunix::Listener::bind(loc.path(), Integrity::Medium).unwrap();
+    let _client = folder.connect().expect("agent.sock has a listener");
+    agent.accept().expect("the connection came to agent.sock");
+}
+
+/// A profile at which `agent.sock` of the plain folder fits and `request.sock` does not (the last two byte
+/// lengths): no agent at High can exist there, since its own `agent.sock` is 7 bytes longer still. Connecting to
+/// `request.sock` says what a missing socket says, with the reason, and not that the agent could not be reached.
+#[test]
+fn a_request_socket_path_over_the_limit_is_answered_as_nothing_serving_it() {
+    let fixed = crate::socket_loc::for_profile(&PathBuf::from("x"), Integrity::Medium)
+        .unwrap()
+        .path()
+        .as_os_str()
+        .len()
+        - 1;
+    let name = format!("sb-ud-rl-{}-", std::process::id());
+    let named = std::env::temp_dir().join(&name);
+    let padding = (crate::socket_loc::MAX_SOCKET_PATH_BYTES - fixed)
+        .checked_sub(named.as_os_str().len())
+        .unwrap_or_else(|| {
+            panic!(
+                "the temp directory is too long for a profile of the length this test needs: {}",
+                named.display()
+            )
+        });
+    let root = named.with_file_name(format!("{name}{}", "x".repeat(padding)));
+    std::fs::create_dir_all(root.join("AppData").join("Local")).unwrap();
+    let profile = TempProfile(root);
+
+    let loc = profile.location();
+    assert_eq!(loc.path().as_os_str().len(), crate::socket_loc::MAX_SOCKET_PATH_BYTES);
+    assert!(loc.request_path().as_os_str().len() > crate::socket_loc::MAX_SOCKET_PATH_BYTES);
+    let folder = open_socket_dir(&loc, &me()).unwrap();
+    let err = folder.connect_request().unwrap_err();
+    assert!(crate::console_prompt::is_no_agent(&err), "{err:#}");
+    assert!(err.is::<crate::socket_loc::RequestPathTooLong>(), "{err:#}");
+    let said = format!("{err:#}");
+    assert!(said.contains("no agent at High"), "{said}");
+    assert!(
+        !said.contains("os error"),
+        "it names no connect that was not made: {said}"
     );
 }
 

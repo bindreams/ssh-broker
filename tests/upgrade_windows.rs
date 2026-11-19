@@ -618,7 +618,7 @@ fn assert_verify_passes_for_an_elevated_agent(verified: &agent_conn::Finished) {
 /// told why nothing can be checked there, and runs no probe.
 #[test]
 fn apply_then_verify_for_an_administrator_shows_an_elevated_session_and_an_unelevated_one_on_request() {
-    use ssh_broker::offer::text::FILTERED_LOOKS_ELSEWHERE;
+    use ssh_broker::offer::text::ELEVATED_AGENT_LOOKS_ELSEWHERE;
     use ssh_broker::protocol::ElevationPolicy;
 
     let _machine = machine::exclusive();
@@ -663,7 +663,7 @@ fn apply_then_verify_for_an_administrator_shows_an_elevated_session_and_an_unele
         unelevated.stderr
     );
     assert!(
-        unelevated.stdout.contains(FILTERED_LOOKS_ELSEWHERE),
+        unelevated.stdout.contains(ELEVATED_AGENT_LOOKS_ELSEWHERE),
         "the explanation is missing from:\n{}",
         unelevated.stdout
     );

@@ -1091,7 +1091,7 @@ fn the_log_folder_is_named_when_the_location_is_known_and_the_failure_is_logged_
 
 #[test]
 fn a_socket_that_is_not_there_is_nobody_listening() {
-    let profile = crate::test_support::TempProfile::new("connect-missing");
+    let profile = crate::test_support::TempProfile::new("conn-missing");
     let location = profile.location();
     // The folder is missing.
     assert!(connect_if_listening(&location, &me()).unwrap().is_none());
@@ -1130,7 +1130,7 @@ fn a_listening_socket_in_the_folder_is_connected_to() {
 /// wait.
 #[test]
 fn a_listener_in_a_refused_folder_is_not_connected_to_and_the_folder_is_named() {
-    let profile = crate::test_support::TempProfile::new("connect-refused");
+    let profile = crate::test_support::TempProfile::new("conn-refused");
     let location = profile.location();
     crate::userdir::ensure_socket_dir(&location, &me()).unwrap();
     let _listener = crate::afunix::Listener::bind(location.path(), crate::socket_loc::Integrity::Medium).unwrap();
