@@ -37,6 +37,8 @@ pub mod console_modes;
 #[cfg(windows)]
 pub mod console_prompt;
 #[cfg(windows)]
+pub mod elevate;
+#[cfg(windows)]
 pub mod filelog;
 pub mod handoff;
 #[cfg(windows)]

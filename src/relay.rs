@@ -183,6 +183,11 @@ pub fn pump_decode<R: Read>(r: &mut R, fr: &mut FrameReader, sink: &mut impl Fra
                         "unexpected HANDSHAKE frame mid-stream"
                     )));
                 }
+                FrameKind::Request => {
+                    return Err(PumpError::Protocol(anyhow::anyhow!(
+                        "unexpected Request frame: it opens a connection to the request socket and is no part of a stream"
+                    )));
+                }
             }
         }
         // `Interrupted` is documented as non-fatal and retryable — a signal arriving mid-read,

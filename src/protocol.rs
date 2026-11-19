@@ -16,6 +16,9 @@ pub const MAX_FRAME: u32 = 1 << 20;
 /// frames (the shell's warnings, then the reason on stderr) and `Exit`, never `Serving`. Any first frame ends
 /// the client's wait, and a client sends no input before it. `Serving` and `HandBack` anywhere but first are protocol errors. [`Mode::Logout`] is not answered this
 /// way.
+///
+/// `Request` (payload: an [`ElevationRequest`]) is a first frame instead of a handshake, on the request socket
+/// only; the agent reads it as it reads a handshake, and in a stream it is a protocol error.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrameKind {
@@ -25,6 +28,7 @@ pub enum FrameKind {
     Exit = 3,
     Serving = 4,
     HandBack = 5,
+    Request = 6,
 }
 
 impl FrameKind {
@@ -36,6 +40,7 @@ impl FrameKind {
             3 => Some(Self::Exit),
             4 => Some(Self::Serving),
             5 => Some(Self::HandBack),
+            6 => Some(Self::Request),
             _ => None,
         }
     }
@@ -183,7 +188,7 @@ impl std::fmt::Debug for SessionId {
 }
 
 /// The wire version; a peer of any other version is refused by name.
-pub const PROTOCOL_VERSION: u16 = 5;
+pub const PROTOCOL_VERSION: u16 = 6;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Mode {
@@ -313,6 +318,63 @@ impl Handshake {
             launch: Launch::Direct,
             elevation: Some(ElevationPolicy::DEFAULT),
         }
+    }
+}
+
+/// What `CreateProcess` takes of a command line, and so what a request may carry of a command line or a
+/// working directory, in UTF-16 units.
+pub const MAX_ELEVATION_UNITS: usize = 32_767;
+
+/// What `ssh-broker elevate` sends on `request.sock`, as the payload of a [`FrameKind::Request`] frame. Everything in
+/// it comes from a process below High: read it strictly ([`ElevationRequest::decode`]), judge it
+/// ([`ElevationRequest::check`]) and use none of it as a path but the working directory, which the agent checks
+/// to be an existing directory.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ElevationRequest {
+    /// First, so that a peer of another version is refused by name ([`ElevationRequest::decode`]).
+    pub version: u16,
+    /// The caller's [`SESSION_VARIABLE`], as it shows a [`SessionId`].
+    pub session: String,
+    /// The command line to run, as `cmdline::join_args` builds it.
+    pub command: String,
+    /// The working directory to run it in.
+    pub cwd: String,
+}
+
+impl ElevationRequest {
+    pub fn encode(&self) -> anyhow::Result<Vec<u8>> {
+        Ok(postcard::to_stdvec(self)?)
+    }
+
+    /// The request `b` holds, and nothing else: bytes after it are an error. A peer of another version is refused
+    /// by its number, before the rest is read.
+    pub fn decode(b: &[u8]) -> anyhow::Result<Self> {
+        let (version, _) = postcard::take_from_bytes::<u16>(b)?;
+        anyhow::ensure!(
+            version == PROTOCOL_VERSION,
+            "protocol version mismatch: peer {version} != ours {PROTOCOL_VERSION}"
+        );
+        let (request, rest) = postcard::take_from_bytes::<Self>(b)?;
+        anyhow::ensure!(rest.is_empty(), "{} byte(s) after the request", rest.len());
+        Ok(request)
+    }
+
+    /// The session this request names, if the request is one the agent may act on: a [`SessionId`], a command that
+    /// is not empty, a command and a working directory of at most [`MAX_ELEVATION_UNITS`] UTF-16 units, and no NUL
+    /// anywhere. The error says which field.
+    pub fn check(&self) -> anyhow::Result<SessionId> {
+        let session = SessionId::parse(&self.session)
+            .ok_or_else(|| anyhow::anyhow!("the session is not a session id of this program"))?;
+        anyhow::ensure!(!self.command.is_empty(), "the command is empty");
+        for (field, text) in [("command", &self.command), ("working directory", &self.cwd)] {
+            anyhow::ensure!(!text.contains('\0'), "the {field} holds a NUL");
+            let units = text.encode_utf16().count();
+            anyhow::ensure!(
+                units <= MAX_ELEVATION_UNITS,
+                "the {field} is {units} UTF-16 units, over the limit of {MAX_ELEVATION_UNITS}"
+            );
+        }
+        Ok(session)
     }
 }
 

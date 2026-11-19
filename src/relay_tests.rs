@@ -633,3 +633,26 @@ fn a_sink_with_the_default_on_serving_refuses_the_answer() {
     assert!(matches!(err, PumpError::Sink(_)), "{err:?}");
     assert!(plain.0.is_empty());
 }
+
+/// A request frame is read by whoever takes a connection's first frame, never by the pump: in a stream it is a
+/// protocol error, first or not, and nothing is delivered.
+#[test]
+fn a_request_frame_in_a_stream_is_a_protocol_error() {
+    for (name, frames) in [
+        ("first", vec![(FrameKind::Request, &b"x"[..])]),
+        (
+            "after data",
+            vec![
+                (FrameKind::Data, &[Stream::Pty as u8, b'x'][..]),
+                (FrameKind::Request, &b"x"[..]),
+            ],
+        ),
+    ] {
+        let wire = framed(&frames);
+        let mut sink = TestSink::default();
+        let err = pump_decode(&mut wire.as_slice(), &mut FrameReader::new(), &mut sink).expect_err(name);
+        assert!(matches!(err, PumpError::Protocol(_)), "{name}: {err:?}");
+        assert!(err.peer_gone(), "{name}");
+        assert_eq!(sink.served, 0, "{name}");
+    }
+}

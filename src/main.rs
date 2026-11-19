@@ -22,6 +22,7 @@ fn main() -> anyhow::Result<()> {
             std::process::exit(2);
         }
         Route::Logout => logout_command(),
+        Route::Elevate(args) => elevate_command(&args),
         Route::AutoLogin(None) => {
             eprintln!("usage: ssh-broker auto-login on|off [<account>]");
             std::process::exit(2);
@@ -42,6 +43,7 @@ fn usage(verb: Verb) -> &'static str {
     match verb {
         Verb::Agent => "usage: ssh-broker agent [--background [--expect-user <sid>]]",
         Verb::Logout => "usage: ssh-broker logout",
+        Verb::Elevate => ssh_broker::offer::text::elevate_usage(),
         Verb::ConsoleFallback => "usage: ssh-broker console-fallback [--login] <handle> (internal)",
         Verb::ApplySshd => "usage: ssh-broker apply-sshd (internal: the task that apply starts runs it)",
         Verb::VerifyProbe => {
@@ -72,6 +74,16 @@ fn logout_command() -> anyhow::Result<()> {
 #[cfg(not(windows))]
 fn logout_command() -> anyhow::Result<()> {
     anyhow::bail!("logout ends a Windows background session and runs only on Windows")
+}
+
+#[cfg(windows)]
+fn elevate_command(args: &[String]) -> anyhow::Result<()> {
+    ssh_broker::elevate::run(args)
+}
+
+#[cfg(not(windows))]
+fn elevate_command(_args: &[String]) -> anyhow::Result<()> {
+    anyhow::bail!("elevate runs a command in a Windows session and runs only on Windows")
 }
 
 #[cfg(windows)]
