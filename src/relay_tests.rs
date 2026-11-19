@@ -634,6 +634,78 @@ fn a_sink_with_the_default_on_serving_refuses_the_answer() {
     assert!(plain.0.is_empty());
 }
 
+fn a_consent_request() -> crate::protocol::ConsentRequest {
+    crate::protocol::ConsentRequest {
+        version: crate::protocol::PROTOCOL_VERSION,
+        command: "cmd /c whoami".to_owned(),
+        cwd: r"C:\Users\me".to_owned(),
+    }
+}
+
+/// The question and its answer are dispatched to the sink, in order with the data around them.
+#[test]
+fn pump_decode_dispatches_consent_and_answer_and_a_sink_without_them_errors() {
+    use crate::protocol::{ConsentAnswer, ConsentRequest};
+    #[derive(Default)]
+    struct Asked {
+        seen: Vec<String>,
+    }
+    impl FrameSink for Asked {
+        fn on_data(&mut self, _stream: Stream, _bytes: &[u8]) -> anyhow::Result<()> {
+            self.seen.push("data".to_owned());
+            Ok(())
+        }
+        fn on_consent(&mut self, request: ConsentRequest) -> anyhow::Result<()> {
+            self.seen.push(format!("consent {}", request.command));
+            Ok(())
+        }
+        fn on_consent_answer(&mut self, answer: ConsentAnswer) -> anyhow::Result<()> {
+            self.seen.push(format!("answer {answer:?}"));
+            Ok(())
+        }
+    }
+    let mut wire = Vec::new();
+    write_data(&mut wire, Stream::Pty, b"x").unwrap();
+    write_frame(&mut wire, FrameKind::Consent, &a_consent_request().encode().unwrap()).unwrap();
+    write_frame(&mut wire, FrameKind::ConsentAnswer, &ConsentAnswer::Refuse.encode().unwrap()).unwrap();
+    write_frame(&mut wire, FrameKind::Exit, &ExitCode(0).encode()).unwrap();
+    let mut sink = Asked::default();
+    let outcome = pump_decode(&mut wire.as_slice(), &mut FrameReader::new(), &mut sink).unwrap();
+    assert_eq!(outcome, Outcome::Exited(0));
+    assert_eq!(sink.seen, ["data", "consent cmd /c whoami", "answer Refuse"]);
+
+    // A sink that does not take them (an exec session's, the logout reply's) refuses each: a sink failure, which says
+    // nothing about the peer.
+    for frame in [
+        (FrameKind::Consent, a_consent_request().encode().unwrap()),
+        (FrameKind::ConsentAnswer, ConsentAnswer::Allow.encode().unwrap()),
+    ] {
+        let wire = framed(&[(frame.0, &frame.1)]);
+        let err = pump_decode(&mut wire.as_slice(), &mut FrameReader::new(), &mut TestSink::default())
+            .expect_err("a sink without it refuses");
+        assert!(matches!(err, PumpError::Sink(_)), "{:?}: {err:?}", frame.0);
+        assert!(!err.peer_gone());
+    }
+}
+
+/// Payloads that are not what the kind says are the peer's fault, not the sink's.
+#[test]
+fn a_consent_frame_that_is_not_one_is_a_protocol_error() {
+    for (kind, payload) in [
+        (FrameKind::Consent, &b"x"[..]),
+        (FrameKind::Consent, &[][..]),
+        (FrameKind::ConsentAnswer, &[2][..]),
+        (FrameKind::ConsentAnswer, &[][..]),
+        (FrameKind::ConsentAnswer, &[0, 0][..]),
+    ] {
+        let wire = framed(&[(kind, payload)]);
+        let err = pump_decode(&mut wire.as_slice(), &mut FrameReader::new(), &mut TestSink::default())
+            .expect_err("refused");
+        assert!(matches!(err, PumpError::Protocol(_)), "{kind:?} {payload:?}: {err:?}");
+        assert!(err.peer_gone());
+    }
+}
+
 /// A request frame is read by whoever takes a connection's first frame, never by the pump: in a stream it is a
 /// protocol error, first or not, and nothing is delivered.
 #[test]

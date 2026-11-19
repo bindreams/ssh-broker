@@ -13,18 +13,27 @@ fn header_roundtrips() {
     assert_eq!(FrameHeader::decode(&bytes).unwrap(), h);
 }
 
-/// The answer's two kinds and the request have the numbers the contract gives them, and a version-6 peer reads them.
+/// The answer's two kinds, the request and the consent's two frames have the numbers the contract gives them, and a
+/// version-7 peer reads them.
 #[test]
-fn the_answer_kinds_and_the_request_have_their_numbers_and_decode() {
+fn the_answer_kinds_the_request_and_the_consent_frames_have_their_numbers_and_decode() {
     assert_eq!(FrameKind::Serving as u8, 4);
     assert_eq!(FrameKind::HandBack as u8, 5);
     assert_eq!(FrameKind::Request as u8, 6);
-    for kind in [FrameKind::Serving, FrameKind::HandBack, FrameKind::Request] {
+    assert_eq!(FrameKind::Consent as u8, 7);
+    assert_eq!(FrameKind::ConsentAnswer as u8, 8);
+    for kind in [
+        FrameKind::Serving,
+        FrameKind::HandBack,
+        FrameKind::Request,
+        FrameKind::Consent,
+        FrameKind::ConsentAnswer,
+    ] {
         let header = FrameHeader { kind, len: 3 };
         assert_eq!(FrameHeader::decode(&header.encode()).unwrap(), header);
     }
     assert!(
-        FrameHeader::decode(&[7, 0, 0, 0, 0]).is_err(),
+        FrameHeader::decode(&[9, 0, 0, 0, 0]).is_err(),
         "the next number is still unknown"
     );
 }
@@ -333,9 +342,9 @@ fn a_version_1_handshake_is_refused_with_the_version_message() {
 }
 
 #[test]
-fn the_wire_version_is_6() {
-    assert_eq!(PROTOCOL_VERSION, 6);
-    assert_eq!(Handshake::pty_default().version, 6);
+fn the_wire_version_is_7() {
+    assert_eq!(PROTOCOL_VERSION, 7);
+    assert_eq!(Handshake::pty_default().version, 7);
 }
 
 #[test]
@@ -473,7 +482,7 @@ fn a_version_2_handshake_is_refused_with_the_version_message() {
     })
     .unwrap();
     let error = Handshake::decode(&bytes).unwrap_err().to_string();
-    assert!(error.contains("peer 2") && error.contains("ours 6"), "{error}");
+    assert!(error.contains("peer 2") && error.contains("ours 7"), "{error}");
 }
 
 /// A peer of another version is refused by its number.
@@ -506,7 +515,7 @@ fn a_version_3_handshake_is_refused_with_the_version_message() {
     })
     .unwrap();
     let error = Handshake::decode(&bytes).unwrap_err().to_string();
-    assert!(error.contains("peer 3") && error.contains("ours 6"), "{error}");
+    assert!(error.contains("peer 3") && error.contains("ours 7"), "{error}");
 }
 
 /// A peer of version 4 has the layout of this one and not its first frame (an answer, then no input before it):
@@ -520,7 +529,7 @@ fn a_version_4_handshake_is_refused_with_the_version_message() {
     .encode()
     .unwrap();
     let error = Handshake::decode(&bytes).unwrap_err().to_string();
-    assert!(error.contains("peer 4") && error.contains("ours 6"), "{error}");
+    assert!(error.contains("peer 4") && error.contains("ours 7"), "{error}");
 }
 
 /// A peer of version 5 has the layout of this one and no request frame: it is refused by its number.
@@ -533,7 +542,70 @@ fn a_version_5_handshake_is_refused_with_the_version_message() {
     .encode()
     .unwrap();
     let error = Handshake::decode(&bytes).unwrap_err().to_string();
-    assert!(error.contains("peer 5") && error.contains("ours 6"), "{error}");
+    assert!(error.contains("peer 5") && error.contains("ours 7"), "{error}");
+}
+
+/// A peer of version 6 has the layout of this one and no consent frames: it is refused by its number, not let
+/// through to be sent a frame it cannot read.
+#[test]
+fn a_version_6_handshake_is_refused_with_the_version_message() {
+    let bytes = Handshake {
+        version: 6,
+        ..Handshake::pty_default()
+    }
+    .encode()
+    .unwrap();
+    let error = Handshake::decode(&bytes).unwrap_err().to_string();
+    assert!(error.contains("peer 6") && error.contains("ours 7"), "{error}");
+}
+
+// The consent question -----
+
+fn a_consent_request() -> ConsentRequest {
+    ConsentRequest {
+        version: PROTOCOL_VERSION,
+        command: r#""C:\Windows\System32\cmd.exe" /c whoami"#.to_owned(),
+        cwd: r"C:\Users\me".to_owned(),
+    }
+}
+
+#[test]
+fn consent_frames_round_trip_and_unknown_content_is_a_protocol_error() {
+    let request = a_consent_request();
+    assert_eq!(ConsentRequest::decode(&request.encode().unwrap()).unwrap(), request);
+    for answer in [ConsentAnswer::Allow, ConsentAnswer::Refuse] {
+        assert_eq!(ConsentAnswer::decode(&answer.encode().unwrap()).unwrap(), answer);
+    }
+    // The two answers are the first two variants, and nothing else is one.
+    assert_eq!(ConsentAnswer::Allow.encode().unwrap(), [0]);
+    assert_eq!(ConsentAnswer::Refuse.encode().unwrap(), [1]);
+    assert!(ConsentAnswer::decode(&[2]).is_err(), "a variant that is not one");
+    assert!(ConsentAnswer::decode(&[]).is_err(), "no answer at all");
+    assert!(ConsentAnswer::decode(&[0, 0]).is_err(), "bytes after the answer");
+    // The request: cut short, or with bytes after it, is an error too.
+    let mut bytes = request.encode().unwrap();
+    assert!(ConsentRequest::decode(&bytes[..bytes.len() - 2]).is_err());
+    bytes.push(0);
+    let error = ConsentRequest::decode(&bytes).unwrap_err().to_string();
+    assert!(error.contains("after"), "{error}");
+}
+
+#[test]
+fn a_consent_request_of_another_version_is_refused_by_name() {
+    // Fields this build does not know follow the number: it is the number that is said.
+    let mut bytes = ConsentRequest {
+        version: PROTOCOL_VERSION + 1,
+        ..a_consent_request()
+    }
+    .encode()
+    .unwrap();
+    bytes.extend_from_slice(&[9, 9, 9]);
+    let error = ConsentRequest::decode(&bytes).unwrap_err().to_string();
+    assert!(
+        error.contains(&format!("peer {}", PROTOCOL_VERSION + 1))
+            && error.contains(&format!("ours {PROTOCOL_VERSION}")),
+        "{error}"
+    );
 }
 
 // The elevation request -----

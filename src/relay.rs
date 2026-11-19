@@ -4,7 +4,7 @@
 //! AF_UNIX connection (`afunix::ConnRx`/`ConnTx`) and the in-memory test transport
 //! below, with identical logic.
 
-use crate::protocol::{ExitCode, FrameKind, FrameReader, Resize, Stream, write_frame};
+use crate::protocol::{ConsentAnswer, ConsentRequest, ExitCode, FrameKind, FrameReader, Resize, Stream, write_frame};
 use std::io::{Read, Write};
 
 /// Result of a decode pump. `Exited(n)` = a clean `EXIT(n)` frame was received;
@@ -131,6 +131,19 @@ pub trait FrameSink {
         let _ = r;
         Ok(())
     }
+    /// The agent asks the person at the terminal ([`FrameKind::Consent`]). The shim's sink of a session with a
+    /// terminal takes it; every other sink, which is one a `Consent` frame should never reach, refuses: a sink
+    /// failure.
+    fn on_consent(&mut self, request: ConsentRequest) -> anyhow::Result<()> {
+        let _ = request;
+        anyhow::bail!("a consent question where none is expected")
+    }
+    /// The shim's answer ([`FrameKind::ConsentAnswer`]). The agent's sink of a session with a terminal takes it;
+    /// every other refuses.
+    fn on_consent_answer(&mut self, answer: ConsentAnswer) -> anyhow::Result<()> {
+        let _ = answer;
+        anyhow::bail!("a consent answer where none is expected")
+    }
 }
 
 /// Read frames from `r` until an `EXIT` frame or EOF, dispatching `DATA`/`RESIZE` to
@@ -182,6 +195,14 @@ pub fn pump_decode<R: Read>(r: &mut R, fr: &mut FrameReader, sink: &mut impl Fra
                     return Err(PumpError::Protocol(anyhow::anyhow!(
                         "unexpected HANDSHAKE frame mid-stream"
                     )));
+                }
+                FrameKind::Consent => {
+                    let request = ConsentRequest::decode(&frame.payload).map_err(PumpError::Protocol)?;
+                    sink.on_consent(request).map_err(PumpError::Sink)?;
+                }
+                FrameKind::ConsentAnswer => {
+                    let answer = ConsentAnswer::decode(&frame.payload).map_err(PumpError::Protocol)?;
+                    sink.on_consent_answer(answer).map_err(PumpError::Sink)?;
                 }
                 FrameKind::Request => {
                     return Err(PumpError::Protocol(anyhow::anyhow!(
