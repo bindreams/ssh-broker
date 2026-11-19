@@ -217,7 +217,7 @@ fn describe_instances(pids: &[u32]) -> String {
     let each: Vec<String> = pids
         .iter()
         .map(|pid| match pid {
-            0 => "one with no process yet".to_string(),
+            0 => "one not launched yet".to_string(),
             pid => format!("process {pid}"),
         })
         .collect();
@@ -226,11 +226,7 @@ fn describe_instances(pids: &[u32]) -> String {
 
 /// The running instances of `task`, and the processes among them that `open` takes for the task's. An instance
 /// whose process has exited, or is not the task's (its pid is another process's now), has ended: see
-/// [`instances_of`].
-///
-/// An instance the engine answers "not running" for when it is read ([`listed`]) was listed a moment before, and
-/// is counted as one not launched yet: the answer does not say whether it ended or does not run yet. The next look
-/// decides: an ended one is not listed again, and one that starts has a process.
+/// [`instances_of`]; so has one the engine answers "not running" for when its process is read ([`engine_pid`]).
 fn running_instances(
     task: &IRegisteredTask,
     open: impl FnMut(u32) -> anyhow::Result<Option<Process>>,
@@ -242,29 +238,25 @@ fn running_instances(
         let mut pids = Vec::new();
         // The collection is indexed from 1.
         for index in 1..=count {
-            let instance = listed(
-                instances.get_Item(&VARIANT::from(index)),
-                &format!("read running instance {index}"),
-            )?;
-            let pid = match instance {
-                Some(instance) => listed(instance.EnginePID(), "read the process of a running instance")?,
-                None => None,
-            };
-            pids.push(pid.unwrap_or(0));
+            let instance = instances
+                .get_Item(&VARIANT::from(index))
+                .with_context(|| format!("read running instance {index}"))?;
+            pids.extend(engine_pid(instance.EnginePID())?);
         }
         pids
     };
     instances_of(pids, open)
 }
 
-/// The value of reading a listed instance (`what`, for the error), from the result of the read. `None` if the
-/// engine answers `SCHED_E_TASK_NOT_RUNNING`: the instance either ended since it was listed or does not run yet, and
-/// the answer does not say which, so it is neither an end nor an error. Any other failure is an error.
-fn listed<T>(read: windows::core::Result<T>, what: &str) -> anyhow::Result<Option<T>> {
+/// The process id the engine gave a listed instance (0 for one it has not launched). `None` if the engine
+/// answers `SCHED_E_TASK_NOT_RUNNING`: it answers so for an instance that has ended and is still listed, for a
+/// moment before it drops it, so the instance is no instance, as in [`instances_of`]. Any other failure is an
+/// error.
+fn engine_pid(read: windows::core::Result<u32>) -> anyhow::Result<Option<u32>> {
     match read {
-        Ok(value) => Ok(Some(value)),
+        Ok(pid) => Ok(Some(pid)),
         Err(e) if e.code() == SCHED_E_TASK_NOT_RUNNING => Ok(None),
-        Err(e) => Err(e).context(what.to_string()),
+        Err(e) => Err(e).context("read the process of a running instance"),
     }
 }
 
