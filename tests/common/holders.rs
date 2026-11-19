@@ -76,18 +76,7 @@ pub fn report(sid_text: &str) -> String {
 
 /// The logon sessions LSA lists for the account `sid_text` (SDDL form), in LSA's order.
 pub fn sessions_of(sid_text: &str) -> Result<Vec<LogonSession>, String> {
-    let mut count = 0u32;
-    let mut list: *mut LUID = std::ptr::null_mut();
-    // SAFETY: valid out-pointers; the list LSA allocates is freed below.
-    let status = unsafe { LsaEnumerateLogonSessions(&mut count, &mut list) };
-    if status.0 != 0 || list.is_null() {
-        return Err(format!("LsaEnumerateLogonSessions failed: NTSTATUS {:#010x}", status.0));
-    }
-    // SAFETY: LSA returned `count` consecutive LUIDs, read before they are freed.
-    let ids: Vec<LUID> = unsafe { std::slice::from_raw_parts(list, count as usize) }.to_vec();
-    // SAFETY: the buffer came from LSA.
-    let _ = unsafe { LsaFreeReturnBuffer(list.cast()) };
-
+    let ids = listed()?;
     let mut sessions = Vec::new();
     for id in &ids {
         let mut data: *mut SECURITY_LOGON_SESSION_DATA = std::ptr::null_mut();
@@ -104,6 +93,22 @@ pub fn sessions_of(sid_text: &str) -> Result<Vec<LogonSession>, String> {
         sessions.extend(session);
     }
     Ok(sessions)
+}
+
+/// The ids of every logon session `LsaEnumerateLogonSessions` lists, whoever owns it.
+pub fn listed() -> Result<Vec<LUID>, String> {
+    let mut count = 0u32;
+    let mut list: *mut LUID = std::ptr::null_mut();
+    // SAFETY: valid out-pointers; the list LSA allocates is freed below.
+    let status = unsafe { LsaEnumerateLogonSessions(&mut count, &mut list) };
+    if status.0 != 0 || list.is_null() {
+        return Err(format!("LsaEnumerateLogonSessions failed: NTSTATUS {:#010x}", status.0));
+    }
+    // SAFETY: LSA returned `count` consecutive LUIDs, read before they are freed.
+    let ids: Vec<LUID> = unsafe { std::slice::from_raw_parts(list, count as usize) }.to_vec();
+    // SAFETY: the buffer came from LSA.
+    let _ = unsafe { LsaFreeReturnBuffer(list.cast()) };
+    Ok(ids)
 }
 
 /// The session `data` describes, if it belongs to the account `sid_text`.

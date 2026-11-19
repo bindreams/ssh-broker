@@ -305,15 +305,14 @@ fn a_stale_password_is_not_visible_in_the_last_result() {
 /// How many times the session is started and ended in `logon_sessions_with_no_process_do_not_pile_up`.
 const CYCLES: usize = 3;
 
-/// The logon sessions of `account` that LSA lists and that have no process left, other than those Windows
-/// has logged off (`logged_off`: the logoff event was seen, so LSA may still list them for a moment while it
-/// tears them down).
-fn sessions_without_a_process(account: &Account, logged_off: &BTreeSet<u64>) -> Vec<holders::LogonSession> {
+/// The logon sessions of `account` that LSA lists and that have no process left, other than those the
+/// ending of the session found gone from LSA's list (`gone`).
+fn sessions_without_a_process(account: &Account, gone: &BTreeSet<u64>) -> Vec<holders::LogonSession> {
     let own = std::process::id();
     holders::sessions_of(&account.sid_text)
         .unwrap_or_else(|why| panic!("list the logon sessions of {}: {why}", account.name))
         .into_iter()
-        .filter(|session| !logged_off.contains(&session.id))
+        .filter(|session| !gone.contains(&session.id))
         .filter(|session| {
             logon_session::processes_of(session.id)
                 .iter()
@@ -351,7 +350,7 @@ fn logon_sessions_with_no_process_do_not_pile_up() {
         stand_in::wait_for_new_serving_marker_of_a_task(&location, previous_marker.as_deref(), TASK_START_BOUND);
         let ended = logout_with(&kit, &account);
         previous_marker = stand_in::serving_marker_text(&location);
-        left_after.push(sessions_without_a_process(&account, &ended.logged_off));
+        left_after.push(sessions_without_a_process(&account, &ended.gone));
     }
     autologin::off(&mut kit.autologin_env(&account.password), &local).unwrap();
 

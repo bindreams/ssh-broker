@@ -1,8 +1,11 @@
-//! Looking at a logon session from outside: which processes hold it, and when Windows destroys it.
+//! Looking at a logon session from outside: which processes hold it, and whether LSA still lists it.
 //! **CI only.**
+//!
+//! The including crate declares `account_fixture` (the list is read by `account_fixture::holders`) and
+//! `process_list`.
 #![allow(dead_code)]
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ssh_broker::winutil::OwnedHandle;
 use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
@@ -16,6 +19,9 @@ use windows::Win32::System::Threading::{
     WaitForSingleObject,
 };
 use windows::core::PCWSTR;
+
+use crate::account_fixture::holders;
+use crate::process_list;
 
 /// The logon id of `process`' token, as the 64-bit value the event log prints in hex.
 pub fn logon_id(process: HANDLE) -> u64 {
@@ -88,9 +94,43 @@ pub fn assert_auditing(subcategory: &str, setting: &str) {
     );
 }
 
-/// Fail unless Logoff auditing for success is on.
-pub fn assert_logoff_auditing() {
-    assert_auditing("Logoff", "Success");
+/// How long LSA may keep listing a logon session after its last process has ended: an external event
+/// that may never come. Measured in CI (2026-11-19): the session left the list by itself about 90 s after
+/// the last process exited for a Batch logon and about 180 s after for an interactive secondary logon; the
+/// bound is well above both. Expiry fails the wait and says what still refers to the session.
+pub const SESSION_END_BOUND: Duration = Duration::from_secs(600);
+
+/// The pause between two looks at LSA's list in [`wait_until_unlisted`]; the look is what is waited on.
+const LOOK_EVERY: Duration = Duration::from_secs(1);
+
+/// Whether `LsaEnumerateLogonSessions` still lists the logon session `id`.
+pub fn is_listed(id: u64) -> Result<bool, String> {
+    Ok(holders::listed()?
+        .iter()
+        .any(|luid| (u64::from(luid.HighPart as u32) << 32) | u64::from(luid.LowPart) == id))
+}
+
+/// Wait until the logon session `id` is no longer in LSA's list, and return how long that took. The
+/// caller holds no handle on a process or token of the session: one keeps it listed. It looks once a
+/// second. After [`SESSION_END_BOUND`] it fails, naming the processes of the session that still run.
+pub fn wait_until_unlisted(id: u64) -> Result<Duration, String> {
+    let started = Instant::now();
+    while is_listed(id)? {
+        if started.elapsed() >= SESSION_END_BOUND {
+            let own = std::process::id();
+            let running: Vec<u32> = processes_of(id)
+                .iter()
+                .filter(|(pid, process)| *pid != own && !process_list::has_exited(process.0))
+                .map(|(pid, _)| *pid)
+                .collect();
+            return Err(format!(
+                "logon session {id:#x} is still in LSA's list {SESSION_END_BOUND:?} after the wait began; \
+                 processes still running in it (pids {running:?})"
+            ));
+        }
+        std::thread::sleep(LOOK_EVERY); // sleep-ok: the pause between two looks at the list; its expiry proves nothing
+    }
+    Ok(started.elapsed())
 }
 
 /// A subscription to Security events that match an XPath query, from now on.
@@ -172,23 +212,6 @@ impl Drop for EventWatch {
     fn drop(&mut self) {
         // SAFETY: the handle from `new`.
         let _ = unsafe { EvtClose(self.subscription) };
-    }
-}
-
-/// The logoff event (Security 4634) of one logon session.
-pub struct LogoffWatch(EventWatch);
-
-impl LogoffWatch {
-    /// Subscribe to events from now on. Create it before the session can end.
-    pub fn new(id: u64) -> LogoffWatch {
-        // The event log spells the id in lower case hex, but accept either.
-        let lower = query_for(4634, "TargetLogonId", &format!("{id:#x}"));
-        let upper = query_for(4634, "TargetLogonId", &format!("0x{id:X}"));
-        LogoffWatch(EventWatch::new(&format!("({lower}) or ({upper})")))
-    }
-
-    pub fn wait(&self, bound: Duration) -> bool {
-        self.0.wait(bound)
     }
 }
 
