@@ -1,120 +1,12 @@
 //! Unit tests for `batch` (pure; the console queue is a fake).
 use super::*;
+use crate::console_prompt::fake_queue::{FakeQueue, focus_record, key, typed};
 use crate::password_entry::{PasswordEntry, Step};
-use std::collections::VecDeque;
-use windows::Win32::System::Console::{FOCUS_EVENT, INPUT_RECORD_0, KEY_EVENT, KEY_EVENT_RECORD, KEY_EVENT_RECORD_0};
-use windows::core::BOOL;
-
-fn key(vk: u16, ch: u16) -> INPUT_RECORD {
-    INPUT_RECORD {
-        EventType: KEY_EVENT as u16,
-        Event: INPUT_RECORD_0 {
-            KeyEvent: KEY_EVENT_RECORD {
-                bKeyDown: BOOL(1),
-                wRepeatCount: 1,
-                wVirtualKeyCode: vk,
-                wVirtualScanCode: 0,
-                uChar: KEY_EVENT_RECORD_0 { UnicodeChar: ch },
-                dwControlKeyState: 0,
-            },
-        },
-    }
-}
-
-/// The records of text pasted into the console: Enter for each `\r`.
-fn typed(text: &str) -> Vec<INPUT_RECORD> {
-    text.encode_utf16()
-        .map(|unit| if unit == 0x0D { key(0x0D, 0x0D) } else { key(0x41, unit) })
-        .collect()
-}
-
-fn characters<'a>(records: impl IntoIterator<Item = &'a INPUT_RECORD>) -> String {
-    let units: Vec<u16> = records
-        .into_iter()
-        // SAFETY: every record in these tests is a key record.
-        .map(|record| unsafe { record.Event.KeyEvent.uChar.UnicodeChar })
-        .collect();
-    String::from_utf16(&units).unwrap()
-}
 
 fn is_zeroed(records: &[INPUT_RECORD]) -> bool {
     // SAFETY: `INPUT_RECORD` is plain data.
     let bytes = unsafe { std::slice::from_raw_parts(records.as_ptr().cast::<u8>(), std::mem::size_of_val(records)) };
     bytes.iter().all(|b| *b == 0)
-}
-
-/// A console input queue: `peek` copies from the head, `read` removes from the head. A `read` of an
-/// empty queue is the console's blocking wait: the next `arrivals` entry lands in the queue first.
-#[derive(Default)]
-struct FakeQueue {
-    queue: VecDeque<INPUT_RECORD>,
-    arrivals: VecDeque<Vec<INPUT_RECORD>>,
-    removed: usize,
-    /// After the next peek that reaches the end of the queue, the console merges a repeat of the last
-    /// key-down into that record: its `wRepeatCount` becomes this.
-    merge_into_tail_after_peek: Option<u16>,
-    fail_peek: bool,
-    fail_read: bool,
-}
-
-impl FakeQueue {
-    fn with(records: Vec<INPUT_RECORD>) -> Self {
-        FakeQueue {
-            queue: records.into(),
-            ..Default::default()
-        }
-    }
-
-    fn type_more(&mut self, records: Vec<INPUT_RECORD>) {
-        self.queue.extend(records);
-    }
-
-    fn left(&self) -> String {
-        characters(&self.queue)
-    }
-}
-
-fn failure() -> windows::core::Error {
-    windows::core::Error::from_hresult(windows::core::HRESULT(-1))
-}
-
-impl InputQueue for FakeQueue {
-    fn peek(&mut self, records: &mut [INPUT_RECORD]) -> windows::core::Result<u32> {
-        if self.fail_peek {
-            records[0] = key(0x41, 'x' as u16);
-            return Err(failure());
-        }
-        let count = records.len().min(self.queue.len());
-        for (slot, record) in records.iter_mut().zip(&self.queue) {
-            *slot = *record;
-        }
-        if count == self.queue.len()
-            && let (Some(repeat), Some(tail)) = (self.merge_into_tail_after_peek.take(), self.queue.back_mut())
-        {
-            tail.Event.KeyEvent.wRepeatCount = repeat;
-        }
-        Ok(count as u32)
-    }
-
-    fn read(&mut self, records: &mut [INPUT_RECORD]) -> windows::core::Result<u32> {
-        if self.fail_read {
-            records[0] = key(0x41, 'x' as u16);
-            return Err(failure());
-        }
-        if self.queue.is_empty() {
-            let arrived = self
-                .arrivals
-                .pop_front()
-                .expect("a blocking read with nothing to arrive: it would hang");
-            self.queue.extend(arrived);
-        }
-        let count = records.len().min(self.queue.len());
-        for slot in records.iter_mut().take(count) {
-            *slot = self.queue.pop_front().unwrap();
-        }
-        self.removed += count;
-        Ok(count as u32)
-    }
 }
 
 fn submitted(step: Step) -> String {
@@ -196,15 +88,13 @@ fn type_ahead_after_a_cancel_stays_queued() {
 #[test]
 fn records_that_are_not_keys_stay_queued() {
     let mut records = typed("pw\r");
-    let mut focus = key(0, 0);
-    focus.EventType = FOCUS_EVENT as u16;
-    records.push(focus);
+    records.push(focus_record());
     let mut queue = FakeQueue::with(records);
     let mut batch = Batch::new();
     let mut entry = PasswordEntry::new();
     submitted(batch.step(&mut queue, &mut entry, &|| false).unwrap());
     let types: Vec<u16> = queue.queue.iter().map(|r| r.EventType).collect();
-    assert_eq!(types, vec![FOCUS_EVENT as u16]);
+    assert_eq!(types, vec![focus_record().EventType]);
 }
 
 /// A password longer than one batch is taken batch by batch, and is one password.
@@ -316,12 +206,6 @@ fn a_backspace_the_console_repeats_into_the_last_peeked_record_deletes_every_tim
 // A generic entry =====
 
 use crate::consent_entry::{ConsentEntry, ConsentStep};
-
-fn focus_record() -> INPUT_RECORD {
-    let mut record = key(0, 0);
-    record.EventType = FOCUS_EVENT as u16;
-    record
-}
 
 /// The consent question's wake-up: a record that no entry feeds on arrives while the step waits, and the stop is
 /// then true. The step ends as stopped, having taken what it read.

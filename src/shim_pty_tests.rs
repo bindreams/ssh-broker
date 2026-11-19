@@ -1425,6 +1425,66 @@ fn an_input_worker_that_was_never_started_is_not_stopped_or_joined_and_its_write
     assert_eq!(closed.len(), 1, "closed twice");
 }
 
+// The consent question, from the main pump to the input worker -----
+
+use super::{ConsentSlot, send_answer};
+use crate::protocol::{ConsentAnswer, ConsentRequest, FrameKind, FrameReader, PROTOCOL_VERSION, Resize};
+
+fn a_question(command: &str) -> ConsentRequest {
+    ConsentRequest {
+        version: PROTOCOL_VERSION,
+        command: command.to_owned(),
+        cwd: r"C:\Users\me".to_owned(),
+    }
+}
+
+#[test]
+fn only_a_started_worker_can_be_handed_a_question() {
+    let mut input = Input::Waiting(());
+    assert!(!input.is_running(), "not before the answer");
+    input.start(|()| std::thread::spawn(|| {})).unwrap();
+    assert!(input.is_running());
+    input.end(|| {}, |()| {});
+    assert!(!input.is_running(), "not after the end");
+}
+
+#[test]
+fn a_question_is_handed_over_once_and_a_second_before_it_is_taken_is_refused() {
+    let slot = ConsentSlot::default();
+    assert_eq!(slot.take(), None, "nothing is waiting");
+    slot.put(a_question("first")).unwrap();
+    let refused = slot.put(a_question("second")).unwrap_err();
+    assert!(format!("{refused:#}").contains("already"), "{refused:#}");
+    assert_eq!(
+        slot.take(),
+        Some(a_question("first")),
+        "the first one is still the one waiting"
+    );
+    assert_eq!(slot.take(), None, "taken once");
+    slot.put(a_question("third"))
+        .expect("the slot is free again once it is taken");
+}
+
+/// The size goes first: the question's own resize records were taken from the console's queue, and the agent gives
+/// the session (or the command it starts, at the size the link holds) the size before it acts on the answer.
+#[test]
+fn the_size_is_sent_before_the_answer_and_both_are_whole_frames() {
+    for answer in [ConsentAnswer::Allow, ConsentAnswer::Refuse] {
+        let mut wire = Vec::new();
+        send_answer(&mut wire, answer, (100, 40)).unwrap();
+        let mut frames = FrameReader::new();
+        frames.push(&wire);
+        let first = frames.next_frame().unwrap().expect("the size");
+        assert_eq!(first.kind, FrameKind::Resize);
+        assert_eq!(Resize::decode(&first.payload).unwrap(), Resize { cols: 100, rows: 40 });
+        let second = frames.next_frame().unwrap().expect("the answer");
+        assert_eq!(second.kind, FrameKind::ConsentAnswer);
+        assert_eq!(ConsentAnswer::decode(&second.payload).unwrap(), answer);
+        assert_eq!(frames.buffered_len(), 0);
+        assert!(frames.next_frame().unwrap().is_none());
+    }
+}
+
 // The root process of a console keeps running through Ctrl+C -----------------------------
 
 /// A shell started under the shim, or under the `console-fallback` verb in a pseudoconsole, shares the

@@ -5,21 +5,29 @@
 //! (`batch`), except the last record of each peek, which is fed from the read that removes it (the
 //! console may have merged a repeat into it since); only the records fed are taken from the
 //! console's queue, and every copy is wiped.
+//!
+//! The same console also carries the consent question ([`ask_consent`]), which the session's shim writes and reads the
+//! answer to itself.
 
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::System::Console::{
-    GetConsoleMode, GetStdHandle, INPUT_RECORD, PeekConsoleInputW, ReadConsoleInputW, STD_INPUT_HANDLE,
-    STD_OUTPUT_HANDLE, WriteConsoleW,
+    FlushConsoleInputBuffer, GetConsoleMode, GetStdHandle, INPUT_RECORD, PeekConsoleInputW, ReadConsoleInputW,
+    STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, WriteConsoleW,
 };
 
+use crate::consent_entry::{ConsentEntry, ConsentStep};
 use crate::console_modes::ConsoleModes;
 use crate::offer::Absence;
+use crate::offer::text::CONSENT_SCREEN_ENTER;
 use crate::password_entry::{PasswordEntry, Step};
+use crate::protocol::ConsentAnswer;
 use crate::socket_loc::SocketLocation;
 use crate::userdir::NoProfile;
 
 mod batch;
 use batch::{Batch, InputQueue};
+#[cfg(test)]
+mod fake_queue;
 
 /// Whether stdin and stdout are both a console: the precondition for a prompt. A session without
 /// one is a login without a terminal and is never prompted, nor is its console mode touched.
@@ -65,17 +73,7 @@ impl ConsolePrompt {
     /// in the console's output code page, which is not UTF-8 unless something set it, and an account
     /// name with a non-ASCII letter then shows as other characters.
     pub fn write_text(&mut self, text: &str) {
-        let units: Vec<u16> = text.encode_utf16().collect();
-        let mut rest = units.as_slice();
-        while !rest.is_empty() {
-            let mut written = 0u32;
-            // SAFETY: `rest` and `written` are valid for the call; the handle is the console's output.
-            let wrote = unsafe { WriteConsoleW(self.modes.stdout, rest, Some(&mut written), None) };
-            if wrote.is_err() || written == 0 {
-                return;
-            }
-            rest = &rest[written as usize..];
-        }
+        let _ = write_console(self.modes.stdout, text);
     }
 
     /// Block until one entry step finishes: a submitted password, an empty Enter, or a cancel. Of
@@ -85,6 +83,81 @@ impl ConsolePrompt {
     pub fn read_step(&mut self) -> Result<Step, windows::core::Error> {
         let mut console = ConsoleInput(self.modes.stdin);
         self.batch.step(&mut console, &mut self.entry, &|| false)
+    }
+}
+
+/// Write `text` to the console `output` as UTF-16, all of it. The error is the first write that failed or took
+/// nothing.
+fn write_console(output: HANDLE, text: &str) -> windows::core::Result<()> {
+    let units: Vec<u16> = text.encode_utf16().collect();
+    let mut rest = units.as_slice();
+    while !rest.is_empty() {
+        let mut written = 0u32;
+        // SAFETY: `rest` and `written` are valid for the call; the handle is the console's output.
+        unsafe { WriteConsoleW(output, rest, Some(&mut written), None) }?;
+        if written == 0 {
+            return Err(windows::core::Error::from_hresult(windows::Win32::Foundation::E_FAIL));
+        }
+        rest = &rest[written as usize..];
+    }
+    Ok(())
+}
+
+/// Take the console's screen and ask `question` on it: the person's answer is [`ConsentAnswer::Allow`] only for one
+/// of `accepted`, without regard to case, and Enter. Anything else, Enter alone, Ctrl+C, a failed read and a `stop`
+/// that turns true while the question waits, is [`ConsentAnswer::Refuse`], with no second question.
+///
+/// What was typed ahead of the question, and what the terminal answered to earlier queries, is thrown away before
+/// the question is written, so it cannot answer it. The question is written after the screen's reset, clear and home
+/// (`CONSENT_SCREEN_ENTER`), what is typed is echoed, and the session's programs, which wrote to this terminal
+/// before and may have left it in any state, can write nothing into it: the agent holds their output. Nothing is
+/// written after the answer; the agent repaints the session's screen. An error is a console that could not be
+/// flushed or written to, and nothing was asked.
+///
+/// `stop` is looked at after every batch of records that did not finish the answer; whatever makes it true must
+/// then put a record in the queue (the shim's does, with `wake_console_input`), which wakes the read.
+pub fn ask_consent(
+    stdin: HANDLE,
+    stdout: HANDLE,
+    question: &str,
+    accepted: &[&str],
+    stop: &dyn Fn() -> bool,
+) -> windows::core::Result<ConsentAnswer> {
+    ask_on(
+        &mut ConsoleInput(stdin),
+        &mut |text| write_console(stdout, text),
+        question,
+        accepted,
+        stop,
+    )
+}
+
+/// [`ask_consent`] on a queue and a way to write that a test can stand in for.
+fn ask_on(
+    queue: &mut impl InputQueue,
+    write: &mut dyn FnMut(&str) -> windows::core::Result<()>,
+    question: &str,
+    accepted: &[&str],
+    stop: &dyn Fn() -> bool,
+) -> windows::core::Result<ConsentAnswer> {
+    queue.discard()?;
+    write(&format!("{CONSENT_SCREEN_ENTER}{question}"))?;
+    let mut entry = ConsentEntry::new(accepted);
+    let mut batch = Batch::new();
+    loop {
+        match batch.step(queue, &mut entry, stop) {
+            Ok(ConsentStep::Allow) => return Ok(ConsentAnswer::Allow),
+            Ok(ConsentStep::Refuse | ConsentStep::Stopped) => return Ok(ConsentAnswer::Refuse),
+            // What is typed is shown; a console that cannot show it has shown the question, and its read fails next.
+            Ok(ConsentStep::Echo(text)) => {
+                let _ = write(&text);
+            }
+            Ok(ConsentStep::Continue) => {}
+            Err(e) => {
+                tracing::warn!("the consent question could not be read: {e}");
+                return Ok(ConsentAnswer::Refuse);
+            }
+        }
     }
 }
 
@@ -104,6 +177,11 @@ impl InputQueue for ConsoleInput {
         // SAFETY: `records` and `count` are valid for the call; the handle is the console's input.
         unsafe { ReadConsoleInputW(self.0, records, &mut count) }?;
         Ok(count)
+    }
+
+    fn discard(&mut self) -> windows::core::Result<()> {
+        // SAFETY: the handle is the console's input.
+        unsafe { FlushConsoleInputBuffer(self.0) }
     }
 }
 

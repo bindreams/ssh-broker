@@ -18,8 +18,11 @@
 
 use crate::cmdline::{Encoding, Login, RawExec, resolve_exec};
 use crate::console_modes::ConsoleModes;
+use crate::console_prompt::ask_consent;
 use crate::offer::text;
-use crate::protocol::{ElevationPolicy, FrameKind, FrameReader, Handshake, Launch, Stream, write_frame};
+use crate::protocol::{
+    ConsentAnswer, ConsentRequest, ElevationPolicy, FrameKind, FrameReader, Handshake, Launch, Stream, write_frame,
+};
 use crate::relay::{FrameSink, write_data};
 use crate::shell::{self, Session, StartError};
 use crate::shim::{
@@ -33,8 +36,8 @@ use crate::winutil::{ChildConsole, UnelevatedToken, contain_and_resume, spawn_su
 use crate::{afunix, conpty, vtinput};
 use socket2::Socket;
 use std::io::Write as _;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::System::Console::{
     CONSOLE_SCREEN_BUFFER_INFO, GetConsoleScreenBufferInfo, GetStdHandle, INPUT_RECORD, ReadConsoleInputW,
@@ -710,6 +713,7 @@ fn run_pty(
     }
 
     let gate = Arc::new(MouseGate::default());
+    let consent = Arc::new(ConsentSlot::default());
     let stopping = Arc::new(AtomicBool::new(false));
 
     // MAIN: pump agent output → sniff/filter → console stdout. Capture the result WITHOUT `?`
@@ -722,6 +726,7 @@ fn run_pty(
         filter: XtwinopsFilter::new(),
         sniffer: MouseModeSniffer::new(),
         gate,
+        consent,
         input: Input::Waiting(tx),
         stdin_raw,
         stopping: Arc::clone(&stopping),
@@ -773,6 +778,11 @@ impl<T> Input<T> {
         }
     }
 
+    /// Whether the worker has been started and not yet ended.
+    fn is_running(&self) -> bool {
+        matches!(self, Input::Running(_))
+    }
+
     /// Tear down. A started worker is stopped with `stop`, then joined; one that never started is closed with
     /// `unstarted`, which gets the write half, and there is nothing to stop or join. Nothing at all happens
     /// the second time.
@@ -788,15 +798,35 @@ impl<T> Input<T> {
     }
 }
 
+/// The consent question the agent asked, on its way from the main pump (which reads it) to the input worker (which
+/// owns the console's input and the connection's write half, and so is the one that can ask and answer).
+#[derive(Default)]
+struct ConsentSlot(Mutex<Option<ConsentRequest>>);
+
+impl ConsentSlot {
+    /// Hand over the question. The agent asks one at a time, so one that is still waiting is a protocol violation.
+    fn put(&self, request: ConsentRequest) -> anyhow::Result<()> {
+        let mut waiting = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        anyhow::ensure!(waiting.is_none(), "a consent question while one was already waiting");
+        *waiting = Some(request);
+        Ok(())
+    }
+
+    fn take(&self) -> Option<ConsentRequest> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner).take()
+    }
+}
+
 /// Routes the agent's output to the real console: observe mouse-mode changes (publishing the
 /// gate), strip XTWINOPS, then write the raw VT bytes straight to the console handle (the
 /// proven short-write loop, not buffered Rust stdout). The agent's answer `Serving` starts the input
-/// worker.
+/// worker, and a consent question is handed to it.
 struct StdoutSink {
     out: isize,
     filter: XtwinopsFilter,
     sniffer: MouseModeSniffer,
     gate: Arc<MouseGate>,
+    consent: Arc<ConsentSlot>,
     input: Input<afunix::ConnTx>,
     stdin_raw: isize,
     stopping: Arc<AtomicBool>,
@@ -806,8 +836,22 @@ impl FrameSink for StdoutSink {
     fn on_serving(&mut self) -> anyhow::Result<()> {
         let (stdin_raw, out) = (self.stdin_raw, self.out);
         let (gate, stopping) = (Arc::clone(&self.gate), Arc::clone(&self.stopping));
+        let consent = Arc::clone(&self.consent);
         self.input
-            .start(|tx| std::thread::spawn(move || input_worker(stdin_raw, out, tx, gate, stopping)))
+            .start(|tx| std::thread::spawn(move || input_worker(stdin_raw, out, tx, gate, consent, stopping)))
+    }
+
+    /// The agent holds the session's output while it asks, so no frame comes between the question and its answer:
+    /// the worker writes the question to a console that nothing else writes to.
+    fn on_consent(&mut self, request: ConsentRequest) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.input.is_running(),
+            "a consent question before the agent had answered `Serving`"
+        );
+        self.consent.put(request)?;
+        // The worker is parked in a read: it looks at the slot when this record wakes it.
+        wake_console_input(self.stdin_raw);
+        Ok(())
     }
 
     fn on_data(&mut self, _stream: Stream, bytes: &[u8]) -> anyhow::Result<()> {
@@ -844,9 +888,10 @@ fn input_worker(
     stdout_raw: isize,
     mut tx: afunix::ConnTx,
     gate: Arc<MouseGate>,
+    consent: Arc<ConsentSlot>,
     stopping: Arc<AtomicBool>,
 ) {
-    unsafe { input_loop(stdin_raw, stdout_raw, &mut tx, &gate, &stopping) };
+    unsafe { input_loop(stdin_raw, stdout_raw, &mut tx, &gate, &consent, &stopping) };
     // FIN: in the disconnect-first case this makes the agent kill the brokered shell and
     // unblocks MAIN's pump; in the EXIT case it ends the agent's drain, which keeps reading
     // until the client closes.
@@ -862,6 +907,7 @@ unsafe fn input_loop(
     stdout_raw: isize,
     tx: &mut afunix::ConnTx,
     gate: &MouseGate,
+    consent: &ConsentSlot,
     stopping: &AtomicBool,
 ) {
     let stdin = HANDLE(stdin_raw as *mut core::ffi::c_void);
@@ -872,6 +918,14 @@ unsafe fn input_loop(
         if stopping.load(Ordering::Relaxed) {
             return;
         }
+        // A question that came while this thread was busy, not parked in the read below.
+        if let Some(request) = consent.take() {
+            if !ask_person(stdin, stdout, &request, stopping, tx) {
+                return;
+            }
+            enc.reset();
+            continue;
+        }
         let mut n = 0u32;
         if unsafe { ReadConsoleInputW(stdin, &mut recs, &mut n) }.is_err() {
             return; // console input closed (SSH side gone)
@@ -880,6 +934,17 @@ unsafe fn input_loop(
         // teardown signal is honored without forwarding the synthetic record.
         if stopping.load(Ordering::Relaxed) {
             return;
+        }
+        // A question woke the read. What this read returned (the wake record, and whatever was typed before the
+        // question reached here) is dropped: the question throws away what was typed ahead, and the agent drops
+        // what reaches it while it asks, so none of it was going to be anyone's. The mouse's state is dropped too,
+        // as the question took its records.
+        if let Some(request) = consent.take() {
+            if !ask_person(stdin, stdout, &request, stopping, tx) {
+                return;
+            }
+            enc.reset();
+            continue;
         }
         for rec in &recs[..n as usize] {
             match rec.EventType {
@@ -943,6 +1008,39 @@ unsafe fn input_loop(
             }
         }
     }
+}
+
+/// Ask the person at this console `request`, on the console's own screen, and send the answer. `false` when the
+/// connection can no longer be written to, so the worker is over.
+///
+/// A console that could not be asked (flushed or written to) gives the refusal: the answer is `Refuse` for anything
+/// but the allowing answer, and the agent runs nothing for it. The agent holds the session's output while it waits,
+/// and drops what reaches it, so the question and the keys that answer it are the console's alone. `stopping` ends
+/// the question as a refusal.
+fn ask_person(
+    stdin: HANDLE,
+    stdout: HANDLE,
+    request: &ConsentRequest,
+    stopping: &AtomicBool,
+    tx: &mut afunix::ConnTx,
+) -> bool {
+    let question = text::consent_question(&request.command, &request.cwd, text::CONSENT_ANSWER_LINE);
+    let answer = ask_consent(stdin, stdout, &question, &text::CONSENT_ALLOWING_ANSWERS, &|| {
+        stopping.load(Ordering::Relaxed)
+    })
+    .unwrap_or_else(|e| {
+        tracing::warn!("the consent question could not be put on the console, so it is refused: {e}");
+        ConsentAnswer::Refuse
+    });
+    send_answer(tx, answer, console_size(stdout)).is_ok()
+}
+
+/// Send the console's size, and then the answer. The question's own resize records were taken from the console's
+/// queue, so the size the agent has may be stale; it is given before the answer, so that the command an `Allow`
+/// starts is started at the size the person has, and the session is repainted at it.
+fn send_answer(tx: &mut impl std::io::Write, answer: ConsentAnswer, (cols, rows): (u16, u16)) -> anyhow::Result<()> {
+    write_frame(tx, FrameKind::Resize, &size_to_resize(cols, rows).encode())?;
+    write_frame(tx, FrameKind::ConsentAnswer, &answer.encode()?)
 }
 
 /// Wake a parked `ReadConsoleInputW` by injecting one benign FOCUS record. The worker, having

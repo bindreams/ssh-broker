@@ -37,6 +37,9 @@ pub(super) trait InputQueue {
     /// Remove up to `records.len()` records from the head of the queue into `records`, waiting for
     /// at least one. Returns how many.
     fn read(&mut self, records: &mut [INPUT_RECORD]) -> windows::core::Result<u32>;
+
+    /// Throw away every record in the queue: what was typed ahead, and what the terminal answered to a query.
+    fn discard(&mut self) -> windows::core::Result<()>;
 }
 
 pub(super) struct Batch {
