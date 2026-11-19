@@ -400,8 +400,12 @@ fn copying_security_gives_the_owner_and_the_acl_and_leaves_the_restore_privilege
     copied.expect("copy the security");
     assert_eq!(after, before, "the privilege was left as the copy made it");
     assert_eq!(source_after, source_before, "the source is as it was");
+    // `icacls /setowner` marks the source's DACL auto-inherited (`D:AI`). The marker records how Windows last
+    // propagated the entries and is not part of what is copied: the owner and the entries are.
+    let entries = |sddl: &str| sddl.replacen("D:AI(", "D:(", 1);
     assert_eq!(
-        destination_after, source_before,
+        entries(&destination_after),
+        entries(&source_before),
         "the destination has the source's owner and ACL"
     );
 }

@@ -18,7 +18,8 @@ use windows::core::PCWSTR;
 use super::{LocalSd, wide};
 use crate::winutil::OwnedHandle;
 
-/// Give `to` the owner, the group and the DACL of `from`, the DACL protected or not as it is there. An owner
+/// Give `to` the owner, the group and the DACL of `from`, the DACL protected or not as it is there. The DACL's
+/// auto-inherited marker is Windows's own record of a propagation and is not copied. An owner
 /// other than the caller's can be set only with `SeRestorePrivilege`, which an elevated administrator holds
 /// and has disabled, so it is enabled for this process for the copy and put back as it was after it; a caller
 /// that does not hold it gets the error.
