@@ -1003,10 +1003,18 @@ fn apply_run_over_ssh_while_it_restarts_sshd_ends_with_its_exit_code_and_the_ses
     let account = Account::create("ssha", true);
     account.make_administrator();
     let _end = session_end::LogOutOnDrop::new(&installed, &account, ServiceLogon::Sshd);
-    // The login first (its rig makes sshd accept the variable), then sshd's files as stock: the `apply` in the
-    // session has a change to make and a restart to do.
+    // sshd accepts the variable (the `apply` above; the login's rig finds it so), which the session needs to be
+    // elevated: a session that is not cannot run `apply`. Then `sshd_config` is written again with the same text,
+    // which sshd cannot have read: the `apply` in the session has a restart to do. (Putting the files back as
+    // stock here instead took the variable from the session: its login came after the drop-in had gone.)
     let login = Login::new(&kit, &account);
-    reset();
+    std::fs::write(config_path(), std::fs::read(config_path()).unwrap()).unwrap();
+    let row = accepts_row(Ok(Integrity::High), sshd_reading_this_machine);
+    assert!(
+        !row.pass,
+        "sshd has a restart to do before the apply in the session: {}",
+        row.detail
+    );
 
     let mut session = SshSession::start(login.command_asking("always"), login.diagnostics());
     session.log_in(&account.password);
