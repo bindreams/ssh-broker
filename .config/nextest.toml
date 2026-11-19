@@ -30,22 +30,15 @@ default-filter = 'not (binary(session_on_demand_windows) & test(/^logon_with_sec
 # timed out.
 slow-timeout = { period = "120s", terminate-after = 5, grace-period = "1s" }
 
-# `logon_sessions_with_no_process_do_not_pile_up` starts and ends three sessions in its body, so its own bounds
-# add up to more than the 10 x 120 s of the binaries below. Its bounds: 3 x `SESSION_END_BOUND` (3 x 360 s),
-# the task starts (`TASK_START_BOUND`, 180 s: one wait in cycle 1, two in each of cycles 2 and 3, 900 s) and the
-# teardown (`UNLOAD_BOUND`, 120 s), 2100 s together. 10 x 300 s leaves 900 s for the waits for the processes'
-# exit and for the `logout` of a `LogOutOnDrop` after a failed cycle. The first override that matches a test
-# sets its timeout, so this one comes before the one for the binary.
-[[profile.ci.overrides]]
-filter = 'binary(auto_login_windows) & test(=logon_sessions_with_no_process_do_not_pile_up)'
-slow-timeout = { period = "300s", terminate-after = 10, grace-period = "1s" }
-
 # A test that makes an account ends it in its teardown, which for a secondary-logon account whose hive
-# stays loaded waits `UNLOAD_BOUND` (120 s) in `profile::remove`, and each `logout` waits up to
-# `SESSION_END_BOUND` (360 s) for the ended logon sessions to leave the system's list. The default 600 s could
+# stays loaded waits `UNLOAD_BOUND` (120 s) in `profile::remove`, and each `logout` of a session whose logon the
+# product made waits up to `SESSION_END_BOUND` (360 s) for it to leave the system's list (a logon the Task
+# Scheduler made is not waited for: see `tests/common/session_end.rs`). The default 600 s could
 # end such a test in the middle of its teardown, lose the message and leave the account and its profile. These
 # binaries get 10 x 120 s, which is every binary that ends a session (`request_socket_windows` does so through
-# `LogOutOnDrop`).
+# `LogOutOnDrop`). `logon_sessions_with_no_process_do_not_pile_up` ends three sessions in its body, none
+# waited for: its bounds are the task starts (`TASK_START_BOUND`, 180 s: one wait in cycle 1, two in each of
+# cycles 2 and 3, 900 s) and the teardown (`UNLOAD_BOUND`, 120 s), which fit.
 [[profile.ci.overrides]]
 filter = 'binary(agent_window_windows) | binary(auto_login_windows) | binary(private_dir_elevated_windows) | binary(prompt_path_windows) | binary(real_sshd_windows) | binary(request_socket_windows) | binary(shell_sshd_windows) | binary(session_on_demand_windows) | binary(sshd_config_windows) | binary(upgrade_windows) | binary(user_isolation_windows)'
 slow-timeout = { period = "120s", terminate-after = 10, grace-period = "1s" }

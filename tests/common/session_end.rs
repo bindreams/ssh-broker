@@ -8,9 +8,13 @@
 //! Scheduler or sshd logon loaded, as it does for a user who logged in at the console. Killing the account's processes (`Account::drop`) is the
 //! fallback, and every use of it is recorded.
 //!
-//! The end of a session is waited for on the real condition: the logon id is no longer in the list
-//! `LsaEnumerateLogonSessions` gives ([`logon_session::wait_until_unlisted`]). One rule for every session,
-//! whoever logged the account on and of whatever type.
+//! Who made the agent's logon decides what is checked ([`ServiceLogon`]). A logon the product made (the
+//! shim's password prompt, `logon::start_background_agent`) is waited for on the real condition: the logon id
+//! is no longer in the list `LsaEnumerateLogonSessions` gives ([`logon_session::wait_until_unlisted`]),
+//! failing at [`logon_session::SESSION_END_BOUND`]. A logon the Task Scheduler made (a task with a stored
+//! password started the agent) is not waited for and its staying is not a failure: that service ends it when
+//! it will (measured: a Task Scheduler logon stayed listed past 360 s with no process in it). The fixture
+//! looks once after no process is left and records whether the session is still listed.
 //!
 //! The including crate declares `account_fixture`, `agent_conn`, `bounded_wait`, `logon_session` and
 //! `process_list`.
@@ -31,13 +35,17 @@ use crate::agent_conn::AgentConn;
 use crate::bounded_wait::CHILD_EXIT_BOUND;
 use crate::logon_session;
 
-/// A session was ended: every logon session of its agents left LSA's list (anything less is an error).
+/// A session was ended: every process of its agents' logon sessions exited, and those the product made left
+/// LSA's list (anything less is an error).
 #[derive(Debug)]
-pub struct Ended;
+pub struct Ended {
+    /// The logon sessions of the agents that were ended, whoever made them.
+    pub agent_sessions: BTreeSet<u64>,
+}
 
 /// Ask the background agent of `account` (the one running `exe`) to end with `exe logout`, run inside the
-/// agent as the account, wait for every process of its logon session to exit and for the session to leave
-/// LSA's list.
+/// agent as the account, wait for every process of its logon session to exit and, for a logon the product made,
+/// for the session to leave LSA's list.
 /// `how` is how the test started the session; the account is declared as logged on that way. `Ok(Some)` when
 /// a session was ended; `Ok(None)` when the account has no agent running `exe`. A failure names the step. It
 /// does not kill anything: the caller decides what the fallback is. One line about the attempt goes to the
@@ -140,7 +148,7 @@ fn end(
 ) -> Result<Option<Ended>, String> {
     let mut steps = Vec::new();
     let outcome = attempt("end the session", || {
-        try_end(exe, name, sid, sid_text, location, &mut steps)
+        try_end(exe, name, sid, sid_text, location, how, &mut steps)
     })
     .and_then(|r| r);
     hive::record(&format!(
@@ -165,6 +173,7 @@ fn try_end(
     sid: &Sid,
     sid_text: &str,
     location: &SocketLocation,
+    how: ServiceLogon,
     steps: &mut Vec<String>,
 ) -> Result<Option<Ended>, String> {
     let integrity = location.integrity();
@@ -195,11 +204,14 @@ fn try_end(
         held.len()
     ));
 
-    // Each session must be listed before it is ended (see `require_listed`).
-    for id in &ids {
-        logon_session::require_listed(*id, sid_text).map_err(|why| format!("before logout: {why}"))?;
+    // A session the product made must be listed before it is ended, or the wait for its end shows nothing (see
+    // `require_listed`).
+    if how == ServiceLogon::Sshd {
+        for id in &ids {
+            logon_session::require_listed(*id, sid_text).map_err(|why| format!("before logout: {why}"))?;
+        }
+        steps.push("every agent session is in LSA's list".to_owned());
     }
-    steps.push("every agent session is in LSA's list".to_owned());
 
     // The default session is unelevated, and `logout` in it reaches an agent at High on its request socket.
     let finished = attempt("ask the agent to log out", || {
@@ -260,18 +272,35 @@ fn try_end(
     }
     drop(remaining);
     steps.push("no process left in the sessions".to_owned());
-    // One deadline for every session: the bound is how long a session may stay listed after its last process.
     let no_process_left = Instant::now();
-    let deadline = no_process_left + logon_session::SESSION_END_BOUND;
-    for id in &ids {
-        logon_session::wait_until_unlisted(*id, deadline)
-            .map_err(|why| format!("a session of {name} did not end: {why}; {}", still_referring(sid_text)))?;
-        steps.push(format!(
-            "logon session {id:#x} left LSA's list {:?} after no process was left",
-            no_process_left.elapsed()
-        ));
+    match how {
+        ServiceLogon::Sshd => {
+            // One deadline for every session: the bound is how long a session may stay listed after its last
+            // process.
+            let deadline = no_process_left + logon_session::SESSION_END_BOUND;
+            for id in &ids {
+                logon_session::wait_until_unlisted(*id, deadline)
+                    .map_err(|why| format!("a session of {name} did not end: {why}; {}", still_referring(sid_text)))?;
+                steps.push(format!(
+                    "logon session {id:#x} left LSA's list {:?} after no process was left",
+                    no_process_left.elapsed()
+                ));
+            }
+        }
+        ServiceLogon::TaskScheduler => {
+            for id in &ids {
+                let listed = logon_session::is_listed(*id)
+                    .map_err(|why| format!("look for logon session {id:#x} in LSA's list: {why}"))?;
+                steps.push(format!(
+                    "logon session {id:#x} {} LSA's list {:?} after no process was left (the Task Scheduler made \
+                     this logon and ends it when it will)",
+                    if listed { "is still in" } else { "has left" },
+                    no_process_left.elapsed()
+                ));
+            }
+        }
     }
-    Ok(Some(Ended))
+    Ok(Some(Ended { agent_sessions: ids }))
 }
 
 /// What the fixture can say about who still refers to the logon sessions of `sid_text` after a wait that

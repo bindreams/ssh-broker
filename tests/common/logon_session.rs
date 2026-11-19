@@ -96,8 +96,10 @@ pub fn assert_auditing(subcategory: &str, setting: &str) {
 }
 
 /// How long LSA may keep listing a logon session after its last process has ended: an external event
-/// that may never come. A Batch logon leaves the list after about 90 s and an interactive secondary logon
-/// after about 180 s; the bound is twice the longer. The sessions a `logout` ends share one deadline of this
+/// that may never come. A Batch logon that the product made (the shim's password prompt) leaves the list after
+/// about 90 s and an interactive secondary logon after about 180 s; the bound is twice the longer. It is for the
+/// logons the product made: a logon the Task Scheduler made stayed listed past 360 s with no process in it, and
+/// is not waited for (see `session_end`). The sessions a `logout` ends share one deadline of this
 /// length, counted from when no process is left in them (see [`wait_until_unlisted`]). A test that ends several
 /// sessions, one `logout` each, needs a termination in `.config/nextest.toml` beyond the sum of its bounds.
 /// Expiry fails the wait and names what still refers to the session.

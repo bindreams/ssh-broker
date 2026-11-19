@@ -78,13 +78,17 @@ pub fn next_account_name(tag: &str) -> String {
 
 /// How a service logged the account on: the logons whose hive Windows keeps loaded after the product's
 /// `logout`, as it does for a user who logged in at the console.
-/// A test says which one it started, and what it checks at the end of the session follows from it.
+/// A test says which one it started, and what it checks at the end of the session follows from it: whose
+/// logon session the agent runs in (see `session_end`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ServiceLogon {
-    /// A Task Scheduler task with a stored password (`auto-login on`): a Batch logon, whose session
-    /// Windows sometimes keeps although no process of it is left.
+    /// The agent was started by a Task Scheduler task with a stored password (`auto-login on`): the Task
+    /// Scheduler made its Batch logon, and ends that logon session when it will (measured: more than 360 s
+    /// after the last process of it). The fixture does not wait for it.
     TaskScheduler,
-    /// sshd's logon of an SSH connection.
+    /// sshd's logon of an SSH connection keeps the hive. The agent is the product's: the shim's password
+    /// prompt (or `logon::start_background_agent` from a test) logged the account on for it, so its logon
+    /// session is the product's, and the fixture waits for it to leave LSA's list.
     Sshd,
 }
 
