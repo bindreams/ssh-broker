@@ -1,11 +1,7 @@
 //! The one way the agent's process ends.
 //!
-//! The agent has several threads that end the process: the `logout` handler once the shells'
-//! output is delivered, the accept loop once it has stopped, the main thread when the agent
-//! fails, and the request socket's thread when its loop met a shortage with no connection live
-//! (it ends the process, as a failed agent does, once the end it decided has settled). Every end
-//! goes through [`end_process`]; the first caller in is the only one that ends the
-//! process, so two threads are never inside the process's exit at once.
+//! The agent has several threads that end the process. Every end goes through [`end_process`]; the first
+//! caller in is the only one that ends the process, so two threads are never inside the process's exit at once.
 //!
 //! What the agent must keep until the process is gone lives here as well (see [`hold_until_end`]).
 //!

@@ -107,8 +107,19 @@ impl SocketDir {
 
     /// Connect to the request socket in the folder held. The only way to connect to it, as [`SocketDir::connect`]
     /// is for `agent.sock`.
+    ///
+    /// A path over the limit is answered as a missing socket ([`crate::console_prompt::is_no_agent`]): `for_profile`
+    /// measures `agent.sock` only, and where that fits and this does not no agent at High can exist, since its own
+    /// `agent.sock` is 7 bytes longer than this path.
     pub fn connect_request(&self) -> anyhow::Result<socket2::Socket> {
-        crate::afunix::connect(&self.location.request_path())
+        let path = self.location.request_path();
+        if path.as_os_str().len() > socket_loc::MAX_SOCKET_PATH_BYTES {
+            return Err(crate::console_prompt::nothing_serves(&format!(
+                "{} is over the socket path limit, so no agent at High can exist for this profile",
+                path.display()
+            )));
+        }
+        crate::afunix::connect(&path)
     }
 }
 

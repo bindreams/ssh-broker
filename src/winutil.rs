@@ -533,16 +533,13 @@ fn handle_list(inherit: &[HANDLE]) -> Vec<HANDLE> {
 /// The Unicode environment block for a child: `base` with `extra` put over it, as `NAME=VALUE` entries each
 /// ended by a NUL, and one more NUL at the end.
 ///
-/// Only the names in `extra` are this function's business. The base keeps its entries, their order and its
-/// duplicates (a name that begins with `=`, a drive's current folder, stays where it is), except that an entry
-/// whose name is a name in `extra`, compared without regard to ASCII case (the names in `extra` are ASCII), is
-/// removed. Each `extra` entry goes before the first entry whose name sorts after its own, by the same
-/// comparison, so a block that was sorted, as Windows hands one over, stays sorted. A name given twice in `extra`
-/// is its last value.
+/// An entry of `base` whose name matches one in `extra` (ASCII case-insensitive) is replaced; each `extra` entry
+/// is inserted before the first `base` name that sorts after it, so a sorted block stays sorted. Other `base`
+/// entries, their order and duplicates (including `=C:`-style names) are kept. The last of a repeated `extra`
+/// name wins.
 pub fn environment_block(base: impl IntoIterator<Item = (OsString, OsString)>, extra: &[(&str, &str)]) -> Vec<u16> {
     use std::cmp::Ordering;
     use std::os::windows::ffi::OsStrExt;
-    // Names compare unit by unit, with ASCII letters upper-cased.
     fn compare(a: &[u16], b: &[u16]) -> Ordering {
         let fold = |unit: &u16| {
             if *unit < 0x80 {
@@ -553,7 +550,6 @@ pub fn environment_block(base: impl IntoIterator<Item = (OsString, OsString)>, e
         };
         a.iter().map(fold).cmp(b.iter().map(fold))
     }
-    // (name, value)
     let mut extras: Vec<(Vec<u16>, Vec<u16>)> = Vec::new();
     for (name, value) in extra {
         let name: Vec<u16> = name.encode_utf16().collect();

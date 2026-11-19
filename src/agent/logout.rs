@@ -134,7 +134,6 @@ pub(super) struct Reservation<'a> {
 }
 
 impl<'a> Reservation<'a> {
-    /// The id the session's environment carries.
     pub(super) fn id(&self) -> &SessionId {
         &self.id
     }

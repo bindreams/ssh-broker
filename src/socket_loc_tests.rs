@@ -7,13 +7,9 @@ fn profile(name: &str) -> PathBuf {
     PathBuf::from(format!(r"C:\Users\{name}"))
 }
 
-/// A profile padded so the longest socket path of its location, the request socket's, is exactly `bytes` long.
+/// A profile padded so the socket path is exactly `bytes` long.
 fn profile_for_socket_path_of(bytes: usize, integrity: Integrity) -> PathBuf {
-    let fixed = for_profile(&profile("x"), integrity)
-        .unwrap()
-        .request_path()
-        .as_os_str()
-        .len();
+    let fixed = for_profile(&profile("x"), integrity).unwrap().path.as_os_str().len();
     profile(&"x".repeat(1 + bytes - fixed))
 }
 
@@ -62,7 +58,7 @@ fn for_profile_accepts_exactly_107_bytes_and_rejects_108() {
         Integrity::Medium,
     )
     .unwrap();
-    assert_eq!(ok.request_path().as_os_str().len(), MAX_SOCKET_PATH_BYTES);
+    assert_eq!(ok.path.as_os_str().len(), MAX_SOCKET_PATH_BYTES);
 
     let too_long = profile_for_socket_path_of(MAX_SOCKET_PATH_BYTES + 1, Integrity::Medium);
     match for_profile(&too_long, Integrity::Medium).unwrap_err() {
@@ -75,40 +71,29 @@ fn for_profile_accepts_exactly_107_bytes_and_rejects_108() {
 }
 
 #[test]
-fn request_path_is_in_the_plain_folder_and_within_the_length_limit() {
+fn request_path_is_in_the_folder_beside_the_agent_socket() {
     let loc = for_profile(&profile("a"), Integrity::Medium).unwrap();
     assert_eq!(REQUEST_SOCKET_FILE_NAME, "request.sock");
     assert_eq!(loc.request_path(), loc.dir().join("request.sock"));
     assert_ne!(loc.request_path(), loc.path(), "not the agent's socket");
-
-    let longest = for_profile(
-        &profile_for_socket_path_of(MAX_SOCKET_PATH_BYTES, Integrity::Medium),
-        Integrity::Medium,
-    )
-    .unwrap();
-    assert_eq!(longest.request_path().as_os_str().len(), MAX_SOCKET_PATH_BYTES);
-    assert!(longest.path().as_os_str().len() < MAX_SOCKET_PATH_BYTES);
 }
 
+/// `for_profile` measures `agent.sock` only, and no separate check is needed for `request.sock`: an agent at High
+/// binds it in the plain folder, where its path is 7 bytes shorter than that agent's own `agent.sock` in the
+/// elevated folder. A profile at which an agent at High can start has room for it.
 #[test]
-fn a_profile_path_too_long_for_request_sock_is_refused_with_the_reason() {
-    // `agent.sock` fits at this length, and `request.sock` is two bytes longer than it.
-    let profile = profile_for_socket_path_of(MAX_SOCKET_PATH_BYTES + 1, Integrity::Medium);
-    let agent_only = for_profile(
-        &profile_for_socket_path_of(MAX_SOCKET_PATH_BYTES, Integrity::Medium),
-        Integrity::Medium,
-    )
-    .unwrap();
-    assert!(agent_only.path().as_os_str().len() < MAX_SOCKET_PATH_BYTES);
-    let error = for_profile(&profile, Integrity::Medium).unwrap_err();
-    match &error {
-        SocketLocationError::TooLong { path, bytes, max } => {
-            assert_eq!(*bytes, MAX_SOCKET_PATH_BYTES + 1);
-            assert_eq!(*max, MAX_SOCKET_PATH_BYTES);
-            assert!(path.ends_with(REQUEST_SOCKET_FILE_NAME), "{}", path.display());
-        }
+fn request_sock_fits_wherever_the_elevated_agent_sock_does() {
+    let mut lengths = 0;
+    for n in (1..).take_while(|n| for_profile(&profile(&"x".repeat(*n)), Integrity::High).is_ok()) {
+        let profile = profile(&"x".repeat(n));
+        let high = for_profile(&profile, Integrity::High).unwrap();
+        let plain = for_profile(&profile, Integrity::Medium).unwrap();
+        let request = plain.request_path().as_os_str().len();
+        assert!(request <= MAX_SOCKET_PATH_BYTES, "a profile of {n} bytes: {request}");
+        assert_eq!(high.path().as_os_str().len() - request, 7);
+        lengths += 1;
     }
-    assert!(error.to_string().contains("the AF_UNIX limit is 107"), "{error}");
+    assert!(lengths > 0);
 }
 
 #[test]
@@ -146,7 +131,7 @@ fn too_long_message_names_path_bytes_and_limit() {
         .join("AppData")
         .join("Local")
         .join("ssh-broker")
-        .join("request.sock");
+        .join("agent.sock");
     assert_eq!(
         err.to_string(),
         format!(
@@ -219,14 +204,14 @@ fn the_two_folders_of_one_profile_never_share_a_socket() {
 }
 
 #[test]
-fn the_longest_profile_path_is_69_bytes_for_a_medium_location_and_60_for_a_high_one() {
+fn the_longest_profile_path_is_71_bytes_for_a_medium_location_and_62_for_a_high_one() {
     let longest = |integrity| {
         let fits = |n: usize| for_profile(&profile(&"x".repeat(n)), integrity).is_ok();
         let n = (1..).take_while(|n| fits(*n)).last().unwrap();
         profile(&"x".repeat(n)).as_os_str().len()
     };
-    assert_eq!(longest(Integrity::Medium), 69);
-    assert_eq!(longest(Integrity::High), 60);
+    assert_eq!(longest(Integrity::Medium), 71);
+    assert_eq!(longest(Integrity::High), 62);
 }
 
 #[test]
@@ -237,7 +222,7 @@ fn a_profile_that_fits_the_plain_folder_but_not_the_elevated_one_is_told_the_ele
         SocketLocationError::TooLong { path, bytes, max } => {
             assert_eq!(bytes, MAX_SOCKET_PATH_BYTES + 9);
             assert_eq!(max, MAX_SOCKET_PATH_BYTES);
-            let tail = Path::new(ELEVATED_SOCKET_DIR_NAME).join(REQUEST_SOCKET_FILE_NAME);
+            let tail = Path::new(ELEVATED_SOCKET_DIR_NAME).join(SOCKET_FILE_NAME);
             assert!(path.ends_with(&tail), "{}", path.display());
         }
     }

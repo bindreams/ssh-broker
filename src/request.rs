@@ -1,8 +1,5 @@
-//! request: the client loop of the verbs that ask the invoking user's agent for something (`logout`; `elevate`
-//! next), over whichever socket reaches it.
-//!
-//! What is asked is the verb's own (`ask`); this is how the agent is found again once, what is said when
-//! there is none, and the exit codes.
+//! request: the client loop of the verbs that ask the invoking user's agent for something (`logout`): connect,
+//! ask, retry once if the agent was ending, and report when there is no agent.
 
 use std::io::Write;
 
@@ -30,13 +27,9 @@ pub enum Asked {
 /// borrowed, not consumed, and the caller keeps it open until the process exits (the agent may wait for the
 /// client to close before it acts, and the client may be inside the tree it ends).
 ///
-/// A connection that ends before the agent's first byte means the agent is ending (its listener closed
-/// with this request queued) or gone: the session the user asked about is ending already. It connects
-/// again, and the next connect finds no agent (the outcome of asking a moment later) or an agent that
-/// answers. A second connection in a row that ends before the first byte breaks the protocol (an agent
-/// that follows it closes without a byte only while its listener closes, as an older agent that does not
-/// know the request does not): it is reported and exits with
-/// [`PROTOCOL_VIOLATION_CODE`](crate::shim::PROTOCOL_VIOLATION_CODE).
+/// A connection that ends before the agent's first byte means the agent is ending or gone; connect once more,
+/// which finds no agent or an agent that answers. A second such connection in a row breaks the protocol:
+/// reported, exit [`PROTOCOL_VIOLATION_CODE`](crate::shim::PROTOCOL_VIOLATION_CODE).
 pub fn ask_at<R, W, T>(
     mut connect: impl FnMut() -> anyhow::Result<(R, W)>,
     mut ask: impl FnMut(&mut R, &mut W, &mut dyn Write) -> Asked,

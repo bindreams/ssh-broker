@@ -86,7 +86,7 @@ fn for_profile_limit_agrees_with_unix_addr() {
     for integrity in [Integrity::Medium, Integrity::High] {
         let fixed = crate::socket_loc::for_profile(&profile_named("x"), integrity)
             .unwrap()
-            .request_path()
+            .path()
             .as_os_str()
             .len();
         for bytes in 105..=109 {
@@ -96,7 +96,7 @@ fn for_profile_limit_agrees_with_unix_addr() {
                 .join("AppData")
                 .join("Local")
                 .join(integrity.dir_name())
-                .join(crate::socket_loc::REQUEST_SOCKET_FILE_NAME);
+                .join(crate::socket_loc::SOCKET_FILE_NAME);
             assert_eq!(
                 location.is_ok(),
                 crate::afunix::unix_addr(&path).is_ok(),
@@ -821,6 +821,33 @@ fn connect_request_reaches_request_sock_and_connect_reaches_agent_sock() {
     let agent = crate::afunix::Listener::bind(loc.path(), Integrity::Medium).unwrap();
     let _client = folder.connect().expect("agent.sock has a listener");
     agent.accept().expect("the connection came to agent.sock");
+}
+
+/// A profile at which `agent.sock` of the plain folder fits and `request.sock` does not (the last two byte
+/// lengths): no agent at High can exist there, since its own `agent.sock` is 7 bytes longer still. Connecting to
+/// `request.sock` says what a missing socket says, with the reason, and not that the agent could not be reached.
+#[test]
+fn a_request_socket_path_over_the_limit_is_answered_as_nothing_serving_it() {
+    let fixed = crate::socket_loc::for_profile(&PathBuf::from("x"), Integrity::Medium)
+        .unwrap()
+        .path()
+        .as_os_str()
+        .len()
+        - 1;
+    let name = format!("sb-ud-rl-{}-", std::process::id());
+    let named = std::env::temp_dir().join(&name);
+    let padding = crate::socket_loc::MAX_SOCKET_PATH_BYTES - fixed - named.as_os_str().len();
+    let root = named.with_file_name(format!("{name}{}", "x".repeat(padding)));
+    std::fs::create_dir_all(root.join("AppData").join("Local")).unwrap();
+    let profile = TempProfile(root);
+
+    let loc = profile.location();
+    assert_eq!(loc.path().as_os_str().len(), crate::socket_loc::MAX_SOCKET_PATH_BYTES);
+    assert!(loc.request_path().as_os_str().len() > crate::socket_loc::MAX_SOCKET_PATH_BYTES);
+    let folder = open_socket_dir(&loc, &me()).unwrap();
+    let err = folder.connect_request().unwrap_err();
+    assert!(crate::console_prompt::is_no_agent(&err), "{err:#}");
+    assert!(format!("{err:#}").contains("no agent at High"), "{err:#}");
 }
 
 #[test]

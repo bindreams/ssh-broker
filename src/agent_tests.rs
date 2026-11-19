@@ -1485,9 +1485,13 @@ fn the_id_a_running_session_prints(tag: &str, control: &super::Control) -> crate
                 FrameKind::Data => {
                     printed.push_str(&String::from_utf8_lossy(&frame.payload[1..]));
                     let prefix = format!("{SESSION_VARIABLE}=");
-                    if let (None, Some(at)) = (id, printed.find(&prefix)) {
-                        let text = &printed[at + prefix.len()..];
-                        let found = SessionId::parse(text.get(..32).expect("the whole id was printed"))
+                    // Output arrives in frames of any size: the id is read once its line has ended.
+                    let line_of_id = printed
+                        .find(&prefix)
+                        .map(|at| &printed[at + prefix.len()..])
+                        .and_then(|text| text.find(['\r', '\n']).map(|end| &text[..end]));
+                    if let (None, Some(digits)) = (id, line_of_id) {
+                        let found = SessionId::parse(digits)
                             .unwrap_or_else(|| panic!("what the session printed is no id: {printed:?}"));
                         assert!(control.is_registered(&found), "the id the session has is registered");
                         id = Some(found);

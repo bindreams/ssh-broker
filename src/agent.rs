@@ -287,22 +287,15 @@ fn serve_with(
 ///
 /// An agent at High also keeps `request.sock` in the plain folder, which the processes of its account below High
 /// can reach (see [`requests`]). Without it the agent serves its sessions all the same, and `logout` from an
-/// unelevated process says which case it is. The plain folder is refused: the client's own walk refuses the same
-/// folder, and `logout` prints "could not reach your session: ..." naming it and exits 4. The folder cannot be
-/// opened for another reason: `logout` reports what its own walk meets there. The folder opens but the socket
-/// cannot be bound, or served: `logout` finds neither socket and prints that no session is reachable from it, and
-/// where to run `logout` instead (exit 1).
+/// unelevated process reports which case it is (see [`crate::logout`]).
 #[cfg(windows)]
 fn run_on(folder: &Arc<SocketDir>, background: bool) -> anyhow::Result<()> {
     let connections = Connections::new();
     let integrity = folder.location().integrity();
-    // Held to the end of this function, as `folder` is held by the process: the plain folder cannot be
-    // renamed or removed meanwhile.
+    // Held to the end of the function so the plain folder cannot be renamed or removed.
     let plain = open_request_folder(folder.location(), |location| {
         crate::userdir::open_socket_dir(location, &crate::acl::Sid::current_user()?)
     });
-    // Closing the listeners wakes each blocked `accept` with a connection of its own (the connect each loop
-    // registered with the tally); the loop then sees the flag.
     let control = Arc::new(Control::new(background, Arc::clone(&connections)));
     let agent_folder = Arc::clone(folder);
     run_on_with(
@@ -320,10 +313,20 @@ fn run_on(folder: &Arc<SocketDir>, background: bool) -> anyhow::Result<()> {
             )
         },
     )
-    .or_else(|err| match err.downcast_ref::<Stopped>() {
-        Some(Stopped) => Ok(()),
-        None => Err(err),
-    })
+    .or_else(|end| run_ended(end, &connections))
+}
+
+/// How [`run_on`] ends, given `end`, how the loop of `agent.sock` ended. A loop that stopped because the end was
+/// decided is a clean end, unless what decided it was a shortage that no connection was live to cure
+/// ([`Connections::fatal_cause`]), possibly on the request socket's loop: then it is that failure, so that the
+/// process ends with the code of a failed agent whichever thread ends it.
+#[cfg(windows)]
+fn run_ended(end: anyhow::Error, connections: &Connections) -> anyhow::Result<()> {
+    match (end.downcast_ref::<Stopped>(), connections.fatal_cause()) {
+        (Some(Stopped), None) => Ok(()),
+        (Some(Stopped), Some(cause)) => Err(anyhow::Error::msg(cause).context(NothingLive)),
+        (None, _) => Err(end),
+    }
 }
 
 /// The plain folder in which an agent that holds `held` keeps its request socket: only an agent at High has one.
@@ -384,7 +387,6 @@ fn serve_requests(listener: Listener, connect: WakeConnect, connections: &Arc<Co
                     requests::serve,
                 )
             });
-            // The cause is logged by `request_loop_ended`, once.
             request_loop_ended(&end, &connections, |end| end_on_error(end));
         });
     if let Err(e) = spawned {
@@ -392,16 +394,11 @@ fn serve_requests(listener: Listener, connect: WakeConnect, connections: &Arc<Co
     }
 }
 
-/// What the request socket's loop does with how it ended (`end`). Whether the agent ends is not that loop's to
-/// say, and whatever stops it leaves the sessions as they are, with one exception: a shortage with no
-/// connection of this agent live ([`NothingLive`]), on which the loop has decided the end (see
-/// [`serve_connections_with`]). The end then goes as every end goes ([`Connections::settle`]: the loop of `agent.sock` is woken and
-/// stops, nothing is live to drain), and only then the process ends, through `end_agent`, as it does when the
-/// loop of `agent.sock` meets the shortage. Nothing is live, so nothing is lost, and the next login starts an
-/// agent with both sockets; an agent that served on without the request socket would leave every `logout` from
-/// an unelevated session with nothing to ask.
-///
-/// The cause is logged here, once; `end_agent` does not log it again.
+/// How the request socket's loop ended (`end`). Any stop leaves the sessions as they are, except a shortage with no
+/// connection live ([`NothingLive`]): the loop has decided the end, so settle it ([`Connections::settle`]) and end
+/// the process via `end_agent`. The main thread, woken by that settle, ends with the same recorded cause
+/// ([`run_ended`]), so the exit code is the same whichever thread ends the process first. Serving on without the
+/// request socket would leave unelevated `logout`s nothing to ask. The cause is logged here, once.
 #[cfg(windows)]
 fn request_loop_ended(end: &anyhow::Error, connections: &Arc<Connections>, end_agent: impl FnOnce(&anyhow::Error)) {
     if end.downcast_ref::<Stopped>().is_some() {
@@ -556,10 +553,8 @@ enum Arrived {
 #[error("the agent stopped accepting connections because its session is ending")]
 struct Stopped;
 
-/// The context of the error with which a loop ends on a shortage of resources when no connection of this agent is
-/// live to free any: nothing can, so the shortage is fatal (see [`serve_connections_with`]). The loop returns it
-/// only after it has decided the end in the tally ([`Connections::decide_end_if_idle`]), so a connection counted
-/// after is refused; what the caller does with it is to settle that end and end the process.
+/// The context of a shortage that met no live connection: the loop has already decided the end (see
+/// [`serve_connections_with`]); the caller settles it and ends the process.
 #[cfg(windows)]
 #[derive(Debug, thiserror::Error)]
 #[error("no connection of this agent is live to free a resource")]
@@ -675,7 +670,8 @@ fn serve_connections_observed<C>(
 /// A shortage that meets no live connection decides the end here, in one step under the tally's lock
 /// ([`Connections::decide_end_if_idle`]), while the loop still holds the connection it kept: that connection is
 /// served once more, as when `stopping` says so, and the loop returns the shortage with [`NothingLive`] as its
-/// context. If a connection became live meanwhile the end stays undecided and the loop goes round again, with
+/// context, and the tally keeps the cause for the main thread ([`run_ended`]). If a connection became live or ended
+/// meanwhile (it may have freed what the loop lacks) the end stays undecided and the loop goes round again, with
 /// the kept connection still held. Both loops of the agent get the rule from here.
 #[cfg(windows)]
 fn serve_connections_with<C>(
@@ -729,16 +725,18 @@ fn serve_connections_with<C>(
             }
             Err(AcceptError::Fatal(e)) => return e.context("the listener failed"),
         };
-        if !connections.wait_for_an_end(ended_before, &mut blocking) && connections.decide_end_if_idle() {
+        if !connections.wait_for_an_end(ended_before, &mut blocking)
+            && connections.decide_end_if_idle(ended_before, &shortage)
+        {
             refuse_kept(kept.take(), &connections, &mut serve);
             return shortage.context(NothingLive);
         }
     }
 }
 
-/// The end is decided while a connection waits for a thread (`kept`). It is served once more, which gets it the
-/// ending refusal (see `handle_connection_in`) and counts it, so the drain waits for the refusal. If there is
-/// still no thread, its client sees the agent end.
+/// Serve the connection `kept` for want of a thread once more, now that the end is decided (see
+/// [`serve_connections_with`]): it is counted, so the drain waits for its refusal. With no thread for that either,
+/// its client sees the agent end.
 #[cfg(windows)]
 fn refuse_kept<C>(
     kept: Option<C>,

@@ -137,7 +137,7 @@ impl ExitCode {
 pub const SESSION_VARIABLE: &str = "SSH_BROKER_SESSION";
 
 /// A session's id: 128 random bits (see `agent::session::new_id`), shown as 32 lower-case hex digits. Never
-/// repeated across agent runs, so a process that outlived its agent names no session of the next.
+/// repeated across agent runs.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SessionId([u8; 16]);
 

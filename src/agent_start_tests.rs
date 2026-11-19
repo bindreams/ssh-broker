@@ -929,12 +929,50 @@ fn an_end_with_no_accept_loop_wakes_nothing_and_waits_for_nothing() {
 fn the_end_is_decided_only_while_no_connection_is_live() {
     let connections = Connections::new();
     let live = connections.begin();
-    assert!(!connections.decide_end_if_idle());
+    let cause = anyhow::anyhow!("accept failed with code 10055");
+    assert!(!connections.decide_end_if_idle(connections.ended(), &cause));
     assert!(!connections.is_closing(), "a live connection keeps the end undecided");
+    assert_eq!(connections.fatal_cause(), None, "and no cause is kept");
 
     drop(live);
-    assert!(connections.decide_end_if_idle());
+    assert!(connections.decide_end_if_idle(connections.ended(), &cause));
     assert!(connections.is_closing());
+}
+
+/// The loop waited for an end and found none to wait for, then decides: a connection that came and went in
+/// between may have freed what the loop lacks, so the end is decided on the count the wait saw, under one lock.
+#[test]
+fn a_connection_that_ended_since_the_wait_keeps_the_end_undecided() {
+    let connections = Connections::new();
+    let since = connections.ended();
+    drop(connections.begin());
+    let cause = anyhow::anyhow!("accept failed with code 10055");
+
+    assert!(!connections.decide_end_if_idle(since, &cause));
+    assert!(!connections.is_closing());
+    assert_eq!(connections.fatal_cause(), None);
+    assert!(
+        connections.decide_end_if_idle(connections.ended(), &cause),
+        "the next attempt, on the new count, decides"
+    );
+}
+
+/// The cause is kept in the step that raises the flag, so whoever reads the flag up finds it. The first cause is
+/// the one kept; an end that a `logout` decided has none.
+#[test]
+fn the_end_a_shortage_decides_keeps_its_cause_with_the_flag() {
+    let connections = Connections::new();
+    assert!(connections.decide_end_if_idle(connections.ended(), &anyhow::anyhow!("accept failed with code 10055")));
+    assert!(connections.decide_end_if_idle(connections.ended(), &anyhow::anyhow!("a later shortage")));
+    assert_eq!(
+        connections.fatal_cause().as_deref(),
+        Some("accept failed with code 10055")
+    );
+
+    let logout = Connections::new();
+    logout.settle();
+    assert!(logout.is_closing());
+    assert_eq!(logout.fatal_cause(), None, "an end by logout is no failure");
 }
 
 /// A logout on `request.sock` can settle before the main thread has counted `agent.sock`'s listener: that

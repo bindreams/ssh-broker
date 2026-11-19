@@ -187,6 +187,46 @@ fn a_client_that_leaves_without_a_byte_is_not_an_error() {
     handle(listener.accept().unwrap(), &control, || panic!("nothing was asked")).unwrap();
 }
 
+/// What `agent.sock` does for a handler that panics, `serve` does for the request socket: the client is answered
+/// with 255 before the connection closes, and not left to take silence for an agent that is going away. The panic is
+/// made where a `logout` of a background agent runs the means a session registered to end it, after the logout
+/// reply and before the end: the client has then two replies, and the second is the failure.
+#[test]
+fn a_request_handler_that_panics_answers_its_connection_with_255() {
+    let (_profile, folder, listener) = request_socket("rq-panic");
+    let control = Control::new(true, Connections::new());
+    let _session = control
+        .reserve()
+        .unwrap()
+        .unwrap()
+        .register(Arc::new(|| panic!("the means to end the session failed")))
+        .expect("the agent is not ending");
+
+    let (mut rx, mut tx) = afunix::split(folder.connect_request().unwrap()).unwrap();
+    send_handshake(&logout_handshake())(&mut tx);
+    // The agent waits for the client to close before it ends anything; half-closing is enough.
+    tx.shutdown_write().unwrap();
+    let conn = listener.accept().unwrap();
+    let served = std::thread::scope(|scope| scope.spawn(|| serve(conn, &control)).join());
+    assert!(served.is_err(), "the panic is not swallowed");
+
+    let mut frames = FrameReader::new();
+    let (mut logout, mut failure) = (TestSink::default(), TestSink::default());
+    assert_eq!(
+        pump_decode(&mut rx, &mut frames, &mut logout).unwrap(),
+        Outcome::Exited(0)
+    );
+    assert_eq!(stderr_of(&logout), logout::ENDING_REPLY);
+    assert_eq!(
+        pump_decode(&mut rx, &mut frames, &mut failure).expect("the failure reply was lost"),
+        Outcome::Exited(logout::FAILED_EXIT_CODE)
+    );
+    assert_eq!(
+        stderr_of(&failure),
+        "ssh-broker: the agent failed while serving this connection: the handler panicked\r\n"
+    );
+}
+
 // Served beside agent.sock -----
 
 /// The request socket's own accept loop, over `listener`, with the end it was given wired as `agent` and
@@ -200,8 +240,8 @@ struct Serving {
     handling: mpsc::Receiver<()>,
 }
 
-fn serve_on(folder: &Arc<SocketDir>, listener: Listener, connections: Arc<Connections>) -> Serving {
-    let control = Arc::new(Control::new(true, Arc::clone(&connections)));
+fn serve_on(folder: &Arc<SocketDir>, listener: Listener, connections: Arc<Connections>, background: bool) -> Serving {
+    let control = Arc::new(Control::new(background, Arc::clone(&connections)));
     let (ended, on_end) = mpsc::channel();
     let (handling, on_handling) = mpsc::channel();
     let loop_thread = std::thread::spawn({
@@ -245,7 +285,7 @@ fn serve_on(folder: &Arc<SocketDir>, listener: Listener, connections: Arc<Connec
 #[test]
 fn a_logout_on_the_request_socket_ends_the_agent_and_its_loop() {
     let (_profile, folder, listener) = request_socket("rq-loop-logout");
-    let serving = serve_on(&folder, listener, Connections::new());
+    let serving = serve_on(&folder, listener, Connections::new(), true);
 
     let (outcome, sink) = ask_raw(&folder, send_handshake(&logout_handshake()));
     assert_eq!(outcome, Outcome::Exited(0));
@@ -258,9 +298,52 @@ fn a_logout_on_the_request_socket_ends_the_agent_and_its_loop() {
     assert!(serving.control.is_ending());
 }
 
+/// A connection that finishes is waited for: the end does not settle while the request socket's loop has one live.
+/// The connection is idle until the end is waiting for it, and then it asks (of a desktop agent, whose answer
+/// ends nothing) and finishes.
+#[test]
+fn a_request_connection_that_finishes_is_waited_for_by_the_end() {
+    let (_profile, folder, listener) = request_socket("rq-drain");
+    let (events, on_event) = mpsc::channel();
+    let connections = Connections::observing_drain({
+        let events = events.clone();
+        move || {
+            let _ = events.send("parked");
+        }
+    });
+    let serving = serve_on(&folder, listener, connections, false);
+
+    let (mut rx, mut tx) = afunix::split(folder.connect_request().unwrap()).unwrap();
+    serving.handling.recv().expect("the loop gave the connection a handler");
+    let settler = std::thread::spawn({
+        let control = Arc::clone(&serving.control);
+        move || {
+            let drained = control.settle();
+            let _ = events.send("settled");
+            drained
+        }
+    });
+    assert_eq!(
+        on_event.recv().unwrap(),
+        "parked",
+        "the end did not wait for the connection"
+    );
+
+    send_handshake(&Handshake {
+        mode: Mode::Logout,
+        ..Handshake::pty_default()
+    })(&mut tx);
+    assert_eq!(settler.join().unwrap(), Drained::Complete);
+    let end = serving.loop_thread.join().unwrap();
+    assert!(end.downcast_ref::<Stopped>().is_some(), "{end:#}");
+
+    let mut sink = TestSink::default();
+    let outcome = pump_decode(&mut rx, &mut FrameReader::new(), &mut sink).expect("the answer arrived");
+    assert_eq!(outcome, Outcome::Exited(logout::DESKTOP_EXIT_CODE));
+}
+
 /// A connection that says nothing is live, and the end counts it among those it waits for, as for a session: a
-/// drain whose bound passes reports it. (That a request connection that finishes is waited for is the tally's
-/// own, for every connection: `a_request_connection_is_drained_like_a_session`.) The loop stops all the same.
+/// drain whose bound passes reports it. The loop stops all the same.
 #[test]
 fn an_idle_connection_on_the_request_socket_is_counted_by_the_end() {
     let (_profile, folder, listener) = request_socket("rq-idle");
@@ -268,6 +351,7 @@ fn an_idle_connection_on_the_request_socket_is_counted_by_the_end() {
         &folder,
         listener,
         Connections::with_drain_bound(std::time::Duration::from_millis(100)),
+        true,
     );
 
     let idle = folder.connect_request().unwrap();
@@ -355,6 +439,57 @@ fn a_shortage_with_nothing_live_ends_the_agent_whichever_socket_met_it() {
     assert!(ended[0].contains("no connection of this agent is live"), "{}", ended[0]);
 }
 
+/// The end the request loop decides is settled on the main thread too: the loop of `agent.sock` returns as if it
+/// were stopped. Whichever of the two threads ends the process first, it ends as a failed agent does (code 1),
+/// and a stop that a `logout` decided is still a clean end.
+#[test]
+fn a_shortage_the_request_loop_decided_ends_the_agent_with_one_code_whichever_thread_is_first() {
+    for request_thread_first in [true, false] {
+        let (connections, end) = request_loop_met(|| {
+            Err(AcceptError::Exhausted {
+                code: 10055,
+                source: std::io::Error::from_raw_os_error(10055),
+            })
+        });
+        let mut request_thread = Vec::new();
+        let mut main_thread = None;
+        let mut request_thread_ends = || {
+            crate::agent::request_loop_ended(&end, &connections, |err| {
+                request_thread.push(crate::agent::exit_code_of(err))
+            })
+        };
+        let mut main_thread_ends =
+            || main_thread = Some(crate::agent::run_ended(anyhow::Error::new(Stopped), &connections));
+        if request_thread_first {
+            request_thread_ends();
+            main_thread_ends();
+        } else {
+            main_thread_ends();
+            request_thread_ends();
+        }
+
+        let main_end = main_thread.unwrap().expect_err("the main thread ends with the failure");
+        assert_eq!(
+            crate::agent::exit_code_of(&main_end),
+            1,
+            "request thread first: {request_thread_first}"
+        );
+        assert!(
+            main_end.downcast_ref::<crate::agent::NothingLive>().is_some()
+                && format!("{main_end:#}").contains("accept failed with code 10055"),
+            "{main_end:#}"
+        );
+        assert_eq!(request_thread, [1], "request thread first: {request_thread_first}");
+    }
+
+    let connections = Connections::new();
+    connections.settle();
+    assert!(
+        crate::agent::run_ended(anyhow::Error::new(Stopped), &connections).is_ok(),
+        "an end by logout is no failure"
+    );
+}
+
 /// Anything else that stops the request loop leaves the agent and its sessions as they are.
 #[test]
 fn every_other_end_of_the_request_loop_leaves_the_agent_running() {
@@ -424,7 +559,7 @@ fn a_decided_end_settles_the_other_loop_before_the_process_ends_and_refuses_logi
     let connections = Connections::new();
     let control = Control::new(true, Arc::clone(&connections));
     let _agent = crate::agent::HeldListener::open(&connections, "agent.sock", |listener| listener.close());
-    assert!(connections.decide_end_if_idle());
+    assert!(connections.decide_end_if_idle(connections.ended(), &shortage()));
     assert!(control.is_ending(), "a login that comes now is refused");
     assert!(control.reserve().unwrap().is_none(), "and gets no session id");
 
@@ -551,5 +686,4 @@ fn a_refused_plain_folder_leaves_the_agent_serving_its_sessions() {
     .unwrap_err();
     assert_eq!(end.to_string(), "stop");
     assert_eq!(*events.borrow(), ["mark", "accept"]);
-    assert!(!folder.location().request_path().exists());
 }

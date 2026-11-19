@@ -180,15 +180,20 @@ fn logout_at_high_asks_agent_sock_only() {
 /// elsewhere to look for.
 #[test]
 fn an_account_with_no_agent_at_high_gets_the_plain_line() {
-    assert_eq!(no_session_line(&Ok(Elevation::Full), false), NO_SESSION);
-    assert_eq!(no_session_line(&Ok(Elevation::Standard), false), NO_SESSION);
+    assert_eq!(no_session_line(&Ok(Elevation::Full), &Ok(false)), NO_SESSION);
+    assert_eq!(no_session_line(&Ok(Elevation::Standard), &Ok(false)), NO_SESSION);
 }
 
 /// A process at High asks the elevated folder, where it finds what it can reach: an elevated folder that holds
 /// no agent is no reason to send it elsewhere.
 #[test]
 fn a_process_at_high_gets_the_plain_line_whatever_folders_there_are() {
-    assert_eq!(no_session_line(&Ok(Elevation::Full), true), NO_SESSION);
+    assert_eq!(no_session_line(&Ok(Elevation::Full), &Ok(true)), NO_SESSION);
+    assert_eq!(
+        no_session_line(&Ok(Elevation::Full), &Err(anyhow::anyhow!("access denied"))),
+        NO_SESSION,
+        "it does not look in the other folder, so a failure to look there is nothing to say"
+    );
 }
 
 /// An administrator's unelevated process reaches an agent at High only on `request.sock`, which the agent may not
@@ -196,15 +201,15 @@ fn a_process_at_high_gets_the_plain_line_whatever_folders_there_are() {
 /// where else to ask.
 #[test]
 fn an_administrators_unelevated_process_is_told_where_else_to_ask() {
-    for elevated_folder in [false, true] {
-        let line = no_session_line(&Ok(Elevation::Filtered), elevated_folder);
+    for elevated_folder in [Ok(false), Ok(true), Err(anyhow::anyhow!("access denied"))] {
+        let line = no_session_line(&Ok(Elevation::Filtered), &elevated_folder);
         assert_eq!(
             line,
             format!(
                 "ssh-broker: no session to end that this process can reach: {}.",
                 crate::offer::text::ELEVATED_AGENT_LOOKS_ELSEWHERE
             ),
-            "elevated folder: {elevated_folder}"
+            "elevated folder: {elevated_folder:?}"
         );
         assert_eq!(line.lines().count(), 1, "{line}");
     }
@@ -215,28 +220,62 @@ fn an_administrators_unelevated_process_is_told_where_else_to_ask() {
 #[test]
 fn an_unelevated_process_of_an_account_with_an_elevated_folder_is_told_where_else_to_ask() {
     assert_eq!(
-        no_session_line(&Ok(Elevation::Standard), true),
-        no_session_line(&Ok(Elevation::Filtered), false)
+        no_session_line(&Ok(Elevation::Standard), &Ok(true)),
+        no_session_line(&Ok(Elevation::Filtered), &Ok(false))
     );
+}
+
+/// A process whose token reads as `Standard` cannot tell, when it could not look for the elevated folder, that its
+/// account has no agent at High: the plain line, with a note that the session may be elsewhere.
+#[test]
+fn a_standard_process_that_could_not_look_for_the_elevated_folder_says_so() {
+    let line = no_session_line(&Ok(Elevation::Standard), &Err(anyhow::anyhow!("access denied")));
+    assert_eq!(
+        line,
+        format!(
+            "{NO_SESSION} Note: {}, so the session may be elsewhere.",
+            crate::offer::text::elevated_session_unchecked_clause("access denied")
+        )
+    );
+    assert!(line.contains("could not be checked (access denied)"), "{line}");
+    assert_eq!(line.lines().count(), 1, "{line}");
 }
 
 #[test]
 fn the_elevated_folder_is_seen_only_when_the_profile_has_it() {
-    // A short tag: the elevated folder's request socket has the longest path of the profile.
+    // A short tag: the elevated folder's agent.sock has the longest path of the profile.
     let profile = crate::test_support::TempProfile::new("lo");
-    assert!(!elevated_folder_exists(&profile.0), "no agent at High has been here");
+    assert!(
+        !elevated_folder_exists(&profile.0).unwrap(),
+        "no agent at High has been here"
+    );
 
     let elevated = profile.location_at(Integrity::High);
     std::fs::create_dir_all(elevated.dir()).unwrap();
-    assert!(elevated_folder_exists(&profile.0));
+    assert!(elevated_folder_exists(&profile.0).unwrap());
 
     let gone = profile.0.join("nowhere");
-    assert!(!elevated_folder_exists(&gone), "a profile that does not exist has none");
+    assert!(
+        !elevated_folder_exists(&gone).unwrap(),
+        "a profile that does not exist has none"
+    );
+}
+
+/// A profile path too long for the elevated folder's `agent.sock` has no agent at High: that is an answer, not a
+/// failure to look. A path the system refuses is a failure.
+#[test]
+fn a_profile_too_long_for_an_agent_at_high_has_none_and_one_that_cannot_be_looked_at_is_an_error() {
+    let long = std::path::PathBuf::from(format!(r"C:\Users\{}", "x".repeat(80)));
+    assert!(!elevated_folder_exists(&long).unwrap());
+
+    let unreadable = std::env::temp_dir().join("a?b");
+    let err = elevated_folder_exists(&unreadable).expect_err("the system refuses the name");
+    assert!(format!("{err:#}").contains("a?b"), "{err:#}");
 }
 
 #[test]
 fn a_token_whose_elevation_cannot_be_read_gets_the_plain_line_and_the_cause() {
-    let line = no_session_line(&Err(anyhow::anyhow!("the token cannot be read")), true);
+    let line = no_session_line(&Err(anyhow::anyhow!("the token cannot be read")), &Ok(true));
     assert!(line.starts_with(NO_SESSION), "{line}");
     assert!(
         line.contains(&crate::offer::text::elevation_unreadable_clause(

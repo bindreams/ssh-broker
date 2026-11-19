@@ -130,6 +130,11 @@ pub fn elevation_unreadable_clause(cause: &str) -> String {
     format!("cannot tell how elevated this login is ({cause})")
 }
 
+/// The clause `logout` uses to say it could not look for the elevated folder of an agent at High; `cause` is why.
+pub fn elevated_session_unchecked_clause(cause: &str) -> String {
+    format!("whether this account has an elevated session could not be checked ({cause})")
+}
+
 /// The stderr line for a login whose token's elevation cannot be read: no session is offered, since its
 /// logon depends on that elevation.
 pub fn elevation_unreadable(cause: &str) -> String {
@@ -140,11 +145,8 @@ pub fn elevation_unreadable(cause: &str) -> String {
     )
 }
 
-/// What an unelevated process of an account whose agent runs at High is told when it asks for the agent that
-/// serves its folder and finds none: the account's agent runs elevated and serves the elevated folder, so the
-/// plain one it looks in has no `agent.sock`. The account is an administrator's, or one Windows splits without
-/// making it one (a Backup Operator), so the clause says neither. For `verify`'s row and for `logout`'s line when
-/// neither socket of the plain folder is served.
+/// Told to an unelevated process whose agent runs at High and serves no socket it can reach. Names neither
+/// "administrator" nor "Backup Operator": either account is split. Used by `verify`'s row and `logout`'s line.
 pub const ELEVATED_AGENT_LOOKS_ELSEWHERE: &str = "this account's agent serves elevated processes: run this from an elevated prompt or from an SSH login that asked for SSH_BROKER_ELEVATION=always";
 
 /// Told when a High login lacks `SeImpersonatePrivilege`, which `CreateProcessWithTokenW` needs; the way

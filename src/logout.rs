@@ -6,11 +6,9 @@
 //! ends anything, and the client never closes the connection itself: it fixes its exit code, and
 //! the kernel closes the socket when the process exits.
 //!
-//! The socket it asks on depends on who it is. An agent at High keeps `agent.sock` in a folder with the High
-//! label, which a process below High cannot connect to, and `request.sock` in the plain folder, which it can.
-//! A process at High asks `agent.sock` of the elevated folder. A process below High looks in the plain folder:
-//! `agent.sock` there is the account's agent (a standard account's, below High, keeps only that), and where
-//! there is none, `request.sock` is the agent at High's.
+//! Which socket it asks is [`connect_in`]'s rule. The reason: an agent at High keeps `agent.sock` in a folder with
+//! the High label, which a process below High cannot connect to, and `request.sock` in the plain folder, which it
+//! can.
 
 use std::io::{Read, Write};
 
@@ -25,22 +23,20 @@ use crate::socket_loc::Integrity;
 /// What `logout` says when there is no agent to ask.
 pub const NO_SESSION: &str = "ssh-broker: no session to end.";
 
-/// The line for "there is no agent to ask", chosen by what this process can see of its account: the elevation of
-/// its token, and `elevated_folder`, whether the account's profile has the folder of an agent at High (see
-/// [`elevated_folder_exists`]). An unelevated process of an account whose agent runs at High reaches that agent
-/// only on `request.sock`, which it may not serve, so none found there may be an agent that serves elsewhere:
-/// its line says that no session is reachable from here, which is true whether there is no agent or one without
-/// a request socket, and where else to ask. Such a process is an administrator's (`Elevation::Filtered`), or the
-/// process of any account Windows splits (Backup Operators), whose unelevated token reads as `Standard`: the
-/// folder shows that an agent at High has been here. A process at High (`Elevation::Full`) asks the elevated
-/// folder itself, and has nowhere else to go. An elevation that cannot be read gets the plain line with the
-/// cause after it, since the token may be a filtered one and the session may be elsewhere.
-pub fn no_session_line(elevation: &anyhow::Result<Elevation>, elevated_folder: bool) -> String {
-    match elevation {
-        Ok(Elevation::Filtered) => where_to_run_line(),
-        Ok(Elevation::Standard) if elevated_folder => where_to_run_line(),
-        Ok(Elevation::Full | Elevation::Standard) => NO_SESSION.to_owned(),
-        Err(e) => format!(
+/// The line for "no agent to ask". An unelevated process of an account whose agent runs at High (`Filtered`, or a
+/// split account like Backup Operators that reads `Standard`) gets the elevated-agent line when
+/// `elevated_folder` ([`elevated_folder_exists`]) says the account has the folder of an agent at High, since it
+/// can reach that agent only on `request.sock`. An unreadable elevation, or a `Standard` process that could not
+/// look for the folder, gets the plain line plus the cause.
+pub fn no_session_line(elevation: &anyhow::Result<Elevation>, elevated_folder: &anyhow::Result<bool>) -> String {
+    match (elevation, elevated_folder) {
+        (Ok(Elevation::Filtered), _) | (Ok(Elevation::Standard), Ok(true)) => where_to_run_line(),
+        (Ok(Elevation::Standard), Err(e)) => format!(
+            "{NO_SESSION} Note: {}, so the session may be elsewhere.",
+            crate::offer::text::elevated_session_unchecked_clause(&format!("{e:#}"))
+        ),
+        (Ok(Elevation::Full | Elevation::Standard), _) => NO_SESSION.to_owned(),
+        (Err(e), _) => format!(
             "{NO_SESSION} Note: {}, so the session may be elsewhere.",
             crate::offer::text::elevation_unreadable_clause(&format!("{e:#}"))
         ),
@@ -57,10 +53,17 @@ fn where_to_run_line() -> String {
 
 /// Whether the profile `profile` has the folder of an agent at High: one has been here. The folder is
 /// made by an agent at High and by nothing else, so its presence is what an unelevated process can see of that
-/// agent when it serves no socket it can reach.
-fn elevated_folder_exists(profile: &std::path::Path) -> bool {
-    crate::socket_loc::for_profile(profile, Integrity::High)
-        .is_ok_and(|location| matches!(location.dir().try_exists(), Ok(true)))
+/// agent when it serves no socket it can reach. A profile too long for an agent at High has none; a folder that
+/// cannot be looked at is an error, which is not "absent".
+fn elevated_folder_exists(profile: &std::path::Path) -> anyhow::Result<bool> {
+    use anyhow::Context;
+    match crate::socket_loc::for_profile(profile, Integrity::High) {
+        Ok(location) => location
+            .dir()
+            .try_exists()
+            .with_context(|| format!("look at {}", location.dir().display())),
+        Err(crate::socket_loc::SocketLocationError::TooLong { .. }) => Ok(false),
+    }
 }
 
 /// Writes the agent's stderr to `err`.
@@ -133,8 +136,12 @@ pub fn run() -> anyhow::Result<()> {
     // No profile, no folder and nothing listening all mean there is no session; anything else is not
     // that.
     let no_session = |e: &anyhow::Error| e.downcast_ref::<crate::userdir::NoProfile>().is_some() || is_no_agent(e);
-    let elevated_folder = crate::userdir::current_profile_dir().is_ok_and(|profile| elevated_folder_exists(&profile));
-    let line = no_session_line(&crate::account::elevation(), elevated_folder);
+    let elevated_folder = match crate::userdir::current_profile_dir() {
+        Ok(profile) => elevated_folder_exists(&profile),
+        Err(e) if e.is::<crate::userdir::NoProfile>() => Ok(false),
+        Err(e) => Err(e),
+    };
+    let line = no_session_line(&crate::account::elevation(), &elevated_folder);
     ask_at(connect, logout_on, no_session, &line, &mut std::io::stderr(), |code| {
         std::process::exit(code)
     })

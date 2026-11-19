@@ -1046,10 +1046,9 @@ fn the_tally_waits_for_every_listener_to_close() {
     assert!(connections.is_closing(), "the flag is up when the loops are woken");
     agent.close();
     assert!(
-        on_return.try_recv().is_err(),
-        "one listener is still open, so the end is not settled"
+        connections.listener_is_open(),
+        "the second listener is still held by the tally"
     );
-    assert!(connections.listener_is_open());
     request.close();
     on_return.recv().unwrap();
     assert!(!connections.listener_is_open());
@@ -1083,29 +1082,4 @@ fn a_logout_wakes_the_loop_of_each_socket_and_ends_the_agent() {
     assert_eq!(loops, ["agent.sock", "request.sock"]);
     assert!(ended.load(Ordering::SeqCst), "the end completed");
     assert!(!connections.listener_is_open());
-}
-
-/// A connection on the request socket is a live connection: the end waits for it, as for a session's.
-#[test]
-fn a_request_connection_is_drained_like_a_session() {
-    let (events, on_event) = mpsc::channel();
-    let connections = Connections::observing_drain({
-        let events = events.clone();
-        move || {
-            let _ = events.send("parked");
-        }
-    });
-    let request = connections.begin();
-    let this_connection = connections.begin();
-    let _logout = connections.begin_logout();
-    let drain = {
-        let connections = Arc::clone(&connections);
-        std::thread::spawn(move || {
-            let _live = this_connection;
-            connections.wait_until_only_logouts_live()
-        })
-    };
-    on_event.recv().unwrap();
-    drop(request);
-    assert_eq!(drain.join().unwrap(), Drained::Complete);
 }

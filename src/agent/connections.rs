@@ -49,6 +49,8 @@ struct Tally {
     /// The end is decided: the accept loop returns after the connection it is accepting, which it
     /// counts first.
     closing: bool,
+    /// The shortage that decided the end, set with `closing` in the same step.
+    fatal_cause: Option<String>,
     /// The listeners the accept loops hold (`agent.sock`, and `request.sock` where the agent keeps one), each
     /// with the way to wake its loop.
     listeners: Vec<Registered>,
@@ -120,6 +122,7 @@ impl Connections {
                 ended: 0,
                 logouts: 0,
                 closing: false,
+                fatal_cause: None,
                 listeners: Vec::new(),
                 next_listener: 0,
             }),
@@ -216,9 +219,7 @@ impl Connections {
     /// The loop calls this before its first look at the flag [`Connections::is_closing`], so whichever way
     /// the end is decided relative to it, the loop stops: an end decided before the registration finds
     /// nothing to wake or wait for, and the loop reads the flag up and returns without blocking; an end
-    /// decided after wakes it ([`Connections::settle`]). That a `logout` on `request.sock` can settle before
-    /// the main thread has registered `agent.sock`'s listener is the first case. A listener registered while
-    /// the end is already waiting for the others is not woken by it either, and stops by itself the same way.
+    /// decided after wakes it ([`Connections::settle`]).
     pub(super) fn listener_opened(self: &Arc<Self>, socket: &'static str, wake: WakeConnect) -> OpenListener {
         let id = self.change(|tally| {
             let id = tally.next_listener;
@@ -237,22 +238,28 @@ impl Connections {
         }
     }
 
-    /// Decide the end of the agent if no connection is live, in one step under the tally's lock: the flag
-    /// [`Connections::is_closing`] reads is up when this returns `true`, and no connection is counted between
-    /// the reading of `live` and the flag. A connection counted after finds the flag up (a login is refused, see
-    /// `Control::is_ending`); one counted before keeps the end undecided (`false`), and what the caller does is
-    /// wait for one to end ([`Connections::wait_for_an_end`]).
-    ///
-    /// The accept loop of each socket calls this when a shortage meets no live connection
-    /// (`serve_connections_with`), while it still holds the connection it kept, so that connection is served once
-    /// more and not closed bare. Deciding does not end anything by itself: the caller of the loop then settles the
-    /// end ([`Connections::settle`]) and ends the process.
-    pub(super) fn decide_end_if_idle(&self) -> bool {
+    /// Decide the end of the agent on the shortage `cause`, if no connection is live and none has ended since the
+    /// count `since` (the one the loop's wait saw, [`Connections::wait_for_an_end`]), in one step under the tally's
+    /// lock: the flag [`Connections::is_closing`] reads is up, and [`Connections::fatal_cause`] set, when this
+    /// returns `true`. A connection counted after finds the flag up (a login is refused, see `Control::is_ending`);
+    /// one counted before, or that ended since `since` and may have freed what the loop lacks, keeps the end
+    /// undecided (`false`).
+    pub(super) fn decide_end_if_idle(&self, since: u64, cause: &anyhow::Error) -> bool {
+        let cause = format!("{cause:#}");
         self.change(|tally| {
-            let idle = tally.live == 0;
-            tally.closing |= idle;
+            let idle = tally.live == 0 && tally.ended == since;
+            if idle {
+                tally.closing = true;
+                tally.fatal_cause.get_or_insert(cause);
+            }
             idle
         })
+    }
+
+    /// The shortage that decided the end ([`Connections::decide_end_if_idle`]), if one did: the first, written in
+    /// the same step that raised the flag. An end that a `logout` decided has none.
+    pub(super) fn fatal_cause(&self) -> Option<String> {
+        self.lock().fatal_cause.clone()
     }
 
     /// Whether the end is decided: the accept loop stops after its current accept.
@@ -277,12 +284,9 @@ impl Connections {
     /// went. Any number of callers (the `logout` handlers, the thread that ran the loop) may ask; the first
     /// does the work and the others wait for it.
     ///
-    /// The first wait is with the listeners open, so a login that arrives meanwhile gets the refusal.
-    /// A loop counts every connection it accepts before it looks at the flag set here, so once it has
-    /// returned the second judgement sees every connection it took. A connection the system queued and
-    /// nobody accepted is reset when the listener closes, at the latest with the process; its shim goes
-    /// back to its no-agent path. If the first wait gave up on connections that do not finish, the
-    /// second is not made: those would not finish either.
+    /// Waits with the listeners open (a login meanwhile gets the refusal), stops and closes the listeners, then
+    /// judges again; the second judgement sees every connection a loop took, since a loop counts a connection
+    /// before it reads the flag. A first wait that gave up is not repeated.
     pub(super) fn settle(self: &Arc<Self>) -> Drained {
         *self.settled.get_or_init(|| {
             let first = self.wait_until_only_logouts_live();
@@ -335,13 +339,9 @@ impl Connections {
         }
     }
 
-    /// Run `wake`, the connect to `socket`'s listener `id`, on a thread of its own, so that the caller
-    /// never waits for it. The wake is a connect to the agent's own listener, and a connect to a listener
-    /// whose queue is full may wait for room in it; the caller may be the `logout` handler. A wake that has
-    /// to wait wakes nothing that needs waking: the queue is full only if the accept loop is not blocked in
-    /// `accept`, and a loop that is not blocked reads the flag before its next `accept`.
-    ///
-    /// A wake that fails, or a thread that cannot be started, is recorded against the listener.
+    /// Run `wake` (the connect to `socket`'s listener `id`) on a thread of its own so the caller never waits: a
+    /// connect to a full queue may block, and a full queue means the loop is not in `accept` and will read the
+    /// flag before its next one. A failed wake or thread is recorded against the listener.
     fn wake_without_blocking(self: &Arc<Self>, id: u64, socket: &'static str, wake: WakeConnect) {
         let on_thread = Arc::clone(self);
         let started = std::thread::Builder::new()

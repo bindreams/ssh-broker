@@ -174,16 +174,15 @@ pub enum SocketLocationError {
     TooLong { path: PathBuf, bytes: usize, max: usize },
 }
 
-/// The socket location inside `profile` for processes at `integrity`, or why it cannot be used. Both sockets
-/// of the folder must fit the limit, the longer name's ([`SocketLocation::request_path`]) deciding.
+/// The socket location inside `profile` for processes at `integrity`, or why it cannot be used. Only `agent.sock`
+/// is measured: `request.sock` is bound by an agent at High in the plain folder, where its path is 7 bytes
+/// shorter than that agent's own `agent.sock`, so it fits whenever the agent can start.
 pub fn for_profile(profile: &Path, integrity: Integrity) -> Result<SocketLocation, SocketLocationError> {
     let location = SocketLocation::in_profile(profile, integrity);
-    let longest = location.request_path();
-    debug_assert!(longest.as_os_str().len() >= location.path.as_os_str().len());
-    let bytes = longest.as_os_str().len();
+    let bytes = location.path.as_os_str().len();
     if bytes > MAX_SOCKET_PATH_BYTES {
         return Err(SocketLocationError::TooLong {
-            path: longest,
+            path: location.path,
             bytes,
             max: MAX_SOCKET_PATH_BYTES,
         });
