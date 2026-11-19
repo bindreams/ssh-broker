@@ -63,8 +63,8 @@ fn with_session(kit: &Kit, account: &Account, check: impl FnOnce(&mut dyn FnMut(
 }
 
 /// End the session a task started with the product's `logout` (the kit's copy of the exe, run inside the
-/// agent) and wait for its logon sessions to leave LSA's list. It checks what ssh-broker controls (see `session_end`), not that Windows
-/// unloads the hive of a Task Scheduler logon.
+/// agent) and wait for its logon sessions to leave LSA's list. It checks what ssh-broker controls (see
+/// `session_end`), not that Windows unloads the hive of a Task Scheduler logon.
 fn logout_with(kit: &Kit, account: &Account) -> session_end::Ended {
     session_end::log_out_running(&kit.exe, account, ServiceLogon::TaskScheduler)
 }

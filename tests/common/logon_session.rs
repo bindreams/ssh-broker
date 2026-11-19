@@ -96,14 +96,14 @@ pub fn assert_auditing(subcategory: &str, setting: &str) {
 }
 
 /// How long LSA may keep listing a logon session after its last process has ended: an external event
-/// that may never come. Measured in CI (2026-11-19): the session left the list by itself about 90 s after
-/// the last process exited for a Batch logon and about 180 s after for an interactive secondary logon; the
-/// bound is twice the longer. It applies to each session in turn, so it must expire before the test's own
-/// termination in `.config/nextest.toml` (10 x 120 s) even with a second session and the teardown after it.
-/// Expiry fails the wait and says what still refers to the session.
+/// that may never come. A Batch logon leaves the list after about 90 s and an interactive secondary logon
+/// after about 180 s; the bound is twice the longer. The sessions a `logout` ends share one deadline of this
+/// length, counted from when no process is left in them (see [`wait_until_unlisted`]). A test that ends several
+/// sessions, one `logout` each, needs a termination in `.config/nextest.toml` beyond the sum of its bounds.
+/// Expiry fails the wait and names what still refers to the session.
 pub const SESSION_END_BOUND: Duration = Duration::from_secs(360);
 
-/// The pause between two looks at LSA's list in [`wait_until_unlisted`]; the look is what is waited on.
+/// The pause between two looks at LSA's list in [`wait_until_unlisted`].
 const LOOK_EVERY: Duration = Duration::from_secs(1);
 
 /// Whether `LsaEnumerateLogonSessions` still lists the logon session `id`.
@@ -127,13 +127,13 @@ pub fn require_listed(id: u64, sid_text: &str) -> Result<(), String> {
     }
 }
 
-/// Wait until the logon session `id` is no longer in LSA's list, and return how long that took. The
-/// caller holds no handle on a process or token of the session: one keeps it listed. It looks once a
-/// second. After [`SESSION_END_BOUND`] it fails, naming the processes of the session that still run.
-pub fn wait_until_unlisted(id: u64) -> Result<Duration, String> {
-    let started = Instant::now();
+/// Wait until the logon session `id` is no longer in LSA's list. The caller holds no handle on a process or
+/// token of the session: one keeps it listed. It looks once a second. Once `deadline` has passed it fails,
+/// naming the processes of the session that still run. `deadline` is [`SESSION_END_BOUND`] after the moment
+/// no process is left in any session a `logout` ended, the same for each of them.
+pub fn wait_until_unlisted(id: u64, deadline: Instant) -> Result<(), String> {
     while is_listed(id)? {
-        if started.elapsed() >= SESSION_END_BOUND {
+        if Instant::now() >= deadline {
             let own = std::process::id();
             let running: Vec<u32> = processes_of(id)
                 .iter()
@@ -141,13 +141,13 @@ pub fn wait_until_unlisted(id: u64) -> Result<Duration, String> {
                 .map(|(pid, _)| *pid)
                 .collect();
             return Err(format!(
-                "logon session {id:#x} is still in LSA's list {SESSION_END_BOUND:?} after the wait began; \
-                 processes still running in it (pids {running:?})"
+                "logon session {id:#x} is still in LSA's list {SESSION_END_BOUND:?} after the last process of \
+                 its logout's sessions ended; processes still running in it (pids {running:?})"
             ));
         }
         std::thread::sleep(LOOK_EVERY); // sleep-ok: the pause between two looks at the list; its expiry proves nothing
     }
-    Ok(started.elapsed())
+    Ok(())
 }
 
 /// A subscription to Security events that match an XPath query, from now on.
@@ -171,7 +171,7 @@ impl EventWatch {
     /// Subscribe to `channel`. A pull subscription signals its event only after a call of `EvtNext`
     /// has returned `ERROR_NO_MORE_ITEMS`: the service does not signal for a client that has not yet
     /// asked (measured: with no such call a logged event never signalled, on the Application channel
-    /// and, in CI, for Security events 4625 and 4634). So the subscription is primed
+    /// and, in CI, for Security events). So the subscription is primed
     /// with one call here, and an event that arrived before it is remembered.
     pub fn on(channel: &str, query: &str) -> EventWatch {
         // SAFETY: an unnamed manual-reset event.

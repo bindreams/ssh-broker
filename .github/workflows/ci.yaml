@@ -109,8 +109,7 @@ jobs:
         run: rustup toolchain install
 
       # A test waits for a Security event, which the system writes only with the auditing on: a refused logon
-      # (`a_stale_password_is_not_visible_in_the_last_result`, 4625). The end of a logon session is read from
-      # the system's list of sessions, not from its logoff event (`tests/common/logon_session.rs`).
+      # (`a_stale_password_is_not_visible_in_the_last_result`, 4625).
       - name: Audit refused logons
         if: runner.os == 'Windows'
         run: |

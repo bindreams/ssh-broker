@@ -10,8 +10,7 @@
 //!
 //! The end of a session is waited for on the real condition: the logon id is no longer in the list
 //! `LsaEnumerateLogonSessions` gives ([`logon_session::wait_until_unlisted`]). One rule for every session,
-//! whoever logged the account on and of whatever type. The logoff event (Security 4634) is not waited for:
-//! it comes with that end, a little after it, or not at all within a query.
+//! whoever logged the account on and of whatever type.
 //!
 //! The including crate declares `account_fixture`, `agent_conn`, `bounded_wait`, `logon_session` and
 //! `process_list`.
@@ -196,7 +195,7 @@ fn try_end(
         held.len()
     ));
 
-    // The wait for the end below passes at once for an id that was never listed: see each session listed first.
+    // Each session must be listed before it is ended (see `require_listed`).
     for id in &ids {
         logon_session::require_listed(*id, sid_text).map_err(|why| format!("before logout: {why}"))?;
     }
@@ -209,7 +208,6 @@ fn try_end(
         asker.end_stdin();
         asker.read_to_end()
     })?;
-    let logged_out = Instant::now();
     steps.push(format!("logout exit {:?}", finished.exit));
     if finished.exit != Some(0) {
         return Err(format!(
@@ -262,12 +260,15 @@ fn try_end(
     }
     drop(remaining);
     steps.push("no process left in the sessions".to_owned());
+    // One deadline for every session: the bound is how long a session may stay listed after its last process.
+    let no_process_left = Instant::now();
+    let deadline = no_process_left + logon_session::SESSION_END_BOUND;
     for id in &ids {
-        logon_session::wait_until_unlisted(*id)
+        logon_session::wait_until_unlisted(*id, deadline)
             .map_err(|why| format!("a session of {name} did not end: {why}; {}", still_referring(sid_text)))?;
         steps.push(format!(
-            "logon session {id:#x} left LSA's list {:?} after logout returned",
-            logged_out.elapsed()
+            "logon session {id:#x} left LSA's list {:?} after no process was left",
+            no_process_left.elapsed()
         ));
     }
     Ok(Some(Ended))

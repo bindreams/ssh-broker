@@ -870,7 +870,6 @@ fn logon_session_is_logged_off_after_logout() {
     let account = Account::create("lolog", true);
     let agent = BackgroundAgent::start(&kit, &account);
     let id = logon_session::logon_id(agent.process.0);
-    // The wait below passes at once for an id that was never listed: see the session listed first.
     logon_session::require_listed(id, &account.sid_text).unwrap_or_else(|why| panic!("before logout: {why}"));
 
     let own = std::process::id();
@@ -893,9 +892,12 @@ fn logon_session_is_logged_off_after_logout() {
     drop(held);
     drop(agent);
 
-    let took = logon_session::wait_until_unlisted(id).unwrap_or_else(|why| panic!("M6: {why}"));
+    let no_process_left = std::time::Instant::now();
+    logon_session::wait_until_unlisted(id, no_process_left + logon_session::SESSION_END_BOUND)
+        .unwrap_or_else(|why| panic!("M6: {why}"));
     account_fixture::hive::record(&format!(
-        "logon session {id:#x} left LSA's list {took:?} after its last process ended"
+        "logon session {id:#x} left LSA's list {:?} after its last process ended",
+        no_process_left.elapsed()
     ));
 
     // The product's own end of a secondary-logon session leaves nothing that keeps the profile loaded
