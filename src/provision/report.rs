@@ -1,4 +1,4 @@
-//! provision::report — verify's human-readable report + exit-code policy (pure).
+//! provision::report — doctor's human-readable report + exit-code policy (pure).
 
 pub struct Check {
     pub name: &'static str,
@@ -26,7 +26,7 @@ pub fn format_report(rows: &[Check]) -> String {
 
 /// 0 iff there is at least one check and every check passed; otherwise 1. Empty is
 /// fail-closed (an empty report must never read as success).
-pub fn verify_exit_code(rows: &[Check]) -> i32 {
+pub fn doctor_exit_code(rows: &[Check]) -> i32 {
     if !rows.is_empty() && rows.iter().all(|r| r.pass) {
         0
     } else {

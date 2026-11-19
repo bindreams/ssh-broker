@@ -1,9 +1,9 @@
-//! `verify`'s bounded wait and the `--probe-timeout` flag that sizes it — the one place this crate
+//! `doctor`'s bounded wait and the `--probe-timeout` flag that sizes it — the one place this crate
 //! deliberately puts a clock on a wait, with the reason written down.
 //!
 //! The rule bans synchronising with time: a sleep, or a poll carrying a numeric bound, standing in
 //! for a real primitive between pieces of code we control. The justification here is narrower than
-//! "the network might swallow it", because **there is no network in this path**. `verify` runs on
+//! "the network might swallow it", because **there is no network in this path**. `doctor` runs on
 //! this host and drives the agent over the AF_UNIX socket IN-PROCESS — no ssh client, no sshd, no
 //! separate shim process. If the agent dies, the socket EOFs, the pump reports a closed peer, and
 //! the probe fails with no clock involved at all.
@@ -12,9 +12,9 @@
 //! the session-1 probe child, never produces output. A wedged LSASS blocking the child's DPAPI
 //! round trip does that. So does a hung filesystem filter driver. So does a deadlock of our own.
 //!
-//! That last one is the uncomfortable part, and it is why this is confined to `verify`: most ways
+//! That last one is the uncomfortable part, and it is why this is confined to `doctor`: most ways
 //! this can hang are OUR bugs, and a clock over a bug is exactly what the rule exists to forbid. It
-//! earns its place because `verify` is a one-shot operator diagnostic whose subject is a
+//! earns its place because `doctor` is a one-shot operator diagnostic whose subject is a
 //! possibly-sick machine — hanging is the worst way to report one, and it throws away the local
 //! rows already gathered. `--probe-timeout 0` keeps the true unbounded hang for anyone debugging
 //! such a deadlock. If you are reaching for this module to make a flaky wait pass, that is the bug.
@@ -72,7 +72,7 @@ pub fn probe_timeout_from_args(args: &[String]) -> anyhow::Result<Option<Duratio
 /// selects for someone debugging a genuine deadlock.
 ///
 /// On expiry the sender is left running. That is deliberate: it is blocked inside the relay
-/// conversation with no portable way to interrupt it. `verify` goes on without it (it starts no
+/// conversation with no portable way to interrupt it. `doctor` goes on without it (it starts no
 /// further probe and prints its report) and exits afterwards, so process teardown collects the thread.
 pub fn await_bounded<T>(rx: &Receiver<T>, timeout: Option<Duration>) -> Result<T, WaitError> {
     let Some(d) = timeout else {

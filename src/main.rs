@@ -33,8 +33,8 @@ fn main() -> anyhow::Result<()> {
         }),
         Route::Apply => provision::apply(),
         Route::ApplySshd => provision::apply_sshd(),
-        Route::Verify => provision::verify(),
-        Route::VerifyProbe(link) => provision::verify_probe(link),
+        Route::Doctor => provision::doctor(),
+        Route::DoctorProbe(link) => provision::doctor_probe(link),
         Route::ConsoleFallback { handle, login } => console_fallback_command(handle, login),
     }
 }
@@ -46,8 +46,8 @@ fn usage(verb: Verb) -> &'static str {
         Verb::Elevate => ssh_broker::offer::text::elevate_usage(),
         Verb::ConsoleFallback => "usage: ssh-broker console-fallback [--login] <handle> (internal)",
         Verb::ApplySshd => "usage: ssh-broker apply-sshd (internal: the task that apply starts runs it)",
-        Verb::VerifyProbe => {
-            "usage: ssh-broker verify-probe [--make-junction <directory> | --follow <directory>] (internal)"
+        Verb::DoctorProbe => {
+            "usage: ssh-broker doctor-probe [--make-junction <directory> | --follow <directory>] (internal)"
         }
     }
 }

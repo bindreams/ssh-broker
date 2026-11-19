@@ -584,39 +584,39 @@ fn apply_keeps_default_shell_arguments_until_a_config_holds_them() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// `<installed> verify` run through the agent of `admin` at `location`, as a session that asks for
+/// `<installed> doctor` run through the agent of `admin` at `location`, as a session that asks for
 /// `elevation`.
-fn verify_through(
+fn doctor_through(
     installed: &Path,
     admin: &Account,
     location: &ssh_broker::socket_loc::SocketLocation,
     elevation: ssh_broker::protocol::ElevationPolicy,
 ) -> agent_conn::Finished {
     let mut conn = agent_conn::AgentConn::connect(location, &admin.sid);
-    conn.start_exec_as(&format!("\"{}\" verify", installed.display()), elevation);
+    conn.start_exec_as(&format!("\"{}\" doctor", installed.display()), elevation);
     conn.end_stdin();
     conn.read_to_end()
 }
 
-/// What `verify` shows through an administrator's elevated agent: it exits 0, the session is elevated, an
+/// What `doctor` shows through an administrator's elevated agent: it exits 0, the session is elevated, an
 /// unelevated one can be had, and the junction was followed, not skipped.
-fn assert_verify_passes_for_an_elevated_agent(verified: &agent_conn::Finished) {
+fn assert_doctor_passes_for_an_elevated_agent(finished: &agent_conn::Finished) {
     assert_eq!(
-        verified.exit,
+        finished.exit,
         Some(0),
-        "verify:\n{}{}",
-        verified.stdout,
-        verified.stderr
+        "doctor:\n{}{}",
+        finished.stdout,
+        finished.stderr
     );
-    agent_conn::assert_verify_session_rows(&verified.stdout);
+    agent_conn::assert_doctor_session_rows(&finished.stdout);
 }
 
-/// Elevated (CI only). `verify`, run in an administrator's session through the account's elevated agent,
+/// Elevated (CI only). `doctor`, run in an administrator's session through the account's elevated agent,
 /// passes after `apply`: the session is elevated, an unelevated one can be had, and the junction that a
-/// token below High made is followed. The same `verify` run in an unelevated session of the account is
+/// token below High made is followed. The same `doctor` run in an unelevated session of the account is
 /// told why nothing can be checked there, and runs no probe.
 #[test]
-fn apply_then_verify_for_an_administrator_shows_an_elevated_session_and_an_unelevated_one_on_request() {
+fn apply_then_doctor_for_an_administrator_shows_an_elevated_session_and_an_unelevated_one_on_request() {
     use ssh_broker::offer::text::ELEVATED_AGENT_LOOKS_ELSEWHERE;
     use ssh_broker::protocol::ElevationPolicy;
 
@@ -644,15 +644,15 @@ fn apply_then_verify_for_an_administrator_shows_an_elevated_session_and_an_unele
     let location = admin.socket_location();
     stand_in::wait_for_serving_marker_of_a_task(&location, TASK_START_BOUND);
 
-    let verify = |elevation: ElevationPolicy| verify_through(&installed, &admin, &location, elevation);
+    let doctor = |elevation: ElevationPolicy| doctor_through(&installed, &admin, &location, elevation);
 
-    assert_verify_passes_for_an_elevated_agent(&verify(ElevationPolicy::Always));
+    assert_doctor_passes_for_an_elevated_agent(&doctor(ElevationPolicy::Always));
 
-    let unelevated = verify(ElevationPolicy::Prompt);
+    let unelevated = doctor(ElevationPolicy::Prompt);
     assert_eq!(
         unelevated.exit,
         Some(1),
-        "verify:\n{}{}",
+        "doctor:\n{}{}",
         unelevated.stdout,
         unelevated.stderr
     );

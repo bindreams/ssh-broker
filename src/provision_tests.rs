@@ -82,7 +82,7 @@ fn the_probe_handshake_is_direct() {
     assert_eq!(hs.mode, Mode::Exec);
     assert_eq!(
         hs.command.as_deref(),
-        Some(r#""C:\Program Files\ssh-broker\ssh-broker.exe" verify-probe"#)
+        Some(r#""C:\Program Files\ssh-broker\ssh-broker.exe" doctor-probe"#)
     );
 }
 
@@ -112,7 +112,7 @@ fn the_probe_handshake_names_the_junction_work() {
     use crate::protocol::ElevationPolicy;
     let exe = std::path::Path::new(r"C:\Program Files\ssh-broker\ssh-broker.exe");
     let command = |link: &ProbeLink| probe_handshake(exe, ElevationPolicy::Prompt, link).command.unwrap();
-    let base = r#""C:\Program Files\ssh-broker\ssh-broker.exe" verify-probe"#;
+    let base = r#""C:\Program Files\ssh-broker\ssh-broker.exe" doctor-probe"#;
 
     assert_eq!(command(&ProbeLink::NoJunction), base);
     let dir = r"C:\Users\example user\AppData\Local\Temp\sb-junction-9-1";

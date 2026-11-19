@@ -600,7 +600,7 @@ fn a_missing_system_directory_is_an_error_not_a_panic() {
     assert!(format!("{error:#}").contains(OS_ERROR), "{error:#}");
 }
 
-// verify's output is a config =====
+// doctor's output is a config =====
 
 /// Strings a list item can be: every one must come back from `parse` as itself.
 const ITEMS: &[&str] = &[
@@ -683,7 +683,7 @@ fn effective_of(start: &[&str], without: &[&str], with: &[&str], escaping: Escap
     }
 }
 
-/// What `verify` prints is a config the parser reads back as the values it shows, whatever the
+/// What `doctor` prints is a config the parser reads back as the values it shows, whatever the
 /// strings are, because the YAML library renders the values and everything else is a comment.
 #[test]
 fn what_render_prints_parses_back_to_the_same_values() {

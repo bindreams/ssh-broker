@@ -1,9 +1,9 @@
-//! provision::session_rows — the rows of the `verify` report about what a session through the agent
+//! provision::session_rows — the rows of the `doctor` report about what a session through the agent
 //! is: elevated or not, whether an unelevated one can be had, and whether a link a session below High
 //! made is followed.
 //!
 //! The facts are the PROBE lines of the probes the agent started, which read their own tokens; nothing
-//! is judged from `verify`'s own. Every outcome of every probe has a row ([`ProbeOutcome`]), and the rows
+//! is judged from `doctor`'s own. Every outcome of every probe has a row ([`ProbeOutcome`]), and the rows
 //! are a pure function of [`Probes`].
 
 use crate::account::{INTEGRITY_HIGH, INTEGRITY_MEDIUM, integrity_class};
@@ -25,7 +25,7 @@ pub struct Answer {
     pub token_said: String,
 }
 
-/// What became of one probe `verify` asked the agent for.
+/// What became of one probe `doctor` asked the agent for.
 #[derive(Debug, Clone)]
 pub enum ProbeOutcome {
     /// It ran and its PROBE line was read.
@@ -36,7 +36,7 @@ pub enum ProbeOutcome {
     Failed { cause: String, may_still_run: bool },
     /// `--probe-timeout` passed with no answer, so the child may still be running: the cause.
     TimedOut(String),
-    /// `verify` could not start it (no connection to the agent, the handshake not sent), so there is no
+    /// `doctor` could not start it (no connection to the agent, the handshake not sent), so there is no
     /// child: why.
     NotRun(String),
 }
@@ -62,7 +62,7 @@ impl ProbeOutcome {
     }
 }
 
-/// What `verify`'s probes through the agent found.
+/// What `doctor`'s probes through the agent found.
 #[derive(Debug)]
 pub struct Probes {
     /// The probe that asked for an unelevated session, run first for an agent at High integrity: it makes
@@ -72,11 +72,11 @@ pub struct Probes {
     pub default: ProbeOutcome,
     /// What the probes found about the junction, which for an agent at High is settled from both.
     pub junction: Junction,
-    /// A directory `verify` named for the junction that is, or may come to be, left behind: what to delete.
+    /// A directory `doctor` named for the junction that is, or may come to be, left behind: what to delete.
     pub leftover: Option<String>,
 }
 
-/// What `verify` found about a junction that a token below High made.
+/// What `doctor` found about a junction that a token below High made.
 #[derive(Debug)]
 pub enum Junction {
     /// The default probe read through a junction, which for an agent at High one below High made: the
@@ -92,7 +92,7 @@ pub enum Junction {
 }
 
 impl Junction {
-    /// What `verify` knows of the junction besides the default probe's outcome: why there was no junction
+    /// What `doctor` knows of the junction besides the default probe's outcome: why there was no junction
     /// to read, when there was none, and what the probes said.
     fn said(&self) -> String {
         let (cause, note) = match self {
@@ -107,7 +107,7 @@ impl Junction {
     }
 }
 
-/// Every row the probes give, in the order `verify` shows them. `active_console` is the id of the
+/// Every row the probes give, in the order `doctor` shows them. `active_console` is the id of the
 /// physical console's session, which the session row names.
 ///
 /// A default probe that did not answer is the one row `parity probe (via agent)`, with the cause and what
@@ -398,7 +398,7 @@ fn elevation_name(elevation: Elevation) -> &'static str {
     }
 }
 
-/// An integrity level as `verify` shows it: its name and relative id, or that it was not reported.
+/// An integrity level as `doctor` shows it: its name and relative id, or that it was not reported.
 pub(super) fn level(rid: Option<u32>) -> String {
     match rid {
         Some(INTEGRITY_HIGH) => format!("High ({INTEGRITY_HIGH:#x})"),

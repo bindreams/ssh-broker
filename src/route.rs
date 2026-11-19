@@ -1,7 +1,7 @@
 //! argv dispatch.
 //!
 //! The **shim** (the SSH `DefaultShell`) is the default action; `agent`/`apply`/
-//! `verify` are explicit verbs (and `apply-sshd`, `verify-probe` and `console-fallback` hidden ones).
+//! `doctor` are explicit verbs (and `apply-sshd`, `doctor-probe` and `console-fallback` hidden ones).
 //! `DefaultShell` is a bare path and cannot carry a subcommand argument, which is exactly why the shim is the
 //! default: a known verb in first position selects a subcommand, anything else (bare, or sshd's `-c "cmd"`) is
 //! the shim.
@@ -27,7 +27,7 @@ pub enum Route {
     Apply,
     /// Hidden: what the task `apply` hands the sshd step to runs: `provision::apply_sshd`.
     ApplySshd,
-    Verify,
+    Doctor,
     /// `elevate [--terminal] <command> [arguments]`: run the command elevated. `command` is the text after the verb
     /// (and the flag, if it is first) as it was typed, not argv joined again, which has lost the quotes; it is not
     /// blank. `--terminal` gives the command a screen of its own.
@@ -35,8 +35,8 @@ pub enum Route {
         terminal: bool,
         command: String,
     },
-    /// Hidden: the parity-probe child the agent spawns in session 1 (used by `verify`).
-    VerifyProbe(ProbeLink),
+    /// Hidden: the parity-probe child the agent spawns in session 1 (used by `doctor`).
+    DoctorProbe(ProbeLink),
     /// Hidden: the fallback shell of a terminal session through the agent. `handle` is the value of
     /// an inherited pipe that holds a notice and a line (see `handoff`); the verb prints the notice
     /// on its console, starts the line on that console and exits with the code of the line. `login`:
@@ -53,18 +53,18 @@ pub enum Verb {
     Logout,
     Elevate,
     ConsoleFallback,
-    VerifyProbe,
+    DoctorProbe,
     ApplySshd,
 }
 
-/// What a `verify-probe` does with the junction its link check reads through (`provision::probe::link`).
+/// What a `doctor-probe` does with the junction its link check reads through (`provision::probe::link`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProbeLink {
-    /// Make no junction and read none: the probe reports no link outcome. What `verify` runs when it cannot
+    /// Make no junction and read none: the probe reports no link outcome. What `doctor` runs when it cannot
     /// name a directory.
     NoJunction,
     /// Make this directory, which must not exist yet, with a junction in it, read through it, and leave
-    /// it for `verify` to remove: the one probe of an agent below High, and the unelevated probe of an
+    /// it for `doctor` to remove: the one probe of an agent below High, and the unelevated probe of an
     /// administrator's agent, whose junction the elevated probe then follows.
     Make(String),
     /// Read through the junction in this directory, which another probe made.
@@ -116,8 +116,8 @@ pub fn route(args: &[String], command_line: &str) -> Route {
         Some("apply") => Route::Apply,
         Some("apply-sshd") if args.len() == 1 => Route::ApplySshd,
         Some("apply-sshd") => Route::Usage(Verb::ApplySshd),
-        Some("verify") => Route::Verify,
-        Some("verify-probe") => probe_link(&args[1..]).map_or(Route::Usage(Verb::VerifyProbe), Route::VerifyProbe),
+        Some("doctor") => Route::Doctor,
+        Some("doctor-probe") => probe_link(&args[1..]).map_or(Route::Usage(Verb::DoctorProbe), Route::DoctorProbe),
         Some("console-fallback") => console_fallback_args(&args[1..])
             .map_or(Route::Usage(Verb::ConsoleFallback), |(handle, login)| {
                 Route::ConsoleFallback { handle, login }

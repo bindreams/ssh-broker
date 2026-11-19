@@ -118,7 +118,7 @@ fn assert_apply_configured_sshd() {
     }
 }
 
-/// What plain `sshd -T` prints, as the `verify` row reads it.
+/// What plain `sshd -T` prints, as the `doctor` row reads it.
 fn sshd_t() -> String {
     match sshd_reading_this_machine().expect("sshd -T") {
         SshdReading::Read { listing, .. } => listing,
@@ -174,7 +174,7 @@ fn system_cmd() -> PathBuf {
 /// The step on the runner's stock file, run by `apply` through its task, as SYSTEM: the drop-in, the `Include` line
 /// above the first `Match`, the original's security on the replacement (SYSTEM can create the drop-in and
 /// `copy_file_security` works as SYSTEM), and the restart of sshd. No task is left after `apply`, and the report
-/// holds the lines `apply` printed after it said the step was the task's. After the restart the `verify` row
+/// holds the lines `apply` printed after it said the step was the task's. After the restart the `doctor` row
 /// passes and a second run says nothing.
 #[test]
 fn apply_s_sshd_step_adds_the_drop_in_and_the_include_above_the_first_match_and_the_row_passes() {
@@ -343,7 +343,7 @@ fn a_hand_made_sshd_config_d_gets_no_drop_in_and_sshd_config_gets_the_acceptenv_
     assert_in_force_and_read();
 }
 
-/// sshd reads its configuration when it starts, so a file written after that may not have been read: the `verify`
+/// sshd reads its configuration when it starts, so a file written after that may not have been read: the `doctor`
 /// row fails for it until sshd is restarted (by the step, which restarts it): for `sshd_config`, for any other
 /// file in `sshd_config.d`, and for the folder itself when an entry goes. This also measures that an elevated
 /// administrator can read when sshd's process, which runs as SYSTEM, was created.
@@ -509,9 +509,9 @@ fn install_dir_is_on_path() -> bool {
     )
 }
 
-/// `apply` puts the install directory on the system `PATH`, and `verify` (an elevated one) says so.
+/// `apply` puts the install directory on the system `PATH`, and `doctor` (an elevated one) says so.
 #[test]
-fn apply_puts_the_install_directory_on_the_system_path_and_verify_says_so() {
+fn apply_puts_the_install_directory_on_the_system_path_and_doctor_says_so() {
     let _machine = machine::exclusive();
     account_fixture::assert_elevated();
     let _install = Install::capture();
@@ -527,13 +527,13 @@ fn apply_puts_the_install_directory_on_the_system_path_and_verify_says_so() {
         "apply did not put {BASE_DIR} on the PATH:\n{said}"
     );
 
-    let verify = desktop::output(Command::new(canonical_exe()).arg("verify")).expect("run verify");
-    let shown = String::from_utf8_lossy(&verify.stdout).into_owned();
+    let doctor = desktop::output(Command::new(canonical_exe()).arg("doctor")).expect("run doctor");
+    let shown = String::from_utf8_lossy(&doctor.stdout).into_owned();
     assert!(
         shown
             .lines()
             .any(|line| line.starts_with("[PASS] install directory on PATH")),
-        "verify does not say the directory is on the PATH:\n{shown}"
+        "doctor does not say the directory is on the PATH:\n{shown}"
     );
 }
 
@@ -633,15 +633,15 @@ fn an_agent_that_apply_did_not_restart_keeps_its_old_path_until_it_restarts() {
     third.leave();
 }
 
-// verify through a session the prompt started =====
+// doctor through a session the prompt started =====
 
-/// The `verify` of an installed build, through a session that the password prompt started: an administrator with no
+/// The `doctor` of an installed build, through a session that the password prompt started: an administrator with no
 /// agent logs in with a terminal and types the password at the product's own prompt, so the installed shim starts
-/// the installed agent by its batch logon. A login asking `always` then runs the installed exe's `verify`, whose
+/// the installed agent by its batch logon. A login asking `always` then runs the installed exe's `doctor`, whose
 /// parity probes go through that agent. A junction row that is not "followed" is the RedirectionGuard signal for the
 /// password-prompt start path on the runner: stop and report it.
 #[test]
-fn after_apply_verify_passes_through_a_session_the_password_prompt_started() {
+fn after_apply_doctor_passes_through_a_session_the_password_prompt_started() {
     let _machine = machine::exclusive();
     account_fixture::assert_elevated();
     let _install = Install::capture();
@@ -658,22 +658,22 @@ fn after_apply_verify_passes_through_a_session_the_password_prompt_started() {
     let mut prompted = login.start();
     prompted.log_in(&account.password);
 
-    let mut verify = login.command_asking("always");
-    verify
+    let mut doctor = login.command_asking("always");
+    doctor
         .arg("-T")
         .arg("--")
-        .arg(format!("& '{}' verify", installed.display()));
-    let outcome = run_client(verify, false, kit.dir());
+        .arg(format!("& '{}' doctor", installed.display()));
+    let outcome = run_client(doctor, false, kit.dir());
     let shown = String::from_utf8_lossy(&outcome.stdout).into_owned();
     assert_eq!(
         outcome.code,
         Some(0),
-        "verify did not pass (exit {:?}):\n{shown}\n{}\n{}",
+        "doctor did not pass (exit {:?}):\n{shown}\n{}\n{}",
         outcome.code,
         outcome.stderr,
         (login.diagnostics())()
     );
-    agent_conn::assert_verify_session_rows(&shown);
+    agent_conn::assert_doctor_session_rows(&shown);
     prompted.leave();
 }
 

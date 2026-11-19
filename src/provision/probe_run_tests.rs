@@ -1,4 +1,4 @@
-//! Tests for which probes `verify` runs, how it asks each, what it makes of the answers and what it cleans
+//! Tests for which probes `doctor` runs, how it asks each, what it makes of the answers and what it cleans
 //! up after them, with the probes driven by a stand-in that answers as a probe would and makes the
 //! directory a make-probe makes, with the product's own maker, and a junction in it that leads outside.
 use std::cell::RefCell;
@@ -158,7 +158,7 @@ fn is_answered(outcome: &Option<ProbeOutcome>) -> bool {
 
 // the agent is at High ---------------------------------------------------------------------
 
-/// One directory goes to both probes, and `verify` removes it without following the junction in it.
+/// One directory goes to both probes, and `doctor` removes it without following the junction in it.
 #[test]
 fn an_agent_at_high_gets_two_probes_with_one_directory_which_is_removed() {
     let scratch = Scratch::new();
@@ -212,7 +212,7 @@ fn an_agent_below_high_is_probed_once_with_prompt() {
     );
 }
 
-/// A probe that failed may still create the directory, so `verify` says so; the default probe runs on.
+/// A probe that failed may still create the directory, so `doctor` says so; the default probe runs on.
 #[test]
 fn a_failed_unelevated_probe_gives_the_may_still_create_note_and_the_default_probe_runs_without_a_junction() {
     let scratch = Scratch::new();
@@ -454,9 +454,9 @@ fn a_temp_directory_that_is_not_text_gives_no_junction_and_runs_the_probes() {
 
 // the agent is below High ------------------------------------------------------------------
 
-/// The one probe below High makes and follows a junction in the directory `verify` named, and `verify` removes it.
+/// The one probe below High makes and follows a junction in the directory `doctor` named, and `doctor` removes it.
 #[test]
-fn an_agent_below_high_has_one_probe_with_a_directory_that_verify_removes() {
+fn an_agent_below_high_has_one_probe_with_a_directory_that_doctor_removes() {
     let scratch = Scratch::new();
     let probing = Probing::new(unelevated_ok, || {
         answer(
@@ -548,7 +548,7 @@ fn a_probe_that_ended_or_never_started_gives_no_may_still_create_note() {
     }
 }
 
-/// With no agent running, `verify` has no probe and no junction directory to name; the one row is the
+/// With no agent running, `doctor` has no probe and no junction directory to name; the one row is the
 /// probe's, with the cause.
 #[test]
 fn with_no_agent_running_there_is_no_junction_directory_row() {

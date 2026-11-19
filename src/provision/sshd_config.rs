@@ -3,7 +3,7 @@
 //! `apply` owns a drop-in file, [`DROP_IN_NAME`] in `sshd_config.d`, that holds one `AcceptEnv` line, and
 //! adds one [`INCLUDE_LINE`] to `sshd_config` when sshd does not read the drop-in already. When the folder or
 //! the drop-in cannot be used, it puts the [`ACCEPT_LINE`] itself into `sshd_config`. This module is the pure
-//! part: the text edit, the reader of `sshd -T`, and the `verify` row. [`configure`] is the flow over a
+//! part: the text edit, the reader of `sshd -T`, and the `doctor` row. [`configure`] is the flow over a
 //! [`configure::SshdHost`], which tests stand in for; the Windows implementation is `machine::Machine`.
 //!
 //! What it rests on: sshd hands an accepted variable to the DefaultShell and drops
@@ -44,7 +44,7 @@ pub const INCLUDE_LINE: &str = "Include sshd_config.d/*.conf";
 pub(crate) const CHECK_SSHD: &str =
     "Check sshd at this PC: `sc query sshd`; start it with `net start sshd` if it is stopped.";
 
-/// The variable's name, as the `verify` row and `sshd -T` know it.
+/// The variable's name, as the `doctor` row and `sshd -T` know it.
 const VARIABLE: &str = crate::protocol::ElevationPolicy::VARIABLE;
 
 /// Why a file cannot be edited by [`with_line`].
@@ -218,14 +218,14 @@ pub fn pinned(sshd_t_output: &str, name: &str) -> Option<String> {
 }
 
 /// Whether the variable is in force in what `sshd -T` printed: some `acceptenv` pattern takes it, or the
-/// server pins its value itself. The one judgement of `apply` and of the `verify` row.
+/// server pins its value itself. The one judgement of `apply` and of the `doctor` row.
 pub fn in_force(sshd_t_output: &str) -> bool {
     accepts(sshd_t_output, VARIABLE) || pinned(sshd_t_output, VARIABLE).is_some()
 }
 
 const ROW_NAME: &str = "sshd accepts SSH_BROKER_ELEVATION";
 
-/// What the `verify` row is given about sshd.
+/// What the `doctor` row is given about sshd.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SshdReading {
     /// The sshd service runs with arguments, which can name another configuration file: nothing else was read.
@@ -234,7 +234,7 @@ pub enum SshdReading {
     Read { listing: String, read: ConfigRead },
 }
 
-/// The `verify` row for sshd's configuration. `sshd -T` reads sshd's host keys, which only administrators and
+/// The `doctor` row for sshd's configuration. `sshd -T` reads sshd's host keys, which only administrators and
 /// SYSTEM can read, so the row is judged only at [`Integrity::High`] and `reading` is asked only there; below
 /// it the row is informational and passes. At High it passes when the variable is in force ([`in_force`]) and
 /// sshd has read what was changed; it fails when sshd started before a file of its configuration changed (or
@@ -263,7 +263,7 @@ pub fn accepts_row(
         return Check::new(
             ROW_NAME,
             true,
-            "not checked here: sshd's configuration is read by an elevated `verify`",
+            "not checked here: sshd's configuration is read by an elevated `doctor`",
         );
     }
     let (listing, read) = match reading() {

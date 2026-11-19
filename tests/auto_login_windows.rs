@@ -163,10 +163,10 @@ fn stored_task_starts_a_working_session_with_dpapi() {
 
         // The parity probe passes for a session-0 batch agent: `is_genuine_session`.
         let mut probe = connect();
-        probe.start_exec(&format!("\"{}\" verify-probe", kit.exe.display()));
+        probe.start_exec(&format!("\"{}\" doctor-probe", kit.exe.display()));
         probe.end_stdin();
         let done = probe.read_to_end();
-        assert_eq!(done.exit, Some(0), "verify-probe: {:?} {:?}", done.stdout, done.stderr);
+        assert_eq!(done.exit, Some(0), "doctor-probe: {:?} {:?}", done.stdout, done.stderr);
         assert!(done.stdout.contains("session_id=0"), "{}", done.stdout);
         assert!(done.stdout.contains("logon=4"), "a batch logon: {}", done.stdout);
         assert!(done.stdout.contains("dpapi=ok"), "{}", done.stdout);
@@ -262,7 +262,7 @@ fn on_twice_then_off_leaves_no_credential() {
 }
 
 /// Elevated (CI only). M5(g): a stale stored password is invisible in the task's last result, and the
-/// `verify` row says so instead of claiming to have checked.
+/// `doctor` row says so instead of claiming to have checked.
 #[test]
 fn a_stale_password_is_not_visible_in_the_last_result() {
     use ssh_broker::provision::session_task::task_row;

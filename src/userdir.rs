@@ -133,7 +133,7 @@ pub fn open_socket_dir(loc: &SocketLocation, user: &Sid) -> anyhow::Result<Socke
     })
 }
 
-/// [`open_socket_dir`] for a caller that only looks (`verify`): the same walk, and the same judgement
+/// [`open_socket_dir`] for a caller that only looks (`doctor`): the same walk, and the same judgement
 /// of each folder, and nothing is made. A folder that is not there is [`acl::Missing`], in the error
 /// for the socket folder and in [`SocketDir::logs`] for `logs`.
 pub fn inspect_socket_dir(loc: &SocketLocation, user: &Sid) -> anyhow::Result<SocketDir> {
@@ -143,7 +143,7 @@ pub fn inspect_socket_dir(loc: &SocketLocation, user: &Sid) -> anyhow::Result<So
 }
 
 /// [`inspect_socket_dir`] for the account this process runs as, whose location is the one its token
-/// gives: for a caller that connects to its own agent without making anything (`verify`, `logout`).
+/// gives: for a caller that connects to its own agent without making anything (`doctor`, `logout`).
 /// An account without a profile fails with [`NoProfile`].
 pub fn inspect_current_socket_dir() -> anyhow::Result<SocketDir> {
     inspect_socket_dir(&current_socket_location()?, &Sid::current_user()?)

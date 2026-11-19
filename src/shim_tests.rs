@@ -59,7 +59,7 @@ fn exec_shim_relays_streams_and_exit() {
 /// changes. The only defect actually measured there was sftp *hanging* — `std::io::stdout()` is a
 /// `LineWriter`, so newline-less output sat in the buffer — and the fix for that is the per-frame
 /// flush, which applies to every relayed command. Nothing tested byte-transparency itself, so the
-/// premise could diverge silently. This is that test; `verify`'s probe covers the same property
+/// premise could diverge silently. This is that test; `doctor`'s probe covers the same property
 /// end to end, on a real child, real pipes and a real socket.
 ///
 /// Payload: all 256 byte values, so NUL, `0xFF`, a lone CR, a lone LF and invalid UTF-8 are all
@@ -941,7 +941,7 @@ fn a_handshake_that_fails_for_another_reason_is_an_error() {
     assert!(start_exec_input(Denied, &exec_handshake()).is_err());
 }
 
-/// A caller that cannot run the session itself (`verify`'s probe) gets an error that names the cause, not
+/// A caller that cannot run the session itself (`doctor`'s probe) gets an error that names the cause, not
 /// a code that looks like the command's.
 #[test]
 fn run_exec_on_reports_a_hand_back_as_an_error_naming_the_cause() {

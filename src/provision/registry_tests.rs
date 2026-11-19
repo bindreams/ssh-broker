@@ -1,4 +1,4 @@
-//! Tests for the values `apply` owns under `HKLM\SOFTWARE\OpenSSH`: the pure list and the verify
+//! Tests for the values `apply` owns under `HKLM\SOFTWARE\OpenSSH`: the pure list and the doctor
 //! row (host) + the Reg* round-trips (Windows).
 use super::{RegValue, SshdShell, SshdShellReading, desired_values, escape_arguments_check};
 
@@ -44,7 +44,7 @@ fn values_are_the_flag_then_the_option_then_the_shell() {
     );
 }
 
-/// The verify row passes when sshd reads the value as on (a missing value included), and fails
+/// The doctor row passes when sshd reads the value as on (a missing value included), and fails
 /// otherwise, naming the value and `apply`. A read that cannot be made fails too: the setting is
 /// then unknown.
 #[test]

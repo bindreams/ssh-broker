@@ -5,18 +5,18 @@ invariants: [CONTRIBUTING.md](CONTRIBUTING.md). This file is the short orientati
 
 ## What it is
 
-One binary with a handful of entry points plus the hidden `verify-probe` and `console-fallback` children, dispatched by argv. The **shim** is sshd's `DefaultShell`
+One binary with a handful of entry points plus the hidden `doctor-probe` and `console-fallback` children, dispatched by argv. The **shim** is sshd's `DefaultShell`
 and is the default action; the **agent** runs in a user's interactive session (one per logged-on
 user) and hosts the shell in a pseudoconsole (PTY) or on redirected pipes (`ssh host cmd`); the two
 speak framed messages over an ACL-gated AF_UNIX socket in that user's profile. `apply` and
-`verify` install and check that arrangement.
+`doctor` install and check that arrangement.
 
 The point is lineage: a shell that is a child of the agent rather than of `sshd` inherits
-neither the session-0 network logon nor the RedirectionGuard mitigation. `verify` establishes
+neither the session-0 network logon nor the RedirectionGuard mitigation. `doctor` establishes
 the session id and DPAPI through an agent-spawned probe, and whether a junction that a token below
 High made is followed (RedirectionGuard refuses only those, so an agent at High is probed twice: a probe
 that asks for the default policy, an unelevated session, makes the junction, and one that asks for
-`always`, an elevated one, follows it). `verify` names the junction's
+`always`, an elevated one, follows it). `doctor` names the junction's
 directory and removes it; not tested means the volume holds no junctions. It also shows that an
 administrator's session is elevated and that an unelevated one can be had; `provision/probe_run` has
 the rest. The profile follows from the interactive logon and is not separately checked.
@@ -41,7 +41,7 @@ the rest. The profile follows from the interactive logon and is not separately c
 | `filelog` | the daily log in the user's own folder, written under the folder's handle |
 | `handoff` | the notice and the line the agent writes into the inherited pipe it hands the hidden `console-fallback` verb |
 | `vtinput` | Win32 `INPUT_RECORD` → VT sequences (pure, host-testable) |
-| `provision`, `provision/{probe,probe_run,session_rows}` | `apply`/`verify`: DefaultShell, logon task, per-user socket rows, parity probes (the PROBE line, the junction they follow, the two probes of an elevated agent) and the rows they give |
+| `provision`, `provision/{probe,probe_run,session_rows}` | `apply`/`doctor`: DefaultShell, logon task, per-user socket rows, parity probes (the PROBE line, the junction they follow, the two probes of an elevated agent) and the rows they give |
 | `offer`, `offer/text` | the session offer as a pure state machine over injected I/O, and every line it shows |
 | `secret`, `password_entry` | wiped password buffers, and the key-event state machine that fills one |
 | `console_modes`, `console_prompt` | the console's raw mode as a guard; the password prompt on it, and why the shim has no agent |

@@ -182,7 +182,7 @@ EXCLUDE_PATH_CASES: dict[str, tuple[list[str], list[str]]] = {
             "src/shim_tests.rs",
             "src/shim_pty_tests.rs",
             "tests/fail_open_windows.rs",
-            "tests/verify_probe_upstream.rs",
+            "tests/doctor_probe_upstream.rs",
             "tests/interactive_fail_open_containment.rs",
         ],
         [

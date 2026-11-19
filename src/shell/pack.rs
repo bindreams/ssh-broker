@@ -47,7 +47,7 @@ pub fn defaults(is_system_cmd: bool) -> Defaults {
     }
 }
 
-/// Where one effective value comes from, for `verify`.
+/// Where one effective value comes from, for `doctor`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Source {
     User(PathBuf),
@@ -138,7 +138,7 @@ pub struct Plan {
 }
 
 impl Source {
-    /// How `verify` names the source.
+    /// How `doctor` names the source.
     fn label(&self) -> String {
         match self {
             Source::User(file) => format!("user: {}", file.display()),
@@ -152,7 +152,7 @@ impl Source {
 
 /// The effective shell as a config file, each key followed by where its value comes from, then
 /// the program `start` resolved to and, when a configured shell could not be used, the warning,
-/// as comments. What `verify` prints; the config parser reads it back as the values it shows.
+/// as comments. What `doctor` prints; the config parser reads it back as the values it shows.
 pub fn render(effective: &Effective) -> String {
     let why = &effective.why;
     let block = ShellBlock {

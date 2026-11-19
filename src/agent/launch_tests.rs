@@ -34,7 +34,7 @@ fn launched<'a>(hs: &'a Handshake, host: &TestHost) -> Launched<'a> {
 #[test]
 fn a_direct_launch_runs_the_line_unchanged() {
     for mode in [Mode::Exec, Mode::Pty] {
-        let line = r#""C:\a b\ssh-broker.exe" verify-probe"#;
+        let line = r#""C:\a b\ssh-broker.exe" doctor-probe"#;
         let hs_got = handshake(mode, Some(line), Launch::Direct);
         let got = launched(&hs_got, &pwsh_host());
         assert_eq!(got.line, line);
@@ -186,7 +186,7 @@ fn a_shell_that_cannot_start_is_replaced_by_cmd_exe_and_the_warning_names_the_er
 
 #[test]
 fn a_direct_launch_is_never_replaced() {
-    let hs = handshake(Mode::Exec, Some(r"C:\ssh-broker.exe verify-probe"), Launch::Direct);
+    let hs = handshake(Mode::Exec, Some(r"C:\ssh-broker.exe doctor-probe"), Launch::Direct);
     let first = launched(&hs, &pwsh_host());
     let mut tried = 0;
     let error = start(
@@ -467,7 +467,7 @@ fn a_terminal_session_with_a_working_shell_starts_it_as_it_is() {
 
 #[test]
 fn a_direct_launch_is_not_wrapped() {
-    let hs = handshake(Mode::Pty, Some(r"C:\ssh-broker.exe verify-probe"), Launch::Direct);
+    let hs = handshake(Mode::Pty, Some(r"C:\ssh-broker.exe doctor-probe"), Launch::Direct);
     let first = launched(&hs, &pwsh_host());
     let (tried, warned, _) = started(&pwsh_host(), &first, verb(), never);
     assert_eq!((tried, warned), (vec![Try::Line(first.line.clone())], Vec::new()));

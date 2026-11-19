@@ -479,7 +479,7 @@ pub fn sshd_host_of_this_machine() -> anyhow::Result<impl SshdHost> {
     Machine::find().context("cannot find sshd")
 }
 
-/// What the `verify` row is given about sshd on this machine: `sshd -T` (which needs the rights to read sshd's
+/// What the `doctor` row is given about sshd on this machine: `sshd -T` (which needs the rights to read sshd's
 /// host keys) and whether sshd started before a file of its configuration changed, or that the service runs
 /// with arguments. An error says which question could not be answered.
 pub fn sshd_reading_this_machine() -> anyhow::Result<SshdReading> {

@@ -78,7 +78,7 @@ pub enum Encoding {
     /// `DefaultShell` path is not one it special-cases (`w32-doexec.c:308-318`, `:370-371`). It
     /// reads both once per session (`pwd.c` `set_defaultshell`), so a re-read here could disagree
     /// with the session being served. ssh-broker owns the setting instead: `apply` writes the flag
-    /// and installs the shim at a path sshd does not special-case, and `verify` checks it.
+    /// and installs the shim at a path sshd does not special-case, and `doctor` checks it.
     Escaped,
 }
 

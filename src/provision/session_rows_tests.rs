@@ -1,4 +1,4 @@
-//! Tests for the `verify` rows about what a session through the agent is.
+//! Tests for the `doctor` rows about what a session through the agent is.
 use super::*;
 use crate::account::{INTEGRITY_HIGH, INTEGRITY_MEDIUM};
 use crate::provision::probe::{SymlinkState, UpstreamState};
@@ -369,7 +369,7 @@ fn a_directory_that_could_not_be_made_fails_the_junction_row_with_the_cause() {
     assert!(!row.detail.contains("NOT tested"), "{}", row.detail);
 }
 
-/// A volume that holds no junctions was not tested: the row does not fail `verify`, says in so many
+/// A volume that holds no junctions was not tested: the row does not fail `doctor`, says in so many
 /// words that the property was not tested, and gives the probe's reason.
 #[test]
 fn a_volume_without_junctions_is_not_tested_and_fails_nothing() {

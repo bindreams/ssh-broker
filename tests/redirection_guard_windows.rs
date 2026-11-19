@@ -1,11 +1,11 @@
-//! The premise of `verify`'s junction row: RedirectionGuard refuses to follow a junction that a
+//! The premise of `doctor`'s junction row: RedirectionGuard refuses to follow a junction that a
 //! non-administrator made, and follows one that an elevated process made. Windows only; **Elevated (CI only)**.
 //!
 //! The reader is the child half of a test of this binary (`common/child_entry.rs`), which sets
 //! `ProcessRedirectionTrustPolicy` (enforce) on itself and reads through two junctions to the same file:
 //! one this elevated process made, and one that a child of this process made with the unelevated token
 //! (`winutil::UnelevatedToken`, the token a session runs with unless its login asks for `always`). The junction row of
-//! `verify` rests on the second being refused with error 448 while the first is followed, so that a
+//! `doctor` rests on the second being refused with error 448 while the first is followed, so that a
 //! junction an elevated probe made itself, which is always followed, is not what the row reads through.
 #![cfg(windows)]
 
@@ -66,11 +66,11 @@ fn an_elevated_junction_is_followed_and_an_unelevated_one_is_refused_under_redir
     // This elevated process makes one junction with the product's own maker, in a directory of its own.
     link::make(&by_admin(&dir.0)).expect("make the junction as this elevated process");
 
-    // The unelevated process of this account makes the other with the same maker, as the probe `verify`
+    // The unelevated process of this account makes the other with the same maker, as the probe `doctor`
     // runs under the unelevated token does. The probe reads its stdin to the end, which closing it gives.
     let token = UnelevatedToken::of_this_process().expect("make the unelevated token");
     let line = format!(
-        "\"{}\" verify-probe --make-junction \"{}\"",
+        "\"{}\" doctor-probe --make-junction \"{}\"",
         env!("CARGO_BIN_EXE_ssh-broker"),
         by_unelevated(&dir.0).display()
     );

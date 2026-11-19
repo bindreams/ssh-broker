@@ -1,4 +1,4 @@
-//! Host tests for the auto-login task's definition, its read-back and its `verify` row.
+//! Host tests for the auto-login task's definition, its read-back and its `doctor` row.
 use super::*;
 
 const EXE: &str = r"C:\ProgramData\ssh-broker\ssh-broker.exe";
@@ -238,7 +238,7 @@ fn an_exe_compared_case_insensitively_is_the_same_exe() {
     assert_eq!(task_problem(&state(xml), EXE, SID), None);
 }
 
-// the verify row -----
+// the doctor row -----
 
 #[test]
 fn task_row_absent_task_passes() {

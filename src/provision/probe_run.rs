@@ -1,4 +1,4 @@
-//! provision::probe_run — `verify`'s probes through the agent: which are run, in what order, and what
+//! provision::probe_run — `doctor`'s probes through the agent: which are run, in what order, and what
 //! is cleaned up after them.
 //!
 //! The probes run in the agent's session (see [`super::probe`]); this is the parent's side, which
@@ -6,7 +6,7 @@
 //! became of each probe, is a [`Probes`] for [`super::session_rows`] to turn into rows.
 //!
 //! The directory of the junction is named here, under this process's temp directory, before any probe
-//! runs, and no probe names one back, so a path a process below High wrote is never one `verify` acts on.
+//! runs, and no probe names one back, so a path a process below High wrote is never one `doctor` acts on.
 //! It is removed here, through no link, whatever became of the probes: one whose child may still be
 //! running may still create it, and a note says so. A directory left in the temp folder does not make the installation
 //! wrong, so the `junction directory` row it gives passes.
@@ -114,7 +114,7 @@ fn run_at_high(dir: &Path, drive: Drive) -> Probes {
     }
 }
 
-/// What a probe is told to do about the directory `dir` that `verify` named: make a junction in it, or
+/// What a probe is told to do about the directory `dir` that `doctor` named: make a junction in it, or
 /// nothing when it cannot be told to a probe as text.
 fn make_link(dir: &Path) -> ProbeLink {
     dir.to_str()
@@ -215,13 +215,13 @@ fn said(outcome: &ProbeOutcome) -> &str {
 /// the child.
 ///
 /// On expiry the outcome is [`ProbeOutcome::TimedOut`], which becomes the `parity probe (via agent)` row
-/// that an unreachable agent produces, so `verify` still prints every local check and exits non-zero
+/// that an unreachable agent produces, so `doctor` still prints every local check and exits non-zero
 /// instead of hanging with nothing on stdout.
 fn drive_bounded(exe: &Path, elevation: ElevationPolicy, link: ProbeLink, timeout: Option<Duration>) -> ProbeOutcome {
     let (tx, rx) = std::sync::mpsc::channel();
     let exe = exe.to_path_buf();
     // The worker owns the whole relay conversation; on expiry it is left blocked on a socket that is not
-    // delivering. `verify` goes on without it and exits after printing, which collects it.
+    // delivering. `doctor` goes on without it and exits after printing, which collects it.
     std::thread::spawn(move || {
         let _ = tx.send(drive(&exe, elevation, &link));
     });
@@ -253,7 +253,7 @@ fn outcome_of(waited: Result<Result<Answer, Stop>, WaitError>) -> ProbeOutcome {
     }
 }
 
-/// Drive `<exe> verify-probe` as an EXEC command THROUGH the agent (so it runs in session 1), asking for
+/// Drive `<exe> doctor-probe` as an EXEC command THROUGH the agent (so it runs in session 1), asking for
 /// `elevation`, parse the PROBE line it prints, and check whether its binary payload survived intact.
 ///
 /// The byte check reads the RAW stdout, before the lossy UTF-8 conversion the line parse

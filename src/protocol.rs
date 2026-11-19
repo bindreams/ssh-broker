@@ -208,7 +208,7 @@ pub enum Launch {
     /// The shell from `config.yaml` (see [`crate::shell`]), with the command packed for it.
     Shell,
     /// The line in [`Handshake::command`] is spawned as it stands, with no shell in between.
-    /// For ssh-broker's own callers (`verify`'s probe) and tests; `command` is required.
+    /// For ssh-broker's own callers (`doctor`'s probe) and tests; `command` is required.
     Direct,
 }
 
