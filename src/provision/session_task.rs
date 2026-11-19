@@ -10,7 +10,7 @@
 //! the read-back compares what the service holds with what was asked, by facts and not by text.
 
 use super::report::Check;
-use super::schtasks::{settings_xml, xml_escape};
+use super::schtasks::{OnFailure, settings_xml, xml_escape};
 
 /// Every auto-login task is named with this prefix and the account's SID.
 pub const TASK_PREFIX: &str = "ssh-broker-session-";
@@ -42,7 +42,7 @@ pub fn task_xml(exe: &str, sid: &str) -> String {
     let exe = xml_escape(exe);
     let sid = xml_escape(sid);
     let arguments = arguments(&sid);
-    let settings = settings_xml("IgnoreNew");
+    let settings = settings_xml("IgnoreNew", OnFailure::Restart);
     format!(
         r#"<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">

@@ -23,7 +23,8 @@ use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize,
 };
 use windows::Win32::System::TaskScheduler::{
-    IRegisteredTask, ITaskService, TASK_CREATE_OR_UPDATE, TASK_LOGON_PASSWORD, TASK_RUN_USE_SESSION_ID, TaskScheduler,
+    IRegisteredTask, ITaskService, TASK_CREATE_OR_UPDATE, TASK_LOGON_PASSWORD, TASK_LOGON_SERVICE_ACCOUNT,
+    TASK_RUN_USE_SESSION_ID, TaskScheduler,
 };
 use windows::Win32::System::Variant::VARIANT;
 use windows::core::{BSTR, HRESULT, Interface};
@@ -31,6 +32,7 @@ use windows::core::{BSTR, HRESULT, Interface};
 use super::password_variant::PasswordVariant;
 use super::procwait::{self, Process};
 use super::session_task::TaskState;
+use super::sshd_task::WaitOutcome;
 use crate::password_entry::Password;
 
 /// `SCHED_E_TASK_NOT_RUNNING`: `Stop` on a task with no running instance.
@@ -322,6 +324,76 @@ pub fn register_password_task(
     }
     .with_context(|| format!("register the task {name} for {account}"))?;
     Ok(())
+}
+
+/// Register (or replace) a task that runs as SYSTEM, from the definition `xml`, with the DACL `sddl`.
+pub fn register_system_task(name: &str, xml: &str, sddl: &str) -> anyhow::Result<()> {
+    let _com = Com::init()?;
+    let service = connect()?;
+    // SAFETY: as in `connect`; every argument outlives the call.
+    unsafe {
+        service
+            .GetFolder(&BSTR::from("\\"))
+            .context("open the root task folder")?
+            .RegisterTask(
+                &BSTR::from(name),
+                &BSTR::from(xml),
+                TASK_CREATE_OR_UPDATE.0,
+                &VARIANT::from("SYSTEM"),
+                &VARIANT::default(),
+                TASK_LOGON_SERVICE_ACCOUNT,
+                &VARIANT::from(sddl),
+            )
+    }
+    .with_context(|| format!("register the task {name} for SYSTEM"))?;
+    Ok(())
+}
+
+/// Return once the task `name` has no instance: the processes of its instances (running `image`) have
+/// exited. A task that does not exist has none. Nothing stops the task and nothing bounds the wait for a
+/// process that was launched: its exit is the kernel's and the task's to bring about.
+///
+/// An instance the Task Scheduler lists and has not launched is looked at again. That is waiting for an
+/// external event that may never come, so the failure bound [`procwait::EXIT_BOUND`] counts from the first
+/// look that finds only such instances, and its expiry is [`WaitOutcome::NeverLaunched`]: it proves nothing of
+/// what the instance will do.
+pub fn wait_for_instances(name: &str, image: &Path) -> anyhow::Result<WaitOutcome> {
+    let _com = Com::init()?;
+    let service = connect()?;
+    let Some(task) = registered_task(&service, name)? else {
+        return Ok(WaitOutcome::Ended);
+    };
+    wait_until_ended(
+        procwait::EXIT_BOUND,
+        || running_instances(&task, image),
+        |processes| processes.iter().try_for_each(Process::wait_for_exit),
+    )
+}
+
+/// The loop of [`stop_and_wait`] without the stop: list the instances, wait for the processes among them, list
+/// again, until a listing finds none. An instance that has no process to wait for is looked at again at once;
+/// `bound` runs from the first such look since a process was last waited for.
+fn wait_until_ended<P>(
+    bound: Duration,
+    mut list: impl FnMut() -> anyhow::Result<Instances<P>>,
+    mut wait: impl FnMut(Vec<P>) -> anyhow::Result<()>,
+) -> anyhow::Result<WaitOutcome> {
+    let mut never_launched_since: Option<Instant> = None;
+    loop {
+        let instances = list()?;
+        if instances.count == 0 {
+            return Ok(WaitOutcome::Ended);
+        }
+        if !instances.processes.is_empty() {
+            never_launched_since = None;
+            wait(instances.processes)?;
+            continue;
+        }
+        let since = *never_launched_since.get_or_insert_with(Instant::now);
+        if since.elapsed() >= bound {
+            return Ok(WaitOutcome::NeverLaunched { count: instances.count });
+        }
+    }
 }
 
 /// The auto-login tasks (`ssh-broker-session-*`) and whether each is enabled.

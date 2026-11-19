@@ -34,6 +34,12 @@ impl Layout {
         self.base.join("apply.lock")
     }
 
+    /// What the task that sets sshd up says it did, one line each, for `apply` to print; see
+    /// [`super::sshd_task`].
+    pub fn apply_sshd_report_path(&self) -> PathBuf {
+        self.base.join("apply-sshd.log")
+    }
+
     /// The system layer of the shell configuration; see [`crate::shell`].
     pub fn system_config_path(&self) -> PathBuf {
         self.base.join("config.yaml")

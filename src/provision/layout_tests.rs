@@ -23,6 +23,15 @@ impl TempBase {
     }
 }
 
+#[test]
+fn the_sshd_step_s_report_is_in_the_install_directory() {
+    let layout = Layout::production();
+    assert_eq!(
+        layout.apply_sshd_report_path(),
+        Path::new(super::super::BASE_DIR).join("apply-sshd.log")
+    );
+}
+
 /// [`ensure_base`], then [`prepare_in`]: what `apply` does.
 fn prepare(
     layout: &Layout,

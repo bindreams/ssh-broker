@@ -24,8 +24,8 @@ use windows::Win32::System::Diagnostics::ToolHelp::{
 };
 use windows::Win32::System::RemoteDesktop::ProcessIdToSessionId;
 use windows::Win32::System::Threading::{
-    OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
-    QueryFullProcessImageNameW, TerminateProcess, WaitForSingleObject,
+    INFINITE, OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+    PROCESS_TERMINATE, QueryFullProcessImageNameW, TerminateProcess, WaitForSingleObject,
 };
 use windows::core::{HRESULT, PWSTR};
 
@@ -54,6 +54,21 @@ impl Process {
     /// The process handle, for waiting on it. Owned by `self`.
     pub fn handle(&self) -> HANDLE {
         self.handle.0
+    }
+
+    /// Wait, with no bound, until the process has exited. For a process that the caller knows is on its
+    /// way out and whose exit nothing here can hurry; a caller that must give up after a time uses
+    /// [`wait_all_exited`].
+    pub fn wait_for_exit(&self) -> anyhow::Result<()> {
+        // SAFETY: the handle is open with SYNCHRONIZE for the life of `self`.
+        let waited = unsafe { WaitForSingleObject(self.handle.0, INFINITE) };
+        anyhow::ensure!(
+            waited == WAIT_OBJECT_0,
+            "waiting for process {} to exit failed: {}",
+            self.pid,
+            std::io::Error::last_os_error()
+        );
+        Ok(())
     }
 
     /// End the process. The handle held here keeps its PID from being reused, so reopening it by

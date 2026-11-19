@@ -1,7 +1,7 @@
 //! argv dispatch.
 //!
 //! The **shim** (the SSH `DefaultShell`) is the default action; `agent`/`apply`/
-//! `verify` are explicit verbs. `DefaultShell` is a bare path and cannot carry a
+//! `verify` are explicit verbs (and `apply-sshd`, `verify-probe` and `console-fallback` hidden ones). `DefaultShell` is a bare path and cannot carry a
 //! subcommand argument, which is exactly why the shim is the default: a known verb
 //! in first position selects a subcommand, anything else (bare, or sshd's
 //! `-c "cmd"`) is the shim.
@@ -25,6 +25,8 @@ pub enum Route {
     /// `auto-login on|off [<account>]`; `None` when the arguments are not that: print the usage.
     AutoLogin(Option<AutoLoginArgs>),
     Apply,
+    /// Hidden: what the task `apply` hands the sshd step to runs: `provision::apply_sshd`.
+    ApplySshd,
     Verify,
     /// Hidden: the parity-probe child the agent spawns in session 1 (used by `verify`).
     VerifyProbe(ProbeLink),
@@ -44,6 +46,7 @@ pub enum Verb {
     Logout,
     ConsoleFallback,
     VerifyProbe,
+    ApplySshd,
 }
 
 /// What a `verify-probe` does with the junction its link check reads through (`provision::probe::link`).
@@ -102,6 +105,8 @@ pub fn route(args: &[String], command_line: &str) -> Route {
         Some("logout") => Route::Usage(Verb::Logout),
         Some("auto-login") => Route::AutoLogin(auto_login_args(&args[1..])),
         Some("apply") => Route::Apply,
+        Some("apply-sshd") if args.len() == 1 => Route::ApplySshd,
+        Some("apply-sshd") => Route::Usage(Verb::ApplySshd),
         Some("verify") => Route::Verify,
         Some("verify-probe") => probe_link(&args[1..]).map_or(Route::Usage(Verb::VerifyProbe), Route::VerifyProbe),
         Some("console-fallback") => console_fallback_args(&args[1..])

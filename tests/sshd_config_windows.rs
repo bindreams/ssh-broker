@@ -25,7 +25,9 @@ use ssh_broker::provision::sshd_config::restart::{ServiceState, StartOutcome, St
 use ssh_broker::provision::sshd_config::{
     ACCEPT_LINE, DROP_IN_NAME, INCLUDE_LINE, SshdReading, accepts, accepts_row, drop_in_text, in_force, with_line,
 };
+use ssh_broker::provision::sshd_task::{self, WaitOutcome};
 use ssh_broker::provision::{BASE_DIR, canonical_exe};
+use ssh_broker::provision::{schtasks, taskscheduler};
 use ssh_broker::socket_loc::Integrity;
 
 #[path = "common/account.rs"]
@@ -42,6 +44,8 @@ mod fs_state;
 mod hard_errors;
 #[path = "common/install.rs"]
 mod install;
+#[path = "common/job.rs"]
+mod job;
 #[path = "common/logon_session.rs"]
 mod logon_session;
 #[path = "common/machine.rs"]
@@ -122,16 +126,42 @@ fn sshd_t() -> String {
 }
 
 /// `exe apply`, run by the test process (an elevated administrator): installs the build as the product does.
-/// Returns what it printed; fails when it does not end with 0.
-fn apply(kit: &Kit) -> String {
+/// Returns what it printed on standard output and on standard error; fails when it does not end with 0.
+fn apply_streams(kit: &Kit) -> (String, String) {
     let out = desktop::output(Command::new(&kit.exe).arg("apply")).expect("run apply");
-    let text = format!(
-        "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
+    let (stdout, stderr) = (
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
     );
-    assert!(out.status.success(), "apply failed ({:?}):\n{text}", out.status.code());
-    text
+    assert!(
+        out.status.success(),
+        "apply failed ({:?}):\n{stdout}{stderr}",
+        out.status.code()
+    );
+    (stdout, stderr)
+}
+
+/// [`apply_streams`], both streams in one text.
+fn apply(kit: &Kit) -> String {
+    let (stdout, stderr) = apply_streams(kit);
+    format!("{stdout}{stderr}")
+}
+
+/// The lines the report of `apply`'s sshd step holds.
+fn report_lines() -> Vec<String> {
+    let path = ssh_broker::provision::sshd_task::report_path();
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read the report {}: {e}", path.display()));
+    ssh_broker::provision::sshd_task::report_lines(&text)
+}
+
+/// No task of the sshd step is left registered.
+fn assert_no_sshd_task_is_left() {
+    assert_eq!(
+        taskscheduler::task_xml(schtasks::APPLY_SSHD_TASK).expect("ask the Task Scheduler"),
+        None,
+        "apply left the task {} registered",
+        schtasks::APPLY_SSHD_TASK
+    );
 }
 
 fn system_cmd() -> PathBuf {
@@ -140,19 +170,31 @@ fn system_cmd() -> PathBuf {
 
 // The drop-in and the Include line =====
 
-/// The step on the runner's stock file: the drop-in, the `Include` line above the first `Match`, the original's
-/// security on the replacement, and the restart of sshd. After the restart the `verify` row passes and a second
-/// run says nothing.
+/// The step on the runner's stock file, run by `apply` through its task, as SYSTEM: the drop-in, the `Include` line
+/// above the first `Match`, the original's security on the replacement (SYSTEM can create the drop-in and
+/// `copy_file_security` works as SYSTEM), and the restart of sshd. No task is left after `apply`, and the report
+/// holds the lines `apply` printed after it said the step was the task's. After the restart the `verify` row
+/// passes and a second run says nothing.
 #[test]
 fn apply_s_sshd_step_adds_the_drop_in_and_the_include_above_the_first_match_and_the_row_passes() {
     let _machine = machine::exclusive();
     account_fixture::assert_elevated();
+    let _install = Install::capture();
+    let _running = SshdRunningAtTheEnd;
     let stock = reset();
-    let _reset = ResetAtTheEnd;
+    let kit = Kit::broker_with_helper("sshs");
     let security_before = sddl_of(&config_path());
 
-    let (accepted, said) = configure();
-    assert_restarted(accepted, &said);
+    let (stdout, _) = apply_streams(&kit);
+    let printed: Vec<&str> = stdout
+        .lines()
+        .skip_while(|line| !line.starts_with(sshd_task::HANDED_OVER_PREFIX))
+        .skip(1)
+        .collect();
+    let said = report_lines();
+    assert_eq!(printed, said, "apply prints the report, line for line");
+    assert_restarted(true, &said);
+    assert_no_sshd_task_is_left();
     assert_eq!(
         std::fs::read(config_path()).unwrap(),
         with_line(stock, INCLUDE_LINE).unwrap(),
@@ -732,6 +774,87 @@ fn the_service_manager_s_state_follows_a_stop_and_a_start() {
         }
         other => panic!("a start of a running service: {other:?}"),
     }
+}
+
+/// `apply` run in a job that ends with its connection, as sshd's job does: the test reads `apply`'s output through
+/// the pipe and ends the job on the line that says the sshd step is the task's. `apply` is then gone, and the task
+/// (a service started its process, outside the job) finishes the step: its instances end, sshd is running, plain
+/// `sshd -T` shows the variable, a login that asks for the variable gets it, and the report's last line says sshd
+/// restarted. sshd is started again when the test ends, also on failure.
+#[test]
+fn an_apply_ended_after_it_handed_over_the_sshd_step_leaves_sshd_running_with_the_change() {
+    use std::io::{BufRead, BufReader};
+    use std::os::windows::io::AsRawHandle;
+    use std::process::Stdio;
+
+    let _machine = machine::exclusive();
+    account_fixture::assert_elevated();
+    let _install = Install::capture();
+    let _running = SshdRunningAtTheEnd;
+    reset();
+    let kit = Kit::broker_with_helper("sshj");
+    apply(&kit);
+    let installed = canonical_exe();
+    // sshd's files as stock again, and sshd not restarted: the `apply` below has a change to make and a restart
+    // to do.
+    reset();
+
+    let mut job = job::KillOnCloseJob::create();
+    let mut command = Command::new(&installed);
+    command.arg("apply").stdout(Stdio::piped()).stderr(Stdio::null());
+    let mut child = desktop::spawn(&mut command).expect("run apply");
+    job.assign(windows::Win32::Foundation::HANDLE(child.as_raw_handle()));
+    let mut printed = Vec::new();
+    let mut handed_over = false;
+    for line in BufReader::new(child.stdout.take().expect("apply's output is piped")).lines() {
+        let line = line.expect("read what apply prints");
+        handed_over = line.starts_with(sshd_task::HANDED_OVER_PREFIX);
+        printed.push(line);
+        if handed_over {
+            break;
+        }
+    }
+    assert!(
+        handed_over,
+        "apply ended without saying that the sshd step is the task's:\n{printed:#?}"
+    );
+    // The connection ends: every process in the session's job ends with it, `apply` among them.
+    job.close();
+    let _ = child.wait();
+
+    let waited = taskscheduler::wait_for_instances(schtasks::APPLY_SSHD_TASK, &installed)
+        .expect("wait for the instances of the task");
+    assert_eq!(waited, WaitOutcome::Ended);
+    let mut host = sshd_host_of_this_machine().expect("find the sshd service");
+    assert_eq!(host.settled().expect("read the state"), ServiceState::Running);
+    assert_apply_configured_sshd();
+    assert!(
+        accepts(&sshd_t(), ssh_broker::protocol::ElevationPolicy::VARIABLE),
+        "plain `sshd -T` shows the variable"
+    );
+    assert_eq!(
+        report_lines().last().map(String::as_str),
+        Some("apply: sshd restarted; it accepts SSH_BROKER_ELEVATION"),
+        "the report's last line says sshd restarted"
+    );
+
+    // A new login gets the variable: the rig is made after the checks above, so that it cannot have configured
+    // sshd itself.
+    let account = Account::create("sshj", true);
+    account.started_by(ServiceLogon::Sshd);
+    let login = Login::new(&kit, &account);
+    set_stock_shell(&system_cmd());
+    let mut ssh = login.command_asking("always");
+    ssh.arg("-T").arg("--").arg("echo [%SSH_BROKER_ELEVATION%]");
+    let outcome = run_client(ssh, false, kit.dir());
+    let shown = String::from_utf8_lossy(&outcome.stdout).into_owned();
+    assert!(
+        shown.contains("[always]"),
+        "the shell did not see the variable (exit {:?}):\n{shown}\n{}\n{}",
+        outcome.code,
+        outcome.stderr,
+        (login.diagnostics())()
+    );
 }
 
 /// Review Focus 5: `apply` run in an SSH session restarts the very sshd that session came in through. The shim is

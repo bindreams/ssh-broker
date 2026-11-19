@@ -73,6 +73,21 @@ fn the_wait_ends_when_the_process_exits_and_fails_at_the_bound_while_it_runs() {
 }
 
 #[test]
+fn a_wait_with_no_bound_returns_when_the_process_has_exited() {
+    let mut child = child_until_stdin_closes();
+    let process = open_if_image(child.id(), &cmd_exe()).unwrap().unwrap();
+    // The stdin closes on another thread, before or after the wait starts: the wait ends at the exit either way.
+    let stdin = child.stdin.take();
+    let closer = std::thread::spawn(move || drop(stdin));
+    process.wait_for_exit().unwrap();
+    closer.join().unwrap();
+    assert!(
+        child.try_wait().unwrap().is_some(),
+        "the process had exited when the wait returned"
+    );
+}
+
+#[test]
 fn waiting_for_no_processes_returns_at_once() {
     wait_all_exited(&[], Duration::from_millis(1)).unwrap();
 }

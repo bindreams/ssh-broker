@@ -268,6 +268,97 @@ fn a_process_that_does_not_exit_fails_the_stop_without_another_pass() {
     assert_eq!(events.into_inner(), ["disable", "list [11]", "stop", "wait [11]"]);
 }
 
+// Waiting for the instances of a task (host) -----
+
+/// The wait over a script of listings (the last one repeats), recording the order of its calls.
+fn run_wait_until_ended(
+    bound: Duration,
+    listings: Vec<Listing>,
+    wait: bool,
+    events: &RefCell<Vec<String>>,
+) -> anyhow::Result<WaitOutcome> {
+    let log = |e: &str| events.borrow_mut().push(e.to_string());
+    let mut listings = listings.into_iter().peekable();
+    wait_until_ended(
+        bound,
+        || {
+            let pids = if listings.len() > 1 {
+                listings.next().unwrap()
+            } else {
+                listings.peek().cloned().unwrap_or_default()
+            };
+            log(&format!("list {pids:?}"));
+            Ok(Instances {
+                count: pids.len(),
+                pids: pids.clone(),
+                processes: pids.into_iter().filter(|pid| *pid != 0).collect(),
+            })
+        },
+        |pids| {
+            log(&format!("wait {pids:?}"));
+            if wait { Ok(()) } else { anyhow::bail!("failed") }
+        },
+    )
+}
+
+#[test]
+fn the_instances_are_listed_waited_for_and_listed_again_until_there_are_none() {
+    let events = RefCell::new(Vec::new());
+    let outcome = run_wait_until_ended(NO_BOUND, vec![vec![11, 22], vec![]], true, &events).unwrap();
+    assert_eq!(outcome, WaitOutcome::Ended);
+    assert_eq!(events.into_inner(), ["list [11, 22]", "wait [11, 22]", "list []"]);
+}
+
+#[test]
+fn a_task_with_no_instance_has_ended_and_nothing_is_waited_for() {
+    let events = RefCell::new(Vec::new());
+    assert_eq!(
+        run_wait_until_ended(Duration::ZERO, vec![vec![]], true, &events).unwrap(),
+        WaitOutcome::Ended
+    );
+    assert_eq!(events.into_inner(), ["list []"]);
+}
+
+#[test]
+fn an_instance_the_engine_has_not_launched_yet_is_looked_at_again_with_no_count_of_passes() {
+    let events = RefCell::new(Vec::new());
+    let mut listings: Vec<Listing> = (0..1000).map(|_| vec![0]).collect();
+    listings.push(vec![33]);
+    listings.push(vec![]);
+    let outcome = run_wait_until_ended(NO_BOUND, listings, true, &events).unwrap();
+    assert_eq!(outcome, WaitOutcome::Ended);
+    let events = events.into_inner();
+    assert_eq!(events.iter().filter(|e| *e == "list [0]").count(), 1000);
+    assert_eq!(&events[1000..], ["list [33]", "wait [33]", "list []"]);
+}
+
+#[test]
+fn an_instance_that_is_never_launched_is_not_an_end_and_is_reported_with_how_many_past_the_bound() {
+    // With a zero bound the first look that finds only unlaunched instances is past it. The expiry is the
+    // failure bound of an external event that may never come, and says nothing of what the instance does.
+    let events = RefCell::new(Vec::new());
+    let outcome = run_wait_until_ended(Duration::ZERO, vec![vec![0, 0]], true, &events).unwrap();
+    assert_eq!(outcome, WaitOutcome::NeverLaunched { count: 2 });
+    assert_eq!(events.into_inner(), ["list [0, 0]"]);
+}
+
+#[test]
+fn a_launched_instance_is_waited_for_with_no_bound_however_long_the_bound_is_past() {
+    // The bound is for an instance that is never launched, not for one that runs: a launched one is
+    // waited for until it exits, and a zero bound does not cut that wait.
+    let events = RefCell::new(Vec::new());
+    let outcome = run_wait_until_ended(Duration::ZERO, vec![vec![0, 44], vec![]], true, &events).unwrap();
+    assert_eq!(outcome, WaitOutcome::Ended);
+    assert_eq!(events.into_inner(), ["list [0, 44]", "wait [44]", "list []"]);
+}
+
+#[test]
+fn a_wait_that_fails_is_an_error_and_is_not_looked_past() {
+    let events = RefCell::new(Vec::new());
+    assert!(run_wait_until_ended(NO_BOUND, vec![vec![11], vec![]], false, &events).is_err());
+    assert_eq!(events.into_inner(), ["list [11]", "wait [11]"]);
+}
+
 // Stopping a real task (Elevated, CI only) -----
 
 /// Elevated (CI only).
@@ -317,6 +408,40 @@ fn stop_instances_returns_after_the_instance_process_has_exited_and_leaves_the_t
         !crate::provision::schtasks::xml_is_disabled(&enabled_xml),
         "{enabled_xml}"
     );
+}
+
+/// Elevated (CI only). A task registered as a service account (SYSTEM) with no trigger and started on demand:
+/// the wait returns once its instance has no process left, so what the process writes last is there, and the
+/// task has no instance afterwards.
+#[test]
+fn a_system_task_is_registered_run_and_waited_for_until_its_process_has_exited() {
+    let task = ThrowawayTask::new("system-wait");
+    let cmd = PathBuf::from(r"C:\Windows\System32\cmd.exe");
+    let marker = std::env::temp_dir().join(format!("sb-system-wait-{}.txt", std::process::id()));
+    let _ = std::fs::remove_file(&marker);
+    let xml = format!(
+        r#"<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <Principals><Principal id="System"><UserId>S-1-5-18</UserId><RunLevel>HighestAvailable</RunLevel></Principal></Principals>
+  <Settings><MultipleInstancesPolicy>Queue</MultipleInstancesPolicy><ExecutionTimeLimit>PT0S</ExecutionTimeLimit></Settings>
+  <Actions Context="System"><Exec><Command>{}</Command><Arguments>{}</Arguments></Exec></Actions>
+</Task>
+"#,
+        cmd.display(),
+        crate::provision::schtasks::xml_escape(&format!("/c echo done> \"{}\"", marker.display()))
+    );
+    register_system_task(&task.0, &xml, "D:P(A;;FA;;;SY)(A;;FA;;;BA)").unwrap();
+    run_task(&task.0).unwrap();
+
+    let outcome = wait_for_instances(&task.0, &cmd).unwrap();
+    let written = std::fs::read_to_string(&marker);
+    let _ = std::fs::remove_file(&marker);
+    assert_eq!(outcome, WaitOutcome::Ended);
+    assert_eq!(
+        written.expect("the task's process wrote before the wait ended").trim(),
+        "done"
+    );
+    assert!(!has_running_instance(&task.0).unwrap(), "no instance is left");
 }
 
 /// Elevated (CI only).

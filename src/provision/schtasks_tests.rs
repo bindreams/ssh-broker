@@ -59,6 +59,52 @@ fn agent_xml_names_no_user_and_no_logon_type() {
 }
 
 #[test]
+fn apply_sshd_xml_runs_the_verb_as_system_with_no_trigger() {
+    let xml = apply_sshd_task_xml(r"C:\ProgramData\ssh-broker\ssh-broker.exe");
+    assert!(xml.contains("<UserId>S-1-5-18</UserId>"), "SYSTEM, by its SID");
+    assert!(xml.contains("<RunLevel>HighestAvailable</RunLevel>"));
+    assert!(
+        !xml.contains("Trigger"),
+        "a task with no trigger runs nothing by itself, only when `apply` starts it"
+    );
+    assert!(xml.contains(r"<Command>C:\ProgramData\ssh-broker\ssh-broker.exe</Command>"));
+    assert!(xml.contains("<Arguments>apply-sshd</Arguments>"));
+    assert!(xml.contains(r#"encoding="UTF-16""#));
+}
+
+#[test]
+fn apply_sshd_xml_queues_a_second_run_and_never_restarts_a_failed_one() {
+    let xml = apply_sshd_task_xml(r"C:\x.exe");
+    assert!(
+        xml.contains("<MultipleInstancesPolicy>Queue</MultipleInstancesPolicy>"),
+        "an `apply` over a task that still runs waits its turn, and the run it asked for happens"
+    );
+    assert!(
+        !xml.contains("RestartOnFailure"),
+        "a failed run is reported by its report; a restart would restart sshd again"
+    );
+    assert!(
+        xml.contains("<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>"),
+        "no time limit"
+    );
+    assert!(xml.contains("<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>"));
+    assert!(xml.contains("<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>"));
+}
+
+#[test]
+fn the_other_tasks_keep_their_settings() {
+    let agent = agent_task_xml(r"C:\x.exe");
+    assert!(agent.contains("<RestartOnFailure><Interval>PT1M</Interval><Count>3</Count></RestartOnFailure>"));
+    assert!(agent.contains("<MultipleInstancesPolicy>Parallel</MultipleInstancesPolicy>"));
+}
+
+#[test]
+fn apply_sshd_xml_escapes_special_chars() {
+    let xml = apply_sshd_task_xml(r"C:\a&b\x.exe");
+    assert!(xml.contains("a&amp;b"));
+}
+
+#[test]
 fn xml_file_bytes_is_utf16le_with_bom() {
     let xml = agent_task_xml("C:\\x.exe");
     let bytes = xml_file_bytes(&xml);

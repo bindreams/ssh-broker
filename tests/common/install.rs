@@ -105,8 +105,9 @@ impl Drop for ResetAtTheEnd {
 
 // the install =====
 
-/// Puts the machine back as `capture` found it: the real tasks, the install directory, sshd's DefaultShell values
-/// and sshd's configuration files.
+/// Puts the machine back as `capture` found it: the real tasks (the agent task and the task of `apply`'s sshd
+/// step), the install directory with the sshd step's report, sshd's DefaultShell values and sshd's configuration
+/// files.
 pub struct Install {
     exported: Option<PathBuf>,
     /// The system `Path` value as it was, and whether its registry type expands; `None` when it was not a string
@@ -142,6 +143,11 @@ impl Install {
 impl Drop for Install {
     fn drop(&mut self) {
         let canonical = provision::canonical_exe();
+        // The sshd step's task, which an `apply` that was ended leaves behind: it runs to its end first (it
+        // restarts sshd, and holds the exe the directory is removed with), then it is deleted. Its report is in
+        // the install directory, which goes below.
+        let _ = taskscheduler::wait_for_instances(schtasks::APPLY_SSHD_TASK, &canonical);
+        let _ = desktop::output(Command::new("schtasks").args(["/Delete", "/TN", schtasks::APPLY_SSHD_TASK, "/F"]));
         let _ = taskscheduler::stop_instances(schtasks::AGENT_TASK, &canonical);
         let _ = desktop::output(Command::new("schtasks").args(["/Delete", "/TN", schtasks::AGENT_TASK, "/F"]));
         if let Ok(agents) = procwait::background_agents(&canonical) {

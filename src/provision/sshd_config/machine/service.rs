@@ -20,7 +20,7 @@ use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Context;
-use windows::Win32::Foundation::{ERROR_SERVICE_NOTIFY_CLIENT_LAGGING, WAIT_OBJECT_0};
+use windows::Win32::Foundation::ERROR_SERVICE_NOTIFY_CLIENT_LAGGING;
 use windows::Win32::System::Services::{
     ControlService, NotifyServiceStatusChangeW, OpenSCManagerW, OpenServiceW, QueryServiceStatusEx, SC_MANAGER_CONNECT,
     SC_STATUS_PROCESS_INFO, SERVICE_CONTINUE_PENDING, SERVICE_CONTROL_STOP, SERVICE_NOTIFY, SERVICE_NOTIFY_2W,
@@ -28,11 +28,10 @@ use windows::Win32::System::Services::{
     SERVICE_PAUSE_PENDING, SERVICE_PAUSED, SERVICE_QUERY_STATUS, SERVICE_RUNNING, SERVICE_START, SERVICE_START_PENDING,
     SERVICE_STATUS, SERVICE_STATUS_PROCESS, SERVICE_STOP, SERVICE_STOP_PENDING, SERVICE_STOPPED, StartServiceW,
 };
-use windows::Win32::System::Threading::{INFINITE, SleepEx, WaitForSingleObject};
+use windows::Win32::System::Threading::{INFINITE, SleepEx};
 use windows::core::{PCWSTR, w};
 
 use super::{ScHandle, service_process};
-use crate::provision::procwait::Process;
 use crate::provision::sshd_config::restart::{ExitCodes, ServiceState, StartOutcome, StartReply, StopOutcome};
 
 /// The states a registration is made for: the settled ones. A registration made while the service is starting
@@ -137,7 +136,7 @@ impl SshdService {
             Ok(Settled {
                 state: ServiceState::Stopped,
                 ..
-            }) => match held.map(|process| wait_for_exit(&process)).transpose() {
+            }) => match held.map(|process| process.wait_for_exit()).transpose() {
                 Ok(_) => StopOutcome::Stopped,
                 Err(e) => StopOutcome::Unknown {
                     cause: format!("{e:#}"),
@@ -178,18 +177,6 @@ impl SshdService {
 /// What the service manager answered, as it says it.
 fn reply_text(error: std::io::Error) -> String {
     format!("{error}")
-}
-
-/// Wait, with no bound, for the process to exit: the kernel ends it, and nothing here can hurry that.
-fn wait_for_exit(process: &Process) -> anyhow::Result<()> {
-    // SAFETY: the handle is open with SYNCHRONIZE for as long as `process` is.
-    let waited = unsafe { WaitForSingleObject(process.handle(), INFINITE) };
-    anyhow::ensure!(
-        waited == WAIT_OBJECT_0,
-        "waiting for the process of the sshd service ({}) to exit failed",
-        process.pid
-    );
-    Ok(())
 }
 
 /// The service manager and the sshd service on it, opened with `access` to the service.
