@@ -4,15 +4,20 @@
 //!
 //! The scenario is the one `prompt_path_windows` runs (a fresh account, the shim on a console of its own,
 //! the password at the prompt, the background agent's PowerShell as the shell), repeated until a typed line
-//! is not answered. Every typed line is bounded, and around each the I/O counters of every process on the
-//! path of a key (the helper, its two `conhost`s, the shim, the agent, the agent's `conhost`, the shell) are
-//! read, so that a stalled line shows which process's reads and writes did not move. The test only observes:
-//! it lists processes, reads their counters and the logs, and types into its own session.
+//! is not answered. After the login and the first answer, the I/O counters of every process on the path of a
+//! key (the helper, its two `conhost`s, the shim, the agent, the agent's `conhost`, the shell) are read once,
+//! as the baseline. Then each line is typed the moment the answer to the one before has been read, with
+//! nothing else done between lines: a walk of the processes costs tens of milliseconds, and a line typed
+//! after that pause was never lost. The counters are read again only when a line is not answered (and once at
+//! the end of a repetition that had no stall), and are compared with the key-event bytes typed since the
+//! baseline: each process on the path should show those bytes read or written, and the first that does not
+//! shows where the bytes stopped. The test only observes: it lists processes, reads their counters and the
+//! logs, and types into its own session.
 #![cfg(windows)]
 
 use std::fmt::Write as _;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use ssh_broker::socket_loc::SocketLocation;
 use ssh_broker::vtinput::{KeyEvent, encode_key_event};
@@ -48,13 +53,10 @@ use account_fixture::Account;
 use pty_client::PtyRun;
 use stand_in::Kit;
 
-/// How many fresh-account repetitions to run at most: about 12 minutes at the 15 to 40 s one takes.
+/// How many fresh-account repetitions to run at most.
 const REPETITIONS: usize = 20;
-/// The first repetitions give the normal picture of what a line costs each process; their per-line counters
-/// are printed. A later repetition's are printed only if it is the one that stalled.
-const NORMAL_PICTURE: usize = 3;
-/// Lines typed after the first answered one, before `exit`.
-const EXTRA_LINES: usize = 3;
+/// Lines typed after the baseline, each at once after the answer to the one before, before `exit`.
+const MARKER_LINES: usize = 40;
 
 /// What the prompt says first, as in `prompt_path_windows`.
 const PROMPT: &str = "Enter your Windows password to start one.";
@@ -63,8 +65,6 @@ const SHELL_PROMPT: &str = "PS C:\\";
 /// The first line the prompt tests type at the shell: PSReadLine out, so the host's own reader reads on.
 const REMOVE_MODULE: &str =
     "Remove-Module PSReadLine -ErrorAction SilentlyContinue; Write-Output ('psreadline' + '-off')";
-/// The line that stalled in round 1's real tests: long, typed at once after the first answer.
-const PROFILE_LINE: &str = "Write-Output ('profile=' + $env:USERPROFILE + '.')";
 
 // The record -----
 
@@ -72,11 +72,10 @@ const PROFILE_LINE: &str = "Write-Output ('profile=' + $env:USERPROFILE + '.')";
 #[derive(Default)]
 struct Record {
     text: String,
-    /// What the running repetition has noted; moved to `text` when the repetition is one to print.
+    /// What the running repetition has noted; moved to `text` when the repetition ends.
     pending: String,
-    /// Lines typed in all, and in the running repetition.
+    /// Lines typed in all.
     lines_typed: usize,
-    in_repetition: usize,
     /// Where the first stall came, once it has.
     stall: Option<String>,
 }
@@ -100,9 +99,76 @@ enum Verdict {
 
 /// A typed line that was not answered, and what the fixture said when it gave up.
 struct Stalled {
+    /// Its place among the lines typed in the repetition, from 1.
     number: usize,
-    label: &'static str,
+    /// The line as the record shows it: its text, except for the password.
+    shown: String,
     why: String,
+}
+
+/// The counters of the processes on the path at one moment, and the key-event bytes typed before it.
+struct Baseline {
+    typed: usize,
+    counters: Vec<Counters>,
+}
+
+/// What a repetition has typed, for comparing with the counters.
+#[derive(Default)]
+struct Session {
+    /// Lines typed, the stalled one included.
+    lines: usize,
+    /// Bytes of key events typed since the session began, the stalled line included.
+    typed: usize,
+    /// Taken after the first answer; `None` before it.
+    baseline: Option<Baseline>,
+}
+
+impl Session {
+    /// Type `text` as a line (`shown` is what the record says it was) and wait, bounded, for `wait` to see its
+    /// answer. Nothing else is done, so that the next line can follow at once.
+    fn type_line(
+        &mut self,
+        run: &mut PtyRun,
+        shown: &str,
+        text: &str,
+        wait: impl FnOnce(&mut PtyRun),
+    ) -> Result<(), Stalled> {
+        self.lines += 1;
+        self.typed += key_bytes(text) + enter_bytes();
+        bounded(run, |run| {
+            run.type_line(text);
+            wait(run);
+        })
+        .map_err(|why| Stalled {
+            number: self.lines,
+            shown: shown.to_owned(),
+            why,
+        })
+    }
+
+    /// Where the typed bytes and the counters are measured from.
+    fn since(&self) -> &'static str {
+        if self.baseline.is_some() {
+            "the baseline, taken after the first answer"
+        } else {
+            "the session's start (no baseline yet; each process's totals are since it began)"
+        }
+    }
+
+    /// Bytes of key events typed since the baseline (the session's start, if there is none).
+    fn typed_since_baseline(&self) -> usize {
+        self.typed - self.baseline.as_ref().map_or(0, |baseline| baseline.typed)
+    }
+
+    /// What each process's counters rose by since the baseline, as of `now`.
+    fn counters_since_baseline(&self, now: &[Counters]) -> String {
+        counters_delta(
+            self.baseline
+                .as_ref()
+                .map_or(&[][..], |baseline| baseline.counters.as_slice()),
+            now,
+        )
+    }
 }
 
 /// Elevated (CI only). Fails on purpose; read the panic text.
@@ -121,12 +187,9 @@ fn typed_keys_loss_measurement() {
     for n in 1..=REPETITIONS {
         ran = n;
         record.pending.clear();
-        record.in_repetition = 0;
         let verdict = catch_unwind(AssertUnwindSafe(|| repetition(n, &mut record)));
-        if n <= NORMAL_PICTURE || !matches!(verdict, Ok(Verdict::Worked)) {
-            let pending = std::mem::take(&mut record.pending);
-            record.line(pending);
-        }
+        let pending = std::mem::take(&mut record.pending);
+        record.line(pending);
         match verdict {
             Ok(Verdict::Worked) => {}
             Ok(Verdict::Failed) => break,
@@ -159,89 +222,91 @@ fn repetition(n: usize, record: &mut Record) -> Verdict {
     ));
     let mut run = start_run(&kit, &account);
     run.read_until(PROMPT);
-    match typed_lines(record, &mut run, &account, &location) {
+    let mut session = Session::default();
+    let typed = typed_lines(record, &mut session, &mut run, &account, &location);
+    record.lines_typed += session.lines;
+    match typed {
         Ok(()) => Verdict::Worked,
         Err(stalled) => {
             record.stall = Some(format!(
                 "line {} ({}) of repetition {n}, the {}th line typed in all",
-                stalled.number, stalled.label, record.lines_typed
+                stalled.number, stalled.shown, record.lines_typed
             ));
-            at_stall(record, &mut run, &account, &location, &stalled.why);
+            at_stall(record, &mut run, &account, &location, &session, &stalled);
             Verdict::Failed
         }
     }
 }
 
-/// The lines of a repetition, each at once after the answer to the one before; the first stalled one ends it.
+/// The lines of a repetition. The login and the first answer come first, and then the counters are read once;
+/// the marker lines follow, each typed the moment the previous answer has been read. The first line that is
+/// not answered ends the repetition.
 fn typed_lines(
     record: &mut Record,
+    session: &mut Session,
     run: &mut PtyRun,
     account: &Account,
     location: &SocketLocation,
 ) -> Result<(), Stalled> {
-    typed_line(record, run, account, "password", &account.password, |_| {
+    session.type_line(run, "(the password)", &account.password, |_| {
         stand_in::wait_for_serving_marker_of_a_task(location, stand_in::SERVING_BOUND);
     })?;
     run.read_until(SHELL_PROMPT);
-    typed_line(record, run, account, "remove-module", REMOVE_MODULE, |run| {
+    session.type_line(run, REMOVE_MODULE, REMOVE_MODULE, |run| {
         run.read_until("psreadline-off");
     })?;
-    typed_line(record, run, account, "profile", PROFILE_LINE, |run| {
-        run.read_until("profile=C:");
-    })?;
-    for k in 1..=EXTRA_LINES {
-        let marker = format!("marker-{k}");
-        let line = format!("Write-Output ('marker' + '-{k}')");
-        typed_line(record, run, account, "marker", &line, |run| run.read_until(&marker))?;
+    session.baseline = Some(Baseline {
+        typed: session.typed,
+        counters: path_counters(account),
+    });
+    for k in 1..=MARKER_LINES {
+        // Two digits, so that no marker is the start of another: the console's text is never consumed.
+        let marker = format!("marker-{k:02}");
+        let line = format!("Write-Output ('marker' + '-{k:02}')");
+        session.type_line(run, &line, &line, |run| run.read_until(&marker))?;
     }
-    typed_line(record, run, account, "exit", "exit", |run| {
+    record.note(format!(
+        "no stall in the {MARKER_LINES} marker lines; {} bytes of key events typed since the baseline; \
+         change in each process's I/O counters since it, at {} UTC: {}",
+        session.typed_since_baseline(),
+        clock(now_filetime()),
+        one_line(&session.counters_since_baseline(&path_counters(account)))
+    ));
+    session.type_line(run, "exit", "exit", |run| {
         run.finish();
     })
 }
 
-/// Type `text` as a line and wait, bounded, for `wait` to see its answer; note what each process on the path
-/// did with it. `label` is for the record: the password is never printed.
-fn typed_line(
+/// `rows` of `counters_delta`, on one line.
+fn one_line(rows: &str) -> String {
+    rows.lines().map(str::trim).collect::<Vec<_>>().join(" | ")
+}
+
+/// What is recorded once a line is not answered: the line, the key-event bytes typed since the baseline and
+/// what each process's counters rose by since it, the fixture's report (the console text, and the process
+/// tree with thread wait reasons), whether later keys are echoed, the counters over that probe, and the logs.
+fn at_stall(
     record: &mut Record,
     run: &mut PtyRun,
     account: &Account,
-    label: &'static str,
-    text: &str,
-    wait: impl FnOnce(&mut PtyRun),
-) -> Result<(), Stalled> {
-    record.lines_typed += 1;
-    record.in_repetition += 1;
-    let number = record.in_repetition;
-    let sent = key_bytes(text) + enter_bytes();
-    let before = path_counters(account);
-    let wrote = run.bytes().len();
-    let typed_at = clock(now_filetime());
-    let started = Instant::now();
-    let outcome = bounded(run, |run| {
-        run.type_line(text);
-        wait(run);
-    });
-    let took = started.elapsed().as_millis();
-    let after = path_counters(account);
-    let verdict = if outcome.is_ok() {
-        format!("answered after {took} ms")
-    } else {
-        format!("NOT answered: the fixture gave up after {took} ms")
-    };
+    location: &SocketLocation,
+    session: &Session,
+    stalled: &Stalled,
+) {
+    let why = stalled.why.as_str();
+    let now = path_counters(account);
     record.note(format!(
-        "line {number} ({label}; {} characters, {sent} bytes of key events) typed at {typed_at} UTC; {verdict}; \
-         the console wrote {} more bytes; change in each process's I/O counters over the line:\n{}",
-        text.chars().count(),
-        run.bytes().len().saturating_sub(wrote),
-        counters_delta(&before, &after)
+        "\n== THE STALL at {} UTC: line {} of the repetition, {:?}; {} bytes of key events typed since {}, \
+         the stalled line included ({} lines typed in the repetition); change in each process's I/O counters since then:\n{}",
+        clock(now_filetime()),
+        stalled.number,
+        stalled.shown,
+        session.typed_since_baseline(),
+        session.since(),
+        session.lines,
+        session.counters_since_baseline(&now)
     ));
-    outcome.map_err(|why| Stalled { number, label, why })
-}
-
-/// What is recorded once a line is not answered: the fixture's report (the console text, and the process tree
-/// with thread wait reasons), whether later keys are echoed, the counters over that probe, and the logs.
-fn at_stall(record: &mut Record, run: &mut PtyRun, account: &Account, location: &SocketLocation, why: &str) {
-    record.note(format!("\n== THE STALL, as the fixture reported it:\n{why}"));
+    record.note(format!("as the fixture reported it:\n{why}"));
     if !why.contains("process tree:") {
         let tree = helper_of(account).map_or_else(
             || "the helper is gone".to_owned(),
@@ -249,15 +314,14 @@ fn at_stall(record: &mut Record, run: &mut PtyRun, account: &Account, location: 
         );
         record.note(format!("process tree:\n{tree}"));
     }
-    let before_probe = path_counters(account);
     let probed = catch_unwind(AssertUnwindSafe(|| typing_probe(record, run)));
     if let Err(panic) = probed {
         record.note(format!("the typing probe panicked: {}", panic_text(&panic)));
     }
     let after_probe = path_counters(account);
     record.note(format!(
-        "change in each process's I/O counters over the whole typing probe:\n{}",
-        counters_delta(&before_probe, &after_probe)
+        "change in each process's I/O counters from the stall's reading to the end of the typing probe:\n{}",
+        counters_delta(&now, &after_probe)
     ));
     record.note(format!(
         "the logs (agent.log, shim.log), at {} UTC:\n{}",
@@ -380,10 +444,10 @@ fn counters_delta(before: &[Counters], after: &[Counters]) -> String {
             (Err(why), _) => format!("counters unreadable: {why}"),
             (Ok(now), Some(Ok(was))) => rise(was, now),
             (Ok(now), None) => format!(
-                "appeared during the line; its totals: {}",
+                "not in the earlier reading; its totals: {}",
                 rise(&IO_COUNTERS::default(), now)
             ),
-            (Ok(_), Some(Err(why))) => format!("counters unreadable before the line: {why}"),
+            (Ok(_), Some(Err(why))) => format!("counters unreadable in the earlier reading: {why}"),
         };
         let _ = writeln!(text, "    pid {} {}: {change}", now.pid, now.label);
     }
@@ -391,7 +455,7 @@ fn counters_delta(before: &[Counters], after: &[Counters]) -> String {
         .iter()
         .filter(|was| was.pid != 0 && !after.iter().any(|now| now.pid == was.pid))
     {
-        let _ = writeln!(text, "    pid {} {}: gone by the end of the line", gone.pid, gone.label);
+        let _ = writeln!(text, "    pid {} {}: gone by the later reading", gone.pid, gone.label);
     }
     if text.is_empty() {
         text.push_str("    no process on the path\n");
