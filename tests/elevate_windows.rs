@@ -357,9 +357,13 @@ fn ctrl_c_ends_a_command_run_without_a_terminal_and_the_session_goes_on() {
     session.leave();
 }
 
-/// Elevated (CI only). With `--terminal` the keys typed reach the command straight (it reads a line and says it),
-/// and when it ends the session's screen is back: its marker is on the screen, no row of the command is, and the
-/// next line runs.
+/// Elevated (CI only). With `--terminal` the keys typed reach the command straight (it reads a line and exits with a
+/// code that says whether it was the line typed), and when it ends the session's screen is back: its marker is on
+/// the screen, no row of the command is, and the next line runs.
+///
+/// What the command read is judged by its exit code, which the session prints afterwards, and not by anything the
+/// command prints: its screen is replaced by the session's the moment it ends, so its last words need not reach the
+/// client at all (seen in CI: the agent delivered them, and sshd's console never showed them).
 #[test]
 fn with_terminal_keys_reach_the_command_and_the_sessions_screen_comes_back() {
     let _machine = machine::exclusive();
@@ -368,10 +372,13 @@ fn with_terminal_keys_reach_the_command_and_the_sessions_screen_comes_back() {
 
     let mut session = admin.terminal_session();
     session.say("SESSION-MARKER");
-    session.type_line("sbk elevate --terminal cmd.exe /v:on /c \"set /p x=ELEVATED-%OS%:& echo got-!x!\"");
+    session.type_line(
+        "sbk elevate --terminal cmd.exe /v:on /c \"set /p x=ELEVATED-%OS%:& if !x!==typed-into-it (exit 42) else \
+         (exit 43)\"; Write-Output ('KEYS-' + $LASTEXITCODE)",
+    );
     session.read_until("ELEVATED-Windows_NT:");
     session.type_line("typed-into-it");
-    session.read_until("got-typed-into-it");
+    session.read_until("KEYS-42");
     session.say("NEXT-LINE-RAN");
 
     let shown = rendered(&session.transcript, SCROLLBACK);
@@ -380,12 +387,10 @@ fn with_terminal_keys_reach_the_command_and_the_sessions_screen_comes_back() {
         visible.contains("SESSION-MARKER"),
         "the session's screen did not come back:\n{visible}"
     );
-    for row_of_the_command in ["ELEVATED-Windows_NT:", "got-typed-into-it"] {
-        assert!(
-            !shown.rows().iter().any(|row| row.contains(row_of_the_command)),
-            "a row of the command is left on the screen ({row_of_the_command:?}):\n{visible}"
-        );
-    }
+    assert!(
+        !shown.rows().iter().any(|row| row.contains("ELEVATED-Windows_NT:")),
+        "a row of the command is left on the screen:\n{visible}"
+    );
     session.leave();
 }
 
