@@ -602,6 +602,12 @@ impl ConnTx {
         &self.0
     }
 
+    /// A second write half of the same connection: both halves write to the one socket, so the caller
+    /// serialises them (keeps one quiet while the other writes), as it did before.
+    pub fn share(&self) -> ConnTx {
+        ConnTx(self.0.clone())
+    }
+
     /// Send FIN on the write half. Dropping a share does not FIN while another share is held, so
     /// without an explicit shutdown the peer would block forever and never observe `PeerClosed`.
     pub fn shutdown_write(&self) -> anyhow::Result<()> {

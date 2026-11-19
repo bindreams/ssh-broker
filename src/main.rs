@@ -22,7 +22,7 @@ fn main() -> anyhow::Result<()> {
             std::process::exit(2);
         }
         Route::Logout => logout_command(),
-        Route::Elevate(args) => elevate_command(&args),
+        Route::Elevate { terminal, command } => elevate_command(terminal, &command),
         Route::AutoLogin(None) => {
             eprintln!("usage: ssh-broker auto-login on|off [<account>]");
             std::process::exit(2);
@@ -77,12 +77,12 @@ fn logout_command() -> anyhow::Result<()> {
 }
 
 #[cfg(windows)]
-fn elevate_command(args: &[String]) -> anyhow::Result<()> {
-    ssh_broker::elevate::run(args)
+fn elevate_command(terminal: bool, args: &[String]) -> anyhow::Result<()> {
+    ssh_broker::elevate::run(terminal, args)
 }
 
 #[cfg(not(windows))]
-fn elevate_command(_args: &[String]) -> anyhow::Result<()> {
+fn elevate_command(_terminal: bool, _args: &[String]) -> anyhow::Result<()> {
     anyhow::bail!("elevate runs a command in a Windows session and runs only on Windows")
 }
 

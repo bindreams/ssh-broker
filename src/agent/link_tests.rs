@@ -2,7 +2,6 @@
 //! agent. A wait is observed by the callback `deliver_observed` makes before it parks, never by a delay.
 use super::super::test_wire::{Recorder, Wire};
 use super::*;
-use crate::pipes::ExecChild;
 use crate::protocol::{ExitCode, FrameKind, Resize, Stream};
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
@@ -81,12 +80,12 @@ fn no_session_byte_is_written_while_elevated_and_none_of_the_elevated_after() {
     assert_eq!(wire.data(), ["Pbefore", "Pelevated", "Pheld", "Pafter"]);
 }
 
-/// Without a terminal the session's streams and the command's are separate pipes: neither waits for the other.
+/// Without a terminal nothing waits for a carrier: the streams are separate pipes, and a gate there could deadlock a
+/// pipeline that waits on what it gates.
 #[test]
 fn without_a_terminal_no_carrier_waits() {
     let wire = Wire::default();
     let link = Link::new(wire.clone(), false, (0, 0), None);
-    let _guard = link.host_elevated(Arc::new(Recorder::default()));
     link.deliver(Carrier::Session, Stream::Stdout, b"session").unwrap();
     link.deliver(Carrier::Elevated, Stream::Stderr, b"elevated").unwrap();
     assert_eq!(wire.data(), ["Osession", "Eelevated"]);
@@ -162,12 +161,23 @@ fn the_size_at_the_switch_is_applied_to_the_new_target() {
     assert_eq!(elevated.events(), ["resize 120x30"]);
 }
 
+/// Resizing a pseudoconsole to the size it has makes it repaint its whole screen: that is how the session's screen
+/// comes back after the command's.
 #[test]
-fn a_switch_back_does_not_resize_a_session_whose_size_did_not_change() {
+fn the_switch_back_gives_the_session_its_size_even_unchanged() {
     let (wire, session) = (Wire::default(), Arc::new(Recorder::default()));
     let link = terminal_link(&wire, &session);
     drop(link.host_elevated(Arc::new(Recorder::default())));
-    assert!(session.events().is_empty(), "{:?}", session.events());
+    assert_eq!(session.events(), ["resize 80x24"]);
+}
+
+/// A link without a terminal has no screen to hand over: the session's `decide` refuses that request.
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "without a terminal")]
+fn hosting_a_command_on_a_link_without_a_terminal_is_a_bug() {
+    let link = Link::new(Wire::default(), false, (0, 0), None);
+    let _guard = link.host_elevated(Arc::new(Recorder::default()));
 }
 
 #[test]
@@ -190,51 +200,4 @@ fn input_and_resize_are_routed_while_an_output_write_is_blocked() {
     gate.release();
     writer.join().unwrap().unwrap();
     assert_eq!(wire.data(), ["Pstuck"]);
-}
-
-// The elevated command's processes -----
-
-/// A command that waits for input that never comes (the child holds its stdin open), on pipes of its own, in a job
-/// of its own.
-fn waiting_child() -> ExecChild {
-    ExecChild::spawn("findstr.exe x", None, None, &[]).expect("start a command that waits")
-}
-
-#[test]
-fn reap_all_ends_both_trees() {
-    let (wire, session) = (Wire::default(), Arc::new(Recorder::default()));
-    let link = terminal_link(&wire, &session);
-    let (of_session, of_elevated) = (waiting_child(), waiting_child());
-    let _adopted = link.adopt_job(of_elevated.job());
-
-    assert!(link.reap_all(&of_session.job()));
-    of_session.wait().expect("the session's command was ended");
-    of_elevated.wait().expect("the adopted command was ended");
-}
-
-#[test]
-fn a_job_adopted_after_the_end_is_ended_at_once() {
-    let (wire, session) = (Wire::default(), Arc::new(Recorder::default()));
-    let link = terminal_link(&wire, &session);
-    link.end();
-    let late = waiting_child();
-    let _adopted = link.adopt_job(late.job());
-    late.wait().expect("the command adopted after the end was ended");
-}
-
-#[test]
-fn a_job_adopted_after_a_reap_is_ended_at_once_and_a_released_job_is_not_reaped_again() {
-    let (wire, session) = (Wire::default(), Arc::new(Recorder::default()));
-    let link = terminal_link(&wire, &session);
-    let released = waiting_child();
-    drop(link.adopt_job(released.job()));
-    assert_eq!(link.adopted(), 0, "a job is forgotten when its guard drops");
-
-    let own = waiting_child();
-    assert!(link.reap_all(&own.job()));
-    own.wait().unwrap();
-    let late = waiting_child();
-    let _adopted = link.adopt_job(late.job());
-    late.wait().expect("the command adopted after the reap was ended");
-    drop(released);
 }

@@ -12,11 +12,14 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use super::link::{Carrier, Link};
 use super::{
-    ExecStarter, HandleWriter, ParkSignal, PtyStarter, PtyTarget, reap_tree, spawn_stream_pump, teardown_warning,
+    ExecStarter, HandleWriter, HangupGuard, ParkSignal, PtyStarter, PtyTarget, prepare_hangup_watch, reap_tree,
+    spawn_stream_pump, start_hangup_watch, teardown_warning,
 };
+use crate::afunix::ConnTx;
 use crate::conpty;
+use crate::hangup::HangupWatcher;
 use crate::offer::text;
-use crate::protocol::{ElevationPolicy, SESSION_VARIABLE, SessionId, Stream};
+use crate::protocol::{ElevationPolicy, ElevationRequest, SESSION_VARIABLE, SessionId, Stream};
 
 // Whether a request is allowed =====
 
@@ -30,16 +33,18 @@ pub(super) enum Verdict {
 }
 
 /// What `policy` allows when a program of the session asks to run a command elevated, in a session with or without
-/// a terminal. `Never` and `Always` refuse (the second because a session that asked for `always` runs at High,
-/// where `elevate` runs the command in place and asks nobody: a request for it that reaches the agent comes from a
-/// process below High somewhere else in the account); `AutoApprove` runs it; `Prompt` is the question the next unit
-/// builds, and refuses with a sentence that says so.
-pub(super) fn decide(policy: ElevationPolicy, has_terminal: bool) -> Verdict {
-    let _ = has_terminal;
+/// a terminal (`has_terminal`), with a screen of its own or not (`terminal`: `elevate --terminal`). `Never` and
+/// `Always` refuse (the second because a session that asked for `always` runs at High, where `elevate` runs the
+/// command in place and asks nobody: a request for it that reaches the agent comes from a process below High
+/// somewhere else in the account). A command that wants a terminal in a session that has none is refused next:
+/// there is no screen to give it. `AutoApprove` runs it; `Prompt` is the question the next unit builds, and refuses
+/// with a sentence that says so.
+pub(super) fn decide(policy: ElevationPolicy, has_terminal: bool, terminal: bool) -> Verdict {
     match policy {
         ElevationPolicy::Never => Verdict::Refuse(text::elevation_never()),
-        ElevationPolicy::AutoApprove => Verdict::Run,
         ElevationPolicy::Always => Verdict::Refuse(text::elevation_already_elevated()),
+        _ if terminal && !has_terminal => Verdict::Refuse(text::elevation_needs_a_terminal()),
+        ElevationPolicy::AutoApprove => Verdict::Run,
         ElevationPolicy::Prompt => Verdict::Refuse(text::elevation_consent_not_built()),
     }
 }
@@ -85,7 +90,7 @@ pub(super) trait Hosted: Send + Sync {
     fn policy(&self) -> ElevationPolicy;
     /// Whether the session has a terminal.
     fn has_terminal(&self) -> bool;
-    /// The session's connection, which an elevated command's output is carried on.
+    /// The session's connection, which the output of a command run with `--terminal` is carried on.
     fn link(&self) -> &Arc<Link>;
     /// How a command for this session is started.
     fn starts(&self) -> &Starts;
@@ -137,43 +142,62 @@ impl Hosted for HostedSession {
 
 // Running the command =====
 
-/// Run `line` elevated, hosted by the agent, for the session whose connection is `link` and whose id is `id`
-/// (which its environment carries, so that the command can itself ask for what a program of the session can), in
-/// `cwd`. Returns its exit code once it has ended.
+/// Run the command of `request` elevated, hosted by the agent, for the session whose connection is `link` and whose
+/// id is `id` (which its environment carries, so that the command can itself ask for what a program of the session
+/// can), in `cwd`. `conn` is the write half of the request's own connection. Returns its exit code once it has ended.
 ///
-/// The command is started directly with the agent's own token. With a terminal it has a pseudoconsole of its own
-/// at the link's size: the connection carries its output and it gets the client's keys while it runs
-/// ([`Link::host_elevated`]), and when it ends the pseudoconsole is closed and drained as a session's is before
-/// the connection goes back to the session. Without one its stdin is closed at once and its stdout and stderr go
-/// to the client as the session's streams do, beside them: the session's own pipes are read meanwhile.
+/// The command is started directly with the agent's own token, in the mode the REQUEST asks for, whatever the
+/// session is:
+///
+/// - by default it runs on pipes, its stdin closed at once, and its stdout and stderr go back on `conn` as the
+///   request's reply, for the `elevate` client to print. The session's connection is not touched;
+/// - with `--terminal` it has a pseudoconsole of its own at the link's size: the session's connection carries its
+///   output and it gets the client's keys while it runs ([`Link::host_elevated`]), and when it ends the
+///   pseudoconsole is closed and drained as a session's is before the connection goes back to the session, which
+///   repaints its screen.
+///
+/// The command lives as long as the request that asked for it, and no longer: `conn` is watched, and a client that
+/// has hung up ends the command's tree. `elevate` is a process of the session, so the session's own end ends it
+/// first.
 pub(super) fn run_hosted(
     link: &Arc<Link>,
-    line: &str,
+    conn: &ConnTx,
+    request: &ElevationRequest,
     cwd: Option<&Path>,
     starts: &Starts,
     id: &SessionId,
 ) -> anyhow::Result<i32> {
     let id = id.to_string();
     let env = [(SESSION_VARIABLE, id.as_str())];
-    if link.has_terminal() {
-        on_a_pseudoconsole(link, line, cwd, starts, &env)
+    if request.terminal {
+        on_a_pseudoconsole(link, conn, &request.command, cwd, starts, &env)
     } else {
-        on_pipes(link, line, cwd, starts, &env)
+        on_pipes(conn, &request.command, cwd, starts, &env)
     }
+}
+
+/// Watch `conn`, the request's connection, for the client going away, and end `job`'s tree when it does.
+fn watch_request(conn: &ConnTx, job: &Arc<cosca::Job>) -> Option<HangupGuard> {
+    start_hangup_watch(prepare_hangup_watch(conn, HangupWatcher::new), job)
 }
 
 fn on_a_pseudoconsole(
     link: &Arc<Link>,
+    conn: &ConnTx,
     line: &str,
     cwd: Option<&Path>,
     starts: &Starts,
     env: &[(&str, &str)],
 ) -> anyhow::Result<i32> {
+    debug_assert!(
+        link.has_terminal(),
+        "decide refuses --terminal in a session without a terminal"
+    );
     let (cols, rows) = link.size();
     let mut session =
         (starts.pty)(line, cols, rows, cwd, None, None, env).map_err(crate::shell::StartError::into_cause)?;
     let job = session.job();
-    let _adopted = link.adopt_job(Arc::clone(&job));
+    let hangup = watch_request(conn, &job);
     let out_raw = session.out_read_raw();
     let hpc = Arc::new(Mutex::new(Some(session.take_hpc_raw())));
     let target = Arc::new(PtyTarget::new(
@@ -200,34 +224,47 @@ fn on_a_pseudoconsole(
     // is joined before the pipe's handles are closed with `session`.
     target.shutdown();
     drop(session);
+    if let Some(hangup) = hangup {
+        hangup.finish();
+    }
     Ok(waited?)
 }
 
+/// The command on pipes, with its output written to `conn`. A [`Link`] without a terminal of the request's own
+/// connection serialises the two streams' writes, so the pump is the session's own.
 fn on_pipes(
-    link: &Arc<Link>,
+    conn: &ConnTx,
     line: &str,
     cwd: Option<&Path>,
     starts: &Starts,
     env: &[(&str, &str)],
 ) -> anyhow::Result<i32> {
+    let output = Link::new(conn.try_clone()?, false, (0, 0), None);
     let mut child = (starts.exec)(line, cwd, None, env).map_err(crate::shell::StartError::into_cause)?;
     let job = child.job();
-    let _adopted = link.adopt_job(Arc::clone(&job));
+    let hangup = watch_request(conn, &job);
     // The command's stdin is closed at once: it is never fed from the session, which is below it.
     drop(child.take_stdin_write());
+    // A write that fails is a client that has gone: the command's tree ends, and the pump goes on reading.
+    let gone = || {
+        let job = Arc::clone(&job);
+        move || {
+            reap_tree(&job);
+        }
+    };
     let out = spawn_stream_pump(
         child.stdout_read_raw(),
         Stream::Stdout,
-        Arc::clone(link),
+        Arc::clone(&output),
         Carrier::Elevated,
-        || {},
+        gone(),
     );
     let err = spawn_stream_pump(
         child.stderr_read_raw(),
         Stream::Stderr,
-        Arc::clone(link),
+        Arc::clone(&output),
         Carrier::Elevated,
-        || {},
+        gone(),
     );
     let waited = child.wait();
     if let Some(w) = teardown_warning(reap_tree(&job)) {
@@ -235,6 +272,9 @@ fn on_pipes(
     }
     let _ = out.join();
     let _ = err.join();
+    if let Some(hangup) = hangup {
+        hangup.finish();
+    }
     Ok(waited?)
 }
 

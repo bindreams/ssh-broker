@@ -11,9 +11,16 @@ const ID: &str = "0001abcdef102030405060708090a0ff";
 
 /// What an agent would send: stderr text (none when empty), then an exit code.
 fn reply(text: &str, code: i32) -> Vec<u8> {
+    reply_with("", text, code)
+}
+
+/// What an agent would send: stdout text and stderr text (none when empty), in that order, then an exit code.
+fn reply_with(stdout: &str, stderr: &str, code: i32) -> Vec<u8> {
     let mut bytes = Vec::new();
-    if !text.is_empty() {
-        write_data(&mut bytes, Stream::Stderr, text.as_bytes()).unwrap();
+    for (stream, text) in [(Stream::Stdout, stdout), (Stream::Stderr, stderr)] {
+        if !text.is_empty() {
+            write_data(&mut bytes, stream, text.as_bytes()).unwrap();
+        }
     }
     write_frame(&mut bytes, FrameKind::Exit, &ExitCode(code).encode()).unwrap();
     bytes
@@ -25,6 +32,7 @@ fn a_request() -> ElevationRequest {
         session: ID.to_owned(),
         command: "whoami".to_owned(),
         cwd: r"C:\work".to_owned(),
+        terminal: false,
     }
 }
 
@@ -93,23 +101,52 @@ fn join_args_quotes_the_command_so_the_agent_gets_what_was_typed() {
         .map(String::from)
         .to_vec();
     let id = SessionId::parse(ID).unwrap();
-    let request = request_for(&id, &args, r"C:\work");
+    let request = request_for(&id, false, &args, r"C:\work");
     assert_eq!(split_args(&request.command), args, "{}", request.command);
     assert_eq!(request.session, ID);
     assert_eq!(request.cwd, r"C:\work");
     assert_eq!(request.version, PROTOCOL_VERSION);
+    assert!(!request.terminal);
     request.check().expect("what the client builds, the agent accepts");
+    assert!(request_for(&id, true, &args, r"C:\work").terminal);
 }
 
 // Asking the agent -----
 
-fn elevate(server_says: Vec<u8>) -> (i32, String, Vec<u8>) {
+/// The exit code, what was printed to stdout and to stderr, and what was sent.
+fn elevate_split(server_says: Vec<u8>) -> (i32, String, String, Vec<u8>) {
     let mut sent = Vec::new();
-    let mut err = Vec::new();
-    let Asked::Code(code) = elevate_on(&mut Cursor::new(server_says), &mut sent, &mut err, &a_request()) else {
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    let asked = elevate_on(
+        &mut Cursor::new(server_says),
+        &mut sent,
+        &mut out,
+        &mut err,
+        &a_request(),
+    );
+    let Asked::Code(code) = asked else {
         panic!("the agent answered, so it was not unanswered");
     };
-    (code, String::from_utf8(err).unwrap(), sent)
+    (
+        code,
+        String::from_utf8(out).unwrap(),
+        String::from_utf8(err).unwrap(),
+        sent,
+    )
+}
+
+fn elevate(server_says: Vec<u8>) -> (i32, String, Vec<u8>) {
+    let (code, _, err, sent) = elevate_split(server_says);
+    (code, err, sent)
+}
+
+#[test]
+fn the_replys_stdout_goes_to_stdout_and_its_stderr_to_stderr() {
+    let (code, out, err, _) = elevate_split(reply_with("the output\r\n", "the errors\r\n", 3));
+    assert_eq!(
+        (code, out.as_str(), err.as_str()),
+        (3, "the output\r\n", "the errors\r\n")
+    );
 }
 
 #[test]
@@ -139,10 +176,16 @@ fn the_commands_code_is_ours_and_a_refusals_text_goes_to_stderr() {
 
 #[test]
 fn a_connection_the_agent_closed_without_a_byte_is_unanswered_and_says_nothing() {
-    let mut err = Vec::new();
-    let asked = elevate_on(&mut Cursor::new(Vec::new()), &mut Vec::new(), &mut err, &a_request());
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    let asked = elevate_on(
+        &mut Cursor::new(Vec::new()),
+        &mut Vec::new(),
+        &mut out,
+        &mut err,
+        &a_request(),
+    );
     assert!(matches!(asked, Asked::Unanswered));
-    assert!(err.is_empty());
+    assert!(out.is_empty() && err.is_empty());
 }
 
 /// An answer `Serving` is for a session's handshake; a request is never answered with one.

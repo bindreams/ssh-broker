@@ -545,13 +545,19 @@ fn a_request() -> ElevationRequest {
         session: "0001abcdef102030405060708090a0ff".to_owned(),
         command: r#"cmd /c echo "a b""#.to_owned(),
         cwd: r"C:\Users\me\work".to_owned(),
+        terminal: false,
     }
 }
 
 #[test]
 fn an_elevation_request_round_trips_and_a_peer_of_another_version_is_refused_by_name() {
-    let request = a_request();
-    assert_eq!(ElevationRequest::decode(&request.encode().unwrap()).unwrap(), request);
+    for terminal in [false, true] {
+        let request = ElevationRequest {
+            terminal,
+            ..a_request()
+        };
+        assert_eq!(ElevationRequest::decode(&request.encode().unwrap()).unwrap(), request);
+    }
 
     // The version is read alone, so a peer whose request has fields this build does not know is refused by its
     // number and not by a decoding failure.

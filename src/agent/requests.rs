@@ -81,8 +81,10 @@ fn refuse(rx: &mut ConnRx, tx: &mut ConnTx, control: &Control, sentence: &str) -
 }
 
 /// Run the command of an `elevate` request, if its session's login allows it, and answer with its exit code, or
-/// refuse. The session is found by the id in the request: that routes the request and proves nothing (a process of
-/// the account can read another's environment), and what it routes is something the login already allowed.
+/// refuse. The command's output goes back on this connection, and the connection is watched while it runs (see
+/// [`run_hosted`]). The session is found by the id in the request: that routes the request and proves nothing (a
+/// process of the account can read another's environment), and what it routes is something the login already
+/// allowed.
 fn elevate(rx: &mut ConnRx, tx: &mut ConnTx, control: &Control, request: &ElevationRequest) -> anyhow::Result<()> {
     let Some(id) = SessionId::parse(&request.session) else {
         return refuse(rx, tx, control, &text::elevation_not_hosted());
@@ -105,7 +107,7 @@ fn elevate(rx: &mut ConnRx, tx: &mut ConnTx, control: &Control, request: &Elevat
     let Some(hosted) = control.await_hosted(&id) else {
         return refuse(rx, tx, control, &text::elevation_not_hosted());
     };
-    if let Verdict::Refuse(sentence) = decide(hosted.policy(), hosted.has_terminal()) {
+    if let Verdict::Refuse(sentence) = decide(hosted.policy(), hosted.has_terminal(), request.terminal) {
         return refuse(rx, tx, control, &sentence);
     }
     let Some(_slot) = hosted.slot().try_take() else {
@@ -117,7 +119,7 @@ fn elevate(rx: &mut ConnRx, tx: &mut ConnTx, control: &Control, request: &Elevat
         let cause = format!("{} is not an existing directory", request.cwd);
         return refuse(rx, tx, control, &text::elevation_cannot_start(&cause));
     }
-    match run_hosted(hosted.link(), &request.command, cwd.as_deref(), hosted.starts(), &id) {
+    match run_hosted(hosted.link(), tx, request, cwd.as_deref(), hosted.starts(), &id) {
         Ok(code) => logout::reply_and_wait(rx, tx, control, "", code),
         Err(cause) => refuse(rx, tx, control, &text::elevation_cannot_start(&format!("{cause:#}"))),
     }

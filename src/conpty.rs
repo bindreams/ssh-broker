@@ -73,17 +73,17 @@ unsafe fn create_pipe_pair() -> windows::core::Result<(OwnedHandle, OwnedHandle)
 }
 
 /// Create the pseudoconsole, trying the full modern flag set and falling back to the base
-/// flags if passthrough is unavailable. The flag says whether the full set was accepted.
-unsafe fn create_pty(size: COORD, in_read: HANDLE, out_write: HANDLE) -> windows::core::Result<(OwnedHpcon, bool)> {
+/// flags if passthrough is unavailable.
+unsafe fn create_pty(size: COORD, in_read: HANDLE, out_write: HANDLE) -> windows::core::Result<OwnedHpcon> {
     let full = PSEUDOCONSOLE_RESIZE_QUIRK | PSEUDOCONSOLE_WIN32_INPUT_MODE | PSEUDOCONSOLE_PASSTHROUGH_MODE;
-    let (hpc, passthrough) = match unsafe { CreatePseudoConsole(size, in_read, out_write, full) } {
-        Ok(h) => (h, true),
+    let hpc = match unsafe { CreatePseudoConsole(size, in_read, out_write, full) } {
+        Ok(h) => h,
         Err(_) => {
             let base = PSEUDOCONSOLE_RESIZE_QUIRK | PSEUDOCONSOLE_WIN32_INPUT_MODE;
-            (unsafe { CreatePseudoConsole(size, in_read, out_write, base)? }, false)
+            unsafe { CreatePseudoConsole(size, in_read, out_write, base)? }
         }
     };
-    Ok((OwnedHpcon(hpc), passthrough))
+    Ok(OwnedHpcon(hpc))
 }
 
 /// Write the whole buffer to `handle`, looping on the returned byte count. Returns false
@@ -141,8 +141,6 @@ pub fn close_pty_raw(hpc_raw: isize) {
 /// and the parent's input-write / output-read pipe ends.
 pub struct PtySession {
     hpc: Option<OwnedHpcon>,
-    /// The pseudoconsole was made with `PSEUDOCONSOLE_PASSTHROUGH_MODE`.
-    passthrough: bool,
     process: OwnedHandle,
     /// Kernel-enforced containment for the shell and everything it spawns. Teardown always
     /// reaps the whole tree; a normal exit is no different from a disconnect here, for the
@@ -177,7 +175,7 @@ impl PtySession {
             let (out_read, out_write) = create_pipe_pair()?;
 
             // The pseudoconsole owns the child-side ends; the parent keeps in_write+out_read.
-            let (hpc, passthrough) = create_pty(size, in_read.0, out_write.0)?;
+            let hpc = create_pty(size, in_read.0, out_write.0)?;
             drop(in_read);
             drop(out_write);
 
@@ -202,7 +200,6 @@ impl PtySession {
 
             Ok(PtySession {
                 hpc: Some(hpc),
-                passthrough,
                 process,
                 _thread: thread,
                 job: std::sync::Arc::new(job),
@@ -210,12 +207,6 @@ impl PtySession {
                 out_read,
             })
         }
-    }
-
-    /// Whether the pseudoconsole was made with `PSEUDOCONSOLE_PASSTHROUGH_MODE`: the full flag set was accepted. Without
-    /// it `create_pty` fell back to the base flags, which it does without a word.
-    pub fn passthrough(&self) -> bool {
-        self.passthrough
     }
 
     /// Raw output-read handle (as `isize`) for the agent's reader thread.

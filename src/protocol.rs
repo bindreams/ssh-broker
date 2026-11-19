@@ -339,6 +339,9 @@ pub struct ElevationRequest {
     pub command: String,
     /// The working directory to run it in.
     pub cwd: String,
+    /// `elevate --terminal`: the command gets a pseudoconsole of its own that owns the session's screen while it
+    /// runs. Otherwise its input is closed and its output comes back on this connection.
+    pub terminal: bool,
 }
 
 impl ElevationRequest {

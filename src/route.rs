@@ -28,8 +28,12 @@ pub enum Route {
     /// Hidden: what the task `apply` hands the sshd step to runs: `provision::apply_sshd`.
     ApplySshd,
     Verify,
-    /// `elevate <command> [arguments]`: run the command elevated (the arguments after the verb, not empty).
-    Elevate(Vec<String>),
+    /// `elevate [--terminal] <command> [arguments]`: run the command elevated (`command` is the arguments after the
+    /// verb, and the flag if it is first; not empty). `--terminal` gives the command a screen of its own.
+    Elevate {
+        terminal: bool,
+        command: Vec<String>,
+    },
     /// Hidden: the parity-probe child the agent spawns in session 1 (used by `verify`).
     VerifyProbe(ProbeLink),
     /// Hidden: the fallback shell of a terminal session through the agent. `handle` is the value of
@@ -106,8 +110,7 @@ pub fn route(args: &[String], command_line: &str) -> Route {
         Some("agent") => agent_args(&args[1..]).map_or(Route::Usage(Verb::Agent), Route::Agent),
         Some("logout") if args.len() == 1 => Route::Logout,
         Some("logout") => Route::Usage(Verb::Logout),
-        Some("elevate") if args.len() == 1 => Route::Usage(Verb::Elevate),
-        Some("elevate") => Route::Elevate(args[1..].to_vec()),
+        Some("elevate") => elevate_args(&args[1..]),
         Some("auto-login") => Route::AutoLogin(auto_login_args(&args[1..])),
         Some("apply") => Route::Apply,
         Some("apply-sshd") if args.len() == 1 => Route::ApplySshd,
@@ -162,6 +165,22 @@ fn console_fallback_args(rest: &[String]) -> Option<(usize, bool)> {
         .ok()
         .filter(|&handle| handle != 0)
         .map(|handle| (handle, login))
+}
+
+/// What follows `elevate`: `--terminal` counts only as the first argument, and a command must follow it.
+fn elevate_args(rest: &[String]) -> Route {
+    let (terminal, command) = match rest.split_first() {
+        Some((flag, command)) if flag == "--terminal" => (true, command),
+        _ => (false, rest),
+    };
+    if command.is_empty() {
+        Route::Usage(Verb::Elevate)
+    } else {
+        Route::Elevate {
+            terminal,
+            command: command.to_vec(),
+        }
+    }
 }
 
 /// `[]` or `--background [--expect-user <sid>]`, the flag at most once. A

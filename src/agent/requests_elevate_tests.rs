@@ -87,7 +87,8 @@ fn a_pair(tag: &str) -> (socket2::Socket, socket2::Socket, PathBuf) {
 /// The client of a session the agent hosts: reads what the agent sends it, until the test has seen what it waits for.
 struct Client {
     rx: ConnRx,
-    tx: ConnTx,
+    /// Held so that the connection stays open: the session ends when its client closes it.
+    _tx: ConnTx,
     frames: FrameReader,
     /// What the session has sent so far, as text: terminal, stdout and stderr together.
     seen: String,
@@ -145,7 +146,7 @@ fn host(tag: &str, mode: Mode, policy: ElevationPolicy) -> Hosting {
     write_frame(&mut tx, FrameKind::Handshake, &hs.encode().unwrap()).unwrap();
     let mut client = Client {
         rx,
-        tx,
+        _tx: tx,
         frames: FrameReader::new(),
         seen: String::new(),
         exit: None,
@@ -178,6 +179,8 @@ impl Hosting {
 /// What a request was answered.
 struct Reply {
     outcome: Outcome,
+    /// What the command wrote to its stdout (the request connection's, not the session's).
+    stdout: String,
     stderr: String,
     handled: anyhow::Result<()>,
 }
@@ -199,10 +202,70 @@ fn ask(
         drop((rx, tx));
         Reply {
             outcome,
+            stdout: String::from_utf8_lossy(&sink.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&sink.stderr).into_owned(),
             handled: handler.join().unwrap(),
         }
     })
+}
+
+/// A request in flight on a connection of its own, read as the test asks: for a command that has to be seen running
+/// before the test goes on.
+struct Pending {
+    rx: ConnRx,
+    tx: ConnTx,
+    frames: FrameReader,
+    stdout: String,
+    handler: std::thread::JoinHandle<anyhow::Result<()>>,
+}
+
+/// Send `request` on a connection of its own and handle it on a thread.
+fn open(control: &Arc<Control>, tag: &str, request: ElevationRequest) -> Pending {
+    let (server, client, _dir) = a_pair(tag);
+    let control = Arc::clone(control);
+    let handler = std::thread::spawn(move || handle(server, &control, |_| panic!("a request ends nothing")));
+    let (rx, mut tx) = afunix::split(client).unwrap();
+    write_frame(&mut tx, FrameKind::Request, &request.encode().unwrap()).unwrap();
+    Pending {
+        rx,
+        tx,
+        frames: FrameReader::new(),
+        stdout: String::new(),
+        handler,
+    }
+}
+
+impl Pending {
+    /// Read frames until the command's stdout holds `needle`. A frame is what is waited for, never the end of a
+    /// stream.
+    fn read_until(&mut self, needle: &str) {
+        while !self.stdout.contains(needle) {
+            let frame = read_one_frame(&mut self.rx, &mut self.frames).unwrap_or_else(|e| {
+                panic!(
+                    "the request ended before the command showed {needle:?} ({e:#}); it showed {:?}",
+                    self.stdout
+                )
+            });
+            match frame.kind {
+                FrameKind::Data if frame.payload[0] == Stream::Stdout as u8 => {
+                    self.stdout.push_str(&String::from_utf8_lossy(&frame.payload[1..]));
+                }
+                FrameKind::Exit => panic!(
+                    "the command ended before it showed {needle:?}; it showed {:?}",
+                    self.stdout
+                ),
+                _ => {}
+            }
+        }
+    }
+
+    /// The client goes away, as an `elevate` does that is ended: both halves close. Returns what the handler ended
+    /// with, once it has ended: the command it was running is gone by then.
+    fn hang_up(self) -> anyhow::Result<()> {
+        let Pending { rx, tx, handler, .. } = self;
+        drop((rx, tx));
+        handler.join().unwrap()
+    }
 }
 
 fn request(id: &SessionId, command: &str, cwd: &str) -> ElevationRequest {
@@ -211,6 +274,15 @@ fn request(id: &SessionId, command: &str, cwd: &str) -> ElevationRequest {
         session: id.to_string(),
         command: command.to_owned(),
         cwd: cwd.to_owned(),
+        terminal: false,
+    }
+}
+
+/// `elevate --terminal <command>`.
+fn on_a_terminal(id: &SessionId, command: &str) -> ElevationRequest {
+    ElevationRequest {
+        terminal: true,
+        ..request(id, command, "")
     }
 }
 
@@ -387,14 +459,17 @@ fn the_working_directory_must_be_an_existing_directory() {
     }
     assert!(elevated_starts().is_empty(), "nothing started in either");
 
-    let mut session = session;
     let reply = asked(
         &session,
         "cwd-ok",
         request(&session.id, "cmd.exe /d /c cd", dir.to_str().unwrap()),
     );
     assert_eq!(reply.outcome, Outcome::Exited(0), "{}", reply.stderr);
-    session.client.read_until(dir.file_name().unwrap().to_str().unwrap());
+    assert!(
+        reply.stdout.contains(dir.file_name().unwrap().to_str().unwrap()),
+        "{}",
+        reply.stdout
+    );
     assert_eq!(elevated_starts()[0].cwd.as_deref(), Some(dir.as_path()));
     session.leave();
     let _ = std::fs::remove_dir_all(&dir);
@@ -402,44 +477,70 @@ fn the_working_directory_must_be_an_existing_directory() {
 
 // What is run -----
 
-/// The elevated command's code is the reply's, its output goes to the client on its own streams with its stdin
-/// closed, and it was given the agent's own token and the session's id.
+/// By default, in a session with a terminal or without: the elevated command's stdin is closed, its stdout and stderr
+/// and its code go back on the request connection and not on the session's, and it was given the agent's own token
+/// and the session's id.
 #[test]
-fn auto_approve_without_a_terminal_runs_the_command_on_pipes_with_stdin_closed_and_forwards_both_streams_and_the_code()
-{
-    let _serial = serial();
-    let mut session = host("pipes", Mode::Exec, ElevationPolicy::AutoApprove);
-    // `findstr x` ends at once only when its stdin is closed; then the command says its id on both streams.
-    let command =
-        "cmd.exe /d /c \"findstr x & echo out-%SSH_BROKER_SESSION%& echo err-%SSH_BROKER_SESSION% 1>&2 & exit /b 7\"";
-    let reply = asked(&session, "pipes-ask", request(&session.id, command, ""));
-    assert_eq!(reply.outcome, Outcome::Exited(7));
-    assert_eq!(
-        reply.stderr, "",
-        "a command that ran says nothing of its own on the request connection"
-    );
-    assert!(reply.handled.is_ok(), "{:#}", reply.handled.unwrap_err());
+fn a_default_mode_command_runs_on_pipes_with_stdin_closed_and_its_streams_and_code_go_on_the_request_not_the_session() {
+    for (what, mode) in [
+        ("a session without a terminal", Mode::Exec),
+        ("a session with a terminal", Mode::Pty),
+    ] {
+        let _serial = serial();
+        let mut session = host("pipes", mode, ElevationPolicy::AutoApprove);
+        // `findstr x` ends at once only when its stdin is closed; then the command says its id on both streams.
+        let command = "cmd.exe /d /c \"findstr x & echo out-%SSH_BROKER_SESSION%& echo err-%SSH_BROKER_SESSION% 1>&2 & \
+                       exit /b 7\"";
+        let reply = asked(&session, "pipes-ask", request(&session.id, command, ""));
+        let id = session.id.to_string();
+        assert_eq!(reply.outcome, Outcome::Exited(7), "{what}");
+        assert!(reply.stdout.contains(&format!("out-{id}")), "{what}: {}", reply.stdout);
+        assert!(!reply.stdout.contains("err-"), "{what}: {}", reply.stdout);
+        assert!(reply.stderr.contains(&format!("err-{id}")), "{what}: {}", reply.stderr);
+        assert!(!reply.stderr.contains("out-"), "{what}: {}", reply.stderr);
+        assert!(reply.handled.is_ok(), "{what}: {:#}", reply.handled.unwrap_err());
 
-    let id = session.id.to_string();
-    session.client.read_until(&format!("out-{id}"));
-    session.client.read_until(&format!("err-{id}"));
-    let starts = elevated_starts();
-    assert_eq!(starts.len(), 1, "{starts:?}");
-    assert!(!starts[0].terminal && !starts[0].token, "{:?}", starts[0]);
-    assert_eq!(starts[0].line, command, "the command line is started as it stands");
-    assert_eq!(starts[0].session.as_deref(), Some(id.as_str()));
-    session.leave();
+        // The session's own connection carried none of it: what it carries next is the first thing it shows.
+        let hosted = session
+            .control
+            .await_hosted(&session.id)
+            .expect("the session is hosted");
+        hosted
+            .link()
+            .deliver(Carrier::Session, Stream::Stdout, b"the-session-again")
+            .unwrap();
+        session.client.read_until("the-session-again");
+        assert!(
+            !session.client.seen.contains("out-") && !session.client.seen.contains("err-"),
+            "{what}: the session showed {:?}",
+            session.client.seen
+        );
+
+        let starts = elevated_starts();
+        assert_eq!(starts.len(), 1, "{what}: {starts:?}");
+        assert!(!starts[0].terminal && !starts[0].token, "{what}: {:?}", starts[0]);
+        assert_eq!(
+            starts[0].line, command,
+            "{what}: the command line is started as it stands"
+        );
+        assert_eq!(starts[0].session.as_deref(), Some(id.as_str()));
+        session.leave();
+    }
 }
 
-/// With a terminal the connection carries the elevated command while it runs and is the session's again by the time
-/// the reply is written.
+/// `--terminal` in a session with a terminal: the connection carries the elevated command while it runs and is the
+/// session's again by the time the reply is written.
 #[test]
-fn auto_approve_with_a_terminal_switches_the_connection_and_switches_back_before_the_reply() {
+fn a_terminal_command_switches_the_connection_and_switches_back_before_the_reply() {
     let _serial = serial();
     let mut session = host("terminal", Mode::Pty, ElevationPolicy::AutoApprove);
     let command = "cmd.exe /d /c \"echo elevated-output& exit /b 3\"";
-    let reply = asked(&session, "terminal-ask", request(&session.id, command, ""));
+    let reply = asked(&session, "terminal-ask", on_a_terminal(&session.id, command));
     assert_eq!(reply.outcome, Outcome::Exited(3));
+    assert_eq!(
+        reply.stdout, "",
+        "the request connection carries no output of a terminal command"
+    );
     assert_eq!(reply.stderr, "");
 
     session.client.read_until("elevated-output");
@@ -465,12 +566,12 @@ fn auto_approve_with_a_terminal_switches_the_connection_and_switches_back_before
 #[test]
 fn a_second_elevation_while_one_runs_is_refused_and_the_slot_frees_when_it_ends_or_fails() {
     let _serial = serial();
-    let mut session = host("slot", Mode::Exec, ElevationPolicy::AutoApprove);
+    let session = host("slot", Mode::Exec, ElevationPolicy::AutoApprove);
     let id = session.id.to_string();
-    // Says its id, which shows that the command holds the slot, and then runs until the session is left.
+    // Says its id, which shows that the command holds the slot, and then runs until its request is hung up.
     let long = format!("cmd.exe /d /c \"echo running-{id}& ping -n 600 127.0.0.1 >nul\"");
-    let first = ask(&session.control, "slot-first", send(request(&session.id, &long, "")));
-    session.client.read_until(&format!("running-{id}"));
+    let mut first = open(&session.control, "slot-first", request(&session.id, &long, ""));
+    first.read_until(&format!("running-{id}"));
 
     let second = asked(
         &session,
@@ -481,41 +582,36 @@ fn a_second_elevation_while_one_runs_is_refused_and_the_slot_frees_when_it_ends_
     assert_eq!(second.stderr, text::elevation_in_progress());
     assert_eq!(elevated_starts().len(), 1, "the second did not start");
 
-    // Leaving ends the session and, with it, the command that holds the slot.
-    let Hosting {
-        control,
-        id: session_id,
-        client,
-        handler,
-    } = session;
-    drop(client);
-    let _ = handler.join().unwrap();
-    let first = first.join().unwrap();
-    assert!(matches!(first.outcome, Outcome::Exited(_)), "{:?}", first.outcome);
-
-    // A command that does not start frees the slot too, and so does one that ends.
-    let mut again = host("slot-again", Mode::Exec, ElevationPolicy::AutoApprove);
+    // The command ends with its request, and its slot is free again; so is the slot of a command that did not start,
+    // and of one that ends by itself.
+    let _ = first.hang_up();
     let nowhere = asked(
-        &again,
+        &session,
         "slot-fails",
-        request(&again.id, "no-such-program-for-elevate.exe", ""),
+        request(&session.id, "no-such-program-for-elevate.exe", ""),
     );
     assert_eq!(nowhere.outcome, Outcome::Exited(126));
+    assert!(
+        nowhere
+            .stderr
+            .starts_with("ssh-broker: the command could not be started elevated: "),
+        "the slot was free for a command that could not start: {}",
+        nowhere.stderr
+    );
     let fine = asked(
-        &again,
+        &session,
         "slot-ends",
-        request(&again.id, "cmd.exe /d /c echo slot-free", ""),
+        request(&session.id, "cmd.exe /d /c echo slot-free", ""),
     );
     assert_eq!(fine.outcome, Outcome::Exited(0), "{}", fine.stderr);
-    again.client.read_until("slot-free");
-    again.leave();
-    let _ = (control, session_id);
+    assert!(fine.stdout.contains("slot-free"), "{}", fine.stdout);
+    session.leave();
 }
 
 #[test]
 fn an_elevated_command_that_cannot_start_is_refused_with_the_cause_and_the_session_goes_on() {
     let _serial = serial();
-    let mut session = host("nostart", Mode::Exec, ElevationPolicy::AutoApprove);
+    let session = host("nostart", Mode::Exec, ElevationPolicy::AutoApprove);
     let reply = asked(
         &session,
         "nostart-ask",
@@ -538,22 +634,63 @@ fn an_elevated_command_that_cannot_start_is_refused_with_the_cause_and_the_sessi
         request(&session.id, "cmd.exe /d /c echo still-serving", ""),
     );
     assert_eq!(fine.outcome, Outcome::Exited(0));
-    session.client.read_until("still-serving");
+    assert!(fine.stdout.contains("still-serving"), "{}", fine.stdout);
     session.leave();
 }
 
+/// The command lives as long as the request that asked for it: the `elevate` client is inside the session's tree, so
+/// the session's end ends it, and its connection closing is what ends the command. Both with a terminal of its own
+/// and without.
 #[test]
-fn a_session_that_ends_while_the_command_runs_reaps_it() {
-    let _serial = serial();
-    let mut session = host("reap", Mode::Exec, ElevationPolicy::AutoApprove);
-    let id = session.id.to_string();
-    let long = format!("cmd.exe /d /c \"echo running-{id}& ping -n 600 127.0.0.1 >nul\"");
-    let pending = ask(&session.control, "reap-ask", send(request(&session.id, &long, "")));
-    session.client.read_until(&format!("running-{id}"));
+fn the_request_connection_closing_ends_the_command() {
+    for (what, mode, terminal) in [
+        ("a default-mode command", Mode::Exec, false),
+        ("a default-mode command of a session with a terminal", Mode::Pty, false),
+        ("a command with a terminal", Mode::Pty, true),
+    ] {
+        let _serial = serial();
+        let mut session = host("hangup", mode, ElevationPolicy::AutoApprove);
+        let id = session.id.to_string();
+        let long = format!("cmd.exe /d /c \"echo running-{id}& ping -n 600 127.0.0.1 >nul\"");
+        let ask = ElevationRequest {
+            terminal,
+            ..request(&session.id, &long, "")
+        };
+        let mut pending = open(&session.control, "hangup", ask);
+        // The command runs: its output is on the request, or on the session's screen with `--terminal`.
+        if terminal {
+            session.client.read_until(&format!("running-{id}"));
+        } else {
+            pending.read_until(&format!("running-{id}"));
+        }
 
-    // The session's own command ends (its stdin ends), and the elevated one is ended with it.
-    crate::relay::write_data(&mut session.client.tx, Stream::Stdin, b"").unwrap();
-    let reply = pending.join().unwrap();
-    assert!(matches!(reply.outcome, Outcome::Exited(_)), "{:?}", reply.outcome);
+        // The handler returns only once the command, which would run for ten minutes, has ended.
+        let _ = pending.hang_up();
+        assert_eq!(elevated_starts().len(), 1, "{what}");
+
+        // The session goes on: the screen is the session's again, and the slot is free.
+        let again = asked(
+            &session,
+            "hangup-again",
+            request(&session.id, "cmd.exe /d /c echo went-on", ""),
+        );
+        assert_eq!(again.outcome, Outcome::Exited(0), "{what}: {}", again.stderr);
+        session.leave();
+    }
+}
+
+/// `--terminal` needs a terminal to give: a session without one is told so, and nothing starts.
+#[test]
+fn a_terminal_request_in_a_session_without_a_terminal_is_refused_and_starts_nothing() {
+    let _serial = serial();
+    let session = host("noterminal", Mode::Exec, ElevationPolicy::AutoApprove);
+    let reply = asked(
+        &session,
+        "noterminal-ask",
+        on_a_terminal(&session.id, "cmd.exe /c echo SHOULD-NOT-RUN"),
+    );
+    assert_eq!(reply.outcome, Outcome::Exited(126));
+    assert_eq!(reply.stderr, text::elevation_needs_a_terminal());
+    assert!(elevated_starts().is_empty());
     session.leave();
 }

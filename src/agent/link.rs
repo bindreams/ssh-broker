@@ -1,9 +1,11 @@
-//! The session's connection, and whom it carries.
+//! A connection, and whom it carries.
 //!
 //! A session's connection to its client is written by the session's own output pumps. While `ssh-broker
-//! elevate` runs a command with a terminal, the agent hosts that command itself and the same connection carries
-//! ITS output instead, and the client's keys go to it ([`Link::host_elevated`]). The [`Link`] is the one place
-//! that owns the connection's write half, so there is exactly one place that decides whose bytes it carries.
+//! elevate --terminal` runs a command, the agent hosts that command itself and the same connection carries ITS
+//! output instead, and the client's keys go to it ([`Link::host_elevated`]). The [`Link`] is the one place that
+//! owns the connection's write half, so there is exactly one place that decides whose bytes it carries. A link
+//! without a terminal gates nothing: the output of a command that runs without `--terminal` is written to the
+//! request's own connection through one of those.
 //!
 //! **Two locks.** The state (whom the connection carries, where input goes, the size) is under one lock that is
 //! never held across a write to the connection. Writes are serialised by a second lock of their own, which holds
@@ -40,15 +42,10 @@ struct State {
     carrier: Carrier,
     /// The session is over: nothing waits any more, and nothing new is waited for.
     ended: bool,
-    /// The trees were reaped ([`Link::reap_all`]): a job adopted now is ended at once.
-    reaped: bool,
     /// The client's size, as it last reported it.
     size: (u16, u16),
-    /// The size the session's own target was last given.
-    session_size: (u16, u16),
     /// Set while the connection carries the elevated command.
     elevated: Option<ElevatedTarget>,
-    jobs: Vec<Arc<cosca::Job>>,
 }
 
 /// A session's connection. See the module.
@@ -90,11 +87,8 @@ impl Link {
             state: Mutex::new(State {
                 carrier: Carrier::Session,
                 ended: false,
-                reaped: false,
                 size,
-                session_size: size,
                 elevated: None,
-                jobs: Vec::new(),
             }),
             changed: Condvar::new(),
             resizing: Mutex::new(()),
@@ -195,10 +189,7 @@ impl Link {
             state.size = (size.cols, size.rows);
             match &state.elevated {
                 Some(elevated) => Some(Arc::clone(elevated)),
-                None => {
-                    state.session_size = state.size;
-                    self.session.clone()
-                }
+                None => self.session.clone(),
             }
         };
         if let Some(target) = target {
@@ -207,8 +198,10 @@ impl Link {
     }
 
     /// From now on the connection carries the elevated command's output and `target` gets the client's keys and
-    /// size, which it is given now. Dropping the guard switches back.
+    /// size, which it is given now. Dropping the guard switches back. Only a link with a terminal has a screen to
+    /// hand over: `decide` refuses the request that would come here for one without.
     pub(super) fn host_elevated(&self, target: ElevatedTarget) -> ElevatedGuard<'_> {
+        debug_assert!(self.terminal, "a command was hosted on a link without a terminal");
         let _applying = locked(&self.resizing);
         let (cols, rows) = {
             let mut state = locked(&self.state);
@@ -226,47 +219,15 @@ impl Link {
         locked(&self.state).ended = true;
         self.changed.notify_all();
     }
-
-    /// Record the elevated command's job, so that [`Link::reap_all`] ends it with the session's. A job adopted after
-    /// the link has ended or its trees were reaped is ended at once. The job is forgotten when the guard drops.
-    pub(super) fn adopt_job(&self, job: Arc<cosca::Job>) -> AdoptedJob<'_> {
-        let late = {
-            let mut state = locked(&self.state);
-            let late = state.ended || state.reaped;
-            if !late {
-                state.jobs.push(Arc::clone(&job));
-            }
-            late
-        };
-        if late {
-            super::reap_tree(&job);
-        }
-        AdoptedJob { link: self, job }
-    }
-
-    /// End the session's tree and every adopted one. True when every tree was ended. Every place that reaps the
-    /// session's tree comes here, so that the elevated command does not outlive its session.
-    pub(super) fn reap_all(&self, session_job: &cosca::Job) -> bool {
-        let adopted = {
-            let mut state = locked(&self.state);
-            state.reaped = true;
-            state.jobs.clone()
-        };
-        let mut all = super::reap_tree(session_job);
-        for job in adopted {
-            all &= super::reap_tree(&job);
-        }
-        all
-    }
-
-    #[cfg(test)]
-    fn adopted(&self) -> usize {
-        locked(&self.state).jobs.len()
-    }
 }
 
 /// The connection carries the elevated command while this lives; dropping it switches back to the session and
 /// wakes its output pump, before whatever the caller writes next (the request's reply).
+///
+/// The switch back always gives the session's pseudoconsole its current size, even when it is the size it has:
+/// resizing a pseudoconsole to its own size makes it repaint its whole screen, which is how the screen of the
+/// session comes back after the command's. Never a different size and back: that stream asks the person's terminal
+/// to resize its window.
 pub(super) struct ElevatedGuard<'a> {
     link: &'a Link,
 }
@@ -275,32 +236,16 @@ impl Drop for ElevatedGuard<'_> {
     fn drop(&mut self) {
         let link = self.link;
         let _applying = locked(&link.resizing);
-        let changed_size = {
+        let (cols, rows) = {
             let mut state = locked(&link.state);
             state.carrier = Carrier::Session;
             state.elevated = None;
-            let changed = state.size != state.session_size;
-            state.session_size = state.size;
-            changed.then_some(state.size)
+            state.size
         };
         link.changed.notify_all();
-        if let (Some((cols, rows)), Some(session)) = (changed_size, &link.session) {
+        if let Some(session) = &link.session {
             session.resize(cols, rows);
         }
-    }
-}
-
-/// A job recorded by [`Link::adopt_job`]; dropped when the command is over.
-pub(super) struct AdoptedJob<'a> {
-    link: &'a Link,
-    job: Arc<cosca::Job>,
-}
-
-impl Drop for AdoptedJob<'_> {
-    fn drop(&mut self) {
-        locked(&self.link.state)
-            .jobs
-            .retain(|adopted| !Arc::ptr_eq(adopted, &self.job));
     }
 }
 
