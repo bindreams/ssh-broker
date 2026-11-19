@@ -35,7 +35,8 @@ use super::schtasks::WaitOutcome;
 use super::session_task::TaskState;
 use crate::password_entry::Password;
 
-/// `SCHED_E_TASK_NOT_RUNNING`: `Stop` on a task with no running instance.
+/// `SCHED_E_TASK_NOT_RUNNING`: `Stop` on a task with no running instance, or a read of an instance that has
+/// ended.
 const SCHED_E_TASK_NOT_RUNNING: HRESULT = HRESULT(0x8004130Bu32 as i32);
 
 /// COM initialised on this thread, released on drop.
@@ -229,7 +230,7 @@ fn describe_instances(pids: &[u32]) -> String {
 
 /// The running instances of `task`, and the processes among them that `open` takes for the task's. An instance
 /// whose process has exited, or is not the task's (its pid is another process's now), has ended: see
-/// [`instances_of`].
+/// [`instances_of`], and so has one that ended between the listing and the read of its process ([`engine_pid`]).
 fn running_instances(
     task: &IRegisteredTask,
     open: impl FnMut(u32) -> anyhow::Result<Option<Process>>,
@@ -244,11 +245,22 @@ fn running_instances(
             let instance = instances
                 .get_Item(&VARIANT::from(index))
                 .with_context(|| format!("read running instance {index}"))?;
-            pids.push(instance.EnginePID().context("read the process of a running instance")?);
+            pids.extend(engine_pid(instance.EnginePID())?);
         }
         pids
     };
     instances_of(pids, open)
+}
+
+/// The process id the engine gave a listed instance (0 for one it has not launched), from the result of reading
+/// it. `None` if the engine answers `SCHED_E_TASK_NOT_RUNNING`: the instance ended after it was listed, and is no
+/// instance, as in [`instances_of`]. Any other failure is an error.
+fn engine_pid(read: windows::core::Result<u32>) -> anyhow::Result<Option<u32>> {
+    match read {
+        Ok(pid) => Ok(Some(pid)),
+        Err(e) if e.code() == SCHED_E_TASK_NOT_RUNNING => Ok(None),
+        Err(e) => Err(e).context("read the process of a running instance"),
+    }
 }
 
 /// The instances among `listed`, the engine's process id of each (0 for one it has not launched). An instance
