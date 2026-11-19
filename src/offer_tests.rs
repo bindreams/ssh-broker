@@ -382,9 +382,18 @@ fn the_elevate_sentences_are_each_whole() {
         "ssh-broker: this session is already elevated: run the command in it.\r\n"
     );
     assert_eq!(
-        text::elevation_consent_not_built(),
-        "ssh-broker: this login asks before elevating, and asking is not built yet: log in with \
-         SSH_BROKER_ELEVATION=auto-approve to run a command elevated without a question.\r\n"
+        text::elevation_no_terminal(),
+        "ssh-broker: this login asks before elevating, and this session has no terminal to ask on. Log in with \
+         ssh -t, or with SSH_BROKER_ELEVATION=auto-approve to run commands elevated without a question, or with \
+         SSH_BROKER_ELEVATION=always to run the whole session elevated.\r\n"
+    );
+    assert_eq!(
+        text::elevation_declined(),
+        "ssh-broker: running the command as administrator was not allowed, so nothing was run.\r\n"
+    );
+    assert_eq!(
+        text::elevation_session_ended(),
+        "ssh-broker: this session ended before the question was answered, so nothing was run.\r\n"
     );
     assert_eq!(
         text::elevation_in_progress(),
@@ -427,7 +436,9 @@ fn every_elevate_refusal_is_one_prefixed_line_ending_in_crlf() {
         text::elevation_not_hosted(),
         text::elevation_never(),
         text::elevation_already_elevated(),
-        text::elevation_consent_not_built(),
+        text::elevation_no_terminal(),
+        text::elevation_declined(),
+        text::elevation_session_ended(),
         text::elevation_in_progress(),
         text::elevation_cannot_start("why"),
         text::elevation_needs_high_agent(),
@@ -437,6 +448,114 @@ fn every_elevate_refusal_is_one_prefixed_line_ending_in_crlf() {
     ] {
         assert!(line.starts_with("ssh-broker: ") && line.ends_with("\r\n"), "{line:?}");
         assert_eq!(line.matches('\n').count(), 1, "{line:?}");
+    }
+}
+
+// The consent question -----
+
+#[test]
+fn display_shows_control_characters_as_text() {
+    assert_eq!(text::display("a\x1b[31mb"), "a\\x1b[31mb");
+    assert_eq!(
+        text::display("\0\x07\x08\t\r\x7f\u{85}\u{9f}"),
+        "\\x00\\x07\\x08\\x09\\x0d\\x7f\\x85\\x9f"
+    );
+    assert_eq!(text::display("one\ntwo"), "one\\ntwo");
+    // Text is left as it is, whatever its script.
+    let plain = "C:\\Program Files\\caf\u{e9}\u{65e5}\u{672c}.exe /c echo 'a' \\x1b";
+    assert_eq!(text::display(plain), plain);
+}
+
+#[test]
+fn display_shows_bidi_and_zero_width_controls() {
+    // The right-to-left override, the isolates, the zero-width characters, the byte order mark and the line and
+    // paragraph separators change how a line reads or hide that there is anything.
+    for (control, shown) in [
+        ('\u{202e}', "\\u{202e}"),
+        ('\u{202a}', "\\u{202a}"),
+        ('\u{2066}', "\\u{2066}"),
+        ('\u{2069}', "\\u{2069}"),
+        ('\u{200e}', "\\u{200e}"),
+        ('\u{061c}', "\\u{61c}"),
+        ('\u{200b}', "\\u{200b}"),
+        ('\u{200d}', "\\u{200d}"),
+        ('\u{2060}', "\\u{2060}"),
+        ('\u{feff}', "\\u{feff}"),
+        ('\u{ad}', "\\u{ad}"),
+        ('\u{2028}', "\\u{2028}"),
+        ('\u{e0041}', "\\u{e0041}"),
+    ] {
+        assert_eq!(text::display(&format!("a{control}b")), format!("a{shown}b"));
+    }
+}
+
+#[test]
+fn display_cuts_at_the_stated_length_and_gives_the_full_length() {
+    assert_eq!(text::CONSENT_SHOWN_UNITS, 400);
+    let exact = "a".repeat(400);
+    assert_eq!(text::display(&exact), exact, "400 characters are shown whole");
+    assert_eq!(
+        text::display(&"a".repeat(401)),
+        format!("{}... (400 of 401 characters shown)", "a".repeat(400))
+    );
+    // Characters, not bytes and not UTF-16 units; and a control character is one of them.
+    assert_eq!(
+        text::display(&"\u{1F600}".repeat(1000)),
+        format!("{}... (400 of 1000 characters shown)", "\u{1F600}".repeat(400))
+    );
+    assert_eq!(
+        text::display(&"\x1b".repeat(401)),
+        format!("{}... (400 of 401 characters shown)", "\\x1b".repeat(400))
+    );
+}
+
+#[test]
+fn consent_question_is_the_designs_block_whole() {
+    assert_eq!(text::CONSENT_ANSWER_LINE, "Run it as administrator? [y/N] ");
+    assert_eq!(
+        text::consent_question(
+            r"C:\Windows\System32\cmd.exe /c whoami",
+            r"C:\Users\me",
+            text::CONSENT_ANSWER_LINE
+        ),
+        "ssh-broker: a program in this session asks to run as administrator:\r\n    \
+         C:\\Windows\\System32\\cmd.exe /c whoami\r\n    in C:\\Users\\me\r\nRun it as administrator? [y/N] "
+    );
+}
+
+#[test]
+fn consent_question_ends_with_the_answer_line_it_is_given_whatever_it_is() {
+    for line in ["Allow? ", "x", "Type the code ABCDEF: "] {
+        let question = text::consent_question("c", "d", line);
+        assert!(question.ends_with(&format!("\r\n{line}")), "{question:?}");
+        assert_eq!(
+            question.matches("\r\n").count(),
+            3,
+            "three line ends and then the line: {question:?}"
+        );
+    }
+}
+
+/// What is shown of the command and the folder is what `display` makes of them, so that the program that asks
+/// cannot write into the question.
+#[test]
+fn consent_question_shows_the_command_and_folder_cleaned() {
+    let question = text::consent_question("cmd /c \x1b[2J\u{202e}x\nfake line", "C:\\a\x1b[H", "? ");
+    assert_eq!(
+        question.chars().filter(|c| c.is_control()).count(),
+        6,
+        "only the line ends of the block itself: {question:?}"
+    );
+    assert!(question.contains("\\x1b[2J\\u{202e}x\\nfake line"), "{question:?}");
+    assert!(question.contains("in C:\\a\\x1b[H\r\n"), "{question:?}");
+}
+
+#[test]
+fn the_allowing_answers_are_y_and_yes_and_the_screen_has_no_alternate_screen() {
+    assert_eq!(text::CONSENT_ALLOWING_ANSWERS, ["y", "yes"]);
+    assert_eq!(text::CONSENT_SCREEN_ENTER, "\x1b[0m\x1b[r\x1b[?25h\x1b[2J\x1b[H");
+    for alternate in ["?1049", "?1047", "?47"] {
+        assert!(!text::CONSENT_SCREEN_ENTER.contains(alternate), "{alternate}");
     }
 }
 

@@ -156,6 +156,106 @@ pub fn elevation_consent_not_built() -> String {
         .to_owned()
 }
 
+/// The login asked for the default, which asks the person at the terminal, and the session has no terminal to ask on.
+pub fn elevation_no_terminal() -> String {
+    "ssh-broker: this login asks before elevating, and this session has no terminal to ask on. Log in with ssh -t, \
+     or with SSH_BROKER_ELEVATION=auto-approve to run commands elevated without a question, or with \
+     SSH_BROKER_ELEVATION=always to run the whole session elevated.\r\n"
+        .to_owned()
+}
+
+/// The person at the terminal answered the question with anything but the allowing answer.
+pub fn elevation_declined() -> String {
+    "ssh-broker: running the command as administrator was not allowed, so nothing was run.\r\n".to_owned()
+}
+
+/// The session ended while the question was being asked.
+pub fn elevation_session_ended() -> String {
+    "ssh-broker: this session ended before the question was answered, so nothing was run.\r\n".to_owned()
+}
+
+// The consent question =====
+//
+// What the shim writes on the person's terminal when a program of the session asks to run a command as
+// administrator, and what it takes for an answer. The agent sends the command and the folder as they came; the shim
+// is the party that writes to the terminal, so it is where they are cleaned ([`display`], which
+// [`consent_question`] applies).
+
+/// The most characters of the command, and of the folder, the question shows.
+pub const CONSENT_SHOWN_UNITS: usize = 400;
+
+/// The last line of the question, as the person answers it: `[y/N]` as apt asks, the capital letter being what Enter
+/// alone does.
+pub const CONSENT_ANSWER_LINE: &str = "Run it as administrator? [y/N] ";
+
+/// The answers that allow, without regard to case, then Enter. Anything else, Enter alone included, refuses. Agrees
+/// with [`CONSENT_ANSWER_LINE`].
+pub const CONSENT_ALLOWING_ANSWERS: [&str; 2] = ["y", "yes"];
+
+/// What the shim writes first, to take the screen: reset the character attributes, the scroll region and the
+/// cursor's visibility, which the session's programs may have left in any state, clear the screen and home the
+/// cursor. There is no alternate screen: what the session had on the screen is repainted when the question is over (the
+/// agent gives the session's pseudoconsole its size again), which is measured to work through sshd's console where
+/// leaving an alternate screen is not.
+pub const CONSENT_SCREEN_ENTER: &str = "\x1b[0m\x1b[r\x1b[?25h\x1b[2J\x1b[H";
+
+/// The question: the design's block, then `answer_line` as its last line, which ends nothing, so that what is typed
+/// follows it. The command and the folder are those of a program of the session, which can write what it likes: they
+/// are shown by [`display`].
+pub fn consent_question(command: &str, cwd: &str, answer_line: &str) -> String {
+    format!(
+        "ssh-broker: a program in this session asks to run as administrator:\r\n    {}\r\n    in {}\r\n{answer_line}",
+        display(command),
+        display(cwd),
+    )
+}
+
+/// `text` as it is shown to the person: the characters that act on a terminal or hide what a line says are shown as
+/// text and not acted on. A control character (C0, DEL, C1) is `\x` and two hex digits, a line feed is `\n`, and a
+/// bidirectional or zero-width format control, an invisible separator or a tag character is `\u{..}` (see
+/// [`is_hidden_format`]). More than [`CONSENT_SHOWN_UNITS`] characters are cut there and followed by
+/// `... (400 of <n> characters shown)`, with the full count.
+pub fn display(text: &str) -> String {
+    let total = text.chars().count();
+    let mut shown = String::new();
+    for c in text.chars().take(CONSENT_SHOWN_UNITS) {
+        match c {
+            '\n' => shown.push_str("\\n"),
+            c if c.is_control() => {
+                use std::fmt::Write as _;
+                let _ = write!(shown, "\\x{:02x}", u32::from(c));
+            }
+            c if is_hidden_format(c) => {
+                use std::fmt::Write as _;
+                let _ = write!(shown, "\\u{{{:x}}}", u32::from(c));
+            }
+            c => shown.push(c),
+        }
+    }
+    if total > CONSENT_SHOWN_UNITS {
+        shown.push_str(&format!("... ({CONSENT_SHOWN_UNITS} of {total} characters shown)"));
+    }
+    shown
+}
+
+/// A character that is no control character and shows nothing or changes how the text around it is shown: the
+/// soft hyphen, the Arabic letter mark, the Mongolian vowel separator, the zero-width and directional marks and
+/// embeddings and isolates (U+200B to U+200F, U+202A to U+202E, U+2066 to U+2069), the word joiner and invisible
+/// operators (U+2060 to U+2064), the deprecated format controls (U+206A to U+206F), the line and paragraph
+/// separators, the byte order mark, the interlinear annotation marks, and the tag characters.
+fn is_hidden_format(c: char) -> bool {
+    matches!(u32::from(c),
+        0x00AD | 0x061C | 0x180E
+        | 0x200B..=0x200F
+        | 0x2028..=0x202E
+        | 0x2060..=0x2064
+        | 0x2066..=0x206F
+        | 0xFEFF
+        | 0xFFF9..=0xFFFB
+        | 0xE0001
+        | 0xE0020..=0xE007F)
+}
+
 /// A second `elevate` while the session's first is asked or running.
 pub fn elevation_in_progress() -> String {
     "ssh-broker: another elevation is in progress in this session.\r\n".to_owned()

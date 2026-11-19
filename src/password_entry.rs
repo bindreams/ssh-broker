@@ -4,7 +4,7 @@
 //! echoes, logs or formats the text.
 
 use crate::secret::SecretUnits;
-use crate::vtinput::KeyEvent;
+use crate::vtinput::{KeyEntry, KeyEvent};
 
 const VK_BACK: u16 = 0x08;
 const VK_MENU: u16 = 0x12; // Alt
@@ -105,6 +105,24 @@ impl PasswordEntry {
     #[doc(hidden)]
     pub fn backing(&self) -> &[u16] {
         self.text.backing()
+    }
+}
+
+impl KeyEntry for PasswordEntry {
+    type Step = Step;
+
+    fn key(&mut self, k: &KeyEvent) -> Step {
+        PasswordEntry::key(self, k)
+    }
+
+    fn finishes_step(step: &Step) -> bool {
+        !matches!(step, Step::Continue)
+    }
+
+    /// A password read is never stopped from outside (its callers pass a stop that is never true); if it were, it is
+    /// a cancel.
+    fn stopped() -> Step {
+        Step::Cancel
     }
 }
 

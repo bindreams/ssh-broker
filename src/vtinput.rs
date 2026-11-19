@@ -18,6 +18,23 @@ pub struct KeyEvent {
     pub repeat_count: u16,
 }
 
+/// What the console prompts feed key events to: one state machine per prompt (`password_entry`,
+/// `consent_entry`), read through `console_prompt`'s `Batch`.
+pub trait KeyEntry {
+    /// What one key event did.
+    type Step;
+
+    /// Apply one key event.
+    fn key(&mut self, k: &KeyEvent) -> Self::Step;
+
+    /// Whether `step` ends a read: the records up to the one that made it are taken from the console's queue and
+    /// the read returns it. The others are `key`'s "nothing to report yet".
+    fn finishes_step(step: &Self::Step) -> bool;
+
+    /// The step a read returns when it is stopped from outside while it waits for a key.
+    fn stopped() -> Self::Step;
+}
+
 /// Encode a key event as a win32-input-mode CSI sequence. BOTH key-down and key-up are
 /// forwarded (WIN32_INPUT_MODE expects the full edge stream; `Kd` carries 1/0).
 pub fn encode_key_event(k: &KeyEvent) -> Vec<u8> {

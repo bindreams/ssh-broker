@@ -1,4 +1,5 @@
-//! Reading the console's input records into `PasswordEntry`, without taking any it does not feed.
+//! Reading the console's input records into a [`KeyEntry`] (`PasswordEntry`, `ConsentEntry`), without taking
+//! any it does not feed.
 //!
 //! A step peeks at the head of the console queue, feeds the records to the entry in turn, and removes
 //! from the queue exactly the records it fed, up to and including the one that finished the step. The
@@ -11,12 +12,15 @@
 //! the finishing key, its further repeats are the user holding that key: the prompt ends on the first
 //! and drops the rest. Every buffer, and every copy of a record, is overwritten before the step
 //! returns.
+//!
+//! A step that has no key to feed waits for one. The caller's `stop` is looked at after every batch that finished no
+//! step, so before each wait; a wait is ended from outside by something that makes `stop` true and then puts a record
+//! in the queue, which wakes the read.
 
 use windows::Win32::System::Console::INPUT_RECORD;
 use zeroize::Zeroize;
 
-use crate::password_entry::{PasswordEntry, Step};
-use crate::vtinput::KeyEvent;
+use crate::vtinput::{KeyEntry, KeyEvent};
 
 /// Records one peek takes.
 pub(super) const BATCH: usize = 32;
@@ -46,15 +50,26 @@ impl Batch {
         }
     }
 
-    /// Block until one entry step finishes, and return it. The records after the finishing one are
-    /// not taken from the queue. On return, successful or not, the buffer is all zeros.
-    pub fn step(&mut self, queue: &mut impl InputQueue, entry: &mut PasswordEntry) -> windows::core::Result<Step> {
-        let result = self.step_inner(queue, entry);
+    /// Block until one entry step finishes, and return it, or until `stop` says so while no step is finishing: then
+    /// the step is [`KeyEntry::stopped`]. The records after the finishing one are not taken from the queue. On
+    /// return, successful or not, the buffer is all zeros.
+    pub fn step<E: KeyEntry>(
+        &mut self,
+        queue: &mut impl InputQueue,
+        entry: &mut E,
+        stop: &dyn Fn() -> bool,
+    ) -> windows::core::Result<E::Step> {
+        let result = self.step_inner(queue, entry, stop);
         self.wipe();
         result
     }
 
-    fn step_inner(&mut self, queue: &mut impl InputQueue, entry: &mut PasswordEntry) -> windows::core::Result<Step> {
+    fn step_inner<E: KeyEntry>(
+        &mut self,
+        queue: &mut impl InputQueue,
+        entry: &mut E,
+        stop: &dyn Fn() -> bool,
+    ) -> windows::core::Result<E::Step> {
         loop {
             let peeked = (queue.peek(&mut self.records)? as usize).min(BATCH);
             // Only the last record of the queue can change after the peek (the console merges a repeated
@@ -68,6 +83,9 @@ impl Batch {
                 return Ok(step);
             }
             self.take(queue, stable)?;
+            if stop() {
+                return Ok(E::stopped());
+            }
             // With an empty queue this waits for a record, which is fed in any case.
             let read = (queue.read(&mut self.records[..1])? as usize).min(1);
             let (_, step) = self.feed(read, entry);
@@ -81,7 +99,7 @@ impl Batch {
     /// Feed the entry the first `len` records in turn until a step finishes. Returns how many were
     /// fed (the finishing one included) and the step. A fed record is overwritten at once, and so are
     /// the copies made of it.
-    fn feed(&mut self, len: usize, entry: &mut PasswordEntry) -> (usize, Option<Step>) {
+    fn feed<E: KeyEntry>(&mut self, len: usize, entry: &mut E) -> (usize, Option<E::Step>) {
         for (index, slot) in self.records[..len].iter_mut().enumerate() {
             let mut record = std::mem::replace(slot, zeroed_record());
             if record.EventType != EVT_KEY {
@@ -104,9 +122,8 @@ impl Batch {
             let step = entry.key(&event);
             // SAFETY: `KeyEvent` is integers and a `bool`; all-zero bytes are a valid value.
             unsafe { wipe_plain(&mut event) };
-            match step {
-                Step::Continue => {}
-                step => return (index + 1, Some(step)),
+            if E::finishes_step(&step) {
+                return (index + 1, Some(step));
             }
         }
         (len, None)

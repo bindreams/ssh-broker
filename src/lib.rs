@@ -32,6 +32,7 @@ mod command_corpus;
 mod command_line_probe;
 #[cfg(windows)]
 pub mod conpty;
+pub mod consent_entry;
 #[cfg(windows)]
 pub mod console_modes;
 #[cfg(windows)]

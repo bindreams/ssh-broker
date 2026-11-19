@@ -84,7 +84,7 @@ impl ConsolePrompt {
     /// The error is the console input's failure (the SSH side is gone).
     pub fn read_step(&mut self) -> Result<Step, windows::core::Error> {
         let mut console = ConsoleInput(self.modes.stdin);
-        self.batch.step(&mut console, &mut self.entry)
+        self.batch.step(&mut console, &mut self.entry, &|| false)
     }
 }
 
