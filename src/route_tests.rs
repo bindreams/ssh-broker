@@ -288,9 +288,9 @@ fn apply_and_doctor_verbs() {
     );
 }
 
-/// `verify` was the name of `doctor` and is no verb now: it is an unknown word, which the shim takes.
+/// `verify` and `verify-probe` are unknown words, which the shim takes.
 #[test]
-fn the_former_name_of_doctor_is_not_a_verb() {
+fn verify_is_not_a_verb() {
     for word in ["verify", "verify-probe"] {
         assert_eq!(
             route_line(&format!("ssh-broker.exe {word}")),
