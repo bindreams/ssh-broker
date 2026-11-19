@@ -1726,19 +1726,26 @@ fn prepare_hangup_watch(tx: &ConnTx, make_watcher: WatchFactory) -> Option<(Hang
     }
 }
 
-/// Start the watch [`prepare_hangup_watch`] made.
+/// Start the watch [`prepare_hangup_watch`] made, ending `job`'s tree on a hangup.
 #[cfg(windows)]
 fn start_hangup_watch(watcher: Option<(HangupWatcher, Waker)>, job: &Arc<cosca::Job>) -> Option<HangupGuard> {
-    let (hangup, waker) = watcher?;
     let job = Arc::clone(job);
-    let thread = std::thread::spawn(move || {
-        // The wait also ends after a normal teardown.
-        end_of_watch(hangup.wait(), || {
-            if let Some(w) = teardown_warning(reap_tree(&job)) {
-                tracing::error!("{w}");
-            }
-        });
-    });
+    start_watch_with(watcher, move || {
+        if let Some(w) = teardown_warning(reap_tree(&job)) {
+            tracing::error!("{w}");
+        }
+    })
+}
+
+/// Start the watch [`prepare_hangup_watch`] made, calling `on_hangup` when the peer has hung up. The wait also ends
+/// after a normal teardown ([`HangupGuard::finish`]), and then `on_hangup` is called as well.
+#[cfg(windows)]
+fn start_watch_with(
+    watcher: Option<(HangupWatcher, Waker)>,
+    on_hangup: impl FnOnce() + Send + 'static,
+) -> Option<HangupGuard> {
+    let (hangup, waker) = watcher?;
+    let thread = std::thread::spawn(move || end_of_watch(hangup.wait(), on_hangup));
     Some(HangupGuard { waker, thread })
 }
 
@@ -1834,6 +1841,11 @@ impl FrameSink for ExecInputSink {
     // on_resize: default no-op (EXEC has no pseudoconsole).
 }
 
+/// How many chunks of a client's input (one per frame, at most 32 KiB each) a session holds that have not reached the
+/// process: a [`HandleWriter`]'s queue, and the keys a [`Link`] keeps while a question is open.
+#[cfg(windows)]
+const INPUT_QUEUE_CHUNKS: usize = 16;
+
 /// Writes to a blocking handle from a thread of its own.
 ///
 /// The frame reader must never park in a sink. `pump_decode` dispatches inline, and a pipe
@@ -1886,7 +1898,7 @@ impl HandleWriter {
     fn spawn(raw: isize, owned: Option<OwnedHandle>, parked: ParkSignal) -> Self {
         // Frames are at most `protocol::MAX_FRAME`, but the shim sends 32 KiB chunks, so
         // this is well under a megabyte in practice.
-        let (tx, rx) = std::sync::mpsc::sync_channel::<Option<Vec<u8>>>(16);
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Option<Vec<u8>>>(INPUT_QUEUE_CHUNKS);
         let thread = std::thread::spawn(move || {
             let _owned = owned; // dropped on the way out, closing the child's stdin
             for msg in rx {

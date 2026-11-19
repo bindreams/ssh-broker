@@ -10,8 +10,10 @@
 //! of a standard account; the unelevated session is a consent step, not a boundary.
 
 use std::path::Path;
+use std::sync::Arc;
 
-use super::elevation::{HostedSession, RunOutcome, Verdict, consent, decide, run_hosted};
+use super::elevation::{HostedSession, RunOutcome, Verdict, consent, decide, run_hosted, watch_question};
+use super::link::ClientGone;
 use super::{Control, Opened, child_cwd, home_dir, logout, read_opening};
 use crate::afunix::{Conn, ConnRx, ConnTx};
 use crate::elevate::{REFUSED_EXIT_CODE, UNKNOWN_END_EXIT_CODE};
@@ -147,7 +149,20 @@ fn run_elevated(
         return Some((text::elevation_cannot_start(&cause), REFUSED_EXIT_CODE));
     }
     let asked = if ask {
-        match consent(&hosted.link, request, cwd.as_deref()) {
+        // The request's client is watched from before the question: one that hangs up while it is asked ends it, and
+        // one that hangs up before the command starts is never served.
+        let gone = Arc::new(ClientGone::default());
+        let watch = watch_question(&hosted.link, tx, &gone);
+        let answer = consent(&hosted.link, request, cwd.as_deref(), &gone);
+        // Read before the watch is finished: finishing it calls its action too.
+        let hung_up = gone.is_gone();
+        if let Some(watch) = watch {
+            watch.finish();
+        }
+        if hung_up {
+            return None;
+        }
+        match answer {
             Ok(hold) => Some(hold),
             Err(sentence) => return Some((sentence, REFUSED_EXIT_CODE)),
         }

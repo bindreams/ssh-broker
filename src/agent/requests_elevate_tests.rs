@@ -607,6 +607,28 @@ fn a_session_that_ends_while_asking_refuses_and_starts_nothing() {
     session.leave();
 }
 
+/// The client of the request exits while the question is on the screen: the question ends, nothing runs (a late `y`
+/// answers nothing), and the session has its screen back.
+#[test]
+fn a_client_that_hangs_up_while_the_question_is_asked_ends_it_and_nothing_runs() {
+    let _serial = serial();
+    let mut session = host("goneasking", Mode::Pty, ElevationPolicy::Prompt);
+    let pending = open(
+        &session.control,
+        "goneasking-ask",
+        request(&session.id, &cmd("/c echo SHOULD-NOT-RUN"), r"C:\"),
+    );
+    session.client.read_question();
+
+    // The handler returns once the question has ended; with the question still waiting it would not return.
+    let _ = pending.hang_up();
+    session_speaks(&mut session, "the-session-again");
+    session.client.answer(ConsentAnswer::Allow);
+    session_speaks(&mut session, "and-again");
+    assert!(elevated_starts().is_empty(), "the late answer started nothing");
+    session.leave();
+}
+
 /// The keys that reach the agent while the question is asked are the shim's own, not the session's: they are dropped.
 /// What is typed once the question is over reaches the session.
 #[test]

@@ -89,7 +89,7 @@ run lints half of it. CI lints per-platform; use `cargo xwin clippy` for the oth
 **A sink failure is not a disconnect.** `PumpError` names which side failed: a sink failure is
 local and says nothing about the peer — a relayed command closing its own stdin is routine.
 Agent-side callers use `relay::pump_until_peer_gone`, which owns that distinction: it stops
-delivering on a sink failure but keeps reading, so the peer's eventual disconnect is still
-seen. Reach for it rather than `pump_decode` + `peer_gone()`; getting this wrong has both
+delivering data on a sink failure but keeps reading, so the peer's eventual disconnect is still
+seen, and the protocol's control frames (the consent answer) still reach the sink. Reach for it rather than `pump_decode` + `peer_gone()`; getting this wrong has both
 killed live sessions and hung the agent. The shim is the deliberate exception — from where it
 sits a broken sink is its own stdio, so it collapses every `PumpError` to exit 254.

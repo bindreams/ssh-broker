@@ -3,6 +3,28 @@
 use super::*;
 use crate::offer::text;
 
+/// The question shows the folder the command starts in: the request's, else the agent's own. When that cannot be
+/// told, the question is refused with the cause and is never asked, with a blank folder.
+#[test]
+fn the_folder_shown_is_the_folder_the_command_starts_in_or_the_request_is_refused() {
+    let named = Path::new(r"C:\work");
+    assert_eq!(
+        folder_shown(Some(named), || panic!("the agent's own folder is not asked")),
+        Ok(r"C:\work".to_owned())
+    );
+    assert_eq!(
+        folder_shown(None, || Ok(r"C:\agent".into())),
+        Ok(r"C:\agent".to_owned())
+    );
+    let refusal = folder_shown(None, || Err(std::io::Error::other("the folder was removed")))
+        .expect_err("a folder that cannot be told is no question");
+    assert!(refusal.contains("the folder was removed"), "{refusal}");
+    assert!(
+        refusal.starts_with("ssh-broker: the command could not be started elevated"),
+        "{refusal}"
+    );
+}
+
 #[test]
 fn decide_gives_never_refuse_auto_approve_run_always_refuse_already_elevated_prompt_ask_with_a_terminal() {
     for has_terminal in [true, false] {

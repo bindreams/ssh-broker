@@ -461,9 +461,83 @@ fn display_shows_control_characters_as_text() {
         "\\x00\\x07\\x08\\x09\\x0d\\x7f\\x85\\x9f"
     );
     assert_eq!(text::display("one\ntwo"), "one\\ntwo");
-    // Text is left as it is, whatever its script.
-    let plain = "C:\\Program Files\\caf\u{e9}\u{65e5}\u{672c}.exe /c echo 'a' \\x1b";
+    // Text is left as it is, whatever its script, and a backslash that starts no escape of `display`'s is left too.
+    let plain = "C:\\Program Files\\caf\u{e9}\u{65e5}\u{672c}.exe /c echo 'a' \\xampp \\temp\\ \\u \\x1";
     assert_eq!(text::display(plain), plain);
+}
+
+/// Every escape `display` makes is unambiguous: a backslash that would read as the start of one is doubled, so a real
+/// line feed and the text `\n`, a real ESC and the text `\x1b`, show differently.
+#[test]
+fn display_tells_an_escape_from_the_text_that_looks_like_it() {
+    for (text, shown) in [
+        ("C:\\new", "C:\\\\new"),
+        ("C:\nnew", "C:\\nnew"),
+        ("\x1b", "\\x1b"),
+        ("\\x1b", "\\\\x1b"),
+        ("\\x1B", "\\\\x1B"),
+        ("\\u{202e}", "\\\\u{202e}"),
+        ("\u{202e}", "\\u{202e}"),
+        // A backslash before something that is shown as an escape, and before a backslash.
+        ("\\\n", "\\\\\\n"),
+        ("\\\x1b", "\\\\\\x1b"),
+        ("\\\u{202e}", "\\\\\\u{202e}"),
+        ("\\\\", "\\\\\\"),
+        ("\\\\n", "\\\\\\\\n"),
+        // A path reads as it is.
+        ("C:\\Users\\me\\xampp", "C:\\Users\\me\\xampp"),
+        ("trailing\\", "trailing\\"),
+    ] {
+        assert_eq!(text::display(text), shown, "{text:?}");
+    }
+    let texts = [
+        "\n",
+        "\\n",
+        "\\\n",
+        "\\\\n",
+        "\x1b",
+        "\\x1b",
+        "\\\x1b",
+        "\\\\x1b",
+        "\u{202e}",
+        "\\u{202e}",
+        "\\\u{202e}",
+        "\\",
+        "\\\\",
+    ];
+    let mut seen = std::collections::HashMap::new();
+    for text in texts {
+        if let Some(other) = seen.insert(text::display(text), text) {
+            panic!("{other:?} and {text:?} both show as {}", text::display(text));
+        }
+    }
+}
+
+/// The default-ignorable characters that show nothing are shown as escapes: the variation selectors, the combining
+/// grapheme joiner, the Mongolian free variation selectors and vowel separator, the Hangul fillers and the shorthand
+/// format controls.
+#[test]
+fn display_shows_the_other_default_ignorable_characters() {
+    let ranges = [
+        0x034f..=0x034f,
+        0x115f..=0x1160,
+        0x180b..=0x180f,
+        0x3164..=0x3164,
+        0xfe00..=0xfe0f,
+        0xffa0..=0xffa0,
+        0x1bca0..=0x1bca3,
+        0xe0100..=0xe01ef,
+    ];
+    for range in ranges {
+        for code in range {
+            let c = char::from_u32(code).unwrap();
+            assert_eq!(
+                text::display(&format!("a{c}b")),
+                format!("a\\u{{{code:x}}}b"),
+                "U+{code:04X}"
+            );
+        }
+    }
 }
 
 #[test]

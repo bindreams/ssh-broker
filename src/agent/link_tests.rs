@@ -390,7 +390,7 @@ fn ask_on_a_thread(link: &Arc<Link>) -> Asked {
     let (release, released) = mpsc::channel::<()>();
     let link = Arc::clone(link);
     let thread = std::thread::spawn(move || {
-        let outcome = link.ask_observed(&a_question(), || {
+        let outcome = link.ask_observed(&a_question(), &ClientGone::default(), || {
             let _ = parked.send(());
         });
         match outcome {
@@ -510,6 +510,127 @@ fn input_typed_while_asking_is_discarded_and_the_size_is_not() {
     );
 }
 
+/// The client's input is ordered after its answer: keys that arrive once the answer has (a paste `y`, Enter and a
+/// command) are the session's, kept in order and delivered first when the screen goes back, ahead of later keys.
+#[test]
+fn keys_after_the_answer_are_kept_for_the_session_after_a_refusal_in_order() {
+    let (wire, session) = (Wire::default(), Arc::new(Recorder::default()));
+    let link = terminal_link(&wire, &session);
+    let asked = ask_on_a_thread(&link);
+    asked.parked.recv().unwrap();
+
+    link.route_input(b"before").unwrap();
+    link.answer(ConsentAnswer::Refuse);
+    link.route_input(b"dir").unwrap();
+    link.route_input(b"\r").unwrap();
+    asked.answer.recv().unwrap().unwrap();
+    assert_eq!(
+        session.events(),
+        Vec::<String>::new(),
+        "kept, not delivered, while it holds the screen"
+    );
+
+    asked.finish();
+    link.route_input(b"later").unwrap();
+    assert_eq!(
+        session.events(),
+        ["input dir", "input \r", "resize 80x24", "input later"],
+        "the keys typed after the answer, in order, then the repaint, then the later keys; the key before it is gone"
+    );
+}
+
+/// An allowed `--terminal` command is what the keys after the answer are for: they go to it, before any later key.
+#[test]
+fn keys_after_the_answer_are_kept_for_the_elevated_command_after_an_allow_in_order() {
+    let (wire, session, elevated) = (
+        Wire::default(),
+        Arc::new(Recorder::default()),
+        Arc::new(Recorder::default()),
+    );
+    let link = terminal_link(&wire, &session);
+    let asked = ask_on_a_thread(&link);
+    asked.parked.recv().unwrap();
+
+    link.route_input(b"before").unwrap();
+    link.answer(ConsentAnswer::Allow);
+    link.route_input(b"one").unwrap();
+    link.route_input(b"two").unwrap();
+    asked.answer.recv().unwrap().unwrap();
+
+    let guard = host(&link, elevated.clone());
+    link.route_input(b"three").unwrap();
+    assert_eq!(
+        elevated.events(),
+        ["resize 80x24", "input one", "input two", "input three"],
+        "the command is given its size, then the kept keys, then the later ones"
+    );
+    asked.finish();
+    drop(guard);
+    assert_eq!(session.events(), ["resize 80x24"], "none of the keys was the session's");
+}
+
+/// The kept keys are bounded as a session's input queue is: a key beyond them waits for the question's outcome, and
+/// then goes after the ones kept.
+#[test]
+fn a_key_beyond_the_kept_bound_waits_for_the_outcome_and_goes_after_the_kept_ones() {
+    let (wire, session) = (Wire::default(), Arc::new(Recorder::default()));
+    let link = terminal_link(&wire, &session);
+    let asked = ask_on_a_thread(&link);
+    asked.parked.recv().unwrap();
+    link.answer(ConsentAnswer::Refuse);
+    for n in 0..INPUT_QUEUE_CHUNKS {
+        link.route_input(format!("k{n}").as_bytes()).unwrap();
+    }
+
+    let (parked, on_parked) = mpsc::channel();
+    let beyond = {
+        let link = Arc::clone(&link);
+        std::thread::spawn(move || {
+            link.route_input_observed(b"beyond", || {
+                let _ = parked.send(());
+            })
+        })
+    };
+    on_parked.recv().expect("the key beyond the bound waits");
+    assert_eq!(
+        session.events(),
+        Vec::<String>::new(),
+        "nothing is delivered before the outcome"
+    );
+
+    asked.answer.recv().unwrap().unwrap();
+    asked.finish();
+    beyond.join().unwrap().unwrap();
+    let mut expected: Vec<String> = (0..INPUT_QUEUE_CHUNKS).map(|n| format!("input k{n}")).collect();
+    expected.extend(["resize 80x24".to_owned(), "input beyond".to_owned()]);
+    assert_eq!(session.events(), expected);
+}
+
+/// Keys kept for one question are not kept for the next.
+#[test]
+fn keys_kept_for_one_question_are_not_kept_for_the_next() {
+    let (wire, session) = (Wire::default(), Arc::new(Recorder::default()));
+    let link = terminal_link(&wire, &session);
+    let asked = ask_on_a_thread(&link);
+    asked.parked.recv().unwrap();
+    link.answer(ConsentAnswer::Refuse);
+    link.route_input(b"kept").unwrap();
+    asked.answer.recv().unwrap().unwrap();
+    asked.finish();
+
+    let second = ask_on_a_thread(&link);
+    second.parked.recv().unwrap();
+    link.route_input(b"typed at the question").unwrap();
+    link.answer(ConsentAnswer::Refuse);
+    second.answer.recv().unwrap().unwrap();
+    second.finish();
+    assert_eq!(
+        session.events(),
+        ["input kept", "resize 80x24", "resize 80x24"],
+        "the second question kept nothing"
+    );
+}
+
 /// Every return of the screen to the session gives the session's pseudoconsole its size, even unchanged: that is the
 /// repaint of what the question's clear wiped.
 #[test]
@@ -575,6 +696,33 @@ fn end_hosting_ends_a_pending_question_at_once() {
     assert_eq!(kinds, [FrameKind::Consent, FrameKind::Data]);
 }
 
+/// The client of the request the question is for hangs up: the question ends and the screen is the session's again; a
+/// question for a client that has gone is not put.
+#[test]
+fn a_client_that_has_gone_ends_its_question_and_one_that_is_gone_is_not_asked() {
+    let (wire, session) = (Wire::default(), Arc::new(Recorder::default()));
+    let link = terminal_link(&wire, &session);
+    let gone = Arc::new(ClientGone::default());
+    let (parked, on_parked) = mpsc::channel();
+    let asking = {
+        let (link, gone) = (Arc::clone(&link), Arc::clone(&gone));
+        std::thread::spawn(move || {
+            let outcome = link.ask_observed(&a_question(), &gone, || {
+                let _ = parked.send(());
+            });
+            outcome.map(|(answer, _hold)| answer)
+        })
+    };
+    on_parked.recv().expect("the question is waiting");
+    link.client_gone(&gone);
+    assert_eq!(asking.join().unwrap(), Err(Ended));
+    assert_eq!(carrier(&link), Carrier::Session, "the screen is the session's again");
+    assert_eq!(wire.frames().len(), 1, "only the question was written");
+
+    assert!(matches!(link.ask(&a_question(), &gone), Err(Ended)));
+    assert_eq!(wire.frames().len(), 1, "no second question for a client that is gone");
+}
+
 #[test]
 fn ask_on_a_link_whose_hosting_has_ended_or_that_has_ended_is_ended_at_once_and_writes_nothing() {
     for (what, end) in [
@@ -618,7 +766,80 @@ fn a_connection_that_cannot_be_written_ends_the_question_and_gives_the_screen_ba
         (80, 24),
         Some(Arc::clone(&session) as Arc<dyn InputTarget>),
     );
-    assert!(matches!(link.ask(&a_question()), Err(Ended)));
+    assert!(matches!(link.ask(&a_question(), &ClientGone::default()), Err(Ended)));
+    assert_eq!(carrier(&link), Carrier::Session);
+}
+
+/// The session's own input target failed earlier (its pseudoconsole is closed): the input pump has stopped delivering
+/// keys, and the question asked afterwards still gets its answer, and the pump still sees the client go.
+#[test]
+fn a_question_asked_after_the_sessions_input_failed_still_gets_its_answer() {
+    use crate::protocol::{FrameReader, write_frame};
+    use crate::relay::pump_until_peer_gone;
+
+    struct Script<F>(F);
+    impl<F: FnMut() -> Vec<u8>> std::io::Read for Script<F> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let bytes = (self.0)();
+            buf[..bytes.len()].copy_from_slice(&bytes);
+            Ok(bytes.len())
+        }
+    }
+
+    let (wire, session) = (Wire::default(), Arc::new(Recorder::failing()));
+    let link = terminal_link(&wire, &session);
+    let mut sink = super::super::LinkInputSink {
+        link: Arc::clone(&link),
+    };
+    let (mut step, mut asked, mut saw_eof) = (0, None, false);
+    let script = Script(|| {
+        step += 1;
+        let mut bytes = Vec::new();
+        match step {
+            // A key: the session's target fails, and the sink with it.
+            1 => crate::relay::write_data(&mut bytes, Stream::Pty, b"x").unwrap(),
+            // The pump read again, so it saw the failure. Now the question is put and the shim answers it.
+            2 => {
+                let question = ask_on_a_thread(&link);
+                question.parked.recv().expect("the question is waiting for its answer");
+                write_frame(
+                    &mut bytes,
+                    FrameKind::ConsentAnswer,
+                    &ConsentAnswer::Allow.encode().unwrap(),
+                )
+                .unwrap();
+                asked = Some(question);
+            }
+            _ => saw_eof = true,
+        }
+        bytes
+    });
+    pump_until_peer_gone(&mut { script }, &mut FrameReader::new(), &mut sink);
+
+    assert!(
+        saw_eof,
+        "the pump went on reading after the failure, to the client's end"
+    );
+    let asked = asked.expect("the question was asked");
+    assert_eq!(asked.answer.recv().unwrap(), Ok(ConsentAnswer::Allow));
+    asked.finish();
+}
+
+/// The guard of a hosted command gives the connection back whoever carries it by then: what it set is cleared, so
+/// that `end_hosting`, which waits for nothing to be hosted, returns.
+#[test]
+fn dropping_the_elevated_guard_clears_the_hosting_even_when_another_carries_the_connection() {
+    let (wire, session) = (Wire::default(), Arc::new(Recorder::default()));
+    let link = terminal_link(&wire, &session);
+    let guard = host(&link, Arc::new(Recorder::default()));
+    locked(&link.state).carrier = Carrier::Session;
+
+    drop(guard);
+    assert!(
+        locked(&link.state).elevated.is_none(),
+        "the guard cleared what it set; `end_hosting` would wait for ever"
+    );
+    link.end_hosting();
     assert_eq!(carrier(&link), Carrier::Session);
 }
 

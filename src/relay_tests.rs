@@ -452,6 +452,70 @@ fn pump_until_peer_gone_keeps_watching_after_a_sink_failure() {
     assert_eq!(sink.calls, 1, "delivery must stop at the first sink failure");
 }
 
+/// A sink failure stops the data and the resizes, not the protocol's control frames: the answer to a question still
+/// reaches the sink that failed (an `ask` waits for it), and a sink that refuses a control frame does not stop the
+/// pump from watching the peer.
+#[test]
+fn after_a_sink_failure_the_consent_frames_still_reach_the_sink_and_the_pump_sees_the_peer_go() {
+    use crate::protocol::ConsentAnswer;
+    #[derive(Default)]
+    struct FailsData {
+        data: usize,
+        resizes: usize,
+        answers: Vec<ConsentAnswer>,
+    }
+    impl FrameSink for FailsData {
+        fn on_data(&mut self, _stream: Stream, _bytes: &[u8]) -> anyhow::Result<()> {
+            self.data += 1;
+            anyhow::bail!("the session's input target is gone")
+        }
+        fn on_resize(&mut self, _r: Resize) -> anyhow::Result<()> {
+            self.resizes += 1;
+            Ok(())
+        }
+        fn on_consent_answer(&mut self, answer: ConsentAnswer) -> anyhow::Result<()> {
+            self.answers.push(answer);
+            Ok(())
+        }
+    }
+
+    let mut wire = Vec::new();
+    write_data(&mut wire, Stream::Pty, b"breaks the sink").unwrap();
+    write_data(&mut wire, Stream::Pty, b"dropped").unwrap();
+    write_frame(&mut wire, FrameKind::Resize, &Resize { cols: 80, rows: 24 }.encode()).unwrap();
+    write_frame(
+        &mut wire,
+        FrameKind::ConsentAnswer,
+        &ConsentAnswer::Allow.encode().unwrap(),
+    )
+    .unwrap();
+    // A frame the sink refuses (the default `on_consent`) is no end of the watch either.
+    write_frame(&mut wire, FrameKind::Consent, &a_consent_request().encode().unwrap()).unwrap();
+    write_frame(
+        &mut wire,
+        FrameKind::ConsentAnswer,
+        &ConsentAnswer::Refuse.encode().unwrap(),
+    )
+    .unwrap();
+
+    let saw_eof = std::rc::Rc::new(std::cell::Cell::new(false));
+    let mut spy = EofSpy {
+        inner: std::io::Cursor::new(wire),
+        saw_eof: std::rc::Rc::clone(&saw_eof),
+    };
+    let mut sink = FailsData::default();
+    pump_until_peer_gone(&mut spy, &mut FrameReader::new(), &mut sink);
+
+    assert_eq!(sink.data, 1, "data stops at the first sink failure");
+    assert_eq!(sink.resizes, 0, "a resize after the failure is dropped with the data");
+    assert_eq!(
+        sink.answers,
+        [ConsentAnswer::Allow, ConsentAnswer::Refuse],
+        "the answers still reach the sink"
+    );
+    assert!(saw_eof.get(), "the pump keeps watching to the peer's end");
+}
+
 /// The ordinary path is unchanged: a working sink receives every frame, and the pump returns
 /// at end-of-stream rather than after the first one.
 #[test]

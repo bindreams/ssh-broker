@@ -918,14 +918,6 @@ unsafe fn input_loop(
         if stopping.load(Ordering::Relaxed) {
             return;
         }
-        // A question that came while this thread was busy, not parked in the read below.
-        if let Some(request) = consent.take() {
-            if !ask_person(stdin, stdout, &request, stopping, tx) {
-                return;
-            }
-            enc.reset();
-            continue;
-        }
         let mut n = 0u32;
         if unsafe { ReadConsoleInputW(stdin, &mut recs, &mut n) }.is_err() {
             return; // console input closed (SSH side gone)
@@ -935,10 +927,11 @@ unsafe fn input_loop(
         if stopping.load(Ordering::Relaxed) {
             return;
         }
-        // A question woke the read. What this read returned (the wake record, and whatever was typed before the
-        // question reached here) is dropped: the question throws away what was typed ahead, and the agent drops
-        // what reaches it while it asks, so none of it was going to be anyone's. The mouse's state is dropped too,
-        // as the question took its records.
+        // A question wakes the read, whether this thread was parked in it or busy: `on_consent` always injects a wake
+        // record. What this read returned (the wake record, and whatever was typed before the question reached here)
+        // is dropped: the question throws away what was typed ahead, and the agent drops what reaches it while it
+        // asks, so none of it was going to be anyone's. The mouse's state is dropped too, as the question took its
+        // records.
         if let Some(request) = consent.take() {
             if !ask_person(stdin, stdout, &request, stopping, tx) {
                 return;

@@ -1,6 +1,7 @@
 //! Every line the offer shows, in one place. Lines written to the pseudoterminal end in CRLF.
 
 use crate::protocol::ElevationPolicy;
+use crate::shell::config::escape_text;
 
 /// The cost of the plain shell, after Ctrl+C, a failed sign-in or a non-local account.
 pub const COST_LINE: &str =
@@ -206,25 +207,27 @@ pub fn consent_question(command: &str, cwd: &str, answer_line: &str) -> String {
 /// `text` as it is shown to the person: the characters that act on a terminal or hide what a line says are shown as
 /// text and not acted on. A control character (C0, DEL, C1) is `\x` and two hex digits, a line feed is `\n`, and a
 /// bidirectional or zero-width format control, an invisible separator or a tag character is `\u{..}` (see
-/// [`is_hidden_format`]). More than [`CONSENT_SHOWN_UNITS`] characters are cut there and followed by
+/// [`is_hidden_format`]). A backslash that would read as the start of one of these is doubled, so that the text `\n`
+/// and a line feed show differently (the rule of [`escape_text`], which the config file's comments follow too); any
+/// other backslash is left. More than [`CONSENT_SHOWN_UNITS`] characters are cut there and followed by
 /// `... (400 of <n> characters shown)`, with the full count.
 pub fn display(text: &str) -> String {
     let total = text.chars().count();
-    let mut shown = String::new();
-    for c in text.chars().take(CONSENT_SHOWN_UNITS) {
-        match c {
-            '\n' => shown.push_str("\\n"),
-            c if c.is_control() => {
-                use std::fmt::Write as _;
-                let _ = write!(shown, "\\x{:02x}", u32::from(c));
-            }
-            c if is_hidden_format(c) => {
-                use std::fmt::Write as _;
-                let _ = write!(shown, "\\u{{{:x}}}", u32::from(c));
-            }
-            c => shown.push(c),
-        }
-    }
+    let cut: String = text.chars().take(CONSENT_SHOWN_UNITS).collect();
+    let mut shown = escape_text(
+        &cut,
+        |c| match c {
+            '\n' => Some("\\n".to_owned()),
+            c if c.is_control() => Some(format!("\\x{:02x}", u32::from(c))),
+            c if is_hidden_format(c) => Some(format!("\\u{{{:x}}}", u32::from(c))),
+            _ => None,
+        },
+        |rest| match rest {
+            ['n', ..] | ['u', '{', ..] => true,
+            ['x', high, low, ..] => high.is_ascii_hexdigit() && low.is_ascii_hexdigit(),
+            _ => false,
+        },
+    );
     if total > CONSENT_SHOWN_UNITS {
         shown.push_str(&format!("... ({CONSENT_SHOWN_UNITS} of {total} characters shown)"));
     }
@@ -232,13 +235,18 @@ pub fn display(text: &str) -> String {
 }
 
 /// A character that is no control character and shows nothing or changes how the text around it is shown: the
-/// soft hyphen, the Arabic letter mark, the Mongolian vowel separator, the zero-width and directional marks and
+/// soft hyphen, the Arabic letter mark, the combining grapheme joiner, the Hangul fillers, the Mongolian free
+/// variation selectors and vowel separator (U+180B to U+180F), the zero-width and directional marks and
 /// embeddings and isolates (U+200B to U+200F, U+202A to U+202E, U+2066 to U+2069), the word joiner and invisible
 /// operators (U+2060 to U+2064), the deprecated format controls (U+206A to U+206F), the line and paragraph
-/// separators, the byte order mark, the interlinear annotation marks, and the tag characters.
+/// separators, the variation selectors (U+FE00 to U+FE0F, U+E0100 to U+E01EF), the byte order mark, the interlinear
+/// annotation marks, the shorthand format controls (U+1BCA0 to U+1BCA3), and the tag characters.
 fn is_hidden_format(c: char) -> bool {
     matches!(u32::from(c),
-        0x00AD | 0x061C | 0x180E
+        0x00AD | 0x034F | 0x061C | 0x115F | 0x1160 | 0x180B..=0x180F | 0x3164 | 0xFFA0
+        | 0x1BCA0..=0x1BCA3
+        | 0xFE00..=0xFE0F
+        | 0xE0100..=0xE01EF
         | 0x200B..=0x200F
         | 0x2028..=0x202E
         | 0x2060..=0x2064

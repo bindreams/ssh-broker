@@ -6,15 +6,15 @@
 //! [`decide`] says the session's login allowed it. Everything in the request is input from a lower integrity
 //! level: see [`crate::protocol::ElevationRequest`].
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use super::link::{AskGuard, Carrier, Ended, Link};
+use super::link::{AskGuard, Carrier, ClientGone, Ended, Link};
 use super::logout::Killer;
 use super::{
     ExecStarter, HangupGuard, ParkSignal, PtyStarter, PtyTarget, answer_serving, close_unserved_pty, end_pty,
-    prepare_hangup_watch, reap_tree, spawn_stream_pump, start_hangup_watch, teardown_warning,
+    prepare_hangup_watch, reap_tree, spawn_stream_pump, start_hangup_watch, start_watch_with, teardown_warning,
 };
 use crate::afunix::ConnTx;
 use crate::hangup::HangupWatcher;
@@ -120,32 +120,51 @@ impl HostedSession {
 /// the question's hold on the screen, which the caller lets go of, or hands to the command it runs with `--terminal`
 /// ([`run_hosted`]). Anything else is the sentence to refuse with: the answer was no (the screen is back with the
 /// session by then, repainted), or the session ended while it was asked.
+///
+/// `gone` is set when the request's client hangs up ([`watch_question`]): the question ends then, and is not asked at
+/// all if the client is gone already.
 pub(super) fn consent<'a>(
     link: &'a Link,
     request: &ElevationRequest,
     cwd: Option<&Path>,
+    gone: &ClientGone,
 ) -> Result<AskGuard<'a>, String> {
-    let shown = cwd.map_or_else(
-        // Where a command with no folder starts: the agent's own.
-        || {
-            std::env::current_dir()
-                .map(|dir| dir.display().to_string())
-                .unwrap_or_default()
-        },
-        |dir| dir.display().to_string(),
-    );
+    let shown = folder_shown(cwd, std::env::current_dir)?;
     let question = ConsentRequest {
         version: PROTOCOL_VERSION,
         command: request.command.clone(),
         cwd: shown,
     };
-    match link.ask(&question) {
+    match link.ask(&question, gone) {
         Ok((ConsentAnswer::Allow, hold)) => Ok(hold),
         Ok((ConsentAnswer::Refuse, hold)) => {
             drop(hold);
             Err(text::elevation_declined())
         }
         Err(Ended) => Err(text::elevation_session_ended()),
+    }
+}
+
+/// Watch `conn`, the request's connection, while its question is open (and until the command is started): when the
+/// client hangs up, `gone` is set and the question ends ([`Link::client_gone`]). Finishing the watch calls the same
+/// action, so `gone` is read before it is finished. This is the watch [`run_hosted`] starts for a command, with another
+/// action: that one ends the command's tree, which does not exist yet.
+pub(super) fn watch_question(link: &Arc<Link>, conn: &ConnTx, gone: &Arc<ClientGone>) -> Option<HangupGuard> {
+    let (link, gone) = (Arc::clone(link), Arc::clone(gone));
+    start_watch_with(prepare_hangup_watch(conn, HangupWatcher::new), move || {
+        link.client_gone(&gone);
+    })
+}
+
+/// The folder the question shows: where the command starts, `cwd`, or, for a command with no folder, the agent's own
+/// (`current`). `Err` is the sentence to refuse with when that cannot be told: a question that says nothing of where
+/// the command runs is not asked.
+fn folder_shown(cwd: Option<&Path>, current: impl FnOnce() -> std::io::Result<PathBuf>) -> Result<String, String> {
+    match cwd {
+        Some(dir) => Ok(dir.display().to_string()),
+        None => current()
+            .map(|dir| dir.display().to_string())
+            .map_err(|e| text::elevation_cannot_start(&format!("the folder it would start in is not known: {e}"))),
     }
 }
 
