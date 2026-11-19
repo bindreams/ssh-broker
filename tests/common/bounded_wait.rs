@@ -14,8 +14,8 @@ use std::time::Duration;
 use ssh_broker::winutil::OwnedHandle;
 use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows::Win32::System::Threading::{
-    GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
-    WaitForSingleObject,
+    GetExitCodeProcess, GetProcessIoCounters, IO_COUNTERS, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, WaitForSingleObject,
 };
 
 use crate::{desktop, process_list};
@@ -88,10 +88,26 @@ fn exit_status(process: HANDLE) -> String {
     }
 }
 
-/// `root` and its descendants (see [`process_list`]) with each one's I/O counters (the totals of all
-/// its handles since it started, as the system's process list gives them: where a stream of bytes
-/// stopped), its command line, and its threads with their state and wait reason: what a hung tree
-/// is blocked on.
+/// The bytes that `root` and each of its descendants (see [`process_list`]) have read so far, over
+/// all their handles, by process id. Taken twice, the difference says what a process read in between;
+/// a process that cannot be asked is left out.
+pub fn bytes_read(root: HANDLE, root_pid: u32) -> Vec<(u32, u64)> {
+    let read = |process: HANDLE| {
+        let mut counters = IO_COUNTERS::default();
+        // SAFETY: a live handle with query access; a valid out-pointer.
+        unsafe { GetProcessIoCounters(process, &mut counters) }
+            .ok()
+            .map(|()| counters.ReadTransferCount)
+    };
+    let tree = process_list::descendants(root, root_pid);
+    let mut all: Vec<(u32, u64)> = read(root).map(|bytes| (root_pid, bytes)).into_iter().collect();
+    all.extend(tree.members.iter().filter_map(|m| Some((m.pid, read(m.handle())?))));
+    all
+}
+
+/// `root` and its descendants (see [`process_list`]) with each one's I/O counters (totals over all its
+/// handles since start), its command line, and its threads with their state and wait reason: what a
+/// hung tree is blocked on.
 pub fn process_tree(root: HANDLE, root_pid: u32) -> String {
     let tree = process_list::descendants(root, root_pid);
     let mut ids = vec![root_pid];

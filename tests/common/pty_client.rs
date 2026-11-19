@@ -71,6 +71,10 @@ pub struct PtyRun {
     /// the console went quiet after the last input, and which.
     typed: Vec<usize>,
     sent: usize,
+    /// What each process under the helper had read when the first input was about to be sent (a console
+    /// host reads kilobytes of its own while it starts), so that the report of a wait that fails can
+    /// say what each has read SINCE: the bytes sent, for the host that reads them.
+    read_before_input: Option<Vec<(u32, u64)>>,
     /// More to print when a wait fails (the logs the shim and its agent wrote, for one).
     context: Option<Box<dyn Fn() -> String>>,
 }
@@ -132,6 +136,7 @@ impl PtyRun {
             transcript: Vec::new(),
             typed: Vec::new(),
             sent: 0,
+            read_before_input: None,
             context: None,
         }
     }
@@ -164,8 +169,10 @@ impl PtyRun {
 the last bytes it wrote (raw): {:?}
 the lengths of the last lines typed: {:?}
 
-sent {} bytes of key events. Compare with the bytes READ by the helper's pseudoconsole host (the conhost started with `--headless`): it reads them and little else. Farther on the counts are less clean: a process's totals cover all its handles (the agent's writes include its log and every session it serves), and the agent and its console hosts are in this tree only if this console's shim started the agent.
-process tree (each line: the process's I/O totals since it started):
+sent {} bytes of key events. The host that reads them is the `--headless` conhost whose parent= is the helper (the first line of the tree): compare with what it has read since the first of them was sent. Farther on the counts are less clean: a process's counts cover all its handles (the agent's include its log and every session it serves), and the agent and its console hosts are in this tree only if this console's shim started the agent.
+read since the first input was sent, by the processes that were there then:
+{}
+process tree:
 {}
 
 {}",
@@ -173,13 +180,32 @@ process tree (each line: the process's I/O totals since it started):
                 String::from_utf8_lossy(&self.transcript[self.transcript.len().saturating_sub(400)..]),
                 &self.typed[self.typed.len().saturating_sub(3)..],
                 self.sent,
+                self.read_since_input(),
                 crate::bounded_wait::process_tree(self.helper.process.0, self.helper.pid),
                 self.extra()
             ),
         }
     }
 
+    /// What each process that was under the helper at the first input has read since, one per line.
+    fn read_since_input(&self) -> String {
+        let Some(before) = &self.read_before_input else {
+            return "    (no input was sent)\n".to_string();
+        };
+        let now = crate::bounded_wait::bytes_read(self.helper.process.0, self.helper.pid);
+        before
+            .iter()
+            .map(|(pid, then)| match now.iter().find(|(p, _)| p == pid) {
+                Some((_, bytes)) => format!("    pid {pid}: {} bytes\n", bytes.saturating_sub(*then)),
+                None => format!("    pid {pid}: gone\n"),
+            })
+            .collect()
+    }
+
     fn send(&mut self, bytes: &[u8]) {
+        if self.read_before_input.is_none() {
+            self.read_before_input = Some(crate::bounded_wait::bytes_read(self.helper.process.0, self.helper.pid));
+        }
         self.sent += bytes.len();
         assert!(
             write_all_handle(self.input.raw(), bytes),
