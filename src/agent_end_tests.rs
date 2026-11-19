@@ -186,15 +186,16 @@ fn parked_loop_is_ended_by_the_end(
     let connections = Connections::new();
     let _logout_connection = connections.begin();
     let _logout = connections.begin_logout();
-    connections.listener_opened();
+    // The loop is parked for a resource, not in `accept`: the wake does nothing to it.
+    let listener = HeldListener::open(&connections, "agent.sock", |_| {});
     let looped = Arc::new(AtomicBool::new(false));
     let failsafe = Failsafe::new({
-        let connections = Arc::clone(&connections);
+        let listener = Arc::clone(&listener);
         // Closing the listener lets the end go on, so the test can say that the loop had not returned.
-        move || connections.listener_closed()
+        move || listener.close()
     });
     let accepting = std::thread::spawn({
-        let (connections, looped) = (Arc::clone(&connections), Arc::clone(&looped));
+        let (connections, looped, listener) = (Arc::clone(&connections), Arc::clone(&looped), Arc::clone(&listener));
         move || {
             let end = serve_connections_with(
                 Arc::clone(&connections),
@@ -206,13 +207,13 @@ fn parked_loop_is_ended_by_the_end(
                 || connections.is_closing(),
             );
             looped.store(true, Ordering::SeqCst);
-            connections.listener_closed();
+            listener.close();
             end
         }
     });
     on_event.recv().expect("the loop never parked");
 
-    let drained = connections.settle(&|| {});
+    let drained = connections.settle();
 
     let fired = failsafe.finish();
     assert!(
@@ -258,7 +259,7 @@ fn a_loop_that_is_told_the_end_is_decided_before_it_parks_does_not_park() {
     let connections = Connections::new();
     let _logout_connection = connections.begin();
     let _logout = connections.begin_logout();
-    connections.settle(&|| {});
+    connections.settle();
     let before = connections.ended();
     assert!(
         connections.wait_for_an_end(before, || panic!("the loop parked although the end was decided")),

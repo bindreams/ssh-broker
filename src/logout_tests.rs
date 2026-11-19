@@ -176,13 +176,27 @@ fn logout_at_high_asks_agent_sock_only() {
 
 // the line when there is no agent -------------------------------------------------------------
 
-/// An administrator's unelevated process reaches an agent at High as any process does, so no agent found is
-/// the plain "no session": there is no place to look elsewhere.
 #[test]
-fn every_readable_token_gets_the_plain_line() {
-    for elevation in [Elevation::Filtered, Elevation::Full, Elevation::Standard] {
+fn a_token_that_is_not_filtered_gets_the_plain_line() {
+    for elevation in [Elevation::Full, Elevation::Standard] {
         assert_eq!(no_session_line(&Ok(elevation)), NO_SESSION, "{elevation:?}");
     }
+}
+
+/// An administrator's unelevated process reaches an agent at High only on `request.sock`, which the agent may not
+/// serve (it could not bind it), and finds no agent at all when none runs: the line is true of both, and says
+/// where else to ask.
+#[test]
+fn an_administrators_unelevated_process_is_told_where_else_to_ask() {
+    let line = no_session_line(&Ok(Elevation::Filtered));
+    assert_eq!(
+        line,
+        format!(
+            "ssh-broker: no session to end that this process can reach: {}.",
+            crate::offer::text::FILTERED_LOOKS_ELSEWHERE
+        )
+    );
+    assert_eq!(line.lines().count(), 1, "{line}");
 }
 
 #[test]

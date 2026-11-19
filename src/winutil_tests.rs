@@ -837,13 +837,16 @@ fn pair(name: &str, value: &str) -> (OsString, OsString) {
 }
 
 #[test]
-fn environment_block_sorts_replaces_without_case_and_ends_with_a_double_nul() {
+fn environment_block_keeps_the_base_as_it_is_and_places_each_extra_by_its_name() {
+    // A sorted base, as Windows hands one over: a name that begins with `=` first, two names that differ only
+    // in case kept as they are, and the name an extra replaces in another case.
     let base = [
+        pair("=C:", r"C:\work"),
+        pair("alpha", "1"),
+        pair("Alpha", "2"),
         pair("Path", r"C:\Windows"),
         pair("ssh_broker_session", "stale"),
-        pair("=C:", r"C:\work"),
         pair("Zeta", "\u{3042}\u{1F600}"),
-        pair("alpha", "1"),
     ];
     let block = environment_block(base, &[(crate::protocol::SESSION_VARIABLE, "0123"), ("Beta", "2")]);
     assert_eq!(
@@ -851,14 +854,50 @@ fn environment_block_sorts_replaces_without_case_and_ends_with_a_double_nul() {
         [
             r"=C:=C:\work",
             "alpha=1",
+            "Alpha=2",
             "Beta=2",
             r"Path=C:\Windows",
             "SSH_BROKER_SESSION=0123",
             "Zeta=\u{3042}\u{1F600}",
         ],
-        "sorted by name without regard to case; the name in another case is replaced, not kept beside"
+        "each extra sits where its name sorts, without regard to case; the name in another case is replaced, not \
+         kept beside; the rest is as it was"
     );
     assert_eq!(&block[block.len() - 2..], [0, 0], "two NULs at the end");
+}
+
+/// Only the names in `extra` are this function's business: a base that is not sorted is not sorted, and
+/// duplicates in it stay.
+#[test]
+fn environment_block_does_not_sort_or_deduplicate_the_base() {
+    let base = [
+        pair("Zeta", "1"),
+        pair("alpha", "2"),
+        pair("alpha", "3"),
+        pair("Zeta", "4"),
+    ];
+    let block = environment_block(base, &[("Mid", "m")]);
+    let entries = entries_of(&block);
+    assert_eq!(
+        entries
+            .iter()
+            .filter(|entry| *entry != "Mid=m")
+            .cloned()
+            .collect::<Vec<_>>(),
+        ["Zeta=1", "alpha=2", "alpha=3", "Zeta=4"]
+    );
+    assert!(entries.contains(&"Mid=m".to_owned()));
+}
+
+/// Two names that Rust's upper-casing makes one, and Windows does not, are two variables.
+#[test]
+fn environment_block_keeps_names_that_only_unicode_case_folding_joins() {
+    let base = [pair("\u{01C6}", "small"), pair("\u{01C5}", "title")];
+    let block = environment_block(base, &[("A", "b")]);
+    let entries = entries_of(&block);
+    assert!(entries.contains(&"\u{01C6}=small".to_owned()), "{entries:?}");
+    assert!(entries.contains(&"\u{01C5}=title".to_owned()), "{entries:?}");
+    assert_eq!(entries.len(), 3, "{entries:?}");
 }
 
 #[test]

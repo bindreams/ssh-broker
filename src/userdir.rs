@@ -77,14 +77,6 @@ pub fn current_socket_location() -> anyhow::Result<SocketLocation> {
     socket_location_of_token(winutil::own_token()?.0)
 }
 
-/// The plain folder of the account this process runs as, whatever this process's level: where an agent at
-/// High keeps its request socket, for the processes of the account below High to reach. The profile is the
-/// token's, as for [`current_socket_location`].
-pub fn plain_socket_location() -> anyhow::Result<SocketLocation> {
-    // `TooLong` stays downcastable, as in `socket_location_of_token`.
-    Ok(socket_loc::for_profile(&current_profile_dir()?, Integrity::Medium)?)
-}
-
 /// The user's private folder (the one of [`SocketLocation::integrity`]) and its `logs` folder, open by
 /// handle after a walk from the profile directory. They fail separately: serving needs the folder and not a log, so a `logs` that is
 /// refused or broken costs the log only.

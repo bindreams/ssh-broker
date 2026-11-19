@@ -56,28 +56,10 @@ mod stand_in;
 
 use account_fixture::{Account, ServiceLogon};
 use agent_conn::{AgentConn, BackgroundAgent, local_account};
-use sshd_rig::{Login, no_shell_to_carry, run_client};
+use sshd_rig::{Login, TempDir, no_shell_to_carry, run_client};
 use stand_in::Kit;
 
 const CHILD: &str = "the_unelevated_child_connects_to_request_sock";
-
-/// A directory removed with what is in it on drop.
-struct Dir(PathBuf);
-
-impl Dir {
-    fn new(tag: &str) -> Dir {
-        let path = std::env::temp_dir().join(format!("sb-request-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&path);
-        std::fs::create_dir_all(&path).unwrap();
-        Dir(path)
-    }
-}
-
-impl Drop for Dir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
 
 // A socket a process at High made, and a process below High =====
 
@@ -90,13 +72,14 @@ impl Drop for Dir {
 fn an_unelevated_process_of_the_account_connects_to_request_sock_bound_by_a_high_process() {
     account_fixture::assert_elevated();
     let me = Sid::current_user().unwrap();
-    let profile = Dir::new("profile");
+    let profile = TempDir(std::env::temp_dir().join(format!("sb-request-profile-{}", std::process::id())));
     std::fs::create_dir_all(profile.0.join(r"AppData\Local")).unwrap();
     let location = socket_loc::for_profile(&profile.0, Integrity::Medium).expect("the stand-in profile path is short");
     let _folder = userdir::open_socket_dir(&location, &me).expect("make the plain folder at High");
     let listener = Listener::bind(&location.request_path(), Integrity::Medium).expect("bind request.sock at High");
 
-    let pair = Dir::new("pair");
+    let pair = TempDir(std::env::temp_dir().join(format!("sb-request-pair-{}", std::process::id())));
+    std::fs::create_dir_all(&pair.0).unwrap();
     child_entry::write_input(&pair.0, &format!("profile={}\n", profile.0.display()));
     let token = UnelevatedToken::of_this_process().expect("make the unelevated token");
     let line = child_entry::command_line(&std::env::current_exe().unwrap(), CHILD, &pair.0);
@@ -269,8 +252,13 @@ fn an_agent_whose_plain_folder_is_wrongly_owned_serves_sessions_and_logout_says_
     let asked = asker.read_to_end();
     assert_eq!(asked.exit, Some(UNREACHABLE_CODE), "stderr: {:?}", asked.stderr);
     assert!(
-        asked.stderr.contains("could not reach your session") && asked.stderr.contains(socket_loc::SOCKET_DIR_NAME),
-        "logout does not say why: {:?}",
+        asked.stderr.contains("could not reach your session")
+            && asked
+                .stderr
+                .to_lowercase()
+                .contains(&plain.display().to_string().to_lowercase()),
+        "logout does not name the folder {}: {:?}",
+        plain.display(),
         asked.stderr
     );
     assert!(

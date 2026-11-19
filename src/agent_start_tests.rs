@@ -771,6 +771,7 @@ fn the_listener_is_closed_when_the_loop_stops_and_not_held_until_the_process_end
 
     let end = serve_until_drained_in(
         Closes(Arc::clone(&flag)),
+        Arc::new(|| Ok(())),
         &connections,
         || false,
         |_| anyhow::Error::new(Stopped),
@@ -788,6 +789,7 @@ fn the_listener_is_closed_when_the_loop_fails_too() {
 
     let end = serve_until_drained_in(
         Closes(Arc::clone(&flag)),
+        Arc::new(|| Ok(())),
         &connections,
         || false,
         |_| anyhow::anyhow!("the listener failed"),
@@ -804,6 +806,7 @@ fn the_listener_is_closed_when_the_loop_fails_too() {
 /// the test releases it. It says what it does on `events`.
 fn accepting_loop(
     connections: &Arc<Connections>,
+    listener: Arc<HeldListener>,
     woken: std::sync::mpsc::Receiver<()>,
     release: std::sync::mpsc::Receiver<()>,
     events: std::sync::mpsc::Sender<&'static str>,
@@ -816,7 +819,7 @@ fn accepting_loop(
         }
         let late = connections.begin();
         let _ = events.send("counted");
-        connections.listener_closed();
+        listener.close();
         let _ = release.recv();
         let _ = events.send("releasing");
         drop(late);
@@ -833,16 +836,17 @@ fn the_end_is_judged_only_after_the_accept_loop_has_counted_what_it_took_and_clo
             let _ = events.send("parked");
         }
     });
-    connections.listener_opened();
     let (wake, woken) = mpsc::channel();
+    // The loop, not the wake, closes the listener: after it has counted what it took.
+    let listener = HeldListener::open(&connections, "agent.sock", move |_| {
+        let _ = wake.send(());
+    });
     let (release, released) = mpsc::channel();
-    let accepting = accepting_loop(&connections, woken, released, events.clone());
+    let accepting = accepting_loop(&connections, listener, woken, released, events.clone());
     let settler = std::thread::spawn({
         let (connections, events) = (Arc::clone(&connections), events.clone());
         move || {
-            let drained = connections.settle(&move || {
-                let _ = wake.send(());
-            });
+            let drained = connections.settle();
             let _ = events.send("settled");
             drained
         }
@@ -880,7 +884,7 @@ fn the_end_is_judged_only_after_the_accept_loop_has_counted_what_it_took_and_clo
 #[test]
 fn an_end_with_no_accept_loop_wakes_nothing_and_waits_for_nothing() {
     let connections = Connections::new();
-    let drained = connections.settle(&|| panic!("there is no loop to wake"));
+    let drained = connections.settle();
     assert_eq!(drained, Drained::Complete);
     assert!(
         connections.is_closing(),
@@ -888,50 +892,137 @@ fn an_end_with_no_accept_loop_wakes_nothing_and_waits_for_nothing() {
     );
 }
 
+/// A logout on `request.sock` can settle before the main thread has counted `agent.sock`'s listener: that
+/// listener is neither woken nor waited for, and its loop, whose first look at the flag comes after the
+/// count, stops by itself.
 #[test]
-fn a_wake_that_failed_is_logged_and_the_end_does_not_wait_for_the_loop() {
+fn a_listener_opened_after_the_end_was_decided_is_not_woken_and_finds_the_flag_up() {
     let connections = Connections::new();
-    connections.listener_opened();
-    let (log, drained) =
-        crate::test_support::logged(|| connections.settle(&|| connections.wake_failed("no thread for it")));
-    assert_eq!(drained, Drained::Complete);
-    assert!(
-        log.contains("could not wake the accept loop: no thread for it"),
-        "{log}"
+    let _request = HeldListener::open(&connections, "request.sock", |listener| listener.close());
+    assert_eq!(connections.settle(), Drained::Complete);
+
+    let late = connections.listener_opened(
+        "agent.sock",
+        Arc::new(|| panic!("the end was decided before it opened")),
     );
-    assert!(log.contains("ending with the listener open"), "{log}");
+
+    assert!(connections.is_closing(), "its loop is to read the flag and stop");
+    assert!(connections.listener_is_open());
+    drop(late);
+    assert!(!connections.listener_is_open());
+}
+
+/// The case of a fatal `agent.sock` loop at the end: the loop that is still in `accept` is woken by the tally,
+/// whichever loop it is and whoever asked for the end.
+#[test]
+fn a_main_loop_that_fails_while_the_agent_ends_wakes_the_request_loop_and_the_end_completes() {
+    let connections = Connections::new();
+    let (woken, on_woken) = std::sync::mpsc::channel();
+    let _request = HeldListener::open(&connections, "request.sock", move |listener| {
+        woken.send("request.sock").unwrap();
+        listener.close();
+    });
+
+    let end = finish_stopped(anyhow::anyhow!("the listener failed"), &connections, true);
+
+    assert!(format!("{end:#}").contains("the listener failed"), "{end:#}");
+    assert_eq!(on_woken.try_recv(), Ok("request.sock"));
+    assert!(!connections.listener_is_open());
 }
 
 #[test]
-fn a_wake_that_fails_on_its_own_thread_ends_the_wait_for_the_loop() {
+fn a_wake_that_fails_is_logged_with_its_socket_and_the_end_does_not_wait_for_the_loop() {
     let connections = Connections::new();
-    connections.listener_opened();
-    let (log, drained) = crate::test_support::logged(|| {
-        connections.settle(&|| {
-            wake_without_blocking(&connections, || anyhow::bail!("the connect was refused"));
-        })
-    });
+    let _loop = connections.listener_opened("request.sock", Arc::new(|| anyhow::bail!("the connect was refused")));
+    let (log, drained) = crate::test_support::logged(|| connections.settle());
     assert_eq!(drained, Drained::Complete);
-    assert!(log.contains("the connect was refused"), "{log}");
+    assert!(
+        log.contains("could not wake the accept loop of request.sock: the connect was refused"),
+        "{log}"
+    );
+}
+
+#[test]
+fn the_wake_runs_on_a_thread_of_its_own_so_the_caller_never_waits_for_it() {
+    let connections = Connections::new();
+    let (ran_on, on_thread) = std::sync::mpsc::channel();
+    let _loop = connections.listener_opened(
+        "agent.sock",
+        Arc::new(move || {
+            ran_on.send(std::thread::current().id()).unwrap();
+            anyhow::bail!("nothing to wake")
+        }),
+    );
+    // The wake fails, and the warning that says so is captured here, as in every test that makes it.
+    crate::test_support::logged(|| connections.settle());
+    assert_ne!(
+        on_thread.recv().unwrap(),
+        std::thread::current().id(),
+        "the wake ran on the caller's thread"
+    );
+}
+
+/// A wake that fails for one loop gives up on that loop only: the end goes on waiting for the other.
+#[test]
+fn a_wake_that_fails_for_one_loop_does_not_stop_the_end_from_waiting_for_the_other() {
+    let connections = Connections::new();
+    let (events, on_event) = std::sync::mpsc::channel::<&'static str>();
+    let agent = HeldListener::open(&connections, "agent.sock", {
+        let events = events.clone();
+        move |_| {
+            let _ = events.send("agent.sock woken");
+        }
+    });
+    let _request = connections.listener_opened(
+        "request.sock",
+        Arc::new({
+            let events = events.clone();
+            move || {
+                let _ = events.send("request.sock woken");
+                anyhow::bail!("the connect was refused")
+            }
+        }),
+    );
+    let settler = std::thread::spawn({
+        let (connections, events) = (Arc::clone(&connections), events.clone());
+        move || {
+            let (log, drained) = crate::test_support::logged(|| connections.settle());
+            let _ = events.send("settled");
+            (log, drained)
+        }
+    });
+    let mut woken = [on_event.recv().unwrap(), on_event.recv().unwrap()];
+    woken.sort_unstable();
+    assert_eq!(woken, ["agent.sock woken", "request.sock woken"]);
+
+    // The loop of `agent.sock` returns only now, and the end is not over before it has.
+    events.send("agent.sock closes").unwrap();
+    agent.close();
+    let (log, drained) = settler.join().unwrap();
+
+    assert_eq!(drained, Drained::Complete);
+    let order: Vec<_> = on_event.try_iter().collect();
+    assert_eq!(order, ["agent.sock closes", "settled"]);
+    assert!(log.contains("could not wake the accept loop of request.sock"), "{log}");
+    assert!(!log.contains("accept loop of agent.sock"), "{log}");
 }
 
 #[test]
 fn callers_that_ask_for_the_end_together_get_one_decision() {
     let connections = Connections::new();
-    connections.listener_opened();
     let woken = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     // The wake is what closes the listener, as it makes the loop return.
-    let wake = {
-        let (connections, woken) = (Arc::clone(&connections), Arc::clone(&woken));
-        move || {
+    let _listener = HeldListener::open(&connections, "agent.sock", {
+        let woken = Arc::clone(&woken);
+        move |listener| {
             woken.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            connections.listener_closed();
+            listener.close();
         }
-    };
+    });
     let callers: Vec<_> = (0..4)
         .map(|_| {
-            let (connections, wake) = (Arc::clone(&connections), wake.clone());
-            std::thread::spawn(move || connections.settle(&wake))
+            let connections = Arc::clone(&connections);
+            std::thread::spawn(move || connections.settle())
         })
         .collect();
     for caller in callers {
@@ -944,7 +1035,7 @@ fn callers_that_ask_for_the_end_together_get_one_decision() {
 fn a_drain_that_gave_up_on_connections_does_not_wait_for_them_a_second_time() {
     let connections = Connections::with_drain_bound(std::time::Duration::from_millis(10));
     let _hung = connections.begin();
-    let (log, drained) = crate::test_support::logged(|| connections.settle(&|| {}));
+    let (log, drained) = crate::test_support::logged(|| connections.settle());
     assert_eq!(drained, Drained::Abandoned { still_live: 1 });
     assert_eq!(log.matches("had not finished").count(), 1, "{log}");
 }
@@ -1330,22 +1421,6 @@ fn an_error_that_is_not_a_stop_is_still_an_error() {
     assert!(
         format!("{end:#}").contains("the listener failed"),
         "returns without waiting"
-    );
-}
-
-// the wake -----
-
-#[test]
-fn the_wake_runs_on_a_thread_of_its_own_so_the_caller_never_waits_for_it() {
-    let (ran_on, on_thread) = std::sync::mpsc::channel();
-    wake_without_blocking(&Connections::new(), move || {
-        ran_on.send(std::thread::current().id()).unwrap();
-        Ok(())
-    });
-    assert_ne!(
-        on_thread.recv().unwrap(),
-        std::thread::current().id(),
-        "the wake ran on the caller's thread"
     );
 }
 

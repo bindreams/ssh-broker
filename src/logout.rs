@@ -25,13 +25,19 @@ use crate::socket_loc::Integrity;
 /// What `logout` says when there is no agent to ask.
 pub const NO_SESSION: &str = "ssh-broker: no session to end.";
 
-/// The line for "there is no agent to ask". An elevation that cannot be read gets the plain line with the
-/// cause after it, since the token may be a filtered one and the session may be elsewhere. Any other gets the
-/// plain line: an administrator's unelevated process reaches an agent at High as any other does, so none
-/// found is none.
+/// The line for "there is no agent to ask", chosen by the elevation of this process's token. An administrator's
+/// unelevated process (`Elevation::Filtered`) reaches an agent at High only on `request.sock`, which that agent
+/// may not serve, so none found there may be an agent that serves elsewhere: its line says that no session is
+/// reachable from here, which is true whether there is no agent or one without a request socket, and where else
+/// to ask. An elevation that cannot be read gets the plain line with the cause after it, since the token may
+/// be a filtered one and the session may be elsewhere.
 pub fn no_session_line(elevation: &anyhow::Result<Elevation>) -> String {
     match elevation {
-        Ok(Elevation::Filtered | Elevation::Full | Elevation::Standard) => NO_SESSION.to_owned(),
+        Ok(Elevation::Filtered) => format!(
+            "ssh-broker: no session to end that this process can reach: {}.",
+            crate::offer::text::FILTERED_LOOKS_ELSEWHERE
+        ),
+        Ok(Elevation::Full | Elevation::Standard) => NO_SESSION.to_owned(),
         Err(e) => format!(
             "{NO_SESSION} Note: {}, so the session may be elsewhere.",
             crate::offer::text::elevation_unreadable_clause(&format!("{e:#}"))

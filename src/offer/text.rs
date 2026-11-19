@@ -142,8 +142,8 @@ pub fn elevation_unreadable(cause: &str) -> String {
 
 /// What an administrator's unelevated process (`account::Elevation::Filtered`) is told when it asks for the
 /// agent that serves its folder and finds none: the account's agent runs elevated and serves the elevated
-/// folder, so the plain one it looks in has no `agent.sock`. A clause, for `verify`'s row: `logout` does not need
-/// it, since it asks the agent's request socket there.
+/// folder, so the plain one it looks in has no `agent.sock`. A clause, for `verify`'s row and for `logout`'s line
+/// when neither socket of the plain folder is served.
 pub const FILTERED_LOOKS_ELSEWHERE: &str = "this account is an administrator and its agent serves elevated processes: run this from an elevated prompt or from an SSH login that asked for SSH_BROKER_ELEVATION=always";
 
 /// Told when a High login lacks `SeImpersonatePrivilege`, which `CreateProcessWithTokenW` needs; the way

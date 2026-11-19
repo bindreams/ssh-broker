@@ -15,12 +15,7 @@ fn main() -> anyhow::Result<()> {
         // so that none is inside the process's exit while another begins it.
         Route::Agent(args) => match agent::run(args) {
             Ok(()) => agent::end_process(0),
-            Err(e) => {
-                // Reaches an operator's console or redirect; after FreeConsole it is dropped and the exit code is the
-                // record.
-                eprintln!("ssh-broker agent: {e:#}");
-                agent::end_process(agent::exit_code_of(&e))
-            }
+            Err(e) => agent::end_on_error(&e),
         },
         Route::Usage(verb) => {
             eprintln!("{}", usage(verb));

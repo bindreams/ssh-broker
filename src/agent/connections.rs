@@ -49,10 +49,45 @@ struct Tally {
     /// The end is decided: the accept loop returns after the connection it is accepting, which it
     /// counts first.
     closing: bool,
-    /// How many accept loops hold a listener (`agent.sock`, and `request.sock` where the agent keeps one).
-    listeners: usize,
-    /// Why the loop could not be woken, if it could not: nothing will make it return.
+    /// The listeners the accept loops hold (`agent.sock`, and `request.sock` where the agent keeps one), each
+    /// with the way to wake its loop.
+    listeners: Vec<Registered>,
+    /// The next [`Registered::id`].
+    next_listener: u64,
+}
+
+/// A listener an accept loop holds, as the tally knows it.
+struct Registered {
+    id: u64,
+    /// Which socket it is, for the log.
+    socket: &'static str,
+    wake: WakeConnect,
+    /// Why the loop could not be woken, if it could not: nothing will make it return, so the end does not
+    /// wait for it.
     wake_failed: Option<String>,
+}
+
+/// A connect to a listener of this agent, which makes the accept loop blocked on it return from `accept`.
+pub(super) type WakeConnect = Arc<dyn Fn() -> anyhow::Result<()> + Send + Sync>;
+
+/// A listener that is registered with the tally; see [`Connections::listener_opened`]. Dropping it is the
+/// loop's listener being closed.
+pub(super) struct OpenListener {
+    connections: Arc<Connections>,
+    id: u64,
+}
+
+impl Drop for OpenListener {
+    fn drop(&mut self) {
+        self.connections.change(|tally| {
+            let before = tally.listeners.len();
+            tally.listeners.retain(|listener| listener.id != self.id);
+            debug_assert!(
+                tally.listeners.len() < before,
+                "a listener closed that was never opened"
+            );
+        });
+    }
 }
 
 /// A live connection. Dropping it, on any exit from the handler including a panic, ends it.
@@ -85,8 +120,8 @@ impl Connections {
                 ended: 0,
                 logouts: 0,
                 closing: false,
-                listeners: 0,
-                wake_failed: None,
+                listeners: Vec::new(),
+                next_listener: 0,
             }),
             ended: Condvar::new(),
             settled: std::sync::OnceLock::new(),
@@ -114,7 +149,7 @@ impl Connections {
     /// Whether an accept loop holds a listener.
     #[cfg(test)]
     pub(super) fn listener_is_open(&self) -> bool {
-        self.lock().listeners > 0
+        !self.lock().listeners.is_empty()
     }
 
     /// Wake everything parked on the tally without changing it, as a failsafe in a test does.
@@ -173,18 +208,32 @@ impl Connections {
         }
     }
 
-    /// An accept loop is about to run over a listener. Called once for each, before the end can be decided:
-    /// an end that does not see a listener neither wakes its loop nor waits for it.
-    pub(super) fn listener_opened(&self) {
-        self.change(|tally| tally.listeners += 1);
-    }
-
-    /// A loop has returned and its listener is closed.
-    pub(super) fn listener_closed(&self) {
-        self.change(|tally| {
-            debug_assert!(tally.listeners > 0, "a listener closed that was never opened");
-            tally.listeners = tally.listeners.saturating_sub(1);
+    /// An accept loop is about to run over a listener of `socket`: register it with `wake`, the connect
+    /// that makes the loop return from `accept`. The listener counts as held until the guard is dropped,
+    /// which the loop does once it has returned and closed the listener.
+    ///
+    /// The loop calls this before its first look at the flag [`Connections::is_closing`], so whichever way
+    /// the end is decided relative to it, the loop stops: an end decided before the registration finds
+    /// nothing to wake or wait for, and the loop reads the flag up and returns without blocking; an end
+    /// decided after wakes it ([`Connections::settle`]). That a `logout` on `request.sock` can settle before
+    /// the main thread has registered `agent.sock`'s listener is the first case. A listener registered while
+    /// the end is already waiting for the others is not woken by it either, and stops by itself the same way.
+    pub(super) fn listener_opened(self: &Arc<Self>, socket: &'static str, wake: WakeConnect) -> OpenListener {
+        let id = self.change(|tally| {
+            let id = tally.next_listener;
+            tally.next_listener += 1;
+            tally.listeners.push(Registered {
+                id,
+                socket,
+                wake,
+                wake_failed: None,
+            });
+            id
         });
+        OpenListener {
+            connections: Arc::clone(self),
+            id,
+        }
     }
 
     /// Whether the end is decided: the accept loop stops after its current accept.
@@ -192,18 +241,22 @@ impl Connections {
         self.lock().closing
     }
 
-    /// The loop cannot be woken, so waiting for it would not end: the end goes on without it, and
-    /// says why (see [`Connections::settle`]).
-    pub(super) fn wake_failed(&self, why: &str) {
+    /// The loop of listener `id` cannot be woken, so waiting for it would not end: the end goes on without
+    /// it, and says why (see [`Connections::settle`]). A listener that has been closed meanwhile is nothing
+    /// to report: its loop did return.
+    fn wake_failed(&self, id: u64, why: &str) {
         self.change(|tally| {
-            tally.wake_failed.get_or_insert_with(|| why.to_string());
+            if let Some(listener) = tally.listeners.iter_mut().find(|listener| listener.id == id) {
+                listener.wake_failed.get_or_insert_with(|| why.to_string());
+            }
         });
     }
 
     /// Decide the end of the agent: wait until only `logout` requests are live, stop the accept loops
-    /// (`agent.sock`'s, and `request.sock`'s where the agent keeps one) and close their listeners, and
-    /// judge again. Returns how the last judgement went. Any number of callers (the `logout` handlers,
-    /// the thread that ran the loop) may ask; the first does the work and the others wait for it.
+    /// (every listener registered by [`Connections::listener_opened`]: `agent.sock`'s, and `request.sock`'s
+    /// where the agent keeps one) and close their listeners, and judge again. Returns how the last judgement
+    /// went. Any number of callers (the `logout` handlers, the thread that ran the loop) may ask; the first
+    /// does the work and the others wait for it.
     ///
     /// The first wait is with the listeners open, so a login that arrives meanwhile gets the refusal.
     /// A loop counts every connection it accepts before it looks at the flag set here, and its
@@ -211,12 +264,10 @@ impl Connections {
     /// took. A connection the system queued and nobody accepted is reset with the listener; its shim
     /// goes back to its no-agent path. If the first wait gave up on connections that do not finish, the
     /// second is not made: those would not finish either.
-    ///
-    /// `wake` makes a loop that is blocked in `accept` return from it.
-    pub(super) fn settle(&self, wake: &dyn Fn()) -> Drained {
+    pub(super) fn settle(self: &Arc<Self>) -> Drained {
         *self.settled.get_or_init(|| {
             let first = self.wait_until_only_logouts_live();
-            self.close_listener(wake);
+            self.close_listeners();
             match first {
                 Drained::Complete => self.wait_until_only_logouts_live(),
                 abandoned @ Drained::Abandoned { .. } => abandoned,
@@ -224,31 +275,65 @@ impl Connections {
         })
     }
 
-    /// Raise the flag, wake the loops and wait until every one has returned and its listener is closed, or
-    /// until a wake has failed. Nothing is waited for if no loop holds a listener.
-    fn close_listener(&self, wake: &dyn Fn()) {
+    /// Raise the flag, wake the loops of the listeners registered now, and wait until every one of them has
+    /// returned and its listener is closed, or its wake has failed. Nothing is waited for if no loop holds a
+    /// listener. Each wake is made on a thread of its own ([`Connections::wake_without_blocking`]).
+    fn close_listeners(self: &Arc<Self>) {
         // The change wakes a loop parked for a resource (see `wait_for_an_end`): it is not in
-        // `accept`, where `wake` reaches it.
-        if !self.change(|tally| {
+        // `accept`, where the wake reaches it.
+        let to_wake: Vec<_> = self.change(|tally| {
             tally.closing = true;
-            tally.listeners > 0
-        }) {
+            tally
+                .listeners
+                .iter()
+                .map(|listener| (listener.id, listener.socket, Arc::clone(&listener.wake)))
+                .collect()
+        });
+        if to_wake.is_empty() {
             return;
         }
-        wake();
+        for (id, socket, wake) in to_wake {
+            self.wake_without_blocking(id, socket, wake);
+        }
         let tally = self.lock();
         let tally = self
             .ended
             .wait_while(tally, |tally| {
-                let parks = tally.listeners > 0 && tally.wake_failed.is_none();
+                let parks = tally.listeners.iter().any(|listener| listener.wake_failed.is_none());
                 if parks {
                     (self.drain_parks)(tally.live.saturating_sub(tally.logouts));
                 }
                 parks
             })
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let (true, Some(why)) = (tally.listeners > 0, &tally.wake_failed) {
-            tracing::warn!("could not wake the accept loop: {why}; ending with the listener open");
+        for listener in &tally.listeners {
+            if let Some(why) = &listener.wake_failed {
+                tracing::warn!(
+                    "could not wake the accept loop of {}: {why}; not waiting for it",
+                    listener.socket
+                );
+            }
+        }
+    }
+
+    /// Run `wake`, the connect to `socket`'s listener `id`, on a thread of its own, so that the caller
+    /// never waits for it. The wake is a connect to the agent's own listener, and a connect to a listener
+    /// whose queue is full may wait for room in it; the caller may be the `logout` handler. A wake that has
+    /// to wait wakes nothing that needs waking: the queue is full only if the accept loop is not blocked in
+    /// `accept`, and a loop that is not blocked reads the flag before its next `accept`.
+    ///
+    /// A wake that fails, or a thread that cannot be started, is recorded against the listener.
+    fn wake_without_blocking(self: &Arc<Self>, id: u64, socket: &'static str, wake: WakeConnect) {
+        let on_thread = Arc::clone(self);
+        let started = std::thread::Builder::new()
+            .name(format!("wake-{socket}"))
+            .spawn(move || {
+                if let Err(e) = wake() {
+                    on_thread.wake_failed(id, &format!("{e:#}"));
+                }
+            });
+        if let Err(e) = started {
+            self.wake_failed(id, &format!("no thread for it: {e}"));
         }
     }
 
@@ -278,6 +363,39 @@ impl Connections {
                 .wait(tally)
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
         }
+    }
+}
+
+/// A listener registered with the tally that a test closes from any thread, as its loop does: by [`HeldListener::close`],
+/// or when the end wakes it, if `on_wake` says so.
+#[cfg(test)]
+pub(super) struct HeldListener(Mutex<Option<OpenListener>>);
+
+#[cfg(test)]
+impl HeldListener {
+    /// Register a listener of `socket`. When the end wakes it, `on_wake` is called with the listener, which stays
+    /// held until it is closed (by `on_wake`, or by the test).
+    pub(super) fn open(
+        connections: &Arc<Connections>,
+        socket: &'static str,
+        on_wake: impl Fn(&HeldListener) + Send + Sync + 'static,
+    ) -> Arc<HeldListener> {
+        Arc::new_cyclic(|this: &std::sync::Weak<HeldListener>| {
+            let this = this.clone();
+            let wake: WakeConnect = Arc::new(move || {
+                if let Some(listener) = this.upgrade() {
+                    on_wake(&listener);
+                }
+                Ok(())
+            });
+            HeldListener(Mutex::new(Some(connections.listener_opened(socket, wake))))
+        })
+    }
+
+    /// The loop returned and its listener is closed. Does nothing the second time.
+    pub(super) fn close(&self) {
+        let open = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
+        drop(open);
     }
 }
 

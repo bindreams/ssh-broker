@@ -1,7 +1,7 @@
 //! Unit tests for the agent's answer to `logout`. In-process: no socket, no shell, no process ends.
 use super::*;
 use crate::afunix::{ConnRx, ConnTx, split};
-use crate::agent::Drained;
+use crate::agent::{Drained, HeldListener};
 use crate::protocol::{ExitCode, FrameKind, FrameReader, Stream};
 use crate::relay::{Outcome, TestSink, pump_decode, write_data};
 use std::io::Write;
@@ -324,20 +324,23 @@ fn two_logouts_at_once_both_end_the_agent() {
 }
 
 /// A control whose accept loop is the test: `woke` is told each time the loop is woken, and the wake
-/// makes the loop return and close the listener, as a real one does.
-fn control_with_a_loop(connections: &Arc<Connections>, woke: impl Fn() + Send + Sync + 'static) -> Control {
-    connections.listener_opened();
-    let connections = Arc::clone(connections);
-    Control::new(true, Arc::clone(&connections)).with_waker(move || {
+/// makes the loop return and close the listener, as a real one does. The listener is returned: the loop
+/// holds it while the test does.
+fn control_with_a_loop(
+    connections: &Arc<Connections>,
+    woke: impl Fn() + Send + Sync + 'static,
+) -> (Control, Arc<HeldListener>) {
+    let listener = HeldListener::open(connections, "agent.sock", move |listener| {
         woke();
-        connections.listener_closed();
-    })
+        listener.close();
+    });
+    (Control::new(true, Arc::clone(connections)), listener)
 }
 
 #[test]
 fn ending_wakes_the_accept_loop_once_however_many_logouts_ask() {
     let woken = Arc::new(AtomicUsize::new(0));
-    let control = {
+    let (control, _listener) = {
         let woken = Arc::clone(&woken);
         control_with_a_loop(&Connections::new(), move || {
             woken.fetch_add(1, Ordering::SeqCst);
@@ -365,7 +368,7 @@ fn the_accept_loop_is_woken_once_the_shells_are_ended_and_every_other_connection
             let _ = events.send("parked");
         }
     });
-    let control = control_with_a_loop(&connections, {
+    let (control, _listener) = control_with_a_loop(&connections, {
         let events = events.clone();
         move || {
             let _ = events.send("woken");
@@ -415,7 +418,7 @@ fn the_accept_loop_is_woken_after_the_flag_that_stops_it_is_up() {
     // A loop woken before the flag is raised would look, find nothing to stop for and accept again.
     let connections = Connections::new();
     let seen = Arc::new(Mutex::new(None));
-    let control = control_with_a_loop(&connections, {
+    let (control, _listener) = control_with_a_loop(&connections, {
         let (connections, seen) = (Arc::clone(&connections), Arc::clone(&seen));
         move || *seen.lock().unwrap() = Some(connections.is_closing())
     });
@@ -1019,29 +1022,67 @@ fn an_id_from_another_agent_run_is_unknown_to_a_new_agent() {
 #[test]
 fn the_tally_waits_for_every_listener_to_close() {
     let connections = Connections::new();
-    connections.listener_opened();
-    connections.listener_opened();
     let (woken, on_wake) = mpsc::channel();
+    let open = |socket: &'static str| {
+        let woken = woken.clone();
+        HeldListener::open(&connections, socket, move |_| woken.send(socket).unwrap())
+    };
+    let (agent, request) = (open("agent.sock"), open("request.sock"));
     let (returned, on_return) = mpsc::channel();
     let ender = {
         let connections = Arc::clone(&connections);
         std::thread::spawn(move || {
-            connections.settle(&|| woken.send(()).unwrap());
+            connections.settle();
             returned.send(()).unwrap();
         })
     };
-    on_wake.recv().unwrap();
+    let mut loops = [on_wake.recv().unwrap(), on_wake.recv().unwrap()];
+    loops.sort_unstable();
+    assert_eq!(
+        loops,
+        ["agent.sock", "request.sock"],
+        "each loop is woken, by the tally"
+    );
     assert!(connections.is_closing(), "the flag is up when the loops are woken");
-    connections.listener_closed();
+    agent.close();
     assert!(
         on_return.try_recv().is_err(),
         "one listener is still open, so the end is not settled"
     );
     assert!(connections.listener_is_open());
-    connections.listener_closed();
+    request.close();
     on_return.recv().unwrap();
     assert!(!connections.listener_is_open());
     ender.join().unwrap();
+}
+
+/// One `logout`, whichever socket it came in on, wakes the loop of each socket, and the end completes once both
+/// have returned.
+#[test]
+fn a_logout_wakes_the_loop_of_each_socket_and_ends_the_agent() {
+    let connections = Connections::new();
+    let (woken, on_wake) = mpsc::channel();
+    let open = |socket: &'static str| {
+        let woken = woken.clone();
+        HeldListener::open(&connections, socket, move |listener| {
+            woken.send(socket).unwrap();
+            listener.close();
+        })
+    };
+    let (_agent, _request) = (open("agent.sock"), open("request.sock"));
+    let control = Control::new(true, Arc::clone(&connections));
+    let ended = AtomicBool::new(false);
+
+    handle_logout(&mut Closed, &mut Vec::new(), &control, || {
+        ended.store(true, Ordering::SeqCst)
+    })
+    .unwrap();
+
+    let mut loops: Vec<_> = on_wake.try_iter().collect();
+    loops.sort_unstable();
+    assert_eq!(loops, ["agent.sock", "request.sock"]);
+    assert!(ended.load(Ordering::SeqCst), "the end completed");
+    assert!(!connections.listener_is_open());
 }
 
 /// A connection on the request socket is a live connection: the end waits for it, as for a session's.

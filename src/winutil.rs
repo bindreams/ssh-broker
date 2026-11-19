@@ -531,41 +531,49 @@ fn handle_list(inherit: &[HANDLE]) -> Vec<HANDLE> {
 }
 
 /// The Unicode environment block for a child: `base` with `extra` put over it, as `NAME=VALUE` entries each
-/// ended by a NUL, sorted by name without regard to case (as Windows documents a block), and one more NUL at
-/// the end. A name in `extra` replaces the same name in `base`, compared without regard to case, and a name
-/// given twice in `extra` is its last value. A name that begins with `=` (a drive's current folder) is an
-/// ordinary name here.
+/// ended by a NUL, and one more NUL at the end.
+///
+/// Only the names in `extra` are this function's business. The base keeps its entries, their order and its
+/// duplicates (a name that begins with `=`, a drive's current folder, stays where it is), except that an entry
+/// whose name is a name in `extra`, compared without regard to ASCII case (the names in `extra` are ASCII), is
+/// removed. Each `extra` entry goes before the first entry whose name sorts after its own, by the same
+/// comparison, so a block that was sorted, as Windows hands one over, stays sorted. A name given twice in `extra`
+/// is its last value.
 pub fn environment_block(base: impl IntoIterator<Item = (OsString, OsString)>, extra: &[(&str, &str)]) -> Vec<u16> {
+    use std::cmp::Ordering;
     use std::os::windows::ffi::OsStrExt;
-    // What two names are compared by: each unit upper-cased when that is one unit, else as it is (a surrogate,
-    // for one).
-    let folded = |name: &[u16]| -> Vec<u16> {
-        name.iter()
-            .map(|&unit| {
-                let mut upper = char::from_u32(u32::from(unit)).into_iter().flat_map(char::to_uppercase);
-                match (upper.next(), upper.next()) {
-                    (Some(c), None) => u16::try_from(u32::from(c)).unwrap_or(unit),
-                    _ => unit,
-                }
-            })
-            .collect()
-    };
-    // (the name by which entries are compared, name, value)
-    let mut entries: Vec<(Vec<u16>, Vec<u16>, Vec<u16>)> = Vec::new();
-    let mut put = |name: Vec<u16>, value: Vec<u16>| {
-        let key = folded(&name);
-        entries.retain(|(other, _, _)| *other != key);
-        entries.push((key, name, value));
-    };
-    for (name, value) in base {
-        put(name.encode_wide().collect(), value.encode_wide().collect());
+    // Names compare unit by unit, with ASCII letters upper-cased.
+    fn compare(a: &[u16], b: &[u16]) -> Ordering {
+        let fold = |unit: &u16| {
+            if *unit < 0x80 {
+                u16::from((*unit as u8).to_ascii_uppercase())
+            } else {
+                *unit
+            }
+        };
+        a.iter().map(fold).cmp(b.iter().map(fold))
     }
+    // (name, value)
+    let mut extras: Vec<(Vec<u16>, Vec<u16>)> = Vec::new();
     for (name, value) in extra {
-        put(name.encode_utf16().collect(), value.encode_utf16().collect());
+        let name: Vec<u16> = name.encode_utf16().collect();
+        extras.retain(|(other, _)| compare(other, &name) != Ordering::Equal);
+        extras.push((name, value.encode_utf16().collect()));
     }
-    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut entries: Vec<(Vec<u16>, Vec<u16>)> = base
+        .into_iter()
+        .map(|(name, value)| -> (Vec<u16>, Vec<u16>) { (name.encode_wide().collect(), value.encode_wide().collect()) })
+        .filter(|(name, _)| !extras.iter().any(|(extra, _)| compare(extra, name) == Ordering::Equal))
+        .collect();
+    for (name, value) in extras {
+        let at = entries
+            .iter()
+            .position(|(other, _)| compare(other, &name) == Ordering::Greater)
+            .unwrap_or(entries.len());
+        entries.insert(at, (name, value));
+    }
     let mut block = Vec::new();
-    for (_, name, value) in entries {
+    for (name, value) in entries {
         block.extend(name);
         block.push(u16::from(b'='));
         block.extend(value);

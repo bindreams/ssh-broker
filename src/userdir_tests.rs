@@ -40,16 +40,6 @@ fn current_socket_location_lies_inside_the_profile() {
     assert!(loc.path().ends_with(format!(r"AppData\Local\{folder}\agent.sock")));
 }
 
-/// The location of an agent at High's request socket is the plain folder's, whatever level this process is at.
-#[test]
-fn the_plain_socket_location_is_the_plain_folder_at_any_level() {
-    let profile = profile_dir_of_token(own_token().unwrap().0).unwrap();
-    let plain = plain_socket_location().unwrap();
-    assert_eq!(plain, socket_loc::for_profile(&profile, Integrity::Medium).unwrap());
-    assert_eq!(plain.integrity(), Integrity::Medium);
-    assert!(plain.dir().ends_with("ssh-broker"));
-}
-
 #[test]
 fn current_socket_location_fits_sockaddr_un() {
     let loc = current_socket_location().unwrap();

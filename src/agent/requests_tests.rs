@@ -2,8 +2,8 @@
 //! ended. Real sockets in a stand-in profile, which holds a plain folder at the level these tests run at.
 use super::*;
 use crate::acl::Sid;
-use crate::afunix::{self, Listener};
-use crate::agent::{Connections, Drained, Stopped, wake_listeners};
+use crate::afunix::{self, AcceptError, Listener};
+use crate::agent::{Connections, Drained, Stopped};
 use crate::protocol::{FrameKind, FrameReader, Handshake, Stream, write_frame};
 use crate::relay::{Outcome, TestSink, pump_decode, write_data};
 use crate::socket_loc::Integrity;
@@ -201,22 +201,17 @@ struct Serving {
 }
 
 fn serve_on(folder: &Arc<SocketDir>, listener: Listener, connections: Arc<Connections>) -> Serving {
-    let wake = Arc::new(crate::agent::RequestWake::default());
-    let control = Arc::new(Control::new(true, Arc::clone(&connections)).with_waker(wake_listeners(
-        &connections,
-        || Ok(()),
-        &wake,
-    )));
+    let control = Arc::new(Control::new(true, Arc::clone(&connections)));
     let (ended, on_end) = mpsc::channel();
     let (handling, on_handling) = mpsc::channel();
     let loop_thread = std::thread::spawn({
         let (connections, control, folder) = (Arc::clone(&connections), Arc::clone(&control), Arc::clone(folder));
         move || {
-            crate::agent::serve_requests_in(
+            crate::agent::serve_listener(
+                "request.sock",
                 listener,
-                &connections,
-                &wake,
                 Arc::new(move || folder.connect_request().map(drop)),
+                &connections,
                 |listener| {
                     crate::agent::accept_loop(
                         listener,
@@ -294,7 +289,6 @@ fn an_idle_connection_on_the_request_socket_is_counted_by_the_end() {
 fn a_request_listener_that_fails_does_not_end_the_sessions() {
     let connections = Connections::new();
     let control = Control::new(true, Arc::clone(&connections));
-    let wake = crate::agent::RequestWake::default();
     let session = control.reserve().unwrap().unwrap();
     let killed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let session = session
@@ -306,7 +300,7 @@ fn a_request_listener_that_fails_does_not_end_the_sessions() {
         })
         .unwrap();
 
-    let end = crate::agent::serve_requests_in((), &connections, &wake, Arc::new(|| Ok(())), |()| {
+    let end = crate::agent::serve_listener("request.sock", (), Arc::new(|| Ok(())), &connections, |()| {
         anyhow::anyhow!("the listener failed")
     });
 
@@ -319,112 +313,103 @@ fn a_request_listener_that_fails_does_not_end_the_sessions() {
         0,
         "no session was touched"
     );
-    assert!(wake.lock().is_none(), "nothing is left to wake");
     assert!(control.reserve().unwrap().is_some(), "and sessions can still start");
     drop(session);
 }
 
-// The wake -----
-
-/// Collect what the wake connects to, once every thread it started has finished.
-fn connects(wake: &Arc<crate::agent::RequestWake>, times: usize, request_open: bool) -> Vec<&'static str> {
+/// The request loop over an `accept` that fails with `accept`'s error, on a tally of its own with nothing live;
+/// what the loop ended with.
+fn request_loop_met(accept: impl FnMut() -> Result<socket2::Socket, AcceptError>) -> anyhow::Error {
     let connections = Connections::new();
-    let (tx, rx) = mpsc::channel();
-    if request_open {
-        let tx = tx.clone();
-        *wake.lock() = Some(Arc::new(move || {
-            tx.send("request").unwrap();
-            Ok(())
-        }));
-    }
-    let waker = wake_listeners(
-        &connections,
-        {
-            let tx = tx.clone();
-            move || {
-                tx.send("agent").unwrap();
-                Ok(())
-            }
-        },
-        wake,
-    );
-    for _ in 0..times {
-        waker();
-    }
-    drop(waker);
-    wake.lock().take();
-    drop(tx);
-    // Ends when every thread the wake started has finished and let go of its sender.
-    rx.iter().collect()
+    let control = Arc::new(Control::new(true, Arc::clone(&connections)));
+    crate::agent::serve_listener("request.sock", (), Arc::new(|| Ok(())), &connections, |()| {
+        crate::agent::accept_loop_with(
+            accept,
+            &connections,
+            &control,
+            || connections.is_closing(),
+            |_conn, _control| Ok(()),
+        )
+    })
 }
 
+/// A shortage with no connection of the agent live ends the agent when the request loop meets it, as it does
+/// when the loop of `agent.sock` does: nothing is live, so nothing is lost, and the next login starts an agent
+/// with both sockets. Without that, the agent would serve `agent.sock` for the rest of its life with no request
+/// socket, and every `logout` from an unelevated session would find nothing.
 #[test]
-fn the_wake_reaches_agent_sock_and_the_request_socket_only_while_its_loop_is_open() {
-    let wake = Arc::new(crate::agent::RequestWake::default());
-    assert_eq!(connects(&wake, 1, false), ["agent"], "no request loop, nothing to wake");
-    let mut open = connects(&wake, 1, true);
-    open.sort_unstable();
-    assert_eq!(open, ["agent", "request"]);
+fn a_shortage_with_nothing_live_ends_the_agent_whichever_socket_met_it() {
+    let end = request_loop_met(|| {
+        Err(AcceptError::Exhausted {
+            code: 10055,
+            source: std::io::Error::from_raw_os_error(10055),
+        })
+    });
+    let mut ended = Vec::new();
+    crate::agent::request_loop_ended(&end, |err| ended.push(format!("{err:#}")));
+    assert_eq!(ended.len(), 1, "the agent was ended once: {end:#}");
+    assert!(ended[0].contains("no connection of this agent is live"), "{}", ended[0]);
 }
+
+/// Anything else that stops the request loop leaves the agent and its sessions as they are.
+#[test]
+fn every_other_end_of_the_request_loop_leaves_the_agent_running() {
+    let failed = request_loop_met(|| Err(AcceptError::Fatal(anyhow::anyhow!("the listener broke"))));
+    let stopped = anyhow::Error::new(Stopped);
+    for (what, end) in [("a listener that failed", failed), ("an end that was decided", stopped)] {
+        crate::agent::request_loop_ended(&end, |err| panic!("{what} ended the agent: {err:#}"));
+    }
+}
+
+// The wake -----
 
 /// A connect that fails while its loop is open means the loop cannot be woken: the end stops waiting for it.
 #[test]
 fn a_request_loop_that_cannot_be_woken_does_not_hold_the_end_for_ever() {
     let connections = Connections::new();
-    let wake = Arc::new(crate::agent::RequestWake::default());
-    let control =
-        Control::new(true, Arc::clone(&connections)).with_waker(wake_listeners(&connections, || Ok(()), &wake));
+    let control = Control::new(true, Arc::clone(&connections));
     // A loop that holds its listener and cannot be woken, and never returns.
-    connections.listener_opened();
-    *wake.lock() = Some(Arc::new(|| Err(anyhow::anyhow!("no connection"))));
-    assert_eq!(control.settle(), Drained::Complete);
+    let _loop = connections.listener_opened("request.sock", Arc::new(|| Err(anyhow::anyhow!("no connection"))));
+    let (log, drained) = crate::test_support::logged(|| control.settle());
+    assert_eq!(drained, Drained::Complete);
+    assert!(
+        log.contains("could not wake the accept loop of request.sock: no connection"),
+        "{log}"
+    );
 }
 
 // Opening the folder -----
 
 #[test]
 fn only_an_agent_at_high_opens_the_plain_folder() {
-    let result = crate::agent::open_request_folder(
-        Integrity::Medium,
-        || panic!("an agent below High looks for no plain folder"),
-        |_| panic!("and opens none"),
-    );
+    let profile = TempProfile::new("rq-medium");
+    let result = crate::agent::open_request_folder(&profile.location_at(Integrity::Medium), |_| {
+        panic!("an agent below High opens no plain folder")
+    });
     assert!(result.is_none());
 }
 
 #[test]
 fn a_plain_folder_that_cannot_be_opened_is_logged_and_the_agent_serves_without_it() {
-    let profile = TempProfile::new("rq-refused");
+    // A short tag: the elevated folder of the held location has the longer socket path.
+    let profile = TempProfile::new("rf");
     let (log, none) = crate::test_support::logged(|| {
-        crate::agent::open_request_folder(
-            Integrity::High,
-            || Ok(profile.location()),
-            |_| Err(anyhow::anyhow!("the folder is owned by another account")),
-        )
+        crate::agent::open_request_folder(&profile.location_at(Integrity::High), |_| {
+            Err(anyhow::anyhow!("the folder is owned by another account"))
+        })
     });
     assert!(none.is_none());
     assert!(log.contains("the agent serves without a request socket"), "{log}");
     assert!(log.contains("the folder is owned by another account"), "{log}");
-
-    let (log, none) = crate::test_support::logged(|| {
-        crate::agent::open_request_folder(
-            Integrity::High,
-            || Err(anyhow::anyhow!("no profile")),
-            |_| panic!("nothing to open"),
-        )
-    });
-    assert!(none.is_none());
-    assert!(log.contains("no profile"), "{log}");
 }
 
+/// The plain folder is the held folder's profile's, not the one a second lookup of the token's would name.
 #[test]
-fn an_agent_at_high_opens_the_plain_folder_it_is_given() {
-    let profile = TempProfile::new("rq-opened");
-    let folder = crate::agent::open_request_folder(
-        Integrity::High,
-        || Ok(profile.location()),
-        |location| open_socket_dir(location, &Sid::current_user().unwrap()),
-    )
+fn an_agent_at_high_opens_the_plain_folder_of_the_profile_it_holds() {
+    let profile = TempProfile::new("op");
+    let folder = crate::agent::open_request_folder(&profile.location_at(Integrity::High), |location| {
+        open_socket_dir(location, &Sid::current_user().unwrap())
+    })
     .expect("the folder opens");
     assert_eq!(folder.location(), &profile.location());
 }

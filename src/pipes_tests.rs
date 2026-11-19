@@ -69,32 +69,39 @@ fn environment_of_a_child(extra_env: &[(&str, &str)]) -> std::collections::BTree
         .collect()
 }
 
-/// A start with `extra_env` gives the child the id and leaves every other variable as this process has it; a
-/// start with none gives it this process's environment, with no id.
+/// A start with `extra_env` gives the child the id and the variables this test put in its own environment as it
+/// has them; a start with none passes the environment on as it is, so the child's id is this process's, if it
+/// has one.
 #[test]
-fn the_session_environment_carries_its_id_and_nothing_else_changes() {
+fn the_session_environment_carries_its_id_and_the_inherited_variables_arrive_unchanged() {
+    const OURS: [(&str, &str); 2] = [
+        ("SSH_BROKER_TEST_INHERITED_A", "one"),
+        ("SSH_BROKER_TEST_INHERITED_B", "two words"),
+    ];
+    for (name, value) in OURS {
+        // SAFETY: Windows sets a variable through `SetEnvironmentVariableW`, which the system serialises against
+        // every other reader of the environment. The names are unique to this test.
+        unsafe { std::env::set_var(name, value) };
+    }
     let id = "00112233445566778899aabbccddeeff";
-    let inherited: Vec<(String, String)> = std::env::vars()
-        .filter(|(name, _)| !name.starts_with('=') && !name.eq_ignore_ascii_case(crate::protocol::SESSION_VARIABLE))
-        .collect();
-    assert!(!inherited.is_empty(), "a test process has an environment");
 
     let with = environment_of_a_child(&[(crate::protocol::SESSION_VARIABLE, id)]);
     assert_eq!(
         with.get(crate::protocol::SESSION_VARIABLE).map(String::as_str),
         Some(id)
     );
-    for (name, value) in &inherited {
-        assert_eq!(with.get(&name.to_uppercase()), Some(value), "{name} changed");
+    for (name, value) in OURS {
+        assert_eq!(with.get(name).map(String::as_str), Some(value), "{name} changed");
     }
 
     let without = environment_of_a_child(&[]);
-    assert!(
-        !without.contains_key(crate::protocol::SESSION_VARIABLE),
-        "a start with no extra variable gave the child an id"
+    assert_eq!(
+        without.get(crate::protocol::SESSION_VARIABLE).cloned(),
+        std::env::var(crate::protocol::SESSION_VARIABLE).ok(),
+        "a start with no extra variable changed the id"
     );
-    for (name, value) in &inherited {
-        assert_eq!(without.get(&name.to_uppercase()), Some(value), "{name} changed");
+    for (name, value) in OURS {
+        assert_eq!(without.get(name).map(String::as_str), Some(value), "{name} changed");
     }
 }
 

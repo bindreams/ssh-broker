@@ -350,11 +350,10 @@ fn a_login_that_arrives_while_the_agent_drains_gets_the_refusal_at_once() {
     });
     // A connection that is still relaying: the drain cannot finish until the test lets it go.
     let relaying = connections.begin();
-    let control =
-        Arc::new(super::Control::new(true, Arc::clone(&connections)).with_waker(wake_through(&connections, &sock)));
+    let control = Arc::new(super::Control::new(true, Arc::clone(&connections)));
     let serving = thread::spawn({
-        let (connections, control) = (Arc::clone(&connections), Arc::clone(&control));
-        move || super::serve_until_drained(listener, &connections, &control)
+        let (connections, control, wake) = (Arc::clone(&connections), Arc::clone(&control), wake_through(&sock));
+        move || super::serve_until_drained(listener, wake, &connections, &control)
     });
     // What the `logout` handler does.
     control.end_all();
@@ -386,16 +385,10 @@ fn a_login_that_arrives_while_the_agent_drains_gets_the_refusal_at_once() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// The wake the agent uses: a connect to its own listener, on a thread of its own.
-fn wake_through(
-    connections: &std::sync::Arc<super::Connections>,
-    sock: &std::path::Path,
-) -> impl Fn() + Send + Sync + 'static {
-    let (connections, sock) = (std::sync::Arc::clone(connections), sock.to_path_buf());
-    move || {
-        let sock = sock.clone();
-        super::wake_without_blocking(&connections, move || afunix::connect(&sock).map(drop))
-    }
+/// The wake the agent uses: a connect to its own listener.
+fn wake_through(sock: &std::path::Path) -> super::WakeConnect {
+    let sock = sock.to_path_buf();
+    std::sync::Arc::new(move || afunix::connect(&sock).map(drop))
 }
 
 /// A login that the accept loop has taken from the listener and not yet counted, when the agent
@@ -417,8 +410,7 @@ fn a_login_accepted_while_the_end_is_decided_is_refused_not_reset() {
             let _ = events.send("parked");
         }
     });
-    let control =
-        Arc::new(super::Control::new(true, Arc::clone(&connections)).with_waker(wake_through(&connections, &sock)));
+    let control = Arc::new(super::Control::new(true, Arc::clone(&connections)));
     control.end_all();
 
     // The login: its handshake and the stdin end marker, then whatever the agent answers.
@@ -444,10 +436,11 @@ fn a_login_accepted_while_the_end_is_decided_is_refused_not_reset() {
     let (accepted, wait_accepted) = mpsc::channel();
     let (go_on, wait_go_on) = mpsc::channel::<()>();
     let serving = thread::spawn({
-        let (connections, control) = (Arc::clone(&connections), Arc::clone(&control));
+        let (connections, control, wake) = (Arc::clone(&connections), Arc::clone(&control), wake_through(&sock));
         move || {
             super::serve_until_drained_in(
                 listener,
+                wake,
                 &connections,
                 || control.is_ending(),
                 |listener| {

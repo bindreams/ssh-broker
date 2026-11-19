@@ -49,9 +49,6 @@ pub(super) struct Control {
     background: bool,
     state: Mutex<State>,
     connections: Arc<Connections>,
-    /// Makes the accept loop look at the flag that closes it (see [`Connections::settle`]): a loop
-    /// blocked in `accept` does not otherwise notice it.
-    waker: Box<dyn Fn() + Send + Sync>,
 }
 
 type Killer = Arc<dyn Fn() + Send + Sync>;
@@ -68,14 +65,7 @@ impl Control {
             background,
             state: Mutex::new(State::default()),
             connections,
-            waker: Box::new(|| {}),
         }
-    }
-
-    /// Call `waker` to make the accept loop return from `accept`, once the end is decided.
-    pub(super) fn with_waker(mut self, waker: impl Fn() + Send + Sync + 'static) -> Control {
-        self.waker = Box::new(waker);
-        self
     }
 
     /// A control for a connection handled outside the accept loop: a desktop agent that nobody
@@ -130,7 +120,7 @@ impl Control {
     /// Wait until the shells' output is delivered, then stop the accept loop and close the listener
     /// (see [`Connections::settle`]). The process may end when this returns.
     pub(super) fn settle(&self) -> Drained {
-        self.connections.settle(&*self.waker)
+        self.connections.settle()
     }
 }
 

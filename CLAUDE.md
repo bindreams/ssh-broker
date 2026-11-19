@@ -67,7 +67,9 @@ diff. (No lint enforces any of these — `clippy.toml` is deliberately empty.) F
   can replace the socket. If either cannot be proven, refuse to bind. One folder and two ACLs for an
   agent below High (`ssh-broker`); an agent at High (an administrator's elevated one) uses
   `ssh-broker-elevated`, and its folder and socket checks also require the High integrity label,
-  which is what keeps a process of the account below High from connecting.
+  which is what keeps a process of the account below High from connecting. An agent at High also binds
+  `request.sock` in the plain folder, checked as that folder's sockets are (no High label); it takes requests only
+  and never starts a session, and it is what an unelevated process of the account can reach.
 - **The shim fails open on the relay path** *(review)*, through the configured shell (the built-in `cmd.exe` if that is unusable). A broken broker must
   not cost you SSH access. The security boundary never degrades — the ACL gate and the bind
   fail closed. Provisioning has best-effort steps of its own, marked where they occur.
