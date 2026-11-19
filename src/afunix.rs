@@ -276,10 +276,9 @@ fn harden_accepted(sock: &Socket) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Whether a child process could inherit `sock`.
+/// Whether a child process could inherit `sock`, a raw socket or a [`Conn`].
 #[cfg(windows)]
-fn is_inheritable(sock: &Socket) -> anyhow::Result<bool> {
-    use std::os::windows::io::AsRawSocket;
+fn is_inheritable(sock: &impl std::os::windows::io::AsRawSocket) -> anyhow::Result<bool> {
     use windows::Win32::Foundation::{GetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT};
     let handle = HANDLE(sock.as_raw_socket() as usize as *mut core::ffi::c_void);
     let mut flags = 0u32;
@@ -474,20 +473,52 @@ fn write_waiting_by(
 /// Sleep until `sock` may be ready for `kind`, or `timeout` has passed, whichever is first. What
 /// the OS says is not acted on: the caller calls again. An error is the poll's own failing.
 ///
-/// The one thing read from the poll's answer is whether a write's poll slept for what was asked (see
-/// [`pauses`]). A write poll that answers at once with something else (Windows reports a peer's
-/// half-close whatever events were asked for, while a `send` into a full buffer still finds no room)
-/// would turn the caller's loop into a spin, so then the rest of `timeout` is a plain pause. That pause
-/// proves nothing, as the poll's sleep proves nothing: the caller still makes its call, at most about
-/// once a slice in that state and at once when the event asked for is reported. A read does not pause.
+/// The one thing read from the poll's answer is what [`pauses`] says about it: a write's poll that
+/// answers at once with something other than what was asked (Windows reports a peer's half-close
+/// whatever events were asked for, while a `send` into a full buffer still finds no room) would turn the
+/// caller's loop into a spin, so then the rest of `timeout` is a plain pause. That pause proves nothing,
+/// as the poll's sleep proves nothing: the caller still makes its call, at most about once a slice in
+/// that state and at once when the event asked for is reported. A read does not pause.
 ///
 /// On Windows a write whose peer has half-closed its sending side and still reads moves about one send
 /// buffer per [`RECHECK_EVERY`]: `WSAPoll` reports the half-close at once whatever was asked, so the wait
 /// pauses the rest of the slice. No client of ssh-broker reads after half-closing; the shim's input
 /// written between the agent's Exit and its reading of it meets this, and goes to a session that has
 /// ended.
-#[cfg(windows)]
 fn wait(sock: &Socket, kind: IoKind, timeout: Duration) -> std::io::Result<()> {
+    let started = Instant::now();
+    let polled = poll_once(sock, kind, timeout)?;
+    if pauses(kind, polled) {
+        pause_rest(started, timeout);
+    }
+    Ok(())
+}
+
+/// What a poll that returned said, which is all [`wait`] reads from it.
+#[derive(Clone, Copy)]
+enum Polled {
+    /// Nothing was reported: the time ran out, or the poll was interrupted (an interruption ended the
+    /// sleep early, which any end does, and reports nothing).
+    TimedOut,
+    /// The event the wait asked for.
+    Asked,
+    /// Something else and not the event asked for, such as a hang-up alone.
+    Other,
+}
+
+/// Whether a wait whose poll returned before `timeout` pauses for the rest of it: only a write, and only
+/// when the poll reported something other than the event asked ([`Polled::Other`]). A read never pauses:
+/// a peer's close wakes the poll with the hang-up alone (measured on Windows, for a close and for a
+/// half-close), and the `recv` that follows reports the end at once, so a pause would delay every
+/// clean close by up to [`RECHECK_EVERY`]. The spin the pause prevents exists only for a write, which
+/// a full send buffer keeps from sending whatever the poll says (see [`wait`]).
+fn pauses(kind: IoKind, polled: Polled) -> bool {
+    matches!((kind, polled), (IoKind::Write, Polled::Other))
+}
+
+/// One `WSAPoll` of `sock` for `kind`, for at most `timeout`. An error is the poll's own failing.
+#[cfg(windows)]
+fn poll_once(sock: &Socket, kind: IoKind, timeout: Duration) -> std::io::Result<Polled> {
     use std::os::windows::io::AsRawSocket;
     use windows::Win32::Networking::WinSock::{
         POLLRDNORM, POLLWRNORM, SOCKET, WSAGetLastError, WSAPOLL_EVENT_FLAGS, WSAPOLLFD, WSAPoll,
@@ -502,23 +533,26 @@ fn wait(sock: &Socket, kind: IoKind, timeout: Duration) -> std::io::Result<()> {
         revents: WSAPOLL_EVENT_FLAGS(0),
     }];
     let millis = i32::try_from(whole_milliseconds_up(timeout).as_millis()).unwrap_or(i32::MAX);
-    let started = Instant::now();
     // SAFETY: `fds` is a live array of one entry; the socket outlives the call.
     let rc = unsafe { WSAPoll(fds.as_mut_ptr(), 1, millis) };
     if rc < 0 {
         let e = std::io::Error::from_raw_os_error(unsafe { WSAGetLastError() }.0);
-        // An interruption ended the sleep early, which any end does.
-        return if is_interruption(&e) { Ok(()) } else { Err(e) };
+        return if is_interruption(&e) {
+            Ok(Polled::TimedOut)
+        } else {
+            Err(e)
+        };
     }
-    if rc > 0 && pauses(kind, fds[0].revents.0 & events.0 != 0) {
-        pause_rest(started, timeout);
-    }
-    Ok(())
+    Ok(match rc {
+        0 => Polled::TimedOut,
+        _ if fds[0].revents.0 & events.0 != 0 => Polled::Asked,
+        _ => Polled::Other,
+    })
 }
 
-/// [`wait`] with `poll`, which pauses by the same rule.
+/// One `poll` of `sock` for `kind`, as [`poll_once`] does on Windows.
 #[cfg(unix)]
-fn wait(sock: &Socket, kind: IoKind, timeout: Duration) -> std::io::Result<()> {
+fn poll_once(sock: &Socket, kind: IoKind, timeout: Duration) -> std::io::Result<Polled> {
     use std::os::fd::AsRawFd;
     let events = match kind {
         IoKind::Read => libc::POLLIN,
@@ -530,28 +564,21 @@ fn wait(sock: &Socket, kind: IoKind, timeout: Duration) -> std::io::Result<()> {
         revents: 0,
     }];
     let millis = libc::c_int::try_from(whole_milliseconds_up(timeout).as_millis()).unwrap_or(libc::c_int::MAX);
-    let started = Instant::now();
     // SAFETY: `fds` is a live array of one entry; the descriptor is open for the call.
     let rc = unsafe { libc::poll(fds.as_mut_ptr(), 1, millis) };
     if rc < 0 {
         let e = std::io::Error::last_os_error();
-        // A signal ended the sleep early, which any end does.
-        return if is_interruption(&e) { Ok(()) } else { Err(e) };
+        return if is_interruption(&e) {
+            Ok(Polled::TimedOut)
+        } else {
+            Err(e)
+        };
     }
-    if rc > 0 && pauses(kind, fds[0].revents & events != 0) {
-        pause_rest(started, timeout);
-    }
-    Ok(())
-}
-
-/// Whether a wait whose poll returned before `timeout` pauses for the rest of it: only a write, and
-/// only when the poll did not report the event asked (`asked_reported`). A read never pauses: a
-/// peer's close wakes the poll with the hang-up alone (measured on Windows, for a close and for a
-/// half-close), and the `recv` that follows reports the end at once, so a pause would delay every
-/// clean close by up to [`RECHECK_EVERY`]. The spin the pause prevents exists only for a write, which
-/// a full send buffer keeps from sending whatever the poll says (see [`wait`]).
-fn pauses(kind: IoKind, asked_reported: bool) -> bool {
-    matches!(kind, IoKind::Write) && !asked_reported
+    Ok(match rc {
+        0 => Polled::TimedOut,
+        _ if fds[0].revents & events != 0 => Polled::Asked,
+        _ => Polled::Other,
+    })
 }
 
 /// Pause for what is left of `timeout` since `started`. It is a plain pause between two looks at the

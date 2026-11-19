@@ -200,17 +200,23 @@ fn a_write_waiting_for_room_does_not_spin_when_the_peer_has_half_closed_and_does
 
 /// A read whose peer has closed is woken by the hang-up alone, and its next `recv` reports the end at once:
 /// pausing for the rest of the slice would delay every clean close. Only a write, which a full buffer
-/// keeps from sending whatever the poll says, has a spin to prevent.
+/// keeps from sending whatever the poll says, has a spin to prevent. `wait` pauses exactly when `pauses`
+/// says so, so this table is the whole rule.
 #[test]
 fn only_a_write_pauses_when_the_poll_returns_for_something_else() {
-    use super::{IoKind, pauses};
+    use super::{IoKind, Polled, pauses};
     assert!(
-        !pauses(IoKind::Read, false),
+        !pauses(IoKind::Read, Polled::Other),
         "a read whose poll answered with the hang-up only"
     );
-    assert!(!pauses(IoKind::Read, true));
-    assert!(pauses(IoKind::Write, false), "a write whose poll did not report room");
-    assert!(!pauses(IoKind::Write, true));
+    assert!(!pauses(IoKind::Read, Polled::Asked));
+    assert!(!pauses(IoKind::Read, Polled::TimedOut));
+    assert!(
+        pauses(IoKind::Write, Polled::Other),
+        "a write whose poll did not report room"
+    );
+    assert!(!pauses(IoKind::Write, Polled::Asked));
+    assert!(!pauses(IoKind::Write, Polled::TimedOut));
 }
 
 #[cfg(windows)]
@@ -415,6 +421,19 @@ fn a_connection_that_arrives_inheritable_is_refused_not_fixed_up() {
 }
 
 // shares of one connection -----
+
+/// `Conn::new` is `pub`, so it clears the inherit flag itself rather than relying on `accept` or `connect`.
+#[cfg(windows)]
+#[test]
+fn a_connection_made_of_an_inheritable_socket_is_not_inheritable() {
+    let sock = socket2::Socket::new_raw(socket2::Domain::UNIX, socket2::Type::STREAM, None).unwrap();
+    assert!(super::is_inheritable(&sock).unwrap(), "control: made without the flag");
+    let conn = super::Conn::new(sock).unwrap();
+    assert!(
+        !super::is_inheritable(&conn).unwrap(),
+        "a child started now would inherit the connection"
+    );
+}
 
 /// The halves of a split connection and a hang-up watcher are shares of one socket handle. Were either a
 /// second handle (a `try_clone` is born inheritable on Windows), a child started meanwhile (a shell, say)

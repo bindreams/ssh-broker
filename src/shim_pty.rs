@@ -249,7 +249,8 @@ fn try_relay_with(
     let command = login.exec.as_ref().map(|exec| exec.command.as_str());
     // An interactive session whose connection the agent ends before it says anything goes round again:
     // the agent is ending, because an agent that follows the protocol closes a connection without a
-    // byte only while its listener closes. The next connect then finds no listener or an agent that
+    // byte only while its listener closes (and for a socket it cannot make a connection of: see
+    // `handle_connection_in`'s doc). The next connect then finds no listener or an agent that
     // answers. A second close without a byte from a connect that succeeded, right after the first,
     // breaks the protocol, and the session ends there. A connect that fails in between (and the rescue
     // that follows it) starts the count again: that agent is gone.

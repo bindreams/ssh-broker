@@ -63,7 +63,8 @@ diff. (No lint enforces any of these — `clippy.toml` is deliberately empty.) F
   at once, and then sleeps for ever. One loop (`read_waiting`, `write_waiting`, `Listener::accept`) calls, waits
   at most `RECHECK_EVERY` on `WouldBlock`, and calls again. No `SO_RCVTIMEO` on a connection anywhere. A test
   may hold a raw socket as the other end; it then never waits for that socket's end with a blocking read
-  (it waits for a frame, or reads through `afunix::split`).
+  (it waits for a frame, or reads through `afunix::split`). A connection is ONE socket handle
+  (`afunix::Conn`) that its holders share; nothing duplicates it (`try_clone`, `DuplicateHandle`) *(review)*.
 - **Tests fail loudly** — never skip on a missing dependency *(review)*.
 - **Unit tests in a sibling `foo_tests.rs`**, never an inline `#[cfg(test)] mod`. The hook
   catches the inline form; that the sibling is wired up with `#[path]` is *(review)*.

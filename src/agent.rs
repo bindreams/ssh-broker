@@ -937,10 +937,13 @@ fn serve_connection(sock: socket2::Socket, hooks: Hooks, control: &Control) -> a
 /// [`logout::fail_connection`]), and the error comes back for the log. A client that leaves before
 /// it sends anything has nothing to be told, and is not an error.
 ///
-/// The one exception is a socket that refuses non-blocking mode ([`logout::admit`]): Winsock documents
-/// that failure only for a failed network subsystem or something that is not a socket, and answering
-/// such a socket would mean a blocking read, which can miss its wake for ever. It is closed unanswered,
-/// and the shim already handles a close without a byte.
+/// The one exception is a socket that [`Conn::new`] cannot make a connection of ([`logout::admit`]),
+/// and it is closed unanswered, which the shim already handles as a close without a byte:
+/// - one that refuses non-blocking mode: Winsock documents that failure only for a failed network
+///   subsystem or something that is not a socket, and answering it would mean a blocking read, which can
+///   miss its wake for ever;
+/// - one whose inherit flag cannot be cleared: a child started meanwhile could hold it open after the
+///   agent closes it, the class of fault the single shared handle removes.
 #[cfg(windows)]
 fn handle_connection_in(conn: Conn, hooks: Hooks, control: &Control) -> anyhow::Result<()> {
     let Some(Opened { mut rx, fr, mut tx, hs }) = read_request(conn, control)? else {
