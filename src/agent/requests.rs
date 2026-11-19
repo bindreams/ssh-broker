@@ -117,7 +117,7 @@ fn elevate(rx: &mut ConnRx, tx: &mut ConnTx, control: &Control, request: &Elevat
         };
         run_elevated(&hosted, tx, request, &id)
     };
-    // A client that could not be told its command had started is gone: nothing more is written to it.
+    // A client that could not be told its command had started: nothing more is written to it.
     let Some((sentence, code)) = answer else {
         return Ok(());
     };
