@@ -364,6 +364,59 @@ fn the_missing_impersonation_right_is_one_unbroken_sentence() {
     );
 }
 
+// The sentences of `elevate` -----
+
+#[test]
+fn the_elevate_sentences_are_each_whole() {
+    assert_eq!(
+        text::elevation_not_hosted(),
+        "ssh-broker: this shell is not hosted by ssh-broker, so nothing can be elevated from it (a session of an agent \
+         from before this version has no session id: end it and log in again).\r\n"
+    );
+    assert_eq!(
+        text::elevation_never(),
+        "ssh-broker: this login asked that nothing be elevated (SSH_BROKER_ELEVATION=never).\r\n"
+    );
+    assert_eq!(
+        text::elevation_already_elevated(),
+        "ssh-broker: this session is already elevated: run the command in it.\r\n"
+    );
+    assert_eq!(
+        text::elevation_consent_not_built(),
+        "ssh-broker: this login asks before elevating, and asking is not built yet: log in with \
+         SSH_BROKER_ELEVATION=auto-approve to run a command elevated without a question.\r\n"
+    );
+    assert_eq!(
+        text::elevation_in_progress(),
+        "ssh-broker: another elevation is in progress in this session.\r\n"
+    );
+    assert_eq!(
+        text::elevation_cannot_start("the system cannot find the file"),
+        "ssh-broker: the command could not be started elevated: the system cannot find the file\r\n"
+    );
+    assert_eq!(
+        text::elevation_needs_high_agent(),
+        "ssh-broker: elevate needs an account whose agent runs at High, and this account's agent does not.\r\n"
+    );
+    assert_eq!(text::elevate_usage(), "usage: ssh-broker elevate <command> [arguments]");
+}
+
+#[test]
+fn every_elevate_refusal_is_one_prefixed_line_ending_in_crlf() {
+    for line in [
+        text::elevation_not_hosted(),
+        text::elevation_never(),
+        text::elevation_already_elevated(),
+        text::elevation_consent_not_built(),
+        text::elevation_in_progress(),
+        text::elevation_cannot_start("why"),
+        text::elevation_needs_high_agent(),
+    ] {
+        assert!(line.starts_with("ssh-broker: ") && line.ends_with("\r\n"), "{line:?}");
+        assert_eq!(line.matches('\n').count(), 1, "{line:?}");
+    }
+}
+
 // The sentences of the elevation policy -----
 
 #[test]

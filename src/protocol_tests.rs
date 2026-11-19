@@ -13,17 +13,18 @@ fn header_roundtrips() {
     assert_eq!(FrameHeader::decode(&bytes).unwrap(), h);
 }
 
-/// The answer's two kinds have the numbers the contract gives them, and a version-5 peer reads them.
+/// The answer's two kinds and the request have the numbers the contract gives them, and a version-6 peer reads them.
 #[test]
-fn the_answer_kinds_have_their_numbers_and_decode() {
+fn the_answer_kinds_and_the_request_have_their_numbers_and_decode() {
     assert_eq!(FrameKind::Serving as u8, 4);
     assert_eq!(FrameKind::HandBack as u8, 5);
-    for kind in [FrameKind::Serving, FrameKind::HandBack] {
+    assert_eq!(FrameKind::Request as u8, 6);
+    for kind in [FrameKind::Serving, FrameKind::HandBack, FrameKind::Request] {
         let header = FrameHeader { kind, len: 3 };
         assert_eq!(FrameHeader::decode(&header.encode()).unwrap(), header);
     }
     assert!(
-        FrameHeader::decode(&[6, 0, 0, 0, 0]).is_err(),
+        FrameHeader::decode(&[7, 0, 0, 0, 0]).is_err(),
         "the next number is still unknown"
     );
 }
@@ -331,11 +332,11 @@ fn a_version_1_handshake_is_refused_with_the_version_message() {
     );
 }
 
-/// The version is 5.
+/// The version is 6.
 #[test]
-fn the_wire_version_is_5() {
-    assert_eq!(PROTOCOL_VERSION, 5);
-    assert_eq!(Handshake::pty_default().version, 5);
+fn the_wire_version_is_6() {
+    assert_eq!(PROTOCOL_VERSION, 6);
+    assert_eq!(Handshake::pty_default().version, 6);
 }
 
 #[test]
@@ -473,7 +474,7 @@ fn a_version_2_handshake_is_refused_with_the_version_message() {
     })
     .unwrap();
     let error = Handshake::decode(&bytes).unwrap_err().to_string();
-    assert!(error.contains("peer 2") && error.contains("ours 5"), "{error}");
+    assert!(error.contains("peer 2") && error.contains("ours 6"), "{error}");
 }
 
 /// A peer of another version is refused by its number.
@@ -506,7 +507,7 @@ fn a_version_3_handshake_is_refused_with_the_version_message() {
     })
     .unwrap();
     let error = Handshake::decode(&bytes).unwrap_err().to_string();
-    assert!(error.contains("peer 3") && error.contains("ours 5"), "{error}");
+    assert!(error.contains("peer 3") && error.contains("ours 6"), "{error}");
 }
 
 /// A peer of version 4 has the layout of this one and not its first frame (an answer, then no input before it):
@@ -520,7 +521,156 @@ fn a_version_4_handshake_is_refused_with_the_version_message() {
     .encode()
     .unwrap();
     let error = Handshake::decode(&bytes).unwrap_err().to_string();
-    assert!(error.contains("peer 4") && error.contains("ours 5"), "{error}");
+    assert!(error.contains("peer 4") && error.contains("ours 6"), "{error}");
+}
+
+/// A peer of version 5 has the layout of this one and no request frame: it is refused by its number.
+#[test]
+fn a_version_5_handshake_is_refused_with_the_version_message() {
+    let bytes = Handshake {
+        version: 5,
+        ..Handshake::pty_default()
+    }
+    .encode()
+    .unwrap();
+    let error = Handshake::decode(&bytes).unwrap_err().to_string();
+    assert!(error.contains("peer 5") && error.contains("ours 6"), "{error}");
+}
+
+// The elevation request -----
+
+fn a_request() -> ElevationRequest {
+    ElevationRequest {
+        version: PROTOCOL_VERSION,
+        session: "0001abcdef102030405060708090a0ff".to_owned(),
+        command: r#"cmd /c echo "a b""#.to_owned(),
+        cwd: r"C:\Users\me\work".to_owned(),
+    }
+}
+
+#[test]
+fn an_elevation_request_round_trips_and_a_peer_of_another_version_is_refused_by_name() {
+    let request = a_request();
+    assert_eq!(ElevationRequest::decode(&request.encode().unwrap()).unwrap(), request);
+
+    // The version is read alone, so a peer whose request has fields this build does not know is refused by its
+    // number and not by a decoding failure.
+    let mut bytes = ElevationRequest {
+        version: PROTOCOL_VERSION + 1,
+        ..a_request()
+    }
+    .encode()
+    .unwrap();
+    bytes.extend_from_slice(&[9, 9, 9]);
+    let error = ElevationRequest::decode(&bytes).unwrap_err().to_string();
+    assert!(
+        error.contains(&format!("peer {}", PROTOCOL_VERSION + 1))
+            && error.contains(&format!("ours {PROTOCOL_VERSION}")),
+        "{error}"
+    );
+}
+
+#[test]
+fn an_elevation_request_with_bytes_after_it_or_cut_short_is_refused() {
+    let mut bytes = a_request().encode().unwrap();
+    let cut = ElevationRequest::decode(&bytes[..bytes.len() - 3]);
+    assert!(cut.is_err(), "a request cut short");
+    bytes.push(0);
+    let error = ElevationRequest::decode(&bytes).unwrap_err().to_string();
+    assert!(error.contains("after"), "{error}");
+}
+
+#[test]
+fn an_elevation_request_check_refuses_a_bad_session_an_empty_or_oversized_command_or_cwd_and_a_nul() {
+    let session = SessionId::parse(&a_request().session).unwrap();
+    assert_eq!(
+        a_request().check().unwrap(),
+        session,
+        "a good request gives its session"
+    );
+
+    let session_text = a_request().session;
+    let bad = |what: &str, request: ElevationRequest, said: &str| {
+        let error = request.check().expect_err(what);
+        assert!(format!("{error:#}").contains(said), "{what}: {error:#}");
+    };
+    for session in [
+        String::new(),
+        session_text.to_uppercase(),
+        session_text[..31].to_owned(),
+        format!("{session_text}0"),
+    ] {
+        bad(
+            &format!("session {session:?}"),
+            ElevationRequest { session, ..a_request() },
+            "session",
+        );
+    }
+    bad(
+        "an empty command",
+        ElevationRequest {
+            command: String::new(),
+            ..a_request()
+        },
+        "command",
+    );
+    // The limit is in UTF-16 units: a character outside the BMP is two.
+    let at_limit = "a".repeat(MAX_ELEVATION_UNITS);
+    let request = ElevationRequest {
+        command: at_limit.clone(),
+        cwd: at_limit.clone(),
+        ..a_request()
+    };
+    request.check().expect("exactly the limit is allowed");
+    bad(
+        "a command over the limit",
+        ElevationRequest {
+            command: format!("{at_limit}a"),
+            ..a_request()
+        },
+        "command",
+    );
+    bad(
+        "a working directory over the limit",
+        ElevationRequest {
+            cwd: format!("{at_limit}a"),
+            ..a_request()
+        },
+        "working directory",
+    );
+    bad(
+        "a command whose units are over the limit though its characters are not",
+        ElevationRequest {
+            command: "\u{1f600}".repeat(MAX_ELEVATION_UNITS / 2 + 1),
+            ..a_request()
+        },
+        "command",
+    );
+    for (field, request) in [
+        (
+            "session",
+            ElevationRequest {
+                session: format!("{}\0", &session_text[..31]),
+                ..a_request()
+            },
+        ),
+        (
+            "command",
+            ElevationRequest {
+                command: "cmd\0 /c".into(),
+                ..a_request()
+            },
+        ),
+        (
+            "working directory",
+            ElevationRequest {
+                cwd: "C:\\\0".into(),
+                ..a_request()
+            },
+        ),
+    ] {
+        bad(&format!("a NUL in the {field}"), request, field);
+    }
 }
 
 // The session id -----

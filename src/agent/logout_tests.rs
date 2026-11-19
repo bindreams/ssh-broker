@@ -1,8 +1,9 @@
 //! Unit tests for the agent's answer to `logout`. In-process: no socket, no shell, no process ends.
 use super::*;
 use crate::afunix::{ConnRx, ConnTx, split};
+use crate::agent::elevation::{HostedSession, Starts};
 use crate::agent::{Drained, HeldListener};
-use crate::protocol::{ExitCode, FrameKind, FrameReader, Stream};
+use crate::protocol::{ElevationPolicy, ExitCode, FrameKind, FrameReader, Stream};
 use crate::relay::{Outcome, TestSink, pump_decode, write_data};
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -1017,6 +1018,164 @@ fn an_id_from_another_agent_run_is_unknown_to_a_new_agent() {
     assert!(!new.is_registered(&id), "a new agent does not know it");
     let fresh = new.reserve().unwrap().unwrap();
     assert_ne!(*fresh.id(), id, "and does not give it out again");
+}
+
+#[test]
+fn reply_with_empty_text_writes_only_the_exit_frame() {
+    let mut bytes = Vec::new();
+    reply(&mut bytes, "", 7).unwrap();
+    assert_eq!(decode(&bytes), (Vec::new(), Some(7)));
+
+    let mut bytes = Vec::new();
+    reply(&mut bytes, "said\r\n", 126).unwrap();
+    assert_eq!(
+        decode(&bytes),
+        (vec![(Stream::Stderr as u8, "said\r\n".to_owned())], Some(126))
+    );
+}
+
+// Sessions that can be elevated from -----
+
+/// A session entry over a connection that goes nowhere: what `attach` is given.
+fn a_hosted_session(policy: ElevationPolicy) -> Arc<dyn Hosted> {
+    struct Nowhere;
+    impl Write for Nowhere {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl HalfClose for Nowhere {
+        fn shutdown_write(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+    let starts = Starts {
+        pty: crate::conpty::PtySession::spawn,
+        exec: crate::pipes::ExecChild::spawn,
+    };
+    HostedSession::shared(
+        policy,
+        super::super::link::Link::new(Nowhere, true, (80, 24), None),
+        starts,
+    )
+}
+
+/// `await_hosted` of `id` on a thread, which says on the returned channel that it is about to wait.
+fn await_on_a_thread(
+    control: &Arc<Control>,
+    id: SessionId,
+) -> (std::thread::JoinHandle<Option<Arc<dyn Hosted>>>, mpsc::Receiver<()>) {
+    let (parked, on_parked) = mpsc::channel();
+    let control = Arc::clone(control);
+    let thread = std::thread::spawn(move || {
+        control.await_hosted_observed(&id, || {
+            let _ = parked.send(());
+        })
+    });
+    (thread, on_parked)
+}
+
+#[test]
+fn a_request_for_a_reserved_session_waits_for_its_link_and_then_runs() {
+    let control = Arc::new(Control::new(true, Connections::new()));
+    let reservation = control.reserve().unwrap().unwrap();
+    let id = *reservation.id();
+    let registration = reservation
+        .register(counting_killer(&Arc::new(AtomicUsize::new(0))))
+        .unwrap();
+
+    let (waiter, on_parked) = await_on_a_thread(&control, id);
+    on_parked.recv().expect("the request is waiting for the session's link");
+    registration.attach(a_hosted_session(ElevationPolicy::AutoApprove));
+    let hosted = waiter
+        .join()
+        .unwrap()
+        .expect("the request goes on once the session is attached");
+    assert_eq!(hosted.policy(), ElevationPolicy::AutoApprove);
+    assert!(hosted.has_terminal());
+}
+
+/// Before the session is registered it is only an id the agent has given out: a request for it waits as well.
+#[test]
+fn a_request_for_an_id_not_yet_registered_waits_for_the_registration_and_the_link() {
+    let control = Arc::new(Control::new(true, Connections::new()));
+    let reservation = control.reserve().unwrap().unwrap();
+    let id = *reservation.id();
+    let (waiter, on_parked) = await_on_a_thread(&control, id);
+    on_parked.recv().unwrap();
+    let registration = reservation
+        .register(counting_killer(&Arc::new(AtomicUsize::new(0))))
+        .unwrap();
+    registration.attach(a_hosted_session(ElevationPolicy::Prompt));
+    assert!(waiter.join().unwrap().is_some());
+}
+
+#[test]
+fn a_request_waiting_for_a_session_whose_start_fails_is_released_by_the_reservation() {
+    let control = Arc::new(Control::new(true, Connections::new()));
+    let reservation = control.reserve().unwrap().unwrap();
+    let (waiter, on_parked) = await_on_a_thread(&control, *reservation.id());
+    on_parked.recv().unwrap();
+    drop(reservation);
+    assert!(waiter.join().unwrap().is_none(), "the session never started");
+}
+
+#[test]
+fn a_request_waiting_for_a_session_that_ends_before_it_attaches_is_released_by_the_registration() {
+    let control = Arc::new(Control::new(true, Connections::new()));
+    let reservation = control.reserve().unwrap().unwrap();
+    let id = *reservation.id();
+    let registration = reservation
+        .register(counting_killer(&Arc::new(AtomicUsize::new(0))))
+        .unwrap();
+    let (waiter, on_parked) = await_on_a_thread(&control, id);
+    on_parked.recv().unwrap();
+    drop(registration);
+    assert!(waiter.join().unwrap().is_none(), "the session ended without a link");
+}
+
+#[test]
+fn an_id_the_agent_did_not_give_out_is_not_waited_for_and_an_ended_session_is_gone() {
+    let control = Arc::new(Control::new(true, Connections::new()));
+    let stranger = *Control::new(true, Connections::new()).reserve().unwrap().unwrap().id();
+    assert!(
+        control
+            .await_hosted_observed(&stranger, || panic!("an unknown id is not waited for"))
+            .is_none()
+    );
+
+    let reservation = control.reserve().unwrap().unwrap();
+    let id = *reservation.id();
+    let registration = reservation
+        .register(counting_killer(&Arc::new(AtomicUsize::new(0))))
+        .unwrap();
+    registration.attach(a_hosted_session(ElevationPolicy::Never));
+    assert!(
+        control
+            .await_hosted_observed(&id, || panic!("an attached session is not waited for"))
+            .is_some()
+    );
+    drop(registration);
+    assert!(
+        control
+            .await_hosted_observed(&id, || panic!("an ended session is not waited for"))
+            .is_none()
+    );
+}
+
+#[test]
+fn one_elevation_at_a_time_holds_a_slot_that_frees_when_it_is_dropped() {
+    let hosted = a_hosted_session(ElevationPolicy::AutoApprove);
+    let first = hosted.slot().try_take().expect("the first takes the slot");
+    assert!(
+        hosted.slot().try_take().is_none(),
+        "a second is refused while the first holds it"
+    );
+    drop(first);
+    assert!(hosted.slot().try_take().is_some(), "the slot is free again");
 }
 
 // The tally's listeners -----

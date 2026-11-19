@@ -23,9 +23,10 @@
 //! stay held until the process ends, so a successor agent starts only after this one is gone.
 
 use std::io::{Read, Write};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
+use super::elevation::Hosted;
 use super::{Connections, Drained, HalfClose};
 use crate::afunix::{ConnRx, Whole};
 use crate::protocol::{ExitCode, FrameKind, SessionId, Stream, write_frame};
@@ -48,6 +49,9 @@ pub const ENDING_REFUSED_EXIT_CODE: i32 = 255;
 pub(super) struct Control {
     background: bool,
     state: Mutex<State>,
+    /// Woken when a session is registered, attached to its link or gone, for a request that waits for one
+    /// ([`Control::await_hosted`]).
+    changed: Condvar,
     connections: Arc<Connections>,
 }
 
@@ -56,7 +60,16 @@ type Killer = Arc<dyn Fn() + Send + Sync>;
 #[derive(Default)]
 struct State {
     ending: bool,
-    sessions: Vec<(SessionId, Killer)>,
+    /// The ids given out ([`Control::reserve`]) to sessions that are not registered yet.
+    pending: Vec<SessionId>,
+    sessions: Vec<Entry>,
+}
+
+/// A running session: the means to end it and, once its link exists, what a request needs of it.
+struct Entry {
+    id: SessionId,
+    kill: Killer,
+    hosted: Option<Arc<dyn Hosted>>,
 }
 
 impl Control {
@@ -64,6 +77,7 @@ impl Control {
         Control {
             background,
             state: Mutex::new(State::default()),
+            changed: Condvar::new(),
             connections,
         }
     }
@@ -95,16 +109,41 @@ impl Control {
         if self.is_ending() {
             return Ok(None);
         }
-        Ok(Some(Reservation {
-            control: self,
-            id: super::session::new_id()?,
-        }))
+        let id = super::session::new_id()?;
+        self.lock().pending.push(id);
+        Ok(Some(Reservation { control: self, id }))
     }
 
     /// Whether a session registered under `id` is running.
     #[cfg(test)]
     pub(super) fn is_registered(&self, id: &SessionId) -> bool {
-        self.lock().sessions.iter().any(|(registered, _)| registered == id)
+        self.lock().sessions.iter().any(|entry| entry.id == *id)
+    }
+
+    /// The session `id` names, once it can be asked to run a command: waits while the id is one the agent has given
+    /// out and its session has not published its link (it is being started, or wired), on a condition that is
+    /// re-checked, with no timeout. `None` is an id this agent never gave out (an old one, or none), or a session
+    /// that ended or never started: the wait ends when its reservation or registration is dropped.
+    pub(super) fn await_hosted(&self, id: &SessionId) -> Option<Arc<dyn Hosted>> {
+        self.await_hosted_observed(id, || {})
+    }
+
+    /// [`Control::await_hosted`], calling `waiting` each time it is about to wait (with the state locked, so that
+    /// what it waits for cannot happen before the wait begins), so that a test can tell that it is waiting.
+    pub(super) fn await_hosted_observed(&self, id: &SessionId, mut waiting: impl FnMut()) -> Option<Arc<dyn Hosted>> {
+        let mut state = self.lock();
+        loop {
+            match state.sessions.iter().find(|entry| entry.id == *id) {
+                Some(Entry {
+                    hosted: Some(hosted), ..
+                }) => return Some(Arc::clone(hosted)),
+                Some(_) => {}
+                None if state.pending.contains(id) => {}
+                None => return None,
+            }
+            waiting();
+            state = self.changed.wait(state).unwrap_or_else(PoisonError::into_inner);
+        }
     }
 
     /// Begin to end: from now on no session registers, and every registered one is ended. A login
@@ -113,7 +152,7 @@ impl Control {
         let killers: Vec<Killer> = {
             let mut state = self.lock();
             state.ending = true;
-            state.sessions.iter().map(|(_, kill)| Arc::clone(kill)).collect()
+            state.sessions.iter().map(|entry| Arc::clone(&entry.kill)).collect()
         };
         for kill in killers {
             kill();
@@ -127,7 +166,8 @@ impl Control {
     }
 }
 
-/// The id of a session that has not started: dropped unregistered, it leaves nothing behind.
+/// The id of a session that has not started: dropped unregistered, it leaves nothing behind, and a request that
+/// waits for the session is told there is none.
 pub(super) struct Reservation<'a> {
     control: &'a Control,
     id: SessionId,
@@ -146,11 +186,24 @@ impl<'a> Reservation<'a> {
         if state.ending {
             return None;
         }
-        state.sessions.push((self.id, kill));
+        state.pending.retain(|pending| *pending != self.id);
+        state.sessions.push(Entry {
+            id: self.id,
+            kill,
+            hosted: None,
+        });
         Some(Registration {
             control: self.control,
             id: self.id,
         })
+    }
+}
+
+impl Drop for Reservation<'_> {
+    fn drop(&mut self) {
+        // Registered, or not: what is left of the id is gone, and whoever waits for it is told.
+        self.control.lock().pending.retain(|pending| *pending != self.id);
+        self.control.changed.notify_all();
     }
 }
 
@@ -160,9 +213,28 @@ pub(super) struct Registration<'a> {
     id: SessionId,
 }
 
+impl Registration<'_> {
+    /// Publish what a request needs of the session, now that its link exists: a request that waits for it goes on.
+    pub(super) fn attach(&self, hosted: Arc<dyn Hosted>) {
+        let mut state = self.control.lock();
+        if let Some(entry) = state.sessions.iter_mut().find(|entry| entry.id == self.id) {
+            entry.hosted = Some(hosted);
+        }
+        drop(state);
+        self.control.changed.notify_all();
+    }
+}
+
 impl Drop for Registration<'_> {
     fn drop(&mut self) {
-        self.control.lock().sessions.retain(|(id, _)| *id != self.id);
+        // The entry, which holds the session's link, is dropped outside the lock.
+        let removed = {
+            let mut state = self.control.lock();
+            let position = state.sessions.iter().position(|entry| entry.id == self.id);
+            position.map(|position| state.sessions.remove(position))
+        };
+        self.control.changed.notify_all();
+        drop(removed);
     }
 }
 
@@ -339,11 +411,28 @@ fn answer_and_wait<R: LimitedRead, W: Write + HalfClose>(
     Ok(())
 }
 
+/// The reply of a request: `text` on stderr (no frame at all for none, as a command that ran says nothing of its
+/// own), then the exit code.
 fn reply<W: std::io::Write>(tx: &mut W, text: &str, code: i32) -> anyhow::Result<()> {
-    write_data(tx, Stream::Stderr, text.as_bytes())?;
+    if !text.is_empty() {
+        write_data(tx, Stream::Stderr, text.as_bytes())?;
+    }
     write_frame(tx, FrameKind::Exit, &ExitCode(code).encode())?;
     tx.flush()?;
     Ok(())
+}
+
+/// Answer a request that is not a login with `text` and `code`, FIN the write half and wait for the client to close
+/// (see [`wait_for_client`]): the client of `elevate` is inside the session's tree and must be heard out before the
+/// connection goes. The connection counts as live for the drain until the wait returns.
+pub(super) fn reply_and_wait<R: LimitedRead, W: Write + HalfClose>(
+    rx: &mut R,
+    tx: &mut W,
+    control: &Control,
+    text: &str,
+    code: i32,
+) -> anyhow::Result<()> {
+    answer_and_wait(rx, tx, control, |tx| reply(tx, text, code), "a request")
 }
 
 /// A connection whose blocking reads can be given a limit.

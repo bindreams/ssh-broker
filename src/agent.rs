@@ -51,13 +51,19 @@ mod connections;
 #[cfg(windows)]
 mod console;
 #[cfg(windows)]
+mod elevation;
+#[cfg(windows)]
 mod launch;
+#[cfg(windows)]
+mod link;
 #[cfg(windows)]
 mod logout;
 #[cfg(windows)]
 mod requests;
 #[cfg(windows)]
 mod session;
+#[cfg(all(windows, test))]
+mod test_wire;
 #[cfg(windows)]
 mod verb;
 
@@ -77,7 +83,7 @@ use crate::offer::text;
 use crate::pipes::ExecChild;
 #[cfg(windows)]
 use crate::protocol::{
-    ElevationPolicy, ExitCode, FrameKind, FrameReader, Handshake, Mode, Resize, SESSION_VARIABLE, Stream,
+    ElevationPolicy, ExitCode, Frame, FrameKind, FrameReader, Handshake, Mode, Resize, SESSION_VARIABLE, Stream,
     read_one_frame, write_frame,
 };
 #[cfg(windows)]
@@ -97,13 +103,17 @@ use connections::HeldListener;
 #[cfg(windows)]
 use connections::{Connections, Drained, Live, WakeConnect};
 #[cfg(windows)]
+use elevation::{HostedSession, Starts};
+#[cfg(windows)]
+use link::{Carrier, InputTarget, Link};
+#[cfg(windows)]
 use logout::{Control, Reservation};
 #[cfg(windows)]
 use std::path::{Path, PathBuf};
 #[cfg(windows)]
 use std::sync::mpsc::TrySendError;
 #[cfg(windows)]
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 
 /// Everything between "the task started us" and "serve": check where we are, make the user's
 /// private folder, and become the one agent that serves this user.
@@ -835,13 +845,15 @@ fn handle_connection_with(conn: socket2::Socket, hooks: Hooks) -> anyhow::Result
 
 /// What a session runs with: the hooks a test can replace, the agent's shared control, the token its
 /// shell runs with in place of the agent's, if the login did not ask for an elevated session and the agent is
-/// elevated, and the id its environment carries.
+/// elevated, the id its environment carries, and what its login asked of elevation (which `ssh-broker elevate` in it
+/// is judged by).
 #[cfg(windows)]
 struct Env<'a> {
     hooks: Hooks,
     control: &'a Control,
     unelevated: Option<UnelevatedToken>,
     reservation: Reservation<'a>,
+    policy: ElevationPolicy,
 }
 
 /// How a session obtains its [`HangupWatcher`]; a parameter so a test can force a failure.
@@ -939,7 +951,13 @@ fn serve_connection(conn: socket2::Socket, hooks: Hooks, control: &Control) -> a
 /// it sends anything has nothing to be told, and is not an error.
 #[cfg(windows)]
 fn handle_connection_in(conn: socket2::Socket, hooks: Hooks, control: &Control) -> anyhow::Result<()> {
-    let Some(Opened { mut rx, fr, mut tx, hs }) = read_request(hooks.split, conn, control)? else {
+    let Some(Opened {
+        mut rx,
+        fr,
+        mut tx,
+        first: hs,
+    }) = read_request(hooks.split, conn, control)?
+    else {
         return Ok(());
     };
     if hs.mode == Mode::Logout {
@@ -1027,6 +1045,7 @@ fn handle_connection_in(conn: socket2::Socket, hooks: Hooks, control: &Control) 
         control,
         unelevated,
         reservation,
+        policy: hs.elevation.unwrap_or(ElevationPolicy::DEFAULT),
     };
     match hs.mode {
         Mode::Pty => handle_pty(rx, fr, tx, &launched, (hs.cols, hs.rows), cwd, env),
@@ -1035,14 +1054,15 @@ fn handle_connection_in(conn: socket2::Socket, hooks: Hooks, control: &Control) 
     }
 }
 
-/// A connection split into halves, with the handshake that opened it.
+/// A connection split into halves, with what opens it (a [`Handshake`] on every socket; the request socket also
+/// takes a request, see [`requests`]).
 #[cfg(windows)]
-struct Opened {
+struct Opened<T = Handshake> {
     rx: ConnRx,
-    /// The reader that read the handshake, with anything it read past it.
+    /// The reader that read the first frame, with anything it read past it.
     fr: FrameReader,
     tx: ConnTx,
-    hs: Handshake,
+    first: T,
 }
 
 /// Split a connection and read the handshake that opens it: the start of every connection, whichever socket it
@@ -1050,6 +1070,25 @@ struct Opened {
 /// [`logout::fail_connection`]) and is for the log.
 #[cfg(windows)]
 fn read_request(split: Splitter, conn: socket2::Socket, control: &Control) -> anyhow::Result<Option<Opened>> {
+    read_opening(split, conn, control, decode_handshake)
+}
+
+/// The handshake `frame` is, if it is one.
+#[cfg(windows)]
+fn decode_handshake(frame: Frame) -> anyhow::Result<Handshake> {
+    anyhow::ensure!(frame.kind == FrameKind::Handshake, "first frame was not a handshake");
+    Handshake::decode(&frame.payload)
+}
+
+/// [`read_request`] for a socket whose first frame may be more than a handshake: `decode` reads it from the frame,
+/// and its error is answered as an unreadable request is.
+#[cfg(windows)]
+fn read_opening<T>(
+    split: Splitter,
+    conn: socket2::Socket,
+    control: &Control,
+    decode: impl FnOnce(Frame) -> anyhow::Result<T>,
+) -> anyhow::Result<Option<Opened<T>>> {
     let (mut rx, mut tx) = match split(conn) {
         Ok(halves) => halves,
         Err((whole, cause)) => {
@@ -1065,8 +1104,8 @@ fn read_request(split: Splitter, conn: socket2::Socket, control: &Control) -> an
         }
     };
     let mut fr = FrameReader::new();
-    match read_handshake(&mut rx, &mut fr) {
-        Ok(Some(hs)) => Ok(Some(Opened { rx, fr, tx, hs })),
+    match read_first_frame(&mut rx, &mut fr).and_then(|frame| frame.map(decode).transpose()) {
+        Ok(Some(first)) => Ok(Some(Opened { rx, fr, tx, first })),
         Ok(None) => Ok(None),
         Err(cause) => Err(logout::fail_connection(
             &mut rx,
@@ -1116,17 +1155,21 @@ fn show_notices(tx: &mut ConnTx, mode: Mode, texts: &[String]) {
 /// Warn that the session's shell ended with the loader's "DLL not found" status, as the last data of
 /// the session: before the exit code, after everything the shell wrote. Nothing for any other code.
 #[cfg(windows)]
-fn show_exit_notice(tx: &mut ConnTx, mode: Mode, shell: Option<&crate::shell::ConfiguredShell>, code: i32) {
+fn show_exit_notice(link: &Link, mode: Mode, shell: Option<&crate::shell::ConfiguredShell>, code: i32) {
     if let Some(text) = shell.and_then(|shell| shell.exit_notice(code)) {
         tracing::warn!("{text}");
-        show_notice(tx, mode, &text);
+        let (stream, bytes) = launch::notice_frame(mode, &text);
+        // A client that has gone is found by the relay, which owns that case.
+        if let Err(e) = link.deliver(Carrier::Session, stream, &bytes) {
+            tracing::debug!("could not show the shell warning: {e:#}");
+        }
     }
 }
 
-/// The handshake that opens a connection. `None` if the client closed the connection before it sent
+/// The frame that opens a connection. `None` if the client closed the connection before it sent
 /// a byte: the wake that ends the accept loop does, and a client that gave up does; neither is a fault.
 #[cfg(windows)]
-fn read_handshake(rx: &mut impl std::io::Read, fr: &mut FrameReader) -> anyhow::Result<Option<Handshake>> {
+fn read_first_frame(rx: &mut impl std::io::Read, fr: &mut FrameReader) -> anyhow::Result<Option<Frame>> {
     struct Counted<'a, R> {
         inner: &'a mut R,
         any: bool,
@@ -1147,8 +1190,7 @@ fn read_handshake(rx: &mut impl std::io::Read, fr: &mut FrameReader) -> anyhow::
         }
         Err(e) => return Err(e),
     };
-    anyhow::ensure!(frame.kind == FrameKind::Handshake, "first frame was not a handshake");
-    Ok(Some(Handshake::decode(&frame.payload)?))
+    Ok(Some(frame))
 }
 
 #[cfg(test)]
@@ -1206,6 +1248,7 @@ fn handle_pty(
         control,
         unelevated,
         reservation,
+        policy,
     } = env;
     let id = reservation.id().to_string();
     let session_env = [(SESSION_VARIABLE, id.as_str())];
@@ -1260,7 +1303,7 @@ fn handle_pty(
     });
     (hooks.after_spawn)();
     let job = session.job();
-    let Some(_registration) = register_session(reservation, &job) else {
+    let Some(registration) = register_session(reservation, &job) else {
         tracing::debug!("the agent is ending; the shell warnings of a refused login are not shown: {notices:?}");
         close_unserved_pty(session, &*hooks.observe);
         return logout::refuse_while_ending(&mut rx, &mut tx, control);
@@ -1274,67 +1317,51 @@ fn handle_pty(
         return Ok(());
     }
     show_notices(&mut tx, Mode::Pty, &notices);
-    // Before `tx` moves into the shared mutex.
-    let hangup = start_hangup_watch(&tx, &job, hooks.make_watcher);
+    // Before `tx` moves into the link.
+    let watcher = prepare_hangup_watch(&tx, hooks.make_watcher);
 
     let out_raw = session.out_read_raw();
     let in_raw = session.in_write_raw();
     // HPCON shared behind a mutex: the input thread resizes under the lock; teardown takes
     // it (→ None) and closes it under the lock, so resize can never touch a closed HPCON.
     let hpc_cell = Arc::new(Mutex::new(Some(session.take_hpc_raw())));
-    let tx_arc = Arc::new(Mutex::new(tx));
+    // The writer thread may be parked writing to the pseudoconsole's input pipe. The reap does NOT release that:
+    // conhost holds the read end and is not a member of the job. `ClosePseudoConsole` in the waiter below is what
+    // releases it, which is why `shutdown`, which joins the writer, is called only after it.
+    let target = Arc::new(PtyTarget::new(
+        HandleWriter::spawn(in_raw, None, hooks.parked),
+        Arc::clone(&hpc_cell),
+    ));
+    let link = Link::new(tx, true, (cols, rows), Some(target.clone()));
+    let starts = Starts {
+        pty: hooks.start_pty,
+        exec: hooks.start_exec,
+    };
+    registration.attach(HostedSession::shared(policy, Arc::clone(&link), starts));
+    let hangup = start_hangup_watch(watcher, &link, &job);
 
     // Output pump: ConPTY output -> DATA(Pty). It deliberately does NOT emit EXIT.
     // `read_handle` returns 0 for a read *error* as well as for EOF, so this thread cannot
     // tell "the shell finished" from "the pipe broke" — emitting the code from here raced the
     // waiter that produces it, and a failed session could report EXIT(0).
     let out_thread = {
-        let tx = Arc::clone(&tx_arc);
-        let job = Arc::clone(&job);
-        std::thread::spawn(move || {
-            let mut buf = [0u8; 32 * 1024];
-            let mut delivering = true;
-            loop {
-                let n = conpty::read_handle(out_raw, &mut buf);
-                if n == 0 {
-                    break; // pseudoconsole closed (teardown) -> drained to EOF
-                }
-                if !delivering {
-                    continue; // draining, see below
-                }
-                let ok = {
-                    let mut g = tx.lock().unwrap();
-                    write_data(&mut *g, Stream::Pty, &buf[..n]).is_ok()
-                };
-                if !ok {
-                    // The socket is gone. Reap, but keep READING: this thread is the only
-                    // reader of the pseudoconsole's output pipe, and `ClosePseudoConsole`
-                    // below flushes conhost's pending output through it. Abandoning the pipe
-                    // here lets it fill, and teardown then blocks inside the close.
-                    reap_tree(&job);
-                    delivering = false;
-                }
-            }
+        let (link, job) = (Arc::clone(&link), Arc::clone(&job));
+        spawn_stream_pump(out_raw, Stream::Pty, Arc::clone(&link), Carrier::Session, move || {
+            link.reap_all(&job);
         })
     };
 
     let in_thread = {
-        let hpc_cell = Arc::clone(&hpc_cell);
+        let link = Arc::clone(&link);
         let job = Arc::clone(&job);
         std::thread::spawn(move || {
-            let mut sink = PtyInputSink {
-                writer: HandleWriter::spawn(in_raw, None, hooks.parked),
-                hpc_cell,
+            let mut sink = LinkInputSink {
+                link: Arc::clone(&link),
             };
             pump_until_peer_gone(&mut rx, &mut fr, &mut sink);
-            if let Some(w) = teardown_warning(reap_tree(&job)) {
+            if let Some(w) = teardown_warning(link.reap_all(&job)) {
                 tracing::error!("{w}");
             }
-            // Dropping the sink joins the writer thread, which may be parked writing to the
-            // pseudoconsole's input pipe. The reap does NOT release that: conhost holds the
-            // read end and is not a member of the job. `ClosePseudoConsole` in the waiter
-            // below is what releases it, which is why this drop must not be moved ahead of it.
-            drop(sink);
         })
     };
 
@@ -1342,7 +1369,7 @@ fn handle_pty(
     // down (close the HPCON, join the threads) before returning, or the threads would
     // outlive `session` and touch closed handles, and the (forgotten) HPCON would leak.
     let wait_result = session.wait();
-    if let Some(w) = teardown_warning(reap_tree(&job)) {
+    if let Some(w) = teardown_warning(link.reap_all(&job)) {
         tracing::error!("{w}");
     }
     let code = *wait_result.as_ref().unwrap_or(&1);
@@ -1355,20 +1382,21 @@ fn handle_pty(
         }
     }
     let _ = out_thread.join();
-    {
-        // The shell is gone and the output is drained, so the code is final and nothing else
-        // can still be writing frames.
-        let mut g = tx_arc.lock().unwrap();
-        show_exit_notice(&mut g, Mode::Pty, configured.as_ref(), code);
-        // FIN the write half only: the input pump keeps reading until the client closes, so for a
-        // conforming client the socket never closes with unread input, which would reset it and
-        // lose the EXIT frame.
-        send_exit(&mut *g, code);
-    }
+    // The shell is gone and the output is drained, so the code is final and nothing else can still be writing
+    // frames. A command that `ssh-broker elevate` ran has been ended with the session (`reap_all`), and the
+    // connection is the session's again by now: the output pump above could not end before.
+    show_exit_notice(&link, Mode::Pty, configured.as_ref(), code);
+    // FIN the write half only: the input pump keeps reading until the client closes, so for a
+    // conforming client the socket never closes with unread input, which would reset it and
+    // lose the EXIT frame.
+    link.send_exit(code);
+    link.end();
     if let Some(hangup) = hangup {
         hangup.finish();
     }
     let _ = in_thread.join();
+    // The pseudoconsole is closed: the writer thread is released, and goes before the pipe it writes to does.
+    target.shutdown();
     // Threads joined; `session` now drops and closes the process/thread + pipe handles.
     wait_result?;
     Ok(())
@@ -1385,6 +1413,14 @@ trait HalfClose: std::io::Write {
 impl HalfClose for ConnTx {
     fn shutdown_write(&self) -> anyhow::Result<()> {
         ConnTx::shutdown_write(self)
+    }
+}
+
+/// The write half a [`link::Link`] owns.
+#[cfg(windows)]
+impl HalfClose for Box<dyn HalfClose + Send> {
+    fn shutdown_write(&self) -> anyhow::Result<()> {
+        (**self).shutdown_write()
     }
 }
 
@@ -1464,26 +1500,66 @@ fn register_session<'a>(reservation: Reservation<'a>, job: &Arc<cosca::Job>) -> 
     registration
 }
 
-/// Routes decoded input frames into the pseudoconsole.
+/// A pseudoconsole's input: the session's own, or an elevated command's (see `elevation`).
 #[cfg(windows)]
-struct PtyInputSink {
-    writer: HandleWriter,
+struct PtyTarget {
+    /// `None` once [`PtyTarget::shutdown`] has joined the writer.
+    writer: Mutex<Option<HandleWriter>>,
     hpc_cell: Arc<Mutex<Option<isize>>>,
 }
 
 #[cfg(windows)]
-impl FrameSink for PtyInputSink {
-    fn on_data(&mut self, _stream: Stream, bytes: &[u8]) -> anyhow::Result<()> {
-        // PTY input arrives pre-encoded (win32-input-mode); hand it straight to ConPTY#2.
-        self.writer.write(bytes)
+impl PtyTarget {
+    fn new(writer: HandleWriter, hpc_cell: Arc<Mutex<Option<isize>>>) -> Self {
+        PtyTarget {
+            writer: Mutex::new(Some(writer)),
+            hpc_cell,
+        }
     }
-    fn on_resize(&mut self, r: Resize) -> anyhow::Result<()> {
+
+    /// Stop and join the writer thread, which may be parked writing to the pseudoconsole's input pipe until the
+    /// pseudoconsole is closed: call it after that, and before the pipe's handles are closed. Input after it is
+    /// discarded. The writer holds a raw handle that its owner closes, so it must not outlive the owner, and a
+    /// share of this target can: a request that is still being answered holds one.
+    fn shutdown(&self) {
+        let writer = self.writer.lock().unwrap_or_else(PoisonError::into_inner).take();
+        drop(writer);
+    }
+}
+
+#[cfg(windows)]
+impl InputTarget for PtyTarget {
+    fn input(&self, bytes: &[u8]) -> anyhow::Result<()> {
+        // PTY input arrives pre-encoded (win32-input-mode); hand it straight to ConPTY#2.
+        match &*self.writer.lock().unwrap_or_else(PoisonError::into_inner) {
+            Some(writer) => writer.write(bytes),
+            None => Ok(()),
+        }
+    }
+
+    fn resize(&self, cols: u16, rows: u16) {
         // Hold the lock across the OS call (bound guard, not a temporary) so teardown
         // cannot close the HPCON mid-resize.
-        let hpc = self.hpc_cell.lock().unwrap();
+        let hpc = self.hpc_cell.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(raw) = *hpc {
-            let _ = conpty::resize_pty(raw, r.cols, r.rows);
+            let _ = conpty::resize_pty(raw, cols, rows);
         }
+    }
+}
+
+/// Routes decoded input frames of a session with a terminal to whoever the link says gets them.
+#[cfg(windows)]
+struct LinkInputSink {
+    link: Arc<Link>,
+}
+
+#[cfg(windows)]
+impl FrameSink for LinkInputSink {
+    fn on_data(&mut self, _stream: Stream, bytes: &[u8]) -> anyhow::Result<()> {
+        self.link.route_input(bytes)
+    }
+    fn on_resize(&mut self, r: Resize) -> anyhow::Result<()> {
+        self.link.resize(r);
         Ok(())
     }
 }
@@ -1506,6 +1582,7 @@ fn handle_exec(
         control,
         unelevated,
         reservation,
+        policy,
     } = env;
     let id = reservation.id().to_string();
     let session_env = [(SESSION_VARIABLE, id.as_str())];
@@ -1539,7 +1616,7 @@ fn handle_exec(
     };
     (hooks.after_spawn)();
     let job = child.job();
-    let Some(_registration) = register_session(reservation, &job) else {
+    let Some(registration) = register_session(reservation, &job) else {
         tracing::debug!("the agent is ending; the shell warnings of a refused login are not shown: {notices:?}");
         return logout::refuse_while_ending(&mut rx, &mut tx, control);
     };
@@ -1551,17 +1628,42 @@ fn handle_exec(
         return Ok(());
     }
     show_notices(&mut tx, Mode::Exec, &notices);
-    // Before `tx` moves into the shared mutex.
-    let hangup = start_hangup_watch(&tx, &job, hooks.make_watcher);
+    // Before `tx` moves into the link.
+    let watcher = prepare_hangup_watch(&tx, hooks.make_watcher);
     let out_raw = child.stdout_read_raw();
     let err_raw = child.stderr_read_raw();
     let stdin_owned = child.take_stdin_write();
     let stdin_raw = stdin_owned.as_ref().map_or(0, |h| h.raw());
-    // stdout, stderr, and the EXIT frame all share tx → serialize with a mutex.
-    let tx_arc = Arc::new(Mutex::new(tx));
+    // stdout, stderr, and the EXIT frame all share the connection → the link serialises the writes. Without a
+    // terminal the link gates nothing, and the session's input goes to its stdin by this function's own sink.
+    let link = Link::new(tx, false, (0, 0), None);
+    let starts = Starts {
+        pty: hooks.start_pty,
+        exec: hooks.start_exec,
+    };
+    registration.attach(HostedSession::shared(policy, Arc::clone(&link), starts));
+    let hangup = start_hangup_watch(watcher, &link, &job);
 
-    let t_out = spawn_stream_pump(out_raw, Stream::Stdout, Arc::clone(&tx_arc), Arc::clone(&job));
-    let t_err = spawn_stream_pump(err_raw, Stream::Stderr, Arc::clone(&tx_arc), Arc::clone(&job));
+    let reaping = |link: &Arc<Link>| {
+        let (link, job) = (Arc::clone(link), Arc::clone(&job));
+        move || {
+            link.reap_all(&job);
+        }
+    };
+    let t_out = spawn_stream_pump(
+        out_raw,
+        Stream::Stdout,
+        Arc::clone(&link),
+        Carrier::Session,
+        reaping(&link),
+    );
+    let t_err = spawn_stream_pump(
+        err_raw,
+        Stream::Stderr,
+        Arc::clone(&link),
+        Carrier::Session,
+        reaping(&link),
+    );
 
     // stdin pump owns the child's stdin-write handle. A half-close mid-session (empty
     // DATA(Stdin) marker) closes only the child's stdin so a reader like sort/findstr
@@ -1570,7 +1672,7 @@ fn handle_exec(
     // sleeps indefinitely would never exit, and the output pumps — blocked in read with
     // nothing to write — would never detect the dead socket, hanging the waiter.
     let t_in = {
-        let job = Arc::clone(&job);
+        let (link, job) = (Arc::clone(&link), Arc::clone(&job));
         std::thread::spawn(move || {
             let mut sink = ExecInputSink {
                 writer: HandleWriter::spawn(stdin_raw, stdin_owned, hooks.parked),
@@ -1579,7 +1681,7 @@ fn handle_exec(
             // Reap first: dropping the sink joins the writer thread, which may be parked
             // writing to the child's stdin. Here the reap does release it — `ExecChild::spawn`
             // drops the parent's copy of the read end, so the dead child was the only holder.
-            if let Some(w) = teardown_warning(reap_tree(&job)) {
+            if let Some(w) = teardown_warning(link.reap_all(&job)) {
                 tracing::error!("{w}");
             }
             drop(sink); // also closes the child's stdin if the EOF marker never arrived
@@ -1589,20 +1691,18 @@ fn handle_exec(
     let wait_result = child.wait();
     // The command is gone, so the session is over. Reaping now takes its descendants with it
     // and closes the pipes, which is what lets the output pumps below be joined at all.
-    if let Some(w) = teardown_warning(reap_tree(&job)) {
+    if let Some(w) = teardown_warning(link.reap_all(&job)) {
         tracing::error!("{w}");
     }
     let code = *wait_result.as_ref().unwrap_or(&1);
     let _ = t_out.join();
     let _ = t_err.join();
-    {
-        let mut g = tx_arc.lock().unwrap();
-        show_exit_notice(&mut g, Mode::Exec, configured.as_ref(), code);
-        // FIN the write half only: the stdin pump keeps reading until the client closes, so for a
-        // conforming client the socket never closes with unread input, which would reset it and
-        // lose the EXIT frame.
-        send_exit(&mut *g, code);
-    }
+    show_exit_notice(&link, Mode::Exec, configured.as_ref(), code);
+    // FIN the write half only: the stdin pump keeps reading until the client closes, so for a
+    // conforming client the socket never closes with unread input, which would reset it and
+    // lose the EXIT frame.
+    link.send_exit(code);
+    link.end();
     if let Some(hangup) = hangup {
         hangup.finish();
     }
@@ -1624,20 +1724,33 @@ struct HangupGuard {
 ///
 /// `None` if the watcher cannot be created. A failure here must not cost the user a session; it
 /// only loses the hangup protection.
+///
+/// In two steps, because the watcher is made from the connection's write half, which then moves into the session's
+/// [`Link`], and what it ends on a hangup is everything the link carries ([`Link::reap_all`]).
 #[cfg(windows)]
-fn start_hangup_watch(tx: &ConnTx, job: &Arc<cosca::Job>, make_watcher: WatchFactory) -> Option<HangupGuard> {
-    let (hangup, waker) = match make_watcher(tx) {
-        Ok(pair) => pair,
+fn prepare_hangup_watch(tx: &ConnTx, make_watcher: WatchFactory) -> Option<(HangupWatcher, Waker)> {
+    match make_watcher(tx) {
+        Ok(pair) => Some(pair),
         Err(e) => {
             tracing::warn!("could not create the hangup watcher; a silent command will outlive its client: {e}");
-            return None;
+            None
         }
-    };
-    let job = Arc::clone(job);
+    }
+}
+
+/// Start the watch [`prepare_hangup_watch`] made.
+#[cfg(windows)]
+fn start_hangup_watch(
+    watcher: Option<(HangupWatcher, Waker)>,
+    link: &Arc<Link>,
+    job: &Arc<cosca::Job>,
+) -> Option<HangupGuard> {
+    let (hangup, waker) = watcher?;
+    let (link, job) = (Arc::clone(link), Arc::clone(job));
     let thread = std::thread::spawn(move || {
         // The wait also ends after a normal teardown.
         end_of_watch(hangup.wait(), || {
-            if let Some(w) = teardown_warning(reap_tree(&job)) {
+            if let Some(w) = teardown_warning(link.reap_all(&job)) {
                 tracing::error!("{w}");
             }
         });
@@ -1673,15 +1786,19 @@ impl HangupGuard {
     }
 }
 
-/// Pump one child output stream (stdout/stderr) into `DATA(stream)` frames on the shared
-/// connection. On EOF the child is exiting; on a write failure the SSH side is gone, so
-/// kill the child to unblock the waiter.
+/// Pump one output stream (a terminal's, or stdout/stderr) of a process into `DATA(stream)` frames on the session's
+/// connection, as `carrier`'s. On EOF the process is exiting; on a write failure the SSH side is gone (or the link
+/// has ended), so `gone` is called (a session's pump ends its tree) and the pump goes on reading without
+/// delivering: it is the only reader of the pipe, and a pipe nobody reads fills and stalls the writer.
+///
+/// The session's pseudoconsole pump and an elevated command's are this one with another carrier.
 #[cfg(windows)]
 fn spawn_stream_pump(
     raw: isize,
     stream: Stream,
-    tx: Arc<Mutex<ConnTx>>,
-    job: std::sync::Arc<cosca::Job>,
+    link: Arc<Link>,
+    carrier: Carrier,
+    gone: impl Fn() + Send + 'static,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let mut buf = [0u8; 32 * 1024];
@@ -1689,20 +1806,18 @@ fn spawn_stream_pump(
         loop {
             let n = conpty::read_handle(raw, &mut buf);
             if n == 0 {
-                break; // child's stream closed (exiting)
+                break; // stream closed (exiting, or the pseudoconsole closed by teardown and drained to EOF)
             }
             if !delivering {
-                continue; // draining so the pipe cannot fill and stall the writer
+                continue; // draining, see above
             }
-            let ok = {
-                let mut g = tx.lock().unwrap();
-                write_data(&mut *g, stream, &buf[..n]).is_ok()
-            };
-            if !ok {
+            if link.deliver(carrier, stream, &buf[..n]).is_err() {
                 // The socket is gone. This is an independent detector, not a redundant
                 // one: the input pump's queue is bounded, so a command that ignores its stdin
-                // can still park that pump in a send and blind it to the socket.
-                reap_tree(&job);
+                // can still park that pump in a send and blind it to the socket. And keep READING: for a
+                // pseudoconsole, `ClosePseudoConsole` flushes conhost's pending output through the pipe, and
+                // abandoning it here lets it fill, and teardown then blocks inside the close.
+                gone();
                 delivering = false;
             }
         }

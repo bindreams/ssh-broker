@@ -14,10 +14,9 @@ use std::io::{Read, Write};
 
 use crate::account::Elevation;
 use crate::console_prompt::is_no_agent;
-use crate::protocol::{FrameKind, FrameReader, Launch, Mode, Stream, write_frame};
-use crate::relay::{FrameSink, Outcome};
-use crate::request::{Asked, ask_at};
-use crate::shim::{make_handshake, peer_gone, pump_heard};
+use crate::protocol::{FrameKind, Launch, Mode};
+use crate::request::{Asked, ask_at, ask_with};
+use crate::shim::make_handshake;
 use crate::socket_loc::Integrity;
 
 /// What `logout` says when there is no agent to ask.
@@ -61,41 +60,19 @@ fn elevated_folder_exists(profile: &std::path::Path) -> anyhow::Result<bool> {
     }
 }
 
-/// Writes the agent's stderr to `err`.
-struct ReplySink<'a> {
-    err: &'a mut dyn Write,
-}
-
-impl FrameSink for ReplySink<'_> {
-    fn on_data(&mut self, _stream: Stream, bytes: &[u8]) -> anyhow::Result<()> {
-        self.err.write_all(bytes)?;
-        self.err.flush()?;
-        Ok(())
-    }
-}
-
 /// Send the `Logout` handshake over a connected transport and relay the reply to `err`. The transport
 /// is borrowed, not consumed: the caller keeps it open until the process exits.
 pub fn logout_on<R: Read, W: Write>(rx: &mut R, tx: &mut W, err: &mut dyn Write) -> Asked {
     let mut handshake = make_handshake(&None, false, Launch::Direct, String::new(), 0, 0, None);
     handshake.mode = Mode::Logout;
-    let sent = handshake
-        .encode()
-        .and_then(|bytes| write_frame(tx, FrameKind::Handshake, &bytes))
-        .and_then(|()| tx.flush().map_err(Into::into));
-    if let Err(e) = sent {
-        if peer_gone(&e).is_some() {
-            return Asked::Unanswered;
-        }
-        let _ = writeln!(err, "ssh-broker: could not ask the agent to end the session: {e:#}");
-        return Asked::Code(crate::shim::map_outcome(Ok(Outcome::PeerClosed)));
-    }
-    let pumped = pump_heard(rx, &mut FrameReader::new(), &mut ReplySink { err });
-    if pumped.no_answer() {
-        Asked::Unanswered
-    } else {
-        Asked::Code(pumped.code())
-    }
+    ask_with(
+        rx,
+        tx,
+        err,
+        FrameKind::Handshake,
+        handshake.encode(),
+        "ask the agent to end the session",
+    )
 }
 
 /// Connect to the agent that serves a process at `integrity`: `agent` is the connect to `agent.sock` of its

@@ -125,6 +125,57 @@ pub fn unelevated_fallback(cause: &str) -> String {
     )
 }
 
+// ssh-broker elevate =====
+//
+// What `elevate` and the agent say when a command is not run elevated. Each is one line, ending in a line break, so
+// that the agent's reply (stderr text, then `Exit`) and the client's own refusal read the same.
+
+/// `elevate` was typed in a shell that has no valid `SSH_BROKER_SESSION`: not under ssh-broker, or a session of an
+/// agent from before the variable (an agent that was already running when this version was installed).
+pub fn elevation_not_hosted() -> String {
+    "ssh-broker: this shell is not hosted by ssh-broker, so nothing can be elevated from it (a session of an agent \
+     from before this version has no session id: end it and log in again).\r\n"
+        .to_owned()
+}
+
+/// The login asked for `SSH_BROKER_ELEVATION=never`.
+pub fn elevation_never() -> String {
+    "ssh-broker: this login asked that nothing be elevated (SSH_BROKER_ELEVATION=never).\r\n".to_owned()
+}
+
+/// A request reached the agent for a session whose login asked for `always`: that session runs at High, where
+/// `elevate` runs the command in place, so a request for it comes from somewhere else in the account.
+pub fn elevation_already_elevated() -> String {
+    "ssh-broker: this session is already elevated: run the command in it.\r\n".to_owned()
+}
+
+/// The login asked for the default, which asks the person at the terminal; that question is not built yet.
+pub fn elevation_consent_not_built() -> String {
+    "ssh-broker: this login asks before elevating, and asking is not built yet: log in with \
+     SSH_BROKER_ELEVATION=auto-approve to run a command elevated without a question.\r\n"
+        .to_owned()
+}
+
+/// A second `elevate` while the session's first is asked or running.
+pub fn elevation_in_progress() -> String {
+    "ssh-broker: another elevation is in progress in this session.\r\n".to_owned()
+}
+
+/// The command was allowed and could not be started; `cause` is why.
+pub fn elevation_cannot_start(cause: &str) -> String {
+    format!("ssh-broker: the command could not be started elevated: {cause}\r\n")
+}
+
+/// `elevate` in a session of an account whose agent runs below High, which has no request socket.
+pub fn elevation_needs_high_agent() -> String {
+    "ssh-broker: elevate needs an account whose agent runs at High, and this account's agent does not.\r\n".to_owned()
+}
+
+/// What `elevate` prints when it is given no command.
+pub fn elevate_usage() -> &'static str {
+    "usage: ssh-broker elevate <command> [arguments]"
+}
+
 /// The clause every line uses to say a token's elevation could not be read; `cause` is why.
 pub fn elevation_unreadable_clause(cause: &str) -> String {
     format!("cannot tell how elevated this login is ({cause})")

@@ -122,6 +122,26 @@ fn logout_takes_no_arguments() {
 }
 
 #[test]
+fn route_elevate_takes_the_rest_of_the_arguments_and_a_dash_c_login_stays_the_shim() {
+    assert_eq!(
+        route_line("ssh-broker.exe elevate cmd /c whoami"),
+        Route::Elevate(vec!["cmd".into(), "/c".into(), "whoami".into()])
+    );
+    assert_eq!(
+        route_line(r#"ssh-broker.exe elevate "C:\Program Files\x.exe" "a b" --help"#),
+        Route::Elevate(vec![r"C:\Program Files\x.exe".into(), "a b".into(), "--help".into()]),
+        "the arguments are the command's, whatever they look like"
+    );
+    assert_eq!(
+        route_line("ssh-broker.exe elevate"),
+        Route::Usage(Verb::Elevate),
+        "no command is a usage line"
+    );
+    assert_eq!(command("ssh-broker.exe -c \"elevate x\""), some("elevate x"));
+    assert_eq!(command("ssh-broker.exe -c elevate"), some("elevate"));
+}
+
+#[test]
 fn a_flag_name_is_not_a_flag_value() {
     assert_eq!(
         route_line("ssh-broker.exe agent --background --expect-user --expect-user x"),
@@ -276,6 +296,7 @@ fn a_command_named_like_a_verb_is_still_shim_exec() {
         "verify-probe",
         "console-fallback",
         "logout",
+        "elevate",
         "auto-login",
     ] {
         assert_eq!(command(&format!("ssh-broker.exe -c {verb}")), some(verb));
