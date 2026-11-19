@@ -1338,16 +1338,16 @@ fn handle_pty(
         exec: hooks.start_exec,
     };
     registration.attach(HostedSession::shared(policy, Arc::clone(&link), starts));
-    let hangup = start_hangup_watch(watcher, &link, &job);
+    let hangup = start_hangup_watch(watcher, &job);
 
     // Output pump: ConPTY output -> DATA(Pty). It deliberately does NOT emit EXIT.
     // `read_handle` returns 0 for a read *error* as well as for EOF, so this thread cannot
     // tell "the shell finished" from "the pipe broke" — emitting the code from here raced the
     // waiter that produces it, and a failed session could report EXIT(0).
     let out_thread = {
-        let (link, job) = (Arc::clone(&link), Arc::clone(&job));
+        let job = Arc::clone(&job);
         spawn_stream_pump(out_raw, Stream::Pty, Arc::clone(&link), Carrier::Session, move || {
-            link.reap_all(&job);
+            reap_tree(&job);
         })
     };
 
@@ -1359,7 +1359,7 @@ fn handle_pty(
                 link: Arc::clone(&link),
             };
             pump_until_peer_gone(&mut rx, &mut fr, &mut sink);
-            if let Some(w) = teardown_warning(link.reap_all(&job)) {
+            if let Some(w) = teardown_warning(reap_tree(&job)) {
                 tracing::error!("{w}");
             }
         })
@@ -1369,7 +1369,7 @@ fn handle_pty(
     // down (close the HPCON, join the threads) before returning, or the threads would
     // outlive `session` and touch closed handles, and the (forgotten) HPCON would leak.
     let wait_result = session.wait();
-    if let Some(w) = teardown_warning(link.reap_all(&job)) {
+    if let Some(w) = teardown_warning(reap_tree(&job)) {
         tracing::error!("{w}");
     }
     let code = *wait_result.as_ref().unwrap_or(&1);
@@ -1383,8 +1383,9 @@ fn handle_pty(
     }
     let _ = out_thread.join();
     // The shell is gone and the output is drained, so the code is final and nothing else can still be writing
-    // frames. A command that `ssh-broker elevate` ran has been ended with the session (`reap_all`), and the
-    // connection is the session's again by now: the output pump above could not end before.
+    // frames. The connection is the session's again by now, if `ssh-broker elevate --terminal` had it: the output
+    // pump above could not end before. The `elevate` that asked is inside the session's tree, which was just
+    // reaped, and its request connection closing ends the command (see `elevation::run_hosted`).
     show_exit_notice(&link, Mode::Pty, configured.as_ref(), code);
     // FIN the write half only: the input pump keeps reading until the client closes, so for a
     // conforming client the socket never closes with unread input, which would reset it and
@@ -1642,28 +1643,16 @@ fn handle_exec(
         exec: hooks.start_exec,
     };
     registration.attach(HostedSession::shared(policy, Arc::clone(&link), starts));
-    let hangup = start_hangup_watch(watcher, &link, &job);
+    let hangup = start_hangup_watch(watcher, &job);
 
-    let reaping = |link: &Arc<Link>| {
-        let (link, job) = (Arc::clone(link), Arc::clone(&job));
+    let reaping = || {
+        let job = Arc::clone(&job);
         move || {
-            link.reap_all(&job);
+            reap_tree(&job);
         }
     };
-    let t_out = spawn_stream_pump(
-        out_raw,
-        Stream::Stdout,
-        Arc::clone(&link),
-        Carrier::Session,
-        reaping(&link),
-    );
-    let t_err = spawn_stream_pump(
-        err_raw,
-        Stream::Stderr,
-        Arc::clone(&link),
-        Carrier::Session,
-        reaping(&link),
-    );
+    let t_out = spawn_stream_pump(out_raw, Stream::Stdout, Arc::clone(&link), Carrier::Session, reaping());
+    let t_err = spawn_stream_pump(err_raw, Stream::Stderr, Arc::clone(&link), Carrier::Session, reaping());
 
     // stdin pump owns the child's stdin-write handle. A half-close mid-session (empty
     // DATA(Stdin) marker) closes only the child's stdin so a reader like sort/findstr
@@ -1672,7 +1661,7 @@ fn handle_exec(
     // sleeps indefinitely would never exit, and the output pumps — blocked in read with
     // nothing to write — would never detect the dead socket, hanging the waiter.
     let t_in = {
-        let (link, job) = (Arc::clone(&link), Arc::clone(&job));
+        let job = Arc::clone(&job);
         std::thread::spawn(move || {
             let mut sink = ExecInputSink {
                 writer: HandleWriter::spawn(stdin_raw, stdin_owned, hooks.parked),
@@ -1681,7 +1670,7 @@ fn handle_exec(
             // Reap first: dropping the sink joins the writer thread, which may be parked
             // writing to the child's stdin. Here the reap does release it — `ExecChild::spawn`
             // drops the parent's copy of the read end, so the dead child was the only holder.
-            if let Some(w) = teardown_warning(link.reap_all(&job)) {
+            if let Some(w) = teardown_warning(reap_tree(&job)) {
                 tracing::error!("{w}");
             }
             drop(sink); // also closes the child's stdin if the EOF marker never arrived
@@ -1691,7 +1680,7 @@ fn handle_exec(
     let wait_result = child.wait();
     // The command is gone, so the session is over. Reaping now takes its descendants with it
     // and closes the pipes, which is what lets the output pumps below be joined at all.
-    if let Some(w) = teardown_warning(link.reap_all(&job)) {
+    if let Some(w) = teardown_warning(reap_tree(&job)) {
         tracing::error!("{w}");
     }
     let code = *wait_result.as_ref().unwrap_or(&1);
@@ -1726,7 +1715,7 @@ struct HangupGuard {
 /// only loses the hangup protection.
 ///
 /// In two steps, because the watcher is made from the connection's write half, which then moves into the session's
-/// [`Link`], and what it ends on a hangup is everything the link carries ([`Link::reap_all`]).
+/// [`Link`].
 #[cfg(windows)]
 fn prepare_hangup_watch(tx: &ConnTx, make_watcher: WatchFactory) -> Option<(HangupWatcher, Waker)> {
     match make_watcher(tx) {
@@ -1740,17 +1729,13 @@ fn prepare_hangup_watch(tx: &ConnTx, make_watcher: WatchFactory) -> Option<(Hang
 
 /// Start the watch [`prepare_hangup_watch`] made.
 #[cfg(windows)]
-fn start_hangup_watch(
-    watcher: Option<(HangupWatcher, Waker)>,
-    link: &Arc<Link>,
-    job: &Arc<cosca::Job>,
-) -> Option<HangupGuard> {
+fn start_hangup_watch(watcher: Option<(HangupWatcher, Waker)>, job: &Arc<cosca::Job>) -> Option<HangupGuard> {
     let (hangup, waker) = watcher?;
-    let (link, job) = (Arc::clone(link), Arc::clone(job));
+    let job = Arc::clone(job);
     let thread = std::thread::spawn(move || {
         // The wait also ends after a normal teardown.
         end_of_watch(hangup.wait(), || {
-            if let Some(w) = teardown_warning(link.reap_all(&job)) {
+            if let Some(w) = teardown_warning(reap_tree(&job)) {
                 tracing::error!("{w}");
             }
         });
@@ -1791,7 +1776,8 @@ impl HangupGuard {
 /// has ended), so `gone` is called (a session's pump ends its tree) and the pump goes on reading without
 /// delivering: it is the only reader of the pipe, and a pipe nobody reads fills and stalls the writer.
 ///
-/// The session's pseudoconsole pump and an elevated command's are this one with another carrier.
+/// An elevated command's pumps are this one: a `--terminal` command's writes through the session's link with another
+/// carrier, and a default-mode command's through a link of the request's own connection, which has no terminal.
 #[cfg(windows)]
 fn spawn_stream_pump(
     raw: isize,

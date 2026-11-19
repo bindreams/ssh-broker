@@ -398,7 +398,15 @@ fn the_elevate_sentences_are_each_whole() {
         text::elevation_needs_high_agent(),
         "ssh-broker: elevate needs an account whose agent runs at High, and this account's agent does not.\r\n"
     );
-    assert_eq!(text::elevate_usage(), "usage: ssh-broker elevate <command> [arguments]");
+    assert_eq!(
+        text::elevation_needs_a_terminal(),
+        "ssh-broker: --terminal needs a session with a terminal, and this one has none: log in with ssh -t, or leave \
+         out --terminal to run the command with its output here and its input closed.\r\n"
+    );
+    assert_eq!(
+        text::elevate_usage(),
+        "usage: ssh-broker elevate [--terminal] <command> [arguments]"
+    );
 }
 
 #[test]
@@ -411,6 +419,7 @@ fn every_elevate_refusal_is_one_prefixed_line_ending_in_crlf() {
         text::elevation_in_progress(),
         text::elevation_cannot_start("why"),
         text::elevation_needs_high_agent(),
+        text::elevation_needs_a_terminal(),
     ] {
         assert!(line.starts_with("ssh-broker: ") && line.ends_with("\r\n"), "{line:?}");
         assert_eq!(line.matches('\n').count(), 1, "{line:?}");

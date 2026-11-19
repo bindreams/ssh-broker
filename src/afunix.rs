@@ -388,6 +388,15 @@ impl ConnTx {
         self.0.try_clone()
     }
 
+    /// A second write half of the same connection, not inheritable like the halves [`split`] makes. Writes through
+    /// the two are not ordered with each other: the caller keeps one of them quiet while the other writes.
+    pub fn try_clone(&self) -> anyhow::Result<ConnTx> {
+        let dup = self.0.try_clone()?;
+        #[cfg(windows)]
+        set_no_inherit(&dup)?;
+        Ok(ConnTx(dup))
+    }
+
     /// Send FIN on the write half. A `try_clone` dup does NOT FIN on drop, so without an
     /// explicit shutdown the peer would block forever and never observe `PeerClosed`.
     pub fn shutdown_write(&self) -> anyhow::Result<()> {

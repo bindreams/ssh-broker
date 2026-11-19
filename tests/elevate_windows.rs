@@ -6,13 +6,15 @@
 //! allows or not:
 //!
 //! - `never` refuses, and nothing runs;
-//! - `auto-approve` runs the command with the agent's own token, elevated, whose output is the session's, with a
-//!   terminal and without one;
+//! - `auto-approve` runs the command with the agent's own token, elevated. By default, in a session with a terminal
+//!   or without, its input is closed and its output is printed by `elevate` in the session, below the typed line, so
+//!   it can be piped; with `--terminal` it has a screen of its own, and the session's screen comes back when it ends;
 //! - the default (`prompt`) asks the person at the terminal, which a later unit builds: until then it is refused
 //!   with a sentence that says so;
 //! - `always` runs it in place, in a session that is elevated already.
 //!
-//! What the person sees of the terminal while the command runs is the screen tests', not these.
+//! What a session with a terminal shows is judged on the client's stream rendered as a terminal would
+//! (`sshd_rig::rendered`), with the rows that scrolled off.
 #![cfg(windows)]
 
 use ssh_broker::offer::text;
@@ -49,12 +51,25 @@ mod sshd_rig;
 mod stand_in;
 
 use account_fixture::{Account, ServiceLogon};
-use sshd_rig::{Login, SHELL_PROMPT, SshSession, no_shell_to_carry, run_client};
+use sshd_rig::{Login, SHELL_PROMPT, SshSession, no_shell_to_carry, rendered, run_client};
 use stand_in::Kit;
 
 /// What `whoami /groups` prints for a process at High, and for one that is not.
 const HIGH: &str = r"Mandatory Label\High Mandatory Level";
 const MEDIUM: &str = r"Mandatory Label\Medium Mandatory Level";
+
+/// Pieces of what `whoami /groups` prints: no row of a terminal that shows a prompt holds one of these, which is
+/// what a command's output garbled into a prompt's row looks like.
+const COMMAND_ROWS: [&str; 5] = [
+    "Mandatory Label",
+    "Group Name",
+    r"BUILTIN\",
+    "Everyone",
+    r"NT AUTHORITY\",
+];
+
+/// Rows of history a rendering keeps: more than any run here produces.
+const SCROLLBACK: usize = 2000;
 
 /// `elevate` refuses with 126.
 const REFUSED: u32 = 126;
@@ -109,6 +124,31 @@ impl<'a> Started<'a> {
             (self.login.diagnostics())()
         )
     }
+
+    /// A session with a terminal whose login asked for `auto-approve`, past its first prompt. `sbk` is an alias of
+    /// the broker's exe in it, so that a typed `elevate` line is short enough not to wrap on the screen.
+    fn terminal_session(&self) -> SshSession {
+        let mut session = SshSession::start(self.login.command_asking("auto-approve"), self.login.diagnostics());
+        session.read_until(SHELL_PROMPT);
+        session.type_line(&format!("Set-Alias sbk '{}'", self.kit.exe.display()));
+        session.say("ALIAS-IS-SET");
+        session
+    }
+}
+
+/// The index of the first of `rows`, from `from` on, that `wanted` accepts; or a failure that shows all of them.
+fn row_from(rows: &[&str], from: usize, what: &str, wanted: impl Fn(&str) -> bool) -> usize {
+    rows.iter()
+        .enumerate()
+        .skip(from)
+        .find(|(_, row)| wanted(row))
+        .map(|(at, _)| at)
+        .unwrap_or_else(|| panic!("no row {what} from row {from} on; the rows were:\n{}", rows.join("\n")))
+}
+
+/// A row that shows a prompt and, on the same row, a piece of what `whoami /groups` prints.
+fn garbled(row: &str) -> bool {
+    row.contains(SHELL_PROMPT) && COMMAND_ROWS.iter().any(|piece| row.contains(piece))
 }
 
 fn an_administrator(tag: &str) -> (Kit, Account, session_end::LogOutOnDrop) {
@@ -141,17 +181,27 @@ fn never_refuses_elevate_and_nothing_runs() {
     assert!(!marker.exists(), "the command ran: {}", admin.failure(&outcome));
 }
 
-/// Elevated (CI only). `ssh host cmd` with `auto-approve`: the command runs elevated, with the agent's token, and
-/// its output is on the channel, while the session that asked is not elevated.
+/// Elevated (CI only). `ssh host cmd` with `auto-approve`: the command runs elevated, with the agent's token, its
+/// output is `elevate`'s own and so can be piped (only the line the filter keeps comes out), while the session that
+/// asked is not elevated.
 #[test]
-fn auto_approve_in_ssh_host_cmd_runs_whoami_elevated_with_its_output_on_the_channel() {
+fn a_command_run_without_a_terminal_has_its_output_piped_and_the_session_is_not_elevated() {
     let _machine = machine::exclusive();
     let (kit, account, _end) = an_administrator("elau");
     let admin = Started::start(&kit, &account);
 
-    let elevated = admin.elevate_over_ssh(Some("auto-approve"), "whoami /groups");
+    // The account's shell is PowerShell: its own filter is the pipe's other end.
+    let elevated = admin.elevate_over_ssh(
+        Some("auto-approve"),
+        "cmd.exe /c whoami /groups | Select-String 'Mandatory Label'",
+    );
     let shown = String::from_utf8_lossy(&elevated.stdout).into_owned();
     assert!(shown.contains(HIGH), "{}", admin.failure(&elevated));
+    assert!(
+        !COMMAND_ROWS[1..].iter().any(|piece| shown.contains(piece)),
+        "more than the line the filter keeps came through the pipe: {}",
+        admin.failure(&elevated)
+    );
     assert_eq!(elevated.code, Some(0), "{}", admin.failure(&elevated));
 
     // The same program in the session itself is the session's: unelevated.
@@ -166,19 +216,111 @@ fn auto_approve_in_ssh_host_cmd_runs_whoami_elevated_with_its_output_on_the_chan
     );
 }
 
-/// Elevated (CI only). With a terminal: the command runs elevated, its output reaches the person, and the session
-/// answers the next line.
+/// Elevated (CI only). In a session with a terminal, without `--terminal`: the command's output is printed in the
+/// session below the line that was typed, and the prompt follows it, with the next line and its output after that.
+/// Judged on the client's history, in order, and on no row holding a prompt and a row of the command (what the
+/// command's own screen garbled into the session's before this was built).
 #[test]
-fn auto_approve_with_a_terminal_runs_the_command_elevated_and_the_session_continues_after_it() {
+fn with_a_terminal_the_output_is_below_the_typed_line_and_the_prompt_follows() {
     let _machine = machine::exclusive();
     let (kit, account, _end) = an_administrator("elwt");
     let admin = Started::start(&kit, &account);
 
-    let mut session = SshSession::start(admin.login.command_asking("auto-approve"), admin.login.diagnostics());
-    session.read_until(SHELL_PROMPT);
-    session.type_line(&format!("& '{}' elevate cmd.exe /c whoami /groups", kit.exe.display()));
+    let mut session = admin.terminal_session();
+    session.type_line("sbk elevate cmd.exe /c whoami /groups");
     session.read_until(HIGH);
-    session.say("the-session-went-on");
+    session.say("NEXT-LINE-OUTPUT");
+    let shown = rendered(&session.transcript, SCROLLBACK);
+    let history = shown.history();
+    let rows: Vec<&str> = history.lines().collect();
+
+    let typed = row_from(&rows, 0, "of the typed line", |row| {
+        row.starts_with(SHELL_PROMPT) && row.contains("sbk elevate cmd.exe /c whoami /groups")
+    });
+    let high = row_from(&rows, typed + 1, "of the High label", |row| row.contains(HIGH));
+    // The prompt that follows the output has the next typed line after it.
+    let next = row_from(&rows, high + 1, "of a prompt with the next line typed", |row| {
+        row.starts_with(SHELL_PROMPT) && row.contains("Write-Output")
+    });
+    row_from(&rows, next + 1, "of the next line's output", |row| {
+        row == "NEXT-LINE-OUTPUT"
+    });
+
+    // The history ends with the live screen, so these are the visible rows as well.
+    for row in &rows {
+        assert!(
+            !garbled(row),
+            "a row holds a prompt and a row of the command: {row:?}\n{history}\n{}",
+            session.text()
+        );
+    }
+    session.leave();
+}
+
+/// Elevated (CI only). Ctrl+C at the terminal ends the `elevate` that is running a command without `--terminal`,
+/// and the command with it, at once; the session goes on. The command is `ping`, whose arguments are this test's
+/// own, so that its end is found by what is left of it.
+#[test]
+fn ctrl_c_ends_a_command_run_without_a_terminal_and_the_session_goes_on() {
+    let _machine = machine::exclusive();
+    let (kit, account, _end) = an_administrator("elcc");
+    let admin = Started::start(&kit, &account);
+
+    let mut session = admin.terminal_session();
+    session.type_line("sbk elevate cmd.exe /c \"echo running-%OS%& ping -n 611 127.0.0.1 >nul\"");
+    session.read_until("running-Windows_NT");
+
+    // Ctrl+C is the byte the terminal sends for it.
+    {
+        use std::io::Write as _;
+        session
+            .stdin
+            .write_all(&[0x03])
+            .and_then(|()| session.stdin.flush())
+            .expect("send Ctrl+C");
+    }
+
+    // The command is gone when no `ping -n 611` is left; the check is repeated in the session until it holds.
+    session.type_line(concat!(
+        "while (@(Get-CimInstance Win32_Process -Filter \"Name='ping.exe'\" | ",
+        "Where-Object { $_.CommandLine -like '*-n 611*' }).Count) { ",
+        "Start-Sleep -Milliseconds 100 }; ", // sleep-ok: looks again at whether the command is gone each time, with no cap
+        "Write-Output ('ping-' + 'is-gone')",
+    ));
+    session.read_until("ping-is-gone");
+    session.say("THE-SESSION-WENT-ON");
+    session.leave();
+}
+
+/// Elevated (CI only). With `--terminal` the keys typed reach the command straight (it reads a line and says it),
+/// and when it ends the session's screen is back: its marker is on the screen, no row of the command is, and the
+/// next line runs.
+#[test]
+fn with_terminal_keys_reach_the_command_and_the_sessions_screen_comes_back() {
+    let _machine = machine::exclusive();
+    let (kit, account, _end) = an_administrator("elkt");
+    let admin = Started::start(&kit, &account);
+
+    let mut session = admin.terminal_session();
+    session.say("SESSION-MARKER");
+    session.type_line("sbk elevate --terminal cmd.exe /v:on /c \"set /p x=ELEVATED-%OS%:& echo got-!x!\"");
+    session.read_until("ELEVATED-Windows_NT:");
+    session.type_line("typed-into-it");
+    session.read_until("got-typed-into-it");
+    session.say("NEXT-LINE-RAN");
+
+    let shown = rendered(&session.transcript, SCROLLBACK);
+    let visible = shown.visible();
+    assert!(
+        visible.contains("SESSION-MARKER"),
+        "the session's screen did not come back:\n{visible}"
+    );
+    for row_of_the_command in ["ELEVATED-Windows_NT:", "got-typed-into-it"] {
+        assert!(
+            !shown.rows().iter().any(|row| row.contains(row_of_the_command)),
+            "a row of the command is left on the screen ({row_of_the_command:?}):\n{visible}"
+        );
+    }
     session.leave();
 }
 

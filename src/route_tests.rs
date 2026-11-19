@@ -125,11 +125,17 @@ fn logout_takes_no_arguments() {
 fn route_elevate_takes_the_rest_of_the_arguments_and_a_dash_c_login_stays_the_shim() {
     assert_eq!(
         route_line("ssh-broker.exe elevate cmd /c whoami"),
-        Route::Elevate(vec!["cmd".into(), "/c".into(), "whoami".into()])
+        Route::Elevate {
+            terminal: false,
+            command: vec!["cmd".into(), "/c".into(), "whoami".into()]
+        }
     );
     assert_eq!(
         route_line(r#"ssh-broker.exe elevate "C:\Program Files\x.exe" "a b" --help"#),
-        Route::Elevate(vec![r"C:\Program Files\x.exe".into(), "a b".into(), "--help".into()]),
+        Route::Elevate {
+            terminal: false,
+            command: vec![r"C:\Program Files\x.exe".into(), "a b".into(), "--help".into()]
+        },
         "the arguments are the command's, whatever they look like"
     );
     assert_eq!(
@@ -139,6 +145,38 @@ fn route_elevate_takes_the_rest_of_the_arguments_and_a_dash_c_login_stays_the_sh
     );
     assert_eq!(command("ssh-broker.exe -c \"elevate x\""), some("elevate x"));
     assert_eq!(command("ssh-broker.exe -c elevate"), some("elevate"));
+}
+
+#[test]
+fn elevate_terminal_is_a_flag_only_as_the_first_argument_after_the_verb() {
+    assert_eq!(
+        route_line("ssh-broker.exe elevate --terminal cmd /k"),
+        Route::Elevate {
+            terminal: true,
+            command: vec!["cmd".into(), "/k".into()]
+        }
+    );
+    assert_eq!(
+        route_line("ssh-broker.exe elevate cmd --terminal"),
+        Route::Elevate {
+            terminal: false,
+            command: vec!["cmd".into(), "--terminal".into()]
+        },
+        "after the command's first word it is the command's own argument"
+    );
+    assert_eq!(
+        route_line("ssh-broker.exe elevate --terminal --terminal"),
+        Route::Elevate {
+            terminal: true,
+            command: vec!["--terminal".into()]
+        },
+        "only the first one is the flag"
+    );
+    assert_eq!(
+        route_line("ssh-broker.exe elevate --terminal"),
+        Route::Usage(Verb::Elevate),
+        "the flag alone has no command"
+    );
 }
 
 #[test]

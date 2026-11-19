@@ -171,9 +171,16 @@ pub fn elevation_needs_high_agent() -> String {
     "ssh-broker: elevate needs an account whose agent runs at High, and this account's agent does not.\r\n".to_owned()
 }
 
+/// `elevate --terminal` in a session that has no terminal to give the command.
+pub fn elevation_needs_a_terminal() -> String {
+    "ssh-broker: --terminal needs a session with a terminal, and this one has none: log in with ssh -t, or leave out \
+     --terminal to run the command with its output here and its input closed.\r\n"
+        .to_owned()
+}
+
 /// What `elevate` prints when it is given no command.
 pub fn elevate_usage() -> &'static str {
-    "usage: ssh-broker elevate <command> [arguments]"
+    "usage: ssh-broker elevate [--terminal] <command> [arguments]"
 }
 
 /// The clause every line uses to say a token's elevation could not be read; `cause` is why.

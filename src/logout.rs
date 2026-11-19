@@ -60,14 +60,15 @@ fn elevated_folder_exists(profile: &std::path::Path) -> anyhow::Result<bool> {
     }
 }
 
-/// Send the `Logout` handshake over a connected transport and relay the reply to `err`. The transport
-/// is borrowed, not consumed: the caller keeps it open until the process exits.
+/// Send the `Logout` handshake over a connected transport and relay the reply to `err`: the reply of `logout` is
+/// stderr only. The transport is borrowed, not consumed: the caller keeps it open until the process exits.
 pub fn logout_on<R: Read, W: Write>(rx: &mut R, tx: &mut W, err: &mut dyn Write) -> Asked {
     let mut handshake = make_handshake(&None, false, Launch::Direct, String::new(), 0, 0, None);
     handshake.mode = Mode::Logout;
     ask_with(
         rx,
         tx,
+        &mut std::io::stdout(),
         err,
         FrameKind::Handshake,
         handshake.encode(),

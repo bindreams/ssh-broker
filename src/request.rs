@@ -20,26 +20,33 @@ pub enum Asked {
     Unanswered,
 }
 
-/// Writes the agent's stderr to `err`: the reply of a request, which is text and then an exit code.
+/// Writes the reply of a request: the agent's stdout to `out` and everything else (its stderr) to `err`, then an exit
+/// code. A reply is stderr only, except the output of a command the agent ran for `elevate`.
 pub struct ReplySink<'a> {
+    pub out: &'a mut dyn Write,
     pub err: &'a mut dyn Write,
 }
 
 impl FrameSink for ReplySink<'_> {
-    fn on_data(&mut self, _stream: Stream, bytes: &[u8]) -> anyhow::Result<()> {
-        self.err.write_all(bytes)?;
-        self.err.flush()?;
+    fn on_data(&mut self, stream: Stream, bytes: &[u8]) -> anyhow::Result<()> {
+        let to = match stream {
+            Stream::Stdout => &mut *self.out,
+            _ => &mut *self.err,
+        };
+        to.write_all(bytes)?;
+        to.flush()?;
         Ok(())
     }
 }
 
-/// Send the request `payload` as a frame of `kind` over a connected transport and relay the reply to `err`: the
-/// ask of every verb, which `ask_at` runs. `payload` is what encoding the request gave, and `what` says what was
-/// asked, for a request that cannot be sent. The transport is borrowed, not consumed: the caller keeps it open
-/// until the process exits.
+/// Send the request `payload` as a frame of `kind` over a connected transport and relay the reply to `out` and `err`
+/// (see [`ReplySink`]): the ask of every verb, which `ask_at` runs. `payload` is what encoding the request gave, and
+/// `what` says what was asked, for a request that cannot be sent. The transport is borrowed, not consumed: the caller
+/// keeps it open until the process exits.
 pub fn ask_with<R: Read, W: Write>(
     rx: &mut R,
     tx: &mut W,
+    out: &mut dyn Write,
     err: &mut dyn Write,
     kind: FrameKind,
     payload: anyhow::Result<Vec<u8>>,
@@ -55,7 +62,7 @@ pub fn ask_with<R: Read, W: Write>(
         let _ = writeln!(err, "ssh-broker: could not {what}: {e:#}");
         return Asked::Code(map_outcome(Ok(Outcome::PeerClosed)));
     }
-    let pumped = pump_heard(rx, &mut FrameReader::new(), &mut ReplySink { err });
+    let pumped = pump_heard(rx, &mut FrameReader::new(), &mut ReplySink { out, err });
     if pumped.no_answer() {
         Asked::Unanswered
     } else {

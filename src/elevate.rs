@@ -87,23 +87,33 @@ pub fn requestable(request_sock: bool, agent_sock: bool) -> Result<(), Refused> 
     }
 }
 
-/// The request that runs `args` (the command and its arguments, as typed) in `cwd` for session `id`.
-pub fn request_for(id: &SessionId, args: &[String], cwd: &str) -> ElevationRequest {
+/// The request that runs `args` (the command and its arguments, as typed) in `cwd` for session `id`, on a screen of
+/// its own when `terminal`.
+pub fn request_for(id: &SessionId, terminal: bool, args: &[String], cwd: &str) -> ElevationRequest {
     ElevationRequest {
         version: PROTOCOL_VERSION,
         session: id.to_string(),
         command: join_args(args),
         cwd: cwd.to_owned(),
+        terminal,
     }
 }
 
-/// Send `request` over a connected transport and relay the reply to `err`: text, then the code that is this
-/// process's. The transport is borrowed, not consumed: the caller keeps it open until the process exits, as the
-/// agent waits for the client to close before it is done with the connection.
-pub fn elevate_on<R: Read, W: Write>(rx: &mut R, tx: &mut W, err: &mut dyn Write, request: &ElevationRequest) -> Asked {
+/// Send `request` over a connected transport and relay the reply: the command's stdout to `out` and its stderr (or a
+/// refusal's text) to `err`, then the code that is this process's. The transport is borrowed, not consumed: the
+/// caller keeps it open until the process exits, as the agent waits for the client to close before it is done with
+/// the connection.
+pub fn elevate_on<R: Read, W: Write>(
+    rx: &mut R,
+    tx: &mut W,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+    request: &ElevationRequest,
+) -> Asked {
     ask_with(
         rx,
         tx,
+        out,
         err,
         FrameKind::Request,
         request.encode(),
@@ -111,10 +121,10 @@ pub fn elevate_on<R: Read, W: Write>(rx: &mut R, tx: &mut W, err: &mut dyn Write
     )
 }
 
-/// `ssh-broker elevate <command> [arguments]`. Never returns: it exits with the command's code, or
+/// `ssh-broker elevate [--terminal] <command> [arguments]`. Never returns: it exits with the command's code, or
 /// [`REFUSED_EXIT_CODE`] when the command was not run.
-pub fn run(args: &[String]) -> ! {
-    let outcome = start(args);
+pub fn run(terminal: bool, args: &[String]) -> ! {
+    let outcome = start(terminal, args);
     let code = match outcome {
         Ok(code) => code,
         Err(refused) => {
@@ -126,18 +136,19 @@ pub fn run(args: &[String]) -> ! {
 }
 
 /// The command's exit code, run in place or by the agent, or why it was not run.
-fn start(args: &[String]) -> Result<i32, Refused> {
+fn start(terminal: bool, args: &[String]) -> Result<i32, Refused> {
     let integrity = crate::account::integrity()
         .map_err(|e| Refused::CannotStart(text::elevation_unreadable_clause(&format!("{e:#}"))))?;
     let session = std::env::var_os(SESSION_VARIABLE);
     let (id, course) = course(session.as_deref(), integrity)?;
     match course {
         Course::InPlace => run_in_place(args),
-        Course::ViaAgent => via_agent(&id, args),
+        Course::ViaAgent => via_agent(&id, terminal, args),
     }
 }
 
-/// Start the command as a child of this process, on its console, and wait for it.
+/// Start the command as a child of this process, on its console, and wait for it. A process at High has the console
+/// to give, so `--terminal` changes nothing here.
 fn run_in_place(args: &[String]) -> Result<i32, Refused> {
     let (program, rest) = args
         .split_first()
@@ -149,15 +160,16 @@ fn run_in_place(args: &[String]) -> Result<i32, Refused> {
     Ok(status.code().unwrap_or(1))
 }
 
-/// Ask the agent to run `args`, in this process's working directory, and exit with its answer.
+/// Ask the agent to run `args`, in this process's working directory, and exit with its answer. The command's output
+/// is printed here, to this process's stdout and stderr.
 ///
 /// The request socket is the one of the plain folder, asked first when it is there (see [`requestable`]).
-fn via_agent(id: &SessionId, args: &[String]) -> Result<i32, Refused> {
+fn via_agent(id: &SessionId, terminal: bool, args: &[String]) -> Result<i32, Refused> {
     let cwd = std::env::current_dir().map_err(|e| Refused::CannotStart(format!("the working directory: {e}")))?;
     let cwd = cwd
         .to_str()
         .ok_or_else(|| Refused::CannotStart(format!("the working directory {} is not valid Unicode", cwd.display())))?;
-    let request = request_for(id, args, cwd);
+    let request = request_for(id, terminal, args, cwd);
     request.check().map_err(|e| Refused::CannotStart(format!("{e:#}")))?;
 
     let folder = match crate::userdir::inspect_current_socket_dir() {
@@ -185,7 +197,7 @@ fn via_agent(id: &SessionId, args: &[String]) -> Result<i32, Refused> {
     let no_session_line = Refused::NotHosted.text();
     let code = ask_at(
         connect,
-        |rx, tx, err| elevate_on(rx, tx, err, &request),
+        |rx, tx, err| elevate_on(rx, tx, &mut std::io::stdout(), err, &request),
         no_session,
         no_session_line.trim_end(),
         &mut std::io::stderr(),
