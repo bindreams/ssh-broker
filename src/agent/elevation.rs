@@ -234,10 +234,7 @@ fn on_a_pseudoconsole(
 /// The command on pipes, with its output written to `conn`. A [`Link`] without a terminal of the request's own
 /// connection serialises the two streams' writes, so the pump is the session's own.
 fn on_pipes(conn: &mut ConnTx, line: &str, cwd: Option<&Path>, starts: &Starts, env: &[(&str, &str)]) -> RunOutcome {
-    let output = match conn.try_clone() {
-        Ok(tx) => Link::new(tx, false, (0, 0), None),
-        Err(cause) => return RunOutcome::NotStarted(cause),
-    };
+    let output = Link::new(conn.share(), false, (0, 0), None);
     let mut child = match (starts.exec)(line, cwd, None, env) {
         Ok(child) => child,
         Err(cause) => return RunOutcome::NotStarted(cause.into_cause()),

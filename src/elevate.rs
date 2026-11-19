@@ -363,7 +363,7 @@ fn via_agent(id: &SessionId, terminal: bool, found: &Found) -> Result<i32, Refus
 
     let mut stderr = std::io::stderr();
     let outcome = elevate_over(
-        || crate::afunix::split(folder.connect_request()?),
+        || Ok(crate::afunix::split(folder.connect_request()?)?),
         &mut std::io::stdout(),
         &mut stderr,
         &request,

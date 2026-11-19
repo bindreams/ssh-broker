@@ -158,7 +158,7 @@ fn host_running(tag: &str, mode: Mode, policy: ElevationPolicy, command: &str) -
     let (server, client, _dir) = a_pair(tag);
     let handler = std::thread::spawn({
         let control = Arc::clone(&control);
-        move || crate::agent::handle_connection_in(server, recording_hooks(), &control)
+        move || crate::agent::handle_connection_in(afunix::Conn::new(server).unwrap(), recording_hooks(), &control)
     });
     let (rx, mut tx) = afunix::split(client).unwrap();
     let hs = Handshake {
@@ -220,7 +220,11 @@ fn ask(
 ) -> std::thread::JoinHandle<Reply> {
     let (server, client, _dir) = a_pair(tag);
     let control = Arc::clone(control);
-    let handler = std::thread::spawn(move || handle(server, &control, |_| panic!("a request ends nothing")));
+    let handler = std::thread::spawn(move || {
+        handle(afunix::Conn::new(server).unwrap(), &control, |_| {
+            panic!("a request ends nothing")
+        })
+    });
     std::thread::spawn(move || {
         let (mut rx, mut tx) = afunix::split(client).unwrap();
         frames(&mut tx);
@@ -251,7 +255,11 @@ struct Pending {
 fn open(control: &Arc<Control>, tag: &str, request: ElevationRequest) -> Pending {
     let (server, client, _dir) = a_pair(tag);
     let control = Arc::clone(control);
-    let handler = std::thread::spawn(move || handle(server, &control, |_| panic!("a request ends nothing")));
+    let handler = std::thread::spawn(move || {
+        handle(afunix::Conn::new(server).unwrap(), &control, |_| {
+            panic!("a request ends nothing")
+        })
+    });
     let (rx, mut tx) = afunix::split(client).unwrap();
     write_frame(&mut tx, FrameKind::Request, &request.encode().unwrap()).unwrap();
     Pending {
