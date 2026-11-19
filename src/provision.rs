@@ -238,9 +238,9 @@ mod imp {
         )?;
         println!("apply: ok — DefaultShell -> {}, agent task installed", exe.display());
 
-        // 5. sshd accepts SSH_BROKER_ELEVATION. LAST: it says whether the running sshd has read the
-        //    change, and an sshd that has not needs a restart, which this step does not make. It never
-        //    fails `apply`: the variable is a convenience, and `ssh-broker elevate` works without it.
+        // 5. sshd accepts SSH_BROKER_ELEVATION. LAST: an sshd that has not read the change is
+        //    restarted through the service manager. It never fails `apply`: the variable is a
+        //    convenience, and `ssh-broker elevate` works without it.
         sshd_config::machine::configure_this_machine(&mut |line| println!("{line}"));
         Ok(())
     }

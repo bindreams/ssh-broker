@@ -50,7 +50,9 @@ mod sshd_rig;
 mod stand_in;
 
 use account_fixture::{Account, ServiceLogon};
-use sshd_rig::{ConsoleClient, Login, Outcome, SshSession, no_shell_to_carry, run_client, set_stock_shell};
+use sshd_rig::{
+    ConsoleClient, Login, Outcome, SshSession, no_shell_to_carry, run_client, set_stock_shell, sshd_service_pid,
+};
 use stand_in::Kit;
 
 /// A throwaway account sshd admits, a probe shell it can run, and (on request) its running session.
@@ -729,19 +731,6 @@ fn the_warning_is_on_the_screen_when_the_fallback_line_is_near_the_command_line_
         finished.pty
     );
     session.leave();
-}
-
-/// The process id of the sshd service.
-fn sshd_service_pid() -> u32 {
-    let (ok, text) = sshd_rig::run("sc", &["queryex", "sshd"]);
-    assert!(ok, "sc queryex sshd failed:\n{text}");
-    text.lines()
-        .find_map(|line| {
-            let pid = line.trim().strip_prefix("PID")?.trim_start().strip_prefix(':')?;
-            pid.trim().parse::<u32>().ok()
-        })
-        .filter(|pid| *pid != 0)
-        .unwrap_or_else(|| panic!("the sshd service has no process id:\n{text}"))
 }
 
 /// The working directory of the `sshd.exe` processes of this test's session, measured on the runner (CI

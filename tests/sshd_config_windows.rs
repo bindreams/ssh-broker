@@ -15,9 +15,13 @@ use std::process::Command;
 
 use ssh_broker::acl::{copy_file_security, create_install_dir, install_dir_file_problem, install_dir_problem};
 use ssh_broker::provision::path_env::{self, PathPlan};
+use ssh_broker::provision::procwait::Process;
 use ssh_broker::provision::registry;
-use ssh_broker::provision::sshd_config::configure::ConfigRead;
-use ssh_broker::provision::sshd_config::machine::{configure_this_machine, sshd_reading_this_machine};
+use ssh_broker::provision::sshd_config::configure::{ConfigRead, SshdHost};
+use ssh_broker::provision::sshd_config::machine::{
+    configure_this_machine, sshd_host_of_this_machine, sshd_reading_this_machine,
+};
+use ssh_broker::provision::sshd_config::restart::{ServiceState, StartOutcome, StartReply, StopOutcome};
 use ssh_broker::provision::sshd_config::{
     ACCEPT_LINE, DROP_IN_NAME, INCLUDE_LINE, SshdReading, accepts, accepts_row, drop_in_text, in_force, with_line,
 };
@@ -56,8 +60,10 @@ mod stand_in;
 use account_fixture::{Account, ServiceLogon};
 use fs_state::sddl_of;
 use install::{Install, ResetAtTheEnd, candidate_path, config_path, drop_in_dir, drop_in_path, reset};
-use sshd_rig::{Login, SshSession, restart_sshd, run, run_client, set_stock_shell, sshd_event_logs};
+use sshd_rig::{Login, SshSession, run, run_client, set_stock_shell, sshd_event_logs, sshd_service_pid};
 use stand_in::Kit;
+use windows::Win32::Foundation::WAIT_OBJECT_0;
+use windows::Win32::System::Threading::WaitForSingleObject;
 
 /// What `apply`'s sshd step did and said: whether the running sshd takes the variable, and its lines.
 fn configure() -> (bool, Vec<String>) {
@@ -66,14 +72,13 @@ fn configure() -> (bool, Vec<String>) {
     (accepted, said)
 }
 
-/// A step that changed a file of sshd's configuration under a running sshd: it says the service has to be
-/// restarted, and that the variable is not taken yet.
-fn assert_says_to_restart(accepted: bool, said: &[String]) {
-    assert!(!accepted, "{said:#?}");
-    let last = said.last().expect("the step said nothing");
-    assert!(
-        last.starts_with("apply: sshd was started before ")
-            && last.contains("restart the sshd service for it to accept SSH_BROKER_ELEVATION"),
+/// A step that changed a file of sshd's configuration under a running sshd: it restarted the service, and says
+/// that sshd restarted and accepts the variable.
+fn assert_restarted(accepted: bool, said: &[String]) {
+    assert!(accepted, "{said:#?}");
+    assert_eq!(
+        said.last().expect("the step said nothing"),
+        "apply: sshd restarted; it accepts SSH_BROKER_ELEVATION",
         "{said:#?}"
     );
 }
@@ -92,7 +97,7 @@ fn assert_in_force_and_read() {
     assert!(row.pass, "{}", row.detail);
 }
 
-/// `apply` itself put the variable in force in sshd's configuration, and has not restarted sshd. The rig's
+/// `apply` itself put the variable in force in sshd's configuration, and restarted sshd after it. The rig's
 /// `accept_elevation_variable` (run by `Login::new`) would configure sshd itself if `apply` had not, so a test that
 /// logs in after `apply` cannot otherwise tell a defect in `apply`'s sshd step.
 fn assert_apply_configured_sshd() {
@@ -102,10 +107,7 @@ fn assert_apply_configured_sshd() {
                 in_force(&listing),
                 "apply did not put the variable in force:\n{listing}"
             );
-            assert!(
-                matches!(read, ConfigRead::Unread(_)),
-                "apply does not restart sshd, so the files are newer than it: {read:?}"
-            );
+            assert_eq!(read, ConfigRead::Read, "apply restarted sshd after it wrote the files");
         }
         other => panic!("the sshd service was read as {other:?}"),
     }
@@ -139,8 +141,8 @@ fn system_cmd() -> PathBuf {
 // The drop-in and the Include line =====
 
 /// The step on the runner's stock file: the drop-in, the `Include` line above the first `Match`, the original's
-/// security on the replacement, and the sentence that says sshd has to be restarted. After the restart (the
-/// rig's, as an administrator would) the `verify` row passes and a second run says nothing.
+/// security on the replacement, and the restart of sshd. After the restart the `verify` row passes and a second
+/// run says nothing.
 #[test]
 fn apply_s_sshd_step_adds_the_drop_in_and_the_include_above_the_first_match_and_the_row_passes() {
     let _machine = machine::exclusive();
@@ -150,7 +152,7 @@ fn apply_s_sshd_step_adds_the_drop_in_and_the_include_above_the_first_match_and_
     let security_before = sddl_of(&config_path());
 
     let (accepted, said) = configure();
-    assert_says_to_restart(accepted, &said);
+    assert_restarted(accepted, &said);
     assert_eq!(
         std::fs::read(config_path()).unwrap(),
         with_line(stock, INCLUDE_LINE).unwrap(),
@@ -172,10 +174,6 @@ fn apply_s_sshd_step_adds_the_drop_in_and_the_include_above_the_first_match_and_
         accepts(&sshd_t(), ssh_broker::protocol::ElevationPolicy::VARIABLE),
         "plain `sshd -T` shows the variable"
     );
-    let row = accepts_row(Ok(Integrity::High), sshd_reading_this_machine);
-    assert!(!row.pass, "sshd has not read the files yet: {}", row.detail);
-
-    restart_sshd();
     assert_in_force_and_read();
 
     // A second run changes nothing: sshd started after every file was written, so the step has nothing to say.
@@ -194,7 +192,7 @@ fn a_config_with_an_include_already_present_is_left_alone_and_accepts() {
     std::fs::write(config_path(), &edited).unwrap();
 
     let (accepted, said) = configure();
-    assert_says_to_restart(accepted, &said);
+    assert_restarted(accepted, &said);
     assert_eq!(std::fs::read(config_path()).unwrap(), edited);
     assert_eq!(std::fs::read(drop_in_path()).unwrap(), drop_in_text().as_bytes());
     assert!(accepts(&sshd_t(), ssh_broker::protocol::ElevationPolicy::VARIABLE));
@@ -243,7 +241,7 @@ fn a_drop_in_that_cannot_be_replaced_keeps_the_text_it_had() {
         .expect("take the new file's name");
 
     let (accepted, said) = configure();
-    assert_says_to_restart(accepted, &said);
+    assert_restarted(accepted, &said);
     assert_eq!(
         std::fs::read(drop_in_path()).unwrap(),
         b"AcceptEnv OTHER\r\n",
@@ -273,7 +271,7 @@ fn a_hand_made_sshd_config_d_gets_no_drop_in_and_sshd_config_gets_the_acceptenv_
     );
 
     let (accepted, said) = configure();
-    assert_says_to_restart(accepted, &said);
+    assert_restarted(accepted, &said);
     assert!(!drop_in_path().exists(), "no drop-in was written");
     assert_eq!(
         std::fs::read_dir(drop_in_dir()).unwrap().count(),
@@ -299,14 +297,13 @@ fn a_hand_made_sshd_config_d_gets_no_drop_in_and_sshd_config_gets_the_acceptenv_
         "{said:#?}"
     );
     assert!(accepts(&sshd_t(), ssh_broker::protocol::ElevationPolicy::VARIABLE));
-    restart_sshd();
     assert_in_force_and_read();
 }
 
 /// sshd reads its configuration when it starts, so a file written after that may not have been read: the `verify`
-/// row fails for it until sshd is restarted: for `sshd_config`, for any other file in `sshd_config.d`, and for the
-/// folder itself when an entry goes. This also measures that an elevated administrator can read when sshd's
-/// process, which runs as SYSTEM, was created.
+/// row fails for it until sshd is restarted (by the step, which restarts it): for `sshd_config`, for any other
+/// file in `sshd_config.d`, and for the folder itself when an entry goes. This also measures that an elevated
+/// administrator can read when sshd's process, which runs as SYSTEM, was created.
 #[test]
 fn a_configuration_written_after_sshd_started_fails_the_row_until_sshd_is_restarted() {
     let _machine = machine::exclusive();
@@ -314,10 +311,9 @@ fn a_configuration_written_after_sshd_started_fails_the_row_until_sshd_is_restar
     reset();
     let _reset = ResetAtTheEnd;
 
-    // The step writes both files and says to restart; the restart makes sshd start after both were written.
+    // The step writes both files and restarts sshd, which then starts after both were written.
     let (accepted, said) = configure();
-    assert_says_to_restart(accepted, &said);
-    restart_sshd();
+    assert_restarted(accepted, &said);
     assert_in_force_and_read();
 
     // The file is written again, with the same text: sshd cannot have read this write.
@@ -332,10 +328,9 @@ fn a_configuration_written_after_sshd_started_fails_the_row_until_sshd_is_restar
         row.detail
     );
 
-    // The step says the same of a variable already in force, and after a restart the row passes again.
+    // The step restarts sshd for a variable already in force, and after the restart the row passes again.
     let (accepted, said) = configure();
-    assert_says_to_restart(accepted, &said);
-    restart_sshd();
+    assert_restarted(accepted, &said);
     assert_in_force_and_read();
 
     // Every file in the folder is judged, whatever its name: another one, written after sshd started, fails the row.
@@ -349,7 +344,8 @@ fn a_configuration_written_after_sshd_started_fails_the_row_until_sshd_is_restar
         "{}",
         row.detail
     );
-    restart_sshd();
+    let (accepted, said) = configure();
+    assert_restarted(accepted, &said);
     assert_in_force_and_read();
 
     // So is the folder: a file that goes changes it, and the row fails for the folder (this measures that a folder's
@@ -651,8 +647,7 @@ fn sshd_answers_a_connection_after_the_step_and_a_restart() {
     let _reset = ResetAtTheEnd;
 
     let (accepted, said) = configure();
-    assert_says_to_restart(accepted, &said);
-    restart_sshd();
+    assert_restarted(accepted, &said);
 
     let mut ssh = Command::new("ssh");
     ssh.args([
@@ -679,4 +674,102 @@ fn sshd_answers_a_connection_after_the_step_and_a_restart() {
         last.join("\n"),
         sshd_event_logs(25)
     );
+}
+
+// The service manager =====
+
+/// Starts the sshd service when the test ends, also when it fails: a runner whose sshd is down cannot be reached.
+struct SshdRunningAtTheEnd;
+
+impl Drop for SshdRunningAtTheEnd {
+    fn drop(&mut self) {
+        // Already running is the usual answer, and is not an error here.
+        let _ = run("net", &["start", "sshd"]);
+    }
+}
+
+/// Whether the process held by `process` has exited, as a state read and not as a wait.
+fn has_exited(process: &Process) -> bool {
+    // SAFETY: the handle is open with SYNCHRONIZE for as long as `process` is.
+    let state = unsafe { WaitForSingleObject(process.handle(), 0) }; // sleep-ok: zero-timeout state check of a process handle, not a wait
+    state == WAIT_OBJECT_0
+}
+
+/// The real service manager through the machine's own methods: `settled()` says running; `stop()` returns stopped
+/// only once the process the service had has exited (its handle, held before, is signalled), and a second `stop()`
+/// of the stopped service says stopped again; `start()` is accepted and settles running; a second `start()` of the
+/// running service is refused with 1056 and settles running. sshd is started again when the test ends, also on
+/// failure.
+#[test]
+fn the_service_manager_s_state_follows_a_stop_and_a_start() {
+    let _machine = machine::exclusive();
+    account_fixture::assert_elevated();
+    let _running = SshdRunningAtTheEnd;
+    let mut host = sshd_host_of_this_machine().expect("find the sshd service");
+
+    assert_eq!(host.settled().expect("read the state"), ServiceState::Running);
+    let old = Process::open(sshd_service_pid())
+        .expect("open the process of the sshd service")
+        .expect("the sshd service has a process");
+
+    assert_eq!(host.stop().expect("a STOP was sent"), StopOutcome::Stopped);
+    assert!(
+        has_exited(&old),
+        "stop() returned before the old sshd process had exited"
+    );
+    assert_eq!(host.settled().expect("read the state"), ServiceState::Stopped);
+    assert_eq!(
+        host.stop().expect("a STOP was sent"),
+        StopOutcome::Stopped,
+        "a second stop of a stopped service"
+    );
+
+    assert_eq!(host.start(), StartOutcome::Running(StartReply::Accepted));
+    assert_eq!(host.settled().expect("read the state"), ServiceState::Running);
+    match host.start() {
+        StartOutcome::Running(StartReply::Refused(reply)) => {
+            assert!(reply.contains("1056"), "the service manager's reply: {reply}")
+        }
+        other => panic!("a start of a running service: {other:?}"),
+    }
+}
+
+/// Review Focus 5: `apply` run in an SSH session restarts the very sshd that session came in through. The shim is
+/// sshd's `DefaultShell` and the session is an administrator's at High (`always`). It must end with its exit code,
+/// and the session must go on afterwards. Spike 4 measured a restart with the stock shell; this measures it with the
+/// shim. If the session does not survive, stop and report: the restart cannot be the last step of an `apply` that
+/// someone runs over SSH.
+#[test]
+fn apply_run_over_ssh_while_it_restarts_sshd_ends_with_its_exit_code_and_the_session_survives() {
+    let _machine = machine::exclusive();
+    account_fixture::assert_elevated();
+    let _install = Install::capture();
+    let _running = SshdRunningAtTheEnd;
+    reset();
+    let kit = Kit::broker_with_helper("ssha");
+    apply(&kit);
+    let installed = canonical_exe();
+    let account = Account::create("ssha", true);
+    account.make_administrator();
+    let _end = session_end::LogOutOnDrop::new(&installed, &account, ServiceLogon::Sshd);
+    // The login first (its rig makes sshd accept the variable), then sshd's files as stock: the `apply` in the
+    // session has a change to make and a restart to do.
+    let login = Login::new(&kit, &account);
+    reset();
+
+    let mut session = SshSession::start(login.command_asking("always"), login.diagnostics());
+    session.log_in(&account.password);
+    session.type_line(&format!(
+        "& '{}' apply; Write-Output ('apply-exit' + '=' + $LASTEXITCODE + ';')",
+        installed.display()
+    ));
+    session.read_until("apply-exit=0;");
+    assert!(
+        accepts(&sshd_t(), ssh_broker::protocol::ElevationPolicy::VARIABLE),
+        "the apply in the session did not make sshd accept the variable"
+    );
+    assert_apply_configured_sshd();
+    // The session survived the restart: it answers.
+    session.say("still-here-after-the-restart");
+    session.leave();
 }

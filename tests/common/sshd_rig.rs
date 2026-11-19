@@ -145,20 +145,25 @@ fn administrators_authorized_keys() -> PathBuf {
         .join("administrators_authorized_keys")
 }
 
-/// Restart the runner's `sshd` service, as an administrator does after `apply` says to. Machine-wide: CI only.
-pub fn restart_sshd() {
-    let (ok, said) = run("net", &["stop", "sshd"]);
-    assert!(ok, "stop the sshd service: {said}");
-    let (ok, said) = run("net", &["start", "sshd"]);
-    assert!(ok, "start the sshd service: {said}");
+/// The process id of the sshd service.
+pub fn sshd_service_pid() -> u32 {
+    let (ok, text) = run("sc", &["queryex", "sshd"]);
+    assert!(ok, "sc queryex sshd failed:\n{text}");
+    text.lines()
+        .find_map(|line| {
+            let pid = line.trim().strip_prefix("PID")?.trim_start().strip_prefix(':')?;
+            pid.trim().parse::<u32>().ok()
+        })
+        .filter(|pid| *pid != 0)
+        .unwrap_or_else(|| panic!("the sshd service has no process id:\n{text}"))
 }
 
 /// Make the runner's sshd accept `SSH_BROKER_ELEVATION` from a client, with the step `apply` takes (the drop-in
-/// and the `Include` line), restart the `sshd` service when that step says it has not read them, and fail loudly
-/// when sshd does not then accept the variable from files it has read. Once per test process, and a
-/// configuration that accepts the variable already, and has been read, is left as it is. Machine-wide: CI only,
-/// where the runner is discarded after the job. A test that reaches it (every [`Login`] constructor does)
-/// changes what the other tests depend on, so it holds `machine::exclusive()`.
+/// and the `Include` line, and the restart of sshd that reads them), and fail loudly when sshd does not then
+/// accept the variable from files it has read. Once per test process, and a configuration that accepts the
+/// variable already, and has been read, is left as it is. Machine-wide: CI only, where the runner is discarded
+/// after the job. A test that reaches it (every [`Login`] constructor does) changes what the other tests depend
+/// on, so it holds `machine::exclusive()`.
 pub fn accept_elevation_variable() {
     use ssh_broker::provision::sshd_config::configure::ConfigRead;
     use ssh_broker::provision::sshd_config::machine::{configure_this_machine, sshd_reading_this_machine};
@@ -167,9 +172,7 @@ pub fn accept_elevation_variable() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         let mut said = Vec::new();
-        if !configure_this_machine(&mut |line| said.push(line.to_owned())) {
-            restart_sshd();
-        }
+        configure_this_machine(&mut |line| said.push(line.to_owned()));
         match sshd_reading_this_machine() {
             Ok(SshdReading::Read {
                 listing,

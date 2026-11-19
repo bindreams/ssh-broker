@@ -20,6 +20,7 @@ use crate::socket_loc::Integrity;
 pub mod configure;
 #[cfg(windows)]
 pub mod machine;
+pub mod restart;
 
 /// The folder of drop-ins, beside `sshd_config`.
 pub const DROP_IN_DIR_NAME: &str = "sshd_config.d";
@@ -295,7 +296,8 @@ pub fn accepts_row(
             ROW_NAME,
             false,
             format!(
-                "sshd was started before {} was last changed and has not read it; restart the sshd service",
+                "sshd was started before {} was last changed and has not read it; `ssh-broker apply` restarts it, or \
+                 restart the sshd service",
                 file.display()
             ),
         ),
@@ -304,7 +306,7 @@ pub fn accepts_row(
             true,
             format!(
                 "{in_force_as}; {}'s change time is ahead of the clock, so whether the running sshd has read it \
-                 cannot be told (restart the sshd service to be sure)",
+                 cannot be told (`ssh-broker apply` restarts it to be sure, or restart the sshd service)",
                 file.display()
             ),
         ),
@@ -313,7 +315,7 @@ pub fn accepts_row(
             true,
             format!(
                 "{in_force_as}; {} has `{line}`, so whether the running sshd has read its configuration cannot be \
-                 told (restart the sshd service to be sure)",
+                 told (`ssh-broker apply` restarts it to be sure, or restart the sshd service)",
                 file.display()
             ),
         ),
