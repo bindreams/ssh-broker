@@ -15,12 +15,20 @@
 //!   pending state is never resolved by the service manager; a STOP can succeed and the service stay running.
 //!   So a refusal is never judged by its code: the settled state that follows decides. The waits have no bound:
 //!   a bound would only make `apply` give up and leave the machine as it is.
+//!
+//! Two rules that are this crate's own, measured against OpenSSH for Windows' source and not against a service
+//! manager:
+//!
+//! - The service says running before sshd has read its configuration (it reports it, then runs `sshd_main`), so a
+//!   start is over only when its process owns a listening socket or has exited ([`listening::listens`]).
+//! - A STOP answered with 1053 that leaves the service running may still be taking sshd down, so the process held
+//!   before it is waited for; any other STOP that leaves the service running did nothing.
 
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Context;
-use windows::Win32::Foundation::ERROR_SERVICE_NOTIFY_CLIENT_LAGGING;
+use windows::Win32::Foundation::{ERROR_SERVICE_NOTIFY_CLIENT_LAGGING, ERROR_SERVICE_REQUEST_TIMEOUT};
 use windows::Win32::System::Services::{
     ControlService, NotifyServiceStatusChangeW, OpenSCManagerW, OpenServiceW, QueryServiceStatusEx, SC_MANAGER_CONNECT,
     SC_STATUS_PROCESS_INFO, SERVICE_CONTINUE_PENDING, SERVICE_CONTROL_STOP, SERVICE_NOTIFY, SERVICE_NOTIFY_2W,
@@ -31,9 +39,11 @@ use windows::Win32::System::Services::{
 use windows::Win32::System::Threading::{INFINITE, SleepEx};
 use windows::core::{PCWSTR, w};
 
+use super::listening::listens;
 use super::{ScHandle, service_process};
+use crate::provision::procwait::{Process, wait_on};
 use crate::provision::sshd_config::restart::{ExitCodes, ServiceState, StartOutcome, StartReply, StopOutcome};
-use crate::winutil::describe_error;
+use crate::winutil::{describe_error, win32_code};
 
 /// The states a registration is made for: the settled ones. A registration made while the service is starting
 /// or stopping then fires when it settles, and none fires for a pending state.
@@ -64,6 +74,59 @@ fn classify(raw: u32) -> Reading {
         }
         other => Reading::Unknown(other),
     }
+}
+
+/// Wait, with no bound, until `process` owns a listening TCP socket or has exited: the service manager says
+/// running before sshd has read its configuration, and the socket is what sshd does after it has read it and
+/// bound its port. Each look reads the kernel's socket table; between two looks the wait is on the process
+/// itself, so an exit ends it at once. The decision is taken on the exit of `process`, the one held, and never
+/// on a state of the service read after it.
+fn listening_or_exit(process: &Process, reply: StartReply) -> StartOutcome {
+    loop {
+        match listens(process.pid) {
+            Ok(true) => return StartOutcome::Serving(reply),
+            Ok(false) => {}
+            Err(e) => {
+                return StartOutcome::Unreadable {
+                    reply,
+                    cause: format!("{e:#}"),
+                };
+            }
+        }
+        let waited = wait_on(process, BETWEEN_LOOKS); // sleep-ok: only the pause between two looks at the sockets; its expiry proves nothing
+        match waited {
+            Ok(false) => {}
+            Ok(true) => {
+                return match process.exit_code() {
+                    Ok(code) => StartOutcome::Exited { reply, code },
+                    Err(e) => StartOutcome::Unreadable {
+                        reply,
+                        cause: format!("{e:#}"),
+                    },
+                };
+            }
+            Err(e) => {
+                return StartOutcome::Unreadable {
+                    reply,
+                    cause: format!("wait on the process of the sshd service ({}): {e}", process.pid),
+                };
+            }
+        }
+    }
+}
+
+/// How long [`listening_or_exit`] waits on the process between two looks at its sockets, in milliseconds. It is
+/// only the pause between two looks: its expiry proves nothing, and the loop it paces has no count and no total
+/// bound.
+const BETWEEN_LOOKS: u32 = 100;
+
+/// Whether a STOP that the service manager answered with the Win32 code `reply` (`None`: it accepted the STOP),
+/// and after which the service settled in `state`, leaves the old process on its way down unreported. Only
+/// `ERROR_SERVICE_REQUEST_TIMEOUT` (1053: sshd's control handler did not answer in time) with the service still
+/// reading running is taken so; every other reply, an accepted STOP included, that leaves the service running
+/// means that the STOP did nothing.
+fn waits_for_the_old_process(reply: Option<u32>, state: ServiceState) -> bool {
+    reply == Some(ERROR_SERVICE_REQUEST_TIMEOUT.0) && state == ServiceState::Running
 }
 
 /// A settled state with the exit codes the service manager recorded with it.
@@ -127,9 +190,10 @@ impl SshdService {
         let held = service_process().context("hold the process of the sshd service before stopping it")?;
         let mut status = SERVICE_STATUS::default();
         // SAFETY: the handle was opened with the right to stop; `status` is a local the call fills.
-        let refusal = unsafe { ControlService(self.service.0, SERVICE_CONTROL_STOP, &mut status) }
-            .err()
-            .map(|e| describe_error(&e));
+        let control = unsafe { ControlService(self.service.0, SERVICE_CONTROL_STOP, &mut status) }.err();
+        // Decided on the Win32 code, before the reply is made into text.
+        let code = control.as_ref().and_then(|e| win32_code(e.code()));
+        let refusal = control.as_ref().map(describe_error);
         Ok(match self.settle() {
             Err(e) => StopOutcome::Unknown {
                 cause: format!("{e:#}"),
@@ -143,34 +207,73 @@ impl SshdService {
                     cause: format!("{e:#}"),
                 },
             },
+            Ok(Settled { state, .. }) if waits_for_the_old_process(code, state) => {
+                self.after_a_stop_that_timed_out(held, refusal.as_deref().unwrap_or_default())
+            }
             Ok(Settled { state, .. }) => StopOutcome::NotStopped { state, refusal },
         })
     }
 
-    /// Start the service and say what the service manager answered and what settled after.
+    /// The STOP was answered with `reply` (1053) and the service reads running: sshd's handler did not answer in
+    /// time, and the process held before the STOP may be on its way down unreported. Wait, with no bound, for
+    /// it to exit, and read the state once more. `Unknown` when there is no process to wait for or a read
+    /// fails: the flow never says that the service runs with its earlier configuration after a 1053.
+    fn after_a_stop_that_timed_out(&self, held: Option<Process>, reply: &str) -> StopOutcome {
+        let unknown = |what: String| StopOutcome::Unknown {
+            cause: format!("the service manager answered the STOP with {reply}, and {what}"),
+        };
+        let Some(process) = held else {
+            return unknown("the service had no process to wait for".to_owned());
+        };
+        if let Err(e) = process.wait_for_exit() {
+            return unknown(format!("{e:#}"));
+        }
+        match self.settle() {
+            Ok(_) => StopOutcome::Stopped,
+            Err(e) => unknown(format!("the process exited, but the state cannot be read: {e:#}")),
+        }
+    }
+
+    /// Start the service and say what the service manager answered, and how it came out: sshd serving, its
+    /// process exited before it listened, or the state the service manager settled in. A service that settles
+    /// running is not yet serving: the service manager says running before sshd has read its configuration, so
+    /// the process is held and waited on until it listens or exits.
     pub(super) fn start(&self) -> StartOutcome {
         // SAFETY: the handle was opened with the right to start; no arguments are passed.
         let reply = match unsafe { StartServiceW(self.service.0, None) } {
             Ok(()) => StartReply::Accepted,
             Err(e) => StartReply::Refused(describe_error(&e)),
         };
-        match self.settle() {
-            Err(e) => StartOutcome::Unreadable {
-                reply,
-                cause: format!("{e:#}"),
-            },
-            Ok(Settled {
-                state: ServiceState::Running,
-                ..
-            }) => StartOutcome::Running(reply),
-            Ok(Settled {
-                state: ServiceState::Paused,
-                ..
-            }) => StartOutcome::Paused(reply),
-            Ok(Settled {
-                state: ServiceState::Stopped,
-                exit,
-            }) => StartOutcome::Stopped { reply, exit },
+        loop {
+            let settled = match self.settle() {
+                Ok(settled) => settled,
+                Err(e) => {
+                    return StartOutcome::Unreadable {
+                        reply,
+                        cause: format!("{e:#}"),
+                    };
+                }
+            };
+            match settled.state {
+                ServiceState::Paused => return StartOutcome::Paused(reply),
+                ServiceState::Stopped => {
+                    return StartOutcome::Stopped {
+                        reply,
+                        exit: settled.exit,
+                    };
+                }
+                ServiceState::Running => match service_process() {
+                    Ok(Some(process)) => return listening_or_exit(&process, reply),
+                    // The process went between the two reads: the state the service manager says now decides.
+                    Ok(None) => {}
+                    Err(e) => {
+                        return StartOutcome::Unreadable {
+                            reply,
+                            cause: format!("{e:#}"),
+                        };
+                    }
+                },
+            }
         }
     }
 }

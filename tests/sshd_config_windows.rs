@@ -738,11 +738,72 @@ fn has_exited(process: &Process) -> bool {
     state == WAIT_OBJECT_0
 }
 
+/// The ports `sshd -T` names, from its listing's `port` lines.
+fn ports_in(listing: &str) -> Vec<u16> {
+    listing
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("port ")?.trim().parse().ok())
+        .collect()
+}
+
+/// Whether the process `pid` owns a TCP socket in the listening state on `port`, as `netstat -ano` lists the
+/// sockets of both families.
+fn listens_on(pid: u32, port: u16) -> bool {
+    let (ok, text) = run("netstat", &["-ano"]);
+    assert!(ok, "netstat -ano failed:\n{text}");
+    let (port, pid) = (port.to_string(), pid.to_string());
+    text.lines().any(|line| {
+        matches!(
+            line.split_whitespace().collect::<Vec<_>>().as_slice(),
+            ["TCP", local, _, "LISTENING", owner] if local.rsplit(':').next() == Some(port.as_str()) && *owner == pid
+        )
+    })
+}
+
+/// Exclusive listeners of this process on `port`, on the IPv4 and IPv6 wildcard addresses sshd listens on by
+/// default: while they are held, sshd cannot bind the port. Dropped, they release it.
+fn hold(port: u16) -> Vec<socket2::Socket> {
+    use socket2::{Domain, Protocol, SockAddr, Socket, Type};
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+    use std::os::windows::io::AsRawSocket;
+    use windows::Win32::Networking::WinSock::{SO_EXCLUSIVEADDRUSE, SOCKET, SOL_SOCKET, setsockopt};
+
+    let addresses = [
+        (Domain::IPV4, SocketAddr::from((Ipv4Addr::UNSPECIFIED, port))),
+        (Domain::IPV6, SocketAddr::from((Ipv6Addr::UNSPECIFIED, port))),
+    ];
+    addresses
+        .into_iter()
+        .map(|(domain, address)| {
+            let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP)).expect("make a socket");
+            if domain == Domain::IPV6 {
+                socket.set_only_v6(true).expect("keep the IPv6 socket to IPv6");
+            }
+            let on = 1i32.to_ne_bytes();
+            // SAFETY: the socket is open for the call, and `on` is the int the option takes.
+            let set = unsafe {
+                setsockopt(
+                    SOCKET(socket.as_raw_socket() as usize),
+                    SOL_SOCKET,
+                    SO_EXCLUSIVEADDRUSE,
+                    Some(&on),
+                )
+            };
+            assert_eq!(set, 0, "set SO_EXCLUSIVEADDRUSE on the listener for {address}");
+            socket
+                .bind(&SockAddr::from(address))
+                .unwrap_or_else(|e| panic!("hold {address}: {e}"));
+            socket.listen(1).expect("listen");
+            socket
+        })
+        .collect()
+}
+
 /// The real service manager through the machine's own methods: `settled()` says running; `stop()` returns stopped
 /// only once the process the service had has exited (its handle, held before, is signalled), and a second `stop()`
-/// of the stopped service says stopped again; `start()` is accepted and settles running; a second `start()` of the
-/// running service is refused with 1056 and settles running. sshd is started again when the test ends, also on
-/// failure.
+/// of the stopped service says stopped again; `start()` is accepted and returns only once sshd serves: a socket of
+/// the service's process listens on a port that `sshd -T` names; a second `start()` of the running service is
+/// refused with 1056 and says serving. sshd is started again when the test ends, also on failure.
 #[test]
 fn the_service_manager_s_state_follows_a_stop_and_a_start() {
     let _machine = machine::exclusive();
@@ -767,14 +828,80 @@ fn the_service_manager_s_state_follows_a_stop_and_a_start() {
         "a second stop of a stopped service"
     );
 
-    assert_eq!(host.start(), StartOutcome::Running(StartReply::Accepted));
+    assert_eq!(host.start(), StartOutcome::Serving(StartReply::Accepted));
     assert_eq!(host.settled().expect("read the state"), ServiceState::Running);
+    let ports = ports_in(&sshd_t());
+    let pid = sshd_service_pid();
+    assert!(
+        ports.iter().any(|port| listens_on(pid, *port)),
+        "start() said that sshd serves, and no listening socket of the service's process ({pid}) is on a port that \
+         `sshd -T` names ({ports:?})"
+    );
     match host.start() {
-        StartOutcome::Running(StartReply::Refused(reply)) => {
+        StartOutcome::Serving(StartReply::Refused(reply)) => {
             assert!(reply.contains("1056"), "the service manager's reply: {reply}")
         }
         other => panic!("a start of a running service: {other:?}"),
     }
+}
+
+/// An sshd that cannot bind any address is never said to serve, though the service manager says it runs before it
+/// has tried. The configuration names an address this machine does not have (192.0.2.1, reserved for
+/// documentation): `sshd -t` passes it, and sshd exits when it binds. `start()` is accepted and comes out as
+/// `Exited` (the process ended before it listened) or `Stopped` (the service manager saw it end first), never
+/// `Serving`; the test prints which, and the code. Where `sshd -t` rejects that file on the runner, the test
+/// holds sshd's ports with exclusive listeners of its own instead. The stock configuration is put back and sshd
+/// then serves; sshd is started again when the test ends, also on failure.
+#[test]
+fn an_sshd_that_cannot_bind_any_address_is_never_said_to_serve() {
+    let _machine = machine::exclusive();
+    account_fixture::assert_elevated();
+    // Dropped after `_reset`, so that sshd is started with the stock configuration.
+    let _running = SshdRunningAtTheEnd;
+    let stock = reset();
+    let _reset = ResetAtTheEnd;
+    let mut host = sshd_host_of_this_machine().expect("find the sshd service");
+    let ports = ports_in(&sshd_t());
+    assert!(!ports.is_empty(), "`sshd -T` names no port");
+
+    assert_eq!(host.settled().expect("read the state"), ServiceState::Running);
+    assert_eq!(host.stop().expect("a STOP was sent"), StopOutcome::Stopped);
+
+    let unbindable = with_line(stock, "ListenAddress 192.0.2.1").expect("the stock sshd_config can be edited");
+    std::fs::write(config_path(), &unbindable).expect("write the configuration");
+    let held = match host.sshd_check(&config_path()) {
+        Ok(()) => Vec::new(),
+        Err(said) => {
+            eprintln!(
+                "sshd -t rejects an unbindable ListenAddress on this runner ({said}); its ports are held instead"
+            );
+            reset();
+            ports.iter().flat_map(|port| hold(*port)).collect()
+        }
+    };
+
+    match host.start() {
+        StartOutcome::Exited {
+            reply: StartReply::Accepted,
+            code,
+        } => eprintln!("sshd that cannot bind: the process exited before it listened, with code {code}"),
+        StartOutcome::Stopped {
+            reply: StartReply::Accepted,
+            exit,
+        } => eprintln!("sshd that cannot bind: the service manager saw it stop first, with exit codes {exit:?}"),
+        other => panic!("an sshd that cannot bind any address came out of start() as {other:?}"),
+    }
+
+    // sshd runs again: the ports are free, the configuration is the stock one, and the service is stopped.
+    drop(held);
+    assert_eq!(host.stop().expect("a STOP was sent"), StopOutcome::Stopped);
+    reset();
+    assert_eq!(host.start(), StartOutcome::Serving(StartReply::Accepted));
+    let pid = sshd_service_pid();
+    assert!(
+        ports.iter().any(|port| listens_on(pid, *port)),
+        "sshd serves, and no listening socket of its process ({pid}) is on a port that `sshd -T` names ({ports:?})"
+    );
 }
 
 /// `apply` run in a job that ends with its connection, as sshd's job does: the test reads `apply`'s output through

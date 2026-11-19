@@ -49,10 +49,13 @@ pub trait SshdHost {
     /// is starting, stopping, pausing or continuing, with no bound, because the service manager never resolves
     /// a held pending state and a bound would only make `apply` give up. `Err` when the state cannot be read.
     fn settled(&mut self) -> anyhow::Result<ServiceState>;
-    /// Send the service a STOP, wait for what the service manager says to settle, and when it says stopped
-    /// wait for the process the service had before the STOP to exit. `Err`: no STOP was sent.
+    /// Send the service a STOP, wait for what the service manager says to settle, and when it says stopped, or
+    /// when the STOP was answered with 1053 and it says running, wait for the process the service had before the
+    /// STOP to exit. `Err`: no STOP was sent.
     fn stop(&mut self) -> anyhow::Result<StopOutcome>;
-    /// Start the service and wait for what the service manager says to settle.
+    /// Start the service and wait, with no bound, for what the service manager says to settle and, when that is
+    /// running, for sshd to listen or for its process to exit: the service manager says running before sshd has
+    /// read its configuration.
     fn start(&mut self) -> StartOutcome;
     /// This machine's clock.
     fn now(&self) -> SystemTime;

@@ -33,6 +33,7 @@ use crate::acl;
 use crate::provision::procwait::Process;
 use crate::provision::{registry, system_config};
 
+mod listening;
 mod service;
 
 /// The candidate `sshd_config`, beside the original so that the rename that replaces it stays on one volume.

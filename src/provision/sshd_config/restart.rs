@@ -29,7 +29,9 @@ pub enum StopOutcome {
     /// The service manager says stopped, and the process the service had before the STOP has exited.
     Stopped,
     /// The service manager settled in `state`, not stopped. `refusal` is what it answered the STOP when it
-    /// refused it; `None` when it accepted it and the service did not stop.
+    /// refused it; `None` when it accepted it and the service did not stop. Never a service that is running after
+    /// a STOP answered with 1053: that is [`StopOutcome::Stopped`] once the old process has exited, else
+    /// [`StopOutcome::Unknown`].
     NotStopped {
         state: ServiceState,
         refusal: Option<String>,
@@ -56,7 +58,15 @@ pub struct ExitCodes {
 /// How [`SshdHost::start`] went: what the service manager answered, and the state that settled after.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StartOutcome {
-    Running(StartReply),
+    /// The service's process owns a listening TCP socket: sshd has read its configuration and serves. The service
+    /// manager says running before that, so running alone is not this.
+    Serving(StartReply),
+    /// The service's process, which the service manager had reported running, exited with `code` before it
+    /// listened.
+    Exited {
+        reply: StartReply,
+        code: u32,
+    },
     /// Settled stopped, with the exit codes it recorded.
     Stopped {
         reply: StartReply,
@@ -92,11 +102,16 @@ impl Before {
 ///
 /// Nothing is done to a service whose state was not read, and every state decided on is one the service manager
 /// settled in. (1) A stopped service is not started, and a paused one or one whose state cannot be read is left
-/// alone. (2) The STOP; a service that did not stop gets no start. (3) The start. A start that the service manager
-/// accepted and that settles stopped is the only evidence that sshd could not run the files: only then is what
-/// this run changed (`before`) put back, and sshd started again.
+/// alone. (2) The STOP; a service that did not stop gets no start. (3) The start, which is over when sshd listens
+/// or its process has exited: the service manager says running before sshd has read a byte of its configuration.
+/// A start that the service manager accepted and that ended before sshd listened (it settled stopped, or the
+/// process exited) is the only evidence that sshd could not run the files: only then is what this run changed
+/// (`before`) put back, and sshd started again.
 pub fn restart(host: &mut dyn SshdHost, say: &mut dyn FnMut(&str), before: &Before) -> bool {
-    say("apply: restarting sshd; apply waits for the service manager at each step");
+    say(
+        "apply: restarting sshd; apply waits for the service manager at each step, and after a start for sshd to \
+         listen or exit",
+    );
 
     match host.settled() {
         Ok(ServiceState::Running) => {}
@@ -144,7 +159,7 @@ pub fn restart(host: &mut dyn SshdHost, say: &mut dyn FnMut(&str), before: &Befo
 
     let first = host.start();
     match first {
-        StartOutcome::Running(StartReply::Accepted) => {
+        StartOutcome::Serving(StartReply::Accepted) => {
             say(&match &unseen {
                 None => format!("apply: sshd restarted; it accepts {VARIABLE}"),
                 Some(unseen) => format!(
@@ -154,13 +169,13 @@ pub fn restart(host: &mut dyn SshdHost, say: &mut dyn FnMut(&str), before: &Befo
             });
             true
         }
-        StartOutcome::Running(StartReply::Refused(reply)) if unseen.is_none() => {
+        StartOutcome::Serving(StartReply::Refused(reply)) if unseen.is_none() => {
             say(&format!(
                 "apply: sshd restarted (the service manager had started it again: {reply}); it accepts {VARIABLE}"
             ));
             true
         }
-        StartOutcome::Running(StartReply::Refused(reply)) => {
+        StartOutcome::Serving(StartReply::Refused(reply)) => {
             say(&format!(
                 "apply: sshd is running and whether it restarted cannot be told: {stopped}, and a start was \
                  refused ({reply}); `ssh-broker apply` restarts it if it has not read the change"
@@ -178,10 +193,27 @@ pub fn restart(host: &mut dyn SshdHost, say: &mut dyn FnMut(&str), before: &Befo
             ));
             false
         }
+        StartOutcome::Exited {
+            reply: StartReply::Refused(reply),
+            code,
+        } => {
+            say(&format!(
+                "apply: sshd is not serving: {stopped}, the service manager refused a start ({reply}), and the sshd \
+                 it reported running exited (code {code}) before it listened. {CHECK_OR_START_BY_HAND}"
+            ));
+            false
+        }
         StartOutcome::Stopped { exit, .. } => {
             let first = match &unseen {
                 None => stopped_again(exit),
                 Some(unseen) => format!("{unseen}; {}", stopped_again(exit)),
+            };
+            start_again(host, say, before, &first)
+        }
+        StartOutcome::Exited { code, .. } => {
+            let first = match &unseen {
+                None => exited_before_listening(code),
+                Some(unseen) => format!("{unseen}; {}", exited_before_listening(code)),
             };
             start_again(host, say, before, &first)
         }
@@ -204,6 +236,8 @@ pub fn restart(host: &mut dyn SshdHost, say: &mut dyn FnMut(&str), before: &Befo
 
 const START_BY_HAND: &str = "Start it at this PC: `net start sshd`.";
 const CHECK_BY_HAND: &str = "Check it at this PC: `sc query sshd`.";
+const CHECK_OR_START_BY_HAND: &str =
+    "Check it at this PC: `sc query sshd`; start it with `net start sshd` if it is stopped.";
 
 /// What is said when sshd could not be stopped: why, and the state it is in.
 fn not_stopped(why: &str, state: &str) -> String {
@@ -221,6 +255,20 @@ fn stopped_again(exit: ExitCodes) -> String {
     )
 }
 
+/// A start the service manager accepted whose sshd exited before it listened, in a sentence.
+fn exited_before_listening(code: u32) -> String {
+    format!("the start was accepted and sshd exited (code {code}) before it listened")
+}
+
+/// A second start that ended before sshd listened, in a clause: `accepted` is what is said of one the service
+/// manager accepted.
+fn second_ended(reply: StartReply, accepted: String) -> String {
+    match reply {
+        StartReply::Refused(reply) => format!("the service manager refused a second start ({reply})"),
+        StartReply::Accepted => accepted,
+    }
+}
+
 /// What the service manager answered a start, in a clause.
 fn replied(reply: &StartReply) -> String {
     match reply {
@@ -229,7 +277,7 @@ fn replied(reply: &StartReply) -> String {
     }
 }
 
-/// The first start was accepted and sshd stopped again (`first` says how), so sshd could not run the files:
+/// The first start was accepted and ended before sshd listened (`first` says how), so sshd could not run the files:
 /// put back what this run changed, start once more, and say what that came to. Returns whether the running
 /// sshd takes the variable.
 fn start_again(host: &mut dyn SshdHost, say: &mut dyn FnMut(&str), before: &Before, first: &str) -> bool {
@@ -255,21 +303,21 @@ fn start_again(host: &mut dyn SshdHost, say: &mut dyn FnMut(&str), before: &Befo
     let bracketed = account.map_or(String::new(), |said| format!(" (the {said})"));
 
     match host.start() {
-        StartOutcome::Running(StartReply::Accepted) if trouble.is_empty() && changed => {
+        StartOutcome::Serving(StartReply::Accepted) if trouble.is_empty() && changed => {
             say(&format!(
                 "apply: sshd {failed} ({first}); the original configuration was put back and sshd is running \
                  again. It does not accept {VARIABLE}."
             ));
             false
         }
-        StartOutcome::Running(StartReply::Accepted) if trouble.is_empty() => {
+        StartOutcome::Serving(StartReply::Accepted) if trouble.is_empty() => {
             say(&format!(
                 "apply: sshd failed to start once ({first}); a second start worked and sshd is running. It \
                  accepts {VARIABLE}."
             ));
             true
         }
-        StartOutcome::Running(reply) => {
+        StartOutcome::Serving(reply) => {
             let why = match reply {
                 StartReply::Refused(reply) => format!("the service manager refused a second start ({reply})"),
                 StartReply::Accepted => "not all of the files could be put back".to_owned(),
@@ -281,13 +329,23 @@ fn start_again(host: &mut dyn SshdHost, say: &mut dyn FnMut(&str), before: &Befo
             false
         }
         StartOutcome::Stopped { reply, exit } => {
-            let second = match reply {
-                StartReply::Refused(reply) => format!("the service manager refused a second start ({reply})"),
-                StartReply::Accepted => format!(
+            let second = second_ended(
+                reply,
+                format!(
                     "a second start was accepted and sshd stopped again (exit codes {} and {})",
                     exit.win32, exit.specific
                 ),
-            };
+            );
+            say(&format!(
+                "apply: sshd is NOT running: it {failed} ({first}), and {second}.{back} {START_BY_HAND}"
+            ));
+            false
+        }
+        StartOutcome::Exited { reply, code } => {
+            let second = second_ended(
+                reply,
+                format!("a second start was accepted and sshd exited (code {code}) before it listened"),
+            );
             say(&format!(
                 "apply: sshd is NOT running: it {failed} ({first}), and {second}.{back} {START_BY_HAND}"
             ));

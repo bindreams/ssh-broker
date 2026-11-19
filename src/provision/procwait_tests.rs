@@ -87,6 +87,43 @@ fn a_wait_with_no_bound_returns_when_the_process_has_exited() {
     );
 }
 
+/// A `cmd.exe` that exits with `code` at once.
+fn child_exiting_with(code: u32) -> Child {
+    Command::new(cmd_exe())
+        .args(["/d", "/c", &format!("exit {code}")])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn()
+        .unwrap()
+}
+
+#[test]
+fn the_exit_code_of_a_process_that_has_exited_is_read() {
+    // 259 is `STILL_ACTIVE`: a process that exited with it has exited, and its code is that number.
+    for code in [0, 7, STILL_ACTIVE.0 as u32] {
+        let mut child = child_exiting_with(code);
+        let process = Process::open(child.id())
+            .unwrap()
+            .expect("the child's handle keeps it openable");
+        process.wait_for_exit().unwrap();
+        assert_eq!(process.exit_code().unwrap(), code);
+        child.wait().unwrap();
+    }
+}
+
+#[test]
+fn a_process_that_has_not_exited_has_no_exit_code() {
+    let mut child = child_until_stdin_closes();
+    let process = Process::open(child.id()).unwrap().unwrap();
+    let error = process.exit_code().unwrap_err();
+    assert!(format!("{error:#}").contains("has not exited"), "{error:#}");
+    drop(child.stdin.take());
+    process.wait_for_exit().unwrap();
+    child.wait().unwrap();
+}
+
 #[test]
 fn waiting_for_no_processes_returns_at_once() {
     wait_all_exited(&[], Duration::from_millis(1)).unwrap();

@@ -24,8 +24,8 @@ use windows::Win32::System::Diagnostics::ToolHelp::{
 };
 use windows::Win32::System::RemoteDesktop::ProcessIdToSessionId;
 use windows::Win32::System::Threading::{
-    INFINITE, OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
-    PROCESS_TERMINATE, QueryFullProcessImageNameW, TerminateProcess, WaitForSingleObject,
+    GetExitCodeProcess, INFINITE, OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+    PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, QueryFullProcessImageNameW, TerminateProcess, WaitForSingleObject,
 };
 use windows::core::{HRESULT, PWSTR};
 
@@ -69,6 +69,19 @@ impl Process {
             std::io::Error::last_os_error()
         );
         Ok(())
+    }
+
+    /// The exit code of the process once it has exited; `Err` while it runs, and when the code cannot be read.
+    /// Whether it has exited is read from the handle, not from the code: an exit with the code `STILL_ACTIVE`
+    /// is an exit.
+    pub fn exit_code(&self) -> anyhow::Result<u32> {
+        anyhow::ensure!(has_exited(&self.handle), "process {} has not exited", self.pid);
+        let mut code = 0u32;
+        // SAFETY: the handle is open with PROCESS_QUERY_LIMITED_INFORMATION for the life of `self`; `code` is a
+        // local the call fills.
+        unsafe { GetExitCodeProcess(self.handle.0, &mut code) }
+            .with_context(|| format!("read the exit code of process {}", self.pid))?;
+        Ok(code)
     }
 
     /// End the process. The handle held here keeps its PID from being reused, so reopening it by
@@ -733,8 +746,10 @@ pub fn wait_all_exited(processes: &[Process], bound: Duration) -> anyhow::Result
     wait_all_exited_by(processes, bound, &wait_on)
 }
 
-/// Wait up to `millis` for `process` to exit: `true` if it did, `false` if the time ran out.
-fn wait_on(process: &Process, millis: u32) -> std::io::Result<bool> {
+/// Wait up to `millis` for `process` to exit: `true` if it did, `false` if the time ran out. What the expiry
+/// means is the caller's: [`wait_all_exited`] reports it as a failure bound, and the restart of sshd uses it as
+/// the pause between two looks at something else.
+pub fn wait_on(process: &Process, millis: u32) -> std::io::Result<bool> {
     // SAFETY: the handle is open for the life of `process`.
     let outcome = unsafe { WaitForSingleObject(process.handle.0, millis) }; // sleep-ok: failure bound on an external process exit, reported as an error
     if outcome == WAIT_OBJECT_0 {

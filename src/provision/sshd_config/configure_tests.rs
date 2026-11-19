@@ -79,7 +79,7 @@ impl Fake {
     pub(crate) fn restarts_cleanly(&mut self) {
         self.settles = [Ok(ServiceState::Running)].into();
         self.stops = [Ok(StopOutcome::Stopped)].into();
-        self.starts = [StartOutcome::Running(StartReply::Accepted)].into();
+        self.starts = [StartOutcome::Serving(StartReply::Accepted)].into();
     }
 
     /// The service is not running.
@@ -359,7 +359,8 @@ fn unread(file: &str) -> String {
 
 const NOT_RUNNING: &str = "apply: sshd is not running; it reads the change when it starts";
 
-const RESTARTING: &str = "apply: restarting sshd; apply waits for the service manager at each step";
+const RESTARTING: &str = "apply: restarting sshd; apply waits for the service manager at each step, and after a start \
+                          for sshd to listen or exit";
 const RESTARTED: &str = "apply: sshd restarted; it accepts SSH_BROKER_ELEVATION";
 
 /// What the machine does to the service when `apply` restarts sshd and nothing goes wrong.
@@ -1038,7 +1039,7 @@ fn a_change_made_in_this_run_that_sshd_cannot_start_with_is_put_back_through_the
                 specific: 0,
             },
         },
-        StartOutcome::Running(StartReply::Accepted),
+        StartOutcome::Serving(StartReply::Accepted),
     ]
     .into();
     let (accepted, said) = run(&mut host);
