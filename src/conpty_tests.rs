@@ -17,6 +17,31 @@ fn conpty_runs_child_and_captures_output() {
     assert_eq!(code, 0);
 }
 
+/// `create_pty` falls back to the base flags without a word when the full set is refused; `passthrough` says which it
+/// got. The OS is asked directly, for the full flag set, and the answer must be the same.
+#[test]
+fn a_session_says_whether_the_os_granted_passthrough_mode() {
+    let mut session = PtySession::spawn("cmd.exe /k", 80, 24, None, None, None, &[]).unwrap();
+    let reader = drain(session.out_read_raw());
+    let granted = unsafe {
+        let (in_read, _in_write) = create_pipe_pair().unwrap();
+        let (_out_read, out_write) = create_pipe_pair().unwrap();
+        let full = PSEUDOCONSOLE_RESIZE_QUIRK | PSEUDOCONSOLE_WIN32_INPUT_MODE | PSEUDOCONSOLE_PASSTHROUGH_MODE;
+        let probe = CreatePseudoConsole(COORD { X: 80, Y: 24 }, in_read.0, out_write.0, full);
+        probe.map(|hpc| ClosePseudoConsole(hpc)).is_ok()
+    };
+    assert_eq!(
+        session.passthrough(),
+        granted,
+        "this build's answer to the full flag set"
+    );
+
+    session.job().kill_tree().unwrap();
+    let _ = session.wait();
+    session.close_pty();
+    let _ = reader.join();
+}
+
 #[test]
 fn conpty_resize_on_live_session_succeeds() {
     // A shell that stays open so the pseudoconsole is live when we resize it.
