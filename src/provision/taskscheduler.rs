@@ -226,7 +226,7 @@ fn describe_instances(pids: &[u32]) -> String {
 
 /// The running instances of `task`, and the processes among them that `open` takes for the task's. An instance
 /// whose process has exited, or is not the task's (its pid is another process's now), has ended: see
-/// [`instances_of`]; so has one the engine answers "not running" for when its process is read ([`engine_pid`]).
+/// [`instances_of`]. So has one whose process the engine reports "not running" ([`engine_pid`]).
 fn running_instances(
     task: &IRegisteredTask,
     open: impl FnMut(u32) -> anyhow::Result<Option<Process>>,
@@ -248,10 +248,9 @@ fn running_instances(
     instances_of(pids, open)
 }
 
-/// The process id the engine gave a listed instance (0 for one it has not launched). `None` if the engine
-/// answers `SCHED_E_TASK_NOT_RUNNING`: it answers so for an instance that has ended and is still listed, for a
-/// moment before it drops it, so the instance is no instance, as in [`instances_of`]. Any other failure is an
-/// error.
+/// The process id of a listed instance (0 if not launched), or `None` if the engine answers
+/// `SCHED_E_TASK_NOT_RUNNING`: the instance has ended and is listed for a moment before the engine drops it.
+/// Other failures are errors.
 fn engine_pid(read: windows::core::Result<u32>) -> anyhow::Result<Option<u32>> {
     match read {
         Ok(pid) => Ok(Some(pid)),

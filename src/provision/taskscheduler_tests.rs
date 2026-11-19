@@ -438,7 +438,7 @@ fn a_failure_to_identify_the_process_of_an_instance_is_an_error_and_never_an_end
 }
 
 /// An instance can end between the listing and the read of its process: the engine answers
-/// `SCHED_E_TASK_NOT_RUNNING`. That is the end the wait is waiting for, not a failure.
+/// `SCHED_E_TASK_NOT_RUNNING`.
 #[test]
 fn an_instance_that_ended_while_it_was_listed_is_not_an_error() {
     let failed = |code: HRESULT| engine_pid(Err(windows::core::Error::from(code)));
@@ -451,7 +451,6 @@ fn an_instance_that_ended_while_it_was_listed_is_not_an_error() {
         "one not launched yet is an instance"
     );
 
-    // Another Task Scheduler code and a plain Win32 error stay errors.
     let service_down = failed(SCHED_E_SERVICE_NOT_RUNNING).unwrap_err();
     assert!(
         format!("{service_down:#}").contains("read the process of a running instance"),
