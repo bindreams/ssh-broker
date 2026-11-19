@@ -154,7 +154,7 @@ impl EventWatch {
     /// Subscribe to `channel`. A pull subscription signals its event only after a call of `EvtNext`
     /// has returned `ERROR_NO_MORE_ITEMS`: the service does not signal for a client that has not yet
     /// asked (measured: with no such call a logged event never signalled, on the Application channel
-    /// and, in CI, for the 4625 and 4634 events this module watches). So the subscription is primed
+    /// and, in CI, for Security events 4625 and 4634). So the subscription is primed
     /// with one call here, and an event that arrived before it is remembered.
     pub fn on(channel: &str, query: &str) -> EventWatch {
         // SAFETY: an unnamed manual-reset event.
