@@ -14,8 +14,8 @@ use std::time::Duration;
 use ssh_broker::winutil::OwnedHandle;
 use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows::Win32::System::Threading::{
-    GetExitCodeProcess, GetProcessIoCounters, IO_COUNTERS, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
-    PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, WaitForSingleObject,
+    GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
+    WaitForSingleObject,
 };
 
 use crate::{desktop, process_list};
@@ -88,37 +88,24 @@ fn exit_status(process: HANDLE) -> String {
     }
 }
 
-/// `root` and its descendants (see [`process_list`]) with each one's I/O counters (totals since it
-/// started: where a stream of bytes stopped), its command line, and its threads with their state
-/// and wait reason: what a hung tree is blocked on. A line reads
-/// `pid parent=ppid name [I/O since start: reads N ops N bytes; writes ...; other ...]: command line`.
+/// `root` and its descendants (see [`process_list`]) with each one's I/O counters (the totals of all
+/// its handles since it started, as the system's process list gives them: where a stream of bytes
+/// stopped), its command line, and its threads with their state and wait reason: what a hung tree
+/// is blocked on.
 pub fn process_tree(root: HANDLE, root_pid: u32) -> String {
     let tree = process_list::descendants(root, root_pid);
-    // A handle held keeps the pid from being reused, so reopening by pid reaches the same process.
-    // SAFETY: a plain open by id; the handle is closed by `OwnedHandle`.
-    let root_io = match unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, root_pid) } {
-        Ok(handle) => io_totals(OwnedHandle(handle).0),
-        Err(e) => format!("I/O counters unreadable: could not open the process: {e}"),
-    };
-    let mut io = vec![(root_pid, root_io)];
-    io.extend(tree.members.iter().map(|m| (m.pid, io_totals(m.handle()))));
-    let ids: Vec<String> = io.iter().map(|(pid, _)| pid.to_string()).collect();
-    // The text is ours (digits and a system error message); a quote in it must not end its string.
-    let totals: Vec<String> = io
-        .iter()
-        .map(|(pid, text)| format!("'{pid}' = '{}'", text.replace(['\'', '"'], "''")))
-        .collect();
+    let mut ids = vec![root_pid];
+    ids.extend(tree.members.iter().map(|m| m.pid));
+    let ids: Vec<String> = ids.iter().map(u32::to_string).collect();
     let script = format!(
-        "$io = @{{ {totals} }}; \
-         foreach ($id in @({ids})) {{ \
+        "foreach ($id in @({ids})) {{ \
            $p = Get-CimInstance Win32_Process -Filter \"ProcessId=$id\"; \
            if ($p) {{ \
-             '{{0}} parent={{1}} {{2}} [{{4}}]: {{3}}' -f $p.ProcessId, $p.ParentProcessId, $p.Name, $p.CommandLine, $io[\"$id\"]; \
+             '{{0}} parent={{1}} {{2}} [I/O since start: reads {{4}} ops {{5}} bytes; writes {{6}} ops {{7}} bytes; other {{8}} ops {{9}} bytes]: {{3}}' -f $p.ProcessId, $p.ParentProcessId, $p.Name, $p.CommandLine, $p.ReadOperationCount, $p.ReadTransferCount, $p.WriteOperationCount, $p.WriteTransferCount, $p.OtherOperationCount, $p.OtherTransferCount; \
              $proc = Get-Process -Id $id -ErrorAction SilentlyContinue; \
              if ($proc) {{ foreach ($t in $proc.Threads) {{ '    thread {{0}} {{1}} {{2}}' -f $t.Id, $t.ThreadState, $t.WaitReason }} }} \
            }} \
          }}",
-        totals = totals.join("; "),
         ids = ids.join(",")
     );
     let mut report = match desktop::output(
@@ -137,25 +124,6 @@ pub fn process_tree(root: HANDLE, root_pid: u32) -> String {
         report.push_str(&format!("not examined: {note}\n"));
     }
     report
-}
-
-/// What `process` has read, written and otherwise operated on since it started, as operation counts
-/// and bytes, or why that cannot be read. Needs only `PROCESS_QUERY_LIMITED_INFORMATION`.
-fn io_totals(process: HANDLE) -> String {
-    let mut counters = IO_COUNTERS::default();
-    // SAFETY: a live handle with query access; a valid out-pointer.
-    match unsafe { GetProcessIoCounters(process, &mut counters) } {
-        Ok(()) => format!(
-            "I/O since start: reads {} ops {} bytes; writes {} ops {} bytes; other {} ops {} bytes",
-            counters.ReadOperationCount,
-            counters.ReadTransferCount,
-            counters.WriteOperationCount,
-            counters.WriteTransferCount,
-            counters.OtherOperationCount,
-            counters.OtherTransferCount,
-        ),
-        Err(e) => format!("I/O counters unreadable: {e}"),
-    }
 }
 
 /// Append the text of `path` to `into`: a file's contents, or each file of a directory (one

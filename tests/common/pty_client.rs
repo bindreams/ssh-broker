@@ -164,7 +164,7 @@ impl PtyRun {
 the last bytes it wrote (raw): {:?}
 the lengths of the last lines typed: {:?}
 
-sent {} bytes of key events; compare with the bytes read by the helper's second conhost, written by the agent and read by the agent's conhost
+sent {} bytes of key events. Compare with the bytes READ by the helper's pseudoconsole host (the conhost started with `--headless`): it reads them and little else. Farther on the counts are less clean: a process's totals cover all its handles (the agent's writes include its log and every session it serves), and the agent and its console hosts are in this tree only if this console's shim started the agent.
 process tree (each line: the process's I/O totals since it started):
 {}
 
