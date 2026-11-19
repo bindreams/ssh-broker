@@ -78,6 +78,29 @@ fn request_path_is_in_the_folder_beside_the_agent_socket() {
     assert_ne!(loc.request_path(), loc.path(), "not the agent's socket");
 }
 
+#[test]
+fn the_checked_request_path_is_the_request_path_up_to_107_bytes_and_a_typed_refusal_over_it() {
+    let at = |bytes: usize| {
+        let location = for_profile(&profile_for_socket_path_of(bytes, Integrity::Medium), Integrity::Medium).unwrap();
+        assert_eq!(
+            location.request_path().as_os_str().len(),
+            bytes + 2,
+            "request.sock is 2 bytes longer"
+        );
+        location
+    };
+    let fits = at(MAX_SOCKET_PATH_BYTES - 2);
+    assert_eq!(fits.checked_request_path().unwrap(), fits.request_path());
+
+    let over = at(MAX_SOCKET_PATH_BYTES - 1);
+    assert_eq!(
+        over.checked_request_path().unwrap_err(),
+        RequestPathTooLong {
+            path: over.request_path()
+        }
+    );
+}
+
 /// `for_profile` measures `agent.sock` only, and no separate check is needed for `request.sock`: an agent at High
 /// binds it in the plain folder, where its path is 7 bytes shorter than that agent's own `agent.sock` in the
 /// elevated folder. A profile at which an agent at High can start has room for it.

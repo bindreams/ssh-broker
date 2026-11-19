@@ -19,13 +19,17 @@ pub const REQUESTS_ONLY: &str = "this socket takes requests only";
 /// [`handle`] with the agent's own end and a panic reply (see [`logout::PanicReply`]).
 pub(super) fn serve(conn: socket2::Socket, control: &Control) -> anyhow::Result<()> {
     let _answer_a_panic = logout::PanicReply::new(&conn, control);
-    handle(conn, control, || logout::end_the_agent(control))
+    handle(conn, control, |outcome| super::finish_settled(outcome))
 }
 
 /// Serve one connection of the request socket. A `Logout` handshake is answered exactly as on `agent.sock` (the
-/// reply, then the end of a background agent through `end_process`); any other handshake is answered with
+/// reply, then the end of a background agent through `end_process`, given how that end went); any other handshake is answered with
 /// [`REQUESTS_ONLY`] and the connection ends. The error of a connection it cannot read comes back for the log.
-pub(super) fn handle(conn: socket2::Socket, control: &Control, end_process: impl FnOnce()) -> anyhow::Result<()> {
+pub(super) fn handle(
+    conn: socket2::Socket,
+    control: &Control,
+    end_process: impl FnOnce(anyhow::Result<()>),
+) -> anyhow::Result<()> {
     let Some(Opened { mut rx, mut tx, hs, .. }) = read_request(afunix::try_split, conn, control)? else {
         return Ok(());
     };

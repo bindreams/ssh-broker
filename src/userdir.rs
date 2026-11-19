@@ -110,11 +110,7 @@ impl SocketDir {
     ///
     /// A path over the limit is a [`socket_loc::RequestPathTooLong`], no connect being made.
     pub fn connect_request(&self) -> anyhow::Result<socket2::Socket> {
-        let path = self.location.request_path();
-        if path.as_os_str().len() > socket_loc::MAX_SOCKET_PATH_BYTES {
-            return Err(socket_loc::RequestPathTooLong { path }.into());
-        }
-        crate::afunix::connect(&path)
+        crate::afunix::connect(&self.location.checked_request_path()?)
     }
 }
 

@@ -166,31 +166,16 @@ impl Drop for Registration<'_> {
     }
 }
 
-/// What ends a background agent's process once its logout is answered and the session drained: the `end_process`
-/// of [`handle_logout`] on both sockets. How it ends is the tally's record, as for every end that is settled
-/// ([`super::settled_end`]).
-pub(super) fn end_the_agent(control: &Control) {
-    end_the_agent_with(control, |outcome| super::finish_settled(outcome));
-}
-
-/// [`end_the_agent`] with what ends the process as a parameter, so a test can see how the end went.
-///
-/// The record is read after the settle, and it cannot change under this: a shortage is recorded only while no
-/// connection is live, and this `logout` is live until the process ends, so a cause is recorded before the
-/// handler was counted (and is read here) or never.
-pub(super) fn end_the_agent_with(control: &Control, finish: impl FnOnce(anyhow::Result<()>)) {
-    finish(super::settled_end(&control.connections));
-}
-
 /// Answer a `Logout` handshake on a connection whose handshake has been read.
 ///
-/// `end_process` ends the process; it is a parameter so a test can see when it is called. A
-/// desktop agent answers and keeps serving.
+/// `end_process` ends the process, with how that end went: the tally's record, as for every end that is settled
+/// ([`super::settled_end`]). It is a parameter so a test can see when and how it is called; production passes
+/// [`super::finish_settled`]. A desktop agent answers and keeps serving.
 pub(super) fn handle_logout<R: LimitedRead, W: std::io::Write>(
     rx: &mut R,
     tx: &mut W,
     control: &Control,
-    end_process: impl FnOnce(),
+    end_process: impl FnOnce(anyhow::Result<()>),
 ) -> anyhow::Result<()> {
     if !control.background {
         reply(tx, DESKTOP_REPLY, DESKTOP_EXIT_CODE)?;
@@ -205,7 +190,10 @@ pub(super) fn handle_logout<R: LimitedRead, W: std::io::Write>(
     let _logout = control.connections.begin_logout();
     control.end_all();
     control.settle();
-    end_process();
+    // The record is read after the settle, and it cannot change under this: a shortage is recorded only while no
+    // connection is live, and this `logout` is live until the process ends, so a cause is recorded before the
+    // handler was counted (and is read here) or never.
+    end_process(super::settled_end(&control.connections));
     Ok(())
 }
 

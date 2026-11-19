@@ -328,9 +328,10 @@ fn run_ended(end: anyhow::Error, connections: &Connections) -> anyhow::Result<()
 
 /// How an end that is decided and settled ([`Connections::settle`]) goes, from the tally's record and nowhere else:
 /// a clean end, unless what decided it was a shortage that no connection was live to cure
-/// ([`Connections::fatal_cause`]), on whichever loop: then it is that failure. Every thread that ends the agent after a
-/// settle (the main thread through [`run_ended`], the request socket's loop, a `logout`) takes its end from here,
-/// so the process has the same exit code whichever of them ends it first.
+/// ([`Connections::fatal_cause`]), on whichever loop: then it is that failure. Every thread that ends the agent with
+/// an end that was decided (the main thread through [`run_ended`], the request socket's loop, a `logout`) takes its end
+/// from here, so the process has the same exit code whichever of them ends it first. The one end that was not decided
+/// is a loop of `agent.sock` that failed on its own ([`run_ended`]): that is the loop's failure, whatever the record.
 #[cfg(windows)]
 fn settled_end(connections: &Connections) -> anyhow::Result<()> {
     match connections.fatal_cause() {
@@ -339,8 +340,9 @@ fn settled_end(connections: &Connections) -> anyhow::Result<()> {
     }
 }
 
-/// End the process as `outcome` ([`settled_end`]) says: a clean end is logged, a failed one is reported
-/// ([`end_on_error`]).
+/// End the process as `outcome` ([`settled_end`]) says: a clean end is logged, a failed one is logged and then
+/// reported ([`end_on_error`]). A background agent has no stderr, so the log is where the cause is kept; the main
+/// path logs it as well when it is the thread that ends the process, so it can be said twice.
 #[cfg(windows)]
 fn finish_settled(outcome: anyhow::Result<()>) -> ! {
     match outcome {
@@ -348,7 +350,10 @@ fn finish_settled(outcome: anyhow::Result<()>) -> ! {
             tracing::info!("the background session has ended");
             end_process(0)
         }
-        Err(e) => end_on_error(&e),
+        Err(e) => {
+            tracing::error!("the agent stopped: {e:#}");
+            end_on_error(&e)
+        }
     }
 }
 
@@ -938,7 +943,7 @@ fn handle_connection_in(conn: socket2::Socket, hooks: Hooks, control: &Control) 
         return Ok(());
     };
     if hs.mode == Mode::Logout {
-        return logout::handle_logout(&mut rx, &mut tx, control, || logout::end_the_agent(control));
+        return logout::handle_logout(&mut rx, &mut tx, control, |outcome| finish_settled(outcome));
     }
     // Before a shell is started for nothing; the registration below is what decides.
     if control.is_ending() {

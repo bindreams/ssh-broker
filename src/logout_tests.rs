@@ -268,8 +268,10 @@ fn a_profile_too_long_for_an_agent_at_high_has_none_and_one_that_cannot_be_looke
     let long = std::path::PathBuf::from(format!(r"C:\Users\{}", "x".repeat(80)));
     assert!(!elevated_folder_exists(&long).unwrap());
 
-    // Nothing is created: a short fixed path, so its length is no reason for the refusal.
-    let unreadable = std::path::PathBuf::from(r"C:\a?b");
+    // Nothing is created: a short name at the root of the temp directory's drive, so its length is no reason for
+    // the refusal and the drive is one this machine has.
+    let drive: std::path::PathBuf = std::env::temp_dir().components().take(2).collect();
+    let unreadable = drive.join("a?b");
     let err = elevated_folder_exists(&unreadable).expect_err("the system refuses the name");
     assert!(format!("{err:#}").contains("a?b"), "{err:#}");
 }

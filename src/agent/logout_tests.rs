@@ -148,7 +148,7 @@ fn desktop_agent_refuses_logout_and_keeps_serving() {
     let killed = Arc::new(AtomicUsize::new(0));
     let _session = control.register(counting_killer(&killed)).unwrap();
 
-    handle_logout(&mut Closed, &mut written, &control, || {
+    handle_logout(&mut Closed, &mut written, &control, |_| {
         ended.store(true, Ordering::SeqCst)
     })
     .unwrap();
@@ -181,7 +181,7 @@ fn background_agent_acknowledges_before_ending() {
         }
     }
     let mut tx = Recorder(&events, Vec::new());
-    handle_logout(&mut Closed, &mut tx, &control, || events.lock().unwrap().push("ended")).unwrap();
+    handle_logout(&mut Closed, &mut tx, &control, |_| events.lock().unwrap().push("ended")).unwrap();
 
     assert_eq!(*events.lock().unwrap(), ["flushed", "ended"]);
     let (data, exit) = decode(&tx.1);
@@ -212,7 +212,7 @@ fn background_agent_does_not_end_until_the_client_has_closed() {
     let worker = {
         let control = Arc::clone(&control);
         std::thread::spawn(move || {
-            handle_logout(&mut Gate::new(closed), &mut Tx(replied), &control, || {
+            handle_logout(&mut Gate::new(closed), &mut Tx(replied), &control, |_| {
                 ended.send(()).unwrap()
             })
             .unwrap();
@@ -242,7 +242,7 @@ fn logout_ends_every_registered_session_once() {
     let sessions: Vec<_> = (0..3)
         .map(|_| control.register(counting_killer(&killed)).unwrap())
         .collect();
-    handle_logout(&mut Closed, &mut Vec::new(), &control, || {}).unwrap();
+    handle_logout(&mut Closed, &mut Vec::new(), &control, |_| {}).unwrap();
     assert_eq!(killed.load(Ordering::SeqCst), 3);
     drop(sessions);
 }
@@ -252,14 +252,14 @@ fn a_finished_session_is_not_ended_by_a_later_logout() {
     let control = Control::new(true, Connections::new());
     let killed = Arc::new(AtomicUsize::new(0));
     drop(control.register(counting_killer(&killed)).unwrap());
-    handle_logout(&mut Closed, &mut Vec::new(), &control, || {}).unwrap();
+    handle_logout(&mut Closed, &mut Vec::new(), &control, |_| {}).unwrap();
     assert_eq!(killed.load(Ordering::SeqCst), 0);
 }
 
 #[test]
 fn a_session_that_starts_after_the_end_began_is_refused_registration() {
     let control = Control::new(true, Connections::new());
-    handle_logout(&mut Closed, &mut Vec::new(), &control, || {}).unwrap();
+    handle_logout(&mut Closed, &mut Vec::new(), &control, |_| {}).unwrap();
     let killed = Arc::new(AtomicUsize::new(0));
     assert!(control.register(counting_killer(&killed)).is_none());
 }
@@ -281,7 +281,7 @@ fn the_process_ends_only_after_every_other_connection_has_finished() {
 
     let worker = std::thread::spawn(move || {
         let _live = this_connection;
-        handle_logout(&mut Closed, &mut Vec::new(), &control, || {
+        handle_logout(&mut Closed, &mut Vec::new(), &control, |_| {
             let _ = events.send("ended");
         })
         .unwrap();
@@ -310,7 +310,7 @@ fn two_logouts_at_once_both_end_the_agent() {
             let (control, ended) = (Arc::clone(&control), Arc::clone(&ended));
             std::thread::spawn(move || {
                 let _live = live;
-                handle_logout(&mut Closed, &mut Vec::new(), &control, || {
+                handle_logout(&mut Closed, &mut Vec::new(), &control, |_| {
                     ended.fetch_add(1, Ordering::SeqCst);
                 })
                 .unwrap();
@@ -351,9 +351,9 @@ fn ending_wakes_the_accept_loop_once_however_many_logouts_ask() {
         0,
         "nothing wakes it before the end begins"
     );
-    handle_logout(&mut Closed, &mut Vec::new(), &control, || {}).unwrap();
+    handle_logout(&mut Closed, &mut Vec::new(), &control, |_| {}).unwrap();
     assert_eq!(woken.load(Ordering::SeqCst), 1);
-    handle_logout(&mut Closed, &mut Vec::new(), &control, || {}).unwrap();
+    handle_logout(&mut Closed, &mut Vec::new(), &control, |_| {}).unwrap();
     assert_eq!(woken.load(Ordering::SeqCst), 1, "it is already awake");
 }
 
@@ -389,7 +389,7 @@ fn the_accept_loop_is_woken_once_the_shells_are_ended_and_every_other_connection
     std::thread::scope(|scope| {
         scope.spawn(|| {
             let _live = this_connection;
-            handle_logout(&mut Closed, &mut Vec::new(), &control, || {
+            handle_logout(&mut Closed, &mut Vec::new(), &control, |_| {
                 let _ = events.send("ended");
             })
             .unwrap();
@@ -422,7 +422,7 @@ fn the_accept_loop_is_woken_after_the_flag_that_stops_it_is_up() {
         let (connections, seen) = (Arc::clone(&connections), Arc::clone(&seen));
         move || *seen.lock().unwrap() = Some(connections.is_closing())
     });
-    handle_logout(&mut Closed, &mut Vec::new(), &control, || {}).unwrap();
+    handle_logout(&mut Closed, &mut Vec::new(), &control, |_| {}).unwrap();
     assert_eq!(*seen.lock().unwrap(), Some(true));
 }
 
@@ -585,7 +585,7 @@ fn a_session_that_registers_while_the_shells_are_being_ended_is_refused() {
         })
         .unwrap();
 
-    handle_logout(&mut Closed, &mut Vec::new(), &control, || {}).unwrap();
+    handle_logout(&mut Closed, &mut Vec::new(), &control, |_| {}).unwrap();
 
     assert!(refused.load(Ordering::SeqCst));
     *slot.lock().unwrap() = None;
@@ -607,7 +607,10 @@ fn a_logout_whose_client_is_gone_before_the_reply_still_ends_the_agent() {
     let _session = control.register(counting_killer(&killed)).unwrap();
     let ended = AtomicBool::new(false);
 
-    handle_logout(&mut Closed, &mut Gone, &control, || ended.store(true, Ordering::SeqCst)).unwrap();
+    handle_logout(&mut Closed, &mut Gone, &control, |_| {
+        ended.store(true, Ordering::SeqCst)
+    })
+    .unwrap();
 
     assert!(ended.load(Ordering::SeqCst), "every logout ends the agent");
     assert_eq!(killed.load(Ordering::SeqCst), 1);
@@ -751,7 +754,7 @@ fn a_logout_client_that_never_closes_does_not_keep_the_agent_alive_and_the_log_s
     let (_silent, closed) = mpsc::channel::<()>();
 
     let (log, result) = logged(|| {
-        handle_logout(&mut Gate::new(closed), &mut Vec::new(), &control, || {
+        handle_logout(&mut Gate::new(closed), &mut Vec::new(), &control, |_| {
             ended.store(true, Ordering::SeqCst)
         })
     });
@@ -768,7 +771,7 @@ fn a_logout_client_that_closes_in_time_is_not_reported() {
     let (close, closed) = mpsc::channel();
     close.send(()).unwrap();
 
-    let (log, result) = logged(|| handle_logout(&mut Gate::new(closed), &mut Vec::new(), &control, || {}));
+    let (log, result) = logged(|| handle_logout(&mut Gate::new(closed), &mut Vec::new(), &control, |_| {}));
 
     result.unwrap();
     assert!(!log.contains("had not closed"), "{log}");
@@ -869,7 +872,7 @@ fn a_connection_handler_that_never_returns_does_not_keep_the_agent_alive() {
     let ended = AtomicBool::new(false);
 
     let _live = this_connection;
-    handle_logout(&mut Closed, &mut Vec::new(), &control, || {
+    handle_logout(&mut Closed, &mut Vec::new(), &control, |_| {
         ended.store(true, Ordering::SeqCst)
     })
     .unwrap();
@@ -937,7 +940,7 @@ fn control_reserves_an_id_before_the_start_and_registration_ends_it() {
 
     drop(registration);
     assert!(!control.is_registered(&id), "the entry ends with the registration");
-    handle_logout(&mut Closed, &mut Vec::new(), &control, || {}).unwrap();
+    handle_logout(&mut Closed, &mut Vec::new(), &control, |_| {}).unwrap();
     assert_eq!(killed.load(Ordering::SeqCst), 0, "an ended session is not ended again");
 }
 
@@ -947,14 +950,14 @@ fn a_registered_session_is_ended_by_the_id_it_was_given() {
     let killed = Arc::new(AtomicUsize::new(0));
     let reservation = control.reserve().unwrap().unwrap();
     let _registration = reservation.register(counting_killer(&killed)).unwrap();
-    handle_logout(&mut Closed, &mut Vec::new(), &control, || {}).unwrap();
+    handle_logout(&mut Closed, &mut Vec::new(), &control, |_| {}).unwrap();
     assert_eq!(killed.load(Ordering::SeqCst), 1);
 }
 
 #[test]
 fn reserve_is_refused_once_the_agent_is_ending() {
     let control = Control::new(true, Connections::new());
-    handle_logout(&mut Closed, &mut Vec::new(), &control, || {}).unwrap();
+    handle_logout(&mut Closed, &mut Vec::new(), &control, |_| {}).unwrap();
     assert!(control.reserve().unwrap().is_none());
 }
 
@@ -965,7 +968,7 @@ fn a_reservation_made_before_the_end_began_is_refused_registration() {
     let killed = Arc::new(AtomicUsize::new(0));
     let reservation = control.reserve().unwrap().unwrap();
     let id = *reservation.id();
-    handle_logout(&mut Closed, &mut Vec::new(), &control, || {}).unwrap();
+    handle_logout(&mut Closed, &mut Vec::new(), &control, |_| {}).unwrap();
     assert!(reservation.register(counting_killer(&killed)).is_none());
     assert!(!control.is_registered(&id));
 }
@@ -978,7 +981,7 @@ fn a_reservation_dropped_unregistered_leaves_no_entry() {
     let id = *control.reserve().unwrap().unwrap().id();
     assert!(!control.is_registered(&id));
     let _running = control.register(counting_killer(&killed)).unwrap();
-    handle_logout(&mut Closed, &mut Vec::new(), &control, || {}).unwrap();
+    handle_logout(&mut Closed, &mut Vec::new(), &control, |_| {}).unwrap();
     assert_eq!(
         killed.load(Ordering::SeqCst),
         1,
@@ -1083,7 +1086,7 @@ fn a_logout_wakes_the_loop_of_each_socket_and_ends_the_agent() {
     let control = Control::new(true, Arc::clone(&connections));
     let ended = AtomicBool::new(false);
 
-    handle_logout(&mut Closed, &mut Vec::new(), &control, || {
+    handle_logout(&mut Closed, &mut Vec::new(), &control, |_| {
         ended.store(true, Ordering::SeqCst)
     })
     .unwrap();
@@ -1097,11 +1100,11 @@ fn a_logout_wakes_the_loop_of_each_socket_and_ends_the_agent() {
 
 // How the end goes -----
 
-/// How a background agent's end went when `logout` is handled on `control`: what `end_the_agent_with` finished with.
+/// How a background agent's end went when `logout` is handled on `control`: what the handler passed to `end_process`.
 fn logout_ended(control: &Control) -> anyhow::Result<()> {
     let outcome = Mutex::new(None);
-    handle_logout(&mut Closed, &mut Vec::new(), control, || {
-        end_the_agent_with(control, |ended| *outcome.lock().unwrap() = Some(ended))
+    handle_logout(&mut Closed, &mut Vec::new(), control, |ended| {
+        *outcome.lock().unwrap() = Some(ended)
     })
     .unwrap();
     outcome.into_inner().unwrap().expect("the end was finished")

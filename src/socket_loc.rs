@@ -136,6 +136,16 @@ impl SocketLocation {
         self.dir.join(REQUEST_SOCKET_FILE_NAME)
     }
 
+    /// [`SocketLocation::request_path`], or [`RequestPathTooLong`] when it is over the limit, so that nothing
+    /// connects to it.
+    pub fn checked_request_path(&self) -> Result<PathBuf, RequestPathTooLong> {
+        let path = self.request_path();
+        match over_limit(&path) {
+            Some(_) => Err(RequestPathTooLong { path }),
+            None => Ok(path),
+        }
+    }
+
     /// The lock file the agent holds while it serves.
     pub fn lock_path(&self) -> PathBuf {
         self.dir.join(LOCK_FILE_NAME)
@@ -189,8 +199,7 @@ pub struct RequestPathTooLong {
 /// shorter than that agent's own `agent.sock`, so it fits whenever the agent can start.
 pub fn for_profile(profile: &Path, integrity: Integrity) -> Result<SocketLocation, SocketLocationError> {
     let location = SocketLocation::in_profile(profile, integrity);
-    let bytes = location.path.as_os_str().len();
-    if bytes > MAX_SOCKET_PATH_BYTES {
+    if let Some(bytes) = over_limit(&location.path) {
         return Err(SocketLocationError::TooLong {
             path: location.path,
             bytes,
@@ -198,6 +207,11 @@ pub fn for_profile(profile: &Path, integrity: Integrity) -> Result<SocketLocatio
         });
     }
     Ok(location)
+}
+
+/// The length of `path` in bytes if it is over [`MAX_SOCKET_PATH_BYTES`]: the one place a socket path is measured.
+fn over_limit(path: &Path) -> Option<usize> {
+    Some(path.as_os_str().len()).filter(|bytes| *bytes > MAX_SOCKET_PATH_BYTES)
 }
 
 #[cfg(test)]
