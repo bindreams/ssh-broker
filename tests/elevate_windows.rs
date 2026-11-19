@@ -468,7 +468,9 @@ fn the_program_is_found_where_the_session_finds_it() {
     let (kit, account, _end) = an_administrator("elpg");
     let admin = Started::start(&kit, &account);
 
-    let folder = kit.path("probe-folder");
+    // In the account's own profile: its unelevated session cannot `Set-Location` into the kit, which is under the
+    // profile of the account that runs the tests (seen in CI: "Access to the path ... AppData is denied").
+    let folder = account.profile().join("probe-folder");
     std::fs::create_dir(&folder).expect("make the folder of the program");
     let system_root = std::env::var("SystemRoot").expect("SystemRoot");
     std::fs::copy(
