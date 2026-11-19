@@ -289,6 +289,10 @@ fn with_a_terminal_the_output_is_below_the_typed_line_and_the_prompt_follows() {
         );
     }
     session.leave();
+    panic!(
+        "MEASURED (this test fails on purpose): the logs of a session where it works\n{}",
+        (admin.diagnostics())()
+    );
 }
 
 /// The elevated `ping` that [`ctrl_c_ends_a_command_run_without_a_terminal_and_the_session_goes_on`] runs, found by

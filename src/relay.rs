@@ -88,15 +88,32 @@ impl FrameSink for DiscardSink {
 pub fn pump_until_peer_gone<R: Read>(r: &mut R, fr: &mut FrameReader, sink: &mut impl FrameSink) {
     let e = match pump_decode(r, fr, sink) {
         Err(e) => e,
-        Ok(_) => return, // clean end of stream: the peer is finished
+        Ok(outcome) => {
+            tracing::debug!("MEASURE pump_until_peer_gone: ended cleanly: {outcome:?}");
+            return; // clean end of stream: the peer is finished
+        }
     };
-    tracing::debug!("input pump stopped delivering: {e}");
+    tracing::debug!(
+        "MEASURE pump_until_peer_gone: stopped delivering: {e} (peer_gone={})",
+        e.peer_gone()
+    );
     if e.peer_gone() {
         return;
     }
-    if let Err(e) = pump_decode(r, fr, &mut DiscardSink) {
-        tracing::debug!("input pump stopped watching: {e}");
+    match pump_decode(r, fr, &mut DiscardSink) {
+        Err(e) => tracing::debug!("MEASURE pump_until_peer_gone: stopped watching: {e}"),
+        Ok(outcome) => tracing::debug!("MEASURE pump_until_peer_gone: watching ended cleanly: {outcome:?}"),
     }
+}
+
+/// MEASURE: the first 48 bytes of `bytes` as hex, for the debug log.
+pub fn hex_head(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    for byte in bytes.iter().take(48) {
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
 }
 
 /// Write a `DATA` frame: `[stream tag: u8][bytes...]`.
@@ -147,6 +164,12 @@ pub fn pump_decode<R: Read>(r: &mut R, fr: &mut FrameReader, sink: &mut impl Fra
     loop {
         while let Some(frame) = fr.next_frame().map_err(PumpError::Protocol)? {
             let is_first = fr.frames_read() == 1;
+            tracing::debug!(
+                "MEASURE pump_decode: frame {:?}, {} byte(s) (frame no. {})",
+                frame.kind,
+                frame.payload.len(),
+                fr.frames_read()
+            );
             match frame.kind {
                 FrameKind::Serving | FrameKind::HandBack if !is_first => {
                     return Err(PumpError::Protocol(anyhow::anyhow!(
@@ -176,6 +199,7 @@ pub fn pump_decode<R: Read>(r: &mut R, fr: &mut FrameReader, sink: &mut impl Fra
                 }
                 FrameKind::Exit => {
                     let code = ExitCode::decode(&frame.payload).map_err(PumpError::Protocol)?;
+                    tracing::debug!("MEASURE pump_decode: Exit({})", code.0);
                     return Ok(Outcome::Exited(code.0));
                 }
                 FrameKind::Handshake => {

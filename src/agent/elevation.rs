@@ -179,13 +179,34 @@ fn on_a_pseudoconsole(
         "decide refuses --terminal in a session without a terminal"
     );
     let (cols, rows) = link.size();
+    tracing::debug!("MEASURE on_a_pseudoconsole: starting {line:?} at {cols}x{rows}");
     let mut session = match (starts.pty)(line, cols, rows, cwd, None, None, env) {
         Ok(session) => session,
-        Err(cause) => return RunOutcome::NotStarted(cause.into_cause()),
+        Err(cause) => {
+            tracing::debug!("MEASURE on_a_pseudoconsole: the command did not start");
+            return RunOutcome::NotStarted(cause.into_cause());
+        }
     };
+    {
+        use windows::Win32::Foundation::HANDLE;
+        // SAFETY: the process handle is the session's own, open while `session` lives.
+        let pid = unsafe {
+            windows::Win32::System::Threading::GetProcessId(HANDLE(session.process_raw() as *mut core::ffi::c_void))
+        };
+        tracing::debug!("MEASURE on_a_pseudoconsole: the command started, process id {pid}");
+    }
     let job = session.job();
     let hangup = watch_request(conn, &job);
-    if answer_serving(conn).is_err() {
+    tracing::debug!(
+        "MEASURE on_a_pseudoconsole: request watch started: {}",
+        hangup.is_some()
+    );
+    let served = answer_serving(conn);
+    tracing::debug!(
+        "MEASURE on_a_pseudoconsole: Serving answered: {:?}",
+        served.as_ref().map_err(|e| format!("{e:#}"))
+    );
+    if served.is_err() {
         if let Some(w) = teardown_warning(reap_tree(&job)) {
             tracing::error!("{w}");
         }
@@ -220,11 +241,18 @@ fn on_a_pseudoconsole(
     // The session's own teardown (see `handle_pty`), with nothing to end in the link: the command is the one being
     // ended.
     let ended = end_pty(session, &target, pump, || {});
+    tracing::debug!(
+        "MEASURE on_a_pseudoconsole: end_pty returned: {:?} (guard hosted: {})",
+        ended.as_ref().map_err(|e| format!("{e:#}")),
+        guard.is_some()
+    );
     // The connection goes back to the session before the reply is written.
     drop(guard);
+    tracing::debug!("MEASURE on_a_pseudoconsole: guard dropped; finishing the request watch");
     if let Some(hangup) = hangup {
         hangup.finish();
     }
+    tracing::debug!("MEASURE on_a_pseudoconsole: request watch finished");
     match ended {
         Ok(code) => RunOutcome::Exited(code),
         Err(cause) => RunOutcome::EndUnread(cause),
@@ -238,13 +266,24 @@ fn on_pipes(conn: &mut ConnTx, line: &str, cwd: Option<&Path>, starts: &Starts, 
         Ok(tx) => Link::new(tx, false, (0, 0), None),
         Err(cause) => return RunOutcome::NotStarted(cause),
     };
+    tracing::debug!("MEASURE on_pipes: starting {line:?}");
     let mut child = match (starts.exec)(line, cwd, None, env) {
         Ok(child) => child,
-        Err(cause) => return RunOutcome::NotStarted(cause.into_cause()),
+        Err(cause) => {
+            tracing::debug!("MEASURE on_pipes: the command did not start");
+            return RunOutcome::NotStarted(cause.into_cause());
+        }
     };
+    tracing::debug!("MEASURE on_pipes: the command started (the pipe child gives no process id)");
     let job = child.job();
     let hangup = watch_request(conn, &job);
-    if answer_serving(conn).is_err() {
+    tracing::debug!("MEASURE on_pipes: request watch started: {}", hangup.is_some());
+    let served = answer_serving(conn);
+    tracing::debug!(
+        "MEASURE on_pipes: Serving answered: {:?}",
+        served.as_ref().map_err(|e| format!("{e:#}"))
+    );
+    if served.is_err() {
         if let Some(w) = teardown_warning(reap_tree(&job)) {
             tracing::error!("{w}");
         }
@@ -276,15 +315,23 @@ fn on_pipes(conn: &mut ConnTx, line: &str, cwd: Option<&Path>, starts: &Starts, 
         Carrier::Elevated,
         gone(),
     );
+    tracing::debug!("MEASURE on_pipes: waiting for the command");
     let waited = child.wait();
+    tracing::debug!(
+        "MEASURE on_pipes: wait returned: {:?}",
+        waited.as_ref().map_err(|e| format!("{e:#}"))
+    );
     if let Some(w) = teardown_warning(reap_tree(&job)) {
         tracing::error!("{w}");
     }
+    tracing::debug!("MEASURE on_pipes: tree reaped; joining the pumps");
     let _ = out.join();
     let _ = err.join();
+    tracing::debug!("MEASURE on_pipes: pumps joined; finishing the request watch");
     if let Some(hangup) = hangup {
         hangup.finish();
     }
+    tracing::debug!("MEASURE on_pipes: request watch finished");
     match waited {
         Ok(code) => RunOutcome::Exited(code),
         Err(cause) => RunOutcome::EndUnread(cause.into()),

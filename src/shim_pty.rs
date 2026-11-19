@@ -727,12 +727,23 @@ fn run_pty(
         stopping: Arc::clone(&stopping),
     };
     let pumped = pump_heard(&mut rx, &mut fr, &mut sink);
+    match &pumped.outcome {
+        Ok(outcome) => tracing::debug!(
+            "MEASURE shim run_pty: the agent's output pump ended: {outcome:?} (heard={})",
+            pumped.heard
+        ),
+        Err(e) => tracing::debug!(
+            "MEASURE shim run_pty: the agent's output pump ended with an error: {e} (heard={})",
+            pumped.heard
+        ),
+    }
 
     // Ordered teardown: a started worker is stopped, woken and joined; an unstarted one has nothing parked, so no
     // console record is injected and the write half is closed. Console modes are restored by `modes` dropping at
     // scope end — AFTER the join, so the worker is provably done before the restore.
     sink.input.end(
         || {
+            tracing::debug!("MEASURE shim run_pty: stopping and waking the input worker");
             stopping.store(true, Ordering::Relaxed);
             wake_console_input(stdin_raw);
         },
@@ -806,6 +817,7 @@ impl FrameSink for StdoutSink {
     fn on_serving(&mut self) -> anyhow::Result<()> {
         let (stdin_raw, out) = (self.stdin_raw, self.out);
         let (gate, stopping) = (Arc::clone(&self.gate), Arc::clone(&self.stopping));
+        tracing::debug!("MEASURE shim on_serving: starting the input worker");
         self.input
             .start(|tx| std::thread::spawn(move || input_worker(stdin_raw, out, tx, gate, stopping)))
     }
@@ -846,7 +858,9 @@ fn input_worker(
     gate: Arc<MouseGate>,
     stopping: Arc<AtomicBool>,
 ) {
+    tracing::debug!("MEASURE shim input_worker: started");
     unsafe { input_loop(stdin_raw, stdout_raw, &mut tx, &gate, &stopping) };
+    tracing::debug!("MEASURE shim input_worker: loop returned; shutting the socket down");
     // FIN: in the disconnect-first case this makes the agent kill the brokered shell and
     // unblocks MAIN's pump; in the EXIT case it ends the agent's drain, which keeps reading
     // until the client closes.
@@ -870,16 +884,24 @@ unsafe fn input_loop(
     let mut recs: [INPUT_RECORD; 64] = unsafe { std::mem::zeroed() };
     loop {
         if stopping.load(Ordering::Relaxed) {
+            tracing::debug!("MEASURE shim input_loop: ends: stopping set before the read");
             return;
         }
         let mut n = 0u32;
-        if unsafe { ReadConsoleInputW(stdin, &mut recs, &mut n) }.is_err() {
+        tracing::debug!("MEASURE shim input_loop: about to read console input");
+        if let Err(e) = unsafe { ReadConsoleInputW(stdin, &mut recs, &mut n) } {
+            tracing::debug!("MEASURE shim input_loop: ends: ReadConsoleInputW failed: {e}");
             return; // console input closed (SSH side gone)
         }
         // The wake record (or a real one) returns the read; re-check before processing so the
         // teardown signal is honored without forwarding the synthetic record.
         if stopping.load(Ordering::Relaxed) {
+            tracing::debug!("MEASURE shim input_loop: ends: stopping set after the read ({n} record(s))");
             return;
+        }
+        {
+            let keys = recs[..n as usize].iter().filter(|rec| rec.EventType == EVT_KEY).count();
+            tracing::debug!("MEASURE shim input_loop: read {n} record(s), {keys} key event(s)");
         }
         for rec in &recs[..n as usize] {
             match rec.EventType {
@@ -893,7 +915,19 @@ unsafe fn input_loop(
                         control_key_state: k.dwControlKeyState,
                         repeat_count: k.wRepeatCount,
                     };
-                    if write_data(tx, Stream::Pty, &vtinput::encode_key_event(&ke)).is_err() {
+                    let encoded = vtinput::encode_key_event(&ke);
+                    let written = write_data(tx, Stream::Pty, &encoded);
+                    tracing::debug!(
+                        "MEASURE shim input_loop: key (vk={:#x}, char={:#x}, down={}) encoded to {} byte(s) {}; frame written: {:?}",
+                        ke.virtual_key_code,
+                        ke.unicode_char,
+                        ke.key_down,
+                        encoded.len(),
+                        crate::relay::hex_head(&encoded),
+                        written.as_ref().map_err(|e| format!("{e:#}"))
+                    );
+                    if written.is_err() {
+                        tracing::debug!("MEASURE shim input_loop: ends: a key frame could not be written");
                         return;
                     }
                 }
@@ -902,7 +936,13 @@ unsafe fn input_loop(
                     // visible window, so re-query it.
                     let (cols, rows) = console_size(stdout);
                     let r = size_to_resize(cols, rows);
-                    if write_frame(tx, FrameKind::Resize, &r.encode()).is_err() {
+                    let written = write_frame(tx, FrameKind::Resize, &r.encode());
+                    tracing::debug!(
+                        "MEASURE shim input_loop: resize {cols}x{rows} sent: {:?}",
+                        written.as_ref().map_err(|e| format!("{e:#}"))
+                    );
+                    if written.is_err() {
+                        tracing::debug!("MEASURE shim input_loop: ends: a resize frame could not be written");
                         return;
                     }
                 }
@@ -917,8 +957,18 @@ unsafe fn input_loop(
                     };
                     if gate.forward.load(Ordering::Relaxed) {
                         let sgr = enc.encode_sgr(&mev);
-                        if !sgr.is_empty() && write_data(tx, Stream::Pty, &sgr).is_err() {
-                            return;
+                        if !sgr.is_empty() {
+                            let written = write_data(tx, Stream::Pty, &sgr);
+                            tracing::debug!(
+                                "MEASURE shim input_loop: mouse encoded to {} byte(s) {}; frame written: {:?}",
+                                sgr.len(),
+                                crate::relay::hex_head(&sgr),
+                                written.as_ref().map_err(|e| format!("{e:#}"))
+                            );
+                            if written.is_err() {
+                                tracing::debug!("MEASURE shim input_loop: ends: a mouse frame could not be written");
+                                return;
+                            }
                         }
                     } else {
                         // Forwarding off: keep the encoder's view clean so a later enable
@@ -935,7 +985,13 @@ unsafe fn input_loop(
                 EVT_FOCUS if gate.focus.load(Ordering::Relaxed) => {
                     let focused = unsafe { rec.Event.FocusEvent }.bSetFocus.as_bool();
                     let seq: &[u8] = if focused { b"\x1b[I" } else { b"\x1b[O" };
-                    if write_data(tx, Stream::Pty, seq).is_err() {
+                    let written = write_data(tx, Stream::Pty, seq);
+                    tracing::debug!(
+                        "MEASURE shim input_loop: focus {focused} frame written: {:?}",
+                        written.as_ref().map_err(|e| format!("{e:#}"))
+                    );
+                    if written.is_err() {
+                        tracing::debug!("MEASURE shim input_loop: ends: a focus frame could not be written");
                         return;
                     }
                 }

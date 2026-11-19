@@ -85,9 +85,15 @@ fn refuse(rx: &mut ConnRx, tx: &mut ConnTx, control: &Control, sentence: &str) -
 /// process of the account can read another's environment), and what it routes is something the login already
 /// allowed.
 fn elevate(rx: &mut ConnRx, tx: &mut ConnTx, control: &Control, request: &ElevationRequest) -> anyhow::Result<()> {
+    tracing::debug!(
+        "MEASURE requests::elevate: request received (terminal={}, command {:?})",
+        request.terminal,
+        request.command
+    );
     let id = match request.check() {
         Ok(id) => id,
         Err(cause) => {
+            tracing::debug!("MEASURE requests::elevate: the request failed its check: {cause:#}");
             return Err(logout::fail_connection(
                 rx,
                 tx,
@@ -98,30 +104,50 @@ fn elevate(rx: &mut ConnRx, tx: &mut ConnTx, control: &Control, request: &Elevat
             ));
         }
     };
+    tracing::debug!("MEASURE requests::elevate: checked");
     if control.is_ending() {
+        tracing::debug!("MEASURE requests::elevate: the agent is ending; refusing");
         return logout::refuse_while_ending(rx, tx, control);
     }
     // A session that is being started waits here until its link exists; one this agent never gave out, or that is
     // over, is not there.
     let Some(hosted) = control.await_hosted(&id) else {
+        tracing::debug!("MEASURE requests::elevate: no hosted session found; refusing");
         return refuse(rx, tx, control, &text::elevation_not_hosted());
     };
-    if let Verdict::Refuse(sentence) = decide(hosted.policy, hosted.link.has_terminal(), request.terminal) {
+    tracing::debug!(
+        "MEASURE requests::elevate: hosted session found (policy {:?}, terminal {})",
+        hosted.policy,
+        hosted.link.has_terminal()
+    );
+    let verdict = decide(hosted.policy, hosted.link.has_terminal(), request.terminal);
+    tracing::debug!("MEASURE requests::elevate: verdict {verdict:?}");
+    if let Verdict::Refuse(sentence) = verdict {
         return refuse(rx, tx, control, &sentence);
     }
     // The slot is held while the command runs, and not while the client is waited for: the reply is written, and its
     // client waited for, with the slot free, so that the next `elevate` of the session is not refused for it.
     let answer = {
         let Some(_slot) = hosted.slot.try_take() else {
+            tracing::debug!("MEASURE requests::elevate: the slot is taken; refusing");
             return refuse(rx, tx, control, &text::elevation_in_progress());
         };
-        run_elevated(&hosted, tx, request, &id)
+        tracing::debug!("MEASURE requests::elevate: slot taken; running the command");
+        let answer = run_elevated(&hosted, tx, request, &id);
+        tracing::debug!("MEASURE requests::elevate: the run ended: {answer:?}; slot released next");
+        answer
     };
     // A client that could not be told its command had started: nothing more is written to it.
     let Some((sentence, code)) = answer else {
+        tracing::debug!("MEASURE requests::elevate: the client was never served; nothing is written");
         return Ok(());
     };
-    logout::reply_and_wait(rx, tx, control, &sentence, code)
+    let replied = logout::reply_and_wait(rx, tx, control, &sentence, code);
+    tracing::debug!(
+        "MEASURE requests::elevate: reply (code {code}) and wait ended: {:?}",
+        replied.as_ref().map_err(|e| format!("{e:#}"))
+    );
+    replied
 }
 
 /// Run the command of `request` for `hosted`, whose slot the caller holds, and say what to answer: the sentence (empty

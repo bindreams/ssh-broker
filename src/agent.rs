@@ -1348,31 +1348,43 @@ fn handle_pty(
             let mut sink = LinkInputSink {
                 link: Arc::clone(&link),
             };
+            tracing::debug!("MEASURE handle_pty input thread: started");
             pump_until_peer_gone(&mut rx, &mut fr, &mut sink);
+            tracing::debug!("MEASURE handle_pty input thread: pump_until_peer_gone returned; reaping the shell's tree");
             if let Some(w) = teardown_warning(reap_tree(&job)) {
                 tracing::error!("{w}");
             }
+            tracing::debug!("MEASURE handle_pty input thread: ends");
         })
     };
 
     // Do NOT `?` on the end: even when the wait fails the pseudoconsole is closed and the threads joined (see
     // `end_pty`) before this returns, or they would outlive `session` and touch closed handles.
     let ended = end_pty(session, &target, out_thread, || link.end_hosting());
+    tracing::debug!(
+        "MEASURE handle_pty: the shell's exit: {:?}",
+        ended.as_ref().map_err(|e| format!("{e:#}"))
+    );
     let code = *ended.as_ref().unwrap_or(&1);
     // The shell is gone and the output is drained, so the code is final and nothing else can still be writing
     // frames. The connection is the session's again by now, if `ssh-broker elevate --terminal` had it: the output
     // pump above could not end before, and `end_hosting` inside `end_pty` ended the command that held it, whoever
     // asked for it (see `elevation::run_hosted`), and returned only once that command had given it back.
     show_exit_notice(&link, Mode::Pty, configured.as_ref(), code);
+    tracing::debug!("MEASURE handle_pty: exit notice shown; sending Exit({code})");
     // FIN the write half only: the input pump keeps reading until the client closes, so for a
     // conforming client the socket never closes with unread input, which would reset it and
     // lose the EXIT frame.
     link.send_exit(code);
+    tracing::debug!("MEASURE handle_pty: Exit sent; ending the link");
     link.end();
+    tracing::debug!("MEASURE handle_pty: link ended; finishing the hang-up watch");
     if let Some(hangup) = hangup {
         hangup.finish();
     }
+    tracing::debug!("MEASURE handle_pty: hang-up watch finished; joining the input thread");
     let _ = in_thread.join();
+    tracing::debug!("MEASURE handle_pty: input thread joined");
     ended?;
     Ok(())
 }
@@ -1392,13 +1404,22 @@ fn end_pty(
     pump: std::thread::JoinHandle<()>,
     after_reap: impl FnOnce(),
 ) -> anyhow::Result<i32> {
+    tracing::debug!("MEASURE end_pty: waiting for the process");
     let waited = session.wait();
+    tracing::debug!(
+        "MEASURE end_pty: wait returned: {:?}",
+        waited.as_ref().map_err(|e| format!("{e:#}"))
+    );
     if let Some(w) = teardown_warning(reap_tree(&session.job())) {
         tracing::error!("{w}");
     }
+    tracing::debug!("MEASURE end_pty: tree reaped; after_reap (end_hosting) next");
     after_reap();
+    tracing::debug!("MEASURE end_pty: after_reap done; closing the target");
     target.close();
+    tracing::debug!("MEASURE end_pty: target closed; joining the output pump");
     let _ = pump.join();
+    tracing::debug!("MEASURE end_pty: output pump joined");
     // The writer is joined and the pump is, so nothing reads or writes the handles `session` closes.
     drop(session);
     Ok(waited?)
@@ -1547,8 +1568,23 @@ impl InputTarget for PtyTarget {
     fn input(&self, bytes: &[u8]) -> anyhow::Result<()> {
         // PTY input arrives pre-encoded (win32-input-mode); hand it straight to ConPTY#2.
         match &*self.writer.lock().unwrap_or_else(PoisonError::into_inner) {
-            Some(writer) => writer.write(bytes),
-            None => Ok(()),
+            Some(writer) => {
+                let result = writer.write(bytes);
+                tracing::debug!(
+                    "MEASURE PtyTarget::input: {} byte(s) {} handed to the writer: {:?}",
+                    bytes.len(),
+                    crate::relay::hex_head(bytes),
+                    result.as_ref().map_err(|e| format!("{e:#}"))
+                );
+                result
+            }
+            None => {
+                tracing::debug!(
+                    "MEASURE PtyTarget::input: {} byte(s) discarded: the writer is closed",
+                    bytes.len()
+                );
+                Ok(())
+            }
         }
     }
 
@@ -1557,7 +1593,10 @@ impl InputTarget for PtyTarget {
         // cannot close the HPCON mid-resize.
         let hpc = self.hpc.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(raw) = *hpc {
-            let _ = conpty::resize_pty(raw, cols, rows);
+            let result = conpty::resize_pty(raw, cols, rows);
+            tracing::debug!("MEASURE PtyTarget::resize {cols}x{rows}: {result:?}");
+        } else {
+            tracing::debug!("MEASURE PtyTarget::resize {cols}x{rows}: the pseudoconsole is closed");
         }
     }
 }
@@ -1571,9 +1610,20 @@ struct LinkInputSink {
 #[cfg(windows)]
 impl FrameSink for LinkInputSink {
     fn on_data(&mut self, _stream: Stream, bytes: &[u8]) -> anyhow::Result<()> {
-        self.link.route_input(bytes)
+        tracing::debug!(
+            "MEASURE LinkInputSink::on_data: {} byte(s) {}",
+            bytes.len(),
+            crate::relay::hex_head(bytes)
+        );
+        let result = self.link.route_input(bytes);
+        tracing::debug!(
+            "MEASURE LinkInputSink::on_data: routed: {:?}",
+            result.as_ref().map_err(|e| format!("{e:#}"))
+        );
+        result
     }
     fn on_resize(&mut self, r: Resize) -> anyhow::Result<()> {
+        tracing::debug!("MEASURE LinkInputSink::on_resize");
         self.link.resize(r);
         Ok(())
     }
@@ -1748,11 +1798,20 @@ fn start_hangup_watch(watcher: Option<(HangupWatcher, Waker)>, job: &Arc<cosca::
     let job = Arc::clone(job);
     let thread = std::thread::spawn(move || {
         // The wait also ends after a normal teardown.
-        end_of_watch(hangup.wait(), || {
+        tracing::debug!("MEASURE hang-up watcher: started");
+        let waited = hangup.wait();
+        tracing::debug!(
+            "MEASURE hang-up watcher: the wait returned: {:?}",
+            waited.as_ref().map_err(|e| e.to_string())
+        );
+        end_of_watch(waited, || {
+            tracing::debug!("MEASURE hang-up watcher: reaping the tree");
             if let Some(w) = teardown_warning(reap_tree(&job)) {
                 tracing::error!("{w}");
             }
+            tracing::debug!("MEASURE hang-up watcher: tree reaped");
         });
+        tracing::debug!("MEASURE hang-up watcher: finished");
     });
     Some(HangupGuard { waker, thread })
 }
@@ -1772,10 +1831,15 @@ impl HangupGuard {
     /// End the watch once the session has been shut down.
     fn finish(self) {
         let Self { waker, thread } = self;
+        tracing::debug!(
+            "MEASURE HangupGuard::finish: waking the watcher (thread already finished: {})",
+            thread.is_finished()
+        );
         // Wake explicitly: the shutdown alone does not wake the watcher's poll (see hangup).
         match waker.wake() {
             Ok(()) => {
                 let _ = thread.join();
+                tracing::debug!("MEASURE HangupGuard::finish: watcher joined");
             }
             // Dropping the waker closes the wake channel, which normally ends the watcher. If the
             // channel itself failed it may not, and a join could block until the peer's FIN. The
@@ -1803,24 +1867,34 @@ fn spawn_stream_pump(
     std::thread::spawn(move || {
         let mut buf = [0u8; 32 * 1024];
         let mut delivering = true;
+        let mut total = 0usize;
         loop {
             let n = conpty::read_handle(raw, &mut buf);
             if n == 0 {
                 break; // stream closed (exiting, or the pseudoconsole closed by teardown and drained to EOF)
             }
+            total += n;
             if !delivering {
                 continue; // draining, see above
             }
-            if link.deliver(carrier, stream, &buf[..n]).is_err() {
+            if let Err(e) = link.deliver(carrier, stream, &buf[..n]) {
+                tracing::debug!(
+                    "MEASURE spawn_stream_pump ({stream:?}, {carrier:?}, {raw:#x}): delivery of {n} byte(s) failed: {e:#}"
+                );
                 // The socket is gone. This is an independent detector, not a redundant
                 // one: the input pump's queue is bounded, so a command that ignores its stdin
                 // can still park that pump in a send and blind it to the socket. And keep READING: for a
                 // pseudoconsole, `ClosePseudoConsole` flushes conhost's pending output through the pipe, and
                 // abandoning it here lets it fill, and teardown then blocks inside the close.
+                tracing::debug!("MEASURE spawn_stream_pump ({stream:?}, {carrier:?}, {raw:#x}): running `gone`");
                 gone();
+                tracing::debug!("MEASURE spawn_stream_pump ({stream:?}, {carrier:?}, {raw:#x}): `gone` returned");
                 delivering = false;
             }
         }
+        tracing::debug!(
+            "MEASURE spawn_stream_pump ({stream:?}, {carrier:?}, {raw:#x}): the stream ended after {total} byte(s) read (still delivering: {delivering})"
+        );
     })
 }
 
@@ -1903,12 +1977,28 @@ impl HandleWriter {
         let (tx, rx) = std::sync::mpsc::sync_channel::<Option<Vec<u8>>>(16);
         let thread = std::thread::spawn(move || {
             let _owned = owned; // dropped on the way out, closing the child's stdin
+            tracing::debug!("MEASURE HandleWriter {raw:#x}: thread started");
             for msg in rx {
                 match msg {
-                    Some(bytes) if conpty::write_all_handle(raw, &bytes) => {}
-                    _ => break, // the write failed, or the peer signalled stdin-EOF
+                    Some(bytes) => {
+                        let ok = conpty::write_all_handle(raw, &bytes);
+                        tracing::debug!(
+                            "MEASURE HandleWriter {raw:#x}: wrote {} byte(s) {}: ok={ok}",
+                            bytes.len(),
+                            crate::relay::hex_head(&bytes)
+                        );
+                        if !ok {
+                            tracing::debug!("MEASURE HandleWriter {raw:#x}: thread ends: the write failed");
+                            break;
+                        }
+                    }
+                    None => {
+                        tracing::debug!("MEASURE HandleWriter {raw:#x}: thread ends: stdin-EOF marker");
+                        break;
+                    }
                 }
             }
+            tracing::debug!("MEASURE HandleWriter {raw:#x}: thread left its loop");
         });
         Self {
             tx: Some(tx),
@@ -1924,14 +2014,21 @@ impl HandleWriter {
             return Ok(()); // stdin already closed by the marker; further input is discarded
         };
         let stopped = || anyhow::anyhow!("the handle writer stopped");
-        match tx.try_send(Some(bytes.to_vec())) {
+        let queued = match tx.try_send(Some(bytes.to_vec())) {
             Ok(()) => Ok(()),
             Err(TrySendError::Full(msg)) => {
+                tracing::debug!("MEASURE HandleWriter::write: queue full, parking in the send");
                 self.parked.raise();
                 tx.send(msg).map_err(|_| stopped())
             }
             Err(TrySendError::Disconnected(_)) => Err(stopped()),
-        }
+        };
+        tracing::debug!(
+            "MEASURE HandleWriter::write: queued {} byte(s): {:?}",
+            bytes.len(),
+            queued.as_ref().map_err(|e| format!("{e:#}"))
+        );
+        queued
     }
 
     /// Close the underlying handle without ending the session.

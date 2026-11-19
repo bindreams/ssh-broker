@@ -199,13 +199,31 @@ impl Link {
             .map(|hosted| Arc::clone(&hosted.target));
         match (elevated, &self.session) {
             (Some(target), _) => {
+                tracing::debug!(
+                    "MEASURE Link::route_input: {} byte(s) go to the ELEVATED command",
+                    bytes.len()
+                );
                 if let Err(e) = target.input(bytes) {
                     tracing::debug!("the elevated command is ending; dropped its keys: {e:#}");
                 }
                 Ok(())
             }
-            (None, Some(target)) => target.input(bytes),
-            (None, None) => Ok(()),
+            (None, Some(target)) => {
+                tracing::debug!("MEASURE Link::route_input: {} byte(s) go to the SESSION", bytes.len());
+                let result = target.input(bytes);
+                tracing::debug!(
+                    "MEASURE Link::route_input: the session's target answered: {:?}",
+                    result.as_ref().map_err(|e| format!("{e:#}"))
+                );
+                result
+            }
+            (None, None) => {
+                tracing::debug!(
+                    "MEASURE Link::route_input: {} byte(s) go nowhere (no target)",
+                    bytes.len()
+                );
+                Ok(())
+            }
         }
     }
 
@@ -220,6 +238,12 @@ impl Link {
                 None => self.session.clone(),
             }
         };
+        tracing::debug!(
+            "MEASURE Link::resize {}x{}: target present: {}",
+            size.cols,
+            size.rows,
+            target.is_some()
+        );
         if let Some(target) = target {
             target.resize(size.cols, size.rows);
         }
@@ -234,12 +258,14 @@ impl Link {
     /// `end` itself, so a command that asks too late is ended as one hosted when the session ended is.
     pub(super) fn host_elevated(&self, target: ElevatedTarget, end: Killer) -> Option<ElevatedGuard<'_>> {
         debug_assert!(self.terminal, "a command was hosted on a link without a terminal");
+        tracing::debug!("MEASURE Link::host_elevated: entered");
         let applying = locked(&self.resizing);
         let (cols, rows) = {
             let mut state = locked(&self.state);
             if state.hosting_ended {
                 drop(state);
                 drop(applying);
+                tracing::debug!("MEASURE Link::host_elevated: left: hosting already ended; the command is ended");
                 end();
                 return None;
             }
@@ -253,6 +279,7 @@ impl Link {
         self.changed.notify_all();
         target.resize(cols, rows);
         drop(applying);
+        tracing::debug!("MEASURE Link::host_elevated: left: hosted, size {cols}x{rows}");
         Some(ElevatedGuard { link: self })
     }
 
@@ -265,6 +292,7 @@ impl Link {
     /// command's last output is written before the session's `Exit`. Nothing is waited for when nothing was hosted.
     /// No lock is held across the wait but the state lock the wait releases.
     pub(super) fn end_hosting(&self) {
+        tracing::debug!("MEASURE Link::end_hosting: entered");
         let end = {
             let mut state = locked(&self.state);
             state.hosting_ended = true;
@@ -272,18 +300,25 @@ impl Link {
         };
         // A deliver of the command's that waits for the screen is told there is none.
         self.changed.notify_all();
-        let Some(end) = end else { return };
+        let Some(end) = end else {
+            tracing::debug!("MEASURE Link::end_hosting: left: nothing was hosted");
+            return;
+        };
+        tracing::debug!("MEASURE Link::end_hosting: ending the hosted command");
         end();
         let mut state = locked(&self.state);
         while state.elevated.is_some() {
             state = self.changed.wait(state).unwrap_or_else(PoisonError::into_inner);
         }
+        tracing::debug!("MEASURE Link::end_hosting: left: the hosted command gave the connection back");
     }
 
     /// The session is over: every wait ends with an error and none begins.
     pub(super) fn end(&self) {
+        tracing::debug!("MEASURE Link::end: entered");
         locked(&self.state).ended = true;
         self.changed.notify_all();
+        tracing::debug!("MEASURE Link::end: left");
     }
 }
 
@@ -301,6 +336,7 @@ pub(super) struct ElevatedGuard<'a> {
 impl Drop for ElevatedGuard<'_> {
     fn drop(&mut self) {
         let link = self.link;
+        tracing::debug!("MEASURE ElevatedGuard::drop: entered");
         let _applying = locked(&link.resizing);
         let (hosted, (cols, rows)) = {
             let mut state = locked(&link.state);
@@ -312,6 +348,7 @@ impl Drop for ElevatedGuard<'_> {
         if let Some(session) = &link.session {
             session.resize(cols, rows);
         }
+        tracing::debug!("MEASURE ElevatedGuard::drop: left (session resized to {cols}x{rows})");
     }
 }
 

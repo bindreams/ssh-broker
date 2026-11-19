@@ -30,6 +30,7 @@ fn install((writer, guard): Sink) -> anyhow::Result<WorkerGuard> {
     tracing_subscriber::fmt()
         .with_writer(writer)
         .with_ansi(false)
+        .with_max_level(tracing::Level::DEBUG)
         .try_init()
         .map_err(|e| anyhow::anyhow!("a log subscriber is already installed in this process: {e}"))?;
     Ok(guard)
