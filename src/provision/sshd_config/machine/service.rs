@@ -22,7 +22,8 @@
 //! - The service says running before sshd has read its configuration (it reports it, then runs `sshd_main`), so a
 //!   start is over only when its process owns a listening socket or has exited ([`listening::listens`]).
 //! - A STOP answered with 1053 that leaves the service running may still be taking sshd down, so the process held
-//!   before it is waited for; any other STOP that leaves the service running did nothing.
+//!   before it is waited for, and then until the service manager no longer says the service runs in it (it sees
+//!   an exit after the process object is signalled); any other STOP that leaves the service running did nothing.
 
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -129,6 +130,13 @@ fn waits_for_the_old_process(reply: Option<u32>, state: ServiceState) -> bool {
     reply == Some(ERROR_SERVICE_REQUEST_TIMEOUT.0) && state == ServiceState::Running
 }
 
+/// Whether the service manager, which says the service is in `state` with the process id `process_id`, still
+/// says that it runs in `gone`, a process that has exited. Running with another id is a restart by the service
+/// manager's recovery, and every other state says the exit was seen.
+fn still_runs_in(state: u32, process_id: u32, gone: u32) -> bool {
+    state == SERVICE_RUNNING.0 && process_id == gone
+}
+
 /// A settled state with the exit codes the service manager recorded with it.
 struct Settled {
     state: ServiceState,
@@ -166,7 +174,7 @@ impl SshdService {
     /// that it is time to read again.
     fn settle(&self) -> anyhow::Result<Settled> {
         loop {
-            let registration = Registration::arm()?;
+            let registration = Registration::arm(SETTLED_MASK)?;
             let status = self.status()?;
             match classify(status.dwCurrentState.0) {
                 Reading::Settled(state) => {
@@ -214,9 +222,25 @@ impl SshdService {
         })
     }
 
+    /// Wait, with no bound, until the service manager no longer says that the service runs in `gone`, a process
+    /// that has exited. The service manager sees an exit a moment after the process object is signalled, and
+    /// until then a read still says running, in the dead process. The registration is made before each read, so
+    /// a change between the two is delivered.
+    fn left_by(&self, gone: &Process) -> anyhow::Result<()> {
+        loop {
+            let registration = Registration::arm(SERVICE_NOTIFY_STOPPED)?;
+            let status = self.status()?;
+            if !still_runs_in(status.dwCurrentState.0, status.dwProcessId, gone.pid) {
+                return Ok(());
+            }
+            registration.wait();
+        }
+    }
+
     /// The STOP was answered with `reply` (1053) and the service reads running: sshd's handler did not answer in
     /// time, and the process held before the STOP may be on its way down unreported. Wait, with no bound, for
-    /// it to exit, and read the state once more. `Unknown` when there is no process to wait for or a read
+    /// it to exit and for the service manager to see that it has (it sees an exit after the process object is
+    /// signalled), and read the state once more. `Unknown` when there is no process to wait for or a read
     /// fails: the flow never says that the service runs with its earlier configuration after a 1053.
     fn after_a_stop_that_timed_out(&self, held: Option<Process>, reply: &str) -> StopOutcome {
         let unknown = |what: String| StopOutcome::Unknown {
@@ -227,6 +251,10 @@ impl SshdService {
         };
         if let Err(e) = process.wait_for_exit() {
             return unknown(format!("{e:#}"));
+        }
+        // The process stays held through the wait, so that its id is not given to another.
+        if let Err(e) = self.left_by(&process) {
+            return unknown(format!("the process exited, but the state cannot be read: {e:#}"));
         }
         match self.settle() {
             Ok(_) => StopOutcome::Stopped,
@@ -331,7 +359,7 @@ unsafe extern "system" fn on_notification(parameter: *const c_void) {
     }
 }
 
-/// One registration of a notification for the settled states, on handles of its own.
+/// One registration of a notification for the states in a mask, on handles of its own.
 ///
 /// The registration ends when its service handle is closed, and only a close that succeeded promises that no
 /// further notification is queued. So the drop closes that handle itself and reads the result: after a failed
@@ -347,7 +375,7 @@ impl Registration {
     /// Open fresh handles and register on them. The service manager answers
     /// `ERROR_SERVICE_NOTIFY_CLIENT_LAGGING` when it is behind; its documented remedy is to close the handles,
     /// open new ones and register again, so that is what is done, for as long as it answers so.
-    fn arm() -> anyhow::Result<Registration> {
+    fn arm(mask: SERVICE_NOTIFY) -> anyhow::Result<Registration> {
         loop {
             let (manager, service) = open_handles(SERVICE_QUERY_STATUS)?;
             let notification = Box::into_raw(Box::new(Notification {
@@ -362,7 +390,7 @@ impl Registration {
             // own `fired`.
             let code = unsafe {
                 (*notification).buffer.pContext = (&raw mut (*notification).fired).cast();
-                NotifyServiceStatusChangeW(service.0, SETTLED_MASK, (&raw mut (*notification).buffer).cast_const())
+                NotifyServiceStatusChangeW(service.0, mask, (&raw mut (*notification).buffer).cast_const())
             };
             let registration = Registration {
                 notification,

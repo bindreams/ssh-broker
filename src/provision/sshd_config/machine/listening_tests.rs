@@ -23,6 +23,25 @@ fn child_without_sockets() -> Child {
 }
 
 #[test]
+fn rows_that_fit_in_the_buffer_are_read() {
+    // A 4-byte count, then rows of 24 bytes: 4 + 3 * 24 = 76 bytes, held by 19 `u32`s.
+    assert!(rows_fit(19, 4, 24, 3));
+    assert!(rows_fit(19, 4, 24, 0));
+}
+
+#[test]
+fn one_row_more_than_the_buffer_holds_is_refused() {
+    assert!(!rows_fit(19, 4, 24, 4));
+    assert!(!rows_fit(19, 4, 24, usize::MAX));
+}
+
+#[test]
+fn zero_rows_in_a_buffer_that_holds_only_the_count_fit() {
+    assert!(rows_fit(1, 4, 24, 0));
+    assert!(!rows_fit(1, 4, 24, 1));
+}
+
+#[test]
 fn a_process_with_an_ipv4_listener_listens() {
     let _listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     assert!(listens(std::process::id()).unwrap());

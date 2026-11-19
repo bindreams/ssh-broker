@@ -41,31 +41,56 @@ fn listener_owners(family: u32) -> anyhow::Result<Vec<u32>> {
         }
         buffer.resize((size as usize).div_ceil(size_of::<u32>()), 0);
     }
+    // A success that left nothing in the buffer names no table: no listeners, and nothing is dereferenced.
+    if buffer.is_empty() {
+        return Ok(Vec::new());
+    }
     let table = buffer.as_ptr();
+    let (rows_offset, row_size) = if family == AF_INET.0 as u32 {
+        (
+            offset_of!(MIB_TCPTABLE_OWNER_PID, table),
+            size_of::<MIB_TCPROW_OWNER_PID>(),
+        )
+    } else {
+        (
+            offset_of!(MIB_TCP6TABLE_OWNER_PID, table),
+            size_of::<MIB_TCP6ROW_OWNER_PID>(),
+        )
+    };
+    // SAFETY: `buffer` is not empty, so it holds the count, the first field of both table types (`u32`-aligned, as
+    // the buffer is).
+    let count = unsafe { (*table.cast::<MIB_TCPTABLE_OWNER_PID>()).dwNumEntries } as usize;
+    anyhow::ensure!(
+        rows_fit(buffer.len(), rows_offset, row_size, count),
+        "the listening-socket table names more rows than it holds"
+    );
     // SAFETY: the call filled `buffer` with a `MIB_TCPTABLE_OWNER_PID` or a `MIB_TCP6TABLE_OWNER_PID` (by `family`):
-    // a count, then that many rows, all inside `buffer`. The rows are reached from the pointer to the whole
-    // buffer, for the table type declares room for one.
+    // a count, then that many rows. `rows_fit` has shown that the `count` rows lie inside `buffer`. The rows are
+    // reached from the pointer to the whole buffer, for the table type declares room for one.
     Ok(unsafe {
         if family == AF_INET.0 as u32 {
-            let count = (*table.cast::<MIB_TCPTABLE_OWNER_PID>()).dwNumEntries as usize;
-            let rows = table
-                .byte_add(offset_of!(MIB_TCPTABLE_OWNER_PID, table))
-                .cast::<MIB_TCPROW_OWNER_PID>();
+            let rows = table.byte_add(rows_offset).cast::<MIB_TCPROW_OWNER_PID>();
             std::slice::from_raw_parts(rows, count)
                 .iter()
                 .map(|row| row.dwOwningPid)
                 .collect()
         } else {
-            let count = (*table.cast::<MIB_TCP6TABLE_OWNER_PID>()).dwNumEntries as usize;
-            let rows = table
-                .byte_add(offset_of!(MIB_TCP6TABLE_OWNER_PID, table))
-                .cast::<MIB_TCP6ROW_OWNER_PID>();
+            let rows = table.byte_add(rows_offset).cast::<MIB_TCP6ROW_OWNER_PID>();
             std::slice::from_raw_parts(rows, count)
                 .iter()
                 .map(|row| row.dwOwningPid)
                 .collect()
         }
     })
+}
+
+/// Whether `count` rows of `row_size` bytes, starting `rows_offset` bytes in, lie inside a buffer of
+/// `buffer_words` `u32`s.
+fn rows_fit(buffer_words: usize, rows_offset: usize, row_size: usize, count: usize) -> bool {
+    count
+        .checked_mul(row_size)
+        .and_then(|rows| rows.checked_add(rows_offset))
+        .is_some_and(|end| end <= buffer_words.saturating_mul(size_of::<u32>()))
 }
 
 #[cfg(test)]

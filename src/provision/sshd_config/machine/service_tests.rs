@@ -55,6 +55,33 @@ fn a_1053_that_leaves_sshd_paused_or_stopped_is_not_waited_on() {
     }
 }
 
+// the wait for the service manager to see an exit -----
+
+#[test]
+fn a_service_running_in_the_process_that_exited_is_waited_for() {
+    assert!(still_runs_in(SERVICE_RUNNING.0, 4242, 4242));
+}
+
+#[test]
+fn a_service_running_in_another_process_is_not_waited_for() {
+    // The service manager's recovery restarted it.
+    assert!(!still_runs_in(SERVICE_RUNNING.0, 4243, 4242));
+}
+
+#[test]
+fn a_service_that_is_stopped_or_pending_in_the_process_that_exited_is_not_waited_for() {
+    for state in [
+        SERVICE_STOPPED,
+        SERVICE_START_PENDING,
+        SERVICE_STOP_PENDING,
+        SERVICE_CONTINUE_PENDING,
+        SERVICE_PAUSE_PENDING,
+        SERVICE_PAUSED,
+    ] {
+        assert!(!still_runs_in(state.0, 4242, 4242), "state {}", state.0);
+    }
+}
+
 // the wait for a started process -----
 
 /// The looks at a process's sockets are of this machine's real table, and the processes are this test's own.
