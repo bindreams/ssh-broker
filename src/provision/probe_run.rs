@@ -265,7 +265,7 @@ fn drive(exe: &Path, elevation: ElevationPolicy, link: &ProbeLink) -> Result<Ans
         .and_then(|folder| folder.connect())
         .context("connect to agent")
         .map_err(Stop::NotStarted)?;
-    let (rx, tx) = afunix::split(sock).map_err(Stop::NotStarted)?;
+    let (rx, tx) = afunix::split(sock).map_err(|e| Stop::NotStarted(e.into()))?;
     let hs = super::probe_handshake(exe, elevation, link);
     let mut out = Vec::new();
     let mut err = Vec::new();

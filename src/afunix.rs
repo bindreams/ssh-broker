@@ -12,6 +12,11 @@
 //! again. The wait is only a sleep that may end early; what it reports is never acted on (see
 //! [`wait`] for the one thing it is looked at for).
 //!
+//! A connection is one socket handle, [`Conn`], that its halves, its hang-up watcher and its panic
+//! reply share. Nothing duplicates it: a second handle would be one more thing a child process could
+//! inherit, and a child that holds a connection open after every handle of ours is closed keeps its
+//! reader from seeing the end.
+//!
 //! What does not go through the loop: [`connect`], and the liveness probe of [`Listener::bind`] that
 //! calls it, are blocking connects. They wait for the listener's answer, not for data or a close,
 //! and no lost wake of one has been seen.
@@ -20,6 +25,7 @@ use socket2::{Domain, SockAddr, Socket, Type};
 use std::cell::Cell;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::socket_loc::Integrity;
@@ -140,7 +146,7 @@ impl Listener {
     /// child spawned on another thread in between would inherit it).
     ///
     /// The connection's blocking mode is the OS's to say (some platforms hand on the listener's); it
-    /// becomes non-blocking in [`split`] and [`try_split`], which every reader and writer goes through.
+    /// becomes non-blocking in [`Conn::new`], which every reader and writer goes through.
     pub fn accept(&self) -> Result<Socket, AcceptError> {
         finish_accept(accept_waiting(&self.sock), harden_accepted)
     }
@@ -221,7 +227,7 @@ fn finish_accept(
 }
 
 /// Sort an `accept` failure by Winsock's documented causes. A peer that reset or aborted a queued
-/// connection is that connection's loss; `WSAEINTR` is an interruption; `WSAEMFILE` and
+/// connection is that connection's loss; an interruption ([`is_interruption`]) is to be retried; `WSAEMFILE` and
 /// `WSAENOBUFS` are exhaustion; everything else (not listening, not a socket, the network down) is
 /// a broken listener. That includes `WSAEWOULDBLOCK` and `WSAEINPROGRESS`: the first is the
 /// non-blocking listener's "nothing yet", which [`accept_waiting`] waits out and never hands on, and
@@ -229,20 +235,20 @@ fn finish_accept(
 /// can reach this function.
 fn classify_accept_error(e: std::io::Error) -> AcceptError {
     use std::io::ErrorKind;
-    match e.kind() {
-        ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted => return AcceptError::Connection(e.into()),
-        ErrorKind::Interrupted => return AcceptError::Interrupted(e),
-        _ => {}
+    if is_interruption(&e) {
+        return AcceptError::Interrupted(e);
     }
-    by_winsock_code(e)
+    match e.kind() {
+        ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted => AcceptError::Connection(e.into()),
+        _ => by_winsock_code(e),
+    }
 }
 
 /// The Winsock codes `std` has no `ErrorKind` for, by what they mean for `accept`.
 #[cfg(windows)]
 fn by_winsock_code(e: std::io::Error) -> AcceptError {
-    use windows::Win32::Networking::WinSock::{WSAEINPROGRESS, WSAEINTR, WSAEMFILE, WSAENOBUFS, WSAEWOULDBLOCK};
+    use windows::Win32::Networking::WinSock::{WSAEINPROGRESS, WSAEMFILE, WSAENOBUFS, WSAEWOULDBLOCK};
     match e.raw_os_error() {
-        Some(code) if code == WSAEINTR.0 => AcceptError::Interrupted(e),
         Some(code) if code == WSAEMFILE.0 || code == WSAENOBUFS.0 => AcceptError::Exhausted { code, source: e },
         Some(code) if code == WSAEWOULDBLOCK.0 || code == WSAEINPROGRESS.0 => {
             AcceptError::Fatal(anyhow::Error::new(e).context(format!(
@@ -320,158 +326,72 @@ pub(crate) fn connect(path: &Path) -> anyhow::Result<Socket> {
 /// spawned child — otherwise a child (the brokered shell) would inherit the listening
 /// socket or another session's connection, defeating the ACL boundary.
 #[cfg(windows)]
-fn set_no_inherit(sock: &Socket) -> anyhow::Result<()> {
+fn set_no_inherit(sock: &Socket) -> std::io::Result<()> {
     use std::os::windows::io::AsRawSocket;
     use windows::Win32::Foundation::{HANDLE, HANDLE_FLAG_INHERIT, HANDLE_FLAGS, SetHandleInformation};
     let handle = HANDLE(sock.as_raw_socket() as usize as *mut core::ffi::c_void);
-    unsafe {
-        SetHandleInformation(handle, HANDLE_FLAG_INHERIT.0, HANDLE_FLAGS(0))?;
-    }
-    Ok(())
+    // SAFETY: `handle` is the open socket of `sock`.
+    unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT.0, HANDLE_FLAGS(0)) }.map_err(std::io::Error::from)
 }
 
-/// A new handle on the same connection as `sock`, which no child process can inherit at any moment.
-/// Every duplicate of a connection's socket is made here.
+/// A connection: one socket, non-blocking and not inheritable, shared by its halves and by whoever holds a
+/// clone; it closes when the last is dropped.
 ///
-/// `Socket::try_clone` is not used: on Windows its result is born inheritable (measured), and
-/// clearing the flag afterwards leaves a window in which a child started on another thread gets the
-/// duplicate. That child holds the connection open after every handle of ours is closed, and when it
-/// ends the system resets the connection under a reader who was waiting for its end. Here the
-/// duplicate is made with `bInheritHandle` false. Off Windows `try_clone` is `F_DUPFD_CLOEXEC`, which
-/// sets close-on-exec in the same call.
-///
-/// A shutdown through either handle is the connection's, and so is the mode (see [`split`]); closing
-/// one handle leaves the other open.
-pub(crate) fn duplicate(sock: &Socket) -> std::io::Result<Socket> {
-    #[cfg(windows)]
-    {
-        use std::os::windows::io::{AsRawSocket, FromRawSocket};
-        use windows::Win32::Foundation::{DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE};
-        use windows::Win32::System::Threading::GetCurrentProcess;
-        let source = HANDLE(sock.as_raw_socket() as usize as *mut core::ffi::c_void);
-        let mut copy = HANDLE::default();
-        // SAFETY: `source` is the open socket of `sock`, both processes are this one, and `copy` is a
-        // valid out pointer.
-        unsafe {
-            DuplicateHandle(
-                GetCurrentProcess(),
-                source,
-                GetCurrentProcess(),
-                &mut copy,
-                0,
-                false,
-                DUPLICATE_SAME_ACCESS,
-            )
-        }
-        .map_err(std::io::Error::from)?;
-        // SAFETY: `copy` is a socket handle that nothing else owns.
-        Ok(unsafe { Socket::from_raw_socket(copy.0 as usize as u64) })
+/// Every holder sees the connection's state, not a copy of it: a shutdown through any share is the
+/// connection's, and so is the mode. `Socket::try_clone` and `DuplicateHandle` are not used to make a
+/// second handle (see the module doc): on Windows a `try_clone` is born inheritable, and Microsoft's
+/// documentation says not to duplicate sockets.
+#[derive(Clone)]
+pub struct Conn(Arc<Socket>);
+
+impl Conn {
+    /// Make `sock` a connection: non-blocking (a blocking `recv` is what the transport abolishes, and on
+    /// a blocking socket the read limit would be inert), then, on Windows, not inheritable. The inherit
+    /// flag is cleared here and not relied on from `accept` or `connect`, because this is `pub`. An
+    /// error is one of those two steps refused, and the socket is dropped, so closed.
+    pub fn new(sock: Socket) -> std::io::Result<Conn> {
+        sock.set_nonblocking(true)?;
+        #[cfg(windows)]
+        set_no_inherit(&sock)?;
+        Ok(Conn(Arc::new(sock)))
     }
-    #[cfg(not(windows))]
-    sock.try_clone()
+
+    /// Split into a read half and a write half, so that one thread can `pump_decode` while another
+    /// writes frames, mirroring the relay's two-pump model. Both are shares of this connection.
+    pub fn split(self) -> (ConnRx, ConnTx) {
+        (
+            ConnRx {
+                conn: self.clone(),
+                limit: Cell::new(None),
+            },
+            ConnTx(self),
+        )
+    }
+
+    fn socket(&self) -> &Socket {
+        &self.0
+    }
+}
+
+/// What a poll on the connection waits on: the one socket every share has.
+#[cfg(windows)]
+impl std::os::windows::io::AsRawSocket for Conn {
+    fn as_raw_socket(&self) -> std::os::windows::io::RawSocket {
+        std::os::windows::io::AsRawSocket::as_raw_socket(&*self.0)
+    }
 }
 
 /// Read half of a split connection (mirrors the relay test transport's read half).
 pub struct ConnRx {
-    sock: Socket,
+    conn: Conn,
     limit: Cell<Option<Duration>>,
 }
 /// Write half of a split connection.
-pub struct ConnTx(Socket);
+pub struct ConnTx(Conn);
 
-/// Split a connected socket into independent read/write halves, each owning a dup'd OS
-/// handle, so one thread can `pump_decode` while another writes frames — mirroring the
-/// relay's two-pump model.
-///
-/// Both halves are non-blocking, and that is one mode for the connection: the mode belongs to the
-/// socket and not to the handle (measured on Windows), so a handle of it that sets the mode back
-/// (a `try_clone_socket` copy) undoes it for the halves.
-pub fn split(sock: Socket) -> anyhow::Result<(ConnRx, ConnTx)> {
-    try_split(sock).map_err(|(_, e)| e)
-}
-
-/// A connection that [`try_split`] could not split: both directions on the one socket, for a party
-/// that has to answer it all the same.
-pub struct Whole {
-    sock: Socket,
-    limit: Cell<Option<Duration>>,
-}
-
-impl Whole {
-    /// Wrap `sock`, making it non-blocking first (a blocking `recv` is what the transport abolishes,
-    /// and on a blocking socket the read limit would be inert). So no `Whole` is on a blocking socket,
-    /// except the one [`try_split`] gives back when the socket refuses the mode.
-    pub fn of(sock: Socket) -> std::io::Result<Whole> {
-        sock.set_nonblocking(true)?;
-        Ok(Whole::as_is(sock))
-    }
-
-    fn as_is(sock: Socket) -> Whole {
-        Whole {
-            sock,
-            limit: Cell::new(None),
-        }
-    }
-
-    /// See [`ConnRx::set_read_timeout`].
-    pub fn set_read_timeout(&self, limit: Option<Duration>) {
-        self.limit.set(limit);
-    }
-
-    /// Send FIN on the write direction.
-    pub fn shutdown_write(&self) -> anyhow::Result<()> {
-        self.sock.shutdown(std::net::Shutdown::Write)?;
-        Ok(())
-    }
-}
-
-impl Read for &Whole {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        read_waiting(&self.sock, buf, self.limit.get())
-    }
-}
-
-impl Write for &Whole {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        write_waiting(&self.sock, buf)
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        (&self.sock).flush()
-    }
-}
-
-/// [`split`] that gives the connection back, with the reason, when it cannot be split.
-///
-/// The socket is made non-blocking first, so the connection given back is non-blocking unless that
-/// was the failure. When the socket refuses the mode, the caller gets a `Whole` whose reads may block
-/// and whose read limit does not apply: nothing better can be made of it, and the caller answers it
-/// and closes it.
-pub fn try_split(sock: Socket) -> Result<(ConnRx, ConnTx), (Whole, anyhow::Error)> {
-    if let Err(e) = sock.set_nonblocking(true) {
-        return Err((Whole::as_is(sock), e.into()));
-    }
-    // Callers should hand in an already-cleared socket (from accept/connect), but split is `pub` and
-    // must not depend on that. The write half is born not inheritable (see [`duplicate`]).
-    #[cfg(windows)]
-    if let Err(e) = set_no_inherit(&sock) {
-        return Err((Whole::as_is(sock), e));
-    }
-    let write_half = match duplicate(&sock) {
-        Ok(write_half) => write_half,
-        Err(e) => return Err((Whole::as_is(sock), e.into())),
-    };
-    // Said on both halves, though it is one mode for the socket (see `split`), so that nothing here
-    // rests on that.
-    if let Err(e) = write_half.set_nonblocking(true) {
-        return Err((Whole::as_is(sock), e.into()));
-    }
-    Ok((
-        ConnRx {
-            sock,
-            limit: Cell::new(None),
-        },
-        ConnTx(write_half),
-    ))
+/// [`Conn::new`] and [`Conn::split`], for a caller that gives no share of the connection away.
+pub fn split(sock: Socket) -> std::io::Result<(ConnRx, ConnTx)> {
+    Conn::new(sock).map(Conn::split)
 }
 
 impl ConnRx {
@@ -490,8 +410,8 @@ impl ConnRx {
 /// It is the latency of a wake the OS lost (a blocking call on a Windows AF_UNIX socket can miss
 /// one), never a bound and never proof of anything: a wait that ends by this slice proves nothing,
 /// and the loop has no cap. 100 ms is below what a person notices when a prompt ends, and costs
-/// about ten wakeups a second per idle waiting thread. It is also the pause of a wait whose poll
-/// answered at once with something other than what was asked (see [`wait`]), so that such a socket
+/// about ten wakeups a second per idle waiting thread. It is also the pause of a write whose poll
+/// answered at once with something other than what was asked (see [`pauses`]), so that such a socket
 /// is looked at about once a slice and not in a spin.
 pub(crate) const RECHECK_EVERY: Duration = Duration::from_millis(100);
 
@@ -507,16 +427,6 @@ enum IoKind {
 /// called again, which is what finds data, the close, or a shutdown that the wait did not wake for.
 /// A limit that has passed is `TimedOut`, after one more `recv`. Every other result is `recv`'s.
 fn read_waiting(sock: &Socket, buf: &mut [u8], limit: Option<Duration>) -> std::io::Result<usize> {
-    read_waiting_by(sock, buf, limit, wait)
-}
-
-/// [`read_waiting`] with the wait as a parameter, so that a test can count the turns of the loop.
-fn read_waiting_by(
-    sock: &Socket,
-    buf: &mut [u8],
-    limit: Option<Duration>,
-    mut wait: impl FnMut(&Socket, IoKind, Duration) -> std::io::Result<()>,
-) -> std::io::Result<usize> {
     // A limit too long to be a point in time is no limit.
     let deadline = limit.and_then(|limit| Instant::now().checked_add(limit));
     loop {
@@ -545,7 +455,7 @@ fn write_waiting(sock: &Socket, buf: &[u8]) -> std::io::Result<usize> {
     write_waiting_by(sock, buf, wait)
 }
 
-/// [`write_waiting`] with the wait as a parameter, as [`read_waiting_by`].
+/// [`write_waiting`] with the wait as a parameter, so that a test can count the turns of the loop.
 fn write_waiting_by(
     sock: &Socket,
     buf: &[u8],
@@ -564,12 +474,18 @@ fn write_waiting_by(
 /// Sleep until `sock` may be ready for `kind`, or `timeout` has passed, whichever is first. What
 /// the OS says is not acted on: the caller calls again. An error is the poll's own failing.
 ///
-/// The one thing read from the poll's answer is whether it slept for what was asked. A poll that
-/// answers at once with something else (Windows reports a peer's half-close whatever events were
-/// asked for, while a `send` into a full buffer still finds no room) would turn the caller's loop
-/// into a spin, so then the rest of `timeout` is a plain pause. That pause proves nothing, as the
-/// poll's sleep proves nothing: the caller still makes its call, at most about once a slice in that
-/// state and at once when the event asked for is reported.
+/// The one thing read from the poll's answer is whether a write's poll slept for what was asked (see
+/// [`pauses`]). A write poll that answers at once with something else (Windows reports a peer's
+/// half-close whatever events were asked for, while a `send` into a full buffer still finds no room)
+/// would turn the caller's loop into a spin, so then the rest of `timeout` is a plain pause. That pause
+/// proves nothing, as the poll's sleep proves nothing: the caller still makes its call, at most about
+/// once a slice in that state and at once when the event asked for is reported. A read does not pause.
+///
+/// On Windows a write whose peer has half-closed its sending side and still reads moves about one send
+/// buffer per [`RECHECK_EVERY`]: `WSAPoll` reports the half-close at once whatever was asked, so the wait
+/// pauses the rest of the slice. No client of ssh-broker reads after half-closing; the shim's input
+/// written between the agent's Exit and its reading of it meets this, and goes to a session that has
+/// ended.
 #[cfg(windows)]
 fn wait(sock: &Socket, kind: IoKind, timeout: Duration) -> std::io::Result<()> {
     use std::os::windows::io::AsRawSocket;
@@ -594,13 +510,13 @@ fn wait(sock: &Socket, kind: IoKind, timeout: Duration) -> std::io::Result<()> {
         // An interruption ended the sleep early, which any end does.
         return if is_interruption(&e) { Ok(()) } else { Err(e) };
     }
-    if rc > 0 && fds[0].revents.0 & events.0 == 0 {
+    if rc > 0 && pauses(kind, fds[0].revents.0 & events.0 != 0) {
         pause_rest(started, timeout);
     }
     Ok(())
 }
 
-/// [`wait`] with `poll`, which pauses in the same case.
+/// [`wait`] with `poll`, which pauses by the same rule.
 #[cfg(unix)]
 fn wait(sock: &Socket, kind: IoKind, timeout: Duration) -> std::io::Result<()> {
     use std::os::fd::AsRawFd;
@@ -622,10 +538,20 @@ fn wait(sock: &Socket, kind: IoKind, timeout: Duration) -> std::io::Result<()> {
         // A signal ended the sleep early, which any end does.
         return if is_interruption(&e) { Ok(()) } else { Err(e) };
     }
-    if rc > 0 && fds[0].revents & events == 0 {
+    if rc > 0 && pauses(kind, fds[0].revents & events != 0) {
         pause_rest(started, timeout);
     }
     Ok(())
+}
+
+/// Whether a wait whose poll returned before `timeout` pauses for the rest of it: only a write, and
+/// only when the poll did not report the event asked (`asked_reported`). A read never pauses: a
+/// peer's close wakes the poll with the hang-up alone (measured on Windows, for a close and for a
+/// half-close), and the `recv` that follows reports the end at once, so a pause would delay every
+/// clean close by up to [`RECHECK_EVERY`]. The spin the pause prevents exists only for a write, which
+/// a full send buffer keeps from sending whatever the poll says (see [`wait`]).
+fn pauses(kind: IoKind, asked_reported: bool) -> bool {
+    matches!(kind, IoKind::Write) && !asked_reported
 }
 
 /// Pause for what is left of `timeout` since `started`. It is a plain pause between two looks at the
@@ -635,8 +561,9 @@ fn pause_rest(started: Instant, timeout: Duration) {
 }
 
 /// Whether `e` says that a call was interrupted before it did anything. `std` has no `ErrorKind` for
-/// Winsock's `WSAEINTR`, so on Windows the code is what says it.
-fn is_interruption(e: &std::io::Error) -> bool {
+/// Winsock's `WSAEINTR`, so on Windows the code is what says it. Every call that can be interrupted
+/// (`accept`, the poll of a wait, the hang-up watcher's poll) asks here.
+pub(crate) fn is_interruption(e: &std::io::Error) -> bool {
     #[cfg(windows)]
     if e.raw_os_error() == Some(windows::Win32::Networking::WinSock::WSAEINTR.0) {
         return true;
@@ -652,48 +579,46 @@ fn whole_milliseconds_up(limit: Duration) -> Duration {
 }
 
 impl ConnTx {
-    /// A new handle on the same underlying socket, for a thread that must watch the connection
-    /// without owning one of the split halves.
-    ///
-    /// Not inheritable, like every duplicate (see [`duplicate`]).
-    pub fn try_clone_socket(&self) -> std::io::Result<Socket> {
-        duplicate(&self.0)
+    /// The connection this half is a share of, to give a share to a holder that is not a half (the
+    /// hang-up watcher, the panic reply).
+    pub fn conn(&self) -> &Conn {
+        &self.0
     }
 
-    /// Send FIN on the write half. A duplicate does NOT FIN on drop, so without an
-    /// explicit shutdown the peer would block forever and never observe `PeerClosed`.
+    /// Send FIN on the write half. Dropping a share does not FIN while another share is held, so
+    /// without an explicit shutdown the peer would block forever and never observe `PeerClosed`.
     pub fn shutdown_write(&self) -> anyhow::Result<()> {
-        self.0.shutdown(std::net::Shutdown::Write)?;
+        self.0.socket().shutdown(std::net::Shutdown::Write)?;
         Ok(())
     }
 
     /// Shut down both directions of the connection: FIN the write side AND end a read of the OTHER
-    /// split half. A read that is waiting on the other half does not wake for this (measured on
-    /// Windows: a poll on a duplicate does not), but its next re-check, at most [`RECHECK_EVERY`] later,
-    /// calls `recv` again, and `recv` on the shared socket reports the end. `split` uses
-    /// [`duplicate`]: both halves are handles over one underlying socket.
+    /// split half. A read that is already waiting does not wake for this unless input is unread
+    /// (measured on Windows), but its next re-check, at most [`RECHECK_EVERY`] later, calls `recv`
+    /// again, and `recv` reports the end. Both halves are shares of one socket.
     ///
     /// Not for a peer that may still be sending: closing with its input unread resets the
     /// connection and can lose the final frame. Use [`Self::shutdown_write`] and read until the
     /// peer is gone.
     pub fn shutdown_both(&self) -> anyhow::Result<()> {
-        self.0.shutdown(std::net::Shutdown::Both)?;
+        self.0.socket().shutdown(std::net::Shutdown::Both)?;
         Ok(())
     }
 }
 
 impl Read for ConnRx {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        read_waiting(&self.sock, buf, self.limit.get())
+        read_waiting(self.conn.socket(), buf, self.limit.get())
     }
 }
 
 impl Write for ConnTx {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        write_waiting(&self.0, buf)
+        write_waiting(self.0.socket(), buf)
     }
     fn flush(&mut self) -> std::io::Result<()> {
-        self.0.flush()
+        let mut socket = self.0.socket();
+        socket.flush()
     }
 }
 

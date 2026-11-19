@@ -198,25 +198,23 @@ fn a_write_waiting_for_room_does_not_spin_when_the_peer_has_half_closed_and_does
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A `Whole` made of a blocking socket would read with the blocking `recv`, and its read limit would be
-/// inert: `of` makes the socket non-blocking itself.
-#[cfg(windows)]
+/// A read whose peer has closed is woken by the hang-up alone, and its next `recv` reports the end at once:
+/// pausing for the rest of the slice would delay every clean close. Only a write, which a full buffer
+/// keeps from sending whatever the poll says, has a spin to prevent.
 #[test]
-fn a_whole_made_of_a_blocking_socket_does_not_block_a_read() {
-    use std::io::Read;
-    let (server, client, dir) = crate::test_support::raw_socket_pair("whole-nonblocking");
-    let whole = super::Whole::of(client).unwrap();
-    whole.set_read_timeout(Some(std::time::Duration::from_millis(1)));
-    let err = (&whole).read(&mut [0u8; 8]).expect_err("the peer is silent");
-    assert_eq!(err.kind(), std::io::ErrorKind::TimedOut, "{err:?}");
-    drop((server, whole));
-    let _ = std::fs::remove_dir_all(&dir);
+fn only_a_write_pauses_when_the_poll_returns_for_something_else() {
+    use super::{IoKind, pauses};
+    assert!(
+        !pauses(IoKind::Read, false),
+        "a read whose poll answered with the hang-up only"
+    );
+    assert!(!pauses(IoKind::Read, true));
+    assert!(pauses(IoKind::Write, false), "a write whose poll did not report room");
+    assert!(!pauses(IoKind::Write, true));
 }
 
-/// The failure bound of a read in the tests below. A read that gets nothing for this long has lost
-/// its wake, and says so as `TimedOut`, which an assertion names; nothing waits for it to pass.
 #[cfg(windows)]
-const LOST_WAKE_LIMIT: std::time::Duration = std::time::Duration::from_secs(30);
+use crate::test_support::LOST_WAKE_LIMIT;
 
 /// A thread's own handle, to ask whether the thread has an I/O request issued and not yet completed:
 /// it is exactly then parked in the kernel inside a blocking call.
@@ -300,8 +298,8 @@ fn a_read_already_waiting_when_the_peer_closes_sees_the_close() {
     }
 }
 
-/// A poll that is already waiting on one handle does not wake for a shutdown of its duplicate
-/// (measured), so the end of the read is the re-check, not the poll.
+/// A poll that is already waiting does not wake for a shutdown of the same socket while no input is
+/// unread (measured), so the end of the read is the re-check, not the poll.
 #[cfg(windows)]
 #[test]
 fn a_read_on_one_half_ends_when_the_other_half_shuts_down_both_ways() {
@@ -416,67 +414,17 @@ fn a_connection_that_arrives_inheritable_is_refused_not_fixed_up() {
     }
 }
 
-// duplicates -----
+// shares of one connection -----
 
-/// `socket2`'s `try_clone` is born inheritable on Windows, so a duplicate of a connection made that
-/// way and cleared afterwards is inheritable for an instant, and a child started in that instant
-/// holds the connection open after every handle of the agent's is closed. Every duplicate is made
-/// not inheritable from the start.
-#[cfg(windows)]
-#[test]
-fn a_duplicate_is_not_inheritable_from_birth() {
-    let (server, client, dir) = crate::test_support::raw_socket_pair("duplicate-birth");
-    let cloned = server.try_clone().unwrap();
-    assert!(
-        super::is_inheritable(&cloned).unwrap(),
-        "control: a `try_clone` is born inheritable"
-    );
-    let duplicated = super::duplicate(&server).unwrap();
-    let (_server_rx, server_tx) = super::split(server).unwrap();
-    let (_client_rx, client_tx) = super::try_split(client).map_err(|(_, e)| e).unwrap();
-    let watching = server_tx.try_clone_socket().unwrap();
-    for (what, socket) in [
-        ("`duplicate`", &duplicated),
-        ("the write half of `split`", &server_tx.0),
-        ("the write half of `try_split`", &client_tx.0),
-        ("the socket of `try_clone_socket`", &watching),
-    ] {
-        assert!(!super::is_inheritable(socket).unwrap(), "{what} is inheritable");
-    }
-    drop(cloned);
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-/// What a hang-up watcher holds for the life of a session is a duplicate of the writer's socket. A child
-/// started meanwhile (a shell, say) must not hold the connection open once the agent has closed every
-/// handle of its own: the reader sees the end while the child still runs, not a reset when it ends.
+/// The halves of a split connection and a hang-up watcher are shares of one socket handle. Were either a
+/// second handle (a `try_clone` is born inheritable on Windows), a child started meanwhile (a shell, say)
+/// would inherit it and hold the connection open after the agent closed everything of its own.
 #[cfg(windows)]
 #[test]
 fn a_child_started_while_connections_are_split_does_not_hold_them_open() {
-    use std::io::{Read, Write};
-    let home = crate::test_support::NamedCopy::new("holds-connection");
-    let (server, client, dir) = crate::test_support::raw_socket_pair("child-holds");
-    let (mut rx, client_tx) = super::split(client).unwrap();
-    rx.set_read_timeout(Some(LOST_WAKE_LIMIT));
-    let (server_rx, mut server_tx) = super::split(server).unwrap();
-    let watching = server_tx.try_clone_socket().unwrap();
-    let mut child = home.spawn(&[]);
-    server_tx.write_all(b"hello").unwrap();
-    drop((server_rx, server_tx, watching));
-
-    let mut got = Vec::new();
-    let read = rx.read_to_end(&mut got);
-    // The child waits for its input to end; release it before asserting, so a failure leaves nothing running.
-    drop(child.stdin.take());
-    child.wait().unwrap();
-    drop(client_tx);
-    let _ = std::fs::remove_dir_all(&dir);
-
-    assert!(
-        read.is_ok(),
-        "no end while the child ran, so the child holds the connection: {read:?}"
-    );
-    assert_eq!(got, b"hello");
+    crate::test_support::assert_a_child_does_not_hold_a_connection_open("holds-connection", |conn| {
+        crate::hangup::HangupWatcher::new(conn.clone()).unwrap()
+    });
 }
 
 // the socket file's own ACL ----------------------------------------------------------------

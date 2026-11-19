@@ -255,12 +255,15 @@ debugging such a deadlock. Nothing else may take a bound on this argument.
 **Product code reads, writes and accepts on an AF_UNIX socket only through `afunix`** *(review)*. A
 blocking `recv` on a Windows AF_UNIX socket that is already waiting when the peer writes and closes at
 once loses the close about once in fifty (measured), and the reader then sleeps for ever. So a
-connection is non-blocking from birth (`split`, `try_split`), and one loop makes the call, waits for
-the socket for at most `RECHECK_EVERY` when it would block, and makes the call again. The wait is a
-sleep that may end early; what it reports is never acted on, because a poll that is already waiting does
-not wake for a local `shutdown` of a duplicate handle either (measured). A poll that answers at once
-with something other than the event asked for (a half-closed peer, against a full buffer) is followed
-by a pause for the rest of the slice, so that the loop does not spin. `RECHECK_EVERY` is the latency
+connection is non-blocking from birth (`Conn::new`, which `split` calls), and one loop makes the call,
+waits for the socket for at most `RECHECK_EVERY` when it would block, and makes the call again. The
+wait is a sleep that may end early; what it reports is never acted on, because a poll that is already
+waiting does not wake for a local `shutdown` of the same socket either (measured). A write whose poll
+answers at once with something other than the event asked for (a half-closed peer, against a full
+buffer) is followed by a pause for the rest of the slice, so that the loop does not spin; a read is not
+paused. A connection is one socket handle that its halves, its hang-up watcher and its panic reply
+share (`Conn`); never duplicate it, since a duplicate can be inherited by a child process, which then
+holds the connection open after every handle of ours is closed. `RECHECK_EVERY` is the latency
 of a lost wake, never a bound and never proof. A read limit (`ConnRx::set_read_timeout`) is the failure
 bound on a client that may never send or close. Do not set `SO_RCVTIMEO` on a connection, and do not
 read or write one through the raw `socket2::Socket`. A test may hold a raw socket as the other end of

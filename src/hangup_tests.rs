@@ -48,7 +48,7 @@ fn pair(tag: &str) -> (Socket, Socket, std::path::PathBuf) {
 fn watcher_returns_when_the_peer_closes() {
     let (server, client, dir) = pair("close");
     let (_rx, tx) = split(server).unwrap();
-    let (watcher, _waker) = HangupWatcher::new(&tx).unwrap();
+    let (watcher, _waker) = HangupWatcher::new(tx.conn().clone()).unwrap();
     let t = std::thread::spawn(move || watcher.wait());
     client.shutdown(std::net::Shutdown::Both).unwrap();
     drop(client);
@@ -62,7 +62,7 @@ fn watcher_returns_when_the_peer_closes() {
 fn watcher_returns_when_the_peer_closes_with_unread_input() {
     let (server, mut client, dir) = pair("unread");
     let (mut rx, tx) = split(server).unwrap();
-    let (watcher, _waker) = HangupWatcher::new(&tx).unwrap();
+    let (watcher, _waker) = HangupWatcher::new(tx.conn().clone()).unwrap();
     client.write_all(b"unread-frames").unwrap();
     client.shutdown(std::net::Shutdown::Both).unwrap();
     drop(client);
@@ -74,13 +74,13 @@ fn watcher_returns_when_the_peer_closes_with_unread_input() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The session's own `shutdown_both` does not wake a poll on a duplicate of an idle socket, so
-/// the waker is what ends the wait. The peer stays open throughout.
+/// The session's own `shutdown_both` does not wake a poll that is already waiting on its idle socket,
+/// so the waker is what ends the wait. The peer stays open throughout.
 #[test]
 fn watcher_returns_after_local_shutdown() {
     let (server, client, dir) = pair("local");
     let (_rx, tx) = split(server).unwrap();
-    let (watcher, waker) = HangupWatcher::new(&tx).unwrap();
+    let (watcher, waker) = HangupWatcher::new(tx.conn().clone()).unwrap();
     let t = std::thread::spawn(move || watcher.wait());
     tx.shutdown_both().unwrap();
     waker.wake().unwrap();
@@ -98,7 +98,7 @@ fn watcher_returns_after_local_shutdown() {
 fn watcher_waits_for_the_waker_after_a_local_shutdown_write_with_unread_input() {
     let (server, mut client, dir) = pair("local-write");
     let (_rx, tx) = split(server).unwrap();
-    let (watcher, waker) = HangupWatcher::new(&tx).unwrap();
+    let (watcher, waker) = HangupWatcher::new(tx.conn().clone()).unwrap();
     client.write_all(b"unread-frames").unwrap();
     tx.shutdown_write().unwrap();
     assert_eq!(watcher.poll_ready(0).unwrap(), None);
@@ -114,7 +114,7 @@ fn watcher_waits_for_the_waker_after_a_local_shutdown_write_with_unread_input() 
 fn watcher_returns_when_woken_before_it_waits() {
     let (server, client, dir) = pair("early");
     let (_rx, tx) = split(server).unwrap();
-    let (watcher, waker) = HangupWatcher::new(&tx).unwrap();
+    let (watcher, waker) = HangupWatcher::new(tx.conn().clone()).unwrap();
     waker.wake().unwrap();
     watcher.wait().unwrap();
     drop(client);
@@ -129,7 +129,7 @@ fn watcher_returns_when_woken_before_it_waits() {
 fn a_large_write_without_the_teardown_flag_is_drained_whole_and_does_not_end_the_wait() {
     let (server, client, dir) = pair("spurious");
     let (_rx, tx) = split(server).unwrap();
-    let (watcher, waker) = HangupWatcher::new(&tx).unwrap();
+    let (watcher, waker) = HangupWatcher::new(tx.conn().clone()).unwrap();
     // Room for everything below, so it all reaches the receiving end without anyone reading.
     let wanted = 2 * WAKE_READ_BUF + 1;
     socket2::SockRef::from(&watcher.wake_rx)
@@ -173,7 +173,7 @@ fn a_large_write_without_the_teardown_flag_is_drained_whole_and_does_not_end_the
 fn a_closed_wake_channel_without_the_flag_keeps_watching_the_session() {
     let (server, client, dir) = pair("eof");
     let (_rx, tx) = split(server).unwrap();
-    let (watcher, waker) = HangupWatcher::new(&tx).unwrap();
+    let (watcher, waker) = HangupWatcher::new(tx.conn().clone()).unwrap();
     waker.wake_tx.shutdown(std::net::Shutdown::Write).unwrap();
     assert_eq!(watcher.poll_once().unwrap(), Ready::Wake);
     assert!(!watcher.torn_down.load(Ordering::Acquire));
@@ -192,7 +192,7 @@ fn a_closed_wake_channel_without_the_flag_keeps_watching_the_session() {
 fn a_failed_read_on_the_wake_channel_is_logged_and_stops_polling_it() {
     let (server, client, dir) = pair("reset");
     let (_rx, tx) = split(server).unwrap();
-    let (watcher, waker) = HangupWatcher::new(&tx).unwrap();
+    let (watcher, waker) = HangupWatcher::new(tx.conn().clone()).unwrap();
     // A zero linger turns the waker's close into a RST, which the watcher reads as an error.
     socket2::SockRef::from(&waker.wake_tx)
         .set_linger(Some(std::time::Duration::ZERO))
@@ -217,7 +217,7 @@ fn a_failed_read_on_the_wake_channel_is_logged_and_stops_polling_it() {
 fn waking_a_full_wake_queue_is_success() {
     let (server, client, dir) = pair("full");
     let (_rx, tx) = split(server).unwrap();
-    let (watcher, waker) = HangupWatcher::new(&tx).unwrap();
+    let (watcher, waker) = HangupWatcher::new(tx.conn().clone()).unwrap();
     // Nobody reads: fill the queue until the socket says it is full.
     let filler = [0u8; 4096];
     loop {
@@ -238,7 +238,7 @@ fn waking_a_full_wake_queue_is_success() {
 fn watcher_returns_when_the_waker_is_dropped() {
     let (server, client, dir) = pair("dropped");
     let (_rx, tx) = split(server).unwrap();
-    let (watcher, waker) = HangupWatcher::new(&tx).unwrap();
+    let (watcher, waker) = HangupWatcher::new(tx.conn().clone()).unwrap();
     let t = std::thread::spawn(move || watcher.wait());
     drop(waker);
     t.join().unwrap().unwrap();

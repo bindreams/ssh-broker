@@ -27,7 +27,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use super::{Connections, Drained, HalfClose};
-use crate::afunix::{ConnRx, Whole};
+use crate::afunix::{Conn, ConnRx};
 use crate::protocol::{ExitCode, FrameKind, SessionId, Stream, write_frame};
 use crate::relay::{write_data, write_hand_back};
 
@@ -273,25 +273,30 @@ pub(super) fn fail_connection<R: LimitedRead, W: Write + HalfClose>(
     cause.context(what.to_owned())
 }
 
+/// Make a connection of a socket the accept loop took (see [`Conn::new`]). A socket that refuses
+/// non-blocking mode is closed unanswered, and the error says so: answering it would mean a blocking
+/// read (see [`super::handle_connection_in`]).
+pub(super) fn admit(sock: socket2::Socket) -> anyhow::Result<Conn> {
+    Conn::new(sock).map_err(|e| {
+        anyhow::Error::new(e).context("the connection's socket refused non-blocking mode; closed unanswered")
+    })
+}
+
 /// Answers a connection whose handler thread panics. A panic closes the connection without a byte,
 /// which a client takes for an agent that is going away; this writes the failure reply
-/// ([`FAILED_EXIT_CODE`]) first, on a second handle to the same socket, and waits for the client to
+/// ([`FAILED_EXIT_CODE`]) first, on its own share of the connection, and waits for the client to
 /// close like any other failure reply. Dropped without a panic, it does nothing.
 pub(super) struct PanicReply<'a> {
-    conn: Option<socket2::Socket>,
+    conn: Option<Conn>,
     control: &'a Control,
 }
 
 impl<'a> PanicReply<'a> {
-    pub(super) fn new(conn: &socket2::Socket, control: &'a Control) -> Self {
-        let conn = match crate::afunix::duplicate(conn) {
-            Ok(conn) => Some(conn),
-            Err(e) => {
-                tracing::warn!("a panic of this connection's handler will not be answered: {e}");
-                None
-            }
-        };
-        PanicReply { conn, control }
+    pub(super) fn new(conn: Conn, control: &'a Control) -> Self {
+        PanicReply {
+            conn: Some(conn),
+            control,
+        }
     }
 }
 
@@ -312,16 +317,10 @@ impl Drop for PanicReply<'_> {
     }
 }
 
-/// [`fail_connection`] with [`FAILED_EXIT_CODE`] on a connection that nothing has split yet. The split
-/// also makes the socket non-inheritable; if it fails, the reply goes on the whole socket.
-pub(super) fn fail_socket(conn: socket2::Socket, control: &Control, what: &str, cause: anyhow::Error) -> anyhow::Error {
-    match crate::afunix::try_split(conn) {
-        Ok((mut rx, mut tx)) => fail_connection(&mut rx, &mut tx, control, what, cause, FAILED_EXIT_CODE),
-        Err((whole, _)) => {
-            let (mut rx, mut tx) = (&whole, &whole);
-            fail_connection(&mut rx, &mut tx, control, what, cause, FAILED_EXIT_CODE)
-        }
-    }
+/// [`fail_connection`] with [`FAILED_EXIT_CODE`] on a connection that nothing has split yet.
+pub(super) fn fail_socket(conn: Conn, control: &Control, what: &str, cause: anyhow::Error) -> anyhow::Error {
+    let (mut rx, mut tx) = conn.split();
+    fail_connection(&mut rx, &mut tx, control, what, cause, FAILED_EXIT_CODE)
 }
 
 /// Send what `answer` writes (a reply, or a hand-back), FIN the write half and wait for the client to close (see
@@ -353,12 +352,6 @@ pub(super) trait LimitedRead: Read {
 }
 
 impl LimitedRead for ConnRx {
-    fn limit_reads(&mut self, limit: Duration) {
-        self.set_read_timeout(Some(limit));
-    }
-}
-
-impl LimitedRead for &Whole {
     fn limit_reads(&mut self, limit: Duration) {
         self.set_read_timeout(Some(limit));
     }
