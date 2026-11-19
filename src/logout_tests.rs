@@ -45,6 +45,17 @@ fn the_agents_reply_goes_to_stderr_and_its_exit_code_is_ours() {
     assert_eq!(err, "desktop\r\n");
 }
 
+/// A logout is not answered `Serving`: an agent that does is a failure, and its text is not shown.
+#[test]
+fn a_reply_that_begins_with_the_answer_serving_is_a_failure() {
+    let mut server_says = Vec::new();
+    crate::relay::write_serving(&mut server_says).unwrap();
+    server_says.extend(reply("bye\r\n", 0));
+    let (code, err, _) = logout(server_says);
+    assert_eq!(code, 254);
+    assert_eq!(err, "");
+}
+
 /// `logout_at` with a connect that fails with `error`, and a verdict that only a missing agent
 /// is "no session".
 fn logout_failing_to_connect(error: anyhow::Error) -> (i32, String) {

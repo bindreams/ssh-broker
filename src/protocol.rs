@@ -10,6 +10,12 @@ pub const HEADER_LEN: usize = 5;
 /// Guard against absurd allocations from a malformed/hostile length prefix (1 MiB).
 pub const MAX_FRAME: u32 = 1 << 20;
 
+/// The agent's answer: after a [`Mode::Pty`] or [`Mode::Exec`] handshake the agent's first frame is its answer.
+/// `Serving` (no payload) means the session's process has started. `HandBack` (payload: the cause, UTF-8) means it
+/// starts nothing and the client should run the session itself. A refusal is the other possible start: data
+/// frames (the shell's warnings, then the reason on stderr) and `Exit`, never `Serving`. Any first frame ends
+/// the client's wait, and a client sends no input before it. `Serving` and `HandBack` anywhere but first are protocol errors. [`Mode::Logout`] is not answered this
+/// way.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrameKind {
@@ -17,6 +23,8 @@ pub enum FrameKind {
     Data = 1,
     Resize = 2,
     Exit = 3,
+    Serving = 4,
+    HandBack = 5,
 }
 
 impl FrameKind {
@@ -26,6 +34,8 @@ impl FrameKind {
             1 => Some(Self::Data),
             2 => Some(Self::Resize),
             3 => Some(Self::Exit),
+            4 => Some(Self::Serving),
+            5 => Some(Self::HandBack),
             _ => None,
         }
     }
@@ -123,7 +133,7 @@ impl ExitCode {
 }
 
 /// The wire version; a peer of any other version is refused by name.
-pub const PROTOCOL_VERSION: u16 = 4;
+pub const PROTOCOL_VERSION: u16 = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Mode {
@@ -285,6 +295,7 @@ pub fn write_frame<W: std::io::Write>(w: &mut W, kind: FrameKind, payload: &[u8]
 #[derive(Default)]
 pub struct FrameReader {
     buf: Vec<u8>,
+    frames_read: u64,
 }
 
 impl FrameReader {
@@ -299,6 +310,12 @@ impl FrameReader {
     pub fn buffered_len(&self) -> usize {
         self.buf.len()
     }
+    /// How many frames [`Self::next_frame`] has yielded since the reader was made: over the whole
+    /// connection, however many reads or pump calls it took. A frame just yielded is the connection's
+    /// first when this is 1.
+    pub fn frames_read(&self) -> u64 {
+        self.frames_read
+    }
     /// `Ok(Some(frame))` once a whole frame is buffered; `Ok(None)` if more bytes are
     /// needed; `Err` on a malformed header (bad kind / oversize length).
     pub fn next_frame(&mut self) -> anyhow::Result<Option<Frame>> {
@@ -312,6 +329,7 @@ impl FrameReader {
         }
         let payload = self.buf[HEADER_LEN..total].to_vec();
         self.buf.drain(..total);
+        self.frames_read += 1;
         Ok(Some(Frame {
             kind: header.kind,
             payload,

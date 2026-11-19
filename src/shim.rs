@@ -58,8 +58,9 @@ pub fn is_blank_command(command: &str) -> bool {
 // ── EXEC relay ───────────────────────────────────────────────────────────────────────
 
 /// Relay an EXEC session over an already-connected, split transport: send the handshake,
-/// forward `stdin` as `DATA(Stdin)` frames, and write the agent's `Stdout`/`Stderr` (kept
-/// separate) to `out`/`err`, returning the child's exit code.
+/// forward `stdin` as `DATA(Stdin)` frames once the agent has answered `Serving`, and write the agent's
+/// `Stdout`/`Stderr` (kept separate) to `out`/`err`, returning the child's exit code. For a caller that
+/// cannot run the session itself, an agent that hands it back is an error.
 ///
 /// The write half (`tx`) is held until AFTER the `EXIT` frame arrives, so it is not closed mid-run.
 /// That matters because of the EXEC convention (see `protocol::Stream`): the agent treats a full
@@ -74,19 +75,32 @@ where
     E: Write,
     I: Read + Send + 'static,
 {
-    let _keep_open = match start_exec_input(tx, hs, stdin)? {
+    let keep_open = match start_exec_input(tx, hs)? {
         Started::Ready(keep) => keep,
         Started::Closed(e) => return Err(e),
     };
+    let pumped = pump_exec(rx, out, err, keep_open.forwarding(stdin));
+    if let Some(cause) = pumped.handed_back() {
+        anyhow::bail!("the agent handed the session back instead of running it: {cause}");
+    }
     // Route the outcome through the shared exit-code policy so a dead agent (PeerClosed) is
     // 255 and a protocol error is 254 — never the in-band exit 1 that would be
     // indistinguishable from a real command's failure (e.g. `findstr`/`grep` no-match).
-    Ok(pump_exec(rx, out, err).code())
+    Ok(pumped.code())
 }
 
-/// Read the agent's side of an EXEC session until its `EXIT` frame or the end of the connection.
-pub fn pump_exec<R: Read, O: Write, E: Write>(mut rx: R, out: O, err: E) -> Pumped {
-    pump_heard(&mut rx, &mut FrameReader::new(), &mut ExecOutSink { out, err })
+/// Read the agent's side of an EXEC session until its `EXIT` frame or the end of the connection. `forward` is
+/// started when the agent answers `Serving` and never otherwise ([`KeepOpen::forwarding`]).
+pub fn pump_exec<R: Read, O: Write, E: Write>(mut rx: R, out: O, err: E, forward: Forwarder) -> Pumped {
+    pump_heard(
+        &mut rx,
+        &mut FrameReader::new(),
+        &mut ExecOutSink {
+            out,
+            err,
+            forward: Some(forward),
+        },
+    )
 }
 
 /// How a pump of the agent's frames ended, and whether the agent said anything first.
@@ -133,6 +147,15 @@ impl Pumped {
         Pumped {
             outcome: Err(PumpError::Transport(std::io::Error::new(kind, e))),
             heard: false,
+        }
+    }
+
+    /// Why the agent handed the session back, if it did: it started nothing, and the session is the shim's
+    /// to run ([`Outcome::HandedBack`]).
+    pub fn handed_back(&self) -> Option<&str> {
+        match &self.outcome {
+            Ok(Outcome::HandedBack(cause)) => Some(cause),
+            _ => None,
         }
     }
 
@@ -185,7 +208,7 @@ impl<R: Read> Read for Heard<R> {
 
 /// What [`start_exec_input`] did.
 pub enum Started<W> {
-    /// The handshake went out and the input is being forwarded. The session lasts while the guard does.
+    /// The handshake went out. The session lasts while the guard does.
     Ready(KeepOpen<W>),
     /// The peer had closed the connection when the handshake went out.
     Closed(anyhow::Error),
@@ -195,27 +218,33 @@ pub enum Started<W> {
 /// disconnect and kills the command, so the half must outlive the end of the input, which ends the
 /// thread that forwards it: it is dropped after the `EXIT` frame has arrived.
 pub struct KeepOpen<W> {
-    _tx: Arc<Mutex<W>>,
+    tx: Arc<Mutex<W>>,
 }
 
-/// Send `hs` on `tx`, then forward `stdin` to it on a thread of its own, up to an end-of-input marker.
-/// The handshake goes first, so the agent starts the command before any input flows.
-///
-/// The thread is detached: a blocking read of stdin cannot be woken, and the process's exit reaps it.
-pub fn start_exec_input<W: Write + Send + 'static>(
-    mut tx: W,
-    hs: &Handshake,
-    stdin: impl Read + Send + 'static,
-) -> anyhow::Result<Started<W>> {
+/// What forwards a session's input, started when the agent says it serves ([`KeepOpen::forwarding`]).
+pub type Forwarder = Box<dyn FnOnce() + Send>;
+
+impl<W: Write + Send + 'static> KeepOpen<W> {
+    /// The forwarding of `stdin` to this connection, up to an end-of-input marker, for [`pump_exec`] to start
+    /// on a thread of its own once the agent answers `Serving`: input read before that answer would be lost
+    /// to a shell that is not run, when the agent hands the session back. The thread is detached: a blocking
+    /// read of stdin cannot be woken, and the process's exit reaps it.
+    pub fn forwarding(&self, stdin: impl Read + Send + 'static) -> Forwarder {
+        let tx = Arc::clone(&self.tx);
+        Box::new(move || forward_stdin(stdin, tx))
+    }
+}
+
+/// Send `hs` on `tx` and nothing else: input follows only after the agent's `Serving`.
+pub fn start_exec_input<W: Write + Send + 'static>(mut tx: W, hs: &Handshake) -> anyhow::Result<Started<W>> {
     match write_frame(&mut tx, FrameKind::Handshake, &hs.encode()?) {
         Ok(()) => {}
         Err(e) if peer_gone(&e).is_some() => return Ok(Started::Closed(e)),
         Err(e) => return Err(e),
     }
-    let tx = Arc::new(Mutex::new(tx));
-    let forwarding = Arc::clone(&tx);
-    std::thread::spawn(move || forward_stdin(stdin, forwarding));
-    Ok(Started::Ready(KeepOpen { _tx: tx }))
+    Ok(Started::Ready(KeepOpen {
+        tx: Arc::new(Mutex::new(tx)),
+    }))
 }
 
 /// Forward `stdin` to `DATA(Stdin)` frames; on EOF (or a read error, treated as EOF) send the
@@ -241,13 +270,23 @@ fn forward_stdin<I: Read, W: Write>(mut stdin: I, tx: Arc<Mutex<W>>) {
     let _ = write_data(&mut *g, Stream::Stdin, b""); // stdin-EOF marker
 }
 
-/// Routes the agent's decoded output streams to the EXEC writers, keeping stderr separate.
+/// Routes the agent's decoded output streams to the EXEC writers, keeping stderr separate, and starts the
+/// input's forwarding when the agent answers `Serving`.
 struct ExecOutSink<O: Write, E: Write> {
     out: O,
     err: E,
+    /// Taken by [`FrameSink::on_serving`]; still here if the agent never said it serves.
+    forward: Option<Forwarder>,
 }
 
 impl<O: Write, E: Write> FrameSink for ExecOutSink<O, E> {
+    fn on_serving(&mut self) -> anyhow::Result<()> {
+        if let Some(forward) = self.forward.take() {
+            std::thread::spawn(forward);
+        }
+        Ok(())
+    }
+
     fn on_data(&mut self, stream: Stream, bytes: &[u8]) -> anyhow::Result<()> {
         // Flush after each frame: `std::io::stdout()` is a LineWriter, so newline-less or binary
         // output (e.g. a streaming command, or a relayed sftp protocol) would otherwise sit in
@@ -417,7 +456,7 @@ pub fn fail_open<T, K>(
         Ok(StepDown::Own) => None,
         Ok(StepDown::Fallback(cause)) => {
             tracing::warn!("fail-open could not prepare an unelevated session, so it keeps sshd's token: {cause}");
-            tell(stderr, &text::unelevated_fallback(&cause, text::FallbackToken::Sshd));
+            tell(stderr, &text::unelevated_fallback(&cause));
             None
         }
         Ok(StepDown::Refused) => {
@@ -493,6 +532,11 @@ pub fn map_outcome(outcome: Result<Outcome, crate::relay::PumpError>) -> i32 {
         Ok(Outcome::PeerClosed) => {
             tracing::error!("agent closed the connection before sending an exit code");
             255
+        }
+        // The callers that can run the session themselves take a hand-back before they ask for a code.
+        Ok(Outcome::HandedBack(cause)) => {
+            tracing::error!("agent handed the session back, which this caller cannot run itself: {cause}");
+            PROTOCOL_VIOLATION_CODE
         }
         Err(e) => {
             tracing::error!("relay error: {e:?}");

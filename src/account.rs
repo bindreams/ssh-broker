@@ -178,9 +178,10 @@ pub fn integrity() -> anyhow::Result<Integrity> {
 ///
 /// A login that asked for a level is refused when it cannot be given: a level that cannot be read, or a token
 /// that cannot be made, is an error, since a guess would run the session as it is. A login that asked for
-/// nothing gets [`StepDown::Fallback`] in the same two cases: this process's own token, and the cause for the
-/// notice. `integrity` is read once, and `make` only for a [`StepDown::Token`]; both are parameters so that a
-/// test can make either fail.
+/// nothing gets [`StepDown::Fallback`] in the same two cases, with the cause: the login set nothing and could not
+/// be stepped down (see [`StepDown::Fallback`](crate::socket_loc::StepDown::Fallback) for what each caller does).
+/// `integrity` is read once, and `make` only for a [`StepDown::Token`]; both are parameters so that a test can
+/// make either fail.
 pub fn step_down<K>(
     asked: Option<ElevationPolicy>,
     integrity: impl FnOnce() -> anyhow::Result<Integrity>,

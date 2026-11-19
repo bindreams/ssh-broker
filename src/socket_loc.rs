@@ -66,9 +66,9 @@ pub enum StepDown<K> {
     Own,
     /// No session: the login asked for an elevated one and this process is below High.
     Refused,
-    /// This process's own token, because a login that set nothing could not be stepped down; the error is
-    /// why, formatted with its context. It exists only for that: a login that asked for a level is refused
-    /// instead.
+    /// A login that set nothing could not be stepped down; the error is why, formatted with its context. The
+    /// agent hosts no such session and hands it back (`FrameKind::HandBack`); in the shim's fail-open shell it
+    /// runs with sshd's token, after a notice. A login that asked for a level is refused instead.
     Fallback(String),
 }
 

@@ -2,17 +2,19 @@
 //!
 //! Windows-only: it drives the real ssh-shellhost console. `run_on` connects to the agent,
 //! decides fail-open, and dispatches; `run_pty` puts the console into raw VT mode (RAII
-//! restore), spawns ONE `ReadConsoleInputW` worker that re-encodes keys/mouse/resize toward
-//! the agent, and pumps the agent's filtered output to stdout on the main thread.
+//! restore), pumps the agent's filtered output to stdout on the main thread, and, once the agent
+//! answers `Serving`, starts ONE `ReadConsoleInputW` worker that re-encodes keys/mouse/resize
+//! toward the agent. A hand-back starts no worker: the session is run here, by the fail-open.
 //!
 //! Teardown model (mirrors `agent::handle_pty`'s discipline, inverted): MAIN owns `rx`, the
-//! `ConsoleModes` RAII guard, and the worker's `JoinHandle`; it runs `pump_decode` (the
-//! deterministic completion signal) and coordinates teardown. The worker owns `tx` (the sole
-//! frame producer post-handshake) and runs the un-cancellable `ReadConsoleInputW` loop. On
-//! EXIT, MAIN sets a `stopping` flag, wakes the parked read by injecting a benign console
-//! record (`WriteConsoleInputW` — reliable for console reads where `CancelSynchronousIo` is
-//! not), JOINS the worker, then the guard restores modes AFTER the join — so the worker can
-//! never read with a half-restored mode (the use-after-close hazard).
+//! `ConsoleModes` RAII guard, and (through the sink's `Input`) the worker's `JoinHandle`, or the
+//! write half while no worker runs; it runs `pump_decode` (the deterministic completion signal)
+//! and coordinates teardown. The worker owns `tx` (the sole frame producer post-handshake) and
+//! runs the un-cancellable `ReadConsoleInputW` loop. On EXIT, MAIN sets a `stopping` flag, wakes
+//! the parked read by injecting a benign console record (`WriteConsoleInputW` — reliable for
+//! console reads where `CancelSynchronousIo` is not), JOINS the worker (only if it was started),
+//! then the guard restores modes AFTER the join — so the worker can never read with a
+//! half-restored mode (the use-after-close hazard).
 
 use crate::cmdline::{Encoding, Login, RawExec, resolve_exec};
 use crate::console_modes::ConsoleModes;
@@ -276,7 +278,15 @@ fn try_relay_with(
                 closed_before = true;
                 tracing::warn!("the agent ended the connection before it answered; connecting again");
             }
-            Interactive::Pumped(pumped) => return Ok(Some(pumped.code())),
+            Interactive::Pumped(pumped) => {
+                if let Some(cause) = pumped.handed_back() {
+                    // The console is restored (`run_pty` returned), so stderr is safe. Nothing connects
+                    // again: the agent answered, and started nothing.
+                    hand_back_to_fail_open(cause, stderr);
+                    return Ok(None);
+                }
+                return Ok(Some(pumped.code()));
+            }
             Interactive::NoConsole => return Ok(None),
         }
     }
@@ -345,8 +355,9 @@ fn connect_or_rescue(
 
 /// Relay an EXEC session over `conn`, once. The agent may have started the command before it ended a
 /// connection without a byte, and an agent that answers next could run it again, so the command is
-/// neither sent again nor run anywhere else.
-fn relay_exec(
+/// neither sent again nor run anywhere else. The one exception is an agent that says, in its first frame,
+/// that it started nothing (`HandBack`): `Ok(None)`, and the caller runs the command, with `stdin` unread.
+pub(crate) fn relay_exec(
     conn: Socket,
     cmd: &str,
     elevation: Option<ElevationPolicy>,
@@ -357,15 +368,29 @@ fn relay_exec(
     // EXEC ignores cols/rows
     let hs = make_handshake(&Some(cmd.to_owned()), false, Launch::Shell, term(), 80, 24, elevation);
     // Held until the session is over: the agent takes a close for a disconnect.
-    let pumped = match start_exec_input(tx, &hs, stdin)? {
-        Started::Ready(_keep_open) => pump_exec(rx, std::io::stdout(), std::io::stderr()),
+    let pumped = match start_exec_input(tx, &hs)? {
+        Started::Ready(keep_open) => pump_exec(rx, std::io::stdout(), std::io::stderr(), keep_open.forwarding(stdin)),
         Started::Closed(e) => Pumped::closed(e),
     };
+    if let Some(cause) = pumped.handed_back() {
+        hand_back_to_fail_open(cause, stderr);
+        return Ok(None);
+    }
     if pumped.no_answer() {
         let _ = writeln!(stderr, "{AGENT_ENDED_UNANSWERED}");
         return Ok(Some(255));
     }
     Ok(Some(pumped.code()))
+}
+
+/// Say, before the shim runs a session itself, that the agent handed it back and why. Both modes: the console
+/// of a terminal session is restored by now, and a command's stderr is the shim's own while it runs nothing.
+fn hand_back_to_fail_open(cause: &str, stderr: &mut dyn std::io::Write) {
+    let message = unavailable_message(Some(&format!(
+        "the agent could not prepare an unelevated session: {cause}"
+    )));
+    tracing::warn!("{message}");
+    let _ = writeln!(stderr, "{message}");
 }
 
 /// Relay an interactive session over `conn`. A real console is required to capture input. No
@@ -676,8 +701,9 @@ fn run_pty(
     let stdin_raw = modes.stdin.0 as isize;
     let stdout_raw = modes.stdout.0 as isize;
 
-    // Handshake first (MAIN owns tx until the worker spawn consumes it), so the agent has
-    // spawned + sized the shell before the first keystroke/resize frame arrives.
+    // Handshake first (MAIN owns tx until the agent's `Serving` hands it to the input worker): the
+    // worker, which sends the first keystroke and resize frame, starts only after the agent has started
+    // and sized the shell.
     if let Err(e) = write_frame(&mut tx, FrameKind::Handshake, &hs.encode()?) {
         return if peer_gone(&e).is_some() {
             Ok(Pumped::closed(e))
@@ -689,44 +715,104 @@ fn run_pty(
     let gate = Arc::new(MouseGate::default());
     let stopping = Arc::new(AtomicBool::new(false));
 
-    let worker = {
-        let gate = Arc::clone(&gate);
-        let stopping = Arc::clone(&stopping);
-        std::thread::spawn(move || input_worker(stdin_raw, stdout_raw, tx, gate, stopping))
-    };
-
     // MAIN: pump agent output → sniff/filter → console stdout. Capture the result WITHOUT `?`
-    // so teardown always runs (mirrors agent.rs's deferred wait_result handling).
+    // so teardown always runs (mirrors agent.rs's deferred wait_result handling). The input worker
+    // is not started here: the sink starts it when the agent answers `Serving`, so a key typed
+    // before that stays in the console's own buffer, for the agent's shell or, after a hand-back,
+    // for the shell this process runs.
     let mut sink = StdoutSink {
         out: stdout_raw,
         filter: XtwinopsFilter::new(),
         sniffer: MouseModeSniffer::new(),
         gate,
+        input: Input::Waiting(tx),
+        stdin_raw,
+        stopping: Arc::clone(&stopping),
     };
     let pumped = pump_heard(&mut rx, &mut fr, &mut sink);
 
-    // Ordered teardown: stop, wake the parked ReadConsoleInputW, join. Console modes are
-    // restored by `modes` dropping at scope end — AFTER the join, so the worker is provably
-    // done before the restore.
-    stopping.store(true, Ordering::Relaxed);
-    wake_console_input(stdin_raw);
-    let _ = worker.join();
+    // Ordered teardown: a started worker is stopped, woken and joined; an unstarted one has nothing parked, so no
+    // console record is injected and the write half is closed. Console modes are restored by `modes` dropping at
+    // scope end — AFTER the join, so the worker is provably done before the restore.
+    sink.input.end(
+        || {
+            stopping.store(true, Ordering::Relaxed);
+            wake_console_input(stdin_raw);
+        },
+        |tx| {
+            let _ = tx.shutdown_both();
+        },
+    );
 
     drop(modes); // explicit: restore console modes before we return into run_on's process::exit
     Ok(pumped)
 }
 
+/// The input worker of a terminal session, which the agent's answer starts. `T` is the connection's write
+/// half, which the worker owns once it runs.
+///
+/// Until then the write half is held here, in `Waiting`. The half or the worker's handle is held, never both.
+enum Input<T> {
+    /// Not started: nothing was answered yet, or the answer was not `Serving`.
+    Waiting(T),
+    Running(std::thread::JoinHandle<()>),
+    /// Over: stopped or closed.
+    Ended,
+}
+
+impl<T> Input<T> {
+    /// Start the worker with `spawn`, which is given the write half. An error if already started or over
+    /// (the pump takes `Serving` once, so it does not reach this).
+    fn start(&mut self, spawn: impl FnOnce(T) -> std::thread::JoinHandle<()>) -> anyhow::Result<()> {
+        match std::mem::replace(self, Input::Ended) {
+            Input::Waiting(tx) => {
+                *self = Input::Running(spawn(tx));
+                Ok(())
+            }
+            other => {
+                *self = other;
+                anyhow::bail!("the input worker was started twice")
+            }
+        }
+    }
+
+    /// Tear down. A started worker is stopped with `stop`, then joined; one that never started is closed with
+    /// `unstarted`, which gets the write half, and there is nothing to stop or join. Nothing at all happens
+    /// the second time.
+    fn end(&mut self, stop: impl FnOnce(), unstarted: impl FnOnce(T)) {
+        match std::mem::replace(self, Input::Ended) {
+            Input::Waiting(tx) => unstarted(tx),
+            Input::Running(worker) => {
+                stop();
+                let _ = worker.join();
+            }
+            Input::Ended => {}
+        }
+    }
+}
+
 /// Routes the agent's output to the real console: observe mouse-mode changes (publishing the
 /// gate), strip XTWINOPS, then write the raw VT bytes straight to the console handle (the
-/// proven short-write loop, not buffered Rust stdout).
+/// proven short-write loop, not buffered Rust stdout). The agent's answer `Serving` starts the input
+/// worker.
 struct StdoutSink {
     out: isize,
     filter: XtwinopsFilter,
     sniffer: MouseModeSniffer,
     gate: Arc<MouseGate>,
+    input: Input<afunix::ConnTx>,
+    stdin_raw: isize,
+    stopping: Arc<AtomicBool>,
 }
 
 impl FrameSink for StdoutSink {
+    fn on_serving(&mut self) -> anyhow::Result<()> {
+        let (stdin_raw, out) = (self.stdin_raw, self.out);
+        let (gate, stopping) = (Arc::clone(&self.gate), Arc::clone(&self.stopping));
+        self.input
+            .start(|tx| std::thread::spawn(move || input_worker(stdin_raw, out, tx, gate, stopping)))
+    }
+
     fn on_data(&mut self, _stream: Stream, bytes: &[u8]) -> anyhow::Result<()> {
         self.sniffer.observe(bytes);
         // The AND (tracking && SGR) is computed here on the single writer, so the worker

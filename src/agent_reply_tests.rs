@@ -9,9 +9,11 @@ use crate::shell::test_host::{TestHost, USER_CONFIG};
 use crate::socket_loc::StepDown;
 use crate::winutil::UnelevatedToken;
 
-/// What a client saw: how the session ended and what the agent wrote to its stderr and to its terminal.
+/// What a client saw: how the session ended, what the agent wrote to its stderr and to its terminal, and whether its
+/// first frame was the answer `Serving`.
 struct Answer {
     outcome: Outcome,
+    served: usize,
     stderr: String,
     stdout: String,
 }
@@ -32,6 +34,7 @@ fn answered(tag: &str, hooks: Hooks, send: impl FnOnce(&mut ConnTx) + Send + 'st
     (
         Answer {
             outcome,
+            served: sink.served,
             stderr: String::from_utf8(sink.stderr).unwrap(),
             stdout: String::from_utf8(sink.stdout).unwrap(),
         },
@@ -418,7 +421,7 @@ fn agent_refuses_a_login_that_asked_when_the_token_cannot_be_made_and_names_both
             "{tag}"
         );
         assert!(
-            answer.stderr.contains("leaves SSH_BROKER_ELEVATION unset") && answer.stderr.contains("sets it to always"),
+            answer.stderr.contains("leaves SSH_BROKER_ELEVATION unset") && !answer.stderr.contains("always"),
             "{tag}"
         );
         assert!(result.is_err(), "{tag}");
@@ -610,9 +613,10 @@ fn agent_gives_always_its_own_token_at_high() {
 
 // A login that set nothing and cannot be stepped down -----
 
-/// The agent at High whose unelevated token cannot be made: the one rule, with a maker that fails.
-fn at_high_without_a_token(tag: &str, host: TestHost, mode: Mode, command: Option<&str>) -> Answer {
-    let recording = Hooks {
+/// The hooks of an agent at High whose unelevated token cannot be made: the one rule, with a maker that fails, and
+/// starters that record into [`STARTS`].
+fn hooks_at_high_without_a_token(host: TestHost) -> Hooks {
+    Hooks {
         shell_host: Box::new(host),
         make_unelevated: |asked| {
             crate::account::step_down(
@@ -630,69 +634,242 @@ fn at_high_without_a_token(tag: &str, host: TestHost, mode: Mode, command: Optio
             Err(StartError::Program(anyhow::anyhow!("recorded")))
         },
         ..Hooks::production()
-    };
-    answered(tag, recording, request_asking(mode, command, None)).0
-}
-
-/// The notice of a login that set nothing, as the agent says it.
-fn the_fallback_notice() -> String {
-    crate::offer::text::unelevated_fallback("the token cannot be made", crate::offer::text::FallbackToken::Agent)
-}
-
-/// A login that set nothing is not refused when its session cannot be stepped down: it is served with the
-/// agent's own token, and the notice is the first thing it sees, on stderr.
-#[test]
-fn agent_serves_a_command_that_set_nothing_with_its_own_token_and_the_notice_first() {
-    let _serial = STARTS_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    taken_starts();
-    let answer = at_high_without_a_token("fallback-exec", TestHost::new(), Mode::Exec, Some("whoami"));
-    assert_eq!(taken_starts(), [("exec", false, false)], "started once, with no token");
-    assert!(
-        answer.stderr.starts_with(&format!("{}\n", the_fallback_notice())),
-        "{}",
-        answer.stderr
-    );
-    assert_eq!(
-        answer.stderr.matches("could not prepare an unelevated session").count(),
-        1
-    );
-}
-
-/// The same for a terminal: the notice is printed from inside the pseudoconsole by the `console-fallback` verb,
-/// which clears nothing after it, and when the verb cannot start it is the first data on the terminal.
-#[test]
-fn agent_serves_a_terminal_that_set_nothing_with_its_own_token_and_the_notice_first() {
-    let _serial = STARTS_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    for (tag, command) in [("fallback-pty", None), ("fallback-pty-command", Some("whoami"))] {
-        taken_starts();
-        let answer = at_high_without_a_token(tag, TestHost::new(), Mode::Pty, command);
-        assert_eq!(
-            taken_starts(),
-            // The verb's start, then the line the agent falls back to when the verb cannot be started.
-            [("pty", true, false), ("pty", false, false)],
-            "{tag}"
-        );
-        assert!(
-            answer.stdout.starts_with(&format!("{}\r\n", the_fallback_notice())),
-            "{tag}: {}",
-            answer.stdout
-        );
     }
 }
 
-/// The notice comes before the warning for a shell that cannot be used, once each.
+/// The agent at High whose unelevated token cannot be made, asked by a login that set nothing.
+fn at_high_without_a_token(tag: &str, host: TestHost, mode: Mode, command: Option<&str>) -> Answer {
+    answered(
+        tag,
+        hooks_at_high_without_a_token(host),
+        request_asking(mode, command, None),
+    )
+    .0
+}
+
+/// The real agent handler hands a command back to the real command relay of the shim, over one connection:
+/// the shim says why, runs nothing and reads none of its stdin, and the agent's handler returns once the shim's
+/// side has closed (the agent waits for that after it ends its own).
 #[test]
-fn agent_says_the_fallback_notice_before_the_warning_for_a_broken_shell() {
+fn a_real_agent_that_cannot_step_a_command_down_hands_it_back_to_the_real_relay_with_stdin_unread() {
+    use crate::test_support::RecordedInput;
     let _serial = STARTS_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     taken_starts();
-    let host = TestHost::new().with_user_config("shell: {strt: x}\n");
-    let answer = at_high_without_a_token("fallback-broken", host, Mode::Exec, Some("whoami"));
+    let (server, client, dir) = crate::test_support::raw_socket_pair("handback-relay");
+    let agent =
+        std::thread::spawn(move || handle_connection_with(server, hooks_at_high_without_a_token(TestHost::new())));
+    let (stdin, input_dropped, reads) = RecordedInput::new(b"for the shell that runs the command");
+    let mut stderr = Vec::new();
+
+    let relayed = crate::shim_pty::relay_exec(client, "whoami", None, stdin, &mut stderr).unwrap();
+    let handler = agent.join().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert_eq!(relayed, None, "the command falls open");
+    let stderr = String::from_utf8(stderr).unwrap();
+    let prefix = crate::shim_pty::unavailable_message(None);
+    assert!(stderr.starts_with(&prefix), "{stderr}");
+    assert!(stderr.contains("the token cannot be made"), "{stderr}");
+    input_dropped.recv().expect("the input is dropped when the relay ends");
+    assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 0, "stdin was read");
+    assert!(taken_starts().is_empty(), "a start hook was called");
+    assert!(handler.is_ok(), "{:#}", handler.unwrap_err());
+}
+
+/// A login that set nothing is not refused when its session cannot be stepped down, and the agent hosts no session
+/// it could not step down: it answers one `HandBack` with the cause, in both modes, and starts nothing.
+#[test]
+fn agent_hands_back_a_login_that_set_nothing_when_it_cannot_step_it_down_and_starts_nothing() {
+    let _serial = STARTS_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    for (tag, mode, command) in REQUESTS {
+        taken_starts();
+        let answer = at_high_without_a_token(&format!("handback-{tag}"), TestHost::new(), mode, command);
+        assert_eq!(
+            answer.outcome,
+            Outcome::HandedBack("the token cannot be made".to_owned()),
+            "{tag}"
+        );
+        assert!(taken_starts().is_empty(), "{tag}: the start hook was called");
+        assert_eq!(answer.served, 0, "{tag}");
+        assert!(answer.stderr.is_empty() && answer.stdout.is_empty(), "{tag}");
+    }
+}
+
+/// A shell configuration the agent cannot plan changes nothing about a hand-back: the shell is the shim's business
+/// after it, and the agent reads the configuration only for a session it hosts. Here the configured shell is
+/// broken and the built-in `cmd.exe` cannot be found, so planning fails.
+#[test]
+fn agent_hands_back_before_it_reads_a_broken_shell_into_a_warning() {
+    let _serial = STARTS_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     taken_starts();
-    let notice = format!("{}\n", the_fallback_notice());
-    assert!(answer.stderr.starts_with(&notice), "{}", answer.stderr);
+    let host = TestHost {
+        no_system_dir: true,
+        ..TestHost::new().with_user_config("shell: {strt: x}\n")
+    };
     assert!(
-        answer.stderr[notice.len()..].starts_with(&format!("ssh-broker: cannot use the shell from {USER_CONFIG}")),
-        "{}",
-        answer.stderr
+        crate::shell::plan(&host, &crate::shell::Session::Interactive).is_err(),
+        "the host must fail the planning, or this test says nothing"
     );
+    let answer = at_high_without_a_token("handback-broken", host, Mode::Exec, Some("whoami"));
+    assert_eq!(
+        answer.outcome,
+        Outcome::HandedBack("the token cannot be made".to_owned())
+    );
+    assert!(taken_starts().is_empty());
+    assert!(answer.stderr.is_empty(), "{}", answer.stderr);
+}
+
+/// A login that set a level is not handed back: the shim could not run it as it asked.
+#[test]
+fn agent_does_not_hand_back_a_login_that_set_a_level() {
+    for (tag, mode, command) in REQUESTS {
+        let hooks = Hooks {
+            make_unelevated: |asked| {
+                crate::account::step_down(
+                    asked,
+                    || Ok(crate::socket_loc::Integrity::High),
+                    || -> anyhow::Result<UnelevatedToken> { Err(anyhow::anyhow!("the token cannot be made")) },
+                )
+            },
+            start_exec: |_, _, _| panic!("a command was started for a refused login"),
+            start_pty: |_, _, _, _, _, _| panic!("a shell was started for a refused login"),
+            ..Hooks::production()
+        };
+        let (answer, result) = answered(
+            &format!("no-handback-{tag}"),
+            hooks,
+            request_for(mode, command, ElevationPolicy::Prompt),
+        );
+        assert_eq!(answer.outcome, Outcome::Exited(255), "{tag}");
+        assert_eq!(answer.served, 0, "{tag}");
+        assert!(result.is_err(), "{tag}");
+    }
+}
+
+// The answer -----
+
+/// `Serving` means the session's process has started: a start that fails is answered with the ordinary failure
+/// reply, and `Serving` was never sent. A working maker, `Own` and a `Token` alike.
+#[test]
+fn a_start_that_fails_is_never_answered_with_serving() {
+    fn own(_: Option<ElevationPolicy>) -> anyhow::Result<StepDown<UnelevatedToken>> {
+        Ok(StepDown::Own)
+    }
+    fn token(_: Option<ElevationPolicy>) -> anyhow::Result<StepDown<UnelevatedToken>> {
+        Ok(StepDown::Token(UnelevatedToken::of_this_process()?))
+    }
+    for (tag, mode, command) in REQUESTS {
+        for (which, maker) in [("own", own as UnelevatedMaker), ("token", token)] {
+            let hooks = Hooks {
+                make_unelevated: maker,
+                ..failing_starters()
+            };
+            let (answer, result) = answered(
+                &format!("serving-{tag}-{which}"),
+                hooks,
+                request_for(mode, command, ElevationPolicy::Prompt),
+            );
+            assert_eq!(
+                answer.served, 0,
+                "{tag} {which}: Serving was sent for a start that failed"
+            );
+            assert_eq!(answer.outcome, Outcome::Exited(255), "{tag} {which}");
+            assert!(
+                answer.stderr.contains("could not start the"),
+                "{tag} {which}: {}",
+                answer.stderr
+            );
+            assert!(result.is_err(), "{tag} {which}");
+        }
+    }
+}
+
+/// A session that starts and ends by itself: `Serving` first, then its output and its exit code, in both modes.
+#[test]
+fn agent_answers_serving_first_and_then_the_output_of_a_session_that_starts() {
+    for (tag, mode) in [("exec", Mode::Exec), ("pty", Mode::Pty)] {
+        let hooks = Hooks {
+            make_unelevated: |_| Ok(StepDown::Own),
+            ..Hooks::production()
+        };
+        let hs = Handshake {
+            mode,
+            command: Some("cmd.exe /c echo served & exit 7".to_owned()),
+            elevation: Some(ElevationPolicy::Prompt),
+            ..Handshake::pty_default()
+        };
+        let (answer, result) = answered(&format!("serving-runs-{tag}"), hooks, move |tx| {
+            write_frame(tx, FrameKind::Handshake, &hs.encode().unwrap()).unwrap();
+            if mode == Mode::Exec {
+                write_data(tx, Stream::Stdin, b"").unwrap();
+            }
+        });
+        result.unwrap();
+        // The pump takes `Serving` only as the first frame, so once is first.
+        assert_eq!(answer.served, 1, "{tag}");
+        assert_eq!(answer.outcome, Outcome::Exited(7), "{tag}");
+        assert!(answer.stdout.contains("served"), "{tag}: {}", answer.stdout);
+    }
+}
+
+/// `Serving` is written after the session's process has started, not before, in both modes. The hook that runs
+/// right after the start holds the agent there until the client has looked at its connection: a write that had
+/// completed is readable at once on this socket, so a client that finds nothing proves nothing was written yet.
+#[test]
+fn nothing_is_written_to_the_client_until_the_session_has_started() {
+    for (tag, mode) in [("exec", Mode::Exec), ("pty", Mode::Pty)] {
+        nothing_is_written_until_started(tag, mode);
+    }
+}
+
+fn nothing_is_written_until_started(tag: &str, mode: Mode) {
+    use std::mem::MaybeUninit;
+    use std::sync::{Mutex, mpsc};
+    let (started, client_hears_of_it) = mpsc::channel::<()>();
+    let (client_has_looked, agent_waits_for_it) = mpsc::channel::<()>();
+    let agent_waits_for_it = Mutex::new(agent_waits_for_it);
+    let hooks = Hooks {
+        make_unelevated: |_| Ok(StepDown::Own),
+        after_spawn: Box::new(move || {
+            started.send(()).unwrap();
+            // An error is the test having failed before it looked; the agent goes on and ends.
+            let _ = agent_waits_for_it.lock().unwrap().recv();
+        }),
+        ..Hooks::production()
+    };
+    let (server, client, dir) = crate::test_support::raw_socket_pair(&format!("serving-after-start-{tag}"));
+    let agent = std::thread::spawn(move || handle_connection_in(server, hooks, &Control::standalone()));
+    let (mut rx, mut tx) = afunix::split(client).unwrap();
+    let hs = Handshake {
+        mode,
+        command: Some("cmd.exe /c exit 0".to_owned()),
+        ..Handshake::pty_default()
+    };
+    write_frame(&mut tx, FrameKind::Handshake, &hs.encode().unwrap()).unwrap();
+    client_hears_of_it
+        .recv()
+        .expect("the agent ended before it started the session");
+
+    // The agent is held in the hook: the session has started, and nothing has been written to this connection.
+    let looking = tx.try_clone_socket().unwrap();
+    looking.set_nonblocking(true).unwrap();
+    let mut first_byte = [MaybeUninit::<u8>::uninit()];
+    let found = looking.peek(&mut first_byte);
+    looking.set_nonblocking(false).unwrap();
+    // The agent waits for the client to close, and a copy of the connection held open would keep it waiting.
+    drop(looking);
+    client_has_looked.send(()).unwrap();
+    assert!(
+        matches!(&found, Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
+        "something was written before the session had started: {found:?}"
+    );
+
+    let mut sink = TestSink::default();
+    let outcome = pump_decode(&mut rx, &mut FrameReader::new(), &mut sink).expect("the reply was lost");
+    drop((rx, tx));
+    agent.join().unwrap().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert_eq!(sink.served, 1);
+    assert_eq!(outcome, Outcome::Exited(0));
 }

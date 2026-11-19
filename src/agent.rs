@@ -67,7 +67,7 @@ use crate::protocol::{
     ElevationPolicy, ExitCode, FrameKind, FrameReader, Handshake, Mode, Resize, Stream, read_one_frame, write_frame,
 };
 #[cfg(windows)]
-use crate::relay::{FrameSink, pump_until_peer_gone, write_data};
+use crate::relay::{FrameSink, pump_until_peer_gone, write_data, write_serving};
 #[cfg(windows)]
 use crate::route::{AgentArgs, BackgroundArgs};
 #[cfg(windows)]
@@ -689,10 +689,11 @@ struct Hooks {
 enum Observed {
     /// The shell has started. `output` is the read end of the pseudoconsole's output pipe and
     /// `process` the shell's process handle; both are valid until the session is dropped, which is
-    /// after a refused login has reported [`Observed::RefusedConsoleClosed`].
+    /// after a login that was not served has reported [`Observed::UnservedConsoleClosed`].
     ShellStarted { output: isize, process: isize },
-    /// A refused login has closed its pseudoconsole after reading `bytes` of its output.
-    RefusedConsoleClosed { bytes: usize },
+    /// A login that was started and not served has closed its pseudoconsole after reading `bytes` of
+    /// its output.
+    UnservedConsoleClosed { bytes: usize },
 }
 
 #[cfg(windows)]
@@ -765,41 +766,15 @@ fn handle_connection_in(conn: socket2::Socket, hooks: Hooks, control: &Control) 
     if control.is_ending() {
         return logout::refuse_while_ending(&mut rx, &mut tx, control);
     }
-    let mut launched = match launch::launch_line(&hs, &*hooks.shell_host) {
-        Ok(launched) => launched,
-        Err(launch::Refusal::BadRequest(cause)) => {
-            return Err(logout::fail_connection(
-                &mut rx,
-                &mut tx,
-                control,
-                "the agent could not read the request",
-                cause,
-                logout::BAD_REQUEST_EXIT_CODE,
-            ));
-        }
-        Err(launch::Refusal::Failed(cause)) => {
-            return Err(logout::fail_connection(
-                &mut rx,
-                &mut tx,
-                control,
-                "the agent could not prepare the shell",
-                cause,
-                logout::FAILED_EXIT_CODE,
-            ));
-        }
-    };
-    // Once, before anything is started, and given to every start of the session: the line, and the
-    // `console-fallback` verb, whose child inherits it. What each answer of the rule means is on
-    // `crate::account::step_down`.
+    // Decided before the shell's configuration is read: a handed-back login's shell is the shim's to plan
+    // (see `crate::account::step_down`).
     let unelevated = match (hooks.make_unelevated)(hs.elevation) {
         Ok(StepDown::Token(token)) => Some(token),
         Ok(StepDown::Own) => None,
+        // The agent hosts no session it could not step down: the shim runs it, in either mode.
         Ok(StepDown::Fallback(cause)) => {
-            tracing::warn!(
-                "the agent could not prepare an unelevated session, so the session has its own token: {cause}"
-            );
-            launched.add_notice(hs.mode, &text::unelevated_fallback(&cause, text::FallbackToken::Agent));
-            None
+            tracing::warn!("the agent could not prepare an unelevated session, so it hands the session back: {cause}");
+            return logout::hand_back(&mut rx, &mut tx, control, &cause);
         }
         Ok(StepDown::Refused) => {
             return Err(logout::fail_connection(
@@ -822,6 +797,30 @@ fn handle_connection_in(conn: socket2::Socket, hooks: Hooks, control: &Control) 
             ));
         }
     };
+    let launched = match launch::launch_line(&hs, &*hooks.shell_host) {
+        Ok(launched) => launched,
+        Err(launch::Refusal::BadRequest(cause)) => {
+            return Err(logout::fail_connection(
+                &mut rx,
+                &mut tx,
+                control,
+                "the agent could not read the request",
+                cause,
+                logout::BAD_REQUEST_EXIT_CODE,
+            ));
+        }
+        Err(launch::Refusal::Failed(cause)) => {
+            return Err(logout::fail_connection(
+                &mut rx,
+                &mut tx,
+                control,
+                "the agent could not prepare the shell",
+                cause,
+                logout::FAILED_EXIT_CODE,
+            ));
+        }
+    };
+    // The answer `Serving` is written by the handler, once the session's process has started.
     let cwd_buf = child_cwd(&hs.cwd, home_dir());
     let cwd = cwd_buf.as_deref();
     let env = Env {
@@ -844,6 +843,29 @@ fn show_notice(tx: &mut ConnTx, mode: Mode, text: &str) {
     // A client that has gone is found by the relay, which owns that case.
     if let Err(e) = write_data(tx, stream, &bytes) {
         tracing::debug!("could not show the shell warning: {e:#}");
+    }
+}
+
+/// Write the answer `Serving` (see [`FrameKind`]) once the session's process has started, before any of its
+/// output. A write that fails is logged and returned, and the caller ends the session: a client that
+/// was not answered forwards no input to it.
+#[cfg(windows)]
+fn answer_serving(tx: &mut ConnTx) -> anyhow::Result<()> {
+    write_serving(tx).inspect_err(|e| {
+        if crate::shim::peer_gone(e).is_some() {
+            tracing::debug!("the client is gone; could not send the answer: {e:#}");
+        } else {
+            tracing::warn!("could not send the answer: {e:#}");
+        }
+    })
+}
+
+/// Show the warnings of a start, in order, as the first data of a session that was started or ahead of the
+/// failure reply of one that was not.
+#[cfg(windows)]
+fn show_notices(tx: &mut ConnTx, mode: Mode, texts: &[String]) {
+    for text in texts {
+        show_notice(tx, mode, text);
     }
 }
 
@@ -942,7 +964,8 @@ fn handle_pty(
     } = env;
     // The warning for a shell that could not be used is printed by `console-fallback` inside the
     // pseudoconsole, which clears the screen after anything written ahead of it. Without this
-    // program's path it goes out here, before the output threads exist.
+    // program's path it goes out here, before the output threads exist: after `Serving`.
+    let mut notices = Vec::new();
     let started = launch::start(
         &*hooks.shell_host,
         launched,
@@ -958,11 +981,12 @@ fn handle_pty(
                 (hooks.start_pty)(verb_line, cols, rows, cwd, Some(read), unelevated.as_ref())
             }),
         },
-        |text| show_notice(&mut tx, Mode::Pty, text),
+        |text| notices.push(text.to_owned()),
     );
     let (mut session, configured) = match started {
         Ok(started) => started,
         Err(cause) => {
+            show_notices(&mut tx, Mode::Pty, &notices);
             return Err(logout::fail_connection(
                 &mut rx,
                 &mut tx,
@@ -980,8 +1004,19 @@ fn handle_pty(
     (hooks.after_spawn)();
     let job = session.job();
     let Some(_registration) = register_session(control, &job) else {
-        return refuse_unserved_pty(session, &mut rx, &mut tx, control, &*hooks.observe);
+        tracing::debug!("the agent is ending; the shell warnings of a refused login are not shown: {notices:?}");
+        close_unserved_pty(session, &*hooks.observe);
+        return logout::refuse_while_ending(&mut rx, &mut tx, control);
     };
+    if answer_serving(&mut tx).is_err() {
+        // The login was started and cannot be served: end it as a refused one is ended.
+        if let Some(w) = teardown_warning(reap_tree(&job)) {
+            tracing::error!("{w}");
+        }
+        close_unserved_pty(session, &*hooks.observe);
+        return Ok(());
+    }
+    show_notices(&mut tx, Mode::Pty, &notices);
     // Before `tx` moves into the shared mutex.
     let hangup = start_hangup_watch(&tx, &job, hooks.make_watcher);
 
@@ -1120,17 +1155,11 @@ fn send_exit(tx: &mut impl HalfClose, code: i32) {
     }
 }
 
-/// Answer a login whose shell has been ended before it was served with the refusal. The pseudoconsole
-/// is closed first, with its output read as the regular teardown reads it: the shell has been running
-/// since `spawn`, and closing flushes whatever it wrote into a pipe that nothing else reads.
+/// Close the pseudoconsole of a login whose shell has been ended before it was served, with its output
+/// read as the regular teardown reads it: the shell has been running since `spawn`, and closing flushes
+/// whatever it wrote into a pipe that nothing else reads.
 #[cfg(windows)]
-fn refuse_unserved_pty(
-    mut session: PtySession,
-    rx: &mut ConnRx,
-    tx: &mut ConnTx,
-    control: &Control,
-    observe: &(dyn Fn(Observed) + Send + Sync),
-) -> anyhow::Result<()> {
+fn close_unserved_pty(mut session: PtySession, observe: &(dyn Fn(Observed) + Send + Sync)) {
     let out_raw = session.out_read_raw();
     let hpc = session.take_hpc_raw();
     let mut buf = [0u8; 32 * 1024];
@@ -1145,11 +1174,10 @@ fn refuse_unserved_pty(
     );
     if let Err(e) = drained {
         // Closing without a reader could block for ever; the pseudoconsole is left to the process's end.
-        tracing::warn!("could not read the output of a refused shell; its pseudoconsole stays open: {e}");
+        tracing::warn!("could not read the output of an unserved shell; its pseudoconsole stays open: {e}");
     }
-    observe(Observed::RefusedConsoleClosed { bytes });
+    observe(Observed::UnservedConsoleClosed { bytes });
     drop(session); // the pipe ends go after the reader has finished with them
-    logout::refuse_while_ending(rx, tx, control)
 }
 
 /// Run `close`, which flushes into a pipe `read_chunk` reads (it returns 0 at the end), with a
@@ -1221,6 +1249,8 @@ fn handle_exec(
         control,
         unelevated,
     } = env;
+    // The warning for a shell that could not be used goes out after `Serving`.
+    let mut notices = Vec::new();
     let started = launch::start(
         &*hooks.shell_host,
         launched,
@@ -1231,11 +1261,12 @@ fn handle_exec(
                 "a session without a pseudoconsole is given no verb"
             ))),
         },
-        |text| show_notice(&mut tx, Mode::Exec, text),
+        |text| notices.push(text.to_owned()),
     );
     let (mut child, configured) = match started {
         Ok(started) => started,
         Err(cause) => {
+            show_notices(&mut tx, Mode::Exec, &notices);
             return Err(logout::fail_connection(
                 &mut rx,
                 &mut tx,
@@ -1249,8 +1280,17 @@ fn handle_exec(
     (hooks.after_spawn)();
     let job = child.job();
     let Some(_registration) = register_session(control, &job) else {
+        tracing::debug!("the agent is ending; the shell warnings of a refused login are not shown: {notices:?}");
         return logout::refuse_while_ending(&mut rx, &mut tx, control);
     };
+    if answer_serving(&mut tx).is_err() {
+        // The command was started and cannot be served: end it.
+        if let Some(w) = teardown_warning(reap_tree(&job)) {
+            tracing::error!("{w}");
+        }
+        return Ok(());
+    }
+    show_notices(&mut tx, Mode::Exec, &notices);
     // Before `tx` moves into the shared mutex.
     let hangup = start_hangup_watch(&tx, &job, hooks.make_watcher);
     let out_raw = child.stdout_read_raw();

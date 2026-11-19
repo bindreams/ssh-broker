@@ -10,11 +10,13 @@ use std::io::{Read, Write};
 /// Result of a decode pump. `Exited(n)` = a clean `EXIT(n)` frame was received;
 /// `PeerClosed` = the stream ended with NO exit frame (a dead or abruptly-closed
 /// peer). The shim maps `PeerClosed` to a nonzero failure, never to exit 0, so a dead
-/// agent can't masquerade as a successful command.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// agent can't masquerade as a successful command. `HandedBack(cause)` = the agent's answer was
+/// [`FrameKind::HandBack`]: it started nothing, and `cause` is why.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
     Exited(i32),
     PeerClosed,
+    HandedBack(String),
 }
 
 /// Why a decode pump stopped without a clean end-of-stream.
@@ -62,7 +64,8 @@ impl PumpError {
 }
 
 /// A sink that accepts and drops everything, so a pump can keep watching a peer it is no
-/// longer able to deliver to.
+/// longer able to deliver to. It takes over from a sink that has failed, so the first frame is behind it
+/// and an answer is a protocol error before it is asked.
 struct DiscardSink;
 
 impl FrameSink for DiscardSink {
@@ -83,8 +86,9 @@ impl FrameSink for DiscardSink {
 /// never exits on its own. Separating "cannot deliver" from "nobody is there" is the whole point
 /// of [`PumpError`]; this function is where that distinction is spent.
 pub fn pump_until_peer_gone<R: Read>(r: &mut R, fr: &mut FrameReader, sink: &mut impl FrameSink) {
-    let Err(e) = pump_decode(r, fr, sink) else {
-        return; // clean end of stream: the peer is finished
+    let e = match pump_decode(r, fr, sink) {
+        Err(e) => e,
+        Ok(_) => return, // clean end of stream: the peer is finished
     };
     tracing::debug!("input pump stopped delivering: {e}");
     if e.peer_gone() {
@@ -103,9 +107,25 @@ pub fn write_data<W: Write>(w: &mut W, stream: Stream, bytes: &[u8]) -> anyhow::
     write_frame(w, FrameKind::Data, &payload)
 }
 
+/// Write the agent's answer `Serving` (see [`FrameKind`]).
+pub fn write_serving<W: Write>(w: &mut W) -> anyhow::Result<()> {
+    write_frame(w, FrameKind::Serving, &[])
+}
+
+/// Write the agent's answer `HandBack` (see [`FrameKind`]). `cause` is why, for the client to show.
+pub fn write_hand_back<W: Write>(w: &mut W, cause: &str) -> anyhow::Result<()> {
+    write_frame(w, FrameKind::HandBack, cause.as_bytes())
+}
+
 /// Where decoded non-EXIT frames are delivered. Implemented by both the shim and the
 /// agent handlers.
 pub trait FrameSink {
+    /// The agent's answer was `Serving`: called once, before anything else is delivered. An error is a
+    /// [`PumpError::Sink`]. The default is one: a sink that serves overrides it, and the others expect no
+    /// answer.
+    fn on_serving(&mut self) -> anyhow::Result<()> {
+        anyhow::bail!("an answer `Serving` where none is expected")
+    }
     fn on_data(&mut self, stream: Stream, bytes: &[u8]) -> anyhow::Result<()>;
     fn on_resize(&mut self, r: Resize) -> anyhow::Result<()> {
         let _ = r;
@@ -117,11 +137,30 @@ pub trait FrameSink {
 /// `sink`. Reuses `fr`'s residual buffer, so it can continue immediately after a
 /// handshake read via `protocol::read_one_frame`. A `HANDSHAKE` frame mid-stream is a
 /// protocol violation (error).
+///
+/// The agent's answer is recognised only as the connection's first frame (`fr` counts across calls):
+/// `Serving` calls [`FrameSink::on_serving`] and the pump goes on; `HandBack` ends it as
+/// [`Outcome::HandedBack`]. Either one anywhere else is a [`PumpError::Protocol`]; so on the agent's side,
+/// where the handshake was frame one, an answer kind from a client is.
 pub fn pump_decode<R: Read>(r: &mut R, fr: &mut FrameReader, sink: &mut impl FrameSink) -> Result<Outcome, PumpError> {
     let mut buf = [0u8; 32 * 1024];
     loop {
         while let Some(frame) = fr.next_frame().map_err(PumpError::Protocol)? {
+            let is_first = fr.frames_read() == 1;
             match frame.kind {
+                FrameKind::Serving | FrameKind::HandBack if !is_first => {
+                    return Err(PumpError::Protocol(anyhow::anyhow!(
+                        "{:?} frame after the first: the answer comes first or not at all",
+                        frame.kind
+                    )));
+                }
+                FrameKind::Serving => {
+                    sink.on_serving().map_err(PumpError::Sink)?;
+                }
+                FrameKind::HandBack => {
+                    let cause = String::from_utf8_lossy(&frame.payload).into_owned();
+                    return Ok(Outcome::HandedBack(cause));
+                }
                 FrameKind::Data => {
                     let tag = *frame
                         .payload
@@ -236,10 +275,15 @@ pub struct TestSink {
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
     pub resizes: Vec<Resize>,
+    pub served: usize,
 }
 
 #[cfg(test)]
 impl FrameSink for TestSink {
+    fn on_serving(&mut self) -> anyhow::Result<()> {
+        self.served += 1;
+        Ok(())
+    }
     fn on_data(&mut self, stream: Stream, bytes: &[u8]) -> anyhow::Result<()> {
         match stream {
             Stream::Stderr => self.stderr.extend_from_slice(bytes),

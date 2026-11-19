@@ -463,3 +463,173 @@ fn pump_until_peer_gone_delivers_every_frame_to_a_working_sink() {
     pump_until_peer_gone(&mut std::io::Cursor::new(framed), &mut FrameReader::new(), &mut sink);
     assert_eq!(sink.stdout, b"onetwo");
 }
+
+// ── the agent's answer ───────────────────────────────────────────────────────────────────
+
+/// `frames` written in order into one buffer.
+fn framed(frames: &[(FrameKind, &[u8])]) -> Vec<u8> {
+    let mut wire = Vec::new();
+    for (kind, payload) in frames {
+        write_frame(&mut wire, *kind, payload).unwrap();
+    }
+    wire
+}
+
+/// A `Serving` first frame calls the sink's `on_serving` once, before anything else, and the pump goes on.
+#[test]
+fn serving_as_the_first_frame_calls_on_serving_and_the_pump_goes_on() {
+    struct Order(Vec<&'static str>);
+    impl FrameSink for Order {
+        fn on_serving(&mut self) -> anyhow::Result<()> {
+            self.0.push("serving");
+            Ok(())
+        }
+        fn on_data(&mut self, _stream: Stream, _bytes: &[u8]) -> anyhow::Result<()> {
+            self.0.push("data");
+            Ok(())
+        }
+    }
+    let mut wire = Vec::new();
+    write_serving(&mut wire).unwrap();
+    write_data(&mut wire, Stream::Pty, b"x").unwrap();
+    write_frame(&mut wire, FrameKind::Exit, &ExitCode(4).encode()).unwrap();
+    let mut order = Order(Vec::new());
+    let outcome = pump_decode(&mut wire.as_slice(), &mut FrameReader::new(), &mut order).unwrap();
+    assert_eq!(outcome, Outcome::Exited(4));
+    assert_eq!(order.0, ["serving", "data"]);
+}
+
+/// A `HandBack` first frame ends the pump with the cause, and delivers nothing after it.
+#[test]
+fn hand_back_as_the_first_frame_ends_the_pump_with_the_cause() {
+    let mut wire = Vec::new();
+    write_hand_back(&mut wire, "the token cannot be made").unwrap();
+    write_data(&mut wire, Stream::Pty, b"never delivered").unwrap();
+    let mut sink = TestSink::default();
+    let outcome = pump_decode(&mut wire.as_slice(), &mut FrameReader::new(), &mut sink).unwrap();
+    assert_eq!(outcome, Outcome::HandedBack("the token cannot be made".to_owned()));
+    assert!(sink.stdout.is_empty());
+    assert_eq!(sink.served, 0);
+}
+
+/// A first frame that is not the answer is still what it was: a refusal's text and exit.
+#[test]
+fn a_first_frame_that_is_data_is_not_an_answer_and_never_calls_on_serving() {
+    let wire = framed(&[
+        (FrameKind::Data, &[Stream::Stderr as u8, b'n', b'o']),
+        (FrameKind::Exit, &ExitCode(255).encode()),
+    ]);
+    let mut sink = TestSink::default();
+    let outcome = pump_decode(&mut wire.as_slice(), &mut FrameReader::new(), &mut sink).unwrap();
+    assert_eq!(outcome, Outcome::Exited(255));
+    assert_eq!(sink.served, 0);
+}
+
+/// The answer is the first frame or it is a protocol error: after a data frame, `Serving` and `HandBack`
+/// both are, and the sink is not told.
+#[test]
+fn either_answer_after_a_data_frame_is_a_protocol_error() {
+    for (name, wire) in [
+        (
+            "Serving",
+            framed(&[(FrameKind::Data, &[Stream::Pty as u8, b'x']), (FrameKind::Serving, &[])]),
+        ),
+        (
+            "HandBack",
+            framed(&[
+                (FrameKind::Data, &[Stream::Pty as u8, b'x']),
+                (FrameKind::HandBack, b"late"),
+            ]),
+        ),
+    ] {
+        let mut sink = TestSink::default();
+        let err = pump_decode(&mut wire.as_slice(), &mut FrameReader::new(), &mut sink)
+            .expect_err("a late answer is a protocol error");
+        assert!(matches!(err, PumpError::Protocol(_)), "{name}: {err:?}");
+        assert_eq!(sink.served, 0, "{name}");
+    }
+}
+
+/// A second answer is a protocol error too, and so is a `Serving` after a `Serving`.
+#[test]
+fn a_second_answer_is_a_protocol_error() {
+    let wire = framed(&[(FrameKind::Serving, &[]), (FrameKind::Serving, &[])]);
+    let mut sink = TestSink::default();
+    let err = pump_decode(&mut wire.as_slice(), &mut FrameReader::new(), &mut sink).expect_err("two answers");
+    assert!(matches!(err, PumpError::Protocol(_)), "{err:?}");
+    assert_eq!(sink.served, 1);
+}
+
+/// "First" is the connection's first frame, not the first of a call: a reader that has yielded a frame
+/// already, in an earlier `pump_decode` call, takes an answer as a protocol error.
+#[test]
+fn an_answer_in_a_later_pump_call_on_the_same_reader_is_a_protocol_error() {
+    for (name, answer) in [
+        ("Serving", framed(&[(FrameKind::Serving, &[])])),
+        ("HandBack", framed(&[(FrameKind::HandBack, b"late")])),
+    ] {
+        let mut fr = FrameReader::new();
+        let mut sink = TestSink::default();
+        let first = framed(&[(FrameKind::Data, &[Stream::Pty as u8, b'x'])]);
+        let outcome = pump_decode(&mut first.as_slice(), &mut fr, &mut sink).unwrap();
+        assert_eq!(outcome, Outcome::PeerClosed);
+        let err = pump_decode(&mut answer.as_slice(), &mut fr, &mut sink).expect_err("a late answer");
+        assert!(matches!(err, PumpError::Protocol(_)), "{name}: {err:?}");
+        assert_eq!(sink.served, 0, "{name}");
+    }
+}
+
+/// On the agent's side the handshake is frame one, so an answer kind from a client is a protocol error.
+#[test]
+fn a_client_that_sends_an_answer_after_its_handshake_is_a_protocol_error() {
+    use crate::protocol::{Handshake, read_one_frame};
+    for (name, answer) in [("Serving", FrameKind::Serving), ("HandBack", FrameKind::HandBack)] {
+        let wire = framed(&[
+            (FrameKind::Handshake, &Handshake::pty_default().encode().unwrap()),
+            (answer, b"not from a client"),
+        ]);
+        let mut rx = wire.as_slice();
+        let mut fr = FrameReader::new();
+        assert_eq!(read_one_frame(&mut rx, &mut fr).unwrap().kind, FrameKind::Handshake);
+        let mut sink = TestSink::default();
+        let err = pump_decode(&mut rx, &mut fr, &mut sink).expect_err("a client has no answer to give");
+        assert!(matches!(err, PumpError::Protocol(_)), "{name}: {err:?}");
+        assert_eq!(sink.served, 0, "{name}");
+    }
+}
+
+/// A failing `on_serving` is a sink failure, which says nothing about the peer.
+#[test]
+fn a_failing_on_serving_is_a_sink_failure() {
+    struct Refuses;
+    impl FrameSink for Refuses {
+        fn on_serving(&mut self) -> anyhow::Result<()> {
+            anyhow::bail!("no input worker")
+        }
+        fn on_data(&mut self, _stream: Stream, _bytes: &[u8]) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+    let wire = framed(&[(FrameKind::Serving, &[])]);
+    let err = pump_decode(&mut wire.as_slice(), &mut FrameReader::new(), &mut Refuses).expect_err("fails");
+    assert!(matches!(err, PumpError::Sink(_)), "{err:?}");
+    assert!(!err.peer_gone());
+}
+
+/// A sink that expects no answer (a logout's reply sink) refuses one: a sink failure, and nothing is delivered.
+#[test]
+fn a_sink_with_the_default_on_serving_refuses_the_answer() {
+    struct Plain(Vec<u8>);
+    impl FrameSink for Plain {
+        fn on_data(&mut self, _stream: Stream, bytes: &[u8]) -> anyhow::Result<()> {
+            self.0.extend_from_slice(bytes);
+            Ok(())
+        }
+    }
+    let mut wire = framed(&[(FrameKind::Serving, &[])]);
+    write_data(&mut wire, Stream::Stdout, b"after").unwrap();
+    let mut plain = Plain(Vec::new());
+    let err = pump_decode(&mut wire.as_slice(), &mut FrameReader::new(), &mut plain).expect_err("refused");
+    assert!(matches!(err, PumpError::Sink(_)), "{err:?}");
+    assert!(plain.0.is_empty());
+}

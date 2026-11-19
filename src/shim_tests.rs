@@ -9,7 +9,7 @@ use crate::protocol::{
     ElevationPolicy, ExitCode, FrameKind, FrameReader, Handshake, Launch, Mode, Resize, Stream, read_one_frame,
     write_frame,
 };
-use crate::relay::{FrameSink, Outcome, TestSink, duplex, write_data};
+use crate::relay::{FrameSink, Outcome, TestSink, duplex, write_data, write_hand_back, write_serving};
 use crate::test_support::asked_policies;
 use std::io::Write;
 
@@ -27,6 +27,7 @@ fn exec_shim_relays_streams_and_exit() {
         let hs = Handshake::decode(&frame.payload).unwrap();
         assert_eq!(hs.mode, Mode::Exec);
         assert_eq!(hs.command.as_deref(), Some("whatever"));
+        write_serving(&mut stx).unwrap();
         // Emit stdout, then stderr (kept on a separate stream), then the exit code.
         write_data(&mut stx, Stream::Stdout, b"OUT").unwrap();
         write_data(&mut stx, Stream::Stderr, b"ERR").unwrap();
@@ -78,6 +79,7 @@ fn exec_relay_is_byte_clean_from_the_agent() {
     let agent = std::thread::spawn(move || {
         let mut fr = FrameReader::new();
         let _ = read_one_frame(&mut srx, &mut fr).unwrap(); // consume the handshake
+        write_serving(&mut stx).unwrap();
         for c in &chunks {
             write_data(&mut stx, Stream::Stdout, c).unwrap();
         }
@@ -119,6 +121,7 @@ fn exec_relay_is_byte_clean_to_the_agent() {
     let agent = std::thread::spawn(move || {
         let mut fr = FrameReader::new();
         let _ = read_one_frame(&mut srx, &mut fr).unwrap(); // consume the handshake
+        write_serving(&mut stx).unwrap(); // the input flows only after this
         let mut got = Vec::new();
         loop {
             let frame = read_one_frame(&mut srx, &mut fr).unwrap();
@@ -163,6 +166,7 @@ fn exec_shim_dead_agent_is_255_not_command_failure() {
     let agent = std::thread::spawn(move || {
         let mut fr = FrameReader::new();
         let _ = read_one_frame(&mut srx, &mut fr).unwrap(); // consume handshake
+        write_serving(&mut stx).unwrap();
         write_data(&mut stx, Stream::Stdout, b"partial output").unwrap();
         // Drop stx WITHOUT an EXIT frame → the shim sees PeerClosed.
     });
@@ -277,6 +281,7 @@ fn exec_out_sink_flushes_each_frame() {
     let mut sink = ExecOutSink {
         out: FlushSpy::default(),
         err: FlushSpy::default(),
+        forward: None,
     };
     sink.on_data(Stream::Stdout, b"binary-no-newline").unwrap();
     sink.on_data(Stream::Stderr, b"err-no-newline").unwrap();
@@ -511,6 +516,8 @@ fn map_outcome_exit_code_policy() {
     assert_eq!(map_outcome(Ok(Outcome::Exited(0))), 0);
     // A dead/abrupt peer is never 0; protocol errors get a distinct nonzero.
     assert_eq!(map_outcome(Ok(Outcome::PeerClosed)), 255);
+    // A hand-back reaching here is a caller that cannot run a session itself: not the command's code.
+    assert_eq!(map_outcome(Ok(Outcome::HandedBack("why".into()))), 254);
     assert_eq!(
         map_outcome(Err(crate::relay::PumpError::Protocol(anyhow::anyhow!(
             "truncated frame"
@@ -713,7 +720,7 @@ fn a_blank_command_is_empty_or_only_space_tab_cr_lf() {
 
 // The agent that never answers, and the input of a command -----
 
-use super::{PumpError, Pumped, Started, peer_gone, start_exec_input};
+use super::{KeepOpen, PumpError, Pumped, Started, peer_gone, pump_exec, start_exec_input};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 
@@ -770,24 +777,7 @@ fn stdin_data(payload: &[u8]) -> (FrameKind, Vec<u8>) {
     (FrameKind::Data, p)
 }
 
-/// Input that is read once the test lets it: ends at EOF, and says when the reader has dropped it, which
-/// the forwarder does as it returns.
-struct Stdin {
-    data: std::io::Cursor<Vec<u8>>,
-    dropped: mpsc::Sender<()>,
-}
-
-impl std::io::Read for Stdin {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        std::io::Read::read(&mut self.data, buf)
-    }
-}
-
-impl Drop for Stdin {
-    fn drop(&mut self) {
-        let _ = self.dropped.send(());
-    }
-}
+use crate::test_support::RecordedInput as Stdin;
 
 /// A connection that says when it is closed.
 struct Tracked(Arc<AtomicBool>, Wire);
@@ -807,34 +797,98 @@ impl Drop for Tracked {
     }
 }
 
-#[test]
-fn the_handshake_goes_first_and_the_input_follows_with_the_end_marker() {
-    let (conn, from_conn) = wire();
-    let (dropped, _) = mpsc::channel();
-    let stdin = Stdin {
-        data: std::io::Cursor::new(
-            b"b
-a
-"
-            .to_vec(),
-        ),
-        dropped,
-    };
-    let _keep = match start_exec_input(conn, &exec_handshake(), stdin).unwrap() {
+/// What the agent says, as bytes the shim reads: `Serving`, then end of stream.
+fn the_agent_serves() -> Vec<u8> {
+    let mut said = Vec::new();
+    write_serving(&mut said).unwrap();
+    said
+}
+
+/// What the agent says, as bytes the shim reads: a hand-back with `cause`, then end of stream.
+fn the_agent_hands_back(cause: &str) -> Vec<u8> {
+    let mut said = Vec::new();
+    write_hand_back(&mut said, cause).unwrap();
+    said
+}
+
+/// The guard of a connection whose handshake went out; panics if the peer had gone.
+fn ready<W>(started: anyhow::Result<Started<W>>) -> KeepOpen<W> {
+    match started.unwrap() {
         Started::Ready(keep) => keep,
         Started::Closed(e) => panic!("{e:#}"),
-    };
-    let sent = frames(&from_conn, 3);
-    assert_eq!(sent[0].0, FrameKind::Handshake);
-    assert_eq!(
-        sent[1],
-        stdin_data(
-            b"b
-a
-"
-        )
+    }
+}
+
+#[test]
+fn the_handshake_goes_first_and_the_input_follows_the_answer_with_the_end_marker() {
+    let (conn, from_conn) = wire();
+    let (stdin, _, _) = Stdin::new(b"b\na\n");
+    let keep = ready(start_exec_input(conn, &exec_handshake()));
+    assert_eq!(frames(&from_conn, 1)[0].0, FrameKind::Handshake);
+
+    let pumped = pump_exec(
+        the_agent_serves().as_slice(),
+        Vec::new(),
+        Vec::new(),
+        keep.forwarding(stdin),
     );
-    assert_eq!(sent[2], stdin_data(b""), "the end of input is a marker, not a close");
+    assert_eq!(pumped.outcome.unwrap(), Outcome::PeerClosed);
+
+    let sent = frames(&from_conn, 2);
+    assert_eq!(sent[0], stdin_data(b"b\na\n"));
+    assert_eq!(sent[1], stdin_data(b""), "the end of input is a marker, not a close");
+}
+
+/// A hand-back leaves stdin unread, so the shell that finally runs gets the input.
+#[test]
+fn a_hand_back_means_stdin_was_never_read_and_the_cause_comes_back() {
+    let (conn, from_conn) = wire();
+    let (stdin, was_dropped, reads) = Stdin::new(b"input that is for the shell that runs");
+    let keep = ready(start_exec_input(conn, &exec_handshake()));
+
+    let pumped = pump_exec(
+        the_agent_hands_back("the token cannot be made").as_slice(),
+        Vec::new(),
+        Vec::new(),
+        keep.forwarding(stdin),
+    );
+
+    assert_eq!(pumped.handed_back(), Some("the token cannot be made"));
+    assert!(!pumped.no_answer());
+    // The forwarder that was never started is dropped with the sink, and a started one drops its input as it
+    // returns: either way the input has been dropped by here, and the reads it had are final.
+    was_dropped.recv().expect("the input is dropped with the pump");
+    assert_eq!(
+        reads.load(Ordering::SeqCst),
+        0,
+        "stdin was read before the answer, or after a hand-back"
+    );
+    drop(keep);
+    assert_eq!(
+        frames(&from_conn, 1)[0].0,
+        FrameKind::Handshake,
+        "only the handshake was sent"
+    );
+    assert!(from_conn.recv().is_err(), "nothing but the handshake went to the agent");
+}
+
+/// The answer that is not an answer (a refusal's text) starts no input either: the agent is not serving.
+#[test]
+fn a_refusal_in_place_of_the_answer_does_not_start_the_input_either() {
+    let (conn, _from_conn) = wire();
+    let (stdin, was_dropped, reads) = Stdin::new(b"x");
+    let keep = ready(start_exec_input(conn, &exec_handshake()));
+    let mut refusal = Vec::new();
+    write_data(&mut refusal, Stream::Stderr, b"no").unwrap();
+    write_frame(&mut refusal, FrameKind::Exit, &ExitCode(255).encode()).unwrap();
+
+    let mut err = Vec::new();
+    let pumped = pump_exec(refusal.as_slice(), Vec::new(), &mut err, keep.forwarding(stdin));
+
+    assert_eq!(pumped.code(), 255);
+    assert_eq!(err, b"no");
+    was_dropped.recv().expect("the input is dropped with the pump");
+    assert_eq!(reads.load(Ordering::SeqCst), 0);
 }
 
 #[test]
@@ -843,15 +897,14 @@ fn the_connection_stays_open_after_the_end_of_input_until_the_session_is_over() 
     // is held by the caller, not by the thread that forwards the input and ends with it.
     let closed = Arc::new(AtomicBool::new(false));
     let (conn, from_conn) = wire();
-    let (dropped, forwarder_returned) = mpsc::channel();
-    let stdin = Stdin {
-        data: std::io::Cursor::new(Vec::new()),
-        dropped,
-    };
-    let keep = match start_exec_input(Tracked(Arc::clone(&closed), conn), &exec_handshake(), stdin).unwrap() {
-        Started::Ready(keep) => keep,
-        Started::Closed(e) => panic!("{e:#}"),
-    };
+    let (stdin, forwarder_returned, _) = Stdin::new(b"");
+    let keep = ready(start_exec_input(Tracked(Arc::clone(&closed), conn), &exec_handshake()));
+    pump_exec(
+        the_agent_serves().as_slice(),
+        Vec::new(),
+        Vec::new(),
+        keep.forwarding(stdin),
+    );
     assert_eq!(frames(&from_conn, 2)[1], stdin_data(b""));
     forwarder_returned
         .recv()
@@ -868,7 +921,7 @@ fn the_connection_stays_open_after_the_end_of_input_until_the_session_is_over() 
 fn a_handshake_to_a_peer_that_has_gone_is_reported_not_raised() {
     let (gone, from_gone) = wire();
     drop(from_gone);
-    match start_exec_input(gone, &exec_handshake(), std::io::empty()).unwrap() {
+    match start_exec_input(gone, &exec_handshake()).unwrap() {
         Started::Closed(e) => assert_eq!(peer_gone(&e), Some(std::io::ErrorKind::BrokenPipe)),
         Started::Ready(_) => panic!("the peer had gone"),
     }
@@ -885,7 +938,28 @@ fn a_handshake_that_fails_for_another_reason_is_an_error() {
             Ok(())
         }
     }
-    assert!(start_exec_input(Denied, &exec_handshake(), std::io::empty()).is_err());
+    assert!(start_exec_input(Denied, &exec_handshake()).is_err());
+}
+
+/// A caller that cannot run the session itself (`verify`'s probe) gets an error that names the cause, not
+/// a code that looks like the command's.
+#[test]
+fn run_exec_on_reports_a_hand_back_as_an_error_naming_the_cause() {
+    let (server, client) = duplex();
+    let (mut srx, mut stx) = server.split();
+    let (crx, ctx) = client.split();
+    let agent = std::thread::spawn(move || {
+        let _ = read_one_frame(&mut srx, &mut FrameReader::new()).unwrap();
+        write_hand_back(&mut stx, "the token cannot be made").unwrap();
+    });
+    let hs = Handshake {
+        mode: Mode::Exec,
+        command: Some("x".into()),
+        ..Handshake::pty_default()
+    };
+    let err = super::run_exec_on(crx, ctx, &hs, Vec::new(), Vec::new(), std::io::empty()).unwrap_err();
+    agent.join().unwrap();
+    assert!(format!("{err:#}").contains("the token cannot be made"), "{err:#}");
 }
 
 #[test]
@@ -893,7 +967,8 @@ fn only_a_connection_that_ended_without_a_byte_from_the_agent_is_unanswered() {
     use std::io::ErrorKind::{ConnectionReset, PermissionDenied};
     let transport = |kind| Err(PumpError::Transport(std::io::Error::from(kind)));
     let protocol = || Err(PumpError::Protocol(anyhow::anyhow!("bad frame")));
-    let cases: [(&str, Result<Outcome, PumpError>, bool, bool); 7] = [
+    let cases: [(&str, Result<Outcome, PumpError>, bool, bool); 8] = [
+        ("handed back", Ok(Outcome::HandedBack("why".into())), true, false),
         ("closed, silent", Ok(Outcome::PeerClosed), false, true),
         ("reset, silent", transport(ConnectionReset), false, true),
         ("closed after a byte", Ok(Outcome::PeerClosed), true, false),
@@ -1064,7 +1139,7 @@ fn fail_open_token_failure_of_a_login_that_asked_is_refused_and_names_both_ways_
                 "{asked:?} {exec:?}"
             );
             assert!(
-                text.contains("leaves SSH_BROKER_ELEVATION unset") && text.contains("sets it to always"),
+                text.contains("leaves SSH_BROKER_ELEVATION unset") && !text.contains("always"),
                 "{text:?}"
             );
         }
@@ -1130,10 +1205,7 @@ fn fail_open_a_login_that_set_nothing_gets_the_shell_and_the_notice_when_it_cann
             String::from_utf8(stderr).unwrap(),
             format!(
                 "{}\n",
-                crate::offer::text::unelevated_fallback(
-                    "the token cannot be made",
-                    crate::offer::text::FallbackToken::Sshd
-                )
+                crate::offer::text::unelevated_fallback("the token cannot be made")
             ),
             "{exec:?}"
         );
