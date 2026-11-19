@@ -54,9 +54,9 @@ use pty_client::PtyRun;
 use stand_in::Kit;
 
 /// How many fresh-account repetitions to run at most.
-const REPETITIONS: usize = 20;
+const REPETITIONS: usize = 150;
 /// Lines typed after the baseline, each at once after the answer to the one before, before `exit`.
-const MARKER_LINES: usize = 40;
+const MARKER_LINES: usize = 3;
 
 /// What the prompt says first, as in `prompt_path_windows`.
 const PROMPT: &str = "Enter your Windows password to start one.";
