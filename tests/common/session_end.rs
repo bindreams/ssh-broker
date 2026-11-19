@@ -9,13 +9,16 @@
 //! fallback, and every use of it is recorded.
 //!
 //! The logoff of a session (Security 4634) is waited for. It comes for a secondary-logon session and for
-//! most Task Scheduler Batch sessions; where Windows keeps a Batch session with no process left it is not a
-//! failure here, and `tests/auto_login_windows.rs` measures that such sessions do not pile up.
+//! most Batch sessions. Where Windows keeps a session with no process left, its logon type decides, read
+//! from the session before `logout` is asked: a Batch session is recorded, and is not a failure here
+//! (`tests/auto_login_windows.rs` measures that such sessions do not pile up); a session of any other type,
+//! or of a type that could not be read, fails. Who logged the account on does not decide it: the product
+//! starts the background agent of an administrator's password prompt with a Batch logon, under sshd too.
 //!
 //! The including crate declares `account_fixture`, `agent_conn`, `bounded_wait` and `logon_session`.
 #![allow(dead_code)]
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -26,7 +29,7 @@ use ssh_broker::socket_loc::{Integrity, SocketLocation};
 use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
 use windows::Win32::System::Threading::WaitForSingleObject;
 
-use crate::account_fixture::{Account, ServiceLogon, hive, profile};
+use crate::account_fixture::{Account, ServiceLogon, hive, holders, profile};
 use crate::agent_conn::AgentConn;
 use crate::bounded_wait::CHILD_EXIT_BOUND;
 use crate::logon_session::{self, LogoffWatch};
@@ -34,6 +37,9 @@ use crate::logon_session::{self, LogoffWatch};
 /// How long Windows may take to write the logoff event after the last process of a session has ended: an
 /// external event that may never come. Expiry fails the wait and says what was measured.
 pub const LOGOFF_EVENT_BOUND: Duration = Duration::from_secs(180);
+
+/// `LogonType` of a Batch logon session in `SECURITY_LOGON_SESSION_DATA`.
+const LOGON_TYPE_BATCH: u32 = 4;
 
 /// What ending a session found.
 #[derive(Debug)]
@@ -146,7 +152,10 @@ fn end(
     how: ServiceLogon,
 ) -> Result<Option<Ended>, String> {
     let mut steps = Vec::new();
-    let outcome = attempt("end the session", || try_end(exe, name, sid, location, how, &mut steps)).and_then(|r| r);
+    let outcome = attempt("end the session", || {
+        try_end(exe, name, sid, sid_text, location, &mut steps)
+    })
+    .and_then(|r| r);
     hive::record(&format!(
         "session end [{who}] {name} ({sid_text}), logged on by {how}: {}; hive now (not required to unload after a \
          {how} logon): {}; result: {}",
@@ -167,8 +176,8 @@ fn try_end(
     exe: &Path,
     name: &str,
     sid: &Sid,
+    sid_text: &str,
     location: &SocketLocation,
-    how: ServiceLogon,
     steps: &mut Vec<String>,
 ) -> Result<Option<Ended>, String> {
     let integrity = location.integrity();
@@ -190,6 +199,25 @@ fn try_end(
         .collect();
     // Subscribed before the logout runs, so the event cannot be missed.
     let watches: Vec<(u64, LogoffWatch)> = ids.iter().map(|id| (*id, LogoffWatch::new(*id))).collect();
+    // Read now, while the sessions exist: a session that stays is judged by its type.
+    let logon_types: BTreeMap<u64, u32> = match holders::sessions_of(sid_text) {
+        Ok(sessions) => sessions
+            .into_iter()
+            .filter(|session| ids.contains(&session.id))
+            .map(|session| (session.id, session.logon_type))
+            .collect(),
+        Err(why) => {
+            steps.push(format!("logon types not read: {why}"));
+            BTreeMap::new()
+        }
+    };
+    steps.push(format!(
+        "logon types {:?}",
+        logon_types
+            .iter()
+            .map(|(id, logon_type)| format!("{id:#x}: {logon_type}"))
+            .collect::<Vec<_>>()
+    ));
     let own = std::process::id();
     let held: Vec<_> = ids
         .iter()
@@ -267,34 +295,34 @@ fn try_end(
     drop(remaining);
     steps.push("no process left in the sessions".to_owned());
     let mut logged_off = BTreeSet::new();
-    let mut missing = Vec::new();
+    let mut failed = Vec::new();
     for (id, watch) in &watches {
         let seen = watch.wait(LOGOFF_EVENT_BOUND);
         steps.push(format!("4634 for {id:#x}: {}", if seen { "seen" } else { "not seen" }));
         if seen {
             logged_off.insert(*id);
-        } else {
-            missing.push(format!("{id:#x}"));
+            continue;
         }
-    }
-    if missing.is_empty() {
-        return Ok(Some(Ended { logged_off }));
-    }
-    match how {
-        // Windows keeps some Batch sessions of Task Scheduler with no process left. Whether
+        // Windows keeps some Batch sessions with no process left, whoever logged the account on: the
+        // product starts an administrator's prompt session with a Batch logon, under sshd too. Whether
         // they pile up is measured by `tests/auto_login_windows.rs`; here it is recorded.
-        ServiceLogon::TaskScheduler => {
-            steps.push(format!(
-                "logon session(s) {} stay with no process left, which Windows does at times for a Batch logon",
-                missing.join(", ")
-            ));
-            Ok(Some(Ended { logged_off }))
+        match logon_types.get(id) {
+            Some(&LOGON_TYPE_BATCH) => steps.push(format!(
+                "logon session {id:#x} stays with no process left; it is a Batch logon, which Windows does at \
+                 times keep"
+            )),
+            Some(other) => failed.push(format!("{id:#x} (logon type {other})")),
+            None => failed.push(format!("{id:#x} (logon type could not be read)")),
         }
-        ServiceLogon::Sshd => Err(format!(
+    }
+    if failed.is_empty() {
+        Ok(Some(Ended { logged_off }))
+    } else {
+        Err(format!(
             "logon session(s) {} of {name} still present: no 4634 within {LOGOFF_EVENT_BOUND:?} although every \
-             process of them has ended",
-            missing.join(", ")
-        )),
+             process of them has ended, and a session that is not a Batch logon is not kept",
+            failed.join(", ")
+        ))
     }
 }
 
