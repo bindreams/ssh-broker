@@ -125,10 +125,11 @@ fn the_unelevated_child_connects_to_request_sock() {
 /// The reply the agent gives `logout`.
 const ENDING: &str = "ending your background session.";
 
-/// `ssh -T host -- "<exe>" logout`, in the session the account's default login gets: unelevated.
+/// `ssh -T host -- "& '<exe>' logout"`, in the session the account's default login gets: unelevated. The
+/// account's shell is PowerShell, which runs a quoted path only through its call operator.
 fn logout_over_ssh(kit: &Kit, login: &Login<'_>) -> sshd_rig::Outcome {
     let mut ssh = login.command();
-    ssh.arg("-T").arg("--").arg(format!("\"{}\" logout", kit.exe.display()));
+    ssh.arg("-T").arg("--").arg(format!("& '{}' logout", kit.exe.display()));
     run_client(ssh, false, kit.dir())
 }
 
