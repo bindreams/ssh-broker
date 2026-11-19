@@ -44,12 +44,13 @@ the rest. The profile follows from the interactive logon and is not separately c
 | `provision`, `provision/{probe,probe_run,session_rows}` | `apply`/`doctor`: DefaultShell, logon task, per-user socket rows, parity probes (the PROBE line, the junction they follow, the two probes of an elevated agent) and the rows they give |
 | `offer`, `offer/text` | the session offer as a pure state machine over injected I/O, and every line it shows |
 | `secret`, `password_entry` | wiped password buffers, and the key-event state machine that fills one |
-| `console_modes`, `console_prompt` | the console's raw mode as a guard; the password prompt on it, and why the shim has no agent |
+| `consent_entry` | the key-event state machine of the consent question: `y` or `yes` and Enter allow, anything else refuses |
+| `console_modes`, `console_prompt` | the console's raw mode as a guard; the password prompt on it, the consent question on it (`ask_consent`), and why the shim has no agent |
 | `shim_offer` | the shim's hook for a missing agent: the notice, or the prompt, the logon and the wait for the agent |
 | `account`, `logon`, `socket_watch` | who the token is and how elevated (`Elevation`), the secondary-logon call that starts a background agent, and the folder and profile-list watch with which the shim learns the agent serves (no named kernel object) |
 | `agent_background`, `agent/logout`, `logout` | the background agent's start checks and exit codes; ending a session, both sides |
 | `request`, `agent/requests`, `agent/session` | the client loop of the verbs that ask the agent (on `agent.sock`, or from below High on `request.sock`); the agent's handler of `request.sock`, which an agent at High keeps in the plain folder and which takes requests only (`logout`, `elevate`); the id each session gets in `SSH_BROKER_SESSION` |
-| `elevate`, `agent/elevation`, `agent/link` | `ssh-broker elevate <command>`: the client (in place at High, else one request to the agent); the agent's rule for what a session's `SSH_BROKER_ELEVATION` allows and the hosting of the elevated command; the session's connection, which says whose output it carries and where the client's keys go |
+| `elevate`, `agent/elevation`, `agent/link` | `ssh-broker elevate <command>`: the client (in place at High, else one request to the agent); the agent's rule for what a session's `SSH_BROKER_ELEVATION` allows and the hosting of the elevated command; the session's connection, which says whose output it carries and where the client's keys go, and which carries the consent question to the session's shim and its answer back (the shim writes the question and reads the answer on its own console: `shim_pty`) |
 
 ## Invariants you must not break
 
