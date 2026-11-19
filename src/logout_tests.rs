@@ -176,11 +176,19 @@ fn logout_at_high_asks_agent_sock_only() {
 
 // the line when there is no agent -------------------------------------------------------------
 
+/// A token that is not split, or a split one whose account has never had an agent at High here, has nothing
+/// elsewhere to look for.
 #[test]
-fn a_token_that_is_not_filtered_gets_the_plain_line() {
-    for elevation in [Elevation::Full, Elevation::Standard] {
-        assert_eq!(no_session_line(&Ok(elevation)), NO_SESSION, "{elevation:?}");
-    }
+fn an_account_with_no_agent_at_high_gets_the_plain_line() {
+    assert_eq!(no_session_line(&Ok(Elevation::Full), false), NO_SESSION);
+    assert_eq!(no_session_line(&Ok(Elevation::Standard), false), NO_SESSION);
+}
+
+/// A process at High asks the elevated folder, where it finds what it can reach: an elevated folder that holds
+/// no agent is no reason to send it elsewhere.
+#[test]
+fn a_process_at_high_gets_the_plain_line_whatever_folders_there_are() {
+    assert_eq!(no_session_line(&Ok(Elevation::Full), true), NO_SESSION);
 }
 
 /// An administrator's unelevated process reaches an agent at High only on `request.sock`, which the agent may not
@@ -188,20 +196,47 @@ fn a_token_that_is_not_filtered_gets_the_plain_line() {
 /// where else to ask.
 #[test]
 fn an_administrators_unelevated_process_is_told_where_else_to_ask() {
-    let line = no_session_line(&Ok(Elevation::Filtered));
+    for elevated_folder in [false, true] {
+        let line = no_session_line(&Ok(Elevation::Filtered), elevated_folder);
+        assert_eq!(
+            line,
+            format!(
+                "ssh-broker: no session to end that this process can reach: {}.",
+                crate::offer::text::FILTERED_LOOKS_ELSEWHERE
+            ),
+            "elevated folder: {elevated_folder}"
+        );
+        assert_eq!(line.lines().count(), 1, "{line}");
+    }
+}
+
+/// An account that Windows splits without making it an administrator (Backup Operators) has an agent at High
+/// too, and its unelevated token reads as `Standard`: what shows it is the elevated folder an agent at High made.
+#[test]
+fn an_unelevated_process_of_an_account_with_an_elevated_folder_is_told_where_else_to_ask() {
     assert_eq!(
-        line,
-        format!(
-            "ssh-broker: no session to end that this process can reach: {}.",
-            crate::offer::text::FILTERED_LOOKS_ELSEWHERE
-        )
+        no_session_line(&Ok(Elevation::Standard), true),
+        no_session_line(&Ok(Elevation::Filtered), false)
     );
-    assert_eq!(line.lines().count(), 1, "{line}");
+}
+
+#[test]
+fn the_elevated_folder_is_seen_only_when_the_profile_has_it() {
+    // A short tag: the elevated folder's request socket has the longest path of the profile.
+    let profile = crate::test_support::TempProfile::new("lo");
+    assert!(!elevated_folder_exists(&profile.0), "no agent at High has been here");
+
+    let elevated = profile.location_at(Integrity::High);
+    std::fs::create_dir_all(elevated.dir()).unwrap();
+    assert!(elevated_folder_exists(&profile.0));
+
+    let gone = profile.0.join("nowhere");
+    assert!(!elevated_folder_exists(&gone), "a profile that does not exist has none");
 }
 
 #[test]
 fn a_token_whose_elevation_cannot_be_read_gets_the_plain_line_and_the_cause() {
-    let line = no_session_line(&Err(anyhow::anyhow!("the token cannot be read")));
+    let line = no_session_line(&Err(anyhow::anyhow!("the token cannot be read")), true);
     assert!(line.starts_with(NO_SESSION), "{line}");
     assert!(
         line.contains(&crate::offer::text::elevation_unreadable_clause(

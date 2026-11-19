@@ -317,36 +317,46 @@ fn a_request_listener_that_fails_does_not_end_the_sessions() {
     drop(session);
 }
 
-/// The request loop over an `accept` that fails with `accept`'s error, on a tally of its own with nothing live;
-/// what the loop ended with.
-fn request_loop_met(accept: impl FnMut() -> Result<socket2::Socket, AcceptError>) -> anyhow::Error {
+/// The request loop over an `accept` that fails with `accept`'s error, on a tally of its own with nothing live,
+/// run as the agent runs it; the tally, and what the loop ended with.
+fn request_loop_met(
+    mut accept: impl FnMut() -> Result<socket2::Socket, AcceptError>,
+) -> (Arc<Connections>, anyhow::Error) {
     let connections = Connections::new();
     let control = Arc::new(Control::new(true, Arc::clone(&connections)));
-    crate::agent::serve_listener("request.sock", (), Arc::new(|| Ok(())), &connections, |()| {
-        crate::agent::accept_loop_with(
-            accept,
+    let end = crate::agent::serve_listener("request.sock", (), Arc::new(|| Ok(())), &connections, |()| {
+        crate::agent::run_until_the_end_is_decided(
             &connections,
-            &control,
-            || connections.is_closing(),
-            |_conn, _control| Ok(()),
+            || {
+                crate::agent::accept_loop_with(
+                    &mut accept,
+                    &connections,
+                    &control,
+                    || connections.is_closing(),
+                    |_conn, _control| Ok(()),
+                )
+            },
+            || {},
         )
-    })
+    });
+    (connections, end)
 }
 
-/// A shortage with no connection of the agent live ends the agent when the request loop meets it, as it does
-/// when the loop of `agent.sock` does: nothing is live, so nothing is lost, and the next login starts an agent
-/// with both sockets. Without that, the agent would serve `agent.sock` for the rest of its life with no request
-/// socket, and every `logout` from an unelevated session would find nothing.
+/// A shortage that no connection of the agent is live to end makes the request loop decide the end, as the loop of
+/// `agent.sock` does: nothing is live, so nothing is lost, and the next login starts an agent with both sockets.
+/// Without that, the agent would serve `agent.sock` for the rest of its life with no request socket, and every
+/// `logout` from an unelevated session would find nothing.
 #[test]
 fn a_shortage_with_nothing_live_ends_the_agent_whichever_socket_met_it() {
-    let end = request_loop_met(|| {
+    let (connections, end) = request_loop_met(|| {
         Err(AcceptError::Exhausted {
             code: 10055,
             source: std::io::Error::from_raw_os_error(10055),
         })
     });
+    assert!(connections.is_closing(), "the end is decided with the shortage");
     let mut ended = Vec::new();
-    crate::agent::request_loop_ended(&end, |err| ended.push(format!("{err:#}")));
+    crate::agent::request_loop_ended(&end, &connections, |err| ended.push(format!("{err:#}")));
     assert_eq!(ended.len(), 1, "the agent was ended once: {end:#}");
     assert!(ended[0].contains("no connection of this agent is live"), "{}", ended[0]);
 }
@@ -354,27 +364,104 @@ fn a_shortage_with_nothing_live_ends_the_agent_whichever_socket_met_it() {
 /// Anything else that stops the request loop leaves the agent and its sessions as they are.
 #[test]
 fn every_other_end_of_the_request_loop_leaves_the_agent_running() {
-    let failed = request_loop_met(|| Err(AcceptError::Fatal(anyhow::anyhow!("the listener broke"))));
+    let (connections, failed) = request_loop_met(|| Err(AcceptError::Fatal(anyhow::anyhow!("the listener broke"))));
+    assert!(!connections.is_closing(), "a loop that failed decides nothing");
     let stopped = anyhow::Error::new(Stopped);
     for (what, end) in [("a listener that failed", failed), ("an end that was decided", stopped)] {
-        crate::agent::request_loop_ended(&end, |err| panic!("{what} ended the agent: {err:#}"));
+        crate::agent::request_loop_ended(&end, &connections, |err| panic!("{what} ended the agent: {err:#}"));
     }
 }
 
-// The wake -----
+/// What a loop returns when it met a shortage with nothing live to end.
+fn shortage() -> anyhow::Error {
+    anyhow::anyhow!("accept failed with code 10055").context(crate::agent::NothingLive)
+}
 
-/// A connect that fails while its loop is open means the loop cannot be woken: the end stops waiting for it.
+/// Whether the end is decided is read in the one step that sets it, under the tally's lock, so no connection can
+/// become live between the reading and the flag; the loop still holds its listener when it is read.
 #[test]
-fn a_request_loop_that_cannot_be_woken_does_not_hold_the_end_for_ever() {
+fn the_request_loop_decides_the_end_with_its_listener_still_held() {
+    let connections = Connections::new();
+    let mut runs = 0;
+    let end = crate::agent::serve_listener("request.sock", (), Arc::new(|| Ok(())), &connections, |()| {
+        crate::agent::run_until_the_end_is_decided(
+            &connections,
+            || {
+                runs += 1;
+                shortage()
+            },
+            || panic!("nothing is live, so there is nothing to wait for"),
+        )
+    });
+    assert_eq!(runs, 1);
+    assert!(end.downcast_ref::<crate::agent::NothingLive>().is_some(), "{end:#}");
+    assert!(connections.is_closing());
+}
+
+/// A connection that became live after the loop met its shortage is a connection that can end and free what the
+/// loop lacks: the shortage is no longer one with nothing live. The agent is not ended and the loop does not give
+/// up its listener: it waits for an end, as the shared rule says, and serves again.
+#[test]
+fn a_connection_counted_after_the_shortage_keeps_the_agent_and_the_request_loop() {
+    let connections = Connections::new();
+    let held = std::cell::RefCell::new(None);
+    let (release, released) = mpsc::channel::<crate::agent::Live>();
+    // Its handler returning: the drop takes the tally's lock, which the wait for an end holds until it parks.
+    let handler = std::thread::spawn(move || drop(released.recv().unwrap()));
+    let mut runs = 0;
+
+    let end = crate::agent::serve_listener("request.sock", (), Arc::new(|| Ok(())), &connections, |()| {
+        crate::agent::run_until_the_end_is_decided(
+            &connections,
+            || {
+                runs += 1;
+                assert!(connections.listener_is_open(), "run {runs}: the listener is held");
+                if runs == 1 {
+                    *held.borrow_mut() = Some(connections.begin());
+                    shortage()
+                } else {
+                    anyhow::Error::new(Stopped)
+                }
+            },
+            || release.send(held.borrow_mut().take().unwrap()).unwrap(),
+        )
+    });
+    handler.join().unwrap();
+
+    assert_eq!(runs, 2, "the loop served again");
+    assert!(end.downcast_ref::<Stopped>().is_some(), "{end:#}");
+    assert!(!connections.is_closing(), "and the end was not decided");
+    crate::agent::request_loop_ended(&end, &connections, |err| panic!("the agent was ended: {err:#}"));
+}
+
+/// The end that is decided goes as every end goes: the other loop is woken and stops accepting, and only then does
+/// the process end. From the decision on no login gets a session.
+#[test]
+fn a_decided_end_settles_the_other_loop_before_the_process_ends_and_refuses_logins() {
     let connections = Connections::new();
     let control = Control::new(true, Arc::clone(&connections));
-    // A loop that holds its listener and cannot be woken, and never returns.
-    let _loop = connections.listener_opened("request.sock", Arc::new(|| Err(anyhow::anyhow!("no connection"))));
-    let (log, drained) = crate::test_support::logged(|| control.settle());
-    assert_eq!(drained, Drained::Complete);
-    assert!(
-        log.contains("could not wake the accept loop of request.sock: no connection"),
-        "{log}"
+    let _agent = crate::agent::HeldListener::open(&connections, "agent.sock", |listener| listener.close());
+    assert!(connections.decide_end_if_idle());
+    assert!(control.is_ending(), "a login that comes now is refused");
+    assert!(control.reserve().unwrap().is_none(), "and gets no session id");
+
+    let (log, listener_open_at_the_end) = crate::test_support::logged(|| {
+        let mut listener_open = Vec::new();
+        crate::agent::request_loop_ended(&shortage(), &connections, |_| {
+            listener_open.push(connections.listener_is_open())
+        });
+        listener_open
+    });
+
+    assert_eq!(
+        listener_open_at_the_end,
+        [false],
+        "the process ended before the other loop had stopped"
+    );
+    assert_eq!(
+        log.matches("accept failed with code 10055").count(),
+        1,
+        "the cause is said once: {log}"
     );
 }
 

@@ -87,7 +87,7 @@ use crate::route::{AgentArgs, BackgroundArgs};
 #[cfg(windows)]
 use crate::shell::StartError;
 #[cfg(windows)]
-use crate::socket_loc::{Integrity, SocketLocation, StepDown};
+use crate::socket_loc::{Integrity, REQUEST_SOCKET_FILE_NAME, SOCKET_FILE_NAME, SocketLocation, StepDown};
 #[cfg(windows)]
 use crate::userdir::SocketDir;
 #[cfg(windows)]
@@ -286,9 +286,12 @@ fn serve_with(
 /// the user's lock, so no other agent of this user binds meanwhile.
 ///
 /// An agent at High also keeps `request.sock` in the plain folder, which the processes of its account below High
-/// can reach (see [`requests`]). Without it (the folder is refused or held, the socket cannot be bound) the agent
-/// serves its sessions all the same, and `logout` from an administrator's unelevated process, which finds neither
-/// socket there, says that no session is reachable from it and where to run `logout` instead.
+/// can reach (see [`requests`]). Without it the agent serves its sessions all the same, and `logout` from an
+/// unelevated process says which case it is. The plain folder is refused: the client's own walk refuses the same
+/// folder, and `logout` prints "could not reach your session: ..." naming it and exits 4. The folder cannot be
+/// opened for another reason: `logout` reports what its own walk meets there. The folder opens but the socket
+/// cannot be bound, or served: `logout` finds neither socket and prints that no session is reachable from it, and
+/// where to run `logout` instead (exit 1).
 #[cfg(windows)]
 fn run_on(folder: &Arc<SocketDir>, background: bool) -> anyhow::Result<()> {
     let connections = Connections::new();
@@ -372,45 +375,77 @@ fn serve_requests(listener: Listener, connect: WakeConnect, connections: &Arc<Co
     let spawned = std::thread::Builder::new()
         .name("request-socket".into())
         .spawn(move || {
-            let end = serve_listener(REQUEST_SOCKET, listener, connect, &connections, |listener| {
-                accept_loop(
-                    listener,
+            let end = serve_listener(REQUEST_SOCKET_FILE_NAME, listener, connect, &connections, |listener| {
+                run_until_the_end_is_decided(
                     &connections,
-                    &control,
-                    || connections.is_closing(),
-                    requests::serve,
+                    || {
+                        accept_loop(
+                            listener,
+                            &connections,
+                            &control,
+                            || connections.is_closing(),
+                            requests::serve,
+                        )
+                    },
+                    || {},
                 )
             });
-            request_loop_ended(&end, |end| {
-                tracing::error!("the agent stopped: {end:#}");
-                end_on_error(end)
-            });
+            // The cause is logged by `request_loop_ended`, once.
+            request_loop_ended(&end, &connections, |end| end_on_error(end));
         });
     if let Err(e) = spawned {
         tracing::warn!("the agent serves without a request socket: no thread for it: {e}");
     }
 }
 
-/// What the tally and the log call the request socket's listener.
+/// Run the request socket's loop (`run`) until it ends in a way that is the agent's to act on. A shortage with no
+/// connection of this agent live ([`NothingLive`]) is that only once the end is decided, which
+/// [`Connections::decide_end_if_idle`] does in one step under the tally's lock: if a connection became live after
+/// the loop gave up, the shortage is no longer one with nothing live. The loop then does what the shared rule
+/// does with a shortage while something is live (see [`serve_connections_with`]): it waits until a connection
+/// has ended, and runs again, holding its listener throughout. `blocking` is called when that wait is about to
+/// block (see [`Connections::wait_for_an_end`]). Returns the error that ended the loop.
 #[cfg(windows)]
-const REQUEST_SOCKET: &str = "request.sock";
-
-/// What the tally and the log call the listener of the agent's own socket.
-#[cfg(windows)]
-const AGENT_SOCKET: &str = "agent.sock";
+fn run_until_the_end_is_decided(
+    connections: &Arc<Connections>,
+    mut run: impl FnMut() -> anyhow::Error,
+    mut blocking: impl FnMut(),
+) -> anyhow::Error {
+    loop {
+        let end = run();
+        if end.downcast_ref::<NothingLive>().is_none() {
+            return end;
+        }
+        // Read before the decision: a connection that ends between them is not missed.
+        let since = connections.ended();
+        if connections.decide_end_if_idle() {
+            return end;
+        }
+        connections.wait_for_an_end(since, &mut blocking);
+    }
+}
 
 /// What the request socket's loop does with how it ended (`end`). Whether the agent ends is not that loop's to
 /// say, and whatever stops it leaves the sessions as they are, with one exception: a shortage with no
-/// connection of this agent live ([`NothingLive`]) ends the agent through `end_agent`, as it does when the
-/// loop of `agent.sock` meets it. Nothing is live, so nothing is lost, and the next login starts an agent with
-/// both sockets; an agent that served on without the request socket would leave every `logout` from an
-/// unelevated session with nothing to ask.
+/// connection of this agent live ([`NothingLive`]), which [`run_until_the_end_is_decided`] has decided the end
+/// on. The end then goes as every end goes ([`Connections::settle`]: the loop of `agent.sock` is woken and
+/// stops, nothing is live to drain), and only then the process ends, through `end_agent`, as it does when the
+/// loop of `agent.sock` meets the shortage. Nothing is live, so nothing is lost, and the next login starts an
+/// agent with both sockets; an agent that served on without the request socket would leave every `logout` from
+/// an unelevated session with nothing to ask.
+///
+/// The cause is logged here, once; `end_agent` does not log it again.
 #[cfg(windows)]
-fn request_loop_ended(end: &anyhow::Error, end_agent: impl FnOnce(&anyhow::Error)) {
+fn request_loop_ended(end: &anyhow::Error, connections: &Arc<Connections>, end_agent: impl FnOnce(&anyhow::Error)) {
     if end.downcast_ref::<Stopped>().is_some() {
         tracing::debug!("the request socket is closed: the agent is ending");
     } else if end.downcast_ref::<NothingLive>().is_some() {
+        debug_assert!(
+            connections.is_closing(),
+            "the shortage with nothing live is returned only once the end is decided"
+        );
         tracing::error!("the request socket met a shortage with no connection live; ending the agent: {end:#}");
+        connections.settle();
         end_agent(end);
     } else {
         tracing::error!("the request socket stopped; the agent serves its sessions without it: {end:#}");
@@ -418,8 +453,11 @@ fn request_loop_ended(end: &anyhow::Error, end_agent: impl FnOnce(&anyhow::Error
 }
 
 /// Serve `listener` of `socket` to its end: register it with the tally together with `wake`, run `accept` over
-/// it, close it, and only then count it closed. The registration comes before the loop's first look at whether
+/// it, count it closed, and only then close it. The registration comes before the loop's first look at whether
 /// the end is decided (see [`Connections::listener_opened`]). Returns the error that stopped the loop.
+///
+/// The loop has returned when it is counted closed, so a wake that is still on its way is for a loop the tally no
+/// longer holds, and its failure, if the listener has closed by then, is not reported.
 #[cfg(windows)]
 fn serve_listener<L>(
     socket: &'static str,
@@ -430,8 +468,8 @@ fn serve_listener<L>(
 ) -> anyhow::Error {
     let open = connections.listener_opened(socket, wake);
     let end = accept(&listener);
-    drop(listener);
     drop(open);
+    drop(listener);
     end
 }
 
@@ -477,7 +515,7 @@ fn serve_until_drained_in<L>(
     ending: impl FnOnce() -> bool,
     accept: impl FnOnce(&L) -> anyhow::Error,
 ) -> anyhow::Error {
-    let end = serve_listener(AGENT_SOCKET, listener, wake, connections, accept);
+    let end = serve_listener(SOCKET_FILE_NAME, listener, wake, connections, accept);
     finish_stopped(end, connections, ending())
 }
 

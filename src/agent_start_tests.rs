@@ -892,6 +892,20 @@ fn an_end_with_no_accept_loop_wakes_nothing_and_waits_for_nothing() {
     );
 }
 
+/// "No connection is live" and the flag that says so are one step under the tally's lock: a connection is either
+/// counted before it, and the end is not decided, or after, and finds the flag up.
+#[test]
+fn the_end_is_decided_only_while_no_connection_is_live() {
+    let connections = Connections::new();
+    let live = connections.begin();
+    assert!(!connections.decide_end_if_idle());
+    assert!(!connections.is_closing(), "a live connection keeps the end undecided");
+
+    drop(live);
+    assert!(connections.decide_end_if_idle());
+    assert!(connections.is_closing());
+}
+
 /// A logout on `request.sock` can settle before the main thread has counted `agent.sock`'s listener: that
 /// listener is neither woken nor waited for, and its loop, whose first look at the flag comes after the
 /// count, stops by itself.
@@ -940,6 +954,88 @@ fn a_wake_that_fails_is_logged_with_its_socket_and_the_end_does_not_wait_for_the
         log.contains("could not wake the accept loop of request.sock: the connect was refused"),
         "{log}"
     );
+}
+
+/// A loop that returns by itself while the end is decided is not one that could not be woken. Its listener is
+/// closed after it has been counted closed, so that a wake that arrives meanwhile (it connects, and finds the
+/// listener gone) is for a loop the tally no longer holds, and nothing is reported.
+#[test]
+fn a_loop_that_returns_by_itself_while_the_end_is_decided_leaves_no_warning() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Mutex, mpsc};
+
+    /// A listener that records whether it was still registered when it closed, and then lets the wake go on.
+    struct Listener {
+        connections: Arc<Connections>,
+        registered_at_close: Arc<AtomicBool>,
+        closed: Arc<AtomicBool>,
+        go: mpsc::Sender<()>,
+    }
+    impl Drop for Listener {
+        fn drop(&mut self) {
+            let registered = self.connections.listener_is_open();
+            self.registered_at_close.store(registered, Ordering::SeqCst);
+            self.closed.store(true, Ordering::SeqCst);
+            let _ = self.go.send(());
+        }
+    }
+
+    // The tally says when the end is waiting for the loops, which is after the loop's wake is on its way.
+    let (waiting, on_waiting) = mpsc::channel();
+    let waiting = Mutex::new(waiting);
+    let connections = Connections::with_drain(std::time::Duration::from_secs(30), move |_| {
+        let _ = waiting.lock().unwrap().send(());
+    });
+    let (go, on_go) = mpsc::channel();
+    let on_go = Mutex::new(on_go);
+    let closed = Arc::new(AtomicBool::new(false));
+    let registered_at_close = Arc::new(AtomicBool::new(true));
+    let wake: WakeConnect = Arc::new({
+        let closed = Arc::clone(&closed);
+        move || {
+            // The connect is made once the listener has closed.
+            let _ = on_go.lock().unwrap().recv();
+            if closed.load(Ordering::SeqCst) {
+                anyhow::bail!("the connect was refused");
+            }
+            Ok(())
+        }
+    });
+    let (accepting, on_accepting) = mpsc::channel();
+    let (release, released) = mpsc::channel::<()>();
+    let loop_thread = std::thread::spawn({
+        let connections = Arc::clone(&connections);
+        let listener = Listener {
+            connections: Arc::clone(&connections),
+            registered_at_close: Arc::clone(&registered_at_close),
+            closed,
+            go,
+        };
+        move || {
+            serve_listener("request.sock", listener, wake, &connections, |_| {
+                accepting.send(()).unwrap();
+                released.recv().unwrap();
+                anyhow::anyhow!("the loop returned by itself")
+            })
+        }
+    });
+    on_accepting.recv().unwrap();
+    let settler = std::thread::spawn({
+        let connections = Arc::clone(&connections);
+        move || crate::test_support::logged(|| connections.settle())
+    });
+    on_waiting.recv().unwrap();
+
+    release.send(()).unwrap();
+    loop_thread.join().unwrap();
+    let (log, drained) = settler.join().unwrap();
+
+    assert_eq!(drained, Drained::Complete);
+    assert!(
+        !registered_at_close.load(Ordering::SeqCst),
+        "the listener closed while it was still registered"
+    );
+    assert!(!log.contains("could not wake"), "{log}");
 }
 
 #[test]

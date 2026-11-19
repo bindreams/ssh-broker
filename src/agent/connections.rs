@@ -71,7 +71,7 @@ struct Registered {
 pub(super) type WakeConnect = Arc<dyn Fn() -> anyhow::Result<()> + Send + Sync>;
 
 /// A listener that is registered with the tally; see [`Connections::listener_opened`]. Dropping it is the
-/// loop's listener being closed.
+/// loop having returned; its listener is closed right after.
 pub(super) struct OpenListener {
     connections: Arc<Connections>,
     id: u64,
@@ -210,7 +210,8 @@ impl Connections {
 
     /// An accept loop is about to run over a listener of `socket`: register it with `wake`, the connect
     /// that makes the loop return from `accept`. The listener counts as held until the guard is dropped,
-    /// which the loop does once it has returned and closed the listener.
+    /// which the loop does once it has returned, and before it closes the listener: a wake that arrives then
+    /// is for a loop that is gone, and a failure of it is not reported ([`Connections::wake_failed`]).
     ///
     /// The loop calls this before its first look at the flag [`Connections::is_closing`], so whichever way
     /// the end is decided relative to it, the loop stops: an end decided before the registration finds
@@ -236,14 +237,30 @@ impl Connections {
         }
     }
 
+    /// Decide the end of the agent if no connection is live, in one step under the tally's lock: the flag
+    /// [`Connections::is_closing`] reads is up when this returns `true`, and no connection is counted between
+    /// the reading of `live` and the flag. A connection counted after finds the flag up (a login is refused, see
+    /// `Control::is_ending`); one counted before keeps the end undecided (`false`), and what the caller does is
+    /// wait for one to end ([`Connections::wait_for_an_end`]).
+    ///
+    /// Deciding does not end anything by itself: the caller then settles the end ([`Connections::settle`]) and
+    /// ends the process.
+    pub(super) fn decide_end_if_idle(&self) -> bool {
+        self.change(|tally| {
+            let idle = tally.live == 0;
+            tally.closing |= idle;
+            idle
+        })
+    }
+
     /// Whether the end is decided: the accept loop stops after its current accept.
     pub(super) fn is_closing(&self) -> bool {
         self.lock().closing
     }
 
     /// The loop of listener `id` cannot be woken, so waiting for it would not end: the end goes on without
-    /// it, and says why (see [`Connections::settle`]). A listener that has been closed meanwhile is nothing
-    /// to report: its loop did return.
+    /// it, and says why (see [`Connections::settle`]). A listener that is no longer registered is nothing
+    /// to report: its loop did return, and a connect that found its listener closed after that is no failure.
     fn wake_failed(&self, id: u64, why: &str) {
         self.change(|tally| {
             if let Some(listener) = tally.listeners.iter_mut().find(|listener| listener.id == id) {
@@ -259,10 +276,10 @@ impl Connections {
     /// does the work and the others wait for it.
     ///
     /// The first wait is with the listeners open, so a login that arrives meanwhile gets the refusal.
-    /// A loop counts every connection it accepts before it looks at the flag set here, and its
-    /// listener is closed once it has returned, so the second judgement sees every connection the loops
-    /// took. A connection the system queued and nobody accepted is reset with the listener; its shim
-    /// goes back to its no-agent path. If the first wait gave up on connections that do not finish, the
+    /// A loop counts every connection it accepts before it looks at the flag set here, so once it has
+    /// returned the second judgement sees every connection it took. A connection the system queued and
+    /// nobody accepted is reset when the listener closes, at the latest with the process; its shim goes
+    /// back to its no-agent path. If the first wait gave up on connections that do not finish, the
     /// second is not made: those would not finish either.
     pub(super) fn settle(self: &Arc<Self>) -> Drained {
         *self.settled.get_or_init(|| {
@@ -276,7 +293,7 @@ impl Connections {
     }
 
     /// Raise the flag, wake the loops of the listeners registered now, and wait until every one of them has
-    /// returned and its listener is closed, or its wake has failed. Nothing is waited for if no loop holds a
+    /// returned (it closes its listener right after), or its wake has failed. Nothing is waited for if no loop holds a
     /// listener. Each wake is made on a thread of its own ([`Connections::wake_without_blocking`]).
     fn close_listeners(self: &Arc<Self>) {
         // The change wakes a loop parked for a resource (see `wait_for_an_end`): it is not in

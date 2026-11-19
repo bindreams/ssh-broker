@@ -79,9 +79,12 @@ impl Control {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Whether the agent has begun to end: no session may start.
+    /// Whether the agent has begun to end: no session may start. That is so from a `logout` ([`Control::end_all`])
+    /// and from the decision of the end by a shortage with nothing live ([`Connections::decide_end_if_idle`]),
+    /// which has no session to end: a login counted after it is refused, so none is lost when the process ends.
     pub(super) fn is_ending(&self) -> bool {
-        self.lock().ending
+        let ending = self.lock().ending;
+        ending || self.connections.is_closing()
     }
 
     /// Give a session about to start its id, which goes into its environment

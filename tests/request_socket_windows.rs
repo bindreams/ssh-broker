@@ -16,7 +16,7 @@ use std::path::PathBuf;
 
 use ssh_broker::acl::Sid;
 use ssh_broker::afunix::Listener;
-use ssh_broker::logon::{self, LogonKind};
+use ssh_broker::autologin;
 use ssh_broker::pipes::ExecChild;
 use ssh_broker::provision::registry::{OPENSSH_KEY, set_default_shell_under};
 use ssh_broker::provision::{canonical_exe, procwait};
@@ -55,7 +55,7 @@ mod sshd_rig;
 mod stand_in;
 
 use account_fixture::{Account, ServiceLogon};
-use agent_conn::{AgentConn, BackgroundAgent, local_account};
+use agent_conn::{AgentConn, local_account};
 use sshd_rig::{Login, TempDir, no_shell_to_carry, run_client};
 use stand_in::Kit;
 
@@ -72,14 +72,13 @@ const CHILD: &str = "the_unelevated_child_connects_to_request_sock";
 fn an_unelevated_process_of_the_account_connects_to_request_sock_bound_by_a_high_process() {
     account_fixture::assert_elevated();
     let me = Sid::current_user().unwrap();
-    let profile = TempDir(std::env::temp_dir().join(format!("sb-request-profile-{}", std::process::id())));
+    let profile = TempDir::new("request-profile");
     std::fs::create_dir_all(profile.0.join(r"AppData\Local")).unwrap();
     let location = socket_loc::for_profile(&profile.0, Integrity::Medium).expect("the stand-in profile path is short");
     let _folder = userdir::open_socket_dir(&location, &me).expect("make the plain folder at High");
     let listener = Listener::bind(&location.request_path(), Integrity::Medium).expect("bind request.sock at High");
 
-    let pair = TempDir(std::env::temp_dir().join(format!("sb-request-pair-{}", std::process::id())));
-    std::fs::create_dir_all(&pair.0).unwrap();
+    let pair = TempDir::new("request-pair");
     child_entry::write_input(&pair.0, &format!("profile={}\n", profile.0.display()));
     let token = UnelevatedToken::of_this_process().expect("make the unelevated token");
     let line = child_entry::command_line(&std::env::current_exe().unwrap(), CHILD, &pair.0);
@@ -213,7 +212,8 @@ fn a_standard_accounts_logout_still_uses_agent_sock() {
 /// Elevated (CI only). An administrator's agent whose plain folder is not as the agent makes it (here, a folder
 /// an administrator made, with the ACL it inherits) does not refuse to start: it serves its sessions, and has no
 /// request socket, so `logout` in a default session says it could not reach the session, naming the folder, and
-/// exits with `UNREACHABLE_CODE`. The agent is ended by ending its process: its own `logout` is what cannot be
+/// exits with `UNREACHABLE_CODE`. The agent is started as the product starts one for an account with no session (the
+/// stored-password task of `auto-login on`) and ended by ending its process: its own `logout` is what cannot be
 /// reached.
 #[test]
 fn an_agent_whose_plain_folder_is_wrongly_owned_serves_sessions_and_logout_says_why() {
@@ -222,33 +222,25 @@ fn an_agent_whose_plain_folder_is_wrongly_owned_serves_sessions_and_logout_says_
     let kit = Kit::copy_of_broker("rqwo");
     let account = Account::create("rqwo", true);
     account.make_administrator();
+    account.started_by(ServiceLogon::TaskScheduler);
     let plain = account
         .profile()
         .join(r"AppData\Local")
         .join(socket_loc::SOCKET_DIR_NAME);
     std::fs::create_dir_all(&plain).unwrap();
 
-    let started = logon::start_background_agent(
-        &local_account(&account),
-        &password::password(&account.password),
-        &kit.exe,
-        LogonKind::Batch,
-    )
-    .unwrap_or_else(|e| panic!("the logon for {} failed: {e:?}", account.name));
+    let local = local_account(&account);
+    autologin::on(&mut kit.autologin_env(&account.password), &local).unwrap();
     let location = account.socket_location();
-    stand_in::wait_for_serving_marker(&location, started.process.0);
-    let agent = BackgroundAgent {
-        process: started.process,
-        location,
-    };
+    stand_in::wait_for_serving_marker_of_a_task(&location, stand_in::SERVING_BOUND);
 
     // A session that never ends fails after the connection's silence bound; the failure then says which session
     // it was and what the agent had logged.
     let ended = |what: &str, conn: &mut AgentConn| {
         session_end::attempt(what, || conn.read_to_end())
-            .unwrap_or_else(|why| panic!("{why}\nthe agent's logs:\n{}", stand_in::read_logs(&agent.location)))
+            .unwrap_or_else(|why| panic!("{why}\nthe agent's logs:\n{}", stand_in::read_logs(&location)))
     };
-    let mut session = AgentConn::connect(&agent.location, &account.sid);
+    let mut session = AgentConn::connect(&location, &account.sid);
     session.start_exec("cmd.exe /c echo still-serving");
     session.end_stdin();
     let served = ended("the session that echoes", &mut session);
@@ -259,7 +251,7 @@ fn an_agent_whose_plain_folder_is_wrongly_owned_serves_sessions_and_logout_says_
         served.stderr
     );
 
-    let mut asker = AgentConn::connect(&agent.location, &account.sid);
+    let mut asker = AgentConn::connect(&location, &account.sid);
     asker.start_exec(&format!("\"{}\" logout", kit.exe.display()));
     asker.end_stdin();
     let asked = ended("the session that runs logout", &mut asker);
@@ -279,4 +271,14 @@ fn an_agent_whose_plain_folder_is_wrongly_owned_serves_sessions_and_logout_says_
         "a refused folder is not the absence of a session: {:?}",
         asked.stderr
     );
+
+    // The agent's own `logout` cannot be reached, so its process is ended; the task is deleted with the credential.
+    let agents =
+        procwait::user_agents(&kit.exe, &account.sid, Integrity::High).expect("list the agents of the account");
+    assert!(!agents.is_empty(), "the task started no agent at High");
+    for agent in &agents {
+        agent.terminate().expect("end the agent");
+    }
+    procwait::wait_all_exited(&agents, procwait::EXIT_BOUND).expect("the agent exited");
+    autologin::off(&mut kit.autologin_env(&account.password), &local).unwrap();
 }

@@ -25,24 +25,42 @@ use crate::socket_loc::Integrity;
 /// What `logout` says when there is no agent to ask.
 pub const NO_SESSION: &str = "ssh-broker: no session to end.";
 
-/// The line for "there is no agent to ask", chosen by the elevation of this process's token. An administrator's
-/// unelevated process (`Elevation::Filtered`) reaches an agent at High only on `request.sock`, which that agent
-/// may not serve, so none found there may be an agent that serves elsewhere: its line says that no session is
-/// reachable from here, which is true whether there is no agent or one without a request socket, and where else
-/// to ask. An elevation that cannot be read gets the plain line with the cause after it, since the token may
-/// be a filtered one and the session may be elsewhere.
-pub fn no_session_line(elevation: &anyhow::Result<Elevation>) -> String {
+/// The line for "there is no agent to ask", chosen by what this process can see of its account: the elevation of
+/// its token, and `elevated_folder`, whether the account's profile has the folder of an agent at High (see
+/// [`elevated_folder_exists`]). An unelevated process of an account whose agent runs at High reaches that agent
+/// only on `request.sock`, which it may not serve, so none found there may be an agent that serves elsewhere:
+/// its line says that no session is reachable from here, which is true whether there is no agent or one without
+/// a request socket, and where else to ask. Such a process is an administrator's (`Elevation::Filtered`), or the
+/// process of any account Windows splits (Backup Operators), whose unelevated token reads as `Standard`: the
+/// folder shows that an agent at High has been here. A process at High (`Elevation::Full`) asks the elevated
+/// folder itself, and has nowhere else to go. An elevation that cannot be read gets the plain line with the
+/// cause after it, since the token may be a filtered one and the session may be elsewhere.
+pub fn no_session_line(elevation: &anyhow::Result<Elevation>, elevated_folder: bool) -> String {
     match elevation {
-        Ok(Elevation::Filtered) => format!(
-            "ssh-broker: no session to end that this process can reach: {}.",
-            crate::offer::text::FILTERED_LOOKS_ELSEWHERE
-        ),
+        Ok(Elevation::Filtered) => where_to_run_line(),
+        Ok(Elevation::Standard) if elevated_folder => where_to_run_line(),
         Ok(Elevation::Full | Elevation::Standard) => NO_SESSION.to_owned(),
         Err(e) => format!(
             "{NO_SESSION} Note: {}, so the session may be elsewhere.",
             crate::offer::text::elevation_unreadable_clause(&format!("{e:#}"))
         ),
     }
+}
+
+/// What an unelevated process of an account whose agent runs at High is told when neither socket it can reach is served.
+fn where_to_run_line() -> String {
+    format!(
+        "ssh-broker: no session to end that this process can reach: {}.",
+        crate::offer::text::FILTERED_LOOKS_ELSEWHERE
+    )
+}
+
+/// Whether the profile `profile` has the folder of an agent at High: one has been here. The folder is
+/// made by an agent at High and by nothing else, so its presence is what an unelevated process can see of that
+/// agent when it serves no socket it can reach.
+fn elevated_folder_exists(profile: &std::path::Path) -> bool {
+    crate::socket_loc::for_profile(profile, Integrity::High)
+        .is_ok_and(|location| matches!(location.dir().try_exists(), Ok(true)))
 }
 
 /// Writes the agent's stderr to `err`.
@@ -115,7 +133,8 @@ pub fn run() -> anyhow::Result<()> {
     // No profile, no folder and nothing listening all mean there is no session; anything else is not
     // that.
     let no_session = |e: &anyhow::Error| e.downcast_ref::<crate::userdir::NoProfile>().is_some() || is_no_agent(e);
-    let line = no_session_line(&crate::account::elevation());
+    let elevated_folder = crate::userdir::current_profile_dir().is_ok_and(|profile| elevated_folder_exists(&profile));
+    let line = no_session_line(&crate::account::elevation(), elevated_folder);
     ask_at(connect, logout_on, no_session, &line, &mut std::io::stderr(), |code| {
         std::process::exit(code)
     })
