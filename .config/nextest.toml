@@ -39,6 +39,11 @@ slow-timeout = { period = "120s", terminate-after = 5, grace-period = "1s" }
 filter = 'binary(agent_window_windows) | binary(auto_login_windows) | binary(private_dir_elevated_windows) | binary(prompt_path_windows) | binary(real_sshd_windows) | binary(shell_sshd_windows) | binary(session_on_demand_windows) | binary(sshd_config_windows) | binary(upgrade_windows) | binary(user_isolation_windows)'
 slow-timeout = { period = "120s", terminate-after = 10, grace-period = "1s" }
 
+# Each case of the logoff measurement samples for up to 900 s after a logout, past a session and a teardown.
+[[profile.ci.overrides]]
+filter = 'binary(logoff_measure_windows)'
+slow-timeout = { period = "120s", terminate-after = 30, grace-period = "1s" }
+
 # The real-sshd test measures things the plan has never seen (the shim's session, logon type and job under
 # sshd): its output is the result, so a passing run prints it too.
 [[profile.ci.overrides]]
