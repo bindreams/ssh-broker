@@ -162,16 +162,17 @@ impl PtyRun {
 {}
 
 the last bytes it wrote (raw): {:?}
-the lengths of the last lines typed, {} bytes of key events sent in all: {:?}
+the lengths of the last lines typed: {:?}
 
-process tree:
+sent {} bytes of key events; compare with the bytes read by the helper's second conhost, written by the agent and read by the agent's conhost
+process tree (each line: the process's I/O totals since it started):
 {}
 
 {}",
                 self.text(),
                 String::from_utf8_lossy(&self.transcript[self.transcript.len().saturating_sub(400)..]),
-                self.sent,
                 &self.typed[self.typed.len().saturating_sub(3)..],
+                self.sent,
                 crate::bounded_wait::process_tree(self.helper.process.0, self.helper.pid),
                 self.extra()
             ),
