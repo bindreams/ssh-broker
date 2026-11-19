@@ -130,14 +130,14 @@ pub fn next_arg(s: &str) -> Option<(String, &str)> {
                 while chars.next_if(|&(_, c)| c == '\\').is_some() {
                     backslashes += 1;
                 }
-                if chars.next_if(|&(_, c)| c == '"').is_some() {
-                    // 2n backslashes then a quote: n backslashes, and the quote delimits.
+                if chars.peek().is_some_and(|&(_, c)| c == '"') {
+                    // 2n backslashes then a quote: n backslashes, and the quote is left to the quote rule below
+                    // (as `std::env::args` does: inside quotes `""` is one literal quote).
                     // 2n+1: n backslashes and a literal quote.
                     arg.extend(std::iter::repeat_n('\\', backslashes / 2));
                     if backslashes % 2 == 1 {
+                        chars.next();
                         arg.push('"');
-                    } else {
-                        in_quotes = !in_quotes;
                     }
                 } else {
                     arg.extend(std::iter::repeat_n('\\', backslashes));

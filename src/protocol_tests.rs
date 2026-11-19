@@ -332,7 +332,6 @@ fn a_version_1_handshake_is_refused_with_the_version_message() {
     );
 }
 
-/// The version is 6.
 #[test]
 fn the_wire_version_is_6() {
     assert_eq!(PROTOCOL_VERSION, 6);
@@ -653,19 +652,31 @@ fn an_elevation_request_check_refuses_a_bad_session_an_empty_or_oversized_comman
         },
         "command",
     );
-    // The limit is in UTF-16 units: a character outside the BMP is two.
+    // The limit is in UTF-16 units: a character outside the BMP is two. A command line is one unit shorter than
+    // `CreateProcessW` takes, which counts the terminator in its 32,767.
     let at_limit = "a".repeat(MAX_ELEVATION_UNITS);
-    let command_at_limit = format!(r"C:\{}", &at_limit[3..]);
+    let command_at_limit = format!(r"C:\{}", &at_limit[4..]);
+    assert_eq!(command_at_limit.encode_utf16().count(), MAX_ELEVATION_UNITS - 1);
     let request = ElevationRequest {
         command: command_at_limit.clone(),
         cwd: at_limit.clone(),
         ..a_request()
     };
-    request.check().expect("exactly the limit is allowed");
+    request
+        .check()
+        .expect("a command one unit under the limit and a directory of exactly it are allowed");
+    bad(
+        "a command of exactly the limit, which has no room for the terminator",
+        ElevationRequest {
+            command: format!("{command_at_limit}a"),
+            ..a_request()
+        },
+        "command",
+    );
     bad(
         "a command over the limit",
         ElevationRequest {
-            command: format!("{command_at_limit}a"),
+            command: format!("{command_at_limit}aa"),
             ..a_request()
         },
         "command",

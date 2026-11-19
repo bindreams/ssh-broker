@@ -1347,10 +1347,8 @@ fn handle_pty(
     // `end_pty`) before this returns, or they would outlive `session` and touch closed handles.
     let ended = end_pty(session, &target, out_thread, || link.end_hosting());
     let code = *ended.as_ref().unwrap_or(&1);
-    // The shell is gone and the output is drained, so the code is final and nothing else can still be writing
-    // frames. The connection is the session's again by now, if `ssh-broker elevate --terminal` had it: the output
-    // pump above could not end before, and `end_hosting` inside `end_pty` ended the command that held it, whoever
-    // asked for it (see `elevation::run_hosted`), and returned only once that command had given it back.
+    // The shell is gone and the output drained, so the code is final; `end_hosting` (in `end_pty`) has already taken
+    // the connection back from any `elevate --terminal` command.
     show_exit_notice(&link, Mode::Pty, configured.as_ref(), code);
     // FIN the write half only: the input pump keeps reading until the client closes, so for a
     // conforming client the socket never closes with unread input, which would reset it and
@@ -1386,7 +1384,9 @@ fn end_pty(
     }
     after_reap();
     target.close();
-    let _ = pump.join();
+    if pump.join().is_err() {
+        tracing::error!("the output pump panicked; the last of the output may be missing");
+    }
     // The writer is joined and the pump is, so nothing reads or writes the handles `session` closes.
     drop(session);
     Ok(waited?)
@@ -1792,7 +1792,8 @@ fn spawn_stream_pump(
             if !delivering {
                 continue; // draining, see above
             }
-            if link.deliver(carrier, stream, &buf[..n]).is_err() {
+            if let Err(e) = link.deliver(carrier, stream, &buf[..n]) {
+                tracing::debug!("the client is gone; its output is no longer delivered: {e:#}");
                 // The socket is gone. This is an independent detector, not a redundant
                 // one: the input pump's queue is bounded, so a command that ignores its stdin
                 // can still park that pump in a send and blind it to the socket. And keep READING: for a

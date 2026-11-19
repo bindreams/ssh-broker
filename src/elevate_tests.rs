@@ -184,6 +184,20 @@ fn a_program_that_is_not_found_is_refused_naming_it() {
     assert_eq!(refused.exit_code(), 126);
 }
 
+/// No program in the line is no command: it is refused with a sentence that says so, not defaulted to an empty
+/// program name that the host would look for.
+#[test]
+fn a_blank_line_is_refused_and_not_defaulted() {
+    let host = TestHost::new();
+    for blank in ["", "   ", "\t "] {
+        assert_eq!(
+            line_of(&host, blank),
+            Err(Refused::CannotStart("no command was given".to_owned())),
+            "{blank:?}"
+        );
+    }
+}
+
 #[test]
 fn the_request_carries_the_line_as_it_is() {
     let id = SessionId::parse(ID).unwrap();

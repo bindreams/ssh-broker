@@ -7,7 +7,8 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Mutex};
 
 use super::{
-    Encoding, RawExec, after_args, dash_c_tail, decode_command, join_args, resolve_exec, split_args, split_program,
+    Encoding, RawExec, after_args, dash_c_tail, decode_command, join_args, next_arg, resolve_exec, split_args,
+    split_program,
 };
 
 fn args(line: &str) -> Vec<String> {
@@ -31,6 +32,25 @@ fn split_args_follows_the_crt_rules() {
     // The program name is split like any argument here; only `dash_c_tail` special-cases it.
     assert_eq!(args(""), Vec::<String>::new());
     assert_eq!(args("   "), Vec::<String>::new());
+}
+
+/// `std::env::args` reads `"C:\a\\""b.exe"` as `C:\a\"b.exe`: after an even run of backslashes the quote is not
+/// consumed, so inside quotes `""` is one literal quote. `elevate` must look for the program argv holds.
+#[test]
+fn an_even_run_of_backslashes_leaves_the_quote_to_the_quote_rule() {
+    let token = r#""C:\a\\""b.exe""#;
+    assert_eq!(next_arg(token), Some((r#"C:\a\"b.exe"#.to_owned(), "")));
+    assert_eq!(args(&format!("p {token} x")), ["p", r#"C:\a\"b.exe"#, "x"]);
+    // The closing quote after an even run still closes: nothing follows it to pair with.
+    assert_eq!(next_arg(r#""C:\a\\" b"#), Some((r"C:\a\".to_owned(), " b")));
+}
+
+/// An odd run: half the backslashes and a literal quote, which does not toggle.
+#[test]
+fn an_odd_run_of_backslashes_makes_a_literal_quote() {
+    let token = r#""C:\a\\\"b.exe""#;
+    assert_eq!(next_arg(token), Some((r#"C:\a\"b.exe"#.to_owned(), "")));
+    assert_eq!(args(&format!("p {token} x")), ["p", r#"C:\a\"b.exe"#, "x"]);
 }
 
 #[test]

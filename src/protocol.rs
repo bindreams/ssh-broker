@@ -6,6 +6,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::shell::pack::MAX_LINE_UNITS;
+
 pub const HEADER_LEN: usize = 5;
 /// Guard against absurd allocations from a malformed/hostile length prefix (1 MiB).
 pub const MAX_FRAME: u32 = 1 << 20;
@@ -322,8 +324,8 @@ impl Handshake {
     }
 }
 
-/// What `CreateProcess` takes of a command line, and so what a request may carry of a command line or a
-/// working directory, in UTF-16 units.
+/// The most UTF-16 units a request's working directory may have (a path of the system's own limit). A command is
+/// held to [`MAX_LINE_UNITS`], which counts the terminator.
 pub const MAX_ELEVATION_UNITS: usize = 32_767;
 
 /// What `ssh-broker elevate` sends on `request.sock`, as the payload of a [`FrameKind::Request`] frame. Everything in
@@ -365,20 +367,26 @@ impl ElevationRequest {
 
     /// The session this request names, if the request is one the agent may act on: a [`SessionId`], a command that
     /// is not empty and whose program is an absolute path (the file is not looked for: starting it reports that), a
-    /// command and a working directory of at most [`MAX_ELEVATION_UNITS`] UTF-16 units, and no NUL anywhere. The
-    /// error says which field.
+    /// command of fewer than [`MAX_LINE_UNITS`] UTF-16 units (`CreateProcessW` counts its terminator in them, as
+    /// the session's own line does), a working directory of at most [`MAX_ELEVATION_UNITS`], and no NUL anywhere.
+    /// The error says which field.
     pub fn check(&self) -> anyhow::Result<SessionId> {
         let session = SessionId::parse(&self.session)
             .ok_or_else(|| anyhow::anyhow!("the session is not a session id of this program"))?;
         anyhow::ensure!(!self.command.is_empty(), "the command is empty");
         for (field, text) in [("command", &self.command), ("working directory", &self.cwd)] {
             anyhow::ensure!(!text.contains('\0'), "the {field} holds a NUL");
-            let units = text.encode_utf16().count();
-            anyhow::ensure!(
-                units <= MAX_ELEVATION_UNITS,
-                "the {field} is {units} UTF-16 units, over the limit of {MAX_ELEVATION_UNITS}"
-            );
         }
+        let units = self.command.encode_utf16().count();
+        anyhow::ensure!(
+            units < MAX_LINE_UNITS,
+            "the command is {units} UTF-16 units, at or over the limit of {MAX_LINE_UNITS} (with its terminator)"
+        );
+        let units = self.cwd.encode_utf16().count();
+        anyhow::ensure!(
+            units <= MAX_ELEVATION_UNITS,
+            "the working directory is {units} UTF-16 units, over the limit of {MAX_ELEVATION_UNITS}"
+        );
         let (program, _) = crate::cmdline::split_program(&self.command);
         anyhow::ensure!(
             crate::shell::is_absolute_windows(std::path::Path::new(program)),

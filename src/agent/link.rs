@@ -7,6 +7,10 @@
 //! without a terminal gates nothing: the output of a command that runs without `--terminal` is written to the
 //! request's own connection through one of those.
 //!
+//! **Input and screen return at different times.** The keys go back to the session as soon as the command has
+//! exited and its tree is reaped ([`Link::return_input`]), so what is typed while the command's pseudoconsole is
+//! closed and drained is the session's. The screen (the output) returns when the guard drops, after the drain.
+//!
 //! **Two locks.** The state (whom the connection carries, where input goes, the size) is under one lock that is
 //! never held across a write to the connection. Writes are serialised by a second lock of their own, which holds
 //! the write half. Input and resize take only the state lock and the target's own handle, so they are routed while
@@ -41,7 +45,8 @@ pub(super) type ElevatedTarget = Arc<dyn InputTarget>;
 
 /// The elevated command the connection carries: where its input goes, and the means to end it.
 struct Hosted {
-    target: ElevatedTarget,
+    /// `None` once the command's input has gone back to the session ([`Link::return_input`]).
+    target: Option<ElevatedTarget>,
     end: Killer,
 }
 
@@ -114,7 +119,6 @@ impl Link {
         })
     }
 
-    /// Whether the session has a terminal.
     pub(super) fn has_terminal(&self) -> bool {
         self.terminal
     }
@@ -186,8 +190,8 @@ impl Link {
         super::send_exit(&mut *locked(&self.writer), code);
     }
 
-    /// Send the client's keys to whichever target is current: the elevated command's while it runs, else the
-    /// session's. Takes no lock the connection's writes hold, and none while it writes to the target.
+    /// Send the client's keys to whichever target is current: the elevated command's while its input is its, else
+    /// the session's. Takes no lock the connection's writes hold, and none while it writes to the target.
     ///
     /// An error is the session's own target's. The elevated command's input fails when the command is ending (its
     /// pseudoconsole is closed while it is still current), which is no fault of the session: the keys are dropped,
@@ -196,7 +200,7 @@ impl Link {
         let elevated = locked(&self.state)
             .elevated
             .as_ref()
-            .map(|hosted| Arc::clone(&hosted.target));
+            .and_then(|hosted| hosted.target.clone());
         match (elevated, &self.session) {
             (Some(target), _) => {
                 if let Err(e) = target.input(bytes) {
@@ -209,16 +213,24 @@ impl Link {
         }
     }
 
+    /// The hosted command has exited and its tree is reaped: from now on the client's keys and size go to the
+    /// session's own target again, though the connection still carries the command's output until its guard drops
+    /// (its screen is up until the output is drained). The keys typed in that window are the session's shell's, and
+    /// its echo of them waits for the screen like all session output. Does nothing when nothing is hosted.
+    pub(super) fn return_input(&self) {
+        if let Some(hosted) = locked(&self.state).elevated.as_mut() {
+            hosted.target = None;
+        }
+    }
+
     /// The client's size changed: remember it and apply it to the current target.
     pub(super) fn resize(&self, size: Resize) {
         let _applying = locked(&self.resizing);
         let target = {
             let mut state = locked(&self.state);
             state.size = (size.cols, size.rows);
-            match &state.elevated {
-                Some(hosted) => Some(Arc::clone(&hosted.target)),
-                None => self.session.clone(),
-            }
+            let elevated = state.elevated.as_ref().and_then(|hosted| hosted.target.clone());
+            elevated.or_else(|| self.session.clone())
         };
         if let Some(target) = target {
             target.resize(size.cols, size.rows);
@@ -226,8 +238,8 @@ impl Link {
     }
 
     /// From now on the connection carries the elevated command's output and `target` gets the client's keys and
-    /// size, which it is given now; `end` ends the command, and [`Link::end_hosting`] calls it. Dropping the guard
-    /// switches back. Only a link with a terminal has a screen to hand over: `decide` refuses the request that would
+    /// size, which it is given now, until [`Link::return_input`]; `end` ends the command, and [`Link::end_hosting`]
+    /// calls it. Dropping the guard gives the output back. Only a link with a terminal has a screen to hand over: `decide` refuses the request that would
     /// come here for one without.
     ///
     /// `None` when the session's shell is gone already ([`Link::end_hosting`]): nothing is hosted, and this calls
@@ -245,7 +257,7 @@ impl Link {
             }
             state.carrier = Carrier::Elevated;
             state.elevated = Some(Hosted {
-                target: Arc::clone(&target),
+                target: Some(Arc::clone(&target)),
                 end,
             });
             state.size
@@ -287,13 +299,13 @@ impl Link {
     }
 }
 
-/// The connection carries the elevated command while this lives; dropping it switches back to the session and
-/// wakes its output pump, before whatever the caller writes next (the request's reply).
+/// The connection carries the elevated command's output while this lives (its input goes back earlier, at
+/// [`Link::return_input`]); dropping it switches the screen back to the session and wakes its output pump, before
+/// whatever the caller writes next (the request's reply).
 ///
 /// The switch back always gives the session's pseudoconsole its current size, even when it is the size it has:
-/// resizing a pseudoconsole to its own size makes it repaint its whole screen, which is how the screen of the
-/// session comes back after the command's. Never a different size and back: that stream asks the person's terminal
-/// to resize its window.
+/// resizing a pseudoconsole to its own size makes it repaint its whole screen. Never a different size and back:
+/// that stream asks the person's terminal to resize its window.
 pub(super) struct ElevatedGuard<'a> {
     link: &'a Link,
 }

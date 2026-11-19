@@ -176,6 +176,45 @@ fn an_input_error_of_the_elevated_target_is_not_the_sessions_and_the_session_get
         .expect_err("an error of the session's own input is returned");
 }
 
+/// The command has exited and its tree is reaped, but its screen is still up until its output is drained: the keys
+/// typed meanwhile are the session's, and the session's echo of them waits for the screen like all its output.
+#[test]
+fn input_returns_to_the_session_before_the_screen_does() {
+    let (wire, session, elevated) = (
+        Wire::default(),
+        Arc::new(Recorder::default()),
+        Arc::new(Recorder::default()),
+    );
+    let link = terminal_link(&wire, &session);
+    let guard = host(&link, elevated.clone());
+
+    link.return_input();
+    link.route_input(b"k").unwrap();
+    link.resize(Resize { cols: 100, rows: 40 });
+    assert_eq!(
+        session.events(),
+        ["input k", "resize 100x40"],
+        "the keys and the size are the session's"
+    );
+    assert_eq!(
+        elevated.events(),
+        ["resize 80x24"],
+        "the elevated target gets nothing after"
+    );
+
+    // The screen is still the command's: the session's echo waits, and the command's last output is written.
+    let (echo, on_parked) = deliver_parked(&link, Carrier::Session, "echo");
+    on_parked.recv().expect("the session's deliver waits for the screen");
+    link.deliver(Carrier::Elevated, Stream::Pty, b"last").unwrap();
+    assert_eq!(wire.data(), ["Plast"]);
+
+    drop(guard);
+    echo.join()
+        .unwrap()
+        .expect("the session's deliver went on after the switch back");
+    assert_eq!(wire.data(), ["Plast", "Pecho"]);
+}
+
 #[test]
 fn the_size_at_the_switch_is_applied_to_the_new_target() {
     let (wire, session, elevated) = (

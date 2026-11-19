@@ -170,13 +170,10 @@ impl Found<'_> {
 /// this program's own is searched for a bare name.
 ///
 /// A program that only the shell finds (`dir`) or that `PATHEXT` completes (`npm` for `npm.cmd`) is refused and
-/// nothing runs: name the file (`npm.cmd`), or run it through the shell (`cmd /c dir`).
+/// nothing runs: name the file (`npm.cmd`), or run it through the shell (`cmd /c dir`). A line with no argument is
+/// refused too.
 pub fn find_program<'a>(host: &dyn Host, line: &'a str) -> Result<Found<'a>, Refused> {
-    debug_assert!(
-        !line.trim_matches(SEPARATORS).is_empty(),
-        "route sends no blank command"
-    );
-    let (program, rest) = next_arg(line).unwrap_or_default();
+    let (program, rest) = next_arg(line).ok_or_else(|| Refused::CannotStart("no command was given".to_owned()))?;
     let cannot = |reason: &dyn std::fmt::Display| Refused::CannotStart(format!("{program}: {reason}"));
     let named = if program.contains(['\\', '/', ':']) {
         let absolute = std::path::absolute(&program).map_err(|e| cannot(&e))?;

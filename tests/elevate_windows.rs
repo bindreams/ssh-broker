@@ -9,8 +9,7 @@
 //! - `auto-approve` runs the command with the agent's own token, elevated. By default, in a session with a terminal
 //!   or without, its input is closed and its output is printed by `elevate` in the session, below the typed line, so
 //!   it can be piped; with `--terminal` it has a screen of its own, and the session's screen comes back when it ends;
-//! - the default (`prompt`) asks the person at the terminal, which a later unit builds: until then it is refused
-//!   with a sentence that says so;
+//! - the default (`prompt`) asks the person at the terminal; it is refused with a sentence that says so;
 //! - `always` runs it in place, in a session that is elevated already.
 //!
 //! What a session with a terminal shows is judged on the client's stream rendered as a terminal would
@@ -252,8 +251,7 @@ fn a_command_run_without_a_terminal_has_its_output_piped_and_the_session_is_not_
 
 /// Elevated (CI only). In a session with a terminal, without `--terminal`: the command's output is printed in the
 /// session below the line that was typed, and the prompt follows it, with the next line and its output after that.
-/// Judged on the client's history, in order, and on no row holding a prompt and a row of the command (what the
-/// command's own screen garbled into the session's before this was built).
+/// Judged on the client's history, in order, and on no row holding a prompt and a row of the command.
 #[test]
 fn with_a_terminal_the_output_is_below_the_typed_line_and_the_prompt_follows() {
     let _machine = machine::exclusive();
@@ -368,7 +366,7 @@ fn ctrl_c_ends_a_command_run_without_a_terminal_and_the_session_goes_on() {
 ///
 /// What the command read is judged by its exit code, which the session prints afterwards, and not by anything the
 /// command prints: its screen is replaced by the session's the moment it ends, so its last words need not reach the
-/// client at all (seen in CI: the agent delivered them, and sshd's console never showed them).
+/// client at all.
 #[test]
 fn with_terminal_keys_reach_the_command_and_the_sessions_screen_comes_back() {
     let _machine = machine::exclusive();
@@ -399,8 +397,8 @@ fn with_terminal_keys_reach_the_command_and_the_sessions_screen_comes_back() {
     session.leave();
 }
 
-/// Elevated (CI only). The default login asks the person at the terminal, which a later unit builds: until then
-/// `elevate` is refused with a sentence that says so, and the command does not run.
+/// Elevated (CI only). The default login asks the person at the terminal; `elevate` is refused with a sentence that
+/// says so, and the command does not run.
 #[test]
 fn elevate_with_prompt_is_refused_until_the_next_unit() {
     let _machine = machine::exclusive();
@@ -479,7 +477,7 @@ fn the_program_is_found_where_the_session_finds_it() {
     let admin = Started::start(&kit, &account);
 
     // In the account's own profile: its unelevated session cannot `Set-Location` into the kit, which is under the
-    // profile of the account that runs the tests (seen in CI: "Access to the path ... AppData is denied").
+    // profile of the account that runs the tests.
     let folder = account.profile().join("probe-folder");
     std::fs::create_dir(&folder).expect("make the folder of the program");
     let system_root = std::env::var("SystemRoot").expect("SystemRoot");
@@ -532,6 +530,32 @@ fn always_runs_elevate_in_place_and_asks_nothing() {
         !outcome.stderr.contains(text::elevation_already_elevated().trim_end()),
         "the agent was asked: {}",
         admin.failure(&outcome)
+    );
+}
+
+/// Elevated (CI only). In place, as a person uses it: the command's exit code is `elevate`'s, `--terminal` changes
+/// nothing (no screen is made at High), and a program that is not found is the client's own refusal, 126, with the
+/// sentence that names it.
+#[test]
+fn in_place_elevate_gives_the_commands_code_and_refuses_a_program_it_cannot_find() {
+    let _machine = machine::exclusive();
+    let (kit, account, _end) = an_administrator("elip");
+    let admin = Started::start(&kit, &account);
+
+    let plain = admin.elevate_over_ssh(Some("always"), "cmd.exe /c exit 7");
+    assert_eq!(plain.code, Some(7), "{}", admin.failure(&plain));
+
+    let terminal = admin.elevate_over_ssh(Some("always"), "--terminal cmd.exe /c exit 8");
+    assert_eq!(terminal.code, Some(8), "{}", admin.failure(&terminal));
+
+    let nowhere = admin.elevate_over_ssh(Some("always"), "nonesuch-elip");
+    assert_eq!(nowhere.code, Some(REFUSED), "{}", admin.failure(&nowhere));
+    assert!(
+        nowhere
+            .stderr
+            .contains(text::elevation_cannot_start("nonesuch-elip: not found on PATH").trim_end()),
+        "{}",
+        admin.failure(&nowhere)
     );
 }
 

@@ -37,8 +37,8 @@ pub(super) enum Verdict {
 /// `Always` refuse (the second because a session that asked for `always` runs at High, where `elevate` runs the
 /// command in place and asks nobody: a request for it that reaches the agent comes from a process below High
 /// somewhere else in the account). A command that wants a terminal in a session that has none is refused next:
-/// there is no screen to give it. `AutoApprove` runs it; `Prompt` is the question the next unit builds, and refuses
-/// with a sentence that says so.
+/// there is no screen to give it. `AutoApprove` runs it; `Prompt` is refused, with a sentence that says the consent
+/// question does not exist yet.
 pub(super) fn decide(policy: ElevationPolicy, has_terminal: bool, terminal: bool) -> Verdict {
     match policy {
         ElevationPolicy::Never => Verdict::Refuse(text::elevation_never()),
@@ -137,9 +137,9 @@ pub(super) enum RunOutcome {
 /// - by default it runs on pipes, its stdin closed at once, and its stdout and stderr go back on `conn` as the
 ///   request's reply, for the `elevate` client to print. The session's connection is not touched;
 /// - with `--terminal` it has a pseudoconsole of its own at the link's size: the session's connection carries its
-///   output and it gets the client's keys while it runs ([`Link::host_elevated`]), and when it ends the
-///   pseudoconsole is closed and drained as a session's is before the connection goes back to the session, which
-///   repaints its screen.
+///   output and it gets the client's keys while it runs ([`Link::host_elevated`]). When it ends, the client's keys
+///   go back to the session at once ([`Link::return_input`]), and the pseudoconsole is closed and drained as a
+///   session's is before the screen goes back to the session, which repaints it.
 ///
 /// The command lives as long as the request that asked for it, and no longer: `conn` is watched, and a client that
 /// has hung up ends the command's tree. A command with `--terminal` also ends with the session whose screen it
@@ -205,6 +205,9 @@ fn on_a_pseudoconsole(
         })
     };
     let guard = link.host_elevated(target.clone(), end);
+    if guard.is_none() {
+        tracing::debug!("the session's shell is gone: the command was ended instead of hosted");
+    }
     // A delivery that fails is a connection that has gone, and its command has no screen to run on: its tree ends,
     // as the session's own pump's does, and the pump goes on reading until the pseudoconsole is closed. The session's
     // own end is [`Link::end_hosting`]'s, and this is what ends the command when the session's hang-up watch could
@@ -218,8 +221,9 @@ fn on_a_pseudoconsole(
     let pump = spawn_stream_pump(out_raw, Stream::Pty, Arc::clone(link), Carrier::Elevated, gone);
 
     // The session's own teardown (see `handle_pty`), with nothing to end in the link: the command is the one being
-    // ended.
-    let ended = end_pty(session, &target, pump, || {});
+    // ended. Once it has exited and its tree is reaped, the client's keys are the session's again; its screen is
+    // back only when the guard drops below.
+    let ended = end_pty(session, &target, pump, || link.return_input());
     // The connection goes back to the session before the reply is written.
     drop(guard);
     if let Some(hangup) = hangup {
@@ -277,14 +281,19 @@ fn on_pipes(conn: &mut ConnTx, line: &str, cwd: Option<&Path>, starts: &Starts, 
     if let Some(w) = teardown_warning(reap_tree(&job)) {
         tracing::error!("{w}");
     }
-    let _ = out.join();
-    let _ = err.join();
+    let (out, err) = (out.join(), err.join());
+    let panicked = out.is_err() || err.is_err();
+    if panicked {
+        tracing::error!("an output pump panicked; the output the client printed may be cut");
+    }
     if let Some(hangup) = hangup {
         hangup.finish();
     }
-    match waited {
-        Ok(code) => RunOutcome::Exited(code),
-        Err(cause) => RunOutcome::EndUnread(cause.into()),
+    match (waited, panicked) {
+        (Err(cause), _) => RunOutcome::EndUnread(cause.into()),
+        // The command's code must not be reported as a clean end.
+        (Ok(_), true) => RunOutcome::EndUnread(anyhow::anyhow!("an output pump panicked; the output may be cut")),
+        (Ok(code), false) => RunOutcome::Exited(code),
     }
 }
 
