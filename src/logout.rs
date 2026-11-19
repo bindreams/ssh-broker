@@ -51,7 +51,7 @@ pub fn no_session_line(elevation: &anyhow::Result<Elevation>, elevated_folder: b
 fn where_to_run_line() -> String {
     format!(
         "ssh-broker: no session to end that this process can reach: {}.",
-        crate::offer::text::FILTERED_LOOKS_ELSEWHERE
+        crate::offer::text::ELEVATED_AGENT_LOOKS_ELSEWHERE
     )
 }
 

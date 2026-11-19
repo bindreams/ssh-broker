@@ -325,18 +325,12 @@ fn request_loop_met(
     let connections = Connections::new();
     let control = Arc::new(Control::new(true, Arc::clone(&connections)));
     let end = crate::agent::serve_listener("request.sock", (), Arc::new(|| Ok(())), &connections, |()| {
-        crate::agent::run_until_the_end_is_decided(
+        crate::agent::accept_loop_with(
+            &mut accept,
             &connections,
-            || {
-                crate::agent::accept_loop_with(
-                    &mut accept,
-                    &connections,
-                    &control,
-                    || connections.is_closing(),
-                    |_conn, _control| Ok(()),
-                )
-            },
-            || {},
+            &control,
+            || connections.is_closing(),
+            |_conn, _control| Ok(()),
         )
     });
     (connections, end)
@@ -377,59 +371,48 @@ fn shortage() -> anyhow::Error {
     anyhow::anyhow!("accept failed with code 10055").context(crate::agent::NothingLive)
 }
 
-/// Whether the end is decided is read in the one step that sets it, under the tally's lock, so no connection can
-/// become live between the reading and the flag; the loop still holds its listener when it is read.
+/// A connection of the agent that is live when the loop meets a shortage can end and free what the loop lacks: the
+/// shortage is not one with nothing live. The agent is not ended and the loop does not give up its listener: it
+/// waits for an end, as the shared rule says, and accepts again.
 #[test]
-fn the_request_loop_decides_the_end_with_its_listener_still_held() {
+fn a_shortage_while_a_connection_is_live_keeps_the_agent_and_the_request_loop() {
     let connections = Connections::new();
-    let mut runs = 0;
-    let end = crate::agent::serve_listener("request.sock", (), Arc::new(|| Ok(())), &connections, |()| {
-        crate::agent::run_until_the_end_is_decided(
-            &connections,
-            || {
-                runs += 1;
-                shortage()
-            },
-            || panic!("nothing is live, so there is nothing to wait for"),
-        )
-    });
-    assert_eq!(runs, 1);
-    assert!(end.downcast_ref::<crate::agent::NothingLive>().is_some(), "{end:#}");
-    assert!(connections.is_closing());
-}
-
-/// A connection that became live after the loop met its shortage is a connection that can end and free what the
-/// loop lacks: the shortage is no longer one with nothing live. The agent is not ended and the loop does not give
-/// up its listener: it waits for an end, as the shared rule says, and serves again.
-#[test]
-fn a_connection_counted_after_the_shortage_keeps_the_agent_and_the_request_loop() {
-    let connections = Connections::new();
-    let held = std::cell::RefCell::new(None);
+    let control = Arc::new(Control::new(true, Arc::clone(&connections)));
     let (release, released) = mpsc::channel::<crate::agent::Live>();
-    // Its handler returning: the drop takes the tally's lock, which the wait for an end holds until it parks.
+    // The connection ends after the first failure: before the wait for it, or during, the loop goes on.
     let handler = std::thread::spawn(move || drop(released.recv().unwrap()));
-    let mut runs = 0;
+    let mut live = Some(connections.begin());
+    let mut accepted = 0;
 
     let end = crate::agent::serve_listener("request.sock", (), Arc::new(|| Ok(())), &connections, |()| {
-        crate::agent::run_until_the_end_is_decided(
-            &connections,
+        crate::agent::accept_loop_with(
             || {
-                runs += 1;
-                assert!(connections.listener_is_open(), "run {runs}: the listener is held");
-                if runs == 1 {
-                    *held.borrow_mut() = Some(connections.begin());
-                    shortage()
-                } else {
-                    anyhow::Error::new(Stopped)
+                accepted += 1;
+                assert!(
+                    connections.listener_is_open(),
+                    "accept {accepted}: the listener is held"
+                );
+                match live.take() {
+                    Some(live) => {
+                        release.send(live).unwrap();
+                        Err(AcceptError::Exhausted {
+                            code: 10055,
+                            source: std::io::Error::from_raw_os_error(10055),
+                        })
+                    }
+                    None => Err(AcceptError::Fatal(anyhow::anyhow!("the listener failed"))),
                 }
             },
-            || release.send(held.borrow_mut().take().unwrap()).unwrap(),
+            &connections,
+            &control,
+            || connections.is_closing(),
+            |_conn, _control| Ok(()),
         )
     });
     handler.join().unwrap();
 
-    assert_eq!(runs, 2, "the loop served again");
-    assert!(end.downcast_ref::<Stopped>().is_some(), "{end:#}");
+    assert_eq!(accepted, 2, "the loop accepted again");
+    assert_eq!(format!("{end:#}"), "the listener failed: the listener failed");
     assert!(!connections.is_closing(), "and the end was not decided");
     crate::agent::request_loop_ended(&end, &connections, |err| panic!("the agent was ended: {err:#}"));
 }

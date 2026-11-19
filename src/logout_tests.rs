@@ -202,7 +202,7 @@ fn an_administrators_unelevated_process_is_told_where_else_to_ask() {
             line,
             format!(
                 "ssh-broker: no session to end that this process can reach: {}.",
-                crate::offer::text::FILTERED_LOOKS_ELSEWHERE
+                crate::offer::text::ELEVATED_AGENT_LOOKS_ELSEWHERE
             ),
             "elevated folder: {elevated_folder}"
         );

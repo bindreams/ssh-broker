@@ -140,11 +140,12 @@ pub fn elevation_unreadable(cause: &str) -> String {
     )
 }
 
-/// What an administrator's unelevated process (`account::Elevation::Filtered`) is told when it asks for the
-/// agent that serves its folder and finds none: the account's agent runs elevated and serves the elevated
-/// folder, so the plain one it looks in has no `agent.sock`. A clause, for `verify`'s row and for `logout`'s line
-/// when neither socket of the plain folder is served.
-pub const FILTERED_LOOKS_ELSEWHERE: &str = "this account is an administrator and its agent serves elevated processes: run this from an elevated prompt or from an SSH login that asked for SSH_BROKER_ELEVATION=always";
+/// What an unelevated process of an account whose agent runs at High is told when it asks for the agent that
+/// serves its folder and finds none: the account's agent runs elevated and serves the elevated folder, so the
+/// plain one it looks in has no `agent.sock`. The account is an administrator's, or one Windows splits without
+/// making it one (a Backup Operator), so the clause says neither. For `verify`'s row and for `logout`'s line when
+/// neither socket of the plain folder is served.
+pub const ELEVATED_AGENT_LOOKS_ELSEWHERE: &str = "this account's agent serves elevated processes: run this from an elevated prompt or from an SSH login that asked for SSH_BROKER_ELEVATION=always";
 
 /// Told when a High login lacks `SeImpersonatePrivilege`, which `CreateProcessWithTokenW` needs; the way
 /// out is worded as in the batch-right sentence, and granting the right is not suggested.

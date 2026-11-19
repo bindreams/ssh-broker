@@ -799,6 +799,37 @@ fn the_listener_is_closed_when_the_loop_fails_too() {
     assert!(closed(&flag));
 }
 
+/// The loop of `agent.sock` that meets a shortage with nothing live leaves the end decided in the tally, as the loop
+/// of `request.sock` does: a request counted after it is refused, not cut when the process ends.
+#[test]
+fn a_shortage_with_nothing_live_on_the_main_loop_leaves_the_end_decided() {
+    let connections = Connections::new();
+    let control = Arc::new(Control::new(true, Arc::clone(&connections)));
+    let end = serve_until_drained_in(
+        (),
+        Arc::new(|| Ok(())),
+        &connections,
+        || control.is_ending(),
+        |()| {
+            accept_loop_with(
+                || {
+                    Err(AcceptError::Exhausted {
+                        code: 10055,
+                        source: std::io::Error::from_raw_os_error(10055),
+                    })
+                },
+                &connections,
+                &control,
+                || connections.is_closing(),
+                |_conn, _control| Ok(()),
+            )
+        },
+    );
+    assert!(end.downcast_ref::<NothingLive>().is_some(), "{end:#}");
+    assert!(connections.is_closing(), "the end is decided in the tally");
+    assert!(control.is_ending(), "a request counted now is refused");
+}
+
 // deciding the end -----
 
 /// The accept loop as the end meets it: blocked in `accept` until it is woken, it takes one more
@@ -1636,6 +1667,99 @@ fn a_kept_connection_is_served_once_more_when_the_end_is_decided_not_closed_bare
     );
     assert_eq!(handled, [1, 2]);
     assert!(end.downcast_ref::<Stopped>().is_some(), "{end:#}");
+}
+
+/// A shortage with nothing live decides the end in the loop, with the kept connection still held: it is served once
+/// more, now that the end is decided, which gets it the ending refusal.
+#[test]
+fn a_kept_connection_gets_the_ending_refusal_when_a_shortage_decides_the_end() {
+    let connections = Connections::new();
+    let mut tried = Vec::new();
+    let mut closing_at_each_try = Vec::new();
+    let end = serve_connections_with(
+        Arc::clone(&connections),
+        || Ok(1),
+        |conn, live| {
+            tried.push(conn);
+            closing_at_each_try.push(connections.is_closing());
+            if tried.len() == 1 {
+                live.abandon();
+                return Err((conn, std::io::Error::other("no thread")));
+            }
+            Ok(())
+        },
+        || {},
+        || false,
+    );
+    assert_eq!(tried, [1, 1], "the kept connection was closed without a byte");
+    assert_eq!(
+        closing_at_each_try,
+        [false, true],
+        "it is served once the end is decided"
+    );
+    assert!(end.downcast_ref::<NothingLive>().is_some(), "{end:#}");
+    assert!(connections.is_closing());
+}
+
+/// Another connection may become live before, during or after the loop's wait for one to end: the loop then waits
+/// (it is a shortage with something live) or decides the end. Whichever way it falls, the kept connection is served
+/// again: never closed without a byte by an agent that goes on.
+#[test]
+fn a_kept_connection_is_served_again_whichever_way_another_becomes_live_around_the_shortage() {
+    use std::sync::mpsc;
+    let connections = Connections::new();
+    let (go, going) = mpsc::channel::<()>();
+    let (release, released) = mpsc::channel::<()>();
+    let other = std::thread::spawn({
+        let connections = Arc::clone(&connections);
+        move || {
+            going.recv().unwrap();
+            let live = connections.begin();
+            // A loop that never serves the kept connection again drops its senders: nothing more comes.
+            let _ = released.recv();
+            drop(live);
+        }
+    });
+    let mut accepted = 0;
+    let mut tried = Vec::new();
+    let end = serve_connections_with(
+        Arc::clone(&connections),
+        || {
+            accepted += 1;
+            match accepted {
+                1 => Ok(1),
+                _ => Err(AcceptError::Fatal(anyhow::anyhow!("end of script"))),
+            }
+        },
+        |conn, live| {
+            tried.push(conn);
+            if tried.len() == 1 {
+                live.abandon();
+                go.send(()).unwrap();
+                return Err((conn, std::io::Error::other("no thread")));
+            }
+            // The other connection ends once the kept one is being served again.
+            let _ = release.send(());
+            Ok(())
+        },
+        {
+            let release = release.clone();
+            move || {
+                let _ = release.send(());
+            }
+        },
+        || false,
+    );
+    drop(release);
+    other.join().unwrap();
+    assert_eq!(tried, [1, 1], "the kept connection was closed without a byte");
+    let decided = end.downcast_ref::<NothingLive>().is_some();
+    assert!(decided || format!("{end:#}").ends_with("end of script"), "{end:#}");
+    assert_eq!(
+        decided,
+        connections.is_closing(),
+        "NothingLive is returned once the end is decided"
+    );
 }
 
 #[test]

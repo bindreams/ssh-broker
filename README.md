@@ -68,7 +68,7 @@ A session is unelevated unless the login's `SSH_BROKER_ELEVATION` says otherwise
 - A probe that does not answer takes only its own rows with it: the other probe still runs and the rest of the report stands, and a default probe that does not answer is the one row `parity probe (via agent)` beside the unelevated probe's row. A first probe that times out is not followed by a second, since the agent is not answering.
 - `junction directory`: `verify` removes the directory it named, whatever became of the probes. When it cannot, or a probe that did not answer may still create it, this row names the directory so that it can be deleted. It passes on purpose: a directory left in the temp folder does not make the installation wrong.
 
-A process below High that runs `verify` as an administrator finds no agent in the plain folder, and `verify` says why: this account is an administrator and its agent serves elevated processes, so run it from an elevated prompt or from an SSH login that asks for `SSH_BROKER_ELEVATION=always`. `verify` then runs no probe. `logout` works from any process of the account, when the agent's request socket is served; where it is not, `logout` says the same of itself.
+A process below High that runs `verify` as an administrator finds no agent in the plain folder, and `verify` says why: this account's agent serves elevated processes, so run it from an elevated prompt or from an SSH login that asks for `SSH_BROKER_ELEVATION=always`. `verify` then runs no probe. `logout` works from any process of the account, when the agent's request socket is served; where it is not, `logout` says the same of itself.
 
 The limits of elevated sessions are in [Limits worth knowing](#limits-worth-knowing-before-you-install-it).
 

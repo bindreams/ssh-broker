@@ -470,12 +470,13 @@ fn the_filtered_sentences_do_not_call_an_ordinary_ssh_login_the_way_to_an_elevat
         "ssh-broker: this login is an administrator's with elevation removed and cannot reach the account's agent, \
          which runs elevated, so this runs without DPAPI, a loaded profile or symlink traversal."
     );
+    // True of an administrator and of an account Windows splits without making it one, so it says neither.
     assert_eq!(
-        text::FILTERED_LOOKS_ELSEWHERE,
-        "this account is an administrator and its agent serves elevated processes: run this from an elevated prompt \
-         or from an SSH login that asked for SSH_BROKER_ELEVATION=always"
+        text::ELEVATED_AGENT_LOOKS_ELSEWHERE,
+        "this account's agent serves elevated processes: run this from an elevated prompt or from an SSH login \
+         that asked for SSH_BROKER_ELEVATION=always"
     );
-    assert!(!text::FILTERED_LOOKS_ELSEWHERE.contains("ordinary SSH login"));
+    assert!(!text::ELEVATED_AGENT_LOOKS_ELSEWHERE.contains("ordinary SSH login"));
     assert_eq!(
         text::agent_ended(68, None),
         "ssh-broker: the agent refused to run: its token is an administrator's with elevation removed, and an \

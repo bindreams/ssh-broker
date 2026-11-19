@@ -376,18 +376,12 @@ fn serve_requests(listener: Listener, connect: WakeConnect, connections: &Arc<Co
         .name("request-socket".into())
         .spawn(move || {
             let end = serve_listener(REQUEST_SOCKET_FILE_NAME, listener, connect, &connections, |listener| {
-                run_until_the_end_is_decided(
+                accept_loop(
+                    listener,
                     &connections,
-                    || {
-                        accept_loop(
-                            listener,
-                            &connections,
-                            &control,
-                            || connections.is_closing(),
-                            requests::serve,
-                        )
-                    },
-                    || {},
+                    &control,
+                    || connections.is_closing(),
+                    requests::serve,
                 )
             });
             // The cause is logged by `request_loop_ended`, once.
@@ -398,37 +392,10 @@ fn serve_requests(listener: Listener, connect: WakeConnect, connections: &Arc<Co
     }
 }
 
-/// Run the request socket's loop (`run`) until it ends in a way that is the agent's to act on. A shortage with no
-/// connection of this agent live ([`NothingLive`]) is that only once the end is decided, which
-/// [`Connections::decide_end_if_idle`] does in one step under the tally's lock: if a connection became live after
-/// the loop gave up, the shortage is no longer one with nothing live. The loop then does what the shared rule
-/// does with a shortage while something is live (see [`serve_connections_with`]): it waits until a connection
-/// has ended, and runs again, holding its listener throughout. `blocking` is called when that wait is about to
-/// block (see [`Connections::wait_for_an_end`]). Returns the error that ended the loop.
-#[cfg(windows)]
-fn run_until_the_end_is_decided(
-    connections: &Arc<Connections>,
-    mut run: impl FnMut() -> anyhow::Error,
-    mut blocking: impl FnMut(),
-) -> anyhow::Error {
-    loop {
-        let end = run();
-        if end.downcast_ref::<NothingLive>().is_none() {
-            return end;
-        }
-        // Read before the decision: a connection that ends between them is not missed.
-        let since = connections.ended();
-        if connections.decide_end_if_idle() {
-            return end;
-        }
-        connections.wait_for_an_end(since, &mut blocking);
-    }
-}
-
 /// What the request socket's loop does with how it ended (`end`). Whether the agent ends is not that loop's to
 /// say, and whatever stops it leaves the sessions as they are, with one exception: a shortage with no
-/// connection of this agent live ([`NothingLive`]), which [`run_until_the_end_is_decided`] has decided the end
-/// on. The end then goes as every end goes ([`Connections::settle`]: the loop of `agent.sock` is woken and
+/// connection of this agent live ([`NothingLive`]), on which the loop has decided the end (see
+/// [`serve_connections_with`]). The end then goes as every end goes ([`Connections::settle`]: the loop of `agent.sock` is woken and
 /// stops, nothing is live to drain), and only then the process ends, through `end_agent`, as it does when the
 /// loop of `agent.sock` meets the shortage. Nothing is live, so nothing is lost, and the next login starts an
 /// agent with both sockets; an agent that served on without the request socket would leave every `logout` from
@@ -590,7 +557,9 @@ enum Arrived {
 struct Stopped;
 
 /// The context of the error with which a loop ends on a shortage of resources when no connection of this agent is
-/// live to free any: nothing can, so the shortage is fatal (see [`serve_connections_with`]).
+/// live to free any: nothing can, so the shortage is fatal (see [`serve_connections_with`]). The loop returns it
+/// only after it has decided the end in the tally ([`Connections::decide_end_if_idle`]), so a connection counted
+/// after is refused; what the caller does with it is to settle that end and end the process.
 #[cfg(windows)]
 #[derive(Debug, thiserror::Error)]
 #[error("no connection of this agent is live to free a resource")]
@@ -676,7 +645,8 @@ type NotServed<C> = (C, std::io::Error);
 /// for its connection (it returns the connection and the error, having given up its `Live`), is
 /// waited out: the loop blocks until one of this agent's own connections ends, which is the only thing
 /// that can free any of those, and then accepts again, or serves the same connection again if it was
-/// kept. With no live connection nothing can, and the shortage is fatal.
+/// kept. With no live connection nothing can, and the shortage is fatal: the loop decides the end
+/// (see [`serve_connections_with`]).
 #[cfg(all(windows, test))]
 fn serve_connections<C>(
     accept: impl FnMut() -> Result<C, AcceptError>,
@@ -701,6 +671,12 @@ fn serve_connections_observed<C>(
 ///
 /// `stopping` is asked before every `accept`; once it says so the loop returns [`Stopped`]. The
 /// party that makes it true must also make a blocked `accept` return (a connection of its own).
+///
+/// A shortage that meets no live connection decides the end here, in one step under the tally's lock
+/// ([`Connections::decide_end_if_idle`]), while the loop still holds the connection it kept: that connection is
+/// served once more, as when `stopping` says so, and the loop returns the shortage with [`NothingLive`] as its
+/// context. If a connection became live meanwhile the end stays undecided and the loop goes round again, with
+/// the kept connection still held. Both loops of the agent get the rule from here.
 #[cfg(windows)]
 fn serve_connections_with<C>(
     connections: Arc<Connections>,
@@ -715,14 +691,7 @@ fn serve_connections_with<C>(
     let mut kept = None;
     loop {
         if stopping() {
-            // The end is decided while a connection waits for a thread. It is served once more, which
-            // gets it the ending refusal (see `handle_connection_in`) and counts it, so the drain waits
-            // for the refusal. If there is still no thread, its client sees the agent end.
-            if let Some(conn) = kept.take()
-                && let Err((_, e)) = serve(conn, connections.begin())
-            {
-                tracing::warn!("no thread to refuse a connection with ({e}); closing it as the agent ends");
-            }
+            refuse_kept(kept.take(), &connections, &mut serve);
             return anyhow::Error::new(Stopped);
         }
         // Read before the attempt: a connection that ends while it fails is then not missed.
@@ -760,9 +729,26 @@ fn serve_connections_with<C>(
             }
             Err(AcceptError::Fatal(e)) => return e.context("the listener failed"),
         };
-        if !connections.wait_for_an_end(ended_before, &mut blocking) {
+        if !connections.wait_for_an_end(ended_before, &mut blocking) && connections.decide_end_if_idle() {
+            refuse_kept(kept.take(), &connections, &mut serve);
             return shortage.context(NothingLive);
         }
+    }
+}
+
+/// The end is decided while a connection waits for a thread (`kept`). It is served once more, which gets it the
+/// ending refusal (see `handle_connection_in`) and counts it, so the drain waits for the refusal. If there is
+/// still no thread, its client sees the agent end.
+#[cfg(windows)]
+fn refuse_kept<C>(
+    kept: Option<C>,
+    connections: &Arc<Connections>,
+    serve: &mut impl FnMut(C, Live) -> Result<(), NotServed<C>>,
+) {
+    if let Some(conn) = kept
+        && let Err((_, e)) = serve(conn, connections.begin())
+    {
+        tracing::warn!("no thread to refuse a connection with ({e}); closing it as the agent ends");
     }
 }
 

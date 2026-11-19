@@ -114,9 +114,13 @@ pub fn socket_reachable_row(location: &anyhow::Result<SocketLocation>, user: &Si
 }
 
 /// What `verify` shows an administrator's unelevated process in place of the rows about the agent
-/// (the explanation is `offer::text::FILTERED_LOOKS_ELSEWHERE`). Fails, because nothing was proven.
+/// (the explanation is `offer::text::ELEVATED_AGENT_LOOKS_ELSEWHERE`). Fails, because nothing was proven.
 pub fn filtered_row() -> Check {
-    Check::new("socket reachable", false, crate::offer::text::FILTERED_LOOKS_ELSEWHERE)
+    Check::new(
+        "socket reachable",
+        false,
+        crate::offer::text::ELEVATED_AGENT_LOOKS_ELSEWHERE,
+    )
 }
 
 /// What `verify` shows for the account, chosen by the elevation of this process's token.

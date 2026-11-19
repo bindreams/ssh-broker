@@ -243,8 +243,10 @@ impl Connections {
     /// `Control::is_ending`); one counted before keeps the end undecided (`false`), and what the caller does is
     /// wait for one to end ([`Connections::wait_for_an_end`]).
     ///
-    /// Deciding does not end anything by itself: the caller then settles the end ([`Connections::settle`]) and
-    /// ends the process.
+    /// The accept loop of each socket calls this when a shortage meets no live connection
+    /// (`serve_connections_with`), while it still holds the connection it kept, so that connection is served once
+    /// more and not closed bare. Deciding does not end anything by itself: the caller of the loop then settles the
+    /// end ([`Connections::settle`]) and ends the process.
     pub(super) fn decide_end_if_idle(&self) -> bool {
         self.change(|tally| {
             let idle = tally.live == 0;
