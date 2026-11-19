@@ -857,22 +857,20 @@ fn logout_ends_every_process_of_the_logon_session() {
     }
 }
 
-/// Elevated (CI only). Spike M6, not settled in three runs: does the logon session itself go away
-/// once its last process has ended? There is no primitive that says a session is gone, and looking
-/// at `LsaEnumerateLogonSessions` right after the last exit races LSA's teardown, which starts when
-/// the last token handle closes. So this waits for the event Windows writes when it destroys a
-/// session, Security 4634 for this logon id, subscribed before `logout` runs. If it does not come
-/// within the bound, that is M6's measured result, reported as such.
+/// Elevated (CI only). Spike M6: does the logon session itself go away once its last process has
+/// ended? LSA's teardown starts when the last token handle closes and takes about 90 to 180 s, so
+/// this waits until the logon id is no longer in the list `LsaEnumerateLogonSessions` gives, with
+/// the failure bound of [`logon_session::SESSION_END_BOUND`]. If the session stays, that is M6's
+/// measured result, reported as such.
 /// Covers the real agent's `logout` handler.
 #[test]
 fn logon_session_is_logged_off_after_logout() {
     let _machine = machine::shared();
-    logon_session::assert_logoff_auditing();
     let kit = Kit::copy_of_broker("lolog");
     let account = Account::create("lolog", true);
     let agent = BackgroundAgent::start(&kit, &account);
     let id = logon_session::logon_id(agent.process.0);
-    let watch = logon_session::LogoffWatch::new(id);
+    logon_session::require_listed(id, &account.sid_text).unwrap_or_else(|why| panic!("before logout: {why}"));
 
     let own = std::process::id();
     let held: Vec<_> = logon_session::processes_of(id)
@@ -894,10 +892,13 @@ fn logon_session_is_logged_off_after_logout() {
     drop(held);
     drop(agent);
 
-    assert!(
-        watch.wait(session_end::LOGOFF_EVENT_BOUND),
-        "M6: logon session {id:#x} still present: no 4634 although every process of it has ended"
-    );
+    let no_process_left = std::time::Instant::now();
+    logon_session::wait_until_unlisted(id, no_process_left + logon_session::SESSION_END_BOUND)
+        .unwrap_or_else(|why| panic!("M6: {why}"));
+    account_fixture::hive::record(&format!(
+        "logon session {id:#x} left LSA's list {:?} after its last process ended",
+        no_process_left.elapsed()
+    ));
 
     // The product's own end of a secondary-logon session leaves nothing that keeps the profile loaded
     // (Windows does keep the hive of a Task Scheduler or sshd logon, which `session_end` does not ask to

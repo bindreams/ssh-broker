@@ -108,14 +108,11 @@ jobs:
       - name: Install pinned toolchain
         run: rustup toolchain install
 
-      # Tests wait for a Security event, which the system writes only with the auditing on: the end of a
-      # logon session (4634: `logon_session_is_logged_off_after_logout` and every test that ends a background
-      # session with `logout`, see `tests/common/session_end.rs`) and a refused logon
+      # A test waits for a Security event, which the system writes only with the auditing on: a refused logon
       # (`a_stale_password_is_not_visible_in_the_last_result`, 4625).
-      - name: Audit logons and logoffs
+      - name: Audit refused logons
         if: runner.os == 'Windows'
         run: |
-          auditpol /set /subcategory:"Logoff" /success:enable
           auditpol /set /subcategory:"Logon" /failure:enable
           wevtutil sl Microsoft-Windows-TaskScheduler/Operational /e:true
 

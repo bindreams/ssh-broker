@@ -1,8 +1,12 @@
-//! Looking at a logon session from outside: which processes hold it, and when Windows destroys it.
-//! **CI only.**
+//! Looking at a logon session from outside: which processes hold it, whether LSA still lists it and how
+//! long it takes to leave the list ([`wait_until_unlisted`]), and a watch on the Security log for a refused
+//! logon (4625). **CI only.**
+//!
+//! The including crate declares `account_fixture` (the list is read by `account_fixture::holders`) and
+//! `process_list`.
 #![allow(dead_code)]
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ssh_broker::winutil::OwnedHandle;
 use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
@@ -16,6 +20,9 @@ use windows::Win32::System::Threading::{
     WaitForSingleObject,
 };
 use windows::core::PCWSTR;
+
+use crate::account_fixture::holders;
+use crate::process_list;
 
 /// The logon id of `process`' token, as the 64-bit value the event log prints in hex.
 pub fn logon_id(process: HANDLE) -> u64 {
@@ -88,9 +95,61 @@ pub fn assert_auditing(subcategory: &str, setting: &str) {
     );
 }
 
-/// Fail unless Logoff auditing for success is on.
-pub fn assert_logoff_auditing() {
-    assert_auditing("Logoff", "Success");
+/// How long LSA may keep listing a logon session after its last process has ended: an external event
+/// that may never come. A Batch logon that the product made (the shim's password prompt) leaves the list after
+/// about 90 s and an interactive secondary logon after about 180 s; the bound is twice the longer. It is for the
+/// logons the product made: a logon the Task Scheduler made stayed listed past 360 s with no process in it, and
+/// is not waited for (see `session_end`). The sessions a `logout` ends share one deadline of this
+/// length, counted from when no process is left in them (see [`wait_until_unlisted`]). A test that ends several
+/// sessions, one `logout` each, needs a termination in `.config/nextest.toml` beyond the sum of its bounds.
+/// Expiry fails the wait and names what still refers to the session.
+pub const SESSION_END_BOUND: Duration = Duration::from_secs(360);
+
+/// The pause between two looks at LSA's list in [`wait_until_unlisted`].
+const LOOK_EVERY: Duration = Duration::from_secs(1);
+
+/// Whether `LsaEnumerateLogonSessions` still lists the logon session `id`.
+pub fn is_listed(id: u64) -> Result<bool, String> {
+    Ok(holders::listed()?
+        .iter()
+        .any(|luid| (u64::from(luid.HighPart as u32) << 32) | u64::from(luid.LowPart) == id))
+}
+
+/// Fail unless LSA lists the logon session `id` of the account `sid_text` now. Call it before ending the
+/// session: [`wait_until_unlisted`] passes at once for an id that was never listed (read from the wrong
+/// token, or a list that omits it), and so would show nothing.
+pub fn require_listed(id: u64, sid_text: &str) -> Result<(), String> {
+    if is_listed(id)? {
+        Ok(())
+    } else {
+        Err(format!(
+            "logon session {id:#x} of its agent is not in LSA's list before the session is ended\n{}",
+            holders::report(sid_text)
+        ))
+    }
+}
+
+/// Wait until the logon session `id` is no longer in LSA's list. The caller holds no handle on a process or
+/// token of the session: one keeps it listed. It looks once a second. Once `deadline` has passed it fails,
+/// naming the processes of the session that still run. `deadline` is [`SESSION_END_BOUND`] after the moment
+/// no process is left in any session a `logout` ended, the same for each of them.
+pub fn wait_until_unlisted(id: u64, deadline: Instant) -> Result<(), String> {
+    while is_listed(id)? {
+        if Instant::now() >= deadline {
+            let own = std::process::id();
+            let running: Vec<u32> = processes_of(id)
+                .iter()
+                .filter(|(pid, process)| *pid != own && !process_list::has_exited(process.0))
+                .map(|(pid, _)| *pid)
+                .collect();
+            return Err(format!(
+                "logon session {id:#x} is still in LSA's list {SESSION_END_BOUND:?} after the last process of \
+                 its logout's sessions ended; processes still running in it (pids {running:?})"
+            ));
+        }
+        std::thread::sleep(LOOK_EVERY); // sleep-ok: the pause between two looks at the list; its expiry proves nothing
+    }
+    Ok(())
 }
 
 /// A subscription to Security events that match an XPath query, from now on.
@@ -114,7 +173,7 @@ impl EventWatch {
     /// Subscribe to `channel`. A pull subscription signals its event only after a call of `EvtNext`
     /// has returned `ERROR_NO_MORE_ITEMS`: the service does not signal for a client that has not yet
     /// asked (measured: with no such call a logged event never signalled, on the Application channel
-    /// and, in CI, for the 4625 and 4634 events this module watches). So the subscription is primed
+    /// and, in CI, for Security events). So the subscription is primed
     /// with one call here, and an event that arrived before it is remembered.
     pub fn on(channel: &str, query: &str) -> EventWatch {
         // SAFETY: an unnamed manual-reset event.
@@ -172,23 +231,6 @@ impl Drop for EventWatch {
     fn drop(&mut self) {
         // SAFETY: the handle from `new`.
         let _ = unsafe { EvtClose(self.subscription) };
-    }
-}
-
-/// The logoff event (Security 4634) of one logon session.
-pub struct LogoffWatch(EventWatch);
-
-impl LogoffWatch {
-    /// Subscribe to events from now on. Create it before the session can end.
-    pub fn new(id: u64) -> LogoffWatch {
-        // The event log spells the id in lower case hex, but accept either.
-        let lower = query_for(4634, "TargetLogonId", &format!("{id:#x}"));
-        let upper = query_for(4634, "TargetLogonId", &format!("0x{id:X}"));
-        LogoffWatch(EventWatch::new(&format!("({lower}) or ({upper})")))
-    }
-
-    pub fn wait(&self, bound: Duration) -> bool {
-        self.0.wait(bound)
     }
 }
 

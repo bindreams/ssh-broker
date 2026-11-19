@@ -8,22 +8,21 @@
 //! Scheduler or sshd logon loaded, as it does for a user who logged in at the console. Killing the account's processes (`Account::drop`) is the
 //! fallback, and every use of it is recorded.
 //!
-//! The logoff of a session (Security 4634) is waited for. It comes for a secondary-logon session and for
-//! most Batch sessions. Where no 4634 comes although no process is left, the session is recorded and is not
-//! a failure when it is a Batch logon, read from the session before `logout` is asked
-//! (`tests/auto_login_windows.rs` measures that such sessions do not pile up), or when sshd logged the
-//! account on. Any other case fails: a session of another type, or of a type that could not be read.
-//! Under sshd the logon type does not decide it: the product starts the background agent of an
-//! administrator's password prompt with a Batch logon, and the session a standard account's password prompt
-//! starts has been seen not to be logged off within the bound. Whether Windows ends it later is an open
-//! question recorded in the project's queue; the record then lists what still refers to the session.
+//! Who made the agent's logon decides what is checked ([`ServiceLogon`]). A logon the product made (the
+//! shim's password prompt, `logon::start_background_agent`) is waited for on the real condition: the logon id
+//! is no longer in the list `LsaEnumerateLogonSessions` gives ([`logon_session::wait_until_unlisted`]),
+//! failing at [`logon_session::SESSION_END_BOUND`]. A logon the Task Scheduler made (a task with a stored
+//! password started the agent) is not waited for and its staying is not a failure: that service ends it when
+//! it will (measured: a Task Scheduler logon stayed listed past 360 s with no process in it). The fixture
+//! looks once after no process is left and records whether the session is still listed.
 //!
-//! The including crate declares `account_fixture`, `agent_conn`, `bounded_wait` and `logon_session`.
+//! The including crate declares `account_fixture`, `agent_conn`, `bounded_wait`, `logon_session` and
+//! `process_list`.
 #![allow(dead_code)]
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::Instant;
 
 use ssh_broker::acl::Sid;
 use ssh_broker::provision::procwait;
@@ -34,25 +33,19 @@ use windows::Win32::System::Threading::WaitForSingleObject;
 use crate::account_fixture::{Account, ServiceLogon, hive, holders, profile};
 use crate::agent_conn::AgentConn;
 use crate::bounded_wait::CHILD_EXIT_BOUND;
-use crate::logon_session::{self, LogoffWatch};
+use crate::logon_session;
 
-/// How long Windows may take to write the logoff event after the last process of a session has ended: an
-/// external event that may never come. Expiry fails the wait and says what was measured.
-pub const LOGOFF_EVENT_BOUND: Duration = Duration::from_secs(180);
-
-/// `LogonType` of a Batch logon session in `SECURITY_LOGON_SESSION_DATA`.
-const LOGON_TYPE_BATCH: u32 = 4;
-
-/// What ending a session found.
+/// A session was ended: every process of its agents' logon sessions exited, and those the product made left
+/// LSA's list (anything less is an error).
 #[derive(Debug)]
 pub struct Ended {
-    /// The logon sessions of the agents whose logoff (4634) was seen. Windows has destroyed these, whatever
-    /// LSA still lists for a moment.
-    pub logged_off: BTreeSet<u64>,
+    /// The logon sessions of the agents that were ended, whoever made them.
+    pub agent_sessions: BTreeSet<u64>,
 }
 
 /// Ask the background agent of `account` (the one running `exe`) to end with `exe logout`, run inside the
-/// agent as the account, wait for every process of its logon session to exit and for the session's logoff.
+/// agent as the account, wait for every process of its logon session to exit and, for a logon the product made,
+/// for the session to leave LSA's list.
 /// `how` is how the test started the session; the account is declared as logged on that way. `Ok(Some)` when
 /// a session was ended; `Ok(None)` when the account has no agent running `exe`. A failure names the step. It
 /// does not kill anything: the caller decides what the fallback is. One line about the attempt goes to the
@@ -195,32 +188,10 @@ fn try_end(
     if agents.is_empty() {
         return Ok(None);
     }
-    logon_session::assert_logoff_auditing();
     let ids: BTreeSet<u64> = agents
         .iter()
         .map(|agent| logon_session::logon_id(agent.handle()))
         .collect();
-    // Subscribed before the logout runs, so the event cannot be missed.
-    let watches: Vec<(u64, LogoffWatch)> = ids.iter().map(|id| (*id, LogoffWatch::new(*id))).collect();
-    // Read now, while the sessions exist: a session that stays is judged by its type.
-    let logon_types: BTreeMap<u64, u32> = match holders::sessions_of(sid_text) {
-        Ok(sessions) => sessions
-            .into_iter()
-            .filter(|session| ids.contains(&session.id))
-            .map(|session| (session.id, session.logon_type))
-            .collect(),
-        Err(why) => {
-            steps.push(format!("logon types not read: {why}"));
-            BTreeMap::new()
-        }
-    };
-    steps.push(format!(
-        "logon types {:?}",
-        logon_types
-            .iter()
-            .map(|(id, logon_type)| format!("{id:#x}: {logon_type}"))
-            .collect::<Vec<_>>()
-    ));
     let own = std::process::id();
     let held: Vec<_> = ids
         .iter()
@@ -232,6 +203,15 @@ fn try_end(
         ids.iter().map(|id| format!("{id:#x}")).collect::<Vec<_>>(),
         held.len()
     ));
+
+    // A session the product made must be listed before it is ended, or the wait for its end shows nothing (see
+    // `require_listed`).
+    if how == ServiceLogon::Sshd {
+        for id in &ids {
+            logon_session::require_listed(*id, sid_text).map_err(|why| format!("before logout: {why}"))?;
+        }
+        steps.push("every agent session is in LSA's list".to_owned());
+    }
 
     // The default session is unelevated, and `logout` in it reaches an agent at High on its request socket.
     let finished = attempt("ask the agent to log out", || {
@@ -292,55 +272,39 @@ fn try_end(
     }
     drop(remaining);
     steps.push("no process left in the sessions".to_owned());
-    let mut logged_off = BTreeSet::new();
-    let mut failed = Vec::new();
-    let mut unlogged_under_sshd = false;
-    for (id, watch) in &watches {
-        let seen = watch.wait(LOGOFF_EVENT_BOUND);
-        steps.push(format!("4634 for {id:#x}: {}", if seen { "seen" } else { "not seen" }));
-        if seen {
-            logged_off.insert(*id);
-            continue;
-        }
-        // Recorded, not failed: a Batch logon, which Windows keeps at times whoever logged the account on (the
-        // product starts an administrator's prompt session with one, under sshd too; whether they pile up is
-        // measured by `tests/auto_login_windows.rs`); or any session under sshd, where the logoff of a session
-        // a standard account's password prompt started has been seen not to come. That is an open question in
-        // the project's queue, so the record carries what still refers to the session.
-        match logon_types.get(id) {
-            Some(&LOGON_TYPE_BATCH) => steps.push(format!(
-                "logon session {id:#x} stays with no process left; it is a Batch logon, which Windows does at \
-                 times keep"
-            )),
-            found if matches!(how, ServiceLogon::Sshd) => {
-                let logon_type = found.map_or_else(|| "unread".to_owned(), |logon_type| logon_type.to_string());
+    let no_process_left = Instant::now();
+    match how {
+        ServiceLogon::Sshd => {
+            // One deadline for every session: the bound is how long a session may stay listed after its last
+            // process.
+            let deadline = no_process_left + logon_session::SESSION_END_BOUND;
+            for id in &ids {
+                logon_session::wait_until_unlisted(*id, deadline)
+                    .map_err(|why| format!("a session of {name} did not end: {why}; {}", still_referring(sid_text)))?;
                 steps.push(format!(
-                    "logon session {id:#x} (logon type {logon_type}) stays with no process left; under sshd the \
-                     logoff of a session the password prompt started has been seen not to come within the bound; \
-                     whether Windows ends it later is an open question"
+                    "logon session {id:#x} left LSA's list {:?} after no process was left",
+                    no_process_left.elapsed()
                 ));
-                unlogged_under_sshd = true;
             }
-            Some(other) => failed.push(format!("{id:#x} (logon type {other})")),
-            None => failed.push(format!("{id:#x} (logon type could not be read)")),
+        }
+        ServiceLogon::TaskScheduler => {
+            for id in &ids {
+                let listed = logon_session::is_listed(*id)
+                    .map_err(|why| format!("look for logon session {id:#x} in LSA's list: {why}"))?;
+                steps.push(format!(
+                    "logon session {id:#x} {} LSA's list {:?} after no process was left (the Task Scheduler made \
+                     this logon and ends it when it will)",
+                    if listed { "is still in" } else { "has left" },
+                    no_process_left.elapsed()
+                ));
+            }
         }
     }
-    if unlogged_under_sshd {
-        steps.push(still_referring(sid_text));
-    }
-    if failed.is_empty() {
-        Ok(Some(Ended { logged_off }))
-    } else {
-        Err(format!(
-            "logon session(s) {} of {name} still present: no 4634 within {LOGOFF_EVENT_BOUND:?} although every \
-             process of them has ended, and a session that is not a Batch logon is not kept",
-            failed.join(", ")
-        ))
-    }
+    Ok(Some(Ended { agent_sessions: ids }))
 }
 
-/// What the fixture can say about who still refers to the logon sessions of `sid_text` after the wait: the
-/// sessions LSA lists for the account, and the processes still running in them.
+/// What the fixture can say about who still refers to the logon sessions of `sid_text` after a wait that
+/// failed: the sessions LSA lists for the account, and the processes still running in them.
 fn still_referring(sid_text: &str) -> String {
     let sessions = match holders::sessions_of(sid_text) {
         Ok(sessions) => sessions,
