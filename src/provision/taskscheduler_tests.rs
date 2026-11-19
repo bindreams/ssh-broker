@@ -7,6 +7,7 @@ use crate::test_support::ThrowawayTask;
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::time::Duration;
+use windows::Win32::Foundation::SCHED_E_SERVICE_NOT_RUNNING;
 use windows::Win32::System::TaskScheduler::{
     TASK_STATE_DISABLED, TASK_STATE_QUEUED, TASK_STATE_READY, TASK_STATE_RUNNING,
 };
@@ -241,7 +242,7 @@ fn an_instance_that_stop_never_clears_fails_the_stop_naming_the_task_and_the_ins
     let text = format!("{err:#}");
     assert!(text.contains("the-task"), "{text}");
     assert!(text.contains("44"), "names the instance with a process: {text}");
-    assert!(text.contains("not launched"), "names the instance with none: {text}");
+    assert!(text.contains("no process yet"), "names the instance with none: {text}");
     assert_eq!(
         events.into_inner(),
         ["disable", "list [0, 44]", "stop", "wait [44]", "list [0, 44]"],
@@ -436,27 +437,49 @@ fn a_failure_to_identify_the_process_of_an_instance_is_an_error_and_never_an_end
     assert!(result.is_err());
 }
 
-/// An instance can end between the listing and the read of its process: the engine answers
-/// `SCHED_E_TASK_NOT_RUNNING`. That is the end the wait is waiting for, not a failure.
+/// The engine answers `SCHED_E_TASK_NOT_RUNNING` to a read of an instance it has just listed. The answer does not
+/// say whether the instance ended or has not started, so it is neither an error nor an end: the read has no
+/// value, and the next look decides.
 #[test]
-fn an_instance_that_ended_while_it_was_listed_is_not_an_error() {
-    let failed = |code: HRESULT| engine_pid(Err(windows::core::Error::from(code)));
-    assert_eq!(failed(SCHED_E_TASK_NOT_RUNNING).unwrap(), None);
-
-    assert_eq!(engine_pid(Ok(1234)).unwrap(), Some(1234));
+fn a_read_that_says_not_running_of_a_listed_instance_is_no_error_and_no_end() {
+    fn failed<T>(code: HRESULT) -> windows::core::Result<T> {
+        Err(windows::core::Error::from(code))
+    }
     assert_eq!(
-        engine_pid(Ok(0)).unwrap(),
-        Some(0),
-        "one not launched yet is an instance"
+        listed::<u32>(failed(SCHED_E_TASK_NOT_RUNNING), "read a pid").unwrap(),
+        None
+    );
+    assert_eq!(
+        listed::<String>(failed(SCHED_E_TASK_NOT_RUNNING), "read a name").unwrap(),
+        None
     );
 
-    // Another Task Scheduler code (`SCHED_E_SERVICE_NOT_RUNNING`) and a plain Win32 error stay errors.
-    let service_down = failed(HRESULT(0x8004_130Fu32 as i32)).unwrap_err();
-    assert!(
-        format!("{service_down:#}").contains("read the process of a running instance"),
-        "{service_down:#}"
+    assert_eq!(listed(Ok(1234u32), "read a pid").unwrap(), Some(1234));
+    assert_eq!(
+        listed(Ok(0u32), "read a pid").unwrap(),
+        Some(0),
+        "one not launched yet has a value"
     );
-    assert!(failed(HRESULT::from_win32(ERROR_FILE_NOT_FOUND.0)).is_err());
+    assert_eq!(
+        listed(Ok("name".to_string()), "read a name").unwrap(),
+        Some("name".to_string())
+    );
+
+    // Another Task Scheduler code and a plain Win32 error stay errors, each naming what was read.
+    let service_down = listed::<u32>(failed(SCHED_E_SERVICE_NOT_RUNNING), "read a pid").unwrap_err();
+    assert!(format!("{service_down:#}").contains("read a pid"), "{service_down:#}");
+    let missing = listed::<String>(failed(HRESULT::from_win32(ERROR_FILE_NOT_FOUND.0)), "read a name").unwrap_err();
+    assert!(format!("{missing:#}").contains("read a name"), "{missing:#}");
+}
+
+/// A listed instance with no process at one look, which is gone at the next, is not an end at the first look: the
+/// answer "not running" does not say whether it ended or has not started, so the wait looks again.
+#[test]
+fn an_instance_with_no_process_at_one_look_and_gone_at_the_next_ends_the_wait_at_the_second_look() {
+    let events = RefCell::new(Vec::new());
+    let outcome = run_wait_until_ended(NO_BOUND, vec![vec![0], vec![]], true, &events).unwrap();
+    assert_eq!(outcome, WaitOutcome::Ended);
+    assert_eq!(events.into_inner(), ["list [0]", "waiting", "pause", "list []"]);
 }
 
 #[test]
