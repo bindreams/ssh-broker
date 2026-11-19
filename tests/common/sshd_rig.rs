@@ -352,18 +352,32 @@ impl SshSession {
     }
 
     pub fn read_until(&mut self, needle: &str) {
+        self.read_until_shown(&format!("{needle:?}"), |text| text.contains(needle));
+    }
+
+    /// Read until the session has shown `needle` after the last `after` it has shown: something new, where
+    /// `needle` alone was on the screen before (the shell's next prompt after a command's output).
+    pub fn read_until_after(&mut self, after: &str, needle: &str) {
+        self.read_until_shown(&format!("{needle:?} after {after:?}"), |text| {
+            text.rfind(after)
+                .is_some_and(|at| text[at + after.len()..].contains(needle))
+        });
+    }
+
+    /// Read until `shown` accepts what the session has shown; `what` names it for the failure.
+    fn read_until_shown(&mut self, what: &str, shown: impl Fn(&str) -> bool) {
         loop {
-            if self.text().contains(needle) {
+            if shown(&self.text()) {
                 return;
             }
             let received = self.output.recv_timeout(SILENCE_BOUND); // sleep-ok: failure bound on the session's output, an external event that may never come; expiry fails the test and is not read as state
             match received {
                 Ok(chunk) => self.transcript.extend_from_slice(&chunk),
                 Err(RecvTimeoutError::Disconnected) => {
-                    self.fail(&format!("ssh ended before the session showed {needle:?}"))
+                    self.fail(&format!("ssh ended before the session showed {what}"))
                 }
                 Err(RecvTimeoutError::Timeout) => self.fail(&format!(
-                    "the session was silent for {SILENCE_BOUND:?} while the test waited for {needle:?}"
+                    "the session was silent for {SILENCE_BOUND:?} while the test waited for {what}"
                 )),
             }
         }

@@ -353,6 +353,11 @@ fn ctrl_c_ends_a_command_run_without_a_terminal_and_the_session_goes_on() {
         bounded_wait::CHILD_EXIT_BOUND,
         &[],
     );
+    // The next line is typed at the shell's next prompt, as a person types it, and not before: PowerShell's own
+    // Ctrl+C handler discards the console's pending input once it has stopped the command
+    // (`ConsoleHost.HandleBreak` calls `FlushConsoleInputBuffer` on Windows), so a line typed while it is still
+    // at that is lost by the shell, whatever carried it there.
+    session.read_until_after("running-Windows_NT", SHELL_PROMPT);
     session.say("THE-SESSION-WENT-ON");
     session.leave();
 }
