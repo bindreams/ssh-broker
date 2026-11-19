@@ -82,7 +82,17 @@ fn classify(raw: u32) -> Reading {
 /// bound its port. Each look reads the kernel's socket table; between two looks the wait is on the process
 /// itself, so an exit ends it at once. The decision is taken on the exit of `process`, the one held, and never
 /// on a state of the service read after it.
-fn listening_or_exit(process: &Process, reply: StartReply) -> StartOutcome {
+///
+/// An exit is answered only once the service manager has seen it: `left` is called with the exited process and
+/// returns when the service manager no longer says the service runs in it (see [`SshdService::left_by`]). The
+/// service manager can say running in a dead process for a moment after its object is signalled, and a start
+/// sent then is refused with 1056. So [`StartOutcome::Exited`] means: the process exited, and the service
+/// manager has seen it. A `left` that fails makes the outcome [`StartOutcome::Unreadable`] with its cause.
+fn listening_or_exit(
+    process: &Process,
+    reply: StartReply,
+    left: impl FnOnce(&Process) -> anyhow::Result<()>,
+) -> StartOutcome {
     loop {
         match listens(process.pid) {
             Ok(true) => return StartOutcome::Serving(reply),
@@ -98,6 +108,12 @@ fn listening_or_exit(process: &Process, reply: StartReply) -> StartOutcome {
         match waited {
             Ok(false) => {}
             Ok(true) => {
+                if let Err(e) = left(process) {
+                    return StartOutcome::Unreadable {
+                        reply,
+                        cause: format!("{e:#}"),
+                    };
+                }
                 return match process.exit_code() {
                     Ok(code) => StartOutcome::Exited { reply, code },
                     Err(e) => StartOutcome::Unreadable {
@@ -193,8 +209,10 @@ impl SshdService {
     }
 
     /// Hold the service's process, send the STOP, and say what settled. The process is the mark that makes
-    /// "stopped" mean the old sshd is gone: the service manager says stopped before it has exited.
-    pub(super) fn stop(&self) -> anyhow::Result<StopOutcome> {
+    /// "stopped" mean the old sshd is gone: the service manager says stopped before it has exited. `unanswered`
+    /// is called once, with the service manager's reply, before a STOP answered with 1053 that leaves the
+    /// service running is waited on.
+    pub(super) fn stop(&self, unanswered: &mut dyn FnMut(&str)) -> anyhow::Result<StopOutcome> {
         let held = service_process().context("hold the process of the sshd service before stopping it")?;
         let mut status = SERVICE_STATUS::default();
         // SAFETY: the handle was opened with the right to stop; `status` is a local the call fills.
@@ -216,7 +234,9 @@ impl SshdService {
                 },
             },
             Ok(Settled { state, .. }) if waits_for_the_old_process(code, state) => {
-                self.after_a_stop_that_timed_out(held, refusal.as_deref().unwrap_or_default())
+                let reply = refusal.as_deref().unwrap_or_default();
+                unanswered(reply);
+                self.after_a_stop_that_timed_out(held, reply)
             }
             Ok(Settled { state, .. }) => StopOutcome::NotStopped { state, refusal },
         })
@@ -291,7 +311,7 @@ impl SshdService {
                     };
                 }
                 ServiceState::Running => match service_process() {
-                    Ok(Some(process)) => return listening_or_exit(&process, reply),
+                    Ok(Some(process)) => return listening_or_exit(&process, reply, |gone| self.left_by(gone)),
                     // The process went between the two reads: the state the service manager says now decides.
                     Ok(None) => {}
                     Err(e) => {

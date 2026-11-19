@@ -31,6 +31,7 @@ use windows::core::{BSTR, HRESULT, Interface};
 
 use super::password_variant::PasswordVariant;
 use super::procwait::{self, Process};
+use super::schtasks::WaitOutcome;
 use super::session_task::TaskState;
 use crate::password_entry::Password;
 
@@ -162,6 +163,18 @@ pub fn has_running_instance(name: &str) -> anyhow::Result<bool> {
     Ok(count > 0)
 }
 
+/// Whether the task `name` has an instance that [`wait_for_instances`] would wait for: one that is not launched
+/// yet, or whose process (running `image`) has not exited. [`has_running_instance`] also counts an instance
+/// the engine still lists after its process has exited. A task that does not exist has none.
+pub fn has_unended_instance(name: &str, image: &Path) -> anyhow::Result<bool> {
+    let _com = Com::init()?;
+    let service = connect()?;
+    let Some(task) = registered_task(&service, name)? else {
+        return Ok(false);
+    };
+    Ok(running_instances(&task, image)?.count > 0)
+}
+
 /// The running instances of a task: how many there are, and the processes among them that are
 /// the agent. An instance the engine has not launched yet has no process to show, and is still
 /// an instance.
@@ -170,16 +183,6 @@ struct Instances<P> {
     /// The process id of each instance, 0 for one the engine has not launched.
     pids: Vec<u32>,
     processes: Vec<P>,
-}
-
-/// How a wait for a task's instances ended.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WaitOutcome {
-    /// The task has no instance any more: every process it ran has exited.
-    Ended,
-    /// The Task Scheduler lists `count` instances that it never launched, for as long as the failure bound.
-    /// That proves nothing of what they will do.
-    NeverLaunched { count: usize },
 }
 
 /// The steps of a stop, in the only order that is safe. Disabled first, so the logon trigger cannot
@@ -376,8 +379,10 @@ pub fn register_system_task(name: &str, xml: &str, sddl: &str) -> anyhow::Result
 }
 
 /// Return once the task `name` has no instance: the processes of its instances (running `image`) have
-/// exited, even if the engine still lists the instance. A task that does not exist has none. Nothing stops the task and nothing bounds the wait for a
-/// process that was launched: its exit is the kernel's and the task's to bring about.
+/// exited. The engine may still list an instance whose process has exited, and that listing is not waited for:
+/// the end is the processes', not the listing's. A task that does not exist has none. Nothing stops the task
+/// and nothing bounds the wait for a process that was launched: its exit is the kernel's and the task's to
+/// bring about.
 ///
 /// An instance the Task Scheduler lists and has not launched is looked at again. That is waiting for an
 /// external event that may never come, so the failure bound [`procwait::EXIT_BOUND`] counts from the first

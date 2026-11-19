@@ -74,6 +74,17 @@ pub(super) fn settings_xml(multiple_instances: &str, on_failure: OnFailure) -> S
 /// ended (see `sshd_task`).
 pub const APPLY_SSHD_TASK: &str = "ssh-broker-apply-sshd";
 
+/// How a wait for a task's instances ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaitOutcome {
+    /// The task has no instance any more: every process it ran has exited. That is about processes, not about
+    /// the Task Scheduler's listing, which may still show an instance whose process has exited.
+    Ended,
+    /// The Task Scheduler lists `count` instances that it never launched, for as long as the failure bound.
+    /// That proves nothing of what they will do.
+    NeverLaunched { count: usize },
+}
+
 /// SYSTEM.
 pub const SYSTEM_SID: &str = "S-1-5-18";
 

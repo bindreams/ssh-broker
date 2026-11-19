@@ -40,6 +40,10 @@ pub fn drop_in_text() -> String {
 /// The one line `sshd_config` gets, above its first `Match`, when sshd does not read the drop-in.
 pub const INCLUDE_LINE: &str = "Include sshd_config.d/*.conf";
 
+/// What to do about sshd at this PC when what `apply` said does not settle whether it runs.
+pub(crate) const CHECK_SSHD: &str =
+    "Check sshd at this PC: `sc query sshd`; start it with `net start sshd` if it is stopped.";
+
 /// The variable's name, as the `verify` row and `sshd -T` know it.
 const VARIABLE: &str = crate::protocol::ElevationPolicy::VARIABLE;
 

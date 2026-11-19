@@ -16,7 +16,6 @@ struct Fake {
     run: Result<(), &'static str>,
     wait: Result<WaitOutcome, &'static str>,
     report: Result<String, &'static str>,
-    last_result: Result<u32, &'static str>,
     remove: Result<(), &'static str>,
 }
 
@@ -27,8 +26,7 @@ impl Fake {
             register: Ok(()),
             run: Ok(()),
             wait: Ok(WaitOutcome::Ended),
-            report: Ok("apply: sshd restarted; it accepts SSH_BROKER_ELEVATION\r\n".to_owned()),
-            last_result: Ok(0),
+            report: Ok(complete("apply: sshd restarted; it accepts SSH_BROKER_ELEVATION")),
             remove: Ok(()),
         }
     }
@@ -52,12 +50,19 @@ impl SshdTask for Fake {
     fn report(&mut self) -> anyhow::Result<String> {
         self.call("report", &self.report)
     }
-    fn last_result(&mut self) -> anyhow::Result<u32> {
-        self.call("last_result", &self.last_result)
-    }
     fn remove(&mut self) -> anyhow::Result<()> {
         self.call("remove", &self.remove)
     }
+}
+
+/// A report text of `lines` (written one per line) that the step closed.
+fn complete(lines: &str) -> String {
+    format!("{}{REPORT_END}\r\n", unclosed(lines))
+}
+
+/// A report text of `lines` (written one per line) with no closing line: the step did not end.
+fn unclosed(lines: &str) -> String {
+    lines.lines().map(|line| format!("{line}\r\n")).collect()
 }
 
 fn run(fake: &mut Fake) -> Log {
@@ -87,7 +92,8 @@ fn calls(log: &Log) -> Vec<String> {
 }
 
 const HANDED_OVER: &str = "apply: sshd's configuration is set up by the task ssh-broker-apply-sshd, which runs as SYSTEM and \
-     finishes even if this apply is ended; what it does follows, and is kept in C:\\ProgramData\\ssh-broker\\apply-sshd.log";
+     finishes even if this apply is ended; what it does follows when it has finished, and can be read while it \
+     runs in C:\\ProgramData\\ssh-broker\\apply-sshd.log";
 
 // the order =====
 
@@ -95,7 +101,9 @@ const HANDED_OVER: &str = "apply: sshd's configuration is set up by the task ssh
 fn the_task_is_registered_run_waited_for_read_and_removed_in_that_order_and_its_lines_are_printed() {
     let log = new_log();
     let mut fake = Fake::new(&log);
-    fake.report = Ok("apply: a first line\r\napply: sshd restarted; it accepts SSH_BROKER_ELEVATION\r\n".to_owned());
+    fake.report = Ok(complete(
+        "apply: a first line\napply: sshd restarted; it accepts SSH_BROKER_ELEVATION",
+    ));
     let log = run(&mut fake);
     assert_eq!(
         *log.borrow(),
@@ -105,7 +113,6 @@ fn the_task_is_registered_run_waited_for_read_and_removed_in_that_order_and_its_
             &format!("said: {HANDED_OVER}"),
             "task: wait",
             "task: report",
-            "task: last_result",
             "said: apply: a first line",
             "said: apply: sshd restarted; it accepts SSH_BROKER_ELEVATION",
             "task: remove",
@@ -131,77 +138,89 @@ fn the_hand_over_names_the_report_it_is_given() {
     assert_eq!(
         handed_over_line(Path::new(r"D:\x\apply-sshd.log")),
         "apply: sshd's configuration is set up by the task ssh-broker-apply-sshd, which runs as SYSTEM and \
-         finishes even if this apply is ended; what it does follows, and is kept in D:\\x\\apply-sshd.log"
+         finishes even if this apply is ended; what it does follows when it has finished, and can be read while \
+         it runs in D:\\x\\apply-sshd.log"
     );
     assert!(HANDED_OVER.starts_with(HANDED_OVER_PREFIX));
 }
 
+// the report says itself that it is whole =====
+
 #[test]
-fn a_report_with_no_line_is_a_step_that_had_nothing_to_say_and_is_said_so() {
+fn a_report_that_ends_with_the_closing_line_is_complete_and_the_closing_line_is_not_printed() {
     let log = new_log();
     let mut fake = Fake::new(&log);
-    fake.report = Ok(String::new());
+    fake.report = Ok(complete("apply: a first line\napply: a second line"));
     let log = run(&mut fake);
-    assert_eq!(
-        said(&log).last().unwrap(),
-        "apply: sshd accepts SSH_BROKER_ELEVATION and has read its configuration; the task had nothing to change"
+    assert_eq!(said(&log)[1..], ["apply: a first line", "apply: a second line"]);
+    assert!(
+        said(&log).iter().all(|line| line != REPORT_END),
+        "the closing line is for the reader, not for the person"
     );
     assert_eq!(calls(&log).last().unwrap(), "remove");
-}
 
-// a task that ended before it finished =====
-
-const ENDED_EARLY: &str = "apply: the task ssh-broker-apply-sshd ended before it finished (its last result was \
-     0xc000013a); what it had said follows. Check sshd at this PC: `sc query sshd`; start it with `net start \
-     sshd` if it is stopped.";
-
-#[test]
-fn a_task_whose_result_is_not_zero_ended_before_it_finished_and_what_it_said_is_not_taken_as_complete() {
-    let log = new_log();
-    let mut fake = Fake::new(&log);
-    fake.report = Ok("apply: sshd is running with its earlier configuration\r\n".to_owned());
-    fake.last_result = Ok(0xC000_013A);
-    let log = run(&mut fake);
-    assert_eq!(
-        said(&log)[1..],
-        [ENDED_EARLY, "apply: sshd is running with its earlier configuration",]
-    );
-    assert_eq!(calls(&log).last().unwrap(), "remove");
+    let parsed = Report::parse(&complete("a\nb"));
+    assert!(parsed.complete);
+    assert_eq!(parsed.lines, ["a", "b"]);
 }
 
 #[test]
-fn a_task_that_ended_before_it_finished_and_had_said_nothing_says_so_and_not_that_there_was_nothing_to_change() {
+fn a_report_without_the_closing_line_is_said_to_be_incomplete_before_what_it_had_said() {
     let log = new_log();
     let mut fake = Fake::new(&log);
-    fake.report = Ok(String::new());
-    fake.last_result = Ok(0xC000_013A);
-    let log = run(&mut fake);
-    assert_eq!(
-        said(&log)[1..],
-        [ENDED_EARLY, "apply: the task ssh-broker-apply-sshd had said nothing"]
-    );
-    assert_eq!(
-        calls(&log),
-        ["register", "run", "wait", "report", "last_result", "remove"]
-    );
-}
-
-#[test]
-fn a_result_that_cannot_be_read_does_not_make_a_report_complete() {
-    let log = new_log();
-    let mut fake = Fake::new(&log);
-    fake.report = Ok("apply: sshd restarted; it accepts SSH_BROKER_ELEVATION\r\n".to_owned());
-    fake.last_result = Err("the service did not answer");
+    fake.report = Ok(unclosed("apply: sshd is running with its earlier configuration"));
     let log = run(&mut fake);
     assert_eq!(
         said(&log)[1..],
         [
-            "apply: whether the task ssh-broker-apply-sshd finished could not be told (its last result could not \
-             be read (the service did not answer)); what it had said follows. Check sshd at this PC: `sc query \
-             sshd`; start it with `net start sshd` if it is stopped.",
-            "apply: sshd restarted; it accepts SSH_BROKER_ELEVATION",
+            "apply: the task ssh-broker-apply-sshd ended before its report was complete; what it had said follows. \
+             Check sshd at this PC: `sc query sshd`; start it with `net start sshd` if it is stopped.",
+            "apply: sshd is running with its earlier configuration",
         ]
     );
+    assert_eq!(calls(&log), ["register", "run", "wait", "report", "remove"]);
+
+    let parsed = Report::parse(&unclosed("a\nb"));
+    assert!(!parsed.complete);
+    assert_eq!(parsed.lines, ["a", "b"]);
+}
+
+#[test]
+fn an_incomplete_report_with_no_line_says_the_task_had_said_nothing() {
+    let log = new_log();
+    let mut fake = Fake::new(&log);
+    fake.report = Ok(String::new());
+    let log = run(&mut fake);
+    assert_eq!(
+        said(&log)[1..],
+        [
+            "apply: the task ssh-broker-apply-sshd ended before its report was complete; what it had said follows. \
+             Check sshd at this PC: `sc query sshd`; start it with `net start sshd` if it is stopped.",
+            "apply: the task ssh-broker-apply-sshd had said nothing",
+        ]
+    );
+    assert_eq!(calls(&log), ["register", "run", "wait", "report", "remove"]);
+}
+
+#[test]
+fn a_closing_line_with_nothing_before_it_is_a_step_that_had_nothing_to_change() {
+    let log = new_log();
+    let mut fake = Fake::new(&log);
+    fake.report = Ok(complete(""));
+    let log = run(&mut fake);
+    assert_eq!(
+        said(&log)[1..],
+        ["apply: sshd accepts SSH_BROKER_ELEVATION and has read its configuration; the task had nothing to change"]
+    );
+    assert_eq!(calls(&log).last().unwrap(), "remove");
+}
+
+#[test]
+fn a_reported_text_is_read_as_its_lines() {
+    assert_eq!(Report::parse("a\r\nb\r\n").lines, ["a", "b"]);
+    assert_eq!(Report::parse("a\nb").lines, ["a", "b"]);
+    assert!(Report::parse("").lines.is_empty());
+    assert!(!Report::parse("").complete);
 }
 
 // what goes wrong =====
@@ -259,38 +278,20 @@ fn a_task_that_cannot_be_started_and_cannot_be_removed_says_both() {
 }
 
 #[test]
-fn a_missing_report_is_said_with_the_tasks_last_result_and_the_task_is_still_removed() {
+fn a_missing_report_is_said_and_the_task_is_still_removed() {
     let log = new_log();
     let mut fake = Fake::new(&log);
     fake.report = Err("the system cannot find the file specified");
-    fake.last_result = Ok(0x8004_1307);
     let log = run(&mut fake);
     assert_eq!(
         said(&log).last().unwrap(),
         &format!(
             "apply: the task ssh-broker-apply-sshd left no report in {REPORT} (the system cannot find the file \
-             specified); its last result was 0x80041307. Whether sshd accepts SSH_BROKER_ELEVATION and is running \
-             is not known: `ssh-broker verify` says, and `sc query sshd` shows whether sshd runs"
+             specified). Whether sshd accepts SSH_BROKER_ELEVATION and is running is not known: `ssh-broker \
+             verify` says, and `sc query sshd` shows whether sshd runs"
         )
     );
-    assert_eq!(calls(&log).last().unwrap(), "remove");
-}
-
-#[test]
-fn a_last_result_that_cannot_be_read_is_said_to_be_unread() {
-    let log = new_log();
-    let mut fake = Fake::new(&log);
-    fake.report = Err("the system cannot find the file specified");
-    fake.last_result = Err("the service did not answer");
-    let log = run(&mut fake);
-    assert!(
-        said(&log)
-            .last()
-            .unwrap()
-            .contains("its last result could not be read (the service did not answer)"),
-        "{:?}",
-        said(&log)
-    );
+    assert_eq!(calls(&log), ["register", "run", "wait", "report", "remove"]);
 }
 
 #[test]
@@ -375,6 +376,37 @@ fn the_verb_writes_each_line_to_the_report_whole_before_it_goes_on() {
 }
 
 #[test]
+fn the_closing_line_is_written_only_after_the_step_has_returned() {
+    let dir = std::env::temp_dir().join(format!("sb-report-end-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("apply-sshd.log");
+
+    let mut inside = None;
+    write_report(&path, |say| {
+        say("apply: first");
+        inside = Some(Report::parse(&std::fs::read_to_string(&path).unwrap()));
+    })
+    .unwrap();
+    let after = Report::parse(&std::fs::read_to_string(&path).unwrap());
+    let raw = std::fs::read_to_string(&path).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let inside = inside.unwrap();
+    assert!(
+        !inside.complete,
+        "while the step runs the file does not say that it is whole"
+    );
+    assert_eq!(inside.lines, ["apply: first"]);
+    assert!(after.complete);
+    assert_eq!(after.lines, ["apply: first"]);
+    assert_eq!(
+        raw,
+        format!("apply: first\r\n{REPORT_END}\r\n"),
+        "the last line of the file"
+    );
+}
+
+#[test]
 fn a_report_that_cannot_be_written_is_an_error_and_the_step_does_not_run() {
     let missing = std::env::temp_dir()
         .join(format!("sb-no-such-dir-{}", std::process::id()))
@@ -386,11 +418,4 @@ fn a_report_that_cannot_be_written_is_an_error_and_the_step_does_not_run() {
         "no report to write to, so nothing is run that nobody could read about"
     );
     assert!(format!("{err:#}").contains("apply-sshd.log"), "{err:#}");
-}
-
-#[test]
-fn a_reported_text_is_read_as_its_lines() {
-    assert_eq!(report_lines("a\r\nb\r\n"), ["a", "b"]);
-    assert_eq!(report_lines("a\nb"), ["a", "b"]);
-    assert!(report_lines("").is_empty());
 }

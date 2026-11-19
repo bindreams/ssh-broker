@@ -485,13 +485,23 @@ fn a_task_has_a_running_instance_from_its_start_until_it_is_stopped() {
     task.register(FOREVER_TASK_XML);
     assert!(!has_running_instance(&task.0).unwrap(), "control: nothing is running");
 
+    assert!(
+        !has_unended_instance(&task.0, &forever_image()).unwrap(),
+        "control: nothing is running"
+    );
+
     let image = forever_image();
     let processes = start_and_find(&task.0, &image);
     assert!(has_running_instance(&task.0).unwrap());
+    assert!(
+        has_unended_instance(&task.0, &image).unwrap(),
+        "an instance whose process runs is unended"
+    );
 
     stop_instances(&task.0, &image).unwrap();
     wait_all_exited(&processes, Duration::ZERO).expect("the process had exited when stop_instances returned");
     assert!(!has_running_instance(&task.0).unwrap());
+    assert!(!has_unended_instance(&task.0, &image).unwrap());
 }
 
 /// Elevated (CI only).

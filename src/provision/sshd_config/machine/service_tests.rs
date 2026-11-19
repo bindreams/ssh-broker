@@ -90,20 +90,24 @@ fn a_process_that_listens_is_serving_and_the_reply_is_kept() {
     let _listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
     let own = Process::open(std::process::id()).unwrap().expect("this process runs");
     let refused = StartReply::Refused("An instance of the service is already running. (1056)".to_owned());
+    let never = |_: &Process| -> anyhow::Result<()> { panic!("a process that listens has not exited") };
     assert_eq!(
-        listening_or_exit(&own, StartReply::Accepted),
+        listening_or_exit(&own, StartReply::Accepted, never),
         StartOutcome::Serving(StartReply::Accepted)
     );
-    assert_eq!(listening_or_exit(&own, refused.clone()), StartOutcome::Serving(refused));
+    assert_eq!(
+        listening_or_exit(&own, refused.clone(), never),
+        StartOutcome::Serving(refused)
+    );
 }
 
-#[test]
-fn a_process_that_exits_without_listening_is_exited_with_its_code_and_the_reply_is_kept() {
+/// A child of this test that exits with `code` without listening, and a handle on it that stays openable.
+fn an_exited_child(code: u32) -> (std::process::Child, Process) {
     use std::os::windows::process::CommandExt;
     let cmd =
         std::path::PathBuf::from(std::env::var_os("SystemRoot").expect("SystemRoot is set")).join(r"System32\cmd.exe");
-    let mut child = std::process::Command::new(cmd)
-        .args(["/d", "/c", "exit 5"])
+    let child = std::process::Command::new(cmd)
+        .args(["/d", "/c", &format!("exit {code}")])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -113,11 +117,53 @@ fn a_process_that_exits_without_listening_is_exited_with_its_code_and_the_reply_
     let process = Process::open(child.id())
         .unwrap()
         .expect("the child's handle keeps it openable");
+    (child, process)
+}
+
+#[test]
+fn a_process_that_exits_without_listening_is_exited_with_its_code_and_the_reply_is_kept() {
+    let (mut child, process) = an_exited_child(5);
     assert_eq!(
-        listening_or_exit(&process, StartReply::Accepted),
+        listening_or_exit(&process, StartReply::Accepted, |_| Ok(())),
         StartOutcome::Exited {
             reply: StartReply::Accepted,
             code: 5
+        }
+    );
+    child.wait().unwrap();
+}
+
+#[test]
+fn an_exit_is_answered_only_once_the_service_manager_has_seen_it_and_for_the_process_that_exited() {
+    let (mut child, process) = an_exited_child(7);
+    let mut asked = Vec::new();
+    let outcome = listening_or_exit(&process, StartReply::Accepted, |gone| {
+        asked.push(gone.pid);
+        Ok(())
+    });
+    assert_eq!(
+        outcome,
+        StartOutcome::Exited {
+            reply: StartReply::Accepted,
+            code: 7
+        }
+    );
+    assert_eq!(asked, [child.id()], "asked once, about the process that exited");
+    child.wait().unwrap();
+}
+
+#[test]
+fn an_exit_the_service_manager_could_not_be_asked_about_is_unreadable_with_the_cause_and_not_exited() {
+    let (mut child, process) = an_exited_child(7);
+    let refused = StartReply::Refused("An instance of the service is already running. (1056)".to_owned());
+    let outcome = listening_or_exit(&process, refused.clone(), |_| {
+        Err(anyhow::anyhow!("the service manager did not answer"))
+    });
+    assert_eq!(
+        outcome,
+        StartOutcome::Unreadable {
+            reply: refused,
+            cause: "the service manager did not answer".to_owned(),
         }
     );
     child.wait().unwrap();

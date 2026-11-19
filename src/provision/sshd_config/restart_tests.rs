@@ -105,6 +105,20 @@ fn a_paused_service_is_left_as_it_is_and_the_advice_is_to_resume_it() {
     );
 }
 
+/// What the service manager answers a STOP that sshd's control handler did not answer in time.
+const NO_ANSWER: &str = "The service did not respond to the start or control request in a timely fashion. (1053)";
+
+/// What is said before the wait for an sshd that did not answer the stop, given the service manager's `reply`.
+fn stop_unanswered_line(reply: &str) -> String {
+    format!(
+        "apply: sshd did not answer the stop in time ({reply}) and the service manager says it is still running; \
+         apply waits, with no time limit, for that sshd to exit, and then starts it. To stop waiting, end the \
+         task ssh-broker-apply-sshd (`schtasks /End /TN ssh-broker-apply-sshd`, elevated) and run `ssh-broker \
+         apply` again; nothing then starts an sshd that exits later. Check sshd at this PC: `sc query sshd`; \
+         start it with `net start sshd` if it is stopped."
+    )
+}
+
 const CAUSE: &str = "the state cannot be read";
 const UNSEEN: &str = "whether sshd stopped could not be told (the state cannot be read)";
 
@@ -208,9 +222,26 @@ fn a_state_that_cannot_be_read_is_never_a_sentence_that_says_sshd_runs_or_does_n
         sentences[5],
         format!(
             "apply: sshd is not serving: {UNSEEN}, the service manager refused a start (Access is denied. (5)), \
-             and the sshd it reported running exited (code 1067) before it listened. Check it at this PC: `sc \
+             and the sshd it reported running exited (code 1067) before it listened. Check sshd at this PC: `sc \
              query sshd`; start it with `net start sshd` if it is stopped."
         )
+    );
+
+    // A stop that was not answered in time says so first, and then, its outcome unknown, still never says that
+    // sshd was stopped.
+    let mut unanswered = self::host();
+    unanswered.settles = [Ok(ServiceState::Running)].into();
+    unanswered.stop_unanswered = Some(NO_ANSWER.to_owned());
+    unanswered.stops = [Ok(StopOutcome::Unknown {
+        cause: CAUSE.to_owned(),
+    })]
+    .into();
+    unanswered.starts = [StartOutcome::Serving(StartReply::Accepted)].into();
+    let (_, said) = run(&mut unanswered);
+    assert_eq!(said[1], stop_unanswered_line(NO_ANSWER));
+    assert!(
+        said.last().unwrap().contains(UNSEEN) && !said.last().unwrap().contains("was stopped"),
+        "{said:#?}"
     );
 
     // A stop that could not be sent says why, and says the running state is the one read before it.
@@ -258,6 +289,26 @@ fn a_start_after_an_unseen_stop_that_stopped_again_says_the_cause_in_every_sente
 }
 
 // the stop =====
+
+#[test]
+fn a_stop_sshd_did_not_answer_in_time_is_said_before_the_wait_and_the_restart_goes_on() {
+    let mut host = host();
+    host.settles = [Ok(ServiceState::Running)].into();
+    host.stop_unanswered = Some(NO_ANSWER.to_owned());
+    host.stops = [Ok(StopOutcome::Stopped)].into();
+    host.starts = [StartOutcome::Serving(StartReply::Accepted)].into();
+    let (taken, said) = run(&mut host);
+    assert!(taken);
+    assert_eq!(
+        said,
+        [
+            INTRO,
+            &stop_unanswered_line(NO_ANSWER),
+            &format!("apply: sshd restarted; it accepts {ELEVATION}")
+        ]
+    );
+    assert_eq!(events(&host), ["settled", "stop", "start"]);
+}
 
 #[test]
 fn a_stop_that_was_not_sent_says_so_with_why_and_that_sshd_was_last_read_as_running() {
@@ -607,7 +658,7 @@ fn a_refused_start_whose_sshd_exits_puts_nothing_back() {
     assert_eq!(
         said.last().unwrap(),
         "apply: sshd is not serving: sshd was stopped, the service manager refused a start (Access is denied. \
-         (5)), and the sshd it reported running exited (code 1067) before it listened. Check it at this PC: `sc \
+         (5)), and the sshd it reported running exited (code 1067) before it listened. Check sshd at this PC: `sc \
          query sshd`; start it with `net start sshd` if it is stopped."
     );
     assert_eq!(

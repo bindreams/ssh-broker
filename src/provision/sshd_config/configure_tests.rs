@@ -57,6 +57,9 @@ pub(crate) struct Fake {
     pub(crate) settles: VecDeque<Result<ServiceState, String>>,
     /// What `stop()` answers, in order; an `Err` is the cause of no STOP having been sent.
     pub(crate) stops: VecDeque<Result<StopOutcome, String>>,
+    /// The reply the next `stop()` passes to its `unanswered` hook, as a STOP answered with 1053 that leaves the
+    /// service running does; `None`: the hook is not called.
+    pub(crate) stop_unanswered: Option<String>,
     /// What `start()` answers, in order.
     pub(crate) starts: VecDeque<StartOutcome>,
     /// A method that fails once a start was asked for: the put-back of the files.
@@ -196,9 +199,12 @@ impl SshdHost for Fake {
             .map_err(|cause| anyhow::anyhow!("{cause}"))
     }
 
-    fn stop(&mut self) -> anyhow::Result<StopOutcome> {
+    fn stop(&mut self, unanswered: &mut dyn FnMut(&str)) -> anyhow::Result<StopOutcome> {
         self.call("stop");
         self.event("stop");
+        if let Some(reply) = self.stop_unanswered.take() {
+            unanswered(&reply);
+        }
         self.stops
             .pop_front()
             .expect("stop() was called, and the test scripted no stop")

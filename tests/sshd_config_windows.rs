@@ -17,6 +17,7 @@ use ssh_broker::acl::{copy_file_security, create_install_dir, install_dir_file_p
 use ssh_broker::provision::path_env::{self, PathPlan};
 use ssh_broker::provision::procwait::Process;
 use ssh_broker::provision::registry;
+use ssh_broker::provision::schtasks::WaitOutcome;
 use ssh_broker::provision::sshd_config::configure::{ConfigRead, SshdHost};
 use ssh_broker::provision::sshd_config::machine::{
     configure_this_machine, sshd_host_of_this_machine, sshd_reading_this_machine,
@@ -26,7 +27,6 @@ use ssh_broker::provision::sshd_config::{
     ACCEPT_LINE, DROP_IN_NAME, INCLUDE_LINE, SshdReading, accepts, accepts_row, drop_in_text, in_force, with_line,
 };
 use ssh_broker::provision::sshd_task;
-use ssh_broker::provision::taskscheduler::WaitOutcome;
 use ssh_broker::provision::{BASE_DIR, canonical_exe};
 use ssh_broker::provision::{schtasks, taskscheduler};
 use ssh_broker::socket_loc::Integrity;
@@ -148,11 +148,11 @@ fn apply(kit: &Kit) -> String {
     format!("{stdout}{stderr}")
 }
 
-/// The lines the report of `apply`'s sshd step holds.
-fn report_lines() -> Vec<String> {
-    let path = ssh_broker::provision::sshd_task::report_path();
+/// What the report of `apply`'s sshd step holds.
+fn report() -> sshd_task::Report {
+    let path = sshd_task::report_path();
     let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read the report {}: {e}", path.display()));
-    ssh_broker::provision::sshd_task::report_lines(&text)
+    sshd_task::Report::parse(&text)
 }
 
 /// No task of the sshd step is left registered.
@@ -192,7 +192,7 @@ fn apply_s_sshd_step_adds_the_drop_in_and_the_include_above_the_first_match_and_
         .skip_while(|line| !line.starts_with(sshd_task::HANDED_OVER_PREFIX))
         .skip(1)
         .collect();
-    let said = report_lines();
+    let said = report().lines;
     assert_eq!(printed, said, "apply prints the report, line for line");
     assert_restarted(true, &said);
     assert_no_sshd_task_is_left();
@@ -816,14 +816,14 @@ fn the_service_manager_s_state_follows_a_stop_and_a_start() {
         .expect("open the process of the sshd service")
         .expect("the sshd service has a process");
 
-    assert_eq!(host.stop().expect("a STOP was sent"), StopOutcome::Stopped);
+    assert_eq!(host.stop(&mut |_| {}).expect("a STOP was sent"), StopOutcome::Stopped);
     assert!(
         has_exited(&old),
         "stop() returned before the old sshd process had exited"
     );
     assert_eq!(host.settled().expect("read the state"), ServiceState::Stopped);
     assert_eq!(
-        host.stop().expect("a STOP was sent"),
+        host.stop(&mut |_| {}).expect("a STOP was sent"),
         StopOutcome::Stopped,
         "a second stop of a stopped service"
     );
@@ -865,7 +865,7 @@ fn an_sshd_that_cannot_bind_any_address_is_never_said_to_serve() {
     assert!(!ports.is_empty(), "`sshd -T` names no port");
 
     assert_eq!(host.settled().expect("read the state"), ServiceState::Running);
-    assert_eq!(host.stop().expect("a STOP was sent"), StopOutcome::Stopped);
+    assert_eq!(host.stop(&mut |_| {}).expect("a STOP was sent"), StopOutcome::Stopped);
 
     let unbindable = with_line(stock, "ListenAddress 192.0.2.1").expect("the stock sshd_config can be edited");
     std::fs::write(config_path(), &unbindable).expect("write the configuration");
@@ -894,7 +894,7 @@ fn an_sshd_that_cannot_bind_any_address_is_never_said_to_serve() {
 
     // sshd runs again: the ports are free, the configuration is the stock one, and the service is stopped.
     drop(held);
-    assert_eq!(host.stop().expect("a STOP was sent"), StopOutcome::Stopped);
+    assert_eq!(host.stop(&mut |_| {}).expect("a STOP was sent"), StopOutcome::Stopped);
     reset();
     assert_eq!(host.start(), StartOutcome::Serving(StartReply::Accepted));
     let pid = sshd_service_pid();
@@ -960,8 +960,14 @@ fn an_apply_ended_after_it_handed_over_the_sshd_step_leaves_sshd_running_with_th
         accepts(&sshd_t(), ssh_broker::protocol::ElevationPolicy::VARIABLE),
         "plain `sshd -T` shows the variable"
     );
+    let report = report();
+    assert!(
+        report.complete,
+        "the report says that the step ended: {:#?}",
+        report.lines
+    );
     assert_eq!(
-        report_lines().last().map(String::as_str),
+        report.lines.last().map(String::as_str),
         Some("apply: sshd restarted; it accepts SSH_BROKER_ELEVATION"),
         "the report's last line says sshd restarted"
     );

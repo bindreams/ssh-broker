@@ -2,7 +2,8 @@
 //! what the service manager says.
 
 use super::configure::SshdHost;
-use super::{DROP_IN_NAME, VARIABLE};
+use super::{CHECK_SSHD, DROP_IN_NAME, VARIABLE};
+use crate::provision::schtasks::APPLY_SSHD_TASK;
 
 /// The settled states of the sshd service. The machine never returns a pending one: it waits for the service
 /// manager to leave it.
@@ -62,7 +63,8 @@ pub enum StartOutcome {
     /// manager says running before that, so running alone is not this.
     Serving(StartReply),
     /// The service's process, which the service manager had reported running, exited with `code` before it
-    /// listened.
+    /// listened, and the service manager has seen the exit: it no longer says the service runs in that process,
+    /// so a start sent now is not refused for it.
     Exited {
         reply: StartReply,
         code: u32,
@@ -136,7 +138,7 @@ pub fn restart(host: &mut dyn SshdHost, say: &mut dyn FnMut(&str), before: &Befo
     }
 
     // What is known of the stop: `None` when `Stopped` was read, else a clause with why it was not seen.
-    let unseen = match host.stop() {
+    let unseen = match host.stop(&mut |reply| say(&stop_unanswered(reply))) {
         Ok(StopOutcome::Stopped) => None,
         Ok(StopOutcome::Unknown { cause }) => Some(format!("whether sshd stopped could not be told ({cause})")),
         Ok(StopOutcome::NotStopped { state, refusal }) => {
@@ -199,7 +201,7 @@ pub fn restart(host: &mut dyn SshdHost, say: &mut dyn FnMut(&str), before: &Befo
         } => {
             say(&format!(
                 "apply: sshd is not serving: {stopped}, the service manager refused a start ({reply}), and the sshd \
-                 it reported running exited (code {code}) before it listened. {CHECK_OR_START_BY_HAND}"
+                 it reported running exited (code {code}) before it listened. {CHECK_SSHD}"
             ));
             false
         }
@@ -236,8 +238,17 @@ pub fn restart(host: &mut dyn SshdHost, say: &mut dyn FnMut(&str), before: &Befo
 
 const START_BY_HAND: &str = "Start it at this PC: `net start sshd`.";
 const CHECK_BY_HAND: &str = "Check it at this PC: `sc query sshd`.";
-const CHECK_OR_START_BY_HAND: &str =
-    "Check it at this PC: `sc query sshd`; start it with `net start sshd` if it is stopped.";
+
+/// What is said before the wait for an sshd that did not answer the stop in time (`reply` is the service
+/// manager's answer): that the wait has no time limit, and how to end it.
+fn stop_unanswered(reply: &str) -> String {
+    format!(
+        "apply: sshd did not answer the stop in time ({reply}) and the service manager says it is still running; \
+         apply waits, with no time limit, for that sshd to exit, and then starts it. To stop waiting, end the task \
+         {APPLY_SSHD_TASK} (`schtasks /End /TN {APPLY_SSHD_TASK}`, elevated) and run `ssh-broker apply` again; \
+         nothing then starts an sshd that exits later. {CHECK_SSHD}"
+    )
+}
 
 /// What is said when sshd could not be stopped: why, and the state it is in.
 fn not_stopped(why: &str, state: &str) -> String {

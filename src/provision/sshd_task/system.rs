@@ -6,8 +6,8 @@ use anyhow::Context;
 
 use super::{SshdTask, hand_over};
 use crate::provision::layout::Layout;
-use crate::provision::schtasks::{APPLY_SSHD_TASK, apply_sshd_task_xml};
-use crate::provision::taskscheduler::{self, WaitOutcome};
+use crate::provision::schtasks::{APPLY_SSHD_TASK, WaitOutcome, apply_sshd_task_xml};
+use crate::provision::taskscheduler;
 
 /// The task's permissions: SYSTEM and Administrators full control, nobody else anything. The task runs code as
 /// SYSTEM, so whoever can edit it can run code as SYSTEM.
@@ -49,12 +49,6 @@ impl SshdTask for SystemTask<'_> {
     fn report(&mut self) -> anyhow::Result<String> {
         let bytes = std::fs::read(self.report).with_context(|| format!("read {}", self.report.display()))?;
         Ok(String::from_utf8_lossy(&bytes).into_owned())
-    }
-
-    fn last_result(&mut self) -> anyhow::Result<u32> {
-        Ok(taskscheduler::task_state(APPLY_SSHD_TASK)?
-            .context("the task is not registered")?
-            .last_result)
     }
 
     fn remove(&mut self) -> anyhow::Result<()> {

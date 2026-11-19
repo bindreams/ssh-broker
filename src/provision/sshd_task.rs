@@ -16,10 +16,12 @@ use std::path::Path;
 
 use anyhow::Context;
 
-use super::schtasks::APPLY_SSHD_TASK;
-use super::taskscheduler::WaitOutcome;
+use super::schtasks::{APPLY_SSHD_TASK, WaitOutcome};
+use super::sshd_config::CHECK_SSHD;
 
+#[cfg(windows)]
 mod system;
+#[cfg(windows)]
 pub use system::{hand_over_sshd_step, report_path};
 
 /// What the hand-over needs of the Task Scheduler and the report.
@@ -33,8 +35,6 @@ pub trait SshdTask {
     fn wait(&mut self) -> anyhow::Result<WaitOutcome>;
     /// The report the verb wrote.
     fn report(&mut self) -> anyhow::Result<String>;
-    /// The task's last result, as the Task Scheduler holds it.
-    fn last_result(&mut self) -> anyhow::Result<u32>;
     /// Delete the task.
     fn remove(&mut self) -> anyhow::Result<()>;
 }
@@ -43,11 +43,12 @@ pub trait SshdTask {
 /// the task's waits for a line that starts with it.
 pub const HANDED_OVER_PREFIX: &str = "apply: sshd's configuration is set up by the task ssh-broker-apply-sshd";
 
-/// The line that says the step is the task's, and where what it does is kept.
+/// The line that says the step is the task's, that what it does is printed when it has finished, and where it
+/// can be read while it runs.
 pub fn handed_over_line(report: &Path) -> String {
     format!(
         "{HANDED_OVER_PREFIX}, which runs as SYSTEM and finishes even if this apply is ended; what it does \
-         follows, and is kept in {}",
+         follows when it has finished, and can be read while it runs in {}",
         report.display()
     )
 }
@@ -56,10 +57,10 @@ pub fn handed_over_line(report: &Path) -> String {
 ///
 /// The order: the task is registered, run, and the hand-over line said; only then is the task waited for, so
 /// that an `apply` ended from there on leaves the step to the task. When the instances have ended, the report is
-/// printed and the task removed. The report is believed to be whole only when the task's last result is 0; any
-/// other result (or one that cannot be read) means the task's process ended before it finished, and the report
-/// is printed as far as it goes. A wait that cannot say the instances ended leaves the task registered and the
-/// report unread, and says that the step may still run: nothing is concluded from it. No failure fails `apply`.
+/// printed and the task removed. The report is believed to be whole only when it says so itself ([`REPORT_END`]
+/// is its last line); one that does not means the task's process ended before the step did, and it is printed as
+/// far as it goes. A wait that cannot say the instances ended leaves the task registered and the report unread,
+/// and says that the step may still run: nothing is concluded from it. No failure fails `apply`.
 pub fn hand_over(task: &mut dyn SshdTask, report: &Path, say: &mut dyn FnMut(&str)) {
     if let Err(e) = task.register() {
         say(&not_set_up("registered", &e));
@@ -91,56 +92,39 @@ pub fn hand_over(task: &mut dyn SshdTask, report: &Path, say: &mut dyn FnMut(&st
         }
     }
 
-    // A report is complete only when the task finished: the process that ends before it does (a panic, an
-    // administrator ending the task) leaves a report as far as it got, and its last result is not 0.
-    let report_text = task.report();
-    let result = task.last_result().map_err(|why| format!("{why:#}"));
-    match report_text {
+    // The report says itself that it is whole: a process that ends before the step does (a panic, an
+    // administrator ending the task) leaves it without its closing line.
+    match task.report() {
         Ok(text) => {
-            let lines = report_lines(&text);
-            let finished = matches!(result, Ok(0));
-            match result {
-                Ok(0) => {
-                    if lines.is_empty() {
-                        say(
-                            "apply: sshd accepts SSH_BROKER_ELEVATION and has read its configuration; the task had nothing to change",
-                        );
-                    }
+            let Report { lines, complete } = Report::parse(&text);
+            if complete {
+                if lines.is_empty() {
+                    say(
+                        "apply: sshd accepts SSH_BROKER_ELEVATION and has read its configuration; the task had nothing to change",
+                    );
                 }
-                Ok(result) => say(&format!(
-                    "apply: the task {APPLY_SSHD_TASK} ended before it finished (its last result was {result:#010x}); \
-                     what it had said follows. {CHECK_SSHD}"
-                )),
-                Err(why) => say(&format!(
-                    "apply: whether the task {APPLY_SSHD_TASK} finished could not be told (its last result could not \
-                     be read ({why})); what it had said follows. {CHECK_SSHD}"
-                )),
-            }
-            if lines.is_empty() && !finished {
-                say(&format!("apply: the task {APPLY_SSHD_TASK} had said nothing"));
+            } else {
+                say(&format!(
+                    "apply: the task {APPLY_SSHD_TASK} ended before its report was complete; what it had said \
+                     follows. {CHECK_SSHD}"
+                ));
+                if lines.is_empty() {
+                    say(&format!("apply: the task {APPLY_SSHD_TASK} had said nothing"));
+                }
             }
             for line in lines {
                 say(&line);
             }
         }
-        Err(e) => {
-            let result = match result {
-                Ok(result) => format!("its last result was {result:#010x}"),
-                Err(why) => format!("its last result could not be read ({why})"),
-            };
-            say(&format!(
-                "apply: the task {APPLY_SSHD_TASK} left no report in {} ({e:#}); {result}. Whether sshd accepts \
-                 SSH_BROKER_ELEVATION and is running is not known: `ssh-broker verify` says, and `sc query sshd` \
-                 shows whether sshd runs",
-                report.display()
-            ));
-        }
+        Err(e) => say(&format!(
+            "apply: the task {APPLY_SSHD_TASK} left no report in {} ({e:#}). Whether sshd accepts \
+             SSH_BROKER_ELEVATION and is running is not known: `ssh-broker verify` says, and `sc query sshd` \
+             shows whether sshd runs",
+            report.display()
+        )),
     }
     remove(task, say);
 }
-
-/// What to do about sshd when the task did not say how its step ended.
-const CHECK_SSHD: &str = "Check sshd at this PC: `sc query sshd`; start it with `net start sshd` if it is stopped.";
 
 fn not_set_up(did_not: &str, cause: &anyhow::Error) -> String {
     format!(
@@ -159,26 +143,53 @@ fn remove(task: &mut dyn SshdTask, say: &mut dyn FnMut(&str)) {
     }
 }
 
-/// The lines of a report text.
-pub fn report_lines(text: &str) -> Vec<String> {
-    text.lines().map(str::to_owned).collect()
+/// The last line of a report whose step ended: the report says itself that it is whole, so that nothing has to
+/// be read of the Task Scheduler to know.
+pub const REPORT_END: &str = "apply-sshd: the step has ended; this report is complete";
+
+/// A report text read: the lines the step said, and whether the step ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Report {
+    /// What the step said, without the closing line.
+    pub lines: Vec<String>,
+    /// The last line is [`REPORT_END`]: the step ended and said everything it had to.
+    pub complete: bool,
+}
+
+impl Report {
+    /// The lines of `text`, and whether the last of them is [`REPORT_END`] (that line is not in `lines`).
+    pub fn parse(text: &str) -> Report {
+        let mut lines: Vec<String> = text.lines().map(str::to_owned).collect();
+        let complete = lines.last().is_some_and(|last| last == REPORT_END);
+        if complete {
+            lines.pop();
+        }
+        Report { lines, complete }
+    }
+}
+
+/// One line and its break, in one write, so that a reader never finds half of a line; in the file when it
+/// returns.
+fn append(file: &mut std::fs::File, line: &str) -> std::io::Result<()> {
+    file.write_all(format!("{line}\r\n").as_bytes())?;
+    file.flush()
 }
 
 /// The verb's side: empty the report at `path`, then run `step`, whose every line is appended to the report and
-/// is in the file when `say` returns. Without a report to write to nothing is run: its words would be lost, and
-/// the `apply` that waits for the task would find none.
+/// is in the file when `say` returns. When `step` has returned and every line was written, [`REPORT_END`] is
+/// appended: a report that is missing a line never closes. Without a report to write to nothing is run: its
+/// words would be lost, and the `apply` that waits for the task would find none.
 pub fn write_report(path: &Path, step: impl FnOnce(&mut dyn FnMut(&str))) -> anyhow::Result<()> {
     let mut file = std::fs::File::create(path).with_context(|| format!("empty the report {}", path.display()))?;
     let mut failure = None;
     step(&mut |line| {
-        // One write for the line and its break, so that a reader never finds half of one.
-        let written = file
-            .write_all(format!("{line}\r\n").as_bytes())
-            .and_then(|()| file.flush());
-        if let Err(e) = written {
+        if let Err(e) = append(&mut file, line) {
             failure.get_or_insert(e);
         }
     });
+    if failure.is_none() {
+        failure = append(&mut file, REPORT_END).err();
+    }
     match failure {
         None => Ok(()),
         Some(e) => Err(e).with_context(|| format!("write the report {}", path.display())),

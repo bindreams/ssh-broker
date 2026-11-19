@@ -141,8 +141,8 @@ impl SshdHost for Machine {
         self.service()?.settled()
     }
 
-    fn stop(&mut self) -> anyhow::Result<StopOutcome> {
-        self.service()?.stop()
+    fn stop(&mut self, unanswered: &mut dyn FnMut(&str)) -> anyhow::Result<StopOutcome> {
+        self.service()?.stop(unanswered)
     }
 
     fn start(&mut self) -> StartOutcome {

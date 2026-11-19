@@ -52,7 +52,10 @@ pub trait SshdHost {
     /// Send the service a STOP, wait for what the service manager says to settle, and when it says stopped, or
     /// when the STOP was answered with 1053 and it says running, wait for the process the service had before the
     /// STOP to exit. `Err`: no STOP was sent.
-    fn stop(&mut self) -> anyhow::Result<StopOutcome>;
+    ///
+    /// `unanswered` is called once, with the service manager's reply, before a STOP answered with 1053 that
+    /// leaves the service running is waited on.
+    fn stop(&mut self, unanswered: &mut dyn FnMut(&str)) -> anyhow::Result<StopOutcome>;
     /// Start the service and wait, with no bound, for what the service manager says to settle and, when that is
     /// running, for sshd to listen or for its process to exit: the service manager says running before sshd has
     /// read its configuration.

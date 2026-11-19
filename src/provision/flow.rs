@@ -2,8 +2,7 @@
 //! the failure paths can be tested with stand-ins.
 
 use super::procwait::{self, StillRunning, Survivor};
-use super::schtasks::APPLY_SSHD_TASK;
-use super::taskscheduler::WaitOutcome;
+use super::schtasks::{APPLY_SSHD_TASK, WaitOutcome};
 
 /// The stop that precedes replacing the exe: first the sshd step of an earlier `apply`, then everything else
 /// that holds the exe (`stop_rest`).
