@@ -361,6 +361,9 @@ fn a_login_with_set_env_always_gets_the_variable_after_apply() {
     let kit = Kit::broker_with_helper("sshe");
     apply(&kit);
     let account = Account::create("sshe", true);
+    // sshd's logon keeps the account's hive loaded, so the account is declared as logged on by sshd, which is how
+    // `Account::drop` deletes the profile; no agent runs for it, so there is none to end (see `session_end`).
+    account.started_by(ServiceLogon::Sshd);
     let login = Login::new(&kit, &account);
     set_stock_shell(&system_cmd());
 
@@ -464,12 +467,13 @@ fn apply_puts_the_install_directory_on_the_system_path_and_verify_says_so() {
 }
 
 /// What a PowerShell session says of where `ssh-broker` is found, typed as a line whose markers the echo of the
-/// typed line does not hold.
+/// typed line does not hold: the answer ends in `;done`, which the shell joins (as in
+/// [`SshSession::check_relayed_shell`]).
 fn type_where_ssh_broker_is(session: &mut SshSession) -> String {
     session.type_line(
-        "Write-Output ('found' + '=' + [string](Get-Command ssh-broker -ErrorAction SilentlyContinue).Source + ';')",
+        "Write-Output ('found' + '=' + [string](Get-Command ssh-broker -ErrorAction SilentlyContinue).Source + ';do' + 'ne')",
     );
-    session.read_until(";");
+    session.read_until(";done");
     let text = session.text();
     let at = text.rfind("found=").expect("the session answered");
     text[at + "found=".len()..]
