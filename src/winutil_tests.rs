@@ -26,6 +26,39 @@ fn win_error_from_preserves_the_underlying_os_code() {
     );
 }
 
+/// `HRESULT_FROM_WIN32` puts a Win32 code in the low word under facility 7; that word is what Windows
+/// documents and what `net helpmsg` takes.
+#[test]
+fn the_win32_code_of_an_hresult_is_its_low_word() {
+    assert_eq!(win32_code(windows::core::HRESULT::from_win32(1056)), Some(1056));
+    assert_eq!(win32_code(windows::core::HRESULT::from_win32(5)), Some(5));
+}
+
+#[test]
+fn an_hresult_of_another_facility_has_no_win32_code() {
+    assert_eq!(win32_code(windows::Win32::Foundation::E_FAIL), None);
+    assert_eq!(win32_code(windows::core::HRESULT(0)), None);
+}
+
+/// A refused service control reads "An instance of the service is already running. (1056)", not the HRESULT
+/// as an `io::Error` prints it ("(os error -2147023840)").
+#[test]
+fn a_windows_error_is_said_with_its_message_and_its_win32_code() {
+    let error = windows::core::Error::from(windows::core::HRESULT::from_win32(1056));
+    let said = describe_error(&error);
+    assert_eq!(said, format!("{} (1056)", error.message().trim()));
+    assert!(!said.contains("os error"), "{said}");
+}
+
+#[test]
+fn an_error_with_no_win32_code_is_said_with_its_hresult() {
+    let error = windows::core::Error::from(windows::Win32::Foundation::E_FAIL);
+    assert_eq!(
+        describe_error(&error),
+        format!("{} (0x80004005)", error.message().trim())
+    );
+}
+
 /// A failure carrying no OS code still converts, rather than inventing one.
 #[test]
 fn win_error_from_falls_back_when_there_is_no_os_code() {

@@ -50,7 +50,9 @@ fn start_and_find(name: &str, image: &Path) -> Vec<Process> {
     // The instance appears when the service has launched it; there is no event to wait on, so
     // this re-reads the real condition until it holds.
     loop {
-        let found = running_instances(&task, image).unwrap().processes;
+        let found = running_instances(&task, |pid| procwait::open_if_image(pid, image))
+            .unwrap()
+            .processes;
         if !found.is_empty() {
             return found;
         }
@@ -268,6 +270,179 @@ fn a_process_that_does_not_exit_fails_the_stop_without_another_pass() {
     assert_eq!(events.into_inner(), ["disable", "list [11]", "stop", "wait [11]"]);
 }
 
+// Waiting for the instances of a task (host) -----
+
+/// The wait over a script of listings (the last one repeats), recording the order of its calls.
+fn run_wait_until_ended(
+    bound: Duration,
+    listings: Vec<Listing>,
+    wait: bool,
+    events: &RefCell<Vec<String>>,
+) -> anyhow::Result<WaitOutcome> {
+    let log = |e: &str| events.borrow_mut().push(e.to_string());
+    let mut listings = listings.into_iter().peekable();
+    wait_until_ended(
+        bound,
+        || {
+            let pids = if listings.len() > 1 {
+                listings.next().unwrap()
+            } else {
+                listings.peek().cloned().unwrap_or_default()
+            };
+            log(&format!("list {pids:?}"));
+            Ok(Instances {
+                count: pids.len(),
+                pids: pids.clone(),
+                processes: pids.into_iter().filter(|pid| *pid != 0).collect(),
+            })
+        },
+        |pids| {
+            log(&format!("wait {pids:?}"));
+            if wait { Ok(()) } else { anyhow::bail!("failed") }
+        },
+        || log("pause"),
+        &mut || log("waiting"),
+    )
+}
+
+#[test]
+fn the_instances_are_listed_waited_for_and_listed_again_until_there_are_none() {
+    let events = RefCell::new(Vec::new());
+    let outcome = run_wait_until_ended(NO_BOUND, vec![vec![11, 22], vec![]], true, &events).unwrap();
+    assert_eq!(outcome, WaitOutcome::Ended);
+    assert_eq!(
+        events.into_inner(),
+        ["list [11, 22]", "waiting", "wait [11, 22]", "list []"]
+    );
+}
+
+#[test]
+fn waiting_is_called_once_before_the_first_wait() {
+    let events = RefCell::new(Vec::new());
+    let outcome = run_wait_until_ended(NO_BOUND, vec![vec![11], vec![22], vec![]], true, &events).unwrap();
+    assert_eq!(outcome, WaitOutcome::Ended);
+    assert_eq!(
+        events.into_inner(),
+        ["list [11]", "waiting", "wait [11]", "list [22]", "wait [22]", "list []"]
+    );
+}
+
+#[test]
+fn waiting_is_not_called_when_no_instance_is_listed() {
+    let events = RefCell::new(Vec::new());
+    run_wait_until_ended(NO_BOUND, vec![vec![]], true, &events).unwrap();
+    assert_eq!(events.into_inner(), ["list []"]);
+}
+
+#[test]
+fn a_task_with_no_instance_has_ended_and_nothing_is_waited_for() {
+    let events = RefCell::new(Vec::new());
+    assert_eq!(
+        run_wait_until_ended(Duration::ZERO, vec![vec![]], true, &events).unwrap(),
+        WaitOutcome::Ended
+    );
+    assert_eq!(events.into_inner(), ["list []"]);
+}
+
+#[test]
+fn an_instance_the_engine_has_not_launched_yet_is_looked_at_again_with_no_count_of_passes() {
+    let events = RefCell::new(Vec::new());
+    let mut listings: Vec<Listing> = (0..1000).map(|_| vec![0]).collect();
+    listings.push(vec![33]);
+    listings.push(vec![]);
+    let outcome = run_wait_until_ended(NO_BOUND, listings, true, &events).unwrap();
+    assert_eq!(outcome, WaitOutcome::Ended);
+    let events = events.into_inner();
+    assert_eq!(events.iter().filter(|e| *e == "list [0]").count(), 1000);
+    assert_eq!(&events[..3], ["list [0]", "waiting", "pause"]);
+    assert_eq!(&events[events.len() - 3..], ["list [33]", "wait [33]", "list []"]);
+}
+
+#[test]
+fn the_wait_pauses_between_two_looks_that_find_nothing_to_wait_on_and_at_no_other_time() {
+    // The look right after `run_task` finds an instance that is not launched yet: looking again at once would
+    // spin the CPU until the engine launches it.
+    let events = RefCell::new(Vec::new());
+    let outcome = run_wait_until_ended(NO_BOUND, vec![vec![0], vec![0], vec![33], vec![]], true, &events).unwrap();
+    assert_eq!(outcome, WaitOutcome::Ended);
+    assert_eq!(
+        events.into_inner(),
+        [
+            "list [0]",
+            "waiting",
+            "pause",
+            "list [0]",
+            "pause",
+            "list [33]",
+            "wait [33]",
+            "list []"
+        ]
+    );
+}
+
+#[test]
+fn an_instance_that_is_never_launched_is_not_an_end_and_is_reported_with_how_many_past_the_bound() {
+    // With a zero bound the first look that finds only unlaunched instances is past it. The expiry is the
+    // failure bound of an external event that may never come, and says nothing of what the instance does.
+    let events = RefCell::new(Vec::new());
+    let outcome = run_wait_until_ended(Duration::ZERO, vec![vec![0, 0]], true, &events).unwrap();
+    assert_eq!(outcome, WaitOutcome::NeverLaunched { count: 2 });
+    assert_eq!(events.into_inner(), ["list [0, 0]", "waiting"]);
+}
+
+#[test]
+fn a_launched_instance_is_waited_for_with_no_bound_however_long_the_bound_is_past() {
+    // The bound is for an instance that is never launched, not for one that runs: a launched one is
+    // waited for until it exits, and a zero bound does not cut that wait.
+    let events = RefCell::new(Vec::new());
+    let outcome = run_wait_until_ended(Duration::ZERO, vec![vec![0, 44], vec![]], true, &events).unwrap();
+    assert_eq!(outcome, WaitOutcome::Ended);
+    assert_eq!(events.into_inner(), ["list [0, 44]", "waiting", "wait [44]", "list []"]);
+}
+
+/// The process of an instance, as the tests hold one: its pid; `open` finds one for the pids in `alive`.
+fn instances_listed(listed: Vec<u32>, alive: &[u32]) -> Instances<u32> {
+    instances_of(listed, |pid| Ok(alive.contains(&pid).then_some(pid))).unwrap()
+}
+
+#[test]
+fn an_instance_whose_process_has_exited_is_not_an_instance_and_one_not_launched_yet_is() {
+    let instances = instances_listed(vec![0, 7, 8], &[8]);
+    assert_eq!(instances.count, 2);
+    assert_eq!(instances.pids, [0, 8]);
+    assert_eq!(instances.processes, [8]);
+}
+
+/// A slow engine lists an instance after its process has exited. It has ended: it is not an instance that was
+/// never launched, which would leave the report unread and the task registered.
+#[test]
+fn a_listed_instance_whose_process_has_exited_ends_the_wait_and_is_not_never_launched() {
+    let outcome = wait_until_ended(
+        Duration::ZERO,
+        || Ok(instances_listed(vec![7], &[])),
+        |_: Vec<u32>| anyhow::bail!("nothing is waited for"),
+        || panic!("no look is paced when no instance is listed"),
+        &mut || {},
+    )
+    .unwrap();
+    assert_eq!(outcome, WaitOutcome::Ended);
+}
+
+#[test]
+fn a_failure_to_identify_the_process_of_an_instance_is_an_error_and_never_an_end() {
+    let result = instances_of(vec![7], |_| -> anyhow::Result<Option<u32>> {
+        anyhow::bail!("cannot tell")
+    });
+    assert!(result.is_err());
+}
+
+#[test]
+fn a_wait_that_fails_is_an_error_and_is_not_looked_past() {
+    let events = RefCell::new(Vec::new());
+    assert!(run_wait_until_ended(NO_BOUND, vec![vec![11], vec![]], false, &events).is_err());
+    assert_eq!(events.into_inner(), ["list [11]", "waiting", "wait [11]"]);
+}
+
 // Stopping a real task (Elevated, CI only) -----
 
 /// Elevated (CI only).
@@ -317,6 +492,41 @@ fn stop_instances_returns_after_the_instance_process_has_exited_and_leaves_the_t
         !crate::provision::schtasks::xml_is_disabled(&enabled_xml),
         "{enabled_xml}"
     );
+}
+
+/// Elevated (CI only). A task registered as a service account (SYSTEM) with no trigger and started on demand:
+/// the wait returns once its instance has no process left, so what the process writes last is there, and the
+/// task has no instance afterwards.
+#[test]
+fn a_system_task_is_registered_run_and_waited_for_until_its_process_has_exited() {
+    let task = ThrowawayTask::new("system-wait");
+    let cmd = PathBuf::from(r"C:\Windows\System32\cmd.exe");
+    let marker = std::env::temp_dir().join(format!("sb-system-wait-{}.txt", std::process::id()));
+    let _ = std::fs::remove_file(&marker);
+    let xml = format!(
+        r#"<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <Principals><Principal id="System"><UserId>S-1-5-18</UserId><RunLevel>HighestAvailable</RunLevel></Principal></Principals>
+  <Settings><MultipleInstancesPolicy>Queue</MultipleInstancesPolicy><ExecutionTimeLimit>PT0S</ExecutionTimeLimit></Settings>
+  <Actions Context="System"><Exec><Command>{}</Command><Arguments>{}</Arguments></Exec></Actions>
+</Task>
+"#,
+        cmd.display(),
+        crate::provision::schtasks::xml_escape(&format!("/c echo done> \"{}\"", marker.display()))
+    );
+    register_system_task(&task.0, &xml, "D:P(A;;FA;;;SY)(A;;FA;;;BA)").unwrap();
+    run_task(&task.0).unwrap();
+
+    // `cmd /c ...` is no verb of ssh-broker: its role is the one `role_of` gives every other command line.
+    let outcome = wait_for_instances(&task.0, &cmd, Role::Shim, &mut || {}).unwrap();
+    let written = std::fs::read_to_string(&marker);
+    let _ = std::fs::remove_file(&marker);
+    assert_eq!(outcome, WaitOutcome::Ended);
+    assert_eq!(
+        written.expect("the task's process wrote before the wait ended").trim(),
+        "done"
+    );
+    assert!(!has_running_instance(&task.0).unwrap(), "no instance is left");
 }
 
 /// Elevated (CI only).

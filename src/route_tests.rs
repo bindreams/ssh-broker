@@ -175,6 +175,18 @@ fn apply_and_verify_verbs() {
     );
 }
 
+/// The hidden verb of the task that sets sshd up takes no arguments; any other shape is a usage error,
+/// never the shim.
+#[test]
+fn apply_sshd_is_a_hidden_verb_that_takes_no_arguments() {
+    let args = |args: &[&str]| args.iter().map(|a| (*a).to_owned()).collect::<Vec<_>>();
+    assert_eq!(route_line("ssh-broker.exe apply-sshd"), Route::ApplySshd);
+    assert_eq!(
+        route(&args(&["apply-sshd", "now"]), "ignored"),
+        Route::Usage(Verb::ApplySshd)
+    );
+}
+
 /// The hidden probe takes the directory of the junction it makes or the one it follows, which `verify`
 /// names: it runs the two probes of an administrator's session with them. Any other shape is a usage
 /// error, never the shim and never a probe that ignored what it was told.

@@ -33,25 +33,87 @@ pub(super) fn xml_escape(s: &str) -> String {
         .replace('\'', "&apos;")
 }
 
-/// The `Settings` of the per-user tasks: no time limit, no battery conditions (the Task Scheduler
-/// default for the two flags is `true`, which would keep a laptop on battery from starting an
-/// agent with nothing reporting it), restart on failure, enabled. `multiple_instances` is the
+/// What the Task Scheduler does with a run that failed.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum OnFailure {
+    /// Run it again, three times at a minute's distance.
+    Restart,
+    /// Nothing: the run is not repeated.
+    Leave,
+}
+
+/// The `Settings` of the tasks: no time limit, no battery conditions (the Task Scheduler default for
+/// the two flags is `true`, which would keep a laptop on battery from starting an agent with
+/// nothing reporting it), what to do on failure, enabled. `multiple_instances` is the
 /// `MultipleInstancesPolicy` value.
-pub(super) fn settings_xml(multiple_instances: &str) -> String {
-    format!(
-        r#"  <Settings>
-    <MultipleInstancesPolicy>{multiple_instances}</MultipleInstancesPolicy>
-    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
-    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
-    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+pub(super) fn settings_xml(multiple_instances: &str, on_failure: OnFailure) -> String {
+    let restart = match on_failure {
+        OnFailure::Restart => {
+            r#"
     <!-- The project forbids arbitrary retry caps; this is a documented numeric bound that is
          not one (see CONTRIBUTING.md's invariants). The Task Scheduler schema requires a Count
          with RestartOnFailure and has no unbounded form.
          A failure outlasting these attempts is covered at the next logon, by the agent task's own
          logon trigger — not before. -->
-    <RestartOnFailure><Interval>PT1M</Interval><Count>3</Count></RestartOnFailure>
+    <RestartOnFailure><Interval>PT1M</Interval><Count>3</Count></RestartOnFailure>"#
+        }
+        OnFailure::Leave => "",
+    };
+    format!(
+        r#"  <Settings>
+    <MultipleInstancesPolicy>{multiple_instances}</MultipleInstancesPolicy>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>{restart}
     <Enabled>true</Enabled>
   </Settings>"#
+    )
+}
+
+/// The task `apply` hands the sshd step to, so that the step finishes even if the `apply` that started it is
+/// ended (see `sshd_task`).
+pub const APPLY_SSHD_TASK: &str = "ssh-broker-apply-sshd";
+
+/// The commands that end [`APPLY_SSHD_TASK`] and remove it, as the clause of a sentence.
+pub fn end_and_remove_apply_sshd_task() -> String {
+    format!("(`schtasks /End /TN {APPLY_SSHD_TASK}`, then `schtasks /Delete /TN {APPLY_SSHD_TASK} /F`, elevated)")
+}
+
+/// How a wait for a task's instances ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaitOutcome {
+    /// The task has no instance any more: every process it ran has exited. That is about processes, not about
+    /// the Task Scheduler's listing, which may still show an instance whose process has exited.
+    Ended,
+    /// The Task Scheduler lists `count` instances that it never launched, for as long as the failure bound.
+    /// That proves nothing of what they will do.
+    NeverLaunched { count: usize },
+}
+
+/// SYSTEM.
+pub const SYSTEM_SID: &str = "S-1-5-18";
+
+/// The definition of [`APPLY_SSHD_TASK`]: `<exe> apply-sshd` as SYSTEM at the highest level, with no trigger,
+/// so it runs only when `apply` starts it. A run that is asked for while another one is still running queues
+/// behind it, and a run that failed is not repeated: the report says what happened.
+pub fn apply_sshd_task_xml(exe: &str) -> String {
+    let exe = xml_escape(exe);
+    let settings = settings_xml("Queue", OnFailure::Leave);
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo><Description>ssh-broker: makes sshd accept SSH_BROKER_ELEVATION and restarts it; started by apply</Description></RegistrationInfo>
+  <Principals><Principal id="System">
+    <UserId>{SYSTEM_SID}</UserId>
+    <RunLevel>{RUN_LEVEL}</RunLevel>
+  </Principal></Principals>
+{settings}
+  <Actions Context="System"><Exec>
+    <Command>{exe}</Command>
+    <Arguments>apply-sshd</Arguments>
+  </Exec></Actions>
+</Task>
+"#
     )
 }
 
@@ -59,7 +121,7 @@ pub(super) fn settings_xml(multiple_instances: &str) -> String {
 /// user logs on. Names no account; `apply` registers it without a password.
 pub fn agent_task_xml(exe: &str) -> String {
     let exe = xml_escape(exe);
-    let settings = settings_xml("Parallel");
+    let settings = settings_xml("Parallel", OnFailure::Restart);
     format!(
         r#"<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">

@@ -6,7 +6,7 @@ negotiable.
 
 ## Architecture
 
-One binary, four entry points plus the hidden `verify-probe` and `console-fallback` children, selected by argv
+One binary, four entry points plus the hidden `apply-sshd`, `verify-probe` and `console-fallback` verbs, selected by argv
 ([`src/route.rs`](src/route.rs)). The shim is
 the *default* action because `DefaultShell` is a bare path and cannot carry a subcommand: a
 known verb in first position selects a subcommand, anything else is the shim.
@@ -17,6 +17,7 @@ known verb in first position selects a subcommand, anything else is the shim.
 | `agent` | `agent` | a user's interactive session, one per logged-on user, started by a logon task for any member of `BUILTIN\Users` |
 | `apply` | `provision` | wherever an admin runs it; needs elevation |
 | `verify` | `provision` | on the host itself, as the account whose agent it asks: an administrator runs it elevated, and an unelevated one finds no agent and says why |
+| `apply-sshd` | `provision`, `provision::sshd_task` | the hidden verb of the task `ssh-broker-apply-sshd`, as SYSTEM: `apply`'s sshd step (the drop-in, the `Include` and the restart of sshd), whose every line it writes to `apply-sshd.log` in the install directory; `apply` registers the task, starts it, waits for its instances and prints the report, so that the step finishes even if the `apply` that started it is ended |
 | `verify-probe` | `provision` | the child the **agent** spawns in its interactive session, driven through the relay by `verify` |
 | `console-fallback [--login] <handle>` | `shim`, `shim_pty`, `handoff` | the fallback shell of a terminal session through the agent: reads a notice and a line from the pipe handle the agent gave it alone (`PROC_THREAD_ATTRIBUTE_HANDLE_LIST`) until the agent closes its end, prints the notice on its pseudoconsole (which clears anything written ahead of it), starts the line there, exits with its code; it keeps through Ctrl+C for the shell, and when it cannot read the pipe it starts the built-in `cmd.exe` for a login (`--login`) and exits 255 for a command |
 

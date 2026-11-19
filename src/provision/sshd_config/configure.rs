@@ -4,8 +4,9 @@
 //! The flow is held apart from the machine ([`SshdHost`]) because `sshd -t` and the service cannot run on a
 //! workstation: tests stand in for it, and `tests/sshd_config_windows.rs` measures the real one in CI. The
 //! step never fails `apply`: the variable is a convenience, and `ssh-broker elevate` works without it. The one
-//! judgement for a change made in this run and one made earlier ([`config_read`]); sshd is never restarted
-//! here, so a machine reached only over SSH keeps its sshd. The original `sshd_config` is untouched until a
+//! judgement for a change made in this run and one made earlier ([`config_read`]); an sshd that has not read
+//! the files is restarted through the service manager ([`restart`]), which never leaves a machine reached only
+//! over SSH without sshd it could have started. The original `sshd_config` is untouched until a
 //! candidate has passed sshd's own checks and then replaced in one rename. The original is read once and
 //! replaced whole: an edit another program makes to it while `apply` runs is lost. That is a contract
 //! (README), not guarded: no lock other editors honour exists, and one that let the rename through would let
@@ -16,6 +17,7 @@ use std::time::SystemTime;
 
 use anyhow::Context;
 
+use super::restart::{Before, ServiceState, StartOutcome, StopOutcome, restart};
 use super::{
     ACCEPT_LINE, DROP_IN_DIR_NAME, INCLUDE_LINE, VARIABLE, drop_in_text, in_force, include_elsewhere, with_line,
 };
@@ -43,6 +45,21 @@ pub trait SshdHost {
     fn sshd_check(&mut self, config: &Path) -> Result<(), String>;
     /// When the running sshd service's process started; `None` when it is not running.
     fn service_started(&mut self) -> anyhow::Result<Option<SystemTime>>;
+    /// What the service manager says the service is, once it says a settled state: it waits while the service
+    /// is starting, stopping, pausing or continuing, with no bound, because the service manager never resolves
+    /// a held pending state and a bound would only make `apply` give up. `Err` when the state cannot be read.
+    fn settled(&mut self) -> anyhow::Result<ServiceState>;
+    /// Send the service a STOP, wait for what the service manager says to settle, and when it says stopped, or
+    /// when the STOP was answered with 1053 and it says running, wait for the process the service had before the
+    /// STOP to exit. `Err`: no STOP was sent.
+    ///
+    /// `unanswered` is called once, with the service manager's reply, before a STOP answered with 1053 that
+    /// leaves the service running is waited on.
+    fn stop(&mut self, unanswered: &mut dyn FnMut(&str)) -> anyhow::Result<StopOutcome>;
+    /// Start the service and wait, with no bound, for what the service manager says to settle and, when that is
+    /// running, for sshd to listen or for its process to exit: the service manager says running before sshd has
+    /// read its configuration.
+    fn start(&mut self) -> StartOutcome;
     /// This machine's clock.
     fn now(&self) -> SystemTime;
     /// `sshd_config` and every file directly in `sshd_config.d`, whatever its extension, each with when it last
@@ -56,6 +73,8 @@ pub trait SshdHost {
     fn read_drop_in(&mut self) -> anyhow::Result<Option<Vec<u8>>>;
     /// Write the drop-in whole, with the permissions its folder gives a file.
     fn write_drop_in(&mut self, text: &[u8]) -> anyhow::Result<()>;
+    /// Remove the drop-in this run made.
+    fn remove_drop_in(&mut self) -> anyhow::Result<()>;
     /// `sshd_config`'s bytes.
     fn read_config(&mut self) -> anyhow::Result<Vec<u8>>;
     /// A new file beside `sshd_config`, with `text`, on disk; its path.
@@ -145,8 +164,8 @@ pub fn config_read(host: &mut dyn SshdHost) -> anyhow::Result<ConfigRead> {
 
 /// Make sshd accept the variable, and say what was done on `say` (a line each). Returns whether the running
 /// sshd takes the variable, or reads it when it next starts (it is not running); false when it does not,
-/// because it has not read the files yet or the variable could not be put in force, and when that cannot be
-/// told.
+/// because it could not be restarted to read the files or the variable could not be put in force, and when that
+/// cannot be told.
 ///
 /// A failed question to sshd writes nothing, and a candidate for `sshd_config` must pass sshd's checks before
 /// it replaces the original.
@@ -167,11 +186,12 @@ pub fn configure(host: &mut dyn SshdHost, say: &mut dyn FnMut(&str)) -> bool {
             return false;
         }
     };
+    let mut before = Before::default();
     if in_force(&listing) {
-        return say_whether_read(host, say);
+        return say_whether_read(host, say, &before);
     }
 
-    match write_drop_in(host) {
+    match write_drop_in(host, &mut before) {
         Ok(()) => {
             // The drop-in is read through an `Include`, when there is one: plain `sshd -T` says.
             let listing = match host.sshd_t(None) {
@@ -181,12 +201,15 @@ pub fn configure(host: &mut dyn SshdHost, say: &mut dyn FnMut(&str)) -> bool {
                     return false;
                 }
             };
-            if !in_force(&listing)
-                && let Err(why) = add_line(host, INCLUDE_LINE)
-            {
-                say(&format!("apply: sshd_config was not changed: {why}"));
-                say(&advice(host));
-                return false;
+            if !in_force(&listing) {
+                match add_line(host, INCLUDE_LINE) {
+                    Ok(original) => before.config = Some(original),
+                    Err(why) => {
+                        say(&format!("apply: sshd_config was not changed: {why}"));
+                        say(&advice(host));
+                        return false;
+                    }
+                }
             }
         }
         Err(problem) => {
@@ -198,9 +221,12 @@ pub fn configure(host: &mut dyn SshdHost, say: &mut dyn FnMut(&str)) -> bool {
                 }
             };
             match add_line(host, ACCEPT_LINE) {
-                Ok(()) => say(&format!(
-                    "{left}; {VARIABLE} is accepted by a line in sshd_config instead"
-                )),
+                Ok(original) => {
+                    before.config = Some(original);
+                    say(&format!(
+                        "{left}; {VARIABLE} is accepted by a line in sshd_config instead"
+                    ));
+                }
                 Err(why) => {
                     say(&left);
                     say(&format!("apply: sshd_config was not changed: {why}"));
@@ -211,7 +237,7 @@ pub fn configure(host: &mut dyn SshdHost, say: &mut dyn FnMut(&str)) -> bool {
         }
     }
 
-    say_whether_read(host, say)
+    say_whether_read(host, say, &before)
 }
 
 /// What is said when sshd cannot be asked for its configuration (`left` says what that left as it was). The
@@ -224,30 +250,36 @@ fn ask_failed(host: &dyn SshdHost, cause: &anyhow::Error, left: &str) -> String 
     )
 }
 
-/// The sentence that says what to do by hand when the step could not put the variable in force.
+/// The sentence that says what to do by hand when the step could not put the variable in force. The next
+/// `apply` finds the line in force and restarts sshd, if it has not read it.
 fn advice(host: &dyn SshdHost) -> String {
     format!(
-        "apply: add `{ACCEPT_LINE}` above the first `Match` in {}, then restart the sshd service; `ssh-broker \
-         elevate` works without it",
+        "apply: add `{ACCEPT_LINE}` above the first `Match` in {}, then run `ssh-broker apply` again, which \
+         restarts sshd; `ssh-broker elevate` works without it",
         host.config_path().display()
     )
 }
 
 /// Make the drop-in what [`drop_in_text`] says, in a folder that is as `apply` makes it. `Err` says why the
 /// folder or the drop-in cannot be used; the flow then leaves them as they are.
-fn write_drop_in(host: &mut dyn SshdHost) -> Result<(), DropInProblem> {
+fn write_drop_in(host: &mut dyn SshdHost, before: &mut Before) -> Result<(), DropInProblem> {
     let refused = |e: anyhow::Error| DropInProblem::Refused(format!("{e:#}"));
     host.ensure_drop_in_dir()?;
     let text = drop_in_text();
-    if host.read_drop_in().map_err(refused)?.as_deref() != Some(text.as_bytes()) {
+    before.drop_in = host.read_drop_in().map_err(refused)?;
+    if before.drop_in.as_deref() != Some(text.as_bytes()) {
         host.write_drop_in(text.as_bytes()).map_err(refused)?;
+        before.drop_in_changed = true;
     }
     Ok(())
 }
 
-/// The variable is in force in what sshd would read: say whether the running sshd has read it, and return
-/// whether it takes it (or will, when it starts).
-fn say_whether_read(host: &mut dyn SshdHost, say: &mut dyn FnMut(&str)) -> bool {
+/// The variable is in force in what sshd would read: say whether the running sshd has read it, restart it when
+/// it has not, and return whether it takes the variable (or will, when it starts). A file whose time cannot be
+/// judged, and an `Include` of another location, restart it to be sure. `before` is what this run changed: a
+/// change sshd cannot have read restarts it even when the times cannot be read, and is put back if sshd cannot
+/// start with it.
+fn say_whether_read(host: &mut dyn SshdHost, say: &mut dyn FnMut(&str), before: &Before) -> bool {
     match config_read(host) {
         Ok(ConfigRead::Read) => true,
         Ok(ConfigRead::NotRunning) => {
@@ -256,27 +288,33 @@ fn say_whether_read(host: &mut dyn SshdHost, say: &mut dyn FnMut(&str)) -> bool 
         }
         Ok(ConfigRead::Unread(file)) => {
             say(&format!(
-                "apply: sshd was started before {} was last changed, so it has not read it; restart the sshd \
-                 service for it to accept {VARIABLE} (`ssh-broker verify` says whether it has)",
+                "apply: sshd was started before {} was last changed, so it has not read it",
                 file.display()
             ));
-            false
+            restart(host, say, before)
         }
         Ok(ConfigRead::AheadOfClock(file)) => {
             say(&format!(
                 "apply: {}'s change time is ahead of this machine's clock, so it cannot be told whether sshd \
-                 has read it; restart the sshd service for it to accept {VARIABLE}",
+                 has read it",
                 file.display()
             ));
-            false
+            restart(host, say, before)
         }
         Ok(ConfigRead::IncludesOther { file, line }) => {
             say(&format!(
                 "apply: {} has `{line}`; files sshd includes from elsewhere are not judged, so it cannot be told \
-                 whether sshd has read its configuration; restart the sshd service to be sure it accepts {VARIABLE}",
+                 whether sshd has read its configuration, and it is restarted to be sure it accepts {VARIABLE}",
                 file.display()
             ));
-            false
+            restart(host, say, before)
+        }
+        Err(e) if before.changed() => {
+            say(&format!(
+                "apply: cannot tell whether sshd has read its configuration ({e:#}); this run changed it, so it \
+                 has not"
+            ));
+            restart(host, say, before)
         }
         Err(e) => {
             say(&format!(
@@ -290,9 +328,9 @@ fn say_whether_read(host: &mut dyn SshdHost, say: &mut dyn FnMut(&str)) -> bool 
 
 /// Put `line` ([`INCLUDE_LINE`] or [`ACCEPT_LINE`]) into `sshd_config` through a candidate: made from the
 /// original, checked by `sshd -t`, shown by `sshd -T` to put the variable in force, given the original's
-/// security descriptor, and only then renamed over it. The original is untouched on any failure, and the
-/// candidate is removed.
-fn add_line(host: &mut dyn SshdHost, line: &str) -> Result<(), String> {
+/// security descriptor, and only then renamed over it. Returns the original's bytes. The original is untouched
+/// on any failure, and the candidate is removed.
+fn add_line(host: &mut dyn SshdHost, line: &str) -> Result<Vec<u8>, String> {
     let original = host.read_config().map_err(|e| format!("cannot read it: {e:#}"))?;
     let edited = with_line(&original, line).map_err(|cannot| format!("it cannot be edited safely: {cannot}"))?;
     let candidate = match host.write_candidate(&edited) {
@@ -321,9 +359,9 @@ fn add_line(host: &mut dyn SshdHost, line: &str) -> Result<(), String> {
     if installed.is_err() {
         host.discard_candidate();
     }
-    installed
+    installed.map(|()| original)
 }
 
 #[cfg(test)]
 #[path = "configure_tests.rs"]
-mod configure_tests;
+pub(super) mod configure_tests;

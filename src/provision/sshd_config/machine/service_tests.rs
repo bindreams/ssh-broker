@@ -1,0 +1,248 @@
+//! Host tests for what is pure in the service module: what a state the service manager reports, with the process
+//! it is in, asks the wait to do next. The waits and the controls need a real service, and
+//! `tests/sshd_config_windows.rs` measures them in CI.
+use super::*;
+use windows::Win32::System::Services::SERVICE_STATUS_CURRENT_STATE;
+
+const PENDING: [SERVICE_STATUS_CURRENT_STATE; 4] = [
+    SERVICE_START_PENDING,
+    SERVICE_STOP_PENDING,
+    SERVICE_CONTINUE_PENDING,
+    SERVICE_PAUSE_PENDING,
+];
+
+#[test]
+fn running_paused_and_stopped_are_settled() {
+    for (state, settled) in [
+        (SERVICE_RUNNING, ServiceState::Running),
+        (SERVICE_PAUSED, ServiceState::Paused),
+        (SERVICE_STOPPED, ServiceState::Stopped),
+    ] {
+        assert_eq!(next(state.0, 4242, None, SETTLED_MASK), Next::Settled(settled));
+    }
+}
+
+#[test]
+fn every_pending_state_is_waited_for_on_the_settled_states() {
+    for pending in PENDING {
+        assert_eq!(
+            next(pending.0, 4242, None, SETTLED_MASK),
+            Next::Wait,
+            "state {}",
+            pending.0
+        );
+        assert_eq!(
+            next(pending.0, 4242, None, SERVICE_NOTIFY_STOPPED),
+            Next::Rearm(SETTLED_MASK),
+            "state {}",
+            pending.0
+        );
+    }
+}
+
+#[test]
+fn a_state_that_is_none_of_the_seven_is_not_guessed_at() {
+    assert_eq!(next(0, 4242, None, SETTLED_MASK), Next::Unknown(0));
+    assert_eq!(next(8, 4242, Some(4242), SETTLED_MASK), Next::Unknown(8));
+}
+
+// the wait for the service manager to see an exit -----
+
+#[test]
+fn a_service_running_in_the_process_that_exited_is_waited_for_until_the_service_manager_says_stopped() {
+    assert_eq!(
+        next(SERVICE_RUNNING.0, 4242, Some(4242), SERVICE_NOTIFY_STOPPED),
+        Next::Wait
+    );
+    assert_eq!(
+        next(SERVICE_RUNNING.0, 4242, Some(4242), SETTLED_MASK),
+        Next::Rearm(SERVICE_NOTIFY_STOPPED)
+    );
+}
+
+#[test]
+fn a_pending_state_in_the_process_that_exited_is_waited_for_until_it_settles() {
+    for pending in [SERVICE_STOP_PENDING, SERVICE_START_PENDING] {
+        for armed in [SETTLED_MASK, SERVICE_NOTIFY_STOPPED] {
+            let step = next(pending.0, 4242, Some(4242), armed);
+            assert!(
+                !matches!(step, Next::Settled(_)),
+                "state {} armed {}: {step:?}",
+                pending.0,
+                armed.0
+            );
+        }
+    }
+}
+
+#[test]
+fn a_service_running_in_another_process_after_an_exit_is_settled() {
+    // The service manager's recovery restarted it.
+    for armed in [SETTLED_MASK, SERVICE_NOTIFY_STOPPED] {
+        assert_eq!(
+            next(SERVICE_RUNNING.0, 4243, Some(4242), armed),
+            Next::Settled(ServiceState::Running)
+        );
+    }
+}
+
+#[test]
+fn stopped_or_paused_after_an_exit_is_settled() {
+    for (state, settled) in [
+        (SERVICE_STOPPED, ServiceState::Stopped),
+        (SERVICE_PAUSED, ServiceState::Paused),
+    ] {
+        assert_eq!(
+            next(state.0, 4242, Some(4242), SERVICE_NOTIFY_STOPPED),
+            Next::Settled(settled)
+        );
+    }
+}
+
+/// 1053: the service's control handler did not answer the STOP in time.
+const REQUEST_TIMEOUT: u32 = 1053;
+
+#[test]
+fn a_stop_answered_with_1053_that_leaves_sshd_running_waits_for_the_old_process() {
+    assert_eq!(REQUEST_TIMEOUT, ERROR_SERVICE_REQUEST_TIMEOUT.0);
+    assert!(waits_for_the_old_process(Some(REQUEST_TIMEOUT), ServiceState::Running));
+}
+
+#[test]
+fn no_other_answer_to_a_stop_that_leaves_sshd_running_waits_for_the_old_process() {
+    // 1051: a control the service cannot take (a dependent service runs); 1061: it is not accepting controls; 5:
+    // access denied. An accepted STOP is `None`.
+    for reply in [Some(1051), Some(1061), Some(5), Some(1056), None] {
+        assert!(
+            !waits_for_the_old_process(reply, ServiceState::Running),
+            "a STOP answered with {reply:?} is not waited on"
+        );
+    }
+}
+
+#[test]
+fn a_1053_that_leaves_sshd_paused_or_stopped_is_not_waited_on() {
+    for state in [ServiceState::Paused, ServiceState::Stopped] {
+        assert!(!waits_for_the_old_process(Some(REQUEST_TIMEOUT), state), "{state}");
+    }
+}
+
+// the wait for a started process -----
+
+/// The looks at a process's sockets are of this machine's real table, and the processes are this test's own.
+#[test]
+fn a_process_that_listens_is_serving_and_the_reply_is_kept() {
+    let _listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let own = Process::open(std::process::id()).unwrap().expect("this process runs");
+    let refused = StartReply::Refused("An instance of the service is already running. (1056)".to_owned());
+    let never = |_: &Process| -> anyhow::Result<()> { panic!("a process that listens has not exited") };
+    assert_eq!(
+        listening_or_exit(&own, StartReply::Accepted, never),
+        StartOutcome::Serving(StartReply::Accepted)
+    );
+    assert_eq!(
+        listening_or_exit(&own, refused.clone(), never),
+        StartOutcome::Serving(refused)
+    );
+}
+
+/// A child of this test that exits with `code` without listening, and a handle on it that stays openable.
+fn an_exited_child(code: u32) -> (std::process::Child, Process) {
+    use std::os::windows::process::CommandExt;
+    let cmd =
+        std::path::PathBuf::from(std::env::var_os("SystemRoot").expect("SystemRoot is set")).join(r"System32\cmd.exe");
+    let child = std::process::Command::new(cmd)
+        .args(["/d", "/c", &format!("exit {code}")])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .creation_flags(0x0800_0000)
+        .spawn()
+        .unwrap();
+    let process = Process::open(child.id())
+        .unwrap()
+        .expect("the child's handle keeps it openable");
+    (child, process)
+}
+
+#[test]
+fn a_process_that_exits_without_listening_is_exited_with_its_code_and_the_reply_is_kept() {
+    let (mut child, process) = an_exited_child(5);
+    assert_eq!(
+        listening_or_exit(&process, StartReply::Accepted, |_| Ok(())),
+        StartOutcome::Exited {
+            reply: StartReply::Accepted,
+            code: 5,
+            unseen: None,
+        }
+    );
+    child.wait().unwrap();
+}
+
+#[test]
+fn an_exit_is_answered_only_once_the_service_manager_has_seen_it_and_for_the_process_that_exited() {
+    let (mut child, process) = an_exited_child(7);
+    let mut asked = Vec::new();
+    let outcome = listening_or_exit(&process, StartReply::Accepted, |gone| {
+        asked.push(gone.pid);
+        Ok(())
+    });
+    assert_eq!(
+        outcome,
+        StartOutcome::Exited {
+            reply: StartReply::Accepted,
+            code: 7,
+            unseen: None,
+        }
+    );
+    assert_eq!(asked, [child.id()], "asked once, about the process that exited");
+    child.wait().unwrap();
+}
+
+#[test]
+fn an_exit_the_service_manager_could_not_be_asked_about_is_exited_with_its_code_and_the_cause() {
+    let (mut child, process) = an_exited_child(7);
+    let refused = StartReply::Refused("An instance of the service is already running. (1056)".to_owned());
+    let outcome = listening_or_exit(&process, refused.clone(), |_| {
+        Err(anyhow::anyhow!("the service manager did not answer"))
+    });
+    assert_eq!(
+        outcome,
+        StartOutcome::Exited {
+            reply: refused,
+            code: 7,
+            unseen: Some("the service manager did not answer".to_owned()),
+        }
+    );
+    child.wait().unwrap();
+}
+
+fn a_notification() -> *mut Notification {
+    Box::into_raw(Box::new(Notification {
+        buffer: SERVICE_NOTIFY_2W::default(),
+        fired: AtomicBool::new(false),
+    }))
+}
+
+#[test]
+fn a_notification_is_freed_after_its_handle_was_closed() {
+    assert_eq!(release(a_notification(), Ok(())), ReleaseOutcome::Freed);
+}
+
+/// A late callback may still write into a notification whose registration was not ended: it is never freed.
+#[test]
+fn a_notification_whose_handle_could_not_be_closed_is_left_alone() {
+    let notification = a_notification();
+    let failed = windows::core::Error::from(windows::Win32::Foundation::E_FAIL);
+    assert_eq!(release(notification, Err(failed)), ReleaseOutcome::Leaked);
+    // SAFETY: `release` left it allocated; this test frees what it made.
+    drop(unsafe { Box::from_raw(notification) });
+}
+
+#[test]
+fn the_notification_mask_is_the_settled_states_and_no_pending_one() {
+    assert_eq!(
+        SETTLED_MASK,
+        SERVICE_NOTIFY_RUNNING | SERVICE_NOTIFY_PAUSED | SERVICE_NOTIFY_STOPPED
+    );
+}

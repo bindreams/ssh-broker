@@ -427,7 +427,8 @@ fn the_sshd_row_fails_when_sshd_started_before_its_configuration_was_written() {
         assert_eq!(
             row.detail,
             format!(
-                "sshd was started before {} was last changed and has not read it; restart the sshd service",
+                "sshd was started before {} was last changed and has not read it; `ssh-broker apply` restarts it, or \
+                 restart the sshd service",
                 PathBuf::from("sshd_config.d").join("10-ssh-broker.conf").display()
             )
         );
@@ -464,7 +465,7 @@ fn the_sshd_row_passes_and_says_so_when_a_files_time_is_ahead_of_the_clock() {
             row.detail,
             format!(
                 "{said}; sshd_config's change time is ahead of the clock, so whether the running sshd has read \
-                 it cannot be told (restart the sshd service to be sure)"
+                 it cannot be told (`ssh-broker apply` restarts it to be sure, or restart the sshd service)"
             )
         );
     }
@@ -502,7 +503,8 @@ fn the_sshd_row_passes_with_a_note_when_sshd_includes_another_location() {
             row.detail,
             format!(
                 "{said}; sshd_config has `Include D:\\x\\*.conf`, so whether the running sshd has read its \
-                 configuration cannot be told (restart the sshd service to be sure)"
+                 configuration cannot be told (`ssh-broker apply` restarts it to be sure, or restart the sshd \
+                 service)"
             )
         );
     }

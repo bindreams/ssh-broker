@@ -94,6 +94,70 @@ fn agents_survive_a_failed_stop_in_the_sessions_the_start_is_told_to_leave_alone
     );
 }
 
+/// [`wait_for_earlier_sshd_step`] over a script: whether the wait finds an earlier step (and so calls
+/// `waiting`) and how it ends. The events are in the order the calls were made.
+fn wait_for_earlier(found: bool, waited: anyhow::Result<WaitOutcome>) -> (Vec<String>, anyhow::Result<()>) {
+    let events = RefCell::new(Vec::new());
+    let log = |event: &str| events.borrow_mut().push(event.to_owned());
+    let result = wait_for_earlier_sshd_step(&mut |line| log(&format!("say: {line}")), |waiting| {
+        log("look for the sshd step");
+        if found {
+            waiting();
+        }
+        log("wait for the sshd step");
+        waited
+    });
+    (events.into_inner(), result)
+}
+
+#[test]
+fn an_earlier_sshd_step_is_said_once_and_waited_for() {
+    let (events, result) = wait_for_earlier(true, Ok(WaitOutcome::Ended));
+    result.unwrap();
+    assert_eq!(
+        events,
+        [
+            "look for the sshd step",
+            "say: apply: an earlier apply's sshd step is still running (the task ssh-broker-apply-sshd); waiting \
+             for it to finish",
+            "wait for the sshd step",
+        ]
+    );
+}
+
+#[test]
+fn nothing_is_said_when_no_earlier_sshd_step_runs() {
+    let (events, result) = wait_for_earlier(false, Ok(WaitOutcome::Ended));
+    result.unwrap();
+    assert_eq!(events, ["look for the sshd step", "wait for the sshd step"]);
+}
+
+#[test]
+fn an_earlier_sshd_step_never_launched_stops_apply() {
+    let (_, result) = wait_for_earlier(true, Ok(WaitOutcome::NeverLaunched { count: 2 }));
+    let text = format!("{:#}", result.unwrap_err());
+    assert_eq!(
+        text,
+        format!(
+            "the Task Scheduler lists 2 instance(s) of the task ssh-broker-apply-sshd that it has not started \
+             after {} s, so apply went no further. End and remove the task (`schtasks /End /TN \
+             ssh-broker-apply-sshd`, then `schtasks /Delete /TN ssh-broker-apply-sshd /F`, elevated); if the step \
+             has started meanwhile, ending it can leave sshd stopped. Check sshd at this PC: `sc query sshd`; \
+             start it with `net start sshd` if it is stopped. Then run apply again",
+            procwait::EXIT_BOUND.as_secs()
+        )
+    );
+}
+
+#[test]
+fn a_failed_wait_for_an_earlier_sshd_step_stops_apply() {
+    let (_, result) = wait_for_earlier(true, Err(anyhow::anyhow!("the Task Scheduler did not answer")));
+    assert_eq!(
+        format!("{:#}", result.unwrap_err()),
+        "wait for an earlier apply's sshd step: the Task Scheduler did not answer"
+    );
+}
+
 #[test]
 fn agents_start_again_when_the_stop_failed_part_way() {
     let (events, result) = flow(true, || anyhow::bail!("access denied"), true);

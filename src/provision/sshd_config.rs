@@ -20,6 +20,7 @@ use crate::socket_loc::Integrity;
 pub mod configure;
 #[cfg(windows)]
 pub mod machine;
+pub mod restart;
 
 /// The folder of drop-ins, beside `sshd_config`.
 pub const DROP_IN_DIR_NAME: &str = "sshd_config.d";
@@ -38,6 +39,10 @@ pub fn drop_in_text() -> String {
 
 /// The one line `sshd_config` gets, above its first `Match`, when sshd does not read the drop-in.
 pub const INCLUDE_LINE: &str = "Include sshd_config.d/*.conf";
+
+/// What to do about sshd at this PC when what `apply` said does not settle whether it runs.
+pub(crate) const CHECK_SSHD: &str =
+    "Check sshd at this PC: `sc query sshd`; start it with `net start sshd` if it is stopped.";
 
 /// The variable's name, as the `verify` row and `sshd -T` know it.
 const VARIABLE: &str = crate::protocol::ElevationPolicy::VARIABLE;
@@ -295,7 +300,8 @@ pub fn accepts_row(
             ROW_NAME,
             false,
             format!(
-                "sshd was started before {} was last changed and has not read it; restart the sshd service",
+                "sshd was started before {} was last changed and has not read it; `ssh-broker apply` restarts it, or \
+                 restart the sshd service",
                 file.display()
             ),
         ),
@@ -304,7 +310,7 @@ pub fn accepts_row(
             true,
             format!(
                 "{in_force_as}; {}'s change time is ahead of the clock, so whether the running sshd has read it \
-                 cannot be told (restart the sshd service to be sure)",
+                 cannot be told (`ssh-broker apply` restarts it to be sure, or restart the sshd service)",
                 file.display()
             ),
         ),
@@ -313,7 +319,7 @@ pub fn accepts_row(
             true,
             format!(
                 "{in_force_as}; {} has `{line}`, so whether the running sshd has read its configuration cannot be \
-                 told (restart the sshd service to be sure)",
+                 told (`ssh-broker apply` restarts it to be sure, or restart the sshd service)",
                 file.display()
             ),
         ),

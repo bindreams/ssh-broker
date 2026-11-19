@@ -48,7 +48,6 @@ mod stand_in;
 use account_fixture::{Account, ServiceLogon};
 use agent_conn::{BackgroundAgent, local_account};
 use install::{Install, OPENSSH_KEY, reg};
-use sshd_rig::restart_sshd;
 use stand_in::Kit;
 
 /// How long a scheduled start may take before the test calls it failed; the start is an external event.
@@ -632,11 +631,6 @@ fn apply_then_verify_for_an_administrator_shows_an_elevated_session_and_an_unele
         String::from_utf8_lossy(&applied.stdout),
         String::from_utf8_lossy(&applied.stderr)
     );
-    // `apply` changed sshd's configuration and does not restart sshd, and `verify` fails its sshd row until the
-    // service has started after the last write. Restarting it is the administrator's step, taken here by the
-    // rig; the unit that makes `apply` restart sshd removes this line.
-    restart_sshd();
-
     // An administrator whose task starts the agent: a batch logon, which gives the full token.
     let admin = Account::create("vf1", true);
     admin.make_administrator();

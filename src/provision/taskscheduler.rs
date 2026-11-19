@@ -23,13 +23,15 @@ use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize,
 };
 use windows::Win32::System::TaskScheduler::{
-    IRegisteredTask, ITaskService, TASK_CREATE_OR_UPDATE, TASK_LOGON_PASSWORD, TASK_RUN_USE_SESSION_ID, TaskScheduler,
+    IRegisteredTask, ITaskService, TASK_CREATE_OR_UPDATE, TASK_LOGON_PASSWORD, TASK_LOGON_SERVICE_ACCOUNT,
+    TASK_RUN_USE_SESSION_ID, TaskScheduler,
 };
 use windows::Win32::System::Variant::VARIANT;
 use windows::core::{BSTR, HRESULT, Interface};
 
 use super::password_variant::PasswordVariant;
-use super::procwait::{self, Process};
+use super::procwait::{self, Process, Role};
+use super::schtasks::WaitOutcome;
 use super::session_task::TaskState;
 use crate::password_entry::Password;
 
@@ -135,7 +137,7 @@ pub fn stop_instances(task_name: &str, image: &Path) -> anyhow::Result<()> {
         task_name,
         procwait::EXIT_BOUND,
         || set_task_enabled(&task, task_name, false),
-        || running_instances(&task, image),
+        || running_instances(&task, |pid| procwait::open_if_image(pid, image)),
         // SAFETY: `task` is a live interface on this thread; `Stop` takes no pointers. The raw
         // vtable call keeps the HRESULT, which the generated wrapper turns into `Ok` for S_FALSE.
         || {
@@ -225,33 +227,54 @@ fn describe_instances(pids: &[u32]) -> String {
     each.join(", ")
 }
 
-/// The running instances of `task`, and the processes among them that run `image`. An instance
-/// whose process is gone, or is not `image`, has nothing to wait for.
-fn running_instances(task: &IRegisteredTask, image: &Path) -> anyhow::Result<Instances<Process>> {
+/// The running instances of `task`, and the processes among them that `open` takes for the task's. An instance
+/// whose process has exited, or is not the task's (its pid is another process's now), has ended: see
+/// [`instances_of`].
+fn running_instances(
+    task: &IRegisteredTask,
+    open: impl FnMut(u32) -> anyhow::Result<Option<Process>>,
+) -> anyhow::Result<Instances<Process>> {
     // SAFETY: `task` and the interfaces taken from it are live and used on this thread only.
-    unsafe {
+    let pids = unsafe {
         let instances = task.GetInstances(0).context("list the running instances")?;
         let count = instances.Count().context("count the running instances")?;
-        let mut found = Vec::new();
         let mut pids = Vec::new();
         // The collection is indexed from 1.
         for index in 1..=count {
             let instance = instances
                 .get_Item(&VARIANT::from(index))
                 .with_context(|| format!("read running instance {index}"))?;
-            let pid = instance.EnginePID().context("read the process of a running instance")?;
-            pids.push(pid);
-            if pid == 0 {
-                continue;
-            }
-            found.extend(procwait::open_if_image(pid, image)?);
+            pids.push(instance.EnginePID().context("read the process of a running instance")?);
         }
-        Ok(Instances {
-            count: usize::try_from(count).unwrap_or(0),
-            pids,
-            processes: found,
-        })
+        pids
+    };
+    instances_of(pids, open)
+}
+
+/// The instances among `listed`, the engine's process id of each (0 for one it has not launched). An instance
+/// whose process `open` finds gone is no instance: the engine can list one a while after its process exited,
+/// and it will never be launched. An instance that is not launched yet is one, and has no process to wait for.
+fn instances_of<P>(
+    listed: Vec<u32>,
+    mut open: impl FnMut(u32) -> anyhow::Result<Option<P>>,
+) -> anyhow::Result<Instances<P>> {
+    let mut pids = Vec::new();
+    let mut processes = Vec::new();
+    for pid in listed {
+        if pid == 0 {
+            pids.push(pid);
+            continue;
+        }
+        if let Some(process) = open(pid)? {
+            pids.push(pid);
+            processes.push(process);
+        }
     }
+    Ok(Instances {
+        count: pids.len(),
+        pids,
+        processes,
+    })
 }
 
 /// What `Stop` returned. `S_FALSE` is a success code ("the user cannot successfully stop instances
@@ -322,6 +345,97 @@ pub fn register_password_task(
     }
     .with_context(|| format!("register the task {name} for {account}"))?;
     Ok(())
+}
+
+/// Register (or replace) a task that runs as SYSTEM, from the definition `xml`, with the DACL `sddl`.
+pub fn register_system_task(name: &str, xml: &str, sddl: &str) -> anyhow::Result<()> {
+    let _com = Com::init()?;
+    let service = connect()?;
+    // SAFETY: as in `connect`; every argument outlives the call.
+    unsafe {
+        service
+            .GetFolder(&BSTR::from("\\"))
+            .context("open the root task folder")?
+            .RegisterTask(
+                &BSTR::from(name),
+                &BSTR::from(xml),
+                TASK_CREATE_OR_UPDATE.0,
+                &VARIANT::from(super::schtasks::SYSTEM_SID),
+                &VARIANT::default(),
+                TASK_LOGON_SERVICE_ACCOUNT,
+                &VARIANT::from(sddl),
+            )
+    }
+    .with_context(|| format!("register the task {name} for SYSTEM"))?;
+    Ok(())
+}
+
+/// Return once the task `name` has no instance: the processes of its instances (running `image` as `role`, which
+/// is the task's own verb: the exe is also the shim and the agent) have exited. The engine may still list an
+/// instance whose process has exited, and that listing is not waited for: the end is the processes', not the
+/// listing's. A task that does not exist has none. Nothing stops the task and nothing bounds the wait for a
+/// process that was launched: its exit is the kernel's and the task's to bring about.
+///
+/// An instance the Task Scheduler lists and has not launched is looked at again. That is waiting for an
+/// external event that may never come, so the failure bound [`procwait::EXIT_BOUND`] counts from the first
+/// look that finds only such instances, and its expiry is [`WaitOutcome::NeverLaunched`]: it proves nothing of
+/// what the instance will do.
+///
+/// `waiting` is called once, on the first listing that finds an instance, before the wait: a task that is not
+/// registered, or whose listing finds none, ends the wait without it.
+pub fn wait_for_instances(
+    name: &str,
+    image: &Path,
+    role: Role,
+    waiting: &mut dyn FnMut(),
+) -> anyhow::Result<WaitOutcome> {
+    let _com = Com::init()?;
+    let service = connect()?;
+    let Some(task) = registered_task(&service, name)? else {
+        return Ok(WaitOutcome::Ended);
+    };
+    wait_until_ended(
+        procwait::EXIT_BOUND,
+        || running_instances(&task, |pid| procwait::open_if_image_in_role(pid, image, role)),
+        |processes| processes.iter().try_for_each(Process::wait_for_exit),
+        || std::thread::sleep(Duration::from_millis(procwait::BETWEEN_LOOKS.into())), // sleep-ok: the pause between two looks; its expiry proves nothing
+        waiting,
+    )
+}
+
+/// The loop of [`stop_and_wait`] without the stop: list the instances, wait for the processes among them, list
+/// again, until a listing finds none. An instance that has no process to wait for is looked at again after
+/// `pause`, the pause between two looks (its expiry proves nothing, so it is no bound); `bound` runs from the
+/// first such look since a process was last waited for. `waiting` is called once, on the first listing that
+/// finds an instance.
+fn wait_until_ended<P>(
+    bound: Duration,
+    mut list: impl FnMut() -> anyhow::Result<Instances<P>>,
+    mut wait: impl FnMut(Vec<P>) -> anyhow::Result<()>,
+    mut pause: impl FnMut(),
+    waiting: &mut dyn FnMut(),
+) -> anyhow::Result<WaitOutcome> {
+    let mut never_launched_since: Option<Instant> = None;
+    let mut said = false;
+    loop {
+        let instances = list()?;
+        if instances.count == 0 {
+            return Ok(WaitOutcome::Ended);
+        }
+        if !std::mem::replace(&mut said, true) {
+            waiting();
+        }
+        if !instances.processes.is_empty() {
+            never_launched_since = None;
+            wait(instances.processes)?;
+            continue;
+        }
+        let since = *never_launched_since.get_or_insert_with(Instant::now);
+        if since.elapsed() >= bound {
+            return Ok(WaitOutcome::NeverLaunched { count: instances.count });
+        }
+        pause();
+    }
 }
 
 /// The auto-login tasks (`ssh-broker-session-*`) and whether each is enabled.

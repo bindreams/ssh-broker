@@ -33,6 +33,7 @@ pub mod session_task;
 #[cfg(windows)]
 pub mod sessions;
 pub mod sshd_config;
+pub mod sshd_task;
 #[cfg(windows)]
 pub(crate) mod system_config;
 #[cfg(windows)]
@@ -46,6 +47,15 @@ pub fn apply() -> anyhow::Result<()> {
     return imp::apply();
     #[cfg(not(windows))]
     anyhow::bail!("apply provisions a Windows host and runs only on Windows");
+}
+
+/// `apply-sshd`: the hidden verb of the task `apply` hands its sshd step to, which runs as SYSTEM: the step,
+/// with each line it says written to the report that `apply` prints. Never invoked directly by users.
+pub fn apply_sshd() -> anyhow::Result<()> {
+    #[cfg(windows)]
+    return imp::apply_sshd();
+    #[cfg(not(windows))]
+    anyhow::bail!("apply-sshd runs only on Windows");
 }
 
 /// `verify` subcommand: local state checks + parity probes through the agent. Windows-only.
@@ -158,9 +168,10 @@ mod imp {
     use super::registry::SshdShell;
     use super::{
         apply_lock, flow, path_env, probe, probe_run, procwait, registry, report, schtasks, session_rows, session_task,
-        sessions, sshd_config, system_config, taskscheduler, user_rows,
+        sessions, sshd_config, sshd_task, system_config, taskscheduler, user_rows,
     };
     use anyhow::Context;
+    use std::io::Write as _;
     use std::path::{Path, PathBuf};
 
     /// Case-insensitive compare of a registry path string (quotes trimmed) to a path.
@@ -194,6 +205,17 @@ mod imp {
         let base = layout::ensure_base(&layout)?;
         let _apply_lock = apply_lock::acquire(&layout.apply_lock_path(), || {
             eprintln!("apply: another apply or an auto-login command is running; waiting for it to finish")
+        })?;
+        // An earlier `apply`'s sshd step is the rest of its run, and outlives its process: it is waited for
+        // before this run touches anything.
+        // A closed stderr loses a line and nothing else; `eprintln!` would panic on it.
+        flow::wait_for_earlier_sshd_step(&mut |line| drop(writeln!(std::io::stderr(), "{line}")), |waiting| {
+            taskscheduler::wait_for_instances(
+                schtasks::APPLY_SSHD_TASK,
+                &layout.canonical_exe(),
+                procwait::Role::ApplySshd,
+                waiting,
+            )
         })?;
         let exe = flow::run(
             || {
@@ -238,11 +260,23 @@ mod imp {
         )?;
         println!("apply: ok — DefaultShell -> {}, agent task installed", exe.display());
 
-        // 5. sshd accepts SSH_BROKER_ELEVATION. LAST: it says whether the running sshd has read the
-        //    change, and an sshd that has not needs a restart, which this step does not make. It never
-        //    fails `apply`: the variable is a convenience, and `ssh-broker elevate` works without it.
-        sshd_config::machine::configure_this_machine(&mut |line| println!("{line}"));
+        // 5. sshd accepts SSH_BROKER_ELEVATION. LAST: an sshd that has not read the change is
+        //    restarted, and `apply` run over SSH restarts the sshd that carries its own connection, so
+        //    the step is the installed exe's task, which finishes even if this `apply` is ended. It
+        //    never fails `apply`: the variable is a convenience, and `ssh-broker elevate` works
+        //    without it.
+        // A closed stdout (an `apply` over an SSH connection that has gone) loses a line and nothing else, and
+        // the report file holds the lines; `println!` would panic on it.
+        sshd_task::hand_over_sshd_step(&layout, &exe, &mut |line| drop(writeln!(std::io::stdout(), "{line}")));
         Ok(())
+    }
+
+    /// `apply-sshd`: see [`super::apply_sshd`]. The step never fails; what fails is the report.
+    pub fn apply_sshd() -> anyhow::Result<()> {
+        let report = Layout::production().apply_sshd_report_path();
+        sshd_task::write_report(&report, |say| {
+            sshd_config::machine::configure_this_machine(say);
+        })
     }
 
     /// Append the install directory to the machine's `PATH`, so that a session finds `ssh-broker` by name.

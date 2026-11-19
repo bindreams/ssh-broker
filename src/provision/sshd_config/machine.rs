@@ -20,18 +20,21 @@ use windows::Win32::Storage::FileSystem::{
 };
 use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::System::Services::{
-    CloseServiceHandle, OpenSCManagerW, OpenServiceW, QueryServiceStatusEx, SC_HANDLE, SC_MANAGER_CONNECT,
-    SC_STATUS_PROCESS_INFO, SERVICE_QUERY_STATUS, SERVICE_STATUS_PROCESS, SERVICE_STOPPED,
+    CloseServiceHandle, SC_HANDLE, SERVICE_QUERY_STATUS, SERVICE_STATUS_PROCESS, SERVICE_STOPPED,
 };
 use windows::Win32::System::Threading::GetProcessTimes;
 use windows::Win32::UI::Shell::{FOLDERID_ProgramData, KF_FLAG_DEFAULT, SHGetKnownFolderPath};
-use windows::core::{PCWSTR, w};
+use windows::core::PCWSTR;
 
 use super::configure::{ConfigFile, ConfigFiles, DropInProblem, SshdHost, config_read, configure};
+use super::restart::{ServiceState, StartOutcome, StopOutcome};
 use super::{DROP_IN_DIR_NAME, DROP_IN_NAME, SshdReading};
 use crate::acl;
 use crate::provision::procwait::Process;
 use crate::provision::{registry, system_config};
+
+mod listening;
+mod service;
 
 /// The candidate `sshd_config`, beside the original so that the rename that replaces it stays on one volume.
 const CANDIDATE_NAME: &str = "sshd_config.ssh-broker-new";
@@ -42,6 +45,8 @@ struct Machine {
     sshd: PathBuf,
     /// The text after the program in that `ImagePath`, when there is some.
     arguments: Option<String>,
+    /// The service as the controls and waits of the restart use it, opened when the first of them is asked.
+    service: Option<service::SshdService>,
 }
 
 impl Machine {
@@ -54,7 +59,15 @@ impl Machine {
             ssh_dir: program_data_dir()?.join("ssh"),
             sshd: PathBuf::from(sshd),
             arguments: system_config::image_arguments(&image).map(str::to_owned),
+            service: None,
         })
+    }
+
+    fn service(&mut self) -> anyhow::Result<&service::SshdService> {
+        if self.service.is_none() {
+            self.service = Some(service::SshdService::open()?);
+        }
+        Ok(self.service.as_ref().expect("opened above"))
     }
 
     fn config(&self) -> PathBuf {
@@ -122,6 +135,25 @@ impl SshdHost for Machine {
             None => Ok(None),
             Some(process) => process_started(&process).map(Some),
         }
+    }
+
+    fn settled(&mut self) -> anyhow::Result<ServiceState> {
+        self.service()?.settled()
+    }
+
+    fn stop(&mut self, unanswered: &mut dyn FnMut(&str)) -> anyhow::Result<StopOutcome> {
+        self.service()?.stop(unanswered)
+    }
+
+    fn start(&mut self) -> StartOutcome {
+        self.service()
+            .expect("the flow reads the state, and so opens the service, before it sends a start")
+            .start()
+    }
+
+    fn remove_drop_in(&mut self) -> anyhow::Result<()> {
+        let path = self.drop_in();
+        std::fs::remove_file(&path).with_context(|| format!("remove {}", path.display()))
     }
 
     fn now(&self) -> SystemTime {
@@ -351,6 +383,16 @@ fn program_data_dir() -> anyhow::Result<PathBuf> {
 /// Closes a service handle.
 struct ScHandle(SC_HANDLE);
 
+impl ScHandle {
+    /// Close the handle and say whether the service manager closed it; the drop's close discards that.
+    fn close(self) -> windows::core::Result<()> {
+        let handle = self.0;
+        std::mem::forget(self);
+        // SAFETY: the handle was opened by `OpenSCManagerW` or `OpenServiceW`; `forget` leaves this the only close.
+        unsafe { CloseServiceHandle(handle) }
+    }
+}
+
 impl Drop for ScHandle {
     fn drop(&mut self) {
         // SAFETY: the handle was opened by `OpenSCManagerW` or `OpenServiceW` and is closed once.
@@ -360,27 +402,8 @@ impl Drop for ScHandle {
 
 /// What the service manager says about the sshd service: its state and the id of its process.
 fn query_sshd() -> anyhow::Result<SERVICE_STATUS_PROCESS> {
-    // SAFETY: null names mean this machine and the active database; the handles are closed by their guards.
-    let manager = ScHandle(
-        unsafe { OpenSCManagerW(PCWSTR::null(), PCWSTR::null(), SC_MANAGER_CONNECT) }
-            .context("open the service manager")?,
-    );
-    // SAFETY: `manager` is open; the name is a NUL-terminated literal.
-    let service = ScHandle(
-        unsafe { OpenServiceW(manager.0, w!("sshd"), SERVICE_QUERY_STATUS) }.context("open the sshd service")?,
-    );
-    let mut status = SERVICE_STATUS_PROCESS::default();
-    let mut needed = 0u32;
-    // SAFETY: the buffer is `status`, whole, and lives as long as the call.
-    let queried = unsafe {
-        let buffer = std::slice::from_raw_parts_mut(
-            (&raw mut status).cast::<u8>(),
-            std::mem::size_of::<SERVICE_STATUS_PROCESS>(),
-        );
-        QueryServiceStatusEx(service.0, SC_STATUS_PROCESS_INFO, Some(buffer), &mut needed)
-    };
-    queried.context("ask the service manager about sshd")?;
-    Ok(status)
+    let (_manager, service) = service::open_handles(SERVICE_QUERY_STATUS)?;
+    service::query(&service)
 }
 
 /// The id of the process the sshd service runs in; `None` when the service has none.
@@ -434,9 +457,9 @@ fn system_time(filetime: FILETIME) -> anyhow::Result<SystemTime> {
 
 // this machine =====
 
-/// `apply`'s sshd step on this machine: see [`configure`]. It never fails and never restarts sshd: what it
-/// could not do is said on `say`. Whether the running sshd takes the variable (or reads it when it next
-/// starts) is returned.
+/// `apply`'s sshd step on this machine: see [`configure`]. It never fails: what it could not do is said on
+/// `say`. An sshd that has not read the change is restarted through the service manager. Whether the running
+/// sshd takes the variable (or reads it when it next starts) is returned.
 pub fn configure_this_machine(say: &mut dyn FnMut(&str)) -> bool {
     match Machine::find() {
         Ok(mut machine) => configure(&mut machine, say),
@@ -448,6 +471,12 @@ pub fn configure_this_machine(say: &mut dyn FnMut(&str)) -> bool {
             false
         }
     }
+}
+
+/// This machine's sshd as [`SshdHost`], for a caller that drives its methods itself: the CI test that measures
+/// the service manager's states through `settled`, `stop` and `start`.
+pub fn sshd_host_of_this_machine() -> anyhow::Result<impl SshdHost> {
+    Machine::find().context("cannot find sshd")
 }
 
 /// What the `verify` row is given about sshd on this machine: `sshd -T` (which needs the rights to read sshd's

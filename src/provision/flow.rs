@@ -1,7 +1,43 @@
 //! The shape of `apply`: install, then bring agents back. Held apart from the Windows calls so
 //! the failure paths can be tested with stand-ins.
 
-use super::procwait::{StillRunning, Survivor};
+use anyhow::Context;
+
+use super::procwait::{self, StillRunning, Survivor};
+use super::schtasks::{APPLY_SSHD_TASK, WaitOutcome, end_and_remove_apply_sshd_task};
+use super::sshd_config::CHECK_SSHD;
+
+/// The wait, at the start of `apply` and right after its lock, for the sshd step of an earlier `apply`.
+///
+/// The lock makes one `apply` run at a time for its whole run, and an earlier `apply` that was ended after its
+/// hand-over has the sshd step as the rest of that run: its task's instance outlives its process, running the
+/// installed exe, and ending it between its stop of sshd and its start would leave sshd stopped. So it is waited
+/// for, with no bound once it has launched, before this run stops, replaces or reads anything it works on.
+/// `wait` is given the function that says the wait has begun, and calls it when it finds an earlier step; it
+/// returns when the instances have ended. An instance the Task Scheduler never launched stops `apply`, as a
+/// task that never clears does in `stop_instances`: nothing goes on beside an instance that may still start.
+pub fn wait_for_earlier_sshd_step(
+    say: &mut dyn FnMut(&str),
+    wait: impl FnOnce(&mut dyn FnMut()) -> anyhow::Result<WaitOutcome>,
+) -> anyhow::Result<()> {
+    let outcome = wait(&mut || {
+        say(&format!(
+            "apply: an earlier apply's sshd step is still running (the task {APPLY_SSHD_TASK}); waiting for it to \
+             finish"
+        ))
+    })
+    .context("wait for an earlier apply's sshd step")?;
+    match outcome {
+        WaitOutcome::Ended => Ok(()),
+        WaitOutcome::NeverLaunched { count } => anyhow::bail!(
+            "the Task Scheduler lists {count} instance(s) of the task {APPLY_SSHD_TASK} that it has not started \
+             after {} s, so apply went no further. End and remove the task {}; if the step has started meanwhile, \
+             ending it can leave sshd stopped. {CHECK_SSHD} Then run apply again",
+            procwait::EXIT_BOUND.as_secs(),
+            end_and_remove_apply_sshd_task()
+        ),
+    }
+}
 
 /// Run `install`, then `start` the agents.
 ///
