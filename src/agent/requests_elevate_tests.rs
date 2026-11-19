@@ -118,17 +118,24 @@ impl Client {
             }
         }
     }
-}
 
-impl Client {
     /// Read frames until the session's `Exit`, which is kept in `exit`.
     fn read_to_exit(&mut self) {
-        while self.exit.is_none() {
-            let frame = read_one_frame(&mut self.rx, &mut self.frames)
-                .unwrap_or_else(|e| panic!("the session ended before its exit code ({e:#})"));
-            if frame.kind == FrameKind::Exit {
-                self.exit = Some(crate::protocol::ExitCode::decode(&frame.payload).unwrap().0);
-            }
+        if self.exit.is_none() {
+            self.exit = Some(read_until_exit(&mut self.rx, &mut self.frames).1);
+        }
+    }
+}
+
+/// Read frames from `rx` until an `Exit`: the kinds of the frames in the order they came, and the code.
+fn read_until_exit(rx: &mut ConnRx, frames: &mut FrameReader) -> (Vec<FrameKind>, i32) {
+    let mut kinds = Vec::new();
+    loop {
+        let frame = read_one_frame(rx, frames)
+            .unwrap_or_else(|e| panic!("the connection ended before its exit code ({e:#}); frames: {kinds:?}"));
+        kinds.push(frame.kind);
+        if frame.kind == FrameKind::Exit {
+            return (kinds, crate::protocol::ExitCode::decode(&frame.payload).unwrap().0);
         }
     }
 }
@@ -142,6 +149,11 @@ struct Hosting {
 }
 
 fn host(tag: &str, mode: Mode, policy: ElevationPolicy) -> Hosting {
+    host_running(tag, mode, policy, "cmd.exe /d /c findstr x")
+}
+
+/// [`host`], with `command` as the session's own program.
+fn host_running(tag: &str, mode: Mode, policy: ElevationPolicy, command: &str) -> Hosting {
     let control = Arc::new(Control::standalone());
     let (server, client, _dir) = a_pair(tag);
     let handler = std::thread::spawn({
@@ -152,7 +164,7 @@ fn host(tag: &str, mode: Mode, policy: ElevationPolicy) -> Hosting {
     let hs = Handshake {
         mode,
         launch: Launch::Direct,
-        command: Some("cmd.exe /d /c findstr x".to_owned()),
+        command: Some(command.to_owned()),
         elevation: Some(policy),
         ..Handshake::pty_default()
     };
@@ -277,15 +289,7 @@ impl Pending {
 
     /// Read frames until the command's `Exit`: the kinds of the frames in the order they came, and the code.
     fn read_to_exit(&mut self) -> (Vec<FrameKind>, i32) {
-        let mut kinds = Vec::new();
-        loop {
-            let frame = read_one_frame(&mut self.rx, &mut self.frames)
-                .unwrap_or_else(|e| panic!("the request ended before its exit code ({e:#}); frames: {kinds:?}"));
-            kinds.push(frame.kind);
-            if frame.kind == FrameKind::Exit {
-                return (kinds, crate::protocol::ExitCode::decode(&frame.payload).unwrap().0);
-            }
-        }
+        read_until_exit(&mut self.rx, &mut self.frames)
     }
 
     /// The client goes away, as an `elevate` does that is ended: both halves close. Returns what the handler ended
@@ -841,6 +845,27 @@ fn a_sessions_end_ends_the_terminal_command_it_hosts_even_a_silent_one_and_the_s
     assert_ne!(code, 77, "the command ran to its own end");
     session.client.read_to_exit();
     assert!(session.client.exit.is_some(), "the session got its exit code");
+    let _ = pending.hang_up();
+    session.leave();
+}
+
+/// The `None` of `Link::host_elevated` seen from a request: a command asked for after the session's shell has gone is
+/// started, answered `Serving` and ended at once, as one hosted when the session ended is. The session's client stays
+/// connected, so its handler is still there to be asked.
+#[test]
+fn a_terminal_command_asked_for_after_the_shell_has_gone_is_ended_at_once() {
+    let _serial = serial();
+    let mut session = host_running("late", Mode::Pty, ElevationPolicy::AutoApprove, &cmd("/d /c exit /b 0"));
+    // The session's `Exit` is written after its shell is gone and nothing more can be hosted.
+    session.client.read_to_exit();
+
+    // Would end by itself with 77 after twenty seconds.
+    let long = cmd("/d /c \"ping -n 20 127.0.0.1 >nul & exit /b 77\"");
+    let mut pending = open(&session.control, "late-ask", on_a_terminal(&session.id, &long));
+    let (kinds, code) = pending.read_to_exit();
+    assert_eq!(kinds.first(), Some(&FrameKind::Serving), "{kinds:?}");
+    assert_ne!(code, 77, "the command ran to its own end");
+    assert_eq!(elevated_starts().len(), 1, "it was started");
     let _ = pending.hang_up();
     session.leave();
 }

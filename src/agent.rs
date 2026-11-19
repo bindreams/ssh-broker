@@ -1350,7 +1350,7 @@ fn handle_pty(
     // The shell is gone and the output is drained, so the code is final and nothing else can still be writing
     // frames. The connection is the session's again by now, if `ssh-broker elevate --terminal` had it: the output
     // pump above could not end before, and `end_hosting` inside `end_pty` ended the command that held it, whoever
-    // asked for it (see `elevation::run_hosted`).
+    // asked for it (see `elevation::run_hosted`), and returned only once that command had given it back.
     show_exit_notice(&link, Mode::Pty, configured.as_ref(), code);
     // FIN the write half only: the input pump keeps reading until the client closes, so for a
     // conforming client the socket never closes with unread input, which would reset it and

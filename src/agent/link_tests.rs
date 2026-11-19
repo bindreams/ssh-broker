@@ -217,22 +217,30 @@ fn after_end_hosting_nothing_is_hosted_and_a_command_that_asks_is_ended_at_once(
     let (wire, session) = (Wire::default(), Arc::new(Recorder::default()));
     let link = terminal_link(&wire, &session);
     let ends = Arc::new(AtomicUsize::new(0));
+    let (on_end, ended) = mpsc::channel();
     let counting = || -> Killer {
-        let ends = Arc::clone(&ends);
+        let (ends, on_end) = (Arc::clone(&ends), on_end.clone());
         Arc::new(move || {
             ends.fetch_add(1, Ordering::SeqCst);
+            let _ = on_end.send(());
         })
     };
 
-    // A hosted command is ended once, and the guard's drop is still what switches back.
+    // A hosted command is ended once, and the guard's drop is still what switches back. `end_hosting` waits for that
+    // drop, so it runs on a thread.
     let guard = link
         .host_elevated(Arc::new(Recorder::default()), counting())
         .expect("hosted");
-    link.end_hosting();
+    let ending = {
+        let link = Arc::clone(&link);
+        std::thread::spawn(move || link.end_hosting())
+    };
+    ended.recv().expect("the hosted command was ended");
     assert_eq!(ends.load(Ordering::SeqCst), 1, "the hosted command was ended");
     link.deliver(Carrier::Elevated, Stream::Pty, b"last words")
         .expect("the hosted command still has the screen until its guard drops");
     drop(guard);
+    ending.join().unwrap();
     assert_eq!(ends.load(Ordering::SeqCst), 1, "the guard's drop ends nothing");
 
     // A command that asks now is refused hosting and ended at once.
@@ -249,6 +257,49 @@ fn after_end_hosting_nothing_is_hosted_and_a_command_that_asks_is_ended_at_once(
     link.route_input(b"k").unwrap();
     assert_eq!(wire.data(), ["Plast words", "Psession"], "nothing else was written");
     assert_eq!(session.events().last().map(String::as_str), Some("input k"));
+}
+
+/// The session's end gives the connection to `send_exit` only once the command it hosted has given it back: its last
+/// output is written before the session's `Exit`. The order is read off one channel the three parties send on: the
+/// command's `end`, the guard's holder just before it drops the guard, and the thread that called `end_hosting`
+/// just after the call.
+#[test]
+fn end_hosting_returns_only_when_the_hosted_command_has_given_the_connection_back() {
+    let (wire, session) = (Wire::default(), Arc::new(Recorder::default()));
+    let link = terminal_link(&wire, &session);
+    let (events, order) = mpsc::channel::<&'static str>();
+    let end: Killer = {
+        let events = events.clone();
+        Arc::new(move || {
+            let _ = events.send("end");
+        })
+    };
+    let guard = link.host_elevated(Arc::new(Recorder::default()), end).expect("hosted");
+
+    let ending = {
+        let (link, events) = (Arc::clone(&link), events.clone());
+        std::thread::spawn(move || {
+            link.end_hosting();
+            let _ = events.send("returned");
+        })
+    };
+    assert_eq!(order.recv().unwrap(), "end", "the hosted command was ended");
+
+    // The command's teardown is still running: it writes its last words, then gives the connection back.
+    link.deliver(Carrier::Elevated, Stream::Pty, b"last words")
+        .expect("the hosted command still has the screen");
+    let _ = events.send("released");
+    drop(guard);
+    ending.join().unwrap();
+
+    assert_eq!(order.try_iter().collect::<Vec<_>>(), ["released", "returned"]);
+    link.send_exit(0);
+    assert_eq!(
+        wire.frames().last().map(|(kind, _)| *kind),
+        Some(FrameKind::Exit),
+        "nothing is written after the Exit"
+    );
+    assert_eq!(wire.data(), ["Plast words"]);
 }
 
 #[test]

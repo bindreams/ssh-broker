@@ -111,6 +111,21 @@ fn the_programs_own_name_may_be_partly_quoted() {
     assert_eq!(after_args(r#"C:\"never closed elevate whoami"#, 1), "");
 }
 
+/// The runtime does not trim the line before it reads argv[0]: a line that starts with a blank has an EMPTY program
+/// name, and the arguments follow it.
+#[test]
+fn a_line_that_starts_with_a_blank_has_an_empty_program_name() {
+    assert_eq!(after_args(" elevate whoami", 1), "whoami");
+    assert_eq!(after_args("\televate whoami /all", 1), "whoami /all");
+    assert_eq!(after_args("  elevate whoami", 0), "elevate whoami");
+    assert_eq!(dash_c_tail(" -c echo hi"), Some("echo hi"));
+    assert_eq!(
+        dash_c_tail(" ssh-broker.exe -c echo hi"),
+        None,
+        "the name is empty and the first argument is not -c"
+    );
+}
+
 #[test]
 fn a_first_terminal_flag_is_skipped_and_a_later_one_kept() {
     let line = r#"ssh-broker.exe elevate --terminal cmd --terminal "x y""#;

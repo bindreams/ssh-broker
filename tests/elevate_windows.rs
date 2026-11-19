@@ -295,8 +295,8 @@ fn with_a_terminal_the_output_is_below_the_typed_line_and_the_prompt_follows() {
 /// its image and by the arguments that test gave it, and held open. This process is elevated, so it can read the
 /// command line of an elevated process, which the unelevated session cannot. It looks again until the ping is listed:
 /// the command prints its marker just before it starts the ping, so the ping may not be there yet. A process that has
-/// exited between the list and the look is the one routine cause of a failure and is skipped; any other failure is a
-/// panic with its cause.
+/// exited between the list and the look, or is ending (`procwait::Ending`: a ping an earlier test just ended), is
+/// skipped; those are the routine causes of a failure, and any other failure is a panic with its cause.
 fn elevated_ping(arguments: &str) -> procwait::Process {
     loop {
         for entry in process_list::snapshot() {
@@ -311,6 +311,7 @@ fn elevated_ping(arguments: &str) -> procwait::Process {
             match procwait::command_line_of(&process) {
                 Ok(line) if line.contains(arguments) => return process,
                 Ok(_) => {}
+                Err(e) if e.chain().any(|cause| cause.is::<procwait::Ending>()) => {}
                 Err(_) if process.exit_code().is_ok() => {}
                 Err(e) => panic!("could not read the command line of the process {}: {e:#}", entry.pid),
             }

@@ -259,6 +259,11 @@ impl Link {
     /// The session's shell is gone: the command hosted now is ended, and none is hosted after (a command that asks
     /// is ended at once by [`Link::host_elevated`], and a deliver for it fails). It does not switch the connection
     /// back: dropping the guard is the one place that does.
+    ///
+    /// Returns once the connection is the session's again: after it has ended the hosted command, it waits, on a
+    /// condition that is re-checked (no timeout), until the command's own teardown has dropped its guard, so that the
+    /// command's last output is written before the session's `Exit`. Nothing is waited for when nothing was hosted.
+    /// No lock is held across the wait but the state lock the wait releases.
     pub(super) fn end_hosting(&self) {
         let end = {
             let mut state = locked(&self.state);
@@ -267,8 +272,11 @@ impl Link {
         };
         // A deliver of the command's that waits for the screen is told there is none.
         self.changed.notify_all();
-        if let Some(end) = end {
-            end();
+        let Some(end) = end else { return };
+        end();
+        let mut state = locked(&self.state);
+        while state.elevated.is_some() {
+            state = self.changed.wait(state).unwrap_or_else(PoisonError::into_inner);
         }
     }
 

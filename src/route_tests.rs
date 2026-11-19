@@ -4,10 +4,11 @@
 //! `route` receives is derived from it the way the C runtime would.
 
 use super::{AgentArgs, AutoLoginArgs, BackgroundArgs, ProbeLink, Route, Toggle, Verb, route};
-use crate::cmdline::{Encoding, RawExec, after_program, resolve_exec, split_args};
+use crate::cmdline::{Encoding, RawExec, resolve_exec, split_args};
 
 fn route_line(line: &str) -> Route {
-    route(&split_args(after_program(line)), line)
+    let args = split_args(line);
+    route(&args[1..], line)
 }
 
 /// The `-c` route that carries `tail`, the text after `-c` as written.
@@ -198,21 +199,37 @@ fn elevate_carries_the_line_as_written_not_argv() {
     );
 }
 
-/// argv's program name is partly quoted: the text after `elevate` is still cut from where argv put it.
+/// argv's program name is partly quoted, or empty: the text after `elevate` is still cut from where argv put it. The
+/// argv after argv[0] is written out for each line, as the runtime gives it, not derived from the line.
 #[test]
 fn the_programs_own_name_may_be_partly_quoted() {
+    let args = |args: &[&str]| args.iter().map(|a| (*a).to_owned()).collect::<Vec<_>>();
     assert_eq!(
-        route_line(r#"C:\tools\"my bin"\ssh-broker.exe elevate whoami"#),
+        route(
+            &args(&["elevate", "whoami"]),
+            r#"C:\tools\"my bin"\ssh-broker.exe elevate whoami"#
+        ),
         Route::Elevate {
             terminal: false,
             command: "whoami".into()
         }
     );
     assert_eq!(
-        route_line(r#"C:\"a b"\"c d"\ssh-broker.exe elevate whoami /all"#),
+        route(
+            &args(&["elevate", "whoami", "/all"]),
+            r#"C:\"a b"\"c d"\ssh-broker.exe elevate whoami /all"#
+        ),
         Route::Elevate {
             terminal: false,
             command: "whoami /all".into()
+        }
+    );
+    // A line that starts with a blank has an empty argv[0]: `elevate` is the first argument.
+    assert_eq!(
+        route(&args(&["elevate", "whoami"]), " elevate whoami"),
+        Route::Elevate {
+            terminal: false,
+            command: "whoami".into()
         }
     );
 }

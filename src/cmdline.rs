@@ -110,10 +110,10 @@ pub fn split_args(line: &str) -> Vec<String> {
 }
 
 /// The first argument of `s` and what follows it exactly as written (empty, or beginning with a separator), or
-/// `None` when only separators remain. The rule is the one the C runtime applies to every argument but the program
-/// name (`CommandLineToArgvW`'s): quotes toggle anywhere, `\"` is a quote. It is the rule for the program of a
-/// line that is the tail of this process's own command line, which is an argument; see [`split_program`] for the
-/// first token of a line handed to `CreateProcessW`.
+/// `None` when only separators remain. The rule is the C runtime's for every argument but the program name, the one
+/// `std::env::args` applies: quotes toggle anywhere, `\"` is a quote. It is the rule for the program of a line that is
+/// the tail of this process's own command line, which is an argument; see [`split_program`] for the first token of a
+/// line handed to `CreateProcessW`.
 pub fn next_arg(s: &str) -> Option<(String, &str)> {
     let s = s.trim_start_matches(SEPARATORS);
     if s.is_empty() {
@@ -177,9 +177,9 @@ pub fn split_program(line: &str) -> (&str, &str) {
 /// What follows the program name of the process's own command line, which the C runtime reads (argv[0]) by its
 /// rule for the program name: no escapes, quotes toggle anywhere in the name (`C:\"a b"\x.exe` is one name), and
 /// it ends at a separator outside quotes. [`split_program`] is `CreateProcessW`'s rule for a line it is handed:
-/// two rules for two things. A name whose quote is never closed runs to the end.
-pub fn after_program(line: &str) -> &str {
-    let line = line.trim_start_matches(SEPARATORS);
+/// two rules for two things. A name whose quote is never closed runs to the end. The line is not trimmed first: one
+/// that starts with a separator has an empty name, and its arguments follow.
+fn after_program(line: &str) -> &str {
     let mut in_quotes = false;
     for (i, c) in line.char_indices() {
         match c {
