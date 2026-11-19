@@ -6,7 +6,9 @@
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Mutex};
 
-use super::{Encoding, RawExec, dash_c_tail, decode_command, join_args, resolve_exec, split_args};
+use super::{
+    Encoding, RawExec, after_args, dash_c_tail, decode_command, join_args, resolve_exec, split_args, split_program,
+};
 
 fn args(line: &str) -> Vec<String> {
     split_args(line)
@@ -64,6 +66,46 @@ fn dash_c_tail_does_not_unquote_the_command() {
         dash_c_tail(r#"ssh-broker.exe -c "C:\a b\p.exe" "x y""#),
         Some(r#""C:\a b\p.exe" "x y""#)
     );
+}
+
+/// `ssh-broker elevate`'s line is what follows the verb, not argv joined again: quotes, `&`, runs of spaces and
+/// escaped quotes stay as they were typed.
+#[test]
+fn the_text_after_the_verb_is_kept_as_written() {
+    assert_eq!(
+        after_args(r#"ssh-broker.exe elevate cmd /c echo "a&whoami""#, 1),
+        r#"cmd /c echo "a&whoami""#
+    );
+    assert_eq!(
+        after_args(r#""C:\Program Files\ssh-broker.exe"  elevate   p  "a  b"   \"c\"  "#, 1),
+        r#"p  "a  b"   \"c\"  "#,
+        "inner runs of spaces and the end are kept; the separators before the text are not"
+    );
+    assert_eq!(after_args("ssh-broker.exe elevate", 1), "");
+    assert_eq!(after_args("ssh-broker.exe elevate   ", 1), "");
+    assert_eq!(after_args("ssh-broker.exe", 1), "");
+}
+
+#[test]
+fn a_first_terminal_flag_is_skipped_and_a_later_one_kept() {
+    let line = r#"ssh-broker.exe elevate --terminal cmd --terminal "x y""#;
+    assert_eq!(after_args(line, 2), r#"cmd --terminal "x y""#);
+    assert_eq!(after_args(line, 1), r#"--terminal cmd --terminal "x y""#);
+}
+
+#[test]
+fn split_program_takes_a_quoted_program_whole() {
+    assert_eq!(split_program("p.exe /a b"), ("p.exe", " /a b"));
+    assert_eq!(
+        split_program(r#"  "C:\a b\p.exe" /a "b c""#),
+        (r"C:\a b\p.exe", r#" /a "b c""#)
+    );
+    // A program name has no escapes: a quote ends it, a backslash before the quote included.
+    assert_eq!(split_program(r#""C:\dir\" x"#), (r"C:\dir\", " x"));
+    assert_eq!(split_program(r#""unclosed name"#), ("unclosed name", ""));
+    assert_eq!(split_program(r#""p"x"#), ("p", "x"));
+    assert_eq!(split_program("p.exe"), ("p.exe", ""));
+    assert_eq!(split_program(""), ("", ""));
 }
 
 // Escaped: non-PTY with sshd's default argument escaping. The command is one argument, quoted if

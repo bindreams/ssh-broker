@@ -146,6 +146,31 @@ fn input_and_resize_go_to_the_elevated_target_while_it_runs_and_back_after() {
     assert_eq!(elevated.events().len(), 3, "the elevated target gets nothing after");
 }
 
+/// The elevated command's input is closed while its pseudoconsole ends, before the guard drops: a key typed in that
+/// window must not be the session's error, which would make the session's input pump drop every later key.
+#[test]
+fn an_input_error_of_the_elevated_target_is_not_the_sessions_and_the_session_gets_the_next_key() {
+    let (wire, session) = (Wire::default(), Arc::new(Recorder::default()));
+    let link = terminal_link(&wire, &session);
+    let elevated = Arc::new(Recorder::failing());
+    let guard = link.host_elevated(elevated.clone());
+
+    link.route_input(b"x")
+        .expect("the command is ending: its error is not the caller's");
+    assert_eq!(elevated.events(), ["resize 80x24", "input x"], "it was tried");
+    assert_eq!(session.events(), Vec::<String>::new(), "the session got none of it");
+
+    drop(guard);
+    link.route_input(b"y").unwrap();
+    assert_eq!(session.events(), ["resize 80x24", "input y"]);
+
+    // The session's own target's error is still the caller's.
+    let failing = Arc::new(Recorder::failing());
+    let link = terminal_link(&Wire::default(), &failing);
+    link.route_input(b"z")
+        .expect_err("an error of the session's own input is returned");
+}
+
 #[test]
 fn the_size_at_the_switch_is_applied_to_the_new_target() {
     let (wire, session, elevated) = (

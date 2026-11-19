@@ -170,14 +170,21 @@ impl Link {
 
     /// Send the client's keys to whichever target is current: the elevated command's while it runs, else the
     /// session's. Takes no lock the connection's writes hold, and none while it writes to the target.
+    ///
+    /// An error is the session's own target's. The elevated command's input fails when the command is ending (its
+    /// pseudoconsole is closed while it is still current), which is no fault of the session: the keys are dropped,
+    /// and the caller, which stops delivering input for good on an error, goes on.
     pub(super) fn route_input(&self, bytes: &[u8]) -> anyhow::Result<()> {
-        let target = {
-            let state = locked(&self.state);
-            state.elevated.clone().or_else(|| self.session.clone())
-        };
-        match target {
-            Some(target) => target.input(bytes),
-            None => Ok(()),
+        let elevated = locked(&self.state).elevated.clone();
+        match (elevated, &self.session) {
+            (Some(target), _) => {
+                if let Err(e) = target.input(bytes) {
+                    tracing::debug!("the elevated command is ending; dropped its keys: {e:#}");
+                }
+                Ok(())
+            }
+            (None, Some(target)) => target.input(bytes),
+            (None, None) => Ok(()),
         }
     }
 

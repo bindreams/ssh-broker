@@ -166,6 +166,24 @@ pub fn elevation_cannot_start(cause: &str) -> String {
     format!("ssh-broker: the command could not be started elevated: {cause}\r\n")
 }
 
+/// The command ran, and how it ended could not be read: the agent could not wait for it, or the client lost the
+/// reply after the agent had said the command started. `cause` is why.
+pub fn elevation_end_unread(cause: &str) -> String {
+    format!("ssh-broker: the command ran, and its end could not be read: {cause}\r\n")
+}
+
+/// The agent's answer to a request could not be read: bytes came, and they were neither a refusal nor a command that
+/// started. `cause` is why.
+pub fn elevation_answer_unreadable(cause: &str) -> String {
+    format!("ssh-broker: the agent's answer could not be read ({cause}); the command may or may not have run.\r\n")
+}
+
+/// What a client says when the agent ended the connection before it answered a command (the shim's, and
+/// `elevate`'s): a command is never sent again, since the agent may have started it. No line terminator.
+pub fn agent_ended_unanswered() -> &'static str {
+    "ssh-broker: the agent ended before it answered; the command may or may not have run"
+}
+
 /// `elevate` in a session of an account whose agent runs below High, which has no request socket.
 pub fn elevation_needs_high_agent() -> String {
     "ssh-broker: elevate needs an account whose agent runs at High, and this account's agent does not.\r\n".to_owned()

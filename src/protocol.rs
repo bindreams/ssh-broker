@@ -335,7 +335,7 @@ pub struct ElevationRequest {
     pub version: u16,
     /// The caller's [`SESSION_VARIABLE`], as it shows a [`SessionId`].
     pub session: String,
-    /// The command line to run, as `cmdline::join_args` builds it.
+    /// The line as typed after `elevate`, its program replaced by the quoted absolute path the client found.
     pub command: String,
     /// The working directory to run it in.
     pub cwd: String,
@@ -363,8 +363,9 @@ impl ElevationRequest {
     }
 
     /// The session this request names, if the request is one the agent may act on: a [`SessionId`], a command that
-    /// is not empty, a command and a working directory of at most [`MAX_ELEVATION_UNITS`] UTF-16 units, and no NUL
-    /// anywhere. The error says which field.
+    /// is not empty and whose program is an absolute path (the file is not looked for: starting it reports that), a
+    /// command and a working directory of at most [`MAX_ELEVATION_UNITS`] UTF-16 units, and no NUL anywhere. The
+    /// error says which field.
     pub fn check(&self) -> anyhow::Result<SessionId> {
         let session = SessionId::parse(&self.session)
             .ok_or_else(|| anyhow::anyhow!("the session is not a session id of this program"))?;
@@ -377,6 +378,11 @@ impl ElevationRequest {
                 "the {field} is {units} UTF-16 units, over the limit of {MAX_ELEVATION_UNITS}"
             );
         }
+        let (program, _) = crate::cmdline::split_program(&self.command);
+        anyhow::ensure!(
+            crate::shell::is_absolute_windows(std::path::Path::new(program)),
+            "the program of the command is not an absolute path: {program:?}"
+        );
         Ok(session)
     }
 }

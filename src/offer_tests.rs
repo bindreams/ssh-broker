@@ -404,6 +404,18 @@ fn the_elevate_sentences_are_each_whole() {
          out --terminal to run the command with its output here and its input closed.\r\n"
     );
     assert_eq!(
+        text::elevation_end_unread("sink failed: gone"),
+        "ssh-broker: the command ran, and its end could not be read: sink failed: gone\r\n"
+    );
+    assert_eq!(
+        text::elevation_answer_unreadable("protocol error: x"),
+        "ssh-broker: the agent's answer could not be read (protocol error: x); the command may or may not have run.\r\n"
+    );
+    assert_eq!(
+        text::agent_ended_unanswered(),
+        "ssh-broker: the agent ended before it answered; the command may or may not have run"
+    );
+    assert_eq!(
         text::elevate_usage(),
         "usage: ssh-broker elevate [--terminal] <command> [arguments]"
     );
@@ -420,6 +432,8 @@ fn every_elevate_refusal_is_one_prefixed_line_ending_in_crlf() {
         text::elevation_cannot_start("why"),
         text::elevation_needs_high_agent(),
         text::elevation_needs_a_terminal(),
+        text::elevation_end_unread("why"),
+        text::elevation_answer_unreadable("why"),
     ] {
         assert!(line.starts_with("ssh-broker: ") && line.ends_with("\r\n"), "{line:?}");
         assert_eq!(line.matches('\n').count(), 1, "{line:?}");

@@ -39,6 +39,27 @@ impl FrameSink for ReplySink<'_> {
     }
 }
 
+/// Send the request `payload` as a frame of `kind`. `Err` is how asking ended without an answer to wait for: the
+/// peer had closed ([`Asked::Unanswered`]), or the request could not be built or written, which `err` is told
+/// (`what` says what was asked).
+pub fn send_request<W: Write>(
+    tx: &mut W,
+    err: &mut dyn Write,
+    kind: FrameKind,
+    payload: anyhow::Result<Vec<u8>>,
+    what: &str,
+) -> Result<(), Asked> {
+    let sent = payload
+        .and_then(|bytes| write_frame(tx, kind, &bytes))
+        .and_then(|()| tx.flush().map_err(Into::into));
+    let Err(e) = sent else { return Ok(()) };
+    if peer_gone(&e).is_some() {
+        return Err(Asked::Unanswered);
+    }
+    let _ = writeln!(err, "ssh-broker: could not {what}: {e:#}");
+    Err(Asked::Code(map_outcome(Ok(Outcome::PeerClosed))))
+}
+
 /// Send the request `payload` as a frame of `kind` over a connected transport and relay the reply to `out` and `err`
 /// (see [`ReplySink`]): the ask of every verb, which `ask_at` runs. `payload` is what encoding the request gave, and
 /// `what` says what was asked, for a request that cannot be sent. The transport is borrowed, not consumed: the caller
@@ -52,15 +73,8 @@ pub fn ask_with<R: Read, W: Write>(
     payload: anyhow::Result<Vec<u8>>,
     what: &str,
 ) -> Asked {
-    let sent = payload
-        .and_then(|bytes| write_frame(tx, kind, &bytes))
-        .and_then(|()| tx.flush().map_err(Into::into));
-    if let Err(e) = sent {
-        if peer_gone(&e).is_some() {
-            return Asked::Unanswered;
-        }
-        let _ = writeln!(err, "ssh-broker: could not {what}: {e:#}");
-        return Asked::Code(map_outcome(Ok(Outcome::PeerClosed)));
+    if let Err(asked) = send_request(tx, err, kind, payload, what) {
+        return asked;
     }
     let pumped = pump_heard(rx, &mut FrameReader::new(), &mut ReplySink { out, err });
     if pumped.no_answer() {

@@ -530,6 +530,44 @@ fn a_hand_back_to_a_client_that_has_gone_is_not_an_error() {
     hand_back(&mut Closed, &mut Gone, &Control::standalone(), "why").unwrap();
 }
 
+/// The reply of a request to a client that has gone (a Ctrl+C ended `elevate` while its command ran) is routine: it is
+/// logged at debug and the handler ends cleanly. A write that fails for another reason is still the handler's error.
+#[test]
+fn a_reply_to_a_client_that_has_gone_is_not_an_error_and_any_other_failed_write_is() {
+    struct Failing(std::io::ErrorKind);
+    impl Write for Failing {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(self.0.into())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(self.0.into())
+        }
+    }
+    impl HalfClose for Failing {
+        fn shutdown_write(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+    let control = Control::standalone();
+    for kind in [
+        std::io::ErrorKind::BrokenPipe,
+        std::io::ErrorKind::ConnectionReset,
+        std::io::ErrorKind::ConnectionAborted,
+    ] {
+        let (log, result) = logged(|| reply_and_wait(&mut Closed, &mut Failing(kind), &control, "", 0));
+        result.unwrap_or_else(|e| panic!("{kind:?}: a client that has gone is not a fault: {e:#}"));
+        assert!(!log.contains("WARN") && !log.contains("ERROR"), "{kind:?}: {log}");
+    }
+    reply_and_wait(
+        &mut Closed,
+        &mut Failing(std::io::ErrorKind::PermissionDenied),
+        &control,
+        "",
+        0,
+    )
+    .expect_err("a write that fails for another reason is an error");
+}
+
 #[test]
 fn the_refusal_is_one_line_that_says_the_session_is_ending_and_to_reconnect() {
     assert_eq!(ENDING_REFUSAL.matches('\n').count(), 1);
@@ -997,7 +1035,7 @@ fn reply_with_empty_text_writes_only_the_exit_frame() {
 // Sessions that can be elevated from -----
 
 /// A session entry over a connection that goes nowhere: what `attach` is given.
-fn a_hosted_session(policy: ElevationPolicy) -> Arc<dyn Hosted> {
+fn a_hosted_session(policy: ElevationPolicy) -> Arc<HostedSession> {
     struct Nowhere;
     impl Write for Nowhere {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
@@ -1016,18 +1054,18 @@ fn a_hosted_session(policy: ElevationPolicy) -> Arc<dyn Hosted> {
         pty: crate::conpty::PtySession::spawn,
         exec: crate::pipes::ExecChild::spawn,
     };
-    HostedSession::shared(
+    Arc::new(HostedSession::new(
         policy,
         super::super::link::Link::new(Nowhere, true, (80, 24), None),
         starts,
-    )
+    ))
 }
 
 /// `await_hosted` of `id` on a thread, which says on the returned channel that it is about to wait.
 fn await_on_a_thread(
     control: &Arc<Control>,
     id: SessionId,
-) -> (std::thread::JoinHandle<Option<Arc<dyn Hosted>>>, mpsc::Receiver<()>) {
+) -> (std::thread::JoinHandle<Option<Arc<HostedSession>>>, mpsc::Receiver<()>) {
     let (parked, on_parked) = mpsc::channel();
     let control = Arc::clone(control);
     let thread = std::thread::spawn(move || {
@@ -1054,8 +1092,8 @@ fn a_request_for_a_reserved_session_waits_for_its_link_and_then_runs() {
         .join()
         .unwrap()
         .expect("the request goes on once the session is attached");
-    assert_eq!(hosted.policy(), ElevationPolicy::AutoApprove);
-    assert!(hosted.has_terminal());
+    assert_eq!(hosted.policy, ElevationPolicy::AutoApprove);
+    assert!(hosted.link.has_terminal());
 }
 
 /// Before the session is registered it is only an id the agent has given out: a request for it waits as well.
@@ -1129,13 +1167,13 @@ fn an_id_the_agent_did_not_give_out_is_not_waited_for_and_an_ended_session_is_go
 #[test]
 fn one_elevation_at_a_time_holds_a_slot_that_frees_when_it_is_dropped() {
     let hosted = a_hosted_session(ElevationPolicy::AutoApprove);
-    let first = hosted.slot().try_take().expect("the first takes the slot");
+    let first = hosted.slot.try_take().expect("the first takes the slot");
     assert!(
-        hosted.slot().try_take().is_none(),
+        hosted.slot.try_take().is_none(),
         "a second is refused while the first holds it"
     );
     drop(first);
-    assert!(hosted.slot().try_take().is_some(), "the slot is free again");
+    assert!(hosted.slot.try_take().is_some(), "the slot is free again");
 }
 
 // The tally's listeners -----

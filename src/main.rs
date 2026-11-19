@@ -77,12 +77,12 @@ fn logout_command() -> anyhow::Result<()> {
 }
 
 #[cfg(windows)]
-fn elevate_command(terminal: bool, args: &[String]) -> anyhow::Result<()> {
-    ssh_broker::elevate::run(terminal, args)
+fn elevate_command(terminal: bool, command: &str) -> anyhow::Result<()> {
+    ssh_broker::elevate::run(terminal, command)
 }
 
 #[cfg(not(windows))]
-fn elevate_command(_terminal: bool, _args: &[String]) -> anyhow::Result<()> {
+fn elevate_command(_terminal: bool, _command: &str) -> anyhow::Result<()> {
     anyhow::bail!("elevate runs a command in a Windows session and runs only on Windows")
 }
 

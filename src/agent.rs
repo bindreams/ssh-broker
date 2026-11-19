@@ -1309,23 +1309,13 @@ fn handle_pty(
     let watcher = prepare_hangup_watch(&tx, hooks.make_watcher);
 
     let out_raw = session.out_read_raw();
-    let in_raw = session.in_write_raw();
-    // HPCON shared behind a mutex: the input thread resizes under the lock; teardown takes
-    // it (→ None) and closes it under the lock, so resize can never touch a closed HPCON.
-    let hpc_cell = Arc::new(Mutex::new(Some(session.take_hpc_raw())));
-    // The writer thread may be parked writing to the pseudoconsole's input pipe. The reap does NOT release that:
-    // conhost holds the read end and is not a member of the job. `ClosePseudoConsole` in the waiter below is what
-    // releases it, which is why `shutdown`, which joins the writer, is called only after it.
-    let target = Arc::new(PtyTarget::new(
-        HandleWriter::spawn(in_raw, None, hooks.parked),
-        Arc::clone(&hpc_cell),
-    ));
+    let target = Arc::new(PtyTarget::new(&mut session, hooks.parked));
     let link = Link::new(tx, true, (cols, rows), Some(target.clone()));
     let starts = Starts {
         pty: hooks.start_pty,
         exec: hooks.start_exec,
     };
-    registration.attach(HostedSession::shared(policy, Arc::clone(&link), starts));
+    registration.attach(Arc::new(HostedSession::new(policy, Arc::clone(&link), starts)));
     let hangup = start_hangup_watch(watcher, &job);
 
     // Output pump: ConPTY output -> DATA(Pty). It deliberately does NOT emit EXIT.
@@ -1353,23 +1343,10 @@ fn handle_pty(
         })
     };
 
-    // Waiter + ordered teardown. Do NOT `?` on wait(): even if it errors we must still tear
-    // down (close the HPCON, join the threads) before returning, or the threads would
-    // outlive `session` and touch closed handles, and the (forgotten) HPCON would leak.
-    let wait_result = session.wait();
-    if let Some(w) = teardown_warning(reap_tree(&job)) {
-        tracing::error!("{w}");
-    }
-    let code = *wait_result.as_ref().unwrap_or(&1);
-    {
-        // Close the pseudoconsole while HOLDING the lock, so a concurrent resize cannot
-        // copy the raw HPCON out and then race this close (use-after-close).
-        let mut hpc = hpc_cell.lock().unwrap();
-        if let Some(raw) = hpc.take() {
-            conpty::close_pty_raw(raw); // → flushes conhost, then output pipe EOF → out_thread ends
-        }
-    }
-    let _ = out_thread.join();
+    // Do NOT `?` on the end: even when the wait fails the pseudoconsole is closed and the threads joined (see
+    // `end_pty`) before this returns, or they would outlive `session` and touch closed handles.
+    let ended = end_pty(session, &target, out_thread);
+    let code = *ended.as_ref().unwrap_or(&1);
     // The shell is gone and the output is drained, so the code is final and nothing else can still be writing
     // frames. The connection is the session's again by now, if `ssh-broker elevate --terminal` had it: the output
     // pump above could not end before. The `elevate` that asked is inside the session's tree, which was just
@@ -1384,11 +1361,25 @@ fn handle_pty(
         hangup.finish();
     }
     let _ = in_thread.join();
-    // The pseudoconsole is closed: the writer thread is released, and goes before the pipe it writes to does.
-    target.shutdown();
-    // Threads joined; `session` now drops and closes the process/thread + pipe handles.
-    wait_result?;
+    ended?;
     Ok(())
+}
+
+/// The end of a session in a pseudoconsole, `session`'s or an elevated command's: wait for its process, reap its
+/// tree, close the pseudoconsole (which flushes conhost and ends the output) and join the writer of `target`, join
+/// the output `pump`, and close what `session` holds. Returns the process's exit code, or why it could not be read:
+/// the teardown is done either way.
+#[cfg(windows)]
+fn end_pty(session: PtySession, target: &PtyTarget, pump: std::thread::JoinHandle<()>) -> anyhow::Result<i32> {
+    let waited = session.wait();
+    if let Some(w) = teardown_warning(reap_tree(&session.job())) {
+        tracing::error!("{w}");
+    }
+    target.close();
+    let _ = pump.join();
+    // The writer is joined and the pump is, so nothing reads or writes the handles `session` closes.
+    drop(session);
+    Ok(waited?)
 }
 
 /// The write half of a connection, which can be closed on its own.
@@ -1485,25 +1476,38 @@ fn register_session<'a>(reservation: Reservation<'a>, job: &Arc<cosca::Job>) -> 
 /// A pseudoconsole's input: the session's own, or an elevated command's (see `elevation`).
 #[cfg(windows)]
 struct PtyTarget {
-    /// `None` once [`PtyTarget::shutdown`] has joined the writer.
+    /// `None` once [`PtyTarget::close`] has joined the writer.
     writer: Mutex<Option<HandleWriter>>,
-    hpc_cell: Arc<Mutex<Option<isize>>>,
+    /// The pseudoconsole, shared behind a mutex: a resize holds the lock across its OS call and teardown takes the
+    /// handle (`None`) and closes it under the lock, so a resize can never touch a closed one.
+    hpc: Mutex<Option<isize>>,
 }
 
 #[cfg(windows)]
 impl PtyTarget {
-    fn new(writer: HandleWriter, hpc_cell: Arc<Mutex<Option<isize>>>) -> Self {
+    /// The target of `session`'s pseudoconsole: it takes the pseudoconsole and the write end of its input, which
+    /// [`PtyTarget::close`] gives back to the system.
+    fn new(session: &mut PtySession, parked: ParkSignal) -> Self {
         PtyTarget {
-            writer: Mutex::new(Some(writer)),
-            hpc_cell,
+            writer: Mutex::new(Some(HandleWriter::spawn(session.in_write_raw(), None, parked))),
+            hpc: Mutex::new(Some(session.take_hpc_raw())),
         }
     }
 
-    /// Stop and join the writer thread, which may be parked writing to the pseudoconsole's input pipe until the
-    /// pseudoconsole is closed: call it after that, and before the pipe's handles are closed. Input after it is
-    /// discarded. The writer holds a raw handle that its owner closes, so it must not outlive the owner, and a
-    /// share of this target can: a request that is still being answered holds one.
-    fn shutdown(&self) {
+    /// Close the pseudoconsole, which flushes conhost and ends the output, then stop and join the writer thread. The
+    /// writer may be parked writing to the pseudoconsole's input pipe, which the reap of the tree does NOT release
+    /// (conhost holds the read end and is not a member of the job): the close does, so the join comes after it, and
+    /// before the pipe's handles are closed with the session. Input after it is discarded. The writer holds a raw
+    /// handle that its owner closes, so it must not outlive the owner, and a share of this target can: a request
+    /// that is still being answered holds one.
+    fn close(&self) {
+        {
+            // Under the lock, so that a concurrent resize cannot copy the handle out and then race this close.
+            let mut hpc = self.hpc.lock().unwrap_or_else(PoisonError::into_inner);
+            if let Some(raw) = hpc.take() {
+                conpty::close_pty_raw(raw);
+            }
+        }
         let writer = self.writer.lock().unwrap_or_else(PoisonError::into_inner).take();
         drop(writer);
     }
@@ -1522,7 +1526,7 @@ impl InputTarget for PtyTarget {
     fn resize(&self, cols: u16, rows: u16) {
         // Hold the lock across the OS call (bound guard, not a temporary) so teardown
         // cannot close the HPCON mid-resize.
-        let hpc = self.hpc_cell.lock().unwrap_or_else(PoisonError::into_inner);
+        let hpc = self.hpc.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(raw) = *hpc {
             let _ = conpty::resize_pty(raw, cols, rows);
         }
@@ -1623,7 +1627,7 @@ fn handle_exec(
         pty: hooks.start_pty,
         exec: hooks.start_exec,
     };
-    registration.attach(HostedSession::shared(policy, Arc::clone(&link), starts));
+    registration.attach(Arc::new(HostedSession::new(policy, Arc::clone(&link), starts)));
     let hangup = start_hangup_watch(watcher, &job);
 
     let reaping = || {

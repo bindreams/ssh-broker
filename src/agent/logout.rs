@@ -26,7 +26,7 @@ use std::io::{Read, Write};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
-use super::elevation::Hosted;
+use super::elevation::HostedSession;
 use super::{Connections, Drained, HalfClose};
 use crate::afunix::{Conn, ConnRx};
 use crate::protocol::{ExitCode, FrameKind, SessionId, Stream, write_frame};
@@ -69,7 +69,7 @@ struct State {
 struct Entry {
     id: SessionId,
     kill: Killer,
-    hosted: Option<Arc<dyn Hosted>>,
+    hosted: Option<Arc<HostedSession>>,
 }
 
 impl Control {
@@ -124,13 +124,17 @@ impl Control {
     /// out and its session has not published its link (it is being started, or wired), on a condition that is
     /// re-checked, with no timeout. `None` is an id this agent never gave out (an old one, or none), or a session
     /// that ended or never started: the wait ends when its reservation or registration is dropped.
-    pub(super) fn await_hosted(&self, id: &SessionId) -> Option<Arc<dyn Hosted>> {
+    pub(super) fn await_hosted(&self, id: &SessionId) -> Option<Arc<HostedSession>> {
         self.await_hosted_observed(id, || {})
     }
 
     /// [`Control::await_hosted`], calling `waiting` each time it is about to wait (with the state locked, so that
     /// what it waits for cannot happen before the wait begins), so that a test can tell that it is waiting.
-    pub(super) fn await_hosted_observed(&self, id: &SessionId, mut waiting: impl FnMut()) -> Option<Arc<dyn Hosted>> {
+    pub(super) fn await_hosted_observed(
+        &self,
+        id: &SessionId,
+        mut waiting: impl FnMut(),
+    ) -> Option<Arc<HostedSession>> {
         let mut state = self.lock();
         loop {
             match state.sessions.iter().find(|entry| entry.id == *id) {
@@ -215,7 +219,7 @@ pub(super) struct Registration<'a> {
 
 impl Registration<'_> {
     /// Publish what a request needs of the session, now that its link exists: a request that waits for it goes on.
-    pub(super) fn attach(&self, hosted: Arc<dyn Hosted>) {
+    pub(super) fn attach(&self, hosted: Arc<HostedSession>) {
         let mut state = self.control.lock();
         if let Some(entry) = state.sessions.iter_mut().find(|entry| entry.id == self.id) {
             entry.hosted = Some(hosted);
@@ -424,6 +428,9 @@ fn reply<W: std::io::Write>(tx: &mut W, text: &str, code: i32) -> anyhow::Result
 /// Answer a request that is not a login with `text` and `code`, FIN the write half and wait for the client to close
 /// (see [`wait_for_client`]): the client of `elevate` is inside the session's tree and must be heard out before the
 /// connection goes. The connection counts as live for the drain until the wait returns.
+///
+/// A client that has gone cannot be told, which is routine (a Ctrl+C ended it while its command ran): it is logged at
+/// debug and is no error.
 pub(super) fn reply_and_wait<R: LimitedRead, W: Write + HalfClose>(
     rx: &mut R,
     tx: &mut W,
@@ -431,7 +438,14 @@ pub(super) fn reply_and_wait<R: LimitedRead, W: Write + HalfClose>(
     text: &str,
     code: i32,
 ) -> anyhow::Result<()> {
-    answer_and_wait(rx, tx, control, |tx| reply(tx, text, code), "a request")
+    answer_and_wait(rx, tx, control, |tx| reply(tx, text, code), "a request").or_else(|e| {
+        if crate::shim::peer_gone(&e).is_some() {
+            tracing::debug!("the client of a request has gone; could not answer it: {e:#}");
+            Ok(())
+        } else {
+            Err(e)
+        }
+    })
 }
 
 /// A connection whose waiting reads can be given a limit.

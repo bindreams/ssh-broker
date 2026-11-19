@@ -127,14 +127,14 @@ fn route_elevate_takes_the_rest_of_the_arguments_and_a_dash_c_login_stays_the_sh
         route_line("ssh-broker.exe elevate cmd /c whoami"),
         Route::Elevate {
             terminal: false,
-            command: vec!["cmd".into(), "/c".into(), "whoami".into()]
+            command: "cmd /c whoami".into()
         }
     );
     assert_eq!(
         route_line(r#"ssh-broker.exe elevate "C:\Program Files\x.exe" "a b" --help"#),
         Route::Elevate {
             terminal: false,
-            command: vec![r"C:\Program Files\x.exe".into(), "a b".into(), "--help".into()]
+            command: r#""C:\Program Files\x.exe" "a b" --help"#.into()
         },
         "the arguments are the command's, whatever they look like"
     );
@@ -153,14 +153,14 @@ fn elevate_terminal_is_a_flag_only_as_the_first_argument_after_the_verb() {
         route_line("ssh-broker.exe elevate --terminal cmd /k"),
         Route::Elevate {
             terminal: true,
-            command: vec!["cmd".into(), "/k".into()]
+            command: "cmd /k".into()
         }
     );
     assert_eq!(
         route_line("ssh-broker.exe elevate cmd --terminal"),
         Route::Elevate {
             terminal: false,
-            command: vec!["cmd".into(), "--terminal".into()]
+            command: "cmd --terminal".into()
         },
         "after the command's first word it is the command's own argument"
     );
@@ -168,7 +168,7 @@ fn elevate_terminal_is_a_flag_only_as_the_first_argument_after_the_verb() {
         route_line("ssh-broker.exe elevate --terminal --terminal"),
         Route::Elevate {
             terminal: true,
-            command: vec!["--terminal".into()]
+            command: "--terminal".into()
         },
         "only the first one is the flag"
     );
@@ -176,6 +176,26 @@ fn elevate_terminal_is_a_flag_only_as_the_first_argument_after_the_verb() {
         route_line("ssh-broker.exe elevate --terminal"),
         Route::Usage(Verb::Elevate),
         "the flag alone has no command"
+    );
+}
+
+/// The command is the text after the verb (and the flag) as typed, not argv joined again: argv has lost the quotes
+/// and the runs of spaces that decide what the command does.
+#[test]
+fn elevate_carries_the_line_as_written_not_argv() {
+    assert_eq!(
+        route_line(r#"ssh-broker.exe elevate cmd /c echo "a&whoami""#),
+        Route::Elevate {
+            terminal: false,
+            command: r#"cmd /c echo "a&whoami""#.into()
+        }
+    );
+    assert_eq!(
+        route_line(r#""C:\Program Files\ssh-broker.exe" elevate --terminal  p   "a  b"  \"c\""#),
+        Route::Elevate {
+            terminal: true,
+            command: r#"p   "a  b"  \"c\""#.into()
+        }
     );
 }
 
