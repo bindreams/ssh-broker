@@ -33,6 +33,7 @@ use windows::core::{PCWSTR, w};
 
 use super::{ScHandle, service_process};
 use crate::provision::sshd_config::restart::{ExitCodes, ServiceState, StartOutcome, StartReply, StopOutcome};
+use crate::winutil::describe_error;
 
 /// The states a registration is made for: the settled ones. A registration made while the service is starting
 /// or stopping then fires when it settles, and none fires for a pending state.
@@ -128,7 +129,7 @@ impl SshdService {
         // SAFETY: the handle was opened with the right to stop; `status` is a local the call fills.
         let refusal = unsafe { ControlService(self.service.0, SERVICE_CONTROL_STOP, &mut status) }
             .err()
-            .map(|e| reply_text(e.into()));
+            .map(|e| describe_error(&e));
         Ok(match self.settle() {
             Err(e) => StopOutcome::Unknown {
                 cause: format!("{e:#}"),
@@ -151,7 +152,7 @@ impl SshdService {
         // SAFETY: the handle was opened with the right to start; no arguments are passed.
         let reply = match unsafe { StartServiceW(self.service.0, None) } {
             Ok(()) => StartReply::Accepted,
-            Err(e) => StartReply::Refused(reply_text(e.into())),
+            Err(e) => StartReply::Refused(describe_error(&e)),
         };
         match self.settle() {
             Err(e) => StartOutcome::Unreadable {
@@ -172,11 +173,6 @@ impl SshdService {
             }) => StartOutcome::Stopped { reply, exit },
         }
     }
-}
-
-/// What the service manager answered, as it says it.
-fn reply_text(error: std::io::Error) -> String {
-    format!("{error}")
 }
 
 /// The service manager and the sshd service on it, opened with `access` to the service.
@@ -220,8 +216,9 @@ struct Notification {
 ///
 /// # Safety
 ///
-/// `parameter` is the `SERVICE_NOTIFY_2W` of a live [`Notification`]: the registration owns it until it has
-/// closed its handles and drained the queued callback.
+/// `parameter` is the `SERVICE_NOTIFY_2W` of a live [`Notification`]. The registration frees it only after
+/// its service handle was closed successfully (no more notifications are queued after that) and the queued
+/// callback was drained; after a failed close it is never freed, so a callback that runs late still finds it.
 unsafe extern "system" fn on_notification(parameter: *const c_void) {
     let buffer = parameter.cast::<SERVICE_NOTIFY_2W>();
     // SAFETY: see above; `pContext` is the address of that notification's `fired`.
@@ -232,8 +229,12 @@ unsafe extern "system" fn on_notification(parameter: *const c_void) {
 }
 
 /// One registration of a notification for the settled states, on handles of its own.
+///
+/// The registration ends when its service handle is closed, and only a close that succeeded promises that no
+/// further notification is queued. So the drop closes that handle itself and reads the result: after a failed
+/// close the notification is leaked, never freed, because a callback may still write into it.
 struct Registration {
-    /// Heap-pinned: the service manager holds its address until the handles are closed.
+    /// Heap-pinned: the service manager holds its address until the service handle is closed.
     notification: *mut Notification,
     /// Closed first when the registration ends, so that no new notification is queued.
     handles: Option<(ScHandle, ScHandle)>,
@@ -287,15 +288,49 @@ impl Registration {
 }
 
 impl Drop for Registration {
-    /// The handles close first, which ends the registration; a notification already queued is then run, so it
-    /// writes into a notification that still exists, and the notification is freed last.
+    /// The service handle closes first, which ends the registration; a notification already queued is then
+    /// run, so it writes into a notification that still exists, and the notification is freed last, when the
+    /// close succeeded.
     fn drop(&mut self) {
-        drop(self.handles.take());
-        // SAFETY: a zero-length alertable wait runs the callbacks already queued to this thread.
-        unsafe { SleepEx(0, true) }; // sleep-ok: runs the queued notification callback, waits for nothing
-        // SAFETY: the pointer came from `Box::into_raw` in `arm` and is freed once, here.
-        drop(unsafe { Box::from_raw(self.notification) });
+        let closed = match self.handles.take() {
+            Some((manager, service)) => {
+                let closed = service.close();
+                drop(manager);
+                closed
+            }
+            None => Ok(()),
+        };
+        release(self.notification, closed);
     }
+}
+
+/// What became of a notification when its registration ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReleaseOutcome {
+    Freed,
+    /// Left allocated for good: its service handle could not be closed.
+    Leaked,
+}
+
+/// End the use of `notification` once its service handle was closed with `closed`: run the callbacks already
+/// queued to this thread, then free it. After a failed close it is not freed, and the leak is logged.
+///
+/// `notification` came from `Box::into_raw` in [`Registration::arm`] and is released once.
+fn release(notification: *mut Notification, closed: windows::core::Result<()>) -> ReleaseOutcome {
+    // SAFETY: a zero-length alertable wait runs the callbacks already queued to this thread.
+    unsafe { SleepEx(0, true) }; // sleep-ok: runs the queued notification callback, waits for nothing
+    if let Err(error) = closed {
+        tracing::warn!(
+            "the sshd service handle could not be closed ({}); the notification registered on it is never freed, \
+             for a late callback may still write into it",
+            describe_error(&error)
+        );
+        return ReleaseOutcome::Leaked;
+    }
+    // SAFETY: the close succeeded, so no callback is queued after the drain above; the pointer came from
+    // `Box::into_raw` and is freed once, here.
+    drop(unsafe { Box::from_raw(notification) });
+    ReleaseOutcome::Freed
 }
 
 #[cfg(test)]

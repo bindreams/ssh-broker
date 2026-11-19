@@ -25,7 +25,8 @@ use ssh_broker::provision::sshd_config::restart::{ServiceState, StartOutcome, St
 use ssh_broker::provision::sshd_config::{
     ACCEPT_LINE, DROP_IN_NAME, INCLUDE_LINE, SshdReading, accepts, accepts_row, drop_in_text, in_force, with_line,
 };
-use ssh_broker::provision::sshd_task::{self, WaitOutcome};
+use ssh_broker::provision::sshd_task;
+use ssh_broker::provision::taskscheduler::WaitOutcome;
 use ssh_broker::provision::{BASE_DIR, canonical_exe};
 use ssh_broker::provision::{schtasks, taskscheduler};
 use ssh_broker::socket_loc::Integrity;

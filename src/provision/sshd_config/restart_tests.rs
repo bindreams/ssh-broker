@@ -104,6 +104,22 @@ fn a_paused_service_is_left_as_it_is_and_the_advice_is_to_resume_it() {
     );
 }
 
+const CAUSE: &str = "the state cannot be read";
+const UNSEEN: &str = "whether sshd stopped could not be told (the state cannot be read)";
+
+/// What the run says after a stop whose outcome is not known, with `start` the answer to the one start.
+fn after_an_unknown_stop(start: StartOutcome) -> String {
+    let mut host = host();
+    host.settles = [Ok(ServiceState::Running)].into();
+    host.stops = [Ok(StopOutcome::Unknown {
+        cause: CAUSE.to_owned(),
+    })]
+    .into();
+    host.starts = [start].into();
+    let (_, said) = run(&mut host);
+    said.last().unwrap().clone()
+}
+
 #[test]
 fn a_state_that_cannot_be_read_is_never_a_sentence_that_says_sshd_runs_or_does_not() {
     let mut host = host();
@@ -129,12 +145,109 @@ fn a_state_that_cannot_be_read_is_never_a_sentence_that_says_sshd_runs_or_does_n
         ["settled"],
         "nothing is done to a service whose state was not read"
     );
+
+    // A stop whose outcome is not known is never said to have happened, and its cause is always said.
+    let sentences = [
+        after_an_unknown_stop(StartOutcome::Stopped {
+            reply: refused("Access is denied. (5)"),
+            exit: exit(1053, 0),
+        }),
+        after_an_unknown_stop(StartOutcome::Paused(StartReply::Accepted)),
+        after_an_unknown_stop(StartOutcome::Unreadable {
+            reply: refused("Access is denied. (5)"),
+            cause: "the service manager did not answer".to_owned(),
+        }),
+        after_an_unknown_stop(StartOutcome::Running(refused("Access is denied. (5)"))),
+        after_an_unknown_stop(StartOutcome::Running(StartReply::Accepted)),
+    ];
+    for said in &sentences {
+        assert!(
+            said.contains(UNSEEN),
+            "the cause of the unseen stop is not said: {said}"
+        );
+        assert!(
+            !said.contains("was stopped"),
+            "an unseen stop is said to have happened: {said}"
+        );
+    }
+    assert_eq!(
+        sentences[0],
+        format!(
+            "apply: sshd is NOT running: {UNSEEN}, and the service manager refused to start it (Access is denied. \
+             (5)). {NOT_RUNNING_ADVICE}"
+        )
+    );
+    assert_eq!(
+        sentences[1],
+        format!("apply: {UNSEEN} and a start was accepted; it is paused. Check it at this PC: `sc query sshd`.")
+    );
+    assert_eq!(
+        sentences[2],
+        format!(
+            "apply: {UNSEEN} and a start was refused (Access is denied. (5)); its state cannot be read (the \
+             service manager did not answer). Check it at this PC: `sc query sshd`."
+        )
+    );
+    assert_eq!(
+        sentences[3],
+        format!(
+            "apply: sshd is running and whether it restarted cannot be told: {UNSEEN}, and a start was refused \
+             (Access is denied. (5)); `ssh-broker apply` restarts it if it has not read the change"
+        )
+    );
+    assert_eq!(
+        sentences[4],
+        format!("apply: sshd restarted; it accepts {ELEVATION} ({UNSEEN}, and the service manager accepted a start)")
+    );
+
+    // A stop that could not be sent says why, and says the running state is the one read before it.
+    let mut unsent = self::host();
+    unsent.settles = [Ok(ServiceState::Running)].into();
+    unsent.stops = [Err(CAUSE.to_owned())].into();
+    let (_, said) = run(&mut unsent);
+    let last = said.last().unwrap();
+    assert!(
+        last.contains(CAUSE) && last.contains("no stop was sent") && last.contains("last read as running"),
+        "{last}"
+    );
+    assert!(
+        !last.contains("is running") && !last.contains("was stopped") && !last.contains("could not be stopped"),
+        "a stop that was not sent is said to have been tried: {last}"
+    );
+}
+
+#[test]
+fn a_start_after_an_unseen_stop_that_stopped_again_says_the_cause_in_every_sentence() {
+    let mut host = host();
+    host.settles = [Ok(ServiceState::Running)].into();
+    host.stops = [Ok(StopOutcome::Unknown {
+        cause: CAUSE.to_owned(),
+    })]
+    .into();
+    host.starts = [
+        StartOutcome::Stopped {
+            reply: StartReply::Accepted,
+            exit: exit(1067, 0),
+        },
+        StartOutcome::Running(StartReply::Accepted),
+    ]
+    .into();
+    let (taken, said) = run(&mut host);
+    assert!(taken);
+    assert_eq!(
+        said.last().unwrap(),
+        &format!(
+            "apply: sshd failed to start once ({UNSEEN}; {}); a second start worked and sshd is running. It \
+             accepts {ELEVATION}.",
+            stopped_again(1067, 0)
+        )
+    );
 }
 
 // the stop =====
 
 #[test]
-fn a_stop_that_was_not_sent_leaves_sshd_running_and_no_start_follows() {
+fn a_stop_that_was_not_sent_says_so_with_why_and_that_sshd_was_last_read_as_running() {
     let mut host = host();
     host.settles = [Ok(ServiceState::Running)].into();
     host.stops = [Err("cannot open the process of the sshd service".to_owned())].into();
@@ -143,9 +256,9 @@ fn a_stop_that_was_not_sent_leaves_sshd_running_and_no_start_follows() {
     assert_eq!(
         said.last().unwrap(),
         &format!(
-            "apply: sshd could not be stopped (cannot open the process of the sshd service) and is running with \
-             its earlier configuration, so it does not accept {ELEVATION} yet; run `ssh-broker apply` again to \
-             restart it"
+            "apply: no stop was sent to sshd (cannot open the process of the sshd service), so it was not \
+             restarted. Its state was last read as running, before that, with its earlier configuration, so it \
+             does not accept {ELEVATION} yet; run `ssh-broker apply` again to restart it"
         )
     );
     assert_eq!(events(&host), ["settled", "stop"]);
@@ -231,7 +344,7 @@ fn a_stop_whose_result_is_not_known_is_followed_by_one_start_decided_without_a_s
     assert!(taken);
     assert_eq!(
         said.last().unwrap(),
-        &format!("apply: sshd restarted; it accepts {ELEVATION}")
+        &format!("apply: sshd restarted; it accepts {ELEVATION} ({UNSEEN}, and the service manager accepted a start)")
     );
     assert_eq!(events(&host), ["settled", "stop", "start"]);
 }
@@ -249,8 +362,10 @@ fn a_start_refused_over_a_running_service_after_an_unknown_stop_does_not_say_it_
     assert!(!taken);
     assert_eq!(
         said.last().unwrap(),
-        "apply: sshd is running and whether it restarted cannot be told (the service is already running); \
-         `ssh-broker apply` restarts it if it has not read the change"
+        &format!(
+            "apply: sshd is running and whether it restarted cannot be told: {UNSEEN}, and a start was refused \
+             (the service is already running); `ssh-broker apply` restarts it if it has not read the change"
+        )
     );
 }
 

@@ -4,10 +4,10 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 
-use super::{SshdTask, WaitOutcome, hand_over};
+use super::{SshdTask, hand_over};
 use crate::provision::layout::Layout;
 use crate::provision::schtasks::{APPLY_SSHD_TASK, apply_sshd_task_xml};
-use crate::provision::taskscheduler;
+use crate::provision::taskscheduler::{self, WaitOutcome};
 
 /// The task's permissions: SYSTEM and Administrators full control, nobody else anything. The task runs code as
 /// SYSTEM, so whoever can edit it can run code as SYSTEM.

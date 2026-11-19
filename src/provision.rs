@@ -33,6 +33,7 @@ pub mod session_task;
 #[cfg(windows)]
 pub mod sessions;
 pub mod sshd_config;
+#[cfg(windows)]
 pub mod sshd_task;
 #[cfg(windows)]
 pub(crate) mod system_config;
@@ -207,8 +208,15 @@ mod imp {
         })?;
         let exe = flow::run(
             || {
-                taskscheduler::stop_instances(schtasks::AGENT_TASK, &layout.canonical_exe())?;
-                stop_background_sessions(&layout.canonical_exe())
+                flow::stop_holders(
+                    || taskscheduler::has_running_instance(schtasks::APPLY_SSHD_TASK),
+                    &mut |line| eprintln!("{line}"),
+                    || taskscheduler::wait_for_instances(schtasks::APPLY_SSHD_TASK, &layout.canonical_exe()),
+                    || {
+                        taskscheduler::stop_instances(schtasks::AGENT_TASK, &layout.canonical_exe())?;
+                        stop_background_sessions(&layout.canonical_exe())
+                    },
+                )
             },
             |stop_agents| {
                 let exe = layout::prepare_in(&base, &current, stop_agents)?;

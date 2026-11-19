@@ -320,6 +320,24 @@ pub fn start_error_of_create(
     }
 }
 
+/// The Win32 error code an HRESULT carries: the low word of one `HRESULT_FROM_WIN32` made (severity bit and
+/// facility 7); `None` for any other HRESULT.
+pub fn win32_code(hresult: windows::core::HRESULT) -> Option<u32> {
+    let bits = hresult.0 as u32;
+    (bits >> 16 == 0x8007).then_some(bits & 0xFFFF)
+}
+
+/// What Windows says of `error`, as "<message> (<code>)": the code is the Win32 one when the error carries
+/// one (what `net helpmsg` takes), else the HRESULT in hex. An `io::Error` made from the same error would
+/// print the HRESULT as a negative "os error".
+pub fn describe_error(error: &windows::core::Error) -> String {
+    let code = match win32_code(error.code()) {
+        Some(code) => code.to_string(),
+        None => format!("{:#010X}", error.code().0 as u32),
+    };
+    format!("{} ({code})", error.message().trim())
+}
+
 /// Whether `error` is `ERROR_PRIVILEGE_NOT_HELD`, as a Win32 code made into an HRESULT.
 fn is_privilege_not_held(error: &windows::core::Error) -> bool {
     error.code() == windows::core::HRESULT::from_win32(windows::Win32::Foundation::ERROR_PRIVILEGE_NOT_HELD.0)
@@ -336,12 +354,9 @@ fn is_not_the_programs(error: &windows::core::Error) -> bool {
         ERROR_PAGED_SYSTEM_RESOURCES, ERROR_PAGEFILE_QUOTA, ERROR_PAGEFILE_QUOTA_EXCEEDED, ERROR_TOO_MANY_OPEN_FILES,
         ERROR_WORKING_SET_QUOTA,
     };
-    // An HRESULT made from a Win32 code: severity and the Win32 facility, then the code.
-    let hresult = error.code().0 as u32;
-    if hresult >> 16 != 0x8007 {
+    let Some(code) = win32_code(error.code()) else {
         return false;
-    }
-    let code = hresult & 0xFFFF;
+    };
     [
         ERROR_TOO_MANY_OPEN_FILES,
         ERROR_NOT_ENOUGH_MEMORY,

@@ -352,6 +352,40 @@ fn a_launched_instance_is_waited_for_with_no_bound_however_long_the_bound_is_pas
     assert_eq!(events.into_inner(), ["list [0, 44]", "wait [44]", "list []"]);
 }
 
+/// The process of an instance, as the tests hold one: its pid; `open` finds one for the pids in `alive`.
+fn instances_listed(listed: Vec<u32>, alive: &[u32]) -> Instances<u32> {
+    instances_of(listed, |pid| Ok(alive.contains(&pid).then_some(pid))).unwrap()
+}
+
+#[test]
+fn an_instance_whose_process_has_exited_is_not_an_instance_and_one_not_launched_yet_is() {
+    let instances = instances_listed(vec![0, 7, 8], &[8]);
+    assert_eq!(instances.count, 2);
+    assert_eq!(instances.pids, [0, 8]);
+    assert_eq!(instances.processes, [8]);
+}
+
+/// A slow engine lists an instance after its process has exited. It has ended: it is not an instance that was
+/// never launched, which would leave the report unread and the task registered.
+#[test]
+fn a_listed_instance_whose_process_has_exited_ends_the_wait_and_is_not_never_launched() {
+    let outcome = wait_until_ended(
+        Duration::ZERO,
+        || Ok(instances_listed(vec![7], &[])),
+        |_: Vec<u32>| anyhow::bail!("nothing is waited for"),
+    )
+    .unwrap();
+    assert_eq!(outcome, WaitOutcome::Ended);
+}
+
+#[test]
+fn a_failure_to_identify_the_process_of_an_instance_is_an_error_and_never_an_end() {
+    let result = instances_of(vec![7], |_| -> anyhow::Result<Option<u32>> {
+        anyhow::bail!("cannot tell")
+    });
+    assert!(result.is_err());
+}
+
 #[test]
 fn a_wait_that_fails_is_an_error_and_is_not_looked_past() {
     let events = RefCell::new(Vec::new());

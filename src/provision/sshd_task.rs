@@ -17,21 +17,10 @@ use std::path::Path;
 use anyhow::Context;
 
 use super::schtasks::APPLY_SSHD_TASK;
+use super::taskscheduler::WaitOutcome;
 
-#[cfg(windows)]
 mod system;
-#[cfg(windows)]
 pub use system::{hand_over_sshd_step, report_path};
-
-/// How the wait for the task's instances ended.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WaitOutcome {
-    /// The task has no instance any more: every process it ran has exited.
-    Ended,
-    /// The Task Scheduler lists `count` instances that it never launched, for as long as the failure bound.
-    /// That proves nothing of what they will do.
-    NeverLaunched { count: usize },
-}
 
 /// What the hand-over needs of the Task Scheduler and the report.
 pub trait SshdTask {
@@ -67,7 +56,9 @@ pub fn handed_over_line(report: &Path) -> String {
 ///
 /// The order: the task is registered, run, and the hand-over line said; only then is the task waited for, so
 /// that an `apply` ended from there on leaves the step to the task. When the instances have ended, the report is
-/// printed and the task removed. A wait that cannot say the instances ended leaves the task registered and the
+/// printed and the task removed. The report is believed to be whole only when the task's last result is 0; any
+/// other result (or one that cannot be read) means the task's process ended before it finished, and the report
+/// is printed as far as it goes. A wait that cannot say the instances ended leaves the task registered and the
 /// report unread, and says that the step may still run: nothing is concluded from it. No failure fails `apply`.
 pub fn hand_over(task: &mut dyn SshdTask, report: &Path, say: &mut dyn FnMut(&str)) {
     if let Err(e) = task.register() {
@@ -100,22 +91,42 @@ pub fn hand_over(task: &mut dyn SshdTask, report: &Path, say: &mut dyn FnMut(&st
         }
     }
 
-    match task.report() {
+    // A report is complete only when the task finished: the process that ends before it does (a panic, an
+    // administrator ending the task) leaves a report as far as it got, and its last result is not 0.
+    let report_text = task.report();
+    let result = task.last_result().map_err(|why| format!("{why:#}"));
+    match report_text {
         Ok(text) => {
             let lines = report_lines(&text);
-            if lines.is_empty() {
-                say(
-                    "apply: sshd accepts SSH_BROKER_ELEVATION and has read its configuration; the task had nothing to change",
-                );
+            let finished = matches!(result, Ok(0));
+            match result {
+                Ok(0) => {
+                    if lines.is_empty() {
+                        say(
+                            "apply: sshd accepts SSH_BROKER_ELEVATION and has read its configuration; the task had nothing to change",
+                        );
+                    }
+                }
+                Ok(result) => say(&format!(
+                    "apply: the task {APPLY_SSHD_TASK} ended before it finished (its last result was {result:#010x}); \
+                     what it had said follows. {CHECK_SSHD}"
+                )),
+                Err(why) => say(&format!(
+                    "apply: whether the task {APPLY_SSHD_TASK} finished could not be told (its last result could not \
+                     be read ({why})); what it had said follows. {CHECK_SSHD}"
+                )),
+            }
+            if lines.is_empty() && !finished {
+                say(&format!("apply: the task {APPLY_SSHD_TASK} had said nothing"));
             }
             for line in lines {
                 say(&line);
             }
         }
         Err(e) => {
-            let result = match task.last_result() {
+            let result = match result {
                 Ok(result) => format!("its last result was {result:#010x}"),
-                Err(why) => format!("its last result could not be read ({why:#})"),
+                Err(why) => format!("its last result could not be read ({why})"),
             };
             say(&format!(
                 "apply: the task {APPLY_SSHD_TASK} left no report in {} ({e:#}); {result}. Whether sshd accepts \
@@ -127,6 +138,9 @@ pub fn hand_over(task: &mut dyn SshdTask, report: &Path, say: &mut dyn FnMut(&st
     }
     remove(task, say);
 }
+
+/// What to do about sshd when the task did not say how its step ended.
+const CHECK_SSHD: &str = "Check sshd at this PC: `sc query sshd`; start it with `net start sshd` if it is stopped.";
 
 fn not_set_up(did_not: &str, cause: &anyhow::Error) -> String {
     format!(

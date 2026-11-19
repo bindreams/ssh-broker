@@ -94,6 +94,101 @@ fn agents_survive_a_failed_stop_in_the_sessions_the_start_is_told_to_leave_alone
     );
 }
 
+/// `run` whose stop is [`stop_holders`] over a script: whether an earlier sshd step is running, how its wait
+/// ends, and the rest of the stop. The events are in the order the calls were made, and the install is the exe
+/// being replaced.
+fn run_with_sshd_step(
+    running: anyhow::Result<bool>,
+    waited: anyhow::Result<WaitOutcome>,
+) -> (Vec<String>, anyhow::Result<()>) {
+    let events = RefCell::new(Vec::new());
+    let log = |event: &str| events.borrow_mut().push(event.to_owned());
+    let result = run(
+        || {
+            stop_holders(
+                || {
+                    log("look for the sshd step");
+                    running
+                },
+                &mut |line| log(&format!("say: {line}")),
+                || {
+                    log("wait for the sshd step");
+                    waited
+                },
+                || {
+                    log("stop the agents");
+                    Ok(())
+                },
+            )
+        },
+        |stop| {
+            stop()?;
+            log("replace the exe");
+            Ok(())
+        },
+        || Ok(()),
+        || Ok(()),
+        |_| {},
+    );
+    (events.into_inner(), result)
+}
+
+#[test]
+fn an_earlier_sshd_step_that_is_running_is_waited_for_before_the_agents_are_stopped_and_the_exe_replaced() {
+    let (events, result) = run_with_sshd_step(Ok(true), Ok(WaitOutcome::Ended));
+    result.unwrap();
+    assert_eq!(
+        events,
+        [
+            "look for the sshd step",
+            "say: apply: an earlier apply's sshd step is still running (the task ssh-broker-apply-sshd); waiting \
+             for it to finish",
+            "wait for the sshd step",
+            "stop the agents",
+            "replace the exe"
+        ]
+    );
+}
+
+#[test]
+fn with_no_earlier_sshd_step_nothing_is_said_and_nothing_is_waited_for() {
+    let (events, result) = run_with_sshd_step(Ok(false), Ok(WaitOutcome::Ended));
+    result.unwrap();
+    assert_eq!(events, ["look for the sshd step", "stop the agents", "replace the exe"]);
+}
+
+#[test]
+fn a_sshd_step_that_cannot_be_waited_for_stops_nothing_and_replaces_nothing() {
+    let (events, result) = run_with_sshd_step(Ok(true), Err(anyhow::anyhow!("the Task Scheduler did not answer")));
+    let text = format!("{:#}", result.unwrap_err());
+    assert!(text.contains("the Task Scheduler did not answer"), "{text}");
+    assert!(
+        !events.iter().any(|e| e == "stop the agents" || e == "replace the exe"),
+        "{events:?}"
+    );
+}
+
+#[test]
+fn an_instance_of_the_sshd_step_that_never_started_fails_the_stop_and_replaces_nothing() {
+    let (events, result) = run_with_sshd_step(Ok(true), Ok(WaitOutcome::NeverLaunched { count: 1 }));
+    let text = format!("{:#}", result.unwrap_err());
+    assert!(
+        text.contains("ssh-broker-apply-sshd") && text.contains("not started") && text.contains("run apply again"),
+        "{text}"
+    );
+    assert!(
+        !events.iter().any(|e| e == "stop the agents" || e == "replace the exe"),
+        "{events:?}"
+    );
+}
+
+#[test]
+fn a_look_for_the_sshd_step_that_fails_stops_nothing_and_replaces_nothing() {
+    let (events, result) = run_with_sshd_step(Err(anyhow::anyhow!("access denied")), Ok(WaitOutcome::Ended));
+    assert!(format!("{:#}", result.unwrap_err()).contains("access denied"));
+    assert_eq!(events, ["look for the sshd step"]);
+}
+
 #[test]
 fn agents_start_again_when_the_stop_failed_part_way() {
     let (events, result) = flow(true, || anyhow::bail!("access denied"), true);

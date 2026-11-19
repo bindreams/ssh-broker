@@ -175,14 +175,7 @@ impl LogonFailure {
     }
 
     fn from_error(error: &windows::core::Error) -> LogonFailure {
-        let hresult = error.code().0 as u32;
-        // `HRESULT_FROM_WIN32` puts the code under facility 7.
-        let code = if hresult >> 16 == 0x8007 {
-            hresult & 0xFFFF
-        } else {
-            hresult
-        };
-        LogonFailure::from_win32(code)
+        LogonFailure::from_win32(crate::winutil::win32_code(error.code()).unwrap_or(error.code().0 as u32))
     }
 }
 

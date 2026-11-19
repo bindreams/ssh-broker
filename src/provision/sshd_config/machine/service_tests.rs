@@ -27,6 +27,28 @@ fn a_state_that_is_none_of_the_seven_is_not_guessed_at() {
     assert_eq!(classify(8), Reading::Unknown(8));
 }
 
+fn a_notification() -> *mut Notification {
+    Box::into_raw(Box::new(Notification {
+        buffer: SERVICE_NOTIFY_2W::default(),
+        fired: AtomicBool::new(false),
+    }))
+}
+
+#[test]
+fn a_notification_is_freed_after_its_handle_was_closed() {
+    assert_eq!(release(a_notification(), Ok(())), ReleaseOutcome::Freed);
+}
+
+/// A late callback may still write into a notification whose registration was not ended: it is never freed.
+#[test]
+fn a_notification_whose_handle_could_not_be_closed_is_left_alone() {
+    let notification = a_notification();
+    let failed = windows::core::Error::from(windows::Win32::Foundation::E_FAIL);
+    assert_eq!(release(notification, Err(failed)), ReleaseOutcome::Leaked);
+    // SAFETY: `release` left it allocated; this test frees what it made.
+    drop(unsafe { Box::from_raw(notification) });
+}
+
 #[test]
 fn the_notification_mask_is_the_settled_states_and_no_pending_one() {
     assert_eq!(

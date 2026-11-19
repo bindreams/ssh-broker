@@ -120,9 +120,10 @@ pub fn restart(host: &mut dyn SshdHost, say: &mut dyn FnMut(&str), before: &Befo
         }
     }
 
-    let stop_seen = match host.stop() {
-        Ok(StopOutcome::Stopped) => true,
-        Ok(StopOutcome::Unknown { .. }) => false,
+    // What is known of the stop: `None` when `Stopped` was read, else a clause with why it was not seen.
+    let unseen = match host.stop() {
+        Ok(StopOutcome::Stopped) => None,
+        Ok(StopOutcome::Unknown { cause }) => Some(format!("whether sshd stopped could not be told ({cause})")),
         Ok(StopOutcome::NotStopped { state, refusal }) => {
             let why = refusal
                 .unwrap_or_else(|| "the service manager accepted the stop and the service did not stop".to_owned());
@@ -130,18 +131,30 @@ pub fn restart(host: &mut dyn SshdHost, say: &mut dyn FnMut(&str), before: &Befo
             return false;
         }
         Err(e) => {
-            say(&not_stopped(&format!("{e:#}"), "running"));
+            say(&format!(
+                "apply: no stop was sent to sshd ({e:#}), so it was not restarted. Its state was last read as \
+                 running, before that, with its earlier configuration, so it does not accept {VARIABLE} yet; run \
+                 `ssh-broker apply` again to restart it"
+            ));
             return false;
         }
     };
+    // "sshd was stopped" is said only of a stop that was read.
+    let stopped = unseen.as_deref().unwrap_or("sshd was stopped");
 
     let first = host.start();
     match first {
         StartOutcome::Running(StartReply::Accepted) => {
-            say(&format!("apply: sshd restarted; it accepts {VARIABLE}"));
+            say(&match &unseen {
+                None => format!("apply: sshd restarted; it accepts {VARIABLE}"),
+                Some(unseen) => format!(
+                    "apply: sshd restarted; it accepts {VARIABLE} ({unseen}, and the service manager accepted a \
+                     start)"
+                ),
+            });
             true
         }
-        StartOutcome::Running(StartReply::Refused(reply)) if stop_seen => {
+        StartOutcome::Running(StartReply::Refused(reply)) if unseen.is_none() => {
             say(&format!(
                 "apply: sshd restarted (the service manager had started it again: {reply}); it accepts {VARIABLE}"
             ));
@@ -149,8 +162,8 @@ pub fn restart(host: &mut dyn SshdHost, say: &mut dyn FnMut(&str), before: &Befo
         }
         StartOutcome::Running(StartReply::Refused(reply)) => {
             say(&format!(
-                "apply: sshd is running and whether it restarted cannot be told ({reply}); `ssh-broker apply` \
-                 restarts it if it has not read the change"
+                "apply: sshd is running and whether it restarted cannot be told: {stopped}, and a start was \
+                 refused ({reply}); `ssh-broker apply` restarts it if it has not read the change"
             ));
             false
         }
@@ -159,22 +172,29 @@ pub fn restart(host: &mut dyn SshdHost, say: &mut dyn FnMut(&str), before: &Befo
             ..
         } => {
             say(&format!(
-                "apply: sshd is NOT running: it was stopped, and the service manager refused to start it ({reply}). \
-                 {START_BY_HAND}"
+                "apply: sshd is NOT running: {}, and the service manager refused to start it ({reply}). \
+                 {START_BY_HAND}",
+                unseen.as_deref().unwrap_or("it was stopped")
             ));
             false
         }
-        StartOutcome::Stopped { exit, .. } => start_again(host, say, before, &stopped_again(exit)),
+        StartOutcome::Stopped { exit, .. } => {
+            let first = match &unseen {
+                None => stopped_again(exit),
+                Some(unseen) => format!("{unseen}; {}", stopped_again(exit)),
+            };
+            start_again(host, say, before, &first)
+        }
         StartOutcome::Paused(reply) => {
             say(&format!(
-                "apply: sshd was stopped and a start was {}; it is paused. {CHECK_BY_HAND}",
+                "apply: {stopped} and a start was {}; it is paused. {CHECK_BY_HAND}",
                 replied(&reply)
             ));
             false
         }
         StartOutcome::Unreadable { reply, cause } => {
             say(&format!(
-                "apply: sshd was stopped and a start was {}; its state cannot be read ({cause}). {CHECK_BY_HAND}",
+                "apply: {stopped} and a start was {}; its state cannot be read ({cause}). {CHECK_BY_HAND}",
                 replied(&reply)
             ));
             false

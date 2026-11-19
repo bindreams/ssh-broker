@@ -32,7 +32,6 @@ use windows::core::{BSTR, HRESULT, Interface};
 use super::password_variant::PasswordVariant;
 use super::procwait::{self, Process};
 use super::session_task::TaskState;
-use super::sshd_task::WaitOutcome;
 use crate::password_entry::Password;
 
 /// `SCHED_E_TASK_NOT_RUNNING`: `Stop` on a task with no running instance.
@@ -173,6 +172,16 @@ struct Instances<P> {
     processes: Vec<P>,
 }
 
+/// How a wait for a task's instances ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaitOutcome {
+    /// The task has no instance any more: every process it ran has exited.
+    Ended,
+    /// The Task Scheduler lists `count` instances that it never launched, for as long as the failure bound.
+    /// That proves nothing of what they will do.
+    NeverLaunched { count: usize },
+}
+
 /// The steps of a stop, in the only order that is safe. Disabled first, so the logon trigger cannot
 /// start an agent from the old exe meanwhile; listed before each stop, because the instances are
 /// gone afterwards; waited for before the next look, so the caller goes on only when every process
@@ -227,33 +236,50 @@ fn describe_instances(pids: &[u32]) -> String {
     each.join(", ")
 }
 
-/// The running instances of `task`, and the processes among them that run `image`. An instance
-/// whose process is gone, or is not `image`, has nothing to wait for.
+/// The running instances of `task`, and the processes among them that run `image`. An instance whose
+/// process has exited, or is not `image` (its pid is another process's now), has ended: see [`instances_of`].
 fn running_instances(task: &IRegisteredTask, image: &Path) -> anyhow::Result<Instances<Process>> {
     // SAFETY: `task` and the interfaces taken from it are live and used on this thread only.
-    unsafe {
+    let pids = unsafe {
         let instances = task.GetInstances(0).context("list the running instances")?;
         let count = instances.Count().context("count the running instances")?;
-        let mut found = Vec::new();
         let mut pids = Vec::new();
         // The collection is indexed from 1.
         for index in 1..=count {
             let instance = instances
                 .get_Item(&VARIANT::from(index))
                 .with_context(|| format!("read running instance {index}"))?;
-            let pid = instance.EnginePID().context("read the process of a running instance")?;
-            pids.push(pid);
-            if pid == 0 {
-                continue;
-            }
-            found.extend(procwait::open_if_image(pid, image)?);
+            pids.push(instance.EnginePID().context("read the process of a running instance")?);
         }
-        Ok(Instances {
-            count: usize::try_from(count).unwrap_or(0),
-            pids,
-            processes: found,
-        })
+        pids
+    };
+    instances_of(pids, |pid| procwait::open_if_image(pid, image))
+}
+
+/// The instances among `listed`, the engine's process id of each (0 for one it has not launched). An instance
+/// whose process `open` finds gone is no instance: the engine can list one a while after its process exited,
+/// and it will never be launched. An instance that is not launched yet is one, and has no process to wait for.
+fn instances_of<P>(
+    listed: Vec<u32>,
+    mut open: impl FnMut(u32) -> anyhow::Result<Option<P>>,
+) -> anyhow::Result<Instances<P>> {
+    let mut pids = Vec::new();
+    let mut processes = Vec::new();
+    for pid in listed {
+        if pid == 0 {
+            pids.push(pid);
+            continue;
+        }
+        if let Some(process) = open(pid)? {
+            pids.push(pid);
+            processes.push(process);
+        }
     }
+    Ok(Instances {
+        count: pids.len(),
+        pids,
+        processes,
+    })
 }
 
 /// What `Stop` returned. `S_FALSE` is a success code ("the user cannot successfully stop instances
@@ -339,7 +365,7 @@ pub fn register_system_task(name: &str, xml: &str, sddl: &str) -> anyhow::Result
                 &BSTR::from(name),
                 &BSTR::from(xml),
                 TASK_CREATE_OR_UPDATE.0,
-                &VARIANT::from("SYSTEM"),
+                &VARIANT::from(super::schtasks::SYSTEM_SID),
                 &VARIANT::default(),
                 TASK_LOGON_SERVICE_ACCOUNT,
                 &VARIANT::from(sddl),
@@ -350,7 +376,7 @@ pub fn register_system_task(name: &str, xml: &str, sddl: &str) -> anyhow::Result
 }
 
 /// Return once the task `name` has no instance: the processes of its instances (running `image`) have
-/// exited. A task that does not exist has none. Nothing stops the task and nothing bounds the wait for a
+/// exited, even if the engine still lists the instance. A task that does not exist has none. Nothing stops the task and nothing bounds the wait for a
 /// process that was launched: its exit is the kernel's and the task's to bring about.
 ///
 /// An instance the Task Scheduler lists and has not launched is looked at again. That is waiting for an

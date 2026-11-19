@@ -387,6 +387,16 @@ fn program_data_dir() -> anyhow::Result<PathBuf> {
 /// Closes a service handle.
 struct ScHandle(SC_HANDLE);
 
+impl ScHandle {
+    /// Close the handle and say whether the service manager closed it; the drop's close discards that.
+    fn close(self) -> windows::core::Result<()> {
+        let handle = self.0;
+        std::mem::forget(self);
+        // SAFETY: the handle was opened by `OpenSCManagerW` or `OpenServiceW`; `forget` leaves this the only close.
+        unsafe { CloseServiceHandle(handle) }
+    }
+}
+
 impl Drop for ScHandle {
     fn drop(&mut self) {
         // SAFETY: the handle was opened by `OpenSCManagerW` or `OpenServiceW` and is closed once.

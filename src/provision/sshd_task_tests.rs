@@ -105,6 +105,7 @@ fn the_task_is_registered_run_waited_for_read_and_removed_in_that_order_and_its_
             &format!("said: {HANDED_OVER}"),
             "task: wait",
             "task: report",
+            "task: last_result",
             "said: apply: a first line",
             "said: apply: sshd restarted; it accepts SSH_BROKER_ELEVATION",
             "task: remove",
@@ -146,6 +147,61 @@ fn a_report_with_no_line_is_a_step_that_had_nothing_to_say_and_is_said_so() {
         "apply: sshd accepts SSH_BROKER_ELEVATION and has read its configuration; the task had nothing to change"
     );
     assert_eq!(calls(&log).last().unwrap(), "remove");
+}
+
+// a task that ended before it finished =====
+
+const ENDED_EARLY: &str = "apply: the task ssh-broker-apply-sshd ended before it finished (its last result was \
+     0xc000013a); what it had said follows. Check sshd at this PC: `sc query sshd`; start it with `net start \
+     sshd` if it is stopped.";
+
+#[test]
+fn a_task_whose_result_is_not_zero_ended_before_it_finished_and_what_it_said_is_not_taken_as_complete() {
+    let log = new_log();
+    let mut fake = Fake::new(&log);
+    fake.report = Ok("apply: sshd is running with its earlier configuration\r\n".to_owned());
+    fake.last_result = Ok(0xC000_013A);
+    let log = run(&mut fake);
+    assert_eq!(
+        said(&log)[1..],
+        [ENDED_EARLY, "apply: sshd is running with its earlier configuration",]
+    );
+    assert_eq!(calls(&log).last().unwrap(), "remove");
+}
+
+#[test]
+fn a_task_that_ended_before_it_finished_and_had_said_nothing_says_so_and_not_that_there_was_nothing_to_change() {
+    let log = new_log();
+    let mut fake = Fake::new(&log);
+    fake.report = Ok(String::new());
+    fake.last_result = Ok(0xC000_013A);
+    let log = run(&mut fake);
+    assert_eq!(
+        said(&log)[1..],
+        [ENDED_EARLY, "apply: the task ssh-broker-apply-sshd had said nothing"]
+    );
+    assert_eq!(
+        calls(&log),
+        ["register", "run", "wait", "report", "last_result", "remove"]
+    );
+}
+
+#[test]
+fn a_result_that_cannot_be_read_does_not_make_a_report_complete() {
+    let log = new_log();
+    let mut fake = Fake::new(&log);
+    fake.report = Ok("apply: sshd restarted; it accepts SSH_BROKER_ELEVATION\r\n".to_owned());
+    fake.last_result = Err("the service did not answer");
+    let log = run(&mut fake);
+    assert_eq!(
+        said(&log)[1..],
+        [
+            "apply: whether the task ssh-broker-apply-sshd finished could not be told (its last result could not \
+             be read (the service did not answer)); what it had said follows. Check sshd at this PC: `sc query \
+             sshd`; start it with `net start sshd` if it is stopped.",
+            "apply: sshd restarted; it accepts SSH_BROKER_ELEVATION",
+        ]
+    );
 }
 
 // what goes wrong =====

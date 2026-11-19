@@ -1,7 +1,41 @@
 //! The shape of `apply`: install, then bring agents back. Held apart from the Windows calls so
 //! the failure paths can be tested with stand-ins.
 
-use super::procwait::{StillRunning, Survivor};
+use super::procwait::{self, StillRunning, Survivor};
+use super::schtasks::APPLY_SSHD_TASK;
+use super::taskscheduler::WaitOutcome;
+
+/// The stop that precedes replacing the exe: first the sshd step of an earlier `apply`, then everything else
+/// that holds the exe (`stop_rest`).
+///
+/// An `apply` ended after the hand-over leaves its task's instance running the installed exe for as long as
+/// the step takes. The exe cannot be replaced under it, and ending it between its stop of sshd and its start
+/// would leave sshd stopped, so it is waited for, with no bound once it has launched. When `sshd_step_running`
+/// says there is one, `say` says that it is waited for, and `wait_for_sshd_step` returns when its instances
+/// have ended. An instance the Task Scheduler never launched fails the stop, as a task that never clears does
+/// in `stop_instances`: nothing is replaced under an instance that may still start.
+pub fn stop_holders(
+    sshd_step_running: impl FnOnce() -> anyhow::Result<bool>,
+    say: &mut dyn FnMut(&str),
+    wait_for_sshd_step: impl FnOnce() -> anyhow::Result<WaitOutcome>,
+    stop_rest: impl FnOnce() -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    if sshd_step_running()? {
+        say(&format!(
+            "apply: an earlier apply's sshd step is still running (the task {APPLY_SSHD_TASK}); waiting for it to \
+             finish"
+        ));
+        match wait_for_sshd_step()? {
+            WaitOutcome::Ended => {}
+            WaitOutcome::NeverLaunched { count } => anyhow::bail!(
+                "the Task Scheduler lists {count} instance(s) of the task {APPLY_SSHD_TASK} that it has not started \
+                 after {} s; the exe was not replaced under them; run apply again",
+                procwait::EXIT_BOUND.as_secs()
+            ),
+        }
+    }
+    stop_rest()
+}
 
 /// Run `install`, then `start` the agents.
 ///
