@@ -1,4 +1,5 @@
-//! vtinput: pure win32-input-mode encoding (host-testable, no Windows types).
+//! vtinput: pure win32-input-mode encoding, and what a key means to a line being typed (host-testable, no Windows
+//! types).
 //!
 //! The shim reads console `INPUT_RECORD`s and forwards keystrokes to the agent, which
 //! writes them straight into ConPTY#2 (created with `WIN32_INPUT_MODE`). The wire form
@@ -6,6 +7,18 @@
 //! (microsoft/terminal doc/specs #4999). Modeled with plain integer fields so the
 //! encoder and the window-size math are pure and unit-tested off-Windows BEFORE they
 //! become the live input path.
+//!
+//! The console prompts type a line instead of forwarding keys: [`KeyEvent::line_key`] is the one reading of a key
+//! they share.
+
+const VK_BACK: u16 = 0x08;
+const VK_MENU: u16 = 0x12; // Alt
+const VK_RETURN: u16 = 0x0D;
+const VK_C: u16 = 0x43;
+const VK_D: u16 = 0x44;
+const ETX: u16 = 0x03; // Ctrl+C as a character
+const EOT: u16 = 0x04; // Ctrl+D as a character
+const CR: u16 = 0x0D;
 
 /// A keyboard event, mirroring the fields of a console `KEY_EVENT_RECORD` we care about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -16,6 +29,63 @@ pub struct KeyEvent {
     pub key_down: bool,
     pub control_key_state: u32,
     pub repeat_count: u16,
+}
+
+/// What a key event does to a line being typed: the one reading of console keys both prompts use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LineKey {
+    /// One UTF-16 unit of text (0x20 or above), typed `count` times (at least 1). A character outside the BMP is two
+    /// of these.
+    Text { unit: u16, count: u16 },
+    /// Backspace, `count` times (at least 1).
+    Erase { count: u16 },
+    /// Enter: once, whatever the record's repeat count.
+    Enter,
+    /// Ctrl+C or Ctrl+D, as a character or as the virtual key without one.
+    Cancel,
+    /// Nothing to the line: any key-up other than Alt's that carries a character, a control character, a key with no
+    /// character.
+    Other,
+}
+
+impl KeyEvent {
+    /// What this event does to a line being typed.
+    pub fn line_key(&self) -> LineKey {
+        let count = self.repeat_count.max(1);
+        if !self.key_down {
+            // A console delivers a character that has no key of its own (one outside the BMP, typed as UTF-8) on
+            // the key-UP record of Alt, as it does for Alt+numpad entry. Any other key-up repeats its key-down.
+            return if self.virtual_key_code == VK_MENU {
+                self.text(count)
+            } else {
+                LineKey::Other
+            };
+        }
+        let ctrl = self.control_key_state & CTRL_PRESSED != 0;
+        let cancel_key = ctrl && self.unicode_char == 0 && matches!(self.virtual_key_code, VK_C | VK_D);
+        if matches!(self.unicode_char, ETX | EOT) || cancel_key {
+            return LineKey::Cancel;
+        }
+        if self.virtual_key_code == VK_RETURN && matches!(self.unicode_char, 0 | CR) {
+            return LineKey::Enter;
+        }
+        if self.virtual_key_code == VK_BACK {
+            return LineKey::Erase { count };
+        }
+        self.text(count)
+    }
+
+    /// The event's character, unless it is a control character.
+    fn text(&self, count: u16) -> LineKey {
+        if self.unicode_char >= 0x20 {
+            LineKey::Text {
+                unit: self.unicode_char,
+                count,
+            }
+        } else {
+            LineKey::Other
+        }
+    }
 }
 
 /// What the console prompts feed key events to: one state machine per prompt (`password_entry`,

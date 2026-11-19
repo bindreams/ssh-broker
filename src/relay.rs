@@ -64,7 +64,7 @@ impl PumpError {
 }
 
 /// `sink` after it has failed on data: the data and the resizes are dropped, and the protocol's control frames (the
-/// consent question and its answer) still go to it, because a question waits on its answer however the session's
+/// consent question, its answer and its withdrawal) still go to it, because a question waits on its answer however the session's
 /// input fares. A control frame the sink refuses is dropped too: the pump's job here is to keep watching the peer.
 /// It takes over from a sink that has failed, so the first frame is behind it and an answer to the connection is a
 /// protocol error before it is asked.
@@ -83,6 +83,12 @@ impl<S: FrameSink> FrameSink for Draining<'_, S> {
     fn on_consent_answer(&mut self, answer: ConsentAnswer) -> anyhow::Result<()> {
         if let Err(e) = self.0.on_consent_answer(answer) {
             tracing::debug!("the failed sink refused a consent answer; dropped: {e:#}");
+        }
+        Ok(())
+    }
+    fn on_consent_withdrawn(&mut self) -> anyhow::Result<()> {
+        if let Err(e) = self.0.on_consent_withdrawn() {
+            tracing::debug!("the failed sink refused a consent withdrawal; dropped: {e:#}");
         }
         Ok(())
     }
@@ -158,6 +164,11 @@ pub trait FrameSink {
         let _ = answer;
         anyhow::bail!("a consent answer where none is expected")
     }
+    /// The agent no longer asks ([`FrameKind::ConsentWithdrawn`]). The shim's sink of a session with a terminal takes
+    /// it; every other refuses.
+    fn on_consent_withdrawn(&mut self) -> anyhow::Result<()> {
+        anyhow::bail!("a consent withdrawal where none is expected")
+    }
 }
 
 /// Read frames from `r` until an `EXIT` frame or EOF, dispatching `DATA`/`RESIZE` to
@@ -217,6 +228,15 @@ pub fn pump_decode<R: Read>(r: &mut R, fr: &mut FrameReader, sink: &mut impl Fra
                 FrameKind::ConsentAnswer => {
                     let answer = ConsentAnswer::decode(&frame.payload).map_err(PumpError::Protocol)?;
                     sink.on_consent_answer(answer).map_err(PumpError::Sink)?;
+                }
+                FrameKind::ConsentWithdrawn => {
+                    if !frame.payload.is_empty() {
+                        return Err(PumpError::Protocol(anyhow::anyhow!(
+                            "a consent withdrawal with {} byte(s) of payload",
+                            frame.payload.len()
+                        )));
+                    }
+                    sink.on_consent_withdrawn().map_err(PumpError::Sink)?;
                 }
                 FrameKind::Request => {
                     return Err(PumpError::Protocol(anyhow::anyhow!(

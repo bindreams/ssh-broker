@@ -1,22 +1,12 @@
 //! The state machine behind the consent question: console key events in, the echo of what is typed and one answer
 //! out.
 //!
-//! Pure and host-testable, like [`crate::password_entry`], which it follows in reading keys. The words that allow
+//! Pure and host-testable, like [`crate::password_entry`]. The words that allow
 //! are given to [`ConsentEntry::new`]; anything else, Enter alone included, refuses, and there is no second
 //! question. What is typed is shown, so that the person sees what they answer, but only as far as an answer can
 //! still be right (see [`ConsentEntry::new`]).
 
-use crate::vtinput::{KeyEntry, KeyEvent};
-
-const VK_BACK: u16 = 0x08;
-const VK_MENU: u16 = 0x12; // Alt
-const VK_RETURN: u16 = 0x0D;
-const VK_C: u16 = 0x43;
-const VK_D: u16 = 0x44;
-const CTRL_PRESSED: u32 = 0x0004 | 0x0008; // RIGHT_CTRL | LEFT_CTRL
-const ETX: u16 = 0x03; // Ctrl+C as a character
-const EOT: u16 = 0x04; // Ctrl+D as a character
-const CR: u16 = 0x0D;
+use crate::vtinput::{KeyEntry, KeyEvent, LineKey};
 
 /// What the console shows for a character it cannot be sure takes one cell, and for one that is not text.
 const SHOWN_INSTEAD: char = '?';
@@ -69,26 +59,19 @@ impl ConsentEntry {
     /// Apply one key event. A character or Backspace acts `repeat_count` times (the console merges a repeated
     /// key-down into one record); Enter and Ctrl+C or Ctrl+D act once.
     pub fn key(&mut self, k: &KeyEvent) -> ConsentStep {
-        if !k.key_down {
-            // A console delivers a character that has no key of its own (one outside the BMP, typed as UTF-8) on
-            // the key-UP record of Alt. Any other key-up repeats its key-down.
-            if k.virtual_key_code == VK_MENU {
-                return self.type_char(k);
+        match k.line_key() {
+            LineKey::Text { unit, count } => {
+                let mut shown = String::new();
+                for _ in 0..count {
+                    self.push_unit(unit, &mut shown);
+                }
+                step_of(shown)
             }
-            return ConsentStep::Continue;
+            LineKey::Erase { count } => self.erase(count),
+            LineKey::Enter => self.answer(),
+            LineKey::Cancel => ConsentStep::Refuse,
+            LineKey::Other => ConsentStep::Continue,
         }
-        let ctrl = k.control_key_state & CTRL_PRESSED != 0;
-        let cancel_key = ctrl && k.unicode_char == 0 && matches!(k.virtual_key_code, VK_C | VK_D);
-        if matches!(k.unicode_char, ETX | EOT) || cancel_key {
-            return ConsentStep::Refuse;
-        }
-        if k.virtual_key_code == VK_RETURN && matches!(k.unicode_char, 0 | CR) {
-            return self.answer();
-        }
-        if k.virtual_key_code == VK_BACK {
-            return self.erase(k.repeat_count.max(1));
-        }
-        self.type_char(k)
     }
 
     fn answer(&self) -> ConsentStep {
@@ -100,17 +83,6 @@ impl ConsentEntry {
         } else {
             ConsentStep::Refuse
         }
-    }
-
-    /// Add the event's character, as many times as it repeats, unless it is a control character.
-    fn type_char(&mut self, k: &KeyEvent) -> ConsentStep {
-        let mut shown = String::new();
-        if k.unicode_char >= 0x20 {
-            for _ in 0..k.repeat_count.max(1) {
-                self.push_unit(k.unicode_char, &mut shown);
-            }
-        }
-        step_of(shown)
     }
 
     /// Add one UTF-16 unit; a character is complete once its last unit is.

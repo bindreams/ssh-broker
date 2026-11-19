@@ -1465,6 +1465,70 @@ fn a_question_is_handed_over_once_and_a_second_before_it_is_taken_is_refused() {
         .expect("the slot is free again once it is taken");
 }
 
+/// The agent withdraws the question the person is being asked: the question's stop turns true (it is the worker's
+/// `stop`, and the sink wakes the console when this says the worker is in the question), the question ends without an
+/// answer to send, and the slot is ready for the next question.
+#[test]
+fn a_withdrawal_ends_the_question_being_asked_without_an_answer() {
+    let slot = ConsentSlot::default();
+    slot.put(a_question("first")).unwrap();
+    assert_eq!(slot.take(), Some(a_question("first")));
+    assert!(!slot.withdrawn(), "not withdrawn yet");
+
+    assert!(slot.withdraw(), "the worker is in the question: it is to be woken");
+    assert!(slot.withdrawn(), "the question's stop is true");
+    assert_eq!(
+        slot.finish(ConsentAnswer::Allow),
+        None,
+        "no answer is sent for a withdrawn question"
+    );
+    assert!(!slot.withdrawn(), "the next question starts clean");
+
+    slot.put(a_question("second")).unwrap();
+    assert_eq!(slot.take(), Some(a_question("second")));
+    assert_eq!(
+        slot.finish(ConsentAnswer::Refuse),
+        Some(ConsentAnswer::Refuse),
+        "a question that was not withdrawn is answered"
+    );
+}
+
+/// A question the worker has not taken yet is dropped by its withdrawal: it is never asked. With no question open, a
+/// withdrawal is ignored and withdraws nothing later.
+#[test]
+fn a_withdrawal_drops_a_question_not_yet_taken_and_with_none_open_is_ignored() {
+    let slot = ConsentSlot::default();
+    assert!(!slot.withdraw(), "nothing is open: nobody to wake");
+    assert!(!slot.withdrawn());
+
+    slot.put(a_question("never asked")).unwrap();
+    assert!(!slot.withdraw(), "the worker is not in it: nobody to wake");
+    assert_eq!(slot.take(), None, "it is never asked");
+
+    slot.put(a_question("after")).unwrap();
+    assert_eq!(slot.take(), Some(a_question("after")));
+    assert!(
+        !slot.withdrawn(),
+        "the earlier withdrawals withdrew nothing of this one"
+    );
+    assert_eq!(slot.finish(ConsentAnswer::Allow), Some(ConsentAnswer::Allow));
+}
+
+/// The agent may ask the next question while the worker is still leaving the withdrawn one: the new one is not
+/// withdrawn with it, and is the next the worker takes.
+#[test]
+fn a_question_put_while_a_withdrawn_one_is_ending_is_not_withdrawn_with_it() {
+    let slot = ConsentSlot::default();
+    slot.put(a_question("first")).unwrap();
+    slot.take().unwrap();
+    assert!(slot.withdraw());
+    slot.put(a_question("second")).expect("the agent asks again");
+    assert_eq!(slot.finish(ConsentAnswer::Refuse), None, "the first was withdrawn");
+    assert_eq!(slot.take(), Some(a_question("second")));
+    assert!(!slot.withdrawn());
+    assert_eq!(slot.finish(ConsentAnswer::Allow), Some(ConsentAnswer::Allow));
+}
+
 /// The size goes first: the question's own resize records were taken from the console's queue, and the agent gives
 /// the session (or the command it starts, at the size the link holds) the size before it acts on the answer.
 #[test]

@@ -13,7 +13,7 @@ fn header_roundtrips() {
     assert_eq!(FrameHeader::decode(&bytes).unwrap(), h);
 }
 
-/// The answer's two kinds, the request and the consent's two frames have the numbers the contract gives them, and a
+/// The answer's two kinds, the request and the consent's three frames have the numbers the contract gives them, and a
 /// version-7 peer reads them.
 #[test]
 fn the_answer_kinds_the_request_and_the_consent_frames_have_their_numbers_and_decode() {
@@ -22,18 +22,20 @@ fn the_answer_kinds_the_request_and_the_consent_frames_have_their_numbers_and_de
     assert_eq!(FrameKind::Request as u8, 6);
     assert_eq!(FrameKind::Consent as u8, 7);
     assert_eq!(FrameKind::ConsentAnswer as u8, 8);
+    assert_eq!(FrameKind::ConsentWithdrawn as u8, 9);
     for kind in [
         FrameKind::Serving,
         FrameKind::HandBack,
         FrameKind::Request,
         FrameKind::Consent,
         FrameKind::ConsentAnswer,
+        FrameKind::ConsentWithdrawn,
     ] {
         let header = FrameHeader { kind, len: 3 };
         assert_eq!(FrameHeader::decode(&header.encode()).unwrap(), header);
     }
     assert!(
-        FrameHeader::decode(&[9, 0, 0, 0, 0]).is_err(),
+        FrameHeader::decode(&[10, 0, 0, 0, 0]).is_err(),
         "the next number is still unknown"
     );
 }
@@ -178,7 +180,7 @@ fn the_reader_counts_the_frames_it_has_yielded() {
     reader.push(b"bc");
     reader.next_frame().unwrap().unwrap();
     assert_eq!(reader.frames_read(), 1);
-    reader.push(&[9, 0, 0, 0, 0]);
+    reader.push(&[10, 0, 0, 0, 0]);
     assert!(reader.next_frame().is_err());
     assert_eq!(reader.frames_read(), 1);
 }
@@ -186,13 +188,13 @@ fn the_reader_counts_the_frames_it_has_yielded() {
 #[test]
 fn reader_rejects_bad_kind_in_stream() {
     let mut reader = FrameReader::new();
-    reader.push(&[9, 0, 0, 0, 0]); // bad kind byte
+    reader.push(&[10, 0, 0, 0, 0]); // bad kind byte
     assert!(reader.next_frame().is_err());
 }
 
 #[test]
 fn header_decode_rejects_bad_kind() {
-    assert!(FrameHeader::decode(&[9, 0, 0, 0, 0]).is_err());
+    assert!(FrameHeader::decode(&[10, 0, 0, 0, 0]).is_err());
 }
 
 #[test]

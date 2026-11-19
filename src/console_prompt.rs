@@ -107,8 +107,9 @@ fn write_console(output: HANDLE, text: &str) -> windows::core::Result<()> {
 /// of `accepted`, without regard to case, and Enter. Anything else, Enter alone, Ctrl+C, a failed read and a `stop`
 /// that turns true while the question waits, is [`ConsentAnswer::Refuse`], with no second question.
 ///
-/// What was typed ahead of the question, and what the terminal answered to earlier queries, is thrown away before
-/// the question is written, so it cannot answer it. The question is written after the screen's reset, clear and home
+/// What the console has already received of what was typed ahead, and of what the terminal answered to earlier
+/// queries, is thrown away before the question is written. Keys still on their way from the person's terminal when it
+/// appears are not: they count as typed after it and can answer it. The question is written after the screen's reset, clear and home
 /// (`CONSENT_SCREEN_ENTER`), what is typed is echoed, and the session's programs, which wrote to this terminal
 /// before and may have left it in any state, can write nothing into it: the agent holds their output. Nothing is
 /// written after the answer; the agent repaints the session's screen. An error is a console that could not be

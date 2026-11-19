@@ -26,6 +26,9 @@ pub const MAX_FRAME: u32 = 1 << 20;
 /// `Consent` (agent to shim, payload: a [`ConsentRequest`]) is the question of a session that has a terminal, and
 /// `ConsentAnswer` (shim to agent, payload: a [`ConsentAnswer`]) its answer. The agent sends no output frame after
 /// `Consent` until it has the answer, and discards the input frames that reach it while it waits.
+/// `ConsentWithdrawn` (agent to shim, no payload) says the agent asks no longer: the question ended without an answer
+/// from the shim, which takes it off its console and sends none, and the agent writes it before the screen goes back to
+/// the session. With no question open it is ignored.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrameKind {
@@ -38,6 +41,7 @@ pub enum FrameKind {
     Request = 6,
     Consent = 7,
     ConsentAnswer = 8,
+    ConsentWithdrawn = 9,
 }
 
 impl FrameKind {
@@ -52,6 +56,7 @@ impl FrameKind {
             6 => Some(Self::Request),
             7 => Some(Self::Consent),
             8 => Some(Self::ConsentAnswer),
+            9 => Some(Self::ConsentWithdrawn),
             _ => None,
         }
     }

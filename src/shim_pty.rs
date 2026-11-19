@@ -799,21 +799,79 @@ impl<T> Input<T> {
 }
 
 /// The consent question the agent asked, on its way from the main pump (which reads it) to the input worker (which
-/// owns the console's input and the connection's write half, and so is the one that can ask and answer).
+/// owns the console's input and the connection's write half, and so is the one that can ask and answer), and the
+/// agent's withdrawal of it.
 #[derive(Default)]
-struct ConsentSlot(Mutex<Option<ConsentRequest>>);
+struct ConsentSlot(Mutex<Questions>);
+
+#[derive(Default)]
+struct Questions {
+    /// Handed over and not yet taken.
+    waiting: Option<ConsentRequest>,
+    /// The question the worker is asking the person.
+    asking: Asking,
+}
+
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
+enum Asking {
+    #[default]
+    No,
+    Yes,
+    /// The agent withdrew it: the worker leaves it without an answer.
+    Withdrawn,
+}
 
 impl ConsentSlot {
+    fn state(&self) -> std::sync::MutexGuard<'_, Questions> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     /// Hand over the question. The agent asks one at a time, so one that is still waiting is a protocol violation.
+    /// The worker may still be leaving a withdrawn one: the agent is free to ask again.
     fn put(&self, request: ConsentRequest) -> anyhow::Result<()> {
-        let mut waiting = self.0.lock().unwrap_or_else(PoisonError::into_inner);
-        anyhow::ensure!(waiting.is_none(), "a consent question while one was already waiting");
-        *waiting = Some(request);
+        let mut state = self.state();
+        anyhow::ensure!(
+            state.waiting.is_none(),
+            "a consent question while one was already waiting"
+        );
+        state.waiting = Some(request);
         Ok(())
     }
 
+    /// The worker takes the question that waits, to ask it: [`ConsentSlot::finish`] ends it.
     fn take(&self) -> Option<ConsentRequest> {
-        self.0.lock().unwrap_or_else(PoisonError::into_inner).take()
+        let mut state = self.state();
+        let request = state.waiting.take();
+        if request.is_some() {
+            state.asking = Asking::Yes;
+        }
+        request
+    }
+
+    /// The agent withdraws its question: the newest one, the one that waits if one does, else the one being asked.
+    /// With none open it is ignored. `true` when the worker is in the question, which the caller must then wake.
+    fn withdraw(&self) -> bool {
+        let mut state = self.state();
+        if state.waiting.take().is_some() {
+            return false;
+        }
+        if state.asking == Asking::Yes {
+            state.asking = Asking::Withdrawn;
+            return true;
+        }
+        false
+    }
+
+    /// Whether the question being asked was withdrawn: the worker's `stop`.
+    fn withdrawn(&self) -> bool {
+        self.state().asking == Asking::Withdrawn
+    }
+
+    /// The question being asked has ended with `answer`. That is the answer to send, unless the agent withdrew the
+    /// question: it asks nothing any more and is sent none.
+    fn finish(&self, answer: ConsentAnswer) -> Option<ConsentAnswer> {
+        let was = std::mem::take(&mut self.state().asking);
+        (was != Asking::Withdrawn).then_some(answer)
     }
 }
 
@@ -851,6 +909,16 @@ impl FrameSink for StdoutSink {
         self.consent.put(request)?;
         // The worker is parked in a read: it looks at the slot when this record wakes it.
         wake_console_input(self.stdin_raw);
+        Ok(())
+    }
+
+    /// The agent asks no longer. A question that is being asked ends (as a stop) and the worker sends no answer; the
+    /// worker, parked in the question's read, is woken to see it. A question not yet taken is dropped, and with none
+    /// open nothing happens.
+    fn on_consent_withdrawn(&mut self) -> anyhow::Result<()> {
+        if self.consent.withdraw() {
+            wake_console_input(self.stdin_raw);
+        }
         Ok(())
     }
 
@@ -932,10 +1000,16 @@ unsafe fn input_loop(
         // is dropped: the question throws away what was typed ahead, and the agent drops what reaches it while it
         // asks, so none of it was going to be anyone's. The mouse's state is dropped too, as the question took its
         // records.
-        if let Some(request) = consent.take() {
-            if !ask_person(stdin, stdout, &request, stopping, tx) {
+        // The agent may ask again while a question ends (its wake record can be taken by the question that is
+        // ending), so every question waiting is asked before the next read.
+        let mut asked = false;
+        while let Some(request) = consent.take() {
+            asked = true;
+            if !ask_person(stdin, stdout, &request, consent, stopping, tx) {
                 return;
             }
+        }
+        if asked {
             enc.reset();
             continue;
         }
@@ -1009,23 +1083,28 @@ unsafe fn input_loop(
 /// A console that could not be asked (flushed or written to) gives the refusal: the answer is `Refuse` for anything
 /// but the allowing answer, and the agent runs nothing for it. The agent holds the session's output while it waits,
 /// and drops what reaches it, so the question and the keys that answer it are the console's alone. `stopping` ends
-/// the question as a refusal.
+/// the question as a refusal. So does the agent's withdrawal of it ([`ConsentSlot::withdraw`]), but then no answer
+/// is sent: the agent asks nothing any more, and the worker goes back to relaying keys.
 fn ask_person(
     stdin: HANDLE,
     stdout: HANDLE,
     request: &ConsentRequest,
+    consent: &ConsentSlot,
     stopping: &AtomicBool,
     tx: &mut afunix::ConnTx,
 ) -> bool {
     let question = text::consent_question(&request.command, &request.cwd, text::CONSENT_ANSWER_LINE);
     let answer = ask_consent(stdin, stdout, &question, &text::CONSENT_ALLOWING_ANSWERS, &|| {
-        stopping.load(Ordering::Relaxed)
+        stopping.load(Ordering::Relaxed) || consent.withdrawn()
     })
     .unwrap_or_else(|e| {
         tracing::warn!("the consent question could not be put on the console, so it is refused: {e}");
         ConsentAnswer::Refuse
     });
-    send_answer(tx, answer, console_size(stdout)).is_ok()
+    match consent.finish(answer) {
+        Some(answer) => send_answer(tx, answer, console_size(stdout)).is_ok(),
+        None => true,
+    }
 }
 
 /// Send the console's size, and then the answer. The question's own resize records were taken from the console's

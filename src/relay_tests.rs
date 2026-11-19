@@ -463,6 +463,7 @@ fn after_a_sink_failure_the_consent_frames_still_reach_the_sink_and_the_pump_see
         data: usize,
         resizes: usize,
         answers: Vec<ConsentAnswer>,
+        withdrawals: usize,
     }
     impl FrameSink for FailsData {
         fn on_data(&mut self, _stream: Stream, _bytes: &[u8]) -> anyhow::Result<()> {
@@ -475,6 +476,10 @@ fn after_a_sink_failure_the_consent_frames_still_reach_the_sink_and_the_pump_see
         }
         fn on_consent_answer(&mut self, answer: ConsentAnswer) -> anyhow::Result<()> {
             self.answers.push(answer);
+            Ok(())
+        }
+        fn on_consent_withdrawn(&mut self) -> anyhow::Result<()> {
+            self.withdrawals += 1;
             Ok(())
         }
     }
@@ -497,6 +502,7 @@ fn after_a_sink_failure_the_consent_frames_still_reach_the_sink_and_the_pump_see
         &ConsentAnswer::Refuse.encode().unwrap(),
     )
     .unwrap();
+    write_frame(&mut wire, FrameKind::ConsentWithdrawn, &[]).unwrap();
 
     let saw_eof = std::rc::Rc::new(std::cell::Cell::new(false));
     let mut spy = EofSpy {
@@ -513,6 +519,7 @@ fn after_a_sink_failure_the_consent_frames_still_reach_the_sink_and_the_pump_see
         [ConsentAnswer::Allow, ConsentAnswer::Refuse],
         "the answers still reach the sink"
     );
+    assert_eq!(sink.withdrawals, 1, "a withdrawal still reaches the sink");
     assert!(saw_eof.get(), "the pump keeps watching to the peer's end");
 }
 
@@ -727,10 +734,15 @@ fn pump_decode_dispatches_consent_and_answer_and_a_sink_without_them_errors() {
             self.seen.push(format!("answer {answer:?}"));
             Ok(())
         }
+        fn on_consent_withdrawn(&mut self) -> anyhow::Result<()> {
+            self.seen.push("withdrawn".to_owned());
+            Ok(())
+        }
     }
     let mut wire = Vec::new();
     write_data(&mut wire, Stream::Pty, b"x").unwrap();
     write_frame(&mut wire, FrameKind::Consent, &a_consent_request().encode().unwrap()).unwrap();
+    write_frame(&mut wire, FrameKind::ConsentWithdrawn, &[]).unwrap();
     write_frame(
         &mut wire,
         FrameKind::ConsentAnswer,
@@ -741,13 +753,17 @@ fn pump_decode_dispatches_consent_and_answer_and_a_sink_without_them_errors() {
     let mut sink = Asked::default();
     let outcome = pump_decode(&mut wire.as_slice(), &mut FrameReader::new(), &mut sink).unwrap();
     assert_eq!(outcome, Outcome::Exited(0));
-    assert_eq!(sink.seen, ["data", "consent cmd /c whoami", "answer Refuse"]);
+    assert_eq!(
+        sink.seen,
+        ["data", "consent cmd /c whoami", "withdrawn", "answer Refuse"]
+    );
 
     // A sink that does not take them (an exec session's, the logout reply's) refuses each: a sink failure, which says
     // nothing about the peer.
     for frame in [
         (FrameKind::Consent, a_consent_request().encode().unwrap()),
         (FrameKind::ConsentAnswer, ConsentAnswer::Allow.encode().unwrap()),
+        (FrameKind::ConsentWithdrawn, Vec::new()),
     ] {
         let wire = framed(&[(frame.0, &frame.1)]);
         let err = pump_decode(&mut wire.as_slice(), &mut FrameReader::new(), &mut TestSink::default())
@@ -766,6 +782,7 @@ fn a_consent_frame_that_is_not_one_is_a_protocol_error() {
         (FrameKind::ConsentAnswer, &[2][..]),
         (FrameKind::ConsentAnswer, &[][..]),
         (FrameKind::ConsentAnswer, &[0, 0][..]),
+        (FrameKind::ConsentWithdrawn, &[0][..]),
     ] {
         let wire = framed(&[(kind, payload)]);
         let err =

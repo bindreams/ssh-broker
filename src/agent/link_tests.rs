@@ -385,12 +385,17 @@ struct Asked {
 }
 
 fn ask_on_a_thread(link: &Arc<Link>) -> Asked {
+    ask_for_on_a_thread(link, Arc::new(ClientGone::default()))
+}
+
+/// [`ask_on_a_thread`] for the request whose client is `gone`.
+fn ask_for_on_a_thread(link: &Arc<Link>, gone: Arc<ClientGone>) -> Asked {
     let (parked, on_parked) = mpsc::channel();
     let (answered, answer) = mpsc::channel();
     let (release, released) = mpsc::channel::<()>();
     let link = Arc::clone(link);
     let thread = std::thread::spawn(move || {
-        let outcome = link.ask_observed(&a_question(), &ClientGone::default(), || {
+        let outcome = link.ask_observed(&a_question(), &gone, || {
             let _ = parked.send(());
         });
         match outcome {
@@ -448,6 +453,7 @@ fn ask_writes_the_consent_frame_and_waits_for_the_answer_and_the_screen_is_the_q
         );
         asked.finish();
         assert_eq!(carrier(&link), Carrier::Session);
+        assert_eq!(wire.frames().len(), 1, "an answered question is not withdrawn");
     }
 }
 
@@ -693,7 +699,72 @@ fn end_hosting_ends_a_pending_question_at_once() {
     })
     .unwrap();
     let kinds: Vec<FrameKind> = wire.frames().iter().map(|(kind, _)| *kind).collect();
-    assert_eq!(kinds, [FrameKind::Consent, FrameKind::Data]);
+    assert_eq!(
+        kinds,
+        [FrameKind::Consent, FrameKind::ConsentWithdrawn, FrameKind::Data]
+    );
+}
+
+/// A target that records which frames the connection had when the session was repainted (given its size).
+struct FramesAtRepaint {
+    wire: Wire,
+    seen: std::sync::Mutex<Vec<Vec<FrameKind>>>,
+}
+
+impl InputTarget for FramesAtRepaint {
+    fn input(&self, _bytes: &[u8]) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn resize(&self, _cols: u16, _rows: u16) {
+        let kinds = self.wire.frames().iter().map(|(kind, _)| *kind).collect();
+        self.seen.lock().unwrap().push(kinds);
+    }
+}
+
+/// Every way a question ends without an answer from the shim tells the shim, so that its question does not stay on
+/// the console: the withdrawal, an empty frame, is written before the screen goes back to the session and repaints.
+#[test]
+fn a_question_that_ends_without_an_answer_is_withdrawn_before_the_screen_goes_back() {
+    type Cause = fn(&Link, &ClientGone);
+    let causes: [(&str, Cause); 3] = [
+        ("the session's shell is gone", |link, _| link.end_hosting()),
+        ("the session is over", |link, _| link.end()),
+        ("the client has gone", |link, gone| link.client_gone(gone)),
+    ];
+    for (what, cause) in causes {
+        let wire = Wire::default();
+        let target = Arc::new(FramesAtRepaint {
+            wire: wire.clone(),
+            seen: Default::default(),
+        });
+        let link = Link::new(
+            wire.clone(),
+            true,
+            (80, 24),
+            Some(Arc::clone(&target) as Arc<dyn InputTarget>),
+        );
+        let gone = Arc::new(ClientGone::default());
+        let asked = ask_for_on_a_thread(&link, Arc::clone(&gone));
+        asked.parked.recv().expect("the question is waiting");
+
+        cause(&link, &gone);
+        assert_eq!(asked.answer.recv().unwrap(), Err(Ended), "{what}");
+        asked.finish();
+        assert_eq!(
+            wire.frames(),
+            [
+                (FrameKind::Consent, a_question().encode().unwrap()),
+                (FrameKind::ConsentWithdrawn, Vec::new()),
+            ],
+            "{what}"
+        );
+        assert_eq!(
+            *target.seen.lock().unwrap(),
+            [[FrameKind::Consent, FrameKind::ConsentWithdrawn]],
+            "{what}: the repaint came after the withdrawal"
+        );
+    }
 }
 
 /// The client of the request the question is for hangs up: the question ends and the screen is the session's again; a
@@ -717,10 +788,18 @@ fn a_client_that_has_gone_ends_its_question_and_one_that_is_gone_is_not_asked() 
     link.client_gone(&gone);
     assert_eq!(asking.join().unwrap(), Err(Ended));
     assert_eq!(carrier(&link), Carrier::Session, "the screen is the session's again");
-    assert_eq!(wire.frames().len(), 1, "only the question was written");
+    assert_eq!(
+        wire.frames().len(),
+        2,
+        "only the question and its withdrawal were written"
+    );
 
     assert!(matches!(link.ask(&a_question(), &gone), Err(Ended)));
-    assert_eq!(wire.frames().len(), 1, "no second question for a client that is gone");
+    assert_eq!(
+        wire.frames().len(),
+        2,
+        "no second question, and no withdrawal of it, for a client that is gone"
+    );
 }
 
 #[test]

@@ -40,7 +40,7 @@ the rest. The profile follows from the interactive logon and is not separately c
 | `agent_lock` | one agent per session, one serving agent per user |
 | `filelog` | the daily log in the user's own folder, written under the folder's handle |
 | `handoff` | the notice and the line the agent writes into the inherited pipe it hands the hidden `console-fallback` verb |
-| `vtinput` | Win32 `INPUT_RECORD` → VT sequences (pure, host-testable) |
+| `vtinput` | Win32 `INPUT_RECORD` → VT sequences, and what a key means to a line being typed (`KeyEvent::line_key`, which both console prompts read through; pure, host-testable) |
 | `provision`, `provision/{probe,probe_run,session_rows}` | `apply`/`doctor`: DefaultShell, logon task, per-user socket rows, parity probes (the PROBE line, the junction they follow, the two probes of an elevated agent) and the rows they give |
 | `offer`, `offer/text` | the session offer as a pure state machine over injected I/O, and every line it shows |
 | `secret`, `password_entry` | wiped password buffers, and the key-event state machine that fills one |

@@ -401,8 +401,9 @@ impl Link {
     /// session when that drops: a command hosted before then takes it from the question instead.
     ///
     /// `gone` says the client of the request the question is for has hung up ([`Link::client_gone`]): the question
-    /// is [`Ended`] at once if it has, and is ended at the moment it does. The shim is not told, and its question
-    /// stays on its console until the person answers it; that answer is then dropped.
+    /// is [`Ended`] at once if it has, and is ended at the moment it does. A question that was written and ends
+    /// without an answer (whatever the cause) is withdrawn to the shim before the screen goes back to the session; one
+    /// that was never written is not. An answer that was already on its way is dropped ([`Link::answer`]).
     pub(super) fn ask(
         &self,
         request: &ConsentRequest,
@@ -457,10 +458,20 @@ impl Link {
             if state.over_for(Carrier::Session) || state.hosting_ended || gone.is_gone() {
                 state.question = Question::None;
                 drop(state);
+                self.withdraw();
                 return Err(Ended);
             }
             waiting();
             state = self.changed.wait(state).unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+
+    /// Tell the shim the question it was put is withdrawn ([`FrameKind::ConsentWithdrawn`]), so that it comes off the
+    /// console and takes no more keys. Written under the write lock, as the question was, and before the hold on the
+    /// screen drops and the session is repainted. A connection that cannot be written is one the shim has left.
+    fn withdraw(&self) {
+        if let Err(e) = write_frame(&mut *locked(&self.writer), FrameKind::ConsentWithdrawn, &[]) {
+            tracing::debug!("the consent withdrawal could not be put to the shim: {e:#}");
         }
     }
 
