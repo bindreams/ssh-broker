@@ -834,10 +834,17 @@ fn a_request_socket_path_over_the_limit_is_answered_as_nothing_serving_it() {
         .as_os_str()
         .len()
         - 1;
-    // Under a fixed short root, not the temp directory, whose length is the machine's.
-    let prefix = format!(r"C:\sb-ud-rl-{}-", std::process::id());
-    let padding = crate::socket_loc::MAX_SOCKET_PATH_BYTES - fixed - prefix.len();
-    let root = PathBuf::from(format!("{prefix}{}", "x".repeat(padding)));
+    let name = format!("sb-ud-rl-{}-", std::process::id());
+    let named = std::env::temp_dir().join(&name);
+    let padding = (crate::socket_loc::MAX_SOCKET_PATH_BYTES - fixed)
+        .checked_sub(named.as_os_str().len())
+        .unwrap_or_else(|| {
+            panic!(
+                "the temp directory is too long for a profile of the length this test needs: {}",
+                named.display()
+            )
+        });
+    let root = named.with_file_name(format!("{name}{}", "x".repeat(padding)));
     std::fs::create_dir_all(root.join("AppData").join("Local")).unwrap();
     let profile = TempProfile(root);
 
