@@ -189,7 +189,8 @@ fn a_program_that_is_not_found_is_refused_naming_it() {
 #[test]
 fn a_blank_line_is_refused_and_not_defaulted() {
     let host = TestHost::new();
-    for blank in ["", "   ", "\t "] {
+    // `""` is an argument (argv has it), and an empty program name: still no command.
+    for blank in ["", "   ", "\t ", "\"\"", "\"\" /c whoami"] {
         assert_eq!(
             line_of(&host, blank),
             Err(Refused::CannotStart("no command was given".to_owned())),

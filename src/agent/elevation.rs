@@ -281,19 +281,16 @@ fn on_pipes(conn: &mut ConnTx, line: &str, cwd: Option<&Path>, starts: &Starts, 
     if let Some(w) = teardown_warning(reap_tree(&job)) {
         tracing::error!("{w}");
     }
-    let (out, err) = (out.join(), err.join());
-    let panicked = out.is_err() || err.is_err();
-    if panicked {
+    // A pump that panicked is the agent's fault, logged as `end_pty` logs it; the command's code is still its code.
+    if out.join().is_err() || err.join().is_err() {
         tracing::error!("an output pump panicked; the output the client printed may be cut");
     }
     if let Some(hangup) = hangup {
         hangup.finish();
     }
-    match (waited, panicked) {
-        (Err(cause), _) => RunOutcome::EndUnread(cause.into()),
-        // The command's code must not be reported as a clean end.
-        (Ok(_), true) => RunOutcome::EndUnread(anyhow::anyhow!("an output pump panicked; the output may be cut")),
-        (Ok(code), false) => RunOutcome::Exited(code),
+    match waited {
+        Ok(code) => RunOutcome::Exited(code),
+        Err(cause) => RunOutcome::EndUnread(cause.into()),
     }
 }
 

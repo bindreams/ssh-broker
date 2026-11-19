@@ -1793,7 +1793,7 @@ fn spawn_stream_pump(
                 continue; // draining, see above
             }
             if let Err(e) = link.deliver(carrier, stream, &buf[..n]) {
-                tracing::debug!("the client is gone; its output is no longer delivered: {e:#}");
+                tracing::debug!("could not deliver output; it is no longer delivered: {e:#}");
                 // The socket is gone. This is an independent detector, not a redundant
                 // one: the input pump's queue is bounded, so a command that ignores its stdin
                 // can still park that pump in a send and blind it to the socket. And keep READING: for a

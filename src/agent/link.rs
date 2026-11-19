@@ -239,8 +239,8 @@ impl Link {
 
     /// From now on the connection carries the elevated command's output and `target` gets the client's keys and
     /// size, which it is given now, until [`Link::return_input`]; `end` ends the command, and [`Link::end_hosting`]
-    /// calls it. Dropping the guard gives the output back. Only a link with a terminal has a screen to hand over: `decide` refuses the request that would
-    /// come here for one without.
+    /// calls it. Dropping the guard gives the output back. Only a link with a terminal has a screen to hand over:
+    /// `decide` refuses the request that would come here for one without.
     ///
     /// `None` when the session's shell is gone already ([`Link::end_hosting`]): nothing is hosted, and this calls
     /// `end` itself, so a command that asks too late is ended as one hosted when the session ended is.

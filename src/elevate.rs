@@ -173,7 +173,9 @@ impl Found<'_> {
 /// nothing runs: name the file (`npm.cmd`), or run it through the shell (`cmd /c dir`). A line with no argument is
 /// refused too.
 pub fn find_program<'a>(host: &dyn Host, line: &'a str) -> Result<Found<'a>, Refused> {
-    let (program, rest) = next_arg(line).ok_or_else(|| Refused::CannotStart("no command was given".to_owned()))?;
+    let (program, rest) = next_arg(line)
+        .filter(|(program, _)| !program.is_empty())
+        .ok_or_else(|| Refused::CannotStart("no command was given".to_owned()))?;
     let cannot = |reason: &dyn std::fmt::Display| Refused::CannotStart(format!("{program}: {reason}"));
     let named = if program.contains(['\\', '/', ':']) {
         let absolute = std::path::absolute(&program).map_err(|e| cannot(&e))?;
@@ -358,6 +360,12 @@ fn via_agent(id: &SessionId, terminal: bool, found: &Found) -> Result<i32, Refus
     };
     requestable(request_sock, held(location.path())?)?;
 
+    // With `--terminal` the command's keys are routed to its own screen while it runs, so a Ctrl+C that reaches
+    // this console comes only after the command has ended, while its screen drains: it must not end this process,
+    // which still has the command's code to give. Without `--terminal`, Ctrl+C ends this process and the command.
+    if terminal {
+        crate::shim_pty::ignore_ctrl_c();
+    }
     let mut stderr = std::io::stderr();
     let outcome = elevate_over(
         || Ok(crate::afunix::split(folder.connect_request()?)?),

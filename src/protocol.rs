@@ -325,7 +325,7 @@ impl Handshake {
 }
 
 /// The most UTF-16 units a request's working directory may have (a path of the system's own limit). A command is
-/// held to [`MAX_LINE_UNITS`], which counts the terminator.
+/// held to the command line's limit (32,767 units with its terminator, the session's own line's).
 pub const MAX_ELEVATION_UNITS: usize = 32_767;
 
 /// What `ssh-broker elevate` sends on `request.sock`, as the payload of a [`FrameKind::Request`] frame. Everything in
@@ -367,7 +367,7 @@ impl ElevationRequest {
 
     /// The session this request names, if the request is one the agent may act on: a [`SessionId`], a command that
     /// is not empty and whose program is an absolute path (the file is not looked for: starting it reports that), a
-    /// command of fewer than [`MAX_LINE_UNITS`] UTF-16 units (`CreateProcessW` counts its terminator in them, as
+    /// command of fewer than 32,767 UTF-16 units (`CreateProcessW` counts its terminator in them, as
     /// the session's own line does), a working directory of at most [`MAX_ELEVATION_UNITS`], and no NUL anywhere.
     /// The error says which field.
     pub fn check(&self) -> anyhow::Result<SessionId> {

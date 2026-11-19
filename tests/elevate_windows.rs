@@ -400,7 +400,7 @@ fn with_terminal_keys_reach_the_command_and_the_sessions_screen_comes_back() {
 /// Elevated (CI only). The default login asks the person at the terminal; `elevate` is refused with a sentence that
 /// says so, and the command does not run.
 #[test]
-fn elevate_with_prompt_is_refused_until_the_next_unit() {
+fn elevate_with_prompt_is_refused_with_a_sentence_that_says_why() {
     let _machine = machine::exclusive();
     let (kit, account, _end) = an_administrator("elpr");
     let admin = Started::start(&kit, &account);
