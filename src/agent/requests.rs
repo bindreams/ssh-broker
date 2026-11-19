@@ -10,15 +10,16 @@
 //! boundary.
 
 use super::{Control, Opened, logout, read_request};
-use crate::afunix;
+use crate::afunix::Conn;
 use crate::protocol::Mode;
 
 /// What a session handshake on the request socket is told.
 pub const REQUESTS_ONLY: &str = "this socket takes requests only";
 
 /// [`handle`] with the agent's own end and a panic reply (see [`logout::PanicReply`]).
-pub(super) fn serve(conn: socket2::Socket, control: &Control) -> anyhow::Result<()> {
-    let _answer_a_panic = logout::PanicReply::new(&conn, control);
+pub(super) fn serve(sock: socket2::Socket, control: &Control) -> anyhow::Result<()> {
+    let conn = logout::admit(sock)?;
+    let _answer_a_panic = logout::PanicReply::new(conn.clone(), control);
     handle(conn, control, |outcome| super::finish_settled(outcome))
 }
 
@@ -26,11 +27,11 @@ pub(super) fn serve(conn: socket2::Socket, control: &Control) -> anyhow::Result<
 /// reply, then the end of a background agent through `end_process`, given how that end went); any other handshake is answered with
 /// [`REQUESTS_ONLY`] and the connection ends. The error of a connection it cannot read comes back for the log.
 pub(super) fn handle(
-    conn: socket2::Socket,
+    conn: Conn,
     control: &Control,
     end_process: impl FnOnce(anyhow::Result<()>),
 ) -> anyhow::Result<()> {
-    let Some(Opened { mut rx, mut tx, hs, .. }) = read_request(afunix::try_split, conn, control)? else {
+    let Some(Opened { mut rx, mut tx, hs, .. }) = read_request(conn, control)? else {
         return Ok(());
     };
     match hs.mode {

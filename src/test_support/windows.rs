@@ -230,6 +230,43 @@ pub fn raw_socket_pair(tag: &str) -> (socket2::Socket, socket2::Socket, PathBuf)
     (server, client, dir)
 }
 
+/// The failure bound of a read in the tests that wait for a connection's end. A read that gets nothing
+/// for this long has lost its wake, and says so as `TimedOut`, which an assertion names; nothing waits
+/// for it to pass.
+pub const LOST_WAKE_LIMIT: Duration = Duration::from_secs(30);
+
+/// A child process started while a connection has one more holder than its halves must not keep the
+/// connection open once all of ours are closed: the client's reader must see the end while the child
+/// still runs, not a reset when the child ends. `holder` makes that holder from the server's
+/// [`Conn`](crate::afunix::Conn), and it is dropped with the server's halves, after the child started.
+pub fn assert_a_child_does_not_hold_a_connection_open<H>(tag: &str, holder: impl FnOnce(&crate::afunix::Conn) -> H) {
+    use std::io::{Read, Write};
+    let home = NamedCopy::new(tag);
+    let (server, client, dir) = raw_socket_pair(tag);
+    let (mut rx, client_tx) = crate::afunix::split(client).unwrap();
+    rx.set_read_timeout(Some(LOST_WAKE_LIMIT));
+    let conn = crate::afunix::Conn::new(server).unwrap();
+    let (server_rx, mut server_tx) = conn.clone().split();
+    let holding = holder(&conn);
+    let mut child = home.spawn(&[]);
+    server_tx.write_all(b"hello").unwrap();
+    drop((conn, server_rx, server_tx, holding));
+
+    let mut got = Vec::new();
+    let read = rx.read_to_end(&mut got);
+    // The child waits for its input to end; release it before asserting, so a failure leaves nothing running.
+    drop(child.stdin.take());
+    child.wait().unwrap();
+    drop(client_tx);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(
+        read.is_ok(),
+        "no end while the child ran, so the child holds the connection: {read:?}"
+    );
+    assert_eq!(got, b"hello");
+}
+
 /// The stdout of `whoami <switch> /fo csv /nh`, which reads this process's token through another path
 /// than the library and so is an independent source for a test.
 pub fn whoami_csv(switch: &str) -> String {

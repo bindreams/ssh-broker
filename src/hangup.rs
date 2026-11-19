@@ -4,14 +4,14 @@
 //! reading, and the peer's FIN sits unseen behind the unread frames. A command that also prints
 //! nothing leaves no output pump to fail a write, so the session would outlive its client.
 //!
-//! [`HangupWatcher`] blocks in `WSAPoll` on a duplicate of the session socket, which reports
-//! `POLLHUP` for a closed peer without consuming a byte. A poll on a duplicate does not wake for
-//! a local `shutdown_write`, nor for a local `shutdown_both` unless input is unread, so a second
-//! socket joins the same poll: [`Waker::wake`] writes to it at teardown. It is one end of a
-//! loopback TCP connection this module made (see [`wake_pair`]); [`accept_own`] admits only that
-//! connection, so no other process can write to the other end.
+//! [`HangupWatcher`] waits in `WSAPoll`, a slice of [`RECHECK_EVERY`] at a time, on a share of the
+//! session's connection (the socket its halves use), which reports `POLLHUP` for a closed peer without
+//! consuming a byte. A poll that is already waiting does not wake for a local shutdown (measured), so a
+//! second socket joins the same poll: [`Waker::wake`] writes to it at teardown. It is one end of a loopback TCP connection
+//! this module made (see [`wake_pair`]); [`accept_own`] admits only that connection, so no other
+//! process can write to the other end.
 
-use crate::afunix::ConnTx;
+use crate::afunix::{Conn, RECHECK_EVERY, is_interruption, poll_milliseconds};
 use socket2::{Domain, SockAddr, Socket, Type};
 use std::cell::Cell;
 use std::io::{Read, Write};
@@ -26,7 +26,7 @@ use windows::Win32::Networking::WinSock::{
 
 /// Waits for the peer of a session socket to hang up.
 pub struct HangupWatcher {
-    session: Socket,
+    session: Conn,
     wake_rx: TcpStream,
     /// The wake channel reached EOF or failed: its `Waker` is gone. Stop polling it, since a
     /// closed socket stays readable forever.
@@ -52,14 +52,13 @@ enum Ready {
 const WAKE_READ_BUF: usize = 64 * 1024;
 
 impl HangupWatcher {
-    /// Watch `tx`'s socket through a duplicate handle.
-    pub fn new(tx: &ConnTx) -> std::io::Result<(HangupWatcher, Waker)> {
-        let session = tx.try_clone_socket()?;
+    /// Watch the connection `session` is a share of. The only failure is making the wake channel.
+    pub fn new(session: Conn) -> std::io::Result<(HangupWatcher, Waker)> {
         let (wake_rx, wake_tx) = wake_pair()?;
         Ok(Self::from_parts(session, wake_rx, wake_tx))
     }
 
-    fn from_parts(session: Socket, wake_rx: TcpStream, wake_tx: TcpStream) -> (HangupWatcher, Waker) {
+    fn from_parts(session: Conn, wake_rx: TcpStream, wake_tx: TcpStream) -> (HangupWatcher, Waker) {
         let torn_down = Arc::new(AtomicBool::new(false));
         let watcher = HangupWatcher {
             session,
@@ -70,7 +69,7 @@ impl HangupWatcher {
         (watcher, Waker { wake_tx, torn_down })
     }
 
-    /// Block, with no timeout, until the peer has closed its end or the session's [`Waker`] has
+    /// Block, with no limit, until the peer has closed its end or the session's [`Waker`] has
     /// woken or been dropped. Never consumes bytes from the stream. An error means the poll itself
     /// failed, not that the peer is gone.
     pub fn wait(self) -> std::io::Result<()> {
@@ -84,15 +83,17 @@ impl HangupWatcher {
         }
     }
 
+    /// Poll in slices of [`RECHECK_EVERY`] until something is ready, with no cap: a poll that is already
+    /// waiting could miss its wake, and the next slice looks again.
     fn poll_once(&self) -> std::io::Result<Ready> {
         loop {
-            if let Some(ready) = self.poll_ready(-1)? {
+            if let Some(ready) = self.poll_ready(poll_milliseconds(RECHECK_EVERY))? {
                 return Ok(ready);
             }
         }
     }
 
-    /// One `WSAPoll` with `timeout_ms` (-1 blocks until something is ready, 0 only asks).
+    /// One `WSAPoll` of at most `timeout_ms` milliseconds (0 only asks).
     fn poll_ready(&self, timeout_ms: i32) -> std::io::Result<Option<Ready>> {
         // No requested events on the session socket: `WSAPoll` reports hangup regardless, and
         // never reports readable data, which is not this watcher's business.
@@ -112,7 +113,9 @@ impl HangupWatcher {
         // SAFETY: `fds` is a live array of at least `polled` entries; both sockets outlive the call.
         let rc = unsafe { WSAPoll(fds.as_mut_ptr(), polled as u32, timeout_ms) };
         if rc < 0 {
-            return Err(std::io::Error::from_raw_os_error(unsafe { WSAGetLastError() }.0));
+            let e = std::io::Error::from_raw_os_error(unsafe { WSAGetLastError() }.0);
+            // An interruption ended the slice early, which any end does; the next slice polls again.
+            return if is_interruption(&e) { Ok(None) } else { Err(e) };
         }
         if fds[0].revents.0 != 0 {
             return Ok(Some(Ready::Hangup));

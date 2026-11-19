@@ -126,7 +126,7 @@ pub fn run() -> anyhow::Result<()> {
             || folder.connect_request(),
             is_no_agent,
         )?;
-        crate::afunix::split(conn)
+        Ok(crate::afunix::split(conn)?)
     };
     // No profile, no folder and nothing listening all mean there is no session; anything else is not
     // that.

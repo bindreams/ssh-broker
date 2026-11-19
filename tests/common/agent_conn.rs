@@ -164,9 +164,9 @@ impl AgentConn {
         let conn = userdir::inspect_socket_dir(location, user)
             .and_then(|folders| folders.connect())
             .unwrap_or_else(|e| panic!("connect to the agent at {}: {e:#}", location.path().display()));
-        // A failure bound on the agent's output, an external event that may never come.
-        conn.set_read_timeout(Some(SILENCE_BOUND)).unwrap();
         let (rx, tx) = afunix::split(conn).unwrap();
+        // A failure bound on the agent's output, an external event that may never come.
+        rx.set_read_timeout(Some(SILENCE_BOUND));
         AgentConn {
             rx,
             tx,

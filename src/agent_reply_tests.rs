@@ -2,7 +2,7 @@
 //! closes none of them without a byte while it is alive. No shell is started: the starters of the
 //! hooks fail on purpose, and the connections are AF_UNIX pairs in a temp dir.
 use super::*;
-use crate::afunix::{ConnTx, Whole};
+use crate::afunix::{self, ConnTx};
 use crate::protocol::{ElevationPolicy, FrameKind, Handshake, Launch, Mode, Stream, write_frame};
 use crate::relay::{Outcome, TestSink, pump_decode, write_data};
 use crate::shell::test_host::{TestHost, USER_CONFIG};
@@ -23,7 +23,8 @@ struct Answer {
 /// is what the agent waits for.
 fn answered(tag: &str, hooks: Hooks, send: impl FnOnce(&mut ConnTx) + Send + 'static) -> (Answer, anyhow::Result<()>) {
     let (server, client, dir) = crate::test_support::raw_socket_pair(tag);
-    let agent = std::thread::spawn(move || handle_connection_in(server, hooks, &Control::standalone()));
+    let agent =
+        std::thread::spawn(move || handle_connection_in(Conn::new(server).unwrap(), hooks, &Control::standalone()));
     let (mut rx, mut tx) = afunix::split(client).unwrap();
     send(&mut tx);
     let mut sink = TestSink::default();
@@ -135,26 +136,11 @@ fn a_frame_cut_short_is_answered_not_dropped() {
 }
 
 #[test]
-fn a_connection_that_cannot_be_split_is_answered_on_the_socket_itself() {
-    let hooks = Hooks {
-        split: |socket| Err((Whole::of(socket), anyhow::anyhow!("no handle to duplicate"))),
-        ..Hooks::production()
-    };
-    let (answer, result) = answered("no-split", hooks, handshake(Mode::Exec, "echo"));
-    assert_eq!(answer.outcome, Outcome::Exited(255));
-    assert_eq!(
-        answer.stderr,
-        "ssh-broker: the agent could not set up the connection: no handle to duplicate\r\n"
-    );
-    assert!(result.is_err());
-}
-
-#[test]
 fn a_client_that_connects_and_leaves_without_a_byte_is_not_a_fault() {
     // The wake that ends the accept loop is such a client.
     let (server, client, dir) = crate::test_support::raw_socket_pair("left");
     drop(client);
-    let result = handle_connection_in(server, Hooks::production(), &Control::standalone());
+    let result = handle_connection_in(Conn::new(server).unwrap(), Hooks::production(), &Control::standalone());
     assert!(result.is_ok(), "{:#}", result.unwrap_err());
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -166,7 +152,7 @@ fn a_client_that_leaves_in_the_middle_of_a_frame_is_still_a_bad_request() {
     let (_rx, mut tx) = afunix::split(client).unwrap();
     std::io::Write::write_all(&mut tx, &[FrameKind::Handshake as u8, 100, 0, 0, 0, 1]).unwrap();
     tx.shutdown_both().unwrap();
-    let result = handle_connection_in(server, Hooks::production(), &Control::standalone());
+    let result = handle_connection_in(Conn::new(server).unwrap(), Hooks::production(), &Control::standalone());
     assert!(result.is_err());
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -193,6 +179,16 @@ fn a_handler_that_panics_answers_its_connection_with_255_before_it_closes() {
         "ssh-broker: the agent failed while serving this connection: the handler panicked\r\n"
     );
     assert!(handler.is_err(), "the panic is not swallowed");
+}
+
+/// The share of the connection a panic reply keeps is not a second handle a child can inherit: a child started
+/// while it is held must not keep the connection open once the agent has closed everything of its own.
+#[test]
+fn a_panic_reply_does_not_let_a_child_hold_the_connection_open() {
+    let control = Control::standalone();
+    crate::test_support::assert_a_child_does_not_hold_a_connection_open("panic-reply-child", |conn| {
+        logout::PanicReply::new(conn.clone(), &control)
+    });
 }
 
 #[test]
@@ -824,7 +820,6 @@ fn nothing_is_written_to_the_client_until_the_session_has_started() {
 }
 
 fn nothing_is_written_until_started(tag: &str, mode: Mode) {
-    use std::mem::MaybeUninit;
     use std::sync::{Mutex, mpsc};
     let (started, client_hears_of_it) = mpsc::channel::<()>();
     let (client_has_looked, agent_waits_for_it) = mpsc::channel::<()>();
@@ -839,7 +834,8 @@ fn nothing_is_written_until_started(tag: &str, mode: Mode) {
         ..Hooks::production()
     };
     let (server, client, dir) = crate::test_support::raw_socket_pair(&format!("serving-after-start-{tag}"));
-    let agent = std::thread::spawn(move || handle_connection_in(server, hooks, &Control::standalone()));
+    let agent =
+        std::thread::spawn(move || handle_connection_in(Conn::new(server).unwrap(), hooks, &Control::standalone()));
     let (mut rx, mut tx) = afunix::split(client).unwrap();
     let hs = Handshake {
         mode,
@@ -852,16 +848,13 @@ fn nothing_is_written_until_started(tag: &str, mode: Mode) {
         .expect("the agent ended before it started the session");
 
     // The agent is held in the hook: the session has started, and nothing has been written to this connection.
-    let looking = tx.try_clone_socket().unwrap();
-    looking.set_nonblocking(true).unwrap();
-    let mut first_byte = [MaybeUninit::<u8>::uninit()];
-    let found = looking.peek(&mut first_byte);
-    looking.set_nonblocking(false).unwrap();
-    // The agent waits for the client to close, and a copy of the connection held open would keep it waiting.
-    drop(looking);
+    // A read with a limit that has already passed makes one `recv` and says `TimedOut` when it finds nothing.
+    rx.set_read_timeout(Some(std::time::Duration::ZERO));
+    let found = std::io::Read::read(&mut rx, &mut [0u8; 1]);
+    rx.set_read_timeout(None);
     client_has_looked.send(()).unwrap();
     assert!(
-        matches!(&found, Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
+        matches!(&found, Err(e) if e.kind() == std::io::ErrorKind::TimedOut),
         "something was written before the session had started: {found:?}"
     );
 

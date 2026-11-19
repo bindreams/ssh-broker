@@ -580,6 +580,7 @@ dependencies = [
  "cosca",
  "encoding_rs",
  "fd-lock",
+ "libc",
  "pipe",
  "postcard",
  "serde",

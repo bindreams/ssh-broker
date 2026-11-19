@@ -252,6 +252,12 @@ whose subject is a possibly-sick machine: hanging is the worst way to report one
 away the local rows already gathered. `--probe-timeout 0` keeps the true unbounded hang for anyone
 debugging such a deadlock. Nothing else may take a bound on this argument.
 
+**Product code reads, writes and accepts on an AF_UNIX socket only through `afunix`** *(review)*:
+connections are non-blocking and one loop waits in slices of `RECHECK_EVERY` and retries (rationale: the
+`afunix` module doc). A connection is one `Conn` handle; never duplicate it. No `SO_RCVTIMEO`, no raw
+`socket2::Socket` I/O. A test holding a raw socket as the other end never waits for its END with a
+blocking read: it waits for a frame, or reads through `afunix::split`.
+
 **No run of spaces inside a string literal.** A sentence written over several lines is joined with a
 trailing `\`, which also drops the next line's indentation; joined any other way, the indentation
 lands in the sentence. The hook rejects three or more spaces between two non-space characters inside

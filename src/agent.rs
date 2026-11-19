@@ -62,7 +62,7 @@ mod session;
 mod verb;
 
 #[cfg(windows)]
-use crate::afunix::{self, AcceptError, ConnRx, ConnTx, Listener};
+use crate::afunix::{AcceptError, Conn, ConnRx, ConnTx, Listener};
 #[cfg(windows)]
 use crate::agent_background::{Refusal, check_start, mark_listening};
 #[cfg(windows)]
@@ -557,11 +557,14 @@ fn accept_loop_with(
                             tracing::warn!("connection handler error: {e:?}");
                         }
                     }
-                    Arrived::Refused(conn, cause) => {
-                        let failure =
-                            logout::fail_socket(conn, &control, "the agent could not use the connection", cause);
-                        tracing::warn!("refused a connection: {failure:#}");
-                    }
+                    Arrived::Refused(sock, cause) => match logout::admit(sock) {
+                        Ok(conn) => {
+                            let failure =
+                                logout::fail_socket(conn, &control, "the agent could not use the connection", cause);
+                            tracing::warn!("refused a connection: {failure:#}");
+                        }
+                        Err(e) => tracing::warn!("refused a connection that could not be answered: {e:#}; {cause:#}"),
+                    },
                 },
             )
         },
@@ -830,7 +833,7 @@ fn handle_connection(conn: socket2::Socket) -> anyhow::Result<()> {
 /// agent's, which `logout` does not end.
 #[cfg(all(windows, test))]
 fn handle_connection_with(conn: socket2::Socket, hooks: Hooks) -> anyhow::Result<()> {
-    handle_connection_in(conn, hooks, &Control::standalone())
+    handle_connection_in(Conn::new(conn)?, hooks, &Control::standalone())
 }
 
 /// What a session runs with: the hooks a test can replace, the agent's shared control, the token its
@@ -844,9 +847,10 @@ struct Env<'a> {
     reservation: Reservation<'a>,
 }
 
-/// How a session obtains its [`HangupWatcher`]; a parameter so a test can force a failure.
+/// How a session obtains its [`HangupWatcher`], given a share of its connection; a parameter so a test can
+/// force a failure.
 #[cfg(windows)]
-type WatchFactory = fn(&ConnTx) -> std::io::Result<(HangupWatcher, Waker)>;
+type WatchFactory = fn(Conn) -> std::io::Result<(HangupWatcher, Waker)>;
 
 /// How a session starts its shell in a pseudoconsole (`command`, `cols`, `rows`, `cwd`, and the one
 /// handle besides the pseudoconsole's that the shell inherits, if any, the token the shell runs
@@ -868,10 +872,6 @@ type PtyStarter = fn(
 #[cfg(windows)]
 type ExecStarter = fn(&str, Option<&Path>, Option<&UnelevatedToken>, &[(&str, &str)]) -> Result<ExecChild, StartError>;
 
-/// How a connection is split into halves; a parameter so a test can force a failure.
-#[cfg(windows)]
-type Splitter = fn(socket2::Socket) -> Result<(ConnRx, ConnTx), (afunix::Whole, anyhow::Error)>;
-
 /// How a session gets what its shell runs with, given what the login asked of elevation: the stepped-down token,
 /// the agent's own, or a refusal (see [`crate::account::step_down`]); a parameter so a test can force a failure.
 #[cfg(windows)]
@@ -886,7 +886,6 @@ struct Hooks {
     start_exec: ExecStarter,
     /// What the shell configuration is resolved against: the machine, in production.
     shell_host: Box<dyn crate::shell::Host + Send + Sync>,
-    split: Splitter,
     parked: ParkSignal,
     /// Called once the session's shell is started and before it is registered, the window in which
     /// the agent can begin to end.
@@ -917,7 +916,6 @@ impl Hooks {
             start_pty: PtySession::spawn,
             start_exec: ExecChild::spawn,
             shell_host: Box::new(crate::shell::WindowsHost),
-            split: afunix::try_split,
             parked: ParkSignal::default(),
             after_spawn: Box::new(|| {}),
             observe: Box::new(|_| {}),
@@ -928,18 +926,22 @@ impl Hooks {
 /// [`handle_connection_in`] for a thread of its own: if the thread panics, the connection is answered
 /// with the failure reply before it closes (see [`logout::PanicReply`]).
 #[cfg(windows)]
-fn serve_connection(conn: socket2::Socket, hooks: Hooks, control: &Control) -> anyhow::Result<()> {
-    let _answer_a_panic = logout::PanicReply::new(&conn, control);
+fn serve_connection(sock: socket2::Socket, hooks: Hooks, control: &Control) -> anyhow::Result<()> {
+    let conn = logout::admit(sock)?;
+    let _answer_a_panic = logout::PanicReply::new(conn.clone(), control);
     handle_connection_in(conn, hooks, control)
 }
 
 /// Serve one connection. The agent never closes a connection without a byte while it is alive: a
-/// connection it cannot set up, read or carry out is answered with a frame the shim prints (see
+/// connection it cannot read or carry out is answered with a frame the shim prints (see
 /// [`logout::fail_connection`]), and the error comes back for the log. A client that leaves before
 /// it sends anything has nothing to be told, and is not an error.
+///
+/// The one exception is a socket that [`Conn::new`] cannot make non-blocking and non-inheritable: it is
+/// closed unanswered, which the shim handles as a close without a byte.
 #[cfg(windows)]
-fn handle_connection_in(conn: socket2::Socket, hooks: Hooks, control: &Control) -> anyhow::Result<()> {
-    let Some(Opened { mut rx, fr, mut tx, hs }) = read_request(hooks.split, conn, control)? else {
+fn handle_connection_in(conn: Conn, hooks: Hooks, control: &Control) -> anyhow::Result<()> {
+    let Some(Opened { mut rx, fr, mut tx, hs }) = read_request(conn, control)? else {
         return Ok(());
     };
     if hs.mode == Mode::Logout {
@@ -1049,21 +1051,8 @@ struct Opened {
 /// came on. `None` if the client left before it sent a byte. An `Err` has been answered already (see
 /// [`logout::fail_connection`]) and is for the log.
 #[cfg(windows)]
-fn read_request(split: Splitter, conn: socket2::Socket, control: &Control) -> anyhow::Result<Option<Opened>> {
-    let (mut rx, mut tx) = match split(conn) {
-        Ok(halves) => halves,
-        Err((whole, cause)) => {
-            let (mut rx, mut tx) = (&whole, &whole);
-            return Err(logout::fail_connection(
-                &mut rx,
-                &mut tx,
-                control,
-                "the agent could not set up the connection",
-                cause,
-                logout::FAILED_EXIT_CODE,
-            ));
-        }
-    };
+fn read_request(conn: Conn, control: &Control) -> anyhow::Result<Option<Opened>> {
+    let (mut rx, mut tx) = conn.split();
     let mut fr = FrameReader::new();
     match read_handshake(&mut rx, &mut fr) {
         Ok(Some(hs)) => Ok(Some(Opened { rx, fr, tx, hs })),
@@ -1388,13 +1377,6 @@ impl HalfClose for ConnTx {
     }
 }
 
-#[cfg(windows)]
-impl HalfClose for &afunix::Whole {
-    fn shutdown_write(&self) -> anyhow::Result<()> {
-        afunix::Whole::shutdown_write(self)
-    }
-}
-
 /// Send the shell's exit code and FIN the write half. A client that has gone loses the code, which
 /// is routine and logged at debug; any other failure loses it too and is logged as a warning.
 #[cfg(windows)]
@@ -1626,7 +1608,7 @@ struct HangupGuard {
 /// only loses the hangup protection.
 #[cfg(windows)]
 fn start_hangup_watch(tx: &ConnTx, job: &Arc<cosca::Job>, make_watcher: WatchFactory) -> Option<HangupGuard> {
-    let (hangup, waker) = match make_watcher(tx) {
+    let (hangup, waker) = match make_watcher(tx.conn().clone()) {
         Ok(pair) => pair,
         Err(e) => {
             tracing::warn!("could not create the hangup watcher; a silent command will outlive its client: {e}");
@@ -1667,7 +1649,7 @@ impl HangupGuard {
             }
             // Dropping the waker closes the wake channel, which normally ends the watcher. If the
             // channel itself failed it may not, and a join could block until the peer's FIN. The
-            // thread holds only a socket duplicate and the job, so detaching it is safe.
+            // thread holds only a share of the connection and the job, so detaching it is safe.
             Err(e) => tracing::error!("could not wake the hangup watcher; leaving it to end on its own: {e}"),
         }
     }

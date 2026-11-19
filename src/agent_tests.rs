@@ -158,7 +158,11 @@ fn assert_refused((outcome, stderr): (Outcome, Vec<u8>)) {
 /// shim takes a connection that ends without a byte for an agent that is going away.
 fn assert_unstartable_is_answered(tag: &str, mode: Mode, what: &str) {
     let (outcome, stderr) = refused_login_of(tag, mode, "ssh-broker-no-such-program-4f1c", |conn| {
-        let result = super::handle_connection_in(conn, Hooks::production(), &super::Control::standalone());
+        let result = super::handle_connection_in(
+            afunix::Conn::new(conn).unwrap(),
+            Hooks::production(),
+            &super::Control::standalone(),
+        );
         assert!(result.is_err(), "the failure is returned for the log");
     });
     assert_eq!(outcome, Outcome::Exited(255));
@@ -188,7 +192,7 @@ fn an_exec_login_to_an_ending_agent_is_refused_before_a_shell_starts() {
             after_spawn: Box::new(|| panic!("a shell was started for a login the agent had refused")),
             ..Hooks::production()
         };
-        super::handle_connection_in(conn, hooks, &control).unwrap();
+        super::handle_connection_in(afunix::Conn::new(conn).unwrap(), hooks, &control).unwrap();
     }));
 }
 
@@ -204,7 +208,7 @@ fn an_exec_login_that_loses_the_race_with_the_end_is_refused_not_relayed() {
             },
             ..Hooks::production()
         };
-        super::handle_connection_in(conn, hooks, &control).unwrap();
+        super::handle_connection_in(afunix::Conn::new(conn).unwrap(), hooks, &control).unwrap();
     }));
 }
 
@@ -219,7 +223,7 @@ fn a_pty_login_that_loses_the_race_with_the_end_is_refused_not_relayed() {
             },
             ..Hooks::production()
         };
-        super::handle_connection_in(conn, hooks, &control).unwrap();
+        super::handle_connection_in(afunix::Conn::new(conn).unwrap(), hooks, &control).unwrap();
     }));
 }
 
@@ -321,7 +325,7 @@ fn a_pty_login_refused_after_the_shell_wrote_a_lot_is_still_refused() {
             },
             ..Hooks::production()
         };
-        super::handle_connection_in(conn, hooks, &control).unwrap();
+        super::handle_connection_in(afunix::Conn::new(conn).unwrap(), hooks, &control).unwrap();
         seen.note("the agent answered the refusal");
     }));
     assert!(
@@ -1232,7 +1236,7 @@ fn session_halves(tag: &str) -> (afunix::ConnTx, afunix::ConnRx, socket2::Socket
 fn finishing_the_hangup_watch_wakes_and_joins_the_watcher_thread() {
     use std::sync::atomic::{AtomicBool, Ordering};
     let (tx, _rx, client, dir) = session_halves("finish-joins");
-    let (watcher, waker) = HangupWatcher::new(&tx).unwrap();
+    let (watcher, waker) = HangupWatcher::new(tx.conn().clone()).unwrap();
     let ended = std::sync::Arc::new(AtomicBool::new(false));
     let flag = std::sync::Arc::clone(&ended);
     let thread = thread::spawn(move || {
@@ -1254,7 +1258,7 @@ fn finishing_the_hangup_watch_wakes_and_joins_the_watcher_thread() {
 #[test]
 fn finishing_the_hangup_watch_does_not_wait_when_the_wake_fails() {
     let (tx, _rx, client, dir) = session_halves("finish-detaches");
-    let (watcher, waker) = HangupWatcher::new(&tx).unwrap();
+    let (watcher, waker) = HangupWatcher::new(tx.conn().clone()).unwrap();
     // With the watcher gone the wake channel's far end is closed, so wakes start failing once the
     // reset reaches us.
     drop(watcher);
@@ -1469,7 +1473,9 @@ fn the_id_a_running_session_prints(tag: &str, control: &super::Control) -> crate
     use crate::protocol::{SESSION_VARIABLE, SessionId, read_one_frame};
     let (server, client, dir) = crate::test_support::raw_socket_pair(tag);
     let id = thread::scope(|scope| {
-        scope.spawn(|| super::handle_connection_in(server, Hooks::production(), control).unwrap());
+        scope.spawn(|| {
+            super::handle_connection_in(afunix::Conn::new(server).unwrap(), Hooks::production(), control).unwrap()
+        });
         let (mut crx, mut ctx) = afunix::split(client).unwrap();
         let hs = Handshake {
             mode: Mode::Exec,

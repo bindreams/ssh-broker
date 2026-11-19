@@ -27,6 +27,14 @@ fn a_read_limit_is_rounded_up_to_whole_milliseconds_and_never_to_zero() {
 }
 
 #[test]
+fn a_poll_is_asked_for_whole_milliseconds_that_fit_what_the_os_takes() {
+    use std::time::Duration;
+    assert_eq!(super::poll_milliseconds(super::RECHECK_EVERY), 100);
+    assert_eq!(super::poll_milliseconds(Duration::ZERO), 1);
+    assert_eq!(super::poll_milliseconds(Duration::MAX), i32::MAX);
+}
+
+#[test]
 fn unix_addr_rejects_an_overlong_path() {
     // sockaddr_un sun_path is ~108 bytes; a 200-char path must be rejected loudly.
     let long = format!("/tmp/{}.sock", "x".repeat(200));
@@ -62,14 +70,14 @@ fn listen_connect_echo() {
     let client = std::thread::spawn({
         let p = sock_path.clone();
         move || {
-            let mut c = super::connect(&p).unwrap();
-            c.write_all(b"hello").unwrap();
+            let (_rx, mut tx) = super::split(super::connect(&p).unwrap()).unwrap();
+            tx.write_all(b"hello").unwrap();
         }
     });
 
-    let mut conn = listener.accept().unwrap();
+    let (mut rx, _tx) = super::split(listener.accept().unwrap()).unwrap();
     let mut buf = [0u8; 5];
-    conn.read_exact(&mut buf).unwrap();
+    rx.read_exact(&mut buf).unwrap();
     assert_eq!(&buf, b"hello");
 
     client.join().unwrap();
@@ -86,11 +94,11 @@ fn split_halves_are_independent_and_shutdown_signals_eof() {
     let client = std::thread::spawn({
         let p = sock_path.clone();
         move || {
-            let mut c = super::connect(&p).unwrap();
-            c.write_all(b"req").unwrap();
+            let (mut rx, mut tx) = super::split(super::connect(&p).unwrap()).unwrap();
+            tx.write_all(b"req").unwrap();
             // read the server's reply until EOF (server shuts down its write half)
             let mut reply = Vec::new();
-            c.read_to_end(&mut reply).unwrap();
+            rx.read_to_end(&mut reply).unwrap();
             reply
         }
     });
@@ -109,6 +117,252 @@ fn split_halves_are_independent_and_shutdown_signals_eof() {
 
     let reply = client.join().unwrap();
     assert_eq!(reply, b"reply");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_write_that_finds_the_buffer_full_goes_on_when_the_peer_reads() {
+    use std::io::{Read, Write};
+    /// More than the socket buffers hold, so the writer must wait for the reader.
+    const TOTAL: usize = 8 * 1024 * 1024;
+    let dir = setup_socket_dir("full-buffer");
+    let sock_path = dir.join("s");
+    let listener = super::Listener::bind(&sock_path, Integrity::Medium).unwrap();
+
+    let writer = std::thread::spawn({
+        let p = sock_path.clone();
+        move || {
+            let (_rx, mut tx) = super::split(super::connect(&p).unwrap()).unwrap();
+            let chunk = [b'x'; 64 * 1024];
+            for _ in 0..TOTAL / chunk.len() {
+                tx.write_all(&chunk).unwrap();
+            }
+            tx.shutdown_write().unwrap();
+        }
+    });
+
+    let (mut rx, _tx) = super::split(listener.accept().unwrap()).unwrap();
+    let mut got = Vec::new();
+    rx.read_to_end(&mut got).unwrap();
+    writer.join().unwrap();
+    assert_eq!(got.len(), TOTAL);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// How long the test below lets a waiting loop run, and the most turns it may make in that time:
+/// a loop that pauses for a slice between two looks makes about five, one that spins makes
+/// hundreds of thousands.
+#[cfg(windows)]
+const OBSERVED: std::time::Duration = std::time::Duration::from_millis(500);
+#[cfg(windows)]
+const MOST_TURNS: u32 = 20;
+
+/// A `wait` that does what the real one does, counts its calls in `turns`, and fails once `OBSERVED`
+/// has passed since `since`, which ends the loop that called it.
+#[cfg(windows)]
+fn counting_wait<'a>(
+    turns: &'a std::cell::Cell<u32>,
+    since: std::time::Instant,
+) -> impl FnMut(&socket2::Socket, super::IoKind, std::time::Duration) -> std::io::Result<()> + 'a {
+    move |sock, kind, timeout| {
+        turns.set(turns.get() + 1);
+        if since.elapsed() >= OBSERVED {
+            return Err(std::io::Error::other("observed long enough"));
+        }
+        super::wait(sock, kind, timeout)
+    }
+}
+
+/// A write to a peer that has shut down its write side and does not read must not spin.
+#[cfg(windows)]
+#[test]
+fn a_write_waiting_for_room_does_not_spin_when_the_peer_has_half_closed_and_does_not_read() {
+    use std::io::Write;
+    let (server, client, dir) = crate::test_support::raw_socket_pair("half-closed-full");
+    server.shutdown(std::net::Shutdown::Write).unwrap();
+    client.set_nonblocking(true).unwrap();
+    for size in [64 * 1024, 1] {
+        let chunk = vec![0u8; size];
+        loop {
+            match (&client).write(&chunk) {
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(e) => panic!("filling the buffer: {e}"),
+            }
+        }
+    }
+    // Controls: the buffer is full, and the poll returns at once with something other than room, which
+    // is the state the pause is for. Without both, a pass here says nothing about the pause.
+    assert_eq!(
+        (&client).write(&[0u8]).map_err(|e| e.kind()),
+        Err(std::io::ErrorKind::WouldBlock),
+        "control: the send buffer is full"
+    );
+    assert_eq!(
+        super::poll_once(&client, super::IoKind::Write, super::RECHECK_EVERY).unwrap(),
+        super::Polled::Other,
+        "control: the poll answers at once with something other than room"
+    );
+    let turns = std::cell::Cell::new(0);
+    let err = super::write_waiting_by(&client, &[0u8], counting_wait(&turns, std::time::Instant::now()))
+        .expect_err("nobody reads, so the write never gets room");
+    assert_eq!(err.to_string(), "observed long enough");
+    assert!(
+        turns.get() <= MOST_TURNS,
+        "{} turns in {OBSERVED:?}: the wait does not pause",
+        turns.get()
+    );
+    drop((server, client));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Only a write pauses when its poll returns for something other than the event asked.
+#[test]
+fn only_a_write_pauses_when_the_poll_returns_for_something_else() {
+    use super::{IoKind, Polled, pauses};
+    assert!(
+        !pauses(IoKind::Read, Polled::Other),
+        "a read whose poll answered with the hang-up only"
+    );
+    assert!(!pauses(IoKind::Read, Polled::Asked));
+    assert!(!pauses(IoKind::Read, Polled::TimedOut));
+    assert!(
+        pauses(IoKind::Write, Polled::Other),
+        "a write whose poll did not report room"
+    );
+    assert!(!pauses(IoKind::Write, Polled::Asked));
+    assert!(!pauses(IoKind::Write, Polled::TimedOut));
+}
+
+/// A read whose limit is already zero still makes one `recv` before it reports `TimedOut`.
+#[cfg(windows)]
+#[test]
+fn a_read_whose_limit_has_passed_still_reads_what_has_arrived() {
+    use std::io::{Read, Write};
+    use std::time::Duration;
+    let (server, client, dir) = crate::test_support::raw_socket_pair("limit-passed");
+    let (mut rx, tx) = super::split(client).unwrap();
+    let (server_rx, mut server_tx) = super::split(server).unwrap();
+    // One write of two bytes: reading the first leaves the second certainly queued.
+    server_tx.write_all(b"ab").unwrap();
+    let mut one = [0u8; 1];
+    assert_eq!(rx.read(&mut one).unwrap(), 1);
+    assert_eq!(&one, b"a");
+    rx.set_read_timeout(Some(Duration::ZERO));
+    assert_eq!(
+        rx.read(&mut one).unwrap(),
+        1,
+        "the queued byte is read, not reported as a time out"
+    );
+    assert_eq!(&one, b"b");
+    let err = rx
+        .read(&mut one)
+        .expect_err("nothing is queued and the limit has passed");
+    assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+    drop((rx, tx, server_rx, server_tx));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(windows)]
+use crate::test_support::LOST_WAKE_LIMIT;
+
+/// A thread's own handle, to ask whether the thread has an I/O request issued and not yet completed:
+/// it is exactly then parked in the kernel inside a blocking call.
+#[cfg(windows)]
+struct ThreadProbe(crate::winutil::OwnedHandle);
+
+#[cfg(windows)]
+impl ThreadProbe {
+    fn of_current() -> ThreadProbe {
+        use windows::Win32::System::Threading::{GetCurrentThreadId, OpenThread, THREAD_QUERY_INFORMATION};
+        // SAFETY: plain calls; the handle is closed by `OwnedHandle`.
+        let handle = unsafe { OpenThread(THREAD_QUERY_INFORMATION, false, GetCurrentThreadId()) }.expect("OpenThread");
+        ThreadProbe(crate::winutil::OwnedHandle(handle))
+    }
+
+    fn io_pending(&self) -> bool {
+        use windows::Win32::System::Threading::GetThreadIOPendingFlag;
+        use windows::core::BOOL;
+        let mut pending = BOOL(0);
+        // SAFETY: `self.0.0` is an open thread handle; `pending` is a valid out pointer.
+        unsafe { GetThreadIOPendingFlag(self.0.0, &mut pending) }.expect("GetThreadIOPendingFlag");
+        pending.as_bool()
+    }
+}
+
+/// Run `wait` on a thread of its own; once that thread is parked inside a call (`ThreadProbe`), run
+/// `act` on this one. Returns what `wait` returned. The re-check of the flag has no cap: `wait`
+/// returning ends it too, and then `act` does not run and the caller's assertion says what came back.
+#[cfg(windows)]
+fn act_once_waiting<R: Send + 'static>(wait: impl FnOnce() -> R + Send + 'static, act: impl FnOnce()) -> R {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, mpsc};
+    let done = Arc::new(AtomicBool::new(false));
+    let (probe_tx, probe_rx) = mpsc::channel();
+    let waiter = std::thread::spawn({
+        let done = Arc::clone(&done);
+        move || {
+            probe_tx.send(ThreadProbe::of_current()).unwrap();
+            let result = wait();
+            done.store(true, Ordering::Release);
+            result
+        }
+    });
+    let probe = probe_rx.recv().expect("the waiter sends its handle");
+    let mut parked = false;
+    while !parked && !done.load(Ordering::Acquire) {
+        parked = probe.io_pending();
+        std::thread::yield_now();
+    }
+    if parked {
+        act();
+    }
+    waiter.join().unwrap()
+}
+
+/// The peer writes and closes at once, while the reader is already waiting: a blocking `recv` on
+/// Windows AF_UNIX loses the close about once in fifty, and its reader then sleeps until its limit.
+/// Every read here is a read of the transport, which must see the close.
+#[cfg(windows)]
+#[test]
+fn a_read_already_waiting_when_the_peer_closes_sees_the_close() {
+    use std::io::Read;
+    const TRIALS: u32 = 500;
+    for i in 0..TRIALS {
+        let (server, client, dir) = crate::test_support::raw_socket_pair(&format!("closes-{i}"));
+        let (mut rx, tx) = super::split(client).unwrap();
+        rx.set_read_timeout(Some(LOST_WAKE_LIMIT));
+        let (server_rx, mut server_tx) = super::split(server).unwrap();
+        let read_to_the_end = move || {
+            let mut got = Vec::new();
+            rx.read_to_end(&mut got).map(|_| got)
+        };
+        let got = act_once_waiting(read_to_the_end, || {
+            use std::io::Write;
+            server_tx.write_all(b"hello").unwrap();
+            drop((server_rx, server_tx));
+        });
+        assert_eq!(got.as_deref().ok(), Some(&b"hello"[..]), "trial {i}: {got:?}");
+        drop(tx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// A poll that is already waiting does not wake for a shutdown of the same socket while no input is
+/// unread (measured), so the end of the read is the re-check, not the poll.
+#[cfg(windows)]
+#[test]
+fn a_read_on_one_half_ends_when_the_other_half_shuts_down_both_ways() {
+    use std::io::Read;
+    let (server, client, dir) = crate::test_support::raw_socket_pair("shutdown-both");
+    let (mut rx, tx) = super::split(client).unwrap();
+    rx.set_read_timeout(Some(LOST_WAKE_LIMIT));
+    let read = act_once_waiting(move || rx.read(&mut [0u8; 8]), || tx.shutdown_both().unwrap());
+    assert!(
+        !matches!(&read, Err(e) if e.kind() == std::io::ErrorKind::TimedOut),
+        "the read did not end when the other half shut the connection down: {read:?}"
+    );
+    drop(server);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -208,6 +462,32 @@ fn a_connection_that_arrives_inheritable_is_refused_not_fixed_up() {
         }
         other => panic!("{other:?}"),
     }
+}
+
+// shares of one connection -----
+
+/// `Conn::new` is `pub`, so it clears the inherit flag itself rather than relying on `accept` or `connect`.
+#[cfg(windows)]
+#[test]
+fn a_connection_made_of_an_inheritable_socket_is_not_inheritable() {
+    let sock = socket2::Socket::new_raw(socket2::Domain::UNIX, socket2::Type::STREAM, None).unwrap();
+    assert!(super::is_inheritable(&sock).unwrap(), "control: made without the flag");
+    let conn = super::Conn::new(sock).unwrap();
+    assert!(
+        !super::is_inheritable(&conn).unwrap(),
+        "a child started now would inherit the connection"
+    );
+}
+
+/// The halves of a split connection and a hang-up watcher are shares of one socket handle. Were either a
+/// second handle (a `try_clone` is born inheritable on Windows), a child started meanwhile (a shell, say)
+/// would inherit it and hold the connection open after the agent closed everything of its own.
+#[cfg(windows)]
+#[test]
+fn a_child_started_while_connections_are_split_does_not_hold_them_open() {
+    crate::test_support::assert_a_child_does_not_hold_a_connection_open("holds-connection", |conn| {
+        crate::hangup::HangupWatcher::new(conn.clone()).unwrap()
+    });
 }
 
 // the socket file's own ACL ----------------------------------------------------------------
@@ -346,6 +626,15 @@ fn an_interruption_is_to_be_retried() {
 
 #[cfg(windows)]
 #[test]
+fn an_interrupted_wait_is_recognised_by_winsocks_code() {
+    // `std` has no `ErrorKind` for WSAEINTR, so the kind alone does not say it.
+    assert!(super::is_interruption(&raw(10004)));
+    assert!(super::is_interruption(&std::io::ErrorKind::Interrupted.into()));
+    assert!(!super::is_interruption(&raw(10035)));
+}
+
+#[cfg(windows)]
+#[test]
 fn a_shortage_of_descriptors_or_buffers_is_exhaustion_and_keeps_its_code() {
     // WSAEMFILE and WSAENOBUFS clear only when something else lets go of a resource.
     for code in [10024, 10055] {
@@ -358,9 +647,10 @@ fn a_shortage_of_descriptors_or_buffers_is_exhaustion_and_keeps_its_code() {
 
 #[cfg(windows)]
 #[test]
-fn codes_a_blocking_listener_cannot_return_are_fatal_and_say_so() {
-    // WSAEWOULDBLOCK needs a non-blocking socket and WSAEINPROGRESS a Winsock 1.1 blocking call in
-    // progress; this listener is neither, so getting one means something is wrong with it.
+fn codes_accept_never_hands_on_are_fatal_and_say_so() {
+    // WSAEWOULDBLOCK is the non-blocking listener's "nothing yet", which `accept_waiting` waits out, and
+    // WSAEINPROGRESS needs a Winsock 1.1 blocking call in progress; getting either here means something
+    // is wrong.
     for code in [10035, 10036] {
         match super::classify_accept_error(raw(code)) {
             super::AcceptError::Fatal(e) => {

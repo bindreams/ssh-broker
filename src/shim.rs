@@ -128,7 +128,8 @@ pub fn closed_twice_message(agent: Option<&std::path::Path>) -> String {
 impl Pumped {
     /// The connection ended without the agent having sent a byte: the agent was ending, or was gone,
     /// before it took this session, because an agent that is alive answers every connection it cannot
-    /// serve. An interactive session goes back to the path it takes when there is no agent; a command is
+    /// serve (but for a socket that cannot be made a connection, which it closes: see
+    /// `handle_connection_in`'s doc). An interactive session goes back to the path it takes when there is no agent; a command is
     /// never sent again, since the agent may have started it. A protocol or sink failure cannot happen
     /// without a byte.
     pub fn no_answer(&self) -> bool {

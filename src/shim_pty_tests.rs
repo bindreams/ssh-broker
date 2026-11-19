@@ -1509,7 +1509,8 @@ fn agent_in_private_folder(
     let listener = crate::afunix::Listener::bind(location.path(), crate::socket_loc::Integrity::Medium).unwrap();
     let agent = std::thread::spawn(move || {
         let mut first = [0u8; 1];
-        listener.accept().unwrap().read(&mut first).unwrap()
+        let (mut rx, _tx) = crate::afunix::split(listener.accept().unwrap()).unwrap();
+        rx.read(&mut first).unwrap()
     });
     (profile, location, agent)
 }
