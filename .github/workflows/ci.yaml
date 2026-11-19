@@ -98,7 +98,8 @@ jobs:
     name: Test (${{ matrix.label }})
     needs: platforms
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
+    # A failure bound, not a pace: the Windows run takes about an hour since each elevate test takes the machine alone.
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.platforms.outputs.matrix) }}

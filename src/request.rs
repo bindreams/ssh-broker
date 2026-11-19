@@ -1,9 +1,11 @@
 //! request: the client loop of the verbs that ask the invoking user's agent for something (`logout`): connect,
 //! ask, retry once if the agent was ending, and report when there is no agent.
 
-use std::io::Write;
+use std::io::{Read, Write};
 
-use crate::shim::{PROTOCOL_VIOLATION_CODE, closed_twice_message};
+use crate::protocol::{FrameKind, FrameReader, Stream, write_frame};
+use crate::relay::{FrameSink, Outcome};
+use crate::shim::{PROTOCOL_VIOLATION_CODE, closed_twice_message, map_outcome, peer_gone, pump_heard};
 
 /// The exit code when the agent could not be reached for a reason other than not being there.
 pub const UNREACHABLE_CODE: i32 = 4;
@@ -16,6 +18,70 @@ pub enum Asked {
     /// The connection ended before the agent's first byte. An agent that is alive answers every
     /// connection, so this one is ending or gone.
     Unanswered,
+}
+
+/// Writes the reply of a request: the agent's stdout to `out` and everything else (its stderr) to `err`, then an exit
+/// code. A reply is stderr only, except the output of a command the agent ran for `elevate`.
+pub struct ReplySink<'a> {
+    pub out: &'a mut dyn Write,
+    pub err: &'a mut dyn Write,
+}
+
+impl FrameSink for ReplySink<'_> {
+    fn on_data(&mut self, stream: Stream, bytes: &[u8]) -> anyhow::Result<()> {
+        let to = match stream {
+            Stream::Stdout => &mut *self.out,
+            _ => &mut *self.err,
+        };
+        to.write_all(bytes)?;
+        to.flush()?;
+        Ok(())
+    }
+}
+
+/// Send the request `payload` as a frame of `kind`. `Err` is how asking ended without an answer to wait for: the
+/// peer had closed ([`Asked::Unanswered`]), or the request could not be built or written, which `err` is told
+/// (`what` says what was asked).
+pub fn send_request<W: Write>(
+    tx: &mut W,
+    err: &mut dyn Write,
+    kind: FrameKind,
+    payload: anyhow::Result<Vec<u8>>,
+    what: &str,
+) -> Result<(), Asked> {
+    let sent = payload
+        .and_then(|bytes| write_frame(tx, kind, &bytes))
+        .and_then(|()| tx.flush().map_err(Into::into));
+    let Err(e) = sent else { return Ok(()) };
+    if peer_gone(&e).is_some() {
+        return Err(Asked::Unanswered);
+    }
+    let _ = writeln!(err, "ssh-broker: could not {what}: {e:#}");
+    Err(Asked::Code(map_outcome(Ok(Outcome::PeerClosed))))
+}
+
+/// Send the request `payload` as a frame of `kind` over a connected transport and relay the reply to `out` and `err`
+/// (see [`ReplySink`]): the ask of every verb, which `ask_at` runs. `payload` is what encoding the request gave, and
+/// `what` says what was asked, for a request that cannot be sent. The transport is borrowed, not consumed: the caller
+/// keeps it open until the process exits.
+pub fn ask_with<R: Read, W: Write>(
+    rx: &mut R,
+    tx: &mut W,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+    kind: FrameKind,
+    payload: anyhow::Result<Vec<u8>>,
+    what: &str,
+) -> Asked {
+    if let Err(asked) = send_request(tx, err, kind, payload, what) {
+        return asked;
+    }
+    let pumped = pump_heard(rx, &mut FrameReader::new(), &mut ReplySink { out, err });
+    if pumped.no_answer() {
+        Asked::Unanswered
+    } else {
+        Asked::Code(pumped.code())
+    }
 }
 
 /// Connect with `connect`, run `ask` on the connection, and hand its exit code to `exit` **while the

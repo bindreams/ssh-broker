@@ -6,6 +6,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::shell::pack::MAX_LINE_UNITS;
+
 pub const HEADER_LEN: usize = 5;
 /// Guard against absurd allocations from a malformed/hostile length prefix (1 MiB).
 pub const MAX_FRAME: u32 = 1 << 20;
@@ -15,7 +17,11 @@ pub const MAX_FRAME: u32 = 1 << 20;
 /// starts nothing and the client should run the session itself. A refusal is the other possible start: data
 /// frames (the shell's warnings, then the reason on stderr) and `Exit`, never `Serving`. Any first frame ends
 /// the client's wait, and a client sends no input before it. `Serving` and `HandBack` anywhere but first are protocol errors. [`Mode::Logout`] is not answered this
-/// way.
+/// way. A `Request` is answered the same way (a refusal, or `Serving` once the command has started, then its output
+/// and its exit code), and that is how the client tells "ran" from "did not run".
+///
+/// `Request` (payload: an [`ElevationRequest`]) is a first frame instead of a handshake, on the request socket
+/// only; the agent reads it as it reads a handshake, and in a stream it is a protocol error.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrameKind {
@@ -25,6 +31,7 @@ pub enum FrameKind {
     Exit = 3,
     Serving = 4,
     HandBack = 5,
+    Request = 6,
 }
 
 impl FrameKind {
@@ -36,6 +43,7 @@ impl FrameKind {
             3 => Some(Self::Exit),
             4 => Some(Self::Serving),
             5 => Some(Self::HandBack),
+            6 => Some(Self::Request),
             _ => None,
         }
     }
@@ -183,7 +191,7 @@ impl std::fmt::Debug for SessionId {
 }
 
 /// The wire version; a peer of any other version is refused by name.
-pub const PROTOCOL_VERSION: u16 = 5;
+pub const PROTOCOL_VERSION: u16 = 6;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Mode {
@@ -313,6 +321,78 @@ impl Handshake {
             launch: Launch::Direct,
             elevation: Some(ElevationPolicy::DEFAULT),
         }
+    }
+}
+
+/// The most UTF-16 units a request's working directory may have (a path of the system's own limit). A command is
+/// held to the command line's limit (32,767 units with its terminator, the session's own line's).
+pub const MAX_ELEVATION_UNITS: usize = 32_767;
+
+/// What `ssh-broker elevate` sends on `request.sock`, as the payload of a [`FrameKind::Request`] frame. Everything in
+/// it comes from a process below High: read it strictly ([`ElevationRequest::decode`]), judge it
+/// ([`ElevationRequest::check`]) and use none of it as a path but the working directory, which the agent checks
+/// to be an existing directory.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ElevationRequest {
+    /// First, so that a peer of another version is refused by name ([`ElevationRequest::decode`]).
+    pub version: u16,
+    /// The caller's [`SESSION_VARIABLE`], as it shows a [`SessionId`].
+    pub session: String,
+    /// The line as typed after `elevate`, its program replaced by the quoted absolute path the client found.
+    pub command: String,
+    /// The working directory to run it in.
+    pub cwd: String,
+    /// `elevate --terminal`: the command gets a pseudoconsole of its own that owns the session's screen while it
+    /// runs. Otherwise its input is closed and its output comes back on this connection.
+    pub terminal: bool,
+}
+
+impl ElevationRequest {
+    pub fn encode(&self) -> anyhow::Result<Vec<u8>> {
+        Ok(postcard::to_stdvec(self)?)
+    }
+
+    /// The request `b` holds, and nothing else: bytes after it are an error. A peer of another version is refused
+    /// by its number, before the rest is read.
+    pub fn decode(b: &[u8]) -> anyhow::Result<Self> {
+        let (version, _) = postcard::take_from_bytes::<u16>(b)?;
+        anyhow::ensure!(
+            version == PROTOCOL_VERSION,
+            "protocol version mismatch: peer {version} != ours {PROTOCOL_VERSION}"
+        );
+        let (request, rest) = postcard::take_from_bytes::<Self>(b)?;
+        anyhow::ensure!(rest.is_empty(), "{} byte(s) after the request", rest.len());
+        Ok(request)
+    }
+
+    /// The session this request names, if the request is one the agent may act on: a [`SessionId`], a command that
+    /// is not empty and whose program is an absolute path (the file is not looked for: starting it reports that), a
+    /// command of fewer than 32,767 UTF-16 units (`CreateProcessW` counts its terminator in them, as
+    /// the session's own line does), a working directory of at most [`MAX_ELEVATION_UNITS`], and no NUL anywhere.
+    /// The error says which field.
+    pub fn check(&self) -> anyhow::Result<SessionId> {
+        let session = SessionId::parse(&self.session)
+            .ok_or_else(|| anyhow::anyhow!("the session is not a session id of this program"))?;
+        anyhow::ensure!(!self.command.is_empty(), "the command is empty");
+        for (field, text) in [("command", &self.command), ("working directory", &self.cwd)] {
+            anyhow::ensure!(!text.contains('\0'), "the {field} holds a NUL");
+        }
+        let units = self.command.encode_utf16().count();
+        anyhow::ensure!(
+            units < MAX_LINE_UNITS,
+            "the command is {units} UTF-16 units, at or over the limit of {MAX_LINE_UNITS} (with its terminator)"
+        );
+        let units = self.cwd.encode_utf16().count();
+        anyhow::ensure!(
+            units <= MAX_ELEVATION_UNITS,
+            "the working directory is {units} UTF-16 units, over the limit of {MAX_ELEVATION_UNITS}"
+        );
+        let (program, _) = crate::cmdline::split_program(&self.command);
+        anyhow::ensure!(
+            crate::shell::is_absolute_windows(std::path::Path::new(program)),
+            "the program of the command is not an absolute path: {program:?}"
+        );
+        Ok(session)
     }
 }
 

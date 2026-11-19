@@ -96,7 +96,7 @@ pub fn join_args<S: AsRef<str>>(args: &[S]) -> String {
 }
 
 /// Space and tab separate arguments; nothing else does.
-const SEPARATORS: [char; 2] = [' ', '\t'];
+pub const SEPARATORS: [char; 2] = [' ', '\t'];
 
 /// Split `line` into arguments by the MSVCRT rules, the program name included.
 pub fn split_args(line: &str) -> Vec<String> {
@@ -109,8 +109,12 @@ pub fn split_args(line: &str) -> Vec<String> {
     args
 }
 
-/// The first argument of `s` and what follows it, or `None` when only separators remain.
-fn next_arg(s: &str) -> Option<(String, &str)> {
+/// The first argument of `s` and what follows it exactly as written (empty, or beginning with a separator), or
+/// `None` when only separators remain. The rule is the C runtime's for every argument but the program name, the one
+/// `std::env::args` applies: quotes toggle anywhere, `\"` is a quote. It is the rule for the program of a line that is
+/// the tail of this process's own command line, which is an argument; see [`split_program`] for the first token of a
+/// line handed to `CreateProcessW`.
+pub fn next_arg(s: &str) -> Option<(String, &str)> {
     let s = s.trim_start_matches(SEPARATORS);
     if s.is_empty() {
         return None;
@@ -126,14 +130,14 @@ fn next_arg(s: &str) -> Option<(String, &str)> {
                 while chars.next_if(|&(_, c)| c == '\\').is_some() {
                     backslashes += 1;
                 }
-                if chars.next_if(|&(_, c)| c == '"').is_some() {
-                    // 2n backslashes then a quote: n backslashes, and the quote delimits.
+                if chars.peek().is_some_and(|&(_, c)| c == '"') {
+                    // 2n backslashes then a quote: n backslashes, and the quote is left to the quote rule below
+                    // (as `std::env::args` does: inside quotes `""` is one literal quote).
                     // 2n+1: n backslashes and a literal quote.
                     arg.extend(std::iter::repeat_n('\\', backslashes / 2));
                     if backslashes % 2 == 1 {
+                        chars.next();
                         arg.push('"');
-                    } else {
-                        in_quotes = !in_quotes;
                     }
                 } else {
                     arg.extend(std::iter::repeat_n('\\', backslashes));
@@ -156,14 +160,49 @@ fn next_arg(s: &str) -> Option<(String, &str)> {
     Some((arg, &s[end..]))
 }
 
-/// The program name, which has no escape rules: a leading quote ends at the next quote.
-fn after_program(line: &str) -> &str {
+/// The program name of `line`, without its quotes, and the rest of the line exactly as written (its separators
+/// included). The program name has no escape rules: a leading quote ends at the next quote, a backslash before it
+/// included, and a name that is never closed runs to the end.
+pub fn split_program(line: &str) -> (&str, &str) {
     let line = line.trim_start_matches(SEPARATORS);
-    let end = match line.strip_prefix('"') {
-        Some(quoted) => quoted.find('"').map_or(line.len(), |i| i + 2),
-        None => line.find(SEPARATORS).unwrap_or(line.len()),
-    };
-    &line[end..]
+    match line.strip_prefix('"') {
+        Some(quoted) => match quoted.find('"') {
+            Some(close) => (&quoted[..close], &quoted[close + 1..]),
+            None => (quoted, ""),
+        },
+        None => line.split_at(line.find(SEPARATORS).unwrap_or(line.len())),
+    }
+}
+
+/// What follows the program name of the process's own command line, which the C runtime reads (argv[0]) by its
+/// rule for the program name: no escapes, quotes toggle anywhere in the name (`C:\"a b"\x.exe` is one name), and
+/// it ends at a separator outside quotes. [`split_program`] is `CreateProcessW`'s rule for a line it is handed:
+/// two rules for two things. A name whose quote is never closed runs to the end. The line is not trimmed first: one
+/// that starts with a separator has an empty name, and its arguments follow.
+fn after_program(line: &str) -> &str {
+    let mut in_quotes = false;
+    for (i, c) in line.char_indices() {
+        match c {
+            '"' => in_quotes = !in_quotes,
+            c if !in_quotes && SEPARATORS.contains(&c) => return &line[i..],
+            _ => {}
+        }
+    }
+    ""
+}
+
+/// The text of `line` after its program name and its first `count` arguments, as written and without the
+/// separators before it: `ssh-broker elevate cmd /c echo  "a&b"` is `cmd /c echo  "a&b"` after one argument
+/// (`elevate`). Empty when the line has no more.
+pub fn after_args(line: &str, count: usize) -> &str {
+    let mut rest = after_program(line);
+    for _ in 0..count {
+        match next_arg(rest) {
+            Some((_, after)) => rest = after,
+            None => return "",
+        }
+    }
+    rest.trim_start_matches(SEPARATORS)
 }
 
 /// The text after the `-c` token, as written; `None` when the line's first argument is not `-c`.

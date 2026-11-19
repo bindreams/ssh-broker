@@ -122,6 +122,119 @@ fn logout_takes_no_arguments() {
 }
 
 #[test]
+fn route_elevate_takes_the_rest_of_the_arguments_and_a_dash_c_login_stays_the_shim() {
+    assert_eq!(
+        route_line("ssh-broker.exe elevate cmd /c whoami"),
+        Route::Elevate {
+            terminal: false,
+            command: "cmd /c whoami".into()
+        }
+    );
+    assert_eq!(
+        route_line(r#"ssh-broker.exe elevate "C:\Program Files\x.exe" "a b" --help"#),
+        Route::Elevate {
+            terminal: false,
+            command: r#""C:\Program Files\x.exe" "a b" --help"#.into()
+        },
+        "the arguments are the command's, whatever they look like"
+    );
+    assert_eq!(
+        route_line("ssh-broker.exe elevate"),
+        Route::Usage(Verb::Elevate),
+        "no command is a usage line"
+    );
+    assert_eq!(command("ssh-broker.exe -c \"elevate x\""), some("elevate x"));
+    assert_eq!(command("ssh-broker.exe -c elevate"), some("elevate"));
+}
+
+#[test]
+fn elevate_terminal_is_a_flag_only_as_the_first_argument_after_the_verb() {
+    assert_eq!(
+        route_line("ssh-broker.exe elevate --terminal cmd /k"),
+        Route::Elevate {
+            terminal: true,
+            command: "cmd /k".into()
+        }
+    );
+    assert_eq!(
+        route_line("ssh-broker.exe elevate cmd --terminal"),
+        Route::Elevate {
+            terminal: false,
+            command: "cmd --terminal".into()
+        },
+        "after the command's first word it is the command's own argument"
+    );
+    assert_eq!(
+        route_line("ssh-broker.exe elevate --terminal --terminal"),
+        Route::Elevate {
+            terminal: true,
+            command: "--terminal".into()
+        },
+        "only the first one is the flag"
+    );
+    assert_eq!(
+        route_line("ssh-broker.exe elevate --terminal"),
+        Route::Usage(Verb::Elevate),
+        "the flag alone has no command"
+    );
+}
+
+/// The command is the text after the verb (and the flag) as typed, not argv joined again: argv has lost the quotes
+/// and the runs of spaces that decide what the command does.
+#[test]
+fn elevate_carries_the_line_as_written_not_argv() {
+    assert_eq!(
+        route_line(r#"ssh-broker.exe elevate cmd /c echo "a&whoami""#),
+        Route::Elevate {
+            terminal: false,
+            command: r#"cmd /c echo "a&whoami""#.into()
+        }
+    );
+    assert_eq!(
+        route_line(r#""C:\Program Files\ssh-broker.exe" elevate --terminal  p   "a  b"  \"c\""#),
+        Route::Elevate {
+            terminal: true,
+            command: r#"p   "a  b"  \"c\""#.into()
+        }
+    );
+}
+
+/// argv's program name is partly quoted, or empty: the text after `elevate` is still cut from where argv put it. The
+/// argv after argv[0] is written out for each line, as the runtime gives it, not derived from the line.
+#[test]
+fn the_programs_own_name_may_be_partly_quoted() {
+    let args = |args: &[&str]| args.iter().map(|a| (*a).to_owned()).collect::<Vec<_>>();
+    assert_eq!(
+        route(
+            &args(&["elevate", "whoami"]),
+            r#"C:\tools\"my bin"\ssh-broker.exe elevate whoami"#
+        ),
+        Route::Elevate {
+            terminal: false,
+            command: "whoami".into()
+        }
+    );
+    assert_eq!(
+        route(
+            &args(&["elevate", "whoami", "/all"]),
+            r#"C:\"a b"\"c d"\ssh-broker.exe elevate whoami /all"#
+        ),
+        Route::Elevate {
+            terminal: false,
+            command: "whoami /all".into()
+        }
+    );
+    // A line that starts with a blank has an empty argv[0]: `elevate` is the first argument.
+    assert_eq!(
+        route(&args(&["elevate", "whoami"]), " elevate whoami"),
+        Route::Elevate {
+            terminal: false,
+            command: "whoami".into()
+        }
+    );
+}
+
+#[test]
 fn a_flag_name_is_not_a_flag_value() {
     assert_eq!(
         route_line("ssh-broker.exe agent --background --expect-user --expect-user x"),
@@ -276,6 +389,7 @@ fn a_command_named_like_a_verb_is_still_shim_exec() {
         "verify-probe",
         "console-fallback",
         "logout",
+        "elevate",
         "auto-login",
     ] {
         assert_eq!(command(&format!("ssh-broker.exe -c {verb}")), some(verb));

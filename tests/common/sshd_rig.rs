@@ -352,18 +352,32 @@ impl SshSession {
     }
 
     pub fn read_until(&mut self, needle: &str) {
+        self.read_until_shown(&format!("{needle:?}"), |text| text.contains(needle));
+    }
+
+    /// Read until the session has shown `needle` after the last `after` it has shown: something new, where
+    /// `needle` alone was on the screen before (the shell's next prompt after a command's output).
+    pub fn read_until_after(&mut self, after: &str, needle: &str) {
+        self.read_until_shown(&format!("{needle:?} after {after:?}"), |text| {
+            text.rfind(after)
+                .is_some_and(|at| text[at + after.len()..].contains(needle))
+        });
+    }
+
+    /// Read until `shown` accepts what the session has shown; `what` names it for the failure.
+    fn read_until_shown(&mut self, what: &str, shown: impl Fn(&str) -> bool) {
         loop {
-            if self.text().contains(needle) {
+            if shown(&self.text()) {
                 return;
             }
             let received = self.output.recv_timeout(SILENCE_BOUND); // sleep-ok: failure bound on the session's output, an external event that may never come; expiry fails the test and is not read as state
             match received {
                 Ok(chunk) => self.transcript.extend_from_slice(&chunk),
                 Err(RecvTimeoutError::Disconnected) => {
-                    self.fail(&format!("ssh ended before the session showed {needle:?}"))
+                    self.fail(&format!("ssh ended before the session showed {what}"))
                 }
                 Err(RecvTimeoutError::Timeout) => self.fail(&format!(
-                    "the session was silent for {SILENCE_BOUND:?} while the test waited for {needle:?}"
+                    "the session was silent for {SILENCE_BOUND:?} while the test waited for {what}"
                 )),
             }
         }
@@ -549,6 +563,61 @@ pub fn screen_text(stream: &[u8]) -> String {
     let mut terminal = vt100::Parser::new(rows, cols, 0);
     terminal.process(stream);
     terminal.screen().contents().replace(['\r', '\n'], "")
+}
+
+/// What a terminal shows after a stream, with scrollback: the rows of the live screen, and the history above them.
+/// Rows are kept and not joined, because a test asserts that no row of an elevated command is left on the screen.
+pub struct Rendered {
+    visible: Vec<String>,
+    history: Vec<String>,
+}
+
+impl Rendered {
+    /// The rows of the live screen, trailing blanks trimmed.
+    pub fn rows(&self) -> &[String] {
+        &self.visible
+    }
+
+    /// The live screen as rows joined by `\n`.
+    pub fn visible(&self) -> String {
+        self.visible.join("\n")
+    }
+
+    /// The scrollback, oldest row first, and then the live screen, as rows joined by `\n`.
+    pub fn history(&self) -> String {
+        self.history.join("\n")
+    }
+}
+
+/// [`rendered_at`] on the 120x30 terminal [`screen_text`] uses.
+pub fn rendered(stream: &[u8], scrollback: usize) -> Rendered {
+    rendered_at(stream, 30, 120, scrollback)
+}
+
+/// The terminal of `rows`x`cols` with `scrollback` rows of history, after `stream`, which a client received for a
+/// session with a terminal. The history is read by stepping the viewport from the oldest row to the live screen.
+pub fn rendered_at(stream: &[u8], rows: u16, cols: u16, scrollback: usize) -> Rendered {
+    let (rows_nz, cols_nz) = (
+        std::num::NonZeroU16::new(rows).expect("a terminal has rows"),
+        std::num::NonZeroU16::new(cols).expect("a terminal has columns"),
+    );
+    let mut terminal = vt100::Parser::new(rows_nz, cols_nz, scrollback);
+    terminal.process(stream);
+    let screen = terminal.screen_mut();
+    let rows_of =
+        |screen: &vt100::Screen| -> Vec<String> { screen.rows(0, cols).map(|row| row.trim_end().to_owned()).collect() };
+    let held = screen.scrollback_len();
+    // The line at the top of the viewport scrolled back by `back` is line `held - back` of the whole: history
+    // first, then the live screen.
+    let mut history = Vec::new();
+    for back in (0..=held).rev() {
+        screen.set_scrollback(back);
+        history.push(rows_of(screen).swap_remove(0));
+    }
+    screen.set_scrollback(0);
+    let visible = rows_of(screen);
+    history.extend(visible.iter().skip(1).cloned());
+    Rendered { visible, history }
 }
 
 // A client on a console of its own =====
