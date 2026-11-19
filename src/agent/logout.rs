@@ -273,9 +273,8 @@ pub(super) fn fail_connection<R: LimitedRead, W: Write + HalfClose>(
     cause.context(what.to_owned())
 }
 
-/// Make a connection of a socket the accept loop took (see [`Conn::new`]). A socket that cannot be made
-/// non-blocking and not inheritable is closed unanswered, and the error says so (the `io::Error` beneath
-/// it says which call failed; see [`super::handle_connection_in`] for why neither is answered).
+/// Make a connection of a socket the accept loop took ([`Conn::new`]); on failure it is closed unanswered
+/// (see [`super::handle_connection_in`]).
 pub(super) fn admit(sock: socket2::Socket) -> anyhow::Result<Conn> {
     Conn::new(sock).map_err(|e| {
         anyhow::Error::new(e)

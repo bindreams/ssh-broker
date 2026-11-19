@@ -115,8 +115,7 @@ pub struct Pumped {
 pub const PROTOCOL_VIOLATION_CODE: i32 = 254;
 
 /// What a client says when two connections in a row that connected were closed without a byte. An agent
-/// that follows the protocol closes a connection without a byte only while its listener is closing (or
-/// for a socket it cannot make a connection of: see `handle_connection_in`'s doc), so
+/// that follows the protocol closes a connection without a byte only while its listener is closing, so
 /// the connect after that fails or reaches an agent that answers: this one is something else, such as
 /// an older agent that does not know the request.
 pub fn closed_twice_message(agent: Option<&std::path::Path>) -> String {

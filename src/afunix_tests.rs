@@ -27,6 +27,14 @@ fn a_read_limit_is_rounded_up_to_whole_milliseconds_and_never_to_zero() {
 }
 
 #[test]
+fn a_poll_is_asked_for_whole_milliseconds_that_fit_what_the_os_takes() {
+    use std::time::Duration;
+    assert_eq!(super::poll_milliseconds(super::RECHECK_EVERY), 100);
+    assert_eq!(super::poll_milliseconds(Duration::ZERO), 1);
+    assert_eq!(super::poll_milliseconds(Duration::MAX), i32::MAX);
+}
+
+#[test]
 fn unix_addr_rejects_an_overlong_path() {
     // sockaddr_un sun_path is ~108 bytes; a 200-char path must be rejected loudly.
     let long = format!("/tmp/{}.sock", "x".repeat(200));
@@ -165,9 +173,7 @@ fn counting_wait<'a>(
     }
 }
 
-/// A peer that has shut down its write side and does not read: `WSAPoll` answers a wait on the other
-/// end at once with the hang-up whatever it was asked for, while a `send` into the full buffer still
-/// finds no room. The write must not turn into a spin.
+/// A write to a peer that has shut down its write side and does not read must not spin.
 #[cfg(windows)]
 #[test]
 fn a_write_waiting_for_room_does_not_spin_when_the_peer_has_half_closed_and_does_not_read() {
@@ -185,6 +191,18 @@ fn a_write_waiting_for_room_does_not_spin_when_the_peer_has_half_closed_and_does
             }
         }
     }
+    // Controls: the buffer is full, and the poll returns at once with something other than room, which
+    // is the state the pause is for. Without both, a pass here says nothing about the pause.
+    assert_eq!(
+        (&client).write(&[0u8]).map_err(|e| e.kind()),
+        Err(std::io::ErrorKind::WouldBlock),
+        "control: the send buffer is full"
+    );
+    assert_eq!(
+        super::poll_once(&client, super::IoKind::Write, super::RECHECK_EVERY).unwrap(),
+        super::Polled::Other,
+        "control: the poll answers at once with something other than room"
+    );
     let turns = std::cell::Cell::new(0);
     let err = super::write_waiting_by(&client, &[0u8], counting_wait(&turns, std::time::Instant::now()))
         .expect_err("nobody reads, so the write never gets room");
@@ -198,10 +216,7 @@ fn a_write_waiting_for_room_does_not_spin_when_the_peer_has_half_closed_and_does
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A read whose peer has closed is woken by the hang-up alone, and its next `recv` reports the end at once:
-/// pausing for the rest of the slice would delay every clean close. Only a write, which a full buffer
-/// keeps from sending whatever the poll says, has a spin to prevent. `wait` pauses exactly when `pauses`
-/// says so, so this table is the whole rule.
+/// Only a write pauses when its poll returns for something other than the event asked.
 #[test]
 fn only_a_write_pauses_when_the_poll_returns_for_something_else() {
     use super::{IoKind, Polled, pauses};
@@ -217,6 +232,35 @@ fn only_a_write_pauses_when_the_poll_returns_for_something_else() {
     );
     assert!(!pauses(IoKind::Write, Polled::Asked));
     assert!(!pauses(IoKind::Write, Polled::TimedOut));
+}
+
+/// A read whose limit is already zero still makes one `recv` before it reports `TimedOut`.
+#[cfg(windows)]
+#[test]
+fn a_read_whose_limit_has_passed_still_reads_what_has_arrived() {
+    use std::io::{Read, Write};
+    use std::time::Duration;
+    let (server, client, dir) = crate::test_support::raw_socket_pair("limit-passed");
+    let (mut rx, tx) = super::split(client).unwrap();
+    let (server_rx, mut server_tx) = super::split(server).unwrap();
+    // One write of two bytes: reading the first leaves the second certainly queued.
+    server_tx.write_all(b"ab").unwrap();
+    let mut one = [0u8; 1];
+    assert_eq!(rx.read(&mut one).unwrap(), 1);
+    assert_eq!(&one, b"a");
+    rx.set_read_timeout(Some(Duration::ZERO));
+    assert_eq!(
+        rx.read(&mut one).unwrap(),
+        1,
+        "the queued byte is read, not reported as a time out"
+    );
+    assert_eq!(&one, b"b");
+    let err = rx
+        .read(&mut one)
+        .expect_err("nothing is queued and the limit has passed");
+    assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+    drop((rx, tx, server_rx, server_tx));
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[cfg(windows)]

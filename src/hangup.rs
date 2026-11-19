@@ -6,14 +6,12 @@
 //!
 //! [`HangupWatcher`] waits in `WSAPoll`, a slice of [`RECHECK_EVERY`] at a time, on a share of the
 //! session's connection (the socket its halves use), which reports `POLLHUP` for a closed peer without
-//! consuming a byte. A poll that is already waiting does not wake for a local `shutdown_write`, nor
-//! for a local `shutdown_both` unless input is unread, and a poll with no events asked, made after a
-//! local `shutdown_write` with input unread, reports nothing (all measured), so a second socket joins
-//! the same poll: [`Waker::wake`] writes to it at teardown. It is one end of a loopback TCP connection
+//! consuming a byte. A poll that is already waiting does not wake for a local shutdown (measured), so a
+//! second socket joins the same poll: [`Waker::wake`] writes to it at teardown. It is one end of a loopback TCP connection
 //! this module made (see [`wake_pair`]); [`accept_own`] admits only that connection, so no other
 //! process can write to the other end.
 
-use crate::afunix::{Conn, RECHECK_EVERY, is_interruption};
+use crate::afunix::{Conn, RECHECK_EVERY, is_interruption, poll_milliseconds};
 use socket2::{Domain, SockAddr, Socket, Type};
 use std::cell::Cell;
 use std::io::{Read, Write};
@@ -89,14 +87,13 @@ impl HangupWatcher {
     /// waiting could miss its wake, and the next slice looks again.
     fn poll_once(&self) -> std::io::Result<Ready> {
         loop {
-            if let Some(ready) = self.poll_ready(RECHECK_EVERY.as_millis() as i32)? {
+            if let Some(ready) = self.poll_ready(poll_milliseconds(RECHECK_EVERY))? {
                 return Ok(ready);
             }
         }
     }
 
-    /// One `WSAPoll` of at most `timeout_ms` milliseconds (0 only asks). [`Self::poll_once`] gives it
-    /// a slice of [`RECHECK_EVERY`], so no call waits without an end.
+    /// One `WSAPoll` of at most `timeout_ms` milliseconds (0 only asks).
     fn poll_ready(&self, timeout_ms: i32) -> std::io::Result<Option<Ready>> {
         // No requested events on the session socket: `WSAPoll` reports hangup regardless, and
         // never reports readable data, which is not this watcher's business.

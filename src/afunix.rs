@@ -337,17 +337,14 @@ fn set_no_inherit(sock: &Socket) -> std::io::Result<()> {
 /// clone; it closes when the last is dropped.
 ///
 /// Every holder sees the connection's state, not a copy of it: a shutdown through any share is the
-/// connection's, and so is the mode. `Socket::try_clone` and `DuplicateHandle` are not used to make a
-/// second handle (see the module doc): on Windows a `try_clone` is born inheritable, and Microsoft's
-/// documentation says not to duplicate sockets.
+/// connection's, and so is the mode.
 #[derive(Clone)]
 pub struct Conn(Arc<Socket>);
 
 impl Conn {
-    /// Make `sock` a connection: non-blocking (a blocking `recv` is what the transport abolishes, and on
-    /// a blocking socket the read limit would be inert), then, on Windows, not inheritable. The inherit
-    /// flag is cleared here and not relied on from `accept` or `connect`, because this is `pub`. An
-    /// error is one of those two steps refused, and the socket is dropped, so closed.
+    /// Make `sock` a connection: non-blocking (else the read limit is inert), then, on Windows, not
+    /// inheritable. The inherit flag is cleared here, not relied on from `accept`/`connect`, because this
+    /// is `pub`. On error the socket is dropped, so closed.
     pub fn new(sock: Socket) -> std::io::Result<Conn> {
         sock.set_nonblocking(true)?;
         #[cfg(windows)]
@@ -404,14 +401,10 @@ impl ConnRx {
     }
 }
 
-/// The longest one wait for a socket lasts before the call it waits for is made again.
-///
-/// It is the latency of a wake the OS lost (a blocking call on a Windows AF_UNIX socket can miss
-/// one), never a bound and never proof of anything: a wait that ends by this slice proves nothing,
-/// and the loop has no cap. 100 ms is below what a person notices when a prompt ends, and costs
-/// about ten wakeups a second per idle waiting thread. It is also the pause of a write whose poll
-/// answered at once with something other than what was asked (see [`pauses`]), so that such a socket
-/// is looked at about once a slice and not in a spin.
+/// The longest one wait lasts before the call is made again: the latency of a wake the OS lost (a
+/// blocking call on a Windows AF_UNIX socket can miss one). Never a bound or proof of state; the loop
+/// has no cap. Also the pause of a write whose poll answered at once with something else (see
+/// [`pauses`]).
 pub(crate) const RECHECK_EVERY: Duration = Duration::from_millis(100);
 
 /// What a [`wait`] waits for the socket to be ready to do.
@@ -422,9 +415,7 @@ enum IoKind {
 }
 
 /// Read from the non-blocking `sock`, waiting for something to read for up to `limit` (`None`: no
-/// limit). The wait is a sleep that may end early and is never acted on: each time it ends, `recv` is
-/// called again, which is what finds data, the close, or a shutdown that the wait did not wake for.
-/// A limit that has passed is `TimedOut`, after one more `recv`. Every other result is `recv`'s.
+/// limit). A limit that has passed is `TimedOut`, after one more `recv`. Every other result is `recv`'s.
 fn read_waiting(sock: &Socket, buf: &mut [u8], limit: Option<Duration>) -> std::io::Result<usize> {
     // A limit too long to be a point in time is no limit.
     let deadline = limit.and_then(|limit| Instant::now().checked_add(limit));
@@ -476,9 +467,7 @@ fn write_waiting_by(
 /// The one thing read from the poll's answer is what [`pauses`] says about it: a write's poll that
 /// answers at once with something other than what was asked (Windows reports a peer's half-close
 /// whatever events were asked for, while a `send` into a full buffer still finds no room) would turn the
-/// caller's loop into a spin, so then the rest of `timeout` is a plain pause. That pause proves nothing,
-/// as the poll's sleep proves nothing: the caller still makes its call, at most about once a slice in
-/// that state and at once when the event asked for is reported. A read does not pause.
+/// caller's loop into a spin, so then the rest of `timeout` is a plain pause. A read does not pause.
 ///
 /// On Windows a write whose peer has half-closed its sending side and still reads moves about one send
 /// buffer per [`RECHECK_EVERY`]: `WSAPoll` reports the half-close at once whatever was asked, so the wait
@@ -495,7 +484,7 @@ fn wait(sock: &Socket, kind: IoKind, timeout: Duration) -> std::io::Result<()> {
 }
 
 /// What a poll that returned said, which is all [`wait`] reads from it.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum Polled {
     /// Nothing was reported: the time ran out, or the poll was interrupted (an interruption ended the
     /// sleep early, which any end does, and reports nothing).
@@ -506,12 +495,10 @@ enum Polled {
     Other,
 }
 
-/// Whether a wait whose poll returned before `timeout` pauses for the rest of it: only a write, and only
-/// when the poll reported something other than the event asked ([`Polled::Other`]). A read never pauses:
-/// a peer's close wakes the poll with the hang-up alone (measured on Windows, for a close and for a
-/// half-close), and the `recv` that follows reports the end at once, so a pause would delay every
-/// clean close by up to [`RECHECK_EVERY`]. The spin the pause prevents exists only for a write, which
-/// a full send buffer keeps from sending whatever the poll says (see [`wait`]).
+/// Whether a wait whose poll returned early pauses for the rest of `timeout`: only a write, and only
+/// when the poll reported something other than the event asked ([`Polled::Other`]). A read does not: a
+/// peer's close wakes the poll with hang-up alone and the next `recv` reports the end, so a pause would
+/// delay every clean close.
 fn pauses(kind: IoKind, polled: Polled) -> bool {
     matches!((kind, polled), (IoKind::Write, Polled::Other))
 }
@@ -532,9 +519,8 @@ fn poll_once(sock: &Socket, kind: IoKind, timeout: Duration) -> std::io::Result<
         events,
         revents: WSAPOLL_EVENT_FLAGS(0),
     }];
-    let millis = i32::try_from(whole_milliseconds_up(timeout).as_millis()).unwrap_or(i32::MAX);
     // SAFETY: `fds` is a live array of one entry; the socket outlives the call.
-    let rc = unsafe { WSAPoll(fds.as_mut_ptr(), 1, millis) };
+    let rc = unsafe { WSAPoll(fds.as_mut_ptr(), 1, poll_milliseconds(timeout)) };
     if rc < 0 {
         let e = std::io::Error::from_raw_os_error(unsafe { WSAGetLastError() }.0);
         return if is_interruption(&e) {
@@ -563,9 +549,8 @@ fn poll_once(sock: &Socket, kind: IoKind, timeout: Duration) -> std::io::Result<
         events,
         revents: 0,
     }];
-    let millis = libc::c_int::try_from(whole_milliseconds_up(timeout).as_millis()).unwrap_or(libc::c_int::MAX);
     // SAFETY: `fds` is a live array of one entry; the descriptor is open for the call.
-    let rc = unsafe { libc::poll(fds.as_mut_ptr(), 1, millis) };
+    let rc = unsafe { libc::poll(fds.as_mut_ptr(), 1, poll_milliseconds(timeout)) };
     if rc < 0 {
         let e = std::io::Error::last_os_error();
         return if is_interruption(&e) {
@@ -605,6 +590,11 @@ fn whole_milliseconds_up(limit: Duration) -> Duration {
     Duration::from_millis(u64::try_from(millis).unwrap_or(u64::MAX))
 }
 
+/// The timeout argument of a poll for `limit`: [`whole_milliseconds_up`], at most what the OS takes.
+pub(crate) fn poll_milliseconds(limit: Duration) -> i32 {
+    i32::try_from(whole_milliseconds_up(limit).as_millis()).unwrap_or(i32::MAX)
+}
+
 impl ConnTx {
     /// The connection this half is a share of, to give a share to a holder that is not a half (the
     /// hang-up watcher, the panic reply).
@@ -622,7 +612,7 @@ impl ConnTx {
     /// Shut down both directions of the connection: FIN the write side AND end a read of the OTHER
     /// split half. A read that is already waiting does not wake for this unless input is unread
     /// (measured on Windows), but its next re-check, at most [`RECHECK_EVERY`] later, calls `recv`
-    /// again, and `recv` reports the end. Both halves are shares of one socket.
+    /// again, and `recv` reports the end.
     ///
     /// Not for a peer that may still be sending: closing with its input unread resets the
     /// connection and can lose the final frame. Use [`Self::shutdown_write`] and read until the

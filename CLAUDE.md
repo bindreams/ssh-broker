@@ -59,9 +59,7 @@ diff. (No lint enforces any of these — `clippy.toml` is deliberately empty.) F
 - **No sleeping as synchronization**, and no arbitrary retry caps *(the retry half: review)*.
   Retrying a documented self-clearing condition is fine; inventing an attempt limit is not.
 - **Product code reads, writes and accepts on an AF_UNIX socket only through `afunix`** *(review)*, and a
-  connection is never blocking: a blocking `recv` on Windows AF_UNIX can miss the wake of a peer that closes
-  at once, and then sleeps for ever. One loop (`read_waiting`, `write_waiting`, `Listener::accept`) calls, waits
-  at most `RECHECK_EVERY` on `WouldBlock`, and calls again. No `SO_RCVTIMEO` on a connection anywhere. A test
+  connection is never blocking. No `SO_RCVTIMEO` on a connection anywhere. A test
   may hold a raw socket as the other end; it then never waits for that socket's end with a blocking read
   (it waits for a frame, or reads through `afunix::split`). A connection is ONE socket handle
   (`afunix::Conn`) that its holders share; nothing duplicates it (`try_clone`, `DuplicateHandle`) *(review)*.
