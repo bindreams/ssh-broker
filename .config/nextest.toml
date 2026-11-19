@@ -39,8 +39,10 @@ slow-timeout = { period = "120s", terminate-after = 5, grace-period = "1s" }
 # `LogOutOnDrop`). `logon_sessions_with_no_process_do_not_pile_up` ends three sessions in its body, none
 # waited for: its bounds are the task starts (`TASK_START_BOUND`, 180 s: one wait in cycle 1, two in each of
 # cycles 2 and 3, 900 s) and the teardown (`UNLOAD_BOUND`, 120 s), which fit.
+# `elevate_windows` is here for its queue too: each of its tests takes the machine alone, and a test's time
+# counts from its start, the wait for the others included.
 [[profile.ci.overrides]]
-filter = 'binary(agent_window_windows) | binary(auto_login_windows) | binary(private_dir_elevated_windows) | binary(prompt_path_windows) | binary(real_sshd_windows) | binary(request_socket_windows) | binary(shell_sshd_windows) | binary(session_on_demand_windows) | binary(sshd_config_windows) | binary(upgrade_windows) | binary(user_isolation_windows)'
+filter = 'binary(agent_window_windows) | binary(auto_login_windows) | binary(elevate_windows) | binary(private_dir_elevated_windows) | binary(prompt_path_windows) | binary(real_sshd_windows) | binary(request_socket_windows) | binary(shell_sshd_windows) | binary(session_on_demand_windows) | binary(sshd_config_windows) | binary(upgrade_windows) | binary(user_isolation_windows)'
 slow-timeout = { period = "120s", terminate-after = 10, grace-period = "1s" }
 
 # The real-sshd test measures things the plan has never seen (the shim's session, logon type and job under
