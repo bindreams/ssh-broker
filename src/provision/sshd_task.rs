@@ -11,12 +11,11 @@
 //! The order and the sentences are here, over [`SshdTask`], which tests stand in for; [`system`] is the Task
 //! Scheduler behind it. No failure here fails `apply`: the variable is a convenience.
 
-use std::io::Write as _;
 use std::path::Path;
 
 use anyhow::Context;
 
-use super::schtasks::{APPLY_SSHD_TASK, WaitOutcome};
+use super::schtasks::{APPLY_SSHD_TASK, WaitOutcome, end_and_remove_apply_sshd_task};
 use super::sshd_config::CHECK_SSHD;
 
 #[cfg(windows)]
@@ -39,8 +38,8 @@ pub trait SshdTask {
     fn remove(&mut self) -> anyhow::Result<()>;
 }
 
-/// What the line that says the step was handed over starts with. A caller that ends `apply` once the step is
-/// the task's waits for a line that starts with it.
+/// Prefix of the line that says the step was handed over; a caller that ends `apply` once the step is the task's
+/// waits for it.
 pub const HANDED_OVER_PREFIX: &str = "apply: sshd's configuration is set up by the task ssh-broker-apply-sshd";
 
 /// The line that says the step is the task's, that what it does is printed when it has finished, and where it
@@ -55,11 +54,10 @@ pub fn handed_over_line(report: &Path) -> String {
 
 /// Hand the sshd step to the task, wait for it, and say what it reported, on `say`.
 ///
-/// The order: the task is registered, run, and the hand-over line said; only then is the task waited for, so
-/// that an `apply` ended from there on leaves the step to the task. When the instances have ended, the report is
-/// printed and the task removed. The report is believed to be whole only when it says so itself ([`REPORT_END`]
-/// is its last line); one that does not means the task's process ended before the step did, and it is printed as
-/// far as it goes. A wait that cannot say the instances ended leaves the task registered and the report unread,
+/// The hand-over line is said before the wait, so an `apply` ended from there on leaves the step to the task.
+/// When the instances have ended, the report is printed and the task removed. The report is believed to be whole only when it says so itself ([`REPORT_END`]
+/// is its last line); one that does not is printed as far as it goes, with both of its readings: the task's
+/// process ended before the step did, or a line could not be written. A wait that cannot say the instances ended leaves the task registered and the report unread,
 /// and says that the step may still run: nothing is concluded from it. No failure fails `apply`.
 pub fn hand_over(task: &mut dyn SshdTask, report: &Path, say: &mut dyn FnMut(&str)) {
     if let Err(e) = task.register() {
@@ -78,8 +76,10 @@ pub fn hand_over(task: &mut dyn SshdTask, report: &Path, say: &mut dyn FnMut(&st
         Ok(WaitOutcome::NeverLaunched { .. }) => {
             say(&format!(
                 "apply: the Task Scheduler lists an instance of the task {APPLY_SSHD_TASK} that it has not \
-                 started; it may still run, and nothing is known of what it does. Its report is {}",
-                report.display()
+                 started; it may still run, and nothing is known of what it does. Its report is {}. End and remove \
+                 the task {} when it is not wanted.",
+                report.display(),
+                end_and_remove_apply_sshd_task()
             ));
             return;
         }
@@ -105,8 +105,9 @@ pub fn hand_over(task: &mut dyn SshdTask, report: &Path, say: &mut dyn FnMut(&st
                 }
             } else {
                 say(&format!(
-                    "apply: the task {APPLY_SSHD_TASK} ended before its report was complete; what it had said \
-                     follows. {CHECK_SSHD}"
+                    "apply: the report of the task {APPLY_SSHD_TASK} has no closing line: the task was ended before \
+                     its step finished, or a line of the report could not be written; what it had said follows. \
+                     {CHECK_SSHD}"
                 ));
                 if lines.is_empty() {
                     say(&format!("apply: the task {APPLY_SSHD_TASK} had said nothing"));
@@ -117,9 +118,9 @@ pub fn hand_over(task: &mut dyn SshdTask, report: &Path, say: &mut dyn FnMut(&st
             }
         }
         Err(e) => say(&format!(
-            "apply: the task {APPLY_SSHD_TASK} left no report in {} ({e:#}). Whether sshd accepts \
-             SSH_BROKER_ELEVATION and is running is not known: `ssh-broker verify` says, and `sc query sshd` \
-             shows whether sshd runs",
+            "apply: the task {APPLY_SSHD_TASK} left no report in {} ({e:#}): it did not start, or could not \
+             create the report. Whether sshd accepts SSH_BROKER_ELEVATION and is running is not known: \
+             `ssh-broker verify` says, and `sc query sshd` shows whether sshd runs",
             report.display()
         )),
     }
@@ -170,9 +171,9 @@ impl Report {
 
 /// One line and its break, in one write, so that a reader never finds half of a line; in the file when it
 /// returns.
-fn append(file: &mut std::fs::File, line: &str) -> std::io::Result<()> {
-    file.write_all(format!("{line}\r\n").as_bytes())?;
-    file.flush()
+fn append(out: &mut impl std::io::Write, line: &str) -> std::io::Result<()> {
+    out.write_all(format!("{line}\r\n").as_bytes())?;
+    out.flush()
 }
 
 /// The verb's side: empty the report at `path`, then run `step`, whose every line is appended to the report and
@@ -181,18 +182,21 @@ fn append(file: &mut std::fs::File, line: &str) -> std::io::Result<()> {
 /// words would be lost, and the `apply` that waits for the task would find none.
 pub fn write_report(path: &Path, step: impl FnOnce(&mut dyn FnMut(&str))) -> anyhow::Result<()> {
     let mut file = std::fs::File::create(path).with_context(|| format!("empty the report {}", path.display()))?;
+    write_lines(&mut file, step).with_context(|| format!("write the report {}", path.display()))
+}
+
+/// [`write_report`] over a writer that is already open: the first line that cannot be written is the error, and
+/// no closing line follows it.
+fn write_lines(out: &mut impl std::io::Write, step: impl FnOnce(&mut dyn FnMut(&str))) -> std::io::Result<()> {
     let mut failure = None;
     step(&mut |line| {
-        if let Err(e) = append(&mut file, line) {
+        if let Err(e) = append(out, line) {
             failure.get_or_insert(e);
         }
     });
-    if failure.is_none() {
-        failure = append(&mut file, REPORT_END).err();
-    }
     match failure {
-        None => Ok(()),
-        Some(e) => Err(e).with_context(|| format!("write the report {}", path.display())),
+        None => append(out, REPORT_END),
+        Some(e) => Err(e),
     }
 }
 

@@ -1,9 +1,8 @@
 //! provision::sshd_config::machine::service — the sshd service through the service manager: its settled state,
 //! a STOP and a start, each followed by a wait on the service manager's own notification.
 //!
-//! A small version of what goetia's `backend/scm/wait.rs` and `wait/system.rs` do, which are measured on a
-//! real service manager (its notes `Windows SCM - *`), and which cannot be used here: goetia's manager acts
-//! only on services it owns. The rules taken from them:
+//! Rules measured on a real service manager, in goetia's `backend/scm/wait.rs`, which cannot be used here (it
+//! acts only on services it owns):
 //!
 //! - The service manager says STOPPED before the process has exited, so a stop is over when the process held
 //!   before the STOP has exited.
@@ -43,7 +42,7 @@ use windows::core::{PCWSTR, w};
 
 use super::listening::listens;
 use super::{ScHandle, service_process};
-use crate::provision::procwait::{Process, wait_on};
+use crate::provision::procwait::{BETWEEN_LOOKS, Process, wait_on};
 use crate::provision::sshd_config::restart::{ExitCodes, ServiceState, StartOutcome, StartReply, StopOutcome};
 use crate::winutil::{describe_error, win32_code};
 
@@ -145,11 +144,6 @@ fn listening_or_exit(
         }
     }
 }
-
-/// How long [`listening_or_exit`] waits on the process between two looks at its sockets, in milliseconds. It is
-/// only the pause between two looks: its expiry proves nothing, and the loop it paces has no count and no total
-/// bound.
-const BETWEEN_LOOKS: u32 = 100;
 
 /// Whether a STOP that the service manager answered with the Win32 code `reply` (`None`: it accepted the STOP),
 /// and after which the service settled in `state`, leaves the old process on its way down unreported. Only

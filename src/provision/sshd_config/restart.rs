@@ -5,8 +5,7 @@ use super::configure::SshdHost;
 use super::{CHECK_SSHD, DROP_IN_NAME, VARIABLE};
 use crate::provision::schtasks::APPLY_SSHD_TASK;
 
-/// The settled states of the sshd service. The machine never returns a pending one: it waits for the service
-/// manager to leave it.
+/// The settled states of the sshd service.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServiceState {
     Running,
@@ -60,17 +59,16 @@ pub struct ExitCodes {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StartOutcome {
     /// The service's process owns a listening TCP socket: sshd has read its configuration and serves. The service
-    /// manager says running before that, so running alone is not this.
+    /// manager says running before that.
     Serving(StartReply),
-    /// The service's process, which the service manager had reported running, exited with `code` before it
-    /// listened. With `unseen` `None` the service manager has seen the exit: it no longer says the service runs in
-    /// that process, so a start sent now is not refused for it. With `unseen` set it is not known that it has,
-    /// and a start sent now may be refused.
+    /// The service's process, which the service manager had reported running, exited with `code` without being
+    /// seen to listen. With `unseen` `None` the service manager has seen the exit: it no longer says the service
+    /// runs in that process, so a start sent now is not refused for it. With `unseen` set it is not known that it
+    /// has, and a start sent now may be refused.
     Exited {
         reply: StartReply,
         code: u32,
-        /// Why whether the service manager has seen the exit could not be read; `None` when it has: a start
-        /// sent now is then not refused for that process.
+        /// Why whether the service manager has seen the exit could not be read; `None` when it has.
         unseen: Option<String>,
     },
     /// Settled stopped, with the exit codes it recorded.
@@ -107,12 +105,11 @@ impl Before {
 /// running sshd takes the variable.
 ///
 /// Nothing is done to a service whose state was not read, and every state decided on is one the service manager
-/// settled in. (1) A stopped service is not started, and a paused one or one whose state cannot be read is left
-/// alone. (2) The STOP; a service that did not stop gets no start. (3) The start, which is over when sshd listens
-/// or its process has exited: the service manager says running before sshd has read a byte of its configuration.
-/// A start that the service manager accepted and that ended before sshd listened (it settled stopped, or the
-/// process exited) is the only evidence that sshd could not run the files: only then is what this run changed
-/// (`before`) put back, and sshd started again.
+/// settled in. A stopped service is not started, and a paused one, one whose state cannot be read and one that did
+/// not stop are left alone. A start that the service manager accepted and that ended before sshd listened (it
+/// settled stopped, or the process exited) is the only evidence that sshd could not run the files: only then is
+/// what this run changed (`before`) put back, and sshd started again. After a stop that was not seen, a refused
+/// start after which sshd reads stopped is followed by one more start, the first sent after a state was read.
 pub fn restart(host: &mut dyn SshdHost, say: &mut dyn FnMut(&str), before: &Before) -> bool {
     say(
         "apply: restarting sshd; apply waits for the service manager at each step, and after a start for sshd to \
@@ -143,7 +140,7 @@ pub fn restart(host: &mut dyn SshdHost, say: &mut dyn FnMut(&str), before: &Befo
 
     // What is known of the stop: `None` when `Stopped` was read, else a clause with why it was not seen.
     let mut unanswered_said = false;
-    let unseen = match host.stop(&mut |reply| {
+    let mut unseen = match host.stop(&mut |reply| {
         unanswered_said = true;
         say(&stop_unanswered(reply));
     }) {
@@ -165,13 +162,21 @@ pub fn restart(host: &mut dyn SshdHost, say: &mut dyn FnMut(&str), before: &Befo
         }
     };
     // "sshd was stopped" is said only of a stop that was read.
-    let stopped = unseen.as_deref().unwrap_or("sshd was stopped");
+    let mut stopped = unseen.clone().unwrap_or_else(|| "sshd was stopped".to_owned());
     // The wait that was announced has ended: say what it came to before the start's own wait.
     if unanswered_said {
         say(&format!("apply: {stopped}; starting sshd"));
     }
 
-    let first = host.start();
+    let mut first = host.start();
+    if let Some(cause) = &unseen
+        && let Some(read) = refused_then_stopped(&first)
+    {
+        stopped = format!("{cause}; {read}");
+        unseen = None;
+        say(&format!("apply: {stopped}; starting sshd"));
+        first = host.start();
+    }
     match first {
         StartOutcome::Serving(StartReply::Accepted) => {
             say(&match &unseen {
@@ -201,20 +206,20 @@ pub fn restart(host: &mut dyn SshdHost, say: &mut dyn FnMut(&str), before: &Befo
             ..
         } => {
             say(&format!(
-                "apply: sshd is NOT running: {}, and the service manager refused to start it ({reply}). \
-                 {START_BY_HAND}",
-                unseen.as_deref().unwrap_or("it was stopped")
+                "apply: sshd is NOT running: {stopped}, and the service manager refused to start it ({reply}). \
+                 {START_BY_HAND}"
             ));
             false
         }
         StartOutcome::Exited {
             reply: StartReply::Refused(reply),
             code,
-            ..
+            unseen: unread,
         } => {
+            let unread = unread.map_or(String::new(), |cause| format!(" {}", unseen_exit(&cause)));
             say(&format!(
                 "apply: sshd is not serving: {stopped}, the service manager refused a start ({reply}), and the sshd \
-                 it reported running exited (code {code}) before it listened. {CHECK_SSHD}"
+                 it reported running exited (code {code}) without being seen to listen{unread}. {CHECK_SSHD}"
             ));
             false
         }
@@ -288,7 +293,33 @@ fn exited_before_listening(code: u32, unseen: Option<&str>) -> String {
     let said = format!("the start was accepted and sshd exited (code {code}) before it listened");
     match unseen {
         None => said,
-        Some(cause) => format!("{said} (whether the service manager had seen it exit could not be read: {cause})"),
+        Some(cause) => format!("{said} {}", unseen_exit(cause)),
+    }
+}
+
+/// Why whether the service manager had seen an exit could not be read, in brackets.
+fn unseen_exit(cause: &str) -> String {
+    format!("(whether the service manager had seen it exit could not be read: {cause})")
+}
+
+/// A start the service manager refused, after which the service reads stopped, in a clause; `None` for any other
+/// outcome.
+fn refused_then_stopped(outcome: &StartOutcome) -> Option<String> {
+    match outcome {
+        StartOutcome::Stopped {
+            reply: StartReply::Refused(reply),
+            ..
+        } => Some(format!(
+            "a start was refused ({reply}), and the service manager then said sshd is stopped"
+        )),
+        StartOutcome::Exited {
+            reply: StartReply::Refused(reply),
+            code,
+            unseen: None,
+        } => Some(format!(
+            "a start was refused ({reply}), and the sshd the service manager reported running exited (code {code})"
+        )),
+        _ => None,
     }
 }
 
@@ -351,10 +382,7 @@ fn start_again(host: &mut dyn SshdHost, say: &mut dyn FnMut(&str), before: &Befo
             true
         }
         StartOutcome::Serving(reply) => {
-            let why = match reply {
-                StartReply::Refused(reply) => format!("the service manager refused a second start ({reply})"),
-                StartReply::Accepted => "not all of the files could be put back".to_owned(),
-            };
+            let why = second_ended(reply, "not all of the files could be put back".to_owned());
             say(&format!(
                 "apply: sshd {failed} ({first}); sshd is running now, but {why}, so which configuration it read \
                  cannot be told{bracketed}; run `ssh-broker apply` again"

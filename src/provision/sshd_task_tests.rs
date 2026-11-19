@@ -95,6 +95,11 @@ const HANDED_OVER: &str = "apply: sshd's configuration is set up by the task ssh
      finishes even if this apply is ended; what it does follows when it has finished, and can be read while it \
      runs in C:\\ProgramData\\ssh-broker\\apply-sshd.log";
 
+/// What is said of a report that has no closing line, which says both things it can mean.
+const NO_CLOSING_LINE: &str = "apply: the report of the task ssh-broker-apply-sshd has no closing line: the task was \
+     ended before its step finished, or a line of the report could not be written; what it had said follows. Check \
+     sshd at this PC: `sc query sshd`; start it with `net start sshd` if it is stopped.";
+
 // the order =====
 
 #[test]
@@ -172,11 +177,7 @@ fn a_report_without_the_closing_line_is_said_to_be_incomplete_before_what_it_had
     let log = run(&mut fake);
     assert_eq!(
         said(&log)[1..],
-        [
-            "apply: the task ssh-broker-apply-sshd ended before its report was complete; what it had said follows. \
-             Check sshd at this PC: `sc query sshd`; start it with `net start sshd` if it is stopped.",
-            "apply: sshd is running with its earlier configuration",
-        ]
+        [NO_CLOSING_LINE, "apply: sshd is running with its earlier configuration",]
     );
     assert_eq!(calls(&log), ["register", "run", "wait", "report", "remove"]);
 
@@ -194,8 +195,7 @@ fn an_incomplete_report_with_no_line_says_the_task_had_said_nothing() {
     assert_eq!(
         said(&log)[1..],
         [
-            "apply: the task ssh-broker-apply-sshd ended before its report was complete; what it had said follows. \
-             Check sshd at this PC: `sc query sshd`; start it with `net start sshd` if it is stopped.",
+            NO_CLOSING_LINE,
             "apply: the task ssh-broker-apply-sshd had said nothing",
         ]
     );
@@ -287,8 +287,9 @@ fn a_missing_report_is_said_and_the_task_is_still_removed() {
         said(&log).last().unwrap(),
         &format!(
             "apply: the task ssh-broker-apply-sshd left no report in {REPORT} (the system cannot find the file \
-             specified). Whether sshd accepts SSH_BROKER_ELEVATION and is running is not known: `ssh-broker \
-             verify` says, and `sc query sshd` shows whether sshd runs"
+             specified): it did not start, or could not create the report. Whether sshd accepts \
+             SSH_BROKER_ELEVATION and is running is not known: `ssh-broker verify` says, and `sc query sshd` shows \
+             whether sshd runs"
         )
     );
     assert_eq!(calls(&log), ["register", "run", "wait", "report", "remove"]);
@@ -323,7 +324,8 @@ fn an_instance_that_was_listed_and_never_launched_is_taken_as_proof_of_nothing()
         said(&log).last().unwrap(),
         &format!(
             "apply: the Task Scheduler lists an instance of the task {TASK} that it has not started; it may still \
-             run, and nothing is known of what it does. Its report is {REPORT}"
+             run, and nothing is known of what it does. Its report is {REPORT}. End and remove the task (`schtasks \
+             /End /TN {TASK}`, then `schtasks /Delete /TN {TASK} /F`, elevated) when it is not wanted."
         )
     );
     assert_eq!(
@@ -404,6 +406,66 @@ fn the_closing_line_is_written_only_after_the_step_has_returned() {
         format!("apply: first\r\n{REPORT_END}\r\n"),
         "the last line of the file"
     );
+}
+
+/// A writer that takes the first `accepts` writes and fails every one after them.
+struct Failing {
+    accepts: usize,
+    written: Vec<u8>,
+}
+
+impl std::io::Write for Failing {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.accepts == 0 {
+            return Err(std::io::Error::other("the disk is full"));
+        }
+        self.accepts -= 1;
+        self.written.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn a_line_that_cannot_be_written_leaves_the_report_without_a_closing_line_and_is_the_error() {
+    let mut out = Failing {
+        accepts: 1,
+        written: Vec::new(),
+    };
+    let mut said = Vec::new();
+    let err = write_lines(&mut out, |say| {
+        say("apply: first");
+        say("apply: second");
+        say("apply: third");
+        said.push("the step ran to its end");
+    })
+    .unwrap_err();
+    assert_eq!(err.to_string(), "the disk is full");
+    assert_eq!(
+        said,
+        ["the step ran to its end"],
+        "the step is not cut short by a failed line"
+    );
+    assert_eq!(
+        String::from_utf8(out.written).unwrap(),
+        "apply: first\r\n",
+        "no closing line follows a failed one: the report says it is not whole"
+    );
+}
+
+#[test]
+fn a_closing_line_that_cannot_be_written_is_the_error() {
+    let mut out = Failing {
+        accepts: 1,
+        written: Vec::new(),
+    };
+    let err = write_lines(&mut out, |say| say("apply: first")).unwrap_err();
+    assert_eq!(err.to_string(), "the disk is full");
+    let text = String::from_utf8(out.written).unwrap();
+    assert!(!text.contains(REPORT_END), "{text}");
 }
 
 #[test]

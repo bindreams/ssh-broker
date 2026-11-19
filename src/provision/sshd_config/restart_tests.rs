@@ -124,17 +124,28 @@ fn stop_unanswered_line(reply: &str) -> String {
 const CAUSE: &str = "the state cannot be read";
 const UNSEEN: &str = "whether sshd stopped could not be told (the state cannot be read)";
 
-/// What the run says after a stop whose outcome is not known, with `start` the answer to the one start.
-fn after_an_unknown_stop(start: StartOutcome) -> String {
+/// A machine whose stop is not known, answering `starts`.
+fn after_an_unknown_stop_with(starts: impl Into<std::collections::VecDeque<StartOutcome>>) -> Fake {
     let mut host = host();
     host.settles = [Ok(ServiceState::Running)].into();
     host.stops = [Ok(StopOutcome::Unknown {
         cause: CAUSE.to_owned(),
     })]
     .into();
-    host.starts = [start].into();
+    host.starts = starts.into();
+    host
+}
+
+/// What the run says after a stop whose outcome is not known, with `starts` the answers to its starts.
+fn after_an_unknown_stop<const N: usize>(starts: [StartOutcome; N]) -> String {
+    let mut host = after_an_unknown_stop_with(starts);
     let (_, said) = run(&mut host);
     said.last().unwrap().clone()
+}
+
+/// The clause that says a start was refused and the service then read stopped, as `restart` says it.
+fn refused_then_stopped_clause(reply: &str) -> String {
+    format!("a start was refused ({reply}), and the service manager then said sshd is stopped")
 }
 
 #[test]
@@ -165,22 +176,28 @@ fn a_state_that_cannot_be_read_is_never_a_sentence_that_says_sshd_runs_or_does_n
 
     // A stop whose outcome is not known is never said to have happened, and its cause is always said.
     let sentences = [
-        after_an_unknown_stop(StartOutcome::Stopped {
-            reply: refused("Access is denied. (5)"),
-            exit: exit(1053, 0),
-        }),
-        after_an_unknown_stop(StartOutcome::Paused(StartReply::Accepted)),
-        after_an_unknown_stop(StartOutcome::Unreadable {
+        after_an_unknown_stop([
+            StartOutcome::Stopped {
+                reply: refused("Access is denied. (5)"),
+                exit: exit(1053, 0),
+            },
+            StartOutcome::Stopped {
+                reply: refused("Access is denied. (5)"),
+                exit: exit(1053, 0),
+            },
+        ]),
+        after_an_unknown_stop([StartOutcome::Paused(StartReply::Accepted)]),
+        after_an_unknown_stop([StartOutcome::Unreadable {
             reply: refused("Access is denied. (5)"),
             cause: "the service manager did not answer".to_owned(),
-        }),
-        after_an_unknown_stop(StartOutcome::Serving(refused("Access is denied. (5)"))),
-        after_an_unknown_stop(StartOutcome::Serving(StartReply::Accepted)),
-        after_an_unknown_stop(StartOutcome::Exited {
+        }]),
+        after_an_unknown_stop([StartOutcome::Serving(refused("Access is denied. (5)"))]),
+        after_an_unknown_stop([StartOutcome::Serving(StartReply::Accepted)]),
+        after_an_unknown_stop([StartOutcome::Exited {
             reply: refused("Access is denied. (5)"),
             code: 1067,
-            unseen: None,
-        }),
+            unseen: Some("the service manager did not answer".to_owned()),
+        }]),
     ];
     for said in &sentences {
         assert!(
@@ -195,8 +212,9 @@ fn a_state_that_cannot_be_read_is_never_a_sentence_that_says_sshd_runs_or_does_n
     assert_eq!(
         sentences[0],
         format!(
-            "apply: sshd is NOT running: {UNSEEN}, and the service manager refused to start it (Access is denied. \
-             (5)). {NOT_RUNNING_ADVICE}"
+            "apply: sshd is NOT running: {UNSEEN}; {}, and the service manager refused to start it (Access is \
+             denied. (5)). {NOT_RUNNING_ADVICE}",
+            refused_then_stopped_clause("Access is denied. (5)")
         )
     );
     assert_eq!(
@@ -225,8 +243,9 @@ fn a_state_that_cannot_be_read_is_never_a_sentence_that_says_sshd_runs_or_does_n
         sentences[5],
         format!(
             "apply: sshd is not serving: {UNSEEN}, the service manager refused a start (Access is denied. (5)), \
-             and the sshd it reported running exited (code 1067) before it listened. Check sshd at this PC: `sc \
-             query sshd`; start it with `net start sshd` if it is stopped."
+             and the sshd it reported running exited (code 1067) without being seen to listen (whether the \
+             service manager had seen it exit could not be read: the service manager did not answer). Check sshd \
+             at this PC: `sc query sshd`; start it with `net start sshd` if it is stopped."
         )
     );
 
@@ -465,6 +484,113 @@ fn a_start_refused_over_a_running_service_after_an_unknown_stop_does_not_say_it_
     );
 }
 
+// a refused start after a stop that was not seen =====
+
+/// A run that changed the files, whose stop is not known, answering `starts`; and what `restart` said, with
+/// the starts and the lines in one sequence (a start is "start").
+fn unseen_stop_over_changed_files(
+    starts: impl Into<std::collections::VecDeque<StartOutcome>>,
+) -> (Fake, bool, Vec<String>) {
+    let (mut host, before) = changed_by_this_run();
+    let log = Rc::new(RefCell::new(Vec::new()));
+    host.said_and_started = Some(Rc::clone(&log));
+    host.settles = [Ok(ServiceState::Running)].into();
+    host.stops = [Ok(StopOutcome::Unknown {
+        cause: CAUSE.to_owned(),
+    })]
+    .into();
+    host.starts = starts.into();
+    let taken = restart(&mut host, &mut |line| log.borrow_mut().push(line.to_owned()), &before);
+    let log = log.borrow().clone();
+    (host, taken, log)
+}
+
+/// The files are as `changed_by_this_run` left them: nothing was put back.
+fn files_were_not_put_back(host: &Fake) {
+    assert_eq!(host.config, format!("Port 22\r\n{INCLUDE_LINE}\r\n").into_bytes());
+    assert!(host.drop_in.is_some());
+}
+
+#[test]
+fn a_refused_start_that_reads_stopped_after_an_unseen_stop_is_followed_by_one_start_more() {
+    let (host, taken, log) = unseen_stop_over_changed_files([
+        StartOutcome::Stopped {
+            reply: refused("An instance of the service is already running. (1056)"),
+            exit: exit(1053, 0),
+        },
+        StartOutcome::Serving(StartReply::Accepted),
+    ]);
+    assert!(taken, "{log:#?}");
+    assert_eq!(events(&host), ["settled", "stop", "start", "start"]);
+    let said = format!(
+        "apply: {UNSEEN}; {}; starting sshd",
+        refused_then_stopped_clause("An instance of the service is already running. (1056)")
+    );
+    let said_at = log
+        .iter()
+        .position(|line| *line == said)
+        .unwrap_or_else(|| panic!("{log:#?}"));
+    let starts: Vec<usize> = (0..log.len()).filter(|i| log[*i] == "start").collect();
+    assert!(
+        starts[0] < said_at && said_at < starts[1],
+        "the line is said after the first start and before the second: {log:#?}"
+    );
+    assert_eq!(
+        log.last().unwrap(),
+        &format!("apply: sshd restarted; it accepts {ELEVATION}")
+    );
+    files_were_not_put_back(&host);
+}
+
+#[test]
+fn a_refused_start_whose_sshd_exited_and_was_seen_after_an_unseen_stop_is_followed_by_one_start_more() {
+    let (host, taken, log) = unseen_stop_over_changed_files([
+        exited(refused("An instance of the service is already running. (1056)"), 1067),
+        StartOutcome::Serving(StartReply::Accepted),
+    ]);
+    assert!(taken, "{log:#?}");
+    assert_eq!(events(&host), ["settled", "stop", "start", "start"]);
+    let said = format!(
+        "apply: {UNSEEN}; a start was refused (An instance of the service is already running. (1056)), and the \
+         sshd the service manager reported running exited (code 1067); starting sshd"
+    );
+    let said_at = log
+        .iter()
+        .position(|line| *line == said)
+        .unwrap_or_else(|| panic!("{log:#?}"));
+    let starts: Vec<usize> = (0..log.len()).filter(|i| log[*i] == "start").collect();
+    assert!(
+        starts[0] < said_at && said_at < starts[1],
+        "the line is said after the first start and before the second: {log:#?}"
+    );
+    files_were_not_put_back(&host);
+}
+
+#[test]
+fn a_second_refusal_after_an_unseen_stop_says_both_replies_and_starts_nothing_more() {
+    let (host, taken, log) = unseen_stop_over_changed_files([
+        StartOutcome::Stopped {
+            reply: refused("the first reply (1056)"),
+            exit: exit(1053, 0),
+        },
+        StartOutcome::Stopped {
+            reply: refused("the second reply (5)"),
+            exit: exit(1053, 0),
+        },
+    ]);
+    assert!(!taken, "{log:#?}");
+    assert_eq!(events(&host), ["settled", "stop", "start", "start"]);
+    assert_eq!(
+        log.last().unwrap(),
+        &format!(
+            "apply: sshd is NOT running: {UNSEEN}; {}, and the service manager refused to start it (the second \
+             reply (5)). {NOT_RUNNING_ADVICE}",
+            refused_then_stopped_clause("the first reply (1056)")
+        )
+    );
+    files_were_not_put_back(&host);
+}
+
 // the start =====
 
 fn after_a_stop() -> Fake {
@@ -527,7 +653,7 @@ fn a_start_refused_that_settles_stopped_puts_nothing_back_because_sshd_never_ran
     assert!(!taken);
     assert_eq!(
         said.last().unwrap(),
-        "apply: sshd is NOT running: it was stopped, and the service manager refused to start it (The service \
+        "apply: sshd is NOT running: sshd was stopped, and the service manager refused to start it (The service \
          did not respond to the start or control request in a timely fashion.). Start it at this PC: `net start \
          sshd`."
     );
@@ -694,8 +820,8 @@ fn a_refused_start_whose_sshd_exits_puts_nothing_back() {
     assert_eq!(
         said.last().unwrap(),
         "apply: sshd is not serving: sshd was stopped, the service manager refused a start (Access is denied. \
-         (5)), and the sshd it reported running exited (code 1067) before it listened. Check sshd at this PC: `sc \
-         query sshd`; start it with `net start sshd` if it is stopped."
+         (5)), and the sshd it reported running exited (code 1067) without being seen to listen. Check sshd at \
+         this PC: `sc query sshd`; start it with `net start sshd` if it is stopped."
     );
     assert_eq!(
         events(&host),

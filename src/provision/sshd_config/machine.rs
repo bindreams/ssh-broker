@@ -27,7 +27,7 @@ use windows::Win32::UI::Shell::{FOLDERID_ProgramData, KF_FLAG_DEFAULT, SHGetKnow
 use windows::core::PCWSTR;
 
 use super::configure::{ConfigFile, ConfigFiles, DropInProblem, SshdHost, config_read, configure};
-use super::restart::{ServiceState, StartOutcome, StartReply, StopOutcome};
+use super::restart::{ServiceState, StartOutcome, StopOutcome};
 use super::{DROP_IN_DIR_NAME, DROP_IN_NAME, SshdReading};
 use crate::acl;
 use crate::provision::procwait::Process;
@@ -146,14 +146,9 @@ impl SshdHost for Machine {
     }
 
     fn start(&mut self) -> StartOutcome {
-        match self.service() {
-            Ok(service) => service.start(),
-            // Not reached by the flow, which reads the state (and so opens the service) first.
-            Err(e) => StartOutcome::Unreadable {
-                reply: StartReply::Refused(format!("no start was sent: {e:#}")),
-                cause: "the sshd service could not be opened".to_owned(),
-            },
-        }
+        self.service()
+            .expect("the flow reads the state, and so opens the service, before it sends a start")
+            .start()
     }
 
     fn remove_drop_in(&mut self) -> anyhow::Result<()> {

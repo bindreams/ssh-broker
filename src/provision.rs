@@ -171,6 +171,7 @@ mod imp {
         sessions, sshd_config, sshd_task, system_config, taskscheduler, user_rows,
     };
     use anyhow::Context;
+    use std::io::Write as _;
     use std::path::{Path, PathBuf};
 
     /// Case-insensitive compare of a registry path string (quotes trimmed) to a path.
@@ -207,8 +208,14 @@ mod imp {
         })?;
         // An earlier `apply`'s sshd step is the rest of its run, and outlives its process: it is waited for
         // before this run touches anything.
-        flow::wait_for_earlier_sshd_step(&mut |line| eprintln!("{line}"), |waiting| {
-            taskscheduler::wait_for_instances(schtasks::APPLY_SSHD_TASK, &layout.canonical_exe(), waiting)
+        // A closed stderr loses a line and nothing else; `eprintln!` would panic on it.
+        flow::wait_for_earlier_sshd_step(&mut |line| drop(writeln!(std::io::stderr(), "{line}")), |waiting| {
+            taskscheduler::wait_for_instances(
+                schtasks::APPLY_SSHD_TASK,
+                &layout.canonical_exe(),
+                procwait::Role::ApplySshd,
+                waiting,
+            )
         })?;
         let exe = flow::run(
             || {
@@ -258,7 +265,9 @@ mod imp {
         //    the step is the installed exe's task, which finishes even if this `apply` is ended. It
         //    never fails `apply`: the variable is a convenience, and `ssh-broker elevate` works
         //    without it.
-        sshd_task::hand_over_sshd_step(&layout, &exe, &mut |line| println!("{line}"));
+        // A closed stdout (an `apply` over an SSH connection that has gone) loses a line and nothing else, and
+        // the report file holds the lines; `println!` would panic on it.
+        sshd_task::hand_over_sshd_step(&layout, &exe, &mut |line| drop(writeln!(std::io::stdout(), "{line}")));
         Ok(())
     }
 

@@ -252,23 +252,26 @@ fn unreadable(error: &anyhow::Error, exited: bool) -> Unreadable {
 /// What an ssh-broker process is, from its command line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
-    /// The shim of an SSH session (sshd's `DefaultShell`), or any other verb.
+    /// The shim of an SSH session (sshd's `DefaultShell`), or any other verb not named below.
     Shim,
     /// `agent`: started by the logon task in a user's desktop session.
     DesktopAgent,
     /// `agent --background`: started by the password prompt or by an auto-login task.
     BackgroundAgent,
+    /// `apply-sshd`: the sshd step of `apply`, run by the task `ssh-broker-apply-sshd`.
+    ApplySshd,
 }
 
 /// The role of the process whose command line is `command_line`. The first argument after the
 /// program decides: `agent` with `--background` among its flags is a background agent, `agent`
-/// without it a desktop agent; anything else is a shim, including no argument and `-c <text>`
-/// (sshd's form), whose text may itself contain the word `agent`.
+/// without it a desktop agent, `apply-sshd` the sshd step; anything else is a shim, including no argument
+/// and `-c <text>` (sshd's form), whose text may itself contain the word `agent`.
 pub fn role_of(command_line: &str) -> Role {
     let args = crate::cmdline::split_args(command_line);
     match args.get(1).map(String::as_str) {
         Some("agent") if args[2..].iter().any(|arg| arg == "--background") => Role::BackgroundAgent,
         Some("agent") => Role::DesktopAgent,
+        Some("apply-sshd") => Role::ApplySshd,
         _ => Role::Shim,
     }
 }
@@ -440,6 +443,31 @@ pub(crate) fn file_id(path: &Path) -> std::io::Result<FileId> {
 /// an error: it might be the agent. Holding the handle is what keeps the identity from here on.
 pub fn open_if_image(pid: u32, image: &Path) -> anyhow::Result<Option<Process>> {
     open_if_image_by(pid, image, &file_id, &image_of, IfEnding::TakeForRunning)
+}
+
+/// [`open_if_image`], and the process must be running `role` (read from its command line, on the opened handle:
+/// the same exe is the shim and the agent too, and a pid the engine still lists can be one of theirs).
+///
+/// `None` as for [`open_if_image`], and for a process of the image in another role. A role that cannot be read
+/// of a process that has exited is `None`; of one that is ending, it is waited for with the process, as an
+/// ending process whose image cannot be read is; of any other it is an error.
+pub fn open_if_image_in_role(pid: u32, image: &Path, role: Role) -> anyhow::Result<Option<Process>> {
+    match open_if_image(pid, image)? {
+        Some(process) => in_role(process, role),
+        None => Ok(None),
+    }
+}
+
+/// `process`, if its command line says `role`: see [`open_if_image_in_role`].
+fn in_role<P: Inspect>(process: P, role: Role) -> anyhow::Result<Option<P>> {
+    match process.command_line() {
+        Ok(line) => Ok((role_of(&line) == role).then_some(process)),
+        Err(e) => match unreadable(&e, process.has_exited()) {
+            Unreadable::Exited => Ok(None),
+            Unreadable::Ending => Ok(Some(process)),
+            Unreadable::Failed => Err(e),
+        },
+    }
 }
 
 /// What to make of a process whose image cannot be read because it is ending.
@@ -654,7 +682,10 @@ fn is_agent_of(process: &impl Inspect, user: &str, integrity: Integrity, image: 
         if !process.runs_image(image)? {
             return Ok(false);
         }
-        Ok(role_of(&process.command_line()?) != Role::Shim)
+        Ok(matches!(
+            role_of(&process.command_line()?),
+            Role::DesktopAgent | Role::BackgroundAgent
+        ))
     })();
     match verdict {
         Err(e) if unreadable(&e, process.has_exited()) != Unreadable::Failed => Ok(false),
@@ -760,6 +791,10 @@ pub fn wait_on(process: &Process, millis: u32) -> std::io::Result<bool> {
         Err(std::io::Error::last_os_error())
     }
 }
+
+/// How long a loop that looks at something again pauses between two looks, in milliseconds. The pause's expiry
+/// proves nothing: the loop it paces has no count and no total bound, and ends on what the looks find.
+pub const BETWEEN_LOOKS: u32 = 100;
 
 /// [`wait_all_exited`] with the wait on one process as a parameter, so a test can make it fail.
 fn wait_all_exited_by(

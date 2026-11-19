@@ -6,6 +6,7 @@ use anyhow::Context;
 
 use super::{SshdTask, hand_over};
 use crate::provision::layout::Layout;
+use crate::provision::procwait::Role;
 use crate::provision::schtasks::{APPLY_SSHD_TASK, WaitOutcome, apply_sshd_task_xml};
 use crate::provision::taskscheduler;
 
@@ -43,8 +44,7 @@ impl SshdTask for SystemTask<'_> {
     }
 
     fn wait(&mut self) -> anyhow::Result<WaitOutcome> {
-        // The hand-over's own line has said that it waits.
-        taskscheduler::wait_for_instances(APPLY_SSHD_TASK, self.exe, &mut || {})
+        taskscheduler::wait_for_instances(APPLY_SSHD_TASK, self.exe, Role::ApplySshd, &mut || {})
     }
 
     fn report(&mut self) -> anyhow::Result<String> {

@@ -30,7 +30,7 @@ use windows::Win32::System::Variant::VARIANT;
 use windows::core::{BSTR, HRESULT, Interface};
 
 use super::password_variant::PasswordVariant;
-use super::procwait::{self, Process};
+use super::procwait::{self, Process, Role};
 use super::schtasks::WaitOutcome;
 use super::session_task::TaskState;
 use crate::password_entry::Password;
@@ -137,7 +137,7 @@ pub fn stop_instances(task_name: &str, image: &Path) -> anyhow::Result<()> {
         task_name,
         procwait::EXIT_BOUND,
         || set_task_enabled(&task, task_name, false),
-        || running_instances(&task, image),
+        || running_instances(&task, |pid| procwait::open_if_image(pid, image)),
         // SAFETY: `task` is a live interface on this thread; `Stop` takes no pointers. The raw
         // vtable call keeps the HRESULT, which the generated wrapper turns into `Ok` for S_FALSE.
         || {
@@ -227,9 +227,13 @@ fn describe_instances(pids: &[u32]) -> String {
     each.join(", ")
 }
 
-/// The running instances of `task`, and the processes among them that run `image`. An instance whose
-/// process has exited, or is not `image` (its pid is another process's now), has ended: see [`instances_of`].
-fn running_instances(task: &IRegisteredTask, image: &Path) -> anyhow::Result<Instances<Process>> {
+/// The running instances of `task`, and the processes among them that `open` takes for the task's. An instance
+/// whose process has exited, or is not the task's (its pid is another process's now), has ended: see
+/// [`instances_of`].
+fn running_instances(
+    task: &IRegisteredTask,
+    open: impl FnMut(u32) -> anyhow::Result<Option<Process>>,
+) -> anyhow::Result<Instances<Process>> {
     // SAFETY: `task` and the interfaces taken from it are live and used on this thread only.
     let pids = unsafe {
         let instances = task.GetInstances(0).context("list the running instances")?;
@@ -244,7 +248,7 @@ fn running_instances(task: &IRegisteredTask, image: &Path) -> anyhow::Result<Ins
         }
         pids
     };
-    instances_of(pids, |pid| procwait::open_if_image(pid, image))
+    instances_of(pids, open)
 }
 
 /// The instances among `listed`, the engine's process id of each (0 for one it has not launched). An instance
@@ -366,8 +370,8 @@ pub fn register_system_task(name: &str, xml: &str, sddl: &str) -> anyhow::Result
     Ok(())
 }
 
-/// Return once the task `name` has no instance: the processes of its instances (running `image`) have
-/// exited. The engine may still list an instance whose process has exited, and that listing is not waited for:
+/// Return once the task `name` has no instance: the processes of its instances (running `image` as `role`, which
+/// is the task's own verb: the exe is also the shim and the agent) have exited. The engine may still list an instance whose process has exited, and that listing is not waited for:
 /// the end is the processes', not the listing's. A task that does not exist has none. Nothing stops the task
 /// and nothing bounds the wait for a process that was launched: its exit is the kernel's and the task's to
 /// bring about.
@@ -379,7 +383,12 @@ pub fn register_system_task(name: &str, xml: &str, sddl: &str) -> anyhow::Result
 ///
 /// `waiting` is called once, on the first listing that finds an instance, before the wait: a task that is not
 /// registered, or whose listing finds none, ends the wait without it.
-pub fn wait_for_instances(name: &str, image: &Path, waiting: &mut dyn FnMut()) -> anyhow::Result<WaitOutcome> {
+pub fn wait_for_instances(
+    name: &str,
+    image: &Path,
+    role: Role,
+    waiting: &mut dyn FnMut(),
+) -> anyhow::Result<WaitOutcome> {
     let _com = Com::init()?;
     let service = connect()?;
     let Some(task) = registered_task(&service, name)? else {
@@ -387,20 +396,23 @@ pub fn wait_for_instances(name: &str, image: &Path, waiting: &mut dyn FnMut()) -
     };
     wait_until_ended(
         procwait::EXIT_BOUND,
-        || running_instances(&task, image),
+        || running_instances(&task, |pid| procwait::open_if_image_in_role(pid, image, role)),
         |processes| processes.iter().try_for_each(Process::wait_for_exit),
+        || std::thread::sleep(Duration::from_millis(procwait::BETWEEN_LOOKS.into())), // sleep-ok: the pause between two looks; its expiry proves nothing
         waiting,
     )
 }
 
 /// The loop of [`stop_and_wait`] without the stop: list the instances, wait for the processes among them, list
-/// again, until a listing finds none. An instance that has no process to wait for is looked at again at once;
-/// `bound` runs from the first such look since a process was last waited for. `waiting` is called once, on the
-/// first listing that finds an instance.
+/// again, until a listing finds none. An instance that has no process to wait for is looked at again after
+/// `pause`, the pause between two looks (its expiry proves nothing, so it is no bound); `bound` runs from the
+/// first such look since a process was last waited for. `waiting` is called once, on the first listing that
+/// finds an instance.
 fn wait_until_ended<P>(
     bound: Duration,
     mut list: impl FnMut() -> anyhow::Result<Instances<P>>,
     mut wait: impl FnMut(Vec<P>) -> anyhow::Result<()>,
+    mut pause: impl FnMut(),
     waiting: &mut dyn FnMut(),
 ) -> anyhow::Result<WaitOutcome> {
     let mut never_launched_since: Option<Instant> = None;
@@ -422,6 +434,7 @@ fn wait_until_ended<P>(
         if since.elapsed() >= bound {
             return Ok(WaitOutcome::NeverLaunched { count: instances.count });
         }
+        pause();
     }
 }
 

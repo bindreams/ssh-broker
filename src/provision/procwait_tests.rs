@@ -541,6 +541,13 @@ fn other_verbs_are_not_agents() {
 }
 
 #[test]
+fn the_verb_apply_sshd_is_a_role_of_its_own_and_a_shim_whose_command_text_names_it_is_not_it() {
+    assert_eq!(role_of(r"C:\x\ssh-broker.exe apply-sshd"), Role::ApplySshd);
+    assert_eq!(role_of(r#"C:\x\ssh-broker.exe -c "ssh-broker apply-sshd""#), Role::Shim);
+    assert_eq!(role_of(r"C:\x\ssh-broker.exe -c apply-sshd"), Role::Shim);
+}
+
+#[test]
 fn only_a_background_agent_is_selected_to_end() {
     let lines = [
         (1u32, r"C:\x\ssh-broker.exe"),
@@ -560,6 +567,26 @@ fn the_command_line_of_a_running_process_is_readable() {
         .expect("the child runs cmd.exe");
     let line = command_line_of(&process).unwrap();
     assert!(line.contains("set /p unused="), "{line}");
+    drop(child.stdin.take());
+    child.wait().unwrap();
+}
+
+/// The pid of the process [`open_if_image_in_role`] holds for `child`, if it does.
+fn opened_in_role(child: &Child, role: Role) -> Option<u32> {
+    open_if_image_in_role(child.id(), &cmd_exe(), role)
+        .unwrap()
+        .map(|process| process.pid)
+}
+
+#[test]
+fn a_process_of_the_image_is_opened_only_for_the_role_its_command_line_says() {
+    let mut child = child_until_stdin_closes();
+    assert_eq!(opened_in_role(&child, Role::Shim), Some(child.id()));
+    assert_eq!(
+        opened_in_role(&child, Role::ApplySshd),
+        None,
+        "a process that runs the image in another role is not the task's"
+    );
     drop(child.stdin.take());
     child.wait().unwrap();
 }
@@ -793,6 +820,70 @@ fn a_process_of_the_user_whose_image_is_refused_for_no_known_reason_fails_the_sc
     let text = format!("{err:#}");
     assert!(text.contains("4242"), "names the process: {text}");
     assert!(text.contains("Access is denied"), "names the cause: {text}");
+}
+
+#[test]
+fn a_process_running_the_apply_sshd_verb_is_no_agent_of_the_user() {
+    let task = Made {
+        command_line: Ok(r"C:\x\ssh-broker.exe apply-sshd"),
+        ..made(10)
+    };
+    assert_eq!(scanned(&[task, made(20)]).unwrap(), [20]);
+}
+
+// the role of a process the task started, over processes the test makes up -----
+
+/// The pid of `process` if it is taken for a process in `role`.
+fn taken_for(process: Made, role: Role) -> anyhow::Result<Option<u32>> {
+    in_role(process, role).map(|taken| taken.map(|process| process.pid))
+}
+
+const TASK_LINE: &str = r"C:\x\ssh-broker.exe apply-sshd";
+
+#[test]
+fn a_process_is_taken_for_the_role_its_command_line_says_and_for_no_other() {
+    let task = Made {
+        command_line: Ok(TASK_LINE),
+        ..made(10)
+    };
+    assert_eq!(taken_for(task.clone(), Role::ApplySshd).unwrap(), Some(10));
+    assert_eq!(taken_for(task, Role::Shim).unwrap(), None);
+    for line in [r"C:\x\ssh-broker.exe", r"C:\x\ssh-broker.exe agent"] {
+        let other = Made {
+            command_line: Ok(line),
+            ..made(11)
+        };
+        assert_eq!(taken_for(other, Role::ApplySshd).unwrap(), None, "{line}");
+    }
+}
+
+#[test]
+fn a_role_that_cannot_be_read_of_a_process_that_has_exited_is_gone() {
+    let gone = Made {
+        exited: true,
+        command_line: Err(Fail::Denied),
+        ..made(10)
+    };
+    assert_eq!(taken_for(gone, Role::ApplySshd).unwrap(), None);
+}
+
+#[test]
+fn a_role_that_cannot_be_read_of_a_process_that_is_ending_is_waited_for_with_it() {
+    let ending = Made {
+        command_line: Err(Fail::Ending),
+        ..made(10)
+    };
+    assert_eq!(taken_for(ending, Role::ApplySshd).unwrap(), Some(10));
+}
+
+#[test]
+fn a_role_that_cannot_be_read_of_a_live_process_is_an_error_naming_it() {
+    let live = Made {
+        command_line: Err(Fail::Denied),
+        ..made(4244)
+    };
+    let text = format!("{:#}", taken_for(live, Role::ApplySshd).unwrap_err());
+    assert!(text.contains("4244") && text.contains("Access is denied"), "{text}");
 }
 
 #[test]

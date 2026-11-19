@@ -74,6 +74,11 @@ pub(super) fn settings_xml(multiple_instances: &str, on_failure: OnFailure) -> S
 /// ended (see `sshd_task`).
 pub const APPLY_SSHD_TASK: &str = "ssh-broker-apply-sshd";
 
+/// The commands that end [`APPLY_SSHD_TASK`] and remove it, as the clause of a sentence.
+pub fn end_and_remove_apply_sshd_task() -> String {
+    format!("(`schtasks /End /TN {APPLY_SSHD_TASK}`, then `schtasks /Delete /TN {APPLY_SSHD_TASK} /F`, elevated)")
+}
+
 /// How a wait for a task's instances ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WaitOutcome {

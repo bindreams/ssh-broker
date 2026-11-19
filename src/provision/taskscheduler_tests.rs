@@ -50,7 +50,9 @@ fn start_and_find(name: &str, image: &Path) -> Vec<Process> {
     // The instance appears when the service has launched it; there is no event to wait on, so
     // this re-reads the real condition until it holds.
     loop {
-        let found = running_instances(&task, image).unwrap().processes;
+        let found = running_instances(&task, |pid| procwait::open_if_image(pid, image))
+            .unwrap()
+            .processes;
         if !found.is_empty() {
             return found;
         }
@@ -298,6 +300,7 @@ fn run_wait_until_ended(
             log(&format!("wait {pids:?}"));
             if wait { Ok(()) } else { anyhow::bail!("failed") }
         },
+        || log("pause"),
         &mut || log("waiting"),
     )
 }
@@ -351,8 +354,30 @@ fn an_instance_the_engine_has_not_launched_yet_is_looked_at_again_with_no_count_
     assert_eq!(outcome, WaitOutcome::Ended);
     let events = events.into_inner();
     assert_eq!(events.iter().filter(|e| *e == "list [0]").count(), 1000);
-    assert_eq!(&events[..2], ["list [0]", "waiting"]);
-    assert_eq!(&events[1001..], ["list [33]", "wait [33]", "list []"]);
+    assert_eq!(&events[..3], ["list [0]", "waiting", "pause"]);
+    assert_eq!(&events[events.len() - 3..], ["list [33]", "wait [33]", "list []"]);
+}
+
+#[test]
+fn the_wait_pauses_between_two_looks_that_find_nothing_to_wait_on_and_at_no_other_time() {
+    // The look right after `run_task` finds an instance that is not launched yet: looking again at once would
+    // spin the CPU until the engine launches it.
+    let events = RefCell::new(Vec::new());
+    let outcome = run_wait_until_ended(NO_BOUND, vec![vec![0], vec![0], vec![33], vec![]], true, &events).unwrap();
+    assert_eq!(outcome, WaitOutcome::Ended);
+    assert_eq!(
+        events.into_inner(),
+        [
+            "list [0]",
+            "waiting",
+            "pause",
+            "list [0]",
+            "pause",
+            "list [33]",
+            "wait [33]",
+            "list []"
+        ]
+    );
 }
 
 #[test]
@@ -396,6 +421,7 @@ fn a_listed_instance_whose_process_has_exited_ends_the_wait_and_is_not_never_lau
         Duration::ZERO,
         || Ok(instances_listed(vec![7], &[])),
         |_: Vec<u32>| anyhow::bail!("nothing is waited for"),
+        || panic!("no look is paced when no instance is listed"),
         &mut || {},
     )
     .unwrap();
@@ -491,7 +517,8 @@ fn a_system_task_is_registered_run_and_waited_for_until_its_process_has_exited()
     register_system_task(&task.0, &xml, "D:P(A;;FA;;;SY)(A;;FA;;;BA)").unwrap();
     run_task(&task.0).unwrap();
 
-    let outcome = wait_for_instances(&task.0, &cmd, &mut || {}).unwrap();
+    // `cmd /c ...` is no verb of ssh-broker: its role is the one `role_of` gives every other command line.
+    let outcome = wait_for_instances(&task.0, &cmd, Role::Shim, &mut || {}).unwrap();
     let written = std::fs::read_to_string(&marker);
     let _ = std::fs::remove_file(&marker);
     assert_eq!(outcome, WaitOutcome::Ended);

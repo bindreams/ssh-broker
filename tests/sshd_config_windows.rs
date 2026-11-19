@@ -15,7 +15,7 @@ use std::process::Command;
 
 use ssh_broker::acl::{copy_file_security, create_install_dir, install_dir_file_problem, install_dir_problem};
 use ssh_broker::provision::path_env::{self, PathPlan};
-use ssh_broker::provision::procwait::Process;
+use ssh_broker::provision::procwait::{Process, Role};
 use ssh_broker::provision::registry;
 use ssh_broker::provision::schtasks::WaitOutcome;
 use ssh_broker::provision::sshd_config::configure::{ConfigRead, SshdHost};
@@ -951,8 +951,17 @@ fn an_apply_ended_after_it_handed_over_the_sshd_step_leaves_sshd_running_with_th
     job.close();
     let _ = child.wait();
 
-    let waited = taskscheduler::wait_for_instances(schtasks::APPLY_SSHD_TASK, &installed, &mut || {})
-        .expect("wait for the instances of the task");
+    // `waiting` is called when the first listing finds an instance: the task had one that had not ended when the
+    // job was closed. A step that had finished by then fails here, loudly, instead of passing for nothing.
+    let mut had_an_instance = false;
+    let waited = taskscheduler::wait_for_instances(schtasks::APPLY_SSHD_TASK, &installed, Role::ApplySshd, &mut || {
+        had_an_instance = true
+    })
+    .expect("wait for the instances of the task");
+    assert!(
+        had_an_instance,
+        "the task had no instance left when the job was closed, so the test did not show that the step outlives `apply`"
+    );
     assert_eq!(waited, WaitOutcome::Ended);
     let mut host = sshd_host_of_this_machine().expect("find the sshd service");
     assert_eq!(host.settled().expect("read the state"), ServiceState::Running);
