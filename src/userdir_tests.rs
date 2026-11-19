@@ -834,10 +834,10 @@ fn a_request_socket_path_over_the_limit_is_answered_as_nothing_serving_it() {
         .as_os_str()
         .len()
         - 1;
-    let name = format!("sb-ud-rl-{}-", std::process::id());
-    let named = std::env::temp_dir().join(&name);
-    let padding = crate::socket_loc::MAX_SOCKET_PATH_BYTES - fixed - named.as_os_str().len();
-    let root = named.with_file_name(format!("{name}{}", "x".repeat(padding)));
+    // Under a fixed short root, not the temp directory, whose length is the machine's.
+    let prefix = format!(r"C:\sb-ud-rl-{}-", std::process::id());
+    let padding = crate::socket_loc::MAX_SOCKET_PATH_BYTES - fixed - prefix.len();
+    let root = PathBuf::from(format!("{prefix}{}", "x".repeat(padding)));
     std::fs::create_dir_all(root.join("AppData").join("Local")).unwrap();
     let profile = TempProfile(root);
 
@@ -847,7 +847,13 @@ fn a_request_socket_path_over_the_limit_is_answered_as_nothing_serving_it() {
     let folder = open_socket_dir(&loc, &me()).unwrap();
     let err = folder.connect_request().unwrap_err();
     assert!(crate::console_prompt::is_no_agent(&err), "{err:#}");
-    assert!(format!("{err:#}").contains("no agent at High"), "{err:#}");
+    assert!(err.is::<crate::socket_loc::RequestPathTooLong>(), "{err:#}");
+    let said = format!("{err:#}");
+    assert!(said.contains("no agent at High"), "{said}");
+    assert!(
+        !said.contains("os error"),
+        "it names no connect that was not made: {said}"
+    );
 }
 
 #[test]

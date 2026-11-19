@@ -29,18 +29,13 @@ pub const NO_SESSION: &str = "ssh-broker: no session to end.";
 /// can reach that agent only on `request.sock`. An unreadable elevation, or a `Standard` process that could not
 /// look for the folder, gets the plain line plus the cause.
 pub fn no_session_line(elevation: &anyhow::Result<Elevation>, elevated_folder: &anyhow::Result<bool>) -> String {
-    match (elevation, elevated_folder) {
-        (Ok(Elevation::Filtered), _) | (Ok(Elevation::Standard), Ok(true)) => where_to_run_line(),
-        (Ok(Elevation::Standard), Err(e)) => format!(
-            "{NO_SESSION} Note: {}, so the session may be elsewhere.",
-            crate::offer::text::elevated_session_unchecked_clause(&format!("{e:#}"))
-        ),
-        (Ok(Elevation::Full | Elevation::Standard), _) => NO_SESSION.to_owned(),
-        (Err(e), _) => format!(
-            "{NO_SESSION} Note: {}, so the session may be elsewhere.",
-            crate::offer::text::elevation_unreadable_clause(&format!("{e:#}"))
-        ),
-    }
+    let unchecked = match (elevation, elevated_folder) {
+        (Ok(Elevation::Filtered), _) | (Ok(Elevation::Standard), Ok(true)) => return where_to_run_line(),
+        (Ok(Elevation::Standard), Err(e)) => crate::offer::text::elevated_session_unchecked_clause(&format!("{e:#}")),
+        (Ok(Elevation::Full | Elevation::Standard), _) => return NO_SESSION.to_owned(),
+        (Err(e), _) => crate::offer::text::elevation_unreadable_clause(&format!("{e:#}")),
+    };
+    format!("{NO_SESSION} Note: {unchecked}, so the session may be elsewhere.")
 }
 
 /// What an unelevated process of an account whose agent runs at High is told when neither socket it can reach is served.

@@ -110,16 +110,7 @@ impl InputQueue for ConsoleInput {
 /// The OS errors a `connect` to the user's socket fails with when nothing serves it, as the tests
 /// observed them: `WSAENETDOWN` (10050) when the folder is missing, `WSAECONNREFUSED` (10061) when
 /// the socket file is missing from an existing folder or is left over from an agent that ended.
-const NO_AGENT_CODES: &[i32] = &[10050, CONNECTION_REFUSED];
-
-/// `WSAECONNREFUSED`.
-const CONNECTION_REFUSED: i32 = 10061;
-
-/// The answer of a connect that is not made because nothing can serve the socket: the error of a missing socket
-/// file, with `why` after it. [`is_no_agent`] says yes to it.
-pub fn nothing_serves(why: &str) -> anyhow::Error {
-    anyhow::Error::new(std::io::Error::from_raw_os_error(CONNECTION_REFUSED)).context(why.to_owned())
-}
+const NO_AGENT_CODES: &[i32] = &[10050, 10061];
 
 /// Why the shim has no agent to relay into. Mapped on the **codes Windows returns**, not on
 /// `ErrorKind`: a connect to a missing path fails with `WSAENETDOWN`, which `NotFound` and
@@ -142,9 +133,11 @@ pub fn absence(connect: &anyhow::Result<socket2::Socket>, location: &anyhow::Res
 }
 
 /// Whether a failed walk to the user's socket and connect to it means nothing serves it: a folder of
-/// the way is not there, or the OS code of the connect says so.
+/// the way is not there, no agent at High can exist for the profile (`request.sock`'s path is over the limit), or the
+/// OS code of the connect says so.
 pub fn is_no_agent(error: &anyhow::Error) -> bool {
     error.is::<crate::acl::Missing>()
+        || error.is::<crate::socket_loc::RequestPathTooLong>()
         || error
             .downcast_ref::<std::io::Error>()
             .and_then(std::io::Error::raw_os_error)

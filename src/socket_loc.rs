@@ -174,6 +174,16 @@ pub enum SocketLocationError {
     TooLong { path: PathBuf, bytes: usize, max: usize },
 }
 
+/// The path of `request.sock` is over the limit. [`for_profile`] measures `agent.sock` only, and where that fits and
+/// this does not, no agent at High can exist for the profile: its own `agent.sock` is 7 bytes longer than this path.
+/// Nothing is there to connect to, which is what a caller that looks for an agent takes this error for
+/// ([`crate::console_prompt::is_no_agent`]).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{} is over the socket path limit, so no agent at High can exist for this profile", path.display())]
+pub struct RequestPathTooLong {
+    pub path: PathBuf,
+}
+
 /// The socket location inside `profile` for processes at `integrity`, or why it cannot be used. Only `agent.sock`
 /// is measured: `request.sock` is bound by an agent at High in the plain folder, where its path is 7 bytes
 /// shorter than that agent's own `agent.sock`, so it fits whenever the agent can start.

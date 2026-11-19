@@ -863,7 +863,7 @@ fn the_end_is_judged_only_after_the_accept_loop_has_counted_what_it_took_and_clo
     let (events, on_event) = mpsc::channel::<&'static str>();
     let connections = Connections::observing_drain({
         let events = events.clone();
-        move || {
+        move |_| {
             let _ = events.send("parked");
         }
     });
@@ -1210,7 +1210,7 @@ fn a_loop_that_failed_while_the_agent_ends_still_waits_for_the_drain() {
     let (events, on_event) = std::sync::mpsc::channel();
     let connections = Connections::observing_drain({
         let events = events.clone();
-        move || {
+        move |_| {
             let _ = events.send("parked");
         }
     });
@@ -1553,7 +1553,7 @@ fn a_stopped_loop_ends_ok_only_after_every_connection_has_finished() {
     let (events, on_event) = std::sync::mpsc::channel();
     let connections = Connections::observing_drain({
         let events = events.clone();
-        move || {
+        move |_| {
             let _ = events.send("parked");
         }
     });

@@ -104,10 +104,11 @@ impl Connections {
         Self::with_drain(drain_bound, |_| {})
     }
 
-    /// [`Connections::new`] that calls `parks` each time the drain is about to park.
+    /// [`Connections::new`] that calls `parks` each time the drain is about to park, with the number of live
+    /// connections that are not `logout` requests (see [`Connections::with_drain`]).
     #[cfg(test)]
-    pub(super) fn observing_drain(parks: impl Fn() + Send + Sync + 'static) -> Arc<Self> {
-        Self::with_drain(DRAIN_BOUND, move |_| parks())
+    pub(super) fn observing_drain(parks: impl Fn(usize) + Send + Sync + 'static) -> Arc<Self> {
+        Self::with_drain(DRAIN_BOUND, parks)
     }
 
     pub(super) fn with_drain(

@@ -167,10 +167,19 @@ impl Drop for Registration<'_> {
 }
 
 /// What ends a background agent's process once its logout is answered and the session drained: the `end_process`
-/// of [`handle_logout`] on both sockets.
-pub(super) fn end_the_agent() {
-    tracing::info!("the background session has ended");
-    super::end_process(0)
+/// of [`handle_logout`] on both sockets. How it ends is the tally's record, as for every end that is settled
+/// ([`super::settled_end`]).
+pub(super) fn end_the_agent(control: &Control) {
+    end_the_agent_with(control, |outcome| super::finish_settled(outcome));
+}
+
+/// [`end_the_agent`] with what ends the process as a parameter, so a test can see how the end went.
+///
+/// The record is read after the settle, and it cannot change under this: a shortage is recorded only while no
+/// connection is live, and this `logout` is live until the process ends, so a cause is recorded before the
+/// handler was counted (and is read here) or never.
+pub(super) fn end_the_agent_with(control: &Control, finish: impl FnOnce(anyhow::Result<()>)) {
+    finish(super::settled_end(&control.connections));
 }
 
 /// Answer a `Logout` handshake on a connection whose handshake has been read.

@@ -271,7 +271,7 @@ fn the_process_ends_only_after_every_other_connection_has_finished() {
     let (events, on_event) = mpsc::channel();
     let connections = Connections::observing_drain({
         let events = events.clone();
-        move || {
+        move |_| {
             let _ = events.send("parked");
         }
     });
@@ -364,7 +364,7 @@ fn the_accept_loop_is_woken_once_the_shells_are_ended_and_every_other_connection
     let (events, on_event) = mpsc::channel::<&'static str>();
     let connections = Connections::observing_drain({
         let events = events.clone();
-        move || {
+        move |_| {
             let _ = events.send("parked");
         }
     });
@@ -699,7 +699,7 @@ fn the_drain_completes_once_a_refused_client_has_closed() {
     let client: Arc<Mutex<Option<mpsc::Sender<()>>>> = Arc::default();
     let connections = Connections::observing_drain({
         let client = Arc::clone(&client);
-        move || drop(client.lock().unwrap().take())
+        move |_| drop(client.lock().unwrap().take())
     });
     let (silent, refusal, dir) = refusal_awaiting_its_client(&connections, "refusal-ends-drain");
     *client.lock().unwrap() = Some(silent);
@@ -1021,19 +1021,24 @@ fn an_id_from_another_agent_run_is_unknown_to_a_new_agent() {
 /// Two accept loops (`agent.sock`, `request.sock`) hold listeners; the end waits for both to close.
 #[test]
 fn the_tally_waits_for_every_listener_to_close() {
-    let connections = Connections::new();
+    let (events, on_event) = mpsc::channel();
+    let connections = Connections::observing_drain({
+        let events = events.clone();
+        move |_| {
+            let _ = events.send("parked");
+        }
+    });
     let (woken, on_wake) = mpsc::channel();
     let open = |socket: &'static str| {
         let woken = woken.clone();
         HeldListener::open(&connections, socket, move |_| woken.send(socket).unwrap())
     };
     let (agent, request) = (open("agent.sock"), open("request.sock"));
-    let (returned, on_return) = mpsc::channel();
     let ender = {
         let connections = Arc::clone(&connections);
         std::thread::spawn(move || {
             connections.settle();
-            returned.send(()).unwrap();
+            events.send("returned").unwrap();
         })
     };
     let mut loops = [on_wake.recv().unwrap(), on_wake.recv().unwrap()];
@@ -1044,13 +1049,19 @@ fn the_tally_waits_for_every_listener_to_close() {
         "each loop is woken, by the tally"
     );
     assert!(connections.is_closing(), "the flag is up when the loops are woken");
+    // Nothing is live, so the drain does not park: the end parks once with both listeners open, and again each time
+    // the tally changes while one is still held.
+    assert_eq!(on_event.recv().unwrap(), "parked", "the end waits for the listeners");
     agent.close();
-    assert!(
-        connections.listener_is_open(),
-        "the second listener is still held by the tally"
+    assert_eq!(
+        on_event.recv().unwrap(),
+        "parked",
+        "the end returned with the second listener still held"
     );
     request.close();
-    on_return.recv().unwrap();
+    // A wake the condition variable gives for nothing parks the end again, so a park may come first.
+    let after = std::iter::from_fn(|| on_event.recv().ok()).find(|event| *event != "parked");
+    assert_eq!(after, Some("returned"));
     assert!(!connections.listener_is_open());
     ender.join().unwrap();
 }
@@ -1082,4 +1093,39 @@ fn a_logout_wakes_the_loop_of_each_socket_and_ends_the_agent() {
     assert_eq!(loops, ["agent.sock", "request.sock"]);
     assert!(ended.load(Ordering::SeqCst), "the end completed");
     assert!(!connections.listener_is_open());
+}
+
+// How the end goes -----
+
+/// How a background agent's end went when `logout` is handled on `control`: what `end_the_agent_with` finished with.
+fn logout_ended(control: &Control) -> anyhow::Result<()> {
+    let outcome = Mutex::new(None);
+    handle_logout(&mut Closed, &mut Vec::new(), control, || {
+        end_the_agent_with(control, |ended| *outcome.lock().unwrap() = Some(ended))
+    })
+    .unwrap();
+    outcome.into_inner().unwrap().expect("the end was finished")
+}
+
+/// A `logout` served after a shortage decided the end (the connection the loop kept, or one accepted before the loop
+/// read the flag) ends the agent as the failed end that the other threads end it as, whichever of them is first.
+#[test]
+fn a_logout_served_after_a_shortage_decided_the_end_ends_as_the_failed_end() {
+    let connections = Connections::new();
+    let control = Control::new(true, Arc::clone(&connections));
+    assert!(connections.decide_end_if_idle(connections.ended(), &anyhow::anyhow!("accept failed with code 10055")));
+
+    let end = logout_ended(&control).expect_err("the end is the failure that decided it");
+
+    assert_eq!(crate::agent::exit_code_of(&end), 1);
+    assert!(end.downcast_ref::<crate::agent::NothingLive>().is_some(), "{end:#}");
+    assert!(format!("{end:#}").contains("accept failed with code 10055"), "{end:#}");
+}
+
+/// With no shortage recorded, a `logout` ends the agent cleanly.
+#[test]
+fn a_logout_with_no_shortage_recorded_ends_cleanly() {
+    let control = Control::new(true, Connections::new());
+
+    assert!(logout_ended(&control).is_ok());
 }

@@ -316,16 +316,39 @@ fn run_on(folder: &Arc<SocketDir>, background: bool) -> anyhow::Result<()> {
     .or_else(|end| run_ended(end, &connections))
 }
 
-/// How [`run_on`] ends, given `end`, how the loop of `agent.sock` ended. A loop that stopped because the end was
-/// decided is a clean end, unless what decided it was a shortage that no connection was live to cure
-/// ([`Connections::fatal_cause`]), possibly on the request socket's loop: then it is that failure, so that the
-/// process ends with the code of a failed agent whichever thread ends it.
+/// How [`run_on`] ends, given `end`, how the loop of `agent.sock` ended: a loop that stopped because the end was
+/// decided ends as that end was settled ([`settled_end`]); any other stop is its own failure.
 #[cfg(windows)]
 fn run_ended(end: anyhow::Error, connections: &Connections) -> anyhow::Result<()> {
-    match (end.downcast_ref::<Stopped>(), connections.fatal_cause()) {
-        (Some(Stopped), None) => Ok(()),
-        (Some(Stopped), Some(cause)) => Err(anyhow::Error::msg(cause).context(NothingLive)),
-        (None, _) => Err(end),
+    match end.downcast_ref::<Stopped>() {
+        Some(Stopped) => settled_end(connections),
+        None => Err(end),
+    }
+}
+
+/// How an end that is decided and settled ([`Connections::settle`]) goes, from the tally's record and nowhere else:
+/// a clean end, unless what decided it was a shortage that no connection was live to cure
+/// ([`Connections::fatal_cause`]), on whichever loop: then it is that failure. Every thread that ends the agent after a
+/// settle (the main thread through [`run_ended`], the request socket's loop, a `logout`) takes its end from here,
+/// so the process has the same exit code whichever of them ends it first.
+#[cfg(windows)]
+fn settled_end(connections: &Connections) -> anyhow::Result<()> {
+    match connections.fatal_cause() {
+        None => Ok(()),
+        Some(cause) => Err(anyhow::Error::msg(cause).context(NothingLive)),
+    }
+}
+
+/// End the process as `outcome` ([`settled_end`]) says: a clean end is logged, a failed one is reported
+/// ([`end_on_error`]).
+#[cfg(windows)]
+fn finish_settled(outcome: anyhow::Result<()>) -> ! {
+    match outcome {
+        Ok(()) => {
+            tracing::info!("the background session has ended");
+            end_process(0)
+        }
+        Err(e) => end_on_error(&e),
     }
 }
 
@@ -387,7 +410,7 @@ fn serve_requests(listener: Listener, connect: WakeConnect, connections: &Arc<Co
                     requests::serve,
                 )
             });
-            request_loop_ended(&end, &connections, |end| end_on_error(end));
+            request_loop_ended(&end, &connections, |outcome| finish_settled(outcome));
         });
     if let Err(e) = spawned {
         tracing::warn!("the agent serves without a request socket: no thread for it: {e}");
@@ -396,11 +419,13 @@ fn serve_requests(listener: Listener, connect: WakeConnect, connections: &Arc<Co
 
 /// How the request socket's loop ended (`end`). Any stop leaves the sessions as they are, except a shortage with no
 /// connection live ([`NothingLive`]): the loop has decided the end, so settle it ([`Connections::settle`]) and end
-/// the process via `end_agent`. The main thread, woken by that settle, ends with the same recorded cause
-/// ([`run_ended`]), so the exit code is the same whichever thread ends the process first. Serving on without the
-/// request socket would leave unelevated `logout`s nothing to ask. The cause is logged here, once.
+/// the process via `end_agent`, with how that end went ([`settled_end`]). The main thread, woken by that settle, and
+/// a `logout` served meanwhile take their ends from the same record, so the exit code is the same whichever thread
+/// ends the process first. Serving on without the request socket would leave unelevated `logout`s nothing to ask.
+/// This logs the cause when the loop ends; the thread that ends the process reports it as well, so it can be said
+/// twice.
 #[cfg(windows)]
-fn request_loop_ended(end: &anyhow::Error, connections: &Arc<Connections>, end_agent: impl FnOnce(&anyhow::Error)) {
+fn request_loop_ended(end: &anyhow::Error, connections: &Arc<Connections>, end_agent: impl FnOnce(anyhow::Result<()>)) {
     if end.downcast_ref::<Stopped>().is_some() {
         tracing::debug!("the request socket is closed: the agent is ending");
     } else if end.downcast_ref::<NothingLive>().is_some() {
@@ -410,7 +435,7 @@ fn request_loop_ended(end: &anyhow::Error, connections: &Arc<Connections>, end_a
         );
         tracing::error!("the request socket met a shortage with no connection live; ending the agent: {end:#}");
         connections.settle();
-        end_agent(end);
+        end_agent(settled_end(connections));
     } else {
         tracing::error!("the request socket stopped; the agent serves its sessions without it: {end:#}");
     }
@@ -913,7 +938,7 @@ fn handle_connection_in(conn: socket2::Socket, hooks: Hooks, control: &Control) 
         return Ok(());
     };
     if hs.mode == Mode::Logout {
-        return logout::handle_logout(&mut rx, &mut tx, control, logout::end_the_agent);
+        return logout::handle_logout(&mut rx, &mut tx, control, || logout::end_the_agent(control));
     }
     // Before a shell is started for nothing; the registration below is what decides.
     if control.is_ending() {

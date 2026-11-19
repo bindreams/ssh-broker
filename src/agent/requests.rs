@@ -19,7 +19,7 @@ pub const REQUESTS_ONLY: &str = "this socket takes requests only";
 /// [`handle`] with the agent's own end and a panic reply (see [`logout::PanicReply`]).
 pub(super) fn serve(conn: socket2::Socket, control: &Control) -> anyhow::Result<()> {
     let _answer_a_panic = logout::PanicReply::new(&conn, control);
-    handle(conn, control, logout::end_the_agent)
+    handle(conn, control, || logout::end_the_agent(control))
 }
 
 /// Serve one connection of the request socket. A `Logout` handshake is answered exactly as on `agent.sock` (the

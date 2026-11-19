@@ -344,7 +344,7 @@ fn a_login_that_arrives_while_the_agent_drains_gets_the_refusal_at_once() {
     let (events, on_event) = mpsc::channel();
     let connections = super::Connections::observing_drain({
         let events = events.clone();
-        move || {
+        move |_| {
             let _ = events.send("draining");
         }
     });
@@ -406,7 +406,7 @@ fn a_login_accepted_while_the_end_is_decided_is_refused_not_reset() {
     let (events, on_event) = mpsc::channel::<&'static str>();
     let connections = super::Connections::observing_drain({
         let events = events.clone();
-        move || {
+        move |_| {
             let _ = events.send("parked");
         }
     });
