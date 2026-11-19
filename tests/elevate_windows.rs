@@ -9,7 +9,8 @@
 //! - `auto-approve` runs the command with the agent's own token, elevated. By default, in a session with a terminal
 //!   or without, its input is closed and its output is printed by `elevate` in the session, below the typed line, so
 //!   it can be piped; with `--terminal` it has a screen of its own, and the session's screen comes back when it ends;
-//! - the default (`prompt`) asks the person at the terminal; it is refused with a sentence that says so;
+//! - the default (`prompt`) asks the person at the terminal (`tests/consent_windows.rs`); in a session without one it
+//!   is refused with a sentence that names the variable;
 //! - `always` runs it in place, in a session that is elevated already.
 //!
 //! What a session with a terminal shows is judged on the client's stream rendered as a terminal would
@@ -397,10 +398,11 @@ fn with_terminal_keys_reach_the_command_and_the_sessions_screen_comes_back() {
     session.leave();
 }
 
-/// Elevated (CI only). The default login asks the person at the terminal; `elevate` is refused with a sentence that
-/// says so, and the command does not run.
+/// Elevated (CI only). The default login asks the person at the terminal; in a session without one there is nobody
+/// to ask, and `elevate` is refused with a sentence that names the variable, and the command does not run. (With a
+/// terminal it asks: `tests/consent_windows.rs`.)
 #[test]
-fn elevate_with_prompt_is_refused_with_a_sentence_that_says_why() {
+fn default_policy_without_a_terminal_refuses_naming_the_variable() {
     let _machine = machine::exclusive();
     let (kit, account, _end) = an_administrator("elpr");
     let admin = Started::start(&kit, &account);
@@ -409,7 +411,7 @@ fn elevate_with_prompt_is_refused_with_a_sentence_that_says_why() {
     let outcome = admin.elevate_over_ssh(None, &format!("cmd.exe /c copy NUL {}", marker.display()));
     assert_eq!(outcome.code, Some(REFUSED), "{}", admin.failure(&outcome));
     assert!(
-        outcome.stderr.contains(text::elevation_consent_not_built().trim_end()),
+        outcome.stderr.contains(text::elevation_no_terminal().trim_end()),
         "{}",
         admin.failure(&outcome)
     );

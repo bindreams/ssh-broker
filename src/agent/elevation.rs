@@ -10,7 +10,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use super::link::{Carrier, Link};
+use super::link::{AskGuard, Carrier, Ended, Link};
 use super::logout::Killer;
 use super::{
     ExecStarter, HangupGuard, ParkSignal, PtyStarter, PtyTarget, answer_serving, close_unserved_pty, end_pty,
@@ -19,7 +19,10 @@ use super::{
 use crate::afunix::ConnTx;
 use crate::hangup::HangupWatcher;
 use crate::offer::text;
-use crate::protocol::{ElevationPolicy, ElevationRequest, SESSION_VARIABLE, SessionId, Stream};
+use crate::protocol::{
+    ConsentAnswer, ConsentRequest, ElevationPolicy, ElevationRequest, PROTOCOL_VERSION, SESSION_VARIABLE, SessionId,
+    Stream,
+};
 
 // Whether a request is allowed =====
 
@@ -28,6 +31,8 @@ use crate::protocol::{ElevationPolicy, ElevationRequest, SESSION_VARIABLE, Sessi
 pub(super) enum Verdict {
     /// Run the command.
     Run,
+    /// Ask the person at the session's terminal first ([`Link::ask`]); run it only if they allow it.
+    Ask,
     /// Do not: say this, exit 126.
     Refuse(String),
 }
@@ -37,15 +42,16 @@ pub(super) enum Verdict {
 /// `Always` refuse (the second because a session that asked for `always` runs at High, where `elevate` runs the
 /// command in place and asks nobody: a request for it that reaches the agent comes from a process below High
 /// somewhere else in the account). A command that wants a terminal in a session that has none is refused next:
-/// there is no screen to give it. `AutoApprove` runs it; `Prompt` is refused, with a sentence that says the consent
-/// question does not exist yet.
+/// there is no screen to give it. `AutoApprove` runs it. `Prompt` asks the person at the terminal; a session without
+/// one has nobody to ask and is refused, with the sentence that names the two levels that need no question.
 pub(super) fn decide(policy: ElevationPolicy, has_terminal: bool, terminal: bool) -> Verdict {
     match policy {
         ElevationPolicy::Never => Verdict::Refuse(text::elevation_never()),
         ElevationPolicy::Always => Verdict::Refuse(text::elevation_already_elevated()),
         _ if terminal && !has_terminal => Verdict::Refuse(text::elevation_needs_a_terminal()),
         ElevationPolicy::AutoApprove => Verdict::Run,
-        ElevationPolicy::Prompt => Verdict::Refuse(text::elevation_consent_not_built()),
+        ElevationPolicy::Prompt if has_terminal => Verdict::Ask,
+        ElevationPolicy::Prompt => Verdict::Refuse(text::elevation_no_terminal()),
     }
 }
 
@@ -107,6 +113,42 @@ impl HostedSession {
     }
 }
 
+// The question =====
+
+/// Ask the person at the session's terminal whether `request`'s command may run, in `cwd` (the folder it would run
+/// in: the request's, else the account's home), through the session's own shim ([`Link::ask`]). `Ok` is a yes, with
+/// the question's hold on the screen, which the caller lets go of, or hands to the command it runs with `--terminal`
+/// ([`run_hosted`]). Anything else is the sentence to refuse with: the answer was no (the screen is back with the
+/// session by then, repainted), or the session ended while it was asked.
+pub(super) fn consent<'a>(
+    link: &'a Link,
+    request: &ElevationRequest,
+    cwd: Option<&Path>,
+) -> Result<AskGuard<'a>, String> {
+    let shown = cwd.map_or_else(
+        // Where a command with no folder starts: the agent's own.
+        || {
+            std::env::current_dir()
+                .map(|dir| dir.display().to_string())
+                .unwrap_or_default()
+        },
+        |dir| dir.display().to_string(),
+    );
+    let question = ConsentRequest {
+        version: PROTOCOL_VERSION,
+        command: request.command.clone(),
+        cwd: shown,
+    };
+    match link.ask(&question) {
+        Ok((ConsentAnswer::Allow, hold)) => Ok(hold),
+        Ok((ConsentAnswer::Refuse, hold)) => {
+            drop(hold);
+            Err(text::elevation_declined())
+        }
+        Err(Ended) => Err(text::elevation_session_ended()),
+    }
+}
+
 // Running the command =====
 
 /// How running a hosted command ended.
@@ -144,6 +186,10 @@ pub(super) enum RunOutcome {
 /// The command lives as long as the request that asked for it, and no longer: `conn` is watched, and a client that
 /// has hung up ends the command's tree. A command with `--terminal` also ends with the session whose screen it
 /// holds, whoever asked for it ([`Link::end_hosting`]).
+///
+/// `asked` is the question's hold on the screen when one was asked, and only for a command with `--terminal`, which
+/// takes the screen from the question without giving it back to the session in between; the hold is let go once it
+/// has. A command run by default is given none: the session's screen is back before it starts.
 pub(super) fn run_hosted(
     link: &Arc<Link>,
     conn: &mut ConnTx,
@@ -151,12 +197,17 @@ pub(super) fn run_hosted(
     cwd: Option<&Path>,
     starts: &Starts,
     id: &SessionId,
+    asked: Option<AskGuard<'_>>,
 ) -> RunOutcome {
     let id = id.to_string();
     let env = [(SESSION_VARIABLE, id.as_str())];
     if request.terminal {
-        on_a_pseudoconsole(link, conn, &request.command, cwd, starts, &env)
+        on_a_pseudoconsole(link, conn, &request.command, cwd, starts, &env, asked)
     } else {
+        debug_assert!(
+            asked.is_none(),
+            "a command on pipes was given the question's hold on the screen"
+        );
         on_pipes(conn, &request.command, cwd, starts, &env)
     }
 }
@@ -173,6 +224,7 @@ fn on_a_pseudoconsole(
     cwd: Option<&Path>,
     starts: &Starts,
     env: &[(&str, &str)],
+    asked: Option<AskGuard<'_>>,
 ) -> RunOutcome {
     debug_assert!(
         link.has_terminal(),
@@ -208,6 +260,9 @@ fn on_a_pseudoconsole(
     if guard.is_none() {
         tracing::debug!("the session's shell is gone: the command was ended instead of hosted");
     }
+    // The command has the screen now (or never will): the question's hold has nothing left to give back, or the
+    // session's screen goes back, repainted, if the command was not hosted.
+    drop(asked);
     // A delivery that fails is a connection that has gone, and its command has no screen to run on: its tree ends,
     // as the session's own pump's does, and the pump goes on reading until the pseudoconsole is closed. The session's
     // own end is [`Link::end_hosting`]'s, and this is what ends the command when the session's hang-up watch could

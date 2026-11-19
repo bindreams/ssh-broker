@@ -83,8 +83,8 @@ use crate::offer::text;
 use crate::pipes::ExecChild;
 #[cfg(windows)]
 use crate::protocol::{
-    ElevationPolicy, ExitCode, Frame, FrameKind, FrameReader, Handshake, Mode, Resize, SESSION_VARIABLE, Stream,
-    read_one_frame, write_frame,
+    ConsentAnswer, ElevationPolicy, ExitCode, Frame, FrameKind, FrameReader, Handshake, Mode, Resize, SESSION_VARIABLE,
+    Stream, read_one_frame, write_frame,
 };
 #[cfg(windows)]
 use crate::relay::{FrameSink, pump_until_peer_gone, write_data, write_serving};
@@ -1556,6 +1556,10 @@ impl FrameSink for LinkInputSink {
     }
     fn on_resize(&mut self, r: Resize) -> anyhow::Result<()> {
         self.link.resize(r);
+        Ok(())
+    }
+    fn on_consent_answer(&mut self, answer: ConsentAnswer) -> anyhow::Result<()> {
+        self.link.answer(answer);
         Ok(())
     }
 }

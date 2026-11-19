@@ -2,7 +2,7 @@
 //! agent. A wait is observed by the callback `deliver_observed` makes before it parks, never by a delay.
 use super::super::test_wire::{Recorder, Wire};
 use super::*;
-use crate::protocol::{ExitCode, FrameKind, Resize, Stream};
+use crate::protocol::{ConsentAnswer, ConsentRequest, ExitCode, FrameKind, Resize, Stream};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 
@@ -361,4 +361,279 @@ fn input_and_resize_are_routed_while_an_output_write_is_blocked() {
     gate.release();
     writer.join().unwrap().unwrap();
     assert_eq!(wire.data(), ["Pstuck"]);
+}
+
+// The question -----
+
+fn a_question() -> ConsentRequest {
+    ConsentRequest {
+        version: crate::protocol::PROTOCOL_VERSION,
+        command: "cmd /c whoami".to_owned(),
+        cwd: r"C:\Users\me".to_owned(),
+    }
+}
+
+/// A question asked on a thread. The thread holds the question's hold on the screen after the answer, until the test
+/// lets it go, so that what is true of the screen while the hold is on can be looked at.
+struct Asked {
+    /// The thread is about to wait for the answer.
+    parked: mpsc::Receiver<()>,
+    /// What `ask` returned.
+    answer: mpsc::Receiver<Result<ConsentAnswer, Ended>>,
+    release: mpsc::Sender<()>,
+    thread: std::thread::JoinHandle<()>,
+}
+
+fn ask_on_a_thread(link: &Arc<Link>) -> Asked {
+    let (parked, on_parked) = mpsc::channel();
+    let (answered, answer) = mpsc::channel();
+    let (release, released) = mpsc::channel::<()>();
+    let link = Arc::clone(link);
+    let thread = std::thread::spawn(move || {
+        let outcome = link.ask_observed(&a_question(), || {
+            let _ = parked.send(());
+        });
+        match outcome {
+            Ok((given, hold)) => {
+                let _ = answered.send(Ok(given));
+                let _ = released.recv();
+                drop(hold);
+            }
+            Err(ended) => {
+                let _ = answered.send(Err(ended));
+            }
+        }
+    });
+    Asked {
+        parked: on_parked,
+        answer,
+        release,
+        thread,
+    }
+}
+
+impl Asked {
+    /// Let the thread drop its hold on the screen and end.
+    fn finish(self) {
+        let _ = self.release.send(());
+        self.thread.join().unwrap();
+    }
+}
+
+fn carrier(link: &Link) -> Carrier {
+    locked(&link.state).carrier
+}
+
+#[test]
+fn ask_writes_the_consent_frame_and_waits_for_the_answer_and_the_screen_is_the_questions_meanwhile() {
+    for answer in [ConsentAnswer::Allow, ConsentAnswer::Refuse] {
+        let (wire, session) = (Wire::default(), Arc::new(Recorder::default()));
+        let link = terminal_link(&wire, &session);
+        let asked = ask_on_a_thread(&link);
+        asked.parked.recv().expect("the question is waiting for its answer");
+        assert_eq!(
+            wire.frames(),
+            [(FrameKind::Consent, a_question().encode().unwrap())],
+            "the question is the one frame written"
+        );
+        assert_eq!(carrier(&link), Carrier::Asking);
+        assert!(asked.answer.try_recv().is_err(), "nothing answered yet");
+
+        link.answer(answer);
+        assert_eq!(asked.answer.recv().unwrap(), Ok(answer));
+        assert_eq!(
+            carrier(&link),
+            Carrier::Asking,
+            "the screen is the question's until its hold is let go"
+        );
+        asked.finish();
+        assert_eq!(carrier(&link), Carrier::Session);
+    }
+}
+
+/// The agent holds the session's output: a write for the session waits behind the question, and no output frame
+/// follows the `Consent` frame until the answer is in.
+#[test]
+fn no_output_frame_follows_the_consent_frame_until_the_answer() {
+    let (wire, session) = (Wire::default(), Arc::new(Recorder::default()));
+    let link = terminal_link(&wire, &session);
+    link.deliver(Carrier::Session, Stream::Pty, b"before").unwrap();
+    let asked = ask_on_a_thread(&link);
+    asked.parked.recv().unwrap();
+
+    let (held, on_held) = deliver_parked(&link, Carrier::Session, "held");
+    on_held.recv().expect("the session's output waits behind the question");
+    let kinds: Vec<FrameKind> = wire.frames().iter().map(|(kind, _)| *kind).collect();
+    assert_eq!(
+        kinds,
+        [FrameKind::Data, FrameKind::Consent],
+        "nothing after the question"
+    );
+
+    link.answer(ConsentAnswer::Refuse);
+    asked.answer.recv().unwrap().unwrap();
+    asked.finish();
+    held.join()
+        .unwrap()
+        .expect("the held output goes on once the question is over");
+    let kinds: Vec<FrameKind> = wire.frames().iter().map(|(kind, _)| *kind).collect();
+    assert_eq!(kinds, [FrameKind::Data, FrameKind::Consent, FrameKind::Data]);
+    assert_eq!(wire.data(), ["Pbefore", "Pheld"]);
+}
+
+/// What is typed while the question is asked is neither the session's nor an answer: it is dropped. The size is
+/// still the session's.
+#[test]
+fn input_typed_while_asking_is_discarded_and_the_size_is_not() {
+    let (wire, session) = (Wire::default(), Arc::new(Recorder::default()));
+    let link = terminal_link(&wire, &session);
+    link.route_input(b"a").unwrap();
+    let asked = ask_on_a_thread(&link);
+    asked.parked.recv().unwrap();
+
+    link.route_input(b"yes\r").expect("dropped, not an error");
+    link.resize(Resize { cols: 100, rows: 40 });
+    assert_eq!(
+        session.events(),
+        ["input a", "resize 100x40"],
+        "no key reached the session"
+    );
+
+    link.answer(ConsentAnswer::Refuse);
+    asked.answer.recv().unwrap().unwrap();
+    asked.finish();
+    link.route_input(b"c").unwrap();
+    assert_eq!(
+        session.events(),
+        ["input a", "resize 100x40", "resize 100x40", "input c"],
+        "the screen came back with the size, and keys are the session's again"
+    );
+}
+
+/// Every return of the screen to the session gives the session's pseudoconsole its size, even unchanged: that is the
+/// repaint of what the question's clear wiped.
+#[test]
+fn the_screen_goes_back_to_the_session_with_its_size_when_the_question_is_over() {
+    let (wire, session) = (Wire::default(), Arc::new(Recorder::default()));
+    let link = terminal_link(&wire, &session);
+    let asked = ask_on_a_thread(&link);
+    asked.parked.recv().unwrap();
+    link.answer(ConsentAnswer::Refuse);
+    asked.answer.recv().unwrap().unwrap();
+    assert_eq!(session.events(), Vec::<String>::new(), "not before");
+    asked.finish();
+    assert_eq!(session.events(), ["resize 80x24"]);
+}
+
+/// An allowed `--terminal` command takes the screen straight from the question: the question's hold, let go
+/// afterwards, gives nothing back, and the session is repainted once, when the command's own hold ends.
+#[test]
+fn a_command_hosted_while_the_question_holds_the_screen_takes_it_and_the_session_is_repainted_once() {
+    let (wire, session, elevated) = (
+        Wire::default(),
+        Arc::new(Recorder::default()),
+        Arc::new(Recorder::default()),
+    );
+    let link = terminal_link(&wire, &session);
+    let asked = ask_on_a_thread(&link);
+    asked.parked.recv().unwrap();
+    link.answer(ConsentAnswer::Allow);
+    asked.answer.recv().unwrap().unwrap();
+
+    let guard = host(&link, elevated.clone());
+    assert_eq!(carrier(&link), Carrier::Elevated);
+    asked.finish();
+    assert_eq!(
+        carrier(&link),
+        Carrier::Elevated,
+        "the question's hold gave nothing back"
+    );
+    assert_eq!(session.events(), Vec::<String>::new(), "no repaint yet");
+
+    drop(guard);
+    assert_eq!(carrier(&link), Carrier::Session);
+    assert_eq!(session.events(), ["resize 80x24"], "one repaint, at the command's end");
+}
+
+/// BINDING (the deputy, 2026-11-19): the session's shell going away ends a pending question at once.
+#[test]
+fn end_hosting_ends_a_pending_question_at_once() {
+    let (wire, session) = (Wire::default(), Arc::new(Recorder::default()));
+    let link = terminal_link(&wire, &session);
+    let asked = ask_on_a_thread(&link);
+    asked.parked.recv().unwrap();
+
+    link.end_hosting();
+    assert_eq!(asked.answer.recv().unwrap(), Err(Ended));
+    asked.finish();
+    // The session's own words can be written again, and nothing but the question was.
+    link.deliver_observed(Carrier::Session, Stream::Pty, b"bye", || {
+        panic!("the screen is still held by the question")
+    })
+    .unwrap();
+    let kinds: Vec<FrameKind> = wire.frames().iter().map(|(kind, _)| *kind).collect();
+    assert_eq!(kinds, [FrameKind::Consent, FrameKind::Data]);
+}
+
+#[test]
+fn ask_on_a_link_whose_hosting_has_ended_or_that_has_ended_is_ended_at_once_and_writes_nothing() {
+    for (what, end) in [
+        ("hosting ended", (|link: &Link| link.end_hosting()) as fn(&Link)),
+        ("ended", |link: &Link| link.end()),
+    ] {
+        let (wire, session) = (Wire::default(), Arc::new(Recorder::default()));
+        let link = terminal_link(&wire, &session);
+        end(&link);
+        let asked = ask_on_a_thread(&link);
+        assert_eq!(asked.answer.recv().unwrap(), Err(Ended), "{what}");
+        assert!(asked.parked.try_recv().is_err(), "{what}: it never waited");
+        asked.finish();
+        assert!(wire.frames().is_empty(), "{what}: no question was put");
+        assert_eq!(carrier(&link), Carrier::Session, "{what}");
+    }
+}
+
+/// A connection that cannot be written is a client that has gone: the question is not put, and the screen is the
+/// session's.
+#[test]
+fn a_connection_that_cannot_be_written_ends_the_question_and_gives_the_screen_back() {
+    struct Broken;
+    impl std::io::Write for Broken {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::ErrorKind::BrokenPipe.into())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl HalfClose for Broken {
+        fn shutdown_write(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+    let session = Arc::new(Recorder::default());
+    let link = Link::new(
+        Broken,
+        true,
+        (80, 24),
+        Some(Arc::clone(&session) as Arc<dyn InputTarget>),
+    );
+    assert!(matches!(link.ask(&a_question()), Err(Ended)));
+    assert_eq!(carrier(&link), Carrier::Session);
+}
+
+/// An answer that nobody asked for (the question was ended and the shim answered late) does not answer the next one.
+#[test]
+fn an_answer_with_no_question_is_dropped_and_does_not_answer_the_next_question() {
+    let (wire, session) = (Wire::default(), Arc::new(Recorder::default()));
+    let link = terminal_link(&wire, &session);
+    link.answer(ConsentAnswer::Allow);
+    let asked = ask_on_a_thread(&link);
+    asked
+        .parked
+        .recv()
+        .expect("the earlier answer did not answer it: it waits");
+    link.answer(ConsentAnswer::Refuse);
+    assert_eq!(asked.answer.recv().unwrap(), Ok(ConsentAnswer::Refuse));
+    asked.finish();
 }

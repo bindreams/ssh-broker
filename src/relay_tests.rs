@@ -667,7 +667,12 @@ fn pump_decode_dispatches_consent_and_answer_and_a_sink_without_them_errors() {
     let mut wire = Vec::new();
     write_data(&mut wire, Stream::Pty, b"x").unwrap();
     write_frame(&mut wire, FrameKind::Consent, &a_consent_request().encode().unwrap()).unwrap();
-    write_frame(&mut wire, FrameKind::ConsentAnswer, &ConsentAnswer::Refuse.encode().unwrap()).unwrap();
+    write_frame(
+        &mut wire,
+        FrameKind::ConsentAnswer,
+        &ConsentAnswer::Refuse.encode().unwrap(),
+    )
+    .unwrap();
     write_frame(&mut wire, FrameKind::Exit, &ExitCode(0).encode()).unwrap();
     let mut sink = Asked::default();
     let outcome = pump_decode(&mut wire.as_slice(), &mut FrameReader::new(), &mut sink).unwrap();
@@ -699,8 +704,8 @@ fn a_consent_frame_that_is_not_one_is_a_protocol_error() {
         (FrameKind::ConsentAnswer, &[0, 0][..]),
     ] {
         let wire = framed(&[(kind, payload)]);
-        let err = pump_decode(&mut wire.as_slice(), &mut FrameReader::new(), &mut TestSink::default())
-            .expect_err("refused");
+        let err =
+            pump_decode(&mut wire.as_slice(), &mut FrameReader::new(), &mut TestSink::default()).expect_err("refused");
         assert!(matches!(err, PumpError::Protocol(_)), "{kind:?} {payload:?}: {err:?}");
         assert!(err.peer_gone());
     }

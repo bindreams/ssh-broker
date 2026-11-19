@@ -149,13 +149,6 @@ pub fn elevation_already_elevated() -> String {
     "ssh-broker: this session is already elevated: run the command in it.\r\n".to_owned()
 }
 
-/// The login asked for the default, which asks the person at the terminal; that question is not built yet.
-pub fn elevation_consent_not_built() -> String {
-    "ssh-broker: this login asks before elevating, and asking is not built yet: log in with \
-     SSH_BROKER_ELEVATION=auto-approve to run a command elevated without a question.\r\n"
-        .to_owned()
-}
-
 /// The login asked for the default, which asks the person at the terminal, and the session has no terminal to ask on.
 pub fn elevation_no_terminal() -> String {
     "ssh-broker: this login asks before elevating, and this session has no terminal to ask on. Log in with ssh -t, \

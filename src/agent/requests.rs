@@ -11,7 +11,7 @@
 
 use std::path::Path;
 
-use super::elevation::{HostedSession, RunOutcome, Verdict, decide, run_hosted};
+use super::elevation::{HostedSession, RunOutcome, Verdict, consent, decide, run_hosted};
 use super::{Control, Opened, child_cwd, home_dir, logout, read_opening};
 use crate::afunix::{Conn, ConnRx, ConnTx};
 use crate::elevate::{REFUSED_EXIT_CODE, UNKNOWN_END_EXIT_CODE};
@@ -107,16 +107,19 @@ fn elevate(rx: &mut ConnRx, tx: &mut ConnTx, control: &Control, request: &Elevat
     let Some(hosted) = control.await_hosted(&id) else {
         return refuse(rx, tx, control, &text::elevation_not_hosted());
     };
-    if let Verdict::Refuse(sentence) = decide(hosted.policy, hosted.link.has_terminal(), request.terminal) {
-        return refuse(rx, tx, control, &sentence);
-    }
-    // The slot is held while the command runs, and not while the client is waited for: the reply is written, and its
-    // client waited for, with the slot free, so that the next `elevate` of the session is not refused for it.
+    let ask = match decide(hosted.policy, hosted.link.has_terminal(), request.terminal) {
+        Verdict::Refuse(sentence) => return refuse(rx, tx, control, &sentence),
+        Verdict::Ask => true,
+        Verdict::Run => false,
+    };
+    // The slot is held while the question is asked and the command runs, and not while the client is waited for: the
+    // reply is written, and its client waited for, with the slot free, so that the next `elevate` of the session is
+    // not refused for it.
     let answer = {
         let Some(_slot) = hosted.slot.try_take() else {
             return refuse(rx, tx, control, &text::elevation_in_progress());
         };
-        run_elevated(&hosted, tx, request, &id)
+        run_elevated(&hosted, tx, request, &id, ask)
     };
     // A client that could not be told its command had started: nothing more is written to it.
     let Some((sentence, code)) = answer else {
@@ -128,12 +131,14 @@ fn elevate(rx: &mut ConnRx, tx: &mut ConnTx, control: &Control, request: &Elevat
 /// Run the command of `request` for `hosted`, whose slot the caller holds, and say what to answer: the sentence (empty
 /// for a command that ran and ended) and the exit code, or `None` when the client could not be told that the command
 /// had started ([`RunOutcome::Unserved`]). Nothing is written to the client but `Serving` and the command's own
-/// output.
+/// output. With `ask`, the person at the session's terminal is asked first, and a command they do not allow, or
+/// that cannot run, is never put to them.
 fn run_elevated(
     hosted: &HostedSession,
     tx: &mut ConnTx,
     request: &ElevationRequest,
     id: &SessionId,
+    ask: bool,
 ) -> Option<(String, i32)> {
     // The working directory is the one path the agent acts on: it is the command's folder, which must be one.
     let cwd = child_cwd(&request.cwd, home_dir());
@@ -141,7 +146,18 @@ fn run_elevated(
         let cause = format!("{} is not an existing directory", request.cwd);
         return Some((text::elevation_cannot_start(&cause), REFUSED_EXIT_CODE));
     }
-    match run_hosted(&hosted.link, tx, request, cwd.as_deref(), &hosted.starts, id) {
+    let asked = if ask {
+        match consent(&hosted.link, request, cwd.as_deref()) {
+            Ok(hold) => Some(hold),
+            Err(sentence) => return Some((sentence, REFUSED_EXIT_CODE)),
+        }
+    } else {
+        None
+    };
+    // A command run by default needs none of the screen: the session's is back, repainted, before it starts. One run
+    // with `--terminal` takes it from the question.
+    let asked = asked.filter(|_| request.terminal);
+    match run_hosted(&hosted.link, tx, request, cwd.as_deref(), &hosted.starts, id, asked) {
         RunOutcome::Exited(code) => Some((String::new(), code)),
         RunOutcome::NotStarted(cause) => Some((text::elevation_cannot_start(&format!("{cause:#}")), REFUSED_EXIT_CODE)),
         RunOutcome::Unserved => None,
