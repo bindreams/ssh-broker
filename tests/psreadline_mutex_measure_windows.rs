@@ -134,7 +134,7 @@ fn psreadline_history_mutex_measurement() {
         }
     }
     panic!(
-        "MEASURED (this test fails on purpose): {ran} of {REPETITIONS} repetitions ran; PSReadLine failed in {}\n\n{}",
+        "MEASURED (this test fails on purpose): {ran} of {REPETITIONS} repetitions ran; the line typed after the first answer stalled in {}\n\n{}",
         failed_in.map_or_else(|| "none of them".to_owned(), |n| format!("repetition {n}")),
         record.text
     );
@@ -153,16 +153,20 @@ fn repetition(n: usize, record: &mut Record) -> Verdict {
     run.read_until(PROMPT);
     run.type_line(&account.password);
     stand_in::wait_for_serving_marker_of_a_task(&location, stand_in::SERVING_BOUND);
-    observe(
-        record,
-        "A: the agent serves; the shell's first prompt is not waited for yet",
-        &account,
-        None,
-    );
+    if n == 1 {
+        observe(
+            record,
+            "A: the agent serves; the shell's first prompt is not waited for yet",
+            &account,
+            None,
+        );
+    }
 
     run.read_until(SHELL_PROMPT);
     run.type_line(REMOVE_MODULE);
-    observe(record, "C1: right after the first line was typed", &account, None);
+    if n == 1 {
+        observe(record, "C1: right after the first line was typed", &account, None);
+    }
 
     run.read_until("psreadline-off");
     let shown = run.text();
@@ -171,22 +175,48 @@ fn repetition(n: usize, record: &mut Record) -> Verdict {
     record.line(format!(
         "PSReadLine failed in this repetition: {failed}; the name in the bug report: {name:?}"
     ));
-    observe(record, "B: the first line was answered", &account, name.as_deref());
-    if !failed {
-        run.type_line("exit");
-        run.finish();
-        return Verdict::Worked;
+    // The census is the same in every repetition: it is taken in the first only, to keep the record readable.
+    if n == 1 {
+        observe(record, "B: the first line was answered", &account, name.as_deref());
+        record.line(format!(
+            "the console showed, up to the first line's answer:\n{}",
+            shown.replace('\x1b', "<ESC>")
+        ));
     }
-    record.line(format!(
-        "the console showed, up to the first line's answer:\n{}",
-        shown.replace('\x1b', "<ESC>")
-    ));
-    typing_probe(record, &mut run);
-    record.line(format!(
-        "the agent's logs (agent.log, shim.log):\n{}",
-        stand_in::read_logs(&location)
-    ));
-    Verdict::Failed
+    // What the tests that stalled do next: a whole line typed at once, with no pause after the answer. Under this
+    // harness PSReadLine fails at every first prompt (`prompt_path_windows::without_psreadline`), so the hunt is
+    // for the STALL of this line, not for the bug report.
+    let line = "Write-Output ('profile=' + $env:USERPROFILE + '.')";
+    let sent = key_bytes(line) + enter_bytes();
+    let before = run.bytes().len();
+    run.type_line(line);
+    match bounded(&mut run, |run| run.read_until("profile=C:")) {
+        Ok(()) => {
+            record.line(format!(
+                "the line typed at once after the first answer WAS answered ({sent} bytes of key events; the \
+                 console wrote {} more bytes)",
+                run.bytes().len() - before
+            ));
+            run.type_line("exit");
+            run.finish();
+            Verdict::Worked
+        }
+        Err(why) => {
+            record.line(format!(
+                "THE STALL: the line typed at once after the first answer was NOT answered ({sent} bytes of key \
+                 events sent; the console wrote {} more bytes):\n{why}",
+                run.bytes().len() - before
+            ));
+            record.line(format!("the console showed:\n{}", run.text().replace('\x1b', "<ESC>")));
+            observe(record, "S: at the stall", &account, name.as_deref());
+            typing_probe(record, &mut run);
+            record.line(format!(
+                "the agent's logs (agent.log, shim.log):\n{}",
+                stand_in::read_logs(&location)
+            ));
+            Verdict::Failed
+        }
+    }
 }
 
 /// The shim of `account` on a console, with the logs printed when a wait fails.
