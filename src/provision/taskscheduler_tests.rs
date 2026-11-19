@@ -7,6 +7,7 @@ use crate::test_support::ThrowawayTask;
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::time::Duration;
+use windows::Win32::Foundation::SCHED_E_SERVICE_NOT_RUNNING;
 use windows::Win32::System::TaskScheduler::{
     TASK_STATE_DISABLED, TASK_STATE_QUEUED, TASK_STATE_READY, TASK_STATE_RUNNING,
 };
@@ -434,6 +435,28 @@ fn a_failure_to_identify_the_process_of_an_instance_is_an_error_and_never_an_end
         anyhow::bail!("cannot tell")
     });
     assert!(result.is_err());
+}
+
+/// An instance can end between the listing and the read of its process: the engine answers
+/// `SCHED_E_TASK_NOT_RUNNING`.
+#[test]
+fn an_instance_that_ended_while_it_was_listed_is_not_an_error() {
+    let failed = |code: HRESULT| engine_pid(Err(windows::core::Error::from(code)));
+    assert_eq!(failed(SCHED_E_TASK_NOT_RUNNING).unwrap(), None);
+
+    assert_eq!(engine_pid(Ok(1234)).unwrap(), Some(1234));
+    assert_eq!(
+        engine_pid(Ok(0)).unwrap(),
+        Some(0),
+        "one not launched yet is an instance"
+    );
+
+    let service_down = failed(SCHED_E_SERVICE_NOT_RUNNING).unwrap_err();
+    assert!(
+        format!("{service_down:#}").contains("read the process of a running instance"),
+        "{service_down:#}"
+    );
+    assert!(failed(HRESULT::from_win32(ERROR_FILE_NOT_FOUND.0)).is_err());
 }
 
 #[test]
