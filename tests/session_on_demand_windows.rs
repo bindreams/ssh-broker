@@ -870,6 +870,8 @@ fn logon_session_is_logged_off_after_logout() {
     let account = Account::create("lolog", true);
     let agent = BackgroundAgent::start(&kit, &account);
     let id = logon_session::logon_id(agent.process.0);
+    // The wait below passes at once for an id that was never listed: see the session listed first.
+    logon_session::require_listed(id, &account.sid_text).unwrap_or_else(|why| panic!("before logout: {why}"));
 
     let own = std::process::id();
     let held: Vec<_> = logon_session::processes_of(id)

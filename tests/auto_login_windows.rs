@@ -8,8 +8,6 @@
 //! `WindowsEnv::with_exe_unchecked`).
 #![cfg(windows)]
 
-use std::collections::BTreeSet;
-
 use ssh_broker::account::LocalAccount;
 use ssh_broker::autologin;
 use ssh_broker::provision::session_task::{task_name, task_problem};
@@ -65,7 +63,7 @@ fn with_session(kit: &Kit, account: &Account, check: impl FnOnce(&mut dyn FnMut(
 }
 
 /// End the session a task started with the product's `logout` (the kit's copy of the exe, run inside the
-/// agent) and wait for its logoff. It checks what ssh-broker controls (see `session_end`), not that Windows
+/// agent) and wait for its logon sessions to leave LSA's list. It checks what ssh-broker controls (see `session_end`), not that Windows
 /// unloads the hive of a Task Scheduler logon.
 fn logout_with(kit: &Kit, account: &Account) -> session_end::Ended {
     session_end::log_out_running(&kit.exe, account, ServiceLogon::TaskScheduler)
@@ -305,14 +303,12 @@ fn a_stale_password_is_not_visible_in_the_last_result() {
 /// How many times the session is started and ended in `logon_sessions_with_no_process_do_not_pile_up`.
 const CYCLES: usize = 3;
 
-/// The logon sessions of `account` that LSA lists and that have no process left, other than those the
-/// ending of the session found gone from LSA's list (`gone`).
-fn sessions_without_a_process(account: &Account, gone: &BTreeSet<u64>) -> Vec<holders::LogonSession> {
+/// The logon sessions of `account` that LSA lists and that have no process left.
+fn sessions_without_a_process(account: &Account) -> Vec<holders::LogonSession> {
     let own = std::process::id();
     holders::sessions_of(&account.sid_text)
         .unwrap_or_else(|why| panic!("list the logon sessions of {}: {why}", account.name))
         .into_iter()
-        .filter(|session| !gone.contains(&session.id))
         .filter(|session| {
             logon_session::processes_of(session.id)
                 .iter()
@@ -323,9 +319,10 @@ fn sessions_without_a_process(account: &Account, gone: &BTreeSet<u64>) -> Vec<ho
 
 /// Elevated (CI only). A measurement of a possible defect (Windows can keep the Batch logon session
 /// of a Task Scheduler start although no process of it is left). One account, auto-login on, the
-/// session started by the task and ended with the product's `logout`, [`CYCLES`] times. After each cycle
-/// the account's logon sessions that LSA lists and that have no process left are counted; the count must not
-/// grow from the first cycle to the last, or sessions pile up.
+/// session started by the task and ended with the product's `logout`, [`CYCLES`] times. Each cycle ends with
+/// the agent's own session gone from LSA's list (`session_end` fails otherwise). After each cycle the
+/// account's logon sessions that LSA still lists and that have no process left, which are not the agent's,
+/// are counted; the count must not grow from the first cycle to the last, or sessions pile up.
 #[test]
 fn logon_sessions_with_no_process_do_not_pile_up() {
     let _machine = machine::shared();
@@ -348,9 +345,9 @@ fn logon_sessions_with_no_process_do_not_pile_up() {
         }
         // The marker of the agent before stays in the folder: wait for the new agent's.
         stand_in::wait_for_new_serving_marker_of_a_task(&location, previous_marker.as_deref(), TASK_START_BOUND);
-        let ended = logout_with(&kit, &account);
+        logout_with(&kit, &account);
         previous_marker = stand_in::serving_marker_text(&location);
-        left_after.push(sessions_without_a_process(&account, &ended.gone));
+        left_after.push(sessions_without_a_process(&account));
     }
     autologin::off(&mut kit.autologin_env(&account.password), &local).unwrap();
 

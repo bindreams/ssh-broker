@@ -1,5 +1,6 @@
-//! Looking at a logon session from outside: which processes hold it, and whether LSA still lists it.
-//! **CI only.**
+//! Looking at a logon session from outside: which processes hold it, whether LSA still lists it and how
+//! long it takes to leave the list ([`wait_until_unlisted`]), and a watch on the Security log for a refused
+//! logon (4625). **CI only.**
 //!
 //! The including crate declares `account_fixture` (the list is read by `account_fixture::holders`) and
 //! `process_list`.
@@ -97,8 +98,10 @@ pub fn assert_auditing(subcategory: &str, setting: &str) {
 /// How long LSA may keep listing a logon session after its last process has ended: an external event
 /// that may never come. Measured in CI (2026-11-19): the session left the list by itself about 90 s after
 /// the last process exited for a Batch logon and about 180 s after for an interactive secondary logon; the
-/// bound is well above both. Expiry fails the wait and says what still refers to the session.
-pub const SESSION_END_BOUND: Duration = Duration::from_secs(600);
+/// bound is twice the longer. It applies to each session in turn, so it must expire before the test's own
+/// termination in `.config/nextest.toml` (10 x 120 s) even with a second session and the teardown after it.
+/// Expiry fails the wait and says what still refers to the session.
+pub const SESSION_END_BOUND: Duration = Duration::from_secs(360);
 
 /// The pause between two looks at LSA's list in [`wait_until_unlisted`]; the look is what is waited on.
 const LOOK_EVERY: Duration = Duration::from_secs(1);
@@ -108,6 +111,20 @@ pub fn is_listed(id: u64) -> Result<bool, String> {
     Ok(holders::listed()?
         .iter()
         .any(|luid| (u64::from(luid.HighPart as u32) << 32) | u64::from(luid.LowPart) == id))
+}
+
+/// Fail unless LSA lists the logon session `id` of the account `sid_text` now. Call it before ending the
+/// session: [`wait_until_unlisted`] passes at once for an id that was never listed (read from the wrong
+/// token, or a list that omits it), and so would show nothing.
+pub fn require_listed(id: u64, sid_text: &str) -> Result<(), String> {
+    if is_listed(id)? {
+        Ok(())
+    } else {
+        Err(format!(
+            "logon session {id:#x} of its agent is not in LSA's list before the session is ended\n{}",
+            holders::report(sid_text)
+        ))
+    }
 }
 
 /// Wait until the logon session `id` is no longer in LSA's list, and return how long that took. The

@@ -19,6 +19,7 @@
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use ssh_broker::acl::Sid;
 use ssh_broker::provision::procwait;
@@ -31,12 +32,9 @@ use crate::agent_conn::AgentConn;
 use crate::bounded_wait::CHILD_EXIT_BOUND;
 use crate::logon_session;
 
-/// What ending a session found.
+/// A session was ended: every logon session of its agents left LSA's list (anything less is an error).
 #[derive(Debug)]
-pub struct Ended {
-    /// The logon sessions of the agents that left LSA's list.
-    pub gone: BTreeSet<u64>,
-}
+pub struct Ended;
 
 /// Ask the background agent of `account` (the one running `exe`) to end with `exe logout`, run inside the
 /// agent as the account, wait for every process of its logon session to exit and for the session to leave
@@ -198,6 +196,12 @@ fn try_end(
         held.len()
     ));
 
+    // The wait for the end below passes at once for an id that was never listed: see each session listed first.
+    for id in &ids {
+        logon_session::require_listed(*id, sid_text).map_err(|why| format!("before logout: {why}"))?;
+    }
+    steps.push("every agent session is in LSA's list".to_owned());
+
     // The default session is unelevated, and `logout` in it reaches an agent at High on its request socket.
     let finished = attempt("ask the agent to log out", || {
         let mut asker = AgentConn::connect(location, sid);
@@ -205,6 +209,7 @@ fn try_end(
         asker.end_stdin();
         asker.read_to_end()
     })?;
+    let logged_out = Instant::now();
     steps.push(format!("logout exit {:?}", finished.exit));
     if finished.exit != Some(0) {
         return Err(format!(
@@ -257,14 +262,15 @@ fn try_end(
     }
     drop(remaining);
     steps.push("no process left in the sessions".to_owned());
-    let mut gone = BTreeSet::new();
     for id in &ids {
-        let took = logon_session::wait_until_unlisted(*id)
+        logon_session::wait_until_unlisted(*id)
             .map_err(|why| format!("a session of {name} did not end: {why}; {}", still_referring(sid_text)))?;
-        steps.push(format!("logon session {id:#x} left LSA's list after {took:?}"));
-        gone.insert(*id);
+        steps.push(format!(
+            "logon session {id:#x} left LSA's list {:?} after logout returned",
+            logged_out.elapsed()
+        ));
     }
-    Ok(Some(Ended { gone }))
+    Ok(Some(Ended))
 }
 
 /// What the fixture can say about who still refers to the logon sessions of `sid_text` after a wait that

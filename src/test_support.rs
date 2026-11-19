@@ -25,6 +25,10 @@ pub fn asked_policies() -> impl Iterator<Item = Option<ElevationPolicy>> {
 /// out: each read re-checks the real condition, and a timed-out slice proves nothing. A blocking read that is
 /// already waiting when the peer closes sometimes never wakes on Windows (measured: the next read after a
 /// timeout returns end-of-stream at once), so a plain `read_to_end` can hang.
+///
+/// It leaves the socket blocking (no read timeout) when it returns the bytes, and with the slice's timeout
+/// set when it returns an error. It relies on a timed-out read losing no bytes: measured for AF_UNIX (see
+/// `afunix::ConnRx::set_read_timeout`), not promised by Winsock.
 pub fn read_until_the_peer_closes<S: std::io::Read>(
     stream: &mut S,
     set_read_timeout: impl Fn(&S, Option<std::time::Duration>) -> std::io::Result<()>,

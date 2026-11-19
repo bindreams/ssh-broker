@@ -76,6 +76,9 @@ fn listen_connect_echo() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The split halves work independently, and the end of the stream is delivered after `shutdown_write`. Not
+/// asserted: that `shutdown_write` wakes a read already blocked in `recv`, which Windows can miss (the
+/// helper reads again after a slice; its doc has the measurement).
 #[test]
 fn split_halves_are_independent_and_shutdown_signals_eof() {
     use std::io::{Read, Write};
@@ -101,7 +104,7 @@ fn split_halves_are_independent_and_shutdown_signals_eof() {
     rx.read_exact(&mut buf).unwrap();
     assert_eq!(&buf, b"req");
 
-    // ...and the tx half sends a reply; shutdown_write FINs so the client's read_to_end ends.
+    // ...and the tx half sends a reply; shutdown_write FINs, so the end of the stream reaches the client.
     tx.write_all(b"reply").unwrap();
     tx.shutdown_write().unwrap();
 
