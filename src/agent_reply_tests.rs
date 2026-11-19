@@ -137,7 +137,7 @@ fn a_frame_cut_short_is_answered_not_dropped() {
 #[test]
 fn a_connection_that_cannot_be_split_is_answered_on_the_socket_itself() {
     let hooks = Hooks {
-        split: |socket| Err((Whole::of(socket), anyhow::anyhow!("no handle to duplicate"))),
+        split: |socket| Err((Whole::of(socket).unwrap(), anyhow::anyhow!("no handle to duplicate"))),
         ..Hooks::production()
     };
     let (answer, result) = answered("no-split", hooks, handshake(Mode::Exec, "echo"));

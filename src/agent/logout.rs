@@ -349,18 +349,18 @@ fn reply<W: std::io::Write>(tx: &mut W, text: &str, code: i32) -> anyhow::Result
 /// A connection whose waiting reads can be given a limit.
 pub(super) trait LimitedRead: Read {
     /// Make a read that finds nothing fail with `TimedOut` once `limit` has passed.
-    fn limit_reads(&mut self, limit: Duration) -> std::io::Result<()>;
+    fn limit_reads(&mut self, limit: Duration);
 }
 
 impl LimitedRead for ConnRx {
-    fn limit_reads(&mut self, limit: Duration) -> std::io::Result<()> {
-        self.set_read_timeout(Some(limit))
+    fn limit_reads(&mut self, limit: Duration) {
+        self.set_read_timeout(Some(limit));
     }
 }
 
 impl LimitedRead for &Whole {
-    fn limit_reads(&mut self, limit: Duration) -> std::io::Result<()> {
-        self.set_read_timeout(Some(limit))
+    fn limit_reads(&mut self, limit: Duration) {
+        self.set_read_timeout(Some(limit));
     }
 }
 
@@ -398,10 +398,7 @@ fn wait_for_close_within<R: LimitedRead>(rx: &mut R, bound: Duration) -> Waited 
         if left.is_zero() {
             return Waited::Abandoned;
         }
-        if let Err(e) = rx.limit_reads(left) {
-            tracing::warn!("could not limit the wait for the client to close: {e}; not waiting for it");
-            return Waited::Closed;
-        }
+        rx.limit_reads(left);
         match rx.read(&mut buf) {
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
             // The deadline is looked at again at the top.

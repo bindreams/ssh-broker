@@ -36,9 +36,7 @@ impl Read for Closed {
 }
 
 impl LimitedRead for Closed {
-    fn limit_reads(&mut self, _: Duration) -> std::io::Result<()> {
-        Ok(())
-    }
+    fn limit_reads(&mut self, _: Duration) {}
 }
 
 /// A client that stays connected until the test says it closes (a send, or dropping the sender).
@@ -66,9 +64,8 @@ impl Read for Gate {
 }
 
 impl LimitedRead for Gate {
-    fn limit_reads(&mut self, limit: Duration) -> std::io::Result<()> {
+    fn limit_reads(&mut self, limit: Duration) {
         self.limit = Some(limit);
-        Ok(())
     }
 }
 
@@ -88,9 +85,7 @@ impl Read for Open {
 }
 
 impl LimitedRead for Open {
-    fn limit_reads(&mut self, _: Duration) -> std::io::Result<()> {
-        Ok(())
-    }
+    fn limit_reads(&mut self, _: Duration) {}
 }
 
 /// What `f` logged, and what it returned.
@@ -484,9 +479,7 @@ fn a_hand_back_is_one_frame_with_the_cause_then_a_fin_and_the_agent_waits_for_th
         }
     }
     impl LimitedRead for Client {
-        fn limit_reads(&mut self, _: Duration) -> std::io::Result<()> {
-            Ok(())
-        }
+        fn limit_reads(&mut self, _: Duration) {}
     }
 
     let events = Events::default();
@@ -716,27 +709,6 @@ fn the_drain_completes_once_a_refused_client_has_closed() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-#[test]
-fn a_wait_whose_limit_cannot_be_set_is_logged() {
-    struct Unlimited;
-    impl Read for Unlimited {
-        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
-            panic!("a read without a limit");
-        }
-    }
-    impl LimitedRead for Unlimited {
-        fn limit_reads(&mut self, _: Duration) -> std::io::Result<()> {
-            Err(std::io::Error::other("no such option"))
-        }
-    }
-
-    let (log, waited) = logged(|| wait_for_close_within(&mut Unlimited, Duration::from_secs(30)));
-
-    assert_eq!(waited, Waited::Closed);
-    assert!(log.contains("could not limit"), "{log}");
-    assert!(log.contains("no such option"), "{log}");
-}
-
 // a handler that never returns -----
 
 /// The drain bound of these tests: the handler they hold never finishes, so the bound is what ends
@@ -799,14 +771,14 @@ fn against_a_silent_client<T>(tag: &str, f: impl FnOnce(&mut ConnRx) -> T) -> T 
 #[test]
 fn a_read_limit_on_a_connection_ends_a_read_that_finds_nothing() {
     let result = against_a_silent_client("limited-read", |rx| {
-        rx.limit_reads(SHORT_BOUND).unwrap();
+        rx.limit_reads(SHORT_BOUND);
         rx.read(&mut [0u8; 8])
     });
     let err = result.expect_err("nothing was sent, and the client is still connected");
     assert_eq!(err.kind(), std::io::ErrorKind::TimedOut, "{err:?}");
 }
 
-/// Limits that are not whole milliseconds. The OS takes whole milliseconds and reads 0 as "no limit".
+/// Limits that are not whole milliseconds: the wait's poll takes whole milliseconds, and 0 would be no wait at all.
 const LIMITS: [Duration; 6] = [
     Duration::from_micros(1),
     Duration::from_micros(500),
@@ -820,7 +792,7 @@ const LIMITS: [Duration; 6] = [
 fn a_read_limit_of_any_length_ends_a_read_that_finds_nothing() {
     for (i, limit) in LIMITS.into_iter().enumerate() {
         let result = against_a_silent_client(&format!("limited-read-{i}"), |rx| {
-            rx.limit_reads(limit).unwrap();
+            rx.limit_reads(limit);
             rx.read(&mut [0u8; 8])
         });
         let err = result.expect_err(&format!("a limit of {limit:?} did not end the read"));
@@ -841,7 +813,7 @@ fn a_wait_for_a_client_that_never_closes_ends_whatever_the_bound() {
 #[test]
 fn a_connection_with_a_read_limit_still_delivers_what_arrives_and_reports_the_close() {
     let ((mut srx, _stx), (crx, mut ctx), dir) = socket_pair("limited-read-data");
-    srx.limit_reads(Duration::from_secs(30)).unwrap();
+    srx.limit_reads(Duration::from_secs(30));
     ctx.write_all(b"hi").unwrap();
     let mut buf = [0u8; 8];
     assert_eq!(srx.read(&mut buf).unwrap(), 2);

@@ -166,7 +166,7 @@ impl AgentConn {
             .unwrap_or_else(|e| panic!("connect to the agent at {}: {e:#}", location.path().display()));
         let (rx, tx) = afunix::split(conn).unwrap();
         // A failure bound on the agent's output, an external event that may never come.
-        rx.set_read_timeout(Some(SILENCE_BOUND)).unwrap();
+        rx.set_read_timeout(Some(SILENCE_BOUND));
         AgentConn {
             rx,
             tx,

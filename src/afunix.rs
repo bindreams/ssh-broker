@@ -4,12 +4,17 @@
 //! `socket_loc`). The `sockaddr_un` path limit (~108 bytes) is surfaced loudly rather than
 //! failing cryptically deep in the OS.
 //!
-//! This module is the only code that reads, writes or accepts on an AF_UNIX socket, and it never
-//! blocks in the OS to do it. A blocking `recv` on Windows AF_UNIX sometimes misses the wake of a
-//! peer that wrote and closed at once, and then sleeps for ever. So every connection is non-blocking,
-//! and one loop ([`read_waiting`], [`write_waiting`], `Listener::accept`) makes the call, and on
-//! `WouldBlock` waits for the socket for at most [`RECHECK_EVERY`] and makes the call again. The
-//! wait is only a sleep that may end early; what it reports is never read.
+//! Product code reads, writes and accepts on an AF_UNIX socket only through this module, and it
+//! never blocks in the OS to do any of those. A blocking `recv` on Windows AF_UNIX sometimes misses
+//! the wake of a peer that wrote and closed at once, and then sleeps for ever. So every connection
+//! is non-blocking, and one loop ([`read_waiting`], [`write_waiting`], `Listener::accept`) makes the
+//! call, and on `WouldBlock` waits for the socket for at most [`RECHECK_EVERY`] and makes the call
+//! again. The wait is only a sleep that may end early; what it reports is never acted on (see
+//! [`wait`] for the one thing it is looked at for).
+//!
+//! What does not go through the loop: [`connect`], and the liveness probe of [`Listener::bind`] that
+//! calls it, are blocking connects. They wait for the listener's answer, not for data or a close,
+//! and no lost wake of one has been seen.
 
 use socket2::{Domain, SockAddr, Socket, Type};
 use std::cell::Cell;
@@ -352,7 +357,15 @@ pub struct Whole {
 }
 
 impl Whole {
-    pub fn of(sock: Socket) -> Whole {
+    /// Wrap `sock`, making it non-blocking first (a blocking `recv` is what the transport abolishes,
+    /// and on a blocking socket the read limit would be inert). So no `Whole` is on a blocking socket,
+    /// except the one [`try_split`] gives back when the socket refuses the mode.
+    pub fn of(sock: Socket) -> std::io::Result<Whole> {
+        sock.set_nonblocking(true)?;
+        Ok(Whole::as_is(sock))
+    }
+
+    fn as_is(sock: Socket) -> Whole {
         Whole {
             sock,
             limit: Cell::new(None),
@@ -360,9 +373,8 @@ impl Whole {
     }
 
     /// See [`ConnRx::set_read_timeout`].
-    pub fn set_read_timeout(&self, limit: Option<Duration>) -> std::io::Result<()> {
+    pub fn set_read_timeout(&self, limit: Option<Duration>) {
         self.limit.set(limit);
-        Ok(())
     }
 
     /// Send FIN on the write direction.
@@ -390,25 +402,27 @@ impl Write for &Whole {
 /// [`split`] that gives the connection back, with the reason, when it cannot be split.
 ///
 /// The socket is made non-blocking first, so the connection given back is non-blocking unless that
-/// was the failure.
+/// was the failure. When the socket refuses the mode, the caller gets a `Whole` whose reads may block
+/// and whose read limit does not apply: nothing better can be made of it, and the caller answers it
+/// and closes it.
 pub fn try_split(sock: Socket) -> Result<(ConnRx, ConnTx), (Whole, anyhow::Error)> {
     if let Err(e) = sock.set_nonblocking(true) {
-        return Err((Whole::of(sock), e.into()));
+        return Err((Whole::as_is(sock), e.into()));
     }
     let write_half = match sock.try_clone() {
         Ok(write_half) => write_half,
-        Err(e) => return Err((Whole::of(sock), e.into())),
+        Err(e) => return Err((Whole::as_is(sock), e.into())),
     };
     // Said on both halves, though it is one mode for the socket (see `split`), so that nothing here
     // rests on that.
     if let Err(e) = write_half.set_nonblocking(true) {
-        return Err((Whole::of(sock), e.into()));
+        return Err((Whole::as_is(sock), e.into()));
     }
     // Clear inherit on BOTH halves: callers should hand in an already-cleared socket
     // (from accept/connect), but split is `pub` and must not depend on that.
     #[cfg(windows)]
     if let Err(e) = set_no_inherit(&sock).and_then(|()| set_no_inherit(&write_half)) {
-        return Err((Whole::of(sock), e));
+        return Err((Whole::as_is(sock), e));
     }
     Ok((
         ConnRx {
@@ -425,9 +439,8 @@ impl ConnRx {
     /// send or close, never proof that nothing is coming. A read that passes the limit has
     /// looked at the socket once more first, so what has arrived is read and not reported as a
     /// time out.
-    pub fn set_read_timeout(&self, limit: Option<Duration>) -> std::io::Result<()> {
+    pub fn set_read_timeout(&self, limit: Option<Duration>) {
         self.limit.set(limit);
-        Ok(())
     }
 }
 
@@ -436,7 +449,9 @@ impl ConnRx {
 /// It is the latency of a wake the OS lost (a blocking call on a Windows AF_UNIX socket can miss
 /// one), never a bound and never proof of anything: a wait that ends by this slice proves nothing,
 /// and the loop has no cap. 100 ms is below what a person notices when a prompt ends, and costs
-/// about ten wakeups a second per idle waiting thread.
+/// about ten wakeups a second per idle waiting thread. It is also the pause of a wait whose poll
+/// answered at once with something other than what was asked (see [`wait`]), so that such a socket
+/// is looked at about once a slice and not in a spin.
 pub(crate) const RECHECK_EVERY: Duration = Duration::from_millis(100);
 
 /// What a [`wait`] waits for the socket to be ready to do.
@@ -447,10 +462,20 @@ enum IoKind {
 }
 
 /// Read from the non-blocking `sock`, waiting for something to read for up to `limit` (`None`: no
-/// limit). The wait is a sleep that may end early and is never read: each time it ends, `recv` is
+/// limit). The wait is a sleep that may end early and is never acted on: each time it ends, `recv` is
 /// called again, which is what finds data, the close, or a shutdown that the wait did not wake for.
 /// A limit that has passed is `TimedOut`, after one more `recv`. Every other result is `recv`'s.
 fn read_waiting(sock: &Socket, buf: &mut [u8], limit: Option<Duration>) -> std::io::Result<usize> {
+    read_waiting_by(sock, buf, limit, wait)
+}
+
+/// [`read_waiting`] with the wait as a parameter, so that a test can count the turns of the loop.
+fn read_waiting_by(
+    sock: &Socket,
+    buf: &mut [u8],
+    limit: Option<Duration>,
+    mut wait: impl FnMut(&Socket, IoKind, Duration) -> std::io::Result<()>,
+) -> std::io::Result<usize> {
     // A limit too long to be a point in time is no limit.
     let deadline = limit.and_then(|limit| Instant::now().checked_add(limit));
     loop {
@@ -476,6 +501,15 @@ fn read_waiting(sock: &Socket, buf: &mut [u8], limit: Option<Duration>) -> std::
 /// Write to the non-blocking `sock`, waiting for room with no limit, as [`read_waiting`] waits.
 /// Every result but `WouldBlock` is `send`'s, so a write may be partial.
 fn write_waiting(sock: &Socket, buf: &[u8]) -> std::io::Result<usize> {
+    write_waiting_by(sock, buf, wait)
+}
+
+/// [`write_waiting`] with the wait as a parameter, as [`read_waiting_by`].
+fn write_waiting_by(
+    sock: &Socket,
+    buf: &[u8],
+    mut wait: impl FnMut(&Socket, IoKind, Duration) -> std::io::Result<()>,
+) -> std::io::Result<usize> {
     loop {
         let mut writer = sock;
         match writer.write(buf) {
@@ -487,7 +521,14 @@ fn write_waiting(sock: &Socket, buf: &[u8]) -> std::io::Result<usize> {
 }
 
 /// Sleep until `sock` may be ready for `kind`, or `timeout` has passed, whichever is first. What
-/// the OS says is not looked at: the caller calls again. An error is the poll's own failing.
+/// the OS says is not acted on: the caller calls again. An error is the poll's own failing.
+///
+/// The one thing read from the poll's answer is whether it slept for what was asked. A poll that
+/// answers at once with something else (Windows reports a peer's half-close whatever events were
+/// asked for, while a `send` into a full buffer still finds no room) would turn the caller's loop
+/// into a spin, so then the rest of `timeout` is a plain pause. That pause proves nothing, as the
+/// poll's sleep proves nothing: the caller still makes its call, at most about once a slice in that
+/// state and at once when the event asked for is reported.
 #[cfg(windows)]
 fn wait(sock: &Socket, kind: IoKind, timeout: Duration) -> std::io::Result<()> {
     use std::os::windows::io::AsRawSocket;
@@ -504,44 +545,62 @@ fn wait(sock: &Socket, kind: IoKind, timeout: Duration) -> std::io::Result<()> {
         revents: WSAPOLL_EVENT_FLAGS(0),
     }];
     let millis = i32::try_from(whole_milliseconds_up(timeout).as_millis()).unwrap_or(i32::MAX);
+    let started = Instant::now();
     // SAFETY: `fds` is a live array of one entry; the socket outlives the call.
     let rc = unsafe { WSAPoll(fds.as_mut_ptr(), 1, millis) };
     if rc < 0 {
         let e = std::io::Error::from_raw_os_error(unsafe { WSAGetLastError() }.0);
         // An interruption ended the sleep early, which any end does.
-        return if e.kind() == std::io::ErrorKind::Interrupted {
-            Ok(())
-        } else {
-            Err(e)
-        };
+        return if is_interruption(&e) { Ok(()) } else { Err(e) };
+    }
+    if rc > 0 && fds[0].revents.0 & events.0 == 0 {
+        pause_rest(started, timeout);
     }
     Ok(())
 }
 
+/// [`wait`] with `poll`, which pauses in the same case.
 #[cfg(unix)]
 fn wait(sock: &Socket, kind: IoKind, timeout: Duration) -> std::io::Result<()> {
     use std::os::fd::AsRawFd;
+    let events = match kind {
+        IoKind::Read => libc::POLLIN,
+        IoKind::Write => libc::POLLOUT,
+    };
     let mut fds = [libc::pollfd {
         fd: sock.as_raw_fd(),
-        events: match kind {
-            IoKind::Read => libc::POLLIN,
-            IoKind::Write => libc::POLLOUT,
-        },
+        events,
         revents: 0,
     }];
     let millis = libc::c_int::try_from(whole_milliseconds_up(timeout).as_millis()).unwrap_or(libc::c_int::MAX);
+    let started = Instant::now();
     // SAFETY: `fds` is a live array of one entry; the descriptor is open for the call.
     let rc = unsafe { libc::poll(fds.as_mut_ptr(), 1, millis) };
     if rc < 0 {
         let e = std::io::Error::last_os_error();
         // A signal ended the sleep early, which any end does.
-        return if e.kind() == std::io::ErrorKind::Interrupted {
-            Ok(())
-        } else {
-            Err(e)
-        };
+        return if is_interruption(&e) { Ok(()) } else { Err(e) };
+    }
+    if rc > 0 && fds[0].revents & events == 0 {
+        pause_rest(started, timeout);
     }
     Ok(())
+}
+
+/// Pause for what is left of `timeout` since `started`. It is a plain pause between two looks at the
+/// socket, so a poll that did not sleep does not make a loop spin; it proves nothing about the socket.
+fn pause_rest(started: Instant, timeout: Duration) {
+    std::thread::sleep(timeout.saturating_sub(started.elapsed())); // sleep-ok: a pause between two looks that proves nothing; the caller calls again
+}
+
+/// Whether `e` says that a call was interrupted before it did anything. `std` has no `ErrorKind` for
+/// Winsock's `WSAEINTR`, so on Windows the code is what says it.
+fn is_interruption(e: &std::io::Error) -> bool {
+    #[cfg(windows)]
+    if e.raw_os_error() == Some(windows::Win32::Networking::WinSock::WSAEINTR.0) {
+        return true;
+    }
+    e.kind() == std::io::ErrorKind::Interrupted
 }
 
 /// `limit` rounded up to whole milliseconds, at least one: a poll takes whole milliseconds, and 0

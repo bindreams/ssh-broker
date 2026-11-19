@@ -141,6 +141,78 @@ fn a_write_that_finds_the_buffer_full_goes_on_when_the_peer_reads() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// How long the test below lets a waiting loop run, and the most turns it may make in that time:
+/// a loop that pauses for a slice between two looks makes about five, one that spins makes
+/// hundreds of thousands.
+#[cfg(windows)]
+const OBSERVED: std::time::Duration = std::time::Duration::from_millis(500);
+#[cfg(windows)]
+const MOST_TURNS: u32 = 20;
+
+/// A `wait` that does what the real one does, counts its calls in `turns`, and fails once `OBSERVED`
+/// has passed since `since`, which ends the loop that called it.
+#[cfg(windows)]
+fn counting_wait<'a>(
+    turns: &'a std::cell::Cell<u32>,
+    since: std::time::Instant,
+) -> impl FnMut(&socket2::Socket, super::IoKind, std::time::Duration) -> std::io::Result<()> + 'a {
+    move |sock, kind, timeout| {
+        turns.set(turns.get() + 1);
+        if since.elapsed() >= OBSERVED {
+            return Err(std::io::Error::other("observed long enough"));
+        }
+        super::wait(sock, kind, timeout)
+    }
+}
+
+/// A peer that has shut down its write side and does not read: `WSAPoll` answers a wait on the other
+/// end at once with the hang-up whatever it was asked for, while a `send` into the full buffer still
+/// finds no room. The write must not turn into a spin.
+#[cfg(windows)]
+#[test]
+fn a_write_waiting_for_room_does_not_spin_when_the_peer_has_half_closed_and_does_not_read() {
+    use std::io::Write;
+    let (server, client, dir) = crate::test_support::raw_socket_pair("half-closed-full");
+    server.shutdown(std::net::Shutdown::Write).unwrap();
+    client.set_nonblocking(true).unwrap();
+    for size in [64 * 1024, 1] {
+        let chunk = vec![0u8; size];
+        loop {
+            match (&client).write(&chunk) {
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(e) => panic!("filling the buffer: {e}"),
+            }
+        }
+    }
+    let turns = std::cell::Cell::new(0);
+    let err = super::write_waiting_by(&client, &[0u8], counting_wait(&turns, std::time::Instant::now()))
+        .expect_err("nobody reads, so the write never gets room");
+    assert_eq!(err.to_string(), "observed long enough");
+    assert!(
+        turns.get() <= MOST_TURNS,
+        "{} turns in {OBSERVED:?}: the wait does not pause",
+        turns.get()
+    );
+    drop((server, client));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A `Whole` made of a blocking socket would read with the blocking `recv`, and its read limit would be
+/// inert: `of` makes the socket non-blocking itself.
+#[cfg(windows)]
+#[test]
+fn a_whole_made_of_a_blocking_socket_does_not_block_a_read() {
+    use std::io::Read;
+    let (server, client, dir) = crate::test_support::raw_socket_pair("whole-nonblocking");
+    let whole = super::Whole::of(client).unwrap();
+    whole.set_read_timeout(Some(std::time::Duration::from_millis(1)));
+    let err = (&whole).read(&mut [0u8; 8]).expect_err("the peer is silent");
+    assert_eq!(err.kind(), std::io::ErrorKind::TimedOut, "{err:?}");
+    drop((server, whole));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// The failure bound of a read in the tests below. A read that gets nothing for this long has lost
 /// its wake, and says so as `TimedOut`, which an assertion names; nothing waits for it to pass.
 #[cfg(windows)]
@@ -211,7 +283,7 @@ fn a_read_already_waiting_when_the_peer_closes_sees_the_close() {
     for i in 0..TRIALS {
         let (server, client, dir) = crate::test_support::raw_socket_pair(&format!("closes-{i}"));
         let (mut rx, tx) = super::split(client).unwrap();
-        rx.set_read_timeout(Some(LOST_WAKE_LIMIT)).unwrap();
+        rx.set_read_timeout(Some(LOST_WAKE_LIMIT));
         let (server_rx, mut server_tx) = super::split(server).unwrap();
         let read_to_the_end = move || {
             let mut got = Vec::new();
@@ -236,7 +308,7 @@ fn a_read_on_one_half_ends_when_the_other_half_shuts_down_both_ways() {
     use std::io::Read;
     let (server, client, dir) = crate::test_support::raw_socket_pair("shutdown-both");
     let (mut rx, tx) = super::split(client).unwrap();
-    rx.set_read_timeout(Some(LOST_WAKE_LIMIT)).unwrap();
+    rx.set_read_timeout(Some(LOST_WAKE_LIMIT));
     let read = act_once_waiting(move || rx.read(&mut [0u8; 8]), || tx.shutdown_both().unwrap());
     assert!(
         !matches!(&read, Err(e) if e.kind() == std::io::ErrorKind::TimedOut),
@@ -476,6 +548,15 @@ fn an_interruption_is_to_be_retried() {
         super::classify_accept_error(raw(10004)),
         super::AcceptError::Interrupted(_)
     ));
+}
+
+#[cfg(windows)]
+#[test]
+fn an_interrupted_wait_is_recognised_by_winsocks_code() {
+    // `std` has no `ErrorKind` for WSAEINTR, so the kind alone does not say it.
+    assert!(super::is_interruption(&raw(10004)));
+    assert!(super::is_interruption(&std::io::ErrorKind::Interrupted.into()));
+    assert!(!super::is_interruption(&raw(10035)));
 }
 
 #[cfg(windows)]

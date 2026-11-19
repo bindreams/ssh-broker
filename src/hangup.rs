@@ -4,12 +4,12 @@
 //! reading, and the peer's FIN sits unseen behind the unread frames. A command that also prints
 //! nothing leaves no output pump to fail a write, so the session would outlive its client.
 //!
-//! [`HangupWatcher`] blocks in `WSAPoll` on a duplicate of the session socket, which reports
-//! `POLLHUP` for a closed peer without consuming a byte. A poll on a duplicate does not wake for
-//! a local `shutdown_write`, nor for a local `shutdown_both` unless input is unread, so a second
-//! socket joins the same poll: [`Waker::wake`] writes to it at teardown. It is one end of a
-//! loopback TCP connection this module made (see [`wake_pair`]); [`accept_own`] admits only that
-//! connection, so no other process can write to the other end.
+//! [`HangupWatcher`] waits in `WSAPoll`, a slice of [`RECHECK_EVERY`] at a time, on a duplicate of
+//! the session socket, which reports `POLLHUP` for a closed peer without consuming a byte. A poll
+//! on a duplicate does not wake for a local `shutdown_write`, nor for a local `shutdown_both`
+//! unless input is unread, so a second socket joins the same poll: [`Waker::wake`] writes to it at
+//! teardown. It is one end of a loopback TCP connection this module made (see [`wake_pair`]);
+//! [`accept_own`] admits only that connection, so no other process can write to the other end.
 
 use crate::afunix::{ConnTx, RECHECK_EVERY};
 use socket2::{Domain, SockAddr, Socket, Type};
@@ -94,7 +94,8 @@ impl HangupWatcher {
         }
     }
 
-    /// One `WSAPoll` with `timeout_ms` (-1 blocks until something is ready, 0 only asks).
+    /// One `WSAPoll` of at most `timeout_ms` milliseconds (0 only asks). [`Self::poll_once`] gives it
+    /// a slice of [`RECHECK_EVERY`], so no call waits without an end.
     fn poll_ready(&self, timeout_ms: i32) -> std::io::Result<Option<Ready>> {
         // No requested events on the session socket: `WSAPoll` reports hangup regardless, and
         // never reports readable data, which is not this watcher's business.
