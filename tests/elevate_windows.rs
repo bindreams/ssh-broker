@@ -52,6 +52,7 @@ mod sshd_rig;
 mod stand_in;
 
 use account_fixture::{Account, ServiceLogon};
+use ssh_broker::socket_loc::{self, Integrity, SocketLocation};
 use sshd_rig::{Login, SHELL_PROMPT, SshSession, no_shell_to_carry, rendered, run_client};
 use stand_in::Kit;
 
@@ -85,6 +86,7 @@ fn agent_exe() -> std::path::PathBuf {
 /// holds the shim sshd runs. The first login stays open: it is what keeps the account's session.
 struct Started<'a> {
     kit: &'a Kit,
+    account: &'a Account,
     login: Login<'a>,
     _first: SshSession,
 }
@@ -98,6 +100,7 @@ impl<'a> Started<'a> {
         first.log_in(&account.password);
         Started {
             kit,
+            account,
             login,
             _first: first,
         }
@@ -122,20 +125,43 @@ impl<'a> Started<'a> {
         run_client(ssh, false, self.kit.dir())
     }
 
+    /// What explains a failure: what the account's agent and shim logged, in both of its folders, first (the
+    /// login's own evidence is long), then the login's.
+    fn diagnostics(&self) -> impl Fn() -> String + 'static {
+        let logs: Vec<SocketLocation> = [Integrity::High, Integrity::Medium]
+            .into_iter()
+            .filter_map(|integrity| socket_loc::for_profile(self.account.try_profile()?, integrity).ok())
+            .collect();
+        let login = self.login.diagnostics();
+        move || {
+            let mut report = String::new();
+            for location in &logs {
+                report += &format!(
+                    "--- the logs in {} ---\n{}\n",
+                    location.logs_dir().display(),
+                    stand_in::read_logs(location)
+                );
+            }
+            report + &login()
+        }
+    }
+
+    /// `outcome`, with its stdout a second time as bytes (a terminal's escape codes do not show otherwise), and
+    /// [`Started::diagnostics`].
     fn failure(&self, outcome: &sshd_rig::Outcome) -> String {
+        let stdout = String::from_utf8_lossy(&outcome.stdout);
         format!(
-            "exit {:?}\nstdout: {}\nstderr: {}\n{}",
+            "exit {:?}\nstdout: {stdout}\nstdout, escaped: {stdout:?}\nstderr: {}\n{}",
             outcome.code,
-            String::from_utf8_lossy(&outcome.stdout),
             outcome.stderr,
-            (self.login.diagnostics())()
+            (self.diagnostics())()
         )
     }
 
     /// A session with a terminal whose login asked for `auto-approve`, past its first prompt. `sbk` is an alias of
     /// the broker's exe in it, so that a typed `elevate` line is short enough not to wrap on the screen.
     fn terminal_session(&self) -> SshSession {
-        let mut session = SshSession::start(self.login.command_asking("auto-approve"), self.login.diagnostics());
+        let mut session = SshSession::start(self.login.command_asking("auto-approve"), self.diagnostics());
         session.read_until(SHELL_PROMPT);
         session.type_line(&format!("Set-Alias sbk '{}'", self.kit.exe.display()));
         session.say("ALIAS-IS-SET");
@@ -200,7 +226,8 @@ fn a_command_run_without_a_terminal_has_its_output_piped_and_the_session_is_not_
     // The account's shell is PowerShell: its own filter is the pipe's other end.
     let elevated = admin.elevate_over_ssh(
         Some("auto-approve"),
-        "cmd.exe /c whoami /groups | Select-String 'Mandatory Label'",
+        // Not `Select-String`: PowerShell 7 marks what it matched with escape codes, in the middle of the line.
+        "cmd.exe /c whoami /groups | Where-Object { $_ -match 'Mandatory Label' }",
     );
     let shown = String::from_utf8_lossy(&elevated.stdout).into_owned();
     assert!(shown.contains(HIGH), "{}", admin.failure(&elevated));
