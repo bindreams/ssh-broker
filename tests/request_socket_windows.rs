@@ -140,8 +140,9 @@ fn prompt_agent_exe() -> PathBuf {
 }
 
 /// Start the account's session at the password prompt, run `logout` by its full path in a default (unelevated)
-/// session, and check that it ended the session: the client's exit code is 0 with the agent's reply, and every
-/// agent of the account at `level` has exited.
+/// session, and check that it ended the session: the agent's reply reached the client, and every agent of the
+/// account at `level` has exited. The client's exit status is not checked: the shell that runs the command is in
+/// the tree the agent ends, and it is ended with that tree's code unless it exits first.
 fn logout_ends_the_session_from_the_default_session(account: &Account, kit: &Kit, level: Integrity) {
     let login = Login::new(kit, account);
     set_default_shell_under(OPENSSH_KEY, &kit.exe.to_string_lossy(), &no_shell_to_carry())
@@ -153,17 +154,12 @@ fn logout_ends_the_session_from_the_default_session(account: &Account, kit: &Kit
         procwait::user_agents(&prompt_agent_exe(), &account.sid, level).expect("list the agents of the account");
     assert!(!agents.is_empty(), "the login started no agent at {level:?}");
     let outcome = logout_over_ssh(kit, &login);
-    assert_eq!(
-        outcome.code,
-        Some(0),
-        "logout in the default session; stderr:\n{}\n{}",
-        outcome.stderr,
-        (login.diagnostics())()
-    );
     assert!(
         outcome.stderr.contains(ENDING),
-        "the agent's reply is missing from stderr:\n{}",
-        outcome.stderr
+        "the agent's reply is missing from stderr (exit {:?}):\n{}\n{}",
+        outcome.code,
+        outcome.stderr,
+        (login.diagnostics())()
     );
     for agent in &agents {
         bounded_wait::wait_for_exit(
@@ -179,8 +175,7 @@ fn logout_ends_the_session_from_the_default_session(account: &Account, kit: &Kit
 
 /// Elevated (CI only). An administrator's default session through the real sshd is unelevated and cannot
 /// connect to its elevated agent's `agent.sock`; `ssh-broker.exe logout`, typed there by its full path, reaches the
-/// agent on `request.sock`, which ends the session: the client exits 0 with the agent's reply, and the agent is
-/// gone.
+/// agent on `request.sock`, which ends the session: the client shows the agent's reply, and the agent is gone.
 #[test]
 fn logout_typed_in_an_unelevated_session_ends_the_session() {
     let _machine = machine::exclusive();
