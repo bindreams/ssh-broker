@@ -52,6 +52,8 @@ pub mod pipes;
 pub mod protocol;
 pub mod provision;
 pub mod relay;
+#[cfg(windows)]
+pub mod request;
 pub mod route;
 pub mod secret;
 pub mod shell;

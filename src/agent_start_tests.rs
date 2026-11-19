@@ -395,7 +395,7 @@ fn a_failed_reset_is_reported_on_stderr_when_the_start_is_refused() {
 
 #[test]
 fn a_failed_reset_goes_to_stderr_and_to_the_log_when_it_opens() {
-    let profile = TempProfile::new("start-reset-log");
+    let profile = TempProfile::new("start-rst-log");
     let loc = profile.location();
     let captured = Captured::default();
     let subscriber = tracing_subscriber::fmt()
@@ -571,11 +571,13 @@ fn every_agent_marks_after_bind() {
             events.borrow_mut().push("bind");
             Ok(())
         },
+        || None::<()>,
         |at| {
             assert_eq!(at, &loc);
             events.borrow_mut().push("mark");
             Ok(())
         },
+        |()| panic!("an agent with no request socket serves none"),
         |()| {
             events.borrow_mut().push("accept");
             anyhow::anyhow!("end of loop")
@@ -588,12 +590,14 @@ fn every_agent_marks_after_bind() {
 
 #[test]
 fn a_failed_bind_marks_nothing_and_accepts_nothing() {
-    let profile = TempProfile::new("marker-bindfail");
+    let profile = TempProfile::new("marker-nobind");
     let loc = profile.location();
     let err = run_on_with(
         &loc,
         |_| -> anyhow::Result<()> { anyhow::bail!("not safe to bind") },
+        || -> Option<()> { panic!("no request socket without a listener") },
         |_| panic!("no marker without a listener"),
+        |()| panic!("no request socket served without a listener"),
         |()| panic!("no accept without a listener"),
     )
     .unwrap_err();
@@ -607,7 +611,9 @@ fn a_failed_marker_write_ends_the_agent_before_it_accepts() {
     let err = run_on_with(
         &loc,
         |_| Ok(()),
+        || None::<()>,
         |_| Err(std::io::Error::other("disk full")),
+        |()| panic!("a shim cannot be woken, so no request socket is served"),
         |()| panic!("a shim cannot be woken, so nothing is accepted"),
     )
     .unwrap_err();

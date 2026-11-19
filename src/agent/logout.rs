@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 
 use super::{Connections, Drained, HalfClose};
 use crate::afunix::{ConnRx, Whole};
-use crate::protocol::{ExitCode, FrameKind, Stream, write_frame};
+use crate::protocol::{ExitCode, FrameKind, SessionId, Stream, write_frame};
 use crate::relay::{write_data, write_hand_back};
 
 /// The reply of a background agent, before it ends.
@@ -59,8 +59,7 @@ type Killer = Arc<dyn Fn() + Send + Sync>;
 #[derive(Default)]
 struct State {
     ending: bool,
-    next_id: u64,
-    sessions: Vec<(u64, Killer)>,
+    sessions: Vec<(SessionId, Killer)>,
 }
 
 impl Control {
@@ -95,18 +94,24 @@ impl Control {
         self.lock().ending
     }
 
-    /// Record a running session, with the means to end its shell tree. The registration lasts
-    /// while the returned guard does. `None` means the agent is already ending: the caller must
-    /// end the session itself, at once.
-    pub(super) fn register(&self, kill: Killer) -> Option<Registration<'_>> {
-        let mut state = self.lock();
-        if state.ending {
-            return None;
+    /// Give a session about to start its id, which goes into its environment
+    /// ([`SESSION_VARIABLE`](crate::protocol::SESSION_VARIABLE)) before its program runs.
+    /// `Ok(None)` means the agent is already ending: no session may start. The id is the one
+    /// [`Reservation::register`] records, and no agent run gives out an id another has.
+    pub(super) fn reserve(&self) -> anyhow::Result<Option<Reservation<'_>>> {
+        if self.is_ending() {
+            return Ok(None);
         }
-        let id = state.next_id;
-        state.next_id += 1;
-        state.sessions.push((id, kill));
-        Some(Registration { control: self, id })
+        Ok(Some(Reservation {
+            control: self,
+            id: super::session::new_id()?,
+        }))
+    }
+
+    /// Whether a session registered under `id` is running.
+    #[cfg(test)]
+    pub(super) fn is_registered(&self, id: &SessionId) -> bool {
+        self.lock().sessions.iter().any(|(registered, _)| registered == id)
     }
 
     /// Begin to end: from now on no session registers, and every registered one is ended. A login
@@ -129,16 +134,51 @@ impl Control {
     }
 }
 
-/// A session recorded by [`Control::register`]; dropped when the session is over.
+/// The id of a session that has not started: dropped unregistered, it leaves nothing behind.
+pub(super) struct Reservation<'a> {
+    control: &'a Control,
+    id: SessionId,
+}
+
+impl<'a> Reservation<'a> {
+    /// The id the session's environment carries.
+    pub(super) fn id(&self) -> &SessionId {
+        &self.id
+    }
+
+    /// Record the running session under this id, with the means to end its shell tree. The registration
+    /// lasts while the returned guard does. `None` means the agent began to end after the reservation: the
+    /// caller must end the session itself, at once.
+    pub(super) fn register(self, kill: Killer) -> Option<Registration<'a>> {
+        let mut state = self.control.lock();
+        if state.ending {
+            return None;
+        }
+        state.sessions.push((self.id, kill));
+        Some(Registration {
+            control: self.control,
+            id: self.id,
+        })
+    }
+}
+
+/// A session recorded by [`Reservation::register`]; dropped when the session is over.
 pub(super) struct Registration<'a> {
     control: &'a Control,
-    id: u64,
+    id: SessionId,
 }
 
 impl Drop for Registration<'_> {
     fn drop(&mut self) {
         self.control.lock().sessions.retain(|(id, _)| *id != self.id);
     }
+}
+
+/// What ends a background agent's process once its logout is answered and the session drained: the `end_process`
+/// of [`handle_logout`] on both sockets.
+pub(super) fn end_the_agent() {
+    tracing::info!("the background session has ended");
+    super::end_process(0)
 }
 
 /// Answer a `Logout` handshake on a connection whose handshake has been read.

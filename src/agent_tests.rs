@@ -464,6 +464,7 @@ fn a_login_accepted_while_the_end_is_decided_is_refused_not_reset() {
                         &connections,
                         &control,
                         || connections.is_closing(),
+                        |conn, control| super::serve_connection(conn, Hooks::production(), control),
                     )
                 },
             )
@@ -1464,4 +1465,59 @@ fn a_configured_shell_that_ends_with_dll_not_found_gets_a_warning_naming_the_set
         !format!("{stdout}{stderr}").contains("STATUS_DLL_NOT_FOUND"),
         "{stdout:?} {stderr:?}"
     );
+}
+
+// The id of a session -----
+
+/// Run a command that prints its session id and then waits for its stdin to end, as an EXEC session of
+/// `control`. When the id is printed the session is running: it checks that `control` has registered that id,
+/// and ends the command. Returns the id the command printed.
+fn the_id_a_running_session_prints(tag: &str, control: &super::Control) -> crate::protocol::SessionId {
+    use crate::protocol::{SESSION_VARIABLE, SessionId, read_one_frame};
+    let (server, client, dir) = crate::test_support::raw_socket_pair(tag);
+    let id = thread::scope(|scope| {
+        scope.spawn(|| super::handle_connection_in(server, Hooks::production(), control).unwrap());
+        let (mut crx, mut ctx) = afunix::split(client).unwrap();
+        let hs = Handshake {
+            mode: Mode::Exec,
+            command: Some(format!("cmd.exe /c \"set {SESSION_VARIABLE} & more\"")),
+            ..Handshake::pty_default()
+        };
+        write_frame(&mut ctx, FrameKind::Handshake, &hs.encode().unwrap()).unwrap();
+        let (mut fr, mut printed, mut id) = (FrameReader::new(), String::new(), None);
+        loop {
+            let frame = read_one_frame(&mut crx, &mut fr).unwrap();
+            match frame.kind {
+                FrameKind::Serving => {}
+                FrameKind::Data => {
+                    printed.push_str(&String::from_utf8_lossy(&frame.payload[1..]));
+                    let prefix = format!("{SESSION_VARIABLE}=");
+                    if let (None, Some(at)) = (id, printed.find(&prefix)) {
+                        let text = &printed[at + prefix.len()..];
+                        let found = SessionId::parse(text.get(..32).expect("the whole id was printed"))
+                            .unwrap_or_else(|| panic!("what the session printed is no id: {printed:?}"));
+                        assert!(control.is_registered(&found), "the id the session has is registered");
+                        id = Some(found);
+                        write_data(&mut ctx, Stream::Stdin, b"").unwrap();
+                    }
+                }
+                FrameKind::Exit => break,
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        id.expect("the session printed its id")
+    });
+    assert!(!control.is_registered(&id), "the entry ends with the session");
+    std::fs::remove_dir_all(&dir).ok();
+    id
+}
+
+/// Each session gets an id of its own before its program starts, in its environment, and the agent registers
+/// that id.
+#[test]
+fn agent_puts_one_random_id_in_each_session_and_registers_that_id() {
+    let control = super::Control::new(false, super::Connections::new());
+    let first = the_id_a_running_session_prints("id-first", &control);
+    let second = the_id_a_running_session_prints("id-second", &control);
+    assert_ne!(first, second, "an id is not given out twice");
 }

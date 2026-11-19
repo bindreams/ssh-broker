@@ -15,6 +15,7 @@ pub use unelevated::UnelevatedToken;
 
 use crate::shell::StartError;
 use anyhow::Context;
+use std::ffi::OsString;
 use std::mem::offset_of;
 use windows::Win32::Foundation::{CloseHandle, ERROR_BAD_LENGTH, ERROR_INSUFFICIENT_BUFFER, HANDLE};
 use windows::Win32::Security::{
@@ -25,10 +26,10 @@ use windows::Win32::System::Diagnostics::Debug::{
     GetThreadErrorMode, SEM_FAILCRITICALERRORS, SetThreadErrorMode, THREAD_ERROR_MODE,
 };
 use windows::Win32::System::Threading::{
-    CREATE_NO_WINDOW, CREATE_SUSPENDED, CreateProcessAsUserW, CreateProcessW, DeleteProcThreadAttributeList,
-    EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess, InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
-    OpenProcessToken, PROCESS_CREATION_FLAGS, PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOEXW,
-    UpdateProcThreadAttribute,
+    CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW, CreateProcessW,
+    DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess, InitializeProcThreadAttributeList,
+    LPPROC_THREAD_ATTRIBUTE_LIST, OpenProcessToken, PROCESS_CREATION_FLAGS, PROCESS_INFORMATION, STARTF_USESTDHANDLES,
+    STARTUPINFOEXW, UpdateProcThreadAttribute,
 };
 use windows::core::{PCWSTR, PWSTR};
 
@@ -529,13 +530,64 @@ fn handle_list(inherit: &[HANDLE]) -> Vec<HANDLE> {
     list
 }
 
+/// The Unicode environment block for a child: `base` with `extra` put over it, as `NAME=VALUE` entries each
+/// ended by a NUL, sorted by name without regard to case (as Windows documents a block), and one more NUL at
+/// the end. A name in `extra` replaces the same name in `base`, compared without regard to case, and a name
+/// given twice in `extra` is its last value. A name that begins with `=` (a drive's current folder) is an
+/// ordinary name here.
+pub fn environment_block(base: impl IntoIterator<Item = (OsString, OsString)>, extra: &[(&str, &str)]) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt;
+    // What two names are compared by: each unit upper-cased when that is one unit, else as it is (a surrogate,
+    // for one).
+    let folded = |name: &[u16]| -> Vec<u16> {
+        name.iter()
+            .map(|&unit| {
+                let mut upper = char::from_u32(u32::from(unit)).into_iter().flat_map(char::to_uppercase);
+                match (upper.next(), upper.next()) {
+                    (Some(c), None) => u16::try_from(u32::from(c)).unwrap_or(unit),
+                    _ => unit,
+                }
+            })
+            .collect()
+    };
+    // (the name by which entries are compared, name, value)
+    let mut entries: Vec<(Vec<u16>, Vec<u16>, Vec<u16>)> = Vec::new();
+    let mut put = |name: Vec<u16>, value: Vec<u16>| {
+        let key = folded(&name);
+        entries.retain(|(other, _, _)| *other != key);
+        entries.push((key, name, value));
+    };
+    for (name, value) in base {
+        put(name.encode_wide().collect(), value.encode_wide().collect());
+    }
+    for (name, value) in extra {
+        put(name.encode_utf16().collect(), value.encode_utf16().collect());
+    }
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut block = Vec::new();
+    for (_, name, value) in entries {
+        block.extend(name);
+        block.push(u16::from(b'='));
+        block.extend(value);
+        block.push(0);
+    }
+    // An empty block is two NULs too: the one that ends the (absent) entries, and the end.
+    if block.is_empty() {
+        block.push(0);
+    }
+    block.push(0);
+    block
+}
+
 /// Start `command` suspended on `console`, optionally in `cwd`, and return its process and primary thread. The
 /// only way ssh-broker starts a session's program, so that none can omit the console policy, the handle list
 /// or the message-box guard.
 ///
 /// The child's standard handles are `std_handles` (input, output, error; null ones for a pseudoconsole). It
 /// inherits exactly the handles in `inherit`, each once, and none when that is empty. With `as_user` the
-/// child's token is that one (`CreateProcessAsUserW`), not this process's.
+/// child's token is that one (`CreateProcessAsUserW`), not this process's. The child's environment is this
+/// process's, with `extra_env` put over it ([`environment_block`]); an empty `extra_env` passes none and the
+/// child inherits as it always did.
 ///
 /// # Safety
 /// Every handle in `inherit` is valid and inheritable, each handle in `std_handles` is valid and inheritable
@@ -547,6 +599,7 @@ pub unsafe fn spawn_suspended(
     std_handles: [HANDLE; 3],
     inherit: &[HANDLE],
     as_user: Option<&UnelevatedToken>,
+    extra_env: &[(&str, &str)],
 ) -> Result<(OwnedHandle, OwnedHandle), StartError> {
     use std::os::windows::ffi::OsStrExt;
     // The pseudoconsole attribute's value is the HPCON itself, never a pointer to it (that was the cause of
@@ -585,7 +638,15 @@ pub unsafe fn spawn_suspended(
     let mut pi = PROCESS_INFORMATION::default();
     let _no_boxes = FailCriticalErrors::enter();
     let inherits = !inherited.is_empty();
-    let flags = creation_flags(&console);
+    // Held until the call returns: the call reads it.
+    let block = (!extra_env.is_empty()).then(|| environment_block(std::env::vars_os(), extra_env));
+    let environment = block.as_ref().map(|block| block.as_ptr() as *const core::ffi::c_void);
+    let flags = creation_flags(&console)
+        | if block.is_some() {
+            CREATE_UNICODE_ENVIRONMENT
+        } else {
+            PROCESS_CREATION_FLAGS(0)
+        };
     unsafe {
         match as_user {
             Some(token) => CreateProcessAsUserW(
@@ -596,7 +657,7 @@ pub unsafe fn spawn_suspended(
                 None,
                 inherits,
                 flags,
-                None,
+                environment,
                 cwd_ptr,
                 &si.StartupInfo,
                 &mut pi,
@@ -608,7 +669,7 @@ pub unsafe fn spawn_suspended(
                 None,
                 inherits,
                 flags,
-                None,
+                environment,
                 cwd_ptr,
                 &si.StartupInfo,
                 &mut pi,

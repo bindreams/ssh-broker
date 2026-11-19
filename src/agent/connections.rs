@@ -49,8 +49,8 @@ struct Tally {
     /// The end is decided: the accept loop returns after the connection it is accepting, which it
     /// counts first.
     closing: bool,
-    /// An accept loop holds the listener.
-    listener_open: bool,
+    /// How many accept loops hold a listener (`agent.sock`, and `request.sock` where the agent keeps one).
+    listeners: usize,
     /// Why the loop could not be woken, if it could not: nothing will make it return.
     wake_failed: Option<String>,
 }
@@ -85,7 +85,7 @@ impl Connections {
                 ended: 0,
                 logouts: 0,
                 closing: false,
-                listener_open: false,
+                listeners: 0,
                 wake_failed: None,
             }),
             ended: Condvar::new(),
@@ -111,10 +111,10 @@ impl Connections {
         self.drain_bound
     }
 
-    /// Whether an accept loop holds the listener.
+    /// Whether an accept loop holds a listener.
     #[cfg(test)]
     pub(super) fn listener_is_open(&self) -> bool {
-        self.lock().listener_open
+        self.lock().listeners > 0
     }
 
     /// Wake everything parked on the tally without changing it, as a failsafe in a test does.
@@ -173,14 +173,18 @@ impl Connections {
         }
     }
 
-    /// An accept loop is about to run over the listener.
+    /// An accept loop is about to run over a listener. Called once for each, before the end can be decided:
+    /// an end that does not see a listener neither wakes its loop nor waits for it.
     pub(super) fn listener_opened(&self) {
-        self.change(|tally| tally.listener_open = true);
+        self.change(|tally| tally.listeners += 1);
     }
 
-    /// The loop has returned and the listener is closed.
+    /// A loop has returned and its listener is closed.
     pub(super) fn listener_closed(&self) {
-        self.change(|tally| tally.listener_open = false);
+        self.change(|tally| {
+            debug_assert!(tally.listeners > 0, "a listener closed that was never opened");
+            tally.listeners = tally.listeners.saturating_sub(1);
+        });
     }
 
     /// Whether the end is decided: the accept loop stops after its current accept.
@@ -196,14 +200,14 @@ impl Connections {
         });
     }
 
-    /// Decide the end of the agent: wait until only `logout` requests are live, stop the accept loop
-    /// and close the listener, and judge again. Returns how the last judgement went. Any number of
-    /// callers (the `logout` handlers, the thread that ran the loop) may ask; the first does the work
-    /// and the others wait for it.
+    /// Decide the end of the agent: wait until only `logout` requests are live, stop the accept loops
+    /// (`agent.sock`'s, and `request.sock`'s where the agent keeps one) and close their listeners, and
+    /// judge again. Returns how the last judgement went. Any number of callers (the `logout` handlers,
+    /// the thread that ran the loop) may ask; the first does the work and the others wait for it.
     ///
-    /// The first wait is with the listener open, so a login that arrives meanwhile gets the refusal.
-    /// The loop counts every connection it accepts before it looks at the flag set here, and the
-    /// listener is closed once it has returned, so the second judgement sees every connection the loop
+    /// The first wait is with the listeners open, so a login that arrives meanwhile gets the refusal.
+    /// A loop counts every connection it accepts before it looks at the flag set here, and its
+    /// listener is closed once it has returned, so the second judgement sees every connection the loops
     /// took. A connection the system queued and nobody accepted is reset with the listener; its shim
     /// goes back to its no-agent path. If the first wait gave up on connections that do not finish, the
     /// second is not made: those would not finish either.
@@ -220,14 +224,14 @@ impl Connections {
         })
     }
 
-    /// Raise the flag, wake the loop and wait until it has returned and the listener is closed, or
-    /// until the wake has failed. Nothing is waited for if no loop holds a listener.
+    /// Raise the flag, wake the loops and wait until every one has returned and its listener is closed, or
+    /// until a wake has failed. Nothing is waited for if no loop holds a listener.
     fn close_listener(&self, wake: &dyn Fn()) {
         // The change wakes a loop parked for a resource (see `wait_for_an_end`): it is not in
         // `accept`, where `wake` reaches it.
         if !self.change(|tally| {
             tally.closing = true;
-            tally.listener_open
+            tally.listeners > 0
         }) {
             return;
         }
@@ -236,14 +240,14 @@ impl Connections {
         let tally = self
             .ended
             .wait_while(tally, |tally| {
-                let parks = tally.listener_open && tally.wake_failed.is_none();
+                let parks = tally.listeners > 0 && tally.wake_failed.is_none();
                 if parks {
                     (self.drain_parks)(tally.live.saturating_sub(tally.logouts));
                 }
                 parks
             })
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let (true, Some(why)) = (tally.listener_open, &tally.wake_failed) {
+        if let (true, Some(why)) = (tally.listeners > 0, &tally.wake_failed) {
             tracing::warn!("could not wake the accept loop: {why}; ending with the listener open");
         }
     }

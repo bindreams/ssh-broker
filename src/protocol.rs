@@ -132,6 +132,56 @@ impl ExitCode {
     }
 }
 
+/// The environment variable in which the agent gives each session its own [`SessionId`]. It routes a request
+/// to its session and proves nothing: a process of the same account at the same level can read another's.
+pub const SESSION_VARIABLE: &str = "SSH_BROKER_SESSION";
+
+/// A session's id: 128 random bits (see `agent::session::new_id`), shown as 32 lower-case hex digits. Never
+/// repeated across agent runs, so a process that outlived its agent names no session of the next.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SessionId([u8; 16]);
+
+impl SessionId {
+    pub const fn from_bytes(bytes: [u8; 16]) -> Self {
+        Self(bytes)
+    }
+
+    /// The id `text` shows: exactly 32 lower-case hex digits, nothing around them. Anything else is `None`.
+    pub fn parse(text: &str) -> Option<Self> {
+        let digits = text.as_bytes();
+        if digits.len() != 32 {
+            return None;
+        }
+        let mut bytes = [0u8; 16];
+        let (pairs, _) = digits.as_chunks::<2>();
+        for (byte, [high, low]) in bytes.iter_mut().zip(pairs) {
+            *byte = (hex_digit(*high)? << 4) | hex_digit(*low)?;
+        }
+        Some(Self(bytes))
+    }
+}
+
+/// The value of one lower-case hex digit.
+fn hex_digit(digit: u8) -> Option<u8> {
+    match digit {
+        b'0'..=b'9' => Some(digit - b'0'),
+        b'a'..=b'f' => Some(digit - b'a' + 10),
+        _ => None,
+    }
+}
+
+impl std::fmt::Display for SessionId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.iter().try_for_each(|byte| write!(f, "{byte:02x}"))
+    }
+}
+
+impl std::fmt::Debug for SessionId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "SessionId({self})")
+    }
+}
+
 /// The wire version; a peer of any other version is refused by name.
 pub const PROTOCOL_VERSION: u16 = 5;
 

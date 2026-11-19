@@ -506,7 +506,8 @@ fn console_fallback_stays_through_a_ctrl_c_that_the_shell_answers() {
         "console-fallback",
         &(pipe.read().0.0 as usize).to_string(),
     ]);
-    let mut console = PtySession::spawn(&verb_line, 120, 30, None, Some(pipe.read()), None).expect("start the verb");
+    let mut console =
+        PtySession::spawn(&verb_line, 120, 30, None, Some(pipe.read()), None, &[]).expect("start the verb");
     pipe.send(&ssh_broker::handoff::encode("the notice", &join_args(&[&probe.to_string_lossy()])).unwrap())
         .expect("hand the verb its line");
     let output = console.out_read_raw();

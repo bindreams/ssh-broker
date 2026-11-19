@@ -155,7 +155,8 @@ impl PtySession {
     /// Spawn `command` in a fresh pseudoconsole of `cols`x`rows`, optionally in `cwd`. The
     /// child inherits the agent's (session-1) token and environment, or the token `as_user` when it is
     /// given, and exactly one handle besides the pseudoconsole's when `inherit` names it (an inheritable
-    /// handle of this process, such as [`crate::winutil::Handoff::read`]).
+    /// handle of this process, such as [`crate::winutil::Handoff::read`]). `extra_env` is put over the
+    /// environment it inherits (see [`spawn_suspended`]).
     pub fn spawn(
         command: &str,
         cols: u16,
@@ -163,6 +164,7 @@ impl PtySession {
         cwd: Option<&Path>,
         inherit: Option<&OwnedHandle>,
         as_user: Option<&UnelevatedToken>,
+        extra_env: &[(&str, &str)],
     ) -> Result<PtySession, StartError> {
         let size = COORD {
             X: cols.max(1) as i16,
@@ -191,6 +193,7 @@ impl PtySession {
                 [null; 3],
                 inherited.as_ref().map_or(&[], |handles| handles.as_slice()),
                 as_user,
+                extra_env,
             )?;
 
             let job = crate::winutil::contain_and_resume(process.0, thread.0, "shell")?;

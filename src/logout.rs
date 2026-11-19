@@ -5,41 +5,39 @@
 //! tree the agent ends. The agent therefore waits for the client to close the connection before it
 //! ends anything, and the client never closes the connection itself: it fixes its exit code, and
 //! the kernel closes the socket when the process exits.
+//!
+//! The socket it asks on depends on who it is. An agent at High keeps `agent.sock` in a folder with the High
+//! label, which a process below High cannot connect to, and `request.sock` in the plain folder, which it can.
+//! A process at High asks `agent.sock` of the elevated folder. A process below High looks in the plain folder:
+//! `agent.sock` there is the account's agent (a standard account's, below High, keeps only that), and where
+//! there is none, `request.sock` is the agent at High's.
 
 use std::io::{Read, Write};
 
 use crate::account::Elevation;
+use crate::console_prompt::is_no_agent;
 use crate::protocol::{FrameKind, FrameReader, Launch, Mode, Stream, write_frame};
 use crate::relay::{FrameSink, Outcome};
-use crate::shim::{PROTOCOL_VIOLATION_CODE, closed_twice_message, make_handshake, peer_gone, pump_heard};
+use crate::request::{Asked, ask_at};
+use crate::shim::{make_handshake, peer_gone, pump_heard};
+use crate::socket_loc::Integrity;
 
 /// What `logout` says when there is no agent to ask.
 pub const NO_SESSION: &str = "ssh-broker: no session to end.";
 
-/// What `logout` says to an administrator's unelevated process when there is no agent to ask (the
-/// explanation is `offer::text::FILTERED_LOOKS_ELSEWHERE`).
-pub fn filtered_no_session() -> String {
-    format!(
-        "ssh-broker: no session to end here: {}.",
-        crate::offer::text::FILTERED_LOOKS_ELSEWHERE
-    )
-}
-
-/// The line for "there is no agent to ask", chosen by the elevation of this process's token. An
-/// elevation that cannot be read gets the plain line with the cause after it, since the token may be a
-/// filtered one.
+/// The line for "there is no agent to ask". An elevation that cannot be read gets the plain line with the
+/// cause after it, since the token may be a filtered one and the session may be elsewhere. Any other gets the
+/// plain line: an administrator's unelevated process reaches an agent at High as any other does, so none
+/// found is none.
 pub fn no_session_line(elevation: &anyhow::Result<Elevation>) -> String {
     match elevation {
-        Ok(Elevation::Filtered) => filtered_no_session(),
-        Ok(Elevation::Full | Elevation::Standard) => NO_SESSION.to_owned(),
+        Ok(Elevation::Filtered | Elevation::Full | Elevation::Standard) => NO_SESSION.to_owned(),
         Err(e) => format!(
             "{NO_SESSION} Note: {}, so the session may be elsewhere.",
             crate::offer::text::elevation_unreadable_clause(&format!("{e:#}"))
         ),
     }
 }
-/// The exit code when the agent could not be reached for a reason other than not being there.
-pub const UNREACHABLE_CODE: i32 = 4;
 
 /// Writes the agent's stderr to `err`.
 struct ReplySink<'a> {
@@ -52,16 +50,6 @@ impl FrameSink for ReplySink<'_> {
         self.err.flush()?;
         Ok(())
     }
-}
-
-/// How asking the agent to end the session went.
-#[derive(Debug)]
-pub enum Asked {
-    /// The agent answered, or the connection failed after it had: the exit code.
-    Code(i32),
-    /// The connection ended before the agent's first byte. An agent that is alive answers every
-    /// connection, so this one is ending or gone.
-    Unanswered,
 }
 
 /// Send the `Logout` handshake over a connected transport and relay the reply to `err`. The transport
@@ -88,48 +76,20 @@ pub fn logout_on<R: Read, W: Write>(rx: &mut R, tx: &mut W, err: &mut dyn Write)
     }
 }
 
-/// Connect with `connect`, run [`logout_on`], and hand its exit code to `exit` **while the
-/// connection is still open**. A connect that fails because there is no agent (`no_session` says
-/// so) is `NO_SESSION` and exit code 1; any other failure is reported with its cause and exits
-/// with [`UNREACHABLE_CODE`], since an agent may well serve this user. `no_session_line` is what the
-/// first says: [`NO_SESSION`], or [`filtered_no_session`] where the process cannot reach the agent that
-/// serves this account.
-///
-/// A connection that ends before the agent's first byte means the agent is ending (its listener closed
-/// with this request queued) or gone: the session the user asked to end is ending already. It connects
-/// again, and the next connect finds no agent (the outcome of running `logout` a moment later) or an
-/// agent that answers. A second connection in a row that ends before the first byte breaks the
-/// protocol (an agent that follows it closes without a byte only while its listener closes, as an
-/// older agent that does not know the request does not): it is reported and exits with
-/// [`PROTOCOL_VIOLATION_CODE`](crate::shim::PROTOCOL_VIOLATION_CODE).
-pub fn logout_at<R: Read, W: Write, T>(
-    mut connect: impl FnMut() -> anyhow::Result<(R, W)>,
-    no_session: impl Fn(&anyhow::Error) -> bool,
-    no_session_line: &str,
-    err: &mut dyn Write,
-    exit: impl FnOnce(i32) -> T,
-) -> T {
-    let mut closed_before = false;
-    loop {
-        let (mut rx, mut tx) = match connect() {
-            Ok(connection) => connection,
-            Err(e) if no_session(&e) => {
-                let _ = writeln!(err, "{no_session_line}");
-                return exit(1);
-            }
-            Err(e) => {
-                let _ = writeln!(err, "ssh-broker: could not reach your session: {e:#}");
-                return exit(UNREACHABLE_CODE);
-            }
-        };
-        match logout_on(&mut rx, &mut tx, err) {
-            Asked::Code(code) => return exit(code),
-            Asked::Unanswered if closed_before => {
-                let _ = writeln!(err, "{}", closed_twice_message(None));
-                return exit(PROTOCOL_VIOLATION_CODE);
-            }
-            Asked::Unanswered => closed_before = true,
-        }
+/// Connect to the agent that serves a process at `integrity`: `agent` is the connect to `agent.sock` of its
+/// folder and `request` the connect to `request.sock` of it. A process at High asks `agent.sock` only. One below
+/// High asks `agent.sock` of the plain folder, and `request.sock` there when `no_agent` says nothing serves the
+/// first: an agent at High keeps only the second in that folder. A failure that is not the absence of an agent
+/// (a socket that refuses this process, say) is the answer as it is, and the second socket is not tried.
+fn connect_in<S>(
+    integrity: Integrity,
+    agent: impl FnOnce() -> anyhow::Result<S>,
+    request: impl FnOnce() -> anyhow::Result<S>,
+    no_agent: impl Fn(&anyhow::Error) -> bool,
+) -> anyhow::Result<S> {
+    match agent() {
+        Err(e) if integrity == Integrity::Medium && no_agent(&e) => request(),
+        asked => asked,
     }
 }
 
@@ -137,16 +97,20 @@ pub fn logout_at<R: Read, W: Write, T>(
 /// profile of this process's token), to end its background session.
 pub fn run() -> anyhow::Result<()> {
     let connect = || {
-        let conn = crate::userdir::inspect_current_socket_dir()?.connect()?;
+        let folder = crate::userdir::inspect_current_socket_dir()?;
+        let conn = connect_in(
+            folder.location().integrity(),
+            || folder.connect(),
+            || folder.connect_request(),
+            is_no_agent,
+        )?;
         crate::afunix::split(conn)
     };
     // No profile, no folder and nothing listening all mean there is no session; anything else is not
     // that.
-    let no_session = |e: &anyhow::Error| {
-        e.downcast_ref::<crate::userdir::NoProfile>().is_some() || crate::console_prompt::is_no_agent(e)
-    };
+    let no_session = |e: &anyhow::Error| e.downcast_ref::<crate::userdir::NoProfile>().is_some() || is_no_agent(e);
     let line = no_session_line(&crate::account::elevation());
-    logout_at(connect, no_session, &line, &mut std::io::stderr(), |code| {
+    ask_at(connect, logout_on, no_session, &line, &mut std::io::stderr(), |code| {
         std::process::exit(code)
     })
 }

@@ -521,6 +521,7 @@ fn start_with_std_handles(
             std_handles,
             &inheritable,
             as_user,
+            &[],
         )
     }?;
     // SAFETY: the live handles from the successful start above.

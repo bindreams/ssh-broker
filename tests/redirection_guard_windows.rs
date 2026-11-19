@@ -74,7 +74,7 @@ fn an_elevated_junction_is_followed_and_an_unelevated_one_is_refused_under_redir
         env!("CARGO_BIN_EXE_ssh-broker"),
         by_unelevated(&dir.0).display()
     );
-    let mut child = ExecChild::spawn(&line, None, Some(&token)).expect("start the unelevated probe");
+    let mut child = ExecChild::spawn(&line, None, Some(&token), &[]).expect("start the unelevated probe");
     drop(child.take_stdin_write());
     let (out, err) = (
         drain::drain(child.stdout_read_raw()),

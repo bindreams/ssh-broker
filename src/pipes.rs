@@ -41,12 +41,14 @@ unsafe fn set_inheritable(h: HANDLE) -> windows::core::Result<()> {
 
 impl ExecChild {
     /// Spawn `command` with redirected std streams, optionally in `cwd`, with the agent's token or the token
-    /// `as_user` when it is given. `CreateProcessW` cannot run leading whitespace, which
-    /// [`crate::shim::spawn_line`] trims.
+    /// `as_user` when it is given, and `extra_env` put over the environment it inherits (see
+    /// [`spawn_suspended`]). `CreateProcessW` cannot run leading whitespace, which [`crate::shim::spawn_line`]
+    /// trims.
     pub fn spawn(
         command: &str,
         cwd: Option<&Path>,
         as_user: Option<&UnelevatedToken>,
+        extra_env: &[(&str, &str)],
     ) -> Result<ExecChild, StartError> {
         unsafe {
             let (stdin_read, stdin_write) = create_pipe()?;
@@ -70,6 +72,7 @@ impl ExecChild {
                 handles,
                 &handles,
                 as_user,
+                extra_env,
             )?;
             // The parent keeps stdin_write/stdout_read/stderr_read; close the child-side ends
             // so the parent's reads see EOF when the child exits.

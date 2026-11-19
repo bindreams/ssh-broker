@@ -2,9 +2,7 @@
 use super::*;
 use crate::protocol::{ExitCode, FrameKind, FrameReader, Handshake, Mode, Stream, write_frame};
 use crate::relay::write_data;
-use std::cell::Cell;
 use std::io::Cursor;
-use std::rc::Rc;
 
 /// What an agent would send: stderr text, then an exit code.
 fn reply(text: &str, code: i32) -> Vec<u8> {
@@ -56,111 +54,6 @@ fn a_reply_that_begins_with_the_answer_serving_is_a_failure() {
     assert_eq!(err, "");
 }
 
-/// `logout_at` with a connect that fails with `error`, and a verdict that only a missing agent
-/// is "no session".
-fn logout_failing_to_connect(error: anyhow::Error) -> (i32, String) {
-    let mut err = Vec::new();
-    let mut error = Some(error);
-    let code = logout_at(
-        || Err::<(Cursor<Vec<u8>>, Vec<u8>), _>(error.take().expect("asked to connect once")),
-        |e| e.to_string() == "nothing listens",
-        NO_SESSION,
-        &mut err,
-        |code| code,
-    );
-    (code, String::from_utf8(err).unwrap())
-}
-
-#[test]
-fn logout_with_no_agent_exits_1() {
-    let (code, err) = logout_failing_to_connect(anyhow::anyhow!("nothing listens"));
-    assert_eq!(code, 1);
-    assert_eq!(err, "ssh-broker: no session to end.\n");
-}
-
-#[test]
-fn logout_that_cannot_reach_an_agent_says_why_and_is_not_no_session() {
-    // An agent that serves this user but refuses the connection is not "no session to end".
-    let (code, err) = logout_failing_to_connect(anyhow::anyhow!("Access is denied. (0x80070005)"));
-    assert_eq!(code, UNREACHABLE_CODE);
-    assert_ne!(code, 1);
-    assert!(!err.contains("no session to end"), "{err}");
-    assert!(err.contains("could not reach your session"), "{err}");
-    assert!(err.contains("Access is denied"), "{err}");
-}
-
-/// `logout_at` over connections that `script` hands out in turn: each is what the agent says, or the
-/// error of a connect that fails. Returns the exit code, what was written to stderr and how many
-/// connections were made.
-fn logout_over(script: impl IntoIterator<Item = Result<Vec<u8>, &'static str>>) -> (i32, String, usize) {
-    let mut script = script.into_iter();
-    let mut connects = 0;
-    let mut err = Vec::new();
-    let code = logout_at(
-        || {
-            connects += 1;
-            match script.next().expect("the script ended: logout asked again") {
-                Ok(says) => Ok((Cursor::new(says), Vec::new())),
-                Err(why) => Err(anyhow::anyhow!(why)),
-            }
-        },
-        |e| e.to_string() == "nothing listens",
-        NO_SESSION,
-        &mut err,
-        |code| code,
-    );
-    (code, String::from_utf8(err).unwrap(), connects)
-}
-
-#[test]
-fn a_connection_that_ends_before_the_agents_first_byte_is_followed_by_a_new_one_and_no_agent_means_no_session() {
-    // The agent was ending when this logout reached it: its listener closed with the request queued.
-    // The session is gone by the time of the next connect, which is what running `logout` a moment
-    // later says too.
-    let (code, err, connects) = logout_over([Ok(Vec::new()), Err("nothing listens")]);
-    assert_eq!(code, 1);
-    assert_eq!(
-        err,
-        "ssh-broker: no session to end.
-"
-    );
-    assert_eq!(connects, 2);
-}
-
-#[test]
-fn a_connection_that_ends_before_the_agents_first_byte_is_followed_by_a_new_one_that_is_answered() {
-    let (code, err, connects) = logout_over([
-        Ok(Vec::new()),
-        Ok(reply(
-            "ssh-broker: ending your background session.
-",
-            0,
-        )),
-    ]);
-    assert_eq!(code, 0);
-    assert_eq!(
-        err,
-        "ssh-broker: ending your background session.
-"
-    );
-    assert_eq!(connects, 2);
-}
-
-#[test]
-fn a_second_connection_that_ends_before_the_agents_first_byte_is_a_protocol_violation() {
-    // An agent that follows the protocol closes a connection without a byte only while its listener
-    // closes, so the connect after that fails or is answered. The script has no third connection:
-    // asking again would fail the test.
-    let (code, err, connects) = logout_over([Ok(Vec::new()), Ok(Vec::new())]);
-    assert_eq!(code, crate::shim::PROTOCOL_VIOLATION_CODE);
-    assert_eq!(
-        err,
-        "ssh-broker: the agent closed the connection twice without answering; it may be a different ssh-broker version
-"
-    );
-    assert_eq!(connects, 2);
-}
-
 /// A connection whose read fails as told.
 struct Failing(std::io::ErrorKind);
 
@@ -208,86 +101,88 @@ fn a_crash_after_a_frame_is_not_unanswered() {
     assert_eq!(err, "partial\r\n");
 }
 
-/// A reader and writer that note when they are dropped.
-struct Held(Rc<Cell<bool>>, Cursor<Vec<u8>>);
+// Which socket -----
 
-impl Read for Held {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        self.1.read(buf)
-    }
-}
-
-impl Write for Held {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        Ok(bytes.len())
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-impl Drop for Held {
-    fn drop(&mut self) {
-        self.0.set(true);
-    }
-}
-
-/// The agent ends the shell tree when it sees the client close, and the client is usually inside
-/// that tree: it must have its exit code fixed before the agent can see the close.
-#[test]
-fn the_connection_is_still_open_when_the_exit_code_is_handed_over() {
-    let dropped = Rc::new(Cell::new(false));
-    let held = Rc::clone(&dropped);
-    let mut err = Vec::new();
-    let was_open = logout_at(
-        move || {
-            let rx = Held(Rc::clone(&held), Cursor::new(reply("bye\r\n", 0)));
-            let tx = Held(Rc::clone(&held), Cursor::new(Vec::new()));
-            Ok((rx, tx))
+/// What `connect_in` connected to, in order, and what it returned.
+fn connected_in(
+    integrity: Integrity,
+    agent: Result<&'static str, &'static str>,
+    request: Result<&'static str, &'static str>,
+) -> (Vec<&'static str>, Result<&'static str, String>) {
+    let tried = std::cell::RefCell::new(Vec::new());
+    let result = connect_in(
+        integrity,
+        || {
+            tried.borrow_mut().push("agent.sock");
+            agent.map_err(|why| anyhow::anyhow!(why))
         },
-        |_| false,
-        NO_SESSION,
-        &mut err,
-        |_code| !dropped.get(),
-    );
-    assert!(was_open, "the exit must happen while the socket is held");
-    assert!(dropped.get(), "and the socket is released only afterwards");
-}
-
-#[test]
-fn an_administrators_unelevated_logout_with_no_agent_in_its_folder_is_told_why_in_one_sentence() {
-    let mut err = Vec::new();
-    let code = logout_at(
-        || Err::<(Cursor<Vec<u8>>, Vec<u8>), _>(anyhow::anyhow!("nothing listens")),
+        || {
+            tried.borrow_mut().push("request.sock");
+            request.map_err(|why| anyhow::anyhow!(why))
+        },
         |e| e.to_string() == "nothing listens",
-        &filtered_no_session(),
-        &mut err,
-        |code| code,
     );
-    let err = String::from_utf8(err).unwrap();
-    assert_eq!(code, 1, "still no session to end");
-    assert_eq!(err.trim_end().lines().count(), 1, "{err}");
-    assert!(err.contains("administrator"), "{err}");
-    assert!(err.contains("elevated"), "{err}");
-    assert!(err.contains("SSH_BROKER_ELEVATION=always"), "{err}");
+    (tried.into_inner(), result.map_err(|e| e.to_string()))
 }
 
+/// Below High: the plain folder's `agent.sock` first (a standard account's agent has only that), then
+/// `request.sock` (an agent at High has only that there), and when neither is there, the error that says so.
 #[test]
-fn the_line_for_a_filtered_prompt_is_the_one_the_verify_row_gives() {
-    assert!(filtered_no_session().contains(crate::offer::text::FILTERED_LOOKS_ELSEWHERE));
+fn logout_below_high_asks_agent_sock_when_it_is_there_then_request_sock_then_says_no_session() {
+    // An agent below High is in the plain folder: the second socket is not tried.
+    assert_eq!(
+        connected_in(Integrity::Medium, Ok("the agent"), Ok("the requests")),
+        (vec!["agent.sock"], Ok("the agent"))
+    );
+    // No agent there: an agent at High takes the request on its own socket.
+    assert_eq!(
+        connected_in(Integrity::Medium, Err("nothing listens"), Ok("the requests")),
+        (vec!["agent.sock", "request.sock"], Ok("the requests"))
+    );
+    // Neither: the error is the absence, which `logout` says as "no session".
+    assert_eq!(
+        connected_in(Integrity::Medium, Err("nothing listens"), Err("nothing listens")),
+        (vec!["agent.sock", "request.sock"], Err("nothing listens".to_owned()))
+    );
+}
+
+/// An agent that is there and refuses this process is not an absent one: its refusal is the answer, and the
+/// other socket is not asked in its place. The same for a request socket that refuses.
+#[test]
+fn a_socket_that_refuses_is_not_a_missing_agent() {
+    assert_eq!(
+        connected_in(Integrity::Medium, Err("Access is denied"), Ok("the requests")),
+        (vec!["agent.sock"], Err("Access is denied".to_owned()))
+    );
+    assert_eq!(
+        connected_in(Integrity::Medium, Err("nothing listens"), Err("Access is denied")),
+        (vec!["agent.sock", "request.sock"], Err("Access is denied".to_owned()))
+    );
+}
+
+/// At High the agent's own socket is the way: a process there can connect to it, and the request socket
+/// is for those that cannot.
+#[test]
+fn logout_at_high_asks_agent_sock_only() {
+    assert_eq!(
+        connected_in(Integrity::High, Ok("the agent"), Ok("the requests")),
+        (vec!["agent.sock"], Ok("the agent"))
+    );
+    assert_eq!(
+        connected_in(Integrity::High, Err("nothing listens"), Ok("the requests")),
+        (vec!["agent.sock"], Err("nothing listens".to_owned()))
+    );
 }
 
 // the line when there is no agent -------------------------------------------------------------
 
+/// An administrator's unelevated process reaches an agent at High as any process does, so no agent found is
+/// the plain "no session": there is no place to look elsewhere.
 #[test]
-fn a_filtered_token_gets_the_line_that_says_where_its_agent_is() {
-    assert_eq!(no_session_line(&Ok(Elevation::Filtered)), filtered_no_session());
-}
-
-#[test]
-fn a_full_or_standard_token_gets_the_plain_line() {
-    assert_eq!(no_session_line(&Ok(Elevation::Full)), NO_SESSION);
-    assert_eq!(no_session_line(&Ok(Elevation::Standard)), NO_SESSION);
+fn every_readable_token_gets_the_plain_line() {
+    for elevation in [Elevation::Filtered, Elevation::Full, Elevation::Standard] {
+        assert_eq!(no_session_line(&Ok(elevation)), NO_SESSION, "{elevation:?}");
+    }
 }
 
 #[test]

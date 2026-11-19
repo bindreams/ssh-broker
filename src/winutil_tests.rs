@@ -820,6 +820,62 @@ fn the_inherit_list_names_each_handle_once() {
     assert!(handle_list(&[]).is_empty());
 }
 
+// The environment block -----
+
+/// The entries of a block, in order, as the text a child would read.
+fn entries_of(block: &[u16]) -> Vec<String> {
+    assert_eq!(block.last(), Some(&0), "the block ends in a NUL");
+    block[..block.len() - 1]
+        .split(|unit| *unit == 0)
+        .filter(|entry| !entry.is_empty())
+        .map(String::from_utf16_lossy)
+        .collect()
+}
+
+fn pair(name: &str, value: &str) -> (OsString, OsString) {
+    (name.into(), value.into())
+}
+
+#[test]
+fn environment_block_sorts_replaces_without_case_and_ends_with_a_double_nul() {
+    let base = [
+        pair("Path", r"C:\Windows"),
+        pair("ssh_broker_session", "stale"),
+        pair("=C:", r"C:\work"),
+        pair("Zeta", "\u{3042}\u{1F600}"),
+        pair("alpha", "1"),
+    ];
+    let block = environment_block(base, &[(crate::protocol::SESSION_VARIABLE, "0123"), ("Beta", "2")]);
+    assert_eq!(
+        entries_of(&block),
+        [
+            r"=C:=C:\work",
+            "alpha=1",
+            "Beta=2",
+            r"Path=C:\Windows",
+            "SSH_BROKER_SESSION=0123",
+            "Zeta=\u{3042}\u{1F600}",
+        ],
+        "sorted by name without regard to case; the name in another case is replaced, not kept beside"
+    );
+    assert_eq!(&block[block.len() - 2..], [0, 0], "two NULs at the end");
+}
+
+#[test]
+fn environment_block_of_an_empty_base_is_just_the_extra_and_of_nothing_is_two_nuls() {
+    assert_eq!(environment_block(std::iter::empty(), &[]), [0, 0]);
+    let block = environment_block(std::iter::empty(), &[("A", "b")]);
+    assert_eq!(entries_of(&block), ["A=b"]);
+    assert_eq!(block, "A=b\0\0".encode_utf16().collect::<Vec<_>>());
+}
+
+/// A name given twice in `extra` is that name once: the later value.
+#[test]
+fn environment_block_takes_the_last_of_a_name_given_twice() {
+    let block = environment_block([pair("X", "base")], &[("x", "first"), ("X", "second")]);
+    assert_eq!(entries_of(&block), ["X=second"]);
+}
+
 // Starting a child -----
 
 /// An inheritable handle: the write end of a pipe, and the read end kept by the caller.
@@ -841,7 +897,7 @@ fn starts(console: ChildConsole, std_handles: [HANDLE; 3], inherit: &[HANDLE]) -
     use windows::Win32::System::Threading::TerminateProcess;
     // SAFETY: the handles are live and inheritable; the child is suspended and ended here.
     let (process, _thread) =
-        unsafe { spawn_suspended("cmd.exe /c exit 0", None, console, std_handles, inherit, None) }?;
+        unsafe { spawn_suspended("cmd.exe /c exit 0", None, console, std_handles, inherit, None, &[]) }?;
     // SAFETY: the suspended process just created.
     unsafe { TerminateProcess(process.0, 1) }.expect("end the suspended child");
     Ok(())

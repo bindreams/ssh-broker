@@ -71,7 +71,7 @@ fn assert_result(dir: &Dir, said: &str) {
 fn a_child_on_pipes_with_the_unelevated_token_is_filtered_and_medium() {
     let token = unelevated_token();
     let dir = Dir::new("pipes");
-    let child = ExecChild::spawn(&child_line(&dir), None, Some(&token)).expect("start the child on pipes");
+    let child = ExecChild::spawn(&child_line(&dir), None, Some(&token), &[]).expect("start the child on pipes");
     // Both pipes are read from the start, so a child that fails noisily ends and says why.
     let (out, err) = (
         drain::drain(child.stdout_read_raw()),
@@ -96,7 +96,7 @@ fn a_child_in_a_pseudoconsole_with_the_unelevated_token_is_filtered_and_medium()
     let token = unelevated_token();
     let dir = Dir::new("pty");
     let mut session =
-        PtySession::spawn(&child_line(&dir), 120, 30, None, None, Some(&token)).expect("start the child in a pty");
+        PtySession::spawn(&child_line(&dir), 120, 30, None, None, Some(&token), &[]).expect("start the child in a pty");
     let output = drain::drain(session.out_read_raw());
     let waited = session.wait();
     session.close_pty(); // the output pipe ends once the pseudoconsole is closed

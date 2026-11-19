@@ -40,6 +40,16 @@ fn current_socket_location_lies_inside_the_profile() {
     assert!(loc.path().ends_with(format!(r"AppData\Local\{folder}\agent.sock")));
 }
 
+/// The location of an agent at High's request socket is the plain folder's, whatever level this process is at.
+#[test]
+fn the_plain_socket_location_is_the_plain_folder_at_any_level() {
+    let profile = profile_dir_of_token(own_token().unwrap().0).unwrap();
+    let plain = plain_socket_location().unwrap();
+    assert_eq!(plain, socket_loc::for_profile(&profile, Integrity::Medium).unwrap());
+    assert_eq!(plain.integrity(), Integrity::Medium);
+    assert!(plain.dir().ends_with("ssh-broker"));
+}
+
 #[test]
 fn current_socket_location_fits_sockaddr_un() {
     let loc = current_socket_location().unwrap();
@@ -86,7 +96,7 @@ fn for_profile_limit_agrees_with_unix_addr() {
     for integrity in [Integrity::Medium, Integrity::High] {
         let fixed = crate::socket_loc::for_profile(&profile_named("x"), integrity)
             .unwrap()
-            .path()
+            .request_path()
             .as_os_str()
             .len();
         for bytes in 105..=109 {
@@ -96,7 +106,7 @@ fn for_profile_limit_agrees_with_unix_addr() {
                 .join("AppData")
                 .join("Local")
                 .join(integrity.dir_name())
-                .join(crate::socket_loc::SOCKET_FILE_NAME);
+                .join(crate::socket_loc::REQUEST_SOCKET_FILE_NAME);
             assert_eq!(
                 location.is_ok(),
                 crate::afunix::unix_addr(&path).is_ok(),
@@ -572,10 +582,10 @@ fn a_logs_folder_held_open_by_another_program_does_not_stop_any_walk() {
 fn logs_can_be_renamed_while_a_walk_is_held() {
     for (tag, walk) in [
         (
-            "rename-logs-make",
+            "rn-logs-make",
             open_socket_dir as fn(&SocketLocation, &Sid) -> anyhow::Result<SocketDir>,
         ),
-        ("rename-logs-look", inspect_socket_dir),
+        ("rn-logs-look", inspect_socket_dir),
     ] {
         let profile = TempProfile::new(tag);
         let loc = profile.location();
@@ -801,6 +811,26 @@ fn an_elevated_folder_without_the_label_is_refused_and_left_as_it_is() {
         crate::test_support::dacl_sddl(loc.dir()).contains("D:P"),
         "and still the DACL it had"
     );
+}
+
+/// `connect` and `connect_request` name the two sockets of the held folder, and each reaches only its own.
+#[test]
+fn connect_request_reaches_request_sock_and_connect_reaches_agent_sock() {
+    let profile = TempProfile::new("rq");
+    let loc = profile.location_at(Integrity::Medium);
+    let folder = open_socket_dir(&loc, &me()).unwrap();
+    let requests = crate::afunix::Listener::bind(&loc.request_path(), Integrity::Medium).unwrap();
+    assert!(
+        folder.connect().is_err(),
+        "nothing listens on agent.sock, and connect does not reach request.sock"
+    );
+    let _client = folder.connect_request().expect("request.sock has a listener");
+    requests.accept().expect("the connection came to request.sock");
+
+    drop(requests);
+    let agent = crate::afunix::Listener::bind(loc.path(), Integrity::Medium).unwrap();
+    let _client = folder.connect().expect("agent.sock has a listener");
+    agent.accept().expect("the connection came to agent.sock");
 }
 
 #[test]

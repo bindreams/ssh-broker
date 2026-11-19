@@ -129,6 +129,17 @@ fn counting_killer(count: &Arc<AtomicUsize>) -> Killer {
     })
 }
 
+/// Reserve an id and register under it at once: what a session does, for a test of something else.
+trait RegisterNow {
+    fn register(&self, kill: Killer) -> Option<Registration<'_>>;
+}
+
+impl RegisterNow for Control {
+    fn register(&self, kill: Killer) -> Option<Registration<'_>> {
+        self.reserve().unwrap()?.register(kill)
+    }
+}
+
 #[test]
 fn desktop_agent_refuses_logout_and_keeps_serving() {
     let control = Control::new(false, Connections::new());
@@ -896,4 +907,164 @@ fn a_connection_that_finishes_within_the_bound_is_waited_for() {
     let finisher = std::thread::spawn(move || drop(other));
     assert_eq!(connections.wait_until_only_logouts_live(), Drained::Complete);
     finisher.join().unwrap();
+}
+
+// Sessions' ids -----
+
+#[test]
+fn control_reserves_an_id_before_the_start_and_registration_ends_it() {
+    let control = Control::new(true, Connections::new());
+    let killed = Arc::new(AtomicUsize::new(0));
+    let reservation = control
+        .reserve()
+        .unwrap()
+        .expect("an agent that is not ending reserves");
+    let id = *reservation.id();
+    assert!(!control.is_registered(&id), "reserved is not running");
+
+    let registration = reservation
+        .register(counting_killer(&killed))
+        .expect("an agent that is not ending registers");
+    assert!(control.is_registered(&id));
+    assert_eq!(
+        SessionId::parse(&id.to_string()),
+        Some(id),
+        "the id is the one that goes into the environment"
+    );
+
+    drop(registration);
+    assert!(!control.is_registered(&id), "the entry ends with the registration");
+    handle_logout(&mut Closed, &mut Vec::new(), &control, || {}).unwrap();
+    assert_eq!(killed.load(Ordering::SeqCst), 0, "an ended session is not ended again");
+}
+
+#[test]
+fn a_registered_session_is_ended_by_the_id_it_was_given() {
+    let control = Control::new(true, Connections::new());
+    let killed = Arc::new(AtomicUsize::new(0));
+    let reservation = control.reserve().unwrap().unwrap();
+    let _registration = reservation.register(counting_killer(&killed)).unwrap();
+    handle_logout(&mut Closed, &mut Vec::new(), &control, || {}).unwrap();
+    assert_eq!(killed.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn reserve_is_refused_once_the_agent_is_ending() {
+    let control = Control::new(true, Connections::new());
+    handle_logout(&mut Closed, &mut Vec::new(), &control, || {}).unwrap();
+    assert!(control.reserve().unwrap().is_none());
+}
+
+/// A session whose start is under way when the end begins is the one the registration refuses.
+#[test]
+fn a_reservation_made_before_the_end_began_is_refused_registration() {
+    let control = Control::new(true, Connections::new());
+    let killed = Arc::new(AtomicUsize::new(0));
+    let reservation = control.reserve().unwrap().unwrap();
+    let id = *reservation.id();
+    handle_logout(&mut Closed, &mut Vec::new(), &control, || {}).unwrap();
+    assert!(reservation.register(counting_killer(&killed)).is_none());
+    assert!(!control.is_registered(&id));
+}
+
+#[test]
+fn a_reservation_dropped_unregistered_leaves_no_entry() {
+    let control = Control::new(true, Connections::new());
+    let killed = Arc::new(AtomicUsize::new(0));
+    // The reservation is dropped at the end of the statement: its session never started.
+    let id = *control.reserve().unwrap().unwrap().id();
+    assert!(!control.is_registered(&id));
+    let _running = control.register(counting_killer(&killed)).unwrap();
+    handle_logout(&mut Closed, &mut Vec::new(), &control, || {}).unwrap();
+    assert_eq!(
+        killed.load(Ordering::SeqCst),
+        1,
+        "only the session that started is ended; the reserved one left nothing to end"
+    );
+}
+
+#[test]
+fn two_reservations_never_share_an_id() {
+    let control = Control::new(true, Connections::new());
+    let killed = Arc::new(AtomicUsize::new(0));
+    let a = control.reserve().unwrap().unwrap();
+    let b = control.reserve().unwrap().unwrap();
+    assert_ne!(a.id(), b.id());
+    let (a_id, b_id) = (*a.id(), *b.id());
+    let _a = a.register(counting_killer(&killed)).unwrap();
+    let _b = b.register(counting_killer(&killed)).unwrap();
+    assert!(control.is_registered(&a_id) && control.is_registered(&b_id));
+}
+
+/// A process that outlived its agent holds an id the next agent never gave out.
+#[test]
+fn an_id_from_another_agent_run_is_unknown_to_a_new_agent() {
+    let (old, new) = (
+        Control::new(true, Connections::new()),
+        Control::new(true, Connections::new()),
+    );
+    let killed = Arc::new(AtomicUsize::new(0));
+    let reservation = old.reserve().unwrap().unwrap();
+    let id = *reservation.id();
+    let _registration = reservation.register(counting_killer(&killed)).unwrap();
+    assert!(old.is_registered(&id));
+    assert!(!new.is_registered(&id), "a new agent does not know it");
+    let fresh = new.reserve().unwrap().unwrap();
+    assert_ne!(*fresh.id(), id, "and does not give it out again");
+}
+
+// The tally's listeners -----
+
+/// Two accept loops (`agent.sock`, `request.sock`) hold listeners; the end waits for both to close.
+#[test]
+fn the_tally_waits_for_every_listener_to_close() {
+    let connections = Connections::new();
+    connections.listener_opened();
+    connections.listener_opened();
+    let (woken, on_wake) = mpsc::channel();
+    let (returned, on_return) = mpsc::channel();
+    let ender = {
+        let connections = Arc::clone(&connections);
+        std::thread::spawn(move || {
+            connections.settle(&|| woken.send(()).unwrap());
+            returned.send(()).unwrap();
+        })
+    };
+    on_wake.recv().unwrap();
+    assert!(connections.is_closing(), "the flag is up when the loops are woken");
+    connections.listener_closed();
+    assert!(
+        on_return.try_recv().is_err(),
+        "one listener is still open, so the end is not settled"
+    );
+    assert!(connections.listener_is_open());
+    connections.listener_closed();
+    on_return.recv().unwrap();
+    assert!(!connections.listener_is_open());
+    ender.join().unwrap();
+}
+
+/// A connection on the request socket is a live connection: the end waits for it, as for a session's.
+#[test]
+fn a_request_connection_is_drained_like_a_session() {
+    let (events, on_event) = mpsc::channel();
+    let connections = Connections::observing_drain({
+        let events = events.clone();
+        move || {
+            let _ = events.send("parked");
+        }
+    });
+    let request = connections.begin();
+    let this_connection = connections.begin();
+    let _logout = connections.begin_logout();
+    let drain = {
+        let connections = Arc::clone(&connections);
+        std::thread::spawn(move || {
+            let _live = this_connection;
+            connections.wait_until_only_logouts_live()
+        })
+    };
+    on_event.recv().unwrap();
+    drop(request);
+    assert_eq!(drain.join().unwrap(), Drained::Complete);
 }

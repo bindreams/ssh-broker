@@ -48,6 +48,7 @@ the rest. The profile follows from the interactive logon and is not separately c
 | `shim_offer` | the shim's hook for a missing agent: the notice, or the prompt, the logon and the wait for the agent |
 | `account`, `logon`, `socket_watch` | who the token is and how elevated (`Elevation`), the secondary-logon call that starts a background agent, and the folder and profile-list watch with which the shim learns the agent serves (no named kernel object) |
 | `agent_background`, `agent/logout`, `logout` | the background agent's start checks and exit codes; ending a session, both sides |
+| `request`, `agent/requests`, `agent/session` | the client loop of the verbs that ask the agent (on `agent.sock`, or from below High on `request.sock`); the agent's handler of `request.sock`, which an agent at High keeps in the plain folder and which takes requests only; the id each session gets in `SSH_BROKER_SESSION` |
 
 ## Invariants you must not break
 

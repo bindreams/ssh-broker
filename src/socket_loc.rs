@@ -17,6 +17,9 @@ pub const SOCKET_DIR_NAME: &str = "ssh-broker";
 /// of the account below High cannot connect to what is in it. The only place the name is written.
 pub const ELEVATED_SOCKET_DIR_NAME: &str = "ssh-broker-elevated";
 pub const SOCKET_FILE_NAME: &str = "agent.sock";
+/// The socket an agent at High keeps in the plain folder for requests (`logout`) from the processes of its
+/// account below High. The only place the name is written.
+pub const REQUEST_SOCKET_FILE_NAME: &str = "request.sock";
 pub const LOCK_FILE_NAME: &str = "agent.lock";
 pub const SESSIONS_LOCK_FILE_NAME: &str = "sessions.lock";
 pub const LOGS_DIR_NAME: &str = "logs";
@@ -126,6 +129,13 @@ impl SocketLocation {
         &self.path
     }
 
+    /// The request socket: where an agent at High takes requests from the processes of its account below High.
+    /// Inside [`SocketLocation::dir`], so it is as private as `path`; only a location at [`Integrity::Medium`]
+    /// is where it is kept.
+    pub fn request_path(&self) -> PathBuf {
+        self.dir.join(REQUEST_SOCKET_FILE_NAME)
+    }
+
     /// The lock file the agent holds while it serves.
     pub fn lock_path(&self) -> PathBuf {
         self.dir.join(LOCK_FILE_NAME)
@@ -164,13 +174,16 @@ pub enum SocketLocationError {
     TooLong { path: PathBuf, bytes: usize, max: usize },
 }
 
-/// The socket location inside `profile` for processes at `integrity`, or why it cannot be used.
+/// The socket location inside `profile` for processes at `integrity`, or why it cannot be used. Both sockets
+/// of the folder must fit the limit, the longer name's ([`SocketLocation::request_path`]) deciding.
 pub fn for_profile(profile: &Path, integrity: Integrity) -> Result<SocketLocation, SocketLocationError> {
     let location = SocketLocation::in_profile(profile, integrity);
-    let bytes = location.path.as_os_str().len();
+    let longest = location.request_path();
+    debug_assert!(longest.as_os_str().len() >= location.path.as_os_str().len());
+    let bytes = longest.as_os_str().len();
     if bytes > MAX_SOCKET_PATH_BYTES {
         return Err(SocketLocationError::TooLong {
-            path: location.path,
+            path: longest,
             bytes,
             max: MAX_SOCKET_PATH_BYTES,
         });
