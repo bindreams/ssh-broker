@@ -63,11 +63,15 @@ pub enum StartOutcome {
     /// manager says running before that, so running alone is not this.
     Serving(StartReply),
     /// The service's process, which the service manager had reported running, exited with `code` before it
-    /// listened, and the service manager has seen the exit: it no longer says the service runs in that process,
-    /// so a start sent now is not refused for it.
+    /// listened. With `unseen` `None` the service manager has seen the exit: it no longer says the service runs in
+    /// that process, so a start sent now is not refused for it. With `unseen` set it is not known that it has,
+    /// and a start sent now may be refused.
     Exited {
         reply: StartReply,
         code: u32,
+        /// Why whether the service manager has seen the exit could not be read; `None` when it has: a start
+        /// sent now is then not refused for that process.
+        unseen: Option<String>,
     },
     /// Settled stopped, with the exit codes it recorded.
     Stopped {
@@ -138,7 +142,11 @@ pub fn restart(host: &mut dyn SshdHost, say: &mut dyn FnMut(&str), before: &Befo
     }
 
     // What is known of the stop: `None` when `Stopped` was read, else a clause with why it was not seen.
-    let unseen = match host.stop(&mut |reply| say(&stop_unanswered(reply))) {
+    let mut unanswered_said = false;
+    let unseen = match host.stop(&mut |reply| {
+        unanswered_said = true;
+        say(&stop_unanswered(reply));
+    }) {
         Ok(StopOutcome::Stopped) => None,
         Ok(StopOutcome::Unknown { cause }) => Some(format!("whether sshd stopped could not be told ({cause})")),
         Ok(StopOutcome::NotStopped { state, refusal }) => {
@@ -158,6 +166,10 @@ pub fn restart(host: &mut dyn SshdHost, say: &mut dyn FnMut(&str), before: &Befo
     };
     // "sshd was stopped" is said only of a stop that was read.
     let stopped = unseen.as_deref().unwrap_or("sshd was stopped");
+    // The wait that was announced has ended: say what it came to before the start's own wait.
+    if unanswered_said {
+        say(&format!("apply: {stopped}; starting sshd"));
+    }
 
     let first = host.start();
     match first {
@@ -198,6 +210,7 @@ pub fn restart(host: &mut dyn SshdHost, say: &mut dyn FnMut(&str), before: &Befo
         StartOutcome::Exited {
             reply: StartReply::Refused(reply),
             code,
+            ..
         } => {
             say(&format!(
                 "apply: sshd is not serving: {stopped}, the service manager refused a start ({reply}), and the sshd \
@@ -212,10 +225,13 @@ pub fn restart(host: &mut dyn SshdHost, say: &mut dyn FnMut(&str), before: &Befo
             };
             start_again(host, say, before, &first)
         }
-        StartOutcome::Exited { code, .. } => {
+        StartOutcome::Exited {
+            code, unseen: unread, ..
+        } => {
+            let exited = exited_before_listening(code, unread.as_deref());
             let first = match &unseen {
-                None => exited_before_listening(code),
-                Some(unseen) => format!("{unseen}; {}", exited_before_listening(code)),
+                None => exited,
+                Some(unseen) => format!("{unseen}; {exited}"),
             };
             start_again(host, say, before, &first)
         }
@@ -266,9 +282,14 @@ fn stopped_again(exit: ExitCodes) -> String {
     )
 }
 
-/// A start the service manager accepted whose sshd exited before it listened, in a sentence.
-fn exited_before_listening(code: u32) -> String {
-    format!("the start was accepted and sshd exited (code {code}) before it listened")
+/// A start the service manager accepted whose sshd exited before it listened, in a sentence. `unseen` is why
+/// whether the service manager had seen the exit could not be read, when it could not.
+fn exited_before_listening(code: u32, unseen: Option<&str>) -> String {
+    let said = format!("the start was accepted and sshd exited (code {code}) before it listened");
+    match unseen {
+        None => said,
+        Some(cause) => format!("{said} (whether the service manager had seen it exit could not be read: {cause})"),
+    }
 }
 
 /// A second start that ended before sshd listened, in a clause: `accepted` is what is said of one the service
@@ -313,6 +334,7 @@ fn start_again(host: &mut dyn SshdHost, say: &mut dyn FnMut(&str), before: &Befo
     let back = account.as_ref().map_or(String::new(), |said| format!(" The {said}."));
     let bracketed = account.map_or(String::new(), |said| format!(" (the {said})"));
 
+    say(&format!("apply: sshd {failed} ({first}); starting it again{bracketed}"));
     match host.start() {
         StartOutcome::Serving(StartReply::Accepted) if trouble.is_empty() && changed => {
             say(&format!(
@@ -352,7 +374,7 @@ fn start_again(host: &mut dyn SshdHost, say: &mut dyn FnMut(&str), before: &Befo
             ));
             false
         }
-        StartOutcome::Exited { reply, code } => {
+        StartOutcome::Exited { reply, code, .. } => {
             let second = second_ended(
                 reply,
                 format!("a second start was accepted and sshd exited (code {code}) before it listened"),

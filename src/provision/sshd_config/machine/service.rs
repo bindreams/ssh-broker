@@ -22,8 +22,9 @@
 //! - The service says running before sshd has read its configuration (it reports it, then runs `sshd_main`), so a
 //!   start is over only when its process owns a listening socket or has exited ([`listening::listens`]).
 //! - A STOP answered with 1053 that leaves the service running may still be taking sshd down, so the process held
-//!   before it is waited for, and then until the service manager no longer says the service runs in it (it sees
-//!   an exit after the process object is signalled); any other STOP that leaves the service running did nothing.
+//!   before it is waited for, and then until the service manager says a settled state that is not running in it
+//!   (it sees an exit after the process object is signalled); any other STOP that leaves the service running did
+//!   nothing.
 
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -51,29 +52,46 @@ use crate::winutil::{describe_error, win32_code};
 const SETTLED_MASK: SERVICE_NOTIFY =
     SERVICE_NOTIFY(SERVICE_NOTIFY_RUNNING.0 | SERVICE_NOTIFY_PAUSED.0 | SERVICE_NOTIFY_STOPPED.0);
 
-/// What a `dwCurrentState` says.
+/// What [`SshdService::settle`] does after reading the service manager's state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Reading {
+enum Next {
     Settled(ServiceState),
-    /// Starting, stopping, pausing or continuing: waited for.
-    Pending,
+    /// Wait for the registration already made.
+    Wait,
+    /// Register for this mask and read again: the registration made is for another state than the one waited for.
+    Rearm(SERVICE_NOTIFY),
     /// A value that is none of the seven states.
     Unknown(u32),
 }
 
-fn classify(raw: u32) -> Reading {
-    match raw {
-        r if r == SERVICE_RUNNING.0 => Reading::Settled(ServiceState::Running),
-        r if r == SERVICE_PAUSED.0 => Reading::Settled(ServiceState::Paused),
-        r if r == SERVICE_STOPPED.0 => Reading::Settled(ServiceState::Stopped),
-        r if r == SERVICE_START_PENDING.0
-            || r == SERVICE_STOP_PENDING.0
-            || r == SERVICE_CONTINUE_PENDING.0
-            || r == SERVICE_PAUSE_PENDING.0 =>
+/// What a reading of the service asks the wait to do: `state` is its `dwCurrentState` and `process_id` the
+/// process it says the service runs in, `exited` the id of a process held that has exited (if any), and `armed`
+/// the mask of the registration made before the reading.
+///
+/// - A pending state is waited for on the settled states.
+/// - Running in the process that exited is waited for on STOPPED: the service manager sees an exit a moment
+///   after the process object is signalled, and until then it says running, in the dead process.
+/// - Running in another process (the service manager's recovery restarted it), stopped and paused are settled,
+///   with an exit or without one.
+///
+/// A re-arm follows only a reading that changed kind, which takes a state change: it cannot spin.
+fn next(state: u32, process_id: u32, exited: Option<u32>, armed: SERVICE_NOTIFY) -> Next {
+    let waits_on = |mask: SERVICE_NOTIFY| if armed == mask { Next::Wait } else { Next::Rearm(mask) };
+    match state {
+        s if s == SERVICE_RUNNING.0 => match exited {
+            Some(gone) if gone == process_id => waits_on(SERVICE_NOTIFY_STOPPED),
+            _ => Next::Settled(ServiceState::Running),
+        },
+        s if s == SERVICE_PAUSED.0 => Next::Settled(ServiceState::Paused),
+        s if s == SERVICE_STOPPED.0 => Next::Settled(ServiceState::Stopped),
+        s if s == SERVICE_START_PENDING.0
+            || s == SERVICE_STOP_PENDING.0
+            || s == SERVICE_CONTINUE_PENDING.0
+            || s == SERVICE_PAUSE_PENDING.0 =>
         {
-            Reading::Pending
+            waits_on(SETTLED_MASK)
         }
-        other => Reading::Unknown(other),
+        other => Next::Unknown(other),
     }
 }
 
@@ -83,15 +101,16 @@ fn classify(raw: u32) -> Reading {
 /// itself, so an exit ends it at once. The decision is taken on the exit of `process`, the one held, and never
 /// on a state of the service read after it.
 ///
-/// An exit is answered only once the service manager has seen it: `left` is called with the exited process and
-/// returns when the service manager no longer says the service runs in it (see [`SshdService::left_by`]). The
-/// service manager can say running in a dead process for a moment after its object is signalled, and a start
-/// sent then is refused with 1056. So [`StartOutcome::Exited`] means: the process exited, and the service
-/// manager has seen it. A `left` that fails makes the outcome [`StartOutcome::Unreadable`] with its cause.
+/// An exit is answered once the service manager has been asked about it: `seen` is called with the exited
+/// process and returns when the service manager says a settled state that is not running in it (see
+/// [`SshdService::settle`]). The service manager can say running in a dead process for a moment after its object
+/// is signalled, and a start sent then is refused with 1056. So [`StartOutcome::Exited`] with no `unseen` means:
+/// the process exited, and the service manager has seen it. A `seen` that fails is still an exit, with its cause
+/// in `unseen`: the exit and its code are known, and only whether the service manager has seen it is not.
 fn listening_or_exit(
     process: &Process,
     reply: StartReply,
-    left: impl FnOnce(&Process) -> anyhow::Result<()>,
+    seen: impl FnOnce(&Process) -> anyhow::Result<()>,
 ) -> StartOutcome {
     loop {
         match listens(process.pid) {
@@ -108,14 +127,9 @@ fn listening_or_exit(
         match waited {
             Ok(false) => {}
             Ok(true) => {
-                if let Err(e) = left(process) {
-                    return StartOutcome::Unreadable {
-                        reply,
-                        cause: format!("{e:#}"),
-                    };
-                }
+                let unseen = seen(process).err().map(|e| format!("{e:#}"));
                 return match process.exit_code() {
-                    Ok(code) => StartOutcome::Exited { reply, code },
+                    Ok(code) => StartOutcome::Exited { reply, code, unseen },
                     Err(e) => StartOutcome::Unreadable {
                         reply,
                         cause: format!("{e:#}"),
@@ -146,13 +160,6 @@ fn waits_for_the_old_process(reply: Option<u32>, state: ServiceState) -> bool {
     reply == Some(ERROR_SERVICE_REQUEST_TIMEOUT.0) && state == ServiceState::Running
 }
 
-/// Whether the service manager, which says the service is in `state` with the process id `process_id`, still
-/// says that it runs in `gone`, a process that has exited. Running with another id is a restart by the service
-/// manager's recovery, and every other state says the exit was seen.
-fn still_runs_in(state: u32, process_id: u32, gone: u32) -> bool {
-    state == SERVICE_RUNNING.0 && process_id == gone
-}
-
 /// A settled state with the exit codes the service manager recorded with it.
 struct Settled {
     state: ServiceState,
@@ -181,19 +188,32 @@ impl SshdService {
 
     /// The settled state, once the service manager says one: see [`SshdService::settle`].
     pub(super) fn settled(&self) -> anyhow::Result<ServiceState> {
-        Ok(self.settle()?.state)
+        Ok(self.settle(None)?.state)
     }
 
-    /// Wait, with no bound, until the service manager says the service is running, paused or stopped. The
-    /// registration is made on handles of its own before the status is read, so a state reached in between is
-    /// seen by the read and one reached after it is delivered; the status decides, and a notification only says
-    /// that it is time to read again.
-    fn settle(&self) -> anyhow::Result<Settled> {
+    /// Wait, with no bound, for `exited` (when given) to exit, and then until the service manager says a settled
+    /// state that is not running in it. The only way from a process held that has gone to a state of the service.
+    ///
+    /// The registration is made on handles of its own before the status is read, so a state reached in between
+    /// is seen by the read and one reached after it is delivered; the status decides ([`next`]), and a
+    /// notification only says that it is time to read again.
+    fn settle(&self, exited: Option<&Process>) -> anyhow::Result<Settled> {
+        if let Some(process) = exited {
+            process
+                .wait_for_exit()
+                .with_context(|| format!("wait for the old sshd ({}) to exit", process.pid))?;
+        }
+        let mut mask = SETTLED_MASK;
         loop {
-            let registration = Registration::arm(SETTLED_MASK)?;
-            let status = self.status()?;
-            match classify(status.dwCurrentState.0) {
-                Reading::Settled(state) => {
+            let registration = Registration::arm(mask)?;
+            let status = self.status().context("read the sshd service's state")?;
+            match next(
+                status.dwCurrentState.0,
+                status.dwProcessId,
+                exited.map(|process| process.pid),
+                mask,
+            ) {
+                Next::Settled(state) => {
                     return Ok(Settled {
                         state,
                         exit: ExitCodes {
@@ -202,8 +222,9 @@ impl SshdService {
                         },
                     });
                 }
-                Reading::Pending => registration.wait(),
-                Reading::Unknown(raw) => anyhow::bail!("the service manager reported the unknown state {raw}"),
+                Next::Wait => registration.wait(),
+                Next::Rearm(rearm) => mask = rearm,
+                Next::Unknown(raw) => anyhow::bail!("the service manager reported the unknown state {raw}"),
             }
         }
     }
@@ -220,65 +241,52 @@ impl SshdService {
         // Decided on the Win32 code, before the reply is made into text.
         let code = control.as_ref().and_then(|e| win32_code(e.code()));
         let refusal = control.as_ref().map(describe_error);
-        Ok(match self.settle() {
+        Ok(match self.settle(None) {
             Err(e) => StopOutcome::Unknown {
                 cause: format!("{e:#}"),
             },
             Ok(Settled {
                 state: ServiceState::Stopped,
                 ..
-            }) => match held.map(|process| process.wait_for_exit()).transpose() {
-                Ok(_) => StopOutcome::Stopped,
-                Err(e) => StopOutcome::Unknown {
-                    cause: format!("{e:#}"),
+            }) => match held {
+                None => StopOutcome::Stopped,
+                // The process stays held through the wait, so that its id is not given to another.
+                Some(process) => match self.settle(Some(&process)) {
+                    Ok(_) => StopOutcome::Stopped,
+                    Err(e) => StopOutcome::Unknown {
+                        cause: format!("{e:#}"),
+                    },
                 },
             },
             Ok(Settled { state, .. }) if waits_for_the_old_process(code, state) => {
-                let reply = refusal.as_deref().unwrap_or_default();
-                unanswered(reply);
-                self.after_a_stop_that_timed_out(held, reply)
+                self.after_a_stop_that_timed_out(held, refusal.as_deref().unwrap_or_default(), unanswered)
             }
             Ok(Settled { state, .. }) => StopOutcome::NotStopped { state, refusal },
         })
     }
 
-    /// Wait, with no bound, until the service manager no longer says that the service runs in `gone`, a process
-    /// that has exited. The service manager sees an exit a moment after the process object is signalled, and
-    /// until then a read still says running, in the dead process. The registration is made before each read, so
-    /// a change between the two is delivered.
-    fn left_by(&self, gone: &Process) -> anyhow::Result<()> {
-        loop {
-            let registration = Registration::arm(SERVICE_NOTIFY_STOPPED)?;
-            let status = self.status()?;
-            if !still_runs_in(status.dwCurrentState.0, status.dwProcessId, gone.pid) {
-                return Ok(());
-            }
-            registration.wait();
-        }
-    }
-
     /// The STOP was answered with `reply` (1053) and the service reads running: sshd's handler did not answer in
-    /// time, and the process held before the STOP may be on its way down unreported. Wait, with no bound, for
-    /// it to exit and for the service manager to see that it has (it sees an exit after the process object is
-    /// signalled), and read the state once more. `Unknown` when there is no process to wait for or a read
-    /// fails: the flow never says that the service runs with its earlier configuration after a 1053.
-    fn after_a_stop_that_timed_out(&self, held: Option<Process>, reply: &str) -> StopOutcome {
+    /// time, and the process held before the STOP may be on its way down unreported. Say so on `unanswered`
+    /// (only when there is a process to wait for), then wait, with no bound, for it to exit and for the service
+    /// manager to say a settled state that is not running in it ([`SshdService::settle`]). `Unknown` when there
+    /// is no process to wait for or a read fails: the flow never says that the service runs with its earlier
+    /// configuration after a 1053.
+    fn after_a_stop_that_timed_out(
+        &self,
+        held: Option<Process>,
+        reply: &str,
+        unanswered: &mut dyn FnMut(&str),
+    ) -> StopOutcome {
         let unknown = |what: String| StopOutcome::Unknown {
             cause: format!("the service manager answered the STOP with {reply}, and {what}"),
         };
         let Some(process) = held else {
             return unknown("the service had no process to wait for".to_owned());
         };
-        if let Err(e) = process.wait_for_exit() {
-            return unknown(format!("{e:#}"));
-        }
-        // The process stays held through the wait, so that its id is not given to another.
-        if let Err(e) = self.left_by(&process) {
-            return unknown(format!("the process exited, but the state cannot be read: {e:#}"));
-        }
-        match self.settle() {
+        unanswered(reply);
+        match self.settle(Some(&process)) {
             Ok(_) => StopOutcome::Stopped,
-            Err(e) => unknown(format!("the process exited, but the state cannot be read: {e:#}")),
+            Err(e) => unknown(format!("{e:#}")),
         }
     }
 
@@ -293,7 +301,7 @@ impl SshdService {
             Err(e) => StartReply::Refused(describe_error(&e)),
         };
         loop {
-            let settled = match self.settle() {
+            let settled = match self.settle(None) {
                 Ok(settled) => settled,
                 Err(e) => {
                     return StartOutcome::Unreadable {
@@ -311,7 +319,9 @@ impl SshdService {
                     };
                 }
                 ServiceState::Running => match service_process() {
-                    Ok(Some(process)) => return listening_or_exit(&process, reply, |gone| self.left_by(gone)),
+                    Ok(Some(process)) => {
+                        return listening_or_exit(&process, reply, |gone| self.settle(Some(gone)).map(drop));
+                    }
                     // The process went between the two reads: the state the service manager says now decides.
                     Ok(None) => {}
                     Err(e) => {
@@ -464,18 +474,14 @@ enum ReleaseOutcome {
 }
 
 /// End the use of `notification` once its service handle was closed with `closed`: run the callbacks already
-/// queued to this thread, then free it. After a failed close it is not freed, and the leak is logged.
+/// queued to this thread, then free it. After a failed close it is not freed, because a late callback may still
+/// write into it; a leak is not reported (`apply` installs no tracing subscriber).
 ///
 /// `notification` came from `Box::into_raw` in [`Registration::arm`] and is released once.
 fn release(notification: *mut Notification, closed: windows::core::Result<()>) -> ReleaseOutcome {
     // SAFETY: a zero-length alertable wait runs the callbacks already queued to this thread.
     unsafe { SleepEx(0, true) }; // sleep-ok: runs the queued notification callback, waits for nothing
-    if let Err(error) = closed {
-        tracing::warn!(
-            "the sshd service handle could not be closed ({}); the notification registered on it is never freed, \
-             for a late callback may still write into it",
-            describe_error(&error)
-        );
+    if closed.is_err() {
         return ReleaseOutcome::Leaked;
     }
     // SAFETY: the close succeeded, so no callback is queued after the drain above; the pointer came from

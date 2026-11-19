@@ -884,6 +884,7 @@ fn an_sshd_that_cannot_bind_any_address_is_never_said_to_serve() {
         StartOutcome::Exited {
             reply: StartReply::Accepted,
             code,
+            ..
         } => eprintln!("sshd that cannot bind: the process exited before it listened, with code {code}"),
         StartOutcome::Stopped {
             reply: StartReply::Accepted,
@@ -950,7 +951,7 @@ fn an_apply_ended_after_it_handed_over_the_sshd_step_leaves_sshd_running_with_th
     job.close();
     let _ = child.wait();
 
-    let waited = taskscheduler::wait_for_instances(schtasks::APPLY_SSHD_TASK, &installed)
+    let waited = taskscheduler::wait_for_instances(schtasks::APPLY_SSHD_TASK, &installed, &mut || {})
         .expect("wait for the instances of the task");
     assert_eq!(waited, WaitOutcome::Ended);
     let mut host = sshd_host_of_this_machine().expect("find the sshd service");

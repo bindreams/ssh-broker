@@ -163,18 +163,6 @@ pub fn has_running_instance(name: &str) -> anyhow::Result<bool> {
     Ok(count > 0)
 }
 
-/// Whether the task `name` has an instance that [`wait_for_instances`] would wait for: one that is not launched
-/// yet, or whose process (running `image`) has not exited. [`has_running_instance`] also counts an instance
-/// the engine still lists after its process has exited. A task that does not exist has none.
-pub fn has_unended_instance(name: &str, image: &Path) -> anyhow::Result<bool> {
-    let _com = Com::init()?;
-    let service = connect()?;
-    let Some(task) = registered_task(&service, name)? else {
-        return Ok(false);
-    };
-    Ok(running_instances(&task, image)?.count > 0)
-}
-
 /// The running instances of a task: how many there are, and the processes among them that are
 /// the agent. An instance the engine has not launched yet has no process to show, and is still
 /// an instance.
@@ -388,7 +376,10 @@ pub fn register_system_task(name: &str, xml: &str, sddl: &str) -> anyhow::Result
 /// external event that may never come, so the failure bound [`procwait::EXIT_BOUND`] counts from the first
 /// look that finds only such instances, and its expiry is [`WaitOutcome::NeverLaunched`]: it proves nothing of
 /// what the instance will do.
-pub fn wait_for_instances(name: &str, image: &Path) -> anyhow::Result<WaitOutcome> {
+///
+/// `waiting` is called once, on the first listing that finds an instance, before the wait: a task that is not
+/// registered, or whose listing finds none, ends the wait without it.
+pub fn wait_for_instances(name: &str, image: &Path, waiting: &mut dyn FnMut()) -> anyhow::Result<WaitOutcome> {
     let _com = Com::init()?;
     let service = connect()?;
     let Some(task) = registered_task(&service, name)? else {
@@ -398,22 +389,29 @@ pub fn wait_for_instances(name: &str, image: &Path) -> anyhow::Result<WaitOutcom
         procwait::EXIT_BOUND,
         || running_instances(&task, image),
         |processes| processes.iter().try_for_each(Process::wait_for_exit),
+        waiting,
     )
 }
 
 /// The loop of [`stop_and_wait`] without the stop: list the instances, wait for the processes among them, list
 /// again, until a listing finds none. An instance that has no process to wait for is looked at again at once;
-/// `bound` runs from the first such look since a process was last waited for.
+/// `bound` runs from the first such look since a process was last waited for. `waiting` is called once, on the
+/// first listing that finds an instance.
 fn wait_until_ended<P>(
     bound: Duration,
     mut list: impl FnMut() -> anyhow::Result<Instances<P>>,
     mut wait: impl FnMut(Vec<P>) -> anyhow::Result<()>,
+    waiting: &mut dyn FnMut(),
 ) -> anyhow::Result<WaitOutcome> {
     let mut never_launched_since: Option<Instant> = None;
+    let mut said = false;
     loop {
         let instances = list()?;
         if instances.count == 0 {
             return Ok(WaitOutcome::Ended);
+        }
+        if !std::mem::replace(&mut said, true) {
+            waiting();
         }
         if !instances.processes.is_empty() {
             never_launched_since = None;

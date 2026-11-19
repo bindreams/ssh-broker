@@ -298,6 +298,7 @@ fn run_wait_until_ended(
             log(&format!("wait {pids:?}"));
             if wait { Ok(()) } else { anyhow::bail!("failed") }
         },
+        &mut || log("waiting"),
     )
 }
 
@@ -306,7 +307,28 @@ fn the_instances_are_listed_waited_for_and_listed_again_until_there_are_none() {
     let events = RefCell::new(Vec::new());
     let outcome = run_wait_until_ended(NO_BOUND, vec![vec![11, 22], vec![]], true, &events).unwrap();
     assert_eq!(outcome, WaitOutcome::Ended);
-    assert_eq!(events.into_inner(), ["list [11, 22]", "wait [11, 22]", "list []"]);
+    assert_eq!(
+        events.into_inner(),
+        ["list [11, 22]", "waiting", "wait [11, 22]", "list []"]
+    );
+}
+
+#[test]
+fn waiting_is_called_once_before_the_first_wait() {
+    let events = RefCell::new(Vec::new());
+    let outcome = run_wait_until_ended(NO_BOUND, vec![vec![11], vec![22], vec![]], true, &events).unwrap();
+    assert_eq!(outcome, WaitOutcome::Ended);
+    assert_eq!(
+        events.into_inner(),
+        ["list [11]", "waiting", "wait [11]", "list [22]", "wait [22]", "list []"]
+    );
+}
+
+#[test]
+fn waiting_is_not_called_when_no_instance_is_listed() {
+    let events = RefCell::new(Vec::new());
+    run_wait_until_ended(NO_BOUND, vec![vec![]], true, &events).unwrap();
+    assert_eq!(events.into_inner(), ["list []"]);
 }
 
 #[test]
@@ -329,7 +351,8 @@ fn an_instance_the_engine_has_not_launched_yet_is_looked_at_again_with_no_count_
     assert_eq!(outcome, WaitOutcome::Ended);
     let events = events.into_inner();
     assert_eq!(events.iter().filter(|e| *e == "list [0]").count(), 1000);
-    assert_eq!(&events[1000..], ["list [33]", "wait [33]", "list []"]);
+    assert_eq!(&events[..2], ["list [0]", "waiting"]);
+    assert_eq!(&events[1001..], ["list [33]", "wait [33]", "list []"]);
 }
 
 #[test]
@@ -339,7 +362,7 @@ fn an_instance_that_is_never_launched_is_not_an_end_and_is_reported_with_how_man
     let events = RefCell::new(Vec::new());
     let outcome = run_wait_until_ended(Duration::ZERO, vec![vec![0, 0]], true, &events).unwrap();
     assert_eq!(outcome, WaitOutcome::NeverLaunched { count: 2 });
-    assert_eq!(events.into_inner(), ["list [0, 0]"]);
+    assert_eq!(events.into_inner(), ["list [0, 0]", "waiting"]);
 }
 
 #[test]
@@ -349,7 +372,7 @@ fn a_launched_instance_is_waited_for_with_no_bound_however_long_the_bound_is_pas
     let events = RefCell::new(Vec::new());
     let outcome = run_wait_until_ended(Duration::ZERO, vec![vec![0, 44], vec![]], true, &events).unwrap();
     assert_eq!(outcome, WaitOutcome::Ended);
-    assert_eq!(events.into_inner(), ["list [0, 44]", "wait [44]", "list []"]);
+    assert_eq!(events.into_inner(), ["list [0, 44]", "waiting", "wait [44]", "list []"]);
 }
 
 /// The process of an instance, as the tests hold one: its pid; `open` finds one for the pids in `alive`.
@@ -373,6 +396,7 @@ fn a_listed_instance_whose_process_has_exited_ends_the_wait_and_is_not_never_lau
         Duration::ZERO,
         || Ok(instances_listed(vec![7], &[])),
         |_: Vec<u32>| anyhow::bail!("nothing is waited for"),
+        &mut || {},
     )
     .unwrap();
     assert_eq!(outcome, WaitOutcome::Ended);
@@ -390,7 +414,7 @@ fn a_failure_to_identify_the_process_of_an_instance_is_an_error_and_never_an_end
 fn a_wait_that_fails_is_an_error_and_is_not_looked_past() {
     let events = RefCell::new(Vec::new());
     assert!(run_wait_until_ended(NO_BOUND, vec![vec![11], vec![]], false, &events).is_err());
-    assert_eq!(events.into_inner(), ["list [11]", "wait [11]"]);
+    assert_eq!(events.into_inner(), ["list [11]", "waiting", "wait [11]"]);
 }
 
 // Stopping a real task (Elevated, CI only) -----
@@ -467,7 +491,7 @@ fn a_system_task_is_registered_run_and_waited_for_until_its_process_has_exited()
     register_system_task(&task.0, &xml, "D:P(A;;FA;;;SY)(A;;FA;;;BA)").unwrap();
     run_task(&task.0).unwrap();
 
-    let outcome = wait_for_instances(&task.0, &cmd).unwrap();
+    let outcome = wait_for_instances(&task.0, &cmd, &mut || {}).unwrap();
     let written = std::fs::read_to_string(&marker);
     let _ = std::fs::remove_file(&marker);
     assert_eq!(outcome, WaitOutcome::Ended);
@@ -485,23 +509,13 @@ fn a_task_has_a_running_instance_from_its_start_until_it_is_stopped() {
     task.register(FOREVER_TASK_XML);
     assert!(!has_running_instance(&task.0).unwrap(), "control: nothing is running");
 
-    assert!(
-        !has_unended_instance(&task.0, &forever_image()).unwrap(),
-        "control: nothing is running"
-    );
-
     let image = forever_image();
     let processes = start_and_find(&task.0, &image);
     assert!(has_running_instance(&task.0).unwrap());
-    assert!(
-        has_unended_instance(&task.0, &image).unwrap(),
-        "an instance whose process runs is unended"
-    );
 
     stop_instances(&task.0, &image).unwrap();
     wait_all_exited(&processes, Duration::ZERO).expect("the process had exited when stop_instances returned");
     assert!(!has_running_instance(&task.0).unwrap());
-    assert!(!has_unended_instance(&task.0, &image).unwrap());
 }
 
 /// Elevated (CI only).

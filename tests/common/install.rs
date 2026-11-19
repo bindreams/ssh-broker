@@ -146,7 +146,7 @@ impl Drop for Install {
         // The sshd step's task, which an `apply` that was ended leaves behind: it runs to its end first (it
         // restarts sshd, and holds the exe the directory is removed with), then it is deleted. Its report is in
         // the install directory, which goes below.
-        let _ = taskscheduler::wait_for_instances(schtasks::APPLY_SSHD_TASK, &canonical);
+        let _ = taskscheduler::wait_for_instances(schtasks::APPLY_SSHD_TASK, &canonical, &mut || {});
         let _ = desktop::output(Command::new("schtasks").args(["/Delete", "/TN", schtasks::APPLY_SSHD_TASK, "/F"]));
         let _ = taskscheduler::stop_instances(schtasks::AGENT_TASK, &canonical);
         let _ = desktop::output(Command::new("schtasks").args(["/Delete", "/TN", schtasks::AGENT_TASK, "/F"]));

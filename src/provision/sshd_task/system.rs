@@ -43,7 +43,8 @@ impl SshdTask for SystemTask<'_> {
     }
 
     fn wait(&mut self) -> anyhow::Result<WaitOutcome> {
-        taskscheduler::wait_for_instances(APPLY_SSHD_TASK, self.exe)
+        // The hand-over's own line has said that it waits.
+        taskscheduler::wait_for_instances(APPLY_SSHD_TASK, self.exe, &mut || {})
     }
 
     fn report(&mut self) -> anyhow::Result<String> {

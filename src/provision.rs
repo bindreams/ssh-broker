@@ -205,17 +205,15 @@ mod imp {
         let _apply_lock = apply_lock::acquire(&layout.apply_lock_path(), || {
             eprintln!("apply: another apply or an auto-login command is running; waiting for it to finish")
         })?;
+        // An earlier `apply`'s sshd step is the rest of its run, and outlives its process: it is waited for
+        // before this run touches anything.
+        flow::wait_for_earlier_sshd_step(&mut |line| eprintln!("{line}"), |waiting| {
+            taskscheduler::wait_for_instances(schtasks::APPLY_SSHD_TASK, &layout.canonical_exe(), waiting)
+        })?;
         let exe = flow::run(
             || {
-                flow::stop_holders(
-                    || taskscheduler::has_unended_instance(schtasks::APPLY_SSHD_TASK, &layout.canonical_exe()),
-                    &mut |line| eprintln!("{line}"),
-                    || taskscheduler::wait_for_instances(schtasks::APPLY_SSHD_TASK, &layout.canonical_exe()),
-                    || {
-                        taskscheduler::stop_instances(schtasks::AGENT_TASK, &layout.canonical_exe())?;
-                        stop_background_sessions(&layout.canonical_exe())
-                    },
-                )
+                taskscheduler::stop_instances(schtasks::AGENT_TASK, &layout.canonical_exe())?;
+                stop_background_sessions(&layout.canonical_exe())
             },
             |stop_agents| {
                 let exe = layout::prepare_in(&base, &current, stop_agents)?;

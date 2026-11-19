@@ -1,39 +1,39 @@
 //! The shape of `apply`: install, then bring agents back. Held apart from the Windows calls so
 //! the failure paths can be tested with stand-ins.
 
+use anyhow::Context;
+
 use super::procwait::{self, StillRunning, Survivor};
 use super::schtasks::{APPLY_SSHD_TASK, WaitOutcome};
 
-/// The stop that precedes replacing the exe: first the sshd step of an earlier `apply`, then everything else
-/// that holds the exe (`stop_rest`).
+/// The wait, at the start of `apply` and right after its lock, for the sshd step of an earlier `apply`.
 ///
-/// An `apply` ended after the hand-over leaves its task's instance running the installed exe for as long as
-/// the step takes. The exe cannot be replaced under it, and ending it between its stop of sshd and its start
-/// would leave sshd stopped, so it is waited for, with no bound once it has launched. When `sshd_step_running`
-/// says there is one, `say` says that it is waited for, and `wait_for_sshd_step` returns when its instances
-/// have ended. An instance the Task Scheduler never launched fails the stop, as a task that never clears does
-/// in `stop_instances`: nothing is replaced under an instance that may still start.
-pub fn stop_holders(
-    sshd_step_running: impl FnOnce() -> anyhow::Result<bool>,
+/// The lock makes one `apply` run at a time for its whole run, and an earlier `apply` that was ended after its
+/// hand-over has the sshd step as the rest of that run: its task's instance outlives its process, running the
+/// installed exe, and ending it between its stop of sshd and its start would leave sshd stopped. So it is waited
+/// for, with no bound once it has launched, before this run stops, replaces or reads anything it works on.
+/// `wait` is given the function that says the wait has begun, and calls it when it finds an earlier step; it
+/// returns when the instances have ended. An instance the Task Scheduler never launched stops `apply`, as a
+/// task that never clears does in `stop_instances`: nothing goes on beside an instance that may still start.
+pub fn wait_for_earlier_sshd_step(
     say: &mut dyn FnMut(&str),
-    wait_for_sshd_step: impl FnOnce() -> anyhow::Result<WaitOutcome>,
-    stop_rest: impl FnOnce() -> anyhow::Result<()>,
+    wait: impl FnOnce(&mut dyn FnMut()) -> anyhow::Result<WaitOutcome>,
 ) -> anyhow::Result<()> {
-    if sshd_step_running()? {
+    let outcome = wait(&mut || {
         say(&format!(
             "apply: an earlier apply's sshd step is still running (the task {APPLY_SSHD_TASK}); waiting for it to \
              finish"
-        ));
-        match wait_for_sshd_step()? {
-            WaitOutcome::Ended => {}
-            WaitOutcome::NeverLaunched { count } => anyhow::bail!(
-                "the Task Scheduler lists {count} instance(s) of the task {APPLY_SSHD_TASK} that it has not started \
-                 after {} s; the exe was not replaced under them; run apply again",
-                procwait::EXIT_BOUND.as_secs()
-            ),
-        }
+        ))
+    })
+    .context("wait for an earlier apply's sshd step")?;
+    match outcome {
+        WaitOutcome::Ended => Ok(()),
+        WaitOutcome::NeverLaunched { count } => anyhow::bail!(
+            "the Task Scheduler lists {count} instance(s) of the task {APPLY_SSHD_TASK} that it has not started \
+             after {} s, so apply went no further; run apply again",
+            procwait::EXIT_BOUND.as_secs()
+        ),
     }
-    stop_rest()
 }
 
 /// Run `install`, then `start` the agents.

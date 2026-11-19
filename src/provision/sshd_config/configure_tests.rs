@@ -6,6 +6,7 @@ use super::super::{ACCEPT_LINE, DROP_IN_NAME, INCLUDE_LINE, drop_in_text, with_l
 use super::*;
 use std::cell::RefCell;
 use std::collections::VecDeque;
+use std::rc::Rc;
 use std::time::{Duration, UNIX_EPOCH};
 
 const STOCK: &str = "#Port 22\r\n#AcceptEnv LANG LC_*\r\nSubsystem sftp sftp-server.exe\r\n\r\nMatch Group administrators\r\n       AuthorizedKeysFile __PROGRAMDATA__/ssh/administrators_authorized_keys\r\n";
@@ -64,6 +65,9 @@ pub(crate) struct Fake {
     pub(crate) starts: VecDeque<StartOutcome>,
     /// A method that fails once a start was asked for: the put-back of the files.
     pub(crate) fail_once_started: Option<&'static str>,
+    /// A log a test shares with its `say` closure: `start()` writes "start" to it, so the lines said and the
+    /// starts made come out in one sequence.
+    pub(crate) said_and_started: Option<Rc<RefCell<Vec<String>>>>,
 }
 
 impl Fake {
@@ -214,6 +218,9 @@ impl SshdHost for Fake {
     fn start(&mut self) -> StartOutcome {
         self.call("start");
         self.event("start");
+        if let Some(log) = &self.said_and_started {
+            log.borrow_mut().push("start".to_owned());
+        }
         self.starts
             .pop_front()
             .expect("start() was called, and the test scripted no start")

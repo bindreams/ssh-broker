@@ -4,6 +4,8 @@
 use super::super::configure::configure_tests::Fake;
 use super::super::{DROP_IN_NAME, INCLUDE_LINE, drop_in_text, with_line};
 use super::*;
+use std::cell::RefCell;
+use std::rc::Rc;
 
 const INTRO: &str = "apply: restarting sshd; apply waits for the service manager at each step, and after a start for \
                      sshd to listen or exit";
@@ -177,6 +179,7 @@ fn a_state_that_cannot_be_read_is_never_a_sentence_that_says_sshd_runs_or_does_n
         after_an_unknown_stop(StartOutcome::Exited {
             reply: refused("Access is denied. (5)"),
             code: 1067,
+            unseen: None,
         }),
     ];
     for said in &sentences {
@@ -304,10 +307,39 @@ fn a_stop_sshd_did_not_answer_in_time_is_said_before_the_wait_and_the_restart_go
         [
             INTRO,
             &stop_unanswered_line(NO_ANSWER),
+            "apply: sshd was stopped; starting sshd",
             &format!("apply: sshd restarted; it accepts {ELEVATION}")
         ]
     );
     assert_eq!(events(&host), ["settled", "stop", "start"]);
+}
+
+#[test]
+fn a_wait_that_ended_without_a_stop_seen_is_followed_by_a_line_that_says_so_before_the_start() {
+    let mut host = host();
+    host.settles = [Ok(ServiceState::Running)].into();
+    host.stop_unanswered = Some(NO_ANSWER.to_owned());
+    host.stops = [Ok(StopOutcome::Unknown {
+        cause: CAUSE.to_owned(),
+    })]
+    .into();
+    host.starts = [StartOutcome::Serving(StartReply::Accepted)].into();
+    let (_, said) = run(&mut host);
+    assert_eq!(said[1], stop_unanswered_line(NO_ANSWER));
+    assert_eq!(said[2], format!("apply: {UNSEEN}; starting sshd"));
+}
+
+#[test]
+fn nothing_is_said_between_a_stop_that_was_answered_and_the_start() {
+    let mut host = host();
+    host.settles = [Ok(ServiceState::Running)].into();
+    host.stops = [Ok(StopOutcome::Unknown {
+        cause: CAUSE.to_owned(),
+    })]
+    .into();
+    host.starts = [StartOutcome::Serving(StartReply::Accepted)].into();
+    let (_, said) = run(&mut host);
+    assert_eq!(said.len(), 2, "{said:#?}");
 }
 
 #[test]
@@ -551,7 +583,11 @@ fn a_start_after_which_sshd_is_paused_puts_nothing_back() {
 // a start whose sshd exited before it listened =====
 
 fn exited(reply: StartReply, code: u32) -> StartOutcome {
-    StartOutcome::Exited { reply, code }
+    StartOutcome::Exited {
+        reply,
+        code,
+        unseen: None,
+    }
 }
 
 /// What a start that was accepted, and whose sshd exited before it listened, is called in a sentence.
@@ -732,6 +768,70 @@ fn what_this_run_changed_is_put_back_before_the_second_start() {
     );
     assert_eq!(host.config, b"Port 22\r\n", "sshd_config is what it was");
     assert_eq!(host.drop_in, None, "the drop-in this run made is gone");
+}
+
+#[test]
+fn the_second_start_is_said_before_it_is_waited_for() {
+    let (mut host, before) = changed_by_this_run();
+    let log = Rc::new(RefCell::new(Vec::new()));
+    host.said_and_started = Some(Rc::clone(&log));
+    first_start_fails(&mut host);
+    host.starts.push_back(StartOutcome::Serving(StartReply::Accepted));
+    let taken = restart(&mut host, &mut |line| log.borrow_mut().push(line.to_owned()), &before);
+    assert!(!taken);
+    let log = log.borrow();
+    let again = format!(
+        "apply: sshd failed to start with {ELEVATION} accepted ({}); starting it again (the original configuration \
+         was put back)",
+        stopped_again(1067, 0)
+    );
+    let said_again = log
+        .iter()
+        .position(|line| *line == again)
+        .unwrap_or_else(|| panic!("{log:#?}"));
+    let starts: Vec<usize> = (0..log.len()).filter(|i| log[*i] == "start").collect();
+    assert_eq!(starts.len(), 2, "{log:#?}");
+    assert!(
+        starts[0] < said_again && said_again < starts[1],
+        "the line is said after the first start and before the second: {log:#?}"
+    );
+}
+
+#[test]
+fn an_exit_whose_record_could_not_be_read_puts_the_files_back_and_says_why_a_second_start_may_be_refused() {
+    let (mut host, before) = changed_by_this_run();
+    host.settles = [Ok(ServiceState::Running)].into();
+    host.stops = [Ok(StopOutcome::Stopped)].into();
+    let reason = "the service manager did not answer";
+    host.starts = [
+        StartOutcome::Exited {
+            reply: StartReply::Accepted,
+            code: 255,
+            unseen: Some(reason.to_owned()),
+        },
+        StartOutcome::Stopped {
+            reply: refused("An instance of the service is already running. (1056)"),
+            exit: exit(1067, 0),
+        },
+    ]
+    .into();
+    let (taken, said) = restart_with(&mut host, &before);
+    assert!(!taken);
+    let first = format!(
+        "{} (whether the service manager had seen it exit could not be read: {reason})",
+        exited_before_listening(255)
+    );
+    assert_eq!(
+        said.last().unwrap(),
+        &format!(
+            "apply: sshd is NOT running: it failed to start with {ELEVATION} accepted ({first}), and the service \
+             manager refused a second start (An instance of the service is already running. (1056)). The original \
+             configuration was put back. {NOT_RUNNING_ADVICE}"
+        )
+    );
+    assert_eq!(host.config, b"Port 22\r\n", "sshd_config is what it was");
+    assert_eq!(host.drop_in, None, "the drop-in this run made is gone");
+    assert_eq!(events(&host).iter().filter(|event| **event == "start").count(), 2);
 }
 
 #[test]
