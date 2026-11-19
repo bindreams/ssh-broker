@@ -114,9 +114,19 @@ impl HalfClose for Wire {
 #[derive(Default)]
 pub(super) struct Recorder {
     events: Mutex<Vec<String>>,
+    /// Every input is recorded and then fails, as the input of a pseudoconsole that has been closed does.
+    fails: bool,
 }
 
 impl Recorder {
+    /// A target whose input fails.
+    pub(super) fn failing() -> Recorder {
+        Recorder {
+            fails: true,
+            ..Recorder::default()
+        }
+    }
+
     pub(super) fn events(&self) -> Vec<String> {
         self.events.lock().unwrap().clone()
     }
@@ -128,6 +138,7 @@ impl InputTarget for Recorder {
             .lock()
             .unwrap()
             .push(format!("input {}", String::from_utf8_lossy(bytes)));
+        anyhow::ensure!(!self.fails, "the target's input is closed");
         Ok(())
     }
 

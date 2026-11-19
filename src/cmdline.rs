@@ -156,14 +156,36 @@ fn next_arg(s: &str) -> Option<(String, &str)> {
     Some((arg, &s[end..]))
 }
 
-/// The program name, which has no escape rules: a leading quote ends at the next quote.
-fn after_program(line: &str) -> &str {
+/// The program name of `line`, without its quotes, and the rest of the line exactly as written (its separators
+/// included). The program name has no escape rules: a leading quote ends at the next quote, a backslash before it
+/// included, and a name that is never closed runs to the end.
+pub fn split_program(line: &str) -> (&str, &str) {
     let line = line.trim_start_matches(SEPARATORS);
-    let end = match line.strip_prefix('"') {
-        Some(quoted) => quoted.find('"').map_or(line.len(), |i| i + 2),
-        None => line.find(SEPARATORS).unwrap_or(line.len()),
-    };
-    &line[end..]
+    match line.strip_prefix('"') {
+        Some(quoted) => match quoted.find('"') {
+            Some(close) => (&quoted[..close], &quoted[close + 1..]),
+            None => (quoted, ""),
+        },
+        None => line.split_at(line.find(SEPARATORS).unwrap_or(line.len())),
+    }
+}
+
+fn after_program(line: &str) -> &str {
+    split_program(line).1
+}
+
+/// The text of `line` after its program name and its first `count` arguments, as written and without the
+/// separators before it: `ssh-broker elevate cmd /c echo  "a&b"` is `cmd /c echo  "a&b"` after one argument
+/// (`elevate`). Empty when the line has no more.
+pub fn after_args(line: &str, count: usize) -> &str {
+    let mut rest = after_program(line);
+    for _ in 0..count {
+        match next_arg(rest) {
+            Some((_, after)) => rest = after,
+            None => return "",
+        }
+    }
+    rest.trim_start_matches(SEPARATORS)
 }
 
 /// The text after the `-c` token, as written; `None` when the line's first argument is not `-c`.

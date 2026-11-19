@@ -11,10 +11,10 @@
 
 use std::path::Path;
 
-use super::elevation::{Verdict, decide, run_hosted};
+use super::elevation::{HostedSession, RunOutcome, Verdict, decide, run_hosted};
 use super::{Control, Opened, child_cwd, home_dir, logout, read_opening};
 use crate::afunix::{self, ConnRx, ConnTx};
-use crate::elevate::REFUSED_EXIT_CODE;
+use crate::elevate::{REFUSED_EXIT_CODE, UNKNOWN_END_EXIT_CODE};
 use crate::offer::text;
 use crate::protocol::{ElevationRequest, Frame, FrameKind, Handshake, Mode, SessionId};
 
@@ -85,19 +85,19 @@ fn refuse(rx: &mut ConnRx, tx: &mut ConnTx, control: &Control, sentence: &str) -
 /// process of the account can read another's environment), and what it routes is something the login already
 /// allowed.
 fn elevate(rx: &mut ConnRx, tx: &mut ConnTx, control: &Control, request: &ElevationRequest) -> anyhow::Result<()> {
-    let Some(id) = SessionId::parse(&request.session) else {
-        return refuse(rx, tx, control, &text::elevation_not_hosted());
+    let id = match request.check() {
+        Ok(id) => id,
+        Err(cause) => {
+            return Err(logout::fail_connection(
+                rx,
+                tx,
+                control,
+                "the agent could not serve the request",
+                cause,
+                logout::BAD_REQUEST_EXIT_CODE,
+            ));
+        }
     };
-    if let Err(cause) = request.check() {
-        return Err(logout::fail_connection(
-            rx,
-            tx,
-            control,
-            "the agent could not serve the request",
-            cause,
-            logout::BAD_REQUEST_EXIT_CODE,
-        ));
-    }
     if control.is_ending() {
         return logout::refuse_while_ending(rx, tx, control);
     }
@@ -106,21 +106,34 @@ fn elevate(rx: &mut ConnRx, tx: &mut ConnTx, control: &Control, request: &Elevat
     let Some(hosted) = control.await_hosted(&id) else {
         return refuse(rx, tx, control, &text::elevation_not_hosted());
     };
-    if let Verdict::Refuse(sentence) = decide(hosted.policy(), hosted.has_terminal(), request.terminal) {
+    if let Verdict::Refuse(sentence) = decide(hosted.policy, hosted.link.has_terminal(), request.terminal) {
         return refuse(rx, tx, control, &sentence);
     }
-    let Some(_slot) = hosted.slot().try_take() else {
-        return refuse(rx, tx, control, &text::elevation_in_progress());
+    // The slot is held while the command runs, and not while the client is waited for: the reply is written, and its
+    // client waited for, with the slot free, so that the next `elevate` of the session is not refused for it.
+    let (sentence, code) = {
+        let Some(_slot) = hosted.slot.try_take() else {
+            return refuse(rx, tx, control, &text::elevation_in_progress());
+        };
+        run_elevated(&hosted, tx, request, &id)
     };
+    logout::reply_and_wait(rx, tx, control, &sentence, code)
+}
+
+/// Run the command of `request` for `hosted`, whose slot the caller holds, and say what to answer: the sentence (empty
+/// for a command that ran and ended) and the exit code. Nothing is written to the client but `Serving` and the
+/// command's own output.
+fn run_elevated(hosted: &HostedSession, tx: &mut ConnTx, request: &ElevationRequest, id: &SessionId) -> (String, i32) {
     // The working directory is the one path the agent acts on: it is the command's folder, which must be one.
     let cwd = child_cwd(&request.cwd, home_dir());
     if !request.cwd.is_empty() && !Path::new(&request.cwd).is_dir() {
         let cause = format!("{} is not an existing directory", request.cwd);
-        return refuse(rx, tx, control, &text::elevation_cannot_start(&cause));
+        return (text::elevation_cannot_start(&cause), REFUSED_EXIT_CODE);
     }
-    match run_hosted(hosted.link(), tx, request, cwd.as_deref(), hosted.starts(), &id) {
-        Ok(code) => logout::reply_and_wait(rx, tx, control, "", code),
-        Err(cause) => refuse(rx, tx, control, &text::elevation_cannot_start(&format!("{cause:#}"))),
+    match run_hosted(&hosted.link, tx, request, cwd.as_deref(), &hosted.starts, id) {
+        RunOutcome::Exited(code) => (String::new(), code),
+        RunOutcome::NotStarted(cause) => (text::elevation_cannot_start(&format!("{cause:#}")), REFUSED_EXIT_CODE),
+        RunOutcome::EndUnread(cause) => (text::elevation_end_unread(&format!("{cause:#}")), UNKNOWN_END_EXIT_CODE),
     }
 }
 

@@ -7,16 +7,15 @@
 //! level: see [`crate::protocol::ElevationRequest`].
 
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
 
 use super::link::{Carrier, Link};
 use super::{
-    ExecStarter, HandleWriter, HangupGuard, ParkSignal, PtyStarter, PtyTarget, prepare_hangup_watch, reap_tree,
-    spawn_stream_pump, start_hangup_watch, teardown_warning,
+    ExecStarter, HangupGuard, ParkSignal, PtyStarter, PtyTarget, answer_serving, close_unserved_pty, end_pty,
+    prepare_hangup_watch, reap_tree, spawn_stream_pump, start_hangup_watch, teardown_warning,
 };
 use crate::afunix::ConnTx;
-use crate::conpty;
 use crate::hangup::HangupWatcher;
 use crate::offer::text;
 use crate::protocol::{ElevationPolicy, ElevationRequest, SESSION_VARIABLE, SessionId, Stream};
@@ -85,66 +84,48 @@ impl Drop for SlotGuard<'_> {
 
 /// What a request needs of the session it is for. Published to `Control` once the session's [`Link`] exists
 /// (`Registration::attach`).
-pub(super) trait Hosted: Send + Sync {
-    /// What the session's login asked of elevation.
-    fn policy(&self) -> ElevationPolicy;
-    /// Whether the session has a terminal.
-    fn has_terminal(&self) -> bool;
-    /// The session's connection, which the output of a command run with `--terminal` is carried on.
-    fn link(&self) -> &Arc<Link>;
-    /// How a command for this session is started.
-    fn starts(&self) -> &Starts;
-    /// The slot of the one elevation the session may have at a time.
-    fn slot(&self) -> &Slot;
-}
-
-/// The session the agent hosts, as a request sees it.
 pub(super) struct HostedSession {
-    policy: ElevationPolicy,
-    link: Arc<Link>,
-    starts: Starts,
-    slot: Slot,
+    /// What the session's login asked of elevation.
+    pub(super) policy: ElevationPolicy,
+    /// The session's connection, which the output of a command run with `--terminal` is carried on.
+    pub(super) link: Arc<Link>,
+    /// How a command for this session is started.
+    pub(super) starts: Starts,
+    /// The slot of the one elevation the session may have at a time.
+    pub(super) slot: Slot,
 }
 
 impl HostedSession {
-    /// The entry of a session with `link`, shared as a request sees it.
-    pub(super) fn shared(policy: ElevationPolicy, link: Arc<Link>, starts: Starts) -> Arc<dyn Hosted> {
-        Arc::new(HostedSession {
+    pub(super) fn new(policy: ElevationPolicy, link: Arc<Link>, starts: Starts) -> Self {
+        HostedSession {
             policy,
             link,
             starts,
             slot: Slot::default(),
-        })
-    }
-}
-
-impl Hosted for HostedSession {
-    fn policy(&self) -> ElevationPolicy {
-        self.policy
-    }
-
-    fn has_terminal(&self) -> bool {
-        self.link.has_terminal()
-    }
-
-    fn link(&self) -> &Arc<Link> {
-        &self.link
-    }
-
-    fn starts(&self) -> &Starts {
-        &self.starts
-    }
-
-    fn slot(&self) -> &Slot {
-        &self.slot
+        }
     }
 }
 
 // Running the command =====
 
+/// How running a hosted command ended.
+pub(super) enum RunOutcome {
+    /// The command did not start, and the client was not told it had: a refusal, with the cause.
+    NotStarted(anyhow::Error),
+    /// The command started, ended, and this is its exit code.
+    Exited(i32),
+    /// The command started (the client was answered `Serving`, or was gone and could not be) and its end could not be
+    /// read: why.
+    EndUnread(anyhow::Error),
+}
+
 /// Run the command of `request` elevated, hosted by the agent, for the session whose connection is `link` and whose
 /// id is `id` (which its environment carries, so that the command can itself ask for what a program of the session
-/// can), in `cwd`. `conn` is the write half of the request's own connection. Returns its exit code once it has ended.
+/// can), in `cwd`. `conn` is the write half of the request's own connection. Returns how it ended ([`RunOutcome`]).
+///
+/// Once the command has started, is contained and runs, and before any output of it is carried, the client is answered
+/// `Serving` on `conn` (see [`FrameKind`](crate::protocol::FrameKind)), in both modes: it is how the client knows the
+/// command ran. When that cannot be written the client is gone, and the command's tree is ended as a session's is.
 ///
 /// The command is started directly with the agent's own token, in the mode the REQUEST asks for, whatever the
 /// session is:
@@ -161,12 +142,12 @@ impl Hosted for HostedSession {
 /// first.
 pub(super) fn run_hosted(
     link: &Arc<Link>,
-    conn: &ConnTx,
+    conn: &mut ConnTx,
     request: &ElevationRequest,
     cwd: Option<&Path>,
     starts: &Starts,
     id: &SessionId,
-) -> anyhow::Result<i32> {
+) -> RunOutcome {
     let id = id.to_string();
     let env = [(SESSION_VARIABLE, id.as_str())];
     if request.terminal {
@@ -181,68 +162,88 @@ fn watch_request(conn: &ConnTx, job: &Arc<cosca::Job>) -> Option<HangupGuard> {
     start_hangup_watch(prepare_hangup_watch(conn, HangupWatcher::new), job)
 }
 
+/// The client has gone and cannot be told its command started: the command is ended.
+fn client_gone_at_serving() -> anyhow::Error {
+    anyhow::anyhow!("the client went away before it was told that the command had started")
+}
+
 fn on_a_pseudoconsole(
     link: &Arc<Link>,
-    conn: &ConnTx,
+    conn: &mut ConnTx,
     line: &str,
     cwd: Option<&Path>,
     starts: &Starts,
     env: &[(&str, &str)],
-) -> anyhow::Result<i32> {
+) -> RunOutcome {
     debug_assert!(
         link.has_terminal(),
         "decide refuses --terminal in a session without a terminal"
     );
     let (cols, rows) = link.size();
-    let mut session =
-        (starts.pty)(line, cols, rows, cwd, None, None, env).map_err(crate::shell::StartError::into_cause)?;
+    let mut session = match (starts.pty)(line, cols, rows, cwd, None, None, env) {
+        Ok(session) => session,
+        Err(cause) => return RunOutcome::NotStarted(cause.into_cause()),
+    };
     let job = session.job();
     let hangup = watch_request(conn, &job);
+    if answer_serving(conn).is_err() {
+        if let Some(w) = teardown_warning(reap_tree(&job)) {
+            tracing::error!("{w}");
+        }
+        close_unserved_pty(session, &|_| {});
+        if let Some(hangup) = hangup {
+            hangup.finish();
+        }
+        return RunOutcome::EndUnread(client_gone_at_serving());
+    }
     let out_raw = session.out_read_raw();
-    let hpc = Arc::new(Mutex::new(Some(session.take_hpc_raw())));
-    let target = Arc::new(PtyTarget::new(
-        HandleWriter::spawn(session.in_write_raw(), None, ParkSignal::default()),
-        Arc::clone(&hpc),
-    ));
+    let target = Arc::new(PtyTarget::new(&mut session, ParkSignal::default()));
     let guard = link.host_elevated(target.clone());
-    let pump = spawn_stream_pump(out_raw, Stream::Pty, Arc::clone(link), Carrier::Elevated, || {});
+    // A delivery that fails is a session that has ended, and its command has no screen to run on: its tree ends,
+    // as the session's own does, and the pump goes on reading until the pseudoconsole is closed.
+    let gone = {
+        let job = Arc::clone(&job);
+        move || {
+            reap_tree(&job);
+        }
+    };
+    let pump = spawn_stream_pump(out_raw, Stream::Pty, Arc::clone(link), Carrier::Elevated, gone);
 
-    // The session's own teardown, in the same order (see `handle_pty`): wait, reap the tree, close the
-    // pseudoconsole while holding its lock (a resize cannot touch a closed one), which flushes conhost and ends
-    // the output, then join the pump.
-    let waited = session.wait();
-    if let Some(w) = teardown_warning(reap_tree(&job)) {
-        tracing::error!("{w}");
-    }
-    if let Some(raw) = hpc.lock().unwrap_or_else(PoisonError::into_inner).take() {
-        conpty::close_pty_raw(raw);
-    }
-    let _ = pump.join();
+    // The session's own teardown (see `handle_pty`).
+    let ended = end_pty(session, &target, pump);
     // The connection goes back to the session before the reply is written.
     drop(guard);
-    // The writer's thread may be parked in the input pipe until the pseudoconsole is closed, which it now is; it
-    // is joined before the pipe's handles are closed with `session`.
-    target.shutdown();
-    drop(session);
     if let Some(hangup) = hangup {
         hangup.finish();
     }
-    Ok(waited?)
+    match ended {
+        Ok(code) => RunOutcome::Exited(code),
+        Err(cause) => RunOutcome::EndUnread(cause),
+    }
 }
 
 /// The command on pipes, with its output written to `conn`. A [`Link`] without a terminal of the request's own
 /// connection serialises the two streams' writes, so the pump is the session's own.
-fn on_pipes(
-    conn: &ConnTx,
-    line: &str,
-    cwd: Option<&Path>,
-    starts: &Starts,
-    env: &[(&str, &str)],
-) -> anyhow::Result<i32> {
-    let output = Link::new(conn.try_clone()?, false, (0, 0), None);
-    let mut child = (starts.exec)(line, cwd, None, env).map_err(crate::shell::StartError::into_cause)?;
+fn on_pipes(conn: &mut ConnTx, line: &str, cwd: Option<&Path>, starts: &Starts, env: &[(&str, &str)]) -> RunOutcome {
+    let output = match conn.try_clone() {
+        Ok(tx) => Link::new(tx, false, (0, 0), None),
+        Err(cause) => return RunOutcome::NotStarted(cause),
+    };
+    let mut child = match (starts.exec)(line, cwd, None, env) {
+        Ok(child) => child,
+        Err(cause) => return RunOutcome::NotStarted(cause.into_cause()),
+    };
     let job = child.job();
     let hangup = watch_request(conn, &job);
+    if answer_serving(conn).is_err() {
+        if let Some(w) = teardown_warning(reap_tree(&job)) {
+            tracing::error!("{w}");
+        }
+        if let Some(hangup) = hangup {
+            hangup.finish();
+        }
+        return RunOutcome::EndUnread(client_gone_at_serving());
+    }
     // The command's stdin is closed at once: it is never fed from the session, which is below it.
     drop(child.take_stdin_write());
     // A write that fails is a client that has gone: the command's tree ends, and the pump goes on reading.
@@ -275,7 +276,10 @@ fn on_pipes(
     if let Some(hangup) = hangup {
         hangup.finish();
     }
-    Ok(waited?)
+    match waited {
+        Ok(code) => RunOutcome::Exited(code),
+        Err(cause) => RunOutcome::EndUnread(cause.into()),
+    }
 }
 
 #[cfg(test)]

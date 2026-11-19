@@ -19,6 +19,7 @@
 
 use ssh_broker::offer::text;
 use ssh_broker::provision::canonical_exe;
+use ssh_broker::provision::procwait;
 use ssh_broker::provision::registry::{OPENSSH_KEY, set_default_shell_under};
 
 #[path = "common/account.rs"]
@@ -107,9 +108,15 @@ impl<'a> Started<'a> {
     /// through its call operator; the exit is the elevated command's code, which PowerShell would otherwise make 0
     /// or 1.
     fn elevate_over_ssh(&self, asking: Option<&str>, tail: &str) -> sshd_rig::Outcome {
+        self.elevate_over_ssh_after(asking, "", tail)
+    }
+
+    /// [`Started::elevate_over_ssh`] after the PowerShell statements `before` (each ending in `;`) have run in the
+    /// session.
+    fn elevate_over_ssh_after(&self, asking: Option<&str>, before: &str, tail: &str) -> sshd_rig::Outcome {
         let mut ssh = self.login.command_with(asking);
         ssh.arg("-T").arg("--").arg(format!(
-            "& '{}' elevate {tail}; exit $LASTEXITCODE",
+            "{before}& '{}' elevate {tail}; exit $LASTEXITCODE",
             self.kit.exe.display()
         ));
         run_client(ssh, false, self.kit.dir())
@@ -257,9 +264,31 @@ fn with_a_terminal_the_output_is_below_the_typed_line_and_the_prompt_follows() {
     session.leave();
 }
 
+/// The elevated `ping` that [`ctrl_c_ends_a_command_run_without_a_terminal_and_the_session_goes_on`] runs, found by
+/// its image and by the arguments that test gave it, and held open. This process is elevated, so it can read the
+/// command line of an elevated process, which the unelevated session cannot. It looks again until the ping is listed:
+/// the command prints its marker just before it starts the ping, so the ping may not be there yet.
+fn elevated_ping(arguments: &str) -> procwait::Process {
+    loop {
+        for entry in process_list::snapshot() {
+            if !entry.exe.eq_ignore_ascii_case("ping.exe") {
+                continue;
+            }
+            let Ok(Some(process)) = procwait::Process::open(entry.pid) else {
+                continue;
+            };
+            if procwait::command_line_of(&process).is_ok_and(|line| line.contains(arguments)) {
+                return process;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50)); // sleep-ok: looks again at whether the ping is listed each time, with no cap
+    }
+}
+
 /// Elevated (CI only). Ctrl+C at the terminal ends the `elevate` that is running a command without `--terminal`,
 /// and the command with it, at once; the session goes on. The command is `ping`, whose arguments are this test's
-/// own, so that its end is found by what is left of it.
+/// own. This process looks for it, which the unelevated session could not do for an elevated process: it is there
+/// while the command runs, and gone (its handle signalled, within the fixtures' bound) after Ctrl+C.
 #[test]
 fn ctrl_c_ends_a_command_run_without_a_terminal_and_the_session_goes_on() {
     let _machine = machine::exclusive();
@@ -269,6 +298,7 @@ fn ctrl_c_ends_a_command_run_without_a_terminal_and_the_session_goes_on() {
     let mut session = admin.terminal_session();
     session.type_line("sbk elevate cmd.exe /c \"echo running-%OS%& ping -n 611 127.0.0.1 >nul\"");
     session.read_until("running-Windows_NT");
+    let ping = elevated_ping("-n 611");
 
     // Ctrl+C is the byte the terminal sends for it.
     {
@@ -280,14 +310,14 @@ fn ctrl_c_ends_a_command_run_without_a_terminal_and_the_session_goes_on() {
             .expect("send Ctrl+C");
     }
 
-    // The command is gone when no `ping -n 611` is left; the check is repeated in the session until it holds.
-    session.type_line(concat!(
-        "while (@(Get-CimInstance Win32_Process -Filter \"Name='ping.exe'\" | ",
-        "Where-Object { $_.CommandLine -like '*-n 611*' }).Count) { ",
-        "Start-Sleep -Milliseconds 100 }; ", // sleep-ok: looks again at whether the command is gone each time, with no cap
-        "Write-Output ('ping-' + 'is-gone')",
-    ));
-    session.read_until("ping-is-gone");
+    // The command's tree ends with the request: a wait on the process itself, which fails the test after the bound.
+    bounded_wait::wait_for_exit(
+        ping.handle(),
+        ping.pid,
+        "the elevated command's ping after Ctrl+C",
+        bounded_wait::CHILD_EXIT_BOUND,
+        &[],
+    );
     session.say("THE-SESSION-WENT-ON");
     session.leave();
 }
@@ -352,6 +382,90 @@ fn the_exit_code_of_the_elevated_command_is_the_codes_of_elevate() {
 
     let outcome = admin.elevate_over_ssh(Some("auto-approve"), "cmd.exe /c exit 7");
     assert_eq!(outcome.code, Some(7), "{}", admin.failure(&outcome));
+
+    // A command that did not run exits 126, with a line that says why: a program that is not found is the client's
+    // own refusal, and no code of the agent's can be taken for the command's.
+    let nowhere = admin.elevate_over_ssh(Some("auto-approve"), "nonesuch-elex");
+    assert_eq!(nowhere.code, Some(REFUSED), "{}", admin.failure(&nowhere));
+    assert!(
+        nowhere
+            .stderr
+            .contains(text::elevation_cannot_start("nonesuch-elex: not found on PATH").trim_end()),
+        "{}",
+        admin.failure(&nowhere)
+    );
+}
+
+/// Elevated (CI only). The line runs as it was typed. In a session whose shell is `cmd.exe`, the quotes round an `&`
+/// keep it from being a second command: `elevate cmd /c echo "a&whoami"` prints the text, and `whoami` does not run
+/// (argv joined again would have lost the quotes, and `echo a&whoami` runs both).
+#[test]
+fn the_line_runs_as_typed_from_cmd() {
+    let _machine = machine::exclusive();
+    let (kit, account, _end) = an_administrator("elcm");
+    let admin = Started::start(&kit, &account);
+    // Read when the next login starts its session, after the first one has its prompt.
+    let system_root = std::env::var("SystemRoot").expect("SystemRoot");
+    account.write_user_config(&format!("shell: '{system_root}\\System32\\cmd.exe'\n"));
+
+    let mut ssh = admin.login.command_asking("auto-approve");
+    ssh.arg("-T")
+        .arg("--")
+        .arg(format!("\"{}\" elevate cmd /c echo \"a&whoami\"", kit.exe.display()));
+    let outcome = run_client(ssh, false, kit.dir());
+    let shown = String::from_utf8_lossy(&outcome.stdout).into_owned();
+    assert_eq!(outcome.code, Some(0), "{}", admin.failure(&outcome));
+    assert!(shown.contains("\"a&whoami\""), "{}", admin.failure(&outcome));
+    assert!(
+        !shown.contains(&account.name),
+        "whoami ran, and said who it is: {}",
+        admin.failure(&outcome)
+    );
+}
+
+/// Elevated (CI only). A program is found the way the session finds it, not the way the agent would: a relative path
+/// is the session's folder's, and a bare name is searched on the session's `PATH`. The program is a copy of `whoami`
+/// under a name of this test's own, in a folder of its own, so nothing the agent could find is that name.
+#[test]
+fn the_program_is_found_where_the_session_finds_it() {
+    let _machine = machine::exclusive();
+    let (kit, account, _end) = an_administrator("elpg");
+    let admin = Started::start(&kit, &account);
+
+    let folder = kit.path("probe-folder");
+    std::fs::create_dir(&folder).expect("make the folder of the program");
+    let system_root = std::env::var("SystemRoot").expect("SystemRoot");
+    std::fs::copy(
+        std::path::Path::new(&system_root).join(r"System32\whoami.exe"),
+        folder.join("probe-elpg.exe"),
+    )
+    .expect("copy whoami under a name of this test's own");
+
+    // After `cd` into the folder, a relative path names the program.
+    let relative = admin.elevate_over_ssh_after(
+        Some("auto-approve"),
+        &format!("Set-Location '{}'; ", folder.display()),
+        r".\probe-elpg.exe /groups",
+    );
+    assert!(
+        String::from_utf8_lossy(&relative.stdout).contains(HIGH),
+        "{}",
+        admin.failure(&relative)
+    );
+    assert_eq!(relative.code, Some(0), "{}", admin.failure(&relative));
+
+    // With the folder put on the PATH of the session only, from another folder, the bare name finds it.
+    let bare = admin.elevate_over_ssh_after(
+        Some("auto-approve"),
+        &format!("$env:PATH = '{};' + $env:PATH; ", folder.display()),
+        "probe-elpg /groups",
+    );
+    assert!(
+        String::from_utf8_lossy(&bare.stdout).contains(HIGH),
+        "{}",
+        admin.failure(&bare)
+    );
+    assert_eq!(bare.code, Some(0), "{}", admin.failure(&bare));
 }
 
 /// Elevated (CI only). A login that asked for `always` is at High already: `elevate` runs the command in place and

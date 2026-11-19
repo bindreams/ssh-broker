@@ -265,7 +265,7 @@ fn try_relay_with(
         match interactive(conn, rescued_modes, login)? {
             Interactive::Pumped(pumped) if pumped.no_answer() => {
                 if command.is_some() {
-                    let _ = writeln!(stderr, "{AGENT_ENDED_UNANSWERED}");
+                    let _ = writeln!(stderr, "{}", text::agent_ended_unanswered());
                     return Ok(Some(255));
                 }
                 if closed_before {
@@ -377,7 +377,7 @@ pub(crate) fn relay_exec(
         return Ok(None);
     }
     if pumped.no_answer() {
-        let _ = writeln!(stderr, "{AGENT_ENDED_UNANSWERED}");
+        let _ = writeln!(stderr, "{}", text::agent_ended_unanswered());
         return Ok(Some(255));
     }
     Ok(Some(pumped.code()))
@@ -413,10 +413,6 @@ fn relay_interactive(conn: Socket, rescued_modes: Option<ConsoleModes>, login: &
     let hs = make_handshake(&command, true, Launch::Shell, term(), cols, rows, login.elevation);
     Ok(Interactive::Pumped(run_pty(modes, rx, FrameReader::new(), tx, &hs)?))
 }
-
-/// What an EXEC session says when the agent ended the connection before it answered.
-const AGENT_ENDED_UNANSWERED: &str =
-    "ssh-broker: the agent ended before it answered; the command may or may not have run";
 
 /// The message of a fail-open, for a location that cannot be used or a connect that failed.
 /// Always `Ok(None)`: the caller falls back to a local shell.
@@ -586,8 +582,8 @@ impl LocalChild {
 /// only to wait, would otherwise end with the default handler, and with it the job that holds the
 /// shell. The handler is this process's own; the shell, started later, does not inherit it (unlike
 /// `SetConsoleCtrlHandler(NULL, TRUE)`, which a child inherits and which would stop Ctrl+C reaching
-/// the programs in the shell).
-fn ignore_ctrl_c() {
+/// the programs in the shell). `ssh-broker elevate` keeps through it the same way while its child runs in place.
+pub(crate) fn ignore_ctrl_c() {
     use windows::Win32::System::Console::SetConsoleCtrlHandler;
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {

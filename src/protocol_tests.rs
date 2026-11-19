@@ -543,9 +543,42 @@ fn a_request() -> ElevationRequest {
     ElevationRequest {
         version: PROTOCOL_VERSION,
         session: "0001abcdef102030405060708090a0ff".to_owned(),
-        command: r#"cmd /c echo "a b""#.to_owned(),
+        command: r#""C:\Windows\System32\cmd.exe" /c echo "a b""#.to_owned(),
         cwd: r"C:\Users\me\work".to_owned(),
         terminal: false,
+    }
+}
+
+#[test]
+fn check_refuses_a_command_whose_program_is_not_absolute() {
+    let with = |command: &str| ElevationRequest {
+        command: command.to_owned(),
+        ..a_request()
+    };
+    for good in [
+        r"C:\p.exe",
+        r"C:\p.exe /a b",
+        r#""C:\a b\p.exe" "x y""#,
+        r"C:/dir/p.exe",
+        r"\\server\share\p.exe x",
+    ] {
+        with(good)
+            .check()
+            .unwrap_or_else(|e| panic!("{good:?} names its program by an absolute path: {e:#}"));
+    }
+    for bad in [
+        "cmd /c echo",
+        r".\p.exe",
+        r"dir\p.exe x",
+        "C:p.exe",
+        r"\p.exe",
+        r#""cmd" /c"#,
+        r#""" x"#,
+        r#"" x"#,
+    ] {
+        let error = with(bad).check().expect_err(bad);
+        let said = format!("{error:#}");
+        assert!(said.contains("program") && said.contains("absolute"), "{bad:?}: {said}");
     }
 }
 
@@ -622,8 +655,9 @@ fn an_elevation_request_check_refuses_a_bad_session_an_empty_or_oversized_comman
     );
     // The limit is in UTF-16 units: a character outside the BMP is two.
     let at_limit = "a".repeat(MAX_ELEVATION_UNITS);
+    let command_at_limit = format!(r"C:\{}", &at_limit[3..]);
     let request = ElevationRequest {
-        command: at_limit.clone(),
+        command: command_at_limit.clone(),
         cwd: at_limit.clone(),
         ..a_request()
     };
@@ -631,7 +665,7 @@ fn an_elevation_request_check_refuses_a_bad_session_an_empty_or_oversized_comman
     bad(
         "a command over the limit",
         ElevationRequest {
-            command: format!("{at_limit}a"),
+            command: format!("{command_at_limit}a"),
             ..a_request()
         },
         "command",
@@ -647,7 +681,7 @@ fn an_elevation_request_check_refuses_a_bad_session_an_empty_or_oversized_comman
     bad(
         "a command whose units are over the limit though its characters are not",
         ElevationRequest {
-            command: "\u{1f600}".repeat(MAX_ELEVATION_UNITS / 2 + 1),
+            command: format!(r"C:\{}", "\u{1f600}".repeat(MAX_ELEVATION_UNITS / 2 + 1)),
             ..a_request()
         },
         "command",
