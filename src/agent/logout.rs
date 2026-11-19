@@ -55,7 +55,7 @@ pub(super) struct Control {
     connections: Arc<Connections>,
 }
 
-type Killer = Arc<dyn Fn() + Send + Sync>;
+pub(super) type Killer = Arc<dyn Fn() + Send + Sync>;
 
 #[derive(Default)]
 struct State {
@@ -280,7 +280,8 @@ pub(super) fn handle_logout<R: LimitedRead, W: std::io::Write>(
 /// arrive is: a client sends no input before it has heard the agent's first frame, so nothing is unread
 /// when the reply goes, but one that sent some anyway would have the connection reset by a plain close,
 /// and the reply lost. The read has the drain's bound ([`wait_for_client`]). The connection stays live for
-/// the drain until the read returns, so the process does not end under it.
+/// the drain until the read returns, so the process does not end under it. A client that has gone is not an error
+/// (see [`answer_and_wait`]).
 pub(super) fn refuse_while_ending<R: LimitedRead, W: Write + HalfClose>(
     rx: &mut R,
     tx: &mut W,
@@ -342,7 +343,7 @@ pub(super) fn fail_connection<R: LimitedRead, W: Write + HalfClose>(
     code: i32,
 ) -> anyhow::Error {
     let text = format!("ssh-broker: {what}: {cause:#}\r\n");
-    // A client that has gone cannot be told; the caller logs the cause either way.
+    // The caller logs the cause either way: a failure to tell the client is only logged at debug.
     if let Err(e) = answer_and_wait(rx, tx, control, |tx| reply(tx, &text, code), "a failed connection") {
         tracing::debug!("could not tell the client why its connection failed: {e:#}");
     }
@@ -401,6 +402,10 @@ pub(super) fn fail_socket(conn: Conn, control: &Control, what: &str, cause: anyh
 
 /// Send what `answer` writes (a reply, or a hand-back), FIN the write half and wait for the client to close (see
 /// [`wait_for_client`]).
+///
+/// A client that has gone cannot be told, which is routine (a Ctrl+C ended it while its command ran): when `answer` or
+/// the FIN fails that way it is logged at debug and is no error, and the client is not waited for. Any other failure
+/// is returned.
 fn answer_and_wait<R: LimitedRead, W: Write + HalfClose>(
     rx: &mut R,
     tx: &mut W,
@@ -408,8 +413,13 @@ fn answer_and_wait<R: LimitedRead, W: Write + HalfClose>(
     answer: impl FnOnce(&mut W) -> anyhow::Result<()>,
     who: &str,
 ) -> anyhow::Result<()> {
-    answer(tx)?;
-    tx.shutdown_write()?;
+    if let Err(e) = answer(tx).and_then(|()| tx.shutdown_write()) {
+        if crate::shim::peer_gone(&e).is_none() {
+            return Err(e);
+        }
+        tracing::debug!("the client of {who} has gone; could not answer it: {e:#}");
+        return Ok(());
+    }
     wait_for_client(rx, control, who);
     Ok(())
 }
@@ -428,9 +438,6 @@ fn reply<W: std::io::Write>(tx: &mut W, text: &str, code: i32) -> anyhow::Result
 /// Answer a request that is not a login with `text` and `code`, FIN the write half and wait for the client to close
 /// (see [`wait_for_client`]): the client of `elevate` is inside the session's tree and must be heard out before the
 /// connection goes. The connection counts as live for the drain until the wait returns.
-///
-/// A client that has gone cannot be told, which is routine (a Ctrl+C ended it while its command ran): it is logged at
-/// debug and is no error.
 pub(super) fn reply_and_wait<R: LimitedRead, W: Write + HalfClose>(
     rx: &mut R,
     tx: &mut W,
@@ -438,14 +445,7 @@ pub(super) fn reply_and_wait<R: LimitedRead, W: Write + HalfClose>(
     text: &str,
     code: i32,
 ) -> anyhow::Result<()> {
-    answer_and_wait(rx, tx, control, |tx| reply(tx, text, code), "a request").or_else(|e| {
-        if crate::shim::peer_gone(&e).is_some() {
-            tracing::debug!("the client of a request has gone; could not answer it: {e:#}");
-            Ok(())
-        } else {
-            Err(e)
-        }
-    })
+    answer_and_wait(rx, tx, control, |tx| reply(tx, text, code), "a request")
 }
 
 /// A connection whose waiting reads can be given a limit.

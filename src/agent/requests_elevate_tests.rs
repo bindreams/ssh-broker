@@ -120,6 +120,19 @@ impl Client {
     }
 }
 
+impl Client {
+    /// Read frames until the session's `Exit`, which is kept in `exit`.
+    fn read_to_exit(&mut self) {
+        while self.exit.is_none() {
+            let frame = read_one_frame(&mut self.rx, &mut self.frames)
+                .unwrap_or_else(|e| panic!("the session ended before its exit code ({e:#})"));
+            if frame.kind == FrameKind::Exit {
+                self.exit = Some(crate::protocol::ExitCode::decode(&frame.payload).unwrap().0);
+            }
+        }
+    }
+}
+
 /// A session the agent hosts, a command that waits for its input, with `policy`, and its id.
 struct Hosting {
     control: Arc<Control>,
@@ -806,31 +819,28 @@ fn the_slot_is_free_when_the_command_has_ended_while_its_client_is_still_connect
     session.leave();
 }
 
-/// A client outside the session's job keeps its command alive after the session ended; with `--terminal` the command
-/// then has no carrier, and a failed delivery ends it as the session's own pump does.
+/// A `--terminal` command ends with the session whose screen it holds, whoever asked for it: its asker here is the
+/// test, outside the session's job, and the command is silent, so no failed delivery could end it.
 #[test]
-fn a_terminal_command_whose_session_has_ended_is_ended() {
+fn a_sessions_end_ends_the_terminal_command_it_hosts_even_a_silent_one_and_the_session_gets_its_exit() {
     let _serial = serial();
     let mut session = host("sessionend", Mode::Pty, ElevationPolicy::AutoApprove);
     let id = session.id.to_string();
-    // Prints a line a second, and would end by itself with 77 after twenty.
+    // Says its id, then writes nothing, and would end by itself with 77 after twenty seconds.
     let long = cmd(&format!(
-        "/d /c \"echo running-{id}& ping -n 20 127.0.0.1 & exit /b 77\""
+        "/d /c \"echo running-{id}& ping -n 20 127.0.0.1 >nul & exit /b 77\""
     ));
     let mut pending = open(&session.control, "sessionend", on_a_terminal(&session.id, &long));
     session.client.read_until(&format!("running-{id}"));
 
-    session
-        .control
-        .await_hosted(&session.id)
-        .expect("the session is hosted")
-        .link
-        .end();
+    // The shell ends as `logout` ends it: the session's client stays connected.
+    session.control.end_all();
 
-    // The command's next line cannot be delivered, which ends its tree: the request is answered with the code of
-    // a command that was ended, and not with its own.
-    let (_, code) = pending.read_to_exit();
+    let (kinds, code) = pending.read_to_exit();
+    assert_eq!(kinds.first(), Some(&FrameKind::Serving), "{kinds:?}");
     assert_ne!(code, 77, "the command ran to its own end");
+    session.client.read_to_exit();
+    assert!(session.client.exit.is_some(), "the session got its exit code");
     let _ = pending.hang_up();
     session.leave();
 }

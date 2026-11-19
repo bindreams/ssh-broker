@@ -1345,12 +1345,12 @@ fn handle_pty(
 
     // Do NOT `?` on the end: even when the wait fails the pseudoconsole is closed and the threads joined (see
     // `end_pty`) before this returns, or they would outlive `session` and touch closed handles.
-    let ended = end_pty(session, &target, out_thread);
+    let ended = end_pty(session, &target, out_thread, || link.end_hosting());
     let code = *ended.as_ref().unwrap_or(&1);
     // The shell is gone and the output is drained, so the code is final and nothing else can still be writing
     // frames. The connection is the session's again by now, if `ssh-broker elevate --terminal` had it: the output
-    // pump above could not end before. The `elevate` that asked is inside the session's tree, which was just
-    // reaped, and its request connection closing ends the command (see `elevation::run_hosted`).
+    // pump above could not end before, and `end_hosting` inside `end_pty` ended the command that held it, whoever
+    // asked for it (see `elevation::run_hosted`).
     show_exit_notice(&link, Mode::Pty, configured.as_ref(), code);
     // FIN the write half only: the input pump keeps reading until the client closes, so for a
     // conforming client the socket never closes with unread input, which would reset it and
@@ -1366,15 +1366,25 @@ fn handle_pty(
 }
 
 /// The end of a session in a pseudoconsole, `session`'s or an elevated command's: wait for its process, reap its
-/// tree, close the pseudoconsole (which flushes conhost and ends the output) and join the writer of `target`, join
-/// the output `pump`, and close what `session` holds. Returns the process's exit code, or why it could not be read:
-/// the teardown is done either way.
+/// tree, run `after_reap`, close the pseudoconsole (which flushes conhost and ends the output) and join the writer of
+/// `target`, join the output `pump`, and close what `session` holds. Returns the process's exit code, or why it
+/// could not be read: the teardown is done either way.
+///
+/// `after_reap` is whatever else must end with this process, and it runs before the close, not only before the join:
+/// the close can wait on a pump that is parked and not reading, and the pump of a session's shell waits for the
+/// elevated command that holds its screen (`Link::end_hosting`).
 #[cfg(windows)]
-fn end_pty(session: PtySession, target: &PtyTarget, pump: std::thread::JoinHandle<()>) -> anyhow::Result<i32> {
+fn end_pty(
+    session: PtySession,
+    target: &PtyTarget,
+    pump: std::thread::JoinHandle<()>,
+    after_reap: impl FnOnce(),
+) -> anyhow::Result<i32> {
     let waited = session.wait();
     if let Some(w) = teardown_warning(reap_tree(&session.job())) {
         tracing::error!("{w}");
     }
+    after_reap();
     target.close();
     let _ = pump.join();
     // The writer is joined and the pump is, so nothing reads or writes the handles `session` closes.

@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::link::{Carrier, Link};
+use super::logout::Killer;
 use super::{
     ExecStarter, HangupGuard, ParkSignal, PtyStarter, PtyTarget, answer_serving, close_unserved_pty, end_pty,
     prepare_hangup_watch, reap_tree, spawn_stream_pump, start_hangup_watch, teardown_warning,
@@ -114,8 +115,10 @@ pub(super) enum RunOutcome {
     NotStarted(anyhow::Error),
     /// The command started, ended, and this is its exit code.
     Exited(i32),
-    /// The command started (the client was answered `Serving`, or was gone and could not be) and its end could not be
-    /// read: why.
+    /// The command started and the client could not be told so: its tree was ended and `answer_serving` has logged
+    /// why. Nothing more is written to the client.
+    Unserved,
+    /// The command started (the client was answered `Serving`) and its end could not be read: why.
     EndUnread(anyhow::Error),
 }
 
@@ -125,7 +128,8 @@ pub(super) enum RunOutcome {
 ///
 /// Once the command has started, is contained and runs, and before any output of it is carried, the client is answered
 /// `Serving` on `conn` (see [`FrameKind`](crate::protocol::FrameKind)), in both modes: it is how the client knows the
-/// command ran. When that cannot be written the client is gone, and the command's tree is ended as a session's is.
+/// command ran. When that cannot be written the client is gone: the command's tree is ended as a session's is, and
+/// the outcome is [`RunOutcome::Unserved`].
 ///
 /// The command is started directly with the agent's own token, in the mode the REQUEST asks for, whatever the
 /// session is:
@@ -138,8 +142,8 @@ pub(super) enum RunOutcome {
 ///   repaints its screen.
 ///
 /// The command lives as long as the request that asked for it, and no longer: `conn` is watched, and a client that
-/// has hung up ends the command's tree. `elevate` is a process of the session, so the session's own end ends it
-/// first.
+/// has hung up ends the command's tree. A command with `--terminal` also ends with the session whose screen it
+/// holds, whoever asked for it ([`Link::end_hosting`]).
 pub(super) fn run_hosted(
     link: &Arc<Link>,
     conn: &mut ConnTx,
@@ -160,11 +164,6 @@ pub(super) fn run_hosted(
 /// Watch `conn`, the request's connection, for the client going away, and end `job`'s tree when it does.
 fn watch_request(conn: &ConnTx, job: &Arc<cosca::Job>) -> Option<HangupGuard> {
     start_hangup_watch(prepare_hangup_watch(conn, HangupWatcher::new), job)
-}
-
-/// The client has gone and cannot be told its command started: the command is ended.
-fn client_gone_at_serving() -> anyhow::Error {
-    anyhow::anyhow!("the client went away before it was told that the command had started")
 }
 
 fn on_a_pseudoconsole(
@@ -194,13 +193,22 @@ fn on_a_pseudoconsole(
         if let Some(hangup) = hangup {
             hangup.finish();
         }
-        return RunOutcome::EndUnread(client_gone_at_serving());
+        return RunOutcome::Unserved;
     }
     let out_raw = session.out_read_raw();
     let target = Arc::new(PtyTarget::new(&mut session, ParkSignal::default()));
-    let guard = link.host_elevated(target.clone());
-    // A delivery that fails is a session that has ended, and its command has no screen to run on: its tree ends,
-    // as the session's own does, and the pump goes on reading until the pseudoconsole is closed.
+    // The session's end ends the command ([`Link::end_hosting`]); a command asked for after it is ended by the call.
+    let end: Killer = {
+        let job = Arc::clone(&job);
+        Arc::new(move || {
+            reap_tree(&job);
+        })
+    };
+    let guard = link.host_elevated(target.clone(), end);
+    // A delivery that fails is a connection that has gone, and its command has no screen to run on: its tree ends,
+    // as the session's own pump's does, and the pump goes on reading until the pseudoconsole is closed. The session's
+    // own end is [`Link::end_hosting`]'s, and this is what ends the command when the session's hang-up watch could
+    // not start and its input pump is parked in a send.
     let gone = {
         let job = Arc::clone(&job);
         move || {
@@ -209,8 +217,9 @@ fn on_a_pseudoconsole(
     };
     let pump = spawn_stream_pump(out_raw, Stream::Pty, Arc::clone(link), Carrier::Elevated, gone);
 
-    // The session's own teardown (see `handle_pty`).
-    let ended = end_pty(session, &target, pump);
+    // The session's own teardown (see `handle_pty`), with nothing to end in the link: the command is the one being
+    // ended.
+    let ended = end_pty(session, &target, pump, || {});
     // The connection goes back to the session before the reply is written.
     drop(guard);
     if let Some(hangup) = hangup {
@@ -242,7 +251,7 @@ fn on_pipes(conn: &mut ConnTx, line: &str, cwd: Option<&Path>, starts: &Starts, 
         if let Some(hangup) = hangup {
             hangup.finish();
         }
-        return RunOutcome::EndUnread(client_gone_at_serving());
+        return RunOutcome::Unserved;
     }
     // The command's stdin is closed at once: it is never fed from the session, which is below it.
     drop(child.take_stdin_write());

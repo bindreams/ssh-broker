@@ -112,29 +112,42 @@ fn elevate(rx: &mut ConnRx, tx: &mut ConnTx, control: &Control, request: &Elevat
     }
     // The slot is held while the command runs, and not while the client is waited for: the reply is written, and its
     // client waited for, with the slot free, so that the next `elevate` of the session is not refused for it.
-    let (sentence, code) = {
+    let answer = {
         let Some(_slot) = hosted.slot.try_take() else {
             return refuse(rx, tx, control, &text::elevation_in_progress());
         };
         run_elevated(&hosted, tx, request, &id)
     };
+    // A client that could not be told its command had started is gone: nothing more is written to it.
+    let Some((sentence, code)) = answer else {
+        return Ok(());
+    };
     logout::reply_and_wait(rx, tx, control, &sentence, code)
 }
 
 /// Run the command of `request` for `hosted`, whose slot the caller holds, and say what to answer: the sentence (empty
-/// for a command that ran and ended) and the exit code. Nothing is written to the client but `Serving` and the
-/// command's own output.
-fn run_elevated(hosted: &HostedSession, tx: &mut ConnTx, request: &ElevationRequest, id: &SessionId) -> (String, i32) {
+/// for a command that ran and ended) and the exit code, or `None` when the client could not be told that the command
+/// had started ([`RunOutcome::Unserved`]). Nothing is written to the client but `Serving` and the command's own
+/// output.
+fn run_elevated(
+    hosted: &HostedSession,
+    tx: &mut ConnTx,
+    request: &ElevationRequest,
+    id: &SessionId,
+) -> Option<(String, i32)> {
     // The working directory is the one path the agent acts on: it is the command's folder, which must be one.
     let cwd = child_cwd(&request.cwd, home_dir());
     if !request.cwd.is_empty() && !Path::new(&request.cwd).is_dir() {
         let cause = format!("{} is not an existing directory", request.cwd);
-        return (text::elevation_cannot_start(&cause), REFUSED_EXIT_CODE);
+        return Some((text::elevation_cannot_start(&cause), REFUSED_EXIT_CODE));
     }
     match run_hosted(&hosted.link, tx, request, cwd.as_deref(), &hosted.starts, id) {
-        RunOutcome::Exited(code) => (String::new(), code),
-        RunOutcome::NotStarted(cause) => (text::elevation_cannot_start(&format!("{cause:#}")), REFUSED_EXIT_CODE),
-        RunOutcome::EndUnread(cause) => (text::elevation_end_unread(&format!("{cause:#}")), UNKNOWN_END_EXIT_CODE),
+        RunOutcome::Exited(code) => Some((String::new(), code)),
+        RunOutcome::NotStarted(cause) => Some((text::elevation_cannot_start(&format!("{cause:#}")), REFUSED_EXIT_CODE)),
+        RunOutcome::Unserved => None,
+        RunOutcome::EndUnread(cause) => {
+            Some((text::elevation_end_unread(&format!("{cause:#}")), UNKNOWN_END_EXIT_CODE))
+        }
     }
 }
 

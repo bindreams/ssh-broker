@@ -11,7 +11,7 @@
 //! code. A shell that is not under ssh-broker, whatever its level, is refused: the session id
 //! ([`SESSION_VARIABLE`]) is how the agent knows which session asks.
 //!
-//! The line that runs is the one that was typed after `elevate` ([`program_line`]), as written, with its program
+//! The line that runs is the one that was typed after `elevate` ([`find_program`]), as written, with its program
 //! found the way the session finds it. `elevate` exits with the command's own exit code, with
 //! [`REFUSED_EXIT_CODE`] when the command did not run, and with [`UNKNOWN_END_EXIT_CODE`] when it cannot tell how
 //! the command ended, each after a line that says why.
@@ -20,7 +20,7 @@ use std::ffi::OsStr;
 use std::io::{Read, Write};
 use std::path::Path;
 
-use crate::cmdline::split_program;
+use crate::cmdline::{SEPARATORS, next_arg};
 use crate::console_prompt::is_no_agent;
 use crate::offer::text;
 use crate::protocol::{
@@ -146,33 +146,56 @@ pub fn requestable(request_sock: bool, agent_sock: bool) -> Result<(), Refused> 
     }
 }
 
-/// The line `line` (what was typed after `elevate`, as written) with its program found the way the session finds
-/// it: `"<absolute path>"` and then the rest of the line exactly as typed. A program with a `\`, `/` or `:` is a
-/// path, made absolute against this process's working directory (the system's rule, `C:x` and `\x` included); a
-/// bare one is searched on `PATH` only, as the shell does, with `.exe` added when it has no extension. Neither the
-/// current directory nor this program's own is searched for a bare name.
+/// A typed line with its program found: the program's absolute path, and the rest of the line exactly as written.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Found<'a> {
+    /// The absolute path of the program, which holds no `"`.
+    pub program: String,
+    /// What followed the program in the typed line: empty, or beginning with a separator.
+    pub rest: &'a str,
+}
+
+impl Found<'_> {
+    /// The line the agent is sent: `"<program>"` and then the rest as typed.
+    pub fn line(&self) -> String {
+        format!("\"{}\"{}", self.program, self.rest)
+    }
+}
+
+/// The program of `line` (what was typed after `elevate`, as written), found the way the session finds it. The
+/// first token of the typed line is an argument of this process (read by [`next_arg`]'s rule, as argv read it), not
+/// the program of a line handed to `CreateProcessW`. A program with a `\`, `/` or `:` is a path, made absolute
+/// against this process's working directory (the system's rule, `C:x` and `\x` included); a bare one is searched on
+/// `PATH` only, as the shell does, with `.exe` added when it has no extension. Neither the current directory nor
+/// this program's own is searched for a bare name.
 ///
 /// A program that only the shell finds (`dir`) or that `PATHEXT` completes (`npm` for `npm.cmd`) is refused and
 /// nothing runs: name the file (`npm.cmd`), or run it through the shell (`cmd /c dir`).
-pub fn program_line(host: &dyn Host, line: &str) -> Result<String, Refused> {
-    let (program, rest) = split_program(line);
+pub fn find_program<'a>(host: &dyn Host, line: &'a str) -> Result<Found<'a>, Refused> {
+    debug_assert!(
+        !line.trim_matches(SEPARATORS).is_empty(),
+        "route sends no blank command"
+    );
+    let (program, rest) = next_arg(line).unwrap_or_default();
     let cannot = |reason: &dyn std::fmt::Display| Refused::CannotStart(format!("{program}: {reason}"));
     let named = if program.contains(['\\', '/', ':']) {
-        let absolute = std::path::absolute(program).map_err(|e| cannot(&e))?;
+        let absolute = std::path::absolute(&program).map_err(|e| cannot(&e))?;
         absolute
             .to_str()
             .map(str::to_owned)
             .ok_or_else(|| cannot(&"the path is not valid Unicode"))?
     } else {
-        program.to_owned()
+        program.clone()
     };
     let found = shell::resolve_program(host, &named).map_err(|reason| cannot(&reason))?;
     let found = found.to_str().ok_or_else(|| cannot(&"the path is not valid Unicode"))?;
-    // A path cannot hold `"`, so the quoted token is always one program name.
-    Ok(format!("\"{found}\"{rest}"))
+    Ok(Found {
+        program: found.to_owned(),
+        rest,
+    })
 }
 
-/// The request that runs `line` (see [`program_line`]) in `cwd` for session `id`, on a screen of its own when
+/// The request that runs `line` (see [`Found::line`]) in `cwd` for session `id`, on a screen of its own when
 /// `terminal`.
 pub fn request_for(id: &SessionId, terminal: bool, line: &str, cwd: &str) -> ElevationRequest {
     ElevationRequest {
@@ -290,41 +313,40 @@ fn start(terminal: bool, command: &str) -> Result<i32, Refused> {
         .map_err(|e| Refused::CannotStart(text::elevation_unreadable_clause(&format!("{e:#}"))))?;
     let session = std::env::var_os(SESSION_VARIABLE);
     let (id, course) = course(session.as_deref(), integrity)?;
-    let line = program_line(&shell::WindowsHost, command)?;
+    let found = find_program(&shell::WindowsHost, command)?;
     match course {
-        Course::InPlace => run_in_place(&line),
-        Course::ViaAgent => via_agent(&id, terminal, &line),
+        Course::InPlace => run_in_place(&found),
+        Course::ViaAgent => via_agent(&id, terminal, &found),
     }
 }
 
-/// Start `line` (see [`program_line`]) as a child of this process, on its console, and wait for it. A process at
+/// Start `found` as a child of this process, on its console, and wait for it. A process at
 /// High has the console to give, so `--terminal` changes nothing here. While the child runs, Ctrl+C and Ctrl+Break
 /// are the child's, which shares the console, and not this process's: it ends when the child does, with its code.
-fn run_in_place(line: &str) -> Result<i32, Refused> {
+fn run_in_place(found: &Found) -> Result<i32, Refused> {
     use std::os::windows::process::CommandExt;
-    let (program, rest) = split_program(line);
-    let mut command = std::process::Command::new(program);
-    let rest = rest.trim_start_matches([' ', '\t']);
+    let mut command = std::process::Command::new(&found.program);
+    let rest = found.rest.trim_start_matches(SEPARATORS);
     if !rest.trim().is_empty() {
         command.raw_arg(rest);
     }
     crate::shim_pty::ignore_ctrl_c();
     let status = command
         .status()
-        .map_err(|e| Refused::CannotStart(format!("{program}: {e}")))?;
+        .map_err(|e| Refused::CannotStart(format!("{}: {e}", found.program)))?;
     Ok(status.code().unwrap_or(1))
 }
 
-/// Ask the agent to run `line` (see [`program_line`]), in this process's working directory, and exit as its answer
+/// Ask the agent to run `found` (see [`Found::line`]), in this process's working directory, and exit as its answer
 /// says ([`ElevateOutcome`]). The command's output is printed here, to this process's stdout and stderr.
 ///
 /// The request socket is the one of the plain folder, asked first when it is there (see [`requestable`]).
-fn via_agent(id: &SessionId, terminal: bool, line: &str) -> Result<i32, Refused> {
+fn via_agent(id: &SessionId, terminal: bool, found: &Found) -> Result<i32, Refused> {
     let cwd = std::env::current_dir().map_err(|e| Refused::CannotStart(format!("the working directory: {e}")))?;
     let cwd = cwd
         .to_str()
         .ok_or_else(|| Refused::CannotStart(format!("the working directory {} is not valid Unicode", cwd.display())))?;
-    let request = request_for(id, terminal, line, cwd);
+    let request = request_for(id, terminal, &found.line(), cwd);
 
     let folder = match crate::userdir::inspect_current_socket_dir() {
         Ok(folder) => folder,

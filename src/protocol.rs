@@ -15,7 +15,8 @@ pub const MAX_FRAME: u32 = 1 << 20;
 /// starts nothing and the client should run the session itself. A refusal is the other possible start: data
 /// frames (the shell's warnings, then the reason on stderr) and `Exit`, never `Serving`. Any first frame ends
 /// the client's wait, and a client sends no input before it. `Serving` and `HandBack` anywhere but first are protocol errors. [`Mode::Logout`] is not answered this
-/// way.
+/// way. A `Request` is answered the same way (a refusal, or `Serving` once the command has started, then its output
+/// and its exit code), and that is how the client tells "ran" from "did not run".
 ///
 /// `Request` (payload: an [`ElevationRequest`]) is a first frame instead of a handshake, on the request socket
 /// only; the agent reads it as it reads a handshake, and in a stream it is a protocol error.
