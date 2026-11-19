@@ -15,6 +15,7 @@
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 
 use super::HalfClose;
+use super::logout::Killer;
 use crate::protocol::{Resize, Stream};
 use crate::relay::write_data;
 
@@ -38,14 +39,30 @@ pub(super) trait InputTarget: Send + Sync {
 /// What the elevated command's keys and size go to while it runs.
 pub(super) type ElevatedTarget = Arc<dyn InputTarget>;
 
+/// The elevated command the connection carries: where its input goes, and the means to end it.
+struct Hosted {
+    target: ElevatedTarget,
+    end: Killer,
+}
+
 struct State {
     carrier: Carrier,
     /// The session is over: nothing waits any more, and nothing new is waited for.
     ended: bool,
+    /// The session's shell is gone ([`Link::end_hosting`]): the command hosted now is ended, and none is hosted after.
+    hosting_ended: bool,
     /// The client's size, as it last reported it.
     size: (u16, u16),
     /// Set while the connection carries the elevated command.
-    elevated: Option<ElevatedTarget>,
+    elevated: Option<Hosted>,
+}
+
+impl State {
+    /// Whether a deliver for `carrier` can never go on: the link is over, or the session's end left the elevated
+    /// command it is for unhosted.
+    fn over_for(&self, carrier: Carrier) -> bool {
+        self.ended || (carrier == Carrier::Elevated && self.hosting_ended && self.elevated.is_none())
+    }
 }
 
 /// A session's connection. See the module.
@@ -87,6 +104,7 @@ impl Link {
             state: Mutex::new(State {
                 carrier: Carrier::Session,
                 ended: false,
+                hosting_ended: false,
                 size,
                 elevated: None,
             }),
@@ -137,7 +155,7 @@ impl Link {
 
     fn admit(&self, carrier: Carrier) -> Admit {
         let state = locked(&self.state);
-        if state.ended {
+        if state.over_for(carrier) {
             Admit::Ended
         } else if !self.terminal || state.carrier == carrier {
             Admit::Go
@@ -152,7 +170,7 @@ impl Link {
         }
         let mut state = locked(&self.state);
         loop {
-            if state.ended {
+            if state.over_for(carrier) {
                 anyhow::bail!("the session has ended");
             }
             if state.carrier == carrier {
@@ -175,7 +193,10 @@ impl Link {
     /// pseudoconsole is closed while it is still current), which is no fault of the session: the keys are dropped,
     /// and the caller, which stops delivering input for good on an error, goes on.
     pub(super) fn route_input(&self, bytes: &[u8]) -> anyhow::Result<()> {
-        let elevated = locked(&self.state).elevated.clone();
+        let elevated = locked(&self.state)
+            .elevated
+            .as_ref()
+            .map(|hosted| Arc::clone(&hosted.target));
         match (elevated, &self.session) {
             (Some(target), _) => {
                 if let Err(e) = target.input(bytes) {
@@ -195,7 +216,7 @@ impl Link {
             let mut state = locked(&self.state);
             state.size = (size.cols, size.rows);
             match &state.elevated {
-                Some(elevated) => Some(Arc::clone(elevated)),
+                Some(hosted) => Some(Arc::clone(&hosted.target)),
                 None => self.session.clone(),
             }
         };
@@ -205,20 +226,50 @@ impl Link {
     }
 
     /// From now on the connection carries the elevated command's output and `target` gets the client's keys and
-    /// size, which it is given now. Dropping the guard switches back. Only a link with a terminal has a screen to
-    /// hand over: `decide` refuses the request that would come here for one without.
-    pub(super) fn host_elevated(&self, target: ElevatedTarget) -> ElevatedGuard<'_> {
+    /// size, which it is given now; `end` ends the command, and [`Link::end_hosting`] calls it. Dropping the guard
+    /// switches back. Only a link with a terminal has a screen to hand over: `decide` refuses the request that would
+    /// come here for one without.
+    ///
+    /// `None` when the session's shell is gone already ([`Link::end_hosting`]): nothing is hosted, and this calls
+    /// `end` itself, so a command that asks too late is ended as one hosted when the session ended is.
+    pub(super) fn host_elevated(&self, target: ElevatedTarget, end: Killer) -> Option<ElevatedGuard<'_>> {
         debug_assert!(self.terminal, "a command was hosted on a link without a terminal");
-        let _applying = locked(&self.resizing);
+        let applying = locked(&self.resizing);
         let (cols, rows) = {
             let mut state = locked(&self.state);
+            if state.hosting_ended {
+                drop(state);
+                drop(applying);
+                end();
+                return None;
+            }
             state.carrier = Carrier::Elevated;
-            state.elevated = Some(Arc::clone(&target));
+            state.elevated = Some(Hosted {
+                target: Arc::clone(&target),
+                end,
+            });
             state.size
         };
         self.changed.notify_all();
         target.resize(cols, rows);
-        ElevatedGuard { link: self }
+        drop(applying);
+        Some(ElevatedGuard { link: self })
+    }
+
+    /// The session's shell is gone: the command hosted now is ended, and none is hosted after (a command that asks
+    /// is ended at once by [`Link::host_elevated`], and a deliver for it fails). It does not switch the connection
+    /// back: dropping the guard is the one place that does.
+    pub(super) fn end_hosting(&self) {
+        let end = {
+            let mut state = locked(&self.state);
+            state.hosting_ended = true;
+            state.elevated.as_ref().map(|hosted| Arc::clone(&hosted.end))
+        };
+        // A deliver of the command's that waits for the screen is told there is none.
+        self.changed.notify_all();
+        if let Some(end) = end {
+            end();
+        }
     }
 
     /// The session is over: every wait ends with an error and none begins.
@@ -243,13 +294,13 @@ impl Drop for ElevatedGuard<'_> {
     fn drop(&mut self) {
         let link = self.link;
         let _applying = locked(&link.resizing);
-        let (cols, rows) = {
+        let (hosted, (cols, rows)) = {
             let mut state = locked(&link.state);
             state.carrier = Carrier::Session;
-            state.elevated = None;
-            state.size
+            (state.elevated.take(), state.size)
         };
         link.changed.notify_all();
+        drop(hosted);
         if let Some(session) = &link.session {
             session.resize(cols, rows);
         }

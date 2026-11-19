@@ -294,18 +294,25 @@ fn with_a_terminal_the_output_is_below_the_typed_line_and_the_prompt_follows() {
 /// The elevated `ping` that [`ctrl_c_ends_a_command_run_without_a_terminal_and_the_session_goes_on`] runs, found by
 /// its image and by the arguments that test gave it, and held open. This process is elevated, so it can read the
 /// command line of an elevated process, which the unelevated session cannot. It looks again until the ping is listed:
-/// the command prints its marker just before it starts the ping, so the ping may not be there yet.
+/// the command prints its marker just before it starts the ping, so the ping may not be there yet. A process that has
+/// exited between the list and the look is the one routine cause of a failure and is skipped; any other failure is a
+/// panic with its cause.
 fn elevated_ping(arguments: &str) -> procwait::Process {
     loop {
         for entry in process_list::snapshot() {
             if !entry.exe.eq_ignore_ascii_case("ping.exe") {
                 continue;
             }
-            let Ok(Some(process)) = procwait::Process::open(entry.pid) else {
+            let opened = procwait::Process::open(entry.pid)
+                .unwrap_or_else(|e| panic!("could not open the process {} to look at it: {e:#}", entry.pid));
+            let Some(process) = opened else {
                 continue;
             };
-            if procwait::command_line_of(&process).is_ok_and(|line| line.contains(arguments)) {
-                return process;
+            match procwait::command_line_of(&process) {
+                Ok(line) if line.contains(arguments) => return process,
+                Ok(_) => {}
+                Err(_) if process.exit_code().is_ok() => {}
+                Err(e) => panic!("could not read the command line of the process {}: {e:#}", entry.pid),
             }
         }
         std::thread::sleep(std::time::Duration::from_millis(50)); // sleep-ok: looks again at whether the ping is listed each time, with no cap
@@ -451,8 +458,9 @@ fn the_line_runs_as_typed_from_cmd() {
 }
 
 /// Elevated (CI only). A program is found the way the session finds it, not the way the agent would: a relative path
-/// is the session's folder's, and a bare name is searched on the session's `PATH`. The program is a copy of `whoami`
-/// under a name of this test's own, in a folder of its own, so nothing the agent could find is that name.
+/// is the session's folder's, and a bare name is searched on the session's `PATH`. The program is a copy of `cmd.exe`
+/// (which needs no file beside it) under a name of this test's own, in a folder of its own, so nothing the agent could
+/// find is that name; the copy runs the real `whoami`, which prints the High label.
 #[test]
 fn the_program_is_found_where_the_session_finds_it() {
     let _machine = machine::exclusive();
@@ -463,16 +471,16 @@ fn the_program_is_found_where_the_session_finds_it() {
     std::fs::create_dir(&folder).expect("make the folder of the program");
     let system_root = std::env::var("SystemRoot").expect("SystemRoot");
     std::fs::copy(
-        std::path::Path::new(&system_root).join(r"System32\whoami.exe"),
+        std::path::Path::new(&system_root).join(r"System32\cmd.exe"),
         folder.join("probe-elpg.exe"),
     )
-    .expect("copy whoami under a name of this test's own");
+    .expect("copy cmd.exe under a name of this test's own");
 
     // After `cd` into the folder, a relative path names the program.
     let relative = admin.elevate_over_ssh_after(
         Some("auto-approve"),
         &format!("Set-Location '{}'; ", folder.display()),
-        r".\probe-elpg.exe /groups",
+        r".\probe-elpg.exe /c whoami /groups",
     );
     assert!(
         String::from_utf8_lossy(&relative.stdout).contains(HIGH),
@@ -485,7 +493,7 @@ fn the_program_is_found_where_the_session_finds_it() {
     let bare = admin.elevate_over_ssh_after(
         Some("auto-approve"),
         &format!("$env:PATH = '{};' + $env:PATH; ", folder.display()),
-        "probe-elpg /groups",
+        "probe-elpg /c whoami /groups",
     );
     assert!(
         String::from_utf8_lossy(&bare.stdout).contains(HIGH),

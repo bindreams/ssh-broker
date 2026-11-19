@@ -4,11 +4,10 @@
 //! `route` receives is derived from it the way the C runtime would.
 
 use super::{AgentArgs, AutoLoginArgs, BackgroundArgs, ProbeLink, Route, Toggle, Verb, route};
-use crate::cmdline::{Encoding, RawExec, resolve_exec, split_args};
+use crate::cmdline::{Encoding, RawExec, after_program, resolve_exec, split_args};
 
 fn route_line(line: &str) -> Route {
-    let args = split_args(line);
-    route(&args[1..], line)
+    route(&split_args(after_program(line)), line)
 }
 
 /// The `-c` route that carries `tail`, the text after `-c` as written.
@@ -195,6 +194,25 @@ fn elevate_carries_the_line_as_written_not_argv() {
         Route::Elevate {
             terminal: true,
             command: r#"p   "a  b"  \"c\""#.into()
+        }
+    );
+}
+
+/// argv's program name is partly quoted: the text after `elevate` is still cut from where argv put it.
+#[test]
+fn the_programs_own_name_may_be_partly_quoted() {
+    assert_eq!(
+        route_line(r#"C:\tools\"my bin"\ssh-broker.exe elevate whoami"#),
+        Route::Elevate {
+            terminal: false,
+            command: "whoami".into()
+        }
+    );
+    assert_eq!(
+        route_line(r#"C:\"a b"\"c d"\ssh-broker.exe elevate whoami /all"#),
+        Route::Elevate {
+            terminal: false,
+            command: "whoami /all".into()
         }
     );
 }

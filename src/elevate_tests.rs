@@ -115,24 +115,40 @@ fn a_bare_program_is_found_on_the_path_and_the_rest_is_kept() {
         .with_program("probe", r"C:\Program Files\tools\probe.exe")
         .with_file(r"C:\other\tool.exe", "MZ");
     assert_eq!(
-        program_line(&host, r#"probe  /groups   "a  b" "a&b""#),
+        line_of(&host, r#"probe  /groups   "a  b" "a&b""#),
         Ok(r#""C:\Program Files\tools\probe.exe"  /groups   "a  b" "a&b""#.to_owned()),
         "the program is the path that was found, quoted; everything after it is as typed"
     );
     assert_eq!(
-        program_line(&host, "probe"),
+        line_of(&host, "probe"),
         Ok(r#""C:\Program Files\tools\probe.exe""#.to_owned())
     );
     assert_eq!(
-        program_line(&host, r#""probe" /x"#),
+        line_of(&host, r#""probe" /x"#),
         Ok(r#""C:\Program Files\tools\probe.exe" /x"#.to_owned()),
         "a quoted program is the same program"
     );
     assert_eq!(
-        program_line(&host, r"C:\other\tool /x"),
+        line_of(&host, r"C:\other\tool /x"),
         Ok(r#""C:\other\tool.exe" /x"#.to_owned()),
         "an absolute name without an extension finds the .exe, as the system does"
     );
+}
+
+/// The typed line is the tail of `ssh-broker`'s own command line: its first token is an argument, and quotes toggle
+/// anywhere in it, as in cmd.exe's `"C:\Program Files"\nodejs\node.exe`.
+#[test]
+fn a_partly_quoted_program_path_is_one_program() {
+    let host = TestHost::new().with_file(r"C:\Program Files\tool\x.exe", "MZ");
+    let found = find_program(&host, r#""C:\Program Files"\tool\x.exe -v"#).expect("the file is there");
+    assert_eq!(found.program, r"C:\Program Files\tool\x.exe");
+    assert_eq!(found.rest, " -v");
+    assert_eq!(found.line(), r#""C:\Program Files\tool\x.exe" -v"#);
+}
+
+/// The line is what was typed after the program, kept as it was, and the program is found and quoted.
+fn line_of(host: &TestHost, typed: &str) -> Result<String, Refused> {
+    find_program(host, typed).map(|found| found.line())
 }
 
 #[test]
@@ -142,13 +158,13 @@ fn a_relative_program_is_made_absolute_against_the_working_directory() {
     let host = TestHost::new().with_file(probe.to_str().unwrap(), "MZ");
     for typed in [r".\sub\probe.exe", r"sub\probe.exe", "sub/probe.exe"] {
         assert_eq!(
-            program_line(&host, &format!("{typed} /groups")),
+            line_of(&host, &format!("{typed} /groups")),
             Ok(format!(r#""{}" /groups"#, probe.display())),
             "{typed}"
         );
     }
     assert_eq!(
-        program_line(&host, r".\sub\absent.exe /x"),
+        line_of(&host, r".\sub\absent.exe /x"),
         Err(Refused::CannotStart(
             r".\sub\absent.exe: there is no such file".to_owned()
         )),
@@ -159,7 +175,7 @@ fn a_relative_program_is_made_absolute_against_the_working_directory() {
 #[test]
 fn a_program_that_is_not_found_is_refused_naming_it() {
     let host = TestHost::new();
-    let refused = program_line(&host, "whoamii /all").unwrap_err();
+    let refused = line_of(&host, "whoamii /all").unwrap_err();
     assert_eq!(refused, Refused::CannotStart("whoamii: not found on PATH".to_owned()));
     assert_eq!(
         refused.text(),

@@ -537,42 +537,81 @@ fn a_hand_back_to_a_client_that_has_gone_is_not_an_error() {
     hand_back(&mut Closed, &mut Gone, &Control::standalone(), "why").unwrap();
 }
 
-/// The reply of a request to a client that has gone (a Ctrl+C ended `elevate` while its command ran) is routine: it is
-/// logged at debug and the handler ends cleanly. A write that fails for another reason is still the handler's error.
+/// An answer to a client that has gone (a Ctrl+C ended `elevate` while its command ran) is routine, whichever answer it
+/// is: it is logged at debug and the handler ends cleanly. A write or a FIN that fails for another reason is still the
+/// handler's error.
 #[test]
-fn a_reply_to_a_client_that_has_gone_is_not_an_error_and_any_other_failed_write_is() {
-    struct Failing(std::io::ErrorKind);
+fn an_answer_to_a_client_that_has_gone_is_not_an_error_and_any_other_failed_write_is() {
+    use std::io::ErrorKind;
+    /// A connection whose writes fail with `write` and whose FIN fails with `fin`, when they are set.
+    struct Failing {
+        write: Option<ErrorKind>,
+        fin: Option<ErrorKind>,
+    }
     impl Write for Failing {
-        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
-            Err(self.0.into())
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.write.map_or(Ok(bytes.len()), |kind| Err(kind.into()))
         }
         fn flush(&mut self) -> std::io::Result<()> {
-            Err(self.0.into())
+            self.write.map_or(Ok(()), |kind| Err(kind.into()))
         }
     }
     impl HalfClose for Failing {
         fn shutdown_write(&self) -> anyhow::Result<()> {
-            Ok(())
+            self.fin.map_or(Ok(()), |kind| Err(std::io::Error::from(kind).into()))
         }
     }
     let control = Control::standalone();
-    for kind in [
-        std::io::ErrorKind::BrokenPipe,
-        std::io::ErrorKind::ConnectionReset,
-        std::io::ErrorKind::ConnectionAborted,
-    ] {
-        let (log, result) = logged(|| reply_and_wait(&mut Closed, &mut Failing(kind), &control, "", 0));
-        result.unwrap_or_else(|e| panic!("{kind:?}: a client that has gone is not a fault: {e:#}"));
-        assert!(!log.contains("WARN") && !log.contains("ERROR"), "{kind:?}: {log}");
+    // Both answers go through `answer_and_wait`: the first is a request's reply, the second a refused login's.
+    let answer = |reply: bool, tx: &mut Failing| {
+        if reply {
+            reply_and_wait(&mut Closed, tx, &control, "", 0)
+        } else {
+            refuse_while_ending(&mut Closed, tx, &control)
+        }
+    };
+    for (what, is_reply) in [("a reply", true), ("a refusal while ending", false)] {
+        let answer = |tx: &mut Failing| answer(is_reply, tx);
+        let gone = [
+            ErrorKind::BrokenPipe,
+            ErrorKind::ConnectionReset,
+            ErrorKind::ConnectionAborted,
+        ]
+        .map(|kind| {
+            (
+                format!("a write that fails with {kind:?}"),
+                Failing {
+                    write: Some(kind),
+                    fin: None,
+                },
+            )
+        })
+        .into_iter()
+        .chain([(
+            "a FIN that fails with BrokenPipe".to_owned(),
+            Failing {
+                write: None,
+                fin: Some(ErrorKind::BrokenPipe),
+            },
+        )]);
+        for (row, mut tx) in gone {
+            let (log, result) = logged(|| answer(&mut tx));
+            result.unwrap_or_else(|e| panic!("{what}, {row}: a client that has gone is not a fault: {e:#}"));
+            assert!(!log.contains("WARN") && !log.contains("ERROR"), "{what}, {row}: {log}");
+        }
+        for mut tx in [
+            Failing {
+                write: Some(ErrorKind::PermissionDenied),
+                fin: None,
+            },
+            Failing {
+                write: None,
+                fin: Some(ErrorKind::PermissionDenied),
+            },
+        ] {
+            answer(&mut tx).expect_err(&format!("{what}: a failure for another reason is an error"));
+        }
     }
-    reply_and_wait(
-        &mut Closed,
-        &mut Failing(std::io::ErrorKind::PermissionDenied),
-        &control,
-        "",
-        0,
-    )
-    .expect_err("a write that fails for another reason is an error");
 }
 
 #[test]

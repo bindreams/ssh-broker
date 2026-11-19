@@ -3,7 +3,7 @@
 use super::super::test_wire::{Recorder, Wire};
 use super::*;
 use crate::protocol::{ExitCode, FrameKind, Resize, Stream};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 
 /// A terminal link over `wire` of 80x24 whose session target is `session`.
@@ -32,13 +32,18 @@ fn deliver_parked(
     (thread, on_parked)
 }
 
+/// Host `target` on `link`, with an end that does nothing: the link is not at its end.
+fn host(link: &Link, target: ElevatedTarget) -> ElevatedGuard<'_> {
+    link.host_elevated(target, Arc::new(|| {})).expect("hosted")
+}
+
 // Whose bytes the connection carries -----
 
 #[test]
 fn deliver_blocks_the_other_carrier_until_the_switch_back() {
     let (wire, session) = (Wire::default(), Arc::new(Recorder::default()));
     let link = terminal_link(&wire, &session);
-    let guard = link.host_elevated(Arc::new(Recorder::default()));
+    let guard = host(&link, Arc::new(Recorder::default()));
 
     let (blocked, on_parked) = deliver_parked(&link, Carrier::Session, "session");
     on_parked.recv().expect("the session's deliver is about to wait");
@@ -61,7 +66,7 @@ fn no_session_byte_is_written_while_elevated_and_none_of_the_elevated_after() {
     let link = terminal_link(&wire, &session);
     link.deliver(Carrier::Session, Stream::Pty, b"before").unwrap();
 
-    let guard = link.host_elevated(Arc::new(Recorder::default()));
+    let guard = host(&link, Arc::new(Recorder::default()));
     link.deliver(Carrier::Elevated, Stream::Pty, b"elevated").unwrap();
     let (session_waits, on_parked) = deliver_parked(&link, Carrier::Session, "held");
     on_parked.recv().unwrap();
@@ -95,7 +100,7 @@ fn without_a_terminal_no_carrier_waits() {
 fn end_wakes_a_blocked_deliver_with_an_error() {
     let (wire, session) = (Wire::default(), Arc::new(Recorder::default()));
     let link = terminal_link(&wire, &session);
-    let _guard = link.host_elevated(Arc::new(Recorder::default()));
+    let _guard = host(&link, Arc::new(Recorder::default()));
     let (blocked, on_parked) = deliver_parked(&link, Carrier::Session, "never");
     on_parked.recv().unwrap();
 
@@ -130,7 +135,7 @@ fn input_and_resize_go_to_the_elevated_target_while_it_runs_and_back_after() {
     let link = terminal_link(&wire, &session);
     link.route_input(b"a").unwrap();
 
-    let guard = link.host_elevated(elevated.clone());
+    let guard = host(&link, elevated.clone());
     link.route_input(b"b").unwrap();
     link.resize(Resize { cols: 100, rows: 40 });
     assert_eq!(session.events(), ["input a"], "the session gets nothing while elevated");
@@ -153,7 +158,7 @@ fn an_input_error_of_the_elevated_target_is_not_the_sessions_and_the_session_get
     let (wire, session) = (Wire::default(), Arc::new(Recorder::default()));
     let link = terminal_link(&wire, &session);
     let elevated = Arc::new(Recorder::failing());
-    let guard = link.host_elevated(elevated.clone());
+    let guard = host(&link, elevated.clone());
 
     link.route_input(b"x")
         .expect("the command is ending: its error is not the caller's");
@@ -182,7 +187,7 @@ fn the_size_at_the_switch_is_applied_to_the_new_target() {
     link.resize(Resize { cols: 120, rows: 30 });
     assert_eq!(session.events(), ["resize 120x30"]);
 
-    let _guard = link.host_elevated(elevated.clone());
+    let _guard = host(&link, elevated.clone());
     assert_eq!(elevated.events(), ["resize 120x30"]);
 }
 
@@ -192,7 +197,7 @@ fn the_size_at_the_switch_is_applied_to_the_new_target() {
 fn the_switch_back_gives_the_session_its_size_even_unchanged() {
     let (wire, session) = (Wire::default(), Arc::new(Recorder::default()));
     let link = terminal_link(&wire, &session);
-    drop(link.host_elevated(Arc::new(Recorder::default())));
+    drop(host(&link, Arc::new(Recorder::default())));
     assert_eq!(session.events(), ["resize 80x24"]);
 }
 
@@ -202,7 +207,48 @@ fn the_switch_back_gives_the_session_its_size_even_unchanged() {
 #[should_panic(expected = "without a terminal")]
 fn hosting_a_command_on_a_link_without_a_terminal_is_a_bug() {
     let link = Link::new(Wire::default(), false, (0, 0), None);
-    let _guard = link.host_elevated(Arc::new(Recorder::default()));
+    let _guard = host(&link, Arc::new(Recorder::default()));
+}
+
+/// The session's shell is gone: the command hosted now is ended, none is hosted after, and what is left of the
+/// connection is the session's.
+#[test]
+fn after_end_hosting_nothing_is_hosted_and_a_command_that_asks_is_ended_at_once() {
+    let (wire, session) = (Wire::default(), Arc::new(Recorder::default()));
+    let link = terminal_link(&wire, &session);
+    let ends = Arc::new(AtomicUsize::new(0));
+    let counting = || -> Killer {
+        let ends = Arc::clone(&ends);
+        Arc::new(move || {
+            ends.fetch_add(1, Ordering::SeqCst);
+        })
+    };
+
+    // A hosted command is ended once, and the guard's drop is still what switches back.
+    let guard = link
+        .host_elevated(Arc::new(Recorder::default()), counting())
+        .expect("hosted");
+    link.end_hosting();
+    assert_eq!(ends.load(Ordering::SeqCst), 1, "the hosted command was ended");
+    link.deliver(Carrier::Elevated, Stream::Pty, b"last words")
+        .expect("the hosted command still has the screen until its guard drops");
+    drop(guard);
+    assert_eq!(ends.load(Ordering::SeqCst), 1, "the guard's drop ends nothing");
+
+    // A command that asks now is refused hosting and ended at once.
+    let late = link.host_elevated(Arc::new(Recorder::default()), counting());
+    assert!(late.is_none(), "nothing is hosted after the session's end");
+    assert_eq!(ends.load(Ordering::SeqCst), 2, "the command that asked was ended");
+
+    link.deliver(Carrier::Session, Stream::Pty, b"session")
+        .expect("a session deliver is written");
+    link.deliver_observed(Carrier::Elevated, Stream::Pty, b"never", || {
+        panic!("an elevated deliver waits after the session's shell is gone")
+    })
+    .expect_err("an elevated deliver fails");
+    link.route_input(b"k").unwrap();
+    assert_eq!(wire.data(), ["Plast words", "Psession"], "nothing else was written");
+    assert_eq!(session.events().last().map(String::as_str), Some("input k"));
 }
 
 #[test]

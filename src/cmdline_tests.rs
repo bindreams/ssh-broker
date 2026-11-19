@@ -86,6 +86,31 @@ fn the_text_after_the_verb_is_kept_as_written() {
     assert_eq!(after_args("ssh-broker.exe", 1), "");
 }
 
+/// argv[0] is read by the C runtime's rule for the program name: no escapes, quotes toggle anywhere in the name,
+/// and it ends at a separator outside quotes. A path may be quoted in parts.
+#[test]
+fn the_programs_own_name_may_be_partly_quoted() {
+    assert_eq!(
+        after_args(r#"C:\tools\"my bin"\ssh-broker.exe elevate whoami"#, 1),
+        "whoami"
+    );
+    assert_eq!(
+        after_args(r#"C:\"a b"\"c d"\ssh-broker.exe elevate whoami /all"#, 1),
+        "whoami /all"
+    );
+    assert_eq!(
+        after_args(r#""C:\a b\ssh-broker.exe" elevate whoami"#, 1),
+        "whoami",
+        "a fully quoted name"
+    );
+    assert_eq!(after_args(r"C:\a\ssh-broker.exe elevate whoami", 1), "whoami");
+    assert_eq!(
+        dash_c_tail(r#"C:\tools\"my bin"\ssh-broker.exe -c echo hi"#),
+        Some("echo hi")
+    );
+    assert_eq!(after_args(r#"C:\"never closed elevate whoami"#, 1), "");
+}
+
 #[test]
 fn a_first_terminal_flag_is_skipped_and_a_later_one_kept() {
     let line = r#"ssh-broker.exe elevate --terminal cmd --terminal "x y""#;
