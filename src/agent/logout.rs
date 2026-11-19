@@ -346,9 +346,9 @@ fn reply<W: std::io::Write>(tx: &mut W, text: &str, code: i32) -> anyhow::Result
     Ok(())
 }
 
-/// A connection whose blocking reads can be given a limit.
+/// A connection whose waiting reads can be given a limit.
 pub(super) trait LimitedRead: Read {
-    /// Make a read that finds nothing fail with `TimedOut` or `WouldBlock` once `limit` has passed.
+    /// Make a read that finds nothing fail with `TimedOut` once `limit` has passed.
     fn limit_reads(&mut self, limit: Duration) -> std::io::Result<()>;
 }
 
@@ -388,8 +388,8 @@ fn wait_for_client<R: LimitedRead>(rx: &mut R, control: &Control, who: &str) {
 }
 
 /// Block until the client has closed its end (or the connection has failed), or `bound` has passed.
-/// Any duration works as the bound: the limit on each read is the time left, which the connection
-/// rounds up to whole milliseconds (see [`ConnRx::set_read_timeout`]).
+/// Any duration works as the bound: the limit on each read is the time left (see
+/// [`ConnRx::set_read_timeout`]).
 fn wait_for_close_within<R: LimitedRead>(rx: &mut R, bound: Duration) -> Waited {
     let deadline = Instant::now() + bound;
     let mut buf = [0u8; 256];
@@ -405,7 +405,7 @@ fn wait_for_close_within<R: LimitedRead>(rx: &mut R, bound: Duration) -> Waited 
         match rx.read(&mut buf) {
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
             // The deadline is looked at again at the top.
-            Err(e) if matches!(e.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {}
             Ok(0) | Err(_) => return Waited::Closed,
             Ok(_) => {}
         }

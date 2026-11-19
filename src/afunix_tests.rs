@@ -62,14 +62,14 @@ fn listen_connect_echo() {
     let client = std::thread::spawn({
         let p = sock_path.clone();
         move || {
-            let mut c = super::connect(&p).unwrap();
-            c.write_all(b"hello").unwrap();
+            let (_rx, mut tx) = super::split(super::connect(&p).unwrap()).unwrap();
+            tx.write_all(b"hello").unwrap();
         }
     });
 
-    let mut conn = listener.accept().unwrap();
+    let (mut rx, _tx) = super::split(listener.accept().unwrap()).unwrap();
     let mut buf = [0u8; 5];
-    conn.read_exact(&mut buf).unwrap();
+    rx.read_exact(&mut buf).unwrap();
     assert_eq!(&buf, b"hello");
 
     client.join().unwrap();
@@ -86,11 +86,11 @@ fn split_halves_are_independent_and_shutdown_signals_eof() {
     let client = std::thread::spawn({
         let p = sock_path.clone();
         move || {
-            let mut c = super::connect(&p).unwrap();
-            c.write_all(b"req").unwrap();
+            let (mut rx, mut tx) = super::split(super::connect(&p).unwrap()).unwrap();
+            tx.write_all(b"req").unwrap();
             // read the server's reply until EOF (server shuts down its write half)
             let mut reply = Vec::new();
-            c.read_to_end(&mut reply).unwrap();
+            rx.read_to_end(&mut reply).unwrap();
             reply
         }
     });
@@ -109,6 +109,140 @@ fn split_halves_are_independent_and_shutdown_signals_eof() {
 
     let reply = client.join().unwrap();
     assert_eq!(reply, b"reply");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_write_that_finds_the_buffer_full_goes_on_when_the_peer_reads() {
+    use std::io::{Read, Write};
+    /// More than the socket buffers hold, so the writer must wait for the reader.
+    const TOTAL: usize = 8 * 1024 * 1024;
+    let dir = setup_socket_dir("full-buffer");
+    let sock_path = dir.join("s");
+    let listener = super::Listener::bind(&sock_path, Integrity::Medium).unwrap();
+
+    let writer = std::thread::spawn({
+        let p = sock_path.clone();
+        move || {
+            let (_rx, mut tx) = super::split(super::connect(&p).unwrap()).unwrap();
+            let chunk = [b'x'; 64 * 1024];
+            for _ in 0..TOTAL / chunk.len() {
+                tx.write_all(&chunk).unwrap();
+            }
+            tx.shutdown_write().unwrap();
+        }
+    });
+
+    let (mut rx, _tx) = super::split(listener.accept().unwrap()).unwrap();
+    let mut got = Vec::new();
+    rx.read_to_end(&mut got).unwrap();
+    writer.join().unwrap();
+    assert_eq!(got.len(), TOTAL);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The failure bound of a read in the tests below. A read that gets nothing for this long has lost
+/// its wake, and says so as `TimedOut`, which an assertion names; nothing waits for it to pass.
+#[cfg(windows)]
+const LOST_WAKE_LIMIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// A thread's own handle, to ask whether the thread has an I/O request issued and not yet completed:
+/// it is exactly then parked in the kernel inside a blocking call.
+#[cfg(windows)]
+struct ThreadProbe(crate::winutil::OwnedHandle);
+
+#[cfg(windows)]
+impl ThreadProbe {
+    fn of_current() -> ThreadProbe {
+        use windows::Win32::System::Threading::{GetCurrentThreadId, OpenThread, THREAD_QUERY_INFORMATION};
+        // SAFETY: plain calls; the handle is closed by `OwnedHandle`.
+        let handle = unsafe { OpenThread(THREAD_QUERY_INFORMATION, false, GetCurrentThreadId()) }.expect("OpenThread");
+        ThreadProbe(crate::winutil::OwnedHandle(handle))
+    }
+
+    fn io_pending(&self) -> bool {
+        use windows::Win32::System::Threading::GetThreadIOPendingFlag;
+        use windows::core::BOOL;
+        let mut pending = BOOL(0);
+        // SAFETY: `self.0.0` is an open thread handle; `pending` is a valid out pointer.
+        unsafe { GetThreadIOPendingFlag(self.0.0, &mut pending) }.expect("GetThreadIOPendingFlag");
+        pending.as_bool()
+    }
+}
+
+/// Run `wait` on a thread of its own; once that thread is parked inside a call (`ThreadProbe`), run
+/// `act` on this one. Returns what `wait` returned. The re-check of the flag has no cap: `wait`
+/// returning ends it too, and then `act` does not run and the caller's assertion says what came back.
+#[cfg(windows)]
+fn act_once_waiting<R: Send + 'static>(wait: impl FnOnce() -> R + Send + 'static, act: impl FnOnce()) -> R {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, mpsc};
+    let done = Arc::new(AtomicBool::new(false));
+    let (probe_tx, probe_rx) = mpsc::channel();
+    let waiter = std::thread::spawn({
+        let done = Arc::clone(&done);
+        move || {
+            probe_tx.send(ThreadProbe::of_current()).unwrap();
+            let result = wait();
+            done.store(true, Ordering::Release);
+            result
+        }
+    });
+    let probe = probe_rx.recv().expect("the waiter sends its handle");
+    let mut parked = false;
+    while !parked && !done.load(Ordering::Acquire) {
+        parked = probe.io_pending();
+        std::thread::yield_now();
+    }
+    if parked {
+        act();
+    }
+    waiter.join().unwrap()
+}
+
+/// The peer writes and closes at once, while the reader is already waiting: a blocking `recv` on
+/// Windows AF_UNIX loses the close about once in fifty, and its reader then sleeps until its limit.
+/// Every read here is a read of the transport, which must see the close.
+#[cfg(windows)]
+#[test]
+fn a_read_already_waiting_when_the_peer_closes_sees_the_close() {
+    use std::io::Read;
+    const TRIALS: u32 = 500;
+    for i in 0..TRIALS {
+        let (server, client, dir) = crate::test_support::raw_socket_pair(&format!("closes-{i}"));
+        let (mut rx, tx) = super::split(client).unwrap();
+        rx.set_read_timeout(Some(LOST_WAKE_LIMIT)).unwrap();
+        let (server_rx, mut server_tx) = super::split(server).unwrap();
+        let read_to_the_end = move || {
+            let mut got = Vec::new();
+            rx.read_to_end(&mut got).map(|_| got)
+        };
+        let got = act_once_waiting(read_to_the_end, || {
+            use std::io::Write;
+            server_tx.write_all(b"hello").unwrap();
+            drop((server_rx, server_tx));
+        });
+        assert_eq!(got.as_deref().ok(), Some(&b"hello"[..]), "trial {i}: {got:?}");
+        drop(tx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// A poll that is already waiting on one handle does not wake for a shutdown of its duplicate
+/// (measured), so the end of the read is the re-check, not the poll.
+#[cfg(windows)]
+#[test]
+fn a_read_on_one_half_ends_when_the_other_half_shuts_down_both_ways() {
+    use std::io::Read;
+    let (server, client, dir) = crate::test_support::raw_socket_pair("shutdown-both");
+    let (mut rx, tx) = super::split(client).unwrap();
+    rx.set_read_timeout(Some(LOST_WAKE_LIMIT)).unwrap();
+    let read = act_once_waiting(move || rx.read(&mut [0u8; 8]), || tx.shutdown_both().unwrap());
+    assert!(
+        !matches!(&read, Err(e) if e.kind() == std::io::ErrorKind::TimedOut),
+        "the read did not end when the other half shut the connection down: {read:?}"
+    );
+    drop(server);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -358,9 +492,10 @@ fn a_shortage_of_descriptors_or_buffers_is_exhaustion_and_keeps_its_code() {
 
 #[cfg(windows)]
 #[test]
-fn codes_a_blocking_listener_cannot_return_are_fatal_and_say_so() {
-    // WSAEWOULDBLOCK needs a non-blocking socket and WSAEINPROGRESS a Winsock 1.1 blocking call in
-    // progress; this listener is neither, so getting one means something is wrong with it.
+fn codes_accept_never_hands_on_are_fatal_and_say_so() {
+    // WSAEWOULDBLOCK is the non-blocking listener's "nothing yet", which `accept_waiting` waits out, and
+    // WSAEINPROGRESS needs a Winsock 1.1 blocking call in progress; getting either here means something
+    // is wrong.
     for code in [10035, 10036] {
         match super::classify_accept_error(raw(code)) {
             super::AcceptError::Fatal(e) => {

@@ -803,13 +803,7 @@ fn a_read_limit_on_a_connection_ends_a_read_that_finds_nothing() {
         rx.read(&mut [0u8; 8])
     });
     let err = result.expect_err("nothing was sent, and the client is still connected");
-    assert!(
-        matches!(
-            err.kind(),
-            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
-        ),
-        "{err:?}"
-    );
+    assert_eq!(err.kind(), std::io::ErrorKind::TimedOut, "{err:?}");
 }
 
 /// Limits that are not whole milliseconds. The OS takes whole milliseconds and reads 0 as "no limit".
@@ -830,13 +824,7 @@ fn a_read_limit_of_any_length_ends_a_read_that_finds_nothing() {
             rx.read(&mut [0u8; 8])
         });
         let err = result.expect_err(&format!("a limit of {limit:?} did not end the read"));
-        assert!(
-            matches!(
-                err.kind(),
-                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
-            ),
-            "{limit:?}: {err:?}"
-        );
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut, "{limit:?}: {err:?}");
     }
 }
 

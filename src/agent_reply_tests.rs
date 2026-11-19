@@ -852,11 +852,10 @@ fn nothing_is_written_until_started(tag: &str, mode: Mode) {
         .expect("the agent ended before it started the session");
 
     // The agent is held in the hook: the session has started, and nothing has been written to this connection.
+    // The connection is non-blocking, and its mode is shared by every handle: it is left as it is.
     let looking = tx.try_clone_socket().unwrap();
-    looking.set_nonblocking(true).unwrap();
     let mut first_byte = [MaybeUninit::<u8>::uninit()];
     let found = looking.peek(&mut first_byte);
-    looking.set_nonblocking(false).unwrap();
     // The agent waits for the client to close, and a copy of the connection held open would keep it waiting.
     drop(looking);
     client_has_looked.send(()).unwrap();

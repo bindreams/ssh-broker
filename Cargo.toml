@@ -26,6 +26,10 @@ fd-lock = "4.0.4"
 vt100 = "0.18"               # renders the VT stream a terminal session delivers to a screen, to check what a user sees (tests/common/sshd_rig.rs; 0.18.1)
 pipe = "0.4"                 # two unidirectional pipes compose the splittable relay test transport, EOF-on-writer-drop (Phase 2; 0.4.0)
 
+# Unix-only dependencies, for the host tests (src/afunix.rs).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"                 # poll(2): the slice of the wait that waking early costs nothing in (0.2.191)
+
 # Windows-only dependencies. Not compiled on the macOS host, so the pure-logic
 # protocol/relay phases unit-test natively here.
 [target.'cfg(windows)'.dependencies]

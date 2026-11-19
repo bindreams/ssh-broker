@@ -252,6 +252,17 @@ whose subject is a possibly-sick machine: hanging is the worst way to report one
 away the local rows already gathered. `--probe-timeout 0` keeps the true unbounded hang for anyone
 debugging such a deadlock. Nothing else may take a bound on this argument.
 
+**`afunix` is the only code that reads, writes or accepts on an AF_UNIX socket** *(review)*. A
+blocking `recv` on a Windows AF_UNIX socket that is already waiting when the peer writes and closes at
+once loses the close about once in fifty (measured), and the reader then sleeps for ever. So a
+connection is non-blocking from birth (`split`, `try_split`), and one loop makes the call, waits for
+the socket for at most `RECHECK_EVERY` when it would block, and makes the call again. The wait is a
+sleep that may end early; what it reports is never read, because a poll that is already waiting does
+not wake for a local `shutdown` of a duplicate handle either (measured). `RECHECK_EVERY` is the latency
+of a lost wake, never a bound and never proof. A read limit (`ConnRx::set_read_timeout`) is the failure
+bound on a client that may never send or close. Do not set `SO_RCVTIMEO` on a connection, and do not
+read or write one through the raw `socket2::Socket`.
+
 **No run of spaces inside a string literal.** A sentence written over several lines is joined with a
 trailing `\`, which also drops the next line's indentation; joined any other way, the indentation
 lands in the sentence. The hook rejects three or more spaces between two non-space characters inside

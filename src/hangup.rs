@@ -11,7 +11,7 @@
 //! loopback TCP connection this module made (see [`wake_pair`]); [`accept_own`] admits only that
 //! connection, so no other process can write to the other end.
 
-use crate::afunix::ConnTx;
+use crate::afunix::{ConnTx, RECHECK_EVERY};
 use socket2::{Domain, SockAddr, Socket, Type};
 use std::cell::Cell;
 use std::io::{Read, Write};
@@ -70,7 +70,7 @@ impl HangupWatcher {
         (watcher, Waker { wake_tx, torn_down })
     }
 
-    /// Block, with no timeout, until the peer has closed its end or the session's [`Waker`] has
+    /// Block, with no limit, until the peer has closed its end or the session's [`Waker`] has
     /// woken or been dropped. Never consumes bytes from the stream. An error means the poll itself
     /// failed, not that the peer is gone.
     pub fn wait(self) -> std::io::Result<()> {
@@ -84,9 +84,11 @@ impl HangupWatcher {
         }
     }
 
+    /// Poll in slices of [`RECHECK_EVERY`] until something is ready, with no cap: a poll that is already
+    /// waiting could miss its wake, and the next slice looks again.
     fn poll_once(&self) -> std::io::Result<Ready> {
         loop {
-            if let Some(ready) = self.poll_ready(-1)? {
+            if let Some(ready) = self.poll_ready(RECHECK_EVERY.as_millis() as i32)? {
                 return Ok(ready);
             }
         }
