@@ -18,8 +18,8 @@ use ssh_broker::acl::Sid;
 use ssh_broker::afunix::Listener;
 use ssh_broker::logon::{self, LogonKind};
 use ssh_broker::pipes::ExecChild;
-use ssh_broker::provision::procwait;
 use ssh_broker::provision::registry::{OPENSSH_KEY, set_default_shell_under};
+use ssh_broker::provision::{canonical_exe, procwait};
 use ssh_broker::request::UNREACHABLE_CODE;
 use ssh_broker::socket_loc::{self, Integrity};
 use ssh_broker::userdir;
@@ -133,6 +133,12 @@ fn logout_over_ssh(kit: &Kit, login: &Login<'_>) -> sshd_rig::Outcome {
     run_client(ssh, false, kit.dir())
 }
 
+/// The exe the agent of a session started at the password prompt runs: the shim starts it from the installed
+/// exe, not from its own copy in the kit (`shim_offer::run_offer`), so that is the image to look for.
+fn prompt_agent_exe() -> PathBuf {
+    canonical_exe()
+}
+
 /// Start the account's session at the password prompt, run `logout` by its full path in a default (unelevated)
 /// session, and check that it ended the session: the client's exit code is 0 with the agent's reply, and every
 /// agent of the account at `level` has exited.
@@ -143,7 +149,8 @@ fn logout_ends_the_session_from_the_default_session(account: &Account, kit: &Kit
     let mut first = login.start();
     first.log_in(&account.password);
 
-    let agents = procwait::user_agents(&kit.exe, &account.sid, level).expect("list the agents of the account");
+    let agents =
+        procwait::user_agents(&prompt_agent_exe(), &account.sid, level).expect("list the agents of the account");
     assert!(!agents.is_empty(), "the login started no agent at {level:?}");
     let outcome = logout_over_ssh(kit, &login);
     assert_eq!(
@@ -181,7 +188,7 @@ fn logout_typed_in_an_unelevated_session_ends_the_session() {
     let kit = Kit::broker_with_helper("rqlo");
     let account = Account::create("rqlo", true);
     account.make_administrator();
-    let _end = session_end::LogOutOnDrop::new(&kit.exe, &account, ServiceLogon::Sshd);
+    let _end = session_end::LogOutOnDrop::new(&prompt_agent_exe(), &account, ServiceLogon::Sshd);
     logout_ends_the_session_from_the_default_session(&account, &kit, Integrity::High);
 }
 
@@ -193,7 +200,7 @@ fn a_standard_accounts_logout_still_uses_agent_sock() {
     account_fixture::assert_elevated();
     let kit = Kit::broker_with_helper("rqst");
     let account = Account::create("rqst", true);
-    let _end = session_end::LogOutOnDrop::new(&kit.exe, &account, ServiceLogon::Sshd);
+    let _end = session_end::LogOutOnDrop::new(&prompt_agent_exe(), &account, ServiceLogon::Sshd);
     logout_ends_the_session_from_the_default_session(&account, &kit, Integrity::Medium);
     assert!(
         !account.socket_location().request_path().exists(),
@@ -235,10 +242,16 @@ fn an_agent_whose_plain_folder_is_wrongly_owned_serves_sessions_and_logout_says_
         location,
     };
 
+    // A session that never ends fails after the connection's silence bound; the failure then says which session
+    // it was and what the agent had logged.
+    let ended = |what: &str, conn: &mut AgentConn| {
+        session_end::attempt(what, || conn.read_to_end())
+            .unwrap_or_else(|why| panic!("{why}\nthe agent's logs:\n{}", stand_in::read_logs(&agent.location)))
+    };
     let mut session = AgentConn::connect(&agent.location, &account.sid);
     session.start_exec("cmd.exe /c echo still-serving");
     session.end_stdin();
-    let served = session.read_to_end();
+    let served = ended("the session that echoes", &mut session);
     assert!(
         served.stdout.contains("still-serving"),
         "the agent did not serve a session: stdout {:?}, stderr {:?}",
@@ -249,7 +262,7 @@ fn an_agent_whose_plain_folder_is_wrongly_owned_serves_sessions_and_logout_says_
     let mut asker = AgentConn::connect(&agent.location, &account.sid);
     asker.start_exec(&format!("\"{}\" logout", kit.exe.display()));
     asker.end_stdin();
-    let asked = asker.read_to_end();
+    let asked = ended("the session that runs logout", &mut asker);
     assert_eq!(asked.exit, Some(UNREACHABLE_CODE), "stderr: {:?}", asked.stderr);
     assert!(
         asked.stderr.contains("could not reach your session")
