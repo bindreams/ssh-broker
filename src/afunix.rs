@@ -330,6 +330,47 @@ fn set_no_inherit(sock: &Socket) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A new handle on the same connection as `sock`, which no child process can inherit at any moment.
+/// Every duplicate of a connection's socket is made here.
+///
+/// `Socket::try_clone` is not used: on Windows its result is born inheritable (measured), and
+/// clearing the flag afterwards leaves a window in which a child started on another thread gets the
+/// duplicate. That child holds the connection open after every handle of ours is closed, and when it
+/// ends the system resets the connection under a reader who was waiting for its end. Here the
+/// duplicate is made with `bInheritHandle` false. Off Windows `try_clone` is `F_DUPFD_CLOEXEC`, which
+/// sets close-on-exec in the same call.
+///
+/// A shutdown through either handle is the connection's, and so is the mode (see [`split`]); closing
+/// one handle leaves the other open.
+pub(crate) fn duplicate(sock: &Socket) -> std::io::Result<Socket> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::{AsRawSocket, FromRawSocket};
+        use windows::Win32::Foundation::{DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE};
+        use windows::Win32::System::Threading::GetCurrentProcess;
+        let source = HANDLE(sock.as_raw_socket() as usize as *mut core::ffi::c_void);
+        let mut copy = HANDLE::default();
+        // SAFETY: `source` is the open socket of `sock`, both processes are this one, and `copy` is a
+        // valid out pointer.
+        unsafe {
+            DuplicateHandle(
+                GetCurrentProcess(),
+                source,
+                GetCurrentProcess(),
+                &mut copy,
+                0,
+                false,
+                DUPLICATE_SAME_ACCESS,
+            )
+        }
+        .map_err(std::io::Error::from)?;
+        // SAFETY: `copy` is a socket handle that nothing else owns.
+        Ok(unsafe { Socket::from_raw_socket(copy.0 as usize as u64) })
+    }
+    #[cfg(not(windows))]
+    sock.try_clone()
+}
+
 /// Read half of a split connection (mirrors the relay test transport's read half).
 pub struct ConnRx {
     sock: Socket,
@@ -409,7 +450,13 @@ pub fn try_split(sock: Socket) -> Result<(ConnRx, ConnTx), (Whole, anyhow::Error
     if let Err(e) = sock.set_nonblocking(true) {
         return Err((Whole::as_is(sock), e.into()));
     }
-    let write_half = match sock.try_clone() {
+    // Callers should hand in an already-cleared socket (from accept/connect), but split is `pub` and
+    // must not depend on that. The write half is born not inheritable (see [`duplicate`]).
+    #[cfg(windows)]
+    if let Err(e) = set_no_inherit(&sock) {
+        return Err((Whole::as_is(sock), e));
+    }
+    let write_half = match duplicate(&sock) {
         Ok(write_half) => write_half,
         Err(e) => return Err((Whole::as_is(sock), e.into())),
     };
@@ -417,12 +464,6 @@ pub fn try_split(sock: Socket) -> Result<(ConnRx, ConnTx), (Whole, anyhow::Error
     // rests on that.
     if let Err(e) = write_half.set_nonblocking(true) {
         return Err((Whole::as_is(sock), e.into()));
-    }
-    // Clear inherit on BOTH halves: callers should hand in an already-cleared socket
-    // (from accept/connect), but split is `pub` and must not depend on that.
-    #[cfg(windows)]
-    if let Err(e) = set_no_inherit(&sock).and_then(|()| set_no_inherit(&write_half)) {
-        return Err((Whole::as_is(sock), e));
     }
     Ok((
         ConnRx {
@@ -613,11 +654,13 @@ fn whole_milliseconds_up(limit: Duration) -> Duration {
 impl ConnTx {
     /// A new handle on the same underlying socket, for a thread that must watch the connection
     /// without owning one of the split halves.
+    ///
+    /// Not inheritable, like every duplicate (see [`duplicate`]).
     pub fn try_clone_socket(&self) -> std::io::Result<Socket> {
-        self.0.try_clone()
+        duplicate(&self.0)
     }
 
-    /// Send FIN on the write half. A `try_clone` dup does NOT FIN on drop, so without an
+    /// Send FIN on the write half. A duplicate does NOT FIN on drop, so without an
     /// explicit shutdown the peer would block forever and never observe `PeerClosed`.
     pub fn shutdown_write(&self) -> anyhow::Result<()> {
         self.0.shutdown(std::net::Shutdown::Write)?;
@@ -628,8 +671,7 @@ impl ConnTx {
     /// split half. A read that is waiting on the other half does not wake for this (measured on
     /// Windows: a poll on a duplicate does not), but its next re-check, at most [`RECHECK_EVERY`] later,
     /// calls `recv` again, and `recv` on the shared socket reports the end. `split` uses
-    /// `try_clone` (WSADuplicateSocketW on Windows / `dup` on Unix): both halves are descriptors
-    /// over one underlying socket.
+    /// [`duplicate`]: both halves are handles over one underlying socket.
     ///
     /// Not for a peer that may still be sending: closing with its input unread resets the
     /// connection and can lose the final frame. Use [`Self::shutdown_write`] and read until the

@@ -195,6 +195,37 @@ fn a_handler_that_panics_answers_its_connection_with_255_before_it_closes() {
     assert!(handler.is_err(), "the panic is not swallowed");
 }
 
+/// The second handle a panic reply keeps on the connection is not one a child can inherit: a child started
+/// while it is held must not keep the connection open once the agent has closed everything of its own.
+#[test]
+fn a_panic_reply_does_not_let_a_child_hold_the_connection_open() {
+    use std::io::{Read, Write};
+    let home = crate::test_support::NamedCopy::new("panic-reply-child");
+    let (server, client, dir) = crate::test_support::raw_socket_pair("panic-reply-child");
+    let (mut rx, tx) = afunix::split(client).unwrap();
+    // The failure bound of the read: a read that gets no end for this long says `TimedOut`, and the assertion names it.
+    rx.set_read_timeout(Some(std::time::Duration::from_secs(30)));
+    let control = Control::standalone();
+    let reply = logout::PanicReply::new(&server, &control);
+    let mut child = home.spawn(&[]);
+    (&server).write_all(b"hello").unwrap();
+    drop((reply, server));
+
+    let mut got = Vec::new();
+    let read = rx.read_to_end(&mut got);
+    // The child waits for its input to end; release it before asserting, so a failure leaves nothing running.
+    drop(child.stdin.take());
+    child.wait().unwrap();
+    drop(tx);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(
+        read.is_ok(),
+        "no end while the child ran, so the child holds the connection: {read:?}"
+    );
+    assert_eq!(got, b"hello");
+}
+
 #[test]
 fn a_handler_that_does_not_panic_adds_nothing_to_its_reply() {
     // A desktop agent answers a logout request and returns without closing anything itself: the

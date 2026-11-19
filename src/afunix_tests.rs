@@ -416,6 +416,69 @@ fn a_connection_that_arrives_inheritable_is_refused_not_fixed_up() {
     }
 }
 
+// duplicates -----
+
+/// `socket2`'s `try_clone` is born inheritable on Windows, so a duplicate of a connection made that
+/// way and cleared afterwards is inheritable for an instant, and a child started in that instant
+/// holds the connection open after every handle of the agent's is closed. Every duplicate is made
+/// not inheritable from the start.
+#[cfg(windows)]
+#[test]
+fn a_duplicate_is_not_inheritable_from_birth() {
+    let (server, client, dir) = crate::test_support::raw_socket_pair("duplicate-birth");
+    let cloned = server.try_clone().unwrap();
+    assert!(
+        super::is_inheritable(&cloned).unwrap(),
+        "control: a `try_clone` is born inheritable"
+    );
+    let duplicated = super::duplicate(&server).unwrap();
+    let (_server_rx, server_tx) = super::split(server).unwrap();
+    let (_client_rx, client_tx) = super::try_split(client).map_err(|(_, e)| e).unwrap();
+    let watching = server_tx.try_clone_socket().unwrap();
+    for (what, socket) in [
+        ("`duplicate`", &duplicated),
+        ("the write half of `split`", &server_tx.0),
+        ("the write half of `try_split`", &client_tx.0),
+        ("the socket of `try_clone_socket`", &watching),
+    ] {
+        assert!(!super::is_inheritable(socket).unwrap(), "{what} is inheritable");
+    }
+    drop(cloned);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// What a hang-up watcher holds for the life of a session is a duplicate of the writer's socket. A child
+/// started meanwhile (a shell, say) must not hold the connection open once the agent has closed every
+/// handle of its own: the reader sees the end while the child still runs, not a reset when it ends.
+#[cfg(windows)]
+#[test]
+fn a_child_started_while_connections_are_split_does_not_hold_them_open() {
+    use std::io::{Read, Write};
+    let home = crate::test_support::NamedCopy::new("holds-connection");
+    let (server, client, dir) = crate::test_support::raw_socket_pair("child-holds");
+    let (mut rx, client_tx) = super::split(client).unwrap();
+    rx.set_read_timeout(Some(LOST_WAKE_LIMIT));
+    let (server_rx, mut server_tx) = super::split(server).unwrap();
+    let watching = server_tx.try_clone_socket().unwrap();
+    let mut child = home.spawn(&[]);
+    server_tx.write_all(b"hello").unwrap();
+    drop((server_rx, server_tx, watching));
+
+    let mut got = Vec::new();
+    let read = rx.read_to_end(&mut got);
+    // The child waits for its input to end; release it before asserting, so a failure leaves nothing running.
+    drop(child.stdin.take());
+    child.wait().unwrap();
+    drop(client_tx);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(
+        read.is_ok(),
+        "no end while the child ran, so the child holds the connection: {read:?}"
+    );
+    assert_eq!(got, b"hello");
+}
+
 // the socket file's own ACL ----------------------------------------------------------------
 
 #[cfg(windows)]

@@ -284,7 +284,7 @@ pub(super) struct PanicReply<'a> {
 
 impl<'a> PanicReply<'a> {
     pub(super) fn new(conn: &socket2::Socket, control: &'a Control) -> Self {
-        let conn = match conn.try_clone() {
+        let conn = match crate::afunix::duplicate(conn) {
             Ok(conn) => Some(conn),
             Err(e) => {
                 tracing::warn!("a panic of this connection's handler will not be answered: {e}");
