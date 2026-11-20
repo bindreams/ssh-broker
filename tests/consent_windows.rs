@@ -136,10 +136,21 @@ fn an_unelevated_process_is_refused_attachment_to_every_process_of_the_shims_con
             (admin.diagnostics())()
         );
     }
-    // The shim is alive and holds the console while the session is open, so its refusal is access denied: any other
-    // error (a process that is gone, a console that cannot be attached to) would satisfy the check above and show
-    // nothing.
-    for shim in &shims {
+    // The login's shim (sshd starts it under the console's host; the agent is the same image and has another parent)
+    // is alive and holds the console while the session is open, so its refusal is access denied: any other error (a
+    // process that is gone, one with no console) would satisfy the check above and show nothing.
+    let under_a_console_host = |shim: &&&process_list::Entry| {
+        listed
+            .iter()
+            .any(|entry| entry.pid == shim.parent && entry.exe.eq_ignore_ascii_case("conhost.exe"))
+    };
+    let of_the_login: Vec<_> = shims.iter().filter(under_a_console_host).collect();
+    assert!(
+        !of_the_login.is_empty(),
+        "no process of the image {shim_image} has a console host for its parent: the login's shim was not found\n{}",
+        (admin.diagnostics())()
+    );
+    for shim in of_the_login {
         let line = shown
             .lines()
             .find(|line| line.starts_with(&format!("pid={} ", shim.pid)))
