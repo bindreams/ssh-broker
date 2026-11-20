@@ -70,7 +70,7 @@ fn the_default_probe_row_says_session_and_passes_for_medium_with_administrators_
     assert_eq!(passes(&rows), [true, true], "{:?}", details(&rows));
     assert_eq!(
         rows[0].detail,
-        "a login that asks for no level gets integrity Medium (0x2000) with Administrators deny-only"
+        "a login at the default level (`prompt`) gets integrity Medium (0x2000) with Administrators deny-only"
     );
     let standard = session_rows(
         &answer(probe(Some(Elevation::Standard), Some(INTEGRITY_MEDIUM))),
@@ -205,7 +205,7 @@ fn a_standard_account_at_high_passes_both_rows_and_both_probes_are_judged() {
     assert_eq!(passes(&rows), [true, true], "{:?}", details(&rows));
     assert!(rows[1].detail.contains("not an administrator"), "{}", rows[1].detail);
 
-    // Neither was stepped as asked: the login that asks for no level was not stepped down, and the one that
+    // Neither was stepped as asked: the login at the default level was not stepped down, and the one that
     // asks for `always` was.
     let rows = session_rows(&answer(always), Some(&answered(session)));
     assert_eq!(passes(&rows), [false, false], "swapped: {:?}", details(&rows));
@@ -319,6 +319,23 @@ fn a_token_with_no_level_reported_and_no_always_probe_gives_the_one_failing_sess
     assert_eq!(passes(&rows), [false], "{:?}", details(&rows));
 }
 
+/// `session privilege` is for a Standard token at exactly Medium. At any other level (Untrusted, Low, Medium Plus)
+/// the token is described as seen by the one failing `session` row.
+#[test]
+fn a_standard_token_at_a_level_other_than_medium_and_no_always_probe_gives_the_one_failing_session_row() {
+    for (rid, says) in [
+        (0x0, "gave a standard account's token at integrity 0x0"),
+        (0x1000, "gave a standard account's token at integrity 0x1000"),
+        (0x2100, "gave a standard account's token at integrity 0x2100"),
+    ] {
+        let rows = session_rows(&answer(probe(Some(Elevation::Standard), Some(rid))), None);
+
+        assert_eq!(names(&rows), ["session"], "{rid:#x}");
+        assert_eq!(passes(&rows), [false], "{rid:#x}: {:?}", details(&rows));
+        assert!(rows[0].detail.contains(says), "{rid:#x}: {}", rows[0].detail);
+    }
+}
+
 // the agent is below High ------------------------------------------------------------------
 
 /// One row, which passes and says the session is a standard account's.
@@ -333,7 +350,7 @@ fn a_standard_account_below_high_has_one_passing_row() {
     assert!(rows[0].detail.contains("standard account"), "{}", rows[0].detail);
 }
 
-/// An administrator's agent below High gives its own token to a login that asks for no level, which is
+/// An administrator's agent below High gives its own token to a login at the default level, which is
 /// unelevated, and cannot give an elevated one: a fault, not a standard account. `elevated session on request`
 /// fails, naming it, and no probe asked for `always` (which a session below High refuses).
 #[test]
@@ -498,7 +515,7 @@ fn a_healthy_administrators_agent_passes_every_row() {
     assert!(rows.iter().all(|row| row.pass), "{:?}", details(&rows));
 }
 
-/// What a login gets is what a login that asks for no level gets: the session id, DPAPI and the bytes of its
+/// What a login gets is what a login at the default level gets: the session id, DPAPI and the bytes of its
 /// relay are read from that probe, whatever the probe that asked for `always` found.
 #[test]
 fn the_rows_about_the_session_a_login_gets_come_from_the_probe_that_asks_for_the_default_level() {

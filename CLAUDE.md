@@ -15,10 +15,10 @@ The point is lineage: a shell that is a child of the agent rather than of `sshd`
 neither the session-0 network logon nor the RedirectionGuard mitigation. `doctor` establishes
 the session id and DPAPI through an agent-spawned probe, and whether a junction that a token below
 High made is followed (RedirectionGuard refuses only those, so an agent at High is probed twice: a probe
-that asks for the default policy, an unelevated session, makes the junction, and one that asks for
+that asks for `prompt`, the default level, an unelevated session, makes the junction, and one that asks for
 `always`, an elevated one, follows it). `doctor` names the junction's
 directory and removes it; not tested means the volume holds no junctions. It also shows that a login
-that asks for no level gets an unelevated session (the `session` row) and one that asks for `always`
+at the default level (`prompt`) gets an unelevated session (the `session` row) and one that asks for `always`
 an elevated one (`elevated session on request`); `provision/probe_run` has the rest. Below High an
 administrator's `doctor` runs no probe and names the ways to check. The profile
 follows from the interactive logon and is not separately checked.
@@ -48,7 +48,7 @@ session's level (`prompt` asks the person at the session's terminal first).
 | `filelog` | the daily log in the user's own folder, written under the folder's handle |
 | `handoff` | the notice and the line the agent writes into the inherited pipe it hands the hidden `console-fallback` verb |
 | `vtinput` | Win32 `INPUT_RECORD` → VT sequences, and what a key means to a line being typed (`KeyEvent::line_key`, which both console prompts read through; pure, host-testable) |
-| `provision`, `provision/{probe,probe_run,session_rows}` | `apply`/`doctor`: DefaultShell, logon task, per-user socket rows, parity probes (the PROBE line, the junction they follow, the two probes of an agent at High: the default level, then `always`) and the rows they give (`Probes::session` gives the session id, DPAPI, byte and `session` rows; `Probes::elevated` the `elevated session on request` row) |
+| `provision`, `provision/{probe,probe_run,session_rows}` | `apply`/`doctor`: DefaultShell, logon task, per-user socket rows, parity probes (the PROBE line, the junction they follow, the two probes of an agent at High: `prompt`, the default level, then `always`) and the rows they give (`Probes::session` gives the session id, DPAPI, byte and `session` rows; `Probes::elevated` the `elevated session on request` row) |
 | `provision/sshd_config` (+`configure`, `restart`, `machine`) | making sshd accept `SSH_BROKER_ELEVATION`: the drop-in and the `Include` (or the `AcceptEnv` line) as a text edit checked by `sshd -t`, the restart of the service through the service manager, and `doctor`'s `sshd accepts` row |
 | `provision/sshd_task`, `provision/procwait` | `apply`'s sshd step run by the transient SYSTEM task `ssh-broker-apply-sshd` (hidden verb `apply-sshd`), so that it finishes if `apply` is ended; and the processes `apply` waits for, found by exe and told by `Role` (shim, desktop agent, background agent, `apply-sshd`) |
 | `provision/path_env` | the install directory on the system `PATH`, and its `doctor` row |

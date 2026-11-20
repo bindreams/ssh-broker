@@ -202,7 +202,7 @@ junction and about its own token (`probe::JUNCTION_SAID`, `probe::TOKEN_SAID`) r
 For an agent below High there is one probe, which makes and follows the junction in the directory it is
 given. The probe's PROBE line also carries its own `elevation` and `integrity` (read by
 `account::elevation_of` and `integrity_of`), which the `session` and `elevated session on request` rows judge:
-the first from the probe that asked for the default level, the second from the one that asked for `always`.
+the first from the probe that asked for `prompt`, the default level, the second from the one that asked for `always`.
 The session id, DPAPI and byte rows are the first probe's too, since that is the session a login gets
 (`session_rows::Probes::session`; `Probes::elevated` is `None` for an agent below High, which refuses
 `always`). The two probes and the two rows are keyed on the agent being at High (the level of the process

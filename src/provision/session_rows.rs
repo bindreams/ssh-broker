@@ -1,5 +1,5 @@
 //! provision::session_rows — the rows of the `doctor` report about what a session through the agent
-//! is: what a login that asks for no level gets, whether one that asks for `always` gets an elevated one,
+//! is: what a login at the default level (`prompt`) gets, whether one that asks for `always` gets an elevated one,
 //! and whether a link a session below High made is followed.
 //!
 //! The facts are the PROBE lines of the probes the agent started, which read their own tokens; nothing
@@ -197,15 +197,19 @@ pub fn session_rows(session: &Answer, elevated: Option<&ProbeOutcome>) -> Vec<Ch
         return vec![session_row(session), elevated_outcome_row(elevated)];
     }
     let level = session.result.integrity.map(integrity_class);
-    if level.is_none() || level == Some(Integrity::High) {
+    if session.result.elevation == Some(Elevation::Standard) {
+        if session.result.integrity == Some(INTEGRITY_MEDIUM) {
+            vec![Check::new(
+                "session privilege",
+                true,
+                "this account is not an administrator: its session is a standard account's, and \
+                 `SSH_BROKER_ELEVATION` cannot elevate it",
+            )]
+        } else {
+            vec![session_row(session)]
+        }
+    } else if level.is_none() || level == Some(Integrity::High) {
         vec![session_row(session)]
-    } else if session.result.elevation == Some(Elevation::Standard) {
-        vec![Check::new(
-            "session privilege",
-            true,
-            "this account is not an administrator: its session is a standard account's, and \
-             `SSH_BROKER_ELEVATION` cannot elevate it",
-        )]
     } else {
         vec![session_row(session), elevated_row(session)]
     }
@@ -295,7 +299,7 @@ fn elevated_outcome_row(elevated: &ProbeOutcome) -> Check {
     }
 }
 
-/// `session`: passes when the session that a login which asks for no level gets is at Medium with
+/// `session`: passes when the session that a login at the default level (`prompt`) gets is at Medium with
 /// Administrators not enabled: `Filtered` for an administrator, `Standard` for an account that is not one.
 fn session_row(session: &Answer) -> Check {
     const NAME: &str = "session";
@@ -306,7 +310,7 @@ fn session_row(session: &Answer) -> Check {
             NAME,
             true,
             format!(
-                "a login that asks for no level gets integrity {} {}",
+                "a login at the default level (`prompt`) gets integrity {} {}",
                 level(Some(INTEGRITY_MEDIUM)),
                 if elevation == Elevation::Filtered {
                     "with Administrators deny-only"
@@ -319,8 +323,8 @@ fn session_row(session: &Answer) -> Check {
             NAME,
             false,
             format!(
-                "a login that asks for no level gave {} at integrity {}, not integrity Medium with Administrators \
-                 not enabled",
+                "a login at the default level (`prompt`) gave {} at integrity {}, not integrity Medium with \
+                 Administrators not enabled",
                 asked.elevation.map_or("an unknown token", elevation_name),
                 level(asked.integrity)
             ),
