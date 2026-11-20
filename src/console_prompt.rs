@@ -119,9 +119,10 @@ fn write_console(output: HANDLE, text: &str) -> windows::core::Result<()> {
 /// a console that could not be read or written to, and nothing was asked.
 ///
 /// `stop` is looked at after the drain, before anything is written (a question that ended meanwhile paints nothing),
-/// and before each pass of the wait for the answer, before anything is fed: once it is true nothing more is fed, and
-/// what is queued stays queued for the relay. Whatever makes it true must then put a record in the queue (the shim's
-/// does, with `wake_console_input`), which wakes the read.
+/// and in each pass of the wait for the answer, after the queue is looked at and before anything of it is fed: once
+/// it is true nothing more is fed, and what is queued stays queued for the relay. Whatever makes it true must then
+/// put a record in the queue (the shim's does, with `wake_console_input`), which wakes the read; nothing behind that
+/// record is taken by the question.
 pub fn ask_consent(
     stdin: HANDLE,
     stdout: HANDLE,

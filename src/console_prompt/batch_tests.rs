@@ -268,6 +268,21 @@ fn keys_queued_behind_the_record_that_woke_a_stopped_read_stay_in_the_queue() {
     );
 }
 
+/// The stop is looked at after the queue and before anything of it is fed: a withdrawal whose wake record and a key
+/// behind it land just before a pass looks at the queue takes nothing of what that pass sees.
+#[test]
+fn a_stop_that_turns_true_as_the_queue_is_looked_at_feeds_nothing_of_it() {
+    let mut up = key(0x59, 'y' as u16);
+    up.Event.KeyEvent.bKeyDown = windows::core::BOOL(0);
+    let mut queue = FakeQueue::with(vec![focus_record(), key(0x59, 'y' as u16), up]);
+    let peeks = std::rc::Rc::clone(&queue.peeks);
+    let step = Batch::new()
+        .step(&mut queue, &mut ConsentEntry::new(&["yes", "y"]), &|| peeks.get() > 0)
+        .unwrap();
+    assert_eq!(step, ConsentStep::Stopped, "nothing was fed, so nothing was typed");
+    assert_eq!(queue.removed, 0, "the wake record and the key behind it stay queued");
+}
+
 /// An entry whose steps are an echo and an answer: each step takes the records up to the one that finished it, and
 /// the rest, typed ahead, stays queued.
 #[test]

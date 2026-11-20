@@ -106,11 +106,12 @@ impl Batch {
         stop: &dyn Fn() -> bool,
     ) -> windows::core::Result<E::Step> {
         loop {
-            // Before anything is fed: what is queued behind the record that woke a stopped read is not the entry's.
+            let peeked = (queue.peek(&mut self.records)? as usize).min(BATCH);
+            // After the look at the queue and before anything of it is fed: what makes `stop` true puts its record in
+            // the queue afterwards, so nothing behind that record is ever fed.
             if stop() {
                 return Ok(E::stopped());
             }
-            let peeked = (queue.peek(&mut self.records)? as usize).min(BATCH);
             // Only the last record of the queue can change after the peek (the console merges a repeated
             // key-down into it), and it is the last peeked one. The records before it are fed from the
             // peek, and the last is fed from the read that removes it.

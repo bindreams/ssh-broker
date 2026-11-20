@@ -856,7 +856,7 @@ impl ConsentSlot {
 
     /// The agent withdraws the question numbered `id`: the one that waits if it is that one, else the one being asked
     /// if it is. With that one not open, a withdrawal is ignored: it is for one that ended. `true` when the worker is
-    /// in the question, which the caller must then wake.
+    /// in the question, which must then be woken ([`ConsentSlot::withdraw_and_wait`]).
     fn withdraw(&self, id: u32) -> bool {
         let mut state = self.state();
         if state.waiting.as_ref().is_some_and(|request| request.id == id) {
@@ -883,20 +883,41 @@ impl ConsentSlot {
         (was != Asking::Withdrawn).then_some(ConsentReply { id, answer })
     }
 
-    /// Wait until the worker has left a question that was withdrawn ([`ConsentSlot::finish`] took `asking` back): from
-    /// then on it writes nothing to the console. Returns at once if the worker is not in a withdrawn question.
-    fn wait_until_left(&self) {
-        self.wait_until_left_observed(|| {});
+    /// The worker is in the question it took until the guard drops, unwinding included: a question it leaves without
+    /// [`ConsentSlot::finish`] has ended all the same, and a withdrawal's wait for it ends.
+    fn in_question(&self) -> InQuestion<'_> {
+        InQuestion(self)
     }
 
-    /// [`ConsentSlot::wait_until_left`], calling `waiting` each time it is about to wait, with the state locked, so a
-    /// test can tell it is waiting.
-    fn wait_until_left_observed(&self, mut waiting: impl FnMut()) {
+    /// [`ConsentSlot::withdraw`], and when the worker is in the question: `wake` it, then wait until it has left the
+    /// question ([`ConsentSlot::finish`], or its [`InQuestion`] dropped). From then on it writes nothing to the
+    /// console.
+    fn withdraw_and_wait(&self, id: u32, wake: impl FnOnce()) {
+        self.withdraw_and_wait_observed(id, wake, || {});
+    }
+
+    /// As [`ConsentSlot::withdraw_and_wait`], calling `waiting` before each wait, with the state locked, so a test
+    /// can tell it is waiting.
+    fn withdraw_and_wait_observed(&self, id: u32, wake: impl FnOnce(), mut waiting: impl FnMut()) {
+        if !self.withdraw(id) {
+            return;
+        }
+        wake();
         let mut state = self.state();
         while state.asking == Asking::Withdrawn {
             waiting();
             state = self.ended.wait(state).unwrap_or_else(PoisonError::into_inner);
         }
+    }
+}
+
+/// The worker's stay in a question ([`ConsentSlot::in_question`]).
+struct InQuestion<'a>(&'a ConsentSlot);
+
+impl Drop for InQuestion<'_> {
+    fn drop(&mut self) {
+        self.0.state().asking = Asking::No;
+        self.0.ended.notify_all();
     }
 }
 
@@ -942,13 +963,12 @@ impl FrameSink for StdoutSink {
     /// worker, parked in the question's read, is woken to see it, and this returns only when the worker has left the
     /// question, so that no later frame is written to the console while the worker can still write to it. The wait
     /// ends without this pump: the worker sees the stop at its next record (the wake record) or after its drain,
-    /// writes nothing more to the console, and calls [`ConsentSlot::finish`]. A question not yet taken is dropped, and
-    /// with none open nothing happens.
+    /// writes nothing more to the console, and leaves the question ([`ConsentSlot::finish`]; a worker that unwinds
+    /// leaves it too). A question not yet taken is dropped, and with none open nothing happens.
     fn on_consent_withdrawn(&mut self, withdrawal: ConsentWithdrawal) -> anyhow::Result<()> {
-        if self.consent.withdraw(withdrawal.id) {
-            wake_console_input(self.stdin_raw);
-            self.consent.wait_until_left();
-        }
+        let stdin_raw = self.stdin_raw;
+        self.consent
+            .withdraw_and_wait(withdrawal.id, || wake_console_input(stdin_raw));
         Ok(())
     }
 
@@ -1036,9 +1056,9 @@ unsafe fn input_loop(
         if !relay.relay(&recs[..n as usize]) {
             return;
         }
-        // The agent may ask again while a question ends (its wake record can be taken by the question that is
-        // ending), so every question waiting is asked before the next read. The mouse's state is dropped after
-        // each, as the question took its records.
+        // A question handed over while the last one's answer was being sent is asked at once (its wake record is
+        // then read as a record that says nothing). The mouse's state is dropped after each, as the question took
+        // its records.
         while let Some(request) = consent.take() {
             let connected = ask_person(stdin, stdout, &request, consent, stopping, &mut relay);
             relay.enc.reset();
@@ -1140,6 +1160,7 @@ fn ask_person(
     stopping: &AtomicBool,
     relay: &mut RecordRelay<'_>,
 ) -> bool {
+    let _in_question = consent.in_question();
     let question = text::consent_question(&request.command, &request.cwd, text::CONSENT_ANSWER_LINE);
     let answer = ask_consent(
         stdin,
@@ -1183,7 +1204,8 @@ fn send_outcome(
 /// read: for the stop that woke the worker, or left in the queue after a question and read later. More reliable for
 /// console reads than `CancelSynchronousIo` (which may not cancel a parked console wait).
 ///
-/// A write that fails is logged and nothing else: the worker is then woken only by the next record of the console.
+/// A write that fails is logged and nothing else: the worker is then woken only by the next record of the console,
+/// and a withdrawal that waits for the worker waits as long.
 fn wake_console_input(stdin_raw: isize) {
     let rec = wake_record();
     let stdin = HANDLE(stdin_raw as *mut core::ffi::c_void);

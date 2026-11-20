@@ -1519,61 +1519,73 @@ fn a_withdrawal_drops_a_question_not_yet_taken_and_with_none_open_is_ignored() {
     assert_eq!(slot.finish(2, ConsentAnswer::Allow), reply(2, ConsentAnswer::Allow));
 }
 
-/// The agent may ask the next question while the worker is still leaving the withdrawn one: the new one is not
-/// withdrawn with it, and is the next the worker takes.
-#[test]
-fn a_question_put_while_a_withdrawn_one_is_ending_is_not_withdrawn_with_it() {
-    let slot = ConsentSlot::default();
-    slot.put(a_question(1, "first")).unwrap();
-    slot.take().unwrap();
-    assert!(slot.withdraw(1));
-    slot.put(a_question(2, "second")).expect("the agent asks again");
-    assert_eq!(slot.finish(1, ConsentAnswer::Refuse), None, "the first was withdrawn");
-    assert_eq!(slot.take(), Some(a_question(2, "second")));
-    assert!(!slot.withdrawn());
-    assert_eq!(slot.finish(2, ConsentAnswer::Allow), reply(2, ConsentAnswer::Allow));
-}
-
-/// The sink, after it woke the worker out of a withdrawn question, waits until the worker has left it, so that the
+/// The sink wakes the worker out of a withdrawn question and then waits until the worker has left it, so that the
 /// console is not written to by the main pump while the worker can still write to it.
 #[test]
-fn a_withdrawal_waits_until_the_worker_has_left_the_question() {
+fn a_withdrawal_wakes_the_worker_and_waits_until_it_has_left_the_question() {
     let slot = ConsentSlot::default();
     slot.put(a_question(1, "first")).unwrap();
     slot.take().unwrap();
-    assert!(slot.withdraw(1));
 
-    let returned = AtomicBool::new(false);
+    let (woken, left) = (AtomicBool::new(false), AtomicBool::new(false));
     let (waiting, is_waiting) = std::sync::mpsc::channel();
-    std::thread::scope(|scope| {
-        let sink = scope.spawn(|| {
-            slot.wait_until_left_observed(|| {
-                let _ = waiting.send(());
-            });
-            returned.store(true, Ordering::SeqCst);
+    let went_on_after_the_worker_left = std::thread::scope(|scope| {
+        // The worker: it leaves the question once the sink waits for it.
+        let (slot, left) = (&slot, &left);
+        scope.spawn(move || {
+            if is_waiting.recv().is_ok() {
+                left.store(true, Ordering::SeqCst);
+                assert_eq!(slot.finish(1, ConsentAnswer::Refuse), None);
+            }
         });
-        is_waiting.recv().expect("the sink waits");
-        assert!(
-            !returned.load(Ordering::SeqCst),
-            "the sink went on while the worker was still in the question"
+        slot.withdraw_and_wait_observed(
+            1,
+            || woken.store(true, Ordering::SeqCst),
+            || {
+                assert!(
+                    woken.load(Ordering::SeqCst),
+                    "the sink waited for a worker it had not woken"
+                );
+                let _ = waiting.send(());
+            },
         );
-        assert_eq!(slot.finish(1, ConsentAnswer::Refuse), None);
-        sink.join().unwrap();
+        let left = left.load(Ordering::SeqCst);
+        // Ends a worker that was never waited for.
+        drop(waiting);
+        left
     });
     assert!(
-        returned.load(Ordering::SeqCst),
-        "the sink goes on once the worker has left"
+        went_on_after_the_worker_left,
+        "the sink went on while the worker was still in the question"
     );
 }
 
-/// A question that is not being asked has no worker to wait for: the withdrawal of one that waits, or of none,
-/// returns at once.
+/// A question that is not being asked has no worker to wake or to wait for.
 #[test]
-fn a_withdrawal_of_a_question_not_taken_does_not_wait() {
+fn a_withdrawal_of_a_question_not_taken_neither_wakes_nor_waits() {
     let slot = ConsentSlot::default();
     slot.put(a_question(1, "never asked")).unwrap();
-    assert!(!slot.withdraw(1));
-    slot.wait_until_left_observed(|| panic!("waited for a worker that is not in a question"));
+    slot.withdraw_and_wait_observed(
+        1,
+        || panic!("woke a worker that is not in a question"),
+        || panic!("waited for a worker that is not in a question"),
+    );
+    assert_eq!(slot.take(), None, "it is never asked");
+}
+
+/// A worker that leaves a question without finishing it (it unwound) has left it: a withdrawal of that question
+/// finds nobody in it, and does not wait.
+#[test]
+fn a_worker_that_leaves_a_question_without_finishing_it_has_left_it() {
+    let slot = ConsentSlot::default();
+    slot.put(a_question(1, "first")).unwrap();
+    slot.take().unwrap();
+    drop(slot.in_question());
+    slot.withdraw_and_wait_observed(
+        1,
+        || panic!("woke a worker that has left the question"),
+        || panic!("waited for a worker that has left the question"),
+    );
 }
 
 /// A withdrawal ends the question it names and no other: one for a question that ended earlier, and so reaches the

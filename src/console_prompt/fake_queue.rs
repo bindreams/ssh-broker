@@ -68,6 +68,8 @@ pub(super) struct FakeQueue {
     pub(super) queue: VecDeque<INPUT_RECORD>,
     pub(super) arrivals: VecDeque<Vec<INPUT_RECORD>>,
     pub(super) removed: usize,
+    /// How many times the queue was peeked: shared, so that a test's `stop` can turn true as the queue is looked at.
+    pub(super) peeks: std::rc::Rc<std::cell::Cell<usize>>,
     /// After the next peek that reaches the end of the queue, the console merges a repeat of the last
     /// key-down into that record: its `wRepeatCount` becomes this.
     pub(super) merge_into_tail_after_peek: Option<u16>,
@@ -108,6 +110,7 @@ impl InputQueue for FakeQueue {
     }
 
     fn peek(&mut self, records: &mut [INPUT_RECORD]) -> windows::core::Result<u32> {
+        self.peeks.set(self.peeks.get() + 1);
         if self.fail_peek {
             records[0] = key(0x41, 'x' as u16);
             return Err(failure());
