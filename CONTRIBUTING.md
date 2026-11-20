@@ -83,10 +83,10 @@ label, so a process of the account below High can connect to it: it is how an un
 It takes requests only (`logout`, and the `ElevationRequest` of `ssh-broker elevate`); a session handshake there is
 answered with a sentence (`agent::requests::REQUESTS_ONLY`) and no session starts. **Everything on it is input from a
 lower level.** Frames are read through the bounded frame reader and parsed strictly, a malformed first frame is
-answered as a failed request, and two things read from it are used as paths: the program of an `elevate`'s command,
-which `ElevationRequest::check` requires to be an absolute path (the client found it; the file is not looked for before
-the command starts, and one that is not there is reported by the start), and its working directory (an empty one stands for
-the account's home; any other must be an existing directory). Neither holds a NUL or passes its length bound, and nothing else read is used as a path. The session id in a request says which session asks and is no credential. The agent
+answered as a failed request, and two things of a request are used as paths, both of an `elevate`: its command's
+program, which `ElevationRequest::check` requires to be absolute (the client found it; the file is not looked for before
+the command starts, and one that is not there is reported by the start), and its working directory, which
+`agent::requests::run_elevated` checks and `child_cwd` resolves. Neither holds a NUL or passes its length bound. The session id in a request says which session asks and is no credential. The agent
 keeps its `SocketDir` of the plain folder for its whole run, as it keeps its own, so the by-path contract below holds
 for `request.sock` too; a plain folder it cannot use costs it the request socket and nothing else. The socket is
 served by the sessions' accept machinery and counted in the same tally, with no read bound of its own: a client that
@@ -209,7 +209,8 @@ The session id, DPAPI and byte rows are the first probe's too, since that is the
 that runs `doctor`, which is the level of the folder it asks), not on `Elevation::Full`. A process below
 High that is an administrator's runs no probe: `doctor` shows its local rows and one failing row, in place of the
 rows about the agent's socket, that names the ways to check: an elevated prompt, an SSH login that asked for
-`always`, and `elevate` in an SSH session (`offer::text::CHECK_BELOW_HIGH_CLAUSE`).
+`always`, and `elevate` in an SSH session (`offer::text::ELEVATED_AGENT_LOOKS_ELSEWHERE`, which `logout` says too,
+and `CHECK_BELOW_HIGH_CLAUSE`).
 `tests/redirection_guard_windows.rs` measures the premise.
 
 ## Building and testing

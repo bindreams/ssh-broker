@@ -738,18 +738,6 @@ fn the_fallback_notice_says_the_session_has_sshds_token_and_which_values_are_ref
     assert!(!text::unelevated_fallback("c").contains('\n'));
 }
 
-/// What `doctor` tells an unelevated administrator: why nothing was checked and every way to check it: an elevated
-/// prompt, an SSH login that asked for `always`, and `elevate` in an SSH session.
-#[test]
-fn the_clause_that_checks_below_high_names_every_way_to_check() {
-    assert_eq!(
-        text::CHECK_BELOW_HIGH_CLAUSE,
-        "this account's agent serves elevated processes. Run ssh-broker doctor from an elevated prompt or from an \
-         SSH login that asked for SSH_BROKER_ELEVATION=always, or run ssh-broker elevate ssh-broker doctor in an SSH \
-         session"
-    );
-}
-
 /// No sentence of `doctor` or of the offer names the verb that `doctor` replaced, or the reserved word that
 /// `SSH_BROKER_ELEVATION` replaced.
 #[test]

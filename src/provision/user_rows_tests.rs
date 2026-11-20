@@ -317,9 +317,9 @@ fn the_row_for_an_unelevated_administrator_says_why_nothing_can_be_checked_here(
     assert_eq!(row.name, "socket reachable");
     assert_eq!(
         row.detail,
-        "not checked below High: this account's agent serves elevated processes. Run ssh-broker doctor from an \
-         elevated prompt or from an SSH login that asked for SSH_BROKER_ELEVATION=always, or run ssh-broker elevate \
-         ssh-broker doctor in an SSH session"
+        "not checked below High: this account's agent serves elevated processes: run this from an elevated prompt \
+         or from an SSH login that asked for SSH_BROKER_ELEVATION=always, or run ssh-broker elevate ssh-broker \
+         doctor in an SSH session"
     );
     assert!(
         !row.detail.contains("to see why, run"),

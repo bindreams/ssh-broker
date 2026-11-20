@@ -315,14 +315,15 @@ pub fn elevation_unreadable(cause: &str) -> String {
     )
 }
 
-/// What `doctor` says after "not checked below High: " in place of the rows about the agent: why, and the three
-/// ways to check them. `elevate` is refused outside a hosted session (a desktop prompt) and where its login's
-/// level refuses it (`never`; `prompt` in a session with no terminal to ask on); where it is refused it says why
-/// itself, so the other ways are named beside it.
-pub const CHECK_BELOW_HIGH_CLAUSE: &str = "this account's agent serves elevated processes. Run ssh-broker doctor from an elevated prompt or from an SSH login that asked for SSH_BROKER_ELEVATION=always, or run ssh-broker elevate ssh-broker doctor in an SSH session";
+/// What `doctor`'s row says after [`ELEVATED_AGENT_LOOKS_ELSEWHERE`] ("not checked below High: ...") in place
+/// of the rows about the agent: the third way to check them. `elevate` is refused outside a hosted session (a
+/// desktop prompt) and where its login's level refuses it (`never`; `prompt` in a session with no terminal to
+/// ask on); where it is refused it says why itself, so the other ways are named beside it.
+pub const CHECK_BELOW_HIGH_CLAUSE: &str = ", or run ssh-broker elevate ssh-broker doctor in an SSH session";
 
 /// Told to an unelevated process whose agent runs at High and serves no socket it can reach. Names neither
-/// "administrator" nor "Backup Operator": either account is split. Used by `logout`'s line.
+/// "administrator" nor "Backup Operator": either account is split. Used by `logout`'s line and by `doctor`'s
+/// row of what is not checked below High.
 pub const ELEVATED_AGENT_LOOKS_ELSEWHERE: &str = "this account's agent serves elevated processes: run this from an elevated prompt or from an SSH login that asked for SSH_BROKER_ELEVATION=always";
 
 /// Told when a High login lacks `SeImpersonatePrivilege`, which `CreateProcessWithTokenW` needs; the way

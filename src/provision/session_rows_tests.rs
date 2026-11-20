@@ -281,33 +281,42 @@ fn an_always_probe_that_did_not_answer_fails_its_row_with_the_cause() {
     }
 }
 
-/// A probe below High that reports a token at High (which an agent below High never gives) is described as seen:
-/// `session` fails, since a login that asks for no level got an elevated token, and the second row passes, since
-/// the token is elevated. Neither says a probe was not run, as none is asked for below High.
+/// A token at High from a probe below High (which an agent below High never gives) is described as seen by the one
+/// failing `session` row, whatever its elevation. No login asked for `always`, so there is no row about it, and
+/// the token is no standard account's session, so there is no `session privilege`.
 #[test]
-fn a_probe_below_high_that_reports_a_token_at_high_is_described_as_seen() {
-    let rows = session_rows(&answer(elevated()), None);
+fn a_token_at_high_with_no_always_probe_gives_the_one_failing_session_row() {
+    for elevation in [Elevation::Standard, Elevation::Full, Elevation::Filtered] {
+        let rows = session_rows(&answer(probe(Some(elevation), Some(INTEGRITY_HIGH))), None);
 
-    assert_eq!(names(&rows), ["session", "elevated session on request"]);
-    assert_eq!(passes(&rows), [false, true], "{:?}", details(&rows));
-    assert!(rows[0].detail.contains("integrity High"), "{}", rows[0].detail);
-    assert!(!rows[1].detail.contains("not run"), "{}", rows[1].detail);
+        assert_eq!(names(&rows), ["session"], "{elevation:?}");
+        assert_eq!(passes(&rows), [false], "{elevation:?}: {:?}", details(&rows));
+        assert!(
+            rows[0].detail.contains("integrity High"),
+            "{elevation:?}: {}",
+            rows[0].detail
+        );
+    }
 }
 
-/// The same holds for a Standard token at High: it is no standard account's session, so `session privilege` does
-/// not pass, and `session` fails as it does for any token at High.
+/// A token whose level was not reported, with no `always` probe, is the same one failing `session` row: the row
+/// says the probe did not report it, a Standard token included.
 #[test]
-fn a_probe_below_high_that_reports_a_standard_token_at_high_passes_no_row() {
-    let rows = session_rows(&answer(probe(Some(Elevation::Standard), Some(INTEGRITY_HIGH))), None);
+fn a_token_with_no_level_reported_and_no_always_probe_gives_the_one_failing_session_row() {
+    for elevation in [Elevation::Standard, Elevation::Filtered, Elevation::Full] {
+        let rows = session_rows(&answer(probe(Some(elevation), None)), None);
 
-    assert!(
-        rows.iter().all(|row| row.name != "session privilege"),
-        "{:?}",
-        names(&rows)
-    );
-    assert_eq!(names(&rows), ["session", "elevated session on request"]);
-    assert!(!rows[0].pass, "{}", rows[0].detail);
-    assert!(rows[0].detail.contains("integrity High"), "{}", rows[0].detail);
+        assert_eq!(names(&rows), ["session"], "{elevation:?}");
+        assert_eq!(passes(&rows), [false], "{elevation:?}: {:?}", details(&rows));
+        assert!(
+            rows[0].detail.contains("did not report its level"),
+            "{elevation:?}: {}",
+            rows[0].detail
+        );
+    }
+    let rows = session_rows(&answer(probe(None, None)), None);
+    assert_eq!(names(&rows), ["session"]);
+    assert_eq!(passes(&rows), [false], "{:?}", details(&rows));
 }
 
 // the agent is below High ------------------------------------------------------------------

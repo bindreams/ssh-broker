@@ -87,9 +87,9 @@ diff. (No lint enforces any of these — `clippy.toml` is deliberately empty.) F
   which is what keeps a process of the account below High from connecting. An agent at High also binds
   `request.sock` in the plain folder, checked as that folder's sockets are (no High label); it takes requests only
   and never starts a session, and it is what an unelevated process of the account can reach. **Everything on it is
-  input from a lower level** *(review)*: bounded, strictly parsed, and used as a path in two places only, both of
-  an `elevate`: its command's program (absolute: `ElevationRequest::check`) and its working directory (an empty one stands for
-  the account's home; any other must be an existing directory).
+  input from a lower level** *(review)*: bounded, strictly parsed, and two things of a request are used as paths,
+  both of an `elevate`: its command's program, which `ElevationRequest::check` requires to be absolute, and its
+  working directory, which `agent::requests::run_elevated` checks and `child_cwd` resolves.
 - **One rule decides a session's token** *(review)*: `account::step_down` turns a login's level and the process's
   integrity into a token, none or a refusal, for the agent, the shim's fail-open shell and the shim's offer alike.
   Nothing on the SSH command line is interpreted: the level is `SSH_BROKER_ELEVATION` and nothing a client types.

@@ -599,9 +599,8 @@ mod imp {
         // A malformed `--probe-timeout` errors rather than quietly applying the default, so the
         // operator who asked to wait indefinitely never silently gets 30s and a wrong diagnosis.
         let probe_timeout = super::bounded::probe_timeout_from_args(&std::env::args().collect::<Vec<_>>())?;
-        // An administrator's unelevated prompt cannot connect to the agent's own socket, and says above how to
-        // check from an elevated one; a probe would only add a raw "connect to agent" failure beside that, so
-        // none is run.
+        // An administrator's unelevated prompt cannot connect to the agent's own socket, and the row above names
+        // the ways to check; a probe would only add a raw "connect to agent" failure beside that, so none is run.
         if !filtered {
             // The probe runs the exe in the install directory, so an untrusted one never gets that far.
             match layout::run_if_trusted_base(&base, |trusted| {
