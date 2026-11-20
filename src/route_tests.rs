@@ -288,7 +288,6 @@ fn apply_and_doctor_verbs() {
     );
 }
 
-/// `verify` and `verify-probe` are unknown words, which the shim takes.
 #[test]
 fn verify_is_not_a_verb() {
     for word in ["verify", "verify-probe"] {
