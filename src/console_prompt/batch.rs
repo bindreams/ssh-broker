@@ -30,6 +30,9 @@ const EVT_KEY: u16 = 0x0001;
 
 /// The console's input queue.
 pub(super) trait InputQueue {
+    /// How many records are in the queue now.
+    fn queued(&mut self) -> windows::core::Result<u32>;
+
     /// Copy up to `records.len()` records from the head of the queue, leaving them there. Returns
     /// how many; 0 if the queue is empty.
     fn peek(&mut self, records: &mut [INPUT_RECORD]) -> windows::core::Result<u32>;
@@ -50,9 +53,10 @@ impl Batch {
         }
     }
 
-    /// Take every record that is queued now and give it to `relay`, in order, a batch at a time; never wait for one that
-    /// is not. Whatever arrives while this runs is taken too, so it ends when the queue is found empty. `Ok(false)`
-    /// when `relay` said the records could not be passed on: the rest stays queued. The buffer is all zeros on return.
+    /// Take the records that are queued now and give them to `relay`, in order, a batch at a time; never wait for one
+    /// that is not. One pass: whatever arrives while this runs is left in the queue, so a sustained stream cannot keep
+    /// it from ending. `Ok(false)` when `relay` said the records could not be passed on: the rest stays queued. The
+    /// buffer is all zeros on return.
     pub fn drain(
         &mut self,
         queue: &mut impl InputQueue,
@@ -68,18 +72,18 @@ impl Batch {
         queue: &mut impl InputQueue,
         relay: &mut dyn FnMut(&[INPUT_RECORD]) -> bool,
     ) -> windows::core::Result<bool> {
-        loop {
-            let queued = (queue.peek(&mut self.records)? as usize).min(BATCH);
-            if queued == 0 {
-                return Ok(true);
-            }
-            // At least `queued` records are there, so this does not wait. The console may have merged a repeat into
-            // the last, which the read returns as it is by now.
-            let taken = (queue.read(&mut self.records[..queued])? as usize).min(queued);
+        let mut left = queue.queued()? as usize;
+        while left > 0 {
+            let batch = left.min(BATCH);
+            // At least `batch` records are there, so this does not wait. The console may have merged a repeat into
+            // the last, which the read returns as it is by now: a merge adds no record.
+            let taken = (queue.read(&mut self.records[..batch])? as usize).min(batch);
+            left -= taken;
             if !relay(&self.records[..taken]) {
                 return Ok(false);
             }
         }
+        Ok(true)
     }
 
     /// Block until one entry step finishes, and return it, or until `stop` says so while no step is finishing: then

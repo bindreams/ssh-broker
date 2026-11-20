@@ -1427,7 +1427,7 @@ fn an_input_worker_that_was_never_started_is_not_stopped_or_joined_and_its_write
 
 // The consent question, from the main pump to the input worker -----
 
-use super::{ConsentSlot, send_answer};
+use super::{ConsentSlot, send_outcome};
 use crate::protocol::{ConsentAnswer, ConsentReply, ConsentRequest, FrameKind, FrameReader, PROTOCOL_VERSION, Resize};
 
 fn a_question(id: u32, command: &str) -> ConsentRequest {
@@ -1560,7 +1560,7 @@ fn a_withdrawal_of_another_question_leaves_the_open_one_open() {
 fn the_size_is_sent_before_the_answer_and_both_are_whole_frames() {
     for answer in [ConsentAnswer::Allow, ConsentAnswer::Refuse] {
         let mut wire = Vec::new();
-        send_answer(&mut wire, ConsentReply { id: 7, answer }, (100, 40)).unwrap();
+        send_outcome(&mut wire, Some(ConsentReply { id: 7, answer }), (100, 40)).unwrap();
         let mut frames = FrameReader::new();
         frames.push(&wire);
         let first = frames.next_frame().unwrap().expect("the size");
@@ -1578,13 +1578,34 @@ fn the_size_is_sent_before_the_answer_and_both_are_whole_frames() {
     }
 }
 
-/// The record the shim injects to wake its own read is never a focus report: one left in the queue after a question
-/// is read later by the relay, which would send the program `ESC[O` if the program asked for focus reports.
+/// A question the agent withdrew consumed the console's resize records as well, and gets no answer: the size is sent
+/// all the same, so the session is repainted at the size the person has.
 #[test]
-fn the_shims_own_wake_record_is_no_focus_report_and_the_terminals_are() {
-    assert_eq!(super::reported_focus(super::WAKE_MARK), None);
-    assert_eq!(super::reported_focus(1), Some(true), "the terminal's focus-in");
-    assert_eq!(super::reported_focus(0), Some(false), "the terminal's focus-out");
+fn a_withdrawn_question_sends_the_size_and_no_answer() {
+    let mut wire = Vec::new();
+    send_outcome(&mut wire, None, (100, 40)).unwrap();
+    let mut frames = FrameReader::new();
+    frames.push(&wire);
+    let only = frames.next_frame().unwrap().expect("the size");
+    assert_eq!(only.kind, FrameKind::Resize);
+    assert_eq!(Resize::decode(&only.payload).unwrap(), Resize { cols: 100, rows: 40 });
+    assert!(frames.next_frame().unwrap().is_none(), "nothing else was sent");
+}
+
+/// The record the shim injects to wake its own read is of a kind the relay never forwards, whatever the console keeps
+/// of its content: one left in the queue after a question is read later by the relay, which would send the program
+/// `ESC[O` if it were a focus report and the program asked for them.
+#[test]
+fn the_shims_own_wake_record_is_of_a_kind_the_relay_never_forwards() {
+    let kind = super::wake_record().EventType;
+    for forwarded in [
+        super::EVT_KEY,
+        super::EVT_MOUSE,
+        super::EVT_WINDOW_BUFFER_SIZE,
+        super::EVT_FOCUS,
+    ] {
+        assert_ne!(kind, forwarded, "the relay forwards records of kind {forwarded}");
+    }
 }
 
 // The root process of a console keeps running through Ctrl+C -----------------------------

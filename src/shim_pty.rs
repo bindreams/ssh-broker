@@ -41,20 +41,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::System::Console::{
-    CONSOLE_SCREEN_BUFFER_INFO, FOCUS_EVENT_RECORD, GetConsoleScreenBufferInfo, GetStdHandle, INPUT_RECORD,
-    INPUT_RECORD_0, ReadConsoleInputW, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, WriteConsoleInputW,
+    CONSOLE_SCREEN_BUFFER_INFO, GetConsoleScreenBufferInfo, GetStdHandle, INPUT_RECORD, INPUT_RECORD_0,
+    MENU_EVENT_RECORD, ReadConsoleInputW, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, WriteConsoleInputW,
 };
-use windows::core::BOOL;
 
 // INPUT_RECORD.EventType values (processthreadsapi/consoleapi). windows-rs 0.62 does not
 // export them as usable typed consts, so name them with their documented `u16` values.
 const EVT_KEY: u16 = 0x0001;
 const EVT_MOUSE: u16 = 0x0002;
 const EVT_WINDOW_BUFFER_SIZE: u16 = 0x0004;
+const EVT_MENU: u16 = 0x0008;
 const EVT_FOCUS: u16 = 0x0010;
-/// The `bSetFocus` of the focus record the shim injects to wake its own read ([`wake_console_input`]). The console
-/// writes 0 and 1 in the focus records it makes of the terminal's reports, so this is none of the person's.
-const WAKE_MARK: i32 = 2;
 
 // ── run() wiring + fail-open ───────────────────────────────────────────────────────
 
@@ -1088,19 +1085,16 @@ impl RecordRelay<'_> {
                 }
                 // Forward focus in/out as `CSI I`/`CSI O`, but ONLY when the shell enabled
                 // ?1004 — else focus-naive programs would see stray `ESC[I`/`ESC[O`. A focus
-                // record arriving while the gate is closed falls through to the `_` arm. The
-                // shim's own wake records (also FOCUS, see `reported_focus`) are never forwarded, including
-                // one that a question left in the queue.
+                // record arriving while the gate is closed falls through to the `_` arm.
                 EVT_FOCUS if gate.focus.load(Ordering::Relaxed) => {
-                    let Some(focused) = reported_focus(unsafe { rec.Event.FocusEvent }.bSetFocus.0) else {
-                        continue;
-                    };
+                    let focused = unsafe { rec.Event.FocusEvent }.bSetFocus.0 != 0;
                     let seq: &[u8] = if focused { b"\x1b[I" } else { b"\x1b[O" };
                     if write_data(tx, Stream::Pty, seq).is_err() {
                         return false;
                     }
                 }
-                _ => {} // MENU: ignored (internal)
+                // MENU (the shim's own wake record, [`wake_console_input`]) and anything else: ignored.
+                _ => {}
             }
         }
         true
@@ -1138,44 +1132,44 @@ fn ask_person(
         tracing::warn!("the consent question could not be put on the console, so it is refused: {e}");
         ConsentAnswer::Refuse
     });
-    match consent.finish(request.id, answer) {
-        Some(reply) => send_answer(&mut *relay.tx, reply, console_size(stdout)).is_ok(),
-        None => true,
+    send_outcome(&mut *relay.tx, consent.finish(request.id, answer), console_size(stdout)).is_ok()
+}
+
+/// Send the console's size, and then the answer if there is one. The question's own resize records were taken from the
+/// console's queue, so the size the agent has may be stale; it is given before the answer, so that the command an
+/// `Allow` starts is started at the size the person has, and the session is repainted at it. A question the agent
+/// withdrew has no answer, and took the resize records all the same.
+fn send_outcome(
+    tx: &mut impl std::io::Write,
+    reply: Option<ConsentReply>,
+    (cols, rows): (u16, u16),
+) -> anyhow::Result<()> {
+    write_frame(tx, FrameKind::Resize, &size_to_resize(cols, rows).encode())?;
+    match reply {
+        Some(reply) => write_frame(tx, FrameKind::ConsentAnswer, &reply.encode()?),
+        None => Ok(()),
     }
 }
 
-/// Send the console's size, and then the answer. The question's own resize records were taken from the console's
-/// queue, so the size the agent has may be stale; it is given before the answer, so that the command an `Allow`
-/// starts is started at the size the person has, and the session is repainted at it.
-fn send_answer(tx: &mut impl std::io::Write, reply: ConsentReply, (cols, rows): (u16, u16)) -> anyhow::Result<()> {
-    write_frame(tx, FrameKind::Resize, &size_to_resize(cols, rows).encode())?;
-    write_frame(tx, FrameKind::ConsentAnswer, &reply.encode()?)
-}
-
-/// What a focus record of the person's terminal says: `Some(focused)`. The record [`wake_console_input`] injects is
-/// the shim's own, carries [`WAKE_MARK`], and says nothing to the relay: `None`.
-fn reported_focus(set_focus: i32) -> Option<bool> {
-    (set_focus != WAKE_MARK).then_some(set_focus != 0)
-}
-
-/// Wake a parked `ReadConsoleInputW` by injecting one FOCUS record, which the console queues as it is written
-/// (`bSetFocus` and all; measured), marked with [`WAKE_MARK`] so that the relay never forwards it as a focus report,
-/// wherever it is read: when it is read for the stop that woke the worker, or left in the queue after a question and
-/// read later. More reliable for console reads than `CancelSynchronousIo` (which may not cancel a parked console
-/// wait).
+/// Wake a parked `ReadConsoleInputW` by injecting one MENU record, which the console queues as it is written and
+/// `ReadConsoleInputW` returns (measured). The relay ignores records of that kind whatever they hold, wherever one is
+/// read: for the stop that woke the worker, or left in the queue after a question and read later. More reliable for
+/// console reads than `CancelSynchronousIo` (which may not cancel a parked console wait).
 fn wake_console_input(stdin_raw: isize) {
-    let rec = INPUT_RECORD {
-        EventType: EVT_FOCUS,
-        Event: INPUT_RECORD_0 {
-            FocusEvent: FOCUS_EVENT_RECORD {
-                bSetFocus: BOOL(WAKE_MARK),
-            },
-        },
-    };
+    let rec = wake_record();
     let stdin = HANDLE(stdin_raw as *mut core::ffi::c_void);
     let mut written = 0u32;
     // SAFETY: the handle is the console's input, live for the call; `rec` and `written` are valid for it.
     let _ = unsafe { WriteConsoleInputW(stdin, std::slice::from_ref(&rec), &mut written) };
+}
+
+fn wake_record() -> INPUT_RECORD {
+    INPUT_RECORD {
+        EventType: EVT_MENU,
+        Event: INPUT_RECORD_0 {
+            MenuEvent: MENU_EVENT_RECORD { dwCommandId: 0 },
+        },
+    }
 }
 
 /// Current visible window size (cols, rows) from the console, or an 80×24 default if the

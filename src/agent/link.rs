@@ -14,25 +14,25 @@
 //! **The question.** Before a command is run for a session whose login asks, the same connection carries the question
 //! to the session's shim ([`Link::ask`]) and its answer comes back on it. While it is asked the session's output is
 //! held, as it is while a command holds the screen. The shim writes the question and reads the answer from the console
-//! itself and relays nothing while it does, so the agent drops no key: it keeps every one that arrives while the
-//! question is asked, in two groups. A key that arrives before the answer (or the withdrawal) was relayed before the
-//! shim began to ask, and is the session's always: it is delivered to the session's target, also when a command run
-//! with `--terminal` takes the screen, where it waits in the session's own input queue as type-ahead does. A key that
-//! arrives after it is ordered after it: it goes to the command that is hosted, else to the session after the first
-//! group. The screen goes back to the session, repainted, when the question's hold on it is let go, unless a command
-//! run with `--terminal` has taken it from the question by then.
+//! itself and relays nothing while it does, so the agent drops no key, and only the session's input pump
+//! ([`Link::route_input`]) hands keys out. A key that arrives before the answer (or the withdrawal) was relayed before
+//! the shim began to ask, and is the session's: the pump gives it to the session's target at once, as at any other
+//! time. A key that arrives after the answer is ordered after it: the pump waits until the command run with
+//! `--terminal` is hosted (and then gives it to the command) or the question's hold on the screen is let go (and then
+//! gives it to the session). The screen goes back to the session, repainted, when the hold is let go, unless a command
+//! has taken it from the question by then.
 //!
-//! The kept keys have no bound. They last from the question to the command's start or the screen's return, hold one
-//! person's typing, and the session's frame reader that routes them must never park: it is the one that sees the
-//! client hang up (see `HandleWriter`).
+//! The pump's one wait is on the link's condition variable, re-checked, with no timeout. It ends by the request
+//! thread's own progress, which needs neither the pump nor the session's client: `is_gone`, starting the process,
+//! attaching it, a small `Serving` write on the request's connection, then hosting it or dropping the hold. Every path
+//! of `run_hosted` and `on_a_pseudoconsole` either hosts or drops the [`AskGuard`], unwinding included, and the
+//! hang-up watcher keeps watching meanwhile. [`Link::end`] releases it too.
 //!
 //! **Locks.** The state (whom the connection carries, where input goes, the size) is under one lock that is never
 //! held across a write to the connection. Writes are serialised by a second lock of their own, which holds the write
 //! half. Input and resize take only the state lock and the target's own handle, so they are routed while an output
-//! write is blocked on a full connection. The order, where both are taken, is writer then state. Two small locks keep
-//! the order of what is applied to a target: sizes (`resizing`) and keys (`inputting`); they come before the state
-//! lock, `resizing` first. Delivering the kept keys can park in a full target queue, so it holds `inputting` alone,
-//! never `resizing`: a resize does not wait for it.
+//! write is blocked on a full connection. The order, where both are taken, is writer then state. One small lock keeps
+//! the order in which sizes are applied to a target (`resizing`); it comes before the state lock.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
@@ -62,6 +62,9 @@ enum Question {
     None,
     /// The `Consent` frame, numbered so, is written or being written, and the answer has not come.
     Asked(u32),
+    /// The answer has come. It lasts until the question's hold is let go or a command is hosted, and the session's keys
+    /// wait while it does: they were typed after the answer, and go to the command or to the session once that is
+    /// known.
     Answered(ConsentAnswer),
 }
 
@@ -112,13 +115,6 @@ struct State {
     question: Question,
     /// The number the last question was given: the link numbers its questions from 1 ([`ConsentRequest::id`]).
     last_question: u32,
-    /// The keys that arrived while the question was asked and before its answer or withdrawal, in order. They were
-    /// relayed before the shim began to ask, so they are the session's whoever gets the screen.
-    early: Vec<Vec<u8>>,
-    /// The keys that arrived after the question's answer or withdrawal, in order: `None` until one has come. They
-    /// wait here until the question's outcome is known, then go to the command hosted ([`Link::host_elevated`]) or
-    /// to the session ([`Link::switch_back`]), after the early ones.
-    kept: Option<Vec<Vec<u8>>>,
 }
 
 impl State {
@@ -139,9 +135,6 @@ pub(super) struct Link {
     changed: Condvar,
     /// Held while a size is applied, so that two sizes are applied in the order they were taken.
     resizing: Mutex<()>,
-    /// Held while keys are delivered to a target, so that the kept keys ([`State::early`], [`State::kept`]) reach it
-    /// before a later one.
-    inputting: Mutex<()>,
     writer: Mutex<Box<dyn HalfClose + Send>>,
 }
 
@@ -152,7 +145,7 @@ enum Admit {
     Ended,
 }
 
-fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+pub(super) fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
@@ -176,12 +169,9 @@ impl Link {
                 elevated: None,
                 question: Question::None,
                 last_question: 0,
-                early: Vec::new(),
-                kept: None,
             }),
             changed: Condvar::new(),
             resizing: Mutex::new(()),
-            inputting: Mutex::new(()),
             writer: Mutex::new(Box::new(tx)),
         })
     }
@@ -258,27 +248,30 @@ impl Link {
     }
 
     /// Send the client's keys to whichever target is current: the elevated command's while its input is its, else
-    /// the session's. Takes no lock the connection's writes hold.
+    /// the session's. Takes no lock the connection's writes hold. Only the session's input pump calls it, and it is
+    /// the only thing that hands keys out.
     ///
-    /// While the question is asked the keys are kept ([`State::early`] before its answer or withdrawal,
-    /// [`State::kept`] after), in order and without bound, until the question's outcome is known: the caller is the
-    /// session's frame reader, which never parks here.
+    /// Once the question is answered the keys wait ([`Question::Answered`]) until the command is hosted or the
+    /// question's hold is let go, or the link has ended: the pump is the one reader of the client's frames, so
+    /// keys after the answer cannot overtake it, and the keys before the answer have gone already.
     ///
     /// An error is the session's own target's. The elevated command's input fails when the command is ending (its
     /// pseudoconsole is closed while it is still current), which is no fault of the session: the keys are dropped,
     /// and the caller, which stops delivering input for good on an error, goes on.
     pub(super) fn route_input(&self, bytes: &[u8]) -> anyhow::Result<()> {
-        // Held until the keys are delivered, so that what the switch back of a question delivers (its kept keys)
-        // is ahead of them.
-        let _ordered = locked(&self.inputting);
+        self.route_input_observed(bytes, || {})
+    }
+
+    /// [`Link::route_input`], calling `waiting` each time it is about to wait for the question's outcome (with the
+    /// state locked, so that the outcome cannot slip in before the wait begins), so that a test can tell that it is
+    /// waiting.
+    pub(super) fn route_input_observed(&self, bytes: &[u8], mut waiting: impl FnMut()) -> anyhow::Result<()> {
         let mut state = locked(&self.state);
-        let elevated = if state.carrier == Carrier::Asking {
-            let state = &mut *state;
-            state.kept.as_mut().unwrap_or(&mut state.early).push(bytes.to_vec());
-            return Ok(());
-        } else {
-            state.elevated.as_ref().and_then(|hosted| hosted.target.clone())
-        };
+        while matches!(state.question, Question::Answered(_)) && !state.ended {
+            waiting();
+            state = self.changed.wait(state).unwrap_or_else(PoisonError::into_inner);
+        }
+        let elevated = state.elevated.as_ref().and_then(|hosted| hosted.target.clone());
         drop(state);
         match (elevated, &self.session) {
             (Some(target), _) => {
@@ -289,17 +282,6 @@ impl Link {
             }
             (None, Some(target)) => target.input(bytes),
             (None, None) => Ok(()),
-        }
-    }
-
-    /// Deliver the keys kept for a question to `target`, in order. An error (the target is ending, as in
-    /// [`Link::route_input`]) is logged and does not stop the rest. The caller holds `inputting`, and not `resizing`:
-    /// a delivery can park in the target's full queue.
-    fn deliver_kept(kept: Vec<Vec<u8>>, target: &dyn InputTarget) {
-        for chunk in kept {
-            if let Err(e) = target.input(&chunk) {
-                tracing::debug!("the keys kept for a question could not be delivered: {e:#}");
-            }
         }
     }
 
@@ -332,21 +314,19 @@ impl Link {
     /// calls it. Dropping the guard gives the output back. Only a link with a terminal has a screen to hand over:
     /// `decide` refuses the request that would come here for one without.
     ///
-    /// The keys kept while a question was asked go first: those from before its answer ([`State::early`]) to the
-    /// session's own target, the others ([`State::kept`]) to `target`, both ahead of any later key. They are delivered
-    /// holding `inputting` alone, after the size is applied.
+    /// It delivers no keys. It ends the question ([`Question::Answered`]), so the pump, which has held the keys typed
+    /// after the answer, gives them to `target` ([`Link::route_input`]).
     ///
     /// `None` when the session's shell is gone already ([`Link::end_hosting`]): nothing is hosted, and this calls
-    /// `end` itself, so a command that asks too late is ended as one hosted when the session ended is.
+    /// `end` itself, so a command that asks too late is ended as one hosted when the session ended is. The question is
+    /// then left as it is: the caller's drop of its hold clears it.
     pub(super) fn host_elevated(&self, target: ElevatedTarget, end: Killer) -> Option<ElevatedGuard<'_>> {
         debug_assert!(self.terminal, "a command was hosted on a link without a terminal");
         let applying = locked(&self.resizing);
-        let ordered = locked(&self.inputting);
-        let (cols, rows, early, kept) = {
+        let (cols, rows) = {
             let mut state = locked(&self.state);
             if state.hosting_ended {
                 drop(state);
-                drop(ordered);
                 drop(applying);
                 end();
                 return None;
@@ -356,23 +336,12 @@ impl Link {
                 target: Some(Arc::clone(&target)),
                 end,
             });
-            (
-                state.size.0,
-                state.size.1,
-                std::mem::take(&mut state.early),
-                state.kept.take().unwrap_or_default(),
-            )
+            state.question = Question::None;
+            state.size
         };
         self.changed.notify_all();
         target.resize(cols, rows);
-        // The size is applied; what is delivered next can park in a full queue, and a resize must not wait for that.
-        // `inputting` stays held, which keeps these keys ahead of later ones.
         drop(applying);
-        if let Some(session) = &self.session {
-            Self::deliver_kept(early, &**session);
-        }
-        Self::deliver_kept(kept, &*target);
-        drop(ordered);
         Some(ElevatedGuard { link: self })
     }
 
@@ -439,11 +408,7 @@ impl Link {
                 return Err(Ended);
             }
             debug_assert!(
-                state.carrier == Carrier::Session
-                    && state.question == Question::None
-                    && state.elevated.is_none()
-                    && state.early.is_empty()
-                    && state.kept.is_none(),
+                state.carrier == Carrier::Session && state.question == Question::None && state.elevated.is_none(),
                 "a question was asked while the screen was not the session's, or another was open"
             );
             state.last_question = state.last_question.wrapping_add(1);
@@ -470,15 +435,12 @@ impl Link {
         let mut state = locked(&self.state);
         loop {
             if let Question::Answered(answer) = state.question {
-                state.question = Question::None;
+                // Left set: the session's keys wait for the hold to be let go or a command to be hosted.
                 drop(state);
                 return Ok((answer, hold));
             }
             if state.over_for(Carrier::Session) || state.hosting_ended || gone.is_gone() {
                 state.question = Question::None;
-                // The shim leaves the question when it reads the withdrawal, and relays keys again: those come
-                // after it, as the keys after an answer do.
-                state.kept = Some(Vec::new());
                 drop(state);
                 self.withdraw(id);
                 return Err(Ended);
@@ -523,7 +485,6 @@ impl Link {
             return;
         }
         state.question = Question::Answered(reply.answer);
-        state.kept = Some(Vec::new());
         drop(state);
         self.changed.notify_all();
     }
@@ -534,16 +495,19 @@ impl Link {
     /// (the clear that began the question, or the command's own screen, wiped what it had). Never a different size
     /// and back: that stream asks the person's terminal to resize its window.
     ///
-    /// The keys kept for a question are delivered first, holding `inputting` alone; the size is applied after, under
-    /// `resizing`, at the size the client has by then. A resize that comes between goes to the session as it comes.
+    /// It delivers no keys. Letting go of the question's hold (`from` is [`Carrier::Asking`]) always ends the
+    /// question ([`Question::Answered`] lasts until then), also when a command has the screen by now, so the keys the
+    /// pump holds go to the session, or stay with the command that took the screen. The size is applied under
+    /// `resizing`, at the size the client has by then.
     fn switch_back(&self, from: Carrier) {
-        // Only a question's screen has kept keys (a command hosted since took them).
-        let ordered = (from == Carrier::Asking).then(|| locked(&self.inputting));
-        let (hosted, early, kept, ours) = {
+        let (hosted, ours) = {
             let mut state = locked(&self.state);
             let ours = state.carrier == from;
             if ours {
                 state.carrier = Carrier::Session;
+            }
+            if from == Carrier::Asking {
+                state.question = Question::None;
             }
             // The command's guard clears what it set whoever carries the connection by now: `end_hosting` waits for
             // nothing to be hosted.
@@ -552,12 +516,7 @@ impl Link {
             } else {
                 None
             };
-            let (early, kept) = if ours {
-                (std::mem::take(&mut state.early), state.kept.take().unwrap_or_default())
-            } else {
-                (Vec::new(), Vec::new())
-            };
-            (hosted, early, kept, ours)
+            (hosted, ours)
         };
         self.changed.notify_all();
         drop(hosted);
@@ -565,15 +524,13 @@ impl Link {
             return;
         }
         let Some(session) = &self.session else { return };
-        Self::deliver_kept(early, &**session);
-        Self::deliver_kept(kept, &**session);
-        drop(ordered);
         let _applying = locked(&self.resizing);
         let (cols, rows) = locked(&self.state).size;
         session.resize(cols, rows);
     }
 
-    /// The session is over: every wait ends with an error and none begins.
+    /// The session is over: every wait ends (a deliver with an error, a [`Link::route_input`] by delivering) and none
+    /// begins.
     pub(super) fn end(&self) {
         locked(&self.state).ended = true;
         self.changed.notify_all();

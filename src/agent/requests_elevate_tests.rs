@@ -641,10 +641,10 @@ fn a_client_that_hangs_up_while_the_question_is_asked_ends_it_and_nothing_runs()
 }
 
 /// The shim relays nothing while it asks, so a key that reaches the agent before the answer was relayed before the
-/// question: it is the session's (the tail of a pasted block, say). The agent keeps it and gives it to the session
-/// once the question is over, ahead of what is typed after.
+/// question: it is the session's (the tail of a pasted block, say). The agent gives it to the session at once, ahead
+/// of what is typed after.
 #[test]
-fn input_typed_while_asking_is_kept_by_the_agent_for_the_session() {
+fn input_typed_while_asking_goes_to_the_session() {
     let _serial = serial();
     let mut session = host("typed", Mode::Pty, ElevationPolicy::Prompt);
     let asking = ask(
@@ -653,7 +653,7 @@ fn input_typed_while_asking_is_kept_by_the_agent_for_the_session() {
         send(request(&session.id, &cmd("/c echo SHOULD-NOT-RUN"), r"C:\")),
     );
     session.client.read_question();
-    // Frames of one connection are handled in order: this is kept before the answer is read.
+    // Frames of one connection are handled in order: this reaches the session before the answer is read.
     session.client.type_text("xearly\r\n");
     session.client.answer(ConsentAnswer::Refuse);
     assert_eq!(asking.join().unwrap().outcome, Outcome::Exited(126));

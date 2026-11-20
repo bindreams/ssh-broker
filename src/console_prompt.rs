@@ -11,8 +11,8 @@
 
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::System::Console::{
-    GetConsoleMode, GetStdHandle, INPUT_RECORD, PeekConsoleInputW, ReadConsoleInputW, STD_INPUT_HANDLE,
-    STD_OUTPUT_HANDLE, WriteConsoleW,
+    GetConsoleMode, GetNumberOfConsoleInputEvents, GetStdHandle, INPUT_RECORD, PeekConsoleInputW, ReadConsoleInputW,
+    STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, WriteConsoleW,
 };
 
 use crate::consent_entry::{ConsentEntry, ConsentStep};
@@ -118,8 +118,9 @@ fn write_console(output: HANDLE, text: &str) -> windows::core::Result<()> {
 /// agent holds their output. Nothing is written after the answer; the agent repaints the session's screen. An error is
 /// a console that could not be read or written to, and nothing was asked.
 ///
-/// `stop` is looked at after every batch of records that did not finish the answer; whatever makes it true must
-/// then put a record in the queue (the shim's does, with `wake_console_input`), which wakes the read.
+/// `stop` is looked at after the drain, before anything is written (a question that ended meanwhile paints nothing),
+/// and after every batch of records that did not finish the answer; whatever makes it true must then put a record in
+/// the queue (the shim's does, with `wake_console_input`), which wakes the read.
 pub fn ask_consent(
     stdin: HANDLE,
     stdout: HANDLE,
@@ -148,7 +149,7 @@ fn ask_on(
     stop: &dyn Fn() -> bool,
 ) -> windows::core::Result<ConsentAnswer> {
     let mut batch = Batch::new();
-    if !batch.drain(queue, relay)? {
+    if !batch.drain(queue, relay)? || stop() {
         return Ok(ConsentAnswer::Refuse);
     }
     write(&format!("{CONSENT_SCREEN_ENTER}{question}"))?;
@@ -174,6 +175,13 @@ fn ask_on(
 struct ConsoleInput(HANDLE);
 
 impl InputQueue for ConsoleInput {
+    fn queued(&mut self) -> windows::core::Result<u32> {
+        let mut count = 0u32;
+        // SAFETY: `count` is valid for the call; the handle is the console's input.
+        unsafe { GetNumberOfConsoleInputEvents(self.0, &mut count) }?;
+        Ok(count)
+    }
+
     fn peek(&mut self, records: &mut [INPUT_RECORD]) -> windows::core::Result<u32> {
         let mut count = 0u32;
         // SAFETY: `records` and `count` are valid for the call; the handle is the console's input.

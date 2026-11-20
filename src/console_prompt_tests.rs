@@ -278,6 +278,42 @@ fn a_console_with_nothing_queued_relays_nothing_and_does_not_wait() {
     );
 }
 
+/// The drain is one pass over what is queued when the question is taken: what arrives while it runs arrived after the
+/// question was asked, so it is the person's answer and not the session's, and a stream that does not stop cannot keep
+/// the question from appearing.
+#[test]
+fn what_arrives_during_the_drain_is_not_drained() {
+    let paste: String = ('a'..='z').cycle().take(2 * batch::BATCH + 5).collect();
+    let mut queue = FakeQueue::with(typed(&paste));
+    queue.typed_after_read = typed("late");
+    queue.arrivals.push_back(typed("\r"));
+    let log = Log::default();
+    assert_eq!(ask(&mut queue, &log, &|| false).unwrap(), ConsentAnswer::Refuse);
+    let relayed: String = log
+        .borrow()
+        .iter()
+        .filter_map(|entry| entry.strip_prefix("relay "))
+        .collect();
+    assert_eq!(relayed, paste, "only what was queued when the question was taken");
+    assert_eq!(
+        log.borrow().iter().filter(|entry| entry.starts_with("write ")).count(),
+        // The question, then the echo of each of the four late characters.
+        1 + 4,
+        "the late records came after the question and were read as its answer: {:?}",
+        log.borrow()
+    );
+}
+
+/// A question withdrawn, or a shim stopped, while the drain ran paints nothing: the screen is not cleared for a
+/// question that is already over.
+#[test]
+fn a_stop_that_is_true_after_the_drain_paints_nothing() {
+    let mut queue = FakeQueue::with(typed("ls\r"));
+    let log = Log::default();
+    assert_eq!(ask(&mut queue, &log, &|| true).unwrap(), ConsentAnswer::Refuse);
+    assert_eq!(*log.borrow(), ["relay ls\r".to_owned()], "relayed, and nothing written");
+}
+
 /// Records that cannot be relayed mean the connection is gone: the question is not written.
 #[test]
 fn a_relay_that_fails_refuses_and_writes_nothing() {

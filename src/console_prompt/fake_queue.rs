@@ -71,6 +71,9 @@ pub(super) struct FakeQueue {
     /// After the next peek that reaches the end of the queue, the console merges a repeat of the last
     /// key-down into that record: its `wRepeatCount` becomes this.
     pub(super) merge_into_tail_after_peek: Option<u16>,
+    /// What the person types right after the next `read`: records that arrive while a drain is running.
+    pub(super) typed_after_read: Vec<INPUT_RECORD>,
+    /// The queue cannot be looked at (`queued` and `peek` fail).
     pub(super) fail_peek: bool,
     pub(super) fail_read: bool,
 }
@@ -97,6 +100,13 @@ pub(super) fn failure() -> windows::core::Error {
 }
 
 impl InputQueue for FakeQueue {
+    fn queued(&mut self) -> windows::core::Result<u32> {
+        if self.fail_peek {
+            return Err(failure());
+        }
+        Ok(self.queue.len() as u32)
+    }
+
     fn peek(&mut self, records: &mut [INPUT_RECORD]) -> windows::core::Result<u32> {
         if self.fail_peek {
             records[0] = key(0x41, 'x' as u16);
@@ -131,6 +141,7 @@ impl InputQueue for FakeQueue {
             *slot = self.queue.pop_front().unwrap();
         }
         self.removed += count;
+        self.queue.extend(std::mem::take(&mut self.typed_after_read));
         Ok(count as u32)
     }
 }

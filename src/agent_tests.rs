@@ -1170,13 +1170,6 @@ fn exec_disconnect_with_a_parked_input_pump_reaps_the_tree_of_a_silent_command()
     );
 }
 
-/// The same on the PTY path, which shares `HandleWriter`.
-#[test]
-fn pty_disconnect_with_a_parked_input_pump_reaps_the_tree_of_a_silent_command() {
-    let raw = run_tree_session("tree-pty-flood", Mode::Pty, false, Ending::Disconnect, true);
-    assert_exits(raw, "the grandchild after a PTY disconnect with the input pump parked");
-}
-
 /// An anonymous pipe `(read, write)`.
 fn anonymous_pipe() -> (crate::winutil::OwnedHandle, crate::winutil::OwnedHandle) {
     use windows::Win32::Foundation::HANDLE;
@@ -1192,7 +1185,7 @@ fn anonymous_pipe() -> (crate::winutil::OwnedHandle, crate::winutil::OwnedHandle
 fn handle_writer_reports_a_full_queue() {
     let (read, write) = anonymous_pipe();
     let parked = ParkSignal::default();
-    let writer = HandleWriter::spawn(write.raw(), Some(write), parked.clone());
+    let writer = HandleWriter::bounded(write.raw(), Some(write), parked.clone());
     // Nobody reads the pipe: the big chunk stalls the writer thread, then the queue fills and the
     // feeder parks in a send.
     let feeder = thread::spawn(move || {

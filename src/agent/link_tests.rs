@@ -503,71 +503,74 @@ fn no_output_frame_follows_the_consent_frame_until_the_answer() {
     assert_eq!(wire.data(), ["Pbefore", "Pheld"]);
 }
 
+/// The inputs a recording target was given, without its sizes.
+fn inputs(target: &Recorder) -> Vec<String> {
+    target
+        .events()
+        .into_iter()
+        .filter(|event| event.starts_with("input "))
+        .collect()
+}
+
 /// The shim relays nothing while it asks, so a key that reaches the agent before the answer was relayed before the
-/// question existed: it is the session's, never dropped, and is delivered once the screen goes back to it. The size
-/// is applied at once.
+/// question existed: it is the session's, and goes to it at once, as at any other time.
 #[test]
-fn input_typed_while_asking_is_kept_for_the_session_and_the_size_is_not() {
+fn keys_before_the_answer_go_straight_to_the_session() {
     let (wire, session) = (Wire::default(), Arc::new(Recorder::default()));
     let link = terminal_link(&wire, &session);
-    link.route_input(b"a").unwrap();
     let asked = ask_on_a_thread(&link);
     asked.parked.recv().unwrap();
 
-    link.route_input(b"yes\r").expect("kept, not an error");
+    link.route_input_observed(b"before", || panic!("waited before the answer"))
+        .unwrap();
     link.resize(Resize { cols: 100, rows: 40 });
-    assert_eq!(
-        session.events(),
-        ["input a", "resize 100x40"],
-        "the key waits for the screen; the size does not"
-    );
+    assert_eq!(session.events(), ["input before", "resize 100x40"]);
+    assert_eq!(carrier(&link), Carrier::Asking, "the question still holds the screen");
 
     link.answer(reply(1, ConsentAnswer::Refuse));
     asked.answer.recv().unwrap().unwrap();
     asked.finish();
-    link.route_input(b"c").unwrap();
-    assert_eq!(
-        session.events(),
-        ["input a", "resize 100x40", "input yes\r", "resize 100x40", "input c"],
-        "the kept key, then the repaint at the size, then the later keys"
-    );
 }
 
-/// The client's input is ordered after its answer: keys that arrive once the answer has (a paste `y`, Enter and a
-/// command) are the session's, kept in order and delivered when the screen goes back, ahead of later keys and behind
-/// the keys that arrived before the answer.
+/// The client's input is ordered after its answer: a key that arrives once the answer has waits, in the pump that
+/// carries it, until the question's hold is let go, and then goes to the session.
 #[test]
-fn keys_after_the_answer_are_kept_for_the_session_after_a_refusal_in_order() {
-    let (wire, session) = (Wire::default(), Arc::new(Recorder::default()));
-    let link = terminal_link(&wire, &session);
-    let asked = ask_on_a_thread(&link);
-    asked.parked.recv().unwrap();
+fn keys_after_the_answer_wait_for_the_hold_and_go_to_the_session_when_it_is_let_go() {
+    for answer in [ConsentAnswer::Allow, ConsentAnswer::Refuse] {
+        let (wire, session) = (Wire::default(), Arc::new(Recorder::default()));
+        let link = terminal_link(&wire, &session);
+        let asked = ask_on_a_thread(&link);
+        asked.parked.recv().unwrap();
+        link.answer(reply(1, answer));
+        asked.answer.recv().unwrap().unwrap();
 
-    link.route_input(b"before").unwrap();
-    link.answer(reply(1, ConsentAnswer::Refuse));
-    link.route_input(b"dir").unwrap();
-    link.route_input(b"\r").unwrap();
-    asked.answer.recv().unwrap().unwrap();
-    assert_eq!(
-        session.events(),
-        Vec::<String>::new(),
-        "kept, not delivered, while it holds the screen"
-    );
+        let (waiting, on_waiting) = mpsc::channel();
+        let pump = {
+            let link = Arc::clone(&link);
+            std::thread::spawn(move || {
+                link.route_input_observed(b"dir", || {
+                    let _ = waiting.send(());
+                })
+            })
+        };
+        on_waiting.recv().expect("the pump waits for the question's outcome");
+        assert_eq!(
+            inputs(&session),
+            Vec::<String>::new(),
+            "{answer:?}: nothing before the hold is let go"
+        );
 
-    asked.finish();
-    link.route_input(b"later").unwrap();
-    assert_eq!(
-        session.events(),
-        ["input before", "input dir", "input \r", "resize 80x24", "input later"],
-        "the key before the answer, the keys after it, in order, then the repaint, then the later keys"
-    );
+        asked.finish();
+        pump.join().unwrap().unwrap();
+        // The repaint's resize races the key, by design: only the inputs are compared.
+        assert_eq!(inputs(&session), ["input dir"], "{answer:?}");
+    }
 }
 
-/// An allowed `--terminal` command is what the keys after the answer are for: they go to it, before any later key.
-/// The key that arrived before the answer was typed before the question and is the session's still: it is given to
-/// the session's target when the command takes the screen.
+/// An allowed `--terminal` command is what the keys after the answer are for: they wait for it, and go to it in
+/// order, ahead of any later key. What came before the answer went to the session at once.
 #[test]
-fn keys_after_the_answer_are_kept_for_the_elevated_command_after_an_allow_in_order() {
+fn keys_after_an_allow_wait_for_the_command_and_go_to_it_in_order() {
     let (wire, session, elevated) = (
         Wire::default(),
         Arc::new(Recorder::default()),
@@ -579,98 +582,36 @@ fn keys_after_the_answer_are_kept_for_the_elevated_command_after_an_allow_in_ord
 
     link.route_input(b"before").unwrap();
     link.answer(reply(1, ConsentAnswer::Allow));
-    link.route_input(b"one").unwrap();
-    link.route_input(b"two").unwrap();
     asked.answer.recv().unwrap().unwrap();
+    let (waiting, on_waiting) = mpsc::channel();
+    let pump = {
+        let link = Arc::clone(&link);
+        std::thread::spawn(move || {
+            link.route_input_observed(b"one", || {
+                let _ = waiting.send(());
+            })
+            .unwrap();
+            link.route_input(b"two")
+        })
+    };
+    on_waiting.recv().expect("the pump waits for the command");
+    assert_eq!(
+        inputs(&session),
+        ["input before"],
+        "nothing of the later keys went to the session"
+    );
+    assert_eq!(
+        inputs(&elevated),
+        Vec::<String>::new(),
+        "nor to a command not yet hosted"
+    );
 
     let guard = host(&link, elevated.clone());
-    assert_eq!(
-        session.events(),
-        ["input before"],
-        "the key from before the answer is given to the session when the command takes the screen"
-    );
-    link.route_input(b"three").unwrap();
-    assert_eq!(
-        elevated.events(),
-        ["resize 80x24", "input one", "input two", "input three"],
-        "the command is given its size, then the kept keys, then the later ones"
-    );
+    pump.join().unwrap().unwrap();
+    assert_eq!(inputs(&elevated), ["input one", "input two"]);
+    assert_eq!(inputs(&session), ["input before"]);
     asked.finish();
     drop(guard);
-    assert_eq!(
-        session.events(),
-        ["input before", "resize 80x24"],
-        "none of the other keys was the session's"
-    );
-}
-
-/// The keys are kept whole, however many and however long the question is open: the session's frame reader, which
-/// calls `route_input`, never waits for the question's outcome, or a client that hangs up meanwhile would go unseen.
-#[test]
-fn every_key_is_kept_and_route_input_never_waits_for_the_outcome() {
-    let (wire, session) = (Wire::default(), Arc::new(Recorder::default()));
-    let link = terminal_link(&wire, &session);
-    let asked = ask_on_a_thread(&link);
-    asked.parked.recv().unwrap();
-    let chunks = 100;
-    for n in 0..chunks {
-        link.route_input(format!("e{n}").as_bytes()).unwrap();
-    }
-    link.answer(reply(1, ConsentAnswer::Refuse));
-    for n in 0..chunks {
-        link.route_input(format!("k{n}").as_bytes()).unwrap();
-    }
-    assert_eq!(
-        session.events(),
-        Vec::<String>::new(),
-        "nothing is delivered before the outcome"
-    );
-
-    asked.answer.recv().unwrap().unwrap();
-    asked.finish();
-    let mut expected: Vec<String> = (0..chunks).map(|n| format!("input e{n}")).collect();
-    expected.extend((0..chunks).map(|n| format!("input k{n}")));
-    expected.push("resize 80x24".to_owned());
-    assert_eq!(
-        session.events(),
-        expected,
-        "all of them, in order, and then the repaint"
-    );
-}
-
-/// Keys kept for one question are not kept for the next: each question's own are delivered when it is over.
-#[test]
-fn keys_kept_for_one_question_are_not_kept_for_the_next() {
-    let (wire, session) = (Wire::default(), Arc::new(Recorder::default()));
-    let link = terminal_link(&wire, &session);
-    let asked = ask_on_a_thread(&link);
-    asked.parked.recv().unwrap();
-    link.answer(reply(1, ConsentAnswer::Refuse));
-    link.route_input(b"kept").unwrap();
-    asked.answer.recv().unwrap().unwrap();
-    asked.finish();
-
-    let second = ask_on_a_thread(&link);
-    second.parked.recv().unwrap();
-    link.route_input(b"typed at the question").unwrap();
-    link.answer(reply(2, ConsentAnswer::Refuse));
-    second.answer.recv().unwrap().unwrap();
-    assert_eq!(
-        session.events(),
-        ["input kept", "resize 80x24"],
-        "the second's are still kept"
-    );
-    second.finish();
-    assert_eq!(
-        session.events(),
-        [
-            "input kept",
-            "resize 80x24",
-            "input typed at the question",
-            "resize 80x24"
-        ],
-        "the first question's keys were delivered once, and the second's after it"
-    );
 }
 
 /// Every return of the screen to the session gives the session's pseudoconsole its size, even unchanged: that is the
@@ -716,101 +657,6 @@ fn a_command_hosted_while_the_question_holds_the_screen_takes_it_and_the_session
     drop(guard);
     assert_eq!(carrier(&link), Carrier::Session);
     assert_eq!(session.events(), ["resize 80x24"], "one repaint, at the command's end");
-}
-
-/// A target whose input stops at a gate, as a full pseudoconsole queue parks the writer: `entered` says an input has
-/// reached it, and the input goes on once `go` has a message.
-struct GatedInput {
-    entered: mpsc::Sender<()>,
-    go: std::sync::Mutex<mpsc::Receiver<()>>,
-    events: std::sync::Mutex<Vec<String>>,
-}
-
-impl GatedInput {
-    fn new() -> (Arc<GatedInput>, mpsc::Receiver<()>, mpsc::Sender<()>) {
-        let ((entered, at_gate), (go, released)) = (mpsc::channel(), mpsc::channel());
-        let target = Arc::new(GatedInput {
-            entered,
-            go: std::sync::Mutex::new(released),
-            events: Default::default(),
-        });
-        (target, at_gate, go)
-    }
-
-    fn events(&self) -> Vec<String> {
-        self.events.lock().unwrap().clone()
-    }
-}
-
-impl InputTarget for GatedInput {
-    fn input(&self, bytes: &[u8]) -> anyhow::Result<()> {
-        self.events
-            .lock()
-            .unwrap()
-            .push(format!("input {}", String::from_utf8_lossy(bytes)));
-        let _ = self.entered.send(());
-        let _ = self.go.lock().unwrap().recv();
-        Ok(())
-    }
-
-    fn resize(&self, cols: u16, rows: u16) {
-        self.events.lock().unwrap().push(format!("resize {cols}x{rows}"));
-    }
-}
-
-/// The kept keys are delivered holding the lock that orders keys and no other: a delivery can park in the target's
-/// full queue, and a resize must not wait for it. Back to the session after a question.
-#[test]
-fn a_resize_is_applied_while_the_kept_keys_are_being_delivered_to_the_session() {
-    let (wire, (gated, at_gate, go)) = (Wire::default(), GatedInput::new());
-    let link = Link::new(wire, true, (80, 24), Some(Arc::clone(&gated) as Arc<dyn InputTarget>));
-    let asked = ask_on_a_thread(&link);
-    asked.parked.recv().unwrap();
-    link.answer(reply(1, ConsentAnswer::Refuse));
-    link.route_input(b"kept").unwrap();
-    asked.answer.recv().unwrap().unwrap();
-
-    // The thread lets go of the question's hold, and the switch back is stuck delivering the key.
-    asked.release.send(()).unwrap();
-    at_gate.recv().expect("the kept key is being delivered");
-    link.resize(Resize { cols: 100, rows: 40 });
-    assert!(
-        gated.events().contains(&"resize 100x40".to_owned()),
-        "the resize was applied: {:?}",
-        gated.events()
-    );
-
-    go.send(()).unwrap();
-    asked.thread.join().unwrap();
-}
-
-/// The same, where the keys go to a command that takes the screen from the question.
-#[test]
-fn a_resize_is_applied_while_the_kept_keys_are_being_delivered_to_the_command() {
-    let (wire, session) = (Wire::default(), Arc::new(Recorder::default()));
-    let (gated, at_gate, go) = GatedInput::new();
-    let link = terminal_link(&wire, &session);
-    let asked = ask_on_a_thread(&link);
-    asked.parked.recv().unwrap();
-    link.answer(reply(1, ConsentAnswer::Allow));
-    link.route_input(b"kept").unwrap();
-    asked.answer.recv().unwrap().unwrap();
-
-    let hosting = {
-        let (link, target) = (Arc::clone(&link), Arc::clone(&gated) as ElevatedTarget);
-        std::thread::spawn(move || drop(host(&link, target)))
-    };
-    at_gate.recv().expect("the kept key is being delivered to the command");
-    link.resize(Resize { cols: 100, rows: 40 });
-    assert!(
-        gated.events().contains(&"resize 100x40".to_owned()),
-        "the resize was applied: {:?}",
-        gated.events()
-    );
-
-    go.send(()).unwrap();
-    hosting.join().unwrap();
-    asked.finish();
 }
 
 /// BINDING (the deputy, 2026-11-19): the session's shell going away ends a pending question at once.
@@ -894,37 +740,6 @@ fn a_question_that_ends_without_an_answer_is_withdrawn_before_the_screen_goes_ba
             "{what}: the repaint came after the withdrawal"
         );
     }
-}
-
-/// Once the agent has withdrawn a question the shim leaves it, and the keys it relays after that are the session's
-/// as the keys after an answer are: kept until the screen goes back, then delivered, not dropped.
-#[test]
-fn keys_after_a_withdrawal_are_kept_for_the_session() {
-    let (wire, session) = (Wire::default(), Arc::new(Recorder::default()));
-    let link = terminal_link(&wire, &session);
-    let gone = Arc::new(ClientGone::default());
-    let asked = ask_for_on_a_thread(&link, Arc::clone(&gone));
-    asked.parked.recv().unwrap();
-
-    // The withdrawal is held inside the connection's write: the screen is still the question's.
-    let (gate, at_gate) = wire.hold_next_write();
-    link.client_gone(&gone);
-    at_gate.recv().expect("the withdrawal is being written");
-    link.route_input(b"after").unwrap();
-    assert_eq!(
-        session.events(),
-        Vec::<String>::new(),
-        "kept, not delivered, while the question holds the screen"
-    );
-
-    gate.release();
-    assert_eq!(asked.answer.recv().unwrap(), Err(Ended));
-    asked.finish();
-    assert_eq!(
-        session.events(),
-        ["input after", "resize 80x24"],
-        "delivered when the screen went back, ahead of the repaint"
-    );
 }
 
 /// The client of the request the question is for hangs up: the question ends and the screen is the session's again; a
@@ -1088,6 +903,10 @@ fn an_answer_with_no_question_is_dropped_and_does_not_answer_the_next_question()
     let (wire, session) = (Wire::default(), Arc::new(Recorder::default()));
     let link = terminal_link(&wire, &session);
     link.answer(reply(1, ConsentAnswer::Allow));
+    // A late answer cannot stall the pump: no question was open, so nothing waits for its outcome.
+    link.route_input_observed(b"k", || panic!("a dropped answer made the pump wait"))
+        .unwrap();
+    assert_eq!(session.events(), ["input k"]);
     let asked = ask_on_a_thread(&link);
     asked
         .parked

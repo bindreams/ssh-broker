@@ -8,13 +8,13 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex};
 
-use super::link::{AskGuard, Carrier, ClientGone, Ended, Link};
+use super::link::{AskGuard, Carrier, ClientGone, Ended, Link, locked};
 use super::logout::Killer;
 use super::{
-    ExecStarter, HangupGuard, ParkSignal, PtyStarter, PtyTarget, answer_serving, close_unserved_pty, end_pty,
-    prepare_hangup_watch, reap_tree, spawn_stream_pump, start_watch_with, teardown_warning,
+    ExecStarter, HangupGuard, PtyStarter, PtyTarget, answer_serving, close_unserved_pty, end_pty, prepare_hangup_watch,
+    reap_tree, spawn_stream_pump, start_watch_with, teardown_warning,
 };
 use crate::afunix::ConnTx;
 use crate::hangup::HangupWatcher;
@@ -201,10 +201,6 @@ impl RequestWatch {
     }
 }
 
-fn locked<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(PoisonError::into_inner)
-}
-
 /// What ends `job`'s tree, and says so when it cannot.
 fn tree_end(job: &Arc<cosca::Job>) -> Killer {
     let job = Arc::clone(job);
@@ -322,7 +318,7 @@ fn on_a_pseudoconsole(
         return RunOutcome::Unserved;
     }
     let out_raw = session.out_read_raw();
-    let target = Arc::new(PtyTarget::new(&mut session, ParkSignal::default()));
+    let target = Arc::new(PtyTarget::new(&mut session));
     let guard = link.host_elevated(target.clone(), end);
     if guard.is_none() {
         tracing::debug!("the session's shell is gone: the command was ended instead of hosted");
@@ -333,7 +329,8 @@ fn on_a_pseudoconsole(
     // A delivery that fails is a connection that has gone, and its command has no screen to run on: its tree ends,
     // as the session's own pump's does, and the pump goes on reading until the pseudoconsole is closed. The session's
     // own end is [`Link::end_hosting`]'s, and this is what ends the command when the session's hang-up watch could
-    // not start and its input pump is parked in a send.
+    // not start. The session's input pump does not park in a send on this path (a pseudoconsole's queue has no
+    // bound), so it still sees the client go.
     let gone = {
         let job = Arc::clone(&job);
         move || {
