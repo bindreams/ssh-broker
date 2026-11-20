@@ -23,10 +23,7 @@ an elevated one (`elevated session on request`); `provision/probe_run` has the r
 administrator's `doctor` runs no probe and names the ways to check. The profile
 follows from the interactive logon and is not separately checked.
 
-A session is unelevated unless its login's `SSH_BROKER_ELEVATION` (`never`, `prompt`, `auto-approve`,
-`always`; unset is `prompt`) says `always`. A program in an unelevated session runs one command elevated
-with `ssh-broker elevate`: it asks the agent at High on `request.sock`, and the agent decides by the
-session's level (`prompt` asks the person at the session's terminal first).
+Levels and `ssh-broker elevate` are described in README.md#elevated-sessions; `agent::elevation` holds the rule.
 
 ## Where things live
 
@@ -57,7 +54,7 @@ session's level (`prompt` asks the person at the session's terminal first).
 | `consent_entry` | the key-event state machine of the consent question: `y` or `yes` and Enter allow, anything else refuses |
 | `console_modes`, `console_prompt` | the console's raw mode as a guard; the password prompt on it, the consent question on it (`ask_consent`), and why the shim has no agent |
 | `shim_offer` | the shim's hook for a missing agent: the notice, or the prompt, the logon and the wait for the agent |
-| `account`, `logon`, `socket_watch` | who the token is and how elevated (`Elevation`), `step_down` (the one rule from a login's level and the process's integrity to a token, none or a refusal), the secondary-logon call that starts a background agent, and the folder and profile-list watch with which the shim learns the agent serves (no named kernel object) |
+| `account`, `logon`, `socket_watch` | who the token is and how elevated (`Elevation`), `step_down`, the secondary-logon call that starts a background agent, and the folder and profile-list watch with which the shim learns the agent serves (no named kernel object) |
 | `agent_background`, `agent/logout`, `logout` | the background agent's start checks and exit codes; ending a session, both sides |
 | `request`, `agent/requests`, `agent/session` | the client loop of the verbs that ask the agent (on `agent.sock`, or from below High on `request.sock`); the agent's handler of `request.sock`, which an agent at High keeps in the plain folder and which takes requests only (`logout`, `elevate`); the id each session gets in `SSH_BROKER_SESSION` |
 | `elevate`, `agent/elevation`, `agent/link` | `ssh-broker elevate <command>`: the client (in place at High, else one request to the agent); the agent's rule for what a session's `SSH_BROKER_ELEVATION` allows and the hosting of the elevated command; the session's connection, which says whose output it carries and where the client's keys go, and which carries the consent question to the session's shim and its answer back (the shim writes the question and reads the answer on its own console: `shim_pty`) |
@@ -87,12 +84,9 @@ diff. (No lint enforces any of these — `clippy.toml` is deliberately empty.) F
   which is what keeps a process of the account below High from connecting. An agent at High also binds
   `request.sock` in the plain folder, checked as that folder's sockets are (no High label); it takes requests only
   and never starts a session, and it is what an unelevated process of the account can reach. **Everything on it is
-  input from a lower level** *(review)*: bounded, strictly parsed, and two things of a request are used as paths,
-  both of an `elevate`: its command's program, which `ElevationRequest::check` requires to be absolute, and its
-  working directory, which `agent::requests::run_elevated` checks and `child_cwd` resolves.
-- **One rule decides a session's token** *(review)*: `account::step_down` turns a login's level and the process's
-  integrity into a token, none or a refusal, for the agent, the shim's fail-open shell and the shim's offer alike.
-  Nothing on the SSH command line is interpreted: the level is `SSH_BROKER_ELEVATION` and nothing a client types.
+  input from a lower level** *(review)*; see `agent::requests`.
+- **One rule decides a session's token** *(review)*: `account::step_down`; see
+  [CONTRIBUTING.md](CONTRIBUTING.md#invariants).
 - **The shim fails open on the relay path** *(review)*, through the configured shell (the built-in `cmd.exe` if that is unusable). A broken broker must
   not cost you SSH access. The security boundary never degrades — the ACL gate and the bind
   fail closed. Provisioning has best-effort steps of its own, marked where they occur.

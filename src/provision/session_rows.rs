@@ -183,13 +183,8 @@ pub fn parity_rows(probes: &Probes, active_console: u32) -> Vec<Check> {
 }
 
 /// The rows for the session the agent gives, from the probe that asked for the default level (`session`)
-/// and, when one was run, what became of the probe that asked for `always` (`elevated`).
-///
-/// With an `always` probe (the agent is at High) the rows are `session` and `elevated session on request`.
-/// Without one (the agent is below High, which refuses `always`), by what the one probe reported:
-/// - a Standard token at Medium integrity: the one passing row `session privilege`;
-/// - integrity High or not reported: the one failing row `session`, saying what was seen;
-/// - any other token (an administrator's at Medium): `session`, and `elevated session on request`, failing.
+/// and, when one was run, the one that asked for `always` (`elevated`). Without an `always` probe the one token
+/// decides.
 pub fn session_rows(session: &Answer, elevated: Option<&ProbeOutcome>) -> Vec<Check> {
     // A probe that asked for `always` was run because the agent is at High, whatever the session probe says of
     // itself: its outcome is judged, never thrown away.
@@ -276,8 +271,7 @@ fn elevated_row(got: &Answer) -> Check {
     }
 }
 
-/// `elevated session on request` for what became of the probe that asked for `always`: judged by
-/// [`elevated_row`] when it answered, and otherwise failing with why there is no answer.
+/// The `elevated session on request` row of a probe outcome that may not have answered.
 fn elevated_outcome_row(elevated: &ProbeOutcome) -> Check {
     match elevated {
         ProbeOutcome::Failed { cause, .. } => Check::new(

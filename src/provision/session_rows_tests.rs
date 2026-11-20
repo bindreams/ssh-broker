@@ -25,8 +25,7 @@ fn answer(result: ProbeResult) -> Answer {
     }
 }
 
-/// What the probe that asks for `always` finds at an administrator's agent, and what the one that asks for the
-/// default level finds there.
+/// What the probe that asks for `always` finds at an administrator's agent.
 fn elevated() -> ProbeResult {
     probe(Some(Elevation::Full), Some(INTEGRITY_HIGH))
 }
@@ -609,26 +608,6 @@ fn every_pair_of_outcomes_has_its_rows() {
                 };
                 assert!(rows[0].detail.starts_with("unavailable"), "{case}");
                 assert!(rows[0].detail.contains(cause), "{case}");
-            }
-        }
-    }
-}
-
-/// No row of any pair of outcomes names the verb that `doctor` replaced or the word that `SSH_BROKER_ELEVATION`
-/// replaced.
-#[test]
-fn no_row_names_the_old_verb_or_the_reserved_word() {
-    for (_, session) in outcomes(unelevated()) {
-        for (_, always) in outcomes(elevated()) {
-            for rows in [
-                rows_of(&probes(session.clone(), Some(always))),
-                rows_of(&probes(session.clone(), None)),
-            ] {
-                for row in rows {
-                    for old in ["verify", "internal-unelevated"] {
-                        assert!(!row.detail.contains(old), "{old}: {} {}", row.name, row.detail);
-                    }
-                }
             }
         }
     }

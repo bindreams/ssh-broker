@@ -679,7 +679,6 @@ fn after_apply_doctor_passes_through_a_session_the_password_prompt_started() {
     );
     agent_conn::assert_doctor_session_rows(&shown);
 
-    // A login that asks for no elevated session: the installed exe's `doctor` is below High and runs no probe.
     let mut unelevated = login.command_asking("auto-approve");
     unelevated
         .arg("-T")
@@ -700,7 +699,6 @@ fn after_apply_doctor_passes_through_a_session_the_password_prompt_started() {
         "the ways to check are missing from:\n{shown}"
     );
 
-    // The command that sentence names, by name, passes.
     let mut elevated = login.command_asking("auto-approve");
     elevated.arg("-T").arg("--").arg("ssh-broker elevate ssh-broker doctor");
     let outcome = run_client(elevated, false, kit.dir());

@@ -345,9 +345,7 @@ pub const MAX_ELEVATION_UNITS: usize = 32_767;
 
 /// What `ssh-broker elevate` sends on `request.sock`, as the payload of a [`FrameKind::Request`] frame. Everything in
 /// it comes from a process below High: read it strictly ([`ElevationRequest::decode`]), judge it
-/// ([`ElevationRequest::check`]) and use two things of it as paths: the command's program, which `check` requires
-/// to be absolute, and the working directory, which `agent::requests::run_elevated` checks and `child_cwd`
-/// resolves.
+/// ([`ElevationRequest::check`]); see the module doc of `agent::requests`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ElevationRequest {
     /// First, so that a peer of another version is refused by name ([`ElevationRequest::decode`]).

@@ -29,8 +29,7 @@ pumping), `afunix` + `acl` (the socket and its security boundary), `socket_loc` 
 user's socket lives, derived from the profile of the token), `agent_lock` (one agent per session, one
 serving agent per user), `filelog` (the per-user log folder), `conpty` (the pseudoconsole
 host), `pipes` (the redirected-pipe EXEC child), `vtinput` (Win32 input records → VT),
-`winutil` (Windows RAII guards, job containment, cosca→Win32 error conversion, the process token and its checked information),
-`account` (who a token is and how elevated, and `step_down`, the one rule that turns a login's level and the process's integrity into a token, none, or a refusal), `consent_entry` and `password_entry` (the key-event state machines of the consent question and of the password prompt: pure, host-testable), `console_prompt` (the consent question, `ask_consent`, and the password prompt, on the console), `provision::sshd_config` (the `AcceptEnv` and `Include` edits, the check with `sshd`, the restart of the service), `provision::sshd_task` (the transient task that runs `apply`'s sshd step as SYSTEM) and `provision::path_env` (the install directory on the system `PATH`).
+`winutil` (Windows RAII guards, job containment, cosca→Win32 error conversion, the process token and its checked information). The rest are in the table of [CLAUDE.md](CLAUDE.md#where-things-live).
 
 The functionality lives in the library rather than the binary so it is reachable from tests on
 every host platform; `main.rs` is a thin dispatcher.
@@ -81,12 +80,8 @@ what a process below High is refused, and `tests/redirection_guard_windows.rs` p
 An agent at High also binds `request.sock` in the plain folder, where neither the folder nor the file carries the
 label, so a process of the account below High can connect to it: it is how an unelevated session reaches the agent.
 It takes requests only (`logout`, and the `ElevationRequest` of `ssh-broker elevate`); a session handshake there is
-answered with a sentence (`agent::requests::REQUESTS_ONLY`) and no session starts. **Everything on it is input from a
-lower level.** Frames are read through the bounded frame reader and parsed strictly, a malformed first frame is
-answered as a failed request, and two things of a request are used as paths, both of an `elevate`: its command's
-program, which `ElevationRequest::check` requires to be absolute (the client found it; the file is not looked for before
-the command starts, and one that is not there is reported by the start), and its working directory, which
-`agent::requests::run_elevated` checks and `child_cwd` resolves. Neither holds a NUL or passes its length bound. The session id in a request says which session asks and is no credential. The agent
+answered with a sentence (`agent::requests::REQUESTS_ONLY`) and no session starts. **Everything on `request.sock` is
+input from a lower level**; see `agent::requests`. The session id in a request says which session asks and is no credential. The agent
 keeps its `SocketDir` of the plain folder for its whole run, as it keeps its own, so the by-path contract below holds
 for `request.sock` too; a plain folder it cannot use costs it the request socket and nothing else. The socket is
 served by the sessions' accept machinery and counted in the same tally, with no read bound of its own: a client that
@@ -234,22 +229,9 @@ covers the other half.
 **CI is the Windows test bed.** The full suite — ACLs, AF_UNIX, pseudoconsoles, the registry —
 runs on `windows-latest` on every PR. You do not need a Windows machine to change this project.
 
-The tests of elevation on request that need a real sshd, a local account or the machine's configuration are
-**Elevated (CI only)**: write them, make `cargo test --no-run` compile them, and let CI run them.
-
-- `tests/elevate_windows.rs`: `ssh-broker elevate` through a real sshd, for each value of `SSH_BROKER_ELEVATION`: the
-  refusals and their sentences, output piped and the input closed, `--terminal`, Ctrl+C, the exit codes, how the
-  program is found, and the in-place course at High. What a terminal shows is judged on the client's stream
-  rendered as a terminal would (`sshd_rig::rendered`).
-- `tests/consent_windows.rs`: the question. The answers are typed as a person types them; `y` and `yes` allow and
-  everything else refuses; a program of the session that writes `yes` to its own output does not answer, and an
-  unelevated process is refused attachment to the console of any process of the shim's.
-- `tests/request_socket_windows.rs`: `request.sock`. A process below High connects to a socket that a process at
-  High made in the plain folder (the premise the socket rests on), `logout` over it from an unelevated session, and
-  an agent whose plain folder is refused still serves its sessions.
-- `tests/sshd_config_windows.rs`: `apply`'s sshd step and the system `PATH` over the runner's real `sshd`. The whole
-  binary runs in nextest's `ci-exclusive` profile and takes the machine alone (`machine::exclusive()`); a test that
-  runs `apply` holds `install::Install`, which puts the install directory, the tasks and sshd's files back.
+Tests that need a real sshd, a local account or the machine's configuration are Elevated (CI only): make
+`cargo test --no-run` compile them and let CI run them. `tests/sshd_config_windows.rs` takes the machine alone
+(`ci-exclusive`).
 
 Host tests of the pieces beside them: `agent::link` (whose output the connection carries, where the keys go),
 `agent::requests`, `agent::elevation` (what each level allows), `consent_entry`, `console_prompt` (what is queued
@@ -360,9 +342,8 @@ all ask it; a second place that decides what a login gets is a defect.
 for one.
 
 **Everything on `request.sock` is input from a lower level** *(review)*, and the socket takes requests only: see
-"The security boundary is the socket file and its folder". A new kind of request is bounded and strictly parsed,
-uses nothing it reads as a path, and, when it can end the agent, ends it through `agent::settled_end` and
-`finish_settled`, which are the one exit code of an agent whose end was decided.
+"The security boundary is the socket file and its folder". A new kind of request that can end the agent ends it
+through `agent::settled_end` and `finish_settled`, which are the one exit code of an agent whose end was decided.
 
 **The consent is decided by a pure state machine** *(review)*. `consent_entry::ConsentEntry` takes key events and
 says whether the answer allows; `console_prompt::ask_consent` does the console I/O around it, as `password_entry`

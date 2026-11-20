@@ -315,10 +315,8 @@ pub fn elevation_unreadable(cause: &str) -> String {
     )
 }
 
-/// What `doctor`'s row says after [`ELEVATED_AGENT_LOOKS_ELSEWHERE`] ("not checked below High: ...") in place
-/// of the rows about the agent: the third way to check them. `elevate` is refused outside a hosted session (a
-/// desktop prompt) and where its login's level refuses it (`never`; `prompt` in a session with no terminal to
-/// ask on); where it is refused it says why itself, so the other ways are named beside it.
+/// The third way to check below High, appended to [`ELEVATED_AGENT_LOOKS_ELSEWHERE`] in `doctor`'s row.
+/// `elevate` is refused in some sessions and says why itself, so the other ways stay named.
 pub const CHECK_BELOW_HIGH_CLAUSE: &str = ", or run ssh-broker elevate ssh-broker doctor in an SSH session";
 
 /// Told to an unelevated process whose agent runs at High and serves no socket it can reach. Names neither

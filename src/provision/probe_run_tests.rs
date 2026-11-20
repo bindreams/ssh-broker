@@ -674,8 +674,8 @@ fn each_pair_of_maker_and_follower_has_the_expected_junction_row() {
             "did not report its junction",
         ),
     ];
-    // A maker that did not answer has no junction row: the session probe is the one that gives the rows, and
-    // its failure is the one `parity probe (via agent)` row, which names the junction's cause.
+    // The session probe is the one that gives the rows, and its failure is the one `parity probe (via agent)` row,
+    // which names the junction's cause.
     for (name, made, followed, passes, says) in table {
         let scratch = Scratch::new();
         let probing = Probing::new(made, followed);

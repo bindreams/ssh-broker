@@ -56,8 +56,6 @@ fn run_at(integrity: Integrity, temp: &Path, drive: Drive) -> Probes {
         Integrity::Medium => run_at_medium(&dir, drive),
         Integrity::High => run_at_high(&dir, drive),
     };
-    // The probe that was to make the directory is the one that asks for the default level: the first of an agent
-    // at High and the only one below it.
     probes.leftover = leftover(&dir, dir.to_str().is_some(), &probes.session);
     probes
 }
@@ -139,10 +137,10 @@ fn not_text(dir: &Path) -> String {
     format!("the directory {} cannot be told to a probe as text", dir.display())
 }
 
-/// Remove `dir` and say what is left of it: why it could not be removed, and that a `maker` whose child may
-/// still be running may still create it. `told` is whether `maker` was given it.
-fn leftover(dir: &Path, told: bool, maker: &ProbeOutcome) -> Option<String> {
-    let may_come = told && maker.may_still_run();
+/// Remove `dir` and say what is left of it: why it could not be removed, and that a session probe whose child
+/// may still be running may still create it. `told` is whether it was given `dir`.
+fn leftover(dir: &Path, told: bool, session: &ProbeOutcome) -> Option<String> {
+    let may_come = told && session.may_still_run();
     match (probe::link::remove(dir), may_come) {
         (Err(e), may_come) => Some(format!(
             "{} could not be removed: {e}{}; it can be deleted",

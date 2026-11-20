@@ -142,7 +142,6 @@ fn run_elevated(
     ask: bool,
 ) -> Option<(String, i32)> {
     let cwd = child_cwd(&request.cwd, home_dir());
-    // A working directory that is not an existing directory is refused.
     if !request.cwd.is_empty() && !Path::new(&request.cwd).is_dir() {
         let cause = format!("{} is not an existing directory", request.cwd);
         return Some((text::elevation_cannot_start(&cause), REFUSED_EXIT_CODE));
