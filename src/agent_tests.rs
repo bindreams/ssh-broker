@@ -1005,21 +1005,22 @@ fn close_handle(raw: isize) {
     }
 }
 
-/// Input the command never drains, so the input pump parks in its bounded queue. A 64 KiB chunk
-/// stalls the writer thread and 64 one-byte frames overfill the queue; the total is about 64 KiB,
-/// which the socket buffers take, so the client's socket writes never block.
-fn flood_input(ctx: &mut impl std::io::Write, stream: Stream) {
-    write_data(ctx, stream, &vec![b'x'; 64 * 1024]).unwrap();
+/// Input a command on pipes never drains, so the input pump parks in its stdin's bounded queue (a
+/// pseudoconsole's has no bound). A 64 KiB chunk stalls the writer thread and 64 one-byte frames
+/// overfill the queue; the total is about 64 KiB, which the socket buffers take, so the client's
+/// socket writes never block.
+fn flood_input(ctx: &mut impl std::io::Write) {
+    write_data(ctx, Stream::Stdin, &vec![b'x'; 64 * 1024]).unwrap();
     for _ in 0..64 {
-        write_data(ctx, stream, b"x").unwrap();
+        write_data(ctx, Stream::Stdin, b"x").unwrap();
     }
 }
 
 /// Drive one relayed command to its marker, pin the grandchild, then end the session the way
 /// `ending` says and hand back the pinned handle.
 ///
-/// `flood` sends [`flood_input`] and waits until the input pump reports it is parked before the
-/// disconnect, so the session ends with the pump provably parked.
+/// `flood` (a command on pipes only) sends [`flood_input`] and waits until the input pump reports
+/// it is parked before the disconnect, so the session ends with the pump provably parked.
 fn run_tree_session(tag: &str, mode: Mode, inherit_stdio: bool, ending: Ending, flood: bool) -> isize {
     let dir = hardened_dir(tag);
     let sock = dir.join("s");
@@ -1053,7 +1054,11 @@ fn run_tree_session(tag: &str, mode: Mode, inherit_stdio: bool, ending: Ending, 
         match ending {
             Ending::Disconnect => {
                 if flood {
-                    flood_input(&mut ctx, if mode == Mode::Pty { Stream::Pty } else { Stream::Stdin });
+                    assert!(
+                        mode == Mode::Exec,
+                        "only a command on pipes has an input queue to park in"
+                    );
+                    flood_input(&mut ctx);
                     client_parked.wait();
                 }
                 let _ = ctx.shutdown_both();

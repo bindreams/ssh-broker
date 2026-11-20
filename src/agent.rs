@@ -1709,8 +1709,9 @@ struct HangupGuard {
 }
 
 /// Start the third detector, for the one case the other two cannot see: a command that is silent
-/// (no output pump ever fails a write) while the input pump is parked in the bounded queue
-/// (nothing reads the socket). It watches the socket without reading it and reaps on a hangup.
+/// (no output pump ever fails a write) while the input pump is not reading the socket: parked in
+/// the bounded queue of a command's stdin on pipes, or waiting for the outcome of an answered
+/// question (`Link::route_input`). It watches the socket without reading it and reaps on a hangup.
 ///
 /// `None` if the watcher cannot be created. A failure here must not cost the user a session; it
 /// only loses the hangup protection.
