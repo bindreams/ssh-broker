@@ -598,7 +598,7 @@ fn doctor_through(
     conn.read_to_end()
 }
 
-/// What `doctor` shows through an administrator's elevated agent: it exits 0, a login that asks for no level gets
+/// What `doctor` shows through an administrator's elevated agent: it exits 0, a login at the default level (`prompt`) gets
 /// an unelevated session, one that asks for `always` gets an elevated one, and the junction was followed, not
 /// skipped.
 fn assert_doctor_passes_for_an_elevated_agent(finished: &agent_conn::Finished) {
@@ -613,7 +613,7 @@ fn assert_doctor_passes_for_an_elevated_agent(finished: &agent_conn::Finished) {
 }
 
 /// Elevated (CI only). `doctor`, run in an administrator's session through the account's elevated agent,
-/// passes after `apply`: a login that asks for no level gets an unelevated session, one that asks for `always`
+/// passes after `apply`: a login at the default level (`prompt`) gets an unelevated session, one that asks for `always`
 /// gets an elevated one, and the junction that a token below High made is followed. The same `doctor` run in an
 /// unelevated session of the account is told the ways to check, and runs no probe.
 #[test]

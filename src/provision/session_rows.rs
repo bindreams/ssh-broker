@@ -68,7 +68,7 @@ impl ProbeOutcome {
 /// What `doctor`'s probes through the agent found.
 #[derive(Debug)]
 pub struct Probes {
-    /// The probe that asked for the default level, which is what a login that sets nothing gets: the session
+    /// The probe that asked for `prompt`, the default level: the session
     /// rows, DPAPI and the bytes of the relay are read from it. For an agent at High integrity it runs first, and
     /// makes the junction the `always` probe follows.
     pub session: ProbeOutcome,
