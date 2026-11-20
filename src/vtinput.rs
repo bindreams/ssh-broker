@@ -7,9 +7,6 @@
 //! (microsoft/terminal doc/specs #4999). Modeled with plain integer fields so the
 //! encoder and the window-size math are pure and unit-tested off-Windows BEFORE they
 //! become the live input path.
-//!
-//! The console prompts type a line instead of forwarding keys: [`KeyEvent::line_key`] is the one reading of a key
-//! they share.
 
 const VK_BACK: u16 = 0x08;
 const VK_MENU: u16 = 0x12; // Alt

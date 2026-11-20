@@ -13,9 +13,7 @@
 //! and drops the rest. Every buffer, and every copy of a record, is overwritten before the step
 //! returns.
 //!
-//! A step that has no key to feed waits for one. The caller's `stop` is looked at after every batch that finished no
-//! step, so before each wait; a wait is ended from outside by something that makes `stop` true and then puts a record
-//! in the queue, which wakes the read.
+//! A step that has no key to feed waits for one, and the caller's `stop` ends the wait: [`super::ask_consent`] says how.
 
 use windows::Win32::System::Console::INPUT_RECORD;
 use zeroize::Zeroize;

@@ -1129,13 +1129,9 @@ impl RecordRelay<'_> {
 /// Ask the person at this console `request`, on the console's own screen, and send the answer. `false` when the
 /// connection can no longer be written to, so the worker is over.
 ///
-/// What was typed or pasted before the question is the session's: it goes to the agent first, through `relay`, and
-/// the question is the next line after that. A console that could not be asked (read or written to) gives the
-/// refusal: the answer is `Refuse` for anything but the allowing answer, and the agent runs nothing for it. The agent
-/// holds the session's output while it waits, and this worker relays no key meanwhile, so the question and the keys
-/// that answer it are the console's alone. `stopping` ends the question as a refusal. So does the agent's
-/// withdrawal of it ([`ConsentSlot::withdraw`]), but then no answer is sent: the agent asks nothing any more, and the
-/// worker goes back to relaying keys.
+/// What is drained before the question, and what is refused, is [`ask_consent`]'s. `stopping` ends the question as a
+/// refusal. So does the agent's withdrawal of it ([`ConsentSlot::withdraw`]), but then no answer is sent: the agent
+/// asks nothing any more, and the worker goes back to relaying keys.
 fn ask_person(
     stdin: HANDLE,
     stdout: HANDLE,

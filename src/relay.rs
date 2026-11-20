@@ -153,21 +153,17 @@ pub trait FrameSink {
         let _ = r;
         Ok(())
     }
-    /// The agent asks the person at the terminal ([`FrameKind::Consent`]). The shim's sink of a session with a
-    /// terminal takes it; every other sink, which is one a `Consent` frame should never reach, refuses: a sink
-    /// failure.
+    /// A [`ConsentRequest`]. The shim's sink of a session with a terminal takes it; every other refuses.
     fn on_consent(&mut self, request: ConsentRequest) -> anyhow::Result<()> {
         let _ = request;
         anyhow::bail!("a consent question where none is expected")
     }
-    /// The shim's answer ([`FrameKind::ConsentAnswer`]). The agent's sink of a session with a terminal takes it;
-    /// every other refuses.
+    /// A [`ConsentReply`]. The agent's sink of a session with a terminal takes it; every other refuses.
     fn on_consent_answer(&mut self, reply: ConsentReply) -> anyhow::Result<()> {
         let _ = reply;
         anyhow::bail!("a consent answer where none is expected")
     }
-    /// The agent no longer asks a question ([`FrameKind::ConsentWithdrawn`]). The shim's sink of a session with a
-    /// terminal takes it; every other refuses.
+    /// A [`ConsentWithdrawal`]. The shim's sink of a session with a terminal takes it; every other refuses.
     fn on_consent_withdrawn(&mut self, withdrawal: ConsentWithdrawal) -> anyhow::Result<()> {
         let _ = withdrawal;
         anyhow::bail!("a consent withdrawal where none is expected")

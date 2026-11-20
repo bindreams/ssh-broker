@@ -62,9 +62,7 @@ enum Question {
     None,
     /// The `Consent` frame, numbered so, is written or being written, and the answer has not come.
     Asked(u32),
-    /// The answer has come. It lasts until the question's hold is let go or a command is hosted, and the session's keys
-    /// wait while it does: they were typed after the answer, and go to the command or to the session once that is
-    /// known.
+    /// The answer has come; the session's keys wait while it lasts (the module doc, "The question").
     Answered(ConsentAnswer),
 }
 
@@ -251,9 +249,7 @@ impl Link {
     /// the session's. Takes no lock the connection's writes hold. Only the session's input pump calls it, and it is
     /// the only thing that hands keys out.
     ///
-    /// Once the question is answered the keys wait ([`Question::Answered`]) until the command is hosted or the
-    /// question's hold is let go, or the link has ended: the pump is the one reader of the client's frames, so
-    /// keys after the answer cannot overtake it, and the keys before the answer have gone already.
+    /// Once the question is answered the keys wait, until the link has ended too (the module doc, "The question").
     ///
     /// An error is the session's own target's. The elevated command's input fails when the command is ending (its
     /// pseudoconsole is closed while it is still current), which is no fault of the session: the keys are dropped,
@@ -262,8 +258,7 @@ impl Link {
         self.route_input_observed(bytes, || {})
     }
 
-    /// [`Link::route_input`], calling `waiting` each time it is about to wait for the question's outcome (with the
-    /// state locked, so that the outcome cannot slip in before the wait begins), so that a test can tell that it is
+    /// As [`Link::route_input`], calling `waiting` before each wait, with the state locked, so a test can tell it is
     /// waiting.
     pub(super) fn route_input_observed(&self, bytes: &[u8], mut waiting: impl FnMut()) -> anyhow::Result<()> {
         let mut state = locked(&self.state);
@@ -314,8 +309,7 @@ impl Link {
     /// calls it. Dropping the guard gives the output back. Only a link with a terminal has a screen to hand over:
     /// `decide` refuses the request that would come here for one without.
     ///
-    /// It delivers no keys. It ends the question ([`Question::Answered`]), so the pump, which has held the keys typed
-    /// after the answer, gives them to `target` ([`Link::route_input`]).
+    /// It delivers no keys; it ends the question (the module doc, "The question").
     ///
     /// `None` when the session's shell is gone already ([`Link::end_hosting`]): nothing is hosted, and this calls
     /// `end` itself, so a command that asks too late is ended as one hosted when the session ended is. The question is
@@ -392,8 +386,7 @@ impl Link {
         self.ask_observed(command, cwd, gone, || {})
     }
 
-    /// [`Link::ask`], calling `waiting` each time it is about to wait for the answer (with the state locked, so
-    /// that the answer cannot slip in before the wait begins), so that a test can tell that it is waiting.
+    /// As [`Link::ask`], calling `waiting` before each wait, with the state locked, so a test can tell it is waiting.
     pub(super) fn ask_observed(
         &self,
         command: &str,
@@ -496,9 +489,8 @@ impl Link {
     /// and back: that stream asks the person's terminal to resize its window.
     ///
     /// It delivers no keys. Letting go of the question's hold (`from` is [`Carrier::Asking`]) always ends the
-    /// question ([`Question::Answered`] lasts until then), also when a command has the screen by now, so the keys the
-    /// pump holds go to the session, or stay with the command that took the screen. The size is applied under
-    /// `resizing`, at the size the client has by then.
+    /// question, also when a command has the screen by now (the module doc, "The question"). The size is applied
+    /// under `resizing`, at the size the client has by then.
     fn switch_back(&self, from: Carrier) {
         let (hosted, ours) = {
             let mut state = locked(&self.state);

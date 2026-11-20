@@ -188,12 +188,11 @@ pub const CONSENT_ALLOWING_ANSWERS: [&str; 2] = ["y", "yes"];
 
 /// What the shim writes first, to take the screen: reset the character attributes, the scroll region and the
 /// cursor's visibility, which the session's programs may have left in any state, clear the screen and home the
-/// cursor. There is no alternate screen: what the session had on the screen is repainted when the question is over (the
-/// agent gives the session's pseudoconsole its size again), which is measured to work through sshd's console where
-/// leaving an alternate screen is not.
+/// cursor. There is no alternate screen: leaving one does not repaint through sshd's console, so the agent repaints by
+/// giving the pseudoconsole its size again.
 pub const CONSENT_SCREEN_ENTER: &str = "\x1b[0m\x1b[r\x1b[?25h\x1b[2J\x1b[H";
 
-/// The question: the design's block, then `answer_line` as its last line, which ends nothing, so that what is typed
+/// The question, with `answer_line` as its last line, which ends nothing, so that what is typed
 /// follows it. The command and the folder are those of a program of the session, which can write what it likes: they
 /// are shown by [`display`].
 pub fn consent_question(command: &str, cwd: &str, answer_line: &str) -> String {
@@ -234,13 +233,9 @@ pub fn display(text: &str) -> String {
     shown
 }
 
-/// A character that is no control character and shows nothing or changes how the text around it is shown: every code
-/// point of the Unicode property Default_Ignorable_Code_Point (the soft hyphen, the Arabic letter mark, the combining
-/// grapheme joiner, the Hangul fillers, the Khmer inherent vowels, the Mongolian free variation selectors and vowel
-/// separator, the zero-width and directional marks, embeddings and isolates, the word joiner and invisible operators,
-/// the deprecated format controls, the variation selectors, the byte order mark, the shorthand and musical format
-/// controls, and the tag characters, with the unassigned code points the property covers), and also the line and
-/// paragraph separators and the interlinear annotation marks, which the property does not list.
+/// A character that is no control character and shows nothing or changes how the text around it is shown:
+/// Default_Ignorable_Code_Point, plus the line and paragraph separators and the interlinear annotation marks, which
+/// the property does not list.
 fn is_hidden_format(c: char) -> bool {
     matches!(u32::from(c),
         0x00AD | 0x034F | 0x061C | 0x115F | 0x1160 | 0x17B4 | 0x17B5 | 0x180B..=0x180F | 0x3164 | 0xFFA0

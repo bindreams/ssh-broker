@@ -18,7 +18,7 @@ use crate::stand_in::{self, Kit};
 /// What `whoami /groups` prints for a process at High.
 pub const HIGH: &str = r"Mandatory Label\High Mandatory Level";
 
-/// Rows of history a rendering keeps: more than any run here produces.
+/// Rows of history a rendering keeps.
 pub const SCROLLBACK: usize = 2000;
 
 /// `elevate` refuses with 126.

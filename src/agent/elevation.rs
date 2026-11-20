@@ -172,17 +172,14 @@ impl RequestWatch {
         (watch, guard)
     }
 
-    /// The session's link, which the question is asked on and the command's screen is handed over on.
     pub(super) fn link(&self) -> &Arc<Link> {
         &self.link
     }
 
-    /// The flag [`Link::ask`] ends a question on.
     pub(super) fn gone(&self) -> &ClientGone {
         &self.gone
     }
 
-    /// Whether the client has hung up.
     pub(super) fn is_gone(&self) -> bool {
         self.gone.is_gone()
     }
@@ -334,8 +331,7 @@ fn on_a_pseudoconsole(
     // A delivery that fails is a connection that has gone, and its command has no screen to run on: its tree ends,
     // as the session's own pump's does, and the pump goes on reading until the pseudoconsole is closed. The session's
     // own end is [`Link::end_hosting`]'s, and this is what ends the command when the session's hang-up watch could
-    // not start. The session's input pump does not park in a send on this path (a pseudoconsole's queue has no
-    // bound), so it still sees the client go.
+    // not start.
     let gone = {
         let job = Arc::clone(&job);
         move || {

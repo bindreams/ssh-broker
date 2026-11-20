@@ -1918,12 +1918,10 @@ impl HandleWriter {
     }
 
     /// A writer for a pseudoconsole's input, whose handle belongs to the session. Its queue has no bound: a console
-    /// host takes input as fast as it is given while its output is read (measured 2026-11-20, build 26100), and the
+    /// host takes input as fast as it is given while its output is read, and the
     /// pump must never park before it reads a `ConsentReply` while the link holds the session's output.
     ///
-    /// The cost: memory grows by what a client sends while it is not reading the session's output (a question open,
-    /// the gap between `Link::return_input` and the drop of the command's guard, a client that sends keys and reads
-    /// none). That holds for every pseudoconsole, at all times.
+    /// The cost: memory grows by what a client sends while it reads none of the session's output.
     fn unbounded(raw: isize) -> Self {
         let (tx, rx) = std::sync::mpsc::channel::<Option<Vec<u8>>>();
         Self::start(raw, None, rx, Queue::Unbounded(tx))
