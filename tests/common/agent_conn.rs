@@ -135,10 +135,10 @@ pub struct Finished {
     pub exit: Option<i32>,
 }
 
-/// The session rows `verify` shows through an administrator's elevated agent, in its `stdout`: the session is
+/// The session rows `doctor` shows through an administrator's elevated agent, in its `stdout`: the session is
 /// elevated, an unelevated one can be had, and the junction was followed, not skipped. Not its exit code, which
 /// also depends on the installation rows.
-pub fn assert_verify_session_rows(stdout: &str) {
+pub fn assert_doctor_session_rows(stdout: &str) {
     for row in [
         "[PASS] elevated session",
         "[PASS] unelevated session on request",

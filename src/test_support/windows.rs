@@ -109,7 +109,7 @@ pub fn hold_without_sharing_read(dir: &std::path::Path) -> std::fs::File {
 
 // A directory of a test's own -----
 
-/// A new, empty directory under the temp dir, named as `verify` names the directory of its junction
+/// A new, empty directory under the temp dir, named as `doctor` names the directory of its junction
 /// ([`crate::provision::probe::link::unique_dir`]), removed with what is in it on drop.
 pub struct Scratch(pub PathBuf);
 

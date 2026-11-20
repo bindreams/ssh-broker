@@ -1,4 +1,4 @@
-//! The junction `verify`'s link row reads through.
+//! The junction `doctor`'s link row reads through.
 //!
 //! RedirectionGuard refuses to follow a link that a non-administrator made, so a junction proves
 //! something only when a token below High made it and the token under test follows it. A junction
@@ -120,7 +120,7 @@ fn make_in(dir: &Path) -> Result<(), MakeError> {
 /// it, or `None` for a probe that was given no junction to make or follow. A directory that could not be
 /// made is [`SymlinkState::NotMade`]; a volume that holds no junctions was not tested
 /// ([`SymlinkState::Skipped`]). Whatever it could not do is on stderr, each line after [`JUNCTION_SAID`],
-/// for `verify` to show.
+/// for `doctor` to show.
 pub fn run(link: &ProbeLink) -> Option<SymlinkState> {
     match link {
         ProbeLink::NoJunction => None,

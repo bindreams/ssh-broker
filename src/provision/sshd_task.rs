@@ -122,7 +122,7 @@ pub fn hand_over(task: &mut dyn SshdTask, report: &Path, say: &mut dyn FnMut(&st
         Err(e) => say(&format!(
             "apply: the report of the task {APPLY_SSHD_TASK} could not be read in {} ({e:#}); if it is not there, \
              the task did not start or could not create it. Whether sshd accepts SSH_BROKER_ELEVATION and is \
-             running is not known: `ssh-broker verify` says, and `sc query sshd` shows whether sshd runs",
+             running is not known: `ssh-broker doctor` says, and `sc query sshd` shows whether sshd runs",
             report.display()
         )),
     }

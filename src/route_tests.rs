@@ -279,13 +279,23 @@ fn a_c_flag_after_a_verb_is_still_exec() {
 }
 
 #[test]
-fn apply_and_verify_verbs() {
+fn apply_and_doctor_verbs() {
     assert_eq!(route_line("ssh-broker.exe apply"), Route::Apply);
-    assert_eq!(route_line("ssh-broker.exe verify"), Route::Verify);
+    assert_eq!(route_line("ssh-broker.exe doctor"), Route::Doctor);
     assert_eq!(
-        route_line("ssh-broker.exe verify-probe"),
-        Route::VerifyProbe(ProbeLink::NoJunction)
+        route_line("ssh-broker.exe doctor-probe"),
+        Route::DoctorProbe(ProbeLink::NoJunction)
     );
+}
+
+#[test]
+fn verify_is_not_a_verb() {
+    for word in ["verify", "verify-probe"] {
+        assert_eq!(
+            route_line(&format!("ssh-broker.exe {word}")),
+            Route::Shim { exec: None }
+        );
+    }
 }
 
 /// The hidden verb of the task that sets sshd up takes no arguments; any other shape is a usage error,
@@ -300,33 +310,33 @@ fn apply_sshd_is_a_hidden_verb_that_takes_no_arguments() {
     );
 }
 
-/// The hidden probe takes the directory of the junction it makes or the one it follows, which `verify`
+/// The hidden probe takes the directory of the junction it makes or the one it follows, which `doctor`
 /// names: it runs the two probes of an administrator's session with them. Any other shape is a usage
 /// error, never the shim and never a probe that ignored what it was told.
 #[test]
-fn verify_probe_takes_the_directory_to_make_a_junction_in_or_to_follow() {
+fn doctor_probe_takes_the_directory_to_make_a_junction_in_or_to_follow() {
     let args = |args: &[&str]| args.iter().map(|a| (*a).to_owned()).collect::<Vec<_>>();
     let dir = r"C:\Users\me\AppData\Local\Temp\sb-junction-1-2";
     assert_eq!(
-        route(&args(&["verify-probe", "--make-junction", dir]), "ignored"),
-        Route::VerifyProbe(ProbeLink::Make(dir.into()))
+        route(&args(&["doctor-probe", "--make-junction", dir]), "ignored"),
+        Route::DoctorProbe(ProbeLink::Make(dir.into()))
     );
     assert_eq!(
-        route(&args(&["verify-probe", "--follow", dir]), "ignored"),
-        Route::VerifyProbe(ProbeLink::Follow(dir.into()))
+        route(&args(&["doctor-probe", "--follow", dir]), "ignored"),
+        Route::DoctorProbe(ProbeLink::Follow(dir.into()))
     );
     for bad in [
-        vec!["verify-probe", "--follow"],
-        vec!["verify-probe", "--make-junction"],
-        vec!["verify-probe", "--follow", "--make-junction"],
-        vec!["verify-probe", "--follow", "a", "b"],
-        vec!["verify-probe", "--make-junction", "a", "b"],
-        vec!["verify-probe", "--make-junction", "--follow", "a"],
-        vec!["verify-probe", "now"],
+        vec!["doctor-probe", "--follow"],
+        vec!["doctor-probe", "--make-junction"],
+        vec!["doctor-probe", "--follow", "--make-junction"],
+        vec!["doctor-probe", "--follow", "a", "b"],
+        vec!["doctor-probe", "--make-junction", "a", "b"],
+        vec!["doctor-probe", "--make-junction", "--follow", "a"],
+        vec!["doctor-probe", "now"],
     ] {
         assert_eq!(
             route(&args(&bad), "ignored"),
-            Route::Usage(Verb::VerifyProbe),
+            Route::Usage(Verb::DoctorProbe),
             "{bad:?}"
         );
     }
@@ -385,8 +395,8 @@ fn a_command_named_like_a_verb_is_still_shim_exec() {
     for verb in [
         "agent",
         "apply",
-        "verify",
-        "verify-probe",
+        "doctor",
+        "doctor-probe",
         "console-fallback",
         "logout",
         "elevate",
@@ -415,7 +425,7 @@ fn every_dash_c_command_routes_to_the_relay_with_its_text_intact() {
         "git status",
         "cmd /c exit 3",
         "ssh-broker.exe agent",
-        r"C:\a b\ssh-broker.exe verify",
+        r"C:\a b\ssh-broker.exe doctor",
     ] {
         assert_eq!(
             command_as(&format!("ssh-broker.exe -c {text}"), Encoding::Verbatim),

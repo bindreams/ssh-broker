@@ -315,7 +315,7 @@ fn populate_builds_a_verified_layout() {
     );
 }
 
-// Rows of the verify report ---------------------------------------------------------------
+// Rows of the doctor report ---------------------------------------------------------------
 
 #[test]
 fn install_dir_row_carries_the_reason_the_directory_is_untrusted() {

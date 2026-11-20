@@ -1,9 +1,9 @@
-//! provision::probe — the parity checks run IN session 1 by `verify-probe`, plus the pure
-//! line format/parse the parent `verify` uses to read the result.
+//! provision::probe — the parity checks run IN session 1 by `doctor-probe`, plus the pure
+//! line format/parse the parent `doctor` uses to read the result.
 //!
-//! `verify` itself runs in whatever session sshd dropped it into (session 0 over the network),
+//! `doctor` itself runs in whatever session sshd dropped it into (session 0 over the network),
 //! so the DPAPI/symlink/session checks MUST run in an agent-spawned child (which is in session
-//! 1) — running them in verify's own process would false-negative on a correctly-installed box.
+//! 1) — running them in doctor's own process would false-negative on a correctly-installed box.
 
 use crate::socket_loc::Elevation;
 
@@ -71,7 +71,7 @@ pub struct ProbeResult {
     /// What the probe found about its junction. `None` is "not reported": a probe that was given no junction,
     /// an exe older than the field, an unknown word.
     pub symlink: Option<SymlinkState>,
-    /// Whether the payload `verify` sent UPSTREAM reached the child unchanged. Only the child can
+    /// Whether the payload `doctor` sent UPSTREAM reached the child unchanged. Only the child can
     /// see what arrived, so the PROBE line is the only way to learn the client → child direction;
     /// the downstream half is checked by comparing the child's stdout directly.
     pub upstream: UpstreamState,
@@ -107,7 +107,7 @@ pub fn is_genuine_session(session_id: u32, logon_type: Option<u32>) -> bool {
 /// the old exe in place). Reporting that as "the payload did not
 /// reach the child intact" would be a diagnosis the code cannot support: the payload may have
 /// arrived perfectly and the child simply never looked. Both still FAIL the gate — the difference
-/// is only in what `verify` tells the operator to do about it.
+/// is only in what `doctor` tells the operator to do about it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UpstreamState {
     Ok,
@@ -130,11 +130,11 @@ impl UpstreamState {
         matches!(self, UpstreamState::Ok)
     }
 
-    /// The `verify` row detail — never a claim the code cannot support.
+    /// The `doctor` row detail — never a claim the code cannot support.
     pub fn detail(self) -> String {
         match self {
             UpstreamState::Ok => String::new(),
-            UpstreamState::Fail => "the payload verify sent upstream did not reach the child intact".into(),
+            UpstreamState::Fail => "the payload doctor sent upstream did not reach the child intact".into(),
             // State what is KNOWN, then the likely cause — the same discipline the `Fail` arm
             // follows. All the parser can tell is that no `upstream=` token arrived; an exe older
             // than this check is the usual reason, but a truncated or garbled PROBE line and a
@@ -157,14 +157,14 @@ impl UpstreamState {
 const BINARY_PROBE_OPEN: &[u8] = b"BINPROBE<";
 const BINARY_PROBE_CLOSE: &[u8] = b">BINPROBE";
 
-/// The payload the probe child writes and `verify` checks: every one of the 256 byte values, so
+/// The payload the probe child writes and `doctor` checks: every one of the 256 byte values, so
 /// NUL, `0xFF`, a lone CR, a lone LF and invalid UTF-8 all have to survive the real path.
 pub fn binary_probe_payload() -> Vec<u8> {
     (0..=255u8).collect()
 }
 
 /// Write the bracketed payload. Deliberately `write_all` on a raw handle rather than `println!`:
-/// the whole point is that no layer between here and `verify` reinterprets a byte.
+/// the whole point is that no layer between here and `doctor` reinterprets a byte.
 pub fn emit_binary_probe<W: std::io::Write>(w: &mut W) -> std::io::Result<()> {
     w.write_all(BINARY_PROBE_OPEN)?;
     w.write_all(&binary_probe_payload())?;
@@ -183,11 +183,11 @@ pub fn binary_probe_ok(stdout: &[u8]) -> bool {
     extract_binary_probe(stdout).is_some_and(|got| got == binary_probe_payload())
 }
 
-/// Whether the payload that arrived on the probe child's stdin is the one `verify` sent upstream.
+/// Whether the payload that arrived on the probe child's stdin is the one `doctor` sent upstream.
 ///
-/// Pure, and host-tested, on purpose. Its only caller (`provision::imp::verify_probe`) is
+/// Pure, and host-tested, on purpose. Its only caller (`provision::imp::doctor_probe`) is
 /// `#[cfg(windows)]` and has no test module, so mutating the comparison THERE to a bare `true`
-/// would make `verify` print a PASS for the client → child row unconditionally with the whole
+/// would make `doctor` print a PASS for the client → child row unconditionally with the whole
 /// suite still green — restoring exactly the unverified assertion that row exists to replace.
 ///
 /// Default-deny by construction: a short or empty read compares unequal, and an I/O error
@@ -229,7 +229,7 @@ fn parse_integrity(text: &str) -> Option<u32> {
     u32::from_str_radix(text.strip_prefix("0x")?, 16).ok()
 }
 
-/// The single line `verify-probe` prints to stdout.
+/// The single line `doctor-probe` prints to stdout.
 pub fn format_probe_line(r: &ProbeResult) -> String {
     let mut line = format!(
         "PROBE session_id={} dpapi={}",
@@ -301,12 +301,12 @@ pub fn parse_probe_line(stdout: &str) -> anyhow::Result<ProbeResult> {
 // ── what a probe says about itself ─────────────────────────────────────────────────────
 
 /// What the probe writes before each line of its stderr about the junction (why it could not make one,
-/// why it could not read through it, what it could not remove), so `verify` can show those lines and no
+/// why it could not read through it, what it could not remove), so `doctor` can show those lines and no
 /// others.
 pub const JUNCTION_SAID: &str = "ssh-broker: junction: ";
 /// The same for each line about its own token (why its elevation or its level could not be read).
 pub const TOKEN_SAID: &str = "ssh-broker: token: ";
-/// How much of one kind of line `verify` shows on a row.
+/// How much of one kind of line `doctor` shows on a row.
 pub const NOTE_LINES: usize = 4;
 pub const NOTE_CHARS: usize = 400;
 

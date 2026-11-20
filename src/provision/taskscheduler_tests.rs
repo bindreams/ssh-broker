@@ -501,7 +501,7 @@ fn stop_instances_returns_after_the_instance_process_has_exited_and_leaves_the_t
         "left disabled so a logon cannot start an agent before the caller resumes it"
     );
 
-    // `verify` reads this off the queried XML, so the service has to write it there.
+    // `doctor` reads this off the queried XML, so the service has to write it there.
     let disabled_xml = task_xml(&task.0).unwrap().unwrap();
     assert!(
         crate::provision::schtasks::xml_is_disabled(&disabled_xml),

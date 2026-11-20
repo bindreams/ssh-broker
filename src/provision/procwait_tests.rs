@@ -535,7 +535,7 @@ fn a_spaced_exe_path_is_parsed() {
 
 #[test]
 fn other_verbs_are_not_agents() {
-    for verb in ["verify", "apply", "logout", "auto-login on"] {
+    for verb in ["doctor", "apply", "logout", "auto-login on"] {
         assert_eq!(role_of(&format!(r"C:\x\ssh-broker.exe {verb}")), Role::Shim, "{verb}");
     }
 }

@@ -149,8 +149,8 @@ fn removing_a_directory_that_is_gone_is_not_an_error() {
 
 // what a probe does with its junction ---------------------------------------------------------
 
-/// `Make`: a probe makes the junction in the directory `verify` named and leaves it; a second probe
-/// follows it by that name and leaves it for `verify` to remove.
+/// `Make`: a probe makes the junction in the directory `doctor` named and leaves it; a second probe
+/// follows it by that name and leaves it for `doctor` to remove.
 #[test]
 fn a_made_junction_is_left_for_the_next_probe_to_follow() {
     let scratch = Scratch::new();
@@ -162,7 +162,7 @@ fn a_made_junction_is_left_for_the_next_probe_to_follow() {
 
     assert_eq!(made, Some(SymlinkState::Ok));
     assert_eq!(followed, Some(SymlinkState::Ok));
-    assert!(dir.exists(), "following leaves what it follows to `verify`");
+    assert!(dir.exists(), "following leaves what it follows to `doctor`");
     remove(&dir).unwrap();
     assert_eq!(
         follow(&dir),

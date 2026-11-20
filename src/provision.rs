@@ -1,4 +1,4 @@
-//! provision: self-install (`apply`) and self-check (`verify`) — the DefaultShell values, the
+//! provision: self-install (`apply`) and self-check (`doctor`) — the DefaultShell values, the
 //! agent logon task (one agent per logged-on user), and parity probes (DPAPI/symlink/session) run
 //! THROUGH the invoking user's agent.
 //!
@@ -58,23 +58,23 @@ pub fn apply_sshd() -> anyhow::Result<()> {
     anyhow::bail!("apply-sshd runs only on Windows");
 }
 
-/// `verify` subcommand: local state checks + parity probes through the agent. Windows-only.
-pub fn verify() -> anyhow::Result<()> {
+/// `doctor` subcommand: local state checks + parity probes through the agent. Windows-only.
+pub fn doctor() -> anyhow::Result<()> {
     #[cfg(windows)]
-    return imp::verify();
+    return imp::doctor();
     #[cfg(not(windows))]
-    anyhow::bail!("verify runs only on Windows");
+    anyhow::bail!("doctor runs only on Windows");
 }
 
-/// `verify-probe`: the hidden child the agent spawns in session 1. Prints one PROBE line and
+/// `doctor-probe`: the hidden child the agent spawns in session 1. Prints one PROBE line and
 /// exits 0 (parity) / 1 (not). Never invoked directly by users.
-pub fn verify_probe(link: crate::route::ProbeLink) -> anyhow::Result<()> {
+pub fn doctor_probe(link: crate::route::ProbeLink) -> anyhow::Result<()> {
     #[cfg(windows)]
-    return imp::verify_probe(link);
+    return imp::doctor_probe(link);
     #[cfg(not(windows))]
     {
         let _ = link;
-        anyhow::bail!("verify-probe runs only on Windows");
+        anyhow::bail!("doctor-probe runs only on Windows");
     }
 }
 
@@ -88,7 +88,7 @@ pub fn check_apply_args(args: &[String]) -> anyhow::Result<()> {
     }
 }
 
-/// The `verify` row for the shell configuration: it passes when the configured (or built-in) shell is
+/// The `doctor` row for the shell configuration: it passes when the configured (or built-in) shell is
 /// in use, and fails when a fallback is, naming the file and the value.
 pub fn shell_config_row(effective: &anyhow::Result<crate::shell::Effective>) -> report::Check {
     match effective {
@@ -112,7 +112,7 @@ pub fn shell_config_row(effective: &anyhow::Result<crate::shell::Effective>) -> 
     }
 }
 
-/// The handshake `verify` sends to run its probe through the agent: ssh-broker's own command, run as
+/// The handshake `doctor` sends to run its probe through the agent: ssh-broker's own command, run as
 /// it stands and not through the user's shell. `elevation` is what the probe asks the agent for, and
 /// `link` what it does about the junction of the link row.
 pub fn probe_handshake(
@@ -121,7 +121,7 @@ pub fn probe_handshake(
     link: &crate::route::ProbeLink,
 ) -> crate::protocol::Handshake {
     use crate::route::ProbeLink;
-    let command = format!("\"{}\" verify-probe", exe.display());
+    let command = format!("\"{}\" doctor-probe", exe.display());
     let command = match link {
         ProbeLink::NoJunction => command,
         ProbeLink::Make(dir) => format!("{command} --make-junction \"{dir}\""),
@@ -460,7 +460,7 @@ mod imp {
     }
 
     /// Decode schtasks output, handling the UTF-16LE it can emit to a redirected pipe (BOM, or
-    /// pervasive NUL bytes). Otherwise treat it as UTF-8/ASCII. The markers verify scans for
+    /// pervasive NUL bytes). Otherwise treat it as UTF-8/ASCII. The markers doctor scans for
     /// (`<Task`, `InteractiveToken`) are ASCII either way, but decoding correctly avoids a
     /// NUL-interleaved false-fail.
     fn decode_output(bytes: &[u8]) -> String {
@@ -496,9 +496,9 @@ mod imp {
         Ok(decode_output(&out.stdout))
     }
 
-    // ── verify ─────────────────────────────────────────────────────────────────────
+    // ── doctor ─────────────────────────────────────────────────────────────────────
 
-    pub fn verify() -> anyhow::Result<()> {
+    pub fn doctor() -> anyhow::Result<()> {
         let layout = Layout::production();
         let exe = layout.canonical_exe();
         let mut rows = Vec::new();
@@ -530,7 +530,7 @@ mod imp {
         rows.push(path_env::row(&registry::read_system_path(), super::BASE_DIR));
 
         // Local: sshd accepts SSH_BROKER_ELEVATION from clients, and has read the files that say so. `sshd -T`
-        // reads sshd's host keys, so the row is judged only by an elevated `verify` (see
+        // reads sshd's host keys, so the row is judged only by an elevated `doctor` (see
         // `sshd_config::accepts_row`).
         rows.push(sshd_config::accepts_row(
             crate::account::integrity(),
@@ -561,7 +561,7 @@ mod imp {
         }
 
         // Per user: this account's socket, its folder and file ACLs, and whether its agent
-        // answers. `verify` reports on the account that runs it.
+        // answers. `doctor` reports on the account that runs it.
         let location = crate::userdir::current_socket_location();
         let account_rows = user_rows::account_rows(&crate::account::elevation());
         let filtered = matches!(account_rows, user_rows::AccountRows::Filtered);
@@ -587,14 +587,14 @@ mod imp {
         }
         rows.push(user_rows::other_users_row());
 
-        // Through the agent: the real parity proof (run in session 1 by verify-probe). Bounded,
+        // Through the agent: the real parity proof (run in session 1 by doctor-probe). Bounded,
         // because the probe child blocks reading the upstream payload before it writes anything,
         // so an agent or session-1 child that wedges yields NO report at all — not even the local
         // rows already gathered above. See `provision::bounded` for why a clock here is the rule's
         // exception rather than a breach of it.
         //
         // Not a claim that this is the only wait that can hang: the `schtasks` queries above are
-        // unbounded too, and a wedged Task Scheduler stalls `verify` just as thoroughly. That case
+        // unbounded too, and a wedged Task Scheduler stalls `doctor` just as thoroughly. That case
         // is simply not addressed here.
         // A malformed `--probe-timeout` errors rather than quietly applying the default, so the
         // operator who asked to wait indefinitely never silently gets 30s and a wrong diagnosis.
@@ -619,16 +619,16 @@ mod imp {
         if let Ok(effective) = &effective {
             println!("\n{}", crate::shell::render(effective));
         }
-        let code = report::verify_exit_code(&rows);
+        let code = report::doctor_exit_code(&rows);
         if code != 0 {
             std::process::exit(code);
         }
         Ok(())
     }
 
-    // ── verify-probe (runs in session 1, spawned by the agent) ───────────────────────
+    // ── doctor-probe (runs in session 1, spawned by the agent) ───────────────────────
 
-    pub fn verify_probe(link: crate::route::ProbeLink) -> anyhow::Result<()> {
+    pub fn doctor_probe(link: crate::route::ProbeLink) -> anyhow::Result<()> {
         let sid = probe::current_session_id();
         let logon_type = probe::current_logon_type();
         let dpapi = probe::dpapi_roundtrip(b"ssh-broker-parity-probe");
@@ -681,7 +681,7 @@ mod imp {
         // `upstream_ok` is deliberately NOT a gate here: it measures the RELAY, not the session,
         // and this child is the wrong place to judge it — exiting non-zero would report a
         // transport fault as a parity failure, and the parent could not tell the two apart. It
-        // rides up in the PROBE line instead, where `verify` gates it as a row of its own.
+        // rides up in the PROBE line instead, where `doctor` gates it as a row of its own.
         let pass = probe::is_genuine_session(sid, logon_type)
             && dpapi
             && !symlink.is_some_and(probe::SymlinkState::is_failure);

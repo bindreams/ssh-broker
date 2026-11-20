@@ -364,7 +364,7 @@ pub fn ensure_private_dir(
     private_dir(parent, name, user, true, hold, integrity)
 }
 
-/// [`ensure_private_dir`] for a caller that only looks (`verify`): the same open and the same
+/// [`ensure_private_dir`] for a caller that only looks (`doctor`): the same open and the same
 /// judgement, and a folder that is not there is [`Missing`] and is not made.
 pub fn open_private_dir(
     parent: &DirHandle,

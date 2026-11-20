@@ -1,5 +1,5 @@
 //! Host tests for the pure parts of `provision::sshd_config`: the text edit, the `sshd -T` reader, the
-//! `verify` row. The flow is in `configure_tests`.
+//! `doctor` row. The flow is in `configure_tests`.
 use super::*;
 use std::path::PathBuf;
 
@@ -348,7 +348,7 @@ fn a_variable_accepted_or_pinned_is_in_force_by_one_judgement() {
     assert!(!in_force("port 22\nacceptenv LANG\n"));
 }
 
-// the verify row ====================================================================
+// the doctor row ====================================================================
 
 const ROW_NAME: &str = "sshd accepts SSH_BROKER_ELEVATION";
 
@@ -366,7 +366,7 @@ fn the_sshd_row_below_high_is_informational_and_passes_without_asking_sshd() {
     assert!(row.pass);
     assert_eq!(
         row.detail,
-        "not checked here: sshd's configuration is read by an elevated `verify`"
+        "not checked here: sshd's configuration is read by an elevated `doctor`"
     );
 }
 

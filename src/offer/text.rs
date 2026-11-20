@@ -222,7 +222,7 @@ pub fn elevation_unreadable(cause: &str) -> String {
 }
 
 /// Told to an unelevated process whose agent runs at High and serves no socket it can reach. Names neither
-/// "administrator" nor "Backup Operator": either account is split. Used by `verify`'s row and `logout`'s line.
+/// "administrator" nor "Backup Operator": either account is split. Used by `doctor`'s row and `logout`'s line.
 pub const ELEVATED_AGENT_LOOKS_ELSEWHERE: &str = "this account's agent serves elevated processes: run this from an elevated prompt or from an SSH login that asked for SSH_BROKER_ELEVATION=always";
 
 /// Told when a High login lacks `SeImpersonatePrivilege`, which `CreateProcessWithTokenW` needs; the way

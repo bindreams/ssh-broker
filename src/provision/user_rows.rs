@@ -1,8 +1,8 @@
-//! provision::user_rows — the rows of the `verify` report about the invoking user's own agent.
+//! provision::user_rows — the rows of the `doctor` report about the invoking user's own agent.
 //!
-//! Every agent is per user, so `verify` reports on the account that runs it and says so. It does
+//! Every agent is per user, so `doctor` reports on the account that runs it and says so. It does
 //! not enumerate other profiles: reading another user's folder is not something an unprivileged
-//! check should do, and each user can run `verify` for themselves.
+//! check should do, and each user can run `doctor` for themselves.
 
 use crate::account::Elevation;
 use crate::acl::{self, Sid};
@@ -113,7 +113,7 @@ pub fn socket_reachable_row(location: &anyhow::Result<SocketLocation>, user: &Si
     }
 }
 
-/// What `verify` shows an administrator's unelevated process in place of the rows about the agent
+/// What `doctor` shows an administrator's unelevated process in place of the rows about the agent
 /// (the explanation is `offer::text::ELEVATED_AGENT_LOOKS_ELSEWHERE`). Fails, because nothing was proven.
 pub fn filtered_row() -> Check {
     Check::new(
@@ -123,7 +123,7 @@ pub fn filtered_row() -> Check {
     )
 }
 
-/// What `verify` shows for the account, chosen by the elevation of this process's token.
+/// What `doctor` shows for the account, chosen by the elevation of this process's token.
 pub enum AccountRows {
     /// The rows about the agent.
     Agent,
@@ -147,12 +147,12 @@ pub fn account_rows(elevation: &anyhow::Result<Elevation>) -> AccountRows {
     }
 }
 
-/// `other users (info)`: says what `verify` covers. Never fails.
+/// `other users (info)`: says what `doctor` covers. Never fails.
 pub fn other_users_row() -> Check {
     Check::new(
         "other users (info)",
         true,
-        "each user runs their own agent; run verify as that user",
+        "each user runs their own agent; run doctor as that user",
     )
 }
 

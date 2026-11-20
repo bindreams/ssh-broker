@@ -38,7 +38,7 @@ pub fn desired_values(exe: &str) -> [(&'static str, RegValue); 3] {
 /// The value sshd reads to decide whether to escape the command it hands the `DefaultShell`.
 pub const ESCAPE_ARGUMENTS: &str = "DefaultShellEscapeArguments";
 
-/// The `verify` row for the escape flag: `read` is [`escape_arguments_under`]'s answer, which
+/// The `doctor` row for the escape flag: `read` is [`escape_arguments_under`]'s answer, which
 /// already follows how sshd reads the value. Off, and a value that cannot be read, both fail:
 /// the shim decodes the escaped form only.
 pub fn escape_arguments_check<E: std::fmt::Display>(read: Result<bool, E>) -> Check {

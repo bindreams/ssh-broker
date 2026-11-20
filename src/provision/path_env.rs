@@ -2,7 +2,7 @@
 //!
 //! `apply` appends [`super::BASE_DIR`] to the machine's `Path` value so that a session finds `ssh-broker` by
 //! name (`ssh-broker elevate ...`). This module is the pure part: what to write for what is stored, and the
-//! `verify` row. Reading and writing the value is `registry`'s.
+//! `doctor` row. Reading and writing the value is `registry`'s.
 //!
 //! The value is read, changed and written back whole, as every program that edits it does: a write another
 //! program makes between the two is lost. Nothing can guard that from one side (see the README).
@@ -128,7 +128,7 @@ pub fn plan(current: &Reading, dir: &str, expanded_length: impl Fn(&str) -> Resu
     PathPlan::Write { value: longer, expand }
 }
 
-/// The `verify` row: the install directory is on the system `PATH`.
+/// The `doctor` row: the install directory is on the system `PATH`.
 pub fn row(current: &Reading, dir: &str) -> Check {
     const NAME: &str = "install directory on PATH";
     match current {

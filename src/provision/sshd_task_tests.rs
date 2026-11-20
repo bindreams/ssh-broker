@@ -288,7 +288,7 @@ fn a_missing_report_is_said_and_the_task_is_still_removed() {
         &format!(
             "apply: the report of the task ssh-broker-apply-sshd could not be read in {REPORT} (the system cannot \
              find the file specified); if it is not there, the task did not start or could not create it. Whether \
-             sshd accepts SSH_BROKER_ELEVATION and is running is not known: `ssh-broker verify` says, and `sc query \
+             sshd accepts SSH_BROKER_ELEVATION and is running is not known: `ssh-broker doctor` says, and `sc query \
              sshd` shows whether sshd runs"
         )
     );

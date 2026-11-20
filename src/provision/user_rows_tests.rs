@@ -1,4 +1,4 @@
-//! Tests for the per-user rows of the `verify` report.
+//! Tests for the per-user rows of the `doctor` report.
 use super::*;
 use crate::acl::{self, Sid};
 use crate::socket_loc::{SocketLocationError, for_profile};
@@ -304,7 +304,7 @@ fn socket_reachable_row_fails_without_a_location() {
 fn other_users_row_always_passes_and_says_each_user_runs_their_own_agent() {
     let row = other_users_row();
     assert!(row.pass);
-    assert!(row.detail.contains("run verify as that user"), "{}", row.detail);
+    assert!(row.detail.contains("run doctor as that user"), "{}", row.detail);
 }
 
 // an administrator's unelevated prompt -------------------------------------------------------

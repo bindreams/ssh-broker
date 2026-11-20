@@ -164,7 +164,7 @@ pub fn create_from_xml_argv(name: &str, xml_path: &str) -> Vec<String> {
     ]
 }
 
-/// `schtasks /Query /TN <name> /XML` — dump a task's definition (for the verify checks).
+/// `schtasks /Query /TN <name> /XML` — dump a task's definition (for the doctor checks).
 pub fn query_task_argv(name: &str) -> Vec<String> {
     vec!["/Query".into(), "/TN".into(), name.into(), "/XML".into()]
 }
@@ -215,7 +215,7 @@ pub fn xml_run_level(query_xml: &str) -> Option<String> {
     Some(query_xml[start..end].trim().to_owned())
 }
 
-/// The `agent task` row of `verify`, from the query of the task's XML: `Ok(None)` if there is no
+/// The `agent task` row of `doctor`, from the query of the task's XML: `Ok(None)` if there is no
 /// such task, and the cause if the query could not be answered.
 pub fn agent_task_row(query: &anyhow::Result<Option<String>>) -> Check {
     let xml = match query {

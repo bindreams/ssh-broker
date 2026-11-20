@@ -68,7 +68,7 @@ pub fn ensure_base(layout: &Layout) -> anyhow::Result<TrustedBase<'_>> {
     Ok(TrustedBase { layout })
 }
 
-/// Check the install directory without creating or changing anything (for `verify`).
+/// Check the install directory without creating or changing anything (for `doctor`).
 pub fn check_base(layout: &Layout) -> BaseCheck<'_> {
     match acl::install_dir_problem(&layout.base) {
         Ok(None) => Ok(TrustedBase { layout }),
@@ -89,7 +89,7 @@ pub fn run_if_trusted_base<T>(
     }
 }
 
-/// The `install dir ACL` row of `verify`.
+/// The `install dir ACL` row of `doctor`.
 pub fn install_dir_row(base: &BaseCheck<'_>) -> Check {
     match base {
         Ok(trusted) => Check::new("install dir ACL", true, trusted.layout.base.display().to_string()),

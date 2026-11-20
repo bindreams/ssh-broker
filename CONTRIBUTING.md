@@ -6,7 +6,7 @@ negotiable.
 
 ## Architecture
 
-One binary, four entry points plus the hidden `apply-sshd`, `verify-probe` and `console-fallback` verbs, selected by argv
+One binary, four entry points plus the hidden `apply-sshd`, `doctor-probe` and `console-fallback` verbs, selected by argv
 ([`src/route.rs`](src/route.rs)). The shim is
 the *default* action because `DefaultShell` is a bare path and cannot carry a subcommand: a
 known verb in first position selects a subcommand, anything else is the shim.
@@ -16,9 +16,9 @@ known verb in first position selects a subcommand, anything else is the shim.
 | *(none)* or `-c "cmd"` | `shim`, `shim_pty` | the SSH session, as sshd's `DefaultShell` |
 | `agent` | `agent` | a user's interactive session, one per logged-on user, started by a logon task for any member of `BUILTIN\Users` |
 | `apply` | `provision` | wherever an admin runs it; needs elevation |
-| `verify` | `provision` | on the host itself, as the account whose agent it asks: an administrator runs it elevated, and an unelevated one finds no agent and says why |
+| `doctor` | `provision` | on the host itself, as the account whose agent it asks: an administrator runs it elevated, and an unelevated one finds no agent and says why |
 | `apply-sshd` | `provision`, `provision::sshd_task` | the hidden verb of the task `ssh-broker-apply-sshd`, as SYSTEM: `apply`'s sshd step (the drop-in, the `Include` and the restart of sshd), whose every line it writes to `apply-sshd.log` in the install directory; `apply` registers the task, starts it, waits for its instances and prints the report, so that the step finishes even if the `apply` that started it is ended |
-| `verify-probe` | `provision` | the child the **agent** spawns in its interactive session, driven through the relay by `verify` |
+| `doctor-probe` | `provision` | the child the **agent** spawns in its interactive session, driven through the relay by `doctor` |
 | `console-fallback [--login] <handle>` | `shim`, `shim_pty`, `handoff` | the fallback shell of a terminal session through the agent: reads a notice and a line from the pipe handle the agent gave it alone (`PROC_THREAD_ATTRIBUTE_HANDLE_LIST`) until the agent closes its end, prints the notice on its pseudoconsole (which clears anything written ahead of it), starts the line there, exits with its code; it keeps through Ctrl+C for the shell, and when it cannot read the pipe it starts the built-in `cmd.exe` for a login (`--login`) and exits 255 for a command |
 
 Supporting modules: `protocol` (frame codec and handshake), `relay` (transport-agnostic
@@ -72,7 +72,7 @@ delete, rename or create beside the socket whatever the DACL says. `acl::verify_
 part of "exactly private"; a folder without it is refused with the words of every other refusal and
 is never labelled afterwards. `tests/user_isolation_windows.rs` pins
 what a process below High is refused, and `tests/redirection_guard_windows.rs` pins the premise of
-`verify`'s junction row (see the next section).
+`doctor`'s junction row (see the next section).
 
 `userdir::open_socket_dir` (and `ensure_socket_dir` over it) reaches the folder by handle: it opens
 the profile directory (opened following a link, see below), then `AppData`, `Local`,
@@ -157,16 +157,16 @@ bind both fail closed. Elsewhere the shim also prefers working over failing in s
 (logging disables itself rather than aborting, for one), and provisioning has best-effort steps of
 its own.
 
-### What `verify`'s junction row proves
+### What `doctor`'s junction row proves
 
 RedirectionGuard refuses to follow a link that a non-administrator made, and a process follows a link it
 made itself, so a row that read through a link the probe made as an elevated process would pass whether or
-not the mitigation is on. For an agent at High integrity `verify` therefore runs two probes through it
-(`provision::probe_run`): first `verify-probe --make-junction <directory>` asking the agent for the default elevation policy
+not the mitigation is on. For an agent at High integrity `doctor` therefore runs two probes through it
+(`provision::probe_run`): first `doctor-probe --make-junction <directory>` asking the agent for the default elevation policy
 (`prompt`: an unelevated session), which makes that directory with a junction in it by a token below High, then
-`verify-probe --follow <directory>` asking for `always` (the account's own token), which reads through it. `verify` names the directory of every junction itself, under its own temp directory with a
+`doctor-probe --follow <directory>` asking for `always` (the account's own token), which reads through it. `doctor` names the directory of every junction itself, under its own temp directory with a
 name unique to the run, before any probe runs, and removes it, through no link, whatever became of the
-probes: no probe reports a path, because a path a process below High wrote is not one an elevated `verify`
+probes: no probe reports a path, because a path a process below High wrote is not one an elevated `doctor`
 acts on. The make-probe fails on a path that exists and never clears one. Each probe's outcome is a value
 (`session_rows::ProbeOutcome`: answered, failed, timed out, not run) and `probe_run::run_at` returns them
 all, so the rows are a pure function of what it found. A probe that fails is data, not an early return: the
@@ -183,7 +183,7 @@ For an agent below High there is one probe, which makes and follows the junction
 given. The probe's PROBE line also carries its own `elevation` and `integrity` (read by
 `account::elevation_of` and `integrity_of`), which the `elevated session` and `unelevated session on request`
 rows judge. The two probes and the two rows are keyed on the agent being at High (the level of the process
-that runs `verify`, which is the level of the folder it asks; the default probe's own level for the rows),
+that runs `doctor`, which is the level of the folder it asks; the default probe's own level for the rows),
 not on `Elevation::Full`.
 `tests/redirection_guard_windows.rs` measures the premise.
 
@@ -238,7 +238,7 @@ marker does not suppress. The hatch is not fixture-only: product code may carry 
 reason is written down, and exactly one place does.
 
 That place is [`provision::bounded`](src/provision/bounded.rs), and its justification is narrower
-than "the network might swallow it". `verify` runs on this host and drives the agent over the
+than "the network might swallow it". `doctor` runs on this host and drives the agent over the
 AF_UNIX socket **in-process** — there is no ssh client, no sshd and no separate shim in that path.
 If the agent dies, the socket EOFs and the probe fails with no clock involved. The bound covers the
 case that has no such primitive: the agent alive while its handler, or the session-1 probe child,
@@ -246,8 +246,8 @@ never produces output — a wedged LSASS blocking the child's DPAPI round trip, 
 filter driver, or a deadlock of our own.
 
 That last possibility is the uncomfortable one, and it is why the bound is confined to this one
-command. Most ways `verify` can hang are OUR bugs, and a clock over a bug is precisely what this
-rule exists to forbid. It is justified here because `verify` is a one-shot operator diagnostic
+command. Most ways `doctor` can hang are OUR bugs, and a clock over a bug is precisely what this
+rule exists to forbid. It is justified here because `doctor` is a one-shot operator diagnostic
 whose subject is a possibly-sick machine: hanging is the worst way to report one, and it throws
 away the local rows already gathered. `--probe-timeout 0` keeps the true unbounded hang for anyone
 debugging such a deadlock. Nothing else may take a bound on this argument.

@@ -397,7 +397,7 @@ pub fn render(block: &ShellBlock) -> anyhow::Result<String> {
     let body = render_file(block).map_err(|e| anyhow::anyhow!("{e}"))?;
     Ok(format!(
         "# Created once by `ssh-broker apply` from the shell sshd used before ssh-broker. Edit it freely;\n\
-         # `apply` never rewrites it. `ssh-broker verify` shows the shell in effect.\n{body}"
+         # `apply` never rewrites it. `ssh-broker doctor` shows the shell in effect.\n{body}"
     ))
 }
 

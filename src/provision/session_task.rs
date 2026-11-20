@@ -1,4 +1,4 @@
-//! provision::session_task — the auto-login task: its definition, its read-back, its `verify` row.
+//! provision::session_task — the auto-login task: its definition, its read-back, its `doctor` row.
 //!
 //! `auto-login on` registers, for one account, a task that starts `agent --background` at boot with
 //! the account's password stored in Task Scheduler's credential store, so nobody types it after a
@@ -273,7 +273,7 @@ fn last_result_is_fine(code: u32) -> bool {
     matches!(code, 0x0000_0000 | 0x0004_1301 | 0x0004_1303)
 }
 
-/// The `auto-login task` row of `verify`: `state` is the query of this account's task (`Ok(None)`
+/// The `auto-login task` row of `doctor`: `state` is the query of this account's task (`Ok(None)`
 /// for none, the cause if it could not be answered).
 ///
 /// The row checks the definition and reports the last result. It says plainly that a failed logon

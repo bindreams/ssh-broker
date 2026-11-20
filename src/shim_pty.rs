@@ -93,7 +93,7 @@ pub fn run_on(exec: Option<RawExec>, detect: impl FnOnce() -> Encoding) -> anyho
     // `DefaultShell` sees them, and its config serialisation differs from Windows' own quoting.
     // The justification for routing was that relaying would corrupt a binary stream; that turned
     // out to be untrue — `exec_relay_is_byte_clean_*` covers the framing in both directions, and
-    // `verify`'s probe covers a real child, real pipes and a real socket in both directions too.
+    // `doctor`'s probe covers a real child, real pipes and a real socket in both directions too.
     // What remains is a throughput difference, which does not earn a classifier.
     // What this login's own token allows is decided once, before anything connects.
     // The level is read once: the stance and the fail-open shell's rule below are given this one result.

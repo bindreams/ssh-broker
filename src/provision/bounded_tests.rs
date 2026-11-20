@@ -1,4 +1,4 @@
-//! Host tests for the bounded wait. The `verify` path that uses it is `#[cfg(windows)]` with no
+//! Host tests for the bounded wait. The `doctor` path that uses it is `#[cfg(windows)]` with no
 //! test module, which is precisely how an earlier check in this file's neighbourhood ended up
 //! measurable only in production — so the logic lives here, where every platform runs it.
 use super::{DEFAULT_PROBE_TIMEOUT, WaitError, await_bounded, probe_timeout_from_args};
@@ -21,7 +21,7 @@ fn a_ready_value_is_returned() {
     assert_eq!(await_bounded(&rx, None).unwrap(), 9);
 }
 
-/// Expiry must be an ERROR carrying the remedy, never a silent default — `verify` turns this into
+/// Expiry must be an ERROR carrying the remedy, never a silent default — `doctor` turns this into
 /// a failed report row, and a row that read as passing would be the unverified assertion the
 /// probe exists to replace.
 ///
@@ -64,7 +64,7 @@ fn a_dead_worker_is_an_error_not_a_default() {
     );
 }
 
-/// `verify` treats a probe that did not answer in time differently from one that stopped without
+/// `doctor` treats a probe that did not answer in time differently from one that stopped without
 /// answering (it starts no probe after the first), so the two are not told apart by their text.
 #[test]
 fn expiry_and_a_dead_worker_are_different_errors() {
@@ -92,11 +92,11 @@ fn expiry_and_a_dead_worker_are_different_errors() {
 #[test]
 fn zero_means_wait_indefinitely() {
     assert_eq!(
-        probe_timeout_from_args(&args(&["verify", "--probe-timeout", "0"])).unwrap(),
+        probe_timeout_from_args(&args(&["doctor", "--probe-timeout", "0"])).unwrap(),
         None
     );
     assert_eq!(
-        probe_timeout_from_args(&args(&["verify", "--probe-timeout=0"])).unwrap(),
+        probe_timeout_from_args(&args(&["doctor", "--probe-timeout=0"])).unwrap(),
         None
     );
 }
@@ -109,15 +109,15 @@ fn zero_means_wait_indefinitely() {
 fn both_spellings_are_accepted_and_absence_means_the_default() {
     let five = Some(Duration::from_secs(5));
     assert_eq!(
-        probe_timeout_from_args(&args(&["verify", "--probe-timeout", "5"])).unwrap(),
+        probe_timeout_from_args(&args(&["doctor", "--probe-timeout", "5"])).unwrap(),
         five
     );
     assert_eq!(
-        probe_timeout_from_args(&args(&["verify", "--probe-timeout=5"])).unwrap(),
+        probe_timeout_from_args(&args(&["doctor", "--probe-timeout=5"])).unwrap(),
         five
     );
     assert_eq!(
-        probe_timeout_from_args(&args(&["verify"])).unwrap(),
+        probe_timeout_from_args(&args(&["doctor"])).unwrap(),
         Some(DEFAULT_PROBE_TIMEOUT),
         "no flag must mean the default, not an unbounded wait"
     );
@@ -129,10 +129,10 @@ fn both_spellings_are_accepted_and_absence_means_the_default() {
 #[test]
 fn a_malformed_value_errors_and_names_the_flag() {
     for bad in [
-        args(&["verify", "--probe-timeout", "abc"]),
-        args(&["verify", "--probe-timeout", "-1"]),
-        args(&["verify", "--probe-timeout="]),
-        args(&["verify", "--probe-timeout"]), // flag last, no value follows
+        args(&["doctor", "--probe-timeout", "abc"]),
+        args(&["doctor", "--probe-timeout", "-1"]),
+        args(&["doctor", "--probe-timeout="]),
+        args(&["doctor", "--probe-timeout"]), // flag last, no value follows
     ] {
         let err = probe_timeout_from_args(&bad).unwrap_err().to_string();
         assert!(err.contains("--probe-timeout"), "{bad:?} -> {err}");

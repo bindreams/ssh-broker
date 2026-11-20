@@ -100,7 +100,7 @@ fn a_probe_that_reports_no_junction_outcome_has_none() {
     assert_eq!(unknown.symlink, None);
 }
 
-/// What `verify` shows of a probe's stderr on a row: only the lines of that row's own kind, a few of them,
+/// What `doctor` shows of a probe's stderr on a row: only the lines of that row's own kind, a few of them,
 /// so another message of the probe (a failed upstream read, or the token's words on the junction row) is
 /// not put there.
 #[test]
@@ -170,8 +170,8 @@ fn a_missing_upstream_token_is_absent_not_a_reported_failure() {
 }
 
 /// The upstream comparison IS the client → child measurement. Its production caller
-/// (`provision::imp::verify_probe`) is `#[cfg(windows)]` with no test module, so had this stayed
-/// inline there, mutating it to a bare `true` would make `verify` print a PASS for that row
+/// (`provision::imp::doctor_probe`) is `#[cfg(windows)]` with no test module, so had this stayed
+/// inline there, mutating it to a bare `true` would make `doctor` print a PASS for that row
 /// unconditionally while the whole suite stayed green — the exact unverified assertion the row
 /// replaced. These cases are what make that mutation fail.
 #[test]

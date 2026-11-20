@@ -77,7 +77,7 @@ pub enum StepDown<K> {
 
 /// What is said of a socket file at `path` that is not as the agent made it (`acl::verify_file_acl` is
 /// false): it must grant exactly `grantee`, SYSTEM and Administrators and, for [`Integrity::High`], carry
-/// the High label. One wording for the agent's refusal to bind and `verify`'s row.
+/// the High label. One wording for the agent's refusal to bind and `doctor`'s row.
 pub fn file_acl_refusal(path: &Path, grantee: &str, integrity: Integrity) -> String {
     format!(
         "{} does not grant exactly {grantee}, SYSTEM and Administrators{}",
