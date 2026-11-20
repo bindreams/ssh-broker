@@ -11,8 +11,8 @@
 
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::System::Console::{
-    FlushConsoleInputBuffer, GetConsoleMode, GetStdHandle, INPUT_RECORD, PeekConsoleInputW, ReadConsoleInputW,
-    STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, WriteConsoleW,
+    GetConsoleMode, GetStdHandle, INPUT_RECORD, PeekConsoleInputW, ReadConsoleInputW, STD_INPUT_HANDLE,
+    STD_OUTPUT_HANDLE, WriteConsoleW,
 };
 
 use crate::consent_entry::{ConsentEntry, ConsentStep};
@@ -107,19 +107,23 @@ fn write_console(output: HANDLE, text: &str) -> windows::core::Result<()> {
 /// of `accepted`, without regard to case, and Enter. Anything else, Enter alone, Ctrl+C, a failed read and a `stop`
 /// that turns true while the question waits, is [`ConsentAnswer::Refuse`], with no second question.
 ///
-/// What the console has already received of what was typed ahead, and of what the terminal answered to earlier
-/// queries, is thrown away before the question is written. Keys still on their way from the person's terminal when it
-/// appears are not: they count as typed after it and can answer it. The question is written after the screen's reset, clear and home
-/// (`CONSENT_SCREEN_ENTER`), what is typed is echoed, and the session's programs, which wrote to this terminal
-/// before and may have left it in any state, can write nothing into it: the agent holds their output. Nothing is
-/// written after the answer; the agent repaints the session's screen. An error is a console that could not be
-/// flushed or written to, and nothing was asked.
+/// The answer is the next line that arrives after the question was asked. What the console had already received
+/// before that, what was typed or pasted ahead and what the terminal answered to earlier queries, is the session's,
+/// and nothing of it is discarded: every record queued at that moment is taken from the queue, without waiting, and
+/// given to `relay` in order, before the question is written. `relay` says `false` when they could not be passed on
+/// (the connection is gone): the question is then refused and not written. Keys still on their way from the person's
+/// terminal when the question appears are not part of that: they count as typed after it and can answer it. The question is
+/// written after the screen's reset, clear and home (`CONSENT_SCREEN_ENTER`), what is typed is echoed, and the session's
+/// programs, which wrote to this terminal before and may have left it in any state, can write nothing into it: the
+/// agent holds their output. Nothing is written after the answer; the agent repaints the session's screen. An error is
+/// a console that could not be read or written to, and nothing was asked.
 ///
 /// `stop` is looked at after every batch of records that did not finish the answer; whatever makes it true must
 /// then put a record in the queue (the shim's does, with `wake_console_input`), which wakes the read.
 pub fn ask_consent(
     stdin: HANDLE,
     stdout: HANDLE,
+    relay: &mut dyn FnMut(&[INPUT_RECORD]) -> bool,
     question: &str,
     accepted: &[&str],
     stop: &dyn Fn() -> bool,
@@ -127,6 +131,7 @@ pub fn ask_consent(
     ask_on(
         &mut ConsoleInput(stdin),
         &mut |text| write_console(stdout, text),
+        relay,
         question,
         accepted,
         stop,
@@ -137,14 +142,17 @@ pub fn ask_consent(
 fn ask_on(
     queue: &mut impl InputQueue,
     write: &mut dyn FnMut(&str) -> windows::core::Result<()>,
+    relay: &mut dyn FnMut(&[INPUT_RECORD]) -> bool,
     question: &str,
     accepted: &[&str],
     stop: &dyn Fn() -> bool,
 ) -> windows::core::Result<ConsentAnswer> {
-    queue.discard()?;
+    let mut batch = Batch::new();
+    if !batch.drain(queue, relay)? {
+        return Ok(ConsentAnswer::Refuse);
+    }
     write(&format!("{CONSENT_SCREEN_ENTER}{question}"))?;
     let mut entry = ConsentEntry::new(accepted);
-    let mut batch = Batch::new();
     loop {
         match batch.step(queue, &mut entry, stop) {
             Ok(ConsentStep::Allow) => return Ok(ConsentAnswer::Allow),
@@ -178,11 +186,6 @@ impl InputQueue for ConsoleInput {
         // SAFETY: `records` and `count` are valid for the call; the handle is the console's input.
         unsafe { ReadConsoleInputW(self.0, records, &mut count) }?;
         Ok(count)
-    }
-
-    fn discard(&mut self) -> windows::core::Result<()> {
-        // SAFETY: the handle is the console's input.
-        unsafe { FlushConsoleInputBuffer(self.0) }
     }
 }
 

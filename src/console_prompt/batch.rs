@@ -37,9 +37,6 @@ pub(super) trait InputQueue {
     /// Remove up to `records.len()` records from the head of the queue into `records`, waiting for
     /// at least one. Returns how many.
     fn read(&mut self, records: &mut [INPUT_RECORD]) -> windows::core::Result<u32>;
-
-    /// Throw away every record in the queue: what was typed ahead, and what the terminal answered to a query.
-    fn discard(&mut self) -> windows::core::Result<()>;
 }
 
 pub(super) struct Batch {
@@ -50,6 +47,38 @@ impl Batch {
     pub fn new() -> Self {
         Batch {
             records: [zeroed_record(); BATCH],
+        }
+    }
+
+    /// Take every record that is queued now and give it to `relay`, in order, a batch at a time; never wait for one that
+    /// is not. Whatever arrives while this runs is taken too, so it ends when the queue is found empty. `Ok(false)`
+    /// when `relay` said the records could not be passed on: the rest stays queued. The buffer is all zeros on return.
+    pub fn drain(
+        &mut self,
+        queue: &mut impl InputQueue,
+        relay: &mut dyn FnMut(&[INPUT_RECORD]) -> bool,
+    ) -> windows::core::Result<bool> {
+        let result = self.drain_inner(queue, relay);
+        self.wipe();
+        result
+    }
+
+    fn drain_inner(
+        &mut self,
+        queue: &mut impl InputQueue,
+        relay: &mut dyn FnMut(&[INPUT_RECORD]) -> bool,
+    ) -> windows::core::Result<bool> {
+        loop {
+            let queued = (queue.peek(&mut self.records)? as usize).min(BATCH);
+            if queued == 0 {
+                return Ok(true);
+            }
+            // At least `queued` records are there, so this does not wait. The console may have merged a repeat into
+            // the last, which the read returns as it is by now.
+            let taken = (queue.read(&mut self.records[..queued])? as usize).min(queued);
+            if !relay(&self.records[..taken]) {
+                return Ok(false);
+            }
         }
     }
 

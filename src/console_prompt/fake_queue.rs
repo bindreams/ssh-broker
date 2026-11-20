@@ -73,7 +73,6 @@ pub(super) struct FakeQueue {
     pub(super) merge_into_tail_after_peek: Option<u16>,
     pub(super) fail_peek: bool,
     pub(super) fail_read: bool,
-    pub(super) fail_discard: bool,
 }
 
 impl FakeQueue {
@@ -133,13 +132,5 @@ impl InputQueue for FakeQueue {
         }
         self.removed += count;
         Ok(count as u32)
-    }
-
-    fn discard(&mut self) -> windows::core::Result<()> {
-        if self.fail_discard {
-            return Err(failure());
-        }
-        self.queue.clear();
-        Ok(())
     }
 }

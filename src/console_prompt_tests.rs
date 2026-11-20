@@ -155,50 +155,53 @@ use crate::offer::text::{CONSENT_ALLOWING_ANSWERS, CONSENT_SCREEN_ENTER};
 use crate::protocol::ConsentAnswer;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use windows::Win32::System::Console::{FOCUS_EVENT, KEY_EVENT, MOUSE_EVENT, WINDOW_BUFFER_SIZE_EVENT};
 
-/// What the question did to the console, in order: `discard`, and each `write`.
+/// What the question did to the console and the relay, in order: each `relay` of records and each `write`.
 type Log = Rc<RefCell<Vec<String>>>;
-
-/// A [`FakeQueue`] that says when it is discarded.
-struct Logged {
-    queue: FakeQueue,
-    log: Log,
-}
-
-impl InputQueue for Logged {
-    fn peek(&mut self, records: &mut [INPUT_RECORD]) -> windows::core::Result<u32> {
-        self.queue.peek(records)
-    }
-    fn read(&mut self, records: &mut [INPUT_RECORD]) -> windows::core::Result<u32> {
-        self.queue.read(records)
-    }
-    fn discard(&mut self) -> windows::core::Result<()> {
-        self.log.borrow_mut().push("discard".to_owned());
-        self.queue.discard()
-    }
-}
-
-fn logged(queue: FakeQueue) -> (Logged, Log) {
-    let log: Log = Rc::default();
-    (
-        Logged {
-            queue,
-            log: Rc::clone(&log),
-        },
-        log,
-    )
-}
 
 const QUESTION: &str = "ssh-broker: a question\r\nRun it as administrator? [y/N] ";
 
-/// Ask on `console`, writing to `log`.
-fn ask(console: &mut Logged, log: &Log, stop: &dyn Fn() -> bool) -> windows::core::Result<ConsentAnswer> {
-    let log = Rc::clone(log);
+/// The records as text: a key is its character, any other record its kind.
+fn described(records: &[INPUT_RECORD]) -> String {
+    records
+        .iter()
+        .map(|record| match u32::from(record.EventType) {
+            KEY_EVENT => {
+                // SAFETY: the event type says this is a key record.
+                let unit = unsafe { record.Event.KeyEvent.uChar.UnicodeChar };
+                String::from_utf16(&[unit]).unwrap()
+            }
+            MOUSE_EVENT => "<mouse>".to_owned(),
+            FOCUS_EVENT => "<focus>".to_owned(),
+            WINDOW_BUFFER_SIZE_EVENT => "<size>".to_owned(),
+            other => format!("<{other}>"),
+        })
+        .collect()
+}
+
+/// Ask on `queue`, logging to `log` what is written and what is relayed.
+fn ask(queue: &mut FakeQueue, log: &Log, stop: &dyn Fn() -> bool) -> windows::core::Result<ConsentAnswer> {
+    ask_relaying(queue, log, &mut |_| true, stop)
+}
+
+/// [`ask`] with `relay_ok` answering whether the relayed records could be sent.
+fn ask_relaying(
+    queue: &mut FakeQueue,
+    log: &Log,
+    relay_ok: &mut dyn FnMut(&[INPUT_RECORD]) -> bool,
+    stop: &dyn Fn() -> bool,
+) -> windows::core::Result<ConsentAnswer> {
+    let (writes, relays) = (Rc::clone(log), Rc::clone(log));
     ask_on(
-        console,
+        queue,
         &mut |text: &str| {
-            log.borrow_mut().push(format!("write {text}"));
+            writes.borrow_mut().push(format!("write {text}"));
             Ok(())
+        },
+        &mut |records: &[INPUT_RECORD]| {
+            relays.borrow_mut().push(format!("relay {}", described(records)));
+            relay_ok(records)
         },
         QUESTION,
         &CONSENT_ALLOWING_ANSWERS,
@@ -206,27 +209,31 @@ fn ask(console: &mut Logged, log: &Log, stop: &dyn Fn() -> bool) -> windows::cor
     )
 }
 
-/// P3 and Review Focus 3: what was typed ahead, and what the terminal answered to earlier queries, is thrown away
-/// before the question is written and so cannot answer it; mouse, focus and size records that come during it are no
-/// answer either. The answer is the first allowing word and Enter after the question.
+/// What was typed or pasted before the question is the session's: it is relayed, in order and whole, before the question
+/// is written, and cannot answer it. Mouse, focus and size records that come during the question are no answer
+/// either. The answer is the first allowing word and Enter after the question.
 #[test]
-fn typed_ahead_records_are_flushed_before_the_question_and_mouse_focus_and_resize_records_during_it_do_not_answer() {
+fn records_queued_before_the_question_are_relayed_in_order_before_it_and_mouse_focus_and_resize_records_during_it_do_not_answer()
+ {
     // Typed ahead: a yes, which must not be the answer.
-    let mut queue = FakeQueue::with(typed("yes\r"));
+    let mut ahead = typed("ye");
+    ahead.push(mouse_record());
+    ahead.extend(typed("s\r"));
+    let mut queue = FakeQueue::with(ahead);
     queue
         .arrivals
         .push_back(vec![mouse_record(), focus_record(), size_record()]);
     queue.arrivals.push_back(typed("n\r"));
-    let (mut console, log) = logged(queue);
-    assert_eq!(ask(&mut console, &log, &|| false).unwrap(), ConsentAnswer::Refuse);
+    let log = Log::default();
+    assert_eq!(ask(&mut queue, &log, &|| false).unwrap(), ConsentAnswer::Refuse);
     assert_eq!(
         *log.borrow(),
         [
-            "discard".to_owned(),
+            "relay ye<mouse>s\r".to_owned(),
             format!("write {CONSENT_SCREEN_ENTER}{QUESTION}"),
             "write n".to_owned()
         ],
-        "the flush, the screen and the question, and the echo"
+        "the typed-ahead records, the screen and the question, and the echo"
     );
 
     // The same with the person's yes after the question.
@@ -236,9 +243,51 @@ fn typed_ahead_records_are_flushed_before_the_question_and_mouse_focus_and_resiz
         .push_back(vec![mouse_record(), focus_record(), size_record()]);
     queue.arrivals.push_back(typed("Y"));
     queue.arrivals.push_back(typed("\r"));
-    let (mut console, log) = logged(queue);
-    assert_eq!(ask(&mut console, &log, &|| false).unwrap(), ConsentAnswer::Allow);
+    let log = Log::default();
+    assert_eq!(ask(&mut queue, &log, &|| false).unwrap(), ConsentAnswer::Allow);
+    assert_eq!(log.borrow().first().map(String::as_str), Some("relay no\r"));
     assert_eq!(log.borrow().last().map(String::as_str), Some("write Y"));
+}
+
+/// A paste longer than one batch is relayed whole, in order.
+#[test]
+fn a_paste_longer_than_one_batch_is_relayed_whole() {
+    let paste: String = ('a'..='z').cycle().take(3 * batch::BATCH + 5).collect();
+    let mut queue = FakeQueue::with(typed(&paste));
+    queue.arrivals.push_back(typed("n\r"));
+    let log = Log::default();
+    assert_eq!(ask(&mut queue, &log, &|| false).unwrap(), ConsentAnswer::Refuse);
+    let relayed: String = log
+        .borrow()
+        .iter()
+        .filter_map(|entry| entry.strip_prefix("relay "))
+        .collect();
+    assert_eq!(relayed, paste);
+}
+
+/// With nothing queued nothing is relayed, and the question does not wait for anything before it is written.
+#[test]
+fn a_console_with_nothing_queued_relays_nothing_and_does_not_wait() {
+    let mut queue = FakeQueue::default();
+    queue.arrivals.push_back(typed("n\r"));
+    let log = Log::default();
+    assert_eq!(ask(&mut queue, &log, &|| false).unwrap(), ConsentAnswer::Refuse);
+    assert_eq!(
+        *log.borrow(),
+        [format!("write {CONSENT_SCREEN_ENTER}{QUESTION}"), "write n".to_owned()]
+    );
+}
+
+/// Records that cannot be relayed mean the connection is gone: the question is not written.
+#[test]
+fn a_relay_that_fails_refuses_and_writes_nothing() {
+    let mut queue = FakeQueue::with(typed("ls\r"));
+    let log = Log::default();
+    assert_eq!(
+        ask_relaying(&mut queue, &log, &mut |_| false, &|| false).unwrap(),
+        ConsentAnswer::Refuse
+    );
+    assert_eq!(*log.borrow(), ["relay ls\r".to_owned()]);
 }
 
 #[test]
@@ -256,8 +305,11 @@ fn y_yes_and_any_case_allow_and_anything_else_refuses() {
     ] {
         let mut queue = FakeQueue::default();
         queue.arrivals.push_back(typed(typed_text));
-        let (mut console, log) = logged(queue);
-        assert_eq!(ask(&mut console, &log, &|| false).unwrap(), expected, "{typed_text:?}");
+        assert_eq!(
+            ask(&mut queue, &Log::default(), &|| false).unwrap(),
+            expected,
+            "{typed_text:?}"
+        );
     }
     // Ctrl+C is a refusal, with the answer typed and without.
     for typed_text in ["", "y"] {
@@ -265,8 +317,10 @@ fn y_yes_and_any_case_allow_and_anything_else_refuses() {
         records.push(key(0x43, 0x03));
         let mut queue = FakeQueue::default();
         queue.arrivals.push_back(records);
-        let (mut console, log) = logged(queue);
-        assert_eq!(ask(&mut console, &log, &|| false).unwrap(), ConsentAnswer::Refuse);
+        assert_eq!(
+            ask(&mut queue, &Log::default(), &|| false).unwrap(),
+            ConsentAnswer::Refuse
+        );
     }
 }
 
@@ -275,9 +329,11 @@ fn y_yes_and_any_case_allow_and_anything_else_refuses() {
 fn what_follows_the_answer_stays_queued() {
     let mut queue = FakeQueue::default();
     queue.arrivals.push_back(typed("y\rls\r"));
-    let (mut console, log) = logged(queue);
-    assert_eq!(ask(&mut console, &log, &|| false).unwrap(), ConsentAnswer::Allow);
-    assert_eq!(console.queue.left(), "ls\r");
+    assert_eq!(
+        ask(&mut queue, &Log::default(), &|| false).unwrap(),
+        ConsentAnswer::Allow
+    );
+    assert_eq!(queue.left(), "ls\r");
 }
 
 /// The session ended (or the shim is ending) while the question waits: that is a refusal, and nothing more is written.
@@ -285,46 +341,46 @@ fn what_follows_the_answer_stays_queued() {
 fn a_stop_refuses_and_writes_nothing_more() {
     let mut queue = FakeQueue::default();
     queue.arrivals.push_back(vec![focus_record()]);
-    let (mut console, log) = logged(queue);
+    let log = Log::default();
     let consulted = Cell::new(0);
     let stop = || {
         consulted.set(consulted.get() + 1);
         consulted.get() >= 2
     };
-    assert_eq!(ask(&mut console, &log, &stop).unwrap(), ConsentAnswer::Refuse);
+    assert_eq!(ask(&mut queue, &log, &stop).unwrap(), ConsentAnswer::Refuse);
+    assert_eq!(*log.borrow(), [format!("write {CONSENT_SCREEN_ENTER}{QUESTION}")]);
+}
+
+#[test]
+fn a_failed_read_of_the_answer_is_a_refusal() {
+    let mut queue = FakeQueue {
+        fail_read: true,
+        ..FakeQueue::default()
+    };
     assert_eq!(
-        *log.borrow(),
-        ["discard".to_owned(), format!("write {CONSENT_SCREEN_ENTER}{QUESTION}")]
+        ask(&mut queue, &Log::default(), &|| false).unwrap(),
+        ConsentAnswer::Refuse
     );
 }
 
+/// A console whose queue cannot be read, so that what is typed ahead cannot be relayed, or that cannot be written
+/// to, shows no question: it is not asked, and reads no key.
 #[test]
-fn a_failed_read_is_a_refusal() {
-    let queue = FakeQueue {
+fn a_console_that_cannot_be_read_or_written_is_not_asked() {
+    let mut queue = FakeQueue {
         fail_peek: true,
         ..FakeQueue::default()
     };
-    let (mut console, log) = logged(queue);
-    assert_eq!(ask(&mut console, &log, &|| false).unwrap(), ConsentAnswer::Refuse);
-}
+    let log = Log::default();
+    assert!(ask(&mut queue, &log, &|| false).is_err());
+    assert!(log.borrow().is_empty(), "nothing was written");
 
-/// A console that cannot be flushed may hold an answer typed ahead, and one that cannot be written to shows no
-/// question: neither is asked, and neither reads a key.
-#[test]
-fn a_console_that_cannot_be_flushed_or_written_is_not_asked() {
-    let queue = FakeQueue {
-        fail_discard: true,
-        ..FakeQueue::default()
-    };
-    let (mut console, log) = logged(queue);
-    assert!(ask(&mut console, &log, &|| false).is_err());
-    assert_eq!(*log.borrow(), ["discard".to_owned()], "nothing was written");
-
-    // Nothing arrives, so a read would panic: the question was not asked.
-    let (mut console, _log) = logged(FakeQueue::with(typed("y\r")));
+    // Nothing arrives, so a read for the answer would panic: the question was not asked.
+    let mut queue = FakeQueue::with(typed("y\r"));
     let outcome = ask_on(
-        &mut console,
+        &mut queue,
         &mut |_: &str| Err(crate::console_prompt::fake_queue::failure()),
+        &mut |_: &[INPUT_RECORD]| true,
         QUESTION,
         &CONSENT_ALLOWING_ANSWERS,
         &|| false,

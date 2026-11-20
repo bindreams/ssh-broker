@@ -988,7 +988,12 @@ unsafe fn input_loop(
 ) {
     let stdin = HANDLE(stdin_raw as *mut core::ffi::c_void);
     let stdout = HANDLE(stdout_raw as *mut core::ffi::c_void);
-    let mut enc = vtinput::MouseEncoder::default();
+    let mut relay = RecordRelay {
+        stdout,
+        gate,
+        tx,
+        enc: vtinput::MouseEncoder::default(),
+    };
     let mut recs: [INPUT_RECORD; 64] = unsafe { std::mem::zeroed() };
     loop {
         if stopping.load(Ordering::Relaxed) {
@@ -1003,25 +1008,39 @@ unsafe fn input_loop(
         if stopping.load(Ordering::Relaxed) {
             return;
         }
-        // A question wakes the read, whether this thread was parked in it or busy: `on_consent` always injects a wake
-        // record. What this read returned (the wake record, and whatever was typed before the question reached here)
-        // is dropped: the question throws away what was typed ahead and has not been relayed. (What the agent
-        // already has of the session's keys it keeps for the session.) The mouse's state is dropped too, as the
-        // question took its records.
+        // What the read returned is the session's, whether or not a question is waiting, and goes first: a question
+        // wakes the read (`on_consent` always injects a wake record), and what was typed before it reached here was
+        // typed before it was asked.
+        if !relay.relay(&recs[..n as usize]) {
+            return;
+        }
         // The agent may ask again while a question ends (its wake record can be taken by the question that is
-        // ending), so every question waiting is asked before the next read.
-        let mut asked = false;
+        // ending), so every question waiting is asked before the next read. The mouse's state is dropped after
+        // each, as the question took its records.
         while let Some(request) = consent.take() {
-            asked = true;
-            if !ask_person(stdin, stdout, &request, consent, stopping, tx) {
+            let connected = ask_person(stdin, stdout, &request, consent, stopping, &mut relay);
+            relay.enc.reset();
+            if !connected {
                 return;
             }
         }
-        if asked {
-            enc.reset();
-            continue;
-        }
-        for rec in &recs[..n as usize] {
+    }
+}
+
+/// The console's records on their way to the agent, re-encoded as the session needs them: the one path every record
+/// the shim relays takes, those the worker reads and those a question takes from the queue before it is asked.
+struct RecordRelay<'a> {
+    stdout: HANDLE,
+    gate: &'a MouseGate,
+    tx: &'a mut afunix::ConnTx,
+    enc: vtinput::MouseEncoder,
+}
+
+impl RecordRelay<'_> {
+    /// Send `records` in order. `false` when the connection can no longer be written to.
+    fn relay(&mut self, records: &[INPUT_RECORD]) -> bool {
+        let (stdout, gate, tx, enc) = (self.stdout, self.gate, &mut *self.tx, &mut self.enc);
+        for rec in records {
             match rec.EventType {
                 EVT_KEY => {
                     let k = unsafe { rec.Event.KeyEvent };
@@ -1034,7 +1053,7 @@ unsafe fn input_loop(
                         repeat_count: k.wRepeatCount,
                     };
                     if write_data(tx, Stream::Pty, &vtinput::encode_key_event(&ke)).is_err() {
-                        return;
+                        return false;
                     }
                 }
                 EVT_WINDOW_BUFFER_SIZE => {
@@ -1043,7 +1062,7 @@ unsafe fn input_loop(
                     let (cols, rows) = console_size(stdout);
                     let r = size_to_resize(cols, rows);
                     if write_frame(tx, FrameKind::Resize, &r.encode()).is_err() {
-                        return;
+                        return false;
                     }
                 }
                 EVT_MOUSE => {
@@ -1058,7 +1077,7 @@ unsafe fn input_loop(
                     if gate.forward.load(Ordering::Relaxed) {
                         let sgr = enc.encode_sgr(&mev);
                         if !sgr.is_empty() && write_data(tx, Stream::Pty, &sgr).is_err() {
-                            return;
+                            return false;
                         }
                     } else {
                         // Forwarding off: keep the encoder's view clean so a later enable
@@ -1078,42 +1097,49 @@ unsafe fn input_loop(
                     };
                     let seq: &[u8] = if focused { b"\x1b[I" } else { b"\x1b[O" };
                     if write_data(tx, Stream::Pty, seq).is_err() {
-                        return;
+                        return false;
                     }
                 }
                 _ => {} // MENU: ignored (internal)
             }
         }
+        true
     }
 }
 
 /// Ask the person at this console `request`, on the console's own screen, and send the answer. `false` when the
 /// connection can no longer be written to, so the worker is over.
 ///
-/// A console that could not be asked (flushed or written to) gives the refusal: the answer is `Refuse` for anything
-/// but the allowing answer, and the agent runs nothing for it. The agent holds the session's output while it waits,
-/// and this worker relays no key meanwhile, so the question and the keys that answer it are the console's alone.
-/// `stopping` ends
-/// the question as a refusal. So does the agent's withdrawal of it ([`ConsentSlot::withdraw`]), but then no answer
-/// is sent: the agent asks nothing any more, and the worker goes back to relaying keys.
+/// What was typed or pasted before the question is the session's: it goes to the agent first, through `relay`, and
+/// the question is the next line after that. A console that could not be asked (read or written to) gives the
+/// refusal: the answer is `Refuse` for anything but the allowing answer, and the agent runs nothing for it. The agent
+/// holds the session's output while it waits, and this worker relays no key meanwhile, so the question and the keys
+/// that answer it are the console's alone. `stopping` ends the question as a refusal. So does the agent's
+/// withdrawal of it ([`ConsentSlot::withdraw`]), but then no answer is sent: the agent asks nothing any more, and the
+/// worker goes back to relaying keys.
 fn ask_person(
     stdin: HANDLE,
     stdout: HANDLE,
     request: &ConsentRequest,
     consent: &ConsentSlot,
     stopping: &AtomicBool,
-    tx: &mut afunix::ConnTx,
+    relay: &mut RecordRelay<'_>,
 ) -> bool {
     let question = text::consent_question(&request.command, &request.cwd, text::CONSENT_ANSWER_LINE);
-    let answer = ask_consent(stdin, stdout, &question, &text::CONSENT_ALLOWING_ANSWERS, &|| {
-        stopping.load(Ordering::Relaxed) || consent.withdrawn()
-    })
+    let answer = ask_consent(
+        stdin,
+        stdout,
+        &mut |records| relay.relay(records),
+        &question,
+        &text::CONSENT_ALLOWING_ANSWERS,
+        &|| stopping.load(Ordering::Relaxed) || consent.withdrawn(),
+    )
     .unwrap_or_else(|e| {
         tracing::warn!("the consent question could not be put on the console, so it is refused: {e}");
         ConsentAnswer::Refuse
     });
     match consent.finish(request.id, answer) {
-        Some(reply) => send_answer(tx, reply, console_size(stdout)).is_ok(),
+        Some(reply) => send_answer(&mut *relay.tx, reply, console_size(stdout)).is_ok(),
         None => true,
     }
 }

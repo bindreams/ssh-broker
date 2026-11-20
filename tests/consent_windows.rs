@@ -169,6 +169,40 @@ fn elevate_asks_and_y_runs_it_elevated_with_keys_typed_afterwards_going_to_it() 
     session.leave();
 }
 
+/// Elevated (CI only). A block of three lines is pasted in one write, and its second line runs `elevate`. What was
+/// pasted before the question is the session's and nothing of it is discarded: the question waits (the third line is
+/// not answering it, and has not run), `y` allows, and the third line runs after the command, its output after the
+/// command's.
+#[test]
+fn the_rest_of_a_pasted_block_runs_after_the_question() {
+    use std::io::Write as _;
+    let _machine = machine::exclusive();
+    let (kit, account, _end) = an_administrator("cnpb");
+    let admin = Started::start(&kit, &account);
+
+    let mut session = admin.terminal_session_asking(None);
+    session
+        .stdin
+        .write_all(
+            b"Write-Output ('FIRST-' + 'LINE')\r\
+              sbk elevate cmd.exe /c \"echo PASTED-%OS%\"\r\
+              Write-Output ('THIRD-' + 'LINE')\r",
+        )
+        .and_then(|()| session.stdin.flush())
+        .expect("paste the block");
+    session.read_until(ANSWER_LINE);
+    assert!(
+        !session.text().contains("THIRD-LINE"),
+        "the third line ran before the question was answered, or answered it\n{}",
+        session.text()
+    );
+    session.type_line("y");
+    session.read_until("PASTED-Windows_NT");
+    session.read_until_after("PASTED-Windows_NT", "THIRD-LINE");
+    session.say("THE-SESSION-WENT-ON");
+    session.leave();
+}
+
 /// Elevated (CI only). `yes`, in any case, allows too; without `--terminal` the command's output is printed in the
 /// session as it is when nobody asks.
 #[test]
