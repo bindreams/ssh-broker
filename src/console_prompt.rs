@@ -158,9 +158,11 @@ fn ask_on(
         match batch.step(queue, &mut entry, stop) {
             Ok(ConsentStep::Allow) => return Ok(ConsentAnswer::Allow),
             Ok(ConsentStep::Refuse | ConsentStep::Stopped) => return Ok(ConsentAnswer::Refuse),
-            // What is typed is shown; a console that cannot show it has shown the question, and its read fails next.
+            // What is typed is shown; a console that cannot show it has shown the question, and the answer is still read.
             Ok(ConsentStep::Echo(text)) => {
-                let _ = write(&text);
+                if let Err(e) = write(&text) {
+                    tracing::debug!("the consent question's echo could not be written: {e}");
+                }
             }
             Ok(ConsentStep::Continue) => {}
             Err(e) => {

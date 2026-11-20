@@ -78,19 +78,19 @@ impl<S: FrameSink> FrameSink for Draining<'_, S> {
     }
     fn on_consent(&mut self, request: ConsentRequest) -> anyhow::Result<()> {
         if let Err(e) = self.0.on_consent(request) {
-            tracing::debug!("the failed sink refused a consent question; dropped: {e:#}");
+            tracing::warn!("the failed sink refused a consent question; dropped: {e:#}");
         }
         Ok(())
     }
     fn on_consent_answer(&mut self, reply: ConsentReply) -> anyhow::Result<()> {
         if let Err(e) = self.0.on_consent_answer(reply) {
-            tracing::debug!("the failed sink refused a consent answer; dropped: {e:#}");
+            tracing::warn!("the failed sink refused a consent answer; dropped: {e:#}");
         }
         Ok(())
     }
     fn on_consent_withdrawn(&mut self, withdrawal: ConsentWithdrawal) -> anyhow::Result<()> {
         if let Err(e) = self.0.on_consent_withdrawn(withdrawal) {
-            tracing::debug!("the failed sink refused a consent withdrawal; dropped: {e:#}");
+            tracing::warn!("the failed sink refused a consent withdrawal; dropped: {e:#}");
         }
         Ok(())
     }

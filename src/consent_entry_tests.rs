@@ -86,6 +86,28 @@ fn anything_else_then_enter_refuses() {
     }
 }
 
+/// A key that is no text (a key-up, Shift) between the answer and Enter adds nothing: the answer is still `y`.
+#[test]
+fn a_key_that_is_no_text_between_y_and_enter_still_allows() {
+    let mut e = apt();
+    e.key(&typed('y' as u16));
+    assert_eq!(
+        e.key(&event(0x59, 'y' as u16, false, 0)),
+        ConsentStep::Continue,
+        "a key-up"
+    );
+    assert_eq!(e.key(&event(0x10, 0, true, 0)), ConsentStep::Continue, "Shift");
+    assert_eq!(e.key(&enter()), ConsentStep::Allow);
+}
+
+/// Ctrl+C refuses, also after the allowing answer was typed.
+#[test]
+fn cancel_refuses_even_after_y() {
+    let mut e = apt();
+    e.key(&typed('y' as u16));
+    assert_eq!(e.key(&event(0x43, 0x03, true, 0x0008)), ConsentStep::Refuse);
+}
+
 #[test]
 fn what_is_accepted_is_what_new_was_given() {
     assert_eq!(answer(&mut ConsentEntry::new(&["go"]), "GO"), ConsentStep::Allow);

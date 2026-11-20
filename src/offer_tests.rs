@@ -561,6 +561,10 @@ fn display_shows_bidi_and_zero_width_controls() {
         ('\u{feff}', "\\u{feff}"),
         ('\u{ad}', "\\u{ad}"),
         ('\u{2028}', "\\u{2028}"),
+        ('\u{2029}', "\\u{2029}"),
+        ('\u{fff9}', "\\u{fff9}"),
+        ('\u{fffa}', "\\u{fffa}"),
+        ('\u{fffb}', "\\u{fffb}"),
         ('\u{e0041}', "\\u{e0041}"),
     ] {
         assert_eq!(text::display(&format!("a{control}b")), format!("a{shown}b"));

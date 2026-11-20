@@ -635,6 +635,9 @@ fn a_client_that_hangs_up_while_the_question_is_asked_ends_it_and_nothing_runs()
     let _ = pending.hang_up();
     session_speaks(&mut session, "the-session-again");
     session.client.answer(ConsentAnswer::Allow);
+    // Frames of one connection are handled in order: once the session shows these keys, the late answer was handled.
+    session.client.type_text("xafter\r\n");
+    session.client.read_until("xafter");
     session_speaks(&mut session, "and-again");
     assert!(elevated_starts().is_empty(), "the late answer started nothing");
     session.leave();

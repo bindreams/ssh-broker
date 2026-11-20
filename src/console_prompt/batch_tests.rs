@@ -1,6 +1,6 @@
 //! Unit tests for `batch` (pure; the console queue is a fake).
 use super::*;
-use crate::console_prompt::fake_queue::{FakeQueue, focus_record, key, typed};
+use crate::console_prompt::fake_queue::{FakeQueue, characters, focus_record, key, typed};
 use crate::password_entry::{PasswordEntry, Step};
 
 fn is_zeroed(records: &[INPUT_RECORD]) -> bool {
@@ -235,6 +235,37 @@ fn a_stop_that_is_already_true_is_seen_before_the_step_waits() {
         .unwrap();
     assert_eq!(step, ConsentStep::Stopped);
     assert_eq!(queue.removed, 0);
+}
+
+/// The record that woke the read is not the only one queued when the stop is looked at: a key typed right behind it
+/// belongs to the session, not to the question that was withdrawn, and stays queued for the relay.
+#[test]
+fn keys_queued_behind_the_record_that_woke_a_stopped_read_stay_in_the_queue() {
+    let mut queue = FakeQueue::with(vec![focus_record()]);
+    let mut up = key(0x59, 'y' as u16);
+    up.Event.KeyEvent.bKeyDown = windows::core::BOOL(0);
+    // The wake record, and the person's `y` right behind it, arrive as the read removes the record that was queued.
+    queue.typed_after_read = vec![focus_record(), key(0x59, 'y' as u16), up];
+    let consulted = std::cell::Cell::new(0);
+    let stop = || {
+        consulted.set(consulted.get() + 1);
+        consulted.get() >= 2
+    };
+    let step = Batch::new()
+        .step(&mut queue, &mut ConsentEntry::new(&["yes", "y"]), &stop)
+        .unwrap();
+    assert_eq!(step, ConsentStep::Stopped, "nothing was fed, so nothing was typed");
+    assert_eq!(queue.removed, 1, "only the record that woke the read was taken");
+    assert_eq!(
+        queue.queue.len(),
+        3,
+        "the wake record and the two `y` records stay queued"
+    );
+    assert_eq!(
+        characters(queue.queue.iter().skip(1)),
+        "yy",
+        "the person's key stays for the relay"
+    );
 }
 
 /// An entry whose steps are an echo and an answer: each step takes the records up to the one that finished it, and

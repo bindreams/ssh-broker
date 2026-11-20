@@ -38,7 +38,7 @@ use crate::{afunix, conpty, vtinput};
 use socket2::Socket;
 use std::io::Write as _;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::System::Console::{
     CONSOLE_SCREEN_BUFFER_INFO, GetConsoleScreenBufferInfo, GetStdHandle, INPUT_RECORD, INPUT_RECORD_0,
@@ -804,7 +804,11 @@ impl<T> Input<T> {
 /// owns the console's input and the connection's write half, and so is the one that can ask and answer), and the
 /// agent's withdrawal of it.
 #[derive(Default)]
-struct ConsentSlot(Mutex<Questions>);
+struct ConsentSlot {
+    questions: Mutex<Questions>,
+    /// Notified when a question ends ([`ConsentSlot::finish`]).
+    ended: Condvar,
+}
 
 #[derive(Default)]
 struct Questions {
@@ -826,11 +830,10 @@ enum Asking {
 
 impl ConsentSlot {
     fn state(&self) -> std::sync::MutexGuard<'_, Questions> {
-        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+        self.questions.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Hand over the question. The agent asks one at a time, so one that is still waiting is a protocol violation.
-    /// The worker may still be leaving a withdrawn one: the agent is free to ask again.
     fn put(&self, request: ConsentRequest) -> anyhow::Result<()> {
         let mut state = self.state();
         anyhow::ensure!(
@@ -876,7 +879,24 @@ impl ConsentSlot {
     /// withdrew the question: it asks nothing any more and is sent none.
     fn finish(&self, id: u32, answer: ConsentAnswer) -> Option<ConsentReply> {
         let was = std::mem::take(&mut self.state().asking);
+        self.ended.notify_all();
         (was != Asking::Withdrawn).then_some(ConsentReply { id, answer })
+    }
+
+    /// Wait until the worker has left a question that was withdrawn ([`ConsentSlot::finish`] took `asking` back): from
+    /// then on it writes nothing to the console. Returns at once if the worker is not in a withdrawn question.
+    fn wait_until_left(&self) {
+        self.wait_until_left_observed(|| {});
+    }
+
+    /// [`ConsentSlot::wait_until_left`], calling `waiting` each time it is about to wait, with the state locked, so a
+    /// test can tell it is waiting.
+    fn wait_until_left_observed(&self, mut waiting: impl FnMut()) {
+        let mut state = self.state();
+        while state.asking == Asking::Withdrawn {
+            waiting();
+            state = self.ended.wait(state).unwrap_or_else(PoisonError::into_inner);
+        }
     }
 }
 
@@ -905,7 +925,8 @@ impl FrameSink for StdoutSink {
     }
 
     /// The agent holds the session's output while it asks, so no frame comes between the question and its answer:
-    /// the worker writes the question to a console that nothing else writes to.
+    /// the worker writes the question to a console that nothing else writes to (until a withdrawal, which waits for
+    /// the worker to leave it).
     fn on_consent(&mut self, request: ConsentRequest) -> anyhow::Result<()> {
         anyhow::ensure!(
             self.input.is_running(),
@@ -918,11 +939,15 @@ impl FrameSink for StdoutSink {
     }
 
     /// The agent asks no longer. A question that is being asked ends (as a stop) and the worker sends no answer; the
-    /// worker, parked in the question's read, is woken to see it. A question not yet taken is dropped, and with none
-    /// open nothing happens.
+    /// worker, parked in the question's read, is woken to see it, and this returns only when the worker has left the
+    /// question, so that no later frame is written to the console while the worker can still write to it. The wait
+    /// ends without this pump: the worker sees the stop at its next record (the wake record) or after its drain,
+    /// writes nothing more to the console, and calls [`ConsentSlot::finish`]. A question not yet taken is dropped, and
+    /// with none open nothing happens.
     fn on_consent_withdrawn(&mut self, withdrawal: ConsentWithdrawal) -> anyhow::Result<()> {
         if self.consent.withdraw(withdrawal.id) {
             wake_console_input(self.stdin_raw);
+            self.consent.wait_until_left();
         }
         Ok(())
     }
@@ -1132,7 +1157,13 @@ fn ask_person(
         tracing::warn!("the consent question could not be put on the console, so it is refused: {e}");
         ConsentAnswer::Refuse
     });
-    send_outcome(&mut *relay.tx, consent.finish(request.id, answer), console_size(stdout)).is_ok()
+    match send_outcome(&mut *relay.tx, consent.finish(request.id, answer), console_size(stdout)) {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::debug!("the consent question's outcome could not be sent, so the connection is gone: {e:#}");
+            false
+        }
+    }
 }
 
 /// Send the console's size, and then the answer if there is one. The question's own resize records were taken from the
@@ -1152,15 +1183,26 @@ fn send_outcome(
 }
 
 /// Wake a parked `ReadConsoleInputW` by injecting one MENU record, which the console queues as it is written and
-/// `ReadConsoleInputW` returns (measured). The relay ignores records of that kind whatever they hold, wherever one is
+/// `ReadConsoleInputW` returns. The relay ignores records of that kind whatever they hold, wherever one is
 /// read: for the stop that woke the worker, or left in the queue after a question and read later. More reliable for
 /// console reads than `CancelSynchronousIo` (which may not cancel a parked console wait).
+///
+/// A write that fails is logged and nothing else: the worker is then woken only by the next record of the console.
 fn wake_console_input(stdin_raw: isize) {
     let rec = wake_record();
     let stdin = HANDLE(stdin_raw as *mut core::ffi::c_void);
     let mut written = 0u32;
     // SAFETY: the handle is the console's input, live for the call; `rec` and `written` are valid for it.
-    let _ = unsafe { WriteConsoleInputW(stdin, std::slice::from_ref(&rec), &mut written) };
+    let result = unsafe { WriteConsoleInputW(stdin, std::slice::from_ref(&rec), &mut written) };
+    match result {
+        Err(e) => tracing::warn!(
+            "the console input could not be woken ({e}), so the input worker is woken only by the next key or other record of the console"
+        ),
+        Ok(()) if written == 0 => tracing::warn!(
+            "the console input could not be woken (no record was written), so the input worker is woken only by the next key or other record of the console"
+        ),
+        Ok(()) => {}
+    }
 }
 
 fn wake_record() -> INPUT_RECORD {

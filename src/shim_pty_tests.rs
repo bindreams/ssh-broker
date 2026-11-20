@@ -1534,6 +1534,48 @@ fn a_question_put_while_a_withdrawn_one_is_ending_is_not_withdrawn_with_it() {
     assert_eq!(slot.finish(2, ConsentAnswer::Allow), reply(2, ConsentAnswer::Allow));
 }
 
+/// The sink, after it woke the worker out of a withdrawn question, waits until the worker has left it, so that the
+/// console is not written to by the main pump while the worker can still write to it.
+#[test]
+fn a_withdrawal_waits_until_the_worker_has_left_the_question() {
+    let slot = ConsentSlot::default();
+    slot.put(a_question(1, "first")).unwrap();
+    slot.take().unwrap();
+    assert!(slot.withdraw(1));
+
+    let returned = AtomicBool::new(false);
+    let (waiting, is_waiting) = std::sync::mpsc::channel();
+    std::thread::scope(|scope| {
+        let sink = scope.spawn(|| {
+            slot.wait_until_left_observed(|| {
+                let _ = waiting.send(());
+            });
+            returned.store(true, Ordering::SeqCst);
+        });
+        is_waiting.recv().expect("the sink waits");
+        assert!(
+            !returned.load(Ordering::SeqCst),
+            "the sink went on while the worker was still in the question"
+        );
+        assert_eq!(slot.finish(1, ConsentAnswer::Refuse), None);
+        sink.join().unwrap();
+    });
+    assert!(
+        returned.load(Ordering::SeqCst),
+        "the sink goes on once the worker has left"
+    );
+}
+
+/// A question that is not being asked has no worker to wait for: the withdrawal of one that waits, or of none,
+/// returns at once.
+#[test]
+fn a_withdrawal_of_a_question_not_taken_does_not_wait() {
+    let slot = ConsentSlot::default();
+    slot.put(a_question(1, "never asked")).unwrap();
+    assert!(!slot.withdraw(1));
+    slot.wait_until_left_observed(|| panic!("waited for a worker that is not in a question"));
+}
+
 /// A withdrawal ends the question it names and no other: one for a question that ended earlier, and so reaches the
 /// shim after the next was asked, leaves the open one (the person is still being asked it) and the one waiting.
 #[test]

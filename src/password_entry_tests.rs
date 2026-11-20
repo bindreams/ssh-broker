@@ -106,13 +106,50 @@ fn backspace_pops_as_many_scalar_values_as_it_repeats() {
     assert_eq!(submitted(e.key(&enter())).as_wide(), [0x61]);
 }
 
+/// Ctrl+C on a partly typed password is the cancel step, and the text is wiped.
 #[test]
 fn cancel_leaves_the_entry_backing_zero() {
     let mut e = PasswordEntry::new();
     type_str(&mut e, "secret");
     assert!(e.backing().iter().any(|&u| u != 0));
-    e.key(&event(0x43, 0x03, true, LEFT_CTRL));
+    assert!(matches!(e.key(&event(0x43, 0x03, true, LEFT_CTRL)), Step::Cancel));
     assert!(e.backing().iter().all(|&u| u == 0));
+}
+
+/// A key that is no text (a key-up, Shift) adds nothing, and the Enter after it submits what was typed before it.
+#[test]
+fn a_key_that_is_no_text_adds_nothing_to_the_password() {
+    let mut e = PasswordEntry::new();
+    type_str(&mut e, "ab");
+    assert!(
+        matches!(e.key(&event(0x41, 0x62, false, 0)), Step::Continue),
+        "a key-up"
+    );
+    assert!(matches!(e.key(&event(0x10, 0, true, 0)), Step::Continue), "Shift");
+    assert_eq!(submitted(e.key(&enter())).as_wide(), [0x61, 0x62]);
+}
+
+/// A character outside the BMP typed as UTF-8 reaches the console on two key-ups of Alt, one per unit: it is one
+/// character of the password, which one Backspace removes whole.
+#[test]
+fn a_character_outside_the_bmp_on_two_alt_key_ups_is_one_character_of_the_password() {
+    const VK_MENU: u16 = 0x12;
+    let units: Vec<u16> = "\u{1F600}".encode_utf16().collect();
+    assert_eq!(units.len(), 2);
+    let mut e = PasswordEntry::new();
+    for &unit in &units {
+        assert!(matches!(e.key(&event(VK_MENU, unit, false, 0)), Step::Continue));
+    }
+    let mut erased = PasswordEntry::new();
+    for &unit in &units {
+        erased.key(&event(VK_MENU, unit, false, 0));
+    }
+    erased.key(&event(VK_BACK, 0x08, true, 0));
+    assert!(
+        matches!(erased.key(&enter()), Step::Empty),
+        "one Backspace removes both units"
+    );
+    assert_eq!(submitted(e.key(&enter())).as_wide(), units.as_slice());
 }
 
 #[test]

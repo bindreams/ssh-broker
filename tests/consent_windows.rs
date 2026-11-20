@@ -72,9 +72,9 @@ fn ask(session: &mut SshSession, line: &str, marker: &std::path::Path) {
     session.read_until_after(&marker.display().to_string(), ANSWER_LINE);
 }
 
-// P2 =====
+// Console attach =====
 
-/// Elevated (CI only). P2, which the consent rests on: a process of the unelevated session is refused when it asks
+/// Elevated (CI only). A process of the unelevated session is refused when it asks
 /// Windows to attach to the console of the shim, of the console host sshd gave it, or of any other process that
 /// shares that console. If Windows allowed it, a program of the session could read the answer as it is typed.
 ///
@@ -133,6 +133,21 @@ fn an_unelevated_process_is_refused_attachment_to_every_process_of_the_shims_con
         assert!(
             !line.ends_with("error=0"),
             "an unelevated process was allowed to attach to the console of {id}: {line}\n{shown}\n{}",
+            (admin.diagnostics())()
+        );
+    }
+    // The shim is alive and holds the console while the session is open, so its refusal is access denied: any other
+    // error (a process that is gone, a console that cannot be attached to) would satisfy the check above and show
+    // nothing.
+    for shim in &shims {
+        let line = shown
+            .lines()
+            .find(|line| line.starts_with(&format!("pid={} ", shim.pid)))
+            .expect("the probe's line of the shim (checked above)");
+        assert!(
+            line.ends_with("error=5"),
+            "attaching to the console of the shim {} was not refused with access denied: {line}\n{shown}\n{}",
+            shim.pid,
             (admin.diagnostics())()
         );
     }

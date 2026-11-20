@@ -87,8 +87,9 @@ impl Batch {
     }
 
     /// Block until one entry step finishes, and return it, or until `stop` says so while no step is finishing: then
-    /// the step is [`KeyEntry::stopped`]. The records after the finishing one are not taken from the queue. On
-    /// return, successful or not, the buffer is all zeros.
+    /// the step is [`KeyEntry::stopped`]. Once `stop` is true nothing more is fed, and what is queued stays queued.
+    /// The records after the finishing one are not taken from the queue. On return, successful or not, the buffer is
+    /// all zeros.
     pub fn step<E: KeyEntry>(
         &mut self,
         queue: &mut impl InputQueue,
@@ -107,6 +108,10 @@ impl Batch {
         stop: &dyn Fn() -> bool,
     ) -> windows::core::Result<E::Step> {
         loop {
+            // Before anything is fed: what is queued behind the record that woke a stopped read is not the entry's.
+            if stop() {
+                return Ok(E::stopped());
+            }
             let peeked = (queue.peek(&mut self.records)? as usize).min(BATCH);
             // Only the last record of the queue can change after the peek (the console merges a repeated
             // key-down into it), and it is the last peeked one. The records before it are fed from the
@@ -119,9 +124,6 @@ impl Batch {
                 return Ok(step);
             }
             self.take(queue, stable)?;
-            if stop() {
-                return Ok(E::stopped());
-            }
             // With an empty queue this waits for a record, which is fed in any case.
             let read = (queue.read(&mut self.records[..1])? as usize).min(1);
             let (_, step) = self.feed(read, entry);

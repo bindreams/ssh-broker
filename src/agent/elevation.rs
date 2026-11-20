@@ -152,8 +152,8 @@ pub(super) struct RequestWatch {
 
 impl RequestWatch {
     /// Start watching `conn`, the request's connection, for the session whose link is `link`. The guard is `None`
-    /// when the watcher could not be made: the request then loses only the hang-up protection, as the session's own
-    /// does ([`prepare_hangup_watch`]).
+    /// when the watcher could not be made ([`prepare_hangup_watch`]): a question asked for the request then stays
+    /// until it is answered, and its command runs until it ends, also when the request's client has gone.
     pub(super) fn start(link: &Arc<Link>, conn: &ConnTx) -> (Arc<RequestWatch>, Option<HangupGuard>) {
         let watch = Arc::new(RequestWatch {
             link: Arc::clone(link),
@@ -164,6 +164,11 @@ impl RequestWatch {
         let guard = start_watch_with(prepare_hangup_watch(conn, HangupWatcher::new), move || {
             on_hangup.on_hangup()
         });
+        if guard.is_none() {
+            tracing::warn!(
+                "the hang-up watch of the request could not start, so a question asked for it stays until it is answered and its command runs until it ends, also when the request's client has gone"
+            );
+        }
         (watch, guard)
     }
 
