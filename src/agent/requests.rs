@@ -5,8 +5,8 @@
 //! agent for those: it takes requests only (`logout`, `elevate`), and no session ever starts on it.
 //!
 //! Input here comes from a lower integrity level: frames are bounded, a malformed first frame is answered as a
-//! failed request, nothing read is used as a path but the working directory of an `elevate`, which is checked to be
-//! an existing directory. A client that connects and stays silent holds a handler thread, as it can on `agent.sock`
+//! failed request, nothing read is used as a path but the program of an `elevate`'s command, which must be absolute,
+//! and its working directory, which is checked to be an existing directory. A client that connects and stays silent holds a handler thread, as it can on `agent.sock`
 //! of a standard account; the unelevated session is a consent step, not a boundary.
 
 use std::path::Path;
