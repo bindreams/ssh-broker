@@ -101,7 +101,8 @@ fn script(command: &str) -> String {
 fn after_marker(text: &str, marker: &str) -> Option<String> {
     text.match_indices(marker).find_map(|(at, _)| {
         let rest = &text[at + marker.len()..];
-        let end = rest.find(['\r', '\n'])?;
+        // With a terminal the value can be followed by an escape sequence (a cursor move) and no line end.
+        let end = rest.find(['\r', '\n', '\u{1b}'])?;
         Some(rest[..end].trim().to_owned())
     })
 }

@@ -137,10 +137,13 @@ jobs:
       # Spike 6 measures gsudo beside Windows' own sudo.
       - name: Install gsudo
         if: runner.os == 'Windows'
-        run: choco install gsudo -y
+        run: |
+          choco install gsudo -y
+          # The job's own PATH was read before the install: the test process looks for gsudo too.
+          Add-Content -Path $env:GITHUB_PATH -Value 'C:\tools\gsudo\Current'
 
       - name: cargo nextest
-        run: cargo nextest run --locked --profile ci --no-tests pass -E 'binary(spike6_sudo_windows)'
+        run: cargo nextest run --locked --profile ci --no-tests pass -E 'binary(spike6_sudo_windows) & test(spike6_q2_gsudo)'
 
       # What the tests recorded about the end of sessions and the state of hives and profiles afterwards
       # (tests/common/hive.rs); nextest hides the output of a test that passes.
