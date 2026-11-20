@@ -17,9 +17,16 @@ the session id and DPAPI through an agent-spawned probe, and whether a junction 
 High made is followed (RedirectionGuard refuses only those, so an agent at High is probed twice: a probe
 that asks for the default policy, an unelevated session, makes the junction, and one that asks for
 `always`, an elevated one, follows it). `doctor` names the junction's
-directory and removes it; not tested means the volume holds no junctions. It also shows that an
-administrator's session is elevated and that an unelevated one can be had; `provision/probe_run` has
-the rest. The profile follows from the interactive logon and is not separately checked.
+directory and removes it; not tested means the volume holds no junctions. It also shows that a login
+that asks for no level gets an unelevated session (the `session` row) and one that asks for `always`
+an elevated one (`elevated session on request`); `provision/probe_run` has the rest. Below High an
+administrator's `doctor` runs no probe and names the command that runs it elevated. The profile
+follows from the interactive logon and is not separately checked.
+
+A session is unelevated unless its login's `SSH_BROKER_ELEVATION` (`never`, `prompt`, `auto-approve`,
+`always`; unset is `prompt`) says `always`. A program in an unelevated session runs one command elevated
+with `ssh-broker elevate`: it asks the agent at High on `request.sock`, and the agent decides by the
+session's level (`prompt` asks the person at the session's terminal first).
 
 ## Where things live
 
@@ -41,13 +48,16 @@ the rest. The profile follows from the interactive logon and is not separately c
 | `filelog` | the daily log in the user's own folder, written under the folder's handle |
 | `handoff` | the notice and the line the agent writes into the inherited pipe it hands the hidden `console-fallback` verb |
 | `vtinput` | Win32 `INPUT_RECORD` → VT sequences, and what a key means to a line being typed (`KeyEvent::line_key`, which both console prompts read through; pure, host-testable) |
-| `provision`, `provision/{probe,probe_run,session_rows}` | `apply`/`doctor`: DefaultShell, logon task, per-user socket rows, parity probes (the PROBE line, the junction they follow, the two probes of an elevated agent) and the rows they give |
+| `provision`, `provision/{probe,probe_run,session_rows}` | `apply`/`doctor`: DefaultShell, logon task, per-user socket rows, parity probes (the PROBE line, the junction they follow, the two probes of an agent at High: the default level, then `always`) and the rows they give (`Probes::session` gives the session id, DPAPI, byte and `session` rows; `Probes::elevated` the `elevated session on request` row) |
+| `provision/sshd_config` (+`configure`, `restart`, `machine`) | making sshd accept `SSH_BROKER_ELEVATION`: the drop-in and the `Include` (or the `AcceptEnv` line) as a text edit checked by `sshd -t`, the restart of the service through the service manager, and `doctor`'s `sshd accepts` row |
+| `provision/sshd_task`, `provision/procwait` | `apply`'s sshd step run by the transient SYSTEM task `ssh-broker-apply-sshd` (hidden verb `apply-sshd`), so that it finishes if `apply` is ended; and the processes `apply` waits for, found by exe and told by `Role` (shim, desktop agent, background agent, `apply-sshd`) |
+| `provision/path_env` | the install directory on the system `PATH`, and its `doctor` row |
 | `offer`, `offer/text` | the session offer as a pure state machine over injected I/O, and every line it shows |
 | `secret`, `password_entry` | wiped password buffers, and the key-event state machine that fills one |
 | `consent_entry` | the key-event state machine of the consent question: `y` or `yes` and Enter allow, anything else refuses |
 | `console_modes`, `console_prompt` | the console's raw mode as a guard; the password prompt on it, the consent question on it (`ask_consent`), and why the shim has no agent |
 | `shim_offer` | the shim's hook for a missing agent: the notice, or the prompt, the logon and the wait for the agent |
-| `account`, `logon`, `socket_watch` | who the token is and how elevated (`Elevation`), the secondary-logon call that starts a background agent, and the folder and profile-list watch with which the shim learns the agent serves (no named kernel object) |
+| `account`, `logon`, `socket_watch` | who the token is and how elevated (`Elevation`), `step_down` (the one rule from a login's level and the process's integrity to a token, none or a refusal), the secondary-logon call that starts a background agent, and the folder and profile-list watch with which the shim learns the agent serves (no named kernel object) |
 | `agent_background`, `agent/logout`, `logout` | the background agent's start checks and exit codes; ending a session, both sides |
 | `request`, `agent/requests`, `agent/session` | the client loop of the verbs that ask the agent (on `agent.sock`, or from below High on `request.sock`); the agent's handler of `request.sock`, which an agent at High keeps in the plain folder and which takes requests only (`logout`, `elevate`); the id each session gets in `SSH_BROKER_SESSION` |
 | `elevate`, `agent/elevation`, `agent/link` | `ssh-broker elevate <command>`: the client (in place at High, else one request to the agent); the agent's rule for what a session's `SSH_BROKER_ELEVATION` allows and the hosting of the elevated command; the session's connection, which says whose output it carries and where the client's keys go, and which carries the consent question to the session's shim and its answer back (the shim writes the question and reads the answer on its own console: `shim_pty`) |
@@ -76,7 +86,12 @@ diff. (No lint enforces any of these — `clippy.toml` is deliberately empty.) F
   `ssh-broker-elevated`, and its folder and socket checks also require the High integrity label,
   which is what keeps a process of the account below High from connecting. An agent at High also binds
   `request.sock` in the plain folder, checked as that folder's sockets are (no High label); it takes requests only
-  and never starts a session, and it is what an unelevated process of the account can reach.
+  and never starts a session, and it is what an unelevated process of the account can reach. **Everything on it is
+  input from a lower level** *(review)*: bounded, strictly parsed, never used as a path (an `elevate`'s working
+  directory, which must be an existing directory, excepted).
+- **One rule decides a session's token** *(review)*: `account::step_down` turns a login's level and the process's
+  integrity into a token, none or a refusal, for the agent, the shim's fail-open shell and the shim's offer alike.
+  Nothing on the SSH command line is interpreted: the level is `SSH_BROKER_ELEVATION` and nothing a client types.
 - **The shim fails open on the relay path** *(review)*, through the configured shell (the built-in `cmd.exe` if that is unusable). A broken broker must
   not cost you SSH access. The security boundary never degrades — the ACL gate and the bind
   fail closed. Provisioning has best-effort steps of its own, marked where they occur.
