@@ -1856,7 +1856,8 @@ const INPUT_QUEUE_CHUNKS: usize = 16;
 /// there has stopped watching the socket, and a disconnect becomes invisible. If the command
 /// also produces no output, nothing is left that can notice, and the session hangs for the
 /// lifetime of the agent. Moving the write off this thread is what sshd gets from a select
-/// loop over non-blocking descriptors.
+/// loop over non-blocking descriptors. (The one wait a session's reader does make is not in a sink:
+/// for the outcome of an answered question, `Link::route_input`, which says what ends it.)
 ///
 /// The queue is bounded ([`HandleWriter::bounded`], a command's stdin on pipes) or not
 /// ([`HandleWriter::unbounded`], a pseudoconsole's input).

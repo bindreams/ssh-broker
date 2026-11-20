@@ -1206,6 +1206,25 @@ fn handle_writer_reports_a_full_queue() {
     feeder.join().unwrap();
 }
 
+/// A pseudoconsole's writer takes what it is given while its handle takes nothing, so its caller (the session's
+/// frame reader, which must still read a consent answer) never parks in it. The same input parks the bounded
+/// writer above; a writer that parked here would hang this test.
+#[test]
+fn an_unbounded_handle_writer_never_parks_its_caller() {
+    let (read, write) = anonymous_pipe();
+    let writer = HandleWriter::unbounded(write.raw());
+    // Nobody reads the pipe: the big chunk stalls the writer thread, and many times what a bounded queue holds is
+    // still taken.
+    writer.write(&vec![b'x'; 64 * 1024]).unwrap();
+    for _ in 0..super::INPUT_QUEUE_CHUNKS * 64 {
+        writer.write(b"x").unwrap();
+    }
+    // Closing the read end fails the stalled write, which ends the writer thread; the drop joins it.
+    drop(read);
+    drop(writer);
+    drop(write);
+}
+
 /// The wait on a hangup watcher ends in an `Err` only when the poll itself failed. That says
 /// nothing about the peer, so it must not reap the command; a hangup or a wake does.
 #[test]
