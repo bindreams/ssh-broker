@@ -615,7 +615,7 @@ fn assert_doctor_passes_for_an_elevated_agent(finished: &agent_conn::Finished) {
 /// Elevated (CI only). `doctor`, run in an administrator's session through the account's elevated agent,
 /// passes after `apply`: a login that asks for no level gets an unelevated session, one that asks for `always`
 /// gets an elevated one, and the junction that a token below High made is followed. The same `doctor` run in an
-/// unelevated session of the account is told the command that checks, and runs no probe.
+/// unelevated session of the account is told the ways to check, and runs no probe.
 #[test]
 fn apply_then_doctor_for_an_administrator_shows_a_session_and_an_elevated_session_on_request() {
     use ssh_broker::offer::text::CHECK_BELOW_HIGH_CLAUSE;
@@ -659,7 +659,7 @@ fn apply_then_doctor_for_an_administrator_shows_a_session_and_an_elevated_sessio
     );
     assert!(
         unelevated.stdout.contains(CHECK_BELOW_HIGH_CLAUSE),
-        "the commands that check are missing from:\n{}",
+        "the ways to check are missing from:\n{}",
         unelevated.stdout
     );
     assert!(

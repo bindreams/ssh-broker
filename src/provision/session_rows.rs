@@ -185,17 +185,20 @@ pub fn parity_rows(probes: &Probes, active_console: u32) -> Vec<Check> {
 /// The rows for the session the agent gives, from the probe that asked for the default level (`session`)
 /// and, when one was run, what became of the probe that asked for `always` (`elevated`).
 ///
-/// The level that decides the rows is worked out once, here. An agent at High has two rows: `session`, which
-/// passes for Medium integrity with Administrators not enabled, and `elevated session on request`. An agent
-/// below High refuses `always`, so it ran no such probe: a standard account's has one passing row; an
-/// administrator's gives its own token to a login that asks for no level, so `session` is judged, and its
-/// agent is not elevated, which `elevated session on request` says.
+/// An agent at High has two rows: `session`, which passes for Medium integrity with Administrators not enabled,
+/// and `elevated session on request`. An agent below High refuses `always`, so it ran no such probe: a standard
+/// account's has one passing row; an administrator's gives its own token to a login that asks for no level, so
+/// `session` is judged, and its agent is not elevated, which `elevated session on request` says. Any other
+/// token without an `always` probe is described as seen, a Standard one at High included: an agent below High
+/// never gives a token at High.
 pub fn session_rows(session: &Answer, elevated: Option<&ProbeOutcome>) -> Vec<Check> {
     // A probe that asked for `always` was run because the agent is at High, whatever the session probe says of
     // itself: its outcome is judged, never thrown away.
     if let Some(elevated) = elevated {
         vec![session_row(session), elevated_outcome_row(elevated)]
-    } else if session.result.elevation == Some(Elevation::Standard) {
+    } else if session.result.elevation == Some(Elevation::Standard)
+        && session.result.integrity.map(integrity_class) != Some(Integrity::High)
+    {
         vec![Check::new(
             "session privilege",
             true,
@@ -222,19 +225,18 @@ fn not_reported(what: &str, token_said: &str) -> String {
 /// does not split). `always` is judged by the token of `got`: the probe that asked for it, or, for an agent
 /// below High, which refuses it, the agent's own token, which is the one `always` would have given.
 fn elevated_row(got: &Answer) -> Check {
-    const NAME: &str = ELEVATED_ROW;
     let said = got.token_said.as_str();
     let got = &got.result;
     let token_level = got.integrity.map(integrity_class);
     match (got.elevation, got.integrity) {
-        (None, None) => Check::new(NAME, false, not_reported("its token or its level", said)),
-        (Some(_), None) => Check::new(NAME, false, not_reported("its level", said)),
-        (None, Some(_)) => Check::new(NAME, false, not_reported("its token", said)),
+        (None, None) => Check::new(ELEVATED_ROW, false, not_reported("its token or its level", said)),
+        (Some(_), None) => Check::new(ELEVATED_ROW, false, not_reported("its level", said)),
+        (None, Some(_)) => Check::new(ELEVATED_ROW, false, not_reported("its token", said)),
         (Some(elevation @ (Elevation::Full | Elevation::Standard)), integrity)
             if token_level == Some(Integrity::High) =>
         {
             Check::new(
-                NAME,
+                ELEVATED_ROW,
                 true,
                 format!(
                     "{}, integrity {}",
@@ -248,7 +250,7 @@ fn elevated_row(got: &Answer) -> Check {
             )
         }
         (Some(elevation), integrity) => Check::new(
-            NAME,
+            ELEVATED_ROW,
             false,
             format!(
                 "the agent's session is not elevated (integrity {}, {}){}",

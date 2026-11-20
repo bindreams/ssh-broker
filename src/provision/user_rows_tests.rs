@@ -317,33 +317,15 @@ fn the_row_for_an_unelevated_administrator_says_why_nothing_can_be_checked_here(
     assert_eq!(row.name, "socket reachable");
     assert_eq!(
         row.detail,
-        "not checked below High, where this account's agent cannot be reached: run ssh-broker elevate ssh-broker \
-         doctor in an SSH session, or ssh-broker doctor from an elevated prompt"
+        "not checked below High: this account's agent serves elevated processes. Run ssh-broker doctor from an \
+         elevated prompt or from an SSH login that asked for SSH_BROKER_ELEVATION=always, or run ssh-broker elevate \
+         ssh-broker doctor in an SSH session"
     );
     assert!(
         !row.detail.contains("to see why, run"),
         "no hint to run the agent: {}",
         row.detail
     );
-}
-
-/// `elevate` is refused outside a hosted session, so an administrator's desktop prompt has one way (an elevated
-/// prompt) and an SSH session the other (`elevate`); the row names both.
-#[test]
-fn the_row_for_an_unelevated_administrator_names_both_ways_to_check() {
-    let row = filtered_row();
-
-    assert!(
-        row.detail.contains(crate::offer::text::CHECK_BELOW_HIGH_CLAUSE),
-        "{}",
-        row.detail
-    );
-    for way in [
-        "ssh-broker elevate ssh-broker doctor in an SSH session",
-        "ssh-broker doctor from an elevated prompt",
-    ] {
-        assert!(row.detail.contains(way), "{way}: {}", row.detail);
-    }
 }
 
 // which rows an account gets ------------------------------------------------------------------

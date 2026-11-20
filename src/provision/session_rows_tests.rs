@@ -294,6 +294,22 @@ fn a_probe_below_high_that_reports_a_token_at_high_is_described_as_seen() {
     assert!(!rows[1].detail.contains("not run"), "{}", rows[1].detail);
 }
 
+/// The same holds for a Standard token at High: it is no standard account's session, so `session privilege` does
+/// not pass, and `session` fails as it does for any token at High.
+#[test]
+fn a_probe_below_high_that_reports_a_standard_token_at_high_passes_no_row() {
+    let rows = session_rows(&answer(probe(Some(Elevation::Standard), Some(INTEGRITY_HIGH))), None);
+
+    assert!(
+        rows.iter().all(|row| row.name != "session privilege"),
+        "{:?}",
+        names(&rows)
+    );
+    assert_eq!(names(&rows), ["session", "elevated session on request"]);
+    assert!(!rows[0].pass, "{}", rows[0].detail);
+    assert!(rows[0].detail.contains("integrity High"), "{}", rows[0].detail);
+}
+
 // the agent is below High ------------------------------------------------------------------
 
 /// One row, which passes and says the session is a standard account's.

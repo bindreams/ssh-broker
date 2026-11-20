@@ -6,7 +6,8 @@
 //!
 //! Input here comes from a lower integrity level: frames are bounded, a malformed first frame is answered as a
 //! failed request, nothing read is used as a path but the program of an `elevate`'s command, which must be absolute,
-//! and its working directory, which is checked to be an existing directory. A client that connects and stays silent holds a handler thread, as it can on `agent.sock`
+//! and its working directory (an empty one stands for the account's home; any other must be an existing directory,
+//! which is checked). A client that connects and stays silent holds a handler thread, as it can on `agent.sock`
 //! of a standard account; the unelevated session is a consent step, not a boundary.
 
 use std::path::Path;

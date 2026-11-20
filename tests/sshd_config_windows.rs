@@ -640,8 +640,8 @@ fn an_agent_that_apply_did_not_restart_keeps_its_old_path_until_it_restarts() {
 /// the installed agent by its batch logon. A login asking `always` then runs the installed exe's `doctor`, whose
 /// parity probes go through that agent. A junction row that is not "followed" is the RedirectionGuard signal for the
 /// password-prompt start path on the runner: stop and report it. A login asking `auto-approve` runs the same
-/// `doctor` unelevated, which is told the two ways to check and exits 1, and then runs the command that sentence
-/// names, `ssh-broker elevate ssh-broker doctor` by name, which passes.
+/// `doctor` unelevated, which is told the ways to check and exits 1; a second login asking `auto-approve` runs one
+/// of them, `ssh-broker elevate ssh-broker doctor` by name, which passes.
 #[test]
 fn after_apply_doctor_passes_through_a_session_the_password_prompt_started() {
     use ssh_broker::offer::text::CHECK_BELOW_HIGH_CLAUSE;

@@ -298,7 +298,7 @@ mod imp {
                 Ok(()) => {
                     registry::broadcast_environment_change();
                     println!(
-                        "apply: added {dir} to the system PATH; sessions started from now on find ssh-broker by name"
+                        "apply: added {dir} to the system PATH; an agent that is running, and its sessions, keep the PATH they started with"
                     );
                 }
                 Err(e) => eprintln!("apply: {dir} was not added to the system PATH: {e:#}"),
