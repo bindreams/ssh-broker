@@ -806,7 +806,7 @@ impl<T> Input<T> {
 #[derive(Default)]
 struct ConsentSlot {
     questions: Mutex<Questions>,
-    /// Notified when a question ends ([`ConsentSlot::finish`]).
+    /// Notified when the worker leaves a question ([`ConsentSlot::finish`], or its [`InQuestion`] dropped).
     ended: Condvar,
 }
 
@@ -844,7 +844,8 @@ impl ConsentSlot {
         Ok(())
     }
 
-    /// The worker takes the question that waits, to ask it: [`ConsentSlot::finish`] ends it.
+    /// The worker takes the question that waits, to ask it, and is in it from now on ([`ConsentSlot::in_question`])
+    /// until [`ConsentSlot::finish`].
     fn take(&self) -> Option<ConsentRequest> {
         let mut state = self.state();
         let request = state.waiting.take();

@@ -1520,44 +1520,52 @@ fn a_withdrawal_drops_a_question_not_yet_taken_and_with_none_open_is_ignored() {
 }
 
 /// The sink wakes the worker out of a withdrawn question and then waits until the worker has left it, so that the
-/// console is not written to by the main pump while the worker can still write to it.
+/// console is not written to by the main pump while the worker can still write to it. The worker leaves by finishing
+/// the question, or without (it unwound, and its stay in the question was dropped).
 #[test]
 fn a_withdrawal_wakes_the_worker_and_waits_until_it_has_left_the_question() {
-    let slot = ConsentSlot::default();
-    slot.put(a_question(1, "first")).unwrap();
-    slot.take().unwrap();
+    for finishes in [true, false] {
+        let slot = ConsentSlot::default();
+        slot.put(a_question(1, "first")).unwrap();
+        slot.take().unwrap();
+        let in_question = slot.in_question();
 
-    let (woken, left) = (AtomicBool::new(false), AtomicBool::new(false));
-    let (waiting, is_waiting) = std::sync::mpsc::channel();
-    let went_on_after_the_worker_left = std::thread::scope(|scope| {
-        // The worker: it leaves the question once the sink waits for it.
-        let (slot, left) = (&slot, &left);
-        scope.spawn(move || {
-            if is_waiting.recv().is_ok() {
-                left.store(true, Ordering::SeqCst);
-                assert_eq!(slot.finish(1, ConsentAnswer::Refuse), None);
-            }
+        let (woken, left) = (AtomicBool::new(false), AtomicBool::new(false));
+        let (waiting, is_waiting) = std::sync::mpsc::channel();
+        let went_on_after_the_worker_left = std::thread::scope(|scope| {
+            // The worker: it leaves the question once the sink waits for it.
+            let (slot, left) = (&slot, &left);
+            scope.spawn(move || {
+                if is_waiting.recv().is_ok() {
+                    left.store(true, Ordering::SeqCst);
+                    if finishes {
+                        assert_eq!(slot.finish(1, ConsentAnswer::Refuse), None);
+                    }
+                    drop(in_question);
+                }
+            });
+            slot.withdraw_and_wait_observed(
+                1,
+                || woken.store(true, Ordering::SeqCst),
+                || {
+                    assert!(
+                        woken.load(Ordering::SeqCst),
+                        "the sink waited for a worker it had not woken"
+                    );
+                    let _ = waiting.send(());
+                },
+            );
+            let left = left.load(Ordering::SeqCst);
+            // Ends a worker that was never waited for.
+            drop(waiting);
+            left
         });
-        slot.withdraw_and_wait_observed(
-            1,
-            || woken.store(true, Ordering::SeqCst),
-            || {
-                assert!(
-                    woken.load(Ordering::SeqCst),
-                    "the sink waited for a worker it had not woken"
-                );
-                let _ = waiting.send(());
-            },
+        assert!(
+            went_on_after_the_worker_left,
+            "the sink went on while the worker was still in the question (finishes: {finishes})"
         );
-        let left = left.load(Ordering::SeqCst);
-        // Ends a worker that was never waited for.
-        drop(waiting);
-        left
-    });
-    assert!(
-        went_on_after_the_worker_left,
-        "the sink went on while the worker was still in the question"
-    );
+        assert!(!slot.withdrawn(), "the slot is clean for the next question");
+    }
 }
 
 /// A question that is not being asked has no worker to wake or to wait for.

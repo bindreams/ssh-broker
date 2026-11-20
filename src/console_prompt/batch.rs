@@ -85,7 +85,8 @@ impl Batch {
     }
 
     /// Block until one entry step finishes, and return it, or until `stop` says so while no step is finishing: then
-    /// the step is [`KeyEntry::stopped`]. Once `stop` is true nothing more is fed, and what is queued stays queued.
+    /// the step is [`KeyEntry::stopped`]. A step that sees `stop` true feeds nothing of what is queued then, and it
+    /// stays queued.
     /// The records after the finishing one are not taken from the queue. On return, successful or not, the buffer is
     /// all zeros.
     pub fn step<E: KeyEntry>(
