@@ -317,7 +317,8 @@ fn the_row_for_an_unelevated_administrator_says_why_nothing_can_be_checked_here(
     assert_eq!(row.name, "socket reachable");
     assert_eq!(
         row.detail,
-        "not checked below High: to check the session rows, run: ssh-broker elevate ssh-broker doctor"
+        "not checked below High, where this account's agent cannot be reached: run ssh-broker elevate ssh-broker \
+         doctor in an SSH session, or ssh-broker doctor from an elevated prompt"
     );
     assert!(
         !row.detail.contains("to see why, run"),
@@ -326,19 +327,22 @@ fn the_row_for_an_unelevated_administrator_says_why_nothing_can_be_checked_here(
     );
 }
 
-/// `elevate` runs the elevated `doctor` where the person already is, so no row sends an unelevated administrator
-/// to an elevated prompt or to a login that asks for `always`.
+/// `elevate` is refused outside a hosted session, so an administrator's desktop prompt has one way (an elevated
+/// prompt) and an SSH session the other (`elevate`); the row names both.
 #[test]
-fn the_row_for_an_unelevated_administrator_names_the_command_that_checks_and_no_other_way() {
+fn the_row_for_an_unelevated_administrator_names_both_ways_to_check() {
     let row = filtered_row();
 
     assert!(
-        row.detail.contains(crate::offer::text::CHECK_SESSION_ROWS_LINE),
+        row.detail.contains(crate::offer::text::CHECK_BELOW_HIGH_CLAUSE),
         "{}",
         row.detail
     );
-    for way in ["elevated prompt", "ordinary SSH login", "SSH_BROKER_ELEVATION=always"] {
-        assert!(!row.detail.contains(way), "{way}: {}", row.detail);
+    for way in [
+        "ssh-broker elevate ssh-broker doctor in an SSH session",
+        "ssh-broker doctor from an elevated prompt",
+    ] {
+        assert!(row.detail.contains(way), "{way}: {}", row.detail);
     }
 }
 

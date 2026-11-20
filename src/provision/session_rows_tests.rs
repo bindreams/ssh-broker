@@ -281,14 +281,17 @@ fn an_always_probe_that_did_not_answer_fails_its_row_with_the_cause() {
     }
 }
 
-/// A session probe that is at High is judged, and with no probe that asked for `always` the second row says so.
+/// A probe below High that reports a token at High (which an agent below High never gives) is described as seen:
+/// `session` fails, since a login that asks for no level got an elevated token, and the second row passes, since
+/// the token is elevated. Neither says a probe was not run, as none is asked for below High.
 #[test]
-fn a_session_at_high_with_no_always_probe_fails_both_rows() {
+fn a_probe_below_high_that_reports_a_token_at_high_is_described_as_seen() {
     let rows = session_rows(&answer(elevated()), None);
 
     assert_eq!(names(&rows), ["session", "elevated session on request"]);
-    assert_eq!(passes(&rows), [false, false], "{:?}", details(&rows));
-    assert!(rows[1].detail.contains("not run"), "{}", rows[1].detail);
+    assert_eq!(passes(&rows), [false, true], "{:?}", details(&rows));
+    assert!(rows[0].detail.contains("integrity High"), "{}", rows[0].detail);
+    assert!(!rows[1].detail.contains("not run"), "{}", rows[1].detail);
 }
 
 // the agent is below High ------------------------------------------------------------------

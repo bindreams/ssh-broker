@@ -738,12 +738,13 @@ fn the_fallback_notice_says_the_session_has_sshds_token_and_which_values_are_ref
     assert!(!text::unelevated_fallback("c").contains('\n'));
 }
 
-/// What `doctor` tells an unelevated administrator is the one command that runs it elevated through the agent.
+/// What `doctor` tells an unelevated administrator: why nothing was checked and the two commands that check it.
 #[test]
-fn the_line_that_checks_the_session_rows_names_the_elevate_command() {
+fn the_clause_that_checks_below_high_names_the_elevate_command_and_the_elevated_prompt() {
     assert_eq!(
-        text::CHECK_SESSION_ROWS_LINE,
-        "to check the session rows, run: ssh-broker elevate ssh-broker doctor"
+        text::CHECK_BELOW_HIGH_CLAUSE,
+        "where this account's agent cannot be reached: run ssh-broker elevate ssh-broker doctor in an SSH \
+         session, or ssh-broker doctor from an elevated prompt"
     );
 }
 
@@ -752,7 +753,7 @@ fn the_line_that_checks_the_session_rows_names_the_elevate_command() {
 #[test]
 fn no_sentence_names_the_old_verb_or_the_reserved_word() {
     let sentences = [
-        text::CHECK_SESSION_ROWS_LINE.to_owned(),
+        text::CHECK_BELOW_HIGH_CLAUSE.to_owned(),
         text::ELEVATED_AGENT_LOOKS_ELSEWHERE.to_owned(),
         text::FILTERED_SHIM_NOTICE.to_owned(),
         text::always_below_high(),

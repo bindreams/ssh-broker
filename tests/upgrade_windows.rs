@@ -618,7 +618,7 @@ fn assert_doctor_passes_for_an_elevated_agent(finished: &agent_conn::Finished) {
 /// unelevated session of the account is told the command that checks, and runs no probe.
 #[test]
 fn apply_then_doctor_for_an_administrator_shows_a_session_and_an_elevated_session_on_request() {
-    use ssh_broker::offer::text::CHECK_SESSION_ROWS_LINE;
+    use ssh_broker::offer::text::CHECK_BELOW_HIGH_CLAUSE;
     use ssh_broker::protocol::ElevationPolicy;
 
     let _machine = machine::exclusive();
@@ -658,8 +658,8 @@ fn apply_then_doctor_for_an_administrator_shows_a_session_and_an_elevated_sessio
         unelevated.stderr
     );
     assert!(
-        unelevated.stdout.contains(CHECK_SESSION_ROWS_LINE),
-        "the command that checks is missing from:\n{}",
+        unelevated.stdout.contains(CHECK_BELOW_HIGH_CLAUSE),
+        "the commands that check are missing from:\n{}",
         unelevated.stdout
     );
     assert!(

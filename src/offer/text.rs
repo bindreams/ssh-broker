@@ -315,9 +315,9 @@ pub fn elevation_unreadable(cause: &str) -> String {
     )
 }
 
-/// What `doctor` says in place of the session rows when this process is below High: the command that runs it
-/// elevated through the account's agent.
-pub const CHECK_SESSION_ROWS_LINE: &str = "to check the session rows, run: ssh-broker elevate ssh-broker doctor";
+/// What `doctor` says after "not checked below High, " in place of the rows about the agent: why, and the two
+/// commands that check them. `elevate` is refused outside a hosted session, so a desktop prompt has only the second.
+pub const CHECK_BELOW_HIGH_CLAUSE: &str = "where this account's agent cannot be reached: run ssh-broker elevate ssh-broker doctor in an SSH session, or ssh-broker doctor from an elevated prompt";
 
 /// Told to an unelevated process whose agent runs at High and serves no socket it can reach. Names neither
 /// "administrator" nor "Backup Operator": either account is split. Used by `logout`'s line.

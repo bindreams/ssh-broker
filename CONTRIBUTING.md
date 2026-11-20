@@ -6,8 +6,8 @@ negotiable.
 
 ## Architecture
 
-One binary, the entry points below plus the hidden `apply-sshd`, `doctor-probe` and `console-fallback` verbs, selected by argv
-([`src/route.rs`](src/route.rs)). The shim is
+One binary, the verbs in the table below, selected by argv ([`src/route.rs`](src/route.rs)). `apply-sshd`,
+`doctor-probe` and `console-fallback` are run by the product itself and not typed. The shim is
 the *default* action because `DefaultShell` is a bare path and cannot carry a subcommand: a
 known verb in first position selects a subcommand, anything else is the shim.
 
@@ -16,9 +16,10 @@ known verb in first position selects a subcommand, anything else is the shim.
 | *(none)* or `-c "cmd"` | `shim`, `shim_pty` | the SSH session, as sshd's `DefaultShell` |
 | `agent` | `agent` | a user's interactive session, one per logged-on user, started by a logon task for any member of `BUILTIN\Users` |
 | `apply` | `provision` | wherever an admin runs it; needs elevation |
+| `auto-login on\|off [<account>]` | `autologin` | wherever an elevated administrator runs it (`on` needs a terminal to ask for the password): stores the account's password with Task Scheduler and registers, or deletes, the boot task that starts its background session |
 | `logout` | `logout`, `request`, `agent::logout` | a process of the account at any level: asks `agent.sock`, and below High `request.sock` where no agent is on the first, to end the account's background session |
 | `elevate [--terminal] <command>` | `elevate`, `request`, `agent::{requests,elevation,link}` | a shell that an agent hosts: runs the command in place at High, and below High asks the agent on `request.sock`, which runs it with its own token once the session's `SSH_BROKER_ELEVATION` allows it |
-| `doctor` | `provision` | on the host itself, as the account whose agent it asks: an administrator runs it elevated, and an unelevated one shows the local rows and the command that runs it elevated through the agent |
+| `doctor` | `provision` | on the host itself, as the account whose agent it asks: an administrator runs it elevated, and an unelevated one shows the local rows and the two ways to check (`ssh-broker elevate ssh-broker doctor` in an SSH session, an elevated prompt) |
 | `apply-sshd` | `provision`, `provision::sshd_task` | the hidden verb of the task `ssh-broker-apply-sshd`, as SYSTEM: `apply`'s sshd step (the drop-in, the `Include` and the restart of sshd), whose every line it writes to `apply-sshd.log` in the install directory; `apply` registers the task, starts it, waits for its instances and prints the report, so that the step finishes even if the `apply` that started it is ended |
 | `doctor-probe` | `provision` | the child the **agent** spawns in its interactive session, driven through the relay by `doctor` |
 | `console-fallback [--login] <handle>` | `shim`, `shim_pty`, `handoff` | the fallback shell of a terminal session through the agent: reads a notice and a line from the pipe handle the agent gave it alone (`PROC_THREAD_ATTRIBUTE_HANDLE_LIST`) until the agent closes its end, prints the notice on its pseudoconsole (which clears anything written ahead of it), starts the line there, exits with its code; it keeps through Ctrl+C for the shell, and when it cannot read the pipe it starts the built-in `cmd.exe` for a login (`--login`) and exits 255 for a command |
@@ -82,8 +83,10 @@ label, so a process of the account below High can connect to it: it is how an un
 It takes requests only (`logout`, and the `ElevationRequest` of `ssh-broker elevate`); a session handshake there is
 answered with a sentence (`agent::requests::REQUESTS_ONLY`) and no session starts. **Everything on it is input from a
 lower level.** Frames are read through the bounded frame reader and parsed strictly, a malformed first frame is
-answered as a failed request, and nothing read is used as a path except the working directory of an `elevate`, which
-must be an existing directory. The session id in a request says which session asks and is no credential. The agent
+answered as a failed request, and two things read from it are used as paths: the program of an `elevate`'s command,
+which `ElevationRequest::check` requires to be an absolute path (the client found it; the file is not looked for before
+the command starts, and one that is not there is reported by the start), and its working directory, which must be an
+existing directory. Neither holds a NUL or passes its length bound, and nothing else read is used as a path. The session id in a request says which session asks and is no credential. The agent
 keeps its `SocketDir` of the plain folder for its whole run, as it keeps its own, so the by-path contract below holds
 for `request.sock` too; a plain folder it cannot use costs it the request socket and nothing else. The socket is
 served by the sessions' accept machinery and counted in the same tally, with no read bound of its own: a client that
@@ -204,8 +207,9 @@ The session id, DPAPI and byte rows are the first probe's too, since that is the
 (`session_rows::Probes::session`; `Probes::elevated` is `None` for an agent below High, which refuses
 `always`). The two probes and the two rows are keyed on the agent being at High (the level of the process
 that runs `doctor`, which is the level of the folder it asks), not on `Elevation::Full`. A process below
-High that is an administrator's runs no probe: `doctor` shows its local rows and one failing row with the
-command that runs it elevated (`offer::text::CHECK_SESSION_ROWS_LINE`).
+High that is an administrator's runs no probe: `doctor` shows its local rows and one failing row, in place of the
+rows about the agent's socket, that names the two ways to check, `elevate` in an SSH session and an elevated prompt
+(`offer::text::CHECK_BELOW_HIGH_CLAUSE`).
 `tests/redirection_guard_windows.rs` measures the premise.
 
 ## Building and testing

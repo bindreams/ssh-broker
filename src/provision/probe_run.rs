@@ -56,7 +56,9 @@ fn run_at(integrity: Integrity, temp: &Path, drive: Drive) -> Probes {
         Integrity::Medium => run_at_medium(&dir, drive),
         Integrity::High => run_at_high(&dir, drive),
     };
-    probes.leftover = leftover(&dir, dir.to_str().is_some(), maker(&probes));
+    // The probe that was to make the directory is the one that asks for the default level: the first of an agent
+    // at High and the only one below it.
+    probes.leftover = leftover(&dir, dir.to_str().is_some(), &probes.session);
     probes
 }
 
@@ -135,12 +137,6 @@ fn read_by(follower: &ProbeOutcome, note: String) -> Junction {
 
 fn not_text(dir: &Path) -> String {
     format!("the directory {} cannot be told to a probe as text", dir.display())
-}
-
-/// The probe that was to make the directory: the one that asks for the default level, which is the first of an
-/// agent at High and the only one below it.
-fn maker(probes: &Probes) -> &ProbeOutcome {
-    &probes.session
 }
 
 /// Remove `dir` and say what is left of it: why it could not be removed, and that a `maker` whose child may

@@ -14,6 +14,9 @@ use super::report::Check;
 
 const APPLY_HINT: &str = "usually an installed exe older than this check: re-run `apply`";
 
+/// The name of the row about the session a login that asks for `always` gets.
+const ELEVATED_ROW: &str = "elevated session on request";
+
 /// A probe that ran and whose PROBE line was read: the line, whether its binary payload survived, and what
 /// it said on stderr about its junction and about its own token ([`super::probe::notes`]).
 #[derive(Debug, Clone)]
@@ -169,7 +172,7 @@ pub fn parity_rows(probes: &Probes, active_console: u32) -> Vec<Check> {
                 },
             ));
             if let Some(elevated) = &probes.elevated {
-                rows.push(elevated_outcome_row(Some(elevated)));
+                rows.push(elevated_outcome_row(elevated));
             }
         }
     }
@@ -188,11 +191,9 @@ pub fn parity_rows(probes: &Probes, active_console: u32) -> Vec<Check> {
 /// administrator's gives its own token to a login that asks for no level, so `session` is judged, and its
 /// agent is not elevated, which `elevated session on request` says.
 pub fn session_rows(session: &Answer, elevated: Option<&ProbeOutcome>) -> Vec<Check> {
-    let token_level = session.result.integrity.map(integrity_class);
     // A probe that asked for `always` was run because the agent is at High, whatever the session probe says of
     // itself: its outcome is judged, never thrown away.
-    let at_high = elevated.is_some() || token_level == Some(Integrity::High);
-    if at_high {
+    if let Some(elevated) = elevated {
         vec![session_row(session), elevated_outcome_row(elevated)]
     } else if session.result.elevation == Some(Elevation::Standard) {
         vec![Check::new(
@@ -221,7 +222,7 @@ fn not_reported(what: &str, token_said: &str) -> String {
 /// does not split). `always` is judged by the token of `got`: the probe that asked for it, or, for an agent
 /// below High, which refuses it, the agent's own token, which is the one `always` would have given.
 fn elevated_row(got: &Answer) -> Check {
-    const NAME: &str = "elevated session on request";
+    const NAME: &str = ELEVATED_ROW;
     let said = got.token_said.as_str();
     let got = &got.result;
     let token_level = got.integrity.map(integrity_class);
@@ -270,24 +271,24 @@ fn elevated_row(got: &Answer) -> Check {
 
 /// `elevated session on request` for what became of the probe that asked for `always`: judged by
 /// [`elevated_row`] when it answered, and otherwise failing with why there is no answer.
-fn elevated_outcome_row(elevated: Option<&ProbeOutcome>) -> Check {
-    const NAME: &str = "elevated session on request";
+fn elevated_outcome_row(elevated: &ProbeOutcome) -> Check {
     match elevated {
-        None => Check::new(NAME, false, "the probe that asks for `always` was not run"),
-        Some(ProbeOutcome::Failed { cause, .. }) => {
-            Check::new(NAME, false, format!("the probe that asks for `always` failed: {cause}"))
-        }
-        Some(ProbeOutcome::TimedOut(cause)) => Check::new(
-            NAME,
+        ProbeOutcome::Failed { cause, .. } => Check::new(
+            ELEVATED_ROW,
+            false,
+            format!("the probe that asks for `always` failed: {cause}"),
+        ),
+        ProbeOutcome::TimedOut(cause) => Check::new(
+            ELEVATED_ROW,
             false,
             format!("the probe that asks for `always` did not answer: {cause}"),
         ),
-        Some(ProbeOutcome::NotRun(cause)) => Check::new(
-            NAME,
+        ProbeOutcome::NotRun(cause) => Check::new(
+            ELEVATED_ROW,
             false,
             format!("the probe that asks for `always` was not run: {cause}"),
         ),
-        Some(ProbeOutcome::Answered(answer)) => elevated_row(answer),
+        ProbeOutcome::Answered(answer) => elevated_row(answer),
     }
 }
 
