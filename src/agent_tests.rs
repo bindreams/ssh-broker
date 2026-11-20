@@ -1005,21 +1005,22 @@ fn close_handle(raw: isize) {
     }
 }
 
-/// Input the command never drains, so the input pump parks in its bounded queue. A 64 KiB chunk
-/// stalls the writer thread and 64 one-byte frames overfill the queue; the total is about 64 KiB,
-/// which the socket buffers take, so the client's socket writes never block.
-fn flood_input(ctx: &mut impl std::io::Write, stream: Stream) {
-    write_data(ctx, stream, &vec![b'x'; 64 * 1024]).unwrap();
+/// Input a command on pipes never drains, so the input pump parks in its stdin's bounded queue (a
+/// pseudoconsole's has no bound). A 64 KiB chunk stalls the writer thread and 64 one-byte frames
+/// overfill the queue; the total is about 64 KiB, which the socket buffers take, so the client's
+/// socket writes never block.
+fn flood_input(ctx: &mut impl std::io::Write) {
+    write_data(ctx, Stream::Stdin, &vec![b'x'; 64 * 1024]).unwrap();
     for _ in 0..64 {
-        write_data(ctx, stream, b"x").unwrap();
+        write_data(ctx, Stream::Stdin, b"x").unwrap();
     }
 }
 
 /// Drive one relayed command to its marker, pin the grandchild, then end the session the way
 /// `ending` says and hand back the pinned handle.
 ///
-/// `flood` sends [`flood_input`] and waits until the input pump reports it is parked before the
-/// disconnect, so the session ends with the pump provably parked.
+/// `flood` (a command on pipes only) sends [`flood_input`] and waits until the input pump reports
+/// it is parked before the disconnect, so the session ends with the pump provably parked.
 fn run_tree_session(tag: &str, mode: Mode, inherit_stdio: bool, ending: Ending, flood: bool) -> isize {
     let dir = hardened_dir(tag);
     let sock = dir.join("s");
@@ -1053,7 +1054,11 @@ fn run_tree_session(tag: &str, mode: Mode, inherit_stdio: bool, ending: Ending, 
         match ending {
             Ending::Disconnect => {
                 if flood {
-                    flood_input(&mut ctx, if mode == Mode::Pty { Stream::Pty } else { Stream::Stdin });
+                    assert!(
+                        mode == Mode::Exec,
+                        "only a command on pipes has an input queue to park in"
+                    );
+                    flood_input(&mut ctx);
                     client_parked.wait();
                 }
                 let _ = ctx.shutdown_both();
@@ -1170,13 +1175,6 @@ fn exec_disconnect_with_a_parked_input_pump_reaps_the_tree_of_a_silent_command()
     );
 }
 
-/// The same on the PTY path, which shares `HandleWriter`.
-#[test]
-fn pty_disconnect_with_a_parked_input_pump_reaps_the_tree_of_a_silent_command() {
-    let raw = run_tree_session("tree-pty-flood", Mode::Pty, false, Ending::Disconnect, true);
-    assert_exits(raw, "the grandchild after a PTY disconnect with the input pump parked");
-}
-
 /// An anonymous pipe `(read, write)`.
 fn anonymous_pipe() -> (crate::winutil::OwnedHandle, crate::winutil::OwnedHandle) {
     use windows::Win32::Foundation::HANDLE;
@@ -1192,7 +1190,7 @@ fn anonymous_pipe() -> (crate::winutil::OwnedHandle, crate::winutil::OwnedHandle
 fn handle_writer_reports_a_full_queue() {
     let (read, write) = anonymous_pipe();
     let parked = ParkSignal::default();
-    let writer = HandleWriter::spawn(write.raw(), Some(write), parked.clone());
+    let writer = HandleWriter::bounded(write.raw(), Some(write), parked.clone());
     // Nobody reads the pipe: the big chunk stalls the writer thread, then the queue fills and the
     // feeder parks in a send.
     let feeder = thread::spawn(move || {
@@ -1206,6 +1204,25 @@ fn handle_writer_reports_a_full_queue() {
     // the feeder's send.
     drop(read);
     feeder.join().unwrap();
+}
+
+/// A pseudoconsole's writer takes what it is given while its handle takes nothing, so its caller (the session's
+/// frame reader, which must still read a consent answer) never parks in it. The same input parks the bounded
+/// writer above; a writer that parked here would hang this test.
+#[test]
+fn an_unbounded_handle_writer_never_parks_its_caller() {
+    let (read, write) = anonymous_pipe();
+    let writer = HandleWriter::unbounded(write.raw());
+    // Nobody reads the pipe: the big chunk stalls the writer thread, and many times what a bounded queue holds is
+    // still taken.
+    writer.write(&vec![b'x'; 64 * 1024]).unwrap();
+    for _ in 0..super::INPUT_QUEUE_CHUNKS * 64 {
+        writer.write(b"x").unwrap();
+    }
+    // Closing the read end fails the stalled write, which ends the writer thread; the drop joins it.
+    drop(read);
+    drop(writer);
+    drop(write);
 }
 
 /// The wait on a hangup watcher ends in an `Err` only when the poll itself failed. That says

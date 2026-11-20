@@ -8,6 +8,7 @@ use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize};
 
 use super::Escaping;
+use crate::text_escape::escape_text;
 
 /// The `shell` block, as written. `None` fields are the defaults, which depend on the program;
 /// `Some(vec![])` is an explicit "none".
@@ -147,28 +148,11 @@ pub fn render_annotated(block: &ShellBlock, notes: &Notes<'_>) -> Result<String,
 /// as it is. Every comment in a rendered config goes through this.
 pub fn comment_text(text: &str) -> String {
     let is_escaped = |c: char| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}' | '\u{fffe}' | '\u{ffff}');
-    let chars: Vec<char> = text.chars().collect();
-    let mut out = String::with_capacity(text.len());
-    for (at, &c) in chars.iter().enumerate() {
-        if is_escaped(c) {
-            out.extend(c.escape_default());
-            continue;
-        }
-        if c == '\\' {
-            // What follows reads as an escape when written out: `\t`, `\r`, `\n`, `\u{..}`, or a doubled
-            // backslash, which is what this very rule writes.
-            let reads_as_escape = match &chars[at + 1..] {
-                ['u', '{', ..] => true,
-                [next, ..] => matches!(next, '\\' | 't' | 'r' | 'n') || is_escaped(*next),
-                [] => false,
-            };
-            if reads_as_escape {
-                out.push('\\');
-            }
-        }
-        out.push(c);
-    }
-    out
+    escape_text(
+        text,
+        |c| is_escaped(c).then(|| c.escape_default().collect()),
+        |rest| matches!(rest, ['u', '{', ..] | ['t' | 'r' | 'n', ..]),
+    )
 }
 
 /// One `key: value` of the block at `indent` columns. A list goes under its key, at the key's own

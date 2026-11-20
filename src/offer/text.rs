@@ -1,6 +1,7 @@
 //! Every line the offer shows, in one place. Lines written to the pseudoterminal end in CRLF.
 
 use crate::protocol::ElevationPolicy;
+use crate::text_escape::escape_text;
 
 /// The cost of the plain shell, after Ctrl+C, a failed sign-in or a non-local account.
 pub const COST_LINE: &str =
@@ -149,11 +150,104 @@ pub fn elevation_already_elevated() -> String {
     "ssh-broker: this session is already elevated: run the command in it.\r\n".to_owned()
 }
 
-/// The login asked for the default, which asks the person at the terminal; that question is not built yet.
-pub fn elevation_consent_not_built() -> String {
-    "ssh-broker: this login asks before elevating, and asking is not built yet: log in with \
-     SSH_BROKER_ELEVATION=auto-approve to run a command elevated without a question.\r\n"
+/// The login asked for the default, which asks the person at the terminal, and the session has no terminal to ask on.
+pub fn elevation_no_terminal() -> String {
+    "ssh-broker: this login asks before elevating, and this session has no terminal to ask on. Log in with ssh -t, \
+     or with SSH_BROKER_ELEVATION=auto-approve to run commands elevated without a question, or with \
+     SSH_BROKER_ELEVATION=always to run the whole session elevated.\r\n"
         .to_owned()
+}
+
+/// The person at the terminal answered the question with anything but the allowing answer.
+pub fn elevation_declined() -> String {
+    "ssh-broker: running the command as administrator was not allowed, so nothing was run.\r\n".to_owned()
+}
+
+/// The session ended while the question was being asked.
+pub fn elevation_session_ended() -> String {
+    "ssh-broker: this session ended before the question was answered, so nothing was run.\r\n".to_owned()
+}
+
+// The consent question =====
+//
+// What the shim writes on the person's terminal when a program of the session asks to run a command as
+// administrator, and what it takes for an answer. The agent sends the command and the folder as they came; the shim
+// is the party that writes to the terminal, so it is where they are cleaned ([`display`], which
+// [`consent_question`] applies).
+
+/// The most characters of the command, and of the folder, the question shows.
+pub const CONSENT_SHOWN_UNITS: usize = 400;
+
+/// The last line of the question, as the person answers it: `[y/N]` as apt asks, the capital letter being what Enter
+/// alone does.
+pub const CONSENT_ANSWER_LINE: &str = "Run it as administrator? [y/N] ";
+
+/// The answers that allow, without regard to case, then Enter. Anything else, Enter alone included, refuses. Agrees
+/// with [`CONSENT_ANSWER_LINE`].
+pub const CONSENT_ALLOWING_ANSWERS: [&str; 2] = ["y", "yes"];
+
+/// What the shim writes first, to take the screen: reset the character attributes, the scroll region and the
+/// cursor's visibility, which the session's programs may have left in any state, clear the screen and home the
+/// cursor. There is no alternate screen: leaving one does not repaint through sshd's console, so the agent repaints by
+/// giving the pseudoconsole its size again.
+pub const CONSENT_SCREEN_ENTER: &str = "\x1b[0m\x1b[r\x1b[?25h\x1b[2J\x1b[H";
+
+/// The question, with `answer_line` as its last line, which ends nothing, so that what is typed
+/// follows it. The command and the folder are those of a program of the session, which can write what it likes: they
+/// are shown by [`display`].
+pub fn consent_question(command: &str, cwd: &str, answer_line: &str) -> String {
+    format!(
+        "ssh-broker: a program in this session asks to run as administrator:\r\n    {}\r\n    in {}\r\n{answer_line}",
+        display(command),
+        display(cwd),
+    )
+}
+
+/// `text` as it is shown to the person: the characters that act on a terminal or hide what a line says are shown as
+/// text and not acted on. A control character (C0, DEL, C1) is `\x` and two hex digits, a line feed is `\n`, and a
+/// bidirectional or zero-width format control, an invisible separator or a tag character is `\u{..}` (see
+/// [`is_hidden_format`]). A backslash that would read as the start of one of these is doubled, so that the text `\n`
+/// and a line feed show differently (the rule of [`escape_text`], which the config file's comments follow too); any
+/// other backslash is left. More than [`CONSENT_SHOWN_UNITS`] characters are cut there and followed by
+/// `... (400 of <n> characters shown)`, with the full count.
+pub fn display(text: &str) -> String {
+    let total = text.chars().count();
+    let cut: String = text.chars().take(CONSENT_SHOWN_UNITS).collect();
+    let mut shown = escape_text(
+        &cut,
+        |c| match c {
+            '\n' => Some("\\n".to_owned()),
+            c if c.is_control() => Some(format!("\\x{:02x}", u32::from(c))),
+            c if is_hidden_format(c) => Some(format!("\\u{{{:x}}}", u32::from(c))),
+            _ => None,
+        },
+        |rest| match rest {
+            ['n', ..] | ['u', '{', ..] => true,
+            ['x', high, low, ..] => high.is_ascii_hexdigit() && low.is_ascii_hexdigit(),
+            _ => false,
+        },
+    );
+    if total > CONSENT_SHOWN_UNITS {
+        shown.push_str(&format!("... ({CONSENT_SHOWN_UNITS} of {total} characters shown)"));
+    }
+    shown
+}
+
+/// A character that is no control character and shows nothing or changes how the text around it is shown:
+/// Default_Ignorable_Code_Point, plus the line and paragraph separators and the interlinear annotation marks, which
+/// the property does not list.
+fn is_hidden_format(c: char) -> bool {
+    matches!(u32::from(c),
+        0x00AD | 0x034F | 0x061C | 0x115F | 0x1160 | 0x17B4 | 0x17B5 | 0x180B..=0x180F | 0x3164 | 0xFFA0
+        | 0x1BCA0..=0x1BCA3
+        | 0x1D173..=0x1D17A
+        | 0xFE00..=0xFE0F
+        | 0x200B..=0x200F
+        | 0x2028..=0x202E
+        | 0x2060..=0x206F
+        | 0xFEFF
+        | 0xFFF0..=0xFFFB
+        | 0xE0000..=0xE0FFF)
 }
 
 /// A second `elevate` while the session's first is asked or running.

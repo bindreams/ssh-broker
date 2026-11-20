@@ -32,6 +32,7 @@ mod command_corpus;
 mod command_line_probe;
 #[cfg(windows)]
 pub mod conpty;
+pub mod consent_entry;
 #[cfg(windows)]
 pub mod console_modes;
 #[cfg(windows)]
@@ -71,6 +72,7 @@ pub mod socket_watch;
 pub mod starting_agent;
 #[cfg(test)]
 mod test_support;
+pub mod text_escape;
 #[cfg(windows)]
 pub mod userdir;
 pub mod vtinput;

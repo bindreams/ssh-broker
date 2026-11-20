@@ -10,8 +10,8 @@ use crate::conpty::PtySession;
 use crate::offer::text;
 use crate::pipes::ExecChild;
 use crate::protocol::{
-    ElevationPolicy, ElevationRequest, FrameKind, FrameReader, Handshake, Launch, PROTOCOL_VERSION, SESSION_VARIABLE,
-    SessionId, Stream, read_one_frame, write_frame,
+    ConsentAnswer, ConsentReply, ConsentRequest, ElevationPolicy, ElevationRequest, FrameKind, FrameReader, Handshake,
+    Launch, PROTOCOL_VERSION, SESSION_VARIABLE, SessionId, Stream, read_one_frame, write_frame,
 };
 use crate::relay::{Outcome, TestSink, pump_decode};
 use crate::socket_loc::StepDown;
@@ -87,11 +87,16 @@ fn a_pair(tag: &str) -> (socket2::Socket, socket2::Socket, PathBuf) {
 /// The client of a session the agent hosts: reads what the agent sends it, until the test has seen what it waits for.
 struct Client {
     rx: ConnRx,
-    /// Held so that the connection stays open: the session ends when its client closes it.
-    _tx: ConnTx,
+    /// Held so that the connection stays open: the session ends when its client closes it. What the shim sends: input,
+    /// and the answer to a question.
+    tx: ConnTx,
     frames: FrameReader,
     /// What the session has sent so far, as text: terminal, stdout and stderr together.
     seen: String,
+    /// How many questions the session has asked it so far.
+    questions: usize,
+    /// The number of the last question it asked: what an answer carries.
+    asked: u32,
     exit: Option<i32>,
 }
 
@@ -107,6 +112,12 @@ impl Client {
             });
             match frame.kind {
                 FrameKind::Data => self.seen.push_str(&String::from_utf8_lossy(&frame.payload[1..])),
+                FrameKind::Consent => {
+                    self.questions += 1;
+                    self.asked = ConsentRequest::decode(&frame.payload)
+                        .expect("a question that decodes")
+                        .id;
+                }
                 FrameKind::Exit => {
                     self.exit = Some(crate::protocol::ExitCode::decode(&frame.payload).unwrap().0);
                     panic!(
@@ -117,6 +128,36 @@ impl Client {
                 _ => {}
             }
         }
+    }
+
+    /// Read frames until the agent asks its question, and return it.
+    fn read_question(&mut self) -> ConsentRequest {
+        loop {
+            let frame = read_one_frame(&mut self.rx, &mut self.frames)
+                .unwrap_or_else(|e| panic!("the session ended before it asked ({e:#}); it showed {:?}", self.seen));
+            match frame.kind {
+                FrameKind::Data => self.seen.push_str(&String::from_utf8_lossy(&frame.payload[1..])),
+                FrameKind::Consent => {
+                    self.questions += 1;
+                    let question = ConsentRequest::decode(&frame.payload).expect("a question that decodes");
+                    self.asked = question.id;
+                    return question;
+                }
+                FrameKind::Exit => panic!("the session exited before it asked; it showed {:?}", self.seen),
+                _ => {}
+            }
+        }
+    }
+
+    /// Answer the last question as the shim does.
+    fn answer(&mut self, answer: ConsentAnswer) {
+        let reply = ConsentReply { id: self.asked, answer };
+        write_frame(&mut self.tx, FrameKind::ConsentAnswer, &reply.encode().unwrap()).unwrap();
+    }
+
+    /// Type `text` as the shim sends keys.
+    fn type_text(&mut self, text: &str) {
+        crate::relay::write_data(&mut self.tx, Stream::Pty, text.as_bytes()).unwrap();
     }
 
     /// Read frames until the session's `Exit`, which is kept in `exit`.
@@ -171,9 +212,11 @@ fn host_running(tag: &str, mode: Mode, policy: ElevationPolicy, command: &str) -
     write_frame(&mut tx, FrameKind::Handshake, &hs.encode().unwrap()).unwrap();
     let mut client = Client {
         rx,
-        _tx: tx,
+        tx,
         frames: FrameReader::new(),
         seen: String::new(),
+        questions: 0,
+        asked: 0,
         exit: None,
     };
     // The first frame is the answer: the session's process has started, and its id is the one it was given.
@@ -425,19 +468,257 @@ fn an_always_session_is_refused_already_elevated_and_starts_nothing() {
     session.leave();
 }
 
+// The question -----
+
+/// The session speaks on its own connection: proof that the screen is the session's, since a write that has to wait
+/// for it panics.
+fn session_speaks(session: &mut Hosting, marker: &str) {
+    let hosted = session
+        .control
+        .await_hosted(&session.id)
+        .expect("the session is hosted");
+    hosted
+        .link
+        .deliver_observed(Carrier::Session, Stream::Pty, marker.as_bytes(), || {
+            panic!("the screen was not the session's")
+        })
+        .unwrap();
+    session.client.read_until(marker);
+}
+
 #[test]
-fn prompt_is_refused_with_the_next_units_sentence() {
+fn prompt_with_a_terminal_asks_and_yes_runs_the_command() {
     let _serial = serial();
-    let session = host("prompt", Mode::Exec, ElevationPolicy::Prompt);
+    let mut session = host("prompt", Mode::Pty, ElevationPolicy::Prompt);
+    let command = cmd("/d /c echo asked-and-run");
+    let asking = ask(
+        &session.control,
+        "prompt-ask",
+        send(request(&session.id, &command, r"C:\")),
+    );
+    let question = session.client.read_question();
+    assert_eq!(
+        (question.command.as_str(), question.cwd.as_str()),
+        (command.as_str(), r"C:\")
+    );
+    assert!(elevated_starts().is_empty(), "nothing runs before the answer");
+
+    session.client.answer(ConsentAnswer::Allow);
+    let reply = asking.join().unwrap();
+    assert_eq!(reply.outcome, Outcome::Exited(0), "{}", reply.stderr);
+    assert_eq!(reply.served, 1);
+    assert!(reply.stdout.contains("asked-and-run"), "{}", reply.stdout);
+    assert_eq!(elevated_starts().len(), 1);
+    // The screen was given back to the session before the command started.
+    session_speaks(&mut session, "the-session-again");
+    session.leave();
+}
+
+#[test]
+fn the_question_shows_the_folder_the_command_runs_in_when_the_request_names_none() {
+    let _serial = serial();
+    let mut session = host("home", Mode::Pty, ElevationPolicy::Prompt);
+    let asking = ask(
+        &session.control,
+        "home-ask",
+        send(request(&session.id, &cmd("/d /c echo x"), "")),
+    );
+    let question = session.client.read_question();
+    let home = home_dir().expect("a home directory in the test's own account");
+    assert_eq!(question.cwd, home.display().to_string());
+    session.client.answer(ConsentAnswer::Refuse);
+    assert_eq!(asking.join().unwrap().outcome, Outcome::Exited(126));
+    session.leave();
+}
+
+/// Every answer but `Allow` is a refusal that starts nothing and says so; the screen is the session's again before
+/// the refusal is written.
+#[test]
+fn no_declines_and_starts_nothing() {
+    let _serial = serial();
+    let mut session = host("declined", Mode::Pty, ElevationPolicy::Prompt);
+    let asking = ask(
+        &session.control,
+        "declined-ask",
+        send(request(&session.id, &cmd("/c echo SHOULD-NOT-RUN"), r"C:\")),
+    );
+    session.client.read_question();
+    session.client.answer(ConsentAnswer::Refuse);
+    let reply = asking.join().unwrap();
+    assert_eq!(reply.outcome, Outcome::Exited(126));
+    assert_eq!(reply.served, 0);
+    assert_eq!(reply.stderr, text::elevation_declined());
+    assert!(elevated_starts().is_empty());
+    session_speaks(&mut session, "the-session-again");
+    session.leave();
+}
+
+#[test]
+fn prompt_without_a_terminal_is_refused_naming_the_variable_and_sends_no_frame() {
+    let _serial = serial();
+    let mut session = host("noask", Mode::Exec, ElevationPolicy::Prompt);
     let reply = asked(
         &session,
-        "prompt-ask",
+        "noask-ask",
         request(&session.id, &cmd("/c echo SHOULD-NOT-RUN"), r"C:\"),
     );
     assert_eq!(reply.outcome, Outcome::Exited(126));
     assert_eq!(reply.served, 0);
-    assert_eq!(reply.stderr, text::elevation_consent_not_built());
+    assert_eq!(reply.stderr, text::elevation_no_terminal());
     assert!(elevated_starts().is_empty());
+    // The session's connection carried no question: what it carries next is the first thing it shows.
+    session_speaks(&mut session, "the-session-again");
+    assert_eq!(session.client.questions, 0);
+    session.leave();
+}
+
+/// A request that cannot run is not asked about.
+#[test]
+fn a_working_directory_that_does_not_exist_is_refused_before_the_question() {
+    let _serial = serial();
+    let mut session = host("nodir", Mode::Pty, ElevationPolicy::Prompt);
+    let missing = std::env::temp_dir().join(format!("sb-consent-missing-{}", std::process::id()));
+    let reply = asked(
+        &session,
+        "nodir-ask",
+        request(&session.id, &cmd("/c echo SHOULD-NOT-RUN"), missing.to_str().unwrap()),
+    );
+    assert_eq!(reply.outcome, Outcome::Exited(126));
+    assert!(
+        reply.stderr.contains("is not an existing directory"),
+        "{}",
+        reply.stderr
+    );
+    session_speaks(&mut session, "the-session-again");
+    assert_eq!(session.client.questions, 0);
+    session.leave();
+}
+
+/// The session's shell going away while the question is asked: nothing runs, and the request is told why.
+#[test]
+fn a_session_that_ends_while_asking_refuses_and_starts_nothing() {
+    let _serial = serial();
+    let mut session = host("endasking", Mode::Pty, ElevationPolicy::Prompt);
+    let asking = ask(
+        &session.control,
+        "endasking-ask",
+        send(request(&session.id, &cmd("/c echo SHOULD-NOT-RUN"), r"C:\")),
+    );
+    session.client.read_question();
+
+    // The shell ends as `logout` ends it: the session's client stays connected, and nobody answers.
+    session.control.end_all();
+    let reply = asking.join().unwrap();
+    assert_eq!(reply.outcome, Outcome::Exited(126));
+    assert_eq!(reply.served, 0);
+    assert_eq!(reply.stderr, text::elevation_session_ended());
+    assert!(elevated_starts().is_empty());
+    session.client.read_to_exit();
+    assert!(session.client.exit.is_some(), "the session got its exit code");
+    session.leave();
+}
+
+/// The client of the request exits while the question is on the screen: the question ends, nothing runs (a late `y`
+/// answers nothing), and the session has its screen back.
+#[test]
+fn a_client_that_hangs_up_while_the_question_is_asked_ends_it_and_nothing_runs() {
+    let _serial = serial();
+    let mut session = host("goneasking", Mode::Pty, ElevationPolicy::Prompt);
+    let pending = open(
+        &session.control,
+        "goneasking-ask",
+        request(&session.id, &cmd("/c echo SHOULD-NOT-RUN"), r"C:\"),
+    );
+    session.client.read_question();
+
+    // The handler returns once the question has ended; with the question still waiting it would not return.
+    let _ = pending.hang_up();
+    session_speaks(&mut session, "the-session-again");
+    session.client.answer(ConsentAnswer::Allow);
+    // Frames of one connection are handled in order: once the session shows these keys, the late answer was handled.
+    session.client.type_text("xafter\r\n");
+    session.client.read_until("xafter");
+    session_speaks(&mut session, "and-again");
+    assert!(elevated_starts().is_empty(), "the late answer started nothing");
+    session.leave();
+}
+
+/// The shim relays nothing while it asks, so a key that reaches the agent before the answer was relayed before the
+/// question: it is the session's (the tail of a pasted block, say). The agent gives it to the session at once, ahead
+/// of what is typed after.
+#[test]
+fn input_typed_while_asking_goes_to_the_session() {
+    let _serial = serial();
+    let mut session = host("typed", Mode::Pty, ElevationPolicy::Prompt);
+    let asking = ask(
+        &session.control,
+        "typed-ask",
+        send(request(&session.id, &cmd("/c echo SHOULD-NOT-RUN"), r"C:\")),
+    );
+    session.client.read_question();
+    // Frames of one connection are handled in order: this reaches the session before the answer is read.
+    session.client.type_text("xearly\r\n");
+    session.client.answer(ConsentAnswer::Refuse);
+    assert_eq!(asking.join().unwrap().outcome, Outcome::Exited(126));
+
+    session.client.type_text("xlater\r\n");
+    session.client.read_until("xlater");
+    let seen = &session.client.seen;
+    assert!(
+        seen.find("xearly")
+            .is_some_and(|early| early < seen.find("xlater").unwrap()),
+        "the session saw {seen:?}"
+    );
+    session.leave();
+}
+
+#[test]
+fn a_second_request_while_asking_is_refused_in_progress() {
+    let _serial = serial();
+    let mut session = host("second", Mode::Pty, ElevationPolicy::Prompt);
+    let first = ask(
+        &session.control,
+        "second-first",
+        send(request(&session.id, &cmd("/c echo SHOULD-NOT-RUN"), r"C:\")),
+    );
+    session.client.read_question();
+
+    let second = asked(
+        &session,
+        "second-second",
+        request(&session.id, &cmd("/c echo SHOULD-NOT-RUN"), r"C:\"),
+    );
+    assert_eq!(second.outcome, Outcome::Exited(126));
+    assert_eq!(second.served, 0);
+    assert_eq!(second.stderr, text::elevation_in_progress());
+
+    session.client.answer(ConsentAnswer::Refuse);
+    assert_eq!(first.join().unwrap().stderr, text::elevation_declined());
+    assert_eq!(session.client.questions, 1, "the second was not asked");
+    assert!(elevated_starts().is_empty());
+    session.leave();
+}
+
+/// With `--terminal` the screen goes from the question straight to the command, whose output the session's
+/// connection carries; and it is the session's again when the command ends.
+#[test]
+fn an_allowed_terminal_command_takes_the_screen_from_the_question() {
+    let _serial = serial();
+    let mut session = host("termask", Mode::Pty, ElevationPolicy::Prompt);
+    let asking = ask(
+        &session.control,
+        "termask-ask",
+        send(ElevationRequest {
+            terminal: true,
+            ..request(&session.id, &cmd("/d /c \"echo elevated-output& exit /b 3\""), r"C:\")
+        }),
+    );
+    session.client.read_question();
+    session.client.answer(ConsentAnswer::Allow);
+    let reply = asking.join().unwrap();
+    assert_eq!(reply.outcome, Outcome::Exited(3), "{}", reply.stderr);
+    session.client.read_until("elevated-output");
+    session_speaks(&mut session, "the-session-again");
     session.leave();
 }
 
@@ -747,6 +1028,36 @@ fn the_request_connection_closing_ends_the_command() {
             request(&session.id, &cmd("/d /c echo went-on"), ""),
         );
         assert_eq!(again.outcome, Outcome::Exited(0), "{what}: {}", again.stderr);
+        session.leave();
+    }
+}
+
+/// The watch of the request, begun before the question, goes on for the command the person allowed: a client that
+/// hangs up while that command runs ends it, with a terminal of its own and without.
+#[test]
+fn a_client_that_hangs_up_while_an_allowed_command_runs_ends_it() {
+    for (what, terminal) in [("a default-mode command", false), ("a command with a terminal", true)] {
+        let _serial = serial();
+        let mut session = host("allowedhangup", Mode::Pty, ElevationPolicy::Prompt);
+        let id = session.id.to_string();
+        let long = cmd(&format!("/d /c \"echo running-{id}& ping -n 600 127.0.0.1 >nul\""));
+        let ask = ElevationRequest {
+            terminal,
+            ..request(&session.id, &long, "")
+        };
+        let mut pending = open(&session.control, "allowedhangup", ask);
+        session.client.read_question();
+        session.client.answer(ConsentAnswer::Allow);
+        if terminal {
+            session.client.read_until(&format!("running-{id}"));
+        } else {
+            pending.read_until(&format!("running-{id}"));
+        }
+
+        // The handler returns only once the command, which would run for ten minutes, has ended.
+        let _ = pending.hang_up();
+        assert_eq!(elevated_starts().len(), 1, "{what}");
+        session_speaks(&mut session, "the-session-again");
         session.leave();
     }
 }

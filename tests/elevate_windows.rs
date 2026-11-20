@@ -9,7 +9,8 @@
 //! - `auto-approve` runs the command with the agent's own token, elevated. By default, in a session with a terminal
 //!   or without, its input is closed and its output is printed by `elevate` in the session, below the typed line, so
 //!   it can be piped; with `--terminal` it has a screen of its own, and the session's screen comes back when it ends;
-//! - the default (`prompt`) asks the person at the terminal; it is refused with a sentence that says so;
+//! - the default (`prompt`) asks the person at the terminal (`tests/consent_windows.rs`); in a session without one it
+//!   is refused with a sentence that names the variable;
 //! - `always` runs it in place, in a session that is elevated already.
 //!
 //! What a session with a terminal shows is judged on the client's stream rendered as a terminal would
@@ -17,7 +18,6 @@
 #![cfg(windows)]
 
 use ssh_broker::offer::text;
-use ssh_broker::provision::canonical_exe;
 use ssh_broker::provision::procwait;
 use ssh_broker::provision::registry::{OPENSSH_KEY, set_default_shell_under};
 
@@ -33,6 +33,8 @@ mod child_entry;
 mod desktop;
 #[path = "common/drain.rs"]
 mod drain;
+#[path = "common/elevate_rig.rs"]
+mod elevate_rig;
 #[path = "common/hard_errors.rs"]
 mod hard_errors;
 #[path = "common/logon_session.rs"]
@@ -51,12 +53,11 @@ mod sshd_rig;
 mod stand_in;
 
 use account_fixture::{Account, ServiceLogon};
-use ssh_broker::socket_loc::{self, Integrity, SocketLocation};
-use sshd_rig::{Login, SHELL_PROMPT, SshSession, no_shell_to_carry, rendered, run_client};
+use elevate_rig::{HIGH, REFUSED, SCROLLBACK, Started, agent_exe, an_administrator};
+use sshd_rig::{Login, SHELL_PROMPT, no_shell_to_carry, rendered, run_client};
 use stand_in::Kit;
 
-/// What `whoami /groups` prints for a process at High, and for one that is not.
-const HIGH: &str = r"Mandatory Label\High Mandatory Level";
+/// What `whoami /groups` prints for a process that is not at High (`HIGH` is `elevate_rig`'s).
 const MEDIUM: &str = r"Mandatory Label\Medium Mandatory Level";
 
 /// Pieces of what `whoami /groups` prints: no row of a terminal that shows a prompt holds one of these, which is
@@ -68,105 +69,6 @@ const COMMAND_ROWS: [&str; 5] = [
     "Everyone",
     r"NT AUTHORITY\",
 ];
-
-/// Rows of history a rendering keeps: more than any run here produces.
-const SCROLLBACK: usize = 2000;
-
-/// `elevate` refuses with 126.
-const REFUSED: u32 = 126;
-
-/// The exe the agent of a session started at the password prompt runs: the shim starts it from the installed exe,
-/// not from its own copy in the kit (`shim_offer::run_offer`), so that is the image to look for.
-fn agent_exe() -> std::path::PathBuf {
-    canonical_exe()
-}
-
-/// An account whose agent a login at the password prompt has started (at High for an administrator), and the kit that
-/// holds the shim sshd runs. The first login stays open: it is what keeps the account's session.
-struct Started<'a> {
-    kit: &'a Kit,
-    account: &'a Account,
-    login: Login<'a>,
-    _first: SshSession,
-}
-
-impl<'a> Started<'a> {
-    fn start(kit: &'a Kit, account: &'a Account) -> Started<'a> {
-        let login = Login::new(kit, account);
-        set_default_shell_under(OPENSSH_KEY, &kit.exe.to_string_lossy(), &no_shell_to_carry())
-            .expect("set the shim as DefaultShell");
-        let mut first = login.start();
-        first.log_in(&account.password);
-        Started {
-            kit,
-            account,
-            login,
-            _first: first,
-        }
-    }
-
-    /// `ssh -T host -- "& '<exe>' elevate <tail>; exit $LASTEXITCODE"`, a login that asked for `asking` (`None`: it
-    /// set nothing): a session without a terminal. The account's shell is PowerShell, which runs a quoted path only
-    /// through its call operator; the exit is the elevated command's code, which PowerShell would otherwise make 0
-    /// or 1.
-    fn elevate_over_ssh(&self, asking: Option<&str>, tail: &str) -> sshd_rig::Outcome {
-        self.elevate_over_ssh_after(asking, "", tail)
-    }
-
-    /// [`Started::elevate_over_ssh`] after the PowerShell statements `before` (each ending in `;`) have run in the
-    /// session.
-    fn elevate_over_ssh_after(&self, asking: Option<&str>, before: &str, tail: &str) -> sshd_rig::Outcome {
-        let mut ssh = self.login.command_with(asking);
-        ssh.arg("-T").arg("--").arg(format!(
-            "{before}& '{}' elevate {tail}; exit $LASTEXITCODE",
-            self.kit.exe.display()
-        ));
-        run_client(ssh, false, self.kit.dir())
-    }
-
-    /// What explains a failure: what the account's agent and shim logged, in both of its folders, first (the
-    /// login's own evidence is long), then the login's.
-    fn diagnostics(&self) -> impl Fn() -> String + 'static {
-        let logs: Vec<SocketLocation> = [Integrity::High, Integrity::Medium]
-            .into_iter()
-            .filter_map(|integrity| socket_loc::for_profile(self.account.try_profile()?, integrity).ok())
-            .collect();
-        let login = self.login.diagnostics();
-        move || {
-            let mut report = String::new();
-            for location in &logs {
-                report += &format!(
-                    "--- the logs in {} ---\n{}\n",
-                    location.logs_dir().display(),
-                    stand_in::read_logs(location)
-                );
-            }
-            report + &login()
-        }
-    }
-
-    /// `outcome`, with its stdout a second time as bytes (a terminal's escape codes do not show otherwise), and
-    /// [`Started::diagnostics`].
-    fn failure(&self, outcome: &sshd_rig::Outcome) -> String {
-        let stdout = String::from_utf8_lossy(&outcome.stdout);
-        format!(
-            "exit {:?}\nstdout: {stdout}\nstdout, escaped: {stdout:?}\nstderr: {}\n{}",
-            outcome.code,
-            outcome.stderr,
-            (self.diagnostics())()
-        )
-    }
-
-    /// A session with a terminal whose login asked for `auto-approve`, past its first prompt. `sbk` is an alias of
-    /// the broker's exe in it, so that a typed `elevate` line is short enough not to wrap on the screen.
-    fn terminal_session(&self) -> SshSession {
-        let mut session = SshSession::start(self.login.command_asking("auto-approve"), self.diagnostics());
-        session.read_until(SHELL_PROMPT);
-        session.type_line(&format!("Set-Alias sbk '{}'", self.kit.exe.display()));
-        session.say("ALIAS-IS-SET");
-        session
-    }
-}
 
 /// The index of the first of `rows`, from `from` on, that `wanted` accepts; or a failure that shows all of them.
 fn row_from(rows: &[&str], from: usize, what: &str, wanted: impl Fn(&str) -> bool) -> usize {
@@ -181,15 +83,6 @@ fn row_from(rows: &[&str], from: usize, what: &str, wanted: impl Fn(&str) -> boo
 /// A row that shows a prompt and, on the same row, a piece of what `whoami /groups` prints.
 fn garbled(row: &str) -> bool {
     row.contains(SHELL_PROMPT) && COMMAND_ROWS.iter().any(|piece| row.contains(piece))
-}
-
-fn an_administrator(tag: &str) -> (Kit, Account, session_end::LogOutOnDrop) {
-    account_fixture::assert_elevated();
-    let kit = Kit::broker_with_helper(tag);
-    let account = Account::create(tag, true);
-    account.make_administrator();
-    let end = session_end::LogOutOnDrop::new(&agent_exe(), &account, ServiceLogon::Sshd);
-    (kit, account, end)
 }
 
 // What the login allows -----
@@ -397,10 +290,11 @@ fn with_terminal_keys_reach_the_command_and_the_sessions_screen_comes_back() {
     session.leave();
 }
 
-/// Elevated (CI only). The default login asks the person at the terminal; `elevate` is refused with a sentence that
-/// says so, and the command does not run.
+/// Elevated (CI only). The default login asks the person at the terminal; in a session without one there is nobody
+/// to ask, and `elevate` is refused with a sentence that names the variable, and the command does not run. (With a
+/// terminal it asks: `tests/consent_windows.rs`.)
 #[test]
-fn elevate_with_prompt_is_refused_with_a_sentence_that_says_why() {
+fn default_policy_without_a_terminal_refuses_naming_the_variable() {
     let _machine = machine::exclusive();
     let (kit, account, _end) = an_administrator("elpr");
     let admin = Started::start(&kit, &account);
@@ -409,7 +303,7 @@ fn elevate_with_prompt_is_refused_with_a_sentence_that_says_why() {
     let outcome = admin.elevate_over_ssh(None, &format!("cmd.exe /c copy NUL {}", marker.display()));
     assert_eq!(outcome.code, Some(REFUSED), "{}", admin.failure(&outcome));
     assert!(
-        outcome.stderr.contains(text::elevation_consent_not_built().trim_end()),
+        outcome.stderr.contains(text::elevation_no_terminal().trim_end()),
         "{}",
         admin.failure(&outcome)
     );

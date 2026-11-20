@@ -6,20 +6,20 @@
 //! [`decide`] says the session's login allowed it. Everything in the request is input from a lower integrity
 //! level: see [`crate::protocol::ElevationRequest`].
 
-use std::path::Path;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
-use super::link::{Carrier, Link};
+use super::link::{AskGuard, Carrier, ClientGone, Ended, Link, locked};
 use super::logout::Killer;
 use super::{
-    ExecStarter, HangupGuard, ParkSignal, PtyStarter, PtyTarget, answer_serving, close_unserved_pty, end_pty,
-    prepare_hangup_watch, reap_tree, spawn_stream_pump, start_hangup_watch, teardown_warning,
+    ExecStarter, HangupGuard, PtyStarter, PtyTarget, answer_serving, close_unserved_pty, end_pty, prepare_hangup_watch,
+    reap_tree, spawn_stream_pump, start_watch_with, teardown_warning,
 };
 use crate::afunix::ConnTx;
 use crate::hangup::HangupWatcher;
 use crate::offer::text;
-use crate::protocol::{ElevationPolicy, ElevationRequest, SESSION_VARIABLE, SessionId, Stream};
+use crate::protocol::{ConsentAnswer, ElevationPolicy, ElevationRequest, SESSION_VARIABLE, SessionId, Stream};
 
 // Whether a request is allowed =====
 
@@ -28,6 +28,8 @@ use crate::protocol::{ElevationPolicy, ElevationRequest, SESSION_VARIABLE, Sessi
 pub(super) enum Verdict {
     /// Run the command.
     Run,
+    /// Ask the person at the session's terminal first ([`Link::ask`]); run it only if they allow it.
+    Ask,
     /// Do not: say this, exit 126.
     Refuse(String),
 }
@@ -37,15 +39,16 @@ pub(super) enum Verdict {
 /// `Always` refuse (the second because a session that asked for `always` runs at High, where `elevate` runs the
 /// command in place and asks nobody: a request for it that reaches the agent comes from a process below High
 /// somewhere else in the account). A command that wants a terminal in a session that has none is refused next:
-/// there is no screen to give it. `AutoApprove` runs it; `Prompt` is refused, with a sentence that says the consent
-/// question does not exist yet.
+/// there is no screen to give it. `AutoApprove` runs it. `Prompt` asks the person at the terminal; a session without
+/// one has nobody to ask and is refused, with the sentence that names the two levels that need no question.
 pub(super) fn decide(policy: ElevationPolicy, has_terminal: bool, terminal: bool) -> Verdict {
     match policy {
         ElevationPolicy::Never => Verdict::Refuse(text::elevation_never()),
         ElevationPolicy::Always => Verdict::Refuse(text::elevation_already_elevated()),
         _ if terminal && !has_terminal => Verdict::Refuse(text::elevation_needs_a_terminal()),
         ElevationPolicy::AutoApprove => Verdict::Run,
-        ElevationPolicy::Prompt => Verdict::Refuse(text::elevation_consent_not_built()),
+        ElevationPolicy::Prompt if has_terminal => Verdict::Ask,
+        ElevationPolicy::Prompt => Verdict::Refuse(text::elevation_no_terminal()),
     }
 }
 
@@ -107,6 +110,122 @@ impl HostedSession {
     }
 }
 
+// The question =====
+
+/// Ask the person at the session's terminal whether `request`'s command may run, in `cwd` (the folder it would run
+/// in: the request's, else the account's home), through the session's own shim ([`Link::ask`]). `Ok` is a yes, with
+/// the question's hold on the screen, which the caller lets go of, or hands to the command it runs with `--terminal`
+/// ([`run_hosted`]). Anything else is the sentence to refuse with: the answer was no (the screen is back with the
+/// session by then, repainted), or the session ended while it was asked.
+///
+/// `gone` is set when the request's client hangs up ([`RequestWatch`]): the question ends then, and is not asked at
+/// all if the client is gone already.
+pub(super) fn consent<'a>(
+    link: &'a Link,
+    request: &ElevationRequest,
+    cwd: Option<&Path>,
+    gone: &ClientGone,
+) -> Result<AskGuard<'a>, String> {
+    let shown = folder_shown(cwd, std::env::current_dir)?;
+    match link.ask(&request.command, &shown, gone) {
+        Ok((ConsentAnswer::Allow, hold)) => Ok(hold),
+        Ok((ConsentAnswer::Refuse, hold)) => {
+            drop(hold);
+            Err(text::elevation_declined())
+        }
+        Err(Ended) => Err(text::elevation_session_ended()),
+    }
+}
+
+/// The one watch of an `elevate` request's connection, from before its question to the end of its command: when the
+/// client hangs up, a question that is asked ends ([`Link::client_gone`]) and a command that has a tree to end
+/// ([`RequestWatch::attach`]) has it ended. There is no moment of the request that nobody watches.
+///
+/// Finishing the watch ([`HangupGuard::finish`]) calls the same action, so [`RequestWatch::is_gone`] is read before it
+/// is finished.
+pub(super) struct RequestWatch {
+    link: Arc<Link>,
+    gone: ClientGone,
+    /// How to end the command's tree, once it has one.
+    command: Mutex<Option<Killer>>,
+}
+
+impl RequestWatch {
+    /// Start watching `conn`, the request's connection, for the session whose link is `link`. The guard is `None`
+    /// when the watcher could not be made ([`prepare_hangup_watch`]): a question asked for the request then stays
+    /// until it is answered or the session ends, and its command runs until it ends, also when the request's client
+    /// has gone.
+    pub(super) fn start(link: &Arc<Link>, conn: &ConnTx) -> (Arc<RequestWatch>, Option<HangupGuard>) {
+        let watch = Arc::new(RequestWatch {
+            link: Arc::clone(link),
+            gone: ClientGone::default(),
+            command: Mutex::new(None),
+        });
+        let on_hangup = Arc::clone(&watch);
+        let guard = start_watch_with(prepare_hangup_watch(conn, HangupWatcher::new), move || {
+            on_hangup.on_hangup()
+        });
+        if guard.is_none() {
+            tracing::warn!(
+                "the hang-up watch of the request could not start, so a question asked for it stays until it is answered or the session ends, and its command runs until it ends, also when the request's client has gone"
+            );
+        }
+        (watch, guard)
+    }
+
+    pub(super) fn link(&self) -> &Arc<Link> {
+        &self.link
+    }
+
+    pub(super) fn gone(&self) -> &ClientGone {
+        &self.gone
+    }
+
+    pub(super) fn is_gone(&self) -> bool {
+        self.gone.is_gone()
+    }
+
+    /// The command has a tree that `end` ends: from now on a hang-up ends it, and one that came before ends it now.
+    /// The command is published before the flag is read, and the hang-up sets the flag before it reads the command,
+    /// so one of the two sees the other.
+    pub(super) fn attach(&self, end: Killer) {
+        *locked(&self.command) = Some(Arc::clone(&end));
+        if self.gone.is_gone() {
+            end();
+        }
+    }
+
+    fn on_hangup(&self) {
+        self.link.client_gone(&self.gone);
+        let end = locked(&self.command).clone();
+        if let Some(end) = end {
+            end();
+        }
+    }
+}
+
+/// What ends `job`'s tree, and says so when it cannot.
+fn tree_end(job: &Arc<cosca::Job>) -> Killer {
+    let job = Arc::clone(job);
+    Arc::new(move || {
+        if let Some(w) = teardown_warning(reap_tree(&job)) {
+            tracing::error!("{w}");
+        }
+    })
+}
+
+/// The folder the question shows: where the command starts, `cwd`, or, for a command with no folder, the agent's own
+/// (`current`). `Err` is the sentence to refuse with when that cannot be told: a question that says nothing of where
+/// the command runs is not asked.
+fn folder_shown(cwd: Option<&Path>, current: impl FnOnce() -> std::io::Result<PathBuf>) -> Result<String, String> {
+    match cwd {
+        Some(dir) => Ok(dir.display().to_string()),
+        None => current()
+            .map(|dir| dir.display().to_string())
+            .map_err(|e| text::elevation_cannot_start(&format!("the folder it would start in is not known: {e}"))),
+    }
+}
+
 // Running the command =====
 
 /// How running a hosted command ended.
@@ -141,39 +260,45 @@ pub(super) enum RunOutcome {
 ///   go back to the session at once ([`Link::return_input`]), and the pseudoconsole is closed and drained as a
 ///   session's is before the screen goes back to the session, which repaints it.
 ///
-/// The command lives as long as the request that asked for it, and no longer: `conn` is watched, and a client that
-/// has hung up ends the command's tree. A command with `--terminal` also ends with the session whose screen it
-/// holds, whoever asked for it ([`Link::end_hosting`]).
+/// The command lives as long as the request that asked for it, and no longer: `watch` watches `conn`, and a client
+/// that has hung up ends the command's tree ([`RequestWatch::attach`]). A command with `--terminal` also ends with the
+/// session whose screen it holds, whoever asked for it ([`Link::end_hosting`]).
+///
+/// `asked` is the question's hold on the screen when one was asked, and only for a command with `--terminal`, which
+/// takes the screen from the question without giving it back to the session in between; the hold is let go once it
+/// has. A command run by default is given none: the session's screen is back before it starts.
 pub(super) fn run_hosted(
-    link: &Arc<Link>,
+    watch: &RequestWatch,
     conn: &mut ConnTx,
     request: &ElevationRequest,
     cwd: Option<&Path>,
     starts: &Starts,
     id: &SessionId,
+    asked: Option<AskGuard<'_>>,
 ) -> RunOutcome {
     let id = id.to_string();
     let env = [(SESSION_VARIABLE, id.as_str())];
     if request.terminal {
-        on_a_pseudoconsole(link, conn, &request.command, cwd, starts, &env)
+        on_a_pseudoconsole(watch, conn, &request.command, cwd, starts, &env, asked)
     } else {
-        on_pipes(conn, &request.command, cwd, starts, &env)
+        debug_assert!(
+            asked.is_none(),
+            "a command on pipes was given the question's hold on the screen"
+        );
+        on_pipes(watch, conn, &request.command, cwd, starts, &env)
     }
 }
 
-/// Watch `conn`, the request's connection, for the client going away, and end `job`'s tree when it does.
-fn watch_request(conn: &ConnTx, job: &Arc<cosca::Job>) -> Option<HangupGuard> {
-    start_hangup_watch(prepare_hangup_watch(conn, HangupWatcher::new), job)
-}
-
 fn on_a_pseudoconsole(
-    link: &Arc<Link>,
+    watch: &RequestWatch,
     conn: &mut ConnTx,
     line: &str,
     cwd: Option<&Path>,
     starts: &Starts,
     env: &[(&str, &str)],
+    asked: Option<AskGuard<'_>>,
 ) -> RunOutcome {
+    let link = watch.link();
     debug_assert!(
         link.has_terminal(),
         "decide refuses --terminal in a session without a terminal"
@@ -184,34 +309,30 @@ fn on_a_pseudoconsole(
         Err(cause) => return RunOutcome::NotStarted(cause.into_cause()),
     };
     let job = session.job();
-    let hangup = watch_request(conn, &job);
+    // The session's end ends the command ([`Link::end_hosting`]) and so does the client's hang-up; a command asked for
+    // after the session's end is ended by the call.
+    let end = tree_end(&job);
+    watch.attach(Arc::clone(&end));
     if answer_serving(conn).is_err() {
         if let Some(w) = teardown_warning(reap_tree(&job)) {
             tracing::error!("{w}");
         }
         close_unserved_pty(session, &|_| {});
-        if let Some(hangup) = hangup {
-            hangup.finish();
-        }
         return RunOutcome::Unserved;
     }
     let out_raw = session.out_read_raw();
-    let target = Arc::new(PtyTarget::new(&mut session, ParkSignal::default()));
-    // The session's end ends the command ([`Link::end_hosting`]); a command asked for after it is ended by the call.
-    let end: Killer = {
-        let job = Arc::clone(&job);
-        Arc::new(move || {
-            reap_tree(&job);
-        })
-    };
+    let target = Arc::new(PtyTarget::new(&mut session));
     let guard = link.host_elevated(target.clone(), end);
     if guard.is_none() {
         tracing::debug!("the session's shell is gone: the command was ended instead of hosted");
     }
+    // The command has the screen now (or never will): the question's hold has nothing left to give back, or the
+    // session's screen goes back, repainted, if the command was not hosted.
+    drop(asked);
     // A delivery that fails is a connection that has gone, and its command has no screen to run on: its tree ends,
     // as the session's own pump's does, and the pump goes on reading until the pseudoconsole is closed. The session's
     // own end is [`Link::end_hosting`]'s, and this is what ends the command when the session's hang-up watch could
-    // not start and its input pump is parked in a send.
+    // not start.
     let gone = {
         let job = Arc::clone(&job);
         move || {
@@ -226,9 +347,6 @@ fn on_a_pseudoconsole(
     let ended = end_pty(session, &target, pump, || link.return_input());
     // The connection goes back to the session before the reply is written.
     drop(guard);
-    if let Some(hangup) = hangup {
-        hangup.finish();
-    }
     match ended {
         Ok(code) => RunOutcome::Exited(code),
         Err(cause) => RunOutcome::EndUnread(cause),
@@ -237,20 +355,24 @@ fn on_a_pseudoconsole(
 
 /// The command on pipes, with its output written to `conn`. A [`Link`] without a terminal of the request's own
 /// connection serialises the two streams' writes, so the pump is the session's own.
-fn on_pipes(conn: &mut ConnTx, line: &str, cwd: Option<&Path>, starts: &Starts, env: &[(&str, &str)]) -> RunOutcome {
+fn on_pipes(
+    watch: &RequestWatch,
+    conn: &mut ConnTx,
+    line: &str,
+    cwd: Option<&Path>,
+    starts: &Starts,
+    env: &[(&str, &str)],
+) -> RunOutcome {
     let output = Link::new(conn.share(), false, (0, 0), None);
     let mut child = match (starts.exec)(line, cwd, None, env) {
         Ok(child) => child,
         Err(cause) => return RunOutcome::NotStarted(cause.into_cause()),
     };
     let job = child.job();
-    let hangup = watch_request(conn, &job);
+    watch.attach(tree_end(&job));
     if answer_serving(conn).is_err() {
         if let Some(w) = teardown_warning(reap_tree(&job)) {
             tracing::error!("{w}");
-        }
-        if let Some(hangup) = hangup {
-            hangup.finish();
         }
         return RunOutcome::Unserved;
     }
@@ -284,9 +406,6 @@ fn on_pipes(conn: &mut ConnTx, line: &str, cwd: Option<&Path>, starts: &Starts, 
     // A pump that panicked is the agent's fault, logged as `end_pty` logs it; the command's code is still its code.
     if out.join().is_err() || err.join().is_err() {
         tracing::error!("an output pump panicked; the output the client printed may be cut");
-    }
-    if let Some(hangup) = hangup {
-        hangup.finish();
     }
     match waited {
         Ok(code) => RunOutcome::Exited(code),

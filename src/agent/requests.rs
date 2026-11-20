@@ -11,7 +11,7 @@
 
 use std::path::Path;
 
-use super::elevation::{HostedSession, RunOutcome, Verdict, decide, run_hosted};
+use super::elevation::{HostedSession, RequestWatch, RunOutcome, Verdict, consent, decide, run_hosted};
 use super::{Control, Opened, child_cwd, home_dir, logout, read_opening};
 use crate::afunix::{Conn, ConnRx, ConnTx};
 use crate::elevate::{REFUSED_EXIT_CODE, UNKNOWN_END_EXIT_CODE};
@@ -107,16 +107,19 @@ fn elevate(rx: &mut ConnRx, tx: &mut ConnTx, control: &Control, request: &Elevat
     let Some(hosted) = control.await_hosted(&id) else {
         return refuse(rx, tx, control, &text::elevation_not_hosted());
     };
-    if let Verdict::Refuse(sentence) = decide(hosted.policy, hosted.link.has_terminal(), request.terminal) {
-        return refuse(rx, tx, control, &sentence);
-    }
-    // The slot is held while the command runs, and not while the client is waited for: the reply is written, and its
-    // client waited for, with the slot free, so that the next `elevate` of the session is not refused for it.
+    let ask = match decide(hosted.policy, hosted.link.has_terminal(), request.terminal) {
+        Verdict::Refuse(sentence) => return refuse(rx, tx, control, &sentence),
+        Verdict::Ask => true,
+        Verdict::Run => false,
+    };
+    // The slot is held while the question is asked and the command runs, and not while the client is waited for: the
+    // reply is written, and its client waited for, with the slot free, so that the next `elevate` of the session is
+    // not refused for it.
     let answer = {
         let Some(_slot) = hosted.slot.try_take() else {
             return refuse(rx, tx, control, &text::elevation_in_progress());
         };
-        run_elevated(&hosted, tx, request, &id)
+        run_elevated(&hosted, tx, request, &id, ask)
     };
     // A client that could not be told its command had started: nothing more is written to it.
     let Some((sentence, code)) = answer else {
@@ -128,12 +131,14 @@ fn elevate(rx: &mut ConnRx, tx: &mut ConnTx, control: &Control, request: &Elevat
 /// Run the command of `request` for `hosted`, whose slot the caller holds, and say what to answer: the sentence (empty
 /// for a command that ran and ended) and the exit code, or `None` when the client could not be told that the command
 /// had started ([`RunOutcome::Unserved`]). Nothing is written to the client but `Serving` and the command's own
-/// output.
+/// output. With `ask`, the person at the session's terminal is asked first, and a command they do not allow, or
+/// that cannot run, is never put to them.
 fn run_elevated(
     hosted: &HostedSession,
     tx: &mut ConnTx,
     request: &ElevationRequest,
     id: &SessionId,
+    ask: bool,
 ) -> Option<(String, i32)> {
     // The working directory is the one path the agent acts on: it is the command's folder, which must be one.
     let cwd = child_cwd(&request.cwd, home_dir());
@@ -141,7 +146,48 @@ fn run_elevated(
         let cause = format!("{} is not an existing directory", request.cwd);
         return Some((text::elevation_cannot_start(&cause), REFUSED_EXIT_CODE));
     }
-    match run_hosted(&hosted.link, tx, request, cwd.as_deref(), &hosted.starts, id) {
+    // One watch of the request's client, from before the question to the end of the command: a client that hangs up
+    // while the question is asked ends it, and one that hangs up while the command runs ends its tree.
+    let (watch, guard) = RequestWatch::start(&hosted.link, tx);
+    let answer = run_watched(&watch, hosted, tx, request, id, ask, cwd.as_deref());
+    // Finishing the watch calls its action too: the client's having hung up was read before.
+    if let Some(guard) = guard {
+        guard.finish();
+    }
+    answer
+}
+
+/// [`run_elevated`] under `watch`.
+///
+/// A client that hangs up before the answer is not served: nothing is written to it, and the command is not started.
+/// One that hangs up in the instant after the answer, once `watch` was read for the last time, may see its command
+/// started and ended at once: the person allowed it.
+fn run_watched(
+    watch: &RequestWatch,
+    hosted: &HostedSession,
+    tx: &mut ConnTx,
+    request: &ElevationRequest,
+    id: &SessionId,
+    ask: bool,
+    cwd: Option<&Path>,
+) -> Option<(String, i32)> {
+    let asked = if ask {
+        match consent(&hosted.link, request, cwd, watch.gone()) {
+            Ok(hold) => Some(hold),
+            // The refusal is for a client that is still there.
+            Err(sentence) => return (!watch.is_gone()).then_some((sentence, REFUSED_EXIT_CODE)),
+        }
+    } else {
+        None
+    };
+    // Read again immediately before the command is started. A `None` lets go of the question's hold.
+    if watch.is_gone() {
+        return None;
+    }
+    // A command run by default needs none of the screen: the session's is back, repainted, before it starts. One run
+    // with `--terminal` takes it from the question.
+    let asked = asked.filter(|_| request.terminal);
+    match run_hosted(watch, tx, request, cwd, &hosted.starts, id, asked) {
         RunOutcome::Exited(code) => Some((String::new(), code)),
         RunOutcome::NotStarted(cause) => Some((text::elevation_cannot_start(&format!("{cause:#}")), REFUSED_EXIT_CODE)),
         RunOutcome::Unserved => None,

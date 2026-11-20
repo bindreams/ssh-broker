@@ -4,7 +4,9 @@
 //! AF_UNIX connection (`afunix::ConnRx`/`ConnTx`) and the in-memory test transport
 //! below, with identical logic.
 
-use crate::protocol::{ExitCode, FrameKind, FrameReader, Resize, Stream, write_frame};
+use crate::protocol::{
+    ConsentReply, ConsentRequest, ConsentWithdrawal, ExitCode, FrameKind, FrameReader, Resize, Stream, write_frame,
+};
 use std::io::{Read, Write};
 
 /// Result of a decode pump. `Exited(n)` = a clean `EXIT(n)` frame was received;
@@ -63,13 +65,33 @@ impl PumpError {
     }
 }
 
-/// A sink that accepts and drops everything, so a pump can keep watching a peer it is no
-/// longer able to deliver to. It takes over from a sink that has failed, so the first frame is behind it
-/// and an answer is a protocol error before it is asked.
-struct DiscardSink;
+/// `sink` after it has failed on data: the data and the resizes are dropped, and the protocol's control frames (the
+/// consent question, its answer and its withdrawal) still go to it, because a question waits on its answer however the session's
+/// input fares. A control frame the sink refuses is dropped too: the pump's job here is to keep watching the peer.
+/// It takes over from a sink that has failed, so the first frame is behind it and an answer to the connection is a
+/// protocol error before it is asked.
+struct Draining<'a, S: FrameSink>(&'a mut S);
 
-impl FrameSink for DiscardSink {
+impl<S: FrameSink> FrameSink for Draining<'_, S> {
     fn on_data(&mut self, _stream: Stream, _bytes: &[u8]) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn on_consent(&mut self, request: ConsentRequest) -> anyhow::Result<()> {
+        if let Err(e) = self.0.on_consent(request) {
+            tracing::warn!("the failed sink refused a consent question; dropped: {e:#}");
+        }
+        Ok(())
+    }
+    fn on_consent_answer(&mut self, reply: ConsentReply) -> anyhow::Result<()> {
+        if let Err(e) = self.0.on_consent_answer(reply) {
+            tracing::warn!("the failed sink refused a consent answer; dropped: {e:#}");
+        }
+        Ok(())
+    }
+    fn on_consent_withdrawn(&mut self, withdrawal: ConsentWithdrawal) -> anyhow::Result<()> {
+        if let Err(e) = self.0.on_consent_withdrawn(withdrawal) {
+            tracing::warn!("the failed sink refused a consent withdrawal; dropped: {e:#}");
+        }
         Ok(())
     }
 }
@@ -78,8 +100,8 @@ impl FrameSink for DiscardSink {
 ///
 /// [`PumpError::Sink`] is the one ending that must not stop the loop: it is local, and the peer
 /// is usually still connected — a relayed command closing its own stdin makes the next write
-/// fail mid-session. Delivery stops there, but watching does not; the pump re-enters with the
-/// frames discarded.
+/// fail mid-session. Data delivery stops there, but watching does not, and neither does the protocol's control
+/// traffic: the pump re-enters with the data and the resizes dropped and the consent frames still going to `sink`.
 ///
 /// Returning early instead would leave nobody reading the transport, so the peer's eventual
 /// disconnect is never observed and whoever waits on the child blocks forever on a command that
@@ -94,7 +116,7 @@ pub fn pump_until_peer_gone<R: Read>(r: &mut R, fr: &mut FrameReader, sink: &mut
     if e.peer_gone() {
         return;
     }
-    if let Err(e) = pump_decode(r, fr, &mut DiscardSink) {
+    if let Err(e) = pump_decode(r, fr, &mut Draining(sink)) {
         tracing::debug!("input pump stopped watching: {e}");
     }
 }
@@ -130,6 +152,21 @@ pub trait FrameSink {
     fn on_resize(&mut self, r: Resize) -> anyhow::Result<()> {
         let _ = r;
         Ok(())
+    }
+    /// A [`ConsentRequest`]. The shim's sink of a session with a terminal takes it; every other refuses.
+    fn on_consent(&mut self, request: ConsentRequest) -> anyhow::Result<()> {
+        let _ = request;
+        anyhow::bail!("a consent question where none is expected")
+    }
+    /// A [`ConsentReply`]. The agent's sink of a session with a terminal takes it; every other refuses.
+    fn on_consent_answer(&mut self, reply: ConsentReply) -> anyhow::Result<()> {
+        let _ = reply;
+        anyhow::bail!("a consent answer where none is expected")
+    }
+    /// A [`ConsentWithdrawal`]. The shim's sink of a session with a terminal takes it; every other refuses.
+    fn on_consent_withdrawn(&mut self, withdrawal: ConsentWithdrawal) -> anyhow::Result<()> {
+        let _ = withdrawal;
+        anyhow::bail!("a consent withdrawal where none is expected")
     }
 }
 
@@ -182,6 +219,18 @@ pub fn pump_decode<R: Read>(r: &mut R, fr: &mut FrameReader, sink: &mut impl Fra
                     return Err(PumpError::Protocol(anyhow::anyhow!(
                         "unexpected HANDSHAKE frame mid-stream"
                     )));
+                }
+                FrameKind::Consent => {
+                    let request = ConsentRequest::decode(&frame.payload).map_err(PumpError::Protocol)?;
+                    sink.on_consent(request).map_err(PumpError::Sink)?;
+                }
+                FrameKind::ConsentAnswer => {
+                    let reply = ConsentReply::decode(&frame.payload).map_err(PumpError::Protocol)?;
+                    sink.on_consent_answer(reply).map_err(PumpError::Sink)?;
+                }
+                FrameKind::ConsentWithdrawn => {
+                    let withdrawal = ConsentWithdrawal::decode(&frame.payload).map_err(PumpError::Protocol)?;
+                    sink.on_consent_withdrawn(withdrawal).map_err(PumpError::Sink)?;
                 }
                 FrameKind::Request => {
                     return Err(PumpError::Protocol(anyhow::anyhow!(

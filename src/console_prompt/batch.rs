@@ -1,4 +1,5 @@
-//! Reading the console's input records into `PasswordEntry`, without taking any it does not feed.
+//! Reading the console's input records into a [`KeyEntry`] (`PasswordEntry`, `ConsentEntry`), without taking
+//! any it does not feed.
 //!
 //! A step peeks at the head of the console queue, feeds the records to the entry in turn, and removes
 //! from the queue exactly the records it fed, up to and including the one that finished the step. The
@@ -11,12 +12,13 @@
 //! the finishing key, its further repeats are the user holding that key: the prompt ends on the first
 //! and drops the rest. Every buffer, and every copy of a record, is overwritten before the step
 //! returns.
+//!
+//! A step that has no key to feed waits for one, and the caller's `stop` ends the wait: [`super::ask_consent`] says how.
 
 use windows::Win32::System::Console::INPUT_RECORD;
 use zeroize::Zeroize;
 
-use crate::password_entry::{PasswordEntry, Step};
-use crate::vtinput::KeyEvent;
+use crate::vtinput::{KeyEntry, KeyEvent};
 
 /// Records one peek takes.
 pub(super) const BATCH: usize = 32;
@@ -26,6 +28,9 @@ const EVT_KEY: u16 = 0x0001;
 
 /// The console's input queue.
 pub(super) trait InputQueue {
+    /// How many records are in the queue now.
+    fn queued(&mut self) -> windows::core::Result<u32>;
+
     /// Copy up to `records.len()` records from the head of the queue, leaving them there. Returns
     /// how many; 0 if the queue is empty.
     fn peek(&mut self, records: &mut [INPUT_RECORD]) -> windows::core::Result<u32>;
@@ -46,17 +51,68 @@ impl Batch {
         }
     }
 
-    /// Block until one entry step finishes, and return it. The records after the finishing one are
-    /// not taken from the queue. On return, successful or not, the buffer is all zeros.
-    pub fn step(&mut self, queue: &mut impl InputQueue, entry: &mut PasswordEntry) -> windows::core::Result<Step> {
-        let result = self.step_inner(queue, entry);
+    /// Take the records that are queued now and give them to `relay`, in order, a batch at a time; never wait for one
+    /// that is not. One pass: whatever arrives while this runs is left in the queue, so a sustained stream cannot keep
+    /// it from ending. `Ok(false)` when `relay` said the records could not be passed on: the rest stays queued. The
+    /// buffer is all zeros on return.
+    pub fn drain(
+        &mut self,
+        queue: &mut impl InputQueue,
+        relay: &mut dyn FnMut(&[INPUT_RECORD]) -> bool,
+    ) -> windows::core::Result<bool> {
+        let result = self.drain_inner(queue, relay);
         self.wipe();
         result
     }
 
-    fn step_inner(&mut self, queue: &mut impl InputQueue, entry: &mut PasswordEntry) -> windows::core::Result<Step> {
+    fn drain_inner(
+        &mut self,
+        queue: &mut impl InputQueue,
+        relay: &mut dyn FnMut(&[INPUT_RECORD]) -> bool,
+    ) -> windows::core::Result<bool> {
+        let mut left = queue.queued()? as usize;
+        while left > 0 {
+            let batch = left.min(BATCH);
+            // At least `batch` records are there, so this does not wait. The console may have merged a repeat into
+            // the last, which the read returns as it is by now: a merge adds no record.
+            let taken = (queue.read(&mut self.records[..batch])? as usize).min(batch);
+            left -= taken;
+            if !relay(&self.records[..taken]) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Block until one entry step finishes, and return it, or until `stop` says so while no step is finishing: then
+    /// the step is [`KeyEntry::stopped`]. A step that sees `stop` true feeds nothing of what is queued then, and it
+    /// stays queued.
+    /// The records after the finishing one are not taken from the queue. On return, successful or not, the buffer is
+    /// all zeros.
+    pub fn step<E: KeyEntry>(
+        &mut self,
+        queue: &mut impl InputQueue,
+        entry: &mut E,
+        stop: &dyn Fn() -> bool,
+    ) -> windows::core::Result<E::Step> {
+        let result = self.step_inner(queue, entry, stop);
+        self.wipe();
+        result
+    }
+
+    fn step_inner<E: KeyEntry>(
+        &mut self,
+        queue: &mut impl InputQueue,
+        entry: &mut E,
+        stop: &dyn Fn() -> bool,
+    ) -> windows::core::Result<E::Step> {
         loop {
             let peeked = (queue.peek(&mut self.records)? as usize).min(BATCH);
+            // After the look at the queue and before anything of it is fed: what makes `stop` true puts its record in
+            // the queue afterwards, so nothing behind that record is ever fed.
+            if stop() {
+                return Ok(E::stopped());
+            }
             // Only the last record of the queue can change after the peek (the console merges a repeated
             // key-down into it), and it is the last peeked one. The records before it are fed from the
             // peek, and the last is fed from the read that removes it.
@@ -81,7 +137,7 @@ impl Batch {
     /// Feed the entry the first `len` records in turn until a step finishes. Returns how many were
     /// fed (the finishing one included) and the step. A fed record is overwritten at once, and so are
     /// the copies made of it.
-    fn feed(&mut self, len: usize, entry: &mut PasswordEntry) -> (usize, Option<Step>) {
+    fn feed<E: KeyEntry>(&mut self, len: usize, entry: &mut E) -> (usize, Option<E::Step>) {
         for (index, slot) in self.records[..len].iter_mut().enumerate() {
             let mut record = std::mem::replace(slot, zeroed_record());
             if record.EventType != EVT_KEY {
@@ -104,9 +160,8 @@ impl Batch {
             let step = entry.key(&event);
             // SAFETY: `KeyEvent` is integers and a `bool`; all-zero bytes are a valid value.
             unsafe { wipe_plain(&mut event) };
-            match step {
-                Step::Continue => {}
-                step => return (index + 1, Some(step)),
+            if E::finishes_step(&step) {
+                return (index + 1, Some(step));
             }
         }
         (len, None)

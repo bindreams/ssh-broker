@@ -22,6 +22,15 @@ pub const MAX_FRAME: u32 = 1 << 20;
 ///
 /// `Request` (payload: an [`ElevationRequest`]) is a first frame instead of a handshake, on the request socket
 /// only; the agent reads it as it reads a handshake, and in a stream it is a protocol error.
+///
+/// `Consent` (agent to shim, payload: a [`ConsentRequest`]) is the question of a session that has a terminal, and
+/// `ConsentAnswer` (shim to agent, payload: a [`ConsentReply`]) its answer, which carries the question's number. The
+/// agent sends no output frame after `Consent` until it has the answer, and keeps the input frames that reach it while
+/// it waits for the session.
+/// `ConsentWithdrawn` (agent to shim, payload: a [`ConsentWithdrawal`]) says the agent asks no longer the question
+/// it names: it ended without an answer from the shim, which takes it off its console and sends none, and the agent
+/// writes it before the screen goes back to the session. It ends only the question it names: with that one not open
+/// it is ignored.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrameKind {
@@ -32,6 +41,9 @@ pub enum FrameKind {
     Serving = 4,
     HandBack = 5,
     Request = 6,
+    Consent = 7,
+    ConsentAnswer = 8,
+    ConsentWithdrawn = 9,
 }
 
 impl FrameKind {
@@ -44,6 +56,9 @@ impl FrameKind {
             4 => Some(Self::Serving),
             5 => Some(Self::HandBack),
             6 => Some(Self::Request),
+            7 => Some(Self::Consent),
+            8 => Some(Self::ConsentAnswer),
+            9 => Some(Self::ConsentWithdrawn),
             _ => None,
         }
     }
@@ -191,7 +206,7 @@ impl std::fmt::Debug for SessionId {
 }
 
 /// The wire version; a peer of any other version is refused by name.
-pub const PROTOCOL_VERSION: u16 = 6;
+pub const PROTOCOL_VERSION: u16 = 7;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Mode {
@@ -393,6 +408,91 @@ impl ElevationRequest {
             "the program of the command is not an absolute path: {program:?}"
         );
         Ok(session)
+    }
+}
+
+/// What the agent asks the session's shim on its connection, as the payload of a [`FrameKind::Consent`] frame: a
+/// program of the session asks to run `command` as administrator. The shim shows both fields to the person at the
+/// terminal, cleaned (`offer::text::consent_question`); neither is used as anything else.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConsentRequest {
+    /// First, so that a peer of another version is refused by name ([`ConsentRequest::decode`]).
+    pub version: u16,
+    /// The question's number: the agent numbers the questions of a session from 1. The shim echoes it in its answer
+    /// ([`ConsentReply`]) and the agent's withdrawal names it ([`ConsentWithdrawal`]), so that an answer or a
+    /// withdrawal belongs to this question and no other.
+    pub id: u32,
+    /// The command line that would run, as the agent would start it.
+    pub command: String,
+    /// The folder it would run in.
+    pub cwd: String,
+}
+
+impl ConsentRequest {
+    pub fn encode(&self) -> anyhow::Result<Vec<u8>> {
+        Ok(postcard::to_stdvec(self)?)
+    }
+
+    /// The request `b` holds, and nothing else: bytes after it are an error. A peer of another version is refused
+    /// by its number, before the rest is read.
+    pub fn decode(b: &[u8]) -> anyhow::Result<Self> {
+        let (version, _) = postcard::take_from_bytes::<u16>(b)?;
+        anyhow::ensure!(
+            version == PROTOCOL_VERSION,
+            "protocol version mismatch: peer {version} != ours {PROTOCOL_VERSION}"
+        );
+        let (request, rest) = postcard::take_from_bytes::<Self>(b)?;
+        anyhow::ensure!(rest.is_empty(), "{} byte(s) after the consent request", rest.len());
+        Ok(request)
+    }
+}
+
+/// What the person said to a [`ConsentRequest`]. The shim sends `Allow` for the allowing answer and `Refuse` for
+/// everything else, including no answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ConsentAnswer {
+    Allow,
+    Refuse,
+}
+
+/// The payload of a [`FrameKind::ConsentAnswer`] frame: the [`ConsentAnswer`] to the question numbered `id`
+/// ([`ConsentRequest::id`]). The agent applies it to that question only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConsentReply {
+    pub id: u32,
+    pub answer: ConsentAnswer,
+}
+
+impl ConsentReply {
+    pub fn encode(&self) -> anyhow::Result<Vec<u8>> {
+        Ok(postcard::to_stdvec(self)?)
+    }
+
+    /// The reply `b` holds, and nothing else: another variant, too few bytes, or bytes after it are errors.
+    pub fn decode(b: &[u8]) -> anyhow::Result<Self> {
+        let (reply, rest) = postcard::take_from_bytes::<Self>(b)?;
+        anyhow::ensure!(rest.is_empty(), "{} byte(s) after the consent answer", rest.len());
+        Ok(reply)
+    }
+}
+
+/// The payload of a [`FrameKind::ConsentWithdrawn`] frame: the agent asks no longer the question numbered `id`
+/// ([`ConsentRequest::id`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConsentWithdrawal {
+    pub id: u32,
+}
+
+impl ConsentWithdrawal {
+    pub fn encode(&self) -> anyhow::Result<Vec<u8>> {
+        Ok(postcard::to_stdvec(self)?)
+    }
+
+    /// The withdrawal `b` holds, and nothing else: too few bytes, or bytes after it, are errors.
+    pub fn decode(b: &[u8]) -> anyhow::Result<Self> {
+        let (withdrawal, rest) = postcard::take_from_bytes::<Self>(b)?;
+        anyhow::ensure!(rest.is_empty(), "{} byte(s) after the consent withdrawal", rest.len());
+        Ok(withdrawal)
     }
 }
 

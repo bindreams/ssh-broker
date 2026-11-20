@@ -83,8 +83,8 @@ use crate::offer::text;
 use crate::pipes::ExecChild;
 #[cfg(windows)]
 use crate::protocol::{
-    ElevationPolicy, ExitCode, Frame, FrameKind, FrameReader, Handshake, Mode, Resize, SESSION_VARIABLE, Stream,
-    read_one_frame, write_frame,
+    ConsentReply, ElevationPolicy, ExitCode, Frame, FrameKind, FrameReader, Handshake, Mode, Resize, SESSION_VARIABLE,
+    Stream, read_one_frame, write_frame,
 };
 #[cfg(windows)]
 use crate::relay::{FrameSink, pump_until_peer_gone, write_data, write_serving};
@@ -898,6 +898,8 @@ struct Hooks {
     start_exec: ExecStarter,
     /// What the shell configuration is resolved against: the machine, in production.
     shell_host: Box<dyn crate::shell::Host + Send + Sync>,
+    /// Raised when the input queue of a command's stdin on pipes is full (the exec path only: a pseudoconsole's has no
+    /// bound).
     parked: ParkSignal,
     /// Called once the session's shell is started and before it is registered, the window in which
     /// the agent can begin to end.
@@ -1309,7 +1311,7 @@ fn handle_pty(
     let watcher = prepare_hangup_watch(&tx, hooks.make_watcher);
 
     let out_raw = session.out_read_raw();
-    let target = Arc::new(PtyTarget::new(&mut session, hooks.parked));
+    let target = Arc::new(PtyTarget::new(&mut session));
     let link = Link::new(tx, true, (cols, rows), Some(target.clone()));
     let starts = Starts {
         pty: hooks.start_pty,
@@ -1497,9 +1499,9 @@ struct PtyTarget {
 impl PtyTarget {
     /// The target of `session`'s pseudoconsole: it takes the pseudoconsole and the write end of its input, which
     /// [`PtyTarget::close`] gives back to the system.
-    fn new(session: &mut PtySession, parked: ParkSignal) -> Self {
+    fn new(session: &mut PtySession) -> Self {
         PtyTarget {
-            writer: Mutex::new(Some(HandleWriter::spawn(session.in_write_raw(), None, parked))),
+            writer: Mutex::new(Some(HandleWriter::unbounded(session.in_write_raw()))),
             hpc: Mutex::new(Some(session.take_hpc_raw())),
         }
     }
@@ -1556,6 +1558,10 @@ impl FrameSink for LinkInputSink {
     }
     fn on_resize(&mut self, r: Resize) -> anyhow::Result<()> {
         self.link.resize(r);
+        Ok(())
+    }
+    fn on_consent_answer(&mut self, reply: ConsentReply) -> anyhow::Result<()> {
+        self.link.answer(reply);
         Ok(())
     }
 }
@@ -1659,7 +1665,7 @@ fn handle_exec(
         let job = Arc::clone(&job);
         std::thread::spawn(move || {
             let mut sink = ExecInputSink {
-                writer: HandleWriter::spawn(stdin_raw, stdin_owned, hooks.parked),
+                writer: HandleWriter::bounded(stdin_raw, stdin_owned, hooks.parked),
             };
             pump_until_peer_gone(&mut rx, &mut fr, &mut sink);
             // Reap first: dropping the sink joins the writer thread, which may be parked
@@ -1703,8 +1709,9 @@ struct HangupGuard {
 }
 
 /// Start the third detector, for the one case the other two cannot see: a command that is silent
-/// (no output pump ever fails a write) while the input pump is parked in the bounded queue
-/// (nothing reads the socket). It watches the socket without reading it and reaps on a hangup.
+/// (no output pump ever fails a write) while the input pump is not reading the socket: parked in
+/// the bounded queue of a command's stdin on pipes, or waiting for the outcome of an answered
+/// question (`Link::route_input`). It watches the socket without reading it and reaps on a hangup.
 ///
 /// `None` if the watcher cannot be created. A failure here must not cost the user a session; it
 /// only loses the hangup protection.
@@ -1722,19 +1729,26 @@ fn prepare_hangup_watch(tx: &ConnTx, make_watcher: WatchFactory) -> Option<(Hang
     }
 }
 
-/// Start the watch [`prepare_hangup_watch`] made.
+/// Start the watch [`prepare_hangup_watch`] made, ending `job`'s tree on a hangup.
 #[cfg(windows)]
 fn start_hangup_watch(watcher: Option<(HangupWatcher, Waker)>, job: &Arc<cosca::Job>) -> Option<HangupGuard> {
-    let (hangup, waker) = watcher?;
     let job = Arc::clone(job);
-    let thread = std::thread::spawn(move || {
-        // The wait also ends after a normal teardown.
-        end_of_watch(hangup.wait(), || {
-            if let Some(w) = teardown_warning(reap_tree(&job)) {
-                tracing::error!("{w}");
-            }
-        });
-    });
+    start_watch_with(watcher, move || {
+        if let Some(w) = teardown_warning(reap_tree(&job)) {
+            tracing::error!("{w}");
+        }
+    })
+}
+
+/// Start the watch [`prepare_hangup_watch`] made, calling `on_hangup` when the peer has hung up. The wait also ends
+/// after a normal teardown ([`HangupGuard::finish`]), and then `on_hangup` is called as well.
+#[cfg(windows)]
+fn start_watch_with(
+    watcher: Option<(HangupWatcher, Waker)>,
+    on_hangup: impl FnOnce() + Send + 'static,
+) -> Option<HangupGuard> {
+    let (hangup, waker) = watcher?;
+    let thread = std::thread::spawn(move || end_of_watch(hangup.wait(), on_hangup));
     Some(HangupGuard { waker, thread })
 }
 
@@ -1795,7 +1809,7 @@ fn spawn_stream_pump(
             if let Err(e) = link.deliver(carrier, stream, &buf[..n]) {
                 tracing::debug!("could not deliver output; it is no longer delivered: {e:#}");
                 // The socket is gone. This is an independent detector, not a redundant
-                // one: the input pump's queue is bounded, so a command that ignores its stdin
+                // one: the input pump's queue is bounded on pipes, so a command that ignores its stdin
                 // can still park that pump in a send and blind it to the socket. And keep READING: for a
                 // pseudoconsole, `ClosePseudoConsole` flushes conhost's pending output through the pipe, and
                 // abandoning it here lets it fill, and teardown then blocks inside the close.
@@ -1830,6 +1844,11 @@ impl FrameSink for ExecInputSink {
     // on_resize: default no-op (EXEC has no pseudoconsole).
 }
 
+/// How many chunks of a client's input (one per frame, at most 32 KiB each) a session holds that have not reached the
+/// process: a [`HandleWriter`]'s queue.
+#[cfg(windows)]
+const INPUT_QUEUE_CHUNKS: usize = 16;
+
 /// Writes to a blocking handle from a thread of its own.
 ///
 /// The frame reader must never park in a sink. `pump_decode` dispatches inline, and a pipe
@@ -1837,18 +1856,25 @@ impl FrameSink for ExecInputSink {
 /// there has stopped watching the socket, and a disconnect becomes invisible. If the command
 /// also produces no output, nothing is left that can notice, and the session hangs for the
 /// lifetime of the agent. Moving the write off this thread is what sshd gets from a select
-/// loop over non-blocking descriptors.
+/// loop over non-blocking descriptors. (The one wait a session's reader does make is not in a sink:
+/// for the outcome of an answered question, `Link::route_input`, which says what ends it.)
 ///
-/// The queue is bounded. Unbounded buffering makes an ordinary `cat big-file | ssh host cmd`
-/// into unbounded growth in a resident agent that is shared with the user's other sessions, so
-/// the cap is what keeps one session from taking down the rest. Once it is full the reader
-/// does park in the send — the socket then applies the same backpressure sshd gets from its
-/// channel window — and the output pumps and the hangup watcher are what still see a disconnect.
+/// The queue is bounded ([`HandleWriter::bounded`], a command's stdin on pipes) or not
+/// ([`HandleWriter::unbounded`], a pseudoconsole's input).
 #[cfg(windows)]
 struct HandleWriter {
-    tx: Option<std::sync::mpsc::SyncSender<Option<Vec<u8>>>>,
+    tx: Option<Queue>,
     thread: Option<std::thread::JoinHandle<()>>,
-    parked: ParkSignal,
+}
+
+/// What a [`HandleWriter`] sends to its thread; `None` is the stdin-EOF marker.
+#[cfg(windows)]
+enum Queue {
+    Bounded {
+        tx: std::sync::mpsc::SyncSender<Option<Vec<u8>>>,
+        parked: ParkSignal,
+    },
+    Unbounded(std::sync::mpsc::Sender<Option<Vec<u8>>>),
 }
 
 /// Raised when a [`HandleWriter`] finds its queue full, i.e. when its caller is about to park in
@@ -1877,12 +1903,36 @@ impl ParkSignal {
 
 #[cfg(windows)]
 impl HandleWriter {
-    /// `owned` is the handle to close on the stdin-EOF marker; the PTY path passes `None`
-    /// because the pseudoconsole's input handle belongs to the session.
-    fn spawn(raw: isize, owned: Option<OwnedHandle>, parked: ParkSignal) -> Self {
+    /// A writer for a command's stdin on pipes: `owned` is the handle to close on the stdin-EOF marker. Its queue holds
+    /// [`INPUT_QUEUE_CHUNKS`] chunks, and `parked` is raised when it is full.
+    ///
+    /// The bound is what keeps one session from taking down the rest: unbounded buffering makes an ordinary
+    /// `cat big-file | ssh host cmd` into unbounded growth in a resident agent that is shared with the user's other
+    /// sessions. Once it is full the reader does park in the send — the socket then applies the same backpressure sshd
+    /// gets from its channel window — and the output pumps and the hangup watcher are what still see a disconnect.
+    fn bounded(raw: isize, owned: Option<OwnedHandle>, parked: ParkSignal) -> Self {
         // Frames are at most `protocol::MAX_FRAME`, but the shim sends 32 KiB chunks, so
         // this is well under a megabyte in practice.
-        let (tx, rx) = std::sync::mpsc::sync_channel::<Option<Vec<u8>>>(16);
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Option<Vec<u8>>>(INPUT_QUEUE_CHUNKS);
+        Self::start(raw, owned, rx, Queue::Bounded { tx, parked })
+    }
+
+    /// A writer for a pseudoconsole's input, whose handle belongs to the session. Its queue has no bound: a console
+    /// host takes input as fast as it is given while its output is read, and the
+    /// pump must never park before it reads a `ConsentReply` while the link holds the session's output.
+    ///
+    /// The cost: memory grows by what a client sends while it reads none of the session's output.
+    fn unbounded(raw: isize) -> Self {
+        let (tx, rx) = std::sync::mpsc::channel::<Option<Vec<u8>>>();
+        Self::start(raw, None, rx, Queue::Unbounded(tx))
+    }
+
+    fn start(
+        raw: isize,
+        owned: Option<OwnedHandle>,
+        rx: std::sync::mpsc::Receiver<Option<Vec<u8>>>,
+        tx: Queue,
+    ) -> Self {
         let thread = std::thread::spawn(move || {
             let _owned = owned; // dropped on the way out, closing the child's stdin
             for msg in rx {
@@ -1895,31 +1945,39 @@ impl HandleWriter {
         Self {
             tx: Some(tx),
             thread: Some(thread),
-            parked,
         }
     }
 
     /// Queue bytes. Fails only once the writer thread has stopped, which is a genuine
     /// [`crate::relay::PumpError::Sink`]: local, and no evidence about the peer.
     fn write(&self, bytes: &[u8]) -> anyhow::Result<()> {
-        let Some(tx) = &self.tx else {
+        let Some(queue) = &self.tx else {
             return Ok(()); // stdin already closed by the marker; further input is discarded
         };
         let stopped = || anyhow::anyhow!("the handle writer stopped");
-        match tx.try_send(Some(bytes.to_vec())) {
-            Ok(()) => Ok(()),
-            Err(TrySendError::Full(msg)) => {
-                self.parked.raise();
-                tx.send(msg).map_err(|_| stopped())
-            }
-            Err(TrySendError::Disconnected(_)) => Err(stopped()),
+        match queue {
+            Queue::Unbounded(tx) => tx.send(Some(bytes.to_vec())).map_err(|_| stopped()),
+            Queue::Bounded { tx, parked } => match tx.try_send(Some(bytes.to_vec())) {
+                Ok(()) => Ok(()),
+                Err(TrySendError::Full(msg)) => {
+                    parked.raise();
+                    tx.send(msg).map_err(|_| stopped())
+                }
+                Err(TrySendError::Disconnected(_)) => Err(stopped()),
+            },
         }
     }
 
     /// Close the underlying handle without ending the session.
     fn close(&mut self) {
-        if let Some(tx) = self.tx.take() {
-            let _ = tx.send(None);
+        match self.tx.take() {
+            Some(Queue::Bounded { tx, .. }) => {
+                let _ = tx.send(None);
+            }
+            Some(Queue::Unbounded(tx)) => {
+                let _ = tx.send(None);
+            }
+            None => {}
         }
     }
 }

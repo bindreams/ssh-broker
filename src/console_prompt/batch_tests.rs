@@ -1,119 +1,12 @@
 //! Unit tests for `batch` (pure; the console queue is a fake).
 use super::*;
-use std::collections::VecDeque;
-use windows::Win32::System::Console::{FOCUS_EVENT, INPUT_RECORD_0, KEY_EVENT, KEY_EVENT_RECORD, KEY_EVENT_RECORD_0};
-use windows::core::BOOL;
-
-fn key(vk: u16, ch: u16) -> INPUT_RECORD {
-    INPUT_RECORD {
-        EventType: KEY_EVENT as u16,
-        Event: INPUT_RECORD_0 {
-            KeyEvent: KEY_EVENT_RECORD {
-                bKeyDown: BOOL(1),
-                wRepeatCount: 1,
-                wVirtualKeyCode: vk,
-                wVirtualScanCode: 0,
-                uChar: KEY_EVENT_RECORD_0 { UnicodeChar: ch },
-                dwControlKeyState: 0,
-            },
-        },
-    }
-}
-
-/// The records of text pasted into the console: Enter for each `\r`.
-fn typed(text: &str) -> Vec<INPUT_RECORD> {
-    text.encode_utf16()
-        .map(|unit| if unit == 0x0D { key(0x0D, 0x0D) } else { key(0x41, unit) })
-        .collect()
-}
-
-fn characters<'a>(records: impl IntoIterator<Item = &'a INPUT_RECORD>) -> String {
-    let units: Vec<u16> = records
-        .into_iter()
-        // SAFETY: every record in these tests is a key record.
-        .map(|record| unsafe { record.Event.KeyEvent.uChar.UnicodeChar })
-        .collect();
-    String::from_utf16(&units).unwrap()
-}
+use crate::console_prompt::fake_queue::{FakeQueue, characters, focus_record, key, typed};
+use crate::password_entry::{PasswordEntry, Step};
 
 fn is_zeroed(records: &[INPUT_RECORD]) -> bool {
     // SAFETY: `INPUT_RECORD` is plain data.
     let bytes = unsafe { std::slice::from_raw_parts(records.as_ptr().cast::<u8>(), std::mem::size_of_val(records)) };
     bytes.iter().all(|b| *b == 0)
-}
-
-/// A console input queue: `peek` copies from the head, `read` removes from the head. A `read` of an
-/// empty queue is the console's blocking wait: the next `arrivals` entry lands in the queue first.
-#[derive(Default)]
-struct FakeQueue {
-    queue: VecDeque<INPUT_RECORD>,
-    arrivals: VecDeque<Vec<INPUT_RECORD>>,
-    removed: usize,
-    /// After the next peek that reaches the end of the queue, the console merges a repeat of the last
-    /// key-down into that record: its `wRepeatCount` becomes this.
-    merge_into_tail_after_peek: Option<u16>,
-    fail_peek: bool,
-    fail_read: bool,
-}
-
-impl FakeQueue {
-    fn with(records: Vec<INPUT_RECORD>) -> Self {
-        FakeQueue {
-            queue: records.into(),
-            ..Default::default()
-        }
-    }
-
-    fn type_more(&mut self, records: Vec<INPUT_RECORD>) {
-        self.queue.extend(records);
-    }
-
-    fn left(&self) -> String {
-        characters(&self.queue)
-    }
-}
-
-fn failure() -> windows::core::Error {
-    windows::core::Error::from_hresult(windows::core::HRESULT(-1))
-}
-
-impl InputQueue for FakeQueue {
-    fn peek(&mut self, records: &mut [INPUT_RECORD]) -> windows::core::Result<u32> {
-        if self.fail_peek {
-            records[0] = key(0x41, 'x' as u16);
-            return Err(failure());
-        }
-        let count = records.len().min(self.queue.len());
-        for (slot, record) in records.iter_mut().zip(&self.queue) {
-            *slot = *record;
-        }
-        if count == self.queue.len()
-            && let (Some(repeat), Some(tail)) = (self.merge_into_tail_after_peek.take(), self.queue.back_mut())
-        {
-            tail.Event.KeyEvent.wRepeatCount = repeat;
-        }
-        Ok(count as u32)
-    }
-
-    fn read(&mut self, records: &mut [INPUT_RECORD]) -> windows::core::Result<u32> {
-        if self.fail_read {
-            records[0] = key(0x41, 'x' as u16);
-            return Err(failure());
-        }
-        if self.queue.is_empty() {
-            let arrived = self
-                .arrivals
-                .pop_front()
-                .expect("a blocking read with nothing to arrive: it would hang");
-            self.queue.extend(arrived);
-        }
-        let count = records.len().min(self.queue.len());
-        for slot in records.iter_mut().take(count) {
-            *slot = self.queue.pop_front().unwrap();
-        }
-        self.removed += count;
-        Ok(count as u32)
-    }
 }
 
 fn submitted(step: Step) -> String {
@@ -130,9 +23,15 @@ fn a_password_after_an_empty_enter_in_one_batch_is_not_lost() {
     let mut queue = FakeQueue::with(typed("\rSecret1\r"));
     let mut batch = Batch::new();
     let mut entry = PasswordEntry::new();
-    assert!(matches!(batch.step(&mut queue, &mut entry).unwrap(), Step::Empty));
+    assert!(matches!(
+        batch.step(&mut queue, &mut entry, &|| false).unwrap(),
+        Step::Empty
+    ));
     assert_eq!(queue.left(), "Secret1\r");
-    assert_eq!(submitted(batch.step(&mut queue, &mut entry).unwrap()), "Secret1");
+    assert_eq!(
+        submitted(batch.step(&mut queue, &mut entry, &|| false).unwrap()),
+        "Secret1"
+    );
     assert_eq!(queue.left(), "");
 }
 
@@ -142,7 +41,7 @@ fn type_ahead_after_the_password_stays_queued() {
     let mut queue = FakeQueue::with(typed("pw\rls\r"));
     let mut batch = Batch::new();
     let mut entry = PasswordEntry::new();
-    assert_eq!(submitted(batch.step(&mut queue, &mut entry).unwrap()), "pw");
+    assert_eq!(submitted(batch.step(&mut queue, &mut entry, &|| false).unwrap()), "pw");
     assert_eq!(queue.left(), "ls\r");
     assert_eq!(queue.removed, 3, "only the records fed to the entry are taken");
 }
@@ -154,7 +53,7 @@ fn type_ahead_longer_than_a_batch_stays_queued_in_order() {
     let mut queue = FakeQueue::with(typed(&format!("pw\r{command}")));
     let mut batch = Batch::new();
     let mut entry = PasswordEntry::new();
-    assert_eq!(submitted(batch.step(&mut queue, &mut entry).unwrap()), "pw");
+    assert_eq!(submitted(batch.step(&mut queue, &mut entry, &|| false).unwrap()), "pw");
     assert_eq!(queue.left(), command);
 }
 
@@ -165,7 +64,7 @@ fn input_that_arrives_after_the_finishing_key_follows_the_type_ahead() {
     let mut queue = FakeQueue::with(typed("pw\rls\r"));
     let mut batch = Batch::new();
     let mut entry = PasswordEntry::new();
-    assert_eq!(submitted(batch.step(&mut queue, &mut entry).unwrap()), "pw");
+    assert_eq!(submitted(batch.step(&mut queue, &mut entry, &|| false).unwrap()), "pw");
     queue.type_more(typed("pwd\r"));
     assert_eq!(queue.left(), "ls\rpwd\r");
 }
@@ -178,7 +77,10 @@ fn type_ahead_after_a_cancel_stays_queued() {
     let mut queue = FakeQueue::with(records);
     let mut batch = Batch::new();
     let mut entry = PasswordEntry::new();
-    assert!(matches!(batch.step(&mut queue, &mut entry).unwrap(), Step::Cancel));
+    assert!(matches!(
+        batch.step(&mut queue, &mut entry, &|| false).unwrap(),
+        Step::Cancel
+    ));
     assert_eq!(queue.left(), "b");
 }
 
@@ -186,15 +88,13 @@ fn type_ahead_after_a_cancel_stays_queued() {
 #[test]
 fn records_that_are_not_keys_stay_queued() {
     let mut records = typed("pw\r");
-    let mut focus = key(0, 0);
-    focus.EventType = FOCUS_EVENT as u16;
-    records.push(focus);
+    records.push(focus_record());
     let mut queue = FakeQueue::with(records);
     let mut batch = Batch::new();
     let mut entry = PasswordEntry::new();
-    submitted(batch.step(&mut queue, &mut entry).unwrap());
+    submitted(batch.step(&mut queue, &mut entry, &|| false).unwrap());
     let types: Vec<u16> = queue.queue.iter().map(|r| r.EventType).collect();
-    assert_eq!(types, vec![FOCUS_EVENT as u16]);
+    assert_eq!(types, vec![focus_record().EventType]);
 }
 
 /// A password longer than one batch is taken batch by batch, and is one password.
@@ -204,7 +104,10 @@ fn a_password_longer_than_a_batch_is_one_password() {
     let mut queue = FakeQueue::with(typed(&format!("{password}\r")));
     let mut batch = Batch::new();
     let mut entry = PasswordEntry::new();
-    assert_eq!(submitted(batch.step(&mut queue, &mut entry).unwrap()), password);
+    assert_eq!(
+        submitted(batch.step(&mut queue, &mut entry, &|| false).unwrap()),
+        password
+    );
     assert_eq!(queue.removed, password.len() + 1);
     assert_eq!(queue.left(), "");
 }
@@ -217,7 +120,7 @@ fn a_step_that_finds_the_queue_empty_waits_and_takes_only_what_it_feeds() {
     queue.arrivals.push_back(typed("pw\rls"));
     let mut batch = Batch::new();
     let mut entry = PasswordEntry::new();
-    assert_eq!(submitted(batch.step(&mut queue, &mut entry).unwrap()), "pw");
+    assert_eq!(submitted(batch.step(&mut queue, &mut entry, &|| false).unwrap()), "pw");
     assert_eq!(queue.left(), "ls");
 }
 
@@ -228,7 +131,7 @@ fn the_buffer_is_overwritten_when_a_step_returns() {
     let mut queue = FakeQueue::with(typed("pw\rls\r"));
     let mut batch = Batch::new();
     let mut entry = PasswordEntry::new();
-    submitted(batch.step(&mut queue, &mut entry).unwrap());
+    submitted(batch.step(&mut queue, &mut entry, &|| false).unwrap());
     assert!(is_zeroed(&batch.records), "a record kept its content");
 }
 
@@ -238,7 +141,7 @@ fn a_failed_peek_leaves_nothing_behind() {
     queue.fail_peek = true;
     let mut batch = Batch::new();
     let mut entry = PasswordEntry::new();
-    assert!(batch.step(&mut queue, &mut entry).is_err());
+    assert!(batch.step(&mut queue, &mut entry, &|| false).is_err());
     assert!(is_zeroed(&batch.records));
 }
 
@@ -250,7 +153,7 @@ fn a_failed_read_leaves_nothing_behind() {
     queue.fail_read = true;
     let mut batch = Batch::new();
     let mut entry = PasswordEntry::new();
-    assert!(batch.step(&mut queue, &mut entry).is_err());
+    assert!(batch.step(&mut queue, &mut entry, &|| false).is_err());
     assert!(is_zeroed(&batch.records));
 }
 
@@ -263,7 +166,10 @@ fn a_key_the_console_repeats_into_the_last_peeked_record_is_typed_every_time() {
     queue.arrivals.push_back(typed("\r"));
     let mut batch = Batch::new();
     let mut entry = PasswordEntry::new();
-    assert_eq!(submitted(batch.step(&mut queue, &mut entry).unwrap()), "abbb");
+    assert_eq!(
+        submitted(batch.step(&mut queue, &mut entry, &|| false).unwrap()),
+        "abbb"
+    );
     assert_eq!(queue.left(), "");
 }
 
@@ -276,7 +182,7 @@ fn a_repeat_merged_into_the_finishing_enter_submits_once() {
     queue.merge_into_tail_after_peek = Some(4);
     let mut batch = Batch::new();
     let mut entry = PasswordEntry::new();
-    assert_eq!(submitted(batch.step(&mut queue, &mut entry).unwrap()), "pw");
+    assert_eq!(submitted(batch.step(&mut queue, &mut entry, &|| false).unwrap()), "pw");
     assert_eq!(queue.removed, 3);
     assert_eq!(queue.left(), "");
     assert!(entry.backing().iter().all(|unit| *unit == 0), "the entry kept text");
@@ -293,6 +199,105 @@ fn a_backspace_the_console_repeats_into_the_last_peeked_record_deletes_every_tim
     queue.arrivals.push_back(typed("\r"));
     let mut batch = Batch::new();
     let mut entry = PasswordEntry::new();
-    assert_eq!(submitted(batch.step(&mut queue, &mut entry).unwrap()), "a");
+    assert_eq!(submitted(batch.step(&mut queue, &mut entry, &|| false).unwrap()), "a");
     assert_eq!(queue.left(), "");
+}
+
+// A generic entry =====
+
+use crate::consent_entry::{ConsentEntry, ConsentStep};
+
+/// The consent question's wake-up: a record that no entry feeds on arrives while the step waits, and the stop is
+/// then true. The step ends as stopped, having taken what it read.
+#[test]
+fn a_stop_ends_a_step_that_is_waiting_for_a_key() {
+    let mut queue = FakeQueue::default();
+    queue.arrivals.push_back(vec![focus_record()]);
+    let consulted = std::cell::Cell::new(0);
+    let stop = || {
+        consulted.set(consulted.get() + 1);
+        consulted.get() >= 2
+    };
+    let step = Batch::new()
+        .step(&mut queue, &mut ConsentEntry::new(&["yes"]), &stop)
+        .unwrap();
+    assert_eq!(step, ConsentStep::Stopped);
+    assert_eq!(queue.removed, 1, "the wake record was read, and nothing else");
+}
+
+/// A stop that was already true before the step began is seen before the step blocks: the fake queue panics on a
+/// read that would hang.
+#[test]
+fn a_stop_that_is_already_true_is_seen_before_the_step_waits() {
+    let mut queue = FakeQueue::default();
+    let step = Batch::new()
+        .step(&mut queue, &mut ConsentEntry::new(&["yes"]), &|| true)
+        .unwrap();
+    assert_eq!(step, ConsentStep::Stopped);
+    assert_eq!(queue.removed, 0);
+}
+
+/// The record that woke the read is not the only one queued when the stop is looked at: a key typed right behind it
+/// belongs to the session, not to the question that was withdrawn, and stays queued for the relay.
+#[test]
+fn keys_queued_behind_the_record_that_woke_a_stopped_read_stay_in_the_queue() {
+    let mut queue = FakeQueue::with(vec![focus_record()]);
+    let mut up = key(0x59, 'y' as u16);
+    up.Event.KeyEvent.bKeyDown = windows::core::BOOL(0);
+    // The wake record, and the person's `y` right behind it, arrive as the read removes the record that was queued.
+    queue.typed_after_read = vec![focus_record(), key(0x59, 'y' as u16), up];
+    let consulted = std::cell::Cell::new(0);
+    let stop = || {
+        consulted.set(consulted.get() + 1);
+        consulted.get() >= 2
+    };
+    let step = Batch::new()
+        .step(&mut queue, &mut ConsentEntry::new(&["yes", "y"]), &stop)
+        .unwrap();
+    assert_eq!(step, ConsentStep::Stopped, "nothing was fed, so nothing was typed");
+    assert_eq!(queue.removed, 1, "only the record that woke the read was taken");
+    assert_eq!(
+        queue.queue.len(),
+        3,
+        "the wake record and the two `y` records stay queued"
+    );
+    assert_eq!(
+        characters(queue.queue.iter().skip(1)),
+        "yy",
+        "the person's key stays for the relay"
+    );
+}
+
+/// The stop is looked at after the queue and before anything of it is fed: a withdrawal whose wake record and a key
+/// behind it land just before a pass looks at the queue takes nothing of what that pass sees.
+#[test]
+fn a_stop_that_turns_true_as_the_queue_is_looked_at_feeds_nothing_of_it() {
+    let mut up = key(0x59, 'y' as u16);
+    up.Event.KeyEvent.bKeyDown = windows::core::BOOL(0);
+    let mut queue = FakeQueue::with(vec![focus_record(), key(0x59, 'y' as u16), up]);
+    let peeks = std::rc::Rc::clone(&queue.peeks);
+    let step = Batch::new()
+        .step(&mut queue, &mut ConsentEntry::new(&["yes", "y"]), &|| peeks.get() > 0)
+        .unwrap();
+    assert_eq!(step, ConsentStep::Stopped, "nothing was fed, so nothing was typed");
+    assert_eq!(queue.removed, 0, "the wake record and the key behind it stay queued");
+}
+
+/// An entry whose steps are an echo and an answer: each step takes the records up to the one that finished it, and
+/// the rest, typed ahead, stays queued.
+#[test]
+fn a_generic_entry_leaves_the_records_after_the_finishing_one_in_the_queue() {
+    let mut queue = FakeQueue::with(typed("y\rlater"));
+    let mut batch = Batch::new();
+    let mut entry = ConsentEntry::new(&["yes", "y"]);
+    assert_eq!(
+        batch.step(&mut queue, &mut entry, &|| false).unwrap(),
+        ConsentStep::Echo("y".into())
+    );
+    assert_eq!(queue.left(), "\rlater");
+    assert_eq!(
+        batch.step(&mut queue, &mut entry, &|| false).unwrap(),
+        ConsentStep::Allow
+    );
+    assert_eq!(queue.left(), "later");
 }
