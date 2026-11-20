@@ -315,18 +315,31 @@ fn the_row_for_an_unelevated_administrator_says_why_nothing_can_be_checked_here(
 
     assert!(!row.pass, "nothing was proven");
     assert_eq!(row.name, "socket reachable");
-    assert!(
-        row.detail.contains("this account's agent serves elevated processes"),
-        "{}",
-        row.detail
+    assert_eq!(
+        row.detail,
+        "not checked below High: to check the session rows, run: ssh-broker elevate ssh-broker doctor"
     );
-    assert!(row.detail.contains("elevated prompt"), "{}", row.detail);
-    assert!(row.detail.contains("SSH_BROKER_ELEVATION=always"), "{}", row.detail);
     assert!(
         !row.detail.contains("to see why, run"),
         "no hint to run the agent: {}",
         row.detail
     );
+}
+
+/// `elevate` runs the elevated `doctor` where the person already is, so no row sends an unelevated administrator
+/// to an elevated prompt or to a login that asks for `always`.
+#[test]
+fn the_row_for_an_unelevated_administrator_names_the_command_that_checks_and_no_other_way() {
+    let row = filtered_row();
+
+    assert!(
+        row.detail.contains(crate::offer::text::CHECK_SESSION_ROWS_LINE),
+        "{}",
+        row.detail
+    );
+    for way in ["elevated prompt", "ordinary SSH login", "SSH_BROKER_ELEVATION=always"] {
+        assert!(!row.detail.contains(way), "{way}: {}", row.detail);
+    }
 }
 
 // which rows an account gets ------------------------------------------------------------------

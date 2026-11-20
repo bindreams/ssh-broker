@@ -738,6 +738,35 @@ fn the_fallback_notice_says_the_session_has_sshds_token_and_which_values_are_ref
     assert!(!text::unelevated_fallback("c").contains('\n'));
 }
 
+/// What `doctor` tells an unelevated administrator is the one command that runs it elevated through the agent.
+#[test]
+fn the_line_that_checks_the_session_rows_names_the_elevate_command() {
+    assert_eq!(
+        text::CHECK_SESSION_ROWS_LINE,
+        "to check the session rows, run: ssh-broker elevate ssh-broker doctor"
+    );
+}
+
+/// No sentence of `doctor` or of the offer names the verb that `doctor` replaced, or the reserved word that
+/// `SSH_BROKER_ELEVATION` replaced.
+#[test]
+fn no_sentence_names_the_old_verb_or_the_reserved_word() {
+    let sentences = [
+        text::CHECK_SESSION_ROWS_LINE.to_owned(),
+        text::ELEVATED_AGENT_LOOKS_ELSEWHERE.to_owned(),
+        text::FILTERED_SHIM_NOTICE.to_owned(),
+        text::always_below_high(),
+        text::always_filtered(),
+        text::unelevated_fallback("c"),
+        text::agent_ended(68, None),
+    ];
+    for sentence in sentences {
+        for old in ["verify", "internal-unelevated"] {
+            assert!(!sentence.contains(old), "{old}: {sentence}");
+        }
+    }
+}
+
 /// The sentences about the filtered login and the elevated agent do not send anyone to an elevated prompt for
 /// an ordinary SSH login.
 #[test]

@@ -315,8 +315,12 @@ pub fn elevation_unreadable(cause: &str) -> String {
     )
 }
 
+/// What `doctor` says in place of the session rows when this process is below High: the command that runs it
+/// elevated through the account's agent.
+pub const CHECK_SESSION_ROWS_LINE: &str = "to check the session rows, run: ssh-broker elevate ssh-broker doctor";
+
 /// Told to an unelevated process whose agent runs at High and serves no socket it can reach. Names neither
-/// "administrator" nor "Backup Operator": either account is split. Used by `doctor`'s row and `logout`'s line.
+/// "administrator" nor "Backup Operator": either account is split. Used by `logout`'s line.
 pub const ELEVATED_AGENT_LOOKS_ELSEWHERE: &str = "this account's agent serves elevated processes: run this from an elevated prompt or from an SSH login that asked for SSH_BROKER_ELEVATION=always";
 
 /// Told when a High login lacks `SeImpersonatePrivilege`, which `CreateProcessWithTokenW` needs; the way

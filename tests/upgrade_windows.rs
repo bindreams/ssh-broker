@@ -598,8 +598,9 @@ fn doctor_through(
     conn.read_to_end()
 }
 
-/// What `doctor` shows through an administrator's elevated agent: it exits 0, the session is elevated, an
-/// unelevated one can be had, and the junction was followed, not skipped.
+/// What `doctor` shows through an administrator's elevated agent: it exits 0, a login that asks for no level gets
+/// an unelevated session, one that asks for `always` gets an elevated one, and the junction was followed, not
+/// skipped.
 fn assert_doctor_passes_for_an_elevated_agent(finished: &agent_conn::Finished) {
     assert_eq!(
         finished.exit,
@@ -612,12 +613,12 @@ fn assert_doctor_passes_for_an_elevated_agent(finished: &agent_conn::Finished) {
 }
 
 /// Elevated (CI only). `doctor`, run in an administrator's session through the account's elevated agent,
-/// passes after `apply`: the session is elevated, an unelevated one can be had, and the junction that a
-/// token below High made is followed. The same `doctor` run in an unelevated session of the account is
-/// told why nothing can be checked there, and runs no probe.
+/// passes after `apply`: a login that asks for no level gets an unelevated session, one that asks for `always`
+/// gets an elevated one, and the junction that a token below High made is followed. The same `doctor` run in an
+/// unelevated session of the account is told the command that checks, and runs no probe.
 #[test]
-fn apply_then_doctor_for_an_administrator_shows_an_elevated_session_and_an_unelevated_one_on_request() {
-    use ssh_broker::offer::text::ELEVATED_AGENT_LOOKS_ELSEWHERE;
+fn apply_then_doctor_for_an_administrator_shows_a_session_and_an_elevated_session_on_request() {
+    use ssh_broker::offer::text::CHECK_SESSION_ROWS_LINE;
     use ssh_broker::protocol::ElevationPolicy;
 
     let _machine = machine::exclusive();
@@ -657,8 +658,8 @@ fn apply_then_doctor_for_an_administrator_shows_an_elevated_session_and_an_unele
         unelevated.stderr
     );
     assert!(
-        unelevated.stdout.contains(ELEVATED_AGENT_LOOKS_ELSEWHERE),
-        "the explanation is missing from:\n{}",
+        unelevated.stdout.contains(CHECK_SESSION_ROWS_LINE),
+        "the command that checks is missing from:\n{}",
         unelevated.stdout
     );
     assert!(

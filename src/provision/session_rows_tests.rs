@@ -25,7 +25,8 @@ fn answer(result: ProbeResult) -> Answer {
     }
 }
 
-/// An administrator's agent's own probe, and the one that asked to be unelevated.
+/// What the probe that asks for `always` finds at an administrator's agent, and what the one that asks for the
+/// default level finds there.
 fn elevated() -> ProbeResult {
     probe(Some(Elevation::Full), Some(INTEGRITY_HIGH))
 }
@@ -62,40 +63,158 @@ fn details(rows: &[Check]) -> Vec<&str> {
 // the agent is at High ---------------------------------------------------------------------
 
 #[test]
-fn an_elevated_agent_that_steps_down_on_request_passes_both_rows() {
-    let rows = session_rows(&answer(elevated()), Some(&answered(unelevated())));
+fn the_default_probe_row_says_session_and_passes_for_medium_with_administrators_not_enabled() {
+    let rows = session_rows(&answer(unelevated()), Some(&answered(elevated())));
 
-    assert_eq!(names(&rows), ["elevated session", "unelevated session on request"]);
+    assert_eq!(names(&rows), ["session", "elevated session on request"]);
     assert_eq!(passes(&rows), [true, true], "{:?}", details(&rows));
-    assert!(rows[0].detail.contains("High (0x3000)"), "{}", rows[0].detail);
+    assert_eq!(
+        rows[0].detail,
+        "a login that asks for no level gets integrity Medium (0x2000) with Administrators deny-only"
+    );
+    let standard = session_rows(
+        &answer(probe(Some(Elevation::Standard), Some(INTEGRITY_MEDIUM))),
+        Some(&answered(elevated())),
+    );
+    assert!(standard[0].pass, "{}", standard[0].detail);
+    assert!(
+        standard[0].detail.contains("this account is not an administrator"),
+        "{}",
+        standard[0].detail
+    );
+}
+
+/// Only Medium (`0x2000`) with Administrators not enabled passes `session`; the others say what the login got.
+#[test]
+fn the_default_probe_row_fails_naming_what_it_saw_otherwise() {
+    for (got, says) in [
+        (
+            probe(Some(Elevation::Full), Some(INTEGRITY_HIGH)),
+            "gave a full administrator's token at integrity High (0x3000)",
+        ),
+        (
+            probe(Some(Elevation::Filtered), Some(INTEGRITY_HIGH)),
+            "gave a token with Administrators deny-only at integrity High (0x3000)",
+        ),
+        (
+            probe(Some(Elevation::Standard), Some(INTEGRITY_HIGH)),
+            "gave a standard account's token at integrity High (0x3000)",
+        ),
+        (
+            probe(Some(Elevation::Filtered), Some(0x1000)),
+            "gave a token with Administrators deny-only at integrity 0x1000",
+        ),
+        (
+            probe(Some(Elevation::Full), Some(INTEGRITY_MEDIUM)),
+            "gave a full administrator's token at integrity Medium (0x2000)",
+        ),
+        (probe(Some(Elevation::Filtered), None), "did not report its level"),
+        (probe(None, Some(INTEGRITY_MEDIUM)), "did not report its token"),
+        (probe(None, None), "did not report its token or its level"),
+    ] {
+        let rows = session_rows(&answer(got.clone()), Some(&answered(elevated())));
+
+        assert_eq!(names(&rows)[0], "session", "{got:?}");
+        assert!(!rows[0].pass, "{got:?}: {}", rows[0].detail);
+        assert!(rows[0].detail.contains(says), "{got:?}: {}", rows[0].detail);
+        assert!(rows[1].pass, "the second row is about the other probe alone");
+    }
+}
+
+/// What the probe said about reading its own token is the reason on the row, in place of a guess that its
+/// exe is old, for either probe's row.
+#[test]
+fn what_the_probe_said_about_its_token_is_on_the_row_instead_of_the_remedy() {
+    let said = "reading its integrity level failed: access denied";
+    for (asked, missing) in [
+        (probe(Some(Elevation::Filtered), None), "its level"),
+        (probe(None, Some(INTEGRITY_MEDIUM)), "its token"),
+    ] {
+        let session = Answer {
+            token_said: said.into(),
+            ..answer(asked.clone())
+        };
+
+        let rows = session_rows(&session, Some(&answered(elevated())));
+
+        assert!(!rows[0].pass, "{asked:?}");
+        assert!(rows[0].detail.contains(said), "{asked:?}: {}", rows[0].detail);
+        assert!(rows[0].detail.contains(missing), "{asked:?}: {}", rows[0].detail);
+        assert!(!rows[0].detail.contains("apply"), "{asked:?}: {}", rows[0].detail);
+    }
+
+    let asked = ProbeOutcome::Answered(Answer {
+        token_said: said.into(),
+        ..answer(probe(Some(Elevation::Full), None))
+    });
+    let rows = session_rows(&answer(unelevated()), Some(&asked));
+    assert!(!rows[1].pass);
+    assert!(rows[1].detail.contains("access denied"), "{}", rows[1].detail);
+    assert!(!rows[1].detail.contains("apply"), "{}", rows[1].detail);
+}
+
+/// A probe that said nothing about its token or its level is named for that, with the remedy, and not
+/// blamed on the session.
+#[test]
+fn a_probe_that_did_not_report_its_token_or_level_says_so_and_does_not_blame_the_session() {
+    let rows = session_rows(&answer(unelevated()), Some(&answered(probe(None, None))));
+    assert!(rows[1].detail.contains("did not report"), "{}", rows[1].detail);
+    assert!(rows[1].detail.contains("apply"), "{}", rows[1].detail);
+
+    let rows = session_rows(
+        &answer(unelevated()),
+        Some(&answered(probe(Some(Elevation::Full), None))),
+    );
+    assert!(
+        rows[1].detail.contains("did not report its level"),
+        "{}",
+        rows[1].detail
+    );
+    assert!(!rows[1].detail.contains("not elevated"), "{}", rows[1].detail);
+
+    let rows = session_rows(
+        &answer(unelevated()),
+        Some(&answered(probe(None, Some(INTEGRITY_HIGH)))),
+    );
+    assert!(
+        rows[1].detail.contains("did not report its token"),
+        "{}",
+        rows[1].detail
+    );
+}
+
+#[test]
+fn the_always_probe_row_is_elevated_session_on_request_and_passes_for_high_with_administrators_enabled() {
+    let rows = session_rows(&answer(unelevated()), Some(&answered(elevated())));
+
+    assert_eq!(rows[1].name, "elevated session on request");
+    assert!(rows[1].pass, "{}", rows[1].detail);
+    assert!(rows[1].detail.contains("Administrators enabled"), "{}", rows[1].detail);
+    assert!(rows[1].detail.contains("High (0x3000)"), "{}", rows[1].detail);
 }
 
 /// A Backup Operator (a split token with no Administrators entry in it) gets the same two rows, which pass.
 #[test]
-fn a_standard_account_at_high_passes_both_rows_and_its_unelevated_probe_is_judged() {
-    let default = probe(Some(Elevation::Standard), Some(INTEGRITY_HIGH));
-    let asked = probe(Some(Elevation::Standard), Some(INTEGRITY_MEDIUM));
+fn a_standard_account_at_high_passes_both_rows_and_both_probes_are_judged() {
+    let session = probe(Some(Elevation::Standard), Some(INTEGRITY_MEDIUM));
+    let always = probe(Some(Elevation::Standard), Some(INTEGRITY_HIGH));
 
-    let rows = session_rows(&answer(default.clone()), Some(&answered(asked)));
+    let rows = session_rows(&answer(session.clone()), Some(&answered(always.clone())));
 
-    assert_eq!(names(&rows), ["elevated session", "unelevated session on request"]);
+    assert_eq!(names(&rows), ["session", "elevated session on request"]);
     assert_eq!(passes(&rows), [true, true], "{:?}", details(&rows));
-    assert!(rows[0].detail.contains("not an administrator"), "{}", rows[0].detail);
+    assert!(rows[1].detail.contains("not an administrator"), "{}", rows[1].detail);
 
-    let at_high = probe(Some(Elevation::Standard), Some(INTEGRITY_HIGH));
-    let rows = session_rows(&answer(default), Some(&answered(at_high)));
-    assert_eq!(
-        passes(&rows),
-        [true, false],
-        "it was not stepped down: {:?}",
-        details(&rows)
-    );
+    // Neither was stepped as asked: the login that asks for no level was not stepped down, and the one that
+    // asks for `always` was.
+    let rows = session_rows(&answer(always), Some(&answered(session)));
+    assert_eq!(passes(&rows), [false, false], "swapped: {:?}", details(&rows));
 }
 
-/// A deny-only token, one below High and one that said nothing fail the `elevated session` row.
+/// A deny-only token, one below High and one that said nothing fail `elevated session on request`.
 #[test]
-fn a_default_probe_that_is_not_at_high_fails_the_elevated_row() {
-    for default in [
+fn an_always_probe_that_is_not_at_high_fails_its_row() {
+    for always in [
         probe(Some(Elevation::Filtered), Some(INTEGRITY_MEDIUM)),
         probe(Some(Elevation::Filtered), Some(INTEGRITY_HIGH)),
         probe(Some(Elevation::Full), Some(INTEGRITY_MEDIUM)),
@@ -104,154 +223,42 @@ fn a_default_probe_that_is_not_at_high_fails_the_elevated_row() {
         probe(None, None),
         probe(None, Some(INTEGRITY_HIGH)),
     ] {
-        let rows = session_rows(&answer(default.clone()), Some(&answered(unelevated())));
+        let rows = session_rows(&answer(unelevated()), Some(&answered(always.clone())));
 
-        assert_eq!(names(&rows)[0], "elevated session", "{default:?}");
-        assert!(!rows[0].pass, "{default:?}: {}", rows[0].detail);
-    }
-}
-
-/// A probe that said nothing about its token or its level is named for that, with the remedy, and not
-/// blamed on the session.
-#[test]
-fn a_probe_that_did_not_report_its_token_or_level_says_so_and_does_not_blame_the_session() {
-    let rows = session_rows(&answer(probe(None, None)), Some(&answered(unelevated())));
-    assert!(rows[0].detail.contains("did not report"), "{}", rows[0].detail);
-    assert!(rows[0].detail.contains("apply"), "{}", rows[0].detail);
-
-    let rows = session_rows(
-        &answer(probe(Some(Elevation::Full), None)),
-        Some(&answered(unelevated())),
-    );
-    assert!(
-        rows[0].detail.contains("did not report its level"),
-        "{}",
-        rows[0].detail
-    );
-    assert!(!rows[0].detail.contains("not elevated"), "{}", rows[0].detail);
-
-    let rows = session_rows(
-        &answer(probe(None, Some(INTEGRITY_HIGH))),
-        Some(&answered(unelevated())),
-    );
-    assert!(
-        rows[0].detail.contains("did not report its token"),
-        "{}",
-        rows[0].detail
-    );
-}
-
-/// What the probe said about reading its own token is the reason on the row, in place of a guess that its
-/// exe is old, for the default probe's row and the unelevated probe's.
-#[test]
-fn what_the_probe_said_about_its_token_is_on_the_row_instead_of_the_remedy() {
-    let said = "reading its integrity level failed: access denied";
-    let default = Answer {
-        token_said: said.into(),
-        ..answer(probe(Some(Elevation::Full), None))
-    };
-
-    let rows = session_rows(&default, Some(&answered(unelevated())));
-
-    assert!(!rows[0].pass);
-    assert!(rows[0].detail.contains("access denied"), "{}", rows[0].detail);
-    assert!(!rows[0].detail.contains("apply"), "{}", rows[0].detail);
-
-    let asked = ProbeOutcome::Answered(Answer {
-        token_said: said.into(),
-        ..answer(probe(None, None))
-    });
-    let rows = session_rows(&answer(elevated()), Some(&asked));
-    assert!(!rows[1].pass);
-    assert!(rows[1].detail.contains("access denied"), "{}", rows[1].detail);
-    assert!(!rows[1].detail.contains("apply"), "{}", rows[1].detail);
-}
-
-/// A probe that read one of the two facts of its token and said why it could not read the other: the row
-/// has its words, whichever of the two is missing.
-#[test]
-fn what_the_probe_said_about_a_half_read_token_is_on_the_unelevated_row() {
-    let said = "reading its integrity level failed: access denied";
-    for (asked, missing) in [
-        (probe(Some(Elevation::Filtered), None), "its level"),
-        (probe(None, Some(INTEGRITY_MEDIUM)), "its token"),
-    ] {
-        let outcome = ProbeOutcome::Answered(Answer {
-            token_said: said.into(),
-            ..answer(asked.clone())
-        });
-
-        let rows = session_rows(&answer(elevated()), Some(&outcome));
-
-        assert!(!rows[1].pass, "{asked:?}");
-        assert!(rows[1].detail.contains(said), "{asked:?}: {}", rows[1].detail);
-        assert!(rows[1].detail.contains(missing), "{asked:?}: {}", rows[1].detail);
-        assert!(!rows[1].detail.contains("apply"), "{asked:?}: {}", rows[1].detail);
+        assert_eq!(names(&rows)[1], "elevated session on request", "{always:?}");
+        assert!(!rows[1].pass, "{always:?}: {}", rows[1].detail);
+        assert!(rows[0].pass, "the first row is about the default probe alone");
     }
 }
 
 #[test]
-fn a_filtered_agent_is_named_as_not_elevated() {
+fn a_filtered_always_probe_is_named_as_not_elevated() {
     let rows = session_rows(
-        &answer(probe(Some(Elevation::Filtered), Some(INTEGRITY_MEDIUM))),
-        Some(&answered(unelevated())),
+        &answer(unelevated()),
+        Some(&answered(probe(Some(Elevation::Filtered), Some(INTEGRITY_MEDIUM)))),
     );
 
-    assert!(rows[0].detail.contains("not elevated"), "{}", rows[0].detail);
-    assert!(rows[0].detail.contains("administrator's agent"), "{}", rows[0].detail);
+    assert!(rows[1].detail.contains("not elevated"), "{}", rows[1].detail);
+    assert!(rows[1].detail.contains("administrator's agent"), "{}", rows[1].detail);
 }
 
 /// An account that is not an administrator is not told that an administrator's agent must be elevated.
 #[test]
 fn a_standard_account_is_not_told_an_administrators_agent_must_be_elevated() {
     let rows = session_rows(
-        &answer(probe(Some(Elevation::Standard), Some(INTEGRITY_MEDIUM))),
-        Some(&answered(unelevated())),
+        &answer(unelevated()),
+        Some(&answered(probe(Some(Elevation::Standard), Some(INTEGRITY_MEDIUM)))),
     );
 
-    assert!(!rows[0].pass);
-    assert!(rows[0].detail.contains("not elevated"), "{}", rows[0].detail);
-    assert!(!rows[0].detail.contains("administrator"), "{}", rows[0].detail);
+    assert!(!rows[1].pass);
+    assert!(rows[1].detail.contains("not elevated"), "{}", rows[1].detail);
+    assert!(!rows[1].detail.contains("administrator"), "{}", rows[1].detail);
 }
 
-/// Only Medium (`0x2000`) with Administrators not enabled passes `unelevated session on request`.
+/// A probe that asked for `always` and did not answer is named on its row with the cause, whichever way it did
+/// not: it failed, it timed out, it was not run.
 #[test]
-fn an_unelevated_probe_at_the_wrong_level_fails_its_row() {
-    for asked in [
-        probe(Some(Elevation::Full), Some(INTEGRITY_HIGH)),
-        probe(Some(Elevation::Filtered), Some(INTEGRITY_HIGH)),
-        probe(Some(Elevation::Standard), Some(INTEGRITY_HIGH)),
-        probe(Some(Elevation::Filtered), Some(0x1000)),
-        probe(Some(Elevation::Standard), Some(0x1000)),
-        probe(Some(Elevation::Filtered), None),
-        probe(Some(Elevation::Full), Some(INTEGRITY_MEDIUM)),
-        probe(None, Some(INTEGRITY_MEDIUM)),
-        probe(None, None),
-    ] {
-        let rows = session_rows(&answer(elevated()), Some(&answered(asked.clone())));
-
-        assert_eq!(names(&rows)[1], "unelevated session on request", "{asked:?}");
-        assert!(!rows[1].pass, "{asked:?}: {}", rows[1].detail);
-        assert!(rows[0].pass, "the first row is about the default probe alone");
-    }
-}
-
-#[test]
-fn an_unelevated_probe_at_medium_without_administrators_enabled_passes_for_either_kind_of_account() {
-    for asked in [
-        probe(Some(Elevation::Filtered), Some(INTEGRITY_MEDIUM)),
-        probe(Some(Elevation::Standard), Some(INTEGRITY_MEDIUM)),
-    ] {
-        let rows = session_rows(&answer(elevated()), Some(&answered(asked.clone())));
-
-        assert!(rows[1].pass, "{asked:?}: {}", rows[1].detail);
-    }
-}
-
-/// A probe that asked for an unelevated session and did not answer is named on its row with the cause,
-/// whichever way it did not: it failed, it timed out, it was not run.
-#[test]
-fn an_unelevated_probe_that_did_not_answer_fails_its_row_with_the_cause() {
+fn an_always_probe_that_did_not_answer_fails_its_row_with_the_cause() {
     for (outcome, cause, says) in [
         (failed("relay failed (code 254)"), "relay failed (code 254)", "failed"),
         (
@@ -265,19 +272,22 @@ fn an_unelevated_probe_that_did_not_answer_fails_its_row_with_the_cause() {
             "not run",
         ),
     ] {
-        let rows = session_rows(&answer(elevated()), Some(&outcome));
+        let rows = session_rows(&answer(unelevated()), Some(&outcome));
 
         assert_eq!(passes(&rows), [true, false], "{outcome:?}");
         assert!(rows[1].detail.contains(cause), "{}", rows[1].detail);
         assert!(rows[1].detail.contains(says), "{}", rows[1].detail);
+        assert!(rows[1].detail.contains("`always`"), "{}", rows[1].detail);
     }
 }
 
+/// A session probe that is at High is judged, and with no probe that asked for `always` the second row says so.
 #[test]
-fn no_unelevated_probe_fails_its_row_for_an_agent_at_high() {
+fn a_session_at_high_with_no_always_probe_fails_both_rows() {
     let rows = session_rows(&answer(elevated()), None);
 
-    assert_eq!(passes(&rows), [true, false]);
+    assert_eq!(names(&rows), ["session", "elevated session on request"]);
+    assert_eq!(passes(&rows), [false, false], "{:?}", details(&rows));
     assert!(rows[1].detail.contains("not run"), "{}", rows[1].detail);
 }
 
@@ -286,28 +296,30 @@ fn no_unelevated_probe_fails_its_row_for_an_agent_at_high() {
 /// One row, which passes and says the session is a standard account's.
 #[test]
 fn a_standard_account_below_high_has_one_passing_row() {
-    let default = probe(Some(Elevation::Standard), Some(INTEGRITY_MEDIUM));
+    let session = probe(Some(Elevation::Standard), Some(INTEGRITY_MEDIUM));
 
-    let rows = session_rows(&answer(default), None);
+    let rows = session_rows(&answer(session), None);
 
     assert_eq!(names(&rows), ["session privilege"]);
     assert!(rows[0].pass, "{}", rows[0].detail);
     assert!(rows[0].detail.contains("standard account"), "{}", rows[0].detail);
 }
 
-/// An administrator's agent below High is not elevated: a fault, not a standard account. The one row
-/// is the `elevated session` row, which fails.
+/// An administrator's agent below High gives its own token to a login that asks for no level, which is
+/// unelevated, and cannot give an elevated one: a fault, not a standard account. `elevated session on request`
+/// fails, naming it, and no probe asked for `always` (which a session below High refuses).
 #[test]
-fn an_administrators_agent_below_high_fails_the_elevated_row() {
-    for default in [
-        probe(Some(Elevation::Filtered), Some(INTEGRITY_MEDIUM)),
-        probe(None, Some(INTEGRITY_MEDIUM)),
-    ] {
-        let rows = session_rows(&answer(default.clone()), None);
+fn an_administrators_agent_below_high_passes_session_and_fails_the_elevated_row() {
+    let rows = session_rows(&answer(unelevated()), None);
 
-        assert_eq!(names(&rows), ["elevated session"], "{default:?}");
-        assert!(!rows[0].pass, "{default:?}: {}", rows[0].detail);
-    }
+    assert_eq!(names(&rows), ["session", "elevated session on request"]);
+    assert_eq!(passes(&rows), [true, false], "{:?}", details(&rows));
+    assert!(rows[1].detail.contains("not elevated"), "{}", rows[1].detail);
+    assert!(rows[1].detail.contains("administrator's agent"), "{}", rows[1].detail);
+
+    let rows = session_rows(&answer(probe(None, Some(INTEGRITY_MEDIUM))), None);
+    assert_eq!(names(&rows), ["session", "elevated session on request"]);
+    assert_eq!(passes(&rows), [false, false], "{:?}", details(&rows));
 }
 
 // the junction -----------------------------------------------------------------------------
@@ -423,10 +435,12 @@ fn the_probes_words_reach_the_junction_row() {
 
 // the whole report of the probes -----------------------------------------------------------
 
-fn probes(default: ProbeOutcome, unelevated: Option<ProbeOutcome>) -> Probes {
+/// What the probes found: the one that asked for the default level (`session`), and, for an agent at High, the one
+/// that asked for `always` (`elevated`).
+fn probes(session: ProbeOutcome, elevated: Option<ProbeOutcome>) -> Probes {
     Probes {
-        unelevated,
-        default,
+        session,
+        elevated,
         junction: read(SymlinkState::Ok, ""),
         leftover: None,
     }
@@ -439,8 +453,8 @@ fn rows_of(probes: &Probes) -> Vec<Check> {
 const ALL_ROWS: [&str; 7] = [
     "interactive session (via agent)",
     "DPAPI (via agent)",
-    "elevated session",
-    "unelevated session on request",
+    "session",
+    "elevated session on request",
     "junction (via agent)",
     "binary download (via agent)",
     "binary upload (via agent)",
@@ -450,10 +464,40 @@ const ALL_ROWS: [&str; 7] = [
 /// byte-transparency rows, all passing for a healthy elevated agent.
 #[test]
 fn a_healthy_administrators_agent_passes_every_row() {
-    let rows = rows_of(&probes(answered(elevated()), Some(answered(unelevated()))));
+    let rows = rows_of(&probes(answered(unelevated()), Some(answered(elevated()))));
 
     assert_eq!(names(&rows), ALL_ROWS);
     assert!(rows.iter().all(|row| row.pass), "{:?}", details(&rows));
+}
+
+/// What a login gets is what a login that asks for no level gets: the session id, DPAPI and the bytes of its
+/// relay are read from that probe, whatever the probe that asked for `always` found.
+#[test]
+fn the_rows_about_the_session_a_login_gets_come_from_the_probe_that_asks_for_the_default_level() {
+    let mut got = unelevated();
+    got.session_id = 7;
+    got.dpapi_ok = false;
+    got.upstream = UpstreamState::Fail;
+    let session = ProbeOutcome::Answered(Answer {
+        binary_ok: false,
+        ..answer(got)
+    });
+    let mut always = elevated();
+    always.session_id = 9;
+
+    let rows = parity_rows(&probes(session, Some(answered(always))), 1);
+
+    assert_eq!(names(&rows), ALL_ROWS);
+    assert!(rows[0].detail.contains("session_id=7"), "{}", rows[0].detail);
+    let failing: Vec<&str> = rows.iter().filter(|row| !row.pass).map(|row| row.name).collect();
+    assert_eq!(
+        failing,
+        [
+            "DPAPI (via agent)",
+            "binary download (via agent)",
+            "binary upload (via agent)"
+        ]
+    );
 }
 
 #[test]
@@ -487,35 +531,33 @@ fn outcomes(answer: ProbeResult) -> [(&'static str, ProbeOutcome); 4] {
     ]
 }
 
-/// Every outcome of the default probe against every outcome of the unelevated one has its rows.
+/// Every outcome of the probe that asks for the default level against every outcome of the one that asks for
+/// `always` has its rows.
 #[test]
 fn every_pair_of_outcomes_has_its_rows() {
-    for (default_name, default) in outcomes(elevated()) {
-        for (unelevated_name, unelevated) in outcomes(unelevated()) {
-            let unelevated_passes = matches!(unelevated, ProbeOutcome::Answered(_));
-            let rows = rows_of(&probes(default.clone(), Some(unelevated)));
-            let case = format!(
-                "default {default_name}, unelevated {unelevated_name}: {:?}",
-                details(&rows)
-            );
+    for (session_name, session) in outcomes(unelevated()) {
+        for (always_name, always) in outcomes(elevated()) {
+            let always_passes = matches!(always, ProbeOutcome::Answered(_));
+            let rows = rows_of(&probes(session.clone(), Some(always)));
+            let case = format!("session {session_name}, always {always_name}: {:?}", details(&rows));
 
-            if default_name == "answered" {
+            if session_name == "answered" {
                 assert_eq!(names(&rows), ALL_ROWS, "{case}");
                 let failing: Vec<&str> = rows.iter().filter(|row| !row.pass).map(|row| row.name).collect();
-                let expected: &[&str] = if unelevated_passes {
+                let expected: &[&str] = if always_passes {
                     &[]
                 } else {
-                    &["unelevated session on request"]
+                    &["elevated session on request"]
                 };
                 assert_eq!(failing, expected, "{case}");
             } else {
                 assert_eq!(
                     names(&rows),
-                    ["parity probe (via agent)", "unelevated session on request"],
+                    ["parity probe (via agent)", "elevated session on request"],
                     "{case}"
                 );
-                assert_eq!(passes(&rows), [false, unelevated_passes], "{case}");
-                let cause = match default_name {
+                assert_eq!(passes(&rows), [false, always_passes], "{case}");
+                let cause = match session_name {
                     "failed" => "relay failed",
                     "timed out" => "no output",
                     _ => "no agent",
@@ -527,7 +569,27 @@ fn every_pair_of_outcomes_has_its_rows() {
     }
 }
 
-/// Below High there is no unelevated probe: a default probe that did not answer is the one row.
+/// No row of any pair of outcomes names the verb that `doctor` replaced or the word that `SSH_BROKER_ELEVATION`
+/// replaced.
+#[test]
+fn no_row_names_the_old_verb_or_the_reserved_word() {
+    for (_, session) in outcomes(unelevated()) {
+        for (_, always) in outcomes(elevated()) {
+            for rows in [
+                rows_of(&probes(session.clone(), Some(always))),
+                rows_of(&probes(session.clone(), None)),
+            ] {
+                for row in rows {
+                    for old in ["verify", "internal-unelevated"] {
+                        assert!(!row.detail.contains(old), "{old}: {} {}", row.name, row.detail);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Below High there is no probe that asks for `always`: a session probe that did not answer is the one row.
 #[test]
 fn a_default_probe_that_did_not_answer_below_high_is_the_one_row() {
     let rows = rows_of(&probes(ProbeOutcome::TimedOut("no output within 30s".into()), None));
@@ -541,7 +603,7 @@ fn a_default_probe_that_did_not_answer_below_high_is_the_one_row() {
 /// another, and what the probes said, on the one row; a cause the row has already is not said twice.
 #[test]
 fn a_default_probe_that_did_not_answer_shows_the_junctions_cause_and_note() {
-    let mut p = probes(failed("relay failed"), Some(answered(unelevated())));
+    let mut p = probes(failed("relay failed"), Some(answered(elevated())));
     p.junction = unavailable("making a junction failed", "removing D:\\t failed: in use");
 
     let rows = rows_of(&p);
@@ -577,10 +639,10 @@ fn an_unread_junction_fails_its_row() {
 }
 
 /// The junction row is `Probes::junction`, which `run` settles from both probes: a refusal fails it,
-/// whatever the unelevated probe saw of its own.
+/// whatever the session probe saw of its own.
 #[test]
 fn the_junction_row_is_the_junction_found() {
-    let mut p = probes(answered(elevated()), Some(answered(unelevated())));
+    let mut p = probes(answered(unelevated()), Some(answered(elevated())));
     p.junction = read(SymlinkState::Blocked, "");
 
     let rows = rows_of(&p);
@@ -594,8 +656,8 @@ fn the_junction_row_is_the_junction_found() {
 fn a_junction_left_behind_is_named_on_its_own_row() {
     let leftover = r"C:\Temp\sb-junction-1 could not be removed: access denied";
 
-    for default in [answered(elevated()), failed("relay failed")] {
-        let mut p = probes(default, Some(answered(unelevated())));
+    for session in [answered(unelevated()), failed("relay failed")] {
+        let mut p = probes(session, Some(answered(elevated())));
         p.leftover = Some(leftover.to_string());
 
         let rows = rows_of(&p);
@@ -606,19 +668,19 @@ fn a_junction_left_behind_is_named_on_its_own_row() {
         assert!(row.detail.contains(r"C:\Temp\sb-junction-1"), "{}", row.detail);
         assert!(row.detail.contains("access denied"), "{}", row.detail);
     }
-    let junction = rows_of(&probes(answered(elevated()), Some(answered(unelevated()))));
+    let junction = rows_of(&probes(answered(unelevated()), Some(answered(elevated()))));
     assert!(!names(&junction).contains(&"junction directory"));
 }
 
 #[test]
 fn the_byte_rows_fail_as_they_did_before() {
-    let mut result = elevated();
+    let mut result = unelevated();
     result.upstream = UpstreamState::Fail;
-    let default = ProbeOutcome::Answered(Answer {
+    let session = ProbeOutcome::Answered(Answer {
         binary_ok: false,
         ..answer(result)
     });
-    let p = probes(default, Some(answered(unelevated())));
+    let p = probes(session, Some(answered(elevated())));
 
     let rows = rows_of(&p);
 
@@ -628,10 +690,10 @@ fn the_byte_rows_fail_as_they_did_before() {
 
 #[test]
 fn a_session_zero_network_logon_fails_the_session_row_and_names_the_console() {
-    let mut result = elevated();
+    let mut result = unelevated();
     result.session_id = 0;
     result.logon_type = Some(3);
-    let p = probes(answered(result), Some(answered(unelevated())));
+    let p = probes(answered(result), Some(answered(elevated())));
 
     let rows = parity_rows(&p, 7);
 
