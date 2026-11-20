@@ -83,7 +83,7 @@ use crate::offer::text;
 use crate::pipes::ExecChild;
 #[cfg(windows)]
 use crate::protocol::{
-    ConsentAnswer, ElevationPolicy, ExitCode, Frame, FrameKind, FrameReader, Handshake, Mode, Resize, SESSION_VARIABLE,
+    ConsentReply, ElevationPolicy, ExitCode, Frame, FrameKind, FrameReader, Handshake, Mode, Resize, SESSION_VARIABLE,
     Stream, read_one_frame, write_frame,
 };
 #[cfg(windows)]
@@ -1558,8 +1558,8 @@ impl FrameSink for LinkInputSink {
         self.link.resize(r);
         Ok(())
     }
-    fn on_consent_answer(&mut self, answer: ConsentAnswer) -> anyhow::Result<()> {
-        self.link.answer(answer);
+    fn on_consent_answer(&mut self, reply: ConsentReply) -> anyhow::Result<()> {
+        self.link.answer(reply);
         Ok(())
     }
 }
@@ -1842,7 +1842,7 @@ impl FrameSink for ExecInputSink {
 }
 
 /// How many chunks of a client's input (one per frame, at most 32 KiB each) a session holds that have not reached the
-/// process: a [`HandleWriter`]'s queue, and the keys a [`Link`] keeps while a question is open.
+/// process: a [`HandleWriter`]'s queue.
 #[cfg(windows)]
 const INPUT_QUEUE_CHUNKS: usize = 16;
 

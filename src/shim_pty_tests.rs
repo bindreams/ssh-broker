@@ -1428,14 +1428,19 @@ fn an_input_worker_that_was_never_started_is_not_stopped_or_joined_and_its_write
 // The consent question, from the main pump to the input worker -----
 
 use super::{ConsentSlot, send_answer};
-use crate::protocol::{ConsentAnswer, ConsentRequest, FrameKind, FrameReader, PROTOCOL_VERSION, Resize};
+use crate::protocol::{ConsentAnswer, ConsentReply, ConsentRequest, FrameKind, FrameReader, PROTOCOL_VERSION, Resize};
 
-fn a_question(command: &str) -> ConsentRequest {
+fn a_question(id: u32, command: &str) -> ConsentRequest {
     ConsentRequest {
         version: PROTOCOL_VERSION,
+        id,
         command: command.to_owned(),
         cwd: r"C:\Users\me".to_owned(),
     }
+}
+
+fn reply(id: u32, answer: ConsentAnswer) -> Option<ConsentReply> {
+    Some(ConsentReply { id, answer })
 }
 
 #[test]
@@ -1452,16 +1457,16 @@ fn only_a_started_worker_can_be_handed_a_question() {
 fn a_question_is_handed_over_once_and_a_second_before_it_is_taken_is_refused() {
     let slot = ConsentSlot::default();
     assert_eq!(slot.take(), None, "nothing is waiting");
-    slot.put(a_question("first")).unwrap();
-    let refused = slot.put(a_question("second")).unwrap_err();
+    slot.put(a_question(1, "first")).unwrap();
+    let refused = slot.put(a_question(2, "second")).unwrap_err();
     assert!(format!("{refused:#}").contains("already"), "{refused:#}");
     assert_eq!(
         slot.take(),
-        Some(a_question("first")),
+        Some(a_question(1, "first")),
         "the first one is still the one waiting"
     );
     assert_eq!(slot.take(), None, "taken once");
-    slot.put(a_question("third"))
+    slot.put(a_question(3, "third"))
         .expect("the slot is free again once it is taken");
 }
 
@@ -1471,25 +1476,25 @@ fn a_question_is_handed_over_once_and_a_second_before_it_is_taken_is_refused() {
 #[test]
 fn a_withdrawal_ends_the_question_being_asked_without_an_answer() {
     let slot = ConsentSlot::default();
-    slot.put(a_question("first")).unwrap();
-    assert_eq!(slot.take(), Some(a_question("first")));
+    slot.put(a_question(1, "first")).unwrap();
+    assert_eq!(slot.take(), Some(a_question(1, "first")));
     assert!(!slot.withdrawn(), "not withdrawn yet");
 
-    assert!(slot.withdraw(), "the worker is in the question: it is to be woken");
+    assert!(slot.withdraw(1), "the worker is in the question: it is to be woken");
     assert!(slot.withdrawn(), "the question's stop is true");
     assert_eq!(
-        slot.finish(ConsentAnswer::Allow),
+        slot.finish(1, ConsentAnswer::Allow),
         None,
         "no answer is sent for a withdrawn question"
     );
     assert!(!slot.withdrawn(), "the next question starts clean");
 
-    slot.put(a_question("second")).unwrap();
-    assert_eq!(slot.take(), Some(a_question("second")));
+    slot.put(a_question(2, "second")).unwrap();
+    assert_eq!(slot.take(), Some(a_question(2, "second")));
     assert_eq!(
-        slot.finish(ConsentAnswer::Refuse),
-        Some(ConsentAnswer::Refuse),
-        "a question that was not withdrawn is answered"
+        slot.finish(2, ConsentAnswer::Refuse),
+        reply(2, ConsentAnswer::Refuse),
+        "a question that was not withdrawn is answered, under its own number"
     );
 }
 
@@ -1498,20 +1503,20 @@ fn a_withdrawal_ends_the_question_being_asked_without_an_answer() {
 #[test]
 fn a_withdrawal_drops_a_question_not_yet_taken_and_with_none_open_is_ignored() {
     let slot = ConsentSlot::default();
-    assert!(!slot.withdraw(), "nothing is open: nobody to wake");
+    assert!(!slot.withdraw(1), "nothing is open: nobody to wake");
     assert!(!slot.withdrawn());
 
-    slot.put(a_question("never asked")).unwrap();
-    assert!(!slot.withdraw(), "the worker is not in it: nobody to wake");
+    slot.put(a_question(1, "never asked")).unwrap();
+    assert!(!slot.withdraw(1), "the worker is not in it: nobody to wake");
     assert_eq!(slot.take(), None, "it is never asked");
 
-    slot.put(a_question("after")).unwrap();
-    assert_eq!(slot.take(), Some(a_question("after")));
+    slot.put(a_question(2, "after")).unwrap();
+    assert_eq!(slot.take(), Some(a_question(2, "after")));
     assert!(
         !slot.withdrawn(),
         "the earlier withdrawals withdrew nothing of this one"
     );
-    assert_eq!(slot.finish(ConsentAnswer::Allow), Some(ConsentAnswer::Allow));
+    assert_eq!(slot.finish(2, ConsentAnswer::Allow), reply(2, ConsentAnswer::Allow));
 }
 
 /// The agent may ask the next question while the worker is still leaving the withdrawn one: the new one is not
@@ -1519,14 +1524,34 @@ fn a_withdrawal_drops_a_question_not_yet_taken_and_with_none_open_is_ignored() {
 #[test]
 fn a_question_put_while_a_withdrawn_one_is_ending_is_not_withdrawn_with_it() {
     let slot = ConsentSlot::default();
-    slot.put(a_question("first")).unwrap();
+    slot.put(a_question(1, "first")).unwrap();
     slot.take().unwrap();
-    assert!(slot.withdraw());
-    slot.put(a_question("second")).expect("the agent asks again");
-    assert_eq!(slot.finish(ConsentAnswer::Refuse), None, "the first was withdrawn");
-    assert_eq!(slot.take(), Some(a_question("second")));
+    assert!(slot.withdraw(1));
+    slot.put(a_question(2, "second")).expect("the agent asks again");
+    assert_eq!(slot.finish(1, ConsentAnswer::Refuse), None, "the first was withdrawn");
+    assert_eq!(slot.take(), Some(a_question(2, "second")));
     assert!(!slot.withdrawn());
-    assert_eq!(slot.finish(ConsentAnswer::Allow), Some(ConsentAnswer::Allow));
+    assert_eq!(slot.finish(2, ConsentAnswer::Allow), reply(2, ConsentAnswer::Allow));
+}
+
+/// A withdrawal ends the question it names and no other: one for a question that ended earlier, and so reaches the
+/// shim after the next was asked, leaves the open one (the person is still being asked it) and the one waiting.
+#[test]
+fn a_withdrawal_of_another_question_leaves_the_open_one_open() {
+    let slot = ConsentSlot::default();
+    slot.put(a_question(2, "being asked")).unwrap();
+    slot.take().unwrap();
+    assert!(!slot.withdraw(1), "question 1 ended before: nobody to wake");
+    assert!(!slot.withdrawn(), "the question being asked is not withdrawn");
+    assert_eq!(
+        slot.finish(2, ConsentAnswer::Allow),
+        reply(2, ConsentAnswer::Allow),
+        "it is answered"
+    );
+
+    slot.put(a_question(4, "waiting")).unwrap();
+    assert!(!slot.withdraw(3), "question 3 is not the waiting one");
+    assert_eq!(slot.take(), Some(a_question(4, "waiting")), "it is still asked");
 }
 
 /// The size goes first: the question's own resize records were taken from the console's queue, and the agent gives
@@ -1535,7 +1560,7 @@ fn a_question_put_while_a_withdrawn_one_is_ending_is_not_withdrawn_with_it() {
 fn the_size_is_sent_before_the_answer_and_both_are_whole_frames() {
     for answer in [ConsentAnswer::Allow, ConsentAnswer::Refuse] {
         let mut wire = Vec::new();
-        send_answer(&mut wire, answer, (100, 40)).unwrap();
+        send_answer(&mut wire, ConsentReply { id: 7, answer }, (100, 40)).unwrap();
         let mut frames = FrameReader::new();
         frames.push(&wire);
         let first = frames.next_frame().unwrap().expect("the size");
@@ -1543,10 +1568,23 @@ fn the_size_is_sent_before_the_answer_and_both_are_whole_frames() {
         assert_eq!(Resize::decode(&first.payload).unwrap(), Resize { cols: 100, rows: 40 });
         let second = frames.next_frame().unwrap().expect("the answer");
         assert_eq!(second.kind, FrameKind::ConsentAnswer);
-        assert_eq!(ConsentAnswer::decode(&second.payload).unwrap(), answer);
+        assert_eq!(
+            ConsentReply::decode(&second.payload).unwrap(),
+            ConsentReply { id: 7, answer },
+            "the answer carries the question's number"
+        );
         assert_eq!(frames.buffered_len(), 0);
         assert!(frames.next_frame().unwrap().is_none());
     }
+}
+
+/// The record the shim injects to wake its own read is never a focus report: one left in the queue after a question
+/// is read later by the relay, which would send the program `ESC[O` if the program asked for focus reports.
+#[test]
+fn the_shims_own_wake_record_is_no_focus_report_and_the_terminals_are() {
+    assert_eq!(super::reported_focus(super::WAKE_MARK), None);
+    assert_eq!(super::reported_focus(1), Some(true), "the terminal's focus-in");
+    assert_eq!(super::reported_focus(0), Some(false), "the terminal's focus-out");
 }
 
 // The root process of a console keeps running through Ctrl+C -----------------------------

@@ -10,10 +10,8 @@
 //! of a standard account; the unelevated session is a consent step, not a boundary.
 
 use std::path::Path;
-use std::sync::Arc;
 
-use super::elevation::{HostedSession, RunOutcome, Verdict, consent, decide, run_hosted, watch_question};
-use super::link::ClientGone;
+use super::elevation::{HostedSession, RequestWatch, RunOutcome, Verdict, consent, decide, run_hosted};
 use super::{Control, Opened, child_cwd, home_dir, logout, read_opening};
 use crate::afunix::{Conn, ConnRx, ConnTx};
 use crate::elevate::{REFUSED_EXIT_CODE, UNKNOWN_END_EXIT_CODE};
@@ -148,31 +146,48 @@ fn run_elevated(
         let cause = format!("{} is not an existing directory", request.cwd);
         return Some((text::elevation_cannot_start(&cause), REFUSED_EXIT_CODE));
     }
+    // One watch of the request's client, from before the question to the end of the command: a client that hangs up
+    // while the question is asked ends it, and one that hangs up while the command runs ends its tree.
+    let (watch, guard) = RequestWatch::start(&hosted.link, tx);
+    let answer = run_watched(&watch, hosted, tx, request, id, ask, cwd.as_deref());
+    // Finishing the watch calls its action too: the client's having hung up was read before.
+    if let Some(guard) = guard {
+        guard.finish();
+    }
+    answer
+}
+
+/// [`run_elevated`] under `watch`.
+///
+/// A client that hangs up before the answer is not served: nothing is written to it, and the command is not started.
+/// One that hangs up in the instant after the answer, once `watch` was read for the last time, may see its command
+/// started and ended at once: the person allowed it.
+fn run_watched(
+    watch: &RequestWatch,
+    hosted: &HostedSession,
+    tx: &mut ConnTx,
+    request: &ElevationRequest,
+    id: &SessionId,
+    ask: bool,
+    cwd: Option<&Path>,
+) -> Option<(String, i32)> {
     let asked = if ask {
-        // The request's client is watched from before the question: one that hangs up while it is asked ends it, and
-        // one that hangs up before the command starts is never served.
-        let gone = Arc::new(ClientGone::default());
-        let watch = watch_question(&hosted.link, tx, &gone);
-        let answer = consent(&hosted.link, request, cwd.as_deref(), &gone);
-        // Read before the watch is finished: finishing it calls its action too.
-        let hung_up = gone.is_gone();
-        if let Some(watch) = watch {
-            watch.finish();
-        }
-        if hung_up {
-            return None;
-        }
-        match answer {
+        match consent(&hosted.link, request, cwd, watch.gone()) {
             Ok(hold) => Some(hold),
-            Err(sentence) => return Some((sentence, REFUSED_EXIT_CODE)),
+            // The refusal is for a client that is still there.
+            Err(sentence) => return (!watch.is_gone()).then_some((sentence, REFUSED_EXIT_CODE)),
         }
     } else {
         None
     };
+    // Read again immediately before the command is started. A `None` lets go of the question's hold.
+    if watch.is_gone() {
+        return None;
+    }
     // A command run by default needs none of the screen: the session's is back, repainted, before it starts. One run
     // with `--terminal` takes it from the question.
     let asked = asked.filter(|_| request.terminal);
-    match run_hosted(&hosted.link, tx, request, cwd.as_deref(), &hosted.starts, id, asked) {
+    match run_hosted(watch, tx, request, cwd, &hosted.starts, id, asked) {
         RunOutcome::Exited(code) => Some((String::new(), code)),
         RunOutcome::NotStarted(cause) => Some((text::elevation_cannot_start(&format!("{cause:#}")), REFUSED_EXIT_CODE)),
         RunOutcome::Unserved => None,

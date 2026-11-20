@@ -457,7 +457,7 @@ fn pump_until_peer_gone_keeps_watching_after_a_sink_failure() {
 /// pump from watching the peer.
 #[test]
 fn after_a_sink_failure_the_consent_frames_still_reach_the_sink_and_the_pump_sees_the_peer_go() {
-    use crate::protocol::ConsentAnswer;
+    use crate::protocol::{ConsentAnswer, ConsentReply, ConsentWithdrawal};
     #[derive(Default)]
     struct FailsData {
         data: usize,
@@ -474,11 +474,11 @@ fn after_a_sink_failure_the_consent_frames_still_reach_the_sink_and_the_pump_see
             self.resizes += 1;
             Ok(())
         }
-        fn on_consent_answer(&mut self, answer: ConsentAnswer) -> anyhow::Result<()> {
-            self.answers.push(answer);
+        fn on_consent_answer(&mut self, reply: ConsentReply) -> anyhow::Result<()> {
+            self.answers.push(reply.answer);
             Ok(())
         }
-        fn on_consent_withdrawn(&mut self) -> anyhow::Result<()> {
+        fn on_consent_withdrawn(&mut self, _withdrawal: ConsentWithdrawal) -> anyhow::Result<()> {
             self.withdrawals += 1;
             Ok(())
         }
@@ -488,21 +488,11 @@ fn after_a_sink_failure_the_consent_frames_still_reach_the_sink_and_the_pump_see
     write_data(&mut wire, Stream::Pty, b"breaks the sink").unwrap();
     write_data(&mut wire, Stream::Pty, b"dropped").unwrap();
     write_frame(&mut wire, FrameKind::Resize, &Resize { cols: 80, rows: 24 }.encode()).unwrap();
-    write_frame(
-        &mut wire,
-        FrameKind::ConsentAnswer,
-        &ConsentAnswer::Allow.encode().unwrap(),
-    )
-    .unwrap();
+    write_frame(&mut wire, FrameKind::ConsentAnswer, &a_reply(ConsentAnswer::Allow)).unwrap();
     // A frame the sink refuses (the default `on_consent`) is no end of the watch either.
     write_frame(&mut wire, FrameKind::Consent, &a_consent_request().encode().unwrap()).unwrap();
-    write_frame(
-        &mut wire,
-        FrameKind::ConsentAnswer,
-        &ConsentAnswer::Refuse.encode().unwrap(),
-    )
-    .unwrap();
-    write_frame(&mut wire, FrameKind::ConsentWithdrawn, &[]).unwrap();
+    write_frame(&mut wire, FrameKind::ConsentAnswer, &a_reply(ConsentAnswer::Refuse)).unwrap();
+    write_frame(&mut wire, FrameKind::ConsentWithdrawn, &a_withdrawal()).unwrap();
 
     let saw_eof = std::rc::Rc::new(std::cell::Cell::new(false));
     let mut spy = EofSpy {
@@ -708,15 +698,26 @@ fn a_sink_with_the_default_on_serving_refuses_the_answer() {
 fn a_consent_request() -> crate::protocol::ConsentRequest {
     crate::protocol::ConsentRequest {
         version: crate::protocol::PROTOCOL_VERSION,
+        id: 4,
         command: "cmd /c whoami".to_owned(),
         cwd: r"C:\Users\me".to_owned(),
     }
 }
 
+/// The payload of an answer frame: `answer` to the question of [`a_consent_request`].
+fn a_reply(answer: crate::protocol::ConsentAnswer) -> Vec<u8> {
+    crate::protocol::ConsentReply { id: 4, answer }.encode().unwrap()
+}
+
+/// The payload of the withdrawal of the question of [`a_consent_request`].
+fn a_withdrawal() -> Vec<u8> {
+    crate::protocol::ConsentWithdrawal { id: 4 }.encode().unwrap()
+}
+
 /// The question and its answer are dispatched to the sink, in order with the data around them.
 #[test]
 fn pump_decode_dispatches_consent_and_answer_and_a_sink_without_them_errors() {
-    use crate::protocol::{ConsentAnswer, ConsentRequest};
+    use crate::protocol::{ConsentAnswer, ConsentReply, ConsentRequest, ConsentWithdrawal};
     #[derive(Default)]
     struct Asked {
         seen: Vec<String>,
@@ -727,43 +728,38 @@ fn pump_decode_dispatches_consent_and_answer_and_a_sink_without_them_errors() {
             Ok(())
         }
         fn on_consent(&mut self, request: ConsentRequest) -> anyhow::Result<()> {
-            self.seen.push(format!("consent {}", request.command));
+            self.seen.push(format!("consent {} {}", request.id, request.command));
             Ok(())
         }
-        fn on_consent_answer(&mut self, answer: ConsentAnswer) -> anyhow::Result<()> {
-            self.seen.push(format!("answer {answer:?}"));
+        fn on_consent_answer(&mut self, reply: ConsentReply) -> anyhow::Result<()> {
+            self.seen.push(format!("answer {} {:?}", reply.id, reply.answer));
             Ok(())
         }
-        fn on_consent_withdrawn(&mut self) -> anyhow::Result<()> {
-            self.seen.push("withdrawn".to_owned());
+        fn on_consent_withdrawn(&mut self, withdrawal: ConsentWithdrawal) -> anyhow::Result<()> {
+            self.seen.push(format!("withdrawn {}", withdrawal.id));
             Ok(())
         }
     }
     let mut wire = Vec::new();
     write_data(&mut wire, Stream::Pty, b"x").unwrap();
     write_frame(&mut wire, FrameKind::Consent, &a_consent_request().encode().unwrap()).unwrap();
-    write_frame(&mut wire, FrameKind::ConsentWithdrawn, &[]).unwrap();
-    write_frame(
-        &mut wire,
-        FrameKind::ConsentAnswer,
-        &ConsentAnswer::Refuse.encode().unwrap(),
-    )
-    .unwrap();
+    write_frame(&mut wire, FrameKind::ConsentWithdrawn, &a_withdrawal()).unwrap();
+    write_frame(&mut wire, FrameKind::ConsentAnswer, &a_reply(ConsentAnswer::Refuse)).unwrap();
     write_frame(&mut wire, FrameKind::Exit, &ExitCode(0).encode()).unwrap();
     let mut sink = Asked::default();
     let outcome = pump_decode(&mut wire.as_slice(), &mut FrameReader::new(), &mut sink).unwrap();
     assert_eq!(outcome, Outcome::Exited(0));
     assert_eq!(
         sink.seen,
-        ["data", "consent cmd /c whoami", "withdrawn", "answer Refuse"]
+        ["data", "consent 4 cmd /c whoami", "withdrawn 4", "answer 4 Refuse"]
     );
 
     // A sink that does not take them (an exec session's, the logout reply's) refuses each: a sink failure, which says
     // nothing about the peer.
     for frame in [
         (FrameKind::Consent, a_consent_request().encode().unwrap()),
-        (FrameKind::ConsentAnswer, ConsentAnswer::Allow.encode().unwrap()),
-        (FrameKind::ConsentWithdrawn, Vec::new()),
+        (FrameKind::ConsentAnswer, a_reply(ConsentAnswer::Allow)),
+        (FrameKind::ConsentWithdrawn, a_withdrawal()),
     ] {
         let wire = framed(&[(frame.0, &frame.1)]);
         let err = pump_decode(&mut wire.as_slice(), &mut FrameReader::new(), &mut TestSink::default())
@@ -779,10 +775,12 @@ fn a_consent_frame_that_is_not_one_is_a_protocol_error() {
     for (kind, payload) in [
         (FrameKind::Consent, &b"x"[..]),
         (FrameKind::Consent, &[][..]),
-        (FrameKind::ConsentAnswer, &[2][..]),
+        (FrameKind::ConsentAnswer, &[4, 2][..]),
+        (FrameKind::ConsentAnswer, &[4][..]),
         (FrameKind::ConsentAnswer, &[][..]),
-        (FrameKind::ConsentAnswer, &[0, 0][..]),
-        (FrameKind::ConsentWithdrawn, &[0][..]),
+        (FrameKind::ConsentAnswer, &[4, 0, 0][..]),
+        (FrameKind::ConsentWithdrawn, &[][..]),
+        (FrameKind::ConsentWithdrawn, &[4, 0][..]),
     ] {
         let wire = framed(&[(kind, payload)]);
         let err =

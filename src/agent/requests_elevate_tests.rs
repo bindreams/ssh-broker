@@ -10,8 +10,8 @@ use crate::conpty::PtySession;
 use crate::offer::text;
 use crate::pipes::ExecChild;
 use crate::protocol::{
-    ConsentAnswer, ConsentRequest, ElevationPolicy, ElevationRequest, FrameKind, FrameReader, Handshake, Launch,
-    PROTOCOL_VERSION, SESSION_VARIABLE, SessionId, Stream, read_one_frame, write_frame,
+    ConsentAnswer, ConsentReply, ConsentRequest, ElevationPolicy, ElevationRequest, FrameKind, FrameReader, Handshake,
+    Launch, PROTOCOL_VERSION, SESSION_VARIABLE, SessionId, Stream, read_one_frame, write_frame,
 };
 use crate::relay::{Outcome, TestSink, pump_decode};
 use crate::socket_loc::StepDown;
@@ -95,6 +95,8 @@ struct Client {
     seen: String,
     /// How many questions the session has asked it so far.
     questions: usize,
+    /// The number of the last question it asked: what an answer carries.
+    asked: u32,
     exit: Option<i32>,
 }
 
@@ -110,7 +112,12 @@ impl Client {
             });
             match frame.kind {
                 FrameKind::Data => self.seen.push_str(&String::from_utf8_lossy(&frame.payload[1..])),
-                FrameKind::Consent => self.questions += 1,
+                FrameKind::Consent => {
+                    self.questions += 1;
+                    self.asked = ConsentRequest::decode(&frame.payload)
+                        .expect("a question that decodes")
+                        .id;
+                }
                 FrameKind::Exit => {
                     self.exit = Some(crate::protocol::ExitCode::decode(&frame.payload).unwrap().0);
                     panic!(
@@ -132,7 +139,9 @@ impl Client {
                 FrameKind::Data => self.seen.push_str(&String::from_utf8_lossy(&frame.payload[1..])),
                 FrameKind::Consent => {
                     self.questions += 1;
-                    return ConsentRequest::decode(&frame.payload).expect("a question that decodes");
+                    let question = ConsentRequest::decode(&frame.payload).expect("a question that decodes");
+                    self.asked = question.id;
+                    return question;
                 }
                 FrameKind::Exit => panic!("the session exited before it asked; it showed {:?}", self.seen),
                 _ => {}
@@ -140,9 +149,10 @@ impl Client {
         }
     }
 
-    /// Answer as the shim does.
+    /// Answer the last question as the shim does.
     fn answer(&mut self, answer: ConsentAnswer) {
-        write_frame(&mut self.tx, FrameKind::ConsentAnswer, &answer.encode().unwrap()).unwrap();
+        let reply = ConsentReply { id: self.asked, answer };
+        write_frame(&mut self.tx, FrameKind::ConsentAnswer, &reply.encode().unwrap()).unwrap();
     }
 
     /// Type `text` as the shim sends keys.
@@ -206,6 +216,7 @@ fn host_running(tag: &str, mode: Mode, policy: ElevationPolicy, command: &str) -
         frames: FrameReader::new(),
         seen: String::new(),
         questions: 0,
+        asked: 0,
         exit: None,
     };
     // The first frame is the answer: the session's process has started, and its id is the one it was given.
@@ -629,10 +640,11 @@ fn a_client_that_hangs_up_while_the_question_is_asked_ends_it_and_nothing_runs()
     session.leave();
 }
 
-/// The keys that reach the agent while the question is asked are the shim's own, not the session's: they are dropped.
-/// What is typed once the question is over reaches the session.
+/// The shim relays nothing while it asks, so a key that reaches the agent before the answer was relayed before the
+/// question: it is the session's (the tail of a pasted block, say). The agent keeps it and gives it to the session
+/// once the question is over, ahead of what is typed after.
 #[test]
-fn input_typed_while_asking_is_discarded_by_the_agent() {
+fn input_typed_while_asking_is_kept_by_the_agent_for_the_session() {
     let _serial = serial();
     let mut session = host("typed", Mode::Pty, ElevationPolicy::Prompt);
     let asking = ask(
@@ -641,17 +653,18 @@ fn input_typed_while_asking_is_discarded_by_the_agent() {
         send(request(&session.id, &cmd("/c echo SHOULD-NOT-RUN"), r"C:\")),
     );
     session.client.read_question();
-    // Frames of one connection are handled in order: this is dropped before the answer is read.
-    session.client.type_text("xlost\r\n");
+    // Frames of one connection are handled in order: this is kept before the answer is read.
+    session.client.type_text("xearly\r\n");
     session.client.answer(ConsentAnswer::Refuse);
     assert_eq!(asking.join().unwrap().outcome, Outcome::Exited(126));
 
-    session.client.type_text("xkept\r\n");
-    session.client.read_until("xkept");
+    session.client.type_text("xlater\r\n");
+    session.client.read_until("xlater");
+    let seen = &session.client.seen;
     assert!(
-        !session.client.seen.contains("xlost"),
-        "the session saw {:?}",
-        session.client.seen
+        seen.find("xearly")
+            .is_some_and(|early| early < seen.find("xlater").unwrap()),
+        "the session saw {seen:?}"
     );
     session.leave();
 }
@@ -1012,6 +1025,36 @@ fn the_request_connection_closing_ends_the_command() {
             request(&session.id, &cmd("/d /c echo went-on"), ""),
         );
         assert_eq!(again.outcome, Outcome::Exited(0), "{what}: {}", again.stderr);
+        session.leave();
+    }
+}
+
+/// The watch of the request, begun before the question, goes on for the command the person allowed: a client that
+/// hangs up while that command runs ends it, with a terminal of its own and without.
+#[test]
+fn a_client_that_hangs_up_while_an_allowed_command_runs_ends_it() {
+    for (what, terminal) in [("a default-mode command", false), ("a command with a terminal", true)] {
+        let _serial = serial();
+        let mut session = host("allowedhangup", Mode::Pty, ElevationPolicy::Prompt);
+        let id = session.id.to_string();
+        let long = cmd(&format!("/d /c \"echo running-{id}& ping -n 600 127.0.0.1 >nul\""));
+        let ask = ElevationRequest {
+            terminal,
+            ..request(&session.id, &long, "")
+        };
+        let mut pending = open(&session.control, "allowedhangup", ask);
+        session.client.read_question();
+        session.client.answer(ConsentAnswer::Allow);
+        if terminal {
+            session.client.read_until(&format!("running-{id}"));
+        } else {
+            pending.read_until(&format!("running-{id}"));
+        }
+
+        // The handler returns only once the command, which would run for ten minutes, has ended.
+        let _ = pending.hang_up();
+        assert_eq!(elevated_starts().len(), 1, "{what}");
+        session_speaks(&mut session, "the-session-again");
         session.leave();
     }
 }

@@ -1,7 +1,7 @@
 //! Every line the offer shows, in one place. Lines written to the pseudoterminal end in CRLF.
 
 use crate::protocol::ElevationPolicy;
-use crate::shell::config::escape_text;
+use crate::text_escape::escape_text;
 
 /// The cost of the plain shell, after Ctrl+C, a failed sign-in or a non-local account.
 pub const COST_LINE: &str =
@@ -234,27 +234,25 @@ pub fn display(text: &str) -> String {
     shown
 }
 
-/// A character that is no control character and shows nothing or changes how the text around it is shown: the
-/// soft hyphen, the Arabic letter mark, the combining grapheme joiner, the Hangul fillers, the Mongolian free
-/// variation selectors and vowel separator (U+180B to U+180F), the zero-width and directional marks and
-/// embeddings and isolates (U+200B to U+200F, U+202A to U+202E, U+2066 to U+2069), the word joiner and invisible
-/// operators (U+2060 to U+2064), the deprecated format controls (U+206A to U+206F), the line and paragraph
-/// separators, the variation selectors (U+FE00 to U+FE0F, U+E0100 to U+E01EF), the byte order mark, the interlinear
-/// annotation marks, the shorthand format controls (U+1BCA0 to U+1BCA3), and the tag characters.
+/// A character that is no control character and shows nothing or changes how the text around it is shown: every code
+/// point of the Unicode property Default_Ignorable_Code_Point (the soft hyphen, the Arabic letter mark, the combining
+/// grapheme joiner, the Hangul fillers, the Khmer inherent vowels, the Mongolian free variation selectors and vowel
+/// separator, the zero-width and directional marks, embeddings and isolates, the word joiner and invisible operators,
+/// the deprecated format controls, the variation selectors, the byte order mark, the shorthand and musical format
+/// controls, and the tag characters, with the unassigned code points the property covers), and also the line and
+/// paragraph separators and the interlinear annotation marks, which the property does not list.
 fn is_hidden_format(c: char) -> bool {
     matches!(u32::from(c),
-        0x00AD | 0x034F | 0x061C | 0x115F | 0x1160 | 0x180B..=0x180F | 0x3164 | 0xFFA0
+        0x00AD | 0x034F | 0x061C | 0x115F | 0x1160 | 0x17B4 | 0x17B5 | 0x180B..=0x180F | 0x3164 | 0xFFA0
         | 0x1BCA0..=0x1BCA3
+        | 0x1D173..=0x1D17A
         | 0xFE00..=0xFE0F
-        | 0xE0100..=0xE01EF
         | 0x200B..=0x200F
         | 0x2028..=0x202E
-        | 0x2060..=0x2064
-        | 0x2066..=0x206F
+        | 0x2060..=0x206F
         | 0xFEFF
-        | 0xFFF9..=0xFFFB
-        | 0xE0001
-        | 0xE0020..=0xE007F)
+        | 0xFFF0..=0xFFFB
+        | 0xE0000..=0xE0FFF)
 }
 
 /// A second `elevate` while the session's first is asked or running.

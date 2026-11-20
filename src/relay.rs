@@ -4,7 +4,9 @@
 //! AF_UNIX connection (`afunix::ConnRx`/`ConnTx`) and the in-memory test transport
 //! below, with identical logic.
 
-use crate::protocol::{ConsentAnswer, ConsentRequest, ExitCode, FrameKind, FrameReader, Resize, Stream, write_frame};
+use crate::protocol::{
+    ConsentReply, ConsentRequest, ConsentWithdrawal, ExitCode, FrameKind, FrameReader, Resize, Stream, write_frame,
+};
 use std::io::{Read, Write};
 
 /// Result of a decode pump. `Exited(n)` = a clean `EXIT(n)` frame was received;
@@ -80,14 +82,14 @@ impl<S: FrameSink> FrameSink for Draining<'_, S> {
         }
         Ok(())
     }
-    fn on_consent_answer(&mut self, answer: ConsentAnswer) -> anyhow::Result<()> {
-        if let Err(e) = self.0.on_consent_answer(answer) {
+    fn on_consent_answer(&mut self, reply: ConsentReply) -> anyhow::Result<()> {
+        if let Err(e) = self.0.on_consent_answer(reply) {
             tracing::debug!("the failed sink refused a consent answer; dropped: {e:#}");
         }
         Ok(())
     }
-    fn on_consent_withdrawn(&mut self) -> anyhow::Result<()> {
-        if let Err(e) = self.0.on_consent_withdrawn() {
+    fn on_consent_withdrawn(&mut self, withdrawal: ConsentWithdrawal) -> anyhow::Result<()> {
+        if let Err(e) = self.0.on_consent_withdrawn(withdrawal) {
             tracing::debug!("the failed sink refused a consent withdrawal; dropped: {e:#}");
         }
         Ok(())
@@ -160,13 +162,14 @@ pub trait FrameSink {
     }
     /// The shim's answer ([`FrameKind::ConsentAnswer`]). The agent's sink of a session with a terminal takes it;
     /// every other refuses.
-    fn on_consent_answer(&mut self, answer: ConsentAnswer) -> anyhow::Result<()> {
-        let _ = answer;
+    fn on_consent_answer(&mut self, reply: ConsentReply) -> anyhow::Result<()> {
+        let _ = reply;
         anyhow::bail!("a consent answer where none is expected")
     }
-    /// The agent no longer asks ([`FrameKind::ConsentWithdrawn`]). The shim's sink of a session with a terminal takes
-    /// it; every other refuses.
-    fn on_consent_withdrawn(&mut self) -> anyhow::Result<()> {
+    /// The agent no longer asks a question ([`FrameKind::ConsentWithdrawn`]). The shim's sink of a session with a
+    /// terminal takes it; every other refuses.
+    fn on_consent_withdrawn(&mut self, withdrawal: ConsentWithdrawal) -> anyhow::Result<()> {
+        let _ = withdrawal;
         anyhow::bail!("a consent withdrawal where none is expected")
     }
 }
@@ -226,17 +229,12 @@ pub fn pump_decode<R: Read>(r: &mut R, fr: &mut FrameReader, sink: &mut impl Fra
                     sink.on_consent(request).map_err(PumpError::Sink)?;
                 }
                 FrameKind::ConsentAnswer => {
-                    let answer = ConsentAnswer::decode(&frame.payload).map_err(PumpError::Protocol)?;
-                    sink.on_consent_answer(answer).map_err(PumpError::Sink)?;
+                    let reply = ConsentReply::decode(&frame.payload).map_err(PumpError::Protocol)?;
+                    sink.on_consent_answer(reply).map_err(PumpError::Sink)?;
                 }
                 FrameKind::ConsentWithdrawn => {
-                    if !frame.payload.is_empty() {
-                        return Err(PumpError::Protocol(anyhow::anyhow!(
-                            "a consent withdrawal with {} byte(s) of payload",
-                            frame.payload.len()
-                        )));
-                    }
-                    sink.on_consent_withdrawn().map_err(PumpError::Sink)?;
+                    let withdrawal = ConsentWithdrawal::decode(&frame.payload).map_err(PumpError::Protocol)?;
+                    sink.on_consent_withdrawn(withdrawal).map_err(PumpError::Sink)?;
                 }
                 FrameKind::Request => {
                     return Err(PumpError::Protocol(anyhow::anyhow!(

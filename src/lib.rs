@@ -72,6 +72,7 @@ pub mod socket_watch;
 pub mod starting_agent;
 #[cfg(test)]
 mod test_support;
+pub mod text_escape;
 #[cfg(windows)]
 pub mod userdir;
 pub mod vtinput;

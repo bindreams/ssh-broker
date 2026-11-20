@@ -21,7 +21,8 @@ use crate::console_modes::ConsoleModes;
 use crate::console_prompt::ask_consent;
 use crate::offer::text;
 use crate::protocol::{
-    ConsentAnswer, ConsentRequest, ElevationPolicy, FrameKind, FrameReader, Handshake, Launch, Stream, write_frame,
+    ConsentAnswer, ConsentReply, ConsentRequest, ConsentWithdrawal, ElevationPolicy, FrameKind, FrameReader, Handshake,
+    Launch, Stream, write_frame,
 };
 use crate::relay::{FrameSink, write_data};
 use crate::shell::{self, Session, StartError};
@@ -40,9 +41,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::System::Console::{
-    CONSOLE_SCREEN_BUFFER_INFO, GetConsoleScreenBufferInfo, GetStdHandle, INPUT_RECORD, ReadConsoleInputW,
-    STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, WriteConsoleInputW,
+    CONSOLE_SCREEN_BUFFER_INFO, FOCUS_EVENT_RECORD, GetConsoleScreenBufferInfo, GetStdHandle, INPUT_RECORD,
+    INPUT_RECORD_0, ReadConsoleInputW, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, WriteConsoleInputW,
 };
+use windows::core::BOOL;
 
 // INPUT_RECORD.EventType values (processthreadsapi/consoleapi). windows-rs 0.62 does not
 // export them as usable typed consts, so name them with their documented `u16` values.
@@ -50,6 +52,9 @@ const EVT_KEY: u16 = 0x0001;
 const EVT_MOUSE: u16 = 0x0002;
 const EVT_WINDOW_BUFFER_SIZE: u16 = 0x0004;
 const EVT_FOCUS: u16 = 0x0010;
+/// The `bSetFocus` of the focus record the shim injects to wake its own read ([`wake_console_input`]). The console
+/// writes 0 and 1 in the focus records it makes of the terminal's reports, so this is none of the person's.
+const WAKE_MARK: i32 = 2;
 
 // ── run() wiring + fail-open ───────────────────────────────────────────────────────
 
@@ -816,7 +821,8 @@ struct Questions {
 enum Asking {
     #[default]
     No,
-    Yes,
+    /// The question numbered so ([`ConsentRequest::id`]).
+    Yes(u32),
     /// The agent withdrew it: the worker leaves it without an answer.
     Withdrawn,
 }
@@ -842,20 +848,22 @@ impl ConsentSlot {
     fn take(&self) -> Option<ConsentRequest> {
         let mut state = self.state();
         let request = state.waiting.take();
-        if request.is_some() {
-            state.asking = Asking::Yes;
+        if let Some(request) = &request {
+            state.asking = Asking::Yes(request.id);
         }
         request
     }
 
-    /// The agent withdraws its question: the newest one, the one that waits if one does, else the one being asked.
-    /// With none open it is ignored. `true` when the worker is in the question, which the caller must then wake.
-    fn withdraw(&self) -> bool {
+    /// The agent withdraws the question numbered `id`: the one that waits if it is that one, else the one being asked
+    /// if it is. With that one not open, a withdrawal is ignored: it is for one that ended. `true` when the worker is
+    /// in the question, which the caller must then wake.
+    fn withdraw(&self, id: u32) -> bool {
         let mut state = self.state();
-        if state.waiting.take().is_some() {
+        if state.waiting.as_ref().is_some_and(|request| request.id == id) {
+            state.waiting = None;
             return false;
         }
-        if state.asking == Asking::Yes {
+        if state.asking == Asking::Yes(id) {
             state.asking = Asking::Withdrawn;
             return true;
         }
@@ -867,11 +875,11 @@ impl ConsentSlot {
         self.state().asking == Asking::Withdrawn
     }
 
-    /// The question being asked has ended with `answer`. That is the answer to send, unless the agent withdrew the
-    /// question: it asks nothing any more and is sent none.
-    fn finish(&self, answer: ConsentAnswer) -> Option<ConsentAnswer> {
+    /// The question numbered `id` being asked has ended with `answer`. That is the reply to send, unless the agent
+    /// withdrew the question: it asks nothing any more and is sent none.
+    fn finish(&self, id: u32, answer: ConsentAnswer) -> Option<ConsentReply> {
         let was = std::mem::take(&mut self.state().asking);
-        (was != Asking::Withdrawn).then_some(answer)
+        (was != Asking::Withdrawn).then_some(ConsentReply { id, answer })
     }
 }
 
@@ -915,8 +923,8 @@ impl FrameSink for StdoutSink {
     /// The agent asks no longer. A question that is being asked ends (as a stop) and the worker sends no answer; the
     /// worker, parked in the question's read, is woken to see it. A question not yet taken is dropped, and with none
     /// open nothing happens.
-    fn on_consent_withdrawn(&mut self) -> anyhow::Result<()> {
-        if self.consent.withdraw() {
+    fn on_consent_withdrawn(&mut self, withdrawal: ConsentWithdrawal) -> anyhow::Result<()> {
+        if self.consent.withdraw(withdrawal.id) {
             wake_console_input(self.stdin_raw);
         }
         Ok(())
@@ -997,9 +1005,9 @@ unsafe fn input_loop(
         }
         // A question wakes the read, whether this thread was parked in it or busy: `on_consent` always injects a wake
         // record. What this read returned (the wake record, and whatever was typed before the question reached here)
-        // is dropped: the question throws away what was typed ahead, and the agent drops what reaches it while it
-        // asks, so none of it was going to be anyone's. The mouse's state is dropped too, as the question took its
-        // records.
+        // is dropped: the question throws away what was typed ahead and has not been relayed. (What the agent
+        // already has of the session's keys it keeps for the session.) The mouse's state is dropped too, as the
+        // question took its records.
         // The agent may ask again while a question ends (its wake record can be taken by the question that is
         // ending), so every question waiting is asked before the next read.
         let mut asked = false;
@@ -1062,10 +1070,12 @@ unsafe fn input_loop(
                 // Forward focus in/out as `CSI I`/`CSI O`, but ONLY when the shell enabled
                 // ?1004 — else focus-naive programs would see stray `ESC[I`/`ESC[O`. A focus
                 // record arriving while the gate is closed falls through to the `_` arm. The
-                // teardown wake record (also a FOCUS) never reaches here: the worker returns
-                // on the post-read `stopping` re-check above, before this loop.
+                // shim's own wake records (also FOCUS, see `reported_focus`) are never forwarded, including
+                // one that a question left in the queue.
                 EVT_FOCUS if gate.focus.load(Ordering::Relaxed) => {
-                    let focused = unsafe { rec.Event.FocusEvent }.bSetFocus.as_bool();
+                    let Some(focused) = reported_focus(unsafe { rec.Event.FocusEvent }.bSetFocus.0) else {
+                        continue;
+                    };
                     let seq: &[u8] = if focused { b"\x1b[I" } else { b"\x1b[O" };
                     if write_data(tx, Stream::Pty, seq).is_err() {
                         return;
@@ -1082,7 +1092,8 @@ unsafe fn input_loop(
 ///
 /// A console that could not be asked (flushed or written to) gives the refusal: the answer is `Refuse` for anything
 /// but the allowing answer, and the agent runs nothing for it. The agent holds the session's output while it waits,
-/// and drops what reaches it, so the question and the keys that answer it are the console's alone. `stopping` ends
+/// and this worker relays no key meanwhile, so the question and the keys that answer it are the console's alone.
+/// `stopping` ends
 /// the question as a refusal. So does the agent's withdrawal of it ([`ConsentSlot::withdraw`]), but then no answer
 /// is sent: the agent asks nothing any more, and the worker goes back to relaying keys.
 fn ask_person(
@@ -1101,8 +1112,8 @@ fn ask_person(
         tracing::warn!("the consent question could not be put on the console, so it is refused: {e}");
         ConsentAnswer::Refuse
     });
-    match consent.finish(answer) {
-        Some(answer) => send_answer(tx, answer, console_size(stdout)).is_ok(),
+    match consent.finish(request.id, answer) {
+        Some(reply) => send_answer(tx, reply, console_size(stdout)).is_ok(),
         None => true,
     }
 }
@@ -1110,22 +1121,35 @@ fn ask_person(
 /// Send the console's size, and then the answer. The question's own resize records were taken from the console's
 /// queue, so the size the agent has may be stale; it is given before the answer, so that the command an `Allow`
 /// starts is started at the size the person has, and the session is repainted at it.
-fn send_answer(tx: &mut impl std::io::Write, answer: ConsentAnswer, (cols, rows): (u16, u16)) -> anyhow::Result<()> {
+fn send_answer(tx: &mut impl std::io::Write, reply: ConsentReply, (cols, rows): (u16, u16)) -> anyhow::Result<()> {
     write_frame(tx, FrameKind::Resize, &size_to_resize(cols, rows).encode())?;
-    write_frame(tx, FrameKind::ConsentAnswer, &answer.encode()?)
+    write_frame(tx, FrameKind::ConsentAnswer, &reply.encode()?)
 }
 
-/// Wake a parked `ReadConsoleInputW` by injecting one benign FOCUS record. The worker, having
-/// observed `stopping`, returns without forwarding it. More reliable for console reads than
-/// `CancelSynchronousIo` (which may not cancel a parked console wait).
+/// What a focus record of the person's terminal says: `Some(focused)`. The record [`wake_console_input`] injects is
+/// the shim's own, carries [`WAKE_MARK`], and says nothing to the relay: `None`.
+fn reported_focus(set_focus: i32) -> Option<bool> {
+    (set_focus != WAKE_MARK).then_some(set_focus != 0)
+}
+
+/// Wake a parked `ReadConsoleInputW` by injecting one FOCUS record, which the console queues as it is written
+/// (`bSetFocus` and all; measured), marked with [`WAKE_MARK`] so that the relay never forwards it as a focus report,
+/// wherever it is read: when it is read for the stop that woke the worker, or left in the queue after a question and
+/// read later. More reliable for console reads than `CancelSynchronousIo` (which may not cancel a parked console
+/// wait).
 fn wake_console_input(stdin_raw: isize) {
-    unsafe {
-        let stdin = HANDLE(stdin_raw as *mut core::ffi::c_void);
-        let mut rec: INPUT_RECORD = std::mem::zeroed();
-        rec.EventType = EVT_FOCUS;
-        let mut written = 0u32;
-        let _ = WriteConsoleInputW(stdin, std::slice::from_ref(&rec), &mut written);
-    }
+    let rec = INPUT_RECORD {
+        EventType: EVT_FOCUS,
+        Event: INPUT_RECORD_0 {
+            FocusEvent: FOCUS_EVENT_RECORD {
+                bSetFocus: BOOL(WAKE_MARK),
+            },
+        },
+    };
+    let stdin = HANDLE(stdin_raw as *mut core::ffi::c_void);
+    let mut written = 0u32;
+    // SAFETY: the handle is the console's input, live for the call; `rec` and `written` are valid for it.
+    let _ = unsafe { WriteConsoleInputW(stdin, std::slice::from_ref(&rec), &mut written) };
 }
 
 /// Current visible window size (cols, rows) from the console, or an 80×24 default if the

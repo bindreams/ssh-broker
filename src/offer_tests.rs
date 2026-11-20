@@ -513,20 +513,24 @@ fn display_tells_an_escape_from_the_text_that_looks_like_it() {
     }
 }
 
-/// The default-ignorable characters that show nothing are shown as escapes: the variation selectors, the combining
-/// grapheme joiner, the Mongolian free variation selectors and vowel separator, the Hangul fillers and the shorthand
-/// format controls.
+/// The default-ignorable characters that show nothing are shown as escapes: every code point of the Unicode property
+/// Default_Ignorable_Code_Point that the other tests do not name, the unassigned ones included (they are ignorable by
+/// the property, so a terminal shows them as nothing too).
 #[test]
 fn display_shows_the_other_default_ignorable_characters() {
     let ranges = [
         0x034f..=0x034f,
         0x115f..=0x1160,
+        0x17b4..=0x17b5,
         0x180b..=0x180f,
+        0x2065..=0x2065,
         0x3164..=0x3164,
         0xfe00..=0xfe0f,
         0xffa0..=0xffa0,
+        0xfff0..=0xfff8,
         0x1bca0..=0x1bca3,
-        0xe0100..=0xe01ef,
+        0x1d173..=0x1d17a,
+        0xe0000..=0xe0fff,
     ];
     for range in ranges {
         for code in range {

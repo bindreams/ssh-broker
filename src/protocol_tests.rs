@@ -566,6 +566,7 @@ fn a_version_6_handshake_is_refused_with_the_version_message() {
 fn a_consent_request() -> ConsentRequest {
     ConsentRequest {
         version: PROTOCOL_VERSION,
+        id: 3,
         command: r#""C:\Windows\System32\cmd.exe" /c whoami"#.to_owned(),
         cwd: r"C:\Users\me".to_owned(),
     }
@@ -576,14 +577,40 @@ fn consent_frames_round_trip_and_unknown_content_is_a_protocol_error() {
     let request = a_consent_request();
     assert_eq!(ConsentRequest::decode(&request.encode().unwrap()).unwrap(), request);
     for answer in [ConsentAnswer::Allow, ConsentAnswer::Refuse] {
-        assert_eq!(ConsentAnswer::decode(&answer.encode().unwrap()).unwrap(), answer);
+        let reply = ConsentReply { id: 300, answer };
+        assert_eq!(ConsentReply::decode(&reply.encode().unwrap()).unwrap(), reply);
     }
-    // The two answers are the first two variants, and nothing else is one.
-    assert_eq!(ConsentAnswer::Allow.encode().unwrap(), [0]);
-    assert_eq!(ConsentAnswer::Refuse.encode().unwrap(), [1]);
-    assert!(ConsentAnswer::decode(&[2]).is_err(), "a variant that is not one");
-    assert!(ConsentAnswer::decode(&[]).is_err(), "no answer at all");
-    assert!(ConsentAnswer::decode(&[0, 0]).is_err(), "bytes after the answer");
+    // The reply is the question's number, then the answer: the first two variants, and nothing else is one.
+    assert_eq!(
+        ConsentReply {
+            id: 5,
+            answer: ConsentAnswer::Allow
+        }
+        .encode()
+        .unwrap(),
+        [5, 0]
+    );
+    assert_eq!(
+        ConsentReply {
+            id: 5,
+            answer: ConsentAnswer::Refuse
+        }
+        .encode()
+        .unwrap(),
+        [5, 1]
+    );
+    assert!(ConsentReply::decode(&[5, 2]).is_err(), "a variant that is not one");
+    assert!(ConsentReply::decode(&[5]).is_err(), "no answer at all");
+    assert!(ConsentReply::decode(&[]).is_err(), "no number at all");
+    assert!(ConsentReply::decode(&[5, 0, 0]).is_err(), "bytes after the answer");
+    let withdrawal = ConsentWithdrawal { id: 300 };
+    assert_eq!(
+        ConsentWithdrawal::decode(&withdrawal.encode().unwrap()).unwrap(),
+        withdrawal
+    );
+    assert_eq!(ConsentWithdrawal { id: 5 }.encode().unwrap(), [5]);
+    assert!(ConsentWithdrawal::decode(&[]).is_err(), "no number at all");
+    assert!(ConsentWithdrawal::decode(&[5, 0]).is_err(), "bytes after the number");
     // The request: cut short, or with bytes after it, is an error too.
     let mut bytes = request.encode().unwrap();
     assert!(ConsentRequest::decode(&bytes[..bytes.len() - 2]).is_err());
