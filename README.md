@@ -317,22 +317,70 @@ The lines the step writes inside its task say `ssh-broker install` where they me
 
 ## Install
 
-Releases carry `ssh-broker-<version>-x86_64-pc-windows-msvc.zip` (`ssh-broker.exe` and the license) and a `.sha256` file, with a build attestation on the zip. Verify before installing:
+You need Windows with OpenSSH's sshd ([Requirements](#requirements)) and an administrator PowerShell (right-click PowerShell in the Start menu, "Run as administrator"). The exe needs no Visual C++ redistributable. To check the download before you run it, stop after the first line: [Check the download](#check-the-download).
 
-```sh
-gh attestation verify ssh-broker-<version>-x86_64-pc-windows-msvc.zip -R bindreams/ssh-broker \
-    --signer-workflow bindreams/ssh-broker/.github/workflows/release-asset.yaml \
-    --source-ref refs/heads/main
-sha256sum -c ssh-broker-<version>-x86_64-pc-windows-msvc.zip.sha256
+```powershell
+Invoke-WebRequest -Uri https://github.com/bindreams/ssh-broker/releases/latest/download/ssh-broker-x86_64-pc-windows-msvc.exe -OutFile $env:TEMP\ssh-broker.exe
+& $env:TEMP\ssh-broker.exe install
 ```
 
-Then extract it and, from an elevated prompt, run `ssh-broker.exe install`. It installs the broker for every user: each user who logs on gets their own agent. `ssh-broker.exe doctor` checks the result for the user who runs it. Sessions start the shell that [Shell configuration](#shell-configuration) names: `cmd.exe` when nothing names another. `install` puts the install directory on the system `PATH`. An agent has the `PATH` of the environment it started in, and its sessions inherit it. The agent that the password prompt starts for an account that has none, after `install`, gives sessions that find `ssh-broker` by name, `ssh-broker elevate` included. An agent that was running keeps the `PATH` it started with until it starts again, as does one started by hand from a shell that was opened before `install`. The release executable has the C runtime linked in, so it needs no Visual C++ redistributable.
+If the first line prints an error, run it again before the second. A first install prints this, with the version installed in place of `<version>`:
 
-`install`'s last step makes sshd accept `SSH_BROKER_ELEVATION`. It runs as a Task Scheduler task, `ssh-broker-install-sshd`, as SYSTEM, so that it finishes, and sshd is running at its end, even if the connection that runs `install` ends while sshd restarts. What `install` says of the step, and the report, are in [the sshd step of install](#the-sshd-step-of-install). An `install` ended before it removes the task leaves it registered with no trigger; the next `install` replaces and removes it. An `install` started while an earlier one's step still runs waits for that step first.
+```
+Installing ssh-broker v<version> for every user of this PC...
+Adding C:\ProgramData\ssh-broker to the system PATH...
+Starting an agent in each logged-on session...
+Setting up sshd to accept SSH_BROKER_ELEVATION; sshd may be restarted, and a connection over SSH may drop now. What the step does is written to C:\ProgramData\ssh-broker\install-sshd.log...
+ssh-broker v<version> has been installed!
+```
+
+A step with nothing to do prints no line: the `PATH` line is absent when the directory is already on the `PATH`, and the agents line when no session has a user. When the last line is there, the install worked, and the version it names is the one installed: an older one than [the latest release](https://github.com/bindreams/ssh-broker/releases/latest) means the download failed and an earlier copy ran. A line on standard error above the last line is a warning: [What the lines of `install` mean](#what-the-lines-of-install-mean).
+
+From the next SSH login, a user who is logged on at the PC gets a shell that an agent in their own session hosts: `install` started an agent in each logged-on session, and the logon task starts one for each user who logs on later. A user with no session at the PC is asked for the password at an interactive login ([Background sessions](#background-sessions)). Sessions start the shell that [Shell configuration](#shell-configuration) names: `cmd.exe` when nothing names another.
+
+### Check it
+
+```powershell
+& C:\ProgramData\ssh-broker\ssh-broker.exe doctor
+```
+
+Run it by path: the window you installed from keeps the `PATH` it started with, and so does every program started from it. `doctor` checks the result for the user who runs it: an account that is not logged on at the PC (an administrator account used only to open this window, say) has no agent, and its `socket reachable` row fails. Its first line names the version and the exe, `ssh-broker v<version> (C:\ProgramData\ssh-broker\ssh-broker.exe)`, and judges nothing; a `[PASS]` or `[FAIL]` row per check follows ([`doctor`](#doctor) lists them), and the exit code is 0 when every row passes.
+
+### Check the download
+
+It needs only the downloaded file. Compare the exe's hash with the line that names `ssh-broker-x86_64-pc-windows-msvc.exe` in `SHA256SUMS`, a file on the release's page ([the latest release](https://github.com/bindreams/ssh-broker/releases/latest)). PowerShell prints the hash in capitals; the two must be equal ignoring case.
+
+```powershell
+(Get-FileHash $env:TEMP\ssh-broker.exe).Hash
+```
+
+With the GitHub CLI (`gh`), the build attestation says the exe was built from this repository's `main` by its release workflow:
+
+```powershell
+gh attestation verify $env:TEMP\ssh-broker.exe -R bindreams/ssh-broker --signer-workflow bindreams/ssh-broker/.github/workflows/release-asset.yaml --source-ref refs/heads/main
+```
+
+The exe and `SHA256SUMS` must come from the same release: the download link always gives the latest, so take `SHA256SUMS` from the page of the release that is the latest when you download. If the hashes differ, a newer release may have come out in between: download the exe again and compare it with the page as it is then.
+
+You may delete `$env:TEMP\ssh-broker.exe` once `install` has ended: it copied the exe to `C:\ProgramData\ssh-broker\ssh-broker.exe`, and that copy is what sshd and the logon task run.
+
+### What `install` changes
+
+- The install directory `C:\ProgramData\ssh-broker`: the copy of the exe, `install-sshd.log`, the logon task's definition `agent-task.xml`, the lock file `apply.lock`, and, when sshd had a `DefaultShell` before, the system `config.yaml` (created once, from that shell: [Shell configuration](#shell-configuration)).
+- sshd's `DefaultShell` under `HKLM\SOFTWARE\OpenSSH`, set to that copy, with `DefaultShellEscapeArguments` (1) and `DefaultShellCommandOption` (`-c`); a `DefaultShellArguments` is removed when `config.yaml` is a file ([Shell configuration](#shell-configuration) says what to do when the shell needs it).
+- The logon task `ssh-broker-agent`, which starts each user's agent at logon.
+- The system `PATH`: the install directory is added to it.
+- sshd's configuration (`AcceptEnv SSH_BROKER_ELEVATION`) and, when sshd has not read it, sshd's restart, through the task `ssh-broker-install-sshd`; [Limits](#limits-worth-knowing-before-you-install-it) says how.
+
+**The `PATH`.** An agent has the `PATH` of the environment it started in, and its sessions inherit it. The agent that the password prompt starts for an account that has none, after `install`, gives sessions that find `ssh-broker` by name, `ssh-broker elevate` included. An agent that was running keeps the `PATH` it started with until it starts again, as does one started by hand from a shell that was opened before `install`.
+
+**The sshd step.** It runs in its task, as SYSTEM and outside your session, so that it finishes, and sshd is running at its end, even if the connection that runs `install` ends while sshd restarts. What `install` says of the step, and the report, are in [the sshd step of install](#the-sshd-step-of-install). An `install` ended before it removes the task leaves it registered with no trigger; the next `install` replaces and removes it. An `install` started while an earlier one's step still runs waits for that step first.
 
 ## Upgrading
 
-Run `install` again from an elevated prompt with the newer build. A running agent holds the installed exe open, so when `install` replaces the exe with a different build it first disables the logon task, so no logon starts an agent from the old exe meanwhile, stops every agent the task started and waits for each to exit, then enables the task again and starts one in each logged-on session (also if a later step fails). Their open SSH sessions end; users reconnect. An agent started by hand with `ssh-broker agent` is not stopped, and the shim of an SSH session that is still open holds the exe too (it is sshd's `DefaultShell`): if either still holds the exe, `install` fails with a message saying so; find them with `tasklist /fi "imagename eq ssh-broker.exe"`, end them or close the sessions, and run `install` again. If an agent does not exit after being stopped, `install` fails naming its process id and starts no agent in that session; run `install` again once the process has exited. A killed `install` can leave the logon task disabled, which `doctor` reports on its `agent task` row; a later `install` enables it again once it is past its argument check, the check of the install directory, the check of the lock file and the wait described next (one that fails earlier leaves the task as it was). An `install` of the build that is already installed leaves agents alone. Only one `install` runs at a time on a machine, for its whole run (a lock on `apply.lock` in the install directory, a file only SYSTEM and Administrators can open, so that no standard user can hold it; `install` refuses a lock file with any other access and tells you to remove it); an `install` that starts while another is running waits for it. `auto-login on` and `off` take the same lock and wait for it in the same way.
+Run `install` again from an elevated prompt with the newer build: the two lines under [Install](#install) download the latest. The last line `install` prints names the version it installed. A download that failed leaves the copy an earlier download left, and the second line installs that build again; one that was cut off leaves part of a file, which Windows does not start. In both cases run the first line again.
+
+A running agent holds the installed exe open, so when `install` replaces the exe with a different build it first disables the logon task, so no logon starts an agent from the old exe meanwhile, stops every agent the task started and waits for each to exit, then enables the task again and starts one in each logged-on session (also if a later step fails). Their open SSH sessions end; users reconnect. An agent started by hand with `ssh-broker agent` is not stopped, and the shim of an SSH session that is still open holds the exe too (it is sshd's `DefaultShell`): if either still holds the exe, `install` fails with a message saying so; find them with `tasklist /fi "imagename eq ssh-broker.exe"`, end them or close the sessions, and run `install` again. If an agent does not exit after being stopped, `install` fails naming its process id and starts no agent in that session; run `install` again once the process has exited. A killed `install` can leave the logon task disabled, which `doctor` reports on its `agent task` row; a later `install` enables it again once it is past its argument check, the check of the install directory, the check of the lock file and the wait described next (one that fails earlier leaves the task as it was). An `install` of the build that is already installed leaves agents alone. Only one `install` runs at a time on a machine, for its whole run (a lock on `apply.lock` in the install directory, a file only SYSTEM and Administrators can open, so that no standard user can hold it; `install` refuses a lock file with any other access and tells you to remove it); an `install` that starts while another is running waits for it. `auto-login on` and `off` take the same lock and wait for it in the same way.
 
 Run `install` from an elevated prompt at the PC. A brokered SSH login can run it only if it asked for `SSH_BROKER_ELEVATION=always`, and then only to repair the installed build: `install` of a different build stops the agent that hosts the session, ends it part-way, and must be run again at the PC.
 
