@@ -15,7 +15,7 @@
 use configure::ConfigRead;
 
 use super::report::Check;
-use crate::socket_loc::Integrity;
+use crate::socket_loc::Elevation;
 
 pub mod configure;
 #[cfg(windows)]
@@ -235,35 +235,36 @@ pub enum SshdReading {
 }
 
 /// The `doctor` row for sshd's configuration. `sshd -T` reads sshd's host keys, which only administrators and
-/// SYSTEM can read, so the row is judged only at [`Integrity::High`] and `reading` is asked only there; below
-/// it the row is informational and passes. At High it passes when the variable is in force ([`in_force`]) and
-/// sshd has read what was changed; it fails when sshd started before a file of its configuration changed (or
-/// at that moment), when the variable is not in force, and, with the cause, when `reading` fails or when the
-/// integrity level `integrity` could not be read. A file whose time is ahead of the clock, or an `Include` of
+/// SYSTEM can read, so the row is judged only by an elevated administrator ([`Elevation::Full`]) and `reading`
+/// is asked only there; for any other process, below High or at High without `Administrators` enabled, the row
+/// is informational and passes. An elevated administrator's row passes when the variable is in force
+/// ([`in_force`]) and sshd has read what was changed; it fails when sshd started before a file of its
+/// configuration changed (or at that moment), when the variable is not in force, and, with the cause, when
+/// `reading` fails or when the `elevation` could not be read. A file whose time is ahead of the clock, or an `Include` of
 /// another location, cannot be judged: the row passes and says so. A service that runs with arguments is not
 /// checked: the row passes and says so.
 pub fn accepts_row(
-    integrity: anyhow::Result<Integrity>,
+    elevation: anyhow::Result<Elevation>,
     reading: impl FnOnce() -> anyhow::Result<SshdReading>,
 ) -> Check {
-    let integrity = match integrity {
-        Ok(integrity) => integrity,
+    let elevation = match elevation {
+        Ok(elevation) => elevation,
         Err(e) => {
             return Check::new(
                 ROW_NAME,
                 false,
                 format!(
-                    "cannot read this process's integrity level, so whether sshd accepts {VARIABLE} is not \
+                    "cannot read this process's elevation, so whether sshd accepts {VARIABLE} is not \
                      known: {e:#}"
                 ),
             );
         }
     };
-    if integrity != Integrity::High {
+    if elevation != Elevation::Full {
         return Check::new(
             ROW_NAME,
             true,
-            "not checked here: sshd's configuration is read by an elevated `doctor`",
+            "not checked here: sshd's configuration is read by an administrator's elevated `doctor`",
         );
     }
     let (listing, read) = match reading() {

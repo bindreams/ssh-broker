@@ -530,10 +530,10 @@ mod imp {
         rows.push(path_env::row(&registry::read_system_path(), super::BASE_DIR));
 
         // Local: sshd accepts SSH_BROKER_ELEVATION from clients, and has read the files that say so. `sshd -T`
-        // reads sshd's host keys, so the row is judged only by an elevated `doctor` (see
+        // reads sshd's host keys, so the row is judged only by an administrator's elevated `doctor` (see
         // `sshd_config::accepts_row`).
         rows.push(sshd_config::accepts_row(
-            crate::account::integrity(),
+            crate::account::elevation(),
             sshd_config::machine::sshd_reading_this_machine,
         ));
 
