@@ -113,13 +113,15 @@ pub fn socket_reachable_row(location: &anyhow::Result<SocketLocation>, user: &Si
     }
 }
 
-/// What `doctor` shows an administrator's unelevated process in place of the rows about the agent
-/// (the explanation is `offer::text::ELEVATED_AGENT_LOOKS_ELSEWHERE`). Fails, because nothing was proven.
+/// What `doctor` shows an administrator's unelevated process in place of the rows about the agent: that nothing
+/// was checked, and the ways to check it (`offer::text::ELEVATED_AGENT_LOOKS_ELSEWHERE` and
+/// `CHECK_BELOW_HIGH_CLAUSE`). Fails, because nothing was proven.
 pub fn filtered_row() -> Check {
+    use crate::offer::text::{CHECK_BELOW_HIGH_CLAUSE, ELEVATED_AGENT_LOOKS_ELSEWHERE};
     Check::new(
         "socket reachable",
         false,
-        crate::offer::text::ELEVATED_AGENT_LOOKS_ELSEWHERE,
+        format!("not checked below High: {ELEVATED_AGENT_LOOKS_ELSEWHERE}{CHECK_BELOW_HIGH_CLAUSE}"),
     )
 }
 

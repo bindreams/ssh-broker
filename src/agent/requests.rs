@@ -5,8 +5,9 @@
 //! agent for those: it takes requests only (`logout`, `elevate`), and no session ever starts on it.
 //!
 //! Input here comes from a lower integrity level: frames are bounded, a malformed first frame is answered as a
-//! failed request, nothing read is used as a path but the working directory of an `elevate`, which is checked to be
-//! an existing directory. A client that connects and stays silent holds a handler thread, as it can on `agent.sock`
+//! failed request, and two things of it are used as paths, both of an `elevate`: its command's program, which
+//! `ElevationRequest::check` requires to be absolute, and its working directory, which [`run_elevated`] checks and
+//! `child_cwd` resolves. A client that connects and stays silent holds a handler thread, as it can on `agent.sock`
 //! of a standard account; the unelevated session is a consent step, not a boundary.
 
 use std::path::Path;
@@ -140,7 +141,6 @@ fn run_elevated(
     id: &SessionId,
     ask: bool,
 ) -> Option<(String, i32)> {
-    // The working directory is the one path the agent acts on: it is the command's folder, which must be one.
     let cwd = child_cwd(&request.cwd, home_dir());
     if !request.cwd.is_empty() && !Path::new(&request.cwd).is_dir() {
         let cause = format!("{} is not an existing directory", request.cwd);

@@ -6,8 +6,8 @@ negotiable.
 
 ## Architecture
 
-One binary, four entry points plus the hidden `apply-sshd`, `doctor-probe` and `console-fallback` verbs, selected by argv
-([`src/route.rs`](src/route.rs)). The shim is
+One binary, the verbs in the table below, selected by argv ([`src/route.rs`](src/route.rs)). `apply-sshd`,
+`doctor-probe` and `console-fallback` are run by the product itself and not typed. The shim is
 the *default* action because `DefaultShell` is a bare path and cannot carry a subcommand: a
 known verb in first position selects a subcommand, anything else is the shim.
 
@@ -16,7 +16,10 @@ known verb in first position selects a subcommand, anything else is the shim.
 | *(none)* or `-c "cmd"` | `shim`, `shim_pty` | the SSH session, as sshd's `DefaultShell` |
 | `agent` | `agent` | a user's interactive session, one per logged-on user, started by a logon task for any member of `BUILTIN\Users` |
 | `apply` | `provision` | wherever an admin runs it; needs elevation |
-| `doctor` | `provision` | on the host itself, as the account whose agent it asks: an administrator runs it elevated, and an unelevated one finds no agent and says why |
+| `auto-login on\|off [<account>]` | `autologin` | wherever an elevated administrator runs it (`on` needs a terminal to ask for the password): stores the account's password with Task Scheduler and registers, or deletes, the boot task that starts its background session |
+| `logout` | `logout`, `request`, `agent::logout` | a process of the account at any level: asks `agent.sock`, and below High `request.sock` where no agent is on the first, to end the account's background session |
+| `elevate [--terminal] <command>` | `elevate`, `request`, `agent::{requests,elevation,link}` | a shell that an agent hosts: runs the command in place at High, and below High asks the agent on `request.sock`, which runs it with its own token once the session's `SSH_BROKER_ELEVATION` allows it |
+| `doctor` | `provision` | on the host itself, as the account whose agent it asks: an administrator runs it elevated, and an unelevated one shows the local rows and the ways to check (an elevated prompt, an SSH login that asked for `always`, `ssh-broker elevate ssh-broker doctor` in an SSH session) |
 | `apply-sshd` | `provision`, `provision::sshd_task` | the hidden verb of the task `ssh-broker-apply-sshd`, as SYSTEM: `apply`'s sshd step (the drop-in, the `Include` and the restart of sshd), whose every line it writes to `apply-sshd.log` in the install directory; `apply` registers the task, starts it, waits for its instances and prints the report, so that the step finishes even if the `apply` that started it is ended |
 | `doctor-probe` | `provision` | the child the **agent** spawns in its interactive session, driven through the relay by `doctor` |
 | `console-fallback [--login] <handle>` | `shim`, `shim_pty`, `handoff` | the fallback shell of a terminal session through the agent: reads a notice and a line from the pipe handle the agent gave it alone (`PROC_THREAD_ATTRIBUTE_HANDLE_LIST`) until the agent closes its end, prints the notice on its pseudoconsole (which clears anything written ahead of it), starts the line there, exits with its code; it keeps through Ctrl+C for the shell, and when it cannot read the pipe it starts the built-in `cmd.exe` for a login (`--login`) and exits 255 for a command |
@@ -26,7 +29,7 @@ pumping), `afunix` + `acl` (the socket and its security boundary), `socket_loc` 
 user's socket lives, derived from the profile of the token), `agent_lock` (one agent per session, one
 serving agent per user), `filelog` (the per-user log folder), `conpty` (the pseudoconsole
 host), `pipes` (the redirected-pipe EXEC child), `vtinput` (Win32 input records → VT),
-`winutil` (Windows RAII guards, job containment, cosca→Win32 error conversion, the process token and its checked information).
+`winutil` (Windows RAII guards, job containment, cosca→Win32 error conversion, the process token and its checked information). The rest are in the table of [CLAUDE.md](CLAUDE.md#where-things-live).
 
 The functionality lives in the library rather than the binary so it is reachable from tests on
 every host platform; `main.rs` is a thin dispatcher.
@@ -73,6 +76,18 @@ part of "exactly private"; a folder without it is refused with the words of ever
 is never labelled afterwards. `tests/user_isolation_windows.rs` pins
 what a process below High is refused, and `tests/redirection_guard_windows.rs` pins the premise of
 `doctor`'s junction row (see the next section).
+
+An agent at High also binds `request.sock` in the plain folder, where neither the folder nor the file carries the
+label, so a process of the account below High can connect to it: it is how an unelevated session reaches the agent.
+It takes requests only (`logout`, and the `ElevationRequest` of `ssh-broker elevate`); a session handshake there is
+answered with a sentence (`agent::requests::REQUESTS_ONLY`) and no session starts. **Everything on `request.sock` is
+input from a lower level**; see `agent::requests`. The session id in a request says which session asks and is no credential. The agent
+keeps its `SocketDir` of the plain folder for its whole run, as it keeps its own, so the by-path contract below holds
+for `request.sock` too; a plain folder it cannot use costs it the request socket and nothing else. The socket is
+served by the sessions' accept machinery and counted in the same tally, with no read bound of its own: a client that
+connects and sends nothing holds a handler thread and can delay the agent's end by up to the drain's bound
+(`agent::connections::DRAIN_BOUND`, 30 seconds). That is the contract the README states, not a defect to guard
+against: the unelevated session is a consent step, not a boundary.
 
 `userdir::open_socket_dir` (and `ensure_socket_dir` over it) reaches the folder by handle: it opens
 the profile directory (opened following a link, see below), then `AppData`, `Local`,
@@ -170,7 +185,7 @@ probes: no probe reports a path, because a path a process below High wrote is no
 acts on. The make-probe fails on a path that exists and never clears one. Each probe's outcome is a value
 (`session_rows::ProbeOutcome`: answered, failed, timed out, not run) and `probe_run::run_at` returns them
 all, so the rows are a pure function of what it found. A probe that fails is data, not an early return: the
-default probe still runs (given no junction), so only the rows about the failed probe fail. A junction
+probe that asks for `always` still runs (given no junction), so only the rows about the failed probe fail. A junction
 counts as made from below High only when the make-probe reports an integrity below High and a junction
 that was made; otherwise the junction row fails with why, and a probe that reported no outcome is never read
 as one that made a junction. A junction needs no privilege, but it needs a volume that holds reparse points,
@@ -181,10 +196,16 @@ and one that was made and not read is `Failed`, and all three fail. The stderr l
 junction and about its own token (`probe::JUNCTION_SAID`, `probe::TOKEN_SAID`) reach the rows they explain.
 For an agent below High there is one probe, which makes and follows the junction in the directory it is
 given. The probe's PROBE line also carries its own `elevation` and `integrity` (read by
-`account::elevation_of` and `integrity_of`), which the `elevated session` and `unelevated session on request`
-rows judge. The two probes and the two rows are keyed on the agent being at High (the level of the process
-that runs `doctor`, which is the level of the folder it asks; the default probe's own level for the rows),
-not on `Elevation::Full`.
+`account::elevation_of` and `integrity_of`), which the `session` and `elevated session on request` rows judge:
+the first from the probe that asked for `prompt`, the default level, the second from the one that asked for `always`.
+The session id, DPAPI and byte rows are the first probe's too, since that is the session a login gets
+(`session_rows::Probes::session`; `Probes::elevated` is `None` for an agent below High, which refuses
+`always`). The two probes and the two rows are keyed on the agent being at High (the level of the process
+that runs `doctor`, which is the level of the folder it asks), not on `Elevation::Full`. A process below
+High that is an administrator's runs no probe: `doctor` shows its local rows and one failing row, in place of the
+rows about the agent's socket, that names the ways to check: an elevated prompt, an SSH login that asked for
+`always`, and `elevate` in an SSH session (`offer::text::ELEVATED_AGENT_LOOKS_ELSEWHERE`, which `logout` says too,
+and `CHECK_BELOW_HIGH_CLAUSE`).
 `tests/redirection_guard_windows.rs` measures the premise.
 
 ## Building and testing
@@ -207,6 +228,14 @@ covers the other half.
 
 **CI is the Windows test bed.** The full suite — ACLs, AF_UNIX, pseudoconsoles, the registry —
 runs on `windows-latest` on every PR. You do not need a Windows machine to change this project.
+
+Tests that need a real sshd, a local account or the machine's configuration are Elevated (CI only): make
+`cargo test --no-run` compile them and let CI run them. `tests/sshd_config_windows.rs` takes the machine alone
+(`ci-exclusive`).
+
+Host tests of the pieces beside them: `agent::link` (whose output the connection carries, where the keys go),
+`agent::requests`, `agent::elevation` (what each level allows), `consent_entry`, `console_prompt` (what is queued
+when the question appears), and `provision::sshd_config` over a stand-in `SshdHost`.
 
 ### Hooks
 
@@ -302,6 +331,29 @@ Windows, in these places:
 
 It never goes on a command line, into the environment, a file, a log, a `tracing` field, a `Debug` impl or an
 error text. A new use of it is a new sink: review it as one.
+
+**One rule decides a session's token** *(review)*. `account::step_down` turns what the login asked
+(`SSH_BROKER_ELEVATION`) and the process's integrity into a token, none, or a refusal. The agent
+(`UnelevatedToken::for_policy`), the shim's fail-open shell (`shim_pty`) and the shim's offer (`shim_offer::stance`)
+all ask it; a second place that decides what a login gets is a defect.
+
+**Nothing on the SSH command line is interpreted** *(review)*. The level of a login is the value of
+`SSH_BROKER_ELEVATION` and nothing a client types as its command: no word, and no read of `SSH_ORIGINAL_COMMAND`
+for one.
+
+**Everything on `request.sock` is input from a lower level** *(review)*, and the socket takes requests only: see
+"The security boundary is the socket file and its folder". A new kind of request that can end the agent ends it
+through `agent::settled_end` and `finish_settled`, which are the one exit code of an agent whose end was decided.
+
+**The consent is decided by a pure state machine** *(review)*. `consent_entry::ConsentEntry` takes key events and
+says whether the answer allows; `console_prompt::ask_consent` does the console I/O around it, as `password_entry`
+and the password prompt do. A change to what allows is a change to the state machine and its host tests, not to
+the console code.
+
+**`AcceptEnv` and `Include` edits go through the text-to-text function and `sshd -t`** *(review)*. `apply` makes
+a candidate of `sshd_config` with `sshd_config::with_line`, has `sshd -t` check it and `sshd -T` show the variable in
+force, and only then renames it over the original (`sshd_config::configure`); the original is untouched on any
+failure.
 
 **No personal home paths** in tracked files *(hook-enforced)*; no usernames or machine names
 *(review)* — the hook matches home-directory shapes only, so a bare username or a hostname is

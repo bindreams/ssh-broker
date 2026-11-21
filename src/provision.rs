@@ -298,7 +298,7 @@ mod imp {
                 Ok(()) => {
                     registry::broadcast_environment_change();
                     println!(
-                        "apply: added {dir} to the system PATH; sessions started from now on find ssh-broker by name"
+                        "apply: added {dir} to the system PATH; an agent that is running, and its sessions, keep the PATH they started with"
                     );
                 }
                 Err(e) => eprintln!("apply: {dir} was not added to the system PATH: {e:#}"),
@@ -599,8 +599,8 @@ mod imp {
         // A malformed `--probe-timeout` errors rather than quietly applying the default, so the
         // operator who asked to wait indefinitely never silently gets 30s and a wrong diagnosis.
         let probe_timeout = super::bounded::probe_timeout_from_args(&std::env::args().collect::<Vec<_>>())?;
-        // An administrator's unelevated prompt has no agent in the folder it looks in, and says why above;
-        // a probe would only add a raw "connect to agent" failure beside that, so none is run.
+        // An administrator's unelevated prompt cannot connect to the agent's own socket, and the row above names
+        // the ways to check; a probe would only add a raw "connect to agent" failure beside that, so none is run.
         if !filtered {
             // The probe runs the exe in the install directory, so an untrusted one never gets that far.
             match layout::run_if_trusted_base(&base, |trusted| {

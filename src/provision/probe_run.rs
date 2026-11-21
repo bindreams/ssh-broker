@@ -56,16 +56,16 @@ fn run_at(integrity: Integrity, temp: &Path, drive: Drive) -> Probes {
         Integrity::Medium => run_at_medium(&dir, drive),
         Integrity::High => run_at_high(&dir, drive),
     };
-    probes.leftover = leftover(&dir, dir.to_str().is_some(), maker(&probes));
+    probes.leftover = leftover(&dir, dir.to_str().is_some(), &probes.session);
     probes
 }
 
 /// The probe of an agent below High: it makes the junction in `dir` and follows it.
 fn run_at_medium(dir: &Path, drive: Drive) -> Probes {
-    let default = drive(ElevationPolicy::DEFAULT, make_link(dir));
-    let note = said(&default).to_owned();
+    let session = drive(ElevationPolicy::DEFAULT, make_link(dir));
+    let note = said(&session).to_owned();
     let junction = if dir.to_str().is_some() {
-        read_by(&default, note)
+        read_by(&session, note)
     } else {
         Junction::Unavailable {
             cause: not_text(dir),
@@ -73,8 +73,8 @@ fn run_at_medium(dir: &Path, drive: Drive) -> Probes {
         }
     };
     Probes {
-        unelevated: None,
-        default,
+        session,
+        elevated: None,
         junction,
         leftover: None,
     }
@@ -82,9 +82,9 @@ fn run_at_medium(dir: &Path, drive: Drive) -> Probes {
 
 /// The two probes of an agent at High, in the order [`run`] gives.
 fn run_at_high(dir: &Path, drive: Drive) -> Probes {
-    let unelevated = drive(ElevationPolicy::DEFAULT, make_link(dir));
-    let source = source_of(dir, &unelevated);
-    let default = match (&source, &unelevated) {
+    let session = drive(ElevationPolicy::DEFAULT, make_link(dir));
+    let source = source_of(dir, &session);
+    let elevated = match (&source, &session) {
         (Source::FromBelowHigh(text), _) => drive(ElevationPolicy::Always, ProbeLink::Follow((*text).to_owned())),
         // An agent that did not answer is not waited on a second time.
         (_, ProbeOutcome::TimedOut(_)) => ProbeOutcome::NotRun("the agent did not answer the first probe".into()),
@@ -93,13 +93,13 @@ fn run_at_high(dir: &Path, drive: Drive) -> Probes {
         _ => drive(ElevationPolicy::Always, ProbeLink::NoJunction),
     };
 
-    let note = [said(&unelevated), said(&default)]
+    let note = [said(&session), said(&elevated)]
         .into_iter()
         .filter(|said| !said.is_empty())
         .collect::<Vec<_>>()
         .join("; ");
     let junction = match source {
-        Source::FromBelowHigh(_) => read_by(&default, note),
+        Source::FromBelowHigh(_) => read_by(&elevated, note),
         Source::NoJunctionsOnVolume => Junction::Read {
             state: Some(SymlinkState::Skipped),
             note,
@@ -107,8 +107,8 @@ fn run_at_high(dir: &Path, drive: Drive) -> Probes {
         Source::Unavailable(cause) => Junction::Unavailable { cause, note },
     };
     Probes {
-        unelevated: Some(unelevated),
-        default,
+        session,
+        elevated: Some(elevated),
         junction,
         leftover: None,
     }
@@ -121,10 +121,10 @@ fn make_link(dir: &Path) -> ProbeLink {
         .map_or(ProbeLink::NoJunction, |text| ProbeLink::Make(text.to_owned()))
 }
 
-/// The junction as the default probe, which follows it, found it; one that gave no answer found nothing, and
-/// its own outcome says why.
-fn read_by(default: &ProbeOutcome, note: String) -> Junction {
-    match default.answer() {
+/// The junction as the probe that follows it found it; one that gave no answer found nothing, and its own
+/// outcome says why.
+fn read_by(follower: &ProbeOutcome, note: String) -> Junction {
+    match follower.answer() {
         Ok(followed) => Junction::Read {
             state: followed.result.symlink,
             note,
@@ -137,15 +137,10 @@ fn not_text(dir: &Path) -> String {
     format!("the directory {} cannot be told to a probe as text", dir.display())
 }
 
-/// The probe that was to make the directory: the unelevated one of an agent at High, the only one below it.
-fn maker(probes: &Probes) -> &ProbeOutcome {
-    probes.unelevated.as_ref().unwrap_or(&probes.default)
-}
-
-/// Remove `dir` and say what is left of it: why it could not be removed, and that a `maker` whose child may
-/// still be running may still create it. `told` is whether `maker` was given it.
-fn leftover(dir: &Path, told: bool, maker: &ProbeOutcome) -> Option<String> {
-    let may_come = told && maker.may_still_run();
+/// Remove `dir` and say what is left of it: why it could not be removed, and that a session probe whose child
+/// may still be running may still create it. `told` is whether it was given `dir`.
+fn leftover(dir: &Path, told: bool, session: &ProbeOutcome) -> Option<String> {
+    let may_come = told && session.may_still_run();
     match (probe::link::remove(dir), may_come) {
         (Err(e), may_come) => Some(format!(
             "{} could not be removed: {e}{}; it can be deleted",
@@ -164,9 +159,9 @@ fn leftover(dir: &Path, told: bool, maker: &ProbeOutcome) -> Option<String> {
     }
 }
 
-/// Where the junction the default probe at High is judged on comes from.
+/// Where the junction the `always` probe is judged on comes from.
 enum Source<'a> {
-    /// A token below High made it, in this directory: the default probe follows it.
+    /// A token below High made it, in this directory: the `always` probe follows it.
     FromBelowHigh(&'a str),
     /// The volume holds no junctions: nothing was tested, and that fails nothing.
     NoJunctionsOnVolume,
@@ -174,13 +169,13 @@ enum Source<'a> {
     Unavailable(String),
 }
 
-/// Whether the unelevated probe made a junction from below High in `dir`. It did only when it answered,
-/// reports its integrity as below High, and its junction was made.
-fn source_of<'a>(dir: &'a Path, unelevated: &ProbeOutcome) -> Source<'a> {
+/// Whether the session probe made a junction from below High in `dir`. It did only when it answered, reports its
+/// integrity as below High, and its junction was made.
+fn source_of<'a>(dir: &'a Path, session: &ProbeOutcome) -> Source<'a> {
     let Some(text) = dir.to_str() else {
         return Source::Unavailable(not_text(dir));
     };
-    let asked = match unelevated.answer() {
+    let asked = match session.answer() {
         Ok(answer) => &answer.result,
         Err(cause) => return Source::Unavailable(cause.to_string()),
     };

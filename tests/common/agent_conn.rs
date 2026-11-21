@@ -135,13 +135,13 @@ pub struct Finished {
     pub exit: Option<i32>,
 }
 
-/// The session rows `doctor` shows through an administrator's elevated agent, in its `stdout`: the session is
-/// elevated, an unelevated one can be had, and the junction was followed, not skipped. Not its exit code, which
-/// also depends on the installation rows.
+/// The session rows `doctor` shows through an administrator's elevated agent, in its `stdout`: a login that asks
+/// for no level gets an unelevated session, one that asks for `always` gets an elevated one, and the junction was
+/// followed, not skipped. Not its exit code, which also depends on the installation rows.
 pub fn assert_doctor_session_rows(stdout: &str) {
     for row in [
-        "[PASS] elevated session",
-        "[PASS] unelevated session on request",
+        "[PASS] session ",
+        "[PASS] elevated session on request",
         "[PASS] junction (via agent)",
     ] {
         assert!(stdout.contains(row), "no {row:?} in:\n{stdout}");

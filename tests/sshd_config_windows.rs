@@ -639,9 +639,13 @@ fn an_agent_that_apply_did_not_restart_keeps_its_old_path_until_it_restarts() {
 /// agent logs in with a terminal and types the password at the product's own prompt, so the installed shim starts
 /// the installed agent by its batch logon. A login asking `always` then runs the installed exe's `doctor`, whose
 /// parity probes go through that agent. A junction row that is not "followed" is the RedirectionGuard signal for the
-/// password-prompt start path on the runner: stop and report it.
+/// password-prompt start path on the runner: stop and report it. A login asking `auto-approve` runs the same
+/// `doctor` unelevated, which is told the ways to check and exits 1; a second login asking `auto-approve` runs one
+/// of them, `ssh-broker elevate ssh-broker doctor` by name, which passes.
 #[test]
 fn after_apply_doctor_passes_through_a_session_the_password_prompt_started() {
+    use ssh_broker::offer::text::CHECK_BELOW_HIGH_CLAUSE;
+
     let _machine = machine::exclusive();
     account_fixture::assert_elevated();
     let _install = Install::capture();
@@ -669,6 +673,40 @@ fn after_apply_doctor_passes_through_a_session_the_password_prompt_started() {
         outcome.code,
         Some(0),
         "doctor did not pass (exit {:?}):\n{shown}\n{}\n{}",
+        outcome.code,
+        outcome.stderr,
+        (login.diagnostics())()
+    );
+    agent_conn::assert_doctor_session_rows(&shown);
+
+    let mut unelevated = login.command_asking("auto-approve");
+    unelevated
+        .arg("-T")
+        .arg("--")
+        .arg(format!("& '{}' doctor", installed.display()));
+    let outcome = run_client(unelevated, false, kit.dir());
+    let shown = String::from_utf8_lossy(&outcome.stdout).into_owned();
+    assert_eq!(
+        outcome.code,
+        Some(1),
+        "an unelevated doctor did not exit 1 (exit {:?}):\n{shown}\n{}\n{}",
+        outcome.code,
+        outcome.stderr,
+        (login.diagnostics())()
+    );
+    assert!(
+        shown.contains(CHECK_BELOW_HIGH_CLAUSE),
+        "the ways to check are missing from:\n{shown}"
+    );
+
+    let mut elevated = login.command_asking("auto-approve");
+    elevated.arg("-T").arg("--").arg("ssh-broker elevate ssh-broker doctor");
+    let outcome = run_client(elevated, false, kit.dir());
+    let shown = String::from_utf8_lossy(&outcome.stdout).into_owned();
+    assert_eq!(
+        outcome.code,
+        Some(0),
+        "the command doctor names did not pass (exit {:?}):\n{shown}\n{}\n{}",
         outcome.code,
         outcome.stderr,
         (login.diagnostics())()

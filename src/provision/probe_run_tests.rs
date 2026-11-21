@@ -152,8 +152,8 @@ fn row_names(rows: &[crate::provision::report::Check]) -> Vec<&str> {
     rows.iter().map(|row| row.name).collect()
 }
 
-fn is_answered(outcome: &Option<ProbeOutcome>) -> bool {
-    matches!(outcome, Some(ProbeOutcome::Answered(_)))
+fn is_answered(outcome: &ProbeOutcome) -> bool {
+    matches!(outcome, ProbeOutcome::Answered(_))
 }
 
 // the agent is at High ---------------------------------------------------------------------
@@ -178,13 +178,13 @@ fn an_agent_at_high_gets_two_probes_with_one_directory_which_is_removed() {
     assert!(scratch.is_empty(), "the directory and what is in it are removed");
     probing.assert_outside_intact();
     assert_eq!(probes.leftover, None);
-    assert!(is_answered(&probes.unelevated));
+    assert!(is_answered(&probes.session));
     let (state, note) = read(&probes).expect("a junction from below High was read");
     assert_eq!(state, Some(SymlinkState::Blocked));
     assert!(note.contains("made it") && note.contains("refused"), "{note}");
 }
 
-/// The junction is made by the default (unelevated) probe and followed by the `always` probe, in that order.
+/// The junction is made by the session probe (the default level) and followed by the `always` probe, in that order.
 #[test]
 fn an_agent_at_high_is_probed_with_prompt_then_always() {
     let scratch = Scratch::new();
@@ -212,9 +212,9 @@ fn an_agent_below_high_is_probed_once_with_prompt() {
     );
 }
 
-/// A probe that failed may still create the directory, so `doctor` says so; the default probe runs on.
+/// A probe that failed may still create the directory, so `doctor` says so; the `always` probe runs on.
 #[test]
-fn a_failed_unelevated_probe_gives_the_may_still_create_note_and_the_default_probe_runs_without_a_junction() {
+fn a_failed_session_probe_gives_the_may_still_create_note_and_the_always_probe_runs_without_a_junction() {
     let scratch = Scratch::new();
     let probing = Probing::new(
         || broke("probe relay failed (code 254)"),
@@ -232,13 +232,13 @@ fn a_failed_unelevated_probe_gives_the_may_still_create_note_and_the_default_pro
     let leftover = probes.leftover.as_deref().expect("a note that the directory may come");
     assert!(leftover.contains(dir.as_str()), "{leftover}");
     assert!(leftover.contains("may still create"), "{leftover}");
-    assert!(matches!(&probes.unelevated, Some(ProbeOutcome::Failed { cause, .. }) if cause.contains("code 254")));
-    assert!(matches!(&probes.default, ProbeOutcome::Answered(_)));
+    assert!(matches!(&probes.session, ProbeOutcome::Failed { cause, .. } if cause.contains("code 254")));
+    assert!(matches!(&probes.elevated, Some(ProbeOutcome::Answered(_))));
     let (cause, note) = unavailable(&probes);
     assert!(cause.contains("code 254"), "{cause}");
     assert!(
         note.contains("no junction"),
-        "the default probe's words are kept: {note}"
+        "the always probe's words are kept: {note}"
     );
 }
 
@@ -254,11 +254,11 @@ fn a_timed_out_first_probe_starts_no_second_probe_and_leaves_a_warning() {
     let probes = probing.run(Integrity::High, &scratch.0);
 
     assert_eq!(probing.asked.borrow().len(), 1);
-    assert!(matches!(&probes.unelevated, Some(ProbeOutcome::TimedOut(_))));
+    assert!(matches!(&probes.session, ProbeOutcome::TimedOut(_)));
     assert!(
-        matches!(&probes.default, ProbeOutcome::NotRun(why) if why.contains("did not answer the first probe")),
+        matches!(&probes.elevated, Some(ProbeOutcome::NotRun(why)) if why.contains("did not answer the first probe")),
         "{:?}",
-        probes.default
+        probes.elevated
     );
     assert!(scratch.is_empty());
     let leftover = probes
@@ -397,17 +397,17 @@ fn a_volume_without_junctions_is_not_tested() {
     assert!(scratch.is_empty());
 }
 
-/// A failed default probe takes its own rows with it and no others.
+/// A failed session probe takes its own rows with it and no others.
 #[test]
-fn a_failed_default_probe_keeps_the_unelevated_row_and_the_leftover() {
+fn a_failed_session_probe_keeps_the_elevated_row_and_the_leftover() {
     let scratch = Scratch::new();
     let probing = Probing::new(
         || ProbeOutcome::TimedOut("no output within 30s".into()),
         || broke("relay: refused"),
     );
     let probes = probing.run(Integrity::High, &scratch.0);
-    // A timed-out first probe starts no second one, so the default probe here is the one that did not run.
-    assert!(matches!(&probes.default, ProbeOutcome::NotRun(_)));
+    // A timed-out first probe starts no second one, so the probe of `always` here is the one that did not run.
+    assert!(matches!(&probes.elevated, Some(ProbeOutcome::NotRun(_))));
 
     let rows = parity_rows(&probes, 1);
 
@@ -416,19 +416,38 @@ fn a_failed_default_probe_keeps_the_unelevated_row_and_the_leftover() {
         names,
         [
             "parity probe (via agent)",
-            "unelevated session on request",
+            "elevated session on request",
             "junction directory"
         ]
     );
 
-    let failing = Probing::new(unelevated_ok, || exited("no PROBE line in probe output: refused"));
+    // The session probe is the one that did not answer, whichever way it did not.
+    let failing = Probing::new(|| exited("no PROBE line in probe output: refused"), elevated_ok);
     let probes = failing.run(Integrity::High, &scratch.0);
-    assert!(matches!(&probes.default, ProbeOutcome::Failed { .. }));
+    assert!(matches!(&probes.session, ProbeOutcome::Failed { .. }));
     let rows = parity_rows(&probes, 1);
     let names: Vec<&str> = rows.iter().map(|row| row.name).collect();
-    assert_eq!(names, ["parity probe (via agent)", "unelevated session on request"]);
+    assert_eq!(names, ["parity probe (via agent)", "elevated session on request"]);
     assert!(rows[0].detail.contains("refused"), "{}", rows[0].detail);
     assert!(rows[1].pass, "{}", rows[1].detail);
+}
+
+/// A failed `always` probe takes its own row and the junction it reads with it, and no other: the session rows
+/// are the session probe's, which answered.
+#[test]
+fn a_failed_always_probe_keeps_the_session_rows() {
+    let scratch = Scratch::new();
+    let probing = Probing::new(unelevated_ok, || exited("no PROBE line in probe output: refused"));
+
+    let probes = probing.run(Integrity::High, &scratch.0);
+
+    assert!(is_answered(&probes.session));
+    assert!(matches!(&probes.elevated, Some(ProbeOutcome::Failed { .. })));
+    let rows = parity_rows(&probes, 1);
+    let failing: Vec<&str> = rows.iter().filter(|row| !row.pass).map(|row| row.name).collect();
+    assert_eq!(failing, ["elevated session on request", "junction (via agent)"]);
+    let session = rows.iter().find(|row| row.name == "session").expect("a session row");
+    assert!(session.pass, "{}", session.detail);
 }
 
 /// A directory that cannot be told to a probe as text is not given to one.
@@ -442,7 +461,7 @@ fn a_temp_directory_that_is_not_text_gives_no_junction_and_runs_the_probes() {
 
     assert_eq!(probing.links(), [ProbeLink::NoJunction, ProbeLink::NoJunction]);
     assert!(unavailable(&probes).0.contains("text"));
-    assert!(is_answered(&probes.unelevated));
+    assert!(is_answered(&probes.session));
     assert_eq!(probes.leftover, None, "no probe was told the directory");
 
     let probing = Probing::new(unelevated_ok, elevated_ok);
@@ -474,7 +493,7 @@ fn an_agent_below_high_has_one_probe_with_a_directory_that_doctor_removes() {
         panic!("expected one make, got {links:?}");
     };
     assert_eq!(Path::new(dir).parent(), Some(scratch.0.as_path()));
-    assert!(probes.unelevated.is_none());
+    assert!(probes.elevated.is_none());
     let (state, note) = read(&probes).expect("its own junction");
     assert_eq!(state, Some(SymlinkState::Ok));
     assert!(note.contains("slow"), "{note}");
@@ -485,7 +504,7 @@ fn an_agent_below_high_has_one_probe_with_a_directory_that_doctor_removes() {
 
 /// A probe below High that did not answer may still create the directory it was told.
 #[test]
-fn an_agent_below_high_that_does_not_answer_has_its_outcome_as_the_default_and_a_note() {
+fn an_agent_below_high_that_does_not_answer_has_its_outcome_as_the_session_and_a_note() {
     for unanswered in [
         (|| ProbeOutcome::TimedOut("no output".into())) as fn() -> ProbeOutcome,
         || broke("relay failed"),
@@ -496,7 +515,7 @@ fn an_agent_below_high_that_does_not_answer_has_its_outcome_as_the_default_and_a
         let probes = probing.run(Integrity::Medium, &scratch.0);
 
         assert!(matches!(
-            &probes.default,
+            &probes.session,
             ProbeOutcome::TimedOut(_) | ProbeOutcome::Failed { .. }
         ));
         assert!(
@@ -504,7 +523,7 @@ fn an_agent_below_high_that_does_not_answer_has_its_outcome_as_the_default_and_a
             "{:?}",
             probes.junction
         );
-        assert!(probes.unelevated.is_none());
+        assert!(probes.elevated.is_none());
         assert!(scratch.is_empty());
         probing.assert_outside_intact();
         let links = probing.links();
@@ -604,7 +623,7 @@ fn each_pair_of_maker_and_follower_has_the_expected_junction_row() {
         answer(Elevation::Full, INTEGRITY_HIGH, symlink, "")
     }
     #[allow(clippy::type_complexity)]
-    let table: [(&str, fn() -> ProbeOutcome, fn() -> ProbeOutcome, bool, &str); 8] = [
+    let table: [(&str, fn() -> ProbeOutcome, fn() -> ProbeOutcome, bool, &str); 7] = [
         (
             "followed",
             || maker(Some(SymlinkState::Ok)),
@@ -654,14 +673,9 @@ fn each_pair_of_maker_and_follower_has_the_expected_junction_row() {
             false,
             "did not report its junction",
         ),
-        (
-            "maker failed",
-            || broke("relay failed"),
-            || follower(Some(SymlinkState::Ok)),
-            false,
-            "relay failed",
-        ),
     ];
+    // The session probe is the one that gives the rows, and its failure is the one `parity probe (via agent)` row,
+    // which names the junction's cause.
     for (name, made, followed, passes, says) in table {
         let scratch = Scratch::new();
         let probing = Probing::new(made, followed);

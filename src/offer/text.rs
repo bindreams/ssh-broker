@@ -315,8 +315,13 @@ pub fn elevation_unreadable(cause: &str) -> String {
     )
 }
 
+/// The third way to check below High, appended to [`ELEVATED_AGENT_LOOKS_ELSEWHERE`] in `doctor`'s row.
+/// `elevate` is refused in some sessions and says why itself, so the other ways stay named.
+pub const CHECK_BELOW_HIGH_CLAUSE: &str = ", or run ssh-broker elevate ssh-broker doctor in an SSH session";
+
 /// Told to an unelevated process whose agent runs at High and serves no socket it can reach. Names neither
-/// "administrator" nor "Backup Operator": either account is split. Used by `doctor`'s row and `logout`'s line.
+/// "administrator" nor "Backup Operator": either account is split. Used by `logout`'s line and by `doctor`'s
+/// row of what is not checked below High.
 pub const ELEVATED_AGENT_LOOKS_ELSEWHERE: &str = "this account's agent serves elevated processes: run this from an elevated prompt or from an SSH login that asked for SSH_BROKER_ELEVATION=always";
 
 /// Told when a High login lacks `SeImpersonatePrivilege`, which `CreateProcessWithTokenW` needs; the way
