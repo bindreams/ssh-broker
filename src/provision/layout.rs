@@ -29,9 +29,10 @@ impl Layout {
     }
 
     /// The file whose lock lets one `install` (or `auto-login on|off`) run at a time; see
-    /// [`super::install_lock`].
+    /// [`super::install_lock`]. It keeps the name 0.1.0 gave it, from the verb's old name, so that this build and
+    /// that one, which can both be on a machine during an upgrade, exclude each other.
     pub fn install_lock_path(&self) -> PathBuf {
-        self.base.join("install.lock")
+        self.base.join("apply.lock")
     }
 
     /// What the task that sets sshd up says it did, one line each, for `install` to print; see

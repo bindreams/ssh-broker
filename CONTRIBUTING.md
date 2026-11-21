@@ -157,7 +157,7 @@ folder's handle and never creates it (`starting_agent`, `userdir::open_existing_
 folder watch (`socket_watch`) stays by path, and neither it nor the connect, which goes through the
 folders held, creates or writes anything.
 
-The install directory is the other half of the boundary: the agent runs the exe in it, so a directory a standard user can write to is a privilege escalation. `install` verifies it exactly and reads and writes nothing in it until that passes. Users can read what is in it, so a file in it that a user must not open (`install.lock`: a byte-range lock needs only a read handle) gets its own protected DACL of SYSTEM and Administrators at creation, verified exactly (`acl::ensure_admin_only_file`).
+The install directory is the other half of the boundary: the agent runs the exe in it, so a directory a standard user can write to is a privilege escalation. `install` verifies it exactly and reads and writes nothing in it until that passes. Users can read what is in it, so a file in it that a user must not open (`apply.lock`, the lock of `install`: a byte-range lock needs only a read handle) gets its own protected DACL of SYSTEM and Administrators at creation, verified exactly (`acl::ensure_admin_only_file`).
 
 ### Fail-open is deliberate, and never in the security boundary
 

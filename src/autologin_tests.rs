@@ -766,7 +766,7 @@ fn the_real_env_tells_a_missing_install_directory_from_a_trusted_one() {
 }
 
 /// Elevated (CI only). The lock `auto-login on|off` take is the file `install` takes: with another
-/// holder on `install.lock`, the real env's `lock_install` blocks (and says so) until it lets go.
+/// holder on the lock file, the real env's `lock_install` blocks (and says so) until it lets go.
 #[test]
 fn the_real_env_waits_for_a_holder_of_the_install_lock_file() {
     let (dir, layout) = hardened_layout("env-waits");
@@ -803,7 +803,7 @@ fn the_real_env_waits_for_a_holder_of_the_install_lock_file() {
 }
 
 /// Elevated (CI only). The guard `lock_install` returns is the lock: while it lives, a second taker
-/// of `install.lock` blocks; once it is dropped, the second gets it.
+/// of the lock file blocks; once it is dropped, the second gets it.
 #[test]
 fn the_real_env_holds_the_install_lock_file_until_its_guard_is_dropped() {
     let (dir, layout) = hardened_layout("env-holds");

@@ -1,6 +1,6 @@
 //! What a test that runs `install` over the machine's real install puts back: the install directory, the tasks, sshd's
-//! `DefaultShell` values, and sshd's configuration files (`sshd_config` and `sshd_config.d`), which `install` now
-//! changes too. **Elevated (CI only).** One guard for every test binary that runs `install`, so that the install
+//! `DefaultShell` values, and sshd's configuration files (`sshd_config` and `sshd_config.d`), which `install`
+//! changes. **Elevated (CI only).** One guard for every test binary that runs `install`, so that the install
 //! directory is absent again when the test ends, whichever binary runs first.
 #![allow(dead_code)]
 

@@ -1044,7 +1044,7 @@ fn an_install_ended_after_it_handed_over_the_sshd_step_leaves_sshd_running_with_
     );
 }
 
-/// Review Focus 5: `install` run in an SSH session restarts the very sshd that session came in through. The shim is
+/// `install` run in an SSH session restarts the very sshd that session came in through. The shim is
 /// sshd's `DefaultShell` and the session is an administrator's at High (`always`). It must end with its exit code,
 /// and the session must go on afterwards. Spike 4 measured a restart with the stock shell; this measures it with the
 /// shim. If the session does not survive, stop and report: the restart cannot be the last step of an `install` that

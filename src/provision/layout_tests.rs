@@ -351,3 +351,12 @@ fn aces_reads_an_sddl_dacl() {
 fn the_production_layout_installs_the_exe_that_the_cfg_free_pins_assert_on() {
     assert_eq!(Layout::production().canonical_exe(), crate::provision::canonical_exe());
 }
+
+/// The lock file is the one 0.1.0 takes, so that a 0.1.0 `apply` or `auto-login` and this build's `install` exclude
+/// each other on a machine that is being upgraded.
+#[test]
+fn the_lock_file_keeps_the_name_the_released_build_takes() {
+    let path = Layout::production().install_lock_path();
+    assert_eq!(path.file_name().and_then(|name| name.to_str()), Some("apply.lock"));
+    assert_eq!(path.parent(), Layout::production().canonical_exe().parent());
+}
