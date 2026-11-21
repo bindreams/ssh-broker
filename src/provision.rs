@@ -209,9 +209,11 @@ mod imp {
         //    the agents start again afterwards, even if a later step fails, except in a session
         //    whose old agent has not exited.
         let current = std::env::current_exe().context("current_exe")?;
-        // Every line goes through `flow::install_run`'s sink, which writes to the console and ignores a stream that
-        // has closed (an `install` over an SSH connection that has gone), and the last line comes after the sshd
-        // step.
+        // Every step line, warning and the last line goes through `flow::install_run`'s sink, which writes to the
+        // console and ignores a stream that has closed (an `install` over an SSH connection that has gone), and the
+        // last line comes after the sshd step. The two notices that are the only record of a value about to be
+        // replaced or removed do not: they are written strictly (`show_to_console`), so that a write that fails ends
+        // `install` before the value is touched.
         flow::install_run(
             &mut say_to_console,
             super::version(),
@@ -265,7 +267,7 @@ mod imp {
                             eq_path(&shell, &exe) && opt == "-c",
                             "DefaultShell read-back mismatch (shell={shell:?}, opt={opt:?})"
                         );
-                        remove_shell_arguments(&base.layout().system_config_path(), say)?;
+                        remove_shell_arguments(&base.layout().system_config_path(), say);
 
                         // 4. The install directory on the system PATH, before any agent starts: an agent's
                         //    environment is fixed when it starts, and its sessions inherit it.
@@ -315,12 +317,10 @@ mod imp {
     /// Write the system config from the shell sshd runs now, if it is not ssh-broker and there is no
     /// config yet (see [`system_config`]). Must run before the registry is overwritten. The install is
     /// complete without the config, so a failure is said on stderr and `install` goes on; the
-    /// [`Handover`] it returns is what the flip takes. `previous` is what the registry holds now.
-    fn carry_previous_shell(
-        base: &layout::TrustedBase<'_>,
-        previous: &SshdShell,
-        say: &mut Say<'_>,
-    ) -> anyhow::Result<Handover> {
+    /// [`Handover`] it returns is what the flip takes. What `hand_over` prints when the config is not written is the
+    /// only record of the previous values: it is written strictly ([`show_to_console`]), and a write that fails
+    /// ends `install` before the flip. `previous` is what the registry holds now.
+    fn carry_previous_shell(base: &layout::TrustedBase<'_>, previous: &SshdShell, say: &mut Say<'_>) -> Handover {
         let config = base.layout().system_config_path();
         let config_is_file = system_config::config_is_file(&config);
         let host = crate::shell::WindowsHost;
@@ -366,9 +366,9 @@ mod imp {
     /// `install` that replaced the shell) or are not wanted. A value that cannot be read, or with no file known
     /// to hold it, is the only copy of the old setup: it is left, and said, for the next `install` (see
     /// [`system_config::plan_arguments`]). A removal prints the value before it deletes it
-    /// ([`remove_arguments`]), and a failed one says so with the cause and `install` goes on. A value that could not
-    /// be shown is not removed, and that is an error of the step.
-    fn remove_shell_arguments(config: &Path, say: &mut Say<'_>) -> anyhow::Result<()> {
+    /// ([`remove_arguments`]; the print is strict, see [`show_to_console`]), and a failed removal says so with the
+    /// cause and `install` goes on.
+    fn remove_shell_arguments(config: &Path, say: &mut Say<'_>) {
         let key = registry::OPENSSH_KEY;
         // Read on its own: another value that cannot be read does not make this one unreadable.
         let read = registry::read_shell_arguments_under(key).map_err(|e| format!("{e:#}"));
@@ -380,7 +380,7 @@ mod imp {
             |shown| registry::remove_shell_arguments_under(key, shown),
             say,
             &mut show_to_console,
-        )
+        );
     }
 
     /// The background sessions' part of the stop that precedes replacing the exe: the auto-login

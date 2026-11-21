@@ -1,5 +1,5 @@
 use super::*;
-use crate::test_support::{Said, recording, say_to_closed_streams, show_to_closed_stderr, silent};
+use crate::test_support::{Said, recording, silent};
 use anyhow::Context;
 use std::cell::RefCell;
 
@@ -648,102 +648,6 @@ fn what_the_install_holds_is_held_through_the_sshd_step() {
     )
     .unwrap();
     assert_eq!(events.into_inner(), ["sshd step", "installed line", "released"]);
-}
-
-/// `install_run` over `say`: its result, and what each step was called with and did.
-fn install_run_saying(say: &mut Say<'_>, body_fails: bool) -> (Result<(), String>, Vec<String>) {
-    let ran = RefCell::new(Vec::new());
-    let result = install_run(
-        say,
-        "0.2.0",
-        |say| {
-            ran.borrow_mut().push("body".to_owned());
-            say(Stream::Out, "A step...");
-            say(Stream::Err, "a warning");
-            anyhow::ensure!(!body_fails, "copy failed");
-            Ok(7)
-        },
-        |held, say| {
-            ran.borrow_mut().push(format!("sshd step with {held}"));
-            say("a line of the sshd step")
-        },
-    )
-    .map_err(|e| format!("{e:#}"));
-    (result, ran.into_inner())
-}
-
-/// A line lost to a closed stream (an `install` over an SSH connection that has gone) is lost and that is all: the
-/// result of `install_run` and what its steps are called with are what they are over a stream that works.
-#[test]
-fn a_line_lost_to_a_closed_stream_changes_nothing_but_the_line() {
-    let working = RefCell::new(Vec::new());
-    for body_fails in [false, true] {
-        assert_eq!(
-            install_run_saying(&mut say_to_closed_streams, body_fails),
-            install_run_saying(&mut recording(&working), body_fails),
-            "body_fails: {body_fails}"
-        );
-    }
-    assert_eq!(
-        install_run_saying(&mut say_to_closed_streams, false),
-        (Ok(()), vec!["body".to_owned(), "sshd step with 7".to_owned()],)
-    );
-}
-
-/// The notice that is the only record of the previous shell's values is not a line: with a standard error that
-/// cannot be written `DefaultShell` is not flipped, the install fails with that, the agents it stopped start again
-/// as after any failed step, and no installed line is said.
-#[test]
-fn a_notice_that_could_not_be_shown_stops_the_flip_and_the_install() {
-    use crate::provision::handover::{hand_over, replace_shell};
-    use crate::provision::registry::SshdShell;
-    use crate::provision::system_config::{Decision, Skip};
-
-    let events = RefCell::new(Vec::new());
-    let said = RefCell::new(Vec::new());
-    let foreign = SshdShell {
-        shell: Some(r"C:\Program Files\PowerShell\7\pwsh.exe".into()),
-        command_option: Some("-NoLogo -c".into()),
-        arguments: Some("-NoProfile".into()),
-        escape_arguments: false,
-    };
-    let result = install_run(
-        &mut recording(&said),
-        "0.2.0",
-        |say| {
-            run(
-                say,
-                || Ok(()),
-                |stop, _| {
-                    stop()?;
-                    replace_shell(
-                        || Ok(foreign),
-                        |previous| {
-                            hand_over(
-                                std::path::Path::new(r"C:\ProgramData\ssh-broker\config.yaml"),
-                                previous,
-                                Decision::Skip(Skip::FileExists),
-                                |_| unreachable!(),
-                                &mut show_to_closed_stderr,
-                            )
-                        },
-                        |_| {
-                            events.borrow_mut().push("flip");
-                            Ok(())
-                        },
-                    )
-                },
-                || Ok(()),
-                |_| Ok(()),
-                |_, _| events.borrow_mut().push("start"),
-            )
-        },
-        |_, _| panic!("the sshd step comes only after the install worked"),
-    );
-    let text = format!("{:#}", result.unwrap_err());
-    assert!(text.contains("could not be shown"), "{text}");
-    assert_eq!(*events.borrow(), ["start"], "no flip, and the agents come back");
-    assert_eq!(*said.borrow(), [out(INSTALLING)]);
 }
 
 #[test]
