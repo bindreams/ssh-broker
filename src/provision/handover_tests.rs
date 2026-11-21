@@ -4,11 +4,11 @@
 use std::cell::Cell;
 use std::path::Path;
 
-use super::{Handover, Stream, hand_over, remove_arguments, replace_shell};
+use super::{Handover, Stream, hand_over, remove_arguments, replace_shell, say_to};
 use crate::provision::registry::{SshdShell, SshdShellReading};
 use crate::provision::system_config::{ConfigKind, CreateOutcome, Decision, Skip, decide};
 use crate::shell::config::ShellBlock;
-use crate::test_support::states_facts_only;
+use crate::test_support::{ClosedStream, states_facts_only};
 
 const PWSH7: &str = r"C:\Program Files\PowerShell\7\pwsh.exe";
 const CONFIG: &str = r"C:\ProgramData\ssh-broker\config.yaml";
@@ -90,17 +90,48 @@ fn a_config_created_by_someone_else_in_between_prints_the_previous_values() {
     assert!(lines[0].1.contains(&format!("{CONFIG} exists")), "{}", lines[0].1);
 }
 
+/// The config is the record of what was carried; stdout carries only `install`'s step lines and its last line.
 #[test]
-fn a_written_config_says_so_on_stdout_and_prints_no_warning() {
+fn a_written_config_says_nothing() {
     let lines = said(Decision::Write(block()), |_| Ok(CreateOutcome::Created));
-    assert_eq!(
-        lines,
-        vec![(
-            Stream::Out,
-            format!("install: wrote {CONFIG} from the shell sshd used before ({PWSH7})")
-        )]
-    );
-    before_the_flip(&lines[0].1);
+    assert_eq!(lines, vec![]);
+}
+
+/// Every notice that stays is on stderr and none begins with the verb's name.
+#[test]
+fn no_notice_begins_with_the_verb_and_every_one_is_on_stderr() {
+    let mut lines = said(Decision::Write(block()), |_| Err(anyhow::anyhow!("disk full")));
+    lines.extend(said(Decision::Write(block()), |_| Ok(CreateOutcome::FileExists)));
+    lines.extend(said(Decision::Skip(Skip::NotAFile), |_| unreachable!()));
+    for events in [
+        removal(Ok(Some("-NoLogo")), Ok(ConfigKind::File), true),
+        removal(Ok(Some("-NoLogo")), Ok(ConfigKind::Missing), false),
+        removal(Err("i/o error"), Ok(ConfigKind::File), false),
+    ] {
+        for event in events {
+            if let Event::Said(stream, text) = event {
+                lines.push((stream, text));
+            }
+        }
+    }
+    assert!(lines.len() >= 6, "{lines:?}");
+    for (stream, text) in lines {
+        assert_eq!(stream, Stream::Err, "{text}");
+        assert!(!text.to_ascii_lowercase().starts_with("install:"), "{text}");
+        assert!(!text.starts_with("install "), "{text}");
+    }
+}
+
+/// The closed standard streams of a service or of a dropped SSH connection lose a line and nothing else.
+#[test]
+fn a_notice_to_a_closed_stream_is_lost_and_nothing_else() {
+    say_to(&mut ClosedStream, &mut ClosedStream, Stream::Out, "a line");
+    say_to(&mut ClosedStream, &mut ClosedStream, Stream::Err, "a line");
+
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    say_to(&mut out, &mut err, Stream::Out, "to stdout");
+    say_to(&mut out, &mut err, Stream::Err, "to stderr");
+    assert_eq!((out, err), (b"to stdout\n".to_vec(), b"to stderr\n".to_vec()));
 }
 
 #[test]
@@ -377,24 +408,19 @@ fn removal(
 }
 
 /// The owner's rule (7/7), applied to the value that is deleted: the text with the value is emitted
-/// before the delete runs, and the delete is confirmed after it.
+/// (on stderr) before the delete runs. A removal that worked says nothing more: stdout carries only
+/// `install`'s step lines and its last line.
 #[test]
-fn the_arguments_are_printed_before_they_are_removed_and_the_removal_is_confirmed_after() {
+fn the_arguments_are_printed_before_they_are_removed_and_a_removal_that_worked_says_nothing_more() {
     let events = removal(Ok(Some("-NoLogo")), Ok(ConfigKind::File), false);
-    let [Event::Said(first, before), Event::Removed, Event::Said(second, after)] = &events[..] else {
+    let [Event::Said(Stream::Err, before), Event::Removed] = &events[..] else {
         panic!("{events:?}");
     };
-    assert_eq!((*first, *second), (Stream::Err, Stream::Out));
-    assert!(
-        before.contains("removing DefaultShellArguments") && before.contains("-NoLogo"),
-        "{before}"
-    );
-    assert!(
-        after.contains("removed DefaultShellArguments") && after.contains("-NoLogo"),
-        "{after}"
+    assert_eq!(
+        before,
+        r#"removing DefaultShellArguments ("-NoLogo") from HKLM\SOFTWARE\OpenSSH"#
     );
     states_facts_only(before);
-    states_facts_only(after);
 }
 
 #[test]

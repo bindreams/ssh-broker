@@ -5,9 +5,9 @@ use std::path::{Path, PathBuf};
 
 use super::{
     ArgumentsPlan, ConfigKind, CreateOutcome, Decision, Skip, SshdClass, arguments_left, arguments_not_removed,
-    arguments_removed, arguments_removing, arguments_unreadable, carried_block, classify, config_is_file,
-    create_once_at, decide, image_arguments, image_dir, not_written, nothing_to_carry, plan_arguments, remove_temp,
-    render, skip_notice, sshd_search_dirs,
+    arguments_removing, arguments_unreadable, carried_block, classify, config_is_file, create_once_at, decide,
+    image_arguments, image_dir, not_written, nothing_to_carry, plan_arguments, remove_temp, render, skip_notice,
+    sshd_location_unreadable, sshd_search_dirs, system_cmd_unknown,
 };
 use crate::provision::registry::SshdShell;
 use crate::shell::Escaping;
@@ -803,7 +803,7 @@ fn the_arguments_left_text_names_the_value_the_key_and_why() {
     let text = arguments_left(KEY, "\"-NoLogo\"", "there is no config");
     assert_eq!(
         text,
-        r#"install: left DefaultShellArguments ("-NoLogo") under HKLM\SOFTWARE\OpenSSH: there is no config"#
+        r#"left DefaultShellArguments ("-NoLogo") under HKLM\SOFTWARE\OpenSSH: there is no config"#
     );
     states_facts_only(&text);
     after_the_flip(&text);
@@ -814,7 +814,7 @@ fn the_arguments_unreadable_text_names_the_key_and_the_cause() {
     let text = arguments_unreadable(KEY, "i/o error");
     assert_eq!(
         text,
-        r"install: left DefaultShellArguments under HKLM\SOFTWARE\OpenSSH: it could not be read (i/o error)"
+        r"left DefaultShellArguments under HKLM\SOFTWARE\OpenSSH: it could not be read (i/o error)"
     );
     states_facts_only(&text);
     after_the_flip(&text);
@@ -825,20 +825,26 @@ fn the_arguments_removing_text_names_the_value_and_the_key() {
     let text = arguments_removing(KEY, "\"-NoLogo\"");
     assert_eq!(
         text,
-        r#"install: removing DefaultShellArguments ("-NoLogo") from HKLM\SOFTWARE\OpenSSH"#
+        r#"removing DefaultShellArguments ("-NoLogo") from HKLM\SOFTWARE\OpenSSH"#
     );
     states_facts_only(&text);
 }
 
 #[test]
-fn the_arguments_removed_text_names_the_value_and_the_key() {
-    let text = arguments_removed(KEY, "\"-NoLogo\"");
+fn the_notice_for_a_location_of_sshd_that_cannot_be_read_names_the_cause() {
+    let text = sshd_location_unreadable("access denied");
+    assert_eq!(text, "cannot read where sshd runs from: access denied");
+    states_facts_only(&text);
+}
+
+#[test]
+fn the_notice_for_a_shell_that_cannot_be_told_from_the_system_cmd_names_it_and_the_cause() {
+    let text = system_cmd_unknown(Path::new(r"C:\x\cmd.exe"), "access denied");
     assert_eq!(
         text,
-        r#"install: removed DefaultShellArguments ("-NoLogo") from HKLM\SOFTWARE\OpenSSH"#
+        r"cannot tell whether C:\x\cmd.exe is the system cmd.exe: access denied"
     );
     states_facts_only(&text);
-    after_the_flip(&text);
 }
 
 #[test]
@@ -846,7 +852,7 @@ fn the_arguments_not_removed_text_names_the_value_the_key_and_the_cause() {
     let text = arguments_not_removed(KEY, "\"-NoLogo\"", "access denied");
     assert_eq!(
         text,
-        r#"install: could not remove DefaultShellArguments ("-NoLogo") from HKLM\SOFTWARE\OpenSSH: access denied"#
+        r#"could not remove DefaultShellArguments ("-NoLogo") from HKLM\SOFTWARE\OpenSSH: access denied"#
     );
     states_facts_only(&text);
     after_the_flip(&text);

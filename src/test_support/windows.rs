@@ -507,6 +507,19 @@ pub fn logged<T>(f: impl FnOnce() -> T) -> (String, T) {
 
 // Printed texts -----
 
+/// A standard stream that has been closed, as by a dropped SSH connection: every write and flush fails.
+pub struct ClosedStream;
+
+impl std::io::Write for ClosedStream {
+    fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+        Err(std::io::ErrorKind::BrokenPipe.into())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Err(std::io::ErrorKind::BrokenPipe.into())
+    }
+}
+
 /// A line the shell step prints states what happened and holds no advice: the how-to is in the README
 /// ("Shell configuration"), once.
 pub fn states_facts_only(text: &str) {

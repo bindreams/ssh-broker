@@ -8,6 +8,7 @@
 //! for the one value that is deleted afterwards: it takes a [`ShownValue`], which only the print of the
 //! value makes.
 
+use std::io::Write;
 use std::path::Path;
 
 use super::registry::{SshdShell, UnreadShell};
@@ -21,12 +22,18 @@ pub enum Stream {
     Err,
 }
 
-/// Writes a notice to the console: standard output or standard error.
+/// Writes a line to `out` or to `err`, by `stream`. A write that fails loses the line and nothing else: `install`
+/// run over an SSH connection that has gone has a closed stdout, and `println!` would panic on it.
+pub fn say_to(out: &mut impl Write, err: &mut impl Write, stream: Stream, text: &str) {
+    let _ = match stream {
+        Stream::Out => writeln!(out, "{text}"),
+        Stream::Err => writeln!(err, "{text}"),
+    };
+}
+
+/// Writes a line to the console: standard output or standard error. The one sink `install` says its lines to.
 pub fn say_to_console(stream: Stream, text: &str) {
-    match stream {
-        Stream::Out => println!("{text}"),
-        Stream::Err => eprintln!("{text}"),
-    }
+    say_to(&mut std::io::stdout(), &mut std::io::stderr(), stream, text);
 }
 
 /// The previous shell's values were carried into the config, or printed, or there were none to keep.
@@ -41,9 +48,8 @@ impl Handover {
         system_config::nothing_to_carry(previous).then_some(Self(()))
     }
 
-    /// The config now holds the previous shell; `text` says so.
-    fn carried(say: &mut dyn FnMut(Stream, &str), text: &str) -> Self {
-        say(Stream::Out, text);
+    /// The config now holds the previous shell. Nothing is said: the config is the record.
+    fn carried() -> Self {
         Self(())
     }
 
@@ -99,16 +105,7 @@ pub fn hand_over(
     }
     let skip = match decision {
         Decision::Write(block) => match create(&block) {
-            Ok(CreateOutcome::Created) => {
-                return Handover::carried(
-                    say,
-                    &format!(
-                        "install: wrote {} from the shell sshd used before ({})",
-                        config.display(),
-                        previous.shell.as_deref().unwrap_or_default()
-                    ),
-                );
-            }
+            Ok(CreateOutcome::Created) => return Handover::carried(),
             // Someone else created the config between the check and the create: it is never rewritten.
             Ok(CreateOutcome::FileExists) => Skip::FileExists,
             Ok(CreateOutcome::NotAFile) => Skip::NotAFile,
@@ -123,8 +120,8 @@ pub fn hand_over(
 
 /// Remove `DefaultShellArguments` once `DefaultShell` is ssh-broker (see [`system_config::plan_arguments`]
 /// for what is read and left). `config` is the config's path and `key` the registry key. The text with the
-/// value is emitted first and `remove`, which takes the [`ShownValue`] that makes, runs after it; then the
-/// removal, or its failure with the cause, is said. A failed removal leaves the value for the next `install`.
+/// value is emitted first and `remove`, which takes the [`ShownValue`] that makes, runs after it; a failed
+/// removal is said with its cause and leaves the value for the next `install`, and one that worked says nothing.
 pub fn remove_arguments(
     config: &Path,
     key: &str,
@@ -138,12 +135,11 @@ pub fn remove_arguments(
         ArgumentsPlan::Leave(notice) => say(Stream::Err, &notice),
         ArgumentsPlan::Remove(value) => {
             let shown = ShownValue::print(say, &system_config::arguments_removing(key, &value));
-            match remove(&shown) {
-                Ok(()) => say(Stream::Out, &system_config::arguments_removed(key, &value)),
-                Err(e) => say(
+            if let Err(e) = remove(&shown) {
+                say(
                     Stream::Err,
                     &system_config::arguments_not_removed(key, &value, &format!("{e:#}")),
-                ),
+                );
             }
         }
     }

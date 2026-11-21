@@ -181,7 +181,7 @@ fn previous_values(previous: &SshdShell) -> String {
 /// the shell, which nothing else keeps. `reason` says why it is not carried.
 fn not_carried(config: &Path, previous: &SshdShell, reason: &str) -> String {
     format!(
-        "install: {reason}. This install does not carry the shell sshd used before into {config}. install replaces \
+        "{reason}. This install does not carry the shell sshd used before into {config}. install replaces \
          DefaultShell next. Previous values under HKLM\\{key}: {values}",
         config = config.display(),
         key = super::registry::OPENSSH_KEY,
@@ -302,28 +302,34 @@ pub fn plan_arguments(
 /// The notice for a `DefaultShellArguments` `install` leaves: `DefaultShell` is ssh-broker by now, `why`
 /// says why the value stays, and `value` is how it was read.
 pub fn arguments_left(key: &str, value: &str, why: &str) -> String {
-    format!("install: left DefaultShellArguments ({value}) under HKLM\\{key}: {why}")
+    format!("left DefaultShellArguments ({value}) under HKLM\\{key}: {why}")
 }
 
 /// The notice for a `DefaultShellArguments` `install` leaves because it could not read it, with the `cause`.
 /// What sshd does with a value nobody could read is not known, so the text says none of it.
 pub fn arguments_unreadable(key: &str, cause: &str) -> String {
-    format!("install: left DefaultShellArguments under HKLM\\{key}: it could not be read ({cause})")
+    format!("left DefaultShellArguments under HKLM\\{key}: it could not be read ({cause})")
 }
 
 /// The text `install` emits before it removes `DefaultShellArguments`, with the `value` as it was read.
 pub fn arguments_removing(key: &str, value: &str) -> String {
-    format!("install: removing DefaultShellArguments ({value}) from HKLM\\{key}")
-}
-
-/// The notice for a `DefaultShellArguments` `install` removed.
-pub fn arguments_removed(key: &str, value: &str) -> String {
-    format!("install: removed DefaultShellArguments ({value}) from HKLM\\{key}")
+    format!("removing DefaultShellArguments ({value}) from HKLM\\{key}")
 }
 
 /// The notice for a `DefaultShellArguments` `install` could not remove, with the `cause`.
 pub fn arguments_not_removed(key: &str, value: &str, cause: &str) -> String {
-    format!("install: could not remove DefaultShellArguments ({value}) from HKLM\\{key}: {cause}")
+    format!("could not remove DefaultShellArguments ({value}) from HKLM\\{key}: {cause}")
+}
+
+/// The notice for where sshd runs from, which `install` could not read (it looks for the shell where sshd does,
+/// and that includes sshd's own directory).
+pub fn sshd_location_unreadable(cause: &str) -> String {
+    format!("cannot read where sshd runs from: {cause}")
+}
+
+/// The notice for a shell that `install` could not tell from the system `cmd.exe` (see [`carried_block`]).
+pub fn system_cmd_unknown(found: &Path, cause: &str) -> String {
+    format!("cannot tell whether {} is the system cmd.exe: {cause}", found.display())
 }
 
 /// The directories sshd's `CreateProcess` searches for a bare `DefaultShell` before `PATH`, in its

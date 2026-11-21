@@ -1,5 +1,7 @@
 //! provision::report — doctor's human-readable report + exit-code policy (pure).
 
+use std::path::Path;
+
 pub struct Check {
     pub name: &'static str,
     pub pass: bool,
@@ -16,10 +18,23 @@ impl Check {
     }
 }
 
-/// Render an aligned PASS/FAIL table.
-pub fn format_report(rows: &[Check]) -> String {
-    rows.iter()
-        .map(|r| format!("[{}] {:<28} {}", if r.pass { "PASS" } else { "FAIL" }, r.name, r.detail))
+/// The heading of the report: the version and the path of the executable that ran. A path that cannot be read
+/// leaves the version alone. It carries no mark: it judges nothing.
+fn heading(version: &str, exe: Option<&Path>) -> String {
+    match exe {
+        Some(exe) => format!("ssh-broker v{version} ({})", exe.display()),
+        None => format!("ssh-broker v{version}"),
+    }
+}
+
+/// The report: the [heading](heading) of this build (`version` and the path of its `exe`, when it can be read),
+/// then an aligned PASS/FAIL table.
+pub fn format_report(version: &str, exe: Option<&Path>, rows: &[Check]) -> String {
+    std::iter::once(heading(version, exe))
+        .chain(
+            rows.iter()
+                .map(|r| format!("[{}] {:<28} {}", if r.pass { "PASS" } else { "FAIL" }, r.name, r.detail)),
+        )
         .collect::<Vec<_>>()
         .join("\n")
 }

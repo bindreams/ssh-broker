@@ -39,7 +39,23 @@ fn prepare(
     stop_agents: impl FnOnce() -> anyhow::Result<()>,
 ) -> anyhow::Result<PathBuf> {
     let base = ensure_base(layout)?;
-    prepare_in(&base, current_exe, stop_agents)
+    prepare_in(&base, current_exe, &mut quiet, stop_agents)
+}
+
+/// A sink for the tests that do not look at what is said.
+fn quiet(_: Stream, _: &str) {}
+
+/// What `prepare_in` says over `layout`, `source` and a stop that does nothing.
+fn said_by_prepare_in(layout: &Layout, source: &Path) -> Vec<(Stream, String)> {
+    let mut said = Vec::new();
+    prepare_in(
+        &forged(layout),
+        source,
+        &mut |stream, text| said.push((stream, text.to_owned())),
+        || Ok(()),
+    )
+    .unwrap();
+    said
 }
 
 impl Drop for TempBase {
@@ -159,7 +175,7 @@ fn prepare_in_stops_the_agents_before_it_replaces_a_changed_exe() {
     let layout = base.layout();
     let seen = std::cell::RefCell::new(None);
 
-    let exe = prepare_in(&forged(&layout), &source, || {
+    let exe = prepare_in(&forged(&layout), &source, &mut quiet, || {
         *seen.borrow_mut() = Some(std::fs::read_to_string(layout.canonical_exe()).unwrap());
         Ok(())
     })
@@ -181,10 +197,53 @@ fn prepare_in_does_not_stop_agents_when_the_exe_is_unchanged() {
     let source = new_exe(&base, "same build");
     let layout = base.layout();
 
-    prepare_in(&forged(&layout), &source, || {
+    prepare_in(&forged(&layout), &source, &mut quiet, || {
         panic!("the exe is not replaced, so no agent needs to leave")
     })
     .unwrap();
+}
+
+#[test]
+fn prepare_in_says_the_agents_are_stopped_before_it_stops_them_and_only_when_it_replaces_an_exe() {
+    let base = TempBase::existing("prepare-says-stop");
+    std::fs::write(base.0.join("ssh-broker.exe"), "old build").unwrap();
+    let source = new_exe(&base, "new build");
+    let layout = base.layout();
+    let said = std::cell::RefCell::new(Vec::new());
+
+    prepare_in(
+        &forged(&layout),
+        &source,
+        &mut |stream, text| said.borrow_mut().push((stream, text.to_owned())),
+        || {
+            assert_eq!(said.borrow().len(), 1, "the line comes before the stop");
+            Ok(())
+        },
+    )
+    .unwrap();
+
+    let said = said.into_inner();
+    assert_eq!(
+        said,
+        [(
+            Stream::Out,
+            "Stopping the running agents; their SSH sessions end...".to_owned()
+        )]
+    );
+}
+
+#[test]
+fn a_step_that_does_not_happen_says_nothing_when_the_exe_is_unchanged_or_new() {
+    // The installed build again: nothing is stopped, so nothing is said.
+    let same = TempBase::existing("prepare-says-same");
+    std::fs::write(same.0.join("ssh-broker.exe"), "same build").unwrap();
+    let source = new_exe(&same, "same build");
+    assert_eq!(said_by_prepare_in(&same.layout(), &source), []);
+
+    // A first install: no exe is installed, so no agent holds it.
+    let first = TempBase::existing("prepare-says-first");
+    let source = new_exe(&first, "new build");
+    assert_eq!(said_by_prepare_in(&first.layout(), &source), []);
 }
 
 #[test]
@@ -196,7 +255,7 @@ fn prepare_in_changes_nothing_when_agents_cannot_be_stopped_for_an_update() {
 
     let err = format!(
         "{:#}",
-        prepare_in(&forged(&layout), &source, || anyhow::bail!("access denied")).unwrap_err()
+        prepare_in(&forged(&layout), &source, &mut quiet, || anyhow::bail!("access denied")).unwrap_err()
     );
 
     assert!(err.contains("access denied"), "{err}");
@@ -219,7 +278,10 @@ fn prepare_in_fails_when_the_exe_is_still_in_use_after_the_stop() {
         .open(layout.canonical_exe())
         .unwrap();
 
-    let err = format!("{:#}", prepare_in(&forged(&layout), &source, || Ok(())).unwrap_err());
+    let err = format!(
+        "{:#}",
+        prepare_in(&forged(&layout), &source, &mut quiet, || Ok(())).unwrap_err()
+    );
 
     assert!(err.contains("in use"), "{err}");
     assert!(err.contains("started by hand"), "{err}");
@@ -278,7 +340,10 @@ fn prepare_in_reports_a_failed_copy_by_its_cause() {
     let layout = base.layout();
     std::fs::create_dir(layout.canonical_exe()).unwrap();
 
-    let err = format!("{:#}", prepare_in(&forged(&layout), &source, || Ok(())).unwrap_err());
+    let err = format!(
+        "{:#}",
+        prepare_in(&forged(&layout), &source, &mut quiet, || Ok(())).unwrap_err()
+    );
 
     assert!(err.contains("ssh-broker.exe"), "{err}");
     assert!(err.contains("os error"), "{err}");
@@ -291,7 +356,7 @@ fn prepare_in_does_not_stop_agents_when_no_exe_is_installed() {
     let source = new_exe(&base, "new build");
     let layout = base.layout();
 
-    prepare_in(&forged(&layout), &source, || {
+    prepare_in(&forged(&layout), &source, &mut quiet, || {
         panic!("there is no installed exe, so no agent holds it")
     })
     .unwrap();
