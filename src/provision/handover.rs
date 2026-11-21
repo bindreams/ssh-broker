@@ -16,32 +16,8 @@ use std::path::Path;
 
 use super::registry::{SshdShell, UnreadShell};
 use super::system_config::{self, ArgumentsPlan, ConfigKind, CreateOutcome, Decision, Skip};
+use super::{Say, Stream};
 use crate::shell::config::ShellBlock;
-
-/// Where a line goes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Stream {
-    Out,
-    Err,
-}
-
-/// The sink for `install`'s lines: takes the stream and the line. A failed write loses the line ([`say_to`]). The two
-/// value notices ([`Handover::printed`], [`ShownValue::print`]) do not use it.
-pub type Say<'a> = dyn FnMut(Stream, &str) + 'a;
-
-/// Writes a line to `out` or to `err`, by `stream`. `install` run over an SSH connection that has gone has a closed
-/// stdout, and `println!` would panic on it.
-pub fn say_to(out: &mut impl Write, err: &mut impl Write, stream: Stream, text: &str) {
-    let _ = match stream {
-        Stream::Out => writeln!(out, "{text}"),
-        Stream::Err => writeln!(err, "{text}"),
-    };
-}
-
-/// The [`Say`] `install` uses.
-pub fn say_to_console(stream: Stream, text: &str) {
-    say_to(&mut std::io::stdout(), &mut std::io::stderr(), stream, text);
-}
 
 /// The proof that a notice was written. Only [`show_to`] and the tests of this module build one, so a `show` that
 /// returns it is the strict writer.

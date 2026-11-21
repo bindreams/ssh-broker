@@ -1,7 +1,8 @@
 //! Host tests for the order of the hand-over and every sentence of it, over a stand-in for the task and the
 //! report. The real Task Scheduler is measured by `tests/sshd_config_windows.rs`, which CI runs.
 use super::*;
-use crate::provision::sshd_task::{LineKind, REPORT_END, render};
+use crate::provision::sshd_config::{LineKind, render};
+use crate::provision::sshd_task::REPORT_END;
 use crate::test_support::{FakeSshdTask, TaskLog};
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -11,13 +12,15 @@ const EXE: &str = r"C:\ProgramData\ssh-broker\ssh-broker.exe";
 const TASK: &str = "ssh-broker-install-sshd";
 
 const STEP_LINE: &str = "Setting up sshd to accept SSH_BROKER_ELEVATION; sshd may be restarted, and a connection over SSH may drop \
-     now. If it does, C:\\ProgramData\\ssh-broker\\ssh-broker.exe doctor says whether the install finished...";
+     now. What the step does is written to C:\\ProgramData\\ssh-broker\\install-sshd.log, and \
+     C:\\ProgramData\\ssh-broker\\ssh-broker.exe doctor says whether sshd accepts the variable...";
 
-/// What is said of a report that has no closing line, which says both things it can mean.
+/// What is said of a report that has no closing line, which says both things it can mean and that the lines the
+/// step had written follow, whether or not there are any.
 const NO_CLOSING_LINE: &str = "the report of the task ssh-broker-install-sshd has no closing line: the task was ended \
-     before its step finished, or a line of the report could not be written; its lines are in the report, \
-     C:\\ProgramData\\ssh-broker\\install-sshd.log, and its warnings follow. Check sshd at this PC: `sc query sshd`; \
-     start it with `net start sshd` if it is stopped.";
+     before its step finished, or a line of the report could not be written. Check sshd at this PC: `sc query \
+     sshd`; start it with `net start sshd` if it is stopped. The lines the step had written, if any, follow; they \
+     say how far it got.";
 
 const ADD_BY_HAND: &str = "add `AcceptEnv SSH_BROKER_ELEVATION` above the first `Match` in \
      C:\\ProgramData\\ssh\\sshd_config, then run `ssh-broker install` again, which restarts sshd";
@@ -106,8 +109,13 @@ fn the_step_line_is_said_after_the_task_is_started_and_before_anything_waits_for
 }
 
 #[test]
-fn the_step_line_names_doctor_by_its_path() {
-    assert_eq!(step_line(Path::new(EXE)), STEP_LINE);
+fn the_step_line_names_the_report_and_doctor_by_their_paths() {
+    assert_eq!(step_line(Path::new(EXE), Path::new(REPORT)), STEP_LINE);
+    assert!(STEP_LINE.contains(REPORT) && STEP_LINE.contains(&format!("{EXE} doctor")));
+    assert!(
+        !STEP_LINE.contains("finished"),
+        "`doctor` does not read the task or the report, so it is not said to tell whether the install finished"
+    );
     assert!(STEP_LINE.starts_with(HANDED_OVER_PREFIX));
     assert!(
         STEP_LINE.ends_with("..."),
@@ -124,7 +132,7 @@ fn a_warning_of_the_step_is_said_on_stderr_and_a_note_is_not_said() {
     fake.report = Ok(closed(&[
         (
             LineKind::Note,
-            "sshd is not running; it reads the change when it starts",
+            "sshd was started before sshd_config was last changed, so it has not read it",
         ),
         (LineKind::Warning, ADD_BY_HAND),
         (LineKind::Note, "restarting sshd"),
@@ -183,23 +191,42 @@ fn a_run_with_only_notes_says_only_the_step_line() {
     assert_eq!(said(&log), [format!("Out: {STEP_LINE}")]);
 }
 
+/// The notes of a report that stopped say how far the step got ("sshd was stopped; starting sshd" means sshd may be
+/// stopped now), so they are shown with the warnings, every line in its order, after the warning that the report
+/// has no closing line.
 #[test]
-fn a_report_without_its_closing_line_is_a_warning_that_comes_before_the_warnings_it_holds() {
+fn a_report_without_its_closing_line_is_said_whole_after_the_warning_that_it_has_none() {
     let log = new_log();
     let mut fake = FakeSshdTask::new(&log);
     fake.report = Ok(unclosed(&[
         (LineKind::Note, "restarting sshd"),
-        (LineKind::Warning, "sshd could not be stopped (access denied)"),
+        (LineKind::Note, "sshd was stopped; starting sshd"),
+        (LineKind::Warning, "sshd could not be started (access denied)\nline 2"),
     ]));
     let log = run(&mut fake);
     assert_eq!(
         said(&log)[1..],
         [
             format!("Err: {NO_CLOSING_LINE}"),
-            "Err: sshd could not be stopped (access denied)".to_owned(),
+            "Err: restarting sshd".to_owned(),
+            "Err: sshd was stopped; starting sshd".to_owned(),
+            "Err: sshd could not be started (access denied)".to_owned(),
+            "Err: line 2".to_owned(),
         ]
     );
     assert_eq!(calls(&log), ["register", "run", "wait", "report", "remove"]);
+}
+
+#[test]
+fn a_report_with_its_closing_line_is_said_by_its_warnings_alone_even_when_it_has_notes() {
+    let log = new_log();
+    let mut fake = FakeSshdTask::new(&log);
+    fake.report = Ok(closed(&[
+        (LineKind::Note, "sshd was stopped; starting sshd"),
+        (LineKind::Warning, "a warning"),
+    ]));
+    let log = run(&mut fake);
+    assert_eq!(said(&log)[1..], ["Err: a warning"]);
 }
 
 #[test]
@@ -284,7 +311,7 @@ fn a_missing_report_is_said_and_the_task_is_still_removed() {
         &format!(
             "Err: the report of the task ssh-broker-install-sshd could not be read in {REPORT} (the system cannot \
              find the file specified); if it is not there, the task did not start or could not create it. Whether \
-             sshd accepts SSH_BROKER_ELEVATION and is running is not known: `ssh-broker doctor` says, and `sc query \
+             sshd accepts SSH_BROKER_ELEVATION and is running is not known: `{EXE} doctor` says, and `sc query \
              sshd` shows whether sshd runs"
         )
     );

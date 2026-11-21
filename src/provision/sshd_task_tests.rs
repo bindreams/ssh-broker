@@ -5,25 +5,6 @@ use super::*;
 // what a line of the report is =====
 
 #[test]
-fn a_warning_is_told_from_a_note_by_its_prefix_in_the_report() {
-    assert_eq!(WARNING_PREFIX, "warning: ");
-    assert_eq!(render(LineKind::Note, "sshd restarted"), "sshd restarted");
-    assert_eq!(
-        render(LineKind::Warning, "sshd is NOT running"),
-        "warning: sshd is NOT running"
-    );
-}
-
-#[test]
-fn every_line_of_a_warning_that_has_several_is_a_warning_in_the_report() {
-    assert_eq!(
-        render(LineKind::Warning, "sshd rejects it: line 1\nline 2"),
-        "warning: sshd rejects it: line 1\nwarning: line 2"
-    );
-    assert_eq!(render(LineKind::Note, "line 1\nline 2"), "line 1\nline 2");
-}
-
-#[test]
 fn a_reported_text_is_read_as_its_lines_and_their_kinds() {
     let parsed = Report::parse("a note\r\nwarning: a warning\r\nanother note\r\n");
     assert_eq!(
@@ -71,6 +52,89 @@ fn a_line_that_is_written_is_read_back_as_it_was_said() {
     );
     assert_eq!(parsed.lines.len(), 4);
     assert_eq!(parsed.lines[0].kind, LineKind::Note);
+}
+
+/// What `Report::parse` reads of `said` after the verb has written it: every line with its kind and text.
+fn written_and_read(said: &[(LineKind, &str)]) -> Vec<(LineKind, String)> {
+    let mut out = Vec::new();
+    write_lines(&mut out, |say| {
+        for (kind, text) in said {
+            say(*kind, text);
+        }
+    })
+    .unwrap();
+    let parsed = Report::parse(&String::from_utf8(out).unwrap());
+    assert!(parsed.complete);
+    parsed.lines.into_iter().map(|line| (line.kind, line.text)).collect()
+}
+
+/// A note that begins with the warning's prefix is written so that `parse` reads it back as a note, and as the text
+/// it was: it cannot become a warning, which `install` would show.
+#[test]
+fn a_note_that_begins_with_the_warning_prefix_is_read_back_as_that_note() {
+    for text in [
+        "warning: this is a note",
+        " warning: one space is a space of the note",
+        "  warning: two",
+        "warning: ",
+    ] {
+        assert_eq!(
+            written_and_read(&[(LineKind::Note, text)]),
+            [(LineKind::Note, text.to_owned())],
+            "{text:?}"
+        );
+    }
+}
+
+#[test]
+fn a_note_of_several_lines_one_of_which_begins_with_the_warning_prefix_stays_a_note() {
+    assert_eq!(
+        written_and_read(&[(LineKind::Note, "first\nwarning: second\nthird")]),
+        [
+            (LineKind::Note, "first".to_owned()),
+            (LineKind::Note, "warning: second".to_owned()),
+            (LineKind::Note, "third".to_owned()),
+        ]
+    );
+}
+
+#[test]
+fn a_warning_whose_text_begins_like_a_warning_is_one_warning_with_that_text() {
+    assert_eq!(
+        written_and_read(&[
+            (LineKind::Warning, "warning: twice"),
+            (LineKind::Warning, " warning: spaced")
+        ]),
+        [
+            (LineKind::Warning, "warning: twice".to_owned()),
+            (LineKind::Warning, " warning: spaced".to_owned()),
+        ]
+    );
+}
+
+/// An empty text is one empty line of its kind, as every line was written before kinds.
+#[test]
+fn an_empty_text_is_one_empty_line_of_its_kind() {
+    assert_eq!(
+        written_and_read(&[(LineKind::Note, ""), (LineKind::Warning, "")]),
+        [(LineKind::Note, String::new()), (LineKind::Warning, String::new())]
+    );
+}
+
+#[test]
+fn a_text_with_crlf_line_breaks_is_read_back_as_its_lines_with_their_kinds() {
+    assert_eq!(
+        written_and_read(&[
+            (LineKind::Note, "first\r\nwarning: second\r\n"),
+            (LineKind::Warning, "one\r\ntwo"),
+        ]),
+        [
+            (LineKind::Note, "first".to_owned()),
+            (LineKind::Note, "warning: second".to_owned()),
+            (LineKind::Warning, "one".to_owned()),
+            (LineKind::Warning, "two".to_owned()),
+        ]
+    );
 }
 
 #[test]

@@ -19,9 +19,9 @@ use anyhow::Context;
 
 use super::restart::{Before, ServiceState, StartOutcome, StopOutcome, restart};
 use super::{
-    ACCEPT_LINE, DROP_IN_DIR_NAME, INCLUDE_LINE, VARIABLE, drop_in_text, in_force, include_elsewhere, with_line,
+    ACCEPT_LINE, DROP_IN_DIR_NAME, INCLUDE_LINE, LineKind, VARIABLE, drop_in_text, in_force, include_elsewhere,
+    with_line,
 };
-use crate::provision::sshd_task::LineKind;
 
 /// Why the drop-in folder or the drop-in cannot be used.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -163,8 +163,7 @@ pub fn config_read(host: &mut dyn SshdHost) -> anyhow::Result<ConfigRead> {
     Ok(ConfigRead::Read)
 }
 
-/// Make sshd accept the variable, and say what was done on `say` (a line each, with its [`LineKind`]: a note says
-/// what the step did or found, a warning what the person must do or what the step could not do or find out).
+/// Make sshd accept the variable, and say what was done on `say` (a line each, with its [`LineKind`]).
 /// Returns whether the running sshd takes the variable, or reads it when it next starts (it is not running); false
 /// when it does not, because it could not be restarted to read the files or the variable could not be put in
 /// force, and when that cannot be told.
@@ -313,7 +312,7 @@ fn say_whether_read(host: &mut dyn SshdHost, say: &mut dyn FnMut(LineKind, &str)
         }
         Ok(ConfigRead::AheadOfClock(file)) => {
             say(
-                LineKind::Warning,
+                LineKind::Note,
                 &format!(
                     "{}'s change time is ahead of this machine's clock, so it cannot be told whether sshd has read it",
                     file.display()
@@ -323,7 +322,7 @@ fn say_whether_read(host: &mut dyn SshdHost, say: &mut dyn FnMut(LineKind, &str)
         }
         Ok(ConfigRead::IncludesOther { file, line }) => {
             say(
-                LineKind::Warning,
+                LineKind::Note,
                 &format!(
                     "{} has `{line}`; files sshd includes from elsewhere are not judged, so it cannot be told \
                      whether sshd has read its configuration, and it is restarted to be sure it accepts {VARIABLE}",
@@ -334,7 +333,7 @@ fn say_whether_read(host: &mut dyn SshdHost, say: &mut dyn FnMut(LineKind, &str)
         }
         Err(e) if before.changed() => {
             say(
-                LineKind::Warning,
+                LineKind::Note,
                 &format!(
                     "cannot tell whether sshd has read its configuration ({e:#}); this run changed it, so it has not"
                 ),

@@ -4,9 +4,9 @@
 use std::path::Path;
 
 use super::Report;
-use crate::provision::handover::{Say, Stream};
 use crate::provision::schtasks::{INSTALL_SSHD_TASK, WaitOutcome, end_and_remove_install_sshd_task};
 use crate::provision::sshd_config::CHECK_SSHD;
+use crate::provision::{Say, Stream};
 
 /// What the hand-over needs of the Task Scheduler and the report.
 pub trait SshdTask {
@@ -27,13 +27,16 @@ pub trait SshdTask {
 /// waits for it.
 pub const HANDED_OVER_PREFIX: &str = "Setting up sshd to accept SSH_BROKER_ELEVATION";
 
-/// The step line: what is about to happen to sshd, that a connection over SSH may drop, and how to tell afterwards
-/// whether the install finished. `exe` is the installed exe, named by its path because the window `install` was
-/// typed in does not see the new `PATH`.
-pub fn step_line(exe: &Path) -> String {
+/// The step line: what is about to happen to sshd, that a connection over SSH may drop, where what the step does is
+/// written, and how to tell afterwards whether sshd accepts the variable. It is all the person has while the task
+/// runs and when the connection drops, so it names the `report` and the installed `exe` (by its path: the window
+/// `install` was typed in does not see the new `PATH`). `doctor` reads neither the task nor the report, so it is
+/// not said to tell whether the install finished.
+pub fn step_line(exe: &Path, report: &Path) -> String {
     format!(
-        "{HANDED_OVER_PREFIX}; sshd may be restarted, and a connection over SSH may drop now. If it does, {} doctor \
-         says whether the install finished...",
+        "{HANDED_OVER_PREFIX}; sshd may be restarted, and a connection over SSH may drop now. What the step does is \
+         written to {}, and {} doctor says whether sshd accepts the variable...",
+        report.display(),
         exe.display()
     )
 }
@@ -43,10 +46,12 @@ pub fn step_line(exe: &Path) -> String {
 ///
 /// The step line (stdout) is said right after the task is started and before the wait, so an `install` ended from
 /// there on leaves the step to the task. When the instances have ended, each warning of the report is said on
-/// stderr, and the task is removed; the notes of the report stay in the report. Every line of this function is a
-/// warning, said on stderr: the task could not be registered, started or removed, the report could not be read, or
-/// it is not whole (its last line, [`REPORT_END`](super::REPORT_END), is missing: the task's process ended before
-/// the step did, or a line could not be written). A wait that cannot say the instances ended leaves the task
+/// stderr, and the task is removed; the notes of the report stay in the report. Every line of this function's own
+/// is a warning, said on stderr: the task could not be registered, started or removed, the report could not be
+/// read, or it is not whole (its last line, [`REPORT_END`](super::REPORT_END), is missing: the task's process ended
+/// before the step did, or a line could not be written). A report that is not whole is said whole after that
+/// warning, every line of it, notes and warnings, in order: the notes say how far the step got, and sshd may be
+/// stopped. A wait that cannot say the instances ended leaves the task
 /// registered and the report unread, and says that the step may still run: nothing is concluded from it. A step
 /// that could not be handed over says no step line. No failure fails `install`.
 pub fn hand_over(task: &mut dyn SshdTask, report: &Path, exe: &Path, say: &mut Say<'_>) {
@@ -60,7 +65,7 @@ pub fn hand_over(task: &mut dyn SshdTask, report: &Path, exe: &Path, say: &mut S
         remove(task, &mut warn);
         return;
     }
-    say(Stream::Out, &step_line(exe));
+    say(Stream::Out, &step_line(exe, report));
     let mut warn = |text: &str| say(Stream::Err, text);
 
     match task.wait() {
@@ -90,26 +95,31 @@ pub fn hand_over(task: &mut dyn SshdTask, report: &Path, exe: &Path, say: &mut S
     match task.report() {
         Ok(text) => {
             let report_read = Report::parse(&text);
-            if !report_read.complete {
+            if report_read.complete {
+                for text in report_read.warnings() {
+                    warn(text);
+                }
+            } else {
+                // The notes of a report that stopped say how far the step got: every line is shown, in order.
                 warn(&format!(
                     "the report of the task {INSTALL_SSHD_TASK} has no closing line: the task was ended before its \
-                     step finished, or a line of the report could not be written; its lines are in the report, {}, \
-                     and its warnings follow. {CHECK_SSHD}",
-                    report.display()
+                     step finished, or a line of the report could not be written. {CHECK_SSHD} The lines the step \
+                     had written, if any, follow; they say how far it got."
                 ));
                 if report_read.lines.is_empty() {
                     warn(&format!("the task {INSTALL_SSHD_TASK} had said nothing"));
                 }
-            }
-            for text in report_read.warnings() {
-                warn(text);
+                for line in &report_read.lines {
+                    warn(&line.text);
+                }
             }
         }
         Err(e) => warn(&format!(
             "the report of the task {INSTALL_SSHD_TASK} could not be read in {} ({e:#}); if it is not there, the \
              task did not start or could not create it. Whether sshd accepts SSH_BROKER_ELEVATION and is running is \
-             not known: `ssh-broker doctor` says, and `sc query sshd` shows whether sshd runs",
-            report.display()
+             not known: `{} doctor` says, and `sc query sshd` shows whether sshd runs",
+            report.display(),
+            exe.display()
         )),
     }
     remove(task, &mut warn);

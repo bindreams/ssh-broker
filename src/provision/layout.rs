@@ -8,8 +8,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 
-use super::handover::{Say, Stream};
 use super::report::Check;
+use super::{Say, Stream};
 use crate::acl;
 
 /// The install directory and the paths derived from it.

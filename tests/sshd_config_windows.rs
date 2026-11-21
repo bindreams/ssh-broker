@@ -24,7 +24,8 @@ use ssh_broker::provision::sshd_config::machine::{
 };
 use ssh_broker::provision::sshd_config::restart::{ServiceState, StartOutcome, StartReply, StopOutcome};
 use ssh_broker::provision::sshd_config::{
-    ACCEPT_LINE, DROP_IN_NAME, INCLUDE_LINE, SshdReading, accepts, accepts_row, drop_in_text, in_force, with_line,
+    ACCEPT_LINE, DROP_IN_NAME, INCLUDE_LINE, LineKind, SshdReading, accepts, accepts_row, drop_in_text, in_force,
+    render, with_line,
 };
 use ssh_broker::provision::sshd_task;
 use ssh_broker::provision::{BASE_DIR, canonical_exe, installed_line, version};
@@ -74,7 +75,7 @@ use windows::Win32::System::Threading::WaitForSingleObject;
 /// report holds them (a warning begins with `warning: `, a note with nothing).
 fn configure() -> (bool, Vec<String>) {
     let mut said = Vec::new();
-    let accepted = configure_this_machine(&mut |kind, text| said.push(sshd_task::render(kind, text)));
+    let accepted = configure_this_machine(&mut |kind, text| said.push(render(kind, text)));
     (accepted, said)
 }
 
@@ -162,11 +163,7 @@ fn report() -> sshd_task::Report {
 
 /// The lines of `report`, as the report file holds them.
 fn rendered(report: &sshd_task::Report) -> Vec<String> {
-    report
-        .lines
-        .iter()
-        .map(|line| sshd_task::render(line.kind, &line.text))
-        .collect()
+    report.lines.iter().map(|line| render(line.kind, &line.text)).collect()
 }
 
 /// No task of the sshd step is left registered.
@@ -187,9 +184,11 @@ fn system_cmd() -> PathBuf {
 
 /// The step on the runner's stock file, run by `install` through its task, as SYSTEM: the drop-in, the `Include` line
 /// above the first `Match`, the original's security on the replacement (SYSTEM can create the drop-in and
-/// `copy_file_security` works as SYSTEM), and the restart of sshd. No task is left after `install`. `install` says
-/// the step line, last before the installed line, and prints on standard error the warnings of the report and none
-/// of its notes. After the restart the `doctor` row passes and a second run says nothing.
+/// `copy_file_security` works as SYSTEM), and the restart of sshd. No task is left after `install`. A healthy first
+/// install says the step line, last before the installed line, and nothing of the step on standard error: its
+/// report is complete and holds no warning, and what the step did is in its notes. Every line on standard output but
+/// the last ends in `...`, and no line on either stream begins with `install`. After the restart the `doctor` row
+/// passes and a second run says nothing.
 #[test]
 fn install_s_sshd_step_adds_the_drop_in_and_the_include_above_the_first_match_and_the_row_passes() {
     let _machine = machine::exclusive();
@@ -208,26 +207,44 @@ fn install_s_sshd_step_adds_the_drop_in_and_the_include_above_the_first_match_an
         Some(&installed.as_str()),
         "install's last line says it is installed:\n{stdout}"
     );
-    assert!(
-        out_lines[out_lines.len() - 2].starts_with(sshd_task::HANDED_OVER_PREFIX),
-        "the step line is the last before the installed line:\n{stdout}"
+    assert_eq!(
+        out_lines[out_lines.len() - 2],
+        sshd_task::step_line(&canonical_exe(), &sshd_task::report_path()),
+        "the step line is the last before the installed line, and names the report and the installed exe:\n{stdout}"
     );
-    let report = report();
-    let warnings: Vec<&str> = report.warnings().collect();
-    let err_lines: Vec<&str> = stderr.lines().collect();
-    assert!(
-        err_lines.ends_with(&warnings),
-        "install prints the warnings of the report, last on standard error:\n{stderr}\n{warnings:#?}"
-    );
-    for note in report
-        .lines
-        .iter()
-        .filter(|line| line.kind == sshd_task::LineKind::Note)
-    {
+    assert!(out_lines[out_lines.len() - 2].starts_with(sshd_task::HANDED_OVER_PREFIX));
+    for line in &out_lines[..out_lines.len() - 1] {
+        assert!(line.ends_with("..."), "a step line says that it is going on: {line}");
+    }
+    for line in stdout.lines().chain(stderr.lines()) {
+        let first = line.split(|c: char| !c.is_alphanumeric()).next().unwrap_or_default();
         assert!(
-            !stdout.contains(&note.text) && !stderr.contains(&note.text),
-            "install printed a note of the report: {}",
-            note.text
+            !first.eq_ignore_ascii_case("install"),
+            "a line begins with the verb: {line}"
+        );
+    }
+    let report = report();
+    assert!(
+        report.complete,
+        "the report ends with its closing line: {:#?}",
+        report.lines
+    );
+    assert_eq!(
+        report.warnings().collect::<Vec<_>>(),
+        Vec::<&str>::new(),
+        "a healthy first install reports no warning"
+    );
+    assert_eq!(
+        report.lines.last().map(|line| line.kind),
+        Some(LineKind::Note),
+        "the report's last line is a note that says what the step did"
+    );
+    // Standard error holds no line of the step: not a line of the report, and none of `hand_over`'s own warnings
+    // (each of which names the task).
+    for line in stderr.lines() {
+        assert!(
+            !line.contains(schtasks::INSTALL_SSHD_TASK) && report.lines.iter().all(|reported| reported.text != line),
+            "standard error holds a line of the sshd step: {line}"
         );
     }
     let said = rendered(&report);
@@ -259,6 +276,41 @@ fn install_s_sshd_step_adds_the_drop_in_and_the_include_above_the_first_match_an
     // A second run changes nothing: sshd started after every file was written, so the step has nothing to say.
     let (again, said) = configure();
     assert!(again && said.is_empty(), "{said:#?}");
+}
+
+/// A warning of the step is on standard error. A drop-in that sshd rejects makes `sshd_config` need a line added by
+/// hand: the step changes nothing, says in a warning which line to add, and `install` shows that warning on standard
+/// error, where the report (which `install` ran as the task) holds it too. The step line is still said first.
+#[test]
+fn install_says_on_standard_error_which_line_to_add_when_sshd_config_cannot_be_edited() {
+    let _machine = machine::exclusive();
+    account_fixture::assert_elevated();
+    let _install = Install::capture();
+    let _running = SshdRunningAtTheEnd;
+    reset();
+    let _reset = ResetAtTheEnd;
+    create_install_dir(&drop_in_dir()).expect("make the drop-in folder");
+    std::fs::write(drop_in_dir().join("99-broken.conf"), "ThisIsNotAnSshdOption yes\r\n").unwrap();
+    let kit = Kit::broker_with_helper("sshw");
+
+    let (stdout, stderr) = install_streams(&kit);
+    let report = report();
+    let advice: Vec<&str> = report
+        .warnings()
+        .filter(|warning| warning.contains(ACCEPT_LINE) && warning.contains("above the first `Match`"))
+        .collect();
+    assert_eq!(advice.len(), 1, "{:#?}", report.lines);
+    assert!(
+        stderr.lines().any(|line| line == advice[0]),
+        "the warning is on standard error:\n{stderr}\n{advice:?}"
+    );
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line.starts_with(sshd_task::HANDED_OVER_PREFIX)),
+        "the step line is on standard output:\n{stdout}"
+    );
+    assert_no_sshd_task_is_left();
 }
 
 /// An `Include` that covers the drop-in is already there: the file is not touched and the variable is accepted

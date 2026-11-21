@@ -4,7 +4,7 @@
 use super::super::restart::StartReply;
 use super::super::{ACCEPT_LINE, DROP_IN_NAME, INCLUDE_LINE, drop_in_text, with_line};
 use super::*;
-use crate::provision::sshd_task::render;
+use crate::provision::sshd_config::render;
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::rc::Rc;
@@ -539,8 +539,8 @@ fn a_file_written_in_the_tick_sshd_started_in_is_judged_unread() {
 fn a_file_whose_time_is_ahead_of_the_clock_cannot_be_judged_and_sshd_is_restarted_each_time() {
     let mut host = Fake::configured();
     host.config_time = host.clock + 1000;
-    let why = "warning: sshd_config's change time is ahead of this machine's clock, so it cannot be told whether \
-               sshd has read it"
+    let why = "sshd_config's change time is ahead of this machine's clock, so it cannot be told whether sshd has \
+               read it"
         .to_owned();
     for _ in 0..2 {
         host.restarts_cleanly();
@@ -559,8 +559,7 @@ fn a_file_whose_time_is_ahead_of_the_clock_cannot_be_judged_and_sshd_is_restarte
     assert_eq!(
         said,
         restarted_for(format!(
-            "warning: {}'s change time is ahead of this machine's clock, so it cannot be told whether sshd has \
-             read it",
+            "{}'s change time is ahead of this machine's clock, so it cannot be told whether sshd has read it",
             Fake::folder().display()
         ))
     );
@@ -588,10 +587,10 @@ fn a_time_that_cannot_be_read_says_so() {
 
 // every file sshd reads =====
 
-/// What `install` says of an `Include` of another location in `file`.
+/// What `install` says of an `Include` of another location in `file`: a note, as sshd is restarted to be sure.
 fn includes_other(file: &str, line: &str) -> String {
     format!(
-        "warning: {file} has `{line}`; files sshd includes from elsewhere are not judged, so it cannot be told \
+        "{file} has `{line}`; files sshd includes from elsewhere are not judged, so it cannot be told \
          whether sshd has read its configuration, and it is restarted to be sure it accepts SSH_BROKER_ELEVATION"
     )
 }
@@ -1082,7 +1081,7 @@ fn a_change_made_in_this_run_is_restarted_for_even_when_the_time_of_the_start_ca
     assert_eq!(said[said.len() - 2], RESTARTING);
     assert_eq!(said.last().unwrap(), RESTARTED);
     assert!(
-        said[said.len() - 3].starts_with("warning: cannot tell whether sshd has read its configuration (")
+        said[said.len() - 3].starts_with("cannot tell whether sshd has read its configuration (")
             && said[said.len() - 3].ends_with("); this run changed it, so it has not"),
         "{said:?}"
     );

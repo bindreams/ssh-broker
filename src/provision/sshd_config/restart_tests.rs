@@ -4,7 +4,7 @@
 use super::super::configure::configure_tests::Fake;
 use super::super::{DROP_IN_NAME, INCLUDE_LINE, drop_in_text, with_line};
 use super::*;
-use crate::provision::sshd_task::render;
+use crate::provision::sshd_config::render;
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -113,10 +113,11 @@ fn a_paused_service_is_left_as_it_is_and_the_advice_is_to_resume_it() {
 /// What the service manager answers a STOP that sshd's control handler did not answer in time.
 const NO_ANSWER: &str = "The service did not respond to the start or control request in a timely fashion. (1053)";
 
-/// What is said before the wait for an sshd that did not answer the stop, given the service manager's `reply`.
+/// What is said before the wait for an sshd that did not answer the stop, given the service manager's `reply`. A
+/// warning: it is the only line that says how to end a wait that has no bound.
 fn stop_unanswered_line(reply: &str) -> String {
     format!(
-        "sshd did not answer the stop in time ({reply}) and the service manager says it is still running; \
+        "warning: sshd did not answer the stop in time ({reply}) and the service manager says it is still running; \
          install waits, with no time limit, for that sshd to exit, and then starts it. To stop waiting, end the \
          task ssh-broker-install-sshd (`schtasks /End /TN ssh-broker-install-sshd`, elevated) and run `ssh-broker \
          install` again; nothing then starts an sshd that exits later. Check sshd at this PC: `sc query sshd`; \

@@ -3,12 +3,12 @@
 
 use anyhow::Context;
 
-use super::handover::{Say, Stream};
 use super::path_env;
 use super::procwait::{self, StillRunning, Survivor};
 use super::schtasks::{INSTALL_SSHD_TASK, WaitOutcome, end_and_remove_install_sshd_task};
 use super::sessions::Targets;
 use super::sshd_config::CHECK_SSHD;
+use super::{Say, Stream};
 
 /// Run `install`: say that it starts, run `body` (everything up to the sshd step, which gives back what must be
 /// held until the end, the lock), run `sshd_step` with the same sink, then say that ssh-broker has been

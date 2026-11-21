@@ -1,5 +1,6 @@
 use super::*;
-use crate::provision::sshd_task::{LineKind, REPORT_END, hand_over, render};
+use crate::provision::sshd_config::{LineKind, render};
+use crate::provision::sshd_task::{REPORT_END, hand_over};
 use crate::test_support::{FakeSshdTask, Said, recording, silent};
 use anyhow::Context;
 use std::cell::RefCell;
@@ -874,7 +875,7 @@ fn the_path_is_announced_before_it_is_written_and_the_programs_told_after() {
 
 const EXE: &str = r"C:\ProgramData\ssh-broker\ssh-broker.exe";
 const REPORT: &str = r"C:\ProgramData\ssh-broker\install-sshd.log";
-const NOTE_OF_THE_STEP: &str = "sshd is not running; it reads the change when it starts";
+const NOTE_OF_THE_STEP: &str = "sshd restarted; it accepts SSH_BROKER_ELEVATION";
 const WARNING_OF_THE_STEP: &str = "add `AcceptEnv SSH_BROKER_ELEVATION` above the first `Match` in sshd_config";
 
 /// The lines of a first install on a machine with trouble at every step that goes on: the waits, the PATH, the
@@ -969,7 +970,10 @@ fn every_stdout_line_but_the_last_ends_in_three_dots() {
 #[test]
 fn the_sshd_step_says_its_step_line_and_its_warning_and_not_its_note() {
     let said = what_a_troubled_install_says();
-    let step_line = out(&crate::provision::sshd_task::step_line(Path::new(EXE)));
+    let step_line = out(&crate::provision::sshd_task::step_line(
+        Path::new(EXE),
+        Path::new(REPORT),
+    ));
     let at = said.iter().position(|line| *line == step_line).expect("the step line");
     assert_eq!(said[at + 1], err(WARNING_OF_THE_STEP));
     assert_eq!(said.last(), Some(&out(INSTALLED)));

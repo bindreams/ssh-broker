@@ -28,10 +28,9 @@ use windows::core::PCWSTR;
 
 use super::configure::{ConfigFile, ConfigFiles, DropInProblem, SshdHost, config_read, configure};
 use super::restart::{ServiceState, StartOutcome, StopOutcome};
-use super::{DROP_IN_DIR_NAME, DROP_IN_NAME, SshdReading};
+use super::{DROP_IN_DIR_NAME, DROP_IN_NAME, LineKind, SshdReading};
 use crate::acl;
 use crate::provision::procwait::Process;
-use crate::provision::sshd_task::LineKind;
 use crate::provision::{registry, system_config};
 
 mod listening;

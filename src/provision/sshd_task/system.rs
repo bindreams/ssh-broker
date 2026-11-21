@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 
 use super::{SshdTask, hand_over};
-use crate::provision::handover::Say;
+use crate::provision::Say;
 use crate::provision::layout::Layout;
 use crate::provision::procwait::Role;
 use crate::provision::schtasks::{INSTALL_SSHD_TASK, WaitOutcome, install_sshd_task_xml};

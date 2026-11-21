@@ -9,53 +9,22 @@
 //! shows the warnings of the report once the task's instances have ended; the notes stay in the report.
 //!
 //! The order and the sentences are in [`hand_over`], over [`SshdTask`], which tests stand in for; [`system`] is the
-//! Task Scheduler behind it. The report, and what each of its lines is, are here. No failure here fails `install`:
-//! the variable is a convenience.
+//! Task Scheduler behind it. The report file is here; what a line of it is (a note or a warning) and how a line is
+//! written and read back are in [`super::sshd_config`], which this module depends on and which does not depend on
+//! it. No failure here fails `install`: the variable is a convenience.
 
 use std::path::Path;
 
 use anyhow::Context;
 
-#[cfg(windows)]
+use super::sshd_config::{LineKind, read_line, render};
+
 mod hand_over;
 #[cfg(windows)]
 mod system;
-#[cfg(windows)]
 pub use hand_over::{HANDED_OVER_PREFIX, SshdTask, hand_over, step_line};
 #[cfg(windows)]
 pub use system::{hand_over_sshd_step, report_path};
-
-/// What a line of the sshd step is. A note says what the step did or found; a warning says what the person must do,
-/// what the step could not do or could not find out, or that sshd is not running or was not restarted. `install`
-/// shows the warnings and leaves the notes in the report.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LineKind {
-    Note,
-    Warning,
-}
-
-/// The beginning of a warning's line in the report; a note's line has none, so the report reads as plain text and
-/// `Report::parse` tells the two apart.
-pub const WARNING_PREFIX: &str = "warning: ";
-
-/// The report's text for a line of `kind` that says `text`: one report line for each line of `text`, each warning
-/// line with [`WARNING_PREFIX`].
-pub fn render(kind: LineKind, text: &str) -> String {
-    match kind {
-        LineKind::Note => {
-            debug_assert!(
-                text.lines().all(|line| !line.starts_with(WARNING_PREFIX)),
-                "a note that begins like a warning would be read as one: {text}"
-            );
-            text.to_owned()
-        }
-        LineKind::Warning => text
-            .lines()
-            .map(|line| format!("{WARNING_PREFIX}{line}"))
-            .collect::<Vec<_>>()
-            .join("\n"),
-    }
-}
 
 /// The last line of a report whose step ended: the report says itself that it is whole, so that nothing has to
 /// be read of the Task Scheduler to know.
@@ -88,15 +57,12 @@ impl Report {
         Report {
             lines: lines
                 .into_iter()
-                .map(|line| match line.strip_prefix(WARNING_PREFIX) {
-                    Some(text) => ReportLine {
-                        kind: LineKind::Warning,
+                .map(|line| {
+                    let (kind, text) = read_line(line);
+                    ReportLine {
+                        kind,
                         text: text.to_owned(),
-                    },
-                    None => ReportLine {
-                        kind: LineKind::Note,
-                        text: line.to_owned(),
-                    },
+                    }
                 })
                 .collect(),
             complete,
@@ -136,7 +102,7 @@ fn write_lines(
 ) -> std::io::Result<()> {
     let mut failure = None;
     step(&mut |kind, text| {
-        for line in render(kind, text).lines() {
+        for line in render(kind, text).split('\n') {
             if let Err(e) = append(out, line) {
                 failure.get_or_insert(e);
             }

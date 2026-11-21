@@ -2,9 +2,8 @@
 //! what the service manager says.
 
 use super::configure::SshdHost;
-use super::{CHECK_SSHD, DROP_IN_NAME, VARIABLE};
+use super::{CHECK_SSHD, DROP_IN_NAME, LineKind, VARIABLE};
 use crate::provision::schtasks::INSTALL_SSHD_TASK;
-use crate::provision::sshd_task::LineKind;
 
 /// The settled states of the sshd service.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,8 +102,8 @@ impl Before {
 }
 
 /// Restart the sshd service so that it reads the files, and say what came of it on `say`: a note for what was done
-/// or found, a warning for an sshd that is not running or was not restarted, for what could not be done or found
-/// out, and for what the person must do. Returns whether the running sshd takes the variable.
+/// or found, a warning for an sshd that is not running or was not restarted, and for what the person must do (see
+/// [`LineKind`]). Returns whether the running sshd takes the variable.
 ///
 /// Nothing is done to a service whose state was not read, and every state decided on is one the service manager
 /// settled in. A stopped service is not started, and a paused one, one whose state cannot be read and one that did
@@ -154,7 +153,7 @@ pub fn restart(host: &mut dyn SshdHost, say: &mut dyn FnMut(LineKind, &str), bef
     let mut unanswered_said = false;
     let mut unseen = match host.stop(&mut |reply| {
         unanswered_said = true;
-        say(LineKind::Note, &stop_unanswered(reply));
+        say(LineKind::Warning, &stop_unanswered(reply));
     }) {
         Ok(StopOutcome::Stopped) => None,
         Ok(StopOutcome::Unknown { cause }) => Some(format!("whether sshd stopped could not be told ({cause})")),
