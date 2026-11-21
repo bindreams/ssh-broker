@@ -153,7 +153,7 @@ pub fn restart(host: &mut dyn SshdHost, say: &mut dyn FnMut(LineKind, &str), bef
     let mut unanswered_said = false;
     let mut unseen = match host.stop(&mut |reply| {
         unanswered_said = true;
-        say(LineKind::Warning, &stop_unanswered(reply));
+        say(LineKind::Note, &stop_unanswered(reply));
     }) {
         Ok(StopOutcome::Stopped) => None,
         Ok(StopOutcome::Unknown { cause }) => Some(format!("whether sshd stopped could not be told ({cause})")),
@@ -297,13 +297,15 @@ const START_BY_HAND: &str = "Start it at this PC: `net start sshd`.";
 const CHECK_BY_HAND: &str = "Check it at this PC: `sc query sshd`.";
 
 /// What is said before the wait for an sshd that did not answer the stop in time (`reply` is the service
-/// manager's answer): that the wait has no time limit, and how to end it.
+/// manager's answer): that the wait has no time limit, and how to end it. A note: it is of use while the wait
+/// lasts, to a reader of the report, and it reads as a plain account when read after the restart went well.
 fn stop_unanswered(reply: &str) -> String {
     format!(
         "sshd did not answer the stop in time ({reply}) and the service manager says it is still running; \
-         install waits, with no time limit, for that sshd to exit, and then starts it. To stop waiting, end the task \
-         {INSTALL_SSHD_TASK} (`schtasks /End /TN {INSTALL_SSHD_TASK}`, elevated) and run `ssh-broker install` again; \
-         nothing then starts an sshd that exits later. {CHECK_SSHD}"
+         install waits, with no time limit, for that sshd to exit, and then starts it. If the task \
+         {INSTALL_SSHD_TASK} is ended during this wait (`schtasks /End /TN {INSTALL_SSHD_TASK}`, elevated), \
+         nothing starts an sshd that exits later: check sshd at this PC with `sc query sshd`, start it with \
+         `net start sshd` if it is stopped, and run `ssh-broker install` again."
     )
 }
 

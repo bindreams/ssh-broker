@@ -1,6 +1,6 @@
 use super::*;
-use crate::provision::sshd_config::{LineKind, render};
-use crate::provision::sshd_task::{REPORT_END, hand_over};
+use crate::provision::sshd_config::LineKind;
+use crate::provision::sshd_task::{REPORT_END, hand_over, render};
 use crate::test_support::{FakeSshdTask, Said, recording, silent};
 use anyhow::Context;
 use std::cell::RefCell;
@@ -970,10 +970,7 @@ fn every_stdout_line_but_the_last_ends_in_three_dots() {
 #[test]
 fn the_sshd_step_says_its_step_line_and_its_warning_and_not_its_note() {
     let said = what_a_troubled_install_says();
-    let step_line = out(&crate::provision::sshd_task::step_line(
-        Path::new(EXE),
-        Path::new(REPORT),
-    ));
+    let step_line = out(&crate::provision::sshd_task::step_line(Path::new(REPORT)));
     let at = said.iter().position(|line| *line == step_line).expect("the step line");
     assert_eq!(said[at + 1], err(WARNING_OF_THE_STEP));
     assert_eq!(said.last(), Some(&out(INSTALLED)));

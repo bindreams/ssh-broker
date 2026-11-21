@@ -234,7 +234,7 @@ pub fn configure(host: &mut dyn SshdHost, say: &mut dyn FnMut(LineKind, &str)) -
                 Ok(original) => {
                     before.config = Some(original);
                     say(
-                        LineKind::Warning,
+                        LineKind::Note,
                         &format!("{left}; {VARIABLE} is accepted by a line in sshd_config instead"),
                     );
                 }

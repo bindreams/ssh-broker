@@ -6,18 +6,20 @@
 //! [`schtasks::INSTALL_SSHD_TASK`], which runs the hidden verb `install-sshd` as SYSTEM, starts it, and waits for
 //! it. A service starts the task's process, outside the session's job, and it runs the step to its end
 //! whatever happens to `install`. The verb writes what the step says to a report, a line at a time, and `install`
-//! shows the warnings of the report once the task's instances have ended; the notes stay in the report.
+//! shows the warnings of the report once the task's instances have ended; the notes stay in the report, unless
+//! the report has no closing line, and then `install` shows it whole.
 //!
 //! The order and the sentences are in [`hand_over`], over [`SshdTask`], which tests stand in for; [`system`] is the
-//! Task Scheduler behind it. The report file is here; what a line of it is (a note or a warning) and how a line is
-//! written and read back are in [`super::sshd_config`], which this module depends on and which does not depend on
-//! it. No failure here fails `install`: the variable is a convenience.
+//! Task Scheduler behind it. The report file is here, with the format of its lines: [`render`] and [`Report::parse`]
+//! are inverses, and a warning's line begins with [`WARNING_PREFIX`]. Which kind a line is ([`LineKind`]) is
+//! [`super::sshd_config`]'s, which does not depend on this module. No failure here fails `install`: the variable is
+//! a convenience.
 
 use std::path::Path;
 
 use anyhow::Context;
 
-use super::sshd_config::{LineKind, read_line, render};
+use super::sshd_config::LineKind;
 
 mod hand_over;
 #[cfg(windows)]
@@ -29,6 +31,45 @@ pub use system::{hand_over_sshd_step, report_path};
 /// The last line of a report whose step ended: the report says itself that it is whole, so that nothing has to
 /// be read of the Task Scheduler to know.
 pub const REPORT_END: &str = "the step has ended; this report is complete";
+
+/// The beginning of a warning's line in the report; a note's line has none, so the report reads as plain text and
+/// [`read_line`] tells the two apart.
+pub const WARNING_PREFIX: &str = "warning: ";
+
+/// Whether `line`, after any spaces, begins with [`WARNING_PREFIX`].
+fn begins_like_a_warning(line: &str) -> bool {
+    line.trim_start_matches(' ').starts_with(WARNING_PREFIX)
+}
+
+/// The report's text for a line of `kind` that says `text`: one report line for each line of `text` (one empty line
+/// for an empty text), each warning line with [`WARNING_PREFIX`]. A note line that begins like a warning gets one
+/// more space in front, so that [`read_line`] does not take it for one.
+pub fn render(kind: LineKind, text: &str) -> String {
+    let mut lines: Vec<&str> = text.lines().collect();
+    if lines.is_empty() {
+        lines.push("");
+    }
+    lines
+        .into_iter()
+        .map(|line| match kind {
+            LineKind::Warning => format!("{WARNING_PREFIX}{line}"),
+            LineKind::Note if begins_like_a_warning(line) => format!(" {line}"),
+            LineKind::Note => line.to_owned(),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The kind and the text of one line of a report, the inverse of [`render`] for one line.
+fn read_line(line: &str) -> (LineKind, &str) {
+    if let Some(text) = line.strip_prefix(WARNING_PREFIX) {
+        (LineKind::Warning, text)
+    } else if line.starts_with(' ') && begins_like_a_warning(line) {
+        (LineKind::Note, &line[1..])
+    } else {
+        (LineKind::Note, line)
+    }
+}
 
 /// One line of a report: what the step said, and what kind of line it is.
 #[derive(Debug, Clone, PartialEq, Eq)]

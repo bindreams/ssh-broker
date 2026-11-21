@@ -51,50 +51,13 @@ const VARIABLE: &str = crate::protocol::ElevationPolicy::VARIABLE;
 /// does not accept the variable, is not running, was not restarted though it had to be, or the step was not done),
 /// or that tells the person something to do. Every other line is a note, one that says the step could not find
 /// something out and did the safe thing instead (restarted sshd to be sure) among them. `install` shows the
-/// warnings and leaves the notes in the report.
+/// warnings of a report that is whole and leaves its notes in the report; a report without its closing line is
+/// shown whole, notes included. How a line is written to the report and read back is
+/// [`sshd_task`](super::sshd_task)'s.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LineKind {
     Note,
     Warning,
-}
-
-/// The beginning of a warning's line in the report; a note's line has none, so the report reads as plain text and
-/// [`read_line`] tells the two apart.
-pub const WARNING_PREFIX: &str = "warning: ";
-
-/// Whether `line`, after any spaces, begins with [`WARNING_PREFIX`].
-fn begins_like_a_warning(line: &str) -> bool {
-    line.trim_start_matches(' ').starts_with(WARNING_PREFIX)
-}
-
-/// The report's text for a line of `kind` that says `text`: one report line for each line of `text` (one empty line
-/// for an empty text), each warning line with [`WARNING_PREFIX`]. A note line that begins like a warning gets one
-/// more space in front, so that [`read_line`] does not take it for one.
-pub fn render(kind: LineKind, text: &str) -> String {
-    let mut lines: Vec<&str> = text.lines().collect();
-    if lines.is_empty() {
-        lines.push("");
-    }
-    lines
-        .into_iter()
-        .map(|line| match kind {
-            LineKind::Warning => format!("{WARNING_PREFIX}{line}"),
-            LineKind::Note if begins_like_a_warning(line) => format!(" {line}"),
-            LineKind::Note => line.to_owned(),
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-/// The kind and the text of one line of a report, the inverse of [`render`] for one line.
-pub fn read_line(line: &str) -> (LineKind, &str) {
-    if let Some(text) = line.strip_prefix(WARNING_PREFIX) {
-        (LineKind::Warning, text)
-    } else if line.starts_with(' ') && begins_like_a_warning(line) {
-        (LineKind::Note, &line[1..])
-    } else {
-        (LineKind::Note, line)
-    }
 }
 
 /// Why a file cannot be edited by [`with_line`].

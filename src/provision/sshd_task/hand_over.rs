@@ -27,17 +27,15 @@ pub trait SshdTask {
 /// waits for it.
 pub const HANDED_OVER_PREFIX: &str = "Setting up sshd to accept SSH_BROKER_ELEVATION";
 
-/// The step line: what is about to happen to sshd, that a connection over SSH may drop, where what the step does is
-/// written, and how to tell afterwards whether sshd accepts the variable. It is all the person has while the task
-/// runs and when the connection drops, so it names the `report` and the installed `exe` (by its path: the window
-/// `install` was typed in does not see the new `PATH`). `doctor` reads neither the task nor the report, so it is
-/// not said to tell whether the install finished.
-pub fn step_line(exe: &Path, report: &Path) -> String {
+/// The step line: what is about to happen to sshd, that a connection over SSH may drop, and where what the step
+/// does is written. It is all the person has while the task runs and when the connection drops, so it names the
+/// `report`. It promises nothing else: the session a person gets when they reconnect is unelevated, and there
+/// `doctor` does not judge the sshd row, so the line does not send them to it.
+pub fn step_line(report: &Path) -> String {
     format!(
         "{HANDED_OVER_PREFIX}; sshd may be restarted, and a connection over SSH may drop now. What the step does is \
-         written to {}, and {} doctor says whether sshd accepts the variable...",
-        report.display(),
-        exe.display()
+         written to {}...",
+        report.display()
     )
 }
 
@@ -50,8 +48,8 @@ pub fn step_line(exe: &Path, report: &Path) -> String {
 /// is a warning, said on stderr: the task could not be registered, started or removed, the report could not be
 /// read, or it is not whole (its last line, [`REPORT_END`](super::REPORT_END), is missing: the task's process ended
 /// before the step did, or a line could not be written). A report that is not whole is said whole after that
-/// warning, every line of it, notes and warnings, in order: the notes say how far the step got, and sshd may be
-/// stopped. A wait that cannot say the instances ended leaves the task
+/// warning, every line of it, notes and warnings, in order: they are what the step had written. A wait that cannot
+/// say the instances ended leaves the task
 /// registered and the report unread, and says that the step may still run: nothing is concluded from it. A step
 /// that could not be handed over says no step line. No failure fails `install`.
 pub fn hand_over(task: &mut dyn SshdTask, report: &Path, exe: &Path, say: &mut Say<'_>) {
@@ -65,7 +63,7 @@ pub fn hand_over(task: &mut dyn SshdTask, report: &Path, exe: &Path, say: &mut S
         remove(task, &mut warn);
         return;
     }
-    say(Stream::Out, &step_line(exe, report));
+    say(Stream::Out, &step_line(report));
     let mut warn = |text: &str| say(Stream::Err, text);
 
     match task.wait() {
@@ -100,11 +98,11 @@ pub fn hand_over(task: &mut dyn SshdTask, report: &Path, exe: &Path, say: &mut S
                     warn(text);
                 }
             } else {
-                // The notes of a report that stopped say how far the step got: every line is shown, in order.
+                // What a report that stopped holds is all there is to show of the step: every line, in order.
                 warn(&format!(
                     "the report of the task {INSTALL_SSHD_TASK} has no closing line: the task was ended before its \
                      step finished, or a line of the report could not be written. {CHECK_SSHD} The lines the step \
-                     had written, if any, follow; they say how far it got."
+                     had written, if any, follow."
                 ));
                 if report_read.lines.is_empty() {
                     warn(&format!("the task {INSTALL_SSHD_TASK} had said nothing"));
@@ -117,7 +115,8 @@ pub fn hand_over(task: &mut dyn SshdTask, report: &Path, exe: &Path, say: &mut S
         Err(e) => warn(&format!(
             "the report of the task {INSTALL_SSHD_TASK} could not be read in {} ({e:#}); if it is not there, the \
              task did not start or could not create it. Whether sshd accepts SSH_BROKER_ELEVATION and is running is \
-             not known: `{} doctor` says, and `sc query sshd` shows whether sshd runs",
+             not known: `{} doctor`, run elevated by an administrator, says whether sshd accepts it, and `sc query \
+             sshd` shows whether sshd runs",
             report.display(),
             exe.display()
         )),

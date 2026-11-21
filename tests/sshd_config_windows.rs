@@ -24,10 +24,9 @@ use ssh_broker::provision::sshd_config::machine::{
 };
 use ssh_broker::provision::sshd_config::restart::{ServiceState, StartOutcome, StartReply, StopOutcome};
 use ssh_broker::provision::sshd_config::{
-    ACCEPT_LINE, DROP_IN_NAME, INCLUDE_LINE, LineKind, SshdReading, accepts, accepts_row, drop_in_text, in_force,
-    render, with_line,
+    ACCEPT_LINE, DROP_IN_NAME, INCLUDE_LINE, SshdReading, accepts, accepts_row, drop_in_text, in_force, with_line,
 };
-use ssh_broker::provision::sshd_task;
+use ssh_broker::provision::sshd_task::{self, render};
 use ssh_broker::provision::{BASE_DIR, canonical_exe, installed_line, version};
 use ssh_broker::provision::{schtasks, taskscheduler};
 use ssh_broker::socket_loc::Elevation;
@@ -209,10 +208,9 @@ fn install_s_sshd_step_adds_the_drop_in_and_the_include_above_the_first_match_an
     );
     assert_eq!(
         out_lines[out_lines.len() - 2],
-        sshd_task::step_line(&canonical_exe(), &sshd_task::report_path()),
-        "the step line is the last before the installed line, and names the report and the installed exe:\n{stdout}"
+        sshd_task::step_line(&sshd_task::report_path()),
+        "the step line is the last before the installed line, and names the report:\n{stdout}"
     );
-    assert!(out_lines[out_lines.len() - 2].starts_with(sshd_task::HANDED_OVER_PREFIX));
     for line in &out_lines[..out_lines.len() - 1] {
         assert!(line.ends_with("..."), "a step line says that it is going on: {line}");
     }
@@ -233,11 +231,6 @@ fn install_s_sshd_step_adds_the_drop_in_and_the_include_above_the_first_match_an
         report.warnings().collect::<Vec<_>>(),
         Vec::<&str>::new(),
         "a healthy first install reports no warning"
-    );
-    assert_eq!(
-        report.lines.last().map(|line| line.kind),
-        Some(LineKind::Note),
-        "the report's last line is a note that says what the step did"
     );
     // Standard error holds no line of the step: not a line of the report, and none of `hand_over`'s own warnings
     // (each of which names the task).
@@ -279,8 +272,8 @@ fn install_s_sshd_step_adds_the_drop_in_and_the_include_above_the_first_match_an
 }
 
 /// A warning of the step is on standard error. A drop-in that sshd rejects makes `sshd_config` need a line added by
-/// hand: the step changes nothing, says in a warning which line to add, and `install` shows that warning on standard
-/// error, where the report (which `install` ran as the task) holds it too. The step line is still said first.
+/// hand: the step says in one warning which line to add, and `install` shows that warning on standard error, where
+/// the report (which `install` ran as the task) holds it too. The step line is on standard output.
 #[test]
 fn install_says_on_standard_error_which_line_to_add_when_sshd_config_cannot_be_edited() {
     let _machine = machine::exclusive();

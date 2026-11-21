@@ -5,6 +5,52 @@ use super::*;
 // what a line of the report is =====
 
 #[test]
+fn a_warning_is_told_from_a_note_by_its_prefix_in_the_report() {
+    assert_eq!(WARNING_PREFIX, "warning: ");
+    assert_eq!(render(LineKind::Note, "sshd restarted"), "sshd restarted");
+    assert_eq!(
+        render(LineKind::Warning, "sshd is NOT running"),
+        "warning: sshd is NOT running"
+    );
+}
+
+#[test]
+fn every_line_of_a_warning_that_has_several_is_a_warning_in_the_report() {
+    assert_eq!(
+        render(LineKind::Warning, "sshd rejects it: line 1\nline 2"),
+        "warning: sshd rejects it: line 1\nwarning: line 2"
+    );
+    assert_eq!(render(LineKind::Note, "line 1\nline 2"), "line 1\nline 2");
+}
+
+#[test]
+fn an_empty_text_is_rendered_as_one_empty_line_of_its_kind() {
+    assert_eq!(render(LineKind::Note, ""), "");
+    assert_eq!(render(LineKind::Warning, ""), "warning: ");
+}
+
+/// A note whose line begins with the prefix gets one more space in front, which `read_line` takes off: the
+/// line cannot be read as a warning, and renders in the report as a plain line.
+#[test]
+fn a_note_that_begins_like_a_warning_is_rendered_with_one_space_more_and_read_line_takes_it_off() {
+    assert_eq!(render(LineKind::Note, "warning: x"), " warning: x");
+    assert_eq!(render(LineKind::Note, " warning: x"), "  warning: x");
+    assert_eq!(render(LineKind::Note, "a\nwarning: b"), "a\n warning: b");
+    for text in ["warning: x", " warning: x", "warning: ", "plain", "  indented", ""] {
+        assert_eq!(
+            read_line(&render(LineKind::Note, text)),
+            (LineKind::Note, text),
+            "{text:?}"
+        );
+        assert_eq!(
+            read_line(&render(LineKind::Warning, text)),
+            (LineKind::Warning, text),
+            "{text:?}"
+        );
+    }
+}
+
+#[test]
 fn a_reported_text_is_read_as_its_lines_and_their_kinds() {
     let parsed = Report::parse("a note\r\nwarning: a warning\r\nanother note\r\n");
     assert_eq!(
