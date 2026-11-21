@@ -44,8 +44,10 @@ jobs:
           V="$(bash .github/scripts/normalize-version.sh "$INPUT_VERSION")"
           echo "version=$V" >> "$GITHUB_OUTPUT"
           echo "tag=v${V}" >> "$GITHUB_OUTPUT"
-          echo "exe=$(bash .github/scripts/asset-name.sh --exe)" >> "$GITHUB_OUTPUT"
-          echo "sums=$(bash .github/scripts/asset-name.sh --sums)" >> "$GITHUB_OUTPUT"
+          EXE_NAME="$(bash .github/scripts/asset-name.sh --exe)"
+          SUMS_NAME="$(bash .github/scripts/asset-name.sh --sums)"
+          echo "exe=$EXE_NAME" >> "$GITHUB_OUTPUT"
+          echo "sums=$SUMS_NAME" >> "$GITHUB_OUTPUT"
 
       - name: Verify draft release exists and resolve commit SHA
         id: release
@@ -129,7 +131,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          (cd draft && sha256sum -c "$SUMS")
+          bash .github/scripts/check-sums-file.sh draft "$EXE" "$SUMS"
           gh attestation verify "draft/${EXE}" \
             -R "$GH_REPO" \
             --signer-workflow "${GH_REPO}/.github/workflows/release-asset.yaml" \
@@ -201,16 +203,18 @@ jobs:
         run: |
           set -euo pipefail
           gh release download "$TAG" --dir published --pattern "$EXE" --pattern "$SUMS"
-          (cd published && sha256sum -c "$SUMS")
+          bash .github/scripts/check-sums-file.sh published "$EXE" "$SUMS"
           gh attestation verify "published/${EXE}" \
             -R "$GH_REPO" \
             --signer-workflow "${GH_REPO}/.github/workflows/release-asset.yaml" \
             --source-digest "$SHA" \
             --source-ref refs/heads/main
+          # The sums file is exactly one line, checked above, so its first field is the exe's hash.
+          HASH="$(cut -d ' ' -f 1 "published/${SUMS}")"
           {
             echo "Release published: https://github.com/${GH_REPO}/releases/tag/${TAG}"
             echo
             echo "Asset: https://github.com/${GH_REPO}/releases/download/${TAG}/${EXE}"
             echo
-            echo "SHA-256: $(cut -d ' ' -f 1 "published/${SUMS}")"
+            echo "SHA-256: $HASH"
           } | tee -a "$GITHUB_STEP_SUMMARY"

@@ -51,10 +51,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          triple="$(bash .github/scripts/asset-name.sh --triple)"
           exe="$(bash .github/scripts/asset-name.sh --exe)"
           sums="$(bash .github/scripts/asset-name.sh --sums)"
           {
-              echo "TRIPLE=$(bash .github/scripts/asset-name.sh --triple)"
+              echo "TRIPLE=$triple"
               echo "EXE=$exe"
               echo "SUMS=$sums"
           } >> "$GITHUB_ENV"
@@ -145,6 +146,9 @@ jobs:
       EXE: ${{ needs.package.outputs.exe }}
       SUMS: ${{ needs.package.outputs.sums }}
     steps:
+      # For the scripts under .github/scripts, so that the checks are defined once.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: release-asset
@@ -162,9 +166,9 @@ jobs:
               exit 1
           fi
 
-      - name: Check the hash
+      - name: Check the sums file is the exe's own line
         shell: bash
-        run: cd dist && sha256sum -c "$SUMS"
+        run: bash .github/scripts/check-sums-file.sh dist "$EXE" "$SUMS"
 
       - name: Verify the attestation
         if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
