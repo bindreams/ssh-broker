@@ -209,11 +209,8 @@ mod imp {
         //    the agents start again afterwards, even if a later step fails, except in a session
         //    whose old agent has not exited.
         let current = std::env::current_exe().context("current_exe")?;
-        // Every step line, warning and the last line goes through `flow::install_run`'s sink, which writes to the
-        // console and ignores a stream that has closed (an `install` over an SSH connection that has gone), and the
-        // last line comes after the sshd step. The two notices that are the only record of a value about to be
-        // replaced or removed do not: they are written strictly (`show_to_console`), so that a write that fails ends
-        // `install` before the value is touched.
+        // All of install's lines go through `handover::Say`; the two value notices do not (see its docs). The last
+        // line follows the sshd step.
         flow::install_run(
             &mut say_to_console,
             super::version(),
@@ -317,9 +314,8 @@ mod imp {
     /// Write the system config from the shell sshd runs now, if it is not ssh-broker and there is no
     /// config yet (see [`system_config`]). Must run before the registry is overwritten. The install is
     /// complete without the config, so a config that is not written does not fail `install`; the
-    /// [`Handover`] it returns is what the flip takes. What `hand_over` prints then is the only record of the
-    /// previous values: it is written strictly ([`show_to_console`]), and a write that fails ends `install`
-    /// before the flip. `previous` is what the registry holds now.
+    /// [`Handover`] it returns is what the flip takes. Its notice is strict: see [`show_to_console`]. `previous` is
+    /// what the registry holds now.
     fn carry_previous_shell(base: &layout::TrustedBase<'_>, previous: &SshdShell, say: &mut Say<'_>) -> Handover {
         let config = base.layout().system_config_path();
         let config_is_file = system_config::config_is_file(&config);

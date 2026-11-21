@@ -19,7 +19,7 @@ impl Check {
 }
 
 /// The heading of the report: the version and the path of the executable that ran. A path that cannot be read
-/// leaves the version alone. It carries no mark: it judges nothing.
+/// leaves the version alone. It carries no mark.
 fn heading(version: &str, exe: Option<&Path>) -> String {
     match exe {
         Some(exe) => format!("ssh-broker v{version} ({})", exe.display()),

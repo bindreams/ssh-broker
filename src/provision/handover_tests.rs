@@ -159,8 +159,7 @@ fn a_notice_is_written_as_a_line() {
     assert_eq!(err, b"the values\n");
 }
 
-/// A notice that cannot be written does not return, so what it announces is not done: `eprintln!` ends the
-/// process the same way.
+/// A notice that cannot be written does not return.
 #[test]
 #[should_panic(expected = "failed printing to stderr")]
 fn a_notice_that_cannot_be_written_does_not_return() {

@@ -443,8 +443,6 @@ fn install_carries_all_four_values_and_a_second_install_does_not_rewrite_them() 
         "{shell:?} {option:?}"
     );
     assert!(provision::registry::escape_arguments_under(provision::registry::OPENSSH_KEY).unwrap());
-    // The arguments are in the config now, so sshd may not pass them to ssh-broker as well, and the
-    // removal says what it removes before it removes it.
     assert!(
         text.contains("removing DefaultShellArguments") && text.contains("-NoLogo -File"),
         "the removal did not print the value:

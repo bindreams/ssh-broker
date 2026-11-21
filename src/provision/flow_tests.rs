@@ -843,9 +843,7 @@ fn a_step_that_does_not_happen_says_nothing() {
     )
     .unwrap();
     assert_eq!(said.into_inner(), []);
-    // No agent is started when no session is logged on, or when every session is held by an agent that has not
-    // exited: no line says that one is. A session that could not be told, or one that is held, is said and is
-    // not a start.
+    // No start, so no step line.
     let (said, starts) = started(Ok(Targets::default()), &[], &[]);
     assert_eq!((said, starts), (vec![], vec![]));
     let targets = Targets {
@@ -872,8 +870,7 @@ fn the_path_is_announced_before_it_is_written_and_the_programs_told_after() {
 }
 
 /// The lines of a first install on a machine with trouble at every step that goes on: the waits, the PATH, the
-/// agents and the sessions. The sshd step is a stand-in that says nothing: its lines are not this module's (they
-/// begin with the verb's name until the unit that rewrites them lands).
+/// agents and the sessions. The sshd step is a stand-in that says nothing: its lines are not this module's.
 fn what_a_troubled_install_says() -> Said {
     let said = RefCell::new(Vec::new());
     install_run(
@@ -927,8 +924,7 @@ fn what_a_troubled_install_says() -> Said {
     said.into_inner()
 }
 
-/// stdout carries the step lines and the last line, and every step line says that it is going on. The sshd
-/// step's own lines are not covered here: they are not this module's.
+/// stdout carries the step lines and the last line, and every step line says that it is going on.
 #[test]
 fn every_stdout_line_but_the_last_ends_in_three_dots() {
     let said = what_a_troubled_install_says();
@@ -949,8 +945,7 @@ fn every_stdout_line_but_the_last_ends_in_three_dots() {
     );
 }
 
-/// The lines this module says, on both streams, never begin with the verb's name: not `install:` (the old prefix)
-/// and not the word. The sshd step's lines are not covered here (see [`what_a_troubled_install_says`]).
+/// No line this module says begins with `install`.
 #[test]
 fn no_line_begins_with_the_verb() {
     let said = what_a_troubled_install_says();

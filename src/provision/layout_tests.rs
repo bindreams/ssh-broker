@@ -220,7 +220,6 @@ fn prepare_in_says_the_agents_are_stopped_before_it_stops_them_and_only_when_it_
 
 #[test]
 fn a_step_that_does_not_happen_says_nothing_when_the_exe_is_unchanged_or_new() {
-    // The installed build again: nothing is stopped, so nothing is said.
     let same = TempBase::existing("prepare-says-same");
     std::fs::write(same.0.join("ssh-broker.exe"), "same build").unwrap();
     let source = new_exe(&same, "same build");

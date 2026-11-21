@@ -13,7 +13,7 @@ use super::sshd_config::CHECK_SSHD;
 /// Run `install`: say that it starts, run `body` (everything up to the sshd step, which gives back what must be
 /// held until the end, the lock), run `sshd_step` with a sink for its lines, then say that ssh-broker has been
 /// installed. The sshd step never fails `install`, so the last line is said exactly when `body` succeeded, and
-/// nothing is said after it. `sshd_step`'s lines go to stdout as it says them.
+/// nothing is said after it.
 pub fn install_run<T>(
     say: &mut Say<'_>,
     version: &str,
@@ -239,8 +239,7 @@ pub fn repair_sessions(
 /// the stop ended. `start_in` starts the agent in one session; an agent that is already running in its session
 /// exits at once, so this is safe to repeat. Best-effort: the install is complete without it, and a failed
 /// `install` runs it too. A session whose old agent survived the stop is left alone: see [`plan_start`]. Each
-/// failure is said on stderr and the rest go on. The step line is said once, right before the first agent is
-/// started, and not at all when no session gets one.
+/// failure is said on stderr and the rest go on.
 pub fn start_agents(
     say: &mut Say<'_>,
     interactive: impl FnOnce() -> anyhow::Result<Targets>,
@@ -288,9 +287,9 @@ pub fn start_agents(
 
 /// Append `dir` to the machine's `PATH` (`current` is what is stored now), so that a session finds `ssh-broker` by
 /// name. `write` stores the value (as `REG_EXPAND_SZ` when its second argument says so) and `broadcast` tells the
-/// running programs, which can take seconds: the step is said before either, and only when a write is made. A
-/// `PATH` that has `dir` says nothing. One that cannot be judged or written is said on stderr and left alone, and
-/// `install` goes on (the install is complete without it).
+/// running programs, which can take seconds: the step is said before either, and only when a write is made. One that
+/// cannot be judged or written is said on stderr and left alone, and `install` goes on (the install is complete
+/// without it).
 pub fn add_install_dir_to_path(
     say: &mut Say<'_>,
     dir: &str,

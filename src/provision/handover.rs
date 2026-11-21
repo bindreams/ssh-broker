@@ -9,8 +9,7 @@
 //! value makes.
 //!
 //! What keeps that guarantee is the notice: it is written to standard error strictly ([`show_to`], as `eprintln!`
-//! does), so a write that fails ends `install` there, before the shell is replaced or the value removed. Every other
-//! line goes through [`Say`], whose write may fail without a consequence.
+//! does), so a write that fails ends `install` there, before the shell is replaced or the value removed.
 
 use std::io::Write;
 use std::path::Path;
@@ -26,14 +25,12 @@ pub enum Stream {
     Err,
 }
 
-/// The sink for `install`'s lines: a `say` that takes the stream and the line. A step line (it ends in `...`, is said
-/// before the step starts and goes to stdout) says what is about to take a while; a warning goes to stderr and says
-/// what the person must know. A line that cannot be written is lost and nothing else is ([`say_to`]). The two notices
-/// that keep a value ([`Handover::printed`], [`ShownValue::print`]) do not go through it.
+/// The sink for `install`'s lines: takes the stream and the line. A failed write loses the line ([`say_to`]). The two
+/// value notices ([`Handover::printed`], [`ShownValue::print`]) do not use it.
 pub type Say<'a> = dyn FnMut(Stream, &str) + 'a;
 
-/// Writes a line to `out` or to `err`, by `stream`. A write that fails loses the line and nothing else: `install`
-/// run over an SSH connection that has gone has a closed stdout, and `println!` would panic on it.
+/// Writes a line to `out` or to `err`, by `stream`. `install` run over an SSH connection that has gone has a closed
+/// stdout, and `println!` would panic on it.
 pub fn say_to(out: &mut impl Write, err: &mut impl Write, stream: Stream, text: &str) {
     let _ = match stream {
         Stream::Out => writeln!(out, "{text}"),
@@ -41,7 +38,7 @@ pub fn say_to(out: &mut impl Write, err: &mut impl Write, stream: Stream, text: 
     };
 }
 
-/// Writes a line to the console: standard output or standard error. The [`Say`] `install` has.
+/// The [`Say`] `install` uses.
 pub fn say_to_console(stream: Stream, text: &str) {
     say_to(&mut std::io::stdout(), &mut std::io::stderr(), stream, text);
 }
@@ -82,8 +79,7 @@ impl Handover {
         Self(())
     }
 
-    /// `text` holds every previous value and was emitted before the shell is replaced: `show` does not return
-    /// when the write fails.
+    /// `text` holds every previous value and was emitted before the shell is replaced.
     fn printed(show: &mut dyn FnMut(&str) -> Written, text: &str) -> Self {
         let _written = show(text);
         Self(())
@@ -96,8 +92,7 @@ impl Handover {
 pub struct ShownValue(());
 
 impl ShownValue {
-    /// `text` holds the value and is emitted before the value is deleted: `show` does not return when the write
-    /// fails.
+    /// `text` holds the value and is emitted before the value is deleted.
     fn print(show: &mut dyn FnMut(&str) -> Written, text: &str) -> Self {
         let _written = show(text);
         Self(())
@@ -123,8 +118,7 @@ pub fn replace_shell<T>(
 /// file, and is called only for a [`Decision::Write`]), or print what is not carried.
 /// `config` is the config's path. A previous shell with nothing to carry ([`system_config::nothing_to_carry`]) is known
 /// from `previous` alone, whatever `decision` says; a decision that claims it for any other shell is
-/// printed, not believed. What is printed goes through `show`, which must not return when the write fails: the
-/// caller passes [`show_to_console`] (see [`show_to`]).
+/// printed, not believed. What is printed goes through `show`.
 pub fn hand_over(
     config: &Path,
     previous: &SshdShell,
@@ -154,8 +148,7 @@ pub fn hand_over(
 /// for what is read and left). `config` is the config's path and `key` the registry key. The text with the
 /// value is emitted first and `remove`, which takes the [`ShownValue`] that makes, runs after it; a failed
 /// removal is said with its cause and leaves the value for the next `install`, and one that worked says nothing.
-/// The text with the value goes through `show`, which must not return when the write fails: the caller passes
-/// [`show_to_console`] (see [`show_to`]). The other lines go through `say`.
+/// The text with the value goes through `show`. The other lines go through `say`.
 pub fn remove_arguments(
     config: &Path,
     key: &str,
