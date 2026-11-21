@@ -184,8 +184,7 @@ fn system_cmd() -> PathBuf {
 /// The step on the runner's stock file, run by `install` through its task, as SYSTEM: the drop-in, the `Include` line
 /// above the first `Match`, the original's security on the replacement (SYSTEM can create the drop-in and
 /// `copy_file_security` works as SYSTEM), and the restart of sshd. No task is left after `install`. A healthy first
-/// install says the step line, last before the installed line, and nothing of the step on standard error: its
-/// report is complete and holds no warning, and what the step did is in its notes. Every line on standard output but
+/// install says the step line, last before the installed line, and nothing of the step on standard error. Every line on standard output but
 /// the last ends in `...`, and no line on either stream begins with `install`. After the restart the `doctor` row
 /// passes and a second run says nothing.
 #[test]
@@ -232,8 +231,7 @@ fn install_s_sshd_step_adds_the_drop_in_and_the_include_above_the_first_match_an
         Vec::<&str>::new(),
         "a healthy first install reports no warning"
     );
-    // Standard error holds no line of the step: not a line of the report, and none of `hand_over`'s own warnings
-    // (each of which names the task).
+    // `hand_over`'s own warnings all name the task, so the check for its name excludes them too.
     for line in stderr.lines() {
         assert!(
             !line.contains(schtasks::INSTALL_SSHD_TASK) && report.lines.iter().all(|reported| reported.text != line),

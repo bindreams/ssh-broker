@@ -9,11 +9,8 @@
 //! shows the warnings of the report once the task's instances have ended; the notes stay in the report, unless
 //! the report has no closing line, and then `install` shows it whole.
 //!
-//! The order and the sentences are in [`hand_over`], over [`SshdTask`], which tests stand in for; [`system`] is the
-//! Task Scheduler behind it. The report file is here, with the format of its lines: [`render`] and [`Report::parse`]
-//! are inverses, and a warning's line begins with [`WARNING_PREFIX`]. Which kind a line is ([`LineKind`]) is
-//! [`super::sshd_config`]'s, which does not depend on this module. No failure here fails `install`: the variable is
-//! a convenience.
+//! The report's line format lives here: [`render`] and [`Report::parse`] are inverses, and a warning's line begins
+//! with [`WARNING_PREFIX`]. [`super::sshd_config`] owns [`LineKind`] and does not depend on this module.
 
 use std::path::Path;
 
@@ -28,12 +25,11 @@ pub use hand_over::{HANDED_OVER_PREFIX, SshdTask, hand_over, step_line};
 #[cfg(windows)]
 pub use system::{hand_over_sshd_step, report_path};
 
-/// The last line of a report whose step ended: the report says itself that it is whole, so that nothing has to
-/// be read of the Task Scheduler to know.
+/// The last line of a report whose step ended; its absence means the step did not finish. [`render`] never
+/// produces it for a line of the step.
 pub const REPORT_END: &str = "the step has ended; this report is complete";
 
-/// The beginning of a warning's line in the report; a note's line has none, so the report reads as plain text and
-/// [`read_line`] tells the two apart.
+/// The beginning of a warning's line in the report.
 pub const WARNING_PREFIX: &str = "warning: ";
 
 /// Whether a note's `line`, after any spaces, begins with [`WARNING_PREFIX`] or is [`REPORT_END`]: it would read as

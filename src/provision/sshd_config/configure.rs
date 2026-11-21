@@ -164,9 +164,8 @@ pub fn config_read(host: &mut dyn SshdHost) -> anyhow::Result<ConfigRead> {
 }
 
 /// Make sshd accept the variable, and say what was done on `say` (a line each, with its [`LineKind`]).
-/// Returns whether the running sshd takes the variable, or reads it when it next starts (it is not running); false
-/// when it does not, because it could not be restarted to read the files or the variable could not be put in
-/// force, and when that cannot be told.
+/// Returns whether sshd takes the variable now or reads it when it next starts; false when it could not be
+/// restarted to read the files, the variable could not be put in force, or that cannot be told.
 ///
 /// A failed question to sshd writes nothing, and a candidate for `sshd_config` must pass sshd's checks before
 /// it replaces the original.

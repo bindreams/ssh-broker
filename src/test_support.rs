@@ -33,7 +33,7 @@ impl std::io::Write for ClosedStream {
     }
 }
 
-/// What the stand-in task and the tests around it record, in order: the calls on the task as `task: <call>`.
+/// What the stand-in task and the tests around it record, in order.
 pub type TaskLog = std::rc::Rc<std::cell::RefCell<Vec<String>>>;
 
 /// A stand-in for the Task Scheduler behind the sshd step: every call is pushed to `log` as `task: <call>`, and

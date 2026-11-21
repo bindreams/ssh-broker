@@ -29,8 +29,8 @@ pub const HANDED_OVER_PREFIX: &str = "Setting up sshd to accept SSH_BROKER_ELEVA
 
 /// The step line: what is about to happen to sshd, that a connection over SSH may drop, and where what the step
 /// does is written. It is all the person has while the task runs and when the connection drops, so it names the
-/// `report`. It promises nothing else: the session a person gets when they reconnect is unelevated, and there
-/// `doctor` does not judge the sshd row, so the line does not send them to it.
+/// `report`. It does not name `doctor`: after a dropped connection the person reconnects unelevated, where
+/// `doctor` does not judge the sshd row.
 pub fn step_line(report: &Path) -> String {
     format!(
         "{HANDED_OVER_PREFIX}; sshd may be restarted, and a connection over SSH may drop now. What the step does is \
@@ -44,14 +44,12 @@ pub fn step_line(report: &Path) -> String {
 ///
 /// The step line (stdout) is said right after the task is started and before the wait, so an `install` ended from
 /// there on leaves the step to the task. When the instances have ended, each warning of the report is said on
-/// stderr, and the task is removed; the notes of the report stay in the report. Every line of this function's own
-/// is a warning, said on stderr: the task could not be registered, started or removed, the report could not be
-/// read, or it is not whole (its last line, [`REPORT_END`](super::REPORT_END), is missing: the task's process ended
-/// before the step did, or a line could not be written). A report that is not whole is said whole after that
-/// warning, every line of it, notes and warnings, in order: they are what the step had written. A wait that cannot
-/// say the instances ended leaves the task
-/// registered and the report unread, and says that the step may still run: nothing is concluded from it. A step
-/// that could not be handed over says no step line. No failure fails `install`.
+/// stderr, and the task is removed; the notes of the report stay in the report.
+///
+/// Warnings of its own (stderr): the task could not be registered, started or removed, the report could not be
+/// read, or it lacks [`REPORT_END`](super::REPORT_END) (then the whole report follows, notes included). A wait
+/// that cannot tell the instances ended leaves the task registered and says the step may still run. No step line
+/// when the step could not be handed over. No failure fails `install`.
 pub fn hand_over(task: &mut dyn SshdTask, report: &Path, exe: &Path, say: &mut Say<'_>) {
     if let Err(e) = task.register() {
         say(Stream::Err, &not_set_up("registered", &e));
@@ -87,8 +85,7 @@ pub fn hand_over(task: &mut dyn SshdTask, report: &Path, exe: &Path, say: &mut S
         }
     }
 
-    // The report says itself that it is whole: a process that ends before the step does (a panic, an
-    // administrator ending the task) leaves it without its closing line.
+    // A process that ends before the step (a panic, `schtasks /End`) leaves no closing line.
     match task.report() {
         Ok(text) => {
             let report_read = Report::parse(&text);
@@ -97,7 +94,6 @@ pub fn hand_over(task: &mut dyn SshdTask, report: &Path, exe: &Path, say: &mut S
                     warn(text);
                 }
             } else {
-                // What a report that stopped holds is all there is to show of the step: every line, in order.
                 warn(&format!(
                     "the report of the task {INSTALL_SSHD_TASK} has no closing line: the task was ended before its \
                      step finished, or a line of the report could not be written. {CHECK_SSHD} The lines the step \

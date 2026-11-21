@@ -101,9 +101,8 @@ impl Before {
     }
 }
 
-/// Restart the sshd service so that it reads the files, and say what came of it on `say`: a note for what was done
-/// or found, a warning for an sshd that is not running or was not restarted, and for what the person must do (see
-/// [`LineKind`]). Returns whether the running sshd takes the variable.
+/// Restart the sshd service so that it reads the files. Say what came of it on `say`, each line with its
+/// [`LineKind`]. Returns whether the running sshd takes the variable.
 ///
 /// Nothing is done to a service whose state was not read, and every state decided on is one the service manager
 /// settled in. A stopped service is not started, and a paused one, one whose state cannot be read and one that did
@@ -298,7 +297,7 @@ const CHECK_BY_HAND: &str = "Check it at this PC: `sc query sshd`.";
 
 /// What is said before the wait for an sshd that did not answer the stop in time (`reply` is the service
 /// manager's answer): that the wait has no time limit, and how to end it. A note: it is of use while the wait
-/// lasts, to a reader of the report, and it reads as a plain account when read after the restart went well.
+/// lasts, to a reader of the report.
 fn stop_unanswered(reply: &str) -> String {
     format!(
         "sshd did not answer the stop in time ({reply}) and the service manager says it is still running; \

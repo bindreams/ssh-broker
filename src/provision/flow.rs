@@ -11,9 +11,8 @@ use super::sshd_config::CHECK_SSHD;
 use super::{Say, Stream};
 
 /// Run `install`: say that it starts, run `body` (everything up to the sshd step, which gives back what must be
-/// held until the end, the lock), run `sshd_step` with the same sink, then say that ssh-broker has been
-/// installed. The sshd step never fails `install`, so the last line is said exactly when `body` succeeded, and
-/// nothing is said after it.
+/// held until the end, the lock), then `sshd_step`. The sshd step never fails `install`, so the line that says it
+/// is installed is said exactly when `body` succeeded, and nothing is said after it.
 pub fn install_run<T>(
     say: &mut Say<'_>,
     version: &str,

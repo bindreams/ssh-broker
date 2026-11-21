@@ -48,12 +48,11 @@ pub enum Stream {
     Err,
 }
 
-/// The sink for `install`'s lines: takes the stream and the line. A failed write loses the line ([`say_to`]). The two
-/// value notices (`Handover::printed` and `ShownValue::print` in `handover`) do not use it.
+/// `install`'s line sink; a failed write loses the line ([`say_to`]). The two value notices (`Handover::printed`
+/// and `ShownValue::print` in `handover`) do not use it.
 pub type Say<'a> = dyn FnMut(Stream, &str) + 'a;
 
-/// Writes a line to `out` or to `err`, by `stream`. `install` run over an SSH connection that has gone has a closed
-/// stdout, and `println!` would panic on it.
+/// A closed stdout (`install` run over an SSH connection that has gone) must not panic, as `println!` would.
 pub fn say_to(out: &mut impl std::io::Write, err: &mut impl std::io::Write, stream: Stream, text: &str) {
     let _ = match stream {
         Stream::Out => writeln!(out, "{text}"),

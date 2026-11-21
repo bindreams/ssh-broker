@@ -36,8 +36,7 @@ impl Layout {
         self.base.join("apply.lock")
     }
 
-    /// What the task that sets sshd up says it did, one line each, notes and warnings; `install` prints the warnings, or every line when the report has no closing line.
-    /// See [`super::sshd_task`].
+    /// The sshd step's report, one line per line the step said. See [`super::sshd_task`].
     pub fn install_sshd_report_path(&self) -> PathBuf {
         self.base.join("install-sshd.log")
     }
