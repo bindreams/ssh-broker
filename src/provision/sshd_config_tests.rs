@@ -362,20 +362,22 @@ fn read(listing: &str) -> anyhow::Result<SshdReading> {
 const NOT_CHECKED_HERE: &str = "not checked here: sshd's configuration is read by an administrator's elevated `doctor`";
 
 #[test]
-fn the_sshd_row_below_high_is_informational_and_passes_without_asking_sshd() {
+fn the_sshd_row_of_an_administrator_that_is_not_elevated_is_informational_and_passes_without_asking_sshd() {
     // An administrator's token below High (UAC's filtered one) is `Filtered`.
-    let row = accepts_row(Ok(Elevation::Filtered), || panic!("sshd must not be asked below High"));
+    let row = accepts_row(&Ok(Elevation::Filtered), || {
+        panic!("sshd must not be asked of an administrator that is not elevated")
+    });
     assert_eq!(row.name, ROW_NAME);
     assert!(row.pass);
     assert_eq!(row.detail, NOT_CHECKED_HERE);
 }
 
 #[test]
-fn the_sshd_row_of_an_account_that_is_not_an_administrator_passes_without_asking_sshd_even_at_high() {
+fn the_sshd_row_of_an_account_that_is_not_an_administrator_passes_without_asking_sshd() {
     // `Standard` is the token of a non-administrator, at High or not (a Backup Operators account's `always`
     // session is at High). Only administrators and SYSTEM can read sshd's configuration.
-    let row = accepts_row(Ok(Elevation::Standard), || {
-        panic!("sshd must not be asked by a process that is not an administrator's")
+    let row = accepts_row(&Ok(Elevation::Standard), || {
+        panic!("sshd must not be asked by an account that is not an administrator")
     });
     assert_eq!(row.name, ROW_NAME);
     assert!(row.pass);
@@ -383,45 +385,36 @@ fn the_sshd_row_of_an_account_that_is_not_an_administrator_passes_without_asking
 }
 
 #[test]
-fn the_sshd_row_of_a_non_administrator_does_not_fail_with_what_reading_would_say() {
-    let mut asked = false;
-    let row = accepts_row(Ok(Elevation::Standard), || {
-        asked = true;
-        Err(anyhow::anyhow!("sshd exited with 1: sshd_config: Permission denied"))
-    });
-    assert!(!asked, "sshd was asked");
-    assert!(row.pass, "{}", row.detail);
-}
-
-#[test]
-fn the_sshd_row_fails_with_the_cause_when_the_elevation_cannot_be_read() {
-    let row = accepts_row(Err(anyhow::anyhow!("the token cannot be opened")), || {
+fn the_sshd_row_fails_with_the_shared_clause_when_the_elevation_cannot_be_read() {
+    let row = accepts_row(&Err(anyhow::anyhow!("the token cannot be opened")), || {
         panic!("sshd must not be asked when the elevation is not known")
     });
     assert_eq!(row.name, ROW_NAME);
     assert!(!row.pass);
     assert_eq!(
         row.detail,
-        "cannot read this process's elevation, so whether sshd accepts SSH_BROKER_ELEVATION is not known: \
-         the token cannot be opened"
+        format!(
+            "{}, so whether sshd accepts SSH_BROKER_ELEVATION is not known",
+            crate::offer::text::elevation_unreadable_clause("the token cannot be opened")
+        )
     );
 }
 
 #[test]
 fn the_sshd_row_of_an_elevated_administrator_passes_when_the_variable_is_accepted_or_pinned_by_the_server() {
-    let accepted = accepts_row(Ok(Elevation::Full), || read("acceptenv SSH_BROKER_ELEVATION\n"));
+    let accepted = accepts_row(&Ok(Elevation::Full), || read("acceptenv SSH_BROKER_ELEVATION\n"));
     assert!(accepted.pass, "{}", accepted.detail);
     assert_eq!(accepted.name, ROW_NAME);
     assert_eq!(accepted.detail, "sshd accepts SSH_BROKER_ELEVATION from clients");
 
-    let pinned = accepts_row(Ok(Elevation::Full), || read("setenv SSH_BROKER_ELEVATION=never\n"));
+    let pinned = accepts_row(&Ok(Elevation::Full), || read("setenv SSH_BROKER_ELEVATION=never\n"));
     assert!(pinned.pass, "{}", pinned.detail);
     assert_eq!(pinned.detail, "pinned by the server to never");
 }
 
 #[test]
-fn the_sshd_row_at_high_fails_when_sshd_does_not_accept_and_says_apply_sets_it_up() {
-    let row = accepts_row(Ok(Elevation::Full), || read("port 22\nacceptenv LANG\n"));
+fn the_sshd_row_of_an_elevated_administrator_fails_when_sshd_does_not_accept_and_says_apply_sets_it_up() {
+    let row = accepts_row(&Ok(Elevation::Full), || read("port 22\nacceptenv LANG\n"));
     assert!(!row.pass);
     assert_eq!(
         row.detail,
@@ -429,7 +422,7 @@ fn the_sshd_row_at_high_fails_when_sshd_does_not_accept_and_says_apply_sets_it_u
          could not do. `ssh-broker elevate` works without it."
     );
     assert!(!row.detail.contains("Include"), "{}", row.detail);
-    let broken = accepts_row(Ok(Elevation::Full), || Err(anyhow::anyhow!("sshd.exe did not start")));
+    let broken = accepts_row(&Ok(Elevation::Full), || Err(anyhow::anyhow!("sshd.exe did not start")));
     assert!(!broken.pass);
     assert!(broken.detail.contains("sshd.exe did not start"), "{}", broken.detail);
 }
@@ -440,7 +433,7 @@ fn the_sshd_row_fails_when_sshd_started_before_its_configuration_was_written() {
         "acceptenv SSH_BROKER_ELEVATION\n",
         "setenv SSH_BROKER_ELEVATION=never\n",
     ] {
-        let row = accepts_row(Ok(Elevation::Full), || {
+        let row = accepts_row(&Ok(Elevation::Full), || {
             Ok(SshdReading::Read {
                 listing: listing.into(),
                 read: ConfigRead::Unread(PathBuf::from("sshd_config.d").join("10-ssh-broker.conf")),
@@ -457,7 +450,7 @@ fn the_sshd_row_fails_when_sshd_started_before_its_configuration_was_written() {
         );
     }
     // A configuration sshd does not accept fails for that, whether or not it was read.
-    let row = accepts_row(Ok(Elevation::Full), || {
+    let row = accepts_row(&Ok(Elevation::Full), || {
         Ok(SshdReading::Read {
             listing: "port 22\n".into(),
             read: ConfigRead::Unread(PathBuf::from("sshd_config")),
@@ -477,7 +470,7 @@ fn the_sshd_row_passes_and_says_so_when_a_files_time_is_ahead_of_the_clock() {
         ),
         ("setenv SSH_BROKER_ELEVATION=never\n", "pinned by the server to never"),
     ] {
-        let row = accepts_row(Ok(Elevation::Full), || {
+        let row = accepts_row(&Ok(Elevation::Full), || {
             Ok(SshdReading::Read {
                 listing: listing.into(),
                 read: ConfigRead::AheadOfClock(PathBuf::from("sshd_config")),
@@ -493,7 +486,7 @@ fn the_sshd_row_passes_and_says_so_when_a_files_time_is_ahead_of_the_clock() {
         );
     }
     // A configuration sshd does not accept fails for that.
-    let row = accepts_row(Ok(Elevation::Full), || {
+    let row = accepts_row(&Ok(Elevation::Full), || {
         Ok(SshdReading::Read {
             listing: "port 22\n".into(),
             read: ConfigRead::AheadOfClock(PathBuf::from("sshd_config")),
@@ -512,7 +505,7 @@ fn the_sshd_row_passes_with_a_note_when_sshd_includes_another_location() {
         ),
         ("setenv SSH_BROKER_ELEVATION=never\n", "pinned by the server to never"),
     ] {
-        let row = accepts_row(Ok(Elevation::Full), || {
+        let row = accepts_row(&Ok(Elevation::Full), || {
             Ok(SshdReading::Read {
                 listing: listing.into(),
                 read: ConfigRead::IncludesOther {
@@ -532,7 +525,7 @@ fn the_sshd_row_passes_with_a_note_when_sshd_includes_another_location() {
         );
     }
     // A configuration sshd does not accept fails for that.
-    let row = accepts_row(Ok(Elevation::Full), || {
+    let row = accepts_row(&Ok(Elevation::Full), || {
         Ok(SshdReading::Read {
             listing: "port 22\n".into(),
             read: ConfigRead::IncludesOther {
@@ -547,7 +540,7 @@ fn the_sshd_row_passes_with_a_note_when_sshd_includes_another_location() {
 
 #[test]
 fn the_sshd_row_passes_as_it_does_for_a_read_configuration_when_sshd_is_not_running() {
-    let row = accepts_row(Ok(Elevation::Full), || {
+    let row = accepts_row(&Ok(Elevation::Full), || {
         Ok(SshdReading::Read {
             listing: "acceptenv SSH_BROKER_ELEVATION\n".into(),
             read: ConfigRead::NotRunning,
@@ -559,7 +552,7 @@ fn the_sshd_row_passes_as_it_does_for_a_read_configuration_when_sshd_is_not_runn
 
 #[test]
 fn the_sshd_row_is_informational_when_the_service_has_arguments() {
-    let row = accepts_row(Ok(Elevation::Full), || {
+    let row = accepts_row(&Ok(Elevation::Full), || {
         Ok(SshdReading::WithArguments(r"-f D:\conf\sshd_config".into()))
     });
     assert!(row.pass, "{}", row.detail);

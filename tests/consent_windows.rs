@@ -44,6 +44,8 @@ mod sshd_rig;
 mod stand_in;
 
 use elevate_rig::{Started, an_administrator};
+use ssh_broker::provision::procwait;
+use ssh_broker::socket_loc::Integrity;
 use sshd_rig::{SshSession, run_client};
 
 /// The last line of the question.
@@ -284,7 +286,8 @@ fn a_program_in_the_session_that_writes_yes_to_its_own_output_does_not_answer() 
     session.leave();
 }
 
-/// Elevated (CI only). `logout` while a question is pending ends the session, and the command does not run.
+/// Elevated (CI only). `logout` while a question is pending ends the session, the agent has exited, and the command
+/// does not run.
 #[test]
 fn logout_while_a_question_is_pending_ends_the_session_and_runs_nothing() {
     let _machine = machine::exclusive();
@@ -299,6 +302,9 @@ fn logout_while_a_question_is_pending_ends_the_session_and_runs_nothing() {
         &made,
     );
 
+    let agents = procwait::user_agents(&elevate_rig::agent_exe(), &account.sid, Integrity::High)
+        .expect("list the agents of the account");
+    assert!(!agents.is_empty(), "the login started no agent at High");
     let mut ssh = admin.login.command_with(None);
     ssh.arg("-T")
         .arg("--")
@@ -307,5 +313,14 @@ fn logout_while_a_question_is_pending_ends_the_session_and_runs_nothing() {
 
     // The session ends with its shell: the wait is for the client to end.
     let _ = session.finish();
+    for agent in &agents {
+        bounded_wait::wait_for_exit(
+            agent.handle(),
+            agent.pid,
+            "the agent after logout",
+            bounded_wait::CHILD_EXIT_BOUND,
+            &[],
+        );
+    }
     assert!(!made.exists(), "the command ran after the session ended");
 }

@@ -98,7 +98,7 @@ fn assert_in_force_and_read() {
         }
         other => panic!("the sshd service was read as {other:?}"),
     }
-    let row = accepts_row(Ok(Elevation::Full), sshd_reading_this_machine);
+    let row = accepts_row(&Ok(Elevation::Full), sshd_reading_this_machine);
     assert!(row.pass, "{}", row.detail);
 }
 
@@ -361,7 +361,7 @@ fn a_configuration_written_after_sshd_started_fails_the_row_until_sshd_is_restar
 
     // The file is written again, with the same text: sshd cannot have read this write.
     std::fs::write(config_path(), std::fs::read(config_path()).unwrap()).unwrap();
-    let row = accepts_row(Ok(Elevation::Full), sshd_reading_this_machine);
+    let row = accepts_row(&Ok(Elevation::Full), sshd_reading_this_machine);
     assert!(!row.pass, "{}", row.detail);
     assert!(
         row.detail.contains("started before")
@@ -379,7 +379,7 @@ fn a_configuration_written_after_sshd_started_fails_the_row_until_sshd_is_restar
     // Every file in the folder is judged, whatever its name: another one, written after sshd started, fails the row.
     let other = drop_in_dir().join("50-other.conf");
     std::fs::write(&other, "# nothing\r\n").unwrap();
-    let row = accepts_row(Ok(Elevation::Full), sshd_reading_this_machine);
+    let row = accepts_row(&Ok(Elevation::Full), sshd_reading_this_machine);
     assert!(!row.pass, "{}", row.detail);
     assert!(
         row.detail
@@ -394,7 +394,7 @@ fn a_configuration_written_after_sshd_started_fails_the_row_until_sshd_is_restar
     // So is the folder: a file that goes changes it, and the row fails for the folder (this measures that a folder's
     // change time moves when an entry goes).
     std::fs::remove_file(&other).unwrap();
-    let row = accepts_row(Ok(Elevation::Full), sshd_reading_this_machine);
+    let row = accepts_row(&Ok(Elevation::Full), sshd_reading_this_machine);
     assert!(!row.pass, "{}", row.detail);
     assert!(
         row.detail
@@ -1063,7 +1063,7 @@ fn apply_run_over_ssh_while_it_restarts_sshd_ends_with_its_exit_code_and_the_ses
     // stock here instead took the variable from the session: its login came after the drop-in had gone.)
     let login = Login::new(&kit, &account);
     std::fs::write(config_path(), std::fs::read(config_path()).unwrap()).unwrap();
-    let row = accepts_row(Ok(Elevation::Full), sshd_reading_this_machine);
+    let row = accepts_row(&Ok(Elevation::Full), sshd_reading_this_machine);
     assert!(
         !row.pass,
         "sshd has a restart to do before the apply in the session: {}",

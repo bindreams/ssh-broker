@@ -240,22 +240,22 @@ pub enum SshdReading {
 /// is informational and passes. An elevated administrator's row passes when the variable is in force
 /// ([`in_force`]) and sshd has read what was changed; it fails when sshd started before a file of its
 /// configuration changed (or at that moment), when the variable is not in force, and, with the cause, when
-/// `reading` fails or when the `elevation` could not be read. A file whose time is ahead of the clock, or an `Include` of
-/// another location, cannot be judged: the row passes and says so. A service that runs with arguments is not
-/// checked: the row passes and says so.
+/// `reading` fails or when the `elevation` could not be read. A file whose time is ahead of the clock, or an
+/// `Include` of another location, cannot be judged: the row passes and says so. A service that runs with
+/// arguments is not checked: the row passes and says so.
 pub fn accepts_row(
-    elevation: anyhow::Result<Elevation>,
+    elevation: &anyhow::Result<Elevation>,
     reading: impl FnOnce() -> anyhow::Result<SshdReading>,
 ) -> Check {
     let elevation = match elevation {
-        Ok(elevation) => elevation,
+        Ok(elevation) => *elevation,
         Err(e) => {
             return Check::new(
                 ROW_NAME,
                 false,
                 format!(
-                    "cannot read this process's elevation, so whether sshd accepts {VARIABLE} is not \
-                     known: {e:#}"
+                    "{}, so whether sshd accepts {VARIABLE} is not known",
+                    crate::offer::text::elevation_unreadable_clause(&format!("{e:#}"))
                 ),
             );
         }

@@ -531,9 +531,10 @@ mod imp {
 
         // Local: sshd accepts SSH_BROKER_ELEVATION from clients, and has read the files that say so. `sshd -T`
         // reads sshd's host keys, so the row is judged only by an administrator's elevated `doctor` (see
-        // `sshd_config::accepts_row`).
+        // `sshd_config::accepts_row`). The elevation is read once, here, for this row and the account's rows.
+        let elevation = crate::account::elevation();
         rows.push(sshd_config::accepts_row(
-            crate::account::elevation(),
+            &elevation,
             sshd_config::machine::sshd_reading_this_machine,
         ));
 
@@ -563,7 +564,7 @@ mod imp {
         // Per user: this account's socket, its folder and file ACLs, and whether its agent
         // answers. `doctor` reports on the account that runs it.
         let location = crate::userdir::current_socket_location();
-        let account_rows = user_rows::account_rows(&crate::account::elevation());
+        let account_rows = user_rows::account_rows(&elevation);
         let filtered = matches!(account_rows, user_rows::AccountRows::Filtered);
         match (crate::acl::Sid::current_user(), account_rows) {
             (Ok(_), user_rows::AccountRows::Filtered) => {
