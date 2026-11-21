@@ -135,7 +135,8 @@ jobs:
           GH_REPO: ${{ github.repository }}
           VERSION: ${{ needs.validate.outputs.version }}
           SHA: ${{ github.sha }}
-          ZIP: dist/${{ needs.package.outputs.zip }}
+          EXE: dist/${{ needs.package.outputs.exe }}
+          SUMS: dist/${{ needs.package.outputs.sums }}
         shell: bash
         run: |
           set -euo pipefail
@@ -145,6 +146,6 @@ jobs:
             --generate-notes \
             --title "$TAG" \
             --target "$SHA" \
-            "$ZIP" "${ZIP}.sha256")"
+            "$EXE" "$SUMS")"
           echo "Draft release created for commit $SHA:"
           echo "  $URL"

@@ -44,7 +44,8 @@ jobs:
           V="$(bash .github/scripts/normalize-version.sh "$INPUT_VERSION")"
           echo "version=$V" >> "$GITHUB_OUTPUT"
           echo "tag=v${V}" >> "$GITHUB_OUTPUT"
-          echo "zip=$(bash .github/scripts/asset-name.sh "$V")" >> "$GITHUB_OUTPUT"
+          echo "exe=$(bash .github/scripts/asset-name.sh --exe)" >> "$GITHUB_OUTPUT"
+          echo "sums=$(bash .github/scripts/asset-name.sh --sums)" >> "$GITHUB_OUTPUT"
 
       - name: Verify draft release exists and resolve commit SHA
         id: release
@@ -73,7 +74,7 @@ jobs:
           echo "commit_sha=$TARGET" >> "$GITHUB_OUTPUT"
 
       # A draft is only trustworthy if it was built from merged code: a valid attestation alone
-      # also covers a pull-request build, or an older zip renamed to this version.
+      # also covers a pull-request build, or an older release's exe attached to this version.
       - name: Verify the workflow runs from main and the draft's commit is on main
         env:
           SHA: ${{ steps.release.outputs.commit_sha }}
@@ -105,13 +106,14 @@ jobs:
       - name: Download the draft's assets
         env:
           TAG: ${{ steps.version.outputs.tag }}
-          ZIP: ${{ steps.version.outputs.zip }}
+          EXE: ${{ steps.version.outputs.exe }}
+          SUMS: ${{ steps.version.outputs.sums }}
         shell: bash
         run: |
           set -euo pipefail
           gh release download "$TAG" --dir draft
 
-          want="$(printf '%s\n' "$ZIP" "$ZIP.sha256" | sort)"
+          want="$(printf '%s\n' "$EXE" "$SUMS" | sort)"
           got="$(ls draft | sort)"
           if [[ "$got" != "$want" ]]; then
             echo "::error::the draft's assets are not exactly the expected pair"
@@ -121,13 +123,14 @@ jobs:
 
       - name: Check the draft's hash and attestation
         env:
-          ZIP: ${{ steps.version.outputs.zip }}
+          EXE: ${{ steps.version.outputs.exe }}
+          SUMS: ${{ steps.version.outputs.sums }}
           SHA: ${{ steps.release.outputs.commit_sha }}
         shell: bash
         run: |
           set -euo pipefail
-          (cd draft && sha256sum -c "${ZIP}.sha256")
-          gh attestation verify "draft/${ZIP}" \
+          (cd draft && sha256sum -c "$SUMS")
+          gh attestation verify "draft/${EXE}" \
             -R "$GH_REPO" \
             --signer-workflow "${GH_REPO}/.github/workflows/release-asset.yaml" \
             --source-digest "$SHA" \
@@ -136,7 +139,8 @@ jobs:
       - name: Publish GitHub release
         env:
           TAG: ${{ steps.version.outputs.tag }}
-          ZIP: ${{ steps.version.outputs.zip }}
+          EXE: ${{ steps.version.outputs.exe }}
+          SUMS: ${{ steps.version.outputs.sums }}
           SHA: ${{ steps.release.outputs.commit_sha }}
         shell: bash
         run: |
@@ -148,12 +152,12 @@ jobs:
           # Replace the draft's assets with the bytes verified above, in case they changed since.
           # GitHub has no compare-and-swap, so a swap in the window between this upload and the
           # edit is not prevented.
-          gh release upload "$TAG" "draft/${ZIP}" "draft/${ZIP}.sha256" --clobber
+          gh release upload "$TAG" "draft/${EXE}" "draft/${SUMS}" --clobber
 
           # Assets added after the download check above would be published too: delete any other
           # asset before un-drafting.
           gh release view "$TAG" --json assets --jq '.assets[].name' | while IFS= read -r name; do
-            if [ "$name" != "$ZIP" ] && [ "$name" != "${ZIP}.sha256" ]; then
+            if [ "$name" != "$EXE" ] && [ "$name" != "$SUMS" ]; then
               echo "Deleting unexpected draft asset: $name"
               gh release delete-asset "$TAG" "$name" --yes
             fi
@@ -177,7 +181,7 @@ jobs:
           fi
 
           # Detects an asset added in the window between the cleanup above and un-drafting.
-          want="$(printf '%s\n' "$ZIP" "${ZIP}.sha256" | sort)"
+          want="$(printf '%s\n' "$EXE" "$SUMS" | sort)"
           got="$(gh release view "$TAG" --json assets --jq '.assets[].name' | sort)"
           if [ "$got" != "$want" ]; then
             echo "::error::The published release's assets are not exactly the expected pair."
@@ -190,14 +194,15 @@ jobs:
       - name: Verify the published asset
         env:
           TAG: ${{ steps.version.outputs.tag }}
-          ZIP: ${{ steps.version.outputs.zip }}
+          EXE: ${{ steps.version.outputs.exe }}
+          SUMS: ${{ steps.version.outputs.sums }}
           SHA: ${{ steps.release.outputs.commit_sha }}
         shell: bash
         run: |
           set -euo pipefail
-          gh release download "$TAG" --dir published --pattern "$ZIP" --pattern "${ZIP}.sha256"
-          (cd published && sha256sum -c "${ZIP}.sha256")
-          gh attestation verify "published/${ZIP}" \
+          gh release download "$TAG" --dir published --pattern "$EXE" --pattern "$SUMS"
+          (cd published && sha256sum -c "$SUMS")
+          gh attestation verify "published/${EXE}" \
             -R "$GH_REPO" \
             --signer-workflow "${GH_REPO}/.github/workflows/release-asset.yaml" \
             --source-digest "$SHA" \
@@ -205,7 +210,7 @@ jobs:
           {
             echo "Release published: https://github.com/${GH_REPO}/releases/tag/${TAG}"
             echo
-            echo "Asset: https://github.com/${GH_REPO}/releases/download/${TAG}/${ZIP}"
+            echo "Asset: https://github.com/${GH_REPO}/releases/download/${TAG}/${EXE}"
             echo
-            echo "SHA-256: $(cut -d ' ' -f 1 "published/${ZIP}.sha256")"
+            echo "SHA-256: $(cut -d ' ' -f 1 "published/${SUMS}")"
           } | tee -a "$GITHUB_STEP_SUMMARY"
