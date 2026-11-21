@@ -2,11 +2,10 @@
 # Succeed only when the sums file `$3` in directory `$1` is exactly the one line
 # `<sha256 of $1/$2>  $2` that the release-asset workflow writes, for the executable `$2`.
 #
-# `sha256sum -c` verifies whatever files the sums file lists, so a sums file that names another
-# file, or lists two, can pass it without saying anything about the executable. The hash is
-# taken from the executable here and the whole file is compared to the line it would be written
-# as. Git for Windows' `sha256sum` marks binary-mode entries with `*`, so the line is spelled
-# out instead of being taken from `sha256sum`.
+# `sha256sum -c` passes a sums file that names another file or lists two, saying nothing about
+# the executable, so the hash is taken from the executable and the whole file compared to the
+# exact line. The line is spelled out because Git for Windows' `sha256sum` marks binary-mode
+# entries with `*`.
 set -euo pipefail
 
 dir="${1:?directory required}"

@@ -165,7 +165,11 @@ jobs:
             fi
           done
 
-          gh release edit "$TAG" --draft=false
+          # `make_latest=legacy` has GitHub choose "latest" by date and version. The default marks
+          # whichever release is published last, an older one included, and the install link is
+          # `releases/latest/download/...`.
+          RELEASE_ID="$(gh release view "$TAG" --json databaseId --jq .databaseId)"
+          gh api -X PATCH "repos/{owner}/{repo}/releases/${RELEASE_ID}" -F draft=false -f make_latest=legacy --silent
 
           # Un-drafting is what creates the tag, so this is the first moment the binding is
           # observable. `targetCommitish` is NOT usable for this: GitHub never recomputes it when
@@ -209,7 +213,6 @@ jobs:
             --signer-workflow "${GH_REPO}/.github/workflows/release-asset.yaml" \
             --source-digest "$SHA" \
             --source-ref refs/heads/main
-          # The sums file is exactly one line, checked above, so its first field is the exe's hash.
           HASH="$(cut -d ' ' -f 1 "published/${SUMS}")"
           {
             echo "Release published: https://github.com/${GH_REPO}/releases/tag/${TAG}"
