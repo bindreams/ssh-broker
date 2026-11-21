@@ -27,7 +27,7 @@ use windows::Win32::System::Threading::{
 /// fail-open interactive session can grow.
 #[test]
 fn interactive_fail_open_reaps_a_grandchild_when_the_shim_exits() {
-    // No `apply` has run on a CI runner, so there is no agent socket to connect to.
+    // No `install` has run on a CI runner, so there is no agent socket to connect to.
     // `try_relay` fails open (`Ok(None)`) the moment the connect fails, before it ever looks at
     // whether stdio is a real console — so the unreachable agent alone is what routes this run
     // to fail open with `exec = None`, i.e. the INTERACTIVE session. The shell it runs is the

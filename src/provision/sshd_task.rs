@@ -1,21 +1,21 @@
-//! provision::sshd_task — `apply`'s sshd step, run by a task so that it finishes even if `apply` is ended.
+//! provision::sshd_task — `install`'s sshd step, run by a task so that it finishes even if `install` is ended.
 //!
-//! `apply` run over SSH runs inside the session's job, which ends every process in it when the connection
-//! ends, and the sshd step restarts the very sshd that carries that connection: an `apply` ended between the
-//! stop and the start would leave a machine reached only over SSH without sshd. So `apply` registers the task
-//! [`schtasks::APPLY_SSHD_TASK`], which runs the hidden verb `apply-sshd` as SYSTEM, starts it, and waits for
+//! `install` run over SSH runs inside the session's job, which ends every process in it when the connection
+//! ends, and the sshd step restarts the very sshd that carries that connection: an `install` ended between the
+//! stop and the start would leave a machine reached only over SSH without sshd. So `install` registers the task
+//! [`schtasks::INSTALL_SSHD_TASK`], which runs the hidden verb `install-sshd` as SYSTEM, starts it, and waits for
 //! it. A service starts the task's process, outside the session's job, and it runs the step to its end
-//! whatever happens to `apply`. The verb writes what the step says to a report, a line at a time, and `apply`
+//! whatever happens to `install`. The verb writes what the step says to a report, a line at a time, and `install`
 //! prints the report once the task's instances have ended.
 //!
 //! The order and the sentences are here, over [`SshdTask`], which tests stand in for; [`system`] is the Task
-//! Scheduler behind it. No failure here fails `apply`: the variable is a convenience.
+//! Scheduler behind it. No failure here fails `install`: the variable is a convenience.
 
 use std::path::Path;
 
 use anyhow::Context;
 
-use super::schtasks::{APPLY_SSHD_TASK, WaitOutcome, end_and_remove_apply_sshd_task};
+use super::schtasks::{INSTALL_SSHD_TASK, WaitOutcome, end_and_remove_install_sshd_task};
 use super::sshd_config::CHECK_SSHD;
 
 #[cfg(windows)]
@@ -25,7 +25,7 @@ pub use system::{hand_over_sshd_step, report_path};
 
 /// What the hand-over needs of the Task Scheduler and the report.
 pub trait SshdTask {
-    /// Register the task, replacing a copy an earlier `apply` left behind, and clear the report of an earlier
+    /// Register the task, replacing a copy an earlier `install` left behind, and clear the report of an earlier
     /// run.
     fn register(&mut self) -> anyhow::Result<()>;
     /// Start the task and return without waiting for it.
@@ -38,15 +38,15 @@ pub trait SshdTask {
     fn remove(&mut self) -> anyhow::Result<()>;
 }
 
-/// Prefix of the line that says the step was handed over; a caller that ends `apply` once the step is the task's
+/// Prefix of the line that says the step was handed over; a caller that ends `install` once the step is the task's
 /// waits for it.
-pub const HANDED_OVER_PREFIX: &str = "apply: sshd's configuration is set up by the task ssh-broker-apply-sshd";
+pub const HANDED_OVER_PREFIX: &str = "install: sshd's configuration is set up by the task ssh-broker-install-sshd";
 
 /// The line that says the step is the task's, that what it does is printed when it has finished, and where it
 /// can be read while it runs.
 pub fn handed_over_line(report: &Path) -> String {
     format!(
-        "{HANDED_OVER_PREFIX}, which runs as SYSTEM and finishes even if this apply is ended; what it does \
+        "{HANDED_OVER_PREFIX}, which runs as SYSTEM and finishes even if this install is ended; what it does \
          follows when it has finished, and can be read while it runs in {}",
         report.display()
     )
@@ -54,12 +54,12 @@ pub fn handed_over_line(report: &Path) -> String {
 
 /// Hand the sshd step to the task, wait for it, and say what it reported, on `say`.
 ///
-/// The hand-over line is said before the wait, so an `apply` ended from there on leaves the step to the task.
+/// The hand-over line is said before the wait, so an `install` ended from there on leaves the step to the task.
 /// When the instances have ended, the report is printed and the task removed. The report is believed to be whole
 /// only when it says so itself ([`REPORT_END`] is its last line); one that does not is printed as far as it goes,
 /// with both of its readings: the task's process ended before the step did, or a line could not be written. A
 /// wait that cannot say the instances ended leaves the task registered and the report unread, and says that the
-/// step may still run: nothing is concluded from it. No failure fails `apply`.
+/// step may still run: nothing is concluded from it. No failure fails `install`.
 pub fn hand_over(task: &mut dyn SshdTask, report: &Path, say: &mut dyn FnMut(&str)) {
     if let Err(e) = task.register() {
         say(&not_set_up("registered", &e));
@@ -76,18 +76,18 @@ pub fn hand_over(task: &mut dyn SshdTask, report: &Path, say: &mut dyn FnMut(&st
         Ok(WaitOutcome::Ended) => {}
         Ok(WaitOutcome::NeverLaunched { .. }) => {
             say(&format!(
-                "apply: the Task Scheduler lists an instance of the task {APPLY_SSHD_TASK} that it has not \
+                "install: the Task Scheduler lists an instance of the task {INSTALL_SSHD_TASK} that it has not \
                  started; it may still run, and nothing is known of what it does. Its report is {}. End and remove \
                  the task {} when it is not wanted; if the step has started meanwhile, ending it can leave sshd \
                  stopped. {CHECK_SSHD}",
                 report.display(),
-                end_and_remove_apply_sshd_task()
+                end_and_remove_install_sshd_task()
             ));
             return;
         }
         Err(e) => {
             say(&format!(
-                "apply: waiting for the task {APPLY_SSHD_TASK} failed ({e:#}); it may still run. Its report is {}",
+                "install: waiting for the task {INSTALL_SSHD_TASK} failed ({e:#}); it may still run. Its report is {}",
                 report.display()
             ));
             return;
@@ -102,17 +102,17 @@ pub fn hand_over(task: &mut dyn SshdTask, report: &Path, say: &mut dyn FnMut(&st
             if complete {
                 if lines.is_empty() {
                     say(
-                        "apply: sshd accepts SSH_BROKER_ELEVATION and has read its configuration; the task had nothing to change",
+                        "install: sshd accepts SSH_BROKER_ELEVATION and has read its configuration; the task had nothing to change",
                     );
                 }
             } else {
                 say(&format!(
-                    "apply: the report of the task {APPLY_SSHD_TASK} has no closing line: the task was ended before \
+                    "install: the report of the task {INSTALL_SSHD_TASK} has no closing line: the task was ended before \
                      its step finished, or a line of the report could not be written; what it had said follows. \
                      {CHECK_SSHD}"
                 ));
                 if lines.is_empty() {
-                    say(&format!("apply: the task {APPLY_SSHD_TASK} had said nothing"));
+                    say(&format!("install: the task {INSTALL_SSHD_TASK} had said nothing"));
                 }
             }
             for line in lines {
@@ -120,7 +120,7 @@ pub fn hand_over(task: &mut dyn SshdTask, report: &Path, say: &mut dyn FnMut(&st
             }
         }
         Err(e) => say(&format!(
-            "apply: the report of the task {APPLY_SSHD_TASK} could not be read in {} ({e:#}); if it is not there, \
+            "install: the report of the task {INSTALL_SSHD_TASK} could not be read in {} ({e:#}); if it is not there, \
              the task did not start or could not create it. Whether sshd accepts SSH_BROKER_ELEVATION and is \
              running is not known: `ssh-broker doctor` says, and `sc query sshd` shows whether sshd runs",
             report.display()
@@ -131,7 +131,7 @@ pub fn hand_over(task: &mut dyn SshdTask, report: &Path, say: &mut dyn FnMut(&st
 
 fn not_set_up(did_not: &str, cause: &anyhow::Error) -> String {
     format!(
-        "apply: sshd was not set up to accept {}: the task {APPLY_SSHD_TASK} could not be {did_not}: {cause:#}. \
+        "install: sshd was not set up to accept {}: the task {INSTALL_SSHD_TASK} could not be {did_not}: {cause:#}. \
          Nothing of sshd's was changed; `ssh-broker elevate` works without it.",
         crate::protocol::ElevationPolicy::VARIABLE
     )
@@ -140,15 +140,15 @@ fn not_set_up(did_not: &str, cause: &anyhow::Error) -> String {
 fn remove(task: &mut dyn SshdTask, say: &mut dyn FnMut(&str)) {
     if let Err(e) = task.remove() {
         say(&format!(
-            "apply: the task {APPLY_SSHD_TASK} could not be removed ({e:#}); it has no trigger, runs nothing by \
-             itself, and the next apply replaces it"
+            "install: the task {INSTALL_SSHD_TASK} could not be removed ({e:#}); it has no trigger, runs nothing by \
+             itself, and the next install replaces it"
         ));
     }
 }
 
 /// The last line of a report whose step ended: the report says itself that it is whole, so that nothing has to
 /// be read of the Task Scheduler to know.
-pub const REPORT_END: &str = "apply-sshd: the step has ended; this report is complete";
+pub const REPORT_END: &str = "install-sshd: the step has ended; this report is complete";
 
 /// A report text read: the lines the step said, and whether the step ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -181,7 +181,7 @@ fn append(out: &mut impl std::io::Write, line: &str) -> std::io::Result<()> {
 /// The verb's side: empty the report at `path`, then run `step`, whose every line is appended to the report and
 /// is in the file when `say` returns. When `step` has returned and every line was written, [`REPORT_END`] is
 /// appended: a report that is missing a line never closes. Without a report to write to nothing is run: its
-/// words would be lost, and the `apply` that waits for the task would find none.
+/// words would be lost, and the `install` that waits for the task would find none.
 pub fn write_report(path: &Path, step: impl FnOnce(&mut dyn FnMut(&str))) -> anyhow::Result<()> {
     let mut file = std::fs::File::create(path).with_context(|| format!("empty the report {}", path.display()))?;
     write_lines(&mut file, step).with_context(|| format!("write the report {}", path.display()))

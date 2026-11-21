@@ -1,4 +1,4 @@
-//! Tests for choosing the sessions `apply` starts an agent in.
+//! Tests for choosing the sessions `install` starts an agent in.
 use super::*;
 
 fn session(id: u32, state: SessionState, has_user: bool) -> SessionInfo {

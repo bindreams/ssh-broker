@@ -134,7 +134,7 @@ fn run_shim_child_with_env(line: &str, home: &Home, env: &[(&str, &str)]) -> std
 /// A session without a PTY that fails open hands the shell the command as one argument, exactly
 /// as the client sent it: the same line the agent would have started, which `shell::plan` makes.
 ///
-/// sshd turns the command into one escaped argument of the shim's line (`apply` sets
+/// sshd turns the command into one escaped argument of the shim's line (`install` sets
 /// `DefaultShellEscapeArguments`) and the shim undoes that; the encoder is the port of sshd's in
 /// `tests/common/sshd_encoder.rs`. Each command is run in a home of its own, because the probe
 /// records one line.

@@ -30,6 +30,7 @@ use windows::Win32::System::Threading::{
 use windows::core::{HRESULT, PWSTR};
 
 use crate::acl::Sid;
+use crate::route::INSTALL_SSHD_VERB;
 use crate::socket_loc::Integrity;
 use crate::winutil::{FileId, OwnedHandle};
 
@@ -258,20 +259,20 @@ pub enum Role {
     DesktopAgent,
     /// `agent --background`: started by the password prompt or by an auto-login task.
     BackgroundAgent,
-    /// `apply-sshd`: the sshd step of `apply`, run by the task `ssh-broker-apply-sshd`.
-    ApplySshd,
+    /// `install-sshd`: the sshd step of `install`, run by the task `ssh-broker-install-sshd`.
+    InstallSshd,
 }
 
 /// The role of the process whose command line is `command_line`. The first argument after the
 /// program decides: `agent` with `--background` among its flags is a background agent, `agent`
-/// without it a desktop agent, `apply-sshd` the sshd step; anything else is a shim, including no argument
+/// without it a desktop agent, `install-sshd` the sshd step; anything else is a shim, including no argument
 /// and `-c <text>` (sshd's form), whose text may itself contain the word `agent`.
 pub fn role_of(command_line: &str) -> Role {
     let args = crate::cmdline::split_args(command_line);
     match args.get(1).map(String::as_str) {
         Some("agent") if args[2..].iter().any(|arg| arg == "--background") => Role::BackgroundAgent,
         Some("agent") => Role::DesktopAgent,
-        Some("apply-sshd") => Role::ApplySshd,
+        Some(INSTALL_SSHD_VERB) => Role::InstallSshd,
         _ => Role::Shim,
     }
 }
@@ -340,7 +341,7 @@ pub fn command_line_of(process: &Process) -> anyhow::Result<String> {
 /// A process the snapshot names `ssh-broker.exe` that cannot be identified or whose command line
 /// cannot be read is an error: it might be a background agent. One of that name that is ending is
 /// taken for one: it holds the exe until it is gone. A process of any other name that is ending is
-/// skipped, whatever it runs: nothing known about it says it holds the exe, and `apply` would wait for
+/// skipped, whatever it runs: nothing known about it says it holds the exe, and `install` would wait for
 /// it. Any other process whose image cannot be read (protected system processes, for one) cannot be
 /// the installed exe and is skipped.
 pub fn background_agents(image: &Path) -> anyhow::Result<Vec<Process>> {
@@ -756,7 +757,7 @@ impl std::fmt::Display for StillRunning {
         }
         write!(
             f,
-            "{}; run apply again once {} exited",
+            "{}; run install again once {} exited",
             parts.join("; "),
             if self.survivors.len() == 1 {
                 "it has"

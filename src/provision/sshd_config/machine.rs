@@ -38,7 +38,7 @@ mod service;
 
 /// The candidate `sshd_config`, beside the original so that the rename that replaces it stays on one volume.
 const CANDIDATE_NAME: &str = "sshd_config.ssh-broker-new";
-/// The files of sshd, and the program `apply` runs to check them.
+/// The files of sshd, and the program `install` runs to check them.
 struct Machine {
     ssh_dir: PathBuf,
     /// The `sshd.exe` the service runs, found from the service's own `ImagePath`.
@@ -202,7 +202,7 @@ impl SshdHost for Machine {
         match acl::install_dir_problem(&dir) {
             Ok(None) => Ok(()),
             Ok(Some(problem)) => Err(DropInProblem::Refused(format!(
-                "it is not the folder apply makes: {problem}"
+                "it is not the folder install makes: {problem}"
             ))),
             Err(e) => Err(DropInProblem::Refused(format!("{e:#}"))),
         }
@@ -232,7 +232,7 @@ impl SshdHost for Machine {
     /// connection (measured in CI on Windows Server 2025, OpenSSH 9.5).
     fn write_drop_in(&mut self, text: &[u8]) -> anyhow::Result<()> {
         let path = self.drop_in();
-        // A drop-in that is there must already be what `apply` makes: it is replaced, never written into.
+        // A drop-in that is there must already be what `install` makes: it is replaced, never written into.
         match std::fs::symlink_metadata(&path) {
             Ok(_) => {
                 if let Some(problem) = acl::install_dir_file_problem(&path)? {
@@ -457,7 +457,7 @@ fn system_time(filetime: FILETIME) -> anyhow::Result<SystemTime> {
 
 // this machine =====
 
-/// `apply`'s sshd step on this machine: see [`configure`]. It never fails: what it could not do is said on
+/// `install`'s sshd step on this machine: see [`configure`]. It never fails: what it could not do is said on
 /// `say`. An sshd that has not read the change is restarted through the service manager. Whether the running
 /// sshd takes the variable (or reads it when it next starts) is returned.
 pub fn configure_this_machine(say: &mut dyn FnMut(&str)) -> bool {
@@ -465,7 +465,7 @@ pub fn configure_this_machine(say: &mut dyn FnMut(&str)) -> bool {
         Ok(mut machine) => configure(&mut machine, say),
         Err(e) => {
             say(&format!(
-                "apply: cannot find sshd, so it was not set up to accept {}: {e:#}",
+                "install: cannot find sshd, so it was not set up to accept {}: {e:#}",
                 crate::protocol::ElevationPolicy::VARIABLE
             ));
             false

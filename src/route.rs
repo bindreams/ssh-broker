@@ -1,12 +1,17 @@
 //! argv dispatch.
 //!
-//! The **shim** (the SSH `DefaultShell`) is the default action; `agent`/`apply`/
-//! `doctor` are explicit verbs (and `apply-sshd`, `doctor-probe` and `console-fallback` hidden ones).
+//! The **shim** (the SSH `DefaultShell`) is the default action; `agent`/`install`/
+//! `doctor` are explicit verbs (and `install-sshd`, `doctor-probe` and `console-fallback` hidden ones).
 //! `DefaultShell` is a bare path and cannot carry a subcommand argument, which is exactly why the shim is the
 //! default: a known verb in first position selects a subcommand, anything else (bare, or sshd's `-c "cmd"`) is
 //! the shim.
 
 use crate::cmdline::{self, RawExec};
+
+/// The hidden verb of the task `install` hands the sshd step to. The route, the task's `<Arguments>`
+/// (`provision::schtasks`) and the role that recognises the task's process (`provision::procwait`) all
+/// read this one name.
+pub const INSTALL_SSHD_VERB: &str = "install-sshd";
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Route {
@@ -24,9 +29,9 @@ pub enum Route {
     Logout,
     /// `auto-login on|off [<account>]`; `None` when the arguments are not that: print the usage.
     AutoLogin(Option<AutoLoginArgs>),
-    Apply,
-    /// Hidden: what the task `apply` hands the sshd step to runs: `provision::apply_sshd`.
-    ApplySshd,
+    Install,
+    /// Hidden: what the task `install` hands the sshd step to runs: `provision::install_sshd`.
+    InstallSshd,
     Doctor,
     /// `elevate [--terminal] <command> [arguments]`: run the command elevated. `command` is the text after the verb
     /// (and the flag, if it is first) as it was typed, not argv joined again, which has lost the quotes; it is not
@@ -54,7 +59,7 @@ pub enum Verb {
     Elevate,
     ConsoleFallback,
     DoctorProbe,
-    ApplySshd,
+    InstallSshd,
 }
 
 /// What a `doctor-probe` does with the junction its link check reads through (`provision::probe::link`).
@@ -113,9 +118,9 @@ pub fn route(args: &[String], command_line: &str) -> Route {
         Some("logout") => Route::Usage(Verb::Logout),
         Some("elevate") => elevate_args(&args[1..], command_line),
         Some("auto-login") => Route::AutoLogin(auto_login_args(&args[1..])),
-        Some("apply") => Route::Apply,
-        Some("apply-sshd") if args.len() == 1 => Route::ApplySshd,
-        Some("apply-sshd") => Route::Usage(Verb::ApplySshd),
+        Some("install") => Route::Install,
+        Some(INSTALL_SSHD_VERB) if args.len() == 1 => Route::InstallSshd,
+        Some(INSTALL_SSHD_VERB) => Route::Usage(Verb::InstallSshd),
         Some("doctor") => Route::Doctor,
         Some("doctor-probe") => probe_link(&args[1..]).map_or(Route::Usage(Verb::DoctorProbe), Route::DoctorProbe),
         Some("console-fallback") => console_fallback_args(&args[1..])

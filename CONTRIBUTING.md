@@ -6,7 +6,7 @@ negotiable.
 
 ## Architecture
 
-One binary, the verbs in the table below, selected by argv ([`src/route.rs`](src/route.rs)). `apply-sshd`,
+One binary, the verbs in the table below, selected by argv ([`src/route.rs`](src/route.rs)). `install-sshd`,
 `doctor-probe` and `console-fallback` are run by the product itself and not typed. The shim is
 the *default* action because `DefaultShell` is a bare path and cannot carry a subcommand: a
 known verb in first position selects a subcommand, anything else is the shim.
@@ -15,12 +15,12 @@ known verb in first position selects a subcommand, anything else is the shim.
 |---|---|---|
 | *(none)* or `-c "cmd"` | `shim`, `shim_pty` | the SSH session, as sshd's `DefaultShell` |
 | `agent` | `agent` | a user's interactive session, one per logged-on user, started by a logon task for any member of `BUILTIN\Users` |
-| `apply` | `provision` | wherever an admin runs it; needs elevation |
+| `install` | `provision` | wherever an admin runs it; needs elevation |
 | `auto-login on\|off [<account>]` | `autologin` | wherever an elevated administrator runs it (`on` needs a terminal to ask for the password): stores the account's password with Task Scheduler and registers, or deletes, the boot task that starts its background session |
 | `logout` | `logout`, `request`, `agent::logout` | a process of the account at any level: asks `agent.sock`, and below High `request.sock` where no agent is on the first, to end the account's background session |
 | `elevate [--terminal] <command>` | `elevate`, `request`, `agent::{requests,elevation,link}` | a shell that an agent hosts: runs the command in place at High, and below High asks the agent on `request.sock`, which runs it with its own token once the session's `SSH_BROKER_ELEVATION` allows it |
 | `doctor` | `provision` | on the host itself, as the account whose agent it asks: an administrator runs it elevated, and an unelevated one shows the local rows and the ways to check (an elevated prompt, an SSH login that asked for `always`, `ssh-broker elevate ssh-broker doctor` in an SSH session) |
-| `apply-sshd` | `provision`, `provision::sshd_task` | the hidden verb of the task `ssh-broker-apply-sshd`, as SYSTEM: `apply`'s sshd step (the drop-in, the `Include` and the restart of sshd), whose every line it writes to `apply-sshd.log` in the install directory; `apply` registers the task, starts it, waits for its instances and prints the report, so that the step finishes even if the `apply` that started it is ended |
+| `install-sshd` | `provision`, `provision::sshd_task` | the hidden verb of the task `ssh-broker-install-sshd`, as SYSTEM: `install`'s sshd step (the drop-in, the `Include` and the restart of sshd), whose every line it writes to `install-sshd.log` in the install directory; `install` registers the task, starts it, waits for its instances and prints the report, so that the step finishes even if the `install` that started it is ended |
 | `doctor-probe` | `provision` | the child the **agent** spawns in its interactive session, driven through the relay by `doctor` |
 | `console-fallback [--login] <handle>` | `shim`, `shim_pty`, `handoff` | the fallback shell of a terminal session through the agent: reads a notice and a line from the pipe handle the agent gave it alone (`PROC_THREAD_ATTRIBUTE_HANDLE_LIST`) until the agent closes its end, prints the notice on its pseudoconsole (which clears anything written ahead of it), starts the line there, exits with its code; it keeps through Ctrl+C for the shell, and when it cannot read the pipe it starts the built-in `cmd.exe` for a login (`--login`) and exits 255 for a command |
 
@@ -157,7 +157,7 @@ folder's handle and never creates it (`starting_agent`, `userdir::open_existing_
 folder watch (`socket_watch`) stays by path, and neither it nor the connect, which goes through the
 folders held, creates or writes anything.
 
-The install directory is the other half of the boundary: the agent runs the exe in it, so a directory a standard user can write to is a privilege escalation. `apply` verifies it exactly and reads and writes nothing in it until that passes. Users can read what is in it, so a file in it that a user must not open (`apply.lock`: a byte-range lock needs only a read handle) gets its own protected DACL of SYSTEM and Administrators at creation, verified exactly (`acl::ensure_admin_only_file`).
+The install directory is the other half of the boundary: the agent runs the exe in it, so a directory a standard user can write to is a privilege escalation. `install` verifies it exactly and reads and writes nothing in it until that passes. Users can read what is in it, so a file in it that a user must not open (`apply.lock`, the lock of `install`: a byte-range lock needs only a read handle) gets its own protected DACL of SYSTEM and Administrators at creation, verified exactly (`acl::ensure_admin_only_file`).
 
 ### Fail-open is deliberate, and never in the security boundary
 
@@ -350,7 +350,7 @@ says whether the answer allows; `console_prompt::ask_consent` does the console I
 and the password prompt do. A change to what allows is a change to the state machine and its host tests, not to
 the console code.
 
-**`AcceptEnv` and `Include` edits go through the text-to-text function and `sshd -t`** *(review)*. `apply` makes
+**`AcceptEnv` and `Include` edits go through the text-to-text function and `sshd -t`** *(review)*. `install` makes
 a candidate of `sshd_config` with `sshd_config::with_line`, has `sshd -t` check it and `sshd -T` show the variable in
 force, and only then renames it over the original (`sshd_config::configure`); the original is untouched on any
 failure.

@@ -3,8 +3,8 @@
 //! The agent task has a group principal, so `schtasks /Run` cannot say whose agent to start: it
 //! has no session or user argument. `IRegisteredTask::RunEx` with `TASK_RUN_USE_SESSION_ID`
 //! starts the task "interactively as the user who is logged on to the specified session", which
-//! is what `apply` needs to give each logged-on user an agent without waiting for their next
-//! logon. And `schtasks /End` is the only CLI way to stop instances, which `apply` needs before it
+//! is what `install` needs to give each logged-on user an agent without waiting for their next
+//! logon. And `schtasks /End` is the only CLI way to stop instances, which `install` needs before it
 //! replaces the exe a running agent holds open; COM does it without parsing text.
 //!
 //! Stopping is more than `Stop`: the call returns before the processes are gone, so it also waits
@@ -201,7 +201,7 @@ fn stop_and_wait<P>(
         }
         if first_stop.is_some_and(|first: Instant| first.elapsed() >= bound) {
             anyhow::bail!(
-                "the task {task_name} still has {} running instance(s) after being stopped for {} s ({}); run apply again",
+                "the task {task_name} still has {} running instance(s) after being stopped for {} s ({}); run install again",
                 instances.count,
                 bound.as_secs(),
                 describe_instances(&instances.pids)
@@ -314,7 +314,7 @@ pub fn run_in_session(task_name: &str, session_id: u32) -> anyhow::Result<()> {
     let _com = Com::init()?;
     let service = connect()?;
     let task = registered_task(&service, task_name)?
-        .with_context(|| format!("the task {task_name} is not registered; run `apply` elevated"))?;
+        .with_context(|| format!("the task {task_name} is not registered; run `install` elevated"))?;
     // SAFETY: the variant and BSTR are empty values that outlive the call.
     unsafe { task.RunEx(&VARIANT::default(), TASK_RUN_USE_SESSION_ID.0, session, &BSTR::new()) }
         .with_context(|| format!("start {task_name} in session {session_id}"))?;

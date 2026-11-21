@@ -154,7 +154,7 @@ fn the_path_row_passes_when_the_directory_is_on_the_path_and_says_what_to_do_whe
     assert!(!off.pass);
     assert_eq!(
         off.detail,
-        format!("{DIR} is not on the system PATH; run `ssh-broker apply`")
+        format!("{DIR} is not on the system PATH; run `ssh-broker install`")
     );
 
     let unreadable = row(&Err("access is denied".into()), DIR);

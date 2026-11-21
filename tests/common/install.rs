@@ -1,6 +1,6 @@
-//! What a test that runs `apply` over the machine's real install puts back: the install directory, the tasks, sshd's
-//! `DefaultShell` values, and sshd's configuration files (`sshd_config` and `sshd_config.d`), which `apply` now
-//! changes too. **Elevated (CI only).** One guard for every test binary that runs `apply`, so that the install
+//! What a test that runs `install` over the machine's real install puts back: the install directory, the tasks, sshd's
+//! `DefaultShell` values, and sshd's configuration files (`sshd_config` and `sshd_config.d`), which `install`
+//! changes. **Elevated (CI only).** One guard for every test binary that runs `install`, so that the install
 //! directory is absent again when the test ends, whichever binary runs first.
 #![allow(dead_code)]
 
@@ -44,7 +44,7 @@ pub fn drop_in_path() -> PathBuf {
     drop_in_dir().join(DROP_IN_NAME)
 }
 
-/// The candidate file `apply` makes beside the original.
+/// The candidate file `install` makes beside the original.
 pub fn candidate_path() -> PathBuf {
     ssh_dir().join("sshd_config.ssh-broker-new")
 }
@@ -52,10 +52,10 @@ pub fn candidate_path() -> PathBuf {
 /// The runner's `sshd_config` as it was before any test changed it, read once per test process.
 static STOCK: OnceLock<Vec<u8>> = OnceLock::new();
 
-/// `text` without the lines `apply` adds to `sshd_config`. A test process does not know whether a test that ran
+/// `text` without the lines `install` adds to `sshd_config`. A test process does not know whether a test that ran
 /// before it left them in the file (nextest starts one process per test, and the tests that run in parallel
 /// change sshd's configuration for good), and a file with the lines is not stock.
-fn without_the_lines_apply_adds(text: &[u8]) -> Vec<u8> {
+fn without_the_lines_install_adds(text: &[u8]) -> Vec<u8> {
     text.split_inclusive(|&byte| byte == b'\n')
         .filter(|line| {
             let line = String::from_utf8_lossy(line);
@@ -70,12 +70,12 @@ fn without_the_lines_apply_adds(text: &[u8]) -> Vec<u8> {
 /// The stock `sshd_config`, saved the first time it is asked for.
 pub fn stock() -> &'static [u8] {
     STOCK.get_or_init(|| {
-        without_the_lines_apply_adds(&std::fs::read(config_path()).expect("read the stock sshd_config"))
+        without_the_lines_install_adds(&std::fs::read(config_path()).expect("read the stock sshd_config"))
     })
 }
 
 /// Put sshd's files as the runner has them: the stock `sshd_config`, no drop-in and no folder for one. The
-/// running service is not restarted: `apply` decides from what `sshd -T` reads from the files, and says whether the
+/// running service is not restarted: `install` decides from what `sshd -T` reads from the files, and says whether the
 /// service started before they were written.
 pub fn reset() -> &'static [u8] {
     let stock = stock();
@@ -105,7 +105,7 @@ impl Drop for ResetAtTheEnd {
 
 // the install =====
 
-/// Puts the machine back as `capture` found it: the real tasks (the agent task and the task of `apply`'s sshd
+/// Puts the machine back as `capture` found it: the real tasks (the agent task and the task of `install`'s sshd
 /// step), the install directory with the sshd step's report, sshd's DefaultShell values and sshd's configuration
 /// files.
 pub struct Install {
@@ -143,16 +143,16 @@ impl Install {
 impl Drop for Install {
     fn drop(&mut self) {
         let canonical = provision::canonical_exe();
-        // The sshd step's task, which an `apply` that was ended leaves behind: it runs to its end first (it
+        // The sshd step's task, which an `install` that was ended leaves behind: it runs to its end first (it
         // restarts sshd, and holds the exe the directory is removed with), then it is deleted. Its report is in
         // the install directory, which goes below.
         let _ = taskscheduler::wait_for_instances(
-            schtasks::APPLY_SSHD_TASK,
+            schtasks::INSTALL_SSHD_TASK,
             &canonical,
-            procwait::Role::ApplySshd,
+            procwait::Role::InstallSshd,
             &mut || {},
         );
-        let _ = desktop::output(Command::new("schtasks").args(["/Delete", "/TN", schtasks::APPLY_SSHD_TASK, "/F"]));
+        let _ = desktop::output(Command::new("schtasks").args(["/Delete", "/TN", schtasks::INSTALL_SSHD_TASK, "/F"]));
         let _ = taskscheduler::stop_instances(schtasks::AGENT_TASK, &canonical);
         let _ = desktop::output(Command::new("schtasks").args(["/Delete", "/TN", schtasks::AGENT_TASK, "/F"]));
         if let Ok(agents) = procwait::background_agents(&canonical) {

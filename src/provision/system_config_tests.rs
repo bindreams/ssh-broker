@@ -1,4 +1,4 @@
-//! Host tests for what `apply` carries from the previous sshd shell into the system config (pure;
+//! Host tests for what `install` carries from the previous sshd shell into the system config (pure;
 //! runs on any platform, no registry).
 
 use std::path::{Path, PathBuf};
@@ -143,7 +143,7 @@ fn the_escape_flag_applies_only_to_the_other_class() {
 
 // not_written =====
 
-/// `apply` replaces `DefaultShell` even when it cannot write the config, so the message holds every
+/// `install` replaces `DefaultShell` even when it cannot write the config, so the message holds every
 /// value of the shell it replaces.
 #[test]
 fn the_message_for_a_config_that_could_not_be_written_holds_every_carried_value() {
@@ -256,7 +256,7 @@ fn decide_table() {
     }
 }
 
-/// What `apply` could not find out is not a reason to say nothing: the config that may or may not be
+/// What `install` could not find out is not a reason to say nothing: the config that may or may not be
 /// there, or the directories to look for the shell in, make the shell not carried, and the decision
 /// says so. A shell that is replaced by nothing, or a config that is there anyway, does not wait on them.
 #[test]
@@ -392,7 +392,7 @@ fn a_bare_shell_is_carried_as_the_file_sshd_found() {
 
 // the previous shell is missing =====
 
-/// `apply` replaces `DefaultShell` whenever it does not carry the shell, so each way of not carrying it
+/// `install` replaces `DefaultShell` whenever it does not carry the shell, so each way of not carrying it
 /// says so with every value of the shell it replaces, as the message for a config it cannot write does.
 /// Nothing is said when nothing is replaced.
 #[test]
@@ -426,12 +426,12 @@ fn every_skip_that_replaces_a_shell_without_carrying_it_holds_every_previous_val
             "escape arguments = no",
             "DefaultShellCommandOption",
             "DefaultShellArguments",
-            "apply replaces DefaultShell next",
+            "install replaces DefaultShell next",
         ] {
             assert!(text.contains(part), "{skip:?}: {part}: {text}");
         }
-        // An earlier `apply` may have carried the shell into the config that is there: the notice says
-        // what this `apply` does, not that the shell is nowhere.
+        // An earlier `install` may have carried the shell into the config that is there: the notice says
+        // what this `install` does, not that the shell is nowhere.
         assert!(!text.contains("is not carried"), "{skip:?}: {text}");
         assert!(!text.contains("escape arguments = yes"), "{skip:?}: {text}");
         states_facts_only(&text);
@@ -781,7 +781,7 @@ fn a_command_option_with_several_words_is_split_like_the_arguments() {
 
 // the texts printed after the flip =====
 
-/// `apply` prints these once `DefaultShell` is ssh-broker, so none says the shell is unchanged or is
+/// `install` prints these once `DefaultShell` is ssh-broker, so none says the shell is unchanged or is
 /// still to be replaced.
 fn after_the_flip(text: &str) {
     for before in [
@@ -803,7 +803,7 @@ fn the_arguments_left_text_names_the_value_the_key_and_why() {
     let text = arguments_left(KEY, "\"-NoLogo\"", "there is no config");
     assert_eq!(
         text,
-        r#"apply: left DefaultShellArguments ("-NoLogo") under HKLM\SOFTWARE\OpenSSH: there is no config"#
+        r#"install: left DefaultShellArguments ("-NoLogo") under HKLM\SOFTWARE\OpenSSH: there is no config"#
     );
     states_facts_only(&text);
     after_the_flip(&text);
@@ -814,7 +814,7 @@ fn the_arguments_unreadable_text_names_the_key_and_the_cause() {
     let text = arguments_unreadable(KEY, "i/o error");
     assert_eq!(
         text,
-        r"apply: left DefaultShellArguments under HKLM\SOFTWARE\OpenSSH: it could not be read (i/o error)"
+        r"install: left DefaultShellArguments under HKLM\SOFTWARE\OpenSSH: it could not be read (i/o error)"
     );
     states_facts_only(&text);
     after_the_flip(&text);
@@ -825,7 +825,7 @@ fn the_arguments_removing_text_names_the_value_and_the_key() {
     let text = arguments_removing(KEY, "\"-NoLogo\"");
     assert_eq!(
         text,
-        r#"apply: removing DefaultShellArguments ("-NoLogo") from HKLM\SOFTWARE\OpenSSH"#
+        r#"install: removing DefaultShellArguments ("-NoLogo") from HKLM\SOFTWARE\OpenSSH"#
     );
     states_facts_only(&text);
 }
@@ -835,7 +835,7 @@ fn the_arguments_removed_text_names_the_value_and_the_key() {
     let text = arguments_removed(KEY, "\"-NoLogo\"");
     assert_eq!(
         text,
-        r#"apply: removed DefaultShellArguments ("-NoLogo") from HKLM\SOFTWARE\OpenSSH"#
+        r#"install: removed DefaultShellArguments ("-NoLogo") from HKLM\SOFTWARE\OpenSSH"#
     );
     states_facts_only(&text);
     after_the_flip(&text);
@@ -846,7 +846,7 @@ fn the_arguments_not_removed_text_names_the_value_the_key_and_the_cause() {
     let text = arguments_not_removed(KEY, "\"-NoLogo\"", "access denied");
     assert_eq!(
         text,
-        r#"apply: could not remove DefaultShellArguments ("-NoLogo") from HKLM\SOFTWARE\OpenSSH: access denied"#
+        r#"install: could not remove DefaultShellArguments ("-NoLogo") from HKLM\SOFTWARE\OpenSSH: access denied"#
     );
     states_facts_only(&text);
     after_the_flip(&text);

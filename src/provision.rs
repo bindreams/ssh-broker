@@ -1,19 +1,19 @@
-//! provision: self-install (`apply`) and self-check (`doctor`) — the DefaultShell values, the
+//! provision: self-install (`install`) and self-check (`doctor`) — the DefaultShell values, the
 //! agent logon task (one agent per logged-on user), and parity probes (DPAPI/symlink/session) run
 //! THROUGH the invoking user's agent.
 //!
 //! The pure, host-tested logic lives in the submodules (registry/schtasks/probe/report); this root
-//! holds the Windows orchestration. `apply` is ordered so a partial run never bricks SSH (the
+//! holds the Windows orchestration. `install` is ordered so a partial run never bricks SSH (the
 //! DefaultShell registry flip is LAST, after the exe is proven present). It knows no user: each
 //! agent makes and hardens its own socket directory in its own profile.
 
-#[cfg(windows)]
-pub(crate) mod apply_lock;
 pub mod bounded;
 #[cfg(windows)]
 mod flow;
 #[cfg(windows)]
 pub mod handover;
+#[cfg(windows)]
+pub(crate) mod install_lock;
 #[cfg(windows)]
 pub(crate) mod layout;
 #[cfg(windows)]
@@ -41,21 +41,21 @@ pub mod taskscheduler;
 #[cfg(windows)]
 pub(crate) mod user_rows;
 
-/// `apply` subcommand: idempotently assert all desired state. Windows-only.
-pub fn apply() -> anyhow::Result<()> {
+/// `install` subcommand: idempotently assert all desired state. Windows-only.
+pub fn install() -> anyhow::Result<()> {
     #[cfg(windows)]
-    return imp::apply();
+    return imp::install();
     #[cfg(not(windows))]
-    anyhow::bail!("apply provisions a Windows host and runs only on Windows");
+    anyhow::bail!("install provisions a Windows host and runs only on Windows");
 }
 
-/// `apply-sshd`: the hidden verb of the task `apply` hands its sshd step to, which runs as SYSTEM: the step,
-/// with each line it says written to the report that `apply` prints. Never invoked directly by users.
-pub fn apply_sshd() -> anyhow::Result<()> {
+/// `install-sshd`: the hidden verb of the task `install` hands its sshd step to, which runs as SYSTEM: the step,
+/// with each line it says written to the report that `install` prints. Never invoked directly by users.
+pub fn install_sshd() -> anyhow::Result<()> {
     #[cfg(windows)]
-    return imp::apply_sshd();
+    return imp::install_sshd();
     #[cfg(not(windows))]
-    anyhow::bail!("apply-sshd runs only on Windows");
+    anyhow::bail!("install-sshd runs only on Windows");
 }
 
 /// `doctor` subcommand: local state checks + parity probes through the agent. Windows-only.
@@ -78,12 +78,12 @@ pub fn doctor_probe(link: crate::route::ProbeLink) -> anyhow::Result<()> {
     }
 }
 
-/// Check the arguments after `apply`.
+/// Check the arguments after `install`.
 ///
-/// `apply` takes none.
-pub fn check_apply_args(args: &[String]) -> anyhow::Result<()> {
+/// `install` takes none.
+pub fn check_install_args(args: &[String]) -> anyhow::Result<()> {
     match args.first() {
-        Some(arg) => anyhow::bail!("apply takes no arguments, got {arg:?}"),
+        Some(arg) => anyhow::bail!("install takes no arguments, got {arg:?}"),
         None => Ok(()),
     }
 }
@@ -138,7 +138,7 @@ pub fn probe_handshake(
     )
 }
 
-/// The directory `apply` installs into. The one place the path is written; [`layout::Layout`]
+/// The directory `install` installs into. The one place the path is written; [`layout::Layout`]
 /// derives from it.
 pub const BASE_DIR: &str = r"C:\ProgramData\ssh-broker";
 
@@ -147,12 +147,12 @@ pub const EXE_NAME: &str = "ssh-broker.exe";
 
 /// Whether sshd, given `shell` as the `DefaultShell`, runs ssh-broker's own exe: it compares the file
 /// name as sshd's `CreateProcess` resolves it (`.exe` is appended to a name with no extension), so
-/// `...\ssh-broker` is ssh-broker too. The one place `apply` asks this.
+/// `...\ssh-broker` is ssh-broker too. The one place `install` asks this.
 pub fn is_ssh_broker(shell: &str) -> bool {
     crate::shell::program_file_name(shell).eq_ignore_ascii_case(EXE_NAME)
 }
 
-/// The path `apply` installs the shim to and registers as `DefaultShell`.
+/// The path `install` installs the shim to and registers as `DefaultShell`.
 pub fn canonical_exe() -> std::path::PathBuf {
     std::path::Path::new(BASE_DIR).join(EXE_NAME)
 }
@@ -167,8 +167,8 @@ mod imp {
     use super::layout::{self, Layout};
     use super::registry::SshdShell;
     use super::{
-        apply_lock, flow, path_env, probe, probe_run, procwait, registry, report, schtasks, session_rows, session_task,
-        sessions, sshd_config, sshd_task, system_config, taskscheduler, user_rows,
+        flow, install_lock, path_env, probe, probe_run, procwait, registry, report, schtasks, session_rows,
+        session_task, sessions, sshd_config, sshd_task, system_config, taskscheduler, user_rows,
     };
     use anyhow::Context;
     use std::io::Write as _;
@@ -179,12 +179,12 @@ mod imp {
         a.trim().trim_matches('"').eq_ignore_ascii_case(&b.to_string_lossy())
     }
 
-    pub fn apply() -> anyhow::Result<()> {
+    pub fn install() -> anyhow::Result<()> {
         let layout = Layout::production();
 
-        // 0. `apply` takes no arguments.
+        // 0. `install` takes no arguments.
         let args: Vec<String> = std::env::args().skip(2).collect();
-        super::check_apply_args(&args)?;
+        super::check_install_args(&args)?;
 
         // 1. Install this exe to a STABLE path (see layout::prepare). Everything registers the
         //    canonical path: a temp path would brick SSH the instant it is deleted; the shim's
@@ -194,26 +194,26 @@ mod imp {
         //    task and the auto-login tasks disabled so that nothing starts one from the old exe
         //    meanwhile. Every run from here
         //    ends by enabling those tasks and starting the auto-login ones that have no session
-        //    (see `flow::repair_sessions`), which also heals what an earlier, killed `apply` left;
+        //    (see `flow::repair_sessions`), which also heals what an earlier, killed `install` left;
         //    the agents start again afterwards, even if a later step fails, except in a session
         //    whose old agent has not exited.
         let current = std::env::current_exe().context("current_exe")?;
         // The install directory first: the lock file lives in it, and nothing is read from it or
-        // written into it before it is proved ours. One `apply` runs at a time, for its whole run,
-        // and no `auto-login on|off` runs during it: a second `apply` waits here, so it never stops
+        // written into it before it is proved ours. One `install` runs at a time, for its whole run,
+        // and no `auto-login on|off` runs during it: a second `install` waits here, so it never stops
         // or starts what the first is working on.
         let base = layout::ensure_base(&layout)?;
-        let _apply_lock = apply_lock::acquire(&layout.apply_lock_path(), || {
-            eprintln!("apply: another apply or an auto-login command is running; waiting for it to finish")
+        let _install_lock = install_lock::acquire(&layout.install_lock_path(), || {
+            eprintln!("install: another install or an auto-login command is running; waiting for it to finish")
         })?;
-        // An earlier `apply`'s sshd step is the rest of its run, and outlives its process: it is waited for
+        // An earlier `install`'s sshd step is the rest of its run, and outlives its process: it is waited for
         // before this run touches anything.
         // A closed stderr loses a line and nothing else; `eprintln!` would panic on it.
         flow::wait_for_earlier_sshd_step(&mut |line| drop(writeln!(std::io::stderr(), "{line}")), |waiting| {
             taskscheduler::wait_for_instances(
-                schtasks::APPLY_SSHD_TASK,
+                schtasks::INSTALL_SSHD_TASK,
                 &layout.canonical_exe(),
-                procwait::Role::ApplySshd,
+                procwait::Role::InstallSshd,
                 waiting,
             )
         })?;
@@ -232,8 +232,8 @@ mod imp {
                 //    holds it. Then write the escape flag and read it back at once, then flip the
                 //    DefaultShell pair LAST and only to the validated canonical path; read that back
                 //    too. sshd reads these once per session, so the shim cannot ask later which form
-                //    sshd used: `apply` owns the flag (see `registry::desired_values`). A shell that
-                //    cannot be read in full stops `apply` here, before any of it is written.
+                //    sshd used: `install` owns the flag (see `registry::desired_values`). A shell that
+                //    cannot be read in full stops `install` here, before any of it is written.
                 replace_shell(
                     || registry::read_sshd_shell_under(registry::OPENSSH_KEY),
                     |previous| carry_previous_shell(&base, previous),
@@ -258,22 +258,22 @@ mod imp {
             repair_session_tasks,
             start_agents,
         )?;
-        println!("apply: ok — DefaultShell -> {}, agent task installed", exe.display());
+        println!("install: ok — DefaultShell -> {}, agent task installed", exe.display());
 
         // 5. sshd accepts SSH_BROKER_ELEVATION. LAST: an sshd that has not read the change is
-        //    restarted, and `apply` run over SSH restarts the sshd that carries its own connection, so
-        //    the step is the installed exe's task, which finishes even if this `apply` is ended. It
-        //    never fails `apply`: the variable is a convenience, and `ssh-broker elevate` works
+        //    restarted, and `install` run over SSH restarts the sshd that carries its own connection, so
+        //    the step is the installed exe's task, which finishes even if this `install` is ended. It
+        //    never fails `install`: the variable is a convenience, and `ssh-broker elevate` works
         //    without it.
-        // A closed stdout (an `apply` over an SSH connection that has gone) loses a line and nothing else, and
+        // A closed stdout (an `install` over an SSH connection that has gone) loses a line and nothing else, and
         // the report file holds the lines; `println!` would panic on it.
         sshd_task::hand_over_sshd_step(&layout, &exe, &mut |line| drop(writeln!(std::io::stdout(), "{line}")));
         Ok(())
     }
 
-    /// `apply-sshd`: see [`super::apply_sshd`]. The step never fails; what fails is the report.
-    pub fn apply_sshd() -> anyhow::Result<()> {
-        let report = Layout::production().apply_sshd_report_path();
+    /// `install-sshd`: see [`super::install_sshd`]. The step never fails; what fails is the report.
+    pub fn install_sshd() -> anyhow::Result<()> {
+        let report = Layout::production().install_sshd_report_path();
         sshd_task::write_report(&report, |say| {
             sshd_config::machine::configure_this_machine(say);
         })
@@ -281,7 +281,7 @@ mod imp {
 
     /// Append the install directory to the machine's `PATH`, so that a session finds `ssh-broker` by name.
     /// The value keeps its registry type; one that cannot be judged or written is said and left alone, and
-    /// `apply` goes on (the install is complete without it).
+    /// `install` goes on (the install is complete without it).
     fn add_install_dir_to_path() {
         let dir = super::BASE_DIR;
         let expanded_length = |text: &str| {
@@ -292,23 +292,23 @@ mod imp {
         match path_env::plan(&registry::read_system_path(), dir, expanded_length) {
             path_env::PathPlan::Present => {}
             path_env::PathPlan::Refuse(why) => {
-                eprintln!("apply: {dir} was not added to the system PATH: {why}");
+                eprintln!("install: {dir} was not added to the system PATH: {why}");
             }
             path_env::PathPlan::Write { value, expand } => match registry::write_system_path(&value, expand) {
                 Ok(()) => {
                     registry::broadcast_environment_change();
                     println!(
-                        "apply: added {dir} to the system PATH; an agent that is running, and its sessions, keep the PATH they started with"
+                        "install: added {dir} to the system PATH; an agent that is running, and its sessions, keep the PATH they started with"
                     );
                 }
-                Err(e) => eprintln!("apply: {dir} was not added to the system PATH: {e:#}"),
+                Err(e) => eprintln!("install: {dir} was not added to the system PATH: {e:#}"),
             },
         }
     }
 
     /// Write the system config from the shell sshd runs now, if it is not ssh-broker and there is no
     /// config yet (see [`system_config`]). Must run before the registry is overwritten. The install is
-    /// complete without the config, so a failure is said on stderr and `apply` goes on; the
+    /// complete without the config, so a failure is said on stderr and `install` goes on; the
     /// [`Handover`] it returns is what the flip takes. `previous` is what the registry holds now.
     fn carry_previous_shell(base: &layout::TrustedBase<'_>, previous: &SshdShell) -> Handover {
         let mut say = say_to_console;
@@ -317,11 +317,11 @@ mod imp {
         let host = crate::shell::WindowsHost;
         // The file the shell resolves to, found as sshd finds it (a bare name is searched in sshd's own
         // directory, the system and Windows directories, then on `PATH`), so the identity check below
-        // looks at that file and not at one of that name beside `apply`. Looked up only when the
+        // looks at that file and not at one of that name beside `install`. Looked up only when the
         // decision needs it, so that what cannot be read is not reported when it does not matter.
         let search = || {
             let image = registry::read_sshd_image_path().unwrap_or_else(|e| {
-                eprintln!("apply: cannot read where sshd runs from: {e:#}");
+                eprintln!("install: cannot read where sshd runs from: {e:#}");
                 None
             });
             system_config::sshd_search_dirs(&host, image.as_deref())
@@ -333,7 +333,7 @@ mod imp {
             use crate::shell::Host;
             host.is_system_cmd(found).unwrap_or_else(|e| {
                 eprintln!(
-                    "apply: cannot tell whether {} is the system cmd.exe: {e}",
+                    "install: cannot tell whether {} is the system cmd.exe: {e}",
                     found.display()
                 );
                 false
@@ -351,10 +351,10 @@ mod imp {
 
     /// Remove `DefaultShellArguments` once `DefaultShell` is ssh-broker and `config` is a file: sshd would
     /// hand the arguments to ssh-broker ahead of `-c`, and the config is where they were carried (by the
-    /// `apply` that replaced the shell) or are not wanted. A value that cannot be read, or with no file known
-    /// to hold it, is the only copy of the old setup: it is left, and said, for the next `apply` (see
+    /// `install` that replaced the shell) or are not wanted. A value that cannot be read, or with no file known
+    /// to hold it, is the only copy of the old setup: it is left, and said, for the next `install` (see
     /// [`system_config::plan_arguments`]). A removal prints the value before it deletes it
-    /// ([`remove_arguments`]), and a failed one says so with the cause and `apply` goes on.
+    /// ([`remove_arguments`]), and a failed one says so with the cause and `install` goes on.
     fn remove_shell_arguments(config: &Path) {
         let key = registry::OPENSSH_KEY;
         // Read on its own: another value that cannot be read does not make this one unreadable.
@@ -386,8 +386,8 @@ mod imp {
     }
 
     /// Enable the agent task: undo the stop's disabling of it, and heal a task that an earlier
-    /// `apply` left disabled by being killed. Registering the task afresh enables it too, but a
-    /// failed `apply` may not have got that far.
+    /// `install` left disabled by being killed. Registering the task afresh enables it too, but a
+    /// failed `install` may not have got that far.
     fn enable_agent_task() -> anyhow::Result<()> {
         taskscheduler::set_enabled(schtasks::AGENT_TASK, true).with_context(|| {
             format!(
@@ -398,7 +398,7 @@ mod imp {
     }
 
     /// Enable every auto-login task that is disabled and start each one that has no session: undoes
-    /// the stop's disabling, and repairs what an `apply` that was killed (or a task disabled by hand)
+    /// the stop's disabling, and repairs what an `install` that was killed (or a task disabled by hand)
     /// left. See [`flow::repair_sessions`].
     fn repair_session_tasks() -> anyhow::Result<()> {
         flow::repair_sessions(
@@ -409,24 +409,24 @@ mod imp {
         )
     }
 
-    /// Step 4 of `apply`: start an agent in each session that already has a user, so nobody has to
+    /// Step 4 of `install`: start an agent in each session that already has a user, so nobody has to
     /// log off and on again (the logon trigger covers every later logon), and to bring back the
     /// agents step 1 stopped. An agent that is already running in its session exits at once, so
     /// this is safe to repeat. Best-effort: the install is complete without it, and a failed
-    /// `apply` runs it too. A session whose old agent survived the stop is left alone: see
+    /// `install` runs it too. A session whose old agent survived the stop is left alone: see
     /// [`flow::plan_start`].
     fn start_agents(survivors: &[procwait::Survivor]) {
         match sessions::interactive_sessions() {
             Ok(targets) => {
                 for (id, why) in &targets.unknown {
                     eprintln!(
-                        "apply: could not tell whether session {id} has a user, so no agent was started there: {why}"
+                        "install: could not tell whether session {id} has a user, so no agent was started there: {why}"
                     );
                 }
                 let plan = flow::plan_start(&targets.ids, survivors);
                 for (id, pids) in &plan.held {
                     eprintln!(
-                        "apply: no agent was started in session {id}: its old agent (process {}) was stopped but has not been seen to exit; run apply again once it has exited",
+                        "install: no agent was started in session {id}: its old agent (process {}) was stopped but has not been seen to exit; run install again once it has exited",
                         pids.iter().map(u32::to_string).collect::<Vec<_>>().join(", ")
                     );
                 }
@@ -434,15 +434,15 @@ mod imp {
                 for id in &plan.start {
                     match taskscheduler::run_in_session(schtasks::AGENT_TASK, *id) {
                         Ok(()) => started += 1,
-                        Err(e) => eprintln!("apply: could not start the agent in session {id}: {e:#}"),
+                        Err(e) => eprintln!("install: could not start the agent in session {id}: {e:#}"),
                     }
                 }
                 println!(
-                    "apply: started the agent in {started} of {} logged-on session(s)",
+                    "install: started the agent in {started} of {} logged-on session(s)",
                     targets.total()
                 );
             }
-            Err(e) => eprintln!("apply: the logged-on sessions could not be listed: {e:#}"),
+            Err(e) => eprintln!("install: the logged-on sessions could not be listed: {e:#}"),
         }
     }
 

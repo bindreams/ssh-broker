@@ -259,7 +259,7 @@ fn a_process_whose_image_cannot_be_read_because_it_is_ending_is_taken_only_when_
 
 #[test]
 fn an_exe_that_does_not_exist_is_held_by_no_process() {
-    // Nothing can be running a file that is not there (the first `apply` of an install).
+    // Nothing can be running a file that is not there (the first `install` of an install).
     let mut child = child_until_stdin_closes();
     let absent = std::env::temp_dir().join(format!("sb-procwait-absent-{}.exe", std::process::id()));
     let found = open_if_image(child.id(), &absent);
@@ -305,7 +305,7 @@ fn a_wait_that_fails_leaves_the_process_a_survivor_with_the_error_and_the_rest_a
     let text = format!("{err:#}");
     assert!(text.contains(&failing_pid.to_string()), "{text}");
     assert!(text.contains("could not confirm"), "{text}");
-    assert!(text.contains("run apply again"), "{text}");
+    assert!(text.contains("run install again"), "{text}");
 
     drop(fails.stdin.take());
     fails.wait().unwrap();
@@ -334,7 +334,7 @@ fn processes_that_outlive_the_bound_are_all_named_with_their_sessions() {
     assert!(still.survivors.iter().all(|s| s.session == Some(session)));
     let text = format!("{err:#}");
     assert!(text.contains(&stays_a.id().to_string()), "{text}");
-    assert!(text.contains("run apply again"), "{text}");
+    assert!(text.contains("run install again"), "{text}");
 
     drop(stays_a.stdin.take());
     drop(stays_b.stdin.take());
@@ -452,7 +452,7 @@ fn an_agent_that_has_ended_is_not_found_while_a_handle_keeps_it_listed() {
 #[test]
 fn a_process_that_has_ended_but_is_still_held_is_nothing_to_wait_for_not_an_error() {
     // The snapshot can name a process that ends before it is opened: its image can no longer be
-    // read, and `background_agents` would fail the whole `apply` on it.
+    // read, and `background_agents` would fail the whole `install` on it.
     let copy = NamedCopy::new("held-ended");
     let mut agent = copy.spawn(&["agent", "--background"]);
     let held = user_agents(&copy.exe(), &Sid::current_user().unwrap(), own_level()).unwrap();
@@ -535,16 +535,19 @@ fn a_spaced_exe_path_is_parsed() {
 
 #[test]
 fn other_verbs_are_not_agents() {
-    for verb in ["doctor", "apply", "logout", "auto-login on"] {
+    for verb in ["doctor", "install", "logout", "auto-login on"] {
         assert_eq!(role_of(&format!(r"C:\x\ssh-broker.exe {verb}")), Role::Shim, "{verb}");
     }
 }
 
 #[test]
-fn the_verb_apply_sshd_is_a_role_of_its_own_and_a_shim_whose_command_text_names_it_is_not_it() {
-    assert_eq!(role_of(r"C:\x\ssh-broker.exe apply-sshd"), Role::ApplySshd);
-    assert_eq!(role_of(r#"C:\x\ssh-broker.exe -c "ssh-broker apply-sshd""#), Role::Shim);
-    assert_eq!(role_of(r"C:\x\ssh-broker.exe -c apply-sshd"), Role::Shim);
+fn the_verb_install_sshd_is_a_role_of_its_own_and_a_shim_whose_command_text_names_it_is_not_it() {
+    assert_eq!(role_of(r"C:\x\ssh-broker.exe install-sshd"), Role::InstallSshd);
+    assert_eq!(
+        role_of(r#"C:\x\ssh-broker.exe -c "ssh-broker install-sshd""#),
+        Role::Shim
+    );
+    assert_eq!(role_of(r"C:\x\ssh-broker.exe -c install-sshd"), Role::Shim);
 }
 
 #[test]
@@ -583,7 +586,7 @@ fn a_process_of_the_image_is_opened_only_for_the_role_its_command_line_says() {
     let mut child = child_until_stdin_closes();
     assert_eq!(opened_in_role(&child, Role::Shim), Some(child.id()));
     assert_eq!(
-        opened_in_role(&child, Role::ApplySshd),
+        opened_in_role(&child, Role::InstallSshd),
         None,
         "a process that runs the image in another role is not the task's"
     );
@@ -823,9 +826,9 @@ fn a_process_of_the_user_whose_image_is_refused_for_no_known_reason_fails_the_sc
 }
 
 #[test]
-fn a_process_running_the_apply_sshd_verb_is_no_agent_of_the_user() {
+fn a_process_running_the_install_sshd_verb_is_no_agent_of_the_user() {
     let task = Made {
-        command_line: Ok(r"C:\x\ssh-broker.exe apply-sshd"),
+        command_line: Ok(r"C:\x\ssh-broker.exe install-sshd"),
         ..made(10)
     };
     assert_eq!(scanned(&[task, made(20)]).unwrap(), [20]);
@@ -838,7 +841,7 @@ fn taken_for(process: Made, role: Role) -> anyhow::Result<Option<u32>> {
     in_role(process, role).map(|taken| taken.map(|process| process.pid))
 }
 
-const TASK_LINE: &str = r"C:\x\ssh-broker.exe apply-sshd";
+const TASK_LINE: &str = r"C:\x\ssh-broker.exe install-sshd";
 
 #[test]
 fn a_process_is_taken_for_the_role_its_command_line_says_and_for_no_other() {
@@ -846,14 +849,14 @@ fn a_process_is_taken_for_the_role_its_command_line_says_and_for_no_other() {
         command_line: Ok(TASK_LINE),
         ..made(10)
     };
-    assert_eq!(taken_for(task.clone(), Role::ApplySshd).unwrap(), Some(10));
+    assert_eq!(taken_for(task.clone(), Role::InstallSshd).unwrap(), Some(10));
     assert_eq!(taken_for(task, Role::Shim).unwrap(), None);
     for line in [r"C:\x\ssh-broker.exe", r"C:\x\ssh-broker.exe agent"] {
         let other = Made {
             command_line: Ok(line),
             ..made(11)
         };
-        assert_eq!(taken_for(other, Role::ApplySshd).unwrap(), None, "{line}");
+        assert_eq!(taken_for(other, Role::InstallSshd).unwrap(), None, "{line}");
     }
 }
 
@@ -864,7 +867,7 @@ fn a_role_that_cannot_be_read_of_a_process_that_has_exited_is_gone() {
         command_line: Err(Fail::Denied),
         ..made(10)
     };
-    assert_eq!(taken_for(gone, Role::ApplySshd).unwrap(), None);
+    assert_eq!(taken_for(gone, Role::InstallSshd).unwrap(), None);
 }
 
 #[test]
@@ -873,7 +876,7 @@ fn a_role_that_cannot_be_read_of_a_process_that_is_ending_is_waited_for_with_it(
         command_line: Err(Fail::Ending),
         ..made(10)
     };
-    assert_eq!(taken_for(ending, Role::ApplySshd).unwrap(), Some(10));
+    assert_eq!(taken_for(ending, Role::InstallSshd).unwrap(), Some(10));
 }
 
 #[test]
@@ -882,7 +885,7 @@ fn a_role_that_cannot_be_read_of_a_live_process_is_an_error_naming_it() {
         command_line: Err(Fail::Denied),
         ..made(4244)
     };
-    let text = format!("{:#}", taken_for(live, Role::ApplySshd).unwrap_err());
+    let text = format!("{:#}", taken_for(live, Role::InstallSshd).unwrap_err());
     assert!(text.contains("4244") && text.contains("Access is denied"), "{text}");
 }
 
@@ -1016,7 +1019,7 @@ fn the_scan_for_background_agents_finds_background_agents_and_not_other_roles() 
 #[test]
 fn an_ending_process_of_another_name_is_not_a_background_agent() {
     // A process mid-exit (a browser's child, a build tool) has an unreadable image; it must not be
-    // classed an agent that `apply` then waits for.
+    // classed an agent that `install` then waits for.
     let (found, asked) =
         background_scanned(&[(10, "chrome.exe"), (20, OURS)], &[ending_image(10), made(20)], &[10]).unwrap();
     assert_eq!(found, [20]);

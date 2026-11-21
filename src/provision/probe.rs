@@ -103,7 +103,7 @@ pub fn is_genuine_session(session_id: u32, logon_type: Option<u32>) -> bool {
 /// Outcome of the upstream (client → child) transparency check.
 ///
 /// `Absent` is deliberately distinct from `Fail`. A probe child older than this check is
-/// reachable: `apply` has not been run since the build that added it (a failed `apply` leaves
+/// reachable: `install` has not been run since the build that added it (a failed `install` leaves
 /// the old exe in place). Reporting that as "the payload did not
 /// reach the child intact" would be a diagnosis the code cannot support: the payload may have
 /// arrived perfectly and the child simply never looked. Both still FAIL the gate — the difference
@@ -138,9 +138,9 @@ impl UpstreamState {
             // State what is KNOWN, then the likely cause — the same discipline the `Fail` arm
             // follows. All the parser can tell is that no `upstream=` token arrived; an exe older
             // than this check is the usual reason, but a truncated or garbled PROBE line and a
-            // child killed mid-write produce it too, and those are not fixed by re-running `apply`.
+            // child killed mid-write produce it too, and those are not fixed by re-running `install`.
             UpstreamState::Absent => "no `upstream=` token in the PROBE line (usually an installed exe older \
-                 than this check — re-run `apply`, stopping the agent first so the exe can be replaced)"
+                 than this check — re-run `install`, stopping the agent first so the exe can be replaced)"
                 .into(),
         }
     }

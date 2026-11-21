@@ -1,4 +1,4 @@
-//! Giving one file the security descriptor of another: what `apply` does so that the `sshd_config` it
+//! Giving one file the security descriptor of another: what `install` does so that the `sshd_config` it
 //! replaces keeps the owner, the group and the DACL the original had.
 
 use std::path::Path;

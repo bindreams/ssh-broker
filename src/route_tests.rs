@@ -279,13 +279,27 @@ fn a_c_flag_after_a_verb_is_still_exec() {
 }
 
 #[test]
-fn apply_and_doctor_verbs() {
-    assert_eq!(route_line("ssh-broker.exe apply"), Route::Apply);
+fn install_is_a_verb() {
+    assert_eq!(route_line("ssh-broker.exe install"), Route::Install);
+}
+
+#[test]
+fn doctor_and_its_probe_are_verbs() {
     assert_eq!(route_line("ssh-broker.exe doctor"), Route::Doctor);
     assert_eq!(
         route_line("ssh-broker.exe doctor-probe"),
         Route::DoctorProbe(ProbeLink::NoJunction)
     );
+}
+
+#[test]
+fn apply_is_an_unknown_word_and_starts_the_shim() {
+    for word in ["apply", "apply-sshd"] {
+        assert_eq!(
+            route_line(&format!("ssh-broker.exe {word}")),
+            Route::Shim { exec: None }
+        );
+    }
 }
 
 #[test]
@@ -301,12 +315,12 @@ fn verify_is_not_a_verb() {
 /// The hidden verb of the task that sets sshd up takes no arguments; any other shape is a usage error,
 /// never the shim.
 #[test]
-fn apply_sshd_is_a_hidden_verb_that_takes_no_arguments() {
+fn install_sshd_is_the_hidden_verb_that_takes_no_arguments() {
     let args = |args: &[&str]| args.iter().map(|a| (*a).to_owned()).collect::<Vec<_>>();
-    assert_eq!(route_line("ssh-broker.exe apply-sshd"), Route::ApplySshd);
+    assert_eq!(route_line("ssh-broker.exe install-sshd"), Route::InstallSshd);
     assert_eq!(
-        route(&args(&["apply-sshd", "now"]), "ignored"),
-        Route::Usage(Verb::ApplySshd)
+        route(&args(&["install-sshd", "now"]), "ignored"),
+        Route::Usage(Verb::InstallSshd)
     );
 }
 
@@ -394,7 +408,7 @@ fn console_fallback_takes_the_value_of_its_handle() {
 fn a_command_named_like_a_verb_is_still_shim_exec() {
     for verb in [
         "agent",
-        "apply",
+        "install",
         "doctor",
         "doctor-probe",
         "console-fallback",
