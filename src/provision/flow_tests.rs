@@ -578,7 +578,10 @@ fn put_on_the_path(current: path_env::Reading, written: anyhow::Result<()>) -> (
             writes.borrow_mut().push((value.to_owned(), expand));
             written
         },
-        || told = true,
+        || {
+            assert!(!writes.borrow().is_empty(), "the programs are told after the write");
+            told = true;
+        },
     );
     (said.into_inner(), writes.into_inner(), told)
 }
@@ -746,13 +749,17 @@ fn every_line_that_was_on_stderr_is_still_said_there() {
         ))]
     );
     assert_eq!(writes, []);
-    let (said, _, _) = put_on_the_path(path_without(), Err(anyhow::anyhow!("access denied")));
+    let (said, _, told) = put_on_the_path(path_without(), Err(anyhow::anyhow!("access denied")));
     assert_eq!(
         said,
         [
             out(&format!("Adding {DIR} to the system PATH...")),
             err(&format!("{DIR} was not added to the system PATH: access denied")),
         ]
+    );
+    assert!(
+        !told,
+        "a failed write is not followed by the notice to the running programs"
     );
 }
 

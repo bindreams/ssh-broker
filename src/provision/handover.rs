@@ -46,17 +46,23 @@ pub fn say_to_console(stream: Stream, text: &str) {
     say_to(&mut std::io::stdout(), &mut std::io::stderr(), stream, text);
 }
 
+/// The proof that a notice was written. Only [`show_to`] and the tests of this module build one, so a `show` that
+/// returns it is the strict writer.
+#[derive(Debug)]
+pub struct Written(());
+
 /// Writes a notice that is the only record of a value to `err`, and does not return if the write fails, as
 /// `eprintln!` does not.
-pub fn show_to(err: &mut impl Write, text: &str) {
+pub fn show_to(err: &mut impl Write, text: &str) -> Written {
     if let Err(e) = writeln!(err, "{text}") {
         panic!("failed printing to stderr: {e}");
     }
+    Written(())
 }
 
 /// Writes a notice to standard error: the `show` that `install` passes to [`hand_over`] and [`remove_arguments`].
-pub fn show_to_console(text: &str) {
-    show_to(&mut std::io::stderr(), text);
+pub fn show_to_console(text: &str) -> Written {
+    show_to(&mut std::io::stderr(), text)
 }
 
 /// The previous shell's values were carried into the config, or printed, or there were none to keep.
@@ -78,8 +84,8 @@ impl Handover {
 
     /// `text` holds every previous value and was emitted before the shell is replaced: `show` does not return
     /// when the write fails.
-    fn printed(show: &mut dyn FnMut(&str), text: &str) -> Self {
-        show(text);
+    fn printed(show: &mut dyn FnMut(&str) -> Written, text: &str) -> Self {
+        let _written = show(text);
         Self(())
     }
 }
@@ -92,8 +98,8 @@ pub struct ShownValue(());
 impl ShownValue {
     /// `text` holds the value and is emitted before the value is deleted: `show` does not return when the write
     /// fails.
-    fn print(show: &mut dyn FnMut(&str), text: &str) -> Self {
-        show(text);
+    fn print(show: &mut dyn FnMut(&str) -> Written, text: &str) -> Self {
+        let _written = show(text);
         Self(())
     }
 }
@@ -124,7 +130,7 @@ pub fn hand_over(
     previous: &SshdShell,
     decision: Decision,
     create: impl FnOnce(&ShellBlock) -> anyhow::Result<CreateOutcome>,
-    show: &mut dyn FnMut(&str),
+    show: &mut dyn FnMut(&str) -> Written,
 ) -> Handover {
     if let Some(handover) = Handover::nothing_to_carry(previous) {
         return handover;
@@ -157,7 +163,7 @@ pub fn remove_arguments(
     config_is_file: impl FnOnce() -> Result<ConfigKind, String>,
     remove: impl FnOnce(&ShownValue) -> anyhow::Result<()>,
     say: &mut Say<'_>,
-    show: &mut dyn FnMut(&str),
+    show: &mut dyn FnMut(&str) -> Written,
 ) {
     match system_config::plan_arguments(config, key, read, config_is_file) {
         ArgumentsPlan::Nothing => {}
