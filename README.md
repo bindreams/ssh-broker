@@ -320,7 +320,7 @@ The contract: an upgrade is expected to succeed, and nothing is guaranteed to be
 
 - Run `apply` again. A logon task that still says `LeastPrivilege` starts an administrator's agent below High, which refuses to run and exits 68; `apply` registers the task as `HighestAvailable`, and `doctor` fails its `agent task` row until it does.
 - An agent of the old version that is still running refuses the new shim, by name, until it is restarted. `apply` restarts the agents the logon task and `auto-login` started; one you started by hand with `ssh-broker agent` is for you to stop and start again, and a session the password prompt started ends and asks for the password at the next login.
-- An administrator's old `%LOCALAPPDATA%\ssh-broker` folder is unused from then on, and may be deleted.
+- What 0.1.0 left in an administrator's `%LOCALAPPDATA%\ssh-broker` folder (its `agent.sock`, lock files and logs) is unused from then on. Leave the folder itself: the elevated agent keeps `request.sock` in it (see [Elevated sessions](#elevated-sessions)).
 - `verify` is now `doctor`. A word the build does not know, an old `verify` included, starts the shim. The system config file 0.1.0 wrote has a comment that names `ssh-broker verify`, and `apply` never rewrites that file: read it as `doctor`. Run `doctor` with the installed exe, after `apply`: `C:\ProgramData\ssh-broker\ssh-broker.exe doctor`.
 - `apply` now also makes sshd accept `SSH_BROKER_ELEVATION` and puts the install directory on the system `PATH`.
 
