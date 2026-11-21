@@ -53,14 +53,13 @@ pub fn step_line(report: &Path) -> String {
 /// registered and the report unread, and says that the step may still run: nothing is concluded from it. A step
 /// that could not be handed over says no step line. No failure fails `install`.
 pub fn hand_over(task: &mut dyn SshdTask, report: &Path, exe: &Path, say: &mut Say<'_>) {
-    let mut warn = |text: &str| say(Stream::Err, text);
     if let Err(e) = task.register() {
-        warn(&not_set_up("registered", &e));
+        say(Stream::Err, &not_set_up("registered", &e));
         return;
     }
     if let Err(e) = task.run() {
-        warn(&not_set_up("started", &e));
-        remove(task, &mut warn);
+        say(Stream::Err, &not_set_up("started", &e));
+        remove(task, say);
         return;
     }
     say(Stream::Out, &step_line(report));
@@ -121,7 +120,7 @@ pub fn hand_over(task: &mut dyn SshdTask, report: &Path, exe: &Path, say: &mut S
             exe.display()
         )),
     }
-    remove(task, &mut warn);
+    remove(task, say);
 }
 
 fn not_set_up(did_not: &str, cause: &anyhow::Error) -> String {
@@ -132,12 +131,15 @@ fn not_set_up(did_not: &str, cause: &anyhow::Error) -> String {
     )
 }
 
-fn remove(task: &mut dyn SshdTask, warn: &mut dyn FnMut(&str)) {
+fn remove(task: &mut dyn SshdTask, say: &mut Say<'_>) {
     if let Err(e) = task.remove() {
-        warn(&format!(
-            "the task {INSTALL_SSHD_TASK} could not be removed ({e:#}); it has no trigger, runs nothing by itself, and \
-             the next install replaces it"
-        ));
+        say(
+            Stream::Err,
+            &format!(
+                "the task {INSTALL_SSHD_TASK} could not be removed ({e:#}); it has no trigger, runs nothing by itself, \
+                 and the next install replaces it"
+            ),
+        );
     }
 }
 

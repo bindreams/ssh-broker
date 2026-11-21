@@ -36,14 +36,17 @@ pub const REPORT_END: &str = "the step has ended; this report is complete";
 /// [`read_line`] tells the two apart.
 pub const WARNING_PREFIX: &str = "warning: ";
 
-/// Whether `line`, after any spaces, begins with [`WARNING_PREFIX`].
-fn begins_like_a_warning(line: &str) -> bool {
-    line.trim_start_matches(' ').starts_with(WARNING_PREFIX)
+/// Whether a note's `line`, after any spaces, begins with [`WARNING_PREFIX`] or is [`REPORT_END`]: it would read as
+/// a warning or as the closing line, so [`render`] puts one space in front of it.
+fn reads_as_the_reports_own(line: &str) -> bool {
+    let line = line.trim_start_matches(' ');
+    line.starts_with(WARNING_PREFIX) || line == REPORT_END
 }
 
 /// The report's text for a line of `kind` that says `text`: one report line for each line of `text` (one empty line
-/// for an empty text), each warning line with [`WARNING_PREFIX`]. A note line that begins like a warning gets one
-/// more space in front, so that [`read_line`] does not take it for one.
+/// for an empty text), each warning line with [`WARNING_PREFIX`]. A note line that [`reads_as_the_reports_own`]
+/// gets one more space in front, which [`read_line`] takes off: a note never reads as a warning, and no line of
+/// the step reads as the closing line.
 pub fn render(kind: LineKind, text: &str) -> String {
     let mut lines: Vec<&str> = text.lines().collect();
     if lines.is_empty() {
@@ -53,7 +56,7 @@ pub fn render(kind: LineKind, text: &str) -> String {
         .into_iter()
         .map(|line| match kind {
             LineKind::Warning => format!("{WARNING_PREFIX}{line}"),
-            LineKind::Note if begins_like_a_warning(line) => format!(" {line}"),
+            LineKind::Note if reads_as_the_reports_own(line) => format!(" {line}"),
             LineKind::Note => line.to_owned(),
         })
         .collect::<Vec<_>>()
@@ -64,7 +67,7 @@ pub fn render(kind: LineKind, text: &str) -> String {
 fn read_line(line: &str) -> (LineKind, &str) {
     if let Some(text) = line.strip_prefix(WARNING_PREFIX) {
         (LineKind::Warning, text)
-    } else if line.starts_with(' ') && begins_like_a_warning(line) {
+    } else if line.starts_with(' ') && reads_as_the_reports_own(line) {
         (LineKind::Note, &line[1..])
     } else {
         (LineKind::Note, line)
@@ -136,7 +139,7 @@ pub fn write_report(path: &Path, step: impl FnOnce(&mut dyn FnMut(LineKind, &str
 }
 
 /// [`write_report`] over a writer that is already open: the first line that cannot be written is the error, and
-/// no closing line follows it.
+/// nothing is written after it (a failed write may have left half a line), the closing line included.
 fn write_lines(
     out: &mut impl std::io::Write,
     step: impl FnOnce(&mut dyn FnMut(LineKind, &str)),
@@ -144,8 +147,10 @@ fn write_lines(
     let mut failure = None;
     step(&mut |kind, text| {
         for line in render(kind, text).split('\n') {
-            if let Err(e) = append(out, line) {
-                failure.get_or_insert(e);
+            if failure.is_none()
+                && let Err(e) = append(out, line)
+            {
+                failure = Some(e);
             }
         }
     });

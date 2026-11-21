@@ -132,6 +132,50 @@ fn a_note_that_begins_with_the_warning_prefix_is_read_back_as_that_note() {
     }
 }
 
+/// A note that is the closing line, with nothing after it (the process ended there), must not make the report
+/// read as complete.
+#[test]
+fn a_note_that_is_the_closing_line_does_not_complete_a_report_that_ends_after_it() {
+    let parsed = Report::parse(&format!("{}\r\n", render(LineKind::Note, REPORT_END)));
+    assert!(!parsed.complete);
+    assert_eq!(
+        parsed.lines,
+        [ReportLine {
+            kind: LineKind::Note,
+            text: REPORT_END.into()
+        }]
+    );
+}
+
+#[test]
+fn a_note_that_is_the_closing_line_is_read_back_as_that_note_in_a_whole_report() {
+    assert_eq!(
+        written_and_read(&[(LineKind::Note, REPORT_END)]),
+        [(LineKind::Note, REPORT_END.to_owned())]
+    );
+    let spaced = format!(" {REPORT_END}");
+    assert_eq!(
+        written_and_read(&[(LineKind::Note, &spaced)]),
+        [(LineKind::Note, spaced.clone())]
+    );
+}
+
+#[test]
+fn a_note_of_several_lines_one_of_which_is_the_closing_line_stays_a_note() {
+    let text = format!("first\n{REPORT_END}\nthird");
+    assert_eq!(
+        written_and_read(&[(LineKind::Note, &text)]),
+        [
+            (LineKind::Note, "first".to_owned()),
+            (LineKind::Note, REPORT_END.to_owned()),
+            (LineKind::Note, "third".to_owned()),
+        ]
+    );
+    let parsed = Report::parse(&format!("first\r\n{}\r\n", render(LineKind::Note, REPORT_END)));
+    assert!(!parsed.complete);
+    assert_eq!(parsed.lines.len(), 2);
+}
+
 #[test]
 fn a_note_of_several_lines_one_of_which_begins_with_the_warning_prefix_stays_a_note() {
     assert_eq!(
@@ -200,7 +244,7 @@ fn a_report_that_ends_with_the_closing_line_is_complete_and_the_closing_line_is_
 // the report file =====
 
 #[test]
-fn the_report_file_holds_notes_and_warnings_as_plain_lines_and_no_line_begins_with_the_verb() {
+fn the_report_file_holds_notes_and_warnings_as_plain_lines() {
     let dir = std::env::temp_dir().join(format!("sb-report-plain-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("install-sshd.log");
@@ -218,13 +262,6 @@ fn the_report_file_holds_notes_and_warnings_as_plain_lines_and_no_line_begins_wi
         raw,
         format!("restarting sshd\r\nwarning: sshd is NOT running\r\nsshd restarted\r\n{REPORT_END}\r\n")
     );
-    for line in raw.lines() {
-        let first = line.split(|c: char| !c.is_alphanumeric()).next().unwrap_or_default();
-        assert!(
-            !first.eq_ignore_ascii_case("install") && !line.starts_with("install-sshd:"),
-            "{line}"
-        );
-    }
 }
 
 #[test]
@@ -327,6 +364,49 @@ fn a_line_that_cannot_be_written_leaves_the_report_without_a_closing_line_and_is
         String::from_utf8(out.written).unwrap(),
         "first\r\n",
         "no closing line follows a failed one: the report says it is not whole"
+    );
+}
+
+/// A writer whose `fails_at`th write (counting from 0) fails and that accepts every other.
+struct FailsOnce {
+    fails_at: usize,
+    writes: usize,
+    written: Vec<u8>,
+}
+
+impl std::io::Write for FailsOnce {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.writes += 1;
+        if self.writes - 1 == self.fails_at {
+            return Err(std::io::Error::other("the disk hiccuped"));
+        }
+        self.written.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn nothing_is_written_after_a_line_that_could_not_be_written() {
+    let mut out = FailsOnce {
+        fails_at: 1,
+        writes: 0,
+        written: Vec::new(),
+    };
+    let err = write_lines(&mut out, |say| {
+        say(LineKind::Note, "first");
+        say(LineKind::Note, "second\nof two lines");
+        say(LineKind::Note, "third");
+    })
+    .unwrap_err();
+    assert_eq!(err.to_string(), "the disk hiccuped");
+    assert_eq!(
+        String::from_utf8(out.written).unwrap(),
+        "first\r\n",
+        "a later line would follow a hole, and no closing line either"
     );
 }
 

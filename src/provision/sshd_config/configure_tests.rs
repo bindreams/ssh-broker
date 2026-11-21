@@ -779,7 +779,8 @@ fn a_candidate_sshd_rejects_leaves_the_original_byte_for_byte_and_says_which_lin
     assert!(host.candidate.is_none(), "the candidate is removed: {:?}", host.events);
     assert!(said_advice(&said), "{said:?}");
     assert!(
-        said.iter().any(|(_, line)| line.contains("Bad configuration option")),
+        said.iter()
+            .any(|(kind, line)| *kind == LineKind::Warning && line.contains("Bad configuration option")),
         "{said:?}"
     );
     assert_nothing_to_remove(&said);
@@ -806,7 +807,11 @@ fn a_config_that_cannot_be_edited_safely_is_left_and_says_which_line_to_add() {
     assert!(!accepted);
     assert_eq!(host.config, before);
     assert!(said_advice(&said), "{said:?}");
-    assert!(said.iter().any(|(_, line)| line.contains("UTF-16")), "{said:?}");
+    assert!(
+        said.iter()
+            .any(|(kind, line)| *kind == LineKind::Warning && line.contains("UTF-16")),
+        "{said:?}"
+    );
     assert!(!host.events.iter().any(|e| e == "write candidate"));
 }
 
@@ -872,7 +877,7 @@ fn a_candidate_that_fails_to_write_is_removed() {
     );
     assert!(
         said.iter()
-            .any(|(_, line)| line.contains("cannot write a candidate beside it")),
+            .any(|(kind, line)| *kind == LineKind::Warning && line.contains("cannot write a candidate beside it")),
         "{said:?}"
     );
 }
