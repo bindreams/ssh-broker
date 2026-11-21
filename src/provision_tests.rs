@@ -21,6 +21,11 @@ fn check_install_args_refuses_any_argument() {
     assert!(err.contains("--user"), "{err}");
 }
 
+#[test]
+fn the_installed_line_is_the_literal() {
+    assert_eq!(installed_line("0.2.0"), "ssh-broker v0.2.0 has been installed!");
+}
+
 // The shell config row and the probe =====
 
 use crate::shell::test_host::{TestHost, USER_CONFIG};

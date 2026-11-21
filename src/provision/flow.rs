@@ -3,9 +3,46 @@
 
 use anyhow::Context;
 
+use super::handover::{Say, Stream};
+use super::path_env;
 use super::procwait::{self, StillRunning, Survivor};
 use super::schtasks::{INSTALL_SSHD_TASK, WaitOutcome, end_and_remove_install_sshd_task};
+use super::sessions::Targets;
 use super::sshd_config::CHECK_SSHD;
+
+/// Run `install`: say that it starts, run `body` (everything up to the sshd step, which gives back what must be
+/// held until the end, the lock), run `sshd_step` with a sink for its lines, then say that ssh-broker has been
+/// installed. The sshd step never fails `install`, so the last line is said exactly when `body` succeeded, and
+/// nothing is said after it.
+pub fn install_run<T>(
+    say: &mut Say<'_>,
+    version: &str,
+    body: impl FnOnce(&mut Say<'_>) -> anyhow::Result<T>,
+    sshd_step: impl FnOnce(&T, &mut dyn FnMut(&str)),
+) -> anyhow::Result<()> {
+    say(
+        Stream::Out,
+        &format!("Installing ssh-broker v{version} for every user of this PC..."),
+    );
+    let held = body(say)?;
+    sshd_step(&held, &mut |line| say(Stream::Out, line));
+    say(Stream::Out, &super::installed_line(version));
+    Ok(())
+}
+
+/// Take the install lock with `acquire`, which is given the function that says the wait has begun, and calls it
+/// when it finds the lock held.
+pub fn wait_for_lock<L>(
+    say: &mut Say<'_>,
+    acquire: impl FnOnce(&mut dyn FnMut()) -> anyhow::Result<L>,
+) -> anyhow::Result<L> {
+    acquire(&mut || {
+        say(
+            Stream::Out,
+            "Waiting for another install or auto-login command to finish...",
+        )
+    })
+}
 
 /// The wait, at the start of `install` and right after its lock, for the sshd step of an earlier `install`.
 ///
@@ -17,16 +54,11 @@ use super::sshd_config::CHECK_SSHD;
 /// returns when the instances have ended. An instance the Task Scheduler never launched stops `install`, as a
 /// task that never clears does in `stop_instances`: nothing goes on beside an instance that may still start.
 pub fn wait_for_earlier_sshd_step(
-    say: &mut dyn FnMut(&str),
+    say: &mut Say<'_>,
     wait: impl FnOnce(&mut dyn FnMut()) -> anyhow::Result<WaitOutcome>,
 ) -> anyhow::Result<()> {
-    let outcome = wait(&mut || {
-        say(&format!(
-            "install: an earlier install's sshd step is still running (the task {INSTALL_SSHD_TASK}); waiting for it to \
-             finish"
-        ))
-    })
-    .context("wait for an earlier install's sshd step")?;
+    let outcome = wait(&mut || say(Stream::Out, "Waiting for an earlier sshd step to finish..."))
+        .context("wait for an earlier install's sshd step")?;
     match outcome {
         WaitOutcome::Ended => Ok(()),
         WaitOutcome::NeverLaunched { count } => anyhow::bail!(
@@ -59,21 +91,27 @@ pub fn wait_for_earlier_sshd_step(
 /// If the stop left agents running (see [`StillRunning`], found under any context `set_up`
 /// added), `start` is told which: an agent started in the session of a survivor would find that
 /// session's slot taken and exit, leaving the session with none once the survivor dies.
+///
+/// `set_up`, `repair_sessions` and `start` are given `say`, the sink of `install`'s lines.
 pub fn run<T>(
+    say: &mut Say<'_>,
     stop: impl FnOnce() -> anyhow::Result<()>,
-    set_up: impl FnOnce(&mut dyn FnMut() -> anyhow::Result<()>) -> anyhow::Result<T>,
+    set_up: impl FnOnce(&mut dyn FnMut() -> anyhow::Result<()>, &mut Say<'_>) -> anyhow::Result<T>,
     resume_agent_task: impl FnOnce() -> anyhow::Result<()>,
-    repair_sessions: impl FnOnce() -> anyhow::Result<()>,
-    start: impl FnOnce(&[Survivor]),
+    repair_sessions: impl FnOnce(&mut Say<'_>) -> anyhow::Result<()>,
+    start: impl FnOnce(&[Survivor], &mut Say<'_>),
 ) -> anyhow::Result<T> {
     let mut stop = Some(stop);
     let mut attempted = false;
-    let result = set_up(&mut || {
-        attempted = true;
-        stop.take().expect("the stop is called at most once")()
-    });
+    let result = set_up(
+        &mut || {
+            attempted = true;
+            stop.take().expect("the stop is called at most once")()
+        },
+        say,
+    );
     let agent_task = resume_agent_task();
-    let sessions = repair_sessions();
+    let sessions = repair_sessions(say);
     // A disabled agent task starts no agent, so its failure holds the start back. The auto-login
     // tasks are other tasks: their failure is reported but does not.
     let (agents_can_start, failure) = match (agent_task, sessions) {
@@ -81,7 +119,7 @@ pub fn run<T>(
         (Ok(()), Err(e)) => (true, Some(e)),
         (Err(e), Ok(())) => (false, Some(e)),
         (Err(e), Err(sessions)) => {
-            eprintln!("install: {sessions:#}");
+            say(Stream::Err, &format!("{sessions:#}"));
             (false, Some(e))
         }
     };
@@ -90,13 +128,13 @@ pub fn run<T>(
             Err(e) => e.downcast_ref::<StillRunning>().map(|s| s.survivors.as_slice()),
             Ok(_) => None,
         };
-        start(survivors.unwrap_or_default());
+        start(survivors.unwrap_or_default(), say);
     }
     match (result, failure) {
         (result, None) => result,
         (Ok(_), Some(e)) => Err(e),
         (Err(set_up_error), Some(e)) => {
-            eprintln!("install: {e:#}");
+            say(Stream::Err, &format!("{e:#}"));
             Err(set_up_error)
         }
     }
@@ -161,6 +199,7 @@ pub fn stop_sessions<P>(
 /// to start it, is printed and is not the result: like the start of the desktop agents, the install
 /// is complete without it.
 pub fn repair_sessions(
+    say: &mut Say<'_>,
     tasks: impl FnOnce() -> anyhow::Result<Vec<SessionTask>>,
     mut enable: impl FnMut(&str) -> anyhow::Result<()>,
     mut running: impl FnMut(&str) -> anyhow::Result<bool>,
@@ -175,7 +214,7 @@ pub fn repair_sessions(
             if first.is_none() {
                 first = Some(e);
             } else {
-                eprintln!("install: {e:#}");
+                say(Stream::Err, &format!("{e:#}"));
             }
             continue;
         }
@@ -183,15 +222,93 @@ pub fn repair_sessions(
             Ok(true) => {}
             Ok(false) => {
                 if let Err(e) = run(&name) {
-                    eprintln!("install: could not start the {name} task: {e:#}");
+                    say(Stream::Err, &format!("could not start the {name} task: {e:#}"));
                 }
             }
-            Err(e) => {
-                eprintln!("install: could not tell whether the {name} task is running, so it was not started: {e:#}")
-            }
+            Err(e) => say(
+                Stream::Err,
+                &format!("could not tell whether the {name} task is running, so it was not started: {e:#}"),
+            ),
         }
     }
     first.map_or(Ok(()), Err)
+}
+
+/// Step 4 of `install`: start an agent in each session that already has a user (`interactive` lists them), so
+/// nobody has to log off and on again (the logon trigger covers every later logon), and to bring back the agents
+/// the stop ended. `start_in` starts the agent in one session; an agent that is already running in its session
+/// exits at once, so this is safe to repeat. Best-effort: the install is complete without it, and a failed
+/// `install` runs it too. A session whose old agent survived the stop is left alone: see [`plan_start`]. Each
+/// failure is said on stderr and the rest go on.
+pub fn start_agents(
+    say: &mut Say<'_>,
+    interactive: impl FnOnce() -> anyhow::Result<Targets>,
+    mut start_in: impl FnMut(u32) -> anyhow::Result<()>,
+    survivors: &[Survivor],
+) {
+    let targets = match interactive() {
+        Ok(targets) => targets,
+        Err(e) => {
+            say(
+                Stream::Err,
+                &format!("the logged-on sessions could not be listed: {e:#}"),
+            );
+            return;
+        }
+    };
+    for (id, why) in &targets.unknown {
+        say(
+            Stream::Err,
+            &format!("could not tell whether session {id} has a user, so no agent was started there: {why}"),
+        );
+    }
+    let plan = plan_start(&targets.ids, survivors);
+    for (id, pids) in &plan.held {
+        say(
+            Stream::Err,
+            &format!(
+                "no agent was started in session {id}: its old agent (process {}) was stopped but has not been seen to exit; run install again once it has exited",
+                pids.iter().map(u32::to_string).collect::<Vec<_>>().join(", ")
+            ),
+        );
+    }
+    if !plan.start.is_empty() {
+        say(Stream::Out, "Starting an agent in each logged-on session...");
+    }
+    for id in &plan.start {
+        if let Err(e) = start_in(*id) {
+            say(
+                Stream::Err,
+                &format!("could not start the agent in session {id}: {e:#}"),
+            );
+        }
+    }
+}
+
+/// Append `dir` to the machine's `PATH` (`current` is what is stored now), so that a session finds `ssh-broker` by
+/// name. `write` stores the value (as `REG_EXPAND_SZ` when its second argument says so) and `broadcast` tells the
+/// running programs, which can take seconds: the step is said before either, and only when a write is made. One that
+/// cannot be judged or written is said on stderr and left alone, and `install` goes on (the install is complete
+/// without it).
+pub fn add_install_dir_to_path(
+    say: &mut Say<'_>,
+    dir: &str,
+    current: &path_env::Reading,
+    expanded_length: impl Fn(&str) -> Result<usize, String>,
+    write: impl FnOnce(&str, bool) -> anyhow::Result<()>,
+    broadcast: impl FnOnce(),
+) {
+    match path_env::plan(current, dir, expanded_length) {
+        path_env::PathPlan::Present => {}
+        path_env::PathPlan::Refuse(why) => say(Stream::Err, &format!("{dir} was not added to the system PATH: {why}")),
+        path_env::PathPlan::Write { value, expand } => {
+            say(Stream::Out, &format!("Adding {dir} to the system PATH..."));
+            match write(&value, expand) {
+                Ok(()) => broadcast(),
+                Err(e) => say(Stream::Err, &format!("{dir} was not added to the system PATH: {e:#}")),
+            }
+        }
+    }
 }
 
 /// Which of the sessions with a user get an agent started, and which are left alone.

@@ -5,6 +5,7 @@ use crate::agent::elevation::{HostedSession, Starts};
 use crate::agent::{Drained, HeldListener};
 use crate::protocol::{ElevationPolicy, ExitCode, FrameKind, FrameReader, Stream};
 use crate::relay::{Outcome, TestSink, pump_decode, write_data};
+use crate::test_support::ClosedStream;
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
@@ -513,21 +514,7 @@ fn a_hand_back_is_one_frame_with_the_cause_then_a_fin_and_the_agent_waits_for_th
 /// A client that has gone cannot be told, which is not a fault.
 #[test]
 fn a_hand_back_to_a_client_that_has_gone_is_not_an_error() {
-    struct Gone;
-    impl Write for Gone {
-        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
-            Err(std::io::ErrorKind::BrokenPipe.into())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Err(std::io::ErrorKind::BrokenPipe.into())
-        }
-    }
-    impl HalfClose for Gone {
-        fn shutdown_write(&self) -> anyhow::Result<()> {
-            Ok(())
-        }
-    }
-    hand_back(&mut Closed, &mut Gone, &Control::standalone(), "why").unwrap();
+    hand_back(&mut Closed, &mut ClosedStream, &Control::standalone(), "why").unwrap();
 }
 
 /// An answer to a client that has gone (a Ctrl+C ended `elevate` while its command ran) is routine, whichever answer it
@@ -664,21 +651,12 @@ fn a_session_that_registers_while_the_shells_are_being_ended_is_refused() {
 
 #[test]
 fn a_logout_whose_client_is_gone_before_the_reply_still_ends_the_agent() {
-    struct Gone;
-    impl Write for Gone {
-        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
-            Err(std::io::ErrorKind::BrokenPipe.into())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Err(std::io::ErrorKind::BrokenPipe.into())
-        }
-    }
     let control = Control::new(true, Connections::new());
     let killed = Arc::new(AtomicUsize::new(0));
     let _session = control.register(counting_killer(&killed)).unwrap();
     let ended = AtomicBool::new(false);
 
-    handle_logout(&mut Closed, &mut Gone, &control, |_| {
+    handle_logout(&mut Closed, &mut ClosedStream, &control, |_| {
         ended.store(true, Ordering::SeqCst)
     })
     .unwrap();

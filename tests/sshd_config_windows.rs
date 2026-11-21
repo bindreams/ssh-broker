@@ -27,7 +27,7 @@ use ssh_broker::provision::sshd_config::{
     ACCEPT_LINE, DROP_IN_NAME, INCLUDE_LINE, SshdReading, accepts, accepts_row, drop_in_text, in_force, with_line,
 };
 use ssh_broker::provision::sshd_task;
-use ssh_broker::provision::{BASE_DIR, canonical_exe};
+use ssh_broker::provision::{BASE_DIR, canonical_exe, installed_line, version};
 use ssh_broker::provision::{schtasks, taskscheduler};
 use ssh_broker::socket_loc::Elevation;
 
@@ -191,10 +191,17 @@ fn install_s_sshd_step_adds_the_drop_in_and_the_include_above_the_first_match_an
     let security_before = sddl_of(&config_path());
 
     let (stdout, _) = install_streams(&kit);
+    let installed = installed_line(version());
+    assert_eq!(
+        stdout.lines().last(),
+        Some(installed.as_str()),
+        "install's last line says it is installed:\n{stdout}"
+    );
     let printed: Vec<&str> = stdout
         .lines()
         .skip_while(|line| !line.starts_with(sshd_task::HANDED_OVER_PREFIX))
         .skip(1)
+        .take_while(|line| *line != installed)
         .collect();
     let said = report().lines;
     assert_eq!(printed, said, "install prints the report, line for line");
@@ -533,6 +540,11 @@ fn install_puts_the_install_directory_on_the_system_path_and_doctor_says_so() {
 
     let doctor = desktop::output(Command::new(canonical_exe()).arg("doctor")).expect("run doctor");
     let shown = String::from_utf8_lossy(&doctor.stdout).into_owned();
+    assert_eq!(
+        shown.lines().next(),
+        Some(format!("ssh-broker v{} ({})", version(), canonical_exe().display()).as_str()),
+        "doctor's report does not begin with the version and the path of the exe that ran:\n{shown}"
+    );
     assert!(
         shown
             .lines()

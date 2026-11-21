@@ -507,6 +507,32 @@ pub fn logged<T>(f: impl FnOnce() -> T) -> (String, T) {
 
 // Printed texts -----
 
+/// A standard stream that has been closed, as by a dropped SSH connection: every write and flush fails.
+pub struct ClosedStream;
+
+impl std::io::Write for ClosedStream {
+    fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+        Err(std::io::ErrorKind::BrokenPipe.into())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Err(std::io::ErrorKind::BrokenPipe.into())
+    }
+}
+
+// The lines of `install` -----
+
+/// What was said, in order, with the stream of each line.
+pub type Said = Vec<(crate::provision::handover::Stream, String)>;
+
+/// A sink for the tests that do not look at what is said.
+pub fn silent(_: crate::provision::handover::Stream, _: &str) {}
+
+/// A sink that records into `said`.
+pub fn recording(said: &std::cell::RefCell<Said>) -> impl FnMut(crate::provision::handover::Stream, &str) + '_ {
+    |stream, text| said.borrow_mut().push((stream, text.to_owned()))
+}
+
 /// A line the shell step prints states what happened and holds no advice: the how-to is in the README
 /// ("Shell configuration"), once.
 pub fn states_facts_only(text: &str) {

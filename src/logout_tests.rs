@@ -2,6 +2,7 @@
 use super::*;
 use crate::protocol::{ExitCode, FrameKind, FrameReader, Handshake, Mode, Stream, write_frame};
 use crate::relay::write_data;
+use crate::test_support::ClosedStream;
 use std::io::Cursor;
 
 /// What an agent would send: stderr text, then an exit code.
@@ -74,17 +75,8 @@ fn a_connection_that_is_reset_or_gone_before_the_agents_first_byte_is_unanswered
 
 #[test]
 fn a_request_that_cannot_be_sent_because_the_agent_has_gone_is_unanswered() {
-    struct Gone;
-    impl Write for Gone {
-        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
-            Err(std::io::ErrorKind::BrokenPipe.into())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Err(std::io::ErrorKind::BrokenPipe.into())
-        }
-    }
     let mut err = Vec::new();
-    let asked = logout_on(&mut Cursor::new(Vec::new()), &mut Gone, &mut err);
+    let asked = logout_on(&mut Cursor::new(Vec::new()), &mut ClosedStream, &mut err);
     assert!(matches!(asked, Asked::Unanswered));
     assert!(err.is_empty(), "nothing is said until the next connect has answered");
 }

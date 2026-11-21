@@ -1,4 +1,5 @@
 use super::*;
+use crate::test_support::{Said, recording, silent};
 use anyhow::Context;
 use std::cell::RefCell;
 
@@ -23,11 +24,12 @@ fn flow_resuming(
 ) -> (Vec<&'static str>, anyhow::Result<()>) {
     let events = RefCell::new(Vec::new());
     let result = run(
+        &mut silent,
         || {
             events.borrow_mut().push("stop");
             stop_result()
         },
-        |stop| {
+        |stop, _| {
             if stops {
                 stop()?;
             }
@@ -39,11 +41,11 @@ fn flow_resuming(
             events.borrow_mut().push("resume");
             resume_result()
         },
-        || {
+        |_| {
             events.borrow_mut().push("repair sessions");
             repair_result()
         },
-        |left| {
+        |left, _| {
             events.borrow_mut().push("start");
             assert!(left.is_empty(), "no agent survived");
         },
@@ -75,14 +77,15 @@ fn agents_survive_a_failed_stop_in_the_sessions_the_start_is_told_to_leave_alone
     }];
     let told = RefCell::new(Vec::new());
     let result = run(
+        &mut silent,
         || Err(StillRunning::new(left.clone(), std::time::Duration::from_secs(60)).into()),
-        |stop| {
+        |stop, _| {
             stop().context("stop the running agents")?;
             Ok(())
         },
         || Ok(()),
-        || Ok(()),
-        |survivors| told.borrow_mut().extend_from_slice(survivors),
+        |_| Ok(()),
+        |survivors, _| told.borrow_mut().extend_from_slice(survivors),
     );
     let text = format!("{:#}", result.unwrap_err());
     assert!(text.contains("process 5 did not exit"), "{text}");
@@ -99,7 +102,7 @@ fn agents_survive_a_failed_stop_in_the_sessions_the_start_is_told_to_leave_alone
 fn wait_for_earlier(found: bool, waited: anyhow::Result<WaitOutcome>) -> (Vec<String>, anyhow::Result<()>) {
     let events = RefCell::new(Vec::new());
     let log = |event: &str| events.borrow_mut().push(event.to_owned());
-    let result = wait_for_earlier_sshd_step(&mut |line| log(&format!("say: {line}")), |waiting| {
+    let result = wait_for_earlier_sshd_step(&mut |stream, line| log(&format!("say {stream:?}: {line}")), |waiting| {
         log("look for the sshd step");
         if found {
             waiting();
@@ -118,8 +121,7 @@ fn an_earlier_sshd_step_is_said_once_and_waited_for() {
         events,
         [
             "look for the sshd step",
-            "say: install: an earlier install's sshd step is still running (the task ssh-broker-install-sshd); waiting \
-             for it to finish",
+            "say Out: Waiting for an earlier sshd step to finish...",
             "wait for the sshd step",
         ]
     );
@@ -439,7 +441,12 @@ impl Machine {
     }
 
     fn repair(&self) -> anyhow::Result<()> {
+        self.repair_saying(&mut silent)
+    }
+
+    fn repair_saying(&self, say: &mut Say<'_>) -> anyhow::Result<()> {
         repair_sessions(
+            say,
             || {
                 Ok(self
                     .tasks
@@ -512,10 +519,439 @@ fn a_task_that_cannot_be_started_does_not_fail_the_repair_or_hold_back_the_other
 #[test]
 fn a_listing_of_the_tasks_that_fails_is_the_result() {
     let result = repair_sessions(
+        &mut silent,
         || anyhow::bail!("service unreachable"),
         |_| Ok(()),
         |_| Ok(false),
         |_| Ok(()),
     );
     assert!(format!("{:#}", result.unwrap_err()).contains("service unreachable"));
+}
+
+// what `install` says =====
+
+use crate::provision::path_env::Stored;
+use crate::provision::sessions::Targets;
+
+const DIR: &str = r"C:\ProgramData\ssh-broker";
+const INSTALLING: &str = "Installing ssh-broker v0.2.0 for every user of this PC...";
+const INSTALLED: &str = "ssh-broker v0.2.0 has been installed!";
+const STARTING: &str = "Starting an agent in each logged-on session...";
+
+fn out(text: &str) -> (Stream, String) {
+    (Stream::Out, text.to_owned())
+}
+
+fn err(text: &str) -> (Stream, String) {
+    (Stream::Err, text.to_owned())
+}
+
+/// A system `PATH` without the install directory, and one with it.
+fn path_without() -> path_env::Reading {
+    Ok(Some(Stored::Sz(r"C:\Windows;C:\Windows\System32".into())))
+}
+
+fn path_with() -> path_env::Reading {
+    Ok(Some(Stored::Sz(format!(r"C:\Windows;{DIR}"))))
+}
+
+fn plain_length(text: &str) -> Result<usize, String> {
+    Ok(text.encode_utf16().count())
+}
+
+/// `add_install_dir_to_path` over `current`, whose write gives `written`; returns what was said and the values
+/// written, and whether the other programs were told.
+fn put_on_the_path(current: path_env::Reading, written: anyhow::Result<()>) -> (Said, Vec<(String, bool)>, bool) {
+    let said = RefCell::new(Vec::new());
+    let writes = RefCell::new(Vec::new());
+    let mut told = false;
+    add_install_dir_to_path(
+        &mut recording(&said),
+        DIR,
+        &current,
+        plain_length,
+        |value, expand| {
+            assert!(
+                !said.borrow().is_empty(),
+                "the line comes before the write, which can take seconds"
+            );
+            writes.borrow_mut().push((value.to_owned(), expand));
+            written
+        },
+        || {
+            assert!(!writes.borrow().is_empty(), "the programs are told after the write");
+            told = true;
+        },
+    );
+    (said.into_inner(), writes.into_inner(), told)
+}
+
+#[test]
+fn the_last_thing_install_says_is_the_installed_line_on_stdout() {
+    let said = RefCell::new(Vec::new());
+    install_run(
+        &mut recording(&said),
+        "0.2.0",
+        |say| {
+            say(Stream::Out, "A step...");
+            say(Stream::Err, "a warning");
+            Ok(())
+        },
+        |(), say| say("a line of the sshd step"),
+    )
+    .unwrap();
+    assert_eq!(
+        said.into_inner(),
+        [
+            out(INSTALLING),
+            out("A step..."),
+            err("a warning"),
+            out("a line of the sshd step"),
+            out(INSTALLED),
+        ]
+    );
+}
+
+#[test]
+fn an_install_that_fails_says_no_installed_line_and_runs_no_sshd_step() {
+    let said = RefCell::new(Vec::new());
+    let result = install_run(
+        &mut recording(&said),
+        "0.2.0",
+        |say| -> anyhow::Result<()> {
+            say(Stream::Out, "A step...");
+            anyhow::bail!("copy failed")
+        },
+        |(), _| panic!("the sshd step comes only after the install worked"),
+    );
+    assert_eq!(format!("{:#}", result.unwrap_err()), "copy failed");
+    assert_eq!(said.into_inner(), [out(INSTALLING), out("A step...")]);
+}
+
+/// The sshd step runs while the install's own state (the lock) is still held, and nothing is dropped before the
+/// installed line.
+#[test]
+fn what_the_install_holds_is_held_through_the_sshd_step() {
+    struct Held<'a>(&'a RefCell<Vec<&'static str>>);
+    impl Drop for Held<'_> {
+        fn drop(&mut self) {
+            self.0.borrow_mut().push("released");
+        }
+    }
+    let events = RefCell::new(Vec::new());
+    install_run(
+        &mut |_, text| {
+            if text == INSTALLED {
+                events.borrow_mut().push("installed line")
+            }
+        },
+        "0.2.0",
+        |_| Ok(Held(&events)),
+        |_, _| events.borrow_mut().push("sshd step"),
+    )
+    .unwrap();
+    assert_eq!(events.into_inner(), ["sshd step", "installed line", "released"]);
+}
+
+#[test]
+fn the_wait_for_another_install_is_a_step_line_on_stdout_said_when_the_lock_is_held() {
+    let said = RefCell::new(Vec::new());
+    let held = wait_for_lock(&mut recording(&said), |waiting| {
+        waiting();
+        Ok("the lock")
+    })
+    .unwrap();
+    assert_eq!(held, "the lock");
+    assert_eq!(
+        said.into_inner(),
+        [out("Waiting for another install or auto-login command to finish...")]
+    );
+
+    let said = RefCell::new(Vec::new());
+    wait_for_lock(&mut recording(&said), |_| Ok(())).unwrap();
+    assert_eq!(said.into_inner(), [], "a free lock says nothing");
+}
+
+/// `start_agents` over a machine: the sessions listed, the survivors of the stop, and the sessions whose start fails.
+fn started(targets: anyhow::Result<Targets>, survivors: &[Survivor], unstartable: &[u32]) -> (Said, Vec<u32>) {
+    let said = RefCell::new(Vec::new());
+    let mut starts = Vec::new();
+    start_agents(
+        &mut recording(&said),
+        || targets,
+        |id| {
+            assert_eq!(
+                said.borrow().iter().filter(|line| **line == out(STARTING)).count(),
+                1,
+                "the line is said once, before the first agent is started"
+            );
+            anyhow::ensure!(!unstartable.contains(&id), "no such task");
+            starts.push(id);
+            Ok(())
+        },
+        survivors,
+    );
+    (said.into_inner(), starts)
+}
+
+fn survivor(pid: u32, session: u32) -> Survivor {
+    Survivor {
+        pid,
+        session: Some(session),
+        unconfirmed: None,
+    }
+}
+
+#[test]
+fn the_start_of_the_agents_is_a_step_line_and_nothing_else_when_it_works() {
+    let targets = Targets {
+        ids: vec![1, 2],
+        unknown: vec![],
+    };
+    let (said, starts) = started(Ok(targets), &[], &[]);
+    assert_eq!(said, [out(STARTING)]);
+    assert_eq!(starts, [1, 2]);
+}
+
+#[test]
+fn every_line_that_was_on_stderr_is_still_said_there() {
+    // `start_agents`
+    let targets = || Targets {
+        ids: vec![1, 2, 4],
+        unknown: vec![(3, "access denied".into())],
+    };
+    let (said, starts) = started(Ok(targets()), &[survivor(5, 2), survivor(6, 2)], &[4]);
+    assert_eq!(
+        said,
+        [
+            err("could not tell whether session 3 has a user, so no agent was started there: access denied"),
+            err(
+                "no agent was started in session 2: its old agent (process 5, 6) was stopped but has not been seen to \
+                 exit; run install again once it has exited"
+            ),
+            out(STARTING),
+            err("could not start the agent in session 4: no such task"),
+        ]
+    );
+    assert_eq!(starts, [1]);
+    let (said, _) = started(Err(anyhow::anyhow!("the service is down")), &[], &[]);
+    assert_eq!(
+        said,
+        [err("the logged-on sessions could not be listed: the service is down")]
+    );
+
+    // `add_install_dir_to_path`
+    let (said, writes, _) = put_on_the_path(Ok(None), Ok(()));
+    assert_eq!(
+        said,
+        [err(&format!(
+            "{DIR} was not added to the system PATH: the system PATH has no Path value"
+        ))]
+    );
+    assert_eq!(writes, []);
+    let (said, _, told) = put_on_the_path(path_without(), Err(anyhow::anyhow!("access denied")));
+    assert_eq!(
+        said,
+        [
+            out(&format!("Adding {DIR} to the system PATH...")),
+            err(&format!("{DIR} was not added to the system PATH: access denied")),
+        ]
+    );
+    assert!(
+        !told,
+        "a failed write is not followed by the notice to the running programs"
+    );
+}
+
+/// `run` says what failed when two things fail and only one can be the result.
+#[test]
+fn the_failure_that_is_not_the_result_is_said_on_stderr() {
+    let said = RefCell::new(Vec::new());
+    let result = run(
+        &mut recording(&said),
+        || Ok(()),
+        |_, _| Ok(()),
+        || anyhow::bail!("agent denied"),
+        |_| anyhow::bail!("task denied"),
+        |_, _| panic!("a disabled agent task starts no agent"),
+    );
+    assert_eq!(format!("{:#}", result.unwrap_err()), "agent denied");
+    assert_eq!(said.into_inner(), [err("task denied")]);
+
+    let said = RefCell::new(Vec::new());
+    let result = run::<()>(
+        &mut recording(&said),
+        || Ok(()),
+        |_, _| anyhow::bail!("register failed"),
+        || Ok(()),
+        |_| anyhow::bail!("task denied"),
+        |_, _| panic!("nothing was stopped"),
+    );
+    assert_eq!(format!("{:#}", result.unwrap_err()), "register failed");
+    assert_eq!(said.into_inner(), [err("task denied")]);
+}
+
+#[test]
+fn the_repair_says_what_it_could_not_enable_after_the_first_and_what_it_could_not_start_or_ask() {
+    let said = RefCell::new(Vec::new());
+    // `a` and `b` cannot be enabled: `a`'s failure is the result and `b`'s is said. `c` cannot be asked whether it
+    // runs, `d` cannot be started.
+    let result = repair_sessions(
+        &mut recording(&said),
+        || {
+            Ok(vec![
+                task("a", false),
+                task("b", false),
+                task("c", true),
+                task("d", true),
+            ])
+        },
+        |_| anyhow::bail!("access denied"),
+        |name| match name {
+            "c" => anyhow::bail!("the Task Scheduler did not answer"),
+            _ => Ok(false),
+        },
+        |_| anyhow::bail!("no such task"),
+    );
+    assert!(format!("{:#}", result.unwrap_err()).contains("could not enable the a task again"));
+    assert_eq!(
+        said.into_inner(),
+        [
+            err("could not enable the b task again; no session starts at boot until it is: access denied"),
+            err(
+                "could not tell whether the c task is running, so it was not started: the Task Scheduler did not answer"
+            ),
+            err("could not start the d task: no such task"),
+        ]
+    );
+}
+
+#[test]
+fn a_step_that_does_not_happen_says_nothing() {
+    // A PATH that is right already: nothing is written, nothing broadcast, nothing said.
+    let (said, writes, told) = put_on_the_path(path_with(), Ok(()));
+    assert_eq!((said, writes, told), (vec![], vec![], false));
+    // An agent task and a stop that were not needed: `run` says nothing of its own.
+    let said = RefCell::new(Vec::new());
+    run(
+        &mut recording(&said),
+        || Ok(()),
+        |_, _| Ok(()),
+        || Ok(()),
+        |_| Ok(()),
+        |_, _| {},
+    )
+    .unwrap();
+    assert_eq!(said.into_inner(), []);
+    // No start, so no step line.
+    let (said, starts) = started(Ok(Targets::default()), &[], &[]);
+    assert_eq!((said, starts), (vec![], vec![]));
+    let targets = Targets {
+        ids: vec![2],
+        unknown: vec![(3, "access denied".into())],
+    };
+    let (said, starts) = started(Ok(targets), &[survivor(5, 2)], &[]);
+    assert_eq!(starts, Vec::<u32>::new());
+    assert!(!said.contains(&out(STARTING)), "{said:?}");
+    assert_eq!(said.len(), 2, "{said:?}");
+    // Nor when the sessions could not be listed: that is said, and nothing starts.
+    let (said, starts) = started(Err(anyhow::anyhow!("the service is down")), &[], &[]);
+    assert_eq!(starts, Vec::<u32>::new());
+    assert!(!said.contains(&out(STARTING)), "{said:?}");
+    assert_eq!(said.len(), 1, "{said:?}");
+}
+
+#[test]
+fn the_path_is_announced_before_it_is_written_and_the_programs_told_after() {
+    let (said, writes, told) = put_on_the_path(path_without(), Ok(()));
+    assert_eq!(said, [out(&format!("Adding {DIR} to the system PATH..."))]);
+    assert_eq!(writes, [(format!(r"C:\Windows;C:\Windows\System32;{DIR}"), false)]);
+    assert!(told, "the running programs hear of the change");
+}
+
+/// The lines of a first install on a machine with trouble at every step that goes on: the waits, the PATH, the
+/// agents and the sessions. The sshd step is a stand-in that says nothing: its lines are not this module's.
+fn what_a_troubled_install_says() -> Said {
+    let said = RefCell::new(Vec::new());
+    install_run(
+        &mut recording(&said),
+        "0.2.0",
+        |say| {
+            wait_for_lock(say, |waiting| {
+                waiting();
+                Ok(())
+            })?;
+            wait_for_earlier_sshd_step(say, |waiting| {
+                waiting();
+                Ok(WaitOutcome::Ended)
+            })?;
+            run(
+                say,
+                || Ok(()),
+                |stop, say| {
+                    stop()?;
+                    add_install_dir_to_path(say, DIR, &Ok(None), plain_length, |_, _| Ok(()), || {});
+                    add_install_dir_to_path(say, DIR, &path_without(), plain_length, |_, _| Ok(()), || {});
+                    Ok(())
+                },
+                || Ok(()),
+                |say| {
+                    let mut machine = Machine::new(vec![("a", true, false), ("b", true, true)]);
+                    machine.unstartable = Some("a");
+                    machine.repair_saying(say)
+                },
+                |survivors, say| {
+                    start_agents(
+                        say,
+                        || {
+                            Ok(Targets {
+                                ids: vec![1, 2],
+                                unknown: vec![(3, "access denied".into())],
+                            })
+                        },
+                        |id| {
+                            anyhow::ensure!(id != 2, "no such task");
+                            Ok(())
+                        },
+                        survivors,
+                    )
+                },
+            )
+        },
+        |_, _| {},
+    )
+    .unwrap();
+    said.into_inner()
+}
+
+/// stdout carries the step lines and the last line, and every step line says that it is going on.
+#[test]
+fn every_stdout_line_but_the_last_ends_in_three_dots() {
+    let said = what_a_troubled_install_says();
+    let stdout: Vec<&str> = said
+        .iter()
+        .filter(|(stream, _)| *stream == Stream::Out)
+        .map(|(_, text)| text.as_str())
+        .collect();
+    assert_eq!(stdout.last(), Some(&INSTALLED));
+    assert!(stdout.len() >= 6, "{stdout:#?}");
+    for line in &stdout[..stdout.len() - 1] {
+        assert!(line.ends_with("..."), "{line}");
+    }
+    assert_eq!(
+        stdout.iter().filter(|line| **line == INSTALLED).count(),
+        1,
+        "nothing else is said as the last line"
+    );
+}
+
+/// No line this module says begins with `install`.
+#[test]
+fn no_line_begins_with_the_verb() {
+    let said = what_a_troubled_install_says();
+    assert!(said.iter().any(|(stream, _)| *stream == Stream::Err), "{said:#?}");
+    for (_, line) in &said {
+        let first = line.split(|c: char| !c.is_alphanumeric()).next().unwrap_or_default();
+        assert!(!first.eq_ignore_ascii_case("install"), "{line}");
+    }
 }

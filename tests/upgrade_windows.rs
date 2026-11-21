@@ -425,7 +425,6 @@ fn install_carries_all_four_values_and_a_second_install_does_not_rewrite_them() 
         String::from_utf8_lossy(&first.stderr)
     );
     assert!(first.status.success(), "the install failed:\n{text}");
-    assert!(text.contains("wrote"), "{text}");
     let written = std::fs::read(&config).unwrap_or_else(|e| panic!("no config after install: {e}\n{text}"));
     assert_eq!(
         parse(&written).unwrap(),
@@ -444,10 +443,8 @@ fn install_carries_all_four_values_and_a_second_install_does_not_rewrite_them() 
         "{shell:?} {option:?}"
     );
     assert!(provision::registry::escape_arguments_under(provision::registry::OPENSSH_KEY).unwrap());
-    // The arguments are in the config now, so sshd may not pass them to ssh-broker as well, and the
-    // removal says what it removed.
     assert!(
-        text.contains("removed DefaultShellArguments") && text.contains("-NoLogo -File"),
+        text.contains("removing DefaultShellArguments") && text.contains("-NoLogo -File"),
         "the removal did not print the value:
 {text}"
     );

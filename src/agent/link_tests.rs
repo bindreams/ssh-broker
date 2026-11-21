@@ -5,6 +5,7 @@ use super::*;
 use crate::protocol::{
     ConsentAnswer, ConsentReply, ConsentRequest, ConsentWithdrawal, ExitCode, FrameKind, Resize, Stream,
 };
+use crate::test_support::ClosedStream;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 
@@ -799,23 +800,9 @@ fn ask_on_a_link_whose_hosting_has_ended_or_that_has_ended_is_ended_at_once_and_
 /// session's.
 #[test]
 fn a_connection_that_cannot_be_written_ends_the_question_and_gives_the_screen_back() {
-    struct Broken;
-    impl std::io::Write for Broken {
-        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
-            Err(std::io::ErrorKind::BrokenPipe.into())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-    impl HalfClose for Broken {
-        fn shutdown_write(&self) -> anyhow::Result<()> {
-            Ok(())
-        }
-    }
     let session = Arc::new(Recorder::default());
     let link = Link::new(
-        Broken,
+        ClosedStream,
         true,
         (80, 24),
         Some(Arc::clone(&session) as Arc<dyn InputTarget>),

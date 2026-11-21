@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 
+use super::handover::{Say, Stream};
 use super::report::Check;
 use crate::acl;
 
@@ -107,13 +108,15 @@ pub fn install_dir_row(base: &BaseCheck<'_>) -> Check {
 /// with the installed build leaves live agents alone. The caller starts agents again once the task
 /// is registered.
 ///
-/// `base` is the proof from [`ensure_base`].
+/// `base` is the proof from [`ensure_base`]. The stop is said on `say` before it starts, and only when it happens.
 pub fn prepare_in(
     base: &TrustedBase<'_>,
     current_exe: &Path,
+    say: &mut Say<'_>,
     stop_agents: impl FnOnce() -> anyhow::Result<()>,
 ) -> anyhow::Result<PathBuf> {
     if would_replace_installed_exe(base.layout, current_exe) {
+        say(Stream::Out, "Stopping the running agents; their SSH sessions end...");
         // Before the exe is copied: a running agent holds it open, and the copy would fail with a
         // sharing violation and leave the old exe under the new task.
         stop_agents().context("stop the running agents")?;

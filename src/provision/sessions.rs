@@ -33,16 +33,8 @@ pub enum SessionState {
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Targets {
     pub ids: Vec<u32>,
-    /// Sessions whose user could not be looked up, with why. No agent is started there, but they
-    /// count in [`Targets::total`] so the summary does not undercount.
+    /// Sessions whose user could not be looked up, with why. No agent is started there.
     pub unknown: Vec<(u32, String)>,
-}
-
-impl Targets {
-    /// Every session `install` tried to cover.
-    pub fn total(&self) -> usize {
-        self.ids.len() + self.unknown.len()
-    }
 }
 
 /// The sessions to start an agent in: logged-on users who are connected or disconnected. Never

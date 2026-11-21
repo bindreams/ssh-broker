@@ -7,26 +7,59 @@
 //! [`registry::remove_shell_arguments_under`](super::registry::remove_shell_arguments_under) is the same
 //! for the one value that is deleted afterwards: it takes a [`ShownValue`], which only the print of the
 //! value makes.
+//!
+//! What keeps that guarantee is the notice: it is written to standard error strictly ([`show_to`], as `eprintln!`
+//! does), so a write that fails ends `install` there, before the shell is replaced or the value removed.
 
+use std::io::Write;
 use std::path::Path;
 
 use super::registry::{SshdShell, UnreadShell};
 use super::system_config::{self, ArgumentsPlan, ConfigKind, CreateOutcome, Decision, Skip};
 use crate::shell::config::ShellBlock;
 
-/// Where a notice goes.
+/// Where a line goes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stream {
     Out,
     Err,
 }
 
-/// Writes a notice to the console: standard output or standard error.
+/// The sink for `install`'s lines: takes the stream and the line. A failed write loses the line ([`say_to`]). The two
+/// value notices ([`Handover::printed`], [`ShownValue::print`]) do not use it.
+pub type Say<'a> = dyn FnMut(Stream, &str) + 'a;
+
+/// Writes a line to `out` or to `err`, by `stream`. `install` run over an SSH connection that has gone has a closed
+/// stdout, and `println!` would panic on it.
+pub fn say_to(out: &mut impl Write, err: &mut impl Write, stream: Stream, text: &str) {
+    let _ = match stream {
+        Stream::Out => writeln!(out, "{text}"),
+        Stream::Err => writeln!(err, "{text}"),
+    };
+}
+
+/// The [`Say`] `install` uses.
 pub fn say_to_console(stream: Stream, text: &str) {
-    match stream {
-        Stream::Out => println!("{text}"),
-        Stream::Err => eprintln!("{text}"),
+    say_to(&mut std::io::stdout(), &mut std::io::stderr(), stream, text);
+}
+
+/// The proof that a notice was written. Only [`show_to`] and the tests of this module build one, so a `show` that
+/// returns it is the strict writer.
+#[derive(Debug)]
+pub struct Written(());
+
+/// Writes a notice that is the only record of a value to `err`, and does not return if the write fails, as
+/// `eprintln!` does not.
+pub fn show_to(err: &mut impl Write, text: &str) -> Written {
+    if let Err(e) = writeln!(err, "{text}") {
+        panic!("failed printing to stderr: {e}");
     }
+    Written(())
+}
+
+/// Writes a notice to standard error: the `show` that `install` passes to [`hand_over`] and [`remove_arguments`].
+pub fn show_to_console(text: &str) -> Written {
+    show_to(&mut std::io::stderr(), text)
 }
 
 /// The previous shell's values were carried into the config, or printed, or there were none to keep.
@@ -41,15 +74,14 @@ impl Handover {
         system_config::nothing_to_carry(previous).then_some(Self(()))
     }
 
-    /// The config now holds the previous shell; `text` says so.
-    fn carried(say: &mut dyn FnMut(Stream, &str), text: &str) -> Self {
-        say(Stream::Out, text);
+    /// The config now holds the previous shell. Nothing is said: the config is the record.
+    fn carried() -> Self {
         Self(())
     }
 
     /// `text` holds every previous value and was emitted before the shell is replaced.
-    fn printed(say: &mut dyn FnMut(Stream, &str), text: &str) -> Self {
-        say(Stream::Err, text);
+    fn printed(show: &mut dyn FnMut(&str) -> Written, text: &str) -> Self {
+        let _written = show(text);
         Self(())
     }
 }
@@ -61,8 +93,8 @@ pub struct ShownValue(());
 
 impl ShownValue {
     /// `text` holds the value and is emitted before the value is deleted.
-    fn print(say: &mut dyn FnMut(Stream, &str), text: &str) -> Self {
-        say(Stream::Err, text);
+    fn print(show: &mut dyn FnMut(&str) -> Written, text: &str) -> Self {
+        let _written = show(text);
         Self(())
     }
 }
@@ -86,64 +118,56 @@ pub fn replace_shell<T>(
 /// file, and is called only for a [`Decision::Write`]), or print what is not carried.
 /// `config` is the config's path. A previous shell with nothing to carry ([`system_config::nothing_to_carry`]) is known
 /// from `previous` alone, whatever `decision` says; a decision that claims it for any other shell is
-/// printed, not believed.
+/// printed, not believed. What is printed goes through `show`.
 pub fn hand_over(
     config: &Path,
     previous: &SshdShell,
     decision: Decision,
     create: impl FnOnce(&ShellBlock) -> anyhow::Result<CreateOutcome>,
-    say: &mut dyn FnMut(Stream, &str),
+    show: &mut dyn FnMut(&str) -> Written,
 ) -> Handover {
     if let Some(handover) = Handover::nothing_to_carry(previous) {
         return handover;
     }
     let skip = match decision {
         Decision::Write(block) => match create(&block) {
-            Ok(CreateOutcome::Created) => {
-                return Handover::carried(
-                    say,
-                    &format!(
-                        "install: wrote {} from the shell sshd used before ({})",
-                        config.display(),
-                        previous.shell.as_deref().unwrap_or_default()
-                    ),
-                );
-            }
+            Ok(CreateOutcome::Created) => return Handover::carried(),
             // Someone else created the config between the check and the create: it is never rewritten.
             Ok(CreateOutcome::FileExists) => Skip::FileExists,
             Ok(CreateOutcome::NotAFile) => Skip::NotAFile,
             Err(e) => {
-                return Handover::printed(say, &system_config::not_written(config, previous, &format!("{e:#}")));
+                return Handover::printed(show, &system_config::not_written(config, previous, &format!("{e:#}")));
             }
         },
         Decision::Skip(skip) => skip,
     };
-    Handover::printed(say, &system_config::skip_notice(config, previous, &skip))
+    Handover::printed(show, &system_config::skip_notice(config, previous, &skip))
 }
 
 /// Remove `DefaultShellArguments` once `DefaultShell` is ssh-broker (see [`system_config::plan_arguments`]
 /// for what is read and left). `config` is the config's path and `key` the registry key. The text with the
-/// value is emitted first and `remove`, which takes the [`ShownValue`] that makes, runs after it; then the
-/// removal, or its failure with the cause, is said. A failed removal leaves the value for the next `install`.
+/// value is emitted first and `remove`, which takes the [`ShownValue`] that makes, runs after it; a failed
+/// removal is said with its cause and leaves the value for the next `install`, and one that worked says nothing.
+/// The text with the value goes through `show`. The other lines go through `say`.
 pub fn remove_arguments(
     config: &Path,
     key: &str,
     read: Result<Option<String>, String>,
     config_is_file: impl FnOnce() -> Result<ConfigKind, String>,
     remove: impl FnOnce(&ShownValue) -> anyhow::Result<()>,
-    say: &mut dyn FnMut(Stream, &str),
+    say: &mut Say<'_>,
+    show: &mut dyn FnMut(&str) -> Written,
 ) {
     match system_config::plan_arguments(config, key, read, config_is_file) {
         ArgumentsPlan::Nothing => {}
         ArgumentsPlan::Leave(notice) => say(Stream::Err, &notice),
         ArgumentsPlan::Remove(value) => {
-            let shown = ShownValue::print(say, &system_config::arguments_removing(key, &value));
-            match remove(&shown) {
-                Ok(()) => say(Stream::Out, &system_config::arguments_removed(key, &value)),
-                Err(e) => say(
+            let shown = ShownValue::print(show, &system_config::arguments_removing(key, &value));
+            if let Err(e) = remove(&shown) {
+                say(
                     Stream::Err,
                     &system_config::arguments_not_removed(key, &value, &format!("{e:#}")),
-                ),
+                );
             }
         }
     }
