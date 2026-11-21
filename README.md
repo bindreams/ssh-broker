@@ -318,11 +318,11 @@ The contract: an upgrade is expected to succeed, and nothing is guaranteed to be
 
 **From 0.1.0, the build before elevated sessions**, some steps are yours; nothing more is done for you:
 
+- `apply` is now `install`, and `verify` is now `doctor`. A word the build does not know, an old `apply` or `verify` included, starts the shim. The system config file 0.1.0 wrote has a comment that names `ssh-broker apply` and `ssh-broker verify`, and `install` never rewrites that file: read them as `install` and `doctor`.
 - Run `install` again. A logon task that still says `LeastPrivilege` starts an administrator's agent below High, which refuses to run and exits 68; `install` registers the task as `HighestAvailable`, and `doctor` fails its `agent task` row until it does.
 - An agent of the old version that is still running refuses the new shim, by name, until it is restarted. `install` restarts the agents the logon task and `auto-login` started; one you started by hand with `ssh-broker agent` is for you to stop and start again, and a session the password prompt started ends and asks for the password at the next login.
 - Delete the `agent.sock` that 0.1.0 left in an administrator's `%LOCALAPPDATA%\ssh-broker` folder, and keep the folder: the elevated agent keeps `request.sock` in it (see [Elevated sessions](#elevated-sessions)). Where there is no `request.sock`, `elevate` takes a leftover `agent.sock` for an agent that runs below High, and says so.
-- `verify` is now `doctor`. A word the build does not know, an old `verify` included, starts the shim. The system config file 0.1.0 wrote has a comment that names `ssh-broker verify`, and `install` never rewrites that file: read it as `doctor`. Run `doctor` with the installed exe, after `install`: `C:\ProgramData\ssh-broker\ssh-broker.exe doctor`.
-- `apply` is now `install`. A word the build does not know, an old `apply` included, starts the shim.
+- Run `doctor` with the installed exe, after `install`: `C:\ProgramData\ssh-broker\ssh-broker.exe doctor`.
 - The `apply.lock` that 0.1.0 left in the install directory is no longer used; you may delete it.
 - `install` now also makes sshd accept `SSH_BROKER_ELEVATION` and puts the install directory on the system `PATH`.
 

@@ -55,12 +55,16 @@ fn the_escape_row_passes_only_when_sshd_would_escape() {
     let off = escape_arguments_check(Ok::<_, String>(false));
     assert!(!off.pass);
     assert!(off.name.contains("DefaultShellEscapeArguments"), "{}", off.name);
-    assert!(off.detail.contains("install"), "{}", off.detail);
+    assert!(off.detail.contains("run `ssh-broker install`"), "{}", off.detail);
 
     let unreadable = escape_arguments_check(Err("Access is denied."));
     assert!(!unreadable.pass);
     assert!(unreadable.detail.contains("Access is denied."), "{}", unreadable.detail);
-    assert!(unreadable.detail.contains("install"), "{}", unreadable.detail);
+    assert!(
+        unreadable.detail.contains("run `ssh-broker install`"),
+        "{}",
+        unreadable.detail
+    );
 }
 
 /// Writing the values leaves `DefaultShellEscapeArguments` as the REG_DWORD 1 sshd reads as on,

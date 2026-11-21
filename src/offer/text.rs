@@ -39,7 +39,7 @@ pub fn not_local(user: &str) -> String {
 }
 
 /// The one stderr line a session without a terminal gets. `exe` is the installed exe's full path:
-/// `install` does not put its directory on `PATH`.
+/// a session of an agent that was running keeps the `PATH` it started with, which lacks the install directory.
 pub fn non_interactive_notice(user: &str, exe: &str) -> String {
     format!(
         "ssh-broker: {user} has no Windows session on this PC, so this runs without DPAPI, a loaded profile or \

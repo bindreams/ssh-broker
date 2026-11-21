@@ -241,14 +241,18 @@ fn agent_task_row_fails_for_the_run_level_of_an_earlier_install_and_says_to_run_
     let row = agent_task_row(&Ok(Some(least_privilege_agent_task_xml())));
     assert!(!row.pass, "{}", row.detail);
     assert!(row.detail.contains("HighestAvailable"), "{}", row.detail);
-    assert!(row.detail.contains("install"), "{}", row.detail);
+    assert!(row.detail.contains("run `install` elevated"), "{}", row.detail);
 }
 
 #[test]
 fn agent_task_row_fails_for_a_per_user_task() {
     let row = agent_task_row(&Ok(Some(per_user_task_xml("DOMAIN\\someone"))));
     assert!(!row.pass);
-    assert!(row.detail.contains("install"), "it says what to do: {}", row.detail);
+    assert!(
+        row.detail.contains("run `install` elevated"),
+        "it says what to do: {}",
+        row.detail
+    );
 }
 
 #[test]
@@ -295,7 +299,7 @@ fn agent_task_row_fails_for_a_disabled_task_and_says_to_run_install() {
     let row = agent_task_row(&Ok(Some(xml)));
     assert!(!row.pass, "{}", row.detail);
     assert!(row.detail.contains("disabled"), "{}", row.detail);
-    assert!(row.detail.contains("install"), "{}", row.detail);
+    assert!(row.detail.contains("Run `install` elevated"), "{}", row.detail);
 }
 
 #[test]

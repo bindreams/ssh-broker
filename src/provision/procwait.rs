@@ -30,6 +30,7 @@ use windows::Win32::System::Threading::{
 use windows::core::{HRESULT, PWSTR};
 
 use crate::acl::Sid;
+use crate::route::INSTALL_SSHD_VERB;
 use crate::socket_loc::Integrity;
 use crate::winutil::{FileId, OwnedHandle};
 
@@ -271,7 +272,7 @@ pub fn role_of(command_line: &str) -> Role {
     match args.get(1).map(String::as_str) {
         Some("agent") if args[2..].iter().any(|arg| arg == "--background") => Role::BackgroundAgent,
         Some("agent") => Role::DesktopAgent,
-        Some("install-sshd") => Role::InstallSshd,
+        Some(INSTALL_SSHD_VERB) => Role::InstallSshd,
         _ => Role::Shim,
     }
 }

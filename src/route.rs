@@ -8,6 +8,11 @@
 
 use crate::cmdline::{self, RawExec};
 
+/// The hidden verb of the task `install` hands the sshd step to. The route, the task's `<Arguments>`
+/// (`provision::schtasks`) and the role that recognises the task's process (`provision::procwait`) all
+/// read this one name.
+pub const INSTALL_SSHD_VERB: &str = "install-sshd";
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum Route {
     /// The SSH DefaultShell. `exec` is `Some(command)` for `-c "cmd"`, `None` for
@@ -114,8 +119,8 @@ pub fn route(args: &[String], command_line: &str) -> Route {
         Some("elevate") => elevate_args(&args[1..], command_line),
         Some("auto-login") => Route::AutoLogin(auto_login_args(&args[1..])),
         Some("install") => Route::Install,
-        Some("install-sshd") if args.len() == 1 => Route::InstallSshd,
-        Some("install-sshd") => Route::Usage(Verb::InstallSshd),
+        Some(INSTALL_SSHD_VERB) if args.len() == 1 => Route::InstallSshd,
+        Some(INSTALL_SSHD_VERB) => Route::Usage(Verb::InstallSshd),
         Some("doctor") => Route::Doctor,
         Some("doctor-probe") => probe_link(&args[1..]).map_or(Route::Usage(Verb::DoctorProbe), Route::DoctorProbe),
         Some("console-fallback") => console_fallback_args(&args[1..])

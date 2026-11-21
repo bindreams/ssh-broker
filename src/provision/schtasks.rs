@@ -15,6 +15,7 @@
 //! no policy).
 
 use super::report::Check;
+use crate::route::INSTALL_SSHD_VERB;
 
 pub const AGENT_TASK: &str = "ssh-broker-agent";
 
@@ -110,7 +111,7 @@ pub fn install_sshd_task_xml(exe: &str) -> String {
 {settings}
   <Actions Context="System"><Exec>
     <Command>{exe}</Command>
-    <Arguments>install-sshd</Arguments>
+    <Arguments>{INSTALL_SSHD_VERB}</Arguments>
   </Exec></Actions>
 </Task>
 "#
