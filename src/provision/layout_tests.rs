@@ -27,12 +27,12 @@ impl TempBase {
 fn the_sshd_step_s_report_is_in_the_install_directory() {
     let layout = Layout::production();
     assert_eq!(
-        layout.apply_sshd_report_path(),
-        Path::new(super::super::BASE_DIR).join("apply-sshd.log")
+        layout.install_sshd_report_path(),
+        Path::new(super::super::BASE_DIR).join("install-sshd.log")
     );
 }
 
-/// [`ensure_base`], then [`prepare_in`]: what `apply` does.
+/// [`ensure_base`], then [`prepare_in`]: what `install` does.
 fn prepare(
     layout: &Layout,
     current_exe: &Path,
@@ -120,7 +120,7 @@ fn trusted_base_gate_does_not_run_the_action_on_an_untrusted_base() {
     assert!(ran.get());
 }
 
-// The apply sequence ----------------------------------------------------------------------
+// The install sequence ----------------------------------------------------------------------
 
 /// A stand-in for the running exe: any file, since `prepare` only copies it.
 fn new_exe(base: &TempBase, bytes: &str) -> PathBuf {
@@ -175,7 +175,7 @@ fn prepare_in_stops_the_agents_before_it_replaces_a_changed_exe() {
 
 #[test]
 fn prepare_in_does_not_stop_agents_when_the_exe_is_unchanged() {
-    // Re-running `apply` with the build that is installed.
+    // Re-running `install` with the build that is installed.
     let base = TempBase::existing("prepare-same");
     std::fs::write(base.0.join("ssh-broker.exe"), "same build").unwrap();
     let source = new_exe(&base, "same build");
@@ -206,7 +206,7 @@ fn prepare_in_changes_nothing_when_agents_cannot_be_stopped_for_an_update() {
 #[test]
 fn prepare_in_fails_when_the_exe_is_still_in_use_after_the_stop() {
     // An agent started by hand (`ssh-broker agent`) is not a task instance, so the stop misses it
-    // and it keeps the exe open. `apply` must not report `ok` with the old exe under the new tasks.
+    // and it keeps the exe open. `install` must not report `ok` with the old exe under the new tasks.
     use std::os::windows::fs::OpenOptionsExt;
     let base = TempBase::existing("prepare-held");
     std::fs::write(base.0.join("ssh-broker.exe"), "old build").unwrap();
@@ -238,7 +238,7 @@ fn an_exe_in_use_is_blamed_on_both_possible_holders_and_the_message_says_how_to_
     assert!(msg.contains("started by hand"), "{msg}");
     assert!(msg.contains("SSH session"), "{msg}");
     assert!(msg.contains("tasklist"), "how to find the holders: {msg}");
-    assert!(msg.contains("run apply again"), "{msg}");
+    assert!(msg.contains("run install again"), "{msg}");
 }
 
 #[test]
@@ -345,9 +345,18 @@ fn aces_reads_an_sddl_dacl() {
     );
 }
 
-/// `canonical_exe` is the path the cfg-free pins (`sshd_reads_the_flag_for_the_path_apply_registers`)
-/// assert on, so it must be the one `apply` installs to and registers.
+/// `canonical_exe` is the path the cfg-free pins (`sshd_reads_the_flag_for_the_path_install_registers`)
+/// assert on, so it must be the one `install` installs to and registers.
 #[test]
 fn the_production_layout_installs_the_exe_that_the_cfg_free_pins_assert_on() {
     assert_eq!(Layout::production().canonical_exe(), crate::provision::canonical_exe());
+}
+
+/// The lock file is the one 0.1.0 takes, so that a 0.1.0 `apply` or `auto-login` and this build's `install` exclude
+/// each other on a machine that is being upgraded.
+#[test]
+fn the_lock_file_keeps_the_name_the_released_build_takes() {
+    let path = Layout::production().install_lock_path();
+    assert_eq!(path.file_name().and_then(|name| name.to_str()), Some("apply.lock"));
+    assert_eq!(path.parent(), Layout::production().canonical_exe().parent());
 }

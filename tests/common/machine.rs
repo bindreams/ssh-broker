@@ -1,7 +1,7 @@
 //! Machine-wide exclusion between the Elevated tests, across processes.
 //!
 //! A test that logs an account on, registers a task or starts an agent holds [`shared`]; a test that
-//! stops or disables `seclogon`, replaces the machine install, runs `apply`, or otherwise changes what
+//! stops or disables `seclogon`, replaces the machine install, runs `install`, or otherwise changes what
 //! the other tests depend on holds [`exclusive`]. CI runs nextest, one process per test, so the
 //! exclusion is a lock on a file in the temp directory, which the kernel gives to a reader or to one
 //! writer across processes (and across handles in one process, so `cargo test` is covered too) and

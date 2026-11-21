@@ -121,7 +121,7 @@ impl Sid {
     }
 
     /// SID of the user owning the current process token. Used by tests and by the
-    /// interactive `apply` path; production provisioning resolves the grantee by name.
+    /// interactive `install` path; production provisioning resolves the grantee by name.
     pub fn current_user() -> anyhow::Result<Sid> {
         Sid::of_token(crate::winutil::own_token()?.0)
     }
@@ -1010,7 +1010,7 @@ pub fn ensure_install_dir(dir: &Path) -> anyhow::Result<()> {
     if let Some(problem) = install_dir_problem(dir)? {
         anyhow::bail!(
             "the install directory {} exists but cannot be trusted: {problem}. \
-             Inspect it, remove it, and run `apply` again",
+             Inspect it, remove it, and run `install` again",
             dir.display()
         );
     }

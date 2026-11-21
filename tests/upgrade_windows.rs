@@ -1,4 +1,4 @@
-//! `apply` over a machine with background sessions: it ends them, restarts the auto-login ones, and
+//! `install` over a machine with background sessions: it ends them, restarts the auto-login ones, and
 //! leaves SSH sessions alone. Windows only; **Elevated (CI only)**.
 //!
 //! This installs into the machine's real install directory, registers the real tasks and writes
@@ -70,9 +70,9 @@ fn agent_pids(sid: &str) -> Vec<u32> {
         .collect()
 }
 
-/// Run `exe apply` and return its output.
-fn apply(exe: &Path) -> std::process::Output {
-    desktop::output(Command::new(exe).arg("apply")).expect("run apply")
+/// Run `exe install` and return its output.
+fn run_install(exe: &Path) -> std::process::Output {
+    desktop::output(Command::new(exe).arg("install")).expect("run install")
 }
 
 /// Removes an account's auto-login task when it goes, whether the test passed or not: a task left behind
@@ -91,8 +91,8 @@ impl Drop for AutoLoginOff {
 struct Scene {
     _auto_login_off: AutoLoginOff,
     broker: &'static Path,
-    /// The build that is installed, as a file outside the install directory: `apply` of it is an
-    /// `apply` of the installed build.
+    /// The build that is installed, as a file outside the install directory: `install` of it is an
+    /// `install` of the installed build.
     old: PathBuf,
     installed: PathBuf,
     kit: Kit,
@@ -120,7 +120,7 @@ fn scene() -> Scene {
     bytes.extend_from_slice(b"an older build");
     std::fs::write(&old, bytes).unwrap();
     let installed = provision::canonical_exe();
-    let first = apply(&old);
+    let first = run_install(&old);
     assert!(
         first.status.success(),
         "installing the old build failed:\n{}{}",
@@ -171,20 +171,20 @@ fn scene() -> Scene {
 }
 
 impl Scene {
-    /// The prompt-path session was ended by `apply`.
+    /// The prompt-path session was ended by `install`.
     fn assert_prompt_session_ended(&self) {
         bounded_wait::wait_for_exit(
             self.session.process.0,
             // SAFETY: a valid process handle.
             unsafe { windows::Win32::System::Threading::GetProcessId(self.session.process.0) },
-            "the prompt-path background agent after apply",
+            "the prompt-path background agent after install",
             bounded_wait::CHILD_EXIT_BOUND,
             &[],
         );
     }
 
     /// The auto-login session was ended and started again: a different process serves the account.
-    fn assert_auto_login_restarted(&self, apply_output: &str) {
+    fn assert_auto_login_restarted(&self, install_output: &str) {
         let started = Instant::now();
         loop {
             let now = agent_pids(&self.auto.sid_text);
@@ -193,7 +193,7 @@ impl Scene {
             }
             assert!(
                 started.elapsed() < TASK_START_BOUND,
-                "the auto-login agent was not started again after apply (before {:?}, now {now:?})\n{apply_output}",
+                "the auto-login agent was not started again after install (before {:?}, now {now:?})\n{install_output}",
                 self.before
             );
             std::thread::yield_now();
@@ -206,7 +206,7 @@ impl Scene {
 /// so the copy reports it), and the auto-login session is running again afterwards. The install
 /// fails here, by design; the upgrade that succeeds is the next test.
 #[test]
-fn apply_upgrade_that_fails_on_a_held_exe_still_restarts_auto_login() {
+fn install_upgrade_that_fails_on_a_held_exe_still_restarts_auto_login() {
     let _machine = machine::exclusive();
     let scene = scene();
     let installed = &scene.installed;
@@ -214,7 +214,7 @@ fn apply_upgrade_that_fails_on_a_held_exe_still_restarts_auto_login() {
     // An open SSH session: the shim holds the installed exe. It is the shim of an account that has no
     // agent (as sshd would run it, under that account's network token): it fails open and runs its
     // command itself, for as long as the command lasts. A shim relayed through an agent would end
-    // when `apply` ends that agent (exit 254, measured in CI), and so would not hold the exe.
+    // when `install` ends that agent (exit 254, measured in CI), and so would not hold the exe.
     let no_agent = Account::create("up3", true);
     // Its standard handles are the null device: a shim with none cannot write the command's first line
     // of output and ends with it.
@@ -255,11 +255,11 @@ fn apply_upgrade_that_fails_on_a_held_exe_still_restarts_auto_login() {
     // its creation. If it has ended, the copy below has nothing to fail on.
     assert!(
         !shim_has_ended(),
-        "the shim ended by itself before apply ran, so it cannot hold the exe"
+        "the shim ended by itself before install ran, so it cannot hold the exe"
     );
 
     // The new build: the copy of this exe. It cannot replace the installed one while the shim runs.
-    let output = apply(scene.broker);
+    let output = run_install(scene.broker);
     let text = format!(
         "{}{}",
         String::from_utf8_lossy(&output.stdout),
@@ -278,7 +278,7 @@ fn apply_upgrade_that_fails_on_a_held_exe_still_restarts_auto_login() {
 
     scene.assert_prompt_session_ended();
     // The shim was left alone.
-    assert!(!shim_has_ended(), "apply must not end an SSH session's shim");
+    assert!(!shim_has_ended(), "install must not end an SSH session's shim");
     scene.assert_auto_login_restarted(&text);
 
     // SAFETY: a valid process handle; ending a shim that already ended is harmless.
@@ -286,15 +286,15 @@ fn apply_upgrade_that_fails_on_a_held_exe_still_restarts_auto_login() {
 }
 
 /// Elevated (CI only). The upgrade that succeeds: nothing holds the installed exe (no SSH session is
-/// open), so `apply` ends the prompt-path session and the auto-login one, replaces the exe with the new
+/// open), so `install` ends the prompt-path session and the auto-login one, replaces the exe with the new
 /// build, and enables and starts the auto-login task again.
 #[test]
-fn apply_upgrade_that_succeeds_ends_a_background_session_and_restarts_auto_login() {
+fn install_upgrade_that_succeeds_ends_a_background_session_and_restarts_auto_login() {
     let _machine = machine::exclusive();
     let scene = scene();
     let old_bytes = std::fs::read(&scene.installed).unwrap();
 
-    let output = apply(scene.broker);
+    let output = run_install(scene.broker);
     let text = format!(
         "{}{}",
         String::from_utf8_lossy(&output.stdout),
@@ -308,7 +308,7 @@ fn apply_upgrade_that_succeeds_ends_a_background_session_and_restarts_auto_login
     assert_eq!(
         new_bytes,
         std::fs::read(scene.broker).unwrap(),
-        "the installed exe is not the build that ran apply"
+        "the installed exe is not the build that ran install"
     );
 
     scene.assert_prompt_session_ended();
@@ -318,15 +318,15 @@ fn apply_upgrade_that_succeeds_ends_a_background_session_and_restarts_auto_login
     let tasks = taskscheduler::session_tasks().unwrap();
     assert!(
         !tasks.is_empty() && tasks.iter().all(|task| task.enabled),
-        "an auto-login task is not enabled after apply: {tasks:?}"
+        "an auto-login task is not enabled after install: {tasks:?}"
     );
 }
 
-/// Elevated (CI only). An `apply` of the build that is already installed repairs an auto-login task
+/// Elevated (CI only). An `install` of the build that is already installed repairs an auto-login task
 /// that an interrupted upgrade left disabled with no session: it enables the task and starts its
 /// session.
 #[test]
-fn apply_of_the_installed_build_enables_a_disabled_auto_login_task_and_starts_its_session() {
+fn install_of_the_installed_build_enables_a_disabled_auto_login_task_and_starts_its_session() {
     let _machine = machine::exclusive();
     let scene = scene();
     let tasks = taskscheduler::session_tasks().unwrap();
@@ -344,41 +344,41 @@ fn apply_of_the_installed_build_enables_a_disabled_auto_login_task_and_starts_it
         "control: the auto-login session is not running"
     );
 
-    let output = apply(&scene.old);
+    let output = run_install(&scene.old);
     let text = format!(
         "{}{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(output.status.success(), "the apply failed:\n{text}");
+    assert!(output.status.success(), "the install failed:\n{text}");
 
     let tasks = taskscheduler::session_tasks().unwrap();
     assert!(
         !tasks.is_empty() && tasks.iter().all(|task| task.enabled),
-        "an auto-login task is not enabled after apply: {tasks:?}"
+        "an auto-login task is not enabled after install: {tasks:?}"
     );
     scene.assert_auto_login_restarted(&text);
 }
 
-/// Elevated (CI only). An `apply` of the build that is already installed leaves a running auto-login
+/// Elevated (CI only). An `install` of the build that is already installed leaves a running auto-login
 /// session running: the same process serves the account afterwards.
 #[test]
-fn apply_of_the_installed_build_leaves_a_running_auto_login_session_running() {
+fn install_of_the_installed_build_leaves_a_running_auto_login_session_running() {
     let _machine = machine::exclusive();
     let scene = scene();
 
-    let output = apply(&scene.old);
+    let output = run_install(&scene.old);
     let text = format!(
         "{}{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(output.status.success(), "the apply failed:\n{text}");
+    assert!(output.status.success(), "the install failed:\n{text}");
 
     assert_eq!(
         agent_pids(&scene.auto.sid_text),
         scene.before,
-        "the auto-login session was stopped or restarted by an apply that replaced nothing\n{text}"
+        "the auto-login session was stopped or restarted by an install that replaced nothing\n{text}"
     );
 }
 
@@ -392,11 +392,11 @@ fn set_sshd_value(name: &str, kind: &str, data: &str) {
     );
 }
 
-/// Elevated (CI only). `apply` over a machine whose sshd runs another shell with options writes the
-/// system config from all four values, before it overwrites them, and a second `apply` (even over
+/// Elevated (CI only). `install` over a machine whose sshd runs another shell with options writes the
+/// system config from all four values, before it overwrites them, and a second `install` (even over
 /// yet another shell) leaves the file as it is.
 #[test]
-fn apply_carries_all_four_values_and_a_second_apply_does_not_rewrite_them() {
+fn install_carries_all_four_values_and_a_second_install_does_not_rewrite_them() {
     use ssh_broker::shell::Escaping;
     use ssh_broker::shell::config::{ShellBlock, parse};
 
@@ -405,7 +405,7 @@ fn apply_carries_all_four_values_and_a_second_apply_does_not_rewrite_them() {
     let dir = std::env::temp_dir().join(format!("sb-carry-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    // Files that exist; `apply` never runs them.
+    // Files that exist; `install` never runs them.
     let (pwsh, other) = (dir.join("pwsh.exe"), dir.join("other.exe"));
     for file in [&pwsh, &other] {
         std::fs::write(file, b"MZ").unwrap();
@@ -418,15 +418,15 @@ fn apply_carries_all_four_values_and_a_second_apply_does_not_rewrite_them() {
     set_sshd_value("DefaultShellArguments", "REG_SZ", r#"-NoLogo -File "C:\a b\x.ps1""#);
     set_sshd_value("DefaultShellEscapeArguments", "REG_DWORD", "0");
 
-    let first = apply(broker);
+    let first = run_install(broker);
     let text = format!(
         "{}{}",
         String::from_utf8_lossy(&first.stdout),
         String::from_utf8_lossy(&first.stderr)
     );
-    assert!(first.status.success(), "the apply failed:\n{text}");
+    assert!(first.status.success(), "the install failed:\n{text}");
     assert!(text.contains("wrote"), "{text}");
-    let written = std::fs::read(&config).unwrap_or_else(|e| panic!("no config after apply: {e}\n{text}"));
+    let written = std::fs::read(&config).unwrap_or_else(|e| panic!("no config after install: {e}\n{text}"));
     assert_eq!(
         parse(&written).unwrap(),
         Some(ShellBlock {
@@ -459,9 +459,9 @@ fn apply_carries_all_four_values_and_a_second_apply_does_not_rewrite_them() {
         String::from_utf8_lossy(&remaining.stdout)
     );
 
-    // Another shell in the registry and a second apply: the file stays byte for byte.
+    // Another shell in the registry and a second install: the file stays byte for byte.
     set_sshd_value("DefaultShell", "REG_SZ", &other.to_string_lossy());
-    let second = apply(broker);
+    let second = run_install(broker);
     assert!(
         second.status.success(),
         "{}{}",
@@ -471,15 +471,15 @@ fn apply_carries_all_four_values_and_a_second_apply_does_not_rewrite_them() {
     assert_eq!(
         std::fs::read(&config).unwrap(),
         written,
-        "the second apply rewrote the config"
+        "the second install rewrote the config"
     );
 
     // A value left behind (a removal that failed, or an administrator putting it back) while sshd
-    // already runs ssh-broker: the next `apply` removes it again, whatever it carried before.
+    // already runs ssh-broker: the next `install` removes it again, whatever it carried before.
     let leftover = reg(&["query", OPENSSH_KEY, "/v", "DefaultShellArguments"]);
-    assert!(!leftover.status.success(), "the second apply left the arguments");
+    assert!(!leftover.status.success(), "the second install left the arguments");
     set_sshd_value("DefaultShellArguments", "REG_SZ", "-NoLogo");
-    let third = apply(broker);
+    let third = run_install(broker);
     assert!(
         third.status.success(),
         "{}{}",
@@ -489,24 +489,24 @@ fn apply_carries_all_four_values_and_a_second_apply_does_not_rewrite_them() {
     let remaining = reg(&["query", OPENSSH_KEY, "/v", "DefaultShellArguments"]);
     assert!(
         !remaining.status.success(),
-        "a later apply left DefaultShellArguments set:
+        "a later install left DefaultShellArguments set:
 {}",
         String::from_utf8_lossy(&remaining.stdout)
     );
     assert_eq!(
         std::fs::read(&config).unwrap(),
         written,
-        "the third apply rewrote the config"
+        "the third install rewrote the config"
     );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Elevated (CI only). With no `config.yaml` to hold them (nothing was carried: sshd ran no shell of
-/// its own), `apply` leaves `DefaultShellArguments` in the registry and says so with the value; once
-/// a later `apply` carries a shell into the config, that `apply` removes them.
+/// its own), `install` leaves `DefaultShellArguments` in the registry and says so with the value; once
+/// a later `install` carries a shell into the config, that `install` removes them.
 #[test]
-fn apply_keeps_default_shell_arguments_until_a_config_holds_them() {
+fn install_keeps_default_shell_arguments_until_a_config_holds_them() {
     let _machine = machine::exclusive();
     let _install = Install::capture();
     let dir = std::env::temp_dir().join(format!("sb-keep-{}", std::process::id()));
@@ -525,7 +525,7 @@ fn apply_keeps_default_shell_arguments_until_a_config_holds_them() {
     // Arguments and no shell: nothing to carry, so no config.
     let _ = reg(&["delete", OPENSSH_KEY, "/v", "DefaultShell", "/f"]);
     set_sshd_value("DefaultShellArguments", "REG_SZ", "-NoLogo");
-    let first = apply(broker);
+    let first = run_install(broker);
     let text = format!(
         "{}{}",
         String::from_utf8_lossy(&first.stdout),
@@ -533,7 +533,7 @@ fn apply_keeps_default_shell_arguments_until_a_config_holds_them() {
     );
     assert!(
         first.status.success(),
-        "the apply failed:
+        "the install failed:
 {text}"
     );
     assert!(
@@ -548,18 +548,18 @@ fn apply_keeps_default_shell_arguments_until_a_config_holds_them() {
     );
     assert!(
         text.contains("left DefaultShellArguments") && text.contains("-NoLogo"),
-        "apply did not say it left the arguments:
+        "install did not say it left the arguments:
 {text}"
     );
 
-    // Another apply with nothing to carry: still left, and said again.
-    let again = apply(broker);
+    // Another install with nothing to carry: still left, and said again.
+    let again = run_install(broker);
     assert!(again.status.success());
-    assert!(arguments(), "a second apply removed the arguments with no config");
+    assert!(arguments(), "a second install removed the arguments with no config");
 
-    // A shell to carry: the config is written, and the same apply removes the arguments.
+    // A shell to carry: the config is written, and the same install removes the arguments.
     set_sshd_value("DefaultShell", "REG_SZ", &pwsh.to_string_lossy());
-    let carrying = apply(broker);
+    let carrying = run_install(broker);
     let text = format!(
         "{}{}",
         String::from_utf8_lossy(&carrying.stdout),
@@ -567,7 +567,7 @@ fn apply_keeps_default_shell_arguments_until_a_config_holds_them() {
     );
     assert!(
         carrying.status.success(),
-        "the apply failed:
+        "the install failed:
 {text}"
     );
     assert!(
@@ -613,11 +613,11 @@ fn assert_doctor_passes_for_an_elevated_agent(finished: &agent_conn::Finished) {
 }
 
 /// Elevated (CI only). `doctor`, run in an administrator's session through the account's elevated agent,
-/// passes after `apply`: a login at the default level (`prompt`) gets an unelevated session, one that asks for `always`
+/// passes after `install`: a login at the default level (`prompt`) gets an unelevated session, one that asks for `always`
 /// gets an elevated one, and the junction that a token below High made is followed. The same `doctor` run in an
 /// unelevated session of the account is told the ways to check, and runs no probe.
 #[test]
-fn apply_then_doctor_for_an_administrator_shows_a_session_and_an_elevated_session_on_request() {
+fn install_then_doctor_for_an_administrator_shows_a_session_and_an_elevated_session_on_request() {
     use ssh_broker::offer::text::CHECK_BELOW_HIGH_CLAUSE;
     use ssh_broker::protocol::ElevationPolicy;
 
@@ -625,12 +625,12 @@ fn apply_then_doctor_for_an_administrator_shows_a_session_and_an_elevated_sessio
     let _install = Install::capture();
     let broker = Path::new(env!("CARGO_BIN_EXE_ssh-broker"));
     let installed = provision::canonical_exe();
-    let applied = apply(broker);
+    let output = run_install(broker);
     assert!(
-        applied.status.success(),
-        "apply failed:\n{}{}",
-        String::from_utf8_lossy(&applied.stdout),
-        String::from_utf8_lossy(&applied.stderr)
+        output.status.success(),
+        "install failed:\n{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
     );
     // An administrator whose task starts the agent: a batch logon, which gives the full token.
     let admin = Account::create("vf1", true);

@@ -1,9 +1,9 @@
-//! The proof that `apply` kept or showed the shell sshd used before it makes ssh-broker `DefaultShell`.
+//! The proof that `install` kept or showed the shell sshd used before it makes ssh-broker `DefaultShell`.
 //!
 //! [`registry::set_default_shell_under`](super::registry::set_default_shell_under) takes a
 //! [`Handover`], and the only ways to get one are here: the config was written from the previous
 //! values (carried), the text that holds every previous value was emitted (printed), or there is
-//! nothing to carry. No path through `apply` can replace the shell with the values neither kept nor shown.
+//! nothing to carry. No path through `install` can replace the shell with the values neither kept nor shown.
 //! [`registry::remove_shell_arguments_under`](super::registry::remove_shell_arguments_under) is the same
 //! for the one value that is deleted afterwards: it takes a [`ShownValue`], which only the print of the
 //! value makes.
@@ -103,7 +103,7 @@ pub fn hand_over(
                 return Handover::carried(
                     say,
                     &format!(
-                        "apply: wrote {} from the shell sshd used before ({})",
+                        "install: wrote {} from the shell sshd used before ({})",
                         config.display(),
                         previous.shell.as_deref().unwrap_or_default()
                     ),
@@ -124,7 +124,7 @@ pub fn hand_over(
 /// Remove `DefaultShellArguments` once `DefaultShell` is ssh-broker (see [`system_config::plan_arguments`]
 /// for what is read and left). `config` is the config's path and `key` the registry key. The text with the
 /// value is emitted first and `remove`, which takes the [`ShownValue`] that makes, runs after it; then the
-/// removal, or its failure with the cause, is said. A failed removal leaves the value for the next `apply`.
+/// removal, or its failure with the cause, is said. A failed removal leaves the value for the next `install`.
 pub fn remove_arguments(
     config: &Path,
     key: &str,

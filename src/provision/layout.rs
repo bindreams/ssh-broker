@@ -1,4 +1,4 @@
-//! layout: where `apply` puts things under the install directory, and the order it touches them.
+//! layout: where `install` puts things under the install directory, and the order it touches them.
 //!
 //! The install directory holds the exe the agent runs, so nothing may be read from it or written
 //! into it until [`acl::ensure_install_dir`] has made it or proved it is the one this build
@@ -28,16 +28,17 @@ impl Layout {
         self.base.join(super::EXE_NAME)
     }
 
-    /// The file whose lock lets one `apply` (or `auto-login on|off`) run at a time; see
-    /// [`super::apply_lock`].
-    pub fn apply_lock_path(&self) -> PathBuf {
+    /// The file whose lock lets one `install` (or `auto-login on|off`) run at a time; see
+    /// [`super::install_lock`]. It keeps the name 0.1.0 gave it, from the verb's old name, so that this build and
+    /// that one, which can both be on a machine during an upgrade, exclude each other.
+    pub fn install_lock_path(&self) -> PathBuf {
         self.base.join("apply.lock")
     }
 
-    /// What the task that sets sshd up says it did, one line each, for `apply` to print; see
+    /// What the task that sets sshd up says it did, one line each, for `install` to print; see
     /// [`super::sshd_task`].
-    pub fn apply_sshd_report_path(&self) -> PathBuf {
-        self.base.join("apply-sshd.log")
+    pub fn install_sshd_report_path(&self) -> PathBuf {
+        self.base.join("install-sshd.log")
     }
 
     /// The system layer of the shell configuration; see [`crate::shell`].
@@ -97,12 +98,12 @@ pub fn install_dir_row(base: &BaseCheck<'_>) -> Check {
     }
 }
 
-/// `apply`'s steps up to the registrations, in the only order that is safe: the base, then the
+/// `install`'s steps up to the registrations, in the only order that is safe: the base, then the
 /// exe. Returns the canonical exe path.
 ///
 /// `stop_agents` stops every running agent and returns only once each has exited (the exe is
 /// copied right after, and a process that is stopped but not yet gone still holds it). It is called
-/// only when an installed exe is about to be replaced by a different build, so re-running `apply`
+/// only when an installed exe is about to be replaced by a different build, so re-running `install`
 /// with the installed build leaves live agents alone. The caller starts agents again once the task
 /// is registered.
 ///
@@ -158,7 +159,7 @@ fn copy_failure(canonical: &Path, err: &std::io::Error) -> String {
             "could not replace {}: {err}. It is in use although the agents of the logon task have exited: \
              either by an agent started by hand with `ssh-broker agent`, or by the shim of an open SSH \
              session (the exe is sshd's DefaultShell). Find the processes with `tasklist /fi \"imagename eq {}\"`, \
-             end them or close the SSH sessions, and run apply again",
+             end them or close the SSH sessions, and run install again",
             canonical.display(),
             super::EXE_NAME
         )

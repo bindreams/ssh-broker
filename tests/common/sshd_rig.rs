@@ -158,7 +158,7 @@ pub fn sshd_service_pid() -> u32 {
         .unwrap_or_else(|| panic!("the sshd service has no process id:\n{text}"))
 }
 
-/// Make the runner's sshd accept `SSH_BROKER_ELEVATION` from a client, with the step `apply` takes (the drop-in
+/// Make the runner's sshd accept `SSH_BROKER_ELEVATION` from a client, with the step `install` takes (the drop-in
 /// and the `Include` line, and the restart of sshd that reads them), and fail loudly when sshd does not then
 /// accept the variable from files it has read. Once per test process, and a configuration that accepts the
 /// variable already, and has been read, is left as it is. Machine-wide: CI only, where the runner is discarded
@@ -179,7 +179,7 @@ pub fn accept_elevation_variable() {
                 read: ConfigRead::Read,
             }) if in_force(&listing) => {}
             other => panic!(
-                "sshd does not accept SSH_BROKER_ELEVATION from files it has read ({other:?}); apply's sshd step \
+                "sshd does not accept SSH_BROKER_ELEVATION from files it has read ({other:?}); install's sshd step \
                  said: {said:#?}"
             ),
         }

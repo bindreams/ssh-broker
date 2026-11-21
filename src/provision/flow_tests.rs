@@ -2,14 +2,14 @@ use super::*;
 use anyhow::Context;
 use std::cell::RefCell;
 
-/// Run the flow with an `install` that stops (or not) and then fails (or not); return the
+/// Run the flow with a `set_up` that stops (or not) and then fails (or not); return the
 /// events in order and the result.
 fn flow(
     stops: bool,
     stop_result: fn() -> anyhow::Result<()>,
-    install_ok: bool,
+    set_up_ok: bool,
 ) -> (Vec<&'static str>, anyhow::Result<()>) {
-    flow_resuming(stops, stop_result, install_ok, || Ok(()), || Ok(()))
+    flow_resuming(stops, stop_result, set_up_ok, || Ok(()), || Ok(()))
 }
 
 /// [`flow`] with the outcome of enabling the agent task again and of repairing the auto-login
@@ -17,7 +17,7 @@ fn flow(
 fn flow_resuming(
     stops: bool,
     stop_result: fn() -> anyhow::Result<()>,
-    install_ok: bool,
+    set_up_ok: bool,
     resume_result: fn() -> anyhow::Result<()>,
     repair_result: fn() -> anyhow::Result<()>,
 ) -> (Vec<&'static str>, anyhow::Result<()>) {
@@ -31,8 +31,8 @@ fn flow_resuming(
             if stops {
                 stop()?;
             }
-            events.borrow_mut().push("install");
-            anyhow::ensure!(install_ok, "register failed");
+            events.borrow_mut().push("set up");
+            anyhow::ensure!(set_up_ok, "register failed");
             Ok(())
         },
         || {
@@ -55,14 +55,14 @@ fn flow_resuming(
 fn agents_start_after_a_successful_install() {
     let (events, result) = flow(true, || Ok(()), true);
     result.unwrap();
-    assert_eq!(events, ["stop", "install", "resume", "repair sessions", "start"]);
+    assert_eq!(events, ["stop", "set up", "resume", "repair sessions", "start"]);
 }
 
 #[test]
 fn agents_that_were_stopped_start_again_when_a_later_step_fails() {
     let (events, result) = flow(true, || Ok(()), false);
     assert_eq!(format!("{:#}", result.unwrap_err()), "register failed");
-    assert_eq!(events, ["stop", "install", "resume", "repair sessions", "start"]);
+    assert_eq!(events, ["stop", "set up", "resume", "repair sessions", "start"]);
 }
 
 #[test]
@@ -86,7 +86,7 @@ fn agents_survive_a_failed_stop_in_the_sessions_the_start_is_told_to_leave_alone
     );
     let text = format!("{:#}", result.unwrap_err());
     assert!(text.contains("process 5 did not exit"), "{text}");
-    assert!(text.contains("run apply again"), "{text}");
+    assert!(text.contains("run install again"), "{text}");
     assert_eq!(
         told.into_inner(),
         left,
@@ -118,7 +118,7 @@ fn an_earlier_sshd_step_is_said_once_and_waited_for() {
         events,
         [
             "look for the sshd step",
-            "say: apply: an earlier apply's sshd step is still running (the task ssh-broker-apply-sshd); waiting \
+            "say: install: an earlier install's sshd step is still running (the task ssh-broker-install-sshd); waiting \
              for it to finish",
             "wait for the sshd step",
         ]
@@ -133,28 +133,28 @@ fn nothing_is_said_when_no_earlier_sshd_step_runs() {
 }
 
 #[test]
-fn an_earlier_sshd_step_never_launched_stops_apply() {
+fn an_earlier_sshd_step_never_launched_stops_install() {
     let (_, result) = wait_for_earlier(true, Ok(WaitOutcome::NeverLaunched { count: 2 }));
     let text = format!("{:#}", result.unwrap_err());
     assert_eq!(
         text,
         format!(
-            "the Task Scheduler lists 2 instance(s) of the task ssh-broker-apply-sshd that it has not started \
-             after {} s, so apply went no further. End and remove the task (`schtasks /End /TN \
-             ssh-broker-apply-sshd`, then `schtasks /Delete /TN ssh-broker-apply-sshd /F`, elevated); if the step \
+            "the Task Scheduler lists 2 instance(s) of the task ssh-broker-install-sshd that it has not started \
+             after {} s, so install went no further. End and remove the task (`schtasks /End /TN \
+             ssh-broker-install-sshd`, then `schtasks /Delete /TN ssh-broker-install-sshd /F`, elevated); if the step \
              has started meanwhile, ending it can leave sshd stopped. Check sshd at this PC: `sc query sshd`; \
-             start it with `net start sshd` if it is stopped. Then run apply again",
+             start it with `net start sshd` if it is stopped. Then run install again",
             procwait::EXIT_BOUND.as_secs()
         )
     );
 }
 
 #[test]
-fn a_failed_wait_for_an_earlier_sshd_step_stops_apply() {
+fn a_failed_wait_for_an_earlier_sshd_step_stops_install() {
     let (_, result) = wait_for_earlier(true, Err(anyhow::anyhow!("the Task Scheduler did not answer")));
     assert_eq!(
         format!("{:#}", result.unwrap_err()),
-        "wait for an earlier apply's sshd step: the Task Scheduler did not answer"
+        "wait for an earlier install's sshd step: the Task Scheduler did not answer"
     );
 }
 
@@ -169,26 +169,26 @@ fn agents_start_again_when_the_stop_failed_part_way() {
 fn no_agent_starts_when_none_was_stopped() {
     let (events, result) = flow(false, || Ok(()), false);
     assert!(result.is_err());
-    assert_eq!(events, ["install", "resume", "repair sessions"]);
+    assert_eq!(events, ["set up", "resume", "repair sessions"]);
 }
 
 #[test]
 fn the_task_is_enabled_again_even_when_no_agent_was_stopped() {
     // The exe may be unchanged and nothing stopped, and the task still disabled by an earlier
-    // `apply` that was killed between its disable and its enable.
+    // `install` that was killed between its disable and its enable.
     let (events, result) = flow(false, || Ok(()), true);
     result.unwrap();
-    assert_eq!(events, ["install", "resume", "repair sessions", "start"]);
+    assert_eq!(events, ["set up", "resume", "repair sessions", "start"]);
 }
 
 #[test]
-fn an_apply_that_could_not_enable_the_task_fails_and_starts_no_agent() {
+fn an_install_that_could_not_enable_the_task_fails_and_starts_no_agent() {
     // A disabled task starts no agent at any logon, so the install did not take.
     let (events, result) = flow_resuming(true, || Ok(()), true, || anyhow::bail!("access denied"), || Ok(()));
     assert!(format!("{:#}", result.unwrap_err()).contains("access denied"));
     assert_eq!(
         events,
-        ["stop", "install", "resume", "repair sessions"],
+        ["stop", "set up", "resume", "repair sessions"],
         "the sessions are independent of the agent task"
     );
 }
@@ -199,18 +199,18 @@ fn a_failed_install_is_reported_as_it_was_when_the_task_could_not_be_enabled_eit
     assert_eq!(format!("{:#}", result.unwrap_err()), "register failed");
     assert_eq!(
         events,
-        ["stop", "install", "resume", "repair sessions"],
+        ["stop", "set up", "resume", "repair sessions"],
         "no agent start: the task cannot start one"
     );
 }
 
 #[test]
-fn an_apply_that_could_not_enable_a_session_task_fails_but_still_starts_the_agents() {
+fn an_install_that_could_not_enable_a_session_task_fails_but_still_starts_the_agents() {
     // A disabled auto-login task starts no session at boot, so the install did not take; the desktop
     // agent is a different task and its start does not wait on that.
     let (events, result) = flow_resuming(true, || Ok(()), true, || Ok(()), || anyhow::bail!("task denied"));
     assert!(format!("{:#}", result.unwrap_err()).contains("task denied"));
-    assert_eq!(events, ["stop", "install", "resume", "repair sessions", "start"]);
+    assert_eq!(events, ["stop", "set up", "resume", "repair sessions", "start"]);
 }
 
 #[test]
@@ -219,7 +219,7 @@ fn a_failed_install_is_reported_as_it_was_when_a_session_task_could_not_be_enabl
     assert_eq!(format!("{:#}", result.unwrap_err()), "register failed");
     assert_eq!(
         events,
-        ["stop", "install", "resume", "repair sessions", "start"],
+        ["stop", "set up", "resume", "repair sessions", "start"],
         "the agents that were stopped start again, as after any failed install"
     );
 }
@@ -234,7 +234,7 @@ fn the_agent_task_failure_is_the_result_when_a_session_task_could_not_be_enabled
         || anyhow::bail!("task denied"),
     );
     assert!(format!("{:#}", result.unwrap_err()).contains("agent denied"));
-    assert_eq!(events, ["stop", "install", "resume", "repair sessions"]);
+    assert_eq!(events, ["stop", "set up", "resume", "repair sessions"]);
 }
 
 #[test]
@@ -413,7 +413,7 @@ fn background_agent_survivor_blocks_the_copy_with_its_pid() {
     world.survivor = Some(4242);
     let text = format!("{:#}", world.stop().unwrap_err());
     assert!(text.contains("process 4242"), "{text}");
-    assert!(text.contains("run apply again"), "{text}");
+    assert!(text.contains("run install again"), "{text}");
 }
 
 // repairing the session tasks -----
@@ -467,7 +467,7 @@ impl Machine {
 
 #[test]
 fn a_disabled_session_task_is_enabled_and_then_started() {
-    // The state a killed `apply` leaves, or a task disabled by hand.
+    // The state a killed `install` leaves, or a task disabled by hand.
     let machine = Machine::new(vec![("a", false, false)]);
     machine.repair().unwrap();
     assert_eq!(*machine.events.borrow(), ["enable a", "running? a", "run a"]);

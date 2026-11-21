@@ -122,7 +122,7 @@ fn short_path(path: &Path) -> PathBuf {
 
 // resolve_program -----
 
-/// `apply` decides whether the shell sshd ran exists through `WindowsHost`: `DefaultShell = ...\pwsh`
+/// `install` decides whether the shell sshd ran exists through `WindowsHost`: `DefaultShell = ...\pwsh`
 /// is the file `...\pwsh.exe`, as `CreateProcess` finds it.
 #[test]
 fn an_absolute_path_without_an_extension_finds_the_exe_on_disk() {

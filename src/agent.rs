@@ -279,7 +279,7 @@ fn serve_with(
     run: impl FnOnce(&SocketLocation) -> anyhow::Result<()>,
     hold: impl FnOnce(Box<dyn std::any::Any + Send>),
 ) -> anyhow::Result<()> {
-    // One agent per session: `apply` starts one per logged-on session every time it runs, and the
+    // One agent per session: `install` starts one per logged-on session every time it runs, and the
     // logon task starts one per logon. This comes first, because the user lock may be held for as
     // long as another session lives.
     let Some(slot) = SessionSlot::try_acquire(&location.sessions_lock_path(), session)? else {
