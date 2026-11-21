@@ -309,7 +309,14 @@ fn logout_while_a_question_is_pending_ends_the_session_and_runs_nothing() {
     ssh.arg("-T")
         .arg("--")
         .arg(format!("& '{}' logout", admin.kit.exe.display()));
-    let _ = run_client(ssh, false, kit.dir());
+    let outcome = run_client(ssh, false, kit.dir());
+    assert!(
+        outcome.stderr.contains("ending your background session."),
+        "the agent's reply to logout is missing from stderr (exit {:?}):\n{}\n{}",
+        outcome.code,
+        outcome.stderr,
+        (admin.diagnostics())()
+    );
 
     // The session ends with its shell: the wait is for the client to end.
     let _ = session.finish();

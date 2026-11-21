@@ -531,7 +531,7 @@ mod imp {
 
         // Local: sshd accepts SSH_BROKER_ELEVATION from clients, and has read the files that say so. `sshd -T`
         // reads sshd's host keys, so the row is judged only by an administrator's elevated `doctor` (see
-        // `sshd_config::accepts_row`). The elevation is read once, here, for this row and the account's rows.
+        // `sshd_config::accepts_row`).
         let elevation = crate::account::elevation();
         rows.push(sshd_config::accepts_row(
             &elevation,

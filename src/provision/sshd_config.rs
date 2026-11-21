@@ -236,8 +236,8 @@ pub enum SshdReading {
 
 /// The `doctor` row for sshd's configuration. `sshd -T` reads sshd's host keys, which only administrators and
 /// SYSTEM can read, so the row is judged only by an elevated administrator ([`Elevation::Full`]) and `reading`
-/// is asked only there; for any other process, below High or at High without `Administrators` enabled, the row
-/// is informational and passes. An elevated administrator's row passes when the variable is in force
+/// is asked only there; for any other process the row is informational and passes. An elevated
+/// administrator's row passes when the variable is in force
 /// ([`in_force`]) and sshd has read what was changed; it fails when sshd started before a file of its
 /// configuration changed (or at that moment), when the variable is not in force, and, with the cause, when
 /// `reading` fails or when the `elevation` could not be read. A file whose time is ahead of the clock, or an

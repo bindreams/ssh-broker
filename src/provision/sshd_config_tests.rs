@@ -363,7 +363,6 @@ const NOT_CHECKED_HERE: &str = "not checked here: sshd's configuration is read b
 
 #[test]
 fn the_sshd_row_of_an_administrator_that_is_not_elevated_is_informational_and_passes_without_asking_sshd() {
-    // An administrator's token below High (UAC's filtered one) is `Filtered`.
     let row = accepts_row(&Ok(Elevation::Filtered), || {
         panic!("sshd must not be asked of an administrator that is not elevated")
     });
@@ -374,8 +373,8 @@ fn the_sshd_row_of_an_administrator_that_is_not_elevated_is_informational_and_pa
 
 #[test]
 fn the_sshd_row_of_an_account_that_is_not_an_administrator_passes_without_asking_sshd() {
-    // `Standard` is the token of a non-administrator, at High or not (a Backup Operators account's `always`
-    // session is at High). Only administrators and SYSTEM can read sshd's configuration.
+    // `Standard` is a non-administrator's token, at High or not (a Backup Operators account's `always` session is
+    // at High).
     let row = accepts_row(&Ok(Elevation::Standard), || {
         panic!("sshd must not be asked by an account that is not an administrator")
     });
