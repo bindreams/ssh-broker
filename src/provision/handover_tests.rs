@@ -1,4 +1,4 @@
-//! Host tests for what `apply` says about the previous sshd shell before it replaces it (pure: no registry,
+//! Host tests for what `install` says about the previous sshd shell before it replaces it (pure: no registry,
 //! no file).
 
 use std::cell::Cell;
@@ -65,7 +65,7 @@ fn holds_every_previous_value(text: &str) {
         "-NoLogo -c",
         "-NoProfile",
         "escape arguments = no",
-        "apply replaces DefaultShell next",
+        "install replaces DefaultShell next",
     ] {
         assert!(text.contains(part), "{part}: {text}");
     }
@@ -73,7 +73,7 @@ fn holds_every_previous_value(text: &str) {
     states_facts_only(text);
 }
 
-/// What `hand_over` prints comes before the flip, which can still fail: it may say what `apply` does
+/// What `hand_over` prints comes before the flip, which can still fail: it may say what `install` does
 /// next, never that `DefaultShell` was replaced or changed.
 fn before_the_flip(text: &str) {
     for past in ["replaced", "changed", "restored", "is now", "has been"] {
@@ -97,7 +97,7 @@ fn a_written_config_says_so_on_stdout_and_prints_no_warning() {
         lines,
         vec![(
             Stream::Out,
-            format!("apply: wrote {CONFIG} from the shell sshd used before ({PWSH7})")
+            format!("install: wrote {CONFIG} from the shell sshd used before ({PWSH7})")
         )]
     );
     before_the_flip(&lines[0].1);
@@ -236,7 +236,7 @@ fn reading() -> SshdShellReading {
 }
 
 /// The owner's rule (7/7): the flip never happens unless the previous values were carried or printed. A
-/// value that cannot be read can be neither, so `apply` stops before the flip and says which, and what
+/// value that cannot be read can be neither, so `install` stops before the flip and says which, and what
 /// was read.
 #[test]
 fn an_unreadable_previous_shell_stops_before_the_flip() {
@@ -316,7 +316,7 @@ fn unreadable_arguments(shell: &str) -> SshdShellReading {
     reading
 }
 
-/// Nothing is lost by replacing ssh-broker with itself, so an unreadable other value does not stop `apply`
+/// Nothing is lost by replacing ssh-broker with itself, so an unreadable other value does not stop `install`
 /// (it must still reach the removal of `DefaultShellArguments`); with a foreign shell it does.
 #[test]
 fn an_unreadable_value_stops_the_flip_only_for_a_shell_that_is_not_ssh_broker() {

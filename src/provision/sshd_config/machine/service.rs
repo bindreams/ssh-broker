@@ -13,7 +13,7 @@
 //! - While a service is still stopping, a start is refused with 1056 and a second STOP with 1061, and a held
 //!   pending state is never resolved by the service manager; a STOP can succeed and the service stay running.
 //!   So a refusal is never judged by its code: the settled state that follows decides. The waits have no bound:
-//!   a bound would only make `apply` give up and leave the machine as it is.
+//!   a bound would only make `install` give up and leave the machine as it is.
 //!
 //! Two rules that are this crate's own, measured against OpenSSH for Windows' source and not against a service
 //! manager:
@@ -160,7 +160,7 @@ struct Settled {
     exit: ExitCodes,
 }
 
-/// The sshd service, opened for the reads and controls this module makes. One per run of `apply`'s step.
+/// The sshd service, opened for the reads and controls this module makes. One per run of `install`'s step.
 pub(super) struct SshdService {
     _manager: ScHandle,
     service: ScHandle,
@@ -469,7 +469,7 @@ enum ReleaseOutcome {
 
 /// End the use of `notification` once its service handle was closed with `closed`: run the callbacks already
 /// queued to this thread, then free it. After a failed close it is not freed, because a late callback may still
-/// write into it; a leak is not reported (`apply` installs no tracing subscriber).
+/// write into it; a leak is not reported (`install` installs no tracing subscriber).
 ///
 /// `notification` came from `Box::into_raw` in [`Registration::arm`] and is released once.
 fn release(notification: *mut Notification, closed: windows::core::Result<()>) -> ReleaseOutcome {

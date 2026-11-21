@@ -70,13 +70,13 @@ pub(super) fn settings_xml(multiple_instances: &str, on_failure: OnFailure) -> S
     )
 }
 
-/// The task `apply` hands the sshd step to, so that the step finishes even if the `apply` that started it is
+/// The task `install` hands the sshd step to, so that the step finishes even if the `install` that started it is
 /// ended (see `sshd_task`).
-pub const APPLY_SSHD_TASK: &str = "ssh-broker-apply-sshd";
+pub const INSTALL_SSHD_TASK: &str = "ssh-broker-install-sshd";
 
-/// The commands that end [`APPLY_SSHD_TASK`] and remove it, as the clause of a sentence.
-pub fn end_and_remove_apply_sshd_task() -> String {
-    format!("(`schtasks /End /TN {APPLY_SSHD_TASK}`, then `schtasks /Delete /TN {APPLY_SSHD_TASK} /F`, elevated)")
+/// The commands that end [`INSTALL_SSHD_TASK`] and remove it, as the clause of a sentence.
+pub fn end_and_remove_install_sshd_task() -> String {
+    format!("(`schtasks /End /TN {INSTALL_SSHD_TASK}`, then `schtasks /Delete /TN {INSTALL_SSHD_TASK} /F`, elevated)")
 }
 
 /// How a wait for a task's instances ended.
@@ -93,16 +93,16 @@ pub enum WaitOutcome {
 /// SYSTEM.
 pub const SYSTEM_SID: &str = "S-1-5-18";
 
-/// The definition of [`APPLY_SSHD_TASK`]: `<exe> apply-sshd` as SYSTEM at the highest level, with no trigger,
-/// so it runs only when `apply` starts it. A run that is asked for while another one is still running queues
+/// The definition of [`INSTALL_SSHD_TASK`]: `<exe> install-sshd` as SYSTEM at the highest level, with no trigger,
+/// so it runs only when `install` starts it. A run that is asked for while another one is still running queues
 /// behind it, and a run that failed is not repeated: the report says what happened.
-pub fn apply_sshd_task_xml(exe: &str) -> String {
+pub fn install_sshd_task_xml(exe: &str) -> String {
     let exe = xml_escape(exe);
     let settings = settings_xml("Queue", OnFailure::Leave);
     format!(
         r#"<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
-  <RegistrationInfo><Description>ssh-broker: makes sshd accept SSH_BROKER_ELEVATION and restarts it; started by apply</Description></RegistrationInfo>
+  <RegistrationInfo><Description>ssh-broker: makes sshd accept SSH_BROKER_ELEVATION and restarts it; started by install</Description></RegistrationInfo>
   <Principals><Principal id="System">
     <UserId>{SYSTEM_SID}</UserId>
     <RunLevel>{RUN_LEVEL}</RunLevel>
@@ -110,7 +110,7 @@ pub fn apply_sshd_task_xml(exe: &str) -> String {
 {settings}
   <Actions Context="System"><Exec>
     <Command>{exe}</Command>
-    <Arguments>apply-sshd</Arguments>
+    <Arguments>install-sshd</Arguments>
   </Exec></Actions>
 </Task>
 "#
@@ -118,7 +118,7 @@ pub fn apply_sshd_task_xml(exe: &str) -> String {
 }
 
 /// The agent logon task definition: runs `<exe> agent` in the interactive session of whichever
-/// user logs on. Names no account; `apply` registers it without a password.
+/// user logs on. Names no account; `install` registers it without a password.
 pub fn agent_task_xml(exe: &str) -> String {
     let exe = xml_escape(exe);
     let settings = settings_xml("Parallel", OnFailure::Restart);
@@ -233,13 +233,13 @@ pub fn agent_task_row(query: &anyhow::Result<Option<String>>) -> Check {
     let detail = if registered && !group {
         format!(
             "registered=true group_logon_task=false {}: the task is not the group logon task with run level \
-             HighestAvailable; run `apply` elevated to replace it",
+             HighestAvailable; run `install` elevated to replace it",
             run_level.unwrap_or_default()
         )
     } else if disabled {
         format!(
             "registered=true group_logon_task=true enabled=false {}: the task is disabled, so no agent starts at a \
-             logon; a killed `apply` leaves it so. Run `apply` elevated to enable it",
+             logon; a killed `install` leaves it so. Run `install` elevated to enable it",
             run_level.unwrap_or_default()
         )
     } else {

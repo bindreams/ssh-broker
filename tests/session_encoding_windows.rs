@@ -5,7 +5,7 @@
 //! report which. Its signal is whether stdin is a console: a PTY session runs the shell under
 //! `conhost.exe --headless` (`win32_pty.c`), while a non-PTY session gives it the pipes
 //! `posix_spawn` set up (`w32fd.c`). The escaped form is the only non-PTY one the shim decodes:
-//! `apply` sets `DefaultShellEscapeArguments`.
+//! `install` sets `DefaultShellEscapeArguments`.
 //!
 //! Windows-only: runs in CI's `Test (windows/amd64)` job. Each test runs this test binary again
 //! as the probe, once under conhost and once under pipes.
@@ -50,7 +50,7 @@ fn a_shell_on_pipes_is_not_verbatim() {
     let stdout = String::from_utf8_lossy(&out.stdout);
 
     assert!(out.status.success(), "the probe failed on pipes:\n{stdout}");
-    // `apply` sets DefaultShellEscapeArguments, and the detection reads no registry value, so a
+    // `install` sets DefaultShellEscapeArguments, and the detection reads no registry value, so a
     // non-PTY session is the escaped form on any machine. (The test does not vary the registry.)
     assert!(
         stdout.contains("encoding=Escaped"),

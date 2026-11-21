@@ -54,7 +54,7 @@ windows = { version = "0.62.2", features = [
     "Win32_Security_Authentication_Identity", # LsaGetLogonSessionData: the logon type of the probe's session
     "Win32_Security_Cryptography", # DPAPI parity probe (CryptProtectData/CryptUnprotectData)
     "Win32_UI_Shell",              # GetUserProfileDirectoryW: the profile of a token
-    "Win32_UI_WindowsAndMessaging", # SendMessageTimeoutW: apply tells the machine's windows that the system PATH changed (src/provision/registry.rs)
+    "Win32_UI_WindowsAndMessaging", # SendMessageTimeoutW: install tells the machine's windows that the system PATH changed (src/provision/registry.rs)
     "Win32_System_Services",       # QueryServiceStatusEx: the process of the sshd service, whose start time says whether sshd has read its configuration (src/provision/sshd_config/machine.rs)
     "Win32_System_TaskScheduler",  # stop/start the agent task per session (COM)
     "Win32_System_Com",            # CoInitializeEx / CoCreateInstance for the Task Scheduler
@@ -64,7 +64,7 @@ windows = { version = "0.62.2", features = [
     "Win32_System_Diagnostics_Debug", # SetThreadErrorMode: a shell that cannot start is an error, not a message box (src/winutil.rs)
     "Win32_System_JobObjects",     # IsProcessInJob/QueryInformationJobObject: the logon asks for breakaway only where the caller's job allows it
     "Wdk_Foundation",
-    "Win32_System_Diagnostics_ToolHelp", # CreateToolhelp32Snapshot: apply lists the processes to find background agents; tests/common/process_list.rs finds a process's descendants
+    "Win32_System_Diagnostics_ToolHelp", # CreateToolhelp32Snapshot: install lists the processes to find background agents; tests/common/process_list.rs finds a process's descendants
     "Wdk_System_Threading",         # NtQueryInformationProcess: the command line of a process, to tell a background agent from a shim; ProcessDefaultHardErrorMode in tests/common/hard_errors.rs
     "Wdk_System_SystemServices",    # PROCESS_EXTENDED_BASIC_INFORMATION: whether the kernel says a process is ending (src/provision/procwait.rs)
     "Win32_System_Kernel",          # PROCESS_BASIC_INFORMATION, which the extended record holds

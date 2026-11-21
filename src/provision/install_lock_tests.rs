@@ -9,8 +9,8 @@ fn not_private(_: &Path) -> anyhow::Result<()> {
 
 #[test]
 fn a_free_lock_is_taken_without_waiting() {
-    let dir = TempProfile::new("apply-lock-free");
-    let lock = acquire_with(not_private, &dir.0.join("apply.lock"), || {
+    let dir = TempProfile::new("install-lock-free");
+    let lock = acquire_with(not_private, &dir.0.join("install.lock"), || {
         panic!("nobody holds the lock")
     })
     .unwrap();
@@ -19,8 +19,8 @@ fn a_free_lock_is_taken_without_waiting() {
 
 #[test]
 fn a_second_holder_waits_for_the_first() {
-    let dir = TempProfile::new("apply-lock-contend");
-    let lock_path = dir.0.join("apply.lock");
+    let dir = TempProfile::new("install-lock-contend");
+    let lock_path = dir.0.join("install.lock");
     let first = acquire_with(not_private, &lock_path, || panic!("nobody holds the lock")).unwrap();
 
     let (waiting, saw_it_held) = mpsc::channel();
@@ -43,16 +43,16 @@ fn a_second_holder_waits_for_the_first() {
 
 #[test]
 fn the_lock_is_released_when_the_holder_drops() {
-    let dir = TempProfile::new("apply-lock-drop");
-    let lock_path = dir.0.join("apply.lock");
+    let dir = TempProfile::new("install-lock-drop");
+    let lock_path = dir.0.join("install.lock");
     drop(acquire_with(not_private, &lock_path, || {}).unwrap());
     drop(acquire_with(not_private, &lock_path, || panic!("the first holder let go of it")).unwrap());
 }
 
 #[test]
 fn the_lock_file_is_made_private_before_the_lock_is_asked_for() {
-    let dir = TempProfile::new("apply-lock-private");
-    let lock_path = dir.0.join("apply.lock");
+    let dir = TempProfile::new("install-lock-private");
+    let lock_path = dir.0.join("install.lock");
     let made = std::cell::RefCell::new(Vec::new());
     let lock = acquire_with(
         |path| {
@@ -70,8 +70,8 @@ fn the_lock_file_is_made_private_before_the_lock_is_asked_for() {
 
 #[test]
 fn a_lock_file_that_cannot_be_made_private_is_not_locked_and_not_created() {
-    let dir = TempProfile::new("apply-lock-refused");
-    let lock_path = dir.0.join("apply.lock");
+    let dir = TempProfile::new("install-lock-refused");
+    let lock_path = dir.0.join("install.lock");
     let err = acquire_with(
         |_| anyhow::bail!("open to Users"),
         &lock_path,

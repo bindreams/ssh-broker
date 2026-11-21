@@ -1,4 +1,4 @@
-//! Host tests for the flow of `apply`'s sshd step, over a stand-in for the machine: files in memory, the
+//! Host tests for the flow of `install`'s sshd step, over a stand-in for the machine: files in memory, the
 //! answers of `sshd` scripted, and a clock that ticks at every write. The real files and the real `sshd` are
 //! measured by `tests/sshd_config_windows.rs`, which CI runs.
 use super::super::restart::StartReply;
@@ -95,7 +95,7 @@ impl Fake {
         self
     }
 
-    /// `with_config` with the drop-in that `apply` writes, and an `Include` that reads it.
+    /// `with_config` with the drop-in that `install` writes, and an `Include` that reads it.
     pub(crate) fn configured() -> Fake {
         let mut host = Fake::with_config(&format!("Port 22\r\n{INCLUDE_LINE}\r\nMatch All\r\n"));
         host.drop_in = Some(drop_in_text().into_bytes());
@@ -357,29 +357,29 @@ fn position(events: &[String], name: &str) -> usize {
         .unwrap_or_else(|| panic!("no {name:?} in {events:?}"))
 }
 
-/// What `apply` says to do by hand.
+/// What `install` says to do by hand.
 fn advice() -> String {
     format!(
-        "apply: add `{ACCEPT_LINE}` above the first `Match` in sshd_config, then run `ssh-broker apply` again, \
+        "install: add `{ACCEPT_LINE}` above the first `Match` in sshd_config, then run `ssh-broker install` again, \
          which restarts sshd; `ssh-broker elevate` works without it"
     )
 }
 
-/// Why `apply` restarts sshd: a variable in force that the running sshd was started too early to have read.
+/// Why `install` restarts sshd: a variable in force that the running sshd was started too early to have read.
 fn unread(file: &str) -> String {
-    format!("apply: sshd was started before {file} was last changed, so it has not read it")
+    format!("install: sshd was started before {file} was last changed, so it has not read it")
 }
 
-const NOT_RUNNING: &str = "apply: sshd is not running; it reads the change when it starts";
+const NOT_RUNNING: &str = "install: sshd is not running; it reads the change when it starts";
 
-const RESTARTING: &str = "apply: restarting sshd; apply waits for the service manager at each step, and after a start \
+const RESTARTING: &str = "install: restarting sshd; install waits for the service manager at each step, and after a start \
                           for sshd to listen or exit";
-const RESTARTED: &str = "apply: sshd restarted; it accepts SSH_BROKER_ELEVATION";
+const RESTARTED: &str = "install: sshd restarted; it accepts SSH_BROKER_ELEVATION";
 
-/// What the machine does to the service when `apply` restarts sshd and nothing goes wrong.
+/// What the machine does to the service when `install` restarts sshd and nothing goes wrong.
 const RESTART: [&str; 3] = ["settled", "stop", "start"];
 
-/// What `apply` says when it restarts sshd for `why` and nothing goes wrong.
+/// What `install` says when it restarts sshd for `why` and nothing goes wrong.
 fn restarted_for(why: String) -> [String; 3] {
     [why, RESTARTING.to_owned(), RESTARTED.to_owned()]
 }
@@ -392,10 +392,10 @@ fn said_advice(said: &[String]) -> bool {
     said.contains(&advice())
 }
 
-/// What `apply` says when it cannot ask sshd for its configuration.
+/// What `install` says when it cannot ask sshd for its configuration.
 fn ask_failed(cause: &str, left: &str) -> String {
     format!(
-        "apply: could not ask sshd for its configuration ({cause}), so {left}. To have sshd accept \
+        "install: could not ask sshd for its configuration ({cause}), so {left}. To have sshd accept \
          SSH_BROKER_ELEVATION, add `{ACCEPT_LINE}` above the first `Match` in sshd_config and restart sshd; \
          `ssh-broker elevate` works without it."
     )
@@ -435,7 +435,7 @@ fn a_service_with_arguments_changes_nothing_and_says_where_to_add_the_line() {
     assert_eq!(
         said,
         [format!(
-            "apply: the sshd service runs with arguments (`-f D:\\conf\\sshd_config`), which can name another \
+            "install: the sshd service runs with arguments (`-f D:\\conf\\sshd_config`), which can name another \
              configuration file, so nothing of sshd's was changed. To have sshd accept SSH_BROKER_ELEVATION, add \
              `{ACCEPT_LINE}` above the first `Match` in the file it reads and restart sshd; `ssh-broker elevate` \
              works without it."
@@ -537,7 +537,7 @@ fn a_file_written_in_the_tick_sshd_started_in_is_judged_unread() {
 fn a_file_whose_time_is_ahead_of_the_clock_cannot_be_judged_and_sshd_is_restarted_each_time() {
     let mut host = Fake::configured();
     host.config_time = host.clock + 1000;
-    let why = "apply: sshd_config's change time is ahead of this machine's clock, so it cannot be told whether \
+    let why = "install: sshd_config's change time is ahead of this machine's clock, so it cannot be told whether \
                sshd has read it"
         .to_owned();
     for _ in 0..2 {
@@ -557,7 +557,7 @@ fn a_file_whose_time_is_ahead_of_the_clock_cannot_be_judged_and_sshd_is_restarte
     assert_eq!(
         said,
         restarted_for(format!(
-            "apply: {}'s change time is ahead of this machine's clock, so it cannot be told whether sshd has \
+            "install: {}'s change time is ahead of this machine's clock, so it cannot be told whether sshd has \
              read it",
             Fake::folder().display()
         ))
@@ -576,7 +576,7 @@ fn a_time_that_cannot_be_read_says_so() {
         assert_eq!(said.len(), 1, "{method}: {said:?}");
         let line = &said[0];
         assert!(
-            line.starts_with("apply: cannot tell whether sshd has read its configuration (")
+            line.starts_with("install: cannot tell whether sshd has read its configuration (")
                 && line.contains(&format!("{method} failed"))
                 && line.ends_with("); restart the sshd service for it to accept SSH_BROKER_ELEVATION"),
             "{method}: {said:?}"
@@ -586,10 +586,10 @@ fn a_time_that_cannot_be_read_says_so() {
 
 // every file sshd reads =====
 
-/// What `apply` says of an `Include` of another location in `file`.
+/// What `install` says of an `Include` of another location in `file`.
 fn includes_other(file: &str, line: &str) -> String {
     format!(
-        "apply: {file} has `{line}`; files sshd includes from elsewhere are not judged, so it cannot be told \
+        "install: {file} has `{line}`; files sshd includes from elsewhere are not judged, so it cannot be told \
          whether sshd has read its configuration, and it is restarted to be sure it accepts SSH_BROKER_ELEVATION"
     )
 }
@@ -832,7 +832,7 @@ fn a_question_to_sshd_about_the_candidate_that_fails_leaves_the_original_and_rem
     );
     assert!(
         said.contains(
-            &"apply: sshd_config was not changed: cannot ask sshd about the edited copy: sshd_t failed".to_owned()
+            &"install: sshd_config was not changed: cannot ask sshd about the edited copy: sshd_t failed".to_owned()
         ),
         "{said:?}"
     );
@@ -893,7 +893,7 @@ fn a_drop_in_folder_that_is_not_administrator_only_gets_the_acceptenv_line_in_ss
     );
     assert!(
         said.contains(&format!(
-            "apply: {} is left as it is (its ACL is not the hardened one); SSH_BROKER_ELEVATION is accepted by a \
+            "install: {} is left as it is (its ACL is not the hardened one); SSH_BROKER_ELEVATION is accepted by a \
              line in sshd_config instead",
             Fake::folder().display()
         )),
@@ -917,7 +917,7 @@ fn a_drop_in_folder_that_cannot_be_made_is_said_not_to_be_made_and_the_line_goes
     assert_eq!(host.drop_in, None);
     assert!(
         said.contains(&format!(
-            "apply: {} could not be made (Access is denied); SSH_BROKER_ELEVATION is accepted by a line in \
+            "install: {} could not be made (Access is denied); SSH_BROKER_ELEVATION is accepted by a line in \
              sshd_config instead",
             Fake::folder().display()
         )),
@@ -1004,7 +1004,7 @@ fn a_second_run_after_sshd_started_changes_nothing_and_says_nothing() {
 }
 
 #[test]
-fn a_failure_of_any_step_does_not_fail_apply() {
+fn a_failure_of_any_step_does_not_fail_install() {
     // These leave sshd's files as they were, say so, and report that the variable is not accepted.
     for method in [
         "sshd_t",
@@ -1062,7 +1062,7 @@ fn a_change_made_in_this_run_that_sshd_cannot_start_with_is_put_back_through_the
     assert!(
         said.last()
             .unwrap()
-            .starts_with("apply: sshd failed to start with SSH_BROKER_ELEVATION accepted ("),
+            .starts_with("install: sshd failed to start with SSH_BROKER_ELEVATION accepted ("),
         "{said:?}"
     );
     let order = |name: &str| position(&host.events, name);
@@ -1080,7 +1080,7 @@ fn a_change_made_in_this_run_is_restarted_for_even_when_the_time_of_the_start_ca
     assert_eq!(said[said.len() - 2], RESTARTING);
     assert_eq!(said.last().unwrap(), RESTARTED);
     assert!(
-        said[said.len() - 3].starts_with("apply: cannot tell whether sshd has read its configuration (")
+        said[said.len() - 3].starts_with("install: cannot tell whether sshd has read its configuration (")
             && said[said.len() - 3].ends_with("); this run changed it, so it has not"),
         "{said:?}"
     );

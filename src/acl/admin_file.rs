@@ -1,7 +1,7 @@
-//! A file only SYSTEM and Administrators can open: the machine-wide `apply` lock.
+//! A file only SYSTEM and Administrators can open: the machine-wide `install` lock.
 //!
 //! A byte-range lock needs only a handle with read or write access, so whoever can open the file
-//! for reading can hold the lock for ever and stall every `apply`. The install directory lets
+//! for reading can hold the lock for ever and stall every `install`. The install directory lets
 //! `BUILTIN\Users` read what is in it, so a file made there with the inherited DACL would be open
 //! to them. This file gets its own protected DACL at creation, and one that is already there must
 //! match it exactly (fail-closed, like [`super::verify_file_acl`]).
@@ -37,7 +37,7 @@ pub fn ensure_admin_only_file(path: &Path) -> anyhow::Result<()> {
     if let Some(problem) = admin_only_file_problem(path)? {
         anyhow::bail!(
             "{} exists but cannot be trusted as private to SYSTEM and Administrators: {problem}. \
-             Inspect it, remove it, and run `apply` again",
+             Inspect it, remove it, and run `install` again",
             path.display()
         );
     }

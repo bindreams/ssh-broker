@@ -511,10 +511,10 @@ pub fn logged<T>(f: impl FnOnce() -> T) -> (String, T) {
 /// ("Shell configuration"), once.
 pub fn states_facts_only(text: &str) {
     for advice in [
-        "run apply",
-        "run `apply`",
-        "apply again",
-        "next apply",
+        "run install",
+        "run `install`",
+        "install again",
+        "next install",
         "put it",
         "replace what",
         "write the config",

@@ -1,10 +1,10 @@
-//! What `apply` does to sshd's configuration and the system `PATH`, over the runner's real `sshd`. Windows only;
+//! What `install` does to sshd's configuration and the system `PATH`, over the runner's real `sshd`. Windows only;
 //! **Elevated (CI only)**.
 //!
 //! Each test starts from the runner's stock `sshd_config` (saved the first time any test of this file looks, and
 //! put back by `install::reset`), takes the machine alone (`machine::exclusive()`), and changes machine-wide
 //! state: sshd's configuration and its service, the `DefaultShell` values, the install directory, the system
-//! `PATH`. A test that runs `apply` holds `install::Install`, which puts the install directory, the tasks, the
+//! `PATH`. A test that runs `install` holds `install::Install`, which puts the install directory, the tasks, the
 //! `DefaultShell` values and sshd's files back as `upgrade_windows` does, so that the directory is absent when the
 //! test ends whichever binary runs first. The whole binary runs in nextest's `ci-exclusive` profile, where no
 //! workflow step has put the exe in the install directory.
@@ -70,7 +70,7 @@ use stand_in::Kit;
 use windows::Win32::Foundation::WAIT_OBJECT_0;
 use windows::Win32::System::Threading::WaitForSingleObject;
 
-/// What `apply`'s sshd step did and said: whether the running sshd takes the variable, and its lines.
+/// What `install`'s sshd step did and said: whether the running sshd takes the variable, and its lines.
 fn configure() -> (bool, Vec<String>) {
     let mut said = Vec::new();
     let accepted = configure_this_machine(&mut |line| said.push(line.to_owned()));
@@ -83,7 +83,7 @@ fn assert_restarted(accepted: bool, said: &[String]) {
     assert!(accepted, "{said:#?}");
     assert_eq!(
         said.last().expect("the step said nothing"),
-        "apply: sshd restarted; it accepts SSH_BROKER_ELEVATION",
+        "install: sshd restarted; it accepts SSH_BROKER_ELEVATION",
         "{said:#?}"
     );
 }
@@ -102,17 +102,21 @@ fn assert_in_force_and_read() {
     assert!(row.pass, "{}", row.detail);
 }
 
-/// `apply` itself put the variable in force in sshd's configuration, and restarted sshd after it. The rig's
-/// `accept_elevation_variable` (run by `Login::new`) would configure sshd itself if `apply` had not, so a test that
-/// logs in after `apply` cannot otherwise tell a defect in `apply`'s sshd step.
-fn assert_apply_configured_sshd() {
+/// `install` itself put the variable in force in sshd's configuration, and restarted sshd after it. The rig's
+/// `accept_elevation_variable` (run by `Login::new`) would configure sshd itself if `install` had not, so a test that
+/// logs in after `install` cannot otherwise tell a defect in `install`'s sshd step.
+fn assert_install_configured_sshd() {
     match sshd_reading_this_machine().expect("an elevated administrator can read sshd's configuration") {
         SshdReading::Read { listing, read } => {
             assert!(
                 in_force(&listing),
-                "apply did not put the variable in force:\n{listing}"
+                "install did not put the variable in force:\n{listing}"
             );
-            assert_eq!(read, ConfigRead::Read, "apply restarted sshd after it wrote the files");
+            assert_eq!(
+                read,
+                ConfigRead::Read,
+                "install restarted sshd after it wrote the files"
+            );
         }
         other => panic!("the sshd service was read as {other:?}"),
     }
@@ -126,29 +130,29 @@ fn sshd_t() -> String {
     }
 }
 
-/// `exe apply`, run by the test process (an elevated administrator): installs the build as the product does.
+/// `exe install`, run by the test process (an elevated administrator): installs the build as the product does.
 /// Returns what it printed on standard output and on standard error; fails when it does not end with 0.
-fn apply_streams(kit: &Kit) -> (String, String) {
-    let out = desktop::output(Command::new(&kit.exe).arg("apply")).expect("run apply");
+fn install_streams(kit: &Kit) -> (String, String) {
+    let out = desktop::output(Command::new(&kit.exe).arg("install")).expect("run install");
     let (stdout, stderr) = (
         String::from_utf8_lossy(&out.stdout).into_owned(),
         String::from_utf8_lossy(&out.stderr).into_owned(),
     );
     assert!(
         out.status.success(),
-        "apply failed ({:?}):\n{stdout}{stderr}",
+        "install failed ({:?}):\n{stdout}{stderr}",
         out.status.code()
     );
     (stdout, stderr)
 }
 
-/// [`apply_streams`], both streams in one text.
-fn apply(kit: &Kit) -> String {
-    let (stdout, stderr) = apply_streams(kit);
+/// [`install_streams`], both streams in one text.
+fn run_install(kit: &Kit) -> String {
+    let (stdout, stderr) = install_streams(kit);
     format!("{stdout}{stderr}")
 }
 
-/// What the report of `apply`'s sshd step holds.
+/// What the report of `install`'s sshd step holds.
 fn report() -> sshd_task::Report {
     let path = sshd_task::report_path();
     let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read the report {}: {e}", path.display()));
@@ -158,10 +162,10 @@ fn report() -> sshd_task::Report {
 /// No task of the sshd step is left registered.
 fn assert_no_sshd_task_is_left() {
     assert_eq!(
-        taskscheduler::task_xml(schtasks::APPLY_SSHD_TASK).expect("ask the Task Scheduler"),
+        taskscheduler::task_xml(schtasks::INSTALL_SSHD_TASK).expect("ask the Task Scheduler"),
         None,
-        "apply left the task {} registered",
-        schtasks::APPLY_SSHD_TASK
+        "install left the task {} registered",
+        schtasks::INSTALL_SSHD_TASK
     );
 }
 
@@ -171,13 +175,13 @@ fn system_cmd() -> PathBuf {
 
 // The drop-in and the Include line =====
 
-/// The step on the runner's stock file, run by `apply` through its task, as SYSTEM: the drop-in, the `Include` line
+/// The step on the runner's stock file, run by `install` through its task, as SYSTEM: the drop-in, the `Include` line
 /// above the first `Match`, the original's security on the replacement (SYSTEM can create the drop-in and
-/// `copy_file_security` works as SYSTEM), and the restart of sshd. No task is left after `apply`, and the report
-/// holds the lines `apply` printed after it said the step was the task's. After the restart the `doctor` row
+/// `copy_file_security` works as SYSTEM), and the restart of sshd. No task is left after `install`, and the report
+/// holds the lines `install` printed after it said the step was the task's. After the restart the `doctor` row
 /// passes and a second run says nothing.
 #[test]
-fn apply_s_sshd_step_adds_the_drop_in_and_the_include_above_the_first_match_and_the_row_passes() {
+fn install_s_sshd_step_adds_the_drop_in_and_the_include_above_the_first_match_and_the_row_passes() {
     let _machine = machine::exclusive();
     account_fixture::assert_elevated();
     let _install = Install::capture();
@@ -186,14 +190,14 @@ fn apply_s_sshd_step_adds_the_drop_in_and_the_include_above_the_first_match_and_
     let kit = Kit::broker_with_helper("sshs");
     let security_before = sddl_of(&config_path());
 
-    let (stdout, _) = apply_streams(&kit);
+    let (stdout, _) = install_streams(&kit);
     let printed: Vec<&str> = stdout
         .lines()
         .skip_while(|line| !line.starts_with(sshd_task::HANDED_OVER_PREFIX))
         .skip(1)
         .collect();
     let said = report().lines;
-    assert_eq!(printed, said, "apply prints the report, line for line");
+    assert_eq!(printed, said, "install prints the report, line for line");
     assert_restarted(true, &said);
     assert_no_sshd_task_is_left();
     assert_eq!(
@@ -242,7 +246,7 @@ fn a_config_with_an_include_already_present_is_left_alone_and_accepts() {
 }
 
 /// A file in `sshd_config.d` that sshd rejects makes the candidate fail `sshd -t` only once the `Include` is in it:
-/// the original stays as it was, byte for byte, and `apply` says which line to add.
+/// the original stays as it was, byte for byte, and `install` says which line to add.
 #[test]
 fn an_unparseable_candidate_leaves_the_original_untouched() {
     let _machine = machine::exclusive();
@@ -268,7 +272,7 @@ fn an_unparseable_candidate_leaves_the_original_untouched() {
 }
 
 /// The drop-in is replaced whole or not at all: when the new file beside it cannot be made (the name it would take
-/// is a folder here), `apply` leaves the drop-in with the text it had, says the folder is left as it is, and puts the
+/// is a folder here), `install` leaves the drop-in with the text it had, says the folder is left as it is, and puts the
 /// `AcceptEnv` line into `sshd_config` instead.
 #[test]
 fn a_drop_in_that_cannot_be_replaced_keeps_the_text_it_had() {
@@ -277,7 +281,7 @@ fn a_drop_in_that_cannot_be_replaced_keeps_the_text_it_had() {
     let stock = reset();
     let _reset = ResetAtTheEnd;
     create_install_dir(&drop_in_dir()).expect("make the drop-in folder");
-    // Made in the folder `apply` made, the file inherits what the folder gives it, as the step's own does.
+    // Made in the folder `install` made, the file inherits what the folder gives it, as the step's own does.
     std::fs::write(drop_in_path(), "AcceptEnv OTHER\r\n").unwrap();
     assert_eq!(install_dir_file_problem(&drop_in_path()).unwrap(), None);
     std::fs::create_dir(drop_in_dir().join(format!("{DROP_IN_NAME}.ssh-broker-new")))
@@ -298,7 +302,7 @@ fn a_drop_in_that_cannot_be_replaced_keeps_the_text_it_had() {
 }
 
 /// A folder an administrator made by hand inherits `ProgramData\ssh`'s permissions, which are not the ones
-/// `apply` makes it with: the premise is measured first. The folder is left as it is, no drop-in is written, and
+/// `install` makes it with: the premise is measured first. The folder is left as it is, no drop-in is written, and
 /// the `AcceptEnv` line goes into `sshd_config` above its first `Match`.
 #[test]
 fn a_hand_made_sshd_config_d_gets_no_drop_in_and_sshd_config_gets_the_acceptenv_line() {
@@ -310,7 +314,7 @@ fn a_hand_made_sshd_config_d_gets_no_drop_in_and_sshd_config_gets_the_acceptenv_
     let problem = install_dir_problem(&drop_in_dir()).expect("judge the folder");
     assert!(
         problem.is_some(),
-        "premise: a folder made by hand is not the folder apply makes"
+        "premise: a folder made by hand is not the folder install makes"
     );
 
     let (accepted, said) = configure();
@@ -449,17 +453,17 @@ fn copying_security_gives_the_owner_and_the_acl_and_leaves_the_restore_privilege
     );
 }
 
-/// A login that sets the variable through `SetEnv` gets it in its shell after `apply`, over the real sshd: the
+/// A login that sets the variable through `SetEnv` gets it in its shell after `install`, over the real sshd: the
 /// stock `cmd.exe` is the shell here, so what it prints is what sshd delivered.
 #[test]
-fn a_login_with_set_env_always_gets_the_variable_after_apply() {
+fn a_login_with_set_env_always_gets_the_variable_after_install() {
     let _machine = machine::exclusive();
     account_fixture::assert_elevated();
     let _install = Install::capture();
     reset();
     let kit = Kit::broker_with_helper("sshe");
-    apply(&kit);
-    assert_apply_configured_sshd();
+    run_install(&kit);
+    assert_install_configured_sshd();
     let account = Account::create("sshe", true);
     // sshd's logon keeps the account's hive loaded, so the account is declared as logged on by sshd, which is how
     // `Account::drop` deletes the profile; no agent runs for it, so there is none to end (see `session_end`).
@@ -509,22 +513,22 @@ fn install_dir_is_on_path() -> bool {
     )
 }
 
-/// `apply` puts the install directory on the system `PATH`, and `doctor` (an elevated one) says so.
+/// `install` puts the install directory on the system `PATH`, and `doctor` (an elevated one) says so.
 #[test]
-fn apply_puts_the_install_directory_on_the_system_path_and_doctor_says_so() {
+fn install_puts_the_install_directory_on_the_system_path_and_doctor_says_so() {
     let _machine = machine::exclusive();
     account_fixture::assert_elevated();
     let _install = Install::capture();
     reset();
     let kit = Kit::broker_with_helper("sshp");
-    apply(&kit);
+    run_install(&kit);
     remove_install_dir_from_path();
     assert!(!install_dir_is_on_path(), "the directory was taken off the PATH");
 
-    let said = apply(&kit);
+    let said = run_install(&kit);
     assert!(
         install_dir_is_on_path(),
-        "apply did not put {BASE_DIR} on the PATH:\n{said}"
+        "install did not put {BASE_DIR} on the PATH:\n{said}"
     );
 
     let doctor = desktop::output(Command::new(canonical_exe()).arg("doctor")).expect("run doctor");
@@ -555,18 +559,18 @@ fn type_where_ssh_broker_is(session: &mut SshSession) -> String {
         .to_owned()
 }
 
-/// A session started after `apply` finds `ssh-broker` by name.
+/// A session started after `install` finds `ssh-broker` by name.
 #[test]
-fn after_apply_a_new_session_runs_ssh_broker_by_name() {
+fn after_install_a_new_session_runs_ssh_broker_by_name() {
     let _machine = machine::exclusive();
     account_fixture::assert_elevated();
     let _install = Install::capture();
     reset();
     let kit = Kit::broker_with_helper("sshn");
-    apply(&kit);
+    run_install(&kit);
     remove_install_dir_from_path();
-    apply(&kit);
-    assert_apply_configured_sshd();
+    run_install(&kit);
+    assert_install_configured_sshd();
     let account = Account::create("sshn", true);
     let _end = session_end::LogOutOnDrop::new(&canonical_exe(), &account, ServiceLogon::Sshd);
     let login = Login::new(&kit, &account);
@@ -577,23 +581,23 @@ fn after_apply_a_new_session_runs_ssh_broker_by_name() {
     let found = type_where_ssh_broker_is(&mut session);
     assert!(
         found.eq_ignore_ascii_case(&canonical_exe().to_string_lossy()),
-        "a session started after apply does not find ssh-broker by name: {found:?}\n{}",
+        "a session started after install does not find ssh-broker by name: {found:?}\n{}",
         session.text()
     );
     session.leave();
 }
 
-/// An agent's environment is fixed when it starts, so the sessions of an agent that `apply` did not restart lack
+/// An agent's environment is fixed when it starts, so the sessions of an agent that `install` did not restart lack
 /// the install directory until it restarts.
 #[test]
-fn an_agent_that_apply_did_not_restart_keeps_its_old_path_until_it_restarts() {
+fn an_agent_that_install_did_not_restart_keeps_its_old_path_until_it_restarts() {
     let _machine = machine::exclusive();
     account_fixture::assert_elevated();
     let _install = Install::capture();
     reset();
     let kit = Kit::broker_with_helper("sshk");
-    apply(&kit);
-    assert_apply_configured_sshd();
+    run_install(&kit);
+    assert_install_configured_sshd();
     remove_install_dir_from_path();
     let account = Account::create("sshk", true);
     let _end = session_end::LogOutOnDrop::new(&canonical_exe(), &account, ServiceLogon::Sshd);
@@ -608,8 +612,8 @@ fn an_agent_that_apply_did_not_restart_keeps_its_old_path_until_it_restarts() {
         "the agent started with the old PATH"
     );
 
-    // `apply` of the installed build puts the directory on the PATH and restarts no agent.
-    apply(&kit);
+    // `install` of the installed build puts the directory on the PATH and restarts no agent.
+    run_install(&kit);
     assert!(install_dir_is_on_path());
     let mut second = login.start_into_running_session();
     assert_eq!(
@@ -643,7 +647,7 @@ fn an_agent_that_apply_did_not_restart_keeps_its_old_path_until_it_restarts() {
 /// `doctor` unelevated, which is told the ways to check and exits 1; a second login asking `auto-approve` runs one
 /// of them, `ssh-broker elevate ssh-broker doctor` by name, which passes.
 #[test]
-fn after_apply_doctor_passes_through_a_session_the_password_prompt_started() {
+fn after_install_doctor_passes_through_a_session_the_password_prompt_started() {
     use ssh_broker::offer::text::CHECK_BELOW_HIGH_CLAUSE;
 
     let _machine = machine::exclusive();
@@ -651,8 +655,8 @@ fn after_apply_doctor_passes_through_a_session_the_password_prompt_started() {
     let _install = Install::capture();
     reset();
     let kit = Kit::broker_with_helper("sshv");
-    apply(&kit);
-    assert_apply_configured_sshd();
+    run_install(&kit);
+    assert_install_configured_sshd();
     let installed = canonical_exe();
     let account = Account::create("sshv", true);
     account.make_administrator();
@@ -943,13 +947,13 @@ fn an_sshd_that_cannot_bind_any_address_is_never_said_to_serve() {
     );
 }
 
-/// `apply` run in a job that ends with its connection, as sshd's job does: the test reads `apply`'s output through
-/// the pipe and ends the job on the line that says the sshd step is the task's. `apply` is then gone, and the task
+/// `install` run in a job that ends with its connection, as sshd's job does: the test reads `install`'s output through
+/// the pipe and ends the job on the line that says the sshd step is the task's. `install` is then gone, and the task
 /// (a service started its process, outside the job) finishes the step: its instances end, sshd is running, plain
 /// `sshd -T` shows the variable, a login that asks for the variable gets it, and the report's last line says sshd
 /// restarted. sshd is started again when the test ends, also on failure.
 #[test]
-fn an_apply_ended_after_it_handed_over_the_sshd_step_leaves_sshd_running_with_the_change() {
+fn an_install_ended_after_it_handed_over_the_sshd_step_leaves_sshd_running_with_the_change() {
     use std::io::{BufRead, BufReader};
     use std::os::windows::io::AsRawHandle;
     use std::process::Stdio;
@@ -960,21 +964,21 @@ fn an_apply_ended_after_it_handed_over_the_sshd_step_leaves_sshd_running_with_th
     let _running = SshdRunningAtTheEnd;
     reset();
     let kit = Kit::broker_with_helper("sshj");
-    apply(&kit);
+    run_install(&kit);
     let installed = canonical_exe();
-    // sshd's files as stock again, and sshd not restarted: the `apply` below has a change to make and a restart
+    // sshd's files as stock again, and sshd not restarted: the `install` below has a change to make and a restart
     // to do.
     reset();
 
     let mut job = job::KillOnCloseJob::create();
     let mut command = Command::new(&installed);
-    command.arg("apply").stdout(Stdio::piped()).stderr(Stdio::null());
-    let mut child = desktop::spawn(&mut command).expect("run apply");
+    command.arg("install").stdout(Stdio::piped()).stderr(Stdio::null());
+    let mut child = desktop::spawn(&mut command).expect("run install");
     job.assign(windows::Win32::Foundation::HANDLE(child.as_raw_handle()));
     let mut printed = Vec::new();
     let mut handed_over = false;
-    for line in BufReader::new(child.stdout.take().expect("apply's output is piped")).lines() {
-        let line = line.expect("read what apply prints");
+    for line in BufReader::new(child.stdout.take().expect("install's output is piped")).lines() {
+        let line = line.expect("read what install prints");
         handed_over = line.starts_with(sshd_task::HANDED_OVER_PREFIX);
         printed.push(line);
         if handed_over {
@@ -983,27 +987,28 @@ fn an_apply_ended_after_it_handed_over_the_sshd_step_leaves_sshd_running_with_th
     }
     assert!(
         handed_over,
-        "apply ended without saying that the sshd step is the task's:\n{printed:#?}"
+        "install ended without saying that the sshd step is the task's:\n{printed:#?}"
     );
-    // The connection ends: every process in the session's job ends with it, `apply` among them.
+    // The connection ends: every process in the session's job ends with it, `install` among them.
     job.close();
     let _ = child.wait();
 
     // `waiting` is called when the first listing finds an instance: the task had one that had not ended when the
     // job was closed. A step that had finished by then fails here, loudly, instead of passing for nothing.
     let mut had_an_instance = false;
-    let waited = taskscheduler::wait_for_instances(schtasks::APPLY_SSHD_TASK, &installed, Role::ApplySshd, &mut || {
-        had_an_instance = true
-    })
-    .expect("wait for the instances of the task");
+    let waited =
+        taskscheduler::wait_for_instances(schtasks::INSTALL_SSHD_TASK, &installed, Role::InstallSshd, &mut || {
+            had_an_instance = true
+        })
+        .expect("wait for the instances of the task");
     assert!(
         had_an_instance,
-        "the task had no instance left when the job was closed, so the test did not show that the step outlives `apply`"
+        "the task had no instance left when the job was closed, so the test did not show that the step outlives `install`"
     );
     assert_eq!(waited, WaitOutcome::Ended);
     let mut host = sshd_host_of_this_machine().expect("find the sshd service");
     assert_eq!(host.settled().expect("read the state"), ServiceState::Running);
-    assert_apply_configured_sshd();
+    assert_install_configured_sshd();
     assert!(
         accepts(&sshd_t(), ssh_broker::protocol::ElevationPolicy::VARIABLE),
         "plain `sshd -T` shows the variable"
@@ -1016,7 +1021,7 @@ fn an_apply_ended_after_it_handed_over_the_sshd_step_leaves_sshd_running_with_th
     );
     assert_eq!(
         report.lines.last().map(String::as_str),
-        Some("apply: sshd restarted; it accepts SSH_BROKER_ELEVATION"),
+        Some("install: sshd restarted; it accepts SSH_BROKER_ELEVATION"),
         "the report's last line says sshd restarted"
     );
 
@@ -1039,49 +1044,49 @@ fn an_apply_ended_after_it_handed_over_the_sshd_step_leaves_sshd_running_with_th
     );
 }
 
-/// Review Focus 5: `apply` run in an SSH session restarts the very sshd that session came in through. The shim is
+/// Review Focus 5: `install` run in an SSH session restarts the very sshd that session came in through. The shim is
 /// sshd's `DefaultShell` and the session is an administrator's at High (`always`). It must end with its exit code,
 /// and the session must go on afterwards. Spike 4 measured a restart with the stock shell; this measures it with the
-/// shim. If the session does not survive, stop and report: the restart cannot be the last step of an `apply` that
+/// shim. If the session does not survive, stop and report: the restart cannot be the last step of an `install` that
 /// someone runs over SSH.
 #[test]
-fn apply_run_over_ssh_while_it_restarts_sshd_ends_with_its_exit_code_and_the_session_survives() {
+fn install_run_over_ssh_while_it_restarts_sshd_ends_with_its_exit_code_and_the_session_survives() {
     let _machine = machine::exclusive();
     account_fixture::assert_elevated();
     let _install = Install::capture();
     let _running = SshdRunningAtTheEnd;
     reset();
     let kit = Kit::broker_with_helper("ssha");
-    apply(&kit);
+    run_install(&kit);
     let installed = canonical_exe();
     let account = Account::create("ssha", true);
     account.make_administrator();
     let _end = session_end::LogOutOnDrop::new(&installed, &account, ServiceLogon::Sshd);
-    // sshd accepts the variable (the `apply` above; the login's rig finds it so), which the session needs to be
-    // elevated: a session that is not cannot run `apply`. Then `sshd_config` is written again with the same text,
-    // which sshd cannot have read: the `apply` in the session has a restart to do. (Putting the files back as
+    // sshd accepts the variable (the `install` above; the login's rig finds it so), which the session needs to be
+    // elevated: a session that is not cannot run `install`. Then `sshd_config` is written again with the same text,
+    // which sshd cannot have read: the `install` in the session has a restart to do. (Putting the files back as
     // stock here instead took the variable from the session: its login came after the drop-in had gone.)
     let login = Login::new(&kit, &account);
     std::fs::write(config_path(), std::fs::read(config_path()).unwrap()).unwrap();
     let row = accepts_row(&Ok(Elevation::Full), sshd_reading_this_machine);
     assert!(
         !row.pass,
-        "sshd has a restart to do before the apply in the session: {}",
+        "sshd has a restart to do before the install in the session: {}",
         row.detail
     );
 
     let mut session = SshSession::start(login.command_asking("always"), login.diagnostics());
     session.log_in(&account.password);
     session.type_line(&format!(
-        "& '{}' apply; Write-Output ('apply-exit' + '=' + $LASTEXITCODE + ';')",
+        "& '{}' install; Write-Output ('install-exit' + '=' + $LASTEXITCODE + ';')",
         installed.display()
     ));
-    session.read_until("apply-exit=0;");
+    session.read_until("install-exit=0;");
     assert!(
         accepts(&sshd_t(), ssh_broker::protocol::ElevationPolicy::VARIABLE),
-        "the apply in the session did not make sshd accept the variable"
+        "the install in the session did not make sshd accept the variable"
     );
-    assert_apply_configured_sshd();
+    assert_install_configured_sshd();
     // The session survived the restart: it answers.
     session.say("still-here-after-the-restart");
     session.leave();

@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 const BOM: &[u8] = b"\xEF\xBB\xBF";
 
-/// The two lines `apply` puts into `sshd_config`: the `Include` of the drop-ins, or the `AcceptEnv` itself when
+/// The two lines `install` puts into `sshd_config`: the `Include` of the drop-ins, or the `AcceptEnv` itself when
 /// the folder cannot be used. The edit is the same for both.
 const LINES: [&str; 2] = [INCLUDE_LINE, ACCEPT_LINE];
 
@@ -412,12 +412,12 @@ fn the_sshd_row_of_an_elevated_administrator_passes_when_the_variable_is_accepte
 }
 
 #[test]
-fn the_sshd_row_of_an_elevated_administrator_fails_when_sshd_does_not_accept_and_says_apply_sets_it_up() {
+fn the_sshd_row_of_an_elevated_administrator_fails_when_sshd_does_not_accept_and_says_install_sets_it_up() {
     let row = accepts_row(&Ok(Elevation::Full), || read("port 22\nacceptenv LANG\n"));
     assert!(!row.pass);
     assert_eq!(
         row.detail,
-        "sshd does not accept SSH_BROKER_ELEVATION from clients; `ssh-broker apply` sets it up, and says what it \
+        "sshd does not accept SSH_BROKER_ELEVATION from clients; `ssh-broker install` sets it up, and says what it \
          could not do. `ssh-broker elevate` works without it."
     );
     assert!(!row.detail.contains("Include"), "{}", row.detail);
@@ -442,7 +442,7 @@ fn the_sshd_row_fails_when_sshd_started_before_its_configuration_was_written() {
         assert_eq!(
             row.detail,
             format!(
-                "sshd was started before {} was last changed and has not read it; `ssh-broker apply` restarts it, or \
+                "sshd was started before {} was last changed and has not read it; `ssh-broker install` restarts it, or \
                  restart the sshd service",
                 PathBuf::from("sshd_config.d").join("10-ssh-broker.conf").display()
             )
@@ -480,7 +480,7 @@ fn the_sshd_row_passes_and_says_so_when_a_files_time_is_ahead_of_the_clock() {
             row.detail,
             format!(
                 "{said}; sshd_config's change time is ahead of the clock, so whether the running sshd has read \
-                 it cannot be told (`ssh-broker apply` restarts it to be sure, or restart the sshd service)"
+                 it cannot be told (`ssh-broker install` restarts it to be sure, or restart the sshd service)"
             )
         );
     }
@@ -518,7 +518,7 @@ fn the_sshd_row_passes_with_a_note_when_sshd_includes_another_location() {
             row.detail,
             format!(
                 "{said}; sshd_config has `Include D:\\x\\*.conf`, so whether the running sshd has read its \
-                 configuration cannot be told (`ssh-broker apply` restarts it to be sure, or restart the sshd \
+                 configuration cannot be told (`ssh-broker install` restarts it to be sure, or restart the sshd \
                  service)"
             )
         );

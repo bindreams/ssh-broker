@@ -78,7 +78,7 @@ fn a_task_that_does_not_exist_has_no_running_instance() {
 
 #[test]
 fn enabling_a_task_that_does_not_exist_is_not_an_error() {
-    // A failed `apply` enables the task again whether or not it got as far as registering it.
+    // A failed `install` enables the task again whether or not it got as far as registering it.
     let name = format!("ssh-broker-test-absent-{}", std::process::id());
     set_enabled(&name, true).unwrap();
 }

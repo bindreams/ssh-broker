@@ -1,6 +1,6 @@
 //! provision::path_env — the install directory on the system `PATH`.
 //!
-//! `apply` appends [`super::BASE_DIR`] to the machine's `Path` value so that a session finds `ssh-broker` by
+//! `install` appends [`super::BASE_DIR`] to the machine's `Path` value so that a session finds `ssh-broker` by
 //! name (`ssh-broker elevate ...`). This module is the pure part: what to write for what is stored, and the
 //! `doctor` row. Reading and writing the value is `registry`'s.
 //!
@@ -46,7 +46,7 @@ pub fn decode_string(data: &[u8], expand: bool) -> Result<Stored, String> {
     })
 }
 
-/// What `apply` does about the `PATH`.
+/// What `install` does about the `PATH`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PathPlan {
     /// The directory is on it.
@@ -144,7 +144,7 @@ pub fn row(current: &Reading, dir: &str) -> Check {
             Some(_) => Check::new(
                 NAME,
                 false,
-                format!("{dir} is not on the system PATH; run `ssh-broker apply`"),
+                format!("{dir} is not on the system PATH; run `ssh-broker install`"),
             ),
         },
     }

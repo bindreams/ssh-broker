@@ -3,7 +3,7 @@
 
 use super::configure::SshdHost;
 use super::{CHECK_SSHD, DROP_IN_NAME, VARIABLE};
-use crate::provision::schtasks::APPLY_SSHD_TASK;
+use crate::provision::schtasks::INSTALL_SSHD_TASK;
 
 /// The settled states of the sshd service.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -113,27 +113,27 @@ impl Before {
 /// start, the first sent after a state was read.
 pub fn restart(host: &mut dyn SshdHost, say: &mut dyn FnMut(&str), before: &Before) -> bool {
     say(
-        "apply: restarting sshd; apply waits for the service manager at each step, and after a start for sshd to \
+        "install: restarting sshd; install waits for the service manager at each step, and after a start for sshd to \
          listen or exit",
     );
 
     match host.settled() {
         Ok(ServiceState::Running) => {}
         Ok(ServiceState::Stopped) => {
-            say("apply: sshd is not running, so it was not started; it reads the change when it is");
+            say("install: sshd is not running, so it was not started; it reads the change when it is");
             return true;
         }
         Ok(ServiceState::Paused) => {
             say(
-                "apply: the sshd service is paused, so it was not restarted; resume it (`sc continue sshd`) and run \
-                 `ssh-broker apply` again",
+                "install: the sshd service is paused, so it was not restarted; resume it (`sc continue sshd`) and run \
+                 `ssh-broker install` again",
             );
             return false;
         }
         Err(e) => {
             say(&format!(
-                "apply: the sshd service's state cannot be read ({e:#}), so it was not restarted; run \
-                 `ssh-broker apply` again to restart it"
+                "install: the sshd service's state cannot be read ({e:#}), so it was not restarted; run \
+                 `ssh-broker install` again to restart it"
             ));
             return false;
         }
@@ -156,9 +156,9 @@ pub fn restart(host: &mut dyn SshdHost, say: &mut dyn FnMut(&str), before: &Befo
         }
         Err(e) => {
             say(&format!(
-                "apply: no stop was sent to sshd ({e:#}), so it was not restarted. Its state was last read as \
+                "install: no stop was sent to sshd ({e:#}), so it was not restarted. Its state was last read as \
                  running, before that, with its earlier configuration, so it does not accept {VARIABLE} yet; run \
-                 `ssh-broker apply` again to restart it"
+                 `ssh-broker install` again to restart it"
             ));
             return false;
         }
@@ -167,7 +167,7 @@ pub fn restart(host: &mut dyn SshdHost, say: &mut dyn FnMut(&str), before: &Befo
     let mut stopped = unseen.clone().unwrap_or_else(|| "sshd was stopped".to_owned());
     // The wait that was announced has ended: say what it came to before the start's own wait.
     if unanswered_said {
-        say(&format!("apply: {stopped}; starting sshd"));
+        say(&format!("install: {stopped}; starting sshd"));
     }
 
     // Whether sshd is known to have stopped (seen, or read stopped after the extra start below). It decides what a
@@ -180,30 +180,30 @@ pub fn restart(host: &mut dyn SshdHost, say: &mut dyn FnMut(&str), before: &Befo
         stopped = format!("{cause}; {read}");
         unseen = Some(stopped.clone());
         state_read = true;
-        say(&format!("apply: {stopped}; starting sshd"));
+        say(&format!("install: {stopped}; starting sshd"));
         first = host.start();
     }
     match first {
         StartOutcome::Serving(StartReply::Accepted) => {
             say(&match (&unseen, state_read) {
                 (Some(unseen), false) => format!(
-                    "apply: sshd restarted; it accepts {VARIABLE} ({unseen}, and the service manager accepted a \
+                    "install: sshd restarted; it accepts {VARIABLE} ({unseen}, and the service manager accepted a \
                      start)"
                 ),
-                _ => format!("apply: sshd restarted; it accepts {VARIABLE}"),
+                _ => format!("install: sshd restarted; it accepts {VARIABLE}"),
             });
             true
         }
         StartOutcome::Serving(StartReply::Refused(reply)) if state_read => {
             say(&format!(
-                "apply: sshd restarted (the service manager had started it again: {reply}); it accepts {VARIABLE}"
+                "install: sshd restarted (the service manager had started it again: {reply}); it accepts {VARIABLE}"
             ));
             true
         }
         StartOutcome::Serving(StartReply::Refused(reply)) => {
             say(&format!(
-                "apply: sshd is running and whether it restarted cannot be told: {stopped}, and a start was \
-                 refused ({reply}); `ssh-broker apply` restarts it if it has not read the change"
+                "install: sshd is running and whether it restarted cannot be told: {stopped}, and a start was \
+                 refused ({reply}); `ssh-broker install` restarts it if it has not read the change"
             ));
             false
         }
@@ -212,7 +212,7 @@ pub fn restart(host: &mut dyn SshdHost, say: &mut dyn FnMut(&str), before: &Befo
             ..
         } => {
             say(&format!(
-                "apply: sshd is NOT running: {stopped}, and the service manager refused to start it ({reply}). \
+                "install: sshd is NOT running: {stopped}, and the service manager refused to start it ({reply}). \
                  {START_BY_HAND}"
             ));
             false
@@ -224,7 +224,7 @@ pub fn restart(host: &mut dyn SshdHost, say: &mut dyn FnMut(&str), before: &Befo
         } => {
             let unread = unread.map_or(String::new(), |cause| format!(" {}", unseen_exit(&cause)));
             say(&format!(
-                "apply: sshd is not serving: {stopped}, the service manager refused a start ({reply}), and the sshd \
+                "install: sshd is not serving: {stopped}, the service manager refused a start ({reply}), and the sshd \
                  it reported running exited (code {code}) without being seen to listen{unread}. {CHECK_SSHD}"
             ));
             false
@@ -248,14 +248,14 @@ pub fn restart(host: &mut dyn SshdHost, say: &mut dyn FnMut(&str), before: &Befo
         }
         StartOutcome::Paused(reply) => {
             say(&format!(
-                "apply: {stopped} and a start was {}; it is paused. {CHECK_BY_HAND}",
+                "install: {stopped} and a start was {}; it is paused. {CHECK_BY_HAND}",
                 replied(&reply)
             ));
             false
         }
         StartOutcome::Unreadable { reply, cause } => {
             say(&format!(
-                "apply: {stopped} and a start was {}; its state cannot be read ({cause}). {CHECK_BY_HAND}",
+                "install: {stopped} and a start was {}; its state cannot be read ({cause}). {CHECK_BY_HAND}",
                 replied(&reply)
             ));
             false
@@ -270,9 +270,9 @@ const CHECK_BY_HAND: &str = "Check it at this PC: `sc query sshd`.";
 /// manager's answer): that the wait has no time limit, and how to end it.
 fn stop_unanswered(reply: &str) -> String {
     format!(
-        "apply: sshd did not answer the stop in time ({reply}) and the service manager says it is still running; \
-         apply waits, with no time limit, for that sshd to exit, and then starts it. To stop waiting, end the task \
-         {APPLY_SSHD_TASK} (`schtasks /End /TN {APPLY_SSHD_TASK}`, elevated) and run `ssh-broker apply` again; \
+        "install: sshd did not answer the stop in time ({reply}) and the service manager says it is still running; \
+         install waits, with no time limit, for that sshd to exit, and then starts it. To stop waiting, end the task \
+         {INSTALL_SSHD_TASK} (`schtasks /End /TN {INSTALL_SSHD_TASK}`, elevated) and run `ssh-broker install` again; \
          nothing then starts an sshd that exits later. {CHECK_SSHD}"
     )
 }
@@ -280,8 +280,8 @@ fn stop_unanswered(reply: &str) -> String {
 /// What is said when sshd could not be stopped: why, and the state it is in.
 fn not_stopped(why: &str, state: &str) -> String {
     format!(
-        "apply: sshd could not be stopped ({why}) and is {state} with its earlier configuration, so it does not \
-         accept {VARIABLE} yet; run `ssh-broker apply` again to restart it"
+        "install: sshd could not be stopped ({why}) and is {state} with its earlier configuration, so it does not \
+         accept {VARIABLE} yet; run `ssh-broker install` again to restart it"
     )
 }
 
@@ -371,18 +371,20 @@ fn start_again(host: &mut dyn SshdHost, say: &mut dyn FnMut(&str), before: &Befo
     let back = account.as_ref().map_or(String::new(), |said| format!(" The {said}."));
     let bracketed = account.map_or(String::new(), |said| format!(" (the {said})"));
 
-    say(&format!("apply: sshd {failed} ({first}); starting it again{bracketed}"));
+    say(&format!(
+        "install: sshd {failed} ({first}); starting it again{bracketed}"
+    ));
     match host.start() {
         StartOutcome::Serving(StartReply::Accepted) if trouble.is_empty() && changed => {
             say(&format!(
-                "apply: sshd {failed} ({first}); the original configuration was put back and sshd is running \
+                "install: sshd {failed} ({first}); the original configuration was put back and sshd is running \
                  again. It does not accept {VARIABLE}."
             ));
             false
         }
         StartOutcome::Serving(StartReply::Accepted) if trouble.is_empty() => {
             say(&format!(
-                "apply: sshd failed to start once ({first}); a second start worked and sshd is running. It \
+                "install: sshd failed to start once ({first}); a second start worked and sshd is running. It \
                  accepts {VARIABLE}."
             ));
             true
@@ -390,8 +392,8 @@ fn start_again(host: &mut dyn SshdHost, say: &mut dyn FnMut(&str), before: &Befo
         StartOutcome::Serving(reply) => {
             let why = second_ended(reply, "not all of the files could be put back".to_owned());
             say(&format!(
-                "apply: sshd {failed} ({first}); sshd is running now, but {why}, so which configuration it read \
-                 cannot be told{bracketed}; run `ssh-broker apply` again"
+                "install: sshd {failed} ({first}); sshd is running now, but {why}, so which configuration it read \
+                 cannot be told{bracketed}; run `ssh-broker install` again"
             ));
             false
         }
@@ -404,7 +406,7 @@ fn start_again(host: &mut dyn SshdHost, say: &mut dyn FnMut(&str), before: &Befo
                 ),
             );
             say(&format!(
-                "apply: sshd is NOT running: it {failed} ({first}), and {second}.{back} {START_BY_HAND}"
+                "install: sshd is NOT running: it {failed} ({first}), and {second}.{back} {START_BY_HAND}"
             ));
             false
         }
@@ -414,13 +416,13 @@ fn start_again(host: &mut dyn SshdHost, say: &mut dyn FnMut(&str), before: &Befo
                 format!("a second start was accepted and sshd exited (code {code}) before it listened"),
             );
             say(&format!(
-                "apply: sshd is NOT running: it {failed} ({first}), and {second}.{back} {START_BY_HAND}"
+                "install: sshd is NOT running: it {failed} ({first}), and {second}.{back} {START_BY_HAND}"
             ));
             false
         }
         StartOutcome::Paused(reply) => {
             say(&format!(
-                "apply: sshd is paused: it {failed} ({first}), and a second start was {}; it is paused.{back} \
+                "install: sshd is paused: it {failed} ({first}), and a second start was {}; it is paused.{back} \
                  {CHECK_BY_HAND}",
                 replied(&reply)
             ));
@@ -428,7 +430,7 @@ fn start_again(host: &mut dyn SshdHost, say: &mut dyn FnMut(&str), before: &Befo
         }
         StartOutcome::Unreadable { reply, cause } => {
             say(&format!(
-                "apply: sshd may not be running: it {failed} ({first}), and a second start was {}; its state \
+                "install: sshd may not be running: it {failed} ({first}), and a second start was {}; its state \
                  cannot be read ({cause}).{back} {CHECK_BY_HAND}",
                 replied(&reply)
             ));

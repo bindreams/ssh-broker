@@ -1,4 +1,4 @@
-//! Tests for the values `apply` owns under `HKLM\SOFTWARE\OpenSSH`: the pure list and the doctor
+//! Tests for the values `install` owns under `HKLM\SOFTWARE\OpenSSH`: the pure list and the doctor
 //! row (host) + the Reg* round-trips (Windows).
 use super::{RegValue, SshdShell, SshdShellReading, desired_values, escape_arguments_check};
 
@@ -45,7 +45,7 @@ fn values_are_the_flag_then_the_option_then_the_shell() {
 }
 
 /// The doctor row passes when sshd reads the value as on (a missing value included), and fails
-/// otherwise, naming the value and `apply`. A read that cannot be made fails too: the setting is
+/// otherwise, naming the value and `install`. A read that cannot be made fails too: the setting is
 /// then unknown.
 #[test]
 fn the_escape_row_passes_only_when_sshd_would_escape() {
@@ -55,12 +55,12 @@ fn the_escape_row_passes_only_when_sshd_would_escape() {
     let off = escape_arguments_check(Ok::<_, String>(false));
     assert!(!off.pass);
     assert!(off.name.contains("DefaultShellEscapeArguments"), "{}", off.name);
-    assert!(off.detail.contains("apply"), "{}", off.detail);
+    assert!(off.detail.contains("install"), "{}", off.detail);
 
     let unreadable = escape_arguments_check(Err("Access is denied."));
     assert!(!unreadable.pass);
     assert!(unreadable.detail.contains("Access is denied."), "{}", unreadable.detail);
-    assert!(unreadable.detail.contains("apply"), "{}", unreadable.detail);
+    assert!(unreadable.detail.contains("install"), "{}", unreadable.detail);
 }
 
 /// Writing the values leaves `DefaultShellEscapeArguments` as the REG_DWORD 1 sshd reads as on,
@@ -229,7 +229,7 @@ fn escape_arguments_reports_a_read_that_fails_for_another_reason() {
     assert!(super::escape_arguments_from_status(ERROR_SUCCESS, [1, 0, 0, 0]).unwrap());
 }
 
-/// `apply` reads the four values the way sshd does before it overwrites them. Under a key of the
+/// `install` reads the four values the way sshd does before it overwrites them. Under a key of the
 /// test's own (HKCU, deleted afterwards); CI only, as it writes the registry.
 #[cfg(windows)]
 #[test]
@@ -362,7 +362,7 @@ fn a_value_of_another_type_is_read_as_the_text_sshd_runs() {
     assert_eq!(got.command_option, None);
 }
 
-/// After `apply` carries `DefaultShellArguments` into the config it removes the value: left, sshd
+/// After `install` carries `DefaultShellArguments` into the config it removes the value: left, sshd
 /// would hand the arguments to the shim before `-c`. Removing a value that is not there, or under a
 /// key that is not there, is not an error, and no other value goes. Under a key of the test's own
 /// (HKCU, deleted afterwards); CI only, as it writes the registry.
@@ -391,7 +391,7 @@ fn removing_the_shell_arguments_removes_that_value_and_nothing_else() {
     super::remove_shell_arguments_hkcu(missing_key.path()).unwrap();
 }
 
-/// `apply` reads `DefaultShellArguments` on its own after the flip, so a value it cannot use in the
+/// `install` reads `DefaultShellArguments` on its own after the flip, so a value it cannot use in the
 /// shell it replaced (or that is absent) does not hide it. Under a key of the test's own (HKCU, deleted
 /// afterwards); CI only, as it writes the registry.
 #[cfg(windows)]
@@ -565,7 +565,7 @@ fn every_failing_value_is_named_and_the_shell_itself_may_be_the_one() {
     }
 }
 
-/// `apply` adds what was or was not changed itself (`replace_shell`), so this text claims nothing about it.
+/// `install` adds what was or was not changed itself (`replace_shell`), so this text claims nothing about it.
 #[test]
 fn the_text_makes_no_claim_about_the_default_shell_being_changed() {
     let mut reading = read_ok();
@@ -582,7 +582,7 @@ fn a_value_that_is_not_set_is_printed_as_not_set() {
     assert!(text.contains("DefaultShellArguments = not set"), "{text}");
 }
 
-/// Replacing ssh-broker with ssh-broker loses nothing, so a value that cannot be read does not stop `apply`;
+/// Replacing ssh-broker with ssh-broker loses nothing, so a value that cannot be read does not stop `install`;
 /// it counts as not set.
 #[test]
 fn with_ssh_broker_as_the_shell_the_other_values_do_not_matter() {

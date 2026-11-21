@@ -59,25 +59,25 @@ fn agent_xml_names_no_user_and_no_logon_type() {
 }
 
 #[test]
-fn apply_sshd_xml_runs_the_verb_as_system_with_no_trigger() {
-    let xml = apply_sshd_task_xml(r"C:\ProgramData\ssh-broker\ssh-broker.exe");
+fn install_sshd_xml_runs_the_verb_as_system_with_no_trigger() {
+    let xml = install_sshd_task_xml(r"C:\ProgramData\ssh-broker\ssh-broker.exe");
     assert!(xml.contains("<UserId>S-1-5-18</UserId>"), "SYSTEM, by its SID");
     assert!(xml.contains("<RunLevel>HighestAvailable</RunLevel>"));
     assert!(
         !xml.contains("Trigger"),
-        "a task with no trigger runs nothing by itself, only when `apply` starts it"
+        "a task with no trigger runs nothing by itself, only when `install` starts it"
     );
     assert!(xml.contains(r"<Command>C:\ProgramData\ssh-broker\ssh-broker.exe</Command>"));
-    assert!(xml.contains("<Arguments>apply-sshd</Arguments>"));
+    assert!(xml.contains("<Arguments>install-sshd</Arguments>"));
     assert!(xml.contains(r#"encoding="UTF-16""#));
 }
 
 #[test]
-fn apply_sshd_xml_queues_a_second_run_and_never_restarts_a_failed_one() {
-    let xml = apply_sshd_task_xml(r"C:\x.exe");
+fn install_sshd_xml_queues_a_second_run_and_never_restarts_a_failed_one() {
+    let xml = install_sshd_task_xml(r"C:\x.exe");
     assert!(
         xml.contains("<MultipleInstancesPolicy>Queue</MultipleInstancesPolicy>"),
-        "an `apply` over a task that still runs waits its turn, and the run it asked for happens"
+        "an `install` over a task that still runs waits its turn, and the run it asked for happens"
     );
     assert!(
         !xml.contains("RestartOnFailure"),
@@ -99,8 +99,8 @@ fn the_other_tasks_keep_their_settings() {
 }
 
 #[test]
-fn apply_sshd_xml_escapes_special_chars() {
-    let xml = apply_sshd_task_xml(r"C:\a&b\x.exe");
+fn install_sshd_xml_escapes_special_chars() {
+    let xml = install_sshd_task_xml(r"C:\a&b\x.exe");
     assert!(xml.contains("a&amp;b"));
 }
 
@@ -207,7 +207,7 @@ fn xml_run_level_reads_the_level_and_finds_none_when_it_is_left_out() {
     assert_eq!(xml_run_level(&omitted), None);
 }
 
-/// The agent task as an earlier `apply` registered it.
+/// The agent task as an earlier `install` registered it.
 fn least_privilege_agent_task_xml() -> String {
     agent_task_xml(r"C:\x.exe").replace("HighestAvailable", "LeastPrivilege")
 }
@@ -237,18 +237,18 @@ fn xml_is_group_logon_task_tolerates_case_and_whitespace_in_the_run_level() {
 }
 
 #[test]
-fn agent_task_row_fails_for_the_run_level_of_an_earlier_apply_and_says_to_run_apply() {
+fn agent_task_row_fails_for_the_run_level_of_an_earlier_install_and_says_to_run_install() {
     let row = agent_task_row(&Ok(Some(least_privilege_agent_task_xml())));
     assert!(!row.pass, "{}", row.detail);
     assert!(row.detail.contains("HighestAvailable"), "{}", row.detail);
-    assert!(row.detail.contains("apply"), "{}", row.detail);
+    assert!(row.detail.contains("install"), "{}", row.detail);
 }
 
 #[test]
 fn agent_task_row_fails_for_a_per_user_task() {
     let row = agent_task_row(&Ok(Some(per_user_task_xml("DOMAIN\\someone"))));
     assert!(!row.pass);
-    assert!(row.detail.contains("apply"), "it says what to do: {}", row.detail);
+    assert!(row.detail.contains("install"), "it says what to do: {}", row.detail);
 }
 
 #[test]
@@ -288,14 +288,14 @@ fn disabled_agent_task_xml() -> String {
 }
 
 #[test]
-fn agent_task_row_fails_for_a_disabled_task_and_says_to_run_apply() {
-    // A killed `apply` leaves the task disabled; nothing then starts at any logon.
+fn agent_task_row_fails_for_a_disabled_task_and_says_to_run_install() {
+    // A killed `install` leaves the task disabled; nothing then starts at any logon.
     let xml = disabled_agent_task_xml();
     assert!(xml_is_group_logon_task(&xml), "control: otherwise the group task");
     let row = agent_task_row(&Ok(Some(xml)));
     assert!(!row.pass, "{}", row.detail);
     assert!(row.detail.contains("disabled"), "{}", row.detail);
-    assert!(row.detail.contains("apply"), "{}", row.detail);
+    assert!(row.detail.contains("install"), "{}", row.detail);
 }
 
 #[test]

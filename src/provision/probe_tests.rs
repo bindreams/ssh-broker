@@ -133,7 +133,7 @@ fn only_the_lines_of_one_kind_of_the_probes_stderr_are_kept_and_they_are_bounded
 ///
 /// It must ALSO distinguish the two ways of not being proven, which is why this is an enum rather
 /// than a bool. A missing token means the installed child predates the check — reachable on a
-/// perfectly healthy box, since `apply` tolerates not replacing the exe while a running agent
+/// perfectly healthy box, since `install` tolerates not replacing the exe while a running agent
 /// holds it open — whereas `upstream=fail` means the child looked and the bytes were wrong. Both
 /// fail the gate; only the second may tell the operator the payload was mangled.
 #[test]

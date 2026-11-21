@@ -1,4 +1,4 @@
-//! Host tests for `apply`'s argument handling.
+//! Host tests for `install`'s argument handling.
 use super::*;
 use crate::route::ProbeLink;
 
@@ -7,15 +7,17 @@ fn args(list: &[&str]) -> Vec<String> {
 }
 
 #[test]
-fn check_apply_args_accepts_no_arguments() {
-    check_apply_args(&[]).unwrap();
+fn check_install_args_accepts_no_arguments() {
+    check_install_args(&[]).unwrap();
 }
 
 #[test]
-fn check_apply_args_refuses_any_argument() {
-    let err = check_apply_args(&args(&["--force"])).unwrap_err().to_string();
+fn check_install_args_refuses_any_argument() {
+    let err = check_install_args(&args(&["--force"])).unwrap_err().to_string();
     assert!(err.contains("--force"), "{err}");
-    let err = check_apply_args(&args(&["--user", "someone"])).unwrap_err().to_string();
+    let err = check_install_args(&args(&["--user", "someone"]))
+        .unwrap_err()
+        .to_string();
     assert!(err.contains("--user"), "{err}");
 }
 
