@@ -10,9 +10,12 @@ on:
         required: false
         type: string
     outputs:
-      zip:
-        description: Name of the archive in the `release-asset` artifact
-        value: ${{ jobs.package.outputs.zip }}
+      exe:
+        description: Name of the executable in the `release-asset` artifact
+        value: ${{ jobs.package.outputs.exe }}
+      sums:
+        description: Name of the file of its SHA-256 sum in the `release-asset` artifact
+        value: ${{ jobs.package.outputs.sums }}
   pull_request:
     paths:
       - .github/workflows/release-asset.yaml
@@ -22,7 +25,6 @@ on:
       - Cargo.toml
       - Cargo.lock
       - rust-toolchain.toml
-      - LICENSE.md
 
 env:
   CARGO_TERM_COLOR: always
@@ -39,15 +41,28 @@ jobs:
       attestations: write
     outputs:
       version: ${{ steps.version.outputs.version }}
-      zip: ${{ steps.version.outputs.zip }}
+      exe: ${{ steps.names.outputs.exe }}
+      sums: ${{ steps.names.outputs.sums }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
-      - name: Resolve the target triple
+      - name: Resolve the target triple and the asset names
+        id: names
         shell: bash
         run: |
           set -euo pipefail
-          echo "TRIPLE=$(bash .github/scripts/asset-name.sh --triple)" >> "$GITHUB_ENV"
+          triple="$(bash .github/scripts/asset-name.sh --triple)"
+          exe="$(bash .github/scripts/asset-name.sh --exe)"
+          sums="$(bash .github/scripts/asset-name.sh --sums)"
+          {
+              echo "TRIPLE=$triple"
+              echo "EXE=$exe"
+              echo "SUMS=$sums"
+          } >> "$GITHUB_ENV"
+          {
+              echo "exe=$exe"
+              echo "sums=$sums"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Install pinned toolchain
         run: rustup toolchain install
@@ -77,7 +92,6 @@ jobs:
               exit 1
           fi
           echo "version=$manifest" >> "$GITHUB_OUTPUT"
-          echo "zip=$(bash .github/scripts/asset-name.sh "$manifest")" >> "$GITHUB_OUTPUT"
 
       - name: Build
         shell: bash
@@ -88,38 +102,30 @@ jobs:
         shell: bash
         run: bash .github/scripts/check-imports.sh "target/${TRIPLE}/release/ssh-broker.exe"
 
-      - name: Stage the archive contents
+      - name: Stage the asset
         shell: bash
         run: |
           set -euo pipefail
-          mkdir stage dist
-          cp "target/${TRIPLE}/release/ssh-broker.exe" LICENSE.md stage/
-
-      - name: Zip
-        env:
-          ZIP: ${{ steps.version.outputs.zip }}
-        shell: pwsh
-        run: Compress-Archive -Path stage/ssh-broker.exe, stage/LICENSE.md -DestinationPath "dist/$env:ZIP"
+          mkdir dist
+          cp "target/${TRIPLE}/release/ssh-broker.exe" "dist/${EXE}"
 
       # `<hex>  <name>`, the form `sha256sum -c` takes. Spelled out because Git for Windows'
       # `sha256sum` marks binary-mode entries with `*`.
       - name: Hash
-        env:
-          ZIP: ${{ steps.version.outputs.zip }}
         shell: bash
         run: |
           set -euo pipefail
-          hash="$(sha256sum "dist/${ZIP}" | cut -d ' ' -f 1)"
-          printf '%s  %s\n' "$hash" "$ZIP" > "dist/${ZIP}.sha256"
-          cat "dist/${ZIP}.sha256"
+          hash="$(sha256sum "dist/${EXE}" | cut -d ' ' -f 1)"
+          printf '%s  %s\n' "$hash" "$EXE" > "dist/${SUMS}"
+          cat "dist/${SUMS}"
 
       # A pull request from a fork gets a read-only token with no OIDC, so it cannot attest. It
-      # still builds, runs the import gate and packages; only the attestation is skipped.
+      # still builds, runs the import gate and stages; only the attestation is skipped.
       - name: Attest build provenance
         if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
         with:
-          subject-path: dist/*.zip
+          subject-path: dist/${{ steps.names.outputs.exe }}
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
@@ -137,42 +143,39 @@ jobs:
       contents: read
     env:
       GH_TOKEN: ${{ github.token }}
-      ZIP: ${{ needs.package.outputs.zip }}
+      EXE: ${{ needs.package.outputs.exe }}
+      SUMS: ${{ needs.package.outputs.sums }}
     steps:
+      # For the scripts under .github/scripts.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: release-asset
           path: dist
 
-      - name: Check the artifact holds exactly the two files, and the archive exactly two members
+      - name: Check the artifact holds exactly the two files
         shell: bash
         run: |
           set -euo pipefail
-          want_files="$(printf '%s\n' "$ZIP" "$ZIP.sha256" | sort)"
+          want_files="$(printf '%s\n' "$EXE" "$SUMS" | sort)"
           got_files="$(ls dist | sort)"
           if [[ "$got_files" != "$want_files" ]]; then
               echo "::error::artifact files are not exactly the expected pair"
               echo "want:"; echo "$want_files"; echo "got:"; echo "$got_files"
               exit 1
           fi
-          want_members="$(printf '%s\n' LICENSE.md ssh-broker.exe)"
-          got_members="$(unzip -Z1 "dist/${ZIP}" | sort)"
-          if [[ "$got_members" != "$want_members" ]]; then
-              echo "::error::archive members are not exactly ssh-broker.exe and LICENSE.md"
-              echo "got:"; echo "$got_members"
-              exit 1
-          fi
 
-      - name: Check the hash
+      - name: Check the sums file is the exe's own line
         shell: bash
-        run: cd dist && sha256sum -c ./*.sha256
+        run: bash .github/scripts/check-sums-file.sh dist "$EXE" "$SUMS"
 
       - name: Verify the attestation
         if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
         shell: bash
         run: |
           set -euo pipefail
-          gh attestation verify "dist/${ZIP}" \
+          gh attestation verify "dist/${EXE}" \
               -R "$GITHUB_REPOSITORY" \
               --signer-workflow "${GITHUB_REPOSITORY}/.github/workflows/release-asset.yaml" \
               --source-digest "$GITHUB_SHA"
