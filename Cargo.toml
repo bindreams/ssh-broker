@@ -1,6 +1,6 @@
 [package]
 name = "ssh-broker"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 
 # Cross-platform dependencies (compile + unit-test on the macOS host).
